@@ -297,7 +297,11 @@ fn last_built(fs: &dyn Fs, leaf: &Path, store: Option<&Path>) -> Option<LastBuil
         .to_str()?
         .strip_suffix(aterm_toolchain::build_cache::NOINDEX)
         .unwrap_or(raw_sysroot_build.to_str()?);
-    if relative.next().is_some() || sysroot_build.parse::<u64>().is_err() {
+    if relative.next().is_some()
+        || sysroot_build.is_empty()
+        || !sysroot_build.bytes().all(|b| b.is_ascii_digit())
+        || sysroot_build.parse::<u64>().is_err()
+    {
         return None;
     }
     let program = store.join(name);
@@ -324,7 +328,11 @@ fn last_built(fs: &dyn Fs, leaf: &Path, store: Option<&Path>) -> Option<LastBuil
         .to_str()?
         .strip_suffix(aterm_toolchain::build_cache::NOINDEX)
         .unwrap_or(raw_target_build.to_str()?);
-    if relative.next().is_some() || target_build.parse::<u64>().is_err() {
+    if relative.next().is_some()
+        || target_build.is_empty()
+        || !target_build.bytes().all(|b| b.is_ascii_digit())
+        || target_build.parse::<u64>().is_err()
+    {
         return None;
     }
     Some(LastBuilt {

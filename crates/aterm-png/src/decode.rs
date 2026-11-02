@@ -5,6 +5,7 @@
 
 use std::io::Read;
 
+use aterm_codec::inflate::DYNAMIC_HEADER_WORK;
 use aterm_codec::inflate::stream::ZlibReader;
 
 use crate::checksum::Crc32;
@@ -12,6 +13,41 @@ use crate::{
     BitDepth, ColorType, DecodingError, Info, Limits, OutputInfo, SIGNATURE, SrgbRenderingIntent,
     Transformations, row_bytes,
 };
+
+/// Image-data bytes per dynamic DEFLATE block a decode's work budget allows: as
+/// dense as an encoder writes them (zlib at its smallest `memLevel` ends a block
+/// every 127 symbols, each at least a byte of image data).
+const BYTES_PER_DYNAMIC_BLOCK: usize = 128;
+
+/// Dynamic blocks a decode's work budget allows on top, so a small image's
+/// stream may still split as its encoder likes.
+const SPARE_DYNAMIC_BLOCKS: u64 = 64;
+
+/// The work an image's zlib stream may spend on block headers
+/// ([`ZlibReader::with_work_budget`]), set by the `image_data` bytes its header
+/// declares. A header's work is not bounded by the output it leads to (an empty
+/// dynamic block is 12 bytes that build three tables, about 2 µs), so without
+/// this a 1x1 image's 4 MiB stream would cost some 0.7 s.
+fn work_budget(image_data: usize) -> u64 {
+    let blocks = u64::try_from(image_data / BYTES_PER_DYNAMIC_BLOCK).unwrap_or(u64::MAX);
+    blocks
+        .saturating_add(SPARE_DYNAMIC_BLOCKS)
+        .saturating_mul(DYNAMIC_HEADER_WORK)
+}
+
+/// What a failed read of the image data means: a stream over its work budget
+/// is [`DecodingError::LimitsExceeded`], anything else [`DecodingError::BadZlib`].
+fn zlib_error(e: &std::io::Error) -> DecodingError {
+    let over_budget = e
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<aterm_codec::inflate::InflateError>())
+        .is_some_and(|inner| *inner == aterm_codec::inflate::InflateError::TooMuchWork);
+    if over_budget {
+        DecodingError::LimitsExceeded
+    } else {
+        DecodingError::BadZlib
+    }
+}
 
 /// Reads a PNG's header and image data.
 pub struct Decoder<R> {
@@ -80,8 +116,9 @@ struct Chunk<'a> {
 }
 
 fn read_chunk(bytes: &[u8], offset: usize) -> Result<Chunk<'_>, DecodingError> {
+    let data_start = offset.checked_add(8).ok_or(DecodingError::Truncated)?;
     let header = bytes
-        .get(offset..offset + 8)
+        .get(offset..data_start)
         .ok_or(DecodingError::Truncated)?;
     let len = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
     if len > 0x7FFF_FFFF {
@@ -89,22 +126,19 @@ fn read_chunk(bytes: &[u8], offset: usize) -> Result<Chunk<'_>, DecodingError> {
     }
     let len = len as usize;
     let kind = [header[4], header[5], header[6], header[7]];
-    let data_start = offset + 8;
+    let crc_start = data_start
+        .checked_add(len)
+        .ok_or(DecodingError::Truncated)?;
+    let next = crc_start.checked_add(4).ok_or(DecodingError::Truncated)?;
     let data = bytes
-        .get(data_start..data_start + len)
+        .get(data_start..crc_start)
         .ok_or(DecodingError::Truncated)?;
-    let crc_bytes = bytes
-        .get(data_start + len..data_start + len + 4)
-        .ok_or(DecodingError::Truncated)?;
+    let crc_bytes = bytes.get(crc_start..next).ok_or(DecodingError::Truncated)?;
     let stored = u32::from_be_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
     if Crc32::of(&[&kind, data]) != stored {
         return Err(DecodingError::BadCrc { chunk: kind });
     }
-    Ok(Chunk {
-        kind,
-        data,
-        next: data_start + len + 4,
-    })
+    Ok(Chunk { kind, data, next })
 }
 
 type PaletteLut = [[u16; 4]; 256];
@@ -321,8 +355,9 @@ impl Reader {
     /// Decode the image into `buf` ([`Limits`]).
     /// # Errors
     /// [`DecodingError`] if `buf` is too small, the compressed data is corrupt or holds fewer or
-    /// far more scanlines than the header declares, or a filter byte is not one of the five defined
-    /// types.
+    /// far more scanlines than the header declares, its block headers cost more work than the
+    /// image's size allows ([`DecodingError::LimitsExceeded`]), or a filter byte is not one of the
+    /// five defined types.
     pub fn next_frame(&mut self, buf: &mut [u8]) -> Result<OutputInfo, DecodingError> {
         let out_size = self.output.buffer_size();
         if buf.len() < out_size {
@@ -346,7 +381,14 @@ impl Reader {
         };
         let palette_lut = palette_lut.as_deref();
 
-        let mut stream = ZlibReader::new(self.compressed.as_slice());
+        let image_data = passes
+            .iter()
+            .map(|&(_, _, pass_h, stride)| {
+                (pass_h as usize).saturating_mul(stride.saturating_add(1))
+            })
+            .fold(0, usize::saturating_add);
+        let mut stream =
+            ZlibReader::with_work_budget(self.compressed.as_slice(), work_budget(image_data));
         let mut row_error = None;
         let bpp = (samples * depth as usize).div_ceil(8).max(1);
         let mut prev: Vec<u8> = Vec::new();
@@ -392,7 +434,7 @@ impl Reader {
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(_) => return Err(DecodingError::BadZlib),
+                Err(e) => return Err(zlib_error(&e)),
             }
         }
         match row_error {
@@ -619,7 +661,7 @@ fn read_image_data(stream: &mut impl Read, buf: &mut [u8]) -> Result<(), Decodin
             Ok(0) => return Err(DecodingError::Truncated),
             Ok(n) => filled += n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => return Err(DecodingError::BadZlib),
+            Err(e) => return Err(zlib_error(&e)),
         }
     }
     Ok(())

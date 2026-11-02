@@ -33,6 +33,8 @@ pub const POISONED_WORDS: &str = "poisoned";
 pub const POISONED_EXIT_WORDS: &str = "poisoned, exiting 75";
 /// Phrase emitted when no `aterm fabric on` job runs the broker.
 pub const UNSUPERVISED_WORDS: &str = "no `aterm fabric on` job runs this broker";
+/// What [`replaced_line`] says of a supervised broker's restart.
+const SUPERVISOR_STARTS_WORDS: &str = "so the supervisor starts that one";
 
 /// Format the diagnostic line emitted when a broker exits over a poisoned log.
 #[must_use]
@@ -44,6 +46,21 @@ pub fn poisoned_line(log: &str, reason: &str, restart: Option<&str>) -> String {
         Some(argv) => format!(
             "{head}; {UNSUPERVISED_WORDS}, so unless something else restarts it, restart it as \
              `{argv}` (astream: {why})"
+        ),
+    }
+}
+
+/// THE LINE A BROKER EXITS WITH WHEN ITS IMAGE WAS REPLACED (fix unit E5, E2E-6's residual),
+/// after `aterm link broker: `: the broker exits either way, and the line says who starts the
+/// new build, the supervisor (`restart` none, [`supervised`]) or, with no `aterm fabric on`
+/// job running it, the command to start it again (`restart`, as [`poisoned_line`] gives it).
+#[must_use]
+pub fn replaced_line(path: &str, restart: Option<&str>) -> String {
+    match restart {
+        None => format!("{path} was replaced by another build; exiting {SUPERVISOR_STARTS_WORDS}"),
+        Some(argv) => format!(
+            "{path} was replaced by another build; exiting, and {UNSUPERVISED_WORDS}, so unless \
+             something else restarts it, start it again as `{argv}`"
         ),
     }
 }
@@ -257,7 +274,18 @@ impl Seam {
             return;
         }
         let marker = fired_marker(log);
-        if let Err(e) = std::fs::write(&marker, b"1\n") {
+        let armed = crate::enable::create_temp_beside(&marker, 0o600).and_then(|(tmp, mut f)| {
+            use std::io::Write as _;
+            let res = f.write_all(b"1\n").and_then(|()| {
+                drop(f);
+                std::fs::rename(&tmp, &marker)
+            });
+            if res.is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+            res
+        });
+        if let Err(e) = armed {
             eprintln!(
                 "aterm link broker: {FAULT_SEAM}: not arming sync: {}: {e}",
                 marker.display()
@@ -343,6 +371,28 @@ mod tests {
                 line.ends_with("(astream: a flush failed (EIO) badly)"),
                 "{line}"
             );
+        }
+    }
+
+    /// A REPLACED BUILD'S EXIT LINE SAYS WHO STARTS THE NEW ONE (fix unit E5): under its
+    /// supervisor, that it starts the new build; with no `aterm fabric on` job running it, the
+    /// command to start it again, as the poisoned exit gives it, and never that a supervisor
+    /// will. NEGATIVE CONTROL (scratch): one wording for both arms fails the unsupervised one.
+    #[test]
+    fn a_replaced_builds_exit_line_names_who_starts_the_new_one() {
+        let path = "/opt/x/aterm";
+        let argv = "aterm link broker /r/bus.sock /r/bus.log --secret-file /r/mint.secret";
+        let supervised = replaced_line(path, None);
+        let alone = replaced_line(path, Some(argv));
+        assert!(supervised.contains(SUPERVISOR_STARTS_WORDS), "{supervised}");
+        assert!(!supervised.contains(UNSUPERVISED_WORDS), "{supervised}");
+        assert!(!supervised.contains(argv), "{supervised}");
+        assert!(alone.contains(UNSUPERVISED_WORDS), "{alone}");
+        assert!(alone.contains(&format!("`{argv}`")), "{alone}");
+        assert!(!alone.contains(SUPERVISOR_STARTS_WORDS), "{alone}");
+        for line in [&supervised, &alone] {
+            assert!(line.starts_with(path), "{line}");
+            assert!(!line.contains('\n'), "{line}");
         }
     }
 

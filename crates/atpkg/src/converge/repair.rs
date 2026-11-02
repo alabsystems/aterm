@@ -56,6 +56,8 @@ pub struct Ground {
     pub exe: Option<PathBuf>,
     /// rustup's home (`$RUSTUP_HOME`, else `~/.rustup`).
     pub rustup_home: Option<PathBuf>,
+    /// The folder zsh reads its `.zshrc` from ([`crate::zdotdir`]).
+    pub zsh: crate::zdotdir::ZshDir,
     /// The rc the account's login shell reads ([`crate::hooks::login_rc`]).
     pub login_rc: Option<&'static str>,
     /// Which surface runs the items.
@@ -149,9 +151,11 @@ impl Ground {
     #[must_use]
     pub fn of_process(layout: Layout, pass: Pass) -> Self {
         let home = aterm_types::dirs::home_dir();
+        let rcs = home.as_deref().map(crate::hooks::RcHome::of_process);
         Self {
             layout,
-            login_rc: home.as_deref().and_then(crate::hooks::account_login_rc),
+            login_rc: rcs.as_ref().and_then(crate::hooks::account_login_rc),
+            zsh: rcs.map(|rcs| rcs.zsh).unwrap_or_default(),
             home,
             exe: std::env::current_exe()
                 .and_then(|exe| exe.canonicalize())
@@ -166,28 +170,24 @@ impl Ground {
 /// The repair items over `ground`, in run order.
 #[must_use]
 pub fn items(ground: &Arc<Ground>) -> Vec<Box<dyn Item>> {
-    [
-        Step::CopiedCommands,
-        Step::Links,
-        Step::Hooks,
-        Step::Rc,
-        Step::Stubs,
-        Step::RustupSeam,
-        Step::RustupLocal,
-        Step::HeldUpdate,
-        Step::Shims,
-        Step::ExecRoots,
-        Step::Store,
-    ]
-    .into_iter()
-    .map(|step| {
-        Box::new(Repair {
-            step,
-            ground: Arc::clone(ground),
-            said: Mutex::new(Vec::new()),
-        }) as Box<dyn Item>
-    })
-    .collect()
+    Step::ALL
+        .into_iter()
+        .map(|step| {
+            Box::new(Repair {
+                step,
+                ground: Arc::clone(ground),
+                said: Mutex::new(Vec::new()),
+            }) as Box<dyn Item>
+        })
+        .collect()
+}
+
+/// Whether `id` is one of repair's items' ids ([`items`]), which `aterm pkg repair --only`
+/// names: known before any ground is read, so a call naming another is refused before the
+/// store lock.
+#[must_use]
+pub fn names_an_item(id: &str) -> bool {
+    Step::ALL.iter().any(|step| step.id() == id)
 }
 
 /// One of repair's steps.
@@ -204,6 +204,40 @@ enum Step {
     Shims,
     ExecRoots,
     Store,
+}
+
+impl Step {
+    /// Every step, in the order [`items`] runs them.
+    const ALL: [Self; 11] = [
+        Self::CopiedCommands,
+        Self::Links,
+        Self::Hooks,
+        Self::Rc,
+        Self::Stubs,
+        Self::RustupSeam,
+        Self::RustupLocal,
+        Self::HeldUpdate,
+        Self::Shims,
+        Self::ExecRoots,
+        Self::Store,
+    ];
+
+    /// This step's [`Item::id`].
+    const fn id(self) -> &'static str {
+        match self {
+            Self::CopiedCommands => COPIED_COMMANDS,
+            Self::Links => LINKS,
+            Self::Hooks => HOOKS,
+            Self::Rc => RC,
+            Self::Stubs => STUBS,
+            Self::RustupSeam => RUSTUP_SEAM,
+            Self::RustupLocal => RUSTUP_LOCAL,
+            Self::HeldUpdate => HELD_UPDATE,
+            Self::Shims => SHIMS,
+            Self::ExecRoots => EXEC_ROOTS,
+            Self::Store => STORE,
+        }
+    }
 }
 
 struct Repair {
@@ -264,6 +298,28 @@ impl Repair {
             .as_deref()
             .ok_or_else(|| "$HOME is unknown".to_owned())
     }
+
+    /// The rc rows' folders: `$HOME`, and zsh's ([`Ground::zsh`]).
+    #[cfg(unix)]
+    fn rc_home(&self) -> Result<crate::hooks::RcHome, String> {
+        Ok(crate::hooks::RcHome {
+            home: self.home()?.to_path_buf(),
+            zsh: self.ground.zsh.clone(),
+        })
+    }
+}
+
+/// What the rc step says of zsh's row while zsh's folder is unknown.
+#[cfg(unix)]
+fn zsh_folder_unknown(zsh: &crate::zdotdir::ZshDir) -> String {
+    let why = match zsh {
+        crate::zdotdir::ZshDir::Unknown(why) => why.as_str(),
+        crate::zdotdir::ZshDir::Home | crate::zdotdir::ZshDir::At(_) => "",
+    };
+    format!(
+        "zsh's .zshrc left alone — which folder zsh reads it from is unknown ({why}); source \
+         ~/.aterm/shell.d from it yourself, or use the export line `aterm pkg doctor` prints"
+    )
 }
 
 fn change(from: impl Into<String>, to: impl Into<String>) -> Probe {
@@ -295,20 +351,7 @@ fn shown(paths: &[PathBuf]) -> String {
 
 impl Item for Repair {
     fn id(&self) -> String {
-        match self.step {
-            Step::CopiedCommands => COPIED_COMMANDS,
-            Step::Links => LINKS,
-            Step::Hooks => HOOKS,
-            Step::Rc => RC,
-            Step::Stubs => STUBS,
-            Step::RustupSeam => RUSTUP_SEAM,
-            Step::RustupLocal => RUSTUP_LOCAL,
-            Step::HeldUpdate => HELD_UPDATE,
-            Step::Shims => SHIMS,
-            Step::ExecRoots => EXEC_ROOTS,
-            Step::Store => STORE,
-        }
-        .to_owned()
+        self.step.id().to_owned()
     }
 
     fn family(&self) -> &'static str {
@@ -648,26 +691,31 @@ impl Repair {
 
     /// The absent login rc ([`Ground::login_rc`], [`crate::hooks::absent_login_rc`]).
     #[cfg(unix)]
-    fn absent_login_rc(&self, home: &Path) -> Option<(&'static str, crate::hooks::RcState)> {
+    fn absent_login_rc(
+        &self,
+        rcs: &crate::hooks::RcHome,
+    ) -> Option<(&'static str, crate::hooks::RcState)> {
         let rc = self.ground.login_rc?;
-        crate::hooks::absent_login_rc(home, rc).map(|state| (rc, state))
+        crate::hooks::absent_login_rc(rcs, rc).map(|state| (rc, state))
     }
 
     /// The rc files a pass of this kind would wire now.
     #[cfg(unix)]
-    fn rc_to_wire(&self, home: &Path) -> Vec<&'static str> {
+    fn rc_to_wire(&self, rcs: &crate::hooks::RcHome) -> Vec<&'static str> {
         use crate::hooks::RcState;
-        crate::hooks::rc_wiring(home)
+        crate::hooks::rc_wiring(rcs)
             .into_iter()
-            .chain(self.absent_login_rc(home))
+            .chain(self.absent_login_rc(rcs))
             .filter(|(rc, state)| {
                 crate::hooks::RC_FILES.iter().any(|(row, _)| row == rc)
                     && match state {
                         RcState::Unwired => true,
                         RcState::OptedOut => self.ground.pass == Pass::Repair,
-                        RcState::Wired | RcState::SourcedElsewhere | RcState::ConsentFenced => {
-                            false
-                        }
+                        RcState::Wired
+                        | RcState::SourcedElsewhere
+                        | RcState::HistoryUnreadable
+                        | RcState::ConsentFenced
+                        | RcState::ZshFolderUnknown => false,
                     }
             })
             .map(|(rc, _)| rc)
@@ -698,11 +746,11 @@ impl Repair {
         if let Some(why) = self.other_bundle() {
             return not_applicable(why);
         }
-        let Ok(home) = self.home() else {
+        let Ok(rcs) = self.rc_home() else {
             return blocked("$HOME is unknown, so no rc file can be read");
         };
-        let absent = self.absent_login_rc(home);
-        let wire = self.rc_to_wire(home);
+        let absent = self.absent_login_rc(&rcs);
+        let wire = self.rc_to_wire(&rcs);
         if !wire.is_empty() {
             if let Err(why) = self.require_current_hooks() {
                 return Probe::Waits {
@@ -713,9 +761,9 @@ impl Repair {
             let (create, edit): (Vec<&str>, Vec<&str>) = wire
                 .iter()
                 .partition(|rc| absent.is_some_and(|(login, _)| login == **rc));
-            let names = |rcs: &[&str]| -> String {
-                rcs.iter()
-                    .map(|rc| format!("~/{rc}"))
+            let names = |rows: &[&str]| -> String {
+                rows.iter()
+                    .map(|rc| rcs.shown(rc))
                     .collect::<Vec<_>>()
                     .join(", ")
             };
@@ -734,14 +782,15 @@ impl Repair {
             }
             return change(from.join("; "), to.join("; "));
         }
-        let wiring = crate::hooks::rc_wiring(home);
-        let stands = crate::hooks::RC_FILES
-            .iter()
-            .any(|(rc, _)| std::fs::symlink_metadata(home.join(rc)).is_ok());
+        let wiring = crate::hooks::rc_wiring(&rcs);
+        let stands = crate::hooks::RC_FILES.iter().any(|(rc, _)| {
+            rcs.path(rc)
+                .is_some_and(|path| std::fs::symlink_metadata(path).is_ok())
+        });
         if wiring.is_empty() && !stands && absent.is_none() {
             let names: Vec<String> = crate::hooks::RC_FILES
                 .iter()
-                .map(|(rc, _)| format!("~/{rc}"))
+                .map(|(rc, _)| rcs.shown(rc))
                 .collect();
             return not_applicable(format!(
                 "none of {} exists and your login shell reads none of them, so no rc is wired \
@@ -751,43 +800,59 @@ impl Repair {
         }
         let mut now: Vec<String> = Vec::new();
         if let Some((rc, state)) = absent {
+            let shown = rcs.shown(rc);
             match state {
+                RcState::HistoryUnreadable => now.push(format!(
+                    "{shown} left absent — shell wiring history is unreadable"
+                )),
                 RcState::OptedOut => now.push(format!(
-                    "~/{rc} left absent — you deleted the one atpkg made for your login shell \
+                    "{shown} left absent — you deleted the one atpkg made for your login shell \
                      (`aterm pkg repair` makes it again)"
                 )),
                 RcState::ConsentFenced => now.push(format!(
-                    "~/{rc} not made — its folder resolves under one macOS guards with a consent \
-                     dialog, which no atpkg pass opens; source ~/.aterm/shell.d from your login \
-                     shell's rc yourself, or use the export line `aterm pkg doctor` prints"
+                    "{shown} not made — its folder resolves under one macOS guards with a \
+                     consent dialog, which no atpkg pass opens; source ~/.aterm/shell.d from \
+                     your login shell's rc yourself, or use the export line `aterm pkg doctor` \
+                     prints"
                 )),
-                RcState::Wired | RcState::SourcedElsewhere | RcState::Unwired => {}
+                RcState::Wired
+                | RcState::SourcedElsewhere
+                | RcState::Unwired
+                | RcState::ZshFolderUnknown => {}
             }
         }
         for (rc, state) in &wiring {
+            let shown = rcs.shown(rc);
             match state {
+                RcState::HistoryUnreadable => now.push(format!(
+                    "{shown} left unchanged — shell wiring history is unreadable"
+                )),
                 RcState::OptedOut => now.push(format!(
-                    "~/{rc} left alone — you deleted atpkg's block (`aterm pkg repair` lays it \
+                    "{shown} left alone — you deleted atpkg's block (`aterm pkg repair` lays it \
                      again)"
                 )),
                 RcState::ConsentFenced => now.push(format!(
-                    "~/{rc} left alone — it resolves under a folder macOS guards with a consent \
-                     dialog (Documents, Desktop, Downloads, iCloud Drive, a sync provider's \
-                     folder, a mounted volume), which no atpkg pass opens; source \
+                    "{shown} left alone — it resolves under a folder macOS guards with a \
+                     consent dialog (Documents, Desktop, Downloads, iCloud Drive, a sync \
+                     provider's folder, a mounted volume), which no atpkg pass opens; source \
                      ~/.aterm/shell.d from it yourself, or use the export line `aterm pkg \
                      doctor` prints"
                 )),
+                RcState::ZshFolderUnknown => now.push(zsh_folder_unknown(&rcs.zsh)),
                 RcState::Wired | RcState::SourcedElsewhere | RcState::Unwired => {}
             }
         }
         for (rc, _) in crate::hooks::RC_FILES {
-            if std::fs::symlink_metadata(home.join(rc)).is_ok()
+            if rcs
+                .path(rc)
+                .is_some_and(|path| std::fs::symlink_metadata(path).is_ok())
                 && !wiring.iter().any(|(wired, _)| wired == &rc)
             {
                 now.push(format!(
-                    "~/{rc} left alone — atpkg edits only a regular file it can read as UTF-8 \
+                    "{} left alone — atpkg edits only a regular file it can read as UTF-8 \
                      (a dangling link, a directory, a FIFO or device, or other bytes is never \
-                     touched)"
+                     touched)",
+                    rcs.shown(rc)
                 ));
             }
         }
@@ -806,7 +871,7 @@ impl Repair {
     #[cfg(unix)]
     fn apply_rc(&self) -> Result<(), String> {
         use crate::hooks::{RcOutcome, RcWiring};
-        let home = self.home()?;
+        let rcs = self.rc_home()?;
         self.require_current_hooks()?;
         let wiring = match self.ground.pass {
             Pass::Repair => RcWiring::Rewire,
@@ -814,28 +879,31 @@ impl Repair {
         };
         let mut failed = Vec::new();
         for (rc, outcome) in
-            crate::hooks::ensure_rc_sources_hooks(home, wiring, self.ground.login_rc)
+            crate::hooks::ensure_rc_sources_hooks(&rcs, wiring, self.ground.login_rc)
         {
+            let shown = rcs.shown(rc);
             match outcome {
                 RcOutcome::Appended => self.say([format!(
-                    "appended atpkg's block to ~/{rc} (it sources ~/.aterm/shell.d; delete the \
-                     block to opt out)"
+                    "appended atpkg's block to {shown} (it sources ~/.aterm/shell.d; delete \
+                     the block to opt out)"
                 )]),
                 RcOutcome::Created => self.say([format!(
-                    "created ~/{rc}, the rc your login shell reads, holding atpkg's block (it \
+                    "created {shown}, the rc your login shell reads, holding atpkg's block (it \
                      sources ~/.aterm/shell.d; delete the block or the file to opt out)"
                 )]),
                 RcOutcome::RelaidOverOptOut => self.say([format!(
-                    "re-laid atpkg's block in ~/{rc} — you had deleted it; delete it again to \
+                    "re-laid atpkg's block in {shown} — you had deleted it; delete it again to \
                      opt out (install and update passes then leave it deleted)"
                 )]),
                 RcOutcome::WriteFailed => failed.push(format!(
-                    "~/{rc} could NOT be rewritten (the file or its directory refused the write)"
+                    "{shown} could NOT be rewritten (the file or its directory refused the \
+                     write)"
                 )),
                 RcOutcome::AlreadyWired
                 | RcOutcome::OptOutKept
                 | RcOutcome::ConsentFenced
-                | RcOutcome::Unreadable => {}
+                | RcOutcome::Unreadable
+                | RcOutcome::ZshFolderUnknown => {}
             }
         }
         if failed.is_empty() {

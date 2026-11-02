@@ -1264,6 +1264,21 @@ fn checkpoint_case(prior: bool, after_checkpoint: bool) -> [[(&'static str, i64)
     if after_checkpoint {
         std::fs::rename(&host.ledger, host.ledger.with_extension("obstruction")).unwrap();
         std::fs::rename(host.ledger.with_extension("retained"), &host.ledger).unwrap();
+        // Retrying the explicit command first recovers the completed local login,
+        // without invoking a second provider flow or waiting for another root grant.
+        assert_ne!(shared_run(&env, &host.base, 2), ExitCode::SUCCESS);
+        assert!(matches!(
+            store
+                .load_logins(host.now())
+                .unwrap()
+                .0
+                .shared
+                .latest(source)
+                .unwrap()
+                .outcome,
+            accounts::shared::Outcome::Published { .. }
+        ));
+        assert_eq!(host.base.calls.get(), 1);
     }
     approval.live.set(false);
     let recover = || {
@@ -1272,9 +1287,10 @@ fn checkpoint_case(prior: bool, after_checkpoint: bool) -> [[(&'static str, i64)
             &store,
             &env.accounts_roster().unwrap(),
             host.now(),
+            crate::harness::accounts_sync::shared_renewal::CheckpointAuthority::Explicit(&approval),
         )
     };
-    assert_eq!(recover(), after_checkpoint);
+    assert!(!recover());
     let recovered = store.load_logins(host.now()).unwrap().0;
     assert_eq!(host.base.calls.get(), 1);
     let images = || {

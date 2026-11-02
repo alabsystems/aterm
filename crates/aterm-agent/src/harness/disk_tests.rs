@@ -117,6 +117,7 @@ fn real(now: i64) -> impl FnMut(&Row) -> std::io::Result<Removed> {
             device: None,
             volume: None,
         },
+        None,
         idle::Sessions::default,
     )
 }
@@ -1635,6 +1636,7 @@ fn remove_idle_whole(
             device: None,
             volume: target::VolumeGuid::of_path_now(&row.path),
         },
+        None,
         |_: &[PathBuf], _: &[u32]| Ok(aterm_uds::holders::PathScan::default()),
         |_| Ok(discover::Running::default()),
         sessions,

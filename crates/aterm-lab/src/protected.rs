@@ -95,6 +95,8 @@ const LIST: &[(Kind, Base, &str)] = &[
     (Kind::Subpath, Base::Home, ".aterm"),
     (Kind::Subpath, Base::Home, ".secrets"),
     (Kind::Subpath, Base::Home, ".local/share/muse"),
+    (Kind::Subpath, Base::Home, ".grok"),
+    (Kind::Prefix, Base::Home, ".kimi"),
     (Kind::Prefix, Base::Home, ".antigravity"),
     (Kind::Literal, Base::Home, ".netrc"),
     (Kind::Literal, Base::Home, ".npmrc"),
@@ -231,6 +233,38 @@ mod tests {
             "prefix\t/Users//o/Library/Application Support/Antigravity\n",
             "prefix\t/Users//o/.antigravity\n",
         ] {
+            assert!(lines.contains(want), "{want}");
+        }
+    }
+
+    /// Grok Build's home and Kimi Code's current and legacy homes are protected;
+    /// siblings of the Grok home and unrelated Kimi folders are not.
+    #[test]
+    fn grok_build_s_and_kimi_code_s_own_data_are_on_the_list() {
+        let h = "/Users//o";
+        for p in [
+            "/Users//o/.grok",
+            "/Users//o/.grok/auth.json",
+            "/Users//o/.kimi",
+            "/Users//o/.kimi/config.toml",
+            "/Users//o/.kimi-code/credentials",
+            "/Users//o/.kimi-code/config.toml",
+            "/Users//o/.kimi-code/credentials/kimi-code.json",
+            "/Users//o/.kimi/.migrated-to-kimi-code",
+        ] {
+            assert!(inside_protected(p, h, CCSOCKS), "{p}");
+        }
+        for p in [
+            "/Users//o/.grokx",
+            "/Users//o/Developer/grok",
+            "/Users//o/.grokker",
+            "/Users//o/.local/share/kimi",
+            "/Users//o/kimi",
+        ] {
+            assert!(!inside_protected(p, h, CCSOCKS), "{p}");
+        }
+        let lines = render_lines(h, CCSOCKS);
+        for want in ["subpath\t/Users//o/.grok\n", "prefix\t/Users//o/.kimi\n"] {
             assert!(lines.contains(want), "{want}");
         }
     }

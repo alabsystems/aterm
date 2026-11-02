@@ -6,6 +6,7 @@
 //! here never compiles. Each test starts its own `FakeGithub`.
 
 mod faults;
+mod git_http;
 mod raw;
 mod routes;
 mod writes;

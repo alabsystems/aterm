@@ -77,15 +77,15 @@ impl StrokeDetector {
             });
             return false;
         };
-        let elapsed = now.saturating_duration_since(previous.moved_at);
         if point == previous.point {
             // Frames repeat this sample between real pointer events: keep the
             // last movement's timestamp, or a slow sparse event lands as a dash.
-            if elapsed > MAX_GAP {
+            if self.travel > 0.0 && now.saturating_duration_since(previous.moved_at) > MAX_GAP {
                 self.travel = 0.0;
             }
             return false;
         }
+        let elapsed = now.saturating_duration_since(previous.moved_at);
         self.last = Some(Sample {
             point,
             moved_at: now,

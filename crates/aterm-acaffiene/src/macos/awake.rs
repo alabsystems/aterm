@@ -6,9 +6,9 @@
 use aterm_objc::send::{send_id, send_id_usize_id, send_v_id};
 use aterm_objc::{Id, Obj, autoreleasepool, class, sel};
 
-/// What `pmset -g assertions` names the activity: the mug's, and a bridge's across an update
+/// What the power manager names the activity: the mug's, and a bridge's across an update
 /// restart ([`mod@super::bridge`]).
-pub(super) const AWAKE_REASON: &str = "aterm aCaffiene is keeping this Mac awake";
+pub(super) const AWAKE_REASON: &str = crate::held::AWAKE_REASON;
 const IDLE_DISPLAY_SLEEP_DISABLED: usize = 1 << 40;
 const USER_INITIATED: usize = 0x00FF_FFFF;
 const OPTIONS: usize = IDLE_DISPLAY_SLEEP_DISABLED | USER_INITIATED;
@@ -88,27 +88,16 @@ pub(super) mod tests {
         drop(second);
     }
 
-    /// The assertion types `pmset -g assertions` lists under this pid named `reason`.
+    /// The assertion types the power manager lists under this pid named `reason`.
     pub(crate) fn assertions_named(reason: &str) -> Vec<String> {
-        let out = aterm_uds::spawnfd::command("/usr/bin/pmset")
-            .args(["-g", "assertions"])
-            .output()
-            .expect("pmset");
-        assert!(out.status.success(), "pmset: {:?}", out.status);
-        let owner = format!("pid {}(", std::process::id());
-        let named = format!("named: \"{reason}\"");
-        String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .filter(|l| l.contains(&owner) && l.contains(&named))
-            .filter_map(|l| l.split("] ").nth(1))
-            .filter_map(|rest| rest.split_whitespace().nth(1))
-            .map(str::to_string)
-            .collect()
+        let held = aterm_sysprobe::power::assertions_of(std::process::id())
+            .expect("the power manager answers");
+        crate::held::assertion_types(&held, reason)
     }
 
     #[test]
     fn powerd_lists_both_assertions_while_held_and_none_after() {
-        let reason = format!("aterm acaffiene pmset test {}", std::process::id());
+        let reason = format!("aterm acaffiene assertion test {}", std::process::id());
         let held = Awake::begin(&reason).expect("begin");
         let mut while_held = assertions_named(&reason);
         while_held.sort();

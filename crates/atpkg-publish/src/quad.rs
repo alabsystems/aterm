@@ -168,7 +168,12 @@ pub fn head_number(releases: &[crate::host::Release]) -> Option<u64> {
     releases
         .iter()
         .filter(|r| !r.draft)
-        .filter_map(|r| r.tag.strip_prefix("atpkg-index-")?.parse::<u64>().ok())
+        .filter_map(|r| {
+            let s = r.tag.strip_prefix("atpkg-index-")?;
+            (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| s.parse::<u64>().ok())
+                .flatten()
+        })
         .max()
 }
 
@@ -281,4 +286,23 @@ pub fn fetch_head_with(
     Err(Error::cannot_run(format!(
         "could not download {tag} from {slug}: {last}"
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn head_number_rejects_signed_tag_suffix() {
+        let rel = |tag: &str| crate::host::Release {
+            tag: tag.to_string(),
+            draft: false,
+            prerelease: false,
+            assets: Vec::new(),
+        };
+        assert_eq!(
+            head_number(&[rel("atpkg-index-5"), rel("atpkg-index-+99")]),
+            Some(5)
+        );
+    }
 }

@@ -96,7 +96,8 @@ pub enum Named {
     Default,
 }
 
-/// A repository typed as `OWNER/NAME` on this command line.
+/// A literal `OWNER/NAME` destination: typed on agh's command line ([`Provenance::Argv`]) or
+/// made by [`Router::grant`] from a `[[writers]]` row ([`Provenance::Granted`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExplicitTarget {
     slug: Slug,
@@ -635,12 +636,18 @@ impl Router {
     #[inline]
     #[must_use]
     pub fn profile(&self, name: &str) -> Option<&Profile> {
+        if let Some(single) = &self.single {
+            return (single.name == name).then_some(single);
+        }
         self.validated.as_ref()?.profiles.get(name)
     }
 
     /// Every profile, sorted by name.
     #[must_use]
     pub fn profiles(&self) -> Vec<&Profile> {
+        if let Some(single) = &self.single {
+            return vec![single];
+        }
         self.validated
             .as_ref()
             .map(|v| v.profiles.values().collect())
@@ -654,7 +661,18 @@ impl Router {
         self.validated.as_ref()?.targets.get(name)
     }
 
-    /// THE decision, with its two decide-time tier walls.
+    /// THE decision, with its two decide-time tier walls: a [`Router::single_identity`]
+    /// router's (`decide_single`), or an agh.toml router's (`decide_routed`, the one
+    /// `AghRouteWall` models).
+    #[must_use]
+    pub fn decide(&self, req: &RouteRequest, presence: &dyn Fn(&str) -> Presence) -> Decision {
+        if let Some(single) = &self.single {
+            return Self::decide_single(single, req, presence);
+        }
+        self.decide_routed(req, presence)
+    }
+
+    /// An agh.toml router's decision (or an empty router's): `AghRouteWall`'s `Decide`.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -663,11 +681,86 @@ impl Router {
             project = "agh::policy::project_decision"
         )
     )]
-    #[must_use]
-    pub fn decide(&self, req: &RouteRequest, presence: &dyn Fn(&str) -> Presence) -> Decision {
+    fn decide_routed(&self, req: &RouteRequest, presence: &dyn Fn(&str) -> Presence) -> Decision {
         match req.access {
             Access::Read => self.decide_read(req, presence),
             Access::WriterRead | Access::Write => self.decide_writer(req, presence),
+        }
+    }
+
+    /// A [`Router::single_identity`] router's decision: the identity alone, at any access, as
+    /// its one profile, which is never release tier; every other target is refused
+    /// `UnscopedNotRead`. `--anonymous` is judged first, as the general router judges it (it
+    /// sends no token), then the release tier, which is `TierMismatch` at every target, then
+    /// the target and `--as` (another profile is `profile_unknown`).
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            reason = "the single_identity router (machines' users().keys()) sends the identity at any access with no --as, which AghRouteWall's Decide forbids the agh.toml router; tests/inline_source.rs pins it"
+        )
+    )]
+    fn decide_single(
+        single: &Profile,
+        req: &RouteRequest,
+        presence: &dyn Fn(&str) -> Presence,
+    ) -> Decision {
+        if req.anonymous {
+            return if req.access == Access::Read {
+                Decision::Anonymous {
+                    why: AnonymousWhy::Asked,
+                }
+            } else {
+                refuse(
+                    RefusalCode::AnonymousWriterRead,
+                    "--anonymous cannot read drafts or write".to_string(),
+                    "drop --anonymous".to_string(),
+                    Vec::new(),
+                )
+            };
+        }
+        let name = single.name.as_str();
+        if single.tier == Tier::Release {
+            return refuse(
+                RefusalCode::TierMismatch,
+                format!(
+                    "{name} is release tier, and a single-identity client is never release tier"
+                ),
+                crate::config::POLICY_CHECK.to_string(),
+                Vec::new(),
+            );
+        }
+        if req.target != RouteTarget::Identity {
+            return refuse(
+                RefusalCode::UnscopedNotRead,
+                "this client speaks for one identity, and reaches only /user".to_string(),
+                "use a client routed by agh.toml for a repository".to_string(),
+                Vec::new(),
+            );
+        }
+        if let Some(asked) = &req.as_profile
+            && asked != name
+        {
+            return unknown_profile(asked);
+        }
+        let judged = presence(name);
+        let tried = vec![(ChainStep::Profile(name.to_string()), judged)];
+        match judged {
+            Presence::Present => Decision::Send {
+                profile: name.to_string(),
+                tier: single.tier,
+            },
+            Presence::Absent => refuse(
+                RefusalCode::WriterAbsent,
+                format!("the identity's profile {name} is absent"),
+                "agh auth status".to_string(),
+                tried,
+            ),
+            Presence::Unusable(slug) => refuse(
+                RefusalCode::WriterUnusable,
+                format!("the identity's profile {name} is unusable: {slug}"),
+                "agh auth status".to_string(),
+                tried,
+            ),
         }
     }
 
@@ -977,8 +1070,9 @@ impl Permit {
         self.tier
     }
 
-    /// How the destination was named: `None` for a write that needed no literal (a dev-tier
-    /// owner's, or an identity write under `single_identity`).
+    /// How the destination was named: `None` for a write that carried no literal of its own
+    /// repository (a dev-tier owner's with none, or with another repository's, or an identity
+    /// write under `single_identity`).
     #[must_use]
     pub fn provenance(&self) -> Option<Provenance> {
         self.provenance
@@ -1006,10 +1100,29 @@ impl Permit {
     /// decodes, and answers `false` for one.
     #[must_use]
     pub fn covers(&self, path: &str) -> bool {
-        // WP1 writes the body (plan §5, body 7); until then no path is covered, so the
-        // transport guard refuses every write.
-        let _ = path;
-        false
+        let Some(rest) = path.strip_prefix('/') else {
+            return false;
+        };
+        let mut segments = Vec::new();
+        for raw in rest.split('/') {
+            if raw.is_empty() || !escapes_well_formed(raw) {
+                return false;
+            }
+            let decoded = aterm_codec::pct::decode(raw);
+            if decoded == "." || decoded == ".." || decoded.contains('/') {
+                return false;
+            }
+            segments.push(decoded);
+        }
+        let is = |at: usize, want: &str| {
+            segments
+                .get(at)
+                .is_some_and(|segment| segment.eq_ignore_ascii_case(want))
+        };
+        match &self.target {
+            PermitTarget::Repo(slug) => is(0, "repos") && is(1, slug.owner()) && is(2, slug.repo()),
+            PermitTarget::Identity => is(0, "user"),
+        }
     }
 
     /// The naming the permit's write was routed with: `Named::Literal` of its literal, or
@@ -1030,13 +1143,43 @@ impl Router {
     /// # Errors
     ///
     /// - Refused `not_granted` (`Sub::Policy(RefusalCode::NotGranted)`), next
-    ///   `a person runs: agh policy grant {caller} {slug}`, when no `[[writers]]` row of
+    ///   `agh policy grant {caller} {slug}`, when no `[[writers]]` row of
     ///   `caller` lists `slug` (ASCII case-insensitive), or this router's `Validated` did not
     ///   come from a file (`ConfigOrigin::Text`), or it has none;
     /// - Usage when `caller` is not `[a-z][a-z0-9-]{0,31}`.
     pub fn grant(&self, caller: &str, slug: &Slug) -> Result<ExplicitTarget> {
-        let _ = (caller, slug);
-        Err(Error::not_yet("Router::grant", "WP1"))
+        if let Some(fault) = crate::config::caller_fault(caller) {
+            return Err(Error::usage(fault));
+        }
+        let why = match &self.validated {
+            None => {
+                format!("{caller} has no grant for {slug}: no agh.toml stands behind this client")
+            }
+            Some(v) if v.origin() != ConfigOrigin::File => format!(
+                "{caller} has no grant for {slug}: a grant counts only in agh.toml read from the owner's file"
+            ),
+            Some(v) => {
+                let listed = v
+                    .writers()
+                    .iter()
+                    .any(|(row, repos)| row == caller && repos.iter().any(|repo| repo == slug));
+                if listed {
+                    return Ok(ExplicitTarget {
+                        slug: slug.clone(),
+                        provenance: Provenance::Granted,
+                        grant: Some(caller.to_string()),
+                    });
+                }
+                format!("no [[writers]] row of {caller} lists {slug}")
+            }
+        };
+        Err(Refusal {
+            code: RefusalCode::NotGranted,
+            why,
+            next: format!("agh policy grant {caller} {slug}"),
+            tried: Vec::new(),
+        }
+        .into_error(Some(slug)))
     }
 
     /// A write permit for `req`, which must be a Write: refused unless `decide(req)` sends.
@@ -1057,8 +1200,7 @@ impl Router {
         req: &RouteRequest,
         presence: &dyn Fn(&str) -> Presence,
     ) -> Result<Permit> {
-        let _ = (req, presence);
-        Err(Error::not_yet("Router::permit", "WP1"))
+        self.permit_decided(req, self.decide(req, presence))
     }
 
     /// [`Router::permit`] over a decision already made: `permit` is
@@ -1070,15 +1212,64 @@ impl Router {
     ///
     /// As [`Router::permit`].
     pub(crate) fn permit_decided(&self, req: &RouteRequest, decision: Decision) -> Result<Permit> {
-        let _ = (req, decision);
-        Err(Error::not_yet("Router::permit_decided", "WP1"))
+        if req.access != Access::Write {
+            return Err(Error::usage(format!(
+                "a permit is for a write; this request is {}",
+                req.access.slug()
+            )));
+        }
+        let (target, repo) = match &req.target {
+            RouteTarget::Repo(slug) => (PermitTarget::Repo(slug.clone()), Some(slug)),
+            RouteTarget::Identity => (PermitTarget::Identity, None),
+            RouteTarget::Owner(_) | RouteTarget::Unscoped => {
+                let refusal = Refusal {
+                    code: RefusalCode::UnscopedNotRead,
+                    why: "a write reaches one repository or the identity, never an owner or an \
+                          unscoped path"
+                        .to_string(),
+                    next: "use a repository path".to_string(),
+                    tried: Vec::new(),
+                };
+                return Err(refusal.into_error(None));
+            }
+        };
+        let (profile, tier) = match decision {
+            Decision::Send { profile, tier } => (profile, tier),
+            Decision::Refuse(refusal) => return Err(refusal.into_error(repo)),
+            Decision::Anonymous { .. } => {
+                let refusal = Refusal {
+                    code: RefusalCode::WriteNone,
+                    why: "a write is never sent anonymously".to_string(),
+                    next: format!("agh whoami --for {} --op write", Self::repo_label(req)),
+                    tried: Vec::new(),
+                };
+                return Err(refusal.into_error(repo));
+            }
+        };
+        let literal = match (&req.named, &req.target) {
+            (Named::Literal(typed), RouteTarget::Repo(slug)) if typed.slug() == slug => {
+                Some(typed.clone())
+            }
+            _ => None,
+        };
+        Ok(Permit {
+            target,
+            profile,
+            tier,
+            provenance: literal.as_ref().map(ExplicitTarget::provenance),
+            grant: literal
+                .as_ref()
+                .and_then(|t| t.granted_to().map(str::to_string)),
+            literal,
+        })
     }
 
     /// A router over one profile (an inline source, §6.1). It routes Identity targets only;
     /// every Repo, Owner or Unscoped target is refused `UnscopedNotRead`.
     /// A Write on an Identity target (machines' `users().keys()`) is sent only under this
-    /// router, with its one profile; a release-tier profile is refused `TierMismatch`, and
-    /// `AghRouteWall`'s M2 `ident` variable carries the rule, with its mutant.
+    /// router, with its one profile; a release-tier profile is refused `TierMismatch` at every
+    /// target. This router is outside `AghRouteWall` (its `ident` rule binds the agh.toml
+    /// router), and `tests/inline_source.rs` pins its decisions.
     #[must_use]
     pub fn single_identity(profile: Profile) -> Router {
         Router {
@@ -1103,6 +1294,17 @@ impl Router {
             .map(|v| v.writers().to_vec())
             .unwrap_or_default()
     }
+}
+
+/// Whether every `%` in `segment` is followed by two hex digits: `pct::decode` passes a
+/// malformed escape through unchanged, so [`Permit::covers`] judges it first.
+fn escapes_well_formed(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    bytes.iter().enumerate().all(|(i, b)| {
+        *b != b'%'
+            || (bytes.get(i + 1).is_some_and(u8::is_ascii_hexdigit)
+                && bytes.get(i + 2).is_some_and(u8::is_ascii_hexdigit))
+    })
 }
 
 /// A refusal with its code, texts and judged steps.
@@ -1160,7 +1362,7 @@ pub const fn project_decision(decision: &Decision) -> (i64, i64) {
     }
 }
 
-/// The host of the sixteen `spec_unmodeled` waivers of `AghRouteWall` .
+/// The host of the twenty-one `spec_unmodeled` waivers of `AghRouteWall`.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::spec_unmodeled(
@@ -1183,6 +1385,30 @@ pub const fn project_decision(decision: &Decision) -> (i64, i64) {
         machine = "AghRouteWall",
         action = "ToggleNamed",
         reason = "Bounded nondeterministic environment selection: whether the slug was typed literally"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AghRouteWall",
+        action = "ToggleGranted",
+        reason = "Bounded nondeterministic environment selection: whether Router::grant made the literal from a [[writers]] row"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AghRouteWall",
+        action = "ToggleRelRead",
+        reason = "Bounded nondeterministic environment selection: whether the release profile heads the release owner's read chain"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AghRouteWall",
+        action = "ToggleIdent",
+        reason = "Bounded nondeterministic environment selection: whether the target is the identity (/user)"
     )
 )]
 #[cfg_attr(
@@ -1229,7 +1455,7 @@ pub const fn project_decision(decision: &Decision) -> (i64, i64) {
     any(test, debug_assertions),
     aterm_spec_anchor::spec_unmodeled(
         machine = "AghRouteWall",
-        action = "BuggyDecideAlias",
+        action = "BuggyDecideUngranted",
         reason = "Buggy=1 negative control only; the router has no such branch: NamedDestination is held by Decide"
     )
 )]
@@ -1287,6 +1513,22 @@ pub const fn project_decision(decision: &Decision) -> (i64, i64) {
         machine = "AghRouteWall",
         action = "BuggyHopOnWrite",
         reason = "Buggy=1 negative control only; the router has no such branch: NoWriteHop is held by Hop"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AghRouteWall",
+        action = "BuggyRelReadAbroad",
+        reason = "Buggy=1 negative control only; the router has no such branch: ReleaseTokenStaysHome is held by Decide"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AghRouteWall",
+        action = "BuggyIdentityDefault",
+        reason = "Buggy=1 negative control only; the agh.toml router has no such branch, and the single_identity router is outside the model (decide_single is waived): IdentityNamed is held by Decide"
     )
 )]
 #[doc(hidden)]

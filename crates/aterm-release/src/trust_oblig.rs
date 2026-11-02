@@ -210,8 +210,10 @@ impl Record {
         let package = head("package")?;
         let unit = head("unit")?;
         let number = |s: &str, what: &str| {
-            s.parse::<u64>()
-                .map_err(|_| format!("its `{what}` line is not a count"))
+            (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| s.parse::<u64>().ok())
+                .flatten()
+                .ok_or_else(|| format!("its `{what}` line is not a count"))
         };
         let functions = number(&head("functions")?, "functions")?;
         let total = number(&head("total")?, "total")?;
@@ -271,8 +273,10 @@ fn row_of(f: &[&str]) -> std::result::Result<Obligation, String> {
         return Err("not eleven fields".into());
     };
     let n = |s: &str, what: &str| {
-        s.parse::<u32>()
-            .map_err(|_| format!("its {what} `{s}` is not a number"))
+        (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| s.parse::<u32>().ok())
+            .flatten()
+            .ok_or_else(|| format!("its {what} `{s}` is not a number"))
     };
     let span = Span {
         l0: n(l0, "start line")?,
@@ -997,9 +1001,17 @@ pub fn write_record(args: &ReduceArgs) -> std::result::Result<Record, String> {
         args.manifest.as_deref(),
     )
     .and_then(|rec| {
-        let tmp = args.out.with_extension("tsv.tmp");
-        fs::write(&tmp, rec.to_text())
-            .and_then(|()| fs::rename(&tmp, &args.out))
+        let dir = args.out.parent().unwrap_or_else(|| Path::new("."));
+        let write = || -> std::io::Result<()> {
+            fs::create_dir_all(dir)?;
+            let stage = aterm_tempfile::Builder::new()
+                .prefix(".oblig-")
+                .tempdir_in(dir)?;
+            let staged = stage.path().join("record.tsv");
+            fs::write(&staged, rec.to_text())?;
+            fs::rename(&staged, &args.out)
+        };
+        write()
             .map_err(|e| format!("{}: {e}", args.out.display()))
             .map(|()| rec)
     })

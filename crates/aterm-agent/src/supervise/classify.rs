@@ -399,7 +399,10 @@ pub(crate) fn classify_except_rm<S: AsRef<str>>(cmd: &str, python_allow: &[S]) -
     }
 }
 
-/// Verify that `line` uses only plain zsh grammar whose expansions behave as text or paths.
+/// Verify that `line` uses only plain zsh grammar whose expansions behave as text or paths: no
+/// unquoted `^`, and no unquoted `#` but one opening a comment, as a startup may set
+/// `EXTENDED_GLOB` (`^x` any name but `x`, `x#` any run of `x`), which the secret check's globs do
+/// not read.
 pub(crate) fn plain_zsh_line(line: &str) -> Result<(), String> {
     let chars: Vec<char> = line.chars().collect();
     plain_zsh(&chars, 0)
@@ -476,6 +479,11 @@ fn plain_zsh(chars: &[char], depth: u8) -> Result<(), String> {
                     continue;
                 }
                 '`' | '\\' | '(' | ')' | '{' | '}' => return Err(format!("`{c}`")),
+                '^' | '#' => {
+                    return Err(format!(
+                        "an unquoted `{c}` in a word, a glob operator under EXTENDED_GLOB"
+                    ));
+                }
                 '[' if at_start && chars.get(i + 1) == Some(&'[') => return Err("`[[`".into()),
                 '=' if at_start => return Err("a word opening with `=`".into()),
                 '=' if !word.starts_with('-') => return Err(format!("the assignment `{word}=`")),
@@ -1536,7 +1544,20 @@ pub(crate) fn git_subcommand(seg: &[String], git_idx: usize) -> Option<(usize, &
     let mut j = git_idx + 1;
     while j < seg.len() {
         let t = seg[j].as_str();
-        if t == "-C" || t == "-c" || t == "--git-dir" || t == "--work-tree" {
+        let span = redirect_span(t);
+        if span > 0 {
+            j += span;
+        } else if t == "--" {
+            return seg.get(j + 1).map(|s| (j + 1, s.as_str()));
+        } else if matches!(
+            t,
+            "-C" | "-c"
+                | "--git-dir"
+                | "--work-tree"
+                | "--namespace"
+                | "--super-prefix"
+                | "--attr-source"
+        ) {
             j += 2;
         } else if t.starts_with('-') {
             j += 1;
@@ -1569,20 +1590,12 @@ fn danger_scan(segments: &[Vec<String>]) -> Option<String> {
                     return Some(format!("a word after a closing {tok} (zsh may run it)"));
                 }
             }
-            if prog == "xargs" {
-                let mut k = i + 1;
-                while k < seg.len() && seg[k].starts_with('-') {
-                    k += if seg[k] == "-n" || seg[k] == "-I" || seg[k] == "-L" || seg[k] == "-P" {
-                        2
-                    } else {
-                        1
-                    };
-                }
-                if let Some(fed) = seg.get(k).map(|t| program(t))
-                    && matches!(fed, "rm" | "mv" | "cp")
-                {
-                    return Some(format!("xargs {fed}"));
-                }
+            if prog == "xargs"
+                && let Some(k) = xargs_command_at(seg, i, false)
+                && let Some(fed) = seg.get(k).map(|t| program(t))
+                && matches!(fed, "rm" | "mv" | "cp")
+            {
+                return Some(format!("xargs {fed}"));
             }
             if tok == "." && i == 0 {
                 return Some("source".to_string());
@@ -1723,10 +1736,16 @@ fn flag_hazard_at(seg: &[String], i: usize) -> Option<String> {
     if prog == "git" {
         let mut j = i + 1;
         while let Some(t) = seg.get(j).map(String::as_str) {
+            let span = redirect_span(t);
+            if span > 0 {
+                j += span;
+                continue;
+            }
             if t == "-c"
                 || (t.starts_with("-c") && t.len() > 2)
                 || t.starts_with("--config-env")
                 || t.starts_with("--exec-path")
+                || t.starts_with("--attr-source")
             {
                 return Some(format!("git {t} (sets config for the run)"));
             }
@@ -1736,7 +1755,17 @@ fn flag_hazard_at(seg: &[String], i: usize) -> Option<String> {
             if t == "--help" || t == "-h" {
                 return Some(format!("git {t} {GIT_HELP_RUNS}"));
             }
-            if matches!(t, "-C" | "--git-dir" | "--work-tree" | "--namespace") {
+            if t == "--" {
+                break;
+            }
+            if matches!(
+                t,
+                "-C" | "--git-dir"
+                    | "--work-tree"
+                    | "--namespace"
+                    | "--super-prefix"
+                    | "--attr-source"
+            ) {
                 j += 2;
             } else if t.starts_with('-') {
                 j += 1;
@@ -2193,17 +2222,70 @@ fn is_name(tok: &str) -> bool {
 }
 
 fn is_duration(tok: &str) -> bool {
-    let body = tok.trim_end_matches(['s', 'm', 'h', 'd']);
-    !body.is_empty() && body.chars().all(|c| c.is_ascii_digit() || c == '.')
+    let body = tok.strip_suffix(['s', 'm', 'h', 'd']).unwrap_or(tok);
+    body.bytes().any(|b| b.is_ascii_digit())
+        && body.bytes().filter(|&b| b == b'.').count() <= 1
+        && body.bytes().all(|b| b.is_ascii_digit() || b == b'.')
 }
 
 fn is_fragment(head: &str) -> bool {
     head.starts_with('-') || head.starts_with('<') || redirect_target(head).is_some()
 }
 
-const XARGS_VALUE_FLAGS: &[&str] = &[
-    "-n", "-I", "-L", "-P", "-d", "-E", "-s", "-a", "-J", "-R", "-S",
+const XARGS_SHORT_VALUE: &[char] = &['n', 'I', 'L', 'P', 'd', 'E', 's', 'a', 'J', 'R', 'S'];
+
+const XARGS_LONG_VALUE: &[&str] = &[
+    "arg-file",
+    "delimiter",
+    "max-args",
+    "max-chars",
+    "max-procs",
+    "process-slot-var",
 ];
+
+fn xargs_command_at(seg: &[String], xargs_idx: usize, skip_redirects: bool) -> Option<usize> {
+    let mut k = xargs_idx + 1;
+    while k < seg.len() {
+        let t = seg[k].as_str();
+        if skip_redirects {
+            let span = redirect_span(t);
+            if span > 0 {
+                k += span;
+                continue;
+            }
+        }
+        if !t.starts_with('-') || t == "-" {
+            break;
+        }
+        if t == "--" {
+            k += 1;
+            break;
+        }
+        if t.starts_with("--") {
+            k += if !t.contains('=')
+                && XARGS_LONG_VALUE
+                    .iter()
+                    .any(|name| long_option_spells(t, name))
+            {
+                2
+            } else {
+                1
+            };
+            continue;
+        }
+        let mut step = 1;
+        for (at, c) in t[1..].char_indices() {
+            if XARGS_SHORT_VALUE.contains(&c) {
+                if t[1 + at + c.len_utf8()..].is_empty() {
+                    step = 2;
+                }
+                break;
+            }
+        }
+        k += step;
+    }
+    (k < seg.len()).then_some(k)
+}
 
 fn segment_head<S: AsRef<str>>(seg: &[String], python_allow: &[S]) -> Option<String> {
     head_from(seg, 0, true, python_allow)
@@ -2275,7 +2357,46 @@ fn skip_prefixes_at(seg: &[String], mut j: usize, mut keyword: bool) -> (usize, 
         match seg.get(j).map(String::as_str) {
             Some("timeout") => {
                 j += 1;
-                while j < seg.len() && (seg[j].starts_with('-') || is_duration(&seg[j])) {
+                while j < seg.len() {
+                    let t = seg[j].as_str();
+                    let span = redirect_span(t);
+                    if span > 0 {
+                        j += span;
+                        continue;
+                    }
+                    if !t.starts_with('-') {
+                        break;
+                    }
+                    if t == "--" {
+                        j += 1;
+                        break;
+                    }
+                    if t.starts_with("--") {
+                        j += if !t.contains('=')
+                            && (long_option_spells(t, "kill-after")
+                                || long_option_spells(t, "signal"))
+                        {
+                            2
+                        } else {
+                            1
+                        };
+                        continue;
+                    }
+                    let mut step = 1;
+                    for (at, c) in t[1..].char_indices() {
+                        if matches!(c, 'k' | 's') {
+                            if t[1 + at + c.len_utf8()..].is_empty() {
+                                step = 2;
+                            }
+                            break;
+                        }
+                    }
+                    j += step;
+                }
+                while let Some(span) = seg.get(j).map(|t| redirect_span(t)).filter(|&n| n > 0) {
+                    j += span;
+                }
+                if seg.get(j).is_some_and(|t| is_duration(t)) {
                     j += 1;
                 }
                 keyword = false;
@@ -2311,38 +2432,43 @@ fn wrapper(seg: &[String], j: usize) -> Option<Wrapped<'_>> {
         return None;
     }
     match program(tok) {
-        "xargs" => {
-            let mut k = j + 1;
-            while k < seg.len() && seg[k].starts_with('-') && seg[k] != "-" {
-                k += if XARGS_VALUE_FLAGS.contains(&seg[k].as_str()) {
-                    2
-                } else {
-                    1
-                };
-            }
-            Some(Ok((k < seg.len()).then(|| (k, Vec::new()))))
-        }
+        "xargs" => Some(Ok(xargs_command_at(seg, j, true).map(|k| (k, Vec::new())))),
         "env" => {
             let mut k = j + 1;
             let mut dirs = Vec::new();
             while k < seg.len() {
                 let t = seg[k].as_str();
-                if t == "--split-string" || t.starts_with("--split-string=") {
+                let span = redirect_span(t);
+                if span > 0 {
+                    k += span;
+                    continue;
+                }
+                if t == "--split-string"
+                    || t.starts_with("--split-string=")
+                    || long_option_spells(t, "split-string")
+                {
                     return Some(Err("env -S".to_string()));
+                }
+                if t == "--argv0" || t.starts_with("--argv0=") || long_option_spells(t, "argv0") {
+                    return Some(Err("env -a".to_string()));
                 }
                 if t == "--" {
                     k += 1;
                     break;
                 }
-                if let Some(dir) = t.strip_prefix("--chdir=") {
+                if let Some((_, dir)) = t.split_once('=').filter(|_| long_option_spells(t, "chdir"))
+                {
                     dirs.push(dir);
                     k += 1;
                     continue;
                 }
-                if t == "--chdir" || t == "--unset" {
-                    if t == "--chdir"
-                        && let Some(dir) = seg.get(k + 1)
-                    {
+                if !t.contains('=')
+                    && (long_option_spells(t, "chdir") || long_option_spells(t, "unset"))
+                {
+                    if long_option_spells(t, "chdir") {
+                        let Some(dir) = seg.get(k + 1) else {
+                            return Some(Err("env --chdir".to_string()));
+                        };
                         dirs.push(dir.as_str());
                     }
                     k += 2;
@@ -2357,6 +2483,9 @@ fn wrapper(seg: &[String], j: usize) -> Option<Wrapped<'_>> {
                     for (at, c) in t.char_indices().skip(1) {
                         if c == 'S' {
                             return Some(Err("env -S".to_string()));
+                        }
+                        if c == 'a' {
+                            return Some(Err("env -a".to_string()));
                         }
                         if !matches!(c, 'u' | 'C' | 'P') {
                             continue;
@@ -2375,9 +2504,10 @@ fn wrapper(seg: &[String], j: usize) -> Option<Wrapped<'_>> {
                                 value.unwrap_or("")
                             )));
                         }
-                        if c == 'C'
-                            && let Some(dir) = value
-                        {
+                        if c == 'C' {
+                            let Some(dir) = value else {
+                                return Some(Err("env -C".to_string()));
+                            };
                             dirs.push(dir);
                         }
                         break;
@@ -2556,6 +2686,9 @@ fn segment_paths(seg: &[String], exempt: bool, out: &mut Vec<String>) {
         return;
     }
     let args = words(at + 1, seg.len());
+    if matches!(head, "sed" | "gsed") {
+        out.extend(sed_reads(&args));
+    }
     if !exempt {
         args.into_iter().for_each(|w| push_word(w, out));
         return;
@@ -2594,7 +2727,14 @@ fn push_word(w: &str, out: &mut Vec<String>) {
     }
 }
 
+/// Push the paths an awk `program` (`imports` false) or a jq filter (`imports` true) may read:
+/// awk's every string literal, and [`SUBSTITUTION`], a word the secret check refuses as built at
+/// run time, where the program names a file it reads at run time ([`awk_names_files_at_run_time`]);
+/// jq's every `import` or `include` path, also with `.json`.
 fn push_literals(program: &str, imports: bool, out: &mut Vec<String>) {
+    if !imports && awk_names_files_at_run_time(program) {
+        out.push(SUBSTITUTION.to_string());
+    }
     let cs: Vec<char> = program.chars().collect();
     let mut i = 0;
     while i < cs.len() {
@@ -2622,6 +2762,60 @@ fn push_literals(program: &str, imports: bool, out: &mut Vec<String>) {
         }
         i += 1;
     }
+}
+
+/// Whether the awk `program` may read a file whose name it builds at run time: it names `ARGV`,
+/// whose elements name the files it reads after its `BEGIN`, or a `getline`'s `<` (the first
+/// before the statement ends) takes other than one string literal standing alone (`getline l <
+/// f`, `getline < "/a" "b"`, `getline < ("/a")`).
+fn awk_names_files_at_run_time(program: &str) -> bool {
+    if names_awk_word(program, "ARGV") {
+        return true;
+    }
+    let cs: Vec<char> = program.chars().collect();
+    let blank = |j: &mut usize| {
+        while cs.get(*j).is_some_and(|c| *c == ' ' || *c == '\t') {
+            *j += 1;
+        }
+    };
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let word: Vec<char> = "getline".chars().collect();
+    let mut k = 0;
+    while k + word.len() <= cs.len() {
+        let whole = cs[k..k + word.len()] == word[..]
+            && !(k > 0 && ident(cs[k - 1]))
+            && !cs.get(k + word.len()).is_some_and(|c| ident(*c));
+        if !whole {
+            k += 1;
+            continue;
+        }
+        k += word.len();
+        let mut j = k;
+        while j < cs.len() && !matches!(cs[j], '<' | ';' | '\n' | '{' | '}') {
+            j += 1;
+        }
+        if cs.get(j) != Some(&'<') {
+            continue;
+        }
+        j += 1;
+        blank(&mut j);
+        if cs.get(j) != Some(&'"') {
+            return true;
+        }
+        j += 1;
+        while j < cs.len() && cs[j] != '"' {
+            j += if cs[j] == '\\' { 2 } else { 1 };
+        }
+        j += 1;
+        blank(&mut j);
+        if !cs
+            .get(j)
+            .is_none_or(|c| matches!(c, ')' | ';' | '\n' | '}' | '>'))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -2880,7 +3074,14 @@ fn push_value(kind: Val, v: &str, out: &mut Vec<String>) {
     }
 }
 
-fn grammar_paths(g: &Grammar, args: &[&str], out: &mut Vec<String>) {
+/// A word [`grammar_walk`] reads: an option's value of a kind, or an operand where the grammar
+/// takes the next one as `First` (its pattern, program or filter first, then operands).
+enum GrammarWord<'a> {
+    Value(Val, &'a str),
+    Operand(First, &'a str),
+}
+
+fn grammar_walk<'a>(g: &Grammar, args: &[&'a str], mut each: impl FnMut(GrammarWord<'a>)) {
     let options_end = args.iter().position(|a| *a == "--").unwrap_or(args.len());
     let is_option = |k: usize, a: &str| k < options_end && a.starts_with('-') && a.len() > 1;
     let supplied = args.iter().enumerate().any(|(k, a)| {
@@ -2902,11 +3103,14 @@ fn grammar_paths(g: &Grammar, args: &[&str], out: &mut Vec<String>) {
             if let Some(v) = glued
                 && let Some(kind) = kinds.next()
             {
-                push_value(kind, v, out);
+                each(GrammarWord::Value(kind, v));
             }
             for kind in kinds {
-                let Some(next) = args.get(k) else { break };
-                push_value(if seen_operand { Val::Path } else { kind }, next, out);
+                let Some(&next) = args.get(k) else { break };
+                each(GrammarWord::Value(
+                    if seen_operand { Val::Path } else { kind },
+                    next,
+                ));
                 k += 1;
             }
             continue;
@@ -2914,15 +3118,48 @@ fn grammar_paths(g: &Grammar, args: &[&str], out: &mut Vec<String>) {
         if k - 1 == options_end {
             continue;
         }
-        match std::mem::replace(&mut first, First::Operand) {
-            First::Pattern => {}
-            First::Program => push_literals(a, false, out),
-            First::Filter => push_literals(a, true, out),
-            First::Operand if g.operands_read => out.push(a.to_string()),
-            First::Operand => {}
-        }
+        each(GrammarWord::Operand(
+            std::mem::replace(&mut first, First::Operand),
+            a,
+        ));
         seen_operand = true;
     }
+}
+
+fn grammar_paths(g: &Grammar, args: &[&str], out: &mut Vec<String>) {
+    grammar_walk(g, args, |w| match w {
+        GrammarWord::Value(kind, v) => push_value(kind, v, out),
+        GrammarWord::Operand(First::Program, a) => push_literals(a, false, out),
+        GrammarWord::Operand(First::Filter, a) => push_literals(a, true, out),
+        GrammarWord::Operand(First::Operand, a) if g.operands_read => out.push(a.to_string()),
+        GrammarWord::Operand(..) => {}
+    });
+}
+
+/// Whether the grep-family or rg command at `seg[at]` names a file or tree to read, by its
+/// grammar: an operand past its pattern (none when an option supplies the pattern), a word a
+/// redirect takes not counted. `false` for any other program.
+pub(crate) fn grammar_names_operand(seg: &[String], at: usize) -> bool {
+    let g = match program(&seg[at]) {
+        "grep" | "egrep" | "fgrep" => &GREP,
+        "rg" => &RG,
+        _ => return false,
+    };
+    let args = unredirected(seg, at + 1);
+    let mut named = false;
+    grammar_walk(g, &args, |w| {
+        named |= matches!(w, GrammarWord::Operand(First::Operand, _));
+    });
+    named
+}
+
+/// `seg`'s words past `from` that no redirect takes (its operator and its target).
+pub(crate) fn unredirected(seg: &[String], from: usize) -> Vec<&str> {
+    let taken = redirect_paths(seg, &mut Vec::new());
+    (from..seg.len())
+        .filter(|k| !taken[*k])
+        .map(|k| seg[k].as_str())
+        .collect()
 }
 
 fn git_read_writes(sub: &str, args: &[String]) -> bool {
@@ -3041,7 +3278,7 @@ fn head_from<S: AsRef<str>>(
              redirect, a wrapper or `time` it is no keyword: a program named `{head_tok}` runs)"
         ));
     }
-    if is_fragment(head_tok) {
+    if keyword && is_fragment(head_tok) {
         return None;
     }
     if head_tok.contains('$') {
@@ -3670,14 +3907,16 @@ fn names_awk_word(text: &str, word: &str) -> bool {
     })
 }
 
-fn sed_args_write(args: &[String]) -> Option<String> {
+/// The scripts sed's words `args` (after the program) run: each `-e`/`--expression` value,
+/// else its first operand; `Err` naming a script read from a file (`-f`, `--file`).
+fn sed_scripts<S: AsRef<str>>(args: &[S]) -> Result<Vec<&str>, String> {
     let mut scripts: Vec<&str> = Vec::new();
     let mut explicit = false;
     let mut k = 0;
     while k < args.len() {
-        let w = args[k].as_str();
+        let w = args[k].as_ref();
         if w == "-f" || w == "--file" || w.starts_with("--file=") || long_option_spells(w, "file") {
-            return Some("sed -f (a script file)".to_string());
+            return Err("sed -f (a script file)".to_string());
         }
         if w.starts_with("--") && w.contains('=') && long_option_spells(w, "expression") {
             scripts.push(w.split_once('=').map_or("", |(_, s)| s));
@@ -3690,7 +3929,7 @@ fn sed_args_write(args: &[String]) -> Option<String> {
             || (w.starts_with("--") && long_option_spells(w, "expression"))
         {
             if let Some(s) = args.get(k + 1) {
-                scripts.push(s);
+                scripts.push(s.as_ref());
             }
             explicit = true;
             k += 2;
@@ -3701,12 +3940,12 @@ fn sed_args_write(args: &[String]) -> Option<String> {
             let mut consumed_next = false;
             for (idx, c) in cluster.char_indices() {
                 match c {
-                    'f' => return Some("sed -f (a script file)".to_string()),
+                    'f' => return Err("sed -f (a script file)".to_string()),
                     'e' => {
                         let rest = &cluster[idx + 1..];
                         if rest.is_empty() {
                             if let Some(s) = args.get(k + 1) {
-                                scripts.push(s.as_str());
+                                scripts.push(s.as_ref());
                             }
                             consumed_next = true;
                         } else {
@@ -3731,7 +3970,7 @@ fn sed_args_write(args: &[String]) -> Option<String> {
         if w == "--" {
             k += 1;
             if !explicit && let Some(s) = args.get(k) {
-                scripts.push(s);
+                scripts.push(s.as_ref());
             }
             break;
         }
@@ -3744,13 +3983,37 @@ fn sed_args_write(args: &[String]) -> Option<String> {
         }
         break;
     }
+    Ok(scripts)
+}
+
+fn sed_args_write(args: &[String]) -> Option<String> {
+    let scripts = match sed_scripts(args) {
+        Ok(scripts) => scripts,
+        Err(why) => return Some(why),
+    };
     if let Some(s) = scripts.iter().find(|s| s.contains(SUBSTITUTION)) {
         return Some(format!("sed: a script this check cannot read ({s})"));
     }
     scripts.iter().find_map(|s| sed_script_writes(s))
 }
 
+/// The files sed's words `args` (after the program) read by name in its scripts (`r` and `R`),
+/// for the secret check.
+fn sed_reads(args: &[&str]) -> Vec<String> {
+    let mut reads = Vec::new();
+    for script in sed_scripts(args).unwrap_or_default() {
+        sed_script_walk(script, &mut reads);
+    }
+    reads
+}
+
 fn sed_script_writes(script: &str) -> Option<String> {
+    sed_script_walk(script, &mut Vec::new())
+}
+
+/// [`sed_script_writes`], pushing onto `reads` each file the script's `r` and `R` commands read
+/// (the rest of the line after the command and its blanks) as it walks.
+fn sed_script_walk(script: &str, reads: &mut Vec<String>) -> Option<String> {
     let cs: Vec<char> = script.chars().collect();
     let n = cs.len();
     let unparsed = || Some("sed (unparsed script)".to_string());
@@ -3883,7 +4146,17 @@ fn sed_script_writes(script: &str) -> Option<String> {
         i += 1;
         match cmd {
             '{' | '}' => {}
-            '#' | 'a' | 'i' | 'c' | 'r' | 'R' => to_line_end(&mut i),
+            '#' | 'a' | 'i' | 'c' => to_line_end(&mut i),
+            'r' | 'R' => {
+                while i < n && matches!(cs[i], ' ' | '\t') {
+                    i += 1;
+                }
+                let from = i;
+                to_line_end(&mut i);
+                if i > from {
+                    reads.push(cs[from..i].iter().collect());
+                }
+            }
             ':' | 'b' | 't' | 'T' | 'v' => to_command_end(&mut i),
             'w' | 'W' => return Some("sed w (writes a file)".to_string()),
             'e' => return Some("sed e (runs a command)".to_string()),

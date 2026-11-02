@@ -368,18 +368,39 @@ impl ApplicationDelegate {
 
     #[track_caller]
     fn maybe_queue_event(&self, event: Event<HandlePendingUserEvents>) {
+        let origin = super::key_origin::capture();
         if !self.ivars().event_handler.in_use() {
-            self.handle_event(event);
+            self.handle_event_with_origin(event, origin);
         } else {
             tracing::debug!(?event, "had to queue event since another is currently being handled");
             let this = self.retained();
-            self.ivars().run_loop.queue_closure(move || this.handle_event(event));
+            self.ivars()
+                .run_loop
+                .queue_closure(move || this.handle_event_with_origin(event, origin));
         }
     }
 
     #[track_caller]
     fn handle_event(&self, event: Event<HandlePendingUserEvents>) {
-        self.ivars().event_handler.handle_event(event, &ActiveEventLoop::new_root(self.retained()))
+        self.handle_event_with_origin(event, super::key_origin::capture());
+    }
+
+    fn handle_event_with_origin(
+        &self,
+        event: Event<HandlePendingUserEvents>,
+        origin: super::key_origin::Captured,
+    ) {
+        let window_event = matches!(&event, Event::WindowEvent { .. });
+        let deliver = || {
+            self.ivars()
+                .event_handler
+                .handle_event(event, &ActiveEventLoop::new_root(self.retained()));
+        };
+        if window_event {
+            origin.dispatch(deliver);
+        } else {
+            deliver();
+        }
     }
 
     /// Dispatches `NewEvents(Init)` and `Resumed`.

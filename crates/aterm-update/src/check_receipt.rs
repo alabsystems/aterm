@@ -94,7 +94,9 @@ fn record_at(
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
-    if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, path(staging)).is_ok() {
+    if crate::install::write_private_file(&tmp, text.as_bytes()).is_ok()
+        && std::fs::rename(&tmp, path(staging)).is_ok()
+    {
         return checks.unwrap_or(0);
     }
     let _ = std::fs::remove_file(tmp);

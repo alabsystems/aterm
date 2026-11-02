@@ -716,6 +716,7 @@ fn term(tok: &str) -> Result<Tok, String> {
                 let label = label.to_ascii_lowercase();
                 let index = label
                     .strip_prefix('l')
+                    .filter(|d| d.len() == 1)
                     .and_then(|d| d.parse::<usize>().ok())
                     .filter(|i| *i < 8);
                 Metric::CpuLevel { index, label }
@@ -785,11 +786,17 @@ impl AwaitSys {
         let mut first = true;
         while let Some(tok) = toks.next() {
             if let Some(v) = tok.strip_prefix("timeout=") {
+                if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(USAGE.to_owned());
+                }
                 timeout_ms = v.parse::<u64>().map_err(|_| USAGE)?.min(TIMEOUT_MAX_MS);
                 continue;
             }
             if tok == "timeout" {
                 let v = toks.next().ok_or(USAGE)?;
+                if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(USAGE.to_owned());
+                }
                 timeout_ms = v.parse::<u64>().map_err(|_| USAGE)?.min(TIMEOUT_MAX_MS);
                 continue;
             }
@@ -808,6 +815,9 @@ impl AwaitSys {
                 continue;
             }
             if let Some(v) = tok.strip_prefix("vol=") {
+                if v.is_empty() || vol.is_some() {
+                    return Err(USAGE.to_owned());
+                }
                 vol = Some(v.to_owned());
                 continue;
             }
@@ -1635,6 +1645,7 @@ mod tests {
             demand: Demand::Fast,
             lanes_off: Vec::new(),
             parked_tabs: Vec::new(),
+            at_ms: 0,
         }));
         let ended = [
             EndedJob {
@@ -1675,6 +1686,7 @@ mod tests {
             demand: Demand::Fast,
             lanes_off: Vec::new(),
             parked_tabs: Vec::new(),
+            at_ms: 0,
         }));
         assert!(evaluate(&machine("sys job=a5 done"), &s2, &[7]).holds);
         assert_eq!(
@@ -1703,6 +1715,7 @@ mod tests {
             demand: Demand::Fast,
             lanes_off: Vec::new(),
             parked_tabs: Vec::new(),
+            at_ms: 0,
         }));
         let o = evaluate(&machine("sys jobs.stuck=1 and jobs.running>=1"), &s, &[7]);
         assert!(o.holds, "{o:?}");
@@ -1801,7 +1814,11 @@ mod tests {
             "sys free>=1GB and",
             "sys and free>=1GB",
             "sys free>=1GB disk=ok",
+            "sys free>=1GB vol=",
+            "sys free>=1GB vol=/a vol=/b",
             "sys free>=1GB timeout=x",
+            "sys free>=1GB timeout=+5000",
+            "sys free>=1GB timeout +5000",
             "sys free>=1KB and free>=2KB and free>=3KB",
             "sys free>=5GiB for=20m",
             "sys disk=ok scope=aterm",

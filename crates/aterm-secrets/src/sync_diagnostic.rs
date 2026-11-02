@@ -55,14 +55,19 @@ impl SyncDiagnostic {
         if text.bytes().any(|byte| byte.is_ascii_control()) {
             return None;
         }
+        let uint = |s: &str| {
+            (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| s.parse().ok())
+                .flatten()
+        };
         let words: Vec<_> = text.split_ascii_whitespace().collect();
         match words.as_slice() {
             [PREFIX, "applied", seq, failed] => Some(Self::Applied {
-                seq: seq.parse().ok()?,
-                failed: failed.parse().ok()?,
+                seq: uint(seq)?,
+                failed: uint(failed)?,
             }),
-            [PREFIX, "unchanged", seq] => Some(Self::Unchanged(seq.parse().ok()?)),
-            [PREFIX, "put-back", seq] => Some(Self::PutBack(seq.parse().ok()?)),
+            [PREFIX, "unchanged", seq] => Some(Self::Unchanged(uint(seq)?)),
+            [PREFIX, "put-back", seq] => Some(Self::PutBack(uint(seq)?)),
             [PREFIX, "not-in"] => Some(Self::NotIn),
             [PREFIX, "failed", code] => Some(Self::Failed(match *code {
                 "journal-busy" => ErrorKind::JournalBusy,
@@ -141,6 +146,8 @@ mod tests {
             "aterm-secrets-sync-v2 unchanged 4",
             "aterm-secrets-sync-v1 failed password=private",
             "aterm-secrets-sync-v1 unchanged -1",
+            "aterm-secrets-sync-v1 unchanged +1",
+            "aterm-secrets-sync-v1 applied +2 0",
             "aterm-secrets-sync-v1 applied 2",
             "aterm-secrets-sync-v1 unchanged 3\napplied seq 99",
             "aterm-secrets-sync-v1\nunchanged 3",

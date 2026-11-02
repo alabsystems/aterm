@@ -11,6 +11,7 @@ use super::*;
 mod quota;
 
 use crate::harness::accounts::{Condition, State};
+use crate::harness::host_path::toml;
 use crate::harness::upgrade::Dialect;
 
 const NOW: i64 = 1_790_000_000;
@@ -167,8 +168,8 @@ impl World {
         let work = self.work_dir(cli);
         let text = format!(
             "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n[[account]]\n\
-             label = \"work\"\nclass = \"dedicated\"\ndir = \"{}\"\n",
-            work.display()
+             label = \"work\"\nclass = \"dedicated\"\ndir = {}\n",
+            toml(&work)
         );
         std::fs::write(self.cfg.join(cli.accounts().roster_file), text).expect("roster");
         work
@@ -275,6 +276,7 @@ fn a_low_codex_session_moves_onto_its_overlay_home_and_resumes_its_rollout() {
             ahead: true,
             rotates: true,
             takes_canary: false,
+            yields: None,
         }
     );
     let line = moved.line.expect("a move writes its line");
@@ -341,8 +343,13 @@ fn a_grok_line_names_the_rows_auth_file_and_leader_and_unsets_grok_auth() {
         .expect("socket")
         .display()
         .to_string();
+    // The socket is the grok home joined with its name, by this host's separator.
+    let named = Path::new("/Users//u/.grok")
+        .join("leader-work-")
+        .display()
+        .to_string();
     let tag = socket
-        .strip_prefix("/Users//u/.grok/leader-work-")
+        .strip_prefix(named.as_str())
         .and_then(|rest| rest.strip_suffix(".sock"))
         .unwrap_or_default();
     assert!(
@@ -420,9 +427,12 @@ fn a_grok_line_drops_a_carried_leader_socket() {
         format!(
             " {}( cd -- '/w' && exec '/usr/bin/env' -u 'GROK_AUTH' -u 'GROK_LEADER_SOCKET' \
              'GROK_AUTH_PATH=/l/work/auth.json' '/opt/grok/bin/grok' '-m' 'grok-4' \
-             '--always-approve' '--leader-socket' '/Users//u/.grok/leader-work-99068163.sock' \
-             '--resume' 'abc' )",
-            crate::harness::upgrade::BASH_LINE_OPENS
+             '--always-approve' '--leader-socket' '{}' '--resume' 'abc' )",
+            crate::harness::upgrade::BASH_LINE_OPENS,
+            // The row's socket in its home, joined as the host joins a path.
+            Path::new("/Users//u/.grok")
+                .join("leader-work-99068163.sock")
+                .display()
         )
     );
     let main = LoginEnv {
@@ -666,6 +676,9 @@ fn a_launch_starts_under_the_pin_or_a_fresh_active_else_next() {
     assert_eq!(launch_env(&one.seat(), Cli::Codex, &no_usage), None);
 }
 
+/// Unix only, as an overlay home is; off Unix,
+/// `an_overlay_row_is_never_started_on_where_aterm_makes_no_links` holds the refusal.
+#[cfg(unix)]
 #[test]
 fn a_kimi_launch_takes_its_next_row_in_an_overlay_linked_to_the_default_home() {
     let world = World::new("launch-kimi");
@@ -709,8 +722,8 @@ fn renewed_work(world: &World) -> PathBuf {
         world.cfg.join("accounts-codex.toml"),
         format!(
             "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n[[account]]\n\
-             label = \"work\"\nclass = \"dedicated\"\ndir = \"{}\"\n",
-            row_dir.display()
+             label = \"work\"\nclass = \"dedicated\"\ndir = {}\n",
+            toml(&row_dir)
         ),
     )
     .expect("roster");
@@ -829,6 +842,46 @@ fn a_launch_keeps_a_low_active_row_when_every_other_row_is_walled() {
     assert_eq!(launch_env(&seat, Cli::Codex, &no_usage), None);
 }
 
+/// The harness's master switch and a CLI's own turn its launch rotation off, as they turn the
+/// window's host's off: a launch reads `accounts` through the one rule
+/// (`SupervisorConfig::accounts_for`), so `[harness] enabled = false` or
+/// `[harness.codex] enabled = false` leaves a Codex worker on its own login, while another CLI's
+/// pool still rotates. Negative control: under the plain `accounts` read, both moved the launch
+/// off the walled default login.
+#[test]
+fn the_harness_switch_and_a_clis_own_switch_turn_its_launch_rotation_off() {
+    let read = |_: Cli, _: &Path, _: Option<&str>, _: i64| -> Option<Usage> {
+        panic!("off reads no usage")
+    };
+    for (tag, config) in [
+        ("launch-harness-off", "[harness]\nenabled = false\n"),
+        ("launch-codex-off", "[harness.codex]\nenabled = false\n"),
+    ] {
+        let world = World::new(tag);
+        world.two(Cli::Codex);
+        world.on_main(Cli::Codex, &[]);
+        wall(&world, Cli::Codex, "main", NOW + HOUR);
+        std::fs::write(world.cfg.join("aterm.toml"), config).expect("aterm.toml");
+        assert_eq!(world.seat().mode_for(Cli::Codex), Mode::Off, "{config}");
+        assert_eq!(
+            launch_env(&world.seat(), Cli::Codex, &read),
+            None,
+            "{config}: the worker stays on its own login"
+        );
+    }
+    let world = World::new("launch-other-cli-on");
+    std::fs::write(
+        world.cfg.join("aterm.toml"),
+        "[harness.codex]\nenabled = false\n",
+    )
+    .expect("aterm.toml");
+    assert_eq!(
+        world.seat().mode_for(Cli::Grok),
+        crate::supervise::config::SupervisorConfig::default().accounts,
+        "Grok Build's pool keeps the configured mode"
+    );
+}
+
 #[test]
 fn accounts_off_places_a_launch_on_the_owners_pin_alone() {
     let world = World::new("launch-off");
@@ -840,7 +893,7 @@ fn accounts_off_places_a_launch_on_the_owners_pin_alone() {
         "[harness]\naccounts = \"off\"\n",
     )
     .expect("aterm.toml");
-    assert_eq!(world.seat().mode(), Mode::Off);
+    assert_eq!(world.seat().mode_for(Cli::Codex), Mode::Off);
     let read = |_: Cli, _: &Path, _: Option<&str>, _: i64| -> Option<Usage> {
         panic!("off reads no usage")
     };
@@ -876,12 +929,13 @@ fn accounts_off_places_a_launch_on_the_owners_pin_alone() {
 }
 
 #[test]
-fn a_keyring_store_holds_the_codex_launch_and_move() {
+fn a_store_without_proven_file_credentials_holds_the_codex_launch_and_move() {
     for (store, held) in [
         ("keyring", true),
         ("auto", true),
         ("ephemeral", true),
         ("file", false),
+        ("future", true),
     ] {
         let world = World::new(&format!("keyring-{store}"));
         world.two(Cli::Codex);
@@ -896,6 +950,20 @@ fn a_keyring_store_holds_the_codex_launch_and_move() {
         .expect("config");
         let pick = launch_env(&world.seat(), Cli::Codex, &no_usage).map(|p| p.label);
         assert_eq!(pick.is_none(), held, "{store}: {pick:?}");
+        let seat = world.seat();
+        let roster = seat.bound_roster(Cli::Codex).unwrap();
+        let enrolled = seat.store(Cli::Codex).enrolled_here(&roster);
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let read = |_: Cli, _: &Path, _: Option<&str>, _: i64| {
+            reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            None
+        };
+        record_usage(&seat, Cli::Codex, &roster, &enrolled, &read).unwrap();
+        assert_eq!(
+            reads.load(std::sync::atomic::Ordering::SeqCst) == 0,
+            held,
+            "{store}: direct usage poll"
+        );
         let exe = Path::new("/opt/codex-old/bin/codex");
         let moved = session_move(
             &world.seat(),
@@ -911,6 +979,9 @@ fn a_keyring_store_holds_the_codex_launch_and_move() {
     assert_eq!(StayWhy::KeyringStore.as_str(), "keyring-store");
 }
 
+/// Unix only, as an overlay home is; off Unix,
+/// `an_overlay_row_is_never_started_on_where_aterm_makes_no_links` holds the refusal.
+#[cfg(unix)]
 #[test]
 fn an_overlay_home_with_shared_entries_of_its_own_is_never_started_on() {
     let world = World::new("drift");
@@ -1186,6 +1257,36 @@ fn a_move_whose_line_cannot_be_written_commits_no_rotation() {
 }
 
 #[test]
+fn an_unwritten_move_keeps_the_preparation_hold_on_its_running_session() {
+    let world = World::new("held-line-fails");
+    world.two(Cli::Codex);
+    world.on_main(Cli::Codex, &[]);
+    world
+        .seat()
+        .store(Cli::Codex)
+        .transact(NOW, &mut None, |state| {
+            state.prepared_accounts.insert("main".into());
+            Ok(Vec::new())
+        })
+        .unwrap();
+    let exe = Path::new("/opt/codex-old/bin/codex");
+    let moved = session_move_using(
+        &world.seat(),
+        &session(Cli::Codex, Supervisor::Aterm, Mode::Early, exe),
+        |_| None,
+    );
+    assert!(
+        matches!(moved.advice, Advice::Wait { until } if until > NOW),
+        "{moved:?}"
+    );
+    assert!(moved.line.is_none());
+    let state = world.load(Cli::Codex);
+    assert_eq!(state.active.as_deref(), Some("main"));
+    assert!(state.prepared_accounts.contains("main"));
+    assert!(state.rotations.is_empty());
+}
+
+#[test]
 fn a_launch_reads_each_rows_usage_in_its_own_home_and_leaves_a_full_one() {
     let world = World::new("usage");
     let work = world.two(Cli::Codex);
@@ -1246,6 +1347,9 @@ fn a_launch_reads_each_rows_usage_in_its_own_home_and_leaves_a_full_one() {
     assert_eq!(pick.as_deref(), Some("main"));
 }
 
+/// Unix only, as an overlay home is; off Unix,
+/// `an_overlay_row_is_never_started_on_where_aterm_makes_no_links` holds the refusal.
+#[cfg(unix)]
 #[test]
 fn a_drifted_unpinned_overlay_row_falls_through_to_a_clean_one_and_a_pinned_one_holds() {
     let world = World::new("drift-fallthrough");
@@ -1255,10 +1359,10 @@ fn a_drifted_unpinned_overlay_row_falls_through_to_a_clean_one_and_a_pinned_one_
     std::fs::write(backup.join("credentials/kimi-code.json"), "{}").expect("backup login");
     let roster_text = format!(
         "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n\
-         [[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = \"{}\"\n\n\
-         [[account]]\nlabel = \"backup\"\nclass = \"dedicated\"\ndir = \"{}\"\n",
-        work.display(),
-        backup.display()
+         [[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = {}\n\n\
+         [[account]]\nlabel = \"backup\"\nclass = \"dedicated\"\ndir = {}\n",
+        toml(&work),
+        toml(&backup)
     );
     std::fs::write(world.cfg.join("accounts-kimi.toml"), roster_text).expect("roster");
     let default_home = world.home.join(".kimi-code");
@@ -1289,6 +1393,9 @@ fn a_drifted_unpinned_overlay_row_falls_through_to_a_clean_one_and_a_pinned_one_
     assert_eq!(launch_env(&world.seat(), Cli::Kimi, &no_usage), None);
 }
 
+/// Unix only, as an overlay home is; off Unix,
+/// `an_overlay_row_is_never_started_on_where_aterm_makes_no_links` holds the refusal.
+#[cfg(unix)]
 #[test]
 fn record_usage_reads_the_default_home_before_linking_overlays_so_startup_files_never_drift() {
     let world = World::new("usage-startup-overlay");
@@ -1356,12 +1463,12 @@ fn fleet_synced_single_enrolled_row_and_lazy_backup_measure_usage_and_launch_unt
     std::fs::write(
         world.cfg.join("accounts-codex.toml"),
         format!(
-            "[[account]]\nlabel = \"codex-1\"\nclass = \"dedicated\"\ndir = \"{}\"\n\
+            "[[account]]\nlabel = \"codex-1\"\nclass = \"dedicated\"\ndir = {}\n\
              email = \"one@example.com\"\n\n\
-             [[account]]\nlabel = \"codex-2\"\nclass = \"dedicated\"\ndir = \"{}\"\n\
+             [[account]]\nlabel = \"codex-2\"\nclass = \"dedicated\"\ndir = {}\n\
              email = \"two@example.com\"\n",
-            c1.display(),
-            c2.display(),
+            toml(&c1),
+            toml(&c2),
         ),
     )
     .expect("roster");
@@ -1459,9 +1566,9 @@ fn fleet_synced_single_enrolled_row_and_lazy_backup_measure_usage_and_launch_unt
         lazy.cfg.join("accounts-codex.toml"),
         format!(
             "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n\
-             [[account]]\nlabel = \"backup\"\nclass = \"dedicated\"\ndir = \"{}\"\n\
+             [[account]]\nlabel = \"backup\"\nclass = \"dedicated\"\ndir = {}\n\
              email = \"backup@example.com\"\n",
-            backup.display()
+            toml(&backup)
         ),
     )
     .expect("lazy roster");
@@ -1503,6 +1610,25 @@ fn fleet_synced_single_enrolled_row_and_lazy_backup_measure_usage_and_launch_unt
         launch_env(&lone.seat(), Cli::Codex, &no_usage).expect("pinned lone default row");
     assert_eq!(pinned_pick.label, "main");
     assert_eq!(pinned_pick.value, None);
+}
+
+/// Where aterm makes no symbolic links (off Unix), a Kimi row, whose seam is an overlay home, is
+/// never started on: its login env is refused by name, and a launch stays on the machine's own
+/// login with nothing linked.
+#[cfg(not(unix))]
+#[test]
+fn an_overlay_row_is_never_started_on_where_aterm_makes_no_links() {
+    let world = World::new("no-links");
+    let work = world.two(Cli::Kimi);
+    world.on_main(Cli::Kimi, &[]);
+    let roster = world.seat().bound_roster(Cli::Kimi).expect("roster");
+    let why = login_env(Cli::Kimi, roster.row("work").expect("work"), &world.home)
+        .expect_err("no overlay off Unix");
+    assert_eq!(why.kind(), std::io::ErrorKind::Unsupported, "{why}");
+    assert!(why.to_string().ends_with("only on Unix"), "{why}");
+    wall(&world, Cli::Kimi, "main", NOW + HOUR);
+    assert_eq!(launch_env(&world.seat(), Cli::Kimi, &no_usage), None);
+    assert!(!work.join("sessions").exists(), "nothing is linked");
 }
 
 /// A [`UsageReader`] answering each home its own [`Reading`], and nothing for any other.
@@ -1803,8 +1929,8 @@ fn a_default_row_a_sign_in_moved_is_named_as_moved_on_a_program_that_ignores_cod
     std::fs::write(
         world.cfg.join(Cli::Codex.accounts().roster_file),
         format!(
-            "[[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = \"{}\"\n",
-            work.display()
+            "[[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = {}\n",
+            toml(&work)
         ),
     )
     .expect("roster");
@@ -1815,34 +1941,38 @@ fn a_default_row_a_sign_in_moved_is_named_as_moved_on_a_program_that_ignores_cod
 
 #[test]
 fn accounts_off_moves_no_cold_relaunch_onto_the_owners_pin() {
-    let world = World::new("cold-off");
-    let program = crate::harness::codex_alab::lay_package(&world.root.join("codex"), true);
-    let work = world.two(Cli::Codex);
-    world.on_main(Cli::Codex, &[]);
-    let work_auth = work.join("auth.json").display().to_string();
-    let on_work = [("CODEX_AUTH_PATH", work_auth.as_str())];
-    pin(&world, Cli::Codex, "main").expect("pin");
-    wall(&world, Cli::Codex, "work", NOW + HOUR);
-    // PRECONDITION: with rotation on, the limited row's tab starts on the pinned one.
-    let moved = cold_launch_env(&world.seat(), Cli::Codex, &on_work, &no_usage, None)
-        .map(|pick| pick.label);
-    assert_eq!(moved.as_deref(), Some("main"));
-    std::fs::write(
-        world.cfg.join("aterm.toml"),
-        "[harness]\naccounts = \"off\"\n",
-    )
-    .expect("aterm.toml");
-    assert_eq!(world.seat().mode(), Mode::Off);
-    assert_eq!(
-        cold_launch_env(&world.seat(), Cli::Codex, &on_work, &no_usage, None),
-        None,
-        "off moves no session, a cold one included"
-    );
-    assert_eq!(
-        cold_resume_env(&world.seat(), Cli::Codex, &on_work, &program).unwrap(),
-        None,
-        "off moves no held resume line onto the owner's pin"
-    );
+    // Each switch that turns Codex's rotation off ([`Seat::mode_for`]): the accounts' own, the
+    // harness's, and Codex's table.
+    for (tag, config) in [
+        ("cold-off", "[harness]\naccounts = \"off\"\n"),
+        ("cold-harness-off", "[harness]\nenabled = false\n"),
+        ("cold-codex-off", "[harness.codex]\nenabled = false\n"),
+    ] {
+        let world = World::new(tag);
+        let program = crate::harness::codex_alab::lay_package(&world.root.join("codex"), true);
+        let work = world.two(Cli::Codex);
+        world.on_main(Cli::Codex, &[]);
+        let work_auth = work.join("auth.json").display().to_string();
+        let on_work = [("CODEX_AUTH_PATH", work_auth.as_str())];
+        pin(&world, Cli::Codex, "main").expect("pin");
+        wall(&world, Cli::Codex, "work", NOW + HOUR);
+        // PRECONDITION: with rotation on, the limited row's tab starts on the pinned one.
+        let moved = cold_launch_env(&world.seat(), Cli::Codex, &on_work, &no_usage, None)
+            .map(|pick| pick.label);
+        assert_eq!(moved.as_deref(), Some("main"), "{config}");
+        std::fs::write(world.cfg.join("aterm.toml"), config).expect("aterm.toml");
+        assert_eq!(world.seat().mode_for(Cli::Codex), Mode::Off, "{config}");
+        assert_eq!(
+            cold_launch_env(&world.seat(), Cli::Codex, &on_work, &no_usage, None),
+            None,
+            "{config}: off moves no session, a cold one included"
+        );
+        assert_eq!(
+            cold_resume_env(&world.seat(), Cli::Codex, &on_work, &program).unwrap(),
+            None,
+            "{config}: off moves no held resume line onto the owner's pin"
+        );
+    }
 }
 
 #[test]

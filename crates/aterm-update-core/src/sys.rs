@@ -30,14 +30,22 @@ impl FileLock {
     #[cfg_attr(trust_verify, trust::skip)]
     fn open_lock_file(path: &Path) -> io::Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .truncate(false)
             .mode(0o600)
-            .custom_flags(libc::O_CLOEXEC)
-            .open(path)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is not a regular file", path.display()),
+            ));
+        }
+        aterm_uds::keep_out_of_children(&file)?;
+        Ok(file)
     }
 
     /// Take `LOCK_EX` on `path` (created `0600` if absent), blocking until free.
@@ -243,7 +251,19 @@ mod tests {
             "successful exec must release the apply transaction atomically"
         );
         drop(lock);
-        let _ = std::fs::remove_file(p);
+        let _ = std::fs::remove_file(&p);
+        let decoy = std::env::temp_dir().join(format!("aterm-lock-decoy-{}", std::process::id()));
+        let _ = std::fs::remove_file(&decoy);
+        std::os::unix::fs::symlink(&decoy, &p).expect("symlink");
+        assert!(
+            FileLock::acquire(&p).is_err(),
+            "a symlinked lock path must never be followed"
+        );
+        assert!(
+            !decoy.exists(),
+            "symlinked lock target must never be created"
+        );
+        let _ = std::fs::remove_file(&p);
     }
 
     #[cfg(windows)]

@@ -6,7 +6,7 @@
 use std::ops::Range;
 
 use astream_wire::steps::{StepEnd, StepFault, scan_steps_from};
-use aterm_core::grid::{HistoryFence, MAX_GRID_COLS, MAX_GRID_ROWS};
+use aterm_core::grid::HistoryFence;
 use aterm_core::terminal::{Terminal, TerminalCheckpoint};
 
 use crate::layout::{
@@ -171,7 +171,9 @@ impl RingRun {
     /// How many lines the run holds.
     #[must_use]
     pub fn lines(&self) -> u64 {
-        self.chunks.iter().map(|c| u64::from(c.n_lines)).sum()
+        self.chunks
+            .iter()
+            .fold(0u64, |acc, c| acc.saturating_add(u64::from(c.n_lines)))
     }
 }
 
@@ -320,14 +322,16 @@ impl RingExport {
     #[must_use]
     pub fn newest(self, max: u64) -> Self {
         let first = self.first.max(self.fence.end.saturating_sub(max));
+        let end = self.fence.end.max(first);
         Self {
             fence: HistoryFence {
                 oldest: first,
+                end,
                 ..self.fence
             },
             first,
-            lines: self.fence.end - first,
-            skip: self.skip + (first - self.first),
+            lines: end - first,
+            skip: self.skip.saturating_add(first - self.first),
         }
     }
 }
@@ -683,10 +687,6 @@ fn walk_tail<V: RegionView + ?Sized>(
                 TailRecord::Resize {
                     rows, cols, policy, ..
                 } => {
-                    if rows == 0 || cols == 0 || rows > MAX_GRID_ROWS || cols > MAX_GRID_COLS {
-                        walk.fault = Some(TailFault::BadLength);
-                        return walk;
-                    }
                     if cols != engine.cols() || rows > engine.rows() {
                         walk.regrids = walk.regrids.saturating_add(1);
                     }

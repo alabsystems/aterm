@@ -30,7 +30,8 @@ pub struct Timings {
     pub ended_at_once: Duration,
     /// How often the shell-holds-its-terminal look runs (a `ps` each time).
     pub shell_look: Duration,
-    /// The relaunched agent's first idle, under the harness's hand.
+    /// The relaunched agent's first rest (an idle, a question, a box or a wall), under the
+    /// harness's hand.
     pub first_idle: Duration,
     /// A relaunched codex-alab's first idle, under the harness's hand (`codex_alab_drive`'s hold).
     pub alab_first_idle: Duration,
@@ -56,6 +57,10 @@ pub struct Timings {
     pub redecide_after_skip: Duration,
     /// The supervisor loop: the lease TTL its claim on a session asks for.
     pub claim_ttl: Duration,
+    /// One exchange on a drive connection to a control socket, with the wait a request names on
+    /// top (`RelayClient::bounded`): a hang guard, never a wait a test sits through, so the tests'
+    /// clock keeps the product's and a test of a server that never answers names its own.
+    pub drive_reply: Duration,
 }
 
 impl Timings {
@@ -82,6 +87,7 @@ impl Timings {
         agy_adopt: Duration::from_secs(30),
         redecide_after_skip: Duration::from_secs(2),
         claim_ttl: Duration::from_secs(90),
+        drive_reply: crate::DEFAULT_REPLY_WAIT,
     };
 
     /// The tests' waits.
@@ -107,6 +113,7 @@ impl Timings {
         agy_adopt: Duration::from_secs(2),
         redecide_after_skip: Duration::from_millis(100),
         claim_ttl: Duration::from_secs(600),
+        drive_reply: crate::DEFAULT_REPLY_WAIT,
     };
 
     /// This build's clock.
@@ -168,6 +175,7 @@ mod tests {
             (p.agy_lock, f.agy_lock),
             (p.agy_adopt, f.agy_adopt),
             (p.redecide_after_skip, f.redecide_after_skip),
+            (p.drive_reply, f.drive_reply),
         ] {
             assert!(fast <= prod, "{fast:?} > {prod:?}");
         }

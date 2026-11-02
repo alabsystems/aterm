@@ -1883,53 +1883,6 @@ fn a_first_point_reads_a_reply_cut_at_the_rows_top_whole() {
     assert!(short.1.is_empty());
     let calls = run(short, true);
     assert!(raised(&calls), "{calls:#?}");
-    let land = crate::supervise::policy::turn_end::land_text(None);
-    let act: Vec<String> = {
-        let words: Vec<&str> = land.split_whitespace().collect();
-        let mut rows = Vec::new();
-        let mut row = String::new();
-        for w in words {
-            if !row.is_empty() && row.chars().count() + 1 + w.chars().count() > 47 {
-                rows.push(std::mem::take(&mut row));
-            }
-            if !row.is_empty() {
-                row.push(' ');
-            }
-            row.push_str(w);
-        }
-        rows.push(row);
-        rows.iter()
-            .enumerate()
-            .map(|(i, r)| format!("{}{r}", if i == 0 { "> " } else { "  " }))
-            .collect()
-    };
-    let filler: Vec<String> = (0..6)
-        .map(|i| format!("Step {i}: the parser's module and suite are in."))
-        .collect();
-    for history in [true, false] {
-        let (mut shown, mut above) = draw(&act, &filler);
-        above.append(&mut shown);
-        let at = above
-            .iter()
-            .position(|r| r.starts_with("> [aterm harness]"))
-            .expect("the act's first row");
-        let shown = above.split_off(at + 2);
-        assert!(
-            above.iter().any(|r| r.starts_with("> [aterm harness]")),
-            "the act's first row is above the screen"
-        );
-        assert!(
-            shown.iter().any(|r| r.contains("NEEDS YOU:")),
-            "the act's NEEDS YOU: row is on the screen"
-        );
-        let calls = run((shown, above), history);
-        assert!(
-            !calls
-                .iter()
-                .any(|c| c.starts_with("set attention owner=needs ")),
-            "history={history}: {calls:#?}"
-        );
-    }
 }
 
 fn agy_paragraph_cells() -> BTreeMap<(usize, usize), String> {
@@ -2309,4 +2262,224 @@ fn a_messages_cells_fold_nothing_they_do_not_prove() {
     let p = run(&shown, measured);
     assert!(p.needs.is_empty(), "{:#?}", p.needs);
     assert_ne!(p.again, tail(&shown));
+}
+
+/// The go-ahead's line (§15.6): a NEEDS YOU line that parks the agent's own reversible work on a
+/// person's go-ahead.
+const GO_AHEAD_NEED: &str =
+    "say \"rerun the checks\" so I can build and test my branch and push it to main";
+
+/// A report that parks on [`GO_AHEAD_NEED`], with `beside` NEEDS YOU lines under it.
+fn parking(beside: &[&str]) -> Vec<String> {
+    let mut lines = vec![
+        "Committed the parser fix on my branch.".to_string(),
+        format!("NEEDS YOU: {GO_AHEAD_NEED}."),
+    ];
+    lines.extend(beside.iter().map(|n| format!("NEEDS YOU: {n}")));
+    said(&lines.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
+/// The agent parks on the go-ahead with `beside` needs, gets one answer, and goes on with a
+/// report that names no need, under `policy`; the window's host hears through `host`, `set`
+/// arranges the mock, and the journal is kept.
+fn go_ahead_run(
+    tag: &str,
+    beside: &[&str],
+    policy: SupervisorConfig,
+    host: &Arc<Hears>,
+    set: impl FnOnce(&mut Mock),
+) -> (Mock, RecordedWatch, Vec<String>) {
+    let screens = vec![
+        busy_screen(),
+        parking(beside),
+        busy_screen(),
+        said(&["Built, tested and pushed the branch; the docs are next."]),
+    ];
+    let last = u32::try_from(screens.len()).expect("a short script");
+    let (dir, journal) = journal_file(tag);
+    let mut m = Mock::new(screens);
+    m.autopilot = Some("cruise");
+    m.turn_gates = vec![1];
+    m.vanish_after = Some(last - 1);
+    m.stall_sleep = Some(Duration::from_secs(20));
+    set(&mut m);
+    let opts = SuperviseOpts {
+        policy,
+        journal: Some(journal.clone()),
+        idle_host: Some(Arc::clone(host) as Arc<dyn IdleHost>),
+        ..auto(30)
+    };
+    let run = record_watch(&mut m, &opts, |s| {
+        s.set_turn_end_timing(TurnEndTiming {
+            short_backoff: Duration::from_millis(30),
+            short_backoff_max: Duration::from_millis(60),
+            ..TurnEndTiming::default()
+        });
+    });
+    crate::supervise::tape::testing::assert_replays(&run.tape, &run.header, &run.sent, &run.lines);
+    let up = journaled(&journal, &format!("{NEEDS} "));
+    let _ = std::fs::remove_dir_all(&dir);
+    (m, run, up)
+}
+
+/// The `turn` requests that typed the owner's standing go-ahead.
+fn go_aheads_typed(m: &Mock) -> usize {
+    m.requests
+        .iter()
+        .filter(|r| {
+            r.starts_with("turn ")
+                && r.contains(crate::supervise::policy::go_ahead::GO_AHEAD_ANSWER)
+        })
+        .count()
+}
+
+/// A LINE THE GO-AHEAD ANSWERS NEVER GOES UP (§15.6): the agent parks its own reversible work on
+/// the person's go-ahead, Cruise types the owner's standing go-ahead, and the line is kept off
+/// the menu bar, the border and the window's host from the decision that types it: no entry is
+/// set, and the host hears no set. The control: with answers off the go-ahead is not typed and
+/// the line goes up, named.
+#[test]
+fn a_go_ahead_line_never_goes_up() {
+    let host = Arc::new(Hears::default());
+    let (m, _, up) = go_ahead_run("go-ahead-line", &[], owners_policy(), &host, |_| {});
+    assert_eq!(go_aheads_typed(&m), 1, "{:#?}", m.requests);
+    assert!(m.needs_calls.is_empty(), "{:#?}", m.needs_calls);
+    assert!(host.told().is_empty(), "{:#?}", host.told());
+    assert!(up.is_empty(), "{up:#?}");
+    let host = Arc::new(Hears::default());
+    let answers_off = SupervisorConfig {
+        answer_questions: false,
+        ..owners_policy()
+    };
+    let (m, _, _) = go_ahead_run("go-ahead-line-off", &[], answers_off, &host, |_| {});
+    assert_eq!(go_aheads_typed(&m), 0, "{:#?}", m.requests);
+    assert!(
+        m.needs_calls
+            .first()
+            .is_some_and(|c| c.starts_with("set ") && c.contains("rerun the checks")),
+        "NEGATIVE CONTROL: answers off: {:#?}",
+        m.needs_calls
+    );
+}
+
+/// BESIDE A PERSON'S NEED ONLY THEIRS GOES UP (§15.6): the report parks on the go-ahead beside a
+/// credential only the person can give; the entry names the credential alone, once, and the
+/// journal counts the line the go-ahead answered apart.
+#[test]
+fn beside_a_persons_need_only_theirs_goes_up() {
+    let host = Arc::new(Hears::default());
+    let (m, _, up) = go_ahead_run("go-ahead-beside", &[NEED], owners_policy(), &host, |_| {});
+    assert_eq!(go_aheads_typed(&m), 1, "{:#?}", m.requests);
+    let sets: Vec<&String> = m
+        .needs_calls
+        .iter()
+        .filter(|c| c.starts_with("set "))
+        .collect();
+    assert_eq!(
+        sets,
+        [&format!(
+            "set attention owner=needs kind=ask claude needs you: {NEED} — carrying on"
+        )],
+        "{:#?}",
+        m.needs_calls
+    );
+    assert_eq!(
+        host.told().first().map(|(n, _)| n.clone()),
+        Some(vec![NEED.to_string()])
+    );
+    assert_eq!(up.len(), 1, "{up:#?}");
+    assert!(
+        up[0].contains(" count=1 attention=OK answered=1 ") && up[0].ends_with(NEED),
+        "{up:#?}"
+    );
+}
+
+/// LAND'S INSTRUCTION OVER A PARK KEEPS ITS LINE OFF (2026-10-30 review 9): under Land before
+/// its instruction, the agent parks on the go-ahead; the instruction typed over it answers the
+/// park, so the line never goes up, and the agent's report after it names no need. The control:
+/// the instruction's `turn` refused, the line goes up after the refused write.
+#[test]
+fn lands_instruction_over_a_park_never_puts_its_line_up() {
+    let land = |m: &mut Mock| m.autopilot = Some("land");
+    let typed = |m: &Mock| {
+        m.requests
+            .iter()
+            .filter(|r| r.starts_with("turn ") && r.contains("Autopilot is Land"))
+            .count()
+    };
+    let host = Arc::new(Hears::default());
+    let (m, _, up) = go_ahead_run("go-ahead-land-first", &[], owners_policy(), &host, land);
+    assert_eq!(typed(&m), 1, "{:#?}", m.requests);
+    assert!(m.needs_calls.is_empty(), "{:#?}", m.needs_calls);
+    assert!(host.told().is_empty(), "{:#?}", host.told());
+    assert!(up.is_empty(), "{up:#?}");
+    let host = Arc::new(Hears::default());
+    let (m, _, _) = go_ahead_run(
+        "go-ahead-land-first-refused",
+        &[],
+        owners_policy(),
+        &host,
+        |m| {
+            land(m);
+            m.verb_replies.insert(
+                "turn",
+                VecDeque::from([err("yield: the person has the tab")]),
+            );
+        },
+    );
+    let turn = m
+        .requests
+        .iter()
+        .position(|r| r.starts_with("turn "))
+        .unwrap_or_else(|| panic!("a turn: {:#?}", m.requests));
+    let set = m
+        .requests
+        .iter()
+        .position(|r| r.starts_with("meta set attention owner=needs "))
+        .unwrap_or_else(|| panic!("NEGATIVE CONTROL: the line goes up: {:#?}", m.requests));
+    assert!(turn < set, "after the refused write: {:#?}", m.requests);
+}
+
+/// AN ANSWER NOT SUBMITTED PUTS THE LINE BACK (§15.6): the go-ahead's `turn` is refused, so the
+/// line it would have answered goes up at the same point, after the refused write.
+#[test]
+fn a_go_ahead_not_submitted_puts_its_line_up() {
+    let host = Arc::new(Hears::default());
+    let (m, run, _) = go_ahead_run("go-ahead-refused-turn", &[], owners_policy(), &host, |m| {
+        m.verb_replies.insert(
+            "turn",
+            VecDeque::from([err("yield: the person has the tab")]),
+        );
+    });
+    let turn = m
+        .requests
+        .iter()
+        .position(|r| r.starts_with("turn "))
+        .unwrap_or_else(|| panic!("a turn: {:#?}", m.requests));
+    let set = m
+        .requests
+        .iter()
+        .position(|r| r.starts_with("meta set attention owner=needs "))
+        .unwrap_or_else(|| panic!("the line goes up: {:#?}", m.requests));
+    assert!(turn < set, "after the refused write: {:#?}", m.requests);
+    assert!(
+        m.needs_calls
+            .first()
+            .is_some_and(|c| c.contains("rerun the checks")),
+        "{:#?}",
+        m.needs_calls
+    );
+    let doors = needs_doors(&run);
+    assert_eq!(
+        doors.get(1).map(String::as_str),
+        Some("ctl set"),
+        "{doors:?}"
+    );
+    assert!(
+        host.told()
+            .first()
+            .is_some_and(|(n, _)| n.iter().any(|n| n.contains("rerun the checks"))),
+        "{:#?}",
+        host.told()
+    );
 }

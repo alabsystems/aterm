@@ -20,6 +20,8 @@ pub(crate) struct BrokerArgs<'a, S> {
     /// can omit it.
     pub lifeline_at: Option<usize>,
     pub repair: bool,
+    /// `--retire-log`: give up the log the one word names.
+    pub retire_log: bool,
     pub words: Vec<&'a S>,
 }
 
@@ -50,6 +52,7 @@ impl<'a, S: AsRef<OsStr>> BrokerArgs<'a, S> {
             lifeline_fd: None,
             lifeline_at: None,
             repair: false,
+            retire_log: false,
             words: Vec::new(),
         };
         let mut i = 0;
@@ -65,6 +68,10 @@ impl<'a, S: AsRef<OsStr>> BrokerArgs<'a, S> {
                 }
                 Some("--repair") => {
                     out.repair = true;
+                    None
+                }
+                Some("--retire-log") => {
+                    out.retire_log = true;
                     None
                 }
                 _ if word.as_encoded_bytes().starts_with(b"-") => {
@@ -124,7 +131,7 @@ impl<'a, S: AsRef<OsStr>> BrokerArgs<'a, S> {
 
     /// What a recognised serving invocation NAMES.
     pub fn named_durability(&self) -> Option<Option<crate::durability::Durability>> {
-        if self.repair || !matches!(self.words.len(), 1 | 2) {
+        if self.repair || self.retire_log || !matches!(self.words.len(), 1 | 2) {
             return None;
         }
         match self.durability {

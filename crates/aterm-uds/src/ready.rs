@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A wait on two descriptors at once, with no timeout: one `poll(2)` that ends when either is
-//! readable, at its end or in error, and reads neither.
+//! Descriptor readiness without consuming bytes: indefinite reads or an absolute-deadline
+//! read/write wait. Hangup also wakes the caller, which drains buffered data before EOF.
 
 use std::io;
 use std::os::fd::{AsRawFd as _, BorrowedFd};
@@ -72,9 +72,80 @@ pub fn either(first: BorrowedFd<'_>, second: BorrowedFd<'_>) -> io::Result<Ready
     }
 }
 
+/// Blocks, with no timeout, until `fd` is readable, at its end or in error: [`either`] of it and
+/// itself. A listener is readable once a connection waits to be accepted.
+///
+/// # Errors
+/// `poll(2)`'s errno, other than `EINTR`.
+pub fn one(fd: BorrowedFd<'_>) -> io::Result<()> {
+    either(fd, fd).map(drop)
+}
+
+/// Which nonblocking operation a deadline wait precedes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Interest {
+    Read,
+    Write,
+}
+
+/// Wait for `interest`, hangup or error without changing socket timeout options.
+/// Use a nonblocking operation after this call: readiness can be consumed by
+/// another reader/writer. Interrupted waits retain the original deadline.
+///
+/// # Errors
+/// Expiry, an invalid descriptor, or `poll(2)` errors other than interruption.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn until(
+    fd: BorrowedFd<'_>,
+    interest: Interest,
+    deadline: std::time::Instant,
+) -> io::Result<()> {
+    loop {
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|n| !n.is_zero())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "readiness deadline"))?;
+        let millis =
+            remaining.as_millis() + u128::from(!remaining.subsec_nanos().is_multiple_of(1_000_000));
+        let timeout = millis.min(i32::MAX as u128) as i32;
+        let mut descriptor = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: match interest {
+                Interest::Read => libc::POLLIN,
+                Interest::Write => libc::POLLOUT,
+            },
+            revents: 0,
+        };
+        // SAFETY: the initialized pollfd remains live and its borrowed descriptor stays open.
+        let result = unsafe { libc::poll(&raw mut descriptor, 1, timeout) };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "readiness deadline",
+            ));
+        }
+        if descriptor.revents & libc::POLLNVAL != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid readiness descriptor",
+            ));
+        }
+        if descriptor.revents != 0 {
+            return Ok(());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Ready, either};
+    use super::{Ready, either, one};
     use std::io::{Read as _, Write as _};
     use std::os::fd::AsFd as _;
     use std::os::unix::net::UnixStream;
@@ -82,6 +153,30 @@ mod tests {
 
     /// The one-minute hang detector on a wait that must end.
     const HANG: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn deadline_readiness_keeps_buffered_bytes_and_eof_after_disconnect() {
+        let (mut near, mut far) = crate::kept_out(UnixStream::pair).unwrap();
+        near.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + HANG;
+        super::until(near.as_fd(), super::Interest::Write, deadline).unwrap();
+        far.write_all(b"kept").unwrap();
+        drop(far);
+        super::until(near.as_fd(), super::Interest::Read, deadline).unwrap();
+        let mut bytes = [0; 4];
+        near.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"kept");
+        super::until(near.as_fd(), super::Interest::Read, deadline).unwrap();
+        assert_eq!(near.read(&mut bytes).unwrap(), 0);
+        for interest in [super::Interest::Read, super::Interest::Write] {
+            assert_eq!(
+                super::until(near.as_fd(), interest, std::time::Instant::now())
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::TimedOut
+            );
+        }
+    }
 
     /// EACH SIDE WAKES THE WAIT, AND NEITHER IS READ: a byte on the first is
     /// still there after the wait said so; the second's writer closing (a
@@ -119,6 +214,25 @@ mod tests {
                 second: true
             }
         );
+        waiter.join().expect("the waiter");
+    }
+
+    /// A LISTENER IS READY WITH A CONNECTION WAITING: [`one`] ends once a connect is queued, and
+    /// a nonblocking accept then finds it.
+    #[test]
+    fn one_ends_when_a_listener_has_a_connection_to_accept() {
+        let root = aterm_tempfile::tempdir().expect("a folder");
+        let path = root.path().join("ready.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let (said, heard) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            one(listener.as_fd()).expect("the wait");
+            said.send(listener.accept().is_ok())
+                .expect("the test listens");
+        });
+        let _client = UnixStream::connect(&path).expect("connect");
+        assert!(heard.recv_timeout(HANG).expect("the wait ended"));
         waiter.join().expect("the waiter");
     }
 

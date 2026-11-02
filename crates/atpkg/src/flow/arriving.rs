@@ -83,7 +83,7 @@ impl Source {
     /// that predates the fetch, once the fetch has `ended`).
     fn len(&mut self, ended: bool) -> u64 {
         if self.file.is_none() && (ended || !self.after_fetch) {
-            self.file = open_regular(&self.path).ok();
+            self.file = crate::metadata_io::open_regular(&self.path).ok();
         }
         self.file
             .as_ref()
@@ -175,18 +175,6 @@ impl<'a> Arriving<'a> {
     fn finish(self) -> String {
         aterm_codec::hex::encode_lower(self.digest.finish().as_ref())
     }
-}
-
-/// `path` opened for reading if it is a regular file, never through a symlink.
-fn open_regular(path: &Path) -> io::Result<std::fs::File> {
-    let meta = std::fs::symlink_metadata(path)?;
-    if !meta.file_type().is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "not a regular file",
-        ));
-    }
-    std::fs::File::open(path)
 }
 
 impl Read for Arriving<'_> {

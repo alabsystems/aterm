@@ -215,7 +215,7 @@ impl Fetch for Curl {
                 cmd.env(name, value);
             }
         }
-        match run_stoppable(cmd, within + Duration::from_secs(30), stopped)? {
+        match run_stoppable(cmd, within.saturating_add(Duration::from_secs(30)), stopped)? {
             Some(0) => Ok(()),
             code => Err(curl_words(code, within)),
         }
@@ -297,6 +297,59 @@ pub fn cache_root(home: Option<&Path>) -> Option<PathBuf> {
     super::headless_oauth::browser_cache_roots(home)
         .into_iter()
         .find(|root| root.extension().is_some_and(|e| e == "noindex"))
+}
+
+/// Supply a headless browser for an authorized unattended sign-in. Existing
+/// browsers are reused; a missing one is fetched through the same pinned,
+/// bounded installer as the harness's other browser routes.
+pub fn ensure_headless_browser(
+    home: Option<&Path>,
+    fetch: &mut dyn Fetch,
+    stopped: &dyn Fn() -> bool,
+) -> Result<super::headless_oauth::HeadlessBrowser, String> {
+    if stopped() {
+        return Err(STOPPED.to_owned());
+    }
+    ensure_headless_with(
+        super::headless_oauth::find_headless_browser(home),
+        || {
+            let archive = Archive::host()
+                .ok_or_else(|| "the browser pin covers no build for this machine".to_owned())?;
+            let root = cache_root(home)
+                .ok_or_else(|| "no private browser cache is available".to_owned())?;
+            Ok((root, archive))
+        },
+        fetch,
+        stopped,
+    )
+}
+
+fn ensure_headless_with(
+    existing: Option<super::headless_oauth::HeadlessBrowser>,
+    source: impl FnOnce() -> Result<(PathBuf, Archive), String>,
+    fetch: &mut dyn Fetch,
+    stopped: &dyn Fn() -> bool,
+) -> Result<super::headless_oauth::HeadlessBrowser, String> {
+    if stopped() {
+        return Err(STOPPED.to_owned());
+    }
+    if let Some(browser) = existing {
+        return Ok(browser);
+    }
+    let (root, archive) = source()?;
+    if let Some(why) = last_failure(&root, &archive) {
+        return Err(format!(
+            "browser installation will retry after its cooldown: {why}"
+        ));
+    }
+    let path = install(&root, &archive, fetch, stopped)?;
+    if stopped() {
+        return Err(STOPPED.to_owned());
+    }
+    Ok(super::headless_oauth::HeadlessBrowser {
+        path,
+        is_headless_shell: true,
+    })
 }
 
 /// The lowercase sha256 of the file at `path`.

@@ -28,19 +28,19 @@ Paths are relative to `crates/aterm-update-core`; function names are `module::it
 - `Canon(c)` (a tag component) := `c` is non-empty ASCII digits && (`|c| = 1` || `c[0] != '0'`). `dec(c)` is then its value in Z.
 - `Code(s)` := `http::curl_http_error_code(s)`. Let `i` be the first index of `"returned error: "` in `s`, and `D` the longest ASCII-digit prefix after it. `Code(s) = Some(dec D)` iff `D != ""` and `dec D <= 65535`; it is `None` otherwise, including when the marker is missing.
 - `Block(h, name)`: the lines of `h` (`str::lines`) after the LAST line that starts with `"HTTP/"` (all lines when there is none), restricted to lines with a `:` whose key (the text before the first `:`), trimmed, equals `name` ignoring ASCII case. `V(h, name)` is that sequence of trimmed values.
-- `Opts(L)` is the option list a lane passes to `curl_argv` (everything before the `-q`/User-Agent/`--`/url framing). "Flag `f` has value `v` in `L`" means `L[i] = f` and `L[i+1] = v` for the unique `i` with `L[i] = f`. Statements about option lists hold for every caller value (cap, dest, body, headers, timeout) that is not itself one of the named flag words.
+- A lane's option list is what it passes to `curl_argv`, before the `-q`/User-Agent/`--`/url framing. "Flag `f` has value `v`" means `f` occurs once in the list and `v` follows it. Statements about option lists hold for every caller value (cap, dest, body, headers, timeout) that is not itself one of the named flag words.
 - Handoff policy: `P` ranges over `HandoffPolicy`. `R(P)` = `P.applies_to_producers`, `cc(P)` = `P.carry_ceiling()`, `rx(P)` = `P.relaxes_land_gate()`, `asks(P)` = `P.asks_anything()`. `Comb(Ps, r)` = `HandoffPolicy::combined(Ps, r)` = {range: `Some(r)`, carry: max over `Ps` of carry (None lowest), gate: Relaxed if any is Relaxed, else Strict if any is Strict, else None}. `Hull(rs)` = `PolicyFile::hull(rs)`. `FB(f, b)` = `PolicyFile::for_build(f, b)`.
 - Sentinel: `Sigma(path)` in `Option<(build: u64, attempts: u32, names: Vec<LaunchName>)>` is `read_record`'s parse of the file. The first whitespace token is a u64, the second (default `"0"`) a u32, and every later token `pid:secs:micros` that parses becomes a name. An unreadable, non-UTF-8 or unparseable file gives `None`. `last32(N)` keeps the last 32 names.
 - pkg_check: `S` is a `Stamps`. `elapsed(t, n, p)` := `(n ⊖ t) >= p || (n ⊖ t) < -p` (signed, saturating). `remaining(t, n, p)` := `0` if `elapsed(t, n, p)`, else `min(max(0, t + p - n), p)`. `I` = `FULL_PASS_INTERVAL_SECS` = 21600 and `Sp` = `PASS_SPACING_SECS` = 300.
 - Roster: `U(s)` = `aterm_types::rfc3339::parse_utc(s)` (exactly `YYYY-MM-DDTHH:MM:SSZ`, 20 bytes). `Ed(k, m, sig)` is ring's Ed25519 verify of `sig` over `m` under the 32 raw bytes that `aterm_codec::base64::decode_strict(k)` gives; Ed25519 unforgeability is an axiom. `Usable(k)` := `k != ""` && `decode_strict(k)` is Ok with length 32.
-- Effectful specs (fs, process, lock) are stated over an abstract file-system and process state. They stay specs because they are general contracts, and they are blocked on gap 8. Several of the functions they name carry `#[cfg_attr(trust_verify, trust::skip)]` today, so proving them includes removing the skip; the pure core of each should be factored out and proved first (plan, order of work step 4).
+- Effectful specs (fs, process, lock) are stated over an abstract file-system and process state and wait on gap 8. Many of their functions carry `#[cfg_attr(trust_verify, trust::skip)]`, so proving one includes removing the skip.
 
 ## 1. Specs (TSV)
 
 Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (every test the spec retires; §2 marks the
-primary one), `rust_features` (what the proof must handle), and `blocking_gaps` (the numbers in
-`AUDIT-trust-for-test-migration-2026-10-15.md` §7 (historical internal audit)). Gap 0 is listed on every row: the installed
-seal publishes no Clean row. Seal `150efe4a` fixes that locally, but it is not on the machine's `trust` channel yet.
+primary one), `rust_features` (what the proof must handle), and `blocking_gaps` (rows of the gap
+table in `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7). Gap 0, an installed seal that
+publishes no Clean row, is on every row.
 
 ```tsv
 id	kind	functions	statement	subsumes	rust_features	blocking_gaps
@@ -352,7 +352,7 @@ src/sentinel.rs	named_launches_and_forgive_launch_of_match_pid_start_time_and_ca
 src/source.rs	an_invalid_slug_reaches_the_log_by_its_length	pick-slug-and-resolve	
 ```
 
-## 3. Coverage
+## 3. Proof order
 
 - 175 live tests; 172 map to one of the 77 specs, and 3 are not spec samples (§4).
 - The biggest collapses (primary tests): `github-rest-lane` (11), `boot-sentinel-state-machine` (10), `curl-lane-option-sets` (7), `full-pass-schedule-rule` (6), `manifest-round-trip` (5), `roster-authorize-appcast` (5), `resumable-download-loop` (5), and 4 each for `advisory-file-lock`, `github-pages-whole-listing`, `resume-plan-and-prefix-rules` and `roster-master-verify`.
@@ -362,9 +362,28 @@ src/source.rs	an_invalid_slug_reaches_the_log_by_its_length	pick-slug-and-resolv
   folded into `url-builders`. `filesize_exceeded` and `vendor_curl_refusal` are defined once, in `vendor-download-verdict`,
   and `vendor-get-step` cites them.
 
-## 4. Tests that are not spec samples
+- `url-builders` (with `slug-validity`, the lemma `Safe(s) && |s| <= 100`) comes before
+  `pointer-location-strict`, then `pointer-classify`, then `pointer-resolve-one-request`.
+- `release-tag-grammar` (its round-trip lemma) comes before `canonical-app-tag`. It and
+  `linux-target-names` come before `linux-artifact-admission`, then `manifest-validate-gate`, then
+  `manifest-round-trip`.
+- `asset-failure-classification` (`Code`) and `api-host-predicate` come before
+  `resume-plan-and-prefix-rules`. `curl-argv-shape` comes before clause (h) of
+  `curl-lane-option-sets` and before `curl-child-env`.
+- `transient-status`, `vendor-trailer`, `header-readers` and `vendor-download-verdict` come before
+  `vendor-get-step` and `vendor-head-step`.
+- `roster-master-verify` and `roster-machine-and-live` come before `roster-authorize-appcast`, whose
+  revocation corollary comes from `roster-validate-bijection`. `roster-admit` comes before the
+  corollary of `clock-fails-closed`.
+- `policy-knob-predicates` comes before `handoff-policy-parse`, then `ranges-read-leniently` and
+  `cutter-strict-read`, then `for-build-and-hull`, then `hull-dominates-every-rescue`,
+  `keeps-every-sealed-build` and `adoption-decision`. `momentary-read-errors` comes before
+  `bundle-policy-read`.
+- `pass-outcome-words` comes before `stamps-parse`. `full-pass-schedule-rule` rests on
+  `elapsed`/`remaining` alone and should be bound to the `AtpkgPassStamps`/`AtpkgFullPassRule`
+  models (gap 10).
 
-Status (2026-10-17): `rfc3339_parses_the_shapes_the_roster_uses` deleted; aterm-types' `parse_utc_inverts_format_and_refuses_looser_shapes` refuses every shape it listed. Its one roster-owned case came back as `a_fractional_stamp_is_lapsed_not_truncated`: swapping `parse_utc_fractional` in for the roster's reader failed no other test.
+Easiest first (fewest gaps beyond 0, a scalar core):
 
 Status (2026-10-16): `release_asset_bound_is_githubs_ceiling_and_covers_batteries_included` deleted; its `const` assert now sits at module scope beside `RELEASE_ASSET_DOWNLOAD_BOUND` in src/http.rs.
 
@@ -447,6 +466,48 @@ are the ones blocked by gap 0 plus the fewest real gaps, with a scalar core that
 
 The effectful specs (`advisory-file-lock`, `lane-slot-claim`, `ensure-private-dir`, `same-volume`,
 `update-enabled-at`, `bundle-policy-read`, `boot-sentinel-state-machine`, `https-gate-before-spawn`,
-`vendor-body-cap`, `codesign-run-mapping`, the hash arms) come last, on gap 8. Before then, factor out each
-one's pure core (the sentinel record parser and its `Sigma` transitions, the `claim` decision, the
-`read_bounded` verdict over a stat result) and prove that core early.
+`vendor-body-cap`, `codesign-run-mapping`, the hash arms) come last, on gap 8. Their pure cores (the
+sentinel record parser and its `Sigma` transitions, the `claim` decision, `read_bounded`'s verdict)
+can be factored out and proved first.
+
+## 4. Tests that are not spec samples
+
+**move-to-bench**: the test measures an external tool, so it belongs with the real-tool
+measurements, not the unit-test lane. **keep**: it holds something no spec states yet.
+
+| test | why | action |
+|---|---|---|
+| `src/codesign.rs::an_unreadable_file_is_not_a_verdict_and_an_unsigned_one_is` | Measures codesign's real words for an unreadable versus an unsigned Mach-O: evidence for the `MACHINE_FAULTS`/`SIGNATURE_FAULTS` tables. `codesign-verdict-classification` covers the first-party classification. | **move-to-bench** |
+| `src/codesign.rs::a_validly_signed_binary_of_another_signer_is_refused` | Runs the real codesign on /bin/ls (COULD NOT RUN when trustd is silent): the platform tool's behaviour, not this crate's. | **move-to-bench** |
+| `src/pkg_check.rs::the_stamp_parser_is_pinned` | Reaches `aterm_types::rfc3339::parse_utc_fractional` through the one-line `rfc3339_to_unix`, but it is the only test that holds the wrapper to the fractional reader (atpkg stamps `last_pass_at` as `….000000000Z`): swapping in `parse_utc` fails it and nothing else. | **keep** until a spec binds `rfc3339_to_unix` to the writer's shape |
+
+## 5. Open findings
+
+1. **`parse_release_tag` answers Overflow where its doc says Malformed.** `v1.2.3.99999999999999999999`
+   gives `Overflow`, though it is not a run of two or three components. `release-tag-grammar` states
+   the code; no test samples the case.
+2. **A url can make a blocked-host 403 read as a rate limit.** `classify_asset_failure`'s web-host
+   403/404 messages embed the url, and `download_error_is_rate_limit` is a substring test for
+   `rate limited (HTTP `. `asset-failure-classification` carries "the url does not contain the
+   marker" as a precondition; a typed error would remove it.
+3. **A wording pin.** `a_vendor_get_attempt_answers_body_not_modified_or_the_status` asserts the
+   `VendorStatus` text lacks `GitHub`, which holds only because the sampled url lacks it.
+   `http-error-display` states the property.
+4. **An incomplete absent-key list.** `absent_optionals_are_omitted_from_emission` does not check
+   `machine_id` or `roster_seq`; `manifest-round-trip` states the rule for every `None` field.
+5. **Timing and clock dependence.** `an_already_private_dir_is_not_rewritten_and_a_drifted_one_is_hardened`
+   sleeps 20 ms so a ctime change shows; under coarse ctime an unwanted chmod goes unseen
+   (`ensure-private-dir` states the chmod condition). `an_unreadable_clock_fails_closed_rather_than_reading_as_1970`
+   also asserts `now_unix() > 1_700_000_000`, which reads the wall clock and samples no spec.
+6. **Public behaviour with no test, so no spec.** `pkg_check::Stamps::completed_older_index_pass`,
+   `HandoffPolicy::names_producers` and `PolicyFile::names_producers`, `handoff_policy::adopt`'s log
+   lines, `Sentinel::named_launches`, and the `None` arms of `Sentinel::forgive_launch_of`.
+7. **Tests §2 does not map.** No row states what these sample: in `src/http.rs`,
+   `a_link_known_down_is_not_paid_for_twice`, `a_connect_that_never_finished_reached_no_host`,
+   `a_silently_held_transfer_continues_within_the_call`,
+   `a_link_that_keeps_moving_is_continued_and_one_that_cuts_short_is_not_asked_in_a_loop`,
+   `bytes_already_at_the_destination_are_never_continued` and the child half the last three spawn,
+   `probe_a_transfer_over_real_curl`; in `src/privatedir.rs`,
+   `missing_ancestors_are_never_shared_whatever_the_umask` and its child half
+   `probe_missing_ancestors_are_never_shared_whatever_the_umask`; in `src/sentinel.rs`,
+   `each_sentinel_write_names_its_flush`.

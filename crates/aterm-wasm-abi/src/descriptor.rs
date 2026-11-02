@@ -592,8 +592,11 @@ pub fn decode(section: &[u8]) -> Result<Vec<Record>, DecodeError> {
             return Err(DecodeError::Version { at, found: rest[4] });
         }
         let len = u32::from_le_bytes([rest[5], rest[6], rest[7], rest[8]]) as usize;
+        let end = HEADER_LEN
+            .checked_add(len)
+            .ok_or(DecodeError::Truncated { at })?;
         let body = rest
-            .get(HEADER_LEN..HEADER_LEN + len)
+            .get(HEADER_LEN..end)
             .ok_or(DecodeError::Truncated { at })?;
         let mut r = Reader {
             bytes: body,
@@ -607,7 +610,7 @@ pub fn decode(section: &[u8]) -> Result<Vec<Record>, DecodeError> {
             });
         }
         out.push(record);
-        at += HEADER_LEN + len;
+        at += end;
     }
     Ok(out)
 }
@@ -865,6 +868,12 @@ mod tests {
         assert_eq!(decode(&foreign), Err(DecodeError::Magic { at: 0 }));
         assert_eq!(
             decode(&rec[..rec.len() - 1]),
+            Err(DecodeError::Truncated { at: 0 })
+        );
+        assert_eq!(
+            decode(&[
+                MAGIC[0], MAGIC[1], MAGIC[2], MAGIC[3], VERSION, 0xff, 0xff, 0xff, 0xff
+            ]),
             Err(DecodeError::Truncated { at: 0 })
         );
         let mut bad_tag = rec.clone();

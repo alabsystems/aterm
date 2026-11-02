@@ -26,7 +26,17 @@
 //! so; and every error of the ledger fails open, saying so in one line. An interrupt ends a wait
 //! before the build starts.
 //!
-//! How it runs ([`supervise`]): the build is spawned as a pass-through, every descriptor this
+//! How the hidden verb runs it ([`front_exec`], BUILD-ADMIT's shim hop): the front, which is the
+//! shell's job, claims, hands its claim to a holder that keeps it for the build's life ([`hold`]),
+//! and becomes the build in its own pid with nothing else changed (its signal state put back as
+//! it was started with it: `build_admit_exec.rs`), so every reader of that pid, its parent, its
+//! job and its signals finds the build itself. A build started under a cargo that holds its
+//! build lock (a build script's) runs under its verified covering claim; without one, an
+//! ambiguous active lock bounds a wait to one admission look ([`possible_build_lock`]). Where
+//! no holder arms, it runs as [`supervise`] runs it.
+//!
+//! How it runs under its front ([`supervise`], and the in-process callers'
+//! [`run_if_claimed_at`]): the build is spawned as a pass-through, every descriptor this
 //! process holds but its own close-on-exec ones handed on, the claim's among those kept back, so
 //! no descendant holds the claim's lock; every catchable signal that ends a process with no core
 //! is passed on, and the terminal keys' signals too where the terminal's key would not reach the
@@ -45,9 +55,15 @@ use aterm_capacity::{Admit, Claim, Error, Ledger, Machine, Need, Pace, Record};
 
 use crate::build_cache::Tool;
 
-/// The hidden verb that runs a build under its claim, `atpkg __build_admit <target> [args…]`:
-/// what a `targo` shim's hop would exec. No shim runs it yet (the design's BUILD-ADMIT says why).
-pub const VERB: &str = "__build_admit";
+/// The hidden verb that runs a build under its claim, `atpkg __build_admit [--shim <tool>
+/// <placed>] <target> [args…]` ([`run_hidden`]): what a `targo` shim's hop execs.
+pub const VERB: &str = aterm_uds::build_front::ADMIT_VERB;
+
+/// What `atpkg __build_admit --capabilities` answers, alone on its line: this atpkg's front takes
+/// the shim hop's words (`--shim <tool> <placed>`) and requires managed explicit targets.
+/// Version-one fronts do not promise that ownership check, so a new shim cannot name them
+/// in its hop ([`crate::build_cache::registered::helper_speaks_hop`]).
+pub const HOP_CAPABILITY: &str = "aterm-build-admit-hop-v2";
 
 /// The variable that admits a build at once (`now`) instead of waiting (`wait`, the default).
 pub const ADMIT_ENV: &str = "ATERM_ADMIT";
@@ -81,6 +97,74 @@ fn live_ledger() -> Option<Ledger> {
         return Some(Ledger::at(PathBuf::from(dir)));
     }
     Ledger::user()
+}
+
+/// The ledger a front claims in, as a reader of that front finds it: this user's, or in a debug
+/// build the one [`LEDGER_ENV`] names in the front's own environment (`env`, which a reader
+/// answers from what the front was started with), as the front's [`Seat::live`] finds it. A
+/// release build never reads it.
+#[must_use]
+pub fn ledger_of_front(env: &dyn Fn(&str) -> Option<String>) -> Option<Ledger> {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(dir) = env(LEDGER_ENV).filter(|dir| !dir.is_empty()) {
+        return Some(Ledger::at(PathBuf::from(dir)));
+    }
+    #[cfg(not(any(test, debug_assertions)))]
+    let _ = env;
+    Ledger::user()
+}
+
+/// WHAT A FRONT'S LEDGER SAYS OF IT ([`front_claim`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FrontClaim {
+    /// Its claim waits for memory.
+    Waiting {
+        /// The memory it claims, bytes ([`Need::mem`]).
+        mem: u64,
+        /// The pid of each memory claim ahead of it, oldest first, as admission counts them: each
+        /// one held, and each one that waits since earlier (none of its own process, whose oldest
+        /// waiting claim this is); never a claim of no memory. A pid holding two is named twice.
+        ahead: Vec<u32>,
+    },
+    /// Its claim is admitted: it execs its build, or, where no holder armed, runs it.
+    Held,
+}
+
+/// What `ledger` says of the front `pid` (`aterm_uds::build_front::front`), read as `aterm pkg
+/// capacity` reads it (no admissions' lock, nothing removed): [`front_claim_in`] its live claims.
+///
+/// # Errors
+/// [`Ledger::list`]'s.
+pub fn front_claim(ledger: &Ledger, pid: u32) -> std::io::Result<Option<FrontClaim>> {
+    Ok(front_claim_in(&ledger.list()?, pid))
+}
+
+/// What `records` (a ledger's live claims, [`Ledger::list`]) say of the front `pid`: its oldest
+/// claim that waits, with the claims ahead of it, else [`FrontClaim::Held`] where it holds one,
+/// else `None` (none laid yet, or one it no longer needs: a front that claims nothing execs at
+/// once). A reader of many fronts in one ledger lists it once and asks this of each.
+#[must_use]
+pub fn front_claim_in(records: &[Record], pid: u32) -> Option<FrontClaim> {
+    let Some(mine) = records
+        .iter()
+        .filter(|r| r.pid == pid && r.held.is_none())
+        .min_by_key(|r| r.order())
+    else {
+        return records
+            .iter()
+            .any(|r| r.pid == pid)
+            .then_some(FrontClaim::Held);
+    };
+    let mut ahead: Vec<&Record> = records
+        .iter()
+        .filter(|r| r.order() != mine.order() && r.need.mem > 0)
+        .filter(|r| r.held.is_some() || r.order() < mine.order())
+        .collect();
+    ahead.sort_by_key(|r| r.order());
+    Some(FrontClaim::Waiting {
+        mem: mine.need.mem,
+        ahead: ahead.into_iter().map(|r| r.pid).collect(),
+    })
 }
 
 /// What a build reads for its selection.
@@ -189,7 +273,11 @@ fn value<'a>(inline: Option<&'a str>, it: &mut dyn Iterator<Item = &'a str>) -> 
 }
 
 /// WHETHER A CALL CLAIMS, and what it builds: `args` as `tool` reads them (a `cargo` call's
-/// first word may name a toolchain, `+stable`). `None` for a call that never claims.
+/// first word may name a toolchain, `+stable`). `None` for a call that never claims: one that
+/// compiles nothing, asks for help, a version or a list, or only resolves what it would build
+/// (`--unit-graph`, `--build-plan`: verify's shaped test compile asks for each call's unit graph
+/// before any of its stages claims, and such a call would otherwise claim the whole build's peak
+/// and wait in the ledger for it).
 #[must_use]
 pub fn classify(args: &[String], tool: Tool) -> Option<Build> {
     let mut it = args.iter().map(String::as_str).peekable();
@@ -214,7 +302,9 @@ pub fn classify(args: &[String], tool: Tool) -> Option<Build> {
             _ => (a, None),
         };
         match flag {
-            "-h" | "--help" | "-V" | "--version" | "--list" => return None,
+            "-h" | "--help" | "-V" | "--version" | "--list" | "--unit-graph" | "--build-plan" => {
+                return None;
+            }
             "--unverified" => unverified = true,
             "-p" | "--package" => named.push(value(inline, &mut it)?.to_owned()),
             "--workspace" | "--all" => workspace = true,
@@ -301,20 +391,30 @@ pub fn classify(args: &[String], tool: Tool) -> Option<Build> {
 fn package_name(toml: &str) -> Option<String> {
     let mut in_package = false;
     for line in toml.lines() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            in_package = line == "[package]";
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('[') {
+            let header = trimmed.split('#').next().unwrap_or(trimmed).trim();
+            in_package = header == "[package]";
             continue;
         }
         if !in_package {
             continue;
         }
-        let Some((k, v)) = line.split_once('=') else {
+        let Some((k, v)) = trimmed.split_once('=') else {
             continue;
         };
         if k.trim() == "name" {
-            let v = v.trim().trim_matches(['"', '\'']);
-            return (!v.is_empty()).then(|| v.to_owned());
+            let v = v.trim();
+            let parsed = if let Some(quote) = v.chars().next().filter(|c| *c == '"' || *c == '\'') {
+                let rest = &v[quote.len_utf8()..];
+                rest.find(quote).map(|end| &rest[..end])?
+            } else {
+                v.split('#').next().unwrap_or(v).trim()
+            };
+            return (!parsed.is_empty()).then(|| parsed.to_owned());
         }
     }
     None
@@ -346,9 +446,9 @@ pub fn key(build: &Build, cwd: &Path) -> Key {
             .or_else(|| {
                 from.ancestors()
                     .map(|d| d.join("Cargo.toml"))
-                    .find(|m| m.is_file())
+                    .find(|m| std::fs::symlink_metadata(m).is_ok_and(|meta| meta.is_file()))
             })
-            .and_then(|m| std::fs::read_to_string(m).ok())
+            .and_then(|m| crate::metadata_io::read_bounded_regular_utf8(&m, 1 << 20).ok())
             .and_then(|t| package_name(&t))
             .map(|name| vec![name]),
     };
@@ -438,6 +538,9 @@ pub enum Admission {
     Open(String),
     /// An interrupt ended its wait: the build does not start.
     Stopped(Error),
+    /// An unclaimed nested build could wait on work waiting for its parent's lock. No build
+    /// started and no claim was forced; enter the outer build through the admission shim.
+    Refused(String),
 }
 
 /// A build's held claim, and where its peak is kept ([`Held::end`]).
@@ -461,18 +564,46 @@ impl Held {
         &self.key
     }
 
-    /// The build ended: keep `peak` under its key when something was read and it `succeeded`, or
-    /// when it failed with a peak that would claim more than this claim did (a failed build
-    /// stopped short of the work its key names, so its peak is the least that work takes: kept, it
-    /// raises the key's next claim, and one below would lower it), unless the run was light beside
-    /// the heavy peak its key keeps ([`Records::keep_unless_light`]: a fresh build that compiled
-    /// nothing); then let the claim go. A key whose builds keep failing (an edit-test loop's
-    /// red runs, a build stopped for swap) so learns what its compile takes. The bytes kept;
+    /// The build ended: let the claim go, then keep its peak ([`Ended::keep`]). The bytes kept;
     /// `None` when nothing was, or the record could not be written (said in one line).
     pub fn end(self, succeeded: bool, peak: u64, say: &mut dyn FnMut(&str)) -> Option<u64> {
+        self.let_go().keep(succeeded, peak, say)
+    }
+
+    /// The build ended: LET THE CLAIM GO NOW, before its peak is read whole or kept (a meter's last
+    /// read, a write of its book under that book's lock), so no waiter waits on a build that has
+    /// ended; what keeps its peak is left ([`Ended::keep`]).
+    #[must_use]
+    pub fn let_go(self) -> Ended {
         let Held { claim, key, own } = self;
-        let raises = aterm_capacity::peak_claim(peak) > claim.record().need.mem;
-        let kept = match own.filter(|_| peak > 0 && (succeeded || raises)) {
+        let claimed = claim.record().need.mem;
+        drop(claim);
+        Ended { claimed, key, own }
+    }
+}
+
+/// An ended build whose claim went ([`Held::let_go`]): what it claimed, the key its peak is kept
+/// under, and where.
+#[derive(Debug)]
+pub struct Ended {
+    claimed: u64,
+    key: Key,
+    own: Option<PathBuf>,
+}
+
+impl Ended {
+    /// Keep `peak` under its key when something was read and it `succeeded`, or when it failed
+    /// with a peak that would claim more than its claim did (a failed build stopped short of the
+    /// work its key names, so its peak is the least that work takes: kept, it raises the key's
+    /// next claim, and one below would lower it), unless the run was light beside the heavy peak
+    /// its key keeps ([`Records::keep_unless_light`]: a fresh build that compiled nothing). A key
+    /// whose builds keep failing (an edit-test loop's red runs, a build stopped for swap) so
+    /// learns what its compile takes. The bytes kept; `None` when nothing was, or the record could
+    /// not be written (said in one line).
+    pub fn keep(self, succeeded: bool, peak: u64, say: &mut dyn FnMut(&str)) -> Option<u64> {
+        let Ended { claimed, key, own } = self;
+        let raises = aterm_capacity::peak_claim(peak) > claimed;
+        match own.filter(|_| peak > 0 && (succeeded || raises)) {
             Some(path) => {
                 let at = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -489,9 +620,7 @@ impl Held {
                 }
             }
             None => None,
-        };
-        drop(claim);
-        kept
+        }
     }
 }
 
@@ -505,6 +634,16 @@ fn open(say: &mut dyn FnMut(&str), why: &str) -> Admission {
 /// CLAIM `build`'s memory, run in `cwd`, at `seat`, saying through `say` what it waits for
 /// ([`aterm_capacity::admit_with`]), what fails open and why it claims nothing.
 pub fn admit(build: &Build, cwd: &Path, seat: &Seat<'_>, say: &mut dyn FnMut(&str)) -> Admission {
+    admit_bounded(build, cwd, seat, &|| None, say)
+}
+
+fn admit_bounded(
+    build: &Build,
+    cwd: &Path,
+    seat: &Seat<'_>,
+    probe_lock: &dyn Fn() -> Option<PathBuf>,
+    say: &mut dyn FnMut(&str),
+) -> Admission {
     let Some(ledger) = &seat.ledger else {
         return open(say, "no home directory keeps the capacity ledger");
     };
@@ -526,6 +665,8 @@ pub fn admit(build: &Build, cwd: &Path, seat: &Seat<'_>, say: &mut dyn FnMut(&st
         }
         Err(e) => return open(say, &format!("the capacity ledger could not be read ({e})")),
     }
+    // Hints never precede verified authority, and an explicit mode choice needs no hint.
+    let possible_lock = (seat.mode == Admit::Wait).then(probe_lock).flatten();
     let key = key(build, cwd);
     let own = seat.own.as_deref().map(Records::load).unwrap_or_default();
     let verify = seat
@@ -552,23 +693,54 @@ pub fn admit(build: &Build, cwd: &Path, seat: &Seat<'_>, say: &mut dyn FnMut(&st
         }
         say(line);
     };
-    let mut admitted = aterm_capacity::admit_with(
-        ledger,
-        seat.machine,
-        ask(beyond),
-        seat.mode,
-        seat.pace,
-        &mut speak,
-    );
+    let attempt = |need: Need, speak: &mut dyn FnMut(&str)| {
+        if seat.mode != Admit::Wait || possible_lock.is_none() {
+            return aterm_capacity::admit_with(
+                ledger,
+                seat.machine,
+                need,
+                seat.mode,
+                seat.pace,
+                speak,
+            );
+        }
+        if let Some(why) = aterm_capacity::never(&need, &reading) {
+            return Err(Error::Never(why));
+        }
+        let watch = aterm_toolchain::interrupt::Watch::enter();
+        if let Some(signal) = watch.take() {
+            return Err(Error::Stopped {
+                signal: Some(signal),
+                short: None,
+            });
+        }
+        let polled = aterm_capacity::Waiter::enter(ledger, seat.machine, need)
+            .map_err(Error::Ledger)?
+            .poll(seat.machine);
+        if let Some(signal) = watch.take() {
+            drop(polled);
+            return Err(Error::Stopped {
+                signal: Some(signal),
+                short: None,
+            });
+        }
+        match polled {
+            aterm_capacity::Polled::Admitted(claim) => Ok(claim),
+            aterm_capacity::Polled::Waiting(waiter, short) => {
+                drop(waiter);
+                Err(Error::Stopped {
+                    signal: None,
+                    short: Some(short),
+                })
+            }
+            // Its claim file was removed between its entry and its look: no look could admit
+            // it, as `admit_waiting` ends such a wait.
+            aterm_capacity::Polled::Gone(e) => Err(Error::Ledger(e)),
+        }
+    };
+    let mut admitted = attempt(ask(beyond), &mut speak);
     if !beyond && matches!(admitted, Err(Error::Never(_))) {
-        admitted = aterm_capacity::admit_with(
-            ledger,
-            seat.machine,
-            ask(true),
-            seat.mode,
-            seat.pace,
-            &mut speak,
-        );
+        admitted = attempt(ask(true), &mut speak);
     }
     match admitted {
         Ok(claim) => Admission::Claimed(Box::new(Held {
@@ -576,6 +748,19 @@ pub fn admit(build: &Build, cwd: &Path, seat: &Seat<'_>, say: &mut dyn FnMut(&st
             key,
             own: seat.own.clone(),
         })),
+        Err(e @ Error::Stopped { signal: None, .. }) if possible_lock.is_some() => {
+            let line = format!(
+                "{SAYS}: {what}: an ancestor has a held build-lock file {}, but its ownership is \
+                 unproven; admission would wait ({e}) and could cycle; enter the outer build \
+                 through the targo admission shim; no build started",
+                possible_lock
+                    .as_deref()
+                    .unwrap_or_else(|| Path::new("?"))
+                    .display(),
+            );
+            say(&line);
+            Admission::Refused(line)
+        }
         Err(e @ Error::Stopped { .. }) => {
             say(&format!(
                 "{SAYS}: {what}: its memory claim was {e}; it did not start"
@@ -697,8 +882,9 @@ pub fn supervise(
         None => child.wait(),
     };
     if let (Some(held), Some(meter)) = (held, meter) {
+        let ended = held.let_go();
         let peak = meter.stop(floor());
-        held.end(
+        ended.keep(
             status.as_ref().is_ok_and(std::process::ExitStatus::success),
             peak,
             say,
@@ -742,7 +928,10 @@ fn end_tree(
     }) else {
         return;
     };
-    let until = std::time::Instant::now() + TREE_ENDS_WITHIN;
+    let now = std::time::Instant::now();
+    let until = now
+        .checked_add(TREE_ENDS_WITHIN)
+        .unwrap_or_else(|| now + std::time::Duration::from_secs(86_400 * 365));
     let mut sent: Vec<u32> = Vec::new();
     loop {
         let left = meter.left();
@@ -775,14 +964,32 @@ fn end_tree(
 /// Replace this process with `target` run on `args`, unchanged: what a call that claims nothing
 /// runs. Returns only when the exec failed: 127, said.
 fn exec<A: AsRef<std::ffi::OsStr>>(target: &Path, args: &[A]) -> std::process::ExitCode {
-    #[expect(
-        clippy::disallowed_types,
-        reason = "a pass-through by exec: its caller's descriptors are the program's"
-    )]
-    let mut command = std::process::Command::new(target);
-    aterm_uds::spawn::set_flags(&mut command, 0);
-    command.args(args);
-    let err = crate::platform::exec_or_run(&mut command);
+    exec_marked(target, args, None)
+}
+
+/// [`exec`], with [`aterm_capacity::COVER_ENV`] set to `marker` where one is given. On Unix the
+/// build starts with the signal state this process was started with ([`becoming`]).
+fn exec_marked<A: AsRef<std::ffi::OsStr>>(
+    target: &Path,
+    args: &[A],
+    marker: Option<&str>,
+) -> std::process::ExitCode {
+    #[cfg(unix)]
+    let err = becoming::become_build(target, args, marker);
+    #[cfg(not(unix))]
+    let err = {
+        #[expect(
+            clippy::disallowed_types,
+            reason = "a pass-through by exec: its caller's descriptors are the program's"
+        )]
+        let mut command = std::process::Command::new(target);
+        aterm_uds::spawn::set_flags(&mut command, 0);
+        command.args(args);
+        if let Some(marker) = marker {
+            command.env(aterm_capacity::COVER_ENV, marker);
+        }
+        crate::platform::exec_or_run(&mut command)
+    };
     eprintln!("atpkg {VERB}: failed to exec {}: {err}", target.display());
     std::process::ExitCode::from(127)
 }
@@ -834,6 +1041,7 @@ pub fn run_if_claimed_at(
             signal: Some(sig), ..
         }) => Some(stopped_by(sig)),
         Admission::Stopped(_) => Some(std::process::ExitCode::from(1)),
+        Admission::Refused(_) => Some(std::process::ExitCode::from(75)),
         Admission::Covered(_) | Admission::Own(_) | Admission::Open(_) => None,
     }
 }
@@ -852,27 +1060,333 @@ pub fn run_if_claimed(
     run_if_claimed_at(target, args, tool, env, &cwd, &Seat::live())
 }
 
-/// `atpkg __build_admit <target> [args…]`: what a `targo` or `targo-tippy` shim's hop would run
-/// once its block has placed the build ([`VERB`]). A call that claims runs `target` under its claim
-/// ([`run_if_claimed`]); every other call, and one whose words are not all UTF-8, becomes
-/// `target` by exec, its words handed on unchanged.
+/// `atpkg __build_admit [--shim <tool> <placed>] <target> [args…]`: what a `targo` or
+/// `targo-tippy` shim's hop runs once its block has placed the build ([`VERB`]); `atpkg
+/// __build_admit --capabilities` answers [`HOP_CAPABILITY`] and runs nothing. The shim's form
+/// first registers the call's build cache as the shim's own registration call did
+/// ([`crate::build_cache::registered::observe_shim_call`]: a refusal is exit 75, no build
+/// started); `<placed>` says what the block changed (`-` nothing, `config` its two leading words,
+/// plus their directory exported for a call that
+/// [`loses_config`](crate::build_cache::loses_config) (tippy, clippy), `env` only its export of
+/// `CARGO_BUILD_BUILD_DIR` (the trust lane)), so the registration reads the call as typed.
+/// Then a call that claims runs `target` under its claim in this pid ([`front_exec`]); other calls
+/// become `target` by exec, their words handed on unchanged. A shim refuses non-UTF-8 words
+/// because its cache placement cannot be established; a non-shim front still passes them on.
 #[must_use]
 pub fn run_hidden(argv: &[std::ffi::OsString]) -> std::process::ExitCode {
+    if let [only] = argv
+        && only == "--capabilities"
+    {
+        println!("{HOP_CAPABILITY}");
+        return std::process::ExitCode::SUCCESS;
+    }
+    let (shim, argv) = match argv.split_first() {
+        Some((first, rest)) if first == "--shim" => match rest {
+            [tool, placed, rest @ ..] => {
+                let tool = match tool.to_str() {
+                    Some("targo") => Tool::Targo,
+                    Some("targo-tippy") => Tool::Tippy,
+                    _ => return usage(),
+                };
+                (Some((tool, placed.as_os_str())), rest)
+            }
+            _ => return usage(),
+        },
+        _ => (None, argv),
+    };
     let Some((target, rest)) = argv.split_first() else {
-        eprintln!("atpkg {VERB}: usage: {VERB} <target> [args…]");
-        return std::process::ExitCode::from(2);
+        return usage();
     };
     let target = Path::new(target);
-    #[cfg(unix)]
-    if let Some(args) = rest
+    let words = rest
         .iter()
         .map(|a| a.to_str().map(str::to_owned))
-        .collect::<Option<Vec<String>>>()
-        && let Some(code) = run_if_claimed(target, &args, tool_of(target), &[])
+        .collect::<Option<Vec<String>>>();
+    if let Some((tool, placed)) = shim {
+        let registered = words
+            .as_deref()
+            .ok_or_else(|| std::io::Error::other("compiler-shim arguments are not UTF-8"))
+            .and_then(|words| {
+                crate::build_cache::registered::observe_shim_call(
+                    words,
+                    tool,
+                    placed.to_str().unwrap_or(""),
+                    std::env::current_dir().ok().as_deref(),
+                )
+            });
+        if let Err(error) = registered {
+            eprintln!("atpkg: build cache ownership refused: {error}; no build started");
+            return std::process::ExitCode::from(75);
+        }
+    }
+    #[cfg(unix)]
+    if let Some(args) = words
+        && let Ok(cwd) = std::env::current_dir()
     {
-        return code;
+        let tool = shim.map_or_else(|| tool_of(target), |(tool, _)| tool);
+        let seat = Seat::live();
+        let possible_lock = || {
+            let me = seat.pid;
+            possible_build_lock(
+                &|| {
+                    seat.machine
+                        .lineage(me)
+                        .map(|line| line.ancestors(me))
+                        .unwrap_or_default()
+                },
+                &|pid| aterm_uds::holders::open_files(pid).unwrap_or_default(),
+                &|file| aterm_uds::ownerlock::probe(file) == aterm_uds::ownerlock::Owner::Live,
+            )
+        };
+        return front_exec_bounded(target, &args, tool, &cwd, &seat, &possible_lock);
     }
     exec(target, rest)
+}
+
+/// Candidate lock-file names for a possible-cycle hint, never ownership or admission proof.
+/// Cargo was observed opening these while building: its build directory's, its artifact
+/// directory's, and the one an older cargo opened for both. Measured
+/// (2026-10-29, `lsof` of the parent from a build script and from a test): targo 1.99.0-dev holds
+/// all three open while a build script runs and none while a test or a `targo run` program runs;
+/// cargo 1.95.0 holds `.cargo-lock` while a build script runs and none while a test runs.
+pub const CARGO_LOCKS: &[&str] = &[".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock"];
+
+/// A POSSIBLE WAIT CYCLE, NOT ADMISSION AUTHORITY: an ancestor has a Cargo-lock-named file
+/// open and a kernel probe says a lock is held there. Neither proves it owns that lock. A
+/// verified covering/own/credited claim still answers first; otherwise Wait gets one ordinary
+/// admission look and a named refusal if it cannot run, rather than force a claim or deadlock.
+/// An unlocked file, an unknown probe, and Cargo's environment words imply no exception.
+#[must_use]
+pub fn possible_build_lock(
+    ancestors: &dyn Fn() -> Vec<u32>,
+    open: &dyn Fn(u32) -> Vec<PathBuf>,
+    held: &dyn Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    ancestors().into_iter().find_map(|pid| {
+        open(pid).into_iter().find(|file| {
+            file.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| CARGO_LOCKS.contains(&n))
+                && held(file)
+        })
+    })
+}
+
+/// The verb's usage, said: 2.
+fn usage() -> std::process::ExitCode {
+    eprintln!("atpkg {VERB}: usage: {VERB} [--shim <tool> <placed>] <target> [args…]");
+    std::process::ExitCode::from(2)
+}
+
+/// THE SHIM HOP'S FRONT: `target` run on `args` as `tool` reads it, in `cwd`, at `seat`, IN THIS
+/// PROCESS'S PID. A call that claims nothing becomes `target` at once ([`exec`]). A claimed one
+/// hands its claim to a holder ([`hand_over`]) and becomes `target` with nothing else changed, so
+/// every reader of this pid, its parent, its job and its signals finds the build itself; where
+/// no holder arms, the build runs under the claim here as [`supervise`] runs it, and only where
+/// that cannot start does it run unclaimed, said. An interrupt that ended the wait ends this
+/// process as it would have ended the build ([`stopped_by`]).
+#[cfg(unix)]
+pub fn front_exec(
+    target: &Path,
+    args: &[String],
+    tool: Tool,
+    cwd: &Path,
+    seat: &Seat<'_>,
+) -> std::process::ExitCode {
+    front_exec_bounded(target, args, tool, cwd, seat, &|| None)
+}
+
+#[cfg(unix)]
+fn front_exec_bounded(
+    target: &Path,
+    args: &[String],
+    tool: Tool,
+    cwd: &Path,
+    seat: &Seat<'_>,
+    probe_lock: &dyn Fn() -> Option<PathBuf>,
+) -> std::process::ExitCode {
+    let Some(build) = classify(args, tool) else {
+        return exec(target, args);
+    };
+    let mut say = |line: &str| eprintln!("{line}");
+    let held = match admit_bounded(&build, cwd, seat, probe_lock, &mut say) {
+        Admission::Claimed(held) => *held,
+        Admission::Stopped(Error::Stopped {
+            signal: Some(sig), ..
+        }) => return stopped_by(sig),
+        Admission::Stopped(_) => return std::process::ExitCode::from(1),
+        Admission::Refused(_) => return std::process::ExitCode::from(75),
+        Admission::Covered(_) | Admission::Own(_) | Admission::Open(_) => {
+            return exec(target, args);
+        }
+    };
+    match hand_over(&held) {
+        Ok(()) => {
+            let marker = std::env::var_os(aterm_capacity::COVER_ENV)
+                .map(|_| held.claim.record().cover_marker());
+            held.claim.hand_off();
+            exec_marked(target, args, marker.as_deref())
+        }
+        Err(why) => {
+            say(&format!(
+                "{SAYS}: its claim's holder did not arm ({why}); the build runs under this front"
+            ));
+            let mut command = aterm_uds::spawnfd::transparent(target);
+            command.args(args);
+            match supervise(Some(held), &mut command, &children_maxrss, &mut say) {
+                Ok(status) => end_like(status),
+                Err(e) => {
+                    say(&format!(
+                        "{SAYS}: the build did not start under its claim ({e}); it runs unclaimed"
+                    ));
+                    exec(target, args)
+                }
+            }
+        }
+    }
+}
+
+/// The longest a front waits for its holder to arm ([`hand_over`]): a production hang bound, past
+/// which the build runs under the front instead.
+#[cfg(target_os = "macos")]
+pub const HOLDER_ARMS_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// HAND `held`'s CLAIM TO A HOLDER ([`hold`]): this executable, as recorded at its `main`'s first
+/// call and unchanged at its path ([`aterm_uds::tether::executable`]), spawned detached with a copy
+/// of the claim's descriptor and the arming pipe, and armed: its pid and then its arming byte
+/// read within [`HOLDER_ARMS_WITHIN`]. Its child, which forks the holder away, is reaped. A
+/// holder that did not arm is let go: the pipe closed under it (so a late arming fails and it
+/// leaves, handing the claim off), and once its pid was read it is ended by proof of its
+/// identity. The claim is this process's either way until it hands it off. Why it did not arm,
+/// where it did not.
+#[cfg(target_os = "macos")]
+fn hand_over(held: &Held) -> Result<(), String> {
+    let exe = aterm_uds::tether::executable().ok_or("no unchanged image of this executable")?;
+    let me = std::process::id();
+    let serial = i32::try_from(me)
+        .ok()
+        .and_then(aterm_uds::process::process_serial)
+        .ok_or("this process's serial is unread")?;
+    let words = hold::Words {
+        pid: me,
+        serial,
+        claim: held.claim.path().to_path_buf(),
+        key: held.key.clone(),
+        own: held.own.clone(),
+    };
+    let descriptor = held
+        .claim
+        .descriptor()
+        .map_err(|e| format!("its claim's descriptor: {e}"))?;
+    let (armed, arming) = std::io::pipe().map_err(|e| format!("a pipe: {e}"))?;
+    let mut command = aterm_uds::spawnfd::LaneCommand::new(exe);
+    command
+        .arg(hold::HOLD_VERB)
+        .args(words.render())
+        .stdin(aterm_uds::spawnfd::ChildStdio::Null)
+        .stdout(aterm_uds::spawnfd::ChildStdio::Null)
+        .stderr(aterm_uds::spawnfd::ChildStdio::Null);
+    let mut child = aterm_uds::spawnfd::detached_with_two_fds(command, descriptor, arming.into())
+        .map_err(|e| format!("its spawn: {e}"))?;
+    let (holder, said) = read_arming(&armed, HOLDER_ARMS_WITHIN);
+    if said.is_ok() {
+        drop(armed);
+        let _ = child.wait();
+        return Ok(());
+    }
+    drop(armed);
+    let _ = child.kill();
+    let _ = child.wait();
+    if let Some(token) = holder {
+        let _ = aterm_uds::process::end_proven(
+            token,
+            aterm_uds::process::END_GRACE,
+            &mut aterm_uds::process::EndControlLive,
+            |_| true,
+        );
+    }
+    said
+}
+
+/// Off macOS no holder runs ([`hold`]): the build runs under its front.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn hand_over(_held: &Held) -> Result<(), String> {
+    Err("no holder runs on this platform".to_owned())
+}
+
+/// Read a holder's arming from `armed` within `within`: its identity, once its pid was read and
+/// it named a live process, and whether it armed (else why not).
+#[cfg(target_os = "macos")]
+fn read_arming(
+    armed: &std::io::PipeReader,
+    within: std::time::Duration,
+) -> (Option<aterm_uds::process::Identity>, Result<(), String>) {
+    use std::os::fd::AsRawFd as _;
+    let until = std::time::Instant::now() + within;
+    let mut got = [0_u8; 5];
+    let mut have = 0;
+    let mut holder = None;
+    while have < got.len() {
+        let left = until.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return (
+                holder,
+                Err(format!("not armed within {}s", within.as_secs())),
+            );
+        }
+        let mut poll = libc::pollfd {
+            fd: armed.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ms = libc::c_int::try_from(left.as_millis().max(1)).unwrap_or(libc::c_int::MAX);
+        // SAFETY: one `pollfd`, live for the call.
+        let ready = unsafe { libc::poll(&raw mut poll, 1, ms) };
+        if ready < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return (
+                holder,
+                Err(format!("its pipe: {}", std::io::Error::last_os_error())),
+            );
+        }
+        if ready == 0 {
+            continue;
+        }
+        // SAFETY: reads into the unread tail of `got`, live for the call.
+        let n = unsafe {
+            libc::read(
+                armed.as_raw_fd(),
+                got[have..].as_mut_ptr().cast(),
+                got.len() - have,
+            )
+        };
+        match n {
+            0 => return (holder, Err("it ended unarmed".to_owned())),
+            n if n < 0 => {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return (
+                    holder,
+                    Err(format!("its pipe: {}", std::io::Error::last_os_error())),
+                );
+            }
+            n => have += n.unsigned_abs(),
+        }
+        if holder.is_none() && have >= 4 {
+            let pid = u32::from_le_bytes([got[0], got[1], got[2], got[3]]);
+            holder = i32::try_from(pid)
+                .ok()
+                .and_then(aterm_uds::process::read_identity);
+        }
+    }
+    if got[4] == 1 {
+        (holder, Ok(()))
+    } else {
+        (holder, Err("its arming byte was not 1".to_owned()))
+    }
 }
 
 /// End as `sig` would have ended the build it kept from starting.
@@ -944,6 +1458,13 @@ pub fn end_like(status: std::process::ExitStatus) -> std::process::ExitCode {
 #[cfg(unix)]
 #[path = "build_admit_front.rs"]
 pub mod front;
+
+#[cfg(unix)]
+#[path = "build_admit_exec.rs"]
+mod becoming;
+
+#[path = "build_admit_hold.rs"]
+pub mod hold;
 
 #[cfg(test)]
 #[path = "build_admit_tests.rs"]

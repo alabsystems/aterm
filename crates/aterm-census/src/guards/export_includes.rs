@@ -99,11 +99,12 @@ fn includes(file: &SourceFile, present: &BTreeSet<&str>) -> Vec<(usize, String)>
     let mut out = Vec::new();
     for name in MACROS {
         for at in hits(code, name, Bound::Word) {
-            let Some(open) = token(code, at + name.len(), "!").and_then(|p| token(code, p, "("))
+            let Some((open, close_delim)) =
+                token(code, at + name.len(), "!").and_then(|p| open_delim(code, p))
             else {
                 continue;
             };
-            let Some((from_crate, path)) = argument(code, text, open) else {
+            let Some((from_crate, path)) = argument(code, text, open, close_delim) else {
                 continue;
             };
             let base = if from_crate {
@@ -126,36 +127,56 @@ fn includes(file: &SourceFile, present: &BTreeSet<&str>) -> Vec<(usize, String)>
 }
 
 /// What an include's argument names, from `at` in the CODE view (just inside its
-/// parenthesis): `(false, path)` for a string literal, `(true, path)` for a `concat!` whose
-/// first argument is `env!("CARGO_MANIFEST_DIR")` and whose others are string literals.
-fn argument(code: &str, text: &str, at: usize) -> Option<(bool, String)> {
-    if let Some((path, _)) = literal(code, text, at) {
-        return Some((false, path.to_string()));
+/// opening delimiter, closed by `close_delim`): `(false, path)` for a string literal,
+/// `(true, path)` for a `concat!` whose first argument is `env!("CARGO_MANIFEST_DIR")`
+/// and whose others are string literals.
+fn argument(code: &str, text: &str, at: usize, close_delim: &str) -> Option<(bool, String)> {
+    if let Some((path, next)) = literal(code, text, at) {
+        let end = token(code, next, ",")
+            .and_then(|p| token(code, p, close_delim))
+            .or_else(|| token(code, next, close_delim));
+        return end.map(|_| (false, path.to_string()));
     }
     let mut at = token(code, at, "concat")?;
     at = token(code, at, "!")?;
-    at = token(code, at, "(")?;
-    at = token(code, at, "env")?;
+    let (open_concat, close_concat) = open_delim(code, at)?;
+    at = token(code, open_concat, "env")?;
     at = token(code, at, "!")?;
-    at = token(code, at, "(")?;
-    let (var, next) = literal(code, text, at)?;
+    let (open_env, close_env) = open_delim(code, at)?;
+    let (var, next) = literal(code, text, open_env)?;
     if var != "CARGO_MANIFEST_DIR" {
         return None;
     }
-    at = token(code, next, ")")?;
+    at = token(code, next, ",")
+        .and_then(|p| token(code, p, close_env))
+        .or_else(|| token(code, next, close_env))?;
     let mut path = String::new();
     loop {
-        if token(code, at, ")").is_some() {
-            return Some((true, path));
+        if let Some(after_concat) = token(code, at, close_concat) {
+            let end = token(code, after_concat, ",")
+                .and_then(|p| token(code, p, close_delim))
+                .or_else(|| token(code, after_concat, close_delim));
+            return end.map(|_| (true, path));
         }
         at = token(code, at, ",")?;
-        if token(code, at, ")").is_some() {
-            return Some((true, path));
+        if let Some(after_concat) = token(code, at, close_concat) {
+            let end = token(code, after_concat, ",")
+                .and_then(|p| token(code, p, close_delim))
+                .or_else(|| token(code, after_concat, close_delim));
+            return end.map(|_| (true, path));
         }
         let (part, next) = literal(code, text, at)?;
         path.push_str(part);
         at = next;
     }
+}
+
+/// The offset just past a macro's opening delimiter `(`, `[`, or `{`, paired with its closer.
+fn open_delim(code: &str, at: usize) -> Option<(usize, &'static str)> {
+    token(code, at, "(")
+        .map(|p| (p, ")"))
+        .or_else(|| token(code, at, "[").map(|p| (p, "]")))
+        .or_else(|| token(code, at, "{").map(|p| (p, "}")))
 }
 
 /// The offset just past `tok`, when it is the next thing after blanks from `at`.
@@ -237,7 +258,9 @@ mod tests {
                    const G: &str = \"include_str!(\\\"../tests/corpus/one.txt\\\")\";\n\
                    const H: &str = include_str!(\"../../../docs/notes.md\");\n\
                    const I: &str = include_str!(\"../../../vendor/astream/Cargo.toml\");\n\
-                   const J: &str = include_str!(\"../../../../../outside.txt\");\n}\n";
+                   const J: &str = include_str!(\"../../../../../outside.txt\");\n\
+                   const K: &str = include_str![\"../tests/corpus/one.txt\"];\n\
+                   const L: &str = include_str!{concat![env!(\"CARGO_MANIFEST_DIR\"), \"/../../vendor/astream/evidence/manifest.toml\"]};\n}\n";
         let found = run(&[
             ("Cargo.toml", ""),
             ("crates/b/Cargo.toml", ""),
@@ -263,6 +286,8 @@ mod tests {
                 "crates/b/src/lib.rs:7",
                 "crates/b/src/lib.rs:9",
                 "crates/b/src/lib.rs:14",
+                "crates/b/src/lib.rs:17",
+                "crates/b/src/lib.rs:18",
             ],
             "{found:#?}"
         );

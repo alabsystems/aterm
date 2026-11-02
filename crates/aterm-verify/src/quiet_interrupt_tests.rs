@@ -244,3 +244,109 @@ fn one_interrupt_in_a_timed_stages_wait_ends_the_run() {
         drop(held);
     }
 }
+
+/// How many quiet claims [`given_up`] was asked for.
+static GIVEN_UP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A quiet claim's wait given up behind pid 4242, which has made no progress for 16 minutes
+/// ([`aterm_capacity::Error::Stuck`]), for a need that asked to give up so.
+fn given_up(need: Need, _mode: Admit) -> Result<Claim, Error> {
+    assert!(need.quiet.is_some(), "only the quiet claim is asked for");
+    assert!(
+        need.stuck_ends.is_some(),
+        "the quiet claim asks to give up behind a stuck holder"
+    );
+    GIVEN_UP.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let span = std::time::Duration::from_secs(16 * 60);
+    let what = "verify perf".to_owned();
+    Err(Error::Stuck {
+        stuck: aterm_toolchain::waits::Stuck {
+            holders: vec![4242],
+            span,
+        },
+        short: aterm_capacity::Shortfall {
+            shorts: vec![aterm_capacity::Short::Quiet {
+                pid: 4242,
+                what: what.clone(),
+                held: true,
+            }],
+            holders: vec![aterm_capacity::Holder {
+                pid: 4242,
+                what,
+                checkout: String::new(),
+                held: true,
+                age: span,
+                mem: 0,
+                claimed: 0,
+                alone: false,
+                disk: 0,
+                quiet: true,
+                order: (0, 4242, 0),
+                stalled: Some(span),
+                credit: Vec::new(),
+            }],
+        },
+    })
+}
+
+/// A stage that passes.
+fn passes(_: &Ctx, spec: &StageSpec) -> Report {
+    let mut r = Report::new(spec.title.clone());
+    r.pass("ran");
+    r
+}
+
+/// A TIMED STAGE WHOSE QUIET CLAIM GAVE UP BEHIND A HOLDER THAT MAKES NO PROGRESS IS NOT RUN,
+/// AND THE RUN GOES ON (CW-WAIT-UNBOUNDED): each of appkit's timed stages asks for the quiet
+/// machine in turn, and each wait given up is that stage's NOT RUN row, naming the holder and
+/// how long it made no progress; the run is not ended as an interrupt ends it, so the next timed
+/// stage asks again, and the run is COULD NOT RUN with no finding. NEGATIVE CONTROL: a stuck end
+/// taken as an interrupt's ends the run at the first, and the second stage asks nothing.
+#[test]
+fn a_timed_stage_given_up_behind_a_stuck_holder_is_not_run_and_the_run_goes_on() {
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("atv-quiet-stuck-")
+        .tempdir()
+        .expect("a scratch dir");
+    let ctx = Ctx::new(
+        dir.path().to_path_buf(),
+        Scope::crate_only("aterm-capacity"),
+        EnvSnapshot::default(),
+        dir.path().join("scratch"),
+    )
+    .with_checks(&[Check::Appkit])
+    .with_quiet(Some(Admit::Wait));
+    let mut log = Vec::new();
+    let code = crate::run_with(
+        &ctx,
+        &mut std::io::sink(),
+        &mut log,
+        &Show::default(),
+        Seams {
+            stage: passes,
+            admit_quiet: given_up,
+            admit_memory: given_up,
+        },
+    )
+    .expect("the result written");
+    let log = String::from_utf8_lossy(&log);
+    assert_eq!(code, crate::exit::COULD_NOT_RUN, "{log}");
+    assert!(!log.contains("FAIL"), "a finding:\n{log}");
+    let rows: Vec<&str> = log
+        .lines()
+        .filter(|l| l.trim_start().starts_with("NOT RUN"))
+        .collect();
+    let asked = GIVEN_UP.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(asked >= 2, "each timed stage asked: {asked}\n{log}");
+    assert_eq!(rows.len(), asked, "{log}");
+    for row in rows {
+        for said in [
+            "its quiet claim gave up its wait",
+            "made no progress for 16m00s (none was signalled)",
+            "pid 4242 holds the quiet machine",
+            "it started nothing",
+        ] {
+            assert!(row.contains(said), "{said:?} in {row}");
+        }
+    }
+}

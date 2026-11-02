@@ -10,6 +10,201 @@ use crate::ai::store::{How, Record};
 
 const NOW: i64 = 1_800_000_000;
 
+fn health_scope_facts(mode: i64) -> Facts {
+    use crate::ai::facts::CliAccounts;
+    let mut f = facts(if mode == 2 || mode == 6 || mode == 7 {
+        &CLAUDE
+    } else {
+        &CODEX
+    });
+    f.login_file = Some((PathBuf::from("/login/auth.json"), None));
+    f.profile_signed_in = true;
+    match mode {
+        1 | 4 => {
+            f.pool = Some(CliAccounts {
+                serving_login: Some(("CODEX_HOME", Some("/isolated".into()))),
+                state: Some("ok"),
+                ..CliAccounts::default()
+            });
+            f.hidden_store = mode == 4;
+        }
+        2 => {
+            let mut account = accounts(Some("ok"));
+            account.login = Some("/isolated".into());
+            account.made = true;
+            f.accounts = Some(account);
+        }
+        3 => f.home_var = Some("/explicit".into()),
+        5 => {
+            f.pool = Some(CliAccounts {
+                store: Some(crate::harness::accounts::Store::at_for(
+                    std::path::Path::new("/unused"),
+                    crate::harness::accounts::Cli::Codex,
+                    std::path::Path::new("/unused"),
+                )),
+                serving_label: Some("main".into()),
+                serving_login: Some(("CODEX_HOME", None)),
+                state: Some("ok"),
+                ..CliAccounts::default()
+            });
+        }
+        6 | 7 => {
+            let mut account = accounts(Some("ok"));
+            account.listed = mode == 6;
+            account.store = Some(crate::harness::accounts::Store::at(std::path::Path::new(
+                "/unused",
+            )));
+            f.accounts = Some(account);
+        }
+        _ => {}
+    }
+    f
+}
+
+#[test]
+fn account_health_is_scoped_to_the_serving_login() {
+    for mode in 0..8 {
+        let mut f = health_scope_facts(mode);
+        let default = mode == 0 || mode == 4 || mode == 7;
+
+        f.record.used_at = Some(NOW - 10);
+        f.record.used_how = Some(How::Review);
+        let row = assess(&f, true, NOW);
+        assert!(row.state.usable(), "mode {mode}: {row:?}");
+        assert_eq!(row.used, default.then_some((NOW - 10, "review")));
+
+        f.record.ended_at = Some(NOW - 5);
+        f.record.ended_why = Some(crate::ai::store::Ended::ReviewAuth);
+        let row = assess(&f, true, NOW);
+        assert_eq!(row.state == State::SignedOut, default, "mode {mode}");
+
+        f.record.ended_at = None;
+        f.record.limited_until = Some(NOW + 60);
+        let row = assess(&f, true, NOW);
+        assert_eq!(row.limited_until, default.then_some(NOW + 60));
+        assert_eq!(row.state == State::Limited(NOW + 60), default);
+
+        f.record = Record::default();
+        f.limited_until = Some(NOW + 30);
+        let row = assess(&f, true, NOW);
+        assert_eq!(row.state, State::Limited(NOW + 30));
+        assert_eq!(row.limited_until, Some(NOW + 30));
+    }
+}
+
+pub(crate) fn health_scope_transition(
+    state: &aterm_spec::interp::State,
+    action: &str,
+) -> aterm_spec::interp::State {
+    let mut next = state.clone();
+    match action {
+        "Scope" => {
+            next.insert("scope", state["scope"] + 1);
+        }
+        "Issue" => {
+            next.insert("issue", state["issue"] + 1);
+        }
+        "Assess" => {
+            let mut f = health_scope_facts(state["scope"]);
+            match state["issue"] {
+                0 => {
+                    f.record.used_at = Some(NOW - 10);
+                    f.record.used_how = Some(How::Review);
+                }
+                1 => {
+                    f.record.ended_at = Some(NOW - 5);
+                    f.record.ended_why = Some(crate::ai::store::Ended::ReviewAuth);
+                }
+                2 => f.record.limited_until = Some(NOW + 60),
+                3 => f.limited_until = Some(NOW + 60),
+                _ => unreachable!(),
+            }
+            let row = assess(&f, true, NOW);
+            next.insert("phase", 1);
+            next.insert("used", i64::from(row.used.is_some()));
+            next.insert("ended", i64::from(row.state == State::SignedOut));
+            next.insert("limited", i64::from(matches!(row.state, State::Limited(_))));
+        }
+        _ => unreachable!(),
+    }
+    next
+}
+
+#[test]
+fn health_assessment_conforms_to_account_scope() {
+    let model = aterm_models_harness::account_health_scope_model();
+    assert_eq!(aterm_spec::interp::prove_and_catch(&model), 64);
+    for state in aterm_spec::interp::reachable_states(&model) {
+        for action in &model.actions {
+            if model.action_enabled(action.name, &state) {
+                let next = health_scope_transition(&state, action.name);
+                assert!(
+                    model.successors(action.name, &state).contains(&next),
+                    "{}: {state:?} -> {next:?}",
+                    action.name
+                );
+            }
+        }
+    }
+    for (scope, issue, field, law) in [
+        (1, 0, "used", "UsageScoped"),
+        (2, 1, "ended", "EndsScoped"),
+        (5, 2, "limited", "LimitsScoped"),
+        (0, 2, "limited", "DefaultLimitRetained"),
+        (6, 3, "limited", "LocalLimitRetained"),
+    ] {
+        let mut initial = model.init_state();
+        initial.insert("scope", scope);
+        initial.insert("issue", issue);
+        let mut bad = health_scope_transition(&initial, "Assess");
+        bad.insert(field, 1 - bad[field]);
+        assert!(!model.check_invariant(law, &bad));
+    }
+}
+
+#[test]
+fn a_plain_isolated_claude_login_keeps_its_own_signed_out_state() {
+    let mut f = facts(&CLAUDE);
+    f.profile_signed_in = true;
+    let mut account = accounts(None);
+    account.login = Some("/isolated".into());
+    account.made = true;
+    account.signed_out_at = Some(NOW - 1);
+    f.accounts = Some(account);
+    assert_eq!(assess(&f, true, NOW).state, State::SignedOut);
+}
+
+#[test]
+fn refused_account_state_never_inherits_legacy_health() {
+    use crate::ai::facts::CliAccounts;
+    for failure in 0..4 {
+        let mut f = health_scope_facts(0);
+        if failure < 2 {
+            f.connector = &CLAUDE;
+            let mut account = accounts(None);
+            if failure == 0 {
+                account.refused = Some("invalid roster".into());
+            } else {
+                account.unread = Some("damaged login record".into());
+            }
+            f.accounts = Some(account);
+        } else {
+            f.pool = Some(CliAccounts {
+                refused: (failure == 2).then(|| "invalid roster".into()),
+                launch_refused: (failure == 3).then(|| "invalid pin".into()),
+                ..CliAccounts::default()
+            });
+        }
+        f.record.ended_at = Some(NOW);
+        f.record.ended_why = Some(crate::ai::store::Ended::ReviewAuth);
+        f.record.limited_until = Some(NOW + 60);
+        assert!(f.default_record().is_none(), "failure {failure}");
+        let row = assess(&f, true, NOW);
+        assert_ne!(row.state, State::SignedOut, "failure {failure}: {row:?}");
+        assert_eq!(row.used, None);
+    }
+}
+
 fn facts(c: &'static Connector) -> Facts {
     Facts {
         connector: c,
@@ -29,17 +224,24 @@ fn facts(c: &'static Connector) -> Facts {
         accounts: None,
         limited_until: None,
         record: Record::default(),
+        record_scope: (c.id == "codex").then_some("file"),
+        credential_store_error: None,
         env_credentials: Vec::new(),
         pool: None,
+        review_source: None,
     }
 }
 
 fn accounts(state: Option<&'static str>) -> ClaudeAccounts {
     ClaudeAccounts {
+        store: None,
+        roster: None,
         label: "main".into(),
         listed: false,
         refused: None,
         unread: None,
+        launch_refused: None,
+        sign_in_refused: None,
         renews: state.is_some(),
         login: None,
         made: false,
@@ -59,7 +261,12 @@ fn accounts(state: Option<&'static str>) -> ClaudeAccounts {
 #[test]
 fn not_wanted_excluded_removed_and_unavailable_are_off_never_a_fault() {
     assert_eq!(assess(&facts(&CODEX), false, NOW).state, State::Off);
-    for kept in [Kept::Unavailable, Kept::Excluded, Kept::Removed] {
+    for kept in [
+        Kept::Unavailable,
+        Kept::Excluded,
+        Kept::Removed,
+        Kept::RemovalUnreadable,
+    ] {
         let mut f = facts(&CODEX);
         f.kept = Some(kept);
         let row = assess(&f, true, NOW);
@@ -496,6 +703,13 @@ fn a_failed_sign_in_or_a_bot_check_on_record_holds_the_row_for_the_upkeep() {
         ..accounts(Some("expired"))
     });
     assert!(held(&claude, NOW).is_some());
+    assert_eq!(bar(&claude), None, "CONTROL: a failure stays aterm's");
+    claude.accounts.as_mut().expect("view").tried = Some(tried("blocked"));
+    let stopped = held(&claude, NOW).expect("a page's stop holds the row too");
+    assert!(stopped.contains("was stopped by its page"), "{stopped}");
+    let person = bar(&claude).expect("a page's stop is a person's");
+    assert_eq!(person.step, "aterm harness accounts renew main");
+    assert_eq!(sign_in_actor(&claude), Actor::Person);
     claude.accounts.as_mut().expect("view").tried = Some(tried("no-route"));
     assert_eq!(held(&claude, NOW), None, "NEGATIVE: no-route");
     claude.accounts.as_mut().expect("view").tried = None;
@@ -550,12 +764,16 @@ fn a_renewal_after_a_recorded_end_clears_it() {
     let mut a = accounts(Some("idle"));
     a.login = Some("/state/accounts/logins/main+1".into());
     a.made = true;
+    a.state = Some("expired");
+    a.signed_out_at = Some(NOW - 600);
     f.accounts = Some(a.clone());
     assert_eq!(
         assess(&f, true, NOW).state,
         State::SignedOut,
-        "the control: the end stands"
+        "the control: this login's own end stands"
     );
+    a.state = Some("idle");
+    a.signed_out_at = None;
     a.renewed_at = Some(NOW - 60);
     f.accounts = Some(a);
     let row = assess(&f, true, NOW);

@@ -356,6 +356,91 @@ pub fn settings_route(text: &str) -> SettingsEnv {
         .map_or(SettingsEnv::Quiet, |(key, _)| SettingsEnv::Names(key))
 }
 
+/// WHY A LAUNCH'S ROUTE VARIABLES NAME NO ONE ROUTE ([`launch_env`]), and whether that is
+/// settled for the agent's process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unnamed {
+    /// Something was not read this time (the agent's environment, or a settings source that could
+    /// not be read or parsed, as one mid-write cannot): read again at the next ask.
+    Unread(String),
+    /// The launch's sources disagree (one variable set to two values): settled for the process.
+    Conflict(String),
+}
+
+impl Unnamed {
+    /// The reason, for the log.
+    #[must_use]
+    pub fn why(&self) -> &str {
+        match self {
+            Unnamed::Unread(why) | Unnamed::Conflict(why) => why,
+        }
+    }
+
+    /// Whether the reason stands for the agent's process ([`Unnamed::Conflict`]), so its gap is
+    /// kept; one not read is read again.
+    #[must_use]
+    pub const fn settled(&self) -> bool {
+        matches!(self, Unnamed::Conflict(_))
+    }
+}
+
+/// THE ROUTE VARIABLES A CLAUDE CODE LAUNCH SETS (v6 §14.17.5.4, the endpoint of a route of its
+/// own): the [`ROUTE_KEYS`], [`ROUTE_PREFIXES`] and `NO_PROXY` variables of its exec environment
+/// and of every settings source's `env` block, as one `KEY=value` list, a variable blank in all of
+/// them left out. Never a precedence guessed: one of them two sources set to different values
+/// ([`Unnamed::Conflict`]), or a source that could not be read or parsed, or an environment that
+/// could not be read ([`Unnamed::Unread`]), is the reason the launch names no one route.
+///
+/// # Errors
+/// The reason the launch's variables cannot be told, for the log, and whether it is settled.
+pub fn launch_env(facts: &RouteFacts) -> Result<Vec<String>, Unnamed> {
+    let Some(env) = &facts.env else {
+        return Err(Unnamed::Unread(
+            "the agent's environment could not be read".to_string(),
+        ));
+    };
+    let mut set: Vec<(String, String, String)> = Vec::new();
+    let mut take = |key: &str, value: &str, at: &str| -> Result<(), Unnamed> {
+        let value = value.trim();
+        let routes = ROUTE_KEYS.contains(&key)
+            || ROUTE_PREFIXES.iter().any(|p| key.starts_with(p))
+            || matches!(key, "NO_PROXY" | "no_proxy");
+        if value.is_empty() || !routes {
+            return Ok(());
+        }
+        match set.iter().find(|(k, _, _)| k == key) {
+            Some((_, v, _)) if v == value => Ok(()),
+            Some((_, _, first)) => Err(Unnamed::Conflict(format!(
+                "{key} is set differently in {first} and {at}"
+            ))),
+            None => {
+                set.push((key.to_string(), value.to_string(), at.to_string()));
+                Ok(())
+            }
+        }
+    };
+    for (key, value) in env.iter().filter_map(|kv| kv.split_once('=')) {
+        take(key, value, "the agent's environment")?;
+    }
+    for (at, source) in &facts.settings {
+        match source {
+            Source::Missing => {}
+            Source::Unreadable => return Err(Unnamed::Unread(format!("{at} could not be read"))),
+            Source::Text(text) => {
+                let settings = settings_of(text)
+                    .ok_or_else(|| Unnamed::Unread(format!("{at} could not be parsed")))?;
+                for (key, value) in &settings.env {
+                    take(key, value, at)?;
+                }
+            }
+        }
+    }
+    Ok(set
+        .into_iter()
+        .map(|(k, v, _)| format!("{k}={v}"))
+        .collect())
+}
+
 /// What one probe concluded ([`NetState::finish`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -1898,6 +1983,62 @@ mod tests {
             Route::Default
         );
         assert!(matches!(route_of(&RouteFacts::default()), Route::Custom(_)));
+    }
+
+    /// A launch's route variables are one list across its environment and settings, the rest of
+    /// either left out; two values for one of them, or a source not read, name no route.
+    #[test]
+    fn a_launchs_route_variables_are_one_list_or_the_reason_it_names_none() {
+        let lab = Source::Text(
+            "{\"env\":{\"ANTHROPIC_BASE_URL\":\"http://127.0.0.1:4100\",\"HTTP_PROXY\":\"http://127.0.0.1:9\",\
+             \"NO_PROXY\":\"127.0.0.1\",\"DISABLE_AUTOUPDATER\":\"1\",\"PATH\":\"/bin\"}}"
+                .to_string(),
+        );
+        assert_eq!(
+            launch_env(&facts(
+                &[
+                    "PATH=/usr/bin",
+                    "HTTP_PROXY=http://127.0.0.1:9",
+                    "HTTPS_PROXY="
+                ],
+                &[("user", lab.clone()), ("absent", Source::Missing)]
+            )),
+            Ok(vec![
+                "HTTP_PROXY=http://127.0.0.1:9".to_string(),
+                "ANTHROPIC_BASE_URL=http://127.0.0.1:4100".to_string(),
+                "NO_PROXY=127.0.0.1".to_string(),
+            ]),
+            "PATH differs and is no route variable; a blank one names nothing"
+        );
+        let other = Source::Text(
+            "{\"env\":{\"ANTHROPIC_BASE_URL\":\"http://127.0.0.1:4200\"}}".to_string(),
+        );
+        let two = launch_env(&facts(&[], &[("user", lab.clone()), ("project", other)]));
+        assert_eq!(
+            two,
+            Err(Unnamed::Conflict(
+                "ANTHROPIC_BASE_URL is set differently in user and project".to_string()
+            )),
+            "two values for one variable are settled for the process"
+        );
+        for (settings, says) in [
+            (Source::Unreadable, "local could not be read"),
+            (
+                Source::Text("{env".to_string()),
+                "local could not be parsed",
+            ),
+        ] {
+            let why = launch_env(&facts(&[], &[("user", lab.clone()), ("local", settings)]));
+            assert_eq!(
+                why,
+                Err(Unnamed::Unread(says.to_string())),
+                "a source not read now is read again"
+            );
+        }
+        assert!(
+            launch_env(&RouteFacts::default()).is_err_and(|why| !why.settled()),
+            "an environment not read is read again"
+        );
     }
 
     /// The lab's route seam admits exactly the loopback base URL it names, for

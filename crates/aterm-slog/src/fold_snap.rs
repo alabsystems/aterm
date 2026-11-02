@@ -45,7 +45,7 @@ fn get<'a>(line: &'a str, skip: usize, key: &str) -> Option<&'a str> {
 
 fn num<T: std::str::FromStr>(line: &str, skip: usize, key: &str) -> Result<T, SnapError> {
     get(line, skip, key)
-        .and_then(|v| v.parse().ok())
+        .and_then(crate::line::parse_u)
         .ok_or(SnapError::Line)
 }
 
@@ -56,7 +56,7 @@ fn opt_num<T: std::str::FromStr>(
 ) -> Result<Option<T>, SnapError> {
     match get(line, skip, key) {
         None => Ok(None),
-        Some(v) => v.parse().map(Some).map_err(|_| SnapError::Line),
+        Some(v) => crate::line::parse_u(v).map(Some).ok_or(SnapError::Line),
     }
 }
 
@@ -154,8 +154,8 @@ fn read_mail(line: &str) -> Result<(bool, Vec<MailWaiting>), SnapError> {
             }
             let (off, t) = pair.split_once(':').ok_or(SnapError::Line)?;
             waiting.push(MailWaiting {
-                off: off.parse().map_err(|_| SnapError::Line)?,
-                t: t.parse().map_err(|_| SnapError::Line)?,
+                off: crate::line::parse_u(off).ok_or(SnapError::Line)?,
+                t: crate::line::parse_u(t).ok_or(SnapError::Line)?,
             });
         }
     }
@@ -176,7 +176,7 @@ fn read_counts<const N: usize>(raw: Option<&str>) -> Result<[u32; N], SnapError>
     for slot in &mut out {
         *slot = it
             .next()
-            .and_then(|n| n.parse().ok())
+            .and_then(crate::line::parse_u)
             .ok_or(SnapError::Line)?;
     }
     if it.next().is_some() {
@@ -535,7 +535,8 @@ impl Fold {
                     });
                 }
                 "last" => {
-                    let slot: usize = tok_at(line, 2)?.parse().map_err(|_| SnapError::Line)?;
+                    let slot: usize =
+                        crate::line::parse_u(tok_at(line, 2)?).ok_or(SnapError::Line)?;
                     if slot >= fold.st.last.len() || fold.st.last[slot].is_some() {
                         return Err(SnapError::Bound);
                     }
@@ -550,7 +551,7 @@ impl Fold {
                     let owner = tok_at(line, 2)?;
                     let key = Key::from_word(tok_at(line, 3)?).ok_or(SnapError::Line)?;
                     let conf = Conf::from_word(tok_at(line, 4)?);
-                    let seq: u64 = tok_at(line, 5)?.parse().map_err(|_| SnapError::Line)?;
+                    let seq: u64 = crate::line::parse_u(tok_at(line, 5)?).ok_or(SnapError::Line)?;
                     let raw = line
                         .split(' ')
                         .filter(|t| !t.is_empty())
@@ -558,14 +559,10 @@ impl Fold {
                         .ok_or(SnapError::Line)?;
                     let val = decode_val(key, raw).ok_or(SnapError::Line)?;
                     let target = match owner.split_at_checked(1) {
-                        Some(("t", i)) => i
-                            .parse::<usize>()
-                            .ok()
+                        Some(("t", i)) => crate::line::parse_u::<usize>(i)
                             .and_then(|i| fold.tracked.get_mut(i))
                             .map(|o| &mut o.f),
-                        Some(("l", i)) => i
-                            .parse::<usize>()
-                            .ok()
+                        Some(("l", i)) => crate::line::parse_u::<usize>(i)
                             .and_then(|i| fold.st.last.get_mut(i))
                             .and_then(Option::as_mut)
                             .map(|c| &mut c.f),

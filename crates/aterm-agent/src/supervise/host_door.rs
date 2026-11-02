@@ -231,8 +231,13 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     fn relaunch_owed(&self) -> bool {
         false
     }
-    /// Whether the foreground agent in the tab was relaunched by aterm to resume the session's
-    /// conversation ([`AgentResumed`]), `None` when no foreground agent snapshot is read.
+    /// [`Self::relaunch_owed`], as the loop asks it of a screen a resume drew: a door of its own,
+    /// so a tape recorded before it replays as recorded, with no carry-on owed at such a screen.
+    fn carry_owed(&self) -> bool {
+        self.relaunch_owed()
+    }
+    /// Whether the foreground agent in the tab resumes a conversation, aterm's relaunch or its own
+    /// arguments ([`AgentResumed`]), `None` when no foreground agent snapshot is read.
     fn agent_resumed(&self) -> Option<AgentResumed> {
         None
     }
@@ -303,7 +308,8 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     }
     /// The reset the loop's open limit episode holds its wall to (`reset_unix`, unix seconds;
     /// `None`: it knows none), told as the episode opens ([`Self::limited`]) and again whenever a
-    /// later limit point moves it later: the reset at which, plus its grace, the loop takes the
+    /// later limit point moves it later or the usage tap ([`Self::tap_window`]) times the wall at
+    /// another reset, earlier or later: the reset at which, plus its grace, the loop takes the
     /// wall as spent and rests there, where a host's line could go. A host that publishes the
     /// wall to others (the `disk-free@v1` seat rule's board) dates it by this, so the two never
     /// disagree on when the wall is spent.
@@ -345,7 +351,7 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
         let _ = plan;
     }
 
-    fn act_taken(&self, act: crate::harness::acts::Act) {
+    fn act_taken(&self, act: crate::harness::acts::TakenAct) {
         let _ = act;
     }
 
@@ -362,8 +368,30 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
         let _ = (needs, entry);
     }
 
+    /// THE HOLD'S OWN WORDS (§14.17 item 1, slice 4b): what the agent said is left, quoted, and
+    /// the files git found, told before [`Self::land_held`] wherever either moved, and `None`
+    /// where the hold reads no words or the loop ends; a notification nothing the loop decides
+    /// reads back.
+    fn land_said(&self, said: Option<&crate::harness::hold_said::HoldSaid>) {
+        let _ = said;
+    }
+
     fn land_held(&self, held: Option<crate::harness::acts::LandHeld>) {
         let _ = held;
+    }
+
+    /// THE PERSON'S SWITCH TO LAND OVER A HELD TAB ASKED ONCE MORE (v6 §14.17 item 3): `true`
+    /// once Land's one ask is typed, `false` once its answer is read or the switch is spent
+    /// otherwise, each told only on a change; a notification nothing the loop decides reads back.
+    fn switch_asked(&self, asked: bool) {
+        let _ = asked;
+    }
+
+    /// WHAT ATERM CHECKED AT THE LANDING (§14.9, slice 9b): told before the landed face on a
+    /// fresh landing (never on one the task's own wake kept), and `None` on the face's move to
+    /// open or theirs after one; a notification nothing the loop decides reads back.
+    fn land_receipt(&self, receipt: Option<&crate::harness::acts::LandReceipt>) {
+        let _ = receipt;
     }
 
     fn resume_command(&self) -> Option<String> {
@@ -372,6 +400,29 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
 
     fn reach(&self) -> Reach {
         Reach::Unknown
+    }
+
+    /// THE SESSION'S TURN ENDED ON A REAL REPLY (v6 §14.17.5.4, slice 12c): told once, at the new
+    /// point the loop decides, where the agent worked and its turn ended idle with its reply
+    /// drawn, no wall, no wall the transcript refused and no interrupt, and the reply is the
+    /// model's by positive evidence: Claude Code's transcript ends on the model's reply, agy's or
+    /// Muse Code's reply reads as no error (`aterm_phase::answered::reads_as_error`). The API
+    /// answered the session's route `ago_ms` before the call (from Claude Code's required reply
+    /// timestamp, or 0 for agy's and Muse Code's point read; a duration, as a tape compares no
+    /// `Instant`), so the host books it as a witness on that route
+    /// (`harness::witness::Witnesses::answered`) for every other session waiting out an outage
+    /// there; a host that names no route books nothing.
+    fn answered(&self, ago_ms: u64) {
+        let _ = ago_ms;
+    }
+
+    /// THE WITNESS ON THE SESSION'S ROUTE (v6 §14.17.5.4): when another session of this aterm on
+    /// the same route (the program and the endpoint its launch names) last finished a turn with a
+    /// real reply ([`Self::answered`]); `None` with no route named or no such turn. Asked only at
+    /// an outage wall's points, and at each step of the wait one decided, so it costs nothing while
+    /// no tab waits.
+    fn witness(&self) -> Option<Instant> {
+        None
     }
 
     /// What the host's measures and network path say of the API's reach now, as [`Self::reach`]
@@ -491,6 +542,11 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
 
     fn account(&self, point: AccountPoint) -> Option<AccountAdvice> {
         let _ = point;
+        None
+    }
+
+    /// An execution hold on the current credential, independent of rotation or login repair.
+    fn account_execution_hold(&self) -> Option<Instant> {
         None
     }
 

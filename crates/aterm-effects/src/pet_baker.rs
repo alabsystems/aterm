@@ -273,19 +273,20 @@ fn paint_eye_dots(
             ky
         };
         let mut allowed_w = f32::MAX;
+        let w_norm = x1 - x0;
         let mut j = 0;
         while j < bounds.len() {
-            let Some((ox0, _, ox1, _)) = bounds[j] else {
-                j += 1;
-                continue;
-            };
             if j == i || ratios[j] < EYE_DOT_FAR_OCCLUDED_RATIO {
                 j += 1;
                 continue;
             }
+            let Some((ox0, _, ox1, _)) = bounds[j] else {
+                j += 1;
+                continue;
+            };
             let gap = (ox0 - x1).max(x0 - ox1);
             if gap > 0.0 {
-                let closing = (x1 - x0 + ox1 - ox0) * 0.5;
+                let closing = (w_norm + ox1 - ox0) * 0.5;
                 if closing > 0.0 {
                     kx = kx.min(1.0 + (gap - min_gap) / closing);
                 }
@@ -655,14 +656,6 @@ impl<K: ExactTileKey> ExactTileBaker<K> {
     /// Look `key` up, baking on a miss when the per-frame budget allows.
     #[inline]
     pub fn tile(&mut self, key: &K) -> Option<&[u8]> {
-        let (w, h) = key.size();
-        if w == 0 || h == 0 {
-            return None;
-        }
-        let want = usize::from(w) * usize::from(h) * 4;
-        if want > MAX_ATLAS_BYTES {
-            return None;
-        }
         let mut i = self.slots.len();
         while i > 0 {
             i -= 1;
@@ -672,6 +665,14 @@ impl<K: ExactTileKey> ExactTileBaker<K> {
             }
         }
         if self.bakes_left == 0 {
+            return None;
+        }
+        let (w, h) = key.size();
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let want = usize::from(w) * usize::from(h) * 4;
+        if want > MAX_ATLAS_BYTES {
             return None;
         }
         self.bakes_left -= 1;

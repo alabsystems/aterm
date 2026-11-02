@@ -76,6 +76,7 @@ impl Bed {
             fleet_path: self.path.with_file_name(FLEET_ROSTER_FILE),
             fleet_accounts: 3,
             changed,
+            conflicts: Vec::new(),
         }
     }
 

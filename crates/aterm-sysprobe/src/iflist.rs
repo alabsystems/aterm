@@ -359,10 +359,13 @@ pub(crate) fn read_growing(
         let Asked::Bytes(need) = ask(None) else {
             return None;
         };
-        size = need.saturating_add(need / 4).max(size.saturating_mul(2));
-        if size > cap {
+        if need > cap {
             return None;
         }
+        size = need
+            .saturating_add(need / 4)
+            .max(size.saturating_mul(2))
+            .min(cap);
     }
     None
 }
@@ -902,6 +905,14 @@ mod tests {
         let mut huge = Kernel::new(5000, 0);
         assert_eq!(read(&mut huge, 1024), None, "past the cap");
         assert_eq!(huge.asks, [Some(64), None], "nothing past the cap is made");
+
+        let mut near_cap = Kernel::new(900, 0);
+        assert_eq!(
+            read(&mut near_cap, 1024).map(|b| b.len()),
+            Some(900),
+            "headroom clamps to cap when need <= cap"
+        );
+        assert_eq!(near_cap.asks, [Some(64), None, Some(1024)]);
 
         assert_eq!(
             read_growing(64, 1024, &mut Vec::new(), |_| Asked::Failed),

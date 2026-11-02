@@ -183,6 +183,18 @@ impl Cli {
         }
     }
 
+    /// The program a session of it runs ([`Self::of`]'s inverse).
+    #[must_use]
+    pub const fn program(self) -> aterm_phase::Program {
+        use aterm_phase::Program;
+        match self {
+            Cli::Claude => Program::Claude,
+            Cli::Codex => Program::Codex,
+            Cli::Grok => Program::Grok,
+            Cli::Kimi => Program::Kimi,
+        }
+    }
+
     /// Its program word ([`Connector::id`]).
     #[must_use]
     pub const fn id(self) -> &'static str {
@@ -1172,14 +1184,24 @@ pub const MUSE: Connector = Connector {
         after: None,
     },
     review: Review {
-        args: &["exec"],
+        // Contributor mode off, the default model at the default effort, like every
+        // fresh Muse Code launch aterm makes (`crate::harness::upgrade_muse`).
+        args: &[
+            "exec",
+            "--contributor-mode",
+            "off",
+            "--model",
+            crate::harness::upgrade_muse::DEFAULT_MODEL,
+            "--reasoning-effort",
+            crate::harness::upgrade_muse::DEFAULT_EFFORT,
+        ],
         levels: Levels {
             yolo: &["--yolo"],
             edits: &["--disable-approval"],
             ask: &[],
             plan: &["--disable-write", "--disable-shell"],
         },
-        levels_first: true,
+        levels_first: false,
         only_at: None,
         prompt: PromptVia::File("--prompt-file"),
         answer: AnswerVia::Stdout,

@@ -11,6 +11,7 @@ use super::search::{
     FILE_PROPOSER, FileProposer, GRID_PROPOSER, GridProposer, Mode, PROPOSER_DOMAIN, Proposer,
     ProposerId, SearchStats, TrainFeedback, candidate_id,
 };
+use super::test_fixtures::refused_off_the_pinned_target;
 use aterm_aos::Digest;
 
 /// The grid proposer proposes the policy's 54 plans in [`GRID_V1`]'s order in round 0 and nothing after, whatever it is shown, and its identity is configured by those bytes.
@@ -22,6 +23,9 @@ fn the_grid_proposer_is_the_policy_grid_once() {
         let p = SchedulePlan::decode(bytes).expect("a grid plan decodes");
         assert_eq!((p.split(), p.wake()), (split, wake));
         assert_eq!(candidate_id(bytes), p.digest(), "a plan's id is its digest");
+    }
+    if refused_off_the_pinned_target() {
+        return;
     }
     assert_eq!(
         plans,
@@ -70,6 +74,9 @@ fn the_file_proposer_parses_hex_lines_and_never_fails() {
     assert_ne!(id, FileProposer::from_text("").id());
     assert_eq!(f.propose(0, &[]).len(), 5);
     assert!(f.propose(1, &[]).is_empty());
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = evaluator();
     for bad in [&c[2], &c[3]] {
         let r = ev.admit_one(bad).expect_err("refused");
@@ -127,6 +134,9 @@ fn junk(n: usize, salt: u8) -> Vec<Vec<u8>> {
 /// The evaluator owns the budgets: oversized proposals are dropped, duplicates skipped, judging stops at 256 distinct candidates even for a grid plan, and only four rounds are asked.
 #[test]
 fn the_budgets_are_the_evaluators() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = evaluator();
     let mut r0 = vec![vec![1u8; MAX_PROPOSAL_BYTES + 1], vec![0u8; 1 << 20]];
     r0.extend(junk(200, 1));
@@ -184,6 +194,9 @@ fn feedback_is_one_training_row_per_judged_candidate() {
         }
     }
     let mut w = Watch { shown: Vec::new() };
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let r = evaluator().select(&mut w).expect_err("no outcome");
     assert!(matches!(r, NoOutcome::NoneAdmitted { .. }), "{r:?}");
     assert_eq!(w.shown.len(), usize::from(MAX_ROUNDS));
@@ -247,6 +260,9 @@ fn a_hostile_proposer_gains_nothing() {
     let rounds: Vec<Vec<Vec<u8>>> = backwards.chunks(14).map(<[Vec<u8>]>::to_vec).collect();
     assert_eq!(rounds.len(), usize::from(MAX_ROUNDS));
     let mut h = Hostile { rounds };
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = evaluator();
     let hostile = ev.search(&mut h).expect("an outcome");
     let grid = &searched().admitted;

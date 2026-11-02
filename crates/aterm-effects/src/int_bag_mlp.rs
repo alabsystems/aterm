@@ -1287,14 +1287,11 @@ fn pre_activations<A: Arith>(
 #[inline]
 fn finish<A: Arith>(p: &ParamsView<'_>, pre: &[i32; H_CAP], out: &mut [u32]) {
     let (h, c) = (p.dims.hidden as usize, p.dims.classes as usize);
-    let mut hid = [0i32; H_CAP];
-    for (hk, &pk) in hid[..h].iter_mut().zip(&pre[..h]) {
-        let at = A::add(pk.clamp(-p.t, p.t), p.t);
-        *hk = i32::from(p.lut[at as usize] as i8);
-    }
     let mut logits = [0i32; C_CAP];
     logits[..c].copy_from_slice(&p.b2[..c]);
-    for (k, &hk) in hid[..h].iter().enumerate() {
+    for (k, &pk) in pre[..h].iter().enumerate() {
+        let at = A::add(pk.clamp(-p.t, p.t), p.t);
+        let hk = i32::from(p.lut[at as usize] as i8);
         if hk == 0 {
             continue;
         }

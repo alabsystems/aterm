@@ -131,6 +131,34 @@ fn assert_every_invariant_breaks_first(m: &Model) {
     );
 }
 
+/// `mutant` is refused in `refused` on each dial that enables it in `live`, and some dial does.
+/// A refusal read on one named dial holds whatever the mutant's guard says once the mutant
+/// moves to another dial, so the dials are found from `live`, never named.
+fn assert_mutant_refused(
+    m: &Model,
+    mutant: &str,
+    live: &aterm_spec::interp::State,
+    refused: &aterm_spec::interp::State,
+) {
+    let dials: Vec<i64> = m
+        .mutant_dials()
+        .into_iter()
+        .filter(|&dial| aterm_spec::interp::with_buggy(m, dial).action_enabled(mutant, live))
+        .collect();
+    assert!(
+        !dials.is_empty(),
+        "{}: {mutant} is enabled on no dial in {live:?}, so its refusal proves nothing",
+        m.name
+    );
+    for dial in dials {
+        assert!(
+            !aterm_spec::interp::with_buggy(m, dial).action_enabled(mutant, refused),
+            "{}: {mutant} at Buggy={dial} is enabled in {refused:?}",
+            m.name
+        );
+    }
+}
+
 fn assert_committed_dead_actions(m: &Model, expected: &[&str]) {
     let healthy_fired = aterm_spec::interp::fired_actions(&aterm_spec::interp::with_buggy(m, 0));
     let dead: Vec<_> = m
@@ -297,6 +325,7 @@ fn derived_session_log_ring_proves_and_catches_each_law() {
             "CrashSameEpoch",
             "RefoldFromRing",
             "EvictRiderAsDetail",
+            "EvictTurnRiderAsDetail",
         ],
     );
     let settle = |m: &aterm_spec::derive::Model, s: &mut aterm_spec::interp::State| {
@@ -357,6 +386,39 @@ fn derived_session_log_ring_proves_and_catches_each_law() {
         (r["ocl"], r["orid"], r["onamed"], r["lost"]),
         (0, 0, 0, 2),
         "the open and its rider go together, both counted"
+    );
+
+    let mut t = model.init_state();
+    for action in ["OpenRun", "OpenTurn", "AmendTurn", "Mark"] {
+        assert!(model.fire(action, &mut t), "{action}: {t:?}");
+        settle(&model, &mut t);
+    }
+    assert_eq!(
+        (t["pturn"], t["trid"], t["tnamed"], t["dturn"], t["lost"]),
+        (1, 1, 1, 1, 0),
+        "an open turn pins the amend that names it"
+    );
+    assert!(model.fire("CloseTurn", &mut t));
+    settle(&model, &mut t);
+    assert_eq!(
+        (t["trid"], t["tnamed"], t["orid"], t["onamed"]),
+        (0, 0, 0, 0),
+        "a named turn's closed open went with its rider"
+    );
+    assert_eq!(
+        (t["tdet"], t["cls"], t["tcl"], t["lost"]),
+        (0, 1, 1, 3),
+        "after the turn's detail, its open and its rider, both counted"
+    );
+    let bug = aterm_spec::interp::with_buggy(&model, 1);
+    let mut b = bug.init_state();
+    for action in ["OpenRun", "OpenTurn", "AmendTurn", "Mark"] {
+        assert!(bug.fire(action, &mut b), "{action}: {b:?}");
+    }
+    assert!(bug.fire("EvictTurnRiderAsDetail", &mut b));
+    assert!(
+        !bug.check_invariant("RiderLivesWithItsOpen", &b),
+        "the open turn's name taken alone breaks the law: {b:?}"
     );
 
     let mut p = model.init_state();
@@ -422,15 +484,13 @@ fn derived_session_log_ring_proves_and_catches_each_law() {
     }
     assert!(!model.action_enabled("HandoffCarried", &too_wide));
     assert!(model.action_enabled("HandoffUncarried", &too_wide));
-    assert!(
-        !aterm_spec::interp::with_buggy(&model, 1).action_enabled("HandoffForgetsOpen", &too_wide)
-    );
 
     let mut c = model.init_state();
     for action in ["OpenRun", "Mark", "Mark", "Draw"] {
         assert!(model.fire(action, &mut c), "{action}: {c:?}");
         settle(&model, &mut c);
     }
+    assert_mutant_refused(&model, "HandoffForgetsOpen", &c, &too_wide);
     assert!(model.fire("HandoffCarried", &mut c));
     assert_eq!((c["ev"], c["cv"]), (1, 1), "the carry's shed");
     for _ in 0..8 {

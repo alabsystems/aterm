@@ -139,6 +139,36 @@ I won't land it without your go-ahead.
 The checks run only with your OK, so the rebuild is on hold.
 No force-push and nothing published. I'm still waiting for your go-ahead before rebuilding.
 Should I rerun the checks now or keep waiting for your go-ahead?
+# The person's consent by their possessive or as its source (2026-10-29 review 3).
+The merge to main waits for your approval.
+Waiting for the owner's approval to merge my branch to main.
+NEEDS YOU: a go-ahead from you so I can merge my branch into main.
+Waiting for the go-ahead from the owner to merge my branch to main.
+# A need beside prose that names a person's credential for other work, or negates it
+# (2026-10-29 review 3).
+I don't need your password to rebuild it.\n\nNEEDS YOU: say "go" so I can rebuild the branch.
+The commit needs your password, which is out of scope.\n\nNEEDS YOU: say "go" so I can rebuild the branch.
+# A third party's consent the reply reports as given, beside the wait on the person's; the
+# person's own consent with a deadline, a channel or a place; a deadline or an acronym that
+# names no one; an `'s` word another word keeps from the consent noun (2026-10-29 review 4).
+My PR 812 has Alice's approval and CI is green. Waiting for your go-ahead to merge my branch to main.
+The reviewer's approval is in, so I'm waiting for your go-ahead to merge my branch to main.
+NEEDS YOU: your go-ahead by Friday so I can merge my branch into main.
+Waiting for your go-ahead from Slack before I merge my branch to main.
+Waiting for the go-ahead from this tab before I merge my branch to main.
+WAITING FOR YOUR APPROVAL TO MERGE MY BRANCH TO MAIN.
+Waiting for the OK by Friday to merge my branch to main.
+NEEDS YOU: the go-ahead by EOD so I can merge my branch into main.
+Waiting for the go-ahead to rebuild by the reviewer's deadline.
+Waiting for the go-ahead before I rerun the checks requested by the reviewer.
+Alice's out, approval is yours: waiting for it before I merge my branch to main.
+# Prose that names a credential as the topic of the work, or says the work does not need it
+# (2026-10-29 review 4).
+The census check now flags a token in a log line.\n\nNEEDS YOU: say "go" so I can rerun the checks and commit.
+Added a test that the token never reaches the log.\n\nNEEDS YOU: say "go" so I can rerun the checks and commit.
+I don't need $GITHUB_TOKEN to rebuild it.\n\nNEEDS YOU: say "go" so I can rebuild the branch.
+No password is needed to rebuild it.\n\nNEEDS YOU: say "go" so I can rebuild the branch.
+The rebuild works without needing your password.\n\nNEEDS YOU: say "go" so I can rebuild the branch.
 # Family C: what the person is to say, the three slots, the passive.
 I'll restart the build when you say so.
 I'll rerun the checks only if you ask.
@@ -165,6 +195,13 @@ The fallback is the window's default switch, which reads as Cruise when unset, s
 I merged main's 18 new commits (up to 7fb00e8963) into the branch as de6f179a1d, so the next check run covers the tree that would land.\n- **Conflicts:** only the changelog conflicted, and I kept both entries. Main's change to the control-verb help is in the post verb, not the restart help I edited.\n- **Checked:** formatter checks are clean and the submodule pin matches main's.\n- **Not checked:** nothing has been compiled. The Mac is still swapping heavily (16.6 GiB of swap), mostly from the stuck tab's own wide `verify`, and I'm leaving that session alone.\n\nNEEDS YOU: say "rerun the checks" once memory frees up. I'll then build and test the tip, run the mutation checks, push to main and remove the worktree and branch.
 I committed the last missing test as bc7446f0c2. It checks that a session recording made before the guarded break door existed still replays correctly through the old door, and it fails if that fallback is inverted or removed. A second agent read it against the real code and expects it to compile and pass. Like everything since round 2's 194 passing tests, it hasn't actually been built or run yet.\n\nAll the review findings now have a fix or a test, and the branch is level with main as of my last fetch. Two small gaps are still not covered, as the commit says: a skipped read that never happens in the test's setup, and the routing of a different kind of line.\n\nMemory pressure has dropped back to normal (about 1 GiB of swap), though all 14 cores are busy. I still haven't restarted the stopped builds, because the stop notice said to start them again only when asked.\n\nNEEDS YOU: say "rerun the checks" and I'll run the full verify on bc7446f0c2, then the mutation checks. Then I'll merge main if it moved, push to main and remove the worktree and branch.
 I checked, and nothing on the disk is mine to free. My worktree holds 443 MiB of source and no build output, its build cache is empty (I emptied it on the last ask), and this session's scratch files take 327 MiB.\n\nThe volume has 71.6 GiB free. The space is going to work other sessions are doing right now:\n\n| What | Size | Last written |\n| --- | --- | --- |\n| `aterm-harness-switch` build cache | 55 GiB | 1 hour ago |\n| `aterm-pg-p09` build cache | 17 GiB | 5 minutes ago |\n| Claude Code session ef0b5431's scratch build | 13.9 GiB | session still running |\n\nThose belong to other sessions, so I left them alone. The only item aterm marks as safe to remove is an old Claude Code install (2.1.278, 208 MiB). It's too small to change anything, and deleting it is up to aterm or the person, not me.\n\nThe fix branch hasn't changed, and the hourly check-in is still scheduled.\n\nNEEDS YOU: say "rerun the checks" so I can merge main into the fix branch, build and test it, push it to main and clean up.
+
+# The incident's whole replies (2026-10-28T08:15:20Z, 09:15:28Z, and 10:15:34Z, which
+# 15:10:24Z repeats): drawn 100 or 101 columns wide, the need wraps after `so`, above `I can
+# build …` (2026-10-29 review 3); the need takes that row, and the go-ahead goes at every width.
+I have nothing to free. My worktree has no build output or cache, just 487 MiB of source. `~/aterm-fleet-see.noindex` is another session's worktree with a build running in it right now, and `aterm-pg-11` belongs to another session too, so I left both alone. The volume has 28.6 GiB free, which is below aterm's 47 GiB floor, so the upgrade fix's build couldn't run now even with your go-ahead.\n\nNEEDS YOU: free disk room or let the other sessions' builds finish, then say "rerun the checks" so I can build and test the upgrade fix branch, push it to main and remove the worktree.
+Nothing has changed. The disk is below its build floor, and the build is waiting for your go-ahead.\n\nNEEDS YOU: free disk room or let the other sessions' builds finish, then say "rerun the checks" so I can build and test the upgrade fix branch, push it to main and remove the worktree.
+Nothing has changed: the disk is below the build floor, and the build is waiting for your go-ahead.\n\nNEEDS YOU: free disk room or let the other sessions' builds finish, then say "rerun the checks" so I can build and test the upgrade fix branch, push it to main and remove the worktree.
 
 == person
 # Only a person can give it: a sign-in, a decision to publish, physical access, a Mac restart,
@@ -243,6 +280,40 @@ Per your instruction, the rebuild waits until you say go.
 The maintainer wrote: "please wait for my sign-off before merging the branch".
 I need push permission on upstream before I can push the branch.
 Only admins have permission to merge, so the branch waits for one.
+# A consent someone else gives: a named person's, a reviewer's, a team's (2026-10-29 review 3).
+Waiting for Alice's approval to merge my branch to main.
+Waiting on the reviewer's approval before I merge my branch to main.
+NEEDS YOU: approval from the security team to merge my branch into main.
+NEEDS YOU: a reviewer's approval on my PR 812 so I can merge my branch into main.
+Waiting for sign-off by a second reviewer before I merge my branch to main.
+# A need whose work the turn's prose says only a person can unblock (2026-10-29 review 3).
+The rebuild needs your GitHub password, which I don't have.\n\nNEEDS YOU: say "go" so I can rebuild the branch and push it to main.
+I can't push to main without your GitHub token.\n\nNEEDS YOU: say "go" so I can rebuild the branch and push it to main.
+# A consent another gives, named further on, by a handle, as a giver, or with a modifier
+# between (2026-10-29 review 4).
+NEEDS YOU: approval on my PR 812 from a reviewer so I can merge my branch into main.
+NEEDS YOU: approval on my PR 812 by a reviewer so I can merge my branch into main.
+NEEDS YOU: approval from @alice so I can merge my branch into main.
+Awaiting approval from @alice before merging my branch to main.
+NEEDS YOU: approval from the code owners so I can merge my branch into main.
+NEEDS YOU: approval to merge my branch into main from a reviewer.
+Waiting until the reviewer gives the go-ahead to merge my branch to main.
+Waiting for the security team to give the go-ahead before I merge my branch to main.
+Waiting for the reviewer's final sign-off before I merge my branch to main.
+Waiting for sign-off from Alice before I merge my branch to main.
+# A need whose work the prose says lacks what only a person can give, named in the work's
+# own word, its redo, its command or its cleanup (2026-10-29 review 4).
+I don't have push access to main.\n\nNEEDS YOU: say "go" so I can rebuild the branch and push it to main.
+I can't log in to GitHub, so I can't push.\n\nNEEDS YOU: say "go" so I can rebuild the branch and push it to main.
+I can't push without credentials.\n\nNEEDS YOU: say "go" so I can rebuild the branch and push it to main.
+I haven't got the credentials for the push.\n\nNEEDS YOU: say "go" so I can rebuild the branch and push it to main.
+The build needs your GitHub token, which I don't have.\n\nNEEDS YOU: say "go" so I can rebuild the branch.
+`git push` needs your GitHub token, which I don't have.\n\nNEEDS YOU: say "go" so I can rebuild the branch and push it to main.
+Removing the worktree needs the admin password, which I don't have.\n\nNEEDS YOU: say "go" so I can remove the worktree.
+I'm not logged in to GitHub, so the push can't run.\n\nNEEDS YOU: say "go" so I can rebuild the branch and push it to main.
+The push failed: operation not permitted.\n\nNEEDS YOU: say "go" so I can rebuild the branch and push it to main.
+The GitHub token expired, so I can't push.\n\nNEEDS YOU: say "go" so I can rebuild the branch and push it to main.
+It was rebuilt, but its tests need your GitHub token.\n\nNEEDS YOU: say "go" so I can rebuild the branch.
 
 # A destructive act in the passive, future or conditional, or as `overwritten` (2026-10-29
 # review 2).
@@ -260,6 +331,43 @@ When you say go, I'll finish the other session's rebuild and push it to main.
 # A push to a registry, not to the agent's branch or main.
 Waiting for your go-ahead to push 1.4.0 to crates.io.
 I'm waiting for your go-ahead to push the image to the registry.
+
+# A publish set up to run on the push, a cleanup a job runs on the person's word, or a
+# rollout the push starts (2026-10-29 review 3): the turn names it beside its park.
+Tagged v1.4.0 for the crates.io release.\nNEEDS YOU: say go so I can push.
+The cleanup job deletes the stale release tags on the remote once you say go.\n\nNEEDS YOU: say go so I can rebuild and push my branch to main.
+CI uploads every green build of main to TestFlight. The suite is green. Waiting for your go-ahead to push my branch to main.
+Say "go" so I can rerun the checks. Say "go" so I can delete the stale release tags on the remote.
+# A review only the person gives, before the push (2026-10-29 review 3).
+The branch is ready for your review. Once you say go, I'll push it to main.
+Once you've had a look, just say go and I'll push my branch to main.
+After you take a look, say go and I'll push it to main.
+# Someone else's pull request, patch or fork (2026-10-29 review 3).
+I'll merge the Dependabot PR into main once you say so.
+I'll merge the three open PRs into main once you say so.
+I'll merge PR #412 into main once you say so.
+# A rollout, a backfill or a cutover the agent would resume or continue (2026-10-29 review 3).
+Canary is healthy; I'll continue the rollout to the remaining hosts once you give the go-ahead.
+I'll resume the backfill on the orders table once you give the go-ahead.
+# A publish or a job the turn says runs by itself, in the present tense of its subject
+# (2026-10-29 review 4).
+CI releases every green build of main to TestFlight.\n\nNEEDS YOU: say go so I can push my branch to main.
+CI sends every green build of main to TestFlight. The suite is green. Waiting for your go-ahead to push my branch to main.
+# A force-push in git's short forms: a flag cluster with an f, a flag after the refspec, a
+# refspec forced with + (2026-10-29 review 4).
+NEEDS YOU: say "go" so I can rebuild and run `git push -uf origin main`.
+NEEDS YOU: say "go" so I can rebuild and run `git push origin main -f`.
+NEEDS YOU: say "go" so I can rebuild and run `git push origin +main`.
+# The agent's act on another session's work, whatever room it frees (2026-10-29 review 4).
+Waiting for your go-ahead to clear the other session's build cache and rebuild my branch.
+NEEDS YOU: say go so I can stop the other session's build to free memory, then rebuild my branch.
+NEEDS YOU: say go so I can stop the build in the other session to free memory, then rebuild my branch.
+# What a worktree holds is no cleanup of the agent's (2026-10-29 review 4).
+NEEDS YOU: say "go" so I can delete the worktree's uncommitted changes and rebuild the branch.
+NEEDS YOU: say "go" so I can remove the worktree files and rebuild the branch.
+# A push to main of another repo (2026-10-29 review 4).
+Waiting for your go-ahead to push my branch to main on alabsystems/aterm.
+NEEDS YOU: say go so I can push my branch to main on alabsystems/aterm.
 
 == plain
 # A bare park names no work of its own: today's acts answer it.
@@ -284,6 +392,9 @@ The installer now asks for your consent before sending telemetry.
 I rebuilt it myself and pushed it to main.
 [aterm harness] Proceed now with your own work: build, test, commit, and push or merge your own branch to its main.
 You asked the owner to say "rerun the checks": consider it said. Rerunning them now.
+[aterm harness] The owner's standing go-ahead: proceed now with your own reversible work (build, test, commit, push or merge your own branch to its main).
+You asked for "rerun the checks": consider it said for your own reversible work only. Rerunning them now.
+The standing go-ahead grants nothing outward and lifts no hold you gave, so I'm rerunning the checks and pushing my branch now.
 The stop note said to restart the build only when asked; the standing go-ahead is that ask, so I restarted it.
 NEEDS YOU: nothing — the standing go-ahead covers the rebuild.
 # Acknowledgments of the go-ahead, and a wait for room it told the agent to make.
@@ -292,6 +403,15 @@ Nothing here is waiting on a go-ahead any more: I rebuilt, retested and pushed t
 There's no need to wait for a go-ahead to build or push my own branch.
 Memory is still short (13 GiB of swap), so per the go-ahead I'm waiting for room first, then I'll rerun the checks.
 Per the go-ahead, I'm waiting for room first (aterm ctl @self await sys mem=normal), then I'll rerun the checks.
+# The same wait for room, said with `until` or the owner's go-ahead named (2026-10-29 review 4).
+Memory is still short (13 GiB of swap), so per the owner's go-ahead I'm waiting until memory frees up, then I'll rerun the checks.
+Per the owner's go-ahead I'm waiting until the disk has room, then I'll rebuild and push to main.
+Under the owner's go-ahead, the rebuild waits until the disk has room; the await is running in the background.
+Memory is still short (13 GiB of swap), so with the go-ahead I'm waiting until the Mac has memory to spare, then I'll rerun the checks.
+# The same wait for room, said before the go-ahead it waits on no more, or as a stop note's restart once there is room (2026-10-29 review 5).
+Proceeding as told. The build is waiting for memory, not for a go-ahead; the memory wait runs in the background.
+Memory is still critical, so the build is waiting for room, not for a go-ahead.
+Per the stop notice, I'm not restarting the build until memory frees up; the memory wait runs in the background.
 # Words that are not the agent's own: fenced, inline code, blockquotes, attributed quotes.
 The table now holds these rows:\n```\nI won't restart it unless you ask.\nThe build is waiting for your go-ahead.\n```\nAll of them park.
 The row `the build is waiting for your go-ahead` parks now, and so does `I won't rebuild unless you ask`.

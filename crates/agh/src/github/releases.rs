@@ -277,7 +277,7 @@ impl<'a> Releases<'a> {
     ///
     /// # Errors
     ///
-    /// `list`'s errors.
+    /// `list`'s errors. Usage when `tag_regex` outruns its step budget on a tag.
     pub fn newest(
         &self,
         prerelease: Option<bool>,
@@ -289,13 +289,32 @@ impl<'a> Releases<'a> {
             how: self.how.as_read(),
         };
         let listing = reader.list(&ListOpts::STANDARD)?;
-        Ok(listing
+        let mut best: Option<ReleaseObject> = None;
+        for release in listing
             .items
             .into_iter()
             .filter(|release| !release.draft)
             .filter(|release| prerelease.is_none_or(|want| release.prerelease == want))
-            .filter(|release| tag_regex.is_none_or(|regex| regex.is_match(&release.tag_name)))
-            .max_by(|a, b| (&a.created_at, a.id).cmp(&(&b.created_at, b.id))))
+        {
+            let matched = match tag_regex {
+                None => true,
+                Some(regex) => regex.try_is_match(&release.tag_name).map_err(|e| {
+                    Error::usage(format!(
+                        "--tag-regex {:?} gave up on a {}-byte tag: {e}",
+                        regex.as_str(),
+                        release.tag_name.len()
+                    ))
+                })?,
+            };
+            if matched
+                && best.as_ref().is_none_or(|cur| {
+                    (&release.created_at, release.id) >= (&cur.created_at, cur.id)
+                })
+            {
+                best = Some(release);
+            }
+        }
+        Ok(best)
     }
 
     /// The asset with this id.

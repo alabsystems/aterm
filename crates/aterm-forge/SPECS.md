@@ -1,7 +1,7 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-forge: spec recovery from its 184 unit tests
+# aterm-forge: spec recovery from its unit tests
 
 > Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 125 tests
 > it deleted and 1 spec whose functions it deleted are gone, and the spec rows no longer cite
@@ -26,30 +26,34 @@ Result: **64 specs**, covering **159 tests**. **25 tests are not spec samples** 
 ## 0. Notation used in the statements
 
 - `chars(x)`: the number of Unicode scalar values in `x`. `lines(x)`: `x.split('\n')` with a trailing
-  empty piece dropped. `W_LINE` = 96, the report width constant.
-- Graph `g = (root, nodes, edges: PkgId → set of PkgId)`. `Path(g,u,v)`: a finite edge walk `u → … → v`.
+  empty piece dropped. `W_LINE` = 96, the report width.
+- Graph `g = (root, nodes, edges: PkgId → set of PkgId)`.
 - `Reach(g,B)` = `{v | v = root, or some walk root → v visits no vertex (root included) equal to B}`;
   empty when `B = Some(root)`. This is `model::Graph::reach`.
 - `WF(s)` for a `CellSurvey s`: `s.graph.nodes = Reach(s.graph, None)`, every edge endpoint is in `nodes`,
-  `dom(s.facts) = nodes`, and `facts[root].is_third_party = false`. `measure` + `parse_tree` establish it.
+  `dom(s.facts) = nodes`, and `facts[root].is_third_party = false`. `loc::survey_cell_logged` establishes
+  it (`resolve::parse_tree`, then `loc::facts_with_paths` per node).
 - `TP(s)` = `s.third_party()`: the nodes `p` with `facts[p].is_third_party`, in `BTreeSet` order.
   `FP(s,id)`: `facts[id]` exists and `¬is_third_party`.
 - `Fall(s,t)` = `Reach(g,None) \ Reach(g,Some(t))`: what drops out of the graph if `t` goes.
 - `Class(v)`: the semver line of `v` (`m` for major `m > 0`; `0.m` for `0.m`, `m > 0`; else `0.0.p`).
-  `caret(r)`: cargo's caret range for `r`; `=r` means every stated component is equal.
+  `caret(r)`: cargo's caret range for `r`.
 - `spec(id)` = `name ++ "@" ++ version`. `Lines(log) ∋ X`: some line of the log contains `X`.
 - `OB-n`: the obligation of that number in `src/attest.rs` (1–10) and `src/check.rs` (11–18).
-- A **fixture tree** is any directory the statement quantifies over. Statements that read fs, git or
-  cargo are about the pure core over those observations; proving them needs the core factored out of
-  the effect (gap 8), which is the first refactor for every row whose gaps include 8.
-- **Gap 0** (installed seal publishes no Lean-discharged row) blocks every spec; it is listed in each
-  row so the histogram is complete. No spec is blocked by gap 0 alone: gap 1 (non-scalar carriers) is
-  in all but one row, because every forge function takes or returns `String`, `Vec`, `Path` or a struct.
+- A **fixture tree** is any directory the statement quantifies over. A statement that reads fs, git or
+  cargo is about the pure core over those observations; proving it needs the core factored out of the
+  effect (gap 8), the first refactor for every row whose gaps include 8.
+- Gaps are the rows of `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7: 0 installed seal, 1
+  non-scalar carriers, 2 `&mut self` views, 3 E6 body widening, 4 callee-ensures composition, 5
+  quantified clauses, 6 plain-Rust clause publication, 7 loops, 8 effects (fs, process, env), 11
+  generics, 12 cross-crate citation (`aterm_toml`, `aterm_census`, `aterm_json`), 13 closures, threads,
+  async. Every row lists gap 0, and none is blocked by it alone; gap 1 is on every row but
+  `absent-ledger-is-empty`, because forge's functions take or return `String`, `Vec`, `Path` or a struct.
 
 ## 1. Specs (TSV)
 
 Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (tests; primary and secondary, see §2),
-`rust features the proof must handle`, `blocking gaps` (audit §7 numbers).
+`rust features the proof must handle`, `blocking gaps`.
 
 ```tsv
 id	kind	functions	statement	subsumes	rust features	blocking gaps
@@ -165,8 +169,7 @@ the `attest-*` and `astream-*` specs) → `survey-reports-live-totals`, `blame-*
 
 ## 2. Test → spec map (TSV)
 
-`primary` is the spec that retires the test. `also` lists the other specs the same test samples. The
-tests of §4 are deleted and have no row.
+`primary` is the spec whose proof retires the test; `also` lists the other specs it samples.
 
 ```tsv
 file	test	primary	also
@@ -239,24 +242,8 @@ tests/red_fixtures.rs	an_unpatched_sibling_version_reds_the_forge_verb	check-ver
 - `dom-cost-is-counterfactual-reach` has 4 primary tests, but `dominator-shape`,
   `dominator-laminar-partition`, `ranked-is-sorted-permutation` and the totals of
   `survey-reports-live-totals` and `blame-report-contents` are corollaries of it.
-
-## 4. Tests that are not spec samples
-
-**Status (2026-10-16): deleted** — 16 of the 19 **delete** rows are gone: every one except
-`loc::mac_arm_stays_within_the_measured_baseline`, `loc::linux_stays_within_the_measured_baseline`
-and `loc::licences_are_read_for_every_third_party_package`, which were not in the confirmed deletion list and are kept.
-Status 2026-10-17: those three went too, with forge's other live-repo tests (8c5dd17c3f).
-The **becomes-spec-after-fix** rows remain. Wasm cell coverage now belongs to
-`check-verdict-obligations`: production OB-17 requires a cell for each browser root,
-without requiring either browser module's graph to contain its sibling's.
-
-**Status (2026-10-17):** every test this section listed is gone, the three kept `loc` tests and
-the **becomes-spec-after-fix** tests included, and so is its table. Most of them read the live
-repository and pinned today's facts about it, not a property of forge's code. The silent 0-LOC
-case one of them guarded is §5.13.
-
-No test is a regression of a removed bug with no general property: each regression-shaped test is an
-instance of one of the §1 specs.
+- No test is a regression of a removed bug with no general property: each regression-shaped test is an
+  instance of one of the §1 specs.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 

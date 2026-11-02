@@ -6,8 +6,8 @@
 //! their own sources: the kernel's route socket ([`aterm_uds::network::RouteChanges`]), the one
 //! `_alab._tcp` browse a process holds, on a Bonjour connection it owns, which tells each member
 //! it did not hold and resolves what it holds to dial hints ([`hear_alab_tcp`]: the node job's,
-//! and a window's only while it serves the fleet port, §4.1 F17), and the Commons runtime's peers, one heard again after a silence
-//! of [`SILENCE`] ([`Heard`]). Each consumer (the window's converge lane, a fleet heartbeat, the sign-in
+//! and a window's only while it serves the fleet port, §4.1 F17), and the Commons runtime's peers, the first heard after every
+//! peer's silence of [`SILENCE`], or one heard for the first time ([`Heard`]). Each consumer (the window's converge lane, a fleet heartbeat, the sign-in
 //! ladder's waits and the account claims, the fleet glance's backoff) holds its own [`Watch`],
 //! is woken once this Mac's spread has passed ([`spread_of`]: a few seconds, the same every time
 //! on one Mac and different between Macs, so ~35 Macs back on one LAN do not dial the issuer and
@@ -24,19 +24,16 @@ use std::time::{Duration, Instant};
 pub(crate) enum Woke {
     /// Its time ran out with no move.
     Timer,
-    /// The kernel told of a change to this Mac's addresses or links.
-    #[cfg_attr(
-        all(windows, not(test)),
-        expect(dead_code, reason = "the route source is macOS's and Linux's")
-    )]
+    /// The kernel told of a change to this Mac's addresses or links (macOS's and Linux's source;
+    /// every platform's watch tells a route move it has not heard as one: [`Told::heard_since`]).
     Route,
     /// The process's `_alab._tcp` browse heard a member it did not hold ([`hear_alab_tcp`]).
     #[cfg_attr(
-        not(any(target_os = "macos", all(test, unix))),
+        not(any(target_os = "macos", test)),
         expect(dead_code, reason = "the browse source is macOS's")
     )]
     Browse,
-    /// The Commons runtime heard a peer again after a silence ([`SILENCE`]), or a new one.
+    /// The Commons runtime heard a peer after every peer's silence ([`SILENCE`]), or a new one.
     Beacon,
     /// macOS's Local Network answer for aterm moved as the window heard it
     /// ([`local_network_moved`]): which LAN hosts aterm may reach changed, or may have.
@@ -50,7 +47,7 @@ impl Woke {
             Self::Timer => "its timer",
             Self::Route => "a route change",
             Self::Browse => "a member heard on the _alab._tcp browse",
-            Self::Beacon => "a Commons beacon from a peer not heard for two minutes",
+            Self::Beacon => "a Commons beacon after two minutes of no peer, or from a new one",
             Self::LocalNetwork => "macOS's Local Network answer for aterm",
         }
     }
@@ -60,10 +57,11 @@ impl Woke {
 pub(crate) const LONG: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// One process's signal: how many moves were told, the source of the last, and when its watches
-/// are due to hear it (`None`: at once).
+/// are due to hear it (`None`: at once), and which of them was the last route move
+/// ([`Told::route`]).
 #[derive(Debug)]
 pub(crate) struct Moved {
-    told: Mutex<(u64, Woke, Option<Instant>)>,
+    told: Mutex<Told>,
     changed: Condvar,
     /// How long after a move its watches hear it, where this Mac shares its moves with a whole
     /// herd ([`HERD`]): this Mac's spread ([`spread_of`]).
@@ -71,6 +69,34 @@ pub(crate) struct Moved {
     /// How many other Macs share this one's moves, read at each move ([`members_here`]): the
     /// spread is the share of [`Moved::spread`] that herd makes ([`herded`]).
     herd: fn() -> usize,
+}
+
+/// What a [`Moved`] was told.
+#[derive(Debug)]
+struct Told {
+    /// How many moves were told.
+    count: u64,
+    /// The source of the last.
+    source: Woke,
+    /// When its watches are due to hear it (`None`: at once).
+    due: Option<Instant>,
+    /// Which move (its count) was the last route move: a watch that has not heard it is told a
+    /// route move, whatever moved after it within the spread (a browse row, a beacon), since
+    /// several moves told meanwhile are one wake and a route move is the one a consumer that
+    /// looks again only on a route move (the API reach probe) must not miss.
+    route: u64,
+}
+
+impl Told {
+    /// What a watch that heard up to move `seen` is told now: the route move where one came
+    /// since, else the last move's source.
+    const fn heard_since(&self, seen: u64) -> Woke {
+        if self.route > seen {
+            Woke::Route
+        } else {
+            self.source
+        }
+    }
 }
 
 impl Moved {
@@ -98,7 +124,12 @@ impl Moved {
     /// hear at once.
     pub(crate) const fn herded_by(spread: Duration, herd: fn() -> usize) -> Self {
         Self {
-            told: Mutex::new((0, Woke::Timer, None)),
+            told: Mutex::new(Told {
+                count: 0,
+                source: Woke::Timer,
+                due: None,
+                route: 0,
+            }),
             changed: Condvar::new(),
             spread,
             herd,
@@ -113,8 +144,9 @@ impl Moved {
     /// The network moved, as `source` heard at `at`: every watch wakes once this signal's spread,
     /// the share of it the herd read now makes ([`herded`]), has passed since `at` (a watch made
     /// by [`Moved::watch_at_once`] at once). A move told while another is still to be heard is
-    /// one wake with it, at the later one's time. macOS's Local Network answer is this Mac's own,
-    /// no event on the LAN every Mac hears at once, so its watches hear it at once.
+    /// one wake with it, at the later one's time, told as a route move where one of them was
+    /// ([`Told::route`]). macOS's Local Network answer is this Mac's own, no event on the LAN
+    /// every Mac hears at once, so its watches hear it at once.
     pub(crate) fn tell_at(&self, source: Woke, at: Instant) {
         let spread = if self.spread.is_zero() || source == Woke::LocalNetwork {
             Duration::ZERO
@@ -127,9 +159,12 @@ impl Moved {
             at.checked_add(spread)
         };
         let mut told = self.told.lock().unwrap_or_else(PoisonError::into_inner);
-        told.0 = told.0.wrapping_add(1);
-        told.1 = source;
-        told.2 = due;
+        told.count = told.count.wrapping_add(1);
+        told.source = source;
+        told.due = due;
+        if source == Woke::Route {
+            told.route = told.count;
+        }
         drop(told);
         self.changed.notify_all();
     }
@@ -137,7 +172,10 @@ impl Moved {
     /// How many moves were told.
     #[cfg(all(test, unix))]
     pub(crate) fn told(&self) -> u64 {
-        self.told.lock().unwrap_or_else(PoisonError::into_inner).0
+        self.told
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .count
     }
 
     /// A watch that hears each move told from now on, once it is due (this Mac's spread after it
@@ -153,7 +191,11 @@ impl Moved {
     }
 
     fn watch_spread(self: &Arc<Self>, spread: bool) -> Watch {
-        let seen = self.told.lock().unwrap_or_else(PoisonError::into_inner).0;
+        let seen = self
+            .told
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .count;
         Watch {
             moved: Arc::clone(self),
             seen,
@@ -174,7 +216,8 @@ pub(crate) struct Watch {
 impl Watch {
     /// Wait at most `most` for a move this watch was not told of, once it is due (this Mac's
     /// spread after it was told): the source of the latest one (several told meanwhile are one
-    /// wake), else [`Woke::Timer`], which leaves a move not yet due to a later wait.
+    /// wake), a route move where one of them was ([`Told::heard_since`]), else [`Woke::Timer`],
+    /// which leaves a move not yet due to a later wait.
     pub(crate) fn wait(&mut self, most: Duration) -> Woke {
         let deadline = Instant::now().checked_add(most);
         let mut told = self
@@ -184,14 +227,15 @@ impl Watch {
             .unwrap_or_else(PoisonError::into_inner);
         loop {
             let now = Instant::now();
-            let unheard = told.0 != self.seen;
+            let unheard = told.count != self.seen;
             let until_due = told
-                .2
+                .due
                 .filter(|_| self.spread)
                 .map_or(Duration::ZERO, |due| due.saturating_duration_since(now));
             if unheard && until_due.is_zero() {
-                self.seen = told.0;
-                return told.1;
+                let woke = told.heard_since(self.seen);
+                self.seen = told.count;
+                return woke;
             }
             let left = deadline.map_or(LONG, |at| at.saturating_duration_since(now));
             if left.is_zero() {
@@ -219,10 +263,25 @@ impl Watch {
             .told
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        (told.0 != self.seen && told.2.is_none_or(|due| !self.spread || now >= due)).then(|| {
-            self.seen = told.0;
-            told.1
-        })
+        (told.count != self.seen && told.due.is_none_or(|due| !self.spread || now >= due)).then(
+            || {
+                let woke = told.heard_since(self.seen);
+                self.seen = told.count;
+                woke
+            },
+        )
+    }
+
+    /// Whether [`Watch::take_at`] would take a move at `now`, taking none. Its one caller, the
+    /// heartbeat clock, is Unix's.
+    #[cfg(unix)]
+    pub(crate) fn due_at(&self, now: Instant) -> bool {
+        let told = self
+            .moved
+            .told
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        told.count != self.seen && told.due.is_none_or(|due| !self.spread || now >= due)
     }
 
     /// [`Watch::take_at`] now.
@@ -433,11 +492,76 @@ pub(crate) fn alab_tcp() -> Option<Arc<aterm_secrets::discover::Watch>> {
 #[cfg(all(not(test), target_os = "macos"))]
 const BROWSE_AGAIN: Duration = Duration::from_secs(60);
 
-/// How long the browse, waiting for System State's Local Network step ([`browse_after_the_step`]),
-/// waits before it looks again with no move told: the step's question wakes it sooner
-/// ([`local_network_moved`]).
+/// How long the browse, waiting for System State's Local Network step or for sharing to be on
+/// ([`keep_browse`]), waits before it looks again with no move told: the step's question wakes it
+/// sooner ([`local_network_moved`]).
 #[cfg(all(not(test), target_os = "macos"))]
 const STEP_LOOK: Duration = Duration::from_secs(10);
+
+/// How often a running browse looks at `[swarm] enabled` while it hears nothing
+/// ([`aterm_net::bonjour::browse_while`]): one `stat` ([`aterm_secrets::swarm::Switch`]).
+#[cfg(all(not(test), target_os = "macos"))]
+const SHARING_LOOK: Duration = Duration::from_secs(5);
+
+/// What the browse's keeper says in aterm.log once per change ([`keep_browse`]).
+#[cfg(target_os = "macos")]
+const BROWSE_SHARING_OFF: &str = "network moved: sharing is off ([swarm] enabled = false), so the \
+    _alab._tcp browse is stopped until it is on";
+
+/// What the browse's keeper says once it waited for System State's Local Network step
+/// ([`keep_browse`]).
+#[cfg(target_os = "macos")]
+const BROWSE_WAITED: &str =
+    "network moved: the _alab._tcp browse waited for System State's Local Network step";
+
+/// What the browse's keeper says once a person turns sharing back on ([`keep_browse`]).
+#[cfg(target_os = "macos")]
+const BROWSE_SHARING_ON: &str = "network moved: sharing is on again, so the _alab._tcp browse \
+    starts again";
+
+/// Keep this process's `_alab._tcp` browse while `[swarm] enabled` leaves sharing on
+/// (`sharing`, `docs/DESIGN-alab-swarm-2026-10-27.md` §9): it starts only with sharing on and
+/// once this process `may_use` the LAN ([`browse_after_the_step`]), both read again after each
+/// `wait`; it runs (`browse`, told to go on only while `sharing` stays on) until sharing goes
+/// off, and starts again once a person turns it back on. Each stop and start is said once in
+/// `said`. It returns once `browse` says the browse is not to be kept (a test's end).
+#[cfg(target_os = "macos")]
+fn keep_browse(
+    mut sharing: impl FnMut() -> bool,
+    mut may_use: impl FnMut() -> bool,
+    mut wait: impl FnMut(),
+    mut browse: impl FnMut(&mut dyn FnMut() -> bool) -> bool,
+    mut said: impl FnMut(&str),
+) {
+    let mut off = false;
+    loop {
+        let mut for_the_step = false;
+        browse_after_the_step(
+            || {
+                let on = sharing();
+                if on == off {
+                    off = !on;
+                    said(if on {
+                        BROWSE_SHARING_ON
+                    } else {
+                        BROWSE_SHARING_OFF
+                    });
+                }
+                let goes = on && may_use();
+                for_the_step |= on && !goes;
+                goes
+            },
+            &mut wait,
+            || {},
+        );
+        if for_the_step {
+            said(BROWSE_WAITED);
+        }
+        if !browse(&mut sharing) {
+            return;
+        }
+    }
+}
 
 /// Start the `browse` (a Bonjour browse is a Local Network use: it puts macOS's Local Network
 /// question on screen where macOS never asked aterm) only once this process `may_use` the LAN
@@ -479,40 +603,57 @@ fn hear_browse(watch: &Arc<aterm_secrets::discover::Watch>, moved: &Arc<Moved>) 
                 aterm_log::warn!("network moved: the browse service name contains a NUL");
                 return;
             };
-            let waited = browse_after_the_step(
+            let mut switch =
+                aterm_types::dirs::home_dir().map(|home| aterm_secrets::swarm::Switch::new(&home));
+            keep_browse(
+                || {
+                    switch.as_mut().is_none_or(|switch| {
+                        switch.enabled_saying(&|line| aterm_log::warn!("network moved: {line}"))
+                            == Ok(true)
+                    })
+                },
                 aterm_types::macos_setup::lan_first_use::may_use,
                 || {
                     let _ = step.wait(STEP_LOOK);
                 },
-                || browse_until_gone(&service, &watch),
+                |sharing| {
+                    browse_until_off(&service, &watch, sharing);
+                    true
+                },
+                |line| aterm_log::info!("{line}"),
             );
-            if waited {
-                aterm_log::info!(
-                    "network moved: the _alab._tcp browse waited for System State's Local \
-                     Network step"
-                );
-            }
         });
     if let Err(error) = spawned {
         aterm_log::warn!("network moved: the browse source did not start: {error}");
     }
 }
 
-/// Browse `service` on `local.` for good, each event reaching `watch`
+/// Browse `service` on `local.` while `sharing` stays on, each event reaching `watch`
 /// ([`aterm_secrets::discover::Watch::hear`]), a fresh connection [`BROWSE_AGAIN`] after one
-/// that failed; it returns once a browse ended with no error.
+/// that failed; it returns once sharing is off (looked at each [`SHARING_LOOK`] the browse hears
+/// nothing, and before each event).
 #[cfg(all(not(test), target_os = "macos"))]
-fn browse_until_gone(service: &std::ffi::CStr, watch: &aterm_secrets::discover::Watch) {
+fn browse_until_off(
+    service: &std::ffi::CStr,
+    watch: &aterm_secrets::discover::Watch,
+    sharing: &mut dyn FnMut() -> bool,
+) {
     use std::ops::ControlFlow;
     let mut said = false;
-    loop {
+    while sharing() {
         watch.began_browse();
-        let result = aterm_net::bonjour::browse(service, c"local.", |event| {
-            if let Ok(name) = event.name.to_str() {
-                watch.hear(event.added, event.interface, name);
-            }
-            ControlFlow::Continue(())
-        });
+        let result = aterm_net::bonjour::browse_while(
+            service,
+            c"local.",
+            SHARING_LOOK,
+            &mut *sharing,
+            |event| {
+                if let Ok(name) = event.name.to_str() {
+                    watch.hear(event.added, event.interface, name);
+                }
+                ControlFlow::Continue(())
+            },
+        );
         match result {
             Ok(()) => return,
             Err(error) if !said => {
@@ -575,17 +716,22 @@ fn hear_routes(moved: &Arc<Moved>) {
     );
 }
 
-/// How long a peer the Commons runtime heard must go unheard for its return to be a move. A live
-/// LAN's peers drop out of Reachable and back about every half minute (an authenticated contact
-/// keeps one Reachable 15 s, and the runtime contacts its peers a few at a time), so this sits
-/// well above that: a Mac back from away is a move, a live peer's blip is none.
+/// How long every peer the Commons runtime heard must go unheard for the next one heard to be a
+/// move: this Mac back from away is a move, one peer's silence is none. It counts awake time
+/// ([`Instant`] stops while macOS sleeps), so a wake on a changed network is the route source's
+/// to tell. A live LAN's peers drop out of Reachable and back all the time (an authenticated
+/// contact keeps one Reachable 15 s, and the runtime contacts its peers a few at a time), and
+/// among some 40 Macs one is always back from longer than this: counted a peer at a time, the
+/// source fired 110 times an hour where its rest allows 120 (0.147.0, 2026-11-01).
 const SILENCE: Duration = Duration::from_secs(2 * 60);
 
 /// What the Commons runtime has told of its peers: when each heard (reachable) within the last
-/// [`SILENCE`] was last heard, and how many looks remain of the baseline.
+/// [`SILENCE`] was last heard, every peer this watch has heard, and how many looks remain of the
+/// baseline.
 #[derive(Debug)]
 pub(crate) struct Heard {
     heard: std::collections::BTreeMap<[u8; 16], Instant>,
+    known: std::collections::BTreeSet<[u8; 16]>,
     baseline: usize,
 }
 
@@ -594,18 +740,34 @@ impl Heard {
     pub(crate) const fn new(baseline: usize) -> Self {
         Self {
             heard: std::collections::BTreeMap::new(),
+            known: std::collections::BTreeSet::new(),
             baseline,
         }
     }
 
+    /// The beacon source's watch: its baseline is [`SETTLE_LOOKS`] looks.
+    pub(crate) const fn commons() -> Self {
+        Self::new(SETTLE_LOOKS)
+    }
+
     /// One look at the peers now ([`Heard::look_at`]).
+    #[cfg(test)]
     pub(crate) fn look(&mut self, peers: &[aterm_types::network_state::PeerObservation]) -> bool {
         self.look_at(peers, Instant::now())
     }
 
-    /// One look at the peers at `now`: whether one is heard that this watch has not heard
-    /// within [`SILENCE`] (a peer back after a silence, or a new one), once the baseline is
-    /// over. It forgets each peer unheard for longer, so it holds only those heard lately.
+    /// An unavailable sample is no look: it neither advances the baseline nor forgets peers.
+    fn look_sample_at(
+        &mut self,
+        peers: Option<&[aterm_types::network_state::PeerObservation]>,
+        now: Instant,
+    ) -> bool {
+        peers.is_some_and(|peers| self.look_at(peers, now))
+    }
+
+    /// One look at the peers at `now`: whether, once the baseline is over, one is heard where no
+    /// peer was within [`SILENCE`], or one this watch never heard. It forgets when each peer
+    /// unheard for longer was heard, so it holds only those heard lately.
     pub(crate) fn look_at(
         &mut self,
         peers: &[aterm_types::network_state::PeerObservation],
@@ -614,41 +776,47 @@ impl Heard {
         use aterm_types::network_state::Reachability;
         self.heard
             .retain(|_, at| now.saturating_duration_since(*at) <= SILENCE);
+        let alone = self.heard.is_empty();
+        let mut back = false;
         let mut new = false;
         for peer in peers
             .iter()
             .filter(|peer| peer.reachability == Reachability::Reachable)
         {
-            new |= self.heard.insert(peer.identity.machine_id, now).is_none();
+            back = true;
+            new |= self.known.insert(peer.identity.machine_id);
+            self.heard.insert(peer.identity.machine_id, now);
         }
         if self.baseline > 0 {
             self.baseline -= 1;
             return false;
         }
-        new
+        new || (alone && back)
     }
 }
 
 /// How often the beacon source reads the Commons runtime's peers.
 const BEACON_LOOK: Duration = Duration::from_secs(2);
 
-/// Hear this process's Commons runtime (`read`: its peers as it observes them now): a peer heard
-/// again after a silence is a move ([`Heard`]). Once per process; none in a test build.
+/// Hear this process's Commons runtime (`read`: its peers as it observes them now, or no sample
+/// while unavailable): a peer heard after every peer's silence, or a new one, is a move
+/// ([`Heard`]). An unavailable
+/// sample leaves the watch unchanged. Once per process; none in a test build.
 pub fn hear_commons(
-    read: impl Fn() -> Vec<aterm_types::network_state::PeerObservation> + Send + 'static,
+    read: impl Fn() -> Option<Vec<aterm_types::network_state::PeerObservation>> + Send + 'static,
 ) {
     static STARTED: OnceLock<()> = OnceLock::new();
     if cfg!(test) || STARTED.set(()).is_err() {
         return;
     }
-    let mut heard = Heard::new(SETTLE_LOOKS);
+    let mut heard = Heard::commons();
     spawn_source(
         "aterm-moved-commons",
         Arc::clone(process()),
         (Woke::Beacon, REST),
         move || {
             std::thread::sleep(BEACON_LOOK);
-            Some(heard.look(&read()))
+            Some(heard.look_sample_at(read().as_deref(), Instant::now()))
         },
     );
 }
@@ -703,6 +871,57 @@ pub(crate) mod tests {
         assert_eq!(browsed.get(), 1, "no step to come: it browses at once");
     }
 
+    /// The automatic `_alab._tcp` browse runs only while `[swarm] enabled` leaves sharing on: off
+    /// from the start it never browses; turned on it starts; turned off it stops, saying so once;
+    /// turned on again it starts again. NEGATIVE CONTROL: a keeper that reads no switch browses
+    /// while sharing is off.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_browse_stops_and_starts_with_the_sharing_switch() {
+        use std::cell::{Cell, RefCell};
+        // The switch as each read finds it: off twice, on for a browse of three looks, off for
+        // two reads, on again for one more browse.
+        let reads = RefCell::new(
+            [
+                false, false, true, true, true, true, false, false, false, true, true, false,
+            ]
+            .into_iter(),
+        );
+        let sharing = || reads.borrow_mut().next().unwrap_or(false);
+        let (browses, looks, waits) = (Cell::new(0), Cell::new(0), Cell::new(0));
+        let said = RefCell::new(Vec::new());
+        keep_browse(
+            sharing,
+            || true,
+            || waits.set(waits.get() + 1),
+            |going| {
+                browses.set(browses.get() + 1);
+                while going() {
+                    looks.set(looks.get() + 1);
+                }
+                browses.get() < 2
+            },
+            |line| said.borrow_mut().push(line.to_owned()),
+        );
+        assert_eq!(browses.get(), 2, "it browsed while on, twice");
+        assert_eq!(
+            looks.get(),
+            4,
+            "each browse ran only while the switch read on"
+        );
+        assert_eq!(waits.get(), 4, "it waited while the switch read off");
+        assert_eq!(
+            *said.borrow(),
+            [
+                BROWSE_SHARING_OFF,
+                BROWSE_SHARING_ON,
+                BROWSE_SHARING_OFF,
+                BROWSE_SHARING_ON
+            ],
+            "each change said once"
+        );
+    }
+
     /// A move told wakes every watch once, with its source; a watch made after it was not told
     /// of it, and a watch with nothing told waits out its time.
     /// NEGATIVE CONTROL: a `tell` that wakes no watch fails the first wait (it reads `Timer`).
@@ -718,6 +937,33 @@ pub(crate) mod tests {
         assert_eq!(one.take(), None, "told once");
         assert_eq!(moved.watch().take(), None, "a later watch was not told");
         assert_eq!(one.wait(Duration::from_millis(1)), Woke::Timer);
+    }
+
+    /// Joining a LAN tells a route move, and the `_alab._tcp` browse or a Commons beacon tells
+    /// another within this Mac's spread: the two are one wake, and a watch hears it as the route
+    /// move, so a consumer that looks again only on a route move (the API reach probe) never
+    /// drops it. A watch that heard the route move already is told the later move's own source.
+    /// NEGATIVE CONTROL: keeping only the latest move's source wakes the watch with `Browse`.
+    #[test]
+    fn a_route_move_followed_by_a_browse_still_wakes_the_local_network_step() {
+        let moved = Arc::new(Moved::spread_by(Duration::from_millis(300)));
+        let mut watch = moved.watch();
+        let mut at_once = moved.watch_at_once();
+        moved.tell(Woke::Route);
+        moved.tell(Woke::Browse);
+        assert_eq!(
+            watch.wait(HANG),
+            Woke::Route,
+            "the route move is not hidden"
+        );
+        assert_eq!(at_once.take(), Some(Woke::Route));
+        moved.tell(Woke::Beacon);
+        assert_eq!(
+            watch.wait(HANG),
+            Woke::Beacon,
+            "no route move since it heard one"
+        );
+        assert_eq!(at_once.take(), Some(Woke::Beacon));
     }
 
     /// A PER-MAC SPREAD AFTER A MOVE (docs/DESIGN-fluid-swarm-2026-10-28.md, F4's follow-up): on
@@ -751,7 +997,11 @@ pub(crate) mod tests {
             None,
             "the later move's spread"
         );
-        assert_eq!(watch.take_at(t0 + secs(14)), Some(Woke::Beacon));
+        assert_eq!(
+            watch.take_at(t0 + secs(14)),
+            Some(Woke::Route),
+            "told as the route move among them"
+        );
         assert_eq!(watch.take_at(t0 + secs(60)), None, "one wake for both");
 
         moved.tell_at(Woke::LocalNetwork, t0 + secs(100));
@@ -999,8 +1249,8 @@ pub(crate) mod tests {
         drop(browse);
     }
 
-    /// A Commons peer heard again after a silence longer than [`SILENCE`], or one new, is a
-    /// move once the baseline is over; one heard within it, or one gone silent, is not.
+    /// A Commons peer heard after every peer's silence longer than [`SILENCE`], or one new, is
+    /// a move once the baseline is over; one heard within it, or one gone silent, is not.
     /// NEGATIVE CONTROL: a look that takes every heard peer as new fails the second look; one
     /// that never forgets a peer misses its return after the silence.
     #[test]
@@ -1031,6 +1281,104 @@ pub(crate) mod tests {
         );
     }
 
+    /// The beacon source's baseline at its real count, not the one-look baseline of the tests
+    /// around it: the source looks once a [`BEACON_LOOK`] after it starts, and every look in
+    /// the first half minute only learns who is heard, one look each however many peers it
+    /// hears. A runtime just started has confirmed no peer yet (each is LastSeen or Unknown
+    /// until an authenticated contact), so the first look hears none; from the second it hears
+    /// two. A peer first heard on the half minute's last look was there before this process
+    /// looked, so it is no move, nor on the next look (heard within [`SILENCE`], as are the
+    /// peers heard throughout); a peer first heard on the first look after the half minute is
+    /// one.
+    /// NEGATIVE CONTROL: `SETTLE_LOOKS = 14` fails "first heard on the baseline's last look";
+    /// `SETTLE_LOOKS = 16` fails "new on the first look after the baseline"; a baseline used up
+    /// once per peer heard rather than once per look fails "first heard on the baseline's last
+    /// look"; one that a look hearing no peer leaves whole fails "new on the first look after
+    /// the baseline".
+    #[test]
+    fn the_commons_baseline_is_fifteen_looks() {
+        use aterm_types::network_state::Reachability::{LastSeen, Reachable, Unknown};
+        const HALF_MINUTE: Duration = Duration::from_secs(30);
+        let last = u32::try_from(HALF_MINUTE.as_millis() / BEACON_LOOK.as_millis())
+            .expect("a half minute is a few looks");
+        assert_eq!(BEACON_LOOK * last, HALF_MINUTE, "whole looks");
+        let start = Instant::now();
+        let at = |look: u32| start + BEACON_LOOK * look;
+        let unconfirmed = [peer(1, LastSeen), peer(4, Unknown)];
+        let two = [peer(1, Reachable), peer(4, Reachable)];
+        let (mut heard, mut fresh) = (Heard::commons(), Heard::commons());
+        for watch in [&mut heard, &mut fresh] {
+            assert!(
+                !watch.look_at(&unconfirmed, at(1)),
+                "baseline look 1 hears no peer"
+            );
+            for look in 2..last {
+                assert!(!watch.look_at(&two, at(look)), "baseline look {look}");
+            }
+        }
+        let three = [peer(1, Reachable), peer(4, Reachable), peer(2, Reachable)];
+        assert!(
+            !heard.look_at(&three, at(last)),
+            "first heard on the baseline's last look"
+        );
+        assert!(
+            !heard.look_at(&three, at(last + 1)),
+            "heard throughout, and since the baseline's last look"
+        );
+        assert!(
+            heard.look_at(
+                &[
+                    peer(1, Reachable),
+                    peer(4, Reachable),
+                    peer(2, Reachable),
+                    peer(3, Reachable)
+                ],
+                at(last + 2)
+            ),
+            "new after the baseline"
+        );
+        assert!(
+            !fresh.look_at(&two, at(last)),
+            "heard throughout the baseline"
+        );
+        assert!(
+            fresh.look_at(
+                &[peer(1, Reachable), peer(4, Reachable), peer(3, Reachable)],
+                at(last + 1)
+            ),
+            "new on the first look after the baseline"
+        );
+    }
+
+    /// Missing samples do not count as empty observations, even after the silence has elapsed.
+    /// NEGATIVE CONTROL: treating an unavailable sample as an empty look consumes the baseline
+    /// and forgets the peer before an actual observation arrives.
+    #[test]
+    fn an_unavailable_commons_sample_leaves_the_watch_unchanged() {
+        use aterm_types::network_state::Reachability::Reachable;
+        let at = Instant::now();
+        let later = at + SILENCE + Duration::from_secs(1);
+        let mut heard = Heard::new(2);
+        assert!(!heard.look_sample_at(Some(&[peer(1, Reachable)]), at));
+        assert_eq!(heard.baseline, 1);
+        let before = heard.heard.clone();
+
+        assert!(!heard.look_sample_at(None, later));
+        assert_eq!(heard.baseline, 1, "no baseline look was observed");
+        assert_eq!(heard.heard, before, "no peer was forgotten or heard again");
+
+        assert!(
+            !heard.look_sample_at(Some(&[peer(1, Reachable)]), later),
+            "the next actual look finishes the baseline"
+        );
+        assert_eq!(heard.baseline, 0);
+        assert_eq!(heard.heard.get(&[1; 16]), Some(&later));
+        assert!(
+            heard.look_sample_at(Some(&[peer(1, Reachable), peer(2, Reachable)]), later),
+            "a new peer in a subsequent actual sample is a move"
+        );
+    }
+
     /// A live LAN's peers drop out of Reachable and back about every half minute (an
     /// authenticated contact keeps one Reachable 15 s): such a blip is no move, however often it
     /// comes, so the source does not fire after each of its rests for as long as the LAN is up.
@@ -1045,6 +1393,28 @@ pub(crate) mod tests {
             assert!(!heard.look(&[peer(1, LastSeen)]), "silent, blip {blip}");
             assert!(!heard.look(&[peer(1, Reachable)]), "back, blip {blip}");
         }
+    }
+
+    /// One peer back from any silence is no move while another is heard: among some 40 Macs one
+    /// always is, and the source fired after each of its rests.
+    /// NEGATIVE CONTROL: a look that times each peer's silence alone takes this return as a move.
+    #[test]
+    fn a_peer_back_while_another_is_heard_is_no_move() {
+        use aterm_types::network_state::Reachability::{LastSeen, Reachable};
+        let at = Instant::now();
+        let mut heard = Heard::new(1);
+        let both = [peer(1, Reachable), peer(2, Reachable)];
+        assert!(!heard.look_at(&both, at), "baseline");
+        let back = SILENCE.as_secs() * 2;
+        for secs in (2..back).step_by(2) {
+            let look = at + Duration::from_secs(secs);
+            let silent = [peer(1, Reachable), peer(2, LastSeen)];
+            assert!(!heard.look_at(&silent, look), "peer 2 silent at {secs} s");
+        }
+        assert!(
+            !heard.look_at(&both, at + Duration::from_secs(back)),
+            "peer 1 was heard all along"
+        );
     }
 
     /// A peer with one byte of machine id, as the Commons runtime observes it.
@@ -1062,6 +1432,8 @@ pub(crate) mod tests {
             first_seen_ms: 1,
             last_seen_ms: 1,
             last_checked_ms: None,
+            last_repair: None,
+            last_authenticated_endpoint: None,
             reachability,
             instances: None,
             samples: Vec::new(),

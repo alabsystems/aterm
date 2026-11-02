@@ -245,11 +245,11 @@ fn schema_exit_has_seventeen_rows() {
 fn schema_nouns_and_verbs() {
     let (_, captured) = run(&["schema", "nouns"]);
     let nouns = common::stdout_json(&captured);
-    assert_eq!(nouns.as_array().map(Vec::len), Some(20));
+    assert_eq!(nouns.as_array().map(Vec::len), Some(23));
     let (_, captured) = run(&["schema", "verbs"]);
     let verbs = common::stdout_json(&captured);
     let verbs = verbs.as_array().expect("an array");
-    assert_eq!(verbs.len(), 28);
+    assert_eq!(verbs.len(), 45);
     let download = verbs
         .iter()
         .find(|v| v["path"] == Value::from("release.download"))

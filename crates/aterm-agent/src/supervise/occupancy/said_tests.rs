@@ -407,6 +407,18 @@ fn why_says_the_wake_held_and_since_when() {
     none.wake = None;
     let lines = why_lines(&none, none.at_ms, 0);
     assert!(lines[3].ends_with(": no wake ready"), "{lines:#?}");
+    // Across a daylight change between `since_ms` and `now_ms`, each instant keeps its own offset.
+    let (pdt, pst) = (-7 * 3600, -8 * 3600);
+    let boundary_s = (SINCE + 30 * MIN).div_euclid(1000);
+    let dst = why_lines_local(&held, SINCE + HOUR, &|s| {
+        Some(if s < boundary_s { pdt } else { pst })
+    });
+    let flat = why_lines(&held, SINCE + HOUR, pst);
+    assert!(dst[0].contains("since 11:52"), "{dst:#?}");
+    assert!(
+        flat[0].contains("since 10:52"),
+        "NEGATIVE CONTROL: {flat:#?}"
+    );
 }
 
 /// THE WAKE IS PART OF THE CHANGE and prints only when judged: a word without it prints as one

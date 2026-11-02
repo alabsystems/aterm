@@ -38,6 +38,10 @@ pub const fn backlog_max(populations: usize) -> usize {
     EV_RULE_BYTES / (FILL_RECORD_BYTES * if populations == 0 { 1 } else { populations })
 }
 
+/// The most rows the ask world's asked table takes pre-filled: the table's
+/// cap (`aterm_link::state::ASKED_KEEP`), which the ask world's tests hold it to.
+pub const ASKED_PREFILL_MAX: usize = 1024;
+
 /// One run's knobs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Spec {
@@ -63,6 +67,9 @@ pub struct Spec {
     pub horizon_ms: Option<u64>,
     /// Whether each world's broker retains its log by default rules.
     pub retention: bool,
+    /// Whether each world's log is sealed at rest under a key, as `aterm link broker` opens a log
+    /// with a `rest.key` beside it: on unless a run names it off, what a fabric root ships.
+    pub at_rest: bool,
     /// Bridge `--log` mirror mode.
     pub log: Log,
     /// Idle bystander sessions spawned beside the talking sessions.
@@ -83,6 +90,11 @@ pub struct Spec {
     /// watermark trails the head by this many when the bridge restarts. 0
     /// (the default) is the attach world without it.
     pub backlog: usize,
+    /// The ask world's asked table pre-filled to this many rows before its
+    /// legs (C04): written as a build before the asks journal wrote the table,
+    /// and taken in by a restarted bridge, as a node that upgraded with a full
+    /// table holds it. 0 (the default) is none; at most [`ASKED_PREFILL_MAX`].
+    pub asked_prefill: usize,
 }
 
 /// The scenarios measured in one run.
@@ -255,8 +267,17 @@ impl Spec {
         if let Some(ms) = self.retention_interval_ms {
             words.push_str(&format!(" retention_interval_ms={ms}"));
         }
+        // Always named: an entry from before the default changed names none and was plaintext.
+        words.push_str(if self.at_rest {
+            " at_rest=on"
+        } else {
+            " at_rest=off"
+        });
         if self.backlog > 0 {
             words.push_str(&format!(" backlog={}", self.backlog));
+        }
+        if self.asked_prefill > 0 {
+            words.push_str(&format!(" asked_prefill={}", self.asked_prefill));
         }
         if self.scenario != Scenario::All {
             words.push_str(&format!(" scenario={}", self.scenario.word()));
@@ -278,7 +299,8 @@ impl Spec {
 /// retention interval on a broker that does not retain, a burst past
 /// [`BURST_MAX`], an attach list that does not rise or passes [`ATTACH_MAX`],
 /// a bystander count past [`ATTACH_MAX`], a backlog past [`backlog_max`] for
-/// its attach sizes or on a run that measures no attach, or no `out=`.
+/// its attach sizes or on a run that measures no attach, an asked prefill past
+/// [`ASKED_PREFILL_MAX`] or on a run that measures no ask, or no `out=`.
 pub fn parse(raw: &str) -> Result<Spec, String> {
     let mut out = None;
     let mut spec = Spec {
@@ -293,6 +315,7 @@ pub fn parse(raw: &str) -> Result<Spec, String> {
         durability: Tier::default(),
         horizon_ms: None,
         retention: true,
+        at_rest: true,
         log: Log::default(),
         retention_interval_ms: None,
         bystanders: 0,
@@ -300,6 +323,7 @@ pub fn parse(raw: &str) -> Result<Spec, String> {
         asks: DEFAULT_ASKS,
         mix_every: DEFAULT_MIX_EVERY,
         backlog: 0,
+        asked_prefill: 0,
     };
     let count = |key: &str, v: &str, zero_ok: bool| -> Result<usize, String> {
         match v.parse::<usize>() {
@@ -327,8 +351,10 @@ pub fn parse(raw: &str) -> Result<Spec, String> {
             "asks" => spec.asks = count(key, v, false)?,
             "mix_every" => spec.mix_every = count(key, v, false)?,
             "backlog" => spec.backlog = count(key, v, true)?,
+            "asked_prefill" => spec.asked_prefill = count(key, v, true)?,
             "durability" => spec.durability = Tier::parse(v)?,
             "retention" => spec.retention = on_off(v)?,
+            "at_rest" => spec.at_rest = on_off(v)?,
             "log" => spec.log = Log::parse(v)?,
             "retention_interval_ms" => {
                 spec.retention_interval_ms = Some(count(key, v, false)? as u64);
@@ -395,6 +421,17 @@ pub fn parse(raw: &str) -> Result<Spec, String> {
     if spec.backlog > 0 && !matches!(spec.scenario, Scenario::All | Scenario::Attach) {
         return Err(format!(
             "{ENV}: backlog= is the attach world's, and this run measures {}",
+            spec.scenario.word()
+        ));
+    }
+    if spec.asked_prefill > ASKED_PREFILL_MAX {
+        return Err(format!(
+            "{ENV}: asked_prefill= tops out at the asked table's {ASKED_PREFILL_MAX} rows"
+        ));
+    }
+    if spec.asked_prefill > 0 && !matches!(spec.scenario, Scenario::All | Scenario::Ask) {
+        return Err(format!(
+            "{ENV}: asked_prefill= is the ask world's, and this run measures {}",
             spec.scenario.word()
         ));
     }

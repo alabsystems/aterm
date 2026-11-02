@@ -15,6 +15,7 @@ pub(crate) mod present;
 pub(crate) mod resources;
 pub(crate) mod shaders;
 pub(crate) mod swapchain;
+pub(crate) mod tray_prims;
 pub(crate) mod warm;
 
 /// The helpers every GPU test module under `metal` shares.
@@ -24,7 +25,8 @@ pub(crate) mod test_support {
 
     /// A device for GPU tests; a machine without one ends the test COULD NOT RUN.
     pub(crate) fn device() -> Device {
-        Device::preferred().unwrap_or_else(|| aterm_spec::host::could_not_run("no Metal device"))
+        Device::preferred_listed()
+            .unwrap_or_else(|| aterm_spec::host::could_not_run("no listed Metal device"))
     }
 
     /// `cell.metal`'s 16-byte `Uniforms` block: `float2 screen`, `float text_blend`, `float pad`, laid out identically in `repr(C)`.
@@ -780,6 +782,16 @@ mod tests {
             LanguageVersion::V2_3 as usize,
             "the language version must be PINNED to the macOS 11 floor"
         );
+        assert!(
+            opts.fast_math_enabled(),
+            "CONTROL: the default keeps fast math"
+        );
+        let precise = CompileOptions::aterm_precise().expect("MTLCompileOptions");
+        assert!(
+            !precise.fast_math_enabled() && precise.preserve_invariance(),
+            "the tray prims compile with fast math off and invariance on"
+        );
+        assert_eq!(precise.language_version(), LanguageVersion::V2_3 as usize);
     }
 
     use aterm_core::terminal::Terminal;

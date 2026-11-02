@@ -160,7 +160,13 @@ fn run_with_readers(
     let stdout = stdout.hand_off(owned.child.stdout.take(), "stdout");
     let stderr = stderr.hand_off(owned.child.stderr.take(), "stderr");
     let (stdout, stderr) = (stdout?, stderr?);
-    let deadline = cap.map(|cap| (Instant::now() + cap, cap));
+    let deadline = cap.map(|cap| {
+        let now = Instant::now();
+        let at = now
+            .checked_add(cap)
+            .unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 3600));
+        (at, cap)
+    });
     let status = loop {
         match owned.child.try_wait() {
             Ok(Some(status)) => {

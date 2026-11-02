@@ -82,10 +82,17 @@ pub(crate) struct GlArmLive {
 impl GlArmLive {
     /// A GL device with the frame's fixed resources.
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn new(ws: Option<crate::gl::device::WindowSystem>) -> Result<Self, String> {
+    pub(crate) fn new(
+        ws: Option<crate::gl::device::WindowSystem>,
+        policy: crate::DevicePolicy,
+    ) -> Result<Self, String> {
+        if policy == crate::DevicePolicy::Headless && ws.is_some() {
+            return Err("gl: a headless context cannot acquire a window-system device".to_owned());
+        }
         Self::on(match ws {
             Some(ws) => GlDevice::on_window_system(ws)?,
-            None => GlDevice::headless()?,
+            None if policy == crate::DevicePolicy::Headless => GlDevice::headless()?,
+            None => GlDevice::headless_with_policy(policy)?,
         })
     }
 
@@ -648,7 +655,7 @@ impl GpuRenderer {
             }
             self.gl_arm = None;
         }
-        match GlArmLive::new(want) {
+        match GlArmLive::new(want, self.ctx.device_policy) {
             Ok(live) => {
                 let caps = live.dev.caps();
                 self.ctx.gl_max_texture_dim = caps.max_texture_dim;
@@ -815,6 +822,8 @@ pub(crate) struct GlTrayCard {
     /// Which upload made it (`GpuRenderer::tray_uploads` after it): a card
     /// with the same serial shows the same pixels.
     pub(crate) serial: u64,
+    /// The [`crate::TrayQuad::serial`] its pixels are (0 when untracked).
+    pub(crate) quad_serial: u64,
 }
 
 impl GpuRenderer {
@@ -889,14 +898,16 @@ impl GpuRenderer {
         )?;
         let bu = Self::gl_post_uniform(
             live,
-            aterm_bits::bytes_of(&BloomUniform {
-                texel: [1.0 / bw as f32, 1.0 / bh as f32],
-                strength: page_bloom_strength(self.bloom_strength, input, self.theme.bg),
-                radius: self.bloom_radius,
-                chroma_radius: bloom_chroma_radius(self.bloom_radius),
-                extent: [1.0; 2],
-                _pad: 0.0,
-            }),
+            aterm_bits::bytes_of(&BloomUniform::new(
+                (bw as f32, bh as f32),
+                (fw, fh),
+                (
+                    page_bloom_strength(self.bloom_strength, input, self.theme.bg),
+                    self.bloom_radius,
+                ),
+                [1.0; 2],
+                self.bloom_mask.as_ref(),
+            )),
         )?;
         let clip = input.fx_clip.map(|(cx0, cy0, cx1, cy1)| {
             [
@@ -1097,27 +1108,49 @@ impl GpuRenderer {
         note_offscreen_written(win, None, (fw, fh));
         let live = self.gl_arm.as_mut().ok_or("the GL arm is not minted")?;
         live.ensure_pipeline(Pipeline::Tray)?;
-        let unchanged = win
-            .gl_tray_card
-            .as_ref()
-            .is_some_and(|c| c.w == t.pw && c.h == t.ph && c.pixels.as_slice() == t.rgba);
-        if !unchanged {
-            let tex = live
-                .dev
-                .texture_2d(TexelFormat::Rgba8Unorm, t.pw, t.ph, None)?;
-            live.dev
-                .upload_rows(&tex, 0, t.ph, t.rgba, t.pw * 4, t.pw)?;
-            self.tray_uploads += 1;
-            let mut pixels = win.gl_tray_card.take().map_or_else(Vec::new, |c| c.pixels);
-            pixels.clear();
-            pixels.extend_from_slice(t.rgba);
-            win.gl_tray_card = Some(GlTrayCard {
-                tex,
-                w: t.pw,
-                h: t.ph,
-                pixels,
-                serial: self.tray_uploads,
-            });
+        let stride = t.pw as usize * 4;
+        let card = win.gl_tray_card.as_ref();
+        let update = crate::renderer::tray_card_update(
+            card.map(|c| (c.w, c.h, c.quad_serial)),
+            &t,
+            || card.and_then(|c| crate::renderer::changed_row_band(&c.pixels, t.rgba, stride)),
+            &mut self.tray_compare_bytes,
+        );
+        match update {
+            crate::renderer::TrayCardUpdate::Keep => {}
+            crate::renderer::TrayCardUpdate::Rows(y0, y1) => {
+                let card = win.gl_tray_card.as_mut().expect("a resident card");
+                let (b0, b1) = (y0 as usize * stride, y1 as usize * stride);
+                live.dev
+                    .upload_rows(&card.tex, y0, y1 - y0, &t.rgba[b0..b1], t.pw * 4, t.pw)?;
+                self.tray_uploads += 1;
+                self.tray_upload_bytes += (b1 - b0) as u64;
+                card.pixels[b0..b1].copy_from_slice(&t.rgba[b0..b1]);
+                card.serial = self.tray_uploads;
+            }
+            crate::renderer::TrayCardUpdate::Whole => {
+                let tex = live
+                    .dev
+                    .texture_2d(TexelFormat::Rgba8Unorm, t.pw, t.ph, None)?;
+                live.dev
+                    .upload_rows(&tex, 0, t.ph, t.rgba, t.pw * 4, t.pw)?;
+                self.tray_uploads += 1;
+                self.tray_upload_bytes += t.rgba.len() as u64;
+                let mut pixels = win.gl_tray_card.take().map_or_else(Vec::new, |c| c.pixels);
+                pixels.clear();
+                pixels.extend_from_slice(t.rgba);
+                win.gl_tray_card = Some(GlTrayCard {
+                    tex,
+                    w: t.pw,
+                    h: t.ph,
+                    pixels,
+                    serial: self.tray_uploads,
+                    quad_serial: 0,
+                });
+            }
+        }
+        if let Some(card) = win.gl_tray_card.as_mut() {
+            card.quad_serial = t.serial;
         }
         let tu = Self::gl_post_uniform(
             live,

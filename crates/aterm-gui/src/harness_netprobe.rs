@@ -3,28 +3,29 @@
 
 //! Background network reachability probe (`aterm-harness-netprobe`) for `harness::netwatch`.
 
-use std::io;
+use std::collections::HashMap;
+use std::io::{self, Read as _, Write as _};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs as _};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
-use aterm_agent::harness::netwatch::{
-    self, API_HOST, API_PORT, NetState, Outcome, Route, RouteFacts, Source,
-};
+use aterm_agent::harness::netwatch::{self, NetState, Outcome, Route, RouteFacts, Source};
+use aterm_agent::harness::witness::{RouteKey, Target, Witnesses};
 use aterm_agent::supervise::policy::WorkerEnv;
 use aterm_agent::supervise::policy::claude_settings;
 use aterm_agent::supervise::policy::turn_end::Reach;
 
+/// Maximum endpoint probes, including the default one. A new endpoint beyond this count uses
+/// the path-only reading; live probes are never evicted or confused with another endpoint.
+pub(crate) const MAX_ENDPOINT_PROBES: usize = 64;
+
 /// One reading of this Mac's network ([`PathSource::watch`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PathEvent {
-    /// The path in use: whether it can carry traffic ([`NetState::path`]).
-    #[cfg_attr(
-        all(not(target_os = "macos"), not(test)),
-        expect(dead_code, reason = "only macOS's path monitor reads the path")
-    )]
+    /// The path in use: whether it can carry traffic ([`NetState::path`]). Only macOS's path
+    /// monitor reads it; an endpoint's own probe is handed the last one ([`NetProbe::to`]).
     Usable(bool),
     /// The routes moved (an address or a link changed), which says nothing of whether the path
     /// can carry traffic ([`NetState::moved`]): a switch between two usable paths, or on a host
@@ -190,6 +191,46 @@ pub(crate) trait Probe: Send + Sync {
         host: &str,
         deadline: aterm_http::Deadline,
     ) -> io::Result<()>;
+    /// Reads an HTTP answer from a plain-HTTP endpoint `host` over `tcp` before `deadline`
+    /// ([`http_answer`]): its server process answered, which the kernel's accept alone does not
+    /// say (v6 §14.17.5.4: a session's `http://` endpoint, the lab stub's among them).
+    fn http_answers(
+        &self,
+        tcp: TcpStream,
+        host: &str,
+        deadline: aterm_http::Deadline,
+    ) -> io::Result<()> {
+        http_answer(tcp, host, deadline)
+    }
+}
+
+/// A `HEAD /` to `host` over `tcp`, answered before `deadline` with a status line (`HTTP/…`,
+/// whatever its status): the endpoint's server process answered. A connection closed with no
+/// answer, or one that answers no HTTP, is an error.
+pub(crate) fn http_answer(
+    mut tcp: TcpStream,
+    host: &str,
+    deadline: aterm_http::Deadline,
+) -> io::Result<()> {
+    let left = deadline
+        .remaining()
+        .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))?;
+    tcp.set_write_timeout(Some(left))?;
+    tcp.set_read_timeout(Some(left))?;
+    tcp.write_all(
+        format!(
+            "HEAD / HTTP/1.1\r\nHost: {host}\r\nUser-Agent: aterm-harness-probe\r\n\
+             Connection: close\r\n\r\n"
+        )
+        .as_bytes(),
+    )?;
+    let mut head = [0_u8; 5];
+    tcp.read_exact(&mut head)?;
+    if &head == b"HTTP/" {
+        Ok(())
+    } else {
+        Err(io::Error::other("the endpoint answered no HTTP"))
+    }
 }
 
 /// Production probe using the system resolver, timed TCP connect, and platform TLS verification.
@@ -297,8 +338,16 @@ fn interleaved(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
     out
 }
 
-/// Runs one probe of the default API route within `budget`.
+/// Runs one probe of the default API route within `budget` ([`probe_target`]).
+#[cfg(test)]
 pub(crate) fn probe_once(probe: &dyn Probe, budget: Duration) -> Outcome {
+    probe_target(probe, &Target::anthropic(), budget)
+}
+
+/// Runs one probe of `target` within `budget`: resolve, connect, then a verified TLS handshake
+/// for an `https` endpoint, an HTTP answer for a plain one ([`Probe::http_answers`]). A name that
+/// does not resolve, or every address refused or unreachable, is Down; any other failure Unknown.
+pub(crate) fn probe_target(probe: &dyn Probe, target: &Target, budget: Duration) -> Outcome {
     let deadline = aterm_http::Deadline::after(budget);
     let in_time = |definite: Outcome| {
         if deadline.remaining().is_some() {
@@ -307,7 +356,7 @@ pub(crate) fn probe_once(probe: &dyn Probe, budget: Duration) -> Outcome {
             Outcome::Unknown
         }
     };
-    let addrs = match probe.resolve(API_HOST, API_PORT) {
+    let addrs = match probe.resolve(&target.host, target.port) {
         Ok(addrs) if !addrs.is_empty() => interleaved(addrs),
         Ok(_) => return in_time(Outcome::Down),
         Err(e) if definite_name_failure(&e) => return in_time(Outcome::Down),
@@ -325,7 +374,12 @@ pub(crate) fn probe_once(probe: &dyn Probe, budget: Duration) -> Outcome {
         }
         match probe.connect(addr, share) {
             Ok(tcp) => {
-                return match probe.handshake(tcp, API_HOST, deadline) {
+                let answered = if target.tls {
+                    probe.handshake(tcp, &target.host, deadline)
+                } else {
+                    probe.http_answers(tcp, &target.host, deadline)
+                };
+                return match answered {
                     Ok(()) => Outcome::Up,
                     Err(_) => Outcome::Unknown,
                 };
@@ -357,6 +411,20 @@ pub(crate) struct NetProbe {
     watch: Mutex<Option<PathWatch>>,
     /// A watch was tried ([`Self::watch_path`]), started or not: none is tried again.
     watched: AtomicBool,
+    /// The endpoint this probe reaches: Claude Code's default route for the instance's own, a
+    /// session's named endpoint for one [`Self::to`] made (v6 §14.17.5.4).
+    target: Target,
+    /// The probes of the other endpoints sessions' launches name ([`Self::to`]), each made at its
+    /// first ask and fed this probe's path readings ([`Self::path_moved`]).
+    others: Mutex<HashMap<Target, Arc<NetProbe>>>,
+    /// Capacity has been reported once, without printing another launch's URL.
+    saturated: AtomicBool,
+    /// The path's last usability reading this probe heard, which a probe [`Self::to`] makes
+    /// starts from.
+    usable: Mutex<Option<bool>>,
+    /// The instance's book of answered turns, the witnesses on each route (v6 §14.17.5.4,
+    /// [`Self::answered`], [`Self::witness`]), kept on the instance's own probe.
+    witnesses: Mutex<Witnesses>,
 }
 
 impl std::fmt::Debug for NetProbe {
@@ -381,6 +449,11 @@ impl NetProbe {
 
     /// Creates a probe using `probe` over `state` (its budget and [`netwatch::Cadence`]).
     pub(crate) fn with_state(probe: Arc<dyn Probe>, state: NetState) -> Arc<Self> {
+        Self::reaching(probe, state, Target::anthropic())
+    }
+
+    /// Creates a probe of `target` using `probe` over `state`.
+    fn reaching(probe: Arc<dyn Probe>, state: NetState, target: Target) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(state),
             wake: Condvar::new(),
@@ -391,7 +464,96 @@ impl NetProbe {
             path: OnceLock::new(),
             watch: Mutex::new(None),
             watched: AtomicBool::new(false),
+            target,
+            others: Mutex::default(),
+            saturated: AtomicBool::new(false),
+            usable: Mutex::default(),
+            witnesses: Mutex::default(),
         })
+    }
+
+    /// THE PROBE OF `target` (v6 §14.17.5.4, slice 12c): this one where it reaches `target`, else
+    /// the instance's probe of that endpoint, made at its first ask with this probe's budget and
+    /// the path's last reading, and fed every later one ([`Self::path_moved`]). It probes nothing
+    /// until a session asks it, and its thread parks while no lease lives, so an endpoint no tab
+    /// waits on uses no probe work. The table and parked threads are bounded by
+    /// [`MAX_ENDPOINT_PROBES`]; a new target at capacity returns `None`, never another target's
+    /// reading. Existing targets remain available and all stop with this instance.
+    pub(crate) fn to(self: &Arc<Self>, target: &Target) -> Option<Arc<Self>> {
+        if *target == self.target {
+            return Some(Arc::clone(self));
+        }
+        self.watch_path();
+        let mut others = self.others.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(probe) = others.get(target) {
+            return Some(Arc::clone(probe));
+        }
+        if others.len() >= MAX_ENDPOINT_PROBES - 1 {
+            if !self.saturated.swap(true, Ordering::SeqCst) {
+                aterm_log::info!(
+                    "harness: API endpoint probe capacity reached; new endpoints use path observations"
+                );
+            }
+            return None;
+        }
+        let budget = self.lock().budget();
+        let probe = Self::reaching(
+            Arc::clone(&self.probe),
+            NetState::with_budget(budget),
+            target.clone(),
+        );
+        if self.stop.load(Ordering::SeqCst) {
+            probe.stop();
+        }
+        let usable = *self.usable.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(usable) = usable {
+            probe.path_moved(PathEvent::Usable(usable));
+        }
+        aterm_log::info!(
+            "harness: the API reach of {} is probed apart from {}",
+            target.says(),
+            self.target.says()
+        );
+        others.insert(target.clone(), Arc::clone(&probe));
+        Some(probe)
+    }
+
+    /// The endpoint this probe reaches.
+    #[cfg(test)]
+    pub(crate) fn target(&self) -> &Target {
+        &self.target
+    }
+
+    /// The endpoints probed apart from this one ([`Self::to`]), each made at a session's first
+    /// ask: what a test reads to know which endpoints sessions' asks reached, without a wait.
+    #[cfg(test)]
+    pub(crate) fn others(&self) -> Vec<Target> {
+        let mut targets: Vec<Target> = self
+            .others
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .keys()
+            .cloned()
+            .collect();
+        targets.sort();
+        targets
+    }
+
+    /// Session `sid`'s turn on route `key` ended on a real reply `at`: booked as a witness on that
+    /// route ([`Witnesses::answered`]).
+    pub(crate) fn answered(&self, key: RouteKey, sid: &str, at: Instant) {
+        self.witnesses
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .answered(key, sid, at);
+    }
+
+    /// The witness on route `key` for session `sid` ([`Witnesses::witness`]).
+    pub(crate) fn witness(&self, key: &RouteKey, sid: &str) -> Option<Instant> {
+        self.witnesses
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .witness(key, sid)
     }
 
     fn lock(&self) -> MutexGuard<'_, NetState> {
@@ -461,6 +623,19 @@ impl NetProbe {
         )
     )]
     pub(crate) fn path_moved(&self, event: PathEvent) {
+        if let PathEvent::Usable(usable) = event {
+            *self.usable.lock().unwrap_or_else(PoisonError::into_inner) = Some(usable);
+        }
+        let others: Vec<Arc<Self>> = self
+            .others
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect();
+        for other in others {
+            other.path_moved(event);
+        }
         let (was, owed) = {
             let mut st = self.lock();
             let was = st.path_satisfied();
@@ -539,6 +714,16 @@ impl NetProbe {
             self.stop.store(true, Ordering::SeqCst);
             self.wake.notify_all();
         }
+        let others: Vec<Arc<Self>> = self
+            .others
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect();
+        for other in others {
+            other.stop();
+        }
         let watch = self
             .watch
             .lock()
@@ -599,7 +784,7 @@ impl NetProbe {
                 }
             }
             let budget = self.lock().budget();
-            let outcome = probe_once(&*self.probe, budget);
+            let outcome = probe_target(&*self.probe, &self.target, budget);
             self.settle(outcome, Instant::now(), SystemTime::now());
         }
     }
@@ -703,6 +888,24 @@ pub(crate) fn route_of_agent(pid: u32, argv: &[String], cwd: &str) -> Route {
     ))
 }
 
+/// Reads agent `pid`'s launch's route variables from its environment and Claude Code settings
+/// ([`netwatch::launch_env`]), or why they name no one route.
+pub(crate) fn launch_env_of_agent(
+    pid: u32,
+    argv: &[String],
+    cwd: &str,
+) -> Result<Vec<String>, netwatch::Unnamed> {
+    let env = atpkg::caller_shell::process_args(pid).map(|a| a.env);
+    netwatch::launch_env(&gather(
+        env,
+        argv,
+        Path::new(cwd),
+        claude_settings::MANAGED_DIR.map(Path::new),
+        Path::new(claude_settings::MANAGED_PREFERENCES_DIR),
+        aterm_types::dirs::home_dir().as_deref(),
+    ))
+}
+
 /// Returns whether agent `pid`'s settings leave its stored login active.
 pub(crate) fn stored_login_of_agent(pid: u32, argv: &[String], cwd: &str) -> bool {
     let env = atpkg::caller_shell::process_args(pid).map(|a| a.env);
@@ -755,6 +958,8 @@ fn stored_login_of(facts: &RouteFacts, home: Option<&Path>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use aterm_agent::harness::netwatch::{API_HOST, API_PORT};
     use std::net::{Ipv4Addr, Ipv6Addr, TcpListener};
     use std::sync::mpsc;
 
@@ -1271,8 +1476,6 @@ mod tests {
         }
         use crate::network_moved::Woke;
         assert!(route_move(Woke::Route));
-        // No Windows build constructs `Woke::Browse` (its source is macOS's), tests included.
-        #[cfg(unix)]
         assert!(!route_move(Woke::Browse));
         for other in [Woke::Timer, Woke::Beacon, Woke::LocalNetwork] {
             assert!(!route_move(other), "{other:?}");
@@ -1994,5 +2197,131 @@ mod tests {
             Route::Default
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A session's plain-HTTP endpoint (v6 §14.17.5.4: the lab stub's, a gateway's `http://`
+    /// base URL) is Up only once its server answers HTTP, whatever the status; a server that
+    /// accepts and says nothing, or answers no HTTP, is Unknown; a refused connection is Down.
+    /// NEGATIVE CONTROL (run): with `probe_target` handshaking every endpoint, as main's probe
+    /// did its one, the answering server reads Unknown and the test fails.
+    #[test]
+    fn a_plain_endpoint_is_up_only_once_its_server_answers_http() {
+        let plain = |addr: SocketAddr| Target {
+            host: addr.ip().to_string(),
+            port: addr.port(),
+            tls: false,
+        };
+        let answered = answering(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n");
+        assert_eq!(
+            probe_target(&SystemProbe, &plain(answered), BUDGET),
+            Outcome::Up
+        );
+        for silent in [answering(b""), answering(b"SSH-2.0-OpenSSH_9.9\r\n")] {
+            assert_eq!(
+                probe_target(&SystemProbe, &plain(silent), BUDGET),
+                Outcome::Unknown
+            );
+        }
+        let refused = {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("loopback");
+            listener.local_addr().expect("addr")
+        };
+        assert_eq!(
+            probe_target(&SystemProbe, &plain(refused), BUDGET),
+            Outcome::Down
+        );
+    }
+
+    /// THE PROBE OF A SESSION'S OWN ENDPOINT (v6 §14.17.5.4): the instance's probe makes one per
+    /// endpoint at its first ask and hands it back after, itself for Claude Code's default route;
+    /// it starts the path's watch, takes every later path reading and the last one before it was
+    /// made, and stops with the instance's probe.
+    #[test]
+    fn a_sessions_endpoint_gets_its_own_probe_fed_the_path_and_stopped_with_it() {
+        let (probe, _resolved) = Answering::new();
+        let root = NetProbe::with(probe, BUDGET);
+        let source = Arc::new(Handing::default());
+        assert!(root.path_from(Arc::clone(&source) as Arc<dyn PathSource>));
+        let stub = Target {
+            host: "127.0.0.1".to_string(),
+            port: 4100,
+            tls: false,
+        };
+        assert!(Arc::ptr_eq(&root.to(&Target::anthropic()).unwrap(), &root));
+        assert_eq!(
+            source.started.load(Ordering::SeqCst),
+            0,
+            "no watch for its own"
+        );
+        let child = root.to(&stub).unwrap();
+        assert_eq!(child.target(), &stub);
+        assert!(
+            Arc::ptr_eq(&root.to(&stub).unwrap(), &child),
+            "one probe per endpoint"
+        );
+        assert_eq!(
+            source.started.load(Ordering::SeqCst),
+            1,
+            "the path is watched"
+        );
+        source.read(true);
+        source.read(false);
+        assert!(
+            matches!(child.path_reach(), Reach::Down { .. }),
+            "the path's loss reaches the endpoint's probe"
+        );
+        let later = Target {
+            port: 4200,
+            ..stub.clone()
+        };
+        assert!(
+            matches!(root.to(&later).unwrap().path_reach(), Reach::Down { .. }),
+            "a probe made after the loss starts from it"
+        );
+        root.stop();
+        assert!(
+            child.stop.load(Ordering::SeqCst),
+            "stopped with the instance's probe"
+        );
+        assert!(
+            root.to(&Target { port: 4300, ..stub })
+                .unwrap()
+                .stop
+                .load(Ordering::SeqCst),
+            "a probe made after the stop is stopped"
+        );
+    }
+
+    /// Endpoint churn cannot leave an unbounded table or parked-thread population. This pure
+    /// control creates no probe lease/thread/IO, preserves existing entries at capacity, and
+    /// proves that an unsupported new endpoint gets no other endpoint's reading.
+    #[test]
+    fn endpoint_probe_capacity_refuses_new_targets_without_evicting_existing_ones() {
+        let (probe, _resolved) = Answering::new();
+        let root = NetProbe::with(probe, BUDGET);
+        let target = |port| Target {
+            host: "127.0.0.1".to_string(),
+            port,
+            tls: false,
+        };
+        let first = root.to(&target(1000)).unwrap();
+        for n in 1..MAX_ENDPOINT_PROBES - 1 {
+            assert!(root.to(&target(1000 + u16::try_from(n).unwrap())).is_some());
+        }
+        assert_eq!(root.others().len(), MAX_ENDPOINT_PROBES - 1);
+        assert!(root.to(&target(9000)).is_none());
+        assert!(Arc::ptr_eq(&root.to(&target(1000)).unwrap(), &first));
+        assert!(Arc::ptr_eq(&root.to(&Target::anthropic()).unwrap(), &root));
+        assert_eq!(root.others().len(), MAX_ENDPOINT_PROBES - 1);
+        assert_eq!(root.spawned.load(Ordering::SeqCst), 0);
+        assert!(
+            root.others
+                .lock()
+                .unwrap()
+                .values()
+                .all(|p| p.spawned.load(Ordering::SeqCst) == 0)
+        );
+        root.stop();
+        assert!(first.stop.load(Ordering::SeqCst));
     }
 }

@@ -32,6 +32,8 @@ macro_rules! println {
 #[cfg(test)]
 aterm_durable::plain_durable_flushes_in_tests!();
 
+/// The bus log sealed at rest under a key left out of backups.
+pub mod at_rest;
 pub mod body;
 pub mod bridge;
 mod broker_args;
@@ -78,6 +80,13 @@ pub mod wait_tally;
 #[must_use]
 pub fn now_ms() -> u64 {
     aterm_time::unix_millis().unwrap_or(0)
+}
+
+#[inline]
+pub(crate) fn parse_uint<T: std::str::FromStr>(s: &str) -> Option<T> {
+    (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| s.parse().ok())
+        .flatten()
 }
 
 /// A unit test's broker, at astream's Relaxed tier: an ack once the batch is in the page cache.

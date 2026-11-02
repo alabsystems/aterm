@@ -5,7 +5,7 @@
 //! lease can be released, including a dial still awaiting its first SYN reply.
 
 use super::{
-    discovery::Hints,
+    discovery::{Hints, Outcome},
     report::{RepairRound, bounded_error},
 };
 use crate::{
@@ -34,6 +34,8 @@ const BEACON: Duration = Duration::from_secs(5);
 struct Channel {
     stopped: bool,
     local: Option<IpAddr>,
+    #[cfg(test)]
+    local_endpoint: Option<SocketAddr>,
     socket: Option<Cancellation>,
 }
 impl Channel {
@@ -42,7 +44,12 @@ impl Channel {
             return Ok(false);
         }
         self.socket = Some(connection.cancellation()?);
-        self.local = Some(connection.local_addr()?.ip());
+        let local = connection.local_addr()?;
+        self.local = Some(local.ip());
+        #[cfg(test)]
+        {
+            self.local_endpoint = Some(local);
+        }
         Ok(true)
     }
     fn stop(&mut self) {
@@ -57,6 +64,8 @@ struct Worker {
     task: JoinHandle<(Option<SocketAddr>, Repair, bool, RepairRound)>,
     incoming: bool,
     target: Option<SocketAddr>,
+    /// When its round began: one that began after a push's ask counts for it ([`Push`]).
+    started: Instant,
 }
 impl Worker {
     fn start(
@@ -80,35 +89,44 @@ impl Worker {
             .spawn(move || {
                 let mut repair = repair;
                 repair.begin_round();
+                let mut connection = connection;
                 let mut exchange_started = false;
                 let result = (|| -> Result<crate::control::Report> {
-                    let (connection, side) = if let Some(connection) = connection {
-                        (connection, Side::Responder)
-                    } else {
-                        if control.lock().unwrap_or_else(|p| p.into_inner()).stopped {
+                    for attempt in 0..2 {
+                        let (connection, side) = if let Some(connection) = connection.take() {
+                            (connection, Side::Responder)
+                        } else {
+                            if control.lock().unwrap_or_else(|p| p.into_inner()).stopped {
+                                return Err(crate::Error::new(
+                                    "automatic repair cancelled before connection",
+                                ));
+                            }
+                            let Some(target) = target else {
+                                return Err(crate::Error::new("automatic repair has no target"));
+                            };
+                            (
+                                Connection::connect(target, scope, Duration::from_secs(3))?,
+                                Side::Initiator,
+                            )
+                        };
+                        if !control
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .install(&connection)?
+                        {
                             return Err(crate::Error::new(
-                                "automatic repair cancelled before connection",
+                                "automatic repair cancelled before exchange",
                             ));
                         }
-                        let Some(target) = target else {
-                            return Err(crate::Error::new("automatic repair has no target"));
-                        };
-                        (
-                            Connection::connect(target, scope, Duration::from_secs(3))?,
-                            Side::Initiator,
-                        )
-                    };
-                    if !control
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .install(&connection)?
-                    {
-                        return Err(crate::Error::new(
-                            "automatic repair cancelled before exchange",
-                        ));
+                        exchange_started = true;
+                        let result = endpoint.exchange(connection, side, &mut repair);
+                        if incoming || attempt != 0 || !repair.retry_application_probe() {
+                            return result;
+                        }
+                        // The old peer closed before any application payload. One
+                        // new connection rebuilds and revalidates the entire round.
                     }
-                    exchange_started = true;
-                    endpoint.exchange(connection, side, &mut repair)
+                    unreachable!("the second exchange always returns")
                 })();
                 let mut control = control.lock().unwrap_or_else(|p| p.into_inner());
                 let success =
@@ -124,6 +142,19 @@ impl Worker {
                     membership_error: repair.membership_error().map(bounded_error),
                     application: repair.application(),
                     application_error: repair.application_error().map(bounded_error),
+                    application_interrupted: repair.application_interrupted(),
+                    application_deferral: repair.application_deferral().cloned().map(|mut why| {
+                        why.local_error = why.local_error.map(bounded_error);
+                        why
+                    }),
+                    application_batch_deferral: repair.application_batch_deferral().cloned().map(
+                        |mut why| {
+                            why.reason = bounded_error(why.reason);
+                            why
+                        },
+                    ),
+                    handoff: repair.handoff().cloned(),
+                    completed_at: Instant::now(),
                     completed_at_ms: aterm_time::unix_millis().unwrap_or(0),
                     dropped_before: 0,
                 };
@@ -138,6 +169,7 @@ impl Worker {
             task,
             incoming,
             target,
+            started: Instant::now(),
         })
     }
     fn stop(&self) {
@@ -152,6 +184,24 @@ impl Worker {
             channel.stop();
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_worker(
+    endpoint: Endpoint,
+    target: SocketAddr,
+    repair: Repair,
+) -> (Repair, bool, RepairRound) {
+    let worker = Worker::start(
+        Arc::new(endpoint),
+        None,
+        Some(target),
+        Scope::Loopback,
+        repair,
+    )
+    .unwrap();
+    let (_, repair, success, report) = worker.task.join().unwrap();
+    (repair, success, report)
 }
 
 struct Link {
@@ -187,6 +237,54 @@ impl Link {
     }
 }
 
+/// A push this transport runs ([`Transport::hurry`]): the table it hands on, when it began, and
+/// whether a round that began since caught a peer up on that table
+/// (`crate::replica::Report::caught_up`).
+struct Push {
+    table: astream_wire::sync::Digest,
+    since: Instant,
+    reached: bool,
+}
+
+/// What one authenticated peer's rounds told this device since the last
+/// [`Transport::take_contacts`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Contact {
+    pub(super) actor: astream_wire::sync::Actor,
+    /// Its latest authentication.
+    pub(super) at: Instant,
+    /// What the latest-authenticated round that said anything of its version said, or
+    /// [`Said::Unknown`] while none did.
+    pub(super) said: Said,
+    /// When that round authenticated; [`Self::at`] while none did.
+    pub(super) said_at: Instant,
+}
+impl Contact {
+    fn new(actor: astream_wire::sync::Actor, at: Instant, said: Said) -> Self {
+        Self {
+            actor,
+            at,
+            said,
+            said_at: at,
+        }
+    }
+    /// Fold in another round with this peer, authenticated at `at`. Rounds finish out of their
+    /// authentication order: a crossed dial's loser authenticates a moment after the round it
+    /// lost to and ends at once, refused before versions are traded. So a round that said
+    /// nothing of its version never hides one that did, whichever finished first, and of two
+    /// that said something the later-authenticated one is kept. While no round said anything,
+    /// [`Self::said_at`] follows [`Self::at`].
+    fn heard(&mut self, at: Instant, said: Said) {
+        self.at = self.at.max(at);
+        if said != Said::Unknown && (self.said == Said::Unknown || at >= self.said_at) {
+            self.said = said;
+            self.said_at = at;
+        } else if self.said == Said::Unknown {
+            self.said_at = self.at;
+        }
+    }
+}
+
 pub(super) struct Transport {
     endpoint: Option<Arc<Endpoint>>,
     links: Vec<Link>,
@@ -198,9 +296,12 @@ pub(super) struct Transport {
     scope: Scope,
     /// The group's port: [`PORT`] on a LAN, an isolated test attachment's own on loopback.
     port: u16,
-    contacts: Vec<(astream_wire::sync::Actor, Instant, Said)>,
+    contacts: Vec<Contact>,
     completed: VecDeque<RepairRound>,
-    failed: bool,
+    /// The push it runs, if any ([`Self::hurry`]).
+    push: Option<Push>,
+    /// The latest failed local link operation since the last refresh, bounded like a repair error.
+    failure: Option<String>,
     /// A listener or multicast socket of this transport reached the LAN ([`Self::bound`]).
     bound: bool,
     /// A LAN attachment's stand-in (tests): while it reads false each address refreshed is one no
@@ -307,7 +408,8 @@ impl Transport {
             port,
             contacts: Vec::new(),
             completed: VecDeque::new(),
-            failed: false,
+            push: None,
+            failure: None,
             bound: false,
             #[cfg(test)]
             stand_in: None,
@@ -326,7 +428,7 @@ impl Transport {
         let stood_in = self.stood_in(addresses);
         #[cfg(test)]
         let addresses = stood_in.as_deref().unwrap_or(addresses);
-        self.failed = false;
+        self.failure = None;
         for address in addresses {
             let IpAddr::V4(source) = address.ip() else {
                 continue;
@@ -345,7 +447,7 @@ impl Transport {
                     Ok(listener) => Some(listener),
                     Err(failure) => {
                         self.bound |= failure.reached;
-                        self.failed = true;
+                        self.fail_link(address.ip(), "listener bind", failure.error);
                         continue;
                     }
                 }
@@ -355,7 +457,7 @@ impl Transport {
                 Ok(hints) => hints,
                 Err(failure) => {
                     self.bound |= failure.reached;
-                    self.failed = true;
+                    self.fail_link(source.into(), "multicast bind", failure.error);
                     continue;
                 }
             };
@@ -367,12 +469,15 @@ impl Transport {
                 #[cfg(test)]
                 permission: self.permission.clone(),
             };
-            if link.beacon(&self.hints).is_ok() {
-                self.links.push(link);
-            } else {
-                self.failed = true;
+            match link.beacon(&self.hints) {
+                Ok(()) => self.links.push(link),
+                Err(error) => self.fail_link(source.into(), "discovery beacon", error),
             }
         }
+    }
+
+    fn fail_link(&mut self, source: IpAddr, operation: &str, error: io::Error) {
+        self.failure = Some(bounded_error(format!("{operation} on {source}: {error}")));
     }
     /// Whether a listener or multicast socket of this transport reached the LAN since it opened:
     /// it bound, whatever its beacon then did (a refused app's binds succeed and its sends fail),
@@ -387,7 +492,11 @@ impl Transport {
         self.links.len()
     }
     pub(super) fn unavailable(&self) -> bool {
-        self.links.is_empty() && self.failed
+        self.links.is_empty() && self.failure.is_some()
+    }
+    /// The latest failed local operation, including its source address and OS error when present.
+    pub(super) fn failure(&self) -> Option<&str> {
+        self.failure.as_deref()
     }
     pub(super) fn peers(&self) -> usize {
         self.hints.count()
@@ -395,10 +504,35 @@ impl Transport {
     pub(super) fn unverified_peers(&self) -> usize {
         self.hints.unverified_count()
     }
-    /// Authenticated peers since the last call, each at its latest contact and with what that
-    /// contact said of its version.
-    pub(super) fn take_contacts(&mut self) -> Vec<(astream_wire::sync::Actor, Instant, Said)> {
+    /// Authenticated peers since the last call, each at its latest contact and with what its
+    /// latest round to say anything said of its version ([`Contact`]).
+    pub(super) fn take_contacts(&mut self) -> Vec<Contact> {
         std::mem::take(&mut self.contacts)
+    }
+
+    /// Push `table`: dial every verified peer now ([`Hints::hurry`]); the rounds this side begins
+    /// repair `table` first while the endpoint's push names it (`crate::replica::First`). How many
+    /// peers it hurried; with none there is no push.
+    pub(super) fn hurry(&mut self, table: astream_wire::sync::Digest, now: Instant) -> usize {
+        let hurried = self.hints.hurry(now);
+        self.push = (hurried > 0).then_some(Push {
+            table,
+            since: now,
+            reached: false,
+        });
+        hurried
+    }
+
+    /// Whether a round that began after the push's [`Self::hurry`] succeeded and caught a peer up
+    /// on its table (`crate::replica::Report::caught_up`).
+    pub(super) fn reached(&self) -> bool {
+        self.push.as_ref().is_some_and(|push| push.reached)
+    }
+
+    /// End the push: rounds keep their ordinary spacing again.
+    pub(super) fn calm(&mut self) {
+        self.push = None;
+        self.hints.calm();
     }
 
     pub(super) fn reports(&mut self) -> impl Iterator<Item = RepairRound> + '_ {
@@ -415,19 +549,26 @@ impl Transport {
     }
 
     fn finish(&mut self, worker: Worker, now: Instant) {
+        let started = worker.started;
         match worker.task.join() {
             Ok((target, repair, success, report)) => {
+                // Either side's round counts once it caught the peer up on the table: what this
+                // side held as the push began is now the peer's too. A round that left some of
+                // it for later, or deferred the table, does not.
+                if let Some(push) = self.push.as_mut()
+                    && success
+                    && started >= push.since
+                    && report
+                        .application
+                        .is_some_and(|app| app.caught_up && app.table == Some(push.table))
+                {
+                    push.reached = true;
+                }
                 if let Some((actor, at)) = repair.authenticated_contact() {
-                    let said = repair.said();
-                    if let Some((_, old, was)) =
-                        self.contacts.iter_mut().find(|(id, _, _)| *id == actor)
-                    {
-                        if at >= *old && said != Said::Unknown {
-                            *was = said;
-                        }
-                        *old = (*old).max(at);
+                    if let Some(contact) = self.contacts.iter_mut().find(|c| c.actor == actor) {
+                        contact.heard(at, repair.said());
                     } else if self.contacts.len() < 64 {
-                        self.contacts.push((actor, at, said));
+                        self.contacts.push(Contact::new(actor, at, repair.said()));
                     }
                 }
                 #[cfg(test)]
@@ -437,13 +578,16 @@ impl Transport {
                     self.observed.insert(table, report.retained_after);
                 }
                 if let Some(address) = target {
-                    self.hints.finish(address, repair, success, now);
+                    let outcome =
+                        Outcome::of(success, &repair, report.control.as_ref().ok().copied());
+                    self.hints.finish(address, repair, outcome, now);
                 }
                 self.retain_report(report);
             }
             Err(_) => {
                 if let Some(address) = worker.target {
-                    self.hints.finish(address, Repair::default(), false, now);
+                    self.hints
+                        .finish(address, Repair::default(), Outcome::Refused, now);
                 }
                 self.retain_report(RepairRound::panicked(worker.target));
             }
@@ -513,6 +657,7 @@ impl Transport {
             }
         }
         let mut index = 0;
+        let mut after_accept = None;
         while index < self.links.len() {
             let link = &self.links[index];
             let serviced = (|| -> io::Result<()> {
@@ -538,13 +683,16 @@ impl Transport {
                     && let Some(endpoint) = &self.endpoint
                 {
                     match listener.accept() {
-                        Ok(connection) => self.workers.push(Worker::start(
-                            endpoint.clone(),
-                            Some(connection),
-                            None,
-                            self.scope,
-                            Repair::default(),
-                        )?),
+                        Ok(connection) => {
+                            self.workers.push(Worker::start(
+                                endpoint.clone(),
+                                Some(connection),
+                                None,
+                                self.scope,
+                                Repair::default(),
+                            )?);
+                            after_accept = Some(index + 1);
+                        }
                         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                         Err(_) => {
                             // Refusing one hostile or vanished peer cannot withdraw
@@ -555,9 +703,9 @@ impl Transport {
                 }
                 Ok(())
             })();
-            if serviced.is_err() {
-                self.failed = true;
+            if let Err(error) = serviced {
                 let local = self.links.remove(index).source;
+                self.fail_link(local, "discovery service", error);
                 for worker in &self.workers {
                     worker.stop_on(local);
                 }
@@ -565,19 +713,62 @@ impl Transport {
                 index += 1;
             }
         }
+        // Keep the next accept behind the last successful listener. Idle
+        // polls preserve that place instead of aligning with a busy link.
+        if let Some(next) = after_accept
+            && next < self.links.len()
+        {
+            self.links.rotate_left(next);
+        }
         if now >= self.beacon {
             self.beacon = now + BEACON;
         }
+        // Pending enrollment has no listener, so every worker may search for
+        // an approver. A serving endpoint keeps capacity for incoming repair.
+        let outgoing_limit = if self
+            .endpoint
+            .as_ref()
+            .is_some_and(|endpoint| endpoint.pending())
+        {
+            WORKERS
+        } else {
+            WORKERS / 2
+        };
+        // Silent discovery candidates must not take every outgoing worker
+        // while a completed peer waits for its next ordinary retry. Reserve
+        // one outgoing worker for established endpoints; the others discover.
+        // Before any peer is established, and while enrolling without a
+        // listener, all outgoing capacity remains available for discovery.
+        let discovering = self
+            .workers
+            .iter()
+            .filter(|worker| {
+                !worker.incoming
+                    && worker
+                        .target
+                        .is_none_or(|address| !self.hints.established(address))
+            })
+            .count();
+        let allow_discovery = outgoing_limit == WORKERS
+            || !self.hints.has_established()
+            || discovering < outgoing_limit - 1;
         if now >= self.dial
             && let Some(endpoint) = &self.endpoint
             && !self.links.is_empty()
             && self.workers.len() < WORKERS
-            && let Some((address, repair)) = self.hints.next(now)
+            && self
+                .workers
+                .iter()
+                .filter(|worker| !worker.incoming)
+                .count()
+                < outgoing_limit
+            && let Some((address, repair)) = self.hints.next_allowed(now, allow_discovery)
         {
             match Worker::start(endpoint.clone(), None, Some(address), self.scope, repair) {
                 Ok(worker) => self.workers.push(worker),
                 Err(error) => {
-                    self.hints.finish(address, Repair::default(), false, now);
+                    self.hints
+                        .finish(address, Repair::default(), Outcome::Busy, now);
                     return Err(error);
                 }
             }

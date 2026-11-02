@@ -147,8 +147,16 @@ impl J {
     /// Set `key` in an object (replacing it in place, else appending).
     pub fn set(&mut self, key: &str, value: J) {
         if let J::Obj(m) = self {
-            if let Some(slot) = m.iter_mut().find(|(k, _)| k == key) {
-                slot.1 = value;
+            if let Some(pos) = m.iter().position(|(k, _)| k == key) {
+                m[pos].1 = value;
+                let mut i = pos + 1;
+                while i < m.len() {
+                    if m[i].0 == key {
+                        m.remove(i);
+                    } else {
+                        i += 1;
+                    }
+                }
             } else {
                 m.push((key.to_string(), value));
             }
@@ -166,6 +174,13 @@ impl J {
     pub fn entry_obj(&mut self, key: &str) -> &mut J {
         if !matches!(self.get(key), Some(J::Obj(_))) {
             self.set(key, J::Obj(Vec::new()));
+        } else if let J::Obj(m) = self
+            && let Some(first) = m.iter().position(|(k, _)| k == key)
+            && let Some(last) = m.iter().rposition(|(k, _)| k == key)
+            && first != last
+        {
+            let winning = m.remove(last).1;
+            self.set(key, winning);
         }
         match self {
             J::Obj(m) => {
@@ -203,7 +218,7 @@ impl J {
         let newline = |out: &mut String, d: usize| {
             if let Some(n) = st.indent {
                 out.push('\n');
-                out.push_str(&" ".repeat(n * d));
+                out.push_str(&" ".repeat(n.saturating_mul(d)));
             }
         };
         match self {
@@ -422,5 +437,12 @@ mod tests {
         assert_eq!(base.get("apiKeyHelper"), None);
         assert_eq!(base.get("env").unwrap().py(), r#"{"A": "1", "B": "2"}"#);
         assert_eq!(base.get("permissions").unwrap().py(), r#"{"allow": ["y"]}"#);
+        let mut dup = J::obj([("k", J::obj([("a", J::Int(1))])), ("k", J::Int(2))]);
+        dup.set("k", J::Int(3));
+        assert_eq!(dup.get("k"), Some(&J::Int(3)));
+        assert_eq!(dup.py(), r#"{"k": 3}"#);
+        let mut dup_obj = J::obj([("k", J::Int(1)), ("k", J::obj([("a", J::Int(2))]))]);
+        dup_obj.entry_obj("k").set("b", J::Int(3));
+        assert_eq!(dup_obj.py(), r#"{"k": {"a": 2, "b": 3}}"#);
     }
 }

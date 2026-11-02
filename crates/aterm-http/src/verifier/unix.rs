@@ -76,18 +76,21 @@ const CERTIFICATE_DIRS: &[&str] = &["/var/ssl/certs"];
 )))]
 const CERTIFICATE_DIRS: &[&str] = &["/etc/ssl/certs"];
 
+/// Upper bound on any single PEM trust-anchor bundle read from disk.
+const MAX_PEM_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
 /// The bundle file to read, if any. `configured` is `$SSL_CERT_FILE`, passed in
 /// so the tests need not mutate the process environment.
 fn bundle_file(configured: Option<PathBuf>) -> Option<PathBuf> {
     if configured.is_some() {
         // A set variable suppresses the built-in search even when its path is
         // missing.
-        return configured.filter(|path| path.exists());
+        return configured.filter(|path| path.is_file());
     }
     CERTIFICATE_FILES
         .iter()
         .map(PathBuf::from)
-        .find(|path| path.exists())
+        .find(|path| path.is_file())
 }
 
 /// Every hash directory to scan. `configured` is `$SSL_CERT_DIR`, a
@@ -96,22 +99,51 @@ fn bundle_file(configured: Option<PathBuf>) -> Option<PathBuf> {
 fn bundle_dirs(configured: Option<PathBuf>) -> Vec<PathBuf> {
     if let Some(configured) = configured {
         return std::env::split_paths(&configured)
-            .filter(|path| !path.as_os_str().is_empty() && path.exists())
+            .filter(|path| !path.as_os_str().is_empty() && path.is_dir())
             .collect();
     }
     CERTIFICATE_DIRS
         .iter()
         .map(PathBuf::from)
-        .filter(|path| path.exists())
+        .filter(|path| path.is_dir())
         .collect()
 }
 
 /// Decode every certificate in one PEM file, tolerating anything else in it.
 fn read_pem_file(path: &Path, out: &mut Vec<Vec<u8>>) {
-    // An unreadable or non-UTF-8 file contributes nothing; only an empty store
-    // overall (`Verifier::from_ders`) is a failure.
-    if let Ok(text) = std::fs::read_to_string(path) {
-        out.extend(crate::pem::decode_certificates_lossy(&text));
+    read_pem_file_up_to(path, MAX_PEM_FILE_BYTES, out);
+}
+
+fn read_pem_file_up_to(path: &Path, cap: u64, out: &mut Vec<Vec<u8>>) {
+    use std::io::Read as _;
+    // An unreadable, non-regular, oversized, or non-UTF-8 file contributes
+    // nothing; only an empty store overall (`Verifier::from_ders`) is a failure.
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    if !meta.is_file() || meta.len() > cap {
+        return;
+    }
+    let Ok(file) = std::fs::File::open(path) else {
+        return;
+    };
+    let Ok(open_meta) = file.metadata() else {
+        return;
+    };
+    if !open_meta.is_file() || open_meta.len() > cap {
+        return;
+    }
+    let mut bytes = Vec::new();
+    if file
+        .take(cap.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.len() as u64 > cap
+    {
+        return;
+    }
+    if let Ok(text) = std::str::from_utf8(&bytes) {
+        out.extend(crate::pem::decode_certificates_lossy(text));
     }
 }
 
@@ -342,7 +374,13 @@ mod tests {
             real.exists(),
             "the fixture must be where the test says it is"
         );
-        assert_eq!(bundle_file(Some(real.clone())), Some(real));
+        assert_eq!(bundle_file(Some(real.clone())), Some(real.clone()));
+        let dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/src/testdata/tls"));
+        assert_eq!(bundle_file(Some(dir.clone())), None);
+        let mut capped = Vec::new();
+        read_pem_file_up_to(&real, 4, &mut capped);
+        read_pem_file_up_to(&dir, MAX_PEM_FILE_BYTES, &mut capped);
+        assert!(capped.is_empty());
     }
 
     /// `$SSL_CERT_DIR` is a `:`-separated list, as OpenSSL and
@@ -351,11 +389,12 @@ mod tests {
     fn a_configured_cert_dir_is_a_list_of_directories() {
         let a = concat!(env!("CARGO_MANIFEST_DIR"), "/src/testdata");
         let b = concat!(env!("CARGO_MANIFEST_DIR"), "/src/testdata/tls");
+        let file = concat!(env!("CARGO_MANIFEST_DIR"), "/src/testdata/tls/root.der");
         let both = vec![PathBuf::from(a), PathBuf::from(b)];
         assert_eq!(bundle_dirs(Some(PathBuf::from(format!("{a}:{b}")))), both);
         assert_eq!(
             bundle_dirs(Some(PathBuf::from(format!(
-                "{a}:/nonexistent/aterm/certs::{b}"
+                "{a}:/nonexistent/aterm/certs:{file}::{b}"
             )))),
             both
         );

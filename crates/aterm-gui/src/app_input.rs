@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use aterm_core::selection::SelectionType;
 use aterm_core::terminal::{CustodyTransition, ModeMirror, Terminal};
-use aterm_effects::cursor_glow::{DeliveredClass, InsertWidth};
+use aterm_effects::cursor_glow::{BoundaryOrigin, DeliveredClass, InsertWidth};
 use aterm_effects::kitty_pet::PetInputKind;
 use aterm_effects::typed_tricks::{TrickEvent, TrickFeed};
 use aterm_session::sink::{AcceptedOrder, SinkWriter};
@@ -1194,8 +1194,8 @@ pub(crate) mod paste_order {
         ev: InputEvent,
         /// What this write's completion re-stamps on the cursor engines.
         ticket: Option<DeliveryTicket>,
-        /// The key-arrival stamp claimed at enqueue.
-        key_ns: u64,
+        /// The key-arrival stamp and clock quality claimed at enqueue.
+        key_ns: crate::metrics::KeyWriteStamp,
         /// A visible press queued behind this sink's paste, never the paste or a key release.
         hot_key: Option<(u64, Option<EventLoopProxy<Wake>>)>,
         /// A large paste's progress and stop.
@@ -1321,29 +1321,46 @@ pub(crate) mod paste_order {
 
     fn run_one(mut job: Job) {
         crate::echo_rtt::forget_write_start();
+        let supervised = job
+            .completion
+            .as_ref()
+            .is_some_and(|completion| completion.is_supervised());
+        let admitted = job
+            .completion
+            .as_ref()
+            .is_none_or(|completion| completion.start_supervised());
         let vim = job
             .control_vim
             .as_ref()
             .and_then(|observer| observer.capture(&job.term));
-        let receipt = match &job.echo {
-            Some(echo) => tracked_egress_metered(
-                &job.term,
-                &job.modes,
-                &job.sink,
-                echo,
-                &job.ev,
-                crate::input::EgressMode::Backpressured,
-                job.ticket,
-                job.meter.as_deref(),
-            ),
-            None => crate::input::seam_egress_receipt(
-                &job.term,
-                &job.modes,
-                &job.sink,
-                &job.ev,
-                crate::input::EgressMode::Backpressured,
-            ),
+        let mode = if supervised {
+            crate::input::EgressMode::PrefixDrained
+        } else {
+            crate::input::EgressMode::Backpressured
         };
+        let receipt = if !admitted {
+            crate::input::EgressReceipt::unwritten(crate::input::Egress::Reported(
+                crate::input::Delivery::Failed,
+            ))
+        } else {
+            match &job.echo {
+                Some(echo) => tracked_egress_metered(
+                    &job.term,
+                    &job.modes,
+                    &job.sink,
+                    echo,
+                    &job.ev,
+                    mode,
+                    job.ticket,
+                    job.meter.as_deref(),
+                ),
+                None => crate::input::seam_egress_receipt(
+                    &job.term, &job.modes, &job.sink, &job.ev, mode,
+                ),
+            }
+        };
+        // PrefixDrained waited only this job's admitted bytes; later terminal replies or
+        // operator input cannot prolong its pending completion and authority lease.
         if let Some(observer) = &job.control_vim {
             observer.accepted(vim, &job.ev, receipt);
         }
@@ -1371,6 +1388,156 @@ pub(crate) mod paste_order {
     mod completion_tests {
         use super::*;
         use crate::control_input_ack::{InputMark, testing};
+
+        #[test]
+        fn scoped_writer_drops_stale_queues_and_finishes_the_started_command_before_ack() {
+            use crate::session_timeline::{SupervisorInputDelivery, scoped_input_tests};
+            use aterm_agent::harness::contract::Scope;
+            use std::io::Read;
+            let (handle, mut reader) = testing::owned_handle(74);
+            {
+                let mut timeline = handle.ctx.timeline.lock().unwrap();
+                let at = timeline.slog().now();
+                timeline.slog_mut().open_session(None, None, at);
+            }
+            scoped_input_tests::install(&handle.ctx, 71, &[Scope::Upgrade]);
+            let delivery = SupervisorInputDelivery::new(
+                &handle.ctx,
+                scoped_input_tests::ticket(&handle.ctx, true, Scope::Approvals),
+            );
+            let stale_delivery = SupervisorInputDelivery::new(
+                &handle.ctx,
+                scoped_input_tests::ticket(&handle.ctx, true, Scope::Approvals),
+            );
+            let mark = InputMark::at_epoch(
+                &handle.ctx,
+                74,
+                aterm_slog::Actor::Harness,
+                crate::session_log::InputVerb::Key,
+                None,
+                false,
+            )
+            .supervised(delivery.batch());
+            let stale_mark = InputMark::at_epoch(
+                &handle.ctx,
+                74,
+                aterm_slog::Actor::Harness,
+                crate::session_log::InputVerb::Key,
+                None,
+                false,
+            )
+            .supervised(stale_delivery.batch());
+            let budget = Arc::new(Budget::new(LIMITS));
+            let job = |byte, completion| {
+                let event = InputEvent::KeySequence(vec![byte]);
+                let bytes = retained_bytes(&event).unwrap();
+                assert!(budget.claim(bytes, false));
+                handle.ctx.sink.claim_ordered_egress();
+                Job {
+                    term: handle.term.clone(),
+                    modes: handle.ctx.modes.clone(),
+                    sink: handle.ctx.sink.clone(),
+                    echo: Some(handle.ctx.output_echo.clone()),
+                    control_vim: None,
+                    ev: event,
+                    ticket: None,
+                    key_ns: crate::metrics::KeyWriteStamp::default(),
+                    hot_key: None,
+                    meter: None,
+                    completion: Some(completion),
+                    written: None,
+                    _reservation: Reservation {
+                        budget: budget.clone(),
+                        sink: handle.ctx.sink.clone(),
+                        bytes,
+                        meter: None,
+                    },
+                }
+            };
+            let queued = job(b'X', stale_mark.completion());
+            run_one(job(b'A', mark.completion()));
+            assert_eq!(testing::byte(&mut reader), b'A');
+            let old_revision = handle
+                .ctx
+                .meta
+                .lock()
+                .unwrap()
+                .supervisor_authority(crate::metrics::now_us())
+                .revision();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let transition = {
+                let ctx = handle.ctx.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let claim = scoped_input_tests::install(&ctx, 71, &[Scope::Approvals]);
+                    tx.send(claim.revision).unwrap();
+                })
+            };
+            barrier.wait();
+            let since = std::time::Instant::now();
+            while handle
+                .ctx
+                .meta
+                .lock()
+                .unwrap()
+                .supervisor_authority(crate::metrics::now_us())
+                .revision()
+                == old_revision
+            {
+                assert!(
+                    since.elapsed() < Duration::from_secs(60),
+                    "hang: scope renewal never became visible"
+                );
+                std::thread::yield_now();
+            }
+            assert!(
+                rx.try_recv().is_err(),
+                "first actual write owns the whole logical command"
+            );
+            run_one(queued);
+            let mut byte = [0];
+            assert_eq!(
+                reader.read(&mut byte).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock,
+                "stale queue emitted no byte"
+            );
+            run_one(job(b'B', mark.completion()));
+            assert_eq!(
+                testing::byte(&mut reader),
+                b'B',
+                "the admitted command's suffix is never truncated"
+            );
+            assert_eq!(
+                testing::input_count(&handle),
+                1,
+                "one logical request, no stale acceptance"
+            );
+            assert!(rx.try_recv().is_err());
+            drop(mark);
+            drop(delivery);
+            assert!(
+                rx.recv_timeout(Duration::from_secs(60))
+                    .expect("hang: batch never drained")
+                    > old_revision
+            );
+            transition.join().unwrap();
+            // Negative control: removing the carried custody from this otherwise identical
+            // job really emits the stale byte. The model law must reject that projection.
+            run_one(job(b'X', stale_mark.supervised(None).completion()));
+            assert_eq!(testing::byte(&mut reader), b'X');
+            let model = aterm_models_harness::scoped_input_drain_model();
+            let mutant = aterm_spec::interp::with_buggy(&model, 1);
+            let mut state = mutant.init_state();
+            for action in ["Queue", "TransitionQueued", "Stale"] {
+                assert!(mutant.fire(action, &mut state));
+            }
+            assert_eq!(state["stale_byte"], 1);
+            assert!(!model.check_invariant("StaleQueueWritesNothing", &state));
+            assert_eq!(budget.used.load(Ordering::Acquire), 0);
+            assert_eq!(handle.ctx.sink.ordered_egress_count(), 0);
+        }
 
         #[test]
         fn only_completed_nonempty_jobs_mark_the_exact_admitted_log() {
@@ -1408,7 +1575,7 @@ pub(crate) mod paste_order {
                     control_vim: None,
                     ev: event,
                     ticket: None,
-                    key_ns: 0,
+                    key_ns: crate::metrics::KeyWriteStamp::default(),
                     hot_key: None,
                     meter: None,
                     completion: Some(completion),
@@ -1635,14 +1802,16 @@ pub(crate) mod paste_order {
         sink.ordered_egress_count() > 0
     }
 
-    /// Wait until this sink's ordered egress has drained ([`aterm_spec::wait::MUST_HAPPEN`]).
+    /// Wait until this sink's ordered egress has drained, the writer done with every queued job
+    /// (a hang detector: [`aterm_spec::wait::MUST_HAPPEN`]).
     #[cfg(test)]
     pub(crate) fn await_drain_for_test(sink: &SinkWriter) {
-        let _ = aterm_spec::wait::within(
+        aterm_spec::wait::within(
             aterm_spec::wait::MUST_HAPPEN,
             std::time::Duration::from_millis(1),
             || (!is_ordering(sink)).then_some(()),
-        );
+        )
+        .expect("the sink's ordered egress drains");
     }
 
     /// The update handoff's cold drain gate, by master.
@@ -1763,7 +1932,7 @@ pub(crate) mod paste_order {
         }
         sink.claim_ordered_egress();
         let key_ns = if matches!(ev, InputEvent::Paste(..)) || echo.is_none() {
-            0
+            crate::metrics::KeyWriteStamp::default()
         } else {
             crate::metrics::take_key_arrival()
         };
@@ -1948,7 +2117,11 @@ pub(crate) mod paste_order {
         hot_key: Option<(u64, Option<&EventLoopProxy<Wake>>)>,
         completion: Option<crate::control_input_ack::InputCompletion>,
     ) -> (crate::input::EgressReceipt, bool) {
-        if queue {
+        if queue
+            || completion
+                .as_ref()
+                .is_some_and(|completion| completion.is_supervised())
+        {
             match enqueue_metered_observed(
                 term,
                 modes,
@@ -3136,6 +3309,8 @@ pub(crate) fn press_fence(ev: &InputEvent) -> Option<bool> {
         | InputEvent::MouseMove { buttons: 3, .. } => None,
         InputEvent::Paste(..)
         | InputEvent::Focus(_)
+        | InputEvent::Resize { .. }
+        | InputEvent::ResizeWindowPx { .. }
         | InputEvent::MouseButton { .. }
         | InputEvent::MouseMove { .. }
         | InputEvent::Wheel { .. } => Some(true),
@@ -3607,7 +3782,13 @@ impl App {
     /// row (a footer hint after Escape or Ctrl-C, a spinner) park it, refusing the keys typed
     /// on it until a navigation key or Return. The boundary is stamped on the input path's clock
     /// ([`input_clock`]), the clock its key's other stamps read.
+    #[cfg(all(test, unix))]
     pub(crate) fn clear_move_license(&mut self, wid: WindowId) {
+        self.clear_move_license_from(wid, BoundaryOrigin::Unknown);
+    }
+
+    /// Apply the existing ownership fence with its fixed diagnostic entry point.
+    pub(crate) fn clear_move_license_from(&mut self, wid: WindowId, origin: BoundaryOrigin) {
         let vim = self
             .front_terminal(wid)
             .and_then(|terminal| self.pool.get(terminal.session))
@@ -3617,12 +3798,15 @@ impl App {
             return;
         }
         if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.fx.cursor_mut().glow.clear_typed(input_clock());
+            ws.fx
+                .cursor_mut()
+                .glow
+                .clear_typed_from(input_clock(), origin);
             ws.fx.cursor_mut().trail.clear_typed();
         }
     }
 
-    /// [`Self::clear_move_license`] for a boundary that cannot take the hand off its row.
+    /// [`Self::clear_move_license_from`] for a boundary that cannot take the hand off its row.
     pub(crate) fn clear_move_license_keeping_hand(&mut self, wid: WindowId) {
         if let Some(ws) = self.windows.get_mut(&wid) {
             let fx = ws.fx.cursor_mut();
@@ -3650,10 +3834,14 @@ impl App {
 
     /// The licence fence [`press_fence`] classified.
     pub(crate) fn fence_move_license(&mut self, wid: WindowId, keep_hand: bool) {
+        self.fence_move_license_from(wid, keep_hand, BoundaryOrigin::InputFence);
+    }
+
+    fn fence_move_license_from(&mut self, wid: WindowId, keep_hand: bool, origin: BoundaryOrigin) {
         if keep_hand {
             self.clear_move_license_keeping_hand(wid);
         } else {
-            self.clear_move_license(wid);
+            self.clear_move_license_from(wid, origin);
         }
     }
 
@@ -3697,22 +3885,26 @@ impl App {
             pool.get(session).map(|owner| owner.ctx.licence.clone())
         });
         if let Some(keep_hand) = owed {
-            self.fence_move_license(wid, keep_hand);
+            self.fence_move_license_from(wid, keep_hand, BoundaryOrigin::ControlFence);
         }
     }
 
     /// External OS command surfaces can consume input before `on_key`/`App::input`.
     pub(crate) fn clear_front_move_license(&mut self) {
         if let Some(wid) = self.frontmost_window {
-            self.clear_move_license(wid);
+            self.clear_move_license_from(wid, BoundaryOrigin::Menu);
         }
     }
 
     /// Licence-only ingress fence for native tab-strip wakes.
     pub(crate) fn clear_tab_surface_move_license(&mut self, window: Option<WindowId>) {
         match window {
-            Some(wid) => self.clear_move_license(wid),
-            None => self.clear_front_move_license(),
+            Some(wid) => self.clear_move_license_from(wid, BoundaryOrigin::TabSurface),
+            None => {
+                if let Some(wid) = self.frontmost_window {
+                    self.clear_move_license_from(wid, BoundaryOrigin::TabSurface);
+                }
+            }
         }
     }
 
@@ -4144,9 +4336,14 @@ impl App {
     }
 
     /// Stamps `session`'s person clock ([`crate::SessionCtx::human_input`]) when `ev` is a
-    /// person's gesture ([`crate::human_input::is_person_gesture`] from [`Source::Human`]).
+    /// person's unmarked gesture ([`crate::human_input::is_person_gesture`] from
+    /// [`Source::Human`]). Posted keys keep that native routing source but carry the
+    /// controller mark, so they do not establish a person's presence or ownership.
     pub(crate) fn note_person_input(&self, session: u64, ev: &InputEvent, src: Source) {
-        if matches!(src, Source::Human) && crate::human_input::is_person_gesture(ev) {
+        if matches!(src, Source::Human)
+            && !self.person_gesture_refused()
+            && crate::human_input::is_person_gesture(ev)
+        {
             self.spares.note_person(std::time::Instant::now());
             if let Some(owner) = self.pool.get(session) {
                 let _ = note_person_event(&owner.ctx, ev);
@@ -4451,6 +4648,12 @@ impl App {
             | InputEvent::Paste(..) => Some(input_clock()),
             _ => None,
         };
+        if let (InputEvent::Paste(..), Some(now)) = (&ev, input_now)
+            && let Some(ws) = self.windows.get_mut(&wid)
+        {
+            // The pasted text's echo cannot be told from the held keys'.
+            crate::aos_host::refute_hold(ws, now);
+        }
         match ev {
             ev @ (InputEvent::Key { .. } | InputEvent::Text(_) | InputEvent::KeySequence(_)) => {
                 let is_release = matches!(
@@ -4506,6 +4709,7 @@ impl App {
                     && sink.tty_swallows_input();
                 let mut swallowed_press = false;
                 let mut composer_newline = false;
+                let mut held_press = false;
                 if let Some(input_now) = input_now {
                     // A bare modifier is inert and leaves the blink phase alone. Gated on
                     // `inert_modifier` only, not on disturbing: an auto-repeat tick is a
@@ -4608,6 +4812,13 @@ impl App {
                         crate::metrics::note_window_input(&mut ws.present_metrics.pending_input);
                         crate::input_hint::arm();
                     }
+                    // Where a key held for its echo would show it, read only while a recording
+                    // runs: the open hold's next column, else the cursor.
+                    let echo_site = self
+                        .windows
+                        .get(&wid)
+                        .filter(|ws| ws.fx.cursor().momentum.aos_attached())
+                        .map(|ws| crate::aos_host::echo::next_site(&ws.aos));
                     let (
                         scrolled,
                         cleared,
@@ -4618,10 +4829,23 @@ impl App {
                         ambiguous_width_double,
                         shell_executing,
                         front_prompt,
+                        echo_press,
                     ) = {
                         let site = crate::metrics::TermWaitSite::Press;
                         let mut t = crate::term_lock_ui(&term, &ui_waiting, site);
                         let (scrolled, cleared) = apply_press_custody(&mut t, press_kind);
+                        let echo_cursor = t.cursor();
+                        let echo_press = (
+                            (echo_cursor.row, echo_cursor.col),
+                            t.grid().pending_wrap(),
+                            t.content_scroll_state().coordinate_generation(),
+                            t.is_alternate_screen(),
+                            t.grid().display_offset(),
+                            t.print_seq(),
+                            echo_site.map_or(crate::aos_host::echo::PressRow::NONE, |site| {
+                                crate::aos_host::echo::PressRow::read(&t, site)
+                            }),
+                        );
                         let kitty_owns_keyboard = t.kitty_suppresses_predictive_echo();
                         let sample = act.is_some().then(|| {
                             let kitty_fn = t.kitty_reports_functional_keys();
@@ -4674,6 +4898,7 @@ impl App {
                             ambiguous_width_double,
                             shell_executing,
                             front_prompt,
+                            echo_press,
                         )
                     };
                     let submit_prompt = front_prompt.filter(|_| line_terminator);
@@ -4704,7 +4929,10 @@ impl App {
                             ws.fx.cursor_mut().glow.clear_typed_keeping_hand(input_now);
                             ws.fx.cursor_mut().trail.clear_typed();
                         } else {
-                            ws.fx.cursor_mut().glow.clear_typed(input_now);
+                            ws.fx
+                                .cursor_mut()
+                                .glow
+                                .clear_typed_from(input_now, BoundaryOrigin::InputClass);
                             ws.fx.cursor_mut().trail.clear_typed();
                         }
                         if !navigation_key && !kill_key && !inert_modifier {
@@ -4738,18 +4966,51 @@ impl App {
                                 .max(1);
                             let at_prompt =
                                 front_prompt.is_some_and(|p| ws.aos.prompt_open(session, p));
-                            if let Some(why) = crate::aos_host::key_privacy(
+                            let verdict = crate::aos_host::key_privacy(
                                 tty_swallows,
                                 self.config.secure_keyboard_entry_or_default(),
                                 at_prompt,
                                 || sink.tty_echo(),
-                            ) {
-                                crate::aos_host::private_key(ws, why);
-                            }
-                            ws.fx.cursor_mut().momentum.on_key(
-                                input_now,
-                                aterm_effects::cursor_momentum::MOMENTUM_GLOW_TAU_S,
                             );
+                            let (
+                                cursor,
+                                pending_wrap,
+                                coord_gen,
+                                alt,
+                                display_offset,
+                                print_seq,
+                                row,
+                            ) = echo_press;
+                            let press = crate::aos_host::echo::Press {
+                                session,
+                                cursor,
+                                pending_wrap,
+                                coord_gen,
+                                alt,
+                                display_offset,
+                                print_seq,
+                                epoch: sink.input_epoch(),
+                                at: input_now,
+                                row,
+                            };
+                            let route = crate::aos_host::admit_key(ws, verdict, &press, |cells| {
+                                crate::aos_host::echo::typed_echo_cells(
+                                    typed.filter(|_| !enter_like),
+                                    ime,
+                                    ambiguous_width_double,
+                                    cells,
+                                )
+                            });
+                            held_press = route == crate::aos_host::echo::KeyRoute::Hold;
+                            if let crate::aos_host::echo::KeyRoute::Private(why) = route {
+                                crate::aos_host::private_key(ws, why, input_now);
+                            }
+                            if !held_press {
+                                ws.fx.cursor_mut().momentum.on_key(
+                                    input_now,
+                                    aterm_effects::cursor_momentum::MOMENTUM_GLOW_TAU_S,
+                                );
+                            }
                             if tty_swallows {
                                 swallowed_press = true;
                             } else {
@@ -5069,6 +5330,9 @@ impl App {
                         .then_some((session, self.proxy.as_ref())),
                     completion,
                 );
+                if held_press && let Some(ws) = self.windows.get_mut(&wid) {
+                    crate::aos_host::echo::note_written(&mut ws.aos, sink.input_epoch());
+                }
                 let outcome = receipt_outcome(receipt);
                 if outcome == InputOutcome::Ok
                     && let (Some((licence, frame, key)), Some(at)) = (vim_input, input_now)
@@ -6028,7 +6292,7 @@ impl App {
         intent: ScrollIntent,
         term: &Arc<Mutex<Terminal>>,
     ) -> InputOutcome {
-        self.clear_move_license(wid);
+        self.clear_move_license_from(wid, BoundaryOrigin::Scroll);
         if let Some(rain) = self.windows.get_mut(&wid).and_then(|ws| ws.fx.rain_mut())
             && term_lock(term).is_alternate_screen()
         {
@@ -6213,8 +6477,9 @@ impl App {
     }
 
     /// Ask window `target` for `asked` device pixels: the platform's window takes it as the
-    /// window manager allows, a headless one as given ([`InputOutcome::NotApplied`] when no such
-    /// window stands).
+    /// window manager allows, a headless one as given, one holding Settings no smaller than its
+    /// least ([`App::least_window_size`]) ([`InputOutcome::NotApplied`] when no such window
+    /// stands).
     pub(crate) fn resize_window_to_px(
         &mut self,
         target: WindowId,
@@ -6246,9 +6511,22 @@ impl App {
             }
             // A headless window has no window manager to ask, so the size asked for is the size
             // it gets, through the grid half of a `Resized` (the live-resize throttle, its
-            // coalescing and its trailing settle), as an edge drag would. Its frame stays the
-            // grid's ([`App::headless_frame_px`]), so the pixels a cell does not fill are left out.
-            None => self.apply_window_resized_grid(target, asked),
+            // coalescing and its trailing settle), as an edge drag would; one holding Settings
+            // no smaller than Settings' least, as a window manager holds a platform's
+            // ([`App::least_window_size`]). Its frame stays the grid's ([`App::headless_frame_px`]),
+            // so the pixels a cell does not fill are left out.
+            None => {
+                let held = if self.window_holds_settings(target) {
+                    let least = self.least_window_size(target);
+                    aterm_window::dpi::PhysicalSize::new(
+                        asked.width.max(least.width),
+                        asked.height.max(least.height),
+                    )
+                } else {
+                    asked
+                };
+                self.apply_window_resized_grid(target, held);
+            }
         }
         InputOutcome::Ok
     }
@@ -7010,7 +7288,7 @@ impl App {
 
         // Shortcuts may consume the key without a reducer event (Copy with
         // no selection, or Paste with no clipboard text). It still reached
-        // the page and ends the startup review's automatic Apply.
+        // the page: the permission gate notes whose gesture it was.
         self.interact_system_state(wid);
 
         if !self.keybindings.is_empty() || !self.key_sequences.is_empty() {
@@ -7132,6 +7410,19 @@ impl App {
             return true;
         }
         match self.native_runtime.view_state(view) {
+            Some(crate::native_app::AppViewState::Mail(state)) => {
+                let Some(crate::native_app::NativeApp::Mail(app)) =
+                    self.native_runtime.app(instance)
+                else {
+                    return false;
+                };
+                state
+                    .common
+                    .last_focus
+                    .as_ref()
+                    .and_then(|key| app.field_input(state, key.as_str()))
+                    .is_some_and(|input| input.preedit().is_some())
+            }
             Some(crate::native_app::AppViewState::Editor(state)) => !state.preedit.is_empty(),
             Some(crate::native_app::AppViewState::Settings(state)) => state
                 .editing_field
@@ -7150,8 +7441,7 @@ impl App {
                     .common
                     .last_focus
                     .as_ref()
-                    .and_then(|key| app.field_projection(key.as_str()))
-                    .is_some_and(|field| field.preedit.is_some())
+                    .is_some_and(|key| app.field_composing(key.as_str()))
             }
             Some(
                 crate::native_app::AppViewState::About(_)
@@ -7219,6 +7509,15 @@ impl App {
                 let text = state.selected_text()?;
                 Some(read(&[text]))
             }
+            Some(crate::native_app::AppViewState::Mail(state)) => {
+                let crate::native_app::NativeApp::Mail(app) = self.native_runtime.app(instance)?
+                else {
+                    return None;
+                };
+                let key = state.common.last_focus.as_ref()?;
+                let text = app.field_input(state, key.as_str())?.selected_text();
+                (!text.is_empty()).then(|| read(&[text]))
+            }
             Some(crate::native_app::AppViewState::SystemState(state)) => {
                 let crate::native_app::NativeApp::SystemState(app) =
                     self.native_runtime.app(instance)?
@@ -7267,7 +7566,9 @@ impl App {
             {
                 self.clear_move_license_keeping_hand(wid);
             }
-            Some(keep_hand) => self.fence_move_license(wid, keep_hand),
+            Some(keep_hand) => {
+                self.fence_move_license_from(wid, keep_hand, BoundaryOrigin::PhysicalPress)
+            }
             None if !inert => {
                 if let Some(ws) = self.windows.get_mut(&wid) {
                     ws.fx.cursor_mut().glow.supersede_typed_press();
@@ -7647,7 +7948,7 @@ impl App {
     }
 
     /// Whether a generic licence boundary keeps the glow's hand on its row in window `wid`
-    /// ([`Self::clear_move_license`]): an agent's composer is in front, read without waiting
+    /// ([`Self::clear_move_license_from`]): an agent's composer is in front, read without waiting
     /// on its session's timeline (a busy one answers no, the generic boundary), and it does not
     /// show vim's INSERT indicator ([`Self::front_composer_in_vim_insert`]).
     fn boundary_keeps_hand(&self, wid: WindowId) -> bool {
@@ -8646,7 +8947,17 @@ impl App {
         text: String,
         cursor: Option<(usize, usize)>,
     ) {
-        self.clear_move_license(wid);
+        let inactive_clear = text.is_empty()
+            && self.windows.get(&wid).is_some_and(|window| {
+                window.preedit.is_empty() && window.ime_compose.is_none_or(|(_, ended)| ended)
+            });
+        if inactive_clear {
+            // A redundant platform unmark/enablement notification is no key-class change.
+            // Retire dangling hints without creating or settling doubt about the caret's row.
+            self.clear_move_license_keeping_hand(wid);
+        } else {
+            self.clear_move_license_from(wid, BoundaryOrigin::ImePreedit);
+        }
         let recipient = self.ime_recipient(wid);
         let starts = !text.is_empty()
             && self
@@ -8711,10 +9022,11 @@ impl App {
         }
         if changed
             && !text.is_empty()
+            && !self.person_gesture_refused()
             && let Some(session) = self.focused_session_id(wid)
             && let Some(owner) = self.pool.get(session)
         {
-            let _ = note_person_reaching(&owner.ctx, crate::human_input::Gesture::Other, false);
+            let _ = note_person_reaching(&owner.ctx, crate::human_input::Gesture::Typed, false);
         }
         if changed && let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
             w.request_redraw();
@@ -8821,7 +9133,7 @@ impl App {
                 ws.fx.cursor_mut().glow.supersede_typed_press();
             }
         } else {
-            self.clear_move_license(wid);
+            self.clear_move_license_from(wid, BoundaryOrigin::ImeCommit);
         }
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.preedit.clear();
@@ -9276,7 +9588,8 @@ impl App {
         let (title, prompt) = match kind {
             crate::native_app::AppKind::Markdown => ("Open Markdown", "Open as Markdown"),
             crate::native_app::AppKind::Editor => ("Open File", "Open"),
-            crate::native_app::AppKind::About
+            crate::native_app::AppKind::Mail
+            | crate::native_app::AppKind::About
             | crate::native_app::AppKind::Settings
             | crate::native_app::AppKind::SystemState
             | crate::native_app::AppKind::Recovery => return,
@@ -9527,7 +9840,6 @@ impl App {
                     self.menu_reset_terminal(wid);
                 }
             }
-            MenuAction::ToggleNeedsInWindows => self.user_toggle_needs_in_windows(),
             MenuAction::StatsBarsDeck | MenuAction::StatsBarsSill | MenuAction::StatsBarsOff => {
                 if let Some(form) = action.stats_bars_form() {
                     self.user_set_stats_bars(form);
@@ -9643,6 +9955,9 @@ impl App {
                 self.open_settings_tab(crate::native_settings::SettingsRoute::Messages);
             }
             MenuAction::SystemState => self.open_system_state_from_menu(),
+            MenuAction::Mail => {
+                self.open_mail_tab();
+            }
             MenuAction::HarnessSettings => {
                 if let Some(wid) = self.frontmost_window {
                     self.open_harness_settings(wid, crate::harness_screen::HarnessFocus::Top);
@@ -11164,6 +11479,34 @@ mod person_presence_tests {
                 "{event:?}"
             );
             assert_eq!(human_events(&ctx), 1, "{event:?}");
+        }
+    }
+
+    /// THE PERSON'S TYPING IS STAMPED APART (`human_typed_ms=`, 2026-10-30 review 8): a key, text,
+    /// a key sequence or a paste that reaches the program stamps it, while a click, a drag, a
+    /// wheel or a scroll of the view stamps `human_ms` alone, so the harness's hour after the
+    /// person's key never starts at a gesture that says nothing.
+    #[test]
+    fn typing_alone_stamps_human_typed_ms() {
+        for (event, types) in typing()
+            .into_iter()
+            .map(|e| (e, true))
+            .chain(pointing().into_iter().map(|e| (e, false)))
+        {
+            let (mut app, _reader) = app();
+            let ctx = ctx(&app);
+            assert_eq!(
+                app.input(WindowId(0), event.clone(), Source::Human),
+                InputOutcome::Ok
+            );
+            let now = crate::metrics::now_us();
+            assert!(ctx.human_input.ms_since(now).is_some(), "{event:?}");
+            assert_eq!(
+                ctx.human_input.typed_ms_since(now).is_some(),
+                types,
+                "{event:?}"
+            );
+            assert_eq!(ctx.human_input.typed_wire(now) != "-", types, "{event:?}");
         }
     }
 

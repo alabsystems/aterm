@@ -775,10 +775,16 @@ impl Prefix {
 
     /// Restores owned payloads stranded by an interrupted same-version reinstall.
     pub fn restore_stale_asides(&self) {
+        if real_base(&self.root).is_err() {
+            return;
+        }
         for (base, kind) in [
             (self.cellar(), Kind::Formula),
             (self.caskroom(), Kind::Cask),
         ] {
+            if real_base(&base).is_err() {
+                continue;
+            }
             let Ok(entries) = std::fs::read_dir(&base) else {
                 continue;
             };
@@ -798,7 +804,7 @@ impl Prefix {
     fn restore_aside(&self, kind: Kind, staging: &Path) {
         let payload = staging.join("payload");
         if !std::fs::symlink_metadata(&payload)
-            .is_ok_and(|m| m.file_type().is_dir() && !m.file_type().is_symlink())
+            .is_ok_and(|m| m.file_type().is_dir() && !crate::platform::is_reparse(&m))
         {
             return;
         }
@@ -809,16 +815,21 @@ impl Prefix {
             Kind::Formula => self.keg(&name, &version),
             Kind::Cask => self.cask_dir(&name, &version),
         };
-        if std::fs::symlink_metadata(&dest).is_ok() {
-            return;
-        }
         let Some(parent) = dest.parent() else {
             return;
         };
         match std::fs::symlink_metadata(parent) {
-            Ok(m) if m.file_type().is_dir() && !m.file_type().is_symlink() => {}
-            Err(_) if std::fs::create_dir(parent).is_ok() => {}
+            Ok(m) if m.file_type().is_dir() && !crate::platform::is_reparse(&m) => {}
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && std::fs::create_dir(parent).is_ok() => {}
             _ => return,
+        }
+        if !matches!(
+            std::fs::symlink_metadata(&dest),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound
+        ) {
+            return;
         }
         if publish_directory(&payload, &dest, false).is_ok() {
             eprintln!("abrew: restored {name} {version} from an interrupted reinstall");
@@ -997,6 +1008,99 @@ pub(super) fn receipt_word(dir: &Path, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Replace one string-valued receipt word in place, preserving
+/// every other byte (the migration receipt fix-up). Returns false
+/// when the receipt or key is absent.
+pub(super) fn replace_receipt_word(dir: &Path, key: &str, value: &str) -> Result<bool, String> {
+    let path = dir.join("INSTALL_RECEIPT.json");
+    let Ok(bytes) = crate::metadata_io::read_bounded_regular(&path, 64 * 1024) else {
+        return Ok(false);
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let needle = format!("\"{key}\"");
+    let Some(key_at) = text.find(&needle) else {
+        return Ok(false);
+    };
+    let after = &text[key_at + needle.len()..];
+    let Some(colon) = after.find(':') else {
+        return Ok(false);
+    };
+    let rest = &after[colon + 1..];
+    let token = rest.trim_start();
+    if !token.starts_with('"') {
+        return Ok(false);
+    }
+    let token_at = text.len() - token.len();
+    let Some(close) = token[1..].find('"') else {
+        return Ok(false);
+    };
+    let mut out = String::with_capacity(text.len());
+    out.push_str(&text[..token_at]);
+    out.push_str(&format!(
+        "\"{}\"",
+        value.replace('\\', "\\\\").replace('"', "\\\"")
+    ));
+    out.push_str(&text[token_at + close + 2..]);
+    write_metadata(&path, out.as_bytes())
+        .map_err(|e| format!("abrew: cannot write receipt in {}: {e}", dir.display()))?;
+    Ok(true)
+}
+
+/// Brew's `tab` marking: flip `installed_on_request` in a receipt
+/// in place, preserving every other byte. Returns the previous
+/// value, or `None` when the receipt or the key is absent. Abrew
+/// receipts carry the value as a string and brew's as a bool; both
+/// token shapes are read, and the replacement keeps the shape
+/// found.
+pub(super) fn set_installed_on_request(
+    dir: &Path,
+    on_request: bool,
+) -> Result<Option<bool>, String> {
+    let path = dir.join("INSTALL_RECEIPT.json");
+    let Ok(bytes) = crate::metadata_io::read_bounded_regular(&path, 64 * 1024) else {
+        return Ok(None);
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    const KEY: &str = "\"installed_on_request\"";
+    let Some(key_at) = text.find(KEY) else {
+        return Ok(None);
+    };
+    let after = &text[key_at + KEY.len()..];
+    let Some(colon) = after.find(':') else {
+        return Ok(None);
+    };
+    let value_at = key_at + KEY.len() + colon + 1;
+    let token = text[value_at..].trim_start();
+    let token_at = text.len() - token.len();
+    let (previous, quoted, len) = if token.starts_with("\"true\"") {
+        (true, true, 6)
+    } else if token.starts_with("\"false\"") {
+        (false, true, 7)
+    } else if token.starts_with("true") {
+        (true, false, 4)
+    } else if token.starts_with("false") {
+        (false, false, 5)
+    } else {
+        return Ok(None);
+    };
+    if previous == on_request {
+        return Ok(Some(previous));
+    }
+    let replacement = match (on_request, quoted) {
+        (true, true) => "\"true\"",
+        (false, true) => "\"false\"",
+        (true, false) => "true",
+        (false, false) => "false",
+    };
+    let mut out = String::with_capacity(text.len());
+    out.push_str(&text[..token_at]);
+    out.push_str(replacement);
+    out.push_str(&text[token_at + len..]);
+    write_metadata(&path, out.as_bytes())
+        .map_err(|e| format!("abrew: cannot write receipt in {}: {e}", dir.display()))?;
+    Ok(Some(previous))
+}
+
 /// A symlink target resolved against its link's directory, with
 /// `.`/`..` folded lexically. Abrew writes absolute opt/pin
 /// links; brew writes relative ones (`../Cellar/...`), and state
@@ -1135,6 +1239,43 @@ impl Lock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tab_marking_flips_both_receipt_shapes() {
+        let tmp = aterm_tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let receipt = dir.join("INSTALL_RECEIPT.json");
+        // Abrew's string shape.
+        std::fs::write(
+            &receipt,
+            "{\n  \"name\": \"x\",\n  \"installed_on_request\": \"true\"\n}\n",
+        )
+        .unwrap();
+        assert_eq!(set_installed_on_request(dir, true).unwrap(), Some(true));
+        assert!(
+            std::fs::read_to_string(&receipt)
+                .unwrap()
+                .contains("\"installed_on_request\": \"true\"")
+        );
+        assert_eq!(set_installed_on_request(dir, false).unwrap(), Some(true));
+        assert!(
+            std::fs::read_to_string(&receipt)
+                .unwrap()
+                .contains("\"installed_on_request\": \"false\"")
+        );
+        // Brew's bool shape keeps its shape.
+        std::fs::write(&receipt, "{\"installed_on_request\":false}").unwrap();
+        assert_eq!(set_installed_on_request(dir, true).unwrap(), Some(false));
+        assert_eq!(
+            std::fs::read_to_string(&receipt).unwrap(),
+            "{\"installed_on_request\":true}"
+        );
+        // Absent key and absent file both read as no tab.
+        std::fs::write(&receipt, "{\"name\":\"x\"}").unwrap();
+        assert_eq!(set_installed_on_request(dir, true).unwrap(), None);
+        std::fs::remove_file(&receipt).unwrap();
+        assert_eq!(set_installed_on_request(dir, true).unwrap(), None);
+    }
 
     #[test]
     #[cfg(unix)]
@@ -1687,6 +1828,13 @@ mod tests {
             r#"{"installed_by":"abrew","name":"wget","version":"1.0"}"#,
         )
         .unwrap();
+        let aside = outside.join(".abrew-reinstall-wget-2.0/payload");
+        std::fs::create_dir_all(&aside).unwrap();
+        std::fs::write(
+            aside.join("INSTALL_RECEIPT.json"),
+            r#"{"installed_by":"abrew","name":"wget","version":"2.0"}"#,
+        )
+        .unwrap();
         for relative in ["", "Cellar", "Pinned", "Library", "cache/api"] {
             let root = tmp
                 .path()
@@ -1698,6 +1846,9 @@ mod tests {
                 std::fs::create_dir_all(root.join(relative).parent().unwrap()).unwrap();
                 std::os::unix::fs::symlink(&outside, root.join(relative)).unwrap();
             }
+            prefix.restore_stale_asides();
+            assert!(!outside.join("wget/2.0").exists(), "{relative}");
+            assert!(aside.join("INSTALL_RECEIPT.json").is_file(), "{relative}");
             assert!(prefix.ensure().is_err(), "{relative}");
             assert!(prefix.pin("wget").is_err(), "{relative}");
             assert!(prefix.unpin("wget").is_err(), "{relative}");

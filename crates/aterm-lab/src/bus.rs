@@ -227,6 +227,63 @@ pub fn await_listening(
     Ok(())
 }
 
+/// Why [`Fabric::start`] started no bus.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Unstarted {
+    /// The broker refused its lifeline as an aterm older than the lifeline every lab launch is
+    /// armed with does ([`unstarted`]).
+    NoLifeline,
+    /// Any other reason, said.
+    Failed(String),
+}
+
+/// Why the lifeline-armed broker [`Fabric::start`] waited for never listened: its exit status
+/// (`exited`, `None` while it runs or after a signal), what it said (`said`) and the wait's own
+/// words (`why`). It is [`Unstarted::NoLifeline`] only for exit 2 with its parser's refusal of
+/// [`aterm_uds::lifeline::FLAG`] as an unknown flag and the flag named nowhere else: what a broker
+/// that predates the lifeline prints. A current broker names the flag in the usage it prints after
+/// every usage error and in its own lifeline errors, so a refusal that names it elsewhere too is a
+/// current broker failing, [`Unstarted::Failed`] like every other ending.
+fn unstarted(exited: Option<i32>, said: &str, why: String) -> Unstarted {
+    let flag = aterm_uds::lifeline::FLAG;
+    if exited == Some(2)
+        && said.contains(&format!("unknown flag `{flag}`"))
+        && said.matches(flag).count() == 1
+    {
+        Unstarted::NoLifeline
+    } else {
+        Unstarted::Failed(why)
+    }
+}
+
+impl From<String> for Unstarted {
+    fn from(why: String) -> Self {
+        Self::Failed(why)
+    }
+}
+
+impl Unstarted {
+    /// How `verb`, driving `aterm`, ends: NOT RUN (exit 3) for an aterm with no lifeline, else a
+    /// failure.
+    #[must_use]
+    pub fn fail(self, verb: &str, aterm: &Path) -> crate::Fail {
+        match self {
+            Self::NoLifeline => crate::Fail::exit(
+                3,
+                format!(
+                    "NOT RUN: {verb}: {} refuses {}: it predates the lifeline every lab launch \
+                     is armed with",
+                    aterm.display(),
+                    aterm_uds::lifeline::FLAG
+                ),
+            ),
+            Self::Failed(why) => {
+                crate::Fail::die(format!("{verb}: cannot start the lab's bus: {why}"))
+            }
+        }
+    }
+}
+
 /// A lab's bus: its broker, the instance's `[fabric]` table and the bridge's state dir.
 pub struct Fabric {
     broker: Option<aterm_uds::spawnfd::Child>,
@@ -244,9 +301,10 @@ impl Fabric {
     /// Lay the bus out under `dir` ([`lay`], keys and live dir alike) and start its broker with
     /// `aterm`'s own `link broker`.
     /// # Errors
-    /// A file could not be made, a grant could not be minted, or the broker never listened (within
-    /// a minute: a hang detector).
-    pub fn start(aterm: &Path, dir: &Path) -> Result<Fabric, String> {
+    /// [`Unstarted::NoLifeline`] for a broker older than its lifeline ([`unstarted`]), else
+    /// [`Unstarted::Failed`]: a file could not be made, a grant could not be minted, or the broker
+    /// never listened (within a minute: a hang detector).
+    pub fn start(aterm: &Path, dir: &Path) -> Result<Fabric, Unstarted> {
         let laid = lay(aterm, dir, dir, None, &mut |argv: &[String]| {
             let out = aterm_uds::spawnfd::command(&argv[0])
                 .args(&argv[1..])
@@ -291,8 +349,14 @@ impl Fabric {
             || std::fs::read_to_string(&said).unwrap_or_default(),
         );
         if let Err(e) = listened {
+            let exited = fabric
+                .broker
+                .as_mut()
+                .and_then(|b| b.try_wait().ok().flatten())
+                .and_then(|status| status.code());
+            let said = std::fs::read_to_string(&said).unwrap_or_default();
             fabric.stop();
-            return Err(e);
+            return Err(unstarted(exited, &said, e));
         }
         Ok(fabric)
     }
@@ -531,5 +595,95 @@ mod tests {
             await_listening(&sock, LISTEN_HANG, || true, String::new),
             Ok(())
         );
+    }
+
+    /// What a current `aterm link broker` prints after each usage error: its usage, which names
+    /// `--lifeline-fd` (its head and its row).
+    const CURRENT_USAGE: &str = "usage: aterm link broker <socket> [log] [--secret-file <path>] \
+        [--durability <tier>]\n                         [--lifeline-fd <n>]\n  \
+        --lifeline-fd <n>    descriptor <n> is the read end of a pipe or FIFO its launcher holds";
+
+    /// A broker older than the lifeline (exit 2, its parser refusing `--lifeline-fd` as an
+    /// unknown flag, its usage naming no such flag) starts no bus as a refusal of its own, which
+    /// a proof ends NOT RUN, naming the verb. A current broker's refusals are failures: a usage
+    /// error or a lifeline it cannot adopt, each followed by its usage naming the flag, a parser
+    /// that lost the flag its usage still names, and the old refusal's words with any exit but 2;
+    /// so is a refusal that names the flag once but refuses no unknown flag. One that listens
+    /// starts the bus. Each is a stand-in aterm whose `link mint` answers every grant; the old one
+    /// refuses only an argv that holds the flag, so it shows the lifeline armed.
+    #[test]
+    fn a_broker_that_refuses_its_lifeline_is_no_failure() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let start = |name: &str, broker: &str| {
+            let aterm = tmp.path().join(name);
+            std::fs::write(
+                &aterm,
+                format!(
+                    "#!/bin/sh\nusage() (printf '%s\\n' '{usage}' >&2)\n\
+                     old='aterm link broker: unknown flag `--lifeline-fd`'\n\
+                     case \"$2\" in\nmint) echo \"$3 00\" ;;\nbroker) {broker} ;;\nesac\n",
+                    usage = CURRENT_USAGE,
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&aterm, std::fs::Permissions::from_mode(0o755)).unwrap();
+            Fabric::start(&aterm, &tmp.path().join(format!("{name}.bus"))).err()
+        };
+        let listen = ": > \"$3\"; read x";
+        let old = start(
+            "old",
+            &format!(
+                "for a; do if [ \"$a\" = --lifeline-fd ]; then echo \"$old\" >&2; \
+                 echo 'usage: aterm link broker <socket> [log] [--secret-file <path>]' >&2; \
+                 exit 2; fi; done; {listen}"
+            ),
+        );
+        assert_eq!(old, Some(Unstarted::NoLifeline));
+        for (name, broker, words) in [
+            (
+                "usage",
+                "echo 'aterm link broker: --durability needs a value' >&2; usage; exit 2",
+                "--durability needs a value",
+            ),
+            (
+                "adopt",
+                "echo 'aterm link broker: --lifeline-fd 0 is not an open descriptor' >&2; usage; \
+                 exit 2",
+                "--lifeline-fd 0 is not an open descriptor",
+            ),
+            (
+                "once",
+                "echo 'aterm link broker: --lifeline-fd 0 is not an open descriptor' >&2; exit 2",
+                "--lifeline-fd 0 is not an open descriptor",
+            ),
+            (
+                "lost",
+                "echo \"$old\" >&2; usage; exit 2",
+                "unknown flag `--lifeline-fd`",
+            ),
+            (
+                "exit1",
+                "echo \"$old\" >&2; exit 1",
+                "unknown flag `--lifeline-fd`",
+            ),
+        ] {
+            let got = start(name, broker);
+            assert!(
+                matches!(&got, Some(Unstarted::Failed(why)) if why.contains(words)),
+                "{name}: {got:?}"
+            );
+        }
+        assert_eq!(start("current", listen), None, "it listens");
+        let aterm = Path::new("/old/aterm");
+        let not_run = Unstarted::NoLifeline.fail("proof", aterm);
+        assert_eq!(not_run.code, 3, "{:?}", not_run.msg);
+        assert_eq!(
+            not_run.msg.as_deref(),
+            Some(
+                "NOT RUN: proof: /old/aterm refuses --lifeline-fd: it predates the lifeline \
+                 every lab launch is armed with"
+            )
+        );
+        assert_eq!(Unstarted::Failed("no".into()).fail("proof", aterm).code, 1);
     }
 }

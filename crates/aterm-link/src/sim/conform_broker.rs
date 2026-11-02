@@ -241,6 +241,9 @@ struct Real {
     /// The rules every open sets, as `aterm link broker` opens its own (`None`: the broker
     /// it serves when setting them fails).
     retain: Option<astream_broker::Retention>,
+    /// The key the log is sealed under, opened keyed and bound as `aterm link broker` opens a log
+    /// with its `rest.key` (`None`: plaintext).
+    at_rest: Option<[u8; 32]>,
     boot: Boot,
     /// Producers whose `/a/will` record the log holds: what an open fires,
     /// one firing each.
@@ -329,7 +332,11 @@ impl Drop for RealConn {
 }
 
 impl Real {
-    fn new(tier: Tier, retain: Option<astream_broker::Retention>) -> Self {
+    fn new(
+        tier: Tier,
+        retain: Option<astream_broker::Retention>,
+        at_rest: Option<[u8; 32]>,
+    ) -> Self {
         let dir = aterm_tempfile::Builder::new()
             .prefix("al-b01")
             .tempdir_in("/tmp")
@@ -342,6 +349,7 @@ impl Real {
             durability: durability(tier),
             retain,
             boot: Boot::Known(BOOT),
+            at_rest,
             up: None,
             conns: BTreeMap::new(),
             will_producers: BTreeSet::new(),
@@ -360,11 +368,34 @@ impl Real {
         self.open_setting(rules);
     }
 
+    /// Whether the log has astream's binding beside it.
+    fn bound_at_rest(&self) -> bool {
+        self.dir.path().join("bus.log.seal").exists()
+    }
+
+    /// The files of the log that hold a subject in the clear, every script's starting `/f/f/`.
+    fn holding_subjects(&self) -> Vec<String> {
+        let mut holding: Vec<String> = std::fs::read_dir(self.dir.path())
+            .expect("the scratch dir")
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().into_string().ok()?;
+                let bytes = std::fs::read(entry.path()).ok()?;
+                (name.starts_with("bus.log") && bytes.windows(5).any(|w| w == b"/f/f/"))
+                    .then_some(name)
+            })
+            .collect();
+        holding.sort();
+        holding
+    }
+
     /// Open again setting `rules`, or none.
     fn open_setting(&mut self, rules: Option<astream_broker::Retention>) {
         let mut opts = self.durability.options();
         opts.boot = self.boot;
         opts.volume = Volume::Boot;
+        opts.require_bound_at_rest = self.at_rest.is_some();
+        opts.at_rest_key = self.at_rest;
         let broker =
             astream_broker::Broker::open_opts(self.dir.path().join("bus.log"), opts, || {
                 Ok(astream_broker::Prepared::Nothing)
@@ -824,9 +855,32 @@ fn run_on(
     mutant: ArmMutant,
     steps: &[Step],
 ) -> Verdict {
+    run_keyed(tier, retain, None, mutant, steps)
+}
+
+/// [`run_on`], the real broker's log sealed under `at_rest`. The model keeps no bytes at rest, so
+/// whatever a keyed log answers differently from it is the seal's doing.
+fn run_keyed(
+    tier: Tier,
+    retain: Option<astream_broker::Retention>,
+    at_rest: Option<[u8; 32]>,
+    mutant: ArmMutant,
+    steps: &[Step],
+) -> Verdict {
+    run_keeping(tier, retain, at_rest, mutant, steps).map(drop)
+}
+
+/// [`run_keyed`], handing back the real broker's files to look at.
+fn run_keeping(
+    tier: Tier,
+    retain: Option<astream_broker::Retention>,
+    at_rest: Option<[u8; 32]>,
+    mutant: ArmMutant,
+    steps: &[Step],
+) -> Result<Real, String> {
     let table = table(tier);
     let clock = Clock::new();
-    let mut real = Real::new(tier, retain.clone());
+    let mut real = Real::new(tier, retain.clone(), at_rest);
     let mut model = Model::new(tier, retain, mutant);
     let mut laws = [Law::default(), Law::default()];
     let mut answers = 0u64;
@@ -920,7 +974,7 @@ fn run_on(
         }
     }
     assert!(answers > 0, "a script that compared nothing");
-    Ok(())
+    Ok(real)
 }
 
 /// Send `reqs` on `c` on both arms, read each answer whole, and compare.
@@ -1901,17 +1955,7 @@ fn the_model_answers_every_script_as_astreams_broker_does() {
         .into_iter()
         .filter(|&tier| served_here(tier))
     {
-        for (name, script) in [
-            ("publishing", scripts::publishing()),
-            ("binary payload", scripts::binary_payload()),
-            ("retiring", scripts::retiring()),
-            ("retiring conditionally", scripts::conditional()),
-            ("wills", scripts::wills()),
-            ("groups", scripts::groups()),
-            ("a commit and a publish in one write", scripts::corked()),
-            ("restarts", scripts::restarts()),
-            ("retention", scripts::retention()),
-        ] {
+        for (name, script) in every_script() {
             if let Err(e) = run(tier, ArmMutant::None, &script) {
                 failed.push(format!("{name}: {e}"));
             }
@@ -1921,6 +1965,84 @@ fn the_model_answers_every_script_as_astreams_broker_does() {
         failed.is_empty(),
         "the model diverged:\n{}",
         failed.join("\n")
+    );
+}
+
+/// Each verb the bridge sends and each edge astream defines for it.
+fn every_script() -> [(&'static str, Vec<Step>); 9] {
+    [
+        ("publishing", scripts::publishing()),
+        ("binary payload", scripts::binary_payload()),
+        ("retiring", scripts::retiring()),
+        ("retiring conditionally", scripts::conditional()),
+        ("wills", scripts::wills()),
+        ("groups", scripts::groups()),
+        ("a commit and a publish in one write", scripts::corked()),
+        ("restarts", scripts::restarts()),
+        ("retention", scripts::retention()),
+    ]
+}
+
+/// **A SEALED LOG ANSWERS AS A PLAINTEXT ONE**: every script on every tier the host serves, the
+/// real broker's log sealed at rest as `aterm link broker` opens one with its `rest.key`, retained
+/// by aterm's rules. The seal lives below everything a client can see, and each run's files show it
+/// was there: a `.seal`, and no subject in the clear in the log or a sidecar. NEGATIVE CONTROLS: the
+/// plaintext arm of a script has no `.seal` and holds its subjects, and a model that forgets its
+/// dedup is still caught through the keyed arm, so the arm compares.
+#[test]
+fn a_sealed_log_answers_every_script_as_the_model_does() {
+    const KEY: [u8; 32] = *b"conform-broker-at-rest-key-32-by";
+    let arm = |tier, key, mutant, script: &[Step]| {
+        run_keeping(
+            tier,
+            Some(crate::broker_rules::default_rules()),
+            key,
+            mutant,
+            script,
+        )
+    };
+    let mut failed = Vec::new();
+    for tier in [Tier::Strict, Tier::Ordered, Tier::Relaxed]
+        .into_iter()
+        .filter(|&tier| served_here(tier))
+    {
+        for (name, script) in every_script() {
+            match arm(tier, Some(KEY), ArmMutant::None, &script) {
+                Err(e) => failed.push(format!("{name}: {e}")),
+                Ok(real) if !real.bound_at_rest() => {
+                    failed.push(format!("{name} at {tier}: no `.seal`: nothing sealed it"));
+                }
+                Ok(real) => {
+                    let holding = real.holding_subjects();
+                    if !holding.is_empty() {
+                        failed.push(format!("{name} at {tier}: in the clear in {holding:?}"));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "the model diverged from a sealed log:\n{}",
+        failed.join("\n")
+    );
+    let plain = arm(Tier::Relaxed, None, ArmMutant::None, &scripts::publishing())
+        .expect("the plaintext arm");
+    assert!(!plain.bound_at_rest(), "CONTROL: no key, no `.seal`");
+    assert_eq!(
+        plain.holding_subjects(),
+        ["bus.log"],
+        "CONTROL: the plaintext log holds its subjects"
+    );
+    assert!(
+        arm(
+            Tier::Relaxed,
+            Some(KEY),
+            ArmMutant::FreshDedup,
+            &scripts::publishing()
+        )
+        .is_err(),
+        "CONTROL: the keyed arm answered a forgetful model's resend as astream answers it"
     );
 }
 

@@ -37,7 +37,7 @@ Gap 0 (a seal that publishes Clean rows) blocks every row and is not repeated in
 
 ## 0. Notation used in the statements
 
-- `Bytes(a)` = `a.as_ref().as_bytes()` for any `A: AsRef<OsStr>`. This is the input to
+- `Bytes(a)` = `a.as_ref().as_bytes()` for any `A: AsRef<OsStr>`, the input to
   `Arg::with_c_str`.
 - `Sys`: an abstract POSIX platform model (gap 8, Lean `PlatformSpec`). It is a state of
   inodes and directory entries plus a per-thread `errno`. Each `*at` call is a relation
@@ -57,17 +57,17 @@ Gap 0 (a seal that publishes Clean rows) blocks every row and is not repeated in
 - `Obs_tree(root)`: the recursive snapshot `(name, kind, mode & 0o7777, nlink, size)` that
   the tests compare.
 - `Identity(fd)` = `(fstat(fd).st_dev, fstat(fd).st_ino)`.
-- `Names(D)`: the multiset of entry names of directory inode `D` in `Sys`, including `.` and
-  `..`.
-- **Pure core.** Only these parts can be proved without gap 8: `Arg::with_c_str`, the flag
-  algebra, `FileType`, the `Errno` constants, `RenameFlags::contains`, and the flag
-  translation inside `renameat_with`. Every other spec is blocked by gap 8 (effects, FFI,
-  `unsafe`).
+- `Names(D)`: the multiset of entry names of directory inode `D` in `Sys`, `.` and `..`
+  included.
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes (primary tests; secondary in §2)`,
-`difficulty (Rust features the proof must handle)`, `blocking_gaps (audit §7)`.
+`subsumes` lists the primary tests (secondary ones are in §2). `difficulty` names the Rust
+features a proof must handle. `blocking_gaps` are rows of the gap table in
+`docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7. Gap 0 (a seal that publishes Clean rows)
+blocks every row and is left out. Only the pure core (`Arg::with_c_str`, the flag algebra,
+`FileType`, the `Errno` constants, `RenameFlags::contains` and the flag translation inside
+`renameat_with`) can be proved without gap 8 (effects, FFI, `unsafe`).
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
@@ -172,21 +172,13 @@ tests/windows.rs	errors_keep_gone_apart_from_everything_else	win-errno-and-place
 - 38 live tests (`tests/dirfd.rs` 16, `tests/windows.rs` 22); all 38 map to one of the 16 specs, and 0 non-spec tests remain (§4).
 - The biggest collapses: `win-unlinkat-confined` (8 primary), `win-handle-relative-ops` (6 primary), `win-dir-listing` (4 primary), and `syscall-passthrough`, `dir-read-from-fresh-description` and `win-pin-volume-walk` (3 primary each).
 - `flags-bit-algebra` and `filetype-predicates` retire no test alone. They are the pure lemmas
-  that make the differential tests' flag words and kind checks meaningful, and they are the
-  cheapest rows to certify.
-- Every test here is a differential run against `std::fs` on a real kernel. A spec stated
-  over `Sys` proves that the crate passes calls through faithfully. It does not prove that the
-  kernel behaves like `Sys`. Deleting a test whose spec is Certified moves the kernel half of its
-  evidence into `Sys`'s axioms (gap 8's FFI assumption channel), so those axioms must be named
-  and reviewed when the tests go.
+  behind the differential tests' flag words and kind checks.
+- `Errno::{is_noent,is_inval}` and the inode-identity codec (`encode_inode_identity_le`,
+  `decode_inode_identity_le`, which nothing calls) have no row.
 
 ## 4. Tests that are not spec samples
 
-> Status 2026-10-16: deleted `large_directory_listings_agree` from `tests/dirfd.rs`.
->
-> Status 2026-10-17: its row here and in §2 is gone. It duplicated
-> `two_interleaved_streams_over_one_descriptor_each_see_every_entry`, which lists a larger
-> directory and compares the whole sorted listing with the std reference (`dir-listing-complete`).
+None: every test in §2 has a primary spec.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
@@ -215,31 +207,30 @@ tests/windows.rs	errors_keep_gone_apart_from_everything_else	win-errno-and-place
    Unix, where `raw_os_error()` is always `Some(errno)` and `Sys` requires `errno ≠ 0` whenever a
    POSIX call returns `-1`.
 
-## 6. Proof order (easiest high-value first)
+## 6. Proof order
 
-No spec is blocked by gap 0 alone. Every row needs at least gap 1, because even the flag and
-`Errno` newtypes are structs. Three small refactors put the pure core within reach of gaps
-1 and 3 only:
+Every row needs gap 1, since even the flag and `Errno` newtypes are structs.
 
-1. **`filetype-predicates`** (gaps 1, 3). A `const fn` and one `&` on a `u32` newtype, so it is an
-   `omega`/`decide` proof once the newtype carrier is admitted. It is the smallest probe of gap 1
-   for this crate, and it backs the kind half of `stats_agree_on_every_field_read_including_inode_identity`.
-2. **`flags-bit-algebra`** (gaps 1, 3; plus 2 for `bitor_assign`). Prove `bits`, `|`, `contains` and
-   the constant table first; `|=` follows once gap 2 lands. The constant rows can be evaluated per
-   platform. With item 1, this certifies every pure fact that the differential tests build on.
-3. **The constant half of `errno-constants-and-conversion`** (gap 1). `NOENT.raw_os_error() = ENOENT`
-   and its siblings are by definition. Proving them retires the tautological half of
-   `the_not_found_errno_is_the_same_constant` (§5.4).
-4. **`arg-cstr-faithful`** (gaps 1, 3, 5, 7, 11, 13). This is the highest-value pure spec: it retires
-   `an_interior_nul_is_refused_rather_than_truncated` outright, and it is the only way to check the
-   heap path (§5.3). Recommendation: factor the body into a monomorphic, closure-free helper,
-   `fn c_name<'b>(bytes: &[u8], buf: &'b mut [u8; 512], heap: &'b mut Vec<u8>) -> Result<&'b CStr>`.
-   With that, gaps 11 and 13 drop out, and `with_c_str` becomes a one-line wrapper that calls `f` once.
-5. **The flag translation in `renameat-with-dispatch`** (gaps 1, 3). Factor
-   `fn rename_raw_flags(RenameFlags) -> Option<c_uint>` per cfg (`None` means `ENOSYS`) and prove part (2)
-   on it. The syscall and `Sys` halves then wait on gap 8 with the rest.
+1. **`filetype-predicates`** (gaps 1, 3): a `const fn` and one `&` on a `u32` newtype, an
+   `omega`/`decide` proof once the newtype carrier is admitted. On Trust seal `150efe4a` a
+   `trust_contract_fn!` contract over it is refused: `self.0` needs the aggregate carrier
+   (gap 1); a comparison through a field projection, `BitAnd` on `u32` and the `as` casts of
+   `libc` constants are outside the E6 fragment (gap 3); and `from_raw_mode`'s struct return has
+   no kernel denotation (gap 1).
+2. **`flags-bit-algebra`** (gaps 1, 3; 2 for `bitor_assign`): `bits`, `|`, `contains` and the
+   constant table first, `|=` once gap 2 lands. The constant rows can be evaluated per platform.
+3. **The constant half of `errno-constants-and-conversion`** (gap 1):
+   `NOENT.raw_os_error() = ENOENT` and its siblings hold by definition. It retires the
+   tautological half of `the_not_found_errno_is_the_same_constant` (§5.4).
+4. **`arg-cstr-faithful`** (gaps 1, 3, 5, 7, 11, 13): it retires
+   `an_interior_nul_is_refused_rather_than_truncated` and is the only check of the heap path
+   (§5.3). Factor the body into a monomorphic, closure-free
+   `fn c_name<'b>(bytes: &[u8], buf: &'b mut [u8; 512], heap: &'b mut Vec<u8>) -> Result<&'b CStr>`;
+   gaps 11 and 13 then drop out, and `with_c_str` becomes a one-line wrapper that calls `f` once.
+5. **The flag translation in `renameat-with-dispatch`** (gaps 1, 3): factor
+   `fn rename_raw_flags(RenameFlags) -> Option<c_uint>` per cfg (`None` means `ENOSYS`) and prove
+   part (2) on it.
 
-After gap 8 (platform lane, FFI assumption channel, `unsafe` discharge): `syscall-passthrough` and
-`fstat-widening` first. Together they retire 5 tests, and the other effectful specs build on them.
-Then the three `Dir` specs, and last `fd-relative-no-reresolution`, which also needs a relational
-(two-state) statement over `Sys`.
+After gap 8: `syscall-passthrough` and `fstat-widening`, which the other effectful specs build
+on; then the three `Dir` specs; last `fd-relative-no-reresolution`, which also needs a
+relational (two-state) statement over `Sys`.

@@ -9,9 +9,10 @@
 //!
 //! A script is a statement a line; a line starting `#` is a comment. Setup directives say how the window is
 //! set up, and each `run <until_ms>` first applies what they changed, in one order (the config,
-//! the grid, the panes, their themes and their focus, the panel rate, the ramp cost), at the
-//! instant the last run ended. It then draws a frame every present interval up to `until_ms`,
-//! each after the timed events (`at <ms> …`) due by its instant, at their own instants.
+//! the scale, the grid, the panes, their themes and their focus, the panel rate, the ramp cost),
+//! at the instant the last run ended. It then draws a frame every present interval up to
+//! `until_ms`, each after the timed events (`at <ms> …`) due by its instant, at their own
+//! instants.
 //! `foreach-scheme dark|light { … }` runs the script once per built-in and pack theme of that
 //! polarity (`aterm_render::theme_is_dark` of its background), each on a fresh rig.
 //!
@@ -74,6 +75,11 @@ const TRANSLUCENT_OPACITY: f32 = 0.8;
 pub(crate) enum Setup {
     /// `grid <rows> <cols>`: the window's grid.
     Grid { rows: u16, cols: u16 },
+    /// `scale <x>`: the window's backing scale, as a window moved to a display of that scale
+    /// takes it (`TrailRig::scale`; a Retina display is 2): its font and its cells `x` times the
+    /// 1x size. With none the window is 1x. The grid is laid again at the new cells, and
+    /// `pointer` and `press` name the window's device pixels at that scale.
+    Scale(f64),
     /// `font <px>`: recorded, not honoured. Every dump draws the fixture face at the App's own
     /// size; the P0.6 corpus wires a size when a script first needs one.
     Font(f32),
@@ -406,6 +412,17 @@ pub(crate) fn statement(code: &str) -> Result<Stmt, String> {
                 cols: positive(cols, "grid cols")?,
             }),
             _ => Err("grid <rows> <cols>".into()),
+        },
+        "scale" => match args.as_slice() {
+            [x] => {
+                let x: f64 = finite(x, "scale")?;
+                if x > 0.0 && x <= 4.0 {
+                    setup(Setup::Scale(x))
+                } else {
+                    Err(format!("scale {x}: over 0 and at most 4"))
+                }
+            }
+            _ => Err("scale <x>".into()),
         },
         "font" => match args.as_slice() {
             [px] => setup(Setup::Font(finite(px, "font px")?)),
@@ -826,6 +843,8 @@ struct Runner {
     applied: Option<Config>,
     grid: Option<(u16, u16)>,
     grid_applied: Option<(u16, u16)>,
+    /// The `scale` not yet handed to the rig.
+    scale: Option<f64>,
     panes: usize,
     focus_pane: Option<usize>,
     hz: Option<u32>,
@@ -854,6 +873,7 @@ impl Runner {
             applied: None,
             grid: None,
             grid_applied: None,
+            scale: None,
             panes: 1,
             focus_pane: None,
             hz: None,
@@ -895,6 +915,7 @@ impl Runner {
     fn setup(&mut self, setup: &Setup) {
         match setup {
             Setup::Grid { rows, cols } => self.grid = Some((*rows, *cols)),
+            Setup::Scale(x) => self.scale = Some(*x),
             Setup::Style(style) => self.config.style.clone_from(style),
             Setup::Pet(seed) => self.config.pet = *seed,
             Setup::Words(style) => {
@@ -936,6 +957,11 @@ impl Runner {
             self.rig
                 .configure(&self.config.toml(self.wallpaper.as_deref()), at)?;
             self.applied = Some(self.config.clone());
+        }
+        if let Some(scale) = self.scale.take() {
+            self.rig.scale(scale, at);
+            // The window keeps its pixel size: lay the grid again at the new cells.
+            self.grid_applied = None;
         }
         if self.grid != self.grid_applied
             && let Some((rows, cols)) = self.grid

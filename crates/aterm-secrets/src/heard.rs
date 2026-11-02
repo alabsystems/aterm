@@ -90,7 +90,11 @@ impl Verdict {
 
     fn parse(text: &str) -> Option<Self> {
         let mut words = text.split_whitespace();
-        let at = words.next()?.parse().ok()?;
+        let at = words
+            .next()
+            .filter(|s| s.bytes().all(|b| b.is_ascii_digit()))?
+            .parse()
+            .ok()?;
         let kind = words.next()?;
         let network = words.next()?.to_owned();
         let heard = match kind {

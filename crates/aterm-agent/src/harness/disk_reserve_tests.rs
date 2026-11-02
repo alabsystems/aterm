@@ -6,6 +6,39 @@
 use super::*;
 use crate::harness::disk::tests::Tmp;
 
+#[cfg(target_os = "macos")]
+#[test]
+fn a_lifetime_pass_guard_refuses_changed_file_privacy_and_read_write_access() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let home = aterm_tempfile::tempdir().expect("owned text fixture");
+    let path = pass_lock_for(home.path());
+    let held = take_pass(&path).unwrap().expect("real pass guard");
+    std::fs::write(&path, b"original pass lock text\n").unwrap();
+    let identity = held.validate_for(&path).expect("private read-write guard");
+    for mode in [0o400, 0o200, 0o644] {
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        assert!(held.validate_for(&path).is_err(), "mode {mode:o}");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(held.validate_for(&path).unwrap(), identity);
+    }
+    let alias = path.with_file_name("pass-alias.lock");
+    std::fs::hard_link(&path, &alias).unwrap();
+    assert!(
+        held.validate_for(&path).is_err(),
+        "another name is not private"
+    );
+    std::fs::remove_file(alias).unwrap();
+    let dir = path.parent().unwrap();
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(held.validate_for(&path).is_err(), "open parent refused");
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(held.validate_for(&path).unwrap(), identity);
+    assert_eq!(std::fs::read(&path).unwrap(), b"original pass lock text\n");
+    assert!(take_pass(&path).unwrap().is_none(), "same lock still held");
+    drop(held);
+}
+
 #[test]
 fn the_reserve_is_written_once_and_released_by_one_unlink() {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};

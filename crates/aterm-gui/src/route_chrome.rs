@@ -65,6 +65,8 @@ pub(crate) struct Composed {
     /// The link target caption the frame shows, for the present that accepts it to publish for a
     /// press (`commit_presented_caption`).
     pub(crate) caption: Option<crate::app_mouse::ShownCaption>,
+    /// Arrows answered by the lens pixels this frame includes, for its successful present.
+    pub(crate) lens_input: Option<crate::stats_lens::LensPaintReceipt>,
 }
 
 impl App {
@@ -97,7 +99,7 @@ impl App {
                 }
                 ChromeStep::StatsDeck => {
                     self.splice_stats_deck(wid);
-                    self.fold_stats_deck(wid);
+                    self.stack_or_fold_stats_deck(wid);
                 }
                 ChromeStep::ClaudeFooter => self.splice_claude_footer(wid, plan, route),
                 ChromeStep::AutopilotMenu => self.splice_autopilot_menu(wid),
@@ -115,6 +117,7 @@ impl App {
         {
             crate::icon_scene::apply(&mut window.input_scratch, cell);
         }
+        composed.lens_input = self.stats_lens_input_receipt(wid);
         Some(composed)
     }
 }

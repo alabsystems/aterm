@@ -1,0 +1,33 @@
+# kimi 2.4.0 · MEASURED 2026-10-29, `aterm ctl text` of a private headless aterm (110x32, aterm 0.146.0) running the real Kimi Code, launched by path with a scratch `HOME` and `KIMI_CODE_HOME` whose `config.toml` names one `openai`-type provider at `http://127.0.0.1:<port>/v1` with a fake key (a local stub of the Chat Completions API, crates/aterm-lab), no login · `kimi -c`, then SIGTERM to its pid (its process title is `kimi-code`) at the idle composer: no `Bye!` and no resume hint: the TUI's last frame stays, zsh reports `terminated` over the composer's row (a death by the signal), and `echo $?` reads 143
+
+
+   Ask When Needed mode: OFF
+
+ ❯ lab first turn
+
+ ● Hi! I am the local lab stub, not a model. (reply 1)
+
+ ❯ lab held for ctrl-c with a draft
+
+ ❯ lab run a shell command to reject
+
+ ✗ Ran a command · $ echo lab-kimi-reject
+   Tool "Bash" was not run because the user rejected the approval request.
+
+   Rejected: Running: echo lab-kimi-reject
+
+ ● lab after the rejection
+
+ ❯ lab hit the quota
+
+ ❯ lab hit an auth failure
+
+ ❯ echo "kimi exit=$?"
+
+ ● Hi! I am the local lab stub, not a model. (reply 16)
+
+ ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │ > zsh: terminated  sh /private/tmp/at.lab-501/aterm-gk-kimi-c1dea2b9/runs/gko/kimi.sh                    │
+lab$ echo "kimi exit=$?"
+kimi exit=143
+lab$

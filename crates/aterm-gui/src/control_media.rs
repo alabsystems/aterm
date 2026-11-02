@@ -401,6 +401,13 @@ pub(crate) fn cmd_image_read(term: &Arc<Mutex<Terminal>>, rest: &str) -> String 
     }
 
     if let (Some(rs), Some(cs)) = (r_tok, c_tok) {
+        if rs.is_empty()
+            || cs.is_empty()
+            || !rs.bytes().all(|b| b.is_ascii_digit())
+            || !cs.bytes().all(|b| b.is_ascii_digit())
+        {
+            return "ERR bad args\n".to_string();
+        }
         let (Ok(r), Ok(c)) = (rs.parse::<usize>(), cs.parse::<usize>()) else {
             return "ERR bad args\n".to_string();
         };
@@ -435,17 +442,22 @@ pub(crate) fn cmd_image_read(term: &Arc<Mutex<Terminal>>, rest: &str) -> String 
     }
 
     let placements: Vec<(usize, Vec<(usize, ImageRef)>)> = match r_tok {
-        Some(rs) => match rs.parse::<usize>() {
-            Ok(r) if r < rows => vec![(r, t.images_row(r))],
-            Ok(_) => {
-                return format!(
-                    "ERR out of range: rows 0-{}, cols 0-{}\n",
-                    rows.saturating_sub(1),
-                    cols.saturating_sub(1)
-                );
+        Some(rs) => {
+            if rs.is_empty() || !rs.bytes().all(|b| b.is_ascii_digit()) {
+                return "ERR bad args\n".to_string();
             }
-            Err(_) => return "ERR bad args\n".to_string(),
-        },
+            match rs.parse::<usize>() {
+                Ok(r) if r < rows => vec![(r, t.images_row(r))],
+                Ok(_) => {
+                    return format!(
+                        "ERR out of range: rows 0-{}, cols 0-{}\n",
+                        rows.saturating_sub(1),
+                        cols.saturating_sub(1)
+                    );
+                }
+                Err(_) => return "ERR bad args\n".to_string(),
+            }
+        }
         None => t.images_frame(rows).into_iter().enumerate().collect(),
     };
     let mut seen: std::collections::HashSet<*const ImageData> = std::collections::HashSet::new();
@@ -1054,146 +1066,38 @@ mod window_target_refusal_tests {
         assert_eq!(super::fact_menu_operand("fact-menus"), None);
     }
 
-    /// `@<sid> open autopilot-menu at=<row>,<col> [by=pointer|keys]` takes the aimed session, a
-    /// 0-based cell of its screen and how it was asked for, in either order. NEGATIVE CONTROLS:
-    /// the same words unaimed, and every malformed `at=` or `by=` (a missing, signed, wide or
-    /// third index, a word beside them, either given twice), answer the aimed form's usage;
-    /// without an `at=` or `by=` the words stay the bare form's ([`super::open_target`]).
+    /// Ordinary menus and native pages retain their routes; retired program-coordinate
+    /// popups are rejected as unsupported operands.
     #[test]
-    fn open_autopilot_menu_at_a_cell_takes_its_aim_and_nothing_else() {
-        use crate::app_introspect::AuxTarget;
-        for (words, cell, keyboard) in [
-            ("autopilot-menu at=20,40", (20, 40), false),
-            ("autopilot-menu at=0,0 by=keys", (0, 0), true),
-            ("autopilot-menu by=pointer at=23,99", (23, 99), false),
-            ("AUTOPILOT-MENU  at=65535,7", (65_535, 7), false),
-        ] {
-            assert_eq!(
-                super::program_menu_operand(Some(7), words),
-                Some(Ok(crate::autopilot_menu::ProgramMenu {
-                    session: 7,
-                    cell,
-                    keyboard
-                })),
-                "{words}"
-            );
-        }
-        let usage = "ERR usage: @<sid> open autopilot-menu at=<row>,<col> [by=pointer|keys]\n";
-        assert_eq!(
-            super::program_menu_operand(None, "autopilot-menu at=20,40 by=keys"),
-            Some(Err(usage.to_string())),
-            "unaimed"
-        );
-        for refused in [
-            "autopilot-menu at=",
-            "autopilot-menu at=20",
-            "autopilot-menu at=20,",
-            "autopilot-menu at=,40",
-            "autopilot-menu at=-1,40",
-            "autopilot-menu at=+1,40",
-            "autopilot-menu at=20,40,1",
-            "autopilot-menu at=a,b",
-            "autopilot-menu at=65536,0",
-            "autopilot-menu at=20, 40",
-            "autopilot-menu at=20,40 at=1,1",
-            "autopilot-menu at=20,40 by=",
-            "autopilot-menu at=20,40 by=mouse",
-            "autopilot-menu at=20,40 by=Keys",
-            "autopilot-menu at=20,40 by=keys by=keys",
-            "autopilot-menu at=20,40 by=keys by=pointer",
-            "autopilot-menu by=keys",
-            "autopilot-menu at=20,40 close",
-            "autopilot-menu close at=20,40",
-            "autopilot-menu at=20,40 BY=keys",
-        ] {
-            assert_eq!(
-                super::program_menu_operand(Some(7), refused),
-                Some(Err(usage.to_string())),
-                "{refused}"
-            );
-        }
-        for bare in [
-            "autopilot-menu",
-            "autopilot-menu close",
-            "autopilot-menu bogus",
-            "fact-menu at=20,40",
-            "menu at=20,40",
-            "autopilot-menus at=20,40",
-        ] {
-            assert_eq!(super::program_menu_operand(Some(7), bare), None, "{bare}");
-            assert_eq!(super::program_menu_operand(None, bare), None, "{bare}");
-        }
-        assert_eq!(
-            super::open_target("autopilot-menu"),
-            Ok((AuxTarget::AutopilotMenu, false)),
-            "the bare form opens the front window's focused session's menu as before"
-        );
-    }
-
-    /// `open`'s words reach the main thread as [`super::open_route`] reads them, the program's
-    /// aimed `autopilot-menu at=…` ahead of the bare `<target> [close]`, which would refuse its
-    /// operand: the aimed session, the cell and `by=keys` reach the request whole. NEGATIVE
-    /// CONTROLS: unaimed, the same words answer the aimed form's usage, never `open`'s, which
-    /// codex-alab reads as an aterm without the form; the bare form, `close`, `fact-menu` and
-    /// `app` route as before.
-    #[test]
-    fn open_routes_a_programs_aimed_menu_ahead_of_the_bare_target() {
+    fn open_routes_surfaces_without_program_coordinate_popups() {
         use super::OpenRoute;
         use crate::app_introspect::AuxTarget;
-        use crate::autopilot_menu::ProgramMenu;
-        for (rest, cell, keyboard) in [
-            (" autopilot-menu at=20,40 by=keys ", (20, 40), true),
-            ("autopilot-menu at=3,7 by=pointer", (3, 7), false),
-            ("autopilot-menu at=0,0", (0, 0), false),
-        ] {
-            assert_eq!(
-                super::open_route(Some(9), rest),
-                OpenRoute::ProgramMenu(ProgramMenu {
-                    session: 9,
-                    cell,
-                    keyboard
-                }),
-                "{rest:?}"
-            );
-        }
-        assert_eq!(
-            super::open_route(None, "autopilot-menu at=20,40 by=keys"),
-            OpenRoute::Refused(super::PROGRAM_MENU_USAGE.to_string()),
-            "unaimed: the aimed form's usage"
-        );
-        assert_eq!(
-            super::open_route(Some(9), "autopilot-menu at=20,40 by=mouse"),
-            OpenRoute::Refused(super::PROGRAM_MENU_USAGE.to_string()),
-            "malformed: the aimed form's usage"
-        );
         for (rest, target, close) in [
             ("autopilot-menu", AuxTarget::AutopilotMenu, false),
             ("autopilot-menu close", AuxTarget::AutopilotMenu, true),
             ("tab-menu", AuxTarget::TabMenu, false),
         ] {
-            for session in [None, Some(9)] {
-                assert_eq!(
-                    super::open_route(session, rest),
-                    OpenRoute::Aux { target, close },
-                    "{rest:?} aimed at {session:?}"
-                );
-            }
+            assert_eq!(super::open_route(rest), OpenRoute::Aux { target, close });
         }
         assert_eq!(
-            super::open_route(Some(9), "fact-menu close"),
+            super::open_route("fact-menu close"),
             OpenRoute::FactMenu(None)
         );
         assert_eq!(
-            super::open_route(Some(9), "app about"),
+            super::open_route("app about"),
             OpenRoute::App(crate::app_control::OpenRequest::About)
         );
-        assert!(
-            matches!(
-                super::open_route(Some(9), "autopilot-menu bogus"),
-                OpenRoute::Refused(refusal) if refusal.starts_with("ERR usage: open <")
-            ),
-            "a bare operand it does not know keeps open's usage"
-        );
+        for rest in [
+            "autopilot-menu at=20,40",
+            "autopilot-menu at=20,40 by=keys",
+            "autopilot-menu by=pointer at=0,0",
+            "autopilot-menu bogus",
+        ] {
+            assert!(
+                matches!(super::open_route(rest), OpenRoute::Refused(_)),
+                "{rest:?}"
+            );
+        }
     }
 
     /// One list writes an exhaustive `match` over `Fact` and the facts `Fact::EVERY` is held
@@ -1894,8 +1798,11 @@ fn video_frames_for_instance<'a>(
     let mut count = VIDEO_FRAMES_DEFAULT;
     for t in args {
         if let Some(v) = t.strip_prefix("count=") {
-            match v.parse::<usize>() {
-                Ok(n) if n >= 1 => count = n.min(VIDEO_FRAMES_MAX),
+            match (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| v.parse::<usize>().ok())
+                .flatten()
+            {
+                Some(n) if n >= 1 => count = n.min(VIDEO_FRAMES_MAX),
                 _ => {
                     return format!(
                         "ERR video frames: bad count '{t}' (1 or more; at most {VIDEO_FRAMES_MAX} are listed)\n"
@@ -1939,28 +1846,37 @@ fn parse_video_args(rest: &str) -> Result<VideoArgs, String> {
             "pace" => args.pace = true,
             t => {
                 if let Some(v) = t.strip_prefix("fps=") {
-                    match v.parse::<u32>() {
-                        Ok(n) => args.fps = Some(n.clamp(1, 120)),
-                        Err(_) => {
+                    match (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                        .then(|| v.parse::<u32>().ok())
+                        .flatten()
+                    {
+                        Some(n) => args.fps = Some(n.clamp(1, 120)),
+                        None => {
                             return Err(format!("ERR video: bad fps '{t}' ({VIDEO_USAGE})\n"));
                         }
                     }
                 } else if let Some(v) = t.strip_prefix("budget=") {
-                    match v.parse::<u64>() {
-                        Ok(mib) => args.budget_bytes = (mib.clamp(64, 4096) as usize) << 20,
-                        Err(_) => {
+                    match (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                        .then(|| v.parse::<u64>().ok())
+                        .flatten()
+                    {
+                        Some(mib) => args.budget_bytes = (mib.clamp(64, 4096) as usize) << 20,
+                        None => {
                             return Err(format!("ERR video: bad budget '{t}' ({VIDEO_USAGE})\n"));
                         }
                     }
                 } else {
-                    match t.parse::<f64>() {
-                        Ok(s) if s.is_finite() => args.secs = s,
-                        Ok(_) => {
+                    match (!t.starts_with('+'))
+                        .then(|| t.parse::<f64>().ok())
+                        .flatten()
+                    {
+                        Some(s) if s.is_finite() => args.secs = s,
+                        Some(_) => {
                             return Err(format!(
                                 "ERR video: non-finite duration '{t}' ({VIDEO_USAGE})\n"
                             ));
                         }
-                        Err(_) => {
+                        None => {
                             return Err(format!("ERR video: unknown arg '{t}' ({VIDEO_USAGE})\n"));
                         }
                     }
@@ -2103,7 +2019,8 @@ pub(crate) fn cmd_video(
     match recv_video_reply(
         &rx,
         &mut cancel_on_drop,
-        std::time::Duration::from_secs_f64(args.secs + 120.0),
+        std::time::Duration::try_from_secs_f64(args.secs + 120.0)
+            .unwrap_or_else(|_| std::time::Duration::from_secs(3600)),
     ) {
         Ok(reply) => {
             let (body, retention) = reply.into_parts();
@@ -2210,65 +2127,6 @@ fn fact_menu_operand(trimmed: &str) -> Option<Result<Option<crate::claude_lights
     })
 }
 
-/// The refusal of a malformed or unaimed [`program_menu_operand`].
-const PROGRAM_MENU_USAGE: &str =
-    "ERR usage: @<sid> open autopilot-menu at=<row>,<col> [by=pointer|keys]\n";
-
-/// `autopilot-menu at=<row>,<col> [by=pointer|keys]` aimed at `session`: the Autopilot menu a
-/// program asks for at a 0-based cell of its own screen, `by=keys` lighting the first row as the
-/// bare form does. `None` where no word after the target starts `at=` or `by=` (the bare form,
-/// [`open_target`]'s), else the request, or [`PROGRAM_MENU_USAGE`] for any other words beside
-/// them or for no aimed session.
-fn program_menu_operand(
-    session: Option<u64>,
-    trimmed: &str,
-) -> Option<Result<crate::autopilot_menu::ProgramMenu, String>> {
-    use crate::app_introspect::AuxTarget;
-    let mut words = trimmed.split_whitespace();
-    if AuxTarget::parse(words.next()?) != Some(AuxTarget::AutopilotMenu) {
-        return None;
-    }
-    let words: Vec<&str> = words.collect();
-    if !words
-        .iter()
-        .any(|w| w.starts_with("at=") || w.starts_with("by="))
-    {
-        return None;
-    }
-    let (mut cell, mut keyboard) = (None, None);
-    for word in words {
-        match word.split_once('=') {
-            Some(("at", at)) if cell.is_none() => {
-                cell = Some(
-                    at.split_once(',')
-                        .and_then(|(row, col)| Some((cell_index(row)?, cell_index(col)?))),
-                );
-            }
-            Some(("by", "pointer")) if keyboard.is_none() => keyboard = Some(false),
-            Some(("by", "keys")) if keyboard.is_none() => keyboard = Some(true),
-            _ => return Some(Err(PROGRAM_MENU_USAGE.to_string())),
-        }
-    }
-    Some(
-        cell.flatten()
-            .zip(session)
-            .map(|(cell, session)| crate::autopilot_menu::ProgramMenu {
-                session,
-                cell,
-                keyboard: keyboard.unwrap_or(false),
-            })
-            .ok_or_else(|| PROGRAM_MENU_USAGE.to_string()),
-    )
-}
-
-/// A 0-based cell index: decimal digits alone, no wider than a terminal's `u16` side.
-fn cell_index(digits: &str) -> Option<usize> {
-    if !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    digits.parse::<u16>().ok().map(usize::from)
-}
-
 /// What an `open` line asks of the main thread, read off its words before any hop.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum OpenRoute {
@@ -2276,8 +2134,6 @@ pub(crate) enum OpenRoute {
     App(crate::app_control::OpenRequest),
     /// `open fact-menu <fact>` (`Some`) or `open fact-menu close` (`None`) ([`fact_menu_operand`]).
     FactMenu(Option<crate::claude_lights::Fact>),
-    /// `@<sid> open autopilot-menu at=…` ([`program_menu_operand`]).
-    ProgramMenu(crate::autopilot_menu::ProgramMenu),
     /// `open <target> [close]` ([`open_target`]).
     Aux {
         target: crate::app_introspect::AuxTarget,
@@ -2287,10 +2143,8 @@ pub(crate) enum OpenRoute {
     Refused(String),
 }
 
-/// Route `open`'s words `rest` aimed at `session` (`None` unaimed): `app`, then `fact-menu`,
-/// then the program's `autopilot-menu at=…`, ahead of the bare `<target> [close]` that would
-/// refuse its operand.
-pub(crate) fn open_route(session: Option<u64>, rest: &str) -> OpenRoute {
+/// Route `open`'s words: a native app, fact menu, or auxiliary surface.
+pub(crate) fn open_route(rest: &str) -> OpenRoute {
     let trimmed = rest.trim();
     if trimmed.split_whitespace().next() == Some("app") {
         return match crate::app_control::parse_open(trimmed) {
@@ -2301,17 +2155,13 @@ pub(crate) fn open_route(session: Option<u64>, rest: &str) -> OpenRoute {
     if let Some(operand) = fact_menu_operand(trimmed) {
         return operand.map_or_else(OpenRoute::Refused, OpenRoute::FactMenu);
     }
-    if let Some(request) = program_menu_operand(session, trimmed) {
-        return request.map_or_else(OpenRoute::Refused, OpenRoute::ProgramMenu);
-    }
     open_target(trimmed).map_or_else(OpenRoute::Refused, |(target, close)| OpenRoute::Aux {
         target,
         close,
     })
 }
 
-/// Handles `open` as [`open_route`] read it: a native tab or auxiliary surface opened or closed,
-/// or the Autopilot menu a program asks for at its own cell.
+/// Handles `open` as [`open_route`] read it: a native tab or auxiliary surface opened or closed.
 pub(crate) fn cmd_open(proxy: &EventLoopProxy<Wake>, route: OpenRoute) -> String {
     match route {
         OpenRoute::Refused(refusal) => refusal,
@@ -2327,19 +2177,6 @@ pub(crate) fn cmd_open(proxy: &EventLoopProxy<Wake>, route: OpenRoute) -> String
                 Ok(Ok(())) => format!(
                     "OK {} fact-menu\n",
                     if fact.is_none() { "closed" } else { "opened" }
-                ),
-                Ok(Err(msg)) => format!("ERR {msg}\n"),
-                Err(e) => format!("ERR {e}\n"),
-            }
-        }
-        OpenRoute::ProgramMenu(request) => {
-            match call_main(proxy, |reply| Wake::OpenProgramAutopilotMenu {
-                request,
-                reply,
-            }) {
-                Ok(Ok(())) => format!(
-                    "OK opened {}\n",
-                    crate::app_introspect::AuxTarget::AutopilotMenu.keyword()
                 ),
                 Ok(Err(msg)) => format!("ERR {msg}\n"),
                 Err(e) => format!("ERR {e}\n"),
@@ -2834,8 +2671,11 @@ pub(crate) fn parse_fx_form(rest: &str) -> Result<crate::FxCtlOp, String> {
                     }
                 }
             }
-            "bars" => match v.parse::<u8>() {
-                Ok(b) if (1..=CELEBRATE_MAX_BARS).contains(&b) => bars.replace(b).is_some(),
+            "bars" => match (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| v.parse::<u8>().ok())
+                .flatten()
+            {
+                Some(b) if (1..=CELEBRATE_MAX_BARS).contains(&b) => bars.replace(b).is_some(),
                 _ => {
                     return Err(format!(
                         "{USAGE} (bars= wants 1..={CELEBRATE_MAX_BARS}, got {v:?})"
@@ -3114,6 +2954,9 @@ fn parse_spawn_args(rest: &str) -> Result<SpawnForm, ()> {
                 return Err(());
             }
         } else if let Some(v) = tok.strip_prefix("window=") {
+            if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(());
+            }
             window = Some(v.parse::<u64>().map_err(|_| ())?);
         } else if let Some(v) = tok.strip_prefix("raise=") {
             raise = Some(match v {
@@ -3309,6 +3152,11 @@ pub(crate) fn cmd_spawn(proxy: &EventLoopProxy<Wake>, rest: &str, session: Optio
                     Err(refusal) => return refusal,
                 },
             };
+            let shell = task
+                .is_none()
+                .then(crate::fabric::serving_driver)
+                .flatten()
+                .map(|driver| driver.node);
             let aim = SpawnAim::from_request(window, session);
             let raise = raise_after_spawn(aim.is_aimed(), raise);
             call_main(proxy, |tx| Wake::SpawnSession {
@@ -3318,6 +3166,7 @@ pub(crate) fn cmd_spawn(proxy: &EventLoopProxy<Wake>, rest: &str, session: Optio
                 raise,
                 theme,
                 task,
+                shell,
                 reply: tx,
             })
         }
@@ -3511,6 +3360,7 @@ impl crate::App {
         raise: bool,
         theme: Option<String>,
         task: Option<crate::task_launch::TaskOrder>,
+        shell: Option<String>,
         reply: std::sync::mpsc::Sender<Result<String, String>>,
     ) {
         let theme = match self.spawn_theme(theme) {
@@ -3532,8 +3382,22 @@ impl crate::App {
                 worker: None,
                 ..
             }) => {
-                let then = crate::tab_spawn::TabSpawnThen::Reply { reply, raise };
                 let ask = SpawnPlan::ask(theme, None);
+                let (ask, then) = if let Some(node) = shell {
+                    let then = crate::tab_spawn::TabSpawnThen::Run(Box::new(move |app, landed| {
+                        let landed = landed.and_then(|sid| {
+                            if crate::control::record_driven_shell(&app.store, &sid, &node) {
+                                Ok(sid)
+                            } else {
+                                Err("the plain shell was adopted before ownership could be recorded".to_owned())
+                            }
+                        });
+                        let _ = reply.send(landed);
+                    }));
+                    (ask.for_fleet_shell(), then)
+                } else {
+                    (ask, crate::tab_spawn::TabSpawnThen::Reply { reply, raise })
+                };
                 self.place_spawn(owner, ask, booking, then);
             }
             Ok(mut plan) => {
@@ -3964,11 +3828,31 @@ pub(crate) fn cmd_close(
     match call_main(proxy, |tx| Wake::CloseSession {
         session,
         by,
+        driver: crate::fabric::serving_driver().map(|driver| driver.node),
         reply: tx,
     }) {
         Ok(Ok(())) => format!("OK closed {sid}\n"),
         Ok(Err(e)) => format!("ERR {e}\n"),
         Err(e) => format!("ERR {e}\n"),
+    }
+}
+
+impl crate::App {
+    /// Final close admission on the event loop, after any time spent in the control queue.
+    pub(crate) fn close_control_session(
+        &mut self,
+        session: u64,
+        driver: Option<&str>,
+    ) -> Result<crate::app_tabs::CloseProgress, String> {
+        let admitted =
+            driver.map(|node| crate::control::drive_close_admission(&self.store, session, node));
+        match admitted {
+            Some(None) => Err("drive no longer owns this untouched session".to_owned()),
+            Some(Some(true)) if self.session_foreground_busy(session) => {
+                Err("close refused (a running job in that pane)".to_owned())
+            }
+            _ => self.close_session_by_id(session),
+        }
     }
 }
 

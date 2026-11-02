@@ -163,8 +163,9 @@ pub fn read_marker(pid: u32, marker: &MarkerRef) -> MarkerEvidence {
     if !dir.is_absolute() {
         return MarkerEvidence::Unknown;
     }
+    let our_uid = aterm_uds::peer::our_uid();
     match std::fs::symlink_metadata(dir) {
-        Ok(m) if m.file_type().is_dir() && m.uid() == aterm_uds::peer::our_uid() => {}
+        Ok(m) if m.file_type().is_dir() && m.uid() == our_uid => {}
         _ => return MarkerEvidence::Unknown,
     }
     for owner in ["app", "other", "lab"] {
@@ -173,7 +174,7 @@ pub fn read_marker(pid: u32, marker: &MarkerRef) -> MarkerEvidence {
             let path = dir.join(file);
             match std::fs::symlink_metadata(&path) {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                Ok(m) if m.file_type().is_file() => {
+                Ok(m) if m.file_type().is_file() && m.uid() == our_uid => {
                     if seen {
                         return MarkerEvidence::Dead;
                     }
@@ -265,9 +266,8 @@ impl Server {
                 std::fs::remove_file(&config.socket)?;
             }
         }
-        let listener = UnixListener::bind(&config.socket)?;
         // The keeper spawns every session's program: keep its sockets out of them all.
-        aterm_uds::keep_out_of_children(&listener)?;
+        let listener = aterm_uds::kept_out(|| UnixListener::bind(&config.socket))?;
         prove_socket_is_ours(dir, &config.socket)?;
         listener.set_nonblocking(true)?;
         sys::raise_nofile();
@@ -400,11 +400,10 @@ impl Server {
 
     fn accept_all(&mut self) {
         while self.dialing.len() < self.dial_checks_max {
-            let stream = match self.listener.accept() {
+            let stream = match aterm_uds::kept_out(|| self.listener.accept()) {
                 Ok((s, _)) => s,
                 Err(_) => return,
             };
-            let _ = aterm_uds::keep_out_of_children(&stream);
             let _ = stream.set_nonblocking(false);
             let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
             let _ = stream.set_write_timeout(Some(IO_TIMEOUT));

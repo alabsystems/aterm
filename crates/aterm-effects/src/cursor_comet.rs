@@ -193,7 +193,9 @@ impl CursorComet {
             None => 0.0,
         };
         self.last = Some(now);
-        self.shimmer = (self.shimmer + dt * (SHIMMER_IDLE + SHIMMER_ACTIVE * e)).fract();
+        if dt > 0.0 {
+            self.shimmer = (self.shimmer + dt * (SHIMMER_IDLE + SHIMMER_ACTIVE * e)).fract();
+        }
         let phase = self.shimmer * std::f32::consts::TAU;
         let breathe = 0.5
             + 0.35 * crate::supernova::sin_cos_f32(phase).0
@@ -201,13 +203,15 @@ impl CursorComet {
 
         let mut dark_stops = (0u32, 0u32);
         let styled = if cfg.dark_theme {
+            // A colour the user chose freezes toward white, not ice: the ice's blue is the
+            // style's own, and under a pin no part of the trail keeps it (composed r0's judges).
+            let ice = if cfg.chosen { 0x00FF_FFFF } else { ICE_WHITE };
             let dimmed = lerp_rgb(cfg.color, 0x0000_0000, 0.50);
-            let whitened = lerp_rgb(cfg.color, ICE_WHITE, 0.55);
+            let whitened = lerp_rgb(cfg.color, ice, 0.55);
             dark_stops = (dimmed, whitened);
             ice_ramp_with(
                 cfg.color,
-                dimmed,
-                whitened,
+                (dimmed, whitened, ice),
                 0.34 + 0.40 * e + 0.05 * (breathe - 0.5),
             )
         } else {
@@ -279,7 +283,7 @@ impl CursorComet {
         cfg: &CometConfig,
         under: &mut Vec<GlowQuad>,
     ) {
-        use crate::cursor_glow::{LIGHT_BODY_ALPHA_CAP, light_body_ink, push_ink_ellipse};
+        use crate::cursor_glow::{LIGHT_BODY_ALPHA_CAP, LightGround, push_ink_ellipse};
         let peak = LIGHT_BODY_ALPHA_CAP
             * (0.35 + 0.65 * e)
             * (1.0 - e)
@@ -291,19 +295,16 @@ impl CursorComet {
         let (cw, ch) = (geom.cw as f32, geom.ch as f32);
         let centre = geom.cell_center(cr, cc);
         let key = (
-            cfg.color & 0x00FF_FFFF,
+            (cfg.color & 0x00FF_FFFF) | (u32::from(cfg.chosen) << 24),
             cfg.theme_fg & 0x00FF_FFFF,
             cfg.theme_bg & 0x00FF_FFFF,
         );
         let ink = match self.light_ink_memo {
             Some((k, ink)) if k == key => ink,
             _ => {
-                let ink = light_body_ink(
-                    cfg.color,
-                    cfg.theme_fg,
-                    cfg.theme_bg,
-                    LIGHT_BODY_ALPHA_CAP as u8,
-                );
+                // A colour the user chose keeps its own chroma ([`LightGround::chosen`]).
+                let ground = LightGround::on(cfg.theme_fg, cfg.theme_bg);
+                let ink = if cfg.chosen { ground.chosen() } else { ground }.body_ink(cfg.color);
                 self.light_ink_memo = Some((key, ink));
                 ink
             }
@@ -351,7 +352,8 @@ impl CursorComet {
         let mut di = 0;
         while di < 4 {
             let (rx, cov_x, t0, dt) = COMA_DISCS[di];
-            let ramp = ice_ramp_with(cfg.color, dimmed, whitened, t0 + dt * e);
+            let ice = if cfg.chosen { 0x00FF_FFFF } else { ICE_WHITE };
+            let ramp = ice_ramp_with(cfg.color, (dimmed, whitened, ice), t0 + dt * e);
             let color = if rx >= 1.0 {
                 lerp_rgb(cfg.accent, ramp, 0.45)
             } else {
@@ -455,12 +457,15 @@ impl CursorComet {
         if !rim_glints {
             return;
         }
+        let cov_base = cov_core * (0.35 + 0.65 * e);
+        if cov_base < 1.0 {
+            return;
+        }
         const GLINT_TW_PHASES: [f32; GLINTS as usize] = [0.0, 2.4, 4.8, 7.2];
         const INV_GLINT_TW_SPAN: f32 = 1.0 / 0.45;
         let glint_r = radius * 0.72;
         let arm = ((ch * 0.11) as i32).max(1);
         let two_arm_plus_1 = 2 * arm + 1;
-        let cov_base = cov_core * (0.35 + 0.65 * e);
         let cov_scale = cov_base * INV_GLINT_TW_SPAN;
         let phase2 = phase * 2.0;
         let (sin_p, cos_p) = crate::supernova::sin_cos_f32(phase * 0.55);
@@ -591,9 +596,10 @@ fn ring_row(
 }
 
 /// The ice ramp off the trail's base hue, `t` 0 (cold, dim) to 1 (sunlit,
-/// near-white): dimmed hue, pure hue, whitened hue, [`ICE_WHITE`].
+/// near-white): dimmed hue, pure hue, whitened hue, `ice` ([`ICE_WHITE`], or white under a
+/// chosen colour).
 #[inline]
-const fn ice_ramp_with(color: u32, dimmed: u32, whitened: u32, t: f32) -> u32 {
+const fn ice_ramp_with(color: u32, (dimmed, whitened, ice): (u32, u32, u32), t: f32) -> u32 {
     const INV_045: f32 = 1.0 / 0.45;
     const INV_033: f32 = 1.0 / 0.33;
     const INV_022: f32 = 1.0 / 0.22;
@@ -603,7 +609,7 @@ const fn ice_ramp_with(color: u32, dimmed: u32, whitened: u32, t: f32) -> u32 {
     } else if t < 0.78 {
         lerp_rgb(color, whitened, (t - 0.45) * INV_033)
     } else {
-        lerp_rgb(whitened, ICE_WHITE, (t - 0.78) * INV_022)
+        lerp_rgb(whitened, ice, (t - 0.78) * INV_022)
     }
 }
 

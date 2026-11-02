@@ -22,13 +22,40 @@ use aterm_secrets::{
 use aterm_uds::private_file::{self, PrivateFileError};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
 };
 
+pub mod custody;
+mod directory;
+#[cfg(test)]
+mod recovery_tests;
 mod replay;
+mod replicas;
 mod witness;
 use witness::Witness;
+
+#[cfg(test)]
+type ReplayObserver = Option<Box<dyn FnOnce()>>;
+#[cfg(test)]
+thread_local! {
+    static REPLAY_OBSERVER: std::cell::RefCell<ReplayObserver> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_replay_observer<T>(
+    observe: impl FnOnce() + 'static,
+    read: impl FnOnce() -> T,
+) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            REPLAY_OBSERVER.with(|slot| slot.borrow_mut().take());
+        }
+    }
+    REPLAY_OBSERVER.with(|slot| assert!(slot.borrow_mut().replace(Box::new(observe)).is_none()));
+    let _reset = Reset;
+    read()
+}
 
 const MAX_RECORDS: usize = 8192;
 const MAX_BYTES: usize = 128 * 1024 * 1024;
@@ -81,6 +108,58 @@ const CONFLICT_SUBJECT: &str = "commons/table-conflict/1";
 const ANCHOR_LEN: usize = 5 + super::SCOPE_LEN + 48 + 16;
 const WITNESS_AT: usize = ANCHOR_LEN + 16;
 const CLAIM_LEN: usize = WITNESS_AT + 40;
+
+/// Recovery replicas can receive and relay authenticated records, but never author
+/// one. Their distinct claim/anchor domain and separate location cannot resume the
+/// original writer or stand in for its receipt commitment.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Region {
+    Primary,
+    Recovery,
+}
+impl Region {
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbTableRecovery",
+            action = "WrongScope",
+            project = "aterm_db::table::store::recovery_tests::recovery_transition"
+        )
+    )]
+    fn validate_directory(self, session: &Session<'_>, dir: &Path, scope: Scope) -> Result<()> {
+        if self == Self::Recovery {
+            let expected = session
+                .bootstrap
+                .journal_dir()
+                .parent()
+                .ok_or_else(|| Error::new("Commons recovery custody has no parent"))?
+                .join("recovery/tables")
+                .join(aterm_codec::hex::encode_lower(&scope.digest()));
+            if dir != expected {
+                return Err(Error::new(
+                    "recovery replica has a noncanonical local location",
+                ));
+            }
+        }
+        Ok(())
+    }
+    const fn magic(self) -> &'static [u8; 4] {
+        match self {
+            Self::Primary => b"ATSC",
+            Self::Recovery => b"ATSR",
+        }
+    }
+    fn claims(self, session: &Session<'_>) -> Result<PathBuf> {
+        let primary = claim_dir(session)?;
+        match self {
+            Self::Primary => Ok(primary),
+            Self::Recovery => primary
+                .parent()
+                .map(|parent| parent.join("recovery/table-claims"))
+                .ok_or_else(|| Error::new("Commons recovery custody has no parent")),
+        }
+    }
+}
 
 fn proof_key(actor: Actor, source: Option<Digest>) -> ProofKey {
     let mut key = [0; 81];
@@ -138,12 +217,14 @@ pub struct MetadataEvidence {
     pub catalog_eligible: bool,
 }
 
-/// A local handle for one immutable table generation. Writers are exclusive;
-/// observations retain a verified committed snapshot. The index retains
+/// A local handle for authenticated table data. Writers are exclusive;
+/// observations retain verified committed snapshots. A recovery observation
+/// can include healthy primary data, with both custody claims rechecked. The index retains
 /// authenticated records and previously witnessed quarantined headers.
 /// Plaintext is decrypted per read. Reopen after a control change; open for a
 /// short local batch, then drop the store and session before network I/O.
 pub struct Store {
+    region: Region,
     scope: Scope,
     actor: Actor,
     data_dir: PathBuf,
@@ -159,6 +240,8 @@ pub struct Store {
     records: BTreeMap<Digest, Stored>,
     conflicts: BTreeMap<ProofKey, StoredConflict>,
     observation: [u8; 64],
+    /// A merged reader keeps the other snapshot's custody checks, never its writer.
+    observed_primary: Option<Box<Store>>,
 }
 impl Store {
     /// Create a fresh table identity and enroll this replica before any write.
@@ -169,20 +252,47 @@ impl Store {
     /// discovery. Repeated calls reopen the existing replica; they never reset it.
     /// An interrupted, still-empty first initialization is resumable.
     pub fn join(session: &Session<'_>, dir: &Path, scope: Scope) -> Result<Self> {
+        Self::join_region(session, dir, scope, Region::Primary)
+    }
+
+    pub(crate) fn join_recovery(session: &Session<'_>, dir: &Path, scope: Scope) -> Result<Self> {
+        Self::join_region(session, dir, scope, Region::Recovery)
+    }
+
+    fn join_region(
+        session: &Session<'_>,
+        dir: &Path,
+        scope: Scope,
+        region: Region,
+    ) -> Result<Self> {
+        session.mutation_guard()?;
         session.context(scope)?;
+        region.validate_directory(session, dir, scope)?;
         if !session.has_control_writer() {
             return Err(Error::new(
                 "table enrollment requires a locked control observation",
             ));
         }
-        let claim_dir = claim_dir(session)?;
+        if region == Region::Recovery {
+            let tables = dir
+                .parent()
+                .ok_or_else(|| Error::new("recovery table has no parent"))?;
+            aterm_journal::create_private_dir_durable(
+                tables
+                    .parent()
+                    .ok_or_else(|| Error::new("recovery storage has no parent"))?,
+            )?;
+            aterm_journal::create_private_dir_durable(tables)?;
+        }
+        let claim_dir = region.claims(session)?;
         aterm_journal::create_private_dir_durable(&claim_dir)?;
         let claim_name = claim_name(scope);
         if matches!(
             private_file::read_private(&claim_dir, &claim_name, CLAIM_LEN),
             Err(PrivateFileError::Missing)
         ) {
-            let mut claim = b"ATSC0".to_vec();
+            let mut claim = region.magic().to_vec();
+            claim.push(b'0');
             claim.extend_from_slice(&scope.bytes());
             claim.extend_from_slice(&session.actor());
             claim.extend_from_slice(&crypto::random::<16>()?);
@@ -192,11 +302,27 @@ impl Store {
             // enrollment: publishing a writer depends on its name surviving.
             aterm_durable::durable_dir(&claim_dir)?;
         }
-        Self::open_mode(session, dir, scope, true)
+        Self::open_region(
+            session,
+            dir,
+            scope,
+            true,
+            Capacity::default(),
+            false,
+            region,
+        )
     }
     /// Reopen with the independently retained ready enrollment claim. Missing
     /// custody, anchor, checkpoint or acknowledged bytes is damage, not a join.
     /// An observation session reads without acquiring the data journal's writer.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbTableRecovery",
+            action = "Promote",
+            project = "aterm_db::table::store::recovery_tests::recovery_transition"
+        )
+    )]
     pub fn open(session: &Session<'_>, dir: &Path, scope: Scope) -> Result<Self> {
         if !session.has_control_writer() {
             return Self::observe(session, dir, scope);
@@ -211,6 +337,57 @@ impl Store {
         Self::open_capacity_mode(session, dir, scope, false, Capacity::default(), true)
     }
 
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbTableRecovery",
+            action = "Reopen",
+            project = "aterm_db::table::store::recovery_tests::recovery_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbTableRecovery",
+            action = "Corrupt",
+            project = "aterm_db::table::store::recovery_tests::recovery_transition"
+        )
+    )]
+    pub(crate) fn open_recovery(session: &Session<'_>, dir: &Path, scope: Scope) -> Result<Self> {
+        Self::open_region(
+            session,
+            dir,
+            scope,
+            false,
+            Capacity::default(),
+            !session.has_control_writer(),
+            Region::Recovery,
+        )
+    }
+
+    pub(crate) fn observe_recovery(
+        session: &Session<'_>,
+        dir: &Path,
+        scope: Scope,
+    ) -> Result<Self> {
+        Self::open_region(
+            session,
+            dir,
+            scope,
+            false,
+            Capacity::default(),
+            true,
+            Region::Recovery,
+        )
+    }
+
+    /// Whether this is a recovery replica or combined recovery observation,
+    /// with authoring permanently disabled.
+    #[must_use]
+    pub const fn is_recovery(&self) -> bool {
+        matches!(self.region, Region::Recovery)
+    }
+
     /// An absent table, an empty discovery reservation, or this replica's first
     /// enrollment cut short after its pending claim (`join`, which resumes it) has
     /// no enrolled storage: a pending claim holds no record, because none is
@@ -221,11 +398,21 @@ impl Store {
         dir: &Path,
         scope: Scope,
     ) -> Result<Option<Self>> {
+        Self::observe_if_exists_region(session, dir, scope, Region::Primary)
+    }
+
+    pub(crate) fn observe_if_exists_region(
+        session: &Session<'_>,
+        dir: &Path,
+        scope: Scope,
+        region: Region,
+    ) -> Result<Option<Self>> {
         session.context(scope)?;
-        let claim_dir = claim_dir(session)?;
+        region.validate_directory(session, dir, scope)?;
+        let claim_dir = region.claims(session)?;
         let claim_name = claim_name(scope);
         match private_file::read_private(&claim_dir, &claim_name, CLAIM_LEN) {
-            Ok(claim) if pending_claim(&claim, scope, &session.actor()) => Ok(None),
+            Ok(claim) if pending_claim_region(&claim, scope, &session.actor(), region) => Ok(None),
             Err(PrivateFileError::Missing) => {
                 match private_file::judge_private_dir(dir)? {
                     private_file::PrivateDir::Missing => return Ok(None),
@@ -238,9 +425,27 @@ impl Store {
                     }
                     _ => {}
                 }
-                Self::observe(session, dir, scope).map(Some)
+                Self::open_region(
+                    session,
+                    dir,
+                    scope,
+                    false,
+                    Capacity::default(),
+                    true,
+                    region,
+                )
+                .map(Some)
             }
-            _ => Self::observe(session, dir, scope).map(Some),
+            _ => Self::open_region(
+                session,
+                dir,
+                scope,
+                false,
+                Capacity::default(),
+                true,
+                region,
+            )
+            .map(Some),
         }
     }
     #[cfg_attr(
@@ -365,6 +570,36 @@ impl Store {
         capacity: Capacity,
         read_only: bool,
     ) -> Result<Self> {
+        Self::open_region(
+            session,
+            dir,
+            scope,
+            initialize,
+            capacity,
+            read_only,
+            Region::Primary,
+        )
+    }
+
+    fn open_region(
+        session: &Session<'_>,
+        dir: &Path,
+        scope: Scope,
+        initialize: bool,
+        capacity: Capacity,
+        read_only: bool,
+        region: Region,
+    ) -> Result<Self> {
+        // Keep each admitted vault source stable through local replay. Live
+        // authority is checked before replay, before finalization and before
+        // returning the store. Every record still authenticates its signed
+        // envelope and historical evidence. No guard escapes this open or
+        // crosses network I/O.
+        let sources = session.local_source_reads()?;
+        if !read_only {
+            session.mutation_guard()?;
+        }
+        region.validate_directory(session, dir, scope)?;
         if capacity.operations > MAX_RECORDS
             || capacity.bytes > MAX_BYTES
             || capacity.conflicts > MAX_CONFLICTS
@@ -372,30 +607,13 @@ impl Store {
             return Err(Error::new("table capacity exceeds custody bounds"));
         }
         session.context(scope)?;
-        let claim_dir = claim_dir(session)?;
+        let claim_dir = region.claims(session)?;
         let claim_name = claim_name(scope);
         let mut claim = private_file::read_private(&claim_dir, &claim_name, CLAIM_LEN)
             .map_err(|_| Error::new("table enrollment claim is missing or damaged"))?;
-        if claim.len() != CLAIM_LEN
-            || &claim[..4] != b"ATSC"
-            || !matches!(claim[4], b'0' | b'1')
-            || claim[5..5 + super::SCOPE_LEN] != scope.bytes()
-            || claim[5 + super::SCOPE_LEN..5 + super::SCOPE_LEN + 48] != session.actor()
-        {
-            return Err(Error::new(
-                "table enrollment claim has another scope or writer",
-            ));
-        }
-        let pending = claim[4] == b'0';
-        if pending && claim[ANCHOR_LEN..] != [0; 56] {
-            return Err(Error::new(
-                "pending table enrollment carries committed state",
-            ));
-        }
-        if !pending && claim[ANCHOR_LEN..WITNESS_AT] != directory_identity(dir)? {
-            return Err(Error::new(
-                "table directory was replaced or copied; explicit recovery required",
-            ));
+        let pending = validate_claim_region(session, scope, &claim, region)?;
+        if !pending {
+            directory::check(dir, &claim_dir, &claim_name, &claim)?;
         }
         if pending && !initialize {
             return Err(Error::new("table enrollment is not yet complete"));
@@ -439,6 +657,7 @@ impl Store {
             (Some(log), replay)
         };
         let mut store = Self {
+            region,
             scope,
             actor: session.actor(),
             data_dir: dir.into(),
@@ -454,53 +673,70 @@ impl Store {
             records: BTreeMap::new(),
             conflicts: BTreeMap::new(),
             observation: session.observation()?,
+            observed_primary: None,
         };
         // The complete acknowledged prefix is verified before any opaque
         // record is considered for quarantine. The tail has no such authority.
         store.witness = replay.witness;
-        for entry in replay.entries {
-            let replay::Entry {
-                receipt,
-                wire,
-                conflict,
-            } = entry;
-            if conflict {
-                let conflict = Conflict::restore(session, scope, &wire)?;
-                store.admit_proof(&conflict)?;
-                if let Some(source) = conflict.discarded() {
-                    store
-                        .index
-                        .insert(source.header.clone())
-                        .map_err(|_| Error::new("invalid discarded-source header"))?;
+        #[cfg(test)]
+        if let Some(observe) = REPLAY_OBSERVER.with(|slot| slot.borrow_mut().take()) {
+            observe();
+        }
+        if !replay.entries.is_empty() {
+            sources.with_store_replay(scope, replay.entries.len(), |batch| {
+                for entry in replay.entries {
+                    let replay::Entry {
+                        receipt,
+                        wire,
+                        conflict,
+                    } = entry;
+                    if conflict {
+                        let conflict = Conflict::restore(session, scope, &wire)?;
+                        store.admit_proof(&conflict)?;
+                        if let Some(source) = conflict.discarded() {
+                            store
+                                .index
+                                .insert(source.header.clone())
+                                .map_err(|_| Error::new("invalid discarded-source header"))?;
+                        }
+                        if store
+                            .conflicts
+                            .insert(conflict.key(), StoredConflict { conflict, receipt })
+                            .is_some()
+                        {
+                            return Err(Error::new("duplicate physical table conflict"));
+                        }
+                    } else {
+                        let stored = replay::restore(batch, receipt, wire, acknowledged.count)?;
+                        store.admit(&stored.header, stored.wire.len())?;
+                        store.operation_bytes += stored.wire.len();
+                        store
+                            .index
+                            .insert(stored.header.clone())
+                            .map_err(|_| Error::new("invalid table replay header"))?;
+                        if store.records.insert(receipt.id, stored).is_some() {
+                            return Err(Error::new("duplicate physical table record"));
+                        }
+                    }
                 }
-                if store
-                    .conflicts
-                    .insert(conflict.key(), StoredConflict { conflict, receipt })
-                    .is_some()
-                {
-                    return Err(Error::new("duplicate physical table conflict"));
-                }
-            } else {
-                let stored = replay::restore(session, scope, receipt, wire, acknowledged.count)?;
-                store.admit(&stored.header, stored.wire.len())?;
-                store.operation_bytes += stored.wire.len();
-                store
-                    .index
-                    .insert(stored.header.clone())
-                    .map_err(|_| Error::new("invalid table replay header"))?;
-                if store.records.insert(receipt.id, stored).is_some() {
-                    return Err(Error::new("duplicate physical table record"));
-                }
-            }
+                Ok(())
+            })?;
+        }
+        session.context(scope)?;
+        if !read_only {
+            session.mutation_guard()?;
         }
         if let Some(log) = &mut store.log {
             log.finish_open()?;
+            if pending {
+                store.claim[ANCHOR_LEN..WITNESS_AT].copy_from_slice(&directory::legacy(dir)?);
+            }
             if pending || store.witness != acknowledged {
-                store.claim[ANCHOR_LEN..WITNESS_AT].copy_from_slice(&directory_identity(dir)?);
                 store.publish_witness(store.witness)?;
             }
             // Complete a possible earlier rename whose directory barrier failed.
             aterm_durable::durable_dir(&store.claim_dir)?;
+            directory::remember(dir, &store.claim_dir, &store.claim_name, &store.claim)?;
         }
         store.check(session)?;
         Ok(store)
@@ -510,9 +746,15 @@ impl Store {
     }
     /// Stable identity of this local enrollment, excluding its advancing
     /// receipt witness. An application pin can detect replacement custody even
-    /// when generic discovery has already enrolled an empty table again.
+    /// when generic discovery has already enrolled an empty table again. A
+    /// combined observation has no single enrollment identity.
     pub(crate) fn custody_id(&self, session: &Session<'_>) -> Result<Digest> {
         self.check(session)?;
+        if self.observed_primary.is_some() {
+            return Err(Error::new(
+                "combined table observation has no single custody identity",
+            ));
+        }
         let mut hash = aterm_digest::Sha256::new();
         hash.update(b"aterm/commons/table-custody/1\0");
         hash.update(&self.claim[..WITNESS_AT]);
@@ -526,17 +768,33 @@ impl Store {
             project = "aterm_db::table::store::replay::tests::quarantine_transition"
         )
     )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbTableRecovery",
+            action = "ChangedControl",
+            project = "aterm_db::table::store::recovery_tests::recovery_transition"
+        )
+    )]
     fn check(&self, session: &Session<'_>) -> Result<()> {
         session.context(self.scope)?;
         if self.actor != session.actor()
             || self.observation != session.observation()?
-            || self.claim[ANCHOR_LEN..WITNESS_AT] != directory_identity(&self.data_dir)?
             || self.poisoned
             || self.log.as_ref().is_some_and(Log::is_poisoned)
         {
             return Err(Error::new(
                 "table custody changed or append is uncertain; reopen",
             ));
+        }
+        directory::check(
+            &self.data_dir,
+            &self.claim_dir,
+            &self.claim_name,
+            &self.claim,
+        )?;
+        if let Some(primary) = &self.observed_primary {
+            primary.check(session)?;
         }
         let current = private_file::read_private(&self.claim_dir, &self.claim_name, CLAIM_LEN).ok();
         if current.as_deref() == Some(&self.claim) {
@@ -605,7 +863,16 @@ impl Store {
             project = "aterm_db::table::store::replay::tests::conflict::reselection_transition"
         )
     )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbTableRecovery",
+            action = "Receive",
+            project = "aterm_db::table::store::recovery_tests::recovery_transition"
+        )
+    )]
     pub fn ingest(&mut self, session: &Session<'_>, wire: &[u8]) -> Result<Receipt> {
+        session.mutation_guard()?;
         self.check(session)?;
         let record = session.authenticate(self.scope, wire)?;
         operation_policy(self.scope, record.header(), record.payload().len())?;
@@ -683,6 +950,7 @@ impl Store {
         )
     )]
     pub fn ingest_conflict(&mut self, session: &Session<'_>, wire: &[u8]) -> Result<Receipt> {
+        session.mutation_guard()?;
         self.check(session)?;
         let conflict = Conflict::authenticate(session, self.scope, wire)?;
         let key = conflict.key();
@@ -919,13 +1187,62 @@ impl Store {
         )
     )]
     pub fn commit_catalog(&mut self, session: &Session<'_>, payload: &[u8]) -> Result<Receipt> {
-        let projection = self.catalog_projection(session)?;
-        let parents = if self.scope == crate::catalog::scope(self.scope.trust()) {
-            BTreeSet::new()
+        self.commit_catalog_with_merges(session, payload, || {
+            Err(Error::new(
+                "table frontier requires a bounded merge before writing",
+            ))
+        })
+    }
+
+    /// Join a wide frontier using application no-ops before committing the edit.
+    /// The payload factory must produce a command with no application effects.
+    /// Each merge is independently durable; an interrupted caller can resume
+    /// from the reduced frontier without repeating a completed application edit.
+    pub(crate) fn commit_catalog_with_merges(
+        &mut self,
+        session: &Session<'_>,
+        payload: &[u8],
+        mut merge: impl FnMut() -> Result<Vec<u8>>,
+    ) -> Result<Receipt> {
+        loop {
+            let projection = self.catalog_projection(session)?;
+            let fits = self.catalog_append_bound(&projection) == 1;
+            let parents = if self.scope == crate::catalog::scope(self.scope.trust()) {
+                BTreeSet::new()
+            } else {
+                projection.heads
+            };
+            if fits {
+                return self.commit_from(session, payload, &projection.ordered, parents);
+            }
+            // commit_from also names this writer's predecessor. Reserve one
+            // parent for it even when another head already descends from it.
+            let joined = parents.into_iter().take(MAX_PARENTS - 1).collect();
+            self.commit_from(session, &merge()?, &projection.ordered, joined)?;
+        }
+    }
+
+    /// Reserve the final record and enough joins for any generated record ids.
+    /// Each join replaces at least `MAX_PARENTS - 1` heads with one head. The
+    /// writer's predecessor can remove another head, but admission cannot rely
+    /// on its position in the next record-id ordering.
+    fn catalog_append_bound(&self, projection: &Projection) -> usize {
+        let heads = &projection.heads;
+        if self.scope == crate::catalog::scope(self.scope.trust())
+            || heads.len() < MAX_PARENTS
+            || (heads.len() == MAX_PARENTS
+                && self
+                    .previous(&projection.ordered)
+                    .is_none_or(|previous| heads.contains(&previous.id)))
+        {
+            1
         } else {
-            projection.heads
-        };
-        self.commit_from(session, payload, &projection.ordered, parents)
+            1 + heads
+                .len()
+                .saturating_sub(MAX_PARENTS)
+                .div_ceil(MAX_PARENTS - 2)
+                .max(1)
+        }
     }
 
     /// Append against complete retained liability evidence, including history
@@ -1018,6 +1335,38 @@ impl Store {
         self.commit_from(session, payload, &retained, BTreeSet::new())
     }
 
+    fn previous(&self, retained: &[Digest]) -> Option<&Header> {
+        retained
+            .iter()
+            .filter_map(|id| self.index.get(id))
+            .filter(|header| header.actor == self.actor)
+            .max_by_key(|header| header.sequence)
+    }
+
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbTableRecovery",
+            action = "AuthorEmpty",
+            project = "aterm_db::table::store::recovery_tests::recovery_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbTableRecovery",
+            action = "AuthorReceived",
+            project = "aterm_db::table::store::recovery_tests::recovery_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbTableRecovery",
+            action = "AuthorRestart",
+            project = "aterm_db::table::store::recovery_tests::recovery_transition"
+        )
+    )]
     fn commit_from(
         &mut self,
         session: &Session<'_>,
@@ -1026,6 +1375,11 @@ impl Store {
         mut parents: BTreeSet<Digest>,
     ) -> Result<Receipt> {
         self.check(session)?;
+        if self.region == Region::Recovery {
+            return Err(Error::new(
+                "recovery replica cannot author records; original writer custody remains fenced",
+            ));
+        }
         session.writer()?;
         if self.conflicted().contains(&self.actor) {
             return Err(Error::new(
@@ -1044,11 +1398,7 @@ impl Store {
                 "local table writer has unavailable source history",
             ));
         }
-        let previous = retained
-            .iter()
-            .filter_map(|id| self.index.get(id))
-            .filter(|header| header.actor == self.actor)
-            .max_by_key(|header| header.sequence);
+        let previous = self.previous(retained);
         let sequence = previous
             .map_or(Some(1), |h| h.sequence.checked_add(1))
             .ok_or_else(|| Error::new("table writer sequence exhausted"))?;
@@ -1150,81 +1500,97 @@ impl Store {
     /// causal dependents. Old keys and author timestamps cannot bypass demotion.
     /// This snapshot is for catalog data only, never outstanding budget liability.
     pub fn catalog(&self, session: &Session<'_>) -> Result<Vec<Record>> {
-        self.catalog_projection(session)?
-            .ordered
-            .iter()
-            .map(|id| session.authenticate(self.scope, &self.records[id].wire))
-            .collect()
+        session.with_read_batch(self.scope, |batch| {
+            let records = self
+                .catalog_projection(session)?
+                .ordered
+                .iter()
+                .map(|id| batch.authenticate(&self.records[id].wire))
+                .collect::<Result<Vec<_>>>()?;
+            self.check(session)?;
+            Ok(records)
+        })
     }
     /// Keep negative application evidence when membership or causal filtering
     /// withdraws a positive record. Quarantined payloads stay unavailable, with
     /// their independently witnessed header metadata. Callers must not interpret
     /// an unavailable payload as absence of a prior request or restriction.
     pub fn metadata_evidence(&self, session: &Session<'_>) -> Result<Vec<MetadataEvidence>> {
-        let eligible: BTreeSet<_> = self
-            .catalog_projection(session)?
-            .ordered
-            .into_iter()
-            .collect();
-        let mut evidence = self
-            .records
-            .values()
-            .map(|stored| {
-                let record = if stored.quarantine.is_none() {
-                    Some(session.authenticate(self.scope, &stored.wire)?)
-                } else {
-                    None
-                };
-                let (roster, epoch, authored_ms) = match &record {
-                    Some(record) => (*record.roster(), record.epoch(), record.authored_ms()),
-                    None => stored
-                        .quarantine
-                        .expect("unavailable payload has witnessed quarantine metadata"),
-                };
-                Ok(MetadataEvidence {
-                    header: stored.header.clone(),
-                    receipt: stored.receipt,
-                    roster,
-                    epoch,
-                    authored_ms,
-                    record,
-                    catalog_eligible: eligible.contains(&stored.header.id),
+        self.metadata_with_append_bound(session)
+            .map(|(evidence, _)| evidence)
+    }
+
+    /// Read application evidence and its next append's conservative record
+    /// count from the same membership and causal projection.
+    pub(crate) fn metadata_with_append_bound(
+        &self,
+        session: &Session<'_>,
+    ) -> Result<(Vec<MetadataEvidence>, usize)> {
+        session.with_read_batch(self.scope, |batch| {
+            let projection = self.catalog_projection(session)?;
+            let append_bound = self.catalog_append_bound(&projection);
+            let eligible: BTreeSet<_> = projection.ordered.into_iter().collect();
+            let mut evidence = self
+                .records
+                .values()
+                .map(|stored| {
+                    let record = if stored.quarantine.is_none() {
+                        Some(batch.authenticate(&stored.wire)?)
+                    } else {
+                        None
+                    };
+                    let (roster, epoch, authored_ms) = match &record {
+                        Some(record) => (*record.roster(), record.epoch(), record.authored_ms()),
+                        None => stored
+                            .quarantine
+                            .expect("unavailable payload has witnessed quarantine metadata"),
+                    };
+                    Ok(MetadataEvidence {
+                        header: stored.header.clone(),
+                        receipt: stored.receipt,
+                        roster,
+                        epoch,
+                        authored_ms,
+                        record,
+                        catalog_eligible: eligible.contains(&stored.header.id),
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        for stored in self.conflicts.values() {
-            let Some(source) = stored.conflict.discarded() else {
-                continue;
-            };
-            if self.records.contains_key(&source.header.id) {
-                continue;
-            }
-            let record = if stored.conflict.active() {
-                None
-            } else {
-                let Some(record) = session.negative_record(
-                    self.scope,
-                    stored
-                        .conflict
-                        .source_for(&source.header.id)
-                        .ok_or_else(|| Error::new("discarded source is missing"))?,
-                )?
-                else {
+                .collect::<Result<Vec<_>>>()?;
+            for stored in self.conflicts.values() {
+                let Some(source) = stored.conflict.discarded() else {
                     continue;
                 };
-                Some(record)
-            };
-            evidence.push(MetadataEvidence {
-                header: source.header.clone(),
-                receipt: stored.receipt,
-                roster: source.roster,
-                epoch: source.epoch,
-                authored_ms: source.authored_ms,
-                record,
-                catalog_eligible: false,
-            });
-        }
-        Ok(evidence)
+                if self.records.contains_key(&source.header.id) {
+                    continue;
+                }
+                let record = if stored.conflict.active() {
+                    None
+                } else {
+                    let Some(record) = session.negative_record(
+                        self.scope,
+                        stored
+                            .conflict
+                            .source_for(&source.header.id)
+                            .ok_or_else(|| Error::new("discarded source is missing"))?,
+                    )?
+                    else {
+                        continue;
+                    };
+                    Some(record)
+                };
+                evidence.push(MetadataEvidence {
+                    header: source.header.clone(),
+                    receipt: stored.receipt,
+                    roster: source.roster,
+                    epoch: source.epoch,
+                    authored_ms: source.authored_ms,
+                    record,
+                    catalog_eligible: false,
+                });
+            }
+            self.check(session)?;
+            Ok((evidence, append_bound))
+        })
     }
     /// Local operation inventory, including pending, forked and quarantined
     /// records. Certificates have a separate inventory. Neither is a claim of
@@ -1577,11 +1943,41 @@ pub(crate) fn claim_dir(session: &Session<'_>) -> Result<PathBuf> {
         .ok_or_else(|| Error::new("Commons custody has no parent"))
 }
 
+fn validate_claim(session: &Session<'_>, scope: Scope, claim: &[u8]) -> Result<bool> {
+    validate_claim_region(session, scope, claim, Region::Primary)
+}
+
+fn validate_claim_region(
+    session: &Session<'_>,
+    scope: Scope,
+    claim: &[u8],
+    region: Region,
+) -> Result<bool> {
+    if claim.len() != CLAIM_LEN
+        || &claim[..4] != region.magic()
+        || !matches!(claim[4], b'0' | b'1')
+        || claim[5..5 + super::SCOPE_LEN] != scope.bytes()
+        || claim[5 + super::SCOPE_LEN..5 + super::SCOPE_LEN + 48] != session.actor()
+    {
+        return Err(Error::new(
+            "table enrollment claim has another scope or writer",
+        ));
+    }
+    let pending = claim[4] == b'0';
+    if pending && claim[ANCHOR_LEN..] != [0; 56] {
+        return Err(Error::new(
+            "pending table enrollment carries committed state",
+        ));
+    }
+    Ok(pending)
+}
+
 /// Whether `claim` is `writer`'s well-formed pending enrollment claim for `scope`, exactly as
 /// `Store::join` writes one before the table's journal exists.
-fn pending_claim(claim: &[u8], scope: Scope, writer: &[u8]) -> bool {
+fn pending_claim_region(claim: &[u8], scope: Scope, writer: &[u8], region: Region) -> bool {
     claim.len() == CLAIM_LEN
-        && claim[..5] == *b"ATSC0"
+        && &claim[..4] == region.magic()
+        && claim[4] == b'0'
         && claim[5..5 + super::SCOPE_LEN] == scope.bytes()
         && claim[5 + super::SCOPE_LEN..5 + super::SCOPE_LEN + 48] == *writer
         && claim[ANCHOR_LEN..].iter().all(|byte| *byte == 0)
@@ -1590,15 +1986,4 @@ fn pending_claim(claim: &[u8], scope: Scope, writer: &[u8]) -> bool {
 /// The file name of `scope`'s enrollment claim inside [`claim_dir`].
 pub(crate) fn claim_name(scope: Scope) -> String {
     format!("{}.claim", aterm_codec::hex::encode_lower(&scope.digest()))
-}
-
-fn directory_identity(dir: &Path) -> Result<[u8; 16]> {
-    let metadata = std::fs::symlink_metadata(dir)?;
-    if !metadata.is_dir() {
-        return Err(Error::new("table directory is not a directory"));
-    }
-    let mut bytes = [0; 16];
-    bytes[..8].copy_from_slice(&metadata.dev().to_le_bytes());
-    bytes[8..].copy_from_slice(&metadata.ino().to_le_bytes());
-    Ok(bytes)
 }

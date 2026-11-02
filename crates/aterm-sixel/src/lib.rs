@@ -398,68 +398,63 @@ impl SixelDecoder {
         if count == 0 {
             return;
         }
+        let next_x = self.x.saturating_add(count).min(SIXEL_MAX_DIMENSION);
         let bits = bits & 0x3F;
         if bits == 0 {
-            self.x = self.x.saturating_add(count).min(SIXEL_MAX_DIMENSION);
-            self.max_x = self.max_x.max(self.x.min(SIXEL_MAX_DIMENSION));
+            self.x = next_x;
+            self.max_x = self.max_x.max(next_x);
             return;
         }
         let color = self.palette.get(self.current_color).copied().unwrap_or(0) & 0x00FF_FFFF;
         let highest_row = (u8::BITS - 1 - bits.leading_zeros()) as usize;
         let want_y = self.band_top.saturating_add(highest_row);
+        let extent_y = want_y.saturating_add(1).min(SIXEL_MAX_DIMENSION);
         self.ensure_capacity(self.x.saturating_add(count).saturating_sub(1), want_y);
         let stride = self.alloc_width;
-        if stride == 0 {
-            return;
-        }
-        if self.raster.len() == stride.saturating_mul(self.alloc_height) {
-            let run_end = self.x.saturating_add(count).min(self.alloc_width);
-            if run_end > self.x {
-                let pixel = 0xFF00_0000 | color;
-                let mut painted_max_y = 0usize;
-                if run_end.saturating_sub(self.x) == 1 {
-                    for (row, mask) in SIXEL_ROW_MASKS.into_iter().enumerate() {
-                        if bits & mask == 0 {
-                            continue;
+        if stride > 0 {
+            if self.raster.len() == stride.saturating_mul(self.alloc_height) {
+                let run_end = self.x.saturating_add(count).min(self.alloc_width);
+                if run_end > self.x {
+                    let pixel = 0xFF00_0000 | color;
+                    if run_end.saturating_sub(self.x) == 1 {
+                        for (row, mask) in SIXEL_ROW_MASKS.into_iter().enumerate() {
+                            if bits & mask == 0 {
+                                continue;
+                            }
+                            let py = self.band_top.saturating_add(row);
+                            if py >= self.alloc_height {
+                                break;
+                            }
+                            let idx = py.saturating_mul(stride).saturating_add(self.x);
+                            if let Some(slot) = self.raster.get_mut(idx) {
+                                *slot = pixel;
+                            }
                         }
-                        let py = self.band_top.saturating_add(row);
-                        if py >= self.alloc_height {
-                            break;
-                        }
-                        let idx = py.saturating_mul(stride).saturating_add(self.x);
-                        if let Some(slot) = self.raster.get_mut(idx) {
-                            *slot = pixel;
-                            painted_max_y = painted_max_y.max(py.saturating_add(1));
-                        }
-                    }
-                } else {
-                    for (row, mask) in SIXEL_ROW_MASKS.into_iter().enumerate() {
-                        if bits & mask == 0 {
-                            continue;
-                        }
-                        let py = self.band_top.saturating_add(row);
-                        if py >= self.alloc_height {
-                            break;
-                        }
-                        let base = py.saturating_mul(stride);
-                        let s = base.saturating_add(self.x);
-                        let e = base.saturating_add(run_end);
-                        if let Some(slice) = self.raster.get_mut(s..e) {
-                            slice.fill(pixel);
-                            painted_max_y = painted_max_y.max(py.saturating_add(1));
+                    } else {
+                        for (row, mask) in SIXEL_ROW_MASKS.into_iter().enumerate() {
+                            if bits & mask == 0 {
+                                continue;
+                            }
+                            let py = self.band_top.saturating_add(row);
+                            if py >= self.alloc_height {
+                                break;
+                            }
+                            let base = py.saturating_mul(stride);
+                            let s = base.saturating_add(self.x);
+                            let e = base.saturating_add(run_end);
+                            if let Some(slice) = self.raster.get_mut(s..e) {
+                                slice.fill(pixel);
+                            }
                         }
                     }
                 }
-                if painted_max_y > 0 {
-                    self.max_x = self.max_x.max(run_end);
-                    self.max_y = self.max_y.max(painted_max_y);
-                }
+            } else {
+                self.paint_pixelwise(bits, count, color, stride);
             }
-        } else {
-            self.paint_pixelwise(bits, count, color, stride);
         }
-        self.x = self.x.saturating_add(count).min(SIXEL_MAX_DIMENSION);
-        self.max_x = self.max_x.max(self.x.min(SIXEL_MAX_DIMENSION));
+        self.x = next_x;
+        self.max_x = self.max_x.max(next_x);
+        self.max_y = self.max_y.max(extent_y);
     }
 
     /// Cold fallback per-pixel paint when `raster.len() != alloc_width * alloc_height`.
@@ -482,8 +477,6 @@ impl SixelDecoder {
                 let idx = py.saturating_mul(stride).saturating_add(px);
                 if let Some(slot) = self.raster.get_mut(idx) {
                     *slot = 0xFF00_0000 | color;
-                    self.max_x = self.max_x.max(px.saturating_add(1));
-                    self.max_y = self.max_y.max(py.saturating_add(1));
                 }
             }
         }
@@ -521,8 +514,29 @@ impl SixelDecoder {
                     .max(need_w)
                     .max(self.alloc_width)
             }
-        } else {
+        } else if self
+            .alloc_width
+            .checked_mul(new_h)
+            .is_some_and(|n| n <= SIXEL_MAX_PIXELS)
+        {
             self.alloc_width
+        } else {
+            // Compact to the geometric mean of the used width and the widest
+            // stride this height allows, so both dimensions keep room and the
+            // next re-stride waits for the painted box to grow by that ratio.
+            // Compacting to the widest stride left no height room: every band
+            // below re-copied the whole raster.
+            let used_w = self.max_x.max(need_w);
+            let per_h = if let Some(h) = NonZeroUsize::new(new_h) {
+                SIXEL_MAX_PIXELS / h
+            } else {
+                SIXEL_MAX_PIXELS
+            };
+            per_h
+                .min(SIXEL_MAX_DIMENSION)
+                .checked_mul(used_w)
+                .map_or(used_w, usize::isqrt)
+                .max(used_w)
         };
         let new_len = new_w.checked_mul(new_h).unwrap_or(0);
         if new_len == 0 || new_len > SIXEL_MAX_PIXELS {
@@ -539,8 +553,9 @@ impl SixelDecoder {
             let dst_rows = new_raster.chunks_mut(new_w);
             let src_rows = self.raster.chunks(old_stride);
             for (dst_row, src_row) in dst_rows.zip(src_rows) {
-                for (d, s) in dst_row.iter_mut().zip(src_row.iter()) {
-                    *d = *s;
+                let kept = dst_row.len().min(src_row.len());
+                if let (Some(d), Some(s)) = (dst_row.get_mut(..kept), src_row.get(..kept)) {
+                    d.copy_from_slice(s);
                 }
             }
         }

@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 
 use super::journal::{Journal, json_str};
 use super::policy::sleeps::{Boot, SleepStamp};
-use super::policy::turn_end::{Conversation, Kept, LimitTry, Replies};
+use super::policy::turn_end::{
+    Conversation, Kept, LandBooks, LimitTry, OffStood, Replies, WallPass,
+};
 use crate::harness::profile::AccountKey;
 
 /// How much of a command a row keeps.
@@ -185,7 +187,8 @@ impl Row<'_> {
         self.to_json_scoped_by(ts, sid, count, captured_boot, conversation, None)
     }
 
-    /// `Self::to_json_scoped`, and where `program` is given, the program the wall was met under ([`PROGRAM`]), whatever the conversation: a hostless wall names it too.
+    /// `Self::to_json_scoped`, with the wall's program or the program whose turns a point row's
+    /// short streak counts ([`PROGRAM`]); a hostless row can name it too.
     pub(crate) fn to_json_scoped_by(
         &self,
         ts: i64,
@@ -455,9 +458,12 @@ fn cut_rows_with_work(
     work: &mut CutWork,
 ) -> Option<Vec<String>> {
     let (held, start) = held_rows(rows)?;
-    let Ok(older) = older_kept(path, &held, start, read, work) else {
+    let Ok(mut older) = older_kept(path, &held, start, read, work) else {
         return Some(held);
     };
+    older.extend(go_ahead_hours_kept(&held, start));
+    older.sort_unstable();
+    older.dedup();
     Some(
         held.into_iter()
             .enumerate()
@@ -468,6 +474,24 @@ fn cut_rows_with_work(
 }
 
 pub(crate) const HELD_BYTES: usize = 16 << 20;
+
+/// Keep the row the hour reader would take for each session, including one older than the
+/// ordinary row window. Clock order need not be append order; equal starts keep the later row.
+fn go_ahead_hours_kept(rows: &[String], start: usize) -> Vec<usize> {
+    let mut newest = std::collections::BTreeMap::new();
+    for (index, row) in rows.iter().enumerate() {
+        if let Some((sid, from)) = go_ahead_hour_row(row) {
+            let previous = newest.entry(sid).or_insert((from, index));
+            if from >= previous.0 {
+                *previous = (from, index);
+            }
+        }
+    }
+    newest
+        .into_values()
+        .filter_map(|(_, index)| (index < start).then_some(index))
+        .collect()
+}
 
 fn held_rows(rows: &mut dyn Iterator<Item = String>) -> Option<(Vec<String>, usize)> {
     let mut newest = std::collections::VecDeque::new();
@@ -490,7 +514,10 @@ fn held_rows(rows: &mut dyn Iterator<Item = String>) -> Option<(Vec<String>, usi
             if record_of(&row).is_none() {
                 plain -= 1;
             }
-            if LandWalk::reads(&row) || SwitchWalk::reads(&row) || row.contains(RULE_EARLIER_BOOKS)
+            if LandWalk::reads(&row)
+                || SwitchWalk::reads(&row)
+                || row.contains(RULE_EARLIER_BOOKS)
+                || row.contains(super::policy::turn_end::RULE_GO_AHEAD_HOUR)
             {
                 older_bytes = older_bytes.checked_add(row.len())?;
                 older.push(row);
@@ -995,14 +1022,30 @@ pub struct Typed {
     pub rule: String,
 }
 
+/// A best-effort display query. Decisions about carrying a conversation use
+/// [`read_typed_texts`] so unreadable evidence is not mistaken for no acts.
 #[must_use]
 pub fn typed_texts(path: &Path, sid: Option<&str>) -> Vec<Typed> {
-    let Ok(body) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
+    read_typed_texts(path, sid).unwrap_or_default()
+}
+
+/// The acts typed for `sid`, preserving a read refusal as unknown evidence. An absent file
+/// contains no acts; an unreadable, nonregular, oversized or non-text file is not an empty book.
+/// # Errors
+/// The existing ledger cannot be read as bounded regular text.
+pub fn read_typed_texts(path: &Path, sid: Option<&str>) -> std::io::Result<Vec<Typed>> {
+    Ok(
+        crate::harness::accounts::read_bounded(path, 16 * 1024 * 1024)?
+            .map_or_else(Vec::new, |body| typed_texts_in(&body, sid)),
+    )
+}
+
+/// The acts typed for `sid` in the books `body`, oldest first: when, what and under which rule.
+#[must_use]
+pub fn typed_texts_in(body: &str, sid: Option<&str>) -> Vec<Typed> {
     let sid = sid.map(|s| s.trim_start_matches('@'));
     let mut out = Vec::new();
-    for line in act_lines(&body).filter(|l| l.contains("\"typed\"")) {
+    for line in act_lines(body).filter(|l| l.contains("\"typed\"")) {
         let Ok(v) = aterm_json::from_str::<aterm_json::Value>(line) else {
             continue;
         };
@@ -1052,6 +1095,36 @@ pub fn typed_at_in(body: &str, sid: Option<&str>) -> Vec<i64> {
         .collect();
     out.sort_unstable();
     out
+}
+
+/// THE PERSON'S HOUR A LOOP BEFORE THIS ONE BOOKED for `sid`
+/// ([`super::policy::turn_end::RULE_GO_AHEAD_HOUR`]): the latest start (unix ms) its rows name.
+#[must_use]
+pub fn go_ahead_hour_in(body: &str, sid: Option<&str>) -> Option<i64> {
+    let want = sid.map(|s| s.trim_start_matches('@'));
+    body.lines()
+        .filter_map(go_ahead_hour_row)
+        .filter_map(|(sid, from)| (sid.as_deref() == want).then_some(from))
+        .max()
+}
+
+/// A row's session and signed start, shared by recovery and cut retention so both choose the
+/// same hour. An invalid rule, JSON body or command contributes no start.
+fn go_ahead_hour_row(line: &str) -> Option<(Option<String>, i64)> {
+    use super::policy::turn_end::RULE_GO_AHEAD_HOUR;
+    if !line.contains(RULE_GO_AHEAD_HOUR) {
+        return None;
+    }
+    let row = aterm_json::from_str::<aterm_json::Value>(line).ok()?;
+    if row.get("rule_id")?.as_str()? != RULE_GO_AHEAD_HOUR {
+        return None;
+    }
+    let sid = row
+        .get("sid")
+        .and_then(aterm_json::Value::as_str)
+        .map(str::to_string);
+    let from = crate::parse_int(row.get("command")?.as_str()?.strip_prefix("from=")?)?;
+    Some((sid, from))
 }
 
 #[must_use]
@@ -1114,7 +1187,7 @@ pub fn left_at_wall_key(turn: &str, work: std::time::Duration) -> String {
 pub fn parse_left_at_wall(key: &str) -> Option<(&str, Option<std::time::Duration>)> {
     let rest = key.strip_prefix(LEFT_AT_WALL)?;
     let worked = rest.rsplit_once('@').and_then(|(turn, secs)| {
-        let secs = secs.parse().ok()?;
+        let secs = crate::parse_uint(secs)?;
         Some((turn, std::time::Duration::from_secs(secs)))
     });
     Some(worked.map_or((rest, None), |(turn, work)| (turn, Some(work))))
@@ -1130,6 +1203,9 @@ pub fn left_retried_key(wall: &str, retry: &str) -> String {
 #[must_use]
 pub fn parse_left_retried(key: &str) -> Option<(u64, &str)> {
     let (hash, wall) = key.strip_prefix(LEFT_RETRIED)?.split_once(':')?;
+    if hash.is_empty() || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
     Some((u64::from_str_radix(hash, 16).ok()?, wall))
 }
 
@@ -1142,7 +1218,7 @@ pub fn left_before_key(at_ms: i64) -> String {
 
 #[must_use]
 pub fn parse_left_before(key: &str) -> Option<u64> {
-    key.strip_prefix(LEFT_BEFORE)?.parse().ok()
+    crate::parse_uint(key.strip_prefix(LEFT_BEFORE)?)
 }
 
 #[must_use]
@@ -1268,14 +1344,30 @@ pub fn left_after_typed(open: &str, rule: &str, command: &str) -> Option<String>
     }
 }
 
+/// A best-effort display query. Decisions about carrying a conversation use
+/// [`read_open_left`] so unreadable evidence does not lift a standing exchange.
 #[must_use]
 pub fn open_left(path: &Path, sid: Option<&str>) -> Option<String> {
-    open_left_in(&std::fs::read_to_string(path).ok()?, sid)
+    read_open_left(path, sid).ok().flatten()
+}
+
+/// The exchange left to the person in `sid`'s books, preserving unreadable evidence.
+/// An absent ledger has no standing exchange.
+/// # Errors
+/// The existing ledger cannot be read as bounded regular text.
+pub fn read_open_left(path: &Path, sid: Option<&str>) -> std::io::Result<Option<String>> {
+    Ok(
+        crate::harness::accounts::read_bounded(path, 16 * 1024 * 1024)?
+            .and_then(|body| open_left_in(&body, sid)),
+    )
 }
 
 #[must_use]
 pub fn typed_at(path: &Path, sid: Option<&str>) -> Vec<i64> {
-    std::fs::read_to_string(path).map_or_else(|_| Vec::new(), |body| typed_at_in(&body, sid))
+    crate::harness::accounts::read_bounded(path, 16 * 1024 * 1024)
+        .ok()
+        .flatten()
+        .map_or_else(Vec::new, |body| typed_at_in(&body, sid))
 }
 
 pub const PROBE_TYPED_REASON: &str = "the accounts probe";
@@ -1442,7 +1534,10 @@ pub fn awaited_try_in(body: &str, sid: Option<&str>) -> Option<AwaitedTry> {
 
 #[must_use]
 pub fn awaited_try(path: &Path, sid: Option<&str>) -> Option<AwaitedTry> {
-    awaited_try_in(&std::fs::read_to_string(path).ok()?, sid)
+    awaited_try_in(
+        &crate::harness::accounts::read_bounded(path, 16 * 1024 * 1024).ok()??,
+        sid,
+    )
 }
 
 #[must_use]
@@ -1625,7 +1720,10 @@ pub fn usage_attempt_taken_in(
 
 #[must_use]
 pub fn usage_attempt(path: &Path, sid: Option<&str>) -> Option<UsageAttempt> {
-    usage_attempt_in(&std::fs::read_to_string(path).ok()?, sid)
+    usage_attempt_in(
+        &crate::harness::accounts::read_bounded(path, 16 * 1024 * 1024).ok()??,
+        sid,
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1812,24 +1910,35 @@ fn delivers_check(command: Option<&str>) -> bool {
     })
 }
 
-fn delivers_land(command: Option<&str>) -> bool {
+pub(crate) fn delivers_land(command: Option<&str>) -> bool {
     use super::policy::turn_end::{
-        LAND, LAND_ANSWER, LAND_NUDGE, RETIRED_LAND_ANSWERS, RETIRED_LAND_NUDGES, RETIRED_LANDS,
+        LAND, LAND_ANSWER, LAND_CHECK_HEAD, LAND_CONTRADICTED_HEAD, LAND_NUDGE,
+        RETIRED_LAND_ANSWERS, RETIRED_LAND_NUDGES, RETIRED_LANDS, past_switch_why,
     };
     command.is_some_and(|c| {
-        [LAND, LAND_NUDGE, LAND_ANSWER]
-            .into_iter()
-            .chain(RETIRED_LANDS)
-            .chain(RETIRED_LAND_NUDGES)
-            .chain(RETIRED_LAND_ANSWERS)
-            .any(|head| opens_with(head, c))
+        let c = past_switch_why(c);
+        let c = c.as_ref();
+        [
+            LAND,
+            LAND_NUDGE,
+            LAND_CONTRADICTED_HEAD,
+            LAND_ANSWER,
+            LAND_CHECK_HEAD,
+        ]
+        .into_iter()
+        .chain(RETIRED_LANDS)
+        .chain(RETIRED_LAND_NUDGES)
+        .chain(RETIRED_LAND_ANSWERS)
+        .any(|head| opens_with(head, c))
     })
 }
 
 /// Whether `command` opens on Land's instruction, now's or a retired build's (no nudge, no answer).
 fn gives_land(command: Option<&str>) -> bool {
-    use super::policy::turn_end::{LAND, RETIRED_LANDS};
+    use super::policy::turn_end::{LAND, RETIRED_LANDS, past_switch_why};
     command.is_some_and(|c| {
+        let c = past_switch_why(c);
+        let c = c.as_ref();
         std::iter::once(LAND)
             .chain(RETIRED_LANDS)
             .any(|head| opens_with(head, c))
@@ -1843,7 +1952,10 @@ fn opens_with(head: &str, text: &str) -> bool {
 
 #[must_use]
 pub fn done_check_owed(path: &Path, sid: Option<&str>) -> Option<CheckOwed> {
-    done_check_owed_in(&std::fs::read_to_string(path).ok()?, sid)
+    done_check_owed_in(
+        &crate::harness::accounts::read_bounded(path, 16 * 1024 * 1024).ok()??,
+        sid,
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1857,6 +1969,10 @@ pub struct LandSeed {
     pub compact: bool,
     pub judged: bool,
     pub owed: Option<&'static str>,
+    /// THE LAST LAND ROW WAS THE LAND CHECK (`land-check@v1`): a restarted loop judges the reply
+    /// it reads as the check's answer, so a `LANDED` there lands
+    /// ([`super::policy::turn_end::TurnEndState::seed_land_owed`]).
+    pub checked: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1902,10 +2018,15 @@ pub fn land_episode_in(body: &str, sid: Option<&str>) -> Option<LandSeed> {
 }
 
 fn land_rule(rule: &str) -> Option<&'static str> {
-    use super::policy::turn_end::{RULE_LAND, RULE_LAND_ANSWER, RULE_LAND_NUDGE};
-    [RULE_LAND, RULE_LAND_NUDGE, RULE_LAND_ANSWER]
-        .into_iter()
-        .find(|r| *r == rule)
+    use super::policy::turn_end::{RULE_LAND, RULE_LAND_ANSWER, RULE_LAND_CHECK, RULE_LAND_NUDGE};
+    [
+        RULE_LAND,
+        RULE_LAND_NUDGE,
+        RULE_LAND_ANSWER,
+        RULE_LAND_CHECK,
+    ]
+    .into_iter()
+    .find(|r| *r == rule)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1937,6 +2058,7 @@ impl LandWalk {
             Some("typed") => {
                 let judged = self.judged;
                 let owed = self.ep.and_then(|e| e.owed);
+                let was_checked = self.ep.is_some_and(|e| e.checked);
                 if rule != RULE_USAGE_PROBE {
                     self.judged = 0;
                 }
@@ -1950,6 +2072,7 @@ impl LandWalk {
                     compact: false,
                     judged: false,
                     owed: None,
+                    checked: false,
                 };
                 let begun = |base: u32| HoldStart {
                     since_ms: v.get("ts").and_then(aterm_json::Value::as_i64),
@@ -2001,6 +2124,9 @@ impl LandWalk {
                 if rule != RULE_USAGE_PROBE
                     && let Some(e) = self.ep.as_mut()
                 {
+                    e.checked = land_rule(rule).map_or(was_checked, |r| {
+                        r == super::policy::turn_end::RULE_LAND_CHECK
+                    });
                     e.owed = if let Some(rule) = land_rule(rule) {
                         Some(rule)
                     } else if e.compact || (e.landing && is_wall_retry(rule)) {
@@ -2018,6 +2144,7 @@ impl LandWalk {
             return;
         };
         match rule {
+            RULE_OFF_STOOD if text("reason") == Some(OFF_STOOD_RESTING) => {}
             RULE_LAND_OVER | RULE_OFF_STOOD => self.ep = None,
             RULE_TASK_DONE => {
                 e.answered = true;
@@ -2066,7 +2193,10 @@ impl LandWalk {
 
 #[must_use]
 pub fn land_episode(path: &Path, sid: Option<&str>) -> Option<LandSeed> {
-    land_episode_in(&std::fs::read_to_string(path).ok()?, sid)
+    land_episode_in(
+        &crate::harness::accounts::read_bounded(path, 16 * 1024 * 1024).ok()??,
+        sid,
+    )
 }
 
 const fn of_try(kind: Option<aterm_phase::WallKind>, limit: LimitTry) -> bool {
@@ -2114,7 +2244,7 @@ fn limit_try_of(reason: &str) -> Option<LimitTry> {
         _ => return None,
     };
     let attempts = field("attempts")
-        .and_then(|n| n.parse::<usize>().ok())
+        .and_then(crate::parse_uint::<usize>)
         .unwrap_or(1);
     Some(LimitTry {
         bucket,
@@ -2141,6 +2271,17 @@ pub struct StreakSeed {
     pub said_reset_ms: Option<i64>,
     /// The done checks of the Cruise run so far ([`Carried::checks`]).
     pub checks: u8,
+    /// The land check's books ([`Carried::land`]).
+    pub land: LandBooks,
+    /// THE HELD REPLY THE PERSON'S SWITCH'S ONE ASK WAS SPENT ON
+    /// ([`super::policy::turn_end::TurnEndState::seed_switch_spent`]): the last kept mark of the
+    /// row that typed the ask, carried past the rows after it until an Off the person set.
+    pub switch_spent: Option<u64>,
+    /// The last point's named program. A subsequent typed act keeps it; legacy unnamed points
+    /// preserve their old unscoped streak behavior.
+    pub program: Option<aterm_phase::Program>,
+    /// The wall's pass at the row ([`Carried::pass`]): none from an older build's row.
+    pub pass: WallPass,
 }
 
 #[must_use]
@@ -2164,8 +2305,11 @@ pub fn short_streak_in(body: &str, sid: Option<&str>) -> Option<StreakSeed> {
         let rule = text("rule_id").unwrap_or("");
         if rule == RULE_OFF_STOOD {
             if let Some(l) = last.as_mut() {
-                l.said = Replies::default();
-                l.said_reset_ms = None;
+                if OffStood::of_reason(text("reason")) == OffStood::Person {
+                    l.said = Replies::default();
+                    l.said_reset_ms = None;
+                    l.switch_spent = None;
+                }
                 l.checks = 0;
             }
             continue;
@@ -2194,6 +2338,10 @@ pub fn short_streak_in(body: &str, sid: Option<&str>) -> Option<StreakSeed> {
                             said: Replies::default(),
                             said_reset_ms: None,
                             checks: 0,
+                            land: LandBooks::default(),
+                            switch_spent: None,
+                            program: None,
+                            pass: WallPass::default(),
                         });
                     }
                 }
@@ -2223,14 +2371,22 @@ pub fn short_streak_in(body: &str, sid: Option<&str>) -> Option<StreakSeed> {
         if last.as_ref().is_some_and(|l| at_ms < l.at_ms) {
             continue;
         }
-        let short = text("reason")
-            .and_then(|r| r.split_once(&format!("({SHORT_STREAK}: ")))
-            .and_then(|(_, rest)| rest.split(')').next())
-            .and_then(|n| n.parse().ok())
-            .unwrap_or(0);
+        let short = text("reason").and_then(short_streak_of).unwrap_or(0);
         let esc = point && text("reason").is_some_and(|r| r.contains(&format!("({PERSONS_ESC})")));
         let (said, said_reset_ms) = text("reason").and_then(replies_note_of).unwrap_or_default();
         let checks = text("reason").and_then(checks_note_of).unwrap_or(0);
+        let land = text("reason").and_then(land_books_of).unwrap_or_default();
+        let switch_spent =
+            if !point && text("command").is_some_and(super::policy::turn_end::is_switch_ask) {
+                said.last().map(|k| k.mark)
+            } else {
+                last.as_ref().and_then(|l| l.switch_spent)
+            };
+        let program = if point {
+            row_program(&v).filter(|p| *p != aterm_phase::Program::Generic)
+        } else {
+            last.as_ref().and_then(|l| l.program)
+        };
         last = Some(StreakSeed {
             at_ms,
             short,
@@ -2244,9 +2400,21 @@ pub fn short_streak_in(body: &str, sid: Option<&str>) -> Option<StreakSeed> {
             said,
             said_reset_ms,
             checks,
+            land,
+            switch_spent,
+            program,
+            pass: text("reason").map(wall_pass_of).unwrap_or_default(),
         });
     }
     last.map(|l| StreakSeed { recorded, ..l })
+}
+
+/// THE SHORT STREAK A ROW'S REASON NAMES ([`point_reason`], [`act_reason_after`]): its `(short
+/// turns in a row: N)`, `None` where it names none.
+#[must_use]
+pub fn short_streak_of(reason: &str) -> Option<u32> {
+    let (_, rest) = reason.split_once(&format!("({SHORT_STREAK}: "))?;
+    crate::parse_uint(rest.split(')').next()?)
 }
 
 /// CRUISE'S CARRIES IN THE BOOKS: when each of `sid`'s carries at a break of its own background
@@ -2327,7 +2495,10 @@ pub fn carry_ended_in(body: &str, sid: Option<&str>) -> bool {
 
 #[must_use]
 pub fn short_streak(path: &Path, sid: Option<&str>) -> Option<StreakSeed> {
-    short_streak_in(&std::fs::read_to_string(path).ok()?, sid)
+    short_streak_in(
+        &crate::harness::accounts::read_bounded(path, 16 * 1024 * 1024).ok()??,
+        sid,
+    )
 }
 
 pub const RULE_TURN_RAN: &str = "turn-ran@v1";
@@ -2339,11 +2510,13 @@ pub const RULE_POINT: &str = "point@v1";
 #[must_use]
 pub fn point_reason(after: Carried, esc: bool) -> String {
     format!(
-        "the turn-end policy judged the point ({SHORT_STREAK}: {}){}{}{}{}",
+        "the turn-end policy judged the point ({SHORT_STREAK}: {}){}{}{}{}{}{}",
         after.short,
         retry_mark(after.retry),
         replies_note(after.said, after.said_reset_ms),
         checks_note(after.checks),
+        land_books_note(after.land),
+        wall_pass_note(after.pass),
         if esc {
             format!(" ({PERSONS_ESC})")
         } else {
@@ -2364,6 +2537,12 @@ pub struct Carried {
     pub said_reset_ms: Option<i64>,
     /// The done checks this Cruise run typed ([`super::policy::turn_end::TurnEndState::checks`]), so a loop after this one asks the next angle.
     pub checks: u8,
+    /// The land check's books ([`super::policy::turn_end::TurnEndState::land_books`]), so a loop
+    /// after this one checks no defense twice.
+    pub land: LandBooks,
+    /// The wall's pass ([`super::policy::turn_end::TurnEndState::wall_pass`], v6 §14.17.5.7), so
+    /// a loop after this one counts a wall's next cut act as this one would.
+    pub pass: WallPass,
 }
 
 impl Carried {
@@ -2375,7 +2554,45 @@ impl Carried {
             said: Replies::NONE,
             said_reset_ms: None,
             checks: 0,
+            land: LandBooks {
+                audited: [None; 3],
+                sent: None,
+            },
+            pass: WallPass {
+                spent: false,
+                owed: false,
+            },
         }
+    }
+}
+
+const WALL_PASS: &str = "the wall's pass";
+const PASS_SPENT: &str = "spent at this streak";
+const CUT_OWED: &str = "a cut act owed its delivery";
+
+/// The ledger's note of the wall's pass ([`Carried::pass`]): none while it is unspent and no cut
+/// act is owed, so a ledger that never met a wall reads as before.
+fn wall_pass_note(pass: WallPass) -> String {
+    let parts: Vec<&str> = [(pass.spent, PASS_SPENT), (pass.owed, CUT_OWED)]
+        .into_iter()
+        .filter_map(|(on, word)| on.then_some(word))
+        .collect();
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!(" ({WALL_PASS}: {})", parts.join("; "))
+}
+
+/// [`wall_pass_note`] read back: unspent and owing nothing where a reason holds no such note.
+fn wall_pass_of(reason: &str) -> WallPass {
+    let parts = reason
+        .split_once(&format!("({WALL_PASS}: "))
+        .and_then(|(_, rest)| rest.split(')').next())
+        .unwrap_or_default();
+    let has = |word: &str| parts.split("; ").any(|p| p == word);
+    WallPass {
+        spent: has(PASS_SPENT),
+        owed: has(CUT_OWED),
     }
 }
 
@@ -2392,7 +2609,63 @@ fn checks_note(checks: u8) -> String {
 /// [`checks_note`] read back: `None` where a reason holds no such note (an older build's, or none typed) or a count that is no number.
 fn checks_note_of(reason: &str) -> Option<u8> {
     let (_, rest) = reason.split_once(&format!("({DONE_CHECKS}: "))?;
-    rest.split(')').next()?.parse().ok()
+    crate::parse_uint(rest.split(')').next()?)
+}
+
+const LAND_BOOKS: &str = "the land check's books";
+
+const AUDITED: &str = "audited ";
+
+const SENT: &str = "sent ";
+
+/// The ledger's note of the land check's books ([`Carried::land`]): the defenses it audited, then
+/// the one its last check audits once answered, each a reply mark; none while both are empty, so
+/// a ledger with no land check reads as before.
+fn land_books_note(books: LandBooks) -> String {
+    let audited: Vec<String> = books
+        .audited
+        .iter()
+        .flatten()
+        .map(|m| format!("{m:016x}"))
+        .collect();
+    let mut parts = Vec::new();
+    if !audited.is_empty() {
+        parts.push(format!("{AUDITED}{}", audited.join(" ")));
+    }
+    if let Some(sent) = books.sent {
+        parts.push(format!("{SENT}{sent:016x}"));
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!(" ({LAND_BOOKS}: {})", parts.join("; "))
+}
+
+/// [`land_books_note`] read back: `None` where a reason holds no such note (an older build's, or
+/// none kept) or a mark that is no hex.
+fn land_books_of(reason: &str) -> Option<LandBooks> {
+    let (_, rest) = reason.split_once(&format!("({LAND_BOOKS}: "))?;
+    let mark = |m: &str| {
+        (!m.is_empty() && m.len() <= 16 && m.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then(|| u64::from_str_radix(m, 16).ok())
+            .flatten()
+    };
+    let mut books = LandBooks::default();
+    for part in rest.split(')').next()?.split("; ") {
+        if let Some(marks) = part.strip_prefix(AUDITED) {
+            let marks: Vec<u64> = marks.split(' ').map(mark).collect::<Option<_>>()?;
+            if marks.len() > books.audited.len() {
+                return None;
+            }
+            let from = books.audited.len() - marks.len();
+            for (slot, m) in books.audited[from..].iter_mut().zip(marks) {
+                *slot = Some(m);
+            }
+        } else {
+            books.sent = Some(mark(part.strip_prefix(SENT)?)?);
+        }
+    }
+    Some(books)
 }
 
 const SAME_REPLIES: &str = "the short streak's replies";
@@ -2432,8 +2705,8 @@ fn replies_note_of(reason: &str) -> Option<(Replies, Option<i64>)> {
     let (mut run, mut reset) = (0, None);
     for part in parts {
         match (part.strip_suffix(IN_A_ROW), part.strip_prefix(RESET_AT)) {
-            (Some(n), _) => run = n.parse().ok()?,
-            (_, Some(ms)) => reset = Some(ms.parse().ok()?),
+            (Some(n), _) => run = crate::parse_uint(n)?,
+            (_, Some(ms)) => reset = Some(crate::parse_int(ms)?),
             _ => return None,
         }
     }
@@ -2442,12 +2715,15 @@ fn replies_note_of(reason: &str) -> Option<(Replies, Option<i64>)> {
         .map(|k| {
             let (mark, answers) = k.split_once(':')?;
             let (answers, tries) = match answers.split_once('w') {
-                Some((n, tries)) => (n, Some(tries.parse().ok()?)),
+                Some((n, tries)) => (n, Some(crate::parse_uint(tries)?)),
                 None => (answers, None),
             };
+            if mark.is_empty() || !mark.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return None;
+            }
             Some(Kept {
                 mark: u64::from_str_radix(mark, 16).ok()?,
-                answers: answers.parse().ok()?,
+                answers: crate::parse_uint(answers)?,
                 walled: tries.is_some(),
                 tries: tries.unwrap_or(0),
             })
@@ -2532,7 +2808,7 @@ fn retry_mark_of(reason: &str) -> Option<RetryMark> {
             let (cause, _) = API_CAUSES.iter().find(|(_, w)| *w == cause)?;
             let code = match field("code")? {
                 "-" => None,
-                n => Some(n.parse().ok()?),
+                n => Some(crate::parse_uint(n)?),
             };
             let retryable = match field("retryable")? {
                 "yes" => true,
@@ -2549,9 +2825,9 @@ fn retry_mark_of(reason: &str) -> Option<RetryMark> {
     };
     Some(RetryMark {
         kind,
-        attempts: field("attempts")?.parse().ok()?,
-        ups: field("ups")?.parse().ok()?,
-        since_ms: field("since")?.parse().ok()?,
+        attempts: crate::parse_uint(field("attempts")?)?,
+        ups: crate::parse_uint(field("ups")?)?,
+        since_ms: crate::parse_int(field("since")?)?,
         down: match field("down") {
             None => false,
             Some("yes") => true,
@@ -2582,6 +2858,8 @@ pub fn act_reason_after(after: Carried, limit: Option<LimitTry>) -> String {
     reason.push_str(&retry_mark(after.retry));
     reason.push_str(&replies_note(after.said, after.said_reset_ms));
     reason.push_str(&checks_note(after.checks));
+    reason.push_str(&land_books_note(after.land));
+    reason.push_str(&wall_pass_note(after.pass));
     if let Some(l) = limit {
         let head = if l.in_place {
             IN_LIMITS_PLACE
@@ -2660,7 +2938,7 @@ pub fn relaunch_waiting_in(body: &str, sid: Option<&str>) -> Option<i64> {
                 .and_then(|r| r.strip_prefix(RELAUNCH_WAITS))
                 .and_then(|r| r.strip_prefix(" (made="))
                 .and_then(|r| r.strip_suffix(')'))
-                .and_then(|r| r.parse().ok());
+                .and_then(crate::parse_int);
         }
     }
     made
@@ -2668,7 +2946,10 @@ pub fn relaunch_waiting_in(body: &str, sid: Option<&str>) -> Option<i64> {
 
 #[must_use]
 pub fn relaunch_waiting(path: &Path, sid: Option<&str>) -> Option<i64> {
-    relaunch_waiting_in(&std::fs::read_to_string(path).ok()?, sid)
+    relaunch_waiting_in(
+        &crate::harness::accounts::read_bounded(path, 16 * 1024 * 1024).ok()??,
+        sid,
+    )
 }
 
 #[must_use]
@@ -2745,10 +3026,10 @@ impl SwitchWalk {
                 self.open = Some(OpenSwitch {
                     from: field("from"),
                     to: to.trim().to_string(),
-                    back_at_unix: field("back_at").and_then(|w| w.parse().ok()),
+                    back_at_unix: field("back_at").and_then(|w| crate::parse_int(&w)),
                     asked: false,
                     made_unix: field("made")
-                        .and_then(|w| w.parse().ok())
+                        .and_then(|w| crate::parse_int(&w))
                         .unwrap_or_else(|| written.div_euclid(1000)),
                 });
             }
@@ -2763,7 +3044,10 @@ impl SwitchWalk {
 
 #[must_use]
 pub fn open_model_switch(path: &Path, sid: Option<&str>) -> Option<OpenSwitch> {
-    open_model_switch_in(&std::fs::read_to_string(path).ok()?, sid)
+    open_model_switch_in(
+        &crate::harness::accounts::read_bounded(path, 16 * 1024 * 1024).ok()??,
+        sid,
+    )
 }
 
 pub const ACCOUNT_MOVE_COMMAND: &str = "relaunch under account ";
@@ -2910,10 +3194,10 @@ pub fn account_moves_in(body: &str, sid: Option<&str>) -> AccountMoves {
 
 #[must_use]
 pub fn account_moves(path: &Path, sid: Option<&str>) -> AccountMoves {
-    std::fs::read_to_string(path).map_or_else(
-        |_| AccountMoves::default(),
-        |body| account_moves_in(&body, sid),
-    )
+    crate::harness::accounts::read_bounded(path, 16 * 1024 * 1024)
+        .ok()
+        .flatten()
+        .map_or_else(AccountMoves::default, |body| account_moves_in(&body, sid))
 }
 
 #[must_use]
@@ -2938,7 +3222,114 @@ pub fn tap_reset_reason(notice: i64, tap: i64, waited: i64) -> String {
     )
 }
 
+/// The `(notice, tap)` resets a [`tap_reset_reason`] names.
+fn tap_reset_of(reason: &str) -> Option<(i64, i64)> {
+    let rest = reason.split_once("(notice_unix=")?.1;
+    let (notice, rest) = rest.split_once("; tap_unix=")?;
+    let (tap, _) = rest.split_once(';')?;
+    Some((crate::parse_int(notice)?, crate::parse_int(tap)?))
+}
+
+/// The words a wall's reset is placed and remembered under: its kind's name and the reset the
+/// notice printed (`-` for none), as the usage tap keys a wall and a [`RULE_WALL_WAIT`] row
+/// names it.
+#[must_use]
+pub fn wall_reset_key(kind: aterm_phase::WallKind, reset: Option<&str>) -> String {
+    format!("{}|{}", kind.name(), reset.unwrap_or("-"))
+}
+
+/// THE DISAGREEMENT A SESSION'S ROWS WROTE DOWN LAST ([`fold_tap_said`]): the `(notice, tap)`
+/// resets of its last [`RULE_TAP_RESET`] row since its last typed act, and the wall that row was
+/// written at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TapSaid {
+    /// The notice's reset and the tap's (unix seconds).
+    pub pair: (i64, i64),
+    /// The [`wall_reset_key`] of the first [`RULE_WALL_WAIT`] row after the pair's: a loop
+    /// writes a new wall's row in the point that writes that wall's pair, after the pair.
+    /// `None` while no wall row has come since, the pair being the open wall's.
+    pub key: Option<String>,
+}
+
+/// Fold one of a session's waiting or typed rows (`typed`, its `rule_id` and `reason`) into the
+/// disagreement its rows wrote down last ([`TapSaid`]): a [`RULE_TAP_RESET`] row's pair replaces
+/// it, the first [`RULE_WALL_WAIT`] row after the pair names its wall, and a typed act ends it
+/// (a fact row, [`is_fact_rule`], is none). A [`RULE_WALL_WAIT_END`] row ends none: a point
+/// that meets a wall of another class, or ends a limit's track under the same notice, writes
+/// the end after the pair it wrote for the wall that stands. The loop folds each row it writes
+/// and a loop that takes the session over folds the ledger's ([`tap_said_in`]), so the two
+/// hold one pair, and the row of a pair at a wall is written once until an act is typed.
+pub fn fold_tap_said(said: &mut Option<TapSaid>, typed: bool, rule_id: &str, reason: &str) {
+    if is_fact_rule(rule_id) {
+        return;
+    }
+    if typed {
+        *said = None;
+        return;
+    }
+    match rule_id {
+        RULE_TAP_RESET => {
+            if let Some(pair) = tap_reset_of(reason) {
+                *said = Some(TapSaid { pair, key: None });
+            }
+        }
+        RULE_WALL_WAIT => {
+            if let Some(s) = said.as_mut().filter(|s| s.key.is_none())
+                && let Some(row) = wall_wait_of(reason)
+            {
+                s.key = row.kind.map(|k| wall_reset_key(k, row.reset.as_deref()));
+            }
+        }
+        _ => {}
+    }
+}
+
 pub const RULE_OFF_STOOD: &str = "autopilot-off@v1";
+
+/// Whether `body` holds a [`RULE_OFF_STOOD`] row for `sid`: the session ran under Off.
+#[must_use]
+pub fn off_stood_in(body: &str, sid: Option<&str>) -> bool {
+    let want = sid.map(|s| s.trim_start_matches('@'));
+    act_lines(body)
+        .filter(|l| l.contains(RULE_OFF_STOOD))
+        .filter_map(|l| aterm_json::from_str::<aterm_json::Value>(l).ok())
+        .any(|v| {
+            let text = |k: &str| v.get(k).and_then(aterm_json::Value::as_str);
+            text("rule_id") == Some(RULE_OFF_STOOD) && text("sid") == want
+        })
+}
+
+/// WHAT THE PARK OF THE OFF A LIFT ENDS KEPT, as `body`'s rows for `sid` say it: the newest
+/// [`RULE_OFF_STOOD`] row's ([`OffStood::of_reason`]: [`OFF_STOOD_HELD`], [`OFF_STOOD_RESTING`]),
+/// where no point or typed act came after it; else the person's ([`OffStood::Person`]), for the
+/// session ran under a word since that row, so the Off this lift ends wrote none (a revoked
+/// worker's, a switch of program), and an older verdict is not its (the post-landing review,
+/// 2026-11-01). A loop the host starts as that Off lifts keeps what the park kept.
+#[must_use]
+pub fn off_kept_in(body: &str, sid: Option<&str>) -> OffStood {
+    let want = sid.map(|s| s.trim_start_matches('@'));
+    act_lines(body)
+        .rev()
+        .filter(|l| {
+            l.contains(RULE_OFF_STOOD)
+                || l.contains(RULE_POINT)
+                || l.contains(",\"decision\":\"typed\",")
+        })
+        .filter_map(|l| aterm_json::from_str::<aterm_json::Value>(l).ok())
+        .find_map(|v| {
+            let text = |k: &str| v.get(k).and_then(aterm_json::Value::as_str);
+            if text("sid") != want {
+                return None;
+            }
+            match text("rule_id") {
+                Some(RULE_OFF_STOOD) => Some(OffStood::of_reason(text("reason"))),
+                Some(RULE_POINT) => Some(OffStood::Person),
+                _ if text("decision") == Some("typed") => Some(OffStood::Person),
+                _ => None,
+            }
+        })
+        .unwrap_or(OffStood::Person)
+}
 
 pub const RULE_EARLIER_BOOKS: &str = "earlier-books@v1";
 
@@ -2956,6 +3347,19 @@ pub const LAND_OVER: &str =
 
 pub const OFF_STOOD: &str = "autopilot off stood: the person drove the session; the land episode, \
      the carry, the replies the streak kept and an act a wall cut are over";
+
+/// [`OFF_STOOD`] where no person set Off (`autopilot_by=` not `human:…`): the replies that hold
+/// stand past it, for only the person's own switch lifts a hold
+/// ([`super::policy::turn_end::TurnEndState::park_off_held`]).
+pub const OFF_STOOD_HELD: &str = "autopilot off stood, set by no person: the land episode, the \
+     carry and an act a wall cut are over; the replies that hold stand";
+
+/// [`OFF_STOOD_HELD`] over Land's rest on a need: the land episode stands too, so a loop that
+/// follows seeds it and reads its point again as the check's answer
+/// ([`super::policy::turn_end::OffStood::Resting`]).
+pub const OFF_STOOD_RESTING: &str = "autopilot off stood, set by no person, over Land's rest on a \
+     need: the carry and an act a wall cut are over; the replies that hold, the land episode and \
+     its need stand";
 
 pub const LIMIT_ENDED: &str = "the limit's track ended (work, or another wall): its tries are over";
 
@@ -2981,7 +3385,7 @@ const TRY_ANSWERED: &str =
     "the limit's try a loop before this one made was answered at once: its first read_ms=";
 
 fn try_answered_of(reason: &str) -> Option<i64> {
-    reason.strip_prefix(TRY_ANSWERED)?.parse().ok()
+    crate::parse_int(reason.strip_prefix(TRY_ANSWERED)?)
 }
 
 pub const WALL_TAKEN: &str =
@@ -3128,24 +3532,43 @@ fn row_program(v: &aterm_json::Value) -> Option<aterm_phase::Program> {
     )
 }
 
-#[must_use]
-pub fn open_wall_in(body: &str, sid: Option<&str>) -> Option<OpenWall> {
+/// `sid`'s waiting and typed rows in `body` but its fact rows, in the order they were written,
+/// each with whether it is a typed one.
+fn waiting_or_typed<'a>(
+    body: &'a str,
+    sid: Option<&str>,
+) -> impl Iterator<Item = (bool, aterm_json::Value)> + 'a {
     let want = sid.map(|s| s.trim_start_matches('@').to_string());
-    let mut open: Option<OpenWall> = None;
-    let mut retry_ms = None;
-    for line in act_lines(body) {
+    act_lines(body).filter_map(move |line| {
         let waits = line.contains(",\"decision\":\"waiting\",");
         let typed = line.contains(",\"decision\":\"typed\",");
         if !waits && !typed {
-            continue;
+            return None;
         }
-        let Ok(v) = aterm_json::from_str::<aterm_json::Value>(line) else {
-            continue;
-        };
+        let v = aterm_json::from_str::<aterm_json::Value>(line).ok()?;
+        (v.get("sid").and_then(aterm_json::Value::as_str) == want.as_deref()).then_some((typed, v))
+    })
+}
+
+/// The disagreement `sid`'s rows in `body` wrote down last ([`fold_tap_said`]): what a loop
+/// that takes the session over holds as its own, so it writes no row for that pair at that
+/// wall again.
+#[must_use]
+pub fn tap_said_in(body: &str, sid: Option<&str>) -> Option<TapSaid> {
+    let mut said = None;
+    for (typed, v) in waiting_or_typed(body, sid) {
+        let text = |k: &str| v.get(k).and_then(aterm_json::Value::as_str).unwrap_or("");
+        fold_tap_said(&mut said, typed, text("rule_id"), text("reason"));
+    }
+    said
+}
+
+#[must_use]
+pub fn open_wall_in(body: &str, sid: Option<&str>) -> Option<OpenWall> {
+    let mut open: Option<OpenWall> = None;
+    let mut retry_ms = None;
+    for (typed, v) in waiting_or_typed(body, sid) {
         let text = |k: &str| v.get(k).and_then(aterm_json::Value::as_str);
-        if text("sid").map(str::to_string) != want {
-            continue;
-        }
         let ts = v.get("ts").and_then(aterm_json::Value::as_i64).unwrap_or(0);
         if typed {
             open = None;
@@ -3212,13 +3635,13 @@ fn wall_wait_of(reason: &str) -> Option<WallRow<'_>> {
                 });
             let (name, tap) = named
                 .split_once("; tap_unix=")
-                .map_or((named, None), |(name, tap)| (name, tap.parse().ok()));
+                .map_or((named, None), |(name, tap)| (name, crate::parse_int(tap)));
             (reset, kind_named(name), tap, login)
         }
         None => (head, None, None, None),
     };
     Some(WallRow {
-        reset_unix: unix.parse().ok(),
+        reset_unix: crate::parse_int(unix),
         tap_unix,
         login,
         reset: (reset != "-").then(|| reset.to_string()),
@@ -3230,7 +3653,10 @@ fn wall_wait_of(reason: &str) -> Option<WallRow<'_>> {
 
 #[must_use]
 pub fn open_wall(path: &Path, sid: Option<&str>) -> Option<OpenWall> {
-    open_wall_in(&std::fs::read_to_string(path).ok()?, sid)
+    open_wall_in(
+        &crate::harness::accounts::read_bounded(path, 16 * 1024 * 1024).ok()??,
+        sid,
+    )
 }
 
 fn sha256_hex(s: &str) -> String {
@@ -3247,6 +3673,84 @@ fn cut(s: &str, n: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// Land's instruction as the person's switch over a held tab types it (v6 §14.17 item 3) opens
+    /// with its why: the ledger's readers read it as Land's own, and a why with nothing after it
+    /// as no instruction.
+    #[test]
+    fn the_switchs_ask_reads_as_lands_instruction() {
+        use crate::supervise::policy::turn_end::{
+            LAND, is_switch_ask, past_switch_why, switch_why,
+        };
+        let mark = crate::harness::harness_mark!();
+        let ask = format!(
+            "{mark} {}{}",
+            switch_why("All done."),
+            LAND.strip_prefix(mark).unwrap_or(LAND)
+        );
+        assert!(is_switch_ask(&ask), "{ask}");
+        assert_eq!(past_switch_why(&ask), LAND);
+        assert!(super::gives_land(Some(&ask)), "{ask}");
+        assert!(super::delivers_land(Some(&ask)), "{ask}");
+        let bare = format!("{mark} {}", switch_why("All done."));
+        assert!(!super::gives_land(Some(&bare)) && !super::delivers_land(Some(&bare)));
+        assert!(!is_switch_ask(LAND) && past_switch_why(LAND) == LAND);
+    }
+
+    /// A RESTART COUNTS LAND'S CONTRADICTION AS THE NUDGE IT IS (v6 §14.4's slice 4c): a ledger
+    /// whose `land-nudge@v1` row typed the contradiction seeds a restarted loop with one nudge,
+    /// and the contradiction typed as a compaction's owed continuation delivers Land's act, read
+    /// by its words ([`super::delivers_land`]).
+    /// Negative controls: the count keyed on a command that opens [`LAND_NUDGE`] in place of the
+    /// rule, and `delivers_land`'s list without `LAND_CONTRADICTED_HEAD`, each fail it.
+    #[test]
+    fn a_restart_counts_lands_contradiction_as_its_nudge() {
+        use crate::harness::repo_work::{RepoRead, RepoWork};
+        use crate::supervise::policy::turn_end::{
+            LAND, RULE_COMPACT, RULE_LAND, RULE_LAND_NUDGE, land_contradicted,
+        };
+        let sid = Some("@s-9");
+        let work = RepoWork {
+            repo: "/r/proj/land-c".to_string(),
+            untracked: 1,
+            paths: vec!["wip-notes.txt".to_string()],
+            main_ref: "origin/main".to_string(),
+            ..RepoWork::default()
+        };
+        let said = land_contradicted(&RepoRead::Found(work), None, &[], None).expect("git's leg");
+        let reason = act_reason(None);
+        let body = |rows: &[(i64, &str, &str)]| -> String {
+            rows.iter()
+                .map(|&(ts, rule_id, command)| {
+                    let row = Row {
+                        rule_id,
+                        outcome: Outcome::Typed,
+                        command,
+                        reason: &reason,
+                        box_seq: 1,
+                    };
+                    format!("{}\n", row.to_json(ts, sid))
+                })
+                .collect()
+        };
+        let nudged = [
+            (10_000, RULE_LAND, LAND),
+            (20_000, RULE_LAND_NUDGE, said.as_str()),
+        ];
+        let ep = land_episode_in(&body(&nudged), sid).expect("the episode");
+        assert_eq!((ep.nudges, ep.landing), (1, true), "{ep:?}");
+        assert_eq!(ep.owed, Some(RULE_LAND_NUDGE), "{ep:?}");
+        let carried = [
+            (10_000, RULE_LAND, LAND),
+            (20_000, RULE_COMPACT, said.as_str()),
+        ];
+        let ep = land_episode_in(&body(&carried), sid).expect("the episode");
+        assert!(
+            ep.landing,
+            "the contradiction carried by a compaction: {ep:?}"
+        );
+        assert!(super::delivers_land(Some(&said)), "{said}");
+    }
 
     #[test]
     fn the_replies_note_carries_the_run_and_the_reset_and_an_older_note_reads_none() {
@@ -3272,6 +3776,232 @@ mod tests {
         let oldest = older.replace("; 4 in a row", "");
         assert_ne!(oldest, older);
         assert_eq!(replies_note_of(&oldest), Some((Replies::of(&[kept]), None)));
+    }
+
+    /// THE HOLD AND THE LAND CHECK'S BOOKS RIDE THE LEDGER (the post-landing review, 2026-11-01):
+    /// a point's replies stand past an Off no person set ([`OFF_STOOD_HELD`]) and end at the
+    /// person's ([`OFF_STOOD`]); the land check's books read back as written, and a reason with no
+    /// such note (an older build's) reads none.
+    #[test]
+    fn the_hold_and_the_land_checks_books_ride_the_ledger() {
+        use super::{
+            Carried, Kept, LandBooks, OFF_STOOD, OFF_STOOD_HELD, OFF_STOOD_RESTING, OffStood,
+            Outcome, RULE_OFF_STOOD, RULE_POINT, Replies, Row, act_reason_after, json_str,
+            land_books_note, off_kept_in, point_reason, short_streak_in,
+        };
+        use crate::supervise::policy::turn_end::{LAND, RULE_LAND, switch_why};
+        let sid = Some("@s-9");
+        let typed_row = |ts: i64, rule_id: &str, outcome: Outcome, command: &str, reason: &str| {
+            let row = Row {
+                rule_id,
+                outcome,
+                command,
+                reason,
+                box_seq: 1,
+            };
+            format!("{}\n", row.to_json(ts, sid))
+        };
+        let row = |ts: i64, rule_id: &str, outcome: Outcome, reason: &str| {
+            typed_row(ts, rule_id, outcome, "", reason)
+        };
+        let kept = Kept {
+            mark: 0x432b_225c_f708_95ef,
+            answers: 2,
+            walled: false,
+            tries: 0,
+        };
+        let land = LandBooks {
+            audited: [None, Some(0x0a), Some(0x0123_4567_89ab_cdef)],
+            sent: Some(0xfeed),
+        };
+        let at = Carried {
+            said: Replies::of(&[kept]),
+            land,
+            ..Carried::streak(1)
+        };
+        let point = row(
+            10_000,
+            RULE_POINT,
+            Outcome::Waiting,
+            &point_reason(at, false),
+        );
+        let seed = short_streak_in(&point, sid).expect("a seed");
+        assert_eq!((seed.said, seed.land), (at.said, land));
+        let acted = row(
+            11_000,
+            RULE_POINT,
+            Outcome::Typed,
+            &act_reason_after(at, None),
+        );
+        assert_eq!(short_streak_in(&acted, sid).map(|s| s.land), Some(land));
+        let held = format!(
+            "{point}{}",
+            row(20_000, RULE_OFF_STOOD, Outcome::Waiting, OFF_STOOD_HELD)
+        );
+        assert_eq!(
+            short_streak_in(&held, sid).map(|s| s.said),
+            Some(at.said),
+            "an Off no person set keeps the replies that hold"
+        );
+        let persons = format!(
+            "{point}{}",
+            row(20_000, RULE_OFF_STOOD, Outcome::Waiting, OFF_STOOD)
+        );
+        assert_eq!(
+            short_streak_in(&persons, sid).map(|s| s.said),
+            Some(Replies::default()),
+            "the person's Off ends them"
+        );
+        let resting = format!(
+            "{point}{}",
+            row(20_000, RULE_OFF_STOOD, Outcome::Waiting, OFF_STOOD_RESTING)
+        );
+        assert_eq!(
+            short_streak_in(&resting, sid).map(|s| s.said),
+            Some(at.said),
+            "an Off no person set over Land's rest keeps the replies that hold too"
+        );
+        // The last Off row says whose it was, and what its park kept ([`off_kept_in`]).
+        assert_eq!(off_kept_in(&held, sid), OffStood::Held);
+        assert_eq!(off_kept_in(&resting, sid), OffStood::Resting);
+        assert_eq!(off_kept_in(&persons, sid), OffStood::Person);
+        assert_eq!(
+            off_kept_in(
+                &format!(
+                    "{held}{}",
+                    row(30_000, RULE_OFF_STOOD, Outcome::Waiting, OFF_STOOD)
+                ),
+                sid
+            ),
+            OffStood::Person
+        );
+        assert_eq!(off_kept_in(&point, sid), OffStood::Person, "no Off at all");
+        // THE LAND EPISODE RIDES PAST AN OFF NO PERSON SET OVER LAND'S REST
+        // ([`OFF_STOOD_RESTING`]), so a loop the host starts as it lifts reads its point as the
+        // check's answer again; any other Off ends it.
+        let checked = format!(
+            "{}{}{point}",
+            typed_row(1_000, RULE_LAND, Outcome::Typed, LAND, "land"),
+            typed_row(
+                5_000,
+                crate::supervise::policy::land_check::RULE_LAND_CHECK,
+                Outcome::Typed,
+                "land check",
+                "check"
+            ),
+        );
+        for (reason, kept) in [
+            (OFF_STOOD_RESTING, true),
+            (OFF_STOOD_HELD, false),
+            (OFF_STOOD, false),
+        ] {
+            let body = format!(
+                "{checked}{}",
+                row(20_000, RULE_OFF_STOOD, Outcome::Waiting, reason)
+            );
+            assert_eq!(
+                super::land_episode_in(&body, sid).is_some_and(|e| e.checked),
+                kept,
+                "{reason}"
+            );
+        }
+        assert!(super::land_episode_in(&checked, sid).is_some_and(|e| e.checked));
+        // AN OLDER OFF'S VERDICT IS NOT A LATER LIFT'S (the second review, 2026-11-01): the
+        // session ran under a word after the held Off's row, so the Off a lift then ends wrote
+        // none (a revoked worker's), and the held row says nothing of it; the row nearest the
+        // lift still counts.
+        for after in [
+            row(
+                30_000,
+                RULE_POINT,
+                Outcome::Waiting,
+                &point_reason(at, false),
+            ),
+            typed_row(30_000, RULE_LAND, Outcome::Typed, LAND, "land"),
+        ] {
+            assert_eq!(
+                off_kept_in(&format!("{held}{after}"), sid),
+                OffStood::Person,
+                "{after}"
+            );
+            assert_eq!(
+                off_kept_in(
+                    &format!(
+                        "{held}{after}{}",
+                        row(40_000, RULE_OFF_STOOD, Outcome::Waiting, OFF_STOOD_HELD)
+                    ),
+                    sid
+                ),
+                OffStood::Held
+            );
+        }
+        // THE SWITCH'S ONE ASK, spent on the reply that held when it was typed, rides the rows
+        // after it, and the person's Off ends it.
+        let mark = crate::harness::harness_mark!();
+        let ask = format!(
+            "{mark} {}{}",
+            switch_why("All done."),
+            LAND.strip_prefix(mark).unwrap_or(LAND)
+        );
+        let asked = format!(
+            "{point}{}{}",
+            typed_row(
+                12_000,
+                RULE_LAND,
+                Outcome::Typed,
+                &ask,
+                &act_reason_after(at, None)
+            ),
+            row(
+                13_000,
+                RULE_POINT,
+                Outcome::Waiting,
+                &point_reason(at, false)
+            )
+        );
+        assert_eq!(
+            short_streak_in(&asked, sid).and_then(|s| s.switch_spent),
+            Some(kept.mark)
+        );
+        assert_eq!(
+            short_streak_in(
+                &format!(
+                    "{asked}{}",
+                    row(14_000, RULE_OFF_STOOD, Outcome::Waiting, OFF_STOOD_HELD)
+                ),
+                sid
+            )
+            .and_then(|s| s.switch_spent),
+            Some(kept.mark),
+            "an Off no person set keeps it"
+        );
+        assert_eq!(
+            short_streak_in(
+                &format!(
+                    "{asked}{}",
+                    row(14_000, RULE_OFF_STOOD, Outcome::Waiting, OFF_STOOD)
+                ),
+                sid
+            )
+            .and_then(|s| s.switch_spent),
+            None,
+            "the person's Off ends it"
+        );
+        let plain = asked.replace(&json_str(&ask), &json_str(LAND));
+        assert_ne!(plain, asked);
+        assert_eq!(
+            short_streak_in(&plain, sid).and_then(|s| s.switch_spent),
+            None,
+            "CONTROL: Land's own act spends no ask"
+        );
+        let none = Carried::streak(1);
+        assert_eq!(land_books_note(none.land), "", "no check: no note");
+        let older = point.replace(&land_books_note(land), "");
+        assert_ne!(older, point);
+        assert_eq!(
+            short_streak_in(&older, sid).map(|s| s.land),
+            Some(LandBooks::default())
+        );
     }
 
     #[test]
@@ -4655,6 +5385,8 @@ mod tests {
                 said: Replies::default(),
                 said_reset_ms: None,
                 checks: 0,
+                land: LandBooks::default(),
+                pass: WallPass::default(),
             };
             let reason = act_reason_after(carried, None);
             let path = seed_ledger(
@@ -4701,6 +5433,8 @@ mod tests {
                 said: Replies::default(),
                 said_reset_ms: None,
                 checks: 0,
+                land: LandBooks::default(),
+                pass: WallPass::default(),
             },
             Some(limit),
         );
@@ -4805,10 +5539,11 @@ mod tests {
         assert_eq!(short_streak_in(&older, sid).map(|s| s.checks), Some(0));
     }
 
-    /// v6 §14.5 (5a): every angle's check, bare and with its suffixes, is delivered as the done
-    /// check (`delivers_check`) and owed as one to a successor (`walk_done_check`), as v1's fixed
-    /// check is. NEGATIVE CONTROLS: the same act under another id seeds no owed check, and v1 under
-    /// a base that is not its prefix is not delivered.
+    /// v6 §14.5 (5a): every angle's check, bare, with its suffixes and as the person's hour cuts it
+    /// (`go_ahead::unless_held`), is delivered as the done check (`delivers_check`) and owed as one
+    /// to a successor (`walk_done_check`), as v1's fixed check is. NEGATIVE CONTROLS: the same act
+    /// under another id seeds no owed check, and v1 under a base that is not its prefix is not
+    /// delivered.
     #[test]
     fn every_angled_check_is_delivered_and_owed_as_the_done_check() {
         use super::super::policy::turn_end::{
@@ -4831,6 +5566,8 @@ mod tests {
                 [
                     done_check_words(n),
                     done_check_act(n, Some("never push to main"), true),
+                    super::super::policy::go_ahead::unless_held(&done_check_words(n), true)
+                        .into_owned(),
                 ]
             })
             .collect();
@@ -5063,6 +5800,8 @@ mod tests {
                         said: Replies::default(),
                         said_reset_ms: None,
                         checks: 0,
+                        land: LandBooks::default(),
+                        pass: WallPass::default(),
                     },
                     false,
                 ),
@@ -5081,6 +5820,8 @@ mod tests {
                         said: Replies::default(),
                         said_reset_ms: None,
                         checks: 0,
+                        land: LandBooks::default(),
+                        pass: WallPass::default(),
                     },
                     None,
                 ),
@@ -5159,6 +5900,8 @@ mod tests {
                         said: Replies::default(),
                         said_reset_ms: None,
                         checks: 0,
+                        land: LandBooks::default(),
+                        pass: WallPass::default(),
                     },
                     false,
                 ),
@@ -5354,6 +6097,8 @@ mod tests {
                         said: Replies::default(),
                         said_reset_ms: None,
                         checks: 0,
+                        land: LandBooks::default(),
+                        pass: WallPass::default(),
                     },
                     false,
                 ),

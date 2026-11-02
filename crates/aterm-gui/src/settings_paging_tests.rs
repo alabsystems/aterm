@@ -807,6 +807,7 @@ fn a_short_window_sheds_chrome_only_as_far_as_the_first_screen_needs() {
             bar_room_given: false,
             preview_listed: false,
             toolbar_listed: false,
+            toolbar_lent: false,
         }
     );
     assert_eq!((need, room), (212.0, 214.0));
@@ -822,6 +823,7 @@ fn a_short_window_sheds_chrome_only_as_far_as_the_first_screen_needs() {
             bar_room_given: false,
             preview_listed: false,
             toolbar_listed: false,
+            toolbar_lent: false,
         }
     );
     // Its card keeps its words beside its buttons where the list holds them together.
@@ -3686,5 +3688,239 @@ fn a_least_windows_messages_of_days_are_whole() {
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(report.is_empty(), "{}", report.join("\n"));
+    });
+}
+
+#[test]
+fn a_least_windows_messages_buttons_are_whole_and_no_screen_is_blank() {
+    // A BUTTON IS WHOLE ON SOME SCREEN, AND A LINE THAT SAYS NOTHING TAKES NO ROOM: at 2x in the
+    // least window (164x96) Open Log Folder stacked its words "Open / Log / Folder" 107pt tall
+    // in a 96pt list, its foot never shown, and with no count to say, the line kept for one
+    // over the buttons was a screen of empty card, Copy All under it never shown. Each of the
+    // count line's buttons is whole on some screen, with a log and without, and every screen
+    // of the list draws something.
+    at_each_text_scale(&[1.5, 2.0], "least messages buttons", |scale| {
+        for (width, height) in [(164.0_f32, 96.0_f32), (164.0, 98.0), (178.0, 152.0)] {
+            for logged in [false, true] {
+                let (mut runtime, instance, view) = if logged {
+                    super::setup_with_messages()
+                } else {
+                    let (mut runtime, instance, view) = setup();
+                    runtime
+                        .dispatch(
+                            instance,
+                            view,
+                            AppEvent::Action(ActionInvocation {
+                                id: route_action(SettingsRoute::Messages),
+                                value: None,
+                            }),
+                        )
+                        .unwrap();
+                    (runtime, instance, view)
+                };
+                let context = format!("{scale}x {width}x{height} logged: {logged}");
+                let cx = view_cx_at(width, height);
+                let mut whole = BTreeSet::new();
+                let mut before: Option<Vec<(String, i64)>> = None;
+                for screen in 0..120 {
+                    let compiled = compile_settings_view(&runtime, instance, view, &cx);
+                    let drawn: Vec<(String, i64)> = compiled
+                        .paint
+                        .iter()
+                        .map(|node| {
+                            (
+                                node.key.as_str().to_string(),
+                                (node.rect.y * 100.0).round() as i64,
+                            )
+                        })
+                        .collect();
+                    if before.as_ref() == Some(&drawn) {
+                        break;
+                    }
+                    before = Some(drawn);
+                    let list = compiled
+                        .paint
+                        .iter()
+                        .filter(|node| {
+                            node.key.as_str().starts_with("settings/messages/")
+                                && node.clip.height >= 1.0
+                                && !matches!(node.content, UiContent::Group(_))
+                                && !node.key.as_str().ends_with("/thumb")
+                        })
+                        .collect::<Vec<_>>();
+                    let heading = compiled
+                        .paint
+                        .iter()
+                        .any(|node| node.key.as_str().starts_with("settings/page-heading/"));
+                    assert!(
+                        heading || !list.is_empty(),
+                        "{context}: screen {screen} draws nothing of the list"
+                    );
+                    for node in list {
+                        if matches!(node.content, UiContent::Button(_)) && node.clip == node.rect {
+                            whole.insert(node.key.as_str().to_string());
+                        }
+                    }
+                    runtime
+                        .dispatch(instance, view, AppEvent::ScrollPage(1))
+                        .unwrap();
+                }
+                for key in [
+                    "settings/messages/copy-all",
+                    "settings/messages/open-folder",
+                ] {
+                    assert!(
+                        whole.contains(key),
+                        "{context}: {key} is whole on no screen"
+                    );
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn a_least_windows_message_head_fits_one_screen_where_its_lines_do() {
+    // AN ENTRY'S HEAD FITS ONE SCREEN WHERE ITS LINES DO: at 2x in a 164x140 window an entry's
+    // stacked head (its mark, its time and a line of title) stood 140pt over a 132pt list, the
+    // room under its last line making it two screens; without that room it is 132pt, one.
+    at_each_text_scale(&[2.0], "message head", |_| {
+        let (mut runtime, instance, view) = super::setup_with_messages();
+        let cx = view_cx_at(164.0, 140.0);
+        let mut head = None;
+        for _ in 0..12 {
+            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+            head = compiled
+                .paint
+                .iter()
+                .find(|node| {
+                    node.key.as_str().starts_with("settings/messages/row/")
+                        && node.key.as_str().ends_with("/title")
+                        && node.clip.height > 1.0
+                })
+                .cloned();
+            if head.is_some() {
+                break;
+            }
+            runtime
+                .dispatch(instance, view, AppEvent::ScrollPage(1))
+                .unwrap();
+        }
+        let head = head.expect("an entry is drawn");
+        assert!(
+            head.clip == head.rect,
+            "the first entry's head {:?} is whole, not {:?}",
+            head.rect,
+            head.clip
+        );
+    });
+}
+
+#[test]
+fn a_least_windows_message_head_fills_the_screens_it_takes() {
+    // A HEAD NO SCREEN HOLDS FILLS THE SCREENS IT TAKES: at 2x in the least windows an entry's
+    // head (its mark, its time, its title) takes two screens of two lines; cut to one line, its
+    // title stood alone on the second over a line of nothing ("aterm…"). Every screen of an
+    // entry's head shows two lines of it.
+    at_each_text_scale(&[2.0], "message head screens", |_| {
+        for (width, height) in [(164.0, 96.0), (164.0, 98.0)] {
+            let (mut runtime, instance, view) = super::setup_with_messages();
+            let cx = view_cx_at(width, height);
+            let mut shown = 0;
+            for _ in 0..30 {
+                let compiled = compile_settings_view(&runtime, instance, view, &cx);
+                let lines = compiled
+                    .paint
+                    .iter()
+                    .filter(|node| {
+                        let key = node.key.as_str();
+                        key.starts_with("settings/messages/row/")
+                            && (key.ends_with("/severity")
+                                || key.contains("/when/line-")
+                                || key.ends_with("/label")
+                                || key.contains("/label/line-"))
+                            && node.clip == node.rect
+                            && (key.ends_with("/severity")
+                                || matches!(&node.content, UiContent::Text(text) if !text.text.trim().is_empty()))
+                    })
+                    .count();
+                if compiled
+                    .paint
+                    .iter()
+                    .any(|node| node.key.as_str().starts_with("settings/messages/row/"))
+                {
+                    shown += 1;
+                    assert!(
+                        lines >= 2,
+                        "{width}x{height}: a screen of an entry's head shows {lines} line(s)"
+                    );
+                }
+                runtime
+                    .dispatch(instance, view, AppEvent::ScrollPage(1))
+                    .unwrap();
+            }
+            assert!(shown >= 10, "{width}x{height}: {shown} screens of entries");
+        }
+    });
+}
+
+#[test]
+fn a_least_windows_harness_pages_its_words_by_the_room() {
+    // A SCREEN OF WORDS PAGES BY ITS ROOM: at 2x in the least window (164x96) Harness kept its
+    // SESSIONS heading over its empty-state paragraph, leaving it a line a screen, a Page Down a
+    // line (9 for 9 lines). The heading gives way where it takes as much of the screen as it
+    // leaves the words, and each Page Down turns over at least two of their lines.
+    at_each_text_scale(&[2.0], "harness paging", |_| {
+        let (mut runtime, instance, view) = setup();
+        let mut state = super::harness::fixture();
+        state.sessions.clear();
+        assert!(runtime.replace_settings_harness(state, 1));
+        runtime
+            .dispatch(instance, view, AppEvent::HarnessChanged { revision: 1 })
+            .unwrap();
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: route_action(SettingsRoute::Harness),
+                    value: None,
+                }),
+            )
+            .unwrap();
+        let cx = view_cx_at(164.0, 96.0);
+        let mut read = BTreeSet::new();
+        let mut screens = 0;
+        let mut lines = 0;
+        for _ in 0..60 {
+            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+            let whole: Vec<String> = compiled
+                .paint
+                .iter()
+                .filter(|node| {
+                    node.key
+                        .as_str()
+                        .starts_with("harness/sessions/empty/line-")
+                        && node.clip == node.rect
+                })
+                .map(|node| node.key.as_str().to_string())
+                .collect();
+            if !whole.is_empty() {
+                screens += 1;
+                lines = lines.max(whole.len());
+                read.extend(whole);
+            } else if !read.is_empty() {
+                break;
+            }
+            runtime
+                .dispatch(instance, view, AppEvent::ScrollPage(1))
+                .unwrap();
+        }
+        assert!(read.len() > 4, "the paragraph's lines: {read:?}");
+        assert!(
+            lines >= 2 && screens <= read.len().div_ceil(2) + 1,
+            "{} lines over {screens} screens, at most {lines} a screen",
+            read.len()
+        );
     });
 }

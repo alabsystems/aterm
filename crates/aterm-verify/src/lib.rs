@@ -34,6 +34,7 @@ pub mod runs;
 pub mod rustup;
 pub mod sched;
 pub mod scope;
+pub mod shape;
 #[cfg(unix)]
 pub mod smoke;
 #[cfg(unix)]
@@ -42,17 +43,19 @@ pub mod soak;
 pub mod stages;
 mod test_workers;
 pub mod testrun;
+pub mod unitgraph;
 /// THE toolchain resolution, shared with atpkg (`aterm help rust`), the libc oracle's gate and the release cutter.
 pub use aterm_toolchain::discovery as toolchain;
 pub mod wasm_glue;
 mod wasm_page;
 pub mod wasm_smoke;
+pub mod window_list;
 
+use std::cell::RefCell;
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::memory::StageKey as _;
@@ -274,7 +277,7 @@ impl MeasureArtifact {
     pub fn built_from(&self, head: &str) -> bool {
         self.commit.as_deref().is_some_and(|c| {
             let c = c.strip_suffix("-dirty").unwrap_or(c);
-            !c.is_empty() && head.starts_with(c)
+            c.len() >= 7 && c.bytes().all(|b| b.is_ascii_hexdigit()) && head.starts_with(c)
         })
     }
 
@@ -351,7 +354,8 @@ pub struct Ctx {
     pub test_threads: Option<u32>,
     /// The program cargo runs in place of test binaries ([`testrun::RECORD_FLAG`]) and rustdoc ([`docdriver`]).
     pub test_recorder: Option<PathBuf>,
-    /// How the timing stages ([`plan::TIMED`]) take the quiet machine: the run waits in the
+    /// How the timing stages ([`plan::TIMED`]), and the browser lane where Safari's window takes
+    /// the desk (`browser::takes_the_desk`), take the quiet machine: the run waits in the
     /// per-user capacity ledger for one quiet claim before its first (`Some(Wait)`), or takes it
     /// at once (`Some(Now)`, `--admit now`), and holds it until its last ends; `None` runs them
     /// with no claim.
@@ -361,6 +365,20 @@ pub struct Ctx {
     /// Where the run keeps what each stage's memory peaked at, and the machine it claims on
     /// ([`memory::Book`], VERIFY-MEM); `None` measures nothing and keeps nothing.
     pub memory: Option<memory::Book>,
+    /// A call of the run's test compile did not pass: every later call of it, and the test
+    /// run's own compile, are COULD NOT RUN behind it and start no cargo, since a recompile of
+    /// what failed would run under a claim learned when it passed, or none.
+    pub test_compile_failed: std::sync::atomic::AtomicBool,
+    /// What resolves a call's unit graph for the test compile's planner ([`shape::shape`]): its
+    /// `--unit-graph` document, or why not; [`stages::unit_graph`] (resolved, never built) but
+    /// in a test.
+    pub unit_graph: fn(&Ctx, &shape::Piece) -> Result<String, String>,
+    /// What the run's shaped test compile has built so far, and what the fresh check said
+    /// ([`shape::fresh_check`]).
+    pub shape_run: Mutex<shape::Run>,
+    /// What names a test compile's heavy compiler for its unit's record ([`memory::read_unit`]
+    /// but in a test).
+    pub unit_reader: memory::UnitReader,
 }
 
 /// A `CARGO_BUILD_JOBS` value as a job count.
@@ -456,6 +474,10 @@ impl Ctx {
             quiet: None,
             runs: None,
             memory: None,
+            test_compile_failed: std::sync::atomic::AtomicBool::new(false),
+            unit_graph: stages::unit_graph,
+            shape_run: Mutex::new(shape::Run::default()),
+            unit_reader: memory::read_unit,
         };
         ctx.refresh_test_threads();
         ctx
@@ -691,7 +713,7 @@ impl Ctx {
     #[must_use]
     pub fn rerun(&self, check: Check) -> String {
         let mut cmd = format!("targo --unverified verify {}", check.name());
-        if check.narrows() {
+        if check.reads(&self.scope) {
             match &self.scope {
                 Scope::Workspace => cmd.push_str(" --all"),
                 s if s.selects_nothing() => {}
@@ -748,7 +770,7 @@ const LIVE: Seams = Seams {
 ///
 /// # Errors
 /// As [`admit_in`]; [`aterm_capacity::Error::Ledger`] with no home to keep the ledger under.
-fn admit_live(
+pub(crate) fn admit_live(
     need: aterm_capacity::Need,
     mode: aterm_capacity::Admit,
 ) -> Result<aterm_capacity::Claim, aterm_capacity::Error> {
@@ -772,10 +794,12 @@ fn admit_live(
 /// `say` what it waits for, its wait ended by the run's end too ([`stopping`]): one interrupt
 /// reaches one of the run's waits (`aterm_toolchain::interrupt::Watch::take`), which ends the run
 /// (`exec::group::stop_run`), and every other wait of its stages, a quiet claim's or another
-/// stage's memory claim's, ends at its next look.
+/// stage's memory claim's, ends at its next look. A need the run asks to end behind holders that
+/// make no progress ([`STUCK_ENDS`]) ends there too, that stage alone.
 ///
 /// # Errors
-/// As [`aterm_capacity::admit_until`]: [`aterm_capacity::Error::Stopped`] once the run ends.
+/// As [`aterm_capacity::admit_until`]: [`aterm_capacity::Error::Stopped`] once the run ends, and
+/// [`aterm_capacity::Error::Stuck`] behind holders that made no progress.
 fn admit_in(
     ledger: &aterm_capacity::Ledger,
     machine: &dyn aterm_capacity::Machine,
@@ -787,12 +811,19 @@ fn admit_in(
     aterm_capacity::admit_until(ledger, machine, need, mode, pace, say, &stopping)
 }
 
+/// How long the holders a stage's quiet or memory claim waits behind, and the run's disk claim,
+/// may make no progress before the wait gives up ([`aterm_capacity::Need::ends_when_stuck`],
+/// CW-WAIT-UNBOUNDED): that stage is then NOT RUN, or the run COULD NOT RUN for its disk, naming
+/// them, and nobody signals them. The stage's own children waiting behind one are ended on the
+/// same bound (`exec::Clock::stuck`).
+pub(crate) const STUCK_ENDS: Duration = aterm_toolchain::stall::STALLED_AFTER;
+
 /// The run's quiet machine ([`Ctx::quiet`]): one claim, admitted before the run's first timed
-/// stage and let go when its last ends, so another run's timed stages wait for all of this run's
-/// rather than taking turns with them.
+/// stage and let go when its last stage and its bounded workers end, so another run's timed
+/// stages wait for all of this run's rather than taking turns with them.
 struct Quiet {
     /// The claim, once admitted.
-    claim: Option<aterm_capacity::Claim>,
+    claim: Option<Arc<aterm_capacity::Claim>>,
     /// The run's timed stages still to end ([`takes_quiet`]).
     left: usize,
     /// How the claim is admitted.
@@ -809,12 +840,47 @@ impl Quiet {
         })
     }
 
-    /// One timed stage ended, or never ran: the claim goes with the last.
+    /// One timed stage ended, or never ran: the run's share goes with the last. A worker that
+    /// outlived its stage still holds its own share until it ends.
     fn passed(&mut self) {
         self.left = self.left.saturating_sub(1);
         if self.left == 0 {
             self.claim = None;
         }
+    }
+}
+
+thread_local! {
+    /// The quiet reservation of this stage or bounded worker.
+    static QUIET_CLAIM: RefCell<Option<Arc<aterm_capacity::Claim>>> = const { RefCell::new(None) };
+}
+
+/// The quiet reservation of this thread, captured before a bounded worker starts.
+fn current_quiet_claim() -> Option<Arc<aterm_capacity::Claim>> {
+    QUIET_CLAIM.with(|claim| claim.borrow().clone())
+}
+
+/// Restore this thread's previous quiet reservation when a stage or worker scope ends.
+#[must_use = "the quiet reservation is this thread's only while the guard lives"]
+struct QuietScope {
+    before: Option<Arc<aterm_capacity::Claim>>,
+    /// A TLS restoration guard stays on the thread where it was installed.
+    _thread: std::marker::PhantomData<*mut ()>,
+}
+
+/// Hold `claim` as this thread's quiet reservation, restoring its predecessor on drop. A
+/// worker gets an owned share so a stage timeout cannot release its still-running work's desk.
+fn holding_quiet_claim(claim: Option<Arc<aterm_capacity::Claim>>) -> QuietScope {
+    QuietScope {
+        before: QUIET_CLAIM.with(|current| current.replace(claim)),
+        _thread: std::marker::PhantomData,
+    }
+}
+
+impl Drop for QuietScope {
+    fn drop(&mut self) {
+        let before = self.before.take();
+        QUIET_CLAIM.with(|claim| *claim.borrow_mut() = before);
     }
 }
 
@@ -834,10 +900,15 @@ const fn stopping() -> bool {
 /// Why a stage the run's end kept from starting did not run.
 const ENDING: &str = "the run was interrupted before this stage started, so it decided nothing";
 
-/// What the run's quiet claim did for a timed stage, for its time line: `first` when the stage's
-/// admission made it. A claim whose patience ran out says it started at its bound, under what
-/// load, and how long it reserved the machine ([`aterm_capacity::QuietStart`]).
-fn admission(claim: &aterm_capacity::Claim, mode: aterm_capacity::Admit, first: bool) -> String {
+/// What the run's quiet claim did for a timed stage, for its time line (or a browser session's
+/// own, for the session that takes the desk): `first` when the stage's admission made it. A
+/// claim whose patience ran out says it started at its bound, under what load, and how long it
+/// reserved the machine ([`aterm_capacity::QuietStart`]).
+pub(crate) fn admission(
+    claim: &aterm_capacity::Claim,
+    mode: aterm_capacity::Admit,
+    first: bool,
+) -> String {
     let bound = claim.record().need.quiet.unwrap_or_default();
     let how = claim
         .quiet()
@@ -860,15 +931,17 @@ fn admission(claim: &aterm_capacity::Claim, mode: aterm_capacity::Admit, first: 
 
 /// Run a timed stage on the run's quiet machine ([`Quiet`]): the first one's claim is admitted
 /// before it starts, waiting for the load within its patience ([`aterm_capacity::QUIET_PATIENCE`])
-/// and saying once a minute what it waits for, and let go when the last one's `f` returns. A
-/// ledger that cannot be used is said, and the stage runs unadmitted, as a run with no claim does.
+/// and saying once a minute what it waits for, and let go when the last one's `f` and any bounded
+/// worker it left running end. A ledger that cannot be used is said, and the stage runs
+/// unadmitted, as a run with no claim does.
 /// Also what the claim did, for the stage's time line.
 ///
 /// # Errors
 /// Why `f` never ran: an interrupt ended the wait, which ends the run
 /// (`exec::group::stop_run`: no stage child starts after it, and each live one is ended, so the
-/// stages it cut short or kept from starting are COULD NOT RUN); or the run was already ending
-/// ([`stopping`]), and no wait begins.
+/// stages it cut short or kept from starting are COULD NOT RUN); the wait gave up behind holders
+/// that made no progress ([`STUCK_ENDS`]), and this stage alone did not run; or the run was
+/// already ending ([`stopping`]), and no wait begins.
 fn quietly<T>(
     ctx: &Ctx,
     quiet: &Mutex<Quiet>,
@@ -889,15 +962,18 @@ fn quietly<T>(
         match &q.claim {
             Some(claim) => Ok(admission(claim, mode, false)),
             None => match (q.admit)(
-                aterm_capacity::Need::timing(format!("verify {title}")),
+                aterm_capacity::Need::timing(format!("verify {title}")).ends_when_stuck(STUCK_ENDS),
                 mode,
             ) {
                 Ok(claim) => {
                     let said = admission(&claim, mode, true);
-                    q.claim = Some(claim);
+                    q.claim = Some(Arc::new(claim));
                     Ok(said)
                 }
-                Err(e @ aterm_capacity::Error::Stopped { .. }) => Err(Some(e)),
+                Err(
+                    e @ (aterm_capacity::Error::Stopped { .. }
+                    | aterm_capacity::Error::Stuck { .. }),
+                ) => Err(Some(e)),
                 Err(e) => {
                     eprintln!("verify: {e}; {title} runs unadmitted");
                     Ok(format!("unadmitted: {e}"))
@@ -913,6 +989,10 @@ fn quietly<T>(
             let Some(e) = stopped else {
                 return Err(ENDING.to_owned());
             };
+            if matches!(e, aterm_capacity::Error::Stuck { .. }) {
+                eprintln!("verify: {title}: the run's quiet claim {e}; {title} decided nothing");
+                return Err(format!("its quiet claim {e}; it started nothing"));
+            }
             eprintln!(
                 "verify: {title}: the run's quiet claim was {e}; the run ends, and what it did \
                  not decide COULD NOT RUN"
@@ -924,7 +1004,9 @@ fn quietly<T>(
             ));
         }
     };
+    let claim = q.claim.clone();
     drop(q);
+    let _quiet = holding_quiet_claim(claim);
     let out = f();
     quiet
         .lock()
@@ -951,11 +1033,13 @@ pub fn time_line(begun: Duration, ran: Duration, machine: &str) -> String {
     line
 }
 
-/// Whether stage `id` runs on the quiet machine: a timed stage ([`plan::TIMED`]) that runs, not
-/// a named skip before it starts anything ([`plan::named_skip`]: a windowed stage under
+/// Whether stage `id` runs on the quiet machine: a timed stage ([`plan::TIMED`]), or the browser
+/// lane where a session of it takes the desk ([`browser::takes_the_desk`]: Safari's window), that
+/// runs, not a named skip before it starts anything ([`plan::named_skip`]: a windowed stage under
 /// `--no-windows`, a measuring one with no `--app`).
 fn takes_quiet(ctx: &Ctx, id: plan::StageId) -> bool {
-    id.timed() && !plan::named_skip(ctx, id)
+    let desk = id == plan::StageId::BrowserLane && browser::takes_the_desk(ctx);
+    (id.timed() || desk) && !plan::named_skip(ctx, id)
 }
 
 /// What stage `spec`'s memory did, for its time line, what it held read off `meter`
@@ -992,11 +1076,37 @@ fn measured(
     if let Some(why) = not_kept {
         return Some(format!("memory: peaked {size}, not kept: {why}"));
     }
-    let key = memory::Key::of_run(spec.id, ctx);
-    Some(match book.keep(spec, &key, peak) {
-        Ok(()) => format!("memory: peaked {size}"),
+    let key = memory::Key::of_stage(spec, ctx);
+    let mut said = match book.keep(spec, &key, peak) {
+        Ok(memory::Kept::Kept | memory::Kept::Nowhere) => format!("memory: peaked {size}"),
+        Ok(memory::Kept::Light) => format!(
+            "memory: peaked {size}, not kept: light beside the heaviest peak its record kept in \
+             two weeks, which stands"
+        ),
+        Ok(memory::Kept::LightBeside(by)) => format!(
+            "memory: peaked {size}, not kept: below a quarter of the {} its claim was planned \
+             by, so it compiled almost none of its work",
+            aterm_capacity::size(by)
+        ),
         Err(e) => format!("memory: peaked {size}, not kept: {e}"),
-    })
+    };
+    match book.keep_units(&key.checkout, &meter.unit_peaks()) {
+        Ok(kept) if !kept.is_empty() => {
+            let heaviest: Vec<String> = kept
+                .iter()
+                .take(3)
+                .map(|(n, p)| format!("{} {}", n.kind, aterm_capacity::size(*p)))
+                .collect();
+            let more = if kept.len() > 3 { ", …" } else { "" };
+            said.push_str(&format!(
+                "; its heaviest units kept: {}{more}",
+                heaviest.join(", ")
+            ));
+        }
+        Ok(_) => {}
+        Err(e) => said.push_str(&format!("; its units' peaks not kept: {e}")),
+    }
+    Some(said)
 }
 
 /// What the run's memory budget of `budget` bytes held stage `i` of `stages` back for
@@ -1083,8 +1193,9 @@ fn admitted_how(claim: &aterm_capacity::Claim, mode: aterm_capacity::Admit) -> S
 
 /// Claim stage `spec`'s memory ([`plan::StageSpec::mem`]) in this user's capacity ledger before
 /// it starts, admitted by `admit` as `--admit` says ([`Ctx::quiet`], wait unless it says now):
-/// waiting, with no deadline, while other runs' claims and what is available leave no room for
-/// it, and saying once a minute what it waits for; at once under `--admit now`. Short only of
+/// waiting while other runs' claims and what is available leave no room for it, and saying once a
+/// minute what it waits for, until every claim it waits behind is held by a holder that has made
+/// no progress for [`STUCK_ENDS`]; at once under `--admit now`. Short only of
 /// memory no claim holds (other work on the machine), it is admitted alone, as the ledger's ALONE
 /// rule says, and no other memory claim is admitted while it runs. A stage that claims more than
 /// can ever be available here ([`memory::Book::budget`]), which the ledger would refuse, asks to
@@ -1096,8 +1207,9 @@ fn admitted_how(claim: &aterm_capacity::Claim, mode: aterm_capacity::Admit) -> S
 ///
 /// # Errors
 /// Why the stage never ran: an interrupt ended the wait, which ends the run
-/// (`exec::group::stop_run`, as a quiet claim's does in [`quietly`]); or the run was already
-/// ending ([`stopping`]), and no wait begins.
+/// (`exec::group::stop_run`, as a quiet claim's does in [`quietly`]); the wait gave up behind
+/// holders that made no progress, naming them, and this stage alone did not run; or the run was
+/// already ending ([`stopping`]), and no wait begins.
 fn claim_memory(
     ctx: &Ctx,
     spec: &plan::StageSpec,
@@ -1111,17 +1223,18 @@ fn claim_memory(
     }
     let mode = ctx.quiet.unwrap_or(aterm_capacity::Admit::Wait);
     let budget = book.budget();
-    let need = book.need(spec, &memory::Key::of_run(spec.id, ctx));
-    let why = if need.bytes == spec.mem {
-        need.to_string()
-    } else {
-        aterm_capacity::size(spec.mem)
+    let need = book.need(spec, &memory::Key::of_stage(spec, ctx));
+    let why = match &spec.part {
+        Some(part) => format!("{} {}", aterm_capacity::size(spec.mem), part.said),
+        None if need.bytes == spec.mem => need.to_string(),
+        None => aterm_capacity::size(spec.mem),
     };
     let title = &spec.title;
     let ask = |alone: bool| {
         let need = aterm_capacity::Need::new(format!("verify {title}"))
             .mem(spec.mem)
-            .covers();
+            .covers()
+            .ends_when_stuck(STUCK_ENDS);
         if alone { need.alone() } else { need }
     };
     let beyond = spec.mem >= budget;
@@ -1157,6 +1270,10 @@ fn claim_memory(
                 "its memory claim was {e}; it started nothing, and the run ends"
             ))
         }
+        Err(e @ aterm_capacity::Error::Stuck { .. }) => {
+            eprintln!("verify: {title}: its memory claim {e}; {title} decided nothing");
+            Err(format!("its memory claim {e}; it started nothing"))
+        }
         Err(e) => {
             eprintln!("verify: {e}; {title} runs unadmitted");
             Ok(Some(MemoryClaim {
@@ -1171,13 +1288,13 @@ fn claim_memory(
 /// quiet machine when it is timed ([`quietly`]), with the machine read as it starts and as it
 /// ends and its memory metered ([`memory::Meter`]): the report, when it started (after any
 /// admission wait) and what the machine did meanwhile, with `held`, what the run's memory budget
-/// held it back for ([`held_note`]), and what its claim did. A timed stage claims its memory
-/// only once it holds the quiet machine: a run holds that across all of its timed stages, so a
-/// timed stage of another run that held memory while it waited for it could keep this run's next
-/// timed stage waiting for that memory, and neither would ever start. A stage holds its memory
+/// held it back for ([`held_note`]), and what its claim did. A stage on the quiet machine
+/// ([`takes_quiet`]) claims its memory only once it holds it: a run holds that across all of its
+/// timed stages, so a timed stage of another run that held memory while it waited for it could
+/// keep this run's next timed stage waiting for that memory, and neither would ever start. A stage holds its memory
 /// claim until it ends, and waits for nothing while it holds one. A stage the run's end keeps
-/// from starting ([`stopping`]), or whose memory or quiet claim an interrupt ended, is COULD NOT
-/// RUN.
+/// from starting ([`stopping`]), or whose memory or quiet claim an interrupt ended or gave up
+/// behind holders that made no progress ([`STUCK_ENDS`]), is COULD NOT RUN.
 fn staged(
     ctx: &Ctx,
     quiet: &Mutex<Quiet>,
@@ -1191,7 +1308,13 @@ fn staged(
         report.cannot_run(format!("{} — {why}", spec.title));
         (report, Instant::now(), held.unwrap_or_default())
     };
-    let meter = (ctx.memory.is_some() && memory::metered(spec)).then(memory::Meter::new);
+    let meter = (ctx.memory.is_some() && memory::metered(spec)).then(|| {
+        if spec.id == plan::StageId::TestCompile {
+            memory::Meter::attributing(ctx.unit_reader, memory::UNIT_FLOOR)
+        } else {
+            memory::Meter::new()
+        }
+    });
     let run = || {
         let claim = claim_memory(ctx, spec, seams.admit_memory)?;
         if stopping() {
@@ -1220,6 +1343,17 @@ fn staged(
         machine.push_str(&said);
     }
     if let Some(said) = measured(ctx, spec, &report, meter.as_deref()) {
+        machine.push_str("; ");
+        machine.push_str(&said);
+    }
+    if let Some(part) = &spec.part
+        && let Some(said) = ctx
+            .shape_run
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .said
+            .remove(&part.index)
+    {
         machine.push_str("; ");
         machine.push_str(&said);
     }
@@ -1263,7 +1397,7 @@ pub fn header(ctx: &Ctx, cone: Option<&str>) -> String {
 /// What the run's checks read.
 #[must_use]
 pub fn selection(ctx: &Ctx, cone: Option<&str>) -> String {
-    if !ctx.checks.iter().any(|c| c.narrows()) {
+    if !ctx.checks.iter().any(|c| c.narrows()) && ctx.scope.is_workspace() {
         "the whole tree".to_string()
     } else if let Some(cone) = cone {
         cone.to_string()
@@ -1393,7 +1527,7 @@ fn run_with(
                         _ => 0.0,
                     };
                     let mine: Vec<&Report> = p.reports.iter().flatten().collect();
-                    let scope = if check.narrows() {
+                    let scope = if check.reads(&ctx.scope) {
                         ctx.scope.label()
                     } else {
                         String::new()
@@ -1721,14 +1855,22 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         .map(|d| runs::records_dir(&d, aterm_uds::process::pid_namespace().as_deref()));
     if let (Some(dir), Some(boot)) = (&runs_dir, aterm_uds::process::boot_id()) {
         let me = i32::try_from(std::process::id()).unwrap_or(0);
-        runs::end_dead_runs(dir, &boot, me, &runs::LiveKernel, &mut |line| {
-            eprintln!("verify: {line}");
-        });
+        runs::end_dead_runs(
+            dir,
+            &boot,
+            me,
+            &runs::LiveKernel,
+            &mut |line| {
+                eprintln!("verify: {line}");
+            },
+            &runs::ToInstance::from_env(),
+        );
     }
     #[cfg(target_os = "macos")]
     if let Some(line) = runs::program_check_line(&runs::LiveKernel, || {
         let me = i32::try_from(std::process::id()).unwrap_or(0);
-        let (app, listed) = atpkg::devtools::listed_for_responsible(me);
+        let (app, listed) =
+            atpkg::devtools::listed_for_responsible(me, window_list::hosting_instance);
         (app, listed.word())
     }) {
         eprintln!("verify: {line}");
@@ -1775,6 +1917,7 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
     let ctx = match runs_dir
         .as_deref()
         .and_then(|dir| runs::Runs::open(&ctx, dir, exec::run))
+        .map(|record| record.telling(Box::new(runs::ToInstance::from_env())))
     {
         Some(record) => ctx.with_runs(record),
         None => ctx,
@@ -1791,7 +1934,9 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
                 record.finish(&runs::LiveKernel);
             }
             std::fs::remove_dir_all(&scratch).ok();
-            return could_not_run(why);
+            let code = could_not_run(why);
+            exec::group::end_interrupted();
+            return code;
         }
     };
     let log = open_log(parsed.log.as_deref(), cwd, &ctx);
@@ -1817,29 +1962,65 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         }
     };
     #[cfg(unix)]
-    if let Some(held) = disk {
-        let claimed = held.estimate;
-        let took = held.finish();
-        let line = format!(
-            "disk: claimed {claimed}; this run grew its directories by {} (they held {} at most)",
-            atpkg::admit_disk::size(took.grew),
-            atpkg::admit_disk::size(took.peak)
-        );
-        let _ = log_file.as_mut().map(|f| writeln!(f, "{line}"));
-    }
-    if let Some(record) = &ctx.runs {
-        record.finish(&runs::LiveKernel);
-    }
-    std::fs::remove_dir_all(&scratch).ok();
+    let_disk_go(disk, log_file.as_mut());
+    end_run(&ctx, &scratch);
     code
 }
 
-/// `mktemp -d`: creates the private directory atomically, and `/tmp` keeps unix-socket paths under macOS's 104-byte `sockaddr_un` limit.
+/// Let the run's disk claim `held` go, saying in `log` what it claimed and what the run grew:
+/// what it took kept for the next run of its scope (`atpkg::admit_disk::Admitted::finish`),
+/// unless an interrupt ended the run ([`stopping`]), which stopped short of its work and so wrote
+/// less than a run of its scope writes (`atpkg::admit_disk::Admitted::abandon`).
+#[cfg(unix)]
+fn let_disk_go(held: Option<atpkg::admit_disk::Admitted>, log: Option<&mut std::fs::File>) {
+    let Some(held) = held else {
+        return;
+    };
+    let claimed = held.estimate;
+    let (took, kept) = if stopping() {
+        (
+            held.abandon(),
+            "; the run was interrupted, so that is not kept for its scope",
+        )
+    } else {
+        (held.finish(), "")
+    };
+    let line = format!(
+        "disk: claimed {claimed}; this run grew its directories by {} (they held {} at most){kept}",
+        atpkg::admit_disk::size(took.grew),
+        atpkg::admit_disk::size(took.peak)
+    );
+    let _ = log.map(|f| writeln!(f, "{line}"));
+}
+
+/// The end of a run that has reported ([`run_with`]) and let its disk claim go (`let_disk_go`):
+/// its run record finished and its `scratch` removed. Then an interrupt the handler took ends it:
+/// it dies of that signal, as it did before it reported (`exec::group::end_interrupted`).
+fn end_run(ctx: &Ctx, scratch: &Path) {
+    if let Some(record) = &ctx.runs {
+        record.finish(&runs::LiveKernel);
+    }
+    std::fs::remove_dir_all(scratch).ok();
+    #[cfg(unix)]
+    exec::group::end_interrupted();
+}
+
+/// A private scratch directory named for `tag`, made atomically. On Unix it is `mktemp -d`'s,
+/// under `/tmp`, which keeps unix-socket paths under macOS's 104-byte `sockaddr_un` limit;
+/// elsewhere (Windows has no `mktemp`) it is [`aterm_tempfile`]'s, in the temporary directory.
+/// The caller removes it.
 ///
 /// # Errors
-/// Fails when `mktemp` is absent or refuses to create the directory.
+/// Fails when `mktemp` is absent or refuses to create the directory, or, off Unix, when the
+/// temporary directory refuses it.
 pub fn mktemp_dir(tag: &str) -> std::io::Result<PathBuf> {
-    let out = Command::new(aterm_uds::os_path!("mktemp"))
+    if !cfg!(unix) {
+        return Ok(aterm_tempfile::Builder::new()
+            .prefix(&format!("{tag}."))
+            .tempdir()?
+            .keep());
+    }
+    let out = aterm_uds::spawnfd::command(aterm_uds::os_path!("mktemp"))
         .arg("-d")
         .arg(format!("/tmp/{tag}.XXXXXX"))
         .output()?;
@@ -1932,6 +2113,9 @@ pub use aterm_uds::host::{host_user_cache, user_cache};
 
 #[cfg(all(test, unix))]
 mod quiet_interrupt_tests;
+
+#[cfg(all(test, unix))]
+mod interrupt_report_tests;
 
 #[cfg(all(test, unix))]
 mod memory_claim_tests;
@@ -2238,33 +2422,29 @@ mod tests {
                 PathBuf::from("/tmp"),
             )
         };
+        let fast = std::path::absolute("/fast/tgt").expect("absolute");
         let theirs = EnvSnapshot {
-            cargo_target_dir: Some(PathBuf::from("/fast/tgt")),
-            cargo_layout: vec![("CARGO_TARGET_DIR", "/fast/tgt".into())],
+            cargo_target_dir: Some(fast.clone()),
+            cargo_layout: vec![("CARGO_TARGET_DIR", fast.clone().into_os_string())],
             ..EnvSnapshot::default()
         };
-        let c = ctx(Path::new("/repo"), theirs.clone());
-        assert_eq!(pinned(&c), Some(PathBuf::from("/fast/tgt")));
-        assert_eq!(
-            c.main_build_dir.as_deref(),
-            Some("build.build-dir='/fast/tgt/build.noindex'")
-        );
+        let repo = std::path::absolute("/repo").expect("absolute");
+        let c = ctx(&repo, theirs.clone());
+        let fast_cfg = format!("build.build-dir='{}'", fast.join("build.noindex").display());
+        assert_eq!(pinned(&c), Some(fast));
+        assert_eq!(c.main_build_dir.as_deref(), Some(fast_cfg.as_str()));
         let argv = stages::main_targo(&c, vec!["--unverified".into(), "test".into()]).argv();
         assert_eq!(
             argv[1..],
-            [
-                "--config",
-                "build.build-dir='/fast/tgt/build.noindex'",
-                "--unverified",
-                "test"
-            ]
+            ["--config", fast_cfg.as_str(), "--unverified", "test"]
         );
-        let c = ctx(Path::new("/repo"), EnvSnapshot::default());
-        assert_eq!(pinned(&c), Some(PathBuf::from("/repo/target")));
-        assert_eq!(
-            c.main_build_dir.as_deref(),
-            Some("build.build-dir='/repo/target/build.noindex'")
+        let c = ctx(&repo, EnvSnapshot::default());
+        let repo_cfg = format!(
+            "build.build-dir='{}'",
+            repo.join("target").join("build.noindex").display()
         );
+        assert_eq!(pinned(&c), Some(repo.join("target")));
+        assert_eq!(c.main_build_dir.as_deref(), Some(repo_cfg.as_str()));
         let chose = EnvSnapshot {
             cargo_layout: vec![("CARGO_BUILD_BUILD_DIR", OsString::new())],
             ..theirs.clone()
@@ -2304,6 +2484,24 @@ mod tests {
             PathBuf::from("/tmp"),
         );
         assert_eq!(unpinned.test_threads, None);
+    }
+
+    /// A red narrowed cell's rerun judges that crate again, not the whole graph and the oracles.
+    #[test]
+    fn a_cells_rerun_keeps_the_p_that_narrowed_it() {
+        let c = |scope| {
+            Ctx::new(
+                PathBuf::from("/repo"),
+                scope,
+                EnvSnapshot::default(),
+                PathBuf::from("/tmp"),
+            )
+        };
+        let narrowed = c(Scope::packages(&["aterm-agent".to_string()]));
+        assert!(narrowed.rerun(Check::Cells).contains(" -p aterm-agent"));
+        let whole = c(Scope::workspace());
+        assert!(!whole.rerun(Check::Cells).contains(" --all"));
+        assert!(!whole.rerun(Check::Cells).contains(" -p "));
     }
 
     #[test]
@@ -2564,5 +2762,18 @@ mod tests {
             held_note(&stages, 1, &sched::Held::default(), 43 * GIB / 2),
             None
         );
+    }
+
+    #[test]
+    fn built_from_rejects_short_or_non_hex_commits() {
+        let art = |commit: &str| MeasureArtifact {
+            app: PathBuf::from("/tmp/aterm.app"),
+            version: Some("0.137.0".into()),
+            commit: Some(commit.into()),
+        };
+        let head = "22cb722a2ec9abcdef0123456789abcdef012345";
+        assert!(!art("22cb72").built_from(head), "6 hex chars is too short");
+        assert!(art("22cb722").built_from(head), "7 hex chars is valid");
+        assert!(!art("22cb722z").built_from("22cb722zabcdef0123456789abcdef0123456789"));
     }
 }

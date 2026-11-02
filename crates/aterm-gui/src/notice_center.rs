@@ -15,9 +15,8 @@ pub(crate) enum Center {
     /// A bundle macOS has not been asked about yet (`UNAuthorizationStatusNotDetermined`).
     Unasked,
     /// macOS lets aterm post quietly, to Notification Center only
-    /// (`UNAuthorizationStatusProvisional`): asked at launch with no dialog
-    /// ([`NoticeCenter::prime`]). aterm posts nothing on it; turning Notify Me on asks for the
-    /// rest, as from [`Center::Unasked`].
+    /// (`UNAuthorizationStatusProvisional`). Explicitly enabled program notifications
+    /// request full delivery before posting, as from [`Center::Unasked`].
     Provisional,
     /// macOS said no, or aterm's notifications are off in System Settings ▸ Notifications.
     Refused,
@@ -40,33 +39,6 @@ pub(crate) const fn status_answer(status: isize) -> Center {
     }
 }
 
-/// What aterm asks macOS for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(
-    all(not(target_os = "macos"), not(test)),
-    expect(dead_code, reason = "UNUserNotificationCenter is macOS's")
-)]
-pub(crate) enum Request {
-    /// Quiet delivery to Notification Center, which macOS grants with no dialog: asked at
-    /// launch ([`NoticeCenter::prime`]).
-    Provisional,
-    /// Banners: macOS's one dialog, asked once Notify Me is on ([`NoticeCenter::ask`]).
-    Full,
-}
-
-/// Whether aterm asks macOS for `request` where it has said `answer`: the quiet ask only of a
-/// bundle never asked, the dialog of one never asked or only granted the quiet delivery.
-#[cfg_attr(
-    all(not(target_os = "macos"), not(test)),
-    expect(dead_code, reason = "UNUserNotificationCenter is macOS's")
-)]
-pub(crate) const fn asks(answer: Center, request: Request) -> bool {
-    matches!(
-        (answer, request),
-        (Center::Unasked, _) | (Center::Provisional, Request::Full)
-    )
-}
-
 /// The session a response goes to.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn clicked_session(
@@ -77,11 +49,15 @@ pub(crate) fn clicked_session(
     own_pid: u32,
     own_instance: &str,
 ) -> Option<u64> {
-    if action != DEFAULT_ACTION || pid?.parse::<u32>().ok()? != own_pid || instance? != own_instance
+    let pid = pid.filter(|p| p.bytes().all(|b| b.is_ascii_digit()))?;
+    if action != DEFAULT_ACTION || pid.parse::<u32>().ok()? != own_pid || instance? != own_instance
     {
         return None;
     }
-    session?.parse().ok()
+    session
+        .filter(|s| s.bytes().all(|b| b.is_ascii_digit()))?
+        .parse()
+        .ok()
 }
 
 /// One notice to post as aterm.
@@ -111,10 +87,6 @@ pub(crate) struct NoticeCenter {
     /// `then` dropped uncalled is an ask that could not be made.
     #[cfg(target_os = "macos")]
     ask: fn(Box<dyn FnOnce() + Send>),
-    /// Ask macOS, where it has never been asked, for quiet delivery
-    /// ([`Request::Provisional`]: no dialog), then call `then` as `ask` does.
-    #[cfg(target_os = "macos")]
-    prime: fn(Box<dyn FnOnce() + Send>),
     /// Become the center's delegate, so a click comes back (main thread;
     /// once per process, and only once a read has opened the center).
     #[cfg(target_os = "macos")]
@@ -131,7 +103,6 @@ impl NoticeCenter {
                 answer: live::answer,
                 post: live::post,
                 ask: live::ask,
-                prime: live::prime,
                 adopt_clicks: live::adopt_clicks,
             };
         }
@@ -150,8 +121,6 @@ impl NoticeCenter {
             #[cfg(target_os = "macos")]
             ask: inert_ask,
             #[cfg(target_os = "macos")]
-            prime: inert_prime,
-            #[cfg(target_os = "macos")]
             adopt_clicks: inert_adopt_clicks,
         }
     }
@@ -167,16 +136,8 @@ impl NoticeCenter {
             answer,
             post: inert_post,
             ask,
-            prime: inert_prime,
             adopt_clicks: inert_adopt_clicks,
         }
-    }
-
-    /// [`Self::stand_in`]'s arms with the test's own quiet ask.
-    #[cfg(all(target_os = "macos", test))]
-    #[must_use]
-    pub(crate) const fn priming(self, prime: fn(Box<dyn FnOnce() + Send>)) -> Self {
-        Self { prime, ..self }
     }
 }
 
@@ -196,12 +157,6 @@ impl NoticeCenter {
     /// it has answered.
     pub(crate) fn ask(self, then: Box<dyn FnOnce() + Send>) {
         (self.ask)(then);
-    }
-
-    /// Ask macOS, if it has never been asked, for quiet delivery (no dialog), and call `then` once
-    /// it has answered: the launch's ask, so turning Notify Me on later is the only dialog.
-    pub(crate) fn prime(self, then: Box<dyn FnOnce() + Send>) {
-        (self.prime)(then);
     }
 
     /// Hear clicks: become the center's delegate (main thread).
@@ -228,33 +183,18 @@ fn inert_ask(_then: Box<dyn FnOnce() + Send>) {
     ASKS.with(|asks| asks.set(asks.get() + 1));
 }
 
-/// The inert quiet ask: as [`inert_ask`].
-#[cfg(target_os = "macos")]
-fn inert_prime(_then: Box<dyn FnOnce() + Send>) {
-    #[cfg(test)]
-    PRIMES.with(|primes| primes.set(primes.get() + 1));
-}
-
 #[cfg(target_os = "macos")]
 const fn inert_adopt_clicks() {}
 
 #[cfg(all(target_os = "macos", test))]
 thread_local! {
     static ASKS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    static PRIMES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// How many times this thread's inert center was asked since the last call (test-only).
 #[cfg(all(target_os = "macos", test))]
 pub(crate) fn take_asks() -> u32 {
     ASKS.with(|asks| asks.replace(0))
-}
-
-/// How many times this thread's inert center was asked for quiet delivery since the last call
-/// (test-only).
-#[cfg(all(target_os = "macos", test))]
-pub(crate) fn take_primes() -> u32 {
-    PRIMES.with(|primes| primes.replace(0))
 }
 
 /// THE PROTOTYPES the notices state for UserNotifications, named so a test
@@ -372,14 +312,10 @@ mod live {
     use aterm_objc::{BlockPtr, Bool, Id, Obj, RcBlock, checked_msg, class, sel};
 
     use super::clicks::NoticeDelegate;
-    use super::{Center, Notice, Request, abi};
+    use super::{Center, Notice, abi};
 
     /// `UNAuthorizationOptionAlert`.
     const ASK_OPTIONS: usize = 1 << 2;
-
-    /// `UNAuthorizationOptionProvisional`: granted with no dialog, delivered to Notification
-    /// Center only.
-    const PROVISIONAL: usize = 1 << 6;
 
     const ANSWER_WAIT: Duration = Duration::from_secs(5);
 
@@ -514,33 +450,24 @@ mod live {
 
     /// Ask macOS, on a thread of its own, where it has not been asked or granted only quiet delivery: the system's one consent prompt for the bundle.
     pub(super) fn ask(then: Box<dyn FnOnce() + Send>) {
-        request(Request::Full, then);
+        request(then);
     }
 
-    /// Ask macOS, on a thread of its own, where it has never been asked, for quiet delivery: no dialog.
-    pub(super) fn prime(then: Box<dyn FnOnce() + Send>) {
-        request(Request::Provisional, then);
-    }
-
-    fn request(what: Request, then: Box<dyn FnOnce() + Send>) {
+    fn request(then: Box<dyn FnOnce() + Send>) {
         let spawned = std::thread::Builder::new()
             .name("aterm-notice-ask".to_string())
             .spawn(move || {
-                let Some(center) = center().filter(|_| super::asks(answer(), what)) else {
+                let Some(center) =
+                    center().filter(|_| matches!(answer(), Center::Unasked | Center::Provisional))
+                else {
                     then();
                     return;
                 };
-                let (options, quiet) = match what {
-                    Request::Full => (ASK_OPTIONS, ""),
-                    Request::Provisional => (
-                        ASK_OPTIONS | PROVISIONAL,
-                        " quietly, to Notification Center only",
-                    ),
-                };
+                let options = ASK_OPTIONS;
                 let then = Mutex::new(Some(then));
                 let answered = move |granted: Bool, _error: Id| {
                     aterm_log::info!(
-                        "notices: macOS {} aterm to post as itself{quiet}",
+                        "notices: macOS {} aterm to post as itself",
                         if granted.as_bool() {
                             "allowed"
                         } else {
@@ -833,25 +760,6 @@ mod tests {
         }
         for unknown in [-1, 5, 99] {
             assert_eq!(status_answer(unknown), Center::Refused, "{unknown}");
-        }
-    }
-
-    /// The quiet ask goes only to a bundle never asked; the dialog to one never asked or granted
-    /// only quiet delivery; neither to one that answered.
-    #[test]
-    fn the_quiet_ask_is_made_once_and_the_dialog_only_while_it_is_owed() {
-        use super::{Request, asks};
-        assert!(asks(Center::Unasked, Request::Provisional));
-        assert!(asks(Center::Unasked, Request::Full));
-        assert!(!asks(Center::Provisional, Request::Provisional), "once");
-        assert!(
-            asks(Center::Provisional, Request::Full),
-            "Notify Me asks for the rest"
-        );
-        for answered in [Center::Granted, Center::Refused, Center::Absent] {
-            for request in [Request::Provisional, Request::Full] {
-                assert!(!asks(answered, request), "{answered:?} {request:?}");
-            }
         }
     }
 

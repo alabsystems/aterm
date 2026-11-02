@@ -9,8 +9,8 @@ use astream_broker::{BrokerLog, Durability};
 use astream_wire::Offset;
 use aterm_json::{Value, json};
 use aterm_types::network_state::{
-    HistoryState, MachineIdentity, NetworkObservation, PeerObservation, PresenceSample,
-    Reachability, Visibility,
+    AccountsExchangeObservation, AuthenticatedEndpoint, HistoryState, MachineIdentity,
+    NetworkObservation, PeerObservation, PresenceSample, Reachability, Visibility,
 };
 use aterm_uds::private_file::{self, PrivateFileError};
 use std::{
@@ -27,7 +27,9 @@ const MAX_BYTES: usize = 512 * 1024;
 const CHECKPOINT: Duration = Duration::from_secs(60);
 const REACHABLE: Duration = Duration::from_secs(15);
 
+pub(crate) mod account_exchange;
 mod relay;
+mod repair;
 
 pub(crate) use relay::{
     error_stage as live_error_stage, read_owner_publication,
@@ -66,6 +68,14 @@ impl Publication {
 
     /// Current claims require both wall-clock and monotonic age evidence.
     /// Re-reading this value never renews its sample time.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbAccountExchangeRetention",
+            action = "Read",
+            project = "aterm_db::network_state::account_exchange::tests::retention_transition"
+        )
+    )]
     pub fn current_at(&self, now: Instant, wall_ms: Option<u64>) -> NetworkObservation {
         let mut state = self.observation.clone();
         let has_current_claim = state.visibility != Visibility::Unavailable
@@ -333,6 +343,60 @@ fn identity(v: &Value) -> Result<MachineIdentity> {
 fn identity_value(i: &MachineIdentity) -> Value {
     json!({"machine":aterm_codec::hex::encode_lower(&i.machine_id),"incarnation":aterm_codec::hex::encode_lower(&i.incarnation)})
 }
+fn accounts_exchange_value(exchange: &AccountsExchangeObservation) -> Value {
+    json!({"scope_digest":aterm_codec::hex::encode_lower(&exchange.scope_digest),
+        "local_actor":aterm_codec::hex::encode_lower(&exchange.local_actor),
+        "control_observation":aterm_codec::hex::encode_lower(&exchange.control_observation),
+        "inventory_count":exchange.inventory_count,
+        "inventory_fingerprint":aterm_codec::hex::encode_lower(&exchange.inventory_fingerprint),
+        "peer":identity_value(&exchange.peer),"sampled_at_ms":exchange.sampled_at_ms})
+}
+fn accounts_exchange(value: &Value) -> Result<Option<AccountsExchangeObservation>> {
+    value
+        .get("accounts_exchange")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            let inventory_count = number(value, "inventory_count")?;
+            let sampled_at_ms = number(value, "sampled_at_ms")?;
+            if inventory_count > crate::replica::MAX_RECORDS as u64 || sampled_at_ms == 0 {
+                return Err(bad());
+            }
+            Ok(AccountsExchangeObservation {
+                scope_digest: bytes(value, "scope_digest")?,
+                local_actor: bytes(value, "local_actor")?,
+                control_observation: bytes(value, "control_observation")?,
+                inventory_count,
+                inventory_fingerprint: bytes(value, "inventory_fingerprint")?,
+                peer: identity(value.get("peer").ok_or_else(bad)?)?,
+                sampled_at_ms,
+            })
+        })
+        .transpose()
+}
+fn endpoint_value(endpoint: &AuthenticatedEndpoint) -> Value {
+    json!({"address":endpoint.address.to_string(),"observed_at_ms":endpoint.observed_at_ms})
+}
+fn endpoint(row: &Value) -> Result<Option<AuthenticatedEndpoint>> {
+    row.get("last_authenticated_endpoint")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            let address = value
+                .get("address")
+                .and_then(Value::as_str)
+                .ok_or_else(bad)?
+                .parse()
+                .map_err(|_| bad())?;
+            let observed_at_ms = number(value, "observed_at_ms")?;
+            if observed_at_ms == 0 {
+                return Err(bad());
+            }
+            Ok(AuthenticatedEndpoint {
+                address,
+                observed_at_ms,
+            })
+        })
+        .transpose()
+}
 fn state_value(s: Reachability) -> &'static str {
     match s {
         Reachability::Reachable => "reachable",
@@ -355,10 +419,13 @@ fn encode(
 ) -> Result<Vec<u8>> {
     let peers: Vec<_> = observation.peers.iter().map(|p| json!({
         "slot":p.slot,"identity":identity_value(&p.identity),"first":p.first_seen_ms,"last":p.last_seen_ms,
+        "last_authenticated_endpoint":p.last_authenticated_endpoint.as_ref().map(endpoint_value),
+        "last_repair":p.last_repair.as_ref().map(repair::value),
         "samples":p.samples.iter().map(|s| json!({"at":s.at_ms,"state":state_value(s.state)})).collect::<Vec<_>>()
     })).collect();
     let value = json!({"version":1,"revision":observation.revision,"observed":observation.observed_at_ms,
         "observer":observation.observer.as_ref().map(identity_value),"limited":observation.retention_limited,"peers":peers,
+        "accounts_exchange":observation.accounts_exchange.as_ref().map(accounts_exchange_value),
         "trust":trust.map(|t|json!({"network":aterm_codec::hex::encode_lower(&t.network),"authority":aterm_codec::hex::encode_lower(&t.authority),"genesis":aterm_codec::hex::encode_lower(&t.genesis)}))});
     let wire = aterm_json::to_vec(&value).map_err(|_| bad())?;
     if wire.len() > MAX_BYTES {
@@ -366,6 +433,14 @@ fn encode(
     }
     Ok(wire)
 }
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbAccountExchangeRetention",
+        action = "HistoryRead",
+        project = "aterm_db::network_state::account_exchange::tests::retention_transition"
+    )
+)]
 fn decode(wire: &[u8]) -> Result<NetworkObservation> {
     if wire.len() > MAX_BYTES {
         return Err(bad());
@@ -403,6 +478,8 @@ fn decode(wire: &[u8]) -> Result<NetworkObservation> {
             first_seen_ms: number(row, "first")?,
             last_seen_ms: number(row, "last")?,
             last_checked_ms: None,
+            last_repair: repair::read(row)?,
+            last_authenticated_endpoint: endpoint(row)?,
             reachability: Reachability::Unknown,
             instances: None,
             samples: samples
@@ -426,6 +503,7 @@ fn decode(wire: &[u8]) -> Result<NetworkObservation> {
         revision: number(&value, "revision")?,
         observed_at_ms: number(&value, "observed")?,
         observer,
+        accounts_exchange: accounts_exchange(&value)?,
         history: HistoryState::Ready,
         detail: "Retained history; current reachability has not been checked".into(),
         peers,
@@ -501,6 +579,8 @@ pub(crate) struct Observer {
     trust: Option<aterm_secrets::commons::journal::Trust>,
     accepting: bool,
     local_verified: bool,
+    accounts_exchange_sampled: Option<Instant>,
+    repair_sampled: BTreeMap<[u8; 16], Instant>,
 }
 impl Observer {
     pub(crate) fn open(
@@ -542,13 +622,16 @@ impl Observer {
                 break;
             }
             for record in records {
-                if record.subject != SUBJECT {
+                if record.seq != offset || record.subject != SUBJECT {
                     return Err(OpenFailure::Unavailable);
                 }
                 state = decode(&record.body)?;
                 trust = decode_trust(&record.body)?;
                 offset = Offset(record.seq.0.checked_add(1).ok_or_else(bad)?);
             }
+        }
+        if log.stats().head != offset {
+            return Err(OpenFailure::Unavailable);
         }
         let mut observer = Self {
             relay: None,
@@ -566,6 +649,8 @@ impl Observer {
             trust,
             accepting: true,
             local_verified: false,
+            accounts_exchange_sampled: None,
+            repair_sampled: BTreeMap::new(),
         };
         observer.publish();
         observer.relay = relay::Server::start(&observer.dir, observer.published.clone()).ok();
@@ -591,6 +676,8 @@ impl Observer {
             trust: None,
             accepting: false,
             local_verified: false,
+            accounts_exchange_sampled: None,
+            repair_sampled: BTreeMap::new(),
         };
         observer.publish();
         observer
@@ -598,6 +685,36 @@ impl Observer {
     /// Keep the retained identity guard while withdrawing its live confirmation.
     pub(crate) fn unconfirm_local(&mut self) {
         self.local_verified = false;
+    }
+
+    /// Retain an admitted historical account exchange in original sample order.
+    pub(crate) fn accounts_exchange(&mut self, candidate: account_exchange::Candidate) {
+        if !self.accepting || !self.local_verified {
+            return;
+        }
+        // Resampling the same local evidence, including through another peer, follows contact
+        // progress: publish it live and checkpoint periodically. Persist a changed local
+        // inventory or authority context immediately, without changing its original timestamps.
+        let transition = self
+            .state
+            .accounts_exchange
+            .as_ref()
+            .is_none_or(|previous| {
+                let next = &candidate.observation;
+                previous.scope_digest != next.scope_digest
+                    || previous.local_actor != next.local_actor
+                    || previous.control_observation != next.control_observation
+                    || previous.inventory_count != next.inventory_count
+                    || previous.inventory_fingerprint != next.inventory_fingerprint
+            });
+        if account_exchange::retain(
+            &mut self.state.accounts_exchange,
+            &mut self.accounts_exchange_sampled,
+            candidate,
+        ) {
+            self.dirty |= transition;
+            self.changed = true;
+        }
     }
 
     pub(crate) fn local(
@@ -635,6 +752,17 @@ impl Observer {
             ));
         }
         if self.state.observer.as_ref() != Some(&identity) {
+            if self
+                .state
+                .observer
+                .as_ref()
+                .is_none_or(|old| old.incarnation != identity.incarnation)
+            {
+                for peer in &mut self.state.peers {
+                    peer.last_repair = None;
+                }
+                self.repair_sampled.clear();
+            }
             self.state.observer = Some(identity);
             self.dirty = true;
         }
@@ -667,6 +795,11 @@ impl Observer {
             .find(|p| p.identity.machine_id == key)
         {
             self.dirty |= p.identity != identity || p.reachability != Reachability::Reachable;
+            if p.identity.incarnation != identity.incarnation {
+                p.last_authenticated_endpoint = None;
+                p.last_repair = None;
+                self.repair_sampled.remove(&key);
+            }
             p.identity = identity;
             p.last_seen_ms = at_ms;
             p.last_checked_ms = Some(at_ms);
@@ -691,6 +824,8 @@ impl Observer {
                 first_seen_ms: at_ms,
                 last_seen_ms: at_ms,
                 last_checked_ms: Some(at_ms),
+                last_repair: None,
+                last_authenticated_endpoint: None,
                 reachability: Reachability::Reachable,
                 instances: None,
                 samples: vec![PresenceSample {
@@ -701,6 +836,34 @@ impl Observer {
             self.dirty = true;
         }
         self.seen.insert(key, now);
+        self.changed = true;
+    }
+    /// Attach only runtime-validated endpoint evidence to an already observed exact identity.
+    /// This does not refresh contact time or reachability.
+    pub(crate) fn endpoint(&mut self, identity: &MachineIdentity, endpoint: AuthenticatedEndpoint) {
+        if !self.accepting || endpoint.observed_at_ms == 0 {
+            return;
+        }
+        let Some(peer) = self
+            .state
+            .peers
+            .iter_mut()
+            .find(|peer| peer.identity == *identity)
+        else {
+            return;
+        };
+        if peer
+            .last_authenticated_endpoint
+            .as_ref()
+            .is_some_and(|old| old.observed_at_ms > endpoint.observed_at_ms)
+        {
+            return;
+        }
+        self.dirty |= peer
+            .last_authenticated_endpoint
+            .as_ref()
+            .is_none_or(|old| old.address != endpoint.address);
+        peer.last_authenticated_endpoint = Some(endpoint);
         self.changed = true;
     }
     pub(crate) fn observe(
@@ -837,15 +1000,23 @@ fn sample(peer: &mut PeerObservation, at_ms: u64, state: Reachability) {
     peer.samples.push(PresenceSample { at_ms, state });
 }
 
-/// Safe metadata-only representation for a local read command.
+/// Safe metadata-only representation for a local read command. Endpoint ages use this
+/// read's wall clock; an unavailable clock or future stamp leaves the age unknown.
 pub fn value(observation: &NetworkObservation) -> Value {
+    let now = aterm_time::unix_millis();
     json!({"revision":observation.revision,"observed_at_ms":observation.observed_at_ms,
         "via_local_process":observation.via_local_process,
         "visibility":format!("{:?}",observation.visibility),"history":format!("{:?}",observation.history),"detail":observation.detail,
         "observer":observation.observer.as_ref().map(identity_value),"unverified_endpoints":observation.unverified_endpoints,
         "retention_limited":observation.retention_limited,"instances":Value::Null,
+        "accounts_exchange":observation.accounts_exchange.as_ref().map(accounts_exchange_value),
         "peers":observation.peers.iter().map(|p|json!({"slot":p.slot,"identity":identity_value(&p.identity),"first_seen_ms":p.first_seen_ms,
-            "last_seen_ms":p.last_seen_ms,"reachability":state_value(p.reachability),"instances":Value::Null})).collect::<Vec<_>>()})
+            "last_seen_ms":p.last_seen_ms,"reachability":state_value(p.reachability),"instances":Value::Null,
+            "last_repair":p.last_repair.as_ref().map(repair::value),
+            "last_authenticated_endpoint":p.last_authenticated_endpoint.as_ref().map(|endpoint| json!({
+                "address":endpoint.address.to_string(),"observed_at_ms":endpoint.observed_at_ms,
+                "age_ms":now.and_then(|now|now.checked_sub(endpoint.observed_at_ms))
+            }))})).collect::<Vec<_>>()})
 }
 
 #[cfg(test)]
@@ -866,6 +1037,8 @@ mod tests {
                     first_seen_ms: 99_000,
                     last_seen_ms: 100_000,
                     last_checked_ms: Some(100_000),
+                    last_repair: None,
+                    last_authenticated_endpoint: None,
                     reachability: Reachability::Reachable,
                     instances: None,
                     samples: vec![PresenceSample {
@@ -951,6 +1124,8 @@ mod tests {
                     first_seen_ms: 91_000,
                     last_seen_ms: 91_000,
                     last_checked_ms: Some(91_000),
+                    last_repair: None,
+                    last_authenticated_endpoint: None,
                     reachability: Reachability::Reachable,
                     instances: None,
                     samples: Vec::new(),
@@ -1041,6 +1216,8 @@ mod tests {
                     first_seen_ms: 99_000,
                     last_seen_ms: 99_000,
                     last_checked_ms: Some(99_000),
+                    last_repair: None,
+                    last_authenticated_endpoint: None,
                     reachability: Reachability::Reachable,
                     instances: None,
                     samples: Vec::new(),
@@ -1100,6 +1277,329 @@ mod tests {
             authority: [2; 32],
             genesis: [3; 32],
         }
+    }
+    fn exchange() -> AccountsExchangeObservation {
+        AccountsExchangeObservation {
+            scope_digest: [3; 32],
+            local_actor: [4; 48],
+            control_observation: [5; 64],
+            inventory_count: 2,
+            inventory_fingerprint: [6; 32],
+            peer: peer(2, 1),
+            sampled_at_ms: 1000,
+        }
+    }
+    #[test]
+    fn historical_exchange_codec_is_bounded_and_old_history_has_no_witness() {
+        let observation = NetworkObservation {
+            accounts_exchange: Some(exchange()),
+            ..NetworkObservation::default()
+        };
+        let wire = encode(&observation, None).unwrap();
+        assert_eq!(
+            decode(&wire).unwrap().accounts_exchange,
+            observation.accounts_exchange
+        );
+        let mut old: Value = aterm_json::from_slice(&wire).unwrap();
+        old.as_object_mut().unwrap().remove("accounts_exchange");
+        assert_eq!(
+            decode(&aterm_json::to_vec(&old).unwrap())
+                .unwrap()
+                .accounts_exchange,
+            None
+        );
+        for (field, value) in [
+            ("scope_digest", json!("short")),
+            ("local_actor", json!("short")),
+            ("control_observation", json!("short")),
+            ("inventory_fingerprint", json!("short")),
+            ("inventory_count", json!(crate::replica::MAX_RECORDS + 1)),
+            ("sampled_at_ms", json!(0)),
+        ] {
+            let mut invalid: Value = aterm_json::from_slice(&wire).unwrap();
+            invalid
+                .as_object_mut()
+                .unwrap()
+                .get_mut("accounts_exchange")
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert(field.into(), value);
+            assert!(
+                decode(&aterm_json::to_vec(&invalid).unwrap()).is_err(),
+                "{field}"
+            );
+        }
+    }
+    #[test]
+    fn journal_reopen_preserves_exchange_without_renewing_contact_or_sample() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let config = root.path().join("config");
+        let at = Instant::now();
+        let expected = exchange();
+        let mut observer = Observer::open(&config, handle()).unwrap();
+        observer.local(peer(1, 1), trust()).unwrap();
+        observer.accounts_exchange(account_exchange::Candidate {
+            observation: expected.clone(),
+            sampled_at: at,
+        });
+        let mut replay = expected.clone();
+        replay.sampled_at_ms = 99_000;
+        observer.accounts_exchange(account_exchange::Candidate {
+            observation: replay,
+            sampled_at: at,
+        });
+        observer.observe(
+            Visibility::Active,
+            0,
+            "observing",
+            2000,
+            at + Duration::from_secs(1),
+        );
+        assert_eq!(observer.state.accounts_exchange, Some(expected.clone()));
+        assert!(
+            observer.state.peers.is_empty(),
+            "historical agreement is not a contact"
+        );
+        assert_eq!(
+            read_history(&config).unwrap().accounts_exchange,
+            Some(expected.clone())
+        );
+        drop(observer);
+        let mut reopened = Observer::open(&config, handle()).unwrap();
+        assert_eq!(reopened.accounts_exchange_sampled, None);
+        reopened.observe(
+            Visibility::Disabled,
+            0,
+            "disabled",
+            50_000,
+            at + Duration::from_secs(60),
+        );
+        assert_eq!(reopened.state.accounts_exchange, Some(expected));
+        assert!(reopened.state.peers.is_empty());
+    }
+    #[test]
+    fn unchanged_account_exchanges_publish_live_and_checkpoint_periodically() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let config = root.path().join("config");
+        let at = Instant::now();
+        let published = handle();
+        let mut observer = Observer::open(&config, published.clone()).unwrap();
+        observer.local(peer(1, 1), trust()).unwrap();
+        observer.contact(peer(2, 1), 1000, at);
+        observer.contact(peer(3, 1), 1000, at);
+        let projection = |observer: &Observer| {
+            private_file::read_private(&observer.dir, "projection.json", MAX_BYTES).unwrap()
+        };
+        let first = exchange();
+        observer.accounts_exchange(account_exchange::Candidate {
+            observation: first.clone(),
+            sampled_at: at,
+        });
+        observer.observe(Visibility::Active, 0, "observing", 2000, at);
+        let first_head = observer.log.as_ref().unwrap().stats().head;
+        let first_projection = projection(&observer);
+        assert_eq!(
+            read_history(&config).unwrap().accounts_exchange,
+            Some(first.clone())
+        );
+
+        let repeated = AccountsExchangeObservation {
+            sampled_at_ms: 3000,
+            ..first
+        };
+        observer.accounts_exchange(account_exchange::Candidate {
+            observation: repeated.clone(),
+            sampled_at: at + Duration::from_secs(1),
+        });
+        observer.observe(
+            Visibility::Active,
+            0,
+            "observing",
+            3000,
+            at + Duration::from_secs(1),
+        );
+        assert_eq!(
+            published.snapshot().accounts_exchange,
+            Some(repeated.clone())
+        );
+        assert_eq!(observer.log.as_ref().unwrap().stats().head, first_head);
+        assert_eq!(projection(&observer), first_projection);
+
+        let alternate = AccountsExchangeObservation {
+            peer: peer(3, 1),
+            sampled_at_ms: 4000,
+            ..repeated
+        };
+        observer.accounts_exchange(account_exchange::Candidate {
+            observation: alternate.clone(),
+            sampled_at: at + Duration::from_secs(2),
+        });
+        observer.observe(
+            Visibility::Active,
+            0,
+            "observing",
+            4000,
+            at + Duration::from_secs(2),
+        );
+        assert_eq!(
+            published.snapshot().accounts_exchange,
+            Some(alternate.clone())
+        );
+        assert_eq!(
+            observer.log.as_ref().unwrap().stats().head,
+            first_head,
+            "an alternate peer does not turn unchanged local evidence into a durable transition"
+        );
+        assert_eq!(projection(&observer), first_projection);
+
+        observer.contact(peer(2, 1), 62_000, at + CHECKPOINT);
+        observer.contact(peer(3, 1), 62_000, at + CHECKPOINT);
+        observer.observe(Visibility::Active, 0, "observing", 62_000, at + CHECKPOINT);
+        let periodic_head = observer.log.as_ref().unwrap().stats().head;
+        assert!(periodic_head > first_head);
+        assert_eq!(
+            read_history(&config).unwrap().accounts_exchange,
+            Some(alternate.clone())
+        );
+        let log = observer.log.as_ref().unwrap();
+        let records = log.read_range(log.read_floor(), 1);
+        assert_eq!(
+            decode(&records[0].body).unwrap().accounts_exchange,
+            Some(alternate.clone()),
+            "the journal stores the latest original sample, not checkpoint time"
+        );
+
+        let mut inventory_changed = alternate;
+        inventory_changed.inventory_fingerprint[0] ^= 1;
+        inventory_changed.sampled_at_ms = 5000;
+        observer.accounts_exchange(account_exchange::Candidate {
+            observation: inventory_changed.clone(),
+            sampled_at: at + CHECKPOINT + Duration::from_secs(1),
+        });
+        observer.observe(
+            Visibility::Active,
+            0,
+            "observing",
+            63_000,
+            at + CHECKPOINT + Duration::from_secs(1),
+        );
+        let inventory_head = observer.log.as_ref().unwrap().stats().head;
+        assert!(
+            inventory_head > periodic_head,
+            "changed retained IDs checkpoint immediately"
+        );
+        assert_eq!(
+            read_history(&config).unwrap().accounts_exchange,
+            Some(inventory_changed.clone())
+        );
+
+        let mut control_changed = inventory_changed;
+        control_changed.control_observation[0] ^= 1;
+        control_changed.sampled_at_ms = 6000;
+        observer.accounts_exchange(account_exchange::Candidate {
+            observation: control_changed.clone(),
+            sampled_at: at + CHECKPOINT + Duration::from_secs(2),
+        });
+        observer.observe(
+            Visibility::Active,
+            0,
+            "observing",
+            64_000,
+            at + CHECKPOINT + Duration::from_secs(2),
+        );
+        assert!(
+            observer.log.as_ref().unwrap().stats().head > inventory_head,
+            "changed control context checkpoints immediately"
+        );
+        assert_eq!(
+            read_history(&config).unwrap().accounts_exchange,
+            Some(control_changed)
+        );
+    }
+
+    #[test]
+    fn retained_endpoint_requires_exact_identity_and_never_refreshes_reachability() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let now = Instant::now();
+        let mut observer = Observer::open(&root.path().join("config"), handle()).unwrap();
+        let identity = peer(2, 1);
+        let endpoint = AuthenticatedEndpoint {
+            address: "192.0.2.3:41384".parse().unwrap(),
+            observed_at_ms: 2000,
+        };
+        observer.endpoint(&identity, endpoint.clone());
+        assert!(observer.state.peers.is_empty());
+        observer.contact(identity.clone(), 1000, now);
+        observer.endpoint(&peer(3, 1), endpoint.clone());
+        observer.endpoint(&peer(2, 2), endpoint.clone());
+        assert!(
+            observer.state.peers[0]
+                .last_authenticated_endpoint
+                .is_none()
+        );
+        observer.endpoint(&identity, endpoint.clone());
+        observer.observe(
+            Visibility::Active,
+            1,
+            "old contact",
+            20_000,
+            now + Duration::from_secs(19),
+        );
+        assert_eq!(observer.state.peers[0].reachability, Reachability::LastSeen);
+        assert_eq!(observer.state.peers[0].last_seen_ms, 1000);
+        assert_eq!(
+            observer.state.peers[0].last_authenticated_endpoint,
+            Some(endpoint.clone())
+        );
+        let restored = decode(&encode(&observer.state, None).unwrap()).unwrap();
+        assert_eq!(
+            restored.peers[0].last_authenticated_endpoint,
+            Some(endpoint)
+        );
+        assert_eq!(restored.peers[0].reachability, Reachability::Unknown);
+        observer.contact(peer(2, 2), 21_000, now + Duration::from_secs(20));
+        assert!(
+            observer.state.peers[0]
+                .last_authenticated_endpoint
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn old_version_one_history_has_no_endpoint_and_future_address_age_is_unknown() {
+        let mut observation = reachable_publication(Instant::now()).observation;
+        let wire = encode(&observation, None).unwrap();
+        let mut old: Value = aterm_json::from_slice(&wire).unwrap();
+        old.as_object_mut()
+            .unwrap()
+            .get_mut("peers")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()[0]
+            .as_object_mut()
+            .unwrap()
+            .remove("last_authenticated_endpoint");
+        let decoded = decode(&aterm_json::to_vec(&old).unwrap()).unwrap();
+        assert!(decoded.peers[0].last_authenticated_endpoint.is_none());
+        assert_eq!(decoded.peers[0].identity, observation.peers[0].identity);
+        observation.peers[0].last_authenticated_endpoint = Some(AuthenticatedEndpoint {
+            address: "[::1]:41384".parse().unwrap(),
+            observed_at_ms: u64::MAX,
+        });
+        let encoded = encode(&observation, None).unwrap();
+        assert_eq!(
+            aterm_json::from_slice::<Value>(&encoded).unwrap()["version"],
+            json!(1)
+        );
+        assert_eq!(
+            decode(&encoded).unwrap().peers[0].last_authenticated_endpoint,
+            observation.peers[0].last_authenticated_endpoint
+        );
+        assert_eq!(
+            value(&observation)["peers"][0]["last_authenticated_endpoint"],
+            json!({"address":"[::1]:41384","observed_at_ms":u64::MAX,"age_ms":null})
+        );
     }
     #[test]
     fn history_restores_stable_slots_but_never_live_reachability() {

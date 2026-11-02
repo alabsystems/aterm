@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! SIGTERM handling: routes user signals to `quit` while letting system signals exit.
+//! SIGTERM handling: a SIGTERM a process sent stops the mug, which keeps the saved mode (the app's
+//! `stop_from_outside`), while one the system sent (launchd's, the kernel's) has its default
+//! action.
 
 use std::io::{self, Read as _};
 use std::os::fd::{AsRawFd as _, IntoRawFd as _};
@@ -38,6 +40,8 @@ pub(super) fn watch(quit: fn(libc::pid_t)) -> Option<Watching> {
         return None;
     }
     let (mut reader, writer) = io::pipe().ok()?;
+    aterm_uds::keep_out_of_children(&reader).ok()?;
+    aterm_uds::keep_out_of_children(&writer).ok()?;
     // SAFETY: `fcntl` reads and sets the status flags of the pipe's live write end.
     let nonblocking = unsafe {
         let flags = libc::fcntl(writer.as_raw_fd(), libc::F_GETFL);

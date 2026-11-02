@@ -121,6 +121,9 @@ PEOPLE
 ON A HOST
     here plan|apply <baseline.toml> [--json]
                               run a baseline on this Mac directly (apply under sudo)
+    here apply --plain        install Apple's Command Line Tools from aterm's own
+                              baseline, reading no file; prints no report and exits
+                              with why it did not finish (`aterm init`'s root half)
     agent <cmd>               the host agent, which the controller runs over SSH
 
 <host> is a host's name, uuid or address. --parallel N (1 to 64) reaches N hosts at once
@@ -433,7 +436,7 @@ fn parse(verb: &str, args: &[String]) -> Result<Opts, String> {
                 o.interval = Some(
                     v.parse::<u64>()
                         .ok()
-                        .filter(|n| (1..=3600).contains(n))
+                        .filter(|n| !v.starts_with('+') && (1..=3600).contains(n))
                         .ok_or_else(|| format!("--interval takes 1 to 3600 seconds, not {v:?}"))?,
                 );
             }
@@ -446,7 +449,7 @@ fn parse(verb: &str, args: &[String]) -> Result<Opts, String> {
                 o.parallel = Some(
                     v.parse::<usize>()
                         .ok()
-                        .filter(|n| (1..=64).contains(n))
+                        .filter(|n| !v.starts_with('+') && (1..=64).contains(n))
                         .ok_or_else(|| format!("--parallel takes 1 to 64, not {v:?}"))?,
                 );
             }
@@ -568,7 +571,21 @@ fn controller(sys: &dyn System, paths: Paths, verb: &str, args: &[String]) -> Ex
 
 fn here(sys: &dyn System, args: &[String]) -> ExitCode {
     let json = args.iter().any(|a| a == "--json");
-    let rest: Vec<&String> = args.iter().filter(|a| *a != "--json").collect();
+    let plain = args.iter().any(|a| a == "--plain");
+    if json && plain {
+        return refuse("here: choose either --json or --plain");
+    }
+    let output = if json {
+        commands::HereOutput::Json
+    } else if plain {
+        commands::HereOutput::Plain
+    } else {
+        commands::HereOutput::Report
+    };
+    let rest: Vec<&String> = args
+        .iter()
+        .filter(|a| *a != "--json" && *a != "--plain")
+        .collect();
     if let Some(flag) = rest.iter().find(|a| a.starts_with('-')) {
         return refuse(&format!("here: unknown option {flag}"));
     }
@@ -577,10 +594,18 @@ fn here(sys: &dyn System, args: &[String]) -> ExitCode {
         Some("apply") => Mode::Apply,
         _ => return refuse("here: takes plan|apply <baseline.toml>"),
     };
+    // `--plain` is `aterm init`'s root half, run as root: it reads no file the person's
+    // account could write, and applies the Command Line Tools' own baseline.
+    if plain {
+        return match rest.as_slice() {
+            [_] if mode == Mode::Apply => commands::here(sys, mode, None, output),
+            _ => refuse("here: --plain takes apply alone, with no baseline file"),
+        };
+    }
     let [_, path] = rest.as_slice() else {
         return refuse("here: takes plan|apply <baseline.toml>");
     };
-    commands::here(sys, mode, Path::new(path.as_str()), json)
+    commands::here(sys, mode, Some(Path::new(path.as_str())), output)
 }
 
 fn refuse(why: &str) -> ExitCode {
@@ -595,7 +620,7 @@ fn scan(root: Option<Paths>, args: &[String]) -> ExitCode {
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
-            "--wait" => match it.next().and_then(|s| s.parse::<u64>().ok()) {
+            "--wait" => match it.next().and_then(|s| crate::parse_uint::<u64>(s)) {
                 Some(secs) if (1..=60).contains(&secs) => wait = Duration::from_secs(secs),
                 _ => return refuse("scan --wait takes whole seconds from 1 to 60"),
             },
@@ -1059,5 +1084,32 @@ mod tests {
             controller(&sys, paths(), "outstanding", &[]),
             ExitCode::SUCCESS
         );
+    }
+
+    /// `here apply --plain` reaches the plain run wherever the flag is spelled (a run without
+    /// root ends on the other class's code, not the usage refusal); with a baseline file, with
+    /// `plan`, or with `--json` it is refused, so the root half never reads a file at all.
+    #[test]
+    fn here_takes_plain_anywhere_and_never_with_a_baseline_file() {
+        let args = |words: &[&str]| words.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
+        let mut user = Fake::default();
+        user.euid = 501;
+        let other = ExitCode::from(crate::init_clt::Unfinished::Other.code().unwrap());
+        for words in [&["apply", "--plain"][..], &["--plain", "apply"]] {
+            assert_eq!(here(&user, &args(words)), other, "{words:?}");
+        }
+        for words in [
+            &["apply", "--plain", "/b/clt.toml"][..],
+            &["apply", "/b/clt.toml", "--plain"],
+            &["plan", "--plain"],
+            &["apply", "--json", "--plain"],
+        ] {
+            assert_eq!(here(&user, &args(words)), ExitCode::from(2), "{words:?}");
+        }
+        assert_eq!(
+            here(&user, &args(&["apply", "/b/clt.toml"])),
+            ExitCode::from(2)
+        );
+        assert!(user.calls().is_empty(), "{:?}", user.calls());
     }
 }

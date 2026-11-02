@@ -7,6 +7,7 @@
 # change) and back while typing goes on.
 
 foreach-scheme light {
+  scale 2
   grid 16 80
   style rainbow kitty
   hz 60

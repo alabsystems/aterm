@@ -48,6 +48,25 @@ pub(crate) fn take_extras_shift_ops() -> usize {
 }
 
 thread_local! {
+    static TAB_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Count one step of a multi-stop tab (CHT, CBT).
+pub(crate) fn count_tab_step() {
+    TAB_STEPS.with(|c| c.set(c.get() + 1));
+}
+
+/// Take (read and reset) the multi-stop tab step count.
+#[cfg(test)]
+pub(crate) fn take_tab_steps() -> usize {
+    TAB_STEPS.with(|c| {
+        let v = c.get();
+        c.set(0);
+        v
+    })
+}
+
+thread_local! {
     static HYPERLINK_WALK_OPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 

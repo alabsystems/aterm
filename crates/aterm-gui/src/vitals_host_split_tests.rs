@@ -183,8 +183,18 @@ fn bars() -> Request {
     }
 }
 
+/// The last split tick now: safe right before one reading, which asks whether a split is due as
+/// it starts.
 fn just_read(reader: &mut Reader) {
     reader.split.last = Some(Instant::now());
+}
+
+/// The last split tick an hour on, so no reading after it falls due as a split tick however long
+/// the live sweeps between them take (stamped now, readings past 4.5 s of wall time made a later
+/// bars reading a split tick).
+#[cfg(target_os = "macos")]
+fn no_split_falls_due(reader: &mut Reader) {
+    reader.split.last = Instant::now().checked_add(Duration::from_secs(3600));
 }
 
 #[test]
@@ -1257,7 +1267,10 @@ fn the_why_fixture_reads_its_scene_over_the_hosts_own_split_ticks() {
         ..Sample::default()
     };
     let read = |scene, at: [u64; 3]| {
-        let fixture = WhyFixture { scene, t0: None };
+        let fixture = WhyFixture::Recorded {
+            scene: Box::new(scene),
+            t0: None,
+        };
         let mut vitals = aterm_vitals::Vitals::new();
         vitals.absorb(&fixture.at(&live, true, at[0]));
         vitals.absorb(&fixture.at(&live, false, at[1]));
@@ -1305,8 +1318,8 @@ fn the_why_fixture_reads_its_scene_over_the_hosts_own_split_ticks() {
         }],
         ..live.clone()
     };
-    let fixture = WhyFixture {
-        scene: spotlight_1032(),
+    let fixture = WhyFixture::Recorded {
+        scene: Box::new(spotlight_1032()),
         t0: None,
     };
     let mut vitals = aterm_vitals::Vitals::new();
@@ -1376,8 +1389,8 @@ fn the_reader_reads_its_scene_on_its_own_split_ticks() {
         armed,
     );
     assert_eq!(reader.split.lane, CoalLane::Unsupported);
-    reader.read_scene(Some(WhyFixture {
-        scene: aterm_vitals::explain::fixtures::spotlight_1032(),
+    reader.read_scene(Some(WhyFixture::Recorded {
+        scene: Box::new(aterm_vitals::explain::fixtures::spotlight_1032()),
         t0: None,
     }));
     assert_eq!(reader.split.lane, CoalLane::On, "the scene's lane");
@@ -1389,7 +1402,10 @@ fn the_reader_reads_its_scene_on_its_own_split_ticks() {
     let _ = reader.read(&bars());
     assert_eq!(reader.split.last, Some(first), "the next, at once, is none");
     let fixture = reader.fixture.as_mut().expect("the scene");
-    fixture.t0 = fixture.t0.and_then(|t| t.checked_sub(five));
+    let WhyFixture::Recorded { t0, .. } = fixture else {
+        panic!("a recorded scene")
+    };
+    *t0 = t0.and_then(|t| t.checked_sub(five));
     reader.split.last = first.checked_sub(five);
     let snap = reader.read(&bars());
     assert!(reader.split.last > Some(first), "five seconds on, one");
@@ -1438,7 +1454,7 @@ fn births_ride_every_whole_reading() {
     const BORN: i64 = 1_790_000_000_000;
     let (mut reader, _) = stand_in_reader();
     kernel(&[(std::process::id(), &own_swept_name(), BORN, false)]);
-    just_read(&mut reader);
+    no_split_falls_due(&mut reader);
     READS.take();
     let _ = reader.read_machine(&Request {
         machine_only: true,
@@ -1588,7 +1604,7 @@ fn births_do_not_need_the_coalitions_lane() {
 fn the_kernels_birth_reaches_a_reading_between_split_ticks() {
     let mut reader = Reader::new(Arc::default());
     reader.split = SplitReader::new(CoalProbe::KERNEL, gauge());
-    just_read(&mut reader);
+    no_split_falls_due(&mut reader);
     let _ = reader.read(&bars());
     let snap = reader.read(&bars());
     assert!(reader.split.coalition_ids.is_empty(), "no split tick");

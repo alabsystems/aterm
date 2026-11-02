@@ -14,7 +14,7 @@ use aterm_agent::supervise::policy::exception::FUTILE_AFTER_TRIES;
 use aterm_agent::supervise::policy::needs::NEEDS_ACK;
 use aterm_agent::supervise::policy::turn_end::{
     Composer, DONE_CHECK, HostTurn, NO_WORK_ACTS, RULE_API_RETRY, RULE_CONTINUE, RULE_DONE_CHECK,
-    TurnEndAction, TurnEndReading, TurnEndState, TurnEndTiming, decide_turn_end,
+    TurnEndAction, TurnEndReading, TurnEndState, TurnEndTiming, WaitKind, decide_turn_end,
 };
 use aterm_agent::supervise::{QuestionPriority, SupervisorConfig};
 use aterm_models_harness::supervisor_turn_end_model;
@@ -149,8 +149,9 @@ fn reading(
         said_cut: false,
         opens_cut: false,
         turn_said: Some(crate::common::earlier(earlier)),
+        said_lines: None,
+        turn_lines: None,
         opened_by: None,
-        opened_words: None,
         message_drawn: false,
         submits: None,
         inputs_before: None,
@@ -168,7 +169,9 @@ fn reading(
         left_record: false,
         left_work: None,
         person: (st["person"] == 1).then_some(JUST_TYPED),
+        key: (st["person"] == 1).then_some(JUST_TYPED),
         reach: Default::default(),
+        witness: None,
         login_back: false,
         auto_continue: None,
         since_limit: None,
@@ -183,6 +186,7 @@ fn reading(
         account: None,
         autopilot: aterm_agent::supervise::Autopilot::Cruise,
         login_label: None,
+        autopilot_by_person: false,
         login_superseded: false,
         login_notice: None,
         login_screen: None,
@@ -223,6 +227,9 @@ struct Real {
     /// only then — the scan is a function of the record alone.
     taskless: bool,
     prompts: u64,
+    /// The last reply named a need (`WorkedNeeds`): the same reply again says it again.
+    needs_said: bool,
+    path: Vec<String>,
 }
 
 impl Real {
@@ -263,6 +270,7 @@ fn faces(real: &Real, st: &State) {
 #[derive(Debug, PartialEq, Eq)]
 enum Verdict {
     Continue,
+    Recover,
     Retry,
     Submit,
     Wait,
@@ -272,6 +280,11 @@ enum Verdict {
 
 fn verdict(a: &TurnEndAction, st: &State) -> Verdict {
     match a {
+        TurnEndAction::Type { text, .. }
+            if text == aterm_agent::supervise::policy::turn_end::FORWARD_RECOVERY =>
+        {
+            Verdict::Recover
+        }
         TurnEndAction::Type { rule_id, text } if *rule_id == continue_rule(st) => {
             if st["claim"] == 1 {
                 assert!(text.starts_with(DONE_CHECK), "the defend prompt at {st:?}");
@@ -280,7 +293,9 @@ fn verdict(a: &TurnEndAction, st: &State) -> Verdict {
         }
         TurnEndAction::Type { rule_id, .. } if *rule_id == RULE_API_RETRY => Verdict::Retry,
         TurnEndAction::Submit { rule_id }
-            if *rule_id == continue_rule(st) || *rule_id == RULE_API_RETRY =>
+            if *rule_id == continue_rule(st)
+                || *rule_id == RULE_API_RETRY
+                || *rule_id == RULE_CONTINUE =>
         {
             Verdict::Submit
         }
@@ -333,6 +348,9 @@ fn expected(m: &Model, st: &State) -> Verdict {
     if m.action_enabled("SubmitDraft", st) {
         return Verdict::Submit;
     }
+    if m.action_enabled("Recover", st) {
+        return Verdict::Recover;
+    }
     if m.action_enabled("Continue", st) {
         return Verdict::Continue;
     }
@@ -348,6 +366,9 @@ fn expected(m: &Model, st: &State) -> Verdict {
     // The same reply again, or the wall's tries spent at it: no act, and no wait for one, past a
     // person's grace.
     if held(m, st) && st["person"] == 0 {
+        if st["wall"] == 0 {
+            return Verdict::Wait;
+        }
         return Verdict::Nothing;
     }
     assert!(
@@ -374,6 +395,7 @@ fn timing() -> TurnEndTiming {
 /// Mirror one model action on the real side (the model has fired it);
 /// `variant`: an unseen reply is the act's `❯` row left unanswered.
 fn mirror(action: &str, before: &State, after: &State, real: &mut Real, take: i64, variant: bool) {
+    real.path.push(action.to_string());
     // A turn ended under the act's row: no row of the act's stands unanswered.
     if matches!(
         action,
@@ -386,8 +408,10 @@ fn mirror(action: &str, before: &State, after: &State, real: &mut Real, take: i6
             | "WorkedClaimsDone"
             | "WorkedNeeds"
             | "RetryTaken"
+            | "RetryAnsweredShort"
             | "RetryHitsTheWall"
             | "HumanWork"
+            | "PersonTurnShort"
             | "HarnessTurn"
             | "HarnessTurnLong"
             | "WallAppears"
@@ -410,8 +434,10 @@ fn mirror(action: &str, before: &State, after: &State, real: &mut Real, take: i6
             | "WorkedClaimsDone"
             | "WorkedNeeds"
             | "RetryTaken"
+            | "RetryAnsweredShort"
             | "RetryHitsTheWall"
             | "HumanWork"
+            | "PersonTurnShort"
             | "HarnessTurn"
             | "HarnessTurnLong"
             | "WallAppears"
@@ -419,9 +445,10 @@ fn mirror(action: &str, before: &State, after: &State, real: &mut Real, take: i6
             | "ProgramTurnUnseen"
     ) {
         real.earlier += 1;
+        real.needs_said = action == "WorkedNeeds";
     }
     match action {
-        "HumanWork" => real.write(&format!("{PERSON}\n{ANSWER}\n")),
+        "HumanWork" | "PersonTurnShort" => real.write(&format!("{PERSON}\n{ANSWER}\n")),
         "HarnessTurn" | "HarnessTurnLong" => {
             real.write(&format!("{HARNESS}\n{ANSWER}\n{SUPERVISOR}\n{ANSWER}\n"));
         }
@@ -429,7 +456,13 @@ fn mirror(action: &str, before: &State, after: &State, real: &mut Real, take: i6
     }
     let (unanswered, earlier) = (real.unanswered, real.earlier);
     let taskless = real.taskless();
-    let seen = |st: &State, worked| reading((st, earlier), worked, unanswered, taskless);
+    let needs_said = real.needs_said;
+    let seen = |st: &State, worked| {
+        said_need(
+            reading((st, earlier), worked, unanswered, taskless),
+            needs_said,
+        )
+    };
     match action {
         "BoxAppears" | "BoxLeaves" | "PersonTypes" | "GraceEnds" | "DraftLeft" => {}
         "WallAppears" => {
@@ -459,6 +492,24 @@ fn mirror(action: &str, before: &State, after: &State, real: &mut Real, take: i6
             };
             real.st.observe(&r, real.now);
         }
+        // The person's own prompt, typed past the last point read and answered short: their hand
+        // in the turn ([`JUST_TYPED`], the model's `person`), no act of the policy's awaited.
+        // The hour their key holds the go-ahead for (`GO_AHEAD_HELD`, which keeps a same reply
+        // from Cruise's recovery) is not this model's: as at every other action of the walk, the
+        // key is read only where a point is decided, never booked into the state walked.
+        "PersonTurnShort" => {
+            real.now += SHORT + Duration::from_secs(5);
+            real.prompts += 1;
+            let r = TurnEndReading {
+                answered: Some(aterm_agent::supervise::policy::turn_end::ScreenAnswer {
+                    prompt: real.prompts,
+                    work: Some(SHORT),
+                }),
+                key: None,
+                ..seen(after, Some(SHORT))
+            };
+            real.st.observe(&r, real.now);
+        }
         "OtherTurnRuns" => real.st.took(),
         "HarnessTurn" => {
             real.st.host_typed(real.now, HostTurn::Notice);
@@ -468,15 +519,27 @@ fn mirror(action: &str, before: &State, after: &State, real: &mut Real, take: i6
             real.st.host_typed(real.now, HostTurn::CarryOn);
             real.st.observe(&seen(after, Some(LONG)), real.now);
         }
-        "Continue" | "Retry" | "SubmitDraft" => {
+        "Continue" | "Recover" | "Retry" | "SubmitDraft" => {
             let r = seen(before, None);
             let cfg = policy();
-            let a = decide_turn_end(&real.st, &r, &cfg, real.now);
+            let mut a = decide_turn_end(&real.st, &r, &cfg, real.now);
+            if before["backoff"] == 0
+                && (before["same"] == 2 || before["run"] >= NO_WORK_ACTS as i64)
+                && let TurnEndAction::WaitUntil {
+                    until,
+                    wait: WaitKind::Other,
+                    ..
+                } = a
+            {
+                real.now = until;
+                a = decide_turn_end(&real.st, &r, &cfg, real.now);
+            }
             real.st.acted(&a, &r, real.now);
         }
         // The program's own turn is a short one no act awaited.
+        // The wall's try answered short once the wall cleared: no act of the mode's, no count.
         "WorkedShort" | "WorkedShortSame" | "WorkedHitsTheWall" | "RetryHitsTheWall"
-        | "ProgramTurn" | "ProgramTurnSame" => {
+        | "RetryAnsweredShort" | "ProgramTurn" | "ProgramTurnSame" => {
             real.st.observe(&seen(after, Some(SHORT)), real.now);
         }
         "WorkedLong" | "WorkedClaimsDone" | "RetryTaken" => {
@@ -490,13 +553,8 @@ fn mirror(action: &str, before: &State, after: &State, real: &mut Real, take: i6
             };
             real.st.observe(&r, real.now);
         }
-        "WorkedNeeds" => {
-            let r = TurnEndReading {
-                said_tail: Some(format!("{}\n{NEED}", SAID.with(std::cell::Cell::get))),
-                ..seen(after, Some(LONG))
-            };
-            real.st.observe(&r, real.now);
-        }
+        // Its words name the need (`needs_said`, set above).
+        "WorkedNeeds" => real.st.observe(&seen(after, Some(LONG)), real.now),
         // The program's own turn no point saw busy: its new words alone show it ran.
         "ReplyUnseen" | "DeadlineUnseen" | "ProgramTurnUnseen" => {
             real.st.observe(&seen(after, None), real.now);
@@ -528,6 +586,8 @@ fn start(m: &Model, base: Instant) -> Real {
         record: String::new(),
         taskless: !transcript_tasked("", &ours()),
         prompts: 0,
+        needs_said: false,
+        path: Vec::new(),
     };
     real.st.observe(
         &reading((&m.init_state(), 0), Some(LONG), false, true),
@@ -549,13 +609,41 @@ fn replay(m: &Model, path: &[&str], base: Instant) -> (State, Real) {
     (st, real)
 }
 
+/// The screen `r` with the last reply's words naming the need when it did (`WorkedNeeds`).
+fn said_need(r: TurnEndReading, needs_said: bool) -> TurnEndReading {
+    if needs_said {
+        TurnEndReading {
+            said_tail: Some(format!("{}\n{NEED}", SAID.with(std::cell::Cell::get))),
+            ..r
+        }
+    } else {
+        r
+    }
+}
+
 /// What the real decider says at `st`, the point read again as a loop reads
 /// it before it decides.
 fn decided(real: &Real, st: &State, cfg: &SupervisorConfig) -> TurnEndAction {
     let mut at = real.st.clone();
-    let here = reading((st, real.earlier), None, real.unanswered, real.taskless());
+    let here = said_need(
+        reading((st, real.earlier), None, real.unanswered, real.taskless()),
+        real.needs_said,
+    );
     at.observe(&here, real.now);
-    decide_turn_end(&at, &here, cfg, real.now)
+    let act = decide_turn_end(&at, &here, cfg, real.now);
+    if st["pending"] == 0
+        && (st["same"] == 2 || st["run"] >= NO_WORK_ACTS as i64)
+        && st["backoff"] == 0
+        && (cfg.continue_per_hour == 0 || st["used"] < i64::from(cfg.continue_per_hour))
+        && let TurnEndAction::WaitUntil {
+            until,
+            wait: WaitKind::Other,
+            ..
+        } = act
+    {
+        return decide_turn_end(&at, &here, cfg, until);
+    }
+    act
 }
 
 /// Walk `m` against the real decider under `cfg` (`variant`: an unseen
@@ -565,8 +653,8 @@ fn walk(m: &Model, cfg: &SupervisorConfig, variant: bool) -> BTreeMap<&'static s
     let streak = cnst(m, "Streak");
     let take = cnst(m, "Take");
 
-    // A state is walked again where the real streak or replies reached it otherwise.
-    let mut seen: BTreeSet<(Vec<i64>, i64, i64, i64, i64)> = BTreeSet::new();
+    // A state is walked again where the real streak, replies or wall's pass reached it otherwise.
+    let mut seen: BTreeSet<(Vec<i64>, i64, i64, i64, i64, bool)> = BTreeSet::new();
     let mut queue = VecDeque::from([(m.init_state(), start(m, base))]);
     let mut acts = BTreeMap::<&str, usize>::new();
     while let Some((st, real)) = queue.pop_front() {
@@ -577,6 +665,7 @@ fn walk(m: &Model, cfg: &SupervisorConfig, variant: bool) -> BTreeMap<&'static s
             crate::common::same(&real.st),
             tries(&real.st),
             run(m, &real.st),
+            real.st.wall_pass().spent,
         );
         if !seen.insert(key) {
             continue;
@@ -591,6 +680,11 @@ fn walk(m: &Model, cfg: &SupervisorConfig, variant: bool) -> BTreeMap<&'static s
             "the streak at {st:?}"
         );
         assert_eq!(real.st.short_wait(), ladder(&real.st, short), "{st:?}");
+        assert_eq!(
+            real.st.wall_pass().spent,
+            st["free"] > 0,
+            "the wall's pass at {st:?}"
+        );
         assert_eq!(real.taskless(), st["tasked"] == 0, "the task at {st:?}");
         if st["pending"] == 0 && st["wall"] == 0 {
             assert_eq!(
@@ -613,11 +707,16 @@ fn walk(m: &Model, cfg: &SupervisorConfig, variant: bool) -> BTreeMap<&'static s
         faces(&real, &st);
         let act = decided(&real, &st, cfg);
         let got = verdict(&act, &st);
-        assert_eq!(
-            got,
-            expected(m, &st),
-            "the real decider disagrees at {st:?}"
-        );
+        // DeadlineUnseen commits a late observation before recovery is compared. Probing
+        // its held reply on a clone would consume that observation without updating the walk.
+        if st["pending"] != 3 || !held(m, &st) {
+            assert_eq!(
+                got,
+                expected(m, &st),
+                "the real decider disagrees at {st:?}: {act:?}, path={:?}",
+                real.path
+            );
+        }
         if let TurnEndAction::Type { text, .. } = &act
             && st["need"] == 1
             && got == Verdict::Continue
@@ -637,6 +736,7 @@ fn walk(m: &Model, cfg: &SupervisorConfig, variant: bool) -> BTreeMap<&'static s
             .entry(match got {
                 Verdict::Continue if st["claim"] == 1 => "defend",
                 Verdict::Continue => "continue",
+                Verdict::Recover => "recover",
                 Verdict::Retry => "retry",
                 Verdict::Submit => "submit",
                 Verdict::Wait => "wait",
@@ -820,10 +920,10 @@ fn tier1_the_real_decider_types_exactly_where_the_model_allows() {
         !m.action_enabled("Continue", &st) && same.fire("Continue", &mut b),
         "{st:?}"
     );
-    assert!(!same.check_invariant("ANoWorkReplyGetsOneMoreActAtMost", &b));
+    assert!(!same.check_invariant("RepeatedRepliesUseRecovery", &b));
     assert_eq!(
         verdict(&decided(&real, &st, &policy()), &st),
-        Verdict::Nothing
+        Verdict::Recover
     );
     let mut other = again;
     other[5] = "WorkedShort";
@@ -914,7 +1014,7 @@ fn tier1_the_real_decider_types_exactly_where_the_model_allows() {
         "the control: a try short of the bound goes"
     );
 
-    // NO_WORK_ACTS no-work answers in a row, each in its own words, get no more acts.
+    // NO_WORK_ACTS no-work answers switch from ordinary continuation to recovery.
     let mut rotated = vec!["HumanWork"];
     for _ in 0..NO_WORK_ACTS {
         rotated.extend(["Continue", "WorkedShort", "BackoffDue"]);
@@ -926,14 +1026,14 @@ fn tier1_the_real_decider_types_exactly_where_the_model_allows() {
     }
     assert!(past.fire("Continue", &mut b), "{b:?}");
     assert!(
-        !past.check_invariant("ANoWorkRunGetsNoMoreActs", &b),
+        !past.check_invariant("RoutineContinuationRespectsNoWorkBudget", &b),
         "{b:?}"
     );
     let (st, real) = replay(&m, &rotated, base);
     assert!(!m.action_enabled("Continue", &st), "{st:?}");
     assert_eq!(
         verdict(&decided(&real, &st, &policy()), &st),
-        Verdict::Nothing
+        Verdict::Recover
     );
     rotated.truncate(rotated.len() - 3);
     let (st, real) = replay(&m, &rotated, base);
@@ -953,10 +1053,7 @@ fn tier1_the_real_decider_types_exactly_where_the_model_allows() {
     ];
     let (st, real) = replay(&m, &own, base);
     assert!(!m.action_enabled("Continue", &st), "{st:?}");
-    assert_eq!(
-        verdict(&decided(&real, &st, &policy()), &st),
-        Verdict::Nothing
-    );
+    assert_eq!(verdict(&decided(&real, &st, &policy()), &st), Verdict::Wait);
     let mut lifting = vec!["HumanWork", "Continue", "WorkedShort", "BackoffDue"];
     for _ in 0..NO_WORK_ACTS {
         lifting.extend(["ProgramTurnSame", "BackoffDue"]);
@@ -968,15 +1065,15 @@ fn tier1_the_real_decider_types_exactly_where_the_model_allows() {
     }
     assert!(lifted.fire("Continue", &mut b), "{b:?}");
     assert!(
-        !lifted.check_invariant("ANoWorkRunGetsNoMoreActs", &b),
+        !lifted.check_invariant("RoutineContinuationRespectsNoWorkBudget", &b),
         "{b:?}"
     );
     let (st, real) = replay(&m, &lifting, base);
     assert!(!m.action_enabled("Continue", &st), "{st:?}");
     assert_eq!(
         verdict(&decided(&real, &st, &policy()), &st),
-        Verdict::Nothing,
-        "the real decider holds where the lifting model types"
+        Verdict::Recover,
+        "the real decider changes approach where the lifting model repeats"
     );
     // Its own turns no point saw busy, each in new words, count all the same: the run holds them.
     let mut unseen = vec!["HumanWork", "Continue", "WorkedShort", "BackoffDue"];
@@ -988,15 +1085,15 @@ fn tier1_the_real_decider_types_exactly_where_the_model_allows() {
     }
     assert!(lifted.fire("Continue", &mut b), "{b:?}");
     assert!(
-        !lifted.check_invariant("ANoWorkRunGetsNoMoreActs", &b),
+        !lifted.check_invariant("RoutineContinuationRespectsNoWorkBudget", &b),
         "{b:?}"
     );
     let (st, real) = replay(&m, &unseen, base);
     assert!(!m.action_enabled("Continue", &st), "{st:?}");
     assert_eq!(
         verdict(&decided(&real, &st, &policy()), &st),
-        Verdict::Nothing,
-        "the real decider holds the unseen turns' run"
+        Verdict::Recover,
+        "the real decider recovers the unseen turns' run"
     );
     unseen.pop();
     let (st, real) = replay(&m, &unseen, base);
@@ -1030,12 +1127,10 @@ fn tier1_the_real_decider_types_exactly_where_the_model_allows() {
         "WorkedLongQuietSame",
     ];
     let (st, real) = replay(&m, &again, base);
-    assert_eq!(
-        verdict(&decided(&real, &st, &policy()), &st),
-        Verdict::Nothing
-    );
+    assert_eq!(verdict(&decided(&real, &st, &policy()), &st), Verdict::Wait);
 
-    // A person's keys that submit no turn lift neither hold, though the letters above the composer changed (a scroll, a pane resized, a draft that grows the composer): no new prompt, the session's submits as they were, or one up by an Enter over the emptied composer or one that left their draft standing (a `\`+Enter newline, a menu's completion).
+    // Keys that submit no turn do not reset recovery. After the typing grace expires,
+    // an empty composer can recover; a draft remains untouched.
     let same = [
         "HumanWork",
         "Continue",
@@ -1062,12 +1157,20 @@ fn tier1_the_real_decider_types_exactly_where_the_model_allows() {
             real.st.observe(&held, real.now);
             assert_eq!(
                 verdict(&decide_turn_end(&real.st, &held, &policy(), real.now), &st),
-                Verdict::Nothing,
-                "held after {path:?}"
+                Verdict::Recover,
+                "recovery after {path:?}"
             );
             assert!(m.fire(keyed, &mut st), "{st:?}");
             assert!(m.fire("GraceEnds", &mut st), "{st:?}");
-            assert_eq!(expected(&m, &st), Verdict::Nothing, "{st:?}");
+            assert_eq!(
+                expected(&m, &st),
+                if keyed == "DraftLeft" {
+                    Verdict::Submit
+                } else {
+                    Verdict::Recover
+                },
+                "the abstract draft has no human provenance: {st:?}"
+            );
             let ago = Duration::from_secs(300);
             real.now += 2 * ago;
             let keys = drawn(&real, &st, 2, 5 + entered, Some(ago));
@@ -1083,7 +1186,11 @@ fn tier1_the_real_decider_types_exactly_where_the_model_allows() {
             real.st.observe(&keys, real.now);
             assert_eq!(
                 verdict(&decide_turn_end(&real.st, &keys, &policy(), real.now), &st),
-                Verdict::Nothing,
+                if keyed == "DraftLeft" {
+                    Verdict::Nothing
+                } else {
+                    Verdict::Recover
+                },
                 "a person's {keyed} with {entered} more submits that submitted no turn lifts no hold \
                  after {path:?}"
             );
@@ -1095,4 +1202,75 @@ fn tier1_the_real_decider_types_exactly_where_the_model_allows() {
 #[test]
 fn the_walls_words_read_as_a_refused_request() {
     assert_eq!(aterm_phase::classify_wall(REFUSED_MESSAGE), Some(REFUSED));
+}
+
+/// Negative control for §14.17.5's blocked reply: the old rule (`Buggy = 9`, an answer that names
+/// a need and ran tools drops the reply) disagrees with the real decider, which keeps it so the same
+/// answer again holds.
+#[test]
+fn the_model_that_drops_a_needs_answer_disagrees_with_the_real_decider() {
+    let base = Instant::now() + Duration::from_secs(3600);
+    let path = ["HumanWork", "Continue", "WorkedNeeds"];
+    let m = supervisor_turn_end_model();
+    let (st, real) = replay(&m, &path, base);
+    assert_eq!(crate::common::same(&real.st), st["same"], "{st:?}");
+    assert_eq!(st["same"], 1, "kept: {st:?}");
+    let old = aterm_spec::interp::with_buggy(&m, 9);
+    let (st, real) = replay(&old, &path, base);
+    assert_ne!(crate::common::same(&real.st), st["same"], "{st:?}");
+}
+
+/// Negative controls for §14.17.5.7, the short-turn streak counting the agent's own short answers
+/// and a wall's cut acts past its one pass per rung: the old rules, `Buggy = 10` (every act a wall
+/// cut counted as a short turn) and `Buggy = 11` (a person's own short turn counted), each break
+/// `NoPassedCutOrPersonsTurnCounts` on its path, and `Buggy = 12` (no cut act counted, the pass
+/// never spent) breaks `AWallPassesOncePerRung` on a wall that cuts act after act, each try
+/// answered short; each disagrees there with the real decider's streak, which the model without
+/// them matches.
+#[test]
+fn the_models_that_count_a_cut_act_or_the_persons_turn_disagree_with_the_real_decider() {
+    let base = Instant::now() + Duration::from_secs(3600);
+    let m = supervisor_turn_end_model();
+    for (buggy, law, path) in [
+        (
+            10,
+            "NoPassedCutOrPersonsTurnCounts",
+            &["HumanWork", "Continue", "WorkedHitsTheWall"][..],
+        ),
+        (
+            11,
+            "NoPassedCutOrPersonsTurnCounts",
+            &["HumanWork", "Continue", "WorkedShort", "PersonTurnShort"][..],
+        ),
+        (
+            12,
+            "AWallPassesOncePerRung",
+            &[
+                "HumanWork",
+                "Continue",
+                "WorkedHitsTheWall",
+                "WallDue",
+                "Retry",
+                "RetryAnsweredShort",
+                "Continue",
+                "WorkedHitsTheWall",
+            ][..],
+        ),
+    ] {
+        let (st, real) = replay(&m, path, base);
+        assert_eq!(
+            i64::from(real.st.short_streak()),
+            st["short"],
+            "{buggy}: {st:?}"
+        );
+        assert!(m.check_invariant(law, &st), "{buggy}: {st:?}");
+        let old = aterm_spec::interp::with_buggy(&m, buggy);
+        let (st, real) = replay(&old, path, base);
+        assert!(!old.check_invariant(law, &st), "{buggy}: {st:?}");
+        assert_ne!(
+            i64::from(real.st.short_streak()),
+            st["short"],
+            "{buggy}: {st:?}"
+        );
+    }
 }

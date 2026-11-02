@@ -359,4 +359,4 @@ fn a_break_no_host_wants_is_said_only_once_it_stood_the_settle() {
 }
 
 #[path = "occupancy_loop_tests.rs"]
-mod occupancy;
+pub(crate) mod occupancy;

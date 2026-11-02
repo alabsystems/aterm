@@ -5,6 +5,8 @@
 //! takes a PUT only when its signer and handoff chain check out, holds long-polls, and queues
 //! join requests, under per-server and per-address caps.
 
+mod heard;
+
 use crate::envelope::{self, MAX_ENVELOPE};
 use crate::transport::{JoinRequest, parse_join_line};
 use crate::wake::{Bell, Wake};
@@ -87,7 +89,7 @@ const JOIN_NOTE_EVERY_SECS: u64 = 60 * 60;
 /// How long before an unchanged join re-post refreshes its queue time ([`JOIN_TTL_SECS`]).
 pub(crate) const JOIN_REFRESH_EVERY_SECS: u64 = 60 * 60;
 /// The most subscriber last-heard records kept per vault (`<name>.heard`).
-pub const MAX_HEARD: usize = 512;
+pub use crate::transport::MAX_HEARD;
 /// The largest `.heard` file read ([`MAX_HEARD`]).
 const MAX_HEARD_FILE: usize = MAX_HEARD * 128;
 /// How long a subscriber's last-heard record is kept without a newer poll (90 days).
@@ -114,6 +116,31 @@ const LINGER_DEADLINE: Duration = Duration::from_secs(2);
 const PROGRAM_EVERY: Duration = Duration::from_secs(5);
 /// How long a server stopping for a new program waits for the answers in flight.
 const DRAIN_DEADLINE: Duration = Duration::from_secs(10);
+/// How long [`Running::stop`] waits to connect to its own listener, which wakes its accept loop.
+const STOP_WAKE_CONNECT: Duration = Duration::from_secs(5);
+/// The longest a server stopping for a new program takes from its last answer to its end
+/// ([`supervise`]): the wake connect [`Running::stop`] makes and the drain
+/// ([`DRAIN_DEADLINE`]). Its registrations end, and a holder of `alab-secrets` leaves its
+/// [`HeldStamp`], only at that end ([`Children`]' drop).
+const STOP_TAKES: Duration =
+    Duration::from_secs(STOP_WAKE_CONNECT.as_secs() + DRAIN_DEADLINE.as_secs());
+/// How often a server whose address another process holds tries it again
+/// ([`bind_when_free`]).
+const BIND_AGAIN_EVERY: Duration = Duration::from_secs(60);
+/// The file a server that stops while it holds `alab-secrets` leaves in its store
+/// ([`HeldStamp`]), for the server that starts in its place ([`AlabNameWatcher::resume`]).
+const ALAB_HELD_FILE: &str = ".alab-held";
+/// How long after a server that held `alab-secrets` stopped the server started in its place
+/// may take the name back at once ([`AlabNameWatcher::resume`]): its first decision must come
+/// within this of the stamp. Every other server that follows the probe takes the name only
+/// after [`ALAB_FALLBACK_AFTER`] in which nothing answered there, counted from a round of its
+/// own after the holder stopped answering, which was at most [`STOP_TAKES`] before the stamp;
+/// one round ([`ADVERTISE_EVERY`]) of what is left is kept as a margin. A device that registers
+/// the name with no probe can hold it anyway, and takes it from this one by mDNS
+/// ([`AlabNameWatcher::lost_name`]).
+const ALAB_RESUME_WITHIN: Duration = Duration::from_secs(
+    ALAB_FALLBACK_AFTER.as_secs() - STOP_TAKES.as_secs() - ADVERTISE_EVERY.as_secs(),
+);
 
 /// Canonical `(m_number_or_max, label)` sort key for F7's lower-label tie-break (`m3` < `m19` <
 /// non-`m<N>` labels).
@@ -137,8 +164,8 @@ pub struct AlabNameInput<'a> {
     /// Sequence of the verified ALab vault envelope currently held in this server's store (`None`
     /// while empty).
     pub own_seq: Option<u64>,
-    /// All `alab-secrets` / `alab-secrets (<N>)` `_alab-vault._tcp` registrations currently
-    /// observed on the LAN.
+    /// Resolved `alab-secrets` / `alab-secrets (<N>)` registrations from this bounded
+    /// browse pass. A rotating watch visits the remaining holders on later passes.
     pub holders: &'a [crate::discover::DiscoveredVault],
     /// Monotone wall-clock instant for fallback duration measurement.
     pub now: Instant,
@@ -148,11 +175,12 @@ pub struct AlabNameInput<'a> {
 /// alongside its own `<label>.local` (`docs/DESIGN-fluid-swarm-2026-10-28.md` §4.1 F7).
 ///
 /// - Every server probes `alab-secrets.local` itself and takes the name only after
-///   [`ALAB_FALLBACK_AFTER`] (90 s) in which nothing answered there with a verified ALab envelope,
-///   so a returning server leaves the name to any holder that answers.
+///   [`ALAB_FALLBACK_AFTER`] (90 s) in which nothing answered there with a verified ALab envelope
+///   at least as new as its own, so a returning server leaves an up-to-date holder in place.
 /// - When two `>= 0.146` holders collide after a partition heal, every server settles them by one
-///   strict order read from `_alab-vault._tcp` TXT (`seq` descending, then `label` ascending); the
-///   loser withdraws and serves under its own label.
+///   strict order of verified envelope sequence descending, then discovery label ascending;
+///   the loser withdraws and serves under its own label. TXT sequence is not evidence, and a
+///   verified public envelope does not authenticate the serving device or its label.
 /// - mDNS lets only one of two holders keep the name, and hides the other's instance from the
 ///   order above: a holder whose registration ends that way lets the name go
 ///   ([`Self::lost_name`]).
@@ -163,6 +191,68 @@ pub struct AlabNameInput<'a> {
 pub struct AlabNameWatcher {
     holding: bool,
     failing_since: Option<Instant>,
+    /// The `seq` a [`HeldStamp`] let this watcher take the name back at, on its first
+    /// [`Self::decide`], and the instant by which that decision must come ([`Self::resume`]).
+    resumed: Option<(u64, Instant)>,
+}
+
+/// What a server that stopped while it held `alab-secrets` left in its store
+/// ([`ALAB_HELD_FILE`], [`Children`]' drop): when it stopped (unix milliseconds) and the `seq`
+/// of the ALab envelope it advertised under the name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HeldStamp {
+    pub(crate) at_ms: u64,
+    pub(crate) seq: u64,
+}
+
+impl HeldStamp {
+    fn line(self) -> String {
+        format!("{} {}\n", self.at_ms, self.seq)
+    }
+
+    fn parse(text: &str) -> Option<HeldStamp> {
+        let (at_ms, seq) = text.strip_suffix('\n')?.split_once(' ')?;
+        Some(HeldStamp {
+            at_ms: at_ms.parse().ok()?,
+            seq: seq.parse().ok()?,
+        })
+    }
+}
+
+/// Leave `stamp` at `path` as this server stops ([`HeldStamp`]); the log says when it cannot.
+fn leave_held_stamp(path: &Path, stamp: HeldStamp) {
+    if let Err(e) = fsx::write_atomic(path, stamp.line().as_bytes(), 0o600) {
+        note(&format!(
+            "could not note that this server held {}.local as it stopped: {e}",
+            crate::alab_advertised()
+        ));
+    }
+}
+
+/// The stamp a server that stopped left at `path`, removed as it is read: a server reads it
+/// once, as it starts ([`AlabNameWatcher::resume`]).
+fn take_held_stamp(path: &Path) -> Option<HeldStamp> {
+    let bytes = fsx::read_owned(path, 64).ok().flatten();
+    let _ = std::fs::remove_file(path);
+    HeldStamp::parse(std::str::from_utf8(&bytes?).ok()?)
+}
+
+/// The stamp this server leaves as it stops at `now_ms` ([`HeldStamp`]): one while a
+/// registration of `alab-secrets` it holds in `slot` is still up, at the highest `seq` its TXT
+/// advertises. A registration a will-sleep took ([`take_for_sleep`]), or one that ended by
+/// itself, leaves none.
+fn held_alab(slot: &mut DnsSdSlot, now_ms: u64) -> Option<HeldStamp> {
+    if slot.held_name.as_deref() != Some(crate::alab_advertised()) {
+        return None;
+    }
+    slot.held
+        .iter_mut()
+        .filter_map(|(_, txt, child)| {
+            let seq = txt.as_ref()?.seq;
+            matches!(child.try_wait(), Ok(None)).then_some(seq)
+        })
+        .max()
+        .map(|seq| HeldStamp { at_ms: now_ms, seq })
 }
 
 impl AlabNameWatcher {
@@ -172,23 +262,56 @@ impl AlabNameWatcher {
         Self::default()
     }
 
+    /// The watcher of a server that starts at `now_ms` (unix milliseconds; `now` is the same
+    /// instant) where one stopped, which left `stamp` if it held `alab-secrets` as it stopped
+    /// (an update that replaced the program, a move of the server's job); this Mac's last sleep
+    /// began at `slept_ms` (unix milliseconds). When this Mac has not slept since that server
+    /// stopped, a first [`Self::decide`] that comes within [`ALAB_RESUME_WITHIN`] of the stop
+    /// takes the name back at once if this server's ALab envelope is at least as new as the one
+    /// advertised there, where a new watcher waits [`ALAB_FALLBACK_AFTER`] first: no other
+    /// server that follows the probe takes the name in that time, and a device that holds it
+    /// anyway takes it from this one as at any registration ([`Self::lost_name`]). A first
+    /// decision that comes later (a round that decided nothing for a while) takes nothing back.
+    /// A Mac that slept since gave the name up as it slept ([`Self::slept`]), so another may
+    /// hold it now, and its server competes for it by the probe and [`ALAB_FALLBACK_AFTER`] as
+    /// any server that does not hold it does.
+    pub(crate) fn resume(
+        stamp: Option<HeldStamp>,
+        now_ms: u64,
+        now: Instant,
+        slept_ms: Option<u64>,
+    ) -> Self {
+        let resumed = stamp
+            .filter(|stamp| slept_ms.is_none_or(|slept| slept < stamp.at_ms))
+            .and_then(|stamp| {
+                let age = Duration::from_millis(now_ms.checked_sub(stamp.at_ms)?);
+                Some((stamp.seq, now + ALAB_RESUME_WITHIN.checked_sub(age)?))
+            });
+        Self {
+            resumed,
+            ..Self::default()
+        }
+    }
+
     /// Whether this server currently holds `alab-secrets`.
     #[must_use]
     pub const fn is_holding(&self) -> bool {
         self.holding
     }
 
-    /// This server's `alab-secrets` registration ended by itself while it held the name. mDNS
-    /// keeps one host per name, and `dns-sd -P` gives a name up to a device that already answers
-    /// to it. That device's registration also hides this server's `_alab-vault._tcp` instance, so
-    /// neither holder hears the other and the (`seq`, `label`) order in [`Self::decide`] never
-    /// meets them: the name stays with the one mDNS kept. This lets it go and listens again. The
+    /// This server's `alab-secrets` registration ended by itself while it held the name, and
+    /// another device answers to it ([`reregister_roles`]). mDNS keeps one host per name, and
+    /// `dns-sd -P` gives a name up to a device that already answers to it. That device's
+    /// registration also hides this server's `_alab-vault._tcp` instance, so neither holder
+    /// hears the other and the (`seq`, `label`) order in [`Self::decide`] never meets them:
+    /// the name stays with the one mDNS kept. This lets it go and listens again. The
     /// next [`Self::decide`] probes `alab-secrets.local`, stays off while a holder answers there,
     /// and takes the name again only after [`ALAB_FALLBACK_AFTER`] in which none does. The heads
     /// still meet: the holder pulls a newer one from this server's own-label instance (F6).
     pub fn lost_name(&mut self) {
         self.holding = false;
         self.failing_since = None;
+        self.resumed = None;
     }
 
     /// This Mac went to sleep, and this server ended its registrations before it let the Mac
@@ -196,10 +319,12 @@ impl AlabNameWatcher {
     /// for while nothing serves it. This lets the name go, as [`Self::lost_name`] does, and
     /// forgets how long nothing answered there (a sleep stops that clock): on wake the next
     /// [`Self::decide`] competes for the name by the same probe and [`ALAB_FALLBACK_AFTER`] as
-    /// any server that does not hold it.
+    /// any server that does not hold it. A server that started where a holder stopped
+    /// ([`Self::resume`]) and slept before its first decision takes nothing back either.
     pub fn slept(&mut self) {
         self.holding = false;
         self.failing_since = None;
+        self.resumed = None;
     }
 
     /// Decide whether this server should advertise `alab-secrets` on this tick.
@@ -211,6 +336,11 @@ impl AlabNameWatcher {
         input: &AlabNameInput<'_>,
         mut probe_alab: impl FnMut(&str) -> Option<u64>,
     ) -> bool {
+        let resumed = self
+            .resumed
+            .take()
+            .filter(|&(_, by)| input.now <= by)
+            .map(|(seq, _)| seq);
         let Some(own_seq) = input.own_seq.filter(|&seq| seq >= 1) else {
             self.holding = false;
             self.failing_since = None;
@@ -221,11 +351,15 @@ impl AlabNameWatcher {
             self.failing_since = None;
             return false;
         };
+        if resumed.is_some_and(|seq| own_seq >= seq) {
+            self.holding = true;
+            self.failing_since = None;
+        }
 
         let peer_outranks = |holders: &[crate::discover::DiscoveredVault],
                              probe: &mut dyn FnMut(&str) -> Option<u64>|
          -> bool {
-            for holder in holders {
+            for holder in holders.iter().take(crate::discover::MAX_CANDIDATES) {
                 match &holder.txt {
                     Some(txt) if txt.vault == crate::ALAB_VAULT => {
                         if let Some(peer_label) = txt.label.as_deref()
@@ -234,7 +368,11 @@ impl AlabNameWatcher {
                             if peer_rank.1 == own_rank.1 {
                                 continue;
                             }
-                            if txt.seq > own_seq || (txt.seq == own_seq && peer_rank < own_rank) {
+                            // TXT is a discovery hint, not evidence that this endpoint holds
+                            // that version. Only the verified response participates in rank.
+                            if probe(&holder.url).is_some_and(|seq| {
+                                seq > own_seq || (seq == own_seq && peer_rank < own_rank)
+                            }) {
                                 return true;
                             }
                         } else if probe(&holder.url).is_some_and(|seq| seq >= own_seq) {
@@ -264,10 +402,15 @@ impl AlabNameWatcher {
             return true;
         }
 
-        let holder_answers = probe_alab(crate::alab_advertised()).is_some()
-            || input.holders.iter().any(|holder| {
-                !holder.url.contains("alab-secrets.local") && probe_alab(&holder.url).is_some()
-            });
+        let holder_answers = probe_alab(crate::alab_advertised()).is_some_and(|seq| seq >= own_seq)
+            || input
+                .holders
+                .iter()
+                .take(crate::discover::MAX_CANDIDATES)
+                .any(|holder| {
+                    !holder.url.contains("alab-secrets.local")
+                        && probe_alab(&holder.url).is_some_and(|seq| seq >= own_seq)
+                });
         if holder_answers {
             self.failing_since = None;
             return false;
@@ -323,9 +466,31 @@ pub fn serve_with_role(
             main.unpark();
         });
     }
-    let listener = TcpListener::bind(options.listen)
-        .map_err(|e| Error::new(format!("listening on {}: {e}", options.listen)))?;
-    let running = start(listener, &options)?;
+    let program = std::env::current_exe().ok();
+    let started_as = program.as_deref().and_then(stamp_of);
+    let stopping = || {
+        stop_reason(
+            &signalled,
+            started_as,
+            program.as_deref().and_then(stamp_of),
+        )
+    };
+    let Some(listener) = bind_when_free(
+        options.listen,
+        BIND_AGAIN_EVERY,
+        &mut |addr| aterm_uds::kept_out(|| TcpListener::bind(addr)),
+        &stopping,
+    )?
+    else {
+        return Ok(());
+    };
+    // The home ALab LAN is told from the evidence under this Mac's secrets directory; a server
+    // started with none (a LaunchDaemon's) observes no request at home.
+    let home: Arc<dyn crate::home_lan::Place> = match &client_paths {
+        Some(paths) => Arc::new(crate::home_lan::Live::new(paths.clone())),
+        None => Arc::new(crate::home_lan::Nowhere),
+    };
+    let running = launch_at(listener, &options, Tuning::default(), home)?;
     note(&format!(
         "serving the vaults in {} on {}",
         options.store.display(),
@@ -356,7 +521,6 @@ pub fn serve_with_role(
     };
     let children = Children::default();
     children.tend_with_role(options.keep_awake, advertise, client_paths);
-    let program = std::env::current_exe().ok();
     let result = supervise(
         running,
         PROGRAM_EVERY,
@@ -365,6 +529,73 @@ pub fn serve_with_role(
     );
     drop(children);
     result
+}
+
+/// A listener on `addr` (made by `bind`) once no other process holds the address. Two logins
+/// on one Mac that are both ALab members each run a vault server on `0.0.0.0:7484`, and the
+/// one that starts second finds the address taken by the first, which serves the same vaults
+/// to both. Exiting there let launchd start it again every 10 s for good; this waits instead,
+/// trying again every `every`, and looks at least every [`PROGRAM_EVERY`] whether it should
+/// stop (`stopping`: a stop signal, which also wakes this thread, or its program replaced on
+/// disk), when it says why and returns `None`. The log says once that it waits, and again when
+/// it binds. Any other failure to bind is the error it was.
+fn bind_when_free(
+    addr: SocketAddr,
+    every: Duration,
+    bind: &mut dyn FnMut(SocketAddr) -> io::Result<TcpListener>,
+    stopping: &dyn Fn() -> Option<&'static str>,
+) -> crate::Result<Option<TcpListener>> {
+    let mut waited = false;
+    loop {
+        match bind(addr) {
+            Ok(listener) => {
+                if waited {
+                    note(&format!("{addr} is free now"));
+                }
+                return Ok(Some(listener));
+            }
+            Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
+                if !std::mem::replace(&mut waited, true) {
+                    note(&format!(
+                        "another process listens on {addr} (another login's vault server on \
+                         this Mac, say); trying again every {}s",
+                        every.as_secs()
+                    ));
+                }
+                let again = Instant::now() + every;
+                loop {
+                    if let Some(why) = stopping() {
+                        note(why);
+                        return Ok(None);
+                    }
+                    let Some(left) = again
+                        .checked_duration_since(Instant::now())
+                        .filter(|left| !left.is_zero())
+                    else {
+                        break;
+                    };
+                    std::thread::park_timeout(left.min(PROGRAM_EVERY));
+                }
+            }
+            Err(e) => return Err(Error::new(format!("listening on {addr}: {e}"))),
+        }
+    }
+}
+
+/// Why a service process stops now, if it does: a stop signal came (`signalled`), or the
+/// program it started from (stamped `was`) was replaced on disk (`now`, [`replaced`]).
+fn stop_reason(
+    signalled: &AtomicBool,
+    was: Option<Stamp>,
+    now: Option<Stamp>,
+) -> Option<&'static str> {
+    if signalled.load(Ordering::SeqCst) {
+        Some("stopped by a signal")
+    } else if replaced(was, now) {
+        Some("this program was replaced on disk; exiting so the service starts the new one")
+    } else {
+        None
+    }
 }
 
 /// An executable as it is on disk.
@@ -402,14 +633,7 @@ fn supervise(
         if running.accept.as_ref().is_none_or(JoinHandle::is_finished) {
             return running.wait();
         }
-        let stopping = if signalled.load(Ordering::SeqCst) {
-            Some("stopped by a signal")
-        } else if replaced(program, stamp()) {
-            Some("this program was replaced on disk; exiting so the service starts the new one")
-        } else {
-            None
-        };
-        if let Some(why) = stopping {
+        if let Some(why) = stop_reason(signalled, program, stamp()) {
             note(why);
             let shared = Arc::clone(&running.shared);
             running.stop();
@@ -443,9 +667,14 @@ impl Running {
                 slot.wake.notify_all();
             }
             flush_all_heard(&self.shared, &mut state);
+            if let Some(coverage) = state.heard_coverage.take()
+                && let Err(error) = coverage.finish(&state.heard, (self.shared.tuning.now)())
+            {
+                note(&format!("heard coverage was not closed cleanly: {error}"));
+            }
         }
         let wake = wake_addr(self.addr);
-        if TcpStream::connect_timeout(&wake, Duration::from_secs(5)).is_ok()
+        if TcpStream::connect_timeout(&wake, STOP_WAKE_CONNECT).is_ok()
             && let Some(accept) = self.accept.take()
         {
             let _ = accept.join();
@@ -549,6 +778,26 @@ pub fn start_with_join_change_gap(
     )
 }
 
+/// [`start_with_join_change_gap`] whose every IPv4 join request is observed on the home ALab LAN
+/// [`crate::home_lan::HomeTag::test`] ([`crate::home_lan::AtHome`]): a test's server stands in
+/// for one on the owner's LAN, where members answered.
+#[cfg(any(test, debug_assertions))]
+pub fn start_at_home(
+    listener: std::net::TcpListener,
+    options: &Options,
+    gap: Duration,
+) -> crate::Result<Running> {
+    launch_at(
+        listener,
+        options,
+        Tuning {
+            join_change_gap: gap,
+            ..Tuning::default()
+        },
+        Arc::new(crate::home_lan::AtHome),
+    )
+}
+
 /// [`start_with_join_change_gap`] with no gap, its join queue kept by the clock `now`.
 #[cfg(test)]
 pub(crate) fn start_with_clock(
@@ -571,7 +820,7 @@ pub(crate) fn start_with_clock(
 /// is posted: its reply's status.
 #[cfg(test)]
 pub(crate) fn post_join_as(running: &Running, name: &str, line: &str, peer: IpAddr) -> u16 {
-    post_join(&running.shared, name, line.as_bytes(), peer).status
+    post_join(&running.shared, name, line.as_bytes(), peer, None).status
 }
 
 /// [`start`] as a server on another Mac than its clients' ([`refuse_unheld`]).
@@ -639,6 +888,21 @@ impl Default for Tuning {
 }
 
 fn launch(listener: TcpListener, options: &Options, tuning: Tuning) -> crate::Result<Running> {
+    launch_at(
+        listener,
+        options,
+        tuning,
+        Arc::new(crate::home_lan::Nowhere),
+    )
+}
+
+/// [`launch`], telling the home ALab LAN by `home` ([`Shared::home`]).
+fn launch_at(
+    listener: TcpListener,
+    options: &Options,
+    tuning: Tuning,
+    home: Arc<dyn crate::home_lan::Place>,
+) -> crate::Result<Running> {
     for (name, _) in &options.pins {
         if !envelope::valid_name(name) {
             return Err(Error::new(
@@ -647,7 +911,12 @@ fn launch(listener: TcpListener, options: &Options, tuning: Tuning) -> crate::Re
         }
     }
     fsx::ensure_private_dir(&options.store)?;
-    let state = load(&options.store, (tuning.now)())?;
+    let mut state = load_with_pins(&options.store, (tuning.now)(), &options.pins)?;
+    state.heard_coverage = Some(heard::Coverage::begin(
+        &options.store,
+        (tuning.now)(),
+        &mut state.heard,
+    )?);
     let _ = aterm_uds::keep_out_of_children(&listener);
     let addr = listener.local_addr()?;
     let shared = Arc::new(Shared {
@@ -656,6 +925,7 @@ fn launch(listener: TcpListener, options: &Options, tuning: Tuning) -> crate::Re
         retired: (tuning.retired)(),
         hold: options.hold,
         tuning,
+        home,
         server_state: Mutex::new(state),
         stopping: AtomicBool::new(false),
         active: AtomicUsize::new(0),
@@ -663,7 +933,8 @@ fn launch(listener: TcpListener, options: &Options, tuning: Tuning) -> crate::Re
         puts: Mutex::new(Puts::default()),
         join_writes: Mutex::new(()),
         record_writes: Mutex::new(()),
-        records_pulls: PullSlots::default(),
+        records_pulls: PullSlots::new(RECORDS_PULLS_AT_ONCE),
+        envelope_pulls: PullSlots::new(ENVELOPE_PULLS_AT_ONCE),
         advertiser: Mutex::new(None),
         #[cfg(test)]
         waiting: AtomicUsize::new(0),
@@ -766,9 +1037,11 @@ fn queue_epoch() -> u64 {
 struct Queued {
     request: JoinRequest,
     peer: Option<IpAddr>,
-    /// A real POST of this recipient was observed on the LAN. Kept separately from the
-    /// first peer, which still accounts for rate limits, and persisted in the listed line.
-    observed_lan: bool,
+    /// The home ALab LAN a real POST of this request was observed on ([`crate::home_lan`]),
+    /// kept apart from the first peer, which still accounts for rate limits. Held in memory
+    /// only, and listed only while this Mac is still on that network: the asking Mac posts again
+    /// within 15 minutes wherever the two meet.
+    home: Option<crate::home_lan::HomeTag>,
     /// The vault's seq when the request was last asked (queued, changed or asked again).
     asked: u64,
     /// When its address last queued or changed it.
@@ -804,9 +1077,13 @@ struct State {
     vaults: BTreeMap<String, Slot>,
     records: BTreeMap<String, RecordSlot>,
     joins: BTreeMap<String, Vec<Queued>>,
-    heard: BTreeMap<String, BTreeMap<String, u64>>,
+    /// The home ALab LAN networks this Mac was on at the last join listing: a listing reads
+    /// `home=` against them, so a move onto or off one is a new version of every queue.
+    listed_here: Vec<crate::home_lan::HomeTag>,
+    heard: heard::History,
     heard_flushed: BTreeMap<String, u64>,
     heard_dirty: BTreeSet<String>,
+    heard_coverage: Option<heard::Coverage>,
 }
 
 struct Shared {
@@ -816,6 +1093,9 @@ struct Shared {
     retired: envelope::Retired,
     hold: Duration,
     tuning: Tuning,
+    /// Where this Mac is: whether a join request was observed on the home ALab LAN, and which
+    /// home networks this Mac is on now ([`crate::home_lan::Place`]).
+    home: Arc<dyn crate::home_lan::Place>,
     server_state: Mutex<State>,
     stopping: AtomicBool,
     active: AtomicUsize,
@@ -829,6 +1109,9 @@ struct Shared {
     record_writes: Mutex<()>,
     /// The records pulls from peers under way now ([`RECORDS_PULLS_AT_ONCE`]).
     records_pulls: PullSlots,
+    /// The pulls of a whole envelope longer than [`ENVELOPE_PEEK`] from peers under way now
+    /// ([`ENVELOPE_PULLS_AT_ONCE`]).
+    envelope_pulls: PullSlots,
     /// The bell the `vault-tend` thread naps on when advertising, rung so a new version updates
     /// its TXT at once.
     advertiser: Mutex<Option<Arc<Bell>>>,
@@ -951,7 +1234,12 @@ fn unheld_note(state: &State, pins: &[(String, [u8; 32])]) -> Option<String> {
 
 /// Read the store: every `<name>.vault` that parses and verifies, and every `<name>.joins` line
 /// that parses and has not expired.
+#[cfg(test)]
 fn load(store: &Path, now: u64) -> crate::Result<State> {
+    load_with_pins(store, now, &[])
+}
+
+fn load_with_pins(store: &Path, now: u64, pins: &[(String, [u8; 32])]) -> crate::Result<State> {
     let mut state = State::default();
     let entries =
         std::fs::read_dir(store).map_err(|e| Error::new(format!("{}: {e}", store.display())))?;
@@ -989,7 +1277,7 @@ fn load(store: &Path, now: u64) -> crate::Result<State> {
                 continue;
             }
             match fsx::read_owned(&path, crate::membership_log::MAX_RECORDS_STREAM) {
-                Ok(Some(bytes)) => match decode_records_held(&state, name, &bytes) {
+                Ok(Some(bytes)) => match decode_records_held(&state, pins, name, &bytes) {
                     Ok(decoded) => {
                         state
                             .records
@@ -1022,7 +1310,13 @@ fn load(store: &Path, now: u64) -> crate::Result<State> {
                 Ok(Some(bytes)) => {
                     let map = parse_heard(&String::from_utf8_lossy(&bytes), Some(now));
                     if !map.is_empty() {
-                        state.heard.insert(name.to_owned(), map);
+                        state.heard.insert(
+                            name.to_owned(),
+                            heard::VaultHistory {
+                                subscribers: map,
+                                anonymous: None,
+                            },
+                        );
                         state.heard_flushed.insert(name.to_owned(), now);
                     }
                 }
@@ -1072,7 +1366,9 @@ fn parse_heard(text: &str, now: Option<u64>) -> BTreeMap<String, u64> {
         let (Some(recipient), Some(at), None) = (parts.next(), parts.next(), parts.next()) else {
             continue;
         };
-        if crate::age::Recipient::parse(recipient).is_err() {
+        if crate::age::Recipient::parse(recipient).is_err()
+            || !at.bytes().all(|b| b.is_ascii_digit())
+        {
             continue;
         }
         let Ok(at) = at.parse::<u64>() else {
@@ -1114,31 +1410,49 @@ fn format_heard(map: &BTreeMap<String, u64>) -> String {
     text
 }
 
-fn record_heard(shared: &Shared, state: &mut State, name: &str, subscriber: &str, now: u64) {
-    let map = state.heard.entry(name.to_owned()).or_default();
-    map.retain(|_, &mut at| now.saturating_sub(at) <= HEARD_TTL_SECS);
-    if !map.contains_key(subscriber)
-        && map.len() >= MAX_HEARD
-        && let Some(oldest) = map
-            .iter()
-            .min_by_key(|&(_, &at)| at)
-            .map(|(recipient, _)| recipient.clone())
-    {
-        map.remove(&oldest);
+fn record_heard(
+    shared: &Shared,
+    state: &mut State,
+    name: &str,
+    subscriber: Option<&str>,
+    now: u64,
+) -> bool {
+    if shared.stopping.load(Ordering::SeqCst) || state.heard_coverage.is_none() {
+        return false;
     }
-    map.insert(subscriber.to_owned(), now);
+    let rows = state.heard.entry(name.to_owned()).or_default();
+    if let Some(subscriber) = subscriber {
+        let last = rows.subscribers.entry(subscriber.to_owned()).or_default();
+        *last = (*last).max(now);
+    } else {
+        rows.anonymous = rows.anonymous.max(Some(now));
+    }
+    let lost_recent = heard::bound(&mut state.heard, now);
+    if let Some(coverage) = state.heard_coverage.as_mut() {
+        coverage.observe_time(now);
+        if lost_recent {
+            coverage.invalidate(now);
+        }
+    }
     state.heard_dirty.insert(name.to_owned());
     let flush_due = match state.heard_flushed.get(name) {
         None => true,
         Some(&last) => now.saturating_sub(last) >= HEARD_FLUSH_SECS,
     };
     if flush_due {
-        let body = format_heard(map);
+        let body = state
+            .heard
+            .get(name)
+            .map(|rows| format_heard(&rows.subscribers))
+            .unwrap_or_default();
         if fsx::write_atomic(&shared.heard_path(name), body.as_bytes(), 0o600).is_ok() {
             state.heard_flushed.insert(name.to_owned(), now);
             state.heard_dirty.remove(name);
+        } else if let Some(coverage) = state.heard_coverage.as_mut() {
+            coverage.invalidate(now);
         }
     }
+    true
 }
 
 fn flush_all_heard(shared: &Shared, state: &mut State) {
@@ -1146,10 +1460,12 @@ fn flush_all_heard(shared: &Shared, state: &mut State) {
     let now = (shared.tuning.now)();
     for name in dirty {
         if let Some(map) = state.heard.get(&name) {
-            let body = format_heard(map);
+            let body = format_heard(&map.subscribers);
             if fsx::write_atomic(&shared.heard_path(&name), body.as_bytes(), 0o600).is_ok() {
                 state.heard_flushed.insert(name.clone(), now);
                 state.heard_dirty.remove(&name);
+            } else if let Some(coverage) = state.heard_coverage.as_mut() {
+                coverage.invalidate(now);
             }
         }
     }
@@ -1210,23 +1526,18 @@ fn expire(queue: &mut Vec<Queued>, now: u64) {
     });
 }
 
-/// Whether a join came directly from this machine or a private/link-local LAN address.
-pub(crate) fn lan_join_peer(peer: IpAddr) -> bool {
-    match peer {
-        IpAddr::V4(ip) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
-        IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or_else(
-            || ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local(),
-            |ip| lan_join_peer(IpAddr::V4(ip)),
-        ),
-    }
-}
-
-/// The listing carries LAN eligibility without disclosing the request's address.
-fn join_lines(queue: &[Queued]) -> String {
+/// The listing: each bare request's home ALab LAN where it was observed on one this Mac is still
+/// on (`here`), never its address. No request is listed `lan=1`: an older approver admits by that
+/// marker alone, wherever its server heard the request. A request that carries a member's Allow
+/// or a password proof lists no `home=` either: an older approver skips any line with a field
+/// it does not know, and can still admit those two by what they carry.
+fn join_lines(queue: &[Queued], here: &[crate::home_lan::HomeTag]) -> String {
     let mut text = String::new();
     for queued in queue {
         let mut request = queued.request.clone();
-        request.lan = queued.observed_lan || queued.peer.is_some_and(lan_join_peer);
+        request.lan = false;
+        let bare = request.allowed.is_none() && request.proof.is_none();
+        request.home = queued.home.clone().filter(|tag| bare && here.contains(tag));
         text.push_str(&request.listed());
         text.push('\n');
     }
@@ -1241,7 +1552,8 @@ fn stored_lines(queue: &[Queued]) -> String {
             text.push_str(&format!("peer {peer} {}\n", queued.asked));
         }
         let mut request = queued.request.clone();
-        request.lan = queued.observed_lan;
+        request.lan = false;
+        request.home = None;
         text.push_str(&request.listed());
         text.push('\n');
     }
@@ -1255,22 +1567,24 @@ fn parse_stored(text: &str) -> Vec<Queued> {
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("peer ") {
             let (address, asked) = rest.split_once(' ').unwrap_or((rest, "0"));
-            peer = address
-                .parse::<IpAddr>()
-                .ok()
-                .map(|ip| (ip, asked.parse::<u64>().unwrap_or(0)));
+            let asked = (!asked.is_empty() && asked.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| asked.parse::<u64>().ok())
+                .flatten()
+                .unwrap_or(0);
+            peer = address.parse::<IpAddr>().ok().map(|ip| (ip, asked));
             continue;
         }
         let (from, asked) = peer.take().unzip();
         if let Ok(mut request) = parse_join_line(line)
             && request.time.is_some()
         {
-            let observed_lan = request.lan || from.is_some_and(lan_join_peer);
+            // An older build's `lan=1` was any private peer's: no home LAN observation.
             request.lan = false;
+            request.home = None;
             queue.push(Queued {
                 request,
                 peer: from,
-                observed_lan,
+                home: None,
                 asked: asked.unwrap_or(0),
                 changed: 0,
                 noted: 0,
@@ -1281,6 +1595,8 @@ fn parse_stored(text: &str) -> Vec<Queued> {
     queue
 }
 
+/// Each connection is [`aterm_uds::accept`]'s: kept out of every child from its creation, with no
+/// spawn of this process held back while the loop waits for one.
 fn accept_loop(
     listener: &TcpListener,
     shared: &Arc<Shared>,
@@ -1288,16 +1604,12 @@ fn accept_loop(
     refusals: &SyncSender<TcpStream>,
 ) -> io::Result<()> {
     loop {
-        let accepted = listener.accept();
+        let accepted = aterm_uds::accept(listener);
         if stop.load(Ordering::SeqCst) {
             return Ok(());
         }
         match accepted {
-            Ok((stream, peer)) => {
-                let _ = aterm_uds::keep_out_of_children(&stream);
-                dispatch(shared, stream, peer.ip(), refusals);
-            }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Ok((stream, peer)) => dispatch(shared, stream, peer.ip(), refusals),
             Err(e) if is_transient(&e) => {
                 std::thread::sleep(Duration::from_millis(50));
             }
@@ -1636,6 +1948,7 @@ struct Request {
     length: Option<usize>,
     expect_continue: bool,
     subscriber: Option<String>,
+    observer: bool,
     no_wait: bool,
     /// Body bytes that arrived with the head.
     early: Vec<u8>,
@@ -1771,6 +2084,7 @@ fn parse_head(head: &[u8], early: Vec<u8>) -> Result<Request, Reply> {
     let mut length: Option<usize> = None;
     let mut expect_continue = false;
     let mut subscriber: Option<String> = None;
+    let mut observer = false;
     let mut no_wait = false;
     for line in lines {
         if line.starts_with([' ', '\t']) {
@@ -1823,6 +2137,8 @@ fn parse_head(head: &[u8], early: Vec<u8>) -> Result<Request, Reply> {
             subscriber = Some(value.to_owned());
         } else if name.eq_ignore_ascii_case(crate::transport::NO_WAIT_HEADER) && value == "1" {
             no_wait = true;
+        } else if name.eq_ignore_ascii_case(crate::transport::OBSERVER_HEADER) && value == "1" {
+            observer = true;
         }
     }
     let (path, query) = match target.split_once('?') {
@@ -1836,6 +2152,7 @@ fn parse_head(head: &[u8], early: Vec<u8>) -> Result<Request, Reply> {
         length,
         expect_continue,
         subscriber,
+        observer,
         no_wait,
         early,
     })
@@ -1863,10 +2180,11 @@ enum Route<'a> {
     Records(&'a str),
     Join(&'a str),
     Verdict(&'a str),
+    Heard(&'a str),
 }
 
-/// `/v1/<name>`, `/v1/<name>/records`, `/v1/<name>/join` or `/v1/<name>/join/verdict`, with
-/// `<name>` a vault name.
+/// `/v1/<name>`, `/v1/<name>/records`, `/v1/<name>/join`, `/v1/<name>/join/verdict` or
+/// `/v1/<name>/heard`, with `<name>` a vault name.
 fn route(path: &str) -> Option<Route<'_>> {
     let rest = path.strip_prefix("/v1/")?;
     let route = match rest.split_once('/') {
@@ -1874,10 +2192,14 @@ fn route(path: &str) -> Option<Route<'_>> {
         Some((name, "records")) => Route::Records(name),
         Some((name, "join")) => Route::Join(name),
         Some((name, "join/verdict")) => Route::Verdict(name),
+        Some((name, "heard")) => Route::Heard(name),
         Some(_) => return None,
     };
-    let (Route::Vault(name) | Route::Records(name) | Route::Join(name) | Route::Verdict(name)) =
-        route;
+    let (Route::Vault(name)
+    | Route::Records(name)
+    | Route::Join(name)
+    | Route::Verdict(name)
+    | Route::Heard(name)) = route;
     envelope::valid_name(name).then_some(route)
 }
 
@@ -1886,13 +2208,14 @@ fn respond(shared: &Shared, stream: &mut TcpStream, peer: IpAddr, mut request: R
     let Some(route) = route(&path) else {
         return Reply::text(
             404,
-            "no such path: the vault paths are /v1/<name>, /v1/<name>/records, /v1/<name>/join and /v1/<name>/join/verdict",
+            "no such path: the vault paths are /v1/<name>, /v1/<name>/records, /v1/<name>/join, /v1/<name>/join/verdict and /v1/<name>/heard",
         );
     };
     let method = request.method.as_str();
     if !matches!(
         (&route, method),
         (Route::Vault(_), "GET" | "PUT")
+            | (Route::Heard(_), "GET")
             | (
                 Route::Records(_) | Route::Join(_) | Route::Verdict(_),
                 "GET" | "POST"
@@ -1900,6 +2223,7 @@ fn respond(shared: &Shared, stream: &mut TcpStream, peer: IpAddr, mut request: R
     ) {
         let allow = match route {
             Route::Vault(_) => "GET, PUT",
+            Route::Heard(_) => "GET",
             Route::Records(_) | Route::Join(_) | Route::Verdict(_) => "GET, POST",
         };
         let mut reply = Reply::text(405, format!("{method} is not answered here; use {allow}"));
@@ -1927,6 +2251,7 @@ fn respond(shared: &Shared, stream: &mut TcpStream, peer: IpAddr, mut request: R
                 request.query.as_deref(),
                 request.subscriber.as_deref(),
                 request.no_wait,
+                request.observer,
             )
         }
         (Route::Vault(name), _) => {
@@ -1987,12 +2312,16 @@ fn respond(shared: &Shared, stream: &mut TcpStream, peer: IpAddr, mut request: R
             shared.join_gets.fetch_add(1, Ordering::SeqCst);
             list_joins(shared, stream, name, request.query.as_deref())
         }
-        (Route::Join(name), _) => match body_length(&request, MAX_JOIN_BODY)
-            .and_then(|length| read_body(stream, request, length, &shared.tuning))
-        {
-            Ok(body) => post_join(shared, name, &body, peer),
-            Err(reply) => reply,
-        },
+        (Route::Join(name), _) => {
+            let arrived_on = stream.local_addr().ok().map(|addr| addr.ip());
+            match body_length(&request, MAX_JOIN_BODY)
+                .and_then(|length| read_body(stream, request, length, &shared.tuning))
+            {
+                Ok(body) => post_join(shared, name, &body, peer, arrived_on),
+                Err(reply) => reply,
+            }
+        }
+        (Route::Heard(name), _) => list_heard(shared, name),
         (Route::Verdict(name), "GET") => list_verdicts(shared, name),
         (Route::Verdict(name), _) => match body_length(&request, MAX_JOIN_BODY)
             .and_then(|length| read_body(stream, request, length, &shared.tuning))
@@ -2222,19 +2551,25 @@ fn get_vault(
     query: Option<&str>,
     subscriber: Option<&str>,
     no_wait: bool,
+    observer: bool,
 ) -> Reply {
     let after = match after_query(query) {
         Ok(after) => after,
         Err(reply) => return reply,
     };
     let mut state = shared.lock_server_state();
+    if shared.stopping.load(Ordering::SeqCst) {
+        return Reply::text(503, "this server is stopping".to_owned());
+    }
     take_from_store(shared, &mut state, name);
     if !state.vaults.contains_key(name) {
         return Reply::text(404, format!("no vault named {name} here"));
     }
-    if let Some(subscriber) = subscriber {
+    if subscriber.is_some() || !observer {
         let now = (shared.tuning.now)();
-        record_heard(shared, &mut state, name, subscriber, now);
+        if !record_heard(shared, &mut state, name, subscriber, now) {
+            return Reply::text(503, "heard history is not tracking reads".to_owned());
+        }
     }
     let Some(slot) = state.vaults.get(name) else {
         return Reply::text(404, format!("no vault named {name} here"));
@@ -2410,6 +2745,12 @@ fn put_vault(shared: &Shared, name: &str, body: &[u8], local: bool) -> Reply {
     });
     slot.held = held;
     slot.wake.notify_all();
+    if let Some(records) = state.records.get(name)
+        && records.store.log().is_none()
+        && !records.raw.is_empty()
+    {
+        records.wake.notify_all();
+    }
     shared.wake_advertiser();
     note(&format!(
         "{name}: accepted seq {} signed by {}{}",
@@ -2532,11 +2873,17 @@ fn take_from_store(shared: &Shared, state: &mut State, name: &str) {
         seq: envelope.seq,
         signer: envelope.signer,
         head: envelope.digest(),
-        parented: slot.held.parented || !envelope.parents.is_empty(),
+        parented: !envelope.parents.is_empty(),
         handoff: envelope.handoff.clone(),
         bytes: Arc::new(bytes),
     };
     slot.wake.notify_all();
+    if let Some(records) = state.records.get(name)
+        && records.store.log().is_none()
+        && !records.raw.is_empty()
+    {
+        records.wake.notify_all();
+    }
     shared.wake_advertiser();
 }
 
@@ -2574,13 +2921,18 @@ fn follow_held(
 /// [`kept_records`]).
 fn decode_records_held(
     state: &State,
+    pins: &[(String, [u8; 32])],
     name: &str,
     bytes: &[u8],
 ) -> crate::Result<crate::membership_log::Store> {
+    let keys = held_keys(state, name).or_else(|| {
+        pins.iter()
+            .find_map(|(v, key)| (v == name).then(|| vec![*key]))
+    });
     Ok(kept_records(
         follow_held(
             crate::membership_log::Store::for_vault(name)?,
-            held_keys(state, name).as_deref(),
+            keys.as_deref(),
         ),
         bytes,
     ))
@@ -2604,6 +2956,7 @@ fn kept_records(empty: crate::membership_log::Store, bytes: &[u8]) -> crate::mem
 
 /// Merge any verified records written directly at `<name>.records` on disk into memory.
 fn take_records_from_store(shared: &Shared, state: &mut State, name: &str) {
+    take_from_store(shared, state, name);
     if vault_capacity_exceeded(state, name) {
         return;
     }
@@ -2615,17 +2968,23 @@ fn take_records_from_store(shared: &Shared, state: &mut State, name: &str) {
     };
     let keys = record_keys(shared, state, name);
     if let Some(slot) = state.records.get_mut(name) {
-        if slot.raw == bytes {
+        if slot.raw == bytes
+            && (slot.store.log().is_some()
+                || keys.as_deref().is_none_or(|k| slot.store.keys() == Some(k)))
+        {
             return;
         }
-        let mut candidate = follow_held(slot.store.clone(), keys.as_deref());
-        if let Ok(added) = candidate.ingest(&bytes) {
-            slot.raw = bytes;
-            // A store with no genesis keeps none of a file's records ([`kept_records`]).
-            if added > 0 && candidate.log().is_some() {
-                slot.store = candidate;
+        let candidate = kept_records(follow_held(slot.store.clone(), keys.as_deref()), &bytes);
+        slot.raw = bytes;
+        if candidate.log().is_some() {
+            let changed = slot.store.log().map(crate::membership_log::Log::heads)
+                != candidate.log().map(crate::membership_log::Log::heads);
+            slot.store = candidate;
+            if changed {
                 slot.wake.notify_all();
             }
+        } else {
+            slot.store = follow_held(slot.store.clone(), keys.as_deref());
         }
         return;
     }
@@ -2702,6 +3061,9 @@ fn get_records(
         Err(reply) => return reply,
     };
     let mut state = shared.lock_server_state();
+    if shared.stopping.load(Ordering::SeqCst) {
+        return Reply::text(503, "this server is stopping".to_owned());
+    }
     take_records_from_store(shared, &mut state, name);
     let known_vault = holds_records(&state, name)
         || state.vaults.contains_key(name)
@@ -2715,7 +3077,9 @@ fn get_records(
         && (holds_records(&state, name) || state.vaults.contains_key(name))
     {
         let now = (shared.tuning.now)();
-        record_heard(shared, &mut state, name, subscriber, now);
+        if !record_heard(shared, &mut state, name, Some(subscriber), now) {
+            return Reply::text(503, "heard history is not tracking reads".to_owned());
+        }
     }
     if let Some(slot) = state.records.get(name) {
         let missing = slot.store.missing(&have);
@@ -2899,7 +3263,15 @@ fn post_records(shared: &Shared, name: &str, body: &[u8], local: bool) -> Reply 
     Reply::empty(204)
 }
 
-fn post_join(shared: &Shared, name: &str, body: &[u8], peer: IpAddr) -> Reply {
+/// `POST /v1/<name>/join` from `peer`, which reached this Mac at its address `arrived_on`
+/// (`None`: unknown): queued with the home ALab LAN it was observed on, if any.
+fn post_join(
+    shared: &Shared,
+    name: &str,
+    body: &[u8],
+    peer: IpAddr,
+    arrived_on: Option<IpAddr>,
+) -> Reply {
     let Ok(text) = std::str::from_utf8(body) else {
         return Reply::text(400, "a join request is one line of text");
     };
@@ -2908,7 +3280,7 @@ fn post_join(shared: &Shared, name: &str, body: &[u8], peer: IpAddr) -> Reply {
         return Reply::text(400, "a join request is one line: `age1… <host> <code>`");
     }
     let request = match parse_join_line(line) {
-        Ok(request) if request.time.is_none() && !request.lan => request,
+        Ok(request) if request.time.is_none() && !request.lan && request.home.is_none() => request,
         Ok(_) => return Reply::text(400, "a join request is `age1… <host> <code>`"),
         Err(e) => return Reply::text(400, e.0),
     };
@@ -2919,8 +3291,12 @@ fn post_join(shared: &Shared, name: &str, body: &[u8], peer: IpAddr) -> Reply {
         return Reply::text(400, "a join request's code is not its key's");
     }
     let now = (shared.tuning.now)();
+    // Judged before any lock: it reads this Mac's interfaces and the evidence file.
+    let home = arrived_on
+        .ok_or(crate::home_lan::Away::NotOnLink)
+        .and_then(|arrived_on| shared.home.observed(arrived_on, peer));
     let _writing = shared.join_writes();
-    let (queue, noted) = match decide_join(shared, name, request, peer, now) {
+    let (queue, noted) = match decide_join(shared, name, request, peer, home, now) {
         Ok(Decided::Next(queue, noted)) => (queue, noted),
         Ok(Decided::Queued) => return Reply::empty(204),
         Err(reply) => return reply,
@@ -2971,12 +3347,14 @@ enum Decided {
     Next(Vec<Queued>, Option<String>),
 }
 
-/// Decide a join request from `peer` under `server_state`, or refuse it ([`Shared::join_writes`]).
+/// Decide a join request from `peer`, observed on the home ALab LAN `home` or not (why), under
+/// `server_state`, or refuse it ([`Shared::join_writes`]).
 fn decide_join(
     shared: &Shared,
     name: &str,
     request: JoinRequest,
     peer: IpAddr,
+    home: Result<crate::home_lan::HomeTag, crate::home_lan::Away>,
     now: u64,
 ) -> Result<Decided, Reply> {
     let mut state = shared.lock_server_state();
@@ -2994,10 +3372,14 @@ fn decide_join(
             && asked.proof == request.proof
     };
     if let Some(at) = queue.iter().position(same) {
-        // Preserve the first address for queue accounting, but let a machine that has
-        // moved onto the LAN become eligible without a changed request or a manual Allow.
-        if lan_join_peer(peer) && !queue[at].observed_lan {
-            queue[at].observed_lan = true;
+        // Preserve the first address for queue accounting, but let a machine observed anew on
+        // the home ALab LAN become eligible without a changed request or a manual Allow. A
+        // repeat observed elsewhere does not clear it: the listing shows it only while this Mac
+        // is on that network.
+        if let Ok(tag) = &home
+            && queue[at].home.as_ref() != Some(tag)
+        {
+            queue[at].home = Some(tag.clone());
             queue[at].asked = seq;
             if now.saturating_sub(queue[at].request.time.unwrap_or(0)) >= JOIN_REFRESH_EVERY_SECS {
                 queue[at].request.time = Some(now);
@@ -3056,8 +3438,15 @@ fn decide_join(
         ));
     }
     let host = &request.host;
+    let at = match &home {
+        Ok(_) => "observed on the home ALab LAN".to_owned(),
+        Err(why) => format!("not on the home ALab LAN: {why}"),
+    };
     let (noted, line) = match &previous {
-        None => (now, Some(format!("join request queued for host {host}"))),
+        None => (
+            now,
+            Some(format!("join request queued for host {host} ({at})")),
+        ),
         Some(previous) if now.saturating_sub(previous.noted) >= JOIN_NOTE_EVERY_SECS => (
             now,
             Some(format!(
@@ -3072,7 +3461,7 @@ fn decide_join(
             ..request
         },
         peer: Some(peer),
-        observed_lan: lan_join_peer(peer) || previous.is_some_and(|old| old.observed_lan),
+        home: home.ok().or_else(|| previous.and_then(|old| old.home)),
         asked: seq,
         changed: now,
         noted,
@@ -3113,9 +3502,27 @@ fn list_joins(shared: &Shared, stream: &TcpStream, name: &str, query: Option<&st
         Ok(after) => after,
         Err(reply) => return reply,
     };
+    // Read before the lock (interfaces and the evidence file): a request observed on a home
+    // network this Mac has since left lists no home there.
+    let here = shared.home.here();
     let mut state = shared.lock_server_state();
     let now = (shared.tuning.now)();
-    let State { vaults, joins, .. } = &mut *state;
+    let State {
+        vaults,
+        joins,
+        listed_here,
+        ..
+    } = &mut *state;
+    // A listing names a request's `home=` only while this Mac is on that network: a move onto
+    // or off one changes what every queue lists, so its version moves too, and an approver that
+    // holds the old listing reads the new one at once rather than an hour later.
+    if *listed_here != here {
+        listed_here.clone_from(&here);
+        for slot in vaults.values_mut() {
+            slot.joins += 1;
+            slot.wake.notify_all();
+        }
+    }
     let Some(slot) = vaults.get_mut(name) else {
         return Reply::text(404, format!("no vault named {name} here"));
     };
@@ -3151,7 +3558,7 @@ fn list_joins(shared: &Shared, stream: &TcpStream, name: &str, query: Option<&st
     let queue = state.joins.entry(name.to_owned()).or_default();
     Reply {
         status: 200,
-        body: Body::Text(join_lines(queue)),
+        body: Body::Text(join_lines(queue, &here)),
         etag: generation,
         vault_head: None,
         allow: None,
@@ -3196,7 +3603,61 @@ fn post_verdict(shared: &Shared, name: &str, body: &[u8]) -> Reply {
     Reply::empty(204)
 }
 
-/// `GET /v1/<name>/join/verdict`: one `age1… refused <tag>` line per request a verdict refused.
+/// `GET /v1/<name>/heard`: each subscriber this server heard for `name` within
+/// [`HEARD_TTL_SECS`], one `<tag> <unix seconds>` line each, the tag a
+/// [`crate::transport::heard_tag`] of its recipient, never the key itself or a value. A member
+/// reads it to tell whether a Mac with no device-key proof in the membership log (a 0.145 Mac)
+/// still subscribes (`DESIGN-fluid-swarm` F20).
+fn list_heard(shared: &Shared, name: &str) -> Reply {
+    let mut state = shared.lock_server_state();
+    if !state.vaults.contains_key(name) && !holds_records(&state, name) {
+        return Reply::text(404, format!("no vault named {name} here"));
+    }
+    let now = (shared.tuning.now)();
+    let Some(since) = state
+        .heard_coverage
+        .as_mut()
+        .and_then(|coverage| coverage.complete_since(now))
+        .filter(|_| !shared.stopping.load(Ordering::SeqCst))
+    else {
+        return Reply::text(
+            503,
+            "heard history does not yet cover the legacy window".to_owned(),
+        );
+    };
+    let mut text = String::new();
+    let mut count = 0;
+    for (recipient, &at) in state
+        .heard
+        .get(name)
+        .into_iter()
+        .flat_map(|rows| rows.subscribers.iter())
+    {
+        if now.saturating_sub(at) > HEARD_TTL_SECS {
+            continue;
+        }
+        if let Ok(parsed) = crate::age::Recipient::parse(recipient) {
+            text.push_str(&format!("{} {at}\n", crate::transport::heard_tag(&parsed)));
+            count += 1;
+        }
+    }
+    let anonymous = state
+        .heard
+        .get(name)
+        .and_then(|rows| rows.anonymous)
+        .map_or_else(|| "-".to_owned(), |at| at.to_string());
+    let text = format!("aterm-heard-v2 {since} {now} {count} {anonymous}\n{text}");
+    Reply {
+        status: 200,
+        body: Body::Text(text),
+        etag: None,
+        vault_head: None,
+        allow: None,
+        retry_after: None,
+        records_need: false,
+    }
+}
+
 fn list_verdicts(shared: &Shared, name: &str) -> Reply {
     let state = shared.lock_server_state();
     if !state.vaults.contains_key(name) {
@@ -3609,10 +4070,17 @@ struct ChildSet {
     /// The log said a held `alab-secrets` registration lost the name ([`reregister_roles`]),
     /// so it says so again only after a later one stays up for a round.
     alab_lost_said: bool,
+    /// The log said a held `alab-secrets` registration ended with no other device answering
+    /// to the name, so this server registers it again ([`reregister_roles`]); it says so again
+    /// only after a later one stays up for a round.
+    alab_again_said: bool,
     /// A will-sleep took this server's registrations ([`take_for_sleep`]), so the next round
     /// lets the `alab-secrets` name go before anything is registered again
     /// ([`reregister_awake`]).
     slept: bool,
+    /// Where this server leaves a [`HeldStamp`] if it stops while it holds `alab-secrets`
+    /// ([`ALAB_HELD_FILE`] in its store; `None`: it does not advertise).
+    held_file: Option<PathBuf>,
 }
 
 fn quiet(program: &str, args: &[String]) -> io::Result<aterm_uds::spawnfd::Child> {
@@ -3639,8 +4107,21 @@ const PEER_PULL_BUDGET: Duration = Duration::from_secs(2);
 const LEGACY_PEER_PULL_BUDGET: Duration = Duration::from_millis(750);
 
 fn is_self_addr(addr: SocketAddr, own_port: u16, here: &[Target]) -> bool {
-    addr.port() == own_port
-        && (addr.ip().is_loopback() || here.iter().any(|t| IpAddr::V4(t.ip) == addr.ip()))
+    let ip = addr.ip().to_canonical();
+    addr.port() == own_port && (ip.is_loopback() || here.iter().any(|t| IpAddr::V4(t.ip) == ip))
+}
+
+fn trimmed_dns_host(host: &str) -> &str {
+    host.strip_suffix('.').unwrap_or(host)
+}
+
+fn strip_local_suffix(host: &str) -> &str {
+    let host = trimmed_dns_host(host);
+    host.len()
+        .checked_sub(".local".len())
+        .and_then(|at| host.split_at_checked(at))
+        .and_then(|(stem, suffix)| suffix.eq_ignore_ascii_case(".local").then_some(stem))
+        .unwrap_or(host)
 }
 
 fn is_obviously_self_url(
@@ -3649,24 +4130,17 @@ fn is_obviously_self_url(
     own_label: Option<&str>,
     here: &[Target],
 ) -> bool {
-    let Some(port) = uri
-        .authority()
-        .rsplit_once(':')
-        .and_then(|(_, p)| p.parse::<u16>().ok())
-    else {
-        return false;
-    };
-    if port != own_port {
+    if uri.port() != own_port {
         return false;
     }
     if let Ok(ip) = uri.host().parse::<IpAddr>() {
+        let ip = ip.to_canonical();
         return ip.is_loopback() || here.iter().any(|t| IpAddr::V4(t.ip) == ip);
     }
-    if let Some(label) = own_label {
-        let host = uri.host().strip_suffix(".local").unwrap_or(uri.host());
-        if host.eq_ignore_ascii_case(label) {
-            return true;
-        }
+    if let Some(label) = own_label
+        && strip_local_suffix(uri.host()).eq_ignore_ascii_case(label)
+    {
+        return true;
     }
     false
 }
@@ -3678,9 +4152,21 @@ fn is_obviously_self_url(
 /// in one budget, and holds this many records bodies: one read while another is stored.
 const RECORDS_PULLS_AT_ONCE: usize = 2;
 
-/// Slots for [`RECORDS_PULLS_AT_ONCE`] records pulls.
-#[derive(Default)]
+/// How much of each peer's envelope answer a pass reads at once from all its peers
+/// ([`pull_from_peer`]): a `204` and a small envelope fit. A longer answer is asked again and
+/// read whole, up to [`MAX_ENVELOPE`], under one of [`ENVELOPE_PULLS_AT_ONCE`] slots.
+const ENVELOPE_PEEK: usize = 256 << 10;
+
+/// How many peers' whole envelopes longer than [`ENVELOPE_PEEK`] a server reads at once: each
+/// is up to [`MAX_ENVELOPE`] and is parsed again where [`put_vault`] stores it, so a host that
+/// advertises 16 instances of itself costs a pass this many such bodies, not 16.
+const ENVELOPE_PULLS_AT_ONCE: usize = 2;
+
+/// Slots for a few pulls at once ([`RECORDS_PULLS_AT_ONCE`] records pulls,
+/// [`ENVELOPE_PULLS_AT_ONCE`] whole envelopes).
 struct PullSlots {
+    /// How many pulls hold a slot at once.
+    at_once: usize,
     taken: Mutex<usize>,
     freed: Condvar,
     /// Pulls waiting for a slot now.
@@ -3688,18 +4174,29 @@ struct PullSlots {
     waiting: AtomicUsize,
 }
 
-/// One records pull's slot, given back when dropped.
+/// One pull's slot, given back when dropped.
 struct PullSlot<'a>(&'a PullSlots);
 
 impl PullSlots {
+    /// Slots for `at_once` pulls.
+    const fn new(at_once: usize) -> PullSlots {
+        PullSlots {
+            at_once,
+            taken: Mutex::new(0),
+            freed: Condvar::new(),
+            #[cfg(test)]
+            waiting: AtomicUsize::new(0),
+        }
+    }
+
     /// A slot, once one is free: a slot's pull ends within its budget.
     fn take(&self) -> PullSlot<'_> {
         let mut taken = self.taken.lock().unwrap_or_else(PoisonError::into_inner);
         #[cfg(test)]
-        let queued = usize::from(*taken >= RECORDS_PULLS_AT_ONCE);
+        let queued = usize::from(*taken >= self.at_once);
         #[cfg(test)]
         self.waiting.fetch_add(queued, Ordering::SeqCst);
-        while *taken >= RECORDS_PULLS_AT_ONCE {
+        while *taken >= self.at_once {
             taken = self
                 .freed
                 .wait(taken)
@@ -3723,7 +4220,8 @@ impl Drop for PullSlot<'_> {
 /// Pull from each of `peers` on a thread of its own ([`pull_from_peer`]): a peer that takes a
 /// pull and never answers (a Mac asleep mid-answer, a server that stalls) holds only its own
 /// pull, not the pulls of every peer after it on the vault-tend thread. Their records bodies
-/// are read [`RECORDS_PULLS_AT_ONCE`] at a time. Returns how many vaults advanced.
+/// are read [`RECORDS_PULLS_AT_ONCE`] at a time, and their envelopes longer than
+/// [`ENVELOPE_PEEK`] [`ENVELOPE_PULLS_AT_ONCE`] at a time. Returns how many vaults advanced.
 fn pull_from_peers_shared(
     shared: &Shared,
     peers: &[crate::discover::DiscoveredVault],
@@ -3809,7 +4307,7 @@ fn pull_from_peer(
     };
     for vault_name in vault_names {
         let vault_url = format!("{base_prefix}/{vault_name}");
-        let (held_seq, held_head, accepted_envelope, accepted_records) = {
+        let (mut held_seq, mut held_head, accepted_envelope, accepted_records) = {
             let mut state = shared.lock_server_state();
             take_from_store(shared, &mut state, &vault_name);
             take_records_from_store(shared, &mut state, &vault_name);
@@ -3824,8 +4322,28 @@ fn pull_from_peer(
             (seq, head, accepted_env, accepted_rec)
         };
         if accepted_envelope {
-            match crate::transport::fetch_after_nowait(&vault_url, held_seq, budget) {
-                Ok(crate::transport::Fetched::Body(bytes)) => {
+            use crate::transport::{Fetched, Pulled, observe_after_nowait_within};
+            // Every peer's answer is read under a small limit at once; a longer one is asked
+            // again and read whole under a slot, held until it is stored.
+            let mut slot = None;
+            let mut pulled =
+                observe_after_nowait_within(&vault_url, held_seq, budget, ENVELOPE_PEEK);
+            if matches!(pulled, Ok(Pulled::Larger)) {
+                slot = Some(shared.envelope_pulls.take());
+                // A pull that held a slot before this one may have stored a newer version (one a
+                // publish spread to several peers): ask after what is held now, so a peer holding
+                // nothing newer answers with no body.
+                (held_seq, held_head) = {
+                    let mut state = shared.lock_server_state();
+                    take_from_store(shared, &mut state, &vault_name);
+                    state.vaults.get(&vault_name).map_or((None, None), |slot| {
+                        (Some(slot.held.seq), Some(slot.held.head))
+                    })
+                };
+                pulled = observe_after_nowait_within(&vault_url, held_seq, budget, MAX_ENVELOPE);
+            }
+            match pulled {
+                Ok(Pulled::Fetched(Fetched::Body(bytes))) => {
                     let reply = put_vault(shared, &vault_name, &bytes, false);
                     if reply.status == 204 {
                         let advanced = {
@@ -3839,9 +4357,10 @@ fn pull_from_peer(
                         }
                     }
                 }
-                Ok(_) => {}
-                Err(_) => return stored,
+                Ok(Pulled::Fetched(_)) => {}
+                Ok(Pulled::Larger) | Err(_) => return stored,
             }
+            drop(slot);
         }
         if accepted_records {
             let _slot = shared.records_pulls.take();
@@ -3921,9 +4440,11 @@ fn probe_alab_endpoint(
     if holding_alab_name
         && !ip_literal
         && !here.is_empty()
-        && uri.host().eq_ignore_ascii_case("alab-secrets.local")
+        && trimmed_dns_host(uri.host()).eq_ignore_ascii_case("alab-secrets.local")
     {
-        let addrs = uri.authority().to_socket_addrs().ok()?;
+        let addrs = (trimmed_dns_host(uri.host()), uri.port())
+            .to_socket_addrs()
+            .ok()?;
         let mut best: Option<u64> = None;
         for addr in addrs {
             if is_self_addr(addr, own_port, here) {
@@ -3931,7 +4452,7 @@ fn probe_alab_endpoint(
             }
             let direct = format!("http://{addr}/v1/{}", crate::ALAB_VAULT);
             if let Ok(crate::transport::Fetched::Body(bytes)) =
-                crate::transport::fetch_after_nowait(&direct, None, Duration::from_secs(3))
+                crate::transport::observe_after_nowait(&direct, None, Duration::from_secs(3))
                 && let Some(seq) = verify_probed_alab_envelope(&bytes, shared)
             {
                 best = Some(best.map_or(seq, |prev| prev.max(seq)));
@@ -3940,13 +4461,13 @@ fn probe_alab_endpoint(
         return best;
     }
     let Ok(crate::transport::Fetched::Body(bytes)) =
-        crate::transport::fetch_after_nowait(&raw_url, None, Duration::from_secs(3))
+        crate::transport::observe_after_nowait(&raw_url, None, Duration::from_secs(3))
     else {
         return None;
     };
     if !ip_literal
         && !here.is_empty()
-        && let Ok(addrs) = uri.authority().to_socket_addrs()
+        && let Ok(addrs) = (trimmed_dns_host(uri.host()), uri.port()).to_socket_addrs()
     {
         let all_addrs: Vec<SocketAddr> = addrs.collect();
         if !all_addrs.is_empty()
@@ -3989,6 +4510,8 @@ fn tend_role_targets(
         let _ = pull_from_peers_shared(shared, peers, port, decided.as_deref(), here);
     }
     let Some(name) = decided else {
+        // A revoked or unavailable role cannot retain an earlier claim across a later grant.
+        alab_watcher.slept();
         return (None, Some((alab_name, port, None)));
     };
     let (primary_txt, own_alab_seq) = {
@@ -4002,6 +4525,7 @@ fn tend_role_targets(
     };
     let primary = Some((name.clone(), port, at(primary_txt)));
     let secondary = if name != alab_name {
+        let mut probe_alab = probe_alab;
         let want_alab = alab_watcher.decide(
             &AlabNameInput {
                 own_label: &name,
@@ -4009,7 +4533,15 @@ fn tend_role_targets(
                 holders,
                 now: Instant::now(),
             },
-            probe_alab,
+            |target| {
+                if target.eq_ignore_ascii_case(&name)
+                    || aterm_http::Uri::parse(target)
+                        .is_some_and(|uri| is_obviously_self_url(&uri, port, Some(&name), here))
+                {
+                    return None;
+                }
+                probe_alab(target)
+            },
         );
         let maybe = if want_alab {
             let txt = {
@@ -4027,6 +4559,14 @@ fn tend_role_targets(
     (primary, secondary)
 }
 
+/// Probe a host label or holder URL for a verified ALab envelope, as [`probe_alab_endpoint`]
+/// does ([`Seams::probe`]).
+type ProbeAlab = fn(&str, u16, Option<&str>, &[Target], bool, &Shared) -> Option<u64>;
+
+/// Whether a device other than this Mac, at the addresses given, answers to `<name>.local`
+/// now ([`Seams::name_answered`]).
+type NameAnswered = dyn Fn(&str, &[Target]) -> bool + Send;
+
 /// Start one `dns-sd -P` of a name and port at a target with a TXT ([`Seams::spawn`]).
 type SpawnAdvert =
     dyn Fn(&str, u16, &Target, Option<&VaultTxt>) -> io::Result<aterm_uds::spawnfd::Child> + Send;
@@ -4037,6 +4577,10 @@ type ListenPower = dyn FnOnce(std::sync::Weak<Bell>, Box<dyn FnMut(Power) + Send
 
 /// End one registration's `dns-sd -P` as this Mac goes to sleep ([`Seams::end_for_sleep`]).
 type EndAdvert = dyn Fn(&mut aterm_uds::spawnfd::Child) + Send + Sync;
+
+/// Start the standing browse that rings this server's bell, with its own names excluded.
+/// A test returns an idle watch and observes its lifetime without using DNS.
+type StartBrowse = dyn Fn(&Arc<Bell>, &[&str]) -> Arc<crate::discover::Watch> + Send;
 
 /// How long a will-sleep waits for this server's registrations to end before it lets the Mac
 /// sleep anyway ([`SleepYield`]). Ending a `dns-sd` takes milliseconds; macOS itself waits at
@@ -4049,8 +4593,9 @@ struct Seams {
     /// Waits at most the time it is given for a change of this Mac's addresses or links, and
     /// says whether one came ([`crate::wake::route_changes`]). `None`: none is heard.
     routes: Option<Box<dyn FnMut(Duration) -> bool + Send>>,
-    /// Whether a standing `_alab-vault._tcp` browse wakes the advert ([`crate::discover::Watch`]).
-    browse: bool,
+    /// Start a standing `_alab-vault._tcp` browse while sharing is on; none starts no browse.
+    /// The worker drops it while sharing is off or unreadable, and starts afresh once on.
+    browse: Option<Box<StartBrowse>>,
     /// Where this Mac advertises now ([`lan_targets`]).
     targets: Box<dyn Fn() -> Vec<Target> + Send>,
     /// Start one `dns-sd -P` of a name and port at a target with a TXT.
@@ -4064,6 +4609,17 @@ struct Seams {
     end_for_sleep: Arc<EndAdvert>,
     /// How long a will-sleep waits for that ([`SLEEP_YIELD_BOUND`]).
     sleep_bound: Duration,
+    /// Probes `alab-secrets.local` and the holders heard for a verified ALab envelope
+    /// ([`probe_alab_endpoint`]); a test's arm hears none.
+    probe: ProbeAlab,
+    /// Whether a device other than this Mac answers to a name ([`name_answered_here`]), asked
+    /// when a registration of `alab-secrets` this server holds ended by itself.
+    name_answered: Box<NameAnswered>,
+    /// Whether `[swarm] enabled` leaves sharing on, read each round
+    /// ([`crate::swarm::enabled_live`]): off, or unreadable, the round advertises nothing, ends
+    /// what it registered and pulls from or probes no other server
+    /// (`docs/DESIGN-alab-swarm-2026-10-27.md` §9).
+    sharing: Box<dyn FnMut() -> bool + Send>,
 }
 
 impl Seams {
@@ -4073,7 +4629,9 @@ impl Seams {
         Seams {
             routes: crate::wake::route_changes()
                 .map(|changes| Box::new(changes) as Box<dyn FnMut(Duration) -> bool + Send>),
-            browse: true,
+            browse: Some(Box::new(|bell, own| {
+                Arc::new(crate::discover::Watch::start(bell, own))
+            })),
             targets: Box::new(lan_targets),
             spawn: Box::new(|name, port, target, txt| {
                 quiet(DNS_SD, &registration_args(target, name, port, txt))
@@ -4082,8 +4640,65 @@ impl Seams {
             power: Box::new(aterm_uds::power::listen::<Bell>),
             end_for_sleep: Arc::new(end),
             sleep_bound: SLEEP_YIELD_BOUND,
+            probe: probe_alab_endpoint,
+            name_answered: Box::new(|name, own| name_answered_here(name, own, NAME_CHECK_BUDGET)),
+            sharing: Box::new(|| {
+                #[cfg(unix)]
+                {
+                    crate::swarm::enabled_live() == Ok(true)
+                }
+                // No `[swarm]` switch is read off unix: the advert is macOS-only anyway.
+                #[cfg(not(unix))]
+                {
+                    true
+                }
+            }),
         }
     }
+}
+
+/// How long [`name_answered_here`] waits for macOS to resolve a name: a device that answers to
+/// it does within milliseconds, and the check runs only on a round after a registration of
+/// `alab-secrets` ended by itself.
+const NAME_CHECK_BUDGET: Duration = Duration::from_secs(1);
+
+/// Whether a device other than this Mac (whose addresses are `own`) answers to `<name>.local`
+/// now: macOS resolves the name within `budget` to an address that is not this Mac's. A lookup
+/// that fails, or has no answer in time, finds none.
+fn name_answered_here(name: &str, own: &[Target], budget: Duration) -> bool {
+    use std::net::ToSocketAddrs;
+    let host = format!("{name}.local:0");
+    let (answer, answered) = sync_channel(1);
+    let spawned = std::thread::Builder::new()
+        .name("vault-name-check".to_owned())
+        .spawn(move || {
+            // A lookup that outlives its budget finds the receiver gone, and its answer is
+            // dropped.
+            let _ = answer.send(host.to_socket_addrs().map(Iterator::collect::<Vec<_>>));
+        });
+    if spawned.is_err() {
+        return false;
+    }
+    let Ok(Ok(addrs)) = answered.recv_timeout(budget) else {
+        return false;
+    };
+    addrs
+        .iter()
+        .any(|addr| !addr.ip().is_loopback() && !own.iter().any(|t| IpAddr::V4(t.ip) == addr.ip()))
+}
+
+/// Whether a registration of `alab-secrets` this server holds ended by itself (its
+/// `dns-sd -P` exited). The `vault-tend` round then asks whether another device answers to
+/// the name ([`Seams::name_answered`]) before it takes the children's lock for
+/// [`reregister_roles`]: a will-sleep waits on that lock ([`take_for_sleep`]).
+fn alab_registration_ended(set: &Mutex<ChildSet>) -> bool {
+    let mut set = set.lock().unwrap_or_else(PoisonError::into_inner);
+    let slot = &mut set.alab_dns;
+    slot.held_name.as_deref() == Some(crate::alab_advertised())
+        && slot
+            .held
+            .iter_mut()
+            .any(|(_, _, child)| matches!(child.try_wait(), Ok(Some(_))))
 }
 
 /// What the server does as the system announces sleep and wake ([`Seams::power`],
@@ -4280,6 +4895,13 @@ impl Children {
         mut seams: Seams,
     ) {
         let held = Arc::clone(&self.set);
+        let held_file = advertise
+            .as_ref()
+            .map(|(_, _, _, shared)| shared.store.join(ALAB_HELD_FILE));
+        held.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .held_file
+            .clone_from(&held_file);
         let pid = std::process::id();
         let bell = Arc::new(Bell::default());
         if let Some(routes) = seams.routes.take() {
@@ -4307,16 +4929,7 @@ impl Children {
                 );
             }
         }
-        // The browse rings for servers other than this one: its own names' Adds come back
-        // with each registration it starts.
-        let watch = (seams.browse && advertise.is_some()).then(|| {
-            let own: Vec<&str> = advertise
-                .iter()
-                .flat_map(|(_, names, _, _)| names.iter().map(String::as_str))
-                .chain([crate::alab_advertised()])
-                .collect();
-            crate::discover::Watch::start(&bell, &own)
-        });
+        let browse_bell = Arc::clone(&bell);
         let napping = Arc::clone(&bell);
         let shared_for_wake = advertise
             .as_ref()
@@ -4324,19 +4937,66 @@ impl Children {
         let spawned = std::thread::Builder::new()
             .name("vault-tend".to_owned())
             .spawn(move || {
-                let watch = watch;
-                let mut alab_watcher = AlabNameWatcher::new();
+                let mut watch = None;
+                // Where a server that held `alab-secrets` stopped, this one takes it back.
+                let mut alab_watcher = AlabNameWatcher::resume(
+                    held_file.as_deref().and_then(take_held_stamp),
+                    aterm_time::unix_millis().unwrap_or(0),
+                    Instant::now(),
+                    aterm_uds::process::last_sleep_ms()
+                        .and_then(|(slept, _)| u64::try_from(slept).ok()),
+                );
+                let probe = seams.probe;
                 let mut why = None;
+                let mut held_said = false;
                 loop {
-                    let here = (seams.targets)();
+                    let sharing = (seams.sharing)();
+                    if !sharing {
+                        // Dropping the watch ends its standing DNS child, not just this round's
+                        // resolves. A later on round gets fresh discoveries and wakes.
+                        watch = None;
+                    } else if watch.is_none()
+                        && advertise.is_some()
+                        && let Some(start) = seams.browse.as_ref()
+                    {
+                        // Its own names' Adds come back with each registration it starts.
+                        let own: Vec<&str> = advertise
+                            .iter()
+                            .flat_map(|(_, names, _, _)| names.iter().map(String::as_str))
+                            .chain([crate::alab_advertised()])
+                            .collect();
+                        watch = Some(start(&browse_bell, &own));
+                    }
+                    if sharing == held_said {
+                        held_said = !sharing;
+                        note(if sharing {
+                            "sharing is on again ([swarm] enabled): advertising this vault"
+                        } else {
+                            "sharing is off ([swarm] enabled = false in aterm.toml, or it cannot \
+                             be read): this server advertises nothing on the local network until \
+                             it is on"
+                        });
+                    }
+                    let here = if sharing {
+                        (seams.targets)()
+                    } else {
+                        Vec::new()
+                    };
                     let (peers, holders) = match &watch {
-                        Some(w) => (
+                        Some(w) if sharing => (
                             w.peer_vaults(PEER_RESOLVE_BUDGET),
                             w.alab_holders(PEER_RESOLVE_BUDGET),
                         ),
-                        None => (Vec::new(), Vec::new()),
+                        _ => (Vec::new(), Vec::new()),
                     };
                     let role_targets = advertise.as_mut().map(|(decide, _, port, shared)| {
+                        if !sharing {
+                            // Ends both registrations ([`reregister_roles`]) and decides nothing.
+                            return (
+                                None,
+                                Some((crate::alab_advertised().to_owned(), *port, None)),
+                            );
+                        }
                         after_sleep(&held, &mut alab_watcher);
                         let port = *port;
                         let holding = alab_watcher.is_holding();
@@ -4349,15 +5009,15 @@ impl Children {
                             &here,
                             &peers,
                             &holders,
-                            |target| {
-                                probe_alab_endpoint(target, port, None, &here, holding, shared)
-                            },
+                            |target| probe(target, port, None, &here, holding, shared),
                         );
                         if let (Some((name, _, _)), Some(w)) = (&targets.0, &watch) {
                             w.note_own(name);
                         }
                         targets
                     });
+                    let alab_answered = (role_targets.is_some() && alab_registration_ended(&held))
+                        .then(|| (seams.name_answered)(crate::alab_advertised(), &here));
                     {
                         let mut set = held.lock().unwrap_or_else(PoisonError::into_inner);
                         if set.closed {
@@ -4374,6 +5034,7 @@ impl Children {
                                 &mut alab_watcher,
                                 why,
                                 &*seams.spawn,
+                                alab_answered,
                             );
                         }
                     }
@@ -4431,16 +5092,21 @@ fn tend_awake(set: &mut ChildSet, spawn: &dyn Fn() -> io::Result<aterm_uds::spaw
 /// Keep `set`'s registrations at what one round of [`tend_role_targets`] decided, each started by
 /// `spawn`: this server's own name in [`ChildSet::dns`] and `alab-secrets` in
 /// [`ChildSet::alab_dns`] ([`reregister_slot`]). A held `alab-secrets` registration that ended
-/// by itself while still wanted lost the name to another device
-/// ([`AlabNameWatcher::lost_name`]): this round ends it and starts none in its place, where
-/// [`reregister_slot`] alone would start one on every round, each losing the same way. The log
-/// says so once, and again only after a later hold of the name stays up for a round.
+/// by itself while still wanted, while another device answers to the name, lost the name to
+/// that device ([`AlabNameWatcher::lost_name`]): this round ends it and starts none in its
+/// place, where [`reregister_slot`] alone would start one on every round, each losing the same
+/// way. One that ended with no other device answering (`alab_answered` is `Some(false)`:
+/// mDNSResponder restarting ends every `dns-sd`) lost nothing, and this round registers the
+/// name again. `alab_answered` is what the round heard when it asked
+/// ([`alab_registration_ended`]); `None`, not asked, reads as a lost name. The log says each
+/// once, and again only after a later hold of the name stays up for a round.
 fn reregister_roles(
     set: &mut ChildSet,
     (primary, secondary): RoleTargets,
     alab_watcher: &mut AlabNameWatcher,
     why: Option<Wake>,
     spawn: &SpawnAdvert,
+    alab_answered: Option<bool>,
 ) {
     match primary {
         Some((name, port, target)) => {
@@ -4458,6 +5124,19 @@ fn reregister_roles(
         return;
     };
     match wanted_ended(&mut set.alab_dns, &alab_name, alab_target.as_ref()) {
+        Some(true) if alab_answered == Some(false) => {
+            // The ended registrations were reaped as they were looked at; the rest stay, and
+            // `reregister_slot` starts the missing ones afresh.
+            set.alab_dns
+                .held
+                .retain_mut(|(_, _, child)| !matches!(child.try_wait(), Ok(Some(_))));
+            if !std::mem::replace(&mut set.alab_again_said, true) {
+                note(&format!(
+                    "the registration of {alab_name}.local ended and no other device answers to \
+                     the name, so this server registers it again"
+                ));
+            }
+        }
         Some(true) => {
             alab_watcher.lost_name();
             alab_target = None;
@@ -4470,7 +5149,10 @@ fn reregister_roles(
                 ));
             }
         }
-        Some(false) => set.alab_lost_said = false,
+        Some(false) => {
+            set.alab_lost_said = false;
+            set.alab_again_said = false;
+        }
         None => {}
     }
     reregister_slot(
@@ -4508,6 +5190,7 @@ fn reregister_awake(
     alab_watcher: &mut AlabNameWatcher,
     why: Option<Wake>,
     spawn: &SpawnAdvert,
+    alab_answered: Option<bool>,
 ) {
     if std::mem::take(&mut set.slept) {
         alab_watcher.slept();
@@ -4517,7 +5200,7 @@ fn reregister_awake(
         alab_watcher.slept();
         return;
     }
-    reregister_roles(set, targets, alab_watcher, why, spawn);
+    reregister_roles(set, targets, alab_watcher, why, spawn, alab_answered);
 }
 
 /// Whether one of `slot`'s registrations that `want` still wants under `name` (its target and
@@ -4636,6 +5319,14 @@ impl Drop for Children {
         let mut guard = self.lock();
         let set = &mut *guard;
         set.closed = true;
+        // A holder that stops (a new program, a move of its job) says so to the server that
+        // starts in its place ([`AlabNameWatcher::resume`]).
+        if let Some(path) = set.held_file.take()
+            && let Some(stamp) =
+                held_alab(&mut set.alab_dns, aterm_time::unix_millis().unwrap_or(0))
+        {
+            leave_held_stamp(&path, stamp);
+        }
         if let Some(mut child) = set.caffeinate.take() {
             end(&mut child);
         }
@@ -4721,6 +5412,50 @@ mod tests {
         launch(listener, options, tuning).expect("started")
     }
 
+    /// A test's place for a server: what it observes a join on and where it is now, both moved
+    /// by the test as a Mac moves between networks.
+    struct Scripted {
+        observed: Mutex<Result<crate::home_lan::HomeTag, crate::home_lan::Away>>,
+        here: Mutex<Vec<crate::home_lan::HomeTag>>,
+    }
+
+    impl Scripted {
+        fn away() -> Arc<Self> {
+            Arc::new(Self {
+                observed: Mutex::new(Err(crate::home_lan::Away::Hotspot)),
+                here: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn at(&self, home: Option<&crate::home_lan::HomeTag>) {
+            *self.observed.lock().unwrap() = home.cloned().ok_or(crate::home_lan::Away::Hotspot);
+            *self.here.lock().unwrap() = home.into_iter().cloned().collect();
+        }
+    }
+
+    impl crate::home_lan::Place for Scripted {
+        fn observed(
+            &self,
+            _: IpAddr,
+            _: IpAddr,
+        ) -> Result<crate::home_lan::HomeTag, crate::home_lan::Away> {
+            self.observed.lock().unwrap().clone()
+        }
+
+        fn here(&self) -> Vec<crate::home_lan::HomeTag> {
+            self.here.lock().unwrap().clone()
+        }
+
+        fn serving(&self, _: IpAddr) -> Vec<crate::home_lan::HomeTag> {
+            self.here()
+        }
+    }
+
+    fn run_at(options: &Options, place: Arc<Scripted>) -> Running {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        launch_at(listener, options, Tuning::default(), place).expect("started")
+    }
+
     /// Wait (a hang detector, not a budget) until `done` holds.
     fn until(what: &str, done: impl Fn() -> bool) {
         let deadline = Instant::now() + HANG_DETECTOR;
@@ -4760,7 +5495,7 @@ mod tests {
         Queued {
             request,
             peer,
-            observed_lan: false,
+            home: None,
             asked: 1,
             changed: 0,
             noted: 0,
@@ -5251,7 +5986,7 @@ mod tests {
         let peer = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let line = join_line(1, "m22");
         assert_eq!(
-            post_join(&running.shared, "alab", line.as_bytes(), peer).status,
+            post_join(&running.shared, "alab", line.as_bytes(), peer, None).status,
             204
         );
         let woke = waiter.join().expect("waiter").expect("woken");
@@ -5302,7 +6037,7 @@ mod tests {
         let ask = |running: &Running, n: u8, host: &str| {
             let line = join_line(n, host);
             assert_eq!(
-                post_join(&running.shared, "alab", line.as_bytes(), peer).status,
+                post_join(&running.shared, "alab", line.as_bytes(), peer, None).status,
                 204
             );
         };
@@ -5419,7 +6154,13 @@ mod tests {
         assert_eq!(requests[0].host, "m3");
         assert_eq!(requests[1].host, "m22b");
         assert!(requests.iter().all(|request| request.time.is_some()));
-        assert!(requests.iter().all(|request| request.lan));
+        // No member evidence here: nothing is observed on the home ALab LAN, and no request is
+        // listed `lan=1`, which an older approver would admit by alone.
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.lan && request.home.is_none())
+        );
 
         for bad in [
             "nonsense".to_owned(),
@@ -5427,6 +6168,8 @@ mod tests {
             format!("{} 1", join_line(3, "m22")),
             format!("{} lan=1", join_line(3, "m22")),
             format!("{} 1 lan=1", join_line(3, "m22")),
+            format!("{} home=0123456789abcdef", join_line(3, "m22")),
+            format!("{} 1 home=0123456789abcdef", join_line(3, "m22")),
             format!("{}\nsecond line", join_line(3, "m22")),
             format!("{} m22 {}", key(3), code(4)),
         ] {
@@ -5466,6 +6209,7 @@ mod tests {
                     code: "abcd-ef23-ghij-k234".to_owned(),
                     time: Some(now),
                     lan: false,
+                    home: None,
                     allowed: None,
                     proof: None,
                 },
@@ -5870,6 +6614,7 @@ mod tests {
                     code: "abcd-ef23-ghij-k234".to_owned(),
                     time: Some(time),
                     lan: false,
+                    home: None,
                     allowed: None,
                     proof: None,
                 },
@@ -6112,7 +6857,7 @@ mod tests {
         transport::post_join(&url(&running), &line).expect("asked again");
         assert_eq!(
             listed()[0],
-            format!("{} {recent} lan=1 proof={}", join_line(1, "m22"), proof(1))
+            format!("{} {recent} proof={}", join_line(1, "m22"), proof(1))
         );
         assert_eq!(inode(&joins), first, "the store was rewritten");
 
@@ -6187,7 +6932,7 @@ mod tests {
         let machine: IpAddr = "192.0.2.10".parse().expect("address");
         let stranger: IpAddr = "192.0.2.66".parse().expect("address");
         let ask = |line: &str, from: IpAddr| {
-            post_join(&running.shared, "alab", line.as_bytes(), from).status
+            post_join(&running.shared, "alab", line.as_bytes(), from, None).status
         };
         let proof = |n: u8| crate::b64::encode_padded(&[n; 32]);
         let key = crate::transport::test_recipient(1);
@@ -6308,7 +7053,7 @@ mod tests {
             let line = format!("{key} {host} {} allowed={allowed}", code(1));
             let from = from.parse().expect("address");
             assert_eq!(
-                post_join(&running.shared, "twice", line.as_bytes(), from).status,
+                post_join(&running.shared, "twice", line.as_bytes(), from, None).status,
                 204
             );
         }
@@ -6564,7 +7309,7 @@ mod tests {
             text,
             format!("peer 192.0.2.7 1\n{one}\n{two}\npeer 2001:db8::7 1\n{three}\n")
         );
-        assert_eq!(join_lines(&queue), format!("{one}\n{two}\n{three}\n"));
+        assert_eq!(join_lines(&queue, &[]), format!("{one}\n{two}\n{three}\n"));
         let triples = |queue: &[Queued]| {
             queue
                 .iter()
@@ -6587,139 +7332,178 @@ mod tests {
         assert_eq!((read[2].peer, read[2].asked), (Some(here), 0));
     }
 
+    /// A request is listed as observed on the home ALab LAN only from this server's own
+    /// observation, and only while this Mac is still on that network: an older build's
+    /// persisted `lan=1` and a private peer restore as no observation, no listing names an
+    /// address, and no listing says `lan=1` (an older approver admits by it alone).
+    ///
+    /// NEGATIVE CONTROLS: with `join_lines` listing `queued.home` unfiltered by `here`, the
+    /// listing of a Mac that left its home network still says `home=` and this test fails. With
+    /// its `bare` filter dropped, "a carried request lists no home" fails.
     #[test]
-    fn lan_eligibility_comes_only_from_server_observations() {
-        for address in [
-            "127.0.0.1",
-            "127.4.3.2",
-            "10.2.3.4",
-            "172.16.1.2",
-            "172.31.255.254",
-            "192.168.1.2",
-            "169.254.3.4",
-            "::1",
-            "fdab::1234",
-            "fe80::1234",
-            "::ffff:192.168.1.2",
-        ] {
-            assert!(lan_join_peer(address.parse().unwrap()), "{address}");
-        }
-        for address in [
-            "0.0.0.0",
-            "100.64.0.1",
-            "172.15.255.254",
-            "172.32.0.1",
-            "192.0.2.7",
-            "8.8.8.8",
-            "224.0.0.1",
-            "::",
-            "2001:db8::7",
-            "ff02::1",
-            "::ffff:8.8.8.8",
-        ] {
-            assert!(!lan_join_peer(address.parse().unwrap()), "{address}");
-        }
+    fn home_lan_observations_come_only_from_the_servers_place() {
         let request = |n| JoinRequest {
             time: Some(1_792_530_000),
             ..parse_join_line(&join_line(n, &format!("m{n}"))).unwrap()
         };
-        // These are the pre-upgrade records: the request has no marker, but the server
-        // already retained the actual socket peer. No repost or member action is needed.
-        let old = vec![
-            queued(request(1), Some("192.168.1.2".parse().unwrap())),
-            queued(request(2), Some("2001:db8::7".parse().unwrap())),
-            queued(request(3), None),
-        ];
-        let saved = stored_lines(&old);
-        assert!(!saved.contains("lan="));
-        let restored = parse_stored(&saved);
-        let listing = join_lines(&restored);
-        assert!(!listing.contains("192.168") && !listing.contains("2001:db8"));
-        let flags: Vec<bool> = listing
-            .lines()
-            .map(|line| parse_join_line(line).unwrap().lan)
-            .collect();
-        assert_eq!(flags, [true, false, false]);
+        let old = format!(
+            "peer 192.168.1.2 1\n{} lan=1\npeer 10.0.0.9 1\n{}\n{}\n",
+            request(1).listed(),
+            request(2).listed(),
+            request(3).listed()
+        );
+        let restored = parse_stored(&old);
+        assert_eq!(restored.len(), 3);
+        assert!(restored.iter().all(|queued| queued.home.is_none()));
+        let tag = crate::home_lan::HomeTag::test();
+        let listing = join_lines(&restored, std::slice::from_ref(&tag));
+        assert!(!listing.contains("192.168") && !listing.contains("10.0.0.9"));
+        assert!(!listing.contains("lan=") && !listing.contains("home="));
         let forged = vec![queued(
             JoinRequest {
                 lan: true,
+                home: Some(tag.clone()),
                 ..request(4)
             },
             Some("192.0.2.7".parse().unwrap()),
         )];
-        assert!(!parse_join_line(join_lines(&forged).trim()).unwrap().lan);
+        assert!(!join_lines(&forged, &[]).contains("lan="));
+        assert!(!join_lines(&forged, &[]).contains("home="));
+        let mut observed = queued(request(5), Some("192.168.1.40".parse().unwrap()));
+        observed.home = Some(tag.clone());
+        let at_home = join_lines(std::slice::from_ref(&observed), std::slice::from_ref(&tag));
+        let listed = parse_join_line(at_home.trim()).unwrap();
+        assert_eq!(listed.home.as_ref(), Some(&tag));
+        assert!(!listed.lan && !at_home.contains("192.168"));
+        let moved = join_lines(std::slice::from_ref(&observed), &[]);
+        assert_eq!(
+            parse_join_line(moved.trim()).unwrap().home,
+            None,
+            "moved off"
+        );
+        let elsewhere = crate::home_lan::HomeTag::of(std::net::Ipv4Addr::new(10, 9, 8, 0), 24);
+        let other = join_lines(std::slice::from_ref(&observed), &[elsewhere]);
+        assert_eq!(parse_join_line(other.trim()).unwrap().home, None);
+        // The store never keeps it: a restart observes anew.
+        assert!(!stored_lines(std::slice::from_ref(&observed)).contains("home="));
+        // A request carrying a member's Allow or a password proof lists no `home=`: an older
+        // approver skips a line with a field it does not know, and admits these by what they
+        // carry.
+        for carried in [
+            JoinRequest {
+                allowed: Some("allowed-by-a-member".to_owned()),
+                ..request(6)
+            },
+            JoinRequest {
+                proof: Some("proof-of-the-password".to_owned()),
+                ..request(7)
+            },
+        ] {
+            let mut observed = queued(carried, Some("192.168.1.41".parse().unwrap()));
+            observed.home = Some(tag.clone());
+            let line = join_lines(std::slice::from_ref(&observed), std::slice::from_ref(&tag));
+            assert!(
+                !line.contains("home="),
+                "a carried request lists no home: {line}"
+            );
+        }
     }
 
+    /// A Mac that asks again once its server is on the home ALab LAN (members heard there) is
+    /// listed at home at once, with its first address and time kept; the listing drops it when
+    /// the server moves off that network (a phone hotspot) and shows it again back home; a
+    /// repeat observed elsewhere does not clear it; and a restarted server observes anew.
+    ///
+    /// NEGATIVE CONTROL: with `decide_join`'s identical-request branch ignoring `home` (no
+    /// update of `queue[at].home`), the repeat at home is never listed and this test fails.
     #[test]
-    fn moving_onto_the_lan_updates_eligibility_without_replacing_the_first_peer() {
-        for first in [Some("192.0.2.7".parse::<IpAddr>().unwrap()), None] {
-            let root = aterm_tempfile::tempdir().unwrap();
-            let opts = options(root.path(), HANG_DETECTOR);
-            let running = run(&opts);
-            put(&running, &envelope(&OLD, 1)).unwrap();
-            let request = JoinRequest {
-                time: Some((running.shared.tuning.now)()),
-                ..parse_join_line(&join_line(1, "m1")).unwrap()
-            };
-            let original = queued(request.clone(), first);
-            fsx::write_atomic(
-                &running.shared.joins_path("alab"),
-                stored_lines(std::slice::from_ref(&original)).as_bytes(),
-                0o600,
-            )
-            .unwrap();
-            running
-                .shared
-                .lock_server_state()
-                .joins
-                .insert("alab".into(), vec![original]);
-            let at = url(&running);
-            assert!(
-                !parse_join_line(&transport::list_joins(&at).unwrap()[0])
-                    .unwrap()
-                    .lan
-            );
-            let generation = running.shared.lock_server_state().vaults["alab"].joins;
-            // Real HTTP POST supplies the loopback socket peer, with the identical request.
-            transport::post_join(&at, &request.line()).unwrap();
-            assert!(
-                parse_join_line(&transport::list_joins(&at).unwrap()[0])
-                    .unwrap()
-                    .lan
-            );
-            {
-                let state = running.shared.lock_server_state();
-                let queued = &state.joins["alab"][0];
-                assert_eq!(queued.peer, first);
-                assert_eq!(queued.request.time, request.time);
-                assert!(queued.observed_lan);
-                assert!(state.vaults["alab"].joins > generation);
-            }
-            running.stop();
-            let running = run(&opts);
-            assert!(
-                parse_join_line(&transport::list_joins(&url(&running)).unwrap()[0])
-                    .unwrap()
-                    .lan
-            );
-            // A later public-source repeat cannot clear the durable LAN observation.
-            assert_eq!(
-                post_join(
-                    &running.shared,
-                    "alab",
-                    request.line().as_bytes(),
-                    "192.0.2.8".parse().unwrap()
-                )
-                .status,
-                204
-            );
-            assert!(
-                parse_join_line(&transport::list_joins(&url(&running)).unwrap()[0])
-                    .unwrap()
-                    .lan
-            );
-            running.stop();
+    fn a_request_observed_at_home_is_listed_there_only_while_this_mac_is() {
+        let tag = crate::home_lan::HomeTag::test();
+        let home_of = |at: &str| {
+            parse_join_line(&transport::list_joins(at).unwrap()[0])
+                .unwrap()
+                .home
+        };
+        let root = aterm_tempfile::tempdir().unwrap();
+        let opts = options(root.path(), HANG_DETECTOR);
+        let place = Scripted::away();
+        let running = run_at(&opts, Arc::clone(&place));
+        put(&running, &envelope(&OLD, 1)).unwrap();
+        let request = parse_join_line(&join_line(1, "m20")).unwrap();
+        let at = url(&running);
+        transport::post_join(&at, &request.line()).unwrap();
+        assert_eq!(home_of(&at), None, "asked from a hotspot");
+        let (peer, time, generation) = {
+            let state = running.shared.lock_server_state();
+            let queued = &state.joins["alab"][0];
+            (queued.peer, queued.request.time, state.vaults["alab"].joins)
+        };
+        place.at(Some(&tag));
+        transport::post_join(&at, &request.line()).unwrap();
+        assert_eq!(home_of(&at), Some(tag.clone()), "asked again at home");
+        {
+            let state = running.shared.lock_server_state();
+            let queued = &state.joins["alab"][0];
+            assert_eq!((queued.peer, queued.request.time), (peer, time));
+            assert!(state.vaults["alab"].joins > generation);
         }
+        place.at(None);
+        assert_eq!(home_of(&at), None, "this Mac moved onto a hotspot");
+        assert_eq!(
+            post_join(
+                &running.shared,
+                "alab",
+                request.line().as_bytes(),
+                "192.0.2.8".parse().unwrap(),
+                None,
+            )
+            .status,
+            204
+        );
+        place.at(Some(&tag));
+        assert_eq!(home_of(&at), Some(tag.clone()), "back home, still observed");
+        running.stop();
+        let running = run(&opts);
+        assert_eq!(home_of(&url(&running)), None, "a restart observes anew");
+        running.stop();
+    }
+
+    /// A listing's version moves when this Mac moves onto or off a home ALab LAN network, since
+    /// `home=` is read against where it is: an approver that holds the listing heard while the
+    /// server was away reads the one at home at once, not after an hour's refresh.
+    ///
+    /// NEGATIVE CONTROL: `list_joins` leaving the version alone when `here` changes (its
+    /// `listed_here` comparison read as `false`): the long-poll past the away version is held
+    /// for the whole hold and answers `Unchanged`, and the `Listed` match fails.
+    #[test]
+    fn a_listing_moves_when_this_mac_moves_onto_its_home_network() {
+        let tag = crate::home_lan::HomeTag::test();
+        let root = aterm_tempfile::tempdir().unwrap();
+        let place = Scripted::away();
+        let running = run_at(&options(root.path(), HANG_DETECTOR), Arc::clone(&place));
+        put(&running, &envelope(&OLD, 1)).unwrap();
+        let at = url(&running);
+        place.at(Some(&tag));
+        let request = parse_join_line(&join_line(1, "m20")).unwrap();
+        transport::post_join(&at, &request.line()).unwrap();
+        place.at(None);
+        let transport::Joins::Listed(lines, Some(away)) =
+            transport::wait_joins(&at, None, HANG_DETECTOR).unwrap()
+        else {
+            panic!("a listing with a version");
+        };
+        assert_eq!(parse_join_line(&lines[0]).unwrap().home, None, "away");
+        place.at(Some(&tag));
+        let back = transport::wait_joins(&at, Some(away), HANG_DETECTOR).unwrap();
+        let transport::Joins::Listed(lines, _) = back else {
+            panic!("the listing back home was held: {back:?}");
+        };
+        assert_eq!(
+            parse_join_line(&lines[0]).unwrap().home,
+            Some(tag),
+            "back home"
+        );
+        running.stop();
     }
 
     #[test]
@@ -6839,6 +7623,34 @@ mod tests {
             assert!(served(&running) == envelope(&OLD, 4), "nothing changes");
         }
         running.stop();
+
+        // When a retired key's parented head gives way via `take_from_store` to the replacement
+        // key's unparented seq 1, `parented` resets to match the replacement envelope rather than
+        // carrying over from the retired lineage.
+        let rep_store = root.path().join("replaced-store");
+        let old_1 = envelope(&OLD, 1);
+        let old_1_head = crate::envelope::parse(&old_1).expect("parse").digest();
+        let old_2_parented = sign(
+            &Unsigned {
+                parents: vec![old_1_head],
+                ..unsigned(2, Vec::new(), "alab")
+            },
+            &OLD,
+        )
+        .expect("signed");
+        let pre = run(&options(&rep_store, HANG_DETECTOR));
+        put(&pre, &old_1).expect("old 1");
+        put(&pre, &old_2_parented).expect("old 2 parented");
+        pre.stop();
+
+        let rep_running = run_tuned(&options(&rep_store, HANG_DETECTOR), retiring());
+        let new_1 = envelope(&NEW, 1);
+        std::fs::write(rep_store.join("alab.vault"), &new_1)
+            .expect("replacement published at store file");
+        assert!(served(&rep_running) == new_1, "replacement served");
+        put(&rep_running, &envelope(&NEW, 2))
+            .expect("unparented seq 2 accepted after unparented replacement at store file");
+        rep_running.stop();
     }
 
     /// A publish at the store path that lands between a PUT's judgment and its lock.
@@ -6975,6 +7787,32 @@ mod tests {
         if let Some(primary) = primary_ipv6() {
             assert!(this_machine(IpAddr::V6(primary), None));
         }
+        let here = [Target {
+            scope: None,
+            ip: Ipv4Addr::new(192, 0, 2, 55),
+        }];
+        for self_url in [
+            ("http://127.0.0.1/v1/alab", 80),
+            ("http://[::1]/v1/alab", 80),
+            ("http://[::ffff:127.0.0.1]:7484/v1/alab", 7484),
+            ("http://[::ffff:192.0.2.55]:7484/v1/alab", 7484),
+            ("HTTP://M22.LOCAL:7484/v1/alab", 7484),
+            ("http://m22.local.:7484/v1/alab", 7484),
+        ] {
+            let uri = aterm_http::Uri::parse(self_url.0).expect("uri");
+            assert!(
+                is_obviously_self_url(&uri, self_url.1, Some("m22"), &here),
+                "{}",
+                self_url.0
+            );
+        }
+        let other = aterm_http::Uri::parse("http://m7.local:7484/v1/alab").expect("uri");
+        assert!(!is_obviously_self_url(&other, 7484, Some("m22"), &here));
+        assert!(is_self_addr(
+            SocketAddr::new(ip("::ffff:192.0.2.55"), 7484),
+            7484,
+            &here
+        ));
     }
 
     #[test]
@@ -7348,7 +8186,7 @@ mod tests {
             None,
             Seams {
                 routes: Some(Box::new(move |most| changes.recv_timeout(most).is_ok())),
-                browse: false,
+                browse: None,
                 targets: Box::new({
                     let here = Arc::clone(&here);
                     move || here.lock().expect("targets").clone()
@@ -7358,6 +8196,9 @@ mod tests {
                 power: Box::new(|_, _| false),
                 end_for_sleep: Arc::new(end),
                 sleep_bound: SLEEP_YIELD_BOUND,
+                probe: |_, _, _, _, _, _| None,
+                name_answered: Box::new(|_, _| false),
+                sharing: Box::new(|| true),
             },
         );
         let registered = || -> (Vec<Target>, Option<Option<Wake>>) {
@@ -7387,6 +8228,187 @@ mod tests {
             "advertising alab-secrets.local at 192.168.1.5 (woken by a route change)"
         );
         drop(children);
+        running.stop();
+    }
+
+    /// Sharing off or unreadable ends both the advert and the standing browse; on restarts a
+    /// fresh watch. The actual worker reads a private config; its injected factory makes idle
+    /// watches (no DNS), whose weak references observe destruction as well as starts.
+    /// NEGATIVE CONTROLS: start before reading sharing, retain a watch while held, or treat an
+    /// unreadable switch as on: the starts or lifetimes no longer match.
+    #[test]
+    fn the_advert_and_browse_end_while_sharing_is_held_and_restart_on() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let home = root.path().join("home");
+        let config = home.join(".config/aterm/aterm.toml");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        const ON: &[u8] = b"[swarm]\nenabled = true\n";
+        const OFF: &[u8] = b"[swarm]\nenabled = false\n";
+        let write_config = |bytes: &[u8]| crate::fsx::write_atomic(&config, bytes, 0o600).unwrap();
+        write_config(OFF);
+        let running = run(&options(root.path(), Duration::from_millis(200)));
+        let sleep = aterm_uds::deadline::stand_in(Path::new("/bin/sleep"));
+        let sleep = sleep.to_str().expect("a UTF-8 path").to_owned();
+        let here = Target {
+            scope: None,
+            ip: Ipv4Addr::new(192, 168, 1, 5),
+        };
+        let watches = Arc::new(Mutex::new(
+            Vec::<std::sync::Weak<crate::discover::Watch>>::new(),
+        ));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let (ring, rings) = std::sync::mpsc::channel::<()>();
+        let children = Children::default();
+        children.tend_seamed(
+            false,
+            Some((
+                "alab-secrets".to_owned(),
+                running.addr.port(),
+                Arc::clone(&running.shared),
+            )),
+            None,
+            Seams {
+                routes: Some(Box::new(move |most| rings.recv_timeout(most).is_ok())),
+                browse: Some(Box::new({
+                    let watches = Arc::clone(&watches);
+                    move |bell, own| {
+                        let watch =
+                            Arc::new(crate::discover::Watch::idle_for(SERVICE_TYPE, bell, own));
+                        watches.lock().unwrap().push(Arc::downgrade(&watch));
+                        watch
+                    }
+                })),
+                targets: Box::new({
+                    let here = here.clone();
+                    move || vec![here.clone()]
+                }),
+                spawn: Box::new(move |_, _, _, _| quiet(&sleep, &["60".to_owned()])),
+                every: ADVERTISE_EVERY,
+                power: Box::new(|_, _| false),
+                end_for_sleep: Arc::new(end),
+                sleep_bound: SLEEP_YIELD_BOUND,
+                probe: |_, _, _, _, _, _| None,
+                name_answered: Box::new(|_, _| false),
+                sharing: Box::new({
+                    let mut switch = crate::swarm::Switch::new(&home);
+                    let reads = Arc::clone(&reads);
+                    move || {
+                        let on = switch.enabled() == Ok(true);
+                        reads.fetch_add(1, Ordering::SeqCst);
+                        on
+                    }
+                }),
+            },
+        );
+        let registered = || -> Vec<Target> {
+            let set = children.lock();
+            set.dns
+                .held
+                .iter()
+                .chain(set.alab_dns.held.iter())
+                .map(|(t, _, _)| t.clone())
+                .collect()
+        };
+        let lives = || -> Vec<bool> {
+            watches
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|watch| watch.strong_count() != 0)
+                .collect()
+        };
+        until("the first round read the switch", || {
+            reads.load(Ordering::SeqCst) >= 1
+        });
+        let _ = ring.send(());
+        // The second round began: the first, with sharing off, is over.
+        until("the second round read the switch", || {
+            reads.load(Ordering::SeqCst) >= 2
+        });
+        assert!(registered().is_empty(), "sharing off: nothing advertised");
+        assert!(lives().is_empty(), "sharing off: no browse even started");
+        for (cycle, hold) in [OFF, b"\xff".as_slice()].into_iter().enumerate() {
+            write_config(ON);
+            let _ = ring.send(());
+            let mut expected = vec![false; cycle + 1];
+            expected[cycle] = true;
+            until("advertised with a fresh browse once sharing is on", || {
+                !registered().is_empty() && lives() == expected
+            });
+            write_config(hold);
+            let _ = ring.send(());
+            until("advert and browse ended while sharing is held", || {
+                registered().is_empty() && lives() == vec![false; cycle + 1]
+            });
+        }
+        write_config(ON);
+        let _ = ring.send(());
+        until("browse restarted after an unreadable switch", || {
+            !registered().is_empty() && lives() == [false, false, true]
+        });
+        write_config(OFF);
+        let _ = ring.send(());
+        until("the final advert and browse ended", || {
+            registered().is_empty() && lives() == [false; 3]
+        });
+        drop(children);
+        running.stop();
+    }
+
+    #[test]
+    fn a_verified_probe_and_a_current_role_are_required_for_holder_election() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let key = signer_public(&OLD).unwrap();
+        let mut opts = options(root.path(), Duration::from_millis(100));
+        opts.pins = vec![(crate::ALAB_VAULT.to_owned(), key)];
+        let running = run(&opts);
+        let bytes = envelope(&OLD, 81);
+        assert_eq!(
+            verify_probed_alab_envelope(&bytes, &running.shared),
+            Some(81)
+        );
+        let invalid_signature = String::from_utf8(bytes)
+            .unwrap()
+            .replace("seq: 81\n", "seq: 82\n");
+        assert!(envelope::parse(invalid_signature.as_bytes()).is_ok());
+        assert_eq!(
+            verify_probed_alab_envelope(invalid_signature.as_bytes(), &running.shared),
+            None
+        );
+        assert_eq!(
+            verify_probed_alab_envelope(&envelope(&STRANGER, 99), &running.shared),
+            None
+        );
+
+        let mut watcher = AlabNameWatcher {
+            holding: true,
+            ..AlabNameWatcher::new()
+        };
+        let mut denied: RoleDecider = Box::new(|_| None);
+        let (primary, secondary) = tend_role_targets(
+            &mut denied,
+            running.addr.port(),
+            &running.shared,
+            None,
+            &mut watcher,
+            &[],
+            &[],
+            &[],
+            |_| Some(81),
+        );
+        assert!(primary.is_none());
+        assert!(secondary.is_some_and(|(_, _, targets)| targets.is_none()));
+        assert!(!watcher.is_holding());
+        // A later positive role must wait the normal grace, not inherit the former claim.
+        assert!(!watcher.decide(
+            &AlabNameInput {
+                own_label: "m5",
+                own_seq: Some(81),
+                holders: &[],
+                now: Instant::now(),
+            },
+            |_| None
+        ));
         running.stop();
     }
 
@@ -7577,7 +8599,15 @@ mod tests {
                     Some(81)
                 },
             );
-            reregister_roles(&mut set, targets, &mut watcher, Some(Wake::Timer), &*spawn);
+            // `m22` answers to the name.
+            reregister_roles(
+                &mut set,
+                targets,
+                &mut watcher,
+                Some(Wake::Timer),
+                &*spawn,
+                Some(true),
+            );
             // Each registration of the name ends as it probes, before the next round looks.
             let deadline = Instant::now() + HANG_DETECTOR;
             while set
@@ -7617,6 +8647,374 @@ mod tests {
         drop(set);
         drop(children);
         running.stop();
+    }
+
+    /// One registration of `alab-secrets` in `slot` advertising ALab at `seq`, a stand-in
+    /// `sleep 60`.
+    fn hold_advertising(slot: &mut DnsSdSlot, seq: u64, sleep: &str) {
+        hold(slot, crate::alab_advertised(), sleep);
+        slot.held[0].1 = Some(VaultTxt {
+            vault: crate::ALAB_VAULT.to_owned(),
+            signer: crate::envelope::fingerprint(&[0x5a; 32]),
+            seq,
+            head: [0x5a; 32],
+            label: Some("m5".to_owned()),
+        });
+    }
+
+    /// The seams of member `m5`'s server in these tests: one address, a stand-in `sleep 60`
+    /// for each registration (each name it starts kept in `started`), a count of its rounds
+    /// (`rounds`, as each starts), no route source, browse or timer round (only a ring starts
+    /// one), nothing heard of this Mac's power, nothing answering a probe, and `name_answered`
+    /// for whether another device answers to a name.
+    fn member_seams(
+        sleep: &str,
+        started: &Arc<Mutex<Vec<String>>>,
+        rounds: &Arc<AtomicUsize>,
+        name_answered: Box<NameAnswered>,
+    ) -> Seams {
+        let sleep = sleep.to_owned();
+        let started = Arc::clone(started);
+        let rounds = Arc::clone(rounds);
+        Seams {
+            routes: None,
+            browse: None,
+            targets: Box::new(move || {
+                rounds.fetch_add(1, Ordering::SeqCst);
+                vec![Target {
+                    scope: None,
+                    ip: Ipv4Addr::new(10, 0, 0, 5),
+                }]
+            }),
+            spawn: Box::new(move |name, _, _, _| {
+                started.lock().expect("started").push(name.to_owned());
+                quiet(&sleep, &["60".to_owned()])
+            }),
+            every: Duration::from_secs(3600),
+            power: Box::new(|_, _| false),
+            end_for_sleep: Arc::new(end),
+            sleep_bound: SLEEP_YIELD_BOUND,
+            probe: |_, _, _, _, _, _| None,
+            name_answered,
+            sharing: Box::new(|| true),
+        }
+    }
+
+    /// A server that stops while it holds `alab-secrets` (an update that replaced its program,
+    /// a move of its job) leaves a stamp in its store, and the server started in its place
+    /// registers the name on its first round. Before, it started as a server that never held
+    /// the name, so `alab-secrets.local` went unanswered for 90-120 s on each such restart
+    /// while it waited out [`ALAB_FALLBACK_AFTER`]. The probe here hears nothing, as on a LAN
+    /// where the name went with the server that stopped.
+    /// NEGATIVE CONTROL: starting the `vault-tend` thread with `AlabNameWatcher::new()` in
+    /// place of [`AlabNameWatcher::resume`] registers no `alab-secrets` on the first round:
+    /// `left: 0, right: 1`, "the restarted holder registers alab-secrets on its first round".
+    #[test]
+    fn a_restarted_holder_takes_the_name_back_on_its_first_round() {
+        let sleep = aterm_uds::deadline::stand_in(Path::new("/bin/sleep"));
+        let sleep = sleep.to_str().expect("a UTF-8 path").to_owned();
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let key = signer_public(&OLD).expect("public");
+        let mut options = options(root.path(), Duration::from_millis(100));
+        options.pins = vec![(crate::ALAB_VAULT.to_owned(), key)];
+        let running = run(&options);
+        put(&running, &envelope(&OLD, 81)).expect("m5 holds seq 81");
+        let stamp = root.path().join(ALAB_HELD_FILE);
+
+        // The server before held the name at seq 81 as it stopped.
+        let before = Children::default();
+        {
+            let mut set = before.lock();
+            set.held_file = Some(stamp.clone());
+            hold_advertising(&mut set.alab_dns, 81, &sleep);
+        }
+        drop(before);
+        assert!(stamp.exists(), "the holder that stopped left a stamp");
+
+        let started = Arc::new(Mutex::new(Vec::<String>::new()));
+        let rounds = Arc::new(AtomicUsize::new(0));
+        let children = Children::default();
+        children.tend_seamed(
+            false,
+            Some((
+                "m5".to_owned(),
+                running.addr.port(),
+                Arc::clone(&running.shared),
+            )),
+            None,
+            member_seams(&sleep, &started, &rounds, Box::new(|_, _| false)),
+        );
+        // A round registers both names under one hold of the children's lock.
+        until("the first round registers m5", || {
+            children.lock().dns.held.len() == 1
+        });
+        let set = children.lock();
+        assert_eq!(
+            set.alab_dns.held.len(),
+            1,
+            "the restarted holder registers alab-secrets on its first round"
+        );
+        assert_eq!(set.alab_dns.started_by, Some(None), "the first round");
+        drop(set);
+        assert!(!stamp.exists(), "a stamp is read once");
+        drop(children);
+        running.stop();
+    }
+
+    /// mDNSResponder restarting (a crash, an OS update) ends every `dns-sd`, the holder's
+    /// registration of `alab-secrets` among them, and no other device answers to the name
+    /// then: the holder registers it again on its next round. Before, any end of that
+    /// registration read as the name lost to another device, so the name stayed unheld until
+    /// some server's 90 s fallback ran out. When another device does answer (an mDNS
+    /// conflict), the holder still lets the name go and registers nothing in its place. The
+    /// round asks with this Mac's addresses, once for each end. The holder here took the name
+    /// back as it started ([`AlabNameWatcher::resume`]). The registration ends as a round
+    /// starts, so no round sees it up at its look and ended under its lock, as one in flight
+    /// would if the test ended it from outside.
+    /// NEGATIVE CONTROL: [`reregister_roles`] letting the name go on any end of the
+    /// registration (no `alab_answered == Some(false)` arm) registers nothing on the round
+    /// after mDNSResponder restarted: `left: 1, right: 2`, "the holder registers the name
+    /// again on its next round".
+    #[test]
+    fn a_holder_whose_registration_ends_with_no_other_device_answering_registers_it_again() {
+        let sleep = aterm_uds::deadline::stand_in(Path::new("/bin/sleep"));
+        let sleep = sleep.to_str().expect("a UTF-8 path").to_owned();
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let key = signer_public(&OLD).expect("public");
+        let mut options = options(root.path(), Duration::from_millis(100));
+        options.pins = vec![(crate::ALAB_VAULT.to_owned(), key)];
+        let running = run(&options);
+        put(&running, &envelope(&OLD, 81)).expect("m5 holds seq 81");
+        let before = Children::default();
+        {
+            let mut set = before.lock();
+            set.held_file = Some(root.path().join(ALAB_HELD_FILE));
+            hold_advertising(&mut set.alab_dns, 81, &sleep);
+        }
+        drop(before);
+
+        let answered = Arc::new(AtomicBool::new(false));
+        let asked = Arc::new(Mutex::new(Vec::<(String, Vec<Target>)>::new()));
+        let name_answered: Box<NameAnswered> = Box::new({
+            let (answered, asked) = (Arc::clone(&answered), Arc::clone(&asked));
+            move |name, own| {
+                asked
+                    .lock()
+                    .expect("asked")
+                    .push((name.to_owned(), own.to_vec()));
+                answered.load(Ordering::SeqCst)
+            }
+        });
+        let started = Arc::new(Mutex::new(Vec::<String>::new()));
+        let rounds = Arc::new(AtomicUsize::new(0));
+        let children = Children::default();
+        // When told to, a round ends the registration's `dns-sd` as it starts, as mDNSResponder
+        // restarting ends it.
+        let end_next = Arc::new(AtomicBool::new(false));
+        let mut seams = member_seams(&sleep, &started, &rounds, name_answered);
+        seams.targets = Box::new({
+            let set = Arc::clone(&children.set);
+            let (end_next, rounds) = (Arc::clone(&end_next), Arc::clone(&rounds));
+            move || {
+                if end_next.swap(false, Ordering::SeqCst) {
+                    let mut set = set.lock().unwrap_or_else(PoisonError::into_inner);
+                    let child = &mut set.alab_dns.held[0].2;
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                rounds.fetch_add(1, Ordering::SeqCst);
+                vec![Target {
+                    scope: None,
+                    ip: Ipv4Addr::new(10, 0, 0, 5),
+                }]
+            }
+        });
+        children.tend_seamed(
+            false,
+            Some((
+                "m5".to_owned(),
+                running.addr.port(),
+                Arc::clone(&running.shared),
+            )),
+            None,
+            seams,
+        );
+        until("the first round registers both names", || {
+            children.lock().alab_dns.held.len() == 1
+        });
+        let bell = children
+            .bell
+            .lock()
+            .expect("bell")
+            .clone()
+            .expect("the advert's bell");
+        let alab_started = || {
+            started
+                .lock()
+                .expect("started")
+                .iter()
+                .filter(|name| *name == crate::alab_advertised())
+                .count()
+        };
+        // The next round ends the registration as it starts. Two rings: the second round
+        // starts only once the first is done. A round seen to start has passed the point where
+        // it ends the registration, so the first ring's round is the one that ends it.
+        let restarted = || {
+            end_next.store(true, Ordering::SeqCst);
+            let before = rounds.load(Ordering::SeqCst);
+            for n in 1..=2 {
+                bell.ring(Wake::Put);
+                until("a round runs", || {
+                    rounds.load(Ordering::SeqCst) >= before + n
+                });
+            }
+        };
+        let here = vec![Target {
+            scope: None,
+            ip: Ipv4Addr::new(10, 0, 0, 5),
+        }];
+
+        restarted();
+        assert_eq!(
+            alab_started(),
+            2,
+            "the holder registers the name again on its next round"
+        );
+        assert_eq!(children.lock().alab_dns.held.len(), 1);
+        assert_eq!(
+            *asked.lock().expect("asked"),
+            [(crate::alab_advertised().to_owned(), here.clone())],
+            "asked once, with this Mac's address"
+        );
+
+        // Another device answers to the name: an mDNS conflict ended the registration.
+        answered.store(true, Ordering::SeqCst);
+        restarted();
+        assert_eq!(
+            alab_started(),
+            2,
+            "a name another device answers to is left to it"
+        );
+        assert!(
+            children.lock().alab_dns.held.is_empty(),
+            "the registration that lost the name ended"
+        );
+        assert_eq!(asked.lock().expect("asked").len(), 2);
+        drop(children);
+        running.stop();
+    }
+
+    /// A stamp lets a restarted server take `alab-secrets` back only while no other server can
+    /// have taken it: by a first decision within [`ALAB_RESUME_WITHIN`] of the stop, with no
+    /// sleep since (a holder gives the name up as it sleeps, and another member may hold it by
+    /// the wake), and with an envelope at least as new as the one advertised there. Otherwise
+    /// it waits out [`ALAB_FALLBACK_AFTER`] as a new server does. The window is counted to the
+    /// decision, not to the server's start: a server whose rounds decide nothing at first (its
+    /// role unreadable for a while) takes nothing back once the window has passed. A sleep
+    /// before its first decision takes nothing back, and a holder whose registrations a
+    /// will-sleep took leaves no stamp.
+    /// NEGATIVE CONTROL: [`AlabNameWatcher::resume`] without its sleep check (`slept_ms` taken
+    /// as `None`) takes back a stamp from before a sleep: "a stamp from before this Mac slept
+    /// is not taken back". [`AlabNameWatcher::decide`] honouring the stamp with no deadline
+    /// (the window checked only as the server starts) takes it back at a first decision
+    /// [`ALAB_RESUME_WITHIN`] after the start: "a first decision later than the window takes
+    /// nothing back".
+    #[test]
+    fn a_stamp_is_taken_back_only_within_its_window_and_with_no_sleep_since() {
+        let t = 1_800_000_000_000_u64;
+        let stamp = HeldStamp { at_ms: t, seq: 81 };
+        assert_eq!(HeldStamp::parse(&stamp.line()), Some(stamp));
+        let within = u64::try_from(ALAB_RESUME_WITHIN.as_millis()).expect("milliseconds");
+        let start = Instant::now();
+        let decide = |watcher: &mut AlabNameWatcher, seq, now| {
+            watcher.decide(
+                &AlabNameInput {
+                    own_label: "m5",
+                    own_seq: Some(seq),
+                    holders: &[],
+                    now,
+                },
+                |_| None,
+            )
+        };
+
+        let mut fresh = AlabNameWatcher::resume(Some(stamp), t + within, start, Some(t - 1));
+        assert!(decide(&mut fresh, 81, start), "a fresh stamp is taken back");
+        let mut prompt = AlabNameWatcher::resume(Some(stamp), t + 1_000, start, None);
+        assert!(
+            decide(
+                &mut prompt,
+                81,
+                start + ALAB_RESUME_WITHIN - Duration::from_secs(1)
+            ),
+            "a first decision within the window, counted from the stop, takes it back"
+        );
+        let mut late = AlabNameWatcher::resume(Some(stamp), t + 1_000, start, None);
+        let past = start + ALAB_RESUME_WITHIN;
+        assert!(
+            !decide(&mut late, 81, past),
+            "a first decision later than the window takes nothing back"
+        );
+        assert!(
+            decide(&mut late, 81, past + ALAB_FALLBACK_AFTER),
+            "a late first decision: the name comes after the fallback, as to any server"
+        );
+
+        for (why, mut watcher, seq) in [
+            (
+                "a stamp from before this Mac slept",
+                AlabNameWatcher::resume(Some(stamp), t + 1_000, start, Some(t + 500)),
+                81,
+            ),
+            (
+                "a stamp older than its window",
+                AlabNameWatcher::resume(Some(stamp), t + within + 1, start, None),
+                81,
+            ),
+            (
+                "a stamp from a later time than now",
+                AlabNameWatcher::resume(Some(stamp), t - 1, start, None),
+                81,
+            ),
+            (
+                "a stamp for a newer envelope than this server holds",
+                AlabNameWatcher::resume(Some(stamp), t + 1_000, start, None),
+                80,
+            ),
+        ] {
+            assert!(!decide(&mut watcher, seq, start), "{why} is not taken back");
+            assert!(
+                decide(&mut watcher, seq, start + ALAB_FALLBACK_AFTER),
+                "{why}: the name comes after the fallback, as to any server"
+            );
+        }
+
+        let mut slept = AlabNameWatcher::resume(Some(stamp), t + 1_000, start, None);
+        slept.slept();
+        assert!(
+            !decide(&mut slept, 81, start),
+            "a sleep before the first decision takes nothing back"
+        );
+
+        let sleep = aterm_uds::deadline::stand_in(Path::new("/bin/sleep"));
+        let sleep = sleep.to_str().expect("a UTF-8 path").to_owned();
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let path = root.path().join(ALAB_HELD_FILE);
+        let children = Children::default();
+        {
+            let mut set = children.lock();
+            set.held_file = Some(path.clone());
+            hold_advertising(&mut set.alab_dns, 81, &sleep);
+        }
+        let asleep = AtomicBool::new(true);
+        for (_, mut child) in take_for_sleep(&children.set, &asleep) {
+            end(&mut child);
+        }
+        drop(children);
+        assert!(
+            !path.exists(),
+            "a holder that went to sleep leaves no stamp"
+        );
     }
 
     /// One registration of `name` in `slot`, a stand-in `sleep 60`: its pid.
@@ -7740,7 +9138,7 @@ mod tests {
         assert!(!asleep.load(Ordering::SeqCst));
         let mut set = children.lock();
         assert!(set.dns.held.is_empty() && set.alab_dns.held.is_empty());
-        reregister_awake(&mut set, &asleep, both(), &mut watcher, None, &*spawn);
+        reregister_awake(&mut set, &asleep, both(), &mut watcher, None, &*spawn, None);
         assert_eq!(
             started.load(Ordering::SeqCst),
             0,
@@ -7846,7 +9244,7 @@ mod tests {
                 },
             );
             let mut set = children.lock();
-            reregister_awake(&mut set, &asleep, targets, watcher, why, &*spawn);
+            reregister_awake(&mut set, &asleep, targets, watcher, why, &*spawn, None);
         };
         let hear = |message| {
             aterm_uds::power::answer(message, &mut |power| yielding.hear(power), || {});
@@ -7994,6 +9392,7 @@ mod tests {
                 &mut watcher,
                 Some(Wake::Timer),
                 &*spawn,
+                None,
             );
         }
         assert_eq!(
@@ -8041,7 +9440,7 @@ mod tests {
             None,
             Seams {
                 routes: None,
-                browse: false,
+                browse: None,
                 targets: Box::new({
                     let rounds = Arc::clone(&rounds);
                     move || {
@@ -8070,6 +9469,9 @@ mod tests {
                 }),
                 end_for_sleep: Arc::new(end),
                 sleep_bound: HANG_DETECTOR,
+                probe: |_, _, _, _, _, _| None,
+                name_answered: Box::new(|_, _| false),
+                sharing: Box::new(|| true),
             },
         );
         let mut handler = heard
@@ -8125,6 +9527,81 @@ mod tests {
         drop(handler);
         drop(children);
         running.stop();
+    }
+
+    /// A server whose address another process holds (a second login's server on a Mac whose
+    /// first login serves on `0.0.0.0:7484`) waits and tries again, where it exited and launchd
+    /// started it again every 10 s for good, and it serves once a bind succeeds. A stop (a
+    /// signal, or its program replaced on disk) ends the wait with no listener. The address is
+    /// held for real (the system refuses each bind of it with `AddrInUse`); the bind that
+    /// succeeds takes a port of its own, since a freed port may go to another test first. A stop
+    /// nothing wakes the wait for (its program replaced on disk) is seen within a look
+    /// ([`PROGRAM_EVERY`]), however long the wait before the next try.
+    /// NEGATIVE CONTROL: [`bind_when_free`] returning the bind's error at once, as
+    /// `serve_with_role`'s plain `?` did, fails: "the second login's server waits for the
+    /// address", `Error("listening on 127.0.0.1:<port>: Address already in use (os error 48)",
+    /// Other)`. Parking for the whole wait (`park_timeout(left)`, no [`PROGRAM_EVERY`] bound)
+    /// fails: "a replaced program ends an hour's wait within a look", `Timeout`.
+    #[test]
+    fn a_server_whose_address_another_process_holds_waits_for_it() {
+        let holder = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = holder.local_addr().expect("addr");
+        let mut tries = 0;
+        let mut freed = None;
+        let bound = bind_when_free(
+            addr,
+            Duration::from_millis(1),
+            &mut |at| {
+                assert_eq!(at, addr);
+                tries += 1;
+                if tries < 3 {
+                    return TcpListener::bind(at);
+                }
+                // The first login's server stopped: the bind succeeds.
+                let listener = TcpListener::bind("127.0.0.1:0")?;
+                freed = listener.local_addr().ok();
+                Ok(listener)
+            },
+            &|| None,
+        )
+        .expect("the second login's server waits for the address")
+        .expect("it serves once a bind succeeds");
+        assert_eq!(tries, 3, "it tried again while the address was held");
+        assert_eq!(bound.local_addr().ok(), freed);
+
+        let looks = AtomicUsize::new(0);
+        let stopped = bind_when_free(
+            addr,
+            Duration::from_millis(1),
+            &mut TcpListener::bind::<SocketAddr>,
+            &|| (looks.fetch_add(1, Ordering::SeqCst) >= 1).then_some("stopped by a signal"),
+        )
+        .expect("a stop is no error");
+        assert!(stopped.is_none(), "a stop ends the wait");
+        assert_eq!(looks.load(Ordering::SeqCst), 2);
+
+        let (done, ended) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let looks = AtomicUsize::new(0);
+            let stopped = bind_when_free(
+                addr,
+                Duration::from_secs(3600),
+                &mut TcpListener::bind::<SocketAddr>,
+                &|| {
+                    (looks.fetch_add(1, Ordering::SeqCst) >= 1)
+                        .then_some("its program was replaced")
+                },
+            );
+            let _ = done.send(stopped.map(|listener| listener.is_none()));
+        });
+        assert!(
+            ended
+                .recv_timeout(HANG_DETECTOR)
+                .expect("a replaced program ends an hour's wait within a look")
+                .expect("a stop is no error"),
+            "a stop ends the wait"
+        );
+        drop(holder);
     }
 
     #[test]
@@ -8294,6 +9771,225 @@ mod tests {
             read_last_heard(root.path()),
             vec![("alab".to_owned(), valid, 1_793_160_500)]
         );
+    }
+
+    #[test]
+    fn heard_coverage_survives_clean_restart_but_not_interrupted_or_corrupt_history() {
+        use std::sync::atomic::AtomicU64;
+        const START: u64 = 1_820_000_000;
+        static CLOCK: AtomicU64 = AtomicU64::new(START);
+        fn clock() -> u64 {
+            CLOCK.load(Ordering::SeqCst)
+        }
+        let root = aterm_tempfile::tempdir().unwrap();
+        let opts = options(root.path(), Duration::from_millis(200));
+        let tuning = Tuning {
+            now: clock,
+            ..Tuning::default()
+        };
+        let running = run_tuned(&opts, tuning);
+        put(&running, &envelope(&OLD, 1)).unwrap();
+        let recipient = crate::transport::test_recipient(0x40);
+        transport::fetch_within_as(&url(&running), None, HANG_DETECTOR, Some(&recipient)).unwrap();
+        let plain = read_all(sent(
+            &running,
+            b"GET /v1/alab HTTP/1.1\r\nHost: legacy\r\n\r\n",
+        ));
+        assert!(plain.starts_with("HTTP/1.1 200 "));
+        let warm = START + transport::HEARD_COVERAGE_SECS;
+        CLOCK.store(warm - 1, Ordering::SeqCst);
+        assert!(transport::fetch_heard(&url(&running)).is_err());
+        CLOCK.store(warm, Ordering::SeqCst);
+        let heard = transport::fetch_heard(&url(&running)).unwrap().unwrap();
+        assert_eq!(
+            heard.anonymous,
+            Some(START),
+            "a plain legacy GET was invisible"
+        );
+        let tag = transport::heard_tag(&crate::age::Recipient::parse(&recipient).unwrap());
+        assert_eq!(
+            heard.subscribers.get(&tag),
+            Some(&START),
+            "the exact-window observation was lost"
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        assert!(
+            launch(listener, &opts, tuning).is_err(),
+            "another writer took the stable history lock"
+        );
+        let plain = read_all(sent(
+            &running,
+            b"GET /v1/alab HTTP/1.1\r\nHost: legacy\r\n\r\n",
+        ));
+        assert!(plain.starts_with("HTTP/1.1 200 "));
+        running.stop();
+        CLOCK.store(warm + 1, Ordering::SeqCst);
+        let restarted = run_tuned(&opts, tuning);
+        assert_eq!(
+            transport::fetch_heard(&url(&restarted))
+                .unwrap()
+                .unwrap()
+                .anonymous,
+            Some(warm),
+            "a clean restart forgot anonymous reads"
+        );
+        assert_eq!(
+            transport::fetch_heard(&url(&restarted))
+                .unwrap()
+                .unwrap()
+                .subscribers
+                .get(&tag),
+            Some(&START),
+            "a clean restart forgot coverage or observations"
+        );
+
+        // An interrupted epoch has no CLEAN close. Retiring the guard without finishing it
+        // models that durable state, without killing a process or claiming a process test.
+        drop(restarted.shared.lock_server_state().heard_coverage.take());
+        restarted.stop();
+        CLOCK.store(warm + 2, Ordering::SeqCst);
+        let interrupted = run_tuned(&opts, tuning);
+        assert!(
+            transport::fetch_heard(&url(&interrupted)).is_err(),
+            "a dirty restart proved absence"
+        );
+        CLOCK.store(warm + 2 + transport::HEARD_COVERAGE_SECS, Ordering::SeqCst);
+        assert!(
+            transport::fetch_heard(&url(&interrupted))
+                .unwrap()
+                .is_some()
+        );
+        interrupted.stop();
+
+        let snapshot = root.path().join("heard-coverage");
+        let valid = std::fs::read(&snapshot).unwrap();
+        let head_end = valid.iter().position(|b| *b == b'\n').unwrap() + 1;
+        let mut changed_start = valid.clone();
+        let since = valid
+            .windows(b" clean ".len())
+            .position(|part| part == b" clean ")
+            .unwrap()
+            + b" clean ".len();
+        changed_start[since] = b'0'; // A syntactically valid earlier start must fail its digest.
+        for broken in [valid[..head_end].to_vec(), changed_start, vec![0xff]] {
+            fsx::write_atomic(&snapshot, &broken, 0o600).unwrap();
+            let restarted = run_tuned(&opts, tuning);
+            assert!(
+                transport::fetch_heard(&url(&restarted)).is_err(),
+                "a partial or corrupt snapshot proved absence"
+            );
+            restarted.stop();
+        }
+        std::fs::remove_file(&snapshot).unwrap();
+        let missing = run_tuned(&opts, tuning);
+        assert!(
+            transport::fetch_heard(&url(&missing)).is_err(),
+            "advisory .heard data proved completeness"
+        );
+        missing.stop();
+
+        std::fs::remove_file(&snapshot).unwrap();
+        std::fs::create_dir(&snapshot).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        assert!(
+            launch(listener, &opts, tuning).is_err(),
+            "an unreadable history admitted untracked reads"
+        );
+    }
+
+    #[test]
+    fn heard_flush_failure_eviction_and_stop_fence_cannot_prove_absence() {
+        use std::sync::atomic::AtomicU64;
+        const START: u64 = 1_830_000_000;
+        static CLOCK: AtomicU64 = AtomicU64::new(START);
+        fn clock() -> u64 {
+            CLOCK.load(Ordering::SeqCst)
+        }
+        let root = aterm_tempfile::tempdir().unwrap();
+        let tuning = Tuning {
+            now: clock,
+            ..Tuning::default()
+        };
+        let running = run_tuned(&options(root.path(), Duration::from_millis(200)), tuning);
+        put(&running, &envelope(&OLD, 1)).unwrap();
+        let recipient = crate::transport::test_recipient(0x41);
+        transport::fetch_within_as(&url(&running), None, HANG_DETECTOR, Some(&recipient)).unwrap();
+        let warm = START + transport::HEARD_COVERAGE_SECS;
+        CLOCK.store(warm, Ordering::SeqCst);
+        assert!(transport::fetch_heard(&url(&running)).unwrap().is_some());
+
+        // A real atomic-write failure after a successfully tracked read poisons coverage.
+        let telemetry = root.path().join("alab.heard");
+        std::fs::remove_file(&telemetry).unwrap();
+        std::fs::create_dir(&telemetry).unwrap();
+        let plain = read_all(sent(
+            &running,
+            b"GET /v1/alab HTTP/1.1\r\nHost: legacy\r\n\r\n",
+        ));
+        assert!(plain.starts_with("HTTP/1.1 200 "));
+        assert_eq!(
+            running.shared.lock_server_state().heard["alab"].anonymous,
+            Some(warm)
+        );
+        assert!(
+            transport::fetch_heard(&url(&running)).is_err(),
+            "a flush failure kept complete coverage"
+        );
+        std::fs::remove_dir(&telemetry).unwrap();
+        transport::fetch_within_as(&url(&running), None, HANG_DETECTOR, Some(&recipient)).unwrap();
+        CLOCK.store(warm + transport::HEARD_COVERAGE_SECS - 1, Ordering::SeqCst);
+        assert!(transport::fetch_heard(&url(&running)).is_err());
+        let complete = warm + transport::HEARD_COVERAGE_SECS;
+        CLOCK.store(complete, Ordering::SeqCst);
+        assert!(transport::fetch_heard(&url(&running)).unwrap().is_some());
+
+        {
+            let mut state = running.shared.lock_server_state();
+            let mut recipients = BTreeSet::new();
+            // More than the bound of distinct, current observations must evict a recent row;
+            // dropping the earlier out-of-window observation alone proves no loss of coverage.
+            for n in 0..=MAX_HEARD {
+                let mut seed = [0x52; 32];
+                // X25519 clamps the low scalar bits, so the counter starts beyond them.
+                seed[8..16].copy_from_slice(&(n as u64).to_le_bytes());
+                let recipient = crate::age::Identity::from_secret_bytes(seed)
+                    .recipient()
+                    .to_bech32();
+                assert!(
+                    recipients.insert(recipient.clone()),
+                    "fixture key collision"
+                );
+                assert!(record_heard(
+                    &running.shared,
+                    &mut state,
+                    "alab",
+                    Some(&recipient),
+                    complete
+                ));
+            }
+            assert_eq!(state.heard["alab"].subscribers.len(), MAX_HEARD);
+        }
+        assert!(
+            transport::fetch_heard(&url(&running)).is_err(),
+            "in-window eviction became absence"
+        );
+
+        // The same fence used by stop excludes a request admitted before stop but not recorded
+        // until afterwards. It may not update history after a clean snapshot is written.
+        running.shared.stopping.store(true, Ordering::SeqCst);
+        let mut state = running.shared.lock_server_state();
+        let before = state.heard.clone();
+        assert!(!record_heard(
+            &running.shared,
+            &mut state,
+            "alab",
+            Some(&recipient),
+            complete + 1
+        ));
+        assert_eq!(state.heard, before);
+        drop(state);
+        running.stop();
     }
 
     fn record_entrant(
@@ -9354,8 +11050,10 @@ mod tests {
         answering.stop();
     }
 
-    /// What the peers of [`a_pass_reads_at_most_two_peers_records_at_once`] saw: the records
-    /// pulls they hold now, the most they held at once, and whether the test let them answer.
+    /// What the peers of [`a_pass_reads_at_most_two_peers_records_at_once`] (and of
+    /// [`a_pass_reads_at_most_two_peers_whole_envelopes_at_once`]) saw: the records pulls (or
+    /// whole envelope pulls) they hold now, the most they held at once, and whether the test let
+    /// them answer.
     #[derive(Default)]
     struct HeldPulls {
         in_flight: usize,
@@ -9441,5 +11139,396 @@ mod tests {
         assert_eq!(held.0.lock().expect("pulls").most, RECORDS_PULLS_AT_ONCE);
         assert_eq!(waiting(), 0);
         running.stop();
+    }
+
+    /// An ALab version of `seq` signed by [`OLD`] whose text runs past a first read
+    /// ([`ENVELOPE_PEEK`]).
+    fn long_envelope(seq: u64) -> Vec<u8> {
+        let mut unsigned = unsigned(seq, Vec::new(), crate::ALAB_VAULT);
+        unsigned.lockers[0].armored = test_armor(&vec![0x42; ENVELOPE_PEEK]);
+        let bytes = sign(&unsigned, &OLD).expect("signed");
+        assert!(bytes.len() > ENVELOPE_PEEK, "longer than a first read");
+        bytes
+    }
+
+    /// A peer that holds `long`, an ALab version of `seq` longer than a first read: it answers
+    /// its first envelope GET with that length alone (a first read takes none of the body), and
+    /// each later one, once `held` lets it go (`None`: at once), with the whole of it, or with a
+    /// 204 when asked after `seq`; each records GET with a 404. `heads` gets the head of each of
+    /// its envelope GETs.
+    fn long_envelope_peer(
+        long: &Arc<Vec<u8>>,
+        seq: u64,
+        held: Option<&Arc<(Mutex<HeldPulls>, Condvar)>>,
+        heads: &Arc<Mutex<Vec<String>>>,
+    ) -> crate::discover::DiscoveredVault {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let dialed = accepted(listener);
+        let (long, held, heads) = (Arc::clone(long), held.cloned(), Arc::clone(heads));
+        std::thread::spawn(move || {
+            while let Ok(mut stream) = dialed.recv_timeout(HANG_DETECTOR) {
+                let head = read_request_head(&mut stream);
+                if !head.starts_with("GET ") || head.contains("/records") {
+                    let _ = stream.write_all(NOT_FOUND);
+                    continue;
+                }
+                let first = {
+                    let mut heads = heads.lock().expect("heads");
+                    heads.push(head.clone());
+                    heads.len() == 1
+                };
+                let length = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    long.len()
+                );
+                if first {
+                    let _ = stream.write_all(length.as_bytes());
+                    continue;
+                }
+                if let Some(held) = &held {
+                    let (lock, bell) = &**held;
+                    let mut pulls = lock.lock().expect("pulls");
+                    pulls.in_flight += 1;
+                    pulls.most = pulls.most.max(pulls.in_flight);
+                    let deadline = Instant::now() + HANG_DETECTOR;
+                    while !pulls.released {
+                        let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                            break;
+                        };
+                        pulls = bell.wait_timeout(pulls, left).expect("pulls").0;
+                    }
+                    pulls.in_flight -= 1;
+                }
+                if head.contains(&format!("?after={seq} ")) {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                    continue;
+                }
+                let mut answer = length.into_bytes();
+                answer.extend_from_slice(&long);
+                let _ = stream.write_all(&answer);
+            }
+        });
+        peer_at(addr, crate::ALAB_VAULT)
+    }
+
+    /// A peer's envelope longer than a first read takes ([`ENVELOPE_PEEK`]) is asked for again,
+    /// read whole and stored: the second read is held to [`MAX_ENVELOPE`], not to the first
+    /// read's limit, so a long version still spreads between servers.
+    /// NEGATIVE CONTROL: the second read held to [`ENVELOPE_PEEK`], as the first is, comes back
+    /// [`crate::transport::Pulled::Larger`] too, and the pull gives up on the peer: `left: 0,
+    /// right: 1`, "one vault advanced".
+    #[test]
+    fn a_peer_envelope_longer_than_a_first_read_is_asked_again_and_stored_whole() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let mut opts = options(root.path(), Duration::from_millis(200));
+        opts.pins = vec![(
+            crate::ALAB_VAULT.to_owned(),
+            signer_public(&OLD).expect("public"),
+        )];
+        let running = run_tuned(
+            &opts,
+            Tuning {
+                peer_pull: HANG_DETECTOR,
+                ..Tuning::default()
+            },
+        );
+        put(&running, &envelope(&OLD, 81)).expect("the server holds seq 81");
+        let heads = Arc::new(Mutex::new(Vec::new()));
+        let peer = long_envelope_peer(&Arc::new(long_envelope(82)), 82, None, &heads);
+
+        assert_eq!(running.pull_from_peers(&[peer]), 1, "one vault advanced");
+        assert_eq!(
+            running.held_seq(crate::ALAB_VAULT),
+            Some(82),
+            "the long version is stored whole"
+        );
+        let heads = heads.lock().expect("heads");
+        assert_eq!(
+            heads.len(),
+            2,
+            "the peer was asked again for its whole envelope"
+        );
+        for head in heads.iter() {
+            assert!(head.starts_with("GET /v1/alab?after=81 "), "{head}");
+        }
+        drop(heads);
+        running.stop();
+    }
+
+    /// A pull that waited for an envelope slot asks after the version held once it has the
+    /// slot, not the one held when its pass began: after a publish, several peers hold the same
+    /// long version, and the pull before it stored that version while it waited, so the peer
+    /// answers 204 and the version is not read whole again. Here three peers hold one long
+    /// version; the two whole reads in flight are held until the third pull waits for a slot.
+    /// NEGATIVE CONTROL: asking after the seq read as the pass began (no re-read once the slot is
+    /// taken) has the third peer send its whole envelope again: `left: 0, right: 1`, "the pull
+    /// that waited for a slot asks after the version stored meanwhile".
+    #[test]
+    fn a_pull_that_waited_for_a_slot_asks_after_the_version_stored_meanwhile() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let mut opts = options(root.path(), Duration::from_millis(200));
+        opts.pins = vec![(
+            crate::ALAB_VAULT.to_owned(),
+            signer_public(&OLD).expect("public"),
+        )];
+        let running = run_tuned(
+            &opts,
+            Tuning {
+                peer_pull: HANG_DETECTOR * 2,
+                ..Tuning::default()
+            },
+        );
+        put(&running, &envelope(&OLD, 81)).expect("the server holds seq 81");
+        let long = Arc::new(long_envelope(82));
+        let held = Arc::new((Mutex::new(HeldPulls::default()), Condvar::new()));
+        let heads: Vec<Arc<Mutex<Vec<String>>>> = (0..=ENVELOPE_PULLS_AT_ONCE)
+            .map(|_| Arc::new(Mutex::new(Vec::new())))
+            .collect();
+        let peers: Vec<_> = heads
+            .iter()
+            .map(|heads| long_envelope_peer(&long, 82, Some(&held), heads))
+            .collect();
+        let waiting = || running.shared.envelope_pulls.waiting.load(Ordering::SeqCst);
+        let in_flight = || held.0.lock().expect("pulls").in_flight;
+
+        std::thread::scope(|scope| {
+            let pass = scope.spawn(|| running.pull_from_peers(&peers));
+            until(
+                "two whole envelope pulls in flight and the third waiting for a slot",
+                || in_flight() == ENVELOPE_PULLS_AT_ONCE && waiting() == 1,
+            );
+            held.0.lock().expect("pulls").released = true;
+            held.1.notify_all();
+            pass.join().expect("the pass");
+        });
+        assert_eq!(running.held_seq(crate::ALAB_VAULT), Some(82));
+        let seconds: Vec<String> = heads
+            .iter()
+            .map(|heads| {
+                heads
+                    .lock()
+                    .expect("heads")
+                    .get(1)
+                    .cloned()
+                    .expect("asked again")
+            })
+            .collect();
+        assert_eq!(
+            seconds
+                .iter()
+                .filter(|head| head.starts_with("GET /v1/alab?after=82 "))
+                .count(),
+            1,
+            "the pull that waited for a slot asks after the version stored meanwhile"
+        );
+        assert_eq!(
+            seconds
+                .iter()
+                .filter(|head| head.starts_with("GET /v1/alab?after=81 "))
+                .count(),
+            ENVELOPE_PULLS_AT_ONCE,
+            "the pulls that took a slot at once ask after the version held then"
+        );
+        running.stop();
+    }
+
+    /// A pass reads at most [`ENVELOPE_PULLS_AT_ONCE`] peers' whole envelopes at once, however
+    /// many peers it pulls, and still asks every peer in the pass: each peer's answer is read
+    /// under [`ENVELOPE_PEEK`], all at once, and only one longer than that is asked again and
+    /// read whole, under a slot. Before, every peer's envelope was read whole at once, so a LAN
+    /// host that advertised 16 instances of itself, each answering with a 16 MiB body, had a
+    /// vault server hold some 256 MiB on a tend pass. Here each of 16 peers answers its first
+    /// envelope GET with a 1 MiB length and holds its second until the test lets it go, and
+    /// every pull may wait past the hang detector, so the pass can neither finish nor time a
+    /// pull out while the test counts.
+    /// NEGATIVE CONTROL: reading the whole envelope without a slot (no
+    /// `shared.envelope_pulls.take()` in `pull_from_peer`) has more peers' whole envelopes in
+    /// flight at once: `left: 16, right: 2`, "whole envelope pulls in flight at once" (any count
+    /// over 2 fails it).
+    #[test]
+    fn a_pass_reads_at_most_two_peers_whole_envelopes_at_once() {
+        const PEERS: usize = 16;
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let mut opts = options(root.path(), Duration::from_millis(200));
+        opts.pins = vec![("team".to_owned(), [0x5a; 32])];
+        let running = run_tuned(
+            &opts,
+            Tuning {
+                peer_pull: HANG_DETECTOR * 2,
+                ..Tuning::default()
+            },
+        );
+        let held = Arc::new((Mutex::new(HeldPulls::default()), Condvar::new()));
+        let asked: Arc<Vec<AtomicUsize>> =
+            Arc::new((0..PEERS).map(|_| AtomicUsize::new(0)).collect());
+        let peers: Vec<_> = (0..PEERS)
+            .map(|peer| {
+                let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+                let addr = listener.local_addr().expect("addr");
+                let dialed = accepted(listener);
+                let (held, asked) = (Arc::clone(&held), Arc::clone(&asked));
+                std::thread::spawn(move || {
+                    while let Ok(mut stream) = dialed.recv_timeout(HANG_DETECTOR) {
+                        let (held, asked) = (Arc::clone(&held), Arc::clone(&asked));
+                        std::thread::spawn(move || {
+                            let head = read_request_head(&mut stream);
+                            if !head.starts_with("GET ") || head.contains("/records") {
+                                let _ = stream.write_all(NOT_FOUND);
+                                return;
+                            }
+                            if asked[peer].fetch_add(1, Ordering::SeqCst) == 0 {
+                                // Longer than the first read takes: it reads no body.
+                                let _ = stream.write_all(
+                                    b"HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\n\
+                                      Connection: close\r\n\r\n",
+                                );
+                                return;
+                            }
+                            let (lock, bell) = &*held;
+                            let mut pulls = lock.lock().expect("pulls");
+                            pulls.in_flight += 1;
+                            pulls.most = pulls.most.max(pulls.in_flight);
+                            let deadline = Instant::now() + HANG_DETECTOR;
+                            while !pulls.released {
+                                let Some(left) = deadline.checked_duration_since(Instant::now())
+                                else {
+                                    break;
+                                };
+                                pulls = bell.wait_timeout(pulls, left).expect("pulls").0;
+                            }
+                            pulls.in_flight -= 1;
+                            drop(pulls);
+                            let _ = stream.write_all(NOT_FOUND);
+                        });
+                    }
+                });
+                peer_at(addr, "team")
+            })
+            .collect();
+        let waiting = || running.shared.envelope_pulls.waiting.load(Ordering::SeqCst);
+        let in_flight = || held.0.lock().expect("pulls").in_flight;
+
+        std::thread::scope(|scope| {
+            let pass = scope.spawn(|| running.pull_from_peers(&peers));
+            until(
+                "two whole envelope pulls in flight and the rest waiting for a slot, or more in \
+                 flight",
+                || {
+                    in_flight() > ENVELOPE_PULLS_AT_ONCE
+                        || (in_flight() == ENVELOPE_PULLS_AT_ONCE
+                            && waiting() == PEERS - ENVELOPE_PULLS_AT_ONCE)
+                },
+            );
+            let (now, queued) = (in_flight(), waiting());
+            held.0.lock().expect("pulls").released = true;
+            held.1.notify_all();
+            assert_eq!(pass.join().expect("the pass"), 0);
+            assert_eq!(
+                now, ENVELOPE_PULLS_AT_ONCE,
+                "whole envelope pulls in flight at once"
+            );
+            assert_eq!(
+                queued,
+                PEERS - ENVELOPE_PULLS_AT_ONCE,
+                "whole envelope pulls waiting for a slot"
+            );
+        });
+        assert_eq!(held.0.lock().expect("pulls").most, ENVELOPE_PULLS_AT_ONCE);
+        assert_eq!(waiting(), 0);
+        for (peer, asked) in asked.iter().enumerate() {
+            assert_eq!(
+                asked.load(Ordering::SeqCst),
+                2,
+                "peer {peer} was asked, and asked again for its whole envelope, in the pass"
+            );
+        }
+        running.stop();
+    }
+
+    #[test]
+    fn records_on_disk_adopt_genesis_once_vault_or_pin_supplies_signer_key() {
+        use crate::membership_log::{Body, Evidence, Log, Record, encode_records};
+
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let (w1, inc1, m1, e1) = record_entrant(1, "m1");
+        let (_, _, _, e2) = record_entrant(2, "m2");
+        let genesis = Record::found(&NEW, vec![e1], 1_000).expect("genesis");
+        let admit = Log::new(genesis.clone())
+            .expect("log")
+            .draft(
+                &m1,
+                1_001,
+                Body::Admit {
+                    entrant: e2,
+                    evidence: Evidence::Phrase,
+                },
+            )
+            .sign(&w1, inc1)
+            .expect("admit");
+        let raw_records = encode_records([&genesis, &admit]);
+        let expected_ids = BTreeSet::from([*genesis.id(), *admit.id()]);
+
+        // 1. `alab.records` is written to disk before `alab.vault` arrives (or before `alab.vault`
+        //    rotates to `NEW`): first read sees no matching signer and keeps `store` empty; once
+        //    `alab.vault` signed by `NEW` is published, `take_records_from_store` re-decodes
+        //    `alab.records` under `NEW` and roots the log.
+        fsx::write_atomic(&root.path().join("alab.records"), &raw_records, 0o600)
+            .expect("write alab.records");
+        let running = run(&options(root.path(), Duration::from_millis(50)));
+        assert!(
+            running.stored_records(crate::ALAB_VAULT).is_empty(),
+            "before alab.vault arrives, alab.records signed by NEW must not root under compiled key"
+        );
+        put(&running, &envelope(&NEW, 1)).expect("put alab.vault signed by NEW");
+        assert_eq!(
+            running.stored_records(crate::ALAB_VAULT).inventory(),
+            expected_ids,
+            "once alab.vault arrives, cached raw bytes in alab.records must be adopted"
+        );
+        running.stop();
+
+        // 2. Same when an admin rotates `alab.vault` directly at the store file (`take_from_store`
+        //    inside `take_records_from_store`).
+        let root2 = aterm_tempfile::tempdir().expect("tempdir");
+        fsx::write_atomic(&root2.path().join("alab.vault"), &envelope(&OLD, 1), 0o600)
+            .expect("write old alab.vault");
+        fsx::write_atomic(&root2.path().join("alab.records"), &raw_records, 0o600)
+            .expect("write alab.records");
+        let running2 = run_tuned(
+            &options(root2.path(), Duration::from_millis(50)),
+            retiring(),
+        );
+        assert!(
+            running2.stored_records(crate::ALAB_VAULT).is_empty(),
+            "OLD vault signer does not match NEW genesis"
+        );
+        fsx::write_atomic(&root2.path().join("alab.vault"), &envelope(&NEW, 1), 0o600)
+            .expect("replace alab.vault at store file");
+        assert_eq!(
+            running2.stored_records(crate::ALAB_VAULT).inventory(),
+            expected_ids,
+            "store-file vault replacement must be picked up by take_records_from_store"
+        );
+        running2.stop();
+
+        // 3. Startup with `--pin alab=<NEW>` adopts `alab.records` even before `alab.vault` exists.
+        let root3 = aterm_tempfile::tempdir().expect("tempdir");
+        fsx::write_atomic(&root3.path().join("alab.records"), &raw_records, 0o600)
+            .expect("write alab.records");
+        let mut pinned_opts = options(root3.path(), Duration::from_millis(50));
+        pinned_opts.pins = vec![(
+            crate::ALAB_VAULT.to_owned(),
+            signer_public(&NEW).expect("NEW pub"),
+        )];
+        let running3 = run(&pinned_opts);
+        assert_eq!(
+            running3.stored_records(crate::ALAB_VAULT).inventory(),
+            expected_ids,
+            "startup with --pin must decode alab.records under pinned key"
+        );
+        running3.stop();
     }
 }

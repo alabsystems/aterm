@@ -19,8 +19,8 @@ impl World {
         let text = format!(
             "[[account]]\nlabel = \"main\"\nclass = \"shared\"\nemail = \"main@example.test\"\n\n\
              [[account]]\nlabel = \"work\"\nclass = \"shared\"\nemail = \"work@example.test\"\n\
-             dir = \"{}\"\n",
-            work.display()
+             dir = {}\n",
+            toml(&work)
         );
         std::fs::write(self.cfg.join(cli.accounts().roster_file), text).expect("roster");
         let secrets = self.home.join(".secrets");
@@ -141,7 +141,7 @@ fn rotation_off_never_starts_on_a_pin_another_mac_holds() {
             "[harness]\naccounts = \"off\"\n",
         )
         .expect("aterm.toml");
-        assert_eq!(world.seat().mode(), Mode::Off);
+        assert_eq!(world.seat().mode_for(Cli::Claude), Mode::Off);
     }
     let (t1, t2) = (
         Arc::new(Replica::new("aa01")),

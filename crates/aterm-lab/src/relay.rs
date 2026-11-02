@@ -70,7 +70,7 @@ impl Take {
 /// Formats one `ptyrec` log line (`<t_ns> <O|I> <hex>`).
 pub(crate) fn take_line(t_ns: u64, way: Way, bytes: &[u8]) -> String {
     use std::fmt::Write as _;
-    let mut line = String::with_capacity(bytes.len() * 2 + 24);
+    let mut line = String::with_capacity(bytes.len().saturating_mul(2).saturating_add(24));
     let _ = write!(
         line,
         "{t_ns} {} ",
@@ -235,6 +235,7 @@ fn relay(command: &[String], mut log: Option<std::fs::File>, mut take: Option<Ta
         Ok(c) => c,
         Err(e) => {
             drop(raw);
+            sys::close(master);
             eprintln!("relay: spawn: {e}");
             return 1;
         }

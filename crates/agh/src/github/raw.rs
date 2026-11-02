@@ -2,19 +2,22 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! `agh api` (design §10.2): one read of any path, or every page of it.
+//! `agh api` (design §10.2): one read of any path, or every page of it, and POST, PATCH, PUT
+//! and DELETE writes to a repository's path under a permit.
 
 use aterm_json::Value;
 
-use crate::client::{Accept, Call, Github, method_refusal};
+use crate::client::{Accept, Answered, Call, CallBody, Github, method_refusal};
 use crate::error::{Error, IdentityRef, Result};
-use crate::journal::IntentStore;
+use crate::github::How;
+use crate::journal::{IntentStore, Settled};
 use crate::model::{UserObject, from_json};
 use crate::page::{End, LinkScope, ListOpts};
 use crate::policy::{Access, Permit, RouteRequest, RouteTarget};
+use crate::retry::Idempotency;
 use crate::slug::Slug;
 use crate::wire::Method;
-use crate::write::Outcome;
+use crate::write::{Outcome, WriteOp};
 
 /// `agh api`.
 pub struct Raw<'a> {
@@ -149,6 +152,118 @@ fn is_file_bytes(essence: &str, path: &str) -> bool {
     rendering && file
 }
 
+/// One answer as `api` prints it: its JSON, its bytes, or under `include` its status, headers
+/// and body.
+///
+/// # Errors
+///
+/// CouldNotRun `Sub::Protocol` for an `application/json` body that is not JSON.
+fn outcome_of(answered: Answered, include: bool, path: &str) -> Result<RawOutcome> {
+    let essence = essence(answered.header("content-type"));
+    let media = Media::of_essence(&essence);
+    let file_bytes = is_file_bytes(&essence, path);
+    let parsed = || match media {
+        Media::Other => None,
+        _ if file_bytes => None,
+        Media::Json | Media::PlusJson if answered.body.is_empty() => None,
+        Media::Json | Media::PlusJson => answered.json().ok(),
+    };
+    let answer = if include {
+        let body = parsed()
+            .unwrap_or_else(|| Value::String(String::from_utf8_lossy(&answered.body).into_owned()));
+        RawAnswer::Included {
+            status: answered.status,
+            headers: answered.headers.clone(),
+            body,
+        }
+    } else if media == Media::Json && !answered.body.is_empty() {
+        RawAnswer::Json(answered.json()?)
+    } else {
+        match parsed() {
+            Some(value) => RawAnswer::Json(value),
+            None => RawAnswer::Bytes(answered.body.clone()),
+        }
+    };
+    Ok(RawOutcome {
+        answer,
+        as_: answered.as_,
+        requests: answered.requests,
+        pages: 1,
+    })
+}
+
+/// `req.path`'s scope rules, `Raw::get`'s and `Raw::send`'s alike: no `#fragment`, which the
+/// wire would cut, so the route would be decided for one path and another sent; no `.` or
+/// `..` segment (typed or percent-encoded), which a normalising server would resolve off the
+/// route.
+fn path_rules(path: &str) -> Result<()> {
+    if path.contains('#') {
+        return Err(Error::usage(format!(
+            "{path}: agh sends no #fragment (it is never sent, so the route would be judged on another path)"
+        )));
+    }
+    crate::path::refuse_encoded_dot_segment("path", path.split('?').next().unwrap_or_default())
+}
+
+/// A write's 2xx answer as `api` prints it: `outcome_of`'s, except that an `application/json`
+/// body that is not JSON is its bytes. GitHub answered a 2xx, so the write was done, and
+/// nothing read after it may report it as not sent.
+fn written_of(answered: Answered, include: bool, path: &str) -> RawOutcome {
+    let body = answered.body.clone();
+    let as_ = answered.as_.clone();
+    let requests = answered.requests;
+    outcome_of(answered, include, path).unwrap_or(RawOutcome {
+        answer: RawAnswer::Bytes(body),
+        as_,
+        requests,
+        pages: 1,
+    })
+}
+
+/// The journal key of an `api` write of `method` to `path` (plan §7 body 7): `api {METHOD}
+/// {path}`, the path canonical, so every spelling GitHub reads as one resource is one key and
+/// `begin`'s open-intent rule holds across them. Each segment is percent-decoded and encoded
+/// again (`path::segment`); a `/repos/{owner}/{repo}/…` path's owner and repository are
+/// lowercased, as GitHub reads them; the query's pairs are sorted.
+pub(crate) fn journal_key(method: Method, path: &str) -> String {
+    let mut segs = segments(path);
+    if segs.first().is_some_and(|first| first == "repos") {
+        for seg in segs.iter_mut().skip(1).take(2) {
+            seg.make_ascii_lowercase();
+        }
+    }
+    let mut canonical = String::new();
+    for seg in &segs {
+        canonical.push('/');
+        canonical.push_str(&crate::path::segment(seg));
+    }
+    if canonical.is_empty() {
+        canonical.push('/');
+    }
+    if let Some((_, query)) = path.split_once('?') {
+        let mut pairs: Vec<&str> = query.split('&').filter(|pair| !pair.is_empty()).collect();
+        pairs.sort_unstable();
+        if !pairs.is_empty() {
+            canonical.push('?');
+            canonical.push_str(&pairs.join("&"));
+        }
+    }
+    format!("api {} {canonical}", method.as_str())
+}
+
+/// What a 2xx answer to an `api` POST created: its numeric `id` (0 for an object GitHub gives
+/// none, such as a ref) and its `html_url`, else its `url`. `agh api` holds GitHub's whole
+/// answer, so every 2xx is settled created.
+fn created_of(answered: &Answered) -> Option<(u64, String)> {
+    let value = answered.json().unwrap_or(Value::Null);
+    let id = value.get("id").and_then(Value::as_u64).unwrap_or(0);
+    let url = ["html_url", "url"]
+        .iter()
+        .find_map(|key| value.get(key).and_then(Value::as_str))
+        .unwrap_or_default();
+    Some((id, url.to_string()))
+}
+
 impl<'a> Raw<'a> {
     /// `agh api` over the client.
     pub(crate) const fn new(gh: &'a Github) -> Raw<'a> {
@@ -195,52 +310,12 @@ impl<'a> Raw<'a> {
             };
             return Err(method_refusal(req.method, repo));
         }
-        if req.path.contains('#') {
-            return Err(Error::usage(format!(
-                "{}: agh sends no #fragment (it is never sent, so the route would be judged on another path)",
-                req.path
-            )));
-        }
-        crate::path::refuse_encoded_dot_segment(
-            "path",
-            req.path.split('?').next().unwrap_or_default(),
-        )?;
+        path_rules(&req.path)?;
         if req.all && req.method != Method::Head {
             return self.all(req, no_probe);
         }
         let answered = self.gh.call(&Self::call(req, no_probe))?;
-        let essence = essence(answered.header("content-type"));
-        let media = Media::of_essence(&essence);
-        let file_bytes = is_file_bytes(&essence, &req.path);
-        let parsed = || match media {
-            Media::Other => None,
-            _ if file_bytes => None,
-            Media::Json | Media::PlusJson if answered.body.is_empty() => None,
-            Media::Json | Media::PlusJson => answered.json().ok(),
-        };
-        let answer = if req.include {
-            let body = parsed().unwrap_or_else(|| {
-                Value::String(String::from_utf8_lossy(&answered.body).into_owned())
-            });
-            RawAnswer::Included {
-                status: answered.status,
-                headers: answered.headers.clone(),
-                body,
-            }
-        } else if media == Media::Json && !answered.body.is_empty() {
-            RawAnswer::Json(answered.json()?)
-        } else {
-            match parsed() {
-                Some(value) => RawAnswer::Json(value),
-                None => RawAnswer::Bytes(answered.body.clone()),
-            }
-        };
-        let outcome = RawOutcome {
-            answer,
-            as_: answered.as_,
-            requests: answered.requests,
-            pages: 1,
-        };
+        let outcome = outcome_of(answered, req.include, &req.path)?;
         Ok((outcome, End::Complete))
     }
 
@@ -328,20 +403,110 @@ impl RawSend {
 
 impl Raw<'_> {
     /// One write, sent once and never retried. A POST is one-shot and journaled
-    /// (`WriteOp::Api`, key `api POST {path}`) through `intents`; PATCH, PUT and DELETE are
-    /// not journaled and `intents` is not called.
+    /// (`WriteOp::Api`, key `journal_key(POST, path)`: `api POST {path}`, its path canonical)
+    /// through `intents`; PATCH, PUT and DELETE are not journaled and `intents` is not called.
+    /// A 2xx is `Outcome::Done` whatever its body: one that is not the JSON it is labelled is
+    /// its bytes.
     ///
     /// # Errors
     ///
-    /// Usage for a read method (`Raw::get` takes it); `Raw::get`'s path scope rules; the
-    /// pipeline's errors.
+    /// Usage for a read method (`Raw::get` takes it); `Raw::get`'s path scope rules; Usage for
+    /// a path whose repository is not the permit's, before anything is journaled or loaded;
+    /// the pipeline's errors.
     pub fn send(
         &self,
         permit: &Permit,
         req: &RawSend,
         intents: &dyn IntentStore,
     ) -> Result<Outcome<RawOutcome>> {
-        let _ = (self.gh, permit, req, intents);
-        Err(Error::not_yet("api writes", "WP3"))
+        if cfg!(not(unix)) {
+            return Err(crate::write::unix_only());
+        }
+        if req.method.is_read() {
+            return Err(Error::usage(format!(
+                "{} is a read: Raw::get takes it",
+                req.method.as_str()
+            )));
+        }
+        path_rules(&req.path)?;
+        let (call, slug) = Self::write_call(req)?;
+        // A path the permit does not cover is Usage before anything is journaled or loaded:
+        // the POST's draft below names the path's repository, and the journal it begins in is
+        // the caller's.
+        crate::client::write_target(&call, permit)?;
+        let include = req.include;
+        let path = req.path.as_str();
+        if req.method == Method::Post {
+            let Some(slug) = slug else {
+                // No permit covers an Unscoped target, so `write_target` refused it above;
+                // the pipeline refuses it again, Usage, and nothing is sent or journaled.
+                return self
+                    .gh
+                    .call_write(&call, permit, &How::write())
+                    .map(|answered| Outcome::Done(written_of(answered, include, path)));
+            };
+            let key = journal_key(Method::Post, path);
+            let draft = self
+                .gh
+                .intent_draft(WriteOp::Api, &slug, &call, permit, &key)?;
+            let outcome = self
+                .gh
+                .one_shot(&call, permit, &draft, intents, &created_of)?;
+            return Ok(match outcome {
+                Outcome::Done(answered) => Outcome::Done(written_of(answered, include, path)),
+                Outcome::NeverSent(error) => Outcome::NeverSent(error),
+                Outcome::Refused(error) => Outcome::Refused(error),
+                Outcome::Unknown { intent, error } => Outcome::Unknown { intent, error },
+            });
+        }
+        // Not journaled, but classified by the one settle rule (plan §7 body 6); a 2xx is
+        // done whatever its body, so `created` is given.
+        let result = self.gh.call_write(&call, permit, &How::write());
+        let settled = crate::write::settle_table(&result, Some((0, String::new())));
+        match (settled, result) {
+            (_, Ok(answered)) => Ok(Outcome::Done(written_of(answered, include, path))),
+            (Settled::NeverSent, Err(error)) => Ok(Outcome::NeverSent(error)),
+            (Settled::Refused { .. }, Err(error)) => Ok(Outcome::Refused(error)),
+            (_, Err(error)) => Err(error),
+        }
+    }
+
+    /// The write `req` names, OneShot and never retried, and its repository: a
+    /// `/repos/{owner}/{repo}/…` path is `RouteTarget::Repo`, and every other path is
+    /// Unscoped, which no permit covers, so the pipeline refuses it before anything is sent.
+    fn write_call(req: &RawSend) -> Result<(Call, Option<Slug>)> {
+        let segs = segments(&req.path);
+        let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
+        let (target, slug) = match segs.as_slice() {
+            ["repos", owner, repo, ..] => match Slug::new(owner, repo) {
+                Ok(slug) => (RouteTarget::Repo(slug.clone()), Some(slug)),
+                Err(_) => (RouteTarget::Unscoped, None),
+            },
+            _ => (RouteTarget::Unscoped, None),
+        };
+        let route = RouteRequest {
+            target,
+            access: Access::Write,
+            ..req.route.clone()
+        };
+        let body = match &req.body {
+            Some(value) => CallBody::Json(
+                aterm_json::to_vec(value)
+                    .map_err(|e| Error::usage(format!("the -f/-F body is not JSON: {e}")))?,
+            ),
+            None => CallBody::Empty,
+        };
+        let call = Call::write(
+            req.method,
+            req.path.clone(),
+            route,
+            Idempotency::OneShot,
+            body,
+        );
+        let call = match &req.accept {
+            Some(media) => call.accept(Accept::Media(media.clone())),
+            None => call,
+        };
+        Ok((call, slug))
     }
 }

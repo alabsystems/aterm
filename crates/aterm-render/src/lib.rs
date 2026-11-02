@@ -115,7 +115,7 @@ pub use fx_raster::{
     for_each_drawn_sprite, fx_bloom_quads, knock_rects, slice_layers,
 };
 pub use glow_ramps::{BeamRows, RampCost, RampSink};
-pub use glyph_ink::{GlyphCoverage, GlyphInk};
+pub use glyph_ink::{GlyphCoverage, GlyphInk, GlyphRaster};
 pub use spill::SpillBand;
 
 pub use deco::{
@@ -1533,6 +1533,11 @@ pub struct Renderer {
     chrome_room: (usize, usize),
     /// [`Self::glyph_ink`]'s last measure, keyed by the face, the rasters, the size and the blend.
     glyph_ink_memo: Option<glyph_ink::GlyphInkMemo>,
+    /// The current input's actual glyph evidence, with unchanged rows shared across frames.
+    glyph_frame_ink_memo: Option<glyph_ink::FrameInkMemo>,
+    /// Identity retained by observations, so equal local epoch counters in two renderers
+    /// cannot authorize reuse of one another's coverage.
+    glyph_ink_identity: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Bumped each time the glyph rasters are dropped ([`Self::clear_glyph_images`]).
     glyph_generation: u64,
     baseline: i32,
@@ -4244,6 +4249,8 @@ struct CachedGlyph {
     /// The knock-out's ring of a mono raster ([`knock_ring`]), built the first time the glyph
     /// lies on a companion's body and dropped with the entry.
     ring: std::cell::OnceCell<Box<[u8]>>,
+    /// Coverage is measured once for this raster and evicted with it.
+    coverage: std::cell::OnceCell<Option<std::sync::Arc<GlyphCoverage>>>,
 }
 
 impl CachedGlyph {
@@ -4254,6 +4261,7 @@ impl CachedGlyph {
             ink,
             used: std::cell::Cell::new(0),
             ring: std::cell::OnceCell::new(),
+            coverage: std::cell::OnceCell::new(),
         }
     }
 }
@@ -6955,6 +6963,8 @@ impl Renderer {
             chrome_room_memo: None,
             chrome_room: (0, 0),
             glyph_ink_memo: None,
+            glyph_frame_ink_memo: None,
+            glyph_ink_identity: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             glyph_generation: 0,
             baseline,
             theme,
@@ -10125,11 +10135,15 @@ impl Renderer {
     /// Set the default-background opacity (0..=1, clamped; Ghostty's `background-opacity`).
     #[inline]
     pub fn set_background_opacity(&mut self, opacity: f32) {
-        self.bg_opacity = if opacity.is_finite() {
+        let opacity = if opacity.is_finite() {
             opacity.clamp(0.0, 1.0)
         } else {
             1.0
         };
+        if self.bg_opacity != opacity {
+            self.invalidate_glyph_frame_ink();
+            self.bg_opacity = opacity;
+        }
     }
 
     /// The configured default-background opacity (see [`set_background_opacity`](Self::set_background_opacity)).
@@ -10786,6 +10800,7 @@ impl Renderer {
 
     /// Install the text-shaping config (ligature mode, features, ambiguous width).
     pub fn set_text_shaping(&mut self, shaping: aterm_types::text_shaping::TextShapingConfig) {
+        self.invalidate_glyph_frame_ink();
         let ambiguous_width_changed = self.shaping.ambiguous_width != shaping.ambiguous_width;
         self.shaping = shaping;
         if ambiguous_width_changed {
@@ -10824,6 +10839,9 @@ impl Renderer {
     /// Install the coverage blend mode (config `text_blending`; default [`TextBlending::LinearCorrected`]).
     #[inline]
     pub fn set_text_blending(&mut self, mode: TextBlending) {
+        if self.text_blending != mode {
+            self.invalidate_glyph_frame_ink();
+        }
         self.text_blending = mode;
     }
 
@@ -10929,6 +10947,7 @@ impl Renderer {
             }
             self.subpix_mode = mode;
             self.subpx_glyphs.clear();
+            self.invalidate_glyph_frame_ink();
             true
         }
         #[cfg(not(all(unix, not(target_os = "macos"))))]
@@ -10949,6 +10968,22 @@ impl Renderer {
         #[cfg(not(all(unix, not(target_os = "macos"))))]
         {
             "off"
+        }
+    }
+
+    /// The frame-level precondition shared by the observer and CPU blitter. Individual
+    /// keys may still use mono when the LCD rasterizer cannot represent their face/style.
+    fn input_uses_lcd_text(&self, input: &RenderInput) -> bool {
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            self.subpix_mode != subpixel::SubpixelMode::Off
+                && self.bg_opacity >= 1.0
+                && input.wallpaper.is_none()
+        }
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        {
+            let _ = input;
+            false
         }
     }
 
@@ -11193,6 +11228,7 @@ impl Renderer {
     }
 
     fn clear_glyph_images(&mut self) {
+        self.invalidate_glyph_frame_ink();
         self.glyphs.clear();
         self.glyph_generation = self.glyph_generation.wrapping_add(1);
         #[cfg(all(unix, not(target_os = "macos")))]
@@ -12402,9 +12438,7 @@ impl Renderer {
         ensure_wallpaper_px(wc, input, w, h);
         #[cfg(all(unix, not(target_os = "macos")))]
         {
-            self.subpx_frame = self.subpix_mode != subpixel::SubpixelMode::Off
-                && self.bg_opacity >= 1.0
-                && input.wallpaper.is_none();
+            self.subpx_frame = self.input_uses_lcd_text(input);
         }
 
         let mut dirty = std::mem::take(&mut wc.dirty_scratch);
@@ -18331,21 +18365,76 @@ pub fn linear_luminance(rgb: u32) -> f32 {
 #[inline]
 #[must_use]
 pub fn blend_text(dst: u32, fg: u32, bg: u32, t: u8, corrected: bool) -> u32 {
-    if t == 0 {
-        return dst & 0x00ff_ffff;
+    TextLevel::new(fg, bg, t, corrected).over(dst)
+}
+
+/// One coverage level `t` of `fg`'s text on a `bg` cell, as [`blend_text`] lays it over any
+/// ground: its corrected alpha (three sRGB transfers, two of them `powf`) is worked out once,
+/// so a reader that lays one glyph level over many grounds (the glass yield's glyph judge)
+/// blends each exactly as [`blend_text`] does, which is this.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextLevel {
+    fg: u32,
+    t: u8,
+    corrected: bool,
+    /// The corrected alpha, read only where `corrected` and `t` is neither `0` nor `255`.
+    a: f32,
+}
+
+impl TextLevel {
+    /// Level `t` of `fg` on `bg`, gamma-corrected or not.
+    #[inline]
+    #[must_use]
+    pub fn new(fg: u32, bg: u32, t: u8, corrected: bool) -> Self {
+        let a = if corrected && t != 0 && t != 255 {
+            correct_alpha(
+                linear_luminance(fg),
+                linear_luminance(bg),
+                f32::from(t) / 255.0,
+            )
+        } else {
+            0.0
+        };
+        Self {
+            fg,
+            t,
+            corrected,
+            a,
+        }
     }
-    if t == 255 {
-        return fg & 0x00ff_ffff;
+
+    /// The level laid over `dst`: [`blend_text`]`(dst, fg, bg, t, corrected)`.
+    #[inline]
+    #[must_use]
+    pub fn over(&self, dst: u32) -> u32 {
+        let (fg, a) = (self.fg, self.a);
+        if self.t == 0 {
+            return dst & 0x00ff_ffff;
+        }
+        if self.t == 255 {
+            return fg & 0x00ff_ffff;
+        }
+        if !self.corrected {
+            return blend(dst, fg, self.t);
+        }
+        let ch = |sh: u32| blend_channel_linear((dst >> sh) & 0xff, (fg >> sh) & 0xff, a);
+        let tt = (((dst >> 24) & 0xff) as f32 * (1.0 - a)).round() as u32;
+        (tt << 24) | (ch(16) << 16) | (ch(8) << 8) | ch(0)
     }
-    if !corrected {
-        return blend(dst, fg, t);
+
+    /// [`Self::over`]'s red, green and blue as tables of the ground's own channel: each channel
+    /// blends apart from the others, so `over(dst)` lays `tables[0][red]`, `tables[1][green]`
+    /// and `tables[2][blue]` of `dst`'s.
+    #[must_use]
+    pub fn channel_tables(&self) -> [[u8; 256]; 3] {
+        let mut out = [[0; 256]; 3];
+        for (table, sh) in out.iter_mut().zip([16_u32, 8, 0]) {
+            for (v, slot) in (0_u32..).zip(table.iter_mut()) {
+                *slot = ((self.over(v << sh) >> sh) & 0xff) as u8;
+            }
+        }
+        out
     }
-    let fg_l = linear_luminance(fg);
-    let bg_l = linear_luminance(bg);
-    let a = correct_alpha(fg_l, bg_l, f32::from(t) / 255.0);
-    let ch = |sh: u32| blend_channel_linear((dst >> sh) & 0xff, (fg >> sh) & 0xff, a);
-    let tt = (((dst >> 24) & 0xff) as f32 * (1.0 - a)).round() as u32;
-    (tt << 24) | (ch(16) << 16) | (ch(8) << 8) | ch(0)
 }
 
 #[derive(Clone, Copy)]
@@ -21682,6 +21771,35 @@ mod tests {
             "materialising must ADOPT the face's own byte handle — a second copy \
              of the file is megabytes on any real chain face"
         );
+    }
+
+    /// A text level's channel tables lay what it lays: over every ground of a sweep, each
+    /// channel of [`TextLevel::over`] is its table's entry for the ground's own channel, at
+    /// every eleventh level of a dark ink on paper and a light ink on a dark page, corrected
+    /// and not.
+    #[test]
+    fn a_text_level_s_channel_tables_lay_what_it_lays() {
+        let mut read = 0;
+        for (fg, bg) in [(0x002B_2D33, 0x00F6_F7F9), (0x00E0_1030, 0x0012_3456)] {
+            for corrected in [true, false] {
+                for t in (0..=255_u8).step_by(11).chain([255]) {
+                    let level = TextLevel::new(fg, bg, t, corrected);
+                    let tables = level.channel_tables();
+                    for dst in (0..0x0100_0000_u32).step_by(0x0001_0F35) {
+                        let out = level.over(dst);
+                        for (table, sh) in tables.iter().zip([16_u32, 8, 0]) {
+                            assert_eq!(
+                                u32::from(table[((dst >> sh) & 0xff) as usize]),
+                                (out >> sh) & 0xff,
+                                "level {t} of #{fg:06x} on #{bg:06x} over #{dst:06x}"
+                            );
+                        }
+                        read += 1;
+                    }
+                }
+            }
+        }
+        assert!(read > 10_000, "fixture: {read} grounds read");
     }
 
     #[test]

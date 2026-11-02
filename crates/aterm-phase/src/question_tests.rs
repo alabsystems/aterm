@@ -562,6 +562,15 @@ fn the_review_tab_is_read_whole_over_its_countdown() {
             "request in 0:14, to avoid blocking progress on",
             "an unattended session",
         ],
+        vec![
+            "⚠ Claude Code will automatically block this request in 0:14, to avoid holding up an \
+             unattended session",
+        ],
+        vec![
+            "⚠ Claude Code will automatically block this",
+            "request in 0:14, to avoid holding up an unattended",
+            "session",
+        ],
     ] {
         let t = with(&block, true);
         let p = parse_prompt_v2(&t).expect("the review");

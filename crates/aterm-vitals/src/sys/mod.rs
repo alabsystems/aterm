@@ -8,6 +8,7 @@ pub mod disk;
 pub mod hardware;
 pub mod jobs_view;
 pub mod json;
+pub mod left;
 pub mod predicate;
 pub mod query;
 pub mod view;
@@ -184,7 +185,17 @@ impl Root {
     /// Where it lies when its path may not be printed: `home`, `tmp` or `volume`.
     #[must_use]
     pub fn under(&self, home: Option<&str>) -> &'static str {
-        if home.is_some_and(|h| !h.is_empty() && self.path.starts_with(h)) {
+        use std::path::{Component, Path};
+        let path = Path::new(&self.path);
+        if path.components().any(|c| matches!(c, Component::ParentDir)) {
+            return "volume";
+        }
+        let valid_home = home.map(Path::new).filter(|h| {
+            h.is_absolute()
+                && h.components().any(|c| matches!(c, Component::Normal(_)))
+                && !h.components().any(|c| matches!(c, Component::ParentDir))
+        });
+        if valid_home.is_some_and(|h| path.starts_with(h)) {
             "home"
         } else if [
             "/tmp",
@@ -193,7 +204,7 @@ impl Root {
             "/private/var/folders",
         ]
         .iter()
-        .any(|t| self.path.starts_with(t))
+        .any(|t| path.starts_with(t))
         {
             "tmp"
         } else {
@@ -331,7 +342,7 @@ pub fn clock_s(ms: u64) -> String {
     format!("{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
 }
 
-/// Pct-encode `text` outside `[A-Za-z0-9._~/+:@,=-]` so spaces, `;`, or `\n` cannot split fields.
+/// Pct-encode `text` outside `[A-Za-z0-9._~/+:@,-]` so spaces, `=`, `;`, or `\n` cannot split fields.
 #[must_use]
 pub fn pct(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -397,6 +408,7 @@ mod tests {
     fn record_values_are_pct_encoded() {
         assert_eq!(pct("/Users//a/my proj;x"), "/Users//a/my%20proj%3Bx");
         assert_eq!(pct("a\nb"), "a%0Ab");
+        assert_eq!(pct("k=v"), "k%3Dv");
         assert_eq!(pct("s-1a2b"), "s-1a2b");
     }
 
@@ -413,7 +425,17 @@ mod tests {
             ..Root::default()
         };
         assert_eq!(r("/Users//a/x").under(Some("/Users//a")), "home");
+        assert_eq!(r("/Users//a").under(Some("/Users//a/")), "home");
+        assert_eq!(r("/Users//alice/x").under(Some("/Users//a")), "volume");
         assert_eq!(r("/private/tmp/x").under(Some("/Users//a")), "tmp");
+        assert_eq!(r("/tmp2/x").under(Some("/Users//a")), "volume");
         assert_eq!(r("/Volumes/X").under(Some("/Users//a")), "volume");
+        assert_eq!(r("/Volumes/X").under(Some("/")), "volume");
+        assert_eq!(r("/tmp/x").under(Some("/")), "tmp");
+        assert_eq!(
+            r("/Users//a/../../Volumes/X").under(Some("/Users//a")),
+            "volume"
+        );
+        assert_eq!(r("/tmp/../Volumes/X").under(Some("/Users//a")), "volume");
     }
 }

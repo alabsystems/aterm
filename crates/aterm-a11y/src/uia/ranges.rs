@@ -280,53 +280,15 @@ impl TextRange {
             return Err(E_INVALIDARG);
         }
         self.read(|_, doc, _, bounds| {
-            let source = doc.slice(bounds[0], bounds[1]);
-            let (haystack, needle, map) = if ignore_case != 0 {
-                let mut folded = String::new();
-                let mut map = Vec::new();
-                let mut offset = bounds[0];
-                for ch in source.chars() {
-                    let end = offset + ch.len_utf16();
-                    for lower in ch.to_lowercase() {
-                        for _ in 0..lower.len_utf8() {
-                            map.push((offset, end));
-                        }
-                        folded.push(lower);
-                    }
-                    offset = end;
-                }
-                (folded, needle.to_lowercase(), map)
-            } else {
-                let mut map = Vec::new();
-                let mut offset = bounds[0];
-                for ch in source.chars() {
-                    let end = offset + ch.len_utf16();
-                    for _ in 0..ch.len_utf8() {
-                        map.push((offset, end));
-                    }
-                    offset = end;
-                }
-                (source, needle.clone(), map)
-            };
-            let found = if backward != 0 {
-                haystack.rfind(&needle)
-            } else {
-                haystack.find(&needle)
-            };
-            let Some(byte) = found else {
-                return Ok(None);
-            };
-            let start = map[byte].0;
-            let end = map[byte + needle.len() - 1].1;
-            Ok(Some(TextRange::spanning(
-                self.key.clone(),
-                doc.floor(start),
-                doc.characters
-                    .iter()
-                    .copied()
-                    .find(|&p| p >= end)
-                    .unwrap_or(doc.len()),
-            )))
+            Ok(doc
+                .find(
+                    bounds[0],
+                    bounds[1],
+                    &needle,
+                    backward != 0,
+                    ignore_case != 0,
+                )
+                .map(|(start, end)| TextRange::spanning(self.key.clone(), start, end)))
         })
     }
 

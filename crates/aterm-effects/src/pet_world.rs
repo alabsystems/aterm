@@ -988,10 +988,7 @@ impl PetWorld {
                 let transient = selected || span_contains(overlay_spans, local_c);
                 let others = lasting || transient;
                 let hull_ink = (glyph && !speck)
-                    || ((u32::from(cell.bg[0]) << 16)
-                        | (u32::from(cell.bg[1]) << 8)
-                        | u32::from(cell.bg[2]))
-                        != default_bg
+                    || (default_bg > 0x00FF_FFFF || cell.bg != implicit.bg)
                     || span_contains(typed_spans, local_c);
                 let painted = hull_ink || speck;
                 if hull_ink {
@@ -2671,6 +2668,12 @@ impl PetReading {
             || kept.content_seq != input.content_seq
             || kept.snapshot_seq != input.snapshot_seq
             || kept.cursor != (input.cursor_row, input.cursor_col, input.cursor_visible)
+            || self.protected.len() != reserve.protected.len()
+            || self.overlays.len() != reserve.overlays.len()
+            || self.ink.len() != reserve.ink.len()
+            || self.blanked.len() != reserve.blanked.len()
+            || self.selections.len() != input.selections.len()
+            || self.selection != input.selection
         {
             return false;
         }
@@ -2679,7 +2682,6 @@ impl PetReading {
         };
         now.extract_gen = expected_gen;
         *kept == now
-            && self.selection == input.selection
             && self.selections == input.selections
             && same_rects(&self.protected, reserve.protected)
             && same_rects(&self.overlays, reserve.overlays)

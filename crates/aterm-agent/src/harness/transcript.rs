@@ -195,6 +195,41 @@ const CONVERSATION: Shape = Shape::Object(&[
     ),
 ]);
 
+/// What the step fold reads of a message's usage: the counts [`super::usage::TokenUsage`] reads,
+/// never the rest of the object.
+const STEP_USAGE: Shape = Shape::Object(&[
+    ("input_tokens", Shape::Scalar),
+    ("output_tokens", Shape::Scalar),
+    ("cache_creation_input_tokens", Shape::Scalar),
+    ("cache_read_input_tokens", Shape::Scalar),
+    (
+        "cache_creation",
+        Shape::Object(&[
+            ("ephemeral_5m_input_tokens", Shape::Scalar),
+            ("ephemeral_1h_input_tokens", Shape::Scalar),
+        ]),
+    ),
+]);
+
+/// What the step fold reads of a notice row (`super::steps::notice_read`): what the wall reader's
+/// notice arms read of it (`wall_confirm::row_of`: an API error's reply, a local command's
+/// output), its discriminants, its error words, its limit and its text, never another key of
+/// [`CONVERSATION`], which the other readers share.
+const STEP_NOTICE: Shape = Shape::Object(&[
+    ("type", Shape::Scalar),
+    ("subtype", Shape::Scalar),
+    ("content", Shape::Scalar),
+    ("isApiErrorMessage", Shape::Scalar),
+    ("error", Shape::Scalar),
+    ("apiError", Shape::Scalar),
+    ("apiErrorStatus", Shape::Scalar),
+    (
+        "quotaLimits",
+        Shape::Object(&[("rateLimitType", Shape::Scalar)]),
+    ),
+    ("message", Shape::Object(&[("content", CONTENT)])),
+]);
+
 const STEP_PART: Shape = Shape::Record(&[
     ("type", Shape::Scalar),
     ("id", Shape::Scalar),
@@ -226,7 +261,7 @@ const STEPS_BARE_FIELDS: [Field; 18] = [
         Shape::Object(&[
             ("id", Shape::Scalar),
             ("model", Shape::Scalar),
-            ("usage", MESSAGE_USAGE),
+            ("usage", STEP_USAGE),
         ]),
     ),
 ];
@@ -238,7 +273,7 @@ const STEPS_FIELDS: [Field; 18] = {
         Shape::Object(&[
             ("id", Shape::Scalar),
             ("model", Shape::Scalar),
-            ("usage", MESSAGE_USAGE),
+            ("usage", STEP_USAGE),
             ("content", STEP_PARTS),
         ]),
     );
@@ -594,6 +629,44 @@ pub(crate) fn steps_bare(line: &str) -> aterm_json::Result<Value> {
     aterm_json::from_str::<Steps<false>>(line).map(|v| v.0)
 }
 
+struct StepNotice(Value);
+
+impl<'de> Deserialize<'de> for StepNotice {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        STEP_NOTICE.deserialize(de).map(Self)
+    }
+}
+
+/// The step fold's read of a notice row ([`STEP_NOTICE`]): what the wall reader's notice arm reads,
+/// never another key.
+pub(crate) fn step_notice(line: &str) -> aterm_json::Result<Value> {
+    aterm_json::from_str::<StepNotice>(line).map(|v| v.0)
+}
+
+/// Every key the step fold's projections keep ([`STEPS`], [`STEPS_BARE`], [`STEP_NOTICE`]), at
+/// any depth: all the fold can read of a row's object, since a projection passes over every other
+/// key unbuilt. The step tests hold `TRANSCRIPT_KEYS` to it.
+#[cfg(test)]
+pub(crate) fn step_keys() -> std::collections::BTreeSet<&'static str> {
+    fn walk(shape: Shape, out: &mut std::collections::BTreeSet<&'static str>) {
+        match shape {
+            Shape::Scalar => {}
+            Shape::Object(fields) | Shape::Record(fields) => {
+                for (name, inner) in fields {
+                    out.insert(name);
+                    walk(*inner, out);
+                }
+            }
+            Shape::Seq(inner) | Shape::Parts(inner) => walk(*inner, out),
+        }
+    }
+    let mut out = std::collections::BTreeSet::new();
+    for shape in [STEPS, STEPS_BARE, STEP_NOTICE] {
+        walk(shape, &mut out);
+    }
+    out
+}
+
 /// Read all harness metadata projections from one Claude Code transcript row.
 #[must_use]
 pub fn claude_reads(line: &str) -> Vec<Option<Value>> {
@@ -607,6 +680,7 @@ pub fn claude_reads(line: &str) -> Vec<Option<Value>> {
         calls,
         steps,
         steps_bare,
+        step_notice,
         goal,
     ]
     .iter()

@@ -349,11 +349,12 @@ fn parse_entry(
         receives: Vec::new(),
     };
     if let Some(url) = get(&["url"]) {
-        if url.starts_with("imap://") || url.starts_with("imaps://") {
+        let lower = url.to_ascii_lowercase();
+        if lower.starts_with("imap://") || lower.starts_with("imaps://") {
             route.imap_url.get_or_insert(url);
         } else if is_webmail(&url) {
             route.webmail_url.get_or_insert(url);
-        } else if url.starts_with("http://") || url.starts_with("https://") {
+        } else if lower.starts_with("http://") || lower.starts_with("https://") {
             route.http_url.get_or_insert(url);
         }
     }
@@ -408,7 +409,7 @@ pub fn login_source(url: &str) -> String {
     let Some((scheme, rest)) = lower.split_once("://") else {
         return lower;
     };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let authority = rest.split(['/', '\\', '?', '#']).next().unwrap_or(rest);
     let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
     format!("{scheme}://{host}")
 }
@@ -456,8 +457,8 @@ fn read_record(record: &Path) -> BTreeMap<String, Failures> {
                 return None;
             }
             let digest = words.next()?.to_owned();
-            let count = words.next()?.parse().ok()?;
-            let last = words.next()?.parse().ok()?;
+            let count = crate::parse_uint(words.next()?)?;
+            let last = crate::parse_int(words.next()?)?;
             Some((digest, Failures { count, last }))
         })
         .collect()
@@ -721,8 +722,15 @@ fn login_in_cell(cell: &str, ai_email: &str) -> Option<String> {
         .split(|c: char| c.is_whitespace() || ",;<>()[]\"'".contains(c))
         .map(|w| w.trim_matches(|c: char| c == '.' || c == ':'))
         .find(|w| {
-            w.split_once('@')
-                .is_some_and(|(l, d)| !l.is_empty() && d.contains('.') && !d.contains('@'))
+            !w.contains('*')
+                && w.split_once('@').is_some_and(|(l, d)| {
+                    !l.is_empty()
+                        && d.contains('.')
+                        && !d.starts_with('.')
+                        && !d.ends_with('.')
+                        && !d.contains("..")
+                        && !d.contains('@')
+                })
         });
     if let Some(found) = address {
         return Some(found.to_owned());

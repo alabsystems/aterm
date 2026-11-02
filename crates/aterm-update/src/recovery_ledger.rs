@@ -80,7 +80,7 @@ impl EndClass {
             "running" => Self::Running,
             "unknown" => Self::Unknown,
             "none" => Self::None,
-            other => Self::Signal(other.strip_prefix("signal-")?.parse().ok()?),
+            other => Self::Signal(crate::parse_uint(other.strip_prefix("signal-")?)?),
         })
     }
 
@@ -302,9 +302,9 @@ impl Restores {
     fn parse(token: &str) -> Option<Self> {
         let mut parts = token.split(':');
         let restores = Self {
-            exact: parts.next()?.parse().ok()?,
-            screen: parts.next()?.parse().ok()?,
-            meta: parts.next()?.parse().ok()?,
+            exact: crate::parse_uint(parts.next()?)?,
+            screen: crate::parse_uint(parts.next()?)?,
+            meta: crate::parse_uint(parts.next()?)?,
             ..Self::default()
         };
         parts.next().is_none().then_some(restores)
@@ -323,17 +323,17 @@ impl Restores {
 
     fn parse_history(&mut self, token: &str) -> Option<()> {
         let mut parts = token.split(':');
-        self.history_lost = parts.next()?.parse().ok()?;
-        self.history_short = parts.next()?.parse().ok()?;
+        self.history_lost = crate::parse_uint(parts.next()?)?;
+        self.history_short = crate::parse_uint(parts.next()?)?;
         parts.next().is_none().then_some(())
     }
 
     fn parse_lost(&mut self, token: &str) -> Option<()> {
         let mut parts = token.split(':');
-        self.in_flight_lost = parts.next()?.parse().ok()?;
-        self.tail_overflows = parts.next()?.parse().ok()?;
-        self.marks_lost = parts.next()?.parse().ok()?;
-        self.resizes_unjournaled = parts.next()?.parse().ok()?;
+        self.in_flight_lost = crate::parse_uint(parts.next()?)?;
+        self.tail_overflows = crate::parse_uint(parts.next()?)?;
+        self.marks_lost = crate::parse_uint(parts.next()?)?;
+        self.resizes_unjournaled = crate::parse_uint(parts.next()?)?;
         parts.next().is_none().then_some(())
     }
 
@@ -367,7 +367,7 @@ impl Restores {
             if word.is_empty() {
                 return None;
             }
-            self.whys.push((word.to_string(), n.parse().ok()?));
+            self.whys.push((word.to_string(), crate::parse_uint(n)?));
         }
         Some(())
     }
@@ -465,7 +465,7 @@ fn parse_opt_u64(token: &str) -> Option<Option<u64>> {
     if token == "?" {
         Some(None)
     } else {
-        token.parse().ok().map(Some)
+        crate::parse_uint(token).map(Some)
     }
 }
 
@@ -539,7 +539,7 @@ impl Row {
             let (key, value) = pair.split_once('=')?;
             fields.insert(key, value);
         }
-        if fields.get("v")?.parse::<u32>().ok()? != ROW_VERSION {
+        if crate::parse_uint::<u32>(fields.get("v")?)? != ROW_VERSION {
             return None;
         }
         let get = |key: &str| fields.get(key).copied();
@@ -551,27 +551,27 @@ impl Row {
                     None => (token, false),
                 };
                 Some(Uptime {
-                    secs: digits.parse().ok()?,
+                    secs: crate::parse_uint(digits)?,
                     at_least,
                 })
             }
         };
         let text = |token: &str| (token != "?").then(|| token.to_string());
         Some(Self {
-            at: get("at")?.parse().ok()?,
-            pid: get("pid")?.parse().ok()?,
-            started: get("started")?.parse().ok()?,
+            at: crate::parse_uint(get("at")?)?,
+            pid: crate::parse_uint(get("pid")?)?,
+            started: crate::parse_uint(get("started")?)?,
             started_us: match get("started_us") {
                 None => None,
-                Some(token) => Some(token.parse().ok().filter(|us| *us < 1_000_000)?),
+                Some(token) => Some(crate::parse_uint(token).filter(|us| *us < 1_000_000)?),
             },
-            build: get("build")?.parse().ok()?,
+            build: crate::parse_uint(get("build")?)?,
             version: get("version")?.to_string(),
             launch: LaunchKind::parse(get("launch")?)?,
             prev: PrevRun {
                 pid: match get("prev_pid")? {
                     "?" => None,
-                    token => Some(token.parse().ok()?),
+                    token => Some(crate::parse_uint(token)?),
                 },
                 build: parse_opt_u64(get("prev_build")?)?,
                 version: text(get("prev_version")?),
@@ -579,7 +579,7 @@ impl Row {
                 uptime,
                 stall: Tri::parse(get("prev_stall")?)?,
                 pressure: Pressure::parse(get("prev_pressure")?)?,
-                trial: get("prev_trial")?.parse().ok()?,
+                trial: crate::parse_uint(get("prev_trial")?)?,
             },
             keeper: match get("keeper") {
                 None => None,
@@ -599,7 +599,7 @@ impl Row {
                         restores.parse_history(history)?;
                     }
                     if let Some(refused) = get("restore_refused") {
-                        restores.refused = refused.parse().ok()?;
+                        restores.refused = crate::parse_uint(refused)?;
                     }
                     Some(restores)
                 }
@@ -695,7 +695,7 @@ fn open_for_read(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt as _;
     std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(path)
 }
 
@@ -720,10 +720,18 @@ pub fn append_row(path: &Path, row: &Row) -> std::io::Result<()> {
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
             .open(path)?;
+        let ours = file.metadata()?;
+        if !ours.file_type().is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "recovery ledger is not a regular file",
+            ));
+        }
+        aterm_uds::keep_out_of_children(&file)?;
         let lock = lock_briefly(&file);
-        let same_inode = match (file.metadata(), std::fs::symlink_metadata(path)) {
-            (Ok(ours), Ok(now)) => ours.ino() == now.ino() && ours.dev() == now.dev(),
-            _ => false,
+        let same_inode = match std::fs::symlink_metadata(path) {
+            Ok(now) => ours.ino() == now.ino() && ours.dev() == now.dev(),
+            Err(_) => false,
         };
         if lock.is_some() && !same_inode {
             continue;
@@ -792,7 +800,7 @@ fn trim_locked(path: &Path) {
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&tmp)
         .and_then(|mut f| f.write_all(text.as_bytes()));
     if written.is_err() || std::fs::rename(&tmp, path).is_err() {
@@ -1340,7 +1348,9 @@ mod tests {
         let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
         // SAFETY: an owned scratch pathname, a NUL-terminated name and mode only.
         assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
-        assert!(read_opened_text(open_for_read(&fifo).unwrap()).is_err());
+        let reader = open_for_read(&fifo).unwrap();
+        assert!(append_row(&fifo, &expected).is_err());
+        assert!(read_opened_text(reader).is_err());
         assert!(read_rows_checked(&fifo).is_err());
 
         std::fs::File::create(&path)

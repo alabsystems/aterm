@@ -873,6 +873,97 @@ mod tests {
     }
 
     #[test]
+    fn print_seq_advances_on_every_print_run_and_nothing_else() {
+        let mut t = Terminal::new(4, 10);
+        let s0 = t.print_seq();
+        t.process(b"ab");
+        let s1 = t.print_seq();
+        assert!(s1 > s0, "a print run advances it");
+        t.process(b"\x1b[C\x1b[2;1H\x1b[31m\x07\x1b[6n");
+        assert_eq!(
+            t.print_seq(),
+            s1,
+            "a cursor move, an SGR, a bell or a query prints nothing"
+        );
+        t.process("中".as_bytes());
+        assert!(t.print_seq() > s1, "a wide glyph prints");
+        let s2 = t.print_seq();
+        t.process(b"\x1bc");
+        assert_eq!(t.print_anchor(), None, "a reset forgets the anchor");
+        assert!(t.print_seq() <= s2, "…and never advances the sequence");
+    }
+
+    /// Reads row 0 of `t` as the echo proof does.
+    fn echo_row(t: &Terminal, row: u16) -> (Vec<char>, Vec<bool>) {
+        let (mut chars, mut visible, mut drawn) = (Vec::new(), Vec::new(), Vec::new());
+        t.screen_row_echo_cells_into(row, &mut chars, &mut visible, &mut drawn);
+        (chars, visible)
+    }
+
+    #[test]
+    fn echo_cells_read_the_live_row_and_count_only_shown_ink() {
+        let mut t = Terminal::new(4, 12);
+        t.process(b"ab\x1b[8mcd\x1b[0m\x1b[34;44mef\x1b[0m\x1b[38;2;1;1;1;40mgh\x1b[0m");
+        t.process("中i\u{301}".as_bytes());
+        let (chars, visible) = echo_row(&t, 0);
+        assert_eq!(chars.len(), 12, "one entry per column");
+        assert_eq!(
+            &chars[..11],
+            &['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', '中', '\0', 'i']
+        );
+        assert_eq!(
+            &visible[..11],
+            &[
+                true, true, false, false, false, false, false, false, true, true, false
+            ],
+            "SGR 8, one palette slot on itself, a near-black RGB on black and a combining mark \
+             are not shown"
+        );
+        assert_eq!(
+            (chars[11], visible[11]),
+            (' ', true),
+            "past the row: a shown blank"
+        );
+
+        let mut inverse = Terminal::new(2, 6);
+        inverse.process(b"\x1b[7mxy\x1b[27m\x1b[7;8mz");
+        let (_, visible) = echo_row(&inverse, 0);
+        assert_eq!(
+            &visible[..3],
+            &[true, true, false],
+            "inverse shows; inverse SGR 8 does not"
+        );
+
+        let mut scrolled = Terminal::new(3, 8);
+        for i in 0..6 {
+            scrolled.process(format!("line{i}\r\n").as_bytes());
+        }
+        scrolled.process(b"live");
+        scrolled.scroll_display(2);
+        assert!(
+            scrolled.grid().display_offset() > 0,
+            "the viewport scrolled back"
+        );
+        let mut shown = Vec::new();
+        scrolled.row_cols_into(2, &mut shown);
+        assert_ne!(
+            &shown[..4],
+            &['l', 'i', 'v', 'e'],
+            "non-vacuity: the viewport shows history"
+        );
+        assert_eq!(
+            &echo_row(&scrolled, 2).0[..4],
+            &['l', 'i', 'v', 'e'],
+            "the live row"
+        );
+        assert_eq!(
+            echo_row(&scrolled, 3),
+            (Vec::new(), Vec::new()),
+            "past the screen"
+        );
+    }
+
+    #[test]
     fn paste_preserves_non_ascii_spaces() {
         let mut t = Terminal::new(4, 80);
         let macos_screenshot =

@@ -32,13 +32,17 @@ impl Rec {
     }
 }
 
-/// Every record of the stopped broker's log at `path`, in offset order.
+/// Every record of the stopped broker's log at `path`, in offset order, opened under `at_rest`
+/// when it is sealed.
 /// # Panics
 /// The log does not open — the broker still holds it, or it is not a log.
 #[must_use]
-pub fn read_log(path: &Path) -> Vec<Rec> {
-    let log = astream_broker::BrokerLog::open(path)
-        .unwrap_or_else(|e| panic!("open the stopped broker's log {}: {e}", path.display()));
+pub fn read_log(path: &Path, at_rest: Option<[u8; 32]>) -> Vec<Rec> {
+    let log = match at_rest {
+        Some(key) => astream_broker::BrokerLog::open_encrypted_bound(path, key),
+        None => astream_broker::BrokerLog::open(path),
+    }
+    .unwrap_or_else(|e| panic!("open the stopped broker's log {}: {e}", path.display()));
     log.read_from(log.base())
         .iter()
         .map(|r| {

@@ -1,0 +1,182 @@
+// Copyright 2026 Andrew Yates
+// SPDX-License-Identifier: Apache-2.0
+//! Verifies Proton's clear-signed SRP modulus against its pinned Ed25519 key.
+
+const KEY: &str = include_str!("proton-modulus-key.asc");
+
+pub(super) fn verify(signed: &str) -> Result<Vec<u8>, String> {
+    if signed.len() > 16 * 1024 {
+        return Err("SRP modulus exceeds limit".into());
+    }
+    let signed = signed.replace("\r\n", "\n");
+    let body = signed
+        .strip_prefix("-----BEGIN PGP SIGNED MESSAGE-----\n")
+        .ok_or("Missing signed SRP modulus")?;
+    let (_, body) = body
+        .split_once("\n\n")
+        .ok_or("Malformed signed SRP modulus")?;
+    let (text, signature) = body
+        .split_once("\n-----BEGIN PGP SIGNATURE-----")
+        .ok_or("Missing SRP modulus signature")?;
+    // A modulus is one base64 line. Refuse cleartext transformations and added data.
+    if text.contains(['\n', '\r']) {
+        return Err("Malformed SRP modulus text".into());
+    }
+    let signature = format!("-----BEGIN PGP SIGNATURE-----{signature}");
+    let signature = armor(&signature, "SIGNATURE")?;
+    let (tag, sig, rest) = packet(&signature)?;
+    if tag != 2 || !rest.is_empty() || sig.len() < 10 || sig[..3] != [4, 1, 22] {
+        return Err("Unsupported SRP modulus signature".into());
+    }
+    let algorithm = match sig[3] {
+        8 => &ring::digest::SHA256,
+        10 => &ring::digest::SHA512,
+        _ => return Err("Unsupported SRP modulus signature hash".into()),
+    };
+    let hashed_len = u16::from_be_bytes([sig[4], sig[5]]) as usize;
+    let end = 6usize
+        .checked_add(hashed_len)
+        .ok_or("Invalid signature length")?;
+    let hashed = sig.get(..end).ok_or("Truncated SRP signature")?;
+    let mut cursor = sig.get(end..).ok_or("Truncated SRP signature")?;
+    if cursor.len() < 2 {
+        return Err("Truncated SRP signature".into());
+    }
+    let unhashed_len = u16::from_be_bytes([cursor[0], cursor[1]]) as usize;
+    cursor = cursor
+        .get(2 + unhashed_len..)
+        .ok_or("Truncated SRP signature")?;
+    if cursor.len() < 2 {
+        return Err("Truncated signature hash".into());
+    }
+    let prefix = &cursor[..2];
+    cursor = &cursor[2..];
+    let (r, next) = mpi(cursor)?;
+    let (s, next) = mpi(next)?;
+    if !next.is_empty() || r.len() > 32 || s.len() > 32 {
+        return Err("Invalid Ed25519 signature size".into());
+    }
+    let mut raw_signature = [0u8; 64];
+    raw_signature[32 - r.len()..32].copy_from_slice(r);
+    raw_signature[64 - s.len()..].copy_from_slice(s);
+    let mut hash = ring::digest::Context::new(algorithm);
+    hash.update(text.as_bytes());
+    hash.update(hashed);
+    hash.update(&[4, 255]);
+    hash.update(&(end as u32).to_be_bytes());
+    let digest = hash.finish();
+    if &digest.as_ref()[..2] != prefix {
+        return Err("SRP modulus digest mismatch".into());
+    }
+    let key = armor(KEY, "PUBLIC KEY BLOCK")?;
+    let (tag, key, _) = packet(&key)?;
+    const CURVE: &[u8] = &[9, 43, 6, 1, 4, 1, 218, 71, 15, 1];
+    if tag != 6
+        || key.len() != 51
+        || key[0] != 4
+        || key[5] != 22
+        || key.get(6..16) != Some(CURVE)
+        || key[18] != 64
+    {
+        return Err("Invalid pinned Proton modulus key".into());
+    }
+    ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, &key[19..])
+        .verify(digest.as_ref(), &raw_signature)
+        .map_err(|_| "Proton modulus signature did not verify")?;
+    let modulus = aterm_codec::base64::decode(text).map_err(|_| "Invalid SRP modulus encoding")?;
+    if modulus.len() != 256 {
+        return Err("Invalid SRP modulus length".into());
+    }
+    Ok(modulus)
+}
+
+pub(super) fn armor(text: &str, label: &str) -> Result<Vec<u8>, String> {
+    let start = format!("-----BEGIN PGP {label}-----");
+    let end = format!("-----END PGP {label}-----");
+    let text = text.strip_prefix(&start).ok_or("Invalid PGP armor")?;
+    let (body, trailing) = text.split_once(&end).ok_or("Unclosed PGP armor")?;
+    if !trailing.trim().is_empty() {
+        return Err("Trailing data in PGP armor".into());
+    }
+    let body = body.replace("\r\n", "\n");
+    let (_, body) = body
+        .split_once("\n\n")
+        .ok_or("Missing PGP armor separator")?;
+    let encoded: String = body
+        .lines()
+        .take_while(|line| !line.starts_with('='))
+        .collect();
+    aterm_codec::base64::decode(encoded.trim()).map_err(|_| "Invalid PGP armor encoding".into())
+}
+
+pub(super) fn packet(input: &[u8]) -> Result<(u8, &[u8], &[u8]), String> {
+    let first = *input.first().ok_or("Truncated PGP packet")?;
+    if first & 128 == 0 {
+        return Err("Invalid PGP packet".into());
+    }
+    let (tag, length, prefix) = if first & 64 != 0 {
+        let b = *input.get(1).ok_or("Truncated PGP packet")?;
+        let (length, prefix) = match b {
+            0..=191 => (usize::from(b), 2),
+            192..=223 => (
+                ((usize::from(b) - 192) << 8)
+                    + usize::from(*input.get(2).ok_or("Truncated PGP packet")?)
+                    + 192,
+                3,
+            ),
+            255 => (
+                u32::from_be_bytes(
+                    input
+                        .get(2..6)
+                        .ok_or("Truncated PGP packet")?
+                        .try_into()
+                        .map_err(|_| "Truncated PGP length")?,
+                ) as usize,
+                6,
+            ),
+            _ => return Err("Partial PGP packet is not accepted here".into()),
+        };
+        (first & 63, length, prefix)
+    } else {
+        let n = match first & 3 {
+            0 => 1,
+            1 => 2,
+            2 => 4,
+            _ => return Err("Indeterminate PGP packet".into()),
+        };
+        let mut length = 0usize;
+        for b in input.get(1..1 + n).ok_or("Truncated PGP packet")? {
+            length = (length << 8) | usize::from(*b);
+        }
+        ((first >> 2) & 15, length, n + 1)
+    };
+    let end = prefix
+        .checked_add(length)
+        .ok_or("PGP packet length overflow")?;
+    Ok((
+        tag,
+        input.get(prefix..end).ok_or("Truncated PGP body")?,
+        input.get(end..).ok_or("Truncated PGP packet")?,
+    ))
+}
+
+pub(super) fn mpi(bytes: &[u8]) -> Result<(&[u8], &[u8]), String> {
+    let size = bytes.get(..2).ok_or("Truncated PGP integer")?;
+    let size = usize::from(u16::from_be_bytes([size[0], size[1]])).div_ceil(8);
+    Ok((
+        bytes.get(2..2 + size).ok_or("Truncated PGP integer")?,
+        bytes.get(2 + size..).ok_or("Truncated PGP integer")?,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn pinned_proton_signature_and_changed_modulus() {
+        let signed = include_str!("modulus-test.asc");
+        assert_eq!(verify(signed).unwrap().len(), 256);
+        assert!(verify(&signed.replacen("W2z5", "W3z5", 1)).is_err());
+        assert!(verify(&format!("{signed}unexpected")).is_err());
+    }
+}

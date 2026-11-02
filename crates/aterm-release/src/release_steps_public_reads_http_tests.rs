@@ -155,7 +155,7 @@ fn public_http_reads_refuse_inherited_headers_without_changing_private_authentic
         let keys = public_header_keys(config_context(&root, &config, &parent, &[])).unwrap();
         let reads = public_reads(Some(std::ffi::OsStr::new(&count)), &keys, None).unwrap();
         let real = Real::new(&root, Some(&root), true, false).unwrap();
-        let stage =
+        let (stage, _) =
             real.dry_run_command(&root.join("engine"), "c0ffee", &root.join("clone"), &reads);
         let reads: Vec<(String, std::ffi::OsString)> = stage
             .get_envs()
@@ -189,6 +189,8 @@ fn unproved_public_header_scopes_refuse_without_echoing_the_config() {
     for scope in [
         "https://github.com/%61labsystems/aterm.git",
         "https://github.com/alabsystems/../alabsystems/aterm.git",
+        "https://github.com./alabsystems/aterm.git",
+        "https://github.com.:443/alabsystems/aterm.git",
         "https://*.com/alabsystems/aterm.git",
         "https://Fixture:QZP6WORD1@github.com/%61labsystems/aterm.git",
     ] {
@@ -232,7 +234,8 @@ fn public_reads_override_inherited_git_parameters_and_preserve_private_authentic
     let keys = public_header_keys(config_context(&root, &config, &parent, &[])).unwrap();
     let reads = public_reads(None, &keys, Some(std::ffi::OsStr::new(parameters))).unwrap();
     let real = Real::new(&root, Some(&root), true, false).unwrap();
-    let stage = real.dry_run_command(&root.join("engine"), "c0ffee", &root.join("clone"), &reads);
+    let (stage, _) =
+        real.dry_run_command(&root.join("engine"), "c0ffee", &root.join("clone"), &reads);
     let reads: Vec<(String, std::ffi::OsString)> = stage
         .get_envs()
         .filter_map(|(key, value)| {

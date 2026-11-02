@@ -51,6 +51,10 @@ fn world(label: &str) -> World {
     let home = root.join("home");
     let keys = Keys::mint("m3", &[]);
     let host = Arc::new(FakeHost::new());
+    host.add_clone_source(
+        &Slug::new("alabsystems", "codex-alab"),
+        &root.join("remotes/alabsystems/codex-alab.git"),
+    );
     let ctx = keys.ctx(&home, host.clone());
     keys.publish_quad(
         &host,
@@ -414,8 +418,9 @@ fn a_package_packs_whole_and_signs_what_a_client_stages() {
         w.host
             .calls()
             .iter()
-            .all(|c| !c.contains("codex-alab") && !c.starts_with("create")),
-        "no host is written without --upload: {:?}",
+            .all(|c| c == "fetch-main alabsystems/codex-alab"
+                || (!c.contains("codex-alab") && !c.starts_with("create"))),
+        "no host is written without --upload (the source check only reads main): {:?}",
         w.host.calls()
     );
 }
@@ -569,6 +574,7 @@ fn upload_goes_to_the_staging_codex_alab_release_only_when_asked() {
     assert_eq!(
         names,
         [
+            atpkg_publish::artifact::upload::VERSION_RESERVATION,
             "codex-2026101601.tar.zst",
             "pkg-codex-2026101601.toml",
             "pkg-codex-2026101601.toml.sig"
@@ -710,7 +716,7 @@ fn each_gate_refuses_before_anything_is_signed() {
                 l.source.clone_from(&side);
                 l.version = format!("0.164.0-dev.3+g{}", &side[..9]);
             }),
-            "is not on alabsystems/codex-alab origin/main",
+            "is not on alabsystems/codex-alab main as the host serves it",
         ),
         (
             "another compiler's sysroot",
@@ -789,8 +795,11 @@ fn the_index_pins_an_alab_build_only_over_a_pack_that_verifies() {
     assert!(text.contains("codex = 2026101501"), "{text}");
     assert!(log.contains("only `--pin codex=<b>`"), "{}", log.text());
     assert!(
-        w.host.calls().iter().all(|c| !c.contains("codex-alab")),
-        "{:?}",
+        w.host
+            .calls()
+            .iter()
+            .all(|c| c == "fetch-main alabsystems/codex-alab" || !c.contains("codex-alab")),
+        "only the pack's source check read codex-alab: {:?}",
         w.host.calls()
     );
 
@@ -845,8 +854,11 @@ fn the_index_pins_an_alab_build_only_over_a_pack_that_verifies() {
         log.text()
     );
     assert!(
-        w2.host.calls().iter().all(|c| !c.contains("codex-alab")),
-        "{:?}",
+        w2.host
+            .calls()
+            .iter()
+            .all(|c| c == "fetch-main alabsystems/codex-alab" || !c.contains("codex-alab")),
+        "only the pack's source check read codex-alab: {:?}",
         w2.host.calls()
     );
 }

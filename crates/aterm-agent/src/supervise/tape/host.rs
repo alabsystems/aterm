@@ -14,13 +14,14 @@ use super::codec::CodecError;
 use super::core::TapeValue;
 use super::frame::Hint;
 use crate::harness::accounts::Sample;
-use crate::harness::acts::{Act, LandHeld, TaskFace};
+use crate::harness::acts::{Act, LandHeld, LandReceipt, TaskFace};
 use crate::harness::disk::Level;
+use crate::harness::hold_said::HoldSaid;
 use crate::harness::profile::AccountKey;
 use crate::harness::repo_work::{CleanAt, RepoRead, RepoWork};
 use crate::harness::upgrade::{LastTurn, StandingLimit};
 use crate::supervise::background::{BackgroundCall, BackgroundEvidence};
-use crate::supervise::facts::FactsReading;
+use crate::supervise::facts::{FactsReading, HeldCall, HeldReading};
 use crate::supervise::fx::Fx;
 use crate::supervise::memory::{AgentMemory, Pressure};
 use crate::supervise::occupancy::wakes::SysWait;
@@ -192,6 +193,14 @@ impl<T: TapeArg> TapeArg for [T] {
     }
 }
 
+impl TapeArg for crate::harness::acts::TakenAct {
+    fn fmt_request(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The act alone was `host.act_taken`'s request before whether it opens a turn rode
+        // beside it, so a tape recorded before compares as it was.
+        fmt::Debug::fmt(&self.act, f)
+    }
+}
+
 impl TapeArg for Sample {
     fn fmt_request(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // These six fields are the original account_probed request. The GUI
@@ -230,6 +239,8 @@ tape_arg_debug!(
     Act,
     TaskFace,
     LandHeld,
+    HoldSaid,
+    LandReceipt,
     Guard,
     StuckSurvey,
     StallSeen,
@@ -388,11 +399,24 @@ impl HostReply for Reach {
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum AdviceWire {
-    Probe { otherwise: Option<Box<AdviceWire>> },
-    Move { to: String },
-    Wait { until: i64 },
-    Hold { until: i64 },
-    Resume { cleared_at: i64 },
+    Probe {
+        otherwise: Option<Box<AdviceWire>>,
+    },
+    Move {
+        to: String,
+        /// Left out where nobody yields by the move, as on a tape recorded before it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        yields: Option<i64>,
+    },
+    Wait {
+        until: i64,
+    },
+    Hold {
+        until: i64,
+    },
+    Resume {
+        cleared_at: i64,
+    },
 }
 
 impl AdviceWire {
@@ -403,7 +427,10 @@ impl AdviceWire {
                     .as_deref()
                     .map(|o| Box::new(AdviceWire::of(o, origin))),
             },
-            AccountAdvice::Move { to } => AdviceWire::Move { to: to.clone() },
+            AccountAdvice::Move { to, yields } => AdviceWire::Move {
+                to: to.clone(),
+                yields: yields.map(|until| offset_ns(origin, until)),
+            },
             AccountAdvice::Wait { until } => AdviceWire::Wait {
                 until: offset_ns(origin, *until),
             },
@@ -423,7 +450,10 @@ impl AdviceWire {
                     .map(|o| o.advice(origin).map(Box::new))
                     .transpose()?,
             },
-            AdviceWire::Move { to } => AccountAdvice::Move { to },
+            AdviceWire::Move { to, yields } => AccountAdvice::Move {
+                to,
+                yields: yields.map(|until| instant_at(origin, until)).transpose()?,
+            },
             AdviceWire::Wait { until } => AccountAdvice::Wait {
                 until: instant_at(origin, until)?,
             },
@@ -784,13 +814,36 @@ impl TapeValue for BackgroundEvidence {
     }
 }
 
-/// `facts`'s answer as a tape holds it ([`FactsReading`]): when it was taken and each call it
-/// names, or `null` for no reading.
+/// `facts`'s answer as a tape holds it ([`FactsReading`]): when it was taken, each call it
+/// names and its held programs, or `null` for no reading. A tape from a build before the held
+/// programs were read holds none (`held` absent), and a reading that did not read them writes
+/// none.
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 struct FactsWire {
     as_of_ms: i64,
     no_progress: Vec<CallWire>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    held: Option<HeldWire>,
+}
+
+/// The held programs as a tape holds them ([`HeldReading`]): when the claim was proved, and each
+/// program's pid, actual exec version where recorded, and how long it has been held.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct HeldWire {
+    as_of_ms: i64,
+    programs: Vec<HeldCallWire>,
+}
+
+/// One held program as a tape holds it ([`HeldCall`]).
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct HeldCallWire {
+    pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exec_version: Option<u64>,
+    held_ms: u64,
 }
 
 /// A DOOR NEWER THAN THE TAPE: a recording build with no `host.facts` asked nothing there and
@@ -801,6 +854,20 @@ impl TapeValue for Option<FactsReading> {
         json(&self.as_ref().map(|r| FactsWire {
             as_of_ms: r.as_of_ms,
             no_progress: r.no_progress.iter().map(call_wire).collect(),
+            held: r.held.as_ref().map(|h| {
+                HeldWire {
+                    as_of_ms: h.as_of_ms,
+                    programs: h
+                        .programs
+                        .iter()
+                        .map(|p| HeldCallWire {
+                            pid: p.pid,
+                            exec_version: p.exec_version,
+                            held_ms: p.held_ms,
+                        })
+                        .collect(),
+                }
+            }),
         }))
     }
 
@@ -808,6 +875,18 @@ impl TapeValue for Option<FactsReading> {
         Ok(of_json::<Option<FactsWire>>(bytes)?.map(|w| FactsReading {
             as_of_ms: w.as_of_ms,
             no_progress: w.no_progress.into_iter().map(call_of).collect(),
+            held: w.held.map(|h| HeldReading {
+                as_of_ms: h.as_of_ms,
+                programs: h
+                    .programs
+                    .into_iter()
+                    .map(|p| HeldCall {
+                        pid: p.pid,
+                        exec_version: p.exec_version,
+                        held_ms: p.held_ms,
+                    })
+                    .collect(),
+            }),
         }))
     }
 
@@ -1302,6 +1381,14 @@ struct RepoWorkWire {
     unlanded: usize,
     #[serde(default)]
     main_ref: String,
+    #[serde(default)]
+    sub_unpushed: usize,
+    #[serde(default)]
+    subs: Vec<String>,
+    #[serde(default)]
+    parked: usize,
+    #[serde(default)]
+    parked_on: Vec<String>,
     paths: Vec<String>,
     /// The work's state ([`RepoWork::state`]); a tape recorded before the
     /// probe read it holds none: not read.
@@ -1317,6 +1404,17 @@ struct CleanAtWire {
     #[serde(default)]
     main_ref: String,
     remote: bool,
+    /// `HEAD`'s branch ([`CleanAt::branch`], slice 9c); a tape recorded before it holds none,
+    /// and one with an empty branch writes none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    branch: String,
+}
+
+/// [`RepoRead::Gone`] on a tape: `{"gone":"<folder>"}`, which neither a [`CheckedWire`] (no
+/// `at`) nor a [`RepoWorkWire`] (no `repo` at its top) reads (slice 9c).
+#[derive(Serialize, Deserialize)]
+struct GoneWire {
+    gone: String,
 }
 
 /// [`RepoRead::Checked`] on a tape: `{"at":{…}}`, which no [`RepoWorkWire`]
@@ -1328,8 +1426,8 @@ struct CheckedWire {
 }
 
 /// The word a tape holds for [`RepoRead::Unread`]; [`RepoRead::Clean`] is
-/// `null`, [`RepoRead::Checked`] its [`CheckedWire`] and [`RepoRead::Found`]
-/// its [`RepoWorkWire`]. A tape recorded before the probe could read as
+/// `null`, [`RepoRead::Checked`] its [`CheckedWire`], [`RepoRead::Gone`] its
+/// [`GoneWire`] and [`RepoRead::Found`] its [`RepoWorkWire`]. A tape recorded before the probe could read as
 /// unread or name what it checked holds `null` for every clean reading, and
 /// reads back [`RepoRead::Clean`], which every decision reads as a checked one.
 const REPO_UNREAD: &str = "unread";
@@ -1345,6 +1443,7 @@ impl TapeValue for RepoRead {
                     head,
                     main_ref,
                     remote,
+                    branch,
                 } = at;
                 return json(&CheckedWire {
                     at: CleanAtWire {
@@ -1352,9 +1451,11 @@ impl TapeValue for RepoRead {
                         head: head.clone(),
                         main_ref: main_ref.clone(),
                         remote: *remote,
+                        branch: branch.clone(),
                     },
                 });
             }
+            RepoRead::Gone(gone) => return json(&GoneWire { gone: gone.clone() }),
             RepoRead::Found(w) => Some(w),
         };
         json(&found.map(|w| {
@@ -1366,6 +1467,10 @@ impl TapeValue for RepoRead {
                 unpushed,
                 unlanded,
                 main_ref,
+                sub_unpushed,
+                subs,
+                parked,
+                parked_on,
                 paths,
                 state,
             } = w;
@@ -1377,6 +1482,10 @@ impl TapeValue for RepoRead {
                 unpushed: *unpushed,
                 unlanded: *unlanded,
                 main_ref: main_ref.clone(),
+                sub_unpushed: *sub_unpushed,
+                subs: subs.clone(),
+                parked: *parked,
+                parked_on: parked_on.clone(),
                 paths: paths.clone(),
                 state: *state,
             }
@@ -1393,7 +1502,11 @@ impl TapeValue for RepoRead {
                 head: at.head,
                 main_ref: at.main_ref,
                 remote: at.remote,
+                branch: at.branch,
             }));
+        }
+        if let Ok(GoneWire { gone }) = of_json::<GoneWire>(bytes) {
+            return Ok(RepoRead::Gone(gone));
         }
         Ok(RepoRead::of_found(
             of_json::<Option<RepoWorkWire>>(bytes)?.map(|w| RepoWork {
@@ -1404,6 +1517,10 @@ impl TapeValue for RepoRead {
                 unpushed: w.unpushed,
                 unlanded: w.unlanded,
                 main_ref: w.main_ref,
+                sub_unpushed: w.sub_unpushed,
+                subs: w.subs,
+                parked: w.parked,
+                parked_on: w.parked_on,
                 paths: w.paths,
                 state: w.state,
             }),

@@ -3,8 +3,6 @@
 
 //! CLI argument parsing for `aterm-release`.
 
-use std::process::Command;
-
 use crate::ledger::{self, Error};
 use crate::{publish, verify};
 
@@ -225,7 +223,13 @@ USAGE
                            room, a line a minute naming the need and the
                            holders, unless --admit now), is ended OVER-BUDGET at
                            --crate-budget (default 21600 s), and is held to
-                           crates/aterm-release/trust/floors.tsv. A check starts
+                           crates/aterm-release/trust/floors.tsv. While a trustd
+                           of another build serves the per-user socket, the run
+                           waits with no deadline for it to retire, naming it
+                           and its leases as the wait starts and once a minute
+                           (--no-wait is COULD NOT RUN at once instead); a check
+                           whose trustd went away under it is COULD NOT RUN,
+                           never a verdict on its code. A check starts
                            once the capacity ledger admits its memory
                            claim (its library's last recorded peak and a fifth
                            more, at least 1 GiB more; with none recorded
@@ -266,7 +270,10 @@ USAGE
                            the proof checks cancelled beyond that run's count
                            (trust/backstops.tsv). No floor is set or raised
                            from a starved run the machine can be credited
-                           with. Every run also prints
+                           with. A shortfall within the prover's run-to-run
+                           spread (2% of a floor it recorded) is undecided,
+                           never RATCHET-REGRESSION, unless the run names an
+                           obligation it lost. Every run also prints
                            the D27 gate's proved (calculus) counter from each
                            check's trust.obligations.v1 record (0, and
                            `ungraded`, from a prover that states no grade), held
@@ -535,9 +542,11 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
             )?;
             let build = values
                 .get("--build-number")
-                .ok_or("linux-build needs --build-number")?
-                .parse::<u64>()
-                .map_err(|_| "linux-build requires a positive u64 build number")?;
+                .ok_or("linux-build needs --build-number")?;
+            let build = (!build.is_empty() && build.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| build.parse::<u64>().ok())
+                .flatten()
+                .ok_or("linux-build requires a positive u64 build number")?;
             let commit = values
                 .get("--commit")
                 .ok_or("linux-build needs --commit")?
@@ -700,9 +709,10 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
                 "yank needs the bad release's build number: targo --unverified ship yank <build> \
                  --release-credentials <profile.toml> --mac-only|--linux-artifacts DIRECTORY",
             )?;
-            let build: u64 = build
-                .parse()
-                .map_err(|_| format!("yank: {build:?} is not a build number (u64)"))?;
+            let build: u64 = (!build.is_empty() && build.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| build.parse().ok())
+                .flatten()
+                .ok_or_else(|| format!("yank: {build:?} is not a build number (u64)"))?;
             let mut opts = verify::YankOptions::default();
             while let Some(flag) = it.next() {
                 match flag {
@@ -944,9 +954,10 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
             }
             "--min-build" => {
                 let n = it.next().ok_or("--min-build needs a number")?;
-                let n: u64 = n
-                    .parse()
-                    .map_err(|_| format!("--min-build: {n:?} is not a u64"))?;
+                let n: u64 = (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                    .then(|| n.parse().ok())
+                    .flatten()
+                    .ok_or_else(|| format!("--min-build: {n:?} is not a u64"))?;
                 opts.min_build = Some(n);
             }
             other => return Err(format!("unknown cut flag {other:?}")),
@@ -1121,7 +1132,7 @@ fn own_code(cmd: &Cmd) -> Option<i32> {
 }
 
 fn repo_root() -> ledger::Result<std::path::PathBuf> {
-    let out = Command::new(aterm_uds::os_path!("git"))
+    let out = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"))
         .args(["rev-parse", "--show-toplevel"])
         .output()
         .map_err(|e| Error::new(format!("failed to run git rev-parse --show-toplevel: {e}")))?;

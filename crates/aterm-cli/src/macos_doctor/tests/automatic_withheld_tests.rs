@@ -6,7 +6,13 @@ use super::*;
 fn spent_init_follow_ups(root: &Path) -> Withholding {
     use aterm_machines::init::Held as _;
 
-    let hold = init_hold_at(root, true, &|_| panic!("uncontended init hold")).unwrap();
+    let hold = init_hold_at(
+        root,
+        aterm_machines::init::Pass::Whole { clones: true },
+        false,
+        Some(&|_| panic!("uncontended init hold")),
+    )
+    .unwrap();
     hold.withheld(&[WIDGETS.into()]).unwrap();
     drop(hold); // The raw Desktop lane was interrupted before it verified.
     let snapshot = initial::initial_setup_snapshot_at(root, Default::default()).unwrap();
@@ -39,7 +45,7 @@ fn spent_init_follow_ups(root: &Path) -> Withholding {
         );
         assert!(!doctor.notification_center_cleared());
         if attempt == 1 {
-            doctor.wait(RETRY_AFTER);
+            doctor.wait(SECOND_TRY_AFTER);
         }
     }
     let owed = load_withheld(root).unwrap();
@@ -129,7 +135,7 @@ fn automatic_withheld_readable_debt_holds_the_same_admitted_run() {
     let row = report.rows.iter().find(|row| row.name == WIDGETS).unwrap();
     assert_eq!(
         (row.status.as_str(), row.detail.as_str()),
-        ("blocked", WAITING)
+        ("blocked", HELD)
     );
     assert_eq!(doctor.notification_center_writes(), 4);
     assert_eq!(

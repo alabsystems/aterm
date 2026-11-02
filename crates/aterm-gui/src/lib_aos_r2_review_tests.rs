@@ -17,16 +17,17 @@ use aterm_session::sink::SinkWriter;
 use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
 
 use super::aos_repair_tests::{
-    KEY_GAP, WID, leave_prompt, momentum_app, status, stranded, type_keys,
+    KEY_GAP, WID, detached_for, leave_prompt, momentum_app, status, stranded, type_keys,
 };
 #[cfg(unix)]
-use super::aos_repair_tests::{exported_log, momentum_app_on, sign_prompt};
+use super::aos_repair_tests::{exported_log, glyph, momentum_app_on, press, sign_prompt};
 use crate::App;
+use crate::aos_host::echo::ECHO_PROOF_BOUND;
 use crate::aos_host::{
     NO_ECHO_KEY, RAW_KEY, SECURE_ENTRY, WATCH_SPAWN_REFUSED, WATCH_THREAD, Worked, key_privacy,
 };
 #[cfg(unix)]
-use crate::input::{InputEvent, PasteFraming, Source};
+use crate::input::{InputEvent, PasteFraming};
 #[cfg(unix)]
 use crate::scripted_redraw_fixture::{feed, scripted_app_with_sink};
 
@@ -38,19 +39,10 @@ fn keys(log: &[MomentumEvent]) -> usize {
         .count()
 }
 
-/// Whether `app`'s timeline lists a detach for `why` (spaces as underscores).
-fn detached_for(app: &App, why: &str) -> bool {
-    app.aos_ls_now()
-        .iter()
-        .any(|l| l.starts_with("slot=0 row=") && l.ends_with(&format!(" detached why={why}")))
-}
-
-/// Dispatches `ev` at `at` as the person's.
-#[cfg(unix)]
-fn press(app: &mut App, ev: InputEvent, at: Instant) {
-    crate::app_input::pin_input_clock(Some(at));
-    let _ = app.input(WID, ev, Source::Human);
-    crate::app_input::pin_input_clock(None);
+/// A frame once a raw key typed at `first` is past its echo's bound: a key whose echo was never
+/// proven stops the recording there.
+fn past_the_bound(app: &mut App, first: Instant) {
+    app.redraw_window_at(WID, first + ECHO_PROOF_BOUND);
 }
 
 /// A plain Enter press.
@@ -188,7 +180,7 @@ fn a_key_is_recorded_only_where_the_tty_or_an_open_prompt_shows_it() {
         ),
         ("raw at a prompt", RAW, true, None),
         (
-            "raw in a program (ssh, Node, sudo pwfeedback)",
+            "raw in a program, identical echoes ('aaa')",
             RAW,
             false,
             Some("raw_key"),
@@ -204,6 +196,10 @@ fn a_key_is_recorded_only_where_the_tty_or_an_open_prompt_shows_it() {
         app.aos_attach_at(MomentumCode::Shipped, t0)
             .expect("attaches");
         let _ = type_keys(&mut app, t0 + KEY_GAP, 3);
+        if detach == Some("raw_key") {
+            assert!(status(&app).attached, "{name}: held for the echo's proof");
+            past_the_bound(&mut app, t0 + KEY_GAP);
+        }
         match detach {
             None => {
                 assert!(status(&app).attached, "{name}: still recording");
@@ -215,6 +211,25 @@ fn a_key_is_recorded_only_where_the_tty_or_an_open_prompt_shows_it() {
             }
         }
     }
+
+    let pty = Pty::new(RAW);
+    let t0 = Instant::now();
+    let mut app = pty.app();
+    app.redraw_window_at(WID, t0);
+    leave_prompt(&app);
+    app.aos_attach_at(MomentumCode::Shipped, t0)
+        .expect("attaches");
+    for (i, c) in ['l', 's'].into_iter().enumerate() {
+        let at = t0 + KEY_GAP * (u32::try_from(i).expect("two") + 1);
+        press(&mut app, glyph(c), at);
+        feed(&app, c.to_string().as_bytes());
+        app.redraw_window_at(WID, at + Duration::from_millis(7));
+    }
+    assert!(
+        status(&app).attached,
+        "raw in a program, its own echo proven in place"
+    );
+    assert_eq!(keys(&exported_log(&app, t0)), 2);
 }
 
 #[test]
@@ -226,6 +241,8 @@ fn a_key_to_a_tty_whose_mode_is_unreadable_and_no_prompt_detaches() {
     app.aos_attach_at(MomentumCode::Shipped, t0)
         .expect("attaches");
     let _ = type_keys(&mut app, t0 + KEY_GAP, 1);
+    assert!(status(&app).attached, "held for its echo's proof");
+    past_the_bound(&mut app, t0 + KEY_GAP);
     assert!(!status(&app).attached);
     assert!(detached_for(&app, "raw_key"), "{:?}", app.aos_ls_now());
 }
@@ -248,6 +265,7 @@ fn after_enter_or_a_pasted_line_the_prompt_no_longer_vouches_for_a_raw_key() {
     press(&mut app, enter(), at + KEY_GAP);
     assert!(status(&app).attached, "Enter itself logs nothing private");
     let at = type_keys(&mut app, at + KEY_GAP * 2, 1);
+    past_the_bound(&mut app, at);
     assert!(
         !status(&app).attached,
         "a key after the line went before the shell's next mark detached"
@@ -275,7 +293,12 @@ fn after_enter_or_a_pasted_line_the_prompt_no_longer_vouches_for_a_raw_key() {
     );
     feed(&app, b"\x1b[?2004l");
     press(&mut app, line("ls\r"), at + KEY_GAP);
-    let _ = type_keys(&mut app, at + KEY_GAP * 2, 1);
+    let at = type_keys(&mut app, at + KEY_GAP * 2, 1);
+    // The pastes, and a key typed while one is queued, reach the PTY on the egress writer, which
+    // locks the terminal; a frame whose read finds that lock busy settles nothing (the watcher
+    // refutes later), so the frame past the bound waits for the writer to finish.
+    crate::app_input::paste_order::await_drain_for_test(&pty.sink);
+    past_the_bound(&mut app, at);
     assert!(
         !status(&app).attached,
         "a key after an unbracketed pasted line detached"
@@ -362,9 +385,12 @@ fn a_watcher_that_cannot_start_lists_each_segment_unjudged_and_claims_no_detach(
         .expect("repairs");
         let (post, worked) = channel();
         WATCH_SPAWN_REFUSED.with(|r| r.set(refused));
-        app.aos_watch_via(Some(move |w: Worked| {
-            let _ = post.send((std::thread::current().name().map(str::to_owned), w));
-        }));
+        app.aos_watch_via(
+            Some(move |w: Worked| {
+                let _ = post.send((std::thread::current().name().map(str::to_owned), w));
+            }),
+            parked.at + Duration::from_millis(600),
+        );
         WATCH_SPAWN_REFUSED.with(|r| r.set(false));
         if !refused {
             let (thread, w) = worked

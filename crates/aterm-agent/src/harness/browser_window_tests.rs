@@ -343,6 +343,17 @@ fn aterms_own_lock_holds_a_profile_a_headless_shell_has_open() {
     assert_eq!(profile_holder(&profile), None, "released on drop");
     let again = ProfileLock::claim(&profile).expect("free again");
     drop(again);
+    std::fs::remove_file(profile.join(PROFILE_LOCK_FILE)).expect("rm lock");
+    let fifo = profile.join(PROFILE_LOCK_FILE);
+    let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).expect("fifo path");
+    // SAFETY: `c_fifo` is a valid NUL-terminated path inside our owned scratch directory.
+    assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+    assert_eq!(profile_holder(&profile), None, "FIFO lock does not block");
+    assert!(
+        matches!(ProfileLock::claim(&profile), Err(Refusal::Unlockable(_))),
+        "FIFO lock must be refused without blocking"
+    );
+    std::fs::remove_file(&fifo).expect("rm fifo");
 
     let here = host_name().expect("this machine's name");
     lock(&profile, &format!("{here}-{own}"));
@@ -421,7 +432,10 @@ fn a_holders_words_say_what_to_do_and_another_machines_lock_names_its_file() {
     .words(profile);
     assert!(
         far.contains("pid 7 on other-desk.example")
-            && far.contains(&format!("remove {}/SingletonLock", profile.display()))
+            && far.contains(&format!(
+                "remove {}",
+                profile.join("SingletonLock").display()
+            ))
             && !far.contains("quit it"),
         "{far}"
     );

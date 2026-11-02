@@ -729,7 +729,7 @@ fn a_free_writer_lock_needs_no_read_of_unrelated_process_descriptors() {
     std::fs::write(&lock, b"").expect("writer lock");
     let profile = "(version 1)(allow default)(deny process-info-pidinfo)";
     let out = aterm_uds::deadline::output_until(
-        aterm_uds::spawnfd::command("/usr/bin/sandbox-exec")
+        aterm_uds::spawnfd::command(crate::test_program::kept("/usr/bin/sandbox-exec"))
             .args(["-p", profile])
             .arg(std::env::current_exe().expect("the test binary"))
             .args(["--exact", NAME, "--nocapture", "--test-threads=1"])

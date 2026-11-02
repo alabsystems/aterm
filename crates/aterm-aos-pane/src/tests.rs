@@ -224,6 +224,81 @@ fn a_trace_exported_and_imported_replays_to_the_same_digests() {
     let mut moved = read.clone();
     moved.head_chain = Digest([1; 32]);
     assert_eq!(moved.check(later, BUILD).unwrap_err().word(), "chain");
+
+    let schema = PaneSchema::new(later);
+    let clean_cp = aterm_aos::checkpoint::Checkpoint::decode(&read.checkpoint).unwrap();
+    let start_state = clean_cp.restore(&schema, &read.identity).unwrap();
+    let mut bad_prov = clean_cp.provenance().clone();
+    bad_prov.input_cursor = 1;
+    let bad_cp = aterm_aos::checkpoint::Checkpoint::capture(&schema, &start_state, bad_prov);
+    let mut forged_prov = read.clone();
+    forged_prov.checkpoint = bad_cp.encode().unwrap();
+    assert_eq!(
+        forged_prov.check(later, BUILD).unwrap_err().word(),
+        "checkpoint"
+    );
+
+    let mut wrong_code_prov = clean_cp.provenance().clone();
+    wrong_code_prov.identity = pane_identity(&PrebuiltPane::new(PaneCode::DemoClockSkew, BUILD));
+    let wrong_code_cp =
+        aterm_aos::checkpoint::Checkpoint::capture(&schema, &start_state, wrong_code_prov);
+    let mut forged_code = read.clone();
+    forged_code.checkpoint = wrong_code_cp.encode().unwrap();
+    assert_eq!(
+        forged_code.check(later, BUILD).unwrap_err().word(),
+        "restore"
+    );
+
+    let mut shifted_log = aterm_aos::log::EventLog::new(
+        aterm_aos::log::LogHeader {
+            identity: read.identity.clone(),
+            log_epoch: 0,
+            first_cursor: 1,
+            ancestor: clean_cp.digest(),
+        },
+        super::trace::PANE_MAX_EVENTS,
+    );
+    for input in rec.inputs() {
+        shifted_log.push(input.clone()).unwrap();
+    }
+    let mut forged_cursor = read.clone();
+    forged_cursor.log = shifted_log.encode(&schema).unwrap();
+    assert_eq!(forged_cursor.check(later, BUILD).unwrap_err().word(), "log");
+
+    let mut broken_log = aterm_aos::log::EventLog::new(
+        aterm_aos::log::LogHeader {
+            identity: read.identity.clone(),
+            log_epoch: 0,
+            first_cursor: 0,
+            ancestor: clean_cp.digest(),
+        },
+        super::trace::PANE_MAX_EVENTS,
+    );
+    for input in rec.inputs() {
+        broken_log.push(input.clone()).unwrap();
+    }
+    broken_log.mark_broken("dropped slice");
+    let mut forged_broken = read.clone();
+    forged_broken.log = broken_log.encode(&schema).unwrap();
+    assert_eq!(forged_broken.check(later, BUILD).unwrap_err().word(), "log");
+
+    let mut forged_seq = read.clone();
+    forged_seq.effects[0].seq = 9;
+    assert_eq!(
+        PaneTrace::decode(&forged_seq.encode()).unwrap_err(),
+        PaneTraceFault::Wire(aterm_aos::wire::WireFault::NonCanonical {
+            field: "trace.effect.seq",
+        })
+    );
+
+    let mut forged_result = read.clone();
+    forged_result.effects[0].result = vec![1];
+    assert_eq!(
+        PaneTrace::decode(&forged_result.encode()).unwrap_err(),
+        PaneTraceFault::Wire(aterm_aos::wire::WireFault::NonCanonical {
+            field: "trace.effect.result",
+        })
+    );
 }
 
 fn law(v: &Verdict) -> Option<(&'static str, u64)> {

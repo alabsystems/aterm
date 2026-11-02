@@ -275,14 +275,16 @@ impl StepFailure {
 
 #[derive(Clone, Debug)]
 pub struct GrantedDocument {
+    pub directory: Option<amacs::store::DirectoryListing>,
     pub grant: DocumentGrant,
     pub text: String,
     pub observed: ObservedFileVersion,
 }
 
-/// One local file admitted but not yet granted.
+/// One local file or directory admitted but not yet granted.
 #[derive(Clone, Debug)]
 pub struct AdmittedDocument {
+    pub directory: Option<amacs::store::DirectoryListing>,
     pub(crate) canonical_uri: String,
     pub(crate) path: PathBuf,
     target: AtomicFileTarget,
@@ -291,6 +293,11 @@ pub struct AdmittedDocument {
 }
 
 impl AdmittedDocument {
+    /// The canonical identity resolved by admission, before minting a grant.
+    pub fn canonical_uri(&self) -> &str {
+        &self.canonical_uri
+    }
+
     /// Whether no file exists yet: admitted with [`AdmitOptions::allow_missing`] as an empty text, which the first save creates.
     pub const fn is_missing(&self) -> bool {
         !self.observed.exists
@@ -350,6 +357,20 @@ pub fn admit_local_file_opts(
     options: AdmitOptions,
 ) -> Result<AdmittedDocument, DocumentHostError> {
     let requested = file_uri_path(uri)?;
+    if fs::symlink_metadata(&requested).is_ok_and(|metadata| metadata.is_dir()) {
+        let target = resolve_atomic_target(&requested, options.allow_config_symlinks)?;
+        let path = target.target_path.clone();
+        let directory = read_directory(&path, options.limit)?;
+        let observed = ObservedFileVersion::observed(directory.text.as_bytes(), None, None);
+        return Ok(AdmittedDocument {
+            canonical_uri: path_to_file_uri(&path)?,
+            path,
+            target,
+            text: directory.text.clone(),
+            observed,
+            directory: Some(directory),
+        });
+    }
     let contents = read_atomic_file_with_config_symlinks(
         &requested,
         options.limit,
@@ -366,12 +387,75 @@ pub fn admit_local_file_opts(
     let canonical_uri = path_to_file_uri(&path)?;
     let decoded = decode_utf8(contents.bytes)?;
     Ok(AdmittedDocument {
+        directory: None,
         canonical_uri,
         path,
         target: contents.baseline.target,
         text: decoded.text,
         observed: contents.baseline.observed.with_encoding(decoded.encoding),
     })
+}
+
+/// Read a bounded, sorted directory listing, keeping exact paths apart from labels.
+pub fn read_directory(
+    path: &Path,
+    limit: usize,
+) -> Result<amacs::store::DirectoryListing, DocumentHostError> {
+    let mut entries = Vec::new();
+    let mut size = 0usize;
+    for entry in fs::read_dir(path).map_err(|error| open_read_error(path, error))? {
+        let entry = entry.map_err(|error| open_read_error(path, error))?;
+        let name = entry.file_name();
+        size = size.saturating_add(name.len()).saturating_add(128);
+        if size > limit {
+            return Err(DocumentHostError::TooLarge { limit });
+        }
+        let kind = entry
+            .file_type()
+            .map_err(|error| open_read_error(&entry.path(), error))?;
+        entries.push((!kind.is_dir(), name, entry.path(), kind));
+    }
+    entries.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    let mut listing = amacs::store::DirectoryListing {
+        text: format!(
+            "{}\nRET/f: open   n/p: move   ^: parent   g: refresh   q: close\n\n",
+            path.to_string_lossy().escape_debug()
+        ),
+        parent: path.parent().map(path_to_file_uri).transpose()?,
+        entries: Vec::new(),
+    };
+    if let Some(parent) = &listing.parent {
+        let start = listing.text.len();
+        listing.text.push_str("  ../\n");
+        listing
+            .entries
+            .push((start..listing.text.len(), parent.clone()));
+    }
+    for (_, name, entry_path, kind) in entries {
+        let start = listing.text.len();
+        listing.text.push_str("  ");
+        for ch in name.to_string_lossy().chars() {
+            if ch.is_control() {
+                listing.text.extend(ch.escape_default());
+            } else {
+                listing.text.push(ch);
+            }
+        }
+        if kind.is_dir() {
+            listing.text.push('/');
+        }
+        if kind.is_symlink() {
+            listing.text.push('@');
+        }
+        listing.text.push('\n');
+        listing
+            .entries
+            .push((start..listing.text.len(), path_to_file_uri(&entry_path)?));
+    }
+    if listing.text.len() > limit {
+        return Err(DocumentHostError::TooLarge { limit });
+    }
+    Ok(listing)
 }
 
 /// Verify that `path`'s parent directory exists ([`Directories::Existing`]).
@@ -890,12 +974,18 @@ impl DocumentGrantStore {
         access: GrantAccess,
     ) -> Result<GrantedDocument, DocumentHostError> {
         let AdmittedDocument {
+            directory,
             canonical_uri,
             path,
             target: admitted_target,
             text,
             observed,
         } = admitted;
+        let access = if directory.is_some() {
+            GrantAccess::ReadOnly
+        } else {
+            access
+        };
         let grant = if let Some(id) = self.by_uri.get(&canonical_uri).copied() {
             let grant = self
                 .grants
@@ -906,7 +996,11 @@ impl DocumentGrantStore {
                 return Err(DocumentHostError::TargetRetargeted);
             }
             grant.target.retain_logical_binding(&admitted_target);
-            grant.access = grant.access.merged(access);
+            grant.access = if directory.is_some() {
+                GrantAccess::ReadOnly
+            } else {
+                grant.access.merged(access)
+            };
             grant.clone()
         } else {
             let raw = self.next_id.max(1);
@@ -924,6 +1018,7 @@ impl DocumentGrantStore {
             grant
         };
         Ok(GrantedDocument {
+            directory,
             grant,
             text,
             observed,
@@ -943,6 +1038,20 @@ impl DocumentGrantStore {
 
     pub fn cloned_grant(&self, id: DocumentGrantId) -> Option<DocumentGrant> {
         self.grants.get(&id).cloned()
+    }
+
+    /// Refresh a directory through its original path binding.
+    pub fn refresh_directory(
+        &self,
+        id: DocumentGrantId,
+        limit: usize,
+    ) -> Result<amacs::store::DirectoryListing, DocumentHostError> {
+        let grant = self
+            .grants
+            .get(&id)
+            .ok_or(DocumentHostError::UnknownGrant)?;
+        grant.validate_current_binding()?;
+        read_directory(&grant.path, limit)
     }
 
     #[cfg(any(test, debug_assertions, feature = "test-support"))]
@@ -993,6 +1102,7 @@ impl DocumentGrantStore {
         let contents = read_bound_file(&grant.target, limit, allow_missing)?;
         let decoded = decode_utf8(contents.bytes)?;
         Ok(GrantedDocument {
+            directory: None,
             grant,
             text: decoded.text,
             observed: contents.baseline.observed.with_encoding(decoded.encoding),
@@ -1215,10 +1325,22 @@ fn bounded_read(
     Ok((bytes, after))
 }
 
+/// What a read holds the file it opened to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Admit {
+    /// Any regular file.
+    Any,
+    /// `aterm.toml`, by the one rule every reader of it holds
+    /// ([`aterm_types::dirs::aterm_config_refusal`]): this user's or root's, with no group or
+    /// other write bit.
+    AtermConfig,
+}
+
 fn read_stable_file(
     path: &Path,
     limit: usize,
     allow_missing: bool,
+    admit: Admit,
 ) -> Result<(Vec<u8>, ObservedFileVersion), DocumentHostError> {
     let RegularReadHandle::Open { mut file, metadata } = open_regular_read(path)? else {
         if allow_missing {
@@ -1230,6 +1352,18 @@ fn read_stable_file(
             message: format!("{}{MISSING_SUFFIX}", path.display()),
         });
     };
+    #[cfg(unix)]
+    if admit == Admit::AtermConfig
+        && let Some(why) = aterm_types::dirs::aterm_config_file_refusal(&metadata)
+    {
+        return Err(DocumentHostError::Io {
+            stage: AtomicSaveStage::Preflight,
+            kind: Some(std::io::ErrorKind::PermissionDenied),
+            message: format!("{}: {why}", path.display()),
+        });
+    }
+    #[cfg(not(unix))]
+    let _ = admit;
     let (bytes, after) = bounded_read(path, &mut file, &metadata, limit)?;
     if bytes.len() > limit {
         return Err(DocumentHostError::TooLarge { limit });
@@ -1251,7 +1385,10 @@ pub fn read_atomic_file(
     read_atomic_file_with_config_symlinks(logical_path, limit, allow_missing, false)
 }
 
-/// Manual/config-only counterpart of [`read_atomic_file`].
+/// Manual/config-only counterpart of [`read_atomic_file`]: `aterm.toml`, a symlink to it
+/// followed, read only from a file this user or root owns that no other user can write, by the
+/// rule every reader of it holds ([`aterm_types::dirs::aterm_config_refusal`]: the `[swarm]`
+/// switch and Commons' policy read it so too).
 pub fn read_config_atomic_file(
     logical_path: &Path,
     limit: usize,
@@ -1267,7 +1404,13 @@ fn read_atomic_file_with_config_symlinks(
     allow_config_symlinks: bool,
 ) -> Result<AtomicFileContents, DocumentHostError> {
     let target = resolve_atomic_target(logical_path, allow_config_symlinks)?;
-    let (bytes, observed) = read_stable_file(target.target_path(), limit, allow_missing)?;
+    // The config reads are `aterm.toml`'s, held to the rule every reader of it holds.
+    let admit = if allow_config_symlinks {
+        Admit::AtermConfig
+    } else {
+        Admit::Any
+    };
+    let (bytes, observed) = read_stable_file(target.target_path(), limit, allow_missing, admit)?;
     validate_atomic_target(&target)?;
     Ok(AtomicFileContents {
         baseline: AtomicFileBaseline { target, observed },
@@ -1281,7 +1424,8 @@ fn read_bound_file(
     allow_missing: bool,
 ) -> Result<AtomicFileContents, DocumentHostError> {
     validate_atomic_target(target)?;
-    let (bytes, observed) = read_stable_file(target.target_path(), limit, allow_missing)?;
+    let (bytes, observed) =
+        read_stable_file(target.target_path(), limit, allow_missing, Admit::Any)?;
     validate_atomic_target(target)?;
     Ok(AtomicFileContents {
         baseline: AtomicFileBaseline {
@@ -1820,6 +1964,21 @@ enum Directories {
     Existing,
 }
 
+impl Directories {
+    /// The mode a commit's temporary is created with, which the umask narrows; a target that
+    /// exists then gives the temporary its own mode. A config commit's ([`Self::Create`]) is
+    /// born with no group or other write bit, so a missing `aterm.toml` it makes passes the rule
+    /// every reader of it holds ([`aterm_types::dirs::aterm_config_refusal`]) under any umask,
+    /// a user-private-group login's `002` included, where `0o666` would make it `664` and every
+    /// later read refuse it. A document's save keeps `0o666`: the umask decides, as an editor's.
+    const fn new_file_mode(self) -> u32 {
+        match self {
+            Self::Create => 0o644,
+            Self::Existing => 0o666,
+        }
+    }
+}
+
 fn write_lock_busy() -> String {
     "save target is busy; retry Save after the other writer finishes".to_string()
 }
@@ -2043,7 +2202,7 @@ fn commit_atomic_bytes_with_seed(
     };
     let name = path.file_name().unwrap_or_else(|| OsStr::new("document"));
 
-    let deadline = std::time::Instant::now() + PREFLIGHT_RETRY_BUDGET;
+    let deadline = std::time::Instant::now().checked_add(PREFLIGHT_RETRY_BUDGET);
     let mut backoff = std::time::Duration::from_millis(1);
     let (_lock_file, baseline_limit) = loop {
         match lock_and_verify_target(baseline, directories) {
@@ -2058,7 +2217,9 @@ fn commit_atomic_bytes_with_seed(
                 ) {
                     return verdict;
                 }
-                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                let remaining = deadline.map_or(PREFLIGHT_RETRY_BUDGET, |deadline| {
+                    deadline.saturating_duration_since(std::time::Instant::now())
+                });
                 if remaining.is_zero() {
                     return verdict;
                 }
@@ -2070,10 +2231,11 @@ fn commit_atomic_bytes_with_seed(
         }
     };
 
-    let (temporary, mut file) = match create_unique_temporary(parent, name, seed) {
-        Ok(created) => created,
-        Err(failure) => return atomic_failed(AtomicSaveStage::CreateTemporary, failure),
-    };
+    let (temporary, mut file) =
+        match create_unique_temporary(parent, name, seed, directories.new_file_mode()) {
+            Ok(created) => created,
+            Err(failure) => return atomic_failed(AtomicSaveStage::CreateTemporary, failure),
+        };
     let result: Result<AtomicSaveProof, AtomicCommitResult> = (|| {
         if let Ok(metadata) = fs::metadata(path) {
             fs::set_permissions(&temporary, metadata.permissions()).map_err(|error| {
@@ -2195,10 +2357,13 @@ fn commit_atomic_bytes_with_seed(
     }
 }
 
+/// A fresh sibling temporary for `name` in `parent`, created with `mode` (Unix: narrowed by the
+/// umask; elsewhere unused).
 fn create_unique_temporary(
     parent: &Path,
     name: &OsStr,
     seed: u64,
+    mode: u32,
 ) -> Result<(PathBuf, File), StepFailure> {
     for attempt in 0_u64..64 {
         let temporary = parent.join(format!(
@@ -2210,6 +2375,10 @@ fn create_unique_temporary(
         ));
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, mode);
+        #[cfg(not(unix))]
+        let _ = mode;
         match options.open(&temporary) {
             Ok(file) => return Ok((temporary, file)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -2374,6 +2543,58 @@ mod tests {
     use super::*;
     use crate::io::{SaveReducer, SaveReduction};
 
+    #[test]
+    fn directory_listing_is_sorted_bounded_and_granted_read_only() {
+        let dir = aterm_tempfile::TempDir::new().unwrap();
+        let path = fs::canonicalize(dir.path()).unwrap();
+        fs::write(path.join("z.txt"), "z").unwrap();
+        fs::write(path.join(".hidden"), "h").unwrap();
+        fs::create_dir(path.join("folder")).unwrap();
+        let uri = path_to_file_uri(&path).unwrap();
+        let admitted = admit_local_file_opts(&uri, AdmitOptions::DOCUMENT).unwrap();
+        let mut grants = DocumentGrantStore::new();
+        let granted = grants
+            .grant_admitted(admitted, GrantAccess::ReadWrite)
+            .unwrap();
+        assert_eq!(granted.grant.access, GrantAccess::ReadOnly);
+        let listing = granted.directory.unwrap();
+        assert!(listing.text.find("folder/").unwrap() < listing.text.find(".hidden").unwrap());
+        assert!(listing.text.find(".hidden").unwrap() < listing.text.find("z.txt").unwrap());
+        assert_eq!(listing.entries.len(), 4);
+        assert!(matches!(
+            read_directory(&path, 1),
+            Err(DocumentHostError::TooLarge { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_labels_escape_control_characters_without_changing_targets() {
+        let dir = aterm_tempfile::TempDir::new().unwrap();
+        let path = fs::canonicalize(dir.path()).unwrap();
+        let file = path.join("line\nbreak\tname");
+        fs::write(&file, "content").unwrap();
+        let listing = read_directory(&path, DEFAULT_DOCUMENT_LIMIT).unwrap();
+        assert!(listing.text.contains("line\\nbreak\\tname"));
+        assert_eq!(
+            file_uri_path(&listing.entries.last().unwrap().1).unwrap(),
+            file
+        );
+    }
+
+    /// Make `path` owner-only, as the person's own `aterm.toml` must be: the rule every reader
+    /// of it holds refuses one its group may write, which a plain write leaves under a
+    /// user-private-group login's umask `002` (Ubuntu's default).
+    fn owner_only(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        #[cfg(not(unix))]
+        let _ = path;
+    }
+
     fn unique_file(name: &str, bytes: &[u8]) -> PathBuf {
         let dir = aterm_tempfile::Builder::new()
             .prefix(&format!("aterm-native-document-host-{name}-"))
@@ -2418,6 +2639,7 @@ mod tests {
     #[test]
     fn component_walk_admits_a_process_temporary_root_path() {
         let path = unique_file("temporary-walk", b"walk\n");
+        owner_only(&path);
         let normalized = normalize_process_temp_root(&path).unwrap();
         assert!(logical_symlink_bindings(&normalized).unwrap().is_empty());
         reject_symlink_components(&normalized).unwrap();
@@ -3467,6 +3689,50 @@ mod tests {
         );
     }
 
+    /// `aterm.toml` is read by the one rule the `[swarm]` switch's readers hold: this user's own
+    /// file, or root's (home-manager's read-only store file a symlink names), with no group or
+    /// other write; a document read holds no such rule.
+    /// NEGATIVE CONTROL: read the config with `Admit::Any`: the group-writable file is read.
+    #[cfg(unix)]
+    #[test]
+    fn aterm_toml_reads_hold_the_rule_every_reader_holds() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = unique_file("config-rule", b"[swarm]\nenabled = false\n");
+        owner_only(&path);
+        assert!(
+            read_config_atomic_file(&path, 1024, false).is_ok(),
+            "this user's own"
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o664)).unwrap();
+        assert!(
+            matches!(
+                read_config_atomic_file(&path, 1024, false),
+                Err(DocumentHostError::Io {
+                    kind: Some(std::io::ErrorKind::PermissionDenied),
+                    ..
+                })
+            ),
+            "its group may write it"
+        );
+        assert!(
+            read_atomic_file(&path, 1024, false).is_ok(),
+            "a document read holds no such rule"
+        );
+        let store = Path::new("/private/etc/hosts.equiv");
+        if let Ok(meta) = fs::metadata(store) {
+            use std::os::unix::fs::MetadataExt as _;
+            if meta.uid() == 0 && meta.mode() & 0o022 == 0 {
+                let linked = path.with_file_name("aterm.toml");
+                std::os::unix::fs::symlink(store, &linked).unwrap();
+                assert!(
+                    read_config_atomic_file(&linked, 1024 * 1024, false).is_ok(),
+                    "root's read-only file a symlink names"
+                );
+            }
+        }
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
     #[cfg(unix)]
     #[test]
     fn canonical_final_target_symlink_swap_is_refused_by_the_opened_handle_seam() {
@@ -3479,7 +3745,7 @@ mod tests {
         symlink(&displaced, &path).unwrap();
 
         assert!(matches!(
-            read_stable_file(target.target_path(), 1024, false),
+            read_stable_file(target.target_path(), 1024, false, Admit::Any),
             Err(DocumentHostError::SymlinkComponent { path: rejected, .. })
                 if rejected == target.target_path()
         ));
@@ -3794,6 +4060,8 @@ mod tests {
         let chained_logical = parent_alias.join("chained.toml");
         fs::write(&first, "theme = \"Default\"\n").unwrap();
         fs::write(&second, "theme = \"Nord\"\n").unwrap();
+        owner_only(&first);
+        owner_only(&second);
         symlink("first.toml", &logical).unwrap();
         symlink(&real_parent, &parent_alias).unwrap();
         symlink("../first.toml", &chained_final).unwrap();
@@ -3919,6 +4187,8 @@ mod tests {
         let logical = dir.join("aterm.toml");
         fs::write(&first, "theme = \"Default\"\n").unwrap();
         fs::write(&second, "theme = \"Dracula\"\n").unwrap();
+        owner_only(&first);
+        owner_only(&second);
         symlink("first.toml", &logical).unwrap();
 
         let mut grants = DocumentGrantStore::new();
@@ -3975,6 +4245,7 @@ mod tests {
         let target = real.join("aterm.toml");
         let logical = alias.join("aterm.toml");
         fs::write(&target, "theme = \"Default\"\n").unwrap();
+        owner_only(&target);
         symlink(&real, &alias).unwrap();
 
         let mut grants = DocumentGrantStore::new();

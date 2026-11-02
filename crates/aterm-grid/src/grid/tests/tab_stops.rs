@@ -318,3 +318,107 @@ fn cht_right_of_the_right_margin_never_moves_the_cursor_backward() {
         grid.cursor_col()
     );
 }
+
+/// CHT and CBT stop at the first step that leaves the cursor where it was. Each of Ps (up to
+/// 65535) steps cost a scan, and every one past the last stop moved nothing: `CSI 65535 I`
+/// cost about a thousand times what a byte of text does (input review 2026-10-30).
+#[test]
+fn cht_and_cbt_stop_stepping_once_the_cursor_stops_moving() {
+    use crate::test_counters::take_tab_steps;
+    let cols = 80u16;
+    for (lrmm, origin) in [(false, false), (true, false), (true, true)] {
+        let mut grid = Grid::new(3, cols);
+        if lrmm {
+            grid.set_horizontal_margins(10, 40);
+        }
+        grid.set_cursor(0, 10);
+        let (left, right) = match (lrmm, origin) {
+            (false, _) => (0, cols - 1),
+            (true, false) => (0, 40),
+            (true, true) => (10, 40),
+        };
+        take_tab_steps();
+
+        grid.tab_n_margin(u16::MAX, lrmm);
+        let (forward, cht_col) = (take_tab_steps(), grid.cursor_col());
+        grid.back_tab_n_margin(u16::MAX, lrmm, origin);
+        let (back, cbt_col) = (take_tab_steps(), grid.cursor_col());
+
+        assert_eq!(
+            (cht_col, cbt_col),
+            (right, left),
+            "lrmm={lrmm} origin={origin}: CHT and CBT land on their bounds"
+        );
+        assert!(
+            forward > 0 && back > 0,
+            "lrmm={lrmm} origin={origin}: the meter counted no step ({forward}, {back})"
+        );
+        assert!(
+            forward <= usize::from(cols) + 1 && back <= usize::from(cols) + 1,
+            "lrmm={lrmm} origin={origin}: CSI 65535 I took {forward} steps and CSI 65535 Z \
+             {back}, on a row of {cols} columns"
+        );
+    }
+}
+
+/// Stopping early changes no answer: CHT and CBT by `n` land where `n` single steps do, over
+/// generated stops, margins, origin mode, cursor columns and double-width rows.
+#[test]
+fn cht_and_cbt_by_n_land_where_n_single_steps_do() {
+    let mut rng = aterm_spec::rng::XorShift::new(0x7AB5_70B5);
+    for _ in 0..400 {
+        let cols = u16::try_from(rng.range(1, 48)).expect("fits");
+        let mut pick = |n: u16| u16::try_from(rng.index(usize::from(n))).expect("fits");
+        let stops: Option<Vec<u16>> =
+            (pick(2) == 0).then(|| (0..cols).filter(|_| pick(4) == 0).collect::<Vec<u16>>());
+        let lrmm = pick(2) == 0;
+        let margins = (pick(cols), pick(cols));
+        let origin = pick(2) == 0;
+        let col = pick(cols);
+        let double_width = pick(3);
+        let n = pick(cols + 3);
+        let build = || {
+            let mut grid = Grid::new(2, cols);
+            if let Some(stops) = &stops {
+                grid.clear_all_tab_stops();
+                for &stop in stops {
+                    grid.set_cursor(0, stop);
+                    grid.set_tab_stop();
+                }
+            }
+            if lrmm && cols > 1 {
+                grid.set_horizontal_margins(margins.0.min(margins.1), margins.0.max(margins.1));
+            }
+            // DECDWL before the cursor moves clamps it to the row; after, it may leave it past.
+            if double_width == 0 {
+                grid.set_row_line_size(0, crate::LineSize::DoubleWidth);
+            }
+            grid.set_cursor(0, col);
+            if double_width == 1 {
+                grid.set_row_line_size(0, crate::LineSize::DoubleWidth);
+            }
+            grid
+        };
+
+        let (mut grid, mut stepped) = (build(), build());
+        grid.tab_n_margin(n, lrmm);
+        for _ in 0..n {
+            stepped.tab_margin(lrmm);
+        }
+        assert_eq!(
+            grid.cursor_col(),
+            stepped.cursor_col(),
+            "CHT {n} from {col} on {cols} columns (lrmm={lrmm})"
+        );
+
+        grid.back_tab_n_margin(n, lrmm, origin);
+        for _ in 0..n {
+            stepped.back_tab_margin(lrmm, origin);
+        }
+        assert_eq!(
+            grid.cursor_col(),
+            stepped.cursor_col(),
+            "CBT {n} on {cols} columns (lrmm={lrmm}, origin={origin})"
+        );
+    }
+}

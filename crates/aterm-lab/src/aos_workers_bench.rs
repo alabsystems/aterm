@@ -407,8 +407,10 @@ pub fn parse_args(args: &[String]) -> Result<Args, Fail> {
     let rounds = match rounds {
         None => REGISTERED_ROUNDS,
         Some(v) => v
-            .parse::<usize>()
-            .ok()
+            .bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| v.parse::<usize>().ok())
+            .flatten()
             .filter(|n| (1..=REGISTERED_ROUNDS).contains(n))
             .ok_or_else(|| {
                 Fail::usage(format!(
@@ -639,7 +641,10 @@ fn first<'a>(p: &[(&'a str, &'a str)], key: &str) -> Option<&'a str> {
 }
 
 fn int(p: &[(&str, &str)], key: &str) -> Option<u64> {
-    first(p, key)?.parse().ok()
+    let v = first(p, key)?;
+    v.bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| v.parse().ok())?
 }
 
 fn float(p: &[(&str, &str)], key: &str) -> Option<f64> {
@@ -651,15 +656,20 @@ fn need<'a>(p: &[(&'a str, &'a str)], key: &str, line: &str) -> Result<&'a str, 
 }
 
 fn need_int(p: &[(&str, &str)], key: &str, line: &str) -> Result<u64, String> {
-    need(p, key, line)?
-        .parse()
-        .map_err(|_| format!("{key}= is not a count in `{line}`"))
+    let v = need(p, key, line)?;
+    v.bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| v.parse().ok())
+        .flatten()
+        .ok_or_else(|| format!("{key}= is not a count in `{line}`"))
 }
 
 fn need_i64(p: &[(&str, &str)], key: &str, line: &str) -> Result<i64, String> {
-    need(p, key, line)?
-        .parse()
-        .map_err(|_| format!("{key}= is not an integer in `{line}`"))
+    let v = need(p, key, line)?;
+    (!v.starts_with('+'))
+        .then(|| v.parse().ok())
+        .flatten()
+        .ok_or_else(|| format!("{key}= is not an integer in `{line}`"))
 }
 
 fn sums(p: &[(&str, &str)], line: &str) -> Result<(u64, u64, i64), String> {

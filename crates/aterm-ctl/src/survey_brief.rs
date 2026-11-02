@@ -44,8 +44,12 @@ fn started(lines: &[String]) -> Option<u64> {
         if (op, node, kind) != ("open", "n", "start") {
             return None;
         }
-        l.split(' ')
-            .find_map(|w| w.strip_prefix("t=")?.parse().ok())
+        l.split(' ').find_map(|w| {
+            let v = w.strip_prefix("t=")?;
+            (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| v.parse().ok())
+                .flatten()
+        })
     })
 }
 

@@ -38,11 +38,14 @@ pub(super) fn read(home: &Path) -> Result<Catalog, String> {
 }
 
 fn complete(snapshot: &Snapshot) -> bool {
-    snapshot.withheld == 0
-        && snapshot
-            .operations
-            .iter()
-            .all(|o| o.available && o.refusal.is_none())
+    snapshot.history_complete()
+}
+
+fn required_browser(value: &aterm_json::Value) -> bool {
+    value
+        .get("details")
+        .and_then(|details| details.get("browser-profile"))
+        .is_some_and(|detail| detail["kind"].as_str() == Some("requirement"))
 }
 
 fn project(snapshot: &Snapshot) -> Catalog {
@@ -66,9 +69,18 @@ fn project(snapshot: &Snapshot) -> Catalog {
                 email: text("email"),
                 realm: text("realm"),
                 secret_reference: value.get("secret_ref").is_some_and(|v| !v.is_null()),
+                required_browser: required_browser(value),
                 conflicted: cell.candidates.len() != 1,
                 stopped: cell.stopped,
                 import: None,
+                import_link: value["source"]["import"]
+                    .as_object()
+                    .filter(|v| {
+                        v.get("kind").and_then(aterm_json::Value::as_str) == Some("source-ref")
+                    })
+                    .and_then(|v| v.get("value"))
+                    .and_then(aterm_json::Value::as_str)
+                    .map(str::to_owned),
             });
         }
     }
@@ -109,6 +121,7 @@ fn project_imports(snapshot: &Snapshot) -> Catalog {
                         email: row["email"].as_str().map(str::to_owned),
                         realm: None,
                         secret_reference: false,
+                        required_browser: false,
                         conflicted: cell.candidates.len() != 1,
                         stopped: cell.stopped,
                         import: Some(ImportOrigin {
@@ -126,6 +139,7 @@ fn project_imports(snapshot: &Snapshot) -> Catalog {
                                 .filter_map(aterm_json::Value::as_u64)
                                 .collect(),
                         }),
+                        import_link: None,
                     }
                 };
                 match row["providers"].as_array() {
@@ -158,8 +172,21 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
+    fn only_a_required_browser_is_labeled_an_unsupported_requirement() {
+        for (kind, required) in [("requirement", true), ("note", false), ("status", false)] {
+            assert_eq!(
+                required_browser(
+                    &json!({"details":{"browser-profile":{"kind":kind,"value":"named"}}})
+                ),
+                required
+            );
+        }
+        assert!(!required_browser(&json!({})));
+    }
+
+    #[test]
     fn shared_catalog_preserves_conflicts_and_only_projects_credential_metadata() {
-        let value = json!({"provider":"anthropic", "method":"oauth", "label":"Shared", "email":"one@example.test", "secret_ref":{"vault":"alab", "entry":"account-key"}});
+        let value = json!({"provider":"anthropic", "method":"oauth", "label":"Shared", "email":"one@example.test", "secret_ref":{"vault":"alab", "entry":"account-key"},"details":{"browser-profile":{"kind":"requirement","value":"named"}}});
         let scope = Scope::new(
             Trust {
                 network: [1; 16],
@@ -206,6 +233,7 @@ mod tests {
         };
         let catalog = project(&snapshot);
         assert_eq!(catalog.rows.len(), 2);
+        assert!(catalog.rows.iter().all(|row| row.required_browser));
         assert!(!catalog.history_complete);
         assert!(
             catalog

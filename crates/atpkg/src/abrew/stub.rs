@@ -69,12 +69,11 @@ fi
 /// Whether the file at `path` is an abrew stub (by its marker line).
 #[must_use]
 pub fn is_abrew_stub(path: &Path) -> bool {
-    std::fs::read(path).is_ok_and(|b| {
-        b.len() <= 16 * 1024
-            && String::from_utf8_lossy(&b)
-                .lines()
-                .take(3)
-                .any(|l| matches!(l.trim(), STUB_MARKER | LEGACY_STUB_MARKER))
+    crate::metadata_io::read_bounded_regular(path, 16 * 1024).is_ok_and(|b| {
+        String::from_utf8_lossy(&b)
+            .lines()
+            .take(3)
+            .any(|l| matches!(l.trim(), STUB_MARKER | LEGACY_STUB_MARKER))
     })
 }
 
@@ -117,7 +116,7 @@ fn plan(layout: &Layout, embedder: &crate::stub::Embedder) -> Plan {
     }
     let path = stub_path(layout);
     let standing = is_abrew_stub(&path)
-        .then(|| std::fs::read_to_string(&path).ok())
+        .then(|| crate::metadata_io::read_bounded_regular_utf8(&path, 16 * 1024).ok())
         .flatten()
         .and_then(|body| crate::stub::sh_named_atpkg(&body, "ATPKG"));
     let offered = embedder.embed(standing.as_deref());
@@ -126,7 +125,9 @@ fn plan(layout: &Layout, embedder: &crate::stub::Embedder) -> Plan {
     match std::fs::symlink_metadata(&path) {
         Err(_) => Plan::Lay(path, body),
         Ok(_) if is_abrew_stub(&path) => {
-            if std::fs::read(&path).is_ok_and(|have| have == body.as_bytes()) {
+            if crate::metadata_io::read_bounded_regular(&path, 16 * 1024)
+                .is_ok_and(|have| have == body.as_bytes())
+            {
                 Plan::Nothing
             } else {
                 Plan::Lay(path, body)
@@ -157,7 +158,7 @@ fn doctor_row_with(
     let path = stub_path(layout);
     let row = |level, text| (Row { level, text }, Class::Relay);
     if is_abrew_stub(&path)
-        && std::fs::read_to_string(&path).is_ok_and(|body| {
+        && crate::metadata_io::read_bounded_regular_utf8(&path, 16 * 1024).is_ok_and(|body| {
             body.lines()
                 .take(3)
                 .any(|line| line.trim() == LEGACY_STUB_MARKER)
@@ -182,7 +183,8 @@ fn doctor_row_with(
         );
     }
     if is_abrew_stub(&path) {
-        let body = std::fs::read_to_string(&path).unwrap_or_default();
+        let body =
+            crate::metadata_io::read_bounded_regular_utf8(&path, 16 * 1024).unwrap_or_default();
         if !body.lines().take(3).any(|line| line.trim() == STUB_MARKER) {
             return row(
                 Level::Warn,
@@ -201,7 +203,7 @@ fn doctor_row_with(
                 "reroute stub brew names no live atpkg; brew refuses commands until aterm pkg repair re-lays it".to_string(),
             )
         }
-    } else if path.exists() {
+    } else if std::fs::symlink_metadata(&path).is_ok() {
         (
             Row {
                 level: Level::Warn,
@@ -532,6 +534,22 @@ mod tests {
         std::fs::write(&dull, "not a program\n").unwrap();
         std::fs::set_permissions(&dull, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(!stub_names_live_atpkg(&body(&dull)));
+
+        let layout = crate::testdir::layout("native-brew-symlink-");
+        let path = stub_path(&layout);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let target_stub = tmp.join("target-brew");
+        std::fs::write(&target_stub, body(&fake)).unwrap();
+        assert!(is_abrew_stub(&target_stub));
+        std::os::unix::fs::symlink(&target_stub, &path).unwrap();
+        assert!(
+            !is_abrew_stub(&path),
+            "symlink to an abrew stub is treated as foreign"
+        );
+        std::fs::remove_file(&target_stub).unwrap();
+        let (row, class) = doctor_row_with(&layout, true, false);
+        assert_eq!(class, aterm_converge::Class::Person);
+        assert!(row.text.contains("is not ours"), "{}", row.text);
     }
 
     #[cfg(unix)]

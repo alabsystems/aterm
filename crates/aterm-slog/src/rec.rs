@@ -3,7 +3,7 @@
 
 //! The record (design §3.1) and the host's clock reading.
 
-use crate::field::{Fields, Key};
+use crate::field::{Fields, Key, Tier};
 use crate::vocab::{Actor, Conf, Kind, Lvl, Node, Op, Src};
 
 /// The host's clock reading at an event: the only way time enters this
@@ -105,6 +105,29 @@ impl Rec {
             ),
             Op::Gap | Op::Snap => true,
         }
+    }
+
+    /// WHAT THE MIRROR PUBLISHES (§5.5, fix unit E5, E2E-16): a record of the bus class
+    /// ([`Rec::is_bus_class`]) whose body would carry something past its header. An amend of
+    /// the bus class whose every field is above the bus's ceiling ([`Tier::WireMeta`]), such
+    /// as Claude Code's transcript match `amend t<n> turn vref=<id>` (`vref=` is a host
+    /// fact), would cross as an amend of nothing, a no-op to every fold, so it is not
+    /// mirrored: the log gives it no `ms` (`Log::push`), so it takes no slot and the bus
+    /// numbers no hole for it. Under `presence = minimal` a take is encoded at
+    /// [`Tier::Wire`], so an amend whose fields are all W* (`ver=`, `model=`) keeps the slot
+    /// it was given at append and crosses with none of them (ruled residual: `ms` is fixed
+    /// before any take's tier is known).
+    ///
+    /// [`Rec::is_bus_class`] and [`Rec::is_turn_class`] stay as they are, and are still what
+    /// `encode_mirror` and `bus::BusSpace::offer` ask: a log carried from an older build, or
+    /// a broker's log, holds field-less amends that already have an `ms`, which must still
+    /// encode as records (refusing them would turn each slot into a `gap why=dropped` cover
+    /// and every reader's fold partial), and a reader folds an older writer's field-less
+    /// amend as a record, never as foreign. The turn class stays within the bus class.
+    #[must_use]
+    pub fn is_mirrored(&self) -> bool {
+        self.is_bus_class()
+            && (self.op != Op::Amend || self.f.iter().any(|(k, _)| k.tier() <= Tier::WireMeta))
     }
 
     /// The `out=` word of a close, if any.

@@ -6,6 +6,7 @@
 # with main's paper arm: the trail at cursor_trail_intensity 0.5.
 
 foreach-scheme light {
+  scale 2
   grid 16 80
   style rainbow kitty
   hz 60

@@ -487,8 +487,10 @@ fn log_wait_resumes(args: &[&str]) -> bool {
 }
 
 fn inbox_plain_read(args: &[&str]) -> bool {
-    args.iter()
-        .all(|a| matches!(*a, "--peek" | "--meta") || a.parse::<u64>().is_ok())
+    args.iter().all(|a| {
+        matches!(*a, "--peek" | "--meta")
+            || (!a.is_empty() && a.bytes().all(|b| b.is_ascii_digit()) && a.parse::<u64>().is_ok())
+    })
 }
 
 /// The part of a blocking read that names something in the old process.
@@ -679,7 +681,7 @@ fn resume_request_with(
     let mut block = seen.block;
     let mut turn = seen.turn;
     let (mut log_seq, mut log_ep, mut log_base) = (None, None, None);
-    let anchor = |v: &str| v.parse::<u64>().ok();
+    let anchor = super::parse_uint::<u64>;
     for token in request.split_whitespace() {
         if token.starts_with("since=") {
             continue;
@@ -697,11 +699,11 @@ fn resume_request_with(
             continue;
         }
         if let Some(v) = token.strip_prefix("log-ep=") {
-            log_ep = v.parse::<u32>().ok();
+            log_ep = super::parse_uint::<u32>(v);
             continue;
         }
         if let Some(v) = token.strip_prefix("log-base=") {
-            log_base = Some(v.parse::<u32>().ok());
+            log_base = Some(super::parse_uint::<u32>(v));
             continue;
         }
         if !token.starts_with('@') {
@@ -942,27 +944,27 @@ impl FrameTracker {
                 self.targets
                     .push(((*local).to_string(), (*sid).to_string(), false));
                 if let (Some(seq), Some(ep)) = (
-                    value("log_seq").and_then(|v| v.parse().ok()),
-                    value("log_ep").and_then(|v| v.parse().ok()),
+                    value("log_seq").and_then(super::parse_uint),
+                    value("log_ep").and_then(super::parse_uint),
                 ) {
                     self.anchors.log_seq = Some(seq);
                     self.anchors.log_ep = Some(ep);
-                    self.anchors.log_base = value("log_base").and_then(|v| v.parse().ok());
+                    self.anchors.log_base = value("log_base").and_then(super::parse_uint);
                 }
             }
             ["LOG", _, seq, ..] => {
-                if let Ok(seq) = seq.parse::<u64>() {
+                if let Some(seq) = super::parse_uint::<u64>(seq) {
                     self.anchors.log_seq = Some(seq);
                 }
             }
             ["GAP", _, lost, ..] if lost.starts_with("log-lost=") => {
                 if let (Some(seq), Some(ep)) = (
-                    value("resync_to").and_then(|v| v.parse().ok()),
-                    value("ep").and_then(|v| v.parse().ok()),
+                    value("resync_to").and_then(super::parse_uint),
+                    value("ep").and_then(super::parse_uint),
                 ) {
                     self.anchors.log_seq = Some(seq);
                     self.anchors.log_ep = Some(ep);
-                    self.anchors.log_base = value("base").and_then(|v| v.parse().ok());
+                    self.anchors.log_base = value("base").and_then(super::parse_uint);
                 }
             }
             ["EVENT", "*", "bye", "quit"] => self.quit = true,
@@ -974,23 +976,25 @@ impl FrameTracker {
                 }
             }
             ["EVENT", _, "block-complete", id, ..] => {
-                if let Ok(id) = id.parse::<u64>() {
+                if let Some(id) = super::parse_uint::<u64>(id) {
                     self.anchors.block = self.anchors.block.max(Some(id));
                 }
             }
             ["EVENT", _, "turn", id, ..] => {
-                if let Ok(id) = id.parse::<u64>() {
+                if let Some(id) = super::parse_uint::<u64>(id) {
                     self.anchors.turn = self.anchors.turn.max(Some(id));
                 }
             }
-            ["DELTA", _, _, "screen", rows, ..] => match rows.parse::<u64>() {
-                Ok(rows) => self.skip_lines = rows,
-                Err(_) => self.lost = true,
+            ["DELTA", _, _, "screen", rows, ..] => match super::parse_uint::<u64>(rows) {
+                Some(rows) => self.skip_lines = rows,
+                None => self.lost = true,
             },
-            ["DELTA", _, _, "cells", len, ..] | ["BYTES", _, len, ..] => match len.parse::<u64>() {
-                Ok(len) => self.skip_bytes = len.saturating_add(1),
-                Err(_) => self.lost = true,
-            },
+            ["DELTA", _, _, "cells", len, ..] | ["BYTES", _, len, ..] => {
+                match super::parse_uint::<u64>(len) {
+                    Some(len) => self.skip_bytes = len.saturating_add(1),
+                    None => self.lost = true,
+                }
+            }
             _ => {}
         }
     }

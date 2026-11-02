@@ -167,14 +167,27 @@ impl Scratch {
 /// memory measured in `book` when one is given and admitted as `mode` says: its exit code and its
 /// log, within the hang detector.
 fn run(root: &Path, book: Option<Book>, mode: Admit, seams: Seams) -> (i32, String) {
+    run_checks(root, book, mode, seams, &[Check::Lint, Check::Fmt], false)
+}
+
+/// [`run`] of `checks`, under `--no-windows` when `no_windows` says.
+fn run_checks(
+    root: &Path,
+    book: Option<Book>,
+    mode: Admit,
+    seams: Seams,
+    checks: &[Check],
+    no_windows: bool,
+) -> (i32, String) {
     let mut ctx = Ctx::new(
         root.to_path_buf(),
         gui(),
         EnvSnapshot::default(),
         root.join("scratch"),
     )
-    .with_checks(&[Check::Lint, Check::Fmt])
+    .with_checks(checks)
     .with_quiet(Some(mode));
+    ctx.no_windows = no_windows;
     if let Some(book) = book {
         ctx = ctx.with_memory(book);
     }
@@ -524,6 +537,68 @@ fn under_admit_now_a_memory_claim_is_taken_at_once() {
         [Admit::Now]
     );
     drop(holder);
+}
+
+#[cfg(target_os = "macos")]
+static DESK: Scratch = Scratch::new();
+
+#[cfg(target_os = "macos")]
+fn desk_admit(need: Need, mode: Admit) -> Result<Claim, Error> {
+    DESK.admit(need, mode)
+}
+
+#[cfg(target_os = "macos")]
+fn desk_stage(_: &Ctx, spec: &StageSpec) -> Report {
+    DESK.stage(spec)
+}
+
+/// THE BROWSER LANE TAKES THE DESK BEFORE ITS MEMORY where Safari's window takes it (macOS, which
+/// ships `safaridriver`): the run's quiet claim is asked for first and the stage's memory only
+/// once that is held, as a timed stage's is, so the stage never holds memory while it waits for
+/// another run's quiet machine (`crate::staged`); the stage sees both held as it runs. NEGATIVE
+/// CONTROL: under `--no-windows`, where Safari is a named skip, it asks for its memory alone.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_browser_stage_with_safari_takes_the_quiet_machine_before_its_memory() {
+    assert!(
+        crate::browser::safari::find().is_ok(),
+        "macOS ships safaridriver"
+    );
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    DESK.ledger
+        .set(dir.path().join("ledger"))
+        .expect("set once");
+    let seams = Seams {
+        stage: desk_stage,
+        admit_quiet: desk_admit,
+        admit_memory: desk_admit,
+    };
+    let browse = |no_windows| {
+        let (code, log) = run_checks(
+            dir.path(),
+            Some(book(dir.path())),
+            Admit::Wait,
+            seams,
+            &[Check::Browser],
+            no_windows,
+        );
+        assert_eq!(code, crate::exit::PASS, "{log}");
+        let seen = DESK.take();
+        let asked: Vec<bool> = seen.asked.iter().map(|(_, mem, _)| *mem > 0).collect();
+        let held: Vec<bool> = seen
+            .looked
+            .iter()
+            .flat_map(|(_, held)| held.iter().map(|(_, mem)| *mem > 0))
+            .collect();
+        (asked, held)
+    };
+    let (asked, mut held) = browse(false);
+    assert_eq!(asked, [false, true], "the quiet machine, then the memory");
+    held.sort_unstable();
+    assert_eq!(held, [false, true], "both held as the stage runs");
+    let (asked, held) = browse(true);
+    assert_eq!(asked, [true], "the memory alone under --no-windows");
+    assert_eq!(held, [true]);
 }
 
 /// Set, the test binary is [`standin_run_waits_for_memory`], its ledger and markers under this
@@ -957,4 +1032,274 @@ fn a_stage_keeps_its_figure_only_when_it_did_its_work() {
             "rows {rows}: {records:?}"
         );
     }
+}
+
+static UNITS: Scratch = Scratch::new();
+
+/// Whether the units stand-in's test compile passes.
+static UNITS_PASS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+fn units_admit(need: Need, mode: Admit) -> Result<Claim, Error> {
+    UNITS.admit(need, mode)
+}
+
+/// A test compile whose meter reads two heavy compilers (aterm-gui's lib-test at 9 GiB, its lib
+/// at 3 GiB) and a light one, passing or failing as [`UNITS_PASS`] says; any other stage passes.
+fn units_stage(_: &Ctx, spec: &StageSpec) -> Report {
+    let mut r = Report::new(spec.title.clone());
+    if spec.id == StageId::TestCompile {
+        let meter = crate::memory::current().expect("the test compile is metered");
+        let member = |pid: u32, gib: u64| aterm_sysprobe::MemberUsage {
+            pid,
+            start: 1,
+            footprint: gib * GIB,
+            peak_footprint: gib * GIB,
+            ..aterm_sysprobe::MemberUsage::default()
+        };
+        meter.started();
+        meter.book(7, &[member(11, 9), member(12, 3), member(13, 0)]);
+        meter.ended(7);
+        if UNITS_PASS.load(std::sync::atomic::Ordering::SeqCst) {
+            r.pass("compiled");
+        } else {
+            r.fail("compiled");
+        }
+        return r;
+    }
+    r.pass("ran");
+    r
+}
+
+/// The units stand-in's compilers by pid: 11 aterm-gui's lib-test, 12 its lib, 13 a light one.
+fn units_reader(pid: u32) -> Option<crate::unitgraph::UnitName> {
+    let kind = match pid {
+        11 => "aterm_gui test",
+        12 => "aterm_gui lib",
+        13 => "aterm_grid lib",
+        _ => return None,
+    };
+    Some(crate::unitgraph::UnitName {
+        package: if pid == 13 { "aterm-grid" } else { "aterm-gui" }.to_owned(),
+        kind: kind.to_owned(),
+    })
+}
+
+fn no_graph(_: &Ctx, _: &crate::shape::Piece) -> Result<String, String> {
+    Err("no unit graph in this test".to_owned())
+}
+
+/// A TEST COMPILE KEEPS ITS HEAVY UNITS' PEAKS WHEN IT PASSED: its meter read aterm-gui's
+/// lib-test at 9 GiB and its lib at 3 GiB, and the book keeps each under its unit's key (stage
+/// `TestCompile unit`, the package, the unit's kind), the light compiler none; the time line names
+/// them, heaviest first. A test compile that failed keeps no unit's peak. NEGATIVE CONTROL: the
+/// failed run's book holds no unit row.
+#[test]
+fn a_passing_test_compile_keeps_its_heavy_units_peaks() {
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    UNITS
+        .ledger
+        .set(dir.path().join("ledger"))
+        .expect("set once");
+    let seams = Seams {
+        stage: units_stage,
+        admit_quiet: units_admit,
+        admit_memory: units_admit,
+    };
+    let run_units = |at: &Path, pass: bool| -> (String, crate::memory::Records) {
+        std::fs::create_dir_all(at).expect("a folder");
+        UNITS_PASS.store(pass, std::sync::atomic::Ordering::SeqCst);
+        let mut ctx = Ctx::new(
+            at.to_path_buf(),
+            gui(),
+            EnvSnapshot::default(),
+            at.join("scratch"),
+        )
+        .with_checks(&[Check::Test])
+        .with_quiet(Some(Admit::Wait))
+        .with_memory(book(at));
+        ctx.unit_reader = units_reader;
+        ctx.unit_graph = no_graph;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut log = Vec::new();
+            let _ = crate::run_with(
+                &ctx,
+                &mut std::io::sink(),
+                &mut log,
+                &Show::default(),
+                seams,
+            );
+            let _ = tx.send(String::from_utf8_lossy(&log).into_owned());
+        });
+        let log = rx
+            .recv_timeout(MUST_HAPPEN)
+            .expect("hang detector: the run never ended");
+        (
+            log,
+            crate::memory::Records::load(&at.join("stage-memory.json")),
+        )
+    };
+    let units = |r: &crate::memory::Records| -> Vec<(String, u64)> {
+        r.rows()
+            .iter()
+            .filter(|row| row.key.stage == crate::shape::UNIT_STAGE)
+            .map(|row| {
+                (
+                    row.key.variant.clone().unwrap_or_default(),
+                    row.peaks.iter().map(|p| p.bytes).max().unwrap_or(0),
+                )
+            })
+            .collect()
+    };
+
+    let (log, records) = run_units(&dir.path().join("pass"), true);
+    assert_eq!(
+        units(&records),
+        [
+            ("aterm_gui lib".to_owned(), 3 * GIB),
+            ("aterm_gui test".to_owned(), 9 * GIB)
+        ]
+    );
+    assert!(
+        log.contains("its heaviest units kept: aterm_gui test 9 GiB, aterm_gui lib 3 GiB"),
+        "{log}"
+    );
+
+    let (_, records) = run_units(&dir.path().join("fail"), false);
+    assert!(units(&records).is_empty(), "{records:?}");
+}
+
+static STUCK: Scratch = Scratch::new();
+
+/// How long [`stuck_admit`]'s claims let the holders they wait behind make no progress.
+const STUCK_AFTER: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// This process, the holder of the claim [`STUCK`]'s ledger holds, having used `cpu_ns` of CPU
+/// time, as [`stuck_machine`] reads it.
+fn this_process_at(cpu_ns: u64) -> aterm_capacity::Procs {
+    aterm_capacity::Procs::of(vec![aterm_capacity::Proc {
+        pid: std::process::id(),
+        ppid: 1,
+        cpu_ns,
+        ..aterm_capacity::Proc::default()
+    }])
+}
+
+/// The machine [`stuck_admit`] admits on: [`machine`], its processes [`this_process_at`].
+fn stuck_machine() -> &'static Fixed {
+    static AT: OnceLock<Fixed> = OnceLock::new();
+    AT.get_or_init(|| {
+        let m = machine();
+        m.set_procs(Some(this_process_at(5)));
+        m
+    })
+}
+
+/// Admit `need` in [`STUCK`]'s ledger on [`stuck_machine`] as the live seam does
+/// ([`crate::admit_in`]): a claim the run asks to give up behind holders that make no progress
+/// does so after [`STUCK_AFTER`] rather than the run's bound; one that asks nothing still asks
+/// nothing.
+fn stuck_admit(need: Need, mode: Admit) -> Result<Claim, Error> {
+    let need = Need {
+        stuck_ends: need.stuck_ends.map(|_| STUCK_AFTER),
+        ..need
+    };
+    crate::admit_in(
+        &STUCK.ledger(),
+        stuck_machine(),
+        Pace {
+            poll: std::time::Duration::from_millis(20),
+            ..Pace::default()
+        },
+        need,
+        mode,
+        &mut |_| {},
+    )
+}
+
+fn stuck_stage(_: &Ctx, spec: &StageSpec) -> Report {
+    STUCK.stage(spec)
+}
+
+/// A STAGE WHOSE MEMORY CLAIM WAITS BEHIND A HOLDER THAT MAKES NO PROGRESS IS NOT RUN
+/// (CW-WAIT-UNBOUNDED): behind a 15 GiB claim whose holder's tree reads idle (20 GiB available
+/// leaves 5 for the lint's 12), the lint's claim gives up once the holder has made none for its
+/// bound, and the run ends within the hang detector, COULD NOT RUN: the lint's row is NOT RUN,
+/// naming the holder and how long it made no progress, and the formatter passes; the holder's
+/// claim stays held, and the lint's has left the queue. NEGATIVE CONTROL: behind the same holder
+/// working (its CPU time moving between looks), the lint waits on past three bounds and runs
+/// once the holder lets go, and the run passes.
+#[test]
+fn a_stage_waiting_behind_a_stuck_holder_is_not_run() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    STUCK
+        .ledger
+        .set(dir.path().join("ledger"))
+        .expect("set once");
+    let holder = aterm_capacity::admit_with(
+        &STUCK.ledger(),
+        stuck_machine(),
+        Need::new("lab linux exec: aterm-linux boot").mem_gib(15),
+        Admit::Wait,
+        Pace::default(),
+        &mut |_| {},
+    )
+    .expect("the holder's claim");
+    let seams = Seams {
+        stage: stuck_stage,
+        admit_quiet: stuck_admit,
+        admit_memory: stuck_admit,
+    };
+    let (code, log) = run(dir.path(), Some(book(dir.path())), Admit::Wait, seams);
+    assert_eq!(code, crate::exit::COULD_NOT_RUN, "{log}");
+    let row = log
+        .lines()
+        .find(|l| l.contains("NOT RUN") && l.contains("tippy lint"))
+        .unwrap_or_else(|| panic!("the lint's row:\n{log}"));
+    for said in [
+        "its memory claim gave up its wait",
+        &format!("pid {} holds 15 GiB of memory", std::process::id()),
+        "which has made no progress for",
+        "(none was signalled)",
+    ] {
+        assert!(row.contains(said), "{said:?} in {row}");
+    }
+    assert!(!log.contains("FAIL"), "a finding:\n{log}");
+    let listed: Vec<String> = STUCK
+        .ledger()
+        .list()
+        .expect("the ledger")
+        .into_iter()
+        .map(|r| r.need.what)
+        .collect();
+    assert_eq!(listed, ["lab linux exec: aterm-linux boot"], "{log}");
+
+    let moving = Arc::new(AtomicBool::new(true));
+    let mover = {
+        let moving = Arc::clone(&moving);
+        std::thread::spawn(move || {
+            let mut ns = 6;
+            while moving.load(Ordering::SeqCst) {
+                stuck_machine().set_procs(Some(this_process_at(ns)));
+                ns += 1;
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        })
+    };
+    let lets_go = std::thread::spawn(move || {
+        // Three bounds of the condition under test, not a wait for anything.
+        std::thread::sleep(STUCK_AFTER * 3);
+        drop(holder);
+    });
+    let (code, log) = run(dir.path(), Some(book(dir.path())), Admit::Wait, seams);
+    assert!(
+        lets_go.is_finished(),
+        "the lint ran before the holder let go:\n{log}"
+    );
+    lets_go.join().expect("the holder let go");
+    moving.store(false, Ordering::SeqCst);
+    mover.join().expect("the mover's end");
+    assert_eq!(code, crate::exit::PASS, "{log}");
 }

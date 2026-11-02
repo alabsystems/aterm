@@ -18,8 +18,117 @@ use std::{
     time::Duration,
 };
 
+mod compatibility;
 mod policy;
+mod recovery;
 pub(super) use policy::session_boundary;
+
+#[test]
+fn a_received_batch_keeps_its_first_local_refusal_and_durable_receipts() {
+    let p = Pair::new(false, 1);
+    let source = p.lab.bootstrap(0);
+    let session = Session::observe(&source).unwrap();
+    let peer = session.actor();
+    let store = Store::observe(&session, &p.paths[0], p.scope).unwrap();
+    let id = *store.inventory(&session).unwrap().next().unwrap();
+    let wire = store.wire(&session, &id).unwrap().unwrap().to_vec();
+    drop(store);
+    drop(session);
+    drop(source);
+
+    let bad = b"private batch fixture value: not an operation";
+    let mut incoming = 2u32.to_le_bytes().to_vec();
+    crate::control::send_frame(&mut incoming, bad).unwrap();
+    crate::control::send_frame(&mut incoming, &wire).unwrap();
+    let replies = incoming.len();
+    let mut stream = Cursor::new(incoming);
+    let receiver = p.replica(1);
+    let round = receiver.round(peer).unwrap();
+    let mut repair = Repair::default();
+    let mut report = Report::default();
+    round
+        .receive_batch(
+            &mut stream,
+            peer,
+            p.scope.digest(),
+            BatchKind::Operation,
+            &mut repair,
+            &mut report,
+        )
+        .unwrap();
+    assert_eq!(report.received, 1);
+    assert_eq!(report.deferred, 1);
+    assert_eq!(p.count(1), 1);
+    let receipts = &stream.get_ref()[replies..];
+    assert_eq!(receipts.len(), 66);
+    assert_eq!(&receipts[..32], &Sha256::digest(bad));
+    assert_eq!(receipts[32], 0);
+    assert_eq!(&receipts[33..65], &id);
+    assert_eq!(receipts[65], 1);
+    let why = repair
+        .batch_deferral
+        .as_ref()
+        .expect("local refusal retained");
+    assert_eq!(why.batch, "operations");
+    assert_eq!(why.stage, "ingest");
+    assert!(!why.reason.is_empty());
+    assert!(!why.reason.contains("private batch fixture value"));
+}
+
+#[test]
+fn a_received_batch_preserves_a_local_storage_refusal() {
+    let p = Pair::new(false, 1);
+    let source = p.lab.bootstrap(0);
+    let session = Session::observe(&source).unwrap();
+    let peer = session.actor();
+    let store = Store::observe(&session, &p.paths[0], p.scope).unwrap();
+    let id = *store.inventory(&session).unwrap().next().unwrap();
+    let wire = store.wire(&session, &id).unwrap().unwrap().to_vec();
+    drop(store);
+    drop(session);
+    drop(source);
+    std::fs::rename(&p.paths[1], p.paths[1].with_extension("held")).unwrap();
+    std::fs::write(&p.paths[1], b"not a table directory").unwrap();
+
+    let mut incoming = 1u32.to_le_bytes().to_vec();
+    crate::control::send_frame(&mut incoming, &wire).unwrap();
+    let replies = incoming.len();
+    let mut stream = Cursor::new(incoming);
+    let receiver = p.replica(1);
+    let round = receiver.round(peer).unwrap();
+    let mut repair = Repair::default();
+    let mut report = Report::default();
+    round
+        .receive_batch(
+            &mut stream,
+            peer,
+            p.scope.digest(),
+            BatchKind::Operation,
+            &mut repair,
+            &mut report,
+        )
+        .unwrap();
+    assert_eq!(report.received, 0);
+    assert_eq!(report.deferred, 1);
+    let receipts = &stream.get_ref()[replies..];
+    assert_eq!(receipts.len(), 33);
+    assert_eq!(&receipts[..32], &id);
+    assert_eq!(receipts[32], 0);
+    let why = repair
+        .batch_deferral
+        .as_ref()
+        .expect("storage refusal retained");
+    assert_eq!(why.batch, "operations");
+    assert_eq!(why.stage, "storage");
+    assert!(!why.reason.is_empty());
+}
+
+#[test]
+fn batch_refusal_metadata_is_bounded_without_splitting_utf8() {
+    let why = BatchDeferral::new("operations", "ingest", "🧪".repeat(300));
+    assert_eq!(why.reason.chars().count(), 128);
+    assert_eq!(why.reason.len(), 512);
+}
 
 #[test]
 fn automatic_batches_recheck_local_policy_and_new_catalog_conflicts() {
@@ -51,7 +160,12 @@ fn automatic_batches_recheck_local_policy_and_new_catalog_conflicts() {
         .unwrap();
     assert!(tables.contains_key(&scope.digest()));
     round.tables = tables;
-    assert!(round.inventory(peer, scope.digest()).unwrap().is_some());
+    assert!(
+        round
+            .inventory(peer, scope.digest(), &mut None)
+            .unwrap()
+            .is_some()
+    );
     drop(held);
     aterm_secrets::fsx::write_atomic(&config, b"[commons]\nenabled=false\n", 0o600).unwrap();
     assert!(
@@ -206,6 +320,7 @@ fn unreadable_membership_recovery_preserves_control_but_never_reports_applicatio
     let endpoints = [p.endpoint(0, true), p.endpoint(1, true)];
     let custody = p.lab.bootstrap(1);
     let observed = Session::observe(&custody).unwrap();
+    let table_before = std::fs::read(p.paths[1].join("table.astream")).unwrap();
     // Unreadable to custody, not merely damaged: a damaged file loads what still verifies
     // (`membership_log::Store::recover`), but one others may write is never read.
     aterm_secrets::fsx::write_atomic(&p.lab.paths[1].records_file(), b"invalid", 0o622).unwrap();
@@ -219,8 +334,11 @@ fn unreadable_membership_recovery_preserves_control_but_never_reports_applicatio
         assert!(repair.application().is_none());
         assert!(repair.application_error().is_none());
     }
-    let table = Store::observe(&observed, &p.paths[1], p.scope).unwrap();
-    assert_eq!(table.inventory(&observed).unwrap().count(), 0);
+    assert!(Store::observe(&observed, &p.paths[1], p.scope).is_err());
+    assert_eq!(
+        std::fs::read(p.paths[1].join("table.astream")).unwrap(),
+        table_before
+    );
     assert!(Bootstrap::cached(&p.lab.paths[1]).is_err());
 }
 
@@ -306,24 +424,7 @@ impl Pair {
             .count()
     }
     fn round(&self, a: &Endpoint, b: &Endpoint, ra: &mut PeerRepair, rb: &mut PeerRepair) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        thread::scope(|threads| {
-            let server = threads.spawn(|| {
-                b.exchange(
-                    Connection::admit(listener.accept().unwrap().0, LinkScope::Loopback).unwrap(),
-                    Side::Responder,
-                    rb,
-                )
-            });
-            a.exchange(
-                Connection::connect(address, LinkScope::Loopback, Duration::from_secs(2)).unwrap(),
-                Side::Initiator,
-                ra,
-            )
-            .unwrap();
-            server.join().unwrap().unwrap();
-        });
+        exchange_round(a, b, ra, rb);
     }
     fn retire_b(&self) {
         let a = self.lab.bootstrap(0);
@@ -348,6 +449,27 @@ impl Pair {
             .ingest(node.bytes())
             .unwrap();
     }
+}
+
+fn exchange_round(a: &Endpoint, b: &Endpoint, ra: &mut PeerRepair, rb: &mut PeerRepair) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    thread::scope(|threads| {
+        let server = threads.spawn(|| {
+            b.exchange(
+                Connection::admit(listener.accept().unwrap().0, LinkScope::Loopback).unwrap(),
+                Side::Responder,
+                rb,
+            )
+        });
+        a.exchange(
+            Connection::connect(address, LinkScope::Loopback, Duration::from_secs(2)).unwrap(),
+            Side::Initiator,
+            ra,
+        )
+        .unwrap();
+        server.join().unwrap().unwrap();
+    });
 }
 
 #[test]
@@ -377,6 +499,10 @@ fn tls_inventory_evidence_precedes_positive_repair_and_distinguishes_equal_count
         assert_eq!(report.local_known, Some(before[n]));
         assert_eq!(report.local_offered, Some(before[n]));
         assert_eq!(report.peer_known, Some(before[1 - n]));
+        assert!(
+            report.matching_inventory.is_none(),
+            "equal counts with different retained IDs are not a match"
+        );
         assert_eq!((report.sent, report.received), (1, 1));
         assert!(repair.application_error().is_none());
         assert_eq!(p.count(n), 2);
@@ -384,13 +510,76 @@ fn tls_inventory_evidence_precedes_positive_repair_and_distinguishes_equal_count
     let after = inventory(0);
     assert_eq!(after, inventory(1));
     p.round(&a, &b, &mut ra, &mut rb);
-    for repair in [&ra, &rb] {
+    for (n, repair) in [&ra, &rb].into_iter().enumerate() {
         let report = repair.application().unwrap();
         assert_eq!(report.local_known, Some(after));
         assert_eq!(report.local_offered, Some(after));
         assert_eq!(report.peer_known, Some(after));
         assert_eq!((report.sent, report.received), (0, 0));
+        let matched = report
+            .matching_inventory
+            .expect("the next completed round observes matching retained IDs");
+        assert_eq!(matched.scope(), p.scope);
+        assert_eq!(matched.inventory(), after);
+        let bootstrap = p.lab.bootstrap(n);
+        let session = Session::observe(&bootstrap).unwrap();
+        assert_eq!(matched.local_actor(), session.actor());
+        assert_eq!(
+            matched.control_observation(),
+            session.observation().unwrap()
+        );
+        assert_eq!(Some(matched.peer_actor()), repair.authenticated_actor());
+        assert_ne!(matched.observed_at_ms(), 0);
     }
+}
+
+#[test]
+fn the_final_matching_inventory_read_rejects_real_inventory_and_control_changes() {
+    let p = Pair::new(false, 0);
+    let replica = p.replica(0);
+    let peer = p.lab.bootstrap(1).request().unwrap().binding().actor();
+    let id = p.scope.digest();
+    let make_report = |round: &Round<'_>| {
+        let before = round
+            .inventory(peer, id, &mut None)
+            .unwrap()
+            .unwrap()
+            .observation;
+        round.inventory_observation.set(Some(before));
+        round.active_table.set(Some(id));
+        Report {
+            table: Some(id),
+            local_known: Some(before.inventory),
+            peer_known: Some(before.inventory),
+            local_offered: Some(before.inventory),
+            ..Report::default()
+        }
+    };
+    let round = replica.round(peer).unwrap();
+    let report = make_report(&round);
+    assert!(round.matching_inventory(peer, id, &report).is_some());
+
+    let source = p.lab.bootstrap(0);
+    let session = Session::open(&source).unwrap();
+    Store::open(&session, &p.paths[0], p.scope)
+        .unwrap()
+        .commit_catalog(&session, b"a concurrent operation after inventory exchange")
+        .unwrap();
+    drop(session);
+    drop(source);
+    assert!(
+        round.matching_inventory(peer, id, &report).is_none(),
+        "a final inventory change withdraws the observation"
+    );
+
+    let round = replica.round(peer).unwrap();
+    let report = make_report(&round);
+    assert!(round.matching_inventory(peer, id, &report).is_some());
+    p.retire_b();
+    assert!(
+        round.matching_inventory(peer, id, &report).is_none(),
+        "changed control and retired peer refuse the final admitted read"
+    );
 }
 
 #[test]
@@ -460,6 +649,719 @@ fn revocation_after_endpoint_creation_withholds_application_data() -> (i64, i64,
     )
 }
 
+#[test]
+fn inbound_rounds_do_not_rewind_the_outbound_table_cursor() {
+    table_scan_case(false, false);
+}
+
+#[test]
+fn new_peers_start_on_different_tables_and_resume_their_own_scan() {
+    let lab = Lab::new(&[Role::Writer; 4]);
+    let mut tables = Vec::new();
+    for table in 0..3 {
+        let paths: [PathBuf; 4] =
+            std::array::from_fn(|node| lab._home.path().join(format!("fresh-{table}-{node}")));
+        let bootstrap = lab.bootstrap(0);
+        let session = Session::open(&bootstrap).unwrap();
+        let scope = Store::create(&session, &paths[0]).unwrap().scope();
+        drop(session);
+        for (node, path) in paths.iter().enumerate().skip(1) {
+            let bootstrap = lab.bootstrap(node);
+            let session = Session::open(&bootstrap).unwrap();
+            Store::join(&session, path, scope).unwrap();
+        }
+        tables.push((scope, paths));
+    }
+    tables.sort_by_key(|(scope, _)| scope.digest());
+    // Each new peer supplies a different table. The first sweep must not
+    // keep asking all three peers about the receiver's first table.
+    for (table, (scope, paths)) in tables.iter().enumerate() {
+        let node = table + 1;
+        let bootstrap = lab.bootstrap(node);
+        let session = Session::open(&bootstrap).unwrap();
+        Store::open(&session, &paths[node], *scope)
+            .unwrap()
+            .commit_catalog(&session, b"first-contact backfill")
+            .unwrap();
+    }
+    let endpoints: Vec<_> = (0..4)
+        .map(|node| {
+            Endpoint::from_bootstrap(&lab.bootstrap(node))
+                .unwrap()
+                .unwrap()
+                .with_tables(
+                    lab.paths[node].clone(),
+                    tables
+                        .iter()
+                        .map(|(scope, paths)| (*scope, paths[node].clone()))
+                        .collect(),
+                )
+                .unwrap()
+        })
+        .collect();
+    let mut outbound: [PeerRepair; 3] = std::array::from_fn(|_| PeerRepair::default());
+    let mut inbound: [PeerRepair; 3] = std::array::from_fn(|_| PeerRepair::default());
+    for peer in 0..3 {
+        exchange_round(
+            &endpoints[0],
+            &endpoints[peer + 1],
+            &mut outbound[peer],
+            &mut inbound[peer],
+        );
+    }
+    let bootstrap = lab.bootstrap(0);
+    let session = Session::observe(&bootstrap).unwrap();
+    for (scope, paths) in &tables {
+        let store = Store::observe(&session, &paths[0], *scope).unwrap();
+        assert_eq!(store.inventory(&session).unwrap().count(), 1);
+    }
+    drop(session);
+    // Once a peer has a cursor, its next ordinary scan continues from it,
+    // independently of the starting positions given to the other peers.
+    for peer in 0..3 {
+        exchange_round(
+            &endpoints[0],
+            &endpoints[peer + 1],
+            &mut outbound[peer],
+            &mut inbound[peer],
+        );
+        assert_eq!(
+            outbound[peer].application().unwrap().table,
+            Some(tables[(peer + 1) % 3].0.digest())
+        );
+    }
+}
+
+#[test]
+fn full_batches_continue_without_starving_another_table() {
+    for initiator in 0..2 {
+        let pair = Pair::new(false, 0);
+        let paths = [
+            pair.lab._home.path().join("second-a"),
+            pair.lab._home.path().join("second-b"),
+        ];
+        let bootstrap = pair.lab.bootstrap(0);
+        let session = Session::open(&bootstrap).unwrap();
+        let scope = Store::create(&session, &paths[0]).unwrap().scope();
+        drop(session);
+        let bootstrap = pair.lab.bootstrap(1);
+        let session = Session::open(&bootstrap).unwrap();
+        Store::join(&session, &paths[1], scope).unwrap();
+        drop(session);
+        let mut tables = [(pair.scope, pair.paths.clone()), (scope, paths)];
+        tables.sort_by_key(|(scope, _)| scope.digest());
+        let count = BATCH * TABLE_BURST + 1;
+        let bootstrap = pair.lab.bootstrap(0);
+        let session = Session::open(&bootstrap).unwrap();
+        for (index, (scope, paths)) in tables.iter().enumerate() {
+            let mut store = Store::open(&session, &paths[0], *scope).unwrap();
+            for _ in 0..if index == 0 { count } else { 1 } {
+                store.commit_catalog(&session, b"backfill fixture").unwrap();
+            }
+        }
+        drop(session);
+        let endpoints: Vec<_> = (0..2)
+            .map(|node| {
+                Endpoint::from_bootstrap(&pair.lab.bootstrap(node))
+                    .unwrap()
+                    .unwrap()
+                    .with_tables(
+                        pair.lab.paths[node].clone(),
+                        tables
+                            .iter()
+                            .map(|(scope, paths)| (*scope, paths[node].clone()))
+                            .collect(),
+                    )
+                    .unwrap()
+            })
+            .collect();
+        let mut sent = PeerRepair::default();
+        let mut received = PeerRepair::default();
+        for turn in 0..TABLE_BURST + 2 {
+            pair.round(
+                &endpoints[initiator],
+                &endpoints[1 - initiator],
+                &mut sent,
+                &mut received,
+            );
+            let report = sent.application().unwrap();
+            let selected = usize::from(turn == TABLE_BURST);
+            assert_eq!(report.table, Some(tables[selected].0.digest()));
+            let transferred = if initiator == 0 {
+                report.sent
+            } else {
+                report.received
+            };
+            assert_eq!(transferred, if turn < TABLE_BURST { BATCH } else { 1 });
+        }
+        let bootstrap = pair.lab.bootstrap(1);
+        let session = Session::observe(&bootstrap).unwrap();
+        for (index, (scope, paths)) in tables.iter().enumerate() {
+            let store = Store::observe(&session, &paths[1], *scope).unwrap();
+            assert_eq!(
+                store.inventory(&session).unwrap().count(),
+                if index == 0 { count } else { 1 }
+            );
+        }
+    }
+}
+
+#[test]
+fn incoming_backlog_guides_a_different_peer_without_starving_regular_tables() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer, Role::Writer]);
+    let mut tables = Vec::new();
+    for index in 0..2 {
+        let paths: [PathBuf; 3] =
+            std::array::from_fn(|node| lab._home.path().join(format!("backlog-{index}-{node}")));
+        let bootstrap = lab.bootstrap(0);
+        let session = Session::open(&bootstrap).unwrap();
+        let scope = Store::create(&session, &paths[0]).unwrap().scope();
+        drop(session);
+        for (node, path) in paths.iter().enumerate().skip(1) {
+            let bootstrap = lab.bootstrap(node);
+            let session = Session::open(&bootstrap).unwrap();
+            Store::join(&session, path, scope).unwrap();
+        }
+        tables.push((scope, paths));
+    }
+    tables.sort_by_key(|(scope, _)| scope.digest());
+    let count = BATCH * (TABLE_BURST + 1) + 1;
+    for (index, (scope, paths)) in tables.iter().enumerate() {
+        let bootstrap = lab.bootstrap(0);
+        let session = Session::open(&bootstrap).unwrap();
+        let mut store = Store::open(&session, &paths[0], *scope).unwrap();
+        let mut wires = Vec::new();
+        for _ in 0..if index == 0 { 1 } else { count } {
+            let id = store
+                .commit_catalog(&session, b"shared backlog")
+                .unwrap()
+                .id;
+            wires.push(store.wire(&session, &id).unwrap().unwrap().to_vec());
+        }
+        drop(store);
+        drop(session);
+        let bootstrap = lab.bootstrap(2);
+        let session = Session::open(&bootstrap).unwrap();
+        let mut store = Store::open(&session, &paths[2], *scope).unwrap();
+        for wire in wires {
+            store.ingest(&session, &wire).unwrap();
+        }
+    }
+    let cache = crate::control::PeerCache::default();
+    let endpoint = |node| {
+        let endpoint = Endpoint::from_bootstrap(&lab.bootstrap(node))
+            .unwrap()
+            .unwrap()
+            .with_tables(
+                lab.paths[node].clone(),
+                tables
+                    .iter()
+                    .map(|(scope, paths)| (*scope, paths[node].clone()))
+                    .collect(),
+            )
+            .unwrap();
+        if node == 1 {
+            endpoint.with_repair_cache(&cache)
+        } else {
+            endpoint
+        }
+    };
+    let mut endpoints: Vec<_> = (0..3).map(&endpoint).collect();
+    let (mut source, mut inbound) = (PeerRepair::default(), PeerRepair::default());
+    // An incoming peer first supplies the small table, then one full batch.
+    for _ in 0..2 {
+        exchange_round(&endpoints[0], &endpoints[1], &mut source, &mut inbound);
+    }
+    assert_eq!(inbound.application().unwrap().received, BATCH);
+    // An ordinary owner rebuild keeps work hints for this same trust and actor.
+    endpoints[1] = endpoint(1);
+
+    // This is a new outgoing peer: it has no per-peer table cursor to resume.
+    let (mut outbound, mut other) = (PeerRepair::default(), PeerRepair::default());
+    for _ in 0..TABLE_BURST {
+        exchange_round(&endpoints[1], &endpoints[2], &mut outbound, &mut other);
+        let report = outbound.application().unwrap();
+        assert_eq!(report.table, Some(tables[1].0.digest()));
+        assert_eq!(report.received, BATCH);
+    }
+    exchange_round(&endpoints[1], &endpoints[2], &mut outbound, &mut other);
+    assert_eq!(
+        outbound.application().unwrap().table,
+        Some(tables[0].0.digest())
+    );
+    exchange_round(&endpoints[1], &endpoints[2], &mut outbound, &mut other);
+    assert_eq!(outbound.application().unwrap().received, 1);
+    let bootstrap = lab.bootstrap(1);
+    let session = Session::observe(&bootstrap).unwrap();
+    let store = Store::observe(&session, &tables[1].1[1], tables[1].0).unwrap();
+    assert_eq!(store.inventory(&session).unwrap().count(), count);
+}
+
+#[test]
+fn duplicate_receipts_do_not_clear_other_missing_ids() {
+    let table = [9; 32];
+    let tables = BTreeSet::from([table]);
+    let known = BTreeSet::from([[1; 32], [2; 32]]);
+    let remote = BTreeSet::from([[1; 32], [2; 32], [3; 32], [4; 32]]);
+    let mut backfill = Backfill::default();
+    backfill.observe(table, &known, &remote);
+    backfill.retained(table, [3; 32]);
+    backfill.retained(table, [3; 32]);
+    // A newer local count and a less-informed peer still supply no record 4.
+    let grown = BTreeSet::from([[1; 32], [2; 32], [3; 32], [8; 32]]);
+    backfill.observe(table, &grown, &known);
+    assert_eq!(backfill.next(&tables, &tables), Some(table));
+    backfill.retained(table, [4; 32]);
+    assert_eq!(backfill.next(&tables, &tables), None);
+}
+
+#[test]
+fn missing_id_hints_keep_inventory_and_table_bounds() {
+    let table = [9; 32];
+    let inventory = |start| {
+        (start..start + MAX_RECORDS)
+            .map(|index| {
+                let mut id = [0; 32];
+                id[..8].copy_from_slice(&u64::try_from(index).unwrap().to_le_bytes());
+                id
+            })
+            .collect::<BTreeSet<_>>()
+    };
+    let first = inventory(0);
+    let second = inventory(MAX_RECORDS);
+    let mut backfill = Backfill::default();
+    backfill.observe(table, &BTreeSet::new(), &first);
+    backfill.observe(table, &BTreeSet::new(), &second);
+    assert_eq!(backfill.wanted[&table], first);
+    // Learning the first set locally frees its slots for the next inventory.
+    backfill.observe(table, &first, &second);
+    assert_eq!(backfill.wanted[&table], second);
+    for index in 0..=MAX_TABLES {
+        let mut other = [0; 32];
+        other[..8].copy_from_slice(&u64::try_from(index).unwrap().to_le_bytes());
+        backfill.observe(other, &BTreeSet::new(), &BTreeSet::from([[5; 32]]));
+    }
+    assert_eq!(backfill.wanted.len(), MAX_TABLES);
+}
+
+#[test]
+fn concurrent_local_writes_do_not_erase_a_remote_backlog() {
+    let lab = Lab::new(&[Role::Writer; 3]);
+    let mut tables = Vec::new();
+    for index in 0..2 {
+        let paths: [PathBuf; 3] =
+            std::array::from_fn(|node| lab._home.path().join(format!("growing-{index}-{node}")));
+        let bootstrap = lab.bootstrap(0);
+        let session = Session::open(&bootstrap).unwrap();
+        let scope = Store::create(&session, &paths[0]).unwrap().scope();
+        drop(session);
+        for (node, path) in paths.iter().enumerate().skip(1) {
+            let bootstrap = lab.bootstrap(node);
+            let session = Session::open(&bootstrap).unwrap();
+            Store::join(&session, path, scope).unwrap();
+        }
+        tables.push((scope, paths));
+    }
+    tables.sort_by_key(|(scope, _)| scope.digest());
+    let bootstrap = lab.bootstrap(0);
+    let session = Session::open(&bootstrap).unwrap();
+    for (index, (scope, paths)) in tables.iter().enumerate() {
+        let mut store = Store::open(&session, &paths[0], *scope).unwrap();
+        for _ in 0..if index == 0 { 1 } else { 2 * BATCH + 1 } {
+            store.commit_catalog(&session, b"source backlog").unwrap();
+        }
+    }
+    drop(session);
+    let cache = crate::control::PeerCache::default();
+    let endpoints: Vec<_> = (0..3)
+        .map(|node| {
+            let endpoint = Endpoint::from_bootstrap(&lab.bootstrap(node))
+                .unwrap()
+                .unwrap()
+                .with_tables(
+                    lab.paths[node].clone(),
+                    tables
+                        .iter()
+                        .map(|(scope, paths)| (*scope, paths[node].clone()))
+                        .collect(),
+                )
+                .unwrap();
+            if node == 1 {
+                endpoint.with_repair_cache(&cache)
+            } else {
+                endpoint
+            }
+        })
+        .collect();
+    let (mut source, mut receiver) = (PeerRepair::default(), PeerRepair::default());
+    for _ in 0..2 {
+        exchange_round(&endpoints[0], &endpoints[1], &mut source, &mut receiver);
+    }
+    assert_eq!(receiver.application().unwrap().received, BATCH);
+
+    // These new records bring the receiver's count up to the source's old
+    // count, but none fills a hole left by the source's first batch.
+    let bootstrap = lab.bootstrap(1);
+    let session = Session::open(&bootstrap).unwrap();
+    let mut store = Store::open(&session, &tables[1].1[1], tables[1].0).unwrap();
+    for _ in 0..BATCH + 1 {
+        store
+            .commit_catalog(&session, b"unrelated local write")
+            .unwrap();
+    }
+    drop(store);
+    drop(session);
+
+    // A less-informed peer offers no missing source records. Its round
+    // must not erase the backlog before the receiver asks the source again.
+    let (mut outbound, mut less_informed) = (PeerRepair::default(), PeerRepair::default());
+    exchange_round(
+        &endpoints[1],
+        &endpoints[2],
+        &mut outbound,
+        &mut less_informed,
+    );
+    assert_eq!(
+        outbound.application().unwrap().table,
+        Some(tables[1].0.digest())
+    );
+    exchange_round(&endpoints[1], &endpoints[0], &mut receiver, &mut source);
+    let recovered = receiver.application().unwrap();
+    assert_eq!(
+        recovered.table,
+        Some(tables[1].0.digest()),
+        "matching record counts must not discard missing record identities"
+    );
+    assert_eq!(recovered.received, BATCH);
+    for _ in 0..TABLE_BURST + 1 {
+        exchange_round(&endpoints[1], &endpoints[0], &mut receiver, &mut source);
+    }
+    let inventories: Vec<BTreeSet<_>> = (0..2)
+        .map(|node| {
+            let bootstrap = lab.bootstrap(node);
+            let session = Session::observe(&bootstrap).unwrap();
+            Store::observe(&session, &tables[1].1[node], tables[1].0)
+                .unwrap()
+                .inventory(&session)
+                .unwrap()
+                .copied()
+                .collect()
+        })
+        .collect();
+    assert_eq!(inventories[0], inventories[1]);
+    assert_eq!(inventories[1].len(), 3 * BATCH + 2);
+}
+
+#[test]
+fn empty_regular_scans_do_not_restore_a_spent_hint_allowance() {
+    let table = [1; 32];
+    let other = [2; 32];
+    let tables = BTreeSet::from([table, other]);
+    let mut backfill = Backfill::default();
+    backfill.observe(table, &BTreeSet::new(), &BTreeSet::from([[3; 32]]));
+    for _ in 0..TABLE_BURST {
+        assert_eq!(backfill.next(&tables, &tables), Some(table));
+    }
+    assert_eq!(backfill.next(&tables, &tables), None);
+    assert_eq!(backfill.regular(&BTreeSet::new(), None), None);
+    assert_eq!(backfill.next(&tables, &tables), None);
+    assert_eq!(backfill.regular(&tables, Some(table)), Some(other));
+    assert_eq!(backfill.next(&tables, &tables), Some(table));
+}
+
+#[test]
+fn stale_backlog_yields_across_first_contact_peers() {
+    let nodes = TABLE_BURST + 4;
+    let roles = vec![Role::Writer; nodes];
+    let lab = Lab::new(&roles);
+    let mut tables = Vec::new();
+    for index in 0..2 {
+        let paths: Vec<_> = (0..nodes)
+            .map(|node| {
+                lab._home
+                    .path()
+                    .join(format!("first-contact-{index}-{node}"))
+            })
+            .collect();
+        let bootstrap = lab.bootstrap(0);
+        let session = Session::open(&bootstrap).unwrap();
+        let scope = Store::create(&session, &paths[0]).unwrap().scope();
+        drop(session);
+        for (node, path) in paths.iter().enumerate().skip(1) {
+            let bootstrap = lab.bootstrap(node);
+            let session = Session::open(&bootstrap).unwrap();
+            Store::join(&session, path, scope).unwrap();
+        }
+        tables.push((scope, paths));
+    }
+    tables.sort_by_key(|(scope, _)| scope.digest());
+    let bootstrap = lab.bootstrap(0);
+    let session = Session::open(&bootstrap).unwrap();
+    let mut source = Store::open(&session, &tables[0].1[0], tables[0].0).unwrap();
+    for _ in 0..BATCH + 1 {
+        source
+            .commit_catalog(&session, b"temporarily absent source")
+            .unwrap();
+    }
+    drop(source);
+    drop(session);
+    for node in 3..nodes {
+        let bootstrap = lab.bootstrap(node);
+        let session = Session::open(&bootstrap).unwrap();
+        Store::open(&session, &tables[1].1[node], tables[1].0)
+            .unwrap()
+            .commit_catalog(&session, b"available on a fresh peer")
+            .unwrap();
+    }
+    let cache = crate::control::PeerCache::default();
+    let endpoints: Vec<_> = (0..nodes)
+        .map(|node| {
+            let endpoint = Endpoint::from_bootstrap(&lab.bootstrap(node))
+                .unwrap()
+                .unwrap()
+                .with_tables(
+                    lab.paths[node].clone(),
+                    tables
+                        .iter()
+                        .map(|(scope, paths)| (*scope, paths[node].clone()))
+                        .collect(),
+                )
+                .unwrap();
+            if node == 1 {
+                endpoint.with_repair_cache(&cache)
+            } else {
+                endpoint
+            }
+        })
+        .collect();
+    // The receiver's ordinary first-contact scan has visited table zero.
+    exchange_round(
+        &endpoints[1],
+        &endpoints[2],
+        &mut PeerRepair::default(),
+        &mut PeerRepair::default(),
+    );
+    let (mut source_state, mut received) = (PeerRepair::default(), PeerRepair::default());
+    exchange_round(
+        &endpoints[0],
+        &endpoints[1],
+        &mut source_state,
+        &mut received,
+    );
+    assert_eq!(received.application().unwrap().received, BATCH);
+
+    // Each available peer gets one contact. None has the missing source
+    // record, but all have useful data in the other table.
+    for node in 3..nodes {
+        exchange_round(
+            &endpoints[1],
+            &endpoints[node],
+            &mut PeerRepair::default(),
+            &mut PeerRepair::default(),
+        );
+    }
+    let bootstrap = lab.bootstrap(1);
+    let session = Session::observe(&bootstrap).unwrap();
+    let available = Store::observe(&session, &tables[1].1[1], tables[1].0)
+        .unwrap()
+        .inventory(&session)
+        .unwrap()
+        .count();
+    assert!(available > 0, "a stale hint consumed every first contact");
+    drop(session);
+
+    // Yielding the scan preserves the original missing record for when its
+    // source participates again.
+    exchange_round(
+        &endpoints[0],
+        &endpoints[1],
+        &mut source_state,
+        &mut received,
+    );
+    assert_eq!(received.application().unwrap().received, 1);
+}
+
+#[test]
+fn rebuilt_endpoints_keep_the_scan_without_preserving_revoked_access() {
+    table_scan_case(true, false);
+    table_scan_case(true, true);
+}
+
+fn table_scan_case(rebuild: bool, retain_hints: bool) {
+    let p = Pair::new(false, 0);
+    let mut tables = vec![(p.scope, p.paths.clone())];
+    for index in 1..3 {
+        let paths = [
+            p.lab._home.path().join(format!("cursor-{index}-a")),
+            p.lab._home.path().join(format!("cursor-{index}-b")),
+        ];
+        let bootstrap = p.lab.bootstrap(0);
+        let session = Session::open(&bootstrap).unwrap();
+        let scope = Store::create(&session, &paths[0]).unwrap().scope();
+        drop(session);
+        let bootstrap = p.lab.bootstrap(1);
+        let session = Session::open(&bootstrap).unwrap();
+        Store::join(&session, &paths[1], scope).unwrap();
+        drop(session);
+        tables.push((scope, paths));
+    }
+    tables.sort_by_key(|(scope, _)| scope.digest());
+    let bootstrap = p.lab.bootstrap(0);
+    let session = Session::open(&bootstrap).unwrap();
+    let last = &tables[2];
+    let expected = Store::open(&session, &last.1[0], last.0)
+        .unwrap()
+        .commit_catalog(&session, b"last table must not starve")
+        .unwrap()
+        .id;
+    drop(session);
+    let endpoint = |node| {
+        Endpoint::from_bootstrap(&p.lab.bootstrap(node))
+            .unwrap()
+            .unwrap()
+            .with_tables(
+                p.lab.paths[node].clone(),
+                tables
+                    .iter()
+                    .map(|(scope, paths)| (*scope, paths[node].clone()))
+                    .collect(),
+            )
+            .unwrap()
+    };
+    let cache = crate::control::PeerCache::default();
+    let sender = || {
+        let endpoint = endpoint(0);
+        if retain_hints {
+            endpoint.with_repair_cache(&cache)
+        } else {
+            endpoint
+        }
+    };
+    let mut stable = sender();
+    let mut outbound = PeerRepair::default();
+    for (scope, _) in &tables {
+        if rebuild {
+            stable = sender();
+            outbound = PeerRepair::default();
+        }
+        p.round(
+            &stable,
+            &endpoint(1),
+            &mut outbound,
+            &mut PeerRepair::default(),
+        );
+        let selected = if rebuild && !retain_hints {
+            tables[0].0
+        } else {
+            *scope
+        };
+        assert_eq!(
+            outbound.application().unwrap().table,
+            Some(selected.digest())
+        );
+        // A restarted peer begins its own scan at the first table. Its inbound
+        // selection must not rewind the stable endpoint's outgoing scan.
+        let mut incoming = PeerRepair::default();
+        p.round(
+            &endpoint(1),
+            &stable,
+            &mut PeerRepair::default(),
+            &mut incoming,
+        );
+        assert_eq!(
+            incoming.application().unwrap().table,
+            Some(tables[0].0.digest())
+        );
+    }
+    let bootstrap = p.lab.bootstrap(1);
+    let session = Session::observe(&bootstrap).unwrap();
+    let retained = Store::open(&session, &last.1[1], last.0).unwrap();
+    assert_eq!(
+        retained
+            .inventory(&session)
+            .unwrap()
+            .copied()
+            .collect::<BTreeSet<_>>(),
+        if rebuild && !retain_hints {
+            BTreeSet::new()
+        } else {
+            BTreeSet::from([expected])
+        }
+    );
+    drop(retained);
+    drop(session);
+    if retain_hints {
+        let old_peer = endpoint(1);
+        let before = std::fs::read(last.1[1].join("table.astream")).unwrap();
+        p.retire_b();
+        let bootstrap = p.lab.bootstrap(0);
+        let session = Session::open(&bootstrap).unwrap();
+        Store::open(&session, &last.1[0], last.0)
+            .unwrap()
+            .commit_catalog(&session, b"after peer removal")
+            .unwrap();
+        drop(session);
+        let (mut sent, mut received) = (PeerRepair::default(), PeerRepair::default());
+        p.round(&sender(), &old_peer, &mut sent, &mut received);
+        assert!(sent.application().is_none() && received.application().is_none());
+        assert_eq!(
+            std::fs::read(last.1[1].join("table.astream")).unwrap(),
+            before
+        );
+    }
+}
+
+#[test]
+fn unavailable_inventories_preserve_the_local_refusal_and_clear_after_repair() {
+    for broken in 0..2 {
+        let p = Pair::new(false, 1);
+        let endpoints = [p.endpoint(0, true), p.endpoint(1, true)];
+        let checkpoint = p.paths[broken].join("table.checkpoint");
+        let saved = p.paths[broken].join("saved-checkpoint");
+        let original = std::fs::read(p.paths[broken].join("table.astream")).unwrap();
+        std::fs::rename(&checkpoint, &saved).unwrap();
+        let bootstrap = p.lab.bootstrap(broken);
+        let session = Session::observe(&bootstrap).unwrap();
+        let error = Store::open(&session, &p.paths[broken], p.scope)
+            .err()
+            .unwrap()
+            .to_string();
+        drop(session);
+        let mut repairs = [PeerRepair::default(), PeerRepair::default()];
+        let [ra, rb] = &mut repairs;
+        p.round(&endpoints[0], &endpoints[1], ra, rb);
+        for (node, repair) in repairs.iter().enumerate() {
+            assert!(repair.application_error().is_none());
+            let report = repair.application().unwrap();
+            assert_eq!(report.table, Some(p.scope.digest()));
+            assert_eq!((report.sent, report.received, report.deferred), (0, 0, 1));
+            assert!(report.local_known.is_none() && report.peer_known.is_none());
+            let why = repair.application_deferral().unwrap();
+            assert_eq!(why.inventory, "conflicts");
+            assert_eq!(
+                why.local_error.as_deref(),
+                (node == broken).then_some(error.as_str())
+            );
+            assert_eq!(why.peer_unavailable, node != broken);
+            assert!(!why.retaining_primary_conflicts);
+        }
+        assert!(!checkpoint.exists());
+        assert_eq!(
+            std::fs::read(p.paths[broken].join("table.astream")).unwrap(),
+            original
+        );
+        std::fs::rename(&saved, &checkpoint).unwrap();
+        let [ra, rb] = &mut repairs;
+        p.round(&endpoints[0], &endpoints[1], ra, rb);
+        for repair in &repairs {
+            assert!(repair.application_deferral().is_none());
+            assert!(repair.application_error().is_none());
+            assert_eq!(repair.application().unwrap().deferred, 0);
+        }
+        assert_eq!((p.count(0), p.count(1)), (1, 1));
+    }
+}
+
 fn damaged_table_is_unavailable_and_never_reset_or_acknowledged() -> (i64, i64, i64) {
     let p = Pair::new(false, 1);
     let (a, b) = (p.endpoint(0, true), p.endpoint(1, true));
@@ -478,9 +1380,7 @@ fn damaged_table_is_unavailable_and_never_reset_or_acknowledged() -> (i64, i64, 
 
 fn a_damaged_neighbor_does_not_starve_healthy_table_repair() -> [i64; 4] {
     let mut observed = [1, 1, 1, 0];
-    for case in aterm_spec::check::each_on(aterm_spec::fs_lane::PLACES, &[0, 1, 2, 3], |&case| {
-        damaged_neighbor_case(case)
-    }) {
+    for case in aterm_spec::fs_lane::each(&[0, 1, 2, 3], |&case| damaged_neighbor_case(case)) {
         for (all, this) in observed.iter_mut().zip(case).take(3) {
             *all &= this;
         }
@@ -566,8 +1466,10 @@ fn damaged_neighbor_case(case: usize) -> [i64; 4] {
         } else {
             (rb.application().unwrap(), ra.application().unwrap())
         };
-        let selected = if turn % 2 == 0 { damaged } else { healthy };
-        assert_eq!(offered.table, Some(tables[selected].0.digest()));
+        let selected = tables
+            .iter()
+            .position(|(scope, _)| offered.table == Some(scope.digest()))
+            .expect("one of the provisioned tables was selected");
         assert_eq!(received.table, offered.table);
         let authenticated = ra.actor().is_some() && rb.actor().is_some();
         assert!(authenticated);
@@ -576,11 +1478,13 @@ fn damaged_neighbor_case(case: usize) -> [i64; 4] {
             observed[3] |= i64::from(offered.sent > 0 || received.received > 0);
             assert_eq!((offered.sent, received.received), (0, 0));
             assert_eq!((offered.deferred, received.deferred), (1, 1));
+            assert!(!offered.caught_up, "a deferred table caught nobody up");
             refused += 1;
         } else {
             let expected = BATCH.min(records - acknowledged);
             assert_eq!((offered.sent, received.received), (expected, expected));
             acknowledged += expected;
+            assert_eq!(offered.caught_up, acknowledged == records);
         }
         let bootstrap = p.lab.bootstrap(receiver);
         let session = Session::open(&bootstrap).unwrap();
@@ -600,7 +1504,8 @@ fn damaged_neighbor_case(case: usize) -> [i64; 4] {
             original
         );
     }
-    assert_eq!((acknowledged, refused), (records, 3));
+    assert_eq!(acknowledged, records);
+    assert!(refused > 0 && refused < 6);
     observed[0] &= i64::from(stored == records);
     observed[1] &= i64::from(acknowledged == records);
 
@@ -665,6 +1570,191 @@ impl Write for LostAck {
         Ok(())
     }
 }
+
+struct LostReceipt {
+    stream: std::os::unix::net::UnixStream,
+    receipt: Option<Digest>,
+    failed: bool,
+}
+impl Read for LostReceipt {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.stream.read(bytes)
+    }
+}
+impl Write for LostReceipt {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.receipt.as_ref().is_some_and(|id| bytes == id) {
+            self.failed = true;
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "lost receipt"));
+        }
+        self.stream.write(bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
+    }
+}
+
+#[test]
+fn interrupted_application_reports_durable_ingestion_without_a_receipt() {
+    let pair = Pair::new(false, 1);
+    let id = {
+        let bootstrap = pair.lab.bootstrap(0);
+        let session = Session::observe(&bootstrap).unwrap();
+        let store = Store::observe(&session, &pair.paths[0], pair.scope).unwrap();
+        *store.inventory(&session).unwrap().next().unwrap()
+    };
+    let (sender, receiver) = (pair.replica(0), pair.replica(1));
+    let exchange = |lose_receipt: bool, repairs: &mut [Repair; 2]| {
+        let (mut left, right) = std::os::unix::net::UnixStream::pair().unwrap();
+        for stream in [&left, &right] {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(60)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(60)))
+                .unwrap();
+        }
+        let (sender, receiver) = (&sender, &receiver);
+        let (client, server) = repairs.split_at_mut(1);
+        thread::scope(|threads| {
+            let worker = threads.spawn(move || {
+                let mut stream = LostReceipt {
+                    stream: right,
+                    receipt: lose_receipt.then_some(id),
+                    failed: false,
+                };
+                let result =
+                    receiver.exchange(&mut stream, sender.actor, Side::Responder, &mut server[0]);
+                (result, stream.failed)
+            });
+            let result =
+                sender.exchange(&mut left, receiver.actor, Side::Initiator, &mut client[0]);
+            drop(left);
+            let (received, failed) = worker.join().unwrap();
+            ([result, received], failed)
+        })
+    };
+    let mut repairs = [Repair::default(), Repair::default()];
+    let (failed, receipt_lost) = exchange(true, &mut repairs);
+    assert!(receipt_lost);
+    assert!(failed.iter().all(Result::is_err));
+    assert_eq!(pair.count(1), 1);
+    let received = repairs[1]
+        .interrupted
+        .expect("failed exchange must retain observed ingestion");
+    assert_eq!(received.table, Some(pair.scope.digest()));
+    assert_eq!(received.received, 1);
+    assert_eq!(received.sent, 0);
+    assert_eq!(repairs[0].interrupted.unwrap().sent, 0);
+
+    let (retried, receipt_lost) = exchange(false, &mut repairs);
+    assert!(!receipt_lost);
+    assert!(retried.iter().all(Result::is_ok), "{retried:?}");
+    assert!(repairs.iter().all(|repair| repair.interrupted.is_none()));
+    assert_eq!(pair.count(1), 1);
+    assert_eq!(retried[1].as_ref().unwrap().received, 0);
+}
+
+#[test]
+fn failed_table_exchange_names_its_table_and_stage() {
+    let pair = Pair::new(false, 1);
+    let receiver = pair.replica(1);
+    let sender = pair.replica(0);
+    let before = std::fs::read(pair.paths[1].join("table.astream")).unwrap();
+    let mut repair = Repair::default();
+    let error = receiver
+        .round(sender.actor)
+        .unwrap()
+        .table(
+            &mut LostAck {
+                input: Cursor::new(Vec::new()),
+            },
+            sender.actor,
+            Side::Initiator,
+            pair.scope.digest(),
+            &mut repair,
+            &mut Report::default(),
+        )
+        .unwrap_err();
+    let diagnostic = error.to_string();
+    assert!(diagnostic.contains(&aterm_codec::hex::encode_lower(&pair.scope.digest())));
+    assert!(diagnostic.contains("conflicts"));
+    assert!(diagnostic.contains("lost acknowledgement"));
+    assert_eq!(
+        std::fs::read(pair.paths[1].join("table.astream")).unwrap(),
+        before
+    );
+    assert_eq!(pair.count(1), 0);
+
+    let (mut left, mut right) = (PeerRepair::default(), PeerRepair::default());
+    pair.round(
+        &pair.endpoint(0, true),
+        &pair.endpoint(1, true),
+        &mut left,
+        &mut right,
+    );
+    assert_eq!(pair.count(1), 1);
+    assert!(
+        [left, right]
+            .iter()
+            .all(|repair| repair.application_error().is_none())
+    );
+}
+
+#[test]
+fn empty_batches_recheck_authority_without_reopening_unrequested_data() {
+    let pair = Pair::new(false, 1);
+    let sender = pair.replica(0);
+    let peer = pair.replica(1).actor;
+    let round = sender.round(peer).unwrap();
+    let table = pair.scope.digest();
+    round.active_table.set(Some(table));
+    let inventory = round.inventory(peer, table, &mut None).unwrap().unwrap();
+    let record = *inventory.known.first().unwrap();
+    let original = std::fs::read(pair.paths[0].join("table.astream")).unwrap();
+    let held = pair.lab._home.path().join("held-table-a");
+    std::fs::rename(&pair.paths[0], &held).unwrap();
+
+    assert!(
+        round
+            .prepare_batch(peer, table, &[] as &[Digest], |_, _, _| {
+                panic!("an empty batch encodes no table records")
+            })
+            .expect("an empty batch needs no unrequested table data")
+            .is_empty()
+    );
+    assert!(
+        round
+            .prepare_batch(peer, table, &[record], |_, _, _| {
+                panic!("unavailable table data cannot supply a requested record")
+            })
+            .is_err()
+    );
+
+    std::fs::rename(&held, &pair.paths[0]).unwrap();
+    assert_eq!(
+        std::fs::read(pair.paths[0].join("table.astream")).unwrap(),
+        original
+    );
+    assert_eq!((pair.count(0), pair.count(1)), (1, 0));
+    let (mut left, mut right) = (PeerRepair::default(), PeerRepair::default());
+    pair.round(
+        &pair.endpoint(0, true),
+        &pair.endpoint(1, true),
+        &mut left,
+        &mut right,
+    );
+    assert_eq!(pair.count(1), 1);
+    pair.retire_b();
+    assert!(
+        round
+            .prepare_batch(peer, table, &[] as &[Digest], |_, _, _| {
+                panic!("an empty batch grants no stale peer authority")
+            })
+            .is_err()
+    );
+}
+
 fn lost_acknowledgement_retries_the_same_durable_record_once(retry_ack: bool) -> (i64, i64, i64) {
     let p = Pair::new(false, 1);
     let a = p.lab.bootstrap(0);
@@ -682,6 +1772,7 @@ fn lost_acknowledgement_retries_the_same_durable_record_once(retry_ack: bool) ->
     let mut failing = LostAck {
         input: Cursor::new(batch.clone()),
     };
+    let mut interrupted = Report::default();
     assert!(
         b.round(actor)
             .unwrap()
@@ -690,11 +1781,16 @@ fn lost_acknowledgement_retries_the_same_durable_record_once(retry_ack: bool) ->
                 actor,
                 p.scope.digest(),
                 BatchKind::Operation,
-                &mut Report::default()
+                &mut Repair::default(),
+                &mut interrupted
             )
             .is_err()
     );
     assert_eq!(p.count(1), 1);
+    assert_eq!(
+        interrupted.received, 1,
+        "durable ingestion remains observed when its receipt cannot be sent"
+    );
     if !retry_ack {
         return (p.count(1) as i64, 0, 0);
     }
@@ -707,6 +1803,7 @@ fn lost_acknowledgement_retries_the_same_durable_record_once(retry_ack: bool) ->
             actor,
             p.scope.digest(),
             BatchKind::Operation,
+            &mut Repair::default(),
             &mut report,
         )
         .unwrap();
@@ -733,6 +1830,91 @@ fn wire_bounds_and_fair_rotation_do_not_depend_on_acknowledgements() {
         next.contains(&[1; 32]),
         "deferred records are revisited after wraparound"
     );
+}
+
+/// A round catches the peer up on a table only once the peer lacks nothing of it this side
+/// offered: a round that leaves some for a later one (more than a batch) has not, so a push never
+/// reads a peer reached that may lack the pushed row. The side that offered nothing the peer
+/// lacked is caught up at once.
+///
+/// NEGATIVE CONTROL: drop the `whole` term (`report.caught_up` whenever the peer accepted the
+/// batch sent), and the first round, which leaves four operations for the next, reads as caught
+/// up.
+#[test]
+fn a_round_catches_the_peer_up_only_once_it_lacks_nothing_of_the_table() {
+    let records = BATCH + 4;
+    let p = Pair::new(false, records);
+    let (a, b) = (p.endpoint(0, true), p.endpoint(1, true));
+    let (mut ra, mut rb) = (PeerRepair::default(), PeerRepair::default());
+    p.round(&a, &b, &mut ra, &mut rb);
+    let first = ra.application().expect("a completed application round");
+    assert_eq!((first.sent, p.count(1)), (BATCH, BATCH));
+    assert!(!first.caught_up, "four operations wait for the next round");
+    assert!(
+        rb.application().expect("the responder's round").caught_up,
+        "the peer offered nothing this side lacked"
+    );
+    p.round(&a, &b, &mut ra, &mut rb);
+    let second = ra.application().expect("a completed application round");
+    assert_eq!((second.sent, p.count(1)), (records - BATCH, records));
+    assert!(second.caught_up);
+}
+
+/// A push's table goes first: while the initiator's push names a table both sides hold, its round
+/// repairs that one, though the turn would take the other.
+///
+/// NEGATIVE CONTROL: make the initiator's choice ignore `first` (only `cycle`), and the round
+/// repairs the lower table, the turn's.
+#[test]
+fn a_pushed_table_is_repaired_before_the_tables_turn() {
+    let p = Pair::new(false, 1);
+    let other_paths = [
+        p.lab._home.path().join("other-a"),
+        p.lab._home.path().join("other-b"),
+    ];
+    let bootstrap = p.lab.bootstrap(0);
+    let session = Session::open(&bootstrap).unwrap();
+    let mut other = Store::create(&session, &other_paths[0]).unwrap();
+    other.commit_catalog(&session, b"pushed edit").unwrap();
+    let other_scope = other.scope();
+    drop(other);
+    drop(session);
+    let bootstrap = p.lab.bootstrap(1);
+    let session = Session::open(&bootstrap).unwrap();
+    Store::join(&session, &other_paths[1], other_scope).unwrap();
+    drop(session);
+    let tables = [(p.scope, p.paths.clone()), (other_scope, other_paths)];
+    let endpoint = |node: usize| {
+        Endpoint::from_bootstrap(&p.lab.bootstrap(node))
+            .unwrap()
+            .unwrap()
+            .with_tables(
+                p.lab.paths[node].clone(),
+                tables
+                    .iter()
+                    .map(|(scope, paths)| (*scope, paths[node].clone()))
+                    .collect(),
+            )
+            .unwrap()
+    };
+    let (lower, higher) = if p.scope.digest() < other_scope.digest() {
+        (p.scope.digest(), other_scope.digest())
+    } else {
+        (other_scope.digest(), p.scope.digest())
+    };
+    assert_eq!(
+        cycle(&BTreeSet::from([lower, higher]), None).next(),
+        Some(&lower),
+        "the turn takes the lower table first"
+    );
+    let mut a = endpoint(0);
+    a.prefer(std::sync::Arc::new(std::sync::Mutex::new(Some(higher))));
+    let b = endpoint(1);
+    let (mut ra, mut rb) = (PeerRepair::default(), PeerRepair::default());
+    p.round(&a, &b, &mut ra, &mut rb);
+    let report = ra.application().expect("a completed application round");
+    assert_eq!(report.table, Some(higher), "the pushed table went first");
+    assert_eq!(report.sent, 1);
 }
 
 /// Execute finite model transitions against actual TLS, custody and durable logs.
@@ -815,11 +1997,9 @@ fn real_repair_conforms_and_receipt_without_storage_mutant_is_detected() {
         model.actions.len()
     );
     let initial = model.init_state();
-    // Each transition's real scenario builds its own Lab, so they run on every core.
+    // Each transition's real scenario builds its own Lab, so they run on the lane's places.
     let names: Vec<&'static str> = model.actions.iter().map(|action| action.name).collect();
-    let actuals = aterm_spec::check::each_on(aterm_spec::fs_lane::PLACES, &names, |name| {
-        repair_transition(&initial, name)
-    });
+    let actuals = aterm_spec::fs_lane::each(&names, |name| repair_transition(&initial, name));
     for (action, actual) in model.actions.iter().zip(actuals) {
         assert!(
             model.successors(action.name, &initial).contains(&actual),
@@ -1061,6 +2241,7 @@ fn blocking_reads_cannot_turn_a_changed_roster_into_a_successful_round() {
                 actor,
                 p.scope.digest(),
                 kind,
+                &mut Repair::default(),
                 &mut Report::default(),
             )
         };
@@ -1160,6 +2341,7 @@ fn lost_conflict_ack_retries_the_original_durable_certificate() {
     let mut lost = LostAck {
         input: Cursor::new(bytes.clone()),
     };
+    let mut interrupted = Report::default();
     assert!(
         b.round(actor)
             .unwrap()
@@ -1168,7 +2350,8 @@ fn lost_conflict_ack_retries_the_original_durable_certificate() {
                 actor,
                 p.scope.digest(),
                 BatchKind::Conflict,
-                &mut Report::default()
+                &mut Repair::default(),
+                &mut interrupted
             )
             .is_err()
     );
@@ -1176,6 +2359,10 @@ fn lost_conflict_ack_retries_the_original_durable_certificate() {
     let session = Session::open(&bootstrap).unwrap();
     let mut store = Store::open(&session, &p.paths[1], p.scope).unwrap();
     assert_eq!(store.conflict_inventory(&session).unwrap().len(), 1);
+    assert_eq!(
+        interrupted.conflicts_received, 1,
+        "durable conflict ingestion remains observed after a lost receipt"
+    );
     assert_eq!(store.inventory(&session).unwrap().count(), 0);
     let receipt = store.ingest_conflict(&session, &wire).unwrap();
     drop((store, session));
@@ -1188,6 +2375,7 @@ fn lost_conflict_ack_retries_the_original_durable_certificate() {
             actor,
             p.scope.digest(),
             BatchKind::Conflict,
+            &mut Repair::default(),
             &mut report,
         )
         .unwrap();
@@ -1195,6 +2383,66 @@ fn lost_conflict_ack_retries_the_original_durable_certificate() {
     let session = Session::open(&bootstrap).unwrap();
     let mut store = Store::open(&session, &p.paths[1], p.scope).unwrap();
     assert_eq!(store.ingest_conflict(&session, &wire).unwrap(), receipt);
+}
+
+#[test]
+fn application_greetings_bind_every_control_byte_in_both_directions() {
+    let observation = [37; 64];
+    for tag in [PROBE, READY] {
+        let frame = [tag, observation.as_slice()].concat();
+        assert_eq!(validate_probe(&frame, tag, &observation), Ok(()));
+        for offset in 0..observation.len() {
+            let mut changed = frame.clone();
+            changed[tag.len() + offset] ^= 1;
+            assert_eq!(
+                validate_probe(&changed, tag, &observation),
+                Err(ProbeMismatch::History {
+                    head_matches: offset >= 32,
+                    basis_matches: offset < 32,
+                })
+            );
+        }
+        let mut changed = frame.clone();
+        changed[tag.len()] ^= 1;
+        changed[tag.len() + 32] ^= 1;
+        assert_eq!(
+            validate_probe(&changed, tag, &observation),
+            Err(ProbeMismatch::History {
+                head_matches: false,
+                basis_matches: false
+            })
+        );
+    }
+}
+
+#[test]
+fn unsupported_or_malformed_greetings_are_not_control_history_observations() {
+    let observation = [37; 64];
+    for tag in [PROBE, READY] {
+        for wrong in [b"ACTP1", b"ACTA1", b"ACTP2", b"ACTA2", b"ACTP3", b"ACTA3"] {
+            if wrong.as_slice() == tag {
+                continue;
+            }
+            let frame = [wrong.as_slice(), observation.as_slice()].concat();
+            assert_eq!(
+                validate_probe(&frame, tag, &observation),
+                Err(ProbeMismatch::Protocol)
+            );
+        }
+        let frame = [tag, observation.as_slice()].concat();
+        for length in 0..frame.len() {
+            assert_eq!(
+                validate_probe(&frame[..length], tag, &observation),
+                Err(ProbeMismatch::Malformed)
+            );
+        }
+        let mut oversized = frame;
+        oversized.push(0);
+        assert_eq!(
+            validate_probe(&oversized, tag, &observation),
+            Err(ProbeMismatch::Malformed)
+        );
+    }
 }
 
 #[test]

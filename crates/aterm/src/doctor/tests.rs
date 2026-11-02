@@ -57,6 +57,7 @@ impl Scratch {
             home: Some(self.home()),
             exe: Some(self.release_exe()),
             rustup_home: Some(self.home().join(".rustup")),
+            zsh: Default::default(),
             login_rc: None,
             pass: Pass::Doctor,
             reads: Default::default(),
@@ -1500,6 +1501,46 @@ fn a_store_lock_that_cannot_be_taken_is_a_warning_and_nothing_is_repaired() {
     assert_eq!(shims.stood_aside, None, "not contention: {shims:?}");
 }
 
+/// THE COMMAND LINE TOOLS TAB NEVER WAITS FOR AN INSTALL PASS: its run (`aterm init --only
+/// base.clt`) composes init's base layer as a read ([`aterm_machines::init::lock_for`]), since
+/// Apple's Command Line Tools touch no store. With an install pass holding the store and a repair
+/// that would change it, nothing waits for the pass and no lock is taken before the tab's password
+/// prompt. CONTROL: a whole run waits for that pass.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_command_line_tools_tab_never_waits_for_an_install_pass_it_does_not_need() {
+    use aterm_machines::init::{BaseLock, lock_for};
+    let scratch = broken("clt-tab-lock");
+    let ground = scratch.ground();
+    let held = atpkg::lock::try_lock_store(&scratch.layout()).expect("the test holds the lock");
+    let waits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = {
+        let waits = Arc::clone(&waits);
+        move |layout: &Layout| {
+            waits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            atpkg::lock::try_lock_store(layout)
+        }
+    };
+    let only = [aterm_machines::init_clt::ID.to_owned()];
+    let base = super::init_base_over(&ground, lock_for(&only, BaseLock::Wait), Some(&counted))
+        .narrowed(&only);
+    assert!(base.held.is_none(), "the tab's run took no lock");
+    assert!(base.items.is_empty(), "narrowed to base.clt alone");
+    assert_eq!(
+        waits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the tab's run waited for the install pass holding the store"
+    );
+    let whole = super::init_base_over(&ground, lock_for(&[], BaseLock::Wait), Some(&counted));
+    assert_eq!(
+        waits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a whole run waits for the pass"
+    );
+    drop(whole);
+    drop(held);
+}
+
 /// INIT'S BASE LAYER AND THE STORE LOCK: held by an install pass, init leaves the pass its own
 /// items when nobody is at the terminal (each `NotApplicable`, exit 0, no second run), waits for
 /// the pass with a person there (the lock taken once the pass lets go), and stands each item
@@ -2259,6 +2300,28 @@ fn base_ai_accounts_names_each_kept_pool_after_claudes() {
         )
     );
     assert!(super::ai_accounts_others_only(&env));
+    // The vault sheet's rows that give one address conflicting assignments in a pool this
+    // machine syncs (Kimi's, whose roster it keeps) are said on the row, as `aterm init` and
+    // `aterm doctor` show it: the CLI and the rows, never the address. CONTROL: with no
+    // conflicting rows nothing is said.
+    let before = format!("{:?}", super::ai_accounts_probe(&env));
+    assert!(!before.contains("conflicting"), "{before}");
+    let sheet = secrets.join("ai-accounts.csv");
+    std::fs::write(
+        &sheet,
+        "email,computer,kimi,notes
+new@example.com,m16,global,
+NEW@example.com,m22,global,
+",
+    )
+    .unwrap();
+    let said = format!("{:?}", super::ai_accounts_probe(&env));
+    assert!(
+        said.contains("conflicting assignments (kimi rows 2, 3)")
+            && !said.to_ascii_lowercase().contains("new@example.com"),
+        "{said}"
+    );
+    std::fs::remove_file(&sheet).unwrap();
     // `[harness] accounts = "off"` turns the accounts' sync off, so the item has nothing to
     // apply (its apply would refuse) where the line above read the pools it would sync.
     std::fs::write(

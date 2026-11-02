@@ -635,7 +635,7 @@ fn private_dir(dir: &Path, home: &Path) -> Result<()> {
 /// `create_dir_all(dirs.config.parent())`, then `dirs.config` made private.
 #[cfg(unix)]
 fn config_dir(dirs: &Dirs) -> Result<()> {
-    if let Some(parent) = dirs.config.parent() {
+    if let Some(parent) = dirs.config.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)
             .map_err(|e| Error::could_not_run(format!("{}: {e}", tilde(parent, &dirs.home))))?;
     }
@@ -748,6 +748,8 @@ impl AuthEdit {
                 ),
             );
         }
+        aterm_uds::keep_out_of_children(&file)
+            .map_err(|e| Error::could_not_run(format!("{what}: {e}")))?;
         #[expect(
             clippy::disallowed_methods,
             reason = "the auth transaction guard releases by LOCK_UN before closing"
@@ -785,7 +787,7 @@ impl Drop for AuthEdit {
 /// `AuthEdit::take`'s.
 #[cfg(all(unix, any(test, debug_assertions)))]
 pub fn hold_auth_edit_for_tests(dirs: &Dirs) -> Result<impl Sized> {
-    if let Some(parent) = dirs.config.parent() {
+    if let Some(parent) = dirs.config.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(|e| Error::could_not_run(e.to_string()))?;
     }
     AuthEdit::take(dirs)

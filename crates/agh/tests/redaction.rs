@@ -278,3 +278,46 @@ fn a_note_still_redacts_tokens_and_learned_values() {
     let stderr = String::from_utf8(captured.stderr()).expect("utf-8");
     assert_eq!(stderr, "held [redacted] and [redacted]\n");
 }
+
+/// `agh_fake::basic(token)`: the padded Basic payload git sends for `token`.
+fn basic_of(token: &str) -> String {
+    let basic = agh_fake::basic(token);
+    assert!(!basic.is_empty(), "agh_fake::basic answers the payload");
+    basic
+}
+
+#[test]
+fn the_basic_credential_of_a_learned_token_is_redacted() {
+    let token = agh_fake::token("basic-learned");
+    let redactor = Redactor::new();
+    redactor.learn(token.as_bytes());
+    let padded = basic_of(&token);
+    let unpadded = padded.trim_end_matches('=').to_string();
+    for payload in [&padded, &unpadded] {
+        let out = redactor.apply(&format!("git sent {payload} to the helper"));
+        assert!(!out.contains(&unpadded), "{out}");
+        assert!(out.starts_with("git sent [redacted]"), "{out}");
+        assert!(out.ends_with(" to the helper"), "{out}");
+    }
+}
+
+#[test]
+fn a_basic_credential_is_a_shape() {
+    let token = agh_fake::token("basic-shape");
+    let basic = basic_of(&token);
+    assert_eq!(
+        Redactor::shapes(&format!("sent basic {basic}")),
+        "sent basic [redacted]"
+    );
+    assert_eq!(
+        Redactor::shapes(&format!("{{\"why\":\"sent Basic \\\"{basic}\\\" then\"}}")),
+        "{\"why\":\"sent Basic \\\"[redacted]\\\" then\"}"
+    );
+}
+
+#[test]
+fn basic_prose_is_left_alone() {
+    for prose in ["the basic configuration", "basic abcdefghijklmnopqr"] {
+        assert_eq!(Redactor::shapes(prose), prose);
+    }
+}

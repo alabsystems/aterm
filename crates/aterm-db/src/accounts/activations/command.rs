@@ -56,7 +56,7 @@ pub(super) fn run_at(
     if parents.windows(2).any(|p| p[0] == p[1]) {
         return Err(Error::new("duplicate account parent"));
     }
-    let key = if command == "accounts-authorize" {
+    let key = if matches!(command, "accounts-authorize" | "accounts-intent") {
         Some(take(&mut options, "--key")?.to_owned())
     } else {
         None
@@ -67,12 +67,19 @@ pub(super) fn run_at(
         None
     };
     empty(&options)?;
-    if !matches!(command, "accounts-authorize" | "accounts-stop") {
+    if !matches!(
+        command,
+        "accounts-authorize" | "accounts-intent" | "accounts-stop"
+    ) {
         return Err(Error::new("unknown account activation command"));
     }
     let admin = aterm_secrets::client::admin_open(&paths).map_err(crate::table::failure)?;
     let request = if let Some(key) = key {
-        db.configuration(&admin, account, &key, actor.unwrap(), parents)?
+        if command == "accounts-intent" {
+            db.intent_configuration(&admin, account, &key, parents)?
+        } else {
+            db.configuration(&admin, account, &key, actor.unwrap(), parents)?
+        }
     } else {
         db.stop_request(account, parents)?
     };

@@ -13,6 +13,7 @@ pub(crate) mod firefox;
 pub(crate) mod judge;
 pub(crate) mod page;
 pub(crate) mod recorded;
+pub(crate) mod safari;
 pub(crate) mod serve;
 pub(crate) mod webkit;
 
@@ -28,8 +29,7 @@ use crate::ladder::Report;
 use crate::perf::Status;
 use crate::{Ctx, EnvSnapshot, exit};
 
-const LABEL: &str =
-    "browser (both web modules in headless browsers: a WebGL2 boot, GPU vs CPU pixels)";
+const LABEL: &str = "browser (both web modules in browsers: a WebGL2 boot, GPU vs CPU pixels)";
 
 /// `cpu_gpu_parity.rs`'s grid.
 const ROWS: u16 = 6;
@@ -75,10 +75,22 @@ const GLOW_RUNOUT: usize = 4;
 const GLOW_FRAMES: usize = 1 + GLOW_KEYS.len() + GLOW_RUNOUT;
 /// The injected clock's step a frame, ms: a brisk typist's 25 keys a second.
 const GLOW_DT_MS: f64 = 40.0;
-/// The glow styles the scene types under: the Rainbow Kitty's ribbon lays
-/// its ramps under the ink; the comet's slabs lay theirs in the additive
-/// stream on a dark page, the ones the bloom and its crown read.
-const GLOW_STYLES: [&str; 2] = ["rainbow kitty", "comet"];
+/// The glow styles the scene types under, one a drawing path: the Rainbow
+/// Kitty's ribbon lays its ramps under the ink; the comet's slabs lay theirs
+/// in the additive stream on a dark page, the ones the bloom and its crown
+/// read; Lumen's glow ramps (its quads alone on paper); Laser's bolt caret;
+/// Sparkle's ribbon and sprites; Fire's caret glow (its quads alone on
+/// paper). The pet is not among them: in the scene's 15 frames its runs
+/// drew what the Rainbow Kitty's do, byte for byte, so its sprite is not
+/// reached here.
+const GLOW_STYLES: [&str; 6] = [
+    "rainbow kitty",
+    "comet",
+    "lumen",
+    "laser",
+    "sparkle",
+    "fire",
+];
 /// The light page's theme: fg, bg, cursor, selection.
 const LIGHT: [u32; 4] = [0x0020_2020, 0x00FA_FAF7, 0x0000_0000, 0x00B4_C8E6];
 /// The page themes the glow runs on: fg, bg, cursor, selection.
@@ -178,6 +190,8 @@ struct Session {
     /// The worker page, judged on its own row: its failure ends only that row.
     worker: Result<Page, Stop>,
     served: usize,
+    /// What its driver did beside the pages: owned automation cleanup and any uncertainty.
+    notes: Vec<String>,
 }
 
 fn ms(t0: Instant) -> f64 {
@@ -193,6 +207,9 @@ enum Engine {
     Firefox(firefox::Firefox),
     /// WebKit, driven by its pages; it keeps a window.
     WebKit(webkit::WebKit),
+    /// The system Safari, its first page opened over WebDriver and the rest driven by the pages;
+    /// its window takes the desk ([`Engine::takes_the_desk`]).
+    Safari(safari::Safari),
 }
 
 impl Engine {
@@ -202,7 +219,14 @@ impl Engine {
             Engine::Chromium(_, angle) => angle.name(),
             Engine::Firefox(_) => "firefox",
             Engine::WebKit(_) => "webkit",
+            Engine::Safari(_) => "safari",
         }
+    }
+
+    /// Whether the session's window is on the desktop and takes the focus, so it holds the quiet
+    /// machine while it runs ([`desk_claim`]).
+    const fn takes_the_desk(&self) -> bool {
+        matches!(self, Engine::Safari(_))
     }
 
     /// What the session's rows add to the lane's label.
@@ -211,6 +235,7 @@ impl Engine {
             Engine::Chromium(_, angle) => format!("WebGL2 on ANGLE {}", angle.name()),
             Engine::Firefox(_) => "Firefox".to_string(),
             Engine::WebKit(_) => "WebKit".to_string(),
+            Engine::Safari(_) => "Safari".to_string(),
         }
     }
 
@@ -236,6 +261,12 @@ impl Engine {
                     gpu.user_agent
                 )
             }),
+            Engine::Safari(_) => (!safari::is_safari(&gpu.user_agent)).then(|| {
+                format!(
+                    "the browser answered as \"{}\", not Safari: no safari session ran",
+                    gpu.user_agent
+                )
+            }),
         }
     }
 
@@ -247,42 +278,64 @@ impl Engine {
             }
             Engine::Firefox(firefox) => drive_firefox(firefox, site, work, profile),
             Engine::WebKit(webkit) => drive_webkit(webkit, site, work, profile),
+            Engine::Safari(safari) => drive_safari(safari, site, work),
         }
     }
 }
 
 /// Every session's name ([`Engine::name`]), as `browser-drive --engine` takes it.
-pub(crate) const ENGINES: [&str; 4] = ["metal", "swiftshader", "firefox", "webkit"];
+pub(crate) const ENGINES: [&str; 5] = ["metal", "swiftshader", "firefox", "webkit", "safari"];
 
-/// WebKit session participation in a run.
-enum WebKitRow {
-    /// Run it on the WebKit found; without one it is NOT RUN.
-    Run(Result<webkit::WebKit, String>),
-    /// Named skip under `--no-windows`, optionally carrying the missing-WebKit fix.
-    Skip(Option<&'static str>),
-    /// Not asked for (`browser-drive` without `--engine webkit`): no row.
+/// A session with a window of its own (WebKit's, Safari's): its part in a run.
+enum Windowed<T> {
+    /// Run it on the browser found; without one it is NOT RUN.
+    Run(Result<T, String>),
+    /// A named skip under `--no-windows`: its words, with the fix.
+    Skip(String),
+    /// Not asked for (`browser-drive` without its `--engine`), or no such browser on this host
+    /// (Safari off macOS): no row.
     Off,
+}
+
+/// Whether the lane's run in `ctx` has a session whose window takes the desk
+/// ([`Engine::takes_the_desk`]: Safari's, on macOS with its `safaridriver`, not under
+/// `--no-windows`). Its stage then runs on the run's quiet machine, admitted before the stage's
+/// memory as a timed stage's is (`takes_quiet` in the crate root), so the session holds no claim
+/// while it waits for one and takes none of its own.
+pub(crate) fn takes_the_desk(ctx: &Ctx) -> bool {
+    !ctx.no_windows && safari::find().is_ok()
 }
 
 /// Build, bind and serve both modules once, then boot the pages in each browser session.
 pub fn run(ctx: &Ctx, r: &mut Report) {
     let t0 = Instant::now();
     let (chromium, firefox, webkit) = (chromium::find(), firefox::find(), webkit::find());
-    let webkit_runs = webkit.is_ok() && !ctx.no_windows;
-    if let (Err(c), Err(f), false) = (&chromium, &firefox, webkit_runs) {
-        let w = match &webkit {
-            Err(w) => format!("; {w}"),
-            Ok(_) => String::new(),
-        };
+    let safari = safari::HERE.then(safari::find);
+    let windowed_runs =
+        !ctx.no_windows && (webkit.is_ok() || safari.as_ref().is_some_and(Result::is_ok));
+    if let (Err(c), Err(f), false) = (&chromium, &firefox, windowed_runs) {
+        let w: String = [
+            webkit.as_ref().err(),
+            safari.as_ref().and_then(|s| s.as_ref().err()),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|w| format!("; {w}"))
+        .collect();
         r.cannot_run(format!(
             "{LABEL} — {c}; {f}{w} (fix: targo --unverified verify provision)"
         ));
         return;
     }
     let webkit = if ctx.no_windows {
-        WebKitRow::Skip(webkit.is_err().then(webkit::fix))
+        Windowed::Skip(webkit::no_windows_skip(webkit.is_err().then(webkit::fix)))
     } else {
-        WebKitRow::Run(webkit)
+        Windowed::Run(webkit)
+    };
+    let safari = match safari {
+        None => Windowed::Off,
+        Some(_) if ctx.no_windows => Windowed::Skip(safari::no_windows_skip()),
+        Some(found) => Windowed::Run(found),
     };
     let work = crate::plan::cells_dir(ctx).join("browser");
     let site = work.join("site");
@@ -295,8 +348,9 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
         cost: Some(cost),
         scratch: ctx.scratch.clone(),
         ceiling: ctx.child_ceiling,
+        quiet: None,
     };
-    sessions(r, &built, &chromium, &firefox, webkit, &[]);
+    sessions(r, &built, &chromium, &firefox, webkit, safari, &[]);
 }
 
 /// Build both wasm modules and assemble the site in `site`.
@@ -336,13 +390,14 @@ fn sessions(
     built: &Built,
     chromium: &Result<chromium::Browser, String>,
     firefox: &Result<firefox::Firefox, String>,
-    webkit: WebKitRow,
+    webkit: Windowed<webkit::WebKit>,
+    safari: Windowed<safari::Safari>,
     wanted: &[String],
 ) {
     let wants = |name: &str| wanted.is_empty() || wanted.iter().any(|w| w == name);
     for name in wanted {
         let here = chromium::angle_backends().iter().any(|a| a.name() == name);
-        if name != "firefox" && name != "webkit" && !here {
+        if !["firefox", "webkit", "safari"].contains(&name.as_str()) && !here {
             r.cannot_run(format!(
                 "{LABEL}, WebGL2 on ANGLE {name} — this host's Chromium sessions are {}",
                 chromium::angle_backends()
@@ -400,17 +455,27 @@ fn sessions(
         }
     }
     match webkit {
-        WebKitRow::Off => {}
-        WebKitRow::Skip(missing) => {
-            r.skip(format!("{LABEL}, {}", webkit::no_windows_skip(missing)));
-        }
-        WebKitRow::Run(Ok(w)) => {
+        Windowed::Off => {}
+        Windowed::Skip(why) => r.skip(format!("{LABEL}, {why}")),
+        Windowed::Run(Ok(w)) => {
             r.raw(format!("webkit: {} ({})", w.path.display(), w.source));
             run_one(r, Engine::WebKit(w));
         }
-        WebKitRow::Run(Err(why)) => {
+        Windowed::Run(Err(why)) => {
             r.cannot_run(format!("{LABEL}, WebKit — {why} (fix: {})", webkit::fix()));
         }
+    }
+    match safari {
+        Windowed::Off => {}
+        Windowed::Skip(why) => r.skip(format!("{LABEL}, {why}")),
+        Windowed::Run(Ok(s)) => {
+            r.raw(format!(
+                "safari: the system Safari, driven by {}",
+                s.driver.display()
+            ));
+            run_one(r, Engine::Safari(s));
+        }
+        Windowed::Run(Err(why)) => r.cannot_run(format!("{LABEL}, Safari — {why}")),
     }
 }
 
@@ -428,6 +493,10 @@ struct Built {
     cost: Option<Cost>,
     scratch: PathBuf,
     ceiling: Option<Duration>,
+    /// How a session that takes the desk admits a quiet machine of its own ([`desk_claim`]):
+    /// `browser-drive`'s. `None` takes no claim of its own: a verify run's stage holds the run's
+    /// quiet machine ([`takes_the_desk`]), or the run takes none.
+    quiet: Option<aterm_capacity::Admit>,
 }
 
 /// Files and directories laid by [`assemble`].
@@ -551,12 +620,19 @@ pub fn drive_main(args: &[String]) -> i32 {
         cost: None,
         scratch: scratch.clone(),
         ceiling: Some(crate::exec::DEFAULT_CHILD_CEILING),
+        quiet: Some(aterm_capacity::Admit::Wait),
     };
     let mut r = Report::new(format!("browser-drive ({})", site.display()));
-    let webkit = if wanted.iter().any(|w| w == "webkit") {
-        WebKitRow::Run(webkit::find())
+    let named = |name: &str| wanted.iter().any(|w| w == name);
+    let webkit = if named("webkit") {
+        Windowed::Run(webkit::find())
     } else {
-        WebKitRow::Off
+        Windowed::Off
+    };
+    let safari = if named("safari") {
+        Windowed::Run(safari::find())
+    } else {
+        Windowed::Off
     };
     sessions(
         &mut r,
@@ -564,6 +640,7 @@ pub fn drive_main(args: &[String]) -> i32 {
         &chromium::find(),
         &firefox::find(),
         webkit,
+        safari,
         &wanted,
     );
     let _ = std::fs::remove_dir_all(&scratch);
@@ -587,13 +664,31 @@ fn session(
         r.cannot_run(format!("{label} — could not create {}: {e}", dir.display()));
         return None;
     }
+    let not_run = format!("{worker_label} — the session's pages did not run (above)");
+    let desk = if engine.takes_the_desk() {
+        match desk_claim(built.quiet, &engine.label()) {
+            Ok(desk) => desk,
+            Err(why) => {
+                r.cannot_run(format!("{label} — {why}"));
+                r.cannot_run(not_run);
+                return None;
+            }
+        }
+    } else {
+        None
+    };
+    if let Some((_, said)) = &desk {
+        r.raw(say(format!("its window takes the desk: {said}")));
+    }
     let (session_engine, session_site, session_dir) =
         (engine.clone(), built.site.clone(), dir.clone());
     let profile = built.scratch.join(format!("browser-profile-{name}"));
-    let driven = crate::exec::bounded(built.ceiling, move || {
+    let driven = bounded_session(desk, built.ceiling, move |desk| {
+        let _quiet = desk
+            .as_ref()
+            .map(|(claim, _)| crate::holding_quiet_claim(Some(std::sync::Arc::clone(claim))));
         session_engine.drive(&session_site, &session_dir, &profile)
     });
-    let not_run = format!("{worker_label} — the session's pages did not run (above)");
     let session = match driven {
         Ok(Ok(s)) => s,
         Ok(Err(Stop::CouldNotRun(why))) => {
@@ -639,6 +734,9 @@ fn session(
         "{}{ready} GPU adapter {}",
         session.product, gpu.adapter
     )));
+    for note in &session.notes {
+        r.raw(say(note.clone()));
+    }
     r.raw(say(timing_line("cpu page (aterm-wasm)", &session.cpu)));
     r.raw(say(timing_line("gpu page (aterm-gpu-web)", &session.gpu)));
     if let Ok(w) = &session.worker {
@@ -1043,6 +1141,7 @@ fn drive_chromium(
         gpu,
         worker,
         served,
+        notes: Vec::new(),
     })
 }
 
@@ -1109,6 +1208,7 @@ impl PostedPages {
             gpu: self.gpu,
             worker: self.worker,
             served: self.served,
+            notes: Vec::new(),
         }
     }
 }
@@ -1136,18 +1236,39 @@ fn drive_by_posts(
     let child = spawn(cmd)
         .map_err(|e| Stop::CouldNotRun(format!("could not start {}: {e}", browser.display())))?;
     let mut running = Running(child);
-    let mut since = Instant::now();
+    let pages = take_posts(&mut server, &log, Instant::now(), || {
+        running
+            .ended()
+            .map(|status| format!("{what} exited ({status})"))
+    });
+    drop(server);
+    drop(running);
+    pages
+}
+
+/// The three answers the pages post to `server`, the first timed from `since`, each waited for
+/// while `ended` says nothing ended (the browser, or its driver): what did, said whole; its log
+/// at `log` goes with a refusal.
+fn take_posts(
+    server: &mut serve::Server,
+    log: &Path,
+    mut since: Instant,
+    mut ended: impl FnMut() -> Option<String>,
+) -> Result<PostedPages, Stop> {
     let mut take = |kind: &str| -> Result<Page, Stop> {
-        let body =
-            server
-                .answer(kind, || running.ended().is_none())
-                .map_err(|why| match running.ended() {
-                    Some(status) if kind == "cpu" => Stop::CouldNotRun(format!(
-                        "{what} exited ({status}) before the cpu page answered\n{}",
-                        log_tail(&log)
-                    )),
-                    _ => Stop::Fail(format!("the {kind} page: {why}\n{}", log_tail(&log))),
-                })?;
+        let body = server
+            .answer(kind, || ended().is_none())
+            .map_err(|why| match ended() {
+                Some(ended) if kind == "cpu" => Stop::CouldNotRun(format!(
+                    "{ended} before the cpu page answered\n{}",
+                    log_tail(log)
+                )),
+                Some(ended) => Stop::Fail(format!(
+                    "the {kind} page: {why}: {ended}\n{}",
+                    log_tail(log)
+                )),
+                None => Stop::Fail(format!("the {kind} page: {why}\n{}", log_tail(log))),
+            })?;
         let evaluate_ms = ms(since);
         since = Instant::now();
         posted(kind, &body).map(|answer| Page {
@@ -1159,15 +1280,132 @@ fn drive_by_posts(
     let cpu = take("cpu")?;
     let gpu = take("gpu")?;
     let worker = take("worker");
-    let served = server.served();
-    drop(server);
-    drop(running);
     Ok(PostedPages {
         cpu,
         gpu,
         worker,
-        served,
+        served: server.served(),
     })
+}
+
+/// Open the pages in the system Safari over `safaridriver` and collect their posted answers,
+/// each waited for while safaridriver and the session's Safari run ([`safari::quit`]). The posts
+/// are what is judged: an open that broke off or outlasted its wait while the pages ran (WebDriver
+/// answers it once the first page has loaded, which a page that keeps beating can outlast) is
+/// said beside them and decides nothing by itself. Cleanup deletes only the created automation
+/// session and ends the owned driver. A process census is no proof of application ownership:
+/// the shared Safari application is left alone, including after an uncertain session reply.
+fn drive_safari(safari: &safari::Safari, site: &Path, work: &Path) -> Result<Session, Stop> {
+    let log = work.join("browser.log");
+    let (out, err) = log_stdio(&log)?;
+    let mut server = serve::Server::start(site).map_err(Stop::CouldNotRun)?;
+    let url = format!("{}/cpu.html?post=1&next=gpu,worker", server.origin());
+    let port = safari::free_port().map_err(Stop::CouldNotRun)?;
+    let mut cmd = LaneCommand::new(&safari.driver);
+    cmd.args(safari::driver_args(port))
+        .stdin(ChildStdio::Null)
+        .stdout(out)
+        .stderr(err);
+    let child = spawn(cmd).map_err(|e| {
+        Stop::CouldNotRun(format!("could not start {}: {e}", safari.driver.display()))
+    })?;
+    let mut driver = Running(child);
+    safari::listening(port, || driver.ended())
+        .map_err(|why| Stop::CouldNotRun(format!("{why}\n{}", log_tail(&log))))?;
+    let asked = safari::command(port, "POST", "/session", Some(&safari::new_session()));
+    let after = safari::running();
+    let safaris = after.unwrap_or_default();
+    let mut notes = vec!["the shared Safari application is left alone".to_owned()];
+    let pages = asked
+        .and_then(|(status, body)| safari::session_id(status, &body))
+        .map_err(|why| {
+            notes.push(
+                "no confirmed session id was received; an automation window may remain".to_owned(),
+            );
+            Stop::CouldNotRun(why)
+        })
+        .and_then(|id| {
+            let mut session = safari::Session::new(port, id);
+            let since = Instant::now();
+            if let Err(why) = session.open(&url) {
+                notes.push(format!("{why}; the pages' answers are what is judged"));
+            }
+            let pages = take_posts(&mut server, &log, since, || {
+                driver
+                    .ended()
+                    .map(|status| format!("safaridriver exited ({status})"))
+                    .or_else(|| safari::quit(&safaris))
+            });
+            if let Err(why) = session.close() {
+                notes.push("its automation window may remain".to_owned());
+                return Err(Stop::Fail(why));
+            }
+            pages
+        });
+    drop(driver);
+    drop(server);
+    let noted = |why: String| {
+        std::iter::once(why)
+            .chain(notes.iter().cloned())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let pages = pages.map_err(|stop| match stop {
+        Stop::CouldNotRun(why) => Stop::CouldNotRun(noted(why)),
+        Stop::Fail(why) => Stop::Fail(noted(why)),
+    })?;
+    let product = safari::product(&pages.gpu.answer.user_agent);
+    let mut session = pages.session(product);
+    session.notes = notes;
+    Ok(session)
+}
+
+/// The quiet machine for a session that takes the desk ([`Engine::takes_the_desk`]) in
+/// `browser-drive`, admitted as `mode` says ([`crate::admit_live`]), with how it was admitted:
+/// one windowed session at a time, on a machine quiet enough for it. `browser-drive` holds no
+/// other claim while it waits; a verify run's stage takes the run's quiet machine before its
+/// memory instead ([`takes_the_desk`]) and hands no mode. `None` with no mode, or where the
+/// ledger cannot be used (said on stderr: the session runs unadmitted, as verify's timed stages
+/// do).
+///
+/// # Errors
+/// An interrupt ended the wait, which ends the run (`exec::group::stop_run`, as a quiet claim's
+/// does in verify): the session starts nothing.
+fn desk_claim(
+    mode: Option<aterm_capacity::Admit>,
+    label: &str,
+) -> Result<Option<(std::sync::Arc<aterm_capacity::Claim>, String)>, String> {
+    let Some(mode) = mode else {
+        return Ok(None);
+    };
+    match crate::admit_live(
+        aterm_capacity::Need::timing(format!("verify browser: {label}")),
+        mode,
+    ) {
+        Ok(claim) => {
+            let said = crate::admission(&claim, mode, true);
+            Ok(Some((std::sync::Arc::new(claim), said)))
+        }
+        Err(e @ aterm_capacity::Error::Stopped { .. }) => {
+            #[cfg(unix)]
+            crate::exec::group::stop_run();
+            Err(format!("its quiet claim was {e}; it started nothing"))
+        }
+        Err(e) => {
+            eprintln!("verify: {e}; {label} runs unadmitted");
+            Ok(None)
+        }
+    }
+}
+
+/// Keep the session's held resources on the worker while it owns the window, including after
+/// an outer timeout has returned. `held` can be an inert drop observer in a control.
+fn bounded_session<G: Send + 'static, T: Send + 'static>(
+    held: G,
+    ceiling: Option<Duration>,
+    drive: impl FnOnce(&G) -> T + Send + 'static,
+) -> Result<T, crate::exec::Unfinished> {
+    crate::exec::bounded(ceiling, move || drive(&held))
 }
 
 /// Scratch home directory removed ([`firefox::remove_home`]) on drop.
@@ -1351,6 +1589,47 @@ pub(crate) fn pin_for(
 mod tests {
     use super::*;
 
+    /// A normal session retires its held resource. A worker deliberately blocked beyond a
+    /// zero ceiling must retain it until released, even though the outer call returned.
+    #[test]
+    fn a_timed_out_session_holds_its_desk_until_the_worker_finishes() {
+        use std::sync::mpsc;
+        struct Held(mpsc::Sender<()>);
+        impl Drop for Held {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+        let (dropped, seen) = mpsc::channel();
+        assert_eq!(
+            bounded_session(Held(dropped), Some(cdp::HANG_DETECTOR), |_| 42),
+            Ok(42)
+        );
+        seen.recv_timeout(cdp::HANG_DETECTOR).unwrap();
+
+        let (dropped, seen) = mpsc::channel();
+        let (ready, started) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        let result = bounded_session(Held(dropped), Some(Duration::ZERO), move |_| {
+            ready.send(()).unwrap();
+            wait.recv_timeout(cdp::HANG_DETECTOR).unwrap();
+        });
+        assert_eq!(
+            result,
+            Err(crate::exec::Unfinished::TimedOut(Duration::ZERO))
+        );
+        started.recv_timeout(cdp::HANG_DETECTOR).unwrap();
+        let held = seen
+            .try_recv()
+            .is_err_and(|e| matches!(e, mpsc::TryRecvError::Empty));
+        release.send(()).unwrap();
+        seen.recv_timeout(cdp::HANG_DETECTOR).unwrap();
+        assert!(
+            held,
+            "the timed-out worker must still own its desk while blocked"
+        );
+    }
+
     /// `readback_split` sums each step and `timing_line` reports untimed overhead.
     #[test]
     fn a_page_s_timings_split_its_readbacks_from_its_frames() {
@@ -1419,11 +1698,11 @@ mod tests {
         let site_arg = site.display().to_string();
         assert_eq!(drive_main(&s(&[&site_arg])), exit::USAGE);
         assert_eq!(
-            drive_main(&s(&[&site_arg, "/o", "--engine", "safari"])),
+            drive_main(&s(&[&site_arg, "/o", "--engine", "opera"])),
             exit::USAGE
         );
         assert_eq!(drive_main(&s(&[&site_arg, "/o", "--fast"])), exit::USAGE);
-        for engine in ["firefox", "webkit"] {
+        for engine in ["firefox", "webkit", "safari"] {
             assert_eq!(
                 drive_main(&s(&[&site_arg, "/o", "--engine", engine])),
                 exit::COULD_NOT_RUN,

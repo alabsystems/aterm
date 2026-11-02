@@ -348,7 +348,7 @@ fn values_come_back_byte_for_byte() {
             "{s:?}"
         );
     }
-    for bad in ["\\", "\\q", "\\x4", "\\xzz"] {
+    for bad in ["\\", "\\q", "\\x4", "\\xzz", "\\x+1"] {
         assert!(unescape(bad).is_err(), "{bad:?}");
     }
     #[cfg(unix)]

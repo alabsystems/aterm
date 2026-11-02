@@ -8,11 +8,11 @@
 //! so its aterm never checks in and its window is never key.) Its front tab's task is marked
 //! working, then done, while another app the drive opens itself is the active app: the menu
 //! bar's Done for you row must stand, and must still stand after a controller's `focus in` and a
-//! second done (a ctl client's focus report is not his look). Once that app is quit by its PID
+//! second done (a ctl client's focus report is no look). Once that app is quit by its PID
 //! and aterm is the active app again, the row must go, and a done while aterm stays active must
 //! be seen as it lands, even after a controller's `focus out`. `--aterm` picks the aterm under
 //! test, so the same verb reads main's build as the negative control (there the row is seen
-//! while he is away), and a build whose look reads the controller-written focus flag fails the
+//! while they are away), and a build whose look reads the controller-written focus flag fails the
 //! two controller legs.
 
 use std::path::PathBuf;
@@ -102,11 +102,19 @@ impl Drop for OtherApp {
     }
 }
 
-/// Every PID whose command line runs [`OTHER_EXE`].
+/// Every PID whose command line runs [`OTHER_EXE`]: one read of the process table, and the
+/// command line read ([`crate::procs::command_line`]) only of a process the kernel names by
+/// [`OTHER_EXE`]'s file name.
 fn other_pids() -> Vec<i32> {
-    crate::procs::table()
+    let name = std::path::Path::new(OTHER_EXE)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(OTHER_APP);
+    aterm_sysprobe::kproc::records()
+        .unwrap_or_default()
         .into_iter()
-        .map(|(pid, _)| pid)
+        .filter(|r| r.comm == name)
+        .filter_map(|r| i32::try_from(r.pid).ok())
         .filter(|&pid| crate::procs::command_line(pid).starts_with(OTHER_EXE))
         .collect()
 }
@@ -460,7 +468,7 @@ mod tests {
             !v("1", "0", "0", "1"),
             "the look read the controller's focus flag"
         );
-        assert!(!v("1", "1", "1", "0"), "his return saw nothing");
+        assert!(!v("1", "1", "1", "0"), "their return saw nothing");
         assert!(!v("1", "1", "0", "1"), "a done while aterm is active stood");
         assert!(!v("?", "1", "0", "0"), "no reading");
     }

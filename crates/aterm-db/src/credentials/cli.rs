@@ -24,7 +24,8 @@ pub const USAGE: &str = "usage:
   aterm secrets need retire <want|id> [--declined] [--note <text>]
                                                    withdraw a need, or decline one a person was asked for
   aterm secrets need pass                          run this Mac's pass over credentials/requests/1 now (and the custodian's, on the vault's admin Mac)
-  aterm secrets need give <want|id>                a holder's give (not in this build: see below)
+  aterm secrets need give <want|id> [--file <path>]
+                                                   offer a value from a file or piped stdin; an admin publishes it now
 ";
 
 fn say(text: &str) -> ExitCode {
@@ -171,10 +172,44 @@ pub fn run(paths: &Paths, words: &[String]) -> Result<String, (String, u8)> {
             }
             Ok(out)
         }
-        "give" => Err((
-            "a holder's give (a value a person types here, sent to the custodian in a handoff) is the handoff step's, not in this build. On the vault's admin Mac, aterm secrets set puts the value in the vault, and that Mac's next pass copies it to the requester\n".to_owned(),
-            2,
-        )),
+        "give" => {
+            let (selector, file) = match &words[1..] {
+                [selector] if !selector.starts_with('-') => (selector, None),
+                [selector, flag, file] if !selector.starts_with('-') && flag == "--file" => {
+                    (selector, Some(file))
+                }
+                _ => {
+                    return Err((
+                        format!(
+                            "give takes a want or request id and an optional --file path\n{USAGE}"
+                        ),
+                        2,
+                    ));
+                }
+            };
+            let result = super::give_from(paths, selector, || {
+                use std::io::{IsTerminal as _, Read as _};
+                use aterm_secrets::{SecretBytes, fsx, need::transfer::MAX_VALUE};
+                let bytes = if let Some(file) = file {
+                    let path = file.strip_prefix("~/").map_or_else(|| std::path::PathBuf::from(file), |tail| paths.home.join(tail));
+                    SecretBytes::from(fsx::read_public(&path, MAX_VALUE).map_err(crate::table::failure)?
+                        .ok_or_else(|| crate::Error::new("the give input file is missing"))?)
+                } else {
+                    if std::io::stdin().is_terminal() {
+                        return Err(crate::Error::new("pipe the value to need give or pass --file; values never appear in arguments"));
+                    }
+                    let mut bytes = zeroize::Zeroizing::new(Vec::new());
+                    std::io::stdin().take(MAX_VALUE as u64 + 1).read_to_end(&mut bytes)?;
+                    if bytes.len() > MAX_VALUE { return Err(crate::Error::new("give accepts at most 64 KiB")); }
+                    SecretBytes::from(bytes.to_vec())
+                };
+                Ok(bytes)
+            }).map_err(|error| (error.to_string(), 1))?;
+            Ok(format!(
+                "give: {} requests published; {} retained privately and offered to the custodian\n",
+                result.published, result.retained
+            ))
+        }
         word => {
             known(&words[1..], &[], &["--purpose"])?;
             let want = Want::parse(word).map_err(|why| (format!("{why}\n{USAGE}"), 2))?;

@@ -29,36 +29,17 @@ struct Lock(std::fs::File);
 
 impl Lock {
     fn take(paths: &Paths) -> crate::Result<Self> {
-        use std::os::unix::fs::OpenOptionsExt;
         fsx::ensure_private_dir(&paths.dir)?;
         let path = paths.dir.join(LOCK);
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(&path)
-            .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
-        let metadata = file
-            .metadata()
-            .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
-        if !metadata.file_type().is_file() {
-            return Err(Error::new(format!(
-                "{}: not a regular file",
-                path.display()
-            )));
-        }
-        aterm_uds::keep_out_of_children(&file)
-            .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+        let ledger_lock_file: std::fs::File = fsx::open_lock(&path)?;
         #[expect(
             clippy::disallowed_methods,
             reason = "the need ledger's lock, whose Drop releases it (File::unlock)"
         )]
-        file.lock()
+        ledger_lock_file
+            .lock()
             .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
-        Ok(Self(file))
+        Ok(Self(ledger_lock_file))
     }
 }
 

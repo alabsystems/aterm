@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A new Mac obtains its credential bundle automatically from a LAN member.
-//! The explicit phrase flow remains available for older members. Both paths write
-//! through the same private-file materializer and follow the vault afterwards.
+//! The joining Mac's flow (`aterm members join`, `docs/DESIGN-fluid-swarm-2026-10-28.md`
+//! §3.3.1): ask every member it found, all at once; then run the phrase a person typed with the
+//! member that shows it, write `~/.secrets` from that member's bundle (F10's interim handover),
+//! ask the vault's server with the `Allowed`, and tell the other members it was let in. How a
+//! member is reached is the caller's: the CLI dials the `ask` ALPN, a test a stream pair.
 
 use super::bundle::Handed;
 use super::desk::Answer;
@@ -14,9 +16,7 @@ use crate::phrase::Phrase;
 use crate::{Error, Result};
 use std::io::{Read, Write};
 
-/// What a Mac that asked does next: the words `aterm members join --no-wait`, `status` and
-/// `aterm init` give it (§3.3.3).
-pub const LET_IN: &str = "waiting for automatic credential sync from a LAN member";
+pub use crate::alab_join::{JOIN_QUIET, JOINING, LET_IN};
 
 /// A stream to one member's `ask` op.
 pub trait Stream: Read + Write + Send {}
@@ -90,10 +90,10 @@ fn named(heard: &Heard, member: &str) -> bool {
     let lower = member.to_ascii_lowercase();
     heard.greeting.name == member
         || heard.at == member
-        || heard
-            .at
-            .rsplit_once(':')
-            .is_some_and(|(host, _)| host == member)
+        || heard.at.rsplit_once(':').is_some_and(|(host, _)| {
+            host == member
+                || host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) == Some(member)
+        })
         || (lower.len() >= 8
             && lower.bytes().all(|b| b.is_ascii_hexdigit())
             && key.starts_with(&lower))
@@ -174,14 +174,44 @@ pub struct Joined {
     pub admission: Admission,
 }
 
+/// Why [`run_phrase`] let nobody in, and whether the phrase went to the member first.
+#[derive(Debug)]
+pub enum PhraseFailed {
+    /// Before the phrase's run went to a member ([`joiner::run_noting_send`]): no member fits
+    /// ([`pick`]: none shows a phrase for this Mac, or several do), the one picked could not be
+    /// dialed or greeted, it changed since it was asked, or this Mac could not start the run.
+    /// Nothing was asked of the phrase, so the same words go again.
+    Unsent(Error),
+    /// After the phrase's run went to the member: it refused the phrase or the run broke off,
+    /// or the bundle it handed could not be written. A phrase is good for one try.
+    Sent(Error),
+}
+
+impl PhraseFailed {
+    /// Whether the phrase went to a member ([`Self::Sent`]).
+    #[must_use]
+    pub const fn sent(&self) -> bool {
+        matches!(self, Self::Sent(_))
+    }
+}
+
+impl std::fmt::Display for PhraseFailed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsent(error) | Self::Sent(error) => error.fmt(formatter),
+        }
+    }
+}
+
 /// Run `phrase` with the member [`pick`] chooses from `heard`, write this Mac's vault
 /// configuration and `~/.secrets` from its bundle (from the membership log where the bundle
 /// carries it, else from the member's `[everyone]` files, after which this Mac asks the vault's
 /// server with its `Allowed`), and tell every other member in `heard` that this Mac was let in.
 ///
 /// # Errors
-/// No member fits, the member changed since it was asked, the run failed (a wrong phrase burns
-/// it), or the bundle could not be written.
+/// [`PhraseFailed::Unsent`]: no member fits, the member could not be reached or changed since it
+/// was asked, or the run could not start. [`PhraseFailed::Sent`]: the run failed (a wrong phrase
+/// burns it), or the bundle could not be written.
 pub fn run_phrase(
     paths: &Paths,
     dial: &Dial<'_>,
@@ -189,30 +219,114 @@ pub fn run_phrase(
     heard: &[Heard],
     phrase: &Phrase,
     member: Option<&str>,
-) -> Result<Joined> {
-    let chosen = pick(heard, member)?;
-    let mut stream = dial(&chosen.at)?;
-    let greeting = joiner::greeting(&mut stream)?;
+) -> std::result::Result<Joined, PhraseFailed> {
+    let chosen = pick(heard, member).map_err(PhraseFailed::Unsent)?;
+    let mut stream = dial(&chosen.at).map_err(PhraseFailed::Unsent)?;
+    let greeting = joiner::greeting(&mut stream).map_err(PhraseFailed::Unsent)?;
     if greeting.key != chosen.greeting.key {
-        return Err(Error::new(format!(
+        return Err(PhraseFailed::Unsent(Error::new(format!(
             "the member at {} is not the one that answered before; ask again",
             chosen.at
-        )));
+        ))));
     }
-    let bundle = joiner::run(&mut stream, &greeting, joining, phrase)?;
+    let mut sent = false;
+    let bundle = joiner::run_noting_send(&mut stream, &greeting, joining, phrase, &mut sent)
+        .map_err(|error| {
+            if sent {
+                PhraseFailed::Sent(error)
+            } else {
+                PhraseFailed::Unsent(error)
+            }
+        })?;
     drop(stream);
-    let joined = accept_bundle(paths, &greeting.name, &bundle)?;
-    for other in heard.iter().filter(|other| other.at != chosen.at) {
-        let told = dial(&other.at).and_then(|mut stream| {
-            let greeting = joiner::greeting(&mut stream)?;
-            joiner::done(&mut stream, &greeting, joining)
-        });
-        drop(told);
-    }
-    Ok(joined)
+    written(paths, dial, joining, heard, chosen, greeting, bundle).map_err(PhraseFailed::Sent)
 }
 
-fn accept_bundle(paths: &Paths, member: &str, bundle: &super::Bundle) -> Result<Joined> {
+/// Prove this Mac to the members at `ats` with nobody's Allow (`desk::serve_with`'s `prove`):
+/// its request's writer key and its fleet node key (`sign_node`) sign each member's fresh
+/// challenge, and it answers the possession challenge. The first member that lets it in hands the
+/// log bundle (`client::admit_by_proof`), which this Mac writes and then follows. Members are
+/// tried one after another in address order, never at once, and none after one that may have
+/// signed (its possession answer went): two members removing one old seat at one cutoff would
+/// make a quorum `Remove`, which no Allow undoes, and the next try reaches the same member first,
+/// which then signs nothing new. Where none let it in, why each refused, by address: this Mac then
+/// asks a person as before.
+///
+/// # Errors
+/// No member let it in ([`Missed`]).
+pub fn prove_first(
+    paths: &Paths,
+    dial: &Dial<'_>,
+    joining: &Joining<'_>,
+    sign_node: joiner::SignNode<'_>,
+    ats: &[String],
+) -> std::result::Result<Joined, Missed> {
+    let mut ats = ats.to_vec();
+    ats.sort();
+    ats.dedup();
+    let mut missed = Vec::new();
+    for at in &ats {
+        let mut sent = false;
+        let tried = (|| {
+            let mut stream = dial(at)?;
+            let greeting = joiner::greeting(&mut stream)?;
+            let bundle = joiner::prove(&mut stream, &greeting, joining, sign_node, &mut sent)?;
+            drop(stream);
+            if !matches!(bundle.handed, Handed::Log { .. }) {
+                return Err(Error::new(
+                    "a member handed files, not the log, for a proof",
+                ));
+            }
+            let report = client::write_from_log_bundle(paths, &bundle)?;
+            // Best effort, as after a phrase: the servers and this Mac's subscriber follow on.
+            drop(client::sync(paths, None));
+            drop(client::ask_allowed(paths));
+            Ok(Joined {
+                member: greeting.name,
+                name: bundle.allowed.name().to_owned(),
+                report,
+                admission: Admission::Logged,
+            })
+        })();
+        match tried {
+            Ok(joined) => return Ok(joined),
+            Err(error) => {
+                missed.push((at.clone(), error.to_string()));
+                if sent {
+                    return Err(Missed {
+                        refused: missed,
+                        signed_maybe: true,
+                    });
+                }
+            }
+        }
+    }
+    Err(Missed {
+        refused: missed,
+        signed_maybe: false,
+    })
+}
+
+/// Why [`prove_first`] let this Mac in nowhere.
+#[derive(Debug)]
+pub struct Missed {
+    /// Why each member it tried refused or failed, by address.
+    pub refused: Vec<(String, String)>,
+    /// The last one tried may have signed this Mac's records (its possession answer went): try no
+    /// other member, on any path, until that one's records had time to reach the others.
+    pub signed_maybe: bool,
+}
+
+/// [`run_phrase`] once `chosen` handed its `bundle`: write it, and tell the other members.
+fn written(
+    paths: &Paths,
+    dial: &Dial<'_>,
+    joining: &Joining<'_>,
+    heard: &[Heard],
+    chosen: &Heard,
+    greeting: Greeting,
+    bundle: super::Bundle,
+) -> Result<Joined> {
     let (report, admission) = match bundle.handed {
         Handed::Log { .. } => {
             let report = client::write_from_log_bundle(paths, &bundle)?;
@@ -228,40 +342,17 @@ fn accept_bundle(paths: &Paths, member: &str, bundle: &super::Bundle) -> Result<
             (report, Admission::Asked(asked))
         }
     };
+    for other in heard.iter().filter(|other| other.at != chosen.at) {
+        let told = dial(&other.at).and_then(|mut stream| {
+            let greeting = joiner::greeting(&mut stream)?;
+            joiner::done(&mut stream, &greeting, joining)
+        });
+        drop(told);
+    }
     Ok(Joined {
-        member: member.to_owned(),
+        member: greeting.name,
         name: bundle.allowed.name().to_owned(),
         report,
         admission,
     })
-}
-
-/// Try the available LAN members automatically, accepting the first complete bundle.
-/// A failed transfer leaves the next member eligible and the next background pass retryable.
-pub fn run_automatic(
-    paths: &Paths,
-    dial: &Dial<'_>,
-    joining: &Joining<'_>,
-    ats: &[String],
-) -> Result<Joined> {
-    let mut last = Error::new("no ALab member answers on this LAN");
-    for at in ats {
-        let result = (|| {
-            let mut stream = dial(at)?;
-            let greeting = joiner::greeting(&mut stream)?;
-            let bundle = joiner::run_lan(&mut stream, &greeting, joining)?;
-            let joined = accept_bundle(paths, &greeting.name, &bundle)?;
-            if !joined.report.failed.is_empty() {
-                return Err(Error::new(
-                    "credential files are incomplete; automatic sync will retry",
-                ));
-            }
-            Ok(joined)
-        })();
-        match result {
-            Ok(joined) => return Ok(joined),
-            Err(error) => last = error,
-        }
-    }
-    Err(last)
 }

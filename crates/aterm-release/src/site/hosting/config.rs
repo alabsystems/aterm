@@ -52,7 +52,7 @@ pub struct Hosting {
 /// A file that cannot be read, or any refusal of [`parse`], naming the file.
 pub fn read(site_dir: &Path) -> Result<Hosting, String> {
     let path = site_dir.join("firebase.json");
-    let text = std::fs::read_to_string(&path)
+    let text = crate::durable::read_regular_text(&path, 256 * 1024)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     parse(&text).map_err(|why| format!("{}: {why}", path.display()))
 }

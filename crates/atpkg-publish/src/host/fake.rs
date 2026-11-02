@@ -28,6 +28,7 @@ struct State {
     unreachable_owners: BTreeSet<String>,
     private: BTreeSet<Slug>,
     not_visible: BTreeSet<Slug>,
+    unanswered_repo: BTreeSet<Slug>,
     stray_drafts: BTreeMap<Slug, BTreeMap<String, usize>>,
     notes: BTreeMap<(Slug, String), String>,
     anonymous: bool,
@@ -147,6 +148,16 @@ impl FakeHost {
             s.not_visible.insert(slug.clone());
         } else {
             s.not_visible.remove(slug);
+        }
+    }
+
+    /// [`ReleaseHost::repo_seen`] on `slug` cannot tell (the repository read did not answer).
+    pub fn set_repo_unanswered(&self, slug: &Slug, unanswered: bool) {
+        let mut s = self.state();
+        if unanswered {
+            s.unanswered_repo.insert(slug.clone());
+        } else {
+            s.unanswered_repo.remove(slug);
         }
     }
 
@@ -276,7 +287,7 @@ impl FakeHost {
         if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > cap {
             return Probe::Unknown(format!("{asset} is over the {cap}-byte cap"));
         }
-        if let Some(parent) = dest.parent()
+        if let Some(parent) = dest.parent().filter(|p| !p.as_os_str().is_empty())
             && let Err(e) = std::fs::create_dir_all(parent)
         {
             return Probe::Unknown(format!("mkdir {}: {e}", parent.display()));
@@ -312,6 +323,19 @@ impl ReleaseHost for FakeHost {
             }));
         }
         Ok(out)
+    }
+
+    fn repo_seen(&self, slug: &Slug) -> Result<bool, HostError> {
+        self.log(format!("repo_seen {slug}"));
+        let s = self.state();
+        if s.unreachable_owners.contains(&slug.owner) || s.unanswered_repo.contains(slug) {
+            return Err(HostError::Unreachable(format!(
+                "{slug} did not answer (HTTP 500)"
+            )));
+        }
+        let identity_sees = !s.anonymous && !s.not_visible.contains(slug);
+        let anonymous_sees = !s.private.contains(slug);
+        Ok(s.repos.contains_key(slug) && (identity_sees || anonymous_sees))
     }
 
     fn release(&self, slug: &Slug, tag: &str) -> Result<Release, HostError> {
@@ -466,6 +490,18 @@ impl ReleaseHost for FakeHost {
             .args(["fetch", "--quiet", "--tags", "--force"])
             .arg(&source)
             .arg("+refs/heads/*:refs/remotes/origin/*"))
+    }
+
+    fn fetch_main(&self, slug: &Slug, dir: &Path, into: &str) -> Result<(), HostError> {
+        self.log(format!("fetch-main {slug}"));
+        self.reachable(slug)?;
+        let source = self.clone_source(slug)?;
+        git(crate::testkit::git()
+            .arg("-C")
+            .arg(dir)
+            .args(["fetch", "--quiet", "--no-tags", "--no-write-fetch-head"])
+            .arg(&source)
+            .arg(format!("+refs/heads/main:{into}")))
     }
 }
 

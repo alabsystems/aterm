@@ -28,8 +28,11 @@ pub(crate) fn parse(rest: &str, enabled: bool) -> Result<Asked, String> {
         [word] => match word.strip_prefix("seed=") {
             Some("off") => Asked::Pin(None),
             Some(seed) => Asked::Pin(Some(
-                seed.parse::<u64>()
-                    .map_err(|_| format!("{USAGE} (`{seed}` is no u64)"))?,
+                seed.bytes()
+                    .all(|b| b.is_ascii_digit())
+                    .then(|| seed.parse::<u64>().ok())
+                    .flatten()
+                    .ok_or_else(|| format!("{USAGE} (`{seed}` is no u64)"))?,
             )),
             None => return Err(USAGE.to_string()),
         },

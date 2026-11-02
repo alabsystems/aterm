@@ -283,7 +283,9 @@ pub(crate) struct Spot {
     pub(crate) filled: usize,
     /// The bytes the PTY held, read after the exec was heard and before the foreground was, when
     /// the exec's group still held the foreground then (`None`: it did not, or the PTY's queue
-    /// cannot be read here, and the exec is placed by its stamp).
+    /// cannot be read here, and the exec is placed by its stamp); for a sampled image, `0`: the
+    /// master showed no byte unread just after the foreground read found the group in front
+    /// ([`RanFeed::sampled`]).
     pub(crate) queued: Option<usize>,
     /// Whether its group was a job of its own, not the shell's.
     pub(crate) job: bool,
@@ -921,6 +923,118 @@ const LOOKS_MAX: usize = 32;
 #[cfg(not(test))]
 const LOOKUP_WAIT: Duration = Duration::from_millis(10);
 
+/// What hears a session's execs (`status exec_watch=`, [`Watching::words`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ExecWatch {
+    /// Nothing: ConPTY, or a test's gather with no source.
+    #[default]
+    None,
+    /// macOS's process watch on the shell (`aterm_uds::procwatch`).
+    #[cfg_attr(
+        not(unix),
+        expect(dead_code, reason = "off unix no gather is wired with a watch")
+    )]
+    Kqueue,
+    /// The foreground sampler alone (`crate::fg_sample::FgSampler`).
+    #[cfg_attr(
+        not(unix),
+        expect(dead_code, reason = "off unix no gather is wired with a watch")
+    )]
+    Sampler,
+    /// Linux's proc connector, proven, with the sampler beside it
+    /// (`aterm_uds::proc_connector`).
+    #[cfg_attr(
+        not(unix),
+        expect(dead_code, reason = "off unix no gather is wired with a watch")
+    )]
+    Connector,
+}
+
+impl ExecWatch {
+    /// Every watch, as `help status` names them (its test is unix's, as the wiring is).
+    #[cfg(all(test, unix))]
+    pub(crate) const ALL: [Self; 4] = [Self::None, Self::Kqueue, Self::Sampler, Self::Connector];
+
+    /// Its word.
+    pub(crate) const fn word(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Kqueue => "kqueue",
+            Self::Sampler => "sampler",
+            Self::Connector => "connector",
+        }
+    }
+}
+
+/// How a session's gather stands with Linux's proc connector (`status exec_watch_why=`,
+/// [`Watching::words`]).
+#[derive(Clone, Debug, Default)]
+pub(crate) enum Connector {
+    /// None serves this gather (`-`): not Linux, a process watch hears, or no sampler runs to
+    /// stand beside it.
+    #[default]
+    NotHere,
+    /// Turned off (`off`): `ATERM_DEV_NO_PROCCONN=1` in a dev-seams build, the control its cost
+    /// is measured against.
+    #[cfg_attr(
+        not(unix),
+        expect(dead_code, reason = "off unix no gather asks the proc connector")
+    )]
+    Off,
+    /// No route could be made (`no-route`: no pipe, `EMFILE`).
+    #[cfg_attr(
+        not(unix),
+        expect(dead_code, reason = "off unix no gather asks the proc connector")
+    )]
+    NoRoute,
+    /// Routed: where this process's listener stands now
+    /// ([`aterm_uds::proc_connector::State::as_str`]).
+    #[cfg(unix)]
+    Routed(aterm_uds::proc_connector::StateReader),
+}
+
+impl Connector {
+    /// Every word `exec_watch_why=` can show (its test is unix's, as the wiring is).
+    #[cfg(all(test, unix))]
+    pub(crate) fn words() -> impl Iterator<Item = &'static str> {
+        let states =
+            aterm_uds::proc_connector::State::ALL.map(aterm_uds::proc_connector::State::as_str);
+        ["-", "off", "no-route"].into_iter().chain(states)
+    }
+}
+
+/// What hears a session's execs, as its gather was wired ([`Ran::watched_by`]).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Watching {
+    /// The watch the gather was given (never [`ExecWatch::Connector`]: a routed connector names
+    /// itself once its listener is live).
+    pub(crate) watch: ExecWatch,
+    /// How it stands with the proc connector.
+    pub(crate) connector: Connector,
+}
+
+impl Watching {
+    /// `(exec_watch, exec_watch_why)`: the watch, `connector` while a routed listener is live
+    /// (the sampler stays beside it), and the connector's word.
+    pub(crate) fn words(&self) -> (&'static str, &'static str) {
+        match &self.connector {
+            Connector::NotHere => (self.watch.word(), "-"),
+            Connector::Off => (self.watch.word(), "off"),
+            Connector::NoRoute => (self.watch.word(), "no-route"),
+            #[cfg(unix)]
+            Connector::Routed(reader) => {
+                let state = reader.get();
+                let watch = if matches!(state, aterm_uds::proc_connector::State::Live { .. }) {
+                    ExecWatch::Connector
+                } else {
+                    self.watch
+                };
+                (watch.word(), state.as_str())
+            }
+        }
+    }
+}
+
 /// One session's execs, oldest first, at most [`RAN_MAX`]: the PTY gather hears what its
 /// [`RanFeed`] reads, a restore notes the holder images it reads, and every reader of a
 /// command's detail reads them back by its block's [`Window`] ([`Ran::heard`]). A session with no
@@ -934,6 +1048,7 @@ pub(crate) struct Ran {
     home: Option<Arc<Path>>,
     shell_path: Mutex<Option<Arc<str>>>,
     lookups: Lookups,
+    watching: Mutex<Watching>,
 }
 
 impl std::fmt::Debug for Ran {
@@ -983,7 +1098,22 @@ impl Ran {
                 memo: Arc::default(),
                 how,
             },
+            watching: Mutex::default(),
         }
+    }
+
+    /// The session's gather was wired with `watching` ([`Ran::watch_words`]).
+    #[cfg(unix)]
+    pub(crate) fn watched_by(&self, watching: Watching) {
+        *self.watching.lock().unwrap_or_else(|p| p.into_inner()) = watching;
+    }
+
+    /// `status exec_watch= exec_watch_why=` ([`Watching::words`]).
+    pub(crate) fn watch_words(&self) -> (&'static str, &'static str) {
+        self.watching
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .words()
     }
 
     fn lock(&self) -> MutexGuard<'_, Log> {
@@ -1140,6 +1270,15 @@ impl Ran {
                 .and_then(|at| usize::try_from(at).ok())
                 .and_then(|at| places.at(at))
         });
+    }
+
+    /// The block executing where the parse stage stopped (`None`: none, or no parse yet), and
+    /// whether the gather has handed on bytes it has not parsed yet: while it has, a block may
+    /// have begun past that point ([`crate::fg_sample::FgSampler::tick`]).
+    #[cfg(unix)]
+    pub(crate) fn parse_point(&self) -> (Option<u64>, bool) {
+        let log = self.lock();
+        (log.at_parsed.flatten(), log.parsed < log.handed)
     }
 
     /// The execs stamped in `window`, oldest first, however placed: the ring's own entries,
@@ -1972,20 +2111,92 @@ impl RanFeed {
     /// no place in the output). Its leader's exec name is not read: off macOS it is the
     /// process's own to set.
     pub(crate) fn image(&self, image: &crate::holder_image::HolderImage, filled: usize) {
-        if image.pgid <= 1 || image.pgid == self.shell {
+        self.hear_image(
+            image.pgid,
+            &image.exe,
+            Spot {
+                filled,
+                queued: None,
+                job: true,
+            },
+        );
+    }
+
+    /// A sample found group `pgid`, whose leader maps `exe`, holding the terminal's foreground,
+    /// read before the master showed no byte unread ([`crate::fg_sample::FgSampler`]): every
+    /// byte the shell wrote before that read was handed on, so the output stood where the gather
+    /// has handed on to, and the image is heard placed there as that group's job's, as an exec
+    /// the watch hears is ([`Spot`]), by its executable's file name and file, unless the group is
+    /// the shell's. A group that holds the foreground after a block's D (a prompt hook's) is
+    /// placed past that D, in no block.
+    pub(crate) fn sampled(&self, pgid: i32, exe: &Path) {
+        self.hear_image(
+            pgid,
+            exe,
+            Spot {
+                filled: 0,
+                queued: Some(0),
+                job: true,
+            },
+        );
+    }
+
+    /// The proc connector routed `exec`, whose image is `exe` (read by its listener's thread
+    /// just after the kernel told it, with the mapped file's identity and, for a group's leader,
+    /// its `PATH`: the process may be gone by now), and the sampler judged it `exact`
+    /// ([`crate::fg_sample::FgSampler::connected`]): placed where the gather has handed on to,
+    /// as a sampled image is ([`RanFeed::sampled`]), else by its stamp. Unless the group is the
+    /// shell's.
+    pub(crate) fn connected(
+        &self,
+        exec: &aterm_uds::proc_connector::Exec,
+        exe: &Path,
+        exact: bool,
+    ) {
+        if exec.pid <= 1 || exec.pgid <= 1 || exec.pid == self.shell || exec.pgid == self.shell {
             return;
         }
-        let names = ExecNames::of_path(&image.exe);
+        let names = ExecNames::of_path(exe);
         if names.image.is_none() {
             return;
         }
-        let read = (self.read)(image.pgid, &mut |_| true);
+        self.ran.hear(
+            Exec {
+                at_ms: 0,
+                pid: exec.pid,
+                pgid: exec.pgid,
+                names: ExecNames {
+                    file: exec.image.file.map(|(dev, ino)| FileId { dev, ino }),
+                    env_path: exec.env_path.as_deref().map(Arc::from),
+                    ..names
+                },
+                during: During::Window,
+            },
+            Spot {
+                filled: 0,
+                queued: exact.then_some(0),
+                job: true,
+            },
+        );
+    }
+
+    /// Hear the image `exe` of group `pgid`'s leader at `spot` ([`RanFeed::image`],
+    /// [`RanFeed::sampled`]).
+    fn hear_image(&self, pgid: i32, exe: &Path, spot: Spot) {
+        if pgid <= 1 || pgid == self.shell {
+            return;
+        }
+        let names = ExecNames::of_path(exe);
+        if names.image.is_none() {
+            return;
+        }
+        let read = (self.read)(pgid, &mut |_| true);
         let file = read.file.filter(|_| read.image == names.image);
         self.ran.hear(
             Exec {
                 at_ms: 0,
-                pid: image.pgid,
-                pgid: image.pgid,
+                pid: pgid,
+                pgid,
                 names: ExecNames {
                     file,
                     env_path: read.env_path,
@@ -1993,11 +2204,7 @@ impl RanFeed {
                 },
                 during: During::Window,
             },
-            Spot {
-                filled,
-                queued: None,
-                job: true,
-            },
+            spot,
         );
     }
 

@@ -179,13 +179,11 @@ impl LaneFidelity {
             out.clear();
             under.clear();
             let frame = g.tick(cur, instant(origin, p), geom, &cfg, &mut out, &mut under);
-            drawn.clear();
-            encode_glass(&mut drawn, &frame, &out, &under);
-            if frame != tick.frame
-                || out.len() != tick.out
-                || under.len() != tick.under
-                || glass_key(drawn.as_bytes()) != tick.key
-            {
+            if frame != tick.frame || out.len() != tick.out || under.len() != tick.under || {
+                drawn.clear();
+                encode_glass(&mut drawn, &frame, &out, &under);
+                glass_key(drawn.as_bytes()) != tick.key
+            } {
                 return fail(
                     cursor,
                     NO_STEP_SLEPT,
@@ -256,7 +254,7 @@ impl LaneFidelity {
             // An interval ending within a frame and δ of `p` is not judged: a probe clamped to `p + f` sees the step a shipped wake one margin later was armed for.
             let floor = p.saturating_add(f);
             // The drawn step only decays between lane events, so one probe δ before the next event sees any step slept through.
-            if next.saturating_sub(delta) > floor {
+            if !last_inert && next.saturating_sub(delta) > floor {
                 let s = next.saturating_sub(delta);
                 let mut copy = g;
                 probe_out.clear();

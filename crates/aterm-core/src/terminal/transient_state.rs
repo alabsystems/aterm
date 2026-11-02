@@ -465,6 +465,7 @@ impl KittyAnimation {
             frames: vec![KittyFrame {
                 image: root,
                 gap_ms: 0,
+                undecodable: false,
             }],
             state: KittyPlayState::Stopped,
             max_loops: 0,
@@ -491,6 +492,8 @@ pub(super) struct KittyFrame {
     pub(super) image: Arc<ImageData>,
     /// Milliseconds it shows before the next frame while the animation runs; `0` is a gapless frame, stepped over without being shown.
     pub(super) gap_ms: u32,
+    /// `image` is a PNG a compose or a frame load failed to decode: later reads refuse it without decoding it again. Not carried, so a restored frame can cost one more decode.
+    pub(super) undecodable: bool,
 }
 
 /// A Kitty animation's `s=` state.

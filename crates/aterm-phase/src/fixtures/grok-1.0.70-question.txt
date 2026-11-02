@@ -1,0 +1,50 @@
+# grok 1.0.70 · MEASURED 2026-10-29, `aterm ctl text` of a private headless aterm (144x50, aterm 0.146.0) running the real Grok Build, launched by path in the lab's jail with a scratch `HOME` and `GROK_HOME`, the lab's `XAI_API_KEY` and `GROK_XAI_API_BASE_URL`/`GROK_CLI_CHAT_PROXY_BASE_URL=http://127.0.0.1:<port>/v1` (a local stub of xAI's API, crates/aterm-lab) · the stub's `tool` mode asks `ask_user_question` (one question, two options): `◆ Ask Which test runner should the lab use?`, the status row `◆ Waiting on answers for Which test runner should the lab use?`, and a card on the heavy left bar: the question, `1 (○) targo test    Run the Trust toolchain tests.`, `2 (○) lab selftest  Run the lab own selftest.`, `z (○) Type your answer here`, `↑/↓ navigate · y copy` with `Enter:submit` at its right, and the key row `Tab:next answer  │  Esc:scrollback  │  Shift+x:dismiss` · cursor=35,6 (hidden) · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+  /p/t/at.lab0/proj                                                                                                   12K / 256K │ [Dashboard]
+
+
+     ❯ toolstart ask me something                                                                                                    2:00 PM
+
+
+     ◆ Ask Which test runner should the lab use?
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+
+    ◆ Waiting on answers for Which test runner should the lab use?                                                          0.1s ⇣12.9k [stop]
+
+  ┃
+  ┃  Which test runner should the lab use?
+  ┃
+  ┃
+  ┃  1 (○) targo test    Run the Trust toolchain tests.                                                                                      █
+  ┃  2 (○) lab selftest  Run the lab own selftest.                                                                                           █
+  ┃  z (○) Type your answer here
+  ┃
+  ┃  ↑/↓ navigate · y copy                                                                                                    Enter:submit
+  ┃
+
+  Tab:next answer  │  Esc:scrollback  │  Shift+x:dismiss

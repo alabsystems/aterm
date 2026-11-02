@@ -7,6 +7,288 @@ use super::*;
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
+fn typed_terminal(keys: &[u8]) -> aterm_core::terminal::Terminal {
+    typed_terminal_at(keys, 72)
+}
+
+fn typed_terminal_at(keys: &[u8], cols: u16) -> aterm_core::terminal::Terminal {
+    let mut output = Vec::new();
+    typing_fixture(&mut std::io::Cursor::new(keys), &mut output, || {
+        Some((14, cols))
+    })
+    .unwrap();
+    let mut term = aterm_core::terminal::Terminal::new(14, cols);
+    term.process(&output);
+    term
+}
+
+#[test]
+fn typed_gallery_input_is_literal_and_return_only_starts_another_prompt() {
+    let ordinary = typed_terminal(TYPING_TEXT.as_bytes());
+    assert_eq!(
+        ordinary.row_text(4).as_deref(),
+        Some("$ echo the quick brown fox")
+    );
+
+    let literal = "$(touch sentinel); <>&| `echo not-a-command`";
+    let mut keys = TYPING_TEXT.as_bytes().to_vec();
+    keys.push(b'\r');
+    keys.extend_from_slice(literal.as_bytes());
+    keys.extend_from_slice(b"\r\x04must not appear");
+    let mut term = typed_terminal(&keys);
+    assert_eq!(term.row_text(4), ordinary.row_text(4));
+    assert_eq!(term.row_text(5), Some(format!("$ {literal}")));
+    assert_eq!(term.row_text(6).as_deref(), Some("$ "));
+    assert_eq!(term.row_text(7).as_deref(), Some(""));
+    let frame = term.cell_frame(14, 72);
+    assert_eq!((frame.cursor_row, frame.cursor_col), (6, 2));
+}
+
+#[test]
+fn typed_gallery_edits_and_clear_repaint_the_current_prompt_without_stale_text() {
+    let ordinary = typed_terminal(b"abc\x08\x7fz");
+    assert_eq!(ordinary.row_text(4).unwrap().trim_end(), "$ az");
+
+    let mut keys = TYPING_TEXT.as_bytes().to_vec();
+    keys.extend_from_slice(b"\r\x0cabc\x08\x7fz\x0c\x7f\x15\x08\x08q\x03must not appear");
+    let mut term = typed_terminal(&keys);
+    assert_eq!(term.row_text(0).unwrap().trim_end(), "$ q");
+    for row in 1..14 {
+        assert!(term.row_text(row).unwrap().trim_end().is_empty());
+    }
+    let frame = term.cell_frame(14, 72);
+    assert_eq!((frame.cursor_row, frame.cursor_col), (0, 3));
+
+    let ignored = typed_terminal(b"q\x00\x1b\xff\x0c");
+    assert_eq!(ignored.row_text(0).unwrap().trim_end(), "$ q");
+}
+
+#[test]
+fn typed_gallery_deletion_repaints_pending_wrap_and_wrapped_rows() {
+    for cols in [12_u16, 40, 72] {
+        for len in [usize::from(cols) - 2, usize::from(cols) - 1, 80] {
+            let mut keys = vec![b'x'; len];
+            if len == 80 {
+                keys.push(b'y');
+            }
+            keys.push(127);
+            let mut term = typed_terminal_at(&keys, cols);
+            let mut expected = aterm_core::terminal::Terminal::new(14, cols);
+            expected.process(b"\x1b[2J\x1b[5;1H$ ");
+            expected.process(&vec![b'x'; len - 1]);
+            for row in 0..14 {
+                assert_eq!(
+                    term.row_text(row).unwrap().trim_end(),
+                    expected.row_text(row).unwrap().trim_end(),
+                    "{cols} columns, {len} input bytes, row {row}"
+                );
+            }
+            let frame = term.cell_frame(14, usize::from(cols));
+            let expected_frame = expected.cell_frame(14, usize::from(cols));
+            assert_eq!(
+                (frame.cursor_row, frame.cursor_col),
+                (expected_frame.cursor_row, expected_frame.cursor_col)
+            );
+
+            keys.push(21);
+            let cleared = typed_terminal_at(&keys, cols);
+            assert_eq!(cleared.row_text(4).unwrap().trim_end(), "$");
+            for row in 5..14 {
+                assert!(cleared.row_text(row).unwrap().trim_end().is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn typed_gallery_edits_follow_a_prompt_scrolled_from_the_bottom_row() {
+    let mut keys = vec![b'\r'; 9];
+    let mut bottom = typed_terminal(&keys);
+    assert_eq!(bottom.cell_frame(14, 72).cursor_row, 13);
+    keys.extend_from_slice(&[b'x'; 71]);
+    let scrolled = typed_terminal(&keys);
+    let full = format!("$ {}", "x".repeat(70));
+    assert_eq!(scrolled.row_text(12).as_deref(), Some(full.as_str()));
+    assert_eq!(scrolled.row_text(13).as_deref(), Some("x"));
+
+    keys.push(127);
+    let mut deleted = typed_terminal(&keys);
+    assert_eq!(deleted.row_text(12).unwrap().trim_end(), full);
+    assert!(deleted.row_text(13).unwrap().trim_end().is_empty());
+    let frame = deleted.cell_frame(14, 72);
+    assert_eq!((frame.cursor_row, frame.cursor_col), (12, 71));
+    keys.extend_from_slice(b"xxxxxxxxxx\x15");
+    let mut cleared = typed_terminal(&keys);
+    assert_eq!(cleared.row_text(12).unwrap().trim_end(), "$");
+    assert!(cleared.row_text(13).unwrap().trim_end().is_empty());
+    let frame = cleared.cell_frame(14, 72);
+    assert_eq!((frame.cursor_row, frame.cursor_col), (12, 2));
+
+    for (cols, row) in [(1_u16, 0), (2, 0), (8, 3)] {
+        let mut keys = vec![b'x'; 80];
+        let full = typed_terminal_at(&keys, cols);
+        assert!(full.visible_content().contains('x'));
+        if cols == 8 {
+            assert!(full.row_text(row).unwrap().starts_with("$ "));
+        } else {
+            assert!(!full.visible_content().contains('$'));
+        }
+        keys.push(21);
+        let mut cleared = typed_terminal_at(&keys, cols);
+        let mut expected = aterm_core::terminal::Terminal::new(14, cols);
+        expected.process(format!("\x1b[2J\x1b[{};1H$ ", row + 1).as_bytes());
+        for row in 0..14 {
+            assert_eq!(
+                cleared.row_text(row).unwrap().trim_end(),
+                expected.row_text(row).unwrap().trim_end()
+            );
+        }
+        let frame = cleared.cell_frame(14, usize::from(cols));
+        let expected_frame = expected.cell_frame(14, usize::from(cols));
+        assert_eq!(
+            (frame.cursor_row, frame.cursor_col),
+            (expected_frame.cursor_row, expected_frame.cursor_col)
+        );
+    }
+}
+
+#[test]
+fn typed_gallery_resize_preserves_held_data_and_unknown_geometry_refuses() {
+    let mut output = Vec::new();
+    let mut looks = 0;
+    typing_fixture(&mut std::io::Cursor::new(b"MMMM MMMM"), &mut output, || {
+        looks += 1;
+        Some(if looks < 4 { (14, 72) } else { (14, 12) })
+    })
+    .unwrap();
+    let mut term = aterm_core::terminal::Terminal::new(14, 12);
+    term.process(&output);
+    assert_eq!(term.row_text(0).unwrap().trim_end(), "$ MMMM MMMM");
+    assert!(term.row_text(4).unwrap().trim_end().is_empty());
+
+    for size in [None, Some((0, 72)), Some((14, 0))] {
+        let mut output = Vec::new();
+        assert!(typing_fixture(&mut std::io::Cursor::new(b"x"), &mut output, || size).is_err());
+        assert!(output.is_empty());
+    }
+}
+
+fn focus_terminal(keys: &[u8]) -> aterm_core::terminal::Terminal {
+    let mut output = Vec::new();
+    line_fixture(&mut std::io::Cursor::new(keys), &mut output, true, || {
+        Some((14, 32))
+    })
+    .unwrap();
+    let mut term = aterm_core::terminal::Terminal::new(14, 32);
+    term.process(&output);
+    term
+}
+
+#[test]
+fn focus_reports_restore_a_populated_composer_before_its_space_and_word_wrap() {
+    let warm = format!("{}shared", "a".repeat(54));
+    let mut keys = warm.as_bytes().to_vec();
+    keys.extend_from_slice(b"\x1b[O\x1b[I");
+    for (count, expected) in [
+        (0, (5, 30, false)),
+        (1, (5, 31, false)),
+        (2, (5, 31, true)),
+        (3, (6, 1, false)),
+        (4, (6, 2, false)),
+        (5, (6, 3, false)),
+        (6, (6, 4, false)),
+    ] {
+        let mut input = keys.clone();
+        input.extend_from_slice(&b" state"[..count]);
+        let term = focus_terminal(&input);
+        let cursor = term.grid().cursor();
+        assert_eq!(
+            (cursor.row, cursor.col, term.grid().pending_wrap()),
+            expected,
+            "after {count} suffix keys"
+        );
+        assert_eq!(
+            term.row_text(4).as_deref(),
+            Some(format!("> {}", "a".repeat(30)).as_str())
+        );
+        assert_eq!(term.row_text(7).unwrap().trim_end(), "focus in");
+    }
+    keys.extend_from_slice(b" state");
+    let term = focus_terminal(&keys);
+    assert_eq!(
+        term.row_text(5).as_deref(),
+        Some(format!("{}shared s", "a".repeat(24)).as_str())
+    );
+    assert_eq!(term.row_text(6).unwrap().trim_end(), "tate");
+
+    // The original scenario still starts with an empty composer.
+    let empty = focus_terminal(b"\x1b[O\x1b[Iecho");
+    assert_eq!(empty.row_text(4).unwrap().trim_end(), "> echo");
+    assert_eq!(empty.row_text(7).unwrap().trim_end(), "focus in");
+}
+
+#[test]
+fn focus_restore_preserves_pending_wrap_and_plain_cup_is_a_negative_control() {
+    for len in [30, 62] {
+        let mut keys = vec![b'x'; len];
+        keys.extend_from_slice(b"\x1b[O\x1b[I");
+        let mut returned = focus_terminal(&keys);
+        let row = if len == 30 { 4 } else { 5 };
+        assert_eq!(returned.grid().cursor().row, row);
+        assert_eq!(returned.grid().cursor().col, 31);
+        assert!(returned.grid().pending_wrap());
+
+        let mut lost = focus_terminal(&keys);
+        lost.process(format!("\x1b[{};32H", row + 1).as_bytes());
+        assert!(!lost.grid().pending_wrap(), "CUP loses the pending state");
+        returned.process(b"z");
+        lost.process(b"z");
+        assert_eq!(returned.grid().cursor().row, row + 1);
+        assert_eq!(returned.grid().cursor().col, 1);
+        assert_eq!(
+            returned.row_text(usize::from(row + 1)).unwrap().trim_end(),
+            "z"
+        );
+        assert_eq!(lost.grid().cursor().row, row);
+        assert!(lost.row_text(usize::from(row)).unwrap().ends_with('z'));
+    }
+}
+
+#[test]
+fn compiled_gallery_programs_preserve_an_occupied_script_and_argument_boundaries() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let lab = root.path().join("lab with spaces");
+    let script = root.path().join("paint.sh");
+    let typing = gallery_program(root.path(), Scenario::Typing, Theme::Light, &lab).unwrap();
+    assert_eq!(
+        typing,
+        vec![
+            lab.to_string_lossy().into_owned(),
+            "__trail-redraw-fixture".into(),
+            "typing".into()
+        ]
+    );
+    assert!(!script.exists(), "the compiled route creates no script");
+
+    let kept = b"existing inert fixture data";
+    std::fs::write(&script, kept).unwrap();
+    for (scenario, mode) in [
+        (Scenario::Typing, Some("typing")),
+        (Scenario::Settings, None),
+        (Scenario::RedrawStall, None),
+        (Scenario::FoldRest, Some("fold")),
+        (Scenario::FocusRoundtrip, Some("focus")),
+        (Scenario::FocusWrap, Some("focus")),
+    ] {
+        let args = gallery_program(root.path(), scenario, Theme::Dark, &lab).unwrap();
+        assert_eq!(args[0], lab.to_string_lossy().as_ref());
+        assert_eq!(args[1], "__trail-redraw-fixture");
+        assert_eq!(args.get(2).map(String::as_str), mode);
+        assert_eq!(args.len(), 2 + usize::from(mode.is_some()));
+        assert_eq!(std::fs::read(&script).unwrap(), kept);
+    }
+}
+
 struct Wire {
     replies: std::io::Cursor<Vec<u8>>,
     sent: Vec<u8>,
@@ -111,28 +393,121 @@ fn inline_capture_validates_png_bytes_and_dimensions_without_an_artifact_ack() {
 }
 
 #[test]
-fn an_open_capture_never_waits_for_its_own_frame_to_close() {
-    let mut client = wire(
-        "OK 1\ntrail open\nOK 1\ntrail returned\nOK 4 26 1 blinking_block\nOK 1\nreturned text\n",
-    );
-    let open = frame_evidence(FrameRead::Open, |request, shape| {
-        relay_reply(&mut client, request, shape).unwrap()
-    });
-    assert!(open.cursor.is_none() && open.text.is_none());
-    assert_eq!(client.transport().sent, b"trail status\n");
-    let returned = frame_evidence(FrameRead::Returned, |request, shape| {
-        relay_reply(&mut client, request, shape).unwrap()
-    });
+fn a_returned_capture_keeps_status_cursor_and_text_replies_separate() {
+    let mut client = wire("OK 1\ntrail returned\nOK 4 26 1 blinking_block\nOK 1\nreturned text\n");
+    let returned =
+        frame_evidence(|request, shape| relay_reply(&mut client, request, shape).unwrap());
     assert_eq!(returned.status.stdout, "trail returned\n");
-    assert_eq!(
-        returned.cursor.unwrap().stdout,
-        "OK 4 26 1 blinking_block\n"
+    assert_eq!(returned.cursor.stdout, "OK 4 26 1 blinking_block\n");
+    assert_eq!(returned.text.stdout, "returned text\n");
+    assert_eq!(client.transport().sent, b"trail status\ncursor\ntext\n");
+}
+
+#[test]
+fn recording_cost_cannot_extend_the_redraw_hold_or_replace_its_boundary_marks() {
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct Boundary {
+        at: u64,
+        open: bool,
+        status: String,
+    }
+
+    #[derive(Default)]
+    struct Recorder {
+        now: u64,
+        open: bool,
+        status: String,
+        boundaries: Option<(Boundary, Boundary)>,
+        operations: Vec<(&'static str, bool)>,
+    }
+
+    impl Recorder {
+        fn toggle(&mut self) -> Boundary {
+            self.open = !self.open;
+            self.status = if self.open { "held" } else { "released" }.into();
+            Boundary {
+                at: self.now,
+                open: self.open,
+                status: self.status.clone(),
+            }
+        }
+
+        fn record(&mut self, clean: bool, cost: u64) {
+            for operation in ["image", "sidecars", "artifact"] {
+                self.operations.push((operation, self.open));
+                self.now += cost;
+            }
+            if clean {
+                for operation in ["clean image", "clean artifact"] {
+                    self.operations.push((operation, self.open));
+                    self.now += cost;
+                }
+            }
+            self.status = "later recording state".into();
+        }
+    }
+
+    let run = |clean, cost, before_release| {
+        let mut recorder = Recorder::default();
+        record_after_hold(
+            &mut recorder,
+            Recorder::toggle,
+            |state, opened| {
+                state.now = opened.at + REDRAW_HOLD_MS;
+                if before_release {
+                    state.record(clean, cost);
+                }
+                Ok::<(), ()>(())
+            },
+            |state, opened, released| {
+                state.boundaries = Some((opened, released));
+                state.record(clean, cost);
+                Ok(())
+            },
+        )
+        .unwrap();
+        recorder
+    };
+
+    for clean in [false, true] {
+        for cost in [0, 3_000] {
+            let recorded = run(clean, cost, false);
+            let (opened, released) = recorded.boundaries.as_ref().unwrap();
+            assert_eq!(released.at - opened.at, REDRAW_HOLD_MS);
+            assert!(opened.open && !released.open);
+            assert_eq!(opened.status, "held");
+            assert_eq!(released.status, "released");
+            assert_eq!(recorded.status, "later recording state");
+            assert!(recorded.operations.iter().all(|(_, open)| !open));
+
+            // The previous driver encoded its open frame and twin before release.
+            // The same fake detects that cost even though the intended hold is unchanged.
+            let previous = run(clean, cost, true);
+            let (opened, released) = previous.boundaries.as_ref().unwrap();
+            assert!(previous.operations.iter().any(|(_, open)| *open));
+            if cost > 0 {
+                assert!(released.at - opened.at > REDRAW_HOLD_MS);
+            }
+        }
+    }
+}
+
+#[test]
+fn an_interrupted_hold_is_released_without_recording() {
+    let mut held = false;
+    let stopped = record_after_hold(
+        &mut held,
+        |held| {
+            *held = !*held;
+        },
+        |held, _| {
+            assert!(*held);
+            Err(Stopped(libc::SIGINT))
+        },
+        |_, _, _| panic!("an interrupted hold records no capture"),
     );
-    assert_eq!(returned.text.unwrap().stdout, "returned text\n");
-    assert_eq!(
-        client.transport().sent,
-        b"trail status\ntrail status\ncursor\ntext\n"
-    );
+    assert_eq!(stopped, Err(Stopped(libc::SIGINT)));
+    assert!(!held);
 }
 
 #[test]
@@ -373,6 +748,31 @@ fn options_go_anywhere_and_scenarios_repeat_in_order_once() {
     assert_eq!(a.aterm.as_deref(), Some("/b/aterm"));
     let all = parse_args(&args(&["--scenario", "all", "/x/g"])).unwrap();
     assert_eq!(all.scenarios, Scenario::ALL.to_vec());
+}
+
+#[test]
+fn focus_wrap_keeps_its_fixed_grid_without_changing_other_scenario_overrides() {
+    let selected = parse_args(&args(&["--scenario", "focus-wrap", "/x/g"])).unwrap();
+    assert_eq!(selected.scenarios, vec![Scenario::FocusWrap]);
+    assert_eq!(Scenario::FocusWrap.grid(), (32, 14, 22));
+    let custom = parse_args(&args(&[
+        "--scenario",
+        "all",
+        "--columns",
+        "80",
+        "--lines",
+        "18",
+        "--font-px",
+        "20",
+        "/x/g",
+    ]))
+    .unwrap();
+    assert_eq!(Scenario::FocusWrap.configured_grid(&custom), (32, 14, 20));
+    assert_eq!(Scenario::Typing.configured_grid(&custom), (80, 18, 20));
+    assert_eq!(
+        Scenario::FocusRoundtrip.configured_grid(&custom),
+        (80, 18, 20)
+    );
 }
 
 #[test]

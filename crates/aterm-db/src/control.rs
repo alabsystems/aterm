@@ -24,6 +24,7 @@ use std::{
     collections::BTreeSet,
     io::{Read, Write},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -77,6 +78,8 @@ pub enum Phase {
     MembershipRecords,
     Application,
     VersionReport,
+    /// Optional holder-to-custodian transfer after a successful application round.
+    Credentials,
     /// Application repair and optional version reporting finished locally.
     Complete,
 }
@@ -100,6 +103,7 @@ impl Phase {
             Self::MembershipRecords => "membership-records",
             Self::Application => "application",
             Self::VersionReport => "version-report",
+            Self::Credentials => "credentials",
             Self::Complete => "complete",
         }
     }
@@ -115,6 +119,108 @@ pub struct Report {
     pub deferred: usize,
 }
 
+/// How long a peer is offered no membership records once it has refused every record this Mac
+/// could offer it under one pair of complete inventories ([`MembershipHint`]). Under that
+/// evidence only a busy or failing disk makes the next offer fare differently; the hold bounds
+/// how late such a refusal is retried, as `network::Repair`'s deferral lapses after the same 60 s.
+const REFUSAL_HOLD: Duration = Duration::from_secs(60);
+
+/// Per-peer membership-record scheduling, never a claim of delivery: where the next round's
+/// selection resumes, and the run of rounds the peer took none of under one pair of complete
+/// inventories.
+#[derive(Clone, Default, Debug)]
+struct MembershipHint {
+    cursor: Option<Digest>,
+    refused: Option<Refusal>,
+}
+
+/// Consecutive rounds a peer durably took none of, all offered under one pair of complete
+/// inventories.
+#[derive(Clone, Copy, Debug)]
+struct Refusal {
+    /// [`hold_key`] of both inventories, so a change on either side ends the run.
+    key: Digest,
+    /// The run's first offered record. A refused round that offers it again has offered every
+    /// record the peer lacks at least once since the run began.
+    first: Digest,
+    /// When the run last proved the peer refuses whatever this Mac can offer it; `None` while
+    /// the run falls short of that.
+    held: Option<Instant>,
+}
+
+impl MembershipHint {
+    /// Whether a round at `now`, under the inventories whose [`hold_key`] is `key`, offers the
+    /// peer anything: not for [`REFUSAL_HOLD`] after a run under that key proved it refuses
+    /// everything. Two full stores on different branches otherwise re-offered 16 refused records
+    /// a round, three rounds a pass, every pass. A change of either inventory ends the run.
+    fn offers(&mut self, key: &Digest, now: Instant) -> bool {
+        match self.refused {
+            Some(run) if run.key != *key => {
+                self.refused = None;
+                true
+            }
+            Some(Refusal { held: Some(at), .. }) => {
+                now.saturating_duration_since(at) >= REFUSAL_HOLD
+            }
+            _ => true,
+        }
+    }
+
+    /// Note a round that offered `offered`, in selection order, under the inventories whose
+    /// [`hold_key`] is `key`, of which the peer durably took `taken`. The peer refuses whatever
+    /// this Mac can offer once a run of refused rounds offered every record it lacks (the run's
+    /// first record comes round again), or at once when `full`: a peer whose complete records
+    /// reach `MAX_RECORDS` takes no complete record (`Log::insert`). A run short of that proves
+    /// nothing, as a busy disk refuses a round and a peer parks a record whose parent it lacks
+    /// without taking it. Once proved, the walk restarts at the earliest record the peer lacks,
+    /// so the round after the hold offers parents before their children, and a refused round
+    /// under the same key renews the hold.
+    fn settle(&mut self, key: Digest, offered: &[Digest], taken: usize, full: bool, now: Instant) {
+        let Some(&first) = offered.first() else {
+            return;
+        };
+        if taken > 0 {
+            self.refused = None;
+            return;
+        }
+        let proved = match &mut self.refused {
+            Some(run) if run.key == key => {
+                if run.held.is_some() {
+                    run.held = Some(now);
+                    false
+                } else {
+                    offered.contains(&run.first)
+                }
+            }
+            _ => {
+                self.refused = Some(Refusal {
+                    key,
+                    first,
+                    held: None,
+                });
+                full
+            }
+        };
+        if proved && let Some(run) = &mut self.refused {
+            run.held = Some(now);
+            self.cursor = None;
+        }
+    }
+}
+
+/// Digest of the two sorted, unique complete inventories a round was offered under, so a hint
+/// keeps one digest per peer, not its ids.
+fn hold_key(local: &BTreeSet<Digest>, remote: &BTreeSet<Digest>) -> Digest {
+    let mut hash = Sha256::new();
+    for ids in [local, remote] {
+        hash.update((ids.len() as u64).to_le_bytes());
+        for id in ids {
+            hash.update(id);
+        }
+    }
+    hash.finalize()
+}
+
 /// Volatile scheduling hint, never a claim of delivery. Keep one per peer.
 /// Advancing past a deferred node prevents it from starving later restrictions;
 /// wraparound retries it even if the caller does not maintain a timer.
@@ -123,14 +229,18 @@ pub struct Repair {
     phase: Phase,
     peer: Option<(Trust, Actor)>,
     authenticated: Option<Instant>,
+    /// This side dialed, sent its hello over an established channel, and the peer closed or went
+    /// quiet before sending its own ([`Self::unanswered`]).
+    unanswered: bool,
     cursor: Option<Digest>,
-    membership_cursor: Option<Digest>,
+    membership_hint: MembershipHint,
     data: crate::replica::Repair,
     application: Option<crate::replica::Report>,
     membership: Option<Report>,
     membership_error: Option<String>,
     said: Said,
     application_error: Option<String>,
+    handoff: Option<std::result::Result<usize, String>>,
 }
 impl Repair {
     /// This attempt's local progress, including its last operation on failure.
@@ -144,6 +254,11 @@ impl Repair {
         self.membership_error = None;
         self.said = Said::Unknown;
         self.application_error = None;
+        self.handoff = None;
+        self.data.retry_probe = false;
+        self.data.deferral = None;
+        self.data.batch_deferral = None;
+        self.data.interrupted = None;
     }
     /// The most recently channel-authenticated peer; the round may have failed.
     pub fn actor(&self) -> Option<Actor> {
@@ -152,7 +267,26 @@ impl Repair {
     pub(crate) fn begin_round(&mut self) {
         self.phase = Phase::Connecting;
         self.authenticated = None;
+        self.unanswered = false;
         self.clear_application();
+    }
+    /// This round's initiator sent its hello over an established channel and the peer closed or
+    /// went quiet before sending its own. A responder answers only once it has admitted the
+    /// round, so this is how contention looks from the dialing side (a crossed dial whose other
+    /// channel holds the pair, a peer cache at capacity, a preferred round that waited out its
+    /// deadline), and equally a peer that refuses this Mac or has not yet approved its enrollment:
+    /// the initiator cannot tell them apart.
+    pub(crate) const fn unanswered(&self) -> bool {
+        self.unanswered
+    }
+    /// Receive the peer's hello; an initiator that gets none of it marks [`Self::unanswered`].
+    fn receive_answer(&mut self, stream: &mut impl Read, side: Side) -> Result<Vec<u8>> {
+        let n = read_u32(stream).inspect_err(|_| self.unanswered = side == Side::Initiator)?;
+        frame_body(stream, n, MAX_ACX2_HELLO)
+    }
+    /// An older application probe failed before any application data was sent.
+    pub(crate) fn retry_application_probe(&self) -> bool {
+        self.data.retry_probe
     }
     /// The peer authenticated during the current round, including a round
     /// whose later control or application exchange failed. A previous round's
@@ -172,6 +306,12 @@ impl Repair {
     pub const fn application(&self) -> Option<crate::replica::Report> {
         self.application
     }
+    /// Observed progress before an application error, not a completed exchange.
+    /// Counts are lower bounds and include idempotent ingests. None also covers
+    /// admission/probe failures; it never proves no data moved. A new round clears it.
+    pub const fn application_interrupted(&self) -> Option<crate::replica::Report> {
+        self.data.interrupted
+    }
     /// Membership-record acknowledgements from a completed negotiated exchange,
     /// before application repair under `atdb/2` or after it for older F13 peers.
     /// None also covers unavailable, failed or unsupported membership exchange.
@@ -183,17 +323,34 @@ impl Repair {
     pub fn membership_error(&self) -> Option<&str> {
         self.membership_error.as_deref()
     }
+
+    /// Credential transfers published this round, or a bounded protocol failure. None
+    /// means no runtime handoff was negotiated; it says nothing about vault contents.
+    pub fn handoff(&self) -> Option<&std::result::Result<usize, String>> {
+        self.handoff.as_ref()
+    }
     /// The last application upgrade's failure in this round. A missing error
     /// does not establish that an application round completed; check
     /// [`Self::application`] separately. Starting another round clears it.
     pub fn application_error(&self) -> Option<&str> {
         self.application_error.as_deref()
     }
+    /// An unavailable inventory in a completed application round. This preserves
+    /// a local refusal separately from a peer's unexplained unavailable inventory.
+    /// Starting another round clears it without discarding scheduling hints.
+    pub fn application_deferral(&self) -> Option<&crate::replica::InventoryDeferral> {
+        self.data.deferral.as_ref()
+    }
+    /// First local batch refusal in this round, including a completed exchange
+    /// that acknowledged no incoming operations. Starting another round clears it.
+    pub fn application_batch_deferral(&self) -> Option<&crate::replica::BatchDeferral> {
+        self.data.batch_deferral.as_ref()
+    }
     fn prepare(&mut self, trust: Trust, actor: Actor) {
         self.authenticated = Some(Instant::now());
         if self.peer != Some((trust, actor)) {
             self.cursor = None;
-            self.membership_cursor = None;
+            self.membership_hint = MembershipHint::default();
             self.peer = Some((trust, actor));
             self.data = crate::replica::Repair::default();
         }
@@ -232,6 +389,18 @@ impl Repair {
     }
 }
 
+/// Bounded scheduling hints for one runtime, retained across endpoint rebuilds.
+/// These hold public IDs and round metadata, never a bootstrap or authority lease.
+#[derive(Default)]
+pub(crate) struct PeerCache(Mutex<Option<CacheScope>>);
+
+struct CacheScope {
+    trust: Trust,
+    actor: Actor,
+    peers: Arc<peers::Cache>,
+    backfill: Arc<Mutex<crate::replica::Backfill>>,
+}
+
 /// Locally pinned journal plus an authority-approved device signing identity.
 /// Construction uses an already enrolled persistent device; it never creates a
 /// network, age identity, writer incarnation, epoch key or plaintext key file.
@@ -244,8 +413,9 @@ pub struct Endpoint {
     /// This device's signed version, traded after a completed round; empty while pending.
     report: Vec<u8>,
     application: Option<crate::replica::Replica>,
-    peers: peers::Cache,
+    peers: Arc<peers::Cache>,
     paths: Option<aterm_secrets::client::Paths>,
+    credentials: Option<(crate::runtime::CredentialOwner, PathBuf)>,
     pending: bool,
     /// Behave as 0.145 does: trade no version after a round.
     #[cfg(test)]
@@ -253,6 +423,9 @@ pub struct Endpoint {
     /// Test an F13 peer whose TLS still selects the application-first order.
     #[cfg(test)]
     pub(crate) legacy_repair: bool,
+    /// Use the released 0.146 projection and `atdb/2` TLS offer in wire tests.
+    #[cfg(test)]
+    pub(crate) legacy_projection: bool,
 }
 
 /// One exchange's absolute deadline: the product's [`crate::network::WITHIN`]. A test needs each
@@ -263,7 +436,56 @@ const EXCHANGE: Duration = crate::network::WITHIN;
 #[cfg(test)]
 const EXCHANGE: Duration = Duration::from_secs(60);
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Protocol {
+    Legacy,
+    Repair,
+    Credentials,
+}
+
+impl Protocol {
+    fn from_alpn(alpn: Option<&[u8]>) -> Self {
+        match alpn {
+            Some(fleet::ALPN_DATABASE_CREDENTIALS) => Self::Credentials,
+            Some(fleet::ALPN_DATABASE_REPAIR) => Self::Repair,
+            _ => Self::Legacy,
+        }
+    }
+}
+
 impl Endpoint {
+    /// Reuse only volatile repair hints for this same pinned trust and local
+    /// writer. Every new connection still authenticates before leasing them.
+    pub(crate) fn with_repair_cache(mut self, cache: &PeerCache) -> Self {
+        let mut current = cache.0.lock().unwrap_or_else(|poison| poison.into_inner());
+        if !current
+            .as_ref()
+            .is_some_and(|scope| scope.trust == self.trust && scope.actor == self.actor)
+        {
+            *current = Some(CacheScope {
+                trust: self.trust,
+                actor: self.actor,
+                peers: Arc::default(),
+                backfill: Arc::default(),
+            });
+        }
+        let scope = current.as_ref().expect("cache scope installed");
+        self.peers = scope.peers.clone();
+        if let Some(application) = &mut self.application {
+            application.share_backfill(&scope.backfill);
+        }
+        self
+    }
+
+    pub(crate) fn with_credential_owner(
+        mut self,
+        owner: crate::runtime::CredentialOwner,
+        config: PathBuf,
+    ) -> Self {
+        self.credentials = Some((owner, config));
+        self
+    }
+
     /// Construct an endpoint from this batch's already checked membership and
     /// historical binding. Construction performs no additional journal open.
     /// The returned endpoint holds no session lock; drop the session before
@@ -360,6 +582,14 @@ impl Endpoint {
         self.paths = Some(paths);
         Ok(self)
     }
+    /// Make the rounds this endpoint initiates repair `first`'s table first while it names one both
+    /// sides hold ([`crate::replica::Replica::prefer`]); an endpoint with no tables has none to.
+    pub(crate) fn prefer(&mut self, first: crate::replica::First) {
+        if let Some(application) = self.application.as_mut() {
+            application.prefer(first);
+        }
+    }
+
     /// Attach an explicit local table set. Discovery/subscription is a higher
     /// layer; no table path or admission can come from a peer's packet.
     pub fn with_tables(
@@ -527,13 +757,16 @@ impl Endpoint {
                 hello,
                 report: Vec::new(),
                 application: None,
-                peers: peers::Cache::default(),
+                peers: Arc::default(),
                 paths: Some(paths),
+                credentials: None,
                 pending: true,
                 #[cfg(test)]
                 legacy: false,
                 #[cfg(test)]
                 legacy_repair: false,
+                #[cfg(test)]
+                legacy_projection: false,
             })
         })
     }
@@ -593,13 +826,16 @@ impl Endpoint {
             hello,
             report,
             application: None,
-            peers: peers::Cache::default(),
+            credentials: None,
+            peers: Arc::default(),
             paths: None,
             pending: false,
             #[cfg(test)]
             legacy: false,
             #[cfg(test)]
             legacy_repair: false,
+            #[cfg(test)]
+            legacy_projection: false,
         })
     }
 
@@ -638,13 +874,16 @@ impl Endpoint {
             hello,
             report,
             application: None,
-            peers: peers::Cache::default(),
+            credentials: None,
+            peers: Arc::default(),
             paths: None,
             pending: false,
             #[cfg(test)]
             legacy: false,
             #[cfg(test)]
             legacy_repair: false,
+            #[cfg(test)]
+            legacy_projection: false,
         })
     }
 
@@ -682,7 +921,14 @@ impl Endpoint {
         match side {
             Side::Initiator => {
                 let mut channel = if negotiate_recovery {
-                    fleet::client_handshake_database_as(
+                    let handshake = fleet::client_handshake_database_as;
+                    #[cfg(test)]
+                    let handshake = if self.legacy_projection {
+                        fleet::test_client_handshake_database_v2_as
+                    } else {
+                        handshake
+                    };
+                    handshake(
                         tcp,
                         &discriminator,
                         Some(&self.identity),
@@ -701,15 +947,14 @@ impl Endpoint {
                 locality
                     .recheck()
                     .inspect_err(|_| repair.phase = Phase::Route)?;
-                let recovery_first = channel.transport.stream().conn.alpn_protocol()
-                    == Some(fleet::ALPN_DATABASE_REPAIR);
+                let protocol = Protocol::from_alpn(channel.transport.stream().conn.alpn_protocol());
                 let result = self.connected_until(
                     channel.transport.stream(),
                     channel.peer.as_ref(),
                     side,
                     repair,
                     until,
-                    recovery_first,
+                    protocol,
                 );
                 locality
                     .finish()
@@ -718,7 +963,14 @@ impl Endpoint {
             }
             Side::Responder => {
                 let mut channel = if negotiate_recovery {
-                    fleet::server_handshake_database_as(
+                    let handshake = fleet::server_handshake_database_as;
+                    #[cfg(test)]
+                    let handshake = if self.legacy_projection {
+                        fleet::test_server_handshake_database_v2_as
+                    } else {
+                        handshake
+                    };
+                    handshake(
                         tcp,
                         &discriminator,
                         Some(&self.identity),
@@ -738,15 +990,14 @@ impl Endpoint {
                 locality
                     .recheck()
                     .inspect_err(|_| repair.phase = Phase::Route)?;
-                let recovery_first = channel.transport.stream().conn.alpn_protocol()
-                    == Some(fleet::ALPN_DATABASE_REPAIR);
+                let protocol = Protocol::from_alpn(channel.transport.stream().conn.alpn_protocol());
                 let result = self.connected_until(
                     channel.transport.stream(),
                     channel.peer.as_ref(),
                     side,
                     repair,
                     until,
-                    recovery_first,
+                    protocol,
                 );
                 locality
                     .finish()
@@ -770,7 +1021,7 @@ impl Endpoint {
             side,
             repair,
             Instant::now() + EXCHANGE,
-            false,
+            Protocol::Legacy,
         )
     }
 
@@ -781,8 +1032,9 @@ impl Endpoint {
         side: Side,
         repair: &mut Repair,
         until: Instant,
-        recovery_first: bool,
+        protocol: Protocol,
     ) -> Result<Report> {
+        let recovery_first = protocol != Protocol::Legacy;
         repair.begin_round();
         repair.phase = Phase::Membership;
         if self.pending {
@@ -797,12 +1049,18 @@ impl Endpoint {
         if side == Side::Initiator {
             send_frame(stream, &self.hello)?;
         }
-        let hello = receive_frame(stream, MAX_ACX2_HELLO)?;
+        let hello = repair.receive_answer(stream, side)?;
         if side == Side::Responder && hello.starts_with(b"ACE1") {
             return enrollment::serve(self, stream, proof, &hello, repair);
         }
-        let actor = authenticate(self.trust, self.actor, proof, &hello)?;
-        verify_peer_against_local_log(self.paths.as_ref(), self.trust, actor, &hello)?;
+        let (actor, peer_log) = authenticate(self.trust, self.actor, proof, &hello)?;
+        verify_peer_against_local_log(
+            self.paths.as_ref(),
+            self.trust,
+            actor,
+            &hello,
+            peer_log.as_deref(),
+        )?;
         let authenticated_at = Instant::now();
         repair.prepare(self.trust, actor);
         repair.authenticated = Some(authenticated_at);
@@ -833,15 +1091,16 @@ impl Endpoint {
         let report = self.repair_control(stream, side, &mut lease)?;
         if recovery_first {
             lease.phase = Phase::MembershipRecords;
-            let application = match self.trade_recovery(stream, side, &mut lease, both_acx2) {
-                Ok(application) => application,
+            let common = match self.trade_recovery(stream, side, &mut lease, both_acx2, protocol) {
+                Ok(common) => common,
                 Err(error) => {
                     lease.membership_error = Some(error.to_string());
                     return Ok(report);
                 }
             };
+            let application = common & 2 != 0;
             if application {
-                self.repair_application(stream, actor, side, &mut lease);
+                self.repair_application(stream, actor, side, &mut lease, protocol);
             }
             // A failed application exchange can leave buffered protocol bytes.
             // The recovery records are already retained; do not reuse that
@@ -850,6 +1109,26 @@ impl Endpoint {
                 if application {
                     lease.phase = Phase::VersionReport;
                     lease.said = self.trade_reports(stream, actor, side);
+                    if common & 4 != 0 {
+                        lease.phase = Phase::Credentials;
+                        if let (Some(paths), Some((owner, config))) =
+                            (&self.paths, &self.credentials)
+                        {
+                            lease.handoff = Some(
+                                crate::credentials::handoff::exchange(
+                                    paths,
+                                    config,
+                                    owner,
+                                    self.trust.network,
+                                    self.actor,
+                                    actor,
+                                    side,
+                                    stream,
+                                )
+                                .map_err(|_| "credential handoff failed".to_owned()),
+                            );
+                        }
+                    }
                     lease.phase = Phase::Complete;
                 } else {
                     lease.phase = Phase::ControlComplete;
@@ -857,7 +1136,7 @@ impl Endpoint {
             }
             return Ok(report);
         }
-        self.repair_application(stream, actor, side, &mut lease);
+        self.repair_application(stream, actor, side, &mut lease, protocol);
         #[cfg(test)]
         if self.legacy {
             if lease.application.is_some() {
@@ -894,11 +1173,12 @@ impl Endpoint {
             stream,
             &MembershipDisk::new(paths, self.trust),
             side,
-            &mut repair.membership_cursor,
+            &mut repair.membership_hint,
             &mut |allow_coalesce| {
                 aterm_secrets::client::reconcile_commons_log(paths, allow_coalesce)
                     .is_ok_and(|written| !written.is_empty())
             },
+            Instant::now(),
         )
     }
 
@@ -910,11 +1190,18 @@ impl Endpoint {
         side: Side,
         repair: &mut Repair,
         both_acx2: bool,
-    ) -> Result<bool> {
+        protocol: Protocol,
+    ) -> Result<u8> {
         const RECORDS: u8 = 1;
         const APPLICATION: u8 = 2;
+        let credentials = if protocol == Protocol::Credentials {
+            4
+        } else {
+            0
+        };
         let flags = (u8::from(self.paths.is_some()) * RECORDS)
-            | (u8::from(self.application.is_some()) * APPLICATION);
+            | (u8::from(self.application.is_some()) * APPLICATION)
+            | (u8::from(self.credentials.is_some() && self.application.is_some()) * credentials);
         let own = [b'A', b'C', b'R', b'2', flags];
         let remote = match side {
             Side::Initiator => {
@@ -929,7 +1216,7 @@ impl Endpoint {
         };
         if remote.len() != own.len()
             || remote[..4] != own[..4]
-            || remote[4] & !(RECORDS | APPLICATION) != 0
+            || remote[4] & !(RECORDS | APPLICATION | credentials) != 0
         {
             return Err(Error::new("invalid Commons repair capabilities"));
         }
@@ -945,11 +1232,12 @@ impl Endpoint {
                         self.trust,
                     ),
                     side,
-                    &mut repair.membership_cursor,
+                    &mut repair.membership_hint,
+                    Instant::now(),
                 )?
             });
         }
-        Ok(common & APPLICATION != 0)
+        Ok(common)
     }
     /// Trade signed versions once a round completed on this side (C26). Each side's next frame
     /// is then the other's report, or its end: a 0.145 peer sends none, reads none and has
@@ -998,7 +1286,8 @@ impl Endpoint {
             stream,
             &MembershipDisk::new(paths, self.trust),
             side,
-            &mut repair.membership_cursor,
+            &mut repair.membership_hint,
+            Instant::now(),
         )
         .ok()
     }
@@ -1026,41 +1315,165 @@ impl Endpoint {
         actor: Actor,
         side: Side,
         repair: &mut Repair,
+        protocol: Protocol,
     ) {
         if let Some(application) = &self.application {
             repair.phase = Phase::Application;
-            let result = application.exchange(stream, actor, side, &mut repair.data);
+            #[cfg(test)]
+            if self.legacy_projection {
+                let result =
+                    application.exchange_legacy_projection(stream, actor, side, &mut repair.data);
+                repair.application_error = result.as_ref().err().map(ToString::to_string);
+                repair.application = result.ok();
+                return;
+            }
+            let result = if protocol == Protocol::Credentials {
+                application.exchange(stream, actor, side, &mut repair.data)
+            } else {
+                application.exchange_with_compatibility(stream, actor, side, &mut repair.data)
+            };
             repair.application_error = result.as_ref().err().map(ToString::to_string);
             repair.application = result.ok();
         }
     }
 }
 
-pub(super) fn check_log_witness(
-    trust: Trust,
-    request: &Request,
-    wire: &[u8],
-) -> Result<aterm_secrets::membership_log::Log> {
-    type WitnessLogCacheEntry = (Trust, Vec<u8>, [u8; 32], aterm_secrets::membership_log::Log);
-    static WITNESS_LOG_CACHE: std::sync::Mutex<std::collections::VecDeque<WitnessLogCacheEntry>> =
-        std::sync::Mutex::new(std::collections::VecDeque::new());
+/// The decoded membership-log witnesses this process holds: room for one per peer a full roster
+/// has ([`WITNESS_ENTRIES`]), within the byte bound 16 maximal witnesses had before
+/// ([`WITNESS_BYTES`]).
+const WITNESS_ENTRIES: usize = aterm_secrets::commons::roster::MAX_MEMBERS + 1;
+const WITNESS_BYTES: usize = 16 * (MAX_ACX2_HELLO - HELLO_FIXED);
 
-    let binding = request.binding();
-    if trust.genesis == [0; 32]
-        || *binding.network() != trust.network
-        || *binding.authority() != trust.authority
-    {
-        return Err(Error::new("Commons device belongs to another network"));
+/// One decoded and verified witness, and the requests it admitted.
+struct WitnessEntry {
+    trust: Trust,
+    digest: [u8; 32],
+    bytes: usize,
+    log: Arc<aterm_secrets::membership_log::Log>,
+    /// The device requests this log gave a historical seat (bounded by [`WITNESS_ENTRIES`]).
+    admitted: Vec<Vec<u8>>,
+}
+
+/// Verified membership-log witnesses, most recently used last. A peer's hello carries its log
+/// witness in every round, and a fleet's peers mostly carry the same log, so a round reuses the
+/// decoded log (its every record's signature checked once) of any peer that presented the same
+/// bytes, and the verdict for a request this log already admitted. Each round still hashes the
+/// bytes it received; a log whose bytes differ is decoded afresh.
+pub(super) struct WitnessLogs {
+    entries: Mutex<std::collections::VecDeque<WitnessEntry>>,
+    max_entries: usize,
+    max_bytes: usize,
+    /// Witnesses decoded (tests).
+    #[cfg(test)]
+    pub(super) decodes: std::sync::atomic::AtomicUsize,
+}
+impl WitnessLogs {
+    pub(super) const fn new(max_entries: usize, max_bytes: usize) -> Self {
+        Self {
+            entries: Mutex::new(std::collections::VecDeque::new()),
+            max_entries,
+            max_bytes,
+            #[cfg(test)]
+            decodes: std::sync::atomic::AtomicUsize::new(0),
+        }
     }
-    let wire_digest = Sha256::digest(wire);
-    let request_bytes = request.bytes();
-    if let Ok(cache) = WITNESS_LOG_CACHE.lock()
-        && let Some((_, _, _, log)) = cache
+
+    /// The log a held entry decoded from `digest` under `trust`, moved to most recently used, and
+    /// whether it already admitted `request`.
+    fn held(
+        &self,
+        trust: Trust,
+        digest: &[u8; 32],
+        request: &[u8],
+    ) -> Option<(Arc<aterm_secrets::membership_log::Log>, bool)> {
+        let mut entries = self.entries.lock().ok()?;
+        let at = entries
             .iter()
-            .find(|(t, b, d, _)| *t == trust && *b == request_bytes && *d == wire_digest)
-    {
-        return Ok(log.clone());
+            .position(|e| e.trust == trust && e.digest == *digest)?;
+        let entry = entries.remove(at)?;
+        let held = (
+            entry.log.clone(),
+            entry.admitted.iter().any(|r| r == request),
+        );
+        entries.push_back(entry);
+        Some(held)
     }
+
+    /// Keep `log`, decoded from `digest` (`bytes` long) under `trust`, as having admitted
+    /// `request`, evicting the least recently used entries beyond either bound.
+    fn keep(
+        &self,
+        trust: Trust,
+        digest: [u8; 32],
+        bytes: usize,
+        log: &Arc<aterm_secrets::membership_log::Log>,
+        request: &[u8],
+    ) {
+        let Ok(mut entries) = self.entries.lock() else {
+            return;
+        };
+        let mut entry = match entries
+            .iter()
+            .position(|e| e.trust == trust && e.digest == digest)
+        {
+            Some(at) => entries.remove(at).expect("position is in range"),
+            None => WitnessEntry {
+                trust,
+                digest,
+                bytes,
+                log: log.clone(),
+                admitted: Vec::new(),
+            },
+        };
+        if !entry.admitted.iter().any(|r| r == request) {
+            if entry.admitted.len() >= WITNESS_ENTRIES {
+                entry.admitted.remove(0);
+            }
+            entry.admitted.push(request.to_vec());
+        }
+        entries.push_back(entry);
+        while entries.len() > self.max_entries
+            || (entries.len() > 1
+                && entries.iter().map(|e| e.bytes).sum::<usize>() > self.max_bytes)
+        {
+            entries.pop_front();
+        }
+    }
+
+    /// [`check_log_witness`] against this cache.
+    pub(super) fn check(
+        &self,
+        trust: Trust,
+        request: &Request,
+        wire: &[u8],
+    ) -> Result<Arc<aterm_secrets::membership_log::Log>> {
+        let binding = request.binding();
+        if trust.genesis == [0; 32]
+            || *binding.network() != trust.network
+            || *binding.authority() != trust.authority
+        {
+            return Err(Error::new("Commons device belongs to another network"));
+        }
+        let wire_digest = Sha256::digest(wire);
+        let request_bytes = request.bytes();
+        let log = match self.held(trust, &wire_digest, request_bytes) {
+            Some((log, true)) => return Ok(log),
+            Some((log, false)) => log,
+            None => {
+                #[cfg(test)]
+                self.decodes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Arc::new(decode_log_witness(trust, wire)?)
+            }
+        };
+        admit_by_log_witness(&log, binding)?;
+        self.keep(trust, wire_digest, wire.len(), &log, request_bytes);
+        Ok(log)
+    }
+}
+
+/// Decode a peer's membership-log witness under `trust`, verifying each record into its log.
+fn decode_log_witness(trust: Trust, wire: &[u8]) -> Result<aterm_secrets::membership_log::Log> {
     let records = aterm_secrets::membership_log::decode_records(wire).map_err(failure)?;
     let mut iter = records.into_iter();
     let genesis = iter
@@ -1077,9 +1490,32 @@ pub(super) fn check_log_witness(
     for record in iter {
         let _ = log.insert(record).map_err(failure)?;
     }
+    Ok(log)
+}
+
+/// Verify a decoded peer witness and return its log. The log is shared with every other round
+/// that presented the same bytes ([`WitnessLogs`]).
+pub(super) fn check_log_witness(
+    trust: Trust,
+    request: &Request,
+    wire: &[u8],
+) -> Result<Arc<aterm_secrets::membership_log::Log>> {
+    static WITNESS_LOGS: WitnessLogs = WitnessLogs::new(WITNESS_ENTRIES, WITNESS_BYTES);
+    WITNESS_LOGS.check(trust, request, wire)
+}
+
+/// Whether `log` gives `binding` a historical seat it has not lost.
+fn admit_by_log_witness(
+    log: &aterm_secrets::membership_log::Log,
+    binding: &aterm_secrets::commons::binding::Binding,
+) -> Result<()> {
     if !log.has_historical_seat(binding)
         || log.membership().removal(&binding.actor()).is_some()
         || log.recipient_is_removed(&binding.recipient())
+        || matches!(
+            log.membership().node(binding.writer()),
+            aterm_secrets::membership_log::NodeStanding::Removed(_)
+        )
         || log.audience_left_out(
             &aterm_secrets::membership_log::EpochAudience::Commons,
             &binding.actor(),
@@ -1109,63 +1545,40 @@ pub(super) fn check_log_witness(
     {
         return Err(Error::new("Commons peer lacks historical log approval"));
     }
-    if let Ok(mut cache) = WITNESS_LOG_CACHE.lock() {
-        cache.retain(|(t, b, d, _)| !(*t == trust && *b == request_bytes && *d == wire_digest));
-        if cache.len() >= 16 {
-            cache.pop_front();
-        }
-        cache.push_back((trust, request_bytes.to_vec(), wire_digest, log.clone()));
-    }
-    Ok(log)
+    Ok(())
 }
 
+/// Check the authenticated peer of `hello` against this device's own membership log and
+/// roster. `peer_log` is the log its `ACX2` witness decoded to when [`authenticate`] checked it
+/// in this same round, so the witness is hashed and looked up once per round.
 fn verify_peer_against_local_log(
     paths: Option<&aterm_secrets::client::Paths>,
     trust: Trust,
     actor: Actor,
     hello: &[u8],
+    peer_log: Option<&aterm_secrets::membership_log::Log>,
 ) -> Result<()> {
     let peer_req = Request::decode(&hello[84..HELLO_FIXED]).map_err(failure)?;
-    let peer_log = if hello.starts_with(b"ACX2") {
-        Some(check_log_witness(trust, &peer_req, &hello[HELLO_FIXED..])?)
-    } else {
-        None
-    };
     let Some(paths) = paths else {
         return Ok(());
     };
     let recipient = peer_req.binding().recipient();
-    let recipient_bech32 = recipient.to_bech32();
-    let roster = aterm_secrets::client::swarm_roster(paths)
+    let roster = aterm_secrets::client::swarm_roster_now(paths)
         .ok()
         .flatten()
         .map(|mut r| {
-            if let Ok(Some(denied)) = aterm_secrets::client::swarm_denied_nodes(paths) {
+            if let Ok(Some(denied)) = aterm_secrets::client::swarm_denied_nodes_now(paths) {
                 r.deny_nodes.extend(denied);
                 r.canonicalize();
             }
             r
         });
-    if let Some(ref roster) = roster {
-        let denied_in_roster = roster
-            .members
-            .iter()
-            .filter(|m| m.recipient.trim() == recipient_bech32)
-            .any(|m| {
-                roster.is_label_denied(&m.label)
-                    || m.aliases.iter().any(|a| roster.is_label_denied(a))
-                    || m.node_id
-                        .as_deref()
-                        .is_some_and(|n| roster.is_node_denied(n))
-                    || m.node_key
-                        .as_deref()
-                        .is_some_and(|k| roster.is_node_denied(k))
-            });
-        if denied_in_roster {
-            return Err(Error::new(
-                "Commons peer was removed from the membership log",
-            ));
-        }
+    if let Some(ref roster) = roster
+        && crate::table::binding_denied_in_roster(roster, peer_req.binding())
+    {
+        return Err(Error::new(
+            "Commons peer was removed from the membership log",
+        ));
     }
     let Ok(Some((local_log, _))) = aterm_secrets::client::trusted_commons_log(paths, trust) else {
         return Ok(());
@@ -1177,19 +1590,15 @@ fn verify_peer_against_local_log(
         let membership = log.membership();
         membership.removal(&actor).is_some()
             || log.recipient_is_removed(&recipient)
+            || matches!(
+                membership.node(peer_req.binding().writer()),
+                NodeStanding::Removed(_)
+            )
             || log.audience_left_out_recipient(&EpochAudience::Commons, &recipient)
             || log.audience_left_out_recipient(&EpochAudience::Everyone, &recipient)
-            || log_roster.as_ref().is_some_and(|r| {
-                r.members
-                    .iter()
-                    .filter(|m| m.recipient.trim() == recipient_bech32)
-                    .any(|m| {
-                        r.is_label_denied(&m.label)
-                            || m.aliases.iter().any(|a| r.is_label_denied(a))
-                            || m.node_id.as_deref().is_some_and(|n| r.is_node_denied(n))
-                            || m.node_key.as_deref().is_some_and(|k| r.is_node_denied(k))
-                    })
-            })
+            || log_roster
+                .as_ref()
+                .is_some_and(|r| crate::table::binding_denied_in_roster(r, peer_req.binding()))
             || membership.members().iter().any(|(m_actor, m)| {
                 (*m_actor == actor || m.binding.recipient() == recipient)
                     && (log.audience_left_out(&EpochAudience::Commons, m_actor)
@@ -1201,14 +1610,9 @@ fn verify_peer_against_local_log(
                                     Some(NodeStanding::Removed(_))
                                 )
                         })
-                        || log_roster.as_ref().is_some_and(|r| {
-                            r.is_label_denied(&m.label)
-                                || r.is_label_denied(&m.name)
-                                || m.node_key.is_some_and(|nk| {
-                                    nk != [0; 32]
-                                        && r.is_node_denied(&aterm_codec::hex::encode_lower(&nk))
-                                })
-                        }))
+                        || log_roster
+                            .as_ref()
+                            .is_some_and(|r| aterm_secrets::client::member_denied_by_roster(r, m)))
             })
     };
     if denied_by(&local_log) {
@@ -1255,6 +1659,8 @@ fn check_witness(trust: Trust, request: &Request, wire: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// The peer actor `hello` proves on this channel, and the membership log its `ACX2` witness decoded
+/// to (none for `ACX1`).
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -1316,7 +1722,7 @@ fn authenticate(
     own: Actor,
     proof: Option<&NodeProof>,
     hello: &[u8],
-) -> Result<Actor> {
+) -> Result<(Actor, Option<Arc<aterm_secrets::membership_log::Log>>)> {
     if hello.len() <= HELLO_FIXED
         || hello[4..20] != trust.network
         || hello[20..52] != trust.authority
@@ -1331,15 +1737,15 @@ fn authenticate(
             }
             let request = Request::decode(&hello[84..HELLO_FIXED]).map_err(failure)?;
             check_witness(trust, &request, &hello[HELLO_FIXED..])?;
-            authenticate_identity(own, proof, &request)
+            Ok((authenticate_identity(own, proof, &request)?, None))
         }
         b"ACX2" => {
             if hello.len() > MAX_ACX2_HELLO {
                 return Err(Error::new("Commons peer protocol or trust pins differ"));
             }
             let request = Request::decode(&hello[84..HELLO_FIXED]).map_err(failure)?;
-            let _ = check_log_witness(trust, &request, &hello[HELLO_FIXED..])?;
-            authenticate_identity(own, proof, &request)
+            let log = check_log_witness(trust, &request, &hello[HELLO_FIXED..])?;
+            Ok((authenticate_identity(own, proof, &request)?, Some(log)))
         }
         _ => Err(Error::new("Commons peer protocol or trust pins differ")),
     }
@@ -1480,17 +1886,19 @@ impl Store for Disk<'_> {
 /// Synchronize verified membership records (`ACX2`) in bounded passes, with a `reconcile`
 /// between them that may sign records (it closes `Wrap` gaps and, given `true`, coalesces
 /// concurrent `Commons` epochs) and answers whether it wrote any. The second `reconcile` and the
-/// third pass run only when the second pass moved records, which both sides see alike.
+/// third pass run only when the second pass moved records, which both sides see alike. `now`
+/// places the peer's refusal hold ([`MembershipHint::offers`]).
 fn sync_log_membership(
     stream: &mut (impl Read + Write),
     store: &MembershipDisk<'_>,
     side: Side,
-    cursor: &mut Option<Digest>,
+    hint: &mut MembershipHint,
     reconcile: &mut dyn FnMut(bool) -> bool,
+    now: Instant,
 ) -> Result<Report> {
     let mut total = Report::default();
     for _ in 0..64 {
-        let (round, done) = exchange_membership_round(stream, store, side, cursor)?;
+        let (round, done) = exchange_membership_round(stream, store, side, hint, now)?;
         total.sent += round.sent;
         total.received += round.received;
         total.deferred = round.deferred;
@@ -1503,7 +1911,7 @@ fn sync_log_membership(
     }
     let mut second_moved = false;
     for _ in 0..16 {
-        let (round, done) = exchange_membership_round(stream, store, side, cursor)?;
+        let (round, done) = exchange_membership_round(stream, store, side, hint, now)?;
         total.sent += round.sent;
         total.received += round.received;
         total.deferred = round.deferred;
@@ -1519,7 +1927,7 @@ fn sync_log_membership(
             store.invalidate();
         }
         for _ in 0..8 {
-            let (round, done) = exchange_membership_round(stream, store, side, cursor)?;
+            let (round, done) = exchange_membership_round(stream, store, side, hint, now)?;
             total.sent += round.sent;
             total.received += round.received;
             total.deferred = round.deferred;
@@ -1538,6 +1946,13 @@ struct MembershipDisk<'a> {
     /// How many times it read the records file.
     #[cfg(test)]
     loads: std::sync::atomic::AtomicUsize,
+    /// How many records it put in batches for the peer.
+    #[cfg(test)]
+    batched: std::sync::atomic::AtomicUsize,
+    /// How many more batches it takes none of, as when another writer holds the state lock past
+    /// `retain_records_for_commons`'s wait.
+    #[cfg(test)]
+    busy: std::sync::atomic::AtomicUsize,
 }
 
 impl<'a> MembershipDisk<'a> {
@@ -1548,6 +1963,10 @@ impl<'a> MembershipDisk<'a> {
             cached: std::sync::Mutex::new(None),
             #[cfg(test)]
             loads: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            batched: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            busy: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -1633,6 +2052,9 @@ impl Store for MembershipDisk<'_> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
+        #[cfg(test)]
+        self.batched
+            .fetch_add(ids.len(), std::sync::atomic::Ordering::Relaxed);
         self.with_store("membership batch", |store| {
             ids.iter()
                 .map(|id| {
@@ -1648,6 +2070,11 @@ impl Store for MembershipDisk<'_> {
     fn retain(&self, wires: &[Vec<u8>]) -> Result<Vec<bool>> {
         if wires.is_empty() {
             return Ok(Vec::new());
+        }
+        #[cfg(test)]
+        if self.busy.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+            self.busy.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(vec![false; wires.len()]);
         }
         let verdicts = aterm_secrets::client::retain_records_for_commons(
             self.paths,
@@ -1667,16 +2094,18 @@ fn exchange_membership(
     stream: &mut (impl Read + Write),
     store: &impl Store,
     side: Side,
-    cursor: &mut Option<Digest>,
+    hint: &mut MembershipHint,
+    now: Instant,
 ) -> Result<Report> {
-    exchange_membership_round(stream, store, side, cursor).map(|(report, _)| report)
+    exchange_membership_round(stream, store, side, hint, now).map(|(report, _)| report)
 }
 
 fn exchange_membership_round(
     stream: &mut (impl Read + Write),
     store: &impl Store,
     side: Side,
-    cursor: &mut Option<Digest>,
+    hint: &mut MembershipHint,
+    now: Instant,
 ) -> Result<(Report, bool)> {
     let local = store.inventory()?;
     let remote = match side {
@@ -1692,7 +2121,12 @@ fn exchange_membership_round(
     };
     let unsent_local = local.difference(&remote).count();
     let unsent_remote = remote.difference(&local).count();
-    let ids = store.select_missing(&local, &remote, cursor)?;
+    let key = hold_key(&local, &remote);
+    let ids = if hint.offers(&key, now) {
+        store.select_missing(&local, &remote, &mut hint.cursor)?
+    } else {
+        Vec::new()
+    };
     let batch = store.batch(&ids)?;
     let (sent, received, deferred) = match side {
         Side::Initiator => {
@@ -1706,6 +2140,13 @@ fn exchange_membership_round(
             (sent, received, out + incoming)
         }
     };
+    hint.settle(
+        key,
+        &ids,
+        sent,
+        remote.len() >= aterm_secrets::membership_log::MAX_RECORDS,
+        now,
+    );
     let done =
         (unsent_local <= RECORDS_PER_ROUND && unsent_remote <= RECORDS_PER_ROUND && deferred == 0)
             || (sent + received == 0);
@@ -1869,7 +2310,12 @@ pub(crate) fn send_frame(stream: &mut impl Write, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 pub(crate) fn receive_frame(stream: &mut impl Read, max: usize) -> Result<Vec<u8>> {
-    let n = read_u32(stream)? as usize;
+    let n = read_u32(stream)?;
+    frame_body(stream, n, max)
+}
+/// The rest of a frame whose length `n` was read.
+fn frame_body(stream: &mut impl Read, n: u32, max: usize) -> Result<Vec<u8>> {
+    let n = n as usize;
     if n > max {
         return Err(Error::new("Commons frame exceeds its bound"));
     }

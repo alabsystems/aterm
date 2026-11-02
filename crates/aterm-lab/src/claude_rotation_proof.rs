@@ -870,12 +870,13 @@ pub struct Displacement<'a> {
 
 /// Whether a sign-in attempt's outcome (`sign_in_attempt.outcome`) left its row without a login.
 fn failing(outcome: &str) -> bool {
-    matches!(outcome, "no-route" | "failed")
+    matches!(outcome, "no-route" | "failed" | "blocked")
 }
 
 /// R5a and R5b: the default login made `d.to`'s at `leg.from`. The ledger books `d.from`
 /// displaced onto `d.to`; where the instance's listing before (`leg.before`) showed `d.to` signed
-/// out, its `auth` row back to `ok`; no automatic sign-in of `d.to` after the displacement; no
+/// out, its `auth` row back to `ok`; no automatic sign-in of `d.to` after the displacement
+/// through this leg's end (a later leg can displace that account again); no
 /// account restart in the window (the default login moved, not the session); the listing after
 /// (`leg.listing`) shows `d.to` with auth `ok`, its login not `expired` and no failed sign-in on
 /// record; and the first turn served after the lab's prompt (`leg.asked`) carried `d.auth`, its
@@ -886,21 +887,30 @@ fn failing(outcome: &str) -> bool {
 pub fn judge_r5(ev: &Ev, leg: &Leg, d: Displacement<'_>) -> Judged {
     let mut missing = Vec::new();
     let from_s = leg.from / 1000 - 1;
+    let through_s = leg.to / 1000;
     let before = listed(&leg.before, d.to);
     let was_out = before.as_ref().is_some_and(|r| r.auth == "signed-out");
     let had_failed = before.as_ref().is_some_and(|r| failing(&r.sign_in));
-    let displaced = booked_after(&ev.ledger, d.from, "displaced", from_s, |r| r.to == d.to);
+    let displaced = booked_after(&ev.ledger, d.from, "displaced", from_s, |r| {
+        r.to == d.to && r.t <= through_s
+    });
     if displaced.is_none() {
         missing.push(format!("no `displaced` row {} → {}", d.from, d.to));
     }
-    if was_out && booked_after(&ev.ledger, d.to, "auth", from_s, |r| r.why == "ok").is_none() {
+    if was_out
+        && booked_after(&ev.ledger, d.to, "auth", from_s, |r| {
+            r.why == "ok" && r.t <= through_s
+        })
+        .is_none()
+    {
         missing.push(format!("no `auth ok` row for {} after the sign-in", d.to));
     }
-    if let Some(r) = ev
-        .ledger
-        .iter()
-        .find(|r| r.account == d.to && r.kind == "sign-in" && r.t >= displaced.unwrap_or(from_s))
-    {
+    if let Some(r) = ev.ledger.iter().find(|r| {
+        r.account == d.to
+            && r.kind == "sign-in"
+            && r.t >= displaced.unwrap_or(from_s)
+            && r.t <= through_s
+    }) {
         missing.push(format!(
             "a sign-in of {} tried after it was signed in: `{}`",
             d.to,
@@ -1639,7 +1649,7 @@ impl ClaudeWatch {
                 std::collections::BTreeSet::new(),
             );
             while !s.load(Ordering::SeqCst) {
-                let rows = lp::ps_rows();
+                let rows = crate::procs::commands();
                 let table: Vec<(i32, i32)> = rows.iter().map(|(p, pp, _)| (*p, *pp)).collect();
                 let family = crate::procs::descendants_in(&table, instance);
                 for (pid, _, command) in &rows {
@@ -2893,6 +2903,14 @@ pub fn cmd_claude_rotation_proof(args: &[String]) -> Res {
     }
     if !crate::paths::valid_tag(&tag) {
         return Err(Fail::die(format!("bad tag '{tag}'")));
+    }
+    let image = crate::paths::paths().need_aterm().map_err(Fail::die)?;
+    if !atpkg::stub::lasting(image) {
+        return Err(Fail::die(format!(
+            "claude-rotation-proof: {} is a transient executable; use a persistent test copy \
+             or dev app so account restarts retain the usage tap",
+            image.display()
+        )));
     }
     let claude = crate::lab::find_claude().map_err(|e| {
         Fail::die(format!(

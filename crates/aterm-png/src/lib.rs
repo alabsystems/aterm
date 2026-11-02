@@ -255,7 +255,8 @@ pub enum DecodingError {
     BadZlib,
     /// The image data decompresses to substantially MORE than the header's dimensions call for.
     ExcessImageData,
-    /// The image would need more than [`Limits::bytes`] to decode.
+    /// The image would need more than [`Limits::bytes`] to decode, or its image data more
+    /// decompression work than its size allows ([`Reader::next_frame`]).
     LimitsExceeded,
     /// An I/O error reading the source.
     Io(std::io::ErrorKind),

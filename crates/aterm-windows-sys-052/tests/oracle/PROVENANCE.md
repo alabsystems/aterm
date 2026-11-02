@@ -15,7 +15,8 @@ EXCEPTION: it needs rustup's stable and a Windows std), `tests/recorded.rs`
 holds the recorded answers on every host, and the Windows cells of `targo
 --unverified verify cells` keep compiling ring against this crate. Since
 2026-10-19 a `verify cells` run that checks either Windows cell also runs
-`oracle-052` (and the 0.61 closure's `oracle`) as rows of its own.
+`oracle-052` (and the 0.61 closure's `oracle`) as rows of its own, unless its
+`-p` names no crate they judge.
 
 ## What it compared, and the result
 

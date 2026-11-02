@@ -6,10 +6,11 @@
 use crate::explain::WhySubject;
 
 /// The usage line a refused `sys` request answers; a stray word after `why` answers [`WHY_USAGE`].
-pub const USAGE: &str = "ERR usage: sys [overview|tab|aterm|global|jobs|cores|gpu|mem|disk|net|procs|why|report] \
+pub const USAGE: &str = "ERR usage: sys [overview|tab|aterm|global|jobs|cores|gpu|mem|disk|net|procs|why|report|left] \
                          [scope=pane|tab|window|aterm|global] [instances=all] [top=<1-64>] \
                          [depth=<1-8>] [fresh=<ms>] [since=<ep>.<seq>] [--json]; scope= on \
-                         jobs disk procs (cores gpu mem net take it, rows unchanged), depth= on \
+                         jobs disk procs (cores gpu mem net take it, rows unchanged), \
+                         scope=pane|tab|aterm on left, depth= on \
                          disk, instances=all on overview aterm global cores gpu mem net and procs \
                          scope=aterm\n";
 /// The usage line for a word after `why` that is not its one subject or an option.
@@ -52,11 +53,14 @@ pub enum View {
     Why,
     /// Bounded CPU hardware, policy and preserved anomaly report.
     Report,
+    /// What closed tabs and dead verify runs left running, and what macOS's program check holds,
+    /// each with its proof and the token `end` takes.
+    Left,
 }
 
 impl View {
     /// Every view, in the help's order.
-    pub const ALL: [View; 13] = [
+    pub const ALL: [View; 14] = [
         Self::Overview,
         Self::Tab,
         Self::Aterm,
@@ -70,6 +74,7 @@ impl View {
         Self::Procs,
         Self::Why,
         Self::Report,
+        Self::Left,
     ];
 
     /// Its word.
@@ -89,6 +94,7 @@ impl View {
             Self::Procs => "procs",
             Self::Why => "why",
             Self::Report => "report",
+            Self::Left => "left",
         }
     }
 
@@ -103,7 +109,7 @@ impl View {
             Self::Overview | Self::Tab | Self::Aterm | Self::Global | Self::Why | Self::Report => {
                 None
             }
-            Self::Jobs | Self::Disk | Self::Procs => Some(ScopeArg::Tab),
+            Self::Jobs | Self::Disk | Self::Procs | Self::Left => Some(ScopeArg::Tab),
             Self::Cores | Self::Gpu | Self::Mem | Self::Net => Some(ScopeArg::Global),
         }
     }
@@ -163,7 +169,12 @@ impl Cursor {
     #[must_use]
     pub fn parse(text: &str) -> Option<Self> {
         let (ep, seq) = text.split_once('.')?;
-        if ep.is_empty() || ep.len() > 16 || seq.is_empty() {
+        if ep.is_empty()
+            || ep.len() > 16
+            || seq.is_empty()
+            || !ep.bytes().all(|b| b.is_ascii_hexdigit())
+            || !seq.bytes().all(|b| b.is_ascii_digit())
+        {
             return None;
         }
         Some(Self {
@@ -269,6 +280,9 @@ impl SysQuery {
                 }
                 q.instances_all = true;
             } else if let Some(v) = tok.strip_prefix("top=") {
+                if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(USAGE);
+                }
                 let n: usize = v.parse().map_err(|_| USAGE)?;
                 if !(1..=TOP_MAX).contains(&n) {
                     return Err(USAGE);
@@ -276,12 +290,18 @@ impl SysQuery {
                 q.top = n;
                 q.top_set = true;
             } else if let Some(v) = tok.strip_prefix("depth=") {
+                if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(USAGE);
+                }
                 let d: u8 = v.parse().map_err(|_| USAGE)?;
                 if !(1..=8).contains(&d) {
                     return Err(USAGE);
                 }
                 q.depth = Some(d);
             } else if let Some(v) = tok.strip_prefix("fresh=") {
+                if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(USAGE);
+                }
                 let ms: u64 = v.parse().map_err(|_| USAGE)?;
                 q.fresh_ms = Some(if ms == 0 { 0 } else { ms.max(FRESH_MIN_MS) });
             } else if let Some(v) = tok.strip_prefix("since=") {
@@ -291,8 +311,14 @@ impl SysQuery {
             } else if tok == "--json" || tok == "json" {
                 q.json = true;
             } else if naming && let Some(v) = tok.strip_prefix("job=") {
+                if q.name.is_some() {
+                    return Err(USAGE);
+                }
                 q.name = Some(NameTarget::Job(id_word(v).ok_or(USAGE)?));
             } else if naming && let Some(v) = tok.strip_prefix("task=") {
+                if q.name.is_some() {
+                    return Err(USAGE);
+                }
                 q.name = Some(NameTarget::Task(id_word(v).ok_or(USAGE)?));
             } else if q.view == View::Why {
                 q.subject = match tok {
@@ -318,6 +344,9 @@ impl SysQuery {
             return Err(USAGE);
         }
         if q.depth.is_some() && q.view != View::Disk {
+            return Err(USAGE);
+        }
+        if q.view == View::Left && matches!(q.scope, Some(ScopeArg::Window | ScopeArg::Global)) {
             return Err(USAGE);
         }
         if q.instances_all {
@@ -363,7 +392,7 @@ impl SysQuery {
             | View::Why => true,
             View::Report => true,
             View::Aterm => false,
-            View::Jobs | View::Procs => {
+            View::Jobs | View::Procs | View::Left => {
                 matches!(self.effective_scope(), Some(ScopeArg::Tab | ScopeArg::Pane))
             }
             View::Disk => matches!(
@@ -432,9 +461,12 @@ mod tests {
             "global scope=aterm",
             "procs top=0",
             "procs top=65",
+            "procs top=+5",
             "procs top=x",
             "procs depth=2",
+            "disk depth=+2",
             "disk depth=9",
+            "fresh=+100",
             "since=7f3a",
             "since=zz.1",
             "procs instances=all",
@@ -445,6 +477,8 @@ mod tests {
             "scope=moon procs",
             "name",
             "name job=a;b",
+            "name job=a1 task=b2",
+            "name job=a1 job=a2",
             "procs caller=a%20b",
             "why scope=tab",
             "why scope=global",
@@ -540,6 +574,45 @@ mod tests {
         }
     }
 
+    /// `left` reads the target's pane or tab, or with `scope=aterm` every session's rows; a
+    /// window or the machine is no scope of it.
+    #[test]
+    fn left_takes_pane_tab_and_aterm_and_refuses_window_and_global() {
+        let scope = |s: &str| SysQuery::parse(s).map(|q| (q.view, q.effective_scope()));
+        assert_eq!(scope("left"), Ok((View::Left, Some(ScopeArg::Tab))));
+        for (text, want) in [
+            ("left scope=pane", ScopeArg::Pane),
+            ("left scope=tab --json", ScopeArg::Tab),
+            ("left scope=aterm top=3", ScopeArg::Aterm),
+        ] {
+            assert_eq!(scope(text), Ok((View::Left, Some(want))), "{text}");
+        }
+        for bad in [
+            "left scope=window",
+            "left scope=global",
+            "left depth=2",
+            "left instances=all",
+            "left left",
+            "left scope=aterm instances=all",
+        ] {
+            assert_eq!(SysQuery::parse(bad), Err(USAGE), "{bad}");
+        }
+    }
+
+    /// Another session's leftovers are Owner's to read: `scope=aterm` reads rows outside the
+    /// target's tab, so it is not target-rows-only and `argument_escalation` makes it Owner-only.
+    /// NEGATIVE CONTROL: read `left` as target-rows-only at every scope, and `scope=aterm` passes
+    /// as a target's read.
+    #[test]
+    fn left_scope_aterm_reads_other_sessions_rows() {
+        let rows_only = |s: &str| SysQuery::parse(s).unwrap().target_rows_only();
+        assert!(rows_only("left"));
+        assert!(rows_only("left scope=pane"));
+        assert!(rows_only("left scope=tab --json"));
+        assert!(!rows_only("left scope=aterm"));
+        assert!(!rows_only("left scope=aterm --json top=5"));
+    }
+
     #[test]
     fn a_cursor_round_trips() {
         let c = Cursor {
@@ -550,6 +623,8 @@ mod tests {
         assert_eq!(Cursor::parse("7f3a.4812"), Some(c));
         assert_eq!(Cursor::parse(".1"), None);
         assert_eq!(Cursor::parse("1."), None);
+        assert_eq!(Cursor::parse("+7f3a.4812"), None);
+        assert_eq!(Cursor::parse("7f3a.+4812"), None);
         assert_eq!(Cursor::parse("12345678901234567.1"), None);
     }
 

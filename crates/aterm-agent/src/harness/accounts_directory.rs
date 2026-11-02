@@ -140,6 +140,20 @@ pub(in crate::harness) fn retained_directory_owner<'a>(
     Ok(None)
 }
 
+/// Whether this checkpoint uses a directory retained by shared preparation custody.
+pub(in crate::harness) fn shared_staging_retained(
+    logins: &Logins,
+    dir: &str,
+) -> Result<bool, String> {
+    let wanted = Location::of(Some(dir), None)?;
+    for kept in logins.shared.staging_paths() {
+        if wanted.conflicts(&Location::of(Some(kept), None)?) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 impl Store {
     /// Admits new rows without assigning another account's retained directory to them.
     /// The caller holds the writer and sign-in locks through publication. No directory

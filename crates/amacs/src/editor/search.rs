@@ -14,7 +14,7 @@ use crate::store::DocumentStore;
 
 impl EditorWorkspace {
     pub(super) fn update_incremental_search(
-        &self,
+        &mut self,
         store: &DocumentStore,
         view: &mut EditorBufferView,
     ) -> Result<Vec<EditorEffect>, EditorError> {
@@ -29,12 +29,14 @@ impl EditorWorkspace {
         } else {
             search_match(&snapshot.text, &query, origin, true, false)
         };
-        Ok(show_match(view, &query, found, origin))
+        let effects = show_match(view, &query, found, origin);
+        self.grid_reveal_caret(store, view);
+        Ok(effects)
     }
 
     /// Keeps a selected match only while its current bytes still match the query.
     pub(super) fn accept_search_match(
-        &self,
+        &mut self,
         store: &DocumentStore,
         view: &mut EditorBufferView,
         query: &str,
@@ -42,12 +44,14 @@ impl EditorWorkspace {
     ) -> Result<bool, EditorError> {
         let snapshot = snapshot_for_view(store, view)?;
         if snapshot.text.get(view.primary_selection().range()) == Some(query) {
+            self.grid_reveal_caret(store, view);
             return Ok(true);
         }
         let origin = clamp_to_char_boundary(&snapshot.text, origin.min(snapshot.text.len()));
         let found = search_match(&snapshot.text, query, origin, true, false);
         let matched = found.is_some();
         select_match(view, found, origin);
+        self.grid_reveal_caret(store, view);
         Ok(matched)
     }
 
@@ -78,7 +82,7 @@ impl EditorWorkspace {
     }
 
     pub(super) fn navigate_search(
-        &self,
+        &mut self,
         store: &DocumentStore,
         view: &mut EditorBufferView,
         forward: bool,
@@ -113,7 +117,9 @@ impl EditorWorkspace {
             _ => view.primary_selection().head,
         };
         let origin = clamp_to_char_boundary(&snapshot.text, origin.min(snapshot.text.len()));
-        Ok(show_match(view, &query, found, origin))
+        let effects = show_match(view, &query, found, origin);
+        self.grid_reveal_caret(store, view);
+        Ok(effects)
     }
 }
 
@@ -245,6 +251,7 @@ mod tests {
     /// again with `remembered_search` mutated to pick the person's query for every input.
     #[test]
     fn a_remembered_search_is_recalled_only_by_the_input_that_accepted_it() {
+        use crate::editor::{Keymap, Platform, Profile};
         fn press(
             store: &mut DocumentStore,
             workspace: &mut EditorWorkspace,
@@ -272,48 +279,61 @@ mod tests {
                 CommandAuthority::Save,
             ]
         };
-        let (mut store, mut workspace, mut view, _) = editor("one hunter2 two");
+        for (platform, start, recall) in [
+            (Platform::Windows, "M-s", "M-s M-s"),
+            (Platform::Mac, "C-s", "C-s C-s"),
+        ] {
+            let (mut store, _, _, document) = editor("one hunter2 two");
+            let mut workspace = EditorWorkspace::with_keymap(Keymap::emacs(Profile::Gui(platform)));
+            let mut view = workspace
+                .attach(&mut store, document, crate::store::DocumentViewId(94))
+                .unwrap();
 
-        press(&mut store, &mut workspace, &mut view, "C-s");
-        workspace
-            .insert_text(&mut store, &mut view, "hunter2")
-            .unwrap();
-        workspace.submit_minibuffer(&mut store, &mut view).unwrap();
-        assert_eq!(
-            view.primary_selection().range(),
-            4..11,
-            "PRECONDITION: the person's search found it"
-        );
+            press(&mut store, &mut workspace, &mut view, start);
+            workspace
+                .insert_text(&mut store, &mut view, "hunter2")
+                .unwrap();
+            workspace.submit_minibuffer(&mut store, &mut view).unwrap();
+            assert_eq!(
+                view.primary_selection().range(),
+                4..11,
+                "{platform:?}: PRECONDITION: the person's search found it"
+            );
 
-        workspace.granted = guest();
-        view.selections = vec![Selection::caret(0)];
-        workspace
-            .execute(&mut store, &mut view, EditorCommand::SearchNext)
-            .unwrap();
-        assert_eq!(
-            view.primary_selection(),
-            &Selection::caret(0),
-            "the guest's search-next"
-        );
-        press(&mut store, &mut workspace, &mut view, "C-s C-s");
-        assert_eq!(recalled(&view).as_deref(), Some(""), "the guest's C-s C-s");
-        workspace.insert_text(&mut store, &mut view, "two").unwrap();
-        workspace.submit_minibuffer(&mut store, &mut view).unwrap();
-        press(&mut store, &mut workspace, &mut view, "C-s C-s");
-        assert_eq!(
-            recalled(&view).as_deref(),
-            Some("two"),
-            "the guest's own query"
-        );
-        press(&mut store, &mut workspace, &mut view, "C-g");
+            workspace.granted = guest();
+            view.selections = vec![Selection::caret(0)];
+            workspace
+                .execute(&mut store, &mut view, EditorCommand::SearchNext)
+                .unwrap();
+            assert_eq!(
+                view.primary_selection(),
+                &Selection::caret(0),
+                "{platform:?}: the guest's search-next"
+            );
+            press(&mut store, &mut workspace, &mut view, recall);
+            assert_eq!(
+                recalled(&view).as_deref(),
+                Some(""),
+                "{platform:?}: the guest's {recall}"
+            );
+            workspace.insert_text(&mut store, &mut view, "two").unwrap();
+            workspace.submit_minibuffer(&mut store, &mut view).unwrap();
+            press(&mut store, &mut workspace, &mut view, recall);
+            assert_eq!(
+                recalled(&view).as_deref(),
+                Some("two"),
+                "{platform:?}: the guest's own query"
+            );
+            press(&mut store, &mut workspace, &mut view, "C-g");
 
-        workspace.granted = CommandAuthority::ALL.to_vec();
-        press(&mut store, &mut workspace, &mut view, "C-s C-s");
-        assert_eq!(
-            recalled(&view).as_deref(),
-            Some("hunter2"),
-            "the person's C-s C-s"
-        );
+            workspace.granted = CommandAuthority::ALL.to_vec();
+            press(&mut store, &mut workspace, &mut view, recall);
+            assert_eq!(
+                recalled(&view).as_deref(),
+                Some("hunter2"),
+                "{platform:?}: the person's {recall}"
+            );
+        }
     }
 
     /// On Windows `C-s` saves and isearch is `M-s`: in a search, `M-s`

@@ -31,6 +31,9 @@ pub(crate) fn apply_lookup(ctx: &mut ApplyContext, lookup: &SubstLookup) -> Opti
         return None;
     }
     for subtable in &lookup.subtables {
+        if !ctx.budget.charge() {
+            return None;
+        }
         if apply_subtable(ctx, subtable).is_some() {
             return Some(());
         }

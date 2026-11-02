@@ -29,20 +29,10 @@ enum GlyphVariationDataOffsets<'a> {
     Long(LazyArray16<'a, Offset32>),
 }
 
-#[derive(Clone, Copy, Default, Debug)]
-struct PointAndDelta {
-    x: i16,
-    y: i16,
-    x_delta: f32,
-    y_delta: f32,
-}
-
 #[derive(Clone, Copy, Default)]
 struct VariationTuple<'a> {
     set_points: Option<SetPointsIter<'a>>,
     deltas: PackedDeltasIter<'a>,
-    /// The last parsed point with delta in the contour.
-    prev_point: Option<PointAndDelta>,
 }
 
 /// The maximum number of variation tuples stored on the stack.
@@ -52,7 +42,7 @@ const MAX_STACK_TUPLES_LEN: u16 = 32;
 /// [`MAX_STACK_TUPLES_LEN`], on the heap past it.
 #[expect(
     clippy::large_enum_variant,
-    reason = "the inline array is the point: a glyph of up to 32 tuples (nearly every one) allocates nothing"
+    reason = "the inline array is the point: a glyph of up to 32 tuples (nearly every one) keeps its tuple headers off the heap"
 )]
 enum VariationTuples<'a> {
     Stack {
@@ -121,6 +111,14 @@ impl<'a> VariationTuples<'a> {
     }
 
     #[inline]
+    fn as_slice(&self) -> &[VariationTuple<'a>] {
+        match self {
+            Self::Stack { headers, len } => headers.get(..usize::from(*len)).unwrap_or(&[]),
+            Self::Heap { vec } => vec.as_slice(),
+        }
+    }
+
+    #[inline]
     fn as_mut_slice(&mut self) -> &mut [VariationTuple<'a>] {
         match self {
             Self::Stack { headers, len } => headers.get_mut(..usize::from(*len)).unwrap_or(&mut []),
@@ -128,62 +126,40 @@ impl<'a> VariationTuples<'a> {
         }
     }
 
-    fn apply(
-        &mut self,
-        all_points: glyf::GlyphPointsIter,
-        points: glyf::GlyphPointsIter,
-        point: glyf::GlyphPoint,
-    ) -> Option<PointF> {
-        let mut x = f32::from(point.x);
-        let mut y = f32::from(point.y);
-
-        for tuple in self.as_mut_slice() {
-            if let Some(ref mut set_points) = tuple.set_points {
-                if set_points.next()? {
-                    if let Some((x_delta, y_delta)) = tuple.deltas.next() {
-                        tuple.prev_point = Some(PointAndDelta {
-                            x: point.x,
-                            y: point.y,
-                            x_delta,
-                            y_delta,
-                        });
-
-                        x += x_delta;
-                        y += y_delta;
-                    } else {
-                        let set_points = set_points.clone();
-                        let (x_delta, y_delta) = infer_deltas(
-                            tuple,
-                            set_points,
-                            points.clone(),
-                            all_points.clone(),
-                            point,
-                        );
-
-                        x += x_delta;
-                        y += y_delta;
-                    }
-                } else {
-                    let set_points = set_points.clone();
-                    let (x_delta, y_delta) =
-                        infer_deltas(tuple, set_points, points.clone(), all_points.clone(), point);
-
-                    x += x_delta;
-                    y += y_delta;
-                }
-
-                if point.last_point {
-                    tuple.prev_point = None;
-                }
+    /// `points`, a simple glyph's outline, moved by every tuple in order.
+    ///
+    /// A tuple that numbers its points leaves the rest to be inferred from
+    /// the numbered points either side of them (IUP), which [`infer_untouched`]
+    /// does in a few passes over each contour, so each tuple costs time
+    /// linear in the points; [`parse_variation_tuples`] charged that to the
+    /// outline's variation budget when it kept the tuple. Each point sums its
+    /// deltas in tuple order onto its stored coordinates, the order
+    /// ttf-parser's per-point stream added them in, so every coordinate is
+    /// the float it was.
+    fn varied(&self, points: &[glyf::GlyphPoint]) -> Vec<PointF> {
+        let mut out: Vec<PointF> = points
+            .iter()
+            .map(|p| PointF {
+                x: f32::from(p.x),
+                y: f32::from(p.y),
+            })
+            .collect();
+        let (mut marks, mut next_numbered) = (Vec::new(), Vec::new());
+        for tuple in self.as_slice() {
+            let mut deltas = tuple.deltas;
+            if let Some(set_points) = tuple.set_points {
+                mark_points(set_points, deltas, points.len(), &mut marks);
+                infer_untouched(points, &marks, &mut next_numbered, &mut out);
             } else {
-                if let Some((x_delta, y_delta)) = tuple.deltas.next() {
-                    x += x_delta;
-                    y += y_delta;
+                for p in &mut out {
+                    if let Some((x_delta, y_delta)) = deltas.next() {
+                        p.x += x_delta;
+                        p.y += y_delta;
+                    }
                 }
             }
         }
-
-        Some(PointF { x, y })
+        out
     }
 
     fn apply_null(&mut self) -> Option<PointF> {
@@ -226,15 +202,22 @@ fn parse_variation_tuples<'a>(
     mut main_s: Stream<'a>,
     mut serialized_s: Stream<'a>,
     tuples: &mut VariationTuples<'a>,
+    work: &mut crate::work::OutlineWork,
 ) -> Option<()> {
     debug_assert!(core::mem::size_of::<VariationTuple>() <= 80);
 
+    // Counted once, not again for every tuple that uses them.
+    let mut shared_count = None;
     for _ in 0..count {
+        work.vary(1)?;
         let header = parse_tuple_variation_header(coordinates, shared_tuple_records, &mut main_s)?;
         if !(header.scalar > 0.0) {
             serialized_s.advance(usize::from(header.serialized_data_len));
             continue;
         }
+        // Each caller walks a kept tuple over all `points_len` points: the
+        // outline's inference, the phantom points and a composite's components.
+        work.vary(usize::from(points_len))?;
 
         let serialized_data_start = serialized_s.offset();
 
@@ -244,10 +227,15 @@ fn parse_variation_tuples<'a>(
             shared_point_numbers.clone()
         };
 
-        let deltas_count = if let Some(point_numbers) = point_numbers.clone() {
-            u16::try_from(point_numbers.clone().count()).ok()?
-        } else {
-            points_len
+        let deltas_count = match point_numbers {
+            None => points_len,
+            Some(numbers) if header.has_private_point_numbers => {
+                u16::try_from(numbers.count()).ok()?
+            }
+            Some(numbers) => match shared_count {
+                Some(count) => count,
+                None => *shared_count.insert(u16::try_from(numbers.count()).ok()?),
+            },
         };
 
         let deltas = {
@@ -260,7 +248,6 @@ fn parse_variation_tuples<'a>(
         let tuple = VariationTuple {
             set_points: point_numbers.map(SetPointsIter::new),
             deltas,
-            prev_point: None,
         };
 
         tuples.push(tuple);
@@ -509,17 +496,6 @@ mod packed_points {
     impl<'a> SetPointsIter<'a> {
         #[inline]
         pub fn new(mut iter: PackedPointsIter<'a>) -> Self {
-            let unref_count = iter.next().unwrap_or(0);
-            SetPointsIter { iter, unref_count }
-        }
-
-        #[inline]
-        pub fn restart(self) -> Self {
-            let mut iter = self.iter.clone();
-            iter.offset = 0;
-            iter.state = State::Control;
-            iter.points_left = 0;
-
             let unref_count = iter.next().unwrap_or(0);
             SetPointsIter { iter, unref_count }
         }
@@ -894,6 +870,59 @@ mod packed_deltas {
                 Some(delta)
             }
         }
+
+        /// Ends where `n` calls of [`Self::next`] would, a run at a time: a
+        /// step per control byte, never one per delta, so skipping the x
+        /// deltas of a tuple whose data is short or a run of zeros costs its
+        /// bytes, not its point count. A read past the data leaves the state
+        /// where `next` would have stopped, answering `None` from there on.
+        fn skip(&mut self, data: &[u8], mut n: u32) {
+            while n > 0 {
+                if self.state == State::Control {
+                    let at = usize::from(self.data_offset);
+                    let Some(control) = data.get(at).copied().map(Control) else {
+                        return;
+                    };
+                    let Some(offset) = self.data_offset.checked_add(1) else {
+                        return;
+                    };
+                    self.data_offset = offset;
+                    self.run_deltas_left = control.run_count();
+                    self.state = if control.is_deltas_are_zero() {
+                        State::ZeroDelta
+                    } else if control.is_deltas_are_words() {
+                        State::LongDelta
+                    } else {
+                        State::ShortDelta
+                    };
+                }
+
+                let width: u16 = match self.state {
+                    State::ZeroDelta => 0,
+                    State::ShortDelta => 1,
+                    _ => 2,
+                };
+                let wanted =
+                    u8::try_from(n).map_or(self.run_deltas_left, |n| n.min(self.run_deltas_left));
+                let readable = match width {
+                    0 => wanted,
+                    w => {
+                        let left = data.len().saturating_sub(usize::from(self.data_offset));
+                        u8::try_from(left / usize::from(w)).map_or(wanted, |r| r.min(wanted))
+                    }
+                };
+                // The bytes read are in `data`, whose offsets fit in `u16`.
+                self.data_offset = self.data_offset.saturating_add(u16::from(readable) * width);
+                self.run_deltas_left -= readable;
+                n -= u32::from(readable);
+                if readable < wanted {
+                    return;
+                }
+                if self.run_deltas_left == 0 {
+                    self.state = State::Control;
+                }
+            }
+        }
     }
 
     #[derive(Clone, Copy, Default)]
@@ -901,10 +930,6 @@ mod packed_deltas {
         data: &'a [u8],
         x_run: RunState,
         y_run: RunState,
-
-        /// A total number of deltas per axis.
-        total_count: u16,
-
         scalar: f32,
     }
 
@@ -915,21 +940,14 @@ mod packed_deltas {
 
             let mut iter = PackedDeltasIter {
                 data,
-                total_count: count,
                 scalar,
                 ..PackedDeltasIter::default()
             };
 
-            for _ in 0..count {
-                iter.y_run.next(data, scalar);
-            }
+            // The y deltas follow all `count` x deltas.
+            iter.y_run.skip(data, u32::from(count));
 
             iter
-        }
-
-        #[inline]
-        pub fn restart(self) -> Self {
-            PackedDeltasIter::new(self.scalar, self.total_count, self.data)
         }
 
         #[inline]
@@ -1309,129 +1327,134 @@ mod packed_deltas {
 
 use packed_deltas::PackedDeltasIter;
 
-/// Infer unreferenced deltas.
-fn infer_deltas(
-    tuple: &VariationTuple,
-    points_set: SetPointsIter,
-    points: glyf::GlyphPointsIter,
-    all_points: glyf::GlyphPointsIter,
-    curr_point: glyf::GlyphPoint,
-) -> (f32, f32) {
-    let mut current_contour = points.current_contour();
-    if curr_point.last_point && current_contour != 0 {
-        // So we have to move to the previous one.
-        current_contour -= 1;
-    }
+/// How a tuple that numbers its points reaches one point of a simple glyph.
+#[derive(Clone, Copy)]
+enum Mark {
+    /// Not numbered: its delta is inferred.
+    Unset,
+    /// Numbered after the tuple's deltas ran out: inferred too, yet it still
+    /// ends the search for the next numbered point, and first in its contour
+    /// it stands in for that point with no delta.
+    Starved,
+    /// Numbered, with this delta.
+    Delta(f32, f32),
+}
 
-    let prev_point = if let Some(prev_point) = tuple.prev_point {
-        // If a contour already had a delta - just use it.
-        prev_point
-    } else {
-        let mut last_point = None;
-        let mut deltas = tuple.deltas.clone();
-        for (point, is_set) in points.clone().zip(points_set.clone()) {
-            if is_set {
-                if let Some((x_delta, y_delta)) = deltas.next() {
-                    last_point = Some(PointAndDelta {
-                        x: point.x,
-                        y: point.y,
-                        x_delta,
-                        y_delta,
-                    });
-                }
-            }
-
-            if point.last_point {
-                break;
-            }
+/// Marks `len` points as the tuple's point numbers and deltas reach them, in order.
+fn mark_points(
+    mut set_points: SetPointsIter,
+    mut deltas: PackedDeltasIter,
+    len: usize,
+    marks: &mut Vec<Mark>,
+) {
+    marks.clear();
+    marks.extend((0..len).map(|_| {
+        if set_points.next() == Some(true) {
+            deltas
+                .next()
+                .map_or(Mark::Starved, |(x, y)| Mark::Delta(x, y))
+        } else {
+            Mark::Unset
         }
+    }));
+}
 
-        match last_point {
-            Some(p) => p,
-            None => return (0.0, 0.0),
-        }
+/// Adds one numbered tuple's deltas to `out`: a [`Mark::Delta`] point's own,
+/// every other point's inferred (`infer_delta`) between the contour's points
+/// with deltas before and after it, wrapping around the contour.
+///
+/// It answers what ttf-parser's per-point rescans did, in a fixed number of
+/// passes over each contour, and keeps their quirks: the search for the next
+/// point stops at any numbered point, a [`Mark::Starved`] one included, and
+/// then falls back to the contour's first numbered point; and a contour's
+/// last point, when nothing before it in the contour has a delta, takes its
+/// previous point from the contour after it.
+fn infer_untouched(
+    points: &[glyf::GlyphPoint],
+    marks: &[Mark],
+    next_numbered: &mut Vec<usize>,
+    out: &mut [PointF],
+) {
+    let has_delta = |at: usize| matches!(marks.get(at), Some(Mark::Delta(..)));
+    let delta = |at: usize| match marks.get(at) {
+        Some(&Mark::Delta(x, y)) => (x, y),
+        _ => (0.0, 0.0),
     };
+    // A contour runs to its first point flagged last, the glyph's final
+    // contour to its final point when none is.
+    let contour_end = |start: usize| {
+        points
+            .iter()
+            .skip(start)
+            .position(|p| p.last_point)
+            .map_or(points.len().saturating_sub(1), |at| start + at)
+    };
+    let last_delta = |start: usize, end: usize| (start..=end).rev().find(|&at| has_delta(at));
 
-    let mut next_point = None;
-    if !curr_point.last_point {
-        let mut deltas = tuple.deltas.clone();
-        for (point, is_set) in points.clone().zip(points_set.clone()) {
-            if is_set {
-                if let Some((x_delta, y_delta)) = deltas.next() {
-                    next_point = Some(PointAndDelta {
-                        x: point.x,
-                        y: point.y,
-                        x_delta,
-                        y_delta,
-                    });
-                }
-
-                break;
-            }
-
-            if point.last_point {
-                break;
-            }
+    // The first numbered point after each point in its contour, built from the back.
+    next_numbered.clear();
+    next_numbered.resize(points.len(), usize::MAX);
+    let mut next = usize::MAX;
+    for at in (0..points.len()).rev() {
+        if points.get(at).is_some_and(|p| p.last_point) {
+            next = usize::MAX;
+        }
+        if let Some(slot) = next_numbered.get_mut(at) {
+            *slot = next;
+        }
+        if !matches!(marks.get(at), Some(Mark::Unset) | None) {
+            next = at;
         }
     }
 
-    if next_point.is_none() {
-        let mut all_points = all_points.clone();
-        let mut deltas = tuple.deltas.clone().restart();
-        let mut points_set = points_set.clone().restart();
-
-        let mut contour = 0;
-        while let (Some(point), Some(is_set)) = (all_points.next(), points_set.next()) {
-            // First, we have to skip already processed contours.
-            if contour != current_contour {
-                if is_set {
-                    let _ = deltas.next();
+    let mut start = 0;
+    while start < points.len() {
+        let end = contour_end(start);
+        let first_numbered =
+            (start..=end).find(|&at| !matches!(marks.get(at), Some(Mark::Unset) | None));
+        let last_in_contour = last_delta(start, end);
+        let mut prev = None;
+        for at in start..=end {
+            let Some(point) = points.get(at) else { break };
+            if let Some(&Mark::Delta(x_delta, y_delta)) = marks.get(at) {
+                if let Some(p) = out.get_mut(at) {
+                    p.x += x_delta;
+                    p.y += y_delta;
                 }
-
-                contour = all_points.current_contour();
+                prev = Some(at);
                 continue;
             }
 
-            if is_set {
-                let (x_delta, y_delta) = deltas.next().unwrap_or((0.0, 0.0));
-                next_point = Some(PointAndDelta {
-                    x: point.x,
-                    y: point.y,
-                    x_delta,
-                    y_delta,
-                });
-
-                break;
-            }
-
-            if point.last_point {
-                break;
+            let before = match prev {
+                Some(before) => Some(before),
+                // Nothing before it has a delta, so the contour's last one
+                // that does comes after it.
+                None if !point.last_point => last_in_contour,
+                None if end + 1 < points.len() => last_delta(end + 1, contour_end(end + 1)),
+                None => None,
+            };
+            let after = if point.last_point {
+                None
+            } else {
+                next_numbered
+                    .get(at)
+                    .copied()
+                    .filter(|&next| has_delta(next))
+            };
+            let (Some(before), Some(after)) = (before, after.or(first_numbered)) else {
+                continue;
+            };
+            let (Some(b), Some(a)) = (points.get(before), points.get(after)) else {
+                continue;
+            };
+            let ((bx, by), (ax, ay)) = (delta(before), delta(after));
+            if let Some(p) = out.get_mut(at) {
+                p.x += infer_delta(b.x, point.x, a.x, bx, ax);
+                p.y += infer_delta(b.y, point.y, a.y, by, ay);
             }
         }
+        start = end + 1;
     }
-
-    let next_point = match next_point {
-        Some(p) => p,
-        None => return (0.0, 0.0),
-    };
-
-    let dx = infer_delta(
-        prev_point.x,
-        curr_point.x,
-        next_point.x,
-        prev_point.x_delta,
-        next_point.x_delta,
-    );
-
-    let dy = infer_delta(
-        prev_point.y,
-        curr_point.y,
-        next_point.y,
-        prev_point.y_delta,
-        next_point.y_delta,
-    );
-
-    (dx, dy)
 }
 
 fn infer_delta(
@@ -1529,6 +1552,7 @@ impl<'a> Table<'a> {
         coordinates: &[NormalizedCoordinate],
         points_len: u16,
         tuples: &mut VariationTuples<'a>,
+        work: &mut crate::work::OutlineWork,
     ) -> Option<()> {
         tuples.clear();
 
@@ -1563,6 +1587,7 @@ impl<'a> Table<'a> {
             points_len,
             data,
             tuples,
+            work,
         )
     }
 
@@ -1616,6 +1641,9 @@ impl<'a> Table<'a> {
         b.bbox.to_rect()
     }
 
+    /// The glyph's phantom points: each kept tuple stepped through every
+    /// outline point to reach them, a walk its parse charged to the same
+    /// variation budget an outline has, so a glyph past it has none.
     pub(crate) fn phantom_points(
         &self,
         glyf_table: glyf::Table,
@@ -1624,7 +1652,14 @@ impl<'a> Table<'a> {
     ) -> Option<PhantomPoints> {
         let outline_points = glyf_table.outline_points(glyph_id);
         let mut tuples = VariationTuples::default();
-        self.parse_variation_data(glyph_id, coordinates, outline_points, &mut tuples)?;
+        let mut work = crate::work::OutlineWork::default();
+        self.parse_variation_data(
+            glyph_id,
+            coordinates,
+            outline_points,
+            &mut tuples,
+            &mut work,
+        )?;
 
         for _ in 0..outline_points {
             tuples.apply_null()?;
@@ -1670,14 +1705,29 @@ fn outline_var_impl(
 
     if number_of_contours > 0 {
         let number_of_contours = NonZeroU16::new(number_of_contours as u16)?;
-        let mut glyph_points = glyf::parse_simple_outline(s.tail()?, number_of_contours)?;
-        let all_glyph_points = glyph_points.clone();
+        let glyph_points = glyf::parse_simple_outline(s.tail()?, number_of_contours)?;
         let points_len = glyph_points.points_left;
-        gvar_table.parse_variation_data(glyph_id, coordinates, points_len, &mut tuples)?;
+        gvar_table.parse_variation_data(glyph_id, coordinates, points_len, &mut tuples, work)?;
 
-        while let Some(point) = glyph_points.next() {
+        if tuples.len() == 0 {
+            for point in glyph_points {
+                work.take()?;
+                builder.push_point(
+                    f32::from(point.x),
+                    f32::from(point.y),
+                    point.on_curve_point,
+                    point.last_point,
+                );
+            }
+            return Some(());
+        }
+
+        let mut points = Vec::with_capacity(usize::from(points_len));
+        for point in glyph_points {
             work.take()?;
-            let p = tuples.apply(all_glyph_points.clone(), glyph_points.clone(), point)?;
+            points.push(point);
+        }
+        for (point, p) in points.iter().zip(tuples.varied(&points)) {
             builder.push_point(p.x, p.y, point.on_curve_point, point.last_point);
         }
 
@@ -1685,7 +1735,13 @@ fn outline_var_impl(
     } else if number_of_contours < 0 {
         let components = glyf::CompositeGlyphIter::new(s.tail()?);
         let components_count = components.clone().count() as u16;
-        gvar_table.parse_variation_data(glyph_id, coordinates, components_count, &mut tuples)?;
+        gvar_table.parse_variation_data(
+            glyph_id,
+            coordinates,
+            components_count,
+            &mut tuples,
+            work,
+        )?;
 
         for component in components {
             let t = tuples.apply_null()?;
@@ -1733,6 +1789,7 @@ fn parse_variation_data<'a>(
     points_len: u16,
     data: &'a [u8],
     tuples: &mut VariationTuples<'a>,
+    work: &mut crate::work::OutlineWork,
 ) -> Option<()> {
     const SHARED_POINT_NUMBERS_FLAG: u16 = 0x8000;
     const COUNT_MASK: u16 = 0x0FFF;
@@ -1766,5 +1823,6 @@ fn parse_variation_data<'a>(
         main_stream,
         serialized_stream,
         tuples,
+        work,
     )
 }

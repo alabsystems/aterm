@@ -492,12 +492,16 @@ pub(crate) fn clean_prompt_words(text: &str) -> Option<String> {
     (!words.starts_with('<')).then(|| words.to_owned())
 }
 
-fn agy_user_input_words(content: &str) -> Option<String> {
-    let body = content
+/// What a `USER_INPUT` row's content says inside its `<USER_REQUEST>`, all of it where it has none.
+pub(crate) fn agy_user_request(content: &str) -> &str {
+    content
         .split_once("<USER_REQUEST>")
         .and_then(|(_, rest)| rest.split_once("</USER_REQUEST>").map(|(inner, _)| inner))
-        .unwrap_or(content);
-    clean_prompt_words(body)
+        .unwrap_or(content)
+}
+
+fn agy_user_input_words(content: &str) -> Option<String> {
+    clean_prompt_words(agy_user_request(content))
 }
 
 fn push_prompt(prompts: &mut Vec<Prompt>, words: &str) {

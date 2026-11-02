@@ -33,6 +33,7 @@ pub(crate) fn parse_cast(text: &str) -> Result<Cast, String> {
         head.get(k)
             .and_then(aterm_json::Value::as_u64)
             .and_then(|v| u16::try_from(v).ok())
+            .filter(|&v| v > 0)
             .ok_or_else(|| format!("cast header: no {k}"))
     };
     let (cols, rows) = (dim("width")?, dim("height")?);
@@ -53,6 +54,9 @@ pub(crate) fn parse_cast(text: &str) -> Result<Cast, String> {
         ) else {
             return Err(format!("cast line {}: not [t, kind, data]", n + 2));
         };
+        if !at.is_finite() || !(0.0..=1e9).contains(&at) {
+            return Err(format!("cast line {}: bad timestamp", n + 2));
+        }
         if kind == "o" {
             events.push(Event {
                 at,
@@ -112,8 +116,21 @@ pub fn cmd_halfdraw(args: &[String]) -> Res {
                         .ok_or_else(|| Fail::usage(format!("halfdraw: no program '{name}'")))?,
                 );
             }
-            "--show" => show = it.next().and_then(|n| n.parse().ok()).ok_or_else(usage)?,
-            "--event" => event = Some(it.next().and_then(|n| n.parse().ok()).ok_or_else(usage)?),
+            "--show" => {
+                show = it
+                    .next()
+                    .filter(|n| n.bytes().all(|b| b.is_ascii_digit()))
+                    .and_then(|n| n.parse().ok())
+                    .ok_or_else(usage)?;
+            }
+            "--event" => {
+                event = Some(
+                    it.next()
+                        .filter(|n| n.bytes().all(|b| b.is_ascii_digit()))
+                        .and_then(|n| n.parse().ok())
+                        .ok_or_else(usage)?,
+                );
+            }
             f if file.is_none() && !f.starts_with('-') => file = Some(f.to_string()),
             _ => return Err(usage()),
         }
@@ -138,6 +155,13 @@ pub(crate) fn base_instant() -> std::time::Instant {
     std::time::Instant::now()
 }
 
+pub(crate) fn event_instant(base: std::time::Instant, at: f64) -> std::time::Instant {
+    std::time::Duration::try_from_secs_f64(at.max(0.0))
+        .ok()
+        .and_then(|d| base.checked_add(d))
+        .unwrap_or(base)
+}
+
 /// The scan's report, as text.
 fn scan(
     cast: &Cast,
@@ -154,7 +178,7 @@ fn scan(
     let mut screens = Vec::new();
     let (mut bsu, mut esu, mut splits) = (0usize, 0usize, 0usize);
     for (i, e) in cast.events.iter().enumerate() {
-        let at = base + std::time::Duration::from_secs_f64(e.at.max(0.0));
+        let at = event_instant(base, e.at);
         t.process_at(
             e.data.as_bytes(),
             ClockReading {
@@ -325,6 +349,10 @@ mod tests {
         assert_eq!((cast.cols, cast.rows, cast.events.len()), (80, 24, 2));
         assert_eq!(cast.events[1].data, "b");
         assert!(parse_cast("{\"version\": 2}\n").is_err(), "no size");
+        assert!(parse_cast("{\"width\": 0, \"height\": 24}\n").is_err());
+        assert!(parse_cast("{\"width\": 80, \"height\": 0}\n").is_err());
         assert!(parse_cast("{\"width\": 1, \"height\": 1}\n[1, \"o\"]\n").is_err());
+        assert!(parse_cast("{\"width\": 1, \"height\": 1}\n[-0.1, \"o\", \"a\"]\n").is_err());
+        assert!(parse_cast("{\"width\": 1, \"height\": 1}\n[1e100, \"o\", \"a\"]\n").is_err());
     }
 }

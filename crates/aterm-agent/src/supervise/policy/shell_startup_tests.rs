@@ -49,8 +49,9 @@ impl Scratch {
         WorkerEnv::from_env(vars)
     }
 
+    /// [`read`] for these Unix workers on every host.
     fn read(&self, worker: &WorkerEnv) -> Result<ShellStartup, String> {
-        read(worker, &self.project())
+        read(worker, &self.project(), false)
     }
 }
 
@@ -211,10 +212,34 @@ fn every_snapshot_of_the_tools_shell_is_judged_and_none_is_unknown() {
         .expect_err("an option it cannot model");
     assert!(!unwritten(&err), "a snapshot stands: {err}");
     assert_eq!(
-        tool_kinds(&s.worker("/bin/zsh", &["CLAUDE_CODE_SHELL=/bin/bash"])),
+        tool_kinds(
+            &s.worker("/bin/zsh", &["CLAUDE_CODE_SHELL=/bin/bash"]),
+            false
+        ),
         [Kind::Bash, Kind::Zsh]
     );
-    assert_eq!(tool_kinds(&s.worker("/bin/sh", &[])), [Kind::Zsh]);
+    assert_eq!(tool_kinds(&s.worker("/bin/sh", &[]), false), [Kind::Zsh]);
+    let zsh_shell = r"CLAUDE_CODE_SHELL=C:\Program Files\Git\usr\bin\zsh.exe";
+    assert_eq!(
+        tool_kinds(&s.worker("/bin/zsh", &[]), true),
+        [Kind::Bash],
+        "on Windows Claude Code's start names Git for Windows' bash, whatever SHELL says"
+    );
+    assert_eq!(
+        tool_kinds(&s.worker("/bin/zsh", &[zsh_shell]), true),
+        [Kind::Zsh, Kind::Bash]
+    );
+    let w = Scratch::new("windows");
+    let err = read(&w.worker("/bin/zsh", &[]), &w.project(), true).expect_err("no snapshot");
+    assert!(err.contains("no shell snapshot of bash"), "{err}");
+    w.snapshot("bash", 1, &bash_snapshot(&[], "", "", ""));
+    let windows = read(&w.worker("/bin/zsh", &[]), &w.project(), true).expect("bash's");
+    assert!(!windows.may_run_zsh(), "{windows:?}");
+    let named = read(&w.worker("/bin/zsh", &[zsh_shell]), &w.project(), true);
+    assert!(
+        named.as_ref().is_ok_and(ShellStartup::may_run_zsh),
+        "a zsh CLAUDE_CODE_SHELL names may run there: {named:?}"
+    );
     let t = Scratch::new("truncated");
     t.snapshot("zsh", 1, "# Snapshot file\n# Functions\n");
     assert!(t.read(&t.worker("/bin/zsh", &[])).is_err());
@@ -306,12 +331,26 @@ fn what_runs_before_every_command_besides_the_snapshot_is_read() {
         ". \"$HOME/.cargo/env\"",
         "source ~/.zshenv.local",
         "eval \"$(tool init zsh)\"",
+        "X=\" # \"; eval \"$(tool init zsh)\"",
+        "ev\\al \"$(tool init zsh)\"",
+        "e'v'al \"$(tool init zsh)\"",
+        "hash git=/tmp/evil",
         "x=${#y}; set -o shwordsplit",
         "rm() { echo }",
     ] {
         std::fs::write(&zshenv, text).expect("zshenv");
         let why = s.read(&s.worker("/bin/zsh", &[])).expect_err(text);
         assert!(why.contains(".zshenv"), "{text}: {why}");
+    }
+    for bad_alias in [
+        "alias -g G='| sh'\n",
+        "alias -- -g G='| sh'\n",
+        "alias -- '-g' G='| sh'\n",
+        "hash git=/tmp/evil\n",
+    ] {
+        let s = Scratch::new("bad-alias");
+        s.snapshot("zsh", 1, &zsh_snapshot("", "", bad_alias));
+        assert!(s.read(&s.worker("/bin/zsh", &[])).is_err(), "{bad_alias}");
     }
     let zdot = s.0.path().join("zdot");
     std::fs::create_dir_all(&zdot).expect("zdotdir");

@@ -3,16 +3,18 @@
 
 //! Fake Responses model for `codex-alab` proof legs, with state owned by each model world.
 
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use aterm_agent::supervise::config::CONTINUE_TEXT;
+use aterm_agent::supervise::policy::land_check::LANDED as LANDED_ANSWER;
 use aterm_agent::supervise::policy::needs::NEEDS_ACK;
 use aterm_agent::supervise::policy::turn_end::{
-    DONE_CHECK, FINISHED, LAND, LAND_ANSWER, LAND_NUDGE,
+    self, DONE_CHECK, FINISHED, LAND, LAND_ANSWER, LAND_CHECK_HEAD, LAND_NUDGE,
 };
 
-use crate::codex_rig::{Answered, call_item, message_item, request_view};
+use crate::codex_rig::{Answered, ResponseGate, call_item, message_item, request_view};
 use crate::pyjson::J;
 
 #[path = "codex_alab_policy_model.rs"]
@@ -26,6 +28,58 @@ pub const RETIRED_CHECK: &str = "If the task is finished and verified";
 
 /// Prefix of the dirty-repository suffix appended to Land nudges.
 pub const REPO_SUFFIX_HEAD: &str = "Your repository still holds work no remote main has";
+
+/// The tag a request carrying Land's contradiction gets (aterm's slice 4c), its words as aterm
+/// types them ([`contradiction_fault`]).
+pub const CONTRADICTED_TAG: &str = "+contradicted";
+
+/// The tag a request carrying Land's contradiction's head gets where its words are not aterm's.
+pub const CONTRADICTED_WRONG_TAG: &str = "+contradicted-wrong";
+
+/// What is wrong with `user`, a prompt that opens with Land's contradiction's head
+/// (`LAND_CONTRADICTED_HEAD`), against aterm's words: the measured fact or the agent's list after
+/// the head, Land's sentence on files no repository holds, "never delete work", and no way out of
+/// landing (the forever lab's escapes, in any case); `None` where it says them all.
+#[must_use]
+pub fn contradiction_fault(user: &str) -> Option<String> {
+    let after = user
+        .split_once(turn_end::LAND_CONTRADICTED_HEAD)
+        .map(|(_, r)| r.trim_start())?;
+    let mut bad = Vec::new();
+    if !after.starts_with(turn_end::CONTRADICTED_GIT)
+        && !after.starts_with(turn_end::CONTRADICTED_LISTED)
+    {
+        bad.push("no measured fact or list after the head".to_string());
+    }
+    for whole in [turn_end::NO_REPOSITORY, "never delete work"] {
+        if !user.contains(whole) {
+            bad.push(format!("does not say {whole:?}"));
+        }
+    }
+    let lower = user.to_lowercase();
+    bad.extend(
+        crate::forever::ESCAPES
+            .iter()
+            .filter(|w| lower.contains(*w))
+            .map(|w| format!("offers a way out ({w:?})")),
+    );
+    (!bad.is_empty()).then(|| bad.join("; "))
+}
+
+/// The tag `user` adds for Land's contradiction: [`CONTRADICTED_TAG`] where it carries aterm's
+/// words, [`CONTRADICTED_WRONG_TAG`] where it opens with the head in other words, nothing where
+/// it carries no contradiction.
+#[must_use]
+pub fn contradiction_tag(user: &str) -> &'static str {
+    if !user.contains(turn_end::LAND_CONTRADICTED_HEAD) {
+        return "";
+    }
+    if contradiction_fault(user).is_some() {
+        CONTRADICTED_WRONG_TAG
+    } else {
+        CONTRADICTED_TAG
+    }
+}
 
 /// Prompt text typed by a person to reopen a landed task.
 pub const REOPEN: &str = "REOPEN";
@@ -59,6 +113,25 @@ pub const WORKER_TASK: &str = "Write the worker's report.";
 
 /// The worker leg's report, the words its `result` carries.
 pub const WORKER_REPORT: &str = "Wrote the worker's report: the lab's task is done.";
+
+/// Whether the worker's land act is answered only once [`WORKER_LAND`] is released.
+static WORKER_LAND_HELD: AtomicBool = AtomicBool::new(false);
+
+/// What holds the worker's land act's answer while [`WORKER_LAND_HELD`]: so its Land hold (the
+/// land act typed, the yield not yet judged) stands until `codex-alab-proof --window-only` read
+/// its row under its manager say `landing`, which a 2 s read of a hold of a second or two catches
+/// only by luck. The gate's own wait is a one-minute hang detector.
+static WORKER_LAND: OnceLock<Arc<ResponseGate>> = OnceLock::new();
+
+/// From now on, the worker's land act's answer waits for [`release_worker_land`].
+pub fn hold_worker_land() {
+    WORKER_LAND_HELD.store(true, Ordering::SeqCst);
+}
+
+/// The worker's land act's answer goes (and any later one at once).
+pub fn release_worker_land() {
+    WORKER_LAND.get_or_init(Default::default).release();
+}
 
 /// First-leg reply claiming completion with the retired done token.
 pub const FIRST_DONE: &str = "Hello from the lab model. Nothing else to do.\n\nATERM-TASK-DONE";
@@ -154,6 +227,8 @@ pub enum Step {
     Nudge(usize),
     /// Land answer to a prose question (`land-answer@v1`).
     LandAnswer,
+    /// The land check (`land-check@v1`, its head [`LAND_CHECK_HEAD`]).
+    LandCheck,
     /// Any other harness-typed prompt.
     Other,
 }
@@ -171,6 +246,7 @@ impl Step {
             Step::Land => "land".to_string(),
             Step::Nudge(n) => format!("nudge{n}"),
             Step::LandAnswer => "land-answer".to_string(),
+            Step::LandCheck => "land-check".to_string(),
             Step::Other => "other".to_string(),
         }
     }
@@ -205,6 +281,9 @@ pub fn leg_of(body: &J) -> Option<String> {
 pub fn step_of(body: &J) -> Step {
     let texts = user_texts(body);
     let (last, _) = request_view(body);
+    if last.contains(LAND_CHECK_HEAD) {
+        return Step::LandCheck;
+    }
     if last.contains(LAND_NUDGE) {
         return Step::Nudge(texts.iter().filter(|t| t.contains(LAND_NUDGE)).count());
     }
@@ -345,9 +424,17 @@ fn answer(body: &J, resets: &Mutex<Vec<(String, i64)>>, now: &dyn Fn() -> i64) -
     if user.contains(REPO_SUFFIX_HEAD) {
         name.push_str("+repo");
     }
+    name.push_str(contradiction_tag(&user));
     let mut a = match (leg.as_str(), step) {
         ("first", Step::Person) => say(FIRST_DONE),
         ("worker", Step::Person) => say(WORKER_REPORT),
+        ("worker", Step::Land) => {
+            let mut a = say(LAND_DEFENSE);
+            if WORKER_LAND_HELD.load(Ordering::SeqCst) {
+                a.gate = Some(Arc::clone(WORKER_LAND.get_or_init(Default::default)));
+            }
+            a
+        }
         ("needs", Step::Person) => say(NEEDS_REPORT),
         ("needs", Step::Continue | Step::Other) if texts_after_prompt(body) == 1 => {
             slow(NEEDS_PLAIN, NEEDS_HOLD)
@@ -409,6 +496,7 @@ fn answer(body: &J, resets: &Mutex<Vec<(String, i64)>>, now: &dyn Fn() -> i64) -
         (_, Step::Defend | Step::RetiredCheck) => say(CRUISE_DEFENSE),
         (_, Step::Land | Step::Nudge(_)) => say(LAND_DEFENSE),
         (_, Step::LandAnswer) => say("Took the option that lands it soonest."),
+        (_, Step::LandCheck) => say(LANDED_ANSWER),
         (_, Step::Continue) => say("Kept going: the next step is in hand."),
         _ => say(&format!(
             "Hello from the lab model. Nothing else to do.\n\n{FINISHED}"
@@ -423,12 +511,48 @@ mod tests {
     use std::sync::atomic::{AtomicI64, Ordering};
 
     use aterm_agent::supervise::policy::needs::{self, needs_you, says_no_needs, without_needs};
-    use aterm_agent::supervise::policy::turn_end::{Said, classify_said, clean_defense, says_done};
+    use aterm_agent::supervise::policy::turn_end::{
+        LAND_CHECK, Said, classify_said, clean_defense, says_done,
+    };
 
     use super::*;
 
     fn answer(body: &J) -> Answered {
         answerer_with_clock(|| 1_000)(body)
+    }
+
+    /// LAND'S CONTRADICTION IS TAGGED BY ITS WORDS (aterm's slice 4c): aterm's own contradiction,
+    /// on either leg, tags `+contradicted`; one that offers a way out, in any case, or drops
+    /// Land's sentence on files no repository holds tags `+contradicted-wrong`; Land's plain nudge
+    /// tags nothing, so codex-alab's proof judges the contradiction only where its fork typed one.
+    /// Negative controls: the escapes matched case-sensitively pass "Ignore it."; the
+    /// no-repository want dropped passes the cut close.
+    #[test]
+    fn the_contradiction_is_tagged_by_its_words() {
+        use aterm_agent::harness::repo_work::{RepoRead, RepoWork};
+        let found = RepoRead::Found(RepoWork {
+            repo: "/private/tmp/at.x/proj/land".to_string(),
+            untracked: 1,
+            paths: vec!["wip-notes.txt".to_string()],
+            main_ref: "origin/main".to_string(),
+            ..RepoWork::default()
+        });
+        let git = turn_end::land_contradicted(&found, None, &[], None).expect("git's leg");
+        let list =
+            turn_end::land_contradicted(&RepoRead::Clean, Some("The docs PR is open."), &[], None)
+                .expect("the list");
+        for text in [&git, &list] {
+            assert_eq!(contradiction_tag(text), CONTRADICTED_TAG, "{text}");
+        }
+        for wrong in [
+            format!("{git} Ignore it."),
+            format!("{git} Or move it out."),
+            git.replace(turn_end::NO_REPOSITORY, ""),
+            format!("{} the docs are fine.", turn_end::LAND_CONTRADICTED_HEAD),
+        ] {
+            assert_eq!(contradiction_tag(&wrong), CONTRADICTED_WRONG_TAG, "{wrong}");
+        }
+        assert_eq!(contradiction_tag(LAND_NUDGE), "");
     }
 
     fn usage_reset(a: &Answered) -> i64 {
@@ -496,6 +620,10 @@ mod tests {
             "every nudge of the conversation is counted"
         );
         assert_eq!(step_of(&body(&[p, LAND_ANSWER], None)), Step::LandAnswer);
+        assert_eq!(
+            step_of(&body(&[p, LAND, LAND_CHECK], None)),
+            Step::LandCheck
+        );
         assert_eq!(step_of(&body(&[p, DONE_CHECK], None)), Step::Defend);
         assert_eq!(
             step_of(&body(&[p, &acted(CONTINUE_TEXT, NEEDS_ACK)], None)),
@@ -910,9 +1038,10 @@ mod tests {
         assert_eq!((a.status, a.tag.as_str()), (200, "usage:side"));
     }
 
-    /// v6 §14.5 (5a): the model reads each of Cruise's six angled done checks, bare and as typed
-    /// with its suffixes, and v1's fixed check as the defend step, by the base they share
-    /// (`DONE_CHECK`). NEGATIVE CONTROL: an angle without the base is no done check to it.
+    /// v6 §14.5 (5a): the model reads each of Cruise's six angled done checks, bare, as typed
+    /// with its suffixes and as the person's hour cuts it (`go_ahead::unless_held`), and v1's
+    /// fixed check as the defend step, by the base they share (`DONE_CHECK`). NEGATIVE CONTROL:
+    /// an angle without the base is no done check to it.
     #[test]
     fn every_angled_done_check_is_the_defend_step() {
         use aterm_agent::supervise::policy::turn_end::{
@@ -923,6 +1052,8 @@ mod tests {
             for check in [
                 done_check_words(n),
                 done_check_act(n, Some("never push to main"), true),
+                aterm_agent::supervise::policy::go_ahead::unless_held(&done_check_words(n), true)
+                    .into_owned(),
             ] {
                 assert_eq!(step_of(&body(&[p, &check], None)), Step::Defend, "{check}");
             }

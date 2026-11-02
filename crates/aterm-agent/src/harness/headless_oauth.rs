@@ -65,6 +65,10 @@ pub const BROWSER_PROFILES_DIR: &str = "browsers";
 /// never makes a profile there that one of them would then pick.
 pub const VENDOR_PROFILES_DIR: &str = "vendor-browsers";
 
+/// A fresh automatic profile remains unproven until authorization succeeds. Failed attempts
+/// retain their cookies and this marker; legacy profiles carry no marker.
+pub const PROFILE_UNPROVEN_MARK: &str = ".aterm-unproven";
+
 /// A label as [`MailboxConfig::contested_labels`] keeps it.
 fn contest_key(label: &str) -> String {
     label.trim().to_ascii_lowercase().replace(['.', '_'], "-")
@@ -108,7 +112,7 @@ fn insert_credential(values: &mut BTreeMap<String, String>, key: String, value: 
 }
 
 /// Configuration for fetching incoming OAuth verification emails (magic links or 6-digit OTPs).
-#[derive(Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MailboxConfig {
     /// Local Maildir / spool directory containing verification message files.
     pub dir: Option<PathBuf>,
@@ -168,12 +172,6 @@ pub struct MailboxConfig {
     pub routed: bool,
     /// On such a view of an entry that is not ready, why it is never tried.
     pub unready: Option<&'static str>,
-}
-
-impl std::fmt::Debug for MailboxConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MailboxConfig").finish_non_exhaustive()
-    }
 }
 
 impl MailboxConfig {
@@ -2121,21 +2119,12 @@ pub struct HeadlessBrowser {
 }
 
 /// Credential extracted from an incoming verification email.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MailboxCredential {
     /// A verification / sign-in magic link URL.
     MagicLink(String),
     /// A 6-digit one-time verification code (OTP).
     Otp(String),
-}
-
-impl std::fmt::Debug for MailboxCredential {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::MagicLink(_) => f.write_str("MagicLink(<redacted>)"),
-            Self::Otp(_) => f.write_str("Otp(<redacted>)"),
-        }
-    }
 }
 
 pub(super) fn is_shell_binary(path: &Path) -> bool {
@@ -2339,10 +2328,25 @@ fn exact_email_profile_dir(store_dir: &Path, email: &str) -> PathBuf {
     }
 }
 
-/// Whether `store_dir` already has a persistent headless browser profile for `label` or `email`.
+/// Whether the persistent profile for `label` or `email` exists and is not marked unproven.
+/// An unreadable marker location, or a marker of any file type, never proves readiness.
 #[must_use]
 pub fn has_browser_profile(store_dir: &Path, label: &str, email: Option<&str>) -> bool {
-    resolve_browser_profile_dir(store_dir, Some(label), email).is_dir()
+    let dir = resolve_browser_profile_dir(store_dir, Some(label), email);
+    dir.is_dir()
+        && std::fs::symlink_metadata(dir.join(PROFILE_UNPROVEN_MARK))
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// Record that authorization succeeded in `profile_dir`, removing its unproven marker.
+/// Missing markers preserve compatibility with existing and manually created profiles.
+/// # Errors
+/// The marker could not be removed for a reason other than its absence.
+pub fn adopt_browser_profile(profile_dir: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(profile_dir.join(PROFILE_UNPROVEN_MARK)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
 }
 
 /// Infer the account label from `ATERM_ACCOUNT_LABEL`, else from `CLAUDE_CONFIG_DIR`
@@ -2464,10 +2468,12 @@ pub fn row_browser_profile(
 
 /// Run authorization with a persistent store profile or an owned scratch profile.
 /// An authorization error does not make persistent cookies or profile data disposable.
+/// A newly published persistent profile is already marked unproven. Successful authorization
+/// removes that marker; a removal error is reported separately and never changes its outcome.
 ///
 /// # Errors
 ///
-/// Scratch allocation failure, a persistent profile another browser or another of aterm's
+/// Scratch allocation or private profile preparation failure, a persistent profile another browser or another of aterm's
 /// launches has open ([`super::browser_window::ProfileLock::claim`], its
 /// [`super::browser_window::Refusal::brief`]), or the authorization's diagnostic, unchanged.
 #[cfg(unix)]
@@ -2477,20 +2483,126 @@ pub(super) fn with_browser_profile(
     email: Option<&str>,
     authorize: impl FnOnce(&Path) -> Result<(), &'static str>,
 ) -> Result<(), &'static str> {
+    with_browser_profile_using(
+        store_dir,
+        label,
+        email,
+        prepare_browser_profile,
+        authorize,
+        |e| {
+            let _ = writeln!(
+                std::io::stderr(),
+                "aterm: browser authorization succeeded, but its profile remains unproven: {e}"
+            );
+        },
+    )
+}
+
+#[cfg(unix)]
+fn write_profile_unproven(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(dir.join(PROFILE_UNPROVEN_MARK))?;
+    file.write_all(b"1\n")
+}
+
+#[cfg(unix)]
+fn publish_browser_profile(from: &Path, to: &Path) -> std::io::Result<()> {
+    aterm_dirfd::renameat_with(
+        aterm_dirfd::CWD,
+        from,
+        aterm_dirfd::CWD,
+        to,
+        aterm_dirfd::RenameFlags::NOREPLACE,
+    )
+    .map_err(std::io::Error::from)
+}
+
+#[cfg(unix)]
+fn prepare_browser_profile(dir: &Path) -> std::io::Result<()> {
+    prepare_browser_profile_with(dir, write_profile_unproven, publish_browser_profile)
+}
+
+/// Prepare only our unpublished staging directory. A creator that loses publication never
+/// writes a marker into the winner, even if that winner has already finished authorization.
+#[cfg(unix)]
+fn prepare_browser_profile_with(
+    dir: &Path,
+    write_marker: impl FnOnce(&Path) -> std::io::Result<()>,
+    publish: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let parent = dir.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "profile has no parent")
+    })?;
+    aterm_types::fs_restricted::ensure_private_dir(parent)?;
+    match std::fs::metadata(dir) {
+        Ok(metadata) if metadata.is_dir() => {
+            return aterm_types::fs_restricted::ensure_private_dir(dir);
+        }
+        Ok(_) => return Err(std::io::ErrorKind::AlreadyExists.into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let stage = aterm_tempfile::Builder::new()
+        .prefix(".aterm-profile-")
+        .tempdir_in(parent)?;
+    aterm_types::fs_restricted::ensure_private_dir(stage.path())?;
+    write_marker(stage.path())?;
+    match publish(stage.path(), dir) {
+        Ok(()) => {
+            // The published directory belongs to the persistent store now.
+            let _ = stage.keep();
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            if !std::fs::metadata(dir)?.is_dir() {
+                return Err(e);
+            }
+            aterm_types::fs_restricted::ensure_private_dir(dir)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(unix)]
+fn with_browser_profile_using(
+    store_dir: Option<&Path>,
+    label: Option<&str>,
+    email: Option<&str>,
+    prepare: impl FnOnce(&Path) -> std::io::Result<()>,
+    authorize: impl FnOnce(&Path) -> Result<(), &'static str>,
+    adoption_error: impl FnOnce(&std::io::Error),
+) -> Result<(), &'static str> {
     let temp_dir;
     let _claimed;
-    let profile_dir = if let Some(store) = store_dir {
+    let (profile_dir, persistent) = if let Some(store) = store_dir {
         let dir = resolve_browser_profile_dir(store, label, email);
-        let _ = aterm_types::fs_restricted::ensure_private_dir(dir.parent().unwrap_or(store));
-        let _ = aterm_types::fs_restricted::ensure_private_dir(&dir);
+        prepare(&dir).map_err(|e| {
+            let _ = writeln!(
+                std::io::stderr(),
+                "aterm: could not prepare private browser profile: {e}"
+            );
+            "could not prepare private browser profile"
+        })?;
         _claimed = super::browser_window::ProfileLock::claim(&dir).map_err(|why| why.brief())?;
-        dir
+        (dir, true)
     } else {
         temp_dir =
             aterm_tempfile::tempdir().map_err(|_| "could not create scratch browser profile")?;
-        temp_dir.path().to_path_buf()
+        (temp_dir.path().to_path_buf(), false)
     };
-    authorize(&profile_dir)
+    let authorized = authorize(&profile_dir);
+    if persistent
+        && authorized.is_ok()
+        && let Err(e) = adopt_browser_profile(&profile_dir)
+    {
+        adoption_error(&e);
+    }
+    authorized
 }
 
 /// Build the command-line arguments for launching `browser` with `profile_dir`: `--headless=new`
@@ -2554,8 +2666,11 @@ pub fn profile_args(profile_dir: &Path) -> Vec<OsString> {
     ] {
         args.push(flag.into());
     }
-    // Never disable Chromium's sandbox to accommodate a root caller. Linux browser
-    // automation must run as an unprivileged user instead.
+    // Chromium requires this exception as root; ordinary Linux users keep its sandbox.
+    #[cfg(target_os = "linux")]
+    if aterm_uds::peer::our_uid() == 0 {
+        args.push("--no-sandbox".into());
+    }
     args
 }
 
@@ -3126,7 +3241,7 @@ impl MailFilter<'_> {
 #[must_use]
 pub fn domain_names(domain: &str, word: &str) -> bool {
     let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
-    let word = word.trim().to_ascii_lowercase();
+    let word = word.trim().trim_end_matches('.').to_ascii_lowercase();
     if word.is_empty() || domain.is_empty() {
         return false;
     }
@@ -3185,6 +3300,9 @@ pub fn mail_from_and_date(raw: &str) -> (Option<String>, Option<i64>) {
     let mut last: Option<&mut Option<String>> = None;
     for line in head.lines() {
         let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            break;
+        }
         if line.starts_with([' ', '\t']) {
             if let Some(Some(value)) = last.as_mut().map(|l| l.as_mut()) {
                 value.push(' ');
@@ -3327,19 +3445,84 @@ fn address_text(v: &Value) -> Option<String> {
 /// The domain of the one address in a `From:` value (`Name <a@b.c>`, `a@b.c (Name)`, or `a@b.c`).
 fn address_domain(value: &str) -> Option<String> {
     let decoded = super::open_url::decode_rfc2047_words(value);
-    let value = decoded.as_str();
-    let addr = match (value.rfind('<'), value.rfind('>')) {
-        (Some(open), Some(close)) if open < close => &value[open + 1..close],
-        _ => value.split('(').next().unwrap_or(value),
+    let trimmed = decoded.trim();
+    let unquoted = trimmed
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .filter(|s| !s.contains(['"', '\\']))
+        .unwrap_or(trimmed);
+    let cleaned = strip_rfc5322_comments_and_quotes(unquoted)?;
+    if cleaned.contains([',', ';']) {
+        return None;
+    }
+    let addr = match (cleaned.find('<'), cleaned.find('>')) {
+        (Some(open), Some(close))
+            if open < close
+                && !cleaned[open + 1..].contains('<')
+                && !cleaned[close + 1..].contains('>')
+                && !cleaned[..open].contains('@')
+                && cleaned[close + 1..].trim().is_empty() =>
+        {
+            &cleaned[open + 1..close]
+        }
+        (None, None) => cleaned.as_str(),
+        _ => return None,
     };
-    let addr = addr.trim().trim_matches('"');
-    let (_, domain) = addr.rsplit_once('@')?;
-    let domain = domain.trim().to_ascii_lowercase();
+    let (local, domain) = addr.trim().split_once('@')?;
+    if local.trim().is_empty() || domain.contains('@') {
+        return None;
+    }
+    let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
     (!domain.is_empty()
-        && domain
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-')))
+        && domain.split('.').all(|label| {
+            !label.is_empty()
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        }))
     .then_some(domain)
+}
+
+/// Strips RFC 5322 parenthesized comments (outside quotes) and replaces quoted strings with `_`.
+fn strip_rfc5322_comments_and_quotes(input: &str) -> Option<String> {
+    let mut out = String::with_capacity(input.len());
+    let mut in_quotes = false;
+    let mut comment_depth = 0usize;
+    let mut escaped = false;
+    for ch in input.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && (in_quotes || comment_depth > 0) {
+            escaped = true;
+            continue;
+        }
+        if comment_depth > 0 {
+            if ch == '(' {
+                comment_depth += 1;
+            } else if ch == ')' {
+                comment_depth -= 1;
+            }
+            continue;
+        }
+        if in_quotes {
+            if ch == '"' {
+                in_quotes = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => {
+                in_quotes = true;
+                out.push('_');
+            }
+            '(' => comment_depth = 1,
+            ')' => return None,
+            _ => out.push(ch),
+        }
+    }
+    (!in_quotes && comment_depth == 0 && !escaped).then_some(out)
 }
 
 /// An RFC 3339 time with any offset or fraction (`2026-10-23T22:15:03.5+02:00`), unix seconds.
@@ -3348,28 +3531,43 @@ fn parse_rfc3339_any(text: &str) -> Option<i64> {
     let (date, time) = t.split_once(['T', 't', ' '])?;
     let mut d = date.split('-');
     let (y, m, day) = (
-        d.next()?.parse::<i64>().ok()?,
-        d.next()?.parse::<u32>().ok()?,
-        d.next()?.parse::<u32>().ok()?,
+        crate::parse_uint::<i64>(d.next()?)?,
+        crate::parse_uint::<u32>(d.next()?)?,
+        crate::parse_uint::<u32>(d.next()?)?,
     );
+    if d.next().is_some() {
+        return None;
+    }
     let (clock, offset) = match time.find(['Z', 'z', '+', '-']) {
         Some(at) => time.split_at(at),
         None => (time, "Z"),
     };
     let mut c = clock.split(':');
     let (hh, mm) = (
-        c.next()?.parse::<i64>().ok()?,
-        c.next()?.parse::<i64>().ok()?,
+        crate::parse_uint::<i64>(c.next()?)?,
+        crate::parse_uint::<i64>(c.next()?)?,
     );
-    let ss = c
-        .next()
-        .and_then(|s| s.split('.').next())
-        .map_or(Some(0), |s| s.parse::<i64>().ok())?;
+    let ss = match c.next() {
+        None => 0,
+        Some(s) => match s.split_once('.') {
+            Some((whole, frac)) if !frac.is_empty() && frac.bytes().all(|b| b.is_ascii_digit()) => {
+                crate::parse_uint::<i64>(whole)?
+            }
+            Some(_) => return None,
+            None => crate::parse_uint::<i64>(s)?,
+        },
+    };
+    if c.next().is_some() {
+        return None;
+    }
     let zone = match offset {
         "Z" | "z" => 0,
-        o => zone_seconds(&o.replace(':', ""))?,
+        o if o.len() == 6 && o.as_bytes().get(3) == Some(&b':') => {
+            zone_seconds(&format!("{}{}", &o[..3], &o[4..]))?
+        }
+        o => zone_seconds(o)?,
     };
-    civil_seconds(y, m, day, hh, mm, ss).map(|at| at - zone)
+    civil_seconds(y, m, day, hh, mm, ss)?.checked_sub(zone)
 }
 
 /// An RFC 2822 `Date:` (`Thu, 23 Oct 2026 22:15:03 +0000`, the weekday and seconds optional, a
@@ -3379,14 +3577,14 @@ pub fn parse_mail_date(text: &str) -> Option<i64> {
     let text = text.split('(').next().unwrap_or(text);
     let text = text.split_once(',').map_or(text, |(_, rest)| rest);
     let mut words = text.split_whitespace();
-    let day = words.next()?.parse::<u32>().ok()?;
+    let day = crate::parse_uint::<u32>(words.next()?)?;
     let month = words.next()?.to_ascii_lowercase();
     let month = [
         "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
     ]
     .iter()
     .position(|m| month.starts_with(m))?;
-    let year = words.next()?.parse::<i64>().ok()?;
+    let year = crate::parse_uint::<i64>(words.next()?)?;
     let year = match year {
         0..=49 => 2000 + year,
         50..=999 => 1900 + year,
@@ -3394,13 +3592,16 @@ pub fn parse_mail_date(text: &str) -> Option<i64> {
     };
     let mut clock = words.next()?.split(':');
     let (hh, mm) = (
-        clock.next()?.parse::<i64>().ok()?,
-        clock.next()?.parse::<i64>().ok()?,
+        crate::parse_uint::<i64>(clock.next()?)?,
+        crate::parse_uint::<i64>(clock.next()?)?,
     );
-    let ss = clock.next().map_or(Some(0), |s| s.parse::<i64>().ok())?;
+    let ss = clock.next().map_or(Some(0), crate::parse_uint::<i64>)?;
+    if clock.next().is_some() {
+        return None;
+    }
     let zone = words.next().map_or(Some(0), zone_seconds)?;
     let month = u32::try_from(month).ok()? + 1;
-    civil_seconds(year, month, day, hh, mm, ss).map(|at| at - zone)
+    civil_seconds(year, month, day, hh, mm, ss)?.checked_sub(zone)
 }
 
 /// A zone's offset east of UTC, in seconds (`+0200`, `-0700`, `GMT`, `EST`, …).
@@ -3427,22 +3628,35 @@ fn zone_seconds(zone: &str) -> Option<i64> {
     }
     let hh = digits[..2].parse::<i64>().ok()?;
     let mm = digits[2..].parse::<i64>().ok()?;
-    Some(sign * (hh * 3600 + mm * 60))
+    (hh <= 23 && mm <= 59).then_some(sign * (hh * 3600 + mm * 60))
 }
 
 /// Unix seconds of a UTC civil time (days from civil, Howard Hinnant's algorithm).
 fn civil_seconds(y: i64, m: u32, d: u32, hh: i64, mm: i64, ss: i64) -> Option<i64> {
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || hh > 23 || mm > 59 || ss > 60 {
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let max_day = match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if !(1..=max_day).contains(&d)
+        || !(0..=23).contains(&hh)
+        || !(0..=59).contains(&mm)
+        || !(0..=60).contains(&ss)
+    {
         return None;
     }
-    let y = if m <= 2 { y - 1 } else { y };
+    let y = if m <= 2 { y.checked_sub(1)? } else { y };
     let era = y.div_euclid(400);
-    let yoe = y - era * 400;
+    let yoe = y.rem_euclid(400);
     let mp = (i64::from(m) + 9) % 12;
     let doy = (153 * mp + 2) / 5 + i64::from(d) - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    Some(days * 86_400 + hh * 3600 + mm * 60 + ss)
+    let days = era.checked_mul(146_097)?.checked_add(doe - 719_468)?;
+    days.checked_mul(86_400)?
+        .checked_add(hh * 3600 + mm * 60 + ss)
 }
 
 fn extract_unseen_credential_from_email(
@@ -3599,21 +3813,28 @@ fn parse_imap_url(url: &str) -> Option<ParsedImapUrl> {
     let default_port = if tls { 993 } else { 143 };
     let (host, port) = if let Some(v6) = host_port.strip_prefix('[') {
         let (addr, after) = v6.split_once(']')?;
-        if !addr.contains(':') {
+        if addr.parse::<std::net::Ipv6Addr>().is_err() {
             return None;
         }
         let port = match after {
             "" => default_port,
-            _ => after.strip_prefix(':')?.parse::<u16>().ok()?,
+            _ => crate::parse_uint::<u16>(after.strip_prefix(':')?)?,
         };
         (addr.to_owned(), port)
     } else {
         match host_port.rsplit_once(':') {
-            Some((h, p)) => (h.to_owned(), p.parse::<u16>().ok()?),
+            Some((h, p)) if !h.contains(':') => (h.to_owned(), crate::parse_uint::<u16>(p)?),
+            Some(_) => return None,
             None => (host_port.to_owned(), default_port),
         }
     };
-    if host.is_empty() || port == 0 || host.chars().any(|c| c.is_whitespace() || c.is_control()) {
+    if host.is_empty()
+        || port == 0
+        || tail.starts_with('\\')
+        || host
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || c == '\\')
+    {
         return None;
     }
     let mailbox_raw = path_part
@@ -3756,7 +3977,7 @@ fn imap_search_sequences<'a>(lines: impl IntoIterator<Item = &'a str>) -> Vec<u3
         {
             continue;
         }
-        seqs.extend(words.filter_map(|word| word.parse::<u32>().ok()));
+        seqs.extend(words.filter_map(crate::parse_uint::<u32>));
     }
     seqs
 }
@@ -4234,7 +4455,7 @@ fn imap_login_refused_words(
 }
 
 fn authority_and_tail(rest: &str) -> (&str, &str) {
-    rest.find(['/', '?', '#'])
+    rest.find(['/', '\\', '?', '#'])
         .map_or((rest, ""), |end| rest.split_at(end))
 }
 
@@ -4262,33 +4483,13 @@ fn cleartext_refusal(url: &str) -> Option<&'static str> {
              name an imaps:// mailbox",
         );
     }
-    let rest = strip_ascii_prefix_ci(trimmed, "http://")?;
-    let (authority, _) = authority_and_tail(rest);
-    let host_port = authority.rsplit_once('@').map_or(authority, |(_, hp)| hp);
-    let host = match host_port.strip_prefix('[') {
-        Some(v6) => v6
-            .split_once(']')
-            .filter(|(addr, after)| {
-                addr.contains(':')
-                    && (after.is_empty()
-                        || after
-                            .strip_prefix(':')
-                            .and_then(|p| p.parse::<u16>().ok())
-                            .is_some_and(|p| p > 0))
-            })
-            .map_or("", |(addr, _)| addr),
-        None => host_port.rsplit_once(':').map_or(host_port, |(h, p)| {
-            if p.parse::<u16>().is_ok_and(|port| port > 0) {
-                h
-            } else {
-                ""
-            }
-        }),
-    };
-    (!is_loopback_host(host)).then_some(
-        "http:// sends its password or token in cleartext, so it is used only for a loopback \
-         host; name an https:// mailbox",
-    )
+    if strip_ascii_prefix_ci(trimmed, "http://").is_some() {
+        return (!is_loopback_http_url(trimmed)).then_some(
+            "http:// sends its password or token in cleartext, so it is used only for a loopback \
+             host; name an https:// mailbox",
+        );
+    }
+    None
 }
 
 /// Why `cfg` is not polled for `target_email`: an `imap://` login, or an `http://` password or
@@ -4344,25 +4545,27 @@ fn parse_loopback_http_url(url: &str) -> Option<LoopbackHttpUrl<'_>> {
     };
     let (host, port) = if let Some(v6) = authority.strip_prefix('[') {
         let (addr, after) = v6.split_once(']')?;
-        if !addr.contains(':') {
+        if addr.parse::<std::net::Ipv6Addr>().is_err() {
             return None;
         }
         let port = match after {
             "" => 80,
-            _ => after.strip_prefix(':')?.parse::<u16>().ok()?,
+            _ => crate::parse_uint::<u16>(after.strip_prefix(':')?)?,
         };
         (addr.to_owned(), port)
     } else {
         match authority.rsplit_once(':') {
-            Some((h, p)) => (h.to_owned(), p.parse::<u16>().ok()?),
+            Some((h, p)) if !h.contains(':') => (h.to_owned(), crate::parse_uint::<u16>(p)?),
+            Some(_) => return None,
             None => (authority.to_owned(), 80),
         }
     };
     if port == 0
         || !is_loopback_host(&host)
-        || authority
+        || tail.starts_with('\\')
+        || raw_authority
             .chars()
-            .any(|c| c.is_whitespace() || c.is_control())
+            .any(|c| c.is_whitespace() || c.is_control() || c == '\\')
     {
         return None;
     }
@@ -4464,7 +4667,10 @@ fn fetch_http_url_body(
     let trimmed = url.trim();
     let cfg_pw = cfg.password_for(target_email);
     let cfg_user = cfg.webmail_user_for(target_email);
-    let basic_auth = cfg_user.as_deref().zip(cfg_pw.as_deref());
+    let basic_auth = cfg_user
+        .as_deref()
+        .zip(cfg_pw.as_deref())
+        .filter(|(u, p)| !u.is_empty() && !p.is_empty());
     if is_loopback_http_url(trimmed) {
         fetch_loopback_http_body(trimmed, cfg.bearer_token.as_deref(), basic_auth)
     } else if strip_ascii_prefix_ci(trimmed, "https://").is_some()
@@ -4514,11 +4720,15 @@ fn fetch_http_url_body(
 
 fn candidate_http_detail_urls(list_url: &str, msg_id: &str) -> Vec<String> {
     let msg_id_trimmed = msg_id.trim();
-    if msg_id_trimmed.is_empty() {
+    let msg_id_decoded = percent_decode(msg_id_trimmed);
+    if msg_id_trimmed.is_empty()
+        || matches!(msg_id_trimmed, "." | "..")
+        || matches!(msg_id_decoded.trim(), "." | "..")
+    {
         return Vec::new();
     }
     let base = list_url
-        .split('?')
+        .split(['?', '#'])
         .next()
         .unwrap_or(list_url)
         .trim_end_matches('/');
@@ -4735,6 +4945,28 @@ fn split_mbox_messages(raw: &str) -> Vec<&str> {
     msgs
 }
 
+/// A Maildir message's unique name, without its info (`:2,FLAGS`): `;` delimits the info
+/// where `:` cannot be in a file name (Windows, and mbsync's `InfoDelimiter` there).
+fn maildir_base(name: &str) -> &str {
+    [":2,", ";2,"]
+        .iter()
+        .filter_map(|info| name.find(info))
+        .min()
+        .map_or(name, |at| &name[..at])
+}
+
+/// Maildir bookkeeping stays in its root, using the message name before its info so a move from
+/// `new/` to `cur/` retains it. A single-file or flat mailbox keeps its adjacent marker.
+fn clicked_marker_for(mailbox_dir: &Path, path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?.to_string_lossy();
+    let parent = path.parent().unwrap_or(mailbox_dir);
+    if mailbox_dir.is_file() || parent == mailbox_dir {
+        return Some(parent.join(format!("{name}.clicked")));
+    }
+    let base_name = maildir_base(&name);
+    Some(mailbox_dir.join(format!("{base_name}.clicked")))
+}
+
 fn scan_maildir_once(
     mailbox_dir: &Path,
     target_email: Option<&str>,
@@ -4786,7 +5018,7 @@ fn scan_maildir_once(
                 return None;
             }
             let is_mbox_ext = name_str.to_ascii_lowercase().ends_with(".mbox");
-            let base_name = name_str.split(":2,").next().unwrap_or(&name_str);
+            let base_name = maildir_base(&name_str);
             let clicked_marker = dir.join(format!("{name_str}.clicked"));
             let base_marker = mailbox_dir.join(format!("{base_name}.clicked"));
             if !is_mbox_ext && (clicked_marker.exists() || base_marker.exists()) {
@@ -4868,7 +5100,7 @@ fn scan_maildir_once(
             );
             if exhausted {
                 tried.insert((path.clone(), len, mtime));
-                if mark_clicked && let Some(name) = path.file_name() {
+                if mark_clicked && let Some(marker) = clicked_marker_for(mailbox_dir, &path) {
                     let write_marker = |target: &Path| {
                         let mut open = std::fs::OpenOptions::new();
                         open.write(true).create(true).truncate(true);
@@ -4881,15 +5113,7 @@ fn scan_maildir_once(
                             let _ = f.write_all(b"1\n");
                         }
                     };
-                    let name_str = name.to_string_lossy();
-                    let parent = path.parent().unwrap_or(mailbox_dir);
-                    let marker = parent.join(format!("{name_str}.clicked"));
                     write_marker(&marker);
-                    if !mailbox_dir.is_file() && parent != mailbox_dir {
-                        let base_name = name_str.split(":2,").next().unwrap_or(&name_str);
-                        let root_marker = mailbox_dir.join(format!("{base_name}.clicked"));
-                        write_marker(&root_marker);
-                    }
                 }
             }
             return Some(found);
@@ -5605,14 +5829,14 @@ fn parse_otpauth_uri(input: &str) -> Option<OtpAuthParams> {
                 secret = percent_decode(v.trim());
             }
             "period" => {
-                if let Ok(p) = v.trim().parse::<u64>()
+                if let Some(p) = crate::parse_uint::<u64>(v.trim())
                     && p > 0
                 {
                     period = p;
                 }
             }
             "digits" => {
-                if let Ok(d) = v.trim().parse::<u32>()
+                if let Some(d) = crate::parse_uint::<u32>(v.trim())
                     && (6..=8).contains(&d)
                 {
                     digits = d;
@@ -7008,7 +7232,7 @@ fn loopback_port(url: &str) -> Option<u16> {
         .strip_prefix("http://127.0.0.1:")
         .or_else(|| url.strip_prefix("http://localhost:"))?;
     let port_str = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-    port_str.parse::<u16>().ok().filter(|p| *p > 0)
+    crate::parse_uint::<u16>(port_str).filter(|p| *p > 0)
 }
 
 impl FlowBound {
@@ -7478,11 +7702,12 @@ const BOT_CHECK_JS: &str = bot_check_helpers_js!();
 /// challenge's token) or fragment.
 fn url_place(url: &str) -> String {
     let url = url.split(['?', '#']).next().unwrap_or("");
-    let place = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
+    let place = strip_ascii_prefix_ci(url, "https://")
+        .or_else(|| strip_ascii_prefix_ci(url, "http://"))
         .unwrap_or(url);
-    format!("`{}`", super::one_line(place, 80))
+    let (authority, path) = authority_and_tail(place);
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    format!("`{}`", super::one_line(&format!("{host}{path}"), 80))
 }
 
 /// The reason a sign-in ends on Cloudflare's bot check ([`bot_check`]) at `url`, `held` after
@@ -7576,8 +7801,10 @@ fn page_step(page: &Page, gate: &Gate<'_>) -> Step {
         if gate.completion == Completion::Device {
             return Step::Refuse("a device sign-in's page went to a local callback".to_owned());
         }
-        let wanted = gate.bound.and_then(|b| b.callback_port);
-        if wanted.is_some_and(|w| w != port) {
+        if gate
+            .bound
+            .is_some_and(|b| b.redirect_uri.is_some() && b.callback_port != Some(port))
+        {
             return Step::Refuse(
                 "the page went to a local port other than the sign-in's callback".to_owned(),
             );
@@ -8356,6 +8583,35 @@ pub struct VendorApprover {
 }
 
 impl VendorApprover {
+    /// Use one already-authorized mailbox without discovering or merging any
+    /// ambient credential source. The caller owns its authorization checks.
+    #[must_use]
+    pub fn with_mailbox(
+        cli: super::accounts::Cli,
+        label: &str,
+        shared_dir: &Path,
+        home: &Path,
+        mut mailbox: MailboxConfig,
+    ) -> Self {
+        let senders = cli.accounts().mail_senders;
+        mailbox.senders = senders.iter().map(|sender| (*sender).to_owned()).collect();
+        Self {
+            shared_dir: shared_dir.to_owned(),
+            label_key: vendor_label_key(cli, label),
+            sign_in_once: None,
+            mailbox: Some(mailbox),
+            mailbox_unready: None,
+            mailbox_unready_login: None,
+            senders,
+            home: Some(home.to_owned()),
+            types_email: cli
+                .accounts()
+                .signin
+                .as_ref()
+                .is_some_and(|signin| signin.types_email),
+        }
+    }
+
     /// The approver for `label` (of `cli`'s pool) with `email`, under `shared_dir`.
     #[must_use]
     pub fn new(
@@ -8555,10 +8811,15 @@ mod uri_authority_tests {
             ("http://remote.example?to=owner@127.0.0.1:1777", false),
             ("http://remote.example#owner@localhost:1777", false),
             ("http://remote.example/path@127.0.0.1:1777", false),
+            ("http://remote.example\\@127.0.0.1:1777", false),
+            ("http://127.0.0.1:1777\\path", false),
+            ("http://::1:1777", false),
             ("https://localhost:1777", false),
         ] {
             assert_eq!(super::is_loopback_http_url(url), selected, "{url}");
         }
+        assert!(super::cleartext_refusal("http://remote.example\\@127.0.0.1:1777/").is_some());
+        assert!(super::cleartext_refusal("imap://remote.example\\@127.0.0.1/INBOX").is_some());
 
         for (url, authority, userinfo, target) in [
             ("http://localhost:1777", "localhost:1777", None, "/"),
@@ -8593,45 +8854,35 @@ mod uri_authority_tests {
             assert_eq!(parsed.port, 1777, "{url}");
             assert_eq!(parsed.target, target, "{url}");
         }
-    }
-}
-
-#[cfg(test)]
-mod credential_debug_tests {
-    use super::{MailboxConfig, MailboxCredential};
-
-    #[test]
-    fn mailbox_credential_debug_hides_codes_and_magic_links() {
-        for credential in [
-            MailboxCredential::Otp("674291".into()),
-            MailboxCredential::MagicLink("https://example.invalid/synthetic-private-link".into()),
-        ] {
-            for output in [format!("{credential:?}"), format!("{credential:#?}")] {
-                assert!(!output.contains("674291"));
-                assert!(!output.contains("synthetic-private-link"));
-                assert!(output.contains("<redacted>"));
-            }
-        }
-    }
-
-    #[test]
-    fn mailbox_debug_does_not_disclose_credentials_or_identity() {
-        let marker = "synthetic-private-mailbox-value";
-        let config = MailboxConfig {
-            bearer_token: Some(marker.into()),
-            password: Some(marker.into()),
-            mailbox_password: Some(marker.into()),
-            totp_secret: Some(marker.into()),
-            user: Some(marker.into()),
-            http_url: Some(marker.into()),
-            passwords: [(marker.into(), marker.into())].into(),
-            mailbox_passwords: [(marker.into(), marker.into())].into(),
-            totp_secrets: [(marker.into(), marker.into())].into(),
-            ..MailboxConfig::default()
-        };
-        for output in [format!("{config:?}"), format!("{config:#?}")] {
-            assert!(!output.contains(marker));
-            assert!(output.contains("MailboxConfig"));
+        assert!(
+            super::candidate_http_detail_urls("http://127.0.0.1:8025/api/v1/messages", ".")
+                .is_empty()
+        );
+        assert!(
+            super::candidate_http_detail_urls("http://127.0.0.1:8025/api/v1/messages", "..")
+                .is_empty()
+        );
+        assert!(
+            super::candidate_http_detail_urls("http://127.0.0.1:8025/api/v1/messages", "%2e%2e")
+                .is_empty()
+        );
+        let plain =
+            super::candidate_http_detail_urls("http://127.0.0.1:8025/api/v1/messages", "msg-42");
+        assert_eq!(
+            plain,
+            vec![
+                "http://127.0.0.1:8025/api/v1/message/msg-42".to_owned(),
+                "http://127.0.0.1:8025/api/v1/messages/msg-42".to_owned(),
+            ]
+        );
+        for suffix in ["#inbox", "?unread=1", "?unread=1#inbox"] {
+            assert_eq!(
+                super::candidate_http_detail_urls(
+                    &format!("http://127.0.0.1:8025/api/v1/messages{suffix}"),
+                    "msg-42",
+                ),
+                plain,
+            );
         }
     }
 }

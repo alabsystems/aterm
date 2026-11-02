@@ -171,6 +171,7 @@ fn handshake_in(trailer: &str) -> Handshake {
     match trailer
         .split_whitespace()
         .last()
+        .filter(|t| !t.starts_with('+'))
         .and_then(|t| t.parse::<f64>().ok())
     {
         Some(secs) if secs > 0.0 => Handshake::Done,
@@ -387,7 +388,10 @@ fn head_attempt(url: &str, args: &[&str], attempt: u32, attempts: u32) -> FirstH
         };
     }
     let code = trailer.split_whitespace().next().unwrap_or("");
-    let Ok(numeric) = code.parse::<u16>() else {
+    let Some(numeric) = (!code.is_empty() && code.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| code.parse::<u16>().ok())
+        .flatten()
+    else {
         return FirstHead::Settled(Err(HttpError::Malformed(format!(
             "the release host answered HTTP {code} to HEAD {url}"
         ))));
@@ -1076,9 +1080,12 @@ fn content_length_header(headers: &str) -> Option<u64> {
 fn vendor_trailer(stdout: &str) -> Option<(u16, String)> {
     let (code, rest) = stdout.trim().split_once(' ')?;
     let url = match rest.rsplit_once(' ') {
-        Some((url, secs)) if secs.parse::<f64>().is_ok() => url,
+        Some((url, secs)) if !secs.starts_with('+') && secs.parse::<f64>().is_ok() => url,
         _ => rest,
     };
+    if code.is_empty() || !code.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
     let code = code.parse::<u16>().ok()?;
     if !url.starts_with("https://") || url.bytes().any(|b| b <= b' ' || b == 0x7f) {
         return None;
@@ -1184,7 +1191,10 @@ fn vendor_head_step(run: &CurlRun<'_>, last: bool, url: &str) -> Step<Option<u64
     if !last && transient_status(code) {
         return Step::Retry;
     }
-    let Ok(code) = code.parse::<u16>() else {
+    let Some(code) = (!code.is_empty() && code.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| code.parse::<u16>().ok())
+        .flatten()
+    else {
         return Step::Done(Err(HttpError::Malformed(format!(
             "the vendor host answered HTTP {code} to HEAD {url}"
         ))));
@@ -1237,14 +1247,17 @@ fn vendor_range_step(run: &CurlRun<'_>, last: bool, url: &str) -> Step<u64> {
     if !last && transient_status(code) {
         return Step::Retry;
     }
-    match code.parse::<u16>() {
-        Ok(206) => Step::Done(content_range_total(headers).ok_or_else(no_size)),
-        Ok(200) => Step::Done(Err(no_size())),
-        Ok(code) => Step::Done(Err(HttpError::VendorStatus {
+    match (!code.is_empty() && code.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| code.parse::<u16>().ok())
+        .flatten()
+    {
+        Some(206) => Step::Done(content_range_total(headers).ok_or_else(no_size)),
+        Some(200) => Step::Done(Err(no_size())),
+        Some(code) => Step::Done(Err(HttpError::VendorStatus {
             code,
             url: url.to_string(),
         })),
-        Err(_) => Step::Done(Err(HttpError::Malformed(format!(
+        None => Step::Done(Err(HttpError::Malformed(format!(
             "the vendor host answered HTTP {code} to a ranged GET of {url}"
         )))),
     }

@@ -295,6 +295,9 @@ fn path_of_open(_file: &std::fs::File) -> Option<PathBuf> {
 
 fn new_file_hunk(root: &Path, rel: &str) -> Option<String> {
     use std::io::Read as _;
+    if rel.is_empty() || rel.contains(['\n', '\r', '\0']) {
+        return None;
+    }
     let path = root.join(rel);
     let mut open = std::fs::OpenOptions::new();
     open.read(true);
@@ -321,6 +324,9 @@ fn new_file_hunk(root: &Path, rel: &str) -> Option<String> {
     file.take(UNTRACKED_FILE_MAX + 1)
         .read_to_end(&mut bytes)
         .ok()?;
+    if bytes.len() as u64 > UNTRACKED_FILE_MAX {
+        return None;
+    }
     let text = String::from_utf8(bytes).ok()?;
     if text.contains('\0') {
         return None;

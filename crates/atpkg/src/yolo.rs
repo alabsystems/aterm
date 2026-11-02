@@ -113,12 +113,16 @@ pub(crate) struct WordOptions {
     pub(crate) own_yolo: &'static [&'static str],
 }
 
+/// The CLI a managed name's vendor alias runs.
+pub(crate) fn cli_name(program: &str) -> &str {
+    crate::vendor_direct::spec(program)
+        .and_then(|row| row.aliases.iter().find(|(name, _)| *name == program))
+        .map_or(program, |(_, target)| *target)
+}
+
 /// Leading options whose arity this word scan knows.
 pub(crate) fn word_options(program: &str) -> WordOptions {
-    let cli = crate::vendor_direct::spec(program)
-        .and_then(|row| row.aliases.iter().find(|(name, _)| *name == program))
-        .map_or(program, |(_, target)| *target);
-    match cli {
+    match cli_name(program) {
         "codex" => WordOptions {
             values: &[
                 "--model",
@@ -127,6 +131,10 @@ pub(crate) fn word_options(program: &str) -> WordOptions {
                 "-C",
                 "--add-dir",
                 "--local-provider",
+                "--config",
+                "-c",
+                "--profile",
+                "-p",
             ],
             switches: &[
                 "--oss",
@@ -292,12 +300,41 @@ pub enum Launch {
     Default(Vec<String>),
 }
 
+fn config_decides_posture(program: &str, head: &[String]) -> bool {
+    if cli_name(program) != "codex" {
+        return false;
+    }
+    let mut next = false;
+    for arg in head {
+        let value = if next {
+            next = false;
+            arg.as_str()
+        } else if matches!(arg.as_str(), "-c" | "--config") {
+            next = true;
+            continue;
+        } else if let Some(value) = arg.strip_prefix("--config=") {
+            value
+        } else if let Some(value) = arg.strip_prefix("-c").filter(|value| !value.is_empty()) {
+            value.strip_prefix('=').unwrap_or(value)
+        } else {
+            continue;
+        };
+        if value
+            .split_once('=')
+            .is_some_and(|(key, _)| matches!(key.trim(), "sandbox_mode" | "approval_policy"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Decide `program args…`, reading the words ahead of a literal `--`. A program with no policy
 /// runs as typed, and so does an unknown leading option (with a typed `--yolo` too, when the
 /// policy has `after` words) or a removal that would join a bare word to an optional value
 /// ([`Stop::Joins`]). Else a typed `--yolo` becomes the policy's flags, dropping the program's
 /// own spellings of that posture ahead of the first word ([`Launch::Flag`]); else a marker, a
-/// `skip` word or a self-update verb runs as typed; else the flags go in front, or behind an
+/// Codex permission config assignment, `skip` word or self-update verb runs as typed; else the flags go in front, or behind an
 /// `after` word ([`Launch::Default`]).
 #[must_use]
 pub fn decide(program: &str, args: &[String]) -> Launch {
@@ -359,6 +396,7 @@ pub fn decide(program: &str, args: &[String]) -> Launch {
     if head
         .iter()
         .any(|a| policy.markers.iter().any(|m| marker_matches(m, a)))
+        || config_decides_posture(program, head)
     {
         return Launch::AsTyped;
     }
@@ -658,6 +696,63 @@ mod tests {
         assert_eq!(word_options("codex-older"), WordOptions::default());
     }
 
+    #[test]
+    fn codex_permission_configs_keep_the_typed_posture() {
+        for program in ["codex", "codex-old"] {
+            for args in [
+                argv(&["-c", "sandbox_mode=\"read-only\""]),
+                argv(&["--config", "approval_policy=\"on-request\""]),
+                argv(&["--config=sandbox_mode=\"workspace-write\""]),
+                argv(&["-csandbox_mode=\"read-only\""]),
+                argv(&["-c=approval_policy=\"never\""]),
+                argv(&["-c", " \tapproval_policy \t=\"on-request\""]),
+                argv(&[
+                    "resume",
+                    "thread-id",
+                    "--config",
+                    "sandbox_mode=\"read-only\"",
+                ]),
+                argv(&[
+                    "--model",
+                    "opus",
+                    "-c",
+                    "approval_policy=\"never\"",
+                    "fork",
+                    "thread-id",
+                ]),
+                argv(&[
+                    "-c",
+                    "model=opus",
+                    "--config=approval_policy=\"on-request\"",
+                ]),
+            ] {
+                assert_eq!(
+                    decide(program, &args),
+                    Launch::AsTyped,
+                    "{program} {args:?}"
+                );
+                let mut explicit = argv(&["--yolo"]);
+                explicit.extend(args.iter().cloned());
+                let mut expected = argv(&["--dangerously-bypass-approvals-and-sandbox"]);
+                expected.extend(args);
+                assert_eq!(decide(program, &explicit), Launch::Flag(expected));
+            }
+            for args in [
+                argv(&["-c", "model=opus", "resume", "thread-id"]),
+                argv(&[
+                    "--config=model=\"sandbox_mode=read-only\"",
+                    "fork",
+                    "thread-id",
+                ]),
+                argv(&["--", "--config=sandbox_mode=read-only"]),
+            ] {
+                let mut expected = argv(&["--dangerously-bypass-approvals-and-sandbox"]);
+                expected.extend(args.iter().cloned());
+                assert_eq!(decide(program, &args), Launch::Default(expected));
+            }
+        }
+    }
+
     /// By default: injected at the front (behind muse's session words), and
     /// never over a decided posture, a skipped word, or past `--`-only noise.
     #[test]
@@ -715,36 +810,12 @@ mod tests {
             ("claude", argv(&["--settings", "team.json"])),
             ("claude", argv(&["--resume", "session-id"])),
             ("codex", argv(&["-s", "read-only"])),
+            ("codex", argv(&["resume", "--not-so-yolo", "thread-id"])),
             ("codex", argv(&["-sread-only"])),
             ("codex", argv(&["-s=workspace-write", "exec", "x"])),
             ("codex", argv(&["--sandbox=workspace-write", "exec", "x"])),
             ("codex", argv(&["-a", "on-request"])),
             ("codex", argv(&["-a=never"])),
-            ("codex", argv(&["-c", "sandbox_mode=\"read-only\""])),
-            ("codex", argv(&["--config=approval_policy=\"never\""])),
-            ("codex", argv(&["--profile", "review"])),
-            ("codex", argv(&["resume", "thread-id"])),
-            ("codex", argv(&["fork", "thread-id"])),
-            ("codex", argv(&["--model", "opus", "resume", "thread-id"])),
-            ("codex", argv(&["--model=opus", "resume", "thread-id"])),
-            ("codex", argv(&["-m", "opus", "fork", "thread-id"])),
-            ("codex", argv(&["-mopus", "fork", "thread-id"])),
-            ("codex", argv(&["-m=opus", "resume", "thread-id"])),
-            ("codex", argv(&["--cd", "/owned/path", "fork", "thread-id"])),
-            ("codex", argv(&["--cd=/owned/path", "resume", "thread-id"])),
-            ("codex", argv(&["-C", "/owned/path", "resume", "thread-id"])),
-            ("codex", argv(&["-C/owned/path", "fork", "thread-id"])),
-            (
-                "codex",
-                argv(&[
-                    "--model",
-                    "opus",
-                    "--cd",
-                    "/owned/path",
-                    "resume",
-                    "thread-id",
-                ]),
-            ),
             (
                 "codex",
                 argv(&["--new-option", "value", "resume", "thread-id"]),
@@ -782,6 +853,35 @@ mod tests {
                 Launch::AsTyped,
                 "{program} {args:?}"
             );
+        }
+        for (_, args) in [
+            ("codex", argv(&["--profile", "review"])),
+            ("codex", argv(&["resume", "thread-id"])),
+            ("codex", argv(&["fork", "thread-id"])),
+            ("codex", argv(&["--model", "opus", "resume", "thread-id"])),
+            ("codex", argv(&["--model=opus", "resume", "thread-id"])),
+            ("codex", argv(&["-m", "opus", "fork", "thread-id"])),
+            ("codex", argv(&["-mopus", "fork", "thread-id"])),
+            ("codex", argv(&["-m=opus", "resume", "thread-id"])),
+            ("codex", argv(&["--cd", "/owned/path", "fork", "thread-id"])),
+            ("codex", argv(&["--cd=/owned/path", "resume", "thread-id"])),
+            ("codex", argv(&["-C", "/owned/path", "resume", "thread-id"])),
+            ("codex", argv(&["-C/owned/path", "fork", "thread-id"])),
+            (
+                "codex",
+                argv(&[
+                    "--model",
+                    "opus",
+                    "--cd",
+                    "/owned/path",
+                    "resume",
+                    "thread-id",
+                ]),
+            ),
+        ] {
+            let mut expected = argv(&["--dangerously-bypass-approvals-and-sandbox"]);
+            expected.extend(args.iter().cloned());
+            assert_eq!(decide("codex", &args), Launch::Default(expected));
         }
         for args in [
             argv(&["--model", "resume", "fix this"]),

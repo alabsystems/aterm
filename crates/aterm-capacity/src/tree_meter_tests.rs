@@ -225,7 +225,19 @@ fn a_killed_roots_tree_leaves_what_it_started_and_not_its_sibling() {
         .expect("hang detector: the root never started its child")
         .expect("the root said its child's pid");
     let meter = TreeMeter::start(root.id());
-    meter.read();
+    // A read is a sample: the root says its child's pid as soon as it forked, and a read made
+    // then may not list the child yet (under load the meter missed it in every read before the
+    // kill, and a member first seen once its root is gone is never the tree's). The kill waits
+    // until a read has booked the child inside, as the meter's own reads would.
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "a read that books the root's child inside its tree",
+        || {
+            meter.read();
+            meter.left().contains(&started).then_some(())
+        },
+    );
+    let child_stdin = root.stdin.take().expect("the left child's stdin");
     root.kill().expect("the root killed");
     root.wait().expect("the root reaped");
     assert_eq!(
@@ -233,7 +245,7 @@ fn a_killed_roots_tree_leaves_what_it_started_and_not_its_sibling() {
         [started],
         "the root's child, and not its sibling"
     );
-    drop(root.stdin.take());
+    drop(child_stdin);
     aterm_spec::wait::until_within(
         aterm_spec::wait::MUST_HAPPEN,
         "the left child's end",
@@ -241,4 +253,132 @@ fn a_killed_roots_tree_leaves_what_it_started_and_not_its_sibling() {
     );
     drop(sibling.0.stdin.take());
     assert!(sibling.0.wait().expect("the sibling's end").success());
+}
+
+/// A ROOT'S SURVIVORS are the live members that descended from it at the last read made while it
+/// lived, the same process by its start: a compiler its killed root left. NEGATIVE CONTROL: a
+/// daemon an earlier read saw inside that forked away while the root lived, a member booked
+/// outside, and a child born since are none (each but the outside one is what [`Tally::left`]
+/// leaves); and a read made once the root is gone, which finds nothing descending, changes none.
+#[test]
+fn a_roots_survivors_descended_from_it_at_the_last_read_it_lived_for() {
+    let mut tally = Tally::default();
+    let read = [
+        member(1, 10, 10),
+        member(2, 10, 10),
+        member(3, 10, 10),
+        member(9, 10, 10),
+    ];
+    tally.book(&read, &mut |pid| pid != 9);
+    tally.mark_within(&read, &mut |pid| pid != 9, &mut || true);
+    tally.mark_within(&read, &mut |pid| pid == 1 || pid == 2, &mut || true);
+    tally.mark_within(&read, &mut |_| false, &mut || false);
+    let now = [
+        alive(2, 7, 1),
+        alive(3, 7, 1),
+        alive(9, 7, 1),
+        alive(4, 7, 2),
+    ];
+    assert_eq!(tally.survivors(&now), [2], "the compiler alone");
+    let using: Vec<(Alive, u64)> = now.iter().map(|a| (*a, u64::from(a.pid) * MIB)).collect();
+    assert_eq!(
+        tally.survivors_using(&using),
+        (vec![2], 2 * MIB),
+        "its footprint alone"
+    );
+    let mut left = tally.left(&now);
+    left.sort_unstable();
+    assert_eq!(left, [2, 3, 4], "what the tree leaves is wider");
+    assert!(Tally::default().survivors(&now).is_empty(), "nothing read");
+}
+
+/// Set, the test binary is [`standin_touches_when_told`]: the MiB it touches once told.
+#[cfg(target_os = "macos")]
+const TOLD: &str = "ATERM_CAPACITY_METER_TOLD";
+
+/// The stand-in that touches the MiB `TOLD` names only once a line comes on stdin, says so
+/// ([`TOUCHED`]), and holds them until stdin ends. Run alone, it does nothing.
+#[cfg(target_os = "macos")]
+#[test]
+fn standin_touches_when_told() {
+    use std::io::{BufRead as _, Read as _, Write as _};
+    let Some(mib) = std::env::var(TOLD)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    else {
+        return;
+    };
+    let mut stdin = std::io::stdin().lock();
+    let mut line = String::new();
+    let _ = stdin.read_line(&mut line);
+    let held = vec![1u8; mib << 20];
+    println!("{TOUCHED}");
+    let _ = std::io::stdout().flush();
+    let mut rest = Vec::new();
+    let _ = stdin.read_to_end(&mut rest);
+    assert_eq!(held.len(), mib << 20);
+}
+
+/// On macOS a meter goes on reading its tree's group once its root is gone: a killed root's
+/// survivor (the compiler a killed `cargo` leaves) is named, and the 256 MiB it touches after the
+/// root's end are read. NEGATIVE CONTROL (by hand: `members_of` reading the root's group anew at
+/// each read, as before): the read after the root's end finds nothing, and the peak stays below
+/// what the survivor touched.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_meter_reads_what_survives_its_root() {
+    use std::io::{BufRead as _, Write as _};
+    let exe = std::env::current_exe().expect("test binary");
+    let mut root = aterm_uds::spawnfd::command("/bin/sh")
+        .args([
+            "-c",
+            "exec 3<&0; \"$0\" --exact tree_meter::tests::standin_touches_when_told \
+             --test-threads=1 --nocapture <&3 & echo \"LEFT $!\"; wait",
+        ])
+        .arg(&exe)
+        .env(TOLD, "256")
+        .process_group(0)
+        .stdin(aterm_uds::spawnfd::Stdio::piped())
+        .stdout(aterm_uds::spawnfd::Stdio::piped())
+        .stderr(aterm_uds::spawnfd::Stdio::null())
+        .spawn()
+        .expect("the root");
+    let out = root.stdout.take().expect("its stdout");
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(out).lines() {
+            let Ok(line) = line else { return };
+            let said = match line.strip_prefix("LEFT ") {
+                Some(pid) => pid.trim().parse::<u32>().ok(),
+                None => line.ends_with(TOUCHED).then_some(0),
+            };
+            if let Some(said) = said {
+                let _ = tx.send(said);
+            }
+        }
+    });
+    let next = || {
+        rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("hang detector: the root or its survivor fell silent")
+    };
+    let survivor = next();
+    let meter = TreeMeter::start(root.id());
+    meter.read();
+    assert!(meter.peak() < 64 * MIB, "read {} MiB", meter.peak() / MIB);
+    let mut tell = root.stdin.take().expect("the survivor's stdin");
+    root.kill().expect("the root killed");
+    root.wait().expect("the root reaped");
+    assert_eq!(meter.survivors(), [survivor], "its survivor");
+    tell.write_all(b"touch\n").expect("told");
+    assert_eq!(next(), 0, "it touched its memory");
+    meter.read();
+    assert!(
+        meter.peak() >= 256 * MIB,
+        "a read after the root's end: {} MiB",
+        meter.peak() / MIB
+    );
+    drop(tell);
+    aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "the survivor's end", || {
+        meter.survivors().is_empty().then_some(())
+    });
 }

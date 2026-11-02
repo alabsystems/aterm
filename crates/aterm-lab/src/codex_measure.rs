@@ -25,13 +25,19 @@
 //!    PROOF-RED on any FAIL ([`gate`]);
 //! 4. each leg's one rollout (ROLLOUTS), every `session_meta` naming the key (KEY), reduced twice
 //!    and a third pass byte-identical ([`crate::measure::fixed_point`], FIXED-POINT), its own
-//!    line naming the key (KEY) ([`reduce_leg`]);
-//! 5. the keys and record kinds against every committed codex-alab reduction (NEW-KEY) and the
-//!    rollout keys the previous build's same leg showed (GONE) ([`judge`]); other drift is noted;
+//!    line naming the key (KEY) ([`reduce_leg`]), and its first pass held to the privacy oracle
+//!    against the rollout itself (TEXT, [`text_kept`]), run 2's legs' too;
+//! 5. the keys and record kinds against every committed codex-alab reduction and the rollout
+//!    keys the previous build's same leg showed ([`judge`], by the judge's rule in
+//!    [`crate::measure`]): a new key the fold reads refuses (NEW-KEY), a lost one refuses (GONE),
+//!    any other new key or record kind waits on run 2, since no rollout row kind is inert
+//!    ([`no_kind_is_inert`]); other drift is noted;
 //! 6. the six reductions written create-new, each path said as it is made;
 //! 7. the standing tests ([`STANDING`]), the crates named (STANDING,
 //!    [`crate::measure::standing_verdict`]);
-//! 8. aterm rebuilt and run 2 expecting `bound` (NOT-BOUND);
+//! 8. aterm rebuilt and run 2 expecting `bound` (NOT-BOUND); then each key step 5 left to it is
+//!    admitted by the row of run 2's same leg that carries it, or refused as one no run exercised
+//!    (NEW-KEY) ([`admitted_by`]);
 //! 9. the note, `docs/measured/codex-alab-proof-<count>-<date>.md`, only when all passed;
 //! 10. both worlds removed (kept and named on a refusal, or with `--keep`).
 //!
@@ -53,12 +59,12 @@ use aterm_phase::anchors::{ROLLOUT_KEYS, rollout_reduction_stem};
 use crate::codex_alab_proof::{self, Run};
 use crate::instance::{take_flag, take_value};
 use crate::measure::{
-    Class, Family, Judged, MEASURED, Reduction, Refusal, STEPS, build_aterm, committed_in, gate,
-    hold_clean, judge, landed, not_run, order_of, reduce_checked, reduce_leg, rows, sha256,
-    standing, standing_line, today, undo_on_hard_exit, with_world, word,
+    Class, Family, Judged, MEASURED, Reduction, Refusal, STEPS, build_aterm, committed_in,
+    exercised, gate, hold_clean, judge, landed, not_run, order_of, reduce_checked, reduce_leg,
+    row_steps, rows, sha256, standing, standing_line, today, undo_on_hard_exit, with_world, word,
 };
 use crate::paths::paths;
-use crate::reduce::Program;
+use crate::reduce::{Program, oracle};
 use crate::{Fail, LAB, Res};
 
 /// What `codex-measure` reads and holds where the measurements differ ([`crate::measure`]).
@@ -67,6 +73,7 @@ pub(crate) const CODEX: Family = Family {
     verb: "codex-measure",
     source: "rollout",
     read: ROLLOUT_KEYS,
+    inert: no_kind_is_inert,
     holds: is_reduction,
     measures: is_alab,
     kind: record_kind,
@@ -76,6 +83,13 @@ pub(crate) const CODEX: Family = Family {
     filters: &FILTERS,
     standing: &STANDING,
 };
+
+/// No rollout record kind is inert: while the Codex step fold reads a fork's copy
+/// (`CodexStepFold::past_copy`) it reads every row's `type` and stamp, whatever its kind, so a row
+/// of any kind can move where the copy ends. Every new rollout key is held to run 2.
+fn no_kind_is_inert(_: &str) -> bool {
+    false
+}
 
 /// A rollout row's record kind: `<type>/<payload.type>`.
 fn record_kind(v: &Value) -> String {
@@ -296,7 +310,9 @@ struct Leg {
     from: PathBuf,
 }
 
-/// STEP 4 over run 1's world `world`: each of [`LEGS`]' one rollout, reduced ([`reduce_leg`]).
+/// STEP 4 over a run's world `world` (run 1's, and run 2's for [`admitted_by`]): each of
+/// [`LEGS`]' one rollout, reduced ([`reduce_leg`]) and held to the privacy oracle every committed
+/// reduction is held to ([`text_kept`]).
 fn reduce_legs(world: &Path, build: &str) -> Result<Vec<Leg>, Refusal> {
     let mut out = Vec::new();
     for leg in LEGS {
@@ -306,8 +322,11 @@ fn reduce_legs(world: &Path, build: &str) -> Result<Vec<Leg>, Refusal> {
             Refusal::new(Class::Rollouts, format!("{leg}: {}: {e}", from.display()))
         })?;
         let text = reduce_leg(&CODEX, leg, &source, build, &reduce_checked(Program::Codex))?;
+        let first = crate::reduce::reduce(&source, Program::Codex)
+            .map_err(|e| Refusal::new(Class::FixedPoint, format!("{leg}: pass 1: {e}")))?;
+        text_kept(leg, &source, &first)?;
         println!(
-            "codex-measure: 4. {leg}: one rollout ({} bytes), cli_version {build}, a fixed point ({} bytes; pass 3 = pass 2)",
+            "codex-measure: 4. {leg}: one rollout ({} bytes), cli_version {build}, a fixed point ({} bytes; pass 3 = pass 2), no text of the rollout kept",
             source.len(),
             text.len()
         );
@@ -318,6 +337,51 @@ fn reduce_legs(world: &Path, build: &str) -> Result<Vec<Leg>, Refusal> {
         });
     }
     Ok(out)
+}
+
+/// STEP 4's privacy check of `first`, the reducer's first pass over the rollout `source` of
+/// `leg`: the privacy oracle every committed reduction is held to ([`oracle::check_no_text`],
+/// ruling T7), here against the rollout itself, whose rows the first pass holds one to one. A
+/// fixed point keeps only what its first pass kept, so the reduction committed keeps no more.
+/// # Errors
+/// TEXT: the first pass keeps text of the rollout.
+pub(crate) fn text_kept(
+    leg: &str,
+    source: &str,
+    first: &crate::reduce::Reduction,
+) -> Result<(), Refusal> {
+    oracle::check_no_text(leg, source, first, Program::Codex)
+        .map_err(|e| Refusal::new(Class::Text, format!("{leg}: {e}")))
+}
+
+/// Run 2, as a verdict names the run that admitted a key.
+const RUN2: &str = "run 2 (expecting `bound`)";
+
+/// STEP 8's judgment of what step 5 left to run 2 ([`Judged::pending`]): run 2's legs, reduced as
+/// run 1's were ([`reduce_legs`]), and each new key admitted by the row of its leg that carries it
+/// ([`exercised`]): the steps the fold made of that row, and run 2's checks, every one passed.
+/// # Errors
+/// ROLLOUTS, KEY or FIXED-POINT on run 2's rollouts; NEW-KEY: run 2 exercised one not.
+fn admitted_by(build: &str, judged: &Judged, run2: &Run) -> Result<Vec<String>, Refusal> {
+    if judged.pending.is_empty() {
+        return Ok(Vec::new());
+    }
+    let legs = reduce_legs(&run2.world.dir, build)?;
+    let texts: Vec<(&str, String)> = legs.iter().map(|l| (l.name, l.text.clone())).collect();
+    let oks = run2.oks;
+    exercised(
+        &CODEX,
+        build,
+        &judged.pending,
+        RUN2,
+        &texts,
+        &|_, text, row| {
+            format!(
+                "{}; every one of run 2's {oks} checks passed",
+                row_steps(Program::Codex, text, row)
+            )
+        },
+    )
 }
 
 /// The package record's line in the note.
@@ -365,6 +429,7 @@ struct Note<'a> {
     legs: &'a [Leg],
     stem: &'a str,
     judged: &'a Judged,
+    admitted: &'a [String],
     passed: &'a [String],
 }
 
@@ -412,18 +477,29 @@ impl Note<'_> {
         }
         let j = self.judged;
         t.push_str(&format!(
-            "\n**Rollout keys.** The six legs show {} keys and {} record kinds, none that the {} \
-             measured builds' reductions do not show, and no rollout key the fold reads that {}'s \
-             same legs showed is gone.",
+            "\n**Rollout keys.** The six legs show {} keys and {} record kinds. None of them is a \
+             key the fold reads that the {} measured builds' reductions do not show, and no rollout \
+             key the fold reads that {}'s same legs showed is gone.",
             j.keys,
             j.kinds,
             j.builds,
             j.prev.as_deref().unwrap_or("a previous build")
         ));
+        if self.admitted.is_empty() {
+            t.push_str(" Nothing new is on any row.");
+        } else {
+            t.push_str(
+                " What is new, and no key the fold reads, was admitted by run 2, which wrote rows \
+                 carrying it and passed every check expecting the build bound:\n\n",
+            );
+            for a in self.admitted {
+                t.push_str(&format!("* {a}\n"));
+            }
+        }
         if j.noted.is_empty() {
             t.push_str(" No other key, record kind or step shape moved.\n");
         } else {
-            t.push_str(" What moved and does not refuse:\n\n");
+            t.push_str("\nWhat moved and does not refuse (gone, or a step shape):\n\n");
             for n in &j.noted {
                 t.push_str(&format!("* {n}\n"));
             }
@@ -502,11 +578,24 @@ pub fn cmd_codex_measure(args: &[String]) -> Res {
         f
     })?;
     println!(
-        "codex-measure: 5. {} keys and {} record kinds, nothing new against {} measured builds' reductions, no rollout key gone against {}{}",
+        "codex-measure: 5. {} keys and {} record kinds, no key the fold reads new against {} measured builds' reductions, no rollout key gone against {}; {}{}",
         judged.keys,
         judged.kinds,
         judged.builds,
         judged.prev.as_deref().unwrap_or("no previous build"),
+        if judged.pending.is_empty() {
+            "nothing new".to_string()
+        } else {
+            format!(
+                "left to run 2 to exercise: {}",
+                judged
+                    .pending
+                    .iter()
+                    .map(crate::measure::Pending::said)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        },
         if judged.noted.is_empty() {
             "; nothing else moved".to_string()
         } else {
@@ -540,6 +629,11 @@ pub fn cmd_codex_measure(args: &[String]) -> Res {
             .map_err(|f| with_world(f, &world1, None))?;
         println!("codex-measure: 8. {}", run_line(2, "bound", &run2));
         gate(Class::NotBound, &run2).map_err(|f| with_world(f, &world1, None))?;
+        let admitted = admitted_by(&build, &judged, &run2)
+            .map_err(|r| with_world(r.into(), &world1, Some(&run2.world.dir)))?;
+        for a in &admitted {
+            println!("codex-measure: 8. admitted {a}");
+        }
         let note = Note {
             build: &build,
             pkg: &pkg,
@@ -550,6 +644,7 @@ pub fn cmd_codex_measure(args: &[String]) -> Res {
             legs: &legs,
             stem: &stem,
             judged: &judged,
+            admitted: &admitted,
             passed: &passed,
         };
         w.create(&note_path, note.text().as_bytes())

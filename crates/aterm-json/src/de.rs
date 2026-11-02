@@ -615,10 +615,14 @@ impl<'de> de::Deserializer<'de> for &mut Deserializer<'de> {
             b'{' => {
                 self.enter()?;
                 self.bump();
-                let out = visitor.visit_enum(EnumAccess { de: self })?;
-                self.expect(b'}', "`}` after the enum variant")?;
+                let out = match visitor.visit_enum(EnumAccess { de: self }) {
+                    Ok(value) => self
+                        .expect(b'}', "`}` after the enum variant")
+                        .map(|()| value),
+                    Err(error) => Err(error),
+                };
                 self.leave();
-                Ok(out)
+                out
             }
             _ => Err(self.err("expected a string or an object for an enum")),
         }

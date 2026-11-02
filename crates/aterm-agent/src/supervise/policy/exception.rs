@@ -17,8 +17,7 @@ use super::turn_end::{
     TurnEndReading, TurnEndState, Unmade, bucket_model, decide_turn_end, decide_turn_end_traced,
     login_wall_moves, login_wall_waits, renewed_draft_holds, sign_in_how, waited_login,
 };
-use crate::harness::acts::{HeldBy, HoldLeg};
-use crate::harness::repo_work::RepoWork;
+use crate::harness::acts::HeldBy;
 
 /// Whether the person is needed now or only when they next look.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,19 +37,8 @@ impl Urgency {
     }
 }
 
-/// THE LOUD HOLD'S ACTION ([`Exception::repeats_land`]): what restarts the typing. One action, as
-/// a standing ask carries one ([`aterm_messages`]' `Step::fault` refuses an `or`); Off stays the
-/// chip's click.
-pub const REPEATS_LAND_ACTION: &str = "Open the tab and tell it what is still open.";
-
-/// THE LOUD HOLD'S TITLE and its short form ([`Exception::repeats_land`]; the band reads `aterm
-/// stopped typing in window 2, tab 3`, the ask's place after it).
-pub const REPEATS_LAND_TITLE: (&str, &str) = ("aterm stopped typing", "Stopped typing");
-
-/// Why the refusal of the standing go-ahead needs a person ([`Exception::refuses_go_ahead`]).
-const REFUSES_GO_AHEAD: &str = "Its agent refuses the standing go-ahead: it still waits on a \
-                                person to build, test or land its own work, so aterm types \
-                                nothing more.";
+/// The recorded reason for recovering from a refused standing decision.
+const REFUSES_GO_AHEAD: &str = "The agent repeated a request; recovery will change approach.";
 
 /// One exception: the digest's item.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,13 +55,40 @@ pub struct Exception {
     pub escalated: bool,
     /// The owner's four-part notice ([`super::notice`]).
     pub notice: Option<Notice>,
-    /// WHICH ARM OF RULING F'S HOLD stopped the typing (§14.3: [`Self::repeats`],
-    /// [`Self::repeats_land`]); `None` for every other exception.
+    /// The repeated-reply classification, or `None` for another exception.
     pub held: Option<HeldBy>,
-    /// A plain ask's title and its short form where no notice titles it (§14.3:
-    /// [`Self::repeats_land`]'s `aterm stopped typing`); `None` keeps the ask's default.
-    pub title: Option<(&'static str, &'static str)>,
 }
+
+/// What a person's turn lifts a hold by, in its clears ([`Exception::repeats_by`]).
+macro_rules! busy_turn {
+    () => {
+        "a person's turn a point saw busy"
+    };
+}
+
+/// What else lifts a hold, after the person's turn ([`Exception::repeats_by`]).
+macro_rules! held_clears_tail {
+    () => {
+        ", a lead's new prompt above Claude Code's reply, or the agent working"
+    };
+}
+
+/// The person's switch to Land, beside their turn, where it asks once more (v6 §14.17 item 3).
+macro_rules! their_switch {
+    () => {
+        " or their switch to Land"
+    };
+}
+
+const SAME_REPLY_CLEARS: &str = concat!("a different reply, ", busy_turn!(), held_clears_tail!());
+const SAME_REPLY_SWITCH_CLEARS: &str = concat!(
+    "a different reply, ",
+    busy_turn!(),
+    their_switch!(),
+    held_clears_tail!()
+);
+const NO_WORK_CLEARS: &str = concat!(busy_turn!(), held_clears_tail!());
+const NO_WORK_SWITCH_CLEARS: &str = concat!(busy_turn!(), their_switch!(), held_clears_tail!());
 
 impl Exception {
     /// A notice's exception ([`super::notice`]).
@@ -117,7 +132,6 @@ impl Exception {
                 back: text.back,
             }),
             held: None,
-            title: None,
         }
     }
 
@@ -135,7 +149,6 @@ impl Exception {
             escalated: false,
             notice: None,
             held: None,
-            title: None,
         }
     }
 
@@ -152,7 +165,6 @@ impl Exception {
             escalated: false,
             notice: None,
             held: None,
-            title: None,
         }
     }
 
@@ -163,76 +175,81 @@ impl Exception {
     /// as no reply came again, and a different reply does not lift it.
     #[must_use]
     pub fn repeats(held: HeldBy) -> Self {
+        Self::repeats_by(held, false)
+    }
+
+    /// [`Self::repeats`], and where `switch`, the person's switch to Land is among what clears it:
+    /// it counts as their turn, and Land asks once more (v6 §14.17 item 3,
+    /// [`TurnEndState::switch_would_ask`]). The stop's words on the glass name the switch from
+    /// this one fact ([`Self::lifted_by_switch`]).
+    #[must_use]
+    pub fn repeats_by(held: HeldBy, switch: bool) -> Self {
         let (why, clears) = match held {
             HeldBy::SameReply => (
                 "Its program answers aterm's acts with the same reply and no work, so aterm types nothing more."
                     .to_string(),
-                "a different reply, a person's turn a point saw busy, a lead's new prompt above Claude Code's reply, or the agent working",
+                if switch {
+                    SAME_REPLY_SWITCH_CLEARS
+                } else {
+                    SAME_REPLY_CLEARS
+                },
             ),
             HeldBy::NoWork => (
                 format!(
                     "Its program answered aterm's acts {}, so aterm types nothing more.",
                     held.answered()
                 ),
-                "a person's turn a point saw busy, a lead's new prompt above Claude Code's reply, or the agent working",
+                if switch {
+                    NO_WORK_SWITCH_CLEARS
+                } else {
+                    NO_WORK_CLEARS
+                },
             ),
         };
         Self {
             kind: ExceptionKind::Stalled,
             when: Urgency::Later,
             why,
-            action: "Open the tab and do what its last reply asks.".to_string(),
+            action: "Revisit the recorded work and continue available tasks.".to_string(),
             clears,
             escalated: false,
             notice: None,
             held: Some(held),
-            title: None,
         }
     }
 
-    /// THE ONE LOUD HOLD (§14.3, limit 3 of §14.0): [`Self::repeats`] under Land whose last
-    /// reading still has repository work git measured (the hold's Repo leg), in a session no
-    /// manager waits on. Its kind stays [`ExceptionKind::Stalled`]; it is needed now, its why
-    /// names the repository's finding (`repo`, [`RepoWork::summary`], cut as Land's act cuts it;
-    /// `None`: the leg's bare words), and it carries its own title, so no program is named.
+    /// WHETHER THE PERSON'S SWITCH TO LAND CLEARS THIS HOLD ([`Self::repeats_by`]): what the
+    /// stop's words on the glass read to name the switch (`aterm_agent::harness::acts::stop_words`).
     #[must_use]
-    pub fn repeats_land(held: HeldBy, repo: Option<&RepoWork>) -> Self {
-        let answered = held.answered();
-        let finding = repo
-            .map(super::turn_end::repo_finding)
-            .filter(|f| !f.is_empty())
-            .map_or_else(String::new, |f| format!(" ({f})"));
-        Self {
-            when: Urgency::Now,
-            why: format!(
-                "Under Land it answered {answered}, and its repository still holds work no remote \
-                 main has{finding}, so aterm types nothing more."
-            ),
-            action: REPEATS_LAND_ACTION.to_string(),
-            title: Some(REPEATS_LAND_TITLE),
-            ..Self::repeats(held)
-        }
+    pub fn lifted_by_switch(&self) -> bool {
+        self.held.is_some()
+            && matches!(
+                self.clears,
+                SAME_REPLY_SWITCH_CLEARS | NO_WORK_SWITCH_CLEARS
+            )
     }
 
-    /// THE AGENT REFUSES THE STANDING GO-AHEAD (owner, 2026-10-29): it still parks its own
-    /// reversible work on a person after [`super::go_ahead::RULE_GO_AHEAD`] answered that park its
-    /// limit of times or for an hour ([`TurnEndState::go_ahead_spent`]), or with the same no-work
-    /// reply ([`held_repeats`]), so aterm types nothing more. Needed now, with one action: the
-    /// person's own go-ahead in the tab.
+    /// A refused standing decision is recorded while the harness recovers autonomously.
     #[must_use]
     pub fn refuses_go_ahead() -> Self {
         Self {
             kind: ExceptionKind::Stalled,
-            when: Urgency::Now,
+            when: Urgency::Later,
             why: REFUSES_GO_AHEAD.to_string(),
-            action: "Open the tab and tell it to go ahead.".to_string(),
+            action: "Choose another approach and continue available work.".to_string(),
             clears: "the agent working outside a break of its own background work, a reply that \
-                     no longer waits on a go-ahead, or a person's turn",
+                     no longer waits on a go-ahead, or a person typing in the tab",
             escalated: false,
             notice: None,
             held: None,
-            title: None,
         }
+    }
+
+    /// Whether this is the go-ahead's refusal ([`Self::refuses_go_ahead`]), which puts the lines
+    /// the go-ahead answered back on the menu bar ([`super::turn_end::GoAheadVerdict::Refused`]).
+    #[must_use]
+    pub fn refuses(&self) -> bool {
+        self.why == REFUSES_GO_AHEAD
     }
 
     /// Whether the agent working on a busy screen ends this exception, `at_break` a break of its
@@ -261,7 +278,6 @@ impl Exception {
             escalated: false,
             notice: None,
             held: None,
-            title: None,
         }
     }
 
@@ -280,7 +296,6 @@ impl Exception {
             escalated: false,
             notice: None,
             held: None,
-            title: None,
         }
     }
 
@@ -297,7 +312,6 @@ impl Exception {
             escalated: false,
             notice: None,
             held: None,
-            title: None,
         }
     }
 
@@ -314,7 +328,6 @@ impl Exception {
             escalated: false,
             notice: None,
             held: None,
-            title: None,
         }
     }
 
@@ -343,7 +356,6 @@ impl Exception {
             escalated: false,
             notice: None,
             held: None,
-            title: None,
         }
     }
 
@@ -392,7 +404,6 @@ impl Exception {
             escalated: false,
             notice: None,
             held: None,
-            title: None,
         }
     }
 }
@@ -840,12 +851,9 @@ fn claude_login(
         // (Console's menu, which only a person's pick at aterm's picker opens): no person is told
         // to sign the login in there either.
         Some(_) if own && super::login::nobody_signs_in(state, reading, cfg) => return Some(None),
-        Some(LoginScreen::Picker(picker)) => {
-            return match super::login::picks(picker, reading.login_method) {
-                Ok(_) => Some(None),
-                Err(_) => told(&notice::LOGIN_CHOOSE, None, None),
-            };
-        }
+        // aterm's own picker: never answered by aterm (its pick opens the browser, which only a
+        // person brings forward), so the choice is told, quietly, once.
+        Some(LoginScreen::Picker(_)) => return told(&notice::LOGIN_CHOOSE, None, None),
         Some(LoginScreen::Browser) => {
             return match roster {
                 Some(label) => told(&notice::LOGIN_SIGN_IN_AS, Some(label), None),
@@ -954,9 +962,7 @@ pub fn exception_for(
     {
         return Some(Exception::unread_limit());
     }
-    let spent = state
-        .go_ahead_owed(reading, now)
-        .is_some_and(|park| state.go_ahead_spent(&park, now));
+    let spent = state.go_ahead_owed(reading, now).is_some() && state.go_ahead_spent(now);
     let decided = (state.replies().holds() || spent).then(|| {
         let mut steps = Vec::new();
         let _ = decide_turn_end_traced(state, reading, cfg, now, &mut steps);
@@ -966,6 +972,15 @@ pub fn exception_for(
         return Some(Exception::refuses_go_ahead());
     }
     let held = state.replies().holds() && decided.flatten() == Some(SAME_REPLY);
+    if held
+        && reading.autopilot == Autopilot::Cruise
+        && reading.wall.is_none()
+        && !state.has_limit_track()
+        && state.replies().last().is_some_and(|reply| !reply.walled)
+    {
+        // Recovery is scheduled and recorded in the ledger, not delegated to the person.
+        return None;
+    }
     let Some(kind) = reading.wall else {
         // Held at the screen's reply, or at the wall a track still stands for: a limit's, or another's.
         return held.then(|| {
@@ -987,7 +1002,6 @@ pub fn exception_for(
             escalated: false,
             notice: None,
             held: None,
-            title: None,
         });
     }
     match kind {
@@ -1003,7 +1017,6 @@ pub fn exception_for(
                 escalated: true,
                 notice: None,
                 held: None,
-                title: None,
             })
         }
         WallKind::Spend if reading.reset_at.is_none() || !cfg.resume_limits => {
@@ -1017,7 +1030,6 @@ pub fn exception_for(
                 escalated: false,
                 notice: None,
                 held: None,
-                title: None,
             })
         }
         WallKind::ModelBucket { .. }
@@ -1061,7 +1073,6 @@ pub fn exception_for(
                 escalated: false,
                 notice: None,
                 held: None,
-                title: None,
             })
         }
         WallKind::UsageSession
@@ -1082,7 +1093,6 @@ pub fn exception_for(
                 escalated: false,
                 notice: None,
                 held: None,
-                title: None,
             })
         }
         WallKind::Context
@@ -1112,16 +1122,7 @@ pub fn exception_for(
     }
 }
 
-/// THE HOLD AT THE SCREEN'S REPLY (§14.3): [`Exception::repeats_land`] under Land where the last
-/// yield read held the Repo leg (git measured work no remote main has), the hold is the agent's
-/// own replies' and no manager waits on the session; [`Exception::repeats`] for every other hold,
-/// an Open-only one, a need's, a managed worker's, Cruise's and a read wall's among them (limit 3
-/// of §14.0). A wall's hold (its tries spent at the newest kept reply, a reply a read wall said)
-/// stays Later once its notice has left the screen too: an error answered the same is no reply
-/// the agent gave twice, and its turn is not the repository's. A held reply that parks on a
-/// go-ahead owed ([`TurnEndState::go_ahead_owed`], with answers on) is
-/// [`Exception::refuses_go_ahead`]: what its last reply asks is the go-ahead the owner already
-/// gave.
+/// Classify a held report for the journal without raising an alert.
 fn held_repeats(
     state: &TurnEndState,
     reading: &TurnEndReading,
@@ -1129,21 +1130,13 @@ fn held_repeats(
     now: Instant,
 ) -> Exception {
     let held = state.held_by().unwrap_or(HeldBy::SameReply);
-    if cfg.answer_questions && state.go_ahead_owed(reading, now).is_some() {
+    if cfg.answer_questions && state.go_ahead_parked(reading, now).is_some() {
         return Exception {
             held: Some(held),
             ..Exception::refuses_go_ahead()
         };
     }
-    let repo_leg = state
-        .land_held()
-        .is_some_and(|hold| hold.read && hold.holds(HoldLeg::Repo));
-    let walled = state.replies().last().is_some_and(|kept| kept.walled);
-    if reading.autopilot == Autopilot::Land && repo_leg && !walled && !state.managed() {
-        Exception::repeats_land(held, state.repo_owed())
-    } else {
-        Exception::repeats(held)
-    }
+    Exception::repeats_by(held, state.switch_would_ask(reading))
 }
 
 #[cfg(test)]

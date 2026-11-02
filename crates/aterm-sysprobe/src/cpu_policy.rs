@@ -232,9 +232,13 @@ pub fn decode_capture(value: &Value) -> Option<Capture> {
         u32::try_from(v[key].as_u64()?).ok()
     }
     fn identity(v: &Value, pid: &str, sec: &str, usec: &str) -> Option<Identity> {
+        let sec = v[sec].as_str()?;
+        if sec.starts_with('0') || !sec.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
         let id = Identity {
             pid: number(v, pid)?,
-            start_s: v[sec].as_str()?.parse().ok()?,
+            start_s: sec.parse().ok()?,
             start_us: number(v, usec)?,
         };
         (id.pid > 0 && id.start_s > 0 && id.start_us < 1_000_000).then_some(id)
@@ -732,6 +736,16 @@ mod tests {
             .unwrap()
             .insert("getter_errors".into(), json!(0));
         assert!(decode_capture(&forged).is_none());
+        for noncanonical in ["+100", "0100", "0"] {
+            let mut bad = encoded.clone();
+            bad.as_object_mut()
+                .unwrap()
+                .insert("collector_start_s".into(), json!(noncanonical));
+            assert!(
+                decode_capture(&bad).is_none(),
+                "noncanonical {noncanonical}"
+            );
+        }
         let mut unprivileged = good;
         unprivileged.effective_uid = 501;
         assert!(!decode_capture(&unprivileged.json()).unwrap().complete());

@@ -12,6 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
+use aterm_agent::supervise::policy::go_ahead;
 use aterm_agent::supervise::policy::turn_end::{self, DONE_ANGLES, RULE_DONE_CHECK};
 
 use super::surfaces::held::{decided_after, stall_of};
@@ -176,9 +177,11 @@ fn checks(seen: &Seen) -> Vec<(i64, &str)> {
 }
 
 /// Whether check `typed` is the `n`th claim's (counting from 0): it opens with
-/// `turn_end::done_check_words`'s words for `n`, whatever suffix follows them.
+/// `turn_end::done_check_words`'s words for `n`, whole or as the person's hour cuts them
+/// (`go_ahead::unless_held`), whatever suffix follows them.
 fn asks(typed: &str, n: usize) -> bool {
-    typed.starts_with(&turn_end::done_check_words(n))
+    let words = turn_end::done_check_words(n);
+    typed.starts_with(&words) || typed.starts_with(go_ahead::unless_held(&words, true).as_ref())
 }
 
 /// The first check that is not its claim's angle, by index.

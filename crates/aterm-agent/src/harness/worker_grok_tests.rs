@@ -98,6 +98,16 @@ fn a_grok_starter_lends_its_worker_only_its_leader_socket() {
         Err("-mx".to_string()),
         "a short option is never read attached"
     );
+    assert_eq!(
+        config_flags(&words(&["grok", "--leader-socket"])),
+        Err("--leader-socket".to_string()),
+        "a value-taking flag with no value"
+    );
+    assert_eq!(
+        config_flags(&words(&["grok", "--model", "--", "--unknown"])),
+        Err("--model".to_string()),
+        "a value-taking flag before `--` with no value"
+    );
     assert_eq!(config_flags(&words(&["grok"])), Ok(Vec::new()));
 }
 
@@ -259,6 +269,15 @@ fn no_grok_worker_starts_without_a_sign_in_file() {
             Some(&user)
         ),
         None
+    );
+    let missing_pooled = d.path().join("missing-accounts-grok.json");
+    assert_eq!(
+        row.signed_out(
+            &starter(&[(AUTH_PATH_ENV, &missing_pooled), (AUTH_PATH_ENV, &pooled)]),
+            Some(&user)
+        ),
+        None,
+        "the last duplicate env entry wins"
     );
     assert!(
         row.signed_out(&starter(&[]), None).is_some(),

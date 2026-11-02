@@ -17,6 +17,28 @@
 //! and those tests, never a library.
 
 mod models_account_adopt_identity;
+mod models_scoped_input;
+mod models_scoped_native;
+pub use models_scoped_input::{scoped_input_drain_model, scoped_input_seal_model};
+pub use models_scoped_native::{
+    initial_prepare_cancellation_model, native_restart_slots_model, scoped_native_handoff_model,
+};
+mod models_native_preparation_queue;
+pub use models_native_preparation_queue::native_preparation_queue_model;
+mod models_native_preparation_admission;
+pub use models_native_preparation_admission::native_preparation_admission_model;
+mod models_native_preparation_revision;
+pub use models_native_preparation_revision::native_preparation_revision_model;
+mod models_preparation_order;
+pub use models_preparation_order::preparation_order_model;
+mod models_mailbox_renewal_admission;
+mod models_shared_candidate_priority;
+mod models_shared_renewal_admission;
+pub use models_mailbox_renewal_admission::mailbox_renewal_admission_model;
+pub use models_shared_candidate_priority::{
+    shared_candidate_priority_model, shared_candidate_progress_model,
+};
+pub use models_shared_renewal_admission::shared_renewal_admission_model;
 mod models_account_adopt_source;
 mod models_account_advice_queue;
 mod models_account_alias_admission;
@@ -26,13 +48,17 @@ mod models_account_application;
 mod models_account_attempt_generation;
 mod models_account_attempt_policy;
 mod models_account_binding_retention;
+mod models_account_browser_rehabilitation;
 mod models_account_claim_activity;
 mod models_account_completion_identity;
 mod models_account_controls;
 mod models_account_create_label;
 mod models_account_dashboard;
 mod models_account_directory_admission;
+mod models_account_execution_visibility;
+mod models_account_explicit_signin;
 mod models_account_gui_read;
+mod models_account_health_scope;
 mod models_account_host_identity;
 mod models_account_identity;
 mod models_account_identity_snapshot;
@@ -64,7 +90,10 @@ mod models_account_pool_preparation;
 mod models_account_pool_recovery;
 mod models_account_pool_usage_policy;
 mod models_account_process_context;
+mod models_account_progress_identity;
+mod models_account_progress_ranking;
 mod models_account_provider_realm;
+mod models_account_publication_activity;
 mod models_account_queued_selection;
 mod models_account_recovery_identity;
 mod models_account_recovery_lock;
@@ -80,12 +109,16 @@ mod models_account_response;
 mod models_account_restart_source;
 mod models_account_retry_inputs;
 mod models_account_return;
+mod models_account_review_observation;
+mod models_account_review_preparation;
+mod models_account_review_storage;
 mod models_account_sample_context;
 mod models_account_selection_commit;
 mod models_account_served_identity;
 mod models_account_session_attribution;
 mod models_account_shared_selection;
 mod models_account_sheet_columns;
+mod models_account_signback_receipt;
 mod models_account_signin;
 mod models_account_signin_epoch;
 mod models_account_signin_lock;
@@ -134,7 +167,9 @@ mod models_occupancy;
 mod models_program_queue;
 mod models_program_resolution;
 mod models_relaunch_prompt;
+mod models_scoped_health;
 mod models_shared_disposition;
+mod models_shared_recovery;
 mod models_shared_renewal;
 mod models_supervise;
 mod models_supervise_accounts;
@@ -154,6 +189,7 @@ pub use models_account_application::account_application_model;
 pub use models_account_attempt_generation::account_attempt_generation_model;
 pub use models_account_attempt_policy::account_attempt_policy_model;
 pub use models_account_binding_retention::account_binding_retention_model;
+pub use models_account_browser_rehabilitation::account_browser_rehabilitation_model;
 pub use models_account_claim_activity::{
     account_claim_activity_model, account_claim_observation_model,
 };
@@ -162,7 +198,10 @@ pub use models_account_controls::account_controls_model;
 pub use models_account_create_label::account_create_label_model;
 pub use models_account_dashboard::account_dashboard_model;
 pub use models_account_directory_admission::account_directory_admission_model;
+pub use models_account_execution_visibility::account_execution_visibility_model;
+pub use models_account_explicit_signin::account_explicit_signin_model;
 pub use models_account_gui_read::account_gui_read_model;
+pub use models_account_health_scope::account_health_scope_model;
 pub use models_account_host_identity::account_host_identity_model;
 pub use models_account_identity::account_identity_model;
 pub use models_account_identity_snapshot::account_identity_snapshot_model;
@@ -194,7 +233,10 @@ pub use models_account_pool_preparation::account_pool_preparation_model;
 pub use models_account_pool_recovery::account_pool_recovery_model;
 pub use models_account_pool_usage_policy::account_pool_usage_policy_model;
 pub use models_account_process_context::account_process_context_model;
+pub use models_account_progress_identity::account_progress_identity_model;
+pub use models_account_progress_ranking::account_progress_ranking_model;
 pub use models_account_provider_realm::account_provider_realm_model;
+pub use models_account_publication_activity::account_publication_activity_model;
 pub use models_account_queued_selection::account_queued_selection_model;
 pub use models_account_recovery_identity::account_recovery_identity_model;
 pub use models_account_recovery_lock::account_recovery_lock_model;
@@ -210,12 +252,16 @@ pub use models_account_response::account_response_model;
 pub use models_account_restart_source::account_restart_source_model;
 pub use models_account_retry_inputs::account_retry_inputs_model;
 pub use models_account_return::account_return_model;
+pub use models_account_review_observation::account_review_observation_model;
+pub use models_account_review_preparation::account_review_preparation_model;
+pub use models_account_review_storage::account_review_storage_model;
 pub use models_account_sample_context::account_sample_context_model;
 pub use models_account_selection_commit::account_selection_commit_model;
 pub use models_account_served_identity::account_served_identity_model;
 pub use models_account_session_attribution::account_session_attribution_model;
 pub use models_account_shared_selection::account_shared_selection_model;
 pub use models_account_sheet_columns::account_sheet_columns_model;
+pub use models_account_signback_receipt::account_signback_receipt_model;
 pub use models_account_signin::account_signin_admission_model;
 pub use models_account_signin_epoch::account_signin_epoch_model;
 pub use models_account_signin_lock::account_signin_lock_model;
@@ -279,7 +325,13 @@ pub use models_program_queue::{
 };
 pub use models_program_resolution::program_resolution_retry_model;
 pub use models_relaunch_prompt::{relaunch_prompt_read_liveness, relaunch_prompt_read_model};
+pub use models_scoped_health::scoped_health_model;
 pub use models_shared_disposition::shared_disposition_model;
+pub use models_shared_recovery::{
+    shared_adoption_progress_model, shared_adoption_recovery_model,
+    shared_checkpoint_authority_model, shared_progress_model, shared_recovery_model,
+    shared_staging_recovery_model,
+};
 pub use models_shared_renewal::{
     renewal_snapshot_model, shared_begin_model, shared_browser_model, shared_checkpoint_model,
     shared_renewal_model,

@@ -7,6 +7,7 @@
 # the rainbow kitty and typing goes on, so the ribbon ramps in.
 
 foreach-scheme light {
+  scale 2
   grid 16 80
   style comet
   hz 60

@@ -20,7 +20,7 @@ use crate::layout::{
 };
 use crate::records::{
     EncodeError, HistoryIdentity, KeyframeHead, MAX_BYTES_PAYLOAD, TAIL_RECORD_HEADER, TailRecord,
-    encode_control, encode_history_chunk, encode_keyframe, pad_header,
+    decode_control, encode_control, encode_history_chunk, encode_keyframe, pad_header,
 };
 use crate::store::{RegionStore, RegionView, StoreError, Touched};
 
@@ -1147,8 +1147,14 @@ impl ControlWriter {
         if len > cap {
             return Err(WriteError::TooLarge { len, cap });
         }
+        if len == 0 {
+            return Ok(());
+        }
         let mut record = vec![0u8; len];
         from.read(geometry.ctl_off(), &mut record)?;
+        if decode_control(&record, seq).is_err() {
+            return Ok(());
+        }
         self.write_record(to, geometry, seq, &record)
     }
 

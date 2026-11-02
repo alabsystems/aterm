@@ -198,7 +198,7 @@ pub fn hold_left(sys: &dyn System, home: &Path) -> Option<Duration> {
     if let Some(stamp) = RootStamp::parse(&text) {
         return stamp.left(boot_clocks(sys).as_ref());
     }
-    let at = text.trim().parse::<u64>().ok();
+    let at = crate::parse_uint::<u64>(text.trim());
     let age = match (at, sys.awake_ms()) {
         (Some(at), Some(now)) => Duration::from_millis(now.checked_sub(at)?),
         _ => Duration::ZERO,

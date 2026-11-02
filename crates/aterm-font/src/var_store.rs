@@ -10,6 +10,10 @@
 use crate::NormalizedCoordinate;
 use crate::parser::{FromData, LazyArray16, NumFrom, Stream};
 
+/// Region-axis evaluations one [`ItemVariationStore::parse_delta`] may make:
+/// real faces name tens of regions of a handful of axes per delta set.
+const DELTA_STEPS: u32 = 65_536;
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ItemVariationStore<'a> {
     data: &'a [u8],
@@ -73,12 +77,24 @@ impl<'a> ItemVariationStore<'a> {
         s.read_array16::<u16>(count)
     }
 
+    /// The delta one item of the store adds at `coordinates`, or `None` when
+    /// it is malformed or would cost more than [`DELTA_STEPS`]: each region
+    /// its delta set names is evaluated over every axis, so a set naming tens
+    /// of thousands of regions in a face of many axes would otherwise cost
+    /// millions of steps for one glyph's advance.
     pub fn parse_delta(
         &self,
         outer_index: u16,
         inner_index: u16,
         coordinates: &[NormalizedCoordinate],
     ) -> Option<f32> {
+        let per_region = u32::try_from(coordinates.len()).map_or(u32::MAX, |axes| axes.max(1));
+        let mut steps = DELTA_STEPS;
+        let mut evaluate = |region: u16| {
+            steps = steps.checked_sub(per_region)?;
+            Some(self.regions.evaluate_region(region, coordinates))
+        };
+
         let offset = self.data_offsets.get(outer_index)?;
         let mut s = Stream::new_at(self.data, usize::num_from(offset))?;
         let item_count = s.read::<u16>()?;
@@ -109,7 +125,7 @@ impl<'a> ItemVariationStore<'a> {
             } else {
                 f32::from(s.read::<i16>()?)
             };
-            delta += num * self.regions.evaluate_region(idx, coordinates);
+            delta += num * evaluate(idx)?;
             i += 1;
         }
 
@@ -120,7 +136,7 @@ impl<'a> ItemVariationStore<'a> {
             } else {
                 f32::from(s.read::<i8>()?)
             };
-            delta += num * self.regions.evaluate_region(idx, coordinates);
+            delta += num * evaluate(idx)?;
             i += 1;
         }
 

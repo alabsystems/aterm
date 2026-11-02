@@ -9,6 +9,750 @@ fn body(v: &str) -> Vec<u8> {
 }
 
 #[test]
+fn a_prearmed_wall_rejects_the_next_main_request_before_any_observer_read() {
+    let messages = r#"{"model":"claude-x","stream":false,"max_tokens":32000,"tools":[{}],"messages":[{"role":"user","content":"initial task"}]}"#;
+    let responses =
+        r#"{"model":"gpt-x","stream":true,"input":[{"role":"user","content":"initial task"}]}"#;
+    let structured =
+        r#"{"input":[],"text":{"format":{"type":"json_schema","schema":{"type":"object"}}}}"#;
+    let chat = r#"{"model":"chat-x","stream":false,"tools":[{"type":"function","function":{"name":"read","parameters":{"type":"object"}}}],"messages":[{"role":"user","content":"initial task"}]}"#;
+    let gemini = r#"{"contents":[{"role":"user","parts":[{"text":"initial task"}]}],"tools":[{"functionDeclarations":[{"name":"read"}]}]}"#;
+    let title =
+        r#"{"contents":[{"role":"user","parts":[{"text":"<USER_REQUEST>title</USER_REQUEST>"}]}]}"#;
+    assert_eq!(analyse(messages.as_bytes()).kind, "main");
+    assert_eq!(analyse_responses(responses.as_bytes()).kind, "codex");
+    assert_eq!(chat::analyse_chat(chat.as_bytes()).kind, "chat");
+    assert_eq!(xai::analyse_chat(chat.as_bytes()).kind, "grok");
+    assert_eq!(gemini::analyse_gemini(gemini.as_bytes()).kind, "gemini");
+    let (port, _) = start(Args::default()).unwrap();
+    let port = port.to_string();
+    let client = aterm_http::Client::new(
+        aterm_http::Trust::PlatformVerifier,
+        aterm_http::ProxyMode::Direct,
+        Duration::from_secs(60),
+    );
+    let post = |path: &str, body: &str, token: &str| {
+        client
+            .post(&format!("http://127.0.0.1:{port}{path}"))
+            .header("Authorization", &format!("Bearer {token}"))
+            .header("x-tbh-agent-role", "main")
+            .send(body.as_bytes())
+            .unwrap()
+    };
+    let mut wrong = Vec::new();
+    for (name, path, side, main, token) in [
+        (
+            "Messages",
+            "/v1/messages",
+            r#"{"messages":[]}"#,
+            messages,
+            LAB_CODEX_KEY,
+        ),
+        (
+            "Codex",
+            "/v1/responses",
+            structured,
+            responses,
+            LAB_CODEX_KEY,
+        ),
+        ("Muse", "/responses", structured, responses, LAB_CODEX_KEY),
+        (
+            "Gemini",
+            "/v1beta/models/gemini-3.5-flash:streamGenerateContent?alt=sse",
+            title,
+            gemini,
+            gemini::LAB_GEMINI_KEY,
+        ),
+        (
+            "Chat",
+            "/v1/chat/completions",
+            r#"{"messages":[]}"#,
+            chat,
+            LAB_CODEX_KEY,
+        ),
+        (
+            "Kimi",
+            "/v1/chat/completions",
+            r#"{"messages":[]}"#,
+            chat,
+            "lab-kimi-not-a-key",
+        ),
+        (
+            "Grok",
+            "/v1/chat/completions",
+            r#"{"messages":[]}"#,
+            chat,
+            xai::LAB_XAI_KEY,
+        ),
+    ] {
+        control(&port, "/__mode?m=ok").unwrap();
+        assert_eq!(
+            post(path, main, token).status(),
+            200,
+            "{name}: ordinary main"
+        );
+        assert_eq!(
+            post(path, main, token).status(),
+            200,
+            "{name}: ordinary successor"
+        );
+        control(&port, "/__mode?m=limit-after:1:five_hour:180000").unwrap();
+        assert_eq!(post("/v1/messages/count_tokens", "{}", token).status(), 200);
+        assert_eq!(
+            client
+                .get(&format!("http://127.0.0.1:{port}/v1/models"))
+                .send(&[])
+                .unwrap()
+                .status(),
+            200
+        );
+        assert_eq!(
+            post(path, side, token).status(),
+            200,
+            "{name}: side spends no main allowance"
+        );
+        assert_eq!(
+            post(path, main, token).status(),
+            200,
+            "{name}: initial task is admitted"
+        );
+        // No observer/status read separates these requests. The last allowed reply must
+        // already have installed the wall before its continuation can be sent.
+        let next = post(path, main, token).status();
+        if next != 429 {
+            wrong.push(format!(
+                "{name}: immediate next main answered {next}, expected 429"
+            ));
+            continue;
+        }
+        let status = J::parse(&control(&port, "/__status").unwrap()).unwrap();
+        let arm = status.get("limit_arm").expect("actual admission evidence");
+        let raised = arm.get("raised_ms").and_then(J::as_i64).unwrap();
+        let reset = arm.get("reset_s").and_then(J::as_i64).unwrap();
+        assert!(raised > 0 && reset % 60 == 0);
+        assert!(
+            (180_000..240_000).contains(&(reset * 1000 - raised)),
+            "reset is rounded from admission, not a latency measure"
+        );
+        control(&port, "/__mode?m=ok").unwrap();
+        assert_eq!(
+            post(path, main, token).status(),
+            200,
+            "{name}: explicit control wins"
+        );
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+#[test]
+fn finite_allowance_parameters_refuse_signed_overflow_and_incomplete_fields() {
+    assert_eq!(
+        limit_after_params("limit-after:0:five_hour:1"),
+        Some((0, "five_hour", 1, "ok"))
+    );
+    assert_eq!(
+        limit_after_params("limit-after:2:five_hour:180000:forever"),
+        Some((2, "five_hour", 180000, "forever"))
+    );
+    for invalid in [
+        "limit-after:+1:x:1",
+        "limit-after:1:x:+1",
+        "limit-after:-1:x:1",
+        "limit-after:18446744073709551616:x:1",
+        "limit-after:1:x:9223372036854775808",
+        "limit-after:1::1",
+        "limit-after:1:x:0",
+        "limit-after:1:x:1:ok:extra",
+    ] {
+        assert!(limit_after_params(invalid).is_none(), "{invalid}");
+    }
+}
+
+#[test]
+fn a_prearmed_allowance_is_atomic_across_concurrent_main_admissions() {
+    let mode = "limit-after:2:five_hour:180000";
+    let stub = Stub::new(Args {
+        mode: mode.to_string(),
+        ..Args::default()
+    });
+    assert_eq!(stub.mode_for_request(mode, false).unwrap(), "ok");
+    let ready = Arc::new(std::sync::Barrier::new(4));
+    let threads: Vec<_> = (0..4)
+        .map(|_| {
+            let stub = Arc::clone(&stub);
+            let ready = Arc::clone(&ready);
+            std::thread::spawn(move || {
+                ready.wait();
+                stub.mode_for_request(mode, true).unwrap()
+            })
+        })
+        .collect();
+    let modes: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+    assert_eq!(modes.iter().filter(|m| m.as_str() == "ok").count(), 2);
+    assert_eq!(
+        modes
+            .iter()
+            .filter(|m| m.starts_with("limit:five_hour:"))
+            .count(),
+        2
+    );
+    let state = stub.st();
+    let arm = state.limit_arm.as_ref().unwrap();
+    assert_eq!(arm.reset_s % 60, 0);
+    assert!((180_000..240_000).contains(&(arm.reset_s * 1000 - arm.raised_ms)));
+}
+
+#[test]
+fn an_unchanged_mode_file_cannot_resurrect_an_exhausted_prearm() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let file = dir.path().join("mode");
+    let mode = "limit-after:0:five_hour:180000";
+    std::fs::write(&file, mode).unwrap();
+    let stub = Stub::new(Args {
+        mode_file: Some(file.clone()),
+        ..Args::default()
+    });
+    assert_eq!(stub.mode(), mode);
+    assert_eq!(stub.mode_for_request(mode, false).unwrap(), "ok");
+    assert!(stub.st().limit_arm.is_none());
+    assert!(
+        stub.mode_for_request(mode, true)
+            .unwrap()
+            .starts_with("limit:five_hour:")
+    );
+    assert!(stub.mode().starts_with("limit:five_hour:"));
+    stub.set_mode(mode, false);
+    assert_eq!(stub.mode(), mode);
+    assert!(stub.st().limit_arm.is_none());
+    assert!(
+        stub.mode_for_request(mode, true)
+            .unwrap()
+            .starts_with("limit:five_hour:")
+    );
+    stub.set_mode("ok", false);
+    assert_eq!(
+        stub.mode_for_request(mode, true).unwrap(),
+        "ok",
+        "an older finite snapshot cannot undo explicit control"
+    );
+}
+
+fn message_delta_text(wire: &str) -> String {
+    wire.lines()
+        .filter_map(|line| J::parse(line.strip_prefix("data: ")?).ok())
+        .filter_map(|data| data.get("delta")?.get("text")?.as_str().map(str::to_string))
+        .collect()
+}
+
+#[test]
+fn a_prearmed_wall_preserves_the_admitted_scripted_reply() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("once.json"),
+        r#"{"times":1,"stream":true,"pace_s":0,"replies":[{"last":"initial task","text":"the scripted initial answer"}]}"#).unwrap();
+    let (port, _) = start(Args {
+        mode: "limit-after:1:five_hour:180000:once".to_string(),
+        modes_dir: Some(dir.path().to_path_buf()),
+        ..Args::default()
+    })
+    .unwrap();
+    let client = aterm_http::Client::new(
+        aterm_http::Trust::PlatformVerifier,
+        aterm_http::ProxyMode::Direct,
+        Duration::from_secs(60),
+    );
+    let post = |body: &str| {
+        client
+            .post(&format!("http://127.0.0.1:{port}/v1/messages"))
+            .send(body.as_bytes())
+            .unwrap()
+    };
+    assert_eq!(
+        post(r#"{"messages":[]}"#).status(),
+        200,
+        "an auxiliary call spends neither finite allowance nor the scripted main reply"
+    );
+    let main = r#"{"model":"claude-x","stream":false,"max_tokens":32000,"tools":[{}],"messages":[{"role":"user","content":"initial task"}]}"#;
+    let first = post(main);
+    assert_eq!(first.status(), 200);
+    assert_eq!(
+        message_delta_text(&String::from_utf8_lossy(first.body())),
+        "the scripted initial answer"
+    );
+    assert_eq!(post(main).status(), 429);
+    control(&port.to_string(), "/__reset").unwrap();
+    let status = J::parse(&control(&port.to_string(), "/__status").unwrap()).unwrap();
+    assert_eq!(status.get("limit_arm"), Some(&J::Null));
+}
+
+/// Capture a tiny actual protocol answer over an owned socket pair without a server or poll race.
+fn wire_answer(stub: &Stub, answer: impl FnOnce(&mut Out<'_>) -> io::Result<()>) -> String {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let mut reader = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (mut writer, _) = listener.accept().unwrap();
+    reader
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .unwrap();
+    writer
+        .set_write_timeout(Some(Duration::from_secs(60)))
+        .unwrap();
+    {
+        let mut out = Out {
+            w: &mut writer,
+            flat: Vec::new(),
+            rate: None,
+            served_200: &stub.served_200,
+        };
+        answer(&mut out).unwrap();
+    }
+    drop(writer);
+    let mut answer = String::new();
+    reader.read_to_string(&mut answer).unwrap();
+    answer
+}
+
+fn messages_at_snapshot(stub: &Stub, snapshot: &str, body: &[u8]) -> String {
+    wire_answer(stub, |out| {
+        stub.messages(
+            "POST",
+            "/v1/messages",
+            body,
+            (snapshot.to_string(), "key"),
+            out,
+        )
+    })
+}
+
+fn replaced_finite_mode_admits_its_current_allowance(from_file: bool) {
+    let main = br#"{"model":"claude-x","stream":false,"max_tokens":32000,"tools":[{}],"messages":[{"role":"user","content":"initial task"}]}"#;
+    let side = br#"{"messages":[]}"#;
+    assert_eq!(analyse(main).kind, "main");
+    assert_ne!(analyse(side).kind, "main");
+    for (allowed, reply_mode) in [(0, "ok"), (2, "ok"), (1, "once")] {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let file = dir.path().join("mode");
+        std::fs::write(dir.path().join("once.json"), r#"{"times":1,"stream":true,"pace_s":0,"replies":[{"last":"initial task","text":"the replacement's scripted answer"}]}"#).unwrap();
+        let original = "limit-after:99:five_hour:180000";
+        let replacement = format!("limit-after:{allowed}:weekly:240000:{reply_mode}");
+        let stub = Stub::new(Args {
+            mode: original.to_string(),
+            mode_file: from_file.then_some(file.clone()),
+            modes_dir: Some(dir.path().to_path_buf()),
+            log: Some(dir.path().join("requests")),
+            ..Args::default()
+        });
+        // Ordinary nonfinite selection remains authoritative; it spends no global allowance.
+        assert!(messages_at_snapshot(&stub, "ok", main).starts_with("HTTP/1.1 200 "));
+        assert!(messages_at_snapshot(&stub, "500", main).starts_with("HTTP/1.1 500 "));
+        let snapshot = stub.mode();
+        assert_eq!(snapshot, original);
+        if from_file {
+            // The file was absent at the snapshot. Its first actual adoption is deterministic,
+            // independent of filesystem timestamp resolution and without a timed rewrite.
+            assert!(!file.exists());
+            std::fs::write(&file, &replacement).unwrap();
+            assert_eq!(stub.mode(), replacement);
+        } else {
+            stub.set_mode(&replacement, false);
+        }
+        assert!(stub.st().limit_arm.is_none());
+        assert!(messages_at_snapshot(&stub, &snapshot, side).starts_with("HTTP/1.1 200 "));
+        {
+            let state = stub.st();
+            assert_eq!(state.mode, replacement);
+            assert_eq!(state.limit_remaining, None);
+            assert!(state.limit_arm.is_none());
+            assert!(
+                state.custom_budget.is_empty(),
+                "the side request spends no scripted reply"
+            );
+        }
+        for n in 0..allowed {
+            let answer = messages_at_snapshot(&stub, &snapshot, main);
+            assert!(
+                answer.starts_with("HTTP/1.1 200 "),
+                "{replacement}: {answer}"
+            );
+            if reply_mode == "once" {
+                assert_eq!(
+                    message_delta_text(&answer),
+                    "the replacement's scripted answer",
+                    "{answer}"
+                );
+            }
+            let state = stub.st();
+            assert_eq!(state.limit_remaining, Some(allowed - n - 1));
+            assert_eq!(state.limit_arm.is_some(), n + 1 == allowed);
+        }
+        let refused = messages_at_snapshot(&stub, &snapshot, main);
+        assert!(
+            refused.starts_with("HTTP/1.1 429 "),
+            "{replacement}: {refused}"
+        );
+        assert!(
+            stub.mode().starts_with("limit:weekly:"),
+            "unchanged file cannot resurrect the allowance"
+        );
+        {
+            let state = stub.st();
+            assert_eq!(state.limit_remaining, Some(0));
+            let arm = state
+                .limit_arm
+                .as_ref()
+                .expect("the current allowance installed its wall");
+            assert!(arm.raised_ms > 0);
+            assert!((240_000..300_000).contains(&(arm.reset_s * 1000 - arm.raised_ms)));
+        }
+        stub.set_mode("ok", false);
+        assert!(messages_at_snapshot(&stub, &snapshot, main).starts_with("HTTP/1.1 200 "));
+        assert!(
+            stub.st().limit_arm.is_none(),
+            "explicit ordinary control still wins"
+        );
+    }
+
+    for malformed in ["limit-after:bad", "limit-after:1:x:0", "LIMIT-AFTER:1:x:2"] {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let file = dir.path().join("mode");
+        let stub = Stub::new(Args {
+            mode: "limit-after:1:five_hour:180000".to_string(),
+            mode_file: from_file.then_some(file.clone()),
+            log: Some(dir.path().join("requests")),
+            ..Args::default()
+        });
+        let snapshot = stub.mode();
+        assert_eq!(
+            limit_after_params(&snapshot),
+            Some((1, "five_hour", 180000, "ok"))
+        );
+        if from_file {
+            assert!(!file.exists());
+            std::fs::write(&file, malformed).unwrap();
+            assert_eq!(stub.mode(), malformed);
+        } else {
+            stub.set_mode(malformed, false);
+        }
+        for body in [main.as_slice(), side.as_slice()] {
+            let refused = messages_at_snapshot(&stub, &snapshot, body);
+            assert!(
+                refused.starts_with("HTTP/1.1 400 "),
+                "{malformed}: {refused}"
+            );
+            let error = J::parse(refused.split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(
+                error.get("error").unwrap().get("type").and_then(J::as_str),
+                Some("invalid_finite_global_mode")
+            );
+            assert_eq!(stub.st().limit_remaining, None);
+            assert!(stub.st().limit_arm.is_none());
+        }
+        let log = std::fs::read_to_string(dir.path().join("requests")).unwrap();
+        assert!(
+            log.contains(&format!(
+                "mode={malformed} invalid finite global mode refused"
+            )),
+            "{log}"
+        );
+    }
+}
+
+#[test]
+fn a_control_replacing_a_finite_snapshot_admits_only_the_new_allowance() {
+    replaced_finite_mode_admits_its_current_allowance(false);
+}
+
+#[test]
+fn a_mode_file_replacing_a_finite_snapshot_admits_only_the_new_allowance() {
+    replaced_finite_mode_admits_its_current_allowance(true);
+}
+
+#[test]
+fn every_admitting_protocol_refuses_a_reserved_mode_replaced_after_its_snapshot() {
+    let original = "limit-after:1:five_hour:180000";
+    let stub = Stub::new(Args {
+        mode: original.to_string(),
+        ..Args::default()
+    });
+    let snapshot = stub.mode();
+    let body = b"{}";
+    let req = Request {
+        method: "POST".into(),
+        target: "/responses".into(),
+        version: "HTTP/1.1".into(),
+        headers: Vec::new(),
+        body: body.to_vec(),
+    };
+    let side = Request {
+        headers: vec![("x-tbh-agent-role".into(), "subagent".into())],
+        method: "POST".into(),
+        target: "/responses".into(),
+        version: "HTTP/1.1".into(),
+        body: body.to_vec(),
+    };
+    for protocol in [
+        "Messages",
+        "Responses",
+        "Muse main",
+        "Muse side",
+        "Chat",
+        "Grok",
+        "Gemini",
+    ] {
+        let answer_for = |mode: &str| {
+            wire_answer(&stub, |out| match protocol {
+                "Messages" => {
+                    stub.messages("POST", "/v1/messages", body, (mode.to_string(), "key"), out)
+                }
+                "Responses" => stub.responses(
+                    "POST",
+                    "/v1/responses",
+                    body,
+                    mode,
+                    None,
+                    Dialect::Codex,
+                    out,
+                ),
+                "Muse main" => stub.muse("POST", "/responses", body, mode, &req, out),
+                "Muse side" => stub.muse("POST", "/responses", body, mode, &side, out),
+                "Chat" => stub.chat("POST", "/v1/chat/completions", body, mode, None, out),
+                "Grok" => stub.xai_chat("POST", "/v1/chat/completions", body, mode, "key", out),
+                "Gemini" => stub.gemini(
+                    "POST",
+                    "/v1beta/models/lab:generateContent",
+                    ("lab", gemini::Verb::Generate),
+                    body,
+                    mode,
+                    "key",
+                    out,
+                ),
+                _ => unreachable!(),
+            })
+        };
+        stub.set_mode(original, false);
+        assert!(
+            answer_for("ok").starts_with("HTTP/1.1 200 "),
+            "{protocol}: ordinary control"
+        );
+        stub.set_mode("limit-after:bad", false);
+        let answer = answer_for(&snapshot);
+        assert!(answer.starts_with("HTTP/1.1 400 "), "{protocol}: {answer}");
+        let error = J::parse(answer.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(
+            error.get("error").unwrap().get("type").and_then(J::as_str),
+            Some("invalid_finite_global_mode"),
+            "{protocol}: {error:?}"
+        );
+    }
+    assert_eq!(stub.st().limit_remaining, None);
+    assert!(stub.st().limit_arm.is_none());
+}
+
+/// A GATED RULE HOLDS ITS REPLY ON EVERY PROTOCOL until the lab opens its gate
+/// ([`Stub::gated_reply`], the forever lab's need gate): a gate the lab opens later holds the
+/// reply until then, and each protocol's custom reply logs its gate opened. Negative control:
+/// one protocol taking its reply with `with_reply` alone (agy's Gemini did, so land-a's need came
+/// and went before the lab read it).
+#[test]
+fn a_gated_rule_holds_its_reply_on_every_protocol() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let log = dir.path().join("stub.log");
+    std::fs::write(
+        dir.path().join("gated.json"),
+        r#"{"text":"LANDED","gate":"g"}"#,
+    )
+    .unwrap();
+    let stub = Stub::new(Args {
+        mode: "gated".to_string(),
+        modes_dir: Some(dir.path().to_path_buf()),
+        log: Some(log.clone()),
+        ..Args::default()
+    });
+    let opened = || {
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .matches("gate g opened")
+            .count()
+    };
+    let body = b"{}";
+    // Grok and Gemini serve a custom mode to a main turn alone, one that offers tools.
+    let grok = br#"{"model":"grok-x","stream":true,"tools":[{"type":"function","function":{"name":"run_command"}}],"messages":[{"role":"user","content":"hi"}]}"#;
+    let gemini_turn = br#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"tools":[{"functionDeclarations":[{"name":"read"}]}]}"#;
+    let req = Request {
+        method: "POST".into(),
+        target: "/responses".into(),
+        version: "HTTP/1.1".into(),
+        headers: Vec::new(),
+        body: body.to_vec(),
+    };
+    let answer_for = |protocol: &str| {
+        wire_answer(&stub, |out| match protocol {
+            "Messages" => stub.messages(
+                "POST",
+                "/v1/messages",
+                body,
+                ("gated".to_string(), "key"),
+                out,
+            ),
+            "Responses" => stub.responses(
+                "POST",
+                "/v1/responses",
+                body,
+                "gated",
+                None,
+                Dialect::Codex,
+                out,
+            ),
+            "Muse" => stub.muse("POST", "/responses", body, "gated", &req, out),
+            "Chat" => stub.chat("POST", "/v1/chat/completions", body, "gated", None, out),
+            "Grok" => stub.xai_chat("POST", "/v1/chat/completions", grok, "gated", "key", out),
+            "Gemini" => stub.gemini(
+                "POST",
+                "/v1beta/models/lab:generateContent",
+                ("lab", gemini::Verb::Generate),
+                gemini_turn,
+                "gated",
+                "key",
+                out,
+            ),
+            _ => unreachable!(),
+        })
+    };
+    let gate = gate_path(dir.path(), "g");
+    let late = {
+        let gate = gate.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            std::fs::write(&gate, b"").unwrap();
+        })
+    };
+    let began = std::time::Instant::now();
+    let first = answer_for("Messages");
+    late.join().unwrap();
+    assert!(
+        began.elapsed() >= Duration::from_millis(300),
+        "the reply waited for its gate"
+    );
+    assert!(first.starts_with("HTTP/1.1 200 "), "{first}");
+    assert_eq!(opened(), 1, "Messages");
+    for (n, protocol) in ["Responses", "Muse", "Chat", "Grok", "Gemini"]
+        .into_iter()
+        .enumerate()
+    {
+        let answer = answer_for(protocol);
+        assert!(answer.starts_with("HTTP/1.1 200 "), "{protocol}: {answer}");
+        assert_eq!(opened(), n + 2, "{protocol}: its reply held for the gate");
+    }
+}
+
+#[test]
+fn finite_modes_are_global_without_swallowing_credential_override_precedence() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let file = dir.path().join("auth.json");
+    std::fs::write(&file, r#"{"key":"500"}"#).unwrap();
+    let mode = "limit-after:1:five_hour:180000";
+    let (port, _) = start(Args {
+        mode: mode.to_string(),
+        auth_modes_file: Some(file.clone()),
+        ..Args::default()
+    })
+    .unwrap();
+    let client = aterm_http::Client::new(
+        aterm_http::Trust::PlatformVerifier,
+        aterm_http::ProxyMode::Direct,
+        Duration::from_secs(60),
+    );
+    let main = r#"{"model":"claude-x","stream":false,"max_tokens":32000,"tools":[{}],"messages":[{"role":"user","content":"initial task"}]}"#;
+    let post = || {
+        client
+            .post(&format!("http://127.0.0.1:{port}/v1/messages"))
+            .header("Authorization", &format!("Bearer {LAB_CODEX_KEY}"))
+            .send(main.as_bytes())
+            .unwrap()
+    };
+    assert_eq!(
+        post().status(),
+        500,
+        "existing nonfinite credential precedence remains"
+    );
+    std::fs::write(&file, format!(r#"{{"key":"{mode}"}}"#)).unwrap();
+    let refused = post();
+    assert_eq!(
+        refused.status(),
+        400,
+        "even an equal string has explicit credential provenance"
+    );
+    assert!(String::from_utf8_lossy(refused.body()).contains("finite_mode_requires_global"));
+    std::fs::write(&file, r#"{"key":"off"}"#).unwrap();
+    assert_eq!(
+        post().status(),
+        200,
+        "neither override spent global allowance"
+    );
+    assert_eq!(post().status(), 429);
+    for invalid in [
+        "limit-after:bad",
+        "limit-after:1:x:0",
+        "limit-after:1:x:2:ok:extra",
+    ] {
+        control(&port.to_string(), &format!("/__mode?m={invalid}")).unwrap();
+        let answer = post();
+        assert_eq!(answer.status(), 400);
+        assert!(String::from_utf8_lossy(answer.body()).contains("invalid_finite_global_mode"));
+    }
+}
+
+#[test]
+fn prearmed_side_roles_and_grok_side_forms_spend_no_main_allowance() {
+    let (port, _) = start(Args {
+        mode: "limit-after:1:five_hour:180000".to_string(),
+        ..Args::default()
+    })
+    .unwrap();
+    let client = aterm_http::Client::new(
+        aterm_http::Trust::PlatformVerifier,
+        aterm_http::ProxyMode::Direct,
+        Duration::from_secs(60),
+    );
+    let responses = r#"{"input":[{"role":"user","content":"hi"}]}"#;
+    assert_eq!(
+        client
+            .post(&format!("http://127.0.0.1:{port}/responses"))
+            .header("x-tbh-agent-role", "subagent")
+            .send(responses.as_bytes())
+            .unwrap()
+            .status(),
+        200
+    );
+    let auth = format!("Bearer {}", xai::LAB_XAI_KEY);
+    let post = |body: &str| {
+        client
+            .post(&format!("http://127.0.0.1:{port}/v1/chat/completions"))
+            .header("Authorization", &auth)
+            .send(body.as_bytes())
+            .unwrap()
+    };
+    let predict = format!(
+        r#"{{"messages":[{{"role":"system","content":"{} into the coding agent."}}]}}"#,
+        xai::PREDICTOR
+    );
+    for side in [
+        r#"{"messages":[]}"#,
+        r#"{"messages":[],"response_format":{"type":"json_schema"}}"#,
+        predict.as_str(),
+    ] {
+        assert_ne!(xai::analyse_chat(side.as_bytes()).kind, "grok");
+        assert_eq!(post(side).status(), 200);
+    }
+    let main = r#"{"tools":[{"type":"function","function":{"name":"read","parameters":{"type":"object"}}}],"messages":[{"role":"user","content":"initial task"}]}"#;
+    assert_eq!(post(main).status(), 200);
+    assert_eq!(post(main).status(), 429);
+    assert_eq!(
+        post(&predict).status(),
+        200,
+        "Grok's existing side-before-error semantics remain after exhaustion"
+    );
+}
+
+#[test]
 fn a_scripted_call_is_read_against_the_tools_its_request_declares() {
     let call = |v: &str| J::parse(v).unwrap();
     // agy 1.4.10's shell tool: closed, with arguments it requires.
@@ -86,6 +830,21 @@ fn a_request_is_classed_by_what_it_asks() {
     assert_eq!(analyse(&compact).kind, "compact");
     assert_eq!(analyse(b"not json").kind, "opaque");
     assert_eq!(analyse(b"[1]").kind, "opaque");
+}
+
+#[test]
+fn received_user_digests_keep_complete_text_and_literal_block_newlines() {
+    let string = analyse(&body(r#"{"messages":[{"role":"user","content":"α\nβ "}]}"#));
+    let blocks = analyse(&body(
+        r#"{"messages":[{"role":"user","content":[{"type":"text","text":"α"},{"type":"tool_result","text":"ignored"},{"type":"text","text":"β "}]}]}"#,
+    ));
+    assert_eq!(string.last_user, "α\nβ ");
+    assert_eq!(blocks.last_user, string.last_user);
+    let whole = message_digest(&string.last_user);
+    assert_eq!(message_digest(&blocks.last_user), whole);
+    for changed in ["α\nβ", "α β ", "α\nb "] {
+        assert_ne!(message_digest(changed), whole, "{changed:?}");
+    }
 }
 
 #[test]
@@ -1320,6 +2079,32 @@ fn a_mode_name_is_judged_as_the_volume_names_its_file() {
     for name in ["mine", "Mine", "refreshed", "slowly"] {
         assert!(super::not_custom(name).is_none(), "{name}");
     }
+    let top = aterm_tempfile::tempdir().unwrap();
+    let modes = top.path().join("modes");
+    std::fs::create_dir_all(&modes).unwrap();
+    std::fs::write(top.path().join("escape.json"), r#"{"status":418}"#).unwrap();
+    std::fs::write(modes.join("v1..v2.json"), r#"{"status":418}"#).unwrap();
+    let s = Stub::new(Args {
+        modes_dir: Some(modes),
+        ..Args::default()
+    });
+    assert!(s.custom_spec(".").is_none());
+    assert!(s.custom_spec("..").is_none());
+    assert!(s.custom_spec("../escape").is_none());
+    assert!(s.custom_spec("c:escape").is_none());
+    assert!(s.custom_spec("v1..v2").is_some());
+    super::sleep_secs(f64::NAN);
+    super::sleep_secs(f64::INFINITY);
+    super::sleep_secs(1e100);
+    super::sleep_secs(-1.0);
+    let hdr = J::parse(r#"{"headers":{"x-ok":"a\r\nb","bad\r\n":"1"}}"#).unwrap();
+    assert_eq!(
+        super::spec_headers(&hdr),
+        vec![("x-ok".to_string(), "a  b".to_string())]
+    );
+    let mut huge =
+        std::io::Cursor::new(b"POST /v1/messages HTTP/1.1\r\nContent-Length: 999999999\r\n\r\n");
+    assert!(read_request(&mut huge).is_err());
 }
 
 #[test]
@@ -2050,5 +2835,148 @@ fn served_on_loopback_each_credential_meets_its_own_mode_and_its_own_headers() {
     assert!(
         !logged.contains(&a) && !logged.contains(&b),
         "no token is logged"
+    );
+}
+
+#[test]
+fn a_limits_429_names_a_windows_reset_moved_from_its_own() {
+    assert_eq!(reset_value("@RESET@", 1_800_000_000), "1800000000");
+    assert_eq!(reset_value("@RESET+120@", 1_800_000_000), "1800000120");
+    assert_eq!(reset_value("@RESET-60@", 1_800_000_000), "1799999940");
+    for kept in [
+        "@RESET+@",
+        "@RESET*2@",
+        "@RESET+1x@",
+        "1800000000",
+        "@SEQ:0.1:0.1@",
+    ] {
+        assert_eq!(reset_value(kept, 1_800_000_000), kept, "{kept}");
+    }
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = dir.path();
+    let headers = dir.join("headers.json");
+    let reset = crate::util::now_secs() + 600;
+    let args = Args {
+        log: Some(dir.join("stub.log")),
+        headers_file: Some(headers.clone()),
+        mode: format!("limit:five_hour:{reset}"),
+        ..Args::default()
+    };
+    let (port, _) = start(args).unwrap();
+    let port = port.to_string();
+    std::fs::write(
+        &headers,
+        r#"{"on429":{"anthropic-ratelimit-unified-5h-utilization":"1.0","anthropic-ratelimit-unified-5h-reset":"@RESET+120@"}}"#,
+    )
+    .unwrap();
+    let turn = r#"{"model":"claude-x","stream":true,"max_tokens":32000,"tools":[{}],"messages":[{"role":"user","content":"hi"}]}"#;
+    let (st, head, _) = post_as(&port, "/v1/messages", None, turn);
+    assert_eq!(st, 429, "at the limit");
+    assert!(
+        head.contains(&format!("anthropic-ratelimit-unified-reset: {reset}")),
+        "the notice's reset: {head}"
+    );
+    assert!(
+        head.contains(&format!(
+            "anthropic-ratelimit-unified-5h-reset: {}",
+            reset + 120
+        )),
+        "the window's reset, two minutes past the notice's: {head}"
+    );
+}
+
+/// THE HOST UNREACHABLE (`drop`, v6 §14.17.5's stand-in): the stub closes each API request's
+/// connection with no answer, and still answers its control paths; `ok` (the control) answers.
+#[test]
+fn a_dropped_mode_closes_each_api_request_with_no_answer() {
+    let args = Args::default();
+    let (port, _) = start(args).unwrap();
+    let port = port.to_string();
+    let client = aterm_http::Client::new(
+        aterm_http::Trust::PlatformVerifier,
+        aterm_http::ProxyMode::Direct,
+        Duration::from_secs(60),
+    );
+    let claude = r#"{"model":"m","stream":false,"messages":[{"role":"user","content":"hi"}]}"#;
+    let post = || {
+        client
+            .post(&format!("http://127.0.0.1:{port}/v1/messages"))
+            .send(claude.as_bytes())
+    };
+    control(&port, "/__mode?m=drop").unwrap();
+    assert!(post().is_err(), "no answer while the mode is drop");
+    assert!(
+        control(&port, "/__status").unwrap().contains("\"drop\""),
+        "the control paths still answer"
+    );
+    control(&port, "/__mode?m=ok").unwrap();
+    assert_eq!(post().unwrap().status(), 200, "the control: ok answers");
+    assert_eq!(not_custom("drop"), Some("a built-in mode"));
+}
+
+/// A 429 that names no limit reset (the `rate-limit` mode's) carries no header made from a
+/// `@RESET…@` template, never the template's words; the headers file's other on429 headers
+/// stand.
+#[test]
+fn a_429_naming_no_reset_carries_no_reset_template() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = dir.path();
+    let headers = dir.join("headers.json");
+    let args = Args {
+        log: Some(dir.join("stub.log")),
+        headers_file: Some(headers.clone()),
+        mode: "rate-limit".to_string(),
+        ..Args::default()
+    };
+    let (port, _) = start(args).unwrap();
+    let port = port.to_string();
+    std::fs::write(
+        &headers,
+        r#"{"on429":{"anthropic-ratelimit-unified-5h-utilization":"1.0","anthropic-ratelimit-unified-5h-reset":"@RESET+120@"}}"#,
+    )
+    .unwrap();
+    let turn = r#"{"model":"claude-x","stream":true,"max_tokens":32000,"tools":[{}],"messages":[{"role":"user","content":"hi"}]}"#;
+    let (st, head, _) = post_as(&port, "/v1/messages", None, turn);
+    assert_eq!(st, 429, "rate-limited");
+    assert!(
+        !head.to_ascii_lowercase().contains("@reset"),
+        "no template on the wire: {head}"
+    );
+    assert!(
+        !head.contains("anthropic-ratelimit-unified-5h-reset:"),
+        "no reset to set it against: {head}"
+    );
+    assert!(
+        head.contains("anthropic-ratelimit-unified-5h-utilization: 1.0"),
+        "the other headers stand: {head}"
+    );
+}
+
+/// THE ANTHROPIC 429 NAMES ITS WAIT IN A HEADER ALONE (v6 §14.17.5.4): `rate-limit:<secs>` on the
+/// Messages API answers the real API's body, which names no number, with the wait in its
+/// `retry-after` header; the Responses API's body names it in its words (the control).
+#[test]
+fn an_anthropic_rate_limit_names_its_wait_in_its_header_alone() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let args = Args {
+        log: Some(dir.path().join("stub.log")),
+        mode: "rate-limit:150".to_string(),
+        ..Args::default()
+    };
+    let (port, _) = start(args).unwrap();
+    let turn = r#"{"model":"claude-x","stream":true,"max_tokens":32000,"tools":[{}],"messages":[{"role":"user","content":"hi"}]}"#;
+    let (st, head, body) = post_as(&port.to_string(), "/v1/messages", None, turn);
+    assert_eq!(st, 429, "rate-limited");
+    assert!(head.contains("retry-after: 150"), "{head}");
+    assert!(
+        body.contains("rate_limit_error") && !body.contains("150") && !body.contains("try again"),
+        "{body}"
+    );
+    let (st, body, _) = responses_error("rate-limit:150", "5").unwrap();
+    assert_eq!(st, 429);
+    assert!(
+        body.py().contains("Please try again in 150s."),
+        "{}",
+        body.py()
     );
 }

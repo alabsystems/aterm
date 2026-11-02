@@ -5,6 +5,7 @@
 # compares the glass's frames on each side of the flip. A light scheme's DECSCNM flash: Default
 # Light's colours, the screen reversed for 100 ms mid-trail (a visual bell).
 
+scale 2
 grid 24 100
 style rainbow kitty
 hz 60

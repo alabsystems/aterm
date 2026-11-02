@@ -125,6 +125,14 @@ impl Shared {
                 let _ = UiaDisconnectProvider(root.as_raw());
             }
         }
+        // While MSAA clients listen, UI Automation keeps every provider that
+        // raised an event in a map it frees per window only on this call.
+        // SAFETY: `hwnd` is still the window's handle: `close` runs at its
+        // WM_NCDESTROY or from the adapter's drop, which `Adapter::new`
+        // requires to precede the handle's end.
+        unsafe {
+            UiaReturnRawElementProvider(hwnd(self.hwnd), 0, 0, std::ptr::null_mut());
+        }
     }
 
     /// The fragment root's `IRawElementProviderSimple`, owned.

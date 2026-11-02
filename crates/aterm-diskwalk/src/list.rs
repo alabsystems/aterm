@@ -376,25 +376,31 @@ pub(crate) mod bulk {
             }
             let mut off = 0usize;
             for _ in 0..n {
+                let Some(hdr_end) = off.checked_add(4) else {
+                    break;
+                };
                 let Some(len) = self
                     .buf
-                    .get(off..off + 4)
+                    .get(off..hdr_end)
                     .and_then(|b| b.try_into().ok())
                     .map(u32::from_ne_bytes)
                 else {
                     break;
                 };
                 let len = len as usize;
-                let Some(entry) = self.buf.get(off..off + len) else {
-                    break;
-                };
                 if len < 4 {
                     break;
                 }
+                let Some(end) = off.checked_add(len) else {
+                    break;
+                };
+                let Some(entry) = self.buf.get(off..end) else {
+                    break;
+                };
                 if let Some(e) = parse(entry, self.private) {
                     visit(&e);
                 }
-                off += len;
+                off = end;
             }
             Ok(true)
         }

@@ -91,8 +91,9 @@ const fn in_place(why: Unused) -> bool {
 }
 
 /// Advisory tooling cleanup candidates at `now`. An entry that needs staging is listed only
-/// while it can be staged ([`super::stage_for`]). [`reclaim`] checks active use before removal;
-/// this read-only observation does not probe process ownership.
+/// while it can be staged ([`super::stage_for`]), and a stage an earlier pass left with the
+/// forecast of what of it will stay ([`Planned::stage`]). [`reclaim`] checks active use before
+/// removal; this read-only observation does not probe process ownership.
 #[must_use]
 pub fn plan(root: &Path, now: SystemTime) -> Vec<Planned> {
     entries(root)
@@ -102,11 +103,15 @@ pub fn plan(root: &Path, now: SystemTime) -> Vec<Planned> {
             if !in_place(why) {
                 super::stage_for(&entry, root, &stage_base(entry.file_name()?))?;
             }
+            if why == Unused::Unfinished {
+                return Some(Planned::stage(entry));
+            }
             Some(Planned {
                 path: entry.clone(),
                 why,
                 paths: vec![entry],
                 held: false,
+                stays: None,
             })
         })
         .collect()
@@ -114,10 +119,14 @@ pub fn plan(root: &Path, now: SystemTime) -> Vec<Planned> {
 
 /// Remove what nobody uses from the tooling cache `root` at `now` ([`why`]), `record` asked first
 /// for each (`false` keeps it); each removed whole ([`super::remove::tree`]) is returned with why,
-/// and a stage some entry of which stayed with what stayed ([`Unused::Stayed`]), for the next pass.
-/// Each stage is visited once a pass, as the one listing of `root` reads it, and an entry is
-/// staged under the lowest free stage name from `.provision-reclaim-<name>`, never over another
-/// entry: a stage that keeps an entry costs only itself, never the next entry of its name.
+/// a stage some entry of which stayed with what stayed ([`Unused::Stayed`]), for the next pass,
+/// and an entry whose intent is on record and nothing of which went (its rename aside refused
+/// after the check, or a process came to use it since; one in a stage by then is returned as the
+/// stage, [`super::Refusal::Staged`]) with [`Unused::Refused`], so every intent on record closes
+/// with an outcome. Each stage is visited once a pass, as the one listing of
+/// `root` reads it, and an entry is staged under the lowest free stage name from
+/// `.provision-reclaim-<name>`, never over another entry: a stage that keeps an entry costs only
+/// itself, never the next entry of its name.
 pub fn reclaim(
     root: &Path,
     now: SystemTime,
@@ -132,7 +141,7 @@ pub(super) fn reclaim_on(
     record: &mut dyn FnMut(&Path, Unused) -> bool,
     fence: &super::fence::Fence<'_>,
 ) -> Vec<(PathBuf, Unused)> {
-    let mut removed = Vec::new();
+    let mut intents = super::Intents::new(record);
     for entry in entries(root) {
         let Some(why) = why(&entry, now) else {
             continue;
@@ -159,34 +168,53 @@ pub(super) fn reclaim_on(
                 .collect();
             fence.clear_all(&paths)
         };
-        if !clear(&entry) || !record(&entry, why) || !clear(&entry) {
+        // A stage an earlier pass left is in its stage from its intent on.
+        let asked = if why == Unused::Unfinished {
+            clear(&entry) && intents.ask_staged(&entry, why)
+        } else {
+            clear(&entry) && intents.ask(&entry, why)
+        };
+        if !asked {
             continue;
         }
-        let stage = if in_place(why) {
-            entry.clone()
-        } else {
-            let Some(stage) = base.and_then(|b| super::stage_aside(&entry, root, &b).ok()) else {
-                continue;
-            };
-            stage
+        if !clear(&entry) {
+            intents.stop();
+            continue;
+        }
+        let stage = match &base {
+            Some(base) if !in_place(why) => {
+                super::seams::staging(&entry);
+                match super::stage_aside(&entry, root, base) {
+                    Ok(stage) => {
+                        intents.moved(&stage);
+                        stage
+                    }
+                    Err(e) => {
+                        intents.refused(super::Refusal::Rename(e.kind()));
+                        continue;
+                    }
+                }
+            }
+            _ => entry.clone(),
         };
         if !clear(&stage) {
+            intents.stop();
             continue;
         }
         let left = super::remove::tree(&stage);
         if left.whole() {
-            removed.push((entry, why));
+            intents.outcome(entry, why);
         } else {
-            removed.push((
+            intents.outcome(
                 stage,
                 Unused::Stayed {
                     stayed: left.stayed,
                     freed: left.freed,
                 },
-            ));
+            );
         }
     }
-    removed
+    intents.finish()
 }
 
 /// The original tooling row a stage name records, including a later unique stage's suffix.
@@ -485,6 +513,168 @@ mod tests {
             assert!(!root.join(format!("{STAGE}{name}")).exists());
         }
         assert_eq!(std::fs::read(outside).unwrap(), b"outside");
+    }
+
+    /// A TOOL WHOSE RENAME IS REFUSED ONCE ITS INTENT IS ON RECORD CLOSES THAT INTENT: a pinned
+    /// tool unused a month passes the check and its intent is put on record; only then, before
+    /// its rename aside ([`super::super::seams::on_staging`]), is the rename made to fail (the
+    /// tooling root set to take no new name, every Unix, not as root; on macOS, the tool's folder
+    /// flagged `uchg`). The pass returns it refused by the rename's error kind, nothing of it
+    /// gone, whole and unstaged; a later pass with the refusal cleared takes it. NEGATIVE
+    /// CONTROL: without the outcome, the pass returns nothing for the intent it put on record.
+    #[cfg(unix)]
+    #[test]
+    fn a_tool_whose_rename_is_refused_after_its_intent_closes_that_intent() {
+        use super::super::seams;
+        struct Undo(PathBuf, fn(&Path));
+        impl Drop for Undo {
+            fn drop(&mut self) {
+                seams::clear();
+                (self.1)(&self.0);
+            }
+        }
+        type Refuse = (&'static str, fn(&Path), fn(&Path));
+        let mut refusals: Vec<Refuse> = Vec::new();
+        if crate::platform::our_uid() != 0 {
+            refusals.push((
+                "a root that takes no new name",
+                |tool| {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    std::fs::set_permissions(
+                        tool.parent().unwrap(),
+                        std::fs::Permissions::from_mode(0o555),
+                    )
+                    .unwrap();
+                },
+                |tool| {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    let _ = std::fs::set_permissions(
+                        tool.parent().unwrap(),
+                        std::fs::Permissions::from_mode(0o755),
+                    );
+                },
+            ));
+        }
+        #[cfg(target_os = "macos")]
+        refusals.push((
+            "uchg",
+            |tool| crate::platform::set_file_flags(tool, libc::UF_IMMUTABLE).unwrap(),
+            |tool| {
+                let _ = crate::platform::set_file_flags(tool, 0);
+            },
+        ));
+        assert!(!refusals.is_empty(), "no refusal this user can set");
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let root = dir.path().join("tooling.noindex");
+        let now = SystemTime::now();
+        let refused = Unused::Refused {
+            by: super::super::Refusal::Rename(std::io::ErrorKind::PermissionDenied),
+        };
+        for (n, (what, refuse, undo)) in refusals.into_iter().enumerate() {
+            let tool = root.join(format!("pwsh-7.6.{n}"));
+            file(&tool.join("bin/tool"));
+            age_tree(&tool, now - RECLAIM_IDLE - DAY);
+            let undone = Undo(tool.clone(), undo);
+            seams::on_staging(refuse);
+            let mut asked = Vec::new();
+            let went = reclaim(&root, now, &mut |p, _| {
+                asked.push(p.to_path_buf());
+                true
+            });
+            assert_eq!(asked, std::slice::from_ref(&tool), "{what}: its intent");
+            assert_eq!(went, [(tool.clone(), refused)], "{what}: its outcome");
+            assert!(tool.join("bin/tool").is_file(), "{what}: whole");
+            assert!(
+                entries(&root).iter().all(|e| e == &tool),
+                "{what}: never staged"
+            );
+            drop(undone);
+            let went = reclaim(&root, now, &mut |_, _| true);
+            assert!(
+                matches!(went.as_slice(), [(p, Unused::Tooling { .. })] if p == &tool),
+                "{what}: the next pass takes it: {went:?}"
+            );
+            assert!(!tool.exists(), "{what}");
+        }
+    }
+
+    /// A TOOL STOPPED ONCE STAGED CLOSES AS ITS STAGE: a pinned tool unused a month whose rename
+    /// aside went through, and that a process comes to use in its stage once its intent is on
+    /// record, is returned as that stage with nothing of it gone ([`super::super::Refusal::Staged`]),
+    /// never as the tool's own path, which no longer holds it; the stage holds it all. That stage,
+    /// stopped the same way by the next pass, is returned as itself, `Staged`; and the pass after,
+    /// the process gone, finishes it ([`Unused::Unfinished`]). NEGATIVE CONTROL: the move not
+    /// marked on the open intent, the pass returns the tool's gone path as `Stopped`.
+    #[cfg(unix)]
+    #[test]
+    fn a_tool_stopped_once_staged_closes_as_its_stage() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let root = dir.path().join("tooling.noindex");
+        let now = SystemTime::now();
+        let tool = root.join("pwsh-7.6.9");
+        file(&tool.join("bin/tool"));
+        age_tree(&tool, now - RECLAIM_IDLE - DAY);
+        let (held, asked) = (std::cell::Cell::new(true), std::cell::Cell::new(false));
+        let processes = |dirs: &[PathBuf], _: &[u32]| {
+            let users = dirs
+                .iter()
+                .filter(|d| {
+                    held.get()
+                        && asked.get()
+                        && d.file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| name.starts_with(STAGE))
+                })
+                .map(|stage| aterm_uds::holders::PathUse {
+                    pid: 35,
+                    how: "cwd",
+                    path: stage.join("bin"),
+                })
+                .collect();
+            Ok(aterm_uds::holders::PathScan {
+                users,
+                ..aterm_uds::holders::PathScan::default()
+            })
+        };
+        let fence = super::super::fence::Fence::new(&processes);
+        let pass = || {
+            asked.set(false);
+            reclaim_on(
+                &root,
+                now,
+                &mut |_, _| {
+                    asked.set(true);
+                    true
+                },
+                &fence,
+            )
+        };
+        let staged = Unused::Refused {
+            by: super::super::Refusal::Staged,
+        };
+        let went = pass();
+        let stages: Vec<PathBuf> = entries(&root);
+        assert_eq!(stages.len(), 1, "moved aside: {went:?}");
+        let stage = stages[0].clone();
+        assert_ne!(stage, tool, "moved aside");
+        assert_eq!(
+            went,
+            [(stage.clone(), staged)],
+            "its stage, nothing of it gone"
+        );
+        assert!(stage.join("bin/tool").is_file(), "the stage holds it all");
+        assert_eq!(
+            pass(),
+            [(stage.clone(), staged)],
+            "the stage, stopped after its intent, is itself"
+        );
+        held.set(false);
+        assert_eq!(
+            pass(),
+            [(stage.clone(), Unused::Unfinished)],
+            "the next pass finishes it"
+        );
+        assert!(!stage.exists() && !tool.exists());
     }
 
     /// A STUCK STAGE KEEPS NO TOOL OF ITS NAME: beside `.provision-reclaim-pwsh-7.6.7`, a stage an

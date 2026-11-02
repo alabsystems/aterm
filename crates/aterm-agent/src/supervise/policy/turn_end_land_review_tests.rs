@@ -5,6 +5,27 @@ use crate::harness::repo_work::RepoWork;
 
 const OTHER_DEFENSE: &str = "Merged the docs and pushed main.\nNothing left: all of it is merged into the remote main branch.";
 
+/// THE CHECK `a` (already acted on at `then`) ANSWERED `LANDED` a minute later by `program`:
+/// whether that answer landed the task.
+fn landed_answer(
+    st: &mut TurnEndState,
+    a: &TurnEndAction,
+    then: Instant,
+    program: aterm_phase::Program,
+) -> bool {
+    assert_eq!(
+        a.rule_id(),
+        Some(RULE_LAND_CHECK),
+        "the check, not a landing: {a:?}"
+    );
+    assert!(!st.landed(), "a defense lands nothing: {a:?}");
+    let answer = land(TurnEndReading {
+        program,
+        ..idle(LANDED_WORD, Some(Duration::from_secs(10)))
+    });
+    at(st, &answer, then + MIN) == TurnEndAction::Nothing && st.landed() && st.task_done()
+}
+
 #[test]
 fn an_untaken_land_act_lands_nothing_on_the_defense_it_was_typed_over() {
     let take = TurnEndTiming::default().take_within;
@@ -37,9 +58,7 @@ fn an_untaken_land_act_lands_nothing_on_the_defense_it_was_typed_over() {
         );
         let mut st = TurnEndState::default();
         let then = start(&mut st);
-        let a = at(&mut st, &land(idle(DEFENSE, Some(2 * MIN))), then + 2 * MIN);
-        assert_eq!(a, TurnEndAction::Nothing, "{what}");
-        assert!(st.landed(), "{what}");
+        lands_on_check(&mut st, &land(idle(DEFENSE, Some(2 * MIN))), then + 2 * MIN);
     }
 }
 
@@ -56,7 +75,7 @@ fn a_landing_off_stood_over_holds_only_on_its_own_words() {
     }
     let (mut st, now) = landed_at(t0());
     st.park_off();
-    let r = land(idle(DEFENSE, None));
+    let r = land(idle(LANDED_WORD, None));
     assert!(!st.reads_record(&r), "its own words: nothing to read");
     let a = at(&mut st, &r, now + 10 * MIN);
     assert_eq!(a, TurnEndAction::Nothing);
@@ -70,8 +89,13 @@ fn a_records_landing_holds_only_at_a_clean_defense() {
         st.observe(&r, t0());
         st.record_landing_holds()
     };
-    assert!(point(land(idle(DEFENSE, None))));
+    assert!(point(land(idle(DEFENSE, None))), "an older build's defense");
+    assert!(point(land(idle(LANDED_WORD, None))), "the check's answer");
     for (why, r) in [
+        (
+            "an answer that lists",
+            land(idle("LANDED, except the docs PR", None)),
+        ),
         ("a report", land(idle("Renamed the lexer's tokens.", None))),
         ("the token", land(idle(FINISHED_REPORT, None))),
         (
@@ -284,12 +308,12 @@ fn an_off_and_back_re_arms_land_over_the_repository_as_it_is() {
     let dirty = |r: TurnEndReading| over_repo(r, uncommitted_repo());
     let (mut st, now) = landed_at(t0());
     assert!(
-        st.landing_words_read(Some(DEFENSE)),
+        st.landing_words_read(Some(LANDED_WORD)),
         "no Off: nothing to ask"
     );
     st.park_off();
     assert!(
-        !st.landing_words_read(Some(DEFENSE)),
+        !st.landing_words_read(Some(LANDED_WORD)),
         "after an Off the repository is asked"
     );
     let (a, _) = until_acted(&mut st, &dirty(land(idle(DEFENSE, None))), now + 10 * MIN);
@@ -313,7 +337,7 @@ fn an_off_and_back_re_arms_land_over_the_repository_as_it_is() {
     }
     let (mut st, now) = landed_at(t0());
     st.park_off();
-    let (a, _) = until_acted(&mut st, &land(idle(DEFENSE, None)), now + 10 * MIN);
+    let (a, _) = until_acted(&mut st, &land(idle(LANDED_WORD, None)), now + 10 * MIN);
     assert_eq!(a, TurnEndAction::Nothing);
     assert!(st.landed());
     let mut st = TurnEndState::default();
@@ -386,11 +410,11 @@ fn a_handoff_after_an_untaken_land_act_types_it_again() {
         let mut st = TurnEndState::default();
         st.seed_land(0, true, false, false);
         st.seed_land_act(said, lead, typed_ago, t0());
-        let (a, _) = until_acted(&mut st, r, t0());
-        (st, a)
+        let (a, then) = until_acted(&mut st, r, t0());
+        (st, a, then)
     };
     let stale = land(idle(DEFENSE, None));
-    let (st, a) = successor(&stale);
+    let (st, a, _) = successor(&stale);
     assert!(!st.landed() && !st.task_done(), "{a:?}");
     assert_eq!(a.rule_id(), Some(RULE_LAND_NUDGE), "{a:?}");
     for (why, r) in [
@@ -417,7 +441,7 @@ fn a_handoff_after_an_untaken_land_act_types_it_again() {
             },
         ),
     ] {
-        let (st, a) = successor(&r);
+        let (st, a, _) = successor(&r);
         assert!(!st.landed(), "{why}: {a:?}");
     }
     for (why, r) in [
@@ -444,9 +468,11 @@ fn a_handoff_after_an_untaken_land_act_types_it_again() {
         ),
         ("a turn seen run", land(idle(DEFENSE, Some(3 * MIN)))),
     ] {
-        let (st, a) = successor(&r);
-        assert_eq!(a, TurnEndAction::Nothing, "{why}");
-        assert!(st.landed(), "{why}");
+        let (mut st, a, then) = successor(&r);
+        assert!(
+            landed_answer(&mut st, &a, then, aterm_phase::Program::Claude),
+            "{why}"
+        );
     }
 }
 
@@ -464,18 +490,19 @@ fn a_handoff_nothing_can_read_the_land_act_on_lands_its_defense() {
             program,
             ..idle(DEFENSE, None)
         });
-        let (a, _) = until_acted(&mut st, &r, t0());
-        (st, a)
+        let (a, then) = until_acted(&mut st, &r, t0());
+        (st, a, then)
     };
     for program in [aterm_phase::Program::Agy, aterm_phase::Program::Muse] {
-        let (st, a) = successor(program, true);
-        assert_eq!(a, TurnEndAction::Nothing, "{program:?}");
-        assert!(st.landed() && st.task_done(), "{program:?}: {a:?}");
+        let (mut st, a, then) = successor(program, true);
+        assert!(landed_answer(&mut st, &a, then, program), "{program:?}");
     }
-    let (st, a) = successor(aterm_phase::Program::Claude, false);
-    assert_eq!(a, TurnEndAction::Nothing, "no act seeded");
-    assert!(st.landed(), "no act seeded: {a:?}");
-    let (st, a) = successor(aterm_phase::Program::Claude, true);
+    let (mut st, a, then) = successor(aterm_phase::Program::Claude, false);
+    assert!(
+        landed_answer(&mut st, &a, then, aterm_phase::Program::Claude),
+        "no act seeded"
+    );
+    let (st, a, _) = successor(aterm_phase::Program::Claude, true);
     assert!(!st.landed(), "{a:?}");
     assert_eq!(a.rule_id(), Some(RULE_LAND_NUDGE), "{a:?}");
 }
@@ -505,7 +532,7 @@ fn a_seeded_landing_holds_over_someone_elses_edits_until_a_turn() {
         panic!("{a:?}");
     };
     assert!(
-        text.contains("commit, merge and push it to the remote main first"),
+        text.starts_with(LAND_CONTRADICTED_HEAD) && text.contains(CONTRADICTED_GIT_ASK),
         "{text}"
     );
     for (why, words, said) in [
@@ -532,6 +559,11 @@ fn a_report_read_in_part_or_a_need_said_earlier_lands_nothing() {
         let a = at(&mut st, &land(r), t0() + 3 * MIN);
         (st, a)
     };
+    let lands = |r: TurnEndReading| {
+        let (mut st, a) = after_instruction(r.clone());
+        let (b, _) = check_answered(&mut st, &land(r), &a, t0() + 3 * MIN, LANDED_WORD);
+        b == TurnEndAction::Nothing && st.landed()
+    };
     let cut = TurnEndReading {
         said_cut: true,
         ..idle(DEFENSE, Some(3 * MIN))
@@ -545,14 +577,17 @@ fn a_report_read_in_part_or_a_need_said_earlier_lands_nothing() {
     let (st, a) = after_instruction(earlier);
     assert!(!st.landed(), "a need said earlier: {a:?}");
     assert_eq!(st.standing_needs(), ["the signing credential"]);
-    let (st, a) = after_instruction(idle(DEFENSE, Some(3 * MIN)));
-    assert!(st.landed(), "whole: {a:?}");
+    assert!(
+        matches!(&a, TurnEndAction::Type { text, rule_id }
+            if *rule_id == RULE_LAND_CHECK && text.contains(NEEDS_ACK)),
+        "the check with the needs' ack: {a:?}"
+    );
+    assert!(lands(idle(DEFENSE, Some(3 * MIN))), "whole");
     let plain = TurnEndReading {
         turn_said: Some("Merged the lexer and ran its suite.".to_string()),
         ..idle(DEFENSE, Some(3 * MIN))
     };
-    let (st, a) = after_instruction(plain);
-    assert!(st.landed(), "an earlier message with no need: {a:?}");
+    assert!(lands(plain), "an earlier message with no need");
 }
 
 const FIRST_LAND_ROWS: &[&str] = &[
@@ -711,10 +746,13 @@ fn every_act_fits_the_verbatim_bound_with_all_its_suffixes() {
                  the force-push to main";
     let rules = "keep each commit small and name the stage it lands ".repeat(8);
     let rules = rules.trim_end();
+    // Under Cruise the check's reversible clause and NEEDS YOU's acknowledgment leave the
+    // repository's ask no room beside the go-ahead's word: the ask outranks it ([`fitted_check`]).
+    let cut_check = super::super::go_ahead::unless_held(&done_check_words(0), true).into_owned();
     for (mode, base, ask) in [
         (
             Autopilot::Cruise,
-            done_check_words(0),
+            cut_check,
             "land what of it you made first, and leave what you did not make exactly as it is",
         ),
         (
@@ -754,6 +792,29 @@ fn every_act_fits_the_verbatim_bound_with_all_its_suffixes() {
             assert!(text.contains(ask), "{what}: the repository's ask: {text}");
         }
     }
+    // With no need to acknowledge, the check keeps the go-ahead's word, and the ask rides too.
+    let mut st = TurnEndState::default();
+    act(
+        &mut st,
+        &under(Autopilot::Cruise, idle("Stage 1 landed.", Some(3 * MIN))),
+        t0(),
+    );
+    let unasked = over_repo(
+        under(
+            Autopilot::Cruise,
+            idle(&needs::without_needs(claim), Some(3 * MIN)),
+        ),
+        repo.clone(),
+    );
+    let (a, _) = past_backoff(&mut st, &unasked, t0() + 3 * MIN);
+    let TurnEndAction::Type { text, .. } = &a else {
+        panic!("{a:?}");
+    };
+    assert!(text.starts_with(&done_check_words(0)), "{text}");
+    assert!(
+        text.contains("land what of it you made first") && !text.contains(NEEDS_ACK),
+        "{text}"
+    );
     let found = open_work(Some(&needs::without_needs(claim)));
     assert!(found.len() > OPEN_NAMED, "{found:?}");
     let whole = format!(
@@ -791,8 +852,10 @@ fn the_retired_done_checks_read_as_typed() {
     assert!(RETIRED_DONE_CHECKS.contains(&main));
 }
 
+/// UNDER LAND THE NUDGE NAMES NONE OF THE READER'S WORDS (§5 of the slice's design): a done
+/// claim that names open work gets the plain nudge; only the agent's own list is quoted.
 #[test]
-fn a_land_done_claim_gets_the_nudge_with_its_open_words() {
+fn a_land_done_claim_gets_the_nudge_without_the_readers_words() {
     let nudge_at = |reply: &str| {
         let mut st = TurnEndState::default();
         act(&mut st, &land(idle("Stage 1 landed.", Some(3 * MIN))), t0());
@@ -807,10 +870,8 @@ fn a_land_done_claim_gets_the_nudge_with_its_open_words() {
     assert_eq!(open, ["still open"], "{claim}");
     assert_eq!(
         nudge_at(claim),
-        TurnEndAction::Type {
-            text: act_words(LAND_NUDGE, &[&open_work_suffix(&open).expect("open")], None),
-            rule_id: RULE_LAND_NUDGE,
-        }
+        land_nudged(),
+        "the reader's words name nothing"
     );
     assert_eq!(nudge_at("Merged the parser. All done."), land_nudged());
     let needs_only = "Merged the parser. All done.\nNEEDS YOU: the docs' sign-off is still open";
@@ -874,6 +935,31 @@ fn a_seeded_landings_own_words_hold_over_a_turn_read_cut() {
         ..land(idle(DEFENSE, None))
     };
     let (a, _) = until_acted(&mut st, &r, t0());
+    assert!(!st.landed(), "{a:?}");
+    assert!(matches!(a, TurnEndAction::Type { .. }), "{a:?}");
+}
+
+/// A NEED THE TURN RETRACTED HOLDS NO LANDING BACK (the post-landing review, 2026-11-01): a
+/// restart reading a seeded landing's own words, whose turn named a need in an earlier message
+/// that its last one retracts with `NEEDS YOU: nothing`, keeps the landing, the agent's last word
+/// on its needs winning ([`TurnEndReading::need_before`]). Control: the same need, not
+/// retracted, keeps no landing. Negative control: the earlier messages read for needs as they
+/// stand (`need_before` without `needs::standing_before`) keeps none either.
+#[test]
+fn a_seeded_landings_own_words_hold_past_a_need_the_turn_retracted() {
+    let retracted = format!("{DEFENSE}\nNEEDS YOU: nothing at this point.");
+    let read = |tail: &str| TurnEndReading {
+        turn_said: Some("NEEDS YOU: the signing credential".to_string()),
+        ..land(idle(tail, None))
+    };
+    let mut st = TurnEndState::default();
+    st.seed_landed(said_mark(Some(&retracted)));
+    let a = at(&mut st, &read(&retracted), t0());
+    assert_eq!(a, TurnEndAction::Nothing);
+    assert!(st.landed() && st.task_done(), "{a:?}");
+    let mut st = TurnEndState::default();
+    st.seed_landed(said_mark(Some(DEFENSE)));
+    let (a, _) = until_acted(&mut st, &read(DEFENSE), t0());
     assert!(!st.landed(), "{a:?}");
     assert!(matches!(a, TurnEndAction::Type { .. }), "{a:?}");
 }
@@ -989,12 +1075,9 @@ fn a_defense_with_a_none_line_in_common_words_lands() {
             act(&mut st, &land(idle("Stage 1 landed.", Some(3 * MIN))), t0()),
             land_instruction()
         );
-        let a = at(
-            &mut st,
-            &land(idle(&defense, Some(3 * MIN))),
-            t0() + 3 * MIN,
-        );
-        (st, a)
+        let r = land(idle(&defense, Some(3 * MIN)));
+        let a = at(&mut st, &r, t0() + 3 * MIN);
+        (st, a, r)
     };
     for none in [
         "NEEDS YOU: no action needed from you.",
@@ -1003,8 +1086,9 @@ fn a_defense_with_a_none_line_in_common_words_lands() {
         "NEEDS YOU: nothing from my side.",
         "NEEDS YOU: —",
     ] {
-        let (st, a) = yield_of(none);
-        assert_eq!(a, TurnEndAction::Nothing, "{none:?}");
+        let (mut st, a, r) = yield_of(none);
+        let (b, _) = check_answered(&mut st, &r, &a, t0() + 3 * MIN, LANDED_WORD);
+        assert_eq!(b, TurnEndAction::Nothing, "{none:?}");
         assert!(st.landed(), "{none:?}");
         assert!(
             st.standing_needs().is_empty(),
@@ -1012,7 +1096,7 @@ fn a_defense_with_a_none_line_in_common_words_lands() {
             st.standing_needs()
         );
     }
-    let (st, a) = yield_of("NEEDS YOU: nothing. Please approve the deploy.");
+    let (st, a, _) = yield_of("NEEDS YOU: nothing. Please approve the deploy.");
     assert!(!st.landed(), "{a:?}");
     assert_eq!(st.standing_needs().len(), 1, "{:?}", st.standing_needs());
 }
@@ -1034,16 +1118,18 @@ fn an_untaken_land_act_is_told_by_the_message_that_opened_the_turn() {
                 opened_by: Some(words_lead(opened)),
                 ..land(idle(DEFENSE, None))
             };
-            let (a, _) = until_acted(&mut st, &r, t0());
-            (st, a)
+            let (a, then) = until_acted(&mut st, &r, t0());
+            (st, a, then)
         };
-        let (st, a) = successor("Fix the parser and push it to main.");
+        let (st, a, _) = successor("Fix the parser and push it to main.");
         assert!(!st.landed() && !st.task_done(), "{program:?}: {a:?}");
         assert_eq!(a.rule_id(), Some(RULE_LAND_NUDGE), "{program:?}: {a:?}");
         for opened in [LAND, first.as_str()] {
-            let (st, a) = successor(opened);
-            assert_eq!(a, TurnEndAction::Nothing, "{program:?}: {opened:?}");
-            assert!(st.landed() && st.task_done(), "{program:?}: {opened:?}");
+            let (mut st, a, then) = successor(opened);
+            assert!(
+                landed_answer(&mut st, &a, then, program),
+                "{program:?}: {opened:?}"
+            );
         }
     }
 }

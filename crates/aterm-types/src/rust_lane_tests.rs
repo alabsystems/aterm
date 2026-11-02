@@ -569,6 +569,15 @@ fn a_pin_is_read_the_way_rustup_reads_it() {
     )
     .expect("write");
     assert_eq!(find_pin(&deep).map(|(_, ch)| ch).as_deref(), Some("trust"));
+    std::fs::write(
+        root.join("crates").join("rust-toolchain.toml"),
+        format!(
+            "[toolchain]\nchannel = \"trust\"\n#{}\n",
+            "x".repeat(70 * 1024)
+        ),
+    )
+    .expect("write");
+    assert_eq!(find_pin(&deep), None);
     assert!(is_trust_channel("trust"));
     assert!(is_trust_channel("trust-9192"));
     assert!(!is_trust_channel("1.97.1"));

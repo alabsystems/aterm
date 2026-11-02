@@ -597,6 +597,7 @@ fn status_pid(status: &str) -> Option<u32> {
     status
         .split_whitespace()
         .find_map(|field| field.strip_prefix("pid="))
+        .filter(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
         .and_then(|pid| pid.parse().ok())
 }
 

@@ -631,6 +631,7 @@ impl App {
         };
         let app = self.native_runtime.app(native.instance)?;
         match app.kind() {
+            crate::native_app::AppKind::Mail => Some(restore::NativeTabRestore::Mail),
             crate::native_app::AppKind::About => Some(restore::NativeTabRestore::About),
             crate::native_app::AppKind::SystemState => Some(restore::NativeTabRestore::SystemState),
             crate::native_app::AppKind::Settings => {
@@ -651,7 +652,8 @@ impl App {
                         restore::NativeTabRestore::Markdown { uri }
                     }
                     crate::native_app::AppKind::Editor => restore::NativeTabRestore::Editor { uri },
-                    crate::native_app::AppKind::About
+                    crate::native_app::AppKind::Mail
+                    | crate::native_app::AppKind::About
                     | crate::native_app::AppKind::Settings
                     | crate::native_app::AppKind::SystemState => unreachable!(),
                     crate::native_app::AppKind::Recovery => unreachable!(),
@@ -840,6 +842,10 @@ impl App {
                 }
                 let mut descriptor = match (app.kind(), state) {
                     (
+                        crate::native_app::AppKind::Mail,
+                        crate::native_app::AppViewState::Mail(_),
+                    ) => restore::NativeLeafRestore::mail(),
+                    (
                         crate::native_app::AppKind::About,
                         crate::native_app::AppViewState::About(_),
                     ) => restore::NativeLeafRestore::about(),
@@ -873,6 +879,7 @@ impl App {
                 };
                 match state {
                     crate::native_app::AppViewState::About(_)
+                    | crate::native_app::AppViewState::Mail(_)
                     | crate::native_app::AppViewState::SystemState(_) => {}
                     crate::native_app::AppViewState::Settings(settings) => {
                         if carry_drafts {
@@ -949,6 +956,7 @@ impl App {
         };
         match state {
             crate::native_app::AppViewState::About(_)
+            | crate::native_app::AppViewState::Mail(_)
             | crate::native_app::AppViewState::Settings(_)
             | crate::native_app::AppViewState::SystemState(_) => true,
             crate::native_app::AppViewState::Markdown(markdown) => {
@@ -2290,7 +2298,7 @@ impl App {
             metrics,
             crate::tab_model::TabSet::default(),
         );
-        self.windows.insert(wid, Box::new(ws));
+        self.insert_unattached_window(wid, ws);
         self.frontmost_window = Some(wid);
         wid
     }
@@ -3521,7 +3529,11 @@ impl App {
     ) -> Result<BuiltRestoreLeaf, String> {
         let mark = self.restore_staging_mark(wid);
         let mut reads_harness = false;
+        let mut reads_lab = false;
         match descriptor.restore_tag.as_str() {
+            "mail" => {
+                self.stage_mail_tab(wid)?;
+            }
             "about" => {
                 self.stage_about_tab(wid)
                     .map_err(|why| format!("About could not be reopened: {why:?}"))?;
@@ -3538,6 +3550,7 @@ impl App {
                     .ok_or_else(|| "Settings route is unavailable".to_string())?;
                 self.stage_settings_restore_view(wid, route)?;
                 reads_harness = route == crate::native_settings::SettingsRoute::Harness;
+                reads_lab = route == crate::native_settings::SettingsRoute::Lab;
             }
             "markdown" | "editor" => {
                 let uri = descriptor
@@ -3572,6 +3585,9 @@ impl App {
         }
         if reads_harness && !self.incoming_handoff_pending {
             self.start_harness_stats_refresh();
+            self.publish_native_harness_state();
+        }
+        if reads_lab && !self.incoming_handoff_pending {
             self.publish_native_harness_state();
         }
         Ok((view, presentation, Some(staging_tab)))
@@ -3829,7 +3845,8 @@ impl App {
             crate::native_app::AppKind::Editor => {
                 crate::native_app::AppViewState::Editor(Box::default())
             }
-            crate::native_app::AppKind::About
+            crate::native_app::AppKind::Mail
+            | crate::native_app::AppKind::About
             | crate::native_app::AppKind::Settings
             | crate::native_app::AppKind::SystemState
             | crate::native_app::AppKind::Recovery => {
@@ -4174,6 +4191,7 @@ impl App {
         descriptor: &restore::NativeTabRestore,
     ) -> Option<crate::tab_model::TabId> {
         let result = match descriptor {
+            restore::NativeTabRestore::Mail => self.stage_mail_tab(wid).map(|_| ()),
             restore::NativeTabRestore::About => self
                 .open_about_tab_in_window(wid)
                 .then_some(())

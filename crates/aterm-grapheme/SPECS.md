@@ -37,19 +37,20 @@ the historical development audit `docs/AUDIT-trust-for-test-migration-2026-10-15
   positions, not the iterator's state machine.
 - `G(s)` = `s.graphemes()` as a list; `GI(s)` = `s.grapheme_indices()` as a list.
 - `W(g,cjk)` = `width::grapheme_display_width_inner(g,cjk)`.
-- `GC_a`: the `GridColumns` state machine. `step(st,c)` = `(st', GridStep)`; `col(st)` = its cursor.
-  `GridCols_a(s)` = `str_grid_columns_with(s,a)` = `col(foldl step GridColumns::with_ambiguous_width(a) chars(s))`.
+- `step(st,c)` = `(st', GridStep)` is `GridColumns`'s step and `col(st)` its cursor.
+  `GridCols_a(s)` = `str_grid_columns_with(s,a)` =
+  `col(foldl step GridColumns::with_ambiguous_width(a) chars(s))`.
 - `GG_a(s)` = `grid_graphemes_with(s,a)` as a list of `{text, byte_offset, start_col, end_col}`.
 - `floor(t,p)`: the largest char boundary of `t` that is ≤ `min(p,|t|)`.
-- `Words(t,F)` = `words(t,F)` collected, a list of byte ranges. `Role(c) ∈ {Base, Mark, Prepend,
-  Joiner, Break}` = `word::role`. `InWord(t,u,F)`: declarative membership of unit `u`, given by the
-  rules in `word.rs`'s module doc and stated as W2.
-- `Cost`: a ghost counter of `word::role` calls, the `ROLE_LOOKUPS` seam lifted to spec-only state.
+- `Words(t,F)` = `words(t,F)` collected as byte ranges. `Role(c) ∈ {Base, Mark, Prepend, Joiner,
+  Break}` = `word::role(c)`. `InWord(t,u,F)`: unit `u` is in a word, by the rules W2 states.
+- `Cost`: a ghost counter of `word::role` calls, the `ROLE_LOOKUPS` test seam as spec state.
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes (primary tests; secondary in §2)`,
-`difficulty (Rust features the proof must handle)`, `blocking gaps (audit §7)`.
+`subsumes` names the primary tests (the rest are in §2), `difficulty` the Rust features the
+proof must handle, and `blocking_gaps` rows of the gap table in
+`docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7.
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
@@ -123,7 +124,9 @@ The cheapest set is gaps {0,1}: S16; then {0,1,3}: S6, S7.
 
 ## 2. Test → spec map (TSV)
 
-`primary` is the spec that retires the test. `also` lists the other specs the same test samples.
+`primary` is the spec that retires the test; `also` lists the other specs it samples. A test
+goes once its primary and every `also` spec are proved. The "comment mislabelled" note on
+`test_boundary_class_reuse_across_clusters` is stale: the test has no such comment.
 
 ```tsv
 file	test	primary	also
@@ -175,7 +178,7 @@ tests/uax29_conformance.rs	grapheme_indices_agree_with_graphemes	S2-indices-are-
 tests/uax29_conformance.rs	where_unicode_segmentation_disagreed_this_crate_follows_unicode_16	S1-graphemes-are-uax29	
 ```
 
-## 3. Coverage
+## 3. Tests with no row
 
 - 46 live tests; all 46 map to one of the 29 specs, and 0 non-spec tests remain (§4).
 - The biggest collapses: L1 line breaks (8 primary), S1 UAX #29 (6), P1 script/category tables (4),
@@ -184,12 +187,22 @@ tests/uax29_conformance.rs	where_unicode_segmentation_disagreed_this_crate_follo
 - S1 has 6 primary tests and carries the official `GraphemeBreakTest` corpus; it is also the
   segmentation half of S2, S3, S11, S12, S20, S21 and L1.
 
-## 4. Tests that are not spec samples
+## 4. Proof order
 
-The 21 tests that sampled no production spec are deleted, together with the `#[cfg(test)]`-only API
-they exercised, which had no production caller in the workspace.
+Every spec needs `char`/`&str` carriers (gap 1) besides gap 0.
 
-## 5. Implied specs that look wrong, or disagree with the code
+1. **S16** (gaps 0, 1): range matches on `char`, the first `char`-carrier probe.
+2. **S7**, the bounds lemma for every width spec, then **S6** (gaps 0, 1, 3).
+3. **S5, S13, S15, S4**: table equalities decidable by evaluation over every scalar once tables
+   are carriers. S13 and S15 have their oracles; S5 and S4 wait on §5.2. **S14** is the shared
+   lemma for S13 and S15.
+4. **S8**, then **S9** (case analysis over S5, S6, S13 and S16 plus a `chars()` walk), then
+   **S10** (cross-crate `TextShapingConfig`, gap 12).
+5. **S2**, **S3**, then **S1**, the hardest pure spec, which fixes the sample values of S11, S12,
+   S20 and S21; then **S11** and **S12**.
+6. **S18**, **S20**, **S21**; **S19** after S9 and S17's local step cases; **S17** last, as a
+   cross-crate refinement against aterm-core's `handler_write` (gaps 10, 12).
+7. **W1 → W2 → W3 → W4** (generic closures, gap 11), then **W5** (ghost state).
 
 1. **Two width rules disagree on every lone control.** `grapheme_display_width_inner` returns 1 by an
    explicit branch for a lone C0/DEL/C1 (`tests::single_cluster_widths` pins it for NUL, ESC and
@@ -205,28 +218,13 @@ they exercised, which had no production caller in the workspace.
 4. **A runtime seam stands in for a cost spec.** W5's tests read the `ROLE_LOOKUPS` thread_local. The
    spec needs a ghost counter, which no audit §7 row names; once W5 is Certified the seam goes.
 
-## 6. Proof order (easiest high-value first)
-
-No spec is blocked by gap 0 alone; each needs `char`/`&str` carriers (gap 1). Within that:
-
-1. **S16 small char predicates** (gaps 0,1). Range matches on `char`, an E6 decision tree. Retires 2
-   tests and is the first `char`-carrier probe.
-2. **S7 char-width range and no-panic, then S6 CJK-vs-default** (gaps 0,1,3). Const fns with table
-   reads, shifts and masks; S7 is the bounds lemma for every width spec, S6 retires 1 test and feeds S10.
-3. **S5 width table, then S13, S15, S4** (table equalities, decidable by evaluation over 0x110000
-   scalars once tables are carriers). S13 and S15 have their oracles vendored already (8 tests); S5
-   (4 tests) and S4 (1) first need the missing UCD files (§5.3). **S14 in_ranges** is the shared lemma
-   for S13/S15 and retires 1.
-4. **S8 str_width fold** (lemma).
-5. **S9 grapheme display width** — the single highest-value spec: 22 tests, straight case analysis over
-   S5/S6/S13/S16 plus a `chars()` walk.
-6. **S10 config dispatch** (8 tests; needs cross-crate `TextShapingConfig`, gap 12).
-7. **S2 indices, S3 class reuse.**
-8. **S1 UAX #29 refinement** — the hardest pure spec; it unlocks the exact sample values of S11, S12,
-   S20, S21.
-9. **S11 aggregate (16 tests), S12 split pointwise (4).**
-10. **S18 grid walk, S20 grid spans, S21 position converters** (14 tests).
-11. **S19 VS16 width vs grid**, after S9 and S17's local step cases.
-12. **S17 grid refinement** — cross-crate against aterm-core's `handler_write` (gaps 10, 12).
-13. **W1–W4 word walk** — generic closures (gap 11); W1 → W2 → W3 → W4.
-14. **W5 cost bound** — needs ghost state; last.
+1. **Two width rules disagree on every lone control.** `grapheme_display_width_inner` returns 1
+   for a lone C0, DEL or C1 (`tests::single_cluster_widths` pins NUL, ESC and DEL), while
+   `char_width` and `GridColumns` give a control 0 columns. `tests/emoji_data.rs` filters
+   controls out to agree (S19's `¬c.is_control()`). The owner should pick one rule.
+2. **Missing oracles.** S4 and S5 cannot be stated against the UCD until
+   `GraphemeBreakProperty.txt`, `DerivedCoreProperties.txt` (InCB) and `EastAsianWidth.txt` are
+   vendored in `tests/data` and the table generator's zero-width rule is a Clean def.
+3. **A test seam stands in for a cost spec.** W5's test reads the `#[cfg(test)]` `ROLE_LOOKUPS`
+   thread_local. The spec needs a ghost counter, which no gap row names (closest: 15); the seam
+   goes once W5 is proved.

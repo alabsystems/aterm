@@ -110,8 +110,8 @@ impl NotifyMsg {
 }
 
 #[cfg(any(target_os = "macos", windows, target_os = "linux", test))]
-fn delivers(msg: &NotifyMsg, suppressed: &HashSet<u64>, own_alerts: bool) -> bool {
-    if msg.own && !own_alerts {
+fn delivers(msg: &NotifyMsg, suppressed: &HashSet<u64>, _own_alerts: bool) -> bool {
+    if msg.own {
         return false;
     }
     !suppressed.contains(&msg.session) && msg.validity.as_ref().is_none_or(NoticeValidity::current)
@@ -312,10 +312,7 @@ fn post_for(way: Route, wanted: impl Fn() -> bool) -> Option<Post> {
             None
         }
         Route::Ask | Route::Unasked => {
-            aterm_log::info!(
-                "notices: one not posted: macOS has not let aterm post as itself yet (Notify Me \
-                 When I'm Needed asks)"
-            );
+            aterm_log::info!("notices: one not posted: macOS has not authorized notifications");
             None
         }
         Route::Lapsed => {
@@ -386,7 +383,7 @@ fn way_for(
     if answer.recv_timeout(ASK_WAIT) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
         aterm_log::info!("notices: macOS has not answered aterm's ask within {ASK_WAIT:?}");
     }
-    learn_voice(center, || wake(crate::Wake::NoticeVoice));
+    wake(crate::Wake::NoticeReady);
     match route(center.answer(), bundled, alerts, true) {
         Route::Center if !wanted() => Route::Lapsed,
         way => way,
@@ -431,93 +428,6 @@ fn running_bundled() -> bool {
     *BUNDLED.get_or_init(|| {
         consent::fence_exe().is_some_and(|exe| consent::path_is_in_app_bundle(&exe))
     })
-}
-
-#[cfg(target_os = "macos")]
-static VOICE: Mutex<Option<crate::status_item::NoticeVoice>> = Mutex::new(None);
-
-#[cfg(target_os = "macos")]
-static LEARNING: AtomicBool = AtomicBool::new(false);
-
-/// WHOSE BANNER aterm's own notices arrive as here, as [`deliver`] posts them — what the status item's Notify Me row's hover says.
-pub(crate) fn own_voice() -> Option<crate::status_item::NoticeVoice> {
-    if cfg!(test) {
-        return Some(crate::status_item::NoticeVoice {
-            center: crate::notice_center::Center::Absent,
-            fallback: crate::status_item::NoticeFallback::ScriptEditor,
-        });
-    }
-    platform_voice()
-}
-
-#[cfg(target_os = "macos")]
-fn platform_voice() -> Option<crate::status_item::NoticeVoice> {
-    *VOICE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn platform_voice() -> Option<crate::status_item::NoticeVoice> {
-    None
-}
-
-#[cfg(any(target_os = "macos", test))]
-const fn voice_of(
-    center: crate::notice_center::Center,
-    bundled: bool,
-    bundle_id: bool,
-) -> crate::status_item::NoticeVoice {
-    use crate::status_item::{NoticeFallback, NoticeVoice};
-    let fallback = if bundled {
-        NoticeFallback::Withheld { named: bundle_id }
-    } else {
-        NoticeFallback::ScriptEditor
-    };
-    NoticeVoice { center, fallback }
-}
-
-/// LEARN [`own_voice`] off the event loop, then call `then` (the App marks its status item dirty, so the hover says it, and becomes the center's delegate): the bundle id reads its `Info.plist` and macOS's answer is a wait on the center, so a thread of its own does both.
-#[cfg(target_os = "macos")]
-pub(crate) fn learn_voice(
-    center: crate::notice_center::NoticeCenter,
-    then: impl FnOnce() + Send + 'static,
-) {
-    if cfg!(test) || LEARNING.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    let spawned = std::thread::Builder::new()
-        .name("aterm-notice-voice".to_string())
-        .spawn(move || {
-            crate::qos::set_self(crate::qos::Role::Background);
-            let voice = voice_of(
-                center.answer(),
-                running_bundled(),
-                crate::signing_identity::running_bundle_id().is_some(),
-            );
-            *VOICE
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(voice);
-            LEARNING.store(false, Ordering::Release);
-            then();
-        });
-    if spawned.is_err() {
-        LEARNING.store(false, Ordering::Release);
-    }
-}
-
-/// The update-health banner's delivery: owed to a cause only the owner can end (`App::post_update_health_banner`), so it bypasses the queue, and posted only once that has read `desktop_alerts` on, so it is delivered as a notice while aterm's own are on (and may ask macOS, as the queue's may; having asked, it is posted only if `own_alerts`, the live switch, is still on).
-#[cfg(all(target_os = "macos", not(test)))]
-pub(crate) fn deliver_update_health_banner(
-    _voice: crate::messages_host::HealthBannerVoice,
-    center: crate::notice_center::NoticeCenter,
-    own_alerts: &AtomicBool,
-    title: &str,
-    banner: &str,
-) {
-    deliver(Some(title), banner, false, None, center, true, || {
-        own_alerts.load(Ordering::Acquire)
-    });
 }
 
 #[cfg(windows)]
@@ -651,21 +561,6 @@ fn post(
     }
 }
 
-/// Deliver one notification on the calling thread, at once (blocking up to twice [`freedesktop::CALL_TIMEOUT`]: joining the bus, its connect and handshake, then the call, each bounded by it): the Linux arm of `menu::notify`, whose callers (a launch that cannot start, a file that cannot open) may end the process right after it, before the delivery thread would run.
-#[cfg(target_os = "linux")]
-pub(crate) fn deliver_now(title: &str, body: &str) {
-    if cfg!(test) || crate::menu::process_is_headless() {
-        return;
-    }
-    let (Ok(addresses), Ok(call)) = (
-        aterm_dbus::address::session_bus(),
-        freedesktop::notify_call(title, body, false, false),
-    ) else {
-        return;
-    };
-    freedesktop::notify_now(&call, &addresses, freedesktop::CALL_TIMEOUT);
-}
-
 #[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
 mod freedesktop {
     #[cfg(target_os = "linux")]
@@ -677,7 +572,7 @@ mod freedesktop {
     use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
     use std::time::Duration;
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(test, target_os = "linux"))]
     use aterm_dbus::address::Address;
     use aterm_dbus::{Connection, Kind, Message, Type, Value};
 
@@ -754,7 +649,7 @@ mod freedesktop {
     }
 
     enum Delivery {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(test, target_os = "linux"))]
         Fixed {
             call: Message,
             validity: Option<super::NoticeValidity>,
@@ -767,7 +662,7 @@ mod freedesktop {
         /// events retain no condition owner and hold no settings lock over I/O.
         fn prepare(&self) -> Option<Message> {
             match self {
-                #[cfg(target_os = "linux")]
+                #[cfg(all(test, target_os = "linux"))]
                 Self::Fixed { call, validity } => {
                     if validity.as_ref().is_some_and(|ticket| !ticket.current()) {
                         return None;
@@ -792,7 +687,7 @@ mod freedesktop {
     }
 
     impl Bus {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(test, target_os = "linux"))]
         pub(super) fn notify(
             &mut self,
             call: &Message,
@@ -875,7 +770,7 @@ mod freedesktop {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(test, target_os = "linux"))]
     pub(super) fn notify_now(
         call: &Message,
         addresses: &[Address],
@@ -1483,35 +1378,6 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn own_notices_default_off_and_say_whose_banner() {
-        use crate::notice_center::Center;
-        use crate::status_item::{NoticeFallback, NoticeVoice};
-        let mut config = crate::app_config::Config::default();
-        assert!(!config.desktop_alerts_or_default());
-        config.desktop_alerts = Some(true);
-        assert!(config.desktop_alerts_or_default());
-        for center in [
-            Center::Absent,
-            Center::Unasked,
-            Center::Refused,
-            Center::Granted,
-        ] {
-            let voice = |fallback| NoticeVoice { center, fallback };
-            for named in [true, false] {
-                assert_eq!(
-                    super::voice_of(center, true, named),
-                    voice(NoticeFallback::Withheld { named }),
-                    "bundled"
-                );
-                assert_eq!(
-                    super::voice_of(center, false, named),
-                    voice(NoticeFallback::ScriptEditor)
-                );
-            }
-        }
-    }
-
-    #[test]
     fn a_bundled_aterm_posts_only_as_itself() {
         use super::{Route, route};
         use crate::notice_center::{Center, status_answer};
@@ -1724,154 +1590,8 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
-    fn a_resolved_herald_notice_is_revoked_while_authorization_waits() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::{Mutex, mpsc};
-        use std::time::{Duration, Instant};
-
-        use crate::notice_center::{Center, NoticeCenter};
-        use crate::status_item::{Escalation, EscalationKind, Herald};
-        use aterm_types::needs::NeedWord;
-
-        type Answer = Box<dyn FnOnce() + Send>;
-        static ASK: Mutex<Option<mpsc::SyncSender<Answer>>> = Mutex::new(None);
-        static GRANTED: AtomicBool = AtomicBool::new(false);
-        const HANG: Duration = Duration::from_secs(60);
-        fn answer() -> Center {
-            if GRANTED.load(Ordering::Acquire) {
-                Center::Granted
-            } else {
-                Center::Unasked
-            }
-        }
-        fn ask(then: Answer) {
-            ASK.lock().unwrap().as_ref().unwrap().send(then).unwrap();
-        }
-        let escalation = |session, key| Escalation {
-            session,
-            kind: EscalationKind::Attention,
-            word: NeedWord::Ask,
-            key,
-            label: format!("need {key}"),
-            body: format!("tab {session}: need {key}"),
-            headline: "aterm needs you",
-            report: None,
-        };
-        let now = Instant::now();
-        let mut herald = Herald::default();
-        let a = escalation(7, 1);
-        let b = escalation(8, 2);
-        let queued_a =
-            NotifyMsg::herald(&herald.note(7, Some(&a), false, true, now).notice.unwrap());
-        let queued_b =
-            NotifyMsg::herald(&herald.note(8, Some(&b), false, true, now).notice.unwrap());
-        let background = HashSet::new();
-        assert!(delivers(&queued_a, &background, true));
-        assert!(delivers(&queued_b, &background, true));
-        assert!(!delivers(&queued_a, &HashSet::from([7]), true));
-        assert!(delivers(&queued_b, &HashSet::from([7]), true));
-        assert!(!delivers(&queued_a, &background, false));
-        let program = NotifyMsg::program(7, None, "program event".into());
-        assert!(delivers(&program, &background, false));
-
-        let (asked, authorization) = mpsc::sync_channel(1);
-        *ASK.lock().unwrap() = Some(asked);
-        GRANTED.store(false, Ordering::Release);
-        let center = NoticeCenter::stand_in(answer, ask);
-        let (finished, route) = mpsc::sync_channel(1);
-        let delivery = std::thread::spawn(move || {
-            let way = super::way_for(center, true, true, &AtomicBool::new(false), || {
-                delivers(&queued_a, &HashSet::new(), true)
-            });
-            finished.send(way).unwrap();
-        });
-        let grant = authorization
-            .recv_timeout(HANG)
-            .expect("authorization is pending");
-        assert_eq!(center.answer(), Center::Unasked);
-        herald.note(7, None, false, true, now);
-        assert!(!herald.told(7, EscalationKind::Attention, a.key));
-        assert!(herald.told(8, EscalationKind::Attention, b.key));
-        assert!(delivers(&queued_b, &background, true), "B still stands");
-        GRANTED.store(true, Ordering::Release);
-        grant();
-        let route = route.recv_timeout(HANG).expect("authorization completed");
-        delivery.join().unwrap();
-        *ASK.lock().unwrap() = None;
-        assert_eq!(route, super::Route::Lapsed, "A resolved before delivery");
-    }
-
-    /// A stand-in macOS: the launch's quiet ask is made once (the next launch finds quiet delivery
-    /// granted) and is no dialog; nothing posts on quiet delivery, Notify Me on or off, until the
-    /// dialog Notify Me's first notice asks for is answered. Negative control: a bundle macOS
-    /// already lets post is asked nothing at launch.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn the_launch_asks_quietly_once_and_only_notify_me_asks_for_banners() {
-        use std::sync::Mutex;
-        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-
-        use super::{Route, route, way_for};
-        use crate::notice_center::{Center, NoticeCenter, Request, asks};
-
-        static SAID: Mutex<Center> = Mutex::new(Center::Unasked);
-        static QUIET: AtomicU32 = AtomicU32::new(0);
-        static DIALOGS: AtomicU32 = AtomicU32::new(0);
-        fn said() -> std::sync::MutexGuard<'static, Center> {
-            SAID.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-        }
-        fn answer() -> Center {
-            *said()
-        }
-        fn prime(then: Box<dyn FnOnce() + Send>) {
-            if asks(answer(), Request::Provisional) {
-                QUIET.fetch_add(1, Ordering::SeqCst);
-                *said() = Center::Provisional;
-            }
-            then();
-        }
-        fn ask(then: Box<dyn FnOnce() + Send>) {
-            if asks(answer(), Request::Full) {
-                DIALOGS.fetch_add(1, Ordering::SeqCst);
-                *said() = Center::Granted;
-            }
-            then();
-        }
-        let asked = || (QUIET.load(Ordering::SeqCst), DIALOGS.load(Ordering::SeqCst));
-        let center = NoticeCenter::stand_in(answer, ask).priming(prime);
-        center.prime(Box::new(|| {}));
-        center.prime(Box::new(|| {}));
-        assert_eq!(asked(), (1, 0), "two launches: one quiet ask, no dialog");
-        assert_eq!(center.answer(), Center::Provisional);
-        for asked in [false, true] {
-            assert_eq!(
-                route(center.answer(), true, false, asked),
-                Route::Unasked,
-                "Notify Me off: nothing posts"
-            );
-        }
-        let first = AtomicBool::new(false);
-        assert_eq!(
-            way_for(center, true, true, &first, || true),
-            Route::Center,
-            "Notify Me's first notice asks, and posts on the yes"
-        );
-        assert_eq!(asked(), (1, 1), "the one dialog");
-
-        *said() = Center::Granted;
-        center.prime(Box::new(|| {}));
-        assert_eq!(
-            asked(),
-            (1, 1),
-            "the control: already allowed, nothing asked"
-        );
-    }
-
-    #[test]
-    fn desktop_alerts_off_drops_only_aterms_own_notices() {
+    fn automatic_notices_never_reach_the_desktop() {
         let none = HashSet::new();
         let own = NotifyMsg::own(7, Some("aterm".into()), "waiting".into());
         let program = NotifyMsg::program(7, None, "build done".into());
@@ -1881,8 +1601,8 @@ mod tests {
             "switch off: aterm's own is dropped"
         );
         assert!(
-            delivers(&own, &none, true),
-            "switch on: it is delivered (control)"
+            !delivers(&own, &none, true),
+            "automatic notices are disabled even with an old opt-in"
         );
         assert!(
             delivers(&program, &none, false),
@@ -1900,132 +1620,7 @@ mod tests {
     }
 
     #[test]
-    fn finished_herald_intents_cannot_be_delivered_after_their_lifecycle_ends() {
-        use std::time::Instant;
-
-        use crate::status_item::{Escalation, EscalationKind, Herald, NOTIFY_RETRY, Spent};
-        use aterm_types::needs::NeedWord;
-
-        #[derive(Clone, Copy, Debug)]
-        enum End {
-            Looking,
-            Told,
-            Disabled,
-            Forgone,
-            Refused,
-            Replaced,
-            Retired,
-            Dropped,
-        }
-        let escalation = |session, key| Escalation {
-            session,
-            kind: EscalationKind::Attention,
-            word: NeedWord::Ask,
-            key,
-            label: format!("need {key}"),
-            body: format!("tab {session}: need {key}"),
-            headline: "aterm needs you",
-            report: None,
-        };
-        let mut stale = Vec::new();
-        for end in [
-            End::Looking,
-            End::Told,
-            End::Disabled,
-            End::Forgone,
-            End::Refused,
-            End::Replaced,
-            End::Retired,
-            End::Dropped,
-        ] {
-            let now = Instant::now();
-            let mut herald = Herald::default();
-            let a = escalation(7, 1);
-            let notice = herald.note(7, Some(&a), false, true, now).notice.unwrap();
-            let copied = notice.clone();
-            let queued = NotifyMsg::herald(&copied);
-            drop(notice);
-            drop(copied);
-            let background = HashSet::new();
-            assert!(
-                delivers(&queued, &background, true),
-                "{end:?}: copies own no intent"
-            );
-            let program = NotifyMsg::program(7, None, "program event".into());
-            let consent_owner = std::sync::Arc::new(());
-            let consent = NotifyMsg::consent(
-                &crate::consent_observer::ObservedPrompt {
-                    session: 7,
-                    blocked_on: "camera".into(),
-                    service: "kTCCServiceCamera".into(),
-                    validity: super::NoticeValidity::new(&consent_owner),
-                }
-                .notice(),
-            );
-            match end {
-                End::Looking | End::Told => {
-                    let spent = if matches!(end, End::Looking) {
-                        Spent::Looking
-                    } else {
-                        Spent::Told
-                    };
-                    let out = herald.note_spent(7, Some(&a), Some(spent), true, now);
-                    assert_eq!(out.owed, 0, "the queued post already paid its debt");
-                    assert!(!out.transition && out.notice.is_none());
-                    assert!(herald.told(7, EscalationKind::Attention, a.key));
-                }
-                End::Disabled => herald.suppress_pending_desktop_notices(),
-                End::Forgone => herald.forgo(7),
-                End::Refused => herald.refused(7, 1, now),
-                End::Replaced => {
-                    let out = herald.note(7, Some(&escalation(7, 3)), false, true, now);
-                    assert!(
-                        out.transition && out.notice.is_none(),
-                        "the floor holds its replacement"
-                    );
-                }
-                End::Retired => herald.retire(7),
-                End::Dropped => herald = Herald::default(),
-            }
-            let b = escalation(8, 2);
-            let current =
-                NotifyMsg::herald(&herald.note(8, Some(&b), false, true, now).notice.unwrap());
-            assert!(
-                delivers(&current, &background, true),
-                "{end:?}: a current B can post"
-            );
-            assert!(
-                delivers(&program, &background, true),
-                "{end:?}: program event remains"
-            );
-            assert!(
-                delivers(&consent, &background, true),
-                "{end:?}: independent consent remains"
-            );
-            if matches!(end, End::Refused) {
-                let retry = NotifyMsg::herald(
-                    &herald
-                        .note(7, Some(&a), false, true, now + NOTIFY_RETRY)
-                        .notice
-                        .unwrap(),
-                );
-                assert!(
-                    delivers(&retry, &background, true),
-                    "a fresh retry remains admissible"
-                );
-            }
-            if delivers(&queued, &background, true) {
-                stale.push(end);
-            }
-        }
-        assert!(
-            stale.is_empty(),
-            "finished intents still admissible: {stale:?}"
-        );
-    }
-
-    #[test]
-    fn an_instance_level_consent_notice_is_not_suppressed_by_the_first_tab() {
+    fn instance_level_consent_is_not_a_desktop_alert() {
         use crate::consent_observer::{AttentionEvent, AttentionGate};
         let mut gate = AttentionGate::new();
         let notice = gate
@@ -2036,8 +1631,8 @@ mod tests {
         let own = NotifyMsg::consent(&notice);
         assert!(own.own, "the consent door speaks in aterm's own voice");
         assert!(
-            delivers(&own, &first_tab_focused, true),
-            "the first tab's focus does not hide an instance-level notice"
+            !delivers(&own, &first_tab_focused, true),
+            "an instance-level diagnostic also stays off the desktop"
         );
         let first_tab = NotifyMsg::own(0, None, "tab 0".into());
         assert!(

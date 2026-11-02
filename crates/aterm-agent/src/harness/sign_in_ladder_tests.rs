@@ -609,3 +609,54 @@ fn the_log_line_names_the_row_how_it_ended_and_the_routes() {
     }
     assert!(!line.contains('\n'));
 }
+
+#[test]
+fn a_peer_heard_ends_every_wait_but_that_of_a_row_a_page_stopped() {
+    let t0 = Instant::now();
+    let mut ladder = Ladder::default();
+    assert_eq!(ladder.vault_turn(Some([1; 32]), t0), VaultTurn::Due);
+    ladder.vault_done(Vault::Unchanged(51));
+    ladder.failed("stopped", "mailbox", t0);
+    ladder.page_stopped("stopped");
+    ladder.failed("relay", "mailbox", t0);
+    let later = t0 + Duration::from_secs(60);
+    ladder.peer_heard(later);
+    assert!(ladder.held("stopped", "mailbox", later), "the page stands");
+    assert!(
+        !ladder.held("relay", "mailbox", later),
+        "NEGATIVE CONTROL: a peer may be what this row was waiting for"
+    );
+    ladder.moved(later);
+    assert!(
+        !ladder.held("stopped", "mailbox", later),
+        "a move may change what the page judges"
+    );
+    assert_eq!(
+        ladder.vault_turn(Some([1; 32]), later),
+        VaultTurn::Due,
+        "the vault is asked at once"
+    );
+}
+
+#[test]
+fn a_run_with_no_exit_says_why_it_failed() {
+    use crate::harness::cli::Renewal;
+    assert_eq!(
+        how_it_ended_because(Renewal::Failed, None, None, Some("it will not run")),
+        "the sign-in did not finish: it will not run"
+    );
+    assert_eq!(
+        how_it_ended_because(Renewal::AuthFailed, Some(1), None, Some("stale")),
+        "claude auth login exited 1 with no login made",
+        "only a run with no ending of its own takes the cause"
+    );
+    let met = crate::harness::open_url::Met::new(
+        crate::harness::open_url::MetWord::BotCheck,
+        Some("claude.ai"),
+    );
+    assert_eq!(
+        how_it_ended_because(Renewal::Failed, None, Some(&met), Some("past its deadline")),
+        how_it_ended(Renewal::Failed, None, Some(&met)),
+        "what the page met says more than the deadline"
+    );
+}

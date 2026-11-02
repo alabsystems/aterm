@@ -28,8 +28,7 @@ fn run_verb(verb: &str, args: &[&str], reply: &[u8]) -> Output {
     listener.set_nonblocking(true).unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_aterm-ctl"));
     for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if name.starts_with("ATERM_") && name != aterm_uds::process::VERIFY_RUN_VAR {
+        if aterm_uds::process::stripped_from_child(&key) {
             command.env_remove(key);
         }
     }

@@ -124,6 +124,9 @@ fn req<'a>(f: &BTreeMap<&str, &'a str>, key: &str) -> Result<&'a str, String> {
 
 fn num<T: std::str::FromStr>(f: &BTreeMap<&str, &str>, key: &str) -> Result<T, String> {
     let v = req(f, key)?;
+    if v.starts_with('+') {
+        return Err(format!("{key}={v} is not a number"));
+    }
     v.parse().map_err(|_| format!("{key}={v} is not a number"))
 }
 
@@ -139,10 +142,11 @@ fn flag(f: &BTreeMap<&str, &str>, key: &str) -> Result<bool, String> {
 fn offset(f: &BTreeMap<&str, &str>, key: &str) -> Result<Option<i128>, String> {
     match req(f, key)? {
         "none" => Ok(None),
-        v => v
+        v if !v.starts_with('+') => v
             .parse()
             .map(Some)
             .map_err(|_| format!("{key}={v} is not an offset")),
+        v => Err(format!("{key}={v} is not an offset")),
     }
 }
 
@@ -245,8 +249,18 @@ pub fn parse_status(line: &str) -> Result<Status, String> {
             },
             hot: flag(&f, "frame_hot")?,
             fp: req(&f, "frame_fp")?.to_string(),
-            out: out.parse().map_err(|_| format!("quads out {out}"))?,
-            under: under.parse().map_err(|_| format!("quads under {under}"))?,
+            out: out
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+                .then(|| out.parse().ok())
+                .flatten()
+                .ok_or_else(|| format!("quads out {out}"))?,
+            under: under
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+                .then(|| under.parse().ok())
+                .flatten()
+                .ok_or_else(|| format!("quads under {under}"))?,
         });
     }
     s.replays = num(&f, "replays")?;
@@ -363,7 +377,11 @@ pub fn typed(word: &str) -> u64 {
 
 /// The cursor a range `a..b` ends at.
 fn range_end(range: &str) -> Option<u64> {
-    range.split_once("..").and_then(|(_, end)| end.parse().ok())
+    range.split_once("..").and_then(|(_, end)| {
+        end.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| end.parse().ok())?
+    })
 }
 
 /// What the drive reads of a `trail status` row.
@@ -422,8 +440,18 @@ pub fn parse_image(line: &str) -> Result<Shot, String> {
         .and_then(|p| p.strip_suffix('"'))
         .unwrap_or(last);
     Ok(Shot {
-        width: w.parse().map_err(|_| format!("image width {w}"))?,
-        height: h.parse().map_err(|_| format!("image height {h}"))?,
+        width: w
+            .bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| w.parse().ok())
+            .flatten()
+            .ok_or_else(|| format!("image width {w}"))?,
+        height: h
+            .bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| h.parse().ok())
+            .flatten()
+            .ok_or_else(|| format!("image height {h}"))?,
         path: path.to_string(),
         phase: fields(b).get("frame-phase").map(|p| (*p).to_string()),
     })

@@ -209,9 +209,12 @@ pub fn kind_of(_path: &Path) -> io::Result<Kind> {
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn open_evtonly(path: &Path, want: Kind) -> io::Result<OwnedFd> {
     use std::os::fd::AsFd as _;
+    if !matches!(want, Kind::Dir | Kind::File) {
+        return Err(io::Error::from_raw_os_error(libc::EFTYPE));
+    }
     let fd = open_with(path, O_EVTONLY | libc::O_NONBLOCK)?;
     let st = fstat_of(fd.as_fd())?;
-    if !matches!(want, Kind::Dir | Kind::File) || kind_of_mode(st.st_mode) != want {
+    if kind_of_mode(st.st_mode) != want {
         return Err(io::Error::from_raw_os_error(libc::EFTYPE));
     }
     Ok(fd)
@@ -357,7 +360,7 @@ impl Watcher {
         Ok(())
     }
 
-    /// WATCH `fd` (an [`open_evtonly`] descriptor) under `id`: its writes, appends, links,
+    /// WATCH `fd` (an open vnode descriptor, including [`open_evtonly`]) under `id`: its writes, appends, links,
     /// attributes and its going, each reported once until the next [`Self::wait`] (`EV_CLEAR`).
     /// # Errors
     /// `kevent(2)`'s; `Unsupported` off macOS.
@@ -392,12 +395,52 @@ impl Watcher {
     #[cfg(target_os = "macos")]
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn wait(&self, timeout: Duration) -> io::Result<Vec<Fired>> {
+        self.notes(timeout).map(|events| {
+            events
+                .into_iter()
+                .map(|(id, notes)| Fired {
+                    id,
+                    gone: notes & NOTE_GONE != 0,
+                })
+                .collect()
+        })
+    }
+
+    /// Drain pending vnode events without waiting. Only an actual `NOTE_DELETE` for `id`
+    /// counts: rename and revoke events never prove that the held inode was deleted.
+    ///
+    /// # Errors
+    /// `kevent(2)`'s; `Unsupported` off macOS.
+    #[cfg(target_os = "macos")]
+    pub fn deleted(&self, id: u64) -> io::Result<bool> {
+        self.notes(Duration::ZERO).map(|events| {
+            events
+                .into_iter()
+                .any(|(event_id, notes)| event_id == id && notes & libc::NOTE_DELETE != 0)
+        })
+    }
+
+    /// See the macOS twin.
+    /// # Errors
+    /// Always `Unsupported`.
+    #[cfg(not(target_os = "macos"))]
+    pub fn deleted(&self, _id: u64) -> io::Result<bool> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+
+    #[cfg(target_os = "macos")]
+    #[cfg_attr(trust_verify, trust::skip)]
+    fn notes(&self, timeout: Duration) -> io::Result<Vec<(u64, u32)>> {
         use std::os::fd::AsRawFd as _;
-        let deadline = std::time::Instant::now() + timeout;
+        const MAX_KEVENT_STEP: Duration = Duration::from_secs(86_400);
+        let deadline = std::time::Instant::now().checked_add(timeout);
         // SAFETY: `kevent` is plain data; all-zero is a valid value for the call to fill.
         let mut events: [libc::kevent; BATCH] = unsafe { std::mem::zeroed() };
         let got = loop {
-            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let left = deadline.map_or(MAX_KEVENT_STEP, |d| {
+                d.saturating_duration_since(std::time::Instant::now())
+                    .min(MAX_KEVENT_STEP)
+            });
             let ts = libc::timespec {
                 tv_sec: libc::time_t::try_from(left.as_secs()).unwrap_or(libc::time_t::MAX),
                 tv_nsec: libc::c_long::from(left.subsec_nanos()),
@@ -413,21 +456,20 @@ impl Watcher {
                     &raw const ts,
                 )
             };
-            if rc >= 0 {
+            if rc > 0 || (rc == 0 && deadline.is_some_and(|d| std::time::Instant::now() >= d)) {
                 break usize::try_from(rc).unwrap_or(0);
             }
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error);
+            if rc < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
             }
         };
         Ok(events[..got.min(BATCH)]
             .iter()
             .filter(|event| event.filter == libc::EVFILT_VNODE && event.flags & libc::EV_ERROR == 0)
-            .map(|event| Fired {
-                id: event.udata.addr() as u64,
-                gone: event.fflags & NOTE_GONE != 0,
-            })
+            .map(|event| (event.udata.addr() as u64, event.fflags))
             .collect())
     }
 

@@ -9,11 +9,13 @@
 //! targo --unverified verify perf --list
 //! ```
 //!
-//! Three kinds of lane. The FLOOR lanes ([`floors`], [`wasm`]) measure the
+//! Three kinds of lane. The FLOOR lanes ([`floors`], [`wasm`], [`vte_engine`]) measure the
 //! engine headless and judge each metric against its committed baseline in
 //! `crates/aterm-verify/perf/golden/`; whatever they measured then meets the
 //! same-box trend ledger ([`trend`]), and a green run appends to it. A bare `verify
-//! perf` runs every floor lane. The ARENA lanes ([`arena`]) open real
+//! perf` runs every floor lane. Each lane waits for a quiet machine first but
+//! `vte-engine`, which runs at the load it finds, reports it, and judges cycles,
+//! not time. The ARENA lanes ([`arena`]) open real
 //! windows and take minutes; they run only when named, and what they measure
 //! has no floor, so they report MEASURED, never a pass. The MEASURED lanes
 //! ([`fabric`], [`restore_e2e`], [`aos`]) are headless but just as unjudgeable —
@@ -40,6 +42,7 @@ mod aos;
 pub(crate) mod arena;
 #[cfg(unix)]
 mod bench_build;
+mod deck;
 mod driver;
 #[cfg(unix)]
 mod fabric;
@@ -49,6 +52,8 @@ mod restore_e2e;
 #[cfg(unix)]
 mod stats;
 mod trend;
+#[cfg(unix)]
+pub(crate) mod vte_engine;
 pub(crate) mod wasm;
 
 pub(crate) use trend::TrendSample;
@@ -107,7 +112,9 @@ pub(crate) enum Lane {
     Effects,
     TrailDarkComposer,
     TrailLightComposer,
+    Deck,
     Wasm,
+    VteEngine,
     Start,
     Compare,
     Cat,
@@ -131,7 +138,7 @@ pub(crate) enum Kind {
 }
 
 impl Lane {
-    pub(crate) const ALL: [Lane; 20] = [
+    pub(crate) const ALL: [Lane; 22] = [
         Lane::Throughput,
         Lane::Pathological,
         Lane::ScrollScrub,
@@ -143,7 +150,9 @@ impl Lane {
         Lane::Effects,
         Lane::TrailDarkComposer,
         Lane::TrailLightComposer,
+        Lane::Deck,
         Lane::Wasm,
+        Lane::VteEngine,
         Lane::Start,
         Lane::Compare,
         Lane::Cat,
@@ -167,7 +176,9 @@ impl Lane {
             Lane::Effects => "effects",
             Lane::TrailDarkComposer => "trail-dark-composer",
             Lane::TrailLightComposer => "trail-light-composer",
+            Lane::Deck => "deck",
             Lane::Wasm => "wasm",
+            Lane::VteEngine => "vte-engine",
             Lane::Start => "start",
             Lane::Compare => "compare",
             Lane::Cat => "cat",
@@ -192,7 +203,9 @@ impl Lane {
             | Lane::Effects
             | Lane::TrailDarkComposer
             | Lane::TrailLightComposer
-            | Lane::Wasm => Kind::Floor,
+            | Lane::Deck
+            | Lane::Wasm
+            | Lane::VteEngine => Kind::Floor,
             Lane::Start | Lane::Compare | Lane::Cat | Lane::Scroll | Lane::Vte => Kind::Arena,
             Lane::Fabric | Lane::RestoreE2e | Lane::Aos => Kind::Measured,
         }
@@ -202,6 +215,14 @@ impl Lane {
     /// skips. Every arena lane does; no other lane does.
     pub(crate) fn opens_windows(self) -> bool {
         self.kind() == Kind::Arena
+    }
+
+    /// Whether the lane waits for a quiet machine before it starts ([`quiet`]). `vte-engine`
+    /// does not: it measures at the load it finds, reports that load beside its numbers, and is
+    /// judged by performance-core cycles, which the clock and the core a sample ran on do not
+    /// move.
+    fn takes_quiet_claim(self) -> bool {
+        self != Lane::VteEngine
     }
 
     /// What the lane measures, for `--list`.
@@ -228,12 +249,21 @@ impl Lane {
                  ground (Default): emission, CPU raster, GPU encode and GPU time"
             }
             Lane::TrailLightComposer => {
-                "trail-dark-composer's scene on Default Light, the trail's light (paper) arm: \
-                 emission, CPU raster, GPU encode and GPU time"
+                "trail-dark-composer's scene on Default Light, the trail's light arm at the \
+                 live level (prism_glass::LIVE): emission, CPU raster, GPU encode and GPU time"
+            }
+            Lane::Deck => {
+                "the stats deck's frame cost (deck_frame_cost: needle, grid and new-reading \
+                 frames, Folded and Full at 2238 px), plus a headless idle take of it, reported"
             }
             Lane::Wasm => {
                 "the shipped wasm modules in the pinned chrome-headless-shell, plus their \
                  module-size ceilings"
+            }
+            Lane::VteEngine => {
+                "performance-core cycles and ms per MiB (min and median) of the pinned \
+                 vtebench's default suite and the d1 ascii and unicode corpora replayed into \
+                 Terminal::process at 120x40; no PTY, GUI or window, at the load it finds"
             }
             Lane::Start => "fresh-process real-window startup timing of one aterm",
             Lane::Compare => "paired ABBA startup A/B of two aterm binaries",
@@ -274,9 +304,18 @@ impl Lane {
                 "targo (release build of aterm-bench with dev-seams), a GPU (its GPU keys need \
                  Metal's clock)"
             }
+            Lane::Deck => {
+                "macOS, targo (opt-test build of aterm-gui's tests; release build of aterm with \
+                 dev-seams and a build of aterm-lab for the idle take)"
+            }
             Lane::Wasm => {
                 "chrome-headless-shell (verify provision), rustup stable + \
                  wasm32-unknown-unknown, wasm-opt"
+            }
+            Lane::VteEngine => {
+                "unix, targo (release build of aterm-bench), git and the network for the pinned \
+                 vtebench's first clone; the vte lane's vtebench build to cross-check its \
+                 payloads; macOS's per-core-type cycle counters to judge anything"
             }
             Lane::Start => "macOS, a built aterm (--binary)",
             Lane::Compare => "macOS, two built aterm binaries (--baseline, --candidate)",
@@ -628,6 +667,13 @@ const OPTIONS: &[OptSpec] = &[
                on, what ships; off also keeps the bridge's auto mirror off)",
     },
     OptSpec {
+        flag: "--at-rest",
+        value: Some("on|off,..."),
+        lanes: &[Lane::Fabric],
+        help: "whether every world's log is sealed at rest under a key, one run and one ledger \
+               entry per word: `off,on --passes 2` is an A B B A set (default on, what ships)",
+    },
+    OptSpec {
         flag: "--log",
         value: Some("auto|off"),
         lanes: &[Lane::Fabric],
@@ -653,6 +699,14 @@ const OPTIONS: &[OptSpec] = &[
         lanes: &[Lane::Fabric],
         help: "posts per leg of the ask scenario: each kind's idle releases, the busy ones, the \
                receipts and the person-lane asks without a pager and with one (default 100)",
+    },
+    OptSpec {
+        flag: "--asked-prefill",
+        value: Some("N"),
+        lanes: &[Lane::Fabric],
+        help: "rows the ask scenario's asked table is pre-filled to before its legs, written as \
+               an older build's table and taken in by a restarted bridge (default 0: none; at \
+               most 1024, the table's cap)",
     },
     OptSpec {
         flag: "--mix-every",
@@ -724,8 +778,8 @@ const OPTIONS: &[OptSpec] = &[
         flag: "--admit",
         value: Some("wait|now"),
         lanes: &Lane::ALL,
-        help: "wait for a quiet machine before each lane (default wait, saying why once a \
-               minute), or start each at once (now)",
+        help: "wait for a quiet machine before each lane but vte-engine (default wait, saying \
+               why once a minute), or start each at once (now)",
     },
 ];
 
@@ -988,7 +1042,10 @@ fn main(args: &[String]) -> ExitCode {
         let record = cli.record.contains(lane);
         eprintln!("--- {} ---", lane.name());
         let skip = no_windows && lane.opens_windows();
-        let quiet = match (!skip).then(|| quiet(*lane, admit)).transpose() {
+        let quiet = match (!skip && lane.takes_quiet_claim())
+            .then(|| quiet(*lane, admit))
+            .transpose()
+        {
             Ok(quiet) => quiet.flatten(),
             Err(why) => {
                 eprintln!("verify perf: COULD NOT RUN — {why}");
@@ -1013,7 +1070,15 @@ fn main(args: &[String]) -> ExitCode {
             Lane::Effects => floors::gate_effects(&floors::EFFECTS, record),
             Lane::TrailDarkComposer => floors::gate_effects(&floors::TRAIL_DARK_COMPOSER, record),
             Lane::TrailLightComposer => floors::gate_effects(&floors::TRAIL_LIGHT_COMPOSER, record),
+            Lane::Deck => deck::gate_deck(record),
             Lane::Wasm => wasm::gate_wasm(record),
+            #[cfg(unix)]
+            Lane::VteEngine => vte_engine::run(record),
+            #[cfg(not(unix))]
+            Lane::VteEngine => LaneRun::skip(
+                "its payload capture runs vtebench's shell scripts under a unix PTY",
+                "run it on macOS or Linux",
+            ),
             #[cfg(unix)]
             Lane::Start => arena::start::run(&arena_args),
             #[cfg(unix)]
@@ -1222,7 +1287,9 @@ mod tests {
                 Lane::Effects,
                 Lane::TrailDarkComposer,
                 Lane::TrailLightComposer,
-                Lane::Wasm
+                Lane::Deck,
+                Lane::Wasm,
+                Lane::VteEngine
             ]
         );
         assert!(cli.record.is_empty());

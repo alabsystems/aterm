@@ -26,8 +26,8 @@ use aterm_types::MutexExt as _;
 
 use aterm_diskwalk::{
     Deny, DirId, HUGE_NOTE, HUGE_WARN, HugeDir, LevelRow, LinkTotals, Marker, Policy, Refusal,
-    RootSpec, Sliced, Step, Sums, Ticket, Tree, Walker, build_dir_above, canonical, link_target,
-    list_one_level, marker_at, worktree_above,
+    RootSpec, Sliced, Step, Sums, Ticket, Tree, Walker, build_dir_above, canonical,
+    directory_identity, link_target, list_one_level, marker_at, worktree_above,
 };
 
 /// How long one read keeps its scope's roots demanded.
@@ -1353,6 +1353,7 @@ impl Engine {
         self.tab_claims = tabs;
         self.own_claims = own;
         self.rederive_nested();
+        self.invalidate_changed_snapshots();
         self.discovered = Some((now, self.facts_seq, live));
         self.dirty = true;
     }
@@ -1450,6 +1451,86 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// A long walk's backoff must not keep a deleted cache on screen for hours.
+    /// Check only retained roots and the subtrees their rows expose, on this
+    /// background thread, with the same no-follow and privacy fences as a walk.
+    fn invalidate_changed_snapshots(&mut self) {
+        let Some(policy) = self.policy.as_ref() else {
+            return;
+        };
+        let mut changed = Vec::new();
+        for (root, tree) in &self.kept.trees {
+            if self
+                .active
+                .as_ref()
+                .is_some_and(|a| root.starts_with(&a.path) || a.path.starts_with(root))
+            {
+                continue;
+            }
+            let Some(record) = self.records.get(root) else {
+                continue;
+            };
+            let (Some((dev, ino)), Some(complete)) = (record.id, record.complete.as_ref()) else {
+                continue;
+            };
+            if record.state != RootState::Complete || record.read_from.is_some() {
+                continue;
+            }
+            let mut visible: BTreeSet<PathBuf> = complete
+                .biggest
+                .iter()
+                .chain(&complete.most_entries)
+                .map(|row| row.rel.clone())
+                .collect();
+            visible.extend(
+                self.records
+                    .iter()
+                    .filter(|(_, row)| row.read_from.as_ref() == Some(root))
+                    .filter_map(|(path, _)| path.strip_prefix(root).ok().map(Path::to_path_buf)),
+            );
+            let stale = directory_identity(root, policy) != Ok((dev, ino))
+                || visible.iter().any(|rel| {
+                    let Some(row) = tree.find(rel).and_then(|id| tree.get(id)) else {
+                        return true;
+                    };
+                    row.refused.is_none()
+                        && !row.mount_boundary
+                        && directory_identity(&root.join(rel), policy) != Ok((dev, row.ino))
+                });
+            if stale {
+                changed.push(root.clone());
+            }
+        }
+        if changed.is_empty() {
+            return;
+        }
+        // Drop covering snapshots too, or rederive_nested could resurrect the
+        // removed row from an older ancestor's tree. Unrelated roots stay warm.
+        let overlaps = |path: &Path| {
+            changed
+                .iter()
+                .any(|root| path.starts_with(root) || root.starts_with(path))
+        };
+        self.records.retain(|path, _| !overlaps(path));
+        self.kept.trees.retain(|path, _| !overlaps(path));
+        self.kept.history.retain(|path, _| !overlaps(path));
+        let huge = self
+            .huge
+            .iter()
+            .filter(|(path, _)| !overlaps(path))
+            .map(|(path, row)| (path.clone(), row.clone()))
+            .collect();
+        let outside = self
+            .outside
+            .iter()
+            .filter(|path| !overlaps(path))
+            .cloned()
+            .collect();
+        self.set_huge(huge, outside);
+        self.rederive_nested();
+        self.dirty = true;
     }
 
     fn writes_roots(&self) -> BTreeSet<PathBuf> {
@@ -1661,6 +1742,7 @@ impl Engine {
             .collect();
         let next = fold_raised(&self.huge, tree.root_path(), &found);
         self.set_huge(next, self.outside.clone());
+        self.invalidate_changed_snapshots();
     }
 
     fn set_huge(&mut self, huge: BTreeMap<PathBuf, HugeDir>, outside: BTreeSet<PathBuf>) {
@@ -2227,3 +2309,7 @@ impl crate::App {
 #[cfg(all(test, unix))]
 #[path = "diskwalk_host_tests.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+#[path = "diskwalk_host/freshness_tests.rs"]
+mod freshness_tests;

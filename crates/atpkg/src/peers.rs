@@ -209,7 +209,7 @@ const SERVE_PACE: Pace = Pace {
 /// fails as timed out.
 struct Paced<'a> {
     conn: &'a TcpStream,
-    until: Instant,
+    until: Option<Instant>,
     idle: Duration,
 }
 
@@ -217,19 +217,22 @@ impl<'a> Paced<'a> {
     fn new(conn: &'a TcpStream, within: Duration, idle: Duration) -> Self {
         Self {
             conn,
-            until: Instant::now() + within,
+            until: Instant::now().checked_add(within),
             idle,
         }
     }
 
     /// Move the deadline to `within` from now.
     fn renew(&mut self, within: Duration) {
-        self.until = Instant::now() + within;
+        self.until = Instant::now().checked_add(within);
     }
 
     /// How long the next read or write may wait.
     fn wait(&self) -> io::Result<Duration> {
-        let left = self.until.saturating_duration_since(Instant::now());
+        let Some(until) = self.until else {
+            return Ok(self.idle);
+        };
+        let left = until.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return Err(io::ErrorKind::TimedOut.into());
         }
@@ -292,19 +295,24 @@ pub(crate) fn configured(peers: &[String]) -> Vec<String> {
 
 fn peer_addr(peer: &str) -> Option<String> {
     let peer = peer.trim();
+    let parse_port = |s: &str| {
+        (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| s.parse::<u16>().ok())
+            .flatten()
+    };
     let (host, port) = match peer.strip_prefix('[') {
         Some(rest) => {
             let (v6, tail) = rest.split_once(']')?;
             v6.parse::<std::net::Ipv6Addr>().ok()?;
             let port = match tail {
                 "" => DEFAULT_PORT,
-                _ => tail.strip_prefix(':')?.parse().ok()?,
+                _ => parse_port(tail.strip_prefix(':')?)?,
             };
             (format!("[{v6}]"), port)
         }
         None => {
             let (host, port) = match peer.rsplit_once(':') {
-                Some((host, port)) => (host, port.parse().ok()?),
+                Some((host, port)) => (host, parse_port(port)?),
                 None => (peer, DEFAULT_PORT),
             };
             let host_ok = !host.is_empty()
@@ -461,7 +469,8 @@ fn from_peer(
     if declared != size {
         return Err(PeerMiss::Unavailable);
     }
-    let mut file = std::fs::File::create(part).map_err(unavailable)?;
+    let _ = std::fs::remove_file(part);
+    let mut file = crate::platform::open_create_new_write(part, 0o600).map_err(unavailable)?;
     let mut digest = crate::tree::BulkSha256::new();
     let mut buf = vec![0u8; 256 * 1024];
     let mut got = 0u64;
@@ -480,7 +489,7 @@ fn from_peer(
         let bytes = buf.get(..n).ok_or(PeerMiss::Unavailable)?;
         got = got.saturating_add(n as u64);
         stepped = stepped.saturating_add(n as u64);
-        if stepped >= pace.step {
+        if pace.step > 0 && stepped >= pace.step {
             stepped %= pace.step;
             body.get_mut().renew(pace.window);
         }
@@ -498,11 +507,9 @@ fn from_peer(
 /// A connection to `peer` (`host:port`), each of its addresses tried within [`PEER_CONNECT`].
 fn connect(peer: &str) -> Option<TcpStream> {
     use std::net::ToSocketAddrs as _;
-    peer.to_socket_addrs().ok()?.find_map(|addr| {
-        let stream = TcpStream::connect_timeout(&addr, PEER_CONNECT).ok()?;
-        let _ = aterm_uds::keep_out_of_children(&stream);
-        Some(stream)
-    })
+    peer.to_socket_addrs()
+        .ok()?
+        .find_map(|addr| aterm_uds::connect_tcp(&addr, PEER_CONNECT).ok())
 }
 
 /// Read a response head from `conn`: the body's `Content-Length` when the status is 200 and
@@ -525,7 +532,15 @@ fn response_length(conn: &mut impl io::BufRead) -> Option<u64> {
         if let Some((name, value)) = line.split_once(':')
             && name.trim().eq_ignore_ascii_case("content-length")
         {
-            length = value.trim().parse().ok();
+            let value = value.trim();
+            if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let parsed: u64 = value.parse().ok()?;
+            if length.is_some_and(|prev| prev != parsed) {
+                return None;
+            }
+            length = Some(parsed);
         }
     }
     ok.then_some(length).flatten()
@@ -678,11 +693,18 @@ pub fn turn_on(layout: &Layout) -> io::Result<()> {
     }
 }
 
+/// Maximum bytes read from `<prefix>/units.serving`.
+const MAX_UNITS_SERVING_BYTES: usize = 4096;
+
 /// Where a server of this store listens now: the address [`Layout::units_serving`] records,
 /// while the process that wrote it lives.
 #[must_use]
 pub fn serving(layout: &Layout) -> Option<SocketAddr> {
-    let text = std::fs::read_to_string(layout.units_serving()).ok()?;
+    let text = crate::metadata_io::read_bounded_regular_utf8(
+        &layout.units_serving(),
+        MAX_UNITS_SERVING_BYTES,
+    )
+    .ok()?;
     let (addr, pid) = serving_record(&text)?;
     crate::progress::pid_alive(pid).then_some(addr)
 }
@@ -693,20 +715,32 @@ fn serving_record(text: &str) -> Option<(SocketAddr, u32)> {
             .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
             .map(str::trim)
     };
-    Some((field("addr")?.parse().ok()?, field("pid")?.parse().ok()?))
+    let pid = field("pid")?;
+    if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((field("addr")?.parse().ok()?, pid.parse().ok()?))
 }
 
 /// Record that this process serves this store's units on `addr` ([`serving`]).
 fn record_serving(layout: &Layout, addr: SocketAddr) {
-    if let Ok(mut record) = crate::platform::open_create_write(&layout.units_serving(), 0o644) {
-        let _ = write!(record, "addr={addr}\npid={}\n", std::process::id());
+    static SERVING_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dest = layout.units_serving();
+    let seq = SERVING_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = dest.with_file_name(format!("units.serving.tmp-{}-{seq}", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    let written = crate::platform::open_create_new_write(&tmp, 0o644)
+        .and_then(|mut record| write!(record, "addr={addr}\npid={}\n", std::process::id()))
+        .and_then(|()| std::fs::rename(&tmp, &dest));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
 /// Remove this process's record of serving, leaving another server's.
 fn clear_serving(layout: &Layout) {
     let path = layout.units_serving();
-    let ours = std::fs::read_to_string(&path)
+    let ours = crate::metadata_io::read_bounded_regular_utf8(&path, MAX_UNITS_SERVING_BYTES)
         .ok()
         .and_then(|text| serving_record(&text))
         .is_some_and(|(_, pid)| pid == std::process::id());
@@ -789,7 +823,7 @@ pub enum Takes {
 /// LAN sharing in `layout`'s store, `written` the `[packages] peers` a person wrote.
 #[must_use]
 pub fn sharing(layout: &Layout, written: Option<&[String]>) -> Sharing {
-    let mut kept = (0, 0);
+    let mut kept = (0usize, 0u64);
     for entry in std::fs::read_dir(units_dir(layout))
         .into_iter()
         .flatten()
@@ -799,7 +833,7 @@ pub fn sharing(layout: &Layout, written: Option<&[String]>) -> Sharing {
             && meta.is_file()
             && links(&meta) >= 2
         {
-            kept = (kept.0 + 1, kept.1 + meta.len());
+            kept = (kept.0.saturating_add(1), kept.1.saturating_add(meta.len()));
         }
     }
     let fleet = fleet();
@@ -1008,8 +1042,7 @@ fn open(layout: &Layout, listen: SocketAddr) -> io::Result<TcpListener> {
             format!("no toolset store at {} yet", layout.prefix.display()),
         ));
     }
-    let listener = TcpListener::bind(listen)?;
-    let _ = aterm_uds::keep_out_of_children(&listener);
+    let listener = aterm_uds::kept_out(|| TcpListener::bind(listen))?;
     listener.set_nonblocking(true)?;
     let units = units_dir(layout);
     crate::platform::make_dirs_born(&units, 0o755)?;
@@ -1055,14 +1088,13 @@ fn answer_until(
     let units = units_dir(layout);
     let slots = Arc::new(Slots::default());
     while running.load(Ordering::Acquire) && !turned_off(layout) {
-        let (conn, from) = match listener.accept() {
+        let (conn, from) = match aterm_uds::kept_out(|| listener.accept()) {
             Ok(accepted) => accepted,
             Err(_) => {
                 std::thread::sleep(ACCEPT_POLL);
                 continue;
             }
         };
-        let _ = aterm_uds::keep_out_of_children(&conn);
         let ip = from.ip().to_canonical();
         // An accepted socket takes the listener's non-blocking mode on BSD and macOS.
         if !admits(ip) || conn.set_nonblocking(false).is_err() || !slots.take(ip) {
@@ -1111,34 +1143,36 @@ fn answer(conn: &TcpStream, units: &Path, pace: &Pace) -> io::Result<()> {
         return status(&mut out, "404 Not Found");
     };
     let path = units.join(sha256);
-    let held = std::fs::symlink_metadata(&path)
+    let mut opened = crate::metadata_io::open_regular(&path)
         .ok()
-        .filter(|meta| meta.is_file() && links(meta) >= 2);
-    let Some(meta) = held else {
+        .and_then(|file| {
+            let meta = file.metadata().ok()?;
+            (meta.is_file() && links(&meta) >= 2).then_some((file, meta.len()))
+        });
+    let Some((file, len)) = opened.as_mut() else {
         // A unit no build holds any more is swept as it is missed.
         if std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file()) {
             let _ = std::fs::remove_file(&path);
         }
         return status(&mut out, "404 Not Found");
     };
-    let mut file = std::fs::File::open(&path)?;
     write!(
         out,
-        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\
+        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {len}\r\n\
          Connection: close\r\n\r\n",
-        meta.len()
     )?;
     // The body keeps the pace: each step of it taken within a window of the step before.
+    let mut limited = file.take(*len);
     let mut buf = vec![0u8; 256 * 1024];
     let mut stepped = 0u64;
     loop {
-        let n = file.read(&mut buf)?;
+        let n = limited.read(&mut buf)?;
         let Some(bytes) = buf.get(..n).filter(|bytes| !bytes.is_empty()) else {
             break;
         };
         out.write_all(bytes)?;
         stepped = stepped.saturating_add(n as u64);
-        if stepped >= pace.step {
+        if pace.step > 0 && stepped >= pace.step {
             stepped %= pace.step;
             out.renew(pace.window);
         }

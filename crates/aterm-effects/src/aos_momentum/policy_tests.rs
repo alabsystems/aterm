@@ -13,9 +13,7 @@ use aterm_aos::replay::{Run, replay};
 use aterm_aos::{ArtifactKind, Digest};
 use aterm_time::Instant;
 
-use super::corpus::{
-    Corpus, CorpusSplit, FRAME_INTERVALS_NS, GOLDEN_TRACE, GOLDEN_TRACE_TARGET, ItemKind, Stratum,
-};
+use super::corpus::{Corpus, CorpusSplit, FRAME_INTERVALS_NS, GOLDEN_TRACE, ItemKind, Stratum};
 use super::fidelity::{LaneFidelity, PROBE_DELTA};
 use super::lane::{Scenario, run};
 use super::plan::{DEMO_PLAN, SHIPPED_PLAN, SchedulePlan, Split, Wake};
@@ -25,11 +23,11 @@ use super::policy::{
     ItemFacts, ItemPin, M4_POLICY_V1_DIGEST, MAX_DISTINCT, MAX_PROPOSAL_BYTES, MAX_ROUNDS,
     Measured, POLICY_NAME, PolicyRefusal, Replace, TRAIN_COUNT, Totals, measure,
 };
-use super::test_fixtures::{attached_for_lane, hosted};
+use super::test_fixtures::{attached_for_lane, hosted, pinned_here};
 use super::{
     DEMO_CODE_NAME, MomentumCode, MomentumEvent, MomentumHost, MomentumObservation, MomentumSchema,
     MomentumTrace, NoStrandedLight, SETTLE_MARGIN, SHIPPED_CODE_NAME, Sched,
-    WAKE_NO_LATER_THAN_CLEAR, target_name,
+    WAKE_NO_LATER_THAN_CLEAR,
 };
 use aterm_aos::evidence::EvidenceGrade;
 
@@ -213,7 +211,7 @@ fn the_policy_is_pinned() {
     assert_eq!((id.name.as_str(), id.version), (POLICY_NAME, 1));
     assert_eq!(POLICY_NAME, "momentum-glow.m4-acceptance");
     println!("momentum-glow.m4-acceptance v1: {}", id.digest.hex());
-    if target_name() == GOLDEN_TRACE_TARGET {
+    if pinned_here() {
         assert_eq!(
             id.digest, M4_POLICY_V1_DIGEST,
             "the policy is pinned in source; re-pinning is a reviewed commit"
@@ -271,16 +269,35 @@ fn the_baseline_is_pinned() {
         "the origin changes nothing"
     );
     let pins = pinned_rows();
-    let moved = moved_rows(&measured, &pins);
-    assert!(
-        moved.is_empty(),
-        "the measured baseline is not the pin ({} rows measured, {} pinned):\n{}",
-        measured.len(),
-        pins.len(),
-        moved.join("\n")
-    );
     let v1 = AcceptancePolicy::v1();
-    assert_eq!(v1.check_baseline(&measured), Ok(()));
+    assert_eq!(v1.check_baseline(&pins), Ok(()));
+    if pinned_here() {
+        let moved = moved_rows(&measured, &pins);
+        assert!(
+            moved.is_empty(),
+            "the measured baseline is not the pin ({} rows measured, {} pinned):\n{}",
+            measured.len(),
+            pins.len(),
+            moved.join("\n")
+        );
+        assert_eq!(v1.check_baseline(&measured), Ok(()));
+    } else {
+        // Another target's libm moves every lane digest and chain (`pinned_here`); what
+        // the glow counts does not move.
+        let counts = |rows: &[Measured]| -> Vec<(String, bool, u64, u64, u64)> {
+            rows.iter()
+                .map(|m| {
+                    let b = &m.baseline;
+                    (m.id.clone(), m.admitted, b.ticks, b.presented, b.wasted)
+                })
+                .collect()
+        };
+        assert_eq!(
+            counts(&measured),
+            counts(&pins),
+            "T, P, Z and admission on every target"
+        );
+    }
 
     for p in ITEMS_V1 {
         let b = p.baseline();
@@ -359,7 +376,7 @@ fn the_baseline_is_pinned() {
         (BaselineField::Admitted, |m| m.admitted = false),
     ];
     for (field, change) in moved {
-        let mut rows = measured.clone();
+        let mut rows = pins.clone();
         change(&mut rows[k]);
         assert_eq!(
             v1.check_baseline(&rows),
@@ -371,7 +388,7 @@ fn the_baseline_is_pinned() {
             field.name()
         );
     }
-    let mut rows = measured.clone();
+    let mut rows = pins.clone();
     rows[k].baseline.lane = None;
     rows[k].admitted = false;
     assert_eq!(

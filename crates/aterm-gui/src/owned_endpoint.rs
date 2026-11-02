@@ -5,10 +5,12 @@
 
 #[cfg(unix)]
 pub(crate) use imp::{
-    arm_orderly_quit, die_of_quit_signal, hold_quit_for_exec, publish, rebound, release,
+    arm_orderly_quit, die_of_quit_signal, die_of_signal, hold_quit_for_exec, publish, rebound,
+    release,
 };
 
-/// How long a headless instance's terminating signal waits ([`arm_orderly_quit`]).
+/// How long a terminating signal's orderly quit runs before the process ends anyway
+/// ([`arm_orderly_quit`]).
 #[cfg(unix)]
 pub(crate) const QUIT_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -84,9 +86,9 @@ mod imp {
         /// Unlink the alias iff it still points where this instance pointed it.
         pub(super) fn remove_if_still_ours(&self) -> bool {
             let mut buf = [0u8; 1024];
-            // SAFETY: `buf` is a live, writable stack buffer of the passed length;
-            // `readlink`/`unlink`
-            // are async-signal-safe.
+            // SAFETY: `buf` is a live, writable stack buffer of the passed length; `readlink`
+            // returns the byte count (no NUL), bounds-checked below. `readlink`/`unlink` are
+            // async-signal-safe.
             unsafe {
                 let n = libc::readlink(self.link.as_ptr(), buf.as_mut_ptr().cast(), buf.len());
                 let Ok(n) = usize::try_from(n) else {
@@ -240,7 +242,10 @@ mod imp {
         }
     }
 
-    /// ARM THE ORDERLY QUIT ([`super`]), in a headless instance once its event loop can be asked.
+    /// ARM THE ORDERLY QUIT ([`super`]): `quit` runs on its own thread at the first terminating
+    /// signal. A headless instance arms it once its event loop can be asked; a window and the
+    /// node job, to give up the account claims before they die of the signal. Once per process:
+    /// a later arm does nothing.
     pub(crate) fn arm_orderly_quit(
         quit: impl FnOnce(libc::c_int) + Send + 'static,
     ) -> std::io::Result<()> {
@@ -263,7 +268,7 @@ mod imp {
                 let sig = libc::c_int::from(byte[0]);
                 let name = signal_name(sig);
                 aterm_log::info!(
-                    "{name}: quitting as the Quit verb does (a second {name} ends the process at once)"
+                    "{name}: quitting in order (a second {name} ends the process at once)"
                 );
                 crate::logging::stderr_line!("aterm-gui: {name}: quitting");
                 quit(sig);
@@ -299,6 +304,13 @@ mod imp {
             crate::crash_signal::release_own_marker();
             die_now(sig);
         }
+    }
+
+    /// Die of `sig` now, as the signal's default action ends the process: what [`publish`]
+    /// recorded removed, as a signal nothing armed for does ([`on_exit_signal`]), and no clean
+    /// exit marked (unlike [`die_of_quit_signal`]), so the next start reads the run as cut short.
+    pub(crate) fn die_of_signal(sig: libc::c_int) {
+        die_now(sig);
     }
 
     /// The graceful exit's removal ([`super`]): what [`publish`] recorded, by the rule the

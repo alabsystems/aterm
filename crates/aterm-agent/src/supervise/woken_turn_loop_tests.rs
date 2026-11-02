@@ -882,3 +882,10 @@ fn the_harnesss_mark_lasts_only_until_claude_code_could_take_the_key() {
     drop(s);
     assert_eq!(m.presses().len(), 1, "one Esc for the wake");
 }
+
+/// [`super::super::observe_table`]'s row of the woken turn's Esc
+/// ([`a_turn_the_mac_slept_through_in_the_vendors_retry_is_pressed_esc_once_the_api_is_up`]).
+pub(crate) fn observe_row_woken_esc() -> &'static [&'static str] {
+    let _ = woken_run("observe-up", Case::on(queued()));
+    &[" esc"]
+}

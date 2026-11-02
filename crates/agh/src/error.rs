@@ -239,7 +239,8 @@ pub fn exit_rows() -> Vec<ExitRow> {
     rows
 }
 
-/// Whether a write may have taken effect.
+/// Whether a write may have taken effect. `None` for a read; a write's `Unknown` after a send
+/// with no answer, and `Applied` after one that landed (design §10.2).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SideEffect {
     /// Nothing was written.
@@ -1149,7 +1150,7 @@ pub(crate) fn push_escaped(out: &mut String, text: &str) {
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
             c => match u8::try_from(c) {
-                Ok(b) if b < 0x20 => {
+                Ok(b) if b.is_ascii_control() => {
                     out.push_str("\\x");
                     aterm_codec::hex::push_lower(out, &[b]);
                 }

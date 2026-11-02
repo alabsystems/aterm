@@ -233,7 +233,7 @@ fn capture_shim(shim: &Path) -> Result<PriorShim, LinkError> {
             crate::platform::MAX_SHIM_BYTES
         )));
     }
-    fs::read(shim)
+    crate::metadata_io::read_bounded_regular(shim, crate::platform::MAX_SHIM_BYTES)
         .map(|bytes| PriorShim::File(bytes, meta.permissions()))
         .map_err(|e| LinkError::Io(format!("{}: {e}", shim.display())))
 }
@@ -251,7 +251,8 @@ fn rollback_tmp(shim: &Path) -> std::io::Result<PathBuf> {
 fn restore_file(shim: &Path, bytes: &[u8], mode: &fs::Permissions) -> std::io::Result<()> {
     let tmp = rollback_tmp(shim)?;
     let _ = fs::remove_file(&tmp);
-    let restored = fs::write(&tmp, bytes)
+    let restored = crate::platform::create_private_new(&tmp)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, bytes))
         .and_then(|()| fs::set_permissions(&tmp, mode.clone()))
         .and_then(|()| fs::rename(&tmp, shim));
     if restored.is_err() {

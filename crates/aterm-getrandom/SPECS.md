@@ -1,50 +1,37 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-getrandom: spec recovery from its 9 unit tests
+# aterm-getrandom: spec recovery from unit tests
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 4 tests it
-> deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
-> were taken before.
-
-> Status 2026-10-16: this file is the crate's migration worklist. Each spec below is proved
-> through Trust/Clean against the compiled Rust function, and then the tests it subsumes are
-> deleted. Nothing has been proved or deleted yet.
-
-Source: `crates/aterm-getrandom` (read only). I read every `#[test]`
-(`src/error.rs` 1, `tests/fill.rs` 5, `tests/recorded.rs` 3 = 9) and the code each one reaches:
-`src/lib.rs`, `src/error.rs`, and `crates/aterm-uds/src/rand.rs` (`fill`, `fill_from`, the Windows
-`fill`). Nothing was compiled or run. The claims below come from reading the code.
-
-Result: **8 specs**, covering **7 tests**. **2 tests are not spec samples** (§4).
-
-Gap numbers refer to `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7. Gap 0 (the
-installed seal publishes no Lean-discharged row) is a prerequisite for every row, so the
-`blocking_gaps` column lists only the gaps beyond it. No spec here is blocked by gap 0 alone.
+Each row states a property of `crates/aterm-getrandom` (`src/lib.rs`, `src/error.rs`) or of the
+`aterm_uds::rand` fill it forwards to, recovered from the tests in `src/error.rs`, `tests/fill.rs`
+and `tests/recorded.rs` (modules of `tests/getrandom_suite.rs`). A test is deleted once Trust/Clean proves its primary spec and every
+`also` spec.
 
 ## 0. Notation used in the statements
 
 - `E(c)` = `Error(c)` for `c: NonZeroU32`, the same value as `Error::from(c)`.
 - `IS` = `Error::INTERNAL_START` = 2^31. `CS` = `Error::CUSTOM_START` = 2^31 + 2^30.
 - `DESC`: the 13-row table in `error.rs::internal_desc`. Offsets `n` in {0..8, 11..14} from `IS`
-  each map to a fixed `&'static str`. Every other code maps to `None`.
-- `OsText(n)` = `std::io::Error::from_raw_os_error(n).to_string()`.
-- `os_description(n)` = `OsText(n)` with the suffix `" (os error n)"` removed. It is `None` when the
-  suffix is missing, when the rest is empty, or when the rest starts with `"Unknown error"`. This is
-  the Unix behaviour; on every other platform it is `None`.
+  each map to a fixed `&'static str`; every other code maps to `None`.
+- `os_description(n)` = `std::io::Error::from_raw_os_error(n).to_string()` with the suffix
+  `" (os error n)"` removed; `None` when the suffix is missing, the rest is empty, or the rest
+  starts with `"Unknown error"`. Off Unix it is always `None`.
 - `PlatformSpec`: the effect assumptions on the OS entropy calls.
   - `getentropy(p, k)` with `k <= 256` returning 0 means `k` CSPRNG bytes were written at `p[0..k]`.
   - `read_exact` returning `Ok` means all `len` bytes were written.
   - `BCryptGenRandom` returning status 0 means `chunk.len()` bytes were written.
 - `Written(buf, i)`: byte `i` of `buf` was stored by an OS entropy source during this call.
-- The CSPRNG assumption: OS output is unpredictable, so two fills differ. This is the statistical
-  part of `tests/fill.rs`. It is an assumption about the OS, and no spec can prove it. The specs
-  below only cite it.
+- The CSPRNG assumption: OS output is unpredictable, so two fills differ. It is the statistical
+  part of `tests/fill.rs`, an assumption about the OS that the specs cite and no proof carries
+  over; deleting the `fill.rs` tests drops only that check.
+- `blocking_gaps`: rows of §7 of `docs/AUDIT-trust-for-test-migration-2026-10-15.md`, beyond gap 0
+  (the installed seal publishes no Lean-discharged row), which every row needs.
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (primary tests; secondary in §2),
-`difficulty` (the Rust features the proof must handle), `blocking_gaps` (audit §7 numbers).
+Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (primary tests; the others are in §2),
+`difficulty` (the Rust features the proof must handle), `blocking_gaps`.
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
@@ -60,8 +47,7 @@ os-fill-writes-every-byte	contract	aterm_uds::rand::fill (unix), aterm_uds::rand
 
 ## 2. Test → spec map (TSV)
 
-`primary` is the spec that retires the test. `also` lists the other specs the same test samples.
-A test is deleted only when its primary and every `also` spec are proved.
+`primary` is the spec that retires the test; `also` lists the other specs it samples.
 
 ```tsv
 file	test	primary	also
@@ -73,23 +59,9 @@ tests/fill.rs	getrandom_writes_every_byte_of_every_length	os-fill-writes-every-b
 tests/fill.rs	getrandom_uninit_writes_every_byte_and_returns_the_same_memory	getrandom-uninit-refines-getrandom	os-fill-writes-every-byte
 ```
 
-## 3. Coverage
-
-- 9 tests read. 7 map to one of the 8 specs. 2 are not spec samples (§4).
-- `error-raw-os-error-partition` has no primary test. It is the shared lemma under both
-  `recorded.rs` formatting tests, which sample it at the `IS` boundary.
-- The `fill.rs` statistical checks (two fills of 16 bytes or more differ; a missed position is
-  caught with probability 1 - 2^-64) sample the CSPRNG assumption, not a crate property. No proof
-  carries them over. Deleting `getrandom_writes_every_byte_of_every_length` and
-  `getrandom_uninit_writes_every_byte_and_returns_the_same_memory` after their specs are proved
-  drops only that statistical check, which tests the OS, not this crate.
-
 ## 4. Tests that are not spec samples
 
-> Status 2026-10-16: `ring_system_random_writes_every_byte_of_every_length` is deleted. `the_property_catches_a_fill_that_skips_bytes` is kept until `os-fill-writes-every-byte`, `getrandom-forwards` and `getrandom-uninit-refines-getrandom` are proved.
-
-> Status 2026-10-17: `the_property_catches_a_fill_that_skips_bytes`, the fill property's negative
-> control, is deleted too, and the rows of both tests are gone.
+None.
 
 ## 5. Suspicious specs
 
@@ -108,10 +80,9 @@ tests/fill.rs	getrandom_uninit_writes_every_byte_and_returns_the_same_memory	get
    states the `0..=4096` byte-fill test scope directly, while `os-fill-writes-every-byte` carries the
    CSPRNG assumption.
 
-## 6. Proof order (easiest high-value first)
+## 6. Proof order
 
-No spec is blocked by gap 0 alone. Every one needs at least gap 1 (a struct, slice or Option
-carrier), so the order follows the smallest remaining gap set.
+Every spec needs at least gap 1, so the order follows the smallest remaining gap set.
 
 1. **`error-code-table`** (gaps 1, 3). A `const fn` over a `NonZeroU32` newtype with u16→u32
    arithmetic, decidable by evaluating 13 constants plus a bound on `n: u16`. It retires
@@ -125,10 +96,9 @@ carrier), so the order follows the smallest remaining gap set.
    case cites `aterm_uds::rand::fill`'s ensures across crates.
 5. **`error-internal-format`** (gaps 1, 3, 4, 5, 6). String and Formatter carriers over a finite
    table plus a fallback arm.
-6. **`getrandom-uninit-refines-getrandom`** (gaps 1, 2, 3, 4, 8). Needs MaybeUninit initialisation and
+6. **`getrandom-uninit-refines-getrandom`** (gaps 1, 2, 3, 4, 8): MaybeUninit initialisation and
    pointer identity on top of `getrandom-forwards`.
-7. **`error-os-format`** (gaps 1, 3, 4, 5, 6, 8). Rests on std's strerror text, an FFI effect.
-8. **`os-fill-writes-every-byte`** (gaps 1, 2, 7, 8, 12, 13). It is the most valuable spec (it is the
-   crate's reason to exist) and the hardest: a chunk-partition loop invariant through a closure, FFI
-   PlatformSpec rows, fs effects, and `fill_from` is `trust::skip` today. It lives in `aterm-uds`, so
-   it is proved there and cited here.
+7. **`error-os-format`** (gaps 1, 3, 4, 5, 6, 8): rests on std's strerror text, an FFI effect.
+8. **`os-fill-writes-every-byte`** (gaps 1, 2, 7, 8, 12, 13): the crate's reason to exist and the
+   hardest: a chunk-partition loop invariant through a closure, FFI `PlatformSpec` rows and fs
+   effects. It lives in `aterm-uds`, so it is proved there and cited here.

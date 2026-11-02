@@ -223,7 +223,8 @@ impl Rooms {
     /// The rooms in `dir`'s [`ROOM_FILE`]; none where it cannot be read.
     #[must_use]
     pub fn load(dir: &Path) -> Self {
-        std::fs::read_to_string(dir.join(ROOM_FILE))
+        const ROOM_FILE_MAX: u64 = 64 * 1024;
+        crate::read_regular_text(&dir.join(ROOM_FILE), ROOM_FILE_MAX)
             .map(|t| Self::decode(&t))
             .unwrap_or_default()
     }
@@ -245,7 +246,7 @@ impl Rooms {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
-            open.mode(0o600);
+            open.mode(0o600).custom_flags(libc::O_CLOEXEC);
         }
         let mut file = open.open(&staged)?;
         #[cfg(unix)]

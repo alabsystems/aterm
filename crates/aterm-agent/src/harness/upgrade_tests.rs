@@ -161,6 +161,18 @@ fn the_rewrite_carries_the_flags_and_resumes_the_conversation() {
         Err(ArgvRefusal::UnknownFlag("-cz".to_string())),
         "an unknown short in a bundle"
     );
+    assert_eq!(
+        rewrite_argv(&argv(&["claude", "--verbose=1"]), ID),
+        Err(ArgvRefusal::UnknownFlag("--verbose".to_string())),
+        "an inline value on a boolean switch is refused"
+    );
+    for missing in ["--model", "-n", "--add-dir"] {
+        assert_eq!(
+            rewrite_argv(&argv(&["claude", missing]), ID),
+            Err(ArgvRefusal::UnknownFlag(missing.to_string())),
+            "{missing}"
+        );
+    }
     for not in [
         "-p",
         "--print",
@@ -2075,6 +2087,15 @@ fn a_lanes_record_key_is_its_word_and_its_tab_and_no_conversation_is_one() {
     assert!(is_session_id(conversation));
     assert_eq!(Agent::keyed(conversation), None);
     assert_eq!(Agent::Codex.record_tab("codexs-1a2b"), None);
+    for bad in ["", "../s-1", "s.1", "s/1"] {
+        assert_eq!(Agent::Codex.record_key(bad), None, "{bad:?}");
+        assert_eq!(
+            Agent::Codex.record_tab(&format!("codex-{bad}")),
+            None,
+            "{bad:?}"
+        );
+        assert_eq!(Agent::keyed(&format!("codex-{bad}")), None, "{bad:?}");
+    }
     for agent in Agent::ALL {
         let Some(prefix) = agent.record_prefix() else {
             continue;
@@ -2645,8 +2666,10 @@ fn a_restarts_cruise_prompt_lands_nothing_in_the_record() {
     let legacy_check = carry_on.replace(CARRY_ON, TOKEN_CHECK_FIXTURE);
     assert_ne!(legacy_check, carry_on, "the fixture replaced the carry-on");
     let checks = [
-        checking(&carry_on, false),
-        checking(&carry_on, true),
+        checking(&carry_on, false, false),
+        checking(&carry_on, true, false),
+        checking(&carry_on, false, true),
+        checking(&carry_on, true, true),
         legacy_check,
     ];
     for check in &checks {
@@ -2670,13 +2693,20 @@ fn a_restarts_cruise_prompt_lands_nothing_in_the_record() {
         assert!(!finished(&reopened), "it opens a landed task: {check}");
     }
     let land = turn_end::land_text(None);
-    assert!(finished(&answered(&land, DEFENSE)), "Land's instruction");
+    assert!(
+        !finished(&answered(&land, DEFENSE)),
+        "CONTROL: Land's instruction answered with a defense lands nothing"
+    );
+    assert!(
+        finished(&answered(turn_end::LAND_CHECK, LANDED)),
+        "the land check answered LANDED"
+    );
     let mut carried = landing_rows();
     carried.push(typed_row(&carry_on));
     assert!(finished(&carried), "the plain carry-on opens nothing");
-    let quoted = format!("Please read this: {land}");
+    let quoted = format!("Please read this: {}", turn_end::LAND_CHECK);
     assert!(
-        !finished(&answered(&quoted, DEFENSE)),
+        !finished(&answered(&quoted, LANDED)),
         "CONTROL: a person's prompt"
     );
 }
@@ -2720,21 +2750,24 @@ fn a_walls_retry_delivers_the_land_act_it_cut_again_to_the_record() {
         scan
     };
     let check = || typed_row(turn_end::DONE_CHECK);
-    let land = || typed_row(&turn_end::land_text(None));
+    // The land act a wall cuts whose retry decides the landing is the land check: its `LANDED`
+    // lands, a defense answering Land's instruction or nudge never does.
+    let land = || typed_row(turn_end::LAND_CHECK);
     let nudge = || typed_row(&turn_end::land_nudge_text(Some("never push to main")));
-    let done = || model_row(DEFENSE);
+    let defense = || model_row(DEFENSE);
+    let done = || model_row(LANDED);
     let going = || model_row("Running the last suite before I say done.");
     let finished: [(&str, Vec<String>); 5] = [
         (
-            "LAND, cut, retried",
+            "the land check, cut, retried",
             vec![land(), wall.clone(), retried.clone(), done()],
         ),
         (
-            "LAND answered, then cut, retried",
+            "the land check answered, then cut, retried",
             vec![land(), going(), wall.clone(), retried.clone(), done()],
         ),
         (
-            "LAND, cut twice",
+            "the land check, cut twice",
             vec![
                 land(),
                 wall.clone(),
@@ -2745,18 +2778,20 @@ fn a_walls_retry_delivers_the_land_act_it_cut_again_to_the_record() {
             ],
         ),
         (
-            "a land nudge, cut, retried",
+            "a land nudge defended, the check cut, retried",
             vec![
-                land(),
+                typed_row(&turn_end::land_text(None)),
                 going(),
                 nudge(),
+                defense(),
+                land(),
                 wall.clone(),
                 retried.clone(),
                 done(),
             ],
         ),
         (
-            "LAND, cut, retried, closed",
+            "the land check, cut, retried, closed",
             vec![
                 land(),
                 wall.clone(),
@@ -2823,13 +2858,17 @@ fn a_walls_retry_delivers_the_land_act_it_cut_again_to_the_record() {
     for (what, rows, ours) in &open {
         let s = scan(rows, ours);
         assert!(!s.finished(), "CONTROL, {what}");
-        assert!(s.said_done(), "CONTROL, {what}: a done report");
     }
+    let s = scan(&[check(), wall.clone(), retried.clone(), defense()], &ours);
+    assert!(
+        !s.finished() && s.said_done(),
+        "CONTROL: the Cruise prompt's retry answered with a defense: a done report"
+    );
     let idle = model_row("No lander is running, so I'm not re-arming that watch.");
     let s = scan(&[land(), wall.clone(), retried, idle], &ours);
     assert!(
         !s.finished(),
-        "CONTROL: an idle report answering the retried LAND"
+        "CONTROL: an idle report answering the retried land check"
     );
 }
 
@@ -2849,9 +2888,11 @@ fn only_a_walls_retry_by_its_ledger_rule_delivers_the_cut_land_act_again() {
             typed_row("Fix the lexer and land it."),
             model_row("All done: the parser and the lexer are in."),
             typed_row(&turn_end::land_text(None)),
+            model_row(DEFENSE),
+            typed_row(turn_end::LAND_CHECK),
             wall.clone(),
             at(typed_row("keep going")),
-            model_row(DEFENSE),
+            model_row(LANDED),
         ] {
             scan.line(&row);
         }
@@ -2860,14 +2901,13 @@ fn only_a_walls_retry_by_its_ledger_rule_delivers_the_cut_land_act_again() {
     let resumed = scan(turn_end::RULE_LIMIT_RESUME);
     assert!(
         resumed.finished(),
-        "the usage resume delivers the act again"
+        "the usage resume delivers the land check again"
     );
     let continued = scan(turn_end::RULE_CONTINUE);
     assert!(
         !continued.finished(),
         "a plain continuation after the wall delivers no act"
     );
-    assert!(continued.said_done(), "its defense is a done report");
     assert!(
         !scan("").finished(),
         "a ledger row that names no rule is no retry"
@@ -2903,7 +2943,34 @@ fn the_vendors_own_continuation_delivers_the_cut_land_act_again_to_the_record() 
     };
     let land = typed_row(&turn_end::land_text(None));
     let s = scan(&[land.clone(), wall.clone(), auto.clone(), done.clone()]);
-    assert!(s.finished(), "the continuation delivers LAND again");
+    assert!(
+        !s.finished() && s.said_done(),
+        "CONTROL: the continuation delivers LAND again, and its defense lands nothing"
+    );
+    let s = scan(&[
+        land.clone(),
+        done.clone(),
+        typed_row(turn_end::LAND_CHECK),
+        wall.clone(),
+        auto.clone(),
+        model_row(LANDED),
+    ]);
+    assert!(
+        s.finished(),
+        "the continuation delivers the land check again"
+    );
+    let s = scan(&[
+        land.clone(),
+        done.clone(),
+        typed_row(turn_end::LAND_CHECK),
+        wall.clone(),
+        notification_row(),
+        model_row(LANDED),
+    ]);
+    assert!(
+        !s.finished(),
+        "CONTROL: a background task's wake after the check's limit"
+    );
     for (what, rows) in [
         (
             "nothing asked before the limit",
@@ -2961,14 +3028,27 @@ fn lands_answer_after_the_instruction_is_a_land_act_to_the_record() {
         scan
     };
     let closed = r#"{"isSidechain":false,"type":"system","subtype":"turn_duration","durationMs":180000,"messageCount":4,"isMeta":false}"#.to_string();
-    let landed = scan(
-        &[land(), question(), answer(), done(), closed],
+    let defended = scan(
+        &[land(), question(), answer(), done()],
         turn_end::RULE_LAND_ANSWER,
     );
     assert!(
-        landed.finished(),
-        "the answer after the instruction lands it"
+        !defended.finished() && defended.said_done(),
+        "the answer after the instruction is a land act, and its defense lands nothing"
     );
+    let landed = scan(
+        &[
+            land(),
+            question(),
+            answer(),
+            done(),
+            typed_row(turn_end::LAND_CHECK),
+            model_row(LANDED),
+            closed,
+        ],
+        turn_end::RULE_LAND_ANSWER,
+    );
+    assert!(landed.finished(), "the land check after it lands it");
     for (what, rows, rule) in [
         (
             "no instruction before it",
@@ -3009,13 +3089,23 @@ const FINISHED_REPORT: &str = "Landed the fix and verified it on main.\n\nATERM-
 const DEFENSE: &str = "Landed the fix and verified it.\nNothing left: it is merged into the \
                        remote main branch.";
 
+/// The land check's answer that lands a task.
+const LANDED: &str = crate::supervise::policy::land_check::LANDED;
+
+/// The land check asked, then answered `LANDED`: what lands a task after its defense.
+fn checked_rows() -> [String; 2] {
+    [typed_row(turn_end::LAND_CHECK), model_row(LANDED)]
+}
+
 fn landing_rows() -> Vec<String> {
-    vec![
+    let mut rows = vec![
         typed_row("Fix the lexer and land it."),
         model_row("The lexer is fixed and its tests pass."),
         typed_row(&turn_end::land_text(None)),
         model_row(DEFENSE),
-    ]
+    ];
+    rows.extend(checked_rows());
+    rows
 }
 
 #[test]
@@ -3031,6 +3121,11 @@ fn finished_holds_until_someone_asks() {
             .collect::<Vec<_>>()
     };
     assert!(!finished(&base[..3]), "Land asked, not answered");
+    assert!(
+        !finished(&base[..4]),
+        "CONTROL: a clean defense alone lands nothing"
+    );
+    assert!(!finished(&base[..5]), "the land check asked, not answered");
     assert!(finished(&base), "the landing");
     let auto = asked_by_row(
         "auto-continuation",
@@ -3092,10 +3187,10 @@ fn finished_holds_until_someone_asks() {
         assert!(finished(rows), "{what}");
     }
     let mut scan = FinishedScan::default();
-    for row in &base[..3] {
+    for row in &base[..5] {
         assert!(!scan.line(row));
     }
-    assert!(scan.line(&base[3]));
+    assert!(scan.line(&base[5]));
     assert!(scan.line(&notification_row()));
     assert!(scan.line(&reply("Done with the cleanup.")));
     assert!(!scan.line(&typed_row("Now add the flag.")));
@@ -3126,9 +3221,9 @@ fn finished_holds_until_someone_asks() {
         "",
         r#"[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]"#,
     );
-    let asked_land = || base[..3].to_vec();
+    let asked_land = || base[..5].to_vec();
     let after_land = |row: String| [asked_land(), vec![row]].concat();
-    let defense_json = aterm_json::to_string(&Value::from(DEFENSE)).expect("json");
+    let defense_json = aterm_json::to_string(&Value::from(LANDED)).expect("json");
     let synthetic = format!(
         r#"{{"isSidechain":false,"type":"assistant","message":{{"model":"<synthetic>","role":"assistant","content":[{{"type":"text","text":{defense_json}}}]}}}}"#
     );
@@ -3190,20 +3285,22 @@ fn lands_instruction_typed_again_after_a_compaction_is_a_land_act_to_the_record(
             typed_row("Fix the lexer and land it."),
             model_row("All tasks are complete and verified; nothing is left to do."),
             typed_row(&land),
+            model_row(DEFENSE),
+            typed_row(turn_end::LAND_CHECK),
             wall.clone(),
             compact.clone(),
             summary.clone(),
             typed_row(continuation),
-            model_row(DEFENSE),
+            model_row(LANDED),
         ] {
             s.line(&row);
         }
         s
     };
-    let again = scan(&land);
+    let again = scan(turn_end::LAND_CHECK);
     assert!(again.finished(), "{again:?}");
     let going = scan("keep going");
-    assert!(!going.finished() && going.said_done(), "{going:?}");
+    assert!(!going.finished(), "{going:?}");
 }
 
 #[test]
@@ -3217,18 +3314,31 @@ fn lands_acts_are_read_by_their_words_whoever_typed_them() {
         }
         s
     };
+    let hinted = crate::supervise::policy::land_check::land_check_text(
+        Some("the docs PR is still open"),
+        true,
+        Some("never push to main"),
+    );
     for land in [
         turn_end::land_text(None),
         turn_end::land_text(Some("never push to main")),
         turn_end::land_nudge_text(None),
     ] {
-        let s = scan(&[
+        let defended = [
             ask.clone(),
             report.clone(),
             typed_row(&land),
             model_row(DEFENSE),
-        ]);
-        assert!(s.finished(), "no ledger: {land}");
+        ];
+        let s = scan(&defended);
+        assert!(
+            !s.finished() && s.said_done(),
+            "a defense lands nothing: {land}"
+        );
+        for check in [turn_end::LAND_CHECK, hinted.as_str()] {
+            let rows = [&defended[..], &[typed_row(check), model_row(LANDED)]].concat();
+            assert!(scan(&rows).finished(), "no ledger: {land}: {check}");
+        }
     }
     for check in [
         turn_end::DONE_CHECK.to_string(),
@@ -3238,9 +3348,9 @@ fn lands_acts_are_read_by_their_words_whoever_typed_them() {
         rows.push(typed_row(&check));
         assert!(!scan(&rows).finished(), "no ledger, opened: {check}");
     }
-    let quoted = format!("Is this wording right? {}", turn_end::land_text(None));
-    let s = scan(&[ask, report, typed_row(&quoted), model_row(DEFENSE)]);
-    assert!(!s.finished() && s.said_done(), "{s:?}");
+    let quoted = format!("Is this wording right? {}", turn_end::LAND_CHECK);
+    let s = scan(&[ask, report, typed_row(&quoted), model_row(LANDED)]);
+    assert!(!s.finished(), "{s:?}");
 }
 
 fn old_challenge(irreversible: bool) -> String {
@@ -3379,6 +3489,12 @@ fn legacy_land_instructions_land_on_a_clean_defense() {
         ]
         .join("\n")
     };
+    for prompt in [turn_end::LAND, turn_end::LAND_NUDGE] {
+        assert!(
+            !transcript_finished(&answered(prompt, DEFENSE), &[]),
+            "CONTROL: today's act lands on its check, never its defense: {prompt}"
+        );
+    }
     for prompt in [instruction, nudge]
         .into_iter()
         .chain(turn_end::RETIRED_LANDS)
@@ -3386,7 +3502,7 @@ fn legacy_land_instructions_land_on_a_clean_defense() {
     {
         assert!(
             transcript_finished(&answered(prompt, DEFENSE), &[]),
-            "{prompt}"
+            "an older build landed on its clean defense: {prompt}"
         );
         for said in [
             "The task is complete. The tests passed and the fix is committed.",
@@ -3401,7 +3517,7 @@ fn legacy_land_instructions_land_on_a_clean_defense() {
 }
 
 #[test]
-fn only_a_land_acts_clean_defense_lands_the_task_in_the_record() {
+fn only_the_land_checks_landed_lands_the_task_in_the_record() {
     let ask = typed_row("Fix the lexer and land it.");
     let report = model_row("All done: the suite passes.");
     let finished = |rows: &[String]| transcript_finished(&rows.join("\n"), &[]);
@@ -3452,13 +3568,40 @@ fn only_a_land_acts_clean_defense_lands_the_task_in_the_record() {
     .chain(turn_end::RETIRED_LAND_NUDGES);
     let needs = format!("{DEFENSE}\nNEEDS YOU: the release credential.");
     let open_work = "Pushed the lexer fix.\nNothing left: the parser's follow-up is still open.";
+    let checked = |act: &str, said: &str, answer: &str| {
+        [
+            &answered(act, said)[..],
+            &[typed_row(turn_end::LAND_CHECK), model_row(answer)],
+        ]
+        .concat()
+    };
     for act in acts {
-        assert!(finished(&answered(act, DEFENSE)), "{act}");
+        let retired = turn_end::RETIRED_LANDS
+            .into_iter()
+            .chain(turn_end::RETIRED_LAND_NUDGES)
+            .any(|r| r == act);
+        assert_eq!(
+            finished(&answered(act, DEFENSE)),
+            retired,
+            "only an older build's act landed on its defense: {act}"
+        );
+        assert!(finished(&checked(act, DEFENSE, LANDED)), "{act}");
         for said in claims {
             assert!(!finished(&answered(act, said)), "a claim: {act}: {said}");
         }
         assert!(!finished(&answered(act, &needs)), "a need: {act}");
         assert!(!finished(&answered(act, open_work)), "open work: {act}");
+        for answer in [
+            "LANDED, except the docs PR",
+            "NEEDS YOU: the release credential.",
+            DEFENSE,
+            open_work,
+        ] {
+            assert!(
+                !finished(&checked(act, DEFENSE, answer)),
+                "the check answered otherwise: {act}: {answer}"
+            );
+        }
     }
     assert!(!finished(&[ask.clone(), model_row(claims[0])]));
     assert!(!finished(&[ask.clone(), model_row(DEFENSE)]));
@@ -3482,6 +3625,8 @@ fn a_wait_at_lands_yield_is_reopened_by_its_own_wake() {
             typed_row("Fix the lexer and land it."),
             model_row("All done."),
             typed_row(&turn_end::land_text(None)),
+            model_row(DEFENSE),
+            typed_row(turn_end::LAND_CHECK),
             model_row(said),
             notification_row(),
             model_row("The release build passed. Next I'll publish the notes."),
@@ -3490,7 +3635,7 @@ fn a_wait_at_lands_yield_is_reopened_by_its_own_wake() {
     for wait in WAITS_AT_THE_CHECK {
         assert!(!finished(&rows(wait)), "{wait}");
     }
-    assert!(finished(&rows(DEFENSE)));
+    assert!(finished(&rows(LANDED)));
 }
 
 fn in_turn(row: &str, id: &str) -> String {
@@ -3511,13 +3656,24 @@ fn a_turn_its_own_goal_keeps_going_takes_the_landing_back() {
     let report = model_row("Stage 1 builds; stage 2 next.");
     let land = in_turn(&typed_row(&turn_end::land_text(None)), "p1");
     let defense = model_row(DEFENSE);
-    let landed = || vec![ask.clone(), report.clone(), land.clone(), defense.clone()];
+    let check = in_turn(&typed_row(turn_end::LAND_CHECK), "p2");
+    let landed_word = model_row(LANDED);
+    let landed = || {
+        vec![
+            ask.clone(),
+            report.clone(),
+            land.clone(),
+            defense.clone(),
+            check.clone(),
+            landed_word.clone(),
+        ]
+    };
     let tool = in_turn(
         &bare_user_row(
             "",
             r#"[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]"#,
         ),
-        "p1",
+        "p2",
     );
     let work = model_row("Correct: stage 2 still fails with E0463. Checking it.");
     let hook = meta_row(
@@ -3530,26 +3686,33 @@ fn a_turn_its_own_goal_keeps_going_takes_the_landing_back() {
         ("a Stop hook's feedback", &hook),
         ("/goal's check-in", &goal),
     ] {
-        let kept = in_turn(kept, "p1");
+        let kept = in_turn(kept, "p2");
         let rows = [landed(), vec![kept.clone(), work.clone()]].concat();
         assert!(!finished(&rows), "{what}, then more work");
         let rows = [landed(), vec![kept.clone(), tool.clone(), work.clone()]].concat();
         assert!(!finished(&rows), "{what}, a tool's result, then more work");
         let rows = [landed(), vec![kept.clone()]].concat();
         assert!(finished(&rows), "{what} alone");
+        let rows = [landed(), vec![kept.clone(), landed_word.clone()]].concat();
+        assert!(finished(&rows), "{what}, then LANDED again");
         let rows = [landed(), vec![kept.clone(), defense.clone()]].concat();
-        assert!(finished(&rows), "{what}, then the defense again");
+        assert!(
+            !finished(&rows),
+            "CONTROL: {what}, then a defense: not the check's word"
+        );
     }
     let rows = [
         typed_row("Make the compiler build itself."),
         report.clone(),
         typed_row(&turn_end::land_text(None)),
         defense.clone(),
+        typed_row(turn_end::LAND_CHECK),
+        landed_word.clone(),
         hook.clone(),
         work.clone(),
     ];
     assert!(!finished(&rows), "no promptId");
-    let wake = in_turn(&meta_row("keep going: check the land log"), "p2");
+    let wake = in_turn(&meta_row("keep going: check the land log"), "p3");
     let rows = [
         landed(),
         vec![wake, model_row("The land log shows nothing new.")],
@@ -3565,6 +3728,8 @@ fn a_turn_its_own_goal_keeps_going_takes_the_landing_back() {
         report,
         typed_row(&turn_end::land_text(None)),
         defense,
+        typed_row(turn_end::LAND_CHECK),
+        landed_word,
         unnumbered_wake,
         model_row("The land log shows nothing new."),
     ];
@@ -3647,6 +3812,7 @@ fn a_shell_command_asks_nothing_and_a_prompt_typed_while_it_works_is_someones() 
     let relanded = [
         wake,
         vec![typed_row(&turn_end::land_text(None)), model_row(DEFENSE)],
+        checked_rows().to_vec(),
     ]
     .concat();
     assert!(finished(&relanded, &[]), "absorbed, then landed again");
@@ -5941,10 +6107,13 @@ fn every_angled_check_is_the_done_checks_prompt_in_the_transcript() {
         })
         .collect();
     texts.push(DONE_CHECK_FIXED_BEFORE.to_string());
-    texts.push(checking(
-        &format!("{HARNESS_MARK} Relaunched: this session was restarted. {CARRY_ON}"),
-        false,
-    ));
+    for held in [false, true] {
+        texts.push(checking(
+            &format!("{HARNESS_MARK} Relaunched: this session was restarted. {CARRY_ON}"),
+            false,
+            held,
+        ));
+    }
     for text in &texts {
         assert!(is_done_check(text), "{text}");
     }

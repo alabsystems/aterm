@@ -352,3 +352,59 @@ fn wire_failures_at_each_phase() {
     let read = wire(&failure(Phase::Sent), Method::Get, Idempotency::OneShot);
     assert_eq!(read.kind, Kind::CouldNotRun);
 }
+
+/// What a write's answer says it may have done: a 4xx wrote nothing (`none`), and a 5xx or a
+/// request that left with no answer may have written (`unknown`).
+#[cfg(unix)]
+#[test]
+fn a_write_s_4xx_is_refused_and_its_5xx_unknown() {
+    use std::sync::Arc;
+
+    use agh::github::raw::RawSend;
+    use agh::policy::{RouteRequest, RouteTarget};
+    use agh::wire::scripted::{Scripted, ScriptedTransport};
+    use agh::write::Outcome;
+
+    let root = common::scratch("write-classes");
+    common::write_token(
+        &root.path().join("tokens"),
+        "dev.token",
+        &agh_fake::token("dev"),
+    );
+    let router = common::router(&common::canonical_config(root.path()), root.path());
+    let transport = Arc::new(ScriptedTransport::new());
+    let gh = common::github_over(router, transport.clone(), common::scripted_endpoints(9000));
+    let slug = common::slug("fixture-dev/app");
+    let send = RawSend::new(
+        Method::Patch,
+        "/repos/fixture-dev/app",
+        RouteRequest::write(RouteTarget::Repo(slug.clone())),
+    );
+    let permit = gh.permit(&send.route).expect("a dev-tier permit");
+    let journal = agh::Journal::open(&agh::config::Dirs::under(root.path()), &slug, gh.fx())
+        .expect("the journal");
+    let json = [("content-type", "application/json")];
+    transport.answer(422, &json, b"{\"message\":\"Validation Failed\"}");
+    let refused = gh.raw().send(&permit, &send, &journal).expect("an outcome");
+    let Outcome::Refused(error) = refused else {
+        panic!("a 422 is refused: {refused:?}");
+    };
+    assert_eq!(error.side_effect.slug(), "none", "{error:?}");
+    transport.answer(502, &json, b"{\"message\":\"Bad Gateway\"}");
+    let error = gh
+        .raw()
+        .send(&permit, &send, &journal)
+        .expect_err("a 502 is no outcome GitHub settled");
+    assert_eq!(error.side_effect.slug(), "unknown", "{error:?}");
+    transport.push(Scripted::Fail(WireError {
+        phase: Phase::Sent,
+        kind: WireKind::Reset,
+        detail: "reset".into(),
+    }));
+    let error = gh
+        .raw()
+        .send(&permit, &send, &journal)
+        .expect_err("a lost answer");
+    assert_eq!(error.side_effect.slug(), "unknown", "{error:?}");
+    assert_eq!(transport.requests().len(), 3);
+}

@@ -461,14 +461,29 @@ pub(crate) mod tests {
     use super::*;
     use aterm_types::scheme_import::{self, MAX_IMPORT_BYTES};
 
-    fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-cli-theme-{tag}-{}-{}",
-            std::process::id(),
-            aterm_time::since_epoch().map_or(0, |d| d.as_nanos())
-        ));
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        dir
+    struct ScratchDir(aterm_tempfile::TempDir);
+
+    impl std::ops::Deref for ScratchDir {
+        type Target = Path;
+
+        fn deref(&self) -> &Self::Target {
+            self.0.path()
+        }
+    }
+
+    impl AsRef<Path> for ScratchDir {
+        fn as_ref(&self) -> &Path {
+            self.0.path()
+        }
+    }
+
+    fn scratch(tag: &str) -> ScratchDir {
+        ScratchDir(
+            aterm_tempfile::Builder::new()
+                .prefix(&format!("aterm-cli-theme-{tag}-"))
+                .tempdir()
+                .expect("scratch dir"),
+        )
     }
 
     fn args(list: &[&str]) -> Vec<OsString> {

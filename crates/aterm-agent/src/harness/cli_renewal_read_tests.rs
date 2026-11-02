@@ -182,7 +182,18 @@ fn manual_renewals_recover_or_refuse_before_dispatching_any_provider() {
                     "{cli:?}, due={due}, fault={fault}: {err}"
                 );
                 if fault < 2 {
-                    assert_eq!(*host.emails.borrow(), ["main@example.test"]);
+                    // The recovery runs everywhere; the sign-in after it only where it runs
+                    // (`signs_in_here`).
+                    let asked: &[&str] = if signs_in_here(cli) {
+                        &["main@example.test"]
+                    } else {
+                        &[]
+                    };
+                    assert_eq!(
+                        *host.emails.borrow(),
+                        asked,
+                        "{cli:?}, due={due}, fault={fault}"
+                    );
                     assert_eq!(
                         bed.store
                             .load_logins(bed.env.now)
@@ -305,6 +316,7 @@ fn scheduling_notes_are_emitted_once_even_when_staging_is_checked() {
                 &bed.path,
                 bed.env.now,
                 recover_staging,
+                bed.env.home.as_deref(),
                 &mut err,
             )
             .unwrap();

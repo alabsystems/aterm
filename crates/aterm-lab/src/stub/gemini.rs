@@ -4,10 +4,11 @@
 //! The stub's Gemini API.
 
 use std::io;
-use std::time::Duration;
 
 use super::{Out, Stub, ToolTurn, Turn, analyse, bump, call_input, call_name, closed};
-use super::{est_tokens, limit_params, rand_hex, script_calls, spec_headers, split_deltas};
+use super::{
+    est_tokens, limit_params, rand_hex, script_calls, sleep_secs, spec_headers, split_deltas,
+};
 use crate::pyjson::{COMPACT, J};
 use crate::util::one_line;
 
@@ -411,6 +412,18 @@ pub const DAY_QUOTA_RETRY: i64 = 3600;
 /// The wall a fixed mode puts on a turn, in Google's shape.
 #[must_use]
 pub fn mode_error(mode: &str, model: &str) -> Option<(u16, J)> {
+    if let Some(secs) = super::rate_limit_after(mode) {
+        // A per-minute quota, agy's own wait: its `RetryInfo` names the mode's seconds.
+        return Some((
+            429,
+            quota_error_for(
+                model,
+                "GenerateRequestsPerMinutePerProjectPerModel-FreeTier",
+                5,
+                &format!("{secs}s"),
+            ),
+        ));
+    }
     Some(match mode {
         "rate-limit" => (429, quota_error(model, DAY_QUOTA_RETRY)),
         "overloaded" => (
@@ -694,6 +707,11 @@ impl Stub {
         }
         let info = analyse_gemini(body);
         let kind = info.kind;
+        let mode = match self.mode_for_request(mode, kind == "gemini") {
+            Ok(mode) => mode,
+            Err(refusal) => return refusal.answer(self, method, path, blen, out),
+        };
+        let mode = mode.as_str();
         let n = bump(&mut self.st().by_kind, kind);
         let mut summary = format!(
             "kind={kind} auth={label} model={model} stream={} contents={} tools={} sys={}c results={} last_user=\"{}\"",
@@ -723,7 +741,7 @@ impl Stub {
                 .and_then(|p| std::fs::read_to_string(p).ok())
                 .and_then(|t| J::parse(&t).ok());
             if let Some((reply, ms)) = script.as_ref().and_then(|s| held_reply(body, s)) {
-                std::thread::sleep(Duration::from_secs_f64(ms / 1000.0));
+                sleep_secs(ms / 1000.0);
                 let s = format!("{summary} tool:held {ms:.0} ms");
                 return self.gemini_answer(t, &s, text_steps(&reply), &[], out);
             }
@@ -749,7 +767,7 @@ impl Stub {
         }
         let mut mode = mode.to_string();
         if let Some(spec) = self.take_custom(&mode, Some(label)) {
-            let spec = super::with_reply(spec, &gemini_users(body));
+            let spec = self.gated_reply(spec, &gemini_users(body));
             if let Some((name, input)) = super::scripted_call(&spec, results_answered(body)) {
                 let note = super::misfit_note(body, &[(&name, &input)]);
                 let call = J::obj([
@@ -774,7 +792,7 @@ impl Stub {
                     .and_then(J::as_f64)
                     .filter(|v| *v > 0.0)
                 {
-                    std::thread::sleep(Duration::from_secs_f64(ms / 1000.0));
+                    sleep_secs(ms / 1000.0);
                 }
                 let reply = spec
                     .get("text")
@@ -815,9 +833,10 @@ impl Stub {
             };
             let now_s = crate::util::now_secs();
             if now_s < reset {
-                let body = quota_error(model, reset - now_s);
+                let rem = reset.saturating_sub(now_s);
+                let body = quota_error(model, rem);
                 let st = out.json(429, &body, &[])?;
-                let s = format!("{summary} limit:{claim} resets in {}s", reset - now_s);
+                let s = format!("{summary} limit:{claim} resets in {rem}s");
                 self.record(method, path, st, blen, &mode, &s);
                 return Ok(());
             }
@@ -875,9 +894,7 @@ impl Stub {
         let last = steps.len().saturating_sub(1);
         let sent = (|| -> io::Result<()> {
             for (i, (pause, parts)) in steps.iter().enumerate() {
-                if *pause > 0.0 {
-                    std::thread::sleep(Duration::from_secs_f64(*pause));
-                }
+                sleep_secs(*pause);
                 let usage = (i == last).then_some((in_tok, out_tok));
                 let c = chunk(parts.clone(), model, &rid, usage);
                 out.chunk(format!("data: {}\r\n\r\n", c.dump(COMPACT)).as_bytes())?;

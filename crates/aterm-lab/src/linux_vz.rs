@@ -391,7 +391,7 @@ fn hex(bytes: &[u8]) -> String {
     })
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = aterm_digest::Sha256::new();
     h.update(bytes);
     hex(&h.finalize())

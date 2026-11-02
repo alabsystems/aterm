@@ -33,8 +33,9 @@ use std::time::Duration;
 /// The desired state's revision: a pass is due on the same build once it moves, as when an item
 /// joins or leaves the pass (3: `sync.identity`; 4: the ALab steward's fleet item; 5:
 /// `sync.steward.revoke`; 6: `sync.node`; 7: `sync.steward.lease` and
-/// `sync.steward.server.standby`; 8: the steward's fleet item retired; 9: automatic signing).
-pub const SPEC: u32 = 9;
+/// `sync.steward.server.standby`; 8: the steward's fleet item retired; 9: automatic signing;
+/// 10: the vault GitHub helper; 11: `sync.clone`).
+pub const SPEC: u32 = 11;
 
 /// The pass's record, in `<state_dir>/converge` ([`FileJournal::DIR`]).
 pub const RECORD: &str = "aligned.json";
@@ -64,6 +65,11 @@ pub const BUILDS_KEPT: usize = 8;
 pub const PEERS: &str = "sync.peers";
 /// `sync.vault`: the vault's subscriber (report only).
 pub const VAULT: &str = "sync.vault";
+/// `sync.github`: reconcile a legacy override with the delivered vault GitHub helper.
+pub const GITHUB: &str = "sync.github";
+/// `sync.clone`: the GitHub step an `aterm init` owes, run once the vault's token lands
+/// ([`crate::init::owed_clone`]).
+pub const CLONE: &str = "sync.clone";
 /// `sync.identity`: this Mac's swarm label in `[ai] machine` and `[fleet] machine`.
 pub const IDENTITY: &str = "sync.identity";
 /// `sync.base`: the row that stands for the base layer a pass leaves to `aterm doctor`.
@@ -88,6 +94,8 @@ pub const ACCOUNTS: &str = "sync.accounts";
 pub const RELEASE: &str = "sync.release";
 /// `sync.fabric`: the message bus (fabric), on by default, and its broker renewed on a new build.
 pub const FABRIC: &str = "sync.fabric";
+/// `sync.awake`: aCaffiene keeping this Mac awake, with no window open too.
+pub const AWAKE: &str = "sync.awake";
 
 /// What every sync row says when `[swarm] enabled = false` turns swarm participation off.
 pub use aterm_secrets::swarm::SWARM_OFF;
@@ -301,9 +309,11 @@ pub enum VaultRead {
 pub enum IdentityRead {
     /// No swarm label applies on this Mac (no ALab vault or swarm roster, or swarm is off): why.
     NotApplicable(String),
-    /// `[ai] machine` and `[fleet] machine` already carry the resolved label: what they read.
+    /// `[ai] machine` and `[fleet] machine` carry this Mac's name (the person's `[identity] name`,
+    /// else the resolved label), or a value the person set, which is kept: what they read.
     Current(String),
-    /// One or both keys differ from the resolved label: what they read now and what a pass writes.
+    /// A key that is unset, or still holds what aterm last wrote, differs from this Mac's name:
+    /// what it reads now and what a pass writes.
     Due {
         /// What `aterm.toml` reads now.
         from: String,
@@ -470,6 +480,19 @@ pub enum ReleaseRead {
     Due(String),
 }
 
+/// Readiness of the already delivered vault GitHub credential helper.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GithubRead {
+    /// Explicitly disabled, custom or foreign configuration is left unchanged.
+    NotApplicable(String),
+    /// The configured helper returns the authenticated vault token.
+    Current(String),
+    /// A legacy managed override shadows the authenticated vault helper.
+    Due(String),
+    /// Required local inputs or GitHub's authentication response are not ready.
+    Deferred(String),
+}
+
 /// What the message bus reads as (`sync.fabric`): on by default, as `aterm fabric on` turns it on,
 /// where the person never turned it off.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -485,6 +508,21 @@ pub enum FabricRead {
     /// It is off and the person never turned it off (no `aterm fabric off` record): what was
     /// found. A pass with an aterm window turns it on ([`Ports::turn_on_fabric`]).
     Unset(String),
+}
+
+/// What aCaffiene's keeping this Mac awake reads as (`sync.awake`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AwakeRead {
+    /// Nothing of it is this pass's: why (not macOS, no installed app, or the person turned
+    /// keep-awake off, which a pass never turns on).
+    NotApplicable(String),
+    /// The installed app's mug holds macOS's assertion: what it reads.
+    Current(String),
+    /// The mug runs but macOS has not granted its activity; it asks again every minute itself:
+    /// why.
+    Asking(String),
+    /// No mug runs: what it finds.
+    Due(String),
 }
 
 /// What this Mac's vault membership reads as (`sync.peers`).
@@ -554,6 +592,14 @@ pub trait Ports: Sync {
     /// Whether an aterm window runs for this login now: its upkeep then keeps the AI accounts
     /// roster, so the subscriber's pass leaves it alone.
     fn window_runs(&self) -> bool;
+    /// Why System State's plan holds this Mac's vault out now, in plain words: the plan leaves
+    /// the Secrets vault off, or a Stop holds setup, or its records cannot be read (design
+    /// §8.5: the Sync rows ride the Secrets switch). A pass reads it once; while it holds, every
+    /// row that rides the vault stands aside and the subscriber's repair waits. `None` where
+    /// nothing holds it, and where no System State runs.
+    fn vault_held(&self) -> Option<String> {
+        None
+    }
     /// Whether `[swarm] enabled` in `aterm.toml` leaves swarm participation on: `false` makes
     /// every sync row read `NotApplicable` before touching its subsystem.
     ///
@@ -572,8 +618,10 @@ pub trait Ports: Sync {
     /// # Errors
     /// The vault's local state, swarm roster or `aterm.toml` cannot be read.
     fn identity(&self) -> Result<IdentityRead, String>;
-    /// `sync.identity`'s apply: writes the resolved swarm label into `[ai] machine` and `[fleet]
-    /// machine` in `aterm.toml`.
+    /// `sync.identity`'s apply: writes this Mac's name (the person's `[identity] name`, else the
+    /// resolved swarm label) into each of `[ai] machine` and `[fleet] machine` that is unset or
+    /// still holds what aterm last wrote; a value the person set stays, and `[identity] name =
+    /// false` writes nothing.
     ///
     /// # Errors
     /// The label could not be resolved or `aterm.toml` could not be updated.
@@ -704,6 +752,42 @@ pub trait Ports: Sync {
     fn sync_release(&self) -> Result<String, String> {
         Ok("release signing is unavailable".into())
     }
+    /// Read the vault GitHub helper without inventorying repositories.
+    fn github(&self) -> Result<GithubRead, String> {
+        Ok(GithubRead::NotApplicable(
+            "vault GitHub helper is unavailable".into(),
+        ))
+    }
+    /// Migrate only a verified legacy override; never clone repositories.
+    fn sync_github(&self) -> Result<String, String> {
+        Ok("vault GitHub helper is unavailable".into())
+    }
+    /// `sync.clone`'s read: the GitHub step an `aterm init` owes, whether System State came to
+    /// hold GitHub repositories after the run that owes it began, and whether the token it waits
+    /// for is here ([`crate::init::owed_clone`]).
+    ///
+    /// # Errors
+    /// Its record, this login's context or its init.toml cannot be read.
+    fn owed_clone(&self) -> Result<crate::init::OwedClone, String> {
+        Ok(crate::init::OwedClone::Nothing(
+            "aterm init owes no clone".into(),
+        ))
+    }
+    /// `sync.clone`'s apply: that step, run once ([`crate::init::clone_owed`]).
+    ///
+    /// # Errors
+    /// A row of the step did not end in place.
+    fn clone_owed(&self) -> Result<String, String> {
+        Err("this build runs no clone aterm init owes".into())
+    }
+    /// Forget the clone an `aterm init` owes ([`crate::init::forget_owed_clone`]): its step was
+    /// turned off, so turning it on later clones nothing by itself.
+    ///
+    /// # Errors
+    /// Its record cannot be removed.
+    fn forget_owed_clone(&self) -> Result<(), String> {
+        Ok(())
+    }
     /// `sync.fabric`'s read.
     ///
     /// # Errors
@@ -715,6 +799,21 @@ pub trait Ports: Sync {
     /// # Errors
     /// The renewal failed.
     fn renew_broker(&self) -> Result<String, String>;
+    /// `sync.awake`'s read.
+    ///
+    /// # Errors
+    /// The mug's files or macOS's assertions cannot be read.
+    fn awake(&self) -> Result<AwakeRead, String>;
+    /// `sync.awake`'s apply: the installed app's mug started, with its Enable at Startup on
+    /// unless the person turned it off.
+    ///
+    /// # Errors
+    /// The mug did not start.
+    fn keep_awake(&self) -> Result<String, String>;
+    /// Whether the person turned the installed app's aCaffiene Enable at Startup off: they chose
+    /// no mug at login, so the subscriber's pass, which runs at login with no window, leaves it
+    /// to a window.
+    fn awake_startup_off(&self) -> bool;
     /// `sync.fabric`'s apply where the fabric is [`FabricRead::Unset`]: `aterm fabric on`'s steps,
     /// which ask nothing.
     ///
@@ -763,6 +862,8 @@ pub fn background_self() {
 enum Kind {
     Peers,
     Vault,
+    Github,
+    OwedClone,
     Identity,
     StewardRevoke,
     StewardLease,
@@ -774,6 +875,17 @@ enum Kind {
     Accounts,
     Release,
     Fabric,
+    Awake,
+}
+
+impl Kind {
+    /// Whether this kind rides the vault, so System State's hold on the vault holds it too
+    /// ([`Ports::vault_held`]): every kind but the fabric, a message bus provisioned on this Mac
+    /// alone (design §8.5), and aCaffiene's keeping this Mac awake, which an aterm window keeps
+    /// whatever the vault does, so the subscriber's pass keeps it alike.
+    const fn rides_the_vault(self) -> bool {
+        !matches!(self, Self::Fabric | Self::Awake)
+    }
 }
 
 struct Synced<'a> {
@@ -782,6 +894,9 @@ struct Synced<'a> {
     trigger: Trigger,
     /// Whether this pass applies: a plan (`--check`) writes nothing, so it does not look.
     mode: Mode,
+    /// Why System State holds the vault out, read as the row starts ([`Ports::vault_held`]): a
+    /// Stop pressed while an earlier row ran holds this one.
+    held: std::sync::OnceLock<Option<String>>,
     /// What the last apply said, the row's detail.
     said: Mutex<Option<String>>,
     /// Why the last apply stood aside.
@@ -795,6 +910,7 @@ impl<'a> Synced<'a> {
             ports,
             trigger,
             mode,
+            held: std::sync::OnceLock::new(),
             said: Mutex::new(None),
             aside: Mutex::new(None),
         }
@@ -806,6 +922,33 @@ impl<'a> Synced<'a> {
 
     fn stand_aside(&self, aside: StoodAside) {
         *self.aside.lock().unwrap_or_else(PoisonError::into_inner) = Some(aside);
+    }
+
+    /// `sync.clone`'s row where its step was turned off (`why`): an apply forgets the clone
+    /// `aterm init` owed, so turning the step on later clones nothing by itself; a plan only
+    /// says so.
+    fn forget_owed_clone(&self, why: &str) -> Probe {
+        if self.mode != Mode::Apply {
+            return not_applicable(format!("{why}; a pass forgets the clone aterm init owed"));
+        }
+        if let Err(unremoved) = self.ports.forget_owed_clone() {
+            return Probe::Unusable { why: unremoved };
+        }
+        not_applicable(format!("{why}; the clone aterm init owed is forgotten"))
+    }
+
+    /// Why `sync.clone`'s apply holds the clone it is about to begin, read again as it begins:
+    /// System State holds the vault (a Stop pressed while the row read what is owed), or holds
+    /// GitHub repositories, or init.toml turned the step off, since. A clone can take half an
+    /// hour, so the probe's reading is too old to start one over.
+    fn owed_clone_held(&self) -> Option<String> {
+        if let Some(why) = self.ports.vault_held() {
+            return Some(why);
+        }
+        match self.ports.owed_clone() {
+            Ok(crate::init::OwedClone::Off(why) | crate::init::OwedClone::Held(why)) => Some(why),
+            _ => None,
+        }
     }
 
     /// Whether this pass turns on a fabric nobody turned off: one an aterm window runs beside,
@@ -892,6 +1035,8 @@ impl Item for Synced<'_> {
         match self.kind {
             Kind::Peers => PEERS,
             Kind::Vault => VAULT,
+            Kind::Github => GITHUB,
+            Kind::OwedClone => CLONE,
             Kind::Identity => IDENTITY,
             Kind::StewardRevoke => STEWARD_REVOKE,
             Kind::StewardLease => STEWARD_LEASE,
@@ -903,6 +1048,7 @@ impl Item for Synced<'_> {
             Kind::Accounts => ACCOUNTS,
             Kind::Release => RELEASE,
             Kind::Fabric => FABRIC,
+            Kind::Awake => AWAKE,
         }
         .to_owned()
     }
@@ -918,6 +1064,7 @@ impl Item for Synced<'_> {
     fn class(&self) -> Class {
         match self.kind {
             Kind::Vault
+            | Kind::Github
             | Kind::Identity
             | Kind::StewardRevoke
             | Kind::StewardLease
@@ -925,8 +1072,11 @@ impl Item for Synced<'_> {
             | Kind::Node
             | Kind::Requests
             | Kind::Release
-            | Kind::Fabric => Class::Relay,
-            Kind::Peers | Kind::Fleet | Kind::SharedData | Kind::Accounts => Class::Install,
+            | Kind::Fabric
+            | Kind::Awake => Class::Relay,
+            Kind::Peers | Kind::OwedClone | Kind::Fleet | Kind::SharedData | Kind::Accounts => {
+                Class::Install
+            }
         }
     }
 
@@ -934,6 +1084,8 @@ impl Item for Synced<'_> {
         match self.kind {
             Kind::Peers => "this Mac's vault",
             Kind::Vault => "the vault's subscriber",
+            Kind::Github => "the vault GitHub credential helper",
+            Kind::OwedClone => "the repositories aterm init owes",
             Kind::Identity => "this Mac's swarm label",
             Kind::StewardRevoke => "the revoke cascade, finished by the ALab steward",
             Kind::StewardLease => "the ALab steward lease",
@@ -945,6 +1097,7 @@ impl Item for Synced<'_> {
             Kind::Accounts => "the AI accounts roster",
             Kind::Release => "shared release signing",
             Kind::Fabric => "the message bus (fabric)",
+            Kind::Awake => "aCaffiene keeping this Mac awake",
         }
         .to_owned()
     }
@@ -954,6 +1107,11 @@ impl Item for Synced<'_> {
             Ok(true) => {}
             Ok(false) => return not_applicable(SWARM_OFF),
             Err(why) => return Probe::Unusable { why },
+        }
+        if self.kind.rides_the_vault()
+            && let Some(why) = self.held.get_or_init(|| self.ports.vault_held())
+        {
+            return not_applicable(why.clone());
         }
         match self.kind {
             Kind::Peers => {
@@ -992,6 +1150,38 @@ impl Item for Synced<'_> {
                 IdentityRead::NotApplicable(why) => not_applicable(why),
                 IdentityRead::Current(now) => Probe::Ok { now },
                 IdentityRead::Due { from, to } => Probe::Change { from, to },
+            }),
+            Kind::OwedClone => read(self.ports.owed_clone(), |owed| {
+                // Turned off in init.toml, or held in System State since the run that owes it
+                // began (principle 4); a hold that run went past by naming the group keeps it.
+                if let crate::init::OwedClone::Off(why) | crate::init::OwedClone::Held(why) = &owed
+                {
+                    return self.forget_owed_clone(why);
+                }
+                match owed {
+                    crate::init::OwedClone::Nothing(now) => Probe::Ok { now },
+                    crate::init::OwedClone::Off(why) | crate::init::OwedClone::Held(why) => {
+                        not_applicable(why)
+                    }
+                    crate::init::OwedClone::Waiting(why) => Probe::Deferred { why },
+                    crate::init::OwedClone::Due(from) => Probe::Change {
+                        from,
+                        to: "cloned, as aterm init clones".to_owned(),
+                    },
+                    crate::init::OwedClone::Person(how) => Probe::Person {
+                        step: CLONE.to_owned(),
+                        how,
+                    },
+                }
+            }),
+            Kind::Github => read(self.ports.github(), |github| match github {
+                GithubRead::NotApplicable(why) => not_applicable(why),
+                GithubRead::Current(now) => Probe::Ok { now },
+                GithubRead::Due(from) => Probe::Change {
+                    from,
+                    to: "verified vault helper exposed; repositories unchanged".into(),
+                },
+                GithubRead::Deferred(why) => Probe::Deferred { why },
             }),
             Kind::StewardRevoke => {
                 read(
@@ -1113,6 +1303,28 @@ impl Item for Synced<'_> {
                     }
                 )),
             }),
+            // The window keeps the mug itself, at launch and every five minutes.
+            Kind::Awake if self.trigger.in_window() => not_applicable(
+                "the aterm window keeps this Mac awake at launch and every five minutes",
+            ),
+            // A person's Enable at Startup off is no mug at login; a window still starts one.
+            Kind::Awake
+                if self.trigger == Trigger::Subscriber && self.ports.awake_startup_off() =>
+            {
+                not_applicable(
+                    "aCaffiene's Enable at Startup is off by your choice, so an aterm window \
+                     starts the mug, not this pass",
+                )
+            }
+            Kind::Awake => read(self.ports.awake(), |awake| match awake {
+                AwakeRead::NotApplicable(why) => not_applicable(why),
+                AwakeRead::Current(now) => Probe::Ok { now },
+                AwakeRead::Asking(why) => Probe::Deferred { why },
+                AwakeRead::Due(from) => Probe::Change {
+                    from,
+                    to: "the installed app's mug keeps this Mac awake".to_owned(),
+                },
+            }),
         }
     }
 
@@ -1126,6 +1338,27 @@ impl Item for Synced<'_> {
                 }
             },
             Kind::Identity => self.ports.sync_identity()?,
+            Kind::Github => self.ports.sync_github()?,
+            Kind::OwedClone => match self.owed_clone_held() {
+                // A Stop pressed, or the group turned off, since the row read what is owed holds
+                // the clone it has not begun (principle 4): the row reads it was not cloned.
+                Some(why) => {
+                    self.stand_aside(StoodAside::Waiting(why));
+                    return Ok(());
+                }
+                None => match self.ports.clone_owed() {
+                    Ok(said) => said,
+                    // A step only a person can finish waits for them: no pass runs it again
+                    // until the token or init.toml changes.
+                    Err(why) => {
+                        if let Ok(crate::init::OwedClone::Person(how)) = self.ports.owed_clone() {
+                            self.stand_aside(StoodAside::Waiting(how));
+                            return Ok(());
+                        }
+                        return Err(format!("{why}; the next pass tries again"));
+                    }
+                },
+            },
             Kind::StewardRevoke => self
                 .ports
                 .apply_steward_revoke()
@@ -1173,6 +1406,7 @@ impl Item for Synced<'_> {
                     return Ok(());
                 }
             },
+            Kind::Awake => self.ports.keep_awake()?,
             // Report only: its probe never plans a change.
             Kind::Vault => return Ok(()),
         };
@@ -1194,6 +1428,10 @@ impl Item for Synced<'_> {
         let remedy = match self.kind {
             Kind::Peers => Remedy::Command("aterm init".to_owned()),
             Kind::Vault => Remedy::Command("aterm secrets agent on".to_owned()),
+            Kind::Github => Remedy::None,
+            Kind::OwedClone => Remedy::Command(
+                crate::init::naming(aterm_types::macos_setup::Setting::Repositories).to_owned(),
+            ),
             Kind::Identity => Remedy::Command("aterm init --converge".to_owned()),
             Kind::StewardRevoke => Remedy::Command("aterm init --converge".to_owned()),
             Kind::StewardLease => Remedy::Command("aterm init --converge".to_owned()),
@@ -1207,6 +1445,7 @@ impl Item for Synced<'_> {
             },
             Kind::Release => Remedy::None,
             Kind::Fabric => Remedy::Command("aterm fabric on".to_owned()),
+            Kind::Awake => Remedy::Command("aterm acaffiene start".to_owned()),
         };
         Explain { why, remedy }
     }
@@ -1399,6 +1638,8 @@ fn sync_items<'a>(ports: &'a dyn Ports, trigger: Trigger, mode: Mode) -> Items<'
     [
         Kind::Peers,
         Kind::Vault,
+        Kind::Github,
+        Kind::OwedClone,
         Kind::Identity,
         Kind::StewardRevoke,
         Kind::StewardLease,
@@ -1410,6 +1651,7 @@ fn sync_items<'a>(ports: &'a dyn Ports, trigger: Trigger, mode: Mode) -> Items<'
         Kind::Accounts,
         Kind::Release,
         Kind::Fabric,
+        Kind::Awake,
     ]
     .into_iter()
     .map(|kind| Box::new(Synced::new(kind, ports, trigger, mode)) as Box<dyn Item + 'a>)
@@ -1522,7 +1764,10 @@ fn run_pass(
     } else {
         record.as_ref().and_then(|record| record.base.clone())
     };
+    // System State's hold on the vault, read for the subscriber's repair here and again as each
+    // row that rides the vault starts, so a Stop pressed mid-pass holds every row after it.
     if mode == Mode::Apply
+        && ports.vault_held().is_none()
         && ports.installed_release()
         && ports.swarm_enabled().unwrap_or(false)
         && let Some(line) = ports.refresh_vault_subscriber().map_err(Stop::Refused)?

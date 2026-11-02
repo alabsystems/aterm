@@ -1163,7 +1163,7 @@ pub(crate) fn last_frame_start(bytes: &[u8]) -> Option<usize> {
 
 /// FNV-1a-128 over `parts`, each prefixed with its length so no two different lists
 /// hash the same bytes.
-fn fnv1a_128(parts: &[&[u8]]) -> [u8; 16] {
+pub(crate) fn fnv1a_128(parts: &[&[u8]]) -> [u8; 16] {
     const OFFSET: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
     const PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
     let mut h = OFFSET;

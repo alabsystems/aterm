@@ -896,6 +896,13 @@ impl Response {
     pub fn body(&self) -> &[u8] {
         &self.body
     }
+
+    /// The response body, taken whole without a copy.
+    #[inline]
+    #[must_use]
+    pub fn into_body(self) -> Vec<u8> {
+        self.body
+    }
 }
 
 fn header_pairs(headers: &[(String, String)]) -> impl Iterator<Item = (&str, &str)> {
@@ -1478,8 +1485,11 @@ mod tests {
             .lines()
             .find_map(|line| {
                 let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("content-length")
-                    .then(|| value.trim().parse::<usize>().unwrap())
+                let value = value.trim();
+                (name.eq_ignore_ascii_case("content-length")
+                    && !value.is_empty()
+                    && value.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| value.parse::<usize>().unwrap())
             })
             .expect("fixture request carries Content-Length");
         assert!(length <= LIMIT, "fixture request body exceeded its bound");

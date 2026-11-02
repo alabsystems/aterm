@@ -269,10 +269,11 @@ const HELP_TAIL: &str = concat!(
     "              spare_shell_needs_person, windowing_behavior, restore_session,\n",
     "              tab_menu_chord.\n",
     "  Cursor      serious_mode (mute sound/decorative effects), motion, cursor_style,\n",
-    "              cursor_blink, cursor_momentum_glow, cursor_trail_style (default\n",
-    "              rainbow kitty pet; off on Windows), cursor_trail_color/_accent/\n",
-    "              _intensity/_radius/_ms/_length/_ring, cursor_trail_bloom\n",
-    "              (+_strength/_radius).\n",
+    "              cursor_blink, idle_rest_secs (rest an untouched window: no blink,\n",
+    "              a still deck; default 0, never), cursor_momentum_glow,\n",
+    "              cursor_trail_style (default rainbow kitty pet; off on Windows),\n",
+    "              cursor_trail_color/_accent/_intensity/_radius/_ms/_length/_ring,\n",
+    "              cursor_trail_bloom (+_strength/_radius).\n",
     "  Sound       trail_sounds (master; the synth is macOS-only), trail_sound_volume,\n",
     "              trail_sound_style (auto | music box | warm pluck | glitter |\n",
     "              ice chime | droplet | pew | zap | tick | crackle | mechanical |\n",
@@ -289,8 +290,6 @@ const HELP_TAIL: &str = concat!(
     "              copy_on_select, confirm_multiline_paste, right_click,\n",
     "              option_as_meta, search_history_lines, focus_boost (Windows;\n",
     "              default on), conpty (Windows: bundled | inbox | auto | path),\n",
-    "              desktop_alerts (aterm's own needs-you alerts as system\n",
-    "              notifications; default off).\n",
     "  Security    allow_window_ops, allow_notifications, allow_kitty_file_transfer,\n",
     "              allow_osc52_query, secure_keyboard_entry (macOS) (default off);\n",
     "              allow_palette_reconfigure (default on).\n",
@@ -319,6 +318,22 @@ fn help_tail() -> String {
 
 fn starter_config_for(path: &std::path::Path) -> String {
     STARTER_CONFIG.replacen(CONFIG_PATH_SLOT, &path.display().to_string(), 1)
+}
+
+/// `--write-config`'s starter at `path`, made only where no file is, and born with no group or
+/// other write bit (`0o644`, which the umask narrows), so it passes the rule every reader of
+/// `aterm.toml` holds (`aterm_types::dirs::aterm_config_refusal`) under any umask. A plain write
+/// under a user-private-group login's `002` (Ubuntu's default) made it `664`, which every read
+/// of it then refused.
+pub(crate) fn write_starter_config(path: &std::path::Path) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o644);
+    options
+        .open(path)?
+        .write_all(starter_config_for(path).as_bytes())
 }
 
 /// Windows-only verbs, appended to `--help` on Windows alone.
@@ -390,6 +405,7 @@ const STARTER_CONFIG: &str = concat!(
 # background = \"#1A1B26\"
 # cursor_style = \"block\"          # block | bar
 # cursor_blink = true
+# idle_rest_secs = 30              # still the blink and the deck's motion after this long untouched (default 0, never)
 # cursor_momentum_glow = true     # typing-speed cursor glow; warm = no blink (default ON, except on Windows)
 # selection_color = \"#33415E\"
 # selection_foreground = \"#FFFFFF\" # selected-text ink; unset = auto contrast floor
@@ -452,7 +468,7 @@ const STARTER_CONFIG: &str = concat!(
 # tone_melody = true               # subtle on-device mood inflection from typed input (default ON)
 # trail_sound_bed = false          # continuous ambient bed texture behind notes (default OFF)
 # trail_sound_riff = true          # held-key sing-along song (default ON; false quiets song, keeps visuals)
-# bell_sound = true                # audible BEL beep (macOS NSBeep / Windows MessageBeep / X11 bell; default ON)
+# bell_sound = false               # audible BEL beep (opt-in; default OFF)
 
 # --- text shaping -------------------------------------------------------------
 # ligatures = true                 # programming ligatures (=>, !=, >=, ===, ...)
@@ -482,10 +498,6 @@ const STARTER_CONFIG: &str = concat!(
 # confirm_multiline_paste = true   # confirm unbracketed multiline paste (sheet / dialog / banner)
 # focus_boost = true               # Windows: boost visible shells' priority while focused (default on)
 # conpty = \"bundled\"               # Windows console host for new tabs: \"bundled\" (default) | \"inbox\" | \"auto\" | path to OpenConsole.exe
-# desktop_alerts = false           # also post aterm's own needs-you alerts as system notifications (default off;
-#                                  #   macOS: UNUserNotificationCenter from Applications/aterm.app once authorized,
-#                                  #   else /usr/bin/osascript when run outside an app bundle).
-#                                  #   Program OSC 9/99/777 notifications are gated by allow_notifications below
 # temporal_recording = true        # Rewind: each pane's recent screens, in memory only (default on; new tabs)
 # rewind_budget_mb = 8             # the most one pane's Rewind history holds (1..=1024, at most rewind_total_mb)
 # rewind_total_mb = 128            # the most every pane's Rewind history holds together (1..=16384); the panes
@@ -618,15 +630,16 @@ fn flag_value(flag: &str, args: &mut impl Iterator<Item = std::ffi::OsString>) -
 }
 
 fn valid_font_px_flag(value: &str) -> bool {
-    value
-        .parse::<f32>()
-        .is_ok_and(|px| px.is_finite() && (crate::FONT_PX_MIN..=crate::FONT_PX_MAX).contains(&px))
+    !value.starts_with('+')
+        && value.parse::<f32>().is_ok_and(|px| {
+            px.is_finite() && (crate::FONT_PX_MIN..=crate::FONT_PX_MAX).contains(&px)
+        })
 }
 
 fn initial_dimension_flag(value: &str, min: u16, max: u16) -> Option<u16> {
-    value
-        .parse::<u16>()
-        .ok()
+    (!value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| value.parse::<u16>().ok())
+        .flatten()
         .filter(|dimension| (min..=max).contains(dimension))
 }
 
@@ -794,8 +807,11 @@ pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
                 }
                 OrdinaryWindowOption::Scale => {
                     let v = flag_value("--scale", &mut args);
-                    match v.parse::<f64>() {
-                        Ok(f) if f.is_finite() && f > 0.0 => launch.scale = Some(f),
+                    match (!v.starts_with('+'))
+                        .then(|| v.parse::<f64>().ok())
+                        .flatten()
+                    {
+                        Some(f) if f.is_finite() && f > 0.0 => launch.scale = Some(f),
                         _ => {
                             eprintln!(
                                 "aterm: --scale expects a positive number, got '{v}' (try --help)"
@@ -901,7 +917,7 @@ pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
                         if let Some(dir) = path.parent() {
                             let _ = std::fs::create_dir_all(dir);
                         }
-                        match std::fs::write(&path, starter_config_for(&path)) {
+                        match write_starter_config(&path) {
                             Ok(()) => {
                                 format!("wrote a documented starter config: {}\n", path.display())
                             }
@@ -1085,7 +1101,11 @@ fn lifeline_request(value: Option<&str>, headless: bool) -> Result<Option<i32>, 
     let Some(value) = value else {
         return Ok(None);
     };
-    let Some(fd) = value.parse::<i32>().ok().filter(|fd| *fd >= 0) else {
+    let Some(fd) = (!value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| value.parse::<i32>().ok())
+        .flatten()
+        .filter(|fd| *fd >= 0)
+    else {
         return Err(format!(
             "--lifeline-fd expects a descriptor number, got '{value}'"
         ));
@@ -1107,7 +1127,11 @@ fn ready_request(
     let Some(value) = value else {
         return Ok(None);
     };
-    let Some(fd) = value.parse::<i32>().ok().filter(|fd| *fd > 2) else {
+    let Some(fd) = (!value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| value.parse::<i32>().ok())
+        .flatten()
+        .filter(|fd| *fd > 2)
+    else {
         return Err(format!(
             "--ready-fd expects a descriptor number above stdio (3 or more), got '{value}'"
         ));

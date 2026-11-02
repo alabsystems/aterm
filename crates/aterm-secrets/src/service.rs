@@ -225,7 +225,7 @@ fn decision_lock_path(home: &Path, job: Job) -> PathBuf {
 
 impl JobDecision {
     fn take(home: &Path, job: Job) -> crate::Result<Self> {
-        use std::os::unix::fs::OpenOptionsExt as _;
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
         crate::fsx::ensure_private_dir(&secrets_dir(home))?;
         let path = decision_lock_path(home, job);
         let file = std::fs::OpenOptions::new()
@@ -234,14 +234,19 @@ impl JobDecision {
             .create(true)
             .truncate(false)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&path)?;
-        if !file.metadata()?.is_file() {
+        let meta = file.metadata()?;
+        if !meta.is_file() || meta.uid() != aterm_uds::peer::our_uid() || meta.nlink() != 1 {
             return Err(Error::new(format!(
-                "{}: not a regular file",
+                "{}: not an owned regular lock file",
                 path.display()
             )));
         }
+        if meta.mode() & 0o7777 != 0o600 {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        aterm_uds::keep_out_of_children(&file)?;
         #[expect(
             clippy::disallowed_methods,
             reason = "the take of JobDecision, whose Drop releases the local service decision lock"
@@ -278,13 +283,16 @@ pub fn back_within_restart_window<E>(
     running: &mut dyn FnMut() -> Result<bool, E>,
     pause: &mut dyn FnMut(Duration),
 ) -> Result<bool, E> {
-    let until = *down_since.get_or_insert_with(&mut *now) + RESTART_WINDOW;
+    let start = *down_since.get_or_insert_with(&mut *now);
     loop {
         let at = now();
-        if at >= until {
+        let Some(rem) = RESTART_WINDOW.checked_sub(at.saturating_duration_since(start)) else {
+            return Ok(false);
+        };
+        if rem.is_zero() {
             return Ok(false);
         }
-        pause(RESTART_POLL.min(until - at));
+        pause(RESTART_POLL.min(rem));
         if running()? {
             return Ok(true);
         }
@@ -480,11 +488,38 @@ pub fn systemd_unit(description: &str, program: &Path, args: &[String]) -> Strin
     )
 }
 
+/// The largest unit file [`unit_program`], [`server_repair_due`] or [`held_at`] reads.
+const UNIT_FILE_MOST: usize = 256 * 1024;
+
+/// Read a regular file (following symlinks such as NixOS unit links, never blocking on a FIFO) up
+/// to `max` bytes.
+fn read_regular_bounded(path: &Path, max: usize) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.file_type().is_file() || meta.len() > max as u64 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0).saturating_add(1));
+    let limit = (max as u64).saturating_add(1);
+    file.take(limit).read_to_end(&mut bytes).ok()?;
+    (bytes.len() <= max).then_some(bytes)
+}
+
+fn read_regular_string(path: &Path, max: usize) -> Option<String> {
+    String::from_utf8(read_regular_bounded(path, max)?).ok()
+}
+
 /// The program `unit`, a job's plist on macOS or its systemd unit elsewhere, starts: the first
 /// `ProgramArguments` string or `ExecStart` word, as [`plist_text`] and [`systemd_unit`] write
 /// them. `None` for a file it cannot read or a form they never write.
 pub fn unit_program(unit: &Path) -> Option<PathBuf> {
-    let text = std::fs::read_to_string(unit).ok()?;
+    let text = read_regular_string(unit, UNIT_FILE_MOST)?;
     if cfg!(target_os = "macos") {
         plist_program(&text)
     } else {
@@ -744,10 +779,10 @@ pub fn systemctl_argv(words: &[&str]) -> Vec<String> {
 pub fn print_pid(text: &str) -> Option<u32> {
     text.lines().find_map(|line| {
         let top = line.strip_prefix('\t')?;
-        top.strip_prefix("pid = ")?
-            .trim_end()
-            .parse()
-            .ok()
+        let pid = top.strip_prefix("pid = ")?.trim_end();
+        (!pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| pid.parse().ok())
+            .flatten()
             .filter(|pid| *pid > 0)
     })
 }
@@ -756,7 +791,10 @@ pub fn print_pid(text: &str) -> Option<u32> {
 pub fn main_pid(text: &str) -> Option<u32> {
     let text = text.trim();
     let text = text.strip_prefix("MainPID=").unwrap_or(text);
-    text.parse().ok().filter(|pid| *pid > 0)
+    (!text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| text.parse().ok())
+        .flatten()
+        .filter(|pid| *pid > 0)
 }
 
 /// The first of `candidates` that exists: `systemctl`, or a clear refusal when this Linux has none.
@@ -1404,6 +1442,259 @@ pub fn repair_subscriber(
     })
 }
 
+/// Install the absent subscriber, or resume its exact owned unit after a failed creation.
+/// `admitted` rechecks the caller's current vault policy, without network work.
+/// An Off record, any pin, or any existing unit/job remains untouched. The
+/// decision lock orders these checks and the install with explicit On/Off.
+pub(crate) fn repair_absent_subscriber(
+    home: &Path,
+    program: &Path,
+    admitted: &mut dyn FnMut() -> crate::Result<bool>,
+) -> crate::Result<Option<String>> {
+    check_own_home(home)?;
+    repair_absent_subscriber_with(
+        home,
+        program,
+        admitted,
+        &mut || state(home, Job::Subscriber),
+        &mut |admitted| install_absent_subscriber(home, program, admitted),
+    )
+}
+
+/// An installation that rechecks the same policy at its local effect boundary.
+type SubscriberInstall<'a> =
+    dyn FnMut(&mut dyn FnMut() -> crate::Result<bool>) -> crate::Result<Option<String>> + 'a;
+
+fn repair_absent_subscriber_with(
+    home: &Path,
+    program: &Path,
+    admitted: &mut dyn FnMut() -> crate::Result<bool>,
+    state: &mut dyn FnMut() -> crate::Result<State>,
+    install: &mut SubscriberInstall<'_>,
+) -> crate::Result<Option<String>> {
+    let absent = || -> crate::Result<bool> {
+        Ok(
+            crate::fsx::kind(&subscriber_off_path(home))? == crate::fsx::Kind::Missing
+                && crate::fsx::kind(&pin_path(home, Job::Subscriber))? == crate::fsx::Kind::Missing
+                && recoverable_subscriber_unit(home, program)? != Some(false),
+        )
+    };
+    if !admitted()? || !absent()? {
+        return Ok(None);
+    }
+    let _decision = JobDecision::take(home, Job::Subscriber)?;
+    let recoverable = match state()? {
+        State::Absent => true,
+        State::Installed { pid: None, .. } => {
+            recoverable_subscriber_unit(home, program)? == Some(true)
+        }
+        State::Installed { pid: Some(_), .. } => false,
+    };
+    if !absent()? || !recoverable || !admitted()? || !absent()? {
+        return Ok(None);
+    }
+    install(admitted)
+}
+
+/// None is absent; true is exactly the owned unit a previous creation published.
+fn recoverable_subscriber_unit(home: &Path, program: &Path) -> crate::Result<Option<bool>> {
+    use std::io::Read as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    let path = unit_file(home, Job::Subscriber);
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((crate::fsx::kind(&path)? != crate::fsx::Kind::Missing).then_some(false));
+        }
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => return Ok(Some(false)),
+        Err(error) => return Err(error.into()),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != aterm_uds::peer::our_uid()
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o6022 != 0
+        || metadata.len() > UNIT_FILE_MOST as u64
+    {
+        return Ok(Some(false));
+    }
+    let mut bytes = Vec::new();
+    file.take(UNIT_FILE_MOST as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    let args = ["secrets".to_owned(), "watch".to_owned()];
+    #[cfg(target_os = "macos")]
+    let matches = {
+        let bundle = bundle_id_of(program);
+        [Domain::Gui, Domain::User].into_iter().any(|domain| {
+            bytes
+                == plist_text_in(
+                    Job::Subscriber.label(),
+                    program,
+                    &args,
+                    &log_path(home, Job::Subscriber),
+                    domain,
+                    bundle.as_deref(),
+                )
+                .as_bytes()
+        })
+    };
+    #[cfg(not(target_os = "macos"))]
+    let matches = bytes == systemd_unit(Job::Subscriber.description(), program, &args).as_bytes();
+    Ok(Some(matches))
+}
+
+fn install_absent_subscriber(
+    home: &Path,
+    program: &Path,
+    admitted: &mut dyn FnMut() -> crate::Result<bool>,
+) -> crate::Result<Option<String>> {
+    #[cfg(target_os = "macos")]
+    {
+        install_absent_launchd(
+            home,
+            program,
+            admitted,
+            &mut launchctl,
+            aterm_types::update_boundary::Boundary::process(),
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let args = ["secrets".to_owned(), "watch".to_owned()];
+        check_argv(program, &args)?;
+        let systemctl = systemctl()?;
+        let name = unit_name(Job::Subscriber);
+        let loaded = run(
+            &systemctl,
+            &systemctl_argv(&["show", "-p", "LoadState", "--value", &name]),
+        )?;
+        // Disk bytes do not establish which definition systemd cached. Do not
+        // reload or act on any loaded unit through the missing-job path.
+        if String::from_utf8_lossy(&loaded.stdout).trim() != "not-found" {
+            return Ok(None);
+        }
+        let unit = unit_path(home, Job::Subscriber);
+        std::fs::create_dir_all(unit.parent().expect("unit parent"))?;
+        if !admitted()? {
+            return Ok(None);
+        }
+        if recoverable_subscriber_unit(home, program)?.is_none()
+            && !crate::fsx::write_new(
+                &unit,
+                systemd_unit(Job::Subscriber.description(), program, &args).as_bytes(),
+                0o644,
+            )?
+        {
+            return Ok(None);
+        }
+        if !admitted()? || recoverable_subscriber_unit(home, program)? != Some(true) {
+            return Ok(None);
+        }
+        run_ok(&systemctl, &systemctl_argv(&["daemon-reload"]))?;
+        run_ok(&systemctl, &systemctl_argv(&["enable", "--now", &name]))?;
+        Ok(Some(format!(
+            "{}: installed its missing subscriber",
+            unit.display()
+        )))
+    }
+}
+
+/// [`install_absent_subscriber`] on macOS, each `launchctl` call through `launchctl`, its
+/// bootstrap holding `boundary`'s guard (this process's, outside a test).
+#[cfg(target_os = "macos")]
+fn install_absent_launchd(
+    home: &Path,
+    program: &Path,
+    admitted: &mut dyn FnMut() -> crate::Result<bool>,
+    launchctl: &mut LaunchctlRun<'_>,
+    boundary: &aterm_types::update_boundary::Boundary,
+) -> crate::Result<Option<String>> {
+    let job = Job::Subscriber;
+    let args = ["secrets".to_owned(), "watch".to_owned()];
+    check_argv(program, &args)?;
+    if launchd_job_with(Domain::Gui, job.label(), launchctl)?.is_some()
+        || launchd_job_with(Domain::User, job.label(), launchctl)?.is_some()
+    {
+        return Ok(None);
+    }
+    let preferred = if launchctl(Launchctl::PrintDomain(Domain::Gui))?
+        .status
+        .success()
+    {
+        Domain::Gui
+    } else {
+        Domain::User
+    };
+    let unit = plist_path(home, job);
+    std::fs::create_dir_all(unit.parent().expect("plist parent"))?;
+    let bundle = bundle_id_of(program);
+    let text_for = |domain| {
+        plist_text_in(
+            job.label(),
+            program,
+            &args,
+            &log_path(home, job),
+            domain,
+            bundle.as_deref(),
+        )
+    };
+    let domain = [Domain::Gui, Domain::User]
+        .into_iter()
+        .find(|domain| {
+            read_regular_string(&unit, UNIT_FILE_MOST).as_deref()
+                == Some(text_for(*domain).as_str())
+        })
+        .unwrap_or(preferred);
+    let text = text_for(domain);
+    if !admitted()? {
+        return Ok(None);
+    }
+    if recoverable_subscriber_unit(home, program)?.is_none()
+        && !crate::fsx::write_new(&unit, text.as_bytes(), 0o644)?
+    {
+        return Ok(None);
+    }
+    if !admitted()? || recoverable_subscriber_unit(home, program)? != Some(true) {
+        return Ok(None);
+    }
+    // This path never replaces a unit or boots out a job. A concurrent foreign
+    // registration can make bootstrap refuse, but is not removed to make room. The bootstrap
+    // holds the update boundary (init-on-by-default design §6.7); a wait there for an update's
+    // handoff, up to minutes, checks again what this checked before it: the policy still admits
+    // the subscriber, its unit is still the one written for it, and no job of its label is
+    // loaded. `None`, a check that says no, stands it aside as that check would have.
+    let held = boundary.hold(
+        aterm_types::update_boundary::GuardedItem::LaunchdBootstrap,
+        || {
+            let still = admitted().map_err(Some)?
+                && recoverable_subscriber_unit(home, program).map_err(Some)? == Some(true)
+                && launchd_job_with(Domain::Gui, job.label(), launchctl)
+                    .map_err(Some)?
+                    .is_none()
+                && launchd_job_with(Domain::User, job.label(), launchctl)
+                    .map_err(Some)?
+                    .is_none();
+            if still { Ok(()) } else { Err(None) }
+        },
+    );
+    let _boundary = match held {
+        Ok(guard) => guard,
+        Err(None) => return Ok(None),
+        Err(Some(error)) => return Err(error),
+    };
+    launchctl_checked(Launchctl::Bootstrap(domain, &unit), launchctl)?;
+    // RunAtLoad and KeepAlive are in the exact generated plist. Bootstrap starts
+    // it; no later kickstart can accidentally act on a replaced loaded job.
+    Ok(Some(format!(
+        "{}: installed its missing subscriber",
+        unit.display()
+    )))
+}
+
 /// Repair the vault server's job when the program its unit file names is gone (its `aterm.app`
 /// moved or deleted, a disk image ejected), which launchd or systemd can then never start again:
 /// installed again running `program()`, with the arguments it had, so it serves the same vaults
@@ -1495,7 +1786,8 @@ pub(crate) fn ensure_server_with(
             install(program, args).map(Some)
         }
         _ => {
-            let text = std::fs::read_to_string(&unit)?;
+            let text = read_regular_string(&unit, UNIT_FILE_MOST)
+                .ok_or_else(|| Error::new("cannot safely read the existing server job"))?;
             if cfg!(target_os = "macos") && text.contains("<key>Disabled</key>") {
                 return Ok(None);
             }
@@ -1549,7 +1841,7 @@ pub(crate) fn repair_server_with(
 /// The arguments of `home`'s server job when [`repair_server`] would install it again: its unit
 /// file reads as a `secrets serve` job, not switched off, whose program `exists` finds gone.
 fn server_repair_due(home: &Path, exists: &dyn Fn(&Path) -> bool) -> Option<Vec<String>> {
-    let text = std::fs::read_to_string(unit_file(home, Job::Server)).ok()?;
+    let text = read_regular_string(&unit_file(home, Job::Server), UNIT_FILE_MOST)?;
     let argv = if cfg!(target_os = "macos") {
         plist_argv(&text).filter(|_| !text.contains("<key>Disabled</key>"))
     } else {
@@ -1598,7 +1890,7 @@ pub fn held(home: &Path, job: Job, program: Option<&Path>) -> Option<Held> {
 
 /// [`held`] under `home`, whoever's it is.
 pub(crate) fn held_at(home: &Path, job: Job, program: Option<&Path>) -> Option<Held> {
-    let text = std::fs::read_to_string(unit_file(home, job)).ok()?;
+    let text = read_regular_string(&unit_file(home, job), UNIT_FILE_MOST)?;
     let canonical = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
     held_in(
         job,
@@ -1866,7 +2158,14 @@ fn install_job(
 ) -> crate::Result<String> {
     #[cfg(target_os = "macos")]
     {
-        install_launchd(home, job, (program, args), restart, &mut launchctl)
+        install_launchd(
+            home,
+            job,
+            (program, args),
+            restart,
+            &mut launchctl,
+            aterm_types::update_boundary::Boundary::process(),
+        )
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -1914,7 +2213,8 @@ fn install_job(
 /// any other is booted out of whichever domain holds it (so a job set up over SSH moves to the
 /// login at the screen, never runs twice), bootstrapped (`RunAtLoad` starts it) and
 /// kickstarted, killing a running instance only when `restart`, so a reinstall never cuts a
-/// long-poll twice.
+/// long-poll twice. From its first read of launchd to the kickstart it holds `boundary`'s guard
+/// (this process's, outside a test).
 #[cfg(any(target_os = "macos", all(test, unix)))]
 fn install_launchd(
     home: &Path,
@@ -1922,14 +2222,28 @@ fn install_launchd(
     (program, args): (&Path, &[String]),
     restart: bool,
     launchctl: &mut LaunchctlRun<'_>,
+    boundary: &aterm_types::update_boundary::Boundary,
 ) -> crate::Result<String> {
     check_argv(program, args)?;
+    // From the reads of what launchd has loaded to the kickstart, the job is not repeated
+    // safely: it holds the update boundary (init-on-by-default design §6.7). The guard comes
+    // first, so a wait there for an update's handoff, up to minutes, comes before anything is
+    // read or written, and nothing acts on what was read before it.
+    let _boundary = boundary
+        .hold(
+            aterm_types::update_boundary::GuardedItem::LaunchdBootstrap,
+            || Ok::<(), std::convert::Infallible>(()),
+        )
+        .unwrap_or_else(|never| match never {});
     let label = job.label();
     let plist = plist_path(home, job);
     let log = log_path(home, job);
     let bundle_id = bundle_id_of(program);
     let text = |domain| plist_text_in(label, program, args, &log, domain, bundle_id.as_deref());
-    let as_held = |domain| std::fs::read(&plist).is_ok_and(|held| held == text(domain).as_bytes());
+    let as_held = |domain| {
+        let expected = text(domain);
+        read_regular_bounded(&plist, expected.len()).is_some_and(|held| held == expected.as_bytes())
+    };
     let line = format!(
         "{label}: launchd user agent {} runs {} {} (log {})",
         plist.display(),
@@ -1996,15 +2310,19 @@ pub fn bundle_id_of(program: &Path) -> Option<String> {
     if !in_bundle {
         return None;
     }
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(contents.join("Info.plist"))
+            .ok()?
+    };
+    if !file.metadata().ok()?.file_type().is_file() {
+        return None;
+    }
     let mut text = Vec::new();
-    std::io::Read::read_to_end(
-        &mut std::io::Read::take(
-            std::fs::File::open(contents.join("Info.plist")).ok()?,
-            INFO_PLIST_MOST,
-        ),
-        &mut text,
-    )
-    .ok()?;
+    std::io::Read::read_to_end(&mut std::io::Read::take(file, INFO_PLIST_MOST), &mut text).ok()?;
     let text = std::str::from_utf8(&text).ok()?;
     let tag = "<key>CFBundleIdentifier</key>";
     let rest = text[text.find(tag)? + tag.len()..]
@@ -2213,6 +2531,79 @@ mod tests {
     use super::*;
 
     #[test]
+    fn missing_subscriber_creation_is_guarded_against_off_pins_and_foreign_jobs() {
+        use std::cell::Cell;
+        for obstruction in [
+            "none",
+            "off",
+            "pin",
+            "foreign-file",
+            "symlink",
+            "loaded",
+            "late-off",
+            "late-pin",
+            "late-policy",
+        ] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let home = root.path();
+            let program = home.join("aterm");
+            crate::fsx::ensure_private_dir(&secrets_dir(home)).unwrap();
+            let unit = unit_file(home, Job::Subscriber);
+            std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
+            let obstruct = |kind: &str| match kind {
+                "off" | "late-off" => std::fs::write(subscriber_off_path(home), b"off").unwrap(),
+                "pin" | "late-pin" => std::fs::write(
+                    pin_path(home, Job::Subscriber),
+                    b"invalid pin still belongs to its writer",
+                )
+                .unwrap(),
+                "foreign-file" => std::fs::write(&unit, b"foreign unit").unwrap(),
+                "symlink" => std::os::unix::fs::symlink("absent-target", &unit).unwrap(),
+                _ => {}
+            };
+            if !obstruction.starts_with("late-") {
+                obstruct(obstruction);
+            }
+            let policy = Cell::new(true);
+            let installs = Cell::new(0);
+            let result = repair_absent_subscriber_with(
+                home,
+                &program,
+                &mut || Ok(policy.get()),
+                &mut || {
+                    obstruct(obstruction);
+                    if obstruction == "late-policy" {
+                        policy.set(false);
+                    }
+                    Ok(if obstruction == "loaded" {
+                        State::Installed {
+                            pid: Some(123),
+                            unit: unit.clone(),
+                        }
+                    } else {
+                        State::Absent
+                    })
+                },
+                &mut |_| {
+                    assert_job_decision_held(home, Job::Subscriber);
+                    installs.set(installs.get() + 1);
+                    Ok(Some("installed".into()))
+                },
+            )
+            .unwrap();
+            assert_eq!(result.is_some(), obstruction == "none", "{obstruction}");
+            assert_eq!(
+                installs.get(),
+                usize::from(obstruction == "none"),
+                "{obstruction}"
+            );
+            if obstruction == "foreign-file" {
+                assert_eq!(std::fs::read(&unit).unwrap(), b"foreign unit");
+            }
+        }
+    }
+
+    #[test]
     fn destination_release_is_actual_and_ignores_build_metadata() {
         assert_eq!(release_answer("aterm 0.147.0+g1234\n"), Some((0, 147, 0)));
         assert_eq!(release_answer("aterm 0.91.0\n"), Some((0, 91, 0)));
@@ -2346,6 +2737,31 @@ mod tests {
             .unwrap()
             .is_some()
         );
+        std::fs::write(&unit, vec![b' '; UNIT_FILE_MOST + 1]).unwrap();
+        assert!(
+            ensure_server_with(
+                home,
+                proposed,
+                &[],
+                &absent,
+                &not_a_candidate,
+                &mut |_, _| panic!("oversized unit file must not be read or installed")
+            )
+            .unwrap_err()
+            .0
+            .contains("cannot safely read the existing server job")
+        );
+        use std::os::unix::fs::PermissionsExt as _;
+        let lock = decision_lock_path(home, Job::Server);
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o666)).unwrap();
+        drop(JobDecision::take(home, Job::Server).unwrap());
+        assert_eq!(
+            std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let extra = home.join("extra-server.lock");
+        std::fs::hard_link(&lock, &extra).unwrap();
+        assert!(JobDecision::take(home, Job::Server).is_err());
     }
 
     /// A job is pointed only at a program that starts as aterm; one macOS kills at launch is
@@ -3639,10 +4055,297 @@ mod tests {
                 (program, &words(args)),
                 restart,
                 &mut |call| self.answer(call),
+                aterm_types::update_boundary::Boundary::process(),
             )
             .expect("installs");
             let calls = self.calls.iter().map(|argv| argv.join(" ")).collect();
             (line, calls)
+        }
+    }
+
+    /// A launchd bootstrap of the subscriber, with the bootout and kickstart around it, is not
+    /// repeated safely, so it holds the update boundary while it runs (init-on-by-default design
+    /// §6.7): an update's handoff waits for it, boundedly. Before, nothing held the guard.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_subscriber_bootstrap_holds_the_update_boundary() {
+        use aterm_types::update_boundary::{Boundary, GuardedItem};
+        let root = aterm_tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let program = root.path().join("aterm");
+        std::fs::write(&program, b"inert test program").unwrap();
+        let boundary = Boundary::new();
+        let mut launchd = FakeLaunchd::default();
+        let mut unguarded = Vec::new();
+        let mut answer = |call: Launchctl<'_>, launchd: &mut FakeLaunchd| {
+            if matches!(
+                call,
+                Launchctl::Bootstrap(..) | Launchctl::Bootout(..) | Launchctl::Kickstart(..)
+            ) && !boundary.is_held(GuardedItem::LaunchdBootstrap)
+            {
+                unguarded.push(launchctl_argv(0, call).join(" "));
+            }
+            launchd.answer(call)
+        };
+        let installed = install_absent_launchd(
+            &home,
+            &program,
+            &mut || Ok(true),
+            &mut |call| answer(call, &mut launchd),
+            &boundary,
+        )
+        .unwrap();
+        assert!(installed.is_some());
+        install_launchd(
+            &home,
+            Job::Subscriber,
+            (&program, &words(&["subscribe"])),
+            true,
+            &mut |call| answer(call, &mut launchd),
+            &boundary,
+        )
+        .expect("reinstalls");
+        assert!(
+            launchd.calls.iter().flatten().any(|word| word == "bootout"),
+            "the reinstall booted the job out: {:?}",
+            launchd.calls
+        );
+        assert_eq!(
+            unguarded,
+            Vec::<String>::new(),
+            "every bootstrap ran under the guard"
+        );
+    }
+
+    /// A job's install reads what launchd has loaded and acts on it: leaves it running, boots it
+    /// out, bootstraps it. Its guard on the update boundary (design §6.7) comes before the first
+    /// read, so a wait there for an update's handoff, up to minutes, comes before anything is read
+    /// or written, and what it does rests on launchd as it is after the wait: here another install
+    /// loaded the job meanwhile, and this one boots it out before its bootstrap. Before, the guard
+    /// came after the reads and the unit's write, and the bootstrap acted on a reading from before
+    /// the wait.
+    #[cfg(unix)]
+    #[test]
+    fn a_job_install_takes_the_boundary_before_it_reads_what_launchd_has_loaded() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let program = root.path().join("aterm");
+        std::fs::write(&program, b"inert test program").unwrap();
+        let boundary = aterm_types::update_boundary::Boundary::new();
+        let launchd = std::sync::Mutex::new(FakeLaunchd::default());
+        let latch = boundary.latch_handoff(Duration::from_secs(60));
+        let installed = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                install_launchd(
+                    &home,
+                    Job::Subscriber,
+                    (&program, &words(&["subscribe"])),
+                    false,
+                    &mut |call| launchd.lock().unwrap().answer(call),
+                    &boundary,
+                )
+            });
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while boundary.waiting() == 0 {
+                assert!(Instant::now() < deadline, "the install never waited");
+                std::thread::yield_now();
+            }
+            assert_eq!(
+                launchd.lock().unwrap().calls,
+                Vec::<Vec<String>>::new(),
+                "the install read launchd before its wait for the handoff"
+            );
+            assert!(
+                !plist_path(&home, Job::Subscriber).exists(),
+                "the install wrote its unit before its wait for the handoff"
+            );
+            // While the handoff is pending another install loads the job; then the handoff is
+            // refused.
+            launchd.lock().unwrap().loaded = Some(Domain::Gui);
+            drop(latch);
+            worker.join().unwrap()
+        });
+        let launchd = launchd.into_inner().unwrap();
+        assert!(
+            installed.is_ok() && launchd.calls.iter().flatten().any(|word| word == "bootout"),
+            "the install acted on launchd as it was before its wait: {installed:?} {:?}",
+            launchd.calls
+        );
+        assert_eq!(boundary.any_held(), None);
+    }
+
+    /// A new subscriber's install checks its policy, its unit and launchd at its local effect
+    /// boundary, right before the bootstrap. The bootstrap's guard waits for a pending update
+    /// handoff (design §6.7), up to minutes, after those checks; once the handoff is refused it
+    /// checks them again, and bootstraps nothing when one says no: the policy turned the
+    /// subscriber off, or a job of its label is loaded now. Before, the job was bootstrapped on
+    /// the checks made before the wait.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_subscriber_bootstrap_that_waited_for_a_handoff_checks_again_before_it_bootstraps() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for change in ["policy", "job", "nothing"] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let home = root.path().join("home");
+            let program = root.path().join("aterm");
+            std::fs::write(&program, b"inert test program").unwrap();
+            let boundary = aterm_types::update_boundary::Boundary::new();
+            let allowed = AtomicBool::new(true);
+            let loaded = AtomicBool::new(false);
+            let latch = boundary.latch_handoff(Duration::from_secs(60));
+            let (installed, calls) = std::thread::scope(|scope| {
+                let worker = scope.spawn(|| {
+                    let mut launchd = FakeLaunchd::default();
+                    let installed = install_absent_launchd(
+                        &home,
+                        &program,
+                        &mut || Ok(allowed.load(Ordering::SeqCst)),
+                        &mut |call| {
+                            if loaded.load(Ordering::SeqCst) {
+                                launchd.loaded = Some(Domain::Gui);
+                            }
+                            launchd.answer(call)
+                        },
+                        &boundary,
+                    );
+                    (installed, launchd.calls)
+                });
+                let deadline = Instant::now() + Duration::from_secs(60);
+                while boundary.waiting() == 0 {
+                    assert!(Instant::now() < deadline, "the bootstrap never waited");
+                    std::thread::yield_now();
+                }
+                // While the handoff is pending, the person turns the subscriber's policy off, or
+                // another install loads its job; then the handoff is refused.
+                match change {
+                    "policy" => allowed.store(false, Ordering::SeqCst),
+                    "job" => loaded.store(true, Ordering::SeqCst),
+                    _ => {}
+                }
+                drop(latch);
+                worker.join().unwrap()
+            });
+            let bootstrapped = calls.iter().flatten().any(|word| word == "bootstrap");
+            if change == "nothing" {
+                // CONTROL: nothing changed while it waited, and it bootstraps once.
+                assert!(
+                    bootstrapped && matches!(installed, Ok(Some(_))),
+                    "{installed:?} {calls:?}"
+                );
+            } else {
+                assert!(
+                    !bootstrapped && matches!(installed, Ok(None)),
+                    "{change}: the subscriber was bootstrapped after its checks changed during \
+                     its wait: {installed:?} {calls:?}"
+                );
+            }
+            assert_eq!(boundary.any_held(), None);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_failed_new_subscriber_bootstrap_resumes_the_exact_unit_without_replacing_it() {
+        use std::os::unix::fs::MetadataExt as _;
+        let root = aterm_tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let program = root.path().join("aterm");
+        std::fs::write(&program, b"inert test program").unwrap();
+        let mut launchd = FakeLaunchd {
+            no_gui: true,
+            ..FakeLaunchd::default()
+        };
+        let first = install_absent_launchd(
+            &home,
+            &program,
+            &mut || Ok(true),
+            &mut |call| {
+                if matches!(call, Launchctl::Bootstrap(..)) {
+                    return Err(Error::new("synthetic bootstrap failure"));
+                }
+                launchd.answer(call)
+            },
+            aterm_types::update_boundary::Boundary::process(),
+        );
+        assert!(first.is_err());
+        let unit = plist_path(&home, Job::Subscriber);
+        let before = std::fs::read(&unit).unwrap();
+        let inode = std::fs::metadata(&unit).unwrap().ino();
+        assert_eq!(
+            recoverable_subscriber_unit(&home, &program).unwrap(),
+            Some(true)
+        );
+        launchd.no_gui = false;
+        let retry = install_absent_launchd(
+            &home,
+            &program,
+            &mut || Ok(true),
+            &mut |call| launchd.answer(call),
+            aterm_types::update_boundary::Boundary::process(),
+        )
+        .unwrap();
+        assert!(retry.is_some());
+        assert_eq!(launchd.loaded, Some(Domain::User));
+        assert_eq!(std::fs::metadata(&unit).unwrap().ino(), inode);
+        assert_eq!(std::fs::read(&unit).unwrap(), before);
+        assert!(
+            !launchd
+                .calls
+                .iter()
+                .flatten()
+                .any(|word| word == "bootout" || word == "kickstart")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn new_subscriber_publication_refuses_late_foreign_units_jobs_and_policy() {
+        use std::cell::Cell;
+        for change in ["file", "job", "policy"] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let home = root.path().join("home");
+            let program = root.path().join("aterm");
+            std::fs::write(&program, b"inert test program").unwrap();
+            let unit = plist_path(&home, Job::Subscriber);
+            std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
+            let allowed = Cell::new(true);
+            let mut launchd = FakeLaunchd::default();
+            if change == "job" {
+                launchd.loaded = Some(Domain::Gui);
+            }
+            let result = install_absent_launchd(
+                &home,
+                &program,
+                &mut || Ok(allowed.get()),
+                &mut |call| {
+                    if matches!(call, Launchctl::PrintDomain(..)) {
+                        if change == "file" {
+                            std::fs::write(&unit, b"foreign unit").unwrap();
+                        }
+                        if change == "policy" {
+                            allowed.set(false);
+                        }
+                    }
+                    launchd.answer(call)
+                },
+                aterm_types::update_boundary::Boundary::process(),
+            )
+            .unwrap();
+            assert!(result.is_none(), "{change}");
+            assert!(
+                !launchd
+                    .calls
+                    .iter()
+                    .flatten()
+                    .any(|word| word == "bootstrap" || word == "bootout" || word == "kickstart"),
+                "{change}"
+            );
+            if change == "file" {
+                assert_eq!(std::fs::read(&unit).unwrap(), b"foreign unit");
+            }
+            if change == "policy" {
+                assert!(!unit.exists());
+            }
         }
     }
 
@@ -3825,6 +4528,7 @@ mod tests {
                 calls.push(launchctl_argv(0, call).join(" "));
                 launchctl(call)
             },
+            aterm_types::update_boundary::Boundary::process(),
         )
         .expect("installs");
         (line, calls)
@@ -4048,6 +4752,26 @@ mod tests {
         assert!(refuse(&program, &words(&["a\nb"])).0.contains("control"));
         assert!(refuse(home, &[]).0.contains("not a file"));
         assert!(!plist_path(home, Job::Subscriber).exists());
+
+        if let Some(mkfifo) = ["/usr/bin/mkfifo", "/bin/mkfifo"]
+            .into_iter()
+            .find(|p| Path::new(p).is_file())
+        {
+            let fifo = root.path().join("fifo.plist");
+            let made = aterm_uds::spawnfd::command(mkfifo)
+                .arg(&fifo)
+                .status()
+                .expect("mkfifo");
+            assert!(made.success());
+            assert_eq!(
+                unit_program(&fifo),
+                None,
+                "a FIFO never blocks unit_program"
+            );
+        }
+        let huge = root.path().join("huge.plist");
+        std::fs::write(&huge, vec![b' '; UNIT_FILE_MOST + 1]).expect("huge");
+        assert_eq!(unit_program(&huge), None, "oversized unit file refused");
     }
 
     /// A subscriber read installed but not running is read again until it runs, within

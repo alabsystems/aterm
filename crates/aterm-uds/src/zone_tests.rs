@@ -41,9 +41,15 @@ fn a_posix_rule_says_the_offset_either_side_of_each_change() {
         "EST5EDT,M13.1.0,M11.1.0",
         "EST5EDT,M3.2.0",
         "EST5x",
+        "<+05 45>-5",
+        "<a,b>-5",
     ] {
         assert_eq!(posix_offset_at(broken, 0), None, "{broken:?}");
     }
+    assert_eq!(posix_offset_at(us, i64::MIN), None);
+    assert_eq!(posix_offset_at(us, i64::MAX), Some(-5 * 3600));
+    assert_eq!(posix_offset_at(sydney, i64::MIN), Some(11 * 3600));
+    assert_eq!(posix_offset_at(sydney, i64::MAX), None);
 }
 
 fn tzif(version: u8, times: &[i64], kinds: &[u8], utoffs: &[i32], footer: &str) -> Vec<u8> {
@@ -139,6 +145,8 @@ fn only_a_plain_zone_name_reads_a_zone_file() {
         "../outside",
         "/etc/localtime",
         "",
+        "Etc/",
+        "Etc//Fixed",
         "Etc/Fi xed",
         "Etc/..",
         "a\nb",
@@ -146,6 +154,10 @@ fn only_a_plain_zone_name_reads_a_zone_file() {
         assert!(!plain_zone_name(refused), "{refused:?}");
         assert_eq!(zone_offset_in(&root, refused, 0), None, "{refused:?}");
     }
+    let mut oversized = tzif(b'2', &[], &[], &[0], "<+03>-3");
+    oversized.resize((1 << 20) + 1, 0);
+    std::fs::write(root.join("Etc/Oversized"), oversized).unwrap();
+    assert_eq!(zone_offset_in(&root, "Etc/Oversized", 0), None);
 }
 
 /// The offset the system's own `date` (the reader this module replaced, kept as its oracle)

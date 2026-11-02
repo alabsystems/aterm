@@ -26,8 +26,13 @@ pub fn translate_rain_into_pane(
     }
     let dx = u32::from(col_off) * cell_w;
     let dy = u32::from(row_off) * cell_h;
-    let x1 = (u32::from(col_off) + u32::from(pane_cols)) * cell_w;
-    let y1 = (u32::from(row_off) + u32::from(pane_rows)) * cell_h;
+    let x1 = ((u32::from(col_off) + u32::from(pane_cols)) * cell_w).min(u32::from(u16::MAX));
+    let y1 = ((u32::from(row_off) + u32::from(pane_rows)) * cell_h).min(u32::from(u16::MAX));
+    if x1 <= dx || y1 <= dy {
+        quads.clear();
+        add.clear();
+        return;
+    }
     #[inline]
     const fn clip_rect(
         (x, y, w, h): (u32, u32, u32, u32),
@@ -38,7 +43,7 @@ pub fn translate_rain_into_pane(
         let ny1_raw = ny0.saturating_add(h);
         let nx1 = if nx1_raw < x1 { nx1_raw } else { x1 };
         let ny1 = if ny1_raw < y1 { ny1_raw } else { y1 };
-        if nx1 > nx0 && ny1 > ny0 && nx1 <= u16::MAX as u32 && ny1 <= u16::MAX as u32 {
+        if nx1 > nx0 && ny1 > ny0 {
             Some((
                 nx0 as u16,
                 ny0 as u16,

@@ -25,6 +25,7 @@ aterm_durable::plain_durable_flushes_in_tests!();
 
 mod agent_warm;
 mod build_cache;
+mod build_hop;
 mod hook_reroute_first;
 mod landing_passthrough;
 mod lane_verb;

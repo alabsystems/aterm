@@ -10,7 +10,7 @@ repository.workspace = true
 description = "Run-Length Encoding container for terminal cell attributes"
 
 [dependencies]
-# None — pure std
+aterm-alloc = { workspace = true }
 
 [dev-dependencies]
 aterm-spec = { workspace = true }

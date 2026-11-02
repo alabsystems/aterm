@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Identity verbs: `auth status`, `auth add`, and `auth remove`.
+//! Identity verbs: `auth status`, `auth add`, `auth remove` and `auth import`.
 
 use std::path::Path;
 
@@ -362,4 +362,14 @@ fn referenced_unusable(
             Presence::Present | Presence::Absent => None,
         }
     })
+}
+
+/// `agh auth import NAME --from-gh …`: a profile from gh's stored login (WP8).
+///
+/// # Errors
+///
+/// could_not_run until WP8.
+pub(crate) fn auth_import(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
+    let _ = (ctx, inv);
+    Err(Error::not_yet("auth import", "WP8"))
 }

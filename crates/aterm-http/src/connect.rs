@@ -7,21 +7,20 @@ use std::io;
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
-/// Connect to `addr` within `timeout`, as `TcpStream::connect_timeout` does.
+/// Connect to `addr` within `timeout`, as `TcpStream::connect_timeout` does, the socket kept out
+/// of every child from its creation (`aterm_uds::connect_tcp`).
 /// # Errors
 /// The connect failed, was refused, or did not complete within `timeout`; or a debug build's
 /// partition cut lists `addr` (`HostUnreachable`, [`aterm_uds::partition::check`]).
 pub fn connect_timeout(addr: &SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
-    aterm_uds::partition::check(*addr)?;
     #[cfg(windows)]
     {
+        aterm_uds::partition::check(*addr)?;
         winsock::connect_timeout(addr, timeout)
     }
     #[cfg(not(windows))]
     {
-        let stream = TcpStream::connect_timeout(addr, timeout)?;
-        let _ = aterm_uds::keep_out_of_children(&stream);
-        Ok(stream)
+        aterm_uds::connect_tcp(addr, timeout)
     }
 }
 

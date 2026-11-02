@@ -6,6 +6,189 @@ use super::*;
 const NOW: i64 = 1_790_000_000;
 const CLIS: [Cli; 4] = [Cli::Claude, Cli::Codex, Cli::Grok, Cli::Kimi];
 
+pub(crate) fn shared_checkpoint_observation(cli: Cli) -> (bool, bool) {
+    shared_checkpoint_case(cli, 0)
+}
+
+pub(crate) fn shared_checkpoint_alias_observation(principal: bool) -> (bool, bool) {
+    shared_checkpoint_case(Cli::Codex, if principal { 2 } else { 1 })
+}
+
+fn shared_checkpoint_case(cli: Cli, case: u8) -> (bool, bool) {
+    let bed = Bed::new(cli);
+    let staging = bed.staging("account");
+    let shared_stage = if case == 2 {
+        bed.store.claim_staging_dir("shared").unwrap()
+    } else {
+        staging.clone()
+    };
+    #[cfg(unix)]
+    let shared_stage = if case == 1 {
+        let alias = bed.store.logins_dir().join("shared-alias");
+        std::os::unix::fs::symlink(&shared_stage, &alias).unwrap();
+        alias
+    } else {
+        shared_stage
+    };
+    let principal = if case == 2 {
+        let claims = r#"{"email":"account@example.test","https://api.openai.com/auth":{"chatgpt_account_id":"provider-account","chatgpt_user_id":"provider-user"}}"#;
+        let encoded = aterm_codec::base64::encode(claims.as_bytes()).unwrap();
+        let token = format!(
+            "header.{}.signature",
+            encoded
+                .trim_end_matches('=')
+                .replace('+', "-")
+                .replace('/', "_")
+        );
+        let doc =
+            aterm_json::json!({"tokens":{"access_token":token,"account_id":"provider-account"}});
+        let path = staging.join(cli.connector().stores[0]);
+        fs::write(&path, doc.to_string()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        super::super::codex_app_login::shared::principal("provider-account", "provider-user")
+            .unwrap()
+    } else {
+        [7; 32]
+    };
+    let source = accounts::shared::Source {
+        network: [1; 32],
+        account: [2; 32],
+    };
+    bed.store
+        .transact_logins(NOW - 2, &mut None, |_, logins| {
+            logins.shared.begin(
+                accounts::shared::Intent {
+                    source,
+                    decision: [3; 32],
+                    generation: 1,
+                    configuration: [4; 32],
+                    request: [5; 16],
+                    label: if case == 0 { "account" } else { "shared" }.into(),
+                    identity: if case == 0 {
+                        "account@example.test"
+                    } else {
+                        "shared@example.test"
+                    }
+                    .into(),
+                    staging: shared_stage.to_str().unwrap().into(),
+                    before_generation: None,
+                    begun_at: NOW - 2,
+                },
+                Some(principal),
+            )?;
+            Ok(Vec::new())
+        })
+        .unwrap();
+    let before = bed.store.load_logins(NOW).unwrap().0;
+    accounts::write_renewal_checkpoint_for(
+        cli,
+        (cli == Cli::Kimi).then_some(Region::Global),
+        "account",
+        "account@example.test",
+        staging.to_str().unwrap(),
+        None,
+        Some(accounts::Proof::Status),
+        NOW - 1,
+        &before,
+    )
+    .unwrap();
+    let files = account_files(&bed.store);
+    let evidence = fs::read(staging.join(accounts::RENEWAL_CHECKPOINT_FILE)).unwrap();
+    let recovered = recover_interrupted_staging_renewals_with(
+        cli,
+        &bed.store,
+        &bed.path,
+        &bed.guard(),
+        NOW,
+        &[],
+        || {},
+    );
+    (
+        recovered,
+        files == account_files(&bed.store)
+            && bed.store.load_logins(NOW).unwrap().0 == before
+            && fs::read(staging.join(accounts::RENEWAL_CHECKPOINT_FILE)).unwrap() == evidence,
+    )
+}
+
+#[test]
+fn shared_non_claude_checkpoints_require_the_authorized_provider_adapter() {
+    for cli in [Cli::Codex, Cli::Kimi] {
+        assert_eq!(shared_checkpoint_observation(cli), (false, true), "{cli:?}");
+    }
+}
+
+#[test]
+fn recovered_login_preserves_claims_replaced_during_admission() {
+    for cli in CLIS {
+        for activity_changed in [false, true] {
+            for ladder_changed in [false, true] {
+                let bed = Bed::new(cli);
+                let staging = bed.checkpoint("account");
+                let guard = bed.guard();
+                super::recovery_policy_tests::hold_retry(&guard, &bed.store, cli, "key", "account");
+                let mut calls = 0;
+                assert!(recover_interrupted_staging_renewals_with(
+                    cli,
+                    &bed.store,
+                    &bed.path,
+                    &guard,
+                    NOW,
+                    &[],
+                    || {
+                        calls += 1;
+                        let mut state = guard.try_lock().expect("recovery released activity lock");
+                        if calls == 1 {
+                            // The wall time deliberately matches the captured claim.
+                            if activity_changed {
+                                state.activity_owners.insert(
+                                    "key".into(),
+                                    LoginOwner::new(&bed.store, cli, "account", NOW),
+                                );
+                            }
+                            if ladder_changed {
+                                state.ladder_owners.insert(
+                                    "key".into(),
+                                    LoginOwner::new(&bed.store, cli, "account", NOW),
+                                );
+                            }
+                        } else {
+                            assert_eq!(calls, 2);
+                            let _writer = bed
+                                .store
+                                .acquire_within(&[])
+                                .unwrap()
+                                .expect("writer released");
+                            assert_eq!(
+                                bed.store
+                                    .load_logins(NOW)
+                                    .unwrap()
+                                    .0
+                                    .get("account")
+                                    .unwrap()
+                                    .dir
+                                    .as_deref(),
+                                staging.to_str(),
+                            );
+                            for held in [&state.last_attempt, &state.parked, &state.bot_checked] {
+                                assert_eq!(held.contains_key("key"), activity_changed);
+                            }
+                            assert_eq!(state.activity_owners.contains_key("key"), activity_changed);
+                            assert_eq!(state.ladder.has_backoff("key"), ladder_changed);
+                            assert_eq!(state.ladder_owners.contains_key("key"), ladder_changed);
+                        }
+                    },
+                ));
+                assert_eq!(calls, 2);
+            }
+        }
+    }
+}
+
 #[test]
 fn checkpoint_recovery_finishes_its_interrupted_commit_without_a_remaining_checkpoint() {
     for cli in CLIS {
@@ -786,7 +969,18 @@ fn a_contradictory_newest_checkpoint_does_not_hide_an_older_valid_candidate() {
 
 #[test]
 fn shared_recovery_uses_observed_identity_for_first_and_pinned_checkpoints() {
+    use crate::harness::cli::shared_renewal::{Authority, Grant};
     use accounts::shared::{Intent, Outcome, Source};
+    struct Approval(Grant);
+    impl Authority for Approval {
+        fn prepare(&self, _: &Row) -> Result<Grant, String> {
+            Ok(self.0.clone())
+        }
+        fn current(&self, grant: &Grant, _: &Row) -> Result<(), String> {
+            assert_eq!(grant, &self.0);
+            Ok(())
+        }
+    }
     let first = super::super::profile::principal_id("first").unwrap();
     let second = super::super::profile::principal_id("second").unwrap();
     let source = Source {
@@ -877,14 +1071,26 @@ fn shared_recovery_uses_observed_identity_for_first_and_pinned_checkpoints() {
                 let before = account_files(&bed.store);
                 let checkpoint = staging.join(accounts::RENEWAL_CHECKPOINT_FILE);
                 let evidence = fs::read(&checkpoint).unwrap();
+                let approval = Approval(Grant {
+                    source,
+                    decision: [3; 32],
+                    generation: 1,
+                    configuration: [4; 32],
+                    identity: "account@example.test".into(),
+                    expected_principal: pinned.then_some(first),
+                    required_browser_profile: None,
+                });
                 assert_eq!(
-                    recover_interrupted_staging_renewals_with(
+                    recover_interrupted_staging_renewals_checked(
                         Cli::Claude,
                         &bed.store,
                         &bed.path,
                         &bed.guard(),
                         NOW,
-                        &[],
+                        (
+                            &[],
+                            &shared_renewal::CheckpointAuthority::Explicit(&approval)
+                        ),
                         || {}
                     ),
                     allowed,
@@ -917,3 +1123,6 @@ fn shared_recovery_uses_observed_identity_for_first_and_pinned_checkpoints() {
         }
     }
 }
+
+#[path = "accounts_checkpoint_authority_tests.rs"]
+mod checkpoint_authority;

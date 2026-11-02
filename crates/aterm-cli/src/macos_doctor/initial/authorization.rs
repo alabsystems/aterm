@@ -207,6 +207,7 @@ impl AuthorizationCommit {
             let restart = Restart {
                 chosen: true,
                 joins: admission == Admission::Join,
+                automatic: false,
             };
             (next.done, next.only, still_restored) = admitted_keeps(
                 restart,
@@ -328,6 +329,12 @@ impl InitialSetupAuthorization {
 
     pub(super) const fn publication_unknown(&self) -> bool {
         matches!(self.state, AuthorizationState::Unconfirmed)
+    }
+
+    /// Whether this ticket's write failed part-way with its publication identified: the next
+    /// admission through it finishes that write from where it stopped, never a fresh one.
+    pub(super) const fn write_unfinished(&self) -> bool {
+        matches!(self.state, AuthorizationState::Writing(_))
     }
 
     /// Observe existing setup records before loading or displaying an offer ([`Self::offer`]).
@@ -467,40 +474,6 @@ impl InitialSetupAuthorization {
         self.persist_as(plan, Admission::Automatic)
     }
 
-    /// A person's Cancel of the review this ticket bound (System State design §3.3), recorded
-    /// for good while the records are still the ones the review bound: the first-run decision,
-    /// cancelled, naming `reviewed`, the plan the review showed ([`save_cancelled_decision`]),
-    /// or, where a Restore's record stands (the review offered what a Restore brought forward),
-    /// that record held ([`Restored::held`]), which keeps what the Restore put back, naming
-    /// `reviewed` too ([`save_cancelled_restore`]), so the Cancel reads and behaves as any
-    /// other. Either is one write, so a process that ends anywhere leaves whole records.
-    /// `Ok(false)` when the records changed since the review bound (a choice made meanwhile
-    /// answers for it) or the setup ended: nothing is written.
-    pub fn cancel_observed(&mut self, reviewed: &Plan) -> InitialSetupObserved<bool> {
-        observe_person_choice(|root| self.cancel_at(root, reviewed))
-    }
-
-    pub(super) fn cancel_at(&mut self, root: &Path, reviewed: &Plan) -> Result<bool, String> {
-        let AuthorizationState::Bound(baseline) = &self.state else {
-            return Ok(false);
-        };
-        if !owns_publications(root, &baseline.publications())? {
-            self.state = AuthorizationState::Ended;
-            return Ok(false);
-        }
-        let current = observation_at(root).map_err(|error| error.to_string())?;
-        if current != *baseline || records_finished(&current.records) {
-            self.state = AuthorizationState::Ended;
-            return Ok(false);
-        }
-        match current.records.restored {
-            Some(restored) => save_cancelled_restore(root, restored, reviewed)?,
-            None => save_cancelled_decision(root, reviewed)?,
-        }
-        self.state = AuthorizationState::Ended;
-        Ok(true)
-    }
-
     /// Widen the provisional plan this ticket observed to `plan`, even after its
     /// run finished. The caller checked the observed records allow it. A review admitted it, so
     /// it waits for the profile lock while another holds it, as a choice does
@@ -637,13 +610,15 @@ impl InitialSetupAuthorization {
         )
     }
 
+    /// [`Self::upgrade_observed`] at `root`, refused [`SETUP_BUSY`] at once, without waiting,
+    /// while another holds the profile lock.
     #[cfg(test)]
     pub(super) fn upgrade_at(
         &mut self,
         root: &Path,
         plan: &Plan,
     ) -> InitialSetupObserved<Option<u64>> {
-        self.persist_at_as(root, plan, Admission::Upgrade)
+        self.upgrade_waiting(root, observation_at(root).ok(), || false, plan)
     }
 
     #[cfg(test)]

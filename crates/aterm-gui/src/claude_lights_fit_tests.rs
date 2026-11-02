@@ -510,8 +510,8 @@ fn a_title_rebuild_reads_its_day_for_each_changed_face_and_not_for_a_kept_one() 
     assert!(ordinary.refresh(
         1,
         landed,
-        || (None, None, None),
-        |stamped| {
+        || (None, None, None, false, None, None),
+        |stamped, _| {
             assert!(stamped);
             reads.set(reads.get() + 1);
             (String::new(), Some(TODAY))
@@ -529,7 +529,7 @@ fn a_title_rebuild_reads_its_day_for_each_changed_face_and_not_for_a_kept_one() 
             1,
             landed,
             || panic!("a kept title read its words"),
-            |_| panic!("a kept title read a clock")
+            |_, _| panic!("a kept title read a clock")
         ));
         assert_eq!(
             (&ordinary.whole, &ordinary.short, ordinary.laid),
@@ -540,8 +540,8 @@ fn a_title_rebuild_reads_its_day_for_each_changed_face_and_not_for_a_kept_one() 
     assert!(trail.refresh(
         1,
         empty,
-        || (None, None, None),
-        |stamped| {
+        || (None, None, None, false, None, None),
+        |stamped, _| {
             assert!(!stamped);
             ("approved 14:05".to_owned(), Some(TODAY))
         }
@@ -551,7 +551,7 @@ fn a_title_rebuild_reads_its_day_for_each_changed_face_and_not_for_a_kept_one() 
         1,
         empty,
         || panic!("a kept title read its words"),
-        |_| panic!("an unchanged trail was read again")
+        |_, _| panic!("an unchanged trail was read again")
     ));
 
     let moved_clock = built(
@@ -572,8 +572,8 @@ fn a_title_rebuild_reads_its_day_for_each_changed_face_and_not_for_a_kept_one() 
         let rebuilt = reading.refresh(
             0,
             to,
-            || (None, None, None),
-            |stamped| {
+            || (None, None, None, false, None, None),
+            |stamped, _| {
                 assert!(stamped);
                 reads.set(reads.get() + 1);
                 (String::new(), Some(TODAY))
@@ -592,8 +592,8 @@ fn a_title_rebuild_reads_its_day_for_each_changed_face_and_not_for_a_kept_one() 
     let cleared = restated.refresh(
         0,
         empty,
-        || (None, None, None),
-        |stamped| {
+        || (None, None, None, false, None, None),
+        |stamped, _| {
             assert!(!stamped);
             clear_reads.set(clear_reads.get() + 1);
             (String::new(), None)
@@ -604,8 +604,8 @@ fn a_title_rebuild_reads_its_day_for_each_changed_face_and_not_for_a_kept_one() 
     let restored = restated.refresh(
         0,
         landed,
-        || (None, None, None),
-        |stamped| {
+        || (None, None, None, false, None, None),
+        |stamped, _| {
             assert!(stamped);
             restore_reads.set(restore_reads.get() + 1);
             (String::new(), Some(TODAY))

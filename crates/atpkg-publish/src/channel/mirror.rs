@@ -77,7 +77,8 @@ fn bind(pkg: &atpkg::PkgManifest, program: &str, build: u64, which: &str, tag: &
 ///
 /// A refusal naming what does not hold: the signed manifest pair under the client's rule,
 /// the program/build bind, at least one artifact, every release asset's sha256, and exactly
-/// the signed set; an I/O error when an asset cannot be hashed.
+/// the signed set plus an optional matching version reservation; an I/O error when an
+/// asset cannot be hashed or reservation metadata cannot be read.
 pub fn check_staged(
     quad: &VerifiedQuad,
     dir: &Path,
@@ -117,7 +118,16 @@ pub fn check_staged(
             expected.push(asset);
         }
     }
-    if let Some(extra) = staged.iter().find(|f| !expected.contains(f)) {
+    if staged
+        .iter()
+        .any(|name| name == upload::VERSION_RESERVATION)
+    {
+        upload::check_version_reservation(&dir.join(upload::VERSION_RESERVATION), &pkg.version)?;
+    }
+    if let Some(extra) = staged
+        .iter()
+        .find(|f| !expected.contains(f) && f.as_str() != upload::VERSION_RESERVATION)
+    {
         return Err(Error::refused(format!(
             "{tag} staging release carries unverifiable extra file {extra} — refusing to \
              republish it"
@@ -328,7 +338,7 @@ fn one(
     }
     log.say(format!(
         "checked {tag} (signature, program/build bind, every release asset's sha256 vs the \
-         signed manifest, no extras)"
+         signed manifest, only matching reservation metadata allowed beyond the signed set)"
     ));
 
     let written: Vec<String> = if public_mf {
@@ -348,10 +358,33 @@ fn one(
             report.planned.push((tag, missing));
             return Ok(());
         }
-        let files: Vec<PathBuf> = missing.iter().map(|n| dir.join(n)).collect();
+        let all_files: Vec<PathBuf> = expected.iter().map(|n| dir.join(n)).collect();
+        let reserved = upload::reserve_pack_version(
+            channel,
+            &public,
+            &tag,
+            &dir.join(&mf),
+            &all_files,
+            &public_notes(program, &staged_pkg, &dir)?,
+        )?;
+        let files: Vec<PathBuf> = reserved
+            .files()
+            .iter()
+            .filter(|file| {
+                file.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| missing.iter().any(|missing| missing == name))
+            })
+            .cloned()
+            .collect();
         channel
             .upload(&public, &tag, &files, Replace::Never)
             .map_err(|e| host_error(format!("upload to {public}@{tag}"), &e))?;
+        if reserved.release.draft {
+            channel
+                .publish_draft(&public, &tag)
+                .map_err(|e| host_error(format!("publish {public}@{tag}"), &e))?;
+        }
         log.say(format!(
             "{public}@{tag} converged — uploaded: {}",
             missing.join(" ")
@@ -360,6 +393,21 @@ fn one(
         missing
     } else {
         match channel.release(&public, &tag) {
+            Ok(release) if release.assets == [upload::VERSION_RESERVATION.to_owned()] => {
+                let reservation_dir = work.join("reservation").join(&tag);
+                channel
+                    .download(
+                        &public,
+                        &tag,
+                        &[upload::VERSION_RESERVATION],
+                        &reservation_dir,
+                    )
+                    .map_err(|e| host_error(format!("read {public}@{tag} reservation"), &e))?;
+                upload::check_version_reservation(
+                    &reservation_dir.join(upload::VERSION_RESERVATION),
+                    &staged_pkg.version,
+                )?;
+            }
             Ok(_) => {
                 return Err(Error::refused(format!(
                     "{public}@{tag} exists but serves no {mf} — an orphaned draft or a \
@@ -379,15 +427,16 @@ fn one(
         }
         let files: Vec<PathBuf> = expected.iter().map(|n| dir.join(n)).collect();
         let notes = public_notes(program, &staged_pkg, &dir)?;
+        let reserved =
+            upload::reserve_pack_version(channel, &public, &tag, &dir.join(&mf), &files, &notes)?;
         channel
-            .create(
-                &public,
-                &tag,
-                &format!("atpkg {program} build {build}"),
-                &notes,
-                &files,
-            )
-            .map_err(|e| host_error(format!("create {public}@{tag}"), &e))?;
+            .upload(&public, &tag, reserved.files(), Replace::Never)
+            .map_err(|e| host_error(format!("upload to {public}@{tag}"), &e))?;
+        if reserved.release.draft {
+            channel
+                .publish_draft(&public, &tag)
+                .map_err(|e| host_error(format!("publish {public}@{tag}"), &e))?;
+        }
         log.say(format!("created {public}@{tag}"));
         report.created.push(tag.clone());
         expected

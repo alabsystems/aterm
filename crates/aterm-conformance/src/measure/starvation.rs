@@ -418,8 +418,8 @@ fn sample(
     let mut n: u32 = 0;
     loop {
         let open_before = window.load(Ordering::SeqCst);
-        n += 1;
-        let deadline = tick * n;
+        n = n.saturating_add(1);
+        let deadline = tick.saturating_mul(n);
         let now = origin.elapsed();
         if deadline > now {
             std::thread::sleep(deadline - now);

@@ -1693,7 +1693,7 @@ fn ensure_directory(path: &Path) -> Result<(), InstallError> {
             path.display()
         ))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            if let Some(parent) = path.parent() {
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
                 ensure_directory(parent)?;
             }
             std::fs::create_dir(path).map_err(|e| format!("abrew: {e}"))?;
@@ -2460,7 +2460,9 @@ pub fn uninstall(
         remove_owned_opt_link(prefix, short)?;
     }
     let base = prefix.cellar().join(short);
-    if force && pinned.is_some() {
+    if (force || targets.len() >= inst.versions.len())
+        && (pinned.is_some() || prefix.pin_link_dangling_ours(short))
+    {
         prefix.unpin(short)?;
     }
     for version in &targets {
@@ -2557,12 +2559,21 @@ pub(super) fn bottle_manifest_dest(prefix: &Prefix, f: &Formula) -> PathBuf {
 /// Whether a usable bottle manifest is already in the cache
 /// (brew only downloads — and only reports — the ones missing).
 pub fn bottle_manifest_cached(prefix: &Prefix, f: &Formula) -> bool {
-    std::fs::read(bottle_manifest_dest(prefix, f)).is_ok_and(|b| b.starts_with(b"{"))
+    if !super::valid_component(&f.name) || !super::valid_cask_version(&keg_version(f)) {
+        return false;
+    }
+    crate::metadata_io::read_head(&bottle_manifest_dest(prefix, f), 1)
+        .is_ok_and(|b| b.starts_with(b"{"))
 }
 
 /// Fetch the bottle manifest when missing; `true` when this call
 /// downloaded it (the case brew reports with a ✔ line).
 pub fn fetch_bottle_manifest(prefix: &Prefix, f: &Formula) -> Result<bool, InstallError> {
+    if !super::valid_component(&f.name) || !super::valid_cask_version(&keg_version(f)) {
+        return Err(InstallError::Unsupported(
+            "unsupported formula name/version".to_string(),
+        ));
+    }
     let Some(bottle) = f.bottle_for(&Machine::this().bottle_tags()).cloned() else {
         return Ok(false);
     };

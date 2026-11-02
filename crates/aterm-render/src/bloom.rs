@@ -484,6 +484,20 @@ pub fn apply(
     rows: usize,
     params: BloomParams,
 ) -> Result<(), String> {
+    apply_kept_off(frame, glow, rows, params, None)
+}
+
+/// [`apply`], the bloom laid at each pixel at `mask`'s weight there ([`LetterMask::weight`]):
+/// none on a cell the mask keeps the post passes off, nor within its ring.
+/// # Errors
+/// As [`apply`].
+pub fn apply_kept_off(
+    frame: &mut Frame,
+    glow: &[GlowQuad],
+    rows: usize,
+    params: BloomParams,
+    mask: Option<&LetterMask>,
+) -> Result<(), String> {
     check_frame(frame)?;
     if !params.strength.is_finite() || !params.radius.is_finite() || params.radius < 0.0 {
         return Err("bloom requires finite strength and a finite nonnegative radius".to_string());
@@ -622,10 +636,14 @@ pub fn apply(
                     chroma[k] += (sc[k] - wc) * weight;
                 }
             }
+            let kept = mask.map_or(1.0, |m| m.weight(px as f32 + 0.5, py as f32 + 0.5));
+            if kept <= 0.0 {
+                continue;
+            }
             let src = [
-                (white + chroma[0]) / wsum * params.strength,
-                (white + chroma[1]) / wsum * params.strength,
-                (white + chroma[2]) / wsum * params.strength,
+                (white + chroma[0]) / wsum * params.strength * kept,
+                (white + chroma[1]) / wsum * params.strength * kept,
+                (white + chroma[2]) / wsum * params.strength * kept,
             ];
             if src.iter().all(|&c| c <= 0.0) {
                 continue;
@@ -638,27 +656,202 @@ pub fn apply(
 }
 
 /// How far past a lettered cell's box a frame whose bloom spares its letters
-/// ([`aterm_core::render::BloomGate::SparesLetters`]) keeps the post passes' source
-/// ([`spare_letters`]): the blur's whole reach ([`reach_px`]) and the
-/// half-res texel the extract widens a thin light to, so no light the passes
-/// keep reaches the cell's pixels.
+/// ([`aterm_core::render::BloomGate::SparesLetters`]) once kept the post passes' source
+/// ([`spare_letters`]): the blur's whole reach ([`reach_px`]) and the half-res texel the
+/// extract widens a thin light to, so no light the passes kept reached the cell's pixels.
+/// The bloom's composite now keeps off the letters itself ([`LetterMask`]); this cut stands
+/// only for a frame whose kept cells outrun the mask's bits ([`MASK_WORDS`]).
 #[inline]
 #[must_use]
 pub fn letter_shield_px(radius: f32) -> u32 {
     reach_px(radius).saturating_add(BLOOM_DOWNSCALE)
 }
 
-/// How far past a lettered cell's box the SDR crown's source keeps off it
-/// when the frame's bloom spares its letters: the crown screens each light
-/// over its own rect alone, so only the ring a letter's ground is read in
-/// (two pixels past its ink, which may lie at the cell's edge) needs keeping.
+/// How far past a lettered cell's box the post passes' source keeps off it when the frame's
+/// bloom spares its letters: the crown screens each light over its own rect alone, and the
+/// bloom's composite keeps off the cell and its ring ([`LetterMask`]), so only the ring a
+/// letter's ground is read in (two pixels past its ink, which may lie at the cell's edge)
+/// needs keeping.
 pub const CROWN_SHIELD_PX: u32 = 2;
 
+/// The share of a cell's width and height over which the bloom eases back to whole past a kept
+/// cell's ring ([`LetterMask`]): the letter guard's feather (`InkLedger::FEATHER_X`/`_Y`).
+pub const MASK_FEATHER: [f32; 2] = [0.45, 0.35];
+
+/// Words of a [`LetterMask`]'s bits, one bit a cell: 32 768 cells, a 2x Retina 4K grid's
+/// 240 x 63 and more. A frame whose bloom could reach more cells than that keeps its source
+/// off them by the blur's reach instead ([`letter_shield_px`]).
+pub const MASK_WORDS: usize = 1024;
+
+/// The cells a frame's bloom keeps off at its composite, and how: none of its light within a
+/// kept cell's box grown by its ring ([`CROWN_SHIELD_PX`], and a smooth scroll's slack each
+/// way vertically), easing back to whole over [`MASK_FEATHER`] of a cell past it (a
+/// smoothstep of the normalised distance, as the letter guard eases a held light). A cell is
+/// kept where it holds a glyph, or the bar or underline caret, which is read against the light
+/// of its own cell (`trail-contrast`'s thin-caret reader).
+///
+/// The bloom once kept off the letters by cutting its source a whole blur's reach from them
+/// ([`letter_shield_px`]): the cut grew with the radius faster than the blur won it back, so a
+/// larger Bloom size lit less, and in the Settings card's seven lines of text it left nothing
+/// to blur (composed r1, B1). Kept off at the composite, the bloom's lit area grows with its
+/// radius and the letters read as the guard weighed them at every radius.
+///
+/// The GPU's `fs_bloom` (`bloom.metal`, `bloom.glsl`, `bloom.hlsl`) reads the same fields and
+/// bits ([`Self::weight`] is its twin).
+#[derive(Clone, Debug, PartialEq)]
+pub struct LetterMask {
+    /// The grid's top-left corner, frame px.
+    pub origin: [f32; 2],
+    /// A cell, px.
+    pub cell: [f32; 2],
+    /// How far past a kept cell's box the bloom keeps off entirely, px.
+    pub grow: [f32; 2],
+    /// How far past that the bloom eases back to whole, px.
+    pub feather: [f32; 2],
+    /// The cells the bits cover: first column, first row, columns, rows.
+    pub window: [u32; 4],
+    /// One bit a cell of the window, row-major (bit `i & 31` of word `i >> 5`): set where the
+    /// bloom keeps off.
+    pub bits: Vec<u32>,
+}
+
+impl LetterMask {
+    /// Whether cell `(c, r)` is kept off: in the window and its bit set.
+    #[inline]
+    #[must_use]
+    pub fn kept(&self, c: i32, r: i32) -> bool {
+        let [c0, r0, nc, nr] = self.window;
+        let (lc, lr) = (i64::from(c) - i64::from(c0), i64::from(r) - i64::from(r0));
+        if lc < 0 || lr < 0 || lc >= i64::from(nc) || lr >= i64::from(nr) {
+            return false;
+        }
+        let i = (lr as usize) * nc as usize + lc as usize;
+        self.bits
+            .get(i >> 5)
+            .is_some_and(|w| (w >> (i & 31)) & 1 != 0)
+    }
+
+    /// The share of the bloom laid at frame point `(x, y)` (a pixel's centre): 0 within a kept
+    /// cell's box grown by [`Self::grow`], rising to 1 over [`Self::feather`] past it, the
+    /// least over the kept cells about the point. `fs_bloom`'s `letter_mask` is its twin.
+    #[must_use]
+    pub fn weight(&self, x: f32, y: f32) -> f32 {
+        let c = ((x - self.origin[0]) / self.cell[0]).floor() as i32;
+        let r = ((y - self.origin[1]) / self.cell[1]).floor() as i32;
+        let mut m = 1.0f32;
+        for dr in -2..=2 {
+            for dc in -1..=1 {
+                let (cc, rr) = (c + dc, r + dr);
+                if !self.kept(cc, rr) {
+                    continue;
+                }
+                let bx0 = self.origin[0] + cc as f32 * self.cell[0] - self.grow[0];
+                let by0 = self.origin[1] + rr as f32 * self.cell[1] - self.grow[1];
+                let bx1 = bx0 + self.cell[0] + 2.0 * self.grow[0];
+                let by1 = by0 + self.cell[1] + 2.0 * self.grow[1];
+                let dx = (bx0 - x).max(x - bx1).max(0.0) / self.feather[0];
+                let dy = (by0 - y).max(y - by1).max(0.0) / self.feather[1];
+                let e2 = dx * dx + dy * dy;
+                if e2 >= 1.0 {
+                    continue;
+                }
+                let e = e2.sqrt();
+                m = m.min(e * e * (3.0 - 2.0 * e));
+            }
+        }
+        m
+    }
+
+    /// The mask of `input`'s kept cells ([`kept_off`]) about the frame box `area` (`x0, y0,
+    /// x1, y1`, px: where the bloom may lay light), its grid at `grid`; `None` where the cells
+    /// that could reach the box outrun [`MASK_WORDS`].
+    #[must_use]
+    pub fn about(
+        input: &aterm_core::render::RenderInput,
+        grid: LetterGrid,
+        area: [i64; 4],
+    ) -> Option<Self> {
+        if grid.cell_w == 0 || grid.cell_h == 0 {
+            return None;
+        }
+        let (cw, ch) = (grid.cell_w as f32, grid.cell_h as f32);
+        let slack = input.scroll_frac_px.unsigned_abs() as f32;
+        let ring = CROWN_SHIELD_PX as f32;
+        let grow = [ring, ring + slack];
+        let feather = [
+            (cw * MASK_FEATHER[0]).max(1.0),
+            (ch * MASK_FEATHER[1]).max(1.0),
+        ];
+        let reach = |g: f32, f: f32| (g + f).ceil() as i64;
+        let (rx, ry) = (reach(grow[0], feather[0]), reach(grow[1], feather[1]));
+        let (pad, top) = (grid.pad as i64, grid.grid_top as i64);
+        let (cwi, chi) = (grid.cell_w as i64, grid.cell_h as i64);
+        // A row's cells may stop at its last ink; the caret's cell may lie past it.
+        let cols = input.cols as i64;
+        let rows = input.rows as i64;
+        let c0 = (area[0] - rx - pad).div_euclid(cwi).clamp(0, cols);
+        let c1 = (area[2] + rx - pad)
+            .div_euclid(cwi)
+            .saturating_add(1)
+            .clamp(0, cols);
+        let r0 = (area[1] - ry - top).div_euclid(chi).clamp(0, rows);
+        let r1 = (area[3] + ry - top)
+            .div_euclid(chi)
+            .saturating_add(1)
+            .clamp(0, rows);
+        let (nc, nr) = ((c1 - c0).max(0) as usize, (r1 - r0).max(0) as usize);
+        if nc.saturating_mul(nr) > MASK_WORDS * 32 {
+            return None;
+        }
+        let mut bits = vec![0u32; (nc * nr).div_ceil(32)];
+        let caret = thin_caret_cell(input);
+        for lr in 0..nr {
+            let r = r0 as usize + lr;
+            let Some(line) = input.cells.get(r) else {
+                continue;
+            };
+            for lc in 0..nc {
+                let c = c0 as usize + lc;
+                if kept_off(line.get(c), caret == Some((r, c))) {
+                    let i = lr * nc + lc;
+                    bits[i >> 5] |= 1 << (i & 31);
+                }
+            }
+        }
+        Some(Self {
+            origin: [grid.pad as f32, grid.grid_top as f32],
+            cell: [cw, ch],
+            grow,
+            feather,
+            window: [c0 as u32, r0 as u32, nc as u32, nr as u32],
+            bits,
+        })
+    }
+}
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    static CUT_BY_REACH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A test's negative control: `f` run with [`spared_sources`] keeping the bloom's source a
+/// whole blur's reach off the kept cells ([`letter_shield_px`]) and no [`LetterMask`], as
+/// looks10 did. Debug and test builds only.
+#[cfg(any(test, debug_assertions))]
+pub fn with_source_cut_by_reach<R>(f: impl FnOnce() -> R) -> R {
+    CUT_BY_REACH.with(|c| c.set(true));
+    let out = f();
+    CUT_BY_REACH.with(|c| c.set(false));
+    out
+}
+
 /// The post passes' sources of a frame whose bloom spares its letters
-/// ([`aterm_core::render::BloomGate::SparesLetters`]): `source` (the lights
-/// both passes read, window px) kept [`CROWN_SHIELD_PX`] off every lettered
-/// cell into `crown`, and [`letter_shield_px`] off them into `bloom`. Both
-/// renderers draw from these, so they bloom and crown alike.
+/// ([`aterm_core::render::BloomGate::SparesLetters`]): `source` (the lights both passes read,
+/// window px) kept [`CROWN_SHIELD_PX`] off every kept cell ([`kept_off`]) into `crown` and
+/// `bloom`, and the mask the bloom's composite lays its light by ([`apply_kept_off`]) for a
+/// blur of `radius`. Where the cells the bloom could reach outrun the mask's bits, `bloom` is
+/// kept a whole blur's reach off them instead ([`letter_shield_px`]) and there is no mask.
+/// Both renderers draw from these, so they bloom and crown alike.
 pub fn spared_sources(
     source: &[GlowQuad],
     input: &aterm_core::render::RenderInput,
@@ -666,13 +859,43 @@ pub fn spared_sources(
     radius: f32,
     crown: &mut Vec<GlowQuad>,
     bloom: &mut Vec<GlowQuad>,
-) {
+) -> Option<LetterMask> {
     crown.clear();
     crown.extend_from_slice(source);
     spare_letters(crown, input, grid, CROWN_SHIELD_PX);
     bloom.clear();
-    bloom.extend_from_slice(source);
-    spare_letters(bloom, input, grid, letter_shield_px(radius));
+    #[cfg(any(test, debug_assertions))]
+    let by_reach = CUT_BY_REACH.with(std::cell::Cell::get);
+    #[cfg(not(any(test, debug_assertions)))]
+    let by_reach = false;
+    let mask = if by_reach {
+        None
+    } else {
+        let mut b = Bounds::EMPTY;
+        for q in crown.iter().filter(|q| usize::from(q.row) < input.rows) {
+            b.add(q);
+        }
+        b.rect().and_then(|[x0, y0, x1, y1]| {
+            let d = i64::from(reach_px(radius)) + i64::from(BLOOM_DOWNSCALE);
+            LetterMask::about(
+                input,
+                grid,
+                [
+                    i64::from(x0) - d,
+                    i64::from(y0) - d,
+                    i64::from(x1) + d,
+                    i64::from(y1) + d,
+                ],
+            )
+        })
+    };
+    bloom.extend_from_slice(crown);
+    if mask.is_none() && (by_reach || !bloom.is_empty()) {
+        bloom.clear();
+        bloom.extend_from_slice(source);
+        spare_letters(bloom, input, grid, letter_shield_px(radius));
+    }
+    mask
 }
 
 /// Where a frame's grid lies in its window pixels ([`spare_letters`]).
@@ -693,6 +916,28 @@ pub struct LetterGrid {
 #[inline]
 fn lettered(c: &aterm_core::terminal::RenderCell) -> bool {
     c.wide || !(c.ch == ' ' || c.ch == '\0' || c.ch.is_control())
+}
+
+/// Whether the post passes keep off a cell: one holding ink ([`lettered`]), or the thin
+/// caret's (`caret`, [`thin_caret_cell`]).
+#[inline]
+fn kept_off(c: Option<&aterm_core::terminal::RenderCell>, caret: bool) -> bool {
+    caret || c.is_some_and(lettered)
+}
+
+/// The cell of `input`'s bar or underline caret, where it is shown: two pixels or so of the
+/// caret's colour, read against the light of its own cell (the effects' thin-caret law weighs
+/// it on the frame's streams, so the post passes keep off the cell as off a letter's). A block
+/// paints its whole cell and keeps the bloom over it.
+#[must_use]
+pub fn thin_caret_cell(input: &aterm_core::render::RenderInput) -> Option<(usize, usize)> {
+    use aterm_core::terminal::CursorStyle as S;
+    let thin = matches!(
+        crate::effective_cursor_style(input, None),
+        S::BlinkingBar | S::SteadyBar | S::BlinkingUnderline | S::SteadyUnderline
+    );
+    (thin && input.cursor_visible && input.cursor_row < input.rows && input.cursor_col < input.cols)
+        .then_some((input.cursor_row, input.cursor_col))
 }
 
 /// Cut the post passes' source (`source`: the lights the bloom extracts and
@@ -728,6 +973,7 @@ pub fn spare_letters(
     let (cw, ch) = (grid.cell_w as i64, grid.cell_h as i64);
     let (pad, top) = (grid.pad as i64, grid.grid_top as i64);
     let mut shields: Vec<[i64; 4]> = Vec::new();
+    let caret = thin_caret_cell(input);
     for (r, line) in input.cells.iter().enumerate().take(input.rows) {
         let y0 = top + r as i64 * ch - slack - grow;
         let y1 = top + (r as i64 + 1) * ch + slack + grow;
@@ -735,8 +981,13 @@ pub fn spare_letters(
             continue;
         }
         let mut run: Option<(i64, i64)> = None;
-        for (c, cell) in line.iter().enumerate() {
-            if !lettered(cell) {
+        // A row's cells may stop at its last ink; the caret's cell may lie past it.
+        let end = match caret {
+            Some((cr, cc)) if cr == r => line.len().max(cc + 1),
+            _ => line.len(),
+        };
+        for c in 0..end {
+            if !kept_off(line.get(c), caret == Some((r, c))) {
                 continue;
             }
             let (x0, x1) = (pad + c as i64 * cw - grow, pad + (c as i64 + 1) * cw + grow);
@@ -989,33 +1240,143 @@ mod tests {
         );
     }
 
-    /// looks10 L1: the bloom of a light beside a letter, its source spared
-    /// ([`spared_sources`]), lays nothing on the letter's cell; bloomed from the light whole
-    /// (the control), it lights the cell.
+    /// looks10 L1, composed r2 B1: the bloom of a light beside a letter, its source spared and
+    /// its composite kept off the letter ([`spared_sources`], [`apply_kept_off`]), lays nothing
+    /// on the letter's cell nor its ring; bloomed from the light whole (the control), it
+    /// lights the cell.
     #[test]
     fn a_spared_bloom_lays_no_light_on_a_letter() {
         let (input, grid) = lettered_row();
         let light = [GlowQuad::flat(0, 44, 0, 32, 16, 0x00E0_E0E0, 0)];
         let (mut crown, mut blur) = (Vec::new(), Vec::new());
-        spared_sources(&light, &input, grid, BLOOM_RADIUS, &mut crown, &mut blur);
-        let letter_lit = |glow: &[GlowQuad]| {
+        let mask = spared_sources(&light, &input, grid, BLOOM_RADIUS, &mut crown, &mut blur);
+        let letter_lit = |glow: &[GlowQuad], mask: Option<&LetterMask>| {
             let mut f = frame(80, 16, 0);
-            apply(&mut f, glow, 1, BloomParams::default()).unwrap();
-            (0..16).any(|y| (24..40).any(|x| f.pixels[y * 80 + x] != 0))
+            apply_kept_off(&mut f, glow, 1, BloomParams::default(), mask).unwrap();
+            (0..16).any(|y| (22..42).any(|x| f.pixels[y * 80 + x] != 0))
         };
         assert!(
-            letter_lit(&light),
+            letter_lit(&light, None),
             "control: the whole light blooms onto the letter"
         );
         assert!(
-            !blur.is_empty(),
+            !blur.is_empty() && mask.is_some(),
             "fixture: the light reaches past the bloom's shield"
         );
-        assert!(!letter_lit(&blur), "the spared bloom lights the letter");
+        assert!(
+            !letter_lit(&blur, mask.as_ref()),
+            "the spared bloom lights the letter"
+        );
         assert_eq!(
             crown,
             light.to_vec(),
             "the crown keeps a light past its shield whole"
+        );
+    }
+
+    /// Composed r2 B1: a frame whose bloom spares its letters lights more the larger its
+    /// radius, and lays nothing on a lettered cell or its ring at any radius: the bloom keeps
+    /// off the letters at its composite ([`LetterMask`]), so its source is cut by the ring
+    /// alone. NEGATIVE CONTROL ([`with_source_cut_by_reach`]): the source cut a whole blur's
+    /// reach off the letters, as looks10 kept it, lights less at the larger radii (the Bloom
+    /// size ran backwards) and nothing at all once the cut covers the light.
+    #[test]
+    fn a_spared_bloom_grows_with_its_radius_and_keeps_off_the_letters() {
+        // Three rows of 30 cells 8x16, `x` in columns 3..9 of rows 0 and 2; a light along
+        // the blank middle row and over the letters.
+        let mut input = aterm_core::render::RenderInput::empty();
+        input.rows = 3;
+        input.cols = 30;
+        let mut lettered = vec![crate::RenderCell::default(); 30];
+        for cell in &mut lettered[3..9] {
+            cell.ch = 'x';
+        }
+        input.cells = vec![
+            lettered.clone(),
+            vec![crate::RenderCell::default(); 30],
+            lettered,
+        ];
+        let grid = LetterGrid {
+            pad: 0,
+            grid_top: 0,
+            cell_w: 8,
+            cell_h: 16,
+        };
+        let light = [GlowQuad::flat(1, 16, 20, 88, 8, 0x00D0_E0F0, 0)];
+        let (w, h) = (240, 48);
+        let ring = |x: usize, y: usize| {
+            let (x, y) = (x as i64, y as i64);
+            (22..74).contains(&x) && ((-2..18).contains(&y) || (30..50).contains(&y))
+        };
+        let bloomed = |radius: f32| -> (usize, bool) {
+            let (mut crown, mut blur) = (Vec::new(), Vec::new());
+            let mask = spared_sources(&light, &input, grid, radius, &mut crown, &mut blur);
+            let mut f = frame(w, h, 0);
+            let params = BloomParams {
+                radius,
+                ..BloomParams::default()
+            };
+            apply_kept_off(&mut f, &blur, 3, params, mask.as_ref()).unwrap();
+            let lit = f.pixels.iter().filter(|&&p| p != 0).count();
+            let on_letter = (0..h).any(|y| (0..w).any(|x| ring(x, y) && f.pixels[y * w + x] != 0));
+            (lit, on_letter)
+        };
+        let radii = [0.5f32, BLOOM_RADIUS, 8.0];
+        let lit: Vec<(usize, bool)> = radii.iter().map(|&r| bloomed(r)).collect();
+        for (r, (_, on)) in radii.iter().zip(&lit) {
+            assert!(!on, "radius {r}: the bloom lit a letter's cell or its ring");
+        }
+        assert!(
+            lit[0].0 < lit[1].0 && lit[1].0 < lit[2].0,
+            "the lit area grows with the radius: {lit:?}"
+        );
+        let cut: Vec<(usize, bool)> =
+            with_source_cut_by_reach(|| radii.iter().map(|&r| bloomed(r)).collect());
+        assert!(
+            !(cut[0].0 < cut[1].0 && cut[1].0 < cut[2].0),
+            "control: the source cut by the blur's reach lights less as the radius grows: {cut:?}"
+        );
+    }
+
+    /// Composed r2 O2(a): the post passes keep off a bar or underline caret's cell as off a
+    /// letter's, past the end of its row's ink too, so the bar reads against the light the
+    /// frame's streams lay in its cell ([`thin_caret_cell`]). NEGATIVE CONTROL: a block caret
+    /// paints its whole cell, and the bloom and the crown are laid over it.
+    #[test]
+    fn the_post_passes_keep_off_a_thin_caret_s_cell() {
+        use aterm_core::terminal::CursorStyle;
+        let mut input = aterm_core::render::RenderInput::empty();
+        input.rows = 1;
+        input.cols = 10;
+        input.cells = vec![vec![crate::RenderCell::default(); 4]];
+        input.cursor_visible = true;
+        input.cursor_col = 6;
+        let grid = LetterGrid {
+            pad: 0,
+            grid_top: 0,
+            cell_w: 8,
+            cell_h: 16,
+        };
+        let light = [GlowQuad::flat(0, 24, 4, 56, 8, 0x00E0_E0E0, 0)];
+        let cell_lit = |style: CursorStyle| {
+            let mut input = input.clone();
+            input.cursor_style = style;
+            let (mut crown, mut blur) = (Vec::new(), Vec::new());
+            let mask = spared_sources(&light, &input, grid, BLOOM_RADIUS, &mut crown, &mut blur);
+            let mut f = frame(80, 16, 0);
+            apply_kept_off(&mut f, &blur, 1, BloomParams::default(), mask.as_ref()).unwrap();
+            sdr_crown(&mut f, &crown, 1, 0.4).unwrap();
+            (0..16).any(|y| (46..58).any(|x| f.pixels[y * 80 + x] != 0))
+        };
+        for style in [CursorStyle::SteadyBar, CursorStyle::BlinkingUnderline] {
+            assert!(
+                !cell_lit(style),
+                "{style:?}: the post passes lit the caret's cell"
+            );
+        }
+        assert!(
+            cell_lit(CursorStyle::SteadyBlock),
+            "control: a block caret's cell takes the bloom and the crown"
         );
     }
 

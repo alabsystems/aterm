@@ -116,7 +116,7 @@ impl Record {
         let (mut cwd, mut argv, mut env) = (None, Vec::new(), Vec::new());
         while let Some(tag) = it.next() {
             match tag {
-                b"cwd" => cwd = Some(PathBuf::from(os_of(it.next()?))),
+                b"cwd" if cwd.is_none() => cwd = Some(PathBuf::from(os_of(it.next()?))),
                 b"arg" => argv.push(os_of(it.next()?)),
                 b"env" => {
                     let k = os_of(it.next()?);
@@ -184,12 +184,16 @@ fn write_record(dir: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// # Errors
 /// When the directory or a record cannot be read, or a record is not one.
 pub fn read_records(dir: &Path) -> Result<Vec<Record>, String> {
-    let mut names: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map_err(|e| format!("cannot read {}: {e}", dir.display()))?
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "rec"))
-        .collect();
+    let mut names: Vec<PathBuf> = Vec::new();
+    for entry in
+        std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?
+    {
+        let entry = entry.map_err(|e| format!("cannot read entry in {}: {e}", dir.display()))?;
+        let p = entry.path();
+        if p.extension().is_some_and(|x| x == "rec") {
+            names.push(p);
+        }
+    }
     names.sort();
     names
         .iter()
@@ -366,7 +370,12 @@ pub fn plan(records: Vec<Record>, log: &str, exes: &[TestExe]) -> Result<Vec<Bin
             }
             let flag = exes
                 .iter()
-                .find(|e| e.exe.file_name().is_some() && e.exe.file_name() == exe.file_name())
+                .find(|e| e.exe == exe)
+                .or_else(|| {
+                    exes.iter().find(|e| {
+                        e.exe.file_name().is_some() && e.exe.file_name() == exe.file_name()
+                    })
+                })
                 .map(|e| e.flag.clone())
                 .ok_or_else(|| format!("the compile did not report {}", exe.display()))?;
             let package = record
@@ -795,7 +804,17 @@ mod tests {
         assert_eq!(recs[0].argv, ["/t/a", "--skip", "m::"]);
         assert_eq!(recs[1].argv, ["/t/b"]);
         assert_eq!(recs[0].cwd, std::env::current_dir().expect("cwd"));
-        assert_eq!(recs[0].var("PATH"), std::env::var_os("PATH").as_deref());
+        assert_eq!(
+            recs[0].var("CARGO_PKG_NAME"),
+            std::env::var_os("CARGO_PKG_NAME").as_deref()
+        );
+        assert!(
+            recs[0]
+                .env
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("PATH")
+                    && Some(v.as_os_str()) == std::env::var_os("PATH").as_deref())
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -1182,5 +1201,30 @@ mod tests {
             cmd.preamble.as_deref(),
             Some("     Running tests/a.rs (target/debug/deps/a-1)\n")
         );
+    }
+
+    #[test]
+    fn plan_prefers_exact_exe_match_before_file_name_fallback() {
+        let records = vec![rec("/r/target/debug/deps/a-1", "x")];
+        let log = "     Running tests/a.rs (target/debug/deps/a-1)\n";
+        let exes = vec![
+            TestExe {
+                exe: PathBuf::from("/other/target/debug/deps/a-1"),
+                flag: "--lib".to_string(),
+            },
+            TestExe {
+                exe: PathBuf::from("/r/target/debug/deps/a-1"),
+                flag: "--test a".to_string(),
+            },
+        ];
+        let bins = plan(records, log, &exes).expect("plan");
+        assert_eq!(bins[0].spec, "-p x --test a");
+    }
+
+    #[test]
+    fn record_decode_rejects_duplicate_cwd() {
+        let mut bytes = rec("/r/target/debug/deps/a-1", "x").encode();
+        bytes.extend_from_slice(b"cwd\0/other\0");
+        assert!(Record::decode(&bytes).is_none());
     }
 }

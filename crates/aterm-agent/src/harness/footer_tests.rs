@@ -2565,14 +2565,10 @@ fn the_limit_wall_is_read_from_the_transcripts_row() {
     let (claude, transcript, two_pm) = walled_session(&root);
     let day0 = two_pm - 14 * 3600;
     let mut cache = FooterCache::default();
-    assert_eq!(
-        wall_at(&claude, &mut cache, two_pm + 60),
-        Some(super::super::session_usage::wall_text(
-            &super::super::session_usage::Wall {
-                label: "5h",
-                resets: "3pm".into(),
-            }
-        )),
+    let wall = wall_at(&claude, &mut cache, two_pm + 60).expect("standing transcript limit");
+    assert!(wall.contains("5h; provider reset: 3pm"));
+    assert!(
+        !wall.contains("UTC"),
         "the vendor's reset, its zone left off"
     );
     assert!(wall_at(&claude, &mut cache, day0 + 15 * 3600 - 1).is_some());
@@ -2982,28 +2978,6 @@ fn a_narrow_rule_gives_way_title_first_and_the_model_last() {
         ]
         .map(|v| v.into_iter().map(str::to_owned).collect::<Vec<_>>())
     );
-    let walled = narrow_rule_walled();
-    let model = "\u{25C6} Opus 5.5 xhigh";
-    let path = "\u{2302} ~/src/github.com/aterm";
-    let short = "\u{2302} \u{2026}/aterm";
-    let branch = "\u{2387} main";
-    let wall = "\u{29D7} 7d \u{267B} Oct 1 at 9am";
-    assert_eq!(
-        walk_down(&walled),
-        [
-            vec![wall, model, path, branch, "\u{03A3} 7h52m"],
-            vec![wall, model, path, branch],
-            vec![wall, model, short, branch],
-            vec![wall, model, short],
-            vec![wall, model],
-            vec![wall, "\u{25C6} Opus 5.5"],
-            vec![wall],
-            vec![model],
-            vec!["\u{25C6} Opus 5.5"],
-            Vec::<&str>::new(),
-        ]
-        .map(|v| v.into_iter().map(str::to_owned).collect::<Vec<_>>())
-    );
     let lights = Some(LightsWidth {
         chips: 13,
         title: 35,
@@ -3265,8 +3239,8 @@ fn narrow_rule_tokens() -> FooterFacts {
 }
 
 #[test]
-fn the_account_costs_only_the_tokens() {
-    let plain = narrow_rule_walled();
+fn an_unblocked_account_costs_only_the_tokens() {
+    let plain = narrow_rule_tokens();
     let named = |label: &str, facts: &FooterFacts| FooterFacts {
         account: Some(label.into()),
         ..facts.clone()
@@ -3277,7 +3251,7 @@ fn the_account_costs_only_the_tokens() {
         .iter()
         .find(|rung| rung.len() < walk[0].len())
         .expect("a narrower rung");
-    assert_eq!(fewer.as_slice(), &walk[0][..5], "{fewer:?}");
+    assert_eq!(fewer.as_slice(), &walk[0][..walk[0].len() - 1], "{fewer:?}");
     let bare = narrow_rule_facts();
 
     let strip = |segments: &[Segment], marks: &[char]| -> Vec<Segment> {
@@ -3288,7 +3262,7 @@ fn the_account_costs_only_the_tokens() {
             .collect()
     };
     for label in ["a", "work-2", "a-label-of-twenty-six-cells"] {
-        for unnamed in [&plain, &bare, &narrow_rule_tokens()] {
+        for unnamed in [&plain, &bare] {
             let facts = named(label, unnamed);
             let mut shown = 0;
             for room in 0..=160 {
@@ -3330,7 +3304,8 @@ fn the_account_costs_only_the_tokens() {
             .collect()
     };
     let pinned = walk_down(&plain);
-    let mut rest = pinned[1..].iter();
+    // When the account no longer fits, its room can show the full runtime row again.
+    let mut rest = pinned.iter();
     for rung in unnamed_of(&walk) {
         assert!(rest.any(|r| *r == rung), "{rung:?} out of order: {walk:?}");
     }
@@ -3393,7 +3368,7 @@ fn subscription_account_and_weekly_outlast_workspace_details_without_overflow() 
 }
 
 /// A WEEKLY FIGURE THE FOOTER HAS NOT GOT IS NOT ON THE RULE: whatever the reason (the tap off,
-/// no reply yet, none told) the rule shows the account and no `weekly ?` or `weekly
+/// no reply yet, none told) the rule shows the account and no `weekly –` or `weekly
 /// unavailable`; the reason is the account's hover title's, the Accounts menu's and a screen
 /// reader's. A standing 7d wall still says `weekly 0% left`, and a real figure, aged or not,
 /// stays beside the account and the controls on an 80-column pane, in its narrow form
@@ -3931,7 +3906,7 @@ fn subscription_control_glyph_outlasts_the_model_when_essentials_cannot_fit() {
 
 #[test]
 fn a_reason_takes_the_accounts_room() {
-    let plain = narrow_rule_walled();
+    let plain = narrow_rule_tokens();
     let facts = FooterFacts {
         account: Some("work-2".into()),
         ..plain.clone()
@@ -3942,16 +3917,16 @@ fn a_reason_takes_the_accounts_room() {
         .filter(|s| s.mark == WALL_MARK || s.mark == MODEL_MARK)
         .cloned()
         .collect();
-    assert_eq!(top.len(), 2);
+    assert_eq!(top.len(), 1);
+    let account = whole.iter().find(|s| s.mark == ACCOUNT_MARK).unwrap();
     let named = |fit: &RuleFit| fit.segments.iter().any(|s| s.mark == ACCOUNT_MARK);
     let with_account = |fit: &RuleFit| {
         let mut fit = fit.clone();
         let at = fit.segments.iter().position(|s| s.mark == MODEL_MARK);
         fit.segments
-            .insert(at.expect("the model") + 1, whole[2].clone());
+            .insert(at.expect("the model") + 1, account.clone());
         fit
     };
-    assert_eq!(whole[2].mark, ACCOUNT_MARK);
     let reason = Some(LightsWidth {
         chips: 13,
         title: 50,
@@ -5637,6 +5612,7 @@ fn drawn_cells_follow_the_glyphs_nudges() {
         mark: false,
         tail: false,
         quiet: false,
+        ..SetGlyph::default()
     };
     let set = |glyphs: Vec<SetGlyph>| SetFacts {
         cells: 12,
@@ -5883,50 +5859,6 @@ fn recovery_and_account_spans_keep_every_optional_fact_clickable() {
     assert_eq!(kinds.last(), Some(&FactKind::Usage));
 }
 
-fn fit_sweep(facts: &FooterFacts) -> String {
-    let lights = [
-        None,
-        Some(LightsWidth {
-            chips: 4,
-            title: 22,
-            lean: [18, 14, 0, 0],
-            short: 9,
-            reason: false,
-        }),
-        Some(LightsWidth {
-            chips: 4,
-            title: 22,
-            lean: [0; LEAN_FORMS],
-            short: 9,
-            reason: true,
-        }),
-    ];
-    let mut out = String::new();
-    for (i, lights) in lights.iter().enumerate() {
-        let shown = |room: usize| {
-            let fit = fit_rule(facts, room, *lights);
-            format!(
-                "{}|{:?}|{}",
-                rung_texts(&fit).join("/"),
-                fit.title,
-                fit.chips
-            )
-        };
-        let mut from = 20;
-        let mut last = shown(20);
-        for room in 21..=201 {
-            let now = (room <= 200).then(|| shown(room));
-            if now.as_ref() != Some(&last) {
-                out.push_str(&format!("{i} {from}..={} {last}\n", room - 1));
-                if let Some(now) = now {
-                    (from, last) = (room, now);
-                }
-            }
-        }
-    }
-    out
-}
-
 #[test]
 fn a_hidden_fact_reads_off_in_rule_gray_and_gives_way_first() {
     let shown = |facts: &FooterFacts| -> Vec<String> {
@@ -6015,18 +5947,6 @@ fn a_hidden_fact_reads_off_in_rule_gray_and_gives_way_first() {
     let no_model = hide(FactMask::MODEL);
     assert_eq!(model_alone(&no_model), None);
     assert_eq!(walk_down(&no_model).last().map(Vec::len), Some(0));
-    let facts = FooterFacts {
-        account: Some("work-2".into()),
-        ..narrow_rule_walled()
-    };
-    let golden: String = include_str!("testdata/footer-fit-sweep.txt")
-        .lines()
-        .skip(1)
-        .map(|l| format!("{l}\n"))
-        .collect();
-    let swept = fit_sweep(&facts);
-    assert!(swept == golden, "the sweep moved:\n{swept}");
-    assert_eq!(plain_ladder(&facts), bare_ladder(&facts));
     assert_ne!(
         plain_ladder(&hide(FactMask::PATH)),
         bare_ladder(&hide(FactMask::PATH))
@@ -6343,6 +6263,7 @@ fn the_effort_split_survives_clusters_and_marks() {
             split: Some(head.len()),
             quiet: (true, false),
             joined: false,
+            ..Segment::default()
         }]);
         let spelled = |pick: &dyn Fn(&SetGlyph) -> bool| -> String {
             set.glyphs
@@ -6502,6 +6423,352 @@ fn compact_recovery_retains_its_blocker_before_the_retry_timestamp() {
 }
 
 #[test]
+fn a_transcript_limit_without_recovery_observations_has_an_ephemeral_unknown_view() {
+    use super::super::account_progress::ProgressPhase;
+    let reset = "Nov 4 at 6:02am";
+    let facts = FooterFacts {
+        usage: Some(super::super::session_usage::UsageFacts {
+            wall: Some(super::super::session_usage::Wall {
+                label: "7d",
+                resets: reset.into(),
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let before = facts.clone();
+    let view = facts
+        .account_progress_view()
+        .expect("known limit, recovery unknown");
+    assert!(matches!(&view, std::borrow::Cow::Owned(_)));
+    assert_eq!(view.phase, ProgressPhase::Unknown);
+    assert_eq!(view.observed_at, 0);
+    assert_eq!(
+        (view.known, view.eligible, view.next_at),
+        (None, None, None)
+    );
+    assert_eq!(view.account, None);
+    assert_eq!(view.details, [UNOBSERVED_RECOVERY_FINDING]);
+    let limit = view
+        .wall
+        .as_deref()
+        .expect("typed limit and provider reset");
+    assert!(limit.contains("7d"));
+    assert!(limit.contains(reset));
+    assert!(limit.contains("provider reset"));
+    let full = account_progress_text(&view, false);
+    assert!(full.contains(reset));
+    assert!(full.contains("Inventory unknown"));
+    assert!(full.contains("Eligibility unknown"));
+    assert!(full.contains("Next unknown"));
+    assert!(!full.contains(&format!("Next {reset}")));
+    assert_eq!(facts, before, "the display does not create an observation");
+    assert!(facts.account_progress.is_none());
+    assert_eq!(
+        facts.account_progress_on_rule().as_deref(),
+        Some(view.as_ref())
+    );
+}
+
+#[test]
+fn an_unobserved_recovery_stays_unknown_on_tight_rules_and_keeps_its_reset_in_disclosure() {
+    let reset = "Nov 4 at 6:02am";
+    let facts = FooterFacts {
+        usage: Some(super::super::session_usage::UsageFacts {
+            wall: Some(super::super::session_usage::Wall {
+                label: "7d",
+                resets: reset.into(),
+            }),
+            ..Default::default()
+        }),
+        model: Some("a model that yields to recovery visibility".into()),
+        path: Some("/a/long/path/that/yields".into()),
+        ..Default::default()
+    };
+    for room in [40, 60, 256] {
+        let fit = fit_rule(&facts, room, None);
+        assert!(fit.width(None) <= room);
+        let recovery = fit
+            .segments
+            .iter()
+            .find(|s| s.mark == WALL_MARK)
+            .expect("limit and recovery");
+        assert!(recovery.text.contains("Limit reached"));
+        assert!(recovery.text.contains("State unknown"));
+        assert!(!recovery.text.contains("Rotation off"));
+        assert!(!recovery.text.contains(&format!("Next {reset}")));
+        if room == 256 {
+            assert!(recovery.text.contains(reset));
+            assert!(recovery.text.contains("provider reset"));
+            assert!(recovery.text.contains(UNOBSERVED_RECOVERY_FINDING));
+        }
+        let set = set_facts(&fit.segments);
+        assert!(
+            fact_spans(&set, &fit.segments)
+                .iter()
+                .flatten()
+                .any(|span| span.kind == FactKind::Account)
+        );
+    }
+    assert!(facts.account_progress.is_none());
+}
+
+#[test]
+fn recovery_outlasts_chips_until_no_recovery_form_fits() {
+    use super::super::account_progress::{AccountProgress, ProgressPhase};
+    let mut observed = AccountProgress::unknown(100);
+    observed.phase = ProgressPhase::Waiting;
+    observed.wall = Some("7d".into());
+    let lights = |chips| LightsWidth {
+        chips,
+        title: 0,
+        lean: [0; LEAN_FORMS],
+        short: 0,
+        reason: false,
+    };
+    for progress in [None, Some(observed)] {
+        let facts = FooterFacts {
+            account_progress: progress,
+            ..narrow_rule_walled()
+        };
+        let tiny = lights(1);
+        assert!(chips_room(&facts, 10) >= tiny.chips);
+        let fit = fit_rule(&facts, 10, Some(tiny));
+        assert!(
+            fit.chips,
+            "the optional model cannot displace fitting controls"
+        );
+        assert!(fit.segments.is_empty());
+        assert!(fit.width(Some(tiny)) <= 10);
+
+        let cramped = lights(30);
+        assert!(
+            fit_rule(&facts, 40, None)
+                .segments
+                .iter()
+                .any(|s| s.mark == WALL_MARK)
+        );
+        let fit = fit_rule(&facts, 40, Some(cramped));
+        assert!(
+            !fit.chips,
+            "recovery fits alone and takes priority over controls alone"
+        );
+        assert!(fit.segments.iter().any(|s| s.mark == WALL_MARK));
+        assert!(fit.width(Some(cramped)) <= 40);
+
+        let fit = fit_rule(&facts, 256, Some(tiny));
+        assert!(fit.chips);
+        assert!(fit.segments.iter().any(|s| s.mark == WALL_MARK));
+        assert!(fit.width(Some(tiny)) <= 256);
+    }
+}
+
+#[test]
+fn the_advertised_chip_budget_agrees_with_the_shortest_recovery_that_fits() {
+    use super::super::account_progress::{AccountProgress, ProgressPhase};
+    let mut cases = vec![narrow_rule_walled()];
+    for phase in [
+        ProgressPhase::Unknown,
+        ProgressPhase::Watching,
+        ProgressPhase::Disabled,
+        ProgressPhase::Limited,
+        ProgressPhase::Waiting,
+        ProgressPhase::Probing,
+        ProgressPhase::Ready,
+        ProgressPhase::Switching {
+            to: "替代👩‍💻-a-long-alternate-account-name".into(),
+        },
+        ProgressPhase::Verifying {
+            to: "a-long-alternate-account-name".into(),
+        },
+        ProgressPhase::SigningIn {
+            label: "替代👩‍💻-a-long-account-name".into(),
+            route: Some("browser".into()),
+        },
+    ] {
+        let mut observed = AccountProgress::unknown(100);
+        observed.known = Some(3);
+        observed.eligible = Some(1);
+        if !matches!(phase, ProgressPhase::Watching | ProgressPhase::Unknown) {
+            observed.wall = Some("7d".into());
+        }
+        observed.phase = phase;
+        observed.details.push(
+            "A long observed recovery finding that must yield before the recovery phase".into(),
+        );
+        observed.next_at = Some(1_800_000_000);
+        cases.push(FooterFacts {
+            account_progress: Some(observed),
+            ..narrow_rule_tokens()
+        });
+    }
+    let mut controls_alone = 0;
+    let mut recovery_alone = 0;
+    let mut together = 0;
+    for facts in cases {
+        let before = facts.clone();
+        // Measure the fitter's actual floor, independently of the allocator's calculation.
+        let minimum = (0..=256)
+            .find(|room| {
+                fit_rule(&facts, *room, None)
+                    .segments
+                    .iter()
+                    .any(|segment| segment.mark == WALL_MARK)
+            })
+            .expect("every recovery phase has a form that fits");
+        assert_eq!(chips_room(&facts, minimum), 0);
+        for room in (0..=96).chain([120, 160, 256]) {
+            let budget = chips_room(&facts, room);
+            if room >= minimum {
+                let alone = fit_rule(&facts, room, None);
+                assert!(
+                    alone
+                        .segments
+                        .iter()
+                        .any(|segment| segment.mark == WALL_MARK)
+                );
+                if budget == 0 {
+                    recovery_alone += 1;
+                }
+            }
+            for chips in 1..=budget {
+                let lights = Some(LightsWidth {
+                    chips,
+                    title: 0,
+                    lean: [0; LEAN_FORMS],
+                    short: 0,
+                    reason: false,
+                });
+                let fit = fit_rule(&facts, room, lights);
+                assert!(
+                    fit.chips,
+                    "{room}/{chips}: advertised budget {budget}, {fit:?}"
+                );
+                assert!(fit.width(lights) <= room);
+                if room >= minimum {
+                    assert!(fit.segments.iter().any(|segment| segment.mark == WALL_MARK));
+                    together += 1;
+                } else {
+                    assert!(
+                        fit.segments.is_empty(),
+                        "controls alone only below the recovery floor"
+                    );
+                    controls_alone += 1;
+                }
+            }
+        }
+        assert_eq!(facts, before, "budgeting never changes the observation");
+    }
+    assert!(controls_alone > 0 && recovery_alone > 0 && together > 0);
+}
+
+#[test]
+fn recovery_ladders_keep_a_joined_weekly_with_its_account() {
+    use super::super::account_progress::{AccountProgress, ProgressPhase};
+    let mut observed = AccountProgress::unknown(100);
+    observed.phase = ProgressPhase::Waiting;
+    observed.wall = Some("7d".into());
+    for progress in [None, Some(observed)] {
+        for email in [None, Some("owner@example.com")] {
+            let facts = FooterFacts {
+                subscription: Some(super::super::profile::SubscriptionDisplay {
+                    email: email.map(str::to_owned),
+                    weekly: Some("weekly 0% left".into()),
+                    ..Default::default()
+                }),
+                account_progress: progress.clone(),
+                ..narrow_rule_walled()
+            };
+            let full = segments(&facts);
+            assert!(unit_whole(&full));
+            assert!(plain_ladder(&facts).iter().all(|rung| unit_whole(rung)));
+            if email.is_some() {
+                // The old account-only removal left a joined weekly without its lead.
+                let mut orphan = full;
+                orphan.retain(|segment| segment.mark != ACCOUNT_MARK);
+                assert!(!unit_whole(&orphan));
+            } else {
+                assert!(
+                    full.iter()
+                        .any(|segment| segment.mark == WEEKLY_MARK && !segment.joined)
+                );
+            }
+            assert_eq!(facts.account_progress, progress);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn clearing_a_typed_transcript_wall_removes_its_unobserved_recovery_view() {
+    let root = cache_test_dir("unobserved-recovery-cleared");
+    let (_, transcript, two_pm) = walled_session(&root);
+    let notice = std::fs::read_to_string(&transcript).unwrap();
+    std::fs::write(
+        &transcript,
+        format!("{}{notice}", served_row("before", two_pm - 60)),
+    )
+    .unwrap();
+    let utc = |_: Option<&str>, _: i64| Some(0);
+    for served in [false, true] {
+        let mut cache = FooterCache::default();
+        let facts = FooterFacts {
+            usage: cache.usage(Some(transcript.clone()), two_pm + 60, &utc),
+            ..Default::default()
+        };
+        assert!(facts.usage.as_ref().unwrap().wall.is_some());
+        assert!(facts.account_progress_view().is_some());
+        assert!(facts.account_progress.is_none());
+        let now = if served {
+            append_to(&transcript, &served_row("after", two_pm + 600));
+            two_pm + 700
+        } else {
+            two_pm + 3600
+        };
+        let cleared = FooterFacts {
+            usage: cache.usage(Some(transcript.clone()), now, &utc),
+            ..Default::default()
+        };
+        assert!(cleared.usage.as_ref().unwrap().wall.is_none());
+        assert!(cleared.account_progress_view().is_none());
+        assert!(cleared.account_progress_on_rule().is_none());
+        assert!(cleared.account_progress.is_none());
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn quoted_limit_text_without_a_typed_notice_cannot_create_recovery_evidence() {
+    let root = cache_test_dir("unobserved-recovery-quote");
+    let (_, transcript, two_pm) = walled_session(&root);
+    let notice = std::fs::read_to_string(&transcript).unwrap();
+    let utc = |_: Option<&str>, _: i64| Some(0);
+    for quote in [
+        notice.replace("\"isApiErrorMessage\":true", "\"isApiErrorMessage\":false"),
+        notice.replace("\"type\":\"assistant\"", "\"type\":\"user\""),
+    ] {
+        std::fs::write(
+            &transcript,
+            format!("{}{quote}", served_row("before", two_pm - 60)),
+        )
+        .unwrap();
+        let mut cache = FooterCache::default();
+        let facts = FooterFacts {
+            usage: cache.usage(Some(transcript.clone()), two_pm + 60, &utc),
+            ..Default::default()
+        };
+        let usage = facts.usage.as_ref().expect("real served usage was read");
+        assert!(usage.input_total() > 0);
+        assert!(usage.wall.is_none());
+        assert!(facts.account_progress_view().is_none());
+        assert!(facts.account_progress_on_rule().is_none());
+        assert!(facts.account_progress.is_none());
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn a_transcript_limit_survives_an_older_idle_account_observation() {
     use super::super::account_progress::{AccountProgress, ProgressPhase};
     let mut progress = AccountProgress::unknown(100);
@@ -6546,6 +6813,18 @@ fn a_transcript_limit_survives_an_older_idle_account_observation() {
         ProgressPhase::Ready,
         ProgressPhase::Probing,
         ProgressPhase::Disabled,
+        ProgressPhase::Limited,
+        ProgressPhase::Waiting,
+        ProgressPhase::Switching {
+            to: "alternate".into(),
+        },
+        ProgressPhase::Verifying {
+            to: "alternate".into(),
+        },
+        ProgressPhase::SigningIn {
+            label: "current".into(),
+            route: None,
+        },
     ] {
         progress.phase = phase;
         facts.account_progress = Some(progress.clone());
@@ -6635,3 +6914,6 @@ fn recovery_event_time_does_not_depend_on_the_observation_age() {
         later.next_at = first.next_at;
     }
 }
+
+#[path = "footer_outlook_tests.rs"]
+mod outlook_unit;

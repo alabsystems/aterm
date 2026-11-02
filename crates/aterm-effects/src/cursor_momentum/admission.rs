@@ -291,7 +291,7 @@ pub const fn admit_tick(
         };
         Ok(ScratchBudget { out, under: 0 })
     } else {
-        let Some(under) = light_halo_budget((cr, cc), geom, &grid, r) else {
+        let Some(under) = light_halo_budget((cr, cc), cfg.bar, geom, &grid, r) else {
             return Err(unbounded);
         };
         Ok(ScratchBudget { out: 0, under })
@@ -492,12 +492,13 @@ const fn dark_halo_budget(
 #[inline]
 const fn light_halo_budget(
     (cr, cc): (u16, u16),
+    bar: bool,
     geom: &Geom,
     g: &Grid,
     radius: f32,
 ) -> Option<usize> {
     let cw = geom.cw as f32;
-    let (cx, _) = geom.cell_center(cr, cc);
+    let (cx, _) = crate::cursor_momentum::seat_at(geom, (cr, cc), bar);
     let rx_full = cw * (0.55 + radius * WIDEST);
     let x_first = cx - rx_full;
     let x_last = cx + rx_full;

@@ -823,21 +823,21 @@ impl TrickListener {
             None => true,
             Some(c) => c.is_whitespace(),
         };
-        let mut plain_token = self.line.token_is_live();
+        let mut plain_token = after_space && self.line.token_is_live();
         if plain_token {
             let s = self.line.token.as_str();
             if s.is_ascii() {
                 plain_token = s.bytes().all(|b| b.is_ascii_alphanumeric());
             } else {
                 for c in s.chars() {
-                    if !(c.is_ascii_alphanumeric() || (!c.is_ascii() && c.is_alphanumeric())) {
+                    if !c.is_alphanumeric() {
                         plain_token = false;
                         break;
                     }
                 }
             }
         }
-        let out = if after_space && plain_token {
+        let out = if plain_token {
             self.line.line_chars = self.line.line_chars.saturating_sub(self.line.token_chars);
             self.line.token.clear();
             self.line.token_chars = 0;

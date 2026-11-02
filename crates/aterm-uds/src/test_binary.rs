@@ -183,7 +183,10 @@ fn sweep(roots: &Path) {
 /// The owner pid in a root's name: the pid, then `-` and the stamp.
 #[cfg(debug_assertions)]
 fn owner_pid(name: &str) -> Option<u32> {
-    name.split_once('-')?.0.parse().ok()
+    let (pid, _stamp) = name.split_once('-')?;
+    (!pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| pid.parse().ok())
+        .flatten()
 }
 
 /// Run [`sweep`] over `roots` inside `exit(3)`.
@@ -296,11 +299,13 @@ mod tests {
         let dead = dir("0-1".to_owned());
         let mine = dir(format!("{me}-1"));
         let live = dir(format!("{parent}-1"));
+        let signed = dir("+0-1".to_owned());
         let other = dir("x".to_owned());
         sweep(temp);
         assert!(!dead.exists(), "a dead process's root goes");
         assert!(!mine.exists(), "an earlier root of this pid goes");
         assert!(live.exists(), "a live process's root stays");
+        assert!(signed.exists(), "a signed prefix is no root");
         assert!(other.exists(), "a name that is no root stays");
     }
 

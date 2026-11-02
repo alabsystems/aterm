@@ -253,6 +253,7 @@ fn wait_words(w: &Wait) -> String {
             |p| format!("a full pipe to pid {p}"),
         ),
         WaitName::ProgramCheck => "macOS's program check".to_owned(),
+        WaitName::Memory => "its memory claim".to_owned(),
         WaitName::Kernel => "an uninterruptible kernel wait".to_owned(),
         WaitName::EventLoop => "an event loop, nothing pending".to_owned(),
         WaitName::Unnamed => "a wait not named".to_owned(),
@@ -291,6 +292,11 @@ pub fn person_name(s: &str) -> String {
     } else {
         kept.to_owned()
     }
+}
+
+/// A fact's word: `yes` or `no`.
+const fn yes_no(b: bool) -> &'static str {
+    if b { "yes" } else { "no" }
 }
 
 /// Unicode format characters that change how text around them is shown.
@@ -360,6 +366,16 @@ impl Findings {
                     n.for_ms
                 ));
             }
+        }
+        for s in &self.stopped_unstarted {
+            out.push(format!(
+                "finding kind=stopped-unstarted pid={} exe={} stopped={} traced={} for_ms={}",
+                s.named.pid,
+                exe_word(&s.named.name),
+                yes_no(s.stopped),
+                yes_no(s.traced),
+                s.named.for_ms
+            ));
         }
         for n in &self.probably_program_check {
             out.push(format!(

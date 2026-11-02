@@ -87,6 +87,19 @@ fn a_tight_pool_is_read_more_often_and_a_passed_refill_at_once() {
         !r.fresh(reset + RESET_SETTLE_S, 0.1),
         "past the spent limit's refill"
     );
+    let low_store = Store::new(dir.path(), "low-refill");
+    let reset_5h = aterm_types::rfc3339::parse_utc_fractional("2026-10-24T05:49:13Z").unwrap();
+    let low_agy = Recorded::new(Ok(doc(0.9, 0.9, 0.05)));
+    current(&low_store, &low_agy, reset_5h - 30, 0.1, false).unwrap();
+    let low_r = low_store.last().unwrap();
+    assert!(
+        low_r.fresh(reset_5h + RESET_SETTLE_S - 1, 0.1),
+        "still fresh inside FRESH_TIGHT_S before the low bucket's refill settles"
+    );
+    assert!(
+        !low_r.fresh(reset_5h + RESET_SETTLE_S, 0.1),
+        "a low bucket's settled refill expires the reading before FRESH_TIGHT_S"
+    );
 }
 
 #[test]
@@ -321,6 +334,194 @@ fn a_launch_rotates_off_the_spent_pool_on_the_kept_reading() {
         shown.quota, reading.quota,
         "the old reading remains available for display"
     );
+
+    // When one pool's 5h bucket settles while another pool's weekly bucket is still spent for days,
+    // a stale launch pick still rotates off the weekly-spent pool onto the open pool.
+    let partial_store = Store::new(dir.path(), "partial-stale");
+    let partial = Recorded::new(Ok(doc(0.0, 0.9, 0.0)));
+    let _ = current(&partial_store, &partial, NOW, r.low, false).unwrap();
+    let stale_rot = rotate_launch(asked, &partial_store, &mute, &r, settled)
+        .expect("weekly-spent pool still rotates to the pool whose 5h refill settled");
+    assert_eq!(stale_rot.got, Got::Stale);
+    assert_eq!(
+        stale_rot.pick,
+        agy_quota::Pick::Rotate {
+            from: "gemini-4-argon-high".to_owned(),
+            from_standing: Standing::Spent,
+            to: "claude-opus-5-5-medium".to_owned(),
+            to_standing: Standing::Open,
+        }
+    );
+    assert_eq!(
+        rotate_launch(
+            Some("claude-opus-5-5-medium"),
+            &partial_store,
+            &mute,
+            &r,
+            settled
+        ),
+        None,
+        "when the asked model's pool settled on a stale reading, launch passes through without claiming fresh standing"
+    );
+
+    let wall_store = Store::new(dir.path(), "wall");
+    let open = Recorded::new(Ok(doc(0.95, 0.95, 0.95)));
+    let _ = rotate_launch_at(
+        Some("claude-opus-5-5-medium"),
+        &wall_store,
+        &open,
+        &r,
+        NOW,
+        false,
+    )
+    .unwrap();
+    let exhausted = Recorded::new(Ok(doc(0.95, 0.05, 0.05)));
+    let kept = rotate_launch_at(
+        Some("claude-opus-5-5-medium"),
+        &wall_store,
+        &exhausted,
+        &r,
+        NOW + WALL_FORCE_FLOOR_S - 1,
+        true,
+    )
+    .unwrap();
+    assert_eq!(
+        (kept.got, exhausted.reads.get()),
+        (Got::Kept, 0),
+        "inside WALL_FORCE_FLOOR_S the kept reading is used"
+    );
+    let refreshed = rotate_launch_at(
+        Some("claude-opus-5-5-medium"),
+        &wall_store,
+        &exhausted,
+        &r,
+        NOW + WALL_FORCE_FLOOR_S,
+        true,
+    )
+    .unwrap();
+    assert_eq!((refreshed.got, exhausted.reads.get()), (Got::Read, 1));
+    assert_eq!(refreshed.pick.model(), Some("gemini-4-argon-high"));
+
+    // An unnamed session (`asked = None`) whose default model changed via `/model` inside
+    // `FRESH_OPEN_S` refreshes `default_model()` when `at_wall` forces a fresh reading.
+    let switch_store = Store::new(dir.path(), "switch");
+    let before_switch = Recorded {
+        default: Some("gemini-4-argon-high"),
+        ..Recorded::new(Ok(doc(0.95, 0.95, 0.95)))
+    };
+    let start_pick = rotate_launch(None, &switch_store, &before_switch, &r, NOW).unwrap();
+    assert_eq!(start_pick.pick.model(), Some("gemini-4-argon-high"));
+    let after_switch = Recorded {
+        default: Some("claude-opus-5-5-medium"),
+        ..Recorded::new(Ok(doc(0.95, 0.95, 0.0)))
+    };
+    let wall_switched = rotate_launch_at(
+        None,
+        &switch_store,
+        &after_switch,
+        &r,
+        NOW + WALL_FORCE_FLOOR_S,
+        true,
+    )
+    .unwrap();
+    assert_eq!(wall_switched.got, Got::Read);
+    assert_eq!(
+        wall_switched.pick,
+        agy_quota::Pick::Rotate {
+            from: "claude-opus-5-5-medium".to_owned(),
+            from_standing: Standing::Spent,
+            to: "gemini-4-argon-high".to_owned(),
+            to_standing: Standing::Open,
+        }
+    );
+
+    // A spent bucket whose reset_at (NOW + 19_800) is crossed < WALL_FORCE_FLOOR_S after a
+    // pre-refill reading (NOW + 19_790) still forces a fresh read at the wall once `now >= reset_at`.
+    let cross_store = Store::new(dir.path(), "cross");
+    let pre_refill = Recorded::new(Ok(doc(0.0, 0.0, 0.0)));
+    let _ = rotate_launch_at(
+        Some("claude-opus-5-5-medium"),
+        &cross_store,
+        &pre_refill,
+        &r,
+        NOW + 19_790,
+        true,
+    )
+    .unwrap();
+    assert_eq!(
+        rotate_launch_at(
+            Some("claude-opus-5-5-medium"),
+            &cross_store,
+            &mute,
+            &r,
+            NOW + 19_805,
+            true,
+        ),
+        None,
+        "a failed refresh after crossing reset_at at a wall refuses the pre-refill reading"
+    );
+    let _ = std::fs::remove_file(cross_store.failed_path());
+    let post_refill = Recorded::new(Ok(doc(0.0, 1.0, 1.0)));
+    let crossed = rotate_launch_at(
+        Some("claude-opus-5-5-medium"),
+        &cross_store,
+        &post_refill,
+        &r,
+        NOW + 19_805,
+        true,
+    )
+    .unwrap();
+    assert_eq!((crossed.got, post_refill.reads.get()), (Got::Read, 1));
+    assert!(matches!(crossed.pick, agy_quota::Pick::Keep { .. }));
+
+    // `launch_opening` reads the kept reading without asking agy: `Some(until)` while every pool
+    // is spent and `until > now` (even after `FRESH_OPEN_S` using `last_default`), and `None` once
+    // `now >= until`, rotation is off, or a pool opens.
+    let hold_store = Store::new(dir.path(), "hold");
+    let hold_agy = Recorded {
+        default: Some("gemini-4-argon-high"),
+        ..Recorded::new(Ok(doc(0.0, 0.8, 0.0)))
+    };
+    let reset_5h = aterm_types::rfc3339::parse_utc_fractional("2026-10-24T05:49:13Z").unwrap();
+    let initial = rotate_launch(None, &hold_store, &hold_agy, &r, NOW).unwrap();
+    assert_eq!(
+        initial.pick,
+        agy_quota::Pick::Wait {
+            model: "gemini-4-argon-high".to_owned(),
+            until: Some(reset_5h),
+        }
+    );
+    assert_eq!(
+        launch_opening(None, &hold_store, &r, NOW + FRESH_OPEN_S + 60),
+        Some(reset_5h),
+        "held past FRESH_OPEN_S still knows the default model and earliest refill"
+    );
+    assert_eq!(launch_opening(None, &hold_store, &off, NOW), None);
+    assert_eq!(
+        launch_opening(None, &hold_store, &r, reset_5h),
+        None,
+        "once `now >= until` the hold ends so the next attempt reads fresh usage"
+    );
+    // If the fresh read at `reset_5h` still sees the pre-refill zero before the server settles,
+    // `launch_opening` holds until `reset_5h + RESET_SETTLE_S`, then releases at the settle point.
+    let lagging = rotate_launch(None, &hold_store, &hold_agy, &r, reset_5h).unwrap();
+    assert_eq!(lagging.got, Got::Read);
+    assert_eq!(
+        launch_opening(None, &hold_store, &r, reset_5h),
+        Some(reset_5h + RESET_SETTLE_S)
+    );
+    assert_eq!(
+        launch_opening(None, &hold_store, &r, reset_5h + RESET_SETTLE_S),
+        None
+    );
+    let refilled = Recorded {
+        default: Some("gemini-4-argon-high"),
+        ..Recorded::new(Ok(doc(0.0, 0.8, 1.0)))
+    };
+    let resumed =
+        rotate_launch(None, &hold_store, &refilled, &r, reset_5h + RESET_SETTLE_S).unwrap();
+    assert_eq!((resumed.got, refilled.reads.get()), (Got::Read, 1));
+    assert_eq!(resumed.pick.model(), Some("claude-opus-5-5-medium"));
 }
 
 #[test]
@@ -331,6 +532,12 @@ fn the_model_document_names_agys_default() {
         "claude-opus-5-5-medium"
     );
     assert!(agy_quota::parse_model(r#"{"command":{"name":"usage","data":{}}}"#).is_err());
+    assert!(
+        agy_quota::parse_model(
+            r#"{"status":"ERROR","response":"not signed in","command":{"name":"model","data":{"id":"claude-opus-5-5-medium"}}}"#
+        )
+        .is_err()
+    );
 }
 
 #[cfg(unix)]
@@ -364,4 +571,36 @@ fn store_rejects_fifos_and_replaces_them_atomically() {
     let (r, got) = current(&store, &agy, NOW, 0.1, false).unwrap();
     assert_eq!((got, r.as_of), (Got::Read, NOW));
     assert_eq!(store.history().len(), 1);
+    assert!(!r.fresh(i64::MAX, 0.1));
+    assert_eq!(
+        burn(
+            &[
+                Sample {
+                    at: i64::MIN,
+                    buckets: vec![(
+                        "gemini-weekly".to_owned(),
+                        Point {
+                            left: Some(0.9),
+                            reset: None,
+                            off: false,
+                        },
+                    )],
+                },
+                Sample {
+                    at: i64::MAX,
+                    buckets: vec![(
+                        "gemini-weekly".to_owned(),
+                        Point {
+                            left: Some(0.5),
+                            reset: None,
+                            off: false,
+                        },
+                    )],
+                },
+            ],
+            "gemini-weekly"
+        ),
+        None,
+        "extreme sample timestamps must not overflow i64 subtraction"
+    );
 }

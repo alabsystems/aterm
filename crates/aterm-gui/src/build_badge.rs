@@ -32,17 +32,20 @@ pub(crate) fn fingerprint(enabled: bool) -> u64 {
     h.finish() | 1
 }
 
-/// Builds the top-right badge tray and its bounding card.
+/// Builds the top-right badge tray and its bounding card. Its type floor, corner radius cap and
+/// border are points, scaled by [`SettingsGeom::px_per_pt`], so a Retina badge is the 1x badge at
+/// twice the pixels.
 pub(crate) fn badge_tray(
     g: &SettingsGeom,
     theme: impl Into<crate::chrome_band::ChromePalette>,
 ) -> TrayInput {
     let r = Roles::from_theme(theme);
     let (cw, ch, px) = (g.cw, g.ch, g.font_px);
+    let pt = g.px_per_pt;
     let tray_w = g.cols as f32 * cw;
 
     let text = badge_text();
-    let size = TypeStep::Caption.px_clamped(px, 9.0, f32::INFINITY);
+    let size = TypeStep::Caption.px_clamped(px, 9.0 * pt, f32::INFINITY);
     let tw = text_w(&text, size.get());
 
     let pad_x = 0.55 * cw;
@@ -53,7 +56,7 @@ pub(crate) fn badge_tray(
     let margin_t = 0.28 * ch;
     let x = (tray_w - pill_w - margin_r).max(0.0);
     let y = margin_t;
-    let radius = (pill_h * 0.5).min(11.0);
+    let radius = (pill_h * 0.5).min(11.0 * pt);
 
     let prims: Vec<DrawPrim> = vec![
         DrawPrim::Panel {
@@ -70,7 +73,7 @@ pub(crate) fn badge_tray(
             w: pill_w,
             h: pill_h,
             radius,
-            width: 1.0,
+            width: pt,
             color: rgba(r.separator, 0x80),
         },
         text_prim(
@@ -103,6 +106,34 @@ mod tests {
             panel_rows: 40,
             px_per_pt: 1.0,
         }
+    }
+
+    /// At 2 device pixels per point the badge is the 1x badge at twice the pixels: its type floor,
+    /// radius cap and border are points. A 10 px font puts the caption under its 9-point floor
+    /// and a 32 px cell rounds the pill past its 11-point cap, so both bind (§14.16).
+    #[test]
+    fn the_badge_wears_its_type_floor_radius_and_border_in_points() {
+        let at = |k: f32| SettingsGeom {
+            cw: 9.0 * k,
+            ch: 32.0 * k,
+            font_px: 10.0 * k,
+            cols: 120,
+            panel_rows: 40,
+            px_per_pt: k,
+        };
+        let one = badge_tray(&at(1.0), Theme::default()).prims;
+        let two = badge_tray(&at(2.0), Theme::default()).prims;
+        let DrawPrim::Stroke { radius, .. } = one[1] else {
+            panic!("the pill's border: {:?}", one[1]);
+        };
+        assert_eq!(radius, 11.0, "the 1x radius is at its cap");
+        let DrawPrim::Text { px, .. } = one[2] else {
+            panic!("the caption: {:?}", one[2]);
+        };
+        assert_eq!(px, 9.0, "the 1x caption is at its floor");
+        // The pill's left edge and width follow the caption's measured advance.
+        let measured = [("panel", 0), ("panel", 2), ("stroke", 0), ("stroke", 2)];
+        crate::palette::assert_drawn_at_scale(&one, &two, 2.0, &measured, "badge");
     }
 
     #[test]

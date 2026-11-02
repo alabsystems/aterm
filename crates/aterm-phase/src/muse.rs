@@ -13,7 +13,7 @@ use crate::wall::{ApiCause, Placement, Wall, WallKind};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 6, "0.6");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 7, "0.7");
 
 #[derive(Debug, Clone, Copy)]
 struct Frame {
@@ -460,10 +460,18 @@ fn ended_rows(rows: &[String]) -> Option<(usize, usize)> {
 }
 
 fn block_lines(rows: &[String], head: usize, last: usize) -> Vec<&str> {
+    block_rows(rows, head, last)
+        .into_iter()
+        .map(|(_, t)| t)
+        .collect()
+}
+
+/// [`block_lines`], each with its row.
+fn block_rows(rows: &[String], head: usize, last: usize) -> Vec<(usize, &str)> {
     let first = rows[head].strip_prefix('◆').unwrap_or(&rows[head]);
-    std::iter::once(crate::text::trim(first))
-        .chain(rows[head + 1..=last].iter().map(|r| crate::text::trim(r)))
-        .filter(|t| !t.is_empty())
+    std::iter::once((head, crate::text::trim(first)))
+        .chain((head + 1..=last).map(|i| (i, crate::text::trim(&rows[i]))))
+        .filter(|(_, t)| !t.is_empty())
         .collect()
 }
 
@@ -625,6 +633,21 @@ fn turn_phase(rows: &[String]) -> (Phase, bool) {
 #[must_use]
 pub fn fresh(rows: &[String]) -> bool {
     open_frame(rows).is_some_and(|f| turn(rows, f.top) == Turn::Fresh)
+}
+
+/// Returns whether `rows` show a session's opening exchange whole: its banner, then one user
+/// message ([`crate::ScreenReader::opening`]).
+#[must_use]
+pub fn opening(rows: &[String]) -> bool {
+    open_frame(rows).is_some_and(|f| {
+        scope(rows, f.top).0.is_some_and(|banner| {
+            rows[banner + 1..f.top]
+                .iter()
+                .filter(|r| r.starts_with('❯'))
+                .count()
+                == 1
+        })
+    })
 }
 
 /// Returns whether a user message or turn reply is visible on `rows`.
@@ -807,6 +830,19 @@ pub fn said_tail(rows: &[String]) -> Option<String> {
     Some(lines.join("\n"))
 }
 
+/// [`said_tail`], each line Muse Code wrapped across rows read as one ([`crate::wrap::said_lines`]).
+#[must_use]
+pub fn said_lines(rows: &[String], apart: crate::reader::Apart) -> Option<String> {
+    said_tail(rows)?;
+    let (head, last) = ended_rows(rows)?;
+    Some(crate::wrap::said_lines(
+        rows,
+        &block_rows(rows, head, last),
+        0,
+        apart,
+    ))
+}
+
 /// Returns whether the reply from [`said_tail`] has its opening `◆` header visible on `rows`.
 #[must_use]
 pub fn said_whole(rows: &[String]) -> bool {
@@ -817,7 +853,14 @@ pub fn said_whole(rows: &[String]) -> bool {
 /// Extracts earlier `◆` replies belonging to the same turn as [`said_tail`].
 #[must_use]
 pub fn turn_said_before(rows: &[String]) -> Option<String> {
-    let (_, said) = turn_before(rows)?;
+    let (_, said) = turn_before(rows, crate::wrap::said_rows)?;
+    (!said.is_empty()).then(|| said.join("\n\n"))
+}
+
+/// [`turn_said_before`], its lines read as [`said_lines`] reads them.
+#[must_use]
+pub fn turn_lines_before(rows: &[String], apart: crate::reader::Apart) -> Option<String> {
+    let (_, said) = turn_before(rows, |said| crate::wrap::said_lines(rows, said, 0, apart))?;
     (!said.is_empty()).then(|| said.join("\n\n"))
 }
 
@@ -825,7 +868,7 @@ pub fn turn_said_before(rows: &[String]) -> Option<String> {
 /// fits on `rows`.
 #[must_use]
 pub fn turn_whole(rows: &[String]) -> bool {
-    turn_before(rows).is_some_and(|(opened, _)| opened)
+    turn_before(rows, crate::wrap::said_rows).is_some_and(|(opened, _)| opened)
 }
 
 /// Returns whether the last turn ran a tool: a tool row of Muse Code's ([`tool_row`], [`ran_row`]) under the `❯` message that opened it.
@@ -909,7 +952,10 @@ pub fn turn_opened_by(rows: &[String]) -> Option<String> {
     Some(text.join(" "))
 }
 
-fn turn_before(rows: &[String]) -> Option<(bool, Vec<String>)> {
+fn turn_before(
+    rows: &[String],
+    read: impl Fn(&[(usize, &str)]) -> String,
+) -> Option<(bool, Vec<String>)> {
     if !said_whole(rows) {
         return None;
     }
@@ -926,14 +972,15 @@ fn turn_before(rows: &[String]) -> Option<(bool, Vec<String>)> {
             .find(|&k| leading_spaces(&rows[k]) == 0 && !blank(&rows[k]))
             .unwrap_or(head);
         let first = rows[h].strip_prefix('◆').unwrap_or(&rows[h]);
-        let lines: Vec<&str> = std::iter::once(crate::text::trim(first))
+        let texts: Vec<(usize, &str)> = std::iter::once((h, crate::text::trim(first)))
             .chain(
                 (h + 1..end)
                     .filter(|&k| !is_view_hint(rows, k) && !in_abnormal_end(rows, k))
-                    .map(|k| crate::text::trim(&rows[k])),
+                    .map(|k| (k, crate::text::trim(&rows[k]))),
             )
-            .filter(|t| !t.is_empty())
+            .filter(|(_, t)| !t.is_empty())
             .collect();
+        let lines: Vec<&str> = texts.iter().map(|&(_, t)| t).collect();
         let Some(&top) = lines.first() else {
             continue;
         };
@@ -945,7 +992,7 @@ fn turn_before(rows: &[String]) -> Option<(bool, Vec<String>)> {
         {
             continue;
         }
-        said.push(lines.join("\n"));
+        said.push(read(&texts));
     }
     Some((user.is_some(), said))
 }
@@ -1051,7 +1098,7 @@ fn wall_of(message: &str) -> Option<(WallKind, Option<String>)> {
         let (_, tail) = rest.split_once(const { crate::anchor!("muse.wall.usage.more") })?;
         let reset = tail
             .split_once(const { crate::anchor!("muse.wall.usage.reset") })
-            .map(|(_, at)| crate::text::trim(at).trim_end_matches('.').to_string())
+            .map(|(_, at)| through_clock(crate::text::trim(at).trim_end_matches('.')).to_string())
             .filter(|at| !at.is_empty());
         return Some((WallKind::UsageSession, reset));
     }
@@ -1066,19 +1113,34 @@ fn wall_of(message: &str) -> Option<(WallKind, Option<String>)> {
             .filter(|at| !at.is_empty());
         return Some((WallKind::UsageSession, reset));
     }
-    let rest = message.strip_prefix(const { crate::anchor!("muse.wall.model_failed") })?;
+    let rest = message
+        .strip_prefix(const { crate::anchor!("muse.wall.model_failed") })
+        .or_else(|| {
+            // Its own tries spent (1.4.13): `model failed after 10 attempts: …`.
+            let after =
+                message.strip_prefix(const { crate::anchor!("muse.wall.model_failed_after") })?;
+            let (n, rest) = after.split_once(' ')?;
+            n.parse::<u32>().ok()?;
+            rest.strip_prefix(const { crate::anchor!("muse.wall.model_failed_attempts") })
+        })?;
     let code = rest
         .strip_prefix(const { crate::anchor!("muse.wall.api_error") })
         .and_then(|r| r.get(..4))
         .and_then(|c| c.strip_suffix(':'))
+        .filter(|c| !c.is_empty() && c.bytes().all(|b| b.is_ascii_digit()))
         .and_then(|c| c.parse::<u16>().ok());
     // The API's usage limit with no reset: the usage wall, not an error time answers.
     if code == Some(429) && rest.contains(const { crate::anchor!("muse.wall.usage_limit_reached") })
     {
         return Some((WallKind::UsageSession, None));
     }
+    let lower = rest.to_lowercase();
+    // A transport error is the connection's, never the API's answer: the host dropped or
+    // unreachable (v6 §14.17.5's network outage).
     let unreachable = code.is_none()
-        && (crate::wall::is_unreachable(rest) || rest.to_lowercase().contains("fetch failed"));
+        && (crate::wall::is_unreachable(rest)
+            || lower.contains("fetch failed")
+            || lower.starts_with(const { crate::anchor!("muse.wall.transport_error") }));
     Some((
         WallKind::ApiError {
             code,
@@ -1164,15 +1226,21 @@ pub fn retrying(rows: &[String]) -> Option<Retry> {
     let (reason, tail) = rest.split_once(const { crate::anchor!("muse.retry.in") })?;
     let (wait, attempt) = tail.split_once(const { crate::anchor!("muse.retry.attempt") })?;
     let (k, n) = attempt.split_once('/')?;
+    let uint = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     let code = reason
         .rsplit_once("(HTTP ")
         .and_then(|(_, c)| c.strip_suffix(')'))
+        .filter(|s| uint(s))
         .and_then(|c| c.parse().ok());
+    let n = crate::text::trim(n);
+    if !uint(k) || !uint(n) {
+        return None;
+    }
     Some(Retry {
         code,
         wait: wait.to_string(),
         attempt: k.parse().ok()?,
-        of: crate::text::trim(n).parse().ok()?,
+        of: n.parse().ok()?,
     })
 }
 
@@ -2152,7 +2220,11 @@ pub fn usage_card_weekly(rows: &[String]) -> Option<UsageCardWeekly> {
     if !crate::text::trim(rest).starts_with("used") {
         return None;
     }
-    let used: u32 = crate::text::trim(used).parse().ok()?;
+    let used = crate::text::trim(used);
+    if used.is_empty() || !used.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let used: u32 = used.parse().ok()?;
     let reset = weekly
         .split_once("Resets ")
         .map(|(_, words)| crate::text::trim(words).to_owned())
@@ -2356,6 +2428,8 @@ pub mod fixtures {
         include_str!("fixtures/muse-1.4.10-R6427.1-limit-rules-under.txt");
     pub const USAGE_WALL_RESETS_DATED: &str =
         include_str!("fixtures/muse-1.4.11-R6667.1-limit-resets-dated.txt");
+    pub const USAGE_WALL_TURN_STOPPED: &str =
+        include_str!("fixtures/muse-1.4.14-R7309.1-limit-turn-stopped.txt");
     pub const USAGE_WALL_STATUS_CARDS: &str =
         include_str!("fixtures/muse-1.4.10-R6427.1-limit-status-cards.txt");
     pub const STATUS_MID_TURN: &str =

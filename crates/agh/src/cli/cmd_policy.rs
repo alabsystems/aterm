@@ -2,8 +2,9 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! `agh policy check` (design §6.3): agh.toml against L1–L10, every fault at once, and with no
-//! agh.toml, the vault's adopted rows (design §6.10).
+//! `agh policy check` (design §6.3): agh.toml against L1–L11, every fault at once, and with no
+//! agh.toml, the vault's adopted rows (design §6.10); and M2's `policy grant` and
+//! `policy revoke`, the `[[writers]]` rows.
 
 use std::path::{Path, PathBuf};
 
@@ -12,11 +13,12 @@ use aterm_json::{Map, Value};
 use super::args::Invocation;
 use super::verbs::Noun;
 use super::{Answer, Ctx, Outcome, Receipt};
-use crate::config::{self, CONFIG_FILE, ConfigFault, Counts};
+use crate::config::{self, AghConfig, CONFIG_FILE, ConfigFault, Counts};
 use crate::error::{Error, Kind, Result};
 use crate::identity::tilde;
 use crate::identity::vault::{self, Found};
 use crate::redact::Redactor;
+use crate::slug::{RepoArg, Slug};
 
 /// `agh policy check [--config PATH]`. Its report's `adopted` lists the vault's tokens when
 /// agh.toml is absent or says `vault = true` and no `--config` was given (else it is empty),
@@ -61,7 +63,12 @@ pub(crate) fn policy_check(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
         },
     };
     let agh_dir = ctx.dirs.as_ref().map(|dirs| dirs.config.as_path());
-    let (present, counts, mut faults) = judge(&dir, &name, &home, agh_dir);
+    let Judged {
+        present,
+        counts,
+        mut faults,
+        rows,
+    } = judge(&dir, &name, &home, agh_dir);
     let adoption = match (&ctx.dirs, inv.flag("--config")) {
         (Some(dirs), None) => vault::view(dirs, &*ctx.env),
         _ => None,
@@ -81,6 +88,34 @@ pub(crate) fn policy_check(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
         present,
         &ctx.redactor,
     );
+    if let Some(object) = value.as_object_mut() {
+        let text = |s: &str| Value::from(ctx.redactor.apply(&config::masked(s)));
+        let mut loose: Vec<&str> = rows
+            .as_ref()
+            .map(|rows| {
+                rows.profiles
+                    .iter()
+                    .filter(|(_, row)| row.legacy_loose)
+                    .map(|(name, _)| name.as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        loose.sort_unstable();
+        object.insert(
+            "legacy_loose".into(),
+            Value::Array(loose.into_iter().map(text).collect()),
+        );
+        let writers = rows
+            .as_ref()
+            .map(|rows| {
+                rows.writers
+                    .iter()
+                    .map(|row| writer_row(&row.caller, &row.repos, &ctx.redactor))
+                    .collect()
+            })
+            .unwrap_or_default();
+        object.insert("writers".into(), Value::Array(writers));
+    }
     if let Some(object) = value.as_object_mut() {
         object.insert("adopted".into(), Value::Array(adopted));
     }
@@ -205,9 +240,25 @@ fn relative_shown(dir: &Path) -> PathBuf {
     }
 }
 
-/// `{"config","counts":{"owners","profiles","targets"},"faults":[{"rule","what"}],"ok",
-/// "present"}`, to which `policy_check` adds `adopted`. The path and each `what` pass `redactor`,
-/// as the error lines do (design §6.6):
+/// One `[[writers]]` row as `policy check`, `policy grant` and `policy revoke` print it:
+/// `{"caller","repos":[…]}`, each string an agh.toml value: masked as a valid row's values are
+/// (`config::masked`, so a legacy token pasted into the row is never printed), then through
+/// `redactor`.
+fn writer_row(caller: &str, repos: &[String], redactor: &Redactor) -> Value {
+    let shown = |s: &str| Value::from(redactor.apply(&config::masked(s)));
+    let mut row = Map::new();
+    row.insert("caller".into(), shown(caller));
+    row.insert(
+        "repos".into(),
+        Value::Array(repos.iter().map(|repo| shown(repo)).collect()),
+    );
+    Value::Object(row)
+}
+
+/// `{"config","counts":{"owners","profiles","targets","writers"},"faults":[{"rule","what"}],
+/// "ok","present"}`, to which `policy_check` adds `adopted`, `legacy_loose` (the profile rows
+/// that set it, sorted) and `writers` (the `[[writers]]` rows in file order). The path and each
+/// `what` pass `redactor`, as the error lines do (design §6.6):
 /// stdout gets no string the Redactor did not see.
 fn report(
     shown: &str,
@@ -221,6 +272,7 @@ fn report(
     counted.insert("owners".into(), count(counts.owners));
     counted.insert("profiles".into(), count(counts.profiles));
     counted.insert("targets".into(), count(counts.targets));
+    counted.insert("writers".into(), count(counts.writers));
     let listed = faults
         .iter()
         .map(|fault| {
@@ -239,20 +291,35 @@ fn report(
     Value::Object(object)
 }
 
-/// Whether the file is there, its row counts, and its faults.
-type Judged = (bool, Counts, Vec<ConfigFault>);
+/// What reading and judging the file found.
+struct Judged {
+    /// Whether the file is there.
+    present: bool,
+    /// Its row counts.
+    counts: Counts,
+    /// Its faults.
+    faults: Vec<ConfigFault>,
+    /// Its rows as written, when it parsed.
+    rows: Option<AghConfig>,
+}
 
-/// What reading and judging the file found: whether it is there, its row counts, and its
-/// faults. No file is a valid state (`present: false`), as it is for `config::load`.
+/// What reading and judging the file found: whether it is there, its row counts, its faults
+/// and its rows. No file is a valid state (`present: false`), as it is for `config::load`.
 #[cfg(unix)]
 fn judge(dir: &Path, name: &str, home: &Path, agh_dir: Option<&Path>) -> Judged {
     match config::faults_of(config::read_config_in(dir, name, home, agh_dir), home) {
-        None => (false, Counts::default(), Vec::new()),
-        Some(judged) => (
-            true,
-            judged.counts,
-            judged.verdict.err().unwrap_or_default(),
-        ),
+        None => Judged {
+            present: false,
+            counts: Counts::default(),
+            faults: Vec::new(),
+            rows: None,
+        },
+        Some(judged) => Judged {
+            present: true,
+            counts: judged.counts,
+            faults: judged.verdict.err().unwrap_or_default(),
+            rows: judged.parsed,
+        },
     }
 }
 
@@ -261,5 +328,186 @@ fn judge(dir: &Path, name: &str, home: &Path, agh_dir: Option<&Path>) -> Judged 
 #[cfg(not(unix))]
 fn judge(dir: &Path, name: &str, home: &Path, agh_dir: Option<&Path>) -> Judged {
     let _ = (dir, name, home, agh_dir);
-    (false, Counts::default(), Vec::new())
+    Judged {
+        present: false,
+        counts: Counts::default(),
+        faults: Vec::new(),
+        rows: None,
+    }
+}
+
+/// `agh policy grant CALLER REPO` (design §6.2): `REPO` added to `CALLER`'s `[[writers]]`
+/// row of agh.toml, which is written again whole, atomically and 0600. It runs with or without
+/// a terminal (owner ruling 2026-10-26: an agent grants as a person does). Its answer is
+/// `{"caller","change","repos"}`: `added` or `unchanged`, and the row after the edit.
+///
+/// # Errors
+///
+/// Usage for a caller outside `[a-z][a-z0-9-]{0,31}` or a `REPO` that is no literal
+/// `OWNER/NAME` (each quoted with a token-shaped part masked). Refused when there is no
+/// agh.toml; when another edit holds the auth edit lock, or the config directory or the lock
+/// is not private; when `read_private` refuses agh.toml or it is not UTF-8; and, with nothing
+/// written, when the edit would break one of its rules, would make it longer than
+/// `config::CONFIG_MAX`, or cannot be made in place (`config::edit_writers`'s Refused).
+/// Invalid when agh.toml does not parse or its `writers` cannot be edited
+/// (`config::edit_writers`'s Invalid). could_not_run off unix, when no config directory
+/// resolves, and when agh.toml or the lock cannot be read or written.
+pub(crate) fn policy_grant(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
+    edit_grant(ctx, inv, true)
+}
+
+/// `agh policy revoke CALLER REPO`: `REPO` taken out of `CALLER`'s `[[writers]]` row, and the
+/// row with its last repository. As `policy grant`, with `removed` or `unchanged`.
+///
+/// # Errors
+///
+/// As `policy grant`.
+pub(crate) fn policy_revoke(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
+    edit_grant(ctx, inv, false)
+}
+
+/// `policy grant` (`add`) and `policy revoke`: the arguments, the file, the edit, the write and
+/// the answer, in that order.
+fn edit_grant(ctx: &mut Ctx, inv: &Invocation, add: bool) -> Result<Outcome> {
+    let caller = inv.require(0, "CALLER")?;
+    let repo = inv.require(1, "REPO")?;
+    if let Some(fault) = config::caller_fault(caller) {
+        return Err(inv.usage(fault));
+    }
+    let slug = match RepoArg::parse(repo) {
+        Ok(RepoArg::Literal(slug)) => slug,
+        Ok(RepoArg::Target(name)) => {
+            return Err(inv.usage(config::masked(&format!(
+                "REPO is a literal OWNER/NAME, not @{name}"
+            ))));
+        }
+        // The parser quotes what was typed, and a legacy token pasted as REPO is all hex, which
+        // the Redactor cannot know: masked as CALLER's fault is.
+        Err(error) => return Err(inv.usage(config::masked(&error.why))),
+    };
+    let Some(dirs) = ctx.dirs.clone() else {
+        return Err(Error::could_not_run(
+            "no config directory: agh cannot provision here",
+        ));
+    };
+    let (change, repos) = write_grant(&dirs, caller, &slug, add)?;
+    let mut value = writer_row(caller, &repos, &ctx.redactor);
+    if let Some(object) = value.as_object_mut() {
+        object.insert("change".into(), Value::from(change));
+    }
+    Ok(Outcome {
+        answer: Answer::Object {
+            noun: Noun::Policy,
+            value,
+        },
+        receipt: Receipt::new(&inv.verb_name()),
+    })
+}
+
+/// The why of `AuthEdit::take`'s refusal while another edit holds the lock.
+#[cfg(unix)]
+const AUTH_EDIT_BUSY: &str = "another agh auth edit is in progress";
+
+/// The edit on unix, under the auth edit lock: agh.toml read with `read_private`, edited by
+/// `config::edit_writers`, judged by L1–L11 and held to `config::CONFIG_MAX`, and written with
+/// `write_private`. The change (`added`, `removed` or `unchanged`) and the caller's
+/// repositories after it.
+#[cfg(unix)]
+fn write_grant(
+    dirs: &config::Dirs,
+    caller: &str,
+    slug: &Slug,
+    add: bool,
+) -> Result<(&'static str, Vec<String>)> {
+    use crate::config::ConfigText;
+    use crate::identity::provision::AuthEdit;
+    let verb = if add { "grant" } else { "revoke" };
+    let missing = || {
+        Error::refused(format!("there is no agh.toml to {verb} in"))
+            .with_next("agh auth add NAME --file PATH --tier TIER")
+    };
+    if std::fs::symlink_metadata(dirs.config_file()).is_err() {
+        return Err(missing());
+    }
+    // The auth verbs' lock, whose busy refusal names the auth command: told again for this verb.
+    let _edit = AuthEdit::take(dirs).map_err(|error| {
+        if error.kind == Kind::Refused && error.why == AUTH_EDIT_BUSY {
+            Error::refused("another agh.toml edit is in progress").with_next(format!(
+                "run agh policy {verb} again after that edit finishes"
+            ))
+        } else {
+            error
+        }
+    })?;
+    let text = match config::read_config(&dirs.config, CONFIG_FILE, &dirs.home) {
+        ConfigText::Text(text) => text,
+        ConfigText::Missing => return Err(missing()),
+        ConfigText::Refused { error, remedy } => {
+            return Err(config::invalid(
+                format!("agh.toml: {error}"),
+                remedy.unwrap_or_else(|| config::POLICY_CHECK.to_string()),
+            ));
+        }
+        ConfigText::Io(error) => {
+            return Err(Error::could_not_run(format!("agh.toml: {error}")));
+        }
+        ConfigText::NotUtf8 => {
+            return Err(config::invalid(
+                "agh.toml is not UTF-8".to_string(),
+                config::POLICY_CHECK,
+            ));
+        }
+    };
+    let edited = config::edit_writers(&text, caller, slug, add)?;
+    let judged = config::judge(&edited, &dirs.home);
+    if let Err(faults) = &judged.verdict {
+        let first = faults.first().map_or_else(String::new, |fault| {
+            format!("{} {}", fault.rule, fault.what)
+        });
+        return Err(
+            Error::refused(format!("the edit would break agh.toml: {first}"))
+                .with_next(config::POLICY_CHECK),
+        );
+    }
+    let repos = judged
+        .parsed
+        .as_ref()
+        .and_then(|rows| rows.writers.iter().find(|row| row.caller == caller))
+        .map(|row| row.repos.clone())
+        .unwrap_or_default();
+    if edited == text {
+        return Ok(("unchanged", repos));
+    }
+    // Every load reads at most CONFIG_MAX bytes and refuses a longer file, and with it every
+    // verb, `policy revoke` included: such an edit is never written.
+    if edited.len() > config::CONFIG_MAX {
+        return Err(Error::refused(format!(
+            "the {verb} would make agh.toml longer than such a file can be ({} bytes; at most \
+             {}; nothing is written)",
+            edited.len(),
+            config::CONFIG_MAX
+        ))
+        .with_next(format!(
+            "make agh.toml shorter, then run agh policy {verb} again"
+        )));
+    }
+    aterm_uds::private_file::write_private(&dirs.config, CONFIG_FILE, edited.as_bytes()).map_err(
+        |e| Error::could_not_run(format!("{}: {e}", tilde(&dirs.config_file(), &dirs.home))),
+    )?;
+    Ok((if add { "added" } else { "removed" }, repos))
+}
+
+/// Off unix agh never reads or writes agh.toml (design §6.6), so it grants nothing there.
+#[cfg(not(unix))]
+fn write_grant(
+    dirs: &config::Dirs,
+    caller: &str,
+    slug: &Slug,
+    add: bool,
+) -> Result<(&'static str, Vec<String>)> {
+    let _ = (dirs, caller, slug, add);
+    Err(Error::could_not_run(
+        "agh reads and writes agh.toml only on unix, where its permissions are checked",
+    )
+    .with_sub(crate::error::Sub::Local))
 }

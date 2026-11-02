@@ -65,10 +65,14 @@ pub(crate) fn declared(text: &str) -> Result<(Want, bool), String> {
 pub(crate) fn obligations(root: &Path) -> (Vec<Obligation>, Vec<String>) {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
         for entry in std::fs::read_dir(dir)? {
-            let path = entry?.path();
-            if path.is_dir() {
+            let entry = entry?;
+            let ft = entry.file_type()?;
+            let path = entry.path();
+            if ft.is_dir() {
                 walk(&path, out)?;
-            } else if path.extension().is_some_and(|e| e == "smt2") {
+            } else if (ft.is_file() || (ft.is_symlink() && path.is_file()))
+                && path.extension().is_some_and(|e| e == "smt2")
+            {
                 out.push(path);
             }
         }
@@ -228,6 +232,16 @@ mod tests {
             !faults.is_empty(),
             "an empty proof walk must fail the requested check"
         );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.path(), dir.path().join("cycle")).unwrap();
+            let (found, faults) = obligations(dir.path());
+            assert!(found.is_empty());
+            assert!(
+                !faults.is_empty(),
+                "directory symlink cycle does not recurse"
+            );
+        }
     }
 
     #[test]

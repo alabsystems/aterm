@@ -37,7 +37,7 @@ pub(super) fn run(live: &Live, cmd: &Cmd, input: &[u8]) -> Result<Ran, RunFailed
     let (reader, writer) =
         io::pipe().map_err(|_| RunFailed::Spawn("input pipe creation failed".into()))?;
     nonblocking(&writer).map_err(|_| RunFailed::Spawn("input pipe configuration failed".into()))?;
-    let deadline = Instant::now() + cmd.budget;
+    let deadline = super::deadline_after(cmd.budget);
     let cancelled = AtomicBool::new(false);
     std::thread::scope(|scope| {
         let writer = std::thread::Builder::new()
@@ -142,6 +142,10 @@ mod tests {
             .unwrap();
         assert!(out.success());
         assert_eq!(out.stdout, input);
+        let max_budget = Live::new()
+            .run_complete_stdout_input(&Cmd::new("/bin/cat").budget(Duration::MAX), b"ok")
+            .unwrap();
+        assert_eq!(max_budget.stdout, b"ok");
     }
 
     #[test]

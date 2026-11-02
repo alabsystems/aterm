@@ -584,38 +584,21 @@ mod tests {
         );
     }
 
-    /// The stall's ⚠ row is on the band whatever `desktop_alerts` says, and it never posts a
-    /// desktop banner: a stopped check or a sibling's lock is not a cause only the owner can
-    /// end (the banner is owed to `NeedsPerson` only: `App::post_update_health_banner`).
     #[test]
-    fn a_checker_stall_posts_no_desktop_banner_whatever_desktop_alerts_says() {
-        use crate::messages_host::UPDATE_HEALTH_BANNERS;
-        let take = || UPDATE_HEALTH_BANNERS.with(|b| std::mem::take(&mut *b.borrow_mut()));
-        let stall = CheckerStall {
-            generation: 1,
-            for_secs: 3_000,
-            phase: CheckerPhase::LockWait,
-            holds_lane: true,
-            checks: 0,
-        };
-        for alerts in [None, Some(false), Some(true)] {
-            let mut app = App::headless_for_test();
-            app.config.desktop_alerts = alerts;
-            let _ = take();
-            app.announce_update_checker_stall(stall, Some(2));
-            assert!(
-                app.messages.live_health().is_some(),
-                "{alerts:?}: the band row is up either way"
-            );
-            let posted = take();
-            assert!(posted.is_empty(), "{alerts:?}: {posted:?}");
-            app.announce_checker_lock_held(9);
-            assert!(take().is_empty(), "{alerts:?}: its own announcement");
-            let revision = app.messages.revision();
-            app.announce_checker_lock_held(10);
-            assert_eq!(app.messages.revision(), revision, "{alerts:?}: latched");
-            assert!(take().is_empty(), "{alerts:?}: latched, no second banner");
-        }
+    fn a_checker_stall_is_recorded_without_a_banner() {
+        let mut app = App::headless_for_test();
+        app.announce_update_checker_stall(
+            CheckerStall {
+                generation: 1,
+                for_secs: 3_000,
+                phase: CheckerPhase::LockWait,
+                holds_lane: true,
+                checks: 0,
+            },
+            Some(2),
+        );
+        assert_eq!(app.message_band_rows, 0);
+        assert!(!app.messages.log().is_empty());
     }
 
     /// The watchdog's heals end the digest's day too: announcing a stall or a held lock claims

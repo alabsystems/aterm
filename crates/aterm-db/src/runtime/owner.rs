@@ -37,9 +37,8 @@ impl Lease {
         private_file::create_private_dir(dir)?;
         aterm_secrets::fsx::write_new(&dir.join("runtime.lock"), b"", 0o600)
             .map_err(|_| Error::new("Commons owner lease cannot be created"))?;
-        let (file, meta) = private_file::open_private(dir, "runtime.lock")
+        let (file, meta) = aterm_uds::kept_out(|| private_file::open_private(dir, "runtime.lock"))
             .map_err(|_| Error::new("Commons owner lease is not private"))?;
-        aterm_uds::keep_out_of_children(&file)?;
         #[expect(
             clippy::disallowed_methods,
             reason = "lease is CLOEXEC/CLOFORK and explicitly unlocks only after all transport workers join"
@@ -100,9 +99,9 @@ impl Drop for Lease {
     }
 }
 
-/// Shared advisory lock (`window.lock`) held by every running interactive `aterm` window so
-/// `aterm node serve`'s background Commons runtime yields observer and transport ownership while
-/// any window runs, and takes them back once the last window exits.
+/// Shared advisory lock (`window.lock`) held by an interactive `aterm` runtime once its first
+/// LAN gate opens. `aterm node serve` yields observer and transport ownership while a ready
+/// window runs, and takes them back once the last such window exits.
 pub(super) struct WindowClaim {
     file: File,
 }
@@ -111,9 +110,8 @@ impl WindowClaim {
         private_file::create_private_dir(dir)?;
         aterm_secrets::fsx::write_new(&dir.join("window.lock"), b"", 0o600)
             .map_err(|_| Error::new("Commons window claim cannot be created"))?;
-        let (file, _) = private_file::open_private(dir, "window.lock")
+        let (file, _) = aterm_uds::kept_out(|| private_file::open_private(dir, "window.lock"))
             .map_err(|_| Error::new("Commons window claim is not private"))?;
-        aterm_uds::keep_out_of_children(&file)?;
         #[expect(
             clippy::disallowed_methods,
             reason = "window claim is CLOEXEC/CLOFORK and WindowClaim::drop releases by LOCK_UN"
@@ -137,12 +135,10 @@ impl Drop for WindowProbe {
 
 /// Whether at least one local interactive `aterm` window holds [`WindowClaim`] in `dir`.
 pub(super) fn window_claimed(dir: &Path) -> bool {
-    let Ok((file, _)) = private_file::open_private(dir, "window.lock") else {
+    let Ok((file, _)) = aterm_uds::kept_out(|| private_file::open_private(dir, "window.lock"))
+    else {
         return false;
     };
-    if aterm_uds::keep_out_of_children(&file).is_err() {
-        return false;
-    }
     #[expect(
         clippy::disallowed_methods,
         reason = "probe lock is CLOEXEC/CLOFORK and WindowProbe::drop releases immediately by LOCK_UN"

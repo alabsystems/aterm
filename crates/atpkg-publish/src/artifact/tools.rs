@@ -231,11 +231,16 @@ impl Tools for HostTools {
             cmd.current_dir(dir);
         }
         let out = match run.deadline {
-            Some(limit) => aterm_uds::deadline::output_until(&mut cmd, Instant::now() + limit)
-                .map_err(|e| match e {
+            Some(limit) => {
+                let now = Instant::now();
+                let until = now
+                    .checked_add(limit)
+                    .unwrap_or_else(|| now + Duration::from_secs(365 * 86_400));
+                aterm_uds::deadline::output_until(&mut cmd, until).map_err(|e| match e {
                     aterm_uds::deadline::RunError::TimedOut => RunError::TimedOut,
                     other => RunError::Spawn(other.to_string()),
-                })?,
+                })?
+            }
             None => cmd
                 .stdin(aterm_uds::spawnfd::Stdio::null())
                 .output()

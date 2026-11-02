@@ -3,7 +3,16 @@
 
 //! `targo --unverified verify` CLI entry point ([`aterm_verify::run_cli`]).
 
-fn main() {
+fn main() -> std::process::ExitCode {
+    // First, while this process has one thread: a tethered child starts as this executable's
+    // tether verb, and this executable is recorded as the one its own tethered spawns run through.
+    if let Some(code) = aterm_uds::tether::entry() {
+        return code;
+    }
+    // Before any dispatch: every child of this dedicated CLI process (targo,
+    // the test binaries, this binary re-invoked as a recorder or doc driver)
+    // inherits the raised limit.
+    aterm_uds::spawnfd::raise_soft_nofile();
     let raw: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     if raw
         .first()

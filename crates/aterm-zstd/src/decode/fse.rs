@@ -199,18 +199,18 @@ impl FseTable {
         while probability_counter < probability_sum {
             let max_remaining_value = probability_sum - probability_counter + 1;
             let bits_to_read = highest_bit_set(max_remaining_value);
-            let unchecked_value = br.get_bits(bits_to_read as usize)?;
-
             let low_threshold = ((1u32 << bits_to_read) - 1) - max_remaining_value;
-            let mask = (1u32 << (bits_to_read - 1)) - 1;
-            let small_value = unchecked_value & mask;
+            let small_value = br.get_bits((bits_to_read - 1) as usize)?;
             let value = if small_value < low_threshold {
-                br.return_bit();
                 small_value
-            } else if unchecked_value > mask {
-                unchecked_value - low_threshold
             } else {
-                unchecked_value
+                let high_bit = br.get_bits(1)?;
+                let unchecked_value = small_value | (high_bit << (bits_to_read - 1));
+                if high_bit != 0 {
+                    unchecked_value - low_threshold
+                } else {
+                    unchecked_value
+                }
             };
 
             let prob = value as i32 - 1;
@@ -370,5 +370,14 @@ mod tests {
         assert!(table.build_from_probabilities(5, &[-2, 16, 18]).is_err());
         assert!(table.build_from_probabilities(5, &[-1; 32]).is_ok());
         assert!(table.build_from_probabilities(5, &[1; 37]).is_err());
+    }
+
+    #[test]
+    fn byte_aligned_short_last_probability_decodes_without_overread() {
+        let buf = 0x4F41_8810u32.to_le_bytes();
+        let mut table = FseTable::new(35);
+        let consumed = table.build_decoder(&buf, 9).unwrap();
+        assert_eq!(consumed, 4);
+        assert_eq!(table.probs, [0, 16, 0, 12, 2, 1, -1]);
     }
 }

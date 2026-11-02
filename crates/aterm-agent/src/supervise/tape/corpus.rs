@@ -336,6 +336,62 @@ impl Scrub {
                 door,
                 request,
                 reply,
+            } if door == doors::CTL_DUTY => {
+                let (duty, revision, args) = super::ctl::duty_parts(request)
+                    .map_err(|error| format!("item {at} ({door}): {error}"))?;
+                let args: Vec<_> = args.iter().map(|word| self.text(word)).collect();
+                let words: Vec<_> = args.iter().map(String::as_str).collect();
+                let reply = super::ctl::control_reply(door, reply)
+                    .map_err(|error| format!("item {at} ({door}): {error}"))?
+                    .map(|reply| match reply {
+                        Ok(CtlReply {
+                            code,
+                            stdout,
+                            stderr,
+                        }) => Ok(CtlReply {
+                            code,
+                            stdout: self.text(&stdout),
+                            stderr: self.text(&stderr),
+                        }),
+                        Err(why) => Err(self.text(&why)),
+                    });
+                EffectRecord::Exchange {
+                    door: door.clone(),
+                    request: super::ctl::duty_request(duty, revision, &words),
+                    reply: super::ctl::encoded_reply(door, reply),
+                }
+            }
+            EffectRecord::Exchange {
+                door,
+                request,
+                reply,
+            } if door == doors::CTL_AUTHORITY || door == doors::CTL_AGENT_ACT => {
+                use super::core::TapeValue;
+                if door == doors::CTL_AUTHORITY {
+                    crate::supervise::BuiltinAuthority::from_tape(reply).map(drop)
+                } else {
+                    crate::harness::agent_image::Act::from_tape(reply).map(drop)
+                }
+                .map_err(|error| format!("item {at} ({door}): {error}"))?;
+                let args = codec::ctl_args(request)
+                    .map_err(|error| format!("item {at} ({door}): {error}"))?;
+                if args.len() != 1 {
+                    return Err(format!(
+                        "item {at} ({door}): a session query needs one target"
+                    ));
+                }
+                let mapped: Vec<_> = args.iter().map(|word| self.text(word)).collect();
+                let words: Vec<_> = mapped.iter().map(String::as_str).collect();
+                EffectRecord::Exchange {
+                    door: door.clone(),
+                    request: codec::ctl_request(&words),
+                    reply: reply.clone(),
+                }
+            }
+            EffectRecord::Exchange {
+                door,
+                request,
+                reply,
             } if door == doors::CTL || door == doors::TELLER => {
                 let bad = |what: &str, e: codec::CodecError| {
                     format!("item {at} ({door}): a {what} that does not read: {e}")

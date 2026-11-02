@@ -35,6 +35,354 @@ thread_local! {
     /// The plans lists were laid out by this render, while [`PlansShared`] is open.
     static PLANS: std::cell::RefCell<Option<Vec<SharedPlan>>> =
         const { std::cell::RefCell::new(None) };
+    /// How wide each stacked setting row this render laid out sets its words, by its key, while
+    /// [`RowWidths`] is open ([`named_row_parts`]).
+    static ROW_WIDTHS: std::cell::RefCell<Option<Vec<(UiKey, f32)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// While a page is built, how wide each stacked setting row sets its words
+/// ([`note_row_width`]), so a row split across stops names its control in the width its words
+/// take ([`named_row_parts`]).
+pub(super) struct RowWidths;
+
+impl RowWidths {
+    pub(super) fn open() -> Self {
+        ROW_WIDTHS.with(|widths| widths.replace(Some(Vec::new())));
+        Self
+    }
+}
+
+impl Drop for RowWidths {
+    fn drop(&mut self) {
+        ROW_WIDTHS.with(|widths| widths.replace(None));
+    }
+}
+
+/// Note that the stacked setting row `key` sets its words `width` wide ([`RowWidths`]).
+pub(super) fn note_row_width(key: &UiKey, width: f32) {
+    ROW_WIDTHS.with(|widths| {
+        if let Some(widths) = widths.borrow_mut().as_mut() {
+            match widths.iter_mut().find(|(was, _)| was == key) {
+                Some((_, known)) => *known = width,
+                None => widths.push((key.clone(), width)),
+            }
+        }
+    });
+}
+
+fn row_width(key: &UiKey) -> Option<f32> {
+    ROW_WIDTHS.with(|widths| {
+        widths
+            .borrow()
+            .as_ref()?
+            .iter()
+            .find(|(was, _)| was == key)
+            .map(|(_, width)| *width)
+    })
+}
+
+/// Where a split row's part names its row ([`named_row_parts`]).
+const ROW_CAPTION: &str = "settings/row-caption/";
+
+/// [`row_parts`] of `row`, and, A ROW SPLIT ACROSS STOPS NAMES ITS CONTROL WHERE ITS NAME IS NOT:
+/// for a stacked setting row, each part after the first that holds the row's own control and
+/// none of its name, and that no screen holds with the name (the room a screen gives the row's
+/// parts, `shared`), leads with a caption of the row's name, on as many of its lines as a list
+/// `room` tall holds over the part, the last ended early with an ellipsis where they do not all
+/// fit, so a screen that shows the control says what it sets. Split from its name, a switch or a
+/// segment stood alone on a screen the keyboard landed on, nothing saying what it set (Keyboard
+/// & Input at 2x in 164x98: Copy on select's switch; Appearance at 178x152: Auto, Light and
+/// Dark). The name stays whole on the part before; a screen says it once
+/// ([`quiet_row_captions`]).
+pub(super) fn named_row_parts(
+    row: (UiNode, f32),
+    (limit, most, gap): (f32, f32, f32),
+    (room, shared): (f32, f32),
+) -> Vec<(UiNode, f32)> {
+    // A stacked setting row a builder noted the width of ([`note_row_width`]), its group named
+    // after its setting, whose key ends with the setting's.
+    let named = Some(&row.0).and_then(|first| match &first.content {
+        UiContent::Group(GroupSpec {
+            label: Some(name), ..
+        }) => row_width(&first.key).map(|width| {
+            let row = first.key.as_str();
+            (
+                row.rsplit('/').next().unwrap_or(row).to_string(),
+                name.clone(),
+                width,
+            )
+        }),
+        _ => None,
+    });
+    let Some((setting, name, width)) = named else {
+        return row_parts(row, limit, most, gap);
+    };
+    let control = format!("settings/control/{setting}");
+    let segment = format!("settings/segment/{setting}/");
+    let colour = format!("settings/color-open/{setting}");
+    let label = format!("settings/label/{setting}");
+    fn holds(node: &UiNode, wanted: &dyn Fn(&str) -> bool) -> bool {
+        wanted(node.key.as_str()) || node.children.iter().any(|child| holds(child, wanted))
+    }
+    let unnamed = |node: &UiNode| {
+        holds(node, &|key| {
+            key == control || key == colour || key.starts_with(&segment)
+        }) && !holds(node, &|key| key.starts_with(&label))
+    };
+    let line = super::row_caption_line_height();
+    let lines = super::row_name_lines(&name, width);
+    // `node` led by a caption of the row's name on as many of its lines as the room holds over
+    // it: each line of the caption and the gap under it take a line of the name, as the name's
+    // lines do over its control. Unchanged where it alone fills the room: a caption over it would
+    // leave a control of it on no screen whole.
+    let captioned = |(mut node, height): (UiNode, f32), at: usize| -> (UiNode, f32) {
+        let held = (((room - height) / line + 0.01).floor().max(0.0) as usize).min(lines.len());
+        if held == 0 {
+            return (node, height);
+        }
+        let mut shown: Vec<String> = lines[..held].to_vec();
+        if held < lines.len()
+            && let Some(last) = shown.last_mut()
+        {
+            *last = crate::native_ui::fit_native_text_label(&lines[held - 1..].join(" "), width);
+        }
+        let key = format!("{ROW_CAPTION}{setting}/part-{at}");
+        let tall = (held as f32 * line - node.layout.gap).max(0.8 * line);
+        let caption = UiNode::new(
+            key.clone(),
+            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+        )
+        .layout(
+            Layout::column()
+                .width(Length::Fill)
+                .height(Length::Fixed(tall)),
+        )
+        .paint_only()
+        .children(
+            shown
+                .into_iter()
+                .enumerate()
+                .map(|(index, text)| {
+                    UiNode::new(
+                        format!("{key}/line-{index}"),
+                        UiContent::Text(crate::native_ui::TextSpec {
+                            text,
+                            role: SemanticRole::Text,
+                            style: StyleRef::Primary,
+                        }),
+                    )
+                    .layout(
+                        Layout::default()
+                            .width(Length::Fill)
+                            .height(Length::Fixed(tall / held as f32)),
+                    )
+                    .paint_only()
+                })
+                .collect(),
+        );
+        let grow = tall + node.layout.gap;
+        node.children.insert(0, caption);
+        if let Length::Fixed(was) = node.layout.height {
+            node.layout.height = Length::Fixed(was + grow);
+        }
+        (node, height + grow)
+    };
+    // The parts that want a caption: those after the first that hold the control and none of
+    // the name, where the row from its name down to their end is taller than the room a screen
+    // gives the row's parts (`shared`). A PART ONE SCREEN HOLDS WITH THE NAME OVER IT TAKES NO
+    // CAPTION: the keyboard's reveal shows the name with it there, and the caption's room stood
+    // empty between the row's controls (Appearance at 2x in 178x586: 68pt between Foreground's
+    // field and its Choose…).
+    let wanting = |parts: &[(UiNode, f32)]| -> Vec<bool> {
+        let mut span = -gap;
+        parts
+            .iter()
+            .enumerate()
+            .map(|(at, (node, height))| {
+                span += height + gap;
+                at > 0 && unnamed(node) && span > shared + 0.01
+            })
+            .collect()
+    };
+    // Parted so a line of the name fits over each part that wants it, where the room is short of
+    // that as the row parts at `limit`.
+    let short = |parts: &[(UiNode, f32)]| {
+        parts
+            .iter()
+            .zip(wanting(parts))
+            .any(|((_, height), wants)| wants && height + line > room + 0.01)
+    };
+    let mut parts = row_parts(row.clone(), limit, most, gap);
+    if short(&parts) {
+        parts = row_parts(row, (limit - line).max(1.0), (most - line).max(1.0), gap);
+    }
+    let wants = wanting(&parts);
+    // A part past the first that holds the row's words alone, its name and its controls on the
+    // parts before, keeps the name for a screen that starts with it ([`words_caption_marker`]).
+    let words_alone = |node: &UiNode| {
+        !holds(node, &|key| {
+            key == control || key == colour || key.starts_with(&segment) || key.starts_with(&label)
+        })
+    };
+    parts
+        .into_iter()
+        .zip(wants)
+        .enumerate()
+        .map(|(at, ((part, height), wants))| {
+            if wants {
+                captioned((part, height), at)
+            } else if at > 0 && words_alone(&part) {
+                (
+                    mark_words(part, words_caption_marker(&setting, &name, width)),
+                    height,
+                )
+            } else {
+                (part, height)
+            }
+        })
+        .collect()
+}
+
+/// The end of the key of a mark that a row's part holds only the row's words
+/// ([`words_caption_marker`]).
+const WORDS_CAPTION: &str = "/words";
+
+/// A ROW'S WORDS PARTED FROM ITS NAME ARE LED BY IT ON A SCREEN THAT STARTS WITH THEM: the mark a
+/// part that holds only the words of setting `setting`'s row keeps, the row's name `name` its
+/// label, set `width` wide; no taller than nothing and drawing nothing, it is opened into the
+/// row's name only where a screen starts with the part ([`SplitCard::node`], the screen's plan
+/// keeping the room, [`ScrollPlan::set_stop_lead`]). Parted from its name, a row's state stood
+/// alone under its card's repeated heading and read as the card's value (Appearance at 164x348:
+/// "THEME", then Window appearance's "Unchanged"); its note read as the card's ("THEME", then
+/// "Auto matches the terminal theme"). Said in the words themselves, the name stood twice on every
+/// screen that showed it over its control; kept as a caption on every screen, its lines stood
+/// empty there ([`quiet_row_captions`]).
+pub(super) fn words_caption_marker(setting: &str, name: &str, width: f32) -> UiNode {
+    UiNode::new(
+        format!("{ROW_CAPTION}{setting}{WORDS_CAPTION}"),
+        UiContent::Group(GroupSpec {
+            label: Some(name.to_string()),
+            ..GroupSpec::unlabeled(SemanticRole::Group)
+        }),
+    )
+    .layout(
+        Layout::default()
+            .width(Length::Fixed(width))
+            .height(Length::Fixed(0.0)),
+    )
+    .paint_only()
+}
+
+fn is_words_marker(node: &UiNode) -> bool {
+    let key = node.key.as_str();
+    key.starts_with(ROW_CAPTION) && key.ends_with(WORDS_CAPTION) && node.children.is_empty()
+}
+
+/// `node` with `marker` ([`words_caption_marker`]) first in the first column down its first
+/// children that sets its children with no gap, where opening it moves nothing else; `node` as
+/// it is where none does.
+pub(super) fn mark_words(mut node: UiNode, marker: UiNode) -> UiNode {
+    fn mark(node: &mut UiNode, marker: UiNode) {
+        if node.layout.flow == Flow::Column && node.layout.gap.abs() < 0.01 {
+            node.children.insert(0, marker);
+        } else if let Some(first) = node.children.first_mut() {
+            mark(first, marker);
+        }
+    }
+    if matches!(node.content, UiContent::Group(_)) {
+        mark(&mut node, marker);
+    }
+    node
+}
+
+/// The mark `node` keeps for its row's name, first down its first children.
+fn words_marker(node: &UiNode) -> Option<&UiNode> {
+    let first = node.children.first()?;
+    if is_words_marker(first) {
+        Some(first)
+    } else {
+        words_marker(first)
+    }
+}
+
+/// What a screen that starts with `node` draws over it, in a card that sets its children `gap`
+/// apart: where `node` holds a row's words alone ([`words_caption_marker`]), the row's name
+/// ([`take_words_caption`]) and the gap under it; else nothing.
+pub(super) fn words_lead(node: &UiNode, gap: f32) -> f32 {
+    if words_marker(node).is_none() {
+        return 0.0;
+    }
+    take_words_caption(&mut node.clone()).map_or(0.0, |(_, tall)| tall + gap)
+}
+
+/// `node` without its mark ([`words_caption_marker`]), and the mark made its row's name: a line
+/// of it for each line the name takes in its width, as a row's name reads over its control, and
+/// how tall they stand. None where `node` keeps no mark.
+pub(super) fn take_words_caption(node: &mut UiNode) -> Option<(UiNode, f32)> {
+    fn take(node: &mut UiNode) -> Option<UiNode> {
+        if node.children.first().is_some_and(is_words_marker) {
+            Some(node.children.remove(0))
+        } else {
+            take(node.children.first_mut()?)
+        }
+    }
+    let marker = take(node)?;
+    let UiContent::Group(GroupSpec {
+        label: Some(name), ..
+    }) = &marker.content
+    else {
+        return None;
+    };
+    let Length::Fixed(width) = marker.layout.width else {
+        return None;
+    };
+    let line = super::row_caption_line_height();
+    let lines = super::row_name_lines(name, width);
+    let tall = lines.len() as f32 * line;
+    let key = marker.key.as_str().to_string();
+    let caption = UiNode::new(
+        key.clone(),
+        UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+    )
+    .layout(
+        Layout::column()
+            .width(Length::Fill)
+            .height(Length::Fixed(tall)),
+    )
+    .paint_only()
+    .children(
+        lines
+            .into_iter()
+            .enumerate()
+            .map(|(index, text)| {
+                UiNode::new(
+                    format!("{key}/line-{index}"),
+                    UiContent::Text(crate::native_ui::TextSpec {
+                        text,
+                        role: SemanticRole::Text,
+                        style: StyleRef::Primary,
+                    }),
+                )
+                .layout(
+                    Layout::default()
+                        .width(Length::Fill)
+                        .height(Length::Fixed(line)),
+                )
+                .paint_only()
+            })
+            .collect(),
+    );
+    Some((caption, tall))
+}
+
+/// `node` without the mark it keeps for its row's name ([`words_caption_marker`]).
+pub(super) fn strip_words_caption(node: &mut UiNode) {
+    if node.children.first().is_some_and(is_words_marker) {
+        node.children.remove(0);
+    } else if let Some(first) = node.children.first_mut() {
+        strip_words_caption(first);
+    }
 }
 
 /// A list's items, its gap, room and what a bar takes of it, and the plan and stops they lay out.
@@ -164,6 +512,9 @@ pub(super) struct ScrollPlan {
     groups: Shared<Option<usize>>,
     heads: Shared<f32>,
     leads: Shared<f32>,
+    /// What a screen that starts with a stop draws over it past its card's head: the name of the
+    /// row whose words alone the stop holds ([`SplitCard::stop_lead`]), else nothing.
+    stop_leads: Shared<f32>,
     captions: Shared<Option<(f32, f32)>>,
     card_captions: Shared<Option<CardCaption>>,
     notes: Shared<bool>,
@@ -330,6 +681,7 @@ impl ScrollPlan {
         Self {
             heights: shared(stops),
             groups: shared(stops),
+            stop_leads: shared(stops),
             card_captions: shared(stops),
             notes: shared(stops),
             keys: shared(stops),
@@ -466,6 +818,7 @@ impl ScrollPlan {
         std::sync::Arc::make_mut(&mut self.card_captions).push(None);
         std::sync::Arc::make_mut(&mut self.notes).push(false);
         std::sync::Arc::make_mut(&mut self.groups).push(None);
+        std::sync::Arc::make_mut(&mut self.stop_leads).push(0.0);
         std::sync::Arc::make_mut(&mut self.control_rows).push(if keys.is_empty() {
             Vec::new()
         } else {
@@ -493,6 +846,7 @@ impl ScrollPlan {
         std::sync::Arc::make_mut(&mut self.card_captions).insert(index, None);
         std::sync::Arc::make_mut(&mut self.notes).insert(index, false);
         std::sync::Arc::make_mut(&mut self.groups).insert(index, None);
+        std::sync::Arc::make_mut(&mut self.stop_leads).insert(index, 0.0);
         std::sync::Arc::make_mut(&mut self.control_rows).insert(
             index,
             if keys.is_empty() {
@@ -540,8 +894,36 @@ impl ScrollPlan {
         }
     }
 
+    /// Where stop `index` starts under the top of its run's card, where a run starts with it:
+    /// under the card's head and what the stop draws over it there ([`Self::stop_leads`]).
     fn lead_of(&self, index: usize) -> f32 {
-        self.groups[index].map_or(0.0, |group| self.leads[group])
+        self.groups[index].map_or(0.0, |group| self.leads[group] + self.stop_leads[index])
+    }
+
+    /// Say that a screen that starts with the last stop added draws `lead` over it past its
+    /// card's head ([`Self::stop_leads`]).
+    pub(super) fn set_stop_lead(&mut self, lead: f32) {
+        self.kept_limit.forget();
+        if let Some(last) = std::sync::Arc::make_mut(&mut self.stop_leads).last_mut() {
+            *last = lead.max(0.0);
+        }
+    }
+
+    /// The caption band a screen that starts at stop `first` paints under its card's top: its
+    /// card's caption, and under it the name a stop of a row's words alone draws over itself
+    /// there ([`Self::stop_leads`]).
+    fn run_caption(&self, first: usize) -> Option<(f32, f32)> {
+        let group = self.groups.get(first).copied().flatten()?;
+        let lead = self.stop_leads[first];
+        let name = (lead > 0.01).then(|| {
+            let top = self.leads[group];
+            (top, top + lead - self.row_gaps[group])
+        });
+        match (self.captions[group], name) {
+            (Some((top, _)), Some((_, bottom))) => Some((top, bottom)),
+            (caption, None) => caption,
+            (None, name) => name,
+        }
     }
 
     fn closing(&self, group: usize) -> f32 {
@@ -753,6 +1135,7 @@ impl ScrollPlan {
         std::sync::Arc::make_mut(&mut self.card_captions).push(None);
         std::sync::Arc::make_mut(&mut self.notes).push(false);
         std::sync::Arc::make_mut(&mut self.groups).push(Some(group));
+        std::sync::Arc::make_mut(&mut self.stop_leads).push(0.0);
         std::sync::Arc::make_mut(&mut self.control_rows).push(if keys.is_empty() {
             Vec::new()
         } else {
@@ -797,7 +1180,9 @@ impl ScrollPlan {
         match run {
             ScrollRun::Card(k) => self.heights[*k],
             ScrollRun::Group { group, rows } => {
-                self.heads[*group] + self.heights[rows.clone()].iter().sum::<f32>()
+                self.heads[*group]
+                    + self.stop_leads[rows.start]
+                    + self.heights[rows.clone()].iter().sum::<f32>()
             }
         }
     }
@@ -813,7 +1198,9 @@ impl ScrollPlan {
                 while k < range.end && self.groups[k] == Some(group) {
                     k += 1;
                 }
-                span += self.heads[group] + self.heights[start..k].iter().sum::<f32>();
+                span += self.heads[group]
+                    + self.stop_leads[start]
+                    + self.heights[start..k].iter().sum::<f32>();
             } else {
                 span += self.heights[start];
             }
@@ -1012,10 +1399,27 @@ impl ScrollPlan {
         let group = self.groups[start].is_some();
         let cut = group && matches!(caption, Some(caption) if !caption.kept);
         let kept = group && matches!(caption, Some(caption) if caption.kept);
+        // A STOP OF A ROW'S WORDS STARTS THE LAST SCREEN UNDER THE ROW'S NAME: where the seat
+        // cuts the caption over it or its name ([`Self::stop_leads`]), it starts under the name,
+        // its card's head scrolled off, where all that falls past the room's edge then is the
+        // blank under the last stop's ink; a filler of words whose name the seat cuts is given
+        // up. Seated past the name, the words stood alone at the top of the last screen
+        // (Keyboard & Input at 2x in 80x24: Predictive echo's note over Predictive editing;
+        // Window at 2x in 80x24: "to disk." under the cut line before it).
+        let head = self.groups[start].map_or(0.0, |group| self.leads[group]);
+        let words = self.stop_leads[start] > 0.01;
+        let name_cut = words && flush > head + 0.01;
+        let under_name = words
+            && ((cut && !name_cut) || {
+                let content = self.ink[n - 1].max(self.controls_of(n - 1).1);
+                let blank = (self.end_under(n - 1) - content).max(0.0);
+                self.span(start..n) - blank - head <= self.room + self.overhang + 0.01
+            });
         let headed = start < top
             && (kept
                 || blank
                 || veiled
+                || name_cut
                 || cut
                     && self.span(start + 1..n) + 0.5 >= self.span(start..n) - self.lead_of(start));
         let (offset, caption) = if headed {
@@ -1023,6 +1427,8 @@ impl ScrollPlan {
             let (flush, after, caption) = seat(start);
             bare = after;
             (flush, caption)
+        } else if under_name && (cut || name_cut) {
+            (head, None)
         } else if cut {
             (self.lead_of(start), None)
         } else {
@@ -1765,9 +2171,9 @@ impl ScrollPlan {
     /// Whether a screen that starts at stop `top` drops its group's caption: a whole stop beats
     /// its caption, so a row that fits the room only with the caption scrolled off starts bare.
     pub(super) fn starts_bare(&self, top: usize) -> bool {
-        let Some(group) = self.groups.get(top).copied().flatten() else {
+        if self.groups.get(top).copied().flatten().is_none() {
             return false;
-        };
+        }
         if let Some(held) = self.held_start
             && held.top == top
         {
@@ -1780,7 +2186,7 @@ impl ScrollPlan {
         // before it ([`Self::captioned_seat`]): seated under the caption, the keyboard's control
         // (Sound's 130pt Trail style at 2x in 164x98) showed 16pt under SOUND EFFECTS, not a
         // line of it.
-        let lead = self.leads[group];
+        let lead = self.lead_of(top);
         let room = match self.foot {
             ListFoot::Peek => self.room + self.given,
             ListFoot::Whole => self.room,
@@ -1807,9 +2213,31 @@ impl ScrollPlan {
 
     fn seat_drop(&self, top: usize) -> f32 {
         if self.starts_bare(top) {
-            self.lead_of(top)
+            self.bare_drop(top)
         } else {
             0.0
+        }
+    }
+
+    /// What a screen that starts bare at stop `top` drops over it: its card's head, and the name
+    /// a stop of a row's words alone draws over itself there ([`Self::stop_leads`]) only where
+    /// the stop does not show under the name alone. A STOP OF A ROW'S WORDS KEEPS ITS ROW'S NAME
+    /// OVER THE CARD'S HEADING: dropped with the heading, the words stood alone at the screen's
+    /// top, no screen saying whose they were (Harness at 220x208: "aterm keeps your coding
+    /// agents working", Supervise coding agents' note).
+    fn bare_drop(&self, top: usize) -> f32 {
+        let Some(group) = self.groups.get(top).copied().flatten() else {
+            return 0.0;
+        };
+        let name = self.stop_leads[top];
+        let room = match self.foot {
+            ListFoot::Peek => self.room + self.given,
+            ListFoot::Whole => self.room,
+        };
+        if name > 0.01 && self.shows_at(name, top, room) {
+            self.leads[group]
+        } else {
+            self.lead_of(top)
         }
     }
 
@@ -2029,11 +2457,10 @@ impl ScrollPlan {
     /// The seat over stop `top` that draws its run's caption whole above it, as high on the
     /// card as that leaves it ([`Self::landings`]).
     fn captioned_seat(&self, top: usize) -> Option<Seat> {
-        let group = self.groups.get(top).copied().flatten()?;
         if self.foot != ListFoot::Peek || !self.starts_run(top) || self.seat_drop(top) <= 0.01 {
             return None;
         }
-        let (caption_top, caption_bottom) = self.captions[group]?;
+        let (caption_top, caption_bottom) = self.run_caption(top)?;
         let natural = self.stop_screen(top);
         if natural.whole || natural.view.start != top || caption_bottom - caption_top > self.room {
             return None;
@@ -2228,10 +2655,11 @@ impl ScrollPlan {
                     && offset < drawn_end - PEEK_MIN + 0.01
                     && !row_whole
                     && !self.taller_than_room(first);
-                let cuts = self.captions[*group]
+                let cuts = self
+                    .run_caption(first)
                     .is_some_and(|(top, bottom)| offset > top + 0.01 && offset < bottom - 0.01);
                 (kept || cuts).then(|| TopCaption {
-                    lead: self.leads[*group],
+                    lead: self.leads[*group] + self.stop_leads[first],
                     kept,
                 })
             }
@@ -2522,12 +2950,6 @@ impl ScrollPlan {
             .chain(self.within.get(index).into_iter().flatten())
     }
 
-    /// Whether stop `index` is `was`'s there, not one moved in by stops added or dropped above.
-    fn holds_stop_of(&self, was: &Self, index: usize) -> bool {
-        let mut known = was.identities(index).peekable();
-        known.peek().is_none() || known.any(|id| self.identities(index).any(|now| now == id))
-    }
-
     /// The stop that lists node `id` or holds control `id`, else the one that draws it.
     pub(super) fn stop_of_identity(&self, id: &UiKey) -> Option<usize> {
         self.ids
@@ -2640,7 +3062,7 @@ pub(super) struct PressedAt {
     /// Where the bar of the status the press brought stands ([`BarSide`]), whether it stands
     /// there bare of its Undo, and the status it was weighed for, once a render weighed it
     /// ([`SettingsViewState::press_side`]).
-    side: Option<(BarSide, bool, Option<String>)>,
+    side: Option<(BarSide, BarForm, Option<String>)>,
     /// Whether the bar may no longer stand over the top of the list: the person scrolled the
     /// list, or the keyboard went to a control there ([`SettingsViewState::press_band`]).
     band_gone: bool,
@@ -2714,6 +3136,30 @@ pub(super) enum BarSide {
     Over,
     /// In the compact toolbar, where neither side of the list holds it.
     Dock,
+}
+
+/// HOW THE BAR OF A STATUS A PRESS BROUGHT STANDS AT ITS SIDE ([`BarSide`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BarForm {
+    /// Its words and its Undo.
+    Whole,
+    /// Its words alone, where no side holds it with its Undo; the Undo stays on Cmd-Z.
+    Bare,
+    /// Its words alone with no room about them, where only that clears the control pressed (a
+    /// 64pt switch at the top of a 96pt window at 2x, its words' line 32pt).
+    Tight,
+}
+
+impl BarForm {
+    /// Whether the bar stands without its Undo.
+    pub(super) const fn bare(self) -> bool {
+        !matches!(self, Self::Whole)
+    }
+
+    /// Whether the bar stands with no room about its words.
+    pub(super) const fn tight(self) -> bool {
+        matches!(self, Self::Tight)
+    }
 }
 
 /// What a page's reveal ([`SettingsViewState::page_reveal`]) is.
@@ -2921,8 +3367,8 @@ pub(super) struct ScrollRecord {
     beside_shown: bool,
     /// Whether this screen revealed what that first result replaced, as each after it does.
     beside_spent: bool,
-    /// Whether it held the start of a stop moved in at its top, which a let-go seats anew.
-    moved_start: bool,
+    /// Whether it held a start the stops seat otherwise, which a let-go seats anew.
+    start_held: bool,
     hold: bool,
     /// The plan and scroll the screen held, kept across re-measurements
     /// ([`SettingsViewState::seat_scroll`], [`SettingsViewState::settle_page_scroll`],
@@ -2941,9 +3387,9 @@ impl ScrollRecord {
         self.keyboard.as_ref()
     }
 
-    /// Whether this screen held the start of a stop moved in at its top, which a let-go seats anew.
-    pub(super) const fn holds_moved_start(&self) -> bool {
-        self.moved_start
+    /// Whether this screen held a start the stops seat otherwise, which a let-go seats anew.
+    pub(super) const fn holds_start(&self) -> bool {
+        self.start_held
     }
 
     /// Forget that the list's top showed a pinned filter's first result whole.
@@ -3117,18 +3563,12 @@ impl SettingsViewState {
                     && record.top == top
                     && (record.plan.room - plan.room).abs() < 0.5
             })
-            .map(|record| {
-                let moved = !plan.holds_stop_of(&record.plan, top);
-                (record.plan.held_seat(record.top), moved)
-            });
-        // A stop moved in by stops added or dropped above holds the seat too, unless let go (R2).
+            .map(|record| record.plan.held_seat(record.top));
+        // A start now seated otherwise, moved in from above or grown, holds unless let go (R2).
         plan.hold_start(None);
-        let moved_start = held_start
-            .is_some_and(|(held, moved)| moved && plan.held_seat(top) != held)
-            .then_some(!self.start_let_go.get());
-        let held_start = held_start
-            .filter(|_| moved_start != Some(false))
-            .map(|(held, _)| held);
+        let anew = held_start.is_some_and(|held| plan.held_seat(top) != held);
+        let let_go = anew && self.start_let_go.get();
+        let held_start = held_start.filter(|_| !let_go);
         plan.hold_start(held_start);
         let first_screen = self
             .scroll_record
@@ -3478,7 +3918,7 @@ impl SettingsViewState {
             keyboard: focus.cloned(),
             beside_shown,
             beside_spent,
-            moved_start: moved_start == Some(true) && plan.held_start.is_some(),
+            start_held: anew && !let_go && plan.held_start.is_some(),
             landed,
             hold: true,
             place,
@@ -3680,7 +4120,7 @@ impl SettingsViewState {
         self.list_reseated.set(true);
     }
 
-    fn listed_on_page(&self, key: &UiKey) -> bool {
+    pub(super) fn listed_on_page(&self, key: &UiKey) -> bool {
         let context = self.scroll_context();
         self.scroll_record
             .borrow()
@@ -3697,6 +4137,16 @@ impl SettingsViewState {
             .as_ref()
             .filter(|record| record.context == context)
             .map(|record| record.plan.clone())
+    }
+
+    /// How far under its list's top the screen last seated lays rows, no further than its room.
+    pub(super) fn rows_laid_to(&self) -> Option<f32> {
+        let context = self.scroll_context();
+        let record = self.scroll_record.borrow();
+        let record = record.as_ref().filter(|record| record.context == context)?;
+        let plan = &record.plan;
+        let screen = plan.screen(record.top.min(plan.limit()));
+        Some((plan.span(screen.view.start..plan.len()) - screen.offset).min(plan.room))
     }
 
     /// The stops the last render of this page showed, as it drew them.
@@ -3874,6 +4324,32 @@ impl SettingsViewState {
             })
     }
 
+    /// Whether the last screen cuts the keyboard's listed control where its list can show it whole.
+    pub(super) fn keyboard_cut_here(&self) -> bool {
+        let Some(key) = self.common.last_focus.as_ref() else {
+            return false;
+        };
+        let context = self.scroll_context();
+        let record = self.scroll_record.borrow();
+        record
+            .as_ref()
+            .filter(|record| record.context == context)
+            .is_some_and(|record| {
+                let plan = &record.plan;
+                let Some(index) = plan.stop_of(key) else {
+                    return false;
+                };
+                let (from, to) = plan
+                    .control_span(index, key)
+                    .unwrap_or_else(|| plan.controls_of(index));
+                let whole = |top: usize| {
+                    let left = Left::on(plan, key, top);
+                    left.whole || left.part + 0.5 >= to - from
+                };
+                !whole(record.top) && (0..=plan.limit()).any(whole)
+            })
+    }
+
     /// Whether a screen seated now precedes the first event, as [`Self::landing_cut`] reads it.
     pub(super) fn seats_opening(&self) -> bool {
         let context = self.scroll_context();
@@ -3945,26 +4421,6 @@ impl SettingsViewState {
                     .plan
                     .stop_holding(reveal)
                     .is_some_and(|index| !record.plan.shows_landing(index, record.top))
-            })
-    }
-
-    /// Whether the screen last seated paints any of what the list reveals beside the keyboard.
-    pub(super) fn reveal_painted(&self) -> bool {
-        let Some(reveal) = self.reveal_owed() else {
-            return false;
-        };
-        let context = self.scroll_context();
-        let record = self.scroll_record.borrow();
-        record
-            .as_ref()
-            .filter(|record| record.context == context)
-            .is_some_and(|record| {
-                let plan = &record.plan;
-                plan.stop_holding(reveal).is_some_and(|index| {
-                    let screen = plan.screen(record.top.min(plan.limit()));
-                    let span = plan.revealed_span(index, Reveal::Keep);
-                    plan.painted_of_span_on(&screen, index, reveal, span) > 0.0
-                })
             })
     }
 
@@ -4285,23 +4741,27 @@ impl SettingsViewState {
         )
     }
 
-    /// Where a render put the bar of the status a press brought ([`BarSide`]), whether bare of
-    /// its Undo, and whether it weighed it for the status standing now.
-    pub(super) fn press_side(&self) -> Option<(BarSide, bool, bool)> {
+    /// Where a render put the bar of the status a press brought ([`BarSide`]), in which form
+    /// ([`BarForm`]), and whether it weighed it for the status standing now.
+    pub(super) fn press_side(&self) -> Option<(BarSide, BarForm, bool)> {
         let status = self.bar_feedback();
         self.pressed_at.borrow().as_ref().and_then(|at| {
             at.side
                 .as_ref()
-                .map(|(side, bare, weighed)| (*side, *bare, weighed.as_ref() == status))
+                .map(|(side, form, weighed)| (*side, *form, weighed.as_ref() == status))
         })
     }
 
-    /// Put the bar of the status standing now, which a press brought, at `side`, `bare` of its
-    /// Undo or not.
-    pub(super) fn settle_press_side(&self, side: BarSide, bare: bool) {
+    /// Where the control a press found ends, down from its list's top, as the press found it.
+    pub(super) fn pressed_end(&self) -> Option<f32> {
+        self.pressed_at.borrow().as_ref().map(|at| at.bottom)
+    }
+
+    /// Put the bar of the status standing now, which a press brought, at `side` in `form`.
+    pub(super) fn settle_press_side(&self, side: BarSide, form: BarForm) {
         let status = self.bar_feedback().cloned();
         if let Some(at) = self.pressed_at.borrow_mut().as_mut() {
-            at.side = Some((side, bare, status));
+            at.side = Some((side, form, status));
         }
     }
 
@@ -4573,10 +5033,19 @@ impl SettingsViewState {
             })
             .collect();
         let keyboard = focus.and_then(|key| plan.stop_holding(key).or_else(|| plan.stop_of(key)));
+        // A pinned filter's first result asks no room for the caption a screen starting bare drops.
+        let bare_first = self
+            .first_beside()
+            .filter(|(first, _)| reveal == Some(first))
+            .and_then(|(first, _)| plan.stop_holding(first))
+            .filter(|&index| index <= plan.limit() && plan.starts_bare(index));
         let mut overrun = 0.0_f32;
         for &(index, (top, bottom)) in &spans {
             let seated = (plan.foot == ListFoot::Whole)
-                .then(|| plan.stop_top(index.min(plan.limit()), index) + bottom)
+                .then(|| match bare_first {
+                    Some(first) if first == index => bottom,
+                    _ => plan.stop_top(index.min(plan.limit()), index) + bottom,
+                })
                 .filter(|need| *need <= room + 0.01);
             overrun = overrun.max(note(
                 seated.unwrap_or(bottom - top),
@@ -5407,6 +5876,7 @@ fn list_screen_node(
     screen: &Screen,
     mut children: Vec<UiNode>,
 ) -> UiNode {
+    quiet_row_captions(&mut children);
     let mut offset = screen.offset;
     if let (Some(caption), Some(first)) = (screen.caption, children.first_mut()) {
         if caption.kept && keep_caption(first, caption.lead, offset) {
@@ -5460,6 +5930,8 @@ fn list_screen_node(
             focusable: false,
             focused: false,
             focus_visible: false,
+            progress: None,
+            motion: None,
         }),
     )
     .layout(
@@ -5527,6 +5999,51 @@ fn keep_caption(card: &mut UiNode, caption: f32, offset: f32) -> bool {
     .paint_only();
     card.children.push(scrolled);
     true
+}
+
+/// `children`, the stops a list's screen draws, each split row named once
+/// ([`named_row_parts`]): by its name where the screen draws it, else by the first of its
+/// parts' captions; the others' lines stand empty, keeping their room. A ROW'S NAME IS SAID
+/// ONCE ON A SCREEN: said under the row's name and control, the next part's caption read as
+/// the name of a row of its own (Cursor & Motion at 164x96: "Motion", Automatic, then
+/// "Motion" again over the Animate the screen cut off).
+fn quiet_row_captions(children: &mut [UiNode]) {
+    fn setting_of<'a>(key: &'a str, prefix: &str) -> Option<&'a str> {
+        key.strip_prefix(prefix)?.split('/').next()
+    }
+    fn labelled(node: &UiNode, out: &mut Vec<String>) {
+        if let Some(setting) = setting_of(node.key.as_str(), "settings/label/") {
+            out.push(setting.to_string());
+            return;
+        }
+        for child in &node.children {
+            labelled(child, out);
+        }
+    }
+    fn quiet(node: &mut UiNode, named: &mut Vec<String>) {
+        if let Some(setting) = setting_of(node.key.as_str(), ROW_CAPTION) {
+            if named.iter().any(|seen| seen == setting) {
+                for line in &mut node.children {
+                    if let UiContent::Text(spec) = &mut line.content {
+                        spec.text.clear();
+                    }
+                }
+            } else {
+                named.push(setting.to_string());
+            }
+            return;
+        }
+        for child in &mut node.children {
+            quiet(child, named);
+        }
+    }
+    let mut named = Vec::new();
+    for child in children.iter() {
+        labelled(child, &mut named);
+    }
+    for child in children {
+        quiet(child, &mut named);
+    }
 }
 
 fn hide_cut_caption(card: &mut UiNode, caption: f32, offset: f32) {
@@ -5923,33 +6440,60 @@ impl SplitCard {
             })
     }
 
-    /// The card holding `rows`, its head over them ([`Self::repeat`] past its first row).
+    /// The card holding `rows`, its head over them ([`Self::repeat`] past its first row), and
+    /// past its first row the name of the row whose words alone its first holds
+    /// ([`Self::stop_lead`]).
     pub(super) fn node(&self, rows: Range<usize>) -> UiNode {
         let head = if rows.start > 0 && !self.repeat.is_empty() {
             &self.repeat
         } else {
             &self.head
         };
-        self.node_under(head, rows)
+        self.node_under(head, rows, true)
     }
 
-    /// The card holding `rows` under `head`.
-    fn node_under(&self, head: &[(UiNode, f32)], rows: Range<usize>) -> UiNode {
+    /// What a screen that starts with the stop of `rows` draws over its first row past the
+    /// card's head: where that row holds a row's words alone, parted from the row's name, the
+    /// name ([`words_caption_marker`]), as tall as it stands; else nothing.
+    pub(super) fn stop_lead(&self, rows: &Range<usize>) -> f32 {
+        match self.rows.get(rows.start) {
+            Some((node, _)) if rows.start > 0 => words_lead(node, self.gap),
+            _ => 0.0,
+        }
+    }
+
+    /// The card holding `rows` under `head`, its first row past the card's first led by the name
+    /// it keeps where `led` says so ([`Self::stop_lead`]).
+    fn node_under(&self, head: &[(UiNode, f32)], rows: Range<usize>, led: bool) -> UiNode {
+        let mut grow = 0.0;
+        let mut children: Vec<UiNode> = head.iter().map(|(node, _)| node.clone()).collect();
+        for (at, (node, _)) in self.rows[rows.clone()].iter().enumerate() {
+            let mut node = node.clone();
+            if led
+                && at == 0
+                && rows.start > 0
+                && let Some((caption, tall)) = take_words_caption(&mut node)
+            {
+                // Under the card's head, as the head's own rows stand: kept with it over the
+                // rows a screen scrolls under them ([`keep_caption`]), hidden with it where cut
+                // ([`hide_cut_caption`]).
+                children.push(caption);
+                grow = tall + self.gap;
+            } else {
+                strip_words_caption(&mut node);
+            }
+            children.push(node);
+        }
         UiNode::new(self.key.clone(), UiContent::Group(self.spec.clone()))
             .layout(
                 Layout::column()
                     .width(Length::Fill)
-                    .height(Length::Fixed(self.height_under(head, rows.clone())))
+                    .height(Length::Fixed(self.height_under(head, rows) + grow))
                     .padding(self.padding)
                     .gap(self.gap)
                     .clipped(),
             )
-            .children(
-                head.iter()
-                    .map(|(node, _)| node.clone())
-                    .chain(self.rows[rows].iter().map(|(node, _)| node.clone()))
-                    .collect(),
-            )
+            .children(children)
     }
 }
 
@@ -5966,13 +6510,22 @@ impl SplitCard {
     }
 
     /// Whether the head the card repeats over every screen of its rows starves them: the room
-    /// under it holds less than the head. Then the head is the card's first row, and scrolls
-    /// away. (A row that fits only without the head starts its screen bare instead,
-    /// [`ScrollPlan::starts_bare`], the head kept over every other.)
+    /// under it holds less than the head, or, over rows of words alone, no more than the head
+    /// and the card's edges take of the screen. Then the head is the card's first row, and
+    /// scrolls away. (A row that fits only without the head starts its screen bare instead,
+    /// [`ScrollPlan::starts_bare`], the head kept over every other.) A SCREEN OF WORDS PAGES BY
+    /// ITS ROOM: Harness's SESSIONS (48pt with the card's edges at 2x in a 164x96 window) was
+    /// kept over the 48pt it left its paragraph, a line a screen, a Page Down a line. Over
+    /// controls the head stays where it leaves them its own height, naming what they set.
     fn head_starves(&self, room: f32) -> bool {
+        if self.head.is_empty() || self.rows.is_empty() {
+            return false;
+        }
+        let rows = self.row_limit(room);
         let head = self.head.iter().map(|(_, height)| height).sum::<f32>()
             + self.head.len().saturating_sub(1) as f32 * self.gap;
-        !self.head.is_empty() && !self.rows.is_empty() && self.row_limit(room) < head - 0.01
+        let words = !self.rows.iter().any(|(node, _)| holds_control(node));
+        rows < head - 0.01 || (words && rows <= room - rows + 0.01)
     }
 
     /// Whether the card is laid out again for a screen `room` tall.
@@ -6018,7 +6571,11 @@ impl SplitCard {
                         limit
                     };
                     if card.splits(&row, room) {
-                        row_parts(row, limit, room, card.gap)
+                        named_row_parts(
+                            row,
+                            (limit, room, card.gap),
+                            (room - card.padding.top - card.padding.bottom, limit),
+                        )
                     } else {
                         vec![row]
                     }
@@ -6349,6 +6906,7 @@ fn plan_items_measured(
                             .flat_map(|(node, _)| keys(node))
                             .collect(),
                     );
+                    plan.set_stop_lead(card.stop_lead(&rows));
                     if !measured {
                         stops.push((index, Some(rows)));
                         continue;
@@ -6555,7 +7113,7 @@ impl SeatedList {
                     } else {
                         &[]
                     };
-                    let mut node = card.node_under(head, first..last).offscreen();
+                    let mut node = card.node_under(head, first..last, false).offscreen();
                     node.key = UiKey::new(format!("{}/{side}", card.key));
                     Some(node)
                 }
@@ -6947,6 +7505,8 @@ mod tests {
                     focusable: true,
                     focused: false,
                     focus_visible: false,
+                    progress: None,
+                    motion: None,
                 }),
             )
         };
@@ -7011,6 +7571,8 @@ mod tests {
                     focusable: true,
                     focused: false,
                     focus_visible: false,
+                    progress: None,
+                    motion: None,
                 }),
             )
         };
@@ -7089,6 +7651,8 @@ mod tests {
                 focusable: true,
                 focused: false,
                 focus_visible: false,
+                progress: None,
+                motion: None,
             }),
         );
         let card = SplitCard {
@@ -7644,6 +8208,8 @@ mod tests {
                         focusable: false,
                         focused: false,
                         focus_visible: false,
+                        progress: None,
+                        motion: None,
                     }),
                 )
                 .paint_only(),

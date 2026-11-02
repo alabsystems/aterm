@@ -70,15 +70,30 @@ impl Grid {
     #[cfg(test)]
     pub fn tab_n(&mut self, n: u16) {
         for _ in 0..n {
+            let col = self.storage.cursor.col;
             self.tab();
+            if self.storage.cursor.col == col {
+                break;
+            }
         }
     }
 
     /// Margin-aware tab forward by n stops (DECLRMM).
+    ///
+    /// A step's target is a function of the cursor column alone (its row, the margins and the
+    /// stops stay put), so a step that leaves the column where it was leaves it there for every
+    /// step after: the loop stops there, as xterm's CHT stops when `TabToNextStop` fails, and
+    /// costs at most one step per column whatever `n` (up to 65535) asks.
     #[inline]
     pub fn tab_n_margin(&mut self, n: u16, left_right_margin_mode: bool) {
         for _ in 0..n {
+            #[cfg(any(test, debug_assertions))]
+            crate::test_counters::count_tab_step();
+            let col = self.storage.cursor.col;
             self.tab_margin(left_right_margin_mode);
+            if self.storage.cursor.col == col {
+                break;
+            }
         }
     }
 
@@ -127,15 +142,26 @@ impl Grid {
     #[cfg(test)]
     pub fn back_tab_n(&mut self, n: u16) {
         for _ in 0..n {
+            let col = self.storage.cursor.col;
             self.back_tab();
+            if self.storage.cursor.col == col {
+                break;
+            }
         }
     }
 
-    /// Margin-aware back tab by n stops (see [`Grid::back_tab_margin`]).
+    /// Margin-aware back tab by n stops (see [`Grid::back_tab_margin`]), stopping at the first
+    /// step that leaves the column where it was, as [`Grid::tab_n_margin`] does.
     #[inline]
     pub fn back_tab_n_margin(&mut self, n: u16, left_right_margin_mode: bool, origin_mode: bool) {
         for _ in 0..n {
+            #[cfg(any(test, debug_assertions))]
+            crate::test_counters::count_tab_step();
+            let col = self.storage.cursor.col;
             self.back_tab_margin(left_right_margin_mode, origin_mode);
+            if self.storage.cursor.col == col {
+                break;
+            }
         }
     }
 

@@ -19,6 +19,9 @@ pub(crate) enum ShaderLibrary {
     Bloom,
     /// `shaders/shimmer.{metal,glsl,hlsl}`.
     Shimmer,
+    /// `shaders/tray_prims.metal`: the GPU tray prims ([`TRAY_PRIMS`]), Metal's alone.
+    #[cfg(target_os = "macos")]
+    TrayPrims,
 }
 
 impl ShaderLibrary {
@@ -33,18 +36,20 @@ impl ShaderLibrary {
             Self::Tray => "tray",
             Self::Bloom => "bloom",
             Self::Shimmer => "shimmer",
+            Self::TrayPrims => "tray_prims",
         }
     }
 
     /// All shader libraries in declaration order.
     #[cfg(all(test, target_os = "macos"))]
-    pub(crate) const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 7] = [
         Self::Cell,
         Self::Blit,
         Self::HdrGlow,
         Self::Tray,
         Self::Bloom,
         Self::Shimmer,
+        Self::TrayPrims,
     ];
 }
 
@@ -535,6 +540,31 @@ impl BindSpec {
         vertex_items: Some(0),
         ..Self::CROWN
     };
+    /// The tray prims ([`TRAY_PRIMS`]): `TrayPrimsUniform` at vertex and fragment
+    /// `[[buffer(2)]]`, the composite law at fragment `[[buffer(1)]]` and the
+    /// instances at fragment `[[buffer(3)]]` (the vertex stage reads them at
+    /// the instance stream's slot); no texture, since the card is fetched.
+    #[cfg(target_os = "macos")]
+    const TRAY_PRIMS: Self = Self {
+        vertex_uniform: Some(2),
+        fragment_textures: &[],
+        fragment_samplers: &[],
+        fragment_buffers: &[2, 1, 3],
+        fragment_palette: None,
+        vertex_items: None,
+    };
+    /// One card of the tray stack ([`TRAY_LAYER`]): `TrayLayerUniform` at vertex
+    /// and fragment `[[buffer(2)]]`, the composite law at fragment
+    /// `[[buffer(1)]]`, the card read (no sampler) at fragment texture 0.
+    #[cfg(target_os = "macos")]
+    const TRAY_LAYER: Self = Self {
+        vertex_uniform: Some(2),
+        fragment_textures: &[0],
+        fragment_samplers: &[],
+        fragment_buffers: &[2, 1],
+        fragment_palette: None,
+        vertex_items: None,
+    };
     /// The tray: placement uniform at vertex `[[buffer(2)]]`, card texture and
     /// linear sampler at fragment 0.
     const TRAY: Self = Self {
@@ -896,6 +926,43 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         binds: BindSpec::CROWN_ITEMS,
     },
 ];
+
+/// The GPU tray prims (`shaders/tray_prims.metal`, docs/DESIGN-stats-deck-gpu-motion-2026-10-26.md
+/// §3.2), Metal's own row outside [`PIPELINES`] (no GL or D3D11 twin): instanced quads into a
+/// card's Rgba8Unorm texture, each fragment fetching the stored byte (`[[color(0)]]`, an Apple GPU)
+/// and storing the CPU raster's composite of it, so no fixed-function blend.
+#[cfg(target_os = "macos")]
+pub(crate) const TRAY_PRIMS: PipelineSpec = PipelineSpec {
+    label: "aterm-gpu tray prims pipeline",
+    library: ShaderLibrary::TrayPrims,
+    vs: "vs_tray_prim",
+    fs: "fs_tray_prim",
+    target: TargetRole::OffscreenUnorm,
+    blend: None,
+    write_mask: WriteMask::All,
+    vertex: VertexLayout::None,
+    #[cfg(any(gl_arm, d3d11_arm, test))]
+    topology: Topology::TriangleStrip,
+    binds: BindSpec::TRAY_PRIMS,
+};
+
+/// One card of a window's tray stack folded into the stack's card
+/// (`shaders/tray_prims.metal`'s `fs_tray_layer`, design §3.3), by the same
+/// fetched composite as [`TRAY_PRIMS`]; Metal's own row likewise.
+#[cfg(target_os = "macos")]
+pub(crate) const TRAY_LAYER: PipelineSpec = PipelineSpec {
+    label: "aterm-gpu tray layer pipeline",
+    library: ShaderLibrary::TrayPrims,
+    vs: "vs_tray_layer",
+    fs: "fs_tray_layer",
+    target: TargetRole::OffscreenUnorm,
+    blend: None,
+    write_mask: WriteMask::All,
+    vertex: VertexLayout::None,
+    #[cfg(any(gl_arm, d3d11_arm, test))]
+    topology: Topology::TriangleStrip,
+    binds: BindSpec::TRAY_LAYER,
+};
 
 /// Total number of entries in [`PIPELINES`].
 pub(crate) const PIPELINE_COUNT: usize = 24;

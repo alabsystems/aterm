@@ -6,7 +6,6 @@
 use std::process::ExitCode;
 
 use aterm_uds::lifeline::OnWake;
-use aterm_uds::listener::names_now;
 
 use crate::bridge::{Bridge, Config};
 use crate::transport;
@@ -388,6 +387,7 @@ fn broker(args: &[String]) -> ExitCode {
 usage: aterm link broker <socket> [log] [--secret-file <path>] [--durability <tier>]
                          [--lifeline-fd <n>]
        aterm link broker --repair <log>
+       aterm link broker --retire-log <log>
 
   <socket>             the Unix socket the bridges' `--broker` names (keep it in a 0700
                        dir: nothing checks)
@@ -417,6 +417,19 @@ usage: aterm link broker <socket> [log] [--secret-file <path>] [--durability <ti
   --repair <log>       cut <log> at its first corrupt record and exit (`nothing to repair`
                        when clean; refused while a running broker holds it, or for a log a
                        newer aterm wrote)
+  --retire-log <log>   give up a log that will not open (a sealed log whose key is gone):
+                       move it, its sidecars and its key to a `retired-<ms>` folder beside
+                       it, nothing deleted, and mint a new key, so the next start begins a
+                       new log with a new identity; refused while it opens or a broker
+                       holds it, and for a folder or a file that is no log. One a crash
+                       stopped is run again: until then a start refuses and mints nothing
+
+A `rest.key` beside <log> (`aterm fabric on` mints one; 32 bytes, 0600, in a 0700 dir)
+seals the log and its sidecars at rest: a plaintext log is sealed once at this start, under its
+lock, and a sealed log whose key is missing or damaged is refused, naming the way out. On macOS
+the key carries the mark Time Machine honours. No other system has a mark, so a backup tool
+there has to be told to skip it. It protects the log in backups that leave the key out and in
+copies made without the key, not against a process of this user or a copy of the whole folder.
 
 Prints `listening <socket>` once bound and keeps `<log>.health` (0600) beside the log.
 Exits 0 when its executable is replaced, its lifeline ends, or its socket path is removed
@@ -443,19 +456,30 @@ so every session that node serves names it in `inbox` (`given_up=`) and marks it
     let lifeline_fd = parsed.lifeline_fd.cloned();
     let lifeline_at = parsed.lifeline_at;
     let repair = parsed.repair;
+    let retire = parsed.retire_log;
     let words: Vec<&str> = parsed.words.iter().map(|word| word.as_str()).collect();
-    if repair {
+    if repair && retire {
+        eprintln!("aterm link broker: --repair and --retire-log are two ways out: name one");
+        eprint!("{USAGE}");
+        return ExitCode::from(2);
+    }
+    if repair || retire {
+        let flag = if repair { "--repair" } else { "--retire-log" };
         if secret_file.is_some() || durability.is_some() || lifeline_fd.is_some() {
-            eprintln!("aterm link broker: --repair takes <log> alone: it serves nothing");
+            eprintln!("aterm link broker: {flag} takes <log> alone: it serves nothing");
             eprint!("{USAGE}");
             return ExitCode::from(2);
         }
         let [log] = words.as_slice() else {
-            eprintln!("aterm link broker: --repair takes exactly one <log>");
+            eprintln!("aterm link broker: {flag} takes exactly one <log>");
             eprint!("{USAGE}");
             return ExitCode::from(2);
         };
-        return repair_log(log);
+        return if repair {
+            repair_log(log)
+        } else {
+            retire_log(log)
+        };
     }
     let usage_error = |why: &str| {
         eprintln!("aterm link broker: {why}");
@@ -512,13 +536,29 @@ so every session that node serves names it in `inbox` (`given_up=`) and marks it
         .then(|| take_stop_signals(std::thread::current()))
         .flatten();
     let seam = crate::broker_health::Seam::from_env(std::path::Path::new(&log));
+    let at_rest = match crate::at_rest::prepare(
+        std::path::Path::new(&log),
+        aterm_uds::backup::Backups::SYSTEM,
+    ) {
+        Ok(at_rest) => at_rest,
+        Err(refused) => {
+            eprintln!("aterm link broker: {}", refused.why);
+            eprintln!("aterm link broker: {}", refused.remedy);
+            return ExitCode::FAILURE;
+        }
+    };
+    for note in &at_rest.notes {
+        eprintln!("aterm link broker: {note}");
+    }
     let opened = crate::durability::open_escalating(
         std::path::Path::new(&log),
         secret,
         durability,
         boot,
         seam.escalation(),
+        at_rest.key.as_ref().map(crate::at_rest::Key::bytes),
     );
+    drop(at_rest);
     let broker = match opened {
         Ok(opened) => {
             use std::io::Write as _;
@@ -542,7 +582,9 @@ so every session that node serves names it in `inbox` (`given_up=`) and marks it
         }
         Err(e) => {
             eprintln!("aterm link broker: open {log}: {e}");
-            if let Some(remedy) = log_refusal_remedy(e.kind(), &log) {
+            if let Some(remedy) = crate::at_rest::open_remedy(std::path::Path::new(&log), e.kind())
+                .or_else(|| log_refusal_remedy(e.kind(), &log))
+            {
                 eprintln!("aterm link broker: {remedy}");
             }
             return ExitCode::FAILURE;
@@ -577,7 +619,6 @@ so every session that node serves names it in `inbox` (`given_up=`) and marks it
             return ExitCode::FAILURE;
         }
     };
-    let bound = aterm_uds::listener::listener_read(&endpoint);
     if let Err(e) = broker.keep_health(crate::broker_health::HEALTH_EVERY) {
         eprintln!(
             "aterm link broker: {}: could not write its health ({e}); astream tries again every \
@@ -598,13 +639,14 @@ so every session that node serves names it in `inbox` (`given_up=`) and marks it
         let _ = writeln!(
             std::io::stderr(),
             "aterm link broker: unix socket on {endpoint}{guard_note}, durability {}: {}; \
-             {retained}; log {}",
+             {retained}; at-rest={}; log {}",
             durability.name(),
             crate::durability::describe_served(
                 durability,
                 Some(broker.served_durability()),
                 Some(guarded)
             ),
+            crate::at_rest::word(std::path::Path::new(&log)),
             broker.log_identity()
         );
     }
@@ -629,16 +671,22 @@ so every session that node serves names it in `inbox` (`given_up=`) and marks it
             }
             poisoned => poisoned,
         };
-        let why = if let Some(sig) = stop.as_ref().and_then(StopSignal::taken) {
-            format!("stopped by {sig}")
-        } else if let Some(reason) = poisoned {
-            use std::io::Write as _;
-            let restart = (!crate::broker_health::supervised()).then(|| {
+        // How to start this broker again by hand, when no `aterm fabric on` job runs it: what
+        // an exit that leaves it to its supervisor says instead (the poisoned log, a replaced
+        // build; fix unit E5).
+        let restart = || {
+            (!crate::broker_health::supervised()).then(|| {
                 let argv: Vec<String> = std::env::args_os()
                     .map(|a| a.to_string_lossy().into_owned())
                     .collect();
                 crate::fabric::shown_argv(&by_hand(argv, args.len(), lifeline_at))
-            });
+            })
+        };
+        let why = if let Some(sig) = stop.as_ref().and_then(StopSignal::taken) {
+            format!("stopped by {sig}")
+        } else if let Some(reason) = poisoned {
+            use std::io::Write as _;
+            let restart = restart();
             drop(keep);
             drop(broker);
             let _ = writeln!(
@@ -649,7 +697,7 @@ so every session that node serves names it in `inbox` (`given_up=`) and marks it
             return ExitCode::from(crate::broker_health::POISONED_EXIT);
         } else if let Some(end) = ends_itself(
             lifeline.as_mut().and_then(OnWake::cut),
-            path_named(&endpoint, &bound),
+            path_named(&endpoint, keep.names_listener()),
         ) {
             end.words(&endpoint)
         } else {
@@ -663,10 +711,7 @@ so every session that node serves names it in `inbox` (`given_up=`) and marks it
             if !w.poll() {
                 continue;
             }
-            format!(
-                "{} was replaced by another build; exiting so the supervisor starts that one",
-                w.path.display()
-            )
+            crate::broker_health::replaced_line(&w.path.display().to_string(), restart().as_deref())
         };
         use std::io::Write as _;
         let mut err = std::io::stderr();
@@ -699,6 +744,9 @@ pub const PATH_GONE_WORDS: &str = "is gone, so no client can reach this broker";
 
 fn adopt_lifeline(number: &str) -> Result<OnWake, String> {
     let flag = aterm_uds::lifeline::FLAG;
+    if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("{flag} {number} is not a descriptor number"));
+    }
     let fd: i32 = number
         .parse()
         .map_err(|_| format!("{flag} {number} is not a descriptor number"))?;
@@ -757,14 +805,19 @@ fn ends_itself(
     }
 }
 
-fn path_named(
-    endpoint: &str,
-    bound: &std::io::Result<Option<aterm_uds::listener::ListenerId>>,
-) -> Option<aterm_uds::listener::Named> {
-    match bound {
-        Ok(Some(bound)) => Some(names_now(endpoint, *bound)),
-        Ok(None) => Some(aterm_uds::listener::Named::Nothing),
-        Err(_) => None,
+/// What `endpoint` names now, given `ours`: whether it names the broker's listener by the
+/// identity astream recorded for it ([`astream_broker::BrokerHandle::names_listener`]), read
+/// before the path named it unless `serve` had to bind the path itself, never by a read of
+/// the path after `serve` returned. `None` when `ours` cannot tell.
+fn path_named(endpoint: &str, ours: Option<bool>) -> Option<aterm_uds::listener::Named> {
+    use aterm_uds::listener::Named;
+    if ours? {
+        return Some(Named::Same);
+    }
+    match aterm_uds::listener::listener_read(endpoint) {
+        Ok(Some(_)) => Some(Named::Another),
+        Ok(None) => Some(Named::Nothing),
+        Err(_) => Some(Named::Unread),
     }
 }
 
@@ -848,6 +901,9 @@ pub fn log_refusal_remedy(kind: std::io::ErrorKind, log: &str) -> Option<String>
 }
 
 fn repair_log(log: &str) -> ExitCode {
+    if let Some(refused) = crate::at_rest::unfinished_retire(std::path::Path::new(log)) {
+        return refuse_repair(&refused);
+    }
     match std::fs::metadata(log) {
         Ok(m) if m.is_file() => {}
         Ok(_) => {
@@ -859,8 +915,30 @@ fn repair_log(log: &str) -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
-    let said = match astream_broker::BrokerLog::open_repair(log, astream_broker::Durability::Strict)
-    {
+    // By the seal, not by the key: a key beside a plaintext log the seal could not take (a damaged
+    // one, say) repairs keyless, and a sealed log never does.
+    let at = std::path::Path::new(log);
+    let opened = if crate::at_rest::is_sealed(at) {
+        match crate::at_rest::read_key(at) {
+            crate::at_rest::KeyFile::Held(key) => astream_broker::BrokerLog::open_encrypted_repair(
+                log,
+                astream_broker::Durability::Strict,
+                key.bytes(),
+            ),
+            crate::at_rest::KeyFile::Damaged(problem) => {
+                return refuse_repair(&crate::at_rest::refusal(at, &problem));
+            }
+            crate::at_rest::KeyFile::Absent => {
+                return refuse_repair(&crate::at_rest::refusal(
+                    at,
+                    &format!("{}: no such file", crate::at_rest::key_path(at).display()),
+                ));
+            }
+        }
+    } else {
+        astream_broker::BrokerLog::open_repair(log, astream_broker::Durability::Strict)
+    };
+    let said = match opened {
         Ok((_, 0)) => format!("{log}: nothing to repair"),
         Ok((_, dropped)) => {
             format!("{log}: repaired, dropped {dropped} byte(s) from the corrupt record on")
@@ -878,6 +956,8 @@ fn repair_log(log: &str) -> ExitCode {
                 if let Some(remedy) = log_refusal_remedy(e.kind(), log) {
                     eprintln!("aterm link broker --repair: {remedy}");
                 }
+            } else if let Some(remedy) = crate::at_rest::repair_remedy(at, e.kind()) {
+                eprintln!("aterm link broker --repair: {remedy}");
             }
             return ExitCode::FAILURE;
         }
@@ -885,6 +965,41 @@ fn repair_log(log: &str) -> ExitCode {
     use std::io::Write as _;
     let _ = writeln!(std::io::stdout().lock(), "{said}");
     ExitCode::SUCCESS
+}
+
+/// A repair that does not run: the log untouched, and the way out.
+fn refuse_repair(refused: &crate::at_rest::Refused) -> ExitCode {
+    eprintln!("aterm link broker --repair: {}", refused.why);
+    eprintln!("aterm link broker --repair: {}", refused.remedy);
+    ExitCode::FAILURE
+}
+
+fn retire_log(log: &str) -> ExitCode {
+    match crate::at_rest::retire(
+        std::path::Path::new(log),
+        aterm_uds::backup::Backups::SYSTEM,
+    ) {
+        Ok(retired) => {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stdout().lock(),
+                "{log}: retired to {} ({}), nothing deleted; {}the next start begins a new log \
+                 with a new identity, and a key found later still reads the retired one",
+                retired.to.display(),
+                retired.moved.join(" "),
+                if retired.minted {
+                    "a new key is minted; "
+                } else {
+                    ""
+                }
+            );
+            ExitCode::SUCCESS
+        }
+        Err(why) => {
+            eprintln!("aterm link broker --retire-log: {why}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 const EXE_WATCH: std::time::Duration = std::time::Duration::from_secs(30);
@@ -1197,19 +1312,65 @@ mod tests {
     fn a_path_gone_before_the_first_look_ends_the_broker() {
         use aterm_uds::listener::Named;
         let gone = "/nonexistent-aterm-link-dir/b.sock";
-        let unbound = path_named(gone, &Ok(None));
+        let unbound = path_named(gone, Some(false));
         assert!(
             matches!(ends_itself(None, unbound), Some(SelfEnd::PathGone)),
             "a path gone before the first look: {unbound:?}"
         );
-        let unread = path_named(gone, &Err(std::io::Error::other("EIO")));
+        let unread = path_named(gone, None);
         assert!(
             ends_itself(None, unread).is_none(),
-            "a bind-time read that failed: {unread:?}"
+            "a listener whose identity astream could not read: {unread:?}"
         );
         assert!(
             ends_itself(None, Some(Named::Unread)).is_none(),
             "a wake's read that failed"
+        );
+    }
+
+    /// The broker's path names its own socket once `serve` returned, through a symlink to
+    /// it too, as a client's connect reaches it, so the broker serves on; a socket renamed
+    /// over the path, as one renamed in just after `serve` returned is at the broker's
+    /// first look, is another socket, so the broker ends itself; and once nothing is
+    /// there, or a file that is no socket, its path is gone.
+    #[cfg(unix)]
+    #[test]
+    fn a_socket_renamed_over_the_path_as_the_broker_starts_ends_it() {
+        use aterm_uds::listener::Named;
+        let scratch = aterm_tempfile::TempDir::new().expect("scratch");
+        let sock = scratch.path().join("b.sock");
+        let theirs = scratch.path().join("t.sock");
+        let held = scratch.path().join("held.sock");
+        let broker = crate::test_broker(scratch.path().join("b.log")).expect("broker");
+        let handle = broker.serve(&sock).expect("serve");
+        let endpoint = sock.to_str().expect("a UTF-8 path");
+        let named = path_named(endpoint, handle.names_listener());
+        assert_eq!(named, Some(Named::Same), "its own socket");
+        assert!(ends_itself(None, named).is_none(), "its own socket");
+        std::fs::hard_link(&sock, &held).expect("held");
+        std::fs::remove_file(&sock).expect("unlink");
+        std::os::unix::fs::symlink(&held, &sock).expect("symlink");
+        let named = path_named(endpoint, handle.names_listener());
+        assert_eq!(named, Some(Named::Same), "a symlink to its own socket");
+        std::fs::remove_file(&sock).expect("unlink the symlink");
+        let _theirs = std::os::unix::net::UnixListener::bind(&theirs).expect("bind");
+        std::fs::rename(&theirs, &sock).expect("rename over");
+        let named = path_named(endpoint, handle.names_listener());
+        assert!(
+            matches!(ends_itself(None, named), Some(SelfEnd::PathTaken)),
+            "another socket: {named:?}"
+        );
+        std::fs::remove_file(&sock).expect("unlink");
+        let named = path_named(endpoint, handle.names_listener());
+        assert!(
+            matches!(ends_itself(None, named), Some(SelfEnd::PathGone)),
+            "nothing there: {named:?}"
+        );
+        std::fs::write(&sock, "").expect("a plain file in its place");
+        let named = path_named(endpoint, handle.names_listener());
+        assert!(
+            matches!(ends_itself(None, named), Some(SelfEnd::PathGone)),
+            "a file that is no socket: {named:?}"
         );
     }
 

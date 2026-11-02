@@ -149,6 +149,31 @@ impl Cmd {
     }
 }
 
+/// The bytes a child's label grows to before its next argument is left out ([`stage_label`]);
+/// a program longer than this is kept whole all the same.
+pub const LABEL_MAX: usize = 160;
+
+/// A child's label, the one its run record's `group` line, its survivor line and its `verify:`
+/// lines carry: its argv joined by spaces, the program always and each next argument while the
+/// whole fits [`LABEL_MAX`] bytes, then ` …+N args` naming how many were left out. So it is at
+/// most [`LABEL_MAX`] bytes and that count unless its program alone is longer; the run record
+/// bounds its encoded `group` line on its own (`runs::stage_field`).
+#[must_use]
+pub fn stage_label(argv: &[String]) -> String {
+    let mut label = String::new();
+    for (i, arg) in argv.iter().enumerate() {
+        if i > 0 {
+            if label.len() + 1 + arg.len() > LABEL_MAX {
+                let left = argv.len() - i;
+                return format!("{label} …+{left} arg{}", if left == 1 { "" } else { "s" });
+            }
+            label.push(' ');
+        }
+        label.push_str(arg);
+    }
+    label
+}
+
 /// The invariant part of every invocation.
 #[derive(Clone, Copy, Debug)]
 pub struct ExecEnv<'a> {
@@ -222,8 +247,13 @@ fn at_desk(host: &dyn Host) -> bool {
 pub trait StageGroupEnd: Sync + std::fmt::Debug {
     /// Record a newly created stage process group.
     fn group_made(&self, pgid: u32, label: &str);
-    /// Sweep and record a stage process group whose leader has exited but is not yet reaped.
+    /// Sweep a stage process group whose leader has exited but is not yet reaped.
     fn group_ended(&self, pgid: u32, label: &str);
+    /// Record the group [`Self::group_ended`] swept, once its leader is reaped: the leader no
+    /// longer holds the group's id then, so one answer of the kernel about the whole group finds
+    /// it empty only when no member is left in it either, and can prove it empty where the
+    /// sweep's listing could not ([`group::empty`]).
+    fn group_reaped(&self, pgid: u32, label: &str);
 }
 
 /// What a child did.
@@ -301,7 +331,8 @@ impl Unfinished {
 /// Run an in-process walk on a thread of its own under the child ceiling, on the wall clock: no
 /// walk waits for admission or a lock. Each child the walk starts books into the meter of the
 /// stage that called this ([`crate::memory::current`]), on the walk's thread or through the
-/// output executor it installs.
+/// output executor it installs. Its quiet reservation, when the calling stage has one, stays
+/// held until the worker actually ends even if the ceiling returns first.
 /// # Errors
 /// [`Unfinished`]: the walk timed out or panicked.
 pub fn bounded<T: Send + 'static>(
@@ -329,12 +360,14 @@ fn bounded_wait<T: Send + 'static>(
     }
     let meter = crate::memory::current();
     let cover = crate::memory::cover();
+    let quiet = crate::current_quiet_claim();
     let scope = Close(std::sync::Arc::new(output::Scope::metered(meter.clone())));
     let executor = std::sync::Arc::clone(&scope.0);
     let (tx, rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
         let _metering = crate::memory::metering(meter);
         let _covering = crate::memory::covering(cover);
+        let _quiet = crate::holding_quiet_claim(quiet);
         aterm_uds::output::with_executor(
             std::sync::Arc::new(move |command| executor.output(command)),
             || {
@@ -424,7 +457,7 @@ pub fn run(cmd: &Cmd, env: ExecEnv<'_>) -> Run {
     };
     let marks = marks.as_ref().map(|m| m.dir.as_path());
 
-    let label = cmd.argv().join(" ");
+    let label = stage_label(&cmd.argv());
     match &cmd.capture {
         Capture::Silent => {
             c.stdout(Stdio::null()).stderr(Stdio::null());
@@ -676,10 +709,12 @@ struct Usage<'a> {
 
 /// A child's clock (`docs/DESIGN-adaptive-build-2026-10-24.md`, CEILING-WAIT): the time it
 /// worked, which its ceiling bounds, apart from the time a wait of its tree for admission or a
-/// lock was marked in `marks` ([`aterm_toolchain::waits`]), which nothing bounds, and the time its
-/// tree waited for a core ([`core_wait`]), which the tree's own progress bounds
+/// lock was marked in `marks` ([`aterm_toolchain::waits`]), which only its holders bound, and the
+/// time its tree waited for a core ([`core_wait`]), which the tree's own progress bounds
 /// ([`NO_PROGRESS_HANG`]). A wait's liveness is its own: its holder named once a minute, and a
-/// dead holder lets its lock go. Each span counts as the last look found it; a read of the tree
+/// dead holder lets its lock go; a live holder whose processes make no progress for its waiter's
+/// bound is named stuck in the mark, and the child is then ended ([`Clock::stuck`]), its holder
+/// left alone (CW-WAIT-UNBOUNDED). Each span counts as the last look found it; a read of the tree
 /// then moves from its work to [`Clock::starved`] what the reads of the last [`CORE_WAIT_SPAN`]
 /// show it waited for a core and have not moved yet ([`CoreWaitSpan::book`]). Each read also
 /// books the tree's footprint into its stage's memory meter (VERIFY-MEM, [`crate::memory`]), and
@@ -694,6 +729,10 @@ struct Clock<'a> {
     starved: Duration,
     /// The waits the last look found.
     waits: Vec<aterm_toolchain::waits::Waiting>,
+    /// How many looks in a row, the last included, found a wait its waiter called stuck. A mark
+    /// is rewritten in place, so one read can catch the tail of the record it replaces: a stuck
+    /// wait is believed on its second look ([`Clock::stuck`]).
+    stuck_looks: u32,
     /// `None` once its host has no reading of the tree: every span with no marked wait is work.
     usage: Option<Usage<'a>>,
     /// The stage meter its reads of the tree book into, and the tree's process group.
@@ -726,6 +765,7 @@ impl<'a> Clock<'a> {
             waited: Duration::ZERO,
             starved: Duration::ZERO,
             waits: Vec::new(),
+            stuck_looks: 0,
             usage: Some(Usage {
                 host,
                 pgid,
@@ -853,7 +893,36 @@ impl<'a> Clock<'a> {
                 ends::saw();
             }
             self.waits = waits;
+            self.stuck_looks = if self.waits.iter().any(|w| w.stuck.is_some()) {
+                self.stuck_looks.saturating_add(1)
+            } else {
+                0
+            };
         }
+    }
+
+    /// Why the child must end now, when the last look found its tree waiting behind holders its
+    /// waiter found stuck ([`aterm_toolchain::waits::Stuck`]), none of them in the child's own
+    /// process group `pgid` (the group its end signals, so a holder is never signalled), on two
+    /// looks in a row: what it waited for, the holder named, and how long that has made no
+    /// progress.
+    fn stuck(&self, pgid: u32) -> Option<String> {
+        if self.stuck_looks < 2 {
+            return None;
+        }
+        let (w, stuck) = self.waits.iter().find_map(|w| {
+            let stuck = w.stuck.as_ref()?;
+            (!stuck.holders.iter().any(|&h| in_group(h, pgid))).then_some((w, stuck))
+        })?;
+        let now = aterm_time::unix_secs().unwrap_or(0);
+        Some(format!(
+            "this child waited for admission or a lock behind a holder that has made no progress \
+             for {}, so it was ended and decided nothing (the holder was left alone): {} (waiting \
+             {})",
+            aterm_capacity::span(stuck.span),
+            w.text,
+            aterm_capacity::span(Duration::from_secs(now.saturating_sub(w.since)))
+        ))
     }
 
     /// Why a child the run's end ended decided nothing: what it waited for, holder named, when
@@ -890,6 +959,28 @@ impl Drop for Clock<'_> {
         }
     }
 }
+
+/// Whether `pid` is in process group `pgid`: a holder there would get the child's end.
+fn in_group(pid: u32, pgid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(pid) = i32::try_from(pid) else {
+            return false;
+        };
+        // SAFETY: `getpgid` takes an integer and reads the process table; it signals nothing.
+        let group = unsafe { libc::getpgid(pid) };
+        group > 0 && u32::try_from(group).is_ok_and(|g| g == pgid)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (pid, pgid);
+        false
+    }
+}
+
+/// How long a child its stuck holder ends ([`Clock::stuck`]) has after its `SIGTERM` to say so
+/// before its group gets `SIGKILL`, as the interrupt's handler gives a stage group.
+const STUCK_GRACE: Duration = Duration::from_secs(2);
 
 /// Whether the run must end now: an interrupt is ending it.
 fn ending() -> bool {
@@ -1008,8 +1099,9 @@ fn resolves(cmd: &Cmd, env: ExecEnv<'_>) -> bool {
 /// Spawn `c` and reap it, ending it at `env.child_ceiling` of work ([`Clock`]: its tree's waits
 /// marked in `marks` and its waits for a core read of `env.host` left out). Once the run is ending
 /// ([`ending`]) the interrupt's handler ends it, and its row says what it waited for, if it
-/// waited. A child that ends after waiting longer than [`STARVED_SAID`] for a core says so on
-/// stderr.
+/// waited. A child whose tree waits behind a stuck holder ([`Clock::stuck`]) is ended
+/// (`SIGTERM`, [`STUCK_GRACE`], then `SIGKILL`) and could not run, naming the holder. A child
+/// that ends after waiting longer than [`STARVED_SAID`] for a core says so on stderr.
 fn finish(
     mut c: Command,
     cmd: &Cmd,
@@ -1026,6 +1118,12 @@ fn finish(
     let sweep = |pgid: u32| {
         if let Some(groups) = stage_groups {
             groups.group_ended(pgid, label);
+        }
+    };
+    #[cfg(unix)]
+    let record = |pgid: u32| {
+        if let Some(groups) = stage_groups {
+            groups.group_reaped(pgid, label);
         }
     };
     #[cfg(not(unix))]
@@ -1064,7 +1162,7 @@ fn finish(
     let mut nap = Duration::from_millis(1);
     loop {
         #[cfg(unix)]
-        let status = live.reap_stage_sweeping(&mut child, false, sweep);
+        let status = live.reap_stage_sweeping(&mut child, false, sweep, record);
         #[cfg(not(unix))]
         let status = child.try_wait();
         match status {
@@ -1083,8 +1181,8 @@ fn finish(
         }
         clock.tick();
         if ending() {
-            // What its tree waits for as the run ends, said at once: the handler re-raises its
-            // signal once its grace is up, before any report. The handler ends the child too (its
+            // What its tree waits for as the run ends, said at once, ahead of the row the run's
+            // report gives it once every stage group is ended. The handler ends the child too (its
             // one `SIGTERM`, up to 2 s, then `SIGKILL`), so it is not signalled here: a lab ends
             // its wait on that `SIGTERM` and says NOT RUN, naming the holder, and a second signal
             // would end it at once, unsaid.
@@ -1095,6 +1193,23 @@ fn finish(
                     eprintln!("verify: {label}: {}", clock.ended());
                 }
             }
+        } else if let Some(why) = clock.stuck(child.id()) {
+            eprintln!("verify: {label}: {why}");
+            let killed = kill_and_reap(
+                &mut child,
+                #[cfg(unix)]
+                &mut live,
+                Some(cmd.term_grace.unwrap_or(STUCK_GRACE)),
+            );
+            return (
+                Run {
+                    ok: false,
+                    output: killed,
+                    code: None,
+                    spawn_error: Some(why),
+                },
+                read_log(log),
+            );
         } else if let Some(limit) = ceiling
             && clock.over(limit)
         {
@@ -1120,7 +1235,10 @@ fn kill_and_reap(
     if let Some(grace) = grace
         && live.term().is_ok()
     {
-        let deadline = Instant::now() + grace;
+        let now = Instant::now();
+        let deadline = now
+            .checked_add(grace)
+            .unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 3600));
         while Instant::now() < deadline {
             if live.exited(child, false).unwrap_or(false) {
                 let _ = live.kill();
@@ -1225,6 +1343,19 @@ pub mod group {
     /// Set when a wait for capacity took the interrupt and [`stop_run`] ends the run.
     static WAIT_STOPPED: AtomicBool = AtomicBool::new(false);
     static SPAWNING: AtomicUsize = AtomicUsize::new(0);
+    /// The interrupt the run dies of once it has reported ([`end_interrupted`]), set by the
+    /// handler once every stage group is ended; 0 while there is none.
+    static PENDING: AtomicI32 = AtomicI32::new(0);
+    /// Set as the handler begins ending the stage groups, before [`PENDING`] is.
+    static HANDLING: AtomicBool = AtomicBool::new(false);
+    /// The write end of the pipe [`kill_on_interrupt`]'s watchdog reads ([`REPORT_GRACE`]); -1
+    /// where it has none, and the handler then re-raises its signal at once.
+    static WATCHDOG: AtomicI32 = AtomicI32::new(-1);
+
+    /// How long an interrupted run has, once every stage group is ended, to write its log, its
+    /// verdict and its `log:` line and to remove its scratch before its watchdog re-raises the
+    /// signal regardless ([`end_interrupted`]).
+    pub const REPORT_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
     /// Counts the spawn-to-registration window.
     pub struct Spawning(());
@@ -1333,31 +1464,37 @@ pub mod group {
             child: &mut std::process::Child,
             block: bool,
         ) -> std::io::Result<Option<std::process::ExitStatus>> {
-            self.reap_stage_sweeping(child, block, |_| {})
+            self.reap_stage_sweeping(child, block, |_| {}, |_| {})
         }
 
-        /// Reap `child`, running `sweep` once after the leader exits and before it is reaped (macOS
-        /// and Linux only).
+        /// Reap `child`, running `sweep` once after the leader exits and before it is reaped, and
+        /// `reaped` with the same group once it is (macOS and Linux only).
         pub(crate) fn reap_stage_sweeping(
             &mut self,
             child: &mut std::process::Child,
             block: bool,
             sweep: impl FnOnce(u32),
+            reaped: impl FnOnce(u32),
         ) -> std::io::Result<Option<std::process::ExitStatus>> {
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             {
                 if !self.exited(child, block)? {
                     return Ok(None);
                 }
-                if let Some(pgid) = self.group {
+                let swept = self.group;
+                if let Some(pgid) = swept {
                     sweep(pgid);
                 }
                 self.release_for_reap(child.id())?;
-                child.wait().map(Some)
+                let status = child.wait()?;
+                if let Some(pgid) = swept {
+                    reaped(pgid);
+                }
+                Ok(Some(status))
             }
             #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             {
-                let _ = sweep;
+                let _ = (sweep, reaped);
                 self.exited(child, block)?;
                 child.try_wait()
             }
@@ -1472,6 +1609,29 @@ pub mod group {
         }
     }
 
+    /// Whether process group `pgid` has no member left, by one answer of the kernel about the
+    /// whole group (`killpg(pgid, 0)`, which sends nothing): `Some(true)` when no process is in
+    /// it (`ESRCH`); `Some(false)` when one is, whether or not this user may signal it (`0`, or
+    /// `EPERM`: another user's, and on macOS a zombie its parent has not reaped, which Linux
+    /// answers `0` for when it is this user's) and whether or not a listing shows it; `None`
+    /// for a `pgid` of 1 or less (`killpg` reads 0 as this process's own group and 1 as every
+    /// process this user may signal) or past `i32::MAX`, unasked, and for any other answer.
+    /// Until its leader is reaped the leader keeps the group, so it is asked after the reap; a
+    /// group made since under the freed id then reads as not empty, never as empty.
+    #[must_use]
+    pub fn empty(pgid: u32) -> Option<bool> {
+        let g = i32::try_from(pgid).ok().filter(|&g| g > 1)?;
+        // SAFETY: two integers; signal 0 sends nothing, and `g` > 1 names one group.
+        if unsafe { killpg(g, 0) } == 0 {
+            return Some(false);
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::ESRCH) => Some(true),
+            Some(libc::EPERM) => Some(false),
+            _ => None,
+        }
+    }
+
     fn signal_group(pgid: u32, sig: i32) -> std::io::Result<()> {
         #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
         custody_audit::before_signal(pgid, sig)?;
@@ -1535,8 +1695,9 @@ pub mod group {
 
     extern "C" fn on_signal(sig: i32) {
         if STOPPING.swap(true, Ordering::SeqCst) {
-            if WAIT_STOPPED.load(Ordering::SeqCst) {
-                // The run is ending on a wait's interrupt ([`stop_run`]); another ends it now.
+            if WAIT_STOPPED.load(Ordering::SeqCst) || PENDING.load(Ordering::SeqCst) != 0 {
+                // The run is ending on a wait's interrupt ([`stop_run`]), or reporting after one
+                // ([`end_interrupted`]); another ends it now.
                 // SAFETY: both take integers only.
                 unsafe {
                     signal(sig, SIG_DFL);
@@ -1545,6 +1706,7 @@ pub mod group {
             }
             return;
         }
+        HANDLING.store(true, Ordering::SeqCst);
         sweep(SIGTERM);
         let nap = libc::timespec {
             tv_sec: 0,
@@ -1562,11 +1724,74 @@ pub mod group {
             }
         }
         sweep(SIGKILL);
+        // The run reports what it has, then dies of `sig` ([`end_interrupted`]); its watchdog
+        // re-raises it past [`REPORT_GRACE`] if it has not. Without a watchdog, at once.
+        PENDING.store(sig, Ordering::SeqCst);
+        let fd = WATCHDOG.load(Ordering::SeqCst);
+        let byte = u8::try_from(sig).unwrap_or(u8::MAX);
+        // SAFETY: `write` is async-signal-safe; `byte` lives across the call and `fd` is the
+        // watchdog pipe's write end, which nothing closes.
+        if fd >= 0 && unsafe { libc::write(fd, (&raw const byte).cast(), 1) } == 1 {
+            return;
+        }
         // SAFETY: both take integers only.
         unsafe {
             signal(sig, SIG_DFL);
             reraise(sig);
         }
+    }
+
+    /// End an interrupted run once it has reported: die of the interrupt the handler ended its
+    /// stage groups for, as the run would have without reporting, once the handler has ended
+    /// them (a stage's group leaves the live list before the handler's next look sees it gone).
+    /// A run no interrupt reached, or one a wait's interrupt ended ([`stop_run`], which exits
+    /// with its verdict), returns.
+    pub fn end_interrupted() {
+        while HANDLING.load(Ordering::SeqCst) && PENDING.load(Ordering::SeqCst) == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(NAP_MS.unsigned_abs()));
+        }
+        let sig = PENDING.load(Ordering::SeqCst);
+        if sig != 0 {
+            // SAFETY: both take integers only.
+            unsafe {
+                signal(sig, SIG_DFL);
+                reraise(sig);
+            }
+        }
+    }
+
+    /// The watchdog an interrupted run's report is held to: woken by the handler through its
+    /// pipe ([`WATCHDOG`]), it re-raises the handler's signal [`REPORT_GRACE`] later unless the
+    /// run has died of it by then ([`end_interrupted`]). Set once; `false` where its pipe or its
+    /// thread could not be made.
+    fn watchdog() -> bool {
+        use std::io::Read as _;
+        use std::os::fd::IntoRawFd as _;
+        if WATCHDOG.load(Ordering::SeqCst) >= 0 {
+            return true;
+        }
+        let Ok((mut read, write)) = std::io::pipe() else {
+            return false;
+        };
+        let spawned = std::thread::Builder::new()
+            .name("verify-interrupt-watchdog".into())
+            .spawn(move || {
+                let mut sig = [0u8];
+                if read.read_exact(&mut sig).is_ok() {
+                    std::thread::sleep(REPORT_GRACE);
+                    let sig = PENDING.load(Ordering::SeqCst);
+                    // SAFETY: both take integers only.
+                    unsafe {
+                        signal(sig, SIG_DFL);
+                        reraise(sig);
+                    }
+                }
+            });
+        if spawned.is_err() {
+            return false;
+        }
+        WATCHDOG.store(write.into_raw_fd(), Ordering::SeqCst);
+        true
     }
 
     /// Re-raise `sig` at its default action.
@@ -1607,11 +1832,14 @@ pub mod group {
         sweep(SIGKILL);
     }
 
-    /// On `SIGINT`, `SIGTERM` or `SIGHUP`, end every live stage child's group.
+    /// On `SIGINT`, `SIGTERM` or `SIGHUP`, end every live stage child's group; the run then
+    /// reports what it has and dies of the signal ([`end_interrupted`]), held to
+    /// [`REPORT_GRACE`] by a watchdog.
     pub fn kill_on_interrupt() {
         if !cfg!(any(target_os = "macos", target_os = "linux")) {
             return;
         }
+        watchdog();
         for sig in [SIGHUP, SIGINT, SIGTERM] {
             // SAFETY: `on_signal` is an `extern "C" fn(i32)` that lives for the whole program and
             // does only async-signal-safe work.
@@ -1828,6 +2056,12 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
+    #[cfg(not(unix))]
+    fn cmd_exe() -> OsString {
+        std::env::var_os("ComSpec")
+            .unwrap_or_else(|| OsString::from(r"C:\Windows\System32\cmd.exe"))
+    }
+
     #[test]
     fn a_child_runs_in_the_root_with_the_runs_variables_and_its_own_win() {
         let tmp = crate::mktemp_dir("atv-setenv").expect("mktemp");
@@ -1837,9 +2071,17 @@ mod tests {
             add_env: &added,
             ..env_in(&tmp)
         };
+        #[cfg(unix)]
         let ask = Cmd::new("/bin/sh").args([
             "-c",
             "cat marker; printf ' %s %s' \"${ATV_ADDED_PROBE-unset}\" \"$PATH\"",
+        ]);
+        #[cfg(not(unix))]
+        let ask = Cmd::new(cmd_exe()).args([
+            "/d",
+            "/v:on",
+            "/c",
+            "set /p m=<marker& if defined ATV_ADDED_PROBE (echo !m! !ATV_ADDED_PROBE! !PATH!) else (echo !m! unset !PATH!)",
         ]);
         assert_eq!(run(&ask, env).trimmed_output(), "x 0 /usr/bin:/bin");
         let stage_says = ask.clone().env("ATV_ADDED_PROBE", "1");
@@ -1865,7 +2107,10 @@ mod tests {
             add_env: &added,
             ..env_in(&tmp)
         };
+        #[cfg(unix)]
         let ask = Cmd::new("/bin/sh").args(["-c", "printf %s \"$ATERM_CAPACITY_COVER\""]);
+        #[cfg(not(unix))]
+        let ask = Cmd::new(cmd_exe()).args(["/d", "/c", "echo %ATERM_CAPACITY_COVER%"]);
         assert_eq!(run(&ask, env).trimmed_output(), aterm_capacity::NO_COVER);
         {
             let _covering = crate::memory::covering(Some("0000000000001-7-0".into()));
@@ -1897,13 +2142,32 @@ mod tests {
     #[test]
     fn a_missing_tool_is_a_failed_run_not_a_panic_and_never_a_pass() {
         let tmp = crate::mktemp_dir("atv-exec3").expect("mktemp");
-        for cmd in [
-            Cmd::new(tmp.join("absent-driver")),
-            Cmd::new(tmp.join("absent-driver")).demoted(),
+        let translator = aterm_uds::process::translator();
+        let mut mute = Vec::new();
+        for (row, cmd) in [
+            ("plain", Cmd::new(tmp.join("absent-driver"))),
+            ("demoted", Cmd::new(tmp.join("absent-driver")).demoted()),
         ] {
             let r = run(&cmd, env_in(&tmp));
-            assert!(!r.ok, "{r:?}");
-            assert!(r.spawn_error.is_some(), "{r:?}");
+            assert!(!r.ok, "{row}: {r:?}");
+            if translator.is_some() && r.spawn_error.is_none() && r.code == Some(127) {
+                mute.push(row);
+                continue;
+            }
+            assert!(r.spawn_error.is_some(), "{row}: {r:?}");
+        }
+        if let Some(translator) = translator
+            && !mute.is_empty()
+        {
+            println!(
+                "NOT RUN under {translator}: exec::tests::\
+                 a_missing_tool_is_a_failed_run_not_a_panic_and_never_a_pass: the spawn error \
+                 ({}): std's answer comes from glibc's posix_spawn, whose child reports a failed \
+                 exec through memory it shares with its parent; the translator runs that child in \
+                 a copy, where the report is lost, so std answers a child that exited 127 (still a \
+                 failed run); a real CPU of this code's arch decides it",
+                mute.join(", ")
+            );
         }
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -1911,16 +2175,18 @@ mod tests {
     #[test]
     fn output_is_captured_with_stderr_merged_and_a_nonzero_exit_keeps_its_code() {
         let tmp = crate::mktemp_dir("atv-exec").expect("mktemp");
-        let r = run(
-            &Cmd::new("/bin/sh").args(["-c", "echo out; echo err >&2; echo out2"]),
-            env_in(&tmp),
-        );
+        #[cfg(unix)]
+        let ok_cmd = Cmd::new("/bin/sh").args(["-c", "echo out; echo err >&2; echo out2"]);
+        #[cfg(not(unix))]
+        let ok_cmd = Cmd::new(cmd_exe()).args(["/d", "/c", "echo out& echo err 1>&2& echo out2"]);
+        let r = run(&ok_cmd, env_in(&tmp));
         assert!(r.ok);
-        assert_eq!(r.trimmed_output(), "out\nerr\nout2");
-        let r = run(
-            &Cmd::new("/bin/sh").args(["-c", "echo why >&2; exit 3"]),
-            env_in(&tmp),
-        );
+        assert_eq!(r.trimmed_output().replace("\r\n", "\n"), "out\nerr\nout2");
+        #[cfg(unix)]
+        let err_cmd = Cmd::new("/bin/sh").args(["-c", "echo why >&2; exit 3"]);
+        #[cfg(not(unix))]
+        let err_cmd = Cmd::new(cmd_exe()).args(["/d", "/c", "echo why 1>&2& exit /b 3"]);
+        let r = run(&err_cmd, env_in(&tmp));
         assert!(!r.ok);
         assert_eq!(r.trimmed_output(), "why");
         assert_eq!(r.code, Some(3));
@@ -1938,26 +2204,49 @@ mod tests {
             add_env: &added,
             ..env_in(&tmp)
         };
-        let cmd = Cmd::replayed(
-            &[
-                OsString::from("/bin/sh"),
-                OsString::from("-c"),
-                OsString::from(
-                    "cat marker; printf ' %s %s %s' \"${RECORDED-unset}\" \"${GATE_ADDED-unset}\" \
-                     \"${HOME-unset}\"",
-                ),
-            ],
-            &pkg,
-            vec![
+        #[cfg(unix)]
+        let argv = vec![
+            OsString::from("/bin/sh"),
+            OsString::from("-c"),
+            OsString::from(
+                "cat marker; printf ' %s %s %s' \"${RECORDED-unset}\" \"${GATE_ADDED-unset}\" \
+                 \"${HOME-unset}\"",
+            ),
+        ];
+        #[cfg(not(unix))]
+        let argv = vec![
+            cmd_exe(),
+            OsString::from("/d"),
+            OsString::from("/v:on"),
+            OsString::from("/c"),
+            OsString::from(
+                "set /p m=<marker& set r=unset& if defined RECORDED set r=!RECORDED!& \
+                 set g=unset& if defined GATE_ADDED set g=!GATE_ADDED!& \
+                 set h=unset& if defined HOME set h=!HOME!& echo !m! !r! !g! !h!",
+            ),
+        ];
+        #[cfg(unix)]
+        let recorded_env = vec![
+            (OsString::from("RECORDED"), OsString::from("yes")),
+            (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
+        ];
+        #[cfg(not(unix))]
+        let recorded_env = {
+            let mut v = vec![
                 (OsString::from("RECORDED"), OsString::from("yes")),
                 (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
-            ],
-        )
-        .preamble("     Running tests/x.rs (target/debug/deps/x-1)\n");
+            ];
+            if let Some(sysroot) = std::env::var_os("SystemRoot") {
+                v.push((OsString::from("SystemRoot"), sysroot));
+            }
+            v
+        };
+        let cmd = Cmd::replayed(&argv, &pkg, recorded_env)
+            .preamble("     Running tests/x.rs (target/debug/deps/x-1)\n");
         let r = run(&cmd, env);
         assert!(r.ok, "{}", r.output);
         assert_eq!(
-            r.trimmed_output(),
+            r.trimmed_output().replace("\r\n", "\n"),
             "     Running tests/x.rs (target/debug/deps/x-1)\nin-pkg yes unset unset",
             "the preamble first, then the child — in its own directory, with only what \
              was recorded"
@@ -2136,6 +2425,43 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
+    /// [`group::empty`] asks the kernel only about one real group: a pgid of 0 (to `killpg`, this
+    /// process's own group), 1 (every process this user may signal), or one past `i32::MAX` is
+    /// `None`, never asked; a group whose one member is this test's exited, unreaped child (a
+    /// leader of its own session) is not empty (`0` on Linux, `EPERM` on macOS, which signals no
+    /// zombie); and once the child is reaped the group is empty. NEGATIVE CONTROLS: let 0 or 1
+    /// through its filter and each reads `Some(false)`; read `EPERM` as `None` and the zombie's
+    /// group is unknown on macOS.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn only_a_real_group_is_asked_and_an_unreaped_leader_keeps_it() {
+        let past = u32::try_from(i32::MAX).expect("i32::MAX") + 1;
+        for pgid in [0, 1, past, u32::MAX] {
+            assert_eq!(group::empty(pgid), None, "pgid {pgid}");
+        }
+        let mut leader = aterm_uds::spawnfd::command("/bin/sh");
+        leader
+            .args(["-c", "exit 0"])
+            .setsid(true)
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .stdout(aterm_uds::spawnfd::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::null());
+        let mut leader = leader.spawn().expect("a leader");
+        let pid = leader.id();
+        aterm_spec::wait::until_within(HANG_DETECTOR, "the leader's exit", || {
+            group::exited(pid, false)
+                .expect("its exit, unreaped")
+                .then_some(())
+        });
+        assert_eq!(
+            group::empty(pid),
+            Some(false),
+            "the unreaped leader keeps its group"
+        );
+        leader.wait().expect("the leader, reaped");
+        assert_eq!(group::empty(pid), Some(true), "reaped, it holds no one");
+    }
+
     #[cfg(unix)]
     #[test]
     fn an_interrupted_gate_kills_every_live_stage_group() {
@@ -2178,6 +2504,7 @@ mod tests {
                 }
                 let _ = stage.join();
             });
+            group::end_interrupted();
             return;
         }
         let tmp = crate::mktemp_dir("atv-interrupt").expect("mktemp");
@@ -2259,13 +2586,29 @@ mod tests {
     #[cfg(unix)]
     const STAND_IN_TEARDOWN: Duration = Duration::from_millis(500);
 
+    /// Set, [`lock_waiter_stand_in`] waits at a test's pace: a line every tenth of a second, its
+    /// holder called stuck after [`STUCK_AFTER`] of no progress.
+    #[cfg(unix)]
+    const WAIT_PACED: &str = "ATERM_VERIFY_TEST_LOCK_PACED";
+
+    /// How long a paced [`lock_waiter_stand_in`] lets its holder make no progress before it calls
+    /// it stuck.
+    #[cfg(unix)]
+    const STUCK_AFTER: Duration = Duration::from_secs(1);
+
+    /// Set, [`lock_waiter_stand_in`] exits 0 once it has the lock and has said so, as a lab whose
+    /// lane came free runs and ends.
+    #[cfg(unix)]
+    const WAIT_THEN_EXIT: &str = "ATERM_VERIFY_TEST_LOCK_THEN_EXIT";
+
     /// Run by the ceiling tests as a stage child: waits for the lock [`WAIT_LOCK`] names, as a lab
-    /// waits for its lane, says when it has it, then works until it is ended. A `SIGTERM` ends its
-    /// wait as a lab's interrupt does: NOT RUN, naming the holder, and exit 3.
+    /// waits for its lane, says when it has it, then works until it is ended or its run is gone
+    /// ([`WAIT_THEN_EXIT`] set: it ends there).
+    /// A `SIGTERM` ends its wait as a lab's interrupt does: NOT RUN, naming the holder, and exit 3.
     #[cfg(unix)]
     #[test]
     fn lock_waiter_stand_in() {
-        use aterm_toolchain::named_lock::{Holder, Refused, Wait, take};
+        use aterm_toolchain::named_lock::{Holder, Pace, Refused, Wait, take, take_paced};
         let Some(path) = std::env::var_os(WAIT_LOCK).map(PathBuf::from) else {
             return;
         };
@@ -2275,9 +2618,16 @@ mod tests {
             libc::signal(libc::SIGTERM, stand_in_stop as extern "C" fn(i32) as usize);
         }
         let me = Holder::me("lab linux exec", Path::new("/checkouts/waiter"));
-        let taken = take(&path, &me, Wait::Block, &mut |_, _| {}, &|| {
-            STAND_IN_STOPPED.load(Ordering::SeqCst)
-        });
+        let stop = || STAND_IN_STOPPED.load(Ordering::SeqCst);
+        let taken = if std::env::var_os(WAIT_PACED).is_some() {
+            let pace = Pace {
+                say_every: Duration::from_millis(100),
+                stalled_after: STUCK_AFTER,
+            };
+            take_paced(&path, &me, Wait::Block, &mut |_, _| {}, &stop, pace)
+        } else {
+            take(&path, &me, Wait::Block, &mut |_, _| {}, &stop)
+        };
         let _held = match taken {
             Ok(held) => held,
             Err(Refused::Stopped { holder, .. }) => {
@@ -2291,7 +2641,12 @@ mod tests {
             Err(e) => panic!("the lock, once its holder lets go: {e:?}"),
         };
         println!("\n{LOCK_ADMITTED}");
-        loop {
+        if std::env::var_os(WAIT_THEN_EXIT).is_some() {
+            return;
+        }
+        // Its run ends it; a run that died first (a failed test) left it a new parent, and it ends.
+        let run = std::os::unix::process::parent_id();
+        while std::os::unix::process::parent_id() == run {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
@@ -2299,13 +2654,22 @@ mod tests {
     /// A stand-in holder's lock at `dir/lane.lock`, and a stage child that waits on it.
     #[cfg(unix)]
     fn held_lane(dir: &Path) -> (aterm_toolchain::named_lock::NamedLock, Cmd) {
+        held_lane_by(dir, std::process::id())
+    }
+
+    /// [`held_lane`], its record naming `pid` as the holder.
+    #[cfg(unix)]
+    fn held_lane_by(dir: &Path, pid: u32) -> (aterm_toolchain::named_lock::NamedLock, Cmd) {
         let lock = dir.join("lane.lock");
         let held = aterm_toolchain::named_lock::take(
             &lock,
-            &aterm_toolchain::named_lock::Holder::me(
-                "lab linux proof",
-                Path::new("/checkouts/holder"),
-            ),
+            &aterm_toolchain::named_lock::Holder {
+                pid,
+                ..aterm_toolchain::named_lock::Holder::me(
+                    "lab linux proof",
+                    Path::new("/checkouts/holder"),
+                )
+            },
             aterm_toolchain::named_lock::Wait::No,
             &mut |_, _| {},
             &|| false,
@@ -2323,7 +2687,7 @@ mod tests {
     }
 
     /// The wait the child of a run with `scratch` has marked, once it has: the one-minute hang
-    /// detector.
+    /// detector. A mark this test laid ([`StartMark`]) is not the child's.
     #[cfg(unix)]
     fn marked(scratch: &Path) -> aterm_toolchain::waits::Waiting {
         let deadline = Instant::now() + HANG_DETECTOR;
@@ -2333,7 +2697,11 @@ mod tests {
                 .flatten()
                 .flatten()
                 .filter(|e| e.file_name().to_string_lossy().starts_with("waits."))
-                .find_map(|e| aterm_toolchain::waits::waiting(&e.path()).pop());
+                .find_map(|e| {
+                    aterm_toolchain::waits::waiting(&e.path())
+                        .into_iter()
+                        .rfind(|w| w.pid != std::process::id())
+                });
             if let Some(w) = found {
                 return w;
             }
@@ -2342,11 +2710,48 @@ mod tests {
         }
     }
 
+    /// A wait this test marks in the marks' directory of the one run with `scratch`, laid as soon
+    /// as the run lays that directory (before or just after it spawns its child, the one-minute
+    /// hang detector): the child's start, which its ceiling would count as work until the child
+    /// marks a wait of its own, so a start a loaded machine holds back (an exec, a page-in) is
+    /// not what its ceiling ends.
+    #[cfg(unix)]
+    struct StartMark {
+        /// Held for its drop, which lets the mark go.
+        _mark: aterm_toolchain::waits::Mark,
+    }
+
+    #[cfg(unix)]
+    impl StartMark {
+        fn lay(scratch: &Path) -> StartMark {
+            let deadline = Instant::now() + HANG_DETECTOR;
+            loop {
+                let dir = std::fs::read_dir(scratch)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .find(|e| e.file_name().to_string_lossy().starts_with("waits."));
+                if let Some(mark) = dir.and_then(|d| {
+                    aterm_toolchain::waits::Mark::at(&d.path(), "the test's child, starting").ok()
+                }) {
+                    return StartMark { _mark: mark };
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the run never laid its marks' directory"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
     /// CEILING-WAIT's acceptance: a stage child waits on a lock its holder keeps for longer than
     /// the child's ceiling, and the ceiling does not end it while it waits; once it has the lock,
-    /// the ceiling runs, and ends it at that much work, saying how long it waited apart. Negative
-    /// control: timed from its spawn, as before, the ceiling ends it while it waits, never
-    /// admitted, with no status.
+    /// the ceiling runs, and ends it at that much work, saying how long it waited apart. The
+    /// child's start is marked a wait ([`StartMark`]) until its own wait is marked, so however
+    /// late a loaded machine starts it, its ceiling times only the work after its admission.
+    /// Negative control: timed from its spawn, as before, the ceiling ends it while it waits,
+    /// never admitted, with no status.
     #[cfg(unix)]
     #[test]
     fn the_ceiling_times_a_childs_work_from_its_admission_not_its_wait() {
@@ -2357,7 +2762,9 @@ mod tests {
             let tmp = tmp.clone();
             std::thread::spawn(move || run(&waiter, ceiled(&tmp, Some(ceiling))))
         };
+        let start = StartMark::lay(&tmp);
         let wait = marked(&tmp);
+        drop(start);
         assert!(
             wait.text.contains(&format!(
                 "waiting for pid {} (lab linux proof, /checkouts/holder)",
@@ -2419,9 +2826,11 @@ mod tests {
     /// ends it: the run is marked ending first, then the child gets the handler's `SIGTERM`, which
     /// ends its wait, so its mark goes while it lives on to say NOT RUN. The run does not signal it
     /// again, so the child's own NOT RUN, naming the holder, is kept; the run's reason names the
-    /// wait its clock last saw; and the Linux lane's row reads NOT RUN with it. Negative controls:
-    /// a look after the end that forgets what the last one found reads `the run was interrupted
-    /// while this child ran`; a run that ends the child itself cuts the child's NOT RUN.
+    /// wait its clock last saw; and the Linux lane's row reads NOT RUN with it, the lane named and
+    /// then the wait, never `killed by a signal, or never spawned`. Negative controls: a look
+    /// after the end that forgets what the last one found reads `the run was interrupted while
+    /// this child ran`; a run that ends the child itself cuts the child's NOT RUN; a row read from
+    /// the exit code alone begins `no exit status — killed by a signal`.
     #[cfg(unix)]
     #[test]
     fn a_child_ended_while_it_waits_says_whom_it_waited_for() {
@@ -2481,11 +2890,304 @@ mod tests {
                 && why.contains(&format!("pid {}", std::process::id())),
             "{why}"
         );
-        let (outcome, label) = crate::stages::linux_lane_outcome(out.code, &out.output);
         let mut r = crate::Report::new("linux");
-        assert!(r.child_could_not_run(&out, &label), "{outcome:?}");
+        r.record_driven(
+            &out,
+            crate::stages::LINUX_LANE,
+            crate::stages::linux_lane_outcome,
+        );
         let row = r.render();
-        assert!(row.contains("NOT RUN") && row.contains(&wait.text), "{row}");
+        let row = row
+            .lines()
+            .find(|l| {
+                l.starts_with(
+                    crate::ladder::Outcome::Fail(crate::ladder::Severity::CouldNotRun).tag(),
+                )
+            })
+            .unwrap_or_else(|| panic!("no NOT RUN row: {row}"));
+        // The row names the lane, then the wait: the child neither died of a signal of its own
+        // nor failed to spawn, so it says neither.
+        assert!(
+            row.contains(&format!(
+                "{} — the run was interrupted while this child waited",
+                crate::stages::LINUX_LANE
+            )) && row.contains(&wait.text),
+            "{row}"
+        );
+        assert!(
+            !row.contains("killed by a signal") && !row.contains("never spawned"),
+            "{row}"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A wait its waiter calls stuck ends the child only on a second look in a row: a mark is
+    /// rewritten in place, and a read between its new record's write and its truncation finds
+    /// the replaced record's `stuck` line after the new first line, as the record here is laid.
+    /// A holder in the child's own group is never the reason, however long the wait is stuck.
+    /// Negative control: a clock that believes one look ends the child on the torn record.
+    #[cfg(unix)]
+    #[test]
+    fn a_stuck_wait_is_believed_on_its_second_look() {
+        use aterm_toolchain::waits::{Mark, Stuck};
+        let tmp = crate::mktemp_dir("atv-stuck-looks").expect("mktemp");
+        let marks = tmp.join("waits");
+        std::fs::create_dir(&marks).expect("the marks' dir");
+        // The holder: this process, whose group is this test's own.
+        let holder = std::process::id();
+        // SAFETY: `getpgid(0)` reads this process's group; it signals nothing.
+        let group = u32::try_from(unsafe { libc::getpgid(0) }).expect("this process's group");
+        let stuck = Stuck {
+            holders: vec![holder],
+            span: Duration::from_secs(900),
+        };
+        let mut mark = Mark::at(&marks, "waiting for its holder, which works").expect("a mark");
+        let mut clock = Clock::new(Some(&marks), &INERT, std::process::id(), None);
+        // The torn record: the new first line, the replaced record's `stuck` line after it.
+        let path = std::fs::read_dir(&marks)
+            .expect("the marks")
+            .flatten()
+            .map(|e| e.path())
+            .next()
+            .expect("the mark's file");
+        let torn =
+            format!("{holder}\t1\twaiting for its holder, which works\nstuck\t900\t{holder}\n");
+        std::fs::write(&path, &torn).expect("the torn record");
+        clock.look();
+        assert!(
+            clock.waits.iter().any(|w| w.stuck.is_some()),
+            "{:?}",
+            clock.waits
+        );
+        assert_eq!(clock.stuck(u32::MAX), None, "one look");
+        mark.say("waiting for its holder, which works");
+        clock.look();
+        assert_eq!(clock.stuck(u32::MAX), None, "the record said anew");
+        mark.say_stuck(
+            "waiting for its holder, which has made no progress",
+            Some(&stuck),
+        );
+        clock.look();
+        assert_eq!(clock.stuck(u32::MAX), None, "its first look");
+        clock.look();
+        let why = clock.stuck(u32::MAX).expect("its second look");
+        assert!(
+            why.contains("no progress for 15m00s")
+                && why.contains("waiting for its holder, which has made no progress"),
+            "{why}"
+        );
+        assert_eq!(clock.stuck(group), None, "a holder in the child's group");
+        drop(mark);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Set, the test binary is [`holder_stand_in`]: `idle` naps, `polls` wakes every 20 ms to do
+    /// a little work, as a holder that itself waits in a chain looks again.
+    #[cfg(unix)]
+    const HOLDER_STAND_IN: &str = "ATERM_VERIFY_TEST_HOLDER";
+
+    /// Run as a lock's named holder by [`a_child_waiting_behind_a_stuck_holder_could_not_run`]:
+    /// lives for twice the hang detector unless its test ends it first, using no CPU time and
+    /// writing nothing (`idle`), or waking to work (`polls`) for 2 ms of each wake. Linux counts a
+    /// process's CPU time in clock ticks (`/proc/<pid>/stat`, 10 ms at `USER_HZ` 100), so its wakes'
+    /// work must sum to several ticks within each [`STUCK_AFTER`] there, or the holder reads as
+    /// one that did none.
+    #[cfg(unix)]
+    #[test]
+    fn holder_stand_in() {
+        let Some(how) = std::env::var_os(HOLDER_STAND_IN) else {
+            return;
+        };
+        let until = Instant::now() + HANG_DETECTOR * 2;
+        if how == "idle" {
+            std::thread::sleep(HANG_DETECTOR * 2);
+        }
+        let mut n = 0u64;
+        while Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+            let wake = Instant::now();
+            while wake.elapsed() < Duration::from_millis(2) {
+                n = std::hint::black_box(n.wrapping_mul(31).wrapping_add(1));
+            }
+        }
+    }
+
+    /// A [`holder_stand_in`], killed when dropped: no test leaves one behind.
+    #[cfg(unix)]
+    struct HolderStandIn(aterm_uds::spawnfd::Child);
+
+    #[cfg(unix)]
+    impl HolderStandIn {
+        fn start(how: &str) -> HolderStandIn {
+            HolderStandIn(
+                aterm_uds::spawnfd::command(std::env::current_exe().expect("the test binary"))
+                    .args([
+                        "--exact",
+                        "exec::tests::holder_stand_in",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .env(HOLDER_STAND_IN, how)
+                    .stdin(aterm_uds::spawnfd::Stdio::null())
+                    .stdout(aterm_uds::spawnfd::Stdio::null())
+                    .stderr(aterm_uds::spawnfd::Stdio::null())
+                    .spawn()
+                    .expect("the holder stand-in"),
+            )
+        }
+
+        /// Whether it still runs: no signal reached it.
+        fn runs(&mut self) -> bool {
+            matches!(self.0.try_wait(), Ok(None))
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for HolderStandIn {
+        fn drop(&mut self) {
+            if self.runs() {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+
+    /// The whole seconds an [`aterm_capacity::span`] under an hour reads (`7s`, `2m05s`).
+    #[cfg(unix)]
+    fn span_secs(span: &str) -> Option<u64> {
+        let secs = span.strip_suffix('s')?;
+        match secs.split_once('m') {
+            Some((m, s)) => Some(m.parse::<u64>().ok()? * 60 + s.parse::<u64>().ok()?),
+            None => secs.parse().ok(),
+        }
+    }
+
+    /// CW-WAIT-UNBOUNDED: a stage child waits on a lock whose named holder lives on and makes no
+    /// progress. Once its waiter calls the holder stuck, the run ends the child (`SIGTERM`, so it
+    /// says its own NOT RUN) rather than waiting on, well inside the one-minute hang detector and
+    /// with no ceiling that could end it instead; the child could not run, naming the holder and
+    /// how long it made no progress, at least the waiter's bound; the Linux lane's row reads NOT
+    /// RUN with it; and the holder is never signalled and still runs. Negative control: a holder
+    /// that wakes to work (a waiter in a chain) is waited for past three times the bound from
+    /// the child's own wait mark, then the child has the lock and runs to its end. Neither run
+    /// has a ceiling, so a starved start of the child, which a ceiling counts as work, decides
+    /// neither, and the control's span starts once the child waits, however late it started.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_waiting_behind_a_stuck_holder_could_not_run() {
+        let tmp = crate::mktemp_dir("atv-stuck-holder").expect("mktemp");
+        let mut holder = HolderStandIn::start("idle");
+        let (held, waiter) = held_lane_by(&tmp, holder.0.id());
+        let waiter = waiter.env(WAIT_PACED, "1");
+        let started = Instant::now();
+        let running = {
+            let (tmp, waiter) = (tmp.clone(), waiter.clone());
+            std::thread::spawn(move || run(&waiter, ceiled(&tmp, None)))
+        };
+        aterm_spec::wait::until_within(HANG_DETECTOR, "the run to end the child", || {
+            running.is_finished().then_some(())
+        });
+        let out = running.join().expect("the run");
+        eprintln!(
+            "the stuck holder ended the child {:?} after it began",
+            started.elapsed()
+        );
+        let why = out
+            .spawn_error
+            .clone()
+            .expect("the stuck holder is its reason");
+        let named = format!("pid {} (lab linux proof, /checkouts/holder)", holder.0.id());
+        let figure = why
+            .strip_prefix(
+                "this child waited for admission or a lock behind a holder that has made no \
+                 progress for ",
+            )
+            .and_then(|rest| rest.split_once(", so it was ended"))
+            .and_then(|(span, _)| span_secs(span));
+        assert!(
+            figure.is_some_and(|secs| secs >= STUCK_AFTER.as_secs())
+                && why.contains(&format!("{named}, which has held"))
+                && why.contains(", and which has made no progress for "),
+            "{why}"
+        );
+        assert!(
+            out.output.contains(&format!(
+                "NOT RUN: interrupted while waiting for {}",
+                named.trim_end_matches(')')
+            )),
+            "the child was ended before it said why: {}",
+            out.output
+        );
+        assert!(
+            !out.output.lines().any(|l| l == LOCK_ADMITTED),
+            "{}",
+            out.output
+        );
+        let mut r = crate::Report::new("linux");
+        r.record_driven(
+            &out,
+            crate::stages::LINUX_LANE,
+            crate::stages::linux_lane_outcome,
+        );
+        let row = r.render();
+        assert!(
+            row.lines().any(|l| l.starts_with(
+                crate::ladder::Outcome::Fail(crate::ladder::Severity::CouldNotRun).tag()
+            ) && l.contains(&format!(
+                "{} — this child waited for admission or a lock behind a holder",
+                crate::stages::LINUX_LANE
+            )) && l.contains(&named)),
+            "{row}"
+        );
+        assert!(holder.runs(), "the holder was signalled");
+        assert_eq!(
+            aterm_toolchain::named_lock::read(&tmp.join("lane.lock")).map(|h| h.pid),
+            Some(holder.0.id()),
+            "the holder keeps the lock"
+        );
+        drop((held, holder));
+
+        let lane = tmp.join("working");
+        std::fs::create_dir(&lane).expect("a second lane");
+        let mut working = HolderStandIn::start("polls");
+        let (held, waiter) = held_lane_by(&lane, working.0.id());
+        let waiter = waiter.env(WAIT_PACED, "1").env(WAIT_THEN_EXIT, "1");
+        let running = {
+            let lane = lane.clone();
+            std::thread::spawn(move || run(&waiter, ceiled(&lane, None)))
+        };
+        let wait = marked(&lane);
+        assert!(
+            wait.text
+                .contains(&format!("waiting for pid {} (", working.0.id())),
+            "{}",
+            wait.text
+        );
+        // Three times the bound past the child's wait mark with the holder at work: the
+        // condition under test.
+        std::thread::sleep(STUCK_AFTER * 3 + Duration::from_millis(500));
+        assert!(
+            !running.is_finished(),
+            "a working holder's waiter was ended: {:?}",
+            running.join().map(|r| (r.spawn_error, r.output))
+        );
+        assert!(working.runs());
+        drop(held);
+        aterm_spec::wait::until_within(HANG_DETECTOR, "the admitted child's end", || {
+            running.is_finished().then_some(())
+        });
+        let out = running.join().expect("the run");
+        assert!(
+            out.ok && out.spawn_error.is_none(),
+            "{:?}: {}",
+            out.spawn_error,
+            out.output
+        );
+        assert!(
+            out.output.lines().any(|l| l == LOCK_ADMITTED),
+            "{}",
+            out.output
+        );
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -2911,6 +3613,99 @@ mod tests {
             command.env("ATERM_VERIFY_BOUNDED_OUTPUT_NORMAL", "1");
         }
         command
+    }
+
+    static BOUNDED_QUIET: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+    fn bounded_quiet_admit(
+        need: aterm_capacity::Need,
+        mode: aterm_capacity::Admit,
+    ) -> Result<aterm_capacity::Claim, aterm_capacity::Error> {
+        crate::admit_in(
+            &aterm_capacity::Ledger::at(BOUNDED_QUIET.get().expect("scratch ledger")),
+            &aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(24, 20, 14)),
+            aterm_capacity::Pace::default(),
+            need,
+            mode,
+            &mut |_| {},
+        )
+    }
+
+    /// A completed last stage releases its quiet claim. A last stage whose bounded walk timed
+    /// out keeps that same claim while the actual worker is blocked, even after the stage's
+    /// owner is dropped, and releases it once that worker ends. The timeout is injected only
+    /// after the worker entered; every wait is a hang detector, never an elapsed-time budget.
+    #[test]
+    fn a_last_stage_keeps_its_quiet_claim_until_its_bounded_worker_ends() {
+        const HANG_DETECTOR: Duration = aterm_spec::wait::MUST_HAPPEN;
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let path = dir.path().join("ledger");
+        BOUNDED_QUIET.set(path.clone()).expect("set once");
+        let ledger = aterm_capacity::Ledger::at(&path);
+        let held = |ledger: &aterm_capacity::Ledger| {
+            ledger
+                .list()
+                .expect("ledger")
+                .iter()
+                .any(|r| r.held.is_some())
+        };
+        let ctx = crate::Ctx::new(
+            dir.path().to_owned(),
+            crate::Scope::crate_only("aterm-gui"),
+            crate::EnvSnapshot::default(),
+            dir.path().join("scratch"),
+        )
+        .with_quiet(Some(aterm_capacity::Admit::Now));
+        let last_stage = || {
+            std::sync::Mutex::new(crate::Quiet {
+                claim: None,
+                left: 1,
+                admit: bounded_quiet_admit,
+            })
+        };
+        let ordinary = last_stage();
+        let worker_ledger = aterm_capacity::Ledger::at(&path);
+        let (complete, _) = crate::quietly(&ctx, &ordinary, "ordinary last stage", || {
+            bounded(Some(HANG_DETECTOR), move || held(&worker_ledger))
+        })
+        .expect("admitted");
+        assert_eq!(complete, Ok(true), "ordinary worker ran while admitted");
+        aterm_spec::wait::until_within(
+            HANG_DETECTOR,
+            "completed worker released its quiet claim",
+            || (!held(&ledger)).then_some(()),
+        );
+
+        let (entered, ready) = std::sync::mpsc::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        let (finished, done) = std::sync::mpsc::channel();
+        let last = last_stage();
+        let (answer, _) = crate::quietly(&ctx, &last, "timed-out last stage", || {
+            bounded_wait(
+                move || {
+                    entered.send(()).expect("entered");
+                    resume.recv_timeout(HANG_DETECTOR).expect("released");
+                    finished.send(()).expect("worker finished");
+                },
+                |_| {
+                    ready.recv_timeout(HANG_DETECTOR).expect("worker entered");
+                    Err(Unfinished::TimedOut(HANG_DETECTOR))
+                },
+            )
+        })
+        .expect("admitted");
+        drop(last);
+        let held_after_stage = held(&ledger);
+        release.send(()).expect("release worker");
+        done.recv_timeout(HANG_DETECTOR).expect("worker ended");
+        aterm_spec::wait::until_within(HANG_DETECTOR, "worker released its quiet claim", || {
+            (!held(&ledger)).then_some(())
+        });
+        assert_eq!(answer, Err(Unfinished::TimedOut(HANG_DETECTOR)));
+        assert!(
+            held_after_stage,
+            "last stage returned but its actual worker still ran"
+        );
     }
 
     #[cfg(unix)]

@@ -36,14 +36,6 @@ const OPENED: [&str; 9] = [
     LOGIN_PICKER_FULLSCREEN_AGAIN_AT_EXPIRED_2_1_310,
 ];
 
-/// The pickers of [`OPENED`] drawn in the fullscreen renderer's bottom panel, past whose method
-/// pick nothing has been measured: no method's Enter is pressed there ([`picks`]).
-const FULLSCREEN: [&str; 3] = [
-    LOGIN_PICKER_FULLSCREEN_HINT_AT_EXPIRED_2_1_310,
-    LOGIN_PICKER_FULLSCREEN_AT_EXPIRED_2_1_310,
-    LOGIN_PICKER_FULLSCREEN_AGAIN_AT_EXPIRED_2_1_310,
-];
-
 /// Every measured picker whose focus arrow keys moved off the first row (no method picked).
 const MOVED: [&str; 3] = [
     LOGIN_PICKER_CONSOLE,
@@ -61,18 +53,9 @@ fn picker_of(text: &str) -> (Vec<String>, PromptV2, LoginPicker) {
     (rows, prompt, picker)
 }
 
-fn focus_steps(d: &Decision) -> Option<i32> {
-    match d {
-        Decision::Approve {
-            rule_id: RULE_LOGIN_METHOD,
-            choice: Choice::Focus { steps, label },
-            ..
-        } => {
-            assert!(label.contains(LoginMethod::Subscription.label()), "{label}");
-            Some(*steps)
-        }
-        _ => None,
-    }
+/// Whether `d` leaves the picker to the person: escalated, no key pressed in it.
+fn persons(d: &Decision) -> bool {
+    matches!(d, Decision::Escalate { .. })
 }
 
 fn ctx(approve: Approve) -> ApprovalCtx {
@@ -88,58 +71,45 @@ fn ctx(approve: Approve) -> ApprovalCtx {
     }
 }
 
-/// Selects the subscription row only when focus is still on the opening row of a picker the
-/// inline renderer draws. CONTROL: the fullscreen renderer's picker, opened alike, is the
-/// person's, since nothing past its method pick has been read in the real-Claude lab.
+/// The loop's own picker is never answered (v6 §14.17, rule 1): every method's pick opens a
+/// sign-in only a person finishes, the subscription's in the system browser, which would come
+/// forward over the person's work. Whatever the method, the renderer or the focus, the picker is
+/// the person's, and for a subscription session the escalation says why.
 #[test]
-fn a_subscription_session_chooses_the_subscription_row_where_the_dialog_opens_it() {
-    for text in OPENED {
-        let (_, prompt, picker) = picker_of(text);
-        let d = pick_method(&prompt, &picker, Some(LoginMethod::Subscription));
-        if FULLSCREEN.contains(&text) {
-            assert!(matches!(&d, Decision::Escalate { .. }), "{d:?}: {text}");
-            let inline = LoginPicker {
-                renderer: aterm_phase::PanelRenderer::Inline,
-                ..picker
-            };
-            let d = pick_method(&prompt, &inline, Some(LoginMethod::Subscription));
-            assert_eq!(
-                focus_steps(&d),
-                Some(0),
-                "its frame alone holds it: {d:?}: {text}"
-            );
-        } else {
-            assert_eq!(focus_steps(&d), Some(0), "{d:?}: {text}");
-        }
-    }
-    for text in MOVED {
-        let (_, prompt, picker) = picker_of(text);
-        let d = pick_method(&prompt, &picker, Some(LoginMethod::Subscription));
-        assert!(matches!(d, Decision::Escalate { .. }), "{d:?}: {text}");
-    }
-}
-
-#[test]
-fn an_unknown_console_or_platform_method_is_the_owners() {
-    for text in OPENED {
-        let (_, prompt, picker) = picker_of(text);
+fn the_loops_own_picker_is_never_answered_so_no_browser_comes_forward() {
+    for text in OPENED.into_iter().chain(MOVED) {
+        let (_, _, picker) = picker_of(text);
         for method in [
+            Some(LoginMethod::Subscription),
             None,
             Some(LoginMethod::Console),
             Some(LoginMethod::Platform),
         ] {
-            let d = pick_method(&prompt, &picker, method);
+            let d = pick_method(&picker, method);
+            assert!(persons(&d), "{method:?}: {d:?}: {text}");
+        }
+        let inline = LoginPicker {
+            renderer: aterm_phase::PanelRenderer::Inline,
+            ..picker
+        };
+        let Decision::Escalate { reason, .. } =
+            pick_method(&inline, Some(LoginMethod::Subscription))
+        else {
+            panic!("{text}");
+        };
+        if OPENED.contains(&text) {
             assert!(
-                matches!(d, Decision::Escalate { .. }),
-                "{method:?}: {d:?}: {text}"
+                reason.contains("opens the sign-in in your browser"),
+                "{reason}: {text}"
             );
         }
     }
 }
 
-/// Answers only the picker opened by the loop's own `/login`, never a user's or Console's.
+/// Answers no login picker: the one the loop's own `/login` opened is the person's as a user's
+/// own and Console's menu are, at the lost login and once work started.
 #[test]
-fn the_approval_policy_answers_only_the_picker_of_its_own_login() {
+fn the_approval_policy_answers_no_login_picker() {
     let now = Instant::now();
     let opening_rows = screen(LOGIN_OPENING);
     assert!(dialog_stands(&opening_rows));
@@ -166,7 +136,10 @@ fn the_approval_policy_answers_only_the_picker_of_its_own_login() {
         let rows = screen(LOGIN_PICKER);
         let read = aterm_phase::read(Some("claude"), &rows, Some(2));
         let d = decide(&read, &rows, &c);
-        assert_eq!(focus_steps(&d), Some(0), "{approve:?}: {d:?}");
+        assert!(
+            persons(&d),
+            "its own picker is the person's too: {approve:?}: {d:?}"
+        );
 
         let unknown = ApprovalCtx {
             login_method: None,
@@ -200,15 +173,7 @@ fn the_approval_policy_answers_only_the_picker_of_its_own_login() {
                 ..c.clone()
             };
             let d = decide(&later_read, &later_rows, &later);
-            if work_started {
-                assert!(matches!(d, Decision::Escalate { .. }), "{approve:?}: {d:?}");
-            } else {
-                assert_eq!(
-                    focus_steps(&d),
-                    Some(0),
-                    "the browser wait: {approve:?}: {d:?}"
-                );
-            }
+            assert!(persons(&d), "{work_started} {approve:?}: {d:?}");
         }
     }
 }
@@ -304,15 +269,10 @@ fn the_picker_aterm_opened_and_nobody_needs_is_backed_out_of() {
                 ..base.clone()
             };
             let d = decide(&read, &rows, &ours);
-            if opened && !FULLSCREEN.contains(&text) {
-                assert_eq!(focus_steps(&d), Some(0), "{approve:?}: {d:?}: {text}");
-            } else {
-                assert!(
-                    matches!(&d, Decision::Escalate { .. }),
-                    "a focus moved off the opening row, or the fullscreen panel: {approve:?}: \
-                     {d:?}: {text}"
-                );
-            }
+            assert!(
+                persons(&d),
+                "its own picker, carried: the person's ({opened}): {approve:?}: {d:?}: {text}"
+            );
             let d = decide(&read, &rows, &base);
             assert!(
                 matches!(&d, Decision::Escalate { .. }),

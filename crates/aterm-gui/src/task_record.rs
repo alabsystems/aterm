@@ -9,7 +9,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use aterm_agent::supervise::occupancy::{FactWord, NoteOutcome};
 
 use crate::SessionCtx;
-use crate::control::Scope;
+use crate::control::{Principal, Scope};
 use crate::turn_ledger::TurnBy;
 
 /// State of a worker session's task.
@@ -137,6 +137,11 @@ pub(crate) struct TaskRecord {
     pub(crate) from: String,
     /// Reason the task entered its current state ([`TASK_WHY`]).
     pub(crate) why: Option<&'static str>,
+    /// What aterm checked at the landing that marked it done (`checked=`,
+    /// `docs/DESIGN-harness-autopilot-2026-10-15.md` §14.9, slice 9c: `3f9a1c2e4b7d@origin/main`,
+    /// `no-remote`, `no-repo`, …; [`checked_word`]); none where the mark said none (a landing with
+    /// no receipt, codex-alab's own, a hand's mark).
+    pub(crate) checked: Option<String>,
     /// Agent exit code for an `exited` task, if known.
     pub(crate) exit: Option<i32>,
     /// Size in bytes of the worker's result file (`0` when absent).
@@ -204,11 +209,15 @@ impl TaskRecord {
         out.push_str(&format!(" fact={word} fact_rev={}", self.fact_rev));
     }
 
-    /// ` why= exit= result_path=`, each only when set.
+    /// ` why= checked= exit= result_path=`, each only when set.
     fn push_optional(&self, out: &mut String) {
         if let Some(why) = self.why {
             out.push_str(" why=");
             out.push_str(why);
+        }
+        if let Some(checked) = &self.checked {
+            out.push_str(" checked=");
+            out.push_str(checked);
         }
         if let Some(exit) = self.exit {
             out.push_str(&format!(" exit={exit}"));
@@ -273,13 +282,13 @@ impl TaskRecord {
             }
             fields.push((key, value));
         }
+        let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        let parse_u64 = |s: &str| digits(s).then(|| s.parse::<u64>().ok()).flatten();
         let field = |key: &str| fields.iter().find(|(k, _)| *k == key).map(|(_, v)| *v);
-        let since_unix_ms = field("since")?.parse::<u64>().ok()?;
+        let since_unix_ms = parse_u64(field("since")?)?;
         let age = std::time::Duration::from_millis(now_unix_ms.saturating_sub(since_unix_ms));
-        let rev = field("rev")?.parse::<u64>().ok().filter(|rev| *rev > 0)?;
-        let fact_rev = field("fact_rev")
-            .and_then(|n| n.parse::<u64>().ok())
-            .unwrap_or(0);
+        let rev = parse_u64(field("rev")?).filter(|rev| *rev > 0)?;
+        let fact_rev = field("fact_rev").and_then(parse_u64).unwrap_or(0);
         Some(Self {
             rev,
             state: TaskState::parse(field("state")?)?,
@@ -288,11 +297,15 @@ impl TaskRecord {
                 Some(word) => Some(why_word(word)?),
                 None => None,
             },
-            exit: match field("exit") {
-                Some(code) => Some(code.parse::<i32>().ok()?),
+            checked: match field("checked") {
+                Some(word) => Some(checked_word(word)?),
                 None => None,
             },
-            result_bytes: field("result_bytes")?.parse::<u64>().ok()?,
+            exit: match field("exit") {
+                Some(code) => Some(parse_exit_i32(code)?),
+                None => None,
+            },
+            result_bytes: parse_u64(field("result_bytes")?)?,
             result_path: match field("result_path") {
                 Some(path) => Some(result_path(path, tasks)?),
                 None => None,
@@ -341,9 +354,33 @@ fn worker_agent(word: &str) -> Option<aterm_phase::Program> {
         .filter(|p| aterm_agent::harness::worker::worker_cli(*p).is_some())
 }
 
+/// THE `checked=` WORD `value` IS (§14.9, slice 9c), as a landing's receipt writes it
+/// (`aterm_agent::harness::acts::LandReceipt::checked_word`): `<12 lowercase hex>@<ref>` where
+/// `HEAD` was found on a remote main (`3f9a1c2e4b7d@origin/main`, the ref one printable ASCII
+/// token), else a leg's own word (`pushed`, `no-remote`, `no-repo`, `gone`); `None` for any other.
+pub(crate) fn checked_word(value: &str) -> Option<String> {
+    aterm_agent::harness::land_receipt::valid_checked_word(value).then(|| value.to_owned())
+}
+
+/// THE REFUSAL OF A HAND MARK'S `checked=` (the post-landing review, 2026-11-01): the word says
+/// what aterm itself checked at a landing, so only aterm's own loop writes it (its connection's
+/// [`Principal::Harness`]); a mark any other owner-socket caller makes names none.
+pub(crate) const CHECKED_BY_HAND: &str =
+    concat!("ERR task mark: ", aterm_types::checked_by_hand!(), "\n");
+
 /// The [`TASK_WHY`] word `value` is, as its `'static` spelling.
 fn why_word(value: &str) -> Option<&'static str> {
     TASK_WHY.iter().copied().find(|w| *w == value)
+}
+
+fn parse_exit_i32(value: &str) -> Option<i32> {
+    let valid = match value.strip_prefix('-') {
+        Some(rest) => {
+            !rest.is_empty() && !rest.starts_with('0') && rest.bytes().all(|b| b.is_ascii_digit())
+        }
+        None => !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()),
+    };
+    valid.then(|| value.parse::<i32>().ok()).flatten()
 }
 
 /// Parsed `task mark` transition and its associated metadata.
@@ -355,6 +392,8 @@ pub(crate) struct TaskMark {
     pub(crate) from: Option<String>,
     /// Transition reason ([`TASK_WHY`]).
     pub(crate) why: Option<&'static str>,
+    /// What aterm checked at the landing ([`TaskRecord::checked`], [`checked_word`]).
+    pub(crate) checked: Option<String>,
     /// Agent exit code.
     pub(crate) exit: Option<i32>,
     /// Result size in bytes.
@@ -365,7 +404,8 @@ pub(crate) struct TaskMark {
 
 /// Usage error line for `task`.
 pub(crate) const TASK_USAGE: &str = "ERR usage: task [mark <working|done|exited|stalled> \
-     [from=<s-…|ctl>] [why=<word>] [exit=<n>] [result_bytes=<n>] [result_path=<pct>]]\n";
+     [from=<s-…|ctl>] [why=<word>] [checked=<word>] [exit=<n>] [result_bytes=<n>] \
+     [result_path=<pct>]]\n";
 
 impl TaskMark {
     /// Creates a mark to `state` with default fields.
@@ -375,6 +415,7 @@ impl TaskMark {
             state,
             from: None,
             why: None,
+            checked: None,
             exit: None,
             result_bytes: 0,
             result_path: None,
@@ -404,8 +445,23 @@ impl TaskMark {
                         format!("ERR task mark: why= is one of {}\n", TASK_WHY.join("|"))
                     })?);
                 }
-                "exit" => mark.exit = Some(value.parse::<i32>().map_err(|_| usage())?),
-                "result_bytes" => mark.result_bytes = value.parse::<u64>().map_err(|_| usage())?,
+                "checked" if state != TaskState::Done => {
+                    return Err("ERR task mark: checked= marks a done task\n".into());
+                }
+                "checked" => {
+                    mark.checked = Some(checked_word(value).ok_or_else(|| {
+                        "ERR task mark: checked= is <head>@<ref>, pushed, no-remote, no-repo or \
+                         gone\n"
+                            .to_string()
+                    })?);
+                }
+                "exit" => mark.exit = Some(parse_exit_i32(value).ok_or_else(usage)?),
+                "result_bytes" => {
+                    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                        return Err(usage());
+                    }
+                    mark.result_bytes = value.parse::<u64>().map_err(|_| usage())?;
+                }
                 "result_path" => {
                     mark.result_path = Some(result_path(value, tasks).ok_or_else(|| {
                         "ERR task mark: result_path= names a file under <state>/tasks/\n"
@@ -438,6 +494,7 @@ impl TaskMark {
                 state: self.state,
                 from,
                 why: self.why,
+                checked: self.checked.clone(),
                 exit: self.exit,
                 result_bytes: self.result_bytes,
                 result_path: self.result_path.clone(),
@@ -455,6 +512,7 @@ impl TaskMark {
         let same = current.state == self.state
             && current.from == from
             && current.why == self.why
+            && current.checked == self.checked
             && current.exit == self.exit
             && current.result_bytes == self.result_bytes
             && current.result_path == self.result_path
@@ -472,6 +530,7 @@ impl TaskMark {
         next.state = self.state;
         next.from = from;
         next.why = self.why;
+        next.checked.clone_from(&self.checked);
         next.exit = self.exit;
         next.result_bytes = self.result_bytes;
         next.result_path.clone_from(&self.result_path);
@@ -873,6 +932,7 @@ fn repair_result(
         state: record.state,
         from: Some(record.from.clone()),
         why: record.why,
+        checked: record.checked.clone(),
         exit: record.exit,
         result_bytes: found.bytes(),
         result_path: record.result_path.clone(),
@@ -975,6 +1035,9 @@ pub(crate) fn cmd_task(ctx: &SessionCtx, local_id: u64, scope: Scope, rest: &str
         Ok(parsed) => parsed,
         Err(reply) => return reply,
     };
+    if parsed.checked.is_some() && crate::control::serving_principal() != Principal::Harness {
+        return CHECKED_BY_HAND.to_string();
+    }
     let deadline_stall =
         parsed.state == TaskState::Stalled && matches!(parsed.why, Some("startup" | "held"));
     let edit = if deadline_stall {
@@ -1053,6 +1116,12 @@ pub(crate) struct AwaitTaskArgs {
 /// Parses `await task` arguments after the `task` word.
 pub(crate) fn parse_await_task(words: &[&str], list: bool) -> Result<AwaitTaskArgs, String> {
     let usage = || AWAIT_TASK_USAGE.to_string();
+    let parse_rev = |s: &str| -> Result<u64, String> {
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(usage());
+        }
+        s.parse::<u64>().map_err(|_| usage())
+    };
     let mut args = AwaitTaskArgs {
         targets: Vec::new(),
         combine: Combine::Any,
@@ -1074,16 +1143,10 @@ pub(crate) fn parse_await_task(words: &[&str], list: bool) -> Result<AwaitTaskAr
                 let (selector, since, fact_since) = match body.split_once(':') {
                     Some((selector, revs)) => {
                         let (rev, fact) = match revs.split_once(':') {
-                            Some((rev, fact)) => {
-                                (rev, Some(fact.parse::<u64>().map_err(|_| usage())?))
-                            }
+                            Some((rev, fact)) => (rev, Some(parse_rev(fact)?)),
                             None => (revs, None),
                         };
-                        (
-                            selector,
-                            Some(rev.parse::<u64>().map_err(|_| usage())?),
-                            fact,
-                        )
+                        (selector, Some(parse_rev(rev)?), fact)
                     }
                     None => (body, None, None),
                 };
@@ -1115,7 +1178,7 @@ pub(crate) fn parse_await_task(words: &[&str], list: bool) -> Result<AwaitTaskAr
             if args.since.is_some() {
                 return Err(usage());
             }
-            args.since = Some(rev.parse::<u64>().map_err(|_| usage())?);
+            args.since = Some(parse_rev(rev)?);
         } else if word == "facts=1" {
             if args.facts {
                 return Err(usage());
@@ -1125,7 +1188,7 @@ pub(crate) fn parse_await_task(words: &[&str], list: bool) -> Result<AwaitTaskAr
             if args.fact_since.is_some() {
                 return Err(usage());
             }
-            args.fact_since = Some(rev.parse::<u64>().map_err(|_| usage())?);
+            args.fact_since = Some(parse_rev(rev)?);
         } else {
             let value = match word.strip_prefix("timeout=") {
                 Some(value) => value,
@@ -1146,9 +1209,10 @@ pub(crate) fn parse_await_task(words: &[&str], list: bool) -> Result<AwaitTaskAr
     Ok(args)
 }
 
-/// Formats a single `await task` reply row (` fact= fact_rev=` at its end once the record's fact
-/// word was ever edited, [`TaskRecord::push_fact`]); `program` is the `program_state=` column, a
-/// claim shown beside `agent=` that no wait reads.
+/// Formats a single `await task` reply row (` checked=` where a landing named what aterm checked,
+/// §14.9 slice 9c, and ` fact= fact_rev=` at its end once the record's fact word was ever edited,
+/// [`TaskRecord::push_fact`]); `program` is the `program_state=` column, a claim shown beside
+/// `agent=` that no wait reads.
 #[must_use]
 pub(crate) fn await_row(
     sid: &str,
@@ -1166,6 +1230,10 @@ pub(crate) fn await_row(
          attention={attention} result_bytes={result_bytes}"
     );
     if let Some(record) = record {
+        if let Some(checked) = &record.checked {
+            row.push_str(" checked=");
+            row.push_str(checked);
+        }
         record.push_fact(&mut row);
     }
     row

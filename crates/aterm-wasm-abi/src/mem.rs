@@ -125,19 +125,29 @@ pub fn set_thrown(thrown: Thrown) {
         Ok((ptr, len)) => (ptr, len as usize),
         Err(_) => (1, 0),
     };
-    RET.with(|s| {
-        s.thrown.set(kind);
-        s.msg_ptr.set(ptr);
-        s.msg_len.set(len);
+    let (prev_kind, prev_ptr, prev_len) = RET.with(|s| {
+        (
+            s.thrown.replace(kind),
+            s.msg_ptr.replace(ptr),
+            s.msg_len.replace(len),
+        )
     });
+    if prev_kind != thrown::NONE && prev_len != 0 {
+        // SAFETY: `set_thrown` previously left `prev_len` bytes of UTF-8 at `prev_ptr` (align 1)
+        // and neither `take_thrown` nor the glue consumed `thrown`.
+        unsafe { free(prev_ptr, prev_len, 1) };
+    }
 }
 
 /// The glue's half of a throw, for native tests.
 #[must_use]
 pub fn take_thrown() -> Option<Thrown> {
     let (kind, ptr, len) = RET.with(|s| {
-        let kind = s.thrown.replace(thrown::NONE);
-        (kind, s.msg_ptr.get(), s.msg_len.get())
+        (
+            s.thrown.replace(thrown::NONE),
+            s.msg_ptr.replace(0),
+            s.msg_len.replace(0),
+        )
     });
     if kind == thrown::NONE {
         return None;
@@ -207,5 +217,8 @@ mod tests {
         assert_eq!(take_thrown(), None, "taken once");
         set_thrown(Thrown::Error(String::new()));
         assert_eq!(take_thrown(), Some(Thrown::Error(String::new())));
+        set_thrown(Thrown::Error("first".into()));
+        set_thrown(Thrown::Value("second".into()));
+        assert_eq!(take_thrown(), Some(Thrown::Value("second".into())));
     }
 }

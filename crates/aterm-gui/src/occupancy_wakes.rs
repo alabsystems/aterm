@@ -227,6 +227,10 @@ pub(crate) trait Env: Send + Sync {
     fn now_ms(&self) -> i64;
     /// The local zone's offset from UTC now, seconds.
     fn local_offset_s(&self) -> i64;
+    /// The local zone's offset from UTC at `unix_s` (unix seconds), seconds.
+    fn local_offset_at(&self, _unix_s: i64) -> Option<i64> {
+        Some(self.local_offset_s())
+    }
     /// The process records.
     fn tree(&self) -> &dyn ProcTree;
     /// The owner's mode in force.
@@ -825,10 +829,11 @@ impl WakeHost {
             books.look(env, &seat.sid, sys.as_ref(), now_ms);
         }
         let shelf = books.shelf(seat);
-        let declared =
-            shelf
-                .book
-                .declare(req, Declarer::Agent, agent, now_ms, env.local_offset_s());
+        let declared = shelf
+            .book
+            .declare_local(req, Declarer::Agent, agent, now_ms, &|unix_s| {
+                env.local_offset_at(unix_s)
+            });
         let ord = match declared {
             Ok(ord) => ord,
             Err(refusal) => return format!("ERR denied wake: {}\n", refusal.words()),
@@ -1919,6 +1924,10 @@ impl Env for Live {
 
     fn local_offset_s(&self) -> i64 {
         crate::presence::local_offset_s().unwrap_or(0)
+    }
+
+    fn local_offset_at(&self, unix_s: i64) -> Option<i64> {
+        crate::presence::local_offset_at(unix_s)
     }
 
     fn tree(&self) -> &dyn ProcTree {

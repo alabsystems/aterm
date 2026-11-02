@@ -26,6 +26,12 @@ libc = { workspace = true }
 # The scratch world each take runs in, a private directory under /tmp.
 aterm-tempfile = { workspace = true }
 
+# A windowed take's CPU time: `proc_pid_rusage` counts it in Mach ticks, which the
+# kernel's own timebase turns into ns (`measure::usage`). Workspace crate, already
+# in this graph through aterm-uds.
+[target.'cfg(target_os = "macos")'.dependencies]
+aterm-sysprobe = { workspace = true }
+
 [dev-dependencies]
 aterm-types = { workspace = true }
 # The matrices start on a quiet machine (benches/support/quiet.rs): a claim in

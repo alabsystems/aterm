@@ -64,6 +64,11 @@ pub(crate) struct Rest {
 /// The lens's per-window state.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct LensSlot {
+    /// Arrow presses awaiting a successful frame of their selected lens.
+    pub(crate) input: crate::metrics::PendingChromeInputStamp,
+    input_selection: Option<LensSelection>,
+    presented_selection: Option<Option<LensSelection>>,
+    scope_tab: Option<crate::tab_model::TabId>,
     /// Stable peer/service selection within the Network State instrument.
     pub(crate) network_target: crate::network_deck::Target,
     /// The open lens.
@@ -78,6 +83,60 @@ pub(crate) struct LensSlot {
     pub(crate) last: Option<(Instrument, Bar)>,
     /// The open lens's shell raster, kept while its prims stay the same.
     pub(crate) shell: Option<ShellRaster>,
+}
+
+impl LensSlot {
+    fn selection(&self, active_tab: Option<crate::tab_model::TabId>) -> Option<LensSelection> {
+        let lens = self.open?;
+        Some(LensSelection {
+            lens,
+            target: if lens.focus == Instrument::NetworkState {
+                self.network_target
+            } else {
+                crate::network_deck::Target::Overview
+            },
+            // Resource lenses read the front tab's panes and label, even in their global
+            // comparison rows. Network State reads machine/service evidence independently.
+            tab: if lens.focus == Instrument::NetworkState {
+                None
+            } else {
+                Some(active_tab?)
+            },
+        })
+    }
+
+    /// A host sync observes every active-tab transition, including a return before painting.
+    pub(crate) fn sync_tab_scope(&mut self, active_tab: Option<crate::tab_model::TabId>) {
+        if self.scope_tab != active_tab {
+            self.scope_tab = active_tab;
+            if self
+                .input_selection
+                .is_some_and(|selection| selection.tab.is_some())
+            {
+                self.retire_input();
+            }
+        }
+    }
+
+    fn retire_input(&mut self) {
+        self.input.retire();
+        self.input_selection = None;
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LensSelection {
+    lens: Lens,
+    target: crate::network_deck::Target,
+    tab: Option<crate::tab_model::TabId>,
+}
+
+/// The lens selection actually included in a composed frame. `None` means painted absence;
+/// an absent receipt means visibility was not established (for example, a covering card).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LensPaintReceipt {
+    selection: Option<LensSelection>,
+    input: Option<crate::metrics::ChromeInputToken>,
 }
 
 /// The lens shell's raster: its shadow rings, ground and rim, which a new reading leaves as they
@@ -1517,7 +1576,8 @@ fn trace_said(what: &str, unit: &str, t: &Trace, span: (i64, i64), loc: &Locale)
         }
         if j < n {
             let at = |i: usize| {
-                let mut t = clock_s(start_ms + i as i64 * bucket_ms, loc.utc_offset_s);
+                let ms = start_ms + i as i64 * bucket_ms;
+                let mut t = clock_s(ms, loc.offset_at_ms(ms));
                 t.truncate(5);
                 t
             };
@@ -1580,7 +1640,10 @@ impl Ctx<'_> {
     }
 
     fn at(&self) -> String {
-        clock_s(self.snap.at_unix_ms, self.loc.utc_offset_s)
+        clock_s(
+            self.snap.at_unix_ms,
+            self.loc.offset_at_ms(self.snap.at_unix_ms),
+        )
     }
 
     fn view(&self, res: Resource) -> ResourceView {
@@ -1611,6 +1674,57 @@ impl Ctx<'_> {
             text.push_str(&format!(" \u{b7} {clause}"));
         }
         Some(("Now", text, state.map_or(InkKind::Words2, |st| st.ink)))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PresenceAxis {
+    Elapsed { start: u64, span: u64 },
+    Recorded { last: usize },
+}
+
+impl PresenceAxis {
+    fn for_samples(samples: &[aterm_types::network_state::PresenceSample], observed: u64) -> Self {
+        let start = samples.first().map_or(observed, |sample| sample.at_ms);
+        if samples.windows(2).all(|pair| pair[0].at_ms < pair[1].at_ms)
+            && samples.last().is_none_or(|sample| sample.at_ms <= observed)
+        {
+            Self::Elapsed {
+                start,
+                span: observed.saturating_sub(start).max(1),
+            }
+        } else {
+            Self::Recorded {
+                last: samples.len().saturating_sub(1),
+            }
+        }
+    }
+
+    fn fraction(self, index: usize, at: u64) -> f64 {
+        match self {
+            Self::Elapsed { start, span } => {
+                at.saturating_sub(start).min(span) as f64 / span as f64
+            }
+            Self::Recorded { last } => index as f64 / last.max(1) as f64,
+        }
+    }
+
+    const fn heading(self) -> &'static str {
+        match self {
+            Self::Elapsed { .. } => "Observed presence",
+            Self::Recorded { .. } => "Recorded order",
+        }
+    }
+
+    const fn words(self) -> &'static str {
+        match self {
+            Self::Elapsed { .. } => {
+                "Recorded samples only; blank intervals do not establish reachability"
+            }
+            Self::Recorded { .. } => {
+                "Samples in recorded order; spacing does not represent elapsed time. Blank intervals do not establish reachability"
+            }
+        }
     }
 }
 
@@ -1647,8 +1761,9 @@ fn lab_network_doc(
             }
             let lines = wrap(metrics, &value, width, BODY_PT);
             let label = name.clone();
-            let compact = (target == crate::network_deck::Target::Overview && name == "Observer")
-                .then(|| line_form(&name, vec![value.clone()]));
+            let compact = ((target == crate::network_deck::Target::Overview && name == "Observer")
+                || matches!(target, crate::network_deck::Target::Peer(_)))
+            .then(|| line_form(&name, vec![value.clone()]));
             let mut forms = vec![form(rows_h(lines.len(), false), move |pen, p| {
                 heading(pen, p, &label, &[]);
                 let ink = pen.inks.words2;
@@ -1680,23 +1795,14 @@ fn lab_network_doc(
         && !peer.samples.is_empty()
     {
         let samples = peer.samples.clone();
-        let now = snapshot.network.observed_at_ms;
-        let start = samples.first().map_or(now, |sample| sample.at_ms);
-        let span = now.saturating_sub(start).max(1);
+        let observed = snapshot.network.observed_at_ms;
+        let axis = PresenceAxis::for_samples(&samples, observed);
         let history = form(42.0, move |pen, p| {
             let color = pen.inks.words2;
-            pen.text(
-                p.x,
-                p.y + HEAD_BASE,
-                "Observed presence",
-                HEAD_PT,
-                true,
-                color,
-            );
+            pen.text(p.x, p.y + HEAD_BASE, axis.heading(), HEAD_PT, true, color);
             let width = (p.w - 8.0).max(1.0);
-            for sample in &samples {
-                let x = p.x
-                    + (sample.at_ms.saturating_sub(start).min(span) as f64 / span as f64) * width;
+            for (index, sample) in samples.iter().enumerate() {
+                let x = p.x + axis.fraction(index, sample.at_ms) * width;
                 let fill = if sample.state == aterm_types::network_state::Reachability::Reachable {
                     pen.inks.machine
                 } else {
@@ -1714,25 +1820,31 @@ fn lab_network_doc(
                     );
                 }
             }
-            pen.text(
-                p.x,
-                p.y + 38.0,
+            let end = "Last observation";
+            let first = pen.cut(
                 "First retained observation",
+                (p.w - pen.width(end, BODY_PT, false) - 8.0).max(0.0),
                 BODY_PT,
                 false,
-                color,
             );
-            pen.text_end(p.x + p.w, p.y + 38.0, "now", BODY_PT, false, color);
+            pen.text(p.x, p.y + 38.0, &first, BODY_PT, false, color);
+            pen.text_end(p.x + p.w, p.y + 38.0, end, BODY_PT, false, color);
         });
-        sections.push(Section {
-            name: "Observed presence".into(),
-            words: vec![
-                "Recorded samples only; blank intervals do not establish reachability".into(),
-            ],
-            right: false,
-            parts: Vec::new(),
-            forms: vec![history],
-        });
+        // Retained samples belong with the selected peer, before general network context.
+        let before_context = sections
+            .iter()
+            .position(|section| section.name == "Network")
+            .unwrap_or(sections.len());
+        sections.insert(
+            before_context,
+            Section {
+                name: "Observed presence".into(),
+                words: vec![axis.words().into()],
+                right: false,
+                parts: Vec::new(),
+                forms: vec![history],
+            },
+        );
     }
     LensDoc {
         name: "Network State",
@@ -1741,7 +1853,13 @@ fn lab_network_doc(
         } else {
             "This machine's local observer and retained authenticated history".into()
         }],
-        explainer: scope.unwrap_or_else(|| "Filled peer: reachable; hollow peer: unconfirmed. Warnings: peer = unknown visibility, local = partial history, service = refresh failed. ↑/↓: machine or service; ←/→: instrument. Reachability grants no account or secret access.".into()),
+        explainer: scope.unwrap_or_else(|| {
+            if matches!(target, crate::network_deck::Target::Peer(_)) {
+                "↑/↓: machine or service. Outbound addresses are historical.".into()
+            } else {
+                "Filled peer: reachable; hollow peer: unconfirmed. Warnings: peer = unknown visibility, local = partial history, service = refresh failed. ↑/↓: machine or service; ←/→: instrument. Reachability grants no account or secret access.".into()
+            }
+        }),
         answer: Some(("Now", crate::network_deck::summary(snapshot), InkKind::Words2)),
         sections,
         two_order: Vec::new(),
@@ -1752,6 +1870,468 @@ fn lab_network_doc(
 #[cfg(test)]
 mod network_tests {
     use super::*;
+
+    fn render_presence(
+        samples: &[aterm_types::network_state::PresenceSample],
+        observed: u64,
+        metrics: &FaceMetrics,
+        width: f64,
+        scale: f32,
+    ) -> (Vec<DrawPrim>, Vec<String>, Vec<TextBox>) {
+        use aterm_types::network_state::{
+            HistoryState, MachineIdentity, NetworkStateSnapshot, PeerObservation, Reachability,
+            Visibility,
+        };
+
+        let resource = Snapshot::default();
+        let input = crate::stats_deck::tests::input(&resource);
+        let inks = input.inks;
+        let mut snapshot = NetworkStateSnapshot::default();
+        snapshot.network.visibility = Visibility::Active;
+        snapshot.network.history = HistoryState::Ready;
+        snapshot.network.observed_at_ms = observed;
+        snapshot.network.peers.push(PeerObservation {
+            slot: 1,
+            identity: MachineIdentity {
+                machine_id: [2; 16],
+                incarnation: [3; 16],
+                label: None,
+            },
+            first_seen_ms: samples.first().map_or(observed, |sample| sample.at_ms),
+            last_seen_ms: observed,
+            last_checked_ms: Some(observed),
+            last_repair: None,
+            last_authenticated_endpoint: None,
+            reachability: Reachability::Reachable,
+            instances: None,
+            samples: samples.to_vec(),
+        });
+        let doc = lab_network_doc(
+            Some(&snapshot),
+            crate::network_deck::Target::Peer(1),
+            metrics,
+            width,
+        );
+        let section = doc
+            .sections
+            .iter()
+            .find(|section| section.name == "Observed presence")
+            .expect("selected peer history");
+        assert_eq!(section.forms[0].h, 42.0);
+        let mut pen = Pen {
+            p: Painter::new(&inks, scale, 14.0 * scale, false),
+            m: metrics,
+            inks,
+            ic: false,
+            s: f64::from(scale),
+            ox: 0.0,
+            oy: 0.0,
+            draw: true,
+            line_tab: 0.0,
+            boxes: Vec::new(),
+        };
+        (section.forms[0].draw)(
+            &mut pen,
+            Place {
+                x: 0.0,
+                y: 0.0,
+                w: width,
+                h: 42.0,
+            },
+        );
+        (pen.p.prims, section.words.clone(), pen.boxes)
+    }
+
+    fn distinct_presence_marks(xs: &[f32], scale: f32) -> bool {
+        xs.windows(2).all(|pair| pair[1] - pair[0] >= 4.0 * scale)
+    }
+
+    #[test]
+    fn rollback_and_duplicate_samples_keep_distinct_states_in_the_actual_painter() {
+        use aterm_types::network_state::{PresenceSample, Reachability};
+        let resource = Snapshot::default();
+        let inks = crate::stats_deck::tests::input(&resource).inks;
+        for (times, observed) in [
+            (vec![100_000, 90_000, 90_001], 90_001),
+            // A frozen wall clock can record contact and its later monotonic expiry equally.
+            (vec![100_000, 100_000], 100_000),
+        ] {
+            let samples: Vec<_> = times
+                .iter()
+                .enumerate()
+                .map(|(index, &at_ms)| PresenceSample {
+                    at_ms,
+                    state: if index == 1 {
+                        Reachability::LastSeen
+                    } else {
+                        Reachability::Reachable
+                    },
+                })
+                .collect();
+            for metrics in [FaceMetrics::helvetica_neue(), FaceMetrics::test_stack()] {
+                for width in [220.0, 420.0] {
+                    for scale in [1.0, 2.0] {
+                        let (prims, words, boxes) =
+                            render_presence(&samples, observed, &metrics, width, scale);
+                        let marks: Vec<_> = prims
+                            .iter()
+                            .filter_map(|prim| match prim {
+                                DrawPrim::Panel { x, w, h, fill, .. }
+                                    if *w == 4.0 * scale && *h == 7.0 * scale =>
+                                {
+                                    Some((*x, *fill))
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        let xs: Vec<_> = marks.iter().map(|(x, _)| *x).collect();
+                        assert_eq!(xs.len(), samples.len());
+                        assert!(distinct_presence_marks(&xs, scale));
+                        assert_eq!(xs[0], 0.0);
+                        assert_eq!(
+                            *xs.last().unwrap(),
+                            ((width - 8.0) * f64::from(scale)) as f32
+                        );
+                        assert!(xs.iter().all(|x| x.is_finite()
+                            && *x >= 0.0
+                            && *x + 4.0 * scale <= width as f32 * scale));
+                        for ((_, fill), sample) in marks.iter().zip(&samples) {
+                            let ink = if sample.state == Reachability::Reachable {
+                                inks.machine
+                            } else {
+                                inks.hollow
+                            };
+                            assert_eq!(*fill, rgba(ink, 255));
+                        }
+                        assert_eq!(
+                            prims
+                                .iter()
+                                .filter(|prim| matches!(prim,
+                                    DrawPrim::Panel { w, h, .. }
+                                        if *w == 2.0 * scale && *h == 5.0 * scale
+                                ))
+                                .count(),
+                            1
+                        );
+                        assert!(boxes.iter().any(|text| text.text == "Recorded order"));
+                        assert!(
+                            boxes
+                                .iter()
+                                .all(|text| text.r[0] >= 0.0 && text.r[2] <= width + EPS)
+                        );
+                        assert!(words.iter().any(|words| words.contains("recorded order")
+                            && words.contains("does not represent elapsed time")));
+                        // The previous formula collapses these same producer histories.
+                        let start = samples[0].at_ms;
+                        let span = observed.saturating_sub(start).max(1);
+                        let former: Vec<_> = samples
+                            .iter()
+                            .map(|sample| {
+                                (sample.at_ms.saturating_sub(start).min(span) as f64 / span as f64
+                                    * (width - 8.0)
+                                    * f64::from(scale)) as f32
+                            })
+                            .collect();
+                        assert!(!distinct_presence_marks(&former, scale));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn presence_axis_keeps_elapsed_spacing_only_with_strictly_increasing_clock_evidence() {
+        use aterm_types::network_state::{PresenceSample, Reachability};
+        let samples = |times: &[u64]| {
+            times
+                .iter()
+                .map(|&at_ms| PresenceSample {
+                    at_ms,
+                    state: Reachability::Reachable,
+                })
+                .collect::<Vec<_>>()
+        };
+        let ordinary = samples(&[90_000, 95_000, 110_000]);
+        let axis = PresenceAxis::for_samples(&ordinary, 130_000);
+        assert!(matches!(axis, PresenceAxis::Elapsed { .. }));
+        assert_eq!(
+            [
+                axis.fraction(0, 90_000),
+                axis.fraction(1, 95_000),
+                axis.fraction(2, 110_000)
+            ],
+            [0.0, 0.125, 0.5]
+        );
+        for (times, observed) in [
+            (vec![], 90_000),
+            (vec![90_000], 90_000),
+            (vec![100_000], 90_000),
+            (vec![90_000, 100_000], 95_000),
+            (vec![90_000, 80_000, 100_000], 110_000),
+            (vec![u64::MAX, 0, 1], 1),
+            (vec![0, u64::MAX], u64::MAX),
+        ] {
+            let samples = samples(&times);
+            let axis = PresenceAxis::for_samples(&samples, observed);
+            let positions: Vec<_> = samples
+                .iter()
+                .enumerate()
+                .map(|(index, sample)| axis.fraction(index, sample.at_ms))
+                .collect();
+            assert!(
+                positions
+                    .iter()
+                    .all(|x| x.is_finite() && (0.0..=1.0).contains(x))
+            );
+            assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+            if times.last().is_some_and(|last| *last > observed)
+                || times.windows(2).any(|pair| pair[0] >= pair[1])
+            {
+                assert!(matches!(axis, PresenceAxis::Recorded { .. }));
+            }
+        }
+        // The ordinary painter must retain its unequal elapsed gaps and original caption.
+        let (prims, words, boxes) =
+            render_presence(&ordinary, 130_000, &FaceMetrics::test_stack(), 420.0, 1.0);
+        let xs: Vec<_> = prims
+            .iter()
+            .filter_map(|prim| match prim {
+                DrawPrim::Panel { x, w, h, .. } if *w == 4.0 && *h == 7.0 => Some(*x),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(xs, [0.0, 52.0, 206.0]);
+        assert!(boxes.iter().any(|text| text.text == "Observed presence"));
+        assert!(words.iter().all(|words| !words.contains("spacing")));
+    }
+
+    fn retained_peer() -> aterm_types::network_state::NetworkStateSnapshot {
+        use aterm_types::network_state::{
+            AuthenticatedEndpoint, HistoryState, MachineIdentity, NetworkStateSnapshot,
+            PeerObservation, Reachability, RepairObservation, RepairOutcome, RepairStage,
+            Visibility,
+        };
+
+        let mut network = NetworkStateSnapshot::default();
+        network.network.visibility = Visibility::Offline;
+        network.network.history = HistoryState::Ready;
+        network.network.observed_at_ms = 1_793_040_000_000;
+        network.network.peers.push(PeerObservation {
+            slot: 7,
+            identity: MachineIdentity {
+                machine_id: [0x23; 16],
+                incarnation: [0x42; 16],
+                label: None,
+            },
+            first_seen_ms: 1_793_030_000_000,
+            last_seen_ms: 1_793_040_000_000,
+            last_checked_ms: None,
+            last_repair: Some(RepairObservation {
+                completed_at_ms: 1_793_000_000_000,
+                outbound: true,
+                stage: Some(RepairStage::Application),
+                outcome: RepairOutcome::Failed,
+                table: Some([7; 32]),
+                sent: Some(7),
+                received: None,
+                deferred: Some(2),
+            }),
+            last_authenticated_endpoint: Some(AuthenticatedEndpoint {
+                address: "[2001:db8::7]:9699".parse().unwrap(),
+                observed_at_ms: 1_793_000_000_000,
+            }),
+            reachability: Reachability::LastSeen,
+            instances: None,
+            samples: Vec::new(),
+        });
+        network
+    }
+
+    #[test]
+    fn short_peer_lenses_keep_the_original_repair_time_with_every_recorded_outcome() {
+        use aterm_types::network_state::RepairOutcome;
+
+        let mut app = crate::App::headless_for_test();
+        let wid = *app.windows.keys().next().unwrap();
+        app.network_source = None;
+        assert!(app.open_network_lens());
+        let target = crate::network_deck::Target::Peer(7);
+        app.windows.get_mut(&wid).unwrap().stats_lens.network_target = target;
+        let resource = Snapshot::default();
+        let lens = Lens {
+            focus: Instrument::NetworkState,
+            bar: Bar::Global,
+            how: Opened::Keyboard,
+        };
+        for outcome in [
+            Some(RepairOutcome::Failed),
+            Some(RepairOutcome::Deferred),
+            Some(RepairOutcome::Exchanged),
+            Some(RepairOutcome::Cancelled),
+            Some(RepairOutcome::NotObserved),
+            Some(RepairOutcome::NoCommonTable),
+            None,
+        ] {
+            let mut network = retained_peer();
+            let label = "fixture-peer".to_owned();
+            network.network.peers[0].identity.label = Some(label.clone());
+            // A visible endpoint or last-seen time cannot satisfy the repair-time check.
+            network.network.peers[0]
+                .last_authenticated_endpoint
+                .as_mut()
+                .unwrap()
+                .observed_at_ms -= 60_000;
+            network.network.peers[0].last_repair = outcome.map(|outcome| {
+                let mut repair = network.network.peers[0].last_repair.clone().unwrap();
+                repair.outcome = outcome;
+                repair
+            });
+            let expected = crate::network_deck::details(&network, target);
+            let value = |name| {
+                expected
+                    .iter()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| value)
+            };
+            let result = value("Last repair").unwrap().split(" · ").next().unwrap();
+            let original_time = network.network.peers[0]
+                .last_repair
+                .as_ref()
+                .map(|repair| aterm_types::rfc3339::format_rfc3339(repair.completed_at_ms / 1000));
+            for metrics in [FaceMetrics::helvetica_neue(), FaceMetrics::test_stack()] {
+                for scale in [1.0_f32, 2.0] {
+                    let mut input = crate::stats_deck::tests::input(&resource);
+                    input.network = Some(&network);
+                    input.network_target = target;
+                    let geometry = lens_geom(
+                        StatsBars::Deck,
+                        0,
+                        80.0 * scale,
+                        0.0,
+                        80.0 * scale,
+                        420.0 * scale,
+                        196.0 * scale,
+                        scale,
+                        14.0 * scale,
+                    )
+                    .unwrap();
+                    let laid = lay_lens(&geometry, &input, &lens, &metrics, true);
+                    let drawn = laid
+                        .prims
+                        .iter()
+                        .filter_map(|prim| match prim {
+                            DrawPrim::Text { s, .. } => Some(s.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    assert!(drawn.contains("LastSeen"), "contact omitted: {drawn}");
+                    assert!(drawn.contains(result), "repair outcome omitted: {drawn}");
+                    if let Some(time) = &original_time {
+                        assert!(
+                            drawn.contains(time),
+                            "original repair time omitted: {drawn}"
+                        );
+                    } else {
+                        assert!(laid.wells.iter().all(|(name, _)| name != "Repair time"));
+                    }
+                }
+            }
+            app.network_snapshot = std::sync::Arc::new(network);
+            let copied = app.stats_lens_sentence(wid).unwrap();
+            assert!(copied.contains(&label));
+            assert!(copied.contains("23232323232323232323232323232323"));
+            assert!(copied.contains("42424242424242424242424242424242"));
+            for (_, value) in &expected {
+                assert!(
+                    copied.contains(value),
+                    "retained field omitted from copy: {value}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn selected_peer_prioritizes_contact_evidence_and_copies_complete_identity() {
+        let resource = Snapshot::default();
+        let network = retained_peer();
+        let mut input = crate::stats_deck::tests::input(&resource);
+        input.network = Some(&network);
+        input.network_target = crate::network_deck::Target::Peer(7);
+        let lens = Lens {
+            focus: Instrument::NetworkState,
+            bar: Bar::Global,
+            how: Opened::Keyboard,
+        };
+        for (metrics, width, height) in [
+            (FaceMetrics::helvetica_neue(), 420.0, 196.0),
+            (FaceMetrics::helvetica_neue(), 840.0, 600.0),
+            (FaceMetrics::test_stack(), 420.0, 196.0),
+            (FaceMetrics::test_stack(), 840.0, 600.0),
+        ] {
+            let geometry = lens_geom(
+                StatsBars::Deck,
+                0,
+                80.0,
+                0.0,
+                80.0,
+                width,
+                height,
+                1.0,
+                14.0,
+            )
+            .unwrap();
+            let laid = lay_lens(&geometry, &input, &lens, &metrics, true);
+            let drawn = laid
+                .prims
+                .iter()
+                .filter_map(|prim| match prim {
+                    DrawPrim::Text { s, .. } => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(drawn.contains("LastSeen"), "contact omitted: {drawn}");
+            assert!(drawn.contains("Failed"), "repair outcome omitted: {drawn}");
+            assert!(
+                laid.wells
+                    .iter()
+                    .any(|(name, words)| { name == "Observation" && words.contains("LastSeen") })
+            );
+            if height > 196.0 {
+                assert!(
+                    drawn.contains("[2001:db8::7]:9699"),
+                    "endpoint omitted: {drawn}"
+                );
+                assert!(
+                    drawn.contains("historical"),
+                    "historical scope omitted: {drawn}"
+                );
+                assert!(
+                    drawn.contains("23232323232323232323232323232323"),
+                    "machine identity omitted: {drawn}"
+                );
+                assert!(
+                    drawn.contains("42424242424242424242424242424242"),
+                    "incarnation omitted: {drawn}"
+                );
+            }
+        }
+
+        let mut app = crate::App::headless_for_test();
+        let wid = *app.windows.keys().next().unwrap();
+        app.network_source = None;
+        app.network_snapshot = std::sync::Arc::new(network);
+        assert!(app.open_network_lens());
+        app.windows.get_mut(&wid).unwrap().stats_lens.network_target =
+            crate::network_deck::Target::Peer(7);
+        let copied = app.stats_lens_sentence(wid).unwrap();
+        assert!(copied.contains("23232323232323232323232323232323"));
+        assert!(copied.contains("42424242424242424242424242424242"));
+        assert!(copied.contains("[2001:db8::7]:9699"));
+        assert!(copied.contains("2026-10-26T07:33:20Z"));
+        assert!(copied.contains("historical"));
+    }
 
     #[test]
     fn overview_observation_time_is_visible() {
@@ -2213,7 +2793,7 @@ fn space_section(c: Ctx<'_>) -> Section<'_> {
         forms
     };
     let freed: Option<Vec<String>> = d.and_then(|d| d.freed_today.as_ref()).map(|(b, at, what)| {
-        let t = words::clock(*at, snap.at_unix_ms, c.loc.utc_offset_s);
+        let t = c.loc.clock(*at, snap.at_unix_ms);
         let g = gb(*b as f64);
         vec![
             format!("aterm {g} today ({t}, {what})"),
@@ -2299,7 +2879,7 @@ fn filling_section(c: Ctx<'_>) -> Section<'_> {
     let mark = freed.and_then(|(b, at, _)| {
         let idx = (at - start_ms) as f64 / BUCKET_MS as f64;
         (0.0..n as f64).contains(&idx).then(|| {
-            let t = words::clock(*at, now, c.loc.utc_offset_s);
+            let t = c.loc.clock(*at, now);
             (idx, format!("aterm freed {} \u{b7} {t}", gb(*b as f64)))
         })
     });
@@ -2324,7 +2904,7 @@ fn filling_section(c: Ctx<'_>) -> Section<'_> {
         said.push_str(&format!(
             " aterm freed {} at {}.",
             words::speak(&gb(*b as f64)),
-            words::clock(*at, now, c.loc.utc_offset_s)
+            c.loc.clock(*at, now)
         ));
     }
     let mut line = growth.clone();
@@ -2351,7 +2931,7 @@ fn where_section(c: Ctx<'_>) -> Section<'_> {
     let sizing = d.is_some_and(|d| d.sizing);
     let at = d
         .and_then(|d| d.hogs_at)
-        .map(|t| words::clock(t, snap.at_unix_ms, c.loc.utc_offset_s));
+        .map(|t| c.loc.clock(t, snap.at_unix_ms));
     let size = |h: &aterm_vitals::model::Hog| {
         if h.partial {
             format!("\u{2265} {}", gb(h.bytes as f64))
@@ -4430,7 +5010,7 @@ fn text_well(c: Ctx<'_>, focus: Instrument) -> LensDoc<'_> {
                     lines.push(format!(
                         "{w} limit {:.0}% used, read at {}",
                         f64::from(p.used_x10) / 10.0,
-                        words::clock(p.read_at, snap.at_unix_ms, c.loc.utc_offset_s)
+                        c.loc.clock(p.read_at, snap.at_unix_ms)
                     ));
                 }
                 None => {
@@ -4467,7 +5047,7 @@ fn text_well(c: Ctx<'_>, focus: Instrument) -> LensDoc<'_> {
             match f.gpu_resets {
                 Some((n, since)) => lines.push(format!(
                     "reset {n}\u{d7} since {}",
-                    words::clock(since, snap.at_unix_ms, c.loc.utc_offset_s)
+                    c.loc.clock(since, snap.at_unix_ms)
                 )),
                 None => lines.push(f.gpu.as_ref().and_then(|g| g.recoveries).map_or_else(
                     || "GPU recovery counter not read".to_owned(),
@@ -4957,10 +5537,7 @@ impl crate::App {
             plate: None,
             form: f.deck,
             contrast: f.contrast,
-            locale: Locale {
-                platform: Platform::host(),
-                utc_offset_s: crate::presence::local_offset_s().unwrap_or(0),
-            },
+            locale: crate::stats_deck::host_locale(self.vitals.snapshot.as_deref()),
             live: crate::stats_live::DeckLive::STILL,
         }
     }
@@ -4979,6 +5556,7 @@ impl crate::App {
         self.network_snapshot.network.observed_at_ms.hash(&mut h);
         self.network_snapshot.network.via_local_process.hash(&mut h);
         self.network_snapshot.network.retention_limited.hash(&mut h);
+        self.network_snapshot.network.accounts_exchange.hash(&mut h);
         crate::network_deck::hash_peer_reachability(&self.network_snapshot, &mut h);
         self.network_snapshot.services.hash(&mut h);
         self.windows
@@ -5000,6 +5578,7 @@ impl crate::App {
     pub(crate) fn splice_stats_lens(&mut self, wid: crate::WindowId) {
         let Some((lg, lens, f)) = self.lens_frame(wid) else {
             if let Some(ws) = self.windows.get_mut(&wid) {
+                ws.stats_lens.retire_input();
                 ws.lens_card = None;
                 ws.stats_lens.rect = None;
                 ws.stats_lens.open = None;
@@ -5062,6 +5641,8 @@ impl crate::App {
             fp,
             geom: fp,
             raster_fingerprint_once: std::sync::OnceLock::new(),
+            serial: 0,
+            delta: None,
         });
     }
 
@@ -5085,6 +5666,7 @@ impl crate::App {
             .and_then(|ws| ws.stats_lens.open)
             .map(|l| l.focus);
         if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.stats_lens.retire_input();
             ws.stats_lens.open = Some(lens);
             ws.stats_lens.last = Some((lens.focus, lens.bar));
             ws.stats_lens.rest = None;
@@ -5153,6 +5735,7 @@ impl crate::App {
         let Some(ws) = self.windows.get_mut(&wid) else {
             return false;
         };
+        ws.stats_lens.retire_input();
         let was = ws.stats_lens.open.take().is_some();
         ws.stats_lens.leave_due = None;
         ws.stats_lens.rest = None;
@@ -5208,6 +5791,9 @@ impl crate::App {
 
     /// Pointer motion over the stats surfaces.
     pub(crate) fn stats_pointer_motion(&mut self, wid: crate::WindowId, now: Instant) -> bool {
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.stats_lens.retire_input();
+        }
         if self.windows.get(&wid).is_none_or(|ws| ws.overlay_open()) {
             return false;
         }
@@ -5269,6 +5855,7 @@ impl crate::App {
     /// The pointer left the window.
     pub(crate) fn stats_pointer_left(&mut self, wid: crate::WindowId, now: Instant) {
         if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.stats_lens.retire_input();
             ws.stats_lens.rest = None;
             if ws.stats_lens.open.is_some_and(|l| l.how == Opened::Hover) {
                 ws.stats_lens.leave_due = Some(now + LEAVE);
@@ -5278,6 +5865,9 @@ impl crate::App {
 
     /// A press: on the lens it pins a hover lens.
     pub(crate) fn stats_press(&mut self, wid: crate::WindowId) -> bool {
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.stats_lens.retire_input();
+        }
         if self.windows.get(&wid).is_none_or(|ws| ws.overlay_open()) {
             return false;
         }
@@ -5329,6 +5919,202 @@ impl crate::App {
         inert: bool,
     ) -> bool {
         use aterm_window::keyboard::{Key, NamedKey};
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.stats_lens.sync_tab_scope(ws.tab_set.active_id());
+        }
+        let arrow = matches!(
+            key,
+            Key::Named(
+                NamedKey::ArrowUp
+                    | NamedKey::ArrowDown
+                    | NamedKey::ArrowLeft
+                    | NamedKey::ArrowRight
+            )
+        );
+        let before = self
+            .windows
+            .get(&wid)
+            .filter(|ws| arrow && !inert && !ws.occluded && ws.stats_lens.open.is_some())
+            .map(|ws| {
+                (
+                    ws.stats_lens.selection(ws.tab_set.active_id()),
+                    crate::metrics::native_input_arrival(),
+                )
+            });
+        let taken = self.stats_lens_key_untimed(wid, mods, key, copy_chord, inert);
+        if taken
+            && let Some((before, arrival)) = before
+            && let Some(ws) = self.windows.get_mut(&wid)
+            && let Some(after) = ws.stats_lens.selection(ws.tab_set.active_id())
+            && before != Some(after)
+        {
+            // A superseded selection that never reached glass has no measured answer.
+            ws.stats_lens.retire_input();
+            let _ = ws.stats_lens.input.arm(arrival);
+            ws.stats_lens.input_selection = Some(after);
+        }
+        taken
+    }
+
+    /// The pending arrows whose selection this composition actually includes. A higher card
+    /// can cover a cached lens, so presence in `lens_card` alone is no paint acknowledgment.
+    pub(crate) fn stats_lens_input_receipt(
+        &mut self,
+        wid: crate::WindowId,
+    ) -> Option<LensPaintReceipt> {
+        let fp = self.stats_lens_fp(wid);
+        let within_surface = self.stats_lens_within_surface(wid);
+        let obstructed = self
+            .paste_banner
+            .as_ref()
+            .is_some_and(|banner| banner.wid == wid)
+            || self
+                .close_banner
+                .as_ref()
+                .is_some_and(|banner| banner.wid == wid)
+            || self
+                .autopilot_menu
+                .as_ref()
+                .is_some_and(|menu| menu.wid == wid)
+            || self
+                .autopilot_menu_spent
+                .as_ref()
+                .is_some_and(|menu| menu.wid == wid);
+        let ws = self.windows.get_mut(&wid)?;
+        ws.stats_lens.sync_tab_scope(ws.tab_set.active_id());
+        if !obstructed
+            && !ws.overlay_open()
+            && ws.tab_menu.is_none()
+            && ws.route_card.is_none()
+            && ws.settings_card.is_none()
+            && ws.badge_card.is_none()
+            && match ws.stats_lens.selection(ws.tab_set.active_id()) {
+                // The lens reaches the glass in the CPU fold, or as a layer of the tray stack
+                // the renderer folds itself (`App::stack_or_fold_stats_deck`), which keeps no
+                // fold.
+                Some(_) => {
+                    within_surface
+                        && (ws.deck_fold.is_some() || ws.tray_stacked)
+                        && ws.lens_card.as_ref().is_some_and(|card| card.fp == fp)
+                }
+                None => ws.lens_card.is_none(),
+            }
+        {
+            let selection = ws.stats_lens.selection(ws.tab_set.active_id());
+            if ws.stats_lens.presented_selection.is_none()
+                || selection != ws.stats_lens.input_selection
+                || ws.stats_lens.presented_selection == Some(selection)
+            {
+                ws.stats_lens.retire_input();
+            }
+            Some(LensPaintReceipt {
+                selection,
+                input: ws.stats_lens.input.token(),
+            })
+        } else {
+            ws.stats_lens.retire_input();
+            None
+        }
+    }
+
+    fn stats_lens_within_surface(&self, wid: crate::WindowId) -> bool {
+        let Some(ws) = self.windows.get(&wid) else {
+            return false;
+        };
+        let (Some(surface), Some(card)) = (ws.win_px, ws.lens_card.as_ref()) else {
+            return false;
+        };
+        let (cw, _) = self.win_cell_size(wid);
+        let Some(frame_w) = usize::from(ws.cols).checked_mul(cw).and_then(|w| {
+            self.win_pad(wid)
+                .checked_mul(2)
+                .and_then(|pad| w.checked_add(pad))
+        }) else {
+            return false;
+        };
+        let placement = aterm_render::frame_placement(
+            surface.width as usize,
+            surface.height as usize,
+            frame_w,
+            self.stats_frame_h(wid),
+        );
+        let within = |start: u32, len: u32, axis: aterm_render::AxisPlacement| {
+            let start = start as usize;
+            len > 0
+                && start >= axis.crop_before
+                && start
+                    .checked_add(len as usize)
+                    .zip(axis.crop_before.checked_add(axis.visible))
+                    .is_some_and(|(end, visible_end)| end <= visible_end)
+        };
+        within(card.dx, card.pw, placement.x) && within(card.dy, card.ph, placement.y)
+    }
+
+    /// A successful own frame acknowledges only the selection its composition carried.
+    pub(crate) fn stats_lens_presented(
+        &mut self,
+        wid: crate::WindowId,
+        receipt: Option<LensPaintReceipt>,
+        visible: bool,
+        capture_forced: bool,
+    ) {
+        let Some(ws) = self.windows.get_mut(&wid) else {
+            return;
+        };
+        if !visible || capture_forced {
+            ws.stats_lens.retire_input();
+            return;
+        }
+        ws.stats_lens.presented_selection = receipt.map(|paint| paint.selection);
+        if let Some(token) = receipt.and_then(|paint| paint.input) {
+            ws.stats_lens.input.record(token, false);
+        } else if receipt.is_none() {
+            ws.stats_lens.retire_input();
+        }
+    }
+
+    /// Debug readback of desired and own-presented selections, without forcing a capture.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn stats_lens_chrome_lines(&self) -> Vec<String> {
+        self.windows
+            .iter()
+            .map(|(wid, ws)| {
+                let show = |selection: Option<LensSelection>| {
+                    selection.map_or_else(
+                        || "closed".to_owned(),
+                        |selection| {
+                            let tab = selection
+                                .tab
+                                .map_or_else(String::new, |tab| format!("@TabId({tab})"));
+                            format!(
+                                "{:?}:{:?}:{:?}{tab}",
+                                selection.lens.focus, selection.lens.bar, selection.target
+                            )
+                        },
+                    )
+                };
+                format!(
+                    "stats-lens window={} desired={} presented={} pending={}",
+                    wid.0,
+                    show(ws.stats_lens.selection(ws.tab_set.active_id())),
+                    ws.stats_lens
+                        .presented_selection
+                        .map_or_else(|| "unknown".to_owned(), show),
+                    u8::from(ws.stats_lens.input.token().is_some())
+                )
+            })
+            .collect()
+    }
+
+    fn stats_lens_key_untimed(
+        &mut self,
+        wid: crate::WindowId,
+        mods: aterm_window::keyboard::ModifiersState,
+        key: &aterm_window::keyboard::Key,
+        copy_chord: bool,
+        inert: bool,
+    ) -> bool {
+        use aterm_window::keyboard::{Key, NamedKey};
         let Some(open) = self.windows.get(&wid).and_then(|ws| ws.stats_lens.open) else {
             return false;
         };
@@ -5372,6 +6158,7 @@ impl crate::App {
                 && matches!(key, Key::Named(NamedKey::ArrowDown | NamedKey::ArrowUp))
             {
                 if let Some(ws) = self.windows.get_mut(&wid) {
+                    ws.stats_lens.retire_input();
                     ws.stats_lens.network_target = crate::network_deck::step(
                         &self.network_snapshot,
                         ws.stats_lens.network_target,
@@ -5448,10 +6235,7 @@ impl crate::App {
         }
         let snap = self.vitals.snapshot.as_deref()?;
         let panes = self.deck_tab_panes(wid);
-        let loc = Locale {
-            platform: Platform::host(),
-            utc_offset_s: crate::presence::local_offset_s().unwrap_or(0),
-        };
+        let loc = crate::stats_deck::host_locale(Some(snap));
         Some(lens_sentence(snap, open.focus, &panes, &loc))
     }
 

@@ -380,7 +380,11 @@ impl<T: Copy + Eq> SplitTree<T> {
         };
         *node = Self::Split {
             axis,
-            ratio: ratio.clamp(0.05, 0.95),
+            ratio: if ratio.is_nan() {
+                0.5
+            } else {
+                ratio.clamp(0.05, 0.95)
+            },
             first,
             second,
         };
@@ -725,7 +729,14 @@ impl VisibleLeafPlan {
             SplitAxis::Horizontal => point.x,
             SplitAxis::Vertical => point.y,
         };
-        let splittable = (divider.span_extent - self.divider.max(0.0)).max(0.0);
+        if !pointer.is_finite()
+            || !divider.span_origin.is_finite()
+            || !divider.span_extent.is_finite()
+        {
+            return None;
+        }
+        let gap = sanitize_nonneg_finite(self.divider);
+        let splittable = (divider.span_extent - gap).max(0.0);
         (splittable > f32::EPSILON)
             .then(|| ((pointer - divider.span_origin) / splittable).clamp(0.0, 1.0))
     }
@@ -835,8 +846,8 @@ impl<T: Copy + Eq> SplitTree<T> {
             self,
             sanitize_rect(bounds),
             point,
-            divider.max(0.0),
-            min_leaf.max(0.0),
+            sanitize_nonneg_finite(divider),
+            sanitize_nonneg_finite(min_leaf),
             &mut path,
         )
     }
@@ -852,7 +863,10 @@ impl<T: Copy + Eq> SplitTree<T> {
             SplitAxis::Horizontal => point.x,
             SplitAxis::Vertical => point.y,
         };
-        let splittable = (hit.span_extent - divider.max(0.0)).max(0.0);
+        if !pointer.is_finite() || !hit.span_origin.is_finite() || !hit.span_extent.is_finite() {
+            return None;
+        }
+        let splittable = (hit.span_extent - sanitize_nonneg_finite(divider)).max(0.0);
         if splittable <= f32::EPSILON {
             return None;
         }
@@ -861,6 +875,9 @@ impl<T: Copy + Eq> SplitTree<T> {
 
     /// Apply a ratio through a still-live divider path. Stale paths fail closed.
     pub fn set_divider_ratio(&mut self, hit: &LogicalDividerHit, ratio: f32) -> bool {
+        if ratio.is_nan() {
+            return false;
+        }
         let mut node = self;
         for branch in hit.path.branches() {
             let Self::Split { first, second, .. } = node else {
@@ -877,6 +894,24 @@ impl<T: Copy + Eq> SplitTree<T> {
         };
         *current = ratio.clamp(0.05, 0.95);
         true
+    }
+}
+
+#[inline]
+fn sanitize_nonneg_finite(value: f32) -> f32 {
+    if value.is_finite() {
+        value.max(0.0)
+    } else {
+        0.0
+    }
+}
+
+#[inline]
+fn sanitize_ratio(ratio: f32) -> f32 {
+    if ratio.is_nan() {
+        0.5
+    } else {
+        ratio.clamp(0.0, 1.0)
     }
 }
 
@@ -897,14 +932,15 @@ fn sanitize_rect(mut rect: LogicalRect) -> LogicalRect {
 }
 
 fn split_extent(extent: f32, divider: f32, ratio: f32, min_leaf: f32) -> (f32, f32) {
-    let divider = divider.clamp(0.0, extent.max(0.0));
+    let extent = sanitize_nonneg_finite(extent);
+    let divider = sanitize_nonneg_finite(divider).min(extent);
     let splittable = (extent - divider).max(0.0);
-    let min_leaf = min_leaf.max(0.0);
+    let min_leaf = sanitize_nonneg_finite(min_leaf);
     if splittable < min_leaf * 2.0 {
         let first = (splittable * 0.5).round();
         return (first, splittable - first);
     }
-    let first = (splittable * ratio.clamp(0.0, 1.0))
+    let first = (splittable * sanitize_ratio(ratio))
         .round()
         .clamp(min_leaf, splittable - min_leaf);
     (first, splittable - first)
@@ -917,7 +953,7 @@ fn child_rects(
     divider: f32,
     min_leaf: f32,
 ) -> (LogicalRect, LogicalRect, LogicalRect) {
-    let divider = divider.max(0.0);
+    let divider = sanitize_nonneg_finite(divider);
     match axis {
         SplitAxis::Horizontal => {
             let (first, second) = split_extent(bounds.size.width, divider, ratio, min_leaf);
@@ -1061,7 +1097,7 @@ fn subtree_sizing<T: Copy>(
         } => {
             let first = subtree_sizing(first, divider, sizing);
             let second = subtree_sizing(second, divider, sizing);
-            let gap = divider.max(0.0);
+            let gap = sanitize_nonneg_finite(divider);
             match axis {
                 SplitAxis::Horizontal => SubtreeSizing {
                     minimum: LogicalSize::new(
@@ -1097,12 +1133,13 @@ fn constrained_extent(
     first_preferred: f32,
     second_preferred: f32,
 ) -> (f32, f32) {
-    let divider = divider.clamp(0.0, extent.max(0.0));
+    let extent = sanitize_nonneg_finite(extent);
+    let divider = sanitize_nonneg_finite(divider).min(extent);
     let available = (extent - divider).max(0.0);
-    let first_minimum = first_minimum.max(0.0);
-    let second_minimum = second_minimum.max(0.0);
+    let first_minimum = sanitize_nonneg_finite(first_minimum);
+    let second_minimum = sanitize_nonneg_finite(second_minimum);
     if available + f32::EPSILON >= first_minimum + second_minimum {
-        let target = available * ratio.clamp(0.0, 1.0);
+        let target = available * sanitize_ratio(ratio);
         let first = target.round().clamp(
             first_minimum,
             (available - second_minimum).max(first_minimum),
@@ -1302,9 +1339,11 @@ impl TabIndicators {
     }
 }
 
-/// Closed icon identity for first-party, non-terminal tab applications.
+/// Closed icon identity for first-party tabs and recognized terminal programs.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum TabIconKind {
+    Mail,
+    Codex,
     About,
     Settings,
     Markdown,
@@ -1318,6 +1357,8 @@ impl TabIconKind {
     #[inline]
     pub const fn semantic_name(self) -> &'static str {
         match self {
+            Self::Mail => "mail",
+            Self::Codex => "codex",
             Self::About => "about",
             Self::Settings => "settings",
             Self::Markdown => "markdown",
@@ -1331,6 +1372,8 @@ impl TabIconKind {
     #[inline]
     pub const fn display_name(self) -> &'static str {
         match self {
+            Self::Mail => "Mail",
+            Self::Codex => "Codex",
             Self::About => "About aterm",
             Self::Settings => "Settings",
             Self::Markdown => "Markdown viewer",
@@ -1513,6 +1556,7 @@ impl Tab {
         sizing: impl Fn(ViewId) -> LeafSizing,
     ) -> VisibleLeafPlan {
         let bounds = sanitize_rect(bounds);
+        let divider = sanitize_nonneg_finite(divider);
         if self.zoomed && self.root.len() > 1 {
             let leaf_sizing = sizing(self.focus).sanitized();
             return VisibleLeafPlan {
@@ -1529,7 +1573,7 @@ impl Tab {
                 dividers: Vec::new(),
                 focused: self.focus,
                 zoomed: true,
-                divider: divider.max(0.0),
+                divider,
             };
         }
         let mut leaves = Vec::with_capacity(self.root.len());
@@ -1537,7 +1581,7 @@ impl Tab {
         plan_into(
             &self.root,
             bounds,
-            divider.max(0.0),
+            divider,
             &sizing,
             self.focus,
             &SplitPath::root(),
@@ -1551,7 +1595,7 @@ impl Tab {
             dividers,
             focused: self.focus,
             zoomed: false,
-            divider: divider.max(0.0),
+            divider,
         }
     }
 
@@ -1653,6 +1697,9 @@ impl Tab {
 
     /// Apply a divider ratio while its stable path still names the same split.
     pub fn set_divider_ratio(&mut self, path: &SplitPath, ratio: f32) -> bool {
+        if ratio.is_nan() {
+            return false;
+        }
         let Some(SplitTree::Split { ratio: current, .. }) = node_at_path_mut(&mut self.root, path)
         else {
             return false;
@@ -2341,6 +2388,25 @@ mod tests {
             seen,
             leaves[..1],
             "stopped at the first match, in visit order"
+        );
+        assert!(!tab.set_divider_ratio(&SplitPath::root(), f32::NAN));
+        let plan = tab.visible_plan(LogicalRect::new(0.0, 0.0, 200.0, 100.0), f32::NAN, |_| {
+            LeafSizing::new(LogicalSize::default(), LogicalSize::default())
+        });
+        assert!(plan.divider.is_finite());
+        assert!(plan.leaves.iter().all(|l| l.rect.size.width.is_finite()
+            && l.rect.size.height.is_finite()
+            && l.rect.origin.x.is_finite()
+            && l.rect.origin.y.is_finite()));
+        assert_eq!(
+            plan.ratio_for_pointer(
+                &plan.dividers[0],
+                LogicalPoint {
+                    x: f32::NAN,
+                    y: 10.0,
+                },
+            ),
+            None
         );
     }
 }

@@ -14,17 +14,13 @@ use crate::{Fail, Res};
 
 /// A glyph's core: at least this share of the way from the clean ground to the clean glyph's extreme, in luminance.
 pub const CORE_SHARE: f64 = 0.70;
-/// A glyph's solid ink, which the local measure judges: a pixel of the clean twin that reads at least this share of
-/// the clean extreme's ratio against the ground, so a frame equal to its twin reads close to what the clean glyph
-/// reads (the antialiased rim reads less on any page, and on paper a pixel nine tenths of the way to the ink in
-/// luminance is still only 6:1).
-pub const SOLID_SHARE: f64 = 0.85;
+/// A glyph's solid ink, which the local measure judges (a pixel of the clean twin that reads at least this share of
+/// the clean extreme's ratio against the ground), the ring of untouched ground a pixel's local ground is read from,
+/// and the extreme under which a cell holds no glyph: the trail judge's metric, one source with the Prism Glass
+/// solver's, which solves the light glass to it.
+pub use aterm_effects::rainbow_kitty::prism_glass::colour::{BLANK_BELOW, RING_REACH, SOLID_SHARE};
 /// The legibility bar the local measure counts pixels under (WCAG AA for text).
 pub const LEGIBLE: f64 = 4.5;
-/// The widest ring of untouched ground a pixel's local ground is read from, px (Chebyshev).
-pub const RING_REACH: i64 = 2;
-/// A cell whose extreme is under this ratio against its ground holds no glyph.
-pub const BLANK_BELOW: f64 = 1.5;
 /// A pixel the effects changed: a channel off by more than this.
 pub const DIFF_DELTA: u8 = 12;
 /// A caret pixel: at least this ratio against the page.
@@ -48,8 +44,9 @@ clean_contrast is the same glyph with no effect drawn. local_contrast judges eac
 to it (the median of the nearest ring, 1 then 2 px out, of pixels that are pure ground in the twin, as the frame has
 them) and names the worst pixel row of the glyph (each row's lower median), so a body or a band over part of a glyph
 counts where the whole cell's median ground would hide it; local_min is its worst pixel and local_under the pixels under
-4.5:1. min_contrast and the --min and --newest-min thresholds judge the lower of contrast and local_contrast. Without a
-twin (--no-clean) the coarser `extreme` method is used.
+4.5:1. min_contrast and the --min and --newest-min thresholds judge local_contrast, what a reader sees round each stroke
+(the letter guard keeps the same reading), or contrast for a glyph with no ground that near. Without a twin (--no-clean)
+the coarser `extreme` method is used.
 The sidecars trail-gallery writes (.text.txt, .cursor.txt, .clean.png, .dims.txt) are read when present.
 
 exit: 0; 1 a threshold failed (--min: a selected cell, --newest-min: a glyph left of the caret, --caret-min: the caret's
@@ -213,6 +210,49 @@ impl Image {
             width,
             height,
             px,
+        })
+    }
+
+    /// Decode an opaque offline frame with each side bounded to 4096 pixels.
+    /// # Errors
+    /// Invalid/oversized PNG, or any pixel has non-opaque alpha.
+    pub(crate) fn decode_opaque(path: &Path, bytes: &[u8]) -> Result<Image, String> {
+        let (rgba, width, height) = aterm_png::decode_rgba8(bytes, 4096)
+            .ok_or_else(|| format!("{}: invalid PNG or side exceeds 4096", path.display()))?;
+        if rgba.as_chunks::<4>().0.iter().any(|p| p[3] != 255) {
+            return Err(format!("{}: non-opaque frame", path.display()));
+        }
+        Ok(Image {
+            path: path.to_path_buf(),
+            width,
+            height,
+            px: rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|p| [p[0], p[1], p[2]])
+                .collect(),
+        })
+    }
+
+    /// Copy `b` at its original pixel scale, with no clipping or resampling.
+    /// # Errors
+    /// The box is empty, inverted, or extends outside this image.
+    pub(crate) fn crop(&self, b: PxBox) -> Result<Image, String> {
+        if b.x0 < 0
+            || b.y0 < 0
+            || b.x1 <= b.x0
+            || b.y1 <= b.y0
+            || usize::try_from(b.x1).ok().is_none_or(|x| x > self.width)
+            || usize::try_from(b.y1).ok().is_none_or(|y| y > self.height)
+        {
+            return Err("crop is empty or outside the frame".into());
+        }
+        Ok(Image {
+            path: self.path.clone(),
+            width: usize::try_from(b.x1 - b.x0).map_err(|e| e.to_string())?,
+            height: usize::try_from(b.y1 - b.y0).map_err(|e| e.to_string())?,
+            px: self.region(b),
         })
     }
 
@@ -657,28 +697,275 @@ impl Local {
     }
 }
 
-/// What a cell is judged at: the lower of its whole-cell and its local contrast.
+/// What a cell is judged at: its local contrast, what a reader sees round each stroke (the one
+/// reading the letter guard keeps, `aterm_effects`' `letter_guard::ring`); its whole-cell contrast
+/// for a glyph with no ground that near, or with no clean twin. A light laid away from the strokes
+/// that the whole cell's median ground counts, or a body over part of the cell, is not what the
+/// letter is read against.
 fn judged(cell: &J) -> Option<f64> {
-    let whole = cell.get("contrast").and_then(J::as_f64)?;
-    Some(
-        cell.get("local_contrast")
-            .and_then(J::as_f64)
-            .map_or(whole, |l| whole.min(l)),
-    )
+    cell.get("local_contrast")
+        .and_then(J::as_f64)
+        .or_else(|| cell.get("contrast").and_then(J::as_f64))
 }
 
 /// The least share of the caret's cell its ink must cover to be read as the caret: under it (a speck,
 /// a thin tail) the caret reads as every lit pixel of the cell, as a plain wash does.
 pub const CARET_INK_SHARE: f64 = 0.125;
 
-/// The caret's reading. Its ink is the lit pixels within the geometric half of the peak's ratio to the page
+/// The caret's drawn shape, as the cursor reply names it (`steady_bar`, `blinking_underline`, ...):
+/// a block fills its cell, a bar is a thin span at the cell's left edge, an underline one at its
+/// foot. A caret named by `--caret` alone, or a reply without a shape, is a block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CaretShape {
+    Block,
+    Bar,
+    Underline,
+}
+
+impl CaretShape {
+    /// The shape a cursor reply's style word names.
+    pub(crate) fn named(word: Option<&str>) -> Self {
+        match word {
+            Some(w) if w.ends_with("_bar") || w == "bar" => Self::Bar,
+            Some(w) if w.ends_with("_underline") || w == "underline" => Self::Underline,
+            _ => Self::Block,
+        }
+    }
+}
+
+/// The caret's reading, by its shape: a block by [`measure_block_caret`], a bar or an underline
+/// by [`measure_thin_caret`]. Each reading names the shape it read.
+fn measure_caret(
+    frame: &Image,
+    clean: Option<&Image>,
+    grid: &Grid,
+    (row, col): (i64, i64),
+    page: Rgb,
+    shape: CaretShape,
+) -> J {
+    let mut out = match shape {
+        CaretShape::Block => measure_block_caret(frame, grid, row, col, page),
+        CaretShape::Bar | CaretShape::Underline => {
+            measure_thin_caret(frame, clean, grid, (row, col), page, shape)
+        }
+    };
+    let name = match shape {
+        CaretShape::Block => "block",
+        CaretShape::Bar => "bar",
+        CaretShape::Underline => "underline",
+    };
+    out.set("read_as", J::s(name));
+    out
+}
+
+/// A bar's or an underline's reading: its ink is its own span, not the cell's brightest light (a
+/// head glow laid at the block's centre beside a bar would otherwise read as the caret). The span
+/// is the run of lines (columns of a bar, rows of an underline) the shape is drawn on, within the
+/// quarter of the cell it is drawn in (the left edge, the foot).
+///
+/// With the frame's clean twin, the span is where the twin draws the caret: the run of lines round
+/// the twin's strongest line there whose median stands [`CARET_DIFF`] off the page (`span_from`
+/// "twin"). A trail light laid against the caret is then never taken for it, whatever its colour
+/// (Comet's ice beside GitHub Light's blue bar is a blend of that blue with the paper, a Return
+/// flash outshines the bar it lies on).
+///
+/// With no twin, or a twin that draws no caret there (`span_from` "frame"), the span is read in the
+/// frame: round its strongest line in that quarter, each line judged by its median contrast to the
+/// page, kept while that is within the geometric half of the strongest (`sqrt`, as a block's ink
+/// is) and while its colour is the strongest line's own ink or that ink's antialiased edge
+/// ([`blends`] with the page).
+///
+/// Its `contrast` is the span's median in the frame against the closer of the page and the median
+/// of the cell's other pixels (the halo it sits in).
+fn measure_thin_caret(
+    frame: &Image,
+    clean: Option<&Image>,
+    grid: &Grid,
+    at: (i64, i64),
+    page: Rgb,
+    shape: CaretShape,
+) -> J {
+    thin_caret_reading(frame, clean, grid, at, page, shape, true)
+}
+
+/// How far, in 8-bit channel steps, a line's colour may sit off the blend of the page and a thin
+/// caret's own ink and still be that ink's antialiased edge.
+const BLEND_SLACK: f64 = 16.0;
+
+/// Whether `c` is a blend of `a` and `b`: within [`BLEND_SLACK`] of the straight line between them,
+/// mixed in sRGB or in linear light (a renderer mixes an edge in one or the other).
+fn blends(c: Rgb, a: Rgb, b: Rgb) -> bool {
+    let nearest = |c: [f64; 3], a: [f64; 3], b: [f64; 3]| {
+        let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let len: f64 = d.iter().map(|x| x * x).sum();
+        let along: f64 = (0..3).map(|i| (c[i] - a[i]) * d[i]).sum();
+        let t = if len > 0.0 {
+            (along / len).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        [a[0] + t * d[0], a[1] + t * d[1], a[2] + t * d[2]]
+    };
+    let srgb = |p: Rgb| p.map(f64::from);
+    let light = |p: Rgb| p.map(|v| linear_table()[usize::from(v)]);
+    let back = |v: f64| {
+        let v = v.clamp(0.0, 1.0);
+        255.0
+            * if v <= 0.003_130_8 {
+                v * 12.92
+            } else {
+                1.055 * v.powf(1.0 / 2.4) - 0.055
+            }
+    };
+    let off = |p: [f64; 3]| {
+        (0..3)
+            .map(|i| (f64::from(c[i]) - p[i]).abs())
+            .fold(0.0, f64::max)
+    };
+    let straight = nearest(srgb(c), srgb(a), srgb(b));
+    let linear = nearest(light(c), light(a), light(b)).map(back);
+    off(straight).min(off(linear)) <= BLEND_SLACK
+}
+
+/// [`measure_thin_caret`]'s reading; `own_ink` false widens a span read in the frame by strength
+/// alone (its tests' negative control).
+fn thin_caret_reading(
+    frame: &Image,
+    clean: Option<&Image>,
+    grid: &Grid,
+    (row, col): (i64, i64),
+    page: Rgb,
+    shape: CaretShape,
+    own_ink: bool,
+) -> J {
+    let cell = grid.cell_box(row, col, 1);
+    let pixels = frame.region(cell);
+    let (w, h) = (
+        usize::try_from(cell.x1 - cell.x0).unwrap_or(0),
+        usize::try_from(cell.y1 - cell.y0).unwrap_or(0),
+    );
+    let mut out = J::obj([("row", J::Int(row)), ("col", J::Int(col))]);
+    if pixels.len() != w * h || w == 0 || h == 0 {
+        for k in ["colour", "contrast", "peak_contrast", "wash_contrast"] {
+            out.set(k, J::Null);
+        }
+        return out;
+    }
+    let bar = shape == CaretShape::Bar;
+    let lines = if bar { w } else { h };
+    let line_of = |px: &[Rgb], i: usize| -> Vec<Rgb> {
+        if bar {
+            (0..h).map(|y| px[y * w + i]).collect()
+        } else {
+            px[i * w..(i + 1) * w].to_vec()
+        }
+    };
+    let strength_of = |px: &[Rgb], i: usize| {
+        let mut c: Vec<f64> = line_of(px, i).iter().map(|&p| contrast(p, page)).collect();
+        c.sort_unstable_by(f64::total_cmp);
+        c[c.len() / 2]
+    };
+    let line = |i: usize| line_of(&pixels, i);
+    let strength = |i: usize| strength_of(&pixels, i);
+    let quarter = lines.div_ceil(4).max(1);
+    let seats: Vec<usize> = if bar {
+        (0..quarter).collect()
+    } else {
+        (lines - quarter..lines).collect()
+    };
+    let strongest = |s: &dyn Fn(usize) -> f64| {
+        seats
+            .iter()
+            .copied()
+            .max_by(|&a, &b| s(a).total_cmp(&s(b)))
+            .unwrap_or(0)
+    };
+    let run = |seat: usize, kept: &dyn Fn(usize) -> bool| {
+        let (mut lo, mut hi) = (seat, seat + 1);
+        while lo > 0 && kept(lo - 1) {
+            lo -= 1;
+        }
+        while hi < lines && kept(hi) {
+            hi += 1;
+        }
+        (lo, hi)
+    };
+    let twin_span = clean
+        .map(|c| c.region(cell))
+        .filter(|twin| twin.len() == w * h)
+        .and_then(|twin| {
+            let drawn = |i: usize| strength_of(&twin, i);
+            let seat = strongest(&drawn);
+            (drawn(seat) >= CARET_DIFF).then(|| run(seat, &|i| drawn(i) >= CARET_DIFF))
+        });
+    let span_from = if twin_span.is_some() { "twin" } else { "frame" };
+    let (lo, hi) = twin_span.unwrap_or_else(|| {
+        let seat = strongest(&strength);
+        let floor = strength(seat).sqrt().max(CARET_DIFF);
+        let seat_ink = median(&line(seat)).unwrap_or(page);
+        run(seat, &|i| {
+            strength(i) >= floor
+                && (!own_ink || blends(median(&line(i)).unwrap_or(page), page, seat_ink))
+        })
+    });
+    let in_span = |i: usize| {
+        let at = if bar { i % w } else { i / w };
+        (lo..hi).contains(&at)
+    };
+    let (mut ink, mut rest) = (Vec::new(), Vec::new());
+    for (i, &p) in pixels.iter().enumerate() {
+        if in_span(i) {
+            ink.push(p)
+        } else {
+            rest.push(p)
+        }
+    }
+    let colour = median(&ink).unwrap_or(page);
+    let ground = median(&rest).unwrap_or(page);
+    let peak = ink
+        .iter()
+        .map(|&p| contrast(p, page))
+        .fold(f64::MIN, f64::max);
+    let lit: Vec<Rgb> = pixels
+        .iter()
+        .copied()
+        .filter(|&p| contrast(p, page) >= CARET_DIFF)
+        .collect();
+    let reading = contrast(colour, page).min(contrast(colour, ground));
+    let (from, to) = if bar {
+        (cell.x0 + lo as i64, cell.x0 + hi as i64)
+    } else {
+        (cell.y0 + lo as i64, cell.y0 + hi as i64)
+    };
+    out.set(
+        "coverage",
+        J::Float(round_to(lit.len() as f64 / pixels.len() as f64, 3)),
+    );
+    out.set("colour", J::s(hex(colour)));
+    out.set("ground", J::s(hex(ground)));
+    out.set(
+        "ink_share",
+        J::Float(round_to(ink.len() as f64 / pixels.len() as f64, 3)),
+    );
+    out.set("span", J::Arr(vec![J::Int(from), J::Int(to)]));
+    out.set("span_from", J::s(span_from));
+    out.set("contrast", J::Float(round_to(reading, 2)));
+    out.set("peak_contrast", J::Float(round_to(peak, 2)));
+    out.set(
+        "wash_contrast",
+        median(&lit).map_or(J::Null, |m| J::Float(round_to(contrast(m, page), 2))),
+    );
+    out
+}
+
+/// A block caret's reading. Its ink is the lit pixels within the geometric half of the peak's ratio to the page
 /// (`sqrt(peak)`), when they cover [`CARET_INK_SHARE`] of the cell; its ground is the median of the cell's
 /// other pixels when they outnumber the ink (a halo the ink sits in), else the page (they are the ink's own
 /// soft edge). `contrast` is the ink's median against the closer of page and ground, so an icon caret
 /// (Laser's bolt) reads by the bolt and not by the halo round it, and still reads low when its halo nearly
 /// matches it. `wash_contrast` is the median of every lit pixel against the page (the reading before the
 /// ink was told from its halo).
-fn measure_caret(frame: &Image, grid: &Grid, row: i64, col: i64, page: Rgb) -> J {
+fn measure_block_caret(frame: &Image, grid: &Grid, row: i64, col: i64, page: Rgb) -> J {
     let pixels = frame.region(grid.cell_box(row, col, 1));
     let lit: Vec<Rgb> = pixels
         .iter()
@@ -1205,7 +1492,13 @@ pub fn report(a: &Args) -> Result<J, String> {
     if let Some((row, col)) = caret
         && grid.holds(row, col)
     {
-        let mut c = measure_caret(&frame, &grid, row, col, page);
+        let shape = CaretShape::named(
+            caret_facts
+                .iter()
+                .find(|(k, _)| k == "shape")
+                .and_then(|(_, v)| v.as_str()),
+        );
+        let mut c = measure_caret(&frame, clean.as_ref(), &grid, (row, col), page, shape);
         for (k, v) in caret_facts {
             c.set(&k, v);
         }

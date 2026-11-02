@@ -78,12 +78,14 @@ pub fn size_words(tokens: u32) -> String {
 fn keep_current(label: &str) -> Option<&str> {
     let rest = label.strip_prefix("Keep ")?;
     let amount = |t: &str| {
-        let digits = t.trim_end_matches(['k', 'm']);
+        let Some(digits) = t.strip_suffix(['k', 'm']) else {
+            return false;
+        };
         !digits.is_empty()
-            && digits.len() < t.len()
-            && t.len() - digits.len() == 1
+            && digits.bytes().filter(|&b| b == b'.').count() <= 1
             && digits.chars().all(|c| c.is_ascii_digit() || c == '.')
             && digits.starts_with(|c: char| c.is_ascii_digit())
+            && digits.ends_with(|c: char| c.is_ascii_digit())
     };
     let ok = match rest.strip_prefix("auto (") {
         Some(inner) => inner
@@ -123,11 +125,14 @@ fn is_title_row(row: &str) -> bool {
     let t = crate::text::trim(row);
     t == title
         || t.strip_prefix(title).is_some_and(|rest| {
+            let uint = |s: &str| {
+                !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) && s.parse::<u8>().is_ok()
+            };
             rest.starts_with("  ")
                 && rest
                     .trim()
                     .split_once(" of ")
-                    .is_some_and(|(n, m)| n.parse::<u8>().is_ok() && m.parse::<u8>().is_ok())
+                    .is_some_and(|(n, m)| uint(n) && uint(m))
         })
 }
 

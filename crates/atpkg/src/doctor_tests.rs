@@ -151,14 +151,14 @@ fn no_cached_index_judges_the_vendor_half_alone() {
     let l = layout("no-index");
     let installed = builds(&["ay", "claude"]);
     assert_eq!(
-        missing_against_index(&l, &installed, &names(&[])),
+        missing_against_index(&l, &installed, &names(&[])).expect("read removal evidence"),
         Missing::default(),
         "not taken on: nothing is owed"
     );
     std::fs::create_dir_all(&l.prefix).unwrap();
     std::fs::write(l.adopted(), "").unwrap();
     assert_eq!(
-        missing_against_index(&l, &installed, &names(&[])),
+        missing_against_index(&l, &installed, &names(&[])).expect("read removal evidence"),
         missing_from_set(
             None,
             crate::config::cached(),
@@ -1232,28 +1232,33 @@ fn rc_wiring_reads_each_state() {
         )
     };
     assert!(
-        crate::hooks::rc_wiring(&home).is_empty(),
+        crate::hooks::rc_wiring(&crate::hooks::RcHome::at(&home)).is_empty(),
         "no rc, nothing to report"
     );
     std::fs::write(&zshrc, "export FOO=1\n").unwrap();
     assert_eq!(
-        crate::hooks::rc_wiring(&home),
+        crate::hooks::rc_wiring(&crate::hooks::RcHome::at(&home)),
         vec![(".zshrc", RcState::Unwired)]
     );
-    let pass = crate::hooks::pass_at(&l, &home, crate::hooks::RcWiring::HonorOptOut, None);
+    let pass = crate::hooks::pass_at(
+        &l,
+        &crate::hooks::RcHome::at(&home),
+        crate::hooks::RcWiring::HonorOptOut,
+        None,
+    );
     assert_eq!(pass.rc(), [(".zshrc", crate::hooks::RcOutcome::Appended)]);
     assert_eq!(
-        crate::hooks::rc_wiring(&home),
+        crate::hooks::rc_wiring(&crate::hooks::RcHome::at(&home)),
         vec![(".zshrc", RcState::Wired)]
     );
     std::fs::write(&zshrc, "export FOO=1\n").unwrap();
     assert_eq!(
-        crate::hooks::rc_wiring(&home),
+        crate::hooks::rc_wiring(&crate::hooks::RcHome::at(&home)),
         vec![(".zshrc", RcState::OptedOut)]
     );
     std::fs::write(&zshrc, install_sh_block("00-atpkg.zsh")).unwrap();
     assert_eq!(
-        crate::hooks::rc_wiring(&home),
+        crate::hooks::rc_wiring(&crate::hooks::RcHome::at(&home)),
         vec![(".zshrc", RcState::SourcedElsewhere)]
     );
     let docs = home.join("Documents");
@@ -1262,7 +1267,7 @@ fn rc_wiring_reads_each_state() {
     std::fs::remove_file(&zshrc).unwrap();
     std::os::unix::fs::symlink(docs.join("zshrc"), &zshrc).unwrap();
     assert_eq!(
-        crate::hooks::rc_wiring(&home),
+        crate::hooks::rc_wiring(&crate::hooks::RcHome::at(&home)),
         vec![(".zshrc", RcState::ConsentFenced)]
     );
     std::fs::remove_file(&zshrc).unwrap();
@@ -1273,13 +1278,13 @@ fn rc_wiring_reads_each_state() {
     .unwrap();
     std::fs::write(home.join(".profile"), "export BAR=1\n").unwrap();
     assert_eq!(
-        crate::hooks::rc_wiring(&home),
+        crate::hooks::rc_wiring(&crate::hooks::RcHome::at(&home)),
         vec![(".bash_profile", RcState::SourcedElsewhere)]
     );
     std::fs::remove_file(home.join(".bash_profile")).unwrap();
     std::fs::write(home.join(".bash_login"), install_sh_block("00-atpkg.bash")).unwrap();
     assert_eq!(
-        crate::hooks::rc_wiring(&home),
+        crate::hooks::rc_wiring(&crate::hooks::RcHome::at(&home)),
         vec![(".bash_login", RcState::SourcedElsewhere)]
     );
     let _ = std::fs::remove_dir_all(&l.prefix);
@@ -1329,7 +1334,7 @@ fn the_login_shell_s_absent_rc_is_a_change_then_a_kept_opt_out() {
 
     let pass = crate::hooks::pass_at(
         &l,
-        &home,
+        &crate::hooks::RcHome::at(&home),
         crate::hooks::RcWiring::HonorOptOut,
         Some(".zshrc"),
     );
@@ -1349,6 +1354,100 @@ fn the_login_shell_s_absent_rc_is_a_change_then_a_kept_opt_out() {
         "{opted_out}"
     );
     assert!(!opted_out.contains(coming), "{opted_out}");
+    let _ = std::fs::remove_dir_all(&l.prefix);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Round 13: the doctor reads zsh's `.zshrc` in the folder zsh reads it from, names it so, says
+/// a folder it could not learn instead of reading `~/.zshrc`, and says where the app's
+/// `aterm.toml` is when it is not this process's, with the command that makes them one folder.
+/// The controls: zsh's folder at `$HOME` gives `~/.zshrc`, and no split gives no such row.
+#[cfg(unix)]
+#[test]
+fn the_doctor_reads_zsh_s_own_zshrc_and_says_the_app_s_aterm_toml() {
+    let l = layout("zsh-split");
+    let home = synthetic_home("zsh-split");
+    std::fs::create_dir_all(home.join(".aterm/shell.d")).unwrap();
+    std::fs::create_dir_all(home.join("zdot")).unwrap();
+    std::fs::write(home.join(".zshrc"), "export FOO=1\n").unwrap();
+    let rows = |probes: &Probes| report_with(&l, Some(&home), None, 0, None, probes);
+    let rc_row = |rows: &[ItemReport]| {
+        rows.iter()
+            .find(|r| r.id == crate::converge::of(crate::converge::RC, ".zshrc"))
+            .map(|r| format!("{} {r:?}", r.title))
+    };
+    let zdot = crate::zdotdir::ZshDir::At(home.join("zdot"));
+
+    let at_zdot = rc_row(&rows(&Probes {
+        login_rc: Some(".zshrc"),
+        zsh: zdot.clone(),
+        ..Probes::default()
+    }))
+    .expect("zsh's absent .zshrc is a row");
+    assert!(
+        at_zdot.starts_with("~/zdot/.zshrc ")
+            && at_zdot.contains("~/zdot/.zshrc does not exist, and your login shell reads it"),
+        "{at_zdot}"
+    );
+    let control = rc_row(&rows(&Probes {
+        login_rc: Some(".zshrc"),
+        ..Probes::default()
+    }))
+    .expect("the unwired ~/.zshrc is a row");
+    assert!(
+        control.starts_with("~/.zshrc ") && control.contains("does not source ~/.aterm/shell.d"),
+        "{control}"
+    );
+
+    let unknown = rc_row(&rows(&Probes {
+        login_rc: Some(".zshrc"),
+        zsh: crate::zdotdir::ZshDir::Unknown("zsh did not answer".to_owned()),
+        ..Probes::default()
+    }))
+    .expect("an unknown zsh folder is a row");
+    assert!(
+        unknown.contains(
+            "zsh's .zshrc is left unwired: which folder zsh reads it from is unknown (zsh did \
+             not answer)"
+        ),
+        "{unknown}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.join(".zshrc")).unwrap(),
+        "export FOO=1\n",
+        "nothing read is written"
+    );
+
+    let split_id = crate::converge::of(crate::converge::CONFIG, "split");
+    let split = crate::config_split::Split {
+        here: home.join("dots/aterm"),
+        app: home.join(".config/aterm"),
+        app_xdg: None,
+        differs: vec!["update.enabled".to_owned()],
+        compared: true,
+        unify: None,
+    };
+    let said = rows(&Probes {
+        config_split: Some(split),
+        ..Probes::default()
+    });
+    let row = said
+        .iter()
+        .find(|r| r.id == split_id)
+        .map(|r| format!("{r:?}"))
+        .unwrap_or_else(|| panic!("{split_id}: {said:#?}"));
+    assert!(
+        row.contains(
+            "this aterm reads ~/dots/aterm/aterm.toml, but the app opened from Finder, the Dock \
+             or `open` reads ~/.config/aterm/aterm.toml"
+        ) && row.contains("they differ in update.enabled")
+            && row.contains("merge what you keep into one"),
+        "{row}"
+    );
+    assert!(
+        rows(&Probes::default()).iter().all(|r| r.id != split_id),
+        "one folder, no row"
+    );
     let _ = std::fs::remove_dir_all(&l.prefix);
     let _ = std::fs::remove_dir_all(&home);
 }

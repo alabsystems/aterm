@@ -11,6 +11,10 @@ mod ledger;
 pub use ledger::Snapshot;
 mod dispatch;
 pub use dispatch::{Attempt, Observation, ObservationState, Outcome};
+mod request;
+pub use request::{BoundRequest, RequestBinding};
+mod registry;
+pub use registry::{Claim, Claimed, RequestKey, RequestRegistry};
 pub(crate) mod command;
 
 use crate::{
@@ -231,19 +235,48 @@ impl Resources {
         create: bool,
         action: impl FnOnce(&Session<'_>, &mut Store, Scope) -> Result<T>,
     ) -> Result<T> {
-        crate::documents::application::with_store(
-            &self.paths,
-            create,
-            |bootstrap| {
-                if bootstrap.trust() != self.allocation.trust() {
-                    return Err(Error::new(
-                        "resource activation belongs to another Commons root",
-                    ));
-                }
-                descriptor(bootstrap, &self.allocation)
-            },
-            action,
-        )
+        self.with_store_deadline(create, None, action)
+    }
+
+    fn with_store_deadline<T>(
+        &self,
+        create: bool,
+        deadline: Option<std::time::Instant>,
+        action: impl FnOnce(&Session<'_>, &mut Store, Scope) -> Result<T>,
+    ) -> Result<T> {
+        let descriptor = |bootstrap: &Bootstrap| {
+            if bootstrap.trust() != self.allocation.trust() {
+                return Err(Error::new(
+                    "resource activation belongs to another Commons root",
+                ));
+            }
+            descriptor(bootstrap, &self.allocation)
+        };
+        let apply = |session: &Session<'_>, store: &mut Store, scope: Scope| {
+            if self.check_existing_pin()?.is_some() {
+                self.pin(session, store, false)?;
+            }
+            let directory = crate::catalog::Directory::new(session.paths(), scope.trust());
+            if let Some(recovery) = directory
+                .recovery()
+                .observe_store_if_exists(session, scope)?
+            {
+                store.reconcile_recovery(session, recovery)?;
+            }
+            action(session, store, scope)
+        };
+        match deadline {
+            Some(deadline) => crate::documents::application::with_store_until(
+                &self.paths,
+                create,
+                descriptor,
+                deadline,
+                apply,
+            ),
+            None => {
+                crate::documents::application::with_store(&self.paths, create, descriptor, apply)
+            }
+        }
     }
 
     fn observe_store<T>(
@@ -265,14 +298,25 @@ impl Resources {
     }
 
     fn pin_path(&self) -> std::path::PathBuf {
-        self.paths
+        self.pin_path_at(&self.paths)
+    }
+    fn pin_path_at(&self, paths: &Paths) -> std::path::PathBuf {
+        paths
             .dir
             .join("commons/resource-pins")
             .join(hex::encode_lower(&window_id(&self.allocation)))
     }
     fn check_existing_pin(&self) -> Result<Option<Digest>> {
-        let Some(bytes) = fsx::read_private(&self.pin_path(), 69).map_err(crate::table::failure)?
-        else {
+        // Succession changes writer custody, not the allocation for an already
+        // pinned resource window. Ancestor pins only constrain identity; they
+        // never supply the successor's local custody or an inherited share.
+        for predecessor in crate::generation::predecessors(&self.paths)? {
+            self.check_pin_at(&self.pin_path_at(&predecessor))?;
+        }
+        self.check_pin_at(&self.pin_path())
+    }
+    fn check_pin_at(&self, path: &std::path::Path) -> Result<Option<Digest>> {
+        let Some(bytes) = fsx::read_private(path, 69).map_err(crate::table::failure)? else {
             return Ok(None);
         };
         let bytes = bytes.as_slice();
@@ -297,7 +341,7 @@ impl Resources {
     }
     fn pin(&self, session: &Session<'_>, store: &Store, create: bool) -> Result<()> {
         let path = self.pin_path();
-        let custody = store.custody_id(session)?;
+        let custody = store.primary_custody_id(session)?;
         if self.check_existing_pin()?.is_none() {
             if !create {
                 return Err(Error::new(

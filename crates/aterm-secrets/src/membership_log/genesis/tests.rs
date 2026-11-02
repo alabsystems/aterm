@@ -316,8 +316,18 @@ fn alab_founders_list_every_machine_with_its_binding_and_a_free_label_for_the_un
             ("mini", false, "m43"),
         ]
     );
+    let dup_labels = BTreeMap::from([
+        (A.recipient(), "m22".to_owned()),
+        (B.recipient(), "m40".to_owned()),
+        (L.recipient(), "m40".to_owned()),
+    ]);
+    let deduped = alab_founders(&machines, &bindings, &dup_labels, 40).unwrap();
+    let deduped_labels: Vec<&str> = deduped.iter().map(|f| f.label.as_str()).collect();
+    assert_eq!(deduped_labels, ["m22", "m40", "m41", "m42"]);
     let twice = [A.request().binding().clone(), A.request().binding().clone()];
     assert!(alab_founders(&machines, &twice, &labels, 40).is_err());
+    assert!(alab_founders(&machines, &bindings, &labels, 100_000).is_err());
+    assert!(alab_founders(&machines, &bindings, &labels, u32::MAX).is_err());
 }
 
 #[test]
@@ -444,6 +454,8 @@ fn a_removed_mac_naming_another_listed_founders_recipient_does_not_block_its_cha
     for case in [
         "before plain removal cutoff",
         "sybil admit-and-remove before plain removal cutoff",
+        "sybil admit removed by admin before plain removal cutoff",
+        "sybil admit squatting active founder recipient removed by admin",
         "backdated self-admit",
         "after plain removal",
         "after quorum removal",
@@ -530,6 +542,54 @@ fn a_removed_mac_naming_another_listed_founders_recipient_does_not_block_its_cha
                 .unwrap();
             removal_cutoff = *rem_sybil.id();
             assert!(store.insert(rem_sybil).unwrap());
+        } else if case == "sybil admit removed by admin before plain removal cutoff"
+            || case == "sybil admit squatting active founder recipient removed by admin"
+        {
+            let target_rec =
+                if case == "sybil admit squatting active founder recipient removed by admin" {
+                    A.recipient()
+                } else {
+                    X.recipient()
+                };
+            let target_label =
+                if case == "sybil admit squatting active founder recipient removed by admin" {
+                    "m22"
+                } else {
+                    "m41"
+                };
+            let sybil = forged_request(I, target_rec);
+            let sybil_id = sybil.binding().actor();
+            let admit_sybil = log(&store)
+                .draft(
+                    &L.id(),
+                    3,
+                    Body::Admit {
+                        entrant: Entrant {
+                            request: sybil,
+                            node_key: [99; 32],
+                            name: "sybil".into(),
+                            label: target_label.into(),
+                        },
+                        evidence: Evidence::Phrase,
+                    },
+                )
+                .sign(&L.seed(), L.incarnation())
+                .unwrap();
+            let admit_sybil_id = *admit_sybil.id();
+            removal_cutoff = admit_sybil_id;
+            assert!(store.insert(admit_sybil).unwrap());
+            let rem_sybil = log(&store)
+                .draft(
+                    &A.id(),
+                    3,
+                    Body::Remove {
+                        member: sybil_id,
+                        cutoff: admit_sybil_id,
+                    },
+                )
+                .sign(&A.seed(), A.incarnation())
+                .unwrap();
+            assert!(store.insert(rem_sybil).unwrap());
         }
 
         let removers: &[Mac] = if case == "after quorum removal" {
@@ -554,7 +614,9 @@ fn a_removed_mac_naming_another_listed_founders_recipient_does_not_block_its_cha
 
         match case {
             "before plain removal cutoff"
-            | "sybil admit-and-remove before plain removal cutoff" => {}
+            | "sybil admit-and-remove before plain removal cutoff"
+            | "sybil admit removed by admin before plain removal cutoff"
+            | "sybil admit squatting active founder recipient removed by admin" => {}
             "backdated sybil admit-and-remove" => {
                 let sybil = forged_request(I, X.recipient());
                 let sybil_id = sybil.binding().actor();
@@ -632,6 +694,10 @@ fn a_removed_mac_naming_another_listed_founders_recipient_does_not_block_its_cha
             !cur.recipient_is_removed(&X.recipient()),
             "{case}: X's recipient must not be marked removed"
         );
+        assert!(
+            !cur.recipient_is_removed(&A.recipient()),
+            "{case}: A's recipient must not be marked removed"
+        );
         assert_eq!(
             membership.removed_labels(),
             &BTreeSet::from(["m40".to_owned()]),
@@ -659,4 +725,96 @@ fn a_removed_mac_naming_another_listed_founders_recipient_does_not_block_its_cha
         assert!(!after.contains(&L.id()), "{case}");
         assert!(after.unproved().is_empty(), "{case}");
     }
+}
+
+#[test]
+fn a_listed_founder_revoked_by_epoch_rotation_is_not_rewrapped_after_concurrent_challenge() {
+    use crate::membership_log::EpochAudience;
+    use crate::text::Audience;
+
+    let record = genesis(
+        &ALAB,
+        &[(A, "m22", true), (B, "m7", true), (L, "m40", false)],
+        1,
+    );
+    let mut base = Log::new(record).unwrap();
+    let (epoch1_draft, epoch1_key) = base.draft_epoch(&A.id(), 2, Audience::Everyone, 1).unwrap();
+    let epoch1 = epoch1_draft.sign(&A.seed(), A.incarnation()).unwrap();
+    let epoch1_id = *epoch1.id();
+    base.insert(epoch1).unwrap();
+    for mac in [A, B, L] {
+        let wrap = base
+            .draft_wrap(&A.id(), 2, epoch1_id, &epoch1_key, mac.recipient())
+            .unwrap()
+            .sign(&A.seed(), A.incarnation())
+            .unwrap();
+        base.insert(wrap).unwrap();
+    }
+
+    // Side A: admin A revokes unproved founder L by minting epoch 2 wrapped only to A and B.
+    let mut side_a = base.clone();
+    let (epoch2_draft, epoch2_key) = side_a
+        .draft_epoch(&A.id(), 3, Audience::Everyone, 2)
+        .unwrap();
+    let epoch2 = epoch2_draft.sign(&A.seed(), A.incarnation()).unwrap();
+    let epoch2_id = *epoch2.id();
+    side_a.insert(epoch2).unwrap();
+    for mac in [A, B] {
+        let wrap = side_a
+            .draft_wrap(&A.id(), 3, epoch2_id, &epoch2_key, mac.recipient())
+            .unwrap()
+            .sign(&A.seed(), A.incarnation())
+            .unwrap();
+        side_a.insert(wrap).unwrap();
+    }
+    let put = side_a
+        .draft_put(
+            &A.id(),
+            4,
+            epoch2_id,
+            &epoch2_key,
+            &crate::text::Entry {
+                name: "secret".into(),
+                value: crate::SecretBytes::from(b"after-revoke".as_slice()),
+                audience: Audience::Everyone,
+                if_absent: false,
+                anchor: None,
+            },
+        )
+        .unwrap()
+        .sign(&A.seed(), A.incarnation())
+        .unwrap();
+    side_a.insert(put).unwrap();
+
+    // Side B: concurrently, B answers L's automatic possession challenge (`Evidence::Listed`).
+    let mut side_b = base.clone();
+    let l_req = L.request();
+    let (proof, challenge) = side_b.challenge(&l_req, [40; 32], "air".into()).unwrap();
+    let answer = l_req.answer(&L.identity(), &L.seed(), &challenge).unwrap();
+    let admit_l = proof
+        .admit(&side_b, &answer, &B.id(), 3)
+        .unwrap()
+        .sign(&B.seed(), B.incarnation())
+        .unwrap();
+    side_b.insert(admit_l).unwrap();
+
+    // After healing, L's concurrent `Evidence::Listed` challenge must not override epoch 2's
+    // revocation or cause `wrap_gaps` to re-wrap epoch 2 to L.
+    let mut healed = side_a;
+    healed.merge(&side_b).unwrap();
+    let opened = healed
+        .open_audience_entries(&A.identity())
+        .unwrap()
+        .unwrap();
+    assert!(healed.audience_left_out_recipient(&EpochAudience::Everyone, &L.recipient()));
+    assert!(healed.audience_left_out(&EpochAudience::Everyone, &L.id()));
+    assert!(healed.left_out(&opened, &EpochAudience::Everyone, &L.id()));
+    assert!(!healed.is_wrap_gap(&opened, &epoch2_id, &L.id()));
+    assert!(
+        healed
+            .wrap_gaps(&opened, &[EpochAudience::Everyone])
+            .iter()
+            .all(|gap| gap.member != L.id() && gap.recipient != L.recipient()),
+        "revoked listed founder L must not receive epoch 2 via wrap_gaps"
+    );
 }

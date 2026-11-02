@@ -1642,6 +1642,21 @@ fn taken(k: usize, h: &[String], prompt: &str) -> Beat {
     )
 }
 
+/// THE LAND CHECK LAND TYPES AT A CLEAN DEFENSE (act `k`, over `defended`): its turn runs and
+/// ends `LANDED`, the answer that lands ([`crate::supervise::policy::land_check`]).
+fn land_checked(k: usize, defended: &[String]) -> [Beat; 2] {
+    let check = crate::supervise::policy::turn_end::LAND_CHECK;
+    let landed = with(defended, &turn(Some(check), &["⏺ LANDED"], 20, 0));
+    [
+        taken(k, defended, check),
+        beat(
+            At::Act(k, MIN),
+            "the check's turn ends: LANDED (landed)",
+            Ev::Point(cc(&landed, &[], "")),
+        ),
+    ]
+}
+
 const BUCKET_RESET: i64 = 1_792_279_200;
 
 fn bucket_armed() -> Vec<String> {
@@ -3397,22 +3412,21 @@ fn grown_scenarios() -> Vec<Scenario> {
             "",
         );
         let land = crate::supervise::policy::turn_end::LAND;
-        let landed = with(&w0, &turn(Some(land), &defense, 10 * MIN, 0));
+        let defended = with(&w0, &turn(Some(land), &defense, 10 * MIN, 0));
+        let [check_runs, check_lands] = land_checked(1, &defended);
         let beats = vec![
             start(),
             beat(At::Start(2 * MIN), "the worker's progress", Ev::Point(p0)),
             taken(0, &w0, land),
             beat(
                 At::Act(0, 10 * MIN),
-                "the land turn ends: a clean defense (landed)",
-                Ev::Point(cc(&landed, &[], "")),
+                "the land turn ends: a clean defense (the check owed)",
+                Ev::Point(cc(&defended, &[], "")),
             ),
-            beat(
-                At::Act(0, 10 * MIN + 30),
-                "Off stood and lifted",
-                Ev::OffLifted,
-            ),
-            beat(At::Act(0, 10 * MIN + 90), "(a handoff instant)", Ev::Mark),
+            check_runs,
+            check_lands,
+            beat(At::Act(1, MIN + 30), "Off stood and lifted", Ev::OffLifted),
+            beat(At::Act(1, MIN + 90), "(a handoff instant)", Ev::Mark),
         ];
         out.push(sc(
             "R4 Off lifts after the landing (Land, in words)".to_string(),
@@ -4436,11 +4450,16 @@ fn api_retry_scenarios() -> Vec<Scenario> {
                     Ev::Point(cc(&answered, &[], "")),
                 ),
             ]);
-            beats.push(if person {
-                taken(2, &answered, crate::supervise::policy::turn_end::LAND_NUDGE)
+            if person {
+                beats.push(taken(
+                    2,
+                    &answered,
+                    crate::supervise::policy::turn_end::LAND_NUDGE,
+                ));
             } else {
-                beat(At::Act(1, 3 * MIN + 90), "(a handoff instant)", Ev::Mark)
-            });
+                beats.extend(land_checked(2, &answered));
+                beats.push(beat(At::Act(2, MIN + 90), "(a handoff instant)", Ev::Mark));
+            }
             let between = if person {
                 ", a person's turn meets one too"
             } else {
@@ -4655,18 +4674,17 @@ fn api_retry_scenarios() -> Vec<Scenario> {
                 k += 2;
             }
             let answered = with(&kept, &turn(Some(land), &defense, 3 * MIN, 0));
-            beats.extend([
-                beat(
-                    At::Act(k + 2, 3 * MIN),
-                    "the continuation's turn ends: a clean defense",
-                    Ev::Point(cc(&answered, &[], "")),
-                ),
-                beat(
-                    At::Act(k + 2, 3 * MIN + 90),
-                    "(a handoff instant)",
-                    Ev::Mark,
-                ),
-            ]);
+            beats.push(beat(
+                At::Act(k + 2, 3 * MIN),
+                "the continuation's turn ends: a clean defense",
+                Ev::Point(cc(&answered, &[], "")),
+            ));
+            beats.extend(land_checked(k + 3, &answered));
+            beats.push(beat(
+                At::Act(k + 3, MIN + 90),
+                "(a handoff instant)",
+                Ev::Mark,
+            ));
             let name = match (api, twice, asked) {
                 (true, ..) => "API 529 cuts Land's instruction, its retry meets a full context",
                 (_, true, _) => {
@@ -5057,6 +5075,40 @@ fn off_stands_at_every_park_the_journal_says() {
     assert!(
         !in_hand(&newer, Some(&park(2_000, SID))),
         "a newer build's record too"
+    );
+    // A park the ledger records itself is read from its own row, which says what it kept (the
+    // second review of the post-landing fixes, 2026-11-01): an Off no person set over Land's rest
+    // keeps the episode. CONTROL: the same row of another park's seq, and the person's own Off.
+    let own = |reason: &str, seq: u64| {
+        format!(
+            "{land}\n{}\n",
+            Row {
+                rule_id: approvals::RULE_OFF_STOOD,
+                outcome: Outcome::Waiting,
+                command: "",
+                reason,
+                box_seq: seq,
+            }
+            .to_json(2_001, Some(SID))
+        )
+    };
+    assert!(
+        in_hand(
+            &own(approvals::OFF_STOOD_RESTING, 7),
+            Some(&park(2_000, SID))
+        ),
+        "the park's own record keeps the rest"
+    );
+    assert!(
+        !in_hand(
+            &own(approvals::OFF_STOOD_RESTING, 1),
+            Some(&park(2_000, SID))
+        ),
+        "another park's record"
+    );
+    assert!(
+        !in_hand(&own(approvals::OFF_STOOD, 7), Some(&park(2_000, SID))),
+        "the person's own Off"
     );
     let later = format!(
         "{land}\n{}\n",
@@ -6364,6 +6416,103 @@ fn a_ledger_no_loop_recorded_points_in_seeds_no_yield() {
             .turn_end_at_point(&p, Some(Duration::from_secs(20)), &opts)
             .expect("a decision");
         assert_eq!(s.turn_end.short_streak(), want, "recorded={recorded}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A LOOP AFTER A RESTART COUNTS THE ACT A WALL CUT AS THE LOOP BEFORE IT WOULD (v6 §14.17.5.7):
+/// the books hold Cruise's continuation typed at two short turns in a row, its answer unread when
+/// the loop stopped, and the loop that follows reads it. Met by an overloaded API, it was the
+/// wall's to answer, so the streak stays at two, where the first loop's own point would leave it;
+/// answered short by the agent it is three. Where the act's row says the wall's pass at that
+/// streak was spent already (a cut act before it went uncounted), the walled answer counts, three,
+/// as the first loop would have counted it. NEGATIVE CONTROLS (§14.17.5.7): with the act a wall
+/// cut counted, as before, the walled answer makes three as well; with the pass the row names left
+/// unseeded, the spent pass's walled answer makes two.
+#[test]
+fn a_successor_counts_the_act_a_wall_cut_as_the_loop_before_would() {
+    use crate::supervise::approvals::{self, Outcome, Row};
+    use crate::supervise::policy::turn_end::RULE_CONTINUE;
+    let dir = crate::supervise::test_scratch_path("seed-matrix", "wall-cut-streak");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    let overloaded = "  ⎿  API Error: 529 Overloaded. This is a server-side issue, usually \
+                      temporary — try again in a moment.";
+    for (walled, spent, want) in [(true, false, 2), (false, false, 3), (true, true, 3)] {
+        let ledger = dir.join(format!("books-{walled}-{spent}.jsonl"));
+        let now_ms = crate::supervise::journal::unix_ms();
+        let carried = approvals::Carried {
+            pass: crate::supervise::policy::turn_end::WallPass { spent, owed: false },
+            ..approvals::Carried::streak(2)
+        };
+        let point = approvals::point_reason(carried, false);
+        let marked = approvals::act_reason_after(carried, None);
+        let rows = [
+            (
+                now_ms - 10 * MIN * 1000,
+                approvals::RULE_POINT,
+                Outcome::Waiting,
+                "",
+                point.as_str(),
+            ),
+            (
+                now_ms - 5 * MIN * 1000,
+                RULE_CONTINUE,
+                Outcome::Typed,
+                "keep going",
+                marked.as_str(),
+            ),
+        ];
+        let body: String = rows
+            .iter()
+            .map(|(ts, rule_id, outcome, command, reason)| {
+                let row = Row {
+                    rule_id,
+                    outcome: *outcome,
+                    command,
+                    reason,
+                    box_seq: 1,
+                };
+                format!("{}\n", row.to_json(*ts, Some(SID)))
+            })
+            .collect();
+        std::fs::write(&ledger, &body).expect("the books");
+        let mut m = Mock::new(vec![Vec::new()]);
+        let mut s = session(&mut m, Some(SID.to_string()));
+        s.set_zone_lookup(test_zones);
+        s.ledger = Ledger::open(Some(&ledger), Some(SID), &mut Vec::new());
+        s.turn_end_seeded = true;
+        s.set_turn_end_timing(TurnEndTiming {
+            take_within: Duration::ZERO,
+            ..TurnEndTiming::default()
+        });
+        s.set_clock(T0, PDT);
+        let open = s.seed_from_ledger(&ledger, now_ms, false);
+        s.seed_wall_memory(open);
+        assert_eq!(
+            s.turn_end.short_streak(),
+            2,
+            "walled={walled} spent={spent}: the act's mark"
+        );
+        s.turn_end.took();
+        let reply: &[&str] = if walled {
+            &["⏺ Running the suite.", overloaded]
+        } else {
+            &["⏺ Stage 3 of 5: still on it."]
+        };
+        let h = with(&work0(), &turn(Some("keep going"), reply, 20, T0));
+        let rows = cc(&h, &[], "");
+        s.ctl.screens = vec![rows.clone()];
+        s.ctl.served = 0;
+        let p = point_at(&s, rows, 101);
+        let _ = s
+            .turn_end_at_point(&p, Some(Duration::from_secs(20)), &auto(30))
+            .expect("a decision");
+        assert_eq!(
+            s.turn_end.short_streak(),
+            want,
+            "walled={walled} spent={spent}"
+        );
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

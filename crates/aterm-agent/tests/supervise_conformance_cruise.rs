@@ -68,6 +68,7 @@ fn finding() -> RepoWork {
         main_ref: "origin/main".to_string(),
         paths: vec!["src/lexer.rs".to_string()],
         state: Some(0x5eed),
+        ..RepoWork::default()
     }
 }
 
@@ -103,8 +104,9 @@ fn point(
         said_cut: false,
         opens_cut: false,
         turn_said: Some(crate::common::earlier(earlier)),
+        said_lines: None,
+        turn_lines: None,
         opened_by: None,
-        opened_words: None,
         message_drawn: false,
         submits: None,
         inputs_before: None,
@@ -123,6 +125,7 @@ fn point(
         left_record: false,
         left_work: None,
         person: None,
+        key: None,
         login_back: false,
         auto_continue: None,
         since_limit: None,
@@ -132,11 +135,13 @@ fn point(
         notice_elsewhere: false,
         reset_clock: None,
         reach,
+        witness: None,
         program: aterm_phase::Program::Claude,
         seat: Default::default(),
         account: None,
         autopilot: Autopilot::Cruise,
         login_label: None,
+        autopilot_by_person: false,
         login_superseded: false,
         login_notice: None,
         login_screen: None,
@@ -163,6 +168,7 @@ fn point(
 #[derive(Debug, PartialEq, Eq)]
 enum Verdict {
     Continue,
+    Recover,
     Check,
     Answer,
     WallAct,
@@ -174,6 +180,11 @@ enum Verdict {
 
 fn verdict(a: &TurnEndAction) -> Verdict {
     match a {
+        TurnEndAction::Type { text, .. }
+            if text == aterm_agent::supervise::policy::turn_end::FORWARD_RECOVERY =>
+        {
+            Verdict::Recover
+        }
         TurnEndAction::Type { rule_id, .. } if *rule_id == RULE_CONTINUE => Verdict::Continue,
         TurnEndAction::Type { text, rule_id } if *rule_id == RULE_DONE_CHECK => {
             assert!(
@@ -200,6 +211,10 @@ fn verdict(a: &TurnEndAction) -> Verdict {
                 },
             ..
         } if why == UNREACHABLE_HOLD => Verdict::Held,
+        TurnEndAction::WaitUntil {
+            wait: WaitKind::Other,
+            ..
+        } => Verdict::Wait,
         TurnEndAction::Nothing => Verdict::Nothing,
         other => panic!("an act the model has no word for: {other:?}"),
     }
@@ -223,10 +238,11 @@ fn defend_prompt(st: &State, real: &TurnEndState) -> String {
 }
 
 /// The acts a measured outage holds (`down` = 1, `capped` = 0: its cap not yet passed).
-const HELD: [&str; 3] = ["Continue", "Check", "Answer"];
+const HELD: [&str; 4] = ["Continue", "Recover", "Check", "Answer"];
 
 fn expected(m: &Model, st: &State) -> Verdict {
     for (action, word) in [
+        ("Recover", Verdict::Recover),
         ("Continue", Verdict::Continue),
         ("Check", Verdict::Check),
         ("Answer", Verdict::Answer),
@@ -376,7 +392,7 @@ fn mirror(action: &str, before: &State, real: &mut Real) {
         "NetDown" => real.down = Some(real.now),
         "NetUp" => real.down = None,
         "OutageCapDue" => real.outage_cap_passes(),
-        "Continue" | "Check" | "Answer" | "WallAct" => {
+        "Continue" | "Recover" | "Check" | "Answer" | "WallAct" => {
             let a = real.decide();
             assert!(
                 !matches!(
@@ -579,8 +595,8 @@ fn tier1_the_buggy_model_is_refuted_by_the_real_decider() {
         !m.action_enabled("Answer", &st) && same.fire("Answer", &mut b),
         "{st:?}"
     );
-    assert!(!same.check_invariant("ANoWorkReplyGetsOneMoreActAtMost", &b));
-    assert_eq!(verdict(&real.clone().decide()), Verdict::Nothing);
+    assert!(!same.check_invariant("RepeatedRepliesUseRecovery", &b));
+    assert_eq!(verdict(&real.clone().decide()), Verdict::Wait);
     let (_, real) = walk(&m, &[&again[..4], &["YieldAsk"]].concat(), base);
     assert_eq!(verdict(&real.clone().decide()), Verdict::Answer);
 

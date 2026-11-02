@@ -13,15 +13,14 @@ formatting that no spec should keep (§4).
 
 ## 0. Notation used in the statements
 
-- `∀`, `∃`, `⇔`, `⇒`, `¬`, `∧`, `∨`, `∈`, `∪`, `∩`, `\` (set difference), `Δ` (symmetric difference)
-  and `++` (concatenation) have their usual meanings. `⊑` is "is a substring of".
+- Logic and set symbols have their usual meanings; `\` is set difference, `Δ` symmetric difference,
+  `++` concatenation and `⊑` "is a substring of".
 - Test ids are `file::test`, with `file` relative to `crates/aterm-libc-oracle/`.
 - **J**: the `aterm_json::Value` model, an inductive `Null | Bool b | Number n | String s | Array [J] |
-  Object (ordered map String → J)`. `get(k)` is map lookup and is None on a non-object. Every statement
-  about a function that reads JSON text is made over J. Parsing text into J is aterm_json's own spec,
-  so citing it is a cross-crate citation (gap 12).
-- `Lines(s)` = `str::lines(s)`. `trim_end`/`trim_start`/`trim` are the std definitions. `Occ(s,p)` = the
-  number of non-overlapping matches of p in s (`s.matches(p).count()`). `Repl(s,p,q)` = `str::replace`.
+  Object (ordered map String → J)`. `get(k)` is map lookup and is None on a non-object. Statements about
+  a function that reads JSON text are made over J; parsing text into J is aterm_json's spec (gap 12).
+- `Lines(s)` = `str::lines(s)`; `trim`, `trim_start` and `trim_end` are std's. `Occ(s,p)` =
+  `s.matches(p).count()`; `Repl(s,p,q)` = `str::replace`.
 - `IdentChar(c)`: c is ASCII alphanumeric or `_`. `Words(s)`: the non-empty maximal IdentChar runs of s.
 - **CELLS**: the 4-row const table in `src/cells.rs`, rows `(triple, key, os, arch, source)`:
   `mac` = (aarch64-apple-darwin, `darwin_aarch64.rs`), `macx` = (x86_64 darwin, `darwin_x86_64.rs`),
@@ -31,11 +30,10 @@ formatting that no spec should keep (§4).
   `item(id) = index[id_key(id)]`, where `id_key(Number n) = decimal(n)`, `id_key(String s) = s`, and any
   other id has no key. `kind_of(item)` is the first `(kind, payload)` member of `item.inner`.
 - **Public(doc)**: the `BTreeMap name → Namespace → Entry{kind,item}` that `Doc::public` returns.
-  `Namespace::of` maps struct, enum, union, type_alias and trait to Type, maps function, constant and
-  static to Value, and maps every other kind to None.
-- `sig_types(e)`: the types a signature mentions (`closure::signature_types`). For a constant or a
-  type_alias it is `[type]`; for a function, the inputs plus the output when present; for a struct or a
-  union, each field's `struct_field`; otherwise `[]`.
+  `Namespace::of` maps struct, enum, union, type_alias and trait to Type, function, constant and static
+  to Value, and every other kind to None.
+- `sig_types(e)` (`closure::signature_types`): `[type]` for a constant or type_alias, the inputs plus any
+  output for a function, each field's `struct_field` for a struct or union, and `[]` otherwise.
 - **Outcome**: `cargo::Outcome {success, code, errors: [Diagnostic], passed, failed: [FailedTest], stderr}`.
 - `ErrList(xs)` = `join("\n", [trim_end(e.rendered) | e in the first 5 of xs] ++ (["... and {|xs|-5} more
   errors"] if |xs|>5))`, implemented once as `cargo::error_list` and called by both `Outcome::detail` and `probe::unmeasured_because`.
@@ -43,10 +41,10 @@ formatting that no spec should keep (§4).
   with a size of "`. `BODY_MARKER` = `"type fd_word = "`, the start of the first line of code `regen::shim::bodies` writes (from the constant), never a comment.
 - `up(x,a)` = `Some(ceil(x/a)·a)` for `a ≥ 1` when `ceil(x/a)·a ≤ 2^64−1`, and `None` when `a = 0` or the product overflows `u64`.
 - F: the filesystem state. A spec that names F is effectful (gap 8).
-- **Gaps** are the rows of `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7. Gap 0 (an installed
-  seal that publishes Lean-discharged rows) comes before every proof, so it is listed on every spec.
-  Gap 6 (publication of plain-Rust clauses) applies to any spec discharged on the SMT lane instead of
-  in Lean. It is left out of the column because the lane is chosen per proof.
+- **Gaps** are the rows of `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7. Every spec lists gap 0
+  (an installed seal that publishes Lean-discharged rows). Gap 6 (publishing plain-Rust clauses) applies
+  to any spec discharged on the SMT lane instead of in Lean; the column leaves it out because the lane is
+  chosen per proof.
 
 ## 1. Specs (TSV)
 
@@ -149,8 +147,8 @@ lemma, `tail`, and `up`. Then `repr-c-layout` → `layout-validate` → `shim-st
 
 ## 2. Test to spec map (TSV)
 
-`primary` is the spec that retires the test. `also` lists the other specs the same test samples.
-Paths are relative to `crates/aterm-libc-oracle/`.
+`primary` is the spec that retires the test; `also` lists the other specs it samples. Paths are
+relative to `crates/aterm-libc-oracle/`.
 
 ```tsv
 file	test	primary	also
@@ -219,7 +217,7 @@ src/verdict.rs	findings_outrank_a_stop_and_a_stop_alone_could_not_run	report-exi
 tests/exit_codes.rs	no_oracle_could_not_run_and_a_stray_flag_is_usage	binary-exit-codes	cli-parse, run-precondition-could-not-run, report-exit-code-precedence
 ```
 
-## 3. Coverage
+## 3. Proof order
 
 - 63 live tests, and all 63 map to one of the 53 specs. 0 tests are not spec samples.
 - The specs are fine-grained, because each test here already names one property. The largest
@@ -229,18 +227,23 @@ tests/exit_codes.rs	no_oracle_could_not_run_and_a_stray_flag_is_usage	binary-exi
   `decls-read-partition` and `expected-shape-is-closure-plus-prims`. `outcome-parse` is reused by
   `control-expect-judge` and `probe-readback`. All three wait on gap 4 (callee ensures into caller).
 
-## 4. Tests that are not spec samples
+- `repr-c-layout` → `layout-validate` → `shim-struct-layout-reproduces-measurement`.
+- `render-type` + `named-identifiers` → `closure-least-fixpoint` → `decls-read-partition`,
+  `expected-shape-is-closure-plus-prims`.
+- `outcome-parse` + `diagnostic-names-whole-identifier` + `outcome-detail-and-tail` →
+  `control-expect-judge`.
+- `apply-edits-anchor-count` + `sibling-compare` → `sibling-controls`.
+- `harvest-missing-names` + `harvest-crate-of` → `harvest-scan-filtered-by-reference`.
+- `shim-const-expr` → `probe-line-key-correspondence` → `probe-readback`.
+- `rustdoc-public-surface` → `shape-records` → `shape-diff-symmetric-difference`.
+- `cli-parse` + `run-precondition-could-not-run` + `report-exit-code-precedence` → `binary-exit-codes`.
 
-No whole test is a non-spec. Two tests also pin formatting that is not part of any spec.
-When their spec is proved, that residue should not survive as a test.
+## 4. Test residue no spec keeps
 
-| test | non-spec residue | action |
-|---|---|---|
-| src/regen/shim.rs::a_cell_module_writes_each_kind_in_its_section | A golden-text test: exact emitted lines, including comments and whitespace that trustfmt rewrites. | **delete the golden fragments** once `shim-emit-sections` is proved. |
-| src/regen/oracle.rs::each_kind_is_pinned_in_its_strongest_form | A golden-text test, including the copyright header and comment lines. | **delete the golden fragments** once `oracle-assertion-forms` is proved. |
-
-Count by action: delete 0 whole tests as non-specs, keep 0, convert 0; trim residue in 2 (it goes
-when the spec's tests are deleted).
+`src/regen/shim.rs::a_cell_module_writes_each_kind_in_its_section` and
+`src/regen/oracle.rs::each_kind_is_pinned_in_its_strongest_form` pin exact emitted lines, including the
+copyright header, comments and whitespace. Their specs (`shim-emit-sections`, `oracle-assertion-forms`)
+keep only the structure; delete the golden fragments when those specs are proved.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 

@@ -6,6 +6,7 @@
 # commit's trail-diff compares glass frames: pause-swoosh on a shell line.
 
 foreach-scheme light {
+  scale 2
   grid 16 80
   style rainbow kitty
   hz 60

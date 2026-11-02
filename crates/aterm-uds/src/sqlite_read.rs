@@ -284,13 +284,16 @@ fn materialize_row<'p>(
         }
     } else {
         decode_record_into(record_bytes, encoding, row_buf)?;
+        row_buf.truncate(schema.columns.len());
         for col_idx in row_buf.len()..schema.columns.len() {
-            row_buf.push(
+            row_buf.push(if schema.rowid_alias_col == Some(col_idx) {
+                SqlValue::Null
+            } else {
                 schema
                     .defaults
                     .get(col_idx)
-                    .map_or(SqlValue::Null, borrow_default),
-            );
+                    .map_or(SqlValue::Null, borrow_default)
+            });
         }
     }
     if let Some(rowid) = rowid
@@ -1158,10 +1161,12 @@ fn parse_sql_default_literal(src: &str, mut in_parens: bool) -> Option<SqlValue<
             (false, cur)
         };
         let nb = num_src.as_bytes();
+        let is_hex = nb.get(..2).is_some_and(|p| p.eq_ignore_ascii_case(b"0x"));
         let mut end = 0usize;
         while end < nb.len() {
             let c = nb[end];
-            let exp_sign = matches!(c, b'+' | b'-')
+            let exp_sign = !is_hex
+                && matches!(c, b'+' | b'-')
                 && end > 0
                 && matches!(nb[end - 1], b'e' | b'E')
                 && (nb[0].is_ascii_digit() || nb[0] == b'.');
@@ -1173,6 +1178,9 @@ fn parse_sql_default_literal(src: &str, mut in_parens: bool) -> Option<SqlValue<
         }
         let tok = num_src.get(..end).filter(|t| !t.is_empty())?;
         let parsed = if let Some(hex) = tok.strip_prefix("0x").or_else(|| tok.strip_prefix("0X")) {
+            if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return None;
+            }
             let signed = if sign {
                 format!("-{hex}")
             } else {

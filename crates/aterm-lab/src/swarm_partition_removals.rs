@@ -28,7 +28,7 @@ use std::time::Instant;
 
 use aterm_secrets::age::Recipient;
 use aterm_secrets::client::{self, Paths};
-use aterm_secrets::membership_log::{Log, MemberId};
+use aterm_secrets::membership_log::{Log, MemberId, RecordId};
 use aterm_secrets::text::Audience;
 
 use super::commons::Mac;
@@ -483,7 +483,7 @@ fn drive(macs: &[Mac], act: &dyn Fn(&str, &[&str]) -> super::world::Out, ev: &mu
     }
 
     // a2 puts the value; every Mac reads its own records.
-    let put = mac(PUTTER).map(|m| client::test_put_everyone(&m.paths, VALUE_NAME, VALUE));
+    let put = mac(PUTTER).map(|m| put_everyone(&m.paths));
     ev.put = Some(match &put {
         Some(Ok(_)) => Ok(()),
         Some(Err(e)) => Err(e.to_string()),
@@ -516,6 +516,21 @@ fn drive(macs: &[Mac], act: &dyn Fn(&str, &[&str]) -> super::world::Out, ev: &mu
             .and_then(|row| row.removed.as_ref())
             .map(client::RemovedNote::title);
     }
+}
+
+/// The putter's `[everyone]` value: `client::test_put_everyone`, a test seam that only a build with
+/// debug assertions has (`cfg(any(test, debug_assertions))`). A release lab (the trail galleries' measuring
+/// build) has none, so its removals plane reports the put as not made rather than failing to compile.
+#[cfg(any(test, debug_assertions))]
+fn put_everyone(paths: &Paths) -> aterm_secrets::Result<RecordId> {
+    client::test_put_everyone(paths, VALUE_NAME, VALUE)
+}
+
+#[cfg(not(any(test, debug_assertions)))]
+fn put_everyone(_paths: &Paths) -> aterm_secrets::Result<RecordId> {
+    Err(aterm_secrets::Error::new(
+        "a release lab has no test seam to put the [everyone] value; run the removals plane from a debug lab",
+    ))
 }
 
 fn rotation_due(paths: &Paths) -> bool {

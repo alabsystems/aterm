@@ -60,8 +60,21 @@ enum Admit {
     Private,
     /// Owned by this user, no group/other write.
     Owned,
+    /// `aterm.toml`, by the one rule every reader of it holds
+    /// ([`aterm_types::dirs::aterm_config_refusal`]): owned by this user or by root, no
+    /// group/other write.
+    AtermConfig,
     /// Anyone's.
     Any,
+}
+
+/// What a read does with a symlink at its path.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Links {
+    /// Refuse it (`O_NOFOLLOW`).
+    Refuse,
+    /// Follow it to the file it names, which the read then admits.
+    Follow,
 }
 
 /// What a read does with a file longer than its cap.
@@ -85,14 +98,31 @@ fn read_admitted_past(
     admit: Admit,
     past: Past,
 ) -> crate::Result<Option<Vec<u8>>> {
+    read_opened(path, max, admit, past, Links::Refuse)
+}
+
+/// [`read_admitted_past`], doing `links` with a symlink at `path`: the file it opens, followed
+/// or not, is the one admitted and read.
+fn read_opened(
+    path: &Path,
+    max: usize,
+    admit: Admit,
+    past: Past,
+    links: Links,
+) -> crate::Result<Option<Vec<u8>>> {
+    let nofollow = if links == Links::Refuse {
+        libc::O_NOFOLLOW
+    } else {
+        0
+    };
     let file = match OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .custom_flags(nofollow | libc::O_NONBLOCK)
         .open(path)
     {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+        Err(e) if links == Links::Refuse && e.raw_os_error() == Some(libc::ELOOP) => {
             return Err(Error::new(format!(
                 "{}: is a symlink; refused",
                 path.display()
@@ -111,6 +141,11 @@ fn read_admitted_past(
     }
     match admit {
         Admit::Any => {}
+        Admit::AtermConfig => {
+            if let Some(why) = aterm_types::dirs::aterm_config_file_refusal(&meta) {
+                return Err(Error::new(format!("{}: {why}", path.display())));
+            }
+        }
         Admit::Private | Admit::Owned => {
             if meta.uid() != euid() {
                 return Err(Error::new(format!(
@@ -177,6 +212,15 @@ pub fn read_owned(path: &Path, max: usize) -> crate::Result<Option<Vec<u8>>> {
     read_admitted(path, max, Admit::Owned)
 }
 
+/// `aterm.toml` at `path`, up to `max` bytes, as every reader of it reads it, the window's
+/// settings included: a symlink there (a dotfiles checkout, home-manager) is followed, and the
+/// file it ends at must be a regular file owned by this user or by root with no group/other
+/// write bits ([`aterm_types::dirs::aterm_config_refusal`]), such as the read-only file
+/// home-manager links from its store.
+pub fn read_aterm_config(path: &Path, max: usize) -> crate::Result<Option<Vec<u8>>> {
+    read_opened(path, max, Admit::AtermConfig, Past::Refuse, Links::Follow)
+}
+
 /// [`read_owned`] that keeps the first `max` bytes of a longer file instead of refusing it.
 pub fn read_owned_head(path: &Path, max: usize) -> crate::Result<Option<Vec<u8>>> {
     read_admitted_past(path, max, Admit::Owned, Past::Head)
@@ -201,6 +245,51 @@ pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> crate::Result<()> {
         .map_err(|e| Error::new(format!("{}: {e}", path.display())))
 }
 
+/// Opens or creates a `0600` regular lock file at `path` (`O_NOFOLLOW | O_NONBLOCK`), verifying
+/// ownership and a single hard link, narrowing its permissions to `0600`, and keeping its
+/// descriptor out of child processes.
+pub(crate) fn open_lock(path: &Path) -> crate::Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+    if !metadata.file_type().is_file() {
+        return Err(Error::new(format!(
+            "{}: not a regular file",
+            path.display()
+        )));
+    }
+    if metadata.uid() != euid() {
+        return Err(Error::new(format!(
+            "{}: owned by uid {}, not this user",
+            path.display(),
+            metadata.uid()
+        )));
+    }
+    if metadata.nlink() != 1 {
+        return Err(Error::new(format!(
+            "{}: has {} hard links",
+            path.display(),
+            metadata.nlink()
+        )));
+    }
+    if metadata.mode() & 0o7777 != 0o600 {
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+    }
+    aterm_uds::keep_out_of_children(&file)
+        .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+    Ok(file)
+}
+
 /// Append `bytes` to the regular file at `path` (never through a symlink) while it is still
 /// `len` bytes long, and make them durable ([`aterm_durable::durable_data`]). A file of another
 /// length is left as it is: its writer was not the one that last read or wrote it.
@@ -209,13 +298,27 @@ pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> crate::Result<()> {
 /// The file is missing, not `len` bytes long, or the open, write or flush fails. A write cut
 /// short leaves part of `bytes` on the end of the file; its writer replaces the file whole then.
 pub fn append_at(path: &Path, len: u64, bytes: &[u8]) -> crate::Result<()> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())
+        && kind(parent)? != Kind::Dir
+    {
+        return Err(Error::new(format!(
+            "{}: no such directory",
+            parent.display()
+        )));
+    }
     let appended = OpenOptions::new()
         .append(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .and_then(|mut file| {
             let metadata = file.metadata()?;
-            if !metadata.file_type().is_file() || metadata.len() != len {
+            if !metadata.file_type().is_file()
+                || metadata.uid() != euid()
+                || metadata.nlink() != 1
+                || metadata.mode() & 0o077 != 0
+                || metadata.mode() & 0o6000 != 0
+                || metadata.len() != len
+            {
                 return Err(io::Error::other("not the file this writer last left"));
             }
             file.write_all(bytes)?;
@@ -536,6 +639,40 @@ mod tests {
                 .expect("ok")
                 .is_none()
         );
+
+        let lock_path = root.path().join("state.lock");
+        std::fs::write(&lock_path, b"").expect("seed lock");
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o644))
+            .expect("widen lock");
+        let _lock = open_lock(&lock_path).expect("open_lock");
+        assert_eq!(
+            std::fs::symlink_metadata(&lock_path).expect("meta").mode() & 0o7777,
+            0o600
+        );
+        let lock_hard = root.path().join("state.lock.hard");
+        std::fs::hard_link(&lock_path, &lock_hard).expect("hard link lock");
+        assert!(open_lock(&lock_path).is_err());
+        std::fs::remove_file(&lock_hard).expect("rm hard link lock");
+
+        let append_file = root.path().join("append.bin");
+        write_atomic(&append_file, b"head", 0o600).expect("write append");
+        append_at(&append_file, 4, b"-tail").expect("append private");
+        assert_eq!(std::fs::read(&append_file).expect("read"), b"head-tail");
+        std::fs::set_permissions(&append_file, std::fs::Permissions::from_mode(0o644))
+            .expect("widen append");
+        assert!(append_at(&append_file, 9, b"!").is_err());
+        std::fs::set_permissions(&append_file, std::fs::Permissions::from_mode(0o600))
+            .expect("restore append");
+        let append_hard = root.path().join("append.hard");
+        std::fs::hard_link(&append_file, &append_hard).expect("hard link append");
+        assert!(append_at(&append_file, 9, b"!").is_err());
+        std::fs::remove_file(&append_hard).expect("rm hard link append");
+        let real_dir = root.path().join("real-dir");
+        std::fs::create_dir(&real_dir).expect("real dir");
+        write_atomic(&real_dir.join("in.bin"), b"abcd", 0o600).expect("seed in");
+        let link_dir = root.path().join("link-dir");
+        std::os::unix::fs::symlink(&real_dir, &link_dir).expect("symlink dir");
+        assert!(append_at(&link_dir.join("in.bin"), 4, b"ef").is_err());
     }
 
     /// A read fills one buffer sized from the file's length, a byte over so it sees the end

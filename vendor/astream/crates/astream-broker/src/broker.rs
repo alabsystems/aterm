@@ -1348,74 +1348,261 @@ enum Endpoint {
     },
 }
 
-/// A filesystem object's identity, device and inode: what makes "this name still
-/// points at OUR listener" checkable after an embedder or another broker may have
-/// replaced the name.
+/// A filesystem object's identity, device and inode, and its birth where the
+/// filesystem records one: what makes "this name still points at OUR listener"
+/// checkable after an embedder or another broker may have replaced the name. The birth
+/// tells apart a file given an inode number another one just freed (ext4 reissues one
+/// at once).
 #[cfg(unix)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct SocketNode {
     dev: u64,
     ino: u64,
+    born: Option<std::time::SystemTime>,
+}
+
+#[cfg(unix)]
+impl SocketNode {
+    /// The identity of what one metadata read describes.
+    fn of(m: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            dev: m.dev(),
+            ino: m.ino(),
+            born: m.created().ok(),
+        }
+    }
 }
 
 /// The identity of whatever `path` names now, WITHOUT following a symlink (a symlink
 /// planted at the name is not the listener).
 #[cfg(unix)]
 fn node_at(path: &Path) -> Option<SocketNode> {
-    use std::os::unix::fs::MetadataExt;
-    let Ok(m) = std::fs::symlink_metadata(path) else {
-        return None;
-    };
-    Some(SocketNode {
-        dev: m.dev(),
-        ino: m.ino(),
+    node_read(path).ok()
+}
+
+/// [`node_at`], with the read's error.
+#[cfg(unix)]
+fn node_read(path: &Path) -> io::Result<SocketNode> {
+    std::fs::symlink_metadata(path).map(|m| SocketNode::of(&m))
+}
+
+/// Make `path` free for a broker's socket, or say why it is not: a file that is not a
+/// socket is `AlreadyExists` and never removed, a socket a broker answers on or one
+/// nothing shows stale is `AddrInUse`, and a stale socket (no socket is bound to it any
+/// more: a crashed broker's) is removed, only while `path` still names it.
+///
+/// A stream connect is no liveness probe: a full listener backlog refuses it on
+/// macOS and can wait indefinitely on Linux. A nonblocking datagram connect is
+/// refused only when no socket at all is bound to the file; a bound stream socket
+/// fails it by type (`EPROTOTYPE`), and a bound datagram takes it. Any other failure
+/// (`EAGAIN`, `EINPROGRESS`, `EALREADY`, `EINTR`, `EACCES`, `EMFILE`) proves nothing
+/// stale, so the socket stays. This probe never queues a stream connection.
+#[cfg(unix)]
+fn claim_socket_path(path: &Path) -> io::Result<()> {
+    claim_socket_path_with(path, |path| {
+        let probe = std::os::unix::net::UnixDatagram::unbound()?;
+        kept_from_children(&probe)?;
+        probe.set_nonblocking(true)?;
+        probe.connect(path)
     })
 }
 
-/// Unlink `path` only while it still names the listener `node`. Narrow, not atomic: a
-/// replacement between the check and the unlink loses — the same window the
-/// unconditional unlink it replaced held open for the whole of shutdown.
 #[cfg(unix)]
-fn unlink_if_listener(path: &Path, node: SocketNode) {
+fn claim_socket_path_with(
+    path: &Path,
+    probe: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return Ok(());
+    };
+    if !meta.file_type().is_socket() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "{}: exists and is not a socket; refusing to replace it",
+                path.display()
+            ),
+        ));
+    }
+    match probe(path) {
+        Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        outcome => {
+            let why = match outcome {
+                Ok(()) => "a live datagram socket accepted the probe".to_string(),
+                Err(error) => error.to_string(),
+            };
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!(
+                    "{}: a socket nothing shows stale (the nonblocking probe: {why}); refusing \
+                     to replace it",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    #[cfg(test)]
+    serve_hook(ServeAt::Judged);
+    unlink_if_node(path, SocketNode::of(&meta));
+    Ok(())
+}
+
+/// The `n` the next private socket name takes ([`private_socket_name`]).
+#[cfg(unix)]
+static PRIVATE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// How many private names [`Broker::bind_unix`] tries before it binds the path itself.
+#[cfg(unix)]
+const PRIVATE_TRIES: usize = 4;
+
+/// `<path>.<pid>.<n>`, the sibling name [`Broker::bind_unix`] binds under before `path`
+/// names the listener; `None` when it is too long for a socket address (`SUN_LEN`).
+#[cfg(unix)]
+fn private_socket_name(path: &Path) -> Option<PathBuf> {
+    let mut name = path.as_os_str().to_os_string();
+    let n = PRIVATE_SEQ.fetch_add(1, Ordering::Relaxed);
+    name.push(format!(".{}.{n}", std::process::id()));
+    let name = PathBuf::from(name);
+    std::os::unix::net::SocketAddr::from_pathname(&name)
+        .is_ok()
+        .then_some(name)
+}
+
+/// Whether `name` is a private socket name of `file`'s: `<file>.<digits>.<digits>`.
+#[cfg(unix)]
+fn is_private_name(file: &std::ffi::OsStr, name: &std::ffi::OsStr) -> bool {
+    let Some(rest) = name
+        .as_encoded_bytes()
+        .strip_prefix(file.as_encoded_bytes())
+        .and_then(|rest| rest.strip_prefix(b"."))
+    else {
+        return false;
+    };
+    let mut numbers = rest.split(|byte| *byte == b'.');
+    let mut number = || {
+        numbers
+            .next()
+            .is_some_and(|n| !n.is_empty() && n.iter().all(u8::is_ascii_digit))
+    };
+    number() && number() && numbers.next().is_none()
+}
+
+/// Remove the stale private names a broker killed inside [`Broker::bind_unix`] left
+/// beside `path` (each through [`claim_socket_path`], so a live one, or a file that is
+/// not a socket, stays): left, one would hold its name against a later process that
+/// gets the same pid.
+#[cfg(unix)]
+fn clear_private_names(path: &Path) {
+    let (Some(dir), Some(file)) = (path.parent(), path.file_name()) else {
+        return;
+    };
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if is_private_name(file, &entry.file_name()) {
+            let _ = claim_socket_path(&entry.path());
+        }
+    }
+}
+
+/// A listener bound under a private name of `path`'s, and that name: the next name
+/// when one is taken (a process with this pid in another pid namespace, sharing the
+/// directory), up to [`PRIVATE_TRIES`]. `None` when no name fits a socket address or
+/// one cannot be bound for another reason.
+#[cfg(unix)]
+fn bind_private(path: &Path) -> Option<(UnixListener, PathBuf)> {
+    for _ in 0..PRIVATE_TRIES {
+        let private = private_socket_name(path)?;
+        match UnixListener::bind(&private) {
+            Ok(listener) => return Some((listener, private)),
+            Err(e) if e.kind() == io::ErrorKind::AddrInUse => {}
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+/// How many times [`link_into_place`] links before it gives up on a path that each
+/// claim found free.
+#[cfg(unix)]
+const LINK_TRIES: usize = 3;
+
+/// Give the listener bound at `private` the name `path` with `link(2)`, which never
+/// replaces a name. A name already there goes through [`claim_socket_path`]: a live
+/// socket or a file that is not a socket is refused, as when `serve` finds it first,
+/// and a stale socket is removed and the link tried again. `None` when the filesystem
+/// refuses the link for another reason: the caller binds `path` itself.
+#[cfg(unix)]
+fn link_into_place(private: &Path, path: &Path) -> Option<io::Result<()>> {
+    for _ in 0..LINK_TRIES {
+        match std::fs::hard_link(private, path) {
+            Ok(()) => return Some(Ok(())),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(_) => return None,
+        }
+        if let Err(e) = claim_socket_path(path) {
+            return Some(Err(e));
+        }
+    }
+    Some(Err(io::Error::new(
+        io::ErrorKind::AddrInUse,
+        format!(
+            "{}: a stale socket was put at this path each time the broker linked its own",
+            path.display()
+        ),
+    )))
+}
+
+/// Unlink `path` only while it still names `node`. Narrow, not atomic: a replacement
+/// between the check and the unlink loses — the same window the unconditional unlink
+/// it replaced held open.
+#[cfg(unix)]
+fn unlink_if_node(path: &Path, node: SocketNode) {
     if node_at(path) == Some(node) {
         let _ = crate::store::remove_file_path(path);
     }
 }
 
-/// Give the listener at `socket` (identity `node`) a second name this broker owns,
+/// Give the listener `from` names (identity `node`) a second name this broker owns,
 /// `<socket>.wake`, so shutdown can dial the blocking acceptor out of `accept()` even
-/// after the embedder unlinked `socket`. A hard link: the same inode, so the same
-/// permissions — it lets in nobody the socket path does not (a peer could reach it
-/// only through the same directory), except after an embedder unlinks the path to
-/// hide a broker it means to keep running, which nothing in astream or aterm does.
+/// after the embedder unlinked `socket`. `from` is the listener's private name while it
+/// has one, which no other process can replace, else `socket` itself. A hard link: the
+/// same inode, so the same permissions — it lets in nobody the socket path does not (a
+/// peer could reach it only through the same directory), except after an embedder
+/// unlinks the path to hide a broker it means to keep running, which nothing in astream
+/// or aterm does.
 ///
 /// `None` — and the listener polls — when that name cannot be had safely:
 /// - `<socket>.wake` is too long for a socket address (`SUN_LEN`), so it could never
 ///   be dialed;
 /// - something that is not a socket is there (a user's file: never removed, exactly
 ///   as `serve` treats its own path);
-/// - a LIVE socket is there: another broker's wake name (its embedder unlinked the
-///   socket path and this broker bound a new one), which that broker's shutdown needs;
-/// - the filesystem refuses the link, or the link does not land on `node` (the socket
-///   path changed between the bind and the link).
+/// - a LIVE socket, or one nothing shows stale, is there ([`claim_socket_path`]):
+///   another broker's wake name (its embedder unlinked the socket path and this broker
+///   bound a new one), which that broker's shutdown needs;
+/// - the filesystem refuses the link, or the link does not land on `node` (`from`
+///   changed between the bind and the link).
 ///
-/// A STALE socket there (nobody answers: a broker that crashed or was killed) is
-/// removed, as `serve` removes a stale socket at its own path.
+/// A STALE socket there (a broker that crashed or was killed) is removed, as `serve`
+/// removes a stale socket at its own path.
 #[cfg(unix)]
-fn link_wake_name(socket: &Path, node: SocketNode) -> Option<PathBuf> {
-    use std::os::unix::fs::FileTypeExt;
+fn link_wake_name(from: &Path, socket: &Path, node: SocketNode) -> Option<PathBuf> {
     let mut wake = socket.to_path_buf();
     wake.as_mut_os_string().push(".wake");
     if std::os::unix::net::SocketAddr::from_pathname(&wake).is_err() {
         return None;
     }
-    if let Ok(meta) = std::fs::symlink_metadata(&wake) {
-        if !meta.file_type().is_socket() || UnixStream::connect(&wake).is_ok() {
-            return None;
-        }
-        let _ = crate::store::remove_file_path(&wake); // stale: nobody answers
-    }
-    if std::fs::hard_link(socket, &wake).is_err() {
+    claim_socket_path(&wake).ok()?;
+    if std::fs::hard_link(from, &wake).is_err() {
         return None;
     }
     if node_at(&wake) != Some(node) {
@@ -2187,6 +2374,47 @@ fn tail_pause_at(pause: &mut Option<TailPause>, at: PauseAt, cursor: u64) {
                 let _ = p.resume.recv();
             }
         }
+    }
+}
+
+/// TEST SEAM: a moment inside `serve` at which another process could change what its
+/// socket path names, where a hook a unit test armed on this thread runs
+/// ([`SERVE_HOOKS`]).
+#[cfg(all(test, unix))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ServeAt {
+    /// [`claim_socket_path`] judged the socket at a path stale, before removing it.
+    Judged,
+    /// The listener is bound (under its private name, or at the path itself), before
+    /// its identity is read and before the path names it.
+    Bound,
+    /// The path names the listener and its wake name is made, before `serve` goes on.
+    Linked,
+}
+
+/// TEST SEAM: what a unit test runs at a [`ServeAt`].
+#[cfg(all(test, unix))]
+pub(crate) type ServeHook = Box<dyn FnOnce()>;
+
+#[cfg(all(test, unix))]
+thread_local! {
+    /// TEST SEAM: the hooks a unit test armed for the `serve` it calls on this thread, each
+    /// run once, in order, at the first [`ServeAt`] it names. Each runs on `serve`'s own
+    /// thread with no lock held, so a hook that panics fails its test and never hangs it.
+    pub(crate) static SERVE_HOOKS: std::cell::RefCell<Vec<(ServeAt, ServeHook)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Run the first hook armed at `at` on this thread, if there is one.
+#[cfg(all(test, unix))]
+fn serve_hook(at: ServeAt) {
+    let hook = SERVE_HOOKS.with(|hooks| {
+        let mut hooks = hooks.borrow_mut();
+        let first = hooks.iter().position(|(when, _)| *when == at)?;
+        Some(hooks.remove(first).1)
+    });
+    if let Some(hook) = hook {
+        hook();
     }
 }
 
@@ -5595,51 +5823,22 @@ impl Broker {
 
     /// Bind the Unix socket at `socket_path` and start accepting clients. Returns a
     /// [`BrokerHandle`] that shuts the broker down and unlinks the socket on demand.
-    /// A leftover socket file is unlinked only if nobody answers on it (stale, from a
-    /// crashed broker); a LIVE broker there is `AddrInUse`, never silently displaced,
-    /// and a path that is not a socket at all is `AlreadyExists`, never removed.
+    /// A leftover socket file is unlinked only if no socket is bound to it any more
+    /// (stale, from a crashed broker); a LIVE broker there, or a socket nothing shows
+    /// stale, is `AddrInUse`, never silently displaced, and a path that is not a socket
+    /// at all is `AlreadyExists`, never removed. That holds for one put there while
+    /// `serve` binds, too: the listener is bound under a private sibling name and then
+    /// linked into place, which replaces nothing. Only where that name cannot be had
+    /// (too long for a socket address, or a filesystem without hard links) does `serve`
+    /// bind the path itself, and then a socket renamed over the path just after that
+    /// bind is taken as its own, and a path removed just after it is `NotFound`.
     /// cfg(unix): std has no Unix-domain sockets on Windows — use
     /// [`serve_tcp`](Self::serve_tcp) there.
     #[cfg(unix)]
     pub fn serve(&self, socket_path: impl AsRef<Path>) -> io::Result<BrokerHandle> {
-        use std::os::unix::fs::FileTypeExt;
         let socket_path = socket_path.as_ref().to_path_buf();
-        if let Ok(meta) = std::fs::symlink_metadata(&socket_path) {
-            if !meta.file_type().is_socket() {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!(
-                        "{}: exists and is not a socket; refusing to replace it",
-                        socket_path.display()
-                    ),
-                ));
-            }
-            match UnixStream::connect(&socket_path) {
-                Ok(_live) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AddrInUse,
-                        format!(
-                            "{}: a broker is already listening on this socket",
-                            socket_path.display()
-                        ),
-                    ))
-                }
-                Err(_) => {
-                    let _ = crate::store::remove_file_path(&socket_path); // stale: nobody answers
-                }
-            }
-        }
-        let listener = UnixListener::bind(&socket_path)?;
-        // Out of every child this process spawns: a child's exec-time close of its copy,
-        // under a descriptor scan, drains the listener and every connection it accepts.
-        kept_from_children(&listener)?;
-        // The wake name first: without one, shutdown could not reach a blocking
-        // acceptor once the embedder unlinked `socket_path`, so the listener polls.
-        let node = node_at(&socket_path);
-        let wake = match node {
-            Some(n) => link_wake_name(&socket_path, n),
-            None => None,
-        };
+        claim_socket_path(&socket_path)?;
+        let (listener, node, wake) = Self::bind_unix(&socket_path)?;
         let polls = wake.is_none();
         if let Err(e) = listener.set_nonblocking(polls) {
             if let Some(w) = &wake {
@@ -5731,6 +5930,79 @@ impl Broker {
                 wake,
             },
         })
+    }
+
+    /// Bind the listener [`serve`](Self::serve) publishes at `path`, with its identity,
+    /// read before `path` names it, and its wake name ([`link_wake_name`]). Bound under
+    /// a private sibling name, `<path>.<pid>.<n>`, which no other process knows, so the
+    /// identity read there is the listener's own; then given `path` by
+    /// [`link_into_place`], which never replaces a socket put there meanwhile, and its
+    /// wake name from the private name; then the private name is removed. A stale one a
+    /// killed broker left beside `path` is removed first ([`clear_private_names`]).
+    ///
+    /// Bound at `path` itself, its identity read there after the bind, when no private
+    /// name fits a socket address (`SUN_LEN`), none can be bound, or it cannot be
+    /// linked for another reason than a name already at `path`. A socket renamed over
+    /// `path` between that bind and that read is taken as the listener's own; a path
+    /// removed in between is `NotFound`, since no client could reach the listener.
+    ///
+    /// Either way the listener is kept from every child this process spawns before
+    /// `path` names it: a child's exec-time close of its copy, under a descriptor scan,
+    /// drains the listener and every connection it accepts.
+    #[cfg(unix)]
+    fn bind_unix(path: &Path) -> io::Result<(UnixListener, Option<SocketNode>, Option<PathBuf>)> {
+        clear_private_names(path);
+        if let Some((listener, private)) = bind_private(path) {
+            #[cfg(test)]
+            serve_hook(ServeAt::Bound);
+            let node = node_at(&private);
+            let placed = match kept_from_children(&listener) {
+                Ok(()) => link_into_place(&private, path),
+                Err(e) => Some(Err(e)),
+            };
+            let wake = match (&placed, node) {
+                (Some(Ok(())), Some(n)) => link_wake_name(&private, path, n),
+                _ => None,
+            };
+            let _ = crate::store::remove_file_path(&private);
+            if let Some(placed) = placed {
+                placed?;
+                #[cfg(test)]
+                serve_hook(ServeAt::Linked);
+                return Ok((listener, node, wake));
+            }
+        }
+        let listener = UnixListener::bind(path)?;
+        #[cfg(test)]
+        serve_hook(ServeAt::Bound);
+        let node = match node_read(path) {
+            Ok(n) => Some(n),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "{}: removed as the broker bound it, so no client can reach its listener",
+                        path.display()
+                    ),
+                ));
+            }
+            Err(_) => None,
+        };
+        if let Err(e) = kept_from_children(&listener) {
+            if let Some(n) = node {
+                unlink_if_node(path, n);
+            }
+            return Err(e);
+        }
+        let wake = node.and_then(|n| link_wake_name(path, path, n));
+        #[cfg(test)]
+        serve_hook(ServeAt::Linked);
+        Ok((listener, node, wake))
     }
 
     /// Like [`serve`](Self::serve) but over TCP — multi-machine, PLAINTEXT and
@@ -6339,6 +6611,34 @@ impl BrokerHandle {
         }
     }
 
+    /// Whether the socket path `serve` bound names this listener now, by the identity
+    /// `serve` read before the path named it: `Some(false)` once the path was unlinked,
+    /// or another socket (or anything else) is there. A symlink there is followed, as a
+    /// client's connect follows it: one to this listener's own socket names it. `None`
+    /// when that cannot be told: TCP, a Unix listener whose identity `serve` could not
+    /// read, or a read of the path that failed otherwise than by its absence.
+    pub fn names_listener(&self) -> Option<bool> {
+        match &self.endpoint {
+            Endpoint::Tcp { .. } => None,
+            #[cfg(unix)]
+            Endpoint::Unix { path, node, .. } => {
+                let node = (*node)?;
+                match std::fs::metadata(path) {
+                    Ok(now) => Some(SocketNode::of(&now) == node),
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                        ) =>
+                    {
+                        Some(false)
+                    }
+                    Err(_) => None,
+                }
+            }
+        }
+    }
+
     /// Whether this listener's acceptor blocks in `accept()` — a new connection is
     /// taken the instant it arrives and an idle listener never wakes. Always `true` for
     /// TCP. `false` for a Unix socket that could not get its `<socket>.wake` name — too
@@ -6503,23 +6803,24 @@ impl BrokerHandle {
         // THIS listener: the embedder may have unlinked the path, and another broker
         // may since have bound its own socket there. An ABANDONED acceptor leaves the
         // socket path alone: no dial through it reached this acceptor, so a path that
-        // still carries `node` names some other broker's socket — the winner of a
-        // `serve` that raced this one past its bind, whose inode this one recorded.
-        // The wake name is this broker's own (it made the link) whatever it names.
+        // still carries `node` names some other socket — one renamed over the path
+        // between this listener's bind there and its identity read (`bind_unix`'s
+        // fallback), whose inode this one recorded. The wake name is this broker's own
+        // (it made the link) whatever it names. A listener whose identity `serve` could
+        // not read removes nothing: it cannot tell its own socket at the path from
+        // another's, and its own, left stale, is removed by the next `serve`.
         #[cfg(unix)]
-        if let Endpoint::Unix { path, node, wake } = &self.endpoint {
-            match node {
-                Some(node) => {
-                    if reached {
-                        unlink_if_listener(path, *node);
-                    }
-                    if let Some(w) = wake {
-                        unlink_if_listener(w, *node);
-                    }
-                }
-                None => {
-                    let _ = crate::store::remove_file_path(path);
-                }
+        if let Endpoint::Unix {
+            path,
+            node: Some(node),
+            wake,
+        } = &self.endpoint
+        {
+            if reached {
+                unlink_if_node(path, *node);
+            }
+            if let Some(w) = wake {
+                unlink_if_node(w, *node);
             }
         }
     }
@@ -12379,15 +12680,15 @@ mod tests {
         drop(TcpStream::connect(own).unwrap());
     }
 
-    /// The Unix face of the same rule: a `serve` that a second `serve` on the same path
-    /// raced past its bind — the other's stale check met this socket between bind()
-    /// and listen(), removed it, and bound its own before this one read the path's
-    /// inode — records the OTHER socket's inode, so its names pass every identity check
-    /// and its wakeup dials connect, to the other broker. Built here directly: the
-    /// listener nameless, the endpoint naming a stranger's socket and a wake name
-    /// linked to it. Shutdown must give up after [`ACCEPT_WAKE_ATTEMPTS`] unanswered
-    /// rounds, and leave the socket path alone — no dial through it ever reached this
-    /// acceptor, so it is the other broker's — while removing the wake name it made.
+    /// The Unix face of the same rule: a `serve` that bound the path itself (its private
+    /// name unusable, [`Broker::bind_unix`]) and over whose path another process renamed
+    /// its own listening socket before this one read the path's inode records the OTHER
+    /// socket's inode, so its names pass every identity check and its wakeup dials
+    /// connect, to the other listener. Built here directly: the listener nameless, the
+    /// endpoint naming a stranger's socket and a wake name linked to it. Shutdown must
+    /// give up after [`ACCEPT_WAKE_ATTEMPTS`] unanswered rounds, and leave the socket
+    /// path alone — no dial through it ever reached this acceptor, so it is the other
+    /// listener's — while removing the wake name it made.
     #[cfg(unix)]
     #[test]
     fn a_unix_wake_dial_another_listener_answers_is_not_redialed_forever() {
@@ -12446,6 +12747,570 @@ mod tests {
             took, ACCEPT_WAKE_ATTEMPTS as usize,
             "wakeup dials the stranger took"
         );
+    }
+
+    /// Removes each path and every `<path>.*` name beside it when dropped, so a test
+    /// leaves nothing behind whether it passes or panics: the names a broker made for
+    /// it, and a private one left by a test that failed inside `serve`. Each path is a
+    /// test's own.
+    #[cfg(unix)]
+    struct Leaves(Vec<String>);
+
+    #[cfg(unix)]
+    impl Drop for Leaves {
+        fn drop(&mut self) {
+            for path in &self.0 {
+                for name in sibling_names(path) {
+                    let _ = std::fs::remove_file(format!("{path}.{name}"));
+                }
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    /// Two socket paths under /tmp for one test, `<tag>`'s own (a Darwin TMPDIR can push
+    /// a socket path past SUN_LEN): the broker's, and the foreign socket's it renames in.
+    #[cfg(unix)]
+    fn renamed_in_paths(tag: &str) -> (Leaves, String, String) {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let k = SEQ.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let ours = format!("/tmp/asb_unit_{tag}_{pid}_{k}_a.sock");
+        let theirs = format!("/tmp/asb_unit_{tag}_{pid}_{k}_s.sock");
+        (Leaves(vec![ours.clone(), theirs.clone()]), ours, theirs)
+    }
+
+    /// The longest socket path under /tmp a socket address holds, `<tag>`'s own: its
+    /// private name and its wake name fit none, so `serve` binds the path itself.
+    #[cfg(unix)]
+    fn longest_socket_path(tag: &str) -> String {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let k = SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut path = format!("/tmp/asb_unit_{tag}_{}_{k}_", std::process::id());
+        while std::os::unix::net::SocketAddr::from_pathname(format!("{path}x")).is_ok() {
+            path.push('x');
+        }
+        assert!(
+            private_socket_name(Path::new(&path)).is_none(),
+            "{path}: a private name fits"
+        );
+        path
+    }
+
+    /// Serve `b` at `path` with `hooks` armed on this thread, each run once, in order,
+    /// at the first [`ServeAt`] it names ([`SERVE_HOOKS`]); every one must have run.
+    #[cfg(unix)]
+    fn serve_with(
+        b: &Broker,
+        path: &str,
+        hooks: Vec<(ServeAt, ServeHook)>,
+    ) -> io::Result<BrokerHandle> {
+        SERVE_HOOKS.with(|armed| *armed.borrow_mut() = hooks);
+        let served = b.serve(path);
+        let left: Vec<ServeAt> =
+            SERVE_HOOKS.with(|armed| armed.borrow_mut().drain(..).map(|(at, _)| at).collect());
+        assert!(left.is_empty(), "serve never reached {left:?}");
+        served
+    }
+
+    /// A hook that renames `from` over `to`.
+    #[cfg(unix)]
+    fn rename(from: &str, to: &str) -> ServeHook {
+        let (from, to) = (from.to_string(), to.to_string());
+        Box::new(move || std::fs::rename(&from, &to).unwrap())
+    }
+
+    /// What else is named `<path>.*` beside `path`: the names a broker made for it.
+    #[cfg(unix)]
+    fn sibling_names(path: &str) -> Vec<String> {
+        let path = Path::new(path);
+        let (Some(dir), Some(file)) = (path.parent(), path.file_name()) else {
+            return Vec::new();
+        };
+        let prefix = format!("{}.", file.to_string_lossy());
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                name.strip_prefix(&prefix).map(str::to_string)
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A LIVE socket renamed over the path while `serve` is between its bind and its
+    /// path naming its listener — another broker putting its own in place — is never
+    /// taken as this broker's: `serve` answers `AddrInUse`, as for a live socket it
+    /// finds there first, and leaves that socket at the path and no name of its own.
+    #[cfg(unix)]
+    #[test]
+    fn a_live_socket_renamed_over_the_path_while_serve_binds_is_refused() {
+        let (_names, ours, theirs) = renamed_in_paths("rnl");
+        let root = crate::test_scratch::Scratch::new("renamed-live");
+        let b = Broker::open_with(root.path().join("log"), Durability::Relaxed).unwrap();
+        let _foreign = UnixListener::bind(&theirs).unwrap();
+        let node = node_at(Path::new(&theirs)).unwrap();
+        let err = serve_with(&b, &ours, vec![(ServeAt::Bound, rename(&theirs, &ours))])
+            .err()
+            .expect("serve took a live socket renamed over its path as its own");
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse, "{err}");
+        assert_eq!(
+            node_at(Path::new(&ours)),
+            Some(node),
+            "the live socket stays at the path"
+        );
+        assert_eq!(sibling_names(&ours), Vec::<String>::new(), "names left");
+    }
+
+    /// Linux's full stream backlog reports EAGAIN to a nonblocking attempt; an
+    /// interrupted, in-progress or otherwise inconclusive probe is equally no
+    /// permission to unlink. Inject the outcomes without waiting on a live queue.
+    /// The definitive stale control still removes the captured socket node.
+    #[cfg(unix)]
+    #[test]
+    fn an_inconclusive_nonblocking_probe_never_reclaims_a_socket() {
+        let (_names, ours, _) = renamed_in_paths("probe-unknown");
+        drop(UnixListener::bind(&ours).unwrap());
+        let node = node_at(Path::new(&ours)).unwrap();
+        for (kind, why) in [
+            (io::ErrorKind::WouldBlock, "Linux full listener backlog"),
+            (io::ErrorKind::Interrupted, "interrupted attempt"),
+            (io::ErrorKind::PermissionDenied, "permission withheld"),
+            (
+                io::ErrorKind::Other,
+                "in-progress or already-pending connection",
+            ),
+        ] {
+            let mut probes = 0;
+            let error = claim_socket_path_with(Path::new(&ours), |_| {
+                probes += 1;
+                Err(io::Error::new(kind, why))
+            })
+            .expect_err("inconclusive evidence keeps the socket");
+            assert_eq!(error.kind(), io::ErrorKind::AddrInUse, "{why}");
+            assert_eq!(probes, 1, "the probe is never retried: {why}");
+            assert_eq!(node_at(Path::new(&ours)), Some(node), "{why}");
+        }
+        assert!(claim_socket_path_with(Path::new(&ours), |_| Ok(())).is_err());
+        assert_eq!(
+            node_at(Path::new(&ours)),
+            Some(node),
+            "a live datagram stays"
+        );
+        claim_socket_path_with(Path::new(&ours), |_| {
+            Err(io::ErrorKind::ConnectionRefused.into())
+        })
+        .unwrap();
+        assert_eq!(
+            node_at(Path::new(&ours)),
+            None,
+            "the definitive stale control"
+        );
+    }
+
+    /// Cleanup of a live private sibling does not dial its stream listener. Such
+    /// a dial would queue here and could block forever once a Linux queue is full.
+    /// No latency assertion is needed: a queued stream connection is the failure.
+    #[cfg(unix)]
+    #[test]
+    fn a_live_private_sibling_keeps_its_accept_queue_untouched() {
+        let (_names, ours, _) = renamed_in_paths("probe-private");
+        let private = format!("{ours}.1.0");
+        let listener = UnixListener::bind(&private).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let node = node_at(Path::new(&private)).unwrap();
+        let root = crate::test_scratch::Scratch::new("private-probe");
+        let broker = Broker::open_with(root.path().join("log"), Durability::Relaxed).unwrap();
+        let mut handle = broker
+            .serve(&ours)
+            .expect("a live sibling cannot hold up serving");
+        assert_eq!(
+            node_at(Path::new(&private)),
+            Some(node),
+            "the live sibling remains"
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "cleanup must never enqueue a stream connect"
+        );
+        assert_eq!(handle.names_listener(), Some(true));
+        handle.shutdown();
+    }
+
+    /// The same window, a STALE socket renamed in (no socket bound to it: what a killed
+    /// broker leaves): `serve` removes it, as it removes one it finds there first, and its
+    /// own listener takes the path. [`BrokerHandle::names_listener`] says so, and says
+    /// when another socket is renamed over the path later.
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_socket_renamed_over_the_path_while_serve_binds_is_replaced() {
+        let (_names, ours, theirs) = renamed_in_paths("rns");
+        let root = crate::test_scratch::Scratch::new("renamed-stale");
+        let b = Broker::open_with(root.path().join("log"), Durability::Relaxed).unwrap();
+        drop(UnixListener::bind(&theirs).unwrap());
+        let stale = node_at(Path::new(&theirs)).unwrap();
+        let mut h = serve_with(&b, &ours, vec![(ServeAt::Bound, rename(&theirs, &ours))]).unwrap();
+        assert_ne!(
+            node_at(Path::new(&ours)),
+            Some(stale),
+            "the stale socket is still at the path"
+        );
+        assert_eq!(h.names_listener(), Some(true));
+        assert!(
+            UnixStream::connect(&ours).is_ok(),
+            "the path reaches nobody"
+        );
+        assert_eq!(sibling_names(&ours), ["wake"], "names left");
+        let _later = UnixListener::bind(&theirs).unwrap();
+        std::fs::rename(&theirs, &ours).unwrap();
+        assert_eq!(h.names_listener(), Some(false), "another socket's path");
+        h.shutdown();
+    }
+
+    /// A LIVE socket renamed over the path once `serve` linked its own there, before
+    /// `serve` returned: the identity `serve` keeps is its listener's, read under the
+    /// private name, so [`BrokerHandle::names_listener`] says the path names another
+    /// socket; the wake name, linked from the private name, names its listener, so
+    /// shutdown reaches its acceptor through it and leaves the other socket at the path.
+    #[cfg(unix)]
+    #[test]
+    fn a_socket_renamed_over_the_path_once_serve_linked_it_is_not_its_own() {
+        let (_names, ours, theirs) = renamed_in_paths("rnk");
+        let root = crate::test_scratch::Scratch::new("renamed-linked");
+        let b = Broker::open_with(root.path().join("log"), Durability::Relaxed).unwrap();
+        let _foreign = UnixListener::bind(&theirs).unwrap();
+        let foreign = node_at(Path::new(&theirs)).unwrap();
+        let mut h = serve_with(&b, &ours, vec![(ServeAt::Linked, rename(&theirs, &ours))]).unwrap();
+        assert_eq!(
+            h.names_listener(),
+            Some(false),
+            "the other socket taken as its own"
+        );
+        let Endpoint::Unix {
+            node: Some(own),
+            wake: Some(wake),
+            ..
+        } = &h.endpoint
+        else {
+            panic!("no identity, or no wake name");
+        };
+        assert_ne!(*own, foreign, "the other socket's identity kept");
+        assert_eq!(node_at(wake), Some(*own), "a wake name for another socket");
+        let wake = wake.clone();
+        h.shutdown();
+        assert_eq!(
+            b.stats().acceptors_abandoned,
+            0,
+            "shutdown never reached its acceptor"
+        );
+        assert_eq!(
+            node_at(Path::new(&ours)),
+            Some(foreign),
+            "the other socket lost the path"
+        );
+        assert_eq!(node_at(&wake), None, "the wake name is left");
+    }
+
+    /// A stale socket at the path that another broker replaces with its own LIVE one
+    /// while `serve` judges it stale, before `serve` removes it: `serve` removes only the
+    /// stale socket it judged, so the live one keeps the path, and `serve` answers
+    /// `AddrInUse`, as for a live socket it finds there first.
+    #[cfg(unix)]
+    #[test]
+    fn a_live_socket_put_in_place_of_a_stale_one_as_serve_judges_it_is_kept() {
+        let (_names, ours, aside) = renamed_in_paths("rnj");
+        let root = crate::test_scratch::Scratch::new("renamed-judged");
+        let b = Broker::open_with(root.path().join("log"), Durability::Relaxed).unwrap();
+        drop(UnixListener::bind(&ours).unwrap());
+        let live = std::rc::Rc::new(std::cell::RefCell::new(None));
+        // The stale socket is moved aside rather than unlinked, so no filesystem can give
+        // its inode number to the live one.
+        let put: ServeHook = {
+            let (live, ours) = (std::rc::Rc::clone(&live), ours.clone());
+            Box::new(move || {
+                std::fs::rename(&ours, &aside).unwrap();
+                *live.borrow_mut() = Some(UnixListener::bind(&ours).unwrap());
+            })
+        };
+        let err = serve_with(&b, &ours, vec![(ServeAt::Judged, put)])
+            .err()
+            .expect("serve displaced a live socket put at its path");
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse, "{err}");
+        assert!(live.borrow().is_some());
+        assert!(
+            UnixStream::connect(&ours).is_ok(),
+            "the live socket lost the path"
+        );
+        assert_eq!(sibling_names(&ours), Vec::<String>::new(), "names left");
+    }
+
+    /// A stream connect that fails otherwise than by refusal shows no socket stale: one
+    /// to a LIVE datagram socket fails by its type, and `serve` leaves that socket in
+    /// place and answers `AddrInUse`.
+    #[cfg(unix)]
+    #[test]
+    fn a_live_datagram_socket_at_the_path_is_not_stale() {
+        let (_names, ours, _) = renamed_in_paths("dgl");
+        let root = crate::test_scratch::Scratch::new("live-datagram");
+        let b = Broker::open_with(root.path().join("log"), Durability::Relaxed).unwrap();
+        let _datagram = std::os::unix::net::UnixDatagram::bind(&ours).unwrap();
+        let node = node_at(Path::new(&ours)).unwrap();
+        let err = b
+            .serve(&ours)
+            .err()
+            .expect("serve replaced a live datagram socket");
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse, "{err}");
+        assert_eq!(node_at(Path::new(&ours)), Some(node), "it lost the path");
+    }
+
+    /// A LIVE listener whose backlog is full refuses a stream connect as a stale socket
+    /// does (on macOS; Linux holds the connect instead), but a datagram connect fails by
+    /// its type: `serve` leaves it in place and answers `AddrInUse`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_listener_whose_backlog_is_full_is_not_stale() {
+        let (_names, ours, _) = renamed_in_paths("full");
+        let root = crate::test_scratch::Scratch::new("full-backlog");
+        let b = Broker::open_with(root.path().join("log"), Durability::Relaxed).unwrap();
+        let _full = UnixListener::bind(&ours).unwrap();
+        let node = node_at(Path::new(&ours)).unwrap();
+        let refused = (0..4096).find_map(|_| UnixStream::connect(&ours).err());
+        assert_eq!(
+            refused.map(|e| e.kind()),
+            Some(io::ErrorKind::ConnectionRefused),
+            "the backlog never filled"
+        );
+        let err = b
+            .serve(&ours)
+            .err()
+            .expect("serve replaced a listener whose backlog is full");
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse, "{err}");
+        assert_eq!(node_at(Path::new(&ours)), Some(node), "it lost the path");
+    }
+
+    /// The stale private names a broker killed inside `serve` left beside the path,
+    /// those with this process's pid and the numbers it takes next among them (its pid
+    /// reused), are removed before `serve` binds, so it binds under a private name of
+    /// its own, not the path; a live one and a file that is not a socket stay.
+    #[cfg(unix)]
+    #[test]
+    fn a_private_name_a_killed_broker_left_is_removed() {
+        let (_names, ours, _) = renamed_in_paths("prv");
+        let root = crate::test_scratch::Scratch::new("private-left");
+        let b = Broker::open_with(root.path().join("log"), Durability::Relaxed).unwrap();
+        let pid = std::process::id();
+        let next = PRIVATE_SEQ.load(Ordering::Relaxed);
+        for name in (next..next + 32)
+            .map(|n| format!("{pid}.{n}"))
+            .chain(["1.0".to_string()])
+        {
+            drop(UnixListener::bind(format!("{ours}.{name}")).unwrap());
+        }
+        let _live = UnixListener::bind(format!("{ours}.2.0")).unwrap();
+        std::fs::write(format!("{ours}.3.0"), "").unwrap();
+        let unbound: ServeHook = {
+            let ours = ours.clone();
+            Box::new(move || {
+                assert_eq!(
+                    node_at(Path::new(&ours)),
+                    None,
+                    "serve bound the path itself"
+                );
+            })
+        };
+        let mut h = serve_with(&b, &ours, vec![(ServeAt::Bound, unbound)]).unwrap();
+        assert_eq!(h.names_listener(), Some(true));
+        assert_eq!(sibling_names(&ours), ["2.0", "3.0", "wake"], "names left");
+        h.shutdown();
+    }
+
+    /// A path whose private name fits no socket address is bound itself, its identity
+    /// read there: [`BrokerHandle::names_listener`] says it names the listener, clients
+    /// reach it, and nothing is made beside it (its wake name does not fit either, so it
+    /// polls). A path removed just after that bind is `NotFound`: no client could reach
+    /// the listener, so `serve` keeps none.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_too_long_for_a_private_name_is_bound_itself() {
+        let ours = longest_socket_path("lng");
+        let _names = Leaves(vec![ours.clone()]);
+        let root = crate::test_scratch::Scratch::new("bound-itself");
+        let b = Broker::open_with(root.path().join("log"), Durability::Relaxed).unwrap();
+        let bound: ServeHook = {
+            let ours = ours.clone();
+            Box::new(move || {
+                assert!(
+                    node_at(Path::new(&ours)).is_some(),
+                    "serve did not bind the path itself"
+                );
+            })
+        };
+        let mut h = serve_with(&b, &ours, vec![(ServeAt::Bound, bound)]).unwrap();
+        assert_eq!(h.names_listener(), Some(true));
+        assert!(!h.blocks_in_accept(), "a wake name that does not fit");
+        assert!(
+            UnixStream::connect(&ours).is_ok(),
+            "the path reaches nobody"
+        );
+        assert_eq!(sibling_names(&ours), Vec::<String>::new(), "names made");
+        h.shutdown();
+        assert_eq!(node_at(Path::new(&ours)), None, "shutdown left its socket");
+
+        let root = crate::test_scratch::Scratch::new("bound-itself-removed");
+        let b = Broker::open_with(root.path().join("log"), Durability::Relaxed).unwrap();
+        let removed: ServeHook = {
+            let ours = ours.clone();
+            Box::new(move || std::fs::remove_file(&ours).unwrap())
+        };
+        let err = serve_with(&b, &ours, vec![(ServeAt::Bound, removed)])
+            .err()
+            .expect("serve kept a listener no path names");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
+    }
+
+    /// A listener whose identity `serve` could not read cannot tell its own socket at the
+    /// path from another's, so its shutdown removes nothing there. Built here directly
+    /// (a read that fails otherwise than by the path's absence has no portable cause): a
+    /// polling listener, its recorded identity cleared, and a LIVE socket renamed over
+    /// its path.
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_without_an_identity_leaves_the_path() {
+        let ours = longest_socket_path("nid");
+        let (_names, _, theirs) = renamed_in_paths("nid");
+        let _ours = Leaves(vec![ours.clone()]);
+        let root = crate::test_scratch::Scratch::new("no-identity");
+        let b = Broker::open_with(root.path().join("log"), Durability::Relaxed).unwrap();
+        let mut h = b.serve(&ours).unwrap();
+        assert!(!h.blocks_in_accept(), "a wake name that does not fit");
+        h.endpoint = Endpoint::Unix {
+            path: PathBuf::from(&ours),
+            node: None,
+            wake: None,
+        };
+        assert_eq!(h.names_listener(), None);
+        let _foreign = UnixListener::bind(&theirs).unwrap();
+        let foreign = node_at(Path::new(&theirs)).unwrap();
+        std::fs::rename(&theirs, &ours).unwrap();
+        h.shutdown();
+        assert_eq!(
+            node_at(Path::new(&ours)),
+            Some(foreign),
+            "shutdown removed a socket it could not tell from its own"
+        );
+    }
+
+    /// A file that is not a socket, put at the path while `serve` binds, is never
+    /// replaced, and `serve` answers `AlreadyExists`, as for one it finds there first:
+    /// one renamed over the path before the link, and one written there in place of a
+    /// stale socket renamed in, once `serve` judged that socket stale and before it
+    /// removed it.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_put_at_the_path_while_serve_binds_is_never_replaced() {
+        let (_names, ours, theirs) = renamed_in_paths("rnf");
+        let root = crate::test_scratch::Scratch::new("renamed-file");
+        let b = Broker::open_with(root.path().join("log"), Durability::Relaxed).unwrap();
+        std::fs::write(&theirs, "a user's file").unwrap();
+        let err = serve_with(&b, &ours, vec![(ServeAt::Bound, rename(&theirs, &ours))])
+            .err()
+            .expect("serve replaced a file renamed over its path");
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{err}");
+        assert_eq!(std::fs::read_to_string(&ours).unwrap(), "a user's file");
+        assert_eq!(sibling_names(&ours), Vec::<String>::new(), "names left");
+
+        std::fs::remove_file(&ours).unwrap();
+        drop(UnixListener::bind(&theirs).unwrap());
+        // The stale socket is moved aside rather than unlinked, so no filesystem can give
+        // its inode number to the file.
+        let write: ServeHook = {
+            let (ours, aside) = (ours.clone(), theirs.clone());
+            Box::new(move || {
+                std::fs::rename(&ours, &aside).unwrap();
+                std::fs::write(&ours, "a user's file").unwrap();
+            })
+        };
+        let hooks = vec![
+            (ServeAt::Bound, rename(&theirs, &ours)),
+            (ServeAt::Judged, write),
+        ];
+        let err = serve_with(&b, &ours, hooks)
+            .err()
+            .expect("serve replaced a file put at its path");
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{err}");
+        assert_eq!(std::fs::read_to_string(&ours).unwrap(), "a user's file");
+        assert_eq!(sibling_names(&ours), Vec::<String>::new(), "names left");
+    }
+
+    /// [`BrokerHandle::names_listener`] follows a symlink at the path, as a client's
+    /// connect does: one to this listener's own socket names it, one to another socket
+    /// or to nothing does not; and shutdown leaves the symlink.
+    #[cfg(unix)]
+    #[test]
+    fn names_listener_follows_a_symlink_as_a_client_does() {
+        let (_names, ours, theirs) = renamed_in_paths("sym");
+        let root = crate::test_scratch::Scratch::new("symlinked");
+        let b = Broker::open_with(root.path().join("log"), Durability::Relaxed).unwrap();
+        let mut h = b.serve(&ours).unwrap();
+        assert!(h.blocks_in_accept(), "no wake name to point at");
+        let point = |to: &str| {
+            std::fs::remove_file(&ours).unwrap();
+            std::os::unix::fs::symlink(to, &ours).unwrap();
+        };
+        point(&format!("{ours}.wake"));
+        assert_eq!(
+            h.names_listener(),
+            Some(true),
+            "a symlink to its own socket"
+        );
+        assert!(
+            UnixStream::connect(&ours).is_ok(),
+            "the symlink reaches nobody"
+        );
+        let _foreign = UnixListener::bind(&theirs).unwrap();
+        point(&theirs);
+        assert_eq!(
+            h.names_listener(),
+            Some(false),
+            "a symlink to another socket"
+        );
+        point(&format!("{theirs}.none"));
+        assert_eq!(h.names_listener(), Some(false), "a symlink to nothing");
+        h.shutdown();
+        assert!(
+            std::fs::symlink_metadata(&ours)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "shutdown removed the symlink"
+        );
+    }
+
+    /// The private-name shape [`clear_private_names`] removes: `<file>.<digits>.<digits>`
+    /// and nothing else.
+    #[cfg(unix)]
+    #[test]
+    fn a_private_name_is_its_files_name_and_two_numbers() {
+        use std::ffi::OsStr;
+        let file = OsStr::new("b.sock");
+        assert!(is_private_name(file, OsStr::new("b.sock.812.0")));
+        for other in [
+            "b.sock",
+            "b.sock.812",
+            "b.sock.812.",
+            "b.sock..0",
+            "b.sock.x.0",
+            "b.sock.812.0.1",
+            "b.sockx.812.0",
+            "b.sock.wake",
+            "a.sock.812.0",
+        ] {
+            assert!(!is_private_name(file, OsStr::new(other)), "{other}");
+        }
     }
 
     /// The liveness probe answers at once and leaves the stream as it found it. The

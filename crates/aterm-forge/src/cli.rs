@@ -182,6 +182,9 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Pars
             "--cell" => cells.push(next(&mut it, "--cell")?),
             "--top" => {
                 let v = next(&mut it, "--top")?;
+                if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(ParseError::BadNumber(v));
+                }
                 top = v.parse().map_err(|_| ParseError::BadNumber(v))?;
             }
             "--update" => update = true,
@@ -374,6 +377,7 @@ mod tests {
             }
         );
         for bad in [
+            vec!["loc", "--top", "+10"],
             vec!["abrew-help", "--check", "--write"],
             vec!["abrew-help", "--output", "elsewhere"],
             vec!["abrew-help", "import-legacy", "--input", "capture.rs"],

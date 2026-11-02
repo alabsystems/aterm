@@ -4,6 +4,10 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/common/xkb/mod.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
+// Modified by the aterm project in 2026; see the repository NOTICE. (libxkbcommon's entry points,
+// types and keysyms are first-party aterm-xkb's, read at run time, where upstream used xkbcommon-dl
+// and xkeysym.)
+
 use std::ops::Deref;
 use std::os::raw::c_char;
 use std::ptr::{self, NonNull};

@@ -11,6 +11,165 @@ use super::wait::{JobFacts, Scene, name_job};
 use super::wire::{age_words, phi_text};
 use super::*;
 
+fn memory_entry_context() -> step::Cx {
+    step::Cx {
+        consumer: Consumer::PersonFg,
+        kind: JobKind::Shell,
+        stretch_milli: 1000,
+        thrashing: false,
+        class_mu: Some(60_000),
+        fault: None,
+    }
+}
+
+fn memory_entry_evidence(at_ms: u64, dt_ms: u64, wait: Wait) -> step::Evidence {
+    step::Evidence {
+        at_ms,
+        dt_ms,
+        exited: false,
+        progress: None,
+        refused: false,
+        cpu_unread: false,
+        cpu_ns: Some(0),
+        calls: Some(0),
+        churn: false,
+        churn_work: false,
+        pageins: Some(0),
+        stopped: None,
+        holds_fg: true,
+        gate: InputGate::default(),
+        zombies: None,
+        zombie_parent_waits: false,
+        wait,
+        named: None,
+    }
+}
+
+fn assert_immediate_memory(out: &step::Out) {
+    assert_eq!(out.class, Class::Waiting);
+    assert_eq!(
+        out.wait.as_ref().map(|wait| wait.name),
+        Some(WaitName::Memory)
+    );
+    assert_eq!(out.standing, Some(Standing::Legit));
+    assert_eq!(out.phi_milli, Some(0));
+    assert_eq!(out.verdict, Verdict::Fine);
+    assert!(!out.no_progress);
+}
+
+#[test]
+fn memory_wait_clears_existing_rate_classification_on_its_first_tick() {
+    for class in [Class::Polling, Class::BusySilent, Class::Thrashing] {
+        for refused in [false, true] {
+            let mut cx = memory_entry_context();
+            cx.thrashing = class == Class::Thrashing;
+            let mut track = step::Track::new(0);
+            let mut ev = memory_entry_evidence(
+                2000,
+                2000,
+                Wait::bare(WaitName::Unnamed, Standing::Capped, 1, "front"),
+            );
+            ev.calls = Some(if class == Class::Polling { 80 } else { 0 });
+            ev.cpu_ns = Some(if class == Class::BusySilent {
+                2_000_000_000
+            } else {
+                0
+            });
+            ev.pageins = Some(if class == Class::Thrashing { 200 } else { 0 });
+            let _ = step::classify_tick(&mut track, &ev, &cx);
+            ev.at_ms = 4000;
+            let trained = step::classify_tick(&mut track, &ev, &cx);
+            assert_eq!(
+                trained.class, class,
+                "the prior rate class must really be active"
+            );
+
+            let mut ordinary = track.clone();
+            ev.at_ms = 6000;
+            let unchanged = step::classify_tick(&mut ordinary, &ev, &cx);
+            assert_eq!(
+                unchanged.class, class,
+                "no memory declaration resets ordinary evidence"
+            );
+
+            let mut memory = memory_entry_evidence(
+                6000,
+                2000,
+                Wait::bare(WaitName::Memory, Standing::Legit, 1, "front"),
+            );
+            if refused {
+                memory.refused = true;
+                memory.cpu_unread = true;
+                memory.cpu_ns = None;
+                memory.calls = None;
+                memory.pageins = None;
+            }
+            assert_immediate_memory(&step::classify_tick(&mut track, &memory, &cx));
+
+            memory.at_ms = 8000;
+            memory.wait = Wait::bare(WaitName::Unnamed, Standing::Capped, 1, "build");
+            let admitted = step::classify_tick(&mut track, &memory, &cx);
+            assert_eq!(
+                admitted.class,
+                Class::Waiting,
+                "old {class:?} must not enter the build"
+            );
+            assert_eq!(
+                admitted.wait.as_ref().map(|wait| wait.name),
+                Some(WaitName::Unnamed)
+            );
+        }
+    }
+}
+
+#[test]
+fn a_legitimate_memory_wait_clears_a_stuck_episode_on_its_first_tick() {
+    let cx = memory_entry_context();
+    let mut track = step::Track::new(0);
+    let mut ev = memory_entry_evidence(
+        0,
+        0,
+        Wait::bare(WaitName::Tcp, Standing::Capable, 1, "front"),
+    );
+    let _ = step::classify_tick(&mut track, &ev, &cx);
+    ev.at_ms = 28 * 60_000;
+    ev.dt_ms = ev.at_ms;
+    let stuck = step::classify_tick(&mut track, &ev, &cx);
+    assert_eq!(stuck.class, Class::Waiting);
+    assert_eq!(
+        stuck.verdict,
+        Verdict::Stuck,
+        "the old suspect episode must really be stuck"
+    );
+    assert!(track.episode_open());
+
+    let mut blocked = track.clone();
+    ev.at_ms += 2000;
+    ev.dt_ms = 2000;
+    ev.wait = Wait::bare(WaitName::Memory, Standing::Capable, 1, "front");
+    let blocked = step::classify_tick(&mut blocked, &ev, &cx);
+    assert_eq!(
+        blocked.verdict,
+        Verdict::Stuck,
+        "a blocked claim holder must retain escalation"
+    );
+    assert!(blocked.phi_milli.is_some_and(|phi| phi > 0));
+
+    let mut unnamed = track.clone();
+    ev.wait = Wait::bare(WaitName::Unnamed, Standing::Capped, 1, "front");
+    let unnamed = step::classify_tick(&mut unnamed, &ev, &cx);
+    assert_ne!(
+        unnamed.verdict,
+        Verdict::Fine,
+        "unproven waits confer no new legitimate standing"
+    );
+    assert!(unnamed.phi_milli.is_some_and(|phi| phi > 0));
+
+    ev.wait = Wait::bare(WaitName::Memory, Standing::Legit, 1, "front");
+    assert_immediate_memory(&step::classify_tick(&mut track, &ev, &cx));
+    assert!(!track.episode_open());
+}
+
 /// The first whole second at which `quiet` reaches φ × 1000 = `phi` for μ.
 fn reach_s(phi: u64, mu_ms: u64) -> u64 {
     (0..10_000u64)

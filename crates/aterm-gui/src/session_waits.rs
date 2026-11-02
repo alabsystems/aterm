@@ -683,7 +683,7 @@ mod tests {
         let late = Instant::now() + PROGRESS_GRACE * 2;
         app.sample_session_waits(late);
         app.settle_messages(late);
-        assert_eq!(app.message_band_rows, 1, "revealed");
+        assert_eq!(app.message_band_rows, 0, "progress stays in the journal");
         let drain = std::thread::spawn(move || {
             let mut sink_bytes = Vec::new();
             let mut chunk = [0u8; 65536];
@@ -702,8 +702,10 @@ mod tests {
         app.sample_session_waits(late + WAIT_SAMPLE);
         assert!(app.session_waits.pastes.is_empty());
         assert_eq!(app.session_waits_deadline(), None, "idle again");
-        let echo = app.messages.echoes().first().expect("the echo");
-        assert_eq!(echo.kind, EchoKind::Complete);
+        assert!(
+            app.messages.echoes().is_empty(),
+            "unshown progress has no visual completion echo"
+        );
         let state = app.messages_state();
         let entry = &state.entries[0];
         assert_eq!(entry.severity, "success");
@@ -751,15 +753,17 @@ mod tests {
         let later = Instant::now() + PROGRESS_GRACE * 2;
         app.sample_session_waits(later);
         app.settle_messages(later);
-        assert_eq!(app.message_band_rows, 1, "revealed");
+        assert_eq!(app.message_band_rows, 0, "progress stays in the journal");
         assert!(app.messages.live(id).is_some(), "the row is still up");
         gauge.pass_done(3_400_000, None);
         gauge.end(aterm_messages::WaitEnd::Done);
         app.sample_session_waits(later + WAIT_SAMPLE);
         assert!(app.session_waits.rewraps.is_empty());
         assert_eq!(app.session_waits_deadline(), None);
-        let echo = app.messages.echoes().first().expect("the echo");
-        assert_eq!(echo.kind, EchoKind::Complete);
+        assert!(
+            app.messages.echoes().is_empty(),
+            "unshown progress has no visual completion echo"
+        );
     }
 
     #[test]
@@ -1014,7 +1018,7 @@ mod tests {
         let late = t0 + PROGRESS_GRACE * 2;
         app.sample_session_waits(late);
         app.settle_messages(late);
-        assert_eq!(app.message_band_rows, 1, "premise: the row is up");
+        assert_eq!(app.message_band_rows, 0, "progress stays in the journal");
         meter.abandon();
         app.sample_session_waits(late + WAIT_SAMPLE);
         assert!(app.session_waits.pastes.is_empty(), "the watch ended");

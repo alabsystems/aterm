@@ -72,7 +72,7 @@ pub enum StageId {
     WasmSmoke,
     /// JS glue generator on `aterm-wasm-abi`'s toy module ([`crate::wasm_glue`]).
     WasmGlue,
-    /// Web modules in headless Chromium, Firefox, and WebKit (`crate::browser`).
+    /// Web modules in headless Chromium, Firefox, WebKit, and the system Safari (`crate::browser`).
     BrowserLane,
     Forge,
     /// End-to-end `codex-alab` native harness (`lab codex-alab-proof`), run exclusively.
@@ -144,6 +144,9 @@ pub struct StageSpec {
     /// claims none, and a run that measures nothing ([`Ctx::memory`] `None`) plans `0` for every
     /// stage.
     pub mem: u64,
+    /// The call of a shaped test compile it is ([`crate::shape::Part`]), or why its test compile
+    /// was not shaped (a part of one call); `None` for every other stage.
+    pub part: Option<crate::shape::Part>,
 }
 
 /// The side lanes' build directories ([`SIDE_LANES`]), each `*.noindex`, live in
@@ -184,8 +187,8 @@ pub fn cells_dir(ctx: &Ctx) -> PathBuf {
 /// an earlier run set aside of it and could not finish (`<lane>.noindex.removing`,
 /// `<lane>.noindex.removing-<n>`) is tried again, whether or not the lane is still there
 /// (`atpkg::build_cache::remove_unbuilt`): one line each for the log, and none for a lane with
-/// nothing of it left; one a build holds stays for a later run. Nothing of this version builds
-/// there.
+/// nothing of it left; one a build or process holds, or retention keeps, stays for a later run.
+/// Nothing of this version builds there.
 #[cfg(unix)]
 #[must_use]
 pub fn retire_old_lanes(ctx: &Ctx) -> Vec<String> {
@@ -208,7 +211,8 @@ fn retire_old_lanes_with(
                 lanes_dir(ctx).display()
             ),
             Ok(false) if there => format!(
-                "kept {}: a build or process still uses it, or ownership is unreadable; a later run checks it again",
+                "kept {} or what was set aside of it: a build holds its cargo locks, a process \
+                 uses it or cannot be ruled out, or retention keeps it; a later run checks it again",
                 old.display()
             ),
             Ok(false) => continue,
@@ -240,27 +244,108 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     if ctx.scope.selects_nothing() {
         wanted.retain(|id| *id != StageId::TestCompile);
     }
-    let mut v: Vec<StageSpec> = declared(&ctx.scope)
+    let v: Vec<StageSpec> = declared(&ctx.scope)
         .into_iter()
         .filter(|s| wanted.contains(&s.id))
         .collect();
     let present: Vec<StageId> = v.iter().map(|s| s.id).collect();
-    let records = ctx.memory.as_ref().map(crate::memory::Book::records);
-    for s in &mut v {
+    let records = ctx
+        .memory
+        .as_ref()
+        .map(|b| (b.records(), b.plain_records()));
+    let mut planned = Vec::with_capacity(v.len());
+    for mut s in v {
         s.after_stages.retain(|id| present.contains(id));
-        if let (Some(book), Some(records)) = (&ctx.memory, &records)
+        if let (Some(book), Some((records, plain))) = (&ctx.memory, &records)
             && !named_skip(ctx, s.id)
         {
-            let key = crate::memory::Key::of_run(s.id, ctx);
-            s.mem = crate::memory::need(records, s, &key, book.physical).bytes;
+            let key = crate::memory::Key::of_stage(&s, ctx);
+            s.mem = crate::memory::need(records, plain, &s, &key, book.physical).bytes;
+            if s.id == StageId::TestCompile && !ctx.scope.is_workspace() {
+                let checkout = ctx.root.display().to_string();
+                let shaping = crate::shape::Shaping {
+                    records,
+                    plain,
+                    checkout: &checkout,
+                    budget: book.budget(),
+                };
+                match crate::shape::shape(ctx.scope.crates(), &shaping, &mut |p| {
+                    (ctx.unit_graph)(ctx, p)
+                }) {
+                    crate::shape::Shaped::Calls(calls) => {
+                        planned.extend(calls_of(ctx, &s, calls));
+                        continue;
+                    }
+                    crate::shape::Shaped::Whole(Some(e)) => at_least(ctx, &mut s, &e, book),
+                    crate::shape::Shaped::Whole(None) => {}
+                }
+            }
         }
+        planned.push(s);
+    }
+    for s in &mut planned {
         // Independent build/test lanes would each spend the same CPU grant.
         // Keep every stage and its bounds, but let a managed run spend it once.
         if ctx.env.build_slot_held.is_some() {
             s.exclusive = true;
         }
     }
-    v
+    planned
+}
+
+/// The unshaped test compile `s` claims at least its estimate `e` ([`crate::shape::Shaped::Whole`])
+/// and a fifth more: its stage's lookup ([`crate::memory::need`]) reads its checkout's record
+/// first, however light (a run after a plain build had compiled it), and never the narrower
+/// selections it holds, where the estimate reads every checkout's record and their cover. Where
+/// that raises its claim, its time line says by what.
+fn at_least(ctx: &Ctx, s: &mut StageSpec, e: &crate::shape::Estimate, book: &crate::memory::Book) {
+    let floor = aterm_capacity::peak_claim(e.peak);
+    if floor <= s.mem {
+        return;
+    }
+    s.part = Some(crate::shape::Part::whole(
+        crate::shape::Piece::of(ctx.scope.crates(), false),
+        format!(
+            "by {} and a fifth more, more than the {} its stage's lookup found; under the run's {} \
+             budget, so not shaped",
+            e.from,
+            aterm_capacity::size(s.mem),
+            aterm_capacity::size(book.budget())
+        ),
+    ));
+    s.mem = floor;
+}
+
+/// The test compile `s` as the calls its planner made ([`crate::shape::shape`]), in its place and
+/// lane: each its own stage, with its own claim and part, titled `test compile (<its selection>),
+/// call i of n`; one call keeps the stage's title, with the claim and the reason it was not
+/// shaped.
+fn calls_of(ctx: &Ctx, s: &StageSpec, calls: Vec<crate::shape::Call>) -> Vec<StageSpec> {
+    calls
+        .into_iter()
+        .map(|call| {
+            let title = if call.part.shaped() {
+                let label = if call.part.closing() {
+                    ctx.scope.label()
+                } else {
+                    call.part.piece.label()
+                };
+                format!(
+                    "test compile ({label}), call {} of {}",
+                    call.part.index + 1,
+                    call.part.of
+                )
+            } else {
+                s.title.clone()
+            };
+            StageSpec {
+                title,
+                mem: call.mem,
+                part: Some(call.part),
+                ..s.clone()
+            }
+        })
+        .collect()
 }
 
 /// Every declared stage in log order.
@@ -360,7 +445,7 @@ pub fn declared(scope: &Scope) -> Vec<StageSpec> {
         ),
         spec(
             StageId::BrowserLane,
-            "browser lane (both web modules in headless Chromium, Firefox and WebKit: WebGL2, GPU vs CPU pixels)",
+            "browser lane (both web modules in headless Chromium, Firefox and WebKit, and in Safari: WebGL2, GPU vs CPU pixels)",
             Lane::CellsTarget,
         ),
         spec(
@@ -381,7 +466,8 @@ pub fn declared(scope: &Scope) -> Vec<StageSpec> {
         ),
         spec(
             StageId::ObjcDrives,
-            "objc drives (live-class audit, IME, toolbar, window and event, on a real AppKit)",
+            "objc drives (live-class audit, IME, toolbar, window, event and frame clock, on a real \
+             AppKit)",
             Lane::MainTarget,
         ),
         exclusive(
@@ -406,6 +492,7 @@ fn spec(id: StageId, title: impl Into<String>, lane: Lane) -> StageSpec {
         exclusive: false,
         after_stages: Vec::new(),
         mem: 0,
+        part: None,
     }
 }
 
@@ -579,6 +666,154 @@ mod tests {
             claims(&ctx(&checks, scope))
                 .iter()
                 .all(|(_, mem)| *mem == 0)
+        );
+    }
+
+    /// A HEAVY TEST COMPILE IS PLANNED AS ITS CALLS, IN ITS PLACE: on 10:23's book the test
+    /// compile over S1 is two stages in the main lane where it stood, before the test run, each
+    /// with its own claim and part: S1 less aterm-gui (15.3 GiB), then S1 (at least the budget),
+    /// titled `call i of n` with the closing call's title over the run's own selection; the doctests,
+    /// which await the test compile, await both. NEGATIVE CONTROL: a run that measures nothing
+    /// plans one test compile, whole and unshaped.
+    #[test]
+    fn a_heavy_test_compile_is_planned_as_its_calls_in_its_place() {
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let path = dir.path().join("stage-memory.json");
+        crate::shape::tests::book_at_1023()
+            .save(&path)
+            .expect("saved");
+        let book = crate::memory::Book::at(
+            Some(path),
+            Some(24 << 30),
+            Some(crate::shape::tests::BUDGET),
+        );
+        let scope = Scope::packages(&crate::shape::tests::s1());
+        let checks = [Check::Test, Check::Doc];
+        let mut c = ctx(&checks, scope.clone()).with_memory(book);
+        c.unit_graph = crate::shape::tests::fixture_graph;
+        let planned = plan(&c);
+        let shown: Vec<(StageId, &str, Lane)> = planned
+            .iter()
+            .map(|s| (s.id, s.title.as_str(), s.lane))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                (
+                    StageId::TestCompile,
+                    "test compile (-p aterm-agent -p aterm-models -p aterm-models-harness -p \
+                     aterm-types), call 1 of 2",
+                    Lane::MainTarget
+                ),
+                (
+                    StageId::TestCompile,
+                    "test compile (-p aterm-agent -p aterm-gui -p aterm-models-harness -p \
+                     aterm-models -p aterm-types), call 2 of 2",
+                    Lane::MainTarget
+                ),
+                (
+                    StageId::Test,
+                    "test (-p aterm-agent -p aterm-gui -p aterm-models-harness -p aterm-models \
+                     -p aterm-types)",
+                    Lane::MainTarget
+                ),
+                (
+                    StageId::Doctests,
+                    "doctests (-p aterm-agent -p aterm-gui -p aterm-models-harness -p \
+                     aterm-models -p aterm-types)",
+                    Lane::AfterCompile
+                ),
+            ]
+        );
+        assert_eq!(
+            planned[0].mem,
+            aterm_capacity::peak_claim((1272u64 << 30) / 100)
+        );
+        assert!(planned[1].mem >= crate::shape::tests::BUDGET);
+        assert!(
+            planned[0]
+                .part
+                .as_ref()
+                .is_some_and(|p| p.shaped() && !p.closing())
+        );
+        assert!(
+            planned[1]
+                .part
+                .as_ref()
+                .is_some_and(crate::shape::Part::closing)
+        );
+        assert_eq!(
+            crate::sched::awaited(&planned, 3).collect::<Vec<_>>(),
+            [0, 1]
+        );
+        crate::sched::check_waits(&planned).expect("each awaits only earlier stages");
+
+        let whole = plan(&ctx(&checks, scope));
+        assert_eq!(
+            whole
+                .iter()
+                .filter(|s| s.id == StageId::TestCompile)
+                .count(),
+            1
+        );
+        assert!(whole.iter().all(|s| s.part.is_none()));
+    }
+
+    /// AN UNSHAPED TEST COMPILE CLAIMS AT LEAST ITS ESTIMATE: `-p aterm-gui -p aterm-lab`, whose
+    /// only kept figure is the `-p aterm-gui` it holds (17.63 GiB in aterm-vmem), is not shaped
+    /// (21.16 GiB, under the 21.3 GiB budget) and claims that, not the cold 12 GiB its stage's
+    /// lookup found; `-p aterm-gui`, whose record here is a fresh run's 32 MiB, claims by
+    /// aterm-vmem's 17.63 GiB and not 1.03 GiB, and its time line says so. NEGATIVE CONTROL, by
+    /// hand: with the estimate dropped, they claimed 12 GiB and 1.03 GiB.
+    #[test]
+    fn an_unshaped_test_compile_claims_at_least_its_estimate() {
+        const GIB: u64 = 1 << 30;
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let path = dir.path().join("stage-memory.json");
+        let key = |checkout: &str, crates: &[&str]| crate::memory::Key {
+            stage: "TestCompile".to_owned(),
+            checkout: checkout.to_owned(),
+            crates: Some(crates.iter().map(|c| (*c).to_owned()).collect()),
+            variant: None,
+        };
+        let mut r = crate::memory::Records::default();
+        r.push(key("/vmem", &["aterm-gui"]), 1763 * GIB / 100, 1);
+        r.save(&path).expect("saved");
+        let claim = |crates: &[&str]| -> (u64, Option<String>) {
+            let book = crate::memory::Book::at(
+                Some(path.clone()),
+                Some(24 * GIB),
+                Some(crate::shape::tests::BUDGET),
+            );
+            let crates: Vec<String> = crates.iter().map(|c| (*c).to_owned()).collect();
+            let c = ctx(&[Check::Test], Scope::packages(&crates)).with_memory(book);
+            let p = plan(&c);
+            let s = p
+                .iter()
+                .find(|s| s.id == StageId::TestCompile)
+                .expect("planned");
+            (s.mem, s.part.as_ref().map(|p| p.said.clone()))
+        };
+        let gui = aterm_capacity::peak_claim(1763 * GIB / 100);
+        assert!(gui < crate::shape::tests::BUDGET);
+
+        let (mem, said) = claim(&["aterm-gui", "aterm-lab"]);
+        assert_eq!(mem, gui);
+        assert!(
+            said.as_deref()
+                .is_some_and(|s| s.contains("the narrower selections it holds, summed")
+                    && s.contains("more than the 12 GiB its stage's lookup found")),
+            "{said:?}"
+        );
+
+        r.push(key("/repo", &["aterm-gui"]), 32 << 20, 2);
+        r.save(&path).expect("saved");
+        let (mem, said) = claim(&["aterm-gui"]);
+        assert_eq!(mem, gui);
+        assert!(
+            said.as_deref()
+                .is_some_and(|s| s.contains("the most `-p aterm-gui` kept in /vmem")),
+            "{said:?}"
         );
     }
 

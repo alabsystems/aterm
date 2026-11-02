@@ -109,6 +109,8 @@ pub(crate) struct AiReading {
     pub(crate) store_note: Option<String>,
     /// What aterm holds of a fleet document from a URL, its last error one sanitized line.
     pub(crate) held: Option<Held>,
+    /// The harness packages installed in the atpkg store, with their versions.
+    pub(crate) harness_packages: Vec<atpkg::harness::Installed>,
 }
 
 impl AiReading {
@@ -149,6 +151,7 @@ impl AiReading {
                 error: held.error.as_deref().map(one_line),
                 ..held
             }),
+            harness_packages: look.harness_packages.clone(),
         }
     }
 
@@ -319,6 +322,9 @@ pub(crate) struct AiProjection {
     pub(crate) fleet_rows: Vec<(String, String)>,
     /// Whether `[ai] fleet` names a URL (Fetch now has something to fetch).
     pub(crate) fleet_from_url: bool,
+    /// Settings ▸ Harness's rows for the installed harness packages and their versions
+    /// ([`AiState::harness_package_rows`]).
+    pub(crate) harness_packages: Vec<(String, String)>,
 }
 
 const fn from_fleet(from: From) -> bool {
@@ -370,6 +376,7 @@ impl AiState {
             looking: self.looking,
             health: self.health(observed),
             clis: self.cli_rows(),
+            harness_packages: self.harness_package_rows(),
             preferred_from_fleet: from_fleet(choices.preferred.1),
             review_rows: self.review_rows(),
             fleet_rows: self.fleet_rows(),
@@ -420,6 +427,49 @@ impl AiState {
             many => format!("{} need you", listed(many)),
         };
         format!("{words} \u{b7} looked {when}")
+    }
+
+    /// One row per installed harness package, `<harness> package` with its version and where it
+    /// comes from (`v0.3.0 · build 17`, `version unrecorded · build 4`, `dev link <checkout>`);
+    /// one `Harness packages` row saying none is installed, or why the look has not read them.
+    fn harness_package_rows(&self) -> Vec<(String, String)> {
+        let lead = "Harness packages".to_string();
+        let Some(reading) = self.reading.as_ref().filter(|_| self.enabled) else {
+            let why = if !self.enabled {
+                "not looked at: Look for AI CLI problems is off"
+            } else if self.looking {
+                "looking\u{2026}"
+            } else {
+                "not looked at yet"
+            };
+            return vec![(lead, why.to_string())];
+        };
+        if reading.harness_packages.is_empty() {
+            return vec![(
+                lead,
+                "none installed: aterm pkg install <agent>-alab installs one".to_string(),
+            )];
+        }
+        reading
+            .harness_packages
+            .iter()
+            .map(|p| {
+                let version = p
+                    .version
+                    .as_deref()
+                    .map_or_else(|| "version unrecorded".to_string(), |v| format!("v{v}"));
+                let from = match (&p.linked, p.build) {
+                    (Some(checkout), _) => format!("dev link {}", checkout.display()),
+                    (None, Some(build)) if p.program == p.harness => format!("build {build}"),
+                    (None, Some(build)) => format!("{} build {build}", p.program),
+                    (None, None) => String::new(),
+                };
+                (
+                    format!("{} package", p.harness),
+                    format!("{version} \u{b7} {from}"),
+                )
+            })
+            .collect()
     }
 
     fn cli_rows(&self) -> Vec<AiCliRow> {

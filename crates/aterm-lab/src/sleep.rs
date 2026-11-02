@@ -83,8 +83,10 @@ fn parse_args(args: &[String]) -> Result<Option<Asked>, Fail> {
             "--for" => {
                 let v = value("SECS")?;
                 secs = Some(
-                    v.parse::<i64>()
-                        .ok()
+                    v.bytes()
+                        .all(|b| b.is_ascii_digit())
+                        .then(|| v.parse::<i64>().ok())
+                        .flatten()
                         .filter(|&s| s > 0 && s <= FOR_MAX)
                         .ok_or_else(|| {
                             usage(format!("--for {v}: whole seconds, 1 to {FOR_MAX}"))
@@ -106,8 +108,10 @@ fn parse_args(args: &[String]) -> Result<Option<Asked>, Fail> {
             "--within" => {
                 let v = value("SECS")?;
                 within = Some(
-                    v.parse::<u64>()
-                        .ok()
+                    v.bytes()
+                        .all(|b| b.is_ascii_digit())
+                        .then(|| v.parse::<u64>().ok())
+                        .flatten()
                         .filter(|&s| s > 0 && s <= WITHIN_MAX)
                         .ok_or_else(|| {
                             usage(format!("--within {v}: whole seconds, 1 to {WITHIN_MAX}"))

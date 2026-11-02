@@ -131,8 +131,12 @@ fn parse_sub(verb: &str, args: &[String]) -> Result<SubArgs, String> {
                 let what = "a time: Unix milliseconds, or YYYY-MM-DD[THH:MM[:SS]][Z|±HH:MM]";
                 let v = need("--since", what, it.next())?;
                 out.since_ms = Some(
-                    supervise::parse_since(&v, tz_offset_s())
-                        .ok_or_else(|| format!("{verb}: --since needs {what}"))?,
+                    supervise::parse_since_local(
+                        &v,
+                        tz_offset_s(),
+                        &supervise::limit::local_offset_at,
+                    )
+                    .ok_or_else(|| format!("{verb}: --since needs {what}"))?,
                 );
             }
             s if s == "--source" || s.starts_with("--source=") => {
@@ -191,13 +195,19 @@ fn classify_verb(args: &[String]) -> Result<Reply, String> {
     let home = std::env::var_os("HOME")
         .filter(|h| !h.is_empty())
         .map(PathBuf::from);
-    classify_verb_at(args, home.as_deref())
+    let cwd = std::env::current_dir().ok();
+    classify_verb_at(args, home.as_deref(), cwd.as_deref())
 }
 
-/// [`classify_verb`] under `home`: the classifier's verdict, then the advisory word's on the line
-/// (`approval::command_read_only_at`: the proof gaps, the blanks and the default secret list), so
-/// the verb calls read-only no line the harness's rules refuse on its words.
-fn classify_verb_at(args: &[String], home: Option<&std::path::Path>) -> Result<Reply, String> {
+/// [`classify_verb`] under `home`, asked from `cwd`: the classifier's verdict, then the advisory
+/// word's on the line (`approval::command_read_only_at`: the proof gaps, the blanks and the
+/// default secret list, a relative path read from `cwd`, where the asking agent's line runs), so
+/// the verb calls read-only no line the harness's rules refuse there on its words.
+fn classify_verb_at(
+    args: &[String],
+    home: Option<&std::path::Path>,
+    cwd: Option<&std::path::Path>,
+) -> Result<Reply, String> {
     let sub = parse_sub("classify", args)?;
     let cmd = sub.rest.join(" ");
     if cmd.trim().is_empty() {
@@ -209,7 +219,7 @@ fn classify_verb_at(args: &[String], home: Option<&std::path::Path>) -> Result<R
     let allow = python_allow(&sub);
     let v = classify_command_with(&cmd, &allow);
     let verdict = if v.read_only {
-        supervise::policy::approval::command_read_only_at(&cmd, &allow, home)
+        supervise::policy::approval::command_read_only_at(&cmd, &allow, home, cwd)
     } else {
         Err(v.reason)
     };
@@ -647,7 +657,7 @@ fn replay_args(args: &[String]) -> Result<ReplayArgs, String> {
                     .ok_or_else(|| format!("--until needs door=N: {USAGE}"))?;
                 let n = at
                     .strip_prefix("door=")
-                    .and_then(|n| n.strip_prefix('#').unwrap_or(n).parse::<u64>().ok())
+                    .and_then(|n| crate::parse_uint::<u64>(n.strip_prefix('#').unwrap_or(n)))
                     .ok_or_else(|| {
                         format!("--until takes door=N (an effect's ordinal), not {at:?}")
                     })?;
@@ -958,7 +968,7 @@ mod tests {
             "grep -m 1 key ~/.config/gh/hosts.yml",
             "git show HEAD:.env",
         ] {
-            let r = classify_verb_at(&args(&[line]), home).expect("ok");
+            let r = classify_verb_at(&args(&[line]), home, None).expect("ok");
             assert_eq!(r.code, 1, "{line}: {r:?}");
             assert!(
                 r.text.starts_with("not-read-only a read of a secret"),
@@ -973,16 +983,41 @@ mod tests {
             "ls -la ~/.ssh",
             "cat README.md",
         ] {
-            let r = classify_verb_at(&args(&[line]), home).expect("ok");
+            let r = classify_verb_at(&args(&[line]), home, None).expect("ok");
             assert_eq!(r, Reply::text("read-only\n".to_string()), "{line}");
         }
         let unknown_home =
-            classify_verb_at(&args(&["cat /Users/_owner/.claude.json"]), None).expect("ok");
+            classify_verb_at(&args(&["cat /Users/_owner/.claude.json"]), None, None).expect("ok");
         assert_eq!(unknown_home.code, 0, "{unknown_home:?}");
         // The classifier's own refusal still comes first.
-        let r = classify_verb_at(&args(&["cat ~/.ssh/id_rsa > out"]), home).expect("ok");
+        let r = classify_verb_at(&args(&["cat ~/.ssh/id_rsa > out"]), home, None).expect("ok");
         assert!(!r.text.contains("a read of a secret"), "{r:?}");
         assert_eq!(r.code, 1);
+    }
+
+    /// `classify` reads a relative path from the directory it is asked from, where the asking
+    /// agent's line runs, and from a directory it cannot place when it has none.
+    #[test]
+    fn classify_reads_a_relative_path_where_it_is_asked() {
+        let home = Some(std::path::Path::new("/Users/_owner"));
+        let proj = Some(std::path::Path::new("/Users/_owner/proj"));
+        for (line, cwd) in [
+            ("cat ../.claude.json", proj),
+            ("cd .. && cat .config/gh/hosts.yml", proj),
+            ("cat .claude.json", None),
+        ] {
+            let r = classify_verb_at(&args(&[line]), home, cwd).expect("ok");
+            assert_eq!(r.code, 1, "{line}: {r:?}");
+            assert!(
+                r.text.starts_with("not-read-only a read of a secret"),
+                "{line}: {r:?}"
+            );
+        }
+        // NEGATIVE CONTROLS
+        for (line, cwd) in [("cat .claude.json", proj), ("cat ../README.md", None)] {
+            let r = classify_verb_at(&args(&[line]), home, cwd).expect("ok");
+            assert_eq!(r, Reply::text("read-only\n".to_string()), "{line}");
+        }
     }
 
     /// `classify` resolves the secret list's home roots under the `HOME` it runs with, and holds a
@@ -995,7 +1030,8 @@ mod tests {
             .expect("the test runs with a HOME");
         for line in [
             "cat ~/.config/gh/hosts.yml".to_string(),
-            format!("cat {}/Library/Preferences/x.plist", home.display()),
+            // Quoted: a Windows home's `\` is the shell's escape outside quotes.
+            format!("cat '{}/Library/Preferences/x.plist'", home.display()),
             "cd ~ && cat .claude.json".to_string(),
             "cat ~/.config/g?/hosts.yml".to_string(),
             "grep -r token ~".to_string(),

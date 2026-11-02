@@ -145,6 +145,12 @@ pub(crate) struct SessionMeta {
     /// ([`SupervisorClaim::identity`]), kept past the claim's end until the connection closes
     /// ([`Self::close_connection`]): a `kind=wait` written on one is its claimant's own.
     pub(crate) claimant_conn: Vec<(u64, crate::self_claim::Proven)>,
+    /// Connections that ever bound a scoped claim, until EOF. Unlike `claimant_conn`, an
+    /// ordinary claim cannot erase this typed-input restriction.
+    pub(crate) scoped_input_connections: Vec<u64>,
+    /// Proven scoped actors seen in this session. A later direct peer is recognized only by
+    /// its fresh kernel pid AND birth, including after claim release and socket reconnect.
+    pub(crate) scoped_input_actors: Vec<crate::self_claim::Proven>,
     /// The stop a proven self-claim told of its own typing (`meta set harness_held`), with that
     /// claim's proof: its claimant's own, so it lapses where a wait written under the claim does
     /// ([`Self::set_supervisor`], [`Self::close_connection`]), and at the same proof's next claim
@@ -183,6 +189,8 @@ impl PartialEq for SessionMeta {
             supervisor: _,
             supervisor_revision: _,
             claimant_conn: _,
+            scoped_input_connections: _,
+            scoped_input_actors: _,
             claim_held: _,
             claim_land: _,
             claim_needs: _,
@@ -309,6 +317,8 @@ impl SessionMeta {
             supervisor: None,
             supervisor_revision: 0,
             claimant_conn: Vec::new(),
+            scoped_input_connections: Vec::new(),
+            scoped_input_actors: Vec::new(),
             claim_held: None,
             claim_land: None,
             claim_needs: None,
@@ -419,6 +429,58 @@ impl SessionMeta {
             .filter(|claim| claim.expires_us.is_none_or(|at| at > now_us))
     }
 
+    /// The live claim's proven contract v3 scope at `now_us` ([`SupervisorClaim::scoped`]):
+    /// a rostered harness's claim, with the versions it announced.
+    #[must_use]
+    pub(crate) fn live_scoped(&self, now_us: u64) -> Option<&crate::harness_claim::Scoped> {
+        self.live_claim(now_us)
+            .and_then(|claim| claim.scoped.as_ref())
+    }
+
+    /// Capture the live claim and its revision together. This snapshot describes duty ownership;
+    /// it grants no input or act admission and must be checked again before either is admitted.
+    #[must_use]
+    pub(crate) fn supervisor_authority(&self, now_us: u64) -> SupervisorAuthority {
+        let claim = self.live_claim(now_us);
+        SupervisorAuthority {
+            holder: claim.map(|c| c.holder.clone()),
+            contract: claim.and_then(|c| {
+                if c.scoped.is_some() {
+                    Some(3)
+                } else {
+                    c.proven.as_ref().map(|_| 2)
+                }
+            }),
+            identity: claim.and_then(|c| c.identity().cloned()),
+            conn: claim.and_then(|c| c.conn),
+            scopes: claim.and_then(|c| c.scoped.as_ref().map(|s| s.claim.scopes.clone())),
+            revision: self.supervisor_revision,
+        }
+    }
+
+    /// A scoped claimant or the private built-in harness must name its input duty. Ordinary
+    /// operator/drive credentials retain their independent authority; attribution text is no
+    /// substitute for this connection history or the direct socket's kernel peer.
+    pub(crate) fn scoped_input_required(
+        &self,
+        principal: crate::control::Principal,
+        conn: Option<u64>,
+        peer: Option<SupervisorInputPeer<'_>>,
+        now_us: u64,
+    ) -> bool {
+        let live = self.live_scoped(now_us);
+        (principal == crate::control::Principal::Harness
+            && (live.is_some() || !self.scoped_input_actors.is_empty()))
+            || conn.is_some_and(|conn| self.scoped_input_connections.contains(&conn))
+            || peer.is_some_and(|peer| {
+                let matches = |known: &crate::self_claim::Proven| {
+                    known.pid == peer.pid && peer.start.is_none_or(|start| known.start == start)
+                };
+                live.is_some_and(|scoped| matches(&scoped.proven))
+                    || self.scoped_input_actors.iter().any(matches)
+            })
+    }
+
     /// The proof of the proven claim `conn` was bound to last ([`Self::claimant_conn`]), whether
     /// that claim stands or ended while `conn` stayed open.
     fn claimant_on(&self, conn: Option<u64>) -> Option<&crate::self_claim::Proven> {
@@ -444,6 +506,16 @@ impl SessionMeta {
         claim: Option<SupervisorClaim>,
         now_us: u64,
     ) -> (u64, AttentionMove) {
+        if let Some(scoped) = claim.as_ref().and_then(|claim| claim.scoped.as_ref()) {
+            if !self.scoped_input_actors.contains(&scoped.proven) {
+                self.scoped_input_actors.push(scoped.proven.clone());
+            }
+            if let Some(conn) = claim.as_ref().and_then(|claim| claim.conn)
+                && !self.scoped_input_connections.contains(&conn)
+            {
+                self.scoped_input_connections.push(conn);
+            }
+        }
         if let Some(claim) = claim.as_ref()
             && let Some(conn) = claim.conn
         {
@@ -498,6 +570,7 @@ impl SessionMeta {
     /// NEEDS YOU set told under that claim ([`Self::self_held`], [`Self::self_land`],
     /// [`Self::self_needs`]) go at the same point; the second value says whether any did.
     pub(crate) fn close_connection(&mut self, conn: u64, now_us: u64) -> (AttentionMove, bool) {
+        self.scoped_input_connections.retain(|bound| *bound != conn);
         let Some(at) = self
             .claimant_conn
             .iter()
@@ -1087,6 +1160,478 @@ pub(crate) struct SupervisorClaim {
     pub(crate) scoped: Option<crate::harness_claim::Scoped>,
 }
 
+/// An owned observation of one session's duty authority at one revision. A missing scope set
+/// means a live legacy or v2 claim takes every duty; a missing holder means no live claim.
+/// Its private fields keep the captured proof, connection, scope and revision together.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SupervisorAuthority {
+    holder: Option<String>,
+    contract: Option<u8>,
+    identity: Option<crate::self_claim::Proven>,
+    conn: Option<u64>,
+    scopes: Option<aterm_agent::harness::contract::Scopes>,
+    revision: u64,
+}
+
+impl SupervisorAuthority {
+    /// The live holder, or none once its lease has lapsed.
+    #[must_use]
+    pub(crate) fn holder(&self) -> Option<&str> {
+        self.holder.as_deref()
+    }
+
+    /// The proven claim's contract (2 or 3), absent for an unproven claim or no live claim.
+    #[must_use]
+    pub(crate) const fn contract(&self) -> Option<u8> {
+        self.contract
+    }
+
+    /// The kernel identity captured by the claim's proof, absent for an unproven claim.
+    #[must_use]
+    pub(crate) fn identity(&self) -> Option<&crate::self_claim::Proven> {
+        self.identity.as_ref()
+    }
+
+    /// The connection the live claim was bound to, absent for a TTL claim or no live claim.
+    #[must_use]
+    pub(crate) const fn connection(&self) -> Option<u64> {
+        self.conn
+    }
+
+    /// The revision captured alongside the claim, retained even where no claim stands.
+    #[must_use]
+    pub(crate) const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// A v3 claim's explicit scope set; legacy and v2 claims have implicit full scope.
+    #[must_use]
+    pub(crate) fn scopes(&self) -> Option<&aterm_agent::harness::contract::Scopes> {
+        self.scopes.as_ref()
+    }
+
+    /// Whether another holder takes `duty` from the built-in holder named by the caller.
+    #[must_use]
+    pub(crate) fn external_takes(
+        &self,
+        builtin_holder: &str,
+        duty: aterm_agent::harness::contract::Scope,
+    ) -> bool {
+        self.holder().is_some_and(|holder| holder != builtin_holder)
+            && self.scopes().is_none_or(|scopes| scopes.contains(duty))
+    }
+
+    /// Whether `duty` stays with the built-in holder: the complement of external ownership.
+    #[must_use]
+    pub(crate) fn builtin_keeps(
+        &self,
+        builtin_holder: &str,
+        duty: aterm_agent::harness::contract::Scope,
+    ) -> bool {
+        !self.external_takes(builtin_holder, duty)
+    }
+
+    /// Additive status words describing the captured contract, effective scopes and revision.
+    /// An absent claim has `-` scopes; a legacy or v2 claim lists every duty in canonical order.
+    #[must_use]
+    pub(crate) fn wire_fields(&self) -> String {
+        use aterm_agent::harness::contract::Scope;
+        let contract = self
+            .contract()
+            .map_or_else(|| "-".to_string(), |n| n.to_string());
+        let scopes = match (self.holder(), self.scopes()) {
+            (None, _) => "-".to_string(),
+            (Some(_), Some(scopes)) => scopes.words(),
+            (Some(_), None) => Scope::ALL.map(Scope::word).join(","),
+        };
+        format!(
+            "supervisor_contract={contract} supervisor_scope={scopes} supervisor_revision={}",
+            self.revision()
+        )
+    }
+}
+
+/// Tests of the typed input boundary and its drain model.
+#[cfg(test)]
+#[path = "session_scoped_input_tests.rs"]
+pub(crate) mod scoped_input_tests;
+
+/// The explicit duty and claim revision a coordinated input request names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SupervisorInputRequest {
+    pub(crate) holder: String,
+    pub(crate) revision: u64,
+    pub(crate) duty: aterm_agent::harness::contract::Scope,
+}
+
+/// Facts read by the serving control lane, never supplied by the request's words.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SupervisorInputCaller {
+    pub(crate) principal: crate::control::Principal,
+    pub(crate) connection: Option<u64>,
+    pub(crate) peer: Option<u32>,
+    pub(crate) proof: Option<crate::self_claim::Proven>,
+}
+
+/// A direct kernel peer, preserving an unreadable birth as uncertainty rather than absence.
+/// This classifies whether typed input is required; it grants no claimed duty or proof.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SupervisorInputPeer<'a> {
+    pub(crate) pid: u32,
+    pub(crate) start: Option<&'a str>,
+}
+
+impl<'a> From<&'a crate::self_claim::Proven> for SupervisorInputPeer<'a> {
+    fn from(proven: &'a crate::self_claim::Proven) -> Self {
+        Self {
+            pid: proven.pid,
+            start: Some(&proven.start),
+        }
+    }
+}
+
+/// The authority carried from control admission to actual queued input delivery. Legacy
+/// callers keep their holder fence; a scoped request carries the entire captured authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SupervisorInputFence {
+    Legacy(String),
+    Scoped(Arc<ScopedInputFence>),
+}
+
+/// A scoped input reservation. Private fields prevent the receiver from rebuilding a grant
+/// from a holder string or a caller's attribution label.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ScopedInputFence {
+    session: aterm_session::SessionId,
+    nonce: aterm_session::LaunchNonce,
+    authority: SupervisorAuthority,
+    request: SupervisorInputRequest,
+    builtin: bool,
+    caller: SupervisorInputCaller,
+}
+
+pub(crate) const SCOPED_INPUT_DENIED: &str = "ERR denied supervisor input authority\n";
+pub(crate) const SCOPED_INPUT_BUSY: &str = "ERR busy supervisor input in flight\n";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum InputWriter {
+    Legacy(String),
+    Builtin(String),
+    Claimant {
+        holder: String,
+        proof: Option<crate::self_claim::Proven>,
+        connection: Option<u64>,
+    },
+}
+
+impl InputWriter {
+    fn same_actor(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Legacy(a) | Self::Builtin(a), Self::Legacy(b) | Self::Builtin(b)) => a == b,
+            _ => self == other,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ActiveInput {
+    writer: InputWriter,
+    duty: Option<aterm_agent::harness::contract::Scope>,
+    inline: bool,
+    native: Option<String>,
+}
+
+impl ActiveInput {
+    fn of(fence: &SupervisorInputFence, inline: bool) -> Self {
+        match fence {
+            SupervisorInputFence::Legacy(holder) => Self {
+                writer: InputWriter::Legacy(holder.clone()),
+                duty: None,
+                inline: false,
+                native: None,
+            },
+            SupervisorInputFence::Scoped(scoped) => Self {
+                writer: if scoped.builtin {
+                    InputWriter::Builtin(scoped.request.holder.clone())
+                } else {
+                    InputWriter::Claimant {
+                        holder: scoped.request.holder.clone(),
+                        proof: scoped.caller.proof.clone(),
+                        connection: scoped.caller.connection,
+                    }
+                },
+                duty: Some(scoped.request.duty),
+                inline,
+                native: None,
+            },
+        }
+    }
+
+    fn conflicts(&self, other: &Self) -> bool {
+        // Ordered jobs serialize spill drain in their one writer. A guarded immediate write
+        // uses no such queue, so its complete prefix/suffix must settle before another typed
+        // batch can start (and it cannot start beside one already writing).
+        self.inline
+            || other.inline
+            || (self.duty.zip(other.duty).is_none_or(|(a, b)| a == b)
+                && !self.writer.same_actor(&other.writer))
+    }
+}
+
+impl SupervisorInputFence {
+    /// Capture a typed request only while its revision, actor, proof and binding agree under
+    /// the session meta lock. This reserves no in-flight write until [`FencedWrite::enter_fence`].
+    pub(crate) fn authorize(
+        ctx: &crate::SessionCtx,
+        request: SupervisorInputRequest,
+        caller: &SupervisorInputCaller,
+        now_us: u64,
+    ) -> Result<Self, String> {
+        let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+        let authority = meta.supervisor_authority(now_us);
+        use aterm_agent::harness::contract::Scope;
+        let typing = matches!(
+            request.duty,
+            Scope::TurnEnd | Scope::Approvals | Scope::Questions | Scope::Walls
+        );
+        if !typing || authority.revision() != request.revision || caller.connection.is_none() {
+            return Err(SCOPED_INPUT_DENIED.to_string());
+        }
+        let builtin = caller.principal == crate::control::Principal::Harness;
+        if builtin {
+            if request.holder != crate::harness_host::holder()
+                || !authority.builtin_keeps(&request.holder, request.duty)
+            {
+                return Err(SCOPED_INPUT_DENIED.to_string());
+            }
+        } else {
+            if authority.contract() != Some(3)
+                || authority.holder() != Some(request.holder.as_str())
+                || !authority.scopes().is_some_and(|s| s.contains(request.duty))
+                || caller.connection.is_none()
+                || caller.connection != authority.connection()
+                || caller.proof.as_ref() != authority.identity()
+                || caller.peer != authority.identity().map(|p| p.pid)
+            {
+                return Err(SCOPED_INPUT_DENIED.to_string());
+            }
+        }
+        Ok(Self::Scoped(Arc::new(ScopedInputFence {
+            session: ctx.self_id.clone(),
+            nonce: ctx.nonce,
+            authority,
+            request,
+            builtin,
+            caller: caller.clone(),
+        })))
+    }
+
+    /// Check a turn before its wait without holding an in-flight reservation for that wait.
+    pub(crate) fn check(&self, ctx: &crate::SessionCtx, now_us: u64) -> Result<(), String> {
+        if let Self::Legacy(holder) = self {
+            return supervisor_fence(ctx, holder, now_us).map_or(Ok(()), Err);
+        }
+        let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+        self.refusal(ctx, &meta, now_us).map_or(Ok(()), Err)
+    }
+
+    fn refusal(&self, ctx: &crate::SessionCtx, meta: &SessionMeta, now_us: u64) -> Option<String> {
+        match self {
+            Self::Legacy(holder) => {
+                if meta.live_scoped(now_us).is_some() {
+                    Some(SCOPED_INPUT_DENIED.to_string())
+                } else {
+                    fence_refusal(meta, holder, now_us)
+                }
+            }
+            Self::Scoped(scoped) => (ctx.self_id != scoped.session
+                || ctx.nonce != scoped.nonce
+                || meta.supervisor_authority(now_us) != scoped.authority)
+                .then(|| SCOPED_INPUT_DENIED.to_string()),
+        }
+    }
+}
+
+/// A control batch before or after its first actual PTY write. Queued batches carry a ticket;
+/// the first ordered-writer delivery admits one lease, which every continuation shares.
+#[derive(Clone, Debug)]
+pub(crate) enum SupervisorInputDelivery {
+    Legacy(String),
+    Scoped(Arc<SupervisorInputBatch>),
+}
+
+impl SupervisorInputDelivery {
+    pub(crate) fn new(ctx: &Arc<crate::SessionCtx>, fence: SupervisorInputFence) -> Self {
+        match fence {
+            SupervisorInputFence::Legacy(holder) => Self::Legacy(holder),
+            fence @ SupervisorInputFence::Scoped(_) => {
+                Self::Scoped(Arc::new(SupervisorInputBatch {
+                    ctx: Arc::downgrade(ctx),
+                    fence,
+                    state: std::sync::Mutex::new(InputBatchState::default()),
+                }))
+            }
+        }
+    }
+
+    pub(crate) fn batch(&self) -> Option<Arc<SupervisorInputBatch>> {
+        match self {
+            Self::Legacy(_) => None,
+            Self::Scoped(batch) => Some(Arc::clone(batch)),
+        }
+    }
+
+    pub(crate) fn is_scoped(&self) -> bool {
+        matches!(self, Self::Scoped(_))
+    }
+
+    pub(crate) fn producer(&self) -> Option<SupervisorInputProducer> {
+        self.batch().map(SupervisorInputProducer)
+    }
+
+    pub(crate) fn check(&self, ctx: &crate::SessionCtx, now_us: u64) -> Result<(), String> {
+        match self {
+            Self::Legacy(holder) => supervisor_fence(ctx, holder, now_us).map_or(Ok(()), Err),
+            Self::Scoped(batch) => batch.check_queued(ctx, now_us),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct SupervisorInputBatch {
+    ctx: std::sync::Weak<crate::SessionCtx>,
+    fence: SupervisorInputFence,
+    state: std::sync::Mutex<InputBatchState>,
+}
+
+#[derive(Debug, Default)]
+struct InputBatchState {
+    sealed: bool,
+    pending: usize,
+    phase: InputBatchPhase,
+}
+
+#[derive(Debug, Default)]
+enum InputBatchPhase {
+    #[default]
+    Queued,
+    Writing(FencedWrite),
+    Refused,
+    Settled,
+}
+
+/// The one logical input producer. Sealing it is idempotent, including an early-return drop.
+/// Read-only reply settlement may keep the batch's Arc but never keeps its writer lease.
+pub(crate) struct SupervisorInputProducer(Arc<SupervisorInputBatch>);
+
+impl Drop for SupervisorInputProducer {
+    fn drop(&mut self) {
+        self.0.seal();
+    }
+}
+
+/// One queued/completing input lineage. Clones of a completion's mark share this reservation
+/// through GUI dispatch and the actual sink worker; its last drop ends that pending work.
+#[derive(Debug)]
+pub(crate) struct SupervisorInputWork(Arc<SupervisorInputBatch>);
+
+impl Drop for SupervisorInputWork {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.pending = state.pending.saturating_sub(1);
+        SupervisorInputBatch::settle(&mut state);
+    }
+}
+
+impl SupervisorInputBatch {
+    fn check_queued(&self, ctx: &crate::SessionCtx, now_us: u64) -> Result<(), String> {
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        match &state.phase {
+            InputBatchPhase::Queued => self.fence.check(ctx, now_us),
+            InputBatchPhase::Writing(lease) => {
+                let SupervisorInputFence::Scoped(scoped) = lease.fence() else {
+                    return Err(SCOPED_INPUT_DENIED.to_string());
+                };
+                (ctx.self_id == scoped.session && ctx.nonce == scoped.nonce)
+                    .then_some(())
+                    .ok_or_else(|| SCOPED_INPUT_DENIED.to_string())
+            }
+            InputBatchPhase::Refused | InputBatchPhase::Settled => {
+                Err(SCOPED_INPUT_DENIED.to_string())
+            }
+        }
+    }
+
+    pub(crate) fn producer(self: &Arc<Self>) -> SupervisorInputProducer {
+        SupervisorInputProducer(Arc::clone(self))
+    }
+
+    pub(crate) fn reserve(self: &Arc<Self>) -> Option<Arc<SupervisorInputWork>> {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.sealed
+            || matches!(
+                state.phase,
+                InputBatchPhase::Refused | InputBatchPhase::Settled
+            )
+        {
+            return None;
+        }
+        state.pending = state.pending.checked_add(1)?;
+        Some(Arc::new(SupervisorInputWork(Arc::clone(self))))
+    }
+
+    pub(crate) fn seal(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.sealed = true;
+        Self::settle(&mut state);
+    }
+
+    fn settle(state: &mut InputBatchState) {
+        if state.sealed && state.pending == 0 {
+            // The owned lease drops here, independently of long-lived observation Arcs.
+            state.phase = InputBatchPhase::Settled;
+        }
+    }
+
+    /// Called immediately before this batch first writes. Once writing, a transition waits for
+    /// its lease and never truncates later bytes or keys of the already admitted batch.
+    pub(crate) fn start(&self) -> bool {
+        self.start_with(false)
+    }
+
+    /// A guarded seam may already hold the terminal lock. It never waits for meta or another
+    /// batch there: a busy first admission writes nothing and can be asked for again.
+    pub(crate) fn start_inline(&self) -> bool {
+        self.start_with(true)
+    }
+
+    fn start_with(&self, nonparking: bool) -> bool {
+        let mut state = if nonparking {
+            match self.state.try_lock() {
+                Ok(state) => state,
+                Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => return false,
+            }
+        } else {
+            self.state.lock().unwrap_or_else(|p| p.into_inner())
+        };
+        match &state.phase {
+            InputBatchPhase::Writing(_) => return true,
+            InputBatchPhase::Refused | InputBatchPhase::Settled => return false,
+            InputBatchPhase::Queued => {}
+        }
+        let lease = self.ctx.upgrade().and_then(|ctx| {
+            if nonparking {
+                FencedWrite::try_enter_fence(&ctx, &self.fence, crate::metrics::now_us()).ok()
+            } else {
+                FencedWrite::enter_fence(&ctx, &self.fence, crate::metrics::now_us()).ok()
+            }
+        });
+        state.phase = lease.map_or(InputBatchPhase::Refused, InputBatchPhase::Writing);
+        matches!(state.phase, InputBatchPhase::Writing(_))
+    }
+}
+
 impl SupervisorClaim {
     /// The process a proof of this claim named, a v2 self-claim's or a v3 scoped claim's.
     #[must_use]
@@ -1367,7 +1912,11 @@ impl AutopilotSetBy {
     #[must_use]
     pub(crate) fn parse_carried(text: &str) -> Option<Self> {
         let (setter, since) = text.trim().split_once(' ')?;
-        let since_ms = since.trim().parse::<i64>().ok()?;
+        let since = since.trim();
+        if since.is_empty() || !since.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let since_ms = since.parse::<i64>().ok()?;
         let (actor, surface) = match setter.strip_prefix("human:") {
             Some(surface) => (
                 aterm_slog::Actor::Human,
@@ -1647,7 +2196,7 @@ pub(crate) fn claim_supervisor(
     .map(|c| c.changed)
 }
 
-/// What a granted claim did ([`claim_supervisor_as`]).
+/// What a granted claim did ([`publish_claim_supervisor_as`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Claimed {
     pub(crate) changed: bool,
@@ -1694,6 +2243,7 @@ pub(crate) fn claim_rule(
 }
 
 /// `meta set supervisor <holder> [ttl=<ms>]`.
+#[cfg(test)]
 pub(crate) fn claim_supervisor_as(
     ctx: &crate::SessionCtx,
     holder: &str,
@@ -1703,11 +2253,28 @@ pub(crate) fn claim_supervisor_as(
     now_us: u64,
     by: aterm_slog::Actor,
 ) -> Result<Claimed, String> {
+    publish_claim_supervisor_as(ctx, holder, conn, expires_us, proven, now_us, by)
+        .map(SupervisorTransition::acknowledge)
+}
+
+/// Publish a claim and capture the prior writers. Only the control worker acknowledging this
+/// transition calls [`SupervisorTransition::acknowledge`]; GUI observers never wait on it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn publish_claim_supervisor_as(
+    ctx: &crate::SessionCtx,
+    holder: &str,
+    conn: Option<u64>,
+    expires_us: Option<u64>,
+    proven: Option<crate::self_claim::Proven>,
+    now_us: u64,
+    by: aterm_slog::Actor,
+) -> Result<SupervisorTransition<Claimed>, String> {
     claim_supervisor_with(ctx, holder, conn, expires_us, proven, None, now_us, by)
 }
 
 /// `meta set supervisor <id>@<pid> contract=3 scope=…`: a rostered harness's proven scoped claim
 /// ([`crate::harness_claim`]), bound to `conn`, under the same [`claim_rule`] as a proof.
+#[cfg(test)]
 pub(crate) fn claim_supervisor_scoped(
     ctx: &crate::SessionCtx,
     holder: &str,
@@ -1716,7 +2283,50 @@ pub(crate) fn claim_supervisor_scoped(
     now_us: u64,
     by: aterm_slog::Actor,
 ) -> Result<Claimed, String> {
+    publish_claim_supervisor_scoped(ctx, holder, conn, scoped, now_us, by)
+        .map(SupervisorTransition::acknowledge)
+}
+
+pub(crate) fn publish_claim_supervisor_scoped(
+    ctx: &crate::SessionCtx,
+    holder: &str,
+    conn: Option<u64>,
+    scoped: crate::harness_claim::Scoped,
+    now_us: u64,
+    by: aterm_slog::Actor,
+) -> Result<SupervisorTransition<Claimed>, String> {
     claim_supervisor_with(ctx, holder, conn, None, None, Some(scoped), now_us, by)
+}
+
+/// A published authority transition and the exact prior revisions its explicit ACK owes.
+/// Dropping or observing a transition never parks a GUI/event/EOF lane.
+#[must_use]
+pub(crate) struct SupervisorTransition<T> {
+    published: T,
+    drain: FencedInputDrain,
+}
+
+impl<T> SupervisorTransition<T> {
+    fn unchanged(published: T) -> Self {
+        Self {
+            published,
+            drain: FencedInputDrain::default(),
+        }
+    }
+
+    pub(crate) fn published(self) -> T {
+        self.published
+    }
+
+    pub(crate) fn published_ref(&self) -> &T {
+        &self.published
+    }
+
+    /// Called only by the explicit control reply lane, with no GUI-needed locks held.
+    pub(crate) fn acknowledge(self) -> T {
+        self.drain.wait();
+        self.published
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1729,7 +2339,7 @@ fn claim_supervisor_with(
     scoped: Option<crate::harness_claim::Scoped>,
     now_us: u64,
     by: aterm_slog::Actor,
-) -> Result<Claimed, String> {
+) -> Result<SupervisorTransition<Claimed>, String> {
     let looked = {
         let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
         meta.live_claim(now_us).and_then(|c| c.identity().cloned())
@@ -1759,6 +2369,9 @@ fn claim_supervisor_with(
     let now_proven = identity.is_some();
     let renewed_identity_changed =
         rule == ClaimRule::Renew && standing.as_ref().is_some_and(|(_, old)| *old != identity);
+    let renewed_scoped_changed = rule == ClaimRule::Renew
+        && meta.live_scoped(now_us).map(|s| &s.claim) != scoped.as_ref().map(|s| &s.claim);
+    let drain = ctx.fenced_writes.capture_drain();
     let (revision, lapsed) = meta.set_supervisor(
         Some(SupervisorClaim {
             holder: holder.to_string(),
@@ -1785,7 +2398,8 @@ fn claim_supervisor_with(
             .unwrap_or_else(|p| p.into_inner())
             .forget_holder_acts();
     }
-    let changed = supervisor_changed || renewed_identity_changed || lapsed.any();
+    let changed =
+        supervisor_changed || renewed_identity_changed || renewed_scoped_changed || lapsed.any();
     if crate::holder_image::DEV_ROWS && matches!(rule, ClaimRule::Take | ClaimRule::Replace) {
         ctx.timeline
             .lock()
@@ -1799,19 +2413,17 @@ fn claim_supervisor_with(
                 ),
             );
     }
-    let meta = if rule == ClaimRule::Replace {
-        settle_fenced_writes(ctx, meta)
-    } else {
-        meta
-    };
     drop(meta);
     let replaced = (rule == ClaimRule::Replace)
         .then(|| standing.map(|(h, _)| h))
         .flatten();
-    Ok(Claimed {
-        changed,
-        replaced,
-        revision,
+    Ok(SupervisorTransition {
+        published: Claimed {
+            changed,
+            replaced,
+            revision,
+        },
+        drain,
     })
 }
 
@@ -1823,6 +2435,9 @@ pub(crate) fn supervisor_fence(
     now_us: u64,
 ) -> Option<String> {
     let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+    if meta.live_scoped(now_us).is_some() {
+        return Some(SCOPED_INPUT_DENIED.to_string());
+    }
     fence_refusal(&meta, holder, now_us)
 }
 
@@ -1839,90 +2454,352 @@ fn fence_refusal(meta: &SessionMeta, holder: &str, now_us: u64) -> Option<String
 /// The session's fenced writes in flight.
 #[derive(Debug, Default)]
 pub(crate) struct FencedWrites {
-    inflight: std::sync::atomic::AtomicU32,
+    state: Arc<FencedWriteState>,
+    pub(crate) native: std::sync::Mutex<crate::native_act::Operations>,
+}
+
+#[derive(Debug, Default)]
+struct FencedWriteState {
+    inflight: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<ActiveInput>>>,
     settled: std::sync::Condvar,
 }
 
-/// One admitted fenced write, counted in [`FencedWrites`] from the fence's read until it drops.
-pub(crate) struct FencedWrite<'a> {
-    ctx: &'a crate::SessionCtx,
+impl FencedWrites {
+    /// Reserve the native position while MetaLock still excludes fresh input admission.
+    /// The marker conflicts with every later writer, including the same actor/revision.
+    pub(crate) fn reserve_native(
+        &self,
+        revision: u64,
+        id: &str,
+        boundary: aterm_types::update_boundary::Held<'static>,
+    ) -> Result<NativeCustody, String> {
+        let state = Arc::clone(&self.state);
+        let mut inflight = state.inflight.lock().unwrap_or_else(|p| p.into_inner());
+        if inflight
+            .values()
+            .flatten()
+            .any(|active| active.native.is_some())
+        {
+            return Err("ERR busy native operation unresolved\n".into());
+        }
+        let active = ActiveInput {
+            writer: InputWriter::Builtin(String::new()),
+            duty: None,
+            inline: true,
+            native: Some(id.to_string()),
+        };
+        inflight.entry(revision).or_default().push(active.clone());
+        drop(inflight);
+        Ok(NativeCustody {
+            state,
+            revision,
+            active,
+            id: id.to_string(),
+            _boundary: boundary,
+        })
+    }
+
+    /// Called with meta held, so no write can join the superseded revision after this capture.
+    fn revisions(&self) -> Vec<u64> {
+        self.state
+            .inflight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    /// Captured while MetaLock excludes admission to the superseded revision.
+    fn capture_drain(&self) -> FencedInputDrain {
+        FencedInputDrain {
+            state: Some(Arc::clone(&self.state)),
+            revisions: self.revisions(),
+        }
+    }
 }
 
-impl<'a> FencedWrite<'a> {
+/// One native operation's exact position in the same ordering as fenced input. The owning
+/// operation retains this after ACK loss and EOF, until its actual outcome is proved.
+#[derive(Debug)]
+pub(crate) struct NativeCustody {
+    state: Arc<FencedWriteState>,
+    revision: u64,
+    active: ActiveInput,
+    id: String,
+    _boundary: aterm_types::update_boundary::Held<'static>,
+}
+
+impl NativeCustody {
+    pub(crate) fn drain(&self) -> NativeDrain {
+        NativeDrain {
+            state: Arc::clone(&self.state),
+            revision: self.revision,
+            id: self.id.clone(),
+        }
+    }
+    /// Only expendable control workers park here, holding no metadata, GUI or input locks.
+    /// A departure before admission cancels the reservation; a started move never calls this.
+    pub(crate) fn await_predecessors(&self, deadline_us: u64) -> bool {
+        let mut inflight = self
+            .state
+            .inflight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        while inflight
+            .values()
+            .flatten()
+            .any(|active| active != &self.active)
+        {
+            let Some(left) = crate::native_act::remaining(deadline_us) else {
+                return false;
+            };
+            if aterm_control::hangup::caller_hung_up() {
+                return false;
+            }
+            let park = aterm_control::hangup::hangup_park(left);
+            inflight = self
+                .state
+                .settled
+                .wait_timeout(inflight, park)
+                .unwrap_or_else(|p| p.into_inner())
+                .0;
+        }
+        crate::native_act::remaining(deadline_us).is_some()
+            && !aterm_control::hangup::caller_hung_up()
+    }
+}
+
+/// A completion reader owns no lease and waits only this operation's marker, never later
+/// revisions, terminal answers, response observation or a different operation's input.
+#[derive(Clone, Debug)]
+pub(crate) struct NativeDrain {
+    state: Arc<FencedWriteState>,
+    revision: u64,
+    id: String,
+}
+
+impl NativeDrain {
+    /// Observation never parks a request lane. Contention and pending actual custody both
+    /// remain Unknown; only absence of this exact marker proves the terminal receipt ready.
+    pub(crate) fn is_drained(&self) -> bool {
+        let inflight = match self.state.inflight.try_lock() {
+            Ok(inflight) => inflight,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return false,
+        };
+        !inflight.get(&self.revision).is_some_and(|active| {
+            active
+                .iter()
+                .any(|active| active.native.as_deref() == Some(self.id.as_str()))
+        })
+    }
+}
+
+impl Drop for NativeCustody {
+    fn drop(&mut self) {
+        let mut inflight = self
+            .state
+            .inflight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(active) = inflight.get_mut(&self.revision) {
+            active.retain(|active| active != &self.active);
+            if active.is_empty() {
+                inflight.remove(&self.revision);
+            }
+        }
+        drop(inflight);
+        self.state.settled.notify_all();
+    }
+}
+
+#[derive(Default)]
+struct FencedInputDrain {
+    state: Option<Arc<FencedWriteState>>,
+    revisions: Vec<u64>,
+}
+
+impl FencedInputDrain {
+    fn wait(self) {
+        let Some(writes) = self.state else {
+            return;
+        };
+        let inflight = writes.inflight.lock().unwrap_or_else(|p| p.into_inner());
+        drop(
+            writes
+                .settled
+                .wait_while(inflight, |inflight| {
+                    self.revisions
+                        .iter()
+                        .any(|revision| inflight.contains_key(revision))
+                })
+                .unwrap_or_else(|p| p.into_inner()),
+        );
+    }
+}
+
+/// One admitted fenced write, counted in [`FencedWrites`] from the fence's read until it drops.
+#[derive(Debug)]
+pub(crate) struct FencedWrite {
+    state: Arc<FencedWriteState>,
+    revision: u64,
+    fence: SupervisorInputFence,
+    active: ActiveInput,
+}
+
+impl FencedWrite {
     /// Admit one write under `holder`'s fence.
     pub(crate) fn enter(
-        ctx: &'a crate::SessionCtx,
+        ctx: &crate::SessionCtx,
         holder: &str,
         now_us: u64,
     ) -> Result<Self, String> {
+        Self::enter_fence(
+            ctx,
+            &SupervisorInputFence::Legacy(holder.to_string()),
+            now_us,
+        )
+    }
+
+    /// Revalidate the carried grant and count this actual write at its admitted revision.
+    pub(crate) fn enter_fence(
+        ctx: &crate::SessionCtx,
+        fence: &SupervisorInputFence,
+        now_us: u64,
+    ) -> Result<Self, String> {
         let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(refusal) = fence_refusal(&meta, holder, now_us) {
+        Self::enter_locked(ctx, fence, now_us, meta, false)
+    }
+
+    fn try_enter_fence(
+        ctx: &crate::SessionCtx,
+        fence: &SupervisorInputFence,
+        now_us: u64,
+    ) -> Result<Self, String> {
+        let meta = match ctx.meta.try_lock() {
+            Ok(meta) => meta,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Err(SCOPED_INPUT_BUSY.to_string()),
+        };
+        Self::enter_locked(ctx, fence, now_us, meta, true)
+    }
+
+    fn enter_locked(
+        ctx: &crate::SessionCtx,
+        fence: &SupervisorInputFence,
+        now_us: u64,
+        meta: std::sync::MutexGuard<'_, SessionMeta>,
+        nonparking: bool,
+    ) -> Result<Self, String> {
+        if let Some(refusal) = fence.refusal(ctx, &meta, now_us) {
             return Err(refusal);
         }
-        ctx.fenced_writes
-            .inflight
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let revision = meta.supervisor_revision;
+        let active = ActiveInput::of(fence, nonparking);
+        let state = Arc::clone(&ctx.fenced_writes.state);
+        let mut inflight = if nonparking {
+            match state.inflight.try_lock() {
+                Ok(inflight) => inflight,
+                Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    return Err(SCOPED_INPUT_BUSY.to_string());
+                }
+            }
+        } else {
+            state.inflight.lock().unwrap_or_else(|p| p.into_inner())
+        };
+        if inflight
+            .values()
+            .flatten()
+            .any(|old| old.conflicts(&active))
+        {
+            return Err(SCOPED_INPUT_BUSY.to_string());
+        }
+        inflight.entry(revision).or_default().push(active.clone());
+        drop(inflight);
         drop(meta);
-        Ok(Self { ctx })
-    }
-}
-
-impl Drop for FencedWrite<'_> {
-    fn drop(&mut self) {
-        let writes = &self.ctx.fenced_writes;
-        writes
-            .inflight
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        let meta = self.ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
-        writes.settled.notify_all();
-        drop(meta);
-    }
-}
-
-fn settle_fenced_writes<'g>(
-    ctx: &crate::SessionCtx,
-    meta: std::sync::MutexGuard<'g, SessionMeta>,
-) -> std::sync::MutexGuard<'g, SessionMeta> {
-    let writes = &ctx.fenced_writes;
-    writes
-        .settled
-        .wait_while(meta, |_| {
-            writes.inflight.load(std::sync::atomic::Ordering::SeqCst) > 0
+        Ok(Self {
+            state,
+            revision,
+            fence: fence.clone(),
+            active,
         })
-        .unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The immutable grant a queued receiver must revalidate before delivery.
+    pub(crate) fn fence(&self) -> &SupervisorInputFence {
+        &self.fence
+    }
+}
+
+impl Drop for FencedWrite {
+    fn drop(&mut self) {
+        let writes = &self.state;
+        let mut inflight = writes.inflight.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(writes) = inflight.get_mut(&self.revision) {
+            if let Some(at) = writes.iter().position(|active| *active == self.active) {
+                writes.remove(at);
+            }
+            if writes.is_empty() {
+                inflight.remove(&self.revision);
+            }
+        }
+        drop(inflight);
+        writes.settled.notify_all();
+    }
 }
 
 /// Release a proven claim when its holder process has exited or left the foreground.
-pub(crate) fn release_proven_if_gone(
+pub(crate) fn publish_release_proven_if_gone(
     ctx: &crate::SessionCtx,
     foreground: i32,
     now_us: u64,
-) -> bool {
+) -> SupervisorTransition<bool> {
     let proven = {
         let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
         meta.live_claim(now_us).and_then(|c| c.identity().cloned())
     };
     let Some(proven) = proven else {
-        return false;
+        return SupervisorTransition::unchanged(false);
     };
     if i64::from(foreground) == i64::from(proven.pid) && proven.alive() {
-        return false;
+        return SupervisorTransition::unchanged(false);
     }
     release_supervisor_if(ctx, now_us, aterm_slog::Actor::Aterm, |claim| {
         claim.identity() == Some(&proven)
     })
 }
 
+#[cfg(test)]
+pub(crate) fn release_proven_if_gone(
+    ctx: &crate::SessionCtx,
+    foreground: i32,
+    now_us: u64,
+) -> bool {
+    publish_release_proven_if_gone(ctx, foreground, now_us).published()
+}
+
 /// Clear the session's supervisor claim.
+pub(crate) fn publish_release_supervisor(
+    ctx: &crate::SessionCtx,
+    conn: Option<u64>,
+    now_us: u64,
+    by: aterm_slog::Actor,
+) -> SupervisorTransition<bool> {
+    release_supervisor_if(ctx, now_us, by, |claim| {
+        conn.is_none() || claim.conn == conn
+    })
+}
+
+#[cfg(test)]
 pub(crate) fn release_supervisor(
     ctx: &crate::SessionCtx,
     conn: Option<u64>,
     now_us: u64,
     by: aterm_slog::Actor,
 ) -> bool {
-    release_supervisor_if(ctx, now_us, by, |claim| {
-        conn.is_none() || claim.conn == conn
-    })
+    publish_release_supervisor(ctx, conn, now_us, by).acknowledge()
 }
 
 /// Connection `conn` closed at `now_us`: take the waits its proven claimant wrote on it and the
@@ -1938,13 +2815,23 @@ pub(crate) fn close_claim_connection(ctx: &crate::SessionCtx, conn: u64, now_us:
 }
 
 /// `meta unset supervisor holder=<h>`.
+pub(crate) fn publish_release_supervisor_held_by(
+    ctx: &crate::SessionCtx,
+    holder: &str,
+    now_us: u64,
+    by: aterm_slog::Actor,
+) -> SupervisorTransition<bool> {
+    release_supervisor_if(ctx, now_us, by, |claim| claim.holder == holder)
+}
+
+#[cfg(test)]
 pub(crate) fn release_supervisor_held_by(
     ctx: &crate::SessionCtx,
     holder: &str,
     now_us: u64,
     by: aterm_slog::Actor,
 ) -> bool {
-    release_supervisor_if(ctx, now_us, by, |claim| claim.holder == holder)
+    publish_release_supervisor_held_by(ctx, holder, now_us, by).acknowledge()
 }
 
 fn release_supervisor_if(
@@ -1952,19 +2839,20 @@ fn release_supervisor_if(
     now_us: u64,
     by: aterm_slog::Actor,
     ours: impl FnOnce(&SupervisorClaim) -> bool,
-) -> bool {
+) -> SupervisorTransition<bool> {
     let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
     let Some(claim) = meta.supervisor.as_ref() else {
-        return false;
+        return SupervisorTransition::unchanged(false);
     };
     if !ours(claim) {
-        return false;
+        return SupervisorTransition::unchanged(false);
     }
     let was_live = meta.live_supervisor(now_us).is_some();
     let proven = meta
         .supervisor
         .as_ref()
         .and_then(|claim| claim.proven.clone());
+    let drain = ctx.fenced_writes.capture_drain();
     let (revision, lapsed) = meta.set_supervisor(None, now_us);
     if lapsed.effective {
         record_attention(ctx, &meta, by);
@@ -1977,20 +2865,27 @@ fn release_supervisor_if(
         crate::self_claim::released(ctx, &proven, revision);
     }
     crate::harness_host::note_claim_released();
-    was_live || lapsed.any()
+    SupervisorTransition {
+        published: was_live || lapsed.any(),
+        drain,
+    }
 }
 
 /// Remove a `ttl=` claim lapsed at `now_us` and record `meta-change field=supervisor value=-`,
 /// as a release does.
-pub(crate) fn lapse_supervisor(ctx: &crate::SessionCtx, now_us: u64) -> bool {
+pub(crate) fn publish_lapse_supervisor(
+    ctx: &crate::SessionCtx,
+    now_us: u64,
+) -> SupervisorTransition<bool> {
     let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
     if meta.supervisor_expiry().is_none_or(|at| at > now_us) {
-        return false;
+        return SupervisorTransition::unchanged(false);
     }
     let proven = meta
         .supervisor
         .as_ref()
         .and_then(|claim| claim.proven.clone());
+    let drain = ctx.fenced_writes.capture_drain();
     let (revision, lapsed) = meta.set_supervisor(None, now_us);
     if lapsed.effective {
         record_attention(ctx, &meta, aterm_slog::Actor::Aterm);
@@ -2001,7 +2896,15 @@ pub(crate) fn lapse_supervisor(ctx: &crate::SessionCtx, now_us: u64) -> bool {
         crate::self_claim::released(ctx, &proven, revision);
     }
     crate::harness_host::note_claim_released();
-    true
+    SupervisorTransition {
+        published: true,
+        drain,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn lapse_supervisor(ctx: &crate::SessionCtx, now_us: u64) -> bool {
+    publish_lapse_supervisor(ctx, now_us).published()
 }
 
 /// The longest `ttl=` a `meta set supervisor` accepts (ms).
@@ -2011,7 +2914,7 @@ pub(crate) const SUPERVISOR_TTL_MAX_MS: u64 = 600_000;
 #[must_use]
 pub(crate) fn parse_carried_supervisor(row: &str) -> Option<(&str, u64)> {
     let (holder, ms) = row.split_once(' ')?;
-    if holder == "-" || !valid_owner_token(holder) {
+    if holder == "-" || !valid_owner_token(holder) || !ms.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     let ms = ms.parse::<u64>().ok().filter(|ms| *ms > 0)?;
@@ -2122,6 +3025,9 @@ pub(crate) struct MetaChange<'a> {
     pub(crate) value: Option<&'a str>,
     pub(crate) by: aterm_slog::Actor,
     pub(crate) land_at: Option<i64>,
+    /// A closed word ([`aterm_slog::vocab::WHY_WORDS`]) saying why the field reads as it does now:
+    /// the supervisor's `confirmed` or `unconfirmed` agent ([`record_supervisor_act`]).
+    pub(crate) why: Option<&'static str>,
 }
 
 impl<'a> MetaChange<'a> {
@@ -2136,12 +3042,21 @@ impl<'a> MetaChange<'a> {
             value,
             by,
             land_at: None,
+            why: None,
         }
     }
 
     /// This change with the Autopilot pair's timer, as its row says it.
     pub(crate) const fn with_land_at(self, land_at: Option<i64>) -> Self {
         MetaChange { land_at, ..self }
+    }
+
+    /// This change with its closed `why=` word.
+    pub(crate) const fn with_why(self, why: &'static str) -> Self {
+        MetaChange {
+            why: Some(why),
+            ..self
+        }
     }
 }
 
@@ -2181,10 +3096,27 @@ fn record_supervisor(
     by: aterm_slog::Actor,
 ) {
     let change = MetaChange::written_by(SUPERVISOR_FIELD, holder, by);
+    // This mark says no act: the next read under a claim tells the act again (H6 rule 3).
+    crate::agent_act::forget_told(ctx.self_id.as_str());
     let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
     timeline.forget_holder_acts();
     timeline.note_supervisor_moved(holder.is_some(), crate::metrics::now_us());
     timeline.record_meta_change(change, meta);
+}
+
+/// The session log's word on what the harness may do in `ctx`'s session now, as the host's read
+/// of its agent's image moved to it (`why` is [`crate::agent_act::why`]'s): `mark - meta
+/// field=supervisor value=<holder> why=confirmed|unconfirmed`, by the harness. Words only: the
+/// image's path is never written.
+pub(crate) fn record_supervisor_act(ctx: &crate::SessionCtx, why: &'static str) {
+    let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+    let holder = meta.live_supervisor(crate::metrics::now_us());
+    let change =
+        MetaChange::written_by(SUPERVISOR_FIELD, holder, aterm_slog::Actor::Harness).with_why(why);
+    ctx.timeline
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .record_meta_change(change, &meta);
 }
 
 /// Put a carried identity back onto a session already live here, which a reader may have seen
@@ -2392,6 +3324,9 @@ pub(crate) struct SessionTimeline {
     leader_copy: Option<(i32, &'static str)>,
     leader_no_harness: Option<i32>,
     leader_no_harness_applied: Option<i32>,
+    /// The foreground leader's group while it is a build's front waiting for memory, and what its
+    /// ledger says ([`Self::build_wait`]).
+    leader_wait: Option<(i32, crate::session_status::program::BuildWait)>,
     upgrade: Option<(
         aterm_agent::harness::upgrade_drive::Row,
         Option<UpgradeOwner>,
@@ -2413,9 +3348,13 @@ pub(crate) struct SessionTimeline {
     worker_installing: bool,
     claude_excerpts: Option<(i32, crate::survey::ClaudeExcerpts)>,
     codex_survey: Option<(i32, crate::survey::CodexSurvey)>,
-    codex_build: Option<(i32, String)>,
+    /// Where the agent in group `.0` works, as the harness host last read it ([`Self::set_work`]).
+    work: Option<(i32, aterm_agent::harness::work_record::WorkRecord)>,
     program_shown: Option<ShownProgram>,
     program_episodes: u64,
+    /// The ledger instant ([`now_ms`]) the program's own report last moved
+    /// ([`Self::note_program_state`]), where [`Self::ab_word`] reads its word from.
+    program_moved_ms: u64,
     claude_side: Option<(i32, std::sync::Arc<crate::claude_footer::FactSide>)>,
     claude_footer_read: Option<(i32, std::time::Instant)>,
     gauges: AgentGauges,
@@ -2442,6 +3381,11 @@ pub(crate) struct SessionTimeline {
     pause: Option<crate::PausePlan>,
     harness_needs: crate::needs::ToldNeeds,
     land_held: Option<aterm_agent::harness::acts::LandHeld>,
+    /// The hold's own words as the loop last told them ([`Self::land_said()`], slice 4b).
+    land_said: Option<Arc<aterm_agent::harness::hold_said::HoldSaid>>,
+    /// The words moved since the hold was last stored ([`Self::set_land_held`] says so once).
+    land_said_untold: bool,
+    land_receipt: Option<Arc<aterm_agent::harness::acts::LandReceipt>>,
     cwd_witness: Option<(u64, i32)>,
     holder_image: Option<std::sync::Arc<crate::holder_image::HolderImage>>,
     drawer_groups: crate::holder_image::DrawerGroups,
@@ -2573,6 +3517,8 @@ pub(crate) struct AgentPublication {
     pub(crate) verdict_moves: u64,
     pub(crate) subject: Option<String>,
     pub(crate) changed_ms: u64,
+    /// Unix milliseconds when the current screen word began, unchanged by details or an input-stall overlay.
+    pub(crate) screen_word_unix_ms: u64,
     pub(crate) changed_continuous_ms: Option<u64>,
     pub(crate) stamp: Option<AgentStamp>,
     pub(crate) screen_word: &'static str,
@@ -2684,6 +3630,7 @@ impl Default for AgentPublication {
             verdict_moves: 0,
             subject: None,
             changed_ms: now_ms(),
+            screen_word_unix_ms: aterm_time::unix_millis().unwrap_or(0),
             changed_continuous_ms: aterm_uds::process::continuous_ms(),
             stamp: None,
             screen_word: "-",
@@ -2901,6 +3848,7 @@ impl SessionTimeline {
         self.program_episodes = self.program_episodes.wrapping_add(1);
         let seq = self.program_episodes;
         self.program_shown = shown.map(|state| ShownProgram::now(state, seq, report));
+        self.program_moved_ms = now_ms();
         let at = self.slog.now();
         self.slog.observe_program(shown, at);
         self.record(PROGRAM_STATE);
@@ -3506,6 +4454,9 @@ impl SessionTimeline {
         let reader_changed = self.agent.reader != reader;
         let old_word = self.agent.word;
         self.set_agent_reader(reader);
+        if self.agent.screen_word != word {
+            self.agent.screen_word_unix_ms = aterm_time::unix_millis().unwrap_or(0);
+        }
         self.agent.screen_word = word;
         self.agent.screen_detail = detail;
         let changed = self.settle_agent_word(regrid);
@@ -3637,6 +4588,7 @@ impl SessionTimeline {
         self.leader_copy = None;
         self.leader_no_harness = None;
         self.leader_no_harness_applied = None;
+        self.leader_wait = None;
         if self.agent.program.take().is_some() || had_reader {
             crate::harness_host::ring();
         }
@@ -4333,6 +5285,32 @@ impl SessionTimeline {
         }
     }
 
+    /// The word the A/B book charges (`HarnessScreen::note_phase`) and the ledger instant it
+    /// moved: the reader's, or where the reader names no state (`unknown`, codex's) the program's
+    /// own report's ([`Self::shown_agent_word`]'s rule; none shown is `unknown`), so the busy
+    /// time of a codex-alab whose screen aterm reads no phase from counts toward its landing's
+    /// work floor (`harness_task::END_WORK_MS`). An `error` report (a turn an API or connection
+    /// error ended) is `unknown` here, no phase: a system message is a wait, not the agent's turn
+    /// end (design §14.17.5), as Claude Code's walls charge no phase.
+    pub(crate) fn ab_word(&self) -> (&'static str, u64) {
+        use aterm_core::terminal::program_state::ProgramStateWord;
+        if self.agent.word != "unknown" {
+            return (self.agent.word, self.agent.changed_ms);
+        }
+        let word = self
+            .program_shown
+            .filter(|shown| shown.state.state != ProgramStateWord::Error)
+            .map_or(self.agent.word, |shown| {
+                crate::program_state::survey_word(shown.state)
+            });
+        (word, self.agent.changed_ms.max(self.program_moved_ms))
+    }
+
+    /// Whether the program's own report is the word the A/B book charges ([`Self::ab_word`]).
+    pub(crate) fn program_speaks(&self) -> bool {
+        self.agent.word == "unknown"
+    }
+
     /// The rollout tap's facts for the codex process in group `pgid` ([`crate::codex_rollout_tap`]),
     /// taken only while that group is in front: whether they were.
     pub(crate) fn set_codex_survey(
@@ -4350,11 +5328,9 @@ impl SessionTimeline {
         true
     }
 
-    /// Forget the rollout tap's facts and the build it named: its tap went. Returns whether any
-    /// were cleared.
+    /// Forget the rollout tap's facts when its tap goes. Returns whether any were cleared.
     pub(crate) fn clear_codex_survey(&mut self) -> bool {
-        let facts = self.codex_survey.take().is_some();
-        self.codex_build.take().is_some() || facts
+        self.codex_survey.take().is_some()
     }
 
     /// The codex facts the survey shows, or `None` when the program in front is not the one they
@@ -4366,24 +5342,32 @@ impl SessionTimeline {
             .map(|(_, survey)| survey)
     }
 
-    /// The product version the codex process in group `pgid` runs, as the rollout tap read it off its
-    /// image ([`aterm_agent::harness::codex_alab::product_version`]), taken only while that group is in
-    /// front: whether it was. Apart from [`Self::codex_survey`], which a build alone never makes.
-    pub(crate) fn set_codex_build(&mut self, pgid: i32, build: Option<String>) -> bool {
-        if self.agent.program_pgid != pgid {
+    /// Where the agent in group `pgid` works ([`aterm_agent::harness::work_record::WorkRecord`]),
+    /// or nothing to show (`None`), taken only while that group is in front and the task's face is
+    /// not landed: whether it was. A landing clears it ([`Self::set_task_face`]).
+    pub(crate) fn set_work(
+        &mut self,
+        pgid: i32,
+        record: Option<aterm_agent::harness::work_record::WorkRecord>,
+    ) -> bool {
+        let landed = matches!(
+            self.task_face,
+            Some((aterm_agent::harness::acts::TaskFace::Landed, _))
+        );
+        if self.agent.program_pgid != pgid || (landed && record.is_some()) {
             return false;
         }
-        self.codex_build = build.map(|build| (pgid, build));
+        self.work = record.map(|record| (pgid, record));
         true
     }
 
-    /// The build [`Self::set_codex_build`] took, or `None` when the program in front is not the
-    /// one it was read for.
-    pub(crate) fn codex_build(&self) -> Option<&str> {
-        self.codex_build
+    /// The work record the survey shows, or `None` when the program in front is not the one it
+    /// was read for.
+    pub(crate) fn work(&self) -> Option<&aterm_agent::harness::work_record::WorkRecord> {
+        self.work
             .as_ref()
             .filter(|(pgid, _)| *pgid == self.agent.program_pgid)
-            .map(|(_, build)| build.as_str())
+            .map(|(_, record)| record)
     }
 
     /// The footer resolver's side for `pgid`, applied only while that group is in front.
@@ -4517,6 +5501,32 @@ impl SessionTimeline {
         let changed = self.leader_no_harness != next;
         self.leader_no_harness = next;
         changed
+    }
+
+    /// The resolver's reading of `pgid`'s leader as a build's front waiting for memory
+    /// ([`crate::session_status::program::LeaderFacts::build_wait`]), applied only while that group is in
+    /// front; whether it changed what [`Self::build_wait`] says.
+    pub(crate) fn set_build_wait(
+        &mut self,
+        pgid: i32,
+        wait: Option<crate::session_status::program::BuildWait>,
+    ) -> bool {
+        if self.agent.program_pgid != pgid {
+            return false;
+        }
+        let next = wait.map(|wait| (pgid, wait));
+        let changed = self.leader_wait != next;
+        self.leader_wait = next;
+        changed
+    }
+
+    /// The foreground leader's wait for memory, while it is a build's front whose claim waits
+    /// (`status wait=memory`, the survey's `wait=`): `None` for any other leader.
+    pub(crate) fn build_wait(&self) -> Option<&crate::session_status::program::BuildWait> {
+        self.leader_wait
+            .as_ref()
+            .filter(|(pgid, _)| *pgid > 0 && *pgid == self.agent.program_pgid)
+            .map(|(_, wait)| wait)
     }
 
     /// Whether the current foreground leader was started with `--no-harness` / `--no-alab-harness`.
@@ -4675,6 +5685,20 @@ impl SessionTimeline {
             return false;
         }
         self.task_face_seeded = false;
+        if matches!(
+            face,
+            Some(
+                aterm_agent::harness::acts::TaskFace::Open
+                    | aterm_agent::harness::acts::TaskFace::Theirs
+            )
+        ) {
+            // A RECEIPT NEVER OUTLIVES ITS LANDING (§14.9, slice 9b).
+            self.land_receipt = None;
+        }
+        if face == Some(aterm_agent::harness::acts::TaskFace::Landed) {
+            // A landed session works nowhere until its task opens again.
+            self.work = None;
+        }
         let held = self.task_face_held.take();
         self.task_face = match face {
             None => {
@@ -4761,17 +5785,61 @@ impl SessionTimeline {
         self.harness_needs.clone()
     }
 
-    /// Replace Land's hold as the session's loop told it ([`Self::land_held()`]).
+    /// Replace Land's hold as the session's loop told it ([`Self::land_held()`]): whether it
+    /// moved, or the hold's words did since it was last stored ([`Self::set_land_said`]), so the
+    /// one fact the hold's tell sends carries a reworded quote too (slice 4b).
     pub(crate) fn set_land_held(
         &mut self,
         held: Option<aterm_agent::harness::acts::LandHeld>,
     ) -> bool {
-        std::mem::replace(&mut self.land_held, held) != held
+        let words = std::mem::take(&mut self.land_said_untold);
+        (std::mem::replace(&mut self.land_held, held) != held) | words
+    }
+
+    /// Replace the hold's own words as the session's loop told them ([`Self::land_said()`]):
+    /// whether they moved. The loop tells the hold right after them, and that store says they
+    /// moved ([`Self::set_land_held`]).
+    pub(crate) fn set_land_said(
+        &mut self,
+        said: Option<Arc<aterm_agent::harness::hold_said::HoldSaid>>,
+    ) -> bool {
+        let moved = self.land_said.as_deref() != said.as_deref();
+        self.land_said = said;
+        self.land_said_untold |= moved;
+        moved
+    }
+
+    /// The hold's own words as the session's loop last told this window's host (§14.17 item 1,
+    /// slice 4b): what the agent said is left and the files git found, sanitized at store.
+    pub(crate) fn land_said(&self) -> Option<&Arc<aterm_agent::harness::hold_said::HoldSaid>> {
+        self.land_said.as_ref()
     }
 
     /// Land's hold as the session's loop last told this window's host (§12.3.3 item 3).
     pub(crate) const fn land_held(&self) -> Option<aterm_agent::harness::acts::LandHeld> {
         self.land_held
+    }
+
+    /// Replace what aterm checked at the landing, as the session's loop told it
+    /// ([`Self::land_receipt()`]): whether it moved.
+    pub(crate) fn set_land_receipt(
+        &mut self,
+        receipt: Option<Arc<aterm_agent::harness::acts::LandReceipt>>,
+    ) -> bool {
+        let same = match (&self.land_receipt, &receipt) {
+            (Some(a), Some(b)) => a == b,
+            (None, None) => true,
+            _ => false,
+        };
+        self.land_receipt = receipt;
+        !same
+    }
+
+    /// What aterm checked at the landing that stands, as the session's loop last told this
+    /// window's host (§14.9, slice 9b), until the task's face moves to open or theirs. Whether
+    /// the landing answered the land check is its `check` (`mode_words::said_words` words it).
+    pub(crate) fn land_receipt(&self) -> Option<&Arc<aterm_agent::harness::acts::LandReceipt>> {
+        self.land_receipt.as_ref()
     }
 
     /// `(path word, "path_evidence= copy= upgrade=")` for `status` and roster rows, after
@@ -4823,6 +5891,161 @@ pub(crate) fn clamp_payload(s: String) -> Arc<str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_screen_wall_detail_keeps_the_limit_episode_start() {
+        let mut timeline = SessionTimeline::default();
+        let stamp = || AgentStamp {
+            generation: crate::control::ScreenGen { epoch: 1, seq: 1 },
+            fp: 1,
+        };
+        timeline.publish_agent(
+            "wall:usage-weekly",
+            None,
+            None,
+            Some(aterm_phase::Program::Claude),
+            stamp(),
+        );
+        timeline.agent.screen_word_unix_ms = 17;
+        timeline.publish_agent(
+            "wall:usage-weekly",
+            Some("a later countdown".into()),
+            None,
+            Some(aterm_phase::Program::Claude),
+            stamp(),
+        );
+        assert_eq!(
+            timeline.agent.screen_word_unix_ms, 17,
+            "a changed detail cannot turn a cleared wall into a new rejection"
+        );
+        timeline.publish_agent(
+            "idle",
+            None,
+            None,
+            Some(aterm_phase::Program::Claude),
+            stamp(),
+        );
+        timeline.publish_agent(
+            "wall:usage-weekly",
+            None,
+            None,
+            Some(aterm_phase::Program::Claude),
+            stamp(),
+        );
+        assert!(
+            timeline.agent.screen_word_unix_ms > 17,
+            "a later limit episode has its own start"
+        );
+    }
+
+    /// One capture preserves a claim's identity, binding and revision, and assigns every duty
+    /// exactly once. Legacy foreign claims and v2 retain full ownership; v3 takes its subset.
+    /// An expired claim is absent, and reading either snapshot changes no revision.
+    #[test]
+    fn supervisor_authority_captures_partial_full_and_expired_ownership() {
+        use aterm_agent::harness::contract::{Scope, Words, read};
+        let host = "aterm-harness@7";
+        let proof = crate::self_claim::Proven {
+            pid: 4242,
+            start: "birth".to_string(),
+        };
+        let Words::Scoped(claim) = read("grok-alab@4242", &["contract=3", "scope=upgrade"]) else {
+            panic!("the roster admits an upgrade claim");
+        };
+        let mut meta = SessionMeta {
+            supervisor_revision: 7,
+            ..SessionMeta::default()
+        };
+        let empty = meta.supervisor_authority(10);
+        assert_eq!(empty.holder(), None);
+        assert_eq!(empty.contract(), None);
+        assert_eq!(empty.identity(), None);
+        assert_eq!(empty.connection(), None);
+        assert_eq!(empty.scopes(), None);
+        assert_eq!(empty.revision(), 7);
+        assert_eq!(
+            empty.wire_fields(),
+            "supervisor_contract=- supervisor_scope=- supervisor_revision=7"
+        );
+        for duty in Scope::ALL {
+            assert!(!empty.external_takes(host, duty));
+            assert!(empty.builtin_keeps(host, duty));
+        }
+
+        meta.supervisor = Some(SupervisorClaim {
+            holder: "grok-alab@4242".to_string(),
+            conn: Some(4),
+            expires_us: None,
+            proven: None,
+            scoped: Some(crate::harness_claim::Scoped {
+                proven: proof.clone(),
+                claim,
+            }),
+        });
+        let partial = meta.supervisor_authority(10);
+        assert_eq!(partial.holder(), Some("grok-alab@4242"));
+        assert_eq!(partial.contract(), Some(3));
+        assert_eq!(partial.identity(), Some(&proof));
+        assert_eq!(partial.connection(), Some(4));
+        assert_eq!(
+            partial.scopes().map(|s| s.words()).as_deref(),
+            Some("upgrade")
+        );
+        assert_eq!(
+            partial.wire_fields(),
+            "supervisor_contract=3 supervisor_scope=upgrade supervisor_revision=7"
+        );
+        for duty in Scope::ALL {
+            assert_eq!(partial.external_takes(host, duty), duty == Scope::Upgrade);
+            assert_eq!(partial.builtin_keeps(host, duty), duty != Scope::Upgrade);
+        }
+
+        for (holder, proven, contract) in [
+            ("foreign", None, None),
+            ("codex-alab@4242", Some(proof.clone()), Some(2)),
+            (host, None, None),
+        ] {
+            meta.supervisor = Some(SupervisorClaim {
+                holder: holder.to_string(),
+                conn: Some(5),
+                expires_us: Some(20),
+                proven,
+                scoped: None,
+            });
+            let live = meta.supervisor_authority(19);
+            assert_eq!(live.contract(), contract, "{holder}");
+            assert_eq!(live.scopes(), None, "implicit full scope");
+            assert!(
+                live.wire_fields().contains(
+                    "supervisor_scope=relaunch,upgrade,turn-end,approvals,questions,walls"
+                )
+            );
+            for duty in Scope::ALL {
+                assert_eq!(live.external_takes(host, duty), holder != host);
+                assert_eq!(live.builtin_keeps(host, duty), holder == host);
+            }
+            let expired = meta.supervisor_authority(20);
+            assert_eq!(expired.holder(), None);
+            assert_eq!(expired.contract(), None);
+            assert_eq!(expired.identity(), None);
+            assert_eq!(expired.connection(), None);
+            assert_eq!(expired.scopes(), None);
+            assert_eq!(expired.revision(), 7);
+            assert!(
+                Scope::ALL
+                    .into_iter()
+                    .all(|duty| expired.builtin_keeps(host, duty))
+            );
+        }
+        assert_eq!(meta.supervisor_revision, 7, "capture is read-only");
+        assert_eq!(
+            partial.contract(),
+            Some(3),
+            "an earlier capture stays unchanged"
+        );
+        assert_eq!(partial.connection(), Some(4));
+        assert!(partial.external_takes(host, Scope::Upgrade));
+    }
 
     #[test]
     fn metadata_sanitizer_is_single_line_bidi_safe_and_grapheme_bounded() {
@@ -5314,6 +6537,61 @@ mod account_progress_tests {
         );
         assert!(!timeline.set_account_progress(42, Some(100), Some("one"), Some(progress)));
         assert_eq!(snapshot(&timeline), None);
+    }
+
+    #[test]
+    fn transcript_only_recovery_reads_remain_unknown_and_foreground_bound() {
+        use crate::harness_recovery_verb::{cmd, snapshot};
+        use aterm_agent::harness::{account_progress::ProgressPhase, session_usage::Wall};
+        let mut timeline = SessionTimeline::for_test();
+        timeline.agent.program_pgid = 42;
+        let mut footer = facts("one");
+        footer.usage.get_or_insert_with(Default::default).wall = Some(Wall {
+            label: "5h",
+            resets: "3pm".into(),
+        });
+        assert!(timeline.set_claude_footer(42, Some(100), Some(footer)));
+        let progress = snapshot(&timeline).expect("typed wall is disclosed");
+        assert_eq!(progress.phase, ProgressPhase::Unknown);
+        assert_eq!(
+            (
+                progress.observed_at,
+                progress.next_at,
+                progress.known,
+                progress.eligible
+            ),
+            (0, None, None, None)
+        );
+        let reply = cmd("recovery", true, || Ok(snapshot(&timeline)));
+        for field in [
+            "available=1",
+            "phase=unknown",
+            "account=-",
+            "known=-",
+            "eligible=-",
+            "observed_at=-",
+            "next_at=-",
+        ] {
+            assert!(
+                reply.split_whitespace().any(|word| word == field),
+                "{reply}"
+            );
+        }
+        let limit = reply
+            .split_whitespace()
+            .find_map(|word| word.strip_prefix("wall="))
+            .unwrap();
+        assert!(aterm_control::wire::pct_decode(limit).contains("provider reset: 3pm"));
+        assert!(timeline.claude_footer().unwrap().account_progress.is_none());
+        timeline.agent.program_pgid = 43;
+        assert_eq!(snapshot(&timeline), None);
+        timeline.agent.program_pgid = 42;
+        assert!(timeline.set_claude_footer(42, Some(102), Some(facts("two"))));
+        assert_eq!(
+            snapshot(&timeline),
+            None,
+            "the old limit is not retained in the new process"
+        );
     }
 }
 

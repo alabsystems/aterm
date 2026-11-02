@@ -144,13 +144,13 @@ impl ToneTracker {
         self.keys_since_infer = 0;
         self.last_infer = Some(now);
         self.inferences = self.inferences.saturating_add(1);
+        if self.buf.len() < 3 {
+            return;
+        }
         let Some(model) = tone::builtin() else {
             self.tone = Tone::Technical;
             return;
         };
-        if self.buf.len() < 3 {
-            return;
-        }
         let (s0, s1) = self.buf.as_slices();
         if let Some(tone) = model.classify_char_slices_opt([s0, s1], &mut self.scratch) {
             self.tone = tone;

@@ -3,12 +3,13 @@
 
 //! Automatic import and proof of the Developer ID pair delivered by the admitted vault.
 
+use super::super::entry::read_signing_material;
 use super::*;
+use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 const RETRY: Duration = Duration::from_secs(60);
 const RECHECK: Duration = Duration::from_secs(30 * 60);
-const APPLE_PREFIX: &str = "~/.aterm/apple/devid-";
 const PROOF: &str = "release-signing-proof.toml";
 
 /// Read-only, value-free readiness of this member's automatic signing setup.
@@ -64,7 +65,15 @@ fn local_stamp(paths: &Paths) -> crate::Result<Option<String>> {
     };
     let meta = match std::fs::symlink_metadata(crate::release_keychain::keychain_path(&paths.home))
     {
-        Ok(meta) if meta.is_file() && meta.uid() == fsx::euid() && meta.nlink() == 1 => meta,
+        Ok(meta)
+            if meta.is_file()
+                && meta.uid() == fsx::euid()
+                && meta.nlink() == 1
+                && meta.mode() & 0o077 == 0
+                && meta.mode() & 0o6000 == 0 =>
+        {
+            meta
+        }
         Ok(_) => return Ok(None),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(Error::new(format!("signing keychain metadata: {error}"))),
@@ -80,18 +89,29 @@ fn local_stamp(paths: &Paths) -> crate::Result<Option<String>> {
     )))
 }
 
-fn proof_current(paths: &Paths, material: &Material) -> crate::Result<bool> {
+/// A successful proof for these exact authenticated bytes, and its age. Keychain upkeep
+/// does not change which material signed; its current usability is checked separately.
+fn material_proof(paths: &Paths, material: &Material) -> crate::Result<Option<(ProofRecord, u64)>> {
     let Some(raw) = fsx::read_private(&paths.dir.join(PROOF), 2048)? else {
-        return Ok(false);
+        return Ok(None);
     };
     let Some(record) = raw.as_str().and_then(ProofRecord::parse) else {
+        return Ok(None);
+    };
+    let Some(age) = now()?.checked_sub(record.proved) else {
+        return Ok(None);
+    };
+    Ok(
+        (record.material == material.stamp && record.identity == material.identity)
+            .then_some((record, age)),
+    )
+}
+
+fn proof_current(paths: &Paths, material: &Material) -> crate::Result<bool> {
+    let Some((record, age)) = material_proof(paths, material)? else {
         return Ok(false);
     };
-    let age = now()?.checked_sub(record.proved);
-    Ok(record.material == material.stamp
-        && record.identity == material.identity
-        && age.is_some_and(|age| age < RECHECK.as_secs())
-        && local_stamp(paths)?.as_deref() == Some(record.local.as_str()))
+    Ok(age < RECHECK.as_secs() && local_stamp(paths)?.as_deref() == Some(record.local.as_str()))
 }
 
 /// Read readiness without modifying credentials, keychains, or the roster's anti-rollback
@@ -108,20 +128,34 @@ pub fn signing_status(paths: &Paths) -> crate::Result<SigningStatus> {
         ));
     };
     if !alab_vault(&config)
-        && !paths.home.join(RELEASE_PROFILE).exists()
-        && !paths.home.join(LEGACY_RELEASE_PROFILE).exists()
+        && !matches!(
+            fsx::kind(&paths.home.join(RELEASE_PROFILE)),
+            Ok(fsx::Kind::File)
+        )
+        && !matches!(
+            fsx::kind(&paths.home.join(LEGACY_RELEASE_PROFILE)),
+            Ok(fsx::Kind::File)
+        )
     {
         return Ok(SigningStatus::NotApplicable(
             "this vault has no shared release ring".into(),
         ));
     }
-    if !authorized_ring_readonly(paths) {
+    status_authorized(paths, &config, authorized_ring_readonly(paths))
+}
+
+fn status_authorized(
+    paths: &Paths,
+    config: &Config,
+    authorized: bool,
+) -> crate::Result<SigningStatus> {
+    if !authorized {
         return Ok(SigningStatus::Pending(
             "awaiting a private matching release profile/key and current master-signed roster"
                 .into(),
         ));
     }
-    status_with(paths, &config)
+    status_with(paths, config)
 }
 
 fn status_with(paths: &Paths, config: &Config) -> crate::Result<SigningStatus> {
@@ -223,23 +257,26 @@ fn material(paths: &Paths, config: &Config) -> crate::Result<Option<Material>> {
     let state = load_state(paths)?;
     let wanted = profile_identity(paths)?;
     let mut shared = None;
-    for name in state.manifest.files.keys() {
+    // Ownership is only a candidate index. Both tracked and adopted files must still match
+    // current authenticated entries, and an adopted file stays outside the manifest.
+    let names: BTreeSet<_> = state
+        .manifest
+        .files
+        .keys()
+        .chain(state.own.iter().flat_map(|names| names.iter()))
+        .collect();
+    for name in names {
         if !name.starts_with(APPLE_PREFIX) || !name.ends_with(".cer") {
             continue;
         }
-        let key_name = format!("{}.key", name.trim_end_matches(".cer"));
-        if !state.manifest.files.contains_key(&key_name) {
-            continue;
-        }
-        let Some(cert) = read_verified_entry(paths, config, name)? else {
+        let key_name = format!("{}.key", name.strip_suffix(".cer").unwrap_or(name));
+        let Some(cert) = read_signing_material(paths, config, name)? else {
             continue;
         };
-        let Some(key) = read_verified_entry(paths, config, &key_name)? else {
+        let Some(key) = read_signing_material(paths, config, &key_name)? else {
             continue;
         };
-        let identity = certificate_identity(cert.value().as_slice())?;
-        let cert = cert.value().clone();
-        let key = key.value().clone();
+        let identity = certificate_identity(cert.as_slice())?;
         let stamp = format!(
             "{}:{}",
             materialize::digest_hex(cert.as_slice()),
@@ -264,11 +301,30 @@ fn material(paths: &Paths, config: &Config) -> crate::Result<Option<Material>> {
     Ok(shared)
 }
 
-/// The proven, vault-delivered Apple identity for this exact local release profile. This
-/// leaves the release ring's cryptographic identity and the profile's bytes unchanged.
-/// An explicit unrelated profile never adopts this member's shared Apple identity.
+/// The previously proven, currently authorized Apple identity for this exact local release
+/// profile. Keychain upkeep or an expired readiness receipt does not select a different
+/// identity: the cutter still checks its keychain and signs with it. This grants no current
+/// readiness and leaves the profile's bytes unchanged. An explicit unrelated profile never
+/// adopts this member's shared identity.
 pub fn effective_signing_identity(paths: &Paths, profile: &Path) -> crate::Result<Option<String>> {
     effective_identity_with(paths, profile, authorized_ring_readonly(paths))
+}
+
+/// The same selection under a fixture's roster anchors, with real ring authorization.
+/// This test seam is absent from production release builds.
+#[cfg(any(test, debug_assertions))]
+pub fn test_signing_observation(
+    paths: &Paths,
+    profile: &Path,
+    anchors: &[&str],
+    at: i64,
+) -> crate::Result<(Option<String>, SigningStatus)> {
+    let authorized = authorized_ring_check(paths, anchors, at, false);
+    let config = config(paths)?.ok_or_else(|| Error::new("fixture has no vault"))?;
+    Ok((
+        effective_identity_with(paths, profile, authorized)?,
+        status_authorized(paths, &config, authorized)?,
+    ))
 }
 
 fn effective_identity_with(
@@ -276,15 +332,20 @@ fn effective_identity_with(
     profile: &Path,
     authorized: bool,
 ) -> crate::Result<Option<String>> {
-    let selected = if paths.home.join(RELEASE_PROFILE).exists() {
+    let selected = if matches!(
+        fsx::kind(&paths.home.join(RELEASE_PROFILE)),
+        Ok(fsx::Kind::File)
+    ) {
         paths.home.join(RELEASE_PROFILE)
     } else {
         paths.home.join(LEGACY_RELEASE_PROFILE)
     };
-    let same_profile = std::fs::canonicalize(profile)
-        .ok()
-        .zip(std::fs::canonicalize(selected).ok())
-        .is_some_and(|(a, b)| a == b);
+    let same_profile = matches!(fsx::kind(profile), Ok(fsx::Kind::File))
+        && matches!(fsx::kind(&selected), Ok(fsx::Kind::File))
+        && std::fs::canonicalize(profile)
+            .ok()
+            .zip(std::fs::canonicalize(selected).ok())
+            .is_some_and(|(a, b)| a == b);
     if !same_profile || !authorized {
         return Ok(None);
     }
@@ -294,7 +355,43 @@ fn effective_identity_with(
     let Some(material) = material(paths, &config)? else {
         return Ok(None);
     };
-    Ok(proof_current(paths, &material)?.then_some(material.identity))
+    Ok(material_proof(paths, &material)?.map(|_| material.identity))
+}
+
+/// Select current authenticated shared material for the explicit probe's real signature.
+/// This is identity selection only; it does not claim that the keychain is ready.
+pub(super) fn probe_identity(paths: &Paths) -> crate::Result<String> {
+    let config = config(paths)?.ok_or_else(|| Error::new("release probe has no vault"))?;
+    if !authorized_ring_readonly(paths) {
+        return Err(Error::new("release probe has no current release ring"));
+    }
+    material(paths, &config)?
+        .map(|material| material.identity)
+        .ok_or_else(|| Error::new("release probe awaits current authenticated signing material"))
+}
+
+/// Called only after the explicit probe verified a real signature while still holding the
+/// shared SigningLease. Publish the same receipt contract used by automatic convergence.
+pub(super) fn record_probe_signature(paths: &Paths, identity: &str) -> crate::Result<()> {
+    let config = config(paths)?.ok_or_else(|| Error::new("release probe has no vault"))?;
+    if !authorized_ring_readonly(paths) {
+        return Err(Error::new("release probe ring changed before its receipt"));
+    }
+    let material = material(paths, &config)?
+        .filter(|material| material.identity == identity)
+        .ok_or_else(|| Error::new("release probe material changed before its receipt"))?;
+    write_proof(paths, &material)
+}
+
+fn write_proof(paths: &Paths, material: &Material) -> crate::Result<()> {
+    let record = ProofRecord {
+        material: material.stamp.clone(),
+        local: local_stamp(paths)?
+            .ok_or_else(|| Error::new("automatic signing proof left no owned private keychain"))?,
+        identity: material.identity.clone(),
+        proved: now()?,
+    };
+    fsx::write_atomic(&paths.dir.join(PROOF), record.text().as_bytes(), 0o600)
 }
 
 fn prepare(paths: &Paths, material: &Material) -> crate::Result<()> {
@@ -364,16 +461,7 @@ impl Rounds {
             0o600,
         )?;
         prepare(paths, &material)?;
-        let record = ProofRecord {
-            material: material.stamp.clone(),
-            local: local_stamp(paths)?.ok_or_else(|| {
-                Error::new("automatic signing proof left no owned private keychain")
-            })?,
-            identity: material.identity.clone(),
-            proved: now()?,
-        };
-        let raw = record.text();
-        fsx::write_atomic(&paths.dir.join(PROOF), raw.as_bytes(), 0o600)?;
+        write_proof(paths, &material)?;
         self.proved = Some((material.stamp, Instant::now()));
         Ok(Some(format!(
             "shared signing identity {} is ready (private keychain, unattended signing proved)",
@@ -386,6 +474,94 @@ impl Rounds {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn adopted_signing_material_is_prepared_without_changing_files_or_ownership() {
+        for anchored in [false, true] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let paths = Paths::for_home(&root.path().join("member"));
+            let source = root.path().join("vault");
+            test_create_unbound(&paths, source.to_str().unwrap(), None, Some("m1")).unwrap();
+            let cert_name = "~/.aterm/apple/devid-existing.cer";
+            let key_name = "~/.aterm/apple/devid-existing.key";
+            let cert = materialize::target_path(&paths.home, cert_name).unwrap();
+            let key = materialize::target_path(&paths.home, key_name).unwrap();
+            fsx::ensure_private_dir(cert.parent().unwrap()).unwrap();
+            if !anchored {
+                fsx::write_atomic(&cert, b"synthetic certificate", 0o600).unwrap();
+            }
+            fsx::write_atomic(&key, b"synthetic private key", 0o600).unwrap();
+            let admin = admin_open(&paths).unwrap();
+            let mut doc = admin.doc.clone();
+            doc.set_entry_with(
+                &Audience::Everyone,
+                cert_name,
+                b"synthetic certificate",
+                anchored,
+                None,
+            )
+            .unwrap();
+            doc.set_entry_with(
+                &Audience::Everyone,
+                key_name,
+                b"synthetic private key",
+                anchored,
+                anchored.then_some(cert_name),
+            )
+            .unwrap();
+            admin_publish(&paths, &admin, &doc).unwrap();
+            let cfg = config(&paths).unwrap().unwrap();
+            let state = load_state(&paths).unwrap();
+            assert_eq!(state.manifest.files.contains_key(cert_name), anchored);
+            assert!(!state.manifest.files.contains_key(key_name));
+            assert_eq!(state.own.as_ref().unwrap().contains(cert_name), !anchored);
+            assert!(state.own.as_ref().unwrap().contains(key_name));
+            let before = (
+                std::fs::read(paths.state_file()).unwrap(),
+                std::fs::read(&cert).unwrap(),
+                std::fs::read(&key).unwrap(),
+            );
+            let calls = Cell::new(0);
+            let prepare = |paths: &Paths, material: &Material| {
+                calls.set(calls.get() + 1);
+                assert_eq!(material.cert.as_slice(), b"synthetic certificate");
+                assert_eq!(material.key.as_slice(), b"synthetic private key");
+                fsx::ensure_private_dir(
+                    crate::release_keychain::keychain_path(&paths.home)
+                        .parent()
+                        .unwrap(),
+                )
+                .unwrap();
+                fsx::write_atomic(
+                    &crate::release_keychain::keychain_path(&paths.home),
+                    b"prepared",
+                    0o600,
+                )
+                .unwrap();
+                fsx::write_atomic(
+                    &crate::release_keychain::password_path(&paths.home),
+                    b"prepared",
+                    0o600,
+                )
+                .unwrap();
+                Ok(())
+            };
+            Rounds::default().step(&paths, &cfg, &prepare).unwrap();
+            assert_eq!(calls.get(), 1);
+            assert!(matches!(
+                status_with(&paths, &cfg).unwrap(),
+                SigningStatus::Ready(_)
+            ));
+            assert_eq!(
+                before,
+                (
+                    std::fs::read(paths.state_file()).unwrap(),
+                    std::fs::read(&cert).unwrap(),
+                    std::fs::read(&key).unwrap()
+                )
+            );
+        }
+    }
 
     #[test]
     fn verified_pairs_are_prepared_and_missing_local_state_is_repaired() {
@@ -452,13 +628,71 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        let unrelated = paths.home.join("unrelated-release.toml");
+        fsx::write_atomic(&unrelated, original_profile, 0o600).unwrap();
+        assert!(
+            effective_identity_with(&paths, &unrelated, true)
+                .unwrap()
+                .is_none()
+        );
+        let linked_profile = paths.home.join("linked-release.toml");
+        std::os::unix::fs::symlink(&profile, &linked_profile).unwrap();
+        assert!(
+            effective_identity_with(&paths, &linked_profile, true)
+                .unwrap()
+                .is_none()
+        );
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let keychain = crate::release_keychain::keychain_path(&paths.home);
+            std::fs::set_permissions(&keychain, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(matches!(
+                status_with(&paths, &cfg).unwrap(),
+                SigningStatus::Pending(_)
+            ));
+            std::fs::set_permissions(&keychain, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(matches!(
+                status_with(&paths, &cfg).unwrap(),
+                SigningStatus::Ready(_)
+            ));
+        }
+        let proof_path = paths.dir.join(PROOF);
+        let proof = fsx::read_private(&proof_path, 2048).unwrap().unwrap();
+        let mut record = ProofRecord::parse(proof.as_str().unwrap()).unwrap();
+        record.proved = now().unwrap() - RECHECK.as_secs();
+        fsx::write_atomic(&proof_path, record.text().as_bytes(), 0o600).unwrap();
+        assert!(
+            effective_identity_with(&paths, &profile, true)
+                .unwrap()
+                .is_some()
+        );
+        assert!(matches!(
+            status_with(&paths, &cfg).unwrap(),
+            SigningStatus::Pending(_)
+        ));
+        record.proved = now().unwrap() + 3600;
+        fsx::write_atomic(&proof_path, record.text().as_bytes(), 0o600).unwrap();
+        assert!(
+            effective_identity_with(&paths, &profile, true)
+                .unwrap()
+                .is_none()
+        );
+        record.proved = now().unwrap();
+        record.identity = "0000000000000000000000000000000000000000".into();
+        fsx::write_atomic(&proof_path, record.text().as_bytes(), 0o600).unwrap();
+        assert!(
+            effective_identity_with(&paths, &profile, true)
+                .unwrap()
+                .is_none()
+        );
+        fsx::write_atomic(&proof_path, proof.as_slice(), 0o600).unwrap();
         assert_eq!(std::fs::read(&profile).unwrap(), original_profile);
         assert!(rounds.step(&paths, &cfg, &prepare).unwrap().is_none());
         std::fs::remove_file(crate::release_keychain::password_path(&paths.home)).unwrap();
         assert!(
             effective_identity_with(&paths, &profile, true)
                 .unwrap()
-                .is_none()
+                .is_some()
         );
         assert!(matches!(
             status_with(&paths, &cfg).unwrap(),
@@ -476,12 +710,37 @@ mod tests {
             status_with(&paths, &cfg).unwrap(),
             SigningStatus::Pending(_)
         ));
+        assert!(
+            effective_identity_with(&paths, &profile, true)
+                .unwrap()
+                .is_some()
+        );
         let fail = |_: &Paths, _: &Material| Err(Error::new("synthetic repair failure"));
         assert!(rounds.step(&paths, &cfg, &fail).is_err());
         assert!(matches!(
             status_with(&paths, &cfg).unwrap(),
             SigningStatus::Pending(_)
         ));
+        assert!(
+            effective_identity_with(&paths, &profile, true)
+                .unwrap()
+                .is_none()
+        );
+        fsx::write_atomic(&proof_path, proof.as_slice(), 0o600).unwrap();
+        let admin = admin_open(&paths).unwrap();
+        let mut doc = admin.doc.clone();
+        doc.set_entry(
+            &Audience::Everyone,
+            "~/.aterm/apple/devid-shared.key",
+            b"rotated private key",
+        )
+        .unwrap();
+        admin_publish(&paths, &admin, &doc).unwrap();
+        assert!(
+            effective_identity_with(&paths, &profile, true)
+                .unwrap()
+                .is_none()
+        );
         // Recipient exclusion is authoritative even when an old successful receipt remains.
         let admin = admin_open(&paths).unwrap();
         let mut doc = admin.doc.clone();
@@ -503,6 +762,11 @@ mod tests {
             .unwrap();
         admin_publish(&paths, &admin, &doc).unwrap();
         assert!(material(&paths, &cfg).unwrap().is_none());
+        assert!(
+            effective_identity_with(&paths, &profile, true)
+                .unwrap()
+                .is_none()
+        );
         assert!(matches!(
             status_with(&paths, &cfg).unwrap(),
             SigningStatus::Pending(_)

@@ -63,6 +63,10 @@ pub enum Family {
     /// (`secrets.need.<want>.awaiting-person`, docs/DESIGN-credential-requests-2026-10-27.md
     /// §10): the whole answer of the need ledger, every look.
     Secrets,
+    /// The Macs asking to join that nothing let in (`members.join.<code>.asking`,
+    /// docs/DESIGN-automatic-alab-lan-admission-2026-10-29.md): a fact for later, never an alert
+    /// on screen; the member desk's whole answer and the admin approver's, every look.
+    Join,
 }
 
 impl Family {
@@ -93,6 +97,7 @@ impl Family {
             Self::Occupancy => "harness.occupancy",
             Self::Setup => "setup",
             Self::Secrets => "secrets.need",
+            Self::Join => "members.join",
         }
     }
 
@@ -115,7 +120,8 @@ impl Family {
             | Self::FleetUnreadable
             | Self::HugeDir
             | Self::ServiceMemory
-            | Self::Secrets => Mode::Level,
+            | Self::Secrets
+            | Self::Join => Mode::Level,
             Self::Privacy
             | Self::Update
             | Self::UpgradeHost
@@ -133,7 +139,7 @@ impl Family {
     }
 
     /// Every family, in digest order.
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 23] = [
         Self::Privacy,
         Self::Update,
         Self::Upgrade,
@@ -156,6 +162,7 @@ impl Family {
         Self::Occupancy,
         Self::Setup,
         Self::Secrets,
+        Self::Join,
     ];
 
     /// The message tag the family's entries carry.
@@ -163,7 +170,7 @@ impl Family {
     #[must_use]
     pub const fn tag(self) -> Tag {
         match self {
-            Self::Privacy => tags::PRIVACY,
+            Self::Privacy | Self::Join => tags::PRIVACY,
             Self::Update => tags::UPDATE,
             Self::Upgrade
             | Self::UpgradeHost

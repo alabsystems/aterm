@@ -260,17 +260,12 @@ impl<'a> InitialSetupAdmissionStopTest<'a> {
         (result, ticket.join_unread())
     }
 
-    /// The startup review's Cancel of this scratch plan, through the ticket's real writer
-    /// ([`InitialSetupAuthorization::cancel_observed`]): whether it recorded the Cancel.
-    pub fn cancel(&mut self) -> Result<bool, String> {
-        let plan = self.plan.clone();
-        let Owner::Startup(ticket) = &mut self.owner else {
-            panic!("the scratch owner is a choice, not a startup review");
-        };
-        observe_mutation_at(self.root, None, Err("busy".into()), |root| {
-            ticket.cancel_at(root, &plan)
-        })
-        .result
+    /// The Cancel an older aterm's first-launch review recorded of this scratch plan
+    /// ([`save_older_cancel`]), which this aterm still reads: no aterm records one since the
+    /// review was deleted (init-on-by-default design §6.1).
+    pub fn older_cancel(&self) -> Result<(), String> {
+        let _lock = HeldLock::take(self.root)?;
+        save_older_cancel(self.root, &self.plan)
     }
 
     /// Set up now, as System State sends it (no group changed), through the real writer.

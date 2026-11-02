@@ -4,6 +4,7 @@
 # A light scheme whose program sets a dark page: Default Light's colours, OSC 11 #111318 mid-
 # trail, then OSC 111 resets the page 1.5 s later.
 
+scale 2
 grid 24 100
 style rainbow kitty
 hz 60

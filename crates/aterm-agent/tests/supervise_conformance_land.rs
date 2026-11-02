@@ -7,13 +7,14 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use aterm_agent::harness::acts::{HoldLeg, LandHeld, TaskFace};
-use aterm_agent::harness::repo_work::RepoWork;
+use aterm_agent::harness::repo_work::{RepoRead, RepoWork};
 use aterm_agent::supervise::phase::Phase;
+use aterm_agent::supervise::policy::land_check::listed_suffix;
 use aterm_agent::supervise::policy::turn_end::{
-    Composer, LAND, LAND_ANSWER, LAND_NUDGE, Outage, RULE_API_CUTOFF, RULE_LAND, RULE_LAND_ANSWER,
-    RULE_LAND_NUDGE, Reach, TurnEndAction, TurnEndReading, TurnEndState, UNREACHABLE_HOLD,
-    WaitKind, clean_defense, decide_turn_end, open_work_strict, open_work_suffix, repo_work_suffix,
-    says_done,
+    Composer, LAND, LAND_ANSWER, LAND_CHECK_HEAD, LAND_CONTRADICTED_HEAD, LAND_NUDGE, Outage,
+    RULE_API_CUTOFF, RULE_LAND, RULE_LAND_ANSWER, RULE_LAND_CHECK, RULE_LAND_NUDGE, Reach,
+    TurnEndAction, TurnEndReading, TurnEndState, UNREACHABLE_HOLD, WaitKind, clean_defense,
+    decide_turn_end, land_contradicted, open_work_strict, repo_work_suffix, says_done,
 };
 use aterm_agent::supervise::{Autopilot, SupervisorConfig};
 use aterm_models_harness::supervisor_land_model;
@@ -50,6 +51,10 @@ const NEEDS: &str = "Nothing left: the parser and its tests are on origin/main.\
                      NEEDS YOU: the release credential, to sign the build";
 const OPEN_DEFENSE: &str = "Nothing left: the parser is pushed.\n- Its branch is not merged yet.";
 const ANSWERED: &str = "Yes: the old syntax still parses.";
+/// The land check's answers: its one landing word, a list, and a need alone.
+const CHECKED: &str = aterm_agent::supervise::policy::land_check::LANDED;
+const LIST: &str = "The parser's branch is not merged yet.";
+const NEED_ONLY: &str = "NEEDS YOU: the release credential, to sign the build";
 
 fn finding() -> RepoWork {
     RepoWork {
@@ -62,6 +67,7 @@ fn finding() -> RepoWork {
         main_ref: "origin/main".to_string(),
         paths: Vec::new(),
         state: Some(0x5eed),
+        ..RepoWork::default()
     }
 }
 
@@ -95,8 +101,9 @@ fn point(said: &str, at: Seen, worked: Option<Duration>, reach: Reach) -> TurnEn
         said_cut: false,
         opens_cut: false,
         turn_said: Some(crate::common::earlier(at.earlier)),
+        said_lines: None,
+        turn_lines: None,
         opened_by: None,
-        opened_words: None,
         message_drawn: false,
         submits: None,
         inputs_before: None,
@@ -115,6 +122,7 @@ fn point(said: &str, at: Seen, worked: Option<Duration>, reach: Reach) -> TurnEn
         left_record: false,
         left_work: None,
         person: at.keyed.then_some(KEYED),
+        key: at.keyed.then_some(KEYED),
         login_back: false,
         auto_continue: None,
         since_limit: None,
@@ -124,11 +132,13 @@ fn point(said: &str, at: Seen, worked: Option<Duration>, reach: Reach) -> TurnEn
         notice_elsewhere: false,
         reset_clock: None,
         reach,
+        witness: None,
         program: aterm_phase::Program::Claude,
         seat: Default::default(),
         account: None,
         autopilot: Autopilot::Land,
         login_label: None,
+        autopilot_by_person: false,
         login_superseded: false,
         login_notice: None,
         login_screen: None,
@@ -155,6 +165,7 @@ fn point(said: &str, at: Seen, worked: Option<Duration>, reach: Reach) -> TurnEn
 #[derive(Debug, PartialEq, Eq)]
 enum Verdict {
     Instruction,
+    Check,
     Nudge,
     Answer,
     WallAct,
@@ -170,8 +181,18 @@ fn verdict(a: &TurnEndAction) -> Verdict {
             assert!(text.starts_with(LAND), "the instruction's words: {text}");
             Verdict::Instruction
         }
+        TurnEndAction::Type { text, rule_id } if *rule_id == RULE_LAND_CHECK => {
+            assert!(
+                text.starts_with(LAND_CHECK_HEAD),
+                "the land check's words: {text}"
+            );
+            Verdict::Check
+        }
         TurnEndAction::Type { text, rule_id } if *rule_id == RULE_LAND_NUDGE => {
-            assert!(text.starts_with(LAND_NUDGE), "the nudge's words: {text}");
+            assert!(
+                text.starts_with(LAND_NUDGE) || text.starts_with(LAND_CONTRADICTED_HEAD),
+                "the nudge's words, or its contradiction's: {text}"
+            );
             Verdict::Nudge
         }
         TurnEndAction::Type { text, rule_id } if *rule_id == RULE_LAND_ANSWER => {
@@ -202,11 +223,12 @@ fn verdict(a: &TurnEndAction) -> Verdict {
 }
 
 /// The acts a measured outage holds (`down` = 1, `capped` = 0: its cap not yet passed).
-const HELD: [&str; 3] = ["Instruction", "Nudge", "Answer"];
+const HELD: [&str; 4] = ["Instruction", "Check", "Nudge", "Answer"];
 
 fn expected(m: &Model, st: &State) -> Verdict {
     for (action, word) in [
         ("Instruction", Verdict::Instruction),
+        ("Check", Verdict::Check),
         ("Nudge", Verdict::Nudge),
         ("Answer", Verdict::Answer),
         ("WallAct", Verdict::WallAct),
@@ -227,11 +249,18 @@ fn expected(m: &Model, st: &State) -> Verdict {
     }
 }
 
-fn nudge(st: &State, real: &TurnEndState) -> String {
+/// Land's nudge as the model's point says it: the agent's own list quoted where it answered the
+/// check with one (never the word reader's open words), then the repository's facts; where the
+/// reply standing is a `Nothing left:` defense over the repository's work, its contradiction
+/// (slice 4c), git's finding leading.
+fn nudge(st: &State) -> String {
+    if matches!(st["said"], 2 | 3) && st["dirty"] == 1 {
+        return land_contradicted(&RepoRead::Found(finding()), None, &[], None).expect("git's leg");
+    }
     let mut text = LAND_NUDGE.to_string();
-    if st["said"] == 3 {
+    if st["said"] == 5 {
         text.push(' ');
-        text.push_str(&open_work_suffix(real.open_items()).expect("the defense's open work"));
+        text.push_str(&listed_suffix(LIST).expect("the list quoted"));
     }
     if st["dirty"] == 1 {
         text.push(' ');
@@ -490,7 +519,11 @@ fn projects(real: &TurnEndState, st: &State) {
     assert_eq!(real.task_done(), done, "the task's end at {st:?}");
     assert_eq!(
         i64::from(real.done_reports()),
-        if done { 2 } else { i64::from(st["said"] > 0) },
+        if done {
+            2
+        } else {
+            i64::from(matches!(st["said"], 1..=3))
+        },
         "the done claim at {st:?}"
     );
     assert_eq!(
@@ -506,8 +539,11 @@ fn projects(real: &TurnEndState, st: &State) {
     assert_eq!(
         !real.open_items().is_empty(),
         st["said"] == 3 && st["walled"] == 0 && !done,
-        "the open work at {st:?}"
+        "the reader's open work at {st:?}"
     );
+    if st["said"] == 5 && st["walled"] == 0 {
+        assert_eq!(real.land_listed(), Some(LIST), "the agent's list at {st:?}");
+    }
     assert_eq!(
         real.repo_owed().is_some(),
         st["dirty"] == 1,
@@ -526,7 +562,7 @@ fn mirror(action: &str, before: &State, real: &mut Real) {
         "NetDown" => real.down = Some(real.now),
         "NetUp" => real.down = None,
         "OutageCapDue" => real.outage_cap_passes(),
-        "Instruction" | "Nudge" | "Answer" | "WallAct" => {
+        "Instruction" | "Check" | "Nudge" | "Answer" | "WallAct" => {
             let a = real.decide();
             assert!(
                 !matches!(
@@ -565,6 +601,17 @@ fn mirror(action: &str, before: &State, real: &mut Real) {
         ),
         "YieldDefenseNeeds" => real.yields(NEEDS, plain, LONG),
         "YieldOpenDefense" => real.yields(OPEN_DEFENSE, plain, LONG),
+        "YieldLanded" => real.yields(CHECKED, plain, SHORT),
+        "YieldLandedDirty" => real.yields(
+            CHECKED,
+            Seen {
+                dirty: true,
+                ..plain
+            },
+            SHORT,
+        ),
+        "YieldList" => real.yields(LIST, plain, SHORT),
+        "YieldNeedOnly" => real.yields(NEED_ONLY, plain, SHORT),
         "OtherTurnRuns" => {
             real.st.took();
             real.at.busy = true;
@@ -699,9 +746,9 @@ fn walk_all(
                 && got == Verdict::Nudge
                 && !real.st.needs_ack_owed()
             {
-                assert_eq!(*text, nudge(&st, &real.st), "the nudge at {st:?}");
+                assert_eq!(*text, nudge(&st), "the nudge at {st:?}");
             }
-            if st["landed"] == 0 && st["other"] == 0 && st["same"] <= 1 {
+            if st["landed"] == 0 && st["other"] == 0 && st["rest"] == 0 && st["same"] <= 1 {
                 assert_ne!(got, Verdict::Nothing, "a silent point at {st:?}");
             }
             *verdicts.entry(format!("{got:?}")).or_default() += 1;
@@ -722,7 +769,7 @@ fn walk_all(
 }
 
 #[test]
-fn tier1_the_real_decider_lands_only_on_a_clean_defense_and_never_goes_quiet() {
+fn tier1_the_real_decider_lands_only_on_its_checks_landed_and_never_goes_quiet() {
     assert!(clean_defense(Some(DEFENSE)));
     assert!(!clean_defense(Some(NEEDS)) && !clean_defense(Some(OPEN_DEFENSE)));
     assert!(!clean_defense(Some(TOKEN)) && says_done(Some(TOKEN)));
@@ -734,6 +781,7 @@ fn tier1_the_real_decider_lands_only_on_a_clean_defense_and_never_goes_quiet() {
         .unwrap_or_else(|e| panic!("the face or the hold told: {e}"));
     for word in [
         "Instruction",
+        "Check",
         "Nudge",
         "Answer",
         "WallAct",
@@ -781,7 +829,13 @@ fn tier1_the_buggy_model_and_three_tellers_are_refuted() {
             "{teller:?}: the opening exchange's face"
         );
     }
-    let path = ["Instruction", "YieldDefense", "OtherTurnRuns"];
+    let path = [
+        "Instruction",
+        "YieldDefense",
+        "Check",
+        "YieldLanded",
+        "OtherTurnRuns",
+    ];
     let mut right = m.init_state();
     let mut wrong = buggy.init_state();
     for action in path {
@@ -791,9 +845,9 @@ fn tier1_the_buggy_model_and_three_tellers_are_refuted() {
     assert!(m.check_invariant("TheHostIsToldTheTasksFace", &right));
     assert!(!buggy.check_invariant("TheHostIsToldTheTasksFace", &wrong));
 
-    let mut path = vec!["Instruction", "YieldOpenDefense", "BackoffDue"];
+    let mut path = vec!["Instruction", "YieldWork"];
     for _ in 0..2 {
-        path.extend(["Nudge", "YieldOpenDefense", "BackoffDue"]);
+        path.extend(["Nudge", "YieldWork"]);
     }
     let mut b = buggy.init_state();
     for action in &path {
@@ -805,21 +859,21 @@ fn tier1_the_buggy_model_and_three_tellers_are_refuted() {
     let (_, real) = walk(&m, &path, base);
     assert_eq!(verdict(&real.clone().decide()), Verdict::Nudge);
     for _ in 0..7 {
-        path.extend(["Nudge", "YieldOpenDefense", "BackoffDue"]);
+        path.extend(["Nudge", "YieldWork"]);
     }
     let (_, real) = walk(&m, &path, base);
     assert_eq!(real.st.land_episode(), (true, 9));
     assert_eq!(verdict(&real.clone().decide()), Verdict::Nudge);
 
-    let path = ["Instruction", "YieldDefenseNeeds", "BackoffDue"];
+    let path = ["Instruction", "YieldDefenseNeeds"];
     let (st, real) = walk(&m, &path, base);
     let mut b = st.clone();
     assert!(buggy.fire("AskHolds", &mut b), "{st:?}");
     assert!(!buggy.check_invariant("ANeedNeverBlocks", &b));
-    assert!(!buggy.action_enabled("Nudge", &b));
+    assert!(!buggy.action_enabled("Check", &b));
     assert!(!real.st.landed());
     let a = real.clone().decide();
-    assert_eq!(verdict(&a), Verdict::Nudge);
+    assert_eq!(verdict(&a), Verdict::Check, "a need never bars the check");
     assert!(
         matches!(&a, TurnEndAction::Type { text, .. }
             if text.contains(aterm_agent::supervise::policy::needs::NEEDS_ACK)),
@@ -832,17 +886,32 @@ fn tier1_the_buggy_model_and_three_tellers_are_refuted() {
             assert!(buggy.fire(action, &mut b), "{action} at {b:?}");
         }
         assert_eq!(b["landed"], 1, "{yielded}: {b:?}");
-        assert!(
-            !buggy.check_invariant("LandedOnlyByCleanDefense", &b),
-            "{yielded}"
-        );
-        let (_, real) = walk(&m, &["Instruction", yielded, "BackoffDue"], base);
+        assert!(!buggy.check_invariant("LandedOnlyByAudit", &b), "{yielded}");
+        // A defense beside a need owes the check, which waits no back-off.
+        let path: &[&str] = if yielded == "YieldDefenseNeeds" {
+            &["Instruction", yielded]
+        } else {
+            &["Instruction", yielded, "BackoffDue"]
+        };
+        let (_, real) = walk(&m, path, base);
         assert!(!real.st.landed() && !real.st.task_done(), "{yielded}");
-        assert_eq!(verdict(&real.clone().decide()), Verdict::Nudge, "{yielded}");
+        let want = if yielded == "YieldDefenseNeeds" {
+            Verdict::Check
+        } else {
+            Verdict::Nudge
+        };
+        assert_eq!(verdict(&real.clone().decide()), want, "{yielded}");
     }
     for path in [
-        &["Instruction", "YieldDefense"][..],
-        &["Instruction", "YieldWall", "WallAct", "YieldDefense"][..],
+        &["Instruction", "YieldDefense", "Check", "YieldLanded"][..],
+        &[
+            "Instruction",
+            "YieldWall",
+            "WallAct",
+            "YieldDefense",
+            "Check",
+            "YieldLanded",
+        ][..],
     ] {
         let (_, real) = walk(&m, path, base);
         assert!(real.st.landed(), "{path:?}");
@@ -855,7 +924,14 @@ fn tier1_the_buggy_model_and_three_tellers_are_refuted() {
 
     let (st, real) = walk(
         &m,
-        &["Instruction", "YieldWall", "WallAct", "YieldDefense"],
+        &[
+            "Instruction",
+            "YieldWall",
+            "WallAct",
+            "YieldDefense",
+            "Check",
+            "YieldLanded",
+        ],
         base,
     );
     let mut b = st.clone();
@@ -1046,18 +1122,105 @@ fn tier1_the_real_teller_tells_what_holds_the_landing() {
         BTreeSet::from(["TheHostIsToldWhatHoldsTheLanding"]),
         "the sweep's own dial"
     );
+    let listed = ["Instruction", "YieldOpenDefense", "Check", "YieldList"];
     let mut st = stale.init_state();
-    for action in ["Instruction", "YieldOpenDefense"] {
+    for action in listed {
         assert!(stale.fire(action, &mut st), "{action} at {st:?}");
     }
     assert!(!stale.check_invariant("TheHostIsToldWhatHoldsTheLanding", &st));
     assert!(stale.check_invariant("TheHostIsToldTheTasksFace", &st));
-    let (_, real) = walk(&m, &["Instruction", "YieldOpenDefense"], Instant::now());
+    let (_, real) = walk(&m, &listed, Instant::now());
     let held = real.held.expect("a hold told");
     assert!(held.read && held.holds(HoldLeg::Open), "{held:?}");
     assert!(
         held.open_words().any(|w| w == "not merged"),
-        "the word Land read: {:?}",
+        "the agent's own list: {:?}",
         held.open_words().collect::<Vec<_>>()
     );
+    let (_, real) = walk(&m, &["Instruction", "YieldOpenDefense"], Instant::now());
+    let held = real.held.expect("a hold told");
+    assert!(
+        held.read && !held.holds(HoldLeg::Open),
+        "the reader's words hold nothing: {held:?}"
+    );
+}
+
+/// THE LAND CHECK'S LAWS, each broken by its own dial (the mutants `non_vacuity` sweeps), and the
+/// real decider kept off each mutant's step.
+#[test]
+fn tier1_each_check_mutant_breaks_its_law_and_the_real_decider_takes_no_such_step() {
+    let m = supervisor_land_model();
+    let base = Instant::now() + Duration::from_secs(3600);
+    let dial = |n: i64| aterm_spec::interp::with_consts(&m, &[("Buggy", n)]);
+    let fire_all = |model: &Model, path: &[&str]| {
+        let mut st = model.init_state();
+        for action in path {
+            assert!(model.fire(action, &mut st), "{action} at {st:?}");
+        }
+        st
+    };
+    for (n, law) in [
+        (6, "LandedOnlyByAudit"),
+        (7, "OneCheckPerDefense"),
+        (8, "NoCheckOverDirty"),
+        (9, "ANeedRestTypesNothing"),
+        (10, "ALandedKeepsItsNeed"),
+    ] {
+        assert!(m.mutant_dials().contains(&n), "{n}: {:?}", m.mutant_dials());
+        assert!(
+            aterm_spec::interp::violated_invariants(&dial(n)).contains(law),
+            "Buggy={n} breaks {law}"
+        );
+    }
+    // 6: the word reader's clean defense lands, unchecked.
+    let b = fire_all(&dial(6), &["Instruction", "YieldDefense"]);
+    assert!(b["landed"] == 1 && !dial(6).check_invariant("LandedOnlyByAudit", &b));
+    let (_, real) = walk(&m, &["Instruction", "YieldDefense"], base);
+    assert!(!real.st.landed());
+    assert_eq!(verdict(&real.clone().decide()), Verdict::Check);
+    // 7: a second check over the defense the first one audited.
+    let listed = ["Instruction", "YieldDefense", "Check", "YieldList"];
+    let mut b = fire_all(&dial(7), &listed);
+    assert!(dial(7).fire("Check", &mut b), "{b:?}");
+    assert!(!dial(7).check_invariant("OneCheckPerDefense", &b));
+    assert!(!m.action_enabled("Check", &fire_all(&m, &listed)));
+    let (_, real) = walk(&m, &listed, base);
+    assert_eq!(
+        verdict(&real.clone().decide()),
+        Verdict::Wait,
+        "the list's nudge waits"
+    );
+    // 8: the check over a dirty repository.
+    let mut b = fire_all(&dial(8), &["Instruction", "YieldDefenseDirty"]);
+    assert!(dial(8).fire("Check", &mut b), "{b:?}");
+    assert!(!dial(8).check_invariant("NoCheckOverDirty", &b));
+    let (_, real) = walk(&m, &["Instruction", "YieldDefenseDirty"], base);
+    assert_ne!(verdict(&real.clone().decide()), Verdict::Check);
+    // 9: an act typed while Land rests on a need.
+    let rest = ["Instruction", "YieldDefense", "Check", "YieldNeedOnly"];
+    let mut b = fire_all(&dial(9), &rest);
+    assert!(dial(9).fire("BackoffDue", &mut b) && dial(9).fire("Nudge", &mut b));
+    assert!(!dial(9).check_invariant("ANeedRestTypesNothing", &b));
+    let (st, real) = walk(&m, &rest, base);
+    assert_eq!(st["rest"], 1);
+    assert!(real.st.land_resting());
+    assert_eq!(
+        verdict(&real.clone().decide()),
+        Verdict::Nothing,
+        "the rest types nothing"
+    );
+    // 10: a `LANDED` takes the need down though nothing retracted it: over a dirty repository,
+    // where nothing lands, and over a clean one, where the need stands beside the landing.
+    for (yields, lands) in [("YieldLandedDirty", false), ("YieldLanded", true)] {
+        let path = ["Instruction", "YieldDefenseNeeds", "Check", yields];
+        let b = fire_all(&dial(10), &path);
+        assert!(b["need"] == 0 && !dial(10).check_invariant("ALandedKeepsItsNeed", &b));
+        let (st, real) = walk(&m, &path, base);
+        assert_eq!(st["need"], 1, "{yields}");
+        assert_eq!(real.st.landed(), lands, "{yields}");
+        assert!(
+            !real.st.standing_needs().is_empty(),
+            "{yields}: the need stands until the agent retracts it"
+        );
+    }
 }

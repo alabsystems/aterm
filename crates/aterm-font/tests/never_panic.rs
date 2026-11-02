@@ -1185,7 +1185,7 @@ fn exercise(bytes: &[u8], rng: &mut Lcg, glyph_cap: u16) -> u64 {
 fn hint(bytes: &[u8], index: u32, face: &Face<'_>, rng: &mut Lcg, glyph_cap: u16) -> u64 {
     use aterm_font::autohint::{HintingInstance, Target};
     let target = [Target::Normal, Target::Light, Target::Lcd][rng.below(3)];
-    let px = [0.5f32, 9.0, 13.0, 16.5, 300.0, 1.0e5][rng.below(6)];
+    let px = [0.01f32, 0.5, 9.0, 13.0, 16.5, 300.0, 1.0e5][rng.below(7)];
     let settings: Vec<(u32, f32)> = face
         .variation_axes()
         .into_iter()

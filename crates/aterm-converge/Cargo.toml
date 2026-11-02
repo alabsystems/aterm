@@ -20,6 +20,10 @@ aterm-json = { workspace = true }
 # A journal line reaches stable media before the change it records is made.
 aterm-durable = { workspace = true }
 
+# O_NOFOLLOW on the journal and its lock so a planted symlink is refused at open.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 # Scratch directories for the journal's tests.
 aterm-tempfile = { workspace = true }

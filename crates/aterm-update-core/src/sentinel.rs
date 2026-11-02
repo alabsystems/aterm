@@ -117,16 +117,48 @@ impl Sentinel {
     /// is dropped, so its launch stays counted.
     #[cfg_attr(trust_verify, trust::skip)]
     fn read_record(&self) -> Option<(u64, u32, Vec<LaunchName>)> {
-        let text = std::fs::read_to_string(&self.path).ok()?;
+        use std::io::Read as _;
+        const MAX_SENTINEL_BYTES: u64 = 4096;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        }
+        #[cfg(not(unix))]
+        if std::fs::symlink_metadata(&self.path)
+            .ok()
+            .is_some_and(|m| m.file_type().is_symlink())
+        {
+            return None;
+        }
+        let file = opts.open(&self.path).ok()?;
+        let meta = file.metadata().ok()?;
+        if !meta.is_file() || meta.len() > MAX_SENTINEL_BYTES {
+            return None;
+        }
+        let mut text = String::new();
+        file.take(MAX_SENTINEL_BYTES + 1)
+            .read_to_string(&mut text)
+            .ok()?;
+        if text.len() as u64 > MAX_SENTINEL_BYTES {
+            return None;
+        }
+        let uint = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
         let mut it = text.split_whitespace();
-        let build = it.next()?.parse().ok()?;
-        let attempts = it.next().unwrap_or("0").parse().ok()?;
+        let build = it.next().filter(|s| uint(s))?.parse().ok()?;
+        let attempts = it.next().unwrap_or("0");
+        let attempts = uint(attempts).then(|| attempts.parse().ok()).flatten()?;
         let names = it
             .filter_map(|token| {
                 let mut fields = token.split(':');
                 let name = LaunchName {
-                    pid: fields.next()?.parse().ok()?,
-                    started: (fields.next()?.parse().ok()?, fields.next()?.parse().ok()?),
+                    pid: fields.next().filter(|s| uint(s))?.parse().ok()?,
+                    started: (
+                        fields.next().filter(|s| uint(s))?.parse().ok()?,
+                        fields.next().filter(|s| uint(s))?.parse().ok()?,
+                    ),
                 };
                 fields.next().is_none().then_some(name)
             })
@@ -238,15 +270,29 @@ impl Sentinel {
             _ => Path::new("."),
         };
         let tmp = parent.join(format!(".boot-sentinel.tmp-{}", std::process::id()));
-        {
+        let mut f = {
             let mut opts = std::fs::OpenOptions::new();
             opts.write(true).create(true).truncate(true);
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt;
-                opts.mode(0o600);
+                opts.mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
             }
-            let mut f = opts.open(&tmp)?;
+            opts.open(&tmp)?
+        };
+        let wrote = (|| -> io::Result<()> {
+            if !f.metadata()?.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "boot sentinel temp path is not a regular file",
+                ));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
             write!(f, "{build} {attempts}")?;
             for name in &names[names.len().saturating_sub(MAX_NAMED_LAUNCHES)..] {
                 let LaunchName {
@@ -256,8 +302,13 @@ impl Sentinel {
                 write!(f, " {pid}:{seconds}:{micros}")?;
             }
             aterm_durable::refusal_accepted(crate::durable::finish(&f, flush))?;
+            drop(f);
+            std::fs::rename(&tmp, &self.path)
+        })();
+        if let Err(error) = wrote {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error);
         }
-        std::fs::rename(&tmp, &self.path)?;
         Ok(flush
             .dir_best_effort(parent)
             .map(|_flushed_or_unavailable| ()))
@@ -459,6 +510,15 @@ mod tests {
         assert!(s.arm(9).is_err());
         assert_eq!(s.read_state(), Some((8, 0)));
         assert!(tmp.is_dir());
+        std::fs::remove_dir(&tmp).unwrap();
+
+        let dir_target = Sentinel::new(dir.join("obstructed-target"));
+        std::fs::create_dir(&dir_target.path).unwrap();
+        assert!(dir_target.arm(9).is_err());
+        assert!(
+            !tmp.exists(),
+            "a failed rename removes the temporary sentinel file"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -495,6 +555,19 @@ mod tests {
             !s.unreadable(),
             "a directory at the path is no marker that does not read"
         );
+        #[cfg(unix)]
+        {
+            std::fs::remove_dir(&s.path).unwrap();
+            let decoy = dir.join("decoy.sentinel");
+            std::fs::write(&decoy, "1235 5").unwrap();
+            std::os::unix::fs::symlink(&decoy, &s.path).unwrap();
+            assert_eq!(
+                s.read_state(),
+                None,
+                "a symlinked sentinel must never be followed"
+            );
+            assert!(!s.unreadable(), "a symlink is not an unreadable marker");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -538,7 +611,11 @@ mod tests {
         assert!(s.named_launches(42).is_empty());
 
         // Malformed name tokens are ignored without corrupting the count or valid names.
-        std::fs::write(&s.path, "42 3 7:1:2 bad 8:9:10:extra 11:12:13").unwrap();
+        std::fs::write(
+            &s.path,
+            "42 3 7:1:2 bad 8:9:10:extra +9:1:2 7:+1:2 11:12:13",
+        )
+        .unwrap();
         assert_eq!(s.read_state(), Some((42, 3)));
         assert_eq!(
             s.named_launches(42),
@@ -553,6 +630,10 @@ mod tests {
                 },
             ]
         );
+        std::fs::write(&s.path, "+42 3").unwrap();
+        assert_eq!(s.read_state(), None);
+        std::fs::write(&s.path, "42 +3").unwrap();
+        assert_eq!(s.read_state(), None);
 
         // Exceeding MAX_NAMED_LAUNCHES (32) evicts the oldest launch names first.
         s.arm(42).unwrap();

@@ -97,6 +97,9 @@ pub struct GlassReport {
     pub tag: PresentTag,
     /// Tag of the next serial's registration, or `tag` when none had registered yet.
     pub successor: PresentTag,
+    /// Where this present showed a stats deck frame ([`arm_deck_target`]) and reached the
+    /// display: how long after the vsync its deck clock targeted, ns (0 when on time).
+    pub deck_late_ns: Option<u64>,
 }
 
 impl GlassReport {
@@ -145,6 +148,19 @@ const ARM_HAS_PREV: u8 = 4;
 #[cfg(any(target_os = "macos", test))]
 const TAG_RING: usize = 16;
 
+std::thread_local! {
+    /// This thread's next registration's deck target ([`arm_deck_target`]),
+    /// `CACurrentMediaTime` ns; 0 none. One per thread: the thread that arms a present is the one
+    /// whose present registers it (the app's redraw, through the swapchain's present), so a
+    /// present on another thread (a test's swapchain beside it) never takes it.
+    static ARM_DECK_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The bits of a [`GlassRing::deck_targets`] slot that hold the target, ns: the rest hold the low
+/// bits of the serial that wrote it. 2^56 ns is about 2.3 years of `CACurrentMediaTime`.
+#[cfg(any(target_os = "macos", test))]
+const DECK_TARGET_MASK: u64 = (1 << 56) - 1;
+
 /// One present-to-glass domain: the process's is [`GLASS`]; a test builds its own.
 #[derive(Debug)]
 struct GlassRing {
@@ -161,6 +177,12 @@ struct GlassRing {
     /// overwritten slot never impersonates an earlier serial's successor.
     #[cfg(any(target_os = "macos", test))]
     tags: [AtomicU64; TAG_RING],
+    /// Serial-indexed deck targets ([`arm_deck_target`]): each slot packs the low 8 bits of the
+    /// serial that wrote it above its target, `CACurrentMediaTime` ns ([`DECK_TARGET_MASK`]; 0:
+    /// the present showed no deck frame), so a slot a later registration overwrote reads as none
+    /// rather than as that registration's target.
+    #[cfg(any(target_os = "macos", test))]
+    deck_targets: [AtomicU64; TAG_RING],
 }
 
 static GLASS: GlassRing = GlassRing::new();
@@ -179,6 +201,8 @@ impl GlassRing {
             takeable_ns: AtomicU64::new(0),
             #[cfg(any(target_os = "macos", test))]
             tags: [const { AtomicU64::new(0) }; TAG_RING],
+            #[cfg(any(target_os = "macos", test))]
+            deck_targets: [const { AtomicU64::new(0) }; TAG_RING],
         }
     }
 
@@ -233,6 +257,11 @@ impl GlassRing {
         };
         let tag = PresentTag::for_pacing(burst, flags & ARM_HOT != 0, flags & ARM_OCCLUDED != 0);
         let serial = self.next_serial.fetch_add(1, Ordering::Relaxed);
+        let target = ARM_DECK_NS
+            .with(|armed| armed.replace(0))
+            .min(DECK_TARGET_MASK);
+        self.deck_targets[ring_slot(serial)]
+            .store(((serial & 0xff) << 56) | target, Ordering::Relaxed);
         let entry = (serial << 8) | u64::from(tag as u8);
         self.tags[ring_slot(serial)].store(entry, Ordering::Release);
         self.takeable_ns.store(registered_ns, Ordering::Relaxed);
@@ -251,8 +280,42 @@ impl GlassRing {
         }
     }
 
+    /// The deck target registration `serial` armed ([`arm_deck_target`]), ns; 0 for none, or
+    /// for a slot a later registration has overwritten since.
     #[cfg(any(target_os = "macos", test))]
+    fn deck_target(&self, serial: u64) -> u64 {
+        let entry = self.deck_targets[ring_slot(serial)].load(Ordering::Relaxed);
+        if entry >> 56 == serial & 0xff {
+            entry & DECK_TARGET_MASK
+        } else {
+            0
+        }
+    }
+
+    /// Deliver the presented handler of registration `serial` at `registered_s` that reached
+    /// the display at `presented_s` (`CACurrentMediaTime` seconds; 0 never shown): its sample,
+    /// and its deck frame's lateness against the vsync its tick targeted ([`arm_deck_target`]).
+    #[cfg(any(target_os = "macos", test))]
+    fn deliver_presented(&self, serial: u64, tag: PresentTag, registered_s: f64, presented_s: f64) {
+        let sample = classify(registered_s, presented_s);
+        let late = deck_late(self.deck_target(serial), sample, presented_s);
+        self.deliver(serial, tag, sample, late);
+    }
+
+    /// Deliver one handler's sample to the sink with the next serial's tag as successor.
+    #[cfg(test)]
     fn deliver_report(&self, serial: u64, tag: PresentTag, sample: GlassSample) {
+        self.deliver(serial, tag, sample, None);
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    fn deliver(
+        &self,
+        serial: u64,
+        tag: PresentTag,
+        sample: GlassSample,
+        deck_late_ns: Option<u64>,
+    ) {
         self.delivered.fetch_add(1, Ordering::Relaxed);
         let successor = match serial.checked_add(1) {
             Some(next) if (next >> 56) == 0 => {
@@ -270,6 +333,7 @@ impl GlassRing {
                 sample,
                 tag,
                 successor,
+                deck_late_ns,
             });
         }
     }
@@ -299,9 +363,49 @@ pub fn arm_present(armed: ArmedPresent) {
     GLASS.arm_present(armed);
 }
 
+/// Arm this thread's next present as one that shows a stats deck frame whose clock tick
+/// targeted the vsync at `target_ns` (`CACurrentMediaTime` ns, [`media_ns_of`]), or as one that
+/// shows none. Its report then carries [`GlassReport::deck_late_ns`].
+#[inline]
+pub fn arm_deck_target(target_ns: Option<u64>) {
+    ARM_DECK_NS.with(|armed| armed.set(target_ns.unwrap_or(0)));
+}
+
+/// `at` on the clock a drawable's `presentedTime` reads (`CACurrentMediaTime`), ns, through one
+/// (`CACurrentMediaTime`, `Instant`) pair; `None` off macOS.
+#[must_use]
+pub fn media_ns_of(at: std::time::Instant) -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        static PAIR: OnceLock<(f64, std::time::Instant)> = OnceLock::new();
+        let &(media_s, now) = PAIR.get_or_init(|| {
+            // SAFETY: reading a monotonic clock.
+            (
+                unsafe { crate::metal::swapchain::media_time_s() },
+                std::time::Instant::now(),
+            )
+        });
+        let secs = if at >= now {
+            media_s + (at - now).as_secs_f64()
+        } else {
+            media_s - (now - at).as_secs_f64()
+        };
+        Some(secs_to_ns(secs))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = at;
+        None
+    }
+}
+
+/// `secs` as whole ns: 0 for a span that is not positive or not finite, `u64::MAX` past the
+/// range.
 #[inline]
 fn secs_to_ns(secs: f64) -> u64 {
     if secs.is_finite() && secs > 0.0 {
+        // A value past `Duration`'s range saturates: this runs in a presented handler, where a
+        // panic would cross the Objective-C boundary.
         Duration::try_from_secs_f64(secs).map_or(u64::MAX, |d| {
             u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
         })
@@ -329,10 +433,25 @@ fn ring_slot(serial: u64) -> usize {
     usize::try_from(serial % TAG_RING as u64).unwrap_or(0)
 }
 
-/// Deliver one handler's sample to the sink with the next serial's tag as successor.
+/// Deliver the presented handler of registration `serial` at `registered_s` that reached the
+/// display at `presented_s` (`CACurrentMediaTime` seconds; 0 never shown): its sample, and its
+/// deck frame's lateness against the vsync its tick targeted ([`arm_deck_target`]).
 #[cfg(target_os = "macos")]
-pub(crate) fn deliver_report(serial: u64, tag: PresentTag, sample: GlassSample) {
-    GLASS.deliver_report(serial, tag, sample);
+pub(crate) fn deliver_presented(serial: u64, tag: PresentTag, registered_s: f64, presented_s: f64) {
+    GLASS.deliver_presented(serial, tag, registered_s, presented_s);
+}
+
+/// A deck frame's lateness: how long after its tick's vsync (`target_ns`, 0 for a present that
+/// showed no deck frame) it reached the display at `presented_s`, 0 when on time; `None` for no
+/// deck frame or one never shown.
+#[cfg(any(target_os = "macos", test))]
+fn deck_late(target_ns: u64, sample: GlassSample, presented_s: f64) -> Option<u64> {
+    match sample {
+        GlassSample::OnGlass { .. } if target_ns != 0 => {
+            Some(secs_to_ns(presented_s).saturating_sub(target_ns))
+        }
+        _ => None,
+    }
 }
 
 /// Classify a presented handler's `registered_s` and `presented_s` (`CACurrentMediaTime` seconds).
@@ -350,7 +469,8 @@ pub fn classify(registered_s: f64, presented_s: f64) -> GlassSample {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArmedPresent, GlassReport, GlassRing, GlassSample, PresentTag, TAG_RING, classify,
+        ArmedPresent, GlassReport, GlassRing, GlassSample, PresentTag, TAG_RING, arm_deck_target,
+        classify, deck_late,
     };
     use std::sync::Mutex;
 
@@ -376,6 +496,83 @@ mod tests {
             classify(-1.0e308, 1.0e308),
             GlassSample::OnGlass { ns: 0 },
             "infinite spans fail closed to 0"
+        );
+        assert_eq!(
+            classify(0.0, f64::MAX),
+            GlassSample::OnGlass { ns: u64::MAX },
+            "a span past Duration's range saturates rather than panics"
+        );
+    }
+
+    /// A present armed with a deck frame's vsync carries it from its registration (the next
+    /// registration carries none unless armed again, another thread's takes none of it, and a
+    /// slot a later registration overwrote reads as none), and its report says how late on glass
+    /// it came: 0 on time, nothing for a frame never shown or a present with no deck frame.
+    #[test]
+    fn a_deck_frame_reports_its_lateness_against_its_vsync() {
+        static SEEN: Mutex<Vec<GlassReport>> = Mutex::new(Vec::new());
+        fn sink(report: GlassReport) {
+            SEEN.lock().unwrap().push(report);
+        }
+        let ring = GlassRing::listening(sink);
+        arm_deck_target(Some(300_000_000_000));
+        let other = std::thread::scope(|scope| {
+            scope
+                .spawn(|| ring.registration_begin(299.98).0)
+                .join()
+                .expect("another thread's present registers")
+        });
+        let (deck, deck_tag) = ring.registration_begin(299.99);
+        let (plain, _) = ring.registration_begin(300.01);
+        let _ = ring.take_registration();
+        assert_eq!(
+            ring.deck_target(other),
+            0,
+            "another thread's present takes no arm of this one's"
+        );
+        assert_eq!(ring.deck_target(deck), 300_000_000_000);
+        assert_eq!(ring.deck_target(plain), 0, "the arm is the one present's");
+        let shown = GlassSample::OnGlass { ns: 1 };
+        assert_eq!(
+            deck_late(ring.deck_target(deck), shown, 300.004),
+            Some(4_000_000)
+        );
+        assert_eq!(
+            deck_late(ring.deck_target(deck), shown, 299.999),
+            Some(0),
+            "early is on time"
+        );
+        assert_eq!(
+            deck_late(ring.deck_target(deck), GlassSample::Skipped, 300.004),
+            None
+        );
+        assert_eq!(deck_late(ring.deck_target(plain), shown, 300.004), None);
+        ring.deliver_presented(deck, deck_tag, 299.99, 300.004);
+        assert_eq!(
+            SEEN.lock().unwrap().last().map(|r| r.deck_late_ns),
+            Some(Some(4_000_000)),
+            "the report carries its deck frame's lateness"
+        );
+        // Each overwriting registration arms a target of its own, so the slot `deck` held keeps
+        // a nonzero target: only the serial's tag tells it is another registration's.
+        let mut over = None;
+        for _ in 0..TAG_RING {
+            arm_deck_target(Some(301_000_000_000));
+            let serial = ring.registration_begin(301.0).0;
+            if serial % TAG_RING as u64 == deck % TAG_RING as u64 {
+                over = Some(serial);
+            }
+        }
+        let over = over.expect("CONTROL: a later registration took the slot `deck` held");
+        assert_eq!(
+            ring.deck_target(over),
+            301_000_000_000,
+            "CONTROL: the slot holds the overwriting registration's target"
+        );
+        assert_eq!(
+            ring.deck_target(deck),
+            0,
+            "a slot a later registration overwrote is not this registration's target"
         );
     }
 
@@ -413,6 +610,7 @@ mod tests {
             sample: GlassSample::Skipped,
             tag,
             successor,
+            deck_late_ns: None,
         };
         assert_eq!(
             report(PresentTag::Spaced, PresentTag::HotBurst).skip_attribution(),

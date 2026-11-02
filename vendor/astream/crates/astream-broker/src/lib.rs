@@ -226,6 +226,8 @@ pub use storage::{storage_len_advance, storage_truncate_within_len};
 pub use store::AntiRollback;
 #[cfg(feature = "retention")]
 pub use store::RetentionTick;
+#[cfg(all(feature = "at-rest", unix))]
+pub use store::SealedLog;
 pub use store::{
     at_rest_version_advance, at_rest_version_is_bound, broker_bt_advance, incarnation_base,
     incarnation_of, is_hidden_record, on_boot_volume, store_ack_seq_in_reserved_half,

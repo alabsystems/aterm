@@ -4,11 +4,12 @@
 use std::sync::mpsc;
 use std::time::Duration;
 
+use super::lines::Mark;
 use super::*;
 use crate::native_app::{
     ActionInvocation, AppViewState, NativeApp, NativeRuntime, ViewId, ViewMotionCx,
 };
-use crate::native_ui::{CompiledUi, LogicalRect};
+use crate::native_ui::{ActionId, CompiledUi, LogicalRect, SemanticValue, UiContent};
 use aterm_types::macos_setup::{PutBack, RestoreOutcome};
 
 fn runtime_with_app(
@@ -40,12 +41,14 @@ fn cx(viewport: LogicalRect, serious: bool) -> ViewCx<'static> {
     }
 }
 
+/// The page as `view` draws it with every line open, so each row the page can show is drawn.
 fn compile(
     app: &SystemStateApp,
     view: &SystemStateViewState,
     width: f32,
     height: f32,
 ) -> CompiledUi {
+    view.every_line_open.set(true);
     let viewport = LogicalRect::new(0.0, 0.0, width, height);
     app.view(view, &cx(viewport, false))
         .compile(viewport)
@@ -59,6 +62,33 @@ fn act(app: &mut SystemStateApp, key: &str) {
 
 fn status_of(scenario: &str) -> SetupStatus {
     fixture_status(scenario).expect("a named scenario")
+}
+
+/// The `fresh` scenario with Full Disk Access and Debugger access off, which a person grants
+/// once Permissions run: what the launch's offer reads on a fresh signed Mac.
+fn fresh_with_grants() -> SetupStatus {
+    let mut status = status_of("fresh");
+    for grant in [
+        reading(
+            Subject::Access(Access::FullDiskAccess),
+            Standing::NeedsYou,
+            Some("Not confirmed"),
+        ),
+        reading(
+            Subject::Access(Access::Debugger),
+            Standing::NeedsYou,
+            Some("Off"),
+        ),
+    ] {
+        if let Some(row) = status
+            .observed
+            .iter_mut()
+            .find(|row| row.subject == grant.subject)
+        {
+            *row = grant;
+        }
+    }
+    status
 }
 
 /// The `mixed` scenario once its Debugger access is on: one managed row (Rust in Spotlight)
@@ -75,7 +105,7 @@ fn to_change() -> SetupStatus {
 }
 
 /// The headline's words: the page heading's subtitle line.
-const HEADLINE: &str = "settings/page-subtitle/system-state";
+const HEADLINE: &str = "system-state/headline";
 
 fn label(compiled: &CompiledUi, key: &str) -> String {
     compiled
@@ -104,6 +134,119 @@ fn with_readings(selection: Selection, observed: Vec<Observation>) -> SetupStatu
         observed,
         ..SetupStatus::default()
     }
+}
+
+/// The lines the page draws for `app`, in page order, and the card's items.
+fn lines_of(app: &SystemStateApp) -> (Vec<lines::LineView>, Vec<lines::CardItem>) {
+    let rows = page::page_rows(app);
+    let card = lines::card_items(app, &rows);
+    let lines = lines::Line::ALL
+        .into_iter()
+        .map(|line| lines::line_view(app, line, &rows, &card))
+        .collect();
+    (lines, card)
+}
+
+/// The line that holds `setting` on `app`'s page.
+fn line_in(app: &SystemStateApp, setting: Setting) -> lines::LineView {
+    let at = lines::Line::of(Subject::Setting(setting));
+    lines_of(app)
+        .0
+        .into_iter()
+        .find(|line| line.line == at)
+        .expect("every line is drawn")
+}
+
+/// A page that reads `status` under its own plan.
+fn page_reading(status: &SetupStatus) -> SystemStateApp {
+    let mut app = SystemStateApp::new(status.plan.clone().unwrap_or_default());
+    app.publish(status.clone());
+    app
+}
+
+/// The mark the line that holds `setting` shows on a page reading `status` (§4.4).
+fn mark_on(status: &SetupStatus, setting: Setting) -> lines::Mark {
+    line_in(&page_reading(status), setting).mark
+}
+
+#[test]
+fn an_untouched_setup_offer_can_restart_without_being_answered() {
+    for kind in [OfferKind::Launch, OfferKind::Resume] {
+        let (send, receive) = mpsc::channel();
+        let request = match kind {
+            OfferKind::Launch => Request::new(Plan::default(), send),
+            OfferKind::Resume => Request::resume(Plan::default(), send),
+        };
+        let mut page = SystemStateApp::new(Plan::default());
+        assert!(page.offer(request.clone()));
+        assert!(page.offer_can_restart(&request));
+        assert!(
+            receive.try_recv().is_err(),
+            "checking never answers the offer"
+        );
+        assert!(request.pending());
+        drop(page);
+        assert_eq!(
+            receive
+                .recv_timeout(Duration::from_secs(60))
+                .unwrap()
+                .decision,
+            WorkstationSetupDecision::Unavailable,
+        );
+    }
+}
+
+#[test]
+fn setup_offer_restart_preserves_drafts_and_pending_work() {
+    let mutations: [fn(&mut SystemStateApp); 10] = [
+        |page| page.plan.selection = Selection::none(),
+        |page| page.url.insert("/draft"),
+        |page| page.url.insert(" "),
+        |page| {
+            page.password
+                .replace(SecretBytes::from("fixture draft".to_owned()))
+        },
+        |page| page.password.composing = true,
+        |page| page.url.set_preedit("draft".into(), None),
+        |page| {
+            page.awaiting = Some(Awaiting {
+                plan: page.plan.clone(),
+                password: None,
+                changed: None,
+            })
+        },
+        |page| page.actions.push_back(SystemStateAction::Restore),
+        |page| page.stopping = true,
+        |page| page.status.busy = true,
+    ];
+    for (index, mutate) in mutations.into_iter().enumerate() {
+        let (send, receive) = mpsc::channel();
+        let request = Request::new(Plan::default(), send);
+        let mut page = SystemStateApp::new(Plan::default());
+        assert!(page.offer(request.clone()));
+        mutate(&mut page);
+        assert!(!page.offer_can_restart(&request), "draft/work case {index}");
+        assert!(request.pending());
+        assert!(receive.try_recv().is_err());
+    }
+}
+
+#[test]
+fn setup_offer_restart_rechecks_the_current_offer_and_late_edits() {
+    let (send, _receive) = mpsc::channel();
+    let request = Request::new(Plan::default(), send);
+    let (other_send, _other_receive) = mpsc::channel();
+    let other = Request::new(Plan::default(), other_send);
+    let mut page = SystemStateApp::new(Plan::default());
+    assert!(page.offer(request.clone()));
+    assert!(!page.offer_can_restart(&other));
+    assert!(page.offer_can_restart(&request));
+    page.url.insert("/late-draft");
+    assert!(!page.offer_can_restart(&request));
+    page.url = TextInputState::new(page.submitted.vault_url.clone());
+    assert!(page.offer_can_restart(&request));
+    page.closed(CloseScope::Tab);
+    assert!(!page.offer_can_restart(&request));
 }
 
 #[test]
@@ -204,9 +347,10 @@ fn rows_show_now_and_wanted_and_at_most_one_chip() {
     );
 }
 
-/// A row the person changed after aterm set it (design §6.9) reads as they left it, under
-/// "Changed by you", with no chip saying it will change; while Set up now runs it, it changes
-/// like any other row, and a differing row without the note still reads as one that will change.
+/// A row the person changed after aterm set it (init design §6.6) reads as they left it, under
+/// "Changed by you", with no chip saying it will change, while an automatic pass runs its stage
+/// too, since that pass keeps the person's value; a differing row without the note still reads
+/// as one that will change.
 #[test]
 fn a_row_changed_by_you_reads_as_you_left_it() {
     let dock = Subject::Setting(Setting::Dock);
@@ -224,10 +368,24 @@ fn a_row_changed_by_you_reads_as_you_left_it() {
         )
     );
 
+    // An automatic pass running the Dock's stage keeps the person's value (init design §6.6):
+    // the row still reads as they left it, with no Will change chip and no "changing now".
     status.running = vec![Setting::Dock];
+    let busy = row_view(dock, &status, Selection::all());
     assert_eq!(
-        row_view(dock, &status, Selection::all()).chip,
-        Some(Chip::WillChange { busy: true })
+        (
+            busy.value,
+            busy.chip,
+            busy.note.as_deref(),
+            busy.label.as_str()
+        ),
+        (
+            RowValue::One("Recent apps shown".into()),
+            None,
+            Some("Changed by you"),
+            "Dock: Recent apps shown, changed by you"
+        ),
+        "a pass leaves the person's value alone, so the row never says it changes now"
     );
 
     let status = with_readings(
@@ -237,6 +395,45 @@ fn a_row_changed_by_you_reads_as_you_left_it() {
     assert_eq!(
         row_view(dock, &status, Selection::all()).chip,
         Some(Chip::WillChange { busy: false })
+    );
+}
+
+/// A row the person changed after aterm set it (design §6.6, "Changed by you") is their value,
+/// kept by every automatic pass: it is no change to make, so the headline neither counts it nor
+/// lights Set up now for it (which would undo it). Another row that differs still counts, and
+/// lights Set up now, whose press sets the kept row again too. Before, the kept row read as one
+/// change to make and lit Set up now.
+#[test]
+fn a_row_changed_by_you_is_no_change_to_make() {
+    let dock = Subject::Setting(Setting::Dock);
+    let mut kept = reading(dock, Standing::Differs, Some("Recent apps shown"));
+    kept.note = Some(aterm_types::macos_setup::CHANGED_BY_YOU.to_owned());
+    let mut only_dock = Selection::none();
+    only_dock.set(Setting::Dock, true);
+    let status = with_readings(only_dock, vec![kept.clone()]);
+    let shown = rows(&status, only_dock);
+    let line = headline(&status, &shown, status.plan.as_ref());
+    assert!(
+        !line.start && !line.text.contains("change"),
+        "{:?} start={} set_up={}",
+        line.text,
+        line.start,
+        line.set_up
+    );
+
+    let widgets = Subject::Setting(Setting::Widgets);
+    let mut both = only_dock;
+    both.set(Setting::Widgets, true);
+    let status = with_readings(
+        both,
+        vec![kept, reading(widgets, Standing::Differs, Some("Shown"))],
+    );
+    let shown = rows(&status, both);
+    let line = headline(&status, &shown, status.plan.as_ref());
+    assert_eq!(
+        (line.text.as_str(), line.start),
+        ("1 change to make", true),
+        "only the row aterm sets counts"
     );
 }
 
@@ -258,11 +455,6 @@ fn a_row_waiting_on_a_person_carries_its_open_and_a_failure_its_reason() {
     assert_eq!(row.chip, Some(Chip::Failed));
     assert_eq!(row.note.as_deref(), Some("REASON17"));
     assert_eq!(row.open, None);
-    assert_eq!(open_words(Access::Debugger).1, "Turn On…");
-    assert_eq!(
-        open_words(Access::FullDiskAccess).0,
-        "Open Full Disk Access"
-    );
 }
 
 /// A probe's reason (`Observation::detail`) shows under every row that needs a person, is not
@@ -371,14 +563,21 @@ fn a_rows_description_is_its_note_wherever_it_explains_the_row() {
         None
     );
 
-    // On the page: the Debugger row names the dialog macOS shows, and a
-    // screen reader hears it.
+    // On the page: the card, which holds the Debugger row while macOS asks for the password,
+    // names the dialog macOS shows, and a screen reader hears it.
     let mut app = SystemStateApp::new(Plan::default());
     app.publish(status_of("debugger"));
     let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 900.0);
     assert!(
-        label(&compiled, "system-state/row/debugger/note").contains("SamplingTools"),
-        "the Debugger row explains the SamplingTools dialog"
+        compiled.semantics.iter().any(|node| {
+            node.key.as_str().starts_with("system-state/card/debugger")
+                && (node.label.contains("SamplingTools")
+                    || node
+                        .description
+                        .as_deref()
+                        .is_some_and(|words| words.contains("SamplingTools")))
+        }),
+        "the card explains the SamplingTools dialog"
     );
 }
 
@@ -436,7 +635,13 @@ fn a_row_that_will_change_shows_no_engine_line_under_it() {
         for busy in [false, true] {
             status.running = if busy { vec![setting] } else { Vec::new() };
             let row = row_view(subject, &status, Selection::all());
-            assert_eq!(row.chip, Some(Chip::WillChange { busy }), "{setting:?}");
+            // A waiting row is calm until its step runs.
+            let chip = if standing == Standing::Waiting && !busy {
+                Chip::Waiting
+            } else {
+                Chip::WillChange { busy }
+            };
+            assert_eq!(row.chip, Some(chip), "{setting:?}");
             let waits = (standing == Standing::Waiting).then_some(WAITING_NOTE);
             assert_eq!(row.note.as_deref(), waits, "{setting:?} busy={busy}");
             assert!(!row.label.contains(line), "{setting:?}: {}", row.label);
@@ -571,8 +776,18 @@ fn a_disk_image_vault_wait_is_said_on_the_row_the_headline_and_the_menu_line() {
     let mut app = SystemStateApp::new(Plan::from(Selection::all()));
     app.publish(status.clone());
     let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 4000.0);
-    assert_eq!(label(&compiled, "system-state/row/secrets/note"), move_it);
-    assert_eq!(label(&compiled, HEADLINE), "Needs you: Secrets vault");
+    // The card holds the row, with its reason; the line leaves it out (said once).
+    assert_eq!(
+        label(&compiled, "system-state/card/secrets/reason"),
+        move_it
+    );
+    assert!(
+        compiled
+            .semantic(&UiKey::new("system-state/row/secrets/note"))
+            .is_none()
+    );
+    assert_eq!(app.headline().text, "Needs you: Secrets vault");
+    assert_eq!(label(&compiled, HEADLINE), "1 thing needs you");
     let head = headline(
         &status,
         &rows(&status, Selection::all()),
@@ -836,9 +1051,9 @@ fn a_value_restore_could_not_reach_is_part_of_the_calm_line_and_no_failure() {
 }
 
 /// A setup pass says what its readings cannot in row names (§3.6): a change that did not take
-/// is its row's failure, which the headline names and shows, its reason on its row and what
-/// comes next in the note; one it could not confirm is said calmly; and what its rollback put
-/// back is one calm line in a Restore's words, never a preference key.
+/// is its row's failure, which the headline names and shows, with Set up now, its reason on its
+/// row and no note to say it again; one it could not confirm says so calmly on its row alone;
+/// and what its rollback put back is one calm line in a Restore's words, never a preference key.
 #[test]
 fn a_pass_says_each_unfinished_row_and_its_rollback_in_row_names() {
     let mut rolled = RestoreOutcome::of([
@@ -861,13 +1076,17 @@ fn a_pass_says_each_unfinished_row_and_its_rollback_in_row_names() {
     assert_eq!(
         status.notes(&plan),
         [
-            "Widgets and Dock failed. Set up now tries again.",
-            "Rust in Spotlight could not be confirmed.",
             "aterm put back what it could not finish. Dock is as it was. Natural scrolling comes \
              back at your next login.",
             JOURNAL_NOTE,
         ]
     );
+    let spotlight = row_view(
+        Subject::Setting(Setting::Spotlight),
+        &status,
+        plan.selection,
+    );
+    assert_eq!(spotlight.note.as_deref(), Some(UNCONFIRMED_NOTE));
     for (setting, reason) in [
         (
             Setting::Widgets,
@@ -884,10 +1103,11 @@ fn a_pass_says_each_unfinished_row_and_its_rollback_in_row_names() {
     }
     let head = headline(&status, &rows(&status, plan.selection), Some(&plan));
     assert_eq!(
-        (head.text.as_str(), head.show),
+        (head.text.as_str(), head.show, head.start),
         (
             "2 steps failed: Widgets, Dock",
-            Some(Subject::Setting(Setting::Widgets))
+            Some(Subject::Setting(Setting::Widgets)),
+            true
         )
     );
     assert_eq!(
@@ -977,7 +1197,7 @@ fn an_unwound_reading_neither_claims_a_check_nor_hides_its_words() {
     let head = headline(&status, &rows(&status, plan.selection), Some(&plan));
     assert_eq!(
         (head.text.as_str(), head.show),
-        ("1 row could not be read: Dock", Some(dock))
+        ("Could not read: Dock", Some(dock))
     );
     let row = row_view(dock, &status, plan.selection);
     assert_eq!(
@@ -1117,8 +1337,11 @@ fn accounts_accessibility_does_not_reopen_an_unneeded_or_settled_grant() {
     }
 }
 
+/// A line names what is not in place, now beside wanted, and says when only some of its settings
+/// are on; a line with none on reads Off (§4.2, §4.3).
 #[test]
-fn group_headers_count_only_what_is_not_in_place() {
+fn a_line_names_what_is_not_in_place_and_says_when_it_is_partly_on() {
+    let natural = Subject::Setting(Setting::NaturalScrolling);
     let status = with_readings(
         Selection::all(),
         vec![
@@ -1127,11 +1350,7 @@ fn group_headers_count_only_what_is_not_in_place() {
                 Standing::InPlace,
                 Some("Control"),
             ),
-            reading(
-                Subject::Setting(Setting::NaturalScrolling),
-                Standing::Differs,
-                Some("On"),
-            ),
+            reading(natural, Standing::Differs, Some("On")),
             reading(
                 Subject::Setting(Setting::TrackpadScrolling),
                 Standing::InPlace,
@@ -1139,38 +1358,36 @@ fn group_headers_count_only_what_is_not_in_place() {
             ),
         ],
     );
-    let all = rows(&status, Selection::all());
+    let under = |selection: Selection| {
+        let mut status = status.clone();
+        status.plan = Some(Plan::from(selection));
+        line_in(&page_reading(&status), Setting::CapsLock)
+    };
+    let mac = under(Selection::all());
     assert_eq!(
-        group_words(Group::Input, Selection::all(), &all),
+        (mac.mark, mac.phrase.as_str()),
         (
-            Some("1 of 3 to change".into()),
-            "Keyboard & Trackpad, Set up, 1 of 3 to change".into()
+            Mark::Pending,
+            format!(
+                "{}: On → {}",
+                natural.name(),
+                Setting::NaturalScrolling.wanted()
+            )
+            .as_str()
         )
     );
-    assert_eq!(
-        group_words(Group::Desktop, Selection::all(), &all),
-        (None, "Desktop & Dock, Set up".into())
-    );
+    assert!(mac.label.contains(" to "), "{}", mac.label);
     let mut mixed = Selection::all();
     mixed.set(Setting::NaturalScrolling, false);
-    assert_eq!(group_choice(Group::Input, mixed), GroupChoice::Partly);
-    assert_eq!(
-        group_words(Group::Input, mixed, &rows(&status, mixed))
-            .0
-            .as_deref(),
-        Some("Partly set up")
+    let partly = under(mixed);
+    assert!(
+        partly.on && partly.phrase.starts_with("Partly on · "),
+        "{partly:?}"
     );
+    let off = under(Selection::none());
     assert_eq!(
-        group_choice(Group::Input, Selection::none()),
-        GroupChoice::LeaveAsIs
-    );
-    assert_eq!(
-        group_words(
-            Group::Input,
-            Selection::none(),
-            &rows(&status, Selection::none())
-        ),
-        (None, "Keyboard & Trackpad, Left as is".into())
+        (off.on, off.mark, off.phrase.as_str()),
+        (false, Mark::Off, lines::LEFT_AS_IS)
     );
 }
 
@@ -1193,7 +1410,7 @@ fn headlines_say_the_state_in_the_designs_words() {
         "Enter your password for Debugger access"
     );
     let needs = line(&status_of("needs-you"));
-    assert_eq!(needs.text, "Needs you: Full Disk Access and 1 more");
+    assert_eq!(needs.text, "Needs you: Full Disk Access");
     assert_eq!(needs.open, Some(Access::FullDiskAccess));
     let failed = line(&status_of("failed"));
     assert_eq!(failed.text, "1 step failed: GitHub repositories");
@@ -1248,20 +1465,20 @@ fn headlines_say_the_state_in_the_designs_words() {
         plan: Some(Plan::from(Selection::none())),
         ..status_of("set-up")
     };
-    assert_eq!(line(&nothing).text, "Everything is left as is");
+    assert_eq!(line(&nothing).text, EVERYTHING_LEFT_AS_IS);
     assert!(fixture_status("toggles").is_none());
 }
 
 /// Where no ALab vault answered aterm's own join, the vault reads not joined in place, as
 /// `macos_doctor` reads it on any plan. On the base plan alone (a non-ALab Mac, its profile left
-/// as is, §3.2) the headline says Permissions are set up, the village draws the Secrets station
+/// as is, §3.2) the headline says Permissions are set up, the Secrets line reads done
 /// settled, the row keeps its note and offers no Turn On Sync, and `setup=` reads done, though the
 /// run still parks on the vault. On the whole profile, whose GitHub repositories `macos_doctor`
 /// reads there as their stage runs them, on this Mac's own GitHub token, the headline says This
 /// Mac is set up once they are cloned; with no token of the Mac's own they wait for the vault's,
-/// as their stage does, and the headline, the village and `setup=` say so. A join the person typed
+/// as their stage does, and the headline, the Developer line and `setup=` say so. A join the person typed
 /// a password for, which `macos_doctor` reads as waiting while the run holds that password for a
-/// try, holds the headline, the village and `setup=` at the vault, on the base plan too.
+/// try, holds the headline, the Secrets line and `setup=` at the vault, on the base plan too.
 #[test]
 fn a_vault_nothing_answered_for_is_set_up_and_a_typed_join_waits_for_it() {
     use crate::system_state_access::setup_field;
@@ -1270,19 +1487,7 @@ fn a_vault_nothing_answered_for_is_set_up_and_a_typed_join_waits_for_it() {
         let plan = status.plan.clone().unwrap();
         headline(status, &rows(status, plan.selection), Some(&plan))
     };
-    let station_of = |status: &SetupStatus, at: Setting| {
-        let plan = status.plan.clone().unwrap();
-        let spec = village_spec(status, &rows(status, plan.selection), &plan, 0);
-        let at = Setting::ALL
-            .iter()
-            .position(|setting| *setting == at)
-            .unwrap();
-        spec.rsplit("states=")
-            .next()
-            .and_then(|states| states.chars().nth(at))
-            .unwrap()
-    };
-    let station = |status: &SetupStatus| station_of(status, Setting::Secrets);
+    let station = |status: &SetupStatus| mark_on(status, Setting::Secrets);
     fn reading_of(status: &mut SetupStatus, setting: Setting) -> &mut Observation {
         status
             .observed
@@ -1305,7 +1510,8 @@ fn a_vault_nothing_answered_for_is_set_up_and_a_typed_join_waits_for_it() {
         (done.text.as_str(), done.show, done.start),
         ("Permissions are set up", None, false)
     );
-    assert_eq!(station(&base), 'G');
+    // A Mac in no vault syncs nothing: its line is calm, never done.
+    assert_eq!(station(&base), Mark::Off);
     let row = row_view(secrets, &base, BASE_PLAN);
     assert_eq!(
         (&row.value, row.chip, row.note.as_deref(), row.turn_on_sync),
@@ -1335,12 +1541,13 @@ fn a_vault_nothing_answered_for_is_set_up_and_a_typed_join_waits_for_it() {
     let mut app = SystemStateApp::new(Plan::from(BASE_PLAN));
     app.publish(base.clone());
     assert!(!app.needs_attention());
+    assert_eq!(app.headline().text, "Permissions are set up");
     assert_eq!(
         label(
             &compile(&app, &SystemStateViewState::default(), 999.0, 1400.0),
             HEADLINE
         ),
-        "Permissions are set up"
+        "Your Mac is ready"
     );
 
     // The whole profile, its vault read as on the base plan: the vault waits on nothing there
@@ -1361,7 +1568,7 @@ fn a_vault_nothing_answered_for_is_set_up_and_a_typed_join_waits_for_it() {
         (done.text.as_str(), done.show, done.start),
         ("This Mac is set up", None, false)
     );
-    assert_eq!(station(&profile), 'G');
+    assert_eq!(station(&profile), Mark::Off);
     assert_eq!(setup_field(&profile), "done");
     // With no token of the Mac's own, they wait for the vault's, as their stage does.
     let mut no_token = profile.clone();
@@ -1379,8 +1586,8 @@ fn a_vault_nothing_answered_for_is_set_up_and_a_typed_join_waits_for_it() {
             false
         )
     );
-    assert_eq!(station(&no_token), 'G');
-    assert_eq!(station_of(&no_token, Setting::Repositories), 'D');
+    assert_eq!(station(&no_token), Mark::Off);
+    assert_eq!(mark_on(&no_token, Setting::Repositories), Mark::Waiting);
     assert_eq!(setup_field(&no_token), "pending:repos");
 
     // A join the person typed waits for that vault, on the base plan too.
@@ -1393,7 +1600,7 @@ fn a_vault_nothing_answered_for_is_set_up_and_a_typed_join_waits_for_it() {
         (waiting.text.as_str(), waiting.show, waiting.start),
         ("1 step waiting: Secrets vault", Some(secrets), false)
     );
-    assert_eq!(station(&typed), 'D');
+    assert_eq!(station(&typed), Mark::Waiting);
     assert_eq!(setup_field(&typed), "pending:vault");
     // A run that ended holds no password for a try, so `macos_doctor` reads its vault as `base`'s,
     // which reads done once the run ends (`ended` above).
@@ -1420,7 +1627,8 @@ fn the_base_plan_headline_names_permissions_only_where_it_sets_them_up() {
 }
 
 /// Rows that only wait are no change to make (§3.2): the count and Set up now come only with a
-/// row that differs, and the count then takes in the waiting rows too (each shows `Will change`).
+/// row that differs, and the count takes in only those rows: a waiting row reads `Waiting`,
+/// calm, since no press changes it before what it waits on comes.
 /// Rows that only wait are named in page order, with a Show to the first, each saying what it
 /// waits on.
 #[test]
@@ -1452,12 +1660,23 @@ fn rows_that_only_wait_are_named_and_not_counted_as_changes() {
         reading(repositories, Standing::Waiting, None),
         reading(dock, Standing::Differs, Some("9 apps")),
     ]);
-    assert_eq!(with_a_change.text, "2 changes to make");
+    assert_eq!(with_a_change.text, "1 change to make");
     assert_eq!((with_a_change.show, with_a_change.start), (None, true));
-    // A fresh Mac: ten rows differ and the repositories wait on the vault.
+    let status = with_readings(
+        Selection::all(),
+        vec![
+            reading(repositories, Standing::Waiting, None),
+            reading(dock, Standing::Differs, Some("9 apps")),
+        ],
+    );
+    assert_eq!(
+        row_view(repositories, &status, Selection::all()).chip,
+        Some(Chip::Waiting)
+    );
+    // A fresh Mac: ten rows differ, and the repositories wait on the vault.
     let fresh = status_of("fresh");
     let fresh = headline(&fresh, &rows(&fresh, Selection::all()), fresh.plan.as_ref());
-    assert_eq!(fresh.text, "11 changes to make");
+    assert_eq!(fresh.text, "10 changes to make");
     assert!(fresh.start);
     // Waiting is no attention: nothing here needs the person yet.
     let mut app = SystemStateApp::new(Plan::default());
@@ -1554,13 +1773,21 @@ fn named_result_failure_headline_survives_new_readings_until_recovery() {
         };
         assert_eq!(line(&current).text, words);
         assert_eq!(app.needs_attention(), !retrying);
+        // The page says setup tries again while it does, naming the step; then it names the
+        // failure, the step in the card saying what failed.
         let compiled = compile(&app, &view, 999.0, 740.0);
-        assert_eq!(label(&compiled, HEADLINE), words);
-        assert!(
-            compiled
-                .semantic(&UiKey::new("system-state/headline/show"))
-                .is_some_and(|node| node.action.is_some() && !node.offscreen)
-        );
+        let carded = lines_of(&app)
+            .1
+            .iter()
+            .any(|item| item.mark == Mark::Failed && item.subject == Some(repository));
+        if retrying {
+            assert_eq!(label(&compiled, HEADLINE), "Setup will try again");
+            assert!(label(&compiled, "system-state/sub").contains(repository.name()));
+            assert!(!carded);
+        } else {
+            assert_eq!(label(&compiled, HEADLINE), "1 step failed");
+            assert!(carded);
+        }
     }
     // The same failed subject is counted once, however it was reported.
     observed_failure.rows = failed.rows.clone();
@@ -1595,9 +1822,10 @@ fn named_result_failure_headline_survives_new_readings_until_recovery() {
         ..settled.clone()
     };
     app.publish(recovered);
+    assert_eq!(line(&settled).text, "This Mac is set up");
     assert_eq!(
         label(&compile(&app, &view, 999.0, 740.0), HEADLINE),
-        line(&settled).text
+        "Your Mac is ready"
     );
     assert!(!app.needs_attention());
     assert!(line(&app.status).show.is_none());
@@ -1676,7 +1904,8 @@ fn a_restored_operation_advisory_stays_visible_without_failure_attention() {
             .iter()
             .any(|node| !node.offscreen && node.label.contains(detail))
     );
-    assert_eq!(label(&compiled, HEADLINE), baseline.text);
+    assert_eq!(app.headline().text, baseline.text);
+    assert_eq!(label(&compiled, HEADLINE), "Your Mac is ready");
     assert!(!app.needs_attention());
 }
 
@@ -1776,8 +2005,13 @@ fn a_failed_check_again_is_a_page_note_only() {
             (line.text.as_str(), line.show, line.start),
             (words, None, false)
         );
+        // The page: ready, as last read.
         let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 900.0);
-        assert_eq!(label(&compiled, HEADLINE), words);
+        assert_eq!(label(&compiled, HEADLINE), "Your Mac is ready");
+        assert!(
+            label(&compiled, "system-state/sub").ends_with(AS_LAST_READ),
+            "{words}"
+        );
     }
 }
 
@@ -1944,7 +2178,7 @@ fn a_choice_during_a_run_goes_at_once_and_nothing_waits_on_the_page() {
     assert_eq!(admission, Admission::Client);
     assert!(!plan.selection.contains(Setting::Messages));
     assert!(!plan.selection.contains(Setting::CapsLock));
-    app.tick(true, true, false);
+    app.tick();
     assert!(app.take_action().is_none(), "nothing is queued for later");
 }
 
@@ -2025,11 +2259,12 @@ fn a_page_opened_by_hand_waits_for_the_plan_in_force() {
     assert!(app.take_action().is_none(), "no guess is submitted");
     assert!(!app.needs_attention());
     let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 900.0);
-    let segment = compiled
-        .semantic(&UiKey::new("system-state/group/0/set-up"))
-        .and_then(|node| node.state)
-        .unwrap();
-    assert!(!segment.enabled && !segment.selected);
+    assert!(
+        compiled
+            .semantic(&UiKey::new("system-state/line/permissions/switch"))
+            .is_none(),
+        "no guess is shown as wanted: no switch until the plan is known"
+    );
     assert_eq!(label(&compiled, HEADLINE), "Checking this Mac…");
     assert!(
         compiled
@@ -2057,7 +2292,10 @@ fn a_page_opened_by_hand_waits_for_the_plan_in_force() {
 fn unknown_plan_check_stays_disabled_after_a_status_error() {
     for status in [SetupStatus::default(), status_of("plan-unread")] {
         let mut app = SystemStateApp::opened();
-        app.publish(status);
+        app.publish(SetupStatus {
+            restorable: true,
+            ..status
+        });
         let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 740.0);
         let enabled = |key: &str| {
             compiled
@@ -2066,7 +2304,12 @@ fn unknown_plan_check_stays_disabled_after_a_status_error() {
                 .unwrap()
                 .enabled
         };
-        assert!(!enabled("system-state/check"));
+        assert!(
+            compiled
+                .semantic(&UiKey::new("system-state/check"))
+                .is_none(),
+            "nothing read: no Check again"
+        );
         assert!(enabled("system-state/restore"));
         act(&mut app, "system-state/check");
         assert!(app.take_action().is_none(), "Check submits no guessed plan");
@@ -2083,7 +2326,11 @@ fn unknown_plan_check_stays_disabled_after_a_status_error() {
 fn unknown_plan_join_keeps_its_draft_until_the_saved_plan_is_known() {
     for status in [SetupStatus::default(), status_of("plan-unread")] {
         let (mut runtime, instance, view) = runtime_with_app(SystemStateApp::opened());
-        runtime.publish_system_state(status);
+        // aterm saved preferences before: Restore stands while the plan is unknown.
+        runtime.publish_system_state(SetupStatus {
+            restorable: true,
+            ..status
+        });
         runtime.system_state_gesture(true);
         let press = |runtime: &mut NativeRuntime, key: &str, value| {
             runtime
@@ -2114,17 +2361,24 @@ fn unknown_plan_join_keeps_its_draft_until_the_saved_plan_is_known() {
         ] {
             press(&mut runtime, key, Some(SemanticInput::Text(text.into())));
         }
+        // Until the plan in force is known the Secrets line has no rows to open, so no Join
+        // shows; the draft typed is kept.
         let tree = compiled(&runtime);
-        assert!(enabled(&tree, "system-state/url"));
-        assert!(enabled(&tree, "system-state/password"));
         assert!(enabled(&tree, "system-state/restore"));
-        assert!(!enabled(&tree, "system-state/vault/join"));
+        assert!(
+            tree.semantic(&UiKey::new("system-state/vault/join"))
+                .and_then(|node| node.state)
+                .is_none_or(|state| !state.enabled)
+        );
         press(&mut runtime, "system-state/vault/join", None);
         assert!(runtime.take_system_state_action().is_none());
 
+        // Once it is known, the Secrets line opens to its rows and the draft's Join (an Off
+        // line opens to nothing, so this plan keeps Secrets on).
         let mut selection = Selection::none();
         selection.set(Setting::Permissions, true);
         selection.set(Setting::Dock, true);
+        selection.set(Setting::Secrets, true);
         runtime.publish_system_state(SetupStatus {
             plan: Some(Plan {
                 selection,
@@ -2132,6 +2386,7 @@ fn unknown_plan_join_keeps_its_draft_until_the_saved_plan_is_known() {
             }),
             ..SetupStatus::default()
         });
+        press(&mut runtime, "system-state/line/secrets/disclose", None);
         let (app, _) = page_in(&runtime, view);
         assert_eq!(app.url.value(), "http://typed.local:7484/v1/team");
         assert_eq!(app.password.text(), "inert-password");
@@ -2139,7 +2394,6 @@ fn unknown_plan_join_keeps_its_draft_until_the_saved_plan_is_known() {
         assert!(enabled(&compiled(&runtime), "system-state/vault/join"));
         press(&mut runtime, "system-state/vault/join", None);
         let (plan, admission, password) = submitted(runtime.take_system_state_action());
-        selection.set(Setting::Secrets, true);
         assert_eq!(plan.selection, selection);
         assert_eq!(plan.vault_url, "http://typed.local:7484/v1/team");
         assert_eq!(admission, Admission::Person);
@@ -2207,17 +2461,24 @@ fn a_saved_setup_unread_just_now_is_said_calmly_until_a_read_succeeds() {
             operation,
             ..unread.clone()
         });
+        // A run says §4.3's words; a Check or a Restore says what it does.
+        let said = match operation {
+            None => lines::SETTING_UP.to_owned(),
+            Some(_) => {
+                Headline::before_plan(&SetupStatus {
+                    busy: true,
+                    operation,
+                    ..SetupStatus::default()
+                })
+                .text
+            }
+        };
         assert_eq!(
             label(
                 &compile(&busy_page, &SystemStateViewState::default(), 999.0, 740.0),
                 HEADLINE
             ),
-            Headline::before_plan(&SetupStatus {
-                busy: true,
-                operation,
-                ..SetupStatus::default()
-            })
-            .text
+            said
         );
     }
     let (instance, _) = app.active_native_view(wid).unwrap();
@@ -2278,7 +2539,15 @@ fn a_generic_check_failure_headline_follows_only_the_exact_reviewed_plan() {
     let mut app = SystemStateApp::new(plan.clone());
     let mut view = SystemStateViewState::default();
     app.publish(success.clone());
-    let settled = label(&compile(&app, &view, 999.0, 740.0), HEADLINE);
+    let said = |app: &SystemStateApp, view: &SystemStateViewState| {
+        let compiled = compile(app, view, 999.0, 740.0);
+        format!(
+            "{} · {}",
+            label(&compiled, HEADLINE),
+            label(&compiled, "system-state/sub")
+        )
+    };
+    let settled = said(&app, &view);
     let checked = SetupStatus {
         retrying: true,
         check: Some(SetupCheck {
@@ -2292,10 +2561,7 @@ fn a_generic_check_failure_headline_follows_only_the_exact_reviewed_plan() {
         ..success
     };
     app.publish(checked.clone());
-    assert_ne!(
-        label(&compile(&app, &view, 999.0, 740.0), HEADLINE),
-        settled
-    );
+    assert_ne!(said(&app, &view), settled);
     assert!(
         !app.needs_attention(),
         "retry suppression is only a signal rule"
@@ -2309,20 +2575,25 @@ fn a_generic_check_failure_headline_follows_only_the_exact_reviewed_plan() {
     );
     for _ in 0..2 {
         app.publish(checked.clone());
-        assert_eq!(
-            label(&compile(&app, &view, 999.0, 740.0), HEADLINE),
-            settled
-        );
+        assert_eq!(said(&app, &view), settled);
         assert!(!app.needs_attention());
     }
 }
 
+/// Changes to make a Stop holds wait for Set up now, which runs the plan in force again as the
+/// person's own admission.
 #[test]
-fn set_up_now_runs_the_plan_again_when_rows_differ() {
+fn set_up_now_runs_the_plan_again_while_a_stop_holds_it() {
     let mut app = SystemStateApp::new(Plan::default());
-    app.publish(to_change());
+    app.publish(SetupStatus {
+        run: Some(InitialSetupRunPolicy {
+            revision: 1,
+            allowed: false,
+        }),
+        ..to_change()
+    });
     let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 900.0);
-    assert_eq!(label(&compiled, HEADLINE), "1 change to make");
+    assert_eq!(label(&compiled, HEADLINE), lines::STOPPED);
     // The button says its action alone: VoiceOver reads the headline beside it.
     assert_eq!(
         label(&compiled, "system-state/headline/start"),
@@ -2458,7 +2729,7 @@ fn only_a_group_choice_or_join_makes_the_plan_the_choosers() {
     let (send, _receive) = mpsc::channel();
     let mut app = SystemStateApp::new(Plan::default());
     assert!(app.offer(Request::new(Plan::default(), send)));
-    app.tick(true, true, false);
+    app.tick();
     assert!(!chosen(app.take_action()));
 }
 
@@ -2487,8 +2758,8 @@ fn an_accepted_plan_does_not_undo_a_choice_made_while_it_waited() {
     assert!(app.awaiting.is_none());
 }
 
-/// The offer of a plan an earlier process admitted is answered by the page itself on the first
-/// tick a person is here, while the run it resumes keeps the page busy; a page asked to Stop that
+/// The offer of a plan an earlier process admitted is answered by the page itself on its first
+/// tick, while the run it resumes keeps the page busy; a page asked to Stop that
 /// run gives no answer to the offer still up, in that frame or later.
 #[test]
 fn a_page_asked_to_stop_gives_the_resumed_offer_no_answer() {
@@ -2506,7 +2777,7 @@ fn a_page_asked_to_stop_gives_the_resumed_offer_no_answer() {
             act(&mut app, "system-state/stop");
             assert!(matches!(app.take_action(), Some(SystemStateAction::Stop)));
         }
-        app.tick(true, true, false);
+        app.tick();
         let answered = matches!(
             app.take_action(),
             Some(SystemStateAction::Apply(_, Admission::Automatic))
@@ -2515,19 +2786,20 @@ fn a_page_asked_to_stop_gives_the_resumed_offer_no_answer() {
     }
 }
 
-/// The launch offer is answered automatically, even on an unattended Mac.
-/// The answer is aterm's own, never a choice, and carries no typed vault.
+/// The launch's offer is answered by the page itself, as the plan stands, at its first tick,
+/// shown or not and whoever is at this Mac (init-on-by-default design §6.1: only the person stages
+/// wait for a person). The answer is aterm's own, never a choice, and carries no typed vault.
 #[test]
-fn the_offer_is_answered_on_the_first_tick_without_waiting_for_a_person() {
+fn the_offer_is_answered_at_the_first_tick_with_no_wait_for_a_person() {
     let (send, receive) = mpsc::channel();
     let request = Request::new(Plan::default(), send);
     let mut app = SystemStateApp::new(Plan::default());
     assert!(app.offer(request.clone()));
     assert!(request.pending());
     assert_eq!(app.headline().text, STARTING_HEADLINE);
-    app.tick(false, false, false);
+    app.tick();
     let Some(SystemStateAction::Apply(answer, who)) = app.take_action() else {
-        panic!("the first unattended tick answers the offer");
+        panic!("the first tick answers the offer");
     };
     assert_eq!(who, Admission::Automatic);
     assert!(!answer.chosen && !answer.vault_typed && answer.password.is_none());
@@ -2540,7 +2812,7 @@ fn the_offer_is_answered_on_the_first_tick_without_waiting_for_a_person() {
             .decision,
         WorkstationSetupDecision::Begin(_)
     ));
-    app.tick(true, true, false);
+    app.tick();
     assert!(app.take_action().is_none(), "answered once");
     assert!(receive.try_recv().is_err());
 }
@@ -2555,10 +2827,10 @@ fn the_pages_own_answer_waits_while_the_page_is_busy() {
         busy: true,
         ..SetupStatus::default()
     });
-    app.tick(true, true, false);
+    app.tick();
     assert!(app.take_action().is_none());
     app.publish(SetupStatus::default());
-    app.tick(true, true, false);
+    app.tick();
     assert!(matches!(
         app.take_action(),
         Some(SystemStateAction::Apply(_, Admission::Automatic))
@@ -2592,7 +2864,7 @@ fn interaction_never_holds_the_pages_own_answer() {
             .unwrap();
         runtime.dispatch(instance, view, event).unwrap();
         assert!(runtime.take_system_state_action().is_none());
-        runtime.tick_system_state(true, true, &[view]);
+        runtime.tick_system_state();
         let (_, admission, password) = submitted(runtime.take_system_state_action());
         assert_eq!(admission, Admission::Automatic);
         assert!(password.is_none());
@@ -2627,7 +2899,7 @@ fn a_group_press_while_the_offer_waits_answers_it_as_the_pressers_choice() {
         panic!("the plan begins");
     };
     assert!(!plan.selection.contains(Setting::Dock));
-    runtime.tick_system_state(true, true, &[view]);
+    runtime.tick_system_state();
     assert!(
         runtime.take_system_state_action().is_none(),
         "the press was the answer"
@@ -2666,7 +2938,7 @@ fn only_join_sends_a_typed_vault_while_the_offer_waits() {
                 )
                 .unwrap();
         }
-        runtime.tick_system_state(true, true, &[view]);
+        runtime.tick_system_state();
         let Some(SystemStateAction::Apply(answer, _)) = runtime.take_system_state_action() else {
             panic!("the offer is answered");
         };
@@ -2704,6 +2976,13 @@ fn an_ax_reveal_moves_only_its_own_view() {
     runtime
         .attach_view(second, instance, AppViewState::SystemState(Box::default()))
         .unwrap();
+    // Every line open in both views, so the list runs past the window.
+    for view in [first, second] {
+        let Some(AppViewState::SystemState(state)) = runtime.view_state(view) else {
+            panic!("a System State view");
+        };
+        state.open_every_line();
+    }
     let viewport = LogicalRect::new(0.0, 0.0, 640.0, 480.0);
     let render = |runtime: &NativeRuntime, view| {
         runtime
@@ -2733,8 +3012,12 @@ fn an_ax_reveal_moves_only_its_own_view() {
     );
 }
 
+/// Closing the page before it answered the launch's offer answers nothing: the offer is let go
+/// as one no window showed, so the worker makes it again where a page answers it at its first
+/// tick (init-on-by-default design §6.1). Negative control: a page whose close answered the
+/// offered plan fails the decision below.
 #[test]
-fn closing_never_cancels_and_never_waits() {
+fn closing_lets_the_offer_go_and_never_waits() {
     for scope in [
         CloseScope::View,
         CloseScope::Tab,
@@ -2760,8 +3043,8 @@ fn closing_never_cancels_and_never_waits() {
         runtime.finish_system_state_close(instance, scope);
         assert_eq!(
             receive.try_recv().unwrap().decision,
-            WorkstationSetupDecision::Closed,
-            "closed, not this launch: never a Cancel, never an offer to show again at once"
+            WorkstationSetupDecision::Unavailable,
+            "let go, to be made again where a page answers it: never an answer of the close's"
         );
     }
 }
@@ -2782,142 +3065,12 @@ fn page_app(
     app
 }
 
-/// The worker hears this Mac's ALab signal while the launch's offer still waits for its answer
-/// while another operation holds the page busy: the offer widens in place, and the
-/// automatic answer uses the widened plan once the operation finishes.
+/// A Cancel an older aterm's review recorded (§3.3; no review is offered since design revision 4)
+/// reads only as those groups turned off: each shows Leave as is, the page says nothing of a
+/// review or a Cancel, the headline is the one for groups left as is with no Set up now, nothing
+/// lights (no Needs you, no diamond, no menu line), and a group's switch turns it back on.
 #[test]
-fn an_alab_signal_widens_a_waiting_offer_in_place() {
-    let (send, receive) = mpsc::channel();
-    let narrow = permissions_only();
-    let request = Request::new(narrow.clone(), send);
-    let mut app = SystemStateApp::new(narrow.clone());
-    assert!(app.offer(request.clone()));
-    app.publish(SetupStatus {
-        busy: true,
-        ..SetupStatus::default()
-    });
-    let (mut runtime, instance, view) = runtime_with_app(app);
-    runtime.tick_system_state(false, true, &[view]);
-    request.send_widened(Plan::default());
-    assert!(runtime.tick_system_state(false, true, &[view]));
-    let app = page_app(&runtime, instance);
-    assert_eq!(app.plan, Plan::default(), "the offer widened in place");
-    assert!(
-        app.notes(&app.reviewed_plan())
-            .contains(&ALAB_ADDED_NOTE.to_owned()),
-        "the page says why"
-    );
-    assert!(runtime.take_system_state_action().is_none());
-    runtime.publish_system_state(SetupStatus::default());
-    runtime.tick_system_state(false, true, &[view]);
-    let Some(SystemStateAction::Apply(answer, admission)) = runtime.take_system_state_action()
-    else {
-        panic!("the page answers the offer");
-    };
-    assert_eq!(admission, Admission::Automatic);
-    assert_eq!(
-        (answer.decision, answer.widened, answer.chosen),
-        (
-            WorkstationSetupDecision::Begin(Plan::default()),
-            true,
-            false
-        )
-    );
-    drop(receive);
-}
-
-/// A press answered the offer as the person's choice before the ALab signal came: nothing
-/// widens, and the page says nothing about it (§3.5).
-#[test]
-fn an_edited_review_stays_the_persons_when_the_alab_signal_comes() {
-    let (send, _receive) = mpsc::channel();
-    let narrow = permissions_only();
-    let request = Request::new(narrow.clone(), send);
-    let mut app = SystemStateApp::new(narrow.clone());
-    assert!(app.offer(request.clone()));
-    act(&mut app, "system-state/group/1/set-up");
-    let edited = app.plan.clone();
-    assert_ne!(edited, narrow);
-    request.send_widened(Plan::default());
-    app.tick(true, true, false);
-    assert_eq!(app.plan, edited, "the person's draft stays as they left it");
-    assert!(
-        !app.notes(&app.reviewed_plan())
-            .contains(&ALAB_ADDED_NOTE.to_owned())
-    );
-}
-
-/// The offer of the groups the ALab signal adds to aterm's provisional plan in force (§3.5):
-/// it shows the added groups at Set up and says why, and the page answers it with the widened
-/// plan as its own answer.
-#[test]
-fn an_offer_of_the_groups_the_alab_signal_adds_is_answered_with_the_widened_plan() {
-    let narrow = permissions_only();
-    let (send, _receive) = mpsc::channel();
-    let mut app = SystemStateApp::new(narrow.clone());
-    assert!(app.offer(Request::widen(Plan::default(), narrow, send)));
-    assert_eq!(app.plan, Plan::default(), "the added groups at Set up");
-    assert!(
-        app.notes(&app.reviewed_plan())
-            .contains(&ALAB_ADDED_NOTE.to_owned())
-    );
-    let (mut runtime, _instance, view) = runtime_with_app(app);
-    runtime.tick_system_state(true, true, &[view]);
-    let Some(SystemStateAction::Apply(answer, admission)) = runtime.take_system_state_action()
-    else {
-        panic!("the page answers the offer");
-    };
-    assert_eq!(admission, Admission::Automatic);
-    assert_eq!(
-        (answer.decision, answer.chosen, answer.vault_typed),
-        (
-            WorkstationSetupDecision::Begin(Plan::default()),
-            false,
-            false
-        )
-    );
-}
-
-/// A press on that offer while it waits answers it with the plan the page shows, whole: the
-/// pressed group as pressed and every other group the ALab signal added with it, not the pressed
-/// group alone taken onto the narrower plan in force.
-#[test]
-fn a_press_on_the_widened_offer_answers_it_with_the_whole_widened_plan() {
-    let narrow = permissions_only();
-    let (send, _receive) = mpsc::channel();
-    let mut app = SystemStateApp::new(narrow.clone());
-    assert!(app.offer(Request::widen(Plan::default(), narrow, send)));
-    let (mut runtime, instance, view) = runtime_with_app(app);
-    runtime
-        .dispatch(
-            instance,
-            view,
-            AppEvent::Action(ActionInvocation {
-                id: ActionId::new("system-state/group/2/leave"),
-                value: None,
-            }),
-        )
-        .unwrap();
-    let Some(SystemStateAction::Apply(answer, _)) = runtime.take_system_state_action() else {
-        panic!("the press answers the offer");
-    };
-    assert!(answer.chosen);
-    assert_eq!(answer.changed, None, "the plan as the page shows it");
-    let WorkstationSetupDecision::Begin(plan) = answer.decision else {
-        panic!("the plan begins");
-    };
-    assert!(!plan.selection.contains(Setting::Dock), "as pressed");
-    assert!(
-        plan.selection.contains(Setting::CapsLock) && plan.selection.contains(Setting::Spotlight),
-        "the other added groups go with it: {plan:?}"
-    );
-}
-
-/// A Cancel an earlier aterm recorded (§3.3; the page offers none since design revision 4): every
-/// group reads Leave as is, the page says so in one calm line beside Set up now, and nothing
-/// lights: no Needs you, no diamond, no menu line.
-#[test]
-fn a_recorded_cancel_leaves_every_group_as_is_with_one_calm_line_and_set_up_now() {
+fn an_older_cancel_reads_off_with_no_review_words() {
     let mut app = SystemStateApp::new(Plan::default());
     let cancelled = SetupStatus {
         plan: Some(Plan::from(Selection::none())),
@@ -2932,35 +3085,59 @@ fn a_recorded_cancel_leaves_every_group_as_is_with_one_calm_line_and_set_up_now(
     };
     app.publish(cancelled.clone());
     assert!(app.plan.selection.is_empty(), "every group at Leave as is");
-    assert_eq!(app.notes(&app.reviewed_plan()), [CANCELLED_NOTE.to_owned()]);
+    for group in Group::ALL {
+        assert_eq!(
+            group_choice(group, app.plan.selection),
+            GroupChoice::LeaveAsIs,
+            "{group:?}"
+        );
+    }
+    let notes = app.notes(&app.reviewed_plan());
     let headline = app.headline();
-    assert_eq!(headline.text, "Everything is left as is");
-    assert!(headline.start, "Set up now beside it");
+    for line in notes.iter().chain(std::iter::once(&headline.text)) {
+        let lower = line.to_lowercase();
+        assert!(
+            !lower.contains("review") && !lower.contains("cancel"),
+            "review-era words on the page: {line:?}"
+        );
+    }
+    assert!(notes.is_empty(), "{notes:?}");
+    assert_eq!(headline.text, EVERYTHING_LEFT_AS_IS);
+    assert!(
+        !headline.start,
+        "no Set up now: each group turns on by its switch"
+    );
     assert!(!app.needs_attention(), "no diamond");
     assert_eq!(
         crate::system_state_access::menu_line(&cancelled, false),
         None,
         "no menu line"
     );
-    // Set up now: the plan as it stands, nothing of the page's own, which the worker takes onto
-    // the plan in force.
+    // A group's switch turns it back on, as the person's own choice.
     app.gesture(true);
-    act(&mut app, "system-state/headline/start");
+    act(&mut app, "system-state/group/0/set-up");
     let Some(SystemStateAction::Apply(answer, admission)) = app.take_action() else {
-        panic!("Set up now sends the plan as it stands");
+        panic!("the switch sends the group's choice");
     };
     assert_eq!(admission, Admission::Person);
-    assert_eq!(
-        (answer.changed, answer.chosen),
-        (Some(Selection::none()), false)
+    assert!(answer.chosen, "a choice, the person's");
+    let WorkstationSetupDecision::Begin(plan) = &answer.decision else {
+        panic!("a plan to begin");
+    };
+    assert!(
+        Group::ALL[0]
+            .settings()
+            .iter()
+            .all(|setting| plan.selection.contains(*setting)),
+        "the group is on again: {plan:?}"
     );
 }
 
-/// The person cancelled the review that offered what a Restore brought forward (§3.3): the page
-/// reads as after any Cancel, its one calm line beside Set up now, every group at Leave as is and
-/// nothing lit, with the Restore's own line still saying what it put back.
+/// A Cancel an older aterm recorded of a review that offered what a Restore brought forward
+/// (§3.3) reads as any older Cancel: every group at Leave as is, nothing lit and no Set up now,
+/// with the Restore's own line still saying what it put back.
 #[test]
-fn a_cancel_after_a_restore_reads_as_any_cancel_beside_the_restores_line() {
+fn an_older_cancel_after_a_restore_keeps_the_restores_line_alone() {
     let mut app = SystemStateApp::new(Plan::default());
     let status = SetupStatus {
         plan: Some(Plan::from(Selection::none())),
@@ -2978,45 +3155,17 @@ fn a_cancel_after_a_restore_reads_as_any_cancel_beside_the_restores_line() {
     assert!(app.plan.selection.is_empty(), "every group at Leave as is");
     assert_eq!(
         app.notes(&app.reviewed_plan()),
-        [
-            CANCELLED_NOTE.to_owned(),
-            "Restore previous settings finished. Dock is as it was.".to_owned()
-        ]
+        ["Restore previous settings finished. Dock is as it was.".to_owned()]
     );
     let headline = app.headline();
-    assert_eq!(headline.text, "Everything is left as is");
-    assert!(headline.start, "Set up now beside it");
+    assert_eq!(headline.text, EVERYTHING_LEFT_AS_IS);
+    assert!(!headline.start, "no Set up now");
     assert!(!app.needs_attention(), "no diamond");
     assert_eq!(
         crate::system_state_access::menu_line(&status, false),
         None,
         "no menu line"
     );
-}
-
-/// This launch's offer was closed unanswered (§3.3): the page shows the plan the offer showed
-/// with Set up now, calm, and nothing it reads lights anything, since nothing approved its
-/// permission steps.
-#[test]
-fn a_review_closed_unanswered_reads_calm_with_set_up_now() {
-    let mut app = SystemStateApp::new(Plan::default());
-    let status = SetupStatus {
-        plan: Some(Plan::default()),
-        unanswered: true,
-        observed: vec![reading(
-            Subject::Access(Access::FullDiskAccess),
-            Standing::NeedsYou,
-            Some("Off"),
-        )],
-        ..SetupStatus::default()
-    };
-    app.publish(status.clone());
-    assert_eq!(app.plan, Plan::default(), "the plan the review showed");
-    let headline = app.headline();
-    assert_eq!(headline.text, NOT_STARTED);
-    assert!(headline.start && headline.open.is_none());
-    assert!(!app.needs_attention());
-    assert_eq!(crate::system_state_access::menu_line(&status, false), None);
 }
 
 #[test]
@@ -3050,14 +3199,6 @@ fn open_buttons_carry_whose_press_it_was() {
         assert!(matches!(
             app.take_action(),
             Some(SystemStateAction::OpenAccess { access: Access::FullDiskAccess, by_person: by }) if by == by_person
-        ));
-        act(&mut app, "system-state/headline/open/full-disk-access");
-        assert!(matches!(
-            app.take_action(),
-            Some(SystemStateAction::OpenAccess {
-                access: Access::FullDiskAccess,
-                by_person: by,
-            }) if by == by_person
         ));
         // A row that does not need a person has no Open to press.
         act(&mut app, "system-state/row/debugger/open");
@@ -3252,16 +3393,16 @@ fn every_scenario_lays_out_at_every_width_with_the_designs_labels() {
             app.publish(status_of(scenario));
             let view = SystemStateViewState::default();
             let compiled = compile(&app, &view, width, height);
-            assert_eq!(
-                label(&compiled, "system-state/brand"),
-                "aterm ALab",
-                "the spoken label drops the lockup's middle dot"
-            );
-            assert!(
-                compiled
-                    .semantic(&UiKey::new("system-state/check"))
-                    .is_some()
-            );
+            assert_eq!(label(&compiled, "system-state/progress"), "Setup progress");
+            // Check again is in the footer while nothing runs, once something was read.
+            if !app.status.busy && !app.status.observed.is_empty() {
+                assert!(
+                    compiled
+                        .semantic(&UiKey::new("system-state/check"))
+                        .is_some(),
+                    "{scenario}"
+                );
+            }
             let running = app.status.running();
             assert_eq!(
                 compiled
@@ -3270,9 +3411,21 @@ fn every_scenario_lays_out_at_every_width_with_the_designs_labels() {
                 running,
                 "{scenario}: Stop only while a run is going"
             );
-            // Every row is listed, on screen or off it.
-            for subject in Subject::all() {
+            // Every row of an open line is listed, on screen or off it, and every row the card
+            // holds is in the card.
+            let (lines, card) = lines_of(&app);
+            for subject in lines
+                .iter()
+                .flat_map(|line| line.rows.iter().map(|row| row.subject))
+            {
                 let key = format!("system-state/row/{}/info", row_slug(subject));
+                assert!(
+                    compiled.semantic(&UiKey::new(key.clone())).is_some(),
+                    "{scenario} {key}"
+                );
+            }
+            for item in &card {
+                let key = format!("system-state/card/{}", item.id);
                 assert!(
                     compiled.semantic(&UiKey::new(key.clone())).is_some(),
                     "{scenario} {key}"
@@ -3288,9 +3441,18 @@ fn every_scenario_lays_out_at_every_width_with_the_designs_labels() {
         "Dock: 9 apps, changing now to 3 apps"
     );
     assert_eq!(
-        label(&compiled, "system-state/group/1"),
-        "Keyboard & Trackpad, Set up"
+        label(&compiled, "system-state/line/mac/disclose"),
+        "Details"
     );
+    let switch = compiled
+        .semantic(&UiKey::new("system-state/line/mac/switch"))
+        .expect("the Mac line's switch");
+    assert!(
+        switch.label.starts_with("Mac settings, working: "),
+        "{}",
+        switch.label
+    );
+    assert_eq!(switch.value, SemanticValue::Bool(true));
 }
 
 #[test]
@@ -3305,7 +3467,9 @@ fn the_list_scrolls_by_points_and_reveals_rows_and_the_vault_fields() {
     let compiled = compile(&app, &view, 640.0, 480.0);
     assert!(compiled.semantic(&last).is_some_and(|node| !node.offscreen));
     // The password field, in the list with the other vault fields, scrolls
-    // in whole like any control: it shows bullets, never what was typed.
+    // in whole like any control: it shows bullets, never what was typed. The person opened the
+    // Secrets line to reach them.
+    app.act(&mut view, "system-state/line/secrets/disclose", None);
     app.vault_open = Some(true);
     app.password
         .input(TextInputEvent::Commit("test-only-password".into()));
@@ -3333,117 +3497,110 @@ fn the_list_scrolls_by_points_and_reveals_rows_and_the_vault_fields() {
         field.rect
     );
     assert!(!format!("{:?}", field.value).contains("test-only"));
-    // From the top of a room taller than a line, where no span the room
-    // cuts would be carried past whole, one line down moves a full line.
-    view.scroll.set(0.0);
+    // From the top of the first line in a room taller than a line, where no span the room cuts
+    // would be carried past whole, one line down moves a full line.
+    let from = view
+        .spans
+        .borrow()
+        .iter()
+        .find(|span| &*span.key == "system-state/line/mac")
+        .expect("the first line is listed")
+        .top;
+    view.scroll.set(from);
     let room = view.room.get();
-    assert!(room > LINE_PX && view.limit.get() > LINE_PX, "{room}");
     assert!(
-        !view
-            .spans
-            .borrow()
-            .iter()
-            .any(|span| span.top > 0.01 && span.top < LINE_PX - 0.01 && span.bottom > room + 0.01),
-        "a span stops the line"
+        room > LINE_PX && view.limit.get() > from + LINE_PX,
+        "{room}"
+    );
+    let stops: Vec<(String, f32, f32)> = view
+        .spans
+        .borrow()
+        .iter()
+        .filter(|span| {
+            span.top > from + 0.01
+                && span.top < from + LINE_PX - 0.01
+                && span.bottom > from + room + 0.01
+        })
+        .map(|span| (span.key.to_string(), span.top, span.bottom))
+        .collect();
+    assert!(
+        stops.is_empty(),
+        "a span stops the line in a room of {room}: {stops:?}"
     );
     view.scroll_steps(1, LINE_PX);
     assert!(
-        (view.scroll.get() - LINE_PX).abs() < 0.01,
-        "a notch moved {}",
+        (view.scroll.get() - from - LINE_PX).abs() < 0.01,
+        "a notch moved {} from {from}",
         view.scroll.get()
     );
     assert!(!view.reveal_listed_control(&UiKey::new("system-state/row/nowhere")));
 }
 
-#[test]
-fn the_failure_headlines_show_button_scrolls_to_the_failed_row() {
-    let mut app = SystemStateApp::new(Plan::default());
-    app.publish(status_of("failed"));
-    let mut view = SystemStateViewState::default();
-    let row = UiKey::new("system-state/row/repositories/info");
-    let compiled = compile(&app, &view, 640.0, 480.0);
-    assert!(
-        compiled
-            .semantic(&UiKey::new("system-state/headline/show"))
-            .is_some()
-    );
-    assert!(compiled.semantic(&row).is_some_and(|node| node.offscreen));
-    app.act(&mut view, "system-state/headline/show", None);
-    assert!(app.take_action().is_none(), "Show only scrolls");
-    let compiled = compile(&app, &view, 640.0, 480.0);
-    assert!(compiled.semantic(&row).is_some_and(|node| !node.offscreen));
-}
-
 /// A vault that waits for an address, after a Join the person typed a password for found none
-/// there, is shown from the headline: with its fields open, Show brings Join and the fields into
-/// view.
+/// there, is said under the headline as setup going on, naming what waits; with its fields open,
+/// a reveal brings Join and the fields into view.
 #[test]
-fn a_waiting_vault_is_shown_from_the_headline() {
+fn a_waiting_vault_is_said_under_the_headline() {
     let mut app = SystemStateApp::new(Plan::default());
     app.publish(status_of("vault"));
     let mut view = SystemStateViewState::default();
     app.act(&mut view, "system-state/row/secrets/disclose", None);
     let join = UiKey::new("system-state/vault/join");
     let compiled = compile(&app, &view, 640.0, 480.0);
-    assert_eq!(
-        label(&compiled, HEADLINE),
-        "2 steps waiting: Secrets vault, GitHub repositories"
+    assert_eq!(label(&compiled, HEADLINE), "Setting up your Mac");
+    assert!(
+        label(&compiled, "system-state/sub")
+            .starts_with("2 steps waiting: Secrets vault, GitHub repositories"),
+        "{}",
+        label(&compiled, "system-state/sub")
     );
     assert!(
         compiled
             .semantics
             .iter()
-            .all(|node| !node.key.as_str().starts_with("system-state/headline/open")),
+            .all(|node| node.key.as_str() != "system-state/row/secrets/open"),
         "macOS has no pane for the vault"
     );
     assert!(compiled.semantic(&join).is_some_and(|node| node.offscreen));
-    app.act(&mut view, "system-state/headline/show", None);
-    assert!(app.take_action().is_none(), "Show only scrolls");
+    assert!(view.reveal_listed_control(&join));
     let compiled = compile(&app, &view, 640.0, 480.0);
-    for key in [&join, &UiKey::new("system-state/url")] {
-        assert!(
-            compiled.semantic(key).is_some_and(|node| !node.offscreen),
-            "{key:?}"
-        );
-    }
+    assert!(compiled.semantic(&join).is_some_and(|node| !node.offscreen));
 }
 
+/// Serious Mode shows the lockup's words alone (§4.5): the prompt, the words and the caret, with
+/// no kitty and no ribbon behind them.
 #[test]
-fn serious_mode_and_high_contrast_show_the_words_alone() {
-    let app = SystemStateApp::new(Plan::default());
+fn serious_mode_shows_the_words_alone() {
+    let mut app = SystemStateApp::new(Plan::default());
+    app.publish(status_of("running"));
     let view = SystemStateViewState::default();
     let viewport = LogicalRect::new(0.0, 0.0, 999.0, 900.0);
     for serious in [false, true] {
-        let tree = app.view(&view, &cx(viewport, serious));
-        let art = &tree.root.children[0].children[0];
-        let UiContent::Custom(spec) = &art.content else {
-            panic!("the brand is drawn by its audit");
+        let compiled = app
+            .view(&view, &cx(viewport, serious))
+            .compile(viewport)
+            .unwrap();
+        let node = compiled
+            .paint
+            .iter()
+            .find(|node| node.key.as_str() == "system-state/progress")
+            .expect("the lockup is painted");
+        let UiContent::Custom(spec) = &node.content else {
+            panic!("the lockup is drawn by its audit");
         };
         assert_eq!(spec.audit_id, crate::native_ui::SYSTEM_STATE_BRAND_AUDIT);
-        assert_eq!(BrandSpec::parse(spec.paint.as_deref()).kitty, !serious);
-        // What the painter draws from that value: the words alone are the
-        // prompt, the words and the caret, with no kitty and no ribbon
-        // behind them; the caret is the one panel left.
+        assert_eq!(LockupSpec::parse(spec.paint.as_deref()).kitty, !serious);
         let mut prims = Vec::new();
-        paint_brand(
+        paint_lockup(
             &mut prims,
-            LogicalRect::new(0.0, 0.0, 400.0, 56.0),
+            LogicalRect::new(0.0, 0.0, 640.0, 48.0),
             spec.paint.as_deref(),
             &crate::settings::Roles::from_theme(aterm_render::Theme::default()),
         );
-        let panels = prims
-            .iter()
-            .filter(|prim| matches!(prim, crate::widget::DrawPrim::Panel { .. }))
-            .count();
         let kitty = prims
             .iter()
             .any(|prim| matches!(prim, crate::widget::DrawPrim::Image { .. }));
         assert_eq!(kitty, !serious, "serious: {serious}");
-        if serious {
-            assert_eq!(panels, 1, "the caret alone, no ribbon stripe");
-        } else {
-            assert!(panels > 6, "six ribbon stripes and the caret");
-        }
     }
 }
 
@@ -3660,146 +3817,6 @@ fn every_word_and_button_face_is_whole_in_a_narrow_pane_at_every_text_size() {
     assert!(cut.is_empty(), "{cut:#?}");
 }
 
-/// A short window keeps the page's controls in view: the brand and then the title give way
-/// before the headline's buttons or the footer leave the window, the brand shows only beside the
-/// title, and a taller window never shows less. What shows depends on the window and the text
-/// size, not the page's state, while the headline names at most one row; then a window `least`
-/// tall (200 points at 1x, 320 at 1.5x, 440 at 2x, 320 wide) keeps the controls in view. A
-/// headline naming several rows (every setting as failed, or the vault and the repositories that
-/// wait on it) counts its own height and is held to the order alone.
-#[test]
-fn a_short_window_keeps_the_headline_and_the_footer_in_view() {
-    use crate::native_appearance::{AppearancePreferences, install_preferences};
-    let controls = [
-        "system-state/headline/open",
-        "system-state/headline/show",
-        "system-state/headline/start",
-        "system-state/stop",
-        "system-state/check",
-        "system-state/restore",
-    ];
-    // Each window width at each text size is one item, whose states and heights hold every check
-    // here (the steady title and brand compare one width's windows across states), so the items
-    // run side by side; a worker prepares its own fonts and text size, a thread's own in tests.
-    let windows: Vec<(f32, i32, i32)> = [(1.0_f32, 128, 200), (1.5, 160, 320), (2.0, 200, 440)]
-        .into_iter()
-        .flat_map(|(scale, narrowest, least)| {
-            [narrowest, 240, 320, 420, 520, 720].map(move |width| (scale, least, width))
-        })
-        .collect();
-    crate::native_settings::tests::on_workers(
-        &windows,
-        "short window",
-        |&(scale, least, width)| {
-            crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
-            let _ = install_preferences(AppearancePreferences {
-                text_scale: scale,
-                ..AppearancePreferences::default()
-            });
-            let mut steady = std::collections::HashMap::new();
-            let mut failed_many = status_of("failed");
-            for observation in &mut failed_many.observed {
-                if matches!(observation.subject, Subject::Setting(_)) {
-                    observation.standing = Standing::Failed;
-                }
-            }
-            for (scenario, status) in [
-                "checking",
-                "running",
-                "debugger",
-                "needs-you",
-                "vault",
-                "set-up",
-                "non-alab",
-                "failed",
-                "check-failed",
-                "mixed",
-                "fresh",
-            ]
-            .map(|scenario| (scenario, status_of(scenario)))
-            .into_iter()
-            .chain([("failed-many", failed_many)])
-            {
-                // The vault that waits for an address names the repositories that wait on it too.
-                let one_name = !matches!(scenario, "failed-many" | "vault");
-                let mut app = SystemStateApp::new(Plan::default());
-                app.publish(status);
-                let mut before: Option<(bool, bool, bool)> = None;
-                for height in (160..=1000).step_by(8) {
-                    let (w, h) = (width as f32, height as f32);
-                    let compiled = compile(&app, &SystemStateViewState::default(), w, h);
-                    let shown = |key: &str| {
-                        let part = format!("{key}/");
-                        compiled.paint.iter().any(|node| {
-                            node.key.as_str() == key || node.key.as_str().starts_with(&part)
-                        })
-                    };
-                    let whole = |key: &str| {
-                        let part = format!("{key}/");
-                        compiled
-                            .paint
-                            .iter()
-                            .filter(|node| {
-                                node.key.as_str() == key || node.key.as_str().starts_with(&part)
-                            })
-                            .all(|node| {
-                                !node.clipped() && node.rect.y >= 0.0 && node.rect.bottom() <= h
-                            })
-                    };
-                    let in_view = shown("system-state/check")
-                        && shown("system-state/restore")
-                        && controls.iter().all(|key| whole(key));
-                    let title = shown("settings/page-heading/system-state");
-                    let brand = shown("system-state/brand");
-                    let at = format!("{scenario} in a {width}×{height} window at {scale}×");
-                    assert!(!brand || title, "the brand without the title, {at}");
-                    assert!(!title || in_view, "the title over cut controls, {at}");
-                    if one_name && width == 320 && height >= least {
-                        assert!(in_view, "the controls, {at}");
-                    }
-                    if one_name && height == 1000 {
-                        assert!(brand && title, "the brand and the title, {at}");
-                        // The list takes the room left: the footer ends at the page's padding.
-                        let foot = compiled
-                            .paint
-                            .iter()
-                            .filter(|node| {
-                                ["system-state/check", "system-state/restore"]
-                                    .iter()
-                                    .any(|key| {
-                                        node.key.as_str() == *key
-                                            || node.key.as_str().starts_with(&format!("{key}/"))
-                                    })
-                            })
-                            .map(|node| node.rect.bottom())
-                            .fold(0.0_f32, f32::max);
-                        let pad_y = Metrics::new(w, h).pad_y;
-                        assert!(
-                            (h - pad_y - foot).abs() < 0.5,
-                            "the footer ends {} above the window's foot, {at}",
-                            h - foot
-                        );
-                    }
-                    if one_name {
-                        assert_eq!(
-                            *steady.entry((width, height)).or_insert((title, brand)),
-                            (title, brand),
-                            "the title and the brand as in every other state, {at}"
-                        );
-                    }
-                    if let Some(before) = before {
-                        assert!(
-                            in_view >= before.0 && title >= before.1 && brand >= before.2,
-                            "less than one point shorter, {at}"
-                        );
-                    }
-                    before = Some((in_view, title, brand));
-                }
-            }
-        },
-    );
-}
-
 /// The page and the view state the runtime holds for `view`.
 fn page_in(runtime: &NativeRuntime, view: ViewId) -> (&SystemStateApp, &SystemStateViewState) {
     let instance = runtime
@@ -3842,9 +3859,8 @@ fn a_short_list_steps_no_further_than_its_room_and_shows_every_note_row_and_cont
             text_scale: scale,
             ..AppearancePreferences::default()
         });
-        // The window a one-line headline, the footer and a list one row
-        // tall fill at this text size: 124pt at 1×.
-        let floor = 34.0 + 90.0 * scale;
+        // A window whose list keeps a little room under the hero, the card and the footer.
+        let floor = 300.0 * scale;
         for (scenario, above) in [
             ("check-failed", 0.0_f32),
             ("check-failed", 22.0),
@@ -3858,6 +3874,22 @@ fn a_short_list_steps_no_further_than_its_room_and_shows_every_note_row_and_cont
             let mut app = SystemStateApp::new(Plan::default());
             app.publish(status_of(scenario));
             let (mut runtime, instance, view) = runtime_with_app(app);
+            // The line with rows open, so the list holds lines, rows and their controls.
+            let line = if scenario == "needs-you" {
+                "permissions"
+            } else {
+                "secrets"
+            };
+            runtime
+                .dispatch(
+                    instance,
+                    view,
+                    AppEvent::Action(ActionInvocation {
+                        id: ActionId::new(format!("system-state/line/{line}/disclose")),
+                        value: None,
+                    }),
+                )
+                .unwrap();
             let compile_now = |runtime: &NativeRuntime| {
                 let (app, state) = page_in(runtime, view);
                 compile(app, state, 720.0, height)
@@ -3865,15 +3897,6 @@ fn a_short_list_steps_no_further_than_its_room_and_shows_every_note_row_and_cont
             let mut compiled = compile_now(&runtime);
             let list = list_rect(&compiled);
             let room = page_in(&runtime, view).1.room.get();
-            if scenario == "check-failed" && above == 0.0 {
-                // The short-window rule's floor: a list one row tall, whose
-                // room over the strip is shorter than one wheel line at 1×.
-                assert!(
-                    (list.height - Metrics::new(720.0, height).row_h).abs() < 0.01,
-                    "{at}"
-                );
-                assert!(scale > 1.0 || room < LINE_PX, "{at}");
-            }
             // Every note, group, row and control the list places, with where
             // it must show whole: in the room where it fits there, else in the
             // list where it fits that.
@@ -3896,14 +3919,6 @@ fn a_short_list_steps_no_further_than_its_room_and_shows_every_note_row_and_cont
                     spans
                         .iter()
                         .any(|(key, _)| key.starts_with("system-state/row/")),
-                    "{at}: {spans:?}"
-                );
-            }
-            if scale == 1.0 && scenario == "check-failed" {
-                assert!(
-                    spans
-                        .iter()
-                        .any(|(key, _)| key.starts_with("system-state/note/")),
                     "{at}: {spans:?}"
                 );
             }
@@ -4010,31 +4025,57 @@ fn a_focused_vault_field_stays_in_view_as_the_list_shrinks_and_shows_when_typed_
         )
     };
     let url = UiKey::new("system-state/url");
-    let compiled = compile_at(&runtime, 249.0);
+    // The tallest window too short for the lockup: the headline shows and the lockup does not.
+    let short = (124..=644)
+        .rev()
+        .find(|height| {
+            !shown(
+                &compile_at(&runtime, *height as f32),
+                "system-state/progress",
+            )
+        })
+        .expect("a short window leaves the lockup out");
+    let (short, taller) = (short as f32, short as f32 + 1.0);
+    let compiled = compile_at(&runtime, short);
     assert!(
-        shown(&compiled, "settings/page-heading/system-state")
-            && !shown(&compiled, "system-state/brand"),
-        "at 720×249 the title shows and the brand does not"
+        shown(&compiled, "system-state/headline") && !shown(&compiled, "system-state/progress"),
+        "at 720×{short} the headline shows and the lockup does not"
     );
     runtime
         .dispatch(instance, view, AppEvent::FocusChanged(Some(url.clone())))
         .unwrap();
-    let compiled = compile_at(&runtime, 249.0);
+    let compiled = compile_at(&runtime, short);
     assert!(
         in_view(&runtime, &compiled, url.as_str()),
         "focus reveals the field"
     );
-    // One point taller, the brand comes back and the list loses its height.
+    // One point taller, the lockup comes back and the list loses its height.
     let room = page_in(&runtime, view).1.room.get();
-    let compiled = compile_at(&runtime, 250.0);
+    let compiled = compile_at(&runtime, taller);
     assert!(
-        shown(&compiled, "system-state/brand"),
-        "the brand at 720×250"
+        shown(&compiled, "system-state/progress"),
+        "the lockup at 720×{taller}"
     );
-    assert!(page_in(&runtime, view).1.room.get() + 30.0 < room);
+    assert!(
+        page_in(&runtime, view).1.room.get() + 24.0 < room,
+        "the lockup at 720×{taller} takes the list's room: {} then {room}",
+        page_in(&runtime, view).1.room.get()
+    );
     assert!(
         in_view(&runtime, &compiled, url.as_str()),
-        "the focused field stays whole in a room the brand shrank"
+        "the focused field stays whole in a room the brand shrank: the list {:?}, its room {} \
+         at {}, the field {:?}, its span {:?}",
+        list_rect(&compiled),
+        page_in(&runtime, view).1.room.get(),
+        page_in(&runtime, view).1.scroll.get(),
+        painted(&compiled, url.as_str()).map(|node| node.rect),
+        page_in(&runtime, view)
+            .1
+            .spans
+            .borrow()
+            .iter()
+            .find(|span| *span.key == *url.as_str())
+            .map(|span| (span.top, span.bottom)),
     );
     // A window that shrinks a point at a time keeps it in view too.
     runtime
@@ -4051,14 +4092,13 @@ fn a_focused_vault_field_stays_in_view_as_the_list_shrinks_and_shows_when_typed_
             "the focused field in a 720×{height} window"
         );
     }
-    // A caret move, a selection or a submit leaves the disclosure as it
-    // stood.
+    // A caret move or a selection leaves the disclosure as it stood (Return joins, as Join
+    // does: `return_in_the_vault_password_joins_as_join_does`).
     let stood = page_in(&runtime, view).0.vault_open;
     for event in [
         TextInputEvent::Left { extend: false },
         TextInputEvent::Home { extend: true },
         TextInputEvent::SelectAll,
-        TextInputEvent::Submit,
         TextInputEvent::Preedit {
             text: String::new(),
             selection: None,
@@ -4071,7 +4111,7 @@ fn a_focused_vault_field_stays_in_view_as_the_list_shrinks_and_shows_when_typed_
     }
     // A focused field scrolled to a sliver the list leaves unpainted is one
     // the person scrolled away from: a room that shrinks leaves it there.
-    compile_at(&runtime, 249.0);
+    compile_at(&runtime, short);
     let bottom = page_in(&runtime, view)
         .1
         .spans
@@ -4082,9 +4122,9 @@ fn a_focused_vault_field_stays_in_view_as_the_list_shrinks_and_shows_when_typed_
         .bottom;
     let sliver = bottom - 3.0;
     page_in(&runtime, view).1.scroll.set(sliver);
-    compile_at(&runtime, 249.0);
+    compile_at(&runtime, short);
     assert!((page_in(&runtime, view).1.scroll.get() - sliver).abs() < 0.01);
-    compile_at(&runtime, 250.0);
+    compile_at(&runtime, taller);
     assert!(
         (page_in(&runtime, view).1.scroll.get() - sliver).abs() < 0.01,
         "a sliver of the focused field leaves the list where it stood"
@@ -4111,7 +4151,7 @@ fn a_focused_vault_field_stays_in_view_as_the_list_shrinks_and_shows_when_typed_
         runtime
             .dispatch(instance, view, AppEvent::ScrollLines(-10_000))
             .unwrap();
-        let compiled = compile_at(&runtime, 250.0);
+        let compiled = compile_at(&runtime, taller);
         assert!(painted(&compiled, key).is_none(), "{key} scrolled away");
         runtime.dispatch(instance, view, event).unwrap();
         // A typed address the worker has not read yet leaves the row
@@ -4120,449 +4160,62 @@ fn a_focused_vault_field_stays_in_view_as_the_list_shrinks_and_shows_when_typed_
             page_in(&runtime, view).0.vault_shown(),
             "{key} typed into keeps the vault open"
         );
-        let compiled = compile_at(&runtime, 250.0);
-        assert!(in_view(&runtime, &compiled, key), "{key} typed into shows");
+        let compiled = compile_at(&runtime, taller);
+        assert!(
+            in_view(&runtime, &compiled, key),
+            "{key} typed into shows: the list {:?}, its room {} at {}, the field {:?}, its span {:?}",
+            list_rect(&compiled),
+            page_in(&runtime, view).1.room.get(),
+            page_in(&runtime, view).1.scroll.get(),
+            painted(&compiled, key).map(|node| node.rect),
+            page_in(&runtime, view)
+                .1
+                .spans
+                .borrow()
+                .iter()
+                .find(|span| *span.key == *key)
+                .map(|span| (span.top, span.bottom)),
+        );
     }
     let (app, _) = page_in(&runtime, view);
     assert!(app.url.value().contains('x') && app.url.value().contains('y'));
 }
 
-/// The village paint node's spec in a compiled page, where the page shows one.
-fn village(compiled: &CompiledUi) -> Option<String> {
-    compiled
-        .paint
-        .iter()
-        .find(|node| node.key.as_str() == "system-state/village")
-        .map(|node| match &node.content {
-            UiContent::Custom(spec) => {
-                assert_eq!(spec.audit_id, crate::native_ui::RAINBOW_BANNER_AUDIT);
-                spec.paint.clone().expect("the village carries its spec")
-            }
-            other => panic!("the village is drawn by its audit: {other:?}"),
-        })
-}
-
-/// What the village painter draws from `spec` in a 640 × 48 strip.
-fn village_prims(spec: &str) -> Vec<crate::widget::DrawPrim> {
-    let mut prims = Vec::new();
-    crate::settings::paint_rainbow_kitty_village(
-        &mut prims,
-        0.0,
-        0.0,
-        640.0,
-        48.0,
-        [0x18, 0x16, 0x22],
-        [0x38, 0x34, 0x4C],
-        spec,
-    );
-    prims
-}
-
-#[test]
-fn the_village_has_one_station_per_setting_in_the_rows_words() {
-    let dock = Subject::Setting(Setting::Dock);
-    let natural = Subject::Setting(Setting::NaturalScrolling);
-    let mut selection = Selection::all();
-    selection.set(Setting::Messages, false);
-    let mut observed: Vec<Observation> = Subject::all()
-        .into_iter()
-        .map(|subject| reading(subject, Standing::InPlace, Some("as wanted")))
-        .collect();
-    let mut set = |subject: Subject, standing: Standing| {
-        for reading in observed.iter_mut().filter(|o| o.subject == subject) {
-            reading.standing = standing;
-        }
-    };
-    set(natural, Standing::Differs);
-    set(dock, Standing::Differs);
-    set(Subject::Setting(Setting::Desktop), Standing::Waiting);
-    set(Subject::Setting(Setting::Secrets), Standing::Failed);
-    set(Subject::Access(Access::Debugger), Standing::NeedsYou);
-    set(Subject::Setting(Setting::Repositories), Standing::Unknown);
-    let mut status = with_readings(selection, observed);
-    status.busy = true;
-    status.running = vec![Setting::Dock];
-    let rows = rows(&status, selection);
-    let spec = village_spec(&status, &rows, &Plan::from(selection), 480);
-    // Caps Lock, Natural scrolling, Trackpad, Desktop, Widgets, Dock,
-    // Messages, FaceTime, Spotlight, Permissions, Secrets, Repositories.
-    let managed = rows.iter().filter(|row| row.managed).count();
-    let done = rows.iter().filter(|row| row.settled()).count();
-    assert_eq!(
-        spec,
-        format!("phase=480;busy=1;done={done};total={managed};states=GDGDGW_GGEED")
-    );
-    // The painter reads back what the page says.
-    let (phase, busy, parsed_done, total, states) =
-        crate::settings::parse_rainbow_kitty_village_spec(&spec);
-    assert_eq!(
-        (phase, busy, parsed_done, total),
-        (480, true, done, managed)
-    );
-    assert_eq!(states.len(), Setting::ALL.len());
-}
-
-/// The headline and the brand reach a screen reader in words (§3.1): each lowers to
-/// a Label, whose words AppKit and AT-SPI read from its value, in one line or wrapped.
+/// The headline and the lockup reach a screen reader in words (§4.7): the headline is a Heading
+/// named by its words, in one line or wrapped, and the lockup a progress indicator with its
+/// count, named "Setup progress".
 #[cfg(a11y_tree)]
 #[test]
-fn the_headline_and_the_brand_publish_their_words_as_a_labels_value() {
+fn the_headline_and_the_progress_reach_a_screen_reader_in_words() {
     use aterm_a11y::model::Role;
     let mut app = SystemStateApp::new(Plan::default());
     app.publish(status_of("running"));
-    let running = "Setting up this Mac… 11 of 16";
     for width in [999.0, 220.0] {
         let compiled = compile(&app, &SystemStateViewState::default(), width, 900.0);
         let projection =
             crate::native_accessibility::project_native_accessibility(&compiled, None).unwrap();
-        let wrapped = compiled
-            .paint
-            .iter()
-            .any(|node| node.key.as_str().starts_with(&format!("{HEADLINE}/line-")));
-        assert_eq!(
-            wrapped,
-            width < 999.0,
-            "{width}: the headline wraps only when narrow"
-        );
-        for (key, words) in [(HEADLINE, running), ("system-state/brand", "aterm ALab")] {
+        let node = |key: &str| {
             let id = projection
                 .id_for_key(&UiKey::new(key))
                 .unwrap_or_else(|| panic!("{width}: {key} is published"));
-            let (_, node) = projection
+            projection
                 .update()
                 .nodes
                 .iter()
                 .find(|(candidate, _)| *candidate == id)
-                .unwrap();
-            assert_eq!(node.role(), Role::Label, "{width}: {key}");
-            assert_eq!(node.value(), Some(words), "{width}: {key}");
-        }
-    }
-}
-
-#[test]
-fn the_village_walks_beside_the_lockup_while_a_run_goes() {
-    let viewport = LogicalRect::new(0.0, 0.0, 999.0, 900.0);
-    let mut app = SystemStateApp::new(Plan::default());
-    app.publish(status_of("running"));
-    let view = SystemStateViewState::default();
-    let frame = |app: &SystemStateApp, motion: ViewMotionCx| {
-        let cx = ViewCx {
-            motion,
-            ..cx(viewport, false)
+                .unwrap()
+                .1
+                .clone()
         };
-        app.view(&view, &cx).compile(viewport).unwrap()
-    };
-    let first = frame(&app, ViewMotionCx::default());
-    let spec0 = village(&first).expect("a wide page shows the village");
-    // Its count is the meter's.
-    let meter = first
-        .paint
-        .iter()
-        .find(|node| node.key.as_str() == "system-state/meter")
-        .and_then(|node| match &node.content {
-            UiContent::Custom(spec) => spec.paint.clone(),
-            _ => None,
-        })
-        .expect("the meter shows while a run goes");
-    let (done, total) = meter.split_once(',').unwrap();
-    assert!(
-        spec0.starts_with(&format!("phase=0;busy=1;done={done};total={total};states=")),
-        "{spec0}"
-    );
-    assert!(
-        spec0.contains("states=GGGGGW"),
-        "the running Dock works: {spec0}"
-    );
-    // Only the lockup is the mark: the village names nothing aloud.
-    assert_eq!(label(&first, "system-state/brand"), "aterm ALab");
-    assert!(
-        first
-            .semantic(&UiKey::new("system-state/village"))
-            .is_none()
-    );
-
-    assert!(
-        app.tick(true, true, view.village_walks()),
-        "a busy tick repaints a page that shows the village"
-    );
-    let second = frame(&app, ViewMotionCx::default());
-    let spec1 = village(&second).unwrap();
-    assert_eq!(spec1, spec0.replacen("phase=0", "phase=120", 1));
-    assert_ne!(
-        format!("{:?}", village_prims(&spec0)),
-        format!("{:?}", village_prims(&spec1)),
-        "the kitties walk across busy ticks"
-    );
-
-    // Reduced motion: the kitties stand, and a busy tick owes no repaint.
-    let still = ViewMotionCx {
-        system_reduced: true,
-        ..ViewMotionCx::default()
-    };
-    let held = village(&frame(&app, still)).unwrap();
-    assert!(held.starts_with("phase=0;"), "{held}");
-    assert!(!app.tick(true, true, view.village_walks()));
-    assert_eq!(village(&frame(&app, still)).unwrap(), held);
-
-    // A window too short for the brand leaves the village out with it, and a
-    // busy tick then owes it no repaint.
-    let _ = frame(&app, ViewMotionCx::default());
-    assert!(app.tick(true, true, view.village_walks()));
-    let short = LogicalRect::new(0.0, 0.0, 999.0, 200.0);
-    let page = app.view(&view, &cx(short, false)).compile(short).unwrap();
-    assert!(village(&page).is_none());
-    assert!(
-        !app.tick(true, true, view.village_walks()),
-        "a busy tick repaints a village the page leaves out"
-    );
-
-    // A run that ends leaves the scene where it stands.
-    let mut done_status = status_of("set-up");
-    done_status.busy = false;
-    app.publish(done_status);
-    let _ = frame(&app, ViewMotionCx::default());
-    assert!(
-        !app.tick(true, true, view.village_walks()),
-        "an idle page does not repaint for the village"
-    );
-}
-
-#[test]
-fn the_village_shows_only_where_the_brand_row_has_room_and_the_kitty_may_show() {
-    let mut app = SystemStateApp::new(Plan::default());
-    app.publish(status_of("running"));
-    let view = SystemStateViewState::default();
-    let at = |app: &SystemStateApp, width: f32, serious: bool| {
-        let viewport = LogicalRect::new(0.0, 0.0, width, 900.0);
-        village(
-            &app.view(&view, &cx(viewport, serious))
-                .compile(viewport)
-                .unwrap(),
-        )
-    };
-    assert!(at(&app, 999.0, false).is_some());
-    assert!(
-        at(&app, 320.0, false).is_none(),
-        "a narrow page shows the lockup alone"
-    );
-    assert!(
-        at(&app, 999.0, true).is_none(),
-        "serious mode shows the words alone"
-    );
-    // A page that does not know the plan yet draws no scene of it.
-    let opened = SystemStateApp::opened();
-    assert!(at(&opened, 999.0, false).is_none());
-}
-
-#[test]
-fn rainbow_kitty_village_builds_and_synergies_stay_stable_when_state_is_stable_while_kitties_roam()
-{
-    let sky = [0x18, 0x16, 0x22];
-    let rim = [0x38, 0x34, 0x4C];
-    let arch_for = |states: &str, phase_ms: u64| -> Vec<crate::widget::DrawPrim> {
-        let spec = format!(
-            "phase={phase_ms};busy=0;done={};total={};states={states}",
-            states.chars().filter(|&c| c == 'G').count(),
-            states.len()
-        );
-        let (p, b, done, total, parsed) = crate::settings::parse_rainbow_kitty_village_spec(&spec);
-        let mut prims = Vec::new();
-        crate::settings::paint_rainbow_kitty_village_architecture(
-            &mut prims, 0.0, 0.0, 640.0, 48.0, sky, rim, p, b, done, total, &parsed,
-        );
-        prims
-    };
-    let kitties_for = |phase_ms: u64| -> Vec<crate::widget::DrawPrim> {
-        let mut prims = Vec::new();
-        crate::settings::paint_rainbow_kitty_village_kitties(
-            &mut prims, 0.0, 640.0, 40.0, phase_ms, false,
-        );
-        prims
-    };
-
-    // The village fills in as stations converge D → G, with neighbour synergies.
-    let pending = arch_for("DDDDDDDDDDDD", 0);
-    let one_done = arch_for("GDDDDDDDDDDD", 0);
-    let pair_synergy = arch_for("GGDDDDDDDDDD", 0);
-    let district_synergy = arch_for("GGGDDDDDDDDD", 0);
-    let all_verified = arch_for("GGGGGGGGGGGG", 0);
-    assert!(
-        pending.len() < one_done.len()
-            && one_done.len() < pair_synergy.len()
-            && pair_synergy.len() < district_synergy.len()
-            && district_synergy.len() < all_verified.len(),
-        "{} < {} < {} < {} < {}",
-        pending.len(),
-        one_done.len(),
-        pair_synergy.len(),
-        district_synergy.len(),
-        all_verified.len(),
-    );
-
-    // With no station working, the buildings never move with the phase.
-    for stable_states in [
-        "GGGGGGGGGGGG",
-        "GDG_GGGGGGGG",
-        "DDDDDDDDDDDD",
-        "GGGGGGGGGGGGGGGGGG",
-    ] {
-        let base = format!("{:?}", arch_for(stable_states, 0));
-        for phase in [120, 480, 1440, 5200] {
-            assert_eq!(
-                base,
-                format!("{:?}", arch_for(stable_states, phase)),
-                "{stable_states} at phase={phase}"
-            );
-        }
+        let headline = node(HEADLINE);
+        assert_eq!(headline.role(), Role::Heading, "{width}");
+        assert_eq!(headline.label(), Some("Setting up your Mac"), "{width}");
+        let progress = node("system-state/progress");
+        assert_eq!(progress.role(), Role::ProgressIndicator, "{width}");
+        assert_eq!(progress.label(), Some("Setup progress"), "{width}");
+        assert_eq!(progress.numeric_value(), Some(11.0), "{width}");
+        assert_eq!(progress.max_numeric_value(), Some(16.0), "{width}");
     }
-
-    // The kitties roam all the same.
-    assert_ne!(
-        format!("{:?}", kitties_for(0)),
-        format!("{:?}", kitties_for(360))
-    );
-    assert_ne!(
-        format!("{:?}", kitties_for(360)),
-        format!("{:?}", kitties_for(1200))
-    );
-}
-
-/// The village walks only on a page someone can see: a page whose tab is in
-/// the background takes no step and asks for no repaint on a busy tick, and
-/// walks on from where it stood once shown again.
-#[test]
-fn a_hidden_page_owes_no_repaint_for_the_village() {
-    let viewport = LogicalRect::new(0.0, 0.0, 999.0, 900.0);
-    let mut app = SystemStateApp::new(Plan::default());
-    app.publish(status_of("running"));
-    let view = SystemStateViewState::default();
-    let phase = |app: &SystemStateApp| {
-        let compiled = app
-            .view(&view, &cx(viewport, false))
-            .compile(viewport)
-            .unwrap();
-        village(&compiled).expect("village shows")
-    };
-    assert!(phase(&app).starts_with("phase=0;busy=1;"));
-    // The tab goes to the background: nothing renders the page any more.
-    let asked = (0..40)
-        .filter(|_| app.tick(true, false, view.village_walks()))
-        .count();
-    assert_eq!(
-        asked, 0,
-        "a page nobody sees asked for {asked} repaints in 40 ticks"
-    );
-    assert!(phase(&app).starts_with("phase=0;"), "it stood still");
-    assert!(
-        app.tick(true, true, view.village_walks()),
-        "shown again, it walks"
-    );
-    assert!(phase(&app).starts_with("phase=120;"));
-}
-
-/// Each view of the one page renders at its own window's size, and a busy
-/// tick walks the village only where a shown view drew it walking: a second
-/// window too short or too narrow for the village neither freezes the first
-/// window's kitties nor, shown alone, repaints a page with nothing moving,
-/// whichever of the two rendered last.
-#[test]
-fn a_shown_views_own_render_decides_whether_a_busy_tick_walks() {
-    let mut app = SystemStateApp::new(Plan::default());
-    app.publish(status_of("running"));
-    let (mut runtime, instance, tall) = runtime_with_app(app);
-    let other = ViewId::from_stored(2);
-    runtime
-        .attach_view(other, instance, AppViewState::SystemState(Box::default()))
-        .unwrap();
-    let render = |runtime: &NativeRuntime, view: ViewId, width: f32, height: f32| {
-        let viewport = LogicalRect::new(0.0, 0.0, width, height);
-        let tree = runtime
-            .render(instance, view, &cx(viewport, false))
-            .unwrap();
-        village(&tree.compile(viewport).unwrap())
-    };
-    let walks = |runtime: &NativeRuntime, view: ViewId| match runtime.view_state(view) {
-        Some(AppViewState::SystemState(state)) => state.village_walks(),
-        _ => panic!("{view:?} is a System State view"),
-    };
-    for (width, height) in [(999.0, 200.0), (320.0, 900.0)] {
-        for tall_last in [false, true] {
-            let mut order = [(tall, 999.0, 900.0), (other, width, height)];
-            if tall_last {
-                order.reverse();
-            }
-            for (view, w, h) in order {
-                let shows = render(&runtime, view, w, h).is_some();
-                assert_eq!(shows, view == tall, "{view:?} at {w}x{h}");
-            }
-            let case = format!("{width}x{height}, tall rendered last: {tall_last}");
-            assert!(walks(&runtime, tall), "{case}");
-            assert!(!walks(&runtime, other), "{case}");
-            assert!(
-                runtime.tick_system_state(true, true, &[tall, other]),
-                "both shown, the tall window's kitties walk ({case})"
-            );
-            assert!(
-                runtime.tick_system_state(true, true, &[tall]),
-                "the tall window alone walks ({case})"
-            );
-            assert!(
-                !runtime.tick_system_state(true, true, &[other]),
-                "a page shown only where its village is left out owes no repaint ({case})"
-            );
-        }
-    }
-}
-
-/// Check again and Restore keep the worker busy, and neither is a run: the
-/// village stands and says no run is going, and their ticks owe no repaint.
-#[test]
-fn the_village_stands_through_check_again_and_restore() {
-    let viewport = LogicalRect::new(0.0, 0.0, 999.0, 900.0);
-    for operation in [SetupOperation::Check, SetupOperation::Restore] {
-        let mut app = SystemStateApp::new(Plan::default());
-        let mut status = status_of("set-up");
-        status.busy = true;
-        status.operation = Some(operation);
-        app.publish(status);
-        let view = SystemStateViewState::default();
-        let compiled = app
-            .view(&view, &cx(viewport, false))
-            .compile(viewport)
-            .unwrap();
-        let spec = village(&compiled).expect("village shows");
-        assert!(
-            spec.contains(";busy=0;"),
-            "{operation:?} reads as a run: {spec}"
-        );
-        assert!(
-            !app.tick(true, true, view.village_walks()),
-            "{operation:?} repaints every tick for the village"
-        );
-    }
-}
-
-/// The page's own ticks are the walk's only clock: between runs the kitties
-/// stand where they are, whatever frame clock repaints the page.
-#[test]
-fn idle_kitties_stand_still_whatever_repaints_the_page() {
-    let viewport = LogicalRect::new(0.0, 0.0, 999.0, 900.0);
-    let app = SystemStateApp::new(Plan::default());
-    let view = SystemStateViewState::default();
-    let spec = |phase: u64| {
-        let cx = ViewCx {
-            animation_phase_ms: phase,
-            ..cx(viewport, false)
-        };
-        village(&app.view(&view, &cx).compile(viewport).unwrap()).expect("village shows")
-    };
-    assert_eq!(spec(0), spec(4_321));
-    assert!(
-        spec(4_321).starts_with("phase=0;busy=0;"),
-        "{}",
-        spec(4_321)
-    );
 }
 
 #[test]
@@ -4883,85 +4536,6 @@ fn every_state_keeps_its_words_whole_at_every_display_scale() {
     assert!(cut.is_empty(), "{} kinds:\n{cut:#?}", cut.len());
 }
 
-/// The kitty stands behind the caret as `assets/aterm-rainbow-kitty.png` draws it,
-/// measured by the pixels it draws: its drawn left edge is under the caret, so the caret
-/// covers its haunch, its tail rises past the caret's top, and none of it inks the words.
-#[test]
-fn the_caret_covers_the_kittys_haunch_as_the_brand_image_draws_it() {
-    use crate::widget::{ArtSpan, DrawPrim};
-    crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
-    for (ground, theme) in [
-        ("dark", aterm_render::Theme::default()),
-        (
-            "light",
-            aterm_render::Theme {
-                fg: 0x0010_1010,
-                bg: 0x00FA_FAFA,
-                ..aterm_render::Theme::default()
-            },
-        ),
-    ] {
-        let roles = crate::settings::Roles::from_theme(theme);
-        for (px, scale) in [(22.0_f32, 1.0_f32), (22.0, 2.0), (16.0, 2.0), (30.0, 3.0)] {
-            let spec = BrandSpec {
-                kitty: true,
-                px,
-                scale,
-            };
-            let mut prims = Vec::new();
-            let rect = LogicalRect::new(8.0, 4.0, 400.0, spec.needed_height());
-            paint_brand(&mut prims, rect, Some(&spec.value()), &roles);
-            let at = format!("{ground} {px}px @{scale}x");
-            let Some((x, y, w, h, art)) = prims.iter().find_map(|prim| match prim {
-                DrawPrim::Image { x, y, w, h, art } => Some((*x, *y, *w, *h, *art)),
-                _ => None,
-            }) else {
-                panic!("{at}: no kitty");
-            };
-            let Some(DrawPrim::Panel {
-                x: caret_x,
-                y: caret_top,
-                w: caret_w,
-                ..
-            }) = prims.last()
-            else {
-                panic!("{at}: the caret is not drawn last");
-            };
-            let Some((words_x, baseline, words)) = prims.iter().find_map(|prim| match prim {
-                DrawPrim::Text { x, baseline, s, .. } => Some((*x, *baseline, s.clone())),
-                _ => None,
-            }) else {
-                panic!("{at}: no words");
-            };
-            let drawn = art.mask().drawn(ArtSpan::BOX).expect("the kitty draws");
-            let (left, top, right) = (x + drawn.left * w, y + drawn.top * h, x + drawn.right * w);
-            assert!(
-                (left - (caret_x + caret_w * 0.5)).abs() < 0.01,
-                "{at}: the kitty's drawn left edge {left} is not at the caret's middle"
-            );
-            assert!(
-                caret_x + caret_w < right,
-                "{at}: the kitty goes on past the caret"
-            );
-            assert!(
-                top < *caret_top,
-                "{at}: the tail rises past the caret's top"
-            );
-            // The words' ink, as the overlap audit reads it: the kitty draws none of it.
-            let words_w =
-                crate::tray_raster::measure_text(&words, px, crate::widget::TextWeight::Regular);
-            let body = 0.7 * px;
-            let over_words = art.mask().drawn(ArtSpan {
-                left: (words_x - x) / w,
-                top: (baseline - body - y) / h,
-                right: (words_x + words_w - x) / w,
-                bottom: (baseline - y) / h,
-            });
-            assert_eq!(over_words, None, "{at}: the kitty inks the words");
-        }
-    }
-}
-
 /// While Restore previous settings runs, no group takes a press (design §3.4): the page shows
 /// the plan the Restore is changing, so a choice made from it could set a group the Restore
 /// puts back again. Once the Restore is done, the groups take a press again.
@@ -4986,14 +4560,13 @@ fn a_group_takes_no_press_while_restore_runs() {
         ..in_force()
     });
     let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 900.0);
-    let segment = compiled
-        .semantic(&UiKey::new("system-state/group/3/leave"))
+    let switch = compiled
+        .semantic(&UiKey::new("system-state/line/accounts/switch"))
         .and_then(|node| node.state)
-        .expect("the group's choice shows");
-    assert!(
-        !segment.enabled,
-        "no group takes a press while Restore runs"
-    );
+        .expect("the line's switch shows");
+    assert!(!switch.enabled, "no line takes a press while Restore runs");
+    act(&mut app, "system-state/line/accounts/switch");
+    assert!(app.take_action().is_none());
     act(&mut app, "system-state/group/3/leave");
     assert!(app.take_action().is_none());
     assert_eq!(app.plan, Plan::default(), "the page shows no choice taken");
@@ -5159,8 +4732,8 @@ fn leave_as_is_on_aterms_provisional_plan_is_kept_as_the_persons() {
 
 /// A stage that failed as a whole reaches the page as the worker's page says it, under the
 /// rows it covers with none of the stage's words (design §3.6): the headline names those rows
-/// and offers Set up now, and the note says what comes next, in one sentence for the rows that
-/// failed alike.
+/// and runs the plan again, and the card says what comes next for each (§4.8), so no note says
+/// it again; while the run retries, one note says it did not finish this time.
 #[test]
 fn a_stage_that_failed_as_a_whole_is_said_under_its_rows() {
     let step = |setting: Setting| SetupStatusRow {
@@ -5180,9 +4753,15 @@ fn a_stage_that_failed_as_a_whole_is_said_under_its_rows() {
             true
         )
     );
+    assert!(status.notes(&plan).is_empty(), "{:?}", status.notes(&plan));
+    let mut app = SystemStateApp::new(plan.clone());
+    app.publish(status.clone());
+    let card = lines::card_items(&app, &app.reviewed_rows());
     assert_eq!(
-        status.notes(&plan),
-        ["Rust in Spotlight failed. Set up now tries again."]
+        card.iter()
+            .map(|item| (item.title.as_str(), item.reason.as_deref()))
+            .collect::<Vec<_>>(),
+        [("Rust in Spotlight failed", Some(lines::TRIES_BY_ITSELF))]
     );
     status.retrying = true;
     assert_eq!(
@@ -5193,14 +4772,7 @@ fn a_stage_that_failed_as_a_whole_is_said_under_its_rows() {
     );
     status.retrying = false;
     status.rows = vec![step(Setting::CapsLock), step(Setting::Dock)];
-    assert_eq!(
-        status.notes(&plan),
-        [format!(
-            "{} and {} failed. Set up now tries again.",
-            Setting::CapsLock.name(),
-            Setting::Dock.name()
-        )]
-    );
+    assert!(status.notes(&plan).is_empty(), "{:?}", status.notes(&plan));
 }
 
 /// While a run aterm widened by itself goes, one calm note says why its groups changed
@@ -5236,7 +4808,7 @@ fn a_widened_run_says_why_its_groups_changed() {
 /// which the page is.
 #[test]
 fn every_scenarios_notes_are_sentences_in_the_pages_words() {
-    for scenario in SCENARIOS {
+    for scenario in FIXTURES {
         let status = status_of(scenario);
         let Some(plan) = status.plan.clone() else {
             continue;
@@ -5271,52 +4843,6 @@ fn every_scenarios_notes_are_sentences_in_the_pages_words() {
     );
 }
 
-/// Every scenario the page's fixture seam draws.
-const SCENARIOS: [&str; 42] = [
-    "checking",
-    "running",
-    "widened",
-    "debugger",
-    "needs-you",
-    "vault",
-    "vault-unreached",
-    "vault-not-syncing",
-    "vault-not-set-up",
-    "sync-off",
-    "vault-failed",
-    "set-up",
-    "non-alab",
-    "widen-stopped",
-    "failed",
-    "check-failed",
-    "check-unconfirmed",
-    "mixed",
-    "named-result-failed",
-    "restore-at-login",
-    "restore-blocked",
-    "restore-unlogged",
-    "vault-source-mismatch",
-    "plan-unread",
-    "fresh",
-    "queued-choice",
-    "queued-restore",
-    "set-aside",
-    "set-aside-non-alab",
-    "startup-retry",
-    "restore-failed",
-    "setup-retried",
-    "failed-retrying",
-    "github-sign-in",
-    "vault-unreadable",
-    "join-refused",
-    "vault-not-joined",
-    "vault-held",
-    "newer",
-    "restoring",
-    "review",
-    "cancelled",
-];
-
 /// Changes aterm made and could not log are a fact for later, never a signal (design §3.6):
 /// one calm note on the page, no menu line, no attention, no failure headline; the exceptions
 /// digest's entry carries it.
@@ -5328,8 +4854,8 @@ fn the_setups_facts_for_later_are_digest_entries() {
     for entry in [
         setup_not_started_entry("initial-setup.json: Permission denied"),
         setup_set_aside_entry("initial-setup.json.unreadable"),
-        setup_unfinished_entry(),
         setup_changed_since_entry("Dock"),
+        keep_awake_failing_entry("the menu bar refused the mug"),
     ] {
         assert_eq!(entry.family(), aterm_messages::exceptions::Family::Setup);
         assert!(entry.message().is_ok(), "{:?}", entry.message().err());
@@ -5341,6 +4867,11 @@ fn the_setups_facts_for_later_are_digest_entries() {
     assert_ne!(
         setup_not_started_entry("").key(),
         setup_set_aside_entry("").key()
+    );
+    assert_eq!(
+        keep_awake_failing_entry("disk full").key(),
+        keep_awake_failing_entry("").key(),
+        "a later trouble replaces the entry, and its clear finds it"
     );
     assert_eq!(
         setup_changed_since_entry("Dock").key(),
@@ -5414,10 +4945,7 @@ fn the_failed_headline_offers_the_action_its_note_names() {
     assert!(failed.start && failed.show.is_some(), "{notes:?}");
     let (step, notes) = line(&status_of("named-result-failed"));
     assert!(step.start);
-    assert_eq!(
-        notes,
-        ["GitHub repositories failed. Set up now tries again."]
-    );
+    assert!(notes.is_empty(), "the card says what comes next: {notes:?}");
     let mut setup = status_of("set-up");
     setup.rows = vec![SetupStatusRow {
         name: SETUP_ROW.into(),
@@ -5429,16 +4957,16 @@ fn the_failed_headline_offers_the_action_its_note_names() {
         (could_not_go.text.as_str(), could_not_go.start),
         ("Setup needs attention", true)
     );
-    assert_eq!(notes, ["Setup failed. Set up now tries again."]);
+    assert_eq!(notes, [format!("Setup failed. {SET_UP_NOW_NOTE}")]);
     // A Check that failed is pressed again where it is.
     let (check, notes) = line(&status_of("check-failed"));
     assert!(!check.start);
     assert_eq!(notes, [format!("Check again failed. {CHECK_FAILED_NOTE}")]);
-    let (_, notes) = line(&status_of("check-unconfirmed"));
-    assert_eq!(
-        notes,
-        ["Check again could not confirm GitHub repositories."]
-    );
+    // A row a Check could not confirm says so on the row, which the headline names: no note
+    // says it again.
+    let (unconfirmed, notes) = line(&status_of("check-unconfirmed"));
+    assert_eq!(unconfirmed.text, "Not confirmed: GitHub repositories");
+    assert!(notes.is_empty(), "{notes:?}");
     // A step aterm tries again by itself is no failure: its note says it did not finish this
     // time and aterm tries again, and the headline offers Show alone meanwhile: the vault's try
     // as the worker's page says it, a step whose run retries, and a setup run that could not go
@@ -5468,14 +4996,14 @@ fn the_failed_headline_offers_the_action_its_note_names() {
         notes,
         [format!("Setup did not finish this time. {RETRIES_NOTE}")]
     );
-    // A vault try held after two names Set up now, which the headline offers.
+    // A vault try held after two waits for this Mac's network or vault to change: no Set up
+    // now, and its row, not a note, says so.
     let mut held = status_of("vault-failed");
     held.retrying = false;
-    held.rows[0].detail = "aterm tried twice, so it tries again once this Mac's network or \
-                           vault changes, or on Set up now."
-        .into();
-    let (vault, _) = line(&held);
-    assert!(vault.start);
+    held.rows[0].detail = TRIED_TWICE.into();
+    let (vault, notes) = line(&held);
+    assert!(!vault.start);
+    assert!(notes.is_empty(), "{notes:?}");
     // A saved setup aterm cannot read is said in its own words: no setup ran to fail.
     assert_eq!(
         status_of("plan-unread").notes(&Plan::default()),
@@ -5720,55 +5248,50 @@ fn a_step_aterm_retries_by_itself_waits_and_is_no_failure() {
     let mut step = status_of("named-result-failed");
     step.retrying = true;
     assert_eq!(line(&step).text, "1 step waiting: GitHub repositories");
-    // Once the tries stop (a vault try held after two, a run that no longer retries), the step
-    // failed, and the headline, the menu line and the diamond say so.
+    // A vault try held after two waits, calm, for this Mac's network or vault to change,
+    // whether or not the run retries other steps: nothing says it failed.
     let mut held = status_of("vault-failed");
-    held.retrying = false;
-    held.rows[0].detail = "aterm tried twice, so it tries again once this Mac's network or \
-                           vault changes, or on Set up now."
-        .into();
-    assert_eq!(line(&held).text, "1 step failed: Secrets vault");
-    assert_eq!(
-        crate::system_state_access::menu_line(&held, false).map(|line| line.label),
-        Some("System State: Secrets vault failed".to_owned())
-    );
-    // Resuming automatic retries replaces the legacy hold with a waiting state.
-    held.retrying = true;
-    assert_eq!(
-        line(&held).text,
-        "2 steps waiting: Secrets vault, GitHub repositories"
-    );
-    assert!(crate::system_state_access::menu_line(&held, false).is_none());
-    assert_eq!(
-        row_view(secrets, &held, Selection::all()).chip,
-        Some(Chip::WillChange { busy: false })
-    );
+    held.rows[0].detail = TRIED_TWICE.into();
+    for retrying in [false, true] {
+        held.retrying = retrying;
+        assert_eq!(
+            line(&held).text,
+            "2 steps waiting: Secrets vault, GitHub repositories"
+        );
+        assert_eq!(
+            crate::system_state_access::menu_line(&held, false),
+            None,
+            "retrying {retrying}"
+        );
+        assert_eq!(
+            row_view(secrets, &held, Selection::all()).chip,
+            Some(Chip::Waiting)
+        );
+    }
+    // Once the tries stop (a run that no longer retries), the step failed, and the headline,
+    // the menu line and the diamond say so.
     step.retrying = false;
     assert_eq!(line(&step).text, "1 step failed: GitHub repositories");
 }
 
-/// The village draws each station as the headline says its rows (design §3.1): a step the
-/// headline names failed takes the error look, though its row reads in place, and a step aterm
-/// tries again by itself the waiting look, never the settled one.
+/// Each line's mark says its rows as the headline says them (design §3.1, §4.4): a step the
+/// headline names failed takes the failed mark, though its row reads in place, and a step aterm
+/// tries again by itself the waiting one, never the done one.
 #[test]
-fn the_village_draws_a_failed_step_as_failed_and_a_retried_one_as_waiting() {
-    let station = |status: &SetupStatus, setting: Setting| {
-        let mut app = SystemStateApp::new(Plan::default());
-        app.publish(status.clone());
-        let spec = village_spec(&app.status, &app.reviewed_rows(), &app.reviewed_plan(), 0);
-        let at = Setting::ALL.iter().position(|s| *s == setting).unwrap();
-        spec.rsplit("states=")
-            .next()
-            .and_then(|states| states.chars().nth(at))
-            .unwrap()
-    };
+fn a_line_marks_a_failed_step_failed_and_a_retried_one_waiting() {
     let failed = status_of("named-result-failed");
-    assert_eq!(station(&failed, Setting::Repositories), 'E');
+    assert_eq!(mark_on(&failed, Setting::Repositories), Mark::Failed);
     let mut retried = failed.clone();
     retried.retrying = true;
-    assert_eq!(station(&retried, Setting::Repositories), 'D');
-    assert_eq!(station(&status_of("vault-failed"), Setting::Secrets), 'D');
-    assert_eq!(station(&status_of("set-up"), Setting::Repositories), 'G');
+    assert_eq!(mark_on(&retried, Setting::Repositories), Mark::Waiting);
+    assert_eq!(
+        mark_on(&status_of("vault-failed"), Setting::Secrets),
+        Mark::Waiting
+    );
+    assert_eq!(
+        mark_on(&status_of("set-up"), Setting::Repositories),
+        Mark::Done
+    );
 }
 
 /// While macOS's administrator dialog for debugger access is up, Turn On… can start nothing
@@ -5868,7 +5391,7 @@ fn a_headline_claims_no_more_than_was_confirmed() {
     assert_eq!(
         (checked.text.as_str(), checked.show, checked.start),
         (
-            "1 row not confirmed: GitHub repositories",
+            "Not confirmed: GitHub repositories",
             Some(repositories),
             false
         )
@@ -5881,10 +5404,7 @@ fn a_headline_claims_no_more_than_was_confirmed() {
             (Setting::Spotlight, Unfinished::Unconfirmed),
         ],
     });
-    assert_eq!(
-        line(&ran).text,
-        "2 rows not confirmed: Dock, Rust in Spotlight"
-    );
+    assert_eq!(line(&ran).text, "Not confirmed: Dock, Rust in Spotlight");
     let mut app = SystemStateApp::new(Plan::default());
     app.publish(status_of("check-unconfirmed"));
     assert!(!app.needs_attention());
@@ -5957,7 +5477,7 @@ fn a_startup_aterm_retries_waits_with_no_set_up_now() {
 /// The headline, the menu line and the tab's diamond signal a failure together or not at all
 /// (design §3.6). A step that failed with its own reason while the run still tries again by
 /// itself waits for that try (`1 step waiting`), its row or note keeping the reason under the
-/// waiting chip, never `Failed`, and the village draws it waiting; once the tries stop, all of
+/// waiting chip, never `Failed`, and its line marks it waiting; once the tries stop, all of
 /// them say it failed at once.
 #[test]
 fn a_failure_signals_in_the_headline_the_menu_line_and_the_diamond_together() {
@@ -5977,20 +5497,12 @@ fn a_failure_signals_in_the_headline_the_menu_line_and_the_diamond_together() {
         );
         line.text
     };
-    let station = |status: &SetupStatus, setting: Setting| {
-        let plan = status.plan.clone().unwrap();
-        let spec = village_spec(status, &rows(status, plan.selection), &plan, 0);
-        let at = Setting::ALL.iter().position(|s| *s == setting).unwrap();
-        spec.rsplit("states=")
-            .next()
-            .and_then(|states| states.chars().nth(at))
-            .unwrap()
-    };
+    let station = mark_on;
     let repositories = Subject::Setting(Setting::Repositories);
     // A reading that failed, with its reason on its row.
     let retrying = status_of("failed-retrying");
     assert_eq!(agree(&retrying), "1 step waiting: GitHub repositories");
-    assert_eq!(station(&retrying, Setting::Repositories), 'D');
+    assert_eq!(station(&retrying, Setting::Repositories), Mark::Waiting);
     let plan = retrying.plan.clone().unwrap();
     assert_eq!(
         retrying.notes(&plan),
@@ -6002,15 +5514,15 @@ fn a_failure_signals_in_the_headline_the_menu_line_and_the_diamond_together() {
     let row = row_view(repositories, &retrying, Selection::all());
     assert_eq!(
         (row.chip, row.note.as_deref()),
-        (Some(Chip::WillChange { busy: false }), Some(GITHUB_STOPPED)),
-        "the row waits with its reason, never red"
+        (Some(Chip::Waiting), Some(GITHUB_STOPPED)),
+        "the row waits with its reason, calm, never red"
     );
     let stopped = SetupStatus {
         retrying: false,
         ..retrying
     };
     assert_eq!(agree(&stopped), "1 step failed: GitHub repositories");
-    assert_eq!(station(&stopped, Setting::Repositories), 'E');
+    assert_eq!(station(&stopped, Setting::Repositories), Mark::Failed);
     assert_eq!(
         row_view(repositories, &stopped, Selection::all()).chip,
         Some(Chip::Failed)
@@ -6026,7 +5538,7 @@ fn a_failure_signals_in_the_headline_the_menu_line_and_the_diamond_together() {
     step.retrying = true;
     let plan = step.plan.clone().unwrap();
     assert_eq!(agree(&step), "1 step waiting: Dock");
-    assert_eq!(station(&step, Setting::Dock), 'D');
+    assert_eq!(station(&step, Setting::Dock), Mark::Waiting);
     assert_eq!(
         step.notes(&plan),
         [format!("Dock did not finish this time. {RETRIES_NOTE}")]
@@ -6038,35 +5550,24 @@ fn a_failure_signals_in_the_headline_the_menu_line_and_the_diamond_together() {
     );
     step.retrying = false;
     assert_eq!(agree(&step), "1 step failed: Dock");
-    assert_eq!(station(&step, Setting::Dock), 'E');
-    assert_eq!(
-        step.notes(&plan),
-        [format!("Dock failed. {SET_UP_NOW_NOTE}")]
-    );
+    assert_eq!(station(&step, Setting::Dock), Mark::Failed);
+    // The headline names it with Set up now, and its row keeps its reason: no note says it again.
+    assert!(step.notes(&plan).is_empty(), "{:?}", step.notes(&plan));
     assert_eq!(
         row_view(dock, &step, Selection::all()).note.as_deref(),
         Some("The change did not take.")
     );
 }
 
-/// What every signal says of one row (design §3.6): the headline, the row's chip, the village's
-/// station, the menu line and the tab's diamond.
+/// What every signal says of one row (design §3.6): the headline, the row's chip, its line's
+/// mark, the menu line and the tab's diamond.
 fn signals(
     status: &SetupStatus,
     subject: Subject,
-) -> (String, Option<Chip>, char, Option<String>, bool) {
+) -> (String, Option<Chip>, Mark, Option<String>, bool) {
     let plan = status.plan.clone().unwrap();
     let all = rows(status, plan.selection);
-    let spec = village_spec(status, &all, &plan, 0);
-    let at = Setting::ALL
-        .iter()
-        .position(|setting| *setting == subject.setting())
-        .unwrap();
-    let station = spec
-        .rsplit("states=")
-        .next()
-        .and_then(|states| states.chars().nth(at))
-        .unwrap();
+    let station = mark_on(status, subject.setting());
     let mut app = SystemStateApp::new(plan.clone());
     app.publish(status.clone());
     (
@@ -6079,17 +5580,17 @@ fn signals(
 }
 
 /// Every failure has one kind, and each signal says it alike (design §3.6): the headline, the
-/// row's chip, the village's station, the menu line and the tab's diamond agree for a transient
+/// row's chip, its line's mark, the menu line and the tab's diamond agree for a transient
 /// failure while aterm tries it again (waiting, calm) and once the tries are spent (failed), and
 /// for one only a person ends (needs you, at once, whether or not the run retries).
 #[test]
-fn every_failure_kind_signals_alike_in_the_headline_the_row_the_village_the_menu_and_the_diamond() {
+fn every_failure_kind_signals_alike_in_the_headline_the_row_the_line_the_menu_and_the_diamond() {
     let repositories = Subject::Setting(Setting::Repositories);
     let waiting = |name: &str| {
         (
             format!("1 step waiting: {name}"),
-            Some(Chip::WillChange { busy: false }),
-            'D',
+            Some(Chip::Waiting),
+            Mark::Waiting,
             None,
             false,
         )
@@ -6098,7 +5599,7 @@ fn every_failure_kind_signals_alike_in_the_headline_the_row_the_village_the_menu
         (
             format!("1 step failed: {name}"),
             Some(Chip::Failed),
-            'E',
+            Mark::Failed,
             Some(format!("System State: {name} failed")),
             true,
         )
@@ -6107,7 +5608,7 @@ fn every_failure_kind_signals_alike_in_the_headline_the_row_the_village_the_menu
         (
             format!("Needs you: {name}"),
             Some(Chip::NeedsYou),
-            'E',
+            Mark::NeedsYou,
             Some(format!("System State: {name} needs you")),
             true,
         )
@@ -6142,10 +5643,11 @@ fn every_failure_kind_signals_alike_in_the_headline_the_row_the_village_the_menu
         let line = crate::system_state_access::menu_line(&sign_in, false).unwrap();
         assert_eq!(line.note.as_deref(), Some(GITHUB_TOKEN_REFUSED));
         let row = row_view(repositories, &sign_in, Selection::all());
+        // The row says who renews the token and the line they run (§3.6).
         assert_eq!(
             (row.note.as_deref(), &row.value),
             (
-                Some(GITHUB_TOKEN_REFUSED),
+                Some(GITHUB_TOKEN_RENEW_NOTE),
                 &RowValue::Change {
                     now: "Needs sign-in".into(),
                     wanted: Setting::Repositories.wanted().into(),
@@ -6181,34 +5683,31 @@ fn every_failure_kind_signals_alike_in_the_headline_the_row_the_village_the_menu
         );
     }
 
-    // An older persisted two-attempt note cannot override an active retry.
+    // A transient vault try held after two waits for a change of network or vault, calm,
+    // whether or not the run retries.
+    // The repositories wait on the vault's token, so the headline names both.
     let mut held = status_of("vault-failed");
     held.rows[0].detail = TRIED_TWICE.into();
-    held.retrying = true;
+    let (_, chip, station, menu, diamond) = waiting("Secrets vault");
     assert_eq!(
         signals(&held, Subject::Setting(Setting::Secrets)),
         (
-            "2 steps waiting: Secrets vault, GitHub repositories".into(),
-            Some(Chip::WillChange { busy: false }),
-            'D',
-            None,
-            false
+            "2 steps waiting: Secrets vault, GitHub repositories".to_owned(),
+            chip,
+            station,
+            menu,
+            diamond
         )
-    );
-    held.retrying = false;
-    assert_eq!(
-        signals(&held, Subject::Setting(Setting::Secrets)),
-        failed("Secrets vault")
     );
 }
 
 /// No fixture's signals contradict one another (design §3.6): wherever a row's chip says
 /// `Failed` the headline says a step failed, the diamond and the menu line show, and the
-/// village draws the error look, and wherever the headline counts a step waiting no row reads
+/// row's line marks it failed, and wherever the headline counts a step waiting no row reads
 /// `Failed` and nothing signals.
 #[test]
 fn no_fixture_says_waiting_and_failed_at_once() {
-    for scenario in SCENARIOS {
+    for scenario in FIXTURES {
         let status = status_of(scenario);
         let Some(plan) = status.plan.clone() else {
             continue;
@@ -6261,11 +5760,9 @@ fn a_waiting_restore_leaves_the_groups_and_check_again_live() {
             .state
             .is_some_and(|state| state.enabled)
     };
-    for index in 0..Group::ALL.len() {
-        for choice in ["set-up", "leave"] {
-            let key = format!("system-state/group/{index}/{choice}");
-            assert!(enabled(&key), "{key}");
-        }
+    for line in lines::Line::ALL {
+        let key = format!("system-state/line/{}/switch", line.slug());
+        assert!(enabled(&key), "{key}");
     }
     assert!(enabled("system-state/check"));
     assert!(!enabled("system-state/restore"));
@@ -6326,15 +5823,11 @@ fn the_set_aside_note_says_what_aterm_kept_as_the_groups_show_it() {
             workspace,
             "{scenario}"
         );
-        let (count, _) = group_words(
-            Group::Developer,
-            plan.selection,
-            &rows(&status, plan.selection),
-        );
+        let developer = line_in(&page_reading(&status), Setting::Spotlight);
         assert_eq!(
-            count.as_deref(),
-            (workspace == GroupChoice::Partly).then_some("Partly set up"),
-            "{scenario}"
+            developer.phrase.starts_with("Partly on · "),
+            workspace == GroupChoice::Partly,
+            "{scenario}: {developer:?}"
         );
         assert_eq!(menu(&status), None);
         let mut app = SystemStateApp::new(plan);
@@ -6357,24 +5850,17 @@ fn the_set_aside_note_names_no_record() {
 }
 
 /// A row read in place that a Check, or a run, could not confirm is not drawn as settled
-/// (design §3.2): its village station waits (`D`), its row has no check mark and says `Not
+/// (design §3.2): its line's mark waits, its row has no check mark and says `Not
 /// confirmed` in its note, where the headline's Show lands; once confirmed it is settled again.
 #[test]
 fn an_unconfirmed_row_is_drawn_waiting_with_its_note() {
-    let station = |app: &SystemStateApp, setting: Setting| {
-        let spec = village_spec(&app.status, &app.reviewed_rows(), &app.reviewed_plan(), 0);
-        let at = Setting::ALL.iter().position(|s| *s == setting).unwrap();
-        spec.rsplit("states=")
-            .next()
-            .and_then(|states| states.chars().nth(at))
-            .unwrap()
-    };
+    let station = |app: &SystemStateApp, setting: Setting| line_in(app, setting).mark;
     let repositories = Subject::Setting(Setting::Repositories);
     let mut app = SystemStateApp::new(Plan::default());
     app.publish(status_of("check-unconfirmed"));
     let line = app.headline();
     assert_eq!(line.show, Some(repositories));
-    assert_eq!(station(&app, Setting::Repositories), 'D');
+    assert_eq!(station(&app, Setting::Repositories), Mark::Waiting);
     let row = app.reviewed_row(repositories);
     assert_eq!(
         (row.chip, row.note.as_deref()),
@@ -6402,7 +5888,7 @@ fn an_unconfirmed_row_is_drawn_waiting_with_its_note() {
         unfinished: vec![(Setting::Dock, Unfinished::Unconfirmed)],
     });
     app.publish(ran);
-    assert_eq!(station(&app, Setting::Dock), 'D');
+    assert_eq!(station(&app, Setting::Dock), Mark::Waiting);
     assert_eq!(
         app.reviewed_row(Subject::Setting(Setting::Dock))
             .note
@@ -6411,13 +5897,14 @@ fn an_unconfirmed_row_is_drawn_waiting_with_its_note() {
     );
     // Confirmed, the rows are settled again.
     app.publish(status_of("set-up"));
-    assert_eq!(station(&app, Setting::Repositories), 'G');
-    assert_eq!(station(&app, Setting::Dock), 'G');
+    assert_eq!(station(&app, Setting::Repositories), Mark::Done);
+    assert_eq!(station(&app, Setting::Dock), Mark::Done);
     assert_eq!(app.reviewed_row(repositories).chip, Some(Chip::InPlace));
 }
 
-/// The first launch's offer of a fresh signed Mac waits for a person at this Mac (the `review`
-/// scenario): Full Disk Access and Debugger access read as needing a person once Permissions run.
+/// The launch's offer of a fresh signed Mac, before the page's first tick answers it
+/// ([`fresh_with_grants`]): Full Disk Access and Debugger access read as needing a person once
+/// Permissions run.
 fn in_review() -> (
     SystemStateApp,
     mpsc::Receiver<crate::workstation_setup::SetupAnswer>,
@@ -6425,7 +5912,7 @@ fn in_review() -> (
     let (send, receive) = mpsc::channel();
     let mut app = SystemStateApp::new(Plan::default());
     assert!(app.offer(Request::new(Plan::default(), send)));
-    app.publish(status_of("review"));
+    app.publish(fresh_with_grants());
     (app, receive)
 }
 
@@ -6435,13 +5922,13 @@ fn in_review() -> (
 #[test]
 fn the_review_headline_is_its_only_signal() {
     // A setup an earlier launch could not finish is said once the review is answered.
-    let mut failing = status_of("review");
+    let mut failing = fresh_with_grants();
     failing.rows = vec![SetupStatusRow {
         name: SETUP_ROW.into(),
         status: "failed".into(),
         detail: String::new(),
     }];
-    for status in [status_of("review"), failing] {
+    for status in [fresh_with_grants(), failing] {
         let (mut app, _receive) = in_review();
         app.publish(status.clone());
         assert_eq!(app.headline().text, STARTING_HEADLINE);
@@ -6492,7 +5979,7 @@ fn review_rows_read_as_what_apply_will_do() {
     }
     // Out of the review the same reading asks for the person, with its button.
     let mut shown = SystemStateApp::new(Plan::default());
-    shown.publish(status_of("review"));
+    shown.publish(fresh_with_grants());
     let row = shown.reviewed_row(Subject::Access(Access::FullDiskAccess));
     assert_eq!(row.chip, Some(Chip::NeedsYou));
     assert_eq!(row.open, Some(Access::FullDiskAccess));
@@ -6520,10 +6007,13 @@ fn a_newer_aterms_setup_never_says_checking() {
         label(&compiled, "system-state/row/messages/info"),
         "Messages: not read"
     );
-    let set_up = compiled
-        .semantic(&UiKey::new("system-state/group/2/set-up"))
-        .unwrap();
-    assert!(!set_up.state.unwrap().enabled);
+    // This aterm cannot read the plan the newer aterm keeps: no line shows an on or off it
+    // would only guess, and none is this aterm's to change.
+    assert!(
+        compiled
+            .semantic(&UiKey::new("system-state/line/mac/switch"))
+            .is_none()
+    );
     assert!(
         !compiled
             .semantics
@@ -6576,8 +6066,8 @@ fn a_vault_the_row_explains_is_not_said_again_under_the_headline() {
 
 /// The `failed` scenario is a failure aterm reaches and a person can act on (design §3.6): the
 /// run's GitHub repositories step, which aterm no longer tries by itself, said by the headline,
-/// the row, the diamond and the menu line together, its note naming Set up now, which the
-/// headline offers.
+/// the row, the diamond and the menu line together, the headline offering Set up now, its
+/// remedy; no note says it again.
 #[test]
 fn the_failed_scenario_names_its_remedy() {
     let status = status_of("failed");
@@ -6586,14 +6076,8 @@ fn the_failed_scenario_names_its_remedy() {
     app.publish(status.clone());
     let headline = app.headline();
     assert_eq!(headline.text, "1 step failed: GitHub repositories");
-    assert!(
-        headline.start,
-        "the headline offers the remedy its note names"
-    );
-    assert_eq!(
-        status.notes(&plan),
-        ["GitHub repositories failed. Set up now tries again."]
-    );
+    assert!(headline.start, "the headline offers its remedy");
+    assert!(status.notes(&plan).is_empty(), "{:?}", status.notes(&plan));
     assert_eq!(
         app.reviewed_row(Subject::Setting(Setting::Repositories))
             .chip,
@@ -6606,18 +6090,18 @@ fn the_failed_scenario_names_its_remedy() {
     );
 }
 
-/// After a person's Cancel of the first launch's review (the `cancelled` scenario), every group
-/// reads Leave as is, nothing lights, and one calm line sits beside Set up now (design §3.3).
+/// The `older-cancel` scenario, a Cancel an older aterm recorded: every group reads Leave as is,
+/// nothing lights, and the page says nothing of a review (design §3.3, init design §6.1).
 #[test]
-fn the_cancelled_scenario_is_one_calm_line_beside_set_up_now() {
-    let status = status_of("cancelled");
+fn the_older_cancel_scenario_reads_every_group_left_as_is() {
+    let status = status_of("older-cancel");
     let plan = status.plan.clone().unwrap();
     let mut app = SystemStateApp::new(plan.clone());
     app.publish(status.clone());
     let headline = app.headline();
-    assert_eq!(headline.text, "Everything is left as is");
-    assert!(headline.start);
-    assert_eq!(status.notes(&plan), [CANCELLED_NOTE]);
+    assert_eq!(headline.text, EVERYTHING_LEFT_AS_IS);
+    assert!(!headline.start);
+    assert!(status.notes(&plan).is_empty());
     assert!(!app.needs_attention());
     assert_eq!(menu(&status), None);
     for subject in Subject::all() {
@@ -6625,71 +6109,26 @@ fn the_cancelled_scenario_is_one_calm_line_beside_set_up_now() {
     }
 }
 
-/// A first-launch review closed unanswered, and the page opened again in that launch (§3.3),
-/// reads as the review did: calm, `Setup has not started` with Set up now, and every row as
-/// what Set up now will do. No row needs you, offers Open or draws the village's error look,
-/// since nobody approved the permission steps, and neither the tab nor the menu bar says a
-/// thing.
+/// aterm widens a plan an older aterm saved with its permissions alone to the base plan every
+/// Mac gets, with no ALab signal (§3.5, init-on-by-default §8.1): its run names sync, never the
+/// ALab profile this Mac did not get.
 #[test]
-fn a_closed_review_reads_its_rows_as_what_set_up_now_will_do() {
-    let status = status_of("review-closed");
-    let mut app = SystemStateApp::new(Plan::default());
-    app.publish(status.clone());
-    let headline = app.headline();
-    assert_eq!(headline.text, NOT_STARTED);
-    assert!(headline.start && headline.open.is_none());
-    assert!(!app.needs_attention());
-    assert!(crate::system_state_access::menu_line(&status, false).is_none());
-    for access in [Access::FullDiskAccess, Access::Debugger] {
-        let row = app.reviewed_row(Subject::Access(access));
-        assert_eq!(
-            row.chip,
-            Some(Chip::WillChange { busy: false }),
-            "{access:?}"
-        );
-        assert!(row.open.is_none(), "{access:?}");
-        assert!(!app.can_open_access(access), "{access:?}");
-    }
-    let village = village_spec(&app.status, &app.reviewed_rows(), &app.reviewed_plan(), 0);
-    assert!(!village.contains('E'), "no error look: {village}");
-}
-
-/// The review of the groups the ALab signal adds (§3.5) stills only what it adds: Full Disk
-/// Access, which the plan in force (Permissions) waits on, still needs the person, with its Open,
-/// the headline, the tab's diamond and the menu line, while the added groups read as what Apply
-/// will do.
-#[test]
-fn a_widen_review_keeps_the_needs_you_of_the_plan_in_force() {
-    let (send, _receive) = mpsc::channel();
-    let mut app = SystemStateApp::new(permissions_only());
-    assert!(app.offer(Request::widen(Plan::default(), permissions_only(), send)));
-    let status = status_of("widen-review");
-    app.publish(status.clone());
-    assert!(app.reviewing_widen());
-    let fda = app.reviewed_row(Subject::Access(Access::FullDiskAccess));
-    assert_eq!(fda.chip, Some(Chip::NeedsYou));
-    assert_eq!(fda.open, Some(Access::FullDiskAccess));
-    assert!(app.can_open_access(Access::FullDiskAccess));
-    let headline = app.headline();
-    assert_eq!(headline.text, "Needs you: Full Disk Access");
-    assert_eq!(headline.open, Some(Access::FullDiskAccess));
-    assert!(!headline.start, "the review's own Apply answers it");
-    assert!(app.needs_attention());
-    assert_eq!(
-        crate::system_state_access::menu_line(&status, false).map(|line| line.label),
-        Some("System State: Full Disk Access needs you".to_owned())
-    );
-    let dock = app.reviewed_row(Subject::Setting(Setting::Dock));
-    assert!(dock.managed, "the review sets the added groups up");
-    assert_eq!(dock.chip, Some(Chip::WillChange { busy: false }));
-    assert_eq!(app.notes(&app.reviewed_plan()), [ALAB_ADDED_NOTE]);
+fn a_widen_to_the_base_plan_names_sync_not_the_alab_profile() {
+    let base = Plan::from(aterm_types::macos_setup::BASE_PLAN);
+    let mut status = status_of("widened");
+    status.plan = Some(base.clone());
+    assert_eq!(status.notes(&base), [SYNC_ADDED_NOTE]);
+    let whole = Plan::default();
+    status.plan = Some(whole.clone());
+    assert_eq!(status.notes(&whole), [WIDENED_NOTE]);
 }
 
 /// Apple's Command Line Tools, which the GitHub repositories wait on (§3.3): the page reads what
 /// their install does. Their tab asking for the password needs the person now, as the debugger
-/// step's dialog does; Apple's installer running is a wait that ends by itself, calm; and the
-/// tools missing, with no tab open and nothing installing them, need the person, with Install…
-/// on the row, which a press asks the window for.
+/// step's dialog does, and the headline's Go to tab brings that tab to the front; Apple's
+/// installer running is a wait that ends by itself, calm; and the tools missing, with no tab
+/// open and nothing installing them, need the person, with Install… on the row, which a press
+/// asks the window for, and a note that says why.
 #[test]
 fn the_command_line_tools_row_reads_what_their_install_does() {
     use crate::system_state_access::menu_line;
@@ -6703,20 +6142,34 @@ fn the_command_line_tools_row_reads_what_their_install_does() {
         (app, menu_line(&status, false), button)
     };
 
-    let (app, line, button) = page("clt-password");
+    let (mut app, line, button) = page("clt-password");
     let row = app.reviewed_row(repositories);
     assert_eq!(app.headline().text, TOOLS_PASSWORD_HEADLINE);
+    assert!(app.headline().go_to_tab);
     assert_eq!(row.chip, Some(Chip::NeedsYou));
     assert_eq!(row.note.as_deref(), Some(TOOLS_PASSWORD_NOTE));
     assert!(!row.install_tools && !button, "its tab is open");
     assert!(app.needs_attention());
     let line = line.expect("the person is needed now");
     assert_eq!(line.note.as_deref(), Some(TOOLS_PASSWORD_HEADLINE));
+    let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 1400.0);
+    let go = compiled
+        .semantic(&UiKey::new(GO_TO_TOOLS_TAB))
+        .expect("the card offers the tab");
+    assert_eq!(
+        go.label, "Go to tab: Command Line Tools",
+        "VoiceOver hears where it goes"
+    );
+    act(&mut app, GO_TO_TOOLS_TAB);
+    assert!(matches!(
+        app.take_action(),
+        Some(SystemStateAction::GoToToolsTab)
+    ));
 
     let (app, line, button) = page("clt-installing");
     let row = app.reviewed_row(repositories);
     assert_eq!(row.standing, Some(Standing::Waiting));
-    assert_eq!(row.chip, Some(Chip::WillChange { busy: false }));
+    assert_eq!(row.chip, Some(Chip::Waiting), "calm while it waits");
     assert_eq!(row.note.as_deref(), Some(INSTALLING_TOOLS_NOTE));
     assert!(!row.install_tools && !button);
     assert_eq!(app.headline().text, "1 step waiting: GitHub repositories");
@@ -6726,16 +6179,21 @@ fn the_command_line_tools_row_reads_what_their_install_does() {
     let (mut app, line, button) = page("clt-missing");
     let row = app.reviewed_row(repositories);
     assert_eq!(app.headline().text, "Needs you: GitHub repositories");
+    assert!(!app.headline().go_to_tab, "no tab to go to");
     assert_eq!(row.chip, Some(Chip::NeedsYou));
     assert_eq!(
         row.note.as_deref(),
-        Some(aterm_types::macos_setup::COMMAND_LINE_TOOLS_MISSING)
+        Some(TOOLS_NEEDED_NOTE),
+        "why, beside Install…"
     );
     assert!(row.install_tools && button);
     assert!(app.needs_attention());
+    let line = line.expect("the person is needed now");
+    assert_eq!(line.label, "System State: GitHub repositories needs you");
     assert_eq!(
-        line.map(|line| line.label),
-        Some("System State: GitHub repositories needs you".to_owned())
+        line.note.as_deref(),
+        Some(aterm_types::macos_setup::COMMAND_LINE_TOOLS_MISSING),
+        "the menu, with no button, says what to do"
     );
     app.by_person = true;
     act(&mut app, INSTALL_TOOLS);
@@ -6743,6 +6201,125 @@ fn the_command_line_tools_row_reads_what_their_install_does() {
         app.take_action(),
         Some(SystemStateAction::InstallDeveloperTools { by_person: true })
     ));
+}
+
+/// Where a press of Install… or Apple's own installer window stands (§3.3): Apple's window
+/// waiting for the person's press needs them there, in the page's words and the menu's; a press
+/// kept while a macOS dialog is up is a wait that ends by itself, calm and with no second
+/// Install…; and a press whose tab did not open says why on the row, with Install… there again.
+#[test]
+fn the_command_line_tools_row_says_where_a_press_or_apples_window_stands() {
+    use crate::system_state_access::menu_line;
+    let repositories = Subject::Setting(Setting::Repositories);
+    let page = |name: &str| {
+        let status = status_of(name);
+        let mut app = SystemStateApp::new(Plan::default());
+        app.publish(status.clone());
+        let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 1400.0);
+        let button = compiled.semantic(&UiKey::new(INSTALL_TOOLS)).is_some();
+        (app, menu_line(&status, false), button)
+    };
+
+    let (app, line, button) = page("clt-apple-window");
+    let row = app.reviewed_row(repositories);
+    assert_eq!(app.headline().text, "Needs you: GitHub repositories");
+    assert!(
+        !app.headline().go_to_tab,
+        "Apple's window is not aterm's tab"
+    );
+    assert_eq!(row.chip, Some(Chip::NeedsYou));
+    assert_eq!(row.note.as_deref(), Some(APPLE_WINDOW_NOTE));
+    assert!(
+        !row.install_tools && !button,
+        "Apple's installer is already open"
+    );
+    assert!(app.needs_attention());
+    let line = line.expect("the person is needed now");
+    assert_eq!(line.note.as_deref(), Some(APPLE_WINDOW_NOTE));
+
+    let (app, line, button) = page("clt-queued");
+    let row = app.reviewed_row(repositories);
+    assert_eq!(row.standing, Some(Standing::Waiting));
+    assert_eq!(row.chip, Some(Chip::Waiting), "calm while it waits");
+    assert_eq!(row.note.as_deref(), Some(TOOLS_QUEUED_NOTE));
+    assert!(!row.install_tools && !button, "the press is kept");
+    assert_eq!(app.headline().text, "1 step waiting: GitHub repositories");
+    assert!(!app.needs_attention(), "a wait that ends by itself");
+    assert!(line.is_none(), "{line:?}");
+
+    let (app, line, button) = page("clt-not-opened");
+    let row = app.reviewed_row(repositories);
+    assert_eq!(row.chip, Some(Chip::NeedsYou));
+    assert_eq!(row.note.as_deref(), Some(TOOLS_NOT_OPENED_NOTE));
+    assert!(row.install_tools && button, "Install… is there again");
+    assert!(app.needs_attention());
+    assert_eq!(
+        line.map(|line| line.label),
+        Some("System State: GitHub repositories needs you".to_owned())
+    );
+}
+
+/// Low Data Mode holding the tools' download back is a wait that ends by itself (§3.3): calm,
+/// with no menu line, and Install… there for a person who turned it off. An account that may not
+/// install them is told so on the row, with no Install… that would only say it again, and no
+/// menu line, since nothing here changes it.
+#[test]
+fn the_command_line_tools_row_reads_low_data_mode_and_a_non_administrator() {
+    use crate::system_state_access::menu_line;
+    let repositories = Subject::Setting(Setting::Repositories);
+    let page = |name: &str| {
+        let status = status_of(name);
+        let mut app = SystemStateApp::new(Plan::default());
+        app.publish(status.clone());
+        let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 1400.0);
+        let button = compiled.semantic(&UiKey::new(INSTALL_TOOLS)).is_some();
+        (app, menu_line(&status, false), button)
+    };
+
+    let (app, line, button) = page("clt-low-data");
+    let row = app.reviewed_row(repositories);
+    assert_eq!(row.standing, Some(Standing::Waiting));
+    assert_eq!(
+        row.chip,
+        Some(Chip::Waiting),
+        "calm until the download can run"
+    );
+    assert_eq!(row.note.as_deref(), Some(TOOLS_LOW_DATA_NOTE));
+    assert!(row.install_tools && button, "Install… stays");
+    assert_eq!(app.headline().text, "1 step waiting: GitHub repositories");
+    assert!(!app.needs_attention(), "a wait that ends by itself");
+    assert!(line.is_none(), "{line:?}");
+
+    let (app, line, button) = page("clt-not-admin");
+    let row = app.reviewed_row(repositories);
+    assert_eq!(row.chip, Some(Chip::NeedsYou));
+    assert_eq!(row.note.as_deref(), Some(TOOLS_NOT_ADMIN_NOTE));
+    assert!(!row.install_tools && !button, "no Install… to loop on");
+    assert!(line.is_none(), "{line:?}");
+}
+
+/// The ALab profile aterm adds by itself, by automatic admission with nobody's press, waits for
+/// another setup in its own words (§3.5): nobody chose it, so the page never says "your
+/// choice", and the wait is calm.
+#[test]
+fn a_profile_aterm_adds_by_itself_waits_in_its_own_words() {
+    let status = status_of("queued-widen");
+    let mut app = SystemStateApp::new(Plan::default());
+    app.publish(status.clone());
+    assert_eq!(
+        app.headline().text,
+        "Waiting to add this Mac's ALab profile…"
+    );
+    assert_eq!(status.notes(&app.reviewed_plan()), [QUEUED_WIDEN_NOTE]);
+    assert!(!app.needs_attention());
+    assert!(crate::system_state_access::menu_line(&status, false).is_none());
+    let choice = SetupStatus {
+        queued_widen: false,
+        ..status
+    };
+    app.publish(choice.clone());
+    assert_eq!(app.headline().text, "Waiting to apply your choice…");
+    assert_eq!(choice.notes(&app.reviewed_plan()), [QUEUED_CHOICE_NOTE]);
 }
 
 /// A restored installer tab owns its unfinished work without claiming a password prompt or
@@ -6757,6 +6334,10 @@ fn a_restored_command_line_tools_tab_continues_before_another_install_is_offered
     let view = SystemStateViewState::default();
     let row = app.reviewed_row(repositories);
     assert_eq!(app.headline().text, TOOLS_RECOVERED_HEADLINE);
+    assert!(
+        app.headline().go_to_tab,
+        "Go to tab brings the restored tab to the front"
+    );
     assert_eq!(row.standing, Some(Standing::NeedsYou));
     assert_eq!(row.chip, Some(Chip::NeedsYou));
     assert_eq!(row.note.as_deref(), Some(TOOLS_RECOVERED_NOTE));
@@ -6815,8 +6396,9 @@ fn a_restored_command_line_tools_tab_continues_before_another_install_is_offered
 }
 
 /// A step the run could not finish keeps its reason on its row (§3.6), in the words its step
-/// decided (`GitHub can't be reached`, never GitHub's own), and the page's note then says only
-/// what comes next: no line says it twice.
+/// decided (`GitHub can't be reached`, never GitHub's own), and the headline names it with Set
+/// up now, what comes next: no note says it again. While the run still tries it, the note says
+/// that aterm does, which neither the row nor the headline says.
 #[test]
 fn a_failed_step_keeps_its_reason_on_its_row() {
     let status = status_of("failed");
@@ -6825,16 +6407,17 @@ fn a_failed_step_keeps_its_reason_on_its_row() {
     let row = app.reviewed_row(Subject::Setting(Setting::Repositories));
     assert_eq!(row.chip, Some(Chip::Failed));
     assert_eq!(row.note.as_deref(), Some(GITHUB_UNREACHED));
+    assert!(app.notes(&app.reviewed_plan()).is_empty());
     assert_eq!(
-        app.notes(&app.reviewed_plan()),
-        [format!("GitHub repositories failed. {SET_UP_NOW_NOTE}")]
+        (app.headline().text.as_str(), app.headline().start),
+        ("1 step failed: GitHub repositories", true)
     );
     // While the run still tries it again, the row keeps the same reason under its waiting chip.
     let mut retrying = status;
     retrying.retrying = true;
     app.publish(retrying);
     let row = app.reviewed_row(Subject::Setting(Setting::Repositories));
-    assert_eq!(row.chip, Some(Chip::WillChange { busy: false }));
+    assert_eq!(row.chip, Some(Chip::Waiting));
     assert_eq!(row.note.as_deref(), Some(GITHUB_UNREACHED));
     assert_eq!(
         app.notes(&app.reviewed_plan()),
@@ -6845,7 +6428,8 @@ fn a_failed_step_keeps_its_reason_on_its_row() {
 }
 
 /// While a newer aterm's setup is in force (§3.2) each row keeps its reading's own note, and the
-/// vault's fields take no words, as its Join takes no press: this aterm joins nothing.
+/// vault reads as it stands: its address in plain words, with no field, no hint and no Join,
+/// since this aterm joins nothing.
 #[test]
 fn a_newer_aterms_page_keeps_row_notes_and_reads_the_vault_as_it_stands() {
     let mut app = SystemStateApp::opened();
@@ -6870,20 +6454,25 @@ fn a_newer_aterms_page_keeps_row_notes_and_reads_the_vault_as_it_stands() {
         Some(aterm_types::macos_setup::LOCAL_NETWORK_UNTOLD),
         "{heard:?}"
     );
+    let address = compiled
+        .semantic(&UiKey::new("system-state/vault/address"))
+        .unwrap_or_else(|| panic!("the address is shown in words: {heard:?}"));
+    assert_eq!(address.label, app.vault_address_as_it_stands());
+    assert!(address.state.is_none(), "words, not a control");
     for key in [
         "system-state/url",
         "system-state/password",
         "system-state/vault/join",
     ] {
-        let state = compiled
-            .semantic(&UiKey::new(key))
-            .unwrap_or_else(|| panic!("{key} is shown"))
-            .state;
         assert!(
-            state.is_some_and(|state| !state.enabled),
-            "{key} takes nothing"
+            compiled.semantic(&UiKey::new(key)).is_none(),
+            "{key} is not drawn: {heard:?}"
         );
     }
+    assert!(
+        !heard.iter().any(|label| label.contains("Password")),
+        "no password and no hint: {heard:?}"
+    );
     let before = app.url.value().to_owned();
     let mut view = SystemStateViewState::default();
     app.act(
@@ -6892,4 +6481,752 @@ fn a_newer_aterms_page_keeps_row_notes_and_reads_the_vault_as_it_stands() {
         Some(SemanticInput::Text("http://elsewhere.local".to_owned())),
     );
     assert_eq!(app.url.value(), before, "the address stays as it stands");
+}
+
+/// A stage the run's ledger parked (aterm stopped in it twice, or it took over an hour;
+/// init-on-by-default design §6.5) reaches the page as its stage row (`waiting`, in the ledger's
+/// words): the rows it changes say so, calm, with no Will change chip, and the headline names the
+/// step waiting. A stage that took over an hour is checked again by the page itself, after its
+/// wait; one aterm stopped in twice waits for the person's Check again, since trying it by itself
+/// could stop aterm again. Check again reads the rows again and lifts the park. Nothing signals:
+/// no diamond, no menu line.
+#[test]
+fn a_parked_stage_says_so_on_the_page() {
+    let repositories = Subject::Setting(Setting::Repositories);
+    for (words, by_itself) in [
+        (
+            format!(
+                "Stopped twice while cloning GitHub repositories; {}",
+                StageRow::HELD_TAIL
+            ),
+            false,
+        ),
+        (
+            format!(
+                "Took over an hour cloning GitHub repositories; {}",
+                StageRow::PARKED_TAIL
+            ),
+            true,
+        ),
+    ] {
+        let mut status = status_of("parked");
+        status.rows[0].detail.clone_from(&words);
+        let plan = status.plan.clone().unwrap();
+        let row = row_view(repositories, &status, plan.selection);
+        assert_eq!(row.note.as_deref(), Some(words.as_str()));
+        assert_eq!(row.chip, Some(Chip::Waiting), "{words}");
+        assert!(row.label.contains("waiting"), "{}", row.label);
+        let all = rows(&status, plan.selection);
+        let line = headline(&status, &all, Some(&plan));
+        assert_eq!(line.text, "1 step waiting: GitHub repositories");
+        assert!(line.check && !line.start && line.show.is_none(), "{line:?}");
+        assert!(status.notes(&plan).is_empty(), "the row says it, once");
+        assert!(menu(&status).is_none());
+        let mut app = SystemStateApp::new(plan.clone());
+        app.publish(status.clone());
+        assert!(!app.needs_attention());
+        let now = aterm_time::Instant::now();
+        app.tick_at(now);
+        app.tick_at(now + by_itself_after(1) + Duration::from_secs(1));
+        let checked = matches!(
+            app.actions.pop_front(),
+            Some(SystemStateAction::Check(checked)) if checked == plan
+        );
+        assert_eq!(
+            checked, by_itself,
+            "the page checks again by itself: {words}"
+        );
+        // Check again reads the rows again whenever a person presses it.
+        let mut app = SystemStateApp::new(plan.clone());
+        app.publish(status.clone());
+        act(&mut app, "system-state/check");
+        assert!(
+            matches!(
+                app.actions.pop_front(),
+                Some(SystemStateAction::Check(checked)) if checked == plan
+            ),
+            "Check again reads the rows again"
+        );
+    }
+    // CONTROL: the same row with no parked stage row is a change Set up now makes.
+    let mut status = status_of("parked");
+    status.rows.clear();
+    let plan = status.plan.clone().unwrap();
+    let line = headline(&status, &rows(&status, plan.selection), Some(&plan));
+    assert!(!line.check && line.start, "{line:?}");
+}
+
+/// A stage that has run past the hour in the aterm still running it (init-on-by-default design
+/// §6.5) reaches the page as a `running` stage row in the ledger's words: the rows it changes say
+/// so, calm, and nothing offers Check again, which could change nothing while that aterm runs it;
+/// it ends by itself or when aterm quits. Before, it read as parked with Check again, which
+/// lifted the park and tried nothing.
+#[test]
+fn a_stage_still_running_past_the_hour_says_so_with_no_check_again() {
+    let repositories = Subject::Setting(Setting::Repositories);
+    let words = format!(
+        "Still cloning GitHub repositories after more than an hour; {}",
+        StageRow::STILL_RUNNING_TAIL
+    );
+    let mut status = status_of("parked");
+    status.rows[0].status = "running".into();
+    status.rows[0].detail.clone_from(&words);
+    let plan = status.plan.clone().unwrap();
+    let row = row_view(repositories, &status, plan.selection);
+    assert_eq!(row.note.as_deref(), Some(words.as_str()));
+    assert_eq!(row.chip, Some(Chip::Waiting));
+    let line = headline(&status, &rows(&status, plan.selection), Some(&plan));
+    assert!(!line.check, "no Check again: {line:?}");
+    assert!(menu(&status).is_none(), "nothing signals");
+    // CONTROL: the same stage once its run has ended is parked, with Check again.
+    status.rows[0].status = "waiting".into();
+    status.rows[0].detail = format!(
+        "Took over an hour cloning GitHub repositories; {}",
+        StageRow::PARKED_TAIL
+    );
+    let line = headline(&status, &rows(&status, plan.selection), Some(&plan));
+    assert!(line.check, "{line:?}");
+}
+
+/// A stage resumed after aterm stopped in it says so on the rows it changes while it goes, in
+/// the ledger's words.
+#[test]
+fn a_resumed_stage_says_so_on_the_page() {
+    let status = status_of("resumed");
+    let plan = status.plan.clone().unwrap();
+    let dock = row_view(Subject::Setting(Setting::Dock), &status, plan.selection);
+    assert_eq!(dock.note.as_deref(), Some(StageRow::RESUMING));
+    assert_eq!(dock.chip, Some(Chip::WillChange { busy: true }));
+    // A row of the stage already in place keeps its check, and a row of another stage says
+    // nothing of it.
+    let caps = row_view(Subject::Setting(Setting::CapsLock), &status, plan.selection);
+    assert_eq!((caps.chip, caps.note), (Some(Chip::InPlace), None));
+    let spotlight = row_view(
+        Subject::Setting(Setting::Spotlight),
+        &status,
+        plan.selection,
+    );
+    assert_eq!(spotlight.note, None);
+    // CONTROL: a running stage row with no words of its own adds none.
+    let mut plain = status.clone();
+    plain.rows[0].detail.clear();
+    assert_eq!(
+        row_view(Subject::Setting(Setting::Dock), &plain, plan.selection).note,
+        None
+    );
+}
+
+/// A step aterm tries again by itself waits, calm (§3.5): its chip reads `Waiting`, the word
+/// VoiceOver hears for it, never `Will change`, and no change a press makes counts it.
+#[test]
+fn a_step_aterm_retries_reads_waiting_as_voiceover_hears_it() {
+    let mut step = status_of("named-result-failed");
+    step.retrying = true;
+    let plan = step.plan.clone().unwrap();
+    let row = row_view(
+        Subject::Setting(Setting::Repositories),
+        &step,
+        plan.selection,
+    );
+    assert_eq!(row.chip, Some(Chip::Waiting));
+    assert!(
+        row.label
+            .ends_with(&format!(", {}", Chip::Waiting.spoken()))
+            || row
+                .label
+                .contains(&format!(", {} ", Chip::Waiting.spoken())),
+        "{}",
+        row.label
+    );
+    assert!(!row.to_change());
+    // A row that waits on something its note names reads `Waiting` the same way.
+    let vault = status_of("vault");
+    let repositories = row_view(
+        Subject::Setting(Setting::Repositories),
+        &vault,
+        plan.selection,
+    );
+    assert_eq!(repositories.chip, Some(Chip::Waiting));
+    assert!(
+        repositories.label.contains("waiting"),
+        "{}",
+        repositories.label
+    );
+}
+
+/// A vault try held after two tries waits, calm, for this Mac's network or vault to change
+/// (§3.5): its row says why and what comes next, the headline counts it waiting with no Set up
+/// now, and neither the diamond nor the menu line says it failed.
+#[test]
+fn a_vault_try_held_after_two_waits_calmly() {
+    let status = status_of("vault-held");
+    let plan = status.plan.clone().unwrap();
+    let secrets = row_view(Subject::Setting(Setting::Secrets), &status, plan.selection);
+    assert_eq!(secrets.chip, Some(Chip::Waiting));
+    assert_eq!(secrets.note.as_deref(), Some(TRIED_TWICE));
+    assert!(!TRIED_TWICE.contains("Set up now"));
+    let line = headline(&status, &rows(&status, plan.selection), Some(&plan));
+    assert_eq!(
+        line.text,
+        "2 steps waiting: Secrets vault, GitHub repositories"
+    );
+    assert!(!line.start);
+    assert!(status.notes(&plan).is_empty(), "{:?}", status.notes(&plan));
+    assert!(menu(&status).is_none());
+    let mut app = SystemStateApp::new(plan);
+    app.publish(status);
+    assert!(!app.needs_attention());
+}
+
+/// A note says every line of itself (§3.6): a narrow page wraps it, never cutting it short.
+#[test]
+fn a_note_is_never_cut_mid_sentence() {
+    let status = status_of("restore-at-login");
+    let plan = status.plan.clone().unwrap();
+    let note = status.notes(&plan).remove(0);
+    let mut app = SystemStateApp::new(plan);
+    app.publish(status);
+    let compiled = compile(&app, &SystemStateViewState::default(), 220.0, 4000.0);
+    let lines: Vec<String> = compiled
+        .paint
+        .iter()
+        .filter(|node| node.key.as_str().starts_with("system-state/note/0/line-"))
+        .filter_map(|node| match &node.content {
+            UiContent::Text(text) => Some(text.text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(lines.len() > 3, "a narrow page wraps it: {lines:?}");
+    assert_eq!(lines.join(" "), note);
+}
+
+/// A step that failed, whose row keeps its reason, is said by the row and the headline alone
+/// (§3.6): no page note repeats it. A row a Check could not confirm likewise.
+#[test]
+fn a_failed_or_unconfirmed_row_is_said_once() {
+    for scenario in ["failed", "check-unconfirmed"] {
+        let status = status_of(scenario);
+        let plan = status.plan.clone().unwrap();
+        let all = rows(&status, plan.selection);
+        let line = headline(&status, &all, Some(&plan));
+        let row = row_view(
+            Subject::Setting(Setting::Repositories),
+            &status,
+            plan.selection,
+        );
+        assert!(
+            line.text.contains("GitHub repositories"),
+            "{scenario}: {line:?}"
+        );
+        assert!(row.note.is_some(), "{scenario}: the row keeps its reason");
+        assert!(
+            status.notes(&plan).is_empty(),
+            "{scenario}: {:?}",
+            status.notes(&plan)
+        );
+    }
+    // CONTROL: a failed step with no reason on its row still says what comes next, in its card
+    // item.
+    let named = status_of("named-result-failed");
+    let plan = named.plan.clone().unwrap();
+    assert!(named.notes(&plan).is_empty());
+    let mut app = SystemStateApp::new(plan);
+    app.publish(named);
+    let card = lines::card_items(&app, &app.reviewed_rows());
+    assert!(
+        card.iter()
+            .any(|item| item.title == "GitHub repositories failed"
+                && item.reason.as_deref() == Some(lines::TRIES_BY_ITSELF)),
+        "{card:?}"
+    );
+}
+
+/// The ALab profile aterm adds by itself is said in one note (§3.5) while the run it starts goes:
+/// the widen applies at once, with no offer of its own to say it again.
+#[test]
+fn a_widened_profile_says_one_alab_note() {
+    let mut app = SystemStateApp::new(permissions_only());
+    let mut status = status_of("widened");
+    status.widened = true;
+    status.busy = true;
+    status.running = vec![Setting::Dock];
+    app.publish(status);
+    let notes = app.notes(&app.reviewed_plan());
+    assert_eq!(
+        notes.iter().filter(|note| *note == WIDENED_NOTE).count(),
+        1,
+        "{notes:?}"
+    );
+}
+
+/// The Command Line Tools row says what it needs in full (§3.3): its note names the tools, and
+/// its button shows its whole label, on one line where the card has room for it and wrapped
+/// where it has not, VoiceOver hearing the whole label either way.
+#[test]
+fn the_tools_row_names_them_and_its_button_says_it_whole_where_it_fits() {
+    let status = status_of("clt-missing");
+    let plan = status.plan.clone().unwrap();
+    let row = row_view(
+        Subject::Setting(Setting::Repositories),
+        &status,
+        plan.selection,
+    );
+    assert_eq!(row.note.as_deref(), Some(TOOLS_NEEDED_NOTE));
+    assert!(TOOLS_NEEDED_NOTE.contains("Command Line Tools"));
+    let mut app = SystemStateApp::new(plan);
+    app.publish(status);
+    let face = |width: f32| {
+        let compiled = compile(&app, &SystemStateViewState::default(), width, 4000.0);
+        let node = compiled
+            .paint
+            .iter()
+            .find(|node| node.key.as_str() == INSTALL_TOOLS)
+            .expect("Install… is painted");
+        let UiContent::Button(control) = &node.content else {
+            panic!("Install… is a button");
+        };
+        assert_eq!(label(&compiled, INSTALL_TOOLS), INSTALL_TOOLS_LABEL);
+        control
+            .spec
+            .visual_label
+            .clone()
+            .unwrap_or_else(|| control.spec.label.clone())
+    };
+    assert_eq!(face(999.0), INSTALL_TOOLS_LABEL, "wide");
+    // Narrow, the card's button wraps its whole face rather than cut it.
+    assert_eq!(
+        face(240.0).replace('\n', " "),
+        INSTALL_TOOLS_LABEL,
+        "narrow"
+    );
+}
+
+/// The Command Line Tools tab a restore brought back is named as its title and the headline
+/// name it.
+#[test]
+fn a_restored_tools_tab_is_named_as_its_title_names_it() {
+    assert!(TOOLS_RECOVERED_NOTE.starts_with("Command Line Tools tab"));
+    assert!(!TOOLS_RECOVERED_NOTE.contains("Installer"));
+    let status = status_of("clt-recovered");
+    let plan = status.plan.clone().unwrap();
+    let row = row_view(
+        Subject::Setting(Setting::Repositories),
+        &status,
+        plan.selection,
+    );
+    assert_eq!(row.note.as_deref(), Some(TOOLS_RECOVERED_NOTE));
+}
+
+/// The Secrets vault row in fluid-swarm §3.6's words: while this Mac asks ALab's members, it
+/// reads `Asking ALab` and describes automatic retries; once a member let it
+/// in, `Allowed`, calm, with nothing for the person to do.
+#[test]
+fn the_vault_row_asks_alab_in_the_pages_words() {
+    let secrets = Subject::Setting(Setting::Secrets);
+    let asking = status_of("vault-asking");
+    let plan = asking.plan.clone().unwrap();
+    let row = row_view(secrets, &asking, plan.selection);
+    assert_eq!(row.chip, Some(Chip::Waiting));
+    assert_eq!(
+        row.note.as_deref(),
+        Some(aterm_types::macos_setup::VAULT_ASKING_NOTE)
+    );
+    assert!(row.note.unwrap().contains("automatically"));
+    assert!(matches!(
+        &row.value,
+        RowValue::Change { now, .. } if now == aterm_types::macos_setup::VAULT_ASKING
+    ));
+    let allowed = status_of("vault-allowed");
+    let row = row_view(secrets, &allowed, plan.selection);
+    assert_eq!(row.chip, Some(Chip::Waiting));
+    assert!(matches!(
+        &row.value,
+        RowValue::Change { now, .. } if now == aterm_types::macos_setup::VAULT_ALLOWED
+    ));
+    assert!(menu(&allowed).is_none());
+    let mut app = SystemStateApp::new(plan);
+    app.publish(allowed);
+    assert!(!app.needs_attention());
+}
+
+#[test]
+fn automatic_admission_never_renders_a_phrase_prompt() {
+    for state in ["vault-asking", "vault-asking-long", "vault-allowed"] {
+        let status = status_of(state);
+        let mut app = SystemStateApp::new(status.plan.clone().unwrap());
+        app.publish(status);
+        let view = SystemStateViewState::default();
+        let compiled = compile(&app, &view, 999.0, 4000.0);
+        assert!(
+            compiled.semantic(&UiKey::new(PHRASE_FIELD)).is_none(),
+            "{state}"
+        );
+        assert!(
+            compiled.semantic(&UiKey::new(PHRASE_JOIN)).is_none(),
+            "{state}"
+        );
+    }
+}
+
+/// Each thing a phrase can come to has its own words under the field. One that reached no Mac in
+/// ALab was asked nothing, so its words stay for another Join and the line says calmly what
+/// helps (the Mac that showed it awake and on this network); one refused is spent, the field
+/// empties and the line sends the person back to press Allow; one that let this Mac in empties
+/// the field too.
+///
+/// NEGATIVE CONTROL: have `phrase_finished` wipe the field for `NotReached` too: the words the
+/// person still holds good are gone.
+#[test]
+fn each_phrase_outcome_has_its_own_words_and_only_a_spent_phrase_empties_the_field() {
+    let asking = status_of("vault-asking");
+    let mut app = SystemStateApp::new(asking.plan.clone().unwrap());
+    app.publish(asking);
+    let mut view = SystemStateViewState::default();
+    let typed = |app: &SystemStateApp| app.field_projection(PHRASE_FIELD).unwrap().text;
+    let try_with =
+        |app: &mut SystemStateApp, view: &mut SystemStateViewState, outcome: PhraseOutcome| {
+            app.act(
+                view,
+                PHRASE_FIELD,
+                Some(SemanticInput::Text("river stone lamp".into())),
+            );
+            app.act(view, PHRASE_JOIN, None);
+            assert!(app.phrase_finished(app.phrase_try().unwrap(), Some(outcome)));
+        };
+
+    try_with(&mut app, &mut view, PhraseOutcome::NotReached);
+    assert_eq!(app.phrase_help(), PHRASE_NOT_REACHED);
+    assert!(PHRASE_NOT_REACHED.contains("still good"));
+    assert!(PHRASE_NOT_REACHED.contains("awake and on this network"));
+    assert_eq!(typed(&app), "river stone lamp", "the words stay");
+    app.act(&mut view, PHRASE_JOIN, None);
+    let joins = app
+        .actions
+        .drain(..)
+        .filter(|action| matches!(action, SystemStateAction::JoinPhrase(..)))
+        .count();
+    assert_eq!(joins, 2, "the same words go again with one press");
+    assert!(app.phrase_finished(app.phrase_try().unwrap(), Some(PhraseOutcome::NotReached)));
+
+    try_with(&mut app, &mut view, PhraseOutcome::Refused);
+    assert_eq!(app.phrase_help(), PHRASE_REFUSED);
+    assert_eq!(typed(&app), "", "a refused phrase is spent");
+
+    try_with(&mut app, &mut view, PhraseOutcome::Joined);
+    assert_eq!(app.phrase_help(), PHRASE_HELP);
+    assert_eq!(typed(&app), "", "a phrase that let this Mac in is spent");
+
+    // A try whose worker ended before it said what the phrase came to may not have sent it: the
+    // line says plainly that the try stopped, and the words stay for Join to try again.
+    try_with(&mut app, &mut view, PhraseOutcome::Stopped);
+    assert_eq!(app.phrase_help(), PHRASE_STOPPED);
+    assert!(PHRASE_STOPPED.contains("press Join to try again"));
+    assert_eq!(typed(&app), "river stone lamp", "the words stay");
+
+    // A try that reached no Mac while this Mac reads macOS's Local Network switch for aterm off
+    // names that switch and where it is, not the other Mac.
+    let mut off = status_of("vault-asking");
+    let lan = off
+        .observed
+        .iter_mut()
+        .find(|row| row.subject == Subject::Access(Access::LocalNetwork))
+        .expect("the fixture reads Local Network");
+    lan.standing = Standing::NeedsYou;
+    lan.now = Some("Off".into());
+    app.publish(off);
+    try_with(&mut app, &mut view, PhraseOutcome::NotReached);
+    assert_eq!(app.phrase_help(), PHRASE_LOCAL_NETWORK_OFF);
+    assert!(PHRASE_LOCAL_NETWORK_OFF.contains("Privacy & Security > Local Network"));
+    assert!(
+        !PHRASE_LOCAL_NETWORK_OFF.contains("awake"),
+        "not the other Mac"
+    );
+    assert_eq!(typed(&app), "river stone lamp", "the words stay");
+}
+
+/// GitHub refusing the vault's token says who renews it (only a vault admin can) and the exact
+/// line they run, which the row's Copy Command puts on the clipboard (§3.6).
+#[test]
+fn a_refused_github_token_says_who_renews_it_and_copies_the_line() {
+    let repositories = Subject::Setting(Setting::Repositories);
+    let status = status_of("github-sign-in");
+    let plan = status.plan.clone().unwrap();
+    let row = row_view(repositories, &status, plan.selection);
+    let note = row.note.clone().unwrap();
+    assert!(note.contains("only a vault admin"), "{note}");
+    assert!(
+        note.ends_with(aterm_types::macos_setup::GITHUB_TOKEN_COMMAND),
+        "{note}"
+    );
+    assert!(row.copy_command);
+    let mut app = SystemStateApp::new(plan);
+    app.publish(status);
+    let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 4000.0);
+    assert_eq!(label(&compiled, COPY_TOKEN_COMMAND), "Copy Command");
+    act(&mut app, COPY_TOKEN_COMMAND);
+    assert!(matches!(
+        app.actions.pop_front(),
+        Some(SystemStateAction::CopyCommand { command, .. })
+            if command == aterm_types::macos_setup::GITHUB_TOKEN_COMMAND
+    ));
+    // CONTROL: a row that needs a person for anything else has no Copy Command.
+    let tools = status_of("clt-missing");
+    let tools_plan = tools.plan.clone().unwrap();
+    assert!(!row_view(repositories, &tools, tools_plan.selection).copy_command);
+}
+
+/// A setting the person changed after aterm set it is theirs (init-on-by-default design §6.6):
+/// the digest's entry says how to have aterm set it again, never to press Set up now, which
+/// keeps their change.
+#[test]
+fn the_changed_since_entry_names_no_set_up_now() {
+    let entry = format!("{:?}", setup_changed_since_entry("Dock"));
+    assert!(!entry.contains("Set up now"), "{entry}");
+    assert!(entry.contains(CHANGED_SINCE_STEP), "{entry}");
+    let status = status_of("changed-by-you");
+    let plan = status.plan.clone().unwrap();
+    let dock = row_view(Subject::Setting(Setting::Dock), &status, plan.selection);
+    assert_eq!(
+        (dock.chip, dock.note.as_deref()),
+        (None, Some(aterm_types::macos_setup::CHANGED_BY_YOU))
+    );
+}
+
+/// Keyboard focus on a card item that leaves the card (the walk moved on to its next page) moves
+/// to the card's first button, its default action, never staying on a control that is gone.
+#[test]
+fn focus_on_a_card_item_that_leaves_the_card_moves_to_its_first_button() {
+    let walk = status_of("walk");
+    let (mut runtime, instance, view) = runtime_with_app(page_reading(&walk));
+    let first = {
+        let Some(NativeApp::SystemState(app)) = runtime.app(instance) else {
+            panic!("the page");
+        };
+        app.card_buttons()
+    };
+    let open = first
+        .first()
+        .cloned()
+        .expect("the walk's page has its button");
+    let Some(AppViewState::SystemState(state)) = runtime.view_state_mut(view) else {
+        panic!("the page's view");
+    };
+    state.common.last_focus = Some(UiKey::new(open.clone()));
+    // Full Disk Access granted: the walk moves to its next page.
+    let mut next = walk.clone();
+    for row in &mut next.observed {
+        if row.subject == Subject::Access(Access::FullDiskAccess) {
+            row.standing = Standing::InPlace;
+            row.now = Some("On".to_owned());
+        }
+    }
+    if let Some(page) = next.walk.as_mut() {
+        page.access = Access::DeveloperTools;
+        page.at = 2;
+    }
+    assert!(runtime.publish_system_state(next));
+    let Some(AppViewState::SystemState(state)) = runtime.view_state(view) else {
+        panic!("the page's view");
+    };
+    let focus = state.common.last_focus.clone();
+    assert_ne!(
+        focus,
+        Some(UiKey::new(open)),
+        "focus stays on a button that is gone"
+    );
+    assert!(focus.is_some(), "focus goes to the card's next default");
+}
+
+/// The hero for `app`, as the page draws it.
+fn hero_of(app: &SystemStateApp) -> lines::Hero {
+    let rows = page::page_rows(app);
+    let card = lines::card_items(app, &rows);
+    lines::hero(app, &rows, &card)
+}
+
+/// The plan an automatic Apply begins, if `action` is one.
+fn automatic_plan(action: Option<SystemStateAction>) -> Option<Plan> {
+    match action {
+        Some(SystemStateAction::Apply(answer, Admission::Automatic)) => match answer.decision {
+            crate::workstation_setup::WorkstationSetupDecision::Begin(plan) => Some(plan),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Revision 4: changes to make that nothing holds start a run by themselves, with no press, and
+/// a run that leaves them undone starts again after 1, 2, 4, 8, then every 15 minutes.
+#[test]
+fn changes_to_make_start_by_themselves_and_try_again_a_little_later_each_time() {
+    assert_eq!(
+        [0, 1, 2, 3, 4, 5, 9].map(|tries| by_itself_after(tries).as_secs() / 60),
+        [0, 1, 2, 4, 8, 15, 15]
+    );
+    let status = to_change();
+    let mut app = page_reading(&status);
+    assert!(
+        app.starts_by_itself(),
+        "changes to make, nothing holding them"
+    );
+    let hero = hero_of(&app);
+    assert_eq!(
+        (hero.headline.as_str(), hero.sub.as_str(), hero.start),
+        (lines::SETTING_UP, lines::STARTING, false),
+        "the page says it sets up, never a press it waits for"
+    );
+    let now = aterm_time::Instant::now();
+    let mut at = now;
+    for tries in 1..=3 {
+        app.tick_at(at);
+        let plan = automatic_plan(app.actions.pop_front())
+            .unwrap_or_else(|| panic!("try {tries} starts by itself"));
+        assert!(app.actions.is_empty());
+        app.apply_accepted(plan);
+        // The run ended with the changes still to make.
+        app.publish(status.clone());
+        assert!(app.retry_waits() && !app.starts_by_itself());
+        let next = at + by_itself_after(tries);
+        assert_eq!(app.next_by_itself(), Some(next), "try {tries}");
+        app.tick_at(next - Duration::from_secs(1));
+        assert!(app.actions.is_empty(), "try {} waits its turn", tries + 1);
+        at = next;
+    }
+    // Once nothing is left to change, the count starts again.
+    let mut done = status_of("set-up");
+    done.plan.clone_from(&status.plan);
+    app.publish(done);
+    app.tick_at(at);
+    assert!(app.actions.is_empty() && app.next_by_itself().is_none());
+}
+
+/// A hold (a person's Stop, an older aterm's Cancel) is the one time changes to make wait for a
+/// press: the page starts nothing, says setup is stopped, and offers Set up now in its footer.
+#[test]
+fn a_hold_keeps_changes_to_make_for_set_up_now_in_the_footer() {
+    let mut status = to_change();
+    status.run = Some(InitialSetupRunPolicy {
+        revision: 1,
+        allowed: false,
+    });
+    let mut app = page_reading(&status);
+    assert!(app.held() && !app.starts_by_itself());
+    app.tick_at(aterm_time::Instant::now());
+    assert!(app.actions.is_empty(), "a hold starts nothing by itself");
+    let hero = hero_of(&app);
+    assert_eq!(hero.headline, lines::STOPPED);
+    assert!(hero.start, "Set up now goes on with them");
+    let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 740.0);
+    assert_eq!(
+        label(&compiled, "system-state/headline/start"),
+        "Set up now"
+    );
+    act(&mut app, "system-state/headline/start");
+    assert!(matches!(
+        app.actions.pop_front(),
+        Some(SystemStateAction::Apply(..))
+    ));
+    // CONTROL: with nothing holding them the footer offers no Set up now.
+    let app = page_reading(&to_change());
+    let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 740.0);
+    assert!(
+        compiled
+            .semantic(&UiKey::new("system-state/headline/start"))
+            .is_none()
+    );
+}
+
+/// A Check that failed as a whole is read again by the page itself after a minute, then after
+/// longer waits: no Check again for the person to press.
+#[test]
+fn a_failed_check_is_read_again_by_itself() {
+    let status = status_of("check-failed");
+    let mut app = page_reading(&status);
+    let now = aterm_time::Instant::now();
+    app.tick_at(now);
+    assert!(
+        !app.actions
+            .iter()
+            .any(|action| matches!(action, SystemStateAction::Check(_))),
+        "no Check before its wait"
+    );
+    app.actions.clear();
+    assert_eq!(app.next_by_itself(), Some(now + by_itself_after(1)));
+    app.tick_at(now + by_itself_after(1));
+    assert!(
+        app.actions
+            .iter()
+            .any(|action| matches!(action, SystemStateAction::Check(_))),
+        "the page checks again by itself: {:?}",
+        app.actions
+    );
+}
+
+/// The footer waits for the first readings, shows no Check again while a check runs, and shows
+/// Restore only once aterm saved preferences to put back.
+#[test]
+fn the_footer_offers_only_what_can_be_done_now() {
+    let has = |status: &SetupStatus, key: &str| {
+        let app = page_reading(status);
+        compile(&app, &SystemStateViewState::default(), 999.0, 740.0)
+            .semantic(&UiKey::new(key))
+            .is_some()
+    };
+    let checking = status_of("checking");
+    assert!(!has(&checking, "system-state/check") && !has(&checking, "system-state/restore"));
+    let set_up = status_of("set-up");
+    assert!(set_up.restorable);
+    assert!(has(&set_up, "system-state/check") && has(&set_up, "system-state/restore"));
+    let unsaved = SetupStatus {
+        restorable: false,
+        ..set_up.clone()
+    };
+    assert!(
+        !has(&unsaved, "system-state/restore"),
+        "nothing to put back"
+    );
+    let reading = SetupStatus {
+        busy: true,
+        operation: Some(SetupOperation::Check),
+        ..set_up
+    };
+    assert!(!has(&reading, "system-state/check"), "a check runs already");
+}
+
+/// Every "needs you" has its card item: a Mac whose Command Line Tools only an administrator
+/// installs says so in the card.
+#[test]
+fn the_tools_an_administrator_installs_are_in_the_card() {
+    let app = page_reading(&status_of("clt-not-admin"));
+    let (_, card) = lines_of(&app);
+    let item = card
+        .iter()
+        .find(|item| item.subject == Some(Subject::Setting(Setting::Repositories)))
+        .expect("the tools' step is in the card");
+    assert_eq!(item.mark, Mark::NeedsYou);
+    assert_eq!(
+        item.title,
+        "Ask an administrator of this Mac to install Apple's Command Line Tools"
+    );
+}
+
+/// A line says what is true now, and where setup changes it, now → wanted (§4.3).
+#[test]
+fn a_line_says_what_is_true_now_and_now_to_wanted() {
+    let app = page_reading(&status_of("set-up"));
+    let mac = line_in(&app, Setting::CapsLock);
+    assert_eq!(mac.mark, Mark::Done);
+    assert!(mac.phrase.starts_with("Caps Lock is "), "{}", mac.phrase);
+    let secrets = line_in(&app, Setting::Secrets);
+    assert_eq!(secrets.phrase, "Joined · in sync");
+    let permissions = line_in(&app, Setting::Permissions);
+    assert_eq!(permissions.phrase, "Granted");
+    let app = page_reading(&status_of("mixed"));
+    let (lines, _) = lines_of(&app);
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.mark == Mark::Pending && line.phrase.contains(" → ")),
+        "{lines:#?}"
+    );
 }

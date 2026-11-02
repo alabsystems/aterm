@@ -129,18 +129,20 @@ pub fn replans_everything(path: &str) -> bool {
     REPLANNING_PATHS.contains(&path)
 }
 
-/// Repo-relative files or directories outside crates that specific members test.
-pub const TESTED_BY: [(&str, &str); 2] = [
+/// Repo-relative files or directories outside crates that specific members test: install.sh's
+/// suites are aterm-update's `install_sh` and aterm-bootstrap-verify's (its Linux half, through
+/// the bootstrap verifier).
+pub const TESTED_BY: [(&str, &str); 3] = [
     ("tools/install.sh", "aterm-update"),
+    ("tools/install.sh", "aterm-bootstrap-verify"),
     ("publish/", "aterm-release"),
 ];
 
-/// Workspace member whose tests exercise `path` ([`TESTED_BY`]), if any.
-#[must_use]
-pub fn tested_by(path: &str) -> Option<&'static str> {
+/// Every workspace member whose tests exercise `path` ([`TESTED_BY`]), in its order.
+pub fn tested_by(path: &str) -> impl Iterator<Item = &'static str> + '_ {
     TESTED_BY
         .iter()
-        .find(|(file, _)| {
+        .filter(move |(file, _)| {
             file.strip_suffix('/')
                 .map_or(*file == path, |dir| path.starts_with(&format!("{dir}/")))
         })
@@ -394,7 +396,7 @@ pub fn select(
     cone.extend(
         paths
             .iter()
-            .filter_map(|p| tested_by(p))
+            .flat_map(|p| tested_by(p))
             .map(str::to_string)
             .filter(|n| names.contains(n)),
     );
@@ -831,6 +833,29 @@ pub fn parse_graph_entries(text: &str, root_prefix: &str) -> Vec<(String, String
         .collect()
 }
 
+fn tree_root_prefix(root: &Path) -> String {
+    let raw = root.display().to_string();
+    let plain = if cfg!(windows) {
+        raw.strip_prefix(r"\\?\").unwrap_or(&raw)
+    } else {
+        raw.as_str()
+    };
+    let mut prefix = plain.to_owned();
+    let sep = std::path::MAIN_SEPARATOR;
+    if !prefix.ends_with(['/', '\\']) {
+        prefix.push(sep);
+    }
+    prefix
+}
+
+fn normalize_manifest_dir(dir: String) -> String {
+    if cfg!(windows) {
+        dir.replace('\\', "/")
+    } else {
+        dir
+    }
+}
+
 fn read_members(root: &Path, tools: &Toolchain, path_env: &OsStr) -> Members {
     let Some(out) = targo_tree(
         root,
@@ -849,7 +874,7 @@ fn read_members(root: &Path, tools: &Toolchain, path_env: &OsStr) -> Members {
     ) else {
         return Members::default();
     };
-    let prefix = format!("{}/", root.display());
+    let prefix = tree_root_prefix(root);
     let shared = std::fs::read_to_string(root.join("Cargo.lock"))
         .map(|lock| lock_shared_names(&lock))
         .unwrap_or_default();
@@ -865,6 +890,7 @@ fn read_members(root: &Path, tools: &Toolchain, path_env: &OsStr) -> Members {
         parse_graph_entries(&out, &prefix)
             .into_iter()
             .map(|(name, dir)| {
+                let dir = normalize_manifest_dir(dir);
                 let at = root.join(&dir);
                 let has_lib = at.join("src/lib.rs").is_file()
                     || std::fs::read_to_string(at.join("Cargo.toml"))
@@ -934,10 +960,11 @@ fn read_path_packages(
         ],
     )?;
     let names = members.names();
-    let prefix = format!("{}/", root.display());
+    let prefix = tree_root_prefix(root);
     let mut found: Vec<(String, String)> = parse_graph_entries(&out, &prefix)
         .into_iter()
         .filter(|(name, _)| !names.contains(name))
+        .map(|(name, dir)| (name, normalize_manifest_dir(dir)))
         .collect();
     found.sort();
     found.dedup();
@@ -966,7 +993,7 @@ fn invert(root: &Path, targo: &Path, path_env: &OsStr, crate_name: &str) -> Opti
             "normal,build,dev",
         ],
     )?;
-    let prefix = format!("{}/", root.display());
+    let prefix = tree_root_prefix(root);
     Some(
         parse_graph_entries(&out, &prefix)
             .into_iter()
@@ -996,16 +1023,16 @@ fn manifests_near(root: &Path, paths: &[String]) -> Manifests {
 #[must_use]
 pub fn manifest_package_name(text: &str) -> Option<String> {
     let mut in_package = false;
-    for line in text.lines() {
+    for raw in text.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
         if line.starts_with('[') {
-            in_package = line.starts_with("[package]");
+            in_package = line == "[package]";
             continue;
         }
         if !in_package {
             continue;
         }
-        let t = line.trim_start();
-        let Some(rest) = t.strip_prefix("name") else {
+        let Some(rest) = line.strip_prefix("name") else {
             continue;
         };
         let rest = rest.trim_start();
@@ -1013,10 +1040,12 @@ pub fn manifest_package_name(text: &str) -> Option<String> {
             continue;
         };
         let rest = rest.trim_start();
-        let Some(rest) = rest.strip_prefix('"') else {
+        let Some(quote) = rest.chars().next().filter(|&c| c == '"' || c == '\'') else {
             continue;
         };
-        return rest.find('"').map(|end| rest[..end].to_string());
+        return rest[1..]
+            .find(quote)
+            .map(|end| rest[1..1 + end].to_string());
     }
     None
 }
@@ -1024,17 +1053,32 @@ pub fn manifest_package_name(text: &str) -> Option<String> {
 /// Whether a `Cargo.toml` text explicitly declares a `[lib]` target.
 #[must_use]
 pub fn declares_lib_target(manifest: &str) -> bool {
-    manifest.lines().any(|l| l.starts_with("[lib]"))
+    manifest
+        .lines()
+        .any(|l| l.split('#').next().unwrap_or("").trim() == "[lib]")
 }
 
 /// Whether workspace member `crates/<name>` has a library target.
 #[must_use]
 pub fn crate_dir_has_lib(root: &std::path::Path, name: &str) -> bool {
+    let name = crate::scope::spec_name(name).unwrap_or(name);
     let dir = root.join("crates").join(name);
-    match std::fs::read_to_string(dir.join("Cargo.toml")) {
-        Ok(manifest) => declares_lib_target(&manifest) || dir.join("src/lib.rs").is_file(),
-        Err(_) => true,
+    if let Ok(manifest) = std::fs::read_to_string(dir.join("Cargo.toml"))
+        && manifest_package_name(&manifest).is_none_or(|pkg| pkg == name)
+    {
+        return declares_lib_target(&manifest) || dir.join("src/lib.rs").is_file();
     }
+    if let Ok(entries) = std::fs::read_dir(root.join("crates")) {
+        for entry in entries.flatten() {
+            let member_dir = entry.path();
+            if let Ok(manifest) = std::fs::read_to_string(member_dir.join("Cargo.toml"))
+                && manifest_package_name(&manifest).as_deref() == Some(name)
+            {
+                return declares_lib_target(&manifest) || member_dir.join("src/lib.rs").is_file();
+            }
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -1621,6 +1665,25 @@ checksum = "aaa"
             &graph(edges),
         );
         assert_eq!(narrowed(&sel), (vec![], vec!["aterm-update".to_string()]));
+        let m = members(&["aterm-update", "aterm-bootstrap-verify", "aterm-gui"]);
+        let sel = select(
+            &paths(&["tools/install.sh"]),
+            &manifests(),
+            &m,
+            &no_packages,
+            &graph(edges),
+        );
+        assert_eq!(
+            narrowed(&sel),
+            (
+                vec![],
+                vec![
+                    "aterm-bootstrap-verify".to_string(),
+                    "aterm-update".to_string()
+                ]
+            ),
+            "both of install.sh's suites"
+        );
         let m = members(&["aterm-release"]);
         for file in [
             "publish/manifest.txt",
@@ -1635,11 +1698,14 @@ checksum = "aaa"
             );
         }
         assert_eq!(
-            tested_by("publishing/x"),
+            tested_by("publishing/x").next(),
             None,
             "a sibling sharing the prefix"
         );
-        assert_eq!(tested_by("tools/install.sh"), Some("aterm-update"));
+        assert_eq!(
+            tested_by("tools/install.sh").collect::<Vec<_>>(),
+            ["aterm-update", "aterm-bootstrap-verify"]
+        );
         let m = members(&["aterm-update", "aterm-gui"]);
         let sel = select(
             &paths(&["docs/PERF-REGRESSION-DEFENCE.md"]),
@@ -1955,5 +2021,16 @@ indexmap v2.14.0 (/repo/vendor/indexmap)
                 .as_deref(),
             Some("first")
         );
+        assert_eq!(
+            manifest_package_name(
+                "[package.metadata.docs]\nname = \"wrong\"\n[package] # comment\nname = 'single'\n"
+            )
+            .as_deref(),
+            Some("single")
+        );
+        assert!(declares_lib_target(
+            "  [lib] # comment\npath = \"src/lib.rs\"\n"
+        ));
+        assert!(!declares_lib_target("[lib-extra]\nname = \"x\"\n"));
     }
 }

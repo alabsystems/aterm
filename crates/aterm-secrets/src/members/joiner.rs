@@ -4,7 +4,7 @@
 //! The joining Mac's side of the `ask` exchange: read a member's greeting, ask, run the phrase
 //! a person typed, and say `done` to the other members it asked.
 
-use super::desk::{Answer, CHALLENGE_LEN, DONE_DOMAIN, ask_message, run_message};
+use super::desk::{Answer, CHALLENGE_LEN, DONE_DOMAIN, ask_message, prove_message, run_message};
 use super::wire::{self, Line};
 use super::{Bundle, bundle::MAX_BUNDLE};
 use crate::commons::binding::Request;
@@ -154,37 +154,6 @@ fn state(line: &str) -> Result<Answer> {
         .ok_or_else(|| Error::new("the member answered an unknown state"))
 }
 
-/// Obtain the credential bundle automatically on the LAN connection.
-/// No phrase is supplied by the caller or shown to a person.
-pub fn run_lan<S: Read + Write + ?Sized>(
-    stream: &mut S,
-    greeting: &Greeting,
-    joining: &Joining<'_>,
-) -> Result<Bundle> {
-    let request = joining.request(greeting)?;
-    let name = wire::unescape(&wire::escape(&joining.name))?;
-    let model = wire::unescape(&wire::escape(&joining.model))?;
-    let signature = sign(
-        joining.device,
-        &ask_message(&greeting.key, &joining.node, &name, &model, request.bytes()),
-    )?;
-    wire::write_line(
-        stream,
-        &format!(
-            "lan request={} node={} name={} model={} sig={}",
-            wire::b64(request.bytes()),
-            wire::hex(&joining.node),
-            wire::escape(&name),
-            wire::escape(&model),
-            wire::hex(signature.as_ref())
-        ),
-    )?;
-    let answer = wire::read_line(stream)?;
-    let words = wire::answer(&answer)?.text("exchange")?;
-    let phrase = Phrase::parse(&words)?;
-    run(stream, greeting, joining, &phrase)
-}
-
 /// Run `phrase` with the member `greeting` came from: a run line signed by this Mac's writer key
 /// over the greeting's challenge ([`run_message`]), CPace, then the possession challenge
 /// (answered only after the member's tag checked), then the bundle, opened under the run's
@@ -197,6 +166,23 @@ pub fn run<S: Read + Write + ?Sized>(
     greeting: &Greeting,
     joining: &Joining<'_>,
     phrase: &Phrase,
+) -> Result<Bundle> {
+    run_noting_send(stream, greeting, joining, phrase, &mut false)
+}
+
+/// [`run`], setting `sent` once the run line went to the member: from there the member holds
+/// the phrase's try, which a phrase is good for one of. An error with `sent` still false came
+/// before the member was asked anything of the phrase (this Mac could not build its request or
+/// sign the run, or the stream failed before the line went), so the same words go again.
+///
+/// # Errors
+/// As [`run`].
+pub fn run_noting_send<S: Read + Write + ?Sized>(
+    stream: &mut S,
+    greeting: &Greeting,
+    joining: &Joining<'_>,
+    phrase: &Phrase,
+    sent: &mut bool,
 ) -> Result<Bundle> {
     let request = joining.request(greeting)?;
     let ci = ChannelId::new(
@@ -227,6 +213,7 @@ pub fn run<S: Read + Write + ?Sized>(
             wire::hex(signature.as_ref())
         ),
     )?;
+    *sent = true;
     let line = wire::read_line(stream)?;
     let theirs = wire::answer(&line)?.hex::<{ crate::pake::NONCE_LEN }>("nonce")?;
     let (shared, ours) = joiner.on_nonce(&theirs)?;
@@ -245,15 +232,80 @@ pub fn run<S: Read + Write + ?Sized>(
         &format!("possess response={}", wire::b64(&response)),
     )?;
     let line = wire::read_line(stream)?;
-    let size: usize = wire::answer(&line)?
-        .get("bundle")?
-        .parse()
-        .ok()
+    let size: usize = Some(wire::answer(&line)?.get("bundle")?)
+        .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|s| s.parse().ok())
         .filter(|size| *size <= MAX_BUNDLE + 64)
         .ok_or_else(|| Error::new("the member's bundle size is out of bounds"))?;
     let mut sealed = vec![0u8; size];
     stream.read_exact(&mut sealed)?;
     let plain = session.open_bundle(&sealed)?;
+    let bundle = Bundle::decode(plain.as_slice())?;
+    if bundle.allowed.binding() != request.binding() || bundle.allowed.signer() != &greeting.key {
+        return Err(Error::new(
+            "the member's bundle allows another Mac or was signed by another member",
+        ));
+    }
+    Ok(bundle)
+}
+
+/// How a joining Mac signs with its fleet node key: `NodeIdentity::sign_record(PROVE_RECORD,
+/// message)` ([`super::desk::PROVE_RECORD`]).
+pub type SignNode<'a> = &'a (dyn Fn(&[u8]) -> [u8; 64] + Sync);
+
+/// Prove this Mac to the member that sent `greeting` (`prove`), with nobody's Allow: sign the
+/// greeting's fresh challenge with the request's writer key and the fleet node key
+/// (`sign_node`), answer the possession challenge, and open the bundle the member sealed to this
+/// Mac's age identity. `sent` turns true once the possession answer went: the member may have
+/// signed this Mac's records by then, so the caller tries no other member at once (two members
+/// removing one old seat at one cutoff would make a quorum `Remove`).
+///
+/// # Errors
+/// The member refused (why, from its `NO` line), the stream failed, or the bundle does not open,
+/// allows another Mac or was signed by another member.
+pub fn prove<S: Read + Write + ?Sized>(
+    stream: &mut S,
+    greeting: &Greeting,
+    joining: &Joining<'_>,
+    sign_node: SignNode<'_>,
+    sent: &mut bool,
+) -> Result<Bundle> {
+    let request = joining.request(greeting)?;
+    let message = prove_message(
+        &greeting.key,
+        &greeting.challenge,
+        &joining.node,
+        request.bytes(),
+    );
+    let signature = sign(joining.device, &message)?;
+    wire::write_line(
+        stream,
+        &format!(
+            "prove request={} node={} name={} sig={} nodesig={} reads=2",
+            wire::b64(request.bytes()),
+            wire::hex(&joining.node),
+            wire::escape(&joining.name),
+            wire::hex(signature.as_ref()),
+            wire::hex(&sign_node(&message))
+        ),
+    )?;
+    let line = wire::read_line(stream)?;
+    let challenge = wire::answer(&line)?.b64("challenge")?;
+    let response = joining.device.answer(&request, &challenge)?;
+    wire::write_line(
+        stream,
+        &format!("possess response={}", wire::b64(&response)),
+    )?;
+    *sent = true;
+    let line = wire::read_line(stream)?;
+    let size: usize = Some(wire::answer(&line)?.get("bundle")?)
+        .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|s| s.parse().ok())
+        .filter(|size| *size <= MAX_BUNDLE + 1024)
+        .ok_or_else(|| Error::new("the member's bundle size is out of bounds"))?;
+    let mut sealed = vec![0u8; size];
+    stream.read_exact(&mut sealed)?;
+    let plain = joining.device.open_sealed(&sealed)?;
     let bundle = Bundle::decode(plain.as_slice())?;
     if bundle.allowed.binding() != request.binding() || bundle.allowed.signer() != &greeting.key {
         return Err(Error::new(

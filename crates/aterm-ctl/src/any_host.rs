@@ -43,14 +43,13 @@ pub(crate) struct Row {
 
 impl Row {
     fn of(fields: &Fields) -> Self {
-        let number = |key: &str| fields.get(key).and_then(|v| v.parse().ok());
         Self {
             program: fields.get("pool").unwrap_or_default().to_owned(),
             label: fields.get("id").unwrap_or_default().to_owned(),
             enrolled: fields.get("enrolled") == Some("1"),
             condition: fields.get("condition").unwrap_or_default().to_owned(),
-            five_hour: number("pct5"),
-            seven_day: number("pct7"),
+            five_hour: fields.number("pct5"),
+            seven_day: fields.number("pct7"),
             walled_until_ms: survey::walled_until_ms(fields),
         }
     }
@@ -146,7 +145,7 @@ pub(crate) fn members_of(peers: &[PeerSurvey]) -> Vec<Member> {
                 host: header.get("host").map(str::to_owned),
                 addr: peer.addr.clone(),
                 drive: header.get("drive") == Some("1"),
-                at_ms: header.get("at_ms").and_then(|ms| ms.parse().ok()),
+                at_ms: header.number("at_ms"),
                 accounts: survey
                     .accounts
                     .as_ref()

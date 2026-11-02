@@ -16,10 +16,11 @@ use crate::harness::harness_mark;
 /// CRUISE'S CONTINUATION, the default `continue_text` (Autopilot Cruise).
 pub const CONTINUE_TEXT: &str = concat!(
     harness_mark!(),
-    " Autopilot is Cruise: keep going. Finish everything in hand, verify it and land it, then \
-     keep hunting for what would make the work more complete and more correct. Never stop to \
-     ask: put what only a person can give on a line starting NEEDS YOU: and carry on with \
-     everything else. A go-ahead for your own reversible work is never a NEEDS YOU item. ",
+    " Autopilot is Cruise: keep going. Finish, verify and land the work, then find the next \
+     improvement. Decide and record why for later AI review; defer unavailable work and \
+     advance what can proceed. ",
+    super::policy::go_ahead::never_a_need!(),
+    " ",
     super::policy::needs::restart_hint!(),
 );
 
@@ -230,7 +231,8 @@ pub struct PromptGrant {
     _sealed: (),
 }
 
-/// The proof the hung-call stuck fact may be typed at a break (`[harness] stuck_break_note`,
+/// The proof an `aterm:` fact (a call at no progress, programs held at macOS's program check)
+/// may be typed at a break (`[harness] stuck_break_note`,
 /// the hung-call design's R3 and the owner's call O10; the occupancy design's §2.1 rank 4):
 /// [`SupervisorConfig::stuck_break_grant`] alone makes one. Not a [`PromptGrant`], which
 /// [`Occupancy::grant`] alone makes: the two keys grant two lines, whatever `occupancy` says.
@@ -351,12 +353,14 @@ pub struct SupervisorConfig {
     /// AN `aterm:` FACT ON A PROMPT THE HARNESS TYPES ANYWAY (`[harness] facts`, system
     /// awareness §14.4): a continuation, a done check, Land's instruction or its nudge may end
     /// with one measured fact of the session's own (a background call of the agent's that has
-    /// made no progress), once per episode, only where it fits whole. `false` is a limit: no fact
-    /// rides, and none is typed at a break either.
+    /// made no progress, or programs of its calls macOS's program check holds), once per
+    /// episode, only where it fits whole. `false` is a limit: no fact rides, and none is typed at
+    /// a break either.
     pub facts: bool,
-    /// THE STUCK FACT AT A BREAK (`[harness] stuck_break_note`, the owner's call O10): at a break
-    /// of the agent's own background work, where no turn end comes for a fact to ride, the
-    /// session's untold no-progress fact is typed as one line of its own, once per episode. A
+    /// AN `aterm:` FACT AT A BREAK (`[harness] stuck_break_note`, the owner's call O10): at a
+    /// break of the agent's own background work, where no turn end comes for a fact to ride, the
+    /// session's untold fact (a call at no progress, programs held at macOS's program check) is
+    /// typed as one line of its own, once per episode. A
     /// key whose `true` is more power: it ships `false`, and only the root `[harness]` table's
     /// `true` turns it on ([`Self::stuck_break_grant`]).
     pub stuck_break_note: bool,
@@ -647,13 +651,13 @@ impl SupervisorConfig {
                     ));
                 }
             },
-            "continue_per_hour" => match value.trim().parse() {
-                Ok(n) => self.continue_per_hour = n,
-                Err(_) => return bad(self, "a count"),
+            "continue_per_hour" => match crate::parse_uint(value.trim()) {
+                Some(n) => self.continue_per_hour = n,
+                None => return bad(self, "a count"),
             },
-            "human_grace_s" => match value.trim().parse() {
-                Ok(n) => self.human_grace_s = n,
-                Err(_) => return bad(self, "a count of seconds"),
+            "human_grace_s" => match crate::parse_uint(value.trim()) {
+                Some(n) => self.human_grace_s = n,
+                None => return bad(self, "a count of seconds"),
             },
             "rules_file" | "model_fallback" if flag == Some(true) => {
                 return Err(format!(
@@ -668,9 +672,9 @@ impl SupervisorConfig {
                     self.model_fallback = None;
                 }
             }
-            "stall_term_after_s" => match value.trim().parse() {
-                Ok(n) => self.stall_term_after_s = n,
-                Err(_) => return bad(self, "a count of seconds (0: never)"),
+            "stall_term_after_s" => match crate::parse_uint(value.trim()) {
+                Some(n) => self.stall_term_after_s = n,
+                None => return bad(self, "a count of seconds (0: never)"),
             },
             "memory_ceiling" => match MemoryCeiling::parse(value) {
                 Some(c) => self.memory_ceiling = c,
@@ -818,6 +822,30 @@ impl SupervisorConfig {
     #[must_use]
     pub fn on_for(&self, agent: Program) -> bool {
         self.enabled && !self.off.contains(&agent)
+    }
+
+    /// `[harness] accounts` as `agent`'s account pool reads it: [`Mode::Off`] where the harness
+    /// is off or `agent` is switched off ([`Self::on_for`]), else [`Self::accounts`]. The one
+    /// rotation switch every reader shares: the window's host, which also needs to supervise
+    /// the session it moves, and a launch's choice of account (`accounts_pool::Seat::mode_for`).
+    /// The sync of a pool's roster reads `[harness] accounts` alone
+    /// (`accounts_sync::accounts_sync_off`).
+    #[must_use]
+    pub fn accounts_for(&self, agent: Program) -> Mode {
+        if self.on_for(agent) {
+            self.accounts
+        } else {
+            Mode::Off
+        }
+    }
+
+    /// `[harness] logins` as `agent`'s account pool reads it: its login lifecycle (the
+    /// automatic sign-in and renewal of its rows) runs where `agent` is supervised
+    /// ([`Self::on_for`]) and [`Self::logins`] is on. The window's host and the accounts' upkeep
+    /// share it, for every pool.
+    #[must_use]
+    pub fn logins_for(&self, agent: Program) -> bool {
+        self.on_for(agent) && self.logins
     }
 
     /// Whether the usage tap ([`Self::usage_tap`]) is on for Claude Code, the one reading every surface shares: the relaunch lines a pass arms it on (the window's lane, `aterm harness upgrade`), the footer's reason for a missing week, and `accounts stats`' tap.
@@ -1685,18 +1713,21 @@ pub fn switch_word(value: &str) -> Option<bool> {
         "false" | "no" | "off" => return Some(false),
         _ => {}
     }
-    let digits = v.replace('_', "");
-    let digits = digits.strip_prefix(['+', '-']).unwrap_or(&digits);
-    let (radix, body) = [("0x", 16), ("0o", 8), ("0b", 2)]
+    let (neg, unsigned) = match v.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, v.strip_prefix('+').unwrap_or(&v)),
+    };
+    let (radix, raw_body) = [("0x", 16), ("0o", 8), ("0b", 2)]
         .into_iter()
-        .find_map(|(p, r)| digits.strip_prefix(p).map(|b| (r, b)))
-        .unwrap_or((10, digits));
+        .find_map(|(p, r)| unsigned.strip_prefix(p).map(|b| (r, b)))
+        .unwrap_or((10, unsigned));
+    let body = raw_body.replace('_', "");
     if body.is_empty() || !body.chars().all(|c| c.is_digit(radix)) {
         return None;
     }
-    match u64::from_str_radix(body, radix).ok()? {
+    match u64::from_str_radix(&body, radix).ok()? {
         0 => Some(false),
-        1 if !v.starts_with('-') => Some(true),
+        1 if !neg => Some(true),
         _ => None,
     }
 }
@@ -1712,7 +1743,7 @@ fn autocompact_size(value: &str) -> Option<Option<u32>> {
     if switch_word(&v) == Some(true) {
         return Some(Some(AUTOCOMPACT_DEFAULT_K));
     }
-    let n: u32 = v.strip_suffix('k').unwrap_or(&v).parse().ok()?;
+    let n: u32 = crate::parse_uint(v.strip_suffix('k').unwrap_or(&v))?;
     let k = if v.ends_with('k') || n < 1000 {
         n
     } else if n.is_multiple_of(1000) {
@@ -4293,5 +4324,7 @@ trust_dialog = false
                 "{raw}"
             );
         }
+        assert_eq!(switch_word("_-1"), None);
+        assert_eq!(switch_word("0_x1"), None);
     }
 }

@@ -263,6 +263,7 @@ pub(super) fn self_claimed_plan(
         detail: e,
     })?;
     Ok(Plan {
+        command: None,
         shell,
         dialect,
         line,
@@ -491,7 +492,7 @@ fn relaunch_held(
     }
     st.line.clone_from(&line);
     save(opts, &key(&tab), st);
-    match type_relaunch_line_with(
+    let typed = type_relaunch_line_with(
         opts,
         c,
         shell,
@@ -501,8 +502,10 @@ fn relaunch_held(
         PromptLook::of(st),
         || lock_free(k),
         |c, pid, tab| k.in_tab(c, pid, tab),
-    ) {
-        Ok(()) => st.prompt = None,
+    );
+    let unanswered = typed == Err(RelaunchLineError::Unanswered);
+    match typed {
+        Ok(()) | Err(RelaunchLineError::Unanswered) => st.prompt = None,
         Err(RelaunchLineError::Wait(why)) => {
             st.note_wait(why, now_s());
             return said(r, format!("wait:{why}"));
@@ -533,6 +536,10 @@ fn relaunch_held(
         &format!("{} (resume)", st.line),
     );
     save(opts, &key(&tab), st);
+    if unanswered {
+        // The line may have run: the next step, on a new connection, reads what it started.
+        return said(r, "wait:unanswered");
+    }
     await_held(opts, r, st, c, hand, k)
 }
 

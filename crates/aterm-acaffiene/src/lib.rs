@@ -9,6 +9,7 @@
 
 pub mod cli;
 pub mod code;
+pub mod held;
 pub mod icon;
 pub mod instance;
 pub mod launchd;
@@ -20,3 +21,4 @@ pub mod model;
 pub mod notify;
 pub mod paths;
 pub mod state;
+pub mod trouble;

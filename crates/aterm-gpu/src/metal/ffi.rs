@@ -360,6 +360,32 @@ impl CompileOptions {
         Some(o)
     }
 
+    /// [`Self::aterm_default`] with fast math off: IEEE division, square root and `fmod`, and no
+    /// reassociation, for a library whose floats must land the CPU's (`tray_prims.metal`).
+    pub(crate) fn aterm_precise() -> Option<Self> {
+        let o = Self::aterm_default()?;
+        o.set_fast_math_enabled(false);
+        Some(o)
+    }
+
+    pub(crate) fn set_fast_math_enabled(&self, on: bool) {
+        // SAFETY: plain `BOOL` property write on a live `MTLCompileOptions`.
+        unsafe {
+            let f: unsafe extern "C-unwind" fn(Id, Sel, ObjcBool) = checked_msg();
+            f(self.0.id(), sel(c"setFastMathEnabled:"), on.into());
+        }
+    }
+
+    /// Read back, as [`Self::preserve_invariance`].
+    #[cfg(test)]
+    pub(crate) fn fast_math_enabled(&self) -> bool {
+        // SAFETY: `-fastMathEnabled` is a `BOOL` getter on a live object.
+        unsafe {
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> ObjcBool = checked_msg();
+            f(self.0.id(), sel(c"fastMathEnabled")).as_bool()
+        }
+    }
+
     pub(crate) fn set_preserve_invariance(&self, on: bool) {
         // SAFETY: plain `BOOL` property write on a live `MTLCompileOptions`.
         unsafe {
@@ -438,10 +464,15 @@ mod window_server_door {
     impl Device {
         /// The GPU aterm renders on.
         pub(crate) fn preferred() -> Option<Self> {
-            if let Some(listed) = Self::preferred_listed() {
-                return Some(listed);
-            }
-            Self::system_default_asks_window_server()
+            Self::for_policy(crate::DevicePolicy::Windowed)
+        }
+
+        /// Apply the context's explicit policy at every device acquisition.
+        pub(crate) fn for_policy(policy: crate::DevicePolicy) -> Option<Self> {
+            policy.select(
+                Self::preferred_listed,
+                Self::system_default_asks_window_server,
+            )
         }
 
         /// [`Self::preferred`] where the device listing decides it, `None` where only the window server could.
@@ -1778,6 +1809,33 @@ mod tests {
     use super::*;
     use crate::metal::test_support::{C_STRING_HOLES, ns_string_of_units};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn headless_listing_refuses_absent_and_ambiguous_devices_without_a_window_fallback() {
+        let display = ListedGpu {
+            low_power: false,
+            headless: false,
+        };
+        for (gpus, expected) in [
+            (vec![Some(display)], Some(0)),
+            (vec![], None),
+            (vec![None], None),
+            (vec![Some(display), Some(display)], None),
+        ] {
+            let listed = || choose_listed(&gpus, true).map(|(i, _)| i);
+            assert_eq!(
+                crate::DevicePolicy::Headless.select(listed, || panic!("WindowServer fallback")),
+                expected
+            );
+            let calls = std::cell::Cell::new(0);
+            let windowed = crate::DevicePolicy::Windowed.select(listed, || {
+                calls.set(calls.get() + 1);
+                Some(99)
+            });
+            assert_eq!(windowed, expected.or(Some(99)));
+            assert_eq!(calls.get(), usize::from(expected.is_none()));
+        }
+    }
 
     /// How many times this process has called [`Device::system_default_asks_window_server`].
     pub(super) static WINDOW_SERVER_ASKS: AtomicUsize = AtomicUsize::new(0);

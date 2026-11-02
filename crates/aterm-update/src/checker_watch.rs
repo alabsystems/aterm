@@ -111,7 +111,9 @@ pub fn now_secs() -> u64 {
 /// The `Instant` a stamp-relative number of running seconds names.
 #[must_use]
 pub fn instant_at(secs: u64) -> Instant {
-    anchor() + Duration::from_secs(secs)
+    let base = anchor();
+    base.checked_add(Duration::from_secs(secs))
+        .unwrap_or_else(|| base + Duration::from_secs(u64::from(u32::MAX)))
 }
 
 const GEN_SHIFT: u32 = 48;
@@ -241,7 +243,7 @@ pub fn classify(beat: &CheckerBeat, now_secs: u64) -> CheckerVerdict {
         }
     } else {
         CheckerVerdict::Fresh {
-            stale_in_secs: threshold - age + 1,
+            stale_in_secs: (threshold - age).saturating_add(1),
         }
     }
 }
@@ -596,6 +598,13 @@ mod tests {
             classify(&beat(CheckerPhase::Waiting, 50, LONGEST), 10),
             CheckerVerdict::Fresh { .. }
         ));
+        assert_eq!(
+            classify(&beat(CheckerPhase::Waiting, 0, u64::MAX), 0),
+            CheckerVerdict::Fresh {
+                stale_in_secs: u64::MAX
+            }
+        );
+        let _ = instant_at(u64::MAX);
     }
 
     #[test]

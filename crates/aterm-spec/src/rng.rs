@@ -56,7 +56,8 @@ impl XorShift {
     /// When `hi <= lo`.
     #[inline]
     pub fn range(&mut self, lo: usize, hi: usize) -> usize {
-        lo + self.index(hi - lo)
+        assert!(lo < hi, "XorShift::range requires lo < hi");
+        lo.saturating_add(self.index(hi - lo))
     }
 
     /// One element of `from`.

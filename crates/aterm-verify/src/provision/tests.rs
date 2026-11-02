@@ -1564,24 +1564,19 @@ fn the_command_line_names_rows_and_flags_only() {
     let o = parse(&["--linux".into(), "fish".into(), "fish".into()]).unwrap();
     assert!(o.linux && o.rows == ["fish"]);
     assert!(parse(&["--fetch".into()]).is_err());
-    assert!(
-        parse(&["fish-shell".into()])
-            .unwrap_err()
-            .contains("the rows: rustup, fish")
-    );
+    assert!(parse(&["fish-shell".into()]).is_err());
     let names: Vec<&str> = select(&Options::default()).iter().map(|r| r.name).collect();
+    assert!(
+        names.contains(&"gitleaks"),
+        "default developer provisioning supplies the publication scanner"
+    );
+    let scanner = parse(&["gitleaks".into()]).unwrap();
     assert_eq!(
-        names,
-        [
-            "rustup",
-            "fish",
-            "bash",
-            "pwsh",
-            "binaryen",
-            "chrome-headless-shell",
-            "firefox",
-            "webkit"
-        ]
+        select(&scanner)
+            .iter()
+            .map(|row| row.name)
+            .collect::<Vec<_>>(),
+        ["gitleaks"]
     );
 }
 

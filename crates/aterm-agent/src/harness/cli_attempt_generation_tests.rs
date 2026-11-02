@@ -26,6 +26,8 @@ struct AttemptHost<'a> {
     changed: Cell<bool>,
     after: RefCell<Option<[Option<Vec<u8>>; 4]>>,
     staging: RefCell<Option<PathBuf>>,
+    /// The sign-in a person waits for, ending ([`AccountsHost::retries_sign_in_lock`]).
+    waited_for: RefCell<Option<Box<dyn FnOnce() + 'a>>>,
 }
 
 impl AttemptHost<'_> {
@@ -129,6 +131,9 @@ impl AttemptHost<'_> {
 #[test]
 fn completed_cli_signins_recover_all_records_without_another_provider_login() {
     for cli in [Cli::Claude, Cli::Codex, Cli::Grok, Cli::Kimi] {
+        if !signs_in_here(cli) {
+            continue;
+        }
         let tmp = tmp_dir("signin-commit-recovery");
         let mut env = env_at(&tmp);
         env.now = NOW;
@@ -176,6 +181,7 @@ fn completed_cli_signins_recover_all_records_without_another_provider_login() {
             changed: Cell::new(false),
             after: RefCell::new(None),
             staging: RefCell::new(None),
+            waited_for: RefCell::new(None),
         };
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -231,6 +237,13 @@ fn completed_cli_signins_recover_all_records_without_another_provider_login() {
 impl AccountsHost for AttemptHost<'_> {
     fn stdin_is_terminal(&self) -> bool {
         true
+    }
+    fn retries_sign_in_lock(&self, _: u32) -> bool {
+        self.waited_for
+            .borrow_mut()
+            .take()
+            .map(|ended| ended())
+            .is_some()
     }
     fn unaskable(&self) -> Option<String> {
         None
@@ -291,6 +304,17 @@ impl AccountsHost for AttemptHost<'_> {
     }
 }
 
+/// The CLI the model's `provider` names.
+fn provider_of(state: &aterm_spec::interp::State) -> Cli {
+    match state["provider"] {
+        1 => Cli::Claude,
+        2 => Cli::Codex,
+        3 => Cli::Grok,
+        4 => Cli::Kimi,
+        _ => unreachable!(),
+    }
+}
+
 pub(crate) fn attempt_transition(
     state: &aterm_spec::interp::State,
     action: &str,
@@ -310,13 +334,7 @@ pub(crate) fn attempt_transition(
             next.insert("phase", 1);
         }
         "Commit" => {
-            let cli = match state["provider"] {
-                1 => Cli::Claude,
-                2 => Cli::Codex,
-                3 => Cli::Grok,
-                4 => Cli::Kimi,
-                _ => unreachable!(),
-            };
+            let cli = provider_of(state);
             let tmp = tmp_dir("attempt-generation");
             let mut env = env_at(&tmp);
             env.now = NOW;
@@ -365,6 +383,7 @@ pub(crate) fn attempt_transition(
                 changed: Cell::new(false),
                 after: RefCell::new(None),
                 staging: RefCell::new(None),
+                waited_for: RefCell::new(None),
             };
             let mut out = Vec::new();
             let mut err = Vec::new();
@@ -483,6 +502,7 @@ fn queued_vendor_renewal_rechecks_its_original_parent_before_running_authenticat
             changed: Cell::new(false),
             after: RefCell::new(None),
             staging: RefCell::new(None),
+            waited_for: RefCell::new(None),
         };
         assert_eq!(
             renew_one_for(
@@ -502,6 +522,90 @@ fn queued_vendor_renewal_rechecks_its_original_parent_before_running_authenticat
     }
 }
 
+/// A person's vendor sign-in goes by what the sign-in they waited for left: one that renewed their
+/// row leaves nothing to run, and one that renewed another row, which moves the clock every parent
+/// reads, lets theirs run. The refusal above holds only for whoever did not wait.
+#[test]
+fn a_vendor_sign_in_a_person_waited_for_goes_by_what_the_wait_left() {
+    for (renewed, runs) in [("main", false), ("other", true)] {
+        let cli = Cli::Kimi;
+        let tmp = tmp_dir("waited-parent");
+        let mut env = env_at(&tmp);
+        env.now = NOW;
+        let store = env.accounts_store_for(cli).unwrap();
+        let path = store.login_dir("main").unwrap();
+        let path = path.to_str().unwrap();
+        let raw = Roster {
+            rows: vec![accounts::Row {
+                label: "main".into(),
+                dir: Some(path.into()),
+                email: Some(OWNER.into()),
+                vendor: accounts::Vendor {
+                    region: Some(crate::ai::connector::Region::Global),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+        };
+        let roster_path = env.accounts_roster_for(cli).unwrap();
+        std::fs::write(
+            &roster_path,
+            accounts::append_rows_for(cli, "", &raw.rows).unwrap(),
+        )
+        .unwrap();
+        let renew = |label: &str| {
+            store
+                .transact_logins(NOW, &mut None, |state, logins| {
+                    Ok(accounts::note_renewed(
+                        state,
+                        logins,
+                        label,
+                        Some(path),
+                        path,
+                        None,
+                        NOW,
+                    ))
+                })
+                .unwrap()
+        };
+        renew("main");
+        let captured = store.load_logins(NOW).unwrap().0;
+        let row = accounts::bound(&raw, &captured)
+            .row("main")
+            .unwrap()
+            .clone();
+        let held = store.signin_now().unwrap().unwrap();
+        let host = AttemptHost {
+            cli,
+            case: 0,
+            store: &store,
+            raw: &raw,
+            old_dir: path,
+            changed: Cell::new(false),
+            after: RefCell::new(None),
+            staging: RefCell::new(None),
+            waited_for: RefCell::new(Some(Box::new(|| {
+                drop(held);
+                renew(renewed);
+            }))),
+        };
+        let renewal = renew_one_for(
+            cli,
+            NOW,
+            &host,
+            &store,
+            (&row, &roster_path, &captured),
+            Some(path),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert_eq!(host.changed.get(), runs, "{renewed}: {renewal:?}");
+        if !runs {
+            assert_eq!(renewal, Renewal::Renewed);
+        }
+    }
+}
+
 #[test]
 fn login_and_renewal_generation_admission_conform_for_every_provider() {
     let model = aterm_models_harness::account_attempt_generation_model();
@@ -509,6 +613,9 @@ fn login_and_renewal_generation_admission_conform_for_every_provider() {
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
             if model.action_enabled(action.name, &state) {
+                if action.name == "Commit" && !signs_in_here(provider_of(&state)) {
+                    continue;
+                }
                 let next = attempt_transition(&state, action.name);
                 assert!(
                     model.successors(action.name, &state).contains(&next),

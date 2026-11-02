@@ -14,12 +14,18 @@ pub mod exception;
 pub mod git_config;
 pub mod go_ahead;
 pub mod guard;
+#[cfg(test)]
+mod guard_base_tests;
+pub mod land_check;
 pub mod login;
 pub mod needs;
 pub mod notice;
 pub mod outlook;
 pub mod probe;
 mod probe_live;
+/// The live probe's test gate, for the loop's tests of a look that does not answer.
+#[cfg(test)]
+pub(crate) use probe_live::tests as probe_live_tests;
 pub mod question;
 pub mod reset;
 pub mod rm_breaker;

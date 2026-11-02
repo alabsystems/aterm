@@ -54,7 +54,7 @@ pub const HELP_ROWS: &str = concat!(
     "  aterm doctor --verbose     every row, the ok ones too\n",
     "  aterm doctor --read-only   the same checks, changing nothing (--json: the report as JSON)\n",
     "  aterm doctor --only <id,…> only those items, families or layers\n",
-    "  aterm doctor --check       only the macOS settings profile (--apply, --restore change it)\n",
+    "  aterm doctor --check       this Mac's profile, in its scope (--apply, --restore change it)\n",
 );
 
 /// `aterm doctor --help`: the grammar and [`HELP_ROWS`].
@@ -63,7 +63,7 @@ pub fn help() -> String {
     format!("usage: aterm doctor {GRAMMAR}\n{HELP_ROWS}")
 }
 
-const ROWS: [(&str, &str, &str, &str); 13] = [
+const ROWS: [(&str, &str, &str, &str); 14] = [
     ("shell:", SHELL, "shell", "the shell aterm starts"),
     (
         "privacy:",
@@ -101,6 +101,12 @@ const ROWS: [(&str, &str, &str, &str); 13] = [
         "base.machine.services",
         "machine",
         "what macOS's own services hold in memory",
+    ),
+    (
+        "awake:",
+        "base.machine.awake",
+        "machine",
+        "aCaffiene keeping this Mac awake",
     ),
     (
         "conpty:",

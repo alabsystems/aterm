@@ -326,7 +326,7 @@ mod tests {
         super::super::restrict_hops(&stream).unwrap();
         // Linux can make a socket IPv6-only when bound to a specific IPv6
         // address. Keep this deliberate invalid fixture dual-stack on both OSes.
-        let address = super::super::tcp::Address::new("[::]:0".parse().unwrap());
+        let address = aterm_uds::connect::Inet::new("[::]:0".parse().unwrap());
         let (pointer, length) = address.parts();
         // SAFETY: address owns the initialized sockaddr for this complete call.
         assert_eq!(

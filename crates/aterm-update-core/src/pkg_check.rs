@@ -145,7 +145,8 @@ impl Stamps {
     /// The stamps of the `status.toml` at `path`; absent or unreadable reads as none.
     #[must_use]
     pub fn read(path: &Path) -> Self {
-        std::fs::read_to_string(path).map_or_else(|_| Self::default(), |text| Self::parse(&text))
+        read_text_bounded(path, 64 * 1024, false)
+            .map_or_else(Self::default, |text| Self::parse(&text))
     }
 
     /// Whether a pass is installing now, or was attempted anywhere on the machine within
@@ -270,14 +271,76 @@ pub fn claim(stamp: &Path, now_unix: i64, every_secs: u64) -> bool {
         Err(e) if e.kind() == std::io::ErrorKind::TimedOut => return false,
         Err(_) => return true,
     };
-    let last = std::fs::read_to_string(stamp)
-        .ok()
-        .and_then(|text| text.trim().parse::<i64>().ok());
+    let last = read_text_bounded(stamp, 256, true).and_then(|text| {
+        let text = text.trim();
+        (!text.starts_with('+'))
+            .then(|| text.parse::<i64>().ok())
+            .flatten()
+    });
     if last.is_some_and(|then| !elapsed(then, now_unix, every_secs)) {
         return false;
     }
-    let _ = std::fs::write(stamp, format!("{now_unix}\n"));
+    write_stamp(stamp, now_unix);
     true
+}
+
+fn read_text_bounded(path: &Path, cap: u64, nofollow: bool) -> Option<String> {
+    use std::io::Read as _;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let flags =
+            libc::O_NONBLOCK | libc::O_CLOEXEC | if nofollow { libc::O_NOFOLLOW } else { 0 };
+        opts.custom_flags(flags);
+    }
+    #[cfg(not(unix))]
+    if nofollow
+        && std::fs::symlink_metadata(path)
+            .ok()
+            .is_some_and(|m| m.file_type().is_symlink())
+    {
+        return None;
+    }
+    let file = opts.open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > cap {
+        return None;
+    }
+    let mut text = String::new();
+    file.take(cap.saturating_add(1))
+        .read_to_string(&mut text)
+        .ok()?;
+    (text.len() as u64 <= cap).then_some(text)
+}
+
+fn write_stamp(stamp: &Path, now_unix: i64) {
+    use std::io::Write as _;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    #[cfg(not(unix))]
+    if std::fs::symlink_metadata(stamp)
+        .ok()
+        .is_some_and(|m| m.file_type().is_symlink())
+    {
+        return;
+    }
+    let Ok(mut file) = opts.open(stamp) else {
+        return;
+    };
+    if !file.metadata().is_ok_and(|m| m.is_file()) {
+        return;
+    }
+    if file.set_len(0).is_ok() {
+        let _ = writeln!(file, "{now_unix}");
+    }
 }
 
 /// A package status stamp → unix seconds: strict about the zone, tolerant of a fraction.
@@ -602,6 +665,22 @@ mod tests {
             "no directory: nothing to hold it"
         );
         assert!(claim(&nowhere, now, day), "…and nothing refuses either");
+        #[cfg(unix)]
+        {
+            let target = dir.parent().unwrap().join("symlink-target.txt");
+            std::fs::write(&target, format!("{now}\n")).unwrap();
+            let linked = dir.parent().unwrap().join("linked.stamp");
+            std::os::unix::fs::symlink(&target, &linked).unwrap();
+            assert!(
+                claim(&linked, now + 60, day),
+                "a symlinked stamp is ignored rather than followed"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&target).unwrap(),
+                format!("{now}\n"),
+                "symlink target must never be overwritten by claim"
+            );
+        }
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 

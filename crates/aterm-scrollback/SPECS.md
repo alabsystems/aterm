@@ -1,46 +1,10 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-scrollback: spec recovery from its 341 unit tests
+# aterm-scrollback: spec recovery from unit tests
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 224 tests
-> it deleted and 10 specs whose functions it deleted are gone. Counts elsewhere in this file
-> were taken before.
->
-> 2026-10-17: the disk-backed cold tier is gone (bb0614b40f), so the rows that still named
-> `DiskBackedScrollback`, `DiskColdTier` or its accessors now state the in-memory store alone, and
-> §3 and §6 no longer cite the disk specs.
-
-> Status 2026-10-16: this is the crate's migration worklist. Each of the 53 specs below is
-> proved through Trust/Clean about the compiled Rust function, and then the tests it subsumes
-> are deleted. Nothing has been proved or deleted yet. The 12 checks in §4 that sample no
-> spec can be deleted or moved to a bench now.
->
-> **Tried 2026-10-19 on seal `150efe4a`: `link-ceiling-formula` and `threshold-bytes-bounds` are
-> blocked, not proved.** The crate is not refused by PM-1; the seal compiles it and reports a row for
-> each fn. Each fn was given `ensures result == <Clean spec def>(args)`, a Clean def stating the
-> row's formula for every input (saturation and the `usize::MAX` cap included). The island defs
-> kernel-check, but E6 mints no `trust_import_aterm_scrollback__line__line_codec_block__max_linked_record_bytes`
-> or `trust_import_aterm_scrollback__watermark__threshold_bytes` (a theorem naming either is refused with
-> `AutoBoundHeadOverApplied`). The seal names the reason (gap 3, E6 shapes): "E6 admission of
-> `…::max_linked_record_bytes` was refused by the FACET gate (Pure, Total, Deterministic and NoPanic
-> must all be established) … the construct outside the E6 fragment is the call to
-> `core::num::<impl usize>::saturating_mul` (E6 reads only the marker-authenticated
-> `wrapping_*`/signed `checked_*` core methods and a forwarding call to a Clean island definition)
-> (and 1 further construct(s) outside it)". For `threshold_bytes` the call is
-> `core::num::<impl u128>::saturating_mul`, with 7 further constructs (the `/ 100`, the `u128`
-> `min` and the casts). The native clause lane refuses the same specs written in Rust
-> (`unsupported contract predicate expression`), because it does not lower method calls or casts.
-> The code is unchanged, and the tests `the_link_ceiling_is_the_record_cap_plus_one_maximal_link_per_column`
-> and `thresholds_are_bounded_for_every_budget` stay. They are unblocked by an E6 reader (or
-> the proven-core route) for unsigned `saturating_add`/`saturating_mul`, `u128` division and `min`, and
-> widening and narrowing casts.
-
-Source: `crates/aterm-scrollback` (read only). I read every `#[test]` fn (341 in 29 files under
-`src/` and `tests/`) and the production code each one reaches. Nothing was compiled or run.
-The claims below come from reading the code.
-
-Result: **53 specs**, covering **329 tests**. **12 tests are not spec samples** (§4).
+Each row states a property of `crates/aterm-scrollback`'s production code, recovered from the tests
+under `src/`. A test is deleted once Trust/Clean proves the spec that subsumes it.
 
 ## 0. Notation used in the statements
 
@@ -49,42 +13,41 @@ Result: **53 specs**, covering **329 tests**. **12 tests are not spec samples** 
   when their `Wire` bytes are equal.
 - `Strip(l)` = `l` with images set to `None`. `Line::serialize` writes no image section, so
   `Wire(l) = Wire(Strip(l))`. Every line that leaves the hot tier is `Strip`-ed.
-- `Caps`: the lines with `len ≤ MAX_LINE_CONTENT_BYTES`, every hyperlink URL `≤ MAX_HYPERLINK_URL_BYTES`,
-  every id `≤ MAX_HYPERLINK_ID_BYTES`, at most `MAX_HYPERLINK_SPANS` hyperlink spans and at most
-  `MAX_UNDERLINE_SPANS` underline spans. The decoders only ever return lines in `Caps`.
-- `Reach`: the stores (`Scrollback`, `ScrollbackStorage`) reachable from
-  their public constructors by any sequence of public calls.
-- `M(s)`: the ghost oldest-first sequence of `Strip`-ed lines a store `s` holds. A store with a
-  corrupt warm block is modelled as *slots*: `Some(line)`, an unreadable slot (`get_line` is `Err`),
-  or a blank slot (a block quarantined mid-history).
-- `V(t)`: the live-line view of a tier `t` (`HotTier`, `WarmTier`, `ColdTier`): the
-  concatenation of its blocks or pages with the first `front_offset` lines dropped.
+- `Caps`: the lines with `len ≤ MAX_LINE_CONTENT_BYTES`, every hyperlink URL
+  `≤ MAX_HYPERLINK_URL_BYTES`, every id `≤ MAX_HYPERLINK_ID_BYTES`, at most `MAX_HYPERLINK_SPANS`
+  hyperlink spans and at most `MAX_UNDERLINE_SPANS` underline spans. The decoders return only lines
+  in `Caps`.
+- `Reach`: the stores (`Scrollback`, `ScrollbackStorage`) reachable from their public
+  constructors by any sequence of public calls.
+- `M`: the ghost oldest-first sequence of `Strip`-ed lines a store holds. A store with a corrupt
+  warm block is modelled as *slots*: `Some(line)`, an unreadable slot (`get_line` is `Err`), or a
+  blank slot (a block quarantined mid-history).
+- `V(t)`: the live-line view of a tier `t` (`HotTier`, `WarmTier`, `ColdTier`): the concatenation
+  of its blocks or pages with the first `front_offset` lines dropped.
 - `take(k, xs)`, `drop(k, xs)`, `last(k, xs)`: the first `min(k,|xs|)` elements, all but those, and
   the last `min(k,|xs|)` elements.
-- `T` = `QUARANTINE_THRESHOLD`.
+- `T` = `QUARANTINE_THRESHOLD` (3).
 - **Observables.** Specs are stated over production accessors (`attrs()`, `hyperlinks()`,
-  `underline_colors()`, `images()`, `warm_line_count()`, `cold_line_count()`, ...). Several helpers
-  the tests call are `#[cfg(test)]`-only: `has_attrs`, `attr_run_count`, `has_underline_colors`,
-  `underline_color_count`, `get_image`, `hot_line_count`, `block_size()`, `HyperlinkSpan::width`,
-  `take_records_walked`, `take_*_find_*_steps`, `recompute_*`, `corrupt_oldest_block`,
-  `inject_corrupted_warm_block`. A proof may use them only as ghost views or as fault-injection
+  `underline_colors()`, `images()`, `warm_line_count()`, `cold_line_count()`, ...). Test seams
+  such as `block_size()`, `hot_line_count`, `take_records_walked`, `take_*_find_*_steps`, the
+  `recompute_*` accountants (not `recompute_watermark`), `corrupt_oldest_block` and
+  `inject_corrupted_warm_block` serve a proof only as ghost views or fault-injection
   preconditions.
 - **Constants.** `MAX_LINE_CONTENT_BYTES` = 2 MiB; `MAX_HYPERLINK_URL_BYTES` = 8192;
   `MAX_HYPERLINK_ID_BYTES` = 256; `MAX_HYPERLINK_SPANS` = `MAX_UNDERLINE_SPANS` = 4096;
   `MAX_HYPERLINK_SPAN_BYTES` = 8460; `MAX_DECODE_PAGE_LINES` = 2^20; `MAX_DECOMPRESSED_SIZE` = 64 MiB
   with an LZ4 ratio cap of 512; `DEFAULT_LINE_LIMIT` = 100,000; watermark percentages 80 (yellow),
   50 (yellow exit) and 95 (red).
-- **Lifting `trust::skip`.** Many target functions carry `#[cfg_attr(trust_verify, trust::skip)]`:
-  `serialize`/`deserialize`, `walk_records`, the strict decoders, `clear_hyperlinks`, `set_images`
-  and `Clone`. Lifting that skip is part of each proof.
+- **`trust::skip`.** Many target functions (the codecs, `walk_records`, `clear_hyperlinks`,
+  `set_images`, `Clone`, ...) carry `#[cfg_attr(trust_verify, trust::skip)]`; lifting it is part
+  of each proof.
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (count of primary tests; the list is in
-§2), `difficulty` (Rust features the proof must handle), `blocking_gaps` (row numbers of
-`AUDIT-trust-for-test-migration-2026-10-15.md` §7 (historical internal audit)). Gap 0, the seal that publishes
-Clean rows, blocks every spec on the machine's `trust` channel. Seal `150efe4a` closes it locally
-(`PLAN-tests-to-specs-2026-10-15.md` (historical internal plan)), but admitting it to the channel is owner-gated.
+Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (the primary-test count when the row
+was written; §2 lists the tests that remain), `difficulty` (Rust features the proof must handle),
+`blocking_gaps` (gap numbers from §7 of `docs/AUDIT-trust-for-test-migration-2026-10-15.md`; gap
+0, the seal that publishes Clean rows, is on every row).
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
@@ -109,7 +72,7 @@ lz4-decode-classification	contract	lz4::decompress_size_prepended, map_decompres
 lz4-roundtrip	round-trip	lz4::{compress_prepend_size,decompress_size_prepended}, encode_cold_block, decode_cold_bounded, decompress_lz4_bounded	∀ x with |x| ≤ MAX_DECOMPRESSED_SIZE: compress_prepend_size(x) = Ok(c) and decompress_size_prepended(&c) = Ok(x); compress_prepend_size errs ⇔ |x| > u32::MAX; likewise for encode_cold_block/decode_cold_bounded, decompress_lz4_bounded, and data compressed by aterm_lz4 directly. Needs the aterm_lz4 lemma that its body length ≥ ⌈|x|/255⌉, so the 512:1 gate never fires on honest output.	5	Vec<u8>, cross-crate LZ4 correctness lemma	0,1,4,7,12
 dec-string-decimal	contract	error::dec_string	∀ v: usize: dec_string(v) = format!("{v}") (shortest base-10 rendering, no sign, no leading zero except "0").	1	String building in a digit loop	0,1,7
 error-source-io-only	contract	ScrollbackError::source	∀ e: e.source().is_some() ⇔ e is ScrollbackError::Io(_), and then it is that io::Error.	1	enum match, Option<&dyn Error>	0,1,3,11
-watermark-transition-table	table-property	watermark::recompute_watermark, Scrollback::update_watermark_level	∀ level c, ∀ b, r, y, x: recompute_watermark(c, b, r, y, x) = Red if b ≥ r; else Yellow if b ≥ y; else Yellow if c = Red; else Green if c = Yellow ∧ b < x; else c. update_watermark_level sets level := recompute_watermark(level, budgeted_bytes, red, yellow, yellow_exit).	8	3-variant non_exhaustive enum match, usize compares; &mut self for the method	0,1,2,3; fragment: `watermark::recompute_watermark` F1+D2b (VF5 first target, docs/PLAN-tests-to-specs-2026-10-15.md "F1-ready specs").
+watermark-transition-table	table-property	watermark::recompute_watermark, Scrollback::update_watermark_level	∀ level c, ∀ b, r, y, x: recompute_watermark(c, b, r, y, x) = Red if b ≥ r; else Yellow if b ≥ y; else Yellow if c = Red; else Green if c = Yellow ∧ b < x; else c. update_watermark_level sets level := recompute_watermark(level, budgeted_bytes, red, yellow, yellow_exit).	8	3-variant non_exhaustive enum match, usize compares; &mut self for the method	0,1,2,3; fragment: `watermark::recompute_watermark` F1+D2b (VF5 first target, docs/PLAN-tests-to-specs-2026-10-15.md "F1-ready specs", row 60). Proved via mirror: Clean R213 row `watermark_recompute` (`RowProvedB3` over a verbatim copy, with a false-clause control); not yet credited: Trust's compiler mints no calculus row until it pins a VF5 base (E4.7).
 threshold-bytes-bounds	contract	watermark::threshold_bytes	∀ p ≤ 100, ∀ b: threshold_bytes(p, b) = ⌊b·p/100⌋ (in u128); hence ≤ b, monotone in p (exit(50) ≤ yellow(80) ≤ red(95)), and = 0 ⇔ b·p < 100.	1	u128 widening, saturating_mul, division, narrowing cast with min	0,3
 store-watermark-invariant	invariant	Scrollback::{new,with_block_size,clear,set_memory_budget,set_watermark_thresholds,sync_accounting}, ScrollbackStorage::watermark_level	∀ s ∈ Reach: (yellow, yellow_exit, red) = (threshold_bytes(Y, budget), threshold_bytes(50, budget), threshold_bytes(R, budget)) for the configured Y, R (default 80, 95); a fresh or cleared store is Green; after every mutator, level = recompute_watermark(previous level, budgeted_memory_used(), red, yellow, yellow_exit). ScrollbackStorage::watermark_level() is the inner store's.	8	type invariant over a large struct with &mut self methods; composes watermark-transition-table	0,1,2,4,6
 eager-promotion-at-yellow	contract	Scrollback::push_line, promote_hot_to_warm	∀ s ∈ Reach, l: push_line promotes one block hot→warm before appending ⇔ hot.len() ≥ hot_limit, or level ≥ Yellow ∧ hot.len() ≥ block_size. So below Yellow, fewer than hot_limit pushes leave warm and cold unchanged.	2	&mut self over VecDeque/Vec tiers, composition into LZ4 compression	0,1,2,4,7
@@ -135,9 +98,8 @@ decode-work-bound	other (cost)	Scrollback::{push_line,truncate,remove_newest}, w
 
 ## 2. Test → spec map (TSV)
 
-`primary` is the spec that retires the test. `also` lists other specs the same test samples. A
-test in §4 has `-` as its primary and its action in `also`. Paths are relative to
-`crates/aterm-scrollback`.
+`primary` is the spec that retires the test; `also` lists the other specs it samples. A §4 test
+has `-` as its primary and its action in `also`. Paths are relative to `crates/aterm-scrollback`.
 
 ```tsv
 file	test	primary	also
@@ -299,50 +261,27 @@ deterministic `records_walked <= 50` `decode-work-bound`). Zero non-spec tests r
    `budgeted_memory_used()` and `total_memory_used()` before and after crossing the compression horizon.**
 5. **Resolved: deleted uncalled `#[cfg(test)]` `HyperlinkSpan::width()`.**
 
-## 6. Proof order (easiest high-value first)
+## 6. Proof order
 
-No spec here is blocked by gap 0 alone: the crate's smallest functions still need E6 widening
-(gap 3) for `saturating_*`, casts or enum matches. The order starts with those, because gap 3 is
-the cheapest Trust work and the seal `150efe4a` already admits range matches on `u8`.
+The smallest functions still need E6 widening (gap 3) for `saturating_*`, casts or enum matches,
+so the order starts there.
 
-1. **`link-ceiling-formula`** and **`threshold-bytes-bounds`** (gaps 0, 3). These are a `const fn`
-   with `saturating_add`/`saturating_mul`, and a `u128` multiply-divide with a narrowing `min`. Both are
-   `omega`-class over the E6 import. They retire 2 tests, and `threshold-bytes-bounds` is a lemma of
-   `store-watermark-invariant` (8 tests).
-2. **`watermark-transition-table`** (gaps 0, 1, 2, 3). The free function `recompute_watermark` needs
-   only gap 3 (an enum match over 3 variants with `usize` compares); state it on the free function
-   first, and the `update_watermark_level` half (gap 2) after. It retires 8 tests and is the other lemma
-   of `store-watermark-invariant`.
-3. **`cell-attrs-codec-mask`** (gaps 0, 1, 3). A `[u8; 10]` LE round-trip and one bit mask. It needs
-   fixed-size arrays from gap 1, but no loops or heap data. It retires 3 tests and is the leaf of every
-   line codec spec.
-4. Then the scalar-state and short-loop specs: `warm-block-quarantine-fsm` (a `Cell<u8>` state
-   machine), `span-column-lookup`, `binary-search-counted` (one loop with an obvious invariant) and
-   `dec-string-decimal`.
-5. The codec cluster: `lz4-decode-classification` (13 tests), `record-is-valid-mirrors-deserialize`,
-   `line-decode-total-capped`, `block-decode-total-bounded`, then the strict and stripping decoders and
-   the round-trips. These need gaps 1, 5 and 7 and the `trust::skip` lifts.
+1. **`link-ceiling-formula`** and **`threshold-bytes-bounds`** (gap 3). Blocked: the seal compiles
+   the crate (PM-1 does not refuse it) but E6 refuses `max_linked_record_bytes` and
+   `threshold_bytes` for unsigned `saturating_add`/`saturating_mul`, `u128` division and `min`,
+   and the casts, and the native clause lane does not lower method calls or casts.
+   `threshold-bytes-bounds` is a lemma of `store-watermark-invariant`.
+2. **`watermark-transition-table`**: state it on the free function `recompute_watermark` (gap 3)
+   first, then the `update_watermark_level` half (gap 2). It is the other lemma of
+   `store-watermark-invariant`.
+3. **`cell-attrs-codec-mask`** (gaps 1, 3): a `[u8; 10]` LE round-trip and one bit mask, the leaf
+   of every line codec spec.
+4. The scalar-state and short-loop specs: `warm-block-quarantine-fsm` (a `Cell<u8>` state
+   machine), `span-column-lookup`, `binary-search-counted` and `dec-string-decimal`.
+5. The codec cluster: `lz4-decode-classification`, `record-is-valid-mirrors-deserialize`,
+   `line-decode-total-capped`, `block-decode-total-bounded`, then the strict and stripping decoders
+   and the round-trips (gaps 1, 5, 7 and the `trust::skip` lifts).
 6. The tier refinements: `hot-tier-deque`, `warm-tier-refines-seq`, `cold-tier-refines-seq`.
-7. The store refinements and invariants by composition (gap 4): `scrollback-refines-seq`,
-   `tier-shape-invariant`, `memory-accounting-exact`, `store-watermark-invariant`, `failure-atomicity`,
+7. By composition over those (gap 4): `scrollback-refines-seq`, `tier-shape-invariant`,
+   `memory-accounting-exact`, `store-watermark-invariant`, `failure-atomicity`,
    `store-corruption-semantics`, `iter-and-dense-walk-match-get-line`, `storage-delegates`.
-
-## 7. Gap histogram
-
-Specs blocked by each audit §7 gap (a spec counts once per gap it needs):
-
-| gap | specs |
-|---|---|
-| 0 seal | 53 |
-| 1 non-scalar carriers | 49 |
-| 2 `&self`/`&mut self` views | 32 |
-| 3 E6 body widening | 24 |
-| 4 callee-ensures composition | 22 |
-| 5 quantified clauses | 18 |
-| 6 plain-Rust clause publication | 2 |
-| 7 loops | 31 |
-| 8 effects | 9 |
-| 10 model→code refinement | 4 |
-| 11 generics | 1 |
-| 12 cross-crate citation | 5 |
-| 13 closures | 4 |

@@ -81,6 +81,31 @@ fn tail(bytes: &[u8]) -> String {
     String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(OUTPUT_KEEP)..]).into_owned()
 }
 
+fn open_regular_stdin(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(not(unix))]
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "stdin path is a symbolic link",
+        ));
+    }
+    let mut open = std::fs::OpenOptions::new();
+    open.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        open.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    }
+    let file = open.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "stdin path is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
 impl Runner for LiveRunner {
     fn run(&self, job: &Job<'_>) -> Result<Ran, RunFailed> {
         let mut cmd = aterm_uds::spawnfd::command(job.program);
@@ -93,13 +118,14 @@ impl Runner for LiveRunner {
         }
         let feed = match job.stdin {
             Some(path) => aterm_uds::spawnfd::Stdio::from(
-                std::fs::File::open(path).map_err(|e| RunFailed::NotRun(e.to_string()))?,
+                open_regular_stdin(path).map_err(|e| RunFailed::NotRun(e.to_string()))?,
             ),
             None => aterm_uds::spawnfd::Stdio::null(),
         };
-        let deadline = Instant::now()
+        let now = Instant::now();
+        let deadline = now
             .checked_add(job.budget)
-            .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400 * 365));
+            .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365));
         match aterm_uds::deadline::output_until_from(&mut cmd, feed, deadline) {
             Ok(out) => Ok(Ran {
                 exit: out.status.code(),
@@ -148,11 +174,17 @@ pub enum Kept {
     Excluded,
     /// Uninstalled here on purpose (`aterm pkg uninstall`).
     Removed,
+    /// Removal evidence could not be read; this grants no permission to install.
+    RemovalUnreadable,
 }
 
 /// Accounts v2's view of the Claude row that serves this machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaudeAccounts {
+    /// The account store whose current selection serves a review, when readable.
+    pub store: Option<crate::harness::accounts::Store>,
+    /// The configured roster path, including an absent file's path.
+    pub roster: Option<PathBuf>,
     /// The serving row's label (the own row's where the roster is refused or the records cannot
     /// be read).
     pub label: String,
@@ -164,13 +196,18 @@ pub struct ClaudeAccounts {
     /// cannot: its state or login bindings, and the folder that holds them (`state.json: not
     /// JSON (…), in <dir>`). The view then yields only that, as for a refused `accounts.toml`.
     pub unread: Option<String>,
+    /// Why the selected credential cannot execute, independently of its login health.
+    pub launch_refused: Option<String>,
+    /// Why no local sign-in can repair the selected account, with no eligible alternative.
+    pub sign_in_refused: Option<String>,
     /// Whether the row has an email and renews by itself.
     pub renews: bool,
     /// The login directory a renewal bound the row to, or `None` for the default login.
     pub login: Option<String>,
     /// Whether a login was made in that bound directory (`accounts::login_made`).
     pub made: bool,
-    /// `accounts::LoginState::as_str`, where the row renews.
+    /// `accounts::LoginState::as_str` where the row renews, or `"expired"` for a
+    /// plain row that the account store records as signed out.
     pub state: Option<&'static str>,
     /// The forecast end, when due.
     pub renew_by: Option<i64>,
@@ -195,7 +232,7 @@ pub struct ClaudeAccounts {
     /// renew` makes with no terminal). `false` where the row renews by no email.
     pub unattended: bool,
     /// The switch that keeps aterm's own sign-ins off here, where one does
-    /// ([`crate::harness::accounts_sync::sign_ins_off`]).
+    /// ([`crate::harness::accounts_sync::sign_ins_off_for`]).
     pub off: Option<&'static str>,
 }
 
@@ -203,7 +240,7 @@ pub struct ClaudeAccounts {
 /// `sign_in_attempt`, [`crate::harness::accounts::SignInAttempt`]): what aterm itself tried.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tried {
-    /// How it ended: `no-route` or `failed`.
+    /// How it ended: `no-route`, `failed` or `blocked`.
     pub outcome: &'static str,
     /// The routes its ladder tried and what each found, one bounded line.
     pub routes: String,
@@ -246,7 +283,7 @@ pub struct Facts {
     pub home_exists: bool,
     /// A login file seen, and when the vendor last wrote it.
     pub login_file: Option<(PathBuf, Option<i64>)>,
-    /// Whether Codex keeps its login in the OS keyring (`cli_auth_credentials_store`).
+    /// Whether Codex selects a non-file credential backend (`cli_auth_credentials_store`).
     pub hidden_store: bool,
     /// Claude: its profile names a signed-in account (`oauthAccount`).
     pub profile_signed_in: bool,
@@ -258,10 +295,73 @@ pub struct Facts {
     pub limited_until: Option<i64>,
     /// This layer's record.
     pub record: Record,
+    /// The provider's credential backend for this record; `None` for unscoped providers.
+    pub record_scope: Option<&'static str>,
+    /// Why the configured credential backend cannot be identified, without credential data.
+    pub credential_store_error: Option<String>,
     /// The row's credential variables set in this environment (names only).
     pub env_credentials: Vec<&'static str>,
     /// Its own accounts pool ([`pool_for`]); Claude Code's is [`Facts::accounts`].
     pub pool: Option<CliAccounts>,
+    /// The source a later review wave can recheck, even before a pool is configured.
+    pub review_source: Option<ReviewSource>,
+}
+
+/// Data needed to recheck a pooled review's account without creating a pool or binding.
+#[derive(Debug, Clone)]
+pub struct ReviewSource {
+    /// The existing account store's location; constructing it writes nothing.
+    pub store: crate::harness::accounts::Store,
+    /// The configured roster path, including when the file is absent.
+    pub roster: PathBuf,
+    /// The caller's config file; its pre-parsed mode is only a gather-time snapshot.
+    pub config: Option<PathBuf>,
+    /// An explicit rotation override; otherwise each wave reads the current config.
+    pub mode_override: Option<crate::harness::accounts::Mode>,
+    /// The measured Codex launch program, when this provider needs one.
+    pub program: Option<PathBuf>,
+}
+
+impl Facts {
+    /// The file account pool only owns launches and health while its backend is selected.
+    pub(crate) fn login_pool(&self) -> Option<&CliAccounts> {
+        self.pool.as_ref().filter(|_| {
+            !self.hidden_store && self.credential_store_error.is_none() && self.home_var.is_none()
+        })
+    }
+
+    /// Whether this run uses the default login rather than an explicit home or an
+    /// isolated account directory. A keyring-backed pool still uses the default login.
+    #[must_use]
+    pub(crate) fn uses_default_login(&self) -> bool {
+        self.home_var.is_none()
+            && self
+                .accounts
+                .as_ref()
+                .is_none_or(|account| account.login.is_none())
+            && (self.hidden_store
+                || self
+                    .pool
+                    .as_ref()
+                    .and_then(|pool| pool.serving_login.as_ref())
+                    .is_none_or(|(_, directory)| directory.is_none()))
+    }
+
+    /// Managed accounts own their health in the account store, including a managed
+    /// default home. The local CLI record belongs only to an unmanaged default login.
+    #[must_use]
+    pub(crate) fn default_record(&self) -> Option<&Record> {
+        if self.credential_store_error.is_some() {
+            return None;
+        }
+        let managed = self.accounts.as_ref().is_some_and(|a| {
+            a.listed || a.refused.is_some() || a.unread.is_some() || a.launch_refused.is_some()
+        }) || (!self.hidden_store
+            && self.pool.as_ref().is_some_and(|p| {
+                p.serving_label.is_some() || p.refused.is_some() || p.launch_refused.is_some()
+            }));
+        (self.uses_default_login() && !managed).then_some(&self.record)
+    }
 }
 
 /// What ends a refused launch of a pool's CLI ([`CliAccounts::launch_refused`]), which decides
@@ -291,6 +391,8 @@ pub struct CliAccounts {
     pub roster: PathBuf,
     /// Why the roster is refused, when it is.
     pub refused: Option<String>,
+    /// Why the serving account requires shared authority or an execution grant before local sign-in.
+    pub sign_in_refused: Option<String>,
     /// The row a sign-in signs in next: the first with an email whose login is not made here,
     /// else the first due, else the first with an email. A CLI whose renewals cannot approve its
     /// page (Grok Build's, [`crate::ai::connector::Cli::renews_headlessly`]) signs a row in by
@@ -319,6 +421,10 @@ pub struct CliAccounts {
     pub due: Vec<String>,
     /// The pool's on-disk store (`accounts::Store::at_for`), when loaded.
     pub store: Option<crate::harness::accounts::Store>,
+    /// An explicit rotation override; otherwise a review rereads the current config.
+    pub mode_override: Option<crate::harness::accounts::Mode>,
+    /// The Codex launch program whose credential-routing capabilities were measured.
+    pub program: Option<PathBuf>,
     /// The serving row's label, when the pool selects one: for Codex, Grok Build and Kimi Code
     /// CLI the row a launch aterm makes takes as the records stand
     /// ([`crate::harness::accounts_pool::launch_now`]) wherever it takes one, and under rotation
@@ -398,7 +504,7 @@ pub struct CliAccounts {
     /// ([`crate::harness::accounts_sync::bot_check_on_record_at`]).
     pub bot_check_at: Option<i64>,
     /// The switch that keeps aterm's own sign-ins off here, where one does
-    /// ([`crate::harness::accounts_sync::sign_ins_off`]).
+    /// ([`crate::harness::accounts_sync::sign_ins_off_for`]).
     pub off: Option<&'static str>,
 }
 
@@ -444,7 +550,7 @@ pub struct Machine<'a> {
     /// `aterm.toml` beside `roster`).
     pub accounts_mode: Option<crate::harness::accounts::Mode>,
     /// The caller's config file, whose `[harness]` switches can keep aterm's own sign-ins off
-    /// ([`crate::harness::accounts_sync::sign_ins_off`]); `None` reads none.
+    /// ([`crate::harness::accounts_sync::sign_ins_off_for`]); `None` reads none.
     pub config: Option<PathBuf>,
 }
 
@@ -555,6 +661,27 @@ pub fn launch_finds_nothing(program: &Path, path: Option<&OsStr>) -> bool {
 /// own row when it is, else the first ready row, else the own row. A refused roster yields only
 /// its refusal ([`ClaudeAccounts::refused`]), and unreadable state or login bindings only why
 /// ([`ClaudeAccounts::unread`]). `None` with no harness state root.
+fn local_sign_in_refusal(
+    row: &crate::harness::accounts::Row,
+    state: &crate::harness::accounts::State,
+    logins: &crate::harness::accounts::Logins,
+) -> Option<String> {
+    if let Some(holder) = &row.held_by {
+        return Some(format!(
+            "account {} is held for another Mac's warm set ({holder})",
+            row.label
+        ));
+    }
+    if let Err(why) = state.execution_verdict(&row.label) {
+        return Some(why.as_str().to_owned());
+    }
+    match logins.shared.required(row) {
+        Ok(None) => None,
+        Ok(Some(_)) => Some("this account requires a fresh root-authorized shared sign-in".into()),
+        Err(why) => Some(why),
+    }
+}
+
 fn claude_accounts(m: &Machine<'_>) -> Option<ClaudeAccounts> {
     use crate::harness::accounts;
     let store = accounts::Store::at(m.harness_state.as_ref()?);
@@ -580,10 +707,14 @@ fn claude_accounts(m: &Machine<'_>) -> Option<ClaudeAccounts> {
         });
     if refused.is_some() || unread.is_some() {
         return Some(ClaudeAccounts {
+            store: None,
+            roster: m.roster.clone(),
             label: crate::ai::login::OWN_LABEL.to_string(),
             listed: false,
             refused,
             unread,
+            launch_refused: None,
+            sign_in_refused: None,
             renews: false,
             login: None,
             made: false,
@@ -603,41 +734,41 @@ fn claude_accounts(m: &Machine<'_>) -> Option<ClaudeAccounts> {
         Some(Ok(r)) if !r.rows.is_empty() => Some(r),
         _ => None,
     };
-    let listed = listed_roster.is_some();
-    let roster = listed_roster.unwrap_or_else(accounts::Roster::own);
     let (state, logins) = cache.ok()?;
+    let Some(roster) = listed_roster else {
+        return Some(ClaudeAccounts {
+            store: Some(store),
+            roster: m.roster.clone(),
+            label: crate::ai::login::OWN_LABEL.to_owned(),
+            listed: false,
+            refused: None,
+            unread: None,
+            launch_refused: None,
+            sign_in_refused: None,
+            renews: false,
+            login: None,
+            made: false,
+            state: None,
+            renew_by: None,
+            limited_until: None,
+            served_at: None,
+            renewed_at: None,
+            signed_out_at: None,
+            next_sign_in: None,
+            tried: None,
+            unattended: false,
+            off: m.config.as_deref().and_then(|config| {
+                crate::harness::accounts_sync::sign_ins_off_for(
+                    config,
+                    crate::harness::accounts::Cli::Claude,
+                )
+            }),
+        });
+    };
     let bound = accounts::bound(&roster, &logins);
     let enrolled = accounts::enrolled(&bound);
-    let own_row = bound
-        .row_for_login(None)
-        .or_else(|| {
-            bound
-                .rows
-                .iter()
-                .find(|r| r.was.iter().any(Option::is_none))
-        })
-        .or_else(|| bound.rows.first())?;
-    let row_ready = |r: &accounts::Row| {
-        let here = r.dir.is_none() || enrolled.contains(&r.label);
-        here && matches!(
-            accounts::condition(r, &state, true, m.now),
-            accounts::Condition::Usable | accounts::Condition::Low | accounts::Condition::Unseen
-        )
-    };
-    let row = state
-        .active
-        .as_deref()
-        .and_then(|label| bound.row(label))
-        .filter(|r| row_ready(r))
-        .or_else(|| {
-            if row_ready(own_row) {
-                Some(own_row)
-            } else {
-                bound.rows.iter().find(|r| row_ready(r))
-            }
-        })
-        .unwrap_or(own_row)
-        .clone();
+    let (row, _) = select_claude_serving_row(&bound, &state, &enrolled, m.now)?;
+    let row = row.clone();
     let made = row
         .dir
         .as_deref()
@@ -654,15 +785,30 @@ fn claude_accounts(m: &Machine<'_>) -> Option<ClaudeAccounts> {
         cond,
         accounts::Condition::SignedOut | accounts::Condition::NotEnrolled
     );
-    let next_sign_in = if limited_until.is_some() || signed_out {
-        accounts::renew_next(&bound, &state, &enrolled, Some(&row.label), m.now)
-            .or_else(|| (signed_out && row.email.is_some()).then(|| row.label.clone()))
+    let local = |row: &accounts::Row| local_sign_in_refusal(row, &state, &logins).is_none();
+    let local_roster = accounts::Roster {
+        rows: bound
+            .rows
+            .iter()
+            .filter(|row| local(row))
+            .cloned()
+            .collect(),
+    };
+    let next_sign_in = if (limited_until.is_some() || signed_out) && (!state.pinned || local(&row))
+    {
+        accounts::renew_next(&local_roster, &state, &enrolled, Some(&row.label), m.now).or_else(
+            || (signed_out && local(&row) && row.email.is_some()).then(|| row.label.clone()),
+        )
     } else {
         None
     };
+    let sign_in_refused = next_sign_in
+        .is_none()
+        .then(|| local_sign_in_refusal(&row, &state, &logins))
+        .flatten();
     let target = next_sign_in.as_deref().unwrap_or(&row.label);
     let target_email = bound.row(target).and_then(|r| r.email.as_deref());
-    let renews_target = target_email.is_some();
+    let renews_target = target_email.is_some() && bound.row(target).is_some_and(local);
     let (login_state, renew_by) = if renews {
         let login = accounts::login_state(&row, &logins, &state, m.now);
         let by = match login {
@@ -670,14 +816,21 @@ fn claude_accounts(m: &Machine<'_>) -> Option<ClaudeAccounts> {
             _ => None,
         };
         (Some(login.as_str()), by)
+    } else if cond == accounts::Condition::SignedOut {
+        (Some("expired"), None)
     } else {
         (None, None)
     };
     Some(ClaudeAccounts {
         label: row.label.clone(),
-        listed,
+        listed: true,
         refused: None,
         unread: None,
+        launch_refused: state
+            .execution_verdict(&row.label)
+            .err()
+            .map(|why| why.as_str().to_owned()),
+        sign_in_refused,
         renews,
         login: row.dir.clone(),
         made,
@@ -694,18 +847,84 @@ fn claude_accounts(m: &Machine<'_>) -> Option<ClaudeAccounts> {
         tried: tried_of(&logins, target),
         unattended: renews_target
             && crate::harness::cli::claude_row_can_run_headless(
+                &|name| (m.var)(name).map(std::ffi::OsString::from),
+                true,
                 m.home.as_deref(),
                 &store,
                 &logins,
                 target,
                 target_email,
             ),
-        off: m
-            .config
-            .as_deref()
-            .and_then(crate::harness::accounts_sync::sign_ins_off),
+        off: m.config.as_deref().and_then(|config| {
+            crate::harness::accounts_sync::sign_ins_off_for(
+                config,
+                crate::harness::accounts::Cli::Claude,
+            )
+        }),
         next_sign_in,
+        store: Some(store),
+        roster: m.roster.clone(),
     })
+}
+
+/// Select Claude's current row and say whether it can serve a new review now.
+/// The fallback row remains available to the doctor even when no row is ready.
+pub(crate) fn select_claude_serving_row<'a>(
+    bound: &'a crate::harness::accounts::Roster,
+    state: &crate::harness::accounts::State,
+    enrolled: &std::collections::BTreeSet<String>,
+    now: i64,
+) -> Option<(&'a crate::harness::accounts::Row, bool)> {
+    use crate::harness::accounts;
+    if state.pinned
+        && let Some(row) = state.active.as_deref().and_then(|label| bound.row(label))
+        && state.execution_verdict(&row.label).is_err()
+    {
+        return Some((row, false));
+    }
+    let own = bound
+        .row_for_login(None)
+        .filter(|r| r.held_by.is_none())
+        .or_else(|| {
+            bound
+                .rows
+                .iter()
+                .find(|r| r.held_by.is_none() && r.was.iter().any(Option::is_none))
+        })
+        .or_else(|| bound.rows.iter().find(|r| r.held_by.is_none()))
+        .or_else(|| bound.row_for_login(None))
+        .or_else(|| {
+            bound
+                .rows
+                .iter()
+                .find(|r| r.was.iter().any(Option::is_none))
+        })
+        .or_else(|| bound.rows.first())?;
+    let ready = |row: &accounts::Row| {
+        row.held_by.is_none()
+            && state.execution_verdict(&row.label).is_ok()
+            && (row.dir.is_none() || enrolled.contains(&row.label))
+            && matches!(
+                accounts::condition(row, state, true, now),
+                accounts::Condition::Usable
+                    | accounts::Condition::Low
+                    | accounts::Condition::Unseen
+            )
+    };
+    let row = state
+        .active
+        .as_deref()
+        .and_then(|label| bound.row(label))
+        .filter(|row| ready(row))
+        .or_else(|| {
+            if ready(own) {
+                Some(own)
+            } else {
+                bound.rows.iter().find(|row| ready(row))
+            }
+        })
+        .unwrap_or(own);
+    Some((row, ready(row)))
 }
 
 /// Claude's profile: whether it names a signed-in account, and the plan.
@@ -727,19 +946,61 @@ fn claude_profile(m: &Machine<'_>, home: &Path) -> (bool, Option<String>) {
 /// account pool then has no row's own login file to start a session under.
 #[must_use]
 pub fn codex_keyring(home: &Path) -> bool {
-    let Ok(Some(text)) =
-        crate::harness::accounts::read_bounded(&home.join("config.toml"), 256 * 1024)
-    else {
-        return false;
+    codex_auth_store(home).is_ok_and(CodexAuthStore::hidden)
+}
+
+/// Whether Codex's readable configuration selects file credentials, including its default.
+/// Unknown or unreadable configuration cannot authorize a file-account launch or renewal.
+#[must_use]
+pub fn codex_file_store(home: &Path) -> bool {
+    codex_auth_store(home).is_ok_and(|storage| storage == CodexAuthStore::File)
+}
+
+/// The credential backend named by Codex's current configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodexAuthStore {
+    File,
+    Keyring,
+    Auto,
+    Ephemeral,
+}
+
+impl CodexAuthStore {
+    pub(crate) fn hidden(self) -> bool {
+        self != Self::File
+    }
+
+    pub(crate) const fn scope(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Keyring => "keyring",
+            Self::Auto => "auto",
+            Self::Ephemeral => "ephemeral",
+        }
+    }
+}
+
+/// Read the backend without opening any credential or accessing the OS keyring.
+/// # Errors
+/// The configuration cannot be read or parsed, or names an unknown backend.
+pub(crate) fn codex_auth_store(home: &Path) -> Result<CodexAuthStore, String> {
+    let text = crate::harness::accounts::read_bounded(&home.join("config.toml"), 256 * 1024)
+        .map_err(|why| format!("cannot read Codex credential storage configuration: {why}"))?;
+    let Some(text) = text else {
+        return Ok(CodexAuthStore::File);
     };
-    aterm_toml::from_str::<aterm_toml::Value>(&text)
-        .ok()
-        .and_then(|doc| {
-            doc.get("cli_auth_credentials_store")
-                .and_then(aterm_toml::Value::as_str)
-                .map(|s| matches!(s, "keyring" | "auto" | "ephemeral"))
-        })
-        .unwrap_or(false)
+    let doc = aterm_toml::from_str::<aterm_toml::Value>(&text)
+        .map_err(|_| "cannot parse Codex credential storage configuration".to_owned())?;
+    match doc.get("cli_auth_credentials_store") {
+        None => Ok(CodexAuthStore::File),
+        Some(value) => match value.as_str() {
+            Some("file") => Ok(CodexAuthStore::File),
+            Some("keyring") => Ok(CodexAuthStore::Keyring),
+            Some("auto") => Ok(CodexAuthStore::Auto),
+            Some("ephemeral") => Ok(CodexAuthStore::Ephemeral),
+            _ => Err("unknown Codex credential storage backend".to_owned()),
+        },
+    }
 }
 
 /// A CLI's stored login file under `dir` (`stat`ed, never opened), with its write time.
@@ -784,12 +1045,13 @@ pub fn gather(m: &Machine<'_>, c: &'static Connector) -> Facts {
         Some(Kept::Unavailable)
     } else if m.exclude.iter().any(|e| e == c.id) {
         Some(Kept::Excluded)
-    } else if managed.is_none()
-        && m.pkg
+    } else if managed.is_none() {
+        m.pkg
             .as_ref()
-            .is_some_and(|l| l.removed_programs().contains(c.id))
-    {
-        Some(Kept::Removed)
+            .and_then(|layout| match layout.removed_programs() {
+                Ok(removed) => removed.contains(c.id).then_some(Kept::Removed),
+                Err(_) => Some(Kept::RemovalUnreadable),
+            })
     } else {
         None
     };
@@ -810,7 +1072,15 @@ pub fn gather(m: &Machine<'_>, c: &'static Connector) -> Facts {
         (false, _) => (false, None, None),
     };
     let is_codex = c.id == super::connector::CODEX.id;
-    let hidden_store = is_codex && home.as_ref().is_ok_and(|h| codex_keyring(h));
+    let (storage, credential_store_error) = match (is_codex, home.as_ref()) {
+        (true, Ok(home)) => match codex_auth_store(home) {
+            Ok(storage) => (Some(storage), None),
+            Err(why) => (None, Some(why)),
+        },
+        _ => (None, None),
+    };
+    let hidden_store = storage.is_some_and(CodexAuthStore::hidden);
+    let record_scope = storage.map(CodexAuthStore::scope);
     // The Codex a launch aterm makes runs, the one program every judge of a row's own login
     // reads (`worker::codex_launch_program`), here from this machine's atpkg layout.
     let launch_program = is_codex.then(|| {
@@ -822,20 +1092,55 @@ pub fn gather(m: &Machine<'_>, c: &'static Connector) -> Facts {
             pool_for_with(
                 m,
                 cli,
-                is_codex.then_some(hidden_store),
+                is_codex.then_some(hidden_store || credential_store_error.is_some()),
                 launch_program.as_deref(),
             )
         })
     } else {
         None
     };
+    let review_source = default_home
+        .then(|| {
+            let cli = crate::harness::accounts::Cli::parse(c.id)?;
+            if cli == crate::harness::accounts::Cli::Claude {
+                return None;
+            }
+            cli.accounts().signin.as_ref()?;
+            Some(ReviewSource {
+                store: crate::harness::accounts::Store::at_for(
+                    m.harness_state.as_deref()?,
+                    cli,
+                    m.home.as_deref()?,
+                ),
+                roster: m
+                    .roster
+                    .as_ref()?
+                    .parent()?
+                    .join(cli.accounts().roster_file),
+                config: m.config.clone(),
+                mode_override: if m.config.is_some() {
+                    None
+                } else {
+                    m.accounts_mode
+                },
+                program: launch_program.clone(),
+            })
+        })
+        .flatten();
     let login_file = match pool.as_ref().filter(|p| p.serving_login.is_some()) {
+        _ if hidden_store || credential_store_error.is_some() => None,
         Some(p) => p.serving_login_file.clone(),
         None => home_login_file,
     };
     let limited_until = match pool.as_ref().filter(|p| p.serving_login.is_some()) {
+        _ if hidden_store || credential_store_error.is_some() => None,
         Some(p) => p.limited_until.or_else(|| {
-            if is_codex && p.enrolled <= 1 {
+            if is_codex
+                && p.enrolled <= 1
+                && p.serving_login
+                    .as_ref()
+                    .is_some_and(|(_, directory)| directory.is_none())
+            {
                 home.as_ref()
                     .ok()
                     .and_then(|h| codex_limit(h, p.renewed_at, m.now))
@@ -862,7 +1167,13 @@ pub fn gather(m: &Machine<'_>, c: &'static Connector) -> Facts {
         plan,
         accounts,
         limited_until,
-        record: m.records.of(c.id),
+        record: if is_codex && storage.is_none() {
+            Record::default()
+        } else {
+            m.records.of_scope(c.id, record_scope)
+        },
+        record_scope,
+        credential_store_error,
         env_credentials: c
             .credential_env
             .iter()
@@ -870,6 +1181,7 @@ pub fn gather(m: &Machine<'_>, c: &'static Connector) -> Facts {
             .filter(|k| (m.var)(k).is_some_and(|v| !v.is_empty()))
             .collect(),
         pool,
+        review_source,
     }
 }
 
@@ -899,11 +1211,12 @@ fn pool_for_with(
     cli.accounts().signin.as_ref()?;
     let config_dir = m.roster.as_ref()?.parent()?;
     let roster_path = config_dir.join(cli.accounts().roster_file);
-    if !roster_path.is_file() {
-        return None;
-    }
-    let roster = match accounts::Roster::load_for(cli, &roster_path) {
-        Ok(roster) => roster,
+    let roster = match accounts::roster_text(&roster_path).and_then(|text| {
+        text.map(|text| accounts::Roster::parse_for(cli, &text))
+            .transpose()
+    }) {
+        Ok(None) => return None,
+        Ok(Some(roster)) => roster,
         Err(why) => {
             return Some(CliAccounts {
                 roster: roster_path,
@@ -938,11 +1251,13 @@ fn pool_for_with(
     let default_login = store_file_in(&default_dir, c.stores);
     let bound = accounts::bound(&roster, &logins);
     let enrolled_here = accounts::enrolled_in(cli, &bound, user_home);
-    let with_email = || bound.rows.iter().filter(|r| r.email.is_some());
-    let due: Vec<String> = bound
-        .rows
-        .iter()
-        .filter(|row| row.email.is_some() && enrolled_here.contains(&row.label))
+    let emails = bound.rows.iter().filter(|r| r.email.is_some()).count();
+    let local = |row: &accounts::Row| local_sign_in_refusal(row, &state, &logins).is_none();
+    let executable =
+        |row: &accounts::Row| row.held_by.is_none() && state.execution_verdict(&row.label).is_ok();
+    let with_email = || bound.rows.iter().filter(|r| local(r) && r.email.is_some());
+    let due: Vec<String> = with_email()
+        .filter(|row| enrolled_here.contains(&row.label))
         .filter(|row| {
             matches!(
                 accounts::login_state(row, &logins, &state, m.now),
@@ -957,7 +1272,7 @@ fn pool_for_with(
         .or_else(|| due.first().cloned())
         .or_else(|| with_email().next().map(|r| r.label.clone()))
         .or_else(|| {
-            let no_email = || bound.rows.iter().filter(|r| r.email.is_none());
+            let no_email = || bound.rows.iter().filter(|r| local(r) && r.email.is_none());
             (!cli.renews_headlessly())
                 .then(|| {
                     no_email()
@@ -972,13 +1287,12 @@ fn pool_for_with(
         .iter()
         .filter(|r| enrolled_here.contains(&r.label))
         .count();
-    let emails = with_email().count();
     let default_home = c
         .home
         .var
         .is_none_or(|v| (m.var)(v).is_none_or(|s| s.is_empty()));
     let hidden_store =
-        cli == Cli::Codex && codex_hidden_store.unwrap_or_else(|| codex_keyring(&default_dir));
+        cli == Cli::Codex && codex_hidden_store.unwrap_or_else(|| !codex_file_store(&default_dir));
     let mode = m.accounts_mode.unwrap_or_else(|| {
         crate::supervise::config::SupervisorConfig::from_path(Some(&config_dir.join("aterm.toml")))
             .0
@@ -997,7 +1311,9 @@ fn pool_for_with(
     let serving =
         if !bound.rows.is_empty() && cli.accounts().measured && default_home && !hidden_store {
             let active = state.active.as_deref().and_then(|label| bound.row(label));
-            if mode == Mode::Off {
+            if state.pinned && active.is_some_and(|row| !executable(row)) {
+                active
+            } else if mode == Mode::Off {
                 // Rotation off takes the owner's pin, else no row: a plain launch runs on this
                 // machine's own login, whose row's records are then the ones that stand.
                 if state.pinned {
@@ -1008,6 +1324,15 @@ fn pool_for_with(
             } else {
                 let own = bound
                     .row_for_login(None)
+                    .filter(|r| executable(r))
+                    .or_else(|| {
+                        bound
+                            .rows
+                            .iter()
+                            .find(|r| executable(r) && r.was.iter().any(Option::is_none))
+                    })
+                    .or_else(|| bound.rows.iter().find(|r| executable(r)))
+                    .or_else(|| bound.row_for_login(None))
                     .or_else(|| {
                         bound
                             .rows
@@ -1022,18 +1347,20 @@ fn pool_for_with(
                             bound
                                 .rows
                                 .iter()
-                                .filter(|r| r.class == cls)
+                                .filter(|r| executable(r) && r.class == cls)
                                 .find(|r| pred(r))
                         })
                 };
                 active
-                    .filter(|r| (state.pinned && row_present(r)) || row_cond(r).fresh())
-                    .or_else(|| own.filter(|r| row_cond(r).fresh()))
+                    .filter(|r| {
+                        executable(r) && ((state.pinned && row_present(r)) || row_cond(r).fresh())
+                    })
+                    .or_else(|| own.filter(|r| executable(r) && row_cond(r).fresh()))
                     .or_else(|| first_in_class(&|r| row_cond(r).fresh()))
-                    .or_else(|| active.filter(|r| row_ready(r)))
-                    .or_else(|| own.filter(|r| row_ready(r)))
+                    .or_else(|| active.filter(|r| executable(r) && row_ready(r)))
+                    .or_else(|| own.filter(|r| executable(r) && row_ready(r)))
                     .or_else(|| first_in_class(&row_ready))
-                    .or_else(|| bound.rows.iter().find(|r| row_present(r)))
+                    .or_else(|| bound.rows.iter().find(|r| executable(r) && row_present(r)))
                     .or(own)
             }
         } else {
@@ -1093,7 +1420,9 @@ fn pool_for_with(
     // it is signed out here, whatever else the pool would sign in next: no other row runs there.
     // One held for another Mac's warm set or leased elsewhere is no sign-in target here.
     let default_sign_in = match &default_serving {
-        Some(crate::harness::codex_alab::DefaultRow::SignedOut { label, .. }) if unread => {
+        Some(crate::harness::codex_alab::DefaultRow::SignedOut { label, .. })
+            if unread && bound.row(label).is_some_and(local) =>
+        {
             Some(label.clone())
         }
         _ => None,
@@ -1136,7 +1465,9 @@ fn pool_for_with(
             _ if launch_step.is_some() => LaunchEnd::Owner,
             Some(None) => LaunchEnd::Owner,
             Some(Some(row)) if unread && row.dir.is_some() => LaunchEnd::Owner,
-            Some(Some(row)) if !row_present(row) => LaunchEnd::SignIn(row.label.clone()),
+            Some(Some(row)) if local(row) && !row_present(row) => {
+                LaunchEnd::SignIn(row.label.clone())
+            }
             _ if unread
                 && matches!(
                     default_serving,
@@ -1151,13 +1482,22 @@ fn pool_for_with(
     let mut out = CliAccounts {
         roster: roster_path,
         refused: None,
-        next,
+        next: next.filter(|_| {
+            !state.pinned
+                || state
+                    .active
+                    .as_deref()
+                    .and_then(|label| bound.row(label))
+                    .is_none_or(local)
+        }),
         rows: bound.rows.len(),
         emails,
         enrolled: enrolled_count,
         signed_in: bound.rows.iter().filter(|r| row_present(r)).count(),
         due,
         store: Some(store),
+        mode_override: m.accounts_mode,
+        program: program.map(Path::to_path_buf),
         default_label: default_row.map(|r| r.label.clone()),
         default_row: default_serving,
         unread,
@@ -1196,7 +1536,8 @@ fn pool_for_with(
                         .rows
                         .iter()
                         .filter(|r| {
-                            r.class == cls
+                            local(r)
+                                && r.class == cls
                                 && r.label != row.label
                                 && r.email.is_some()
                                 && matches!(
@@ -1211,7 +1552,12 @@ fn pool_for_with(
                         .map(|r| r.label.clone())
                         .next()
                 })
-                .or_else(|| (signed_out && row.email.is_some()).then(|| row.label.clone()));
+                .or_else(|| {
+                    (signed_out && local(row) && row.email.is_some()).then(|| row.label.clone())
+                });
+            if state.pinned && !local(row) {
+                out.next_sign_in = None;
+            }
             if let Some(next) = &out.next_sign_in {
                 out.next = Some(next.clone());
             }
@@ -1247,6 +1593,9 @@ fn pool_for_with(
         // there: `aterm ai login` signs in nothing.
         out.next = None;
     }
+    if out.next.is_none() {
+        out.sign_in_refused = serving.and_then(|row| local_sign_in_refusal(row, &state, &logins));
+    }
     // What stands on record of the row a sign-in signs in, and the switches that keep aterm's
     // own sign-ins off here.
     if let Some((label, _)) = out.sign_in_target(cli) {
@@ -1269,7 +1618,7 @@ fn pool_for_with(
     out.off = m
         .config
         .as_deref()
-        .and_then(crate::harness::accounts_sync::sign_ins_off);
+        .and_then(|config| crate::harness::accounts_sync::sign_ins_off_for(config, cli));
     Some(out)
 }
 

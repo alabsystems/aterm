@@ -17,7 +17,7 @@ use atpkg_publish::error::{Error, Result};
 use atpkg_publish::host::fake::{FakeHost, FakeRelease};
 use atpkg_publish::host::{Replace, Slug};
 use atpkg_publish::identity::MachineKey;
-use atpkg_publish::lane::report::{Notifier as _, Recorded};
+use atpkg_publish::lane::report::{NoticeSink as _, Recorded};
 use atpkg_publish::testkit::{Keys, NOW};
 use atpkg_publish::triple::Triple;
 
@@ -230,7 +230,7 @@ impl Fx {
             lacks: self.packer.lacks.lock().expect("lacks").clone(),
             indexes: self.indexer.requests.lock().expect("requests").clone(),
             index_fail: self.indexer.fail.load(Ordering::SeqCst),
-            notes: self.notes.shown(),
+            notes: self.notes.entries(),
             ledger: self.ledger.lock().expect("ledger").clone(),
         }
     }
@@ -274,7 +274,7 @@ impl Fx {
             .collect();
         let notes = Recorded::default();
         for note in &held.notes {
-            notes.notify("", note);
+            notes.record("", note);
         }
         Self {
             packer: FakePacker {

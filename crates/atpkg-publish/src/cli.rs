@@ -48,6 +48,12 @@ pub const VERBS: &[Verb] = &[
         synopsis: "build-local <program> <checkout> [--plan] [--policy repository|unverified] [--profile release|dev] [--jobs N] [--toolchain BIN] [--out DIR] [--link]",
         does: "development build of a program: unsigned, never packed or uploaded",
     },
+    #[cfg(unix)]
+    Verb {
+        name: "harness-local",
+        synopsis: crate::harness_local::SYNOPSIS,
+        does: "run or inspect guarded local harness updates; selection changes only local current",
+    },
     Verb {
         name: "sign",
         synopsis: "sign <pkg.toml>… [--trust-repo DIR]",
@@ -56,7 +62,7 @@ pub const VERBS: &[Verb] = &[
     Verb {
         name: "upload",
         synopsis: "upload <staging|public> <repo> <tag> <file>…",
-        does: "replace or add assets on a standing release with that owner's token (the signing ceremony's re-upload)",
+        does: "upload release assets; managed pack staging reserves its version, and raw public managed-pack replacement is refused",
     },
     Verb {
         name: "index",
@@ -82,6 +88,16 @@ pub const VERBS: &[Verb] = &[
         name: "lane",
         synopsis: "lane run <alab|linux> [--dry-run] [--sha256 HEX] [--log FILE] [--triple T]… | lane install <alab|linux> [--allow-dirty] [--no-arm] [--keyless] | lane disarm <alab|linux>",
         does: "run, install or disarm an unattended lane (--triple and --keyless: linux only; a run without --dry-run needs its installed unit's --sha256)",
+    },
+    Verb {
+        name: "hosts",
+        synopsis: "hosts check [--host agh-staging|agh] [--unit-env] [--keyless]",
+        does: "whether this builder's agh.toml is ready for --host agh-staging or agh (reads files, sends nothing)",
+    },
+    Verb {
+        name: "agh",
+        synopsis: "agh <agh arguments>",
+        does: "agh's CLI as this binary: the lanes' git credential helper",
     },
 ];
 
@@ -119,6 +135,8 @@ pub fn dispatch(ctx: &Ctx, verb: &str, rest: &[String]) -> Result<()> {
         "pack-package" => artifact::package::run(ctx, rest),
         "pack-bottle" => artifact::bottle::run(ctx, rest),
         "build-local" => artifact::build_local::run(ctx, rest),
+        #[cfg(unix)]
+        "harness-local" => crate::harness_local::run(ctx, rest),
         "sign" => artifact::sign::run(ctx, rest),
         "upload" => artifact::upload::run(ctx, rest),
         "index" => channel::index::run(ctx, rest),
@@ -126,6 +144,10 @@ pub fn dispatch(ctx: &Ctx, verb: &str, rest: &[String]) -> Result<()> {
         "publish-group" => channel::group::run(ctx, rest),
         "status" => channel::status::run(ctx, rest),
         "lane" => lane::run(ctx, rest),
+        "hosts" => crate::hosts_check::run(ctx, rest),
+        "agh" => Err(Error::cannot_run(
+            "not yet: the agh forwarding verb lands in WP12",
+        )),
         other => Err(Error::usage(format!(
             "unknown verb `{other}` — `atpkg-publish help` lists them"
         ))),

@@ -22,7 +22,9 @@ use crate::effect_util::{
 };
 use crate::genome::mix;
 use crate::rainbow_kitty::meteor::tri;
-use crate::rainbow_kitty::ribbon::{PAPER_MARK_CONTRAST, paper_mark_ink};
+use crate::rainbow_kitty::ribbon::PAPER_MARK_CONTRAST;
+#[cfg(test)]
+use crate::rainbow_kitty::ribbon::paper_mark_ink;
 use crate::ripple::{
     FLOW_STEP_MS, GLINT_CREST_DARK, GLINT_CREST_LIGHT, GLINT_PERIOD_MS, cell_distance, glint,
 };
@@ -724,8 +726,24 @@ impl LineInks {
         self.key = Some((palette, ground));
     }
 
+    #[cfg(test)]
     #[inline]
     fn at(&self, palette: CardPalette, ground: u32, at: f32) -> u32 {
+        let ground = ground & 0x00FF_FFFF;
+        let table = crate::color_math::relative_luminance_table();
+        let y_bg = crate::color_math::relative_luminance_with(table, ground);
+        self.at_with_ground_lum(table, palette, ground, y_bg, at)
+    }
+
+    #[inline]
+    fn at_with_ground_lum(
+        &self,
+        table: &crate::color_math::RelativeLuminanceTable,
+        palette: CardPalette,
+        ground: u32,
+        y_bg: f32,
+        at: f32,
+    ) -> u32 {
         let step =
             ((at.clamp(0.0, 1.0) * LINE_INK_STEPS as f32).round() as usize).min(LINE_INK_STEPS);
         if self.key == Some((palette, ground)) {
@@ -733,7 +751,7 @@ impl LineInks {
         } else {
             #[cfg(any(test, debug_assertions))]
             LINE_INK_SOLVES.with(|n| n.set(n.get() + 1));
-            palette.text_at(step as f32 * Self::INV_LINE_INK_STEPS, ground)
+            palette.text_at_with_bg_lum(table, step as f32 * Self::INV_LINE_INK_STEPS, y_bg)
         }
     }
 }
@@ -898,6 +916,7 @@ impl CardPalette {
         print_line(self.stripe(k, false))
     }
 
+    #[cfg(test)]
     #[inline]
     const fn text_at(self, t: f32, ground: u32) -> u32 {
         match self {
@@ -924,6 +943,7 @@ impl CardPalette {
     }
 }
 
+#[cfg(test)]
 #[inline]
 const fn paper_silver_ink(rgb: u32, ground: u32) -> u32 {
     let table = crate::color_math::relative_luminance_table();
@@ -2695,11 +2715,18 @@ impl HarnessCard {
         };
         let phi = clock.line_drift(LINE_DRIFT);
         let env = clock.head_env();
-        let pos = (clock.u() * LINE_SWEEPS).fract() * 1.4 - 0.2;
+        let pos = if env == 0.0 {
+            0.0
+        } else {
+            (clock.u() * LINE_SWEEPS).fract() * 1.4 - 0.2
+        };
         let inv_span = 1.0 / f32::from(at.len.saturating_sub(1).max(1));
         let hero = at.hero.clone();
-        let inv_hero_span =
-            1.0 / f32::from(hero.end.saturating_sub(hero.start).saturating_sub(1).max(1));
+        let inv_hero_span = if hero.is_empty() {
+            0.0
+        } else {
+            1.0 / f32::from(hero.end.saturating_sub(hero.start).saturating_sub(1).max(1))
+        };
         let (wc, wr) = at.wand.unwrap_or((at.col, at.row));
         let wc_f = f32::from(wc);
         let dy_rows = f32::from(at.row) - f32::from(wr);
@@ -2758,7 +2785,7 @@ impl HarnessCard {
                     )
                 } else {
                     mix_rgb(
-                        inks.at(palette, ground, place),
+                        inks.at_with_ground_lum(table, palette, ground, lg, place),
                         0,
                         crest * LINE_SWEEP_GAIN_LIGHT,
                     )
@@ -2777,7 +2804,7 @@ impl HarnessCard {
                     )
                 } else {
                     mix_rgb(
-                        inks.at(palette, ground, place),
+                        inks.at_with_ground_lum(table, palette, ground, lg, place),
                         0,
                         crest * LINE_SWEEP_GAIN_LIGHT,
                     )

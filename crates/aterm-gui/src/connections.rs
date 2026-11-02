@@ -413,6 +413,7 @@ mod tests {
             frame: Default::default(),
             witness: Default::default(),
             fenced_writes: Default::default(),
+            native_policy: Default::default(),
         });
         SessionHandle {
             sid,

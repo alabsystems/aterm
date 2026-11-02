@@ -91,7 +91,16 @@ fn trailer(line: &str, out: &mut Spans) {
         }
         byte.is_ascii_alphanumeric() || byte == b'-'
     });
-    if cur.pos() > 0 && hyphens > 0 && cur.eat(b':') && cur.peek().is_none_or(line_space) {
+    let bytes = line.as_bytes();
+    if cur.pos() > 0
+        && hyphens > 0
+        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes
+            .get(cur.pos() - 1)
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && cur.eat(b':')
+        && cur.peek().is_none_or(line_space)
+    {
         out.push(0, cur.pos(), SyntaxClass::Keyword);
     }
 }

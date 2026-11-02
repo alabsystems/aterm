@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use super::LaneKind;
+use crate::ctx::HostChoice;
 
 /// The Apple lane's launchd label.
 pub const LAUNCHD_LABEL: &str = "systems.alab.aterm-auto-alab";
@@ -39,6 +40,8 @@ pub struct UnitSpec {
     pub xdg_config_home: PathBuf,
     /// The atpkg shim dir (`<prefix>/bin`), first on PATH.
     pub shim_bin: PathBuf,
+    /// Which hosts the unit's runs build (`--host`, §16.1): `gh` until WP15.
+    pub host: HostChoice,
 }
 
 impl UnitSpec {
@@ -65,6 +68,7 @@ impl UnitSpec {
     pub fn xdg_state_home(&self) -> PathBuf {
         self.state_dir
             .parent()
+            .filter(|p| !p.as_os_str().is_empty())
             .map_or_else(|| self.state_dir.clone(), Path::to_path_buf)
     }
 

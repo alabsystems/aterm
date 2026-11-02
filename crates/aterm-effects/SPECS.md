@@ -1,7 +1,7 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-effects: spec recovery from its 3027 unit tests
+# aterm-effects: spec recovery from unit tests
 
 > 2026-10-26: the harness switch is words alone on the rule (`● on` / `○ off`, the owner: "make
 > the harness on/off switch more subtle"), so its capsule sprite is gone: `harness_switch` became
@@ -115,6 +115,12 @@
 > `custom_kitty_footprint_matches_emission_at_interior_right_and_top_edges` now requires row-zero custom art
 > to land whole beside its row; it pinned the old partial clip.
 
+> 2026-10-30, ATERM-KI-1025-1: `aos-key-hold` and `aos-key-hold-refines-model` (§1) are the
+> momentum host's hold on typed keys that wait for their echo and its refinement of
+> `aterm_models_aos::aos_key_hold_model`, with their 14 tests in `src/aos_momentum/hold_tests.rs`
+> and `src/aos_momentum/hold_conformance_tests.rs` (§2), written with the code and run. The counts
+> elsewhere in this file were taken before them.
+
 > 2026-10-24: §8 adds the seven specs of Aos M5a's aterm-effects half (`int_bag_mlp`, `tone_int`)
 > with their 50 tests. `tone-asset-decoder-fail-closed` (§1) now also names `tone::raw`, the verified
 > raw view `ToneModel::from_bytes` is rebuilt on. §3's counts were taken before §7 and §8.
@@ -124,120 +130,69 @@
 > `src/aos_momentum/lease_conformance_tests.rs` (§2). The counts elsewhere in this file were taken
 > before it.
 
-> 2026-10-19: `tests/the_owners_composer_gaps/shipping_present.rs` exercises the shared
-> `EffectsPipeline::cursor_step`; its finite F1–F5 laws are ordinary deterministic tests.
-> Established-hand repaint proofs compare prior/retained row content and exact ordered unpaid
-> keys; split insertions also preserve the whole old prefix and tail. The classifier spends
-> those keys once and paints only observed spans. Committed takes are headless terminal-byte
-> replays through that pipeline, not evidence of native presentation.
+No row can be Certified yet: a strict `targo trust check -p aterm-effects` refuses the unit under
+Trust PM-1 before any obligation runs, because the crate derives through `serde`
+(`aterm-serde-derive`). Stage 2 of `docs/PLAN-pm1-proc-macro-reach-2026-10-16.md` moves the derives
+out.
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 863 tests
-> it deleted and 19 specs whose functions it deleted are gone. Counts elsewhere in this file
-> were taken before.
->
-> 2026-10-17: three more specs went with code deleted since: `pl-trail-pack` (Trail Packs),
-> `hole-tripwire` (the Rainbow Kitty v2 hole tripwire) and `v1-refines-v056` (the frozen v0.56
-> synth reference). Two §2 rows of deleted tests went too, and their specs' `primary_tests`
-> dropped by one each. Two renamed tests now carry their new names. Four §4 rows whose work is
-> done went (the two cursor benches and the v2 frame-cost budget live in `benches/`, the
-> wrap-band census is deleted), and so did the §5 item about the companion router's test-only
-> composition, which is deleted; the items after it moved up one.
-
-> Status 2026-10-15: this is the crate's migration worklist. Each of the 855 specs below is
-> proved through Trust/Clean about the compiled Rust function, then the tests it subsumes are
-> deleted. The 97 tests in §4 sample no spec; delete or move them as §4 says. Nothing here is
-> proved yet.
->
-> **Blocked on seal `150efe4a` (measured 2026-10-16): the whole crate, not one spec.** A strict
-> `targo trust check -p aterm-effects` refuses the unit before any obligation runs:
-> `verified Targo refuses unit aterm-effects … in-process proc-macro dependencies
-> [aterm-serde-derive] … Evidence-grade verification currently enforces a no-proc-macro TCB
-> boundary` (Trust PM-1, `reject_in_process_proc_macro_tcb`). The crate derives through
-> `serde = aterm-serde` with `features = ["derive"]`. `--allow-l0-gaps` compiles it but forfeits
-> proof authority, so no row here can be Certified until either aterm-serde-derive is an audited
-> provider in Trust or the derives leave this crate (hand-written impls, or the config types moved
-> to a crate of their own). This gap comes before gap 0 for every row, including the four
-> gap-0-only specs in §6.1 (`momentum-glow-allowed`, `mo-load-shed-exempt`, `mo-serious`,
-> `rkc-heroes`). Their tests stay.
-
-Source: `crates/aterm-effects` (read only), every `#[test]` under `src/` and `tests/`, recovered
-in eleven parallel chunks and merged here. `grep -c '#\[test\]'` reports 3,031; four of those hits
-are mentions in comments (`tests/effects_suite.rs`, `tests/pet_holds_through_a_torn_frame.rs`,
-`tests/trick_flash_alloc.rs`, `tests/typed_tricks_alloc.rs`), so the crate has 3027 tests.
-Nothing was compiled or run; every claim comes from reading the code and the tests.
-
-Result: **855 specs**, covering **2931 tests** as primary. **97 tests are not spec
-samples** (§4). Every test the recovery read is in exactly one of §2 or §4; tests written
-after it (the 2026-10 cursor-trail lanes' among them) are not listed, and nothing keeps this map
-in step with the suite.
-
-Specs that were the same property seen from different chunks were merged: the exact-tile baker
-LRU (pet, animal and robi bakers), the bounded regular-file read (file_feed, toy packs), the
-bounded Bresenham tail (cursor_trail, trail_sweep), `foreign_to_live` (seam laws, zsh isearch),
-the launch look (kitty_cursor, kitty_registry), `motion_caret` (host, torn-repaint tests), the
-cohort walk invariant (ribbon, the insert-colour and walk-census tests), the glow licence, payment,
-park, quad and idle-to-zero laws (the cursor_glow unit tests and the host-seam integration tests).
-
-## 0. Notation used in the statements
+## 0. Notation
 
 - Paths in §2 and §4 are relative to `crates/aterm-effects/`. Function names are relative to the
   crate (`cursor_glow::seam::…`, `rainbow_kitty::ribbon::…`); `mod::` is `rainbow_kitty/mod.rs`.
-- **Gap numbers** are the rows of §7 in the historical development audit
-  `docs/AUDIT-trust-for-test-migration-2026-10-15.md`.
-  Row 0 (a seal that publishes Clean rows) blocks every spec and is listed on every row. f32
-  arithmetic (exp, powf, sin, sqrt, round, casts, NaN) is refused by E6 today and has no row of its
-  own; it is filed under 3 (body widening) and 6 (publishing SMT-proved clauses). The audit should
-  give floats a row. `&mut self` two-state reasoning is 2; Vec/String/Option/struct carriers are 1;
-  `ty_model!` refinement bindings are 10; cross-crate citations (aterm_core, aterm_render,
-  aterm_lexicon, aterm_scene) are 12.
+- **Gaps** (`blocking_gaps`) are rows of the gap table in
+  `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7: 0 a seal that publishes Clean rows (on
+  every row), 1 non-scalar carriers (Vec, String, Option, structs), 2 `&mut self` two-state
+  reasoning, 3 body widening, 4 callee-ensures composition, 5 quantified clauses, 6 publishing
+  SMT-proved clauses, 7 loops, 8 effects, 9 the proc-macro boundary, 10 `ty_model!` refinement
+  bindings, 11 generics, 12 cross-crate citations (aterm_core, aterm_render, aterm_lexicon,
+  aterm_scene), 13 threads, async and closures, 14 Clean elaborator coverage, 16 soundness. f32
+  arithmetic has no row of its own and is filed under 3 and 6.
 - **Reach(X)**: the states of engine X reachable from its `new()`/`default()` by any sequence of
-  its public calls with a non-decreasing injected clock (`aterm_time::Instant`). Every behavioural
-  spec quantifies over Reach and over call scripts; the tests are samples of such scripts.
+  its public calls under a non-decreasing injected clock (`aterm_time::Instant`). Behavioural specs
+  quantify over Reach and over call scripts; the tests are sample scripts.
 - **CursorGlow** (`cursor_glow`): a *judged move* is a tick whose observed caret (or anchored
-  print-run end) differs from the mirror; its *ring row* is the `admission_log` record (reason,
+  print-run end) differs from the mirror; its *ring row* is its `admission_log` record (reason,
   licence, origin, target). A *licence* is any key-time provenance the seam reads: typed stamps and
-  the press-credit ring (`PressCredits`, depth 128, patience P = `IN_FLIGHT_PATIENCE_S`), one-shots
-  (Return, newline, Backspace quench, kill retreat, navigation, user gesture, synthetic note),
-  delivered or armed inserts, and the in-flight pool. *Fresh* means within its class window
-  (F = `TYPE_HINT_FRESH`, `INSERT_HINT_FRESH`, …); *spent* means consumed by the one move it
-  licensed. *Mints nothing* means every presented plane (glow_add, under, halos, patches, char
-  tints, fire halos, forge fill), sparks, particles, rings, crowns, bolts and vapor are unchanged,
-  thermals and `typing_momentum` unchanged, no sound cue, no motion pulse, `spawns()` unchanged.
-  *Idle0* means tick returns fp 0, every plane is empty, `!needs_frame_cadence`,
-  `next_change_deadline == None` and `!is_active`. A quad is *banded* when it lies in the effects
-  box and in one cell-row band whose row tag matches its y.
-- **Ribbon** (`rainbow_kitty::ribbon`): a cohort's walk is `t_at(col) = walk_zero + walk_t(walk_d(col))`
-  with `walk_t` slope 1/`WALK_FAST_CELLS` then `WALK_LAY_RATE`. `Lit(r)` means some under quad
-  with alpha > 0 covers row r; *coverage* is the opacity-weighted share of a cell's pixel band.
-  A *hole* is a dark column strictly between two lit columns of one row.
-- **Host trace** (the `tests/*.rs` seam laws): PTY bytes fed to a real `aterm_core::Terminal`
-  plus the key stamps `app_input.rs` makes (`note_typed`/`_expected`/`_glyph`, `note_motion`,
-  `clear_typed`, inserts), presented in `app_render.rs` order (scroll seam, row probes for the caret
-  row and every `ribbon_rows()` row, then `tick`) on a 16.667, 16 or 8 ms train or GUI pacing.
-  *Twin(rec, off)*: the witness saw a copy of the record's glyph at that follow offset on its arming
-  frame, or on every sampled frame over at least `TWIN_MIN` (40 ms).
-- **PetBrain** (`kitty_pet`): a ~300-field `&mut self` machine whose `tick` is ~2,200 lines of f32
-  control flow; `[BRAIN]` specs need gaps 1, 2, 3, 5 and 7 together. Seeds are `u8`; the tests
-  sample 12 hands through the `#[cfg(test)]` `force_seed`, and every per-seed spec is stated over
-  all 256. *Quiescent* means `!needs_frames()` and `next_change_deadline() == None`.
-- **CursorCat** (`kitty_cursor`): M(σ,t) is the decayed `TypingMomentum` value; *active* means
-  state ≠ Hidden.
-- **Synth** (`trail_sound`): a script is a sequence of `push_meta` and `render` calls; *MB* (the
-  music box) is an event routed to the rainbow kitty v2 voice.
-- **Model refinement**: there is a projection π from the Rust state to the named
-  `aterm_spec::derive` (or test-local) `ty_model!` state such that π(init) is Init, every real step
-  maps to an enabled model action or a stutter, and every model invariant holds on every projected
-  state, with the model's `Buggy = 1` twin as the negative control (`crates/aterm-spec/src/derive.rs`).
-  Today these are Tier-1 tests; the spec is the projection lemma over all inputs.
-- Spec-only reference functions: several tests compare against a `#[cfg(test)]` model
-  (`cursor_trail::line_cells`, `effect_util` walked ramp, `simhash_majority_reference`,
-  `generate_spectrum_table`, `peak_shade_quadratic`). Those become the spec's model, not code that
-  ships.
-
+  the press-credit ring (`PressCredits`, `TYPED_STAMP_DEPTH` slots, patience
+  `IN_FLIGHT_PATIENCE_S`), one-shots (Return, newline, Backspace quench, kill retreat, navigation,
+  user gesture, synthetic note), delivered or armed inserts, and the in-flight pool. *Fresh* means
+  within its class window (`TYPE_HINT_FRESH`, `INSERT_HINT_FRESH`, …); *spent* means consumed by
+  the one move it licensed. *Mints nothing* means every presented plane (glow_add, under, halos,
+  patches, char tints, fire halos, forge fill), the sparks, particles, rings, crowns, bolts and
+  vapor, the thermals, `typing_momentum` and `spawns()` are unchanged, with no sound cue and no
+  motion pulse. *Idle0* means `tick` returns fp 0, every plane is empty, `!needs_frame_cadence()`,
+  `next_change_deadline` is `None` and `!is_active()`. A quad is *banded* when it lies in the
+  effects box and in one cell-row band whose row tag matches its y.
+- **Ribbon** (`rainbow_kitty::ribbon`): a cohort's walk is
+  `t_at(col) = walk_zero + walk_t(walk_d(col))`, where `walk_t` has slope 1/`WALK_FAST_CELLS` up to
+  `WALK_FAST_CELLS` cells and `WALK_LAY_RATE` beyond. *Coverage* is the opacity-weighted share of a
+  cell's pixel band; a *hole* is a dark column strictly between two lit columns of one row.
+- **Host trace** (the `tests/*.rs` seam laws): PTY bytes fed to a real `aterm_core::Terminal` plus
+  the key stamps the GUI makes (`note_typed`, `note_typed_expected`, `note_typed_glyph`,
+  `note_motion`, `clear_typed`, inserts), presented in `aterm-gui`'s `app_render.rs` order (scroll
+  seam, row probes for the caret row and every `ribbon_rows()` row, then `tick`) on a 16.667, 16 or
+  8 ms frame train or GUI pacing. A record's *twin* is a copy of its glyph at a follow offset, seen
+  on its arming frame or on every sampled frame for at least `TWIN_MIN` (40 ms).
+- **PetBrain** (`kitty_pet`): seeds are `u8`; the tests sample a few through the `#[cfg(test)]`
+  `force_seed`, and every per-seed spec ranges over all 256.
+- **CursorCat** (`kitty_cursor`): M(t) is the decayed `TypingMomentum` value; *active* means the
+  state is not Hidden.
+- **Synth** (`trail_sound`): a *script* is a sequence of `push_meta` and `render` calls; an event
+  *under the music box* (the `mb-` rows) is routed to the rainbow kitty v2 voice.
+- **Refinement** rows: a projection π from the Rust state to the named `ty_model!` state maps the
+  initial state to Init and every real step to an enabled model action or a stutter, and every
+  model invariant holds on every projected state; the model's `Buggy` mutants are the negative
+  control (`crates/aterm-spec/src/derive.rs`). The tests are Tier-1 conformance runs; the spec is
+  the projection lemma over all inputs.
+- **Spec-only models**: some tests compare against a `#[cfg(test)]` reference
+  (`cursor_trail::line_cells`, the `effect_util` tests' `walked_ramp`, `simhash_majority_reference`,
+  `generate_spectrum_table`); each becomes its spec's model, not shipped code.
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `blocking_gaps` (audit §7 row numbers; every spec also needs row 0, the seal), `primary_tests` (how many tests it retires as primary; the list is in §2). The Rust features each proof must handle (the `rust_features` notes of the recovery chunks) are summarised by the gap rows.
+Columns: `id`; `kind` (contract, invariant, refinement, equivalence, table-property, round-trip,
+no-panic, other); `functions`; `statement`; `blocking_gaps` (§0); `primary_tests`, how many tests
+the spec retires as primary (listed in §2).
 
 ```tsv
 id	kind	functions	statement	blocking_gaps	primary_tests
@@ -359,7 +314,7 @@ glow-key-time-heat	equivalence	CursorGlow::{cue_keystroke,spawn}	The heat on key
 glow-cue-classification	invariant	CursorGlow::{spawn,spawn_move_light,poof_scan,drain_sound_cues,tick}	Every cue is recorded at a licensed spawn edge with that spawn's class (typing Typed; jump, preview or snapping line feed one Jump; same-column line feed Typed; Backspace shrink Backspace; kill swoosh; navigation nav tick, no heat); the newest erase key owns the pending poof's voice; a v2 nav jump speaks only its meteor; a paste under rainbow kitty records one Strum and banks one silent credit, other styles nothing; a disabled engine and a style switch drop pending cues.	0,1,2,3,4,5,7	5
 glow-typed-cell-lit	invariant	CursorGlow::tick; rainbow_kitty::ribbon::Ribbon; Cohort::t_at; Ribbon::fresh_line	Under rainbow kitty every typed cell of a licensed echo is lit on the echoing tick and a panel period later (born at max(press, t-F)); while a line is typed no cell inside its live span is dark; an unechoed key lays nothing (only the fold's previous-row last cell); Cohort::t_at(col) is independent of echo lag; a composer newline starts a fresh walk; a short pause leaves no hole.	0,1,2,3,4,5,7	7
 glow-kill-once-v2	invariant	CursorGlow::{note_kill,poof_scan}; rainbow_kitty Engine::kills	Each kill key emits exactly one v2 Kill event, from whichever of its retreat or poof is witnessed first, and the Kill precedes the retreat's Move, so no cell under the prompt is lit at or after the retreat.	0,1,2,3,4,5,7	2
-glow-status-row	contract	TrailStatus::{line,ribbon_active}; AdmissionRecord::line; CursorGlow::{celebrate,ribbon_segments,ribbon_hue_bands,v2_status}	The trail status line is one newline-free line with the fixed key sequence (style, resolved, gates, licensed, declined, last_decline_reason, spawns, ribbon fields, momentum, flow, combo, block fill provenance, insert, inflight, park tallies, then issue, comet_cells and comet_alpha_max), each value the engine's own counter; resolved= is the resolved style's label (a fallback's is the default it draws, issue= naming why), else off; ribbon_active == (segments >= 2 and bands >= 2) or a drawing curtain with ribbon_drawn >= 2; flow and combo rise past FLOW_KEY_DISP, latch once per crossing, reset on Backspace, kill or a sub-floor key without lowering combo_best, and freeze while celebrate drives.	0,1,2,3,4,5,7	7
+glow-status-row	contract	TrailStatus::{line,ribbon_active}; AdmissionRecord::line; ProgramRowRefusal; CaretBoundary; CursorGlow::{celebrate,ribbon_segments,ribbon_hue_bands,v2_status,clear_typed_from}	The trail status line is one newline-free line with the fixed key sequence (style, resolved, gates, licensed, declined, last_decline_reason, spawns, ribbon fields, momentum, flow, combo, block fill provenance, insert, inflight, park tallies, then issue, comet_cells and comet_alpha_max), each value the engine's own counter; resolved= is the resolved style's label (a fallback's is the default it draws, issue= naming why), else off; ribbon_active == (segments >= 2 and bands >= 2) or a drawing curtain with ribbon_drawn >= 2; flow and combo rise past FLOW_KEY_DISP, latch once per crossing, reset on Backspace, kill or a sub-floor key without lowering combo_best, and freeze while celebrate drives. A program-row admission record retains its refusing site's already-evaluated guards as AnchorContested(tainted, spoken_for), ParkedAnchor(foreign_glyph, hand_at_caret), or VisibleLanding(landing_foreign, parked_redisplay), without changing licence, cleanup, ring ordering or source binding. Its line appends the fixed program_row site token and only that site's boolean fields, preserving simultaneous true guards; missing detail on a program-row refusal is unknown, and other verdicts have none. A generic boundary stamps its surviving UnownedCaret with a fixed origin, saturating per-engine sequence and original Instant. Keeping-hand clears and typed supersedes leave that witness unchanged; coordinate moves and a saved lay carry it with the doubt; settling/reset removes it with that doubt. Only a refusal reading the parked doubt snapshots it. boundary_to_verdict_ms uses checked verdict.at minus boundary.at, never read time; a future/absent time is -, missing provenance is unknown, and nonapplicable rows use none. No terminal text or new row probe enters these diagnostics, and no diagnostic field is an admission predicate.	0,1,2,3,4,5,7	8
 glow-style-parse-and-v2-engage	table-property	GlowStyle::parse; CursorGlow::{tick,v2_status}; rainbow_kitty Engine::engaged	parse(s) == RainbowKitty iff trim-casefold(s) names the kitty (rainbow kitty, kitty, nyan, rainbow, the flying/tall/underline presentations, the v2 aliases), never a v1 spelling, another style, v1, v2, pack:* or empty. Every RainbowKitty config engages v2 on its first non-degenerate tick; every other built-in style never does.	0,1,2,3,5,7	1
 glow-v2-meteor-frame-zero	contract	CursorGlow::{tick,under_quads,halos,caret_flare_at,take_companion_impulse}	Under v2 a credited same-row navigation move of at least JUMP_MIN_CELLS draws the meteor's train, white heat and coma on its observed tick (fp != 0), lays no v1 light, records only the meteor cue, asks frame cadence, sets caret_flare_at = Some(t), and offers the companion impulse once.	0,1,2,3,4,5,7	1
 glow-degenerate-geom-no-panic	no-panic	CursorGlow::tick	For every reachable engine, config and Geom with rows, cols, cw or ch zero, tick does not panic, returns 0, leaves out empty and does not engage v2.	0,1,2,3,4,5,7	1
@@ -478,7 +433,7 @@ keep-ahead-lead	contract	PetBrain::{lead,rhythm_open,pace,station_now,station_dr
 chase-convergence-and-facing	contract	PetBrain::tick (follower, facing, drift-brake)	Under a parked caret the follower converges to station_safe without ringing; once the caret rests the step never crosses the station faster than RUN_SPEED and the drift-brake never arms from a chase; facing follows travel with FLIP_SPEED hysteresis and the first moving frame faces the gap; a sleeper turns only through travel; a held repeating jump still moves the pet; a skid once drawn stays on glass STILL_SECS from its brake before the arrival takes the cat.	0,1,2,3,5,7	8
 wall-side	contract	PetBrain::{update_wall,station_now,tick}; pending_wall_transit	wall_side flips to the caret's left when the led station overhangs and back only past WALL_RETURN_MARGIN; a flip with nothing in the air is crossed by one small arc; a flight that already crossed consumes the transit; at the wall the Startle faces the caret; a far caret behind earns the shoulder peek.	0,1,2,3	5
 flight-choreography	contract	PetBrain::{tick,flight_pose,coil_envelope,emit,spawn_dust}	Every caret flight is Crouch, Leap, Land; PetLaunch is the coil's last frame and never airborne; pounces and hops show rise, hero and descend, a short Enter is the tucked hop; the body leaves the floor and lands on the baseline; horizontal flight stretches width; volume changes at most 2% per tick (3% at the cut) and touchdown at most 0.12 in scale_y; the landing squash grows with span and the recovery lands on a contact frame; the screen-crossing show plays its whole sequence with dust; a flight asked for from a stand that ends a stride leaves no sooner than STAND_MIN into the stand (deferred_arc).	0,1,2,3,5,7	14
-show-door	contract	PetBrain::{on_move,leave_ground,predicted_tier,launch_big,begin_big_arc}; quiet_leap; pending_big_jump; bound2	The show plays iff a chosen move opened it (a large same-row jump, a standing gap of BIG_GAP_FRAC during a hold, or a joyful word jump), never for a line change, wrap, snap home or post-burst trip; a snap home is one quiet bound; tiers by span (hop/pounce up to POUNCE_SPAN_MAX, bound beyond, two bounds past TWO_BOUND_FRAC unless the touch point is inked); every bound is paced at quiet_speed_max but the one that crosses after the writing's wrap (or back across it under a held delete): that one is paced at BIG_HOP_SPEED_MAX on the big bound's own arc for its span (PetBrain::brisk_shape) and goes with no notice beat; no bound leaves ahead of a wrap that has not come.	0,1,2,3,7,10	11
+show-door	contract	PetBrain::{on_move,leave_ground,predicted_tier,launch_big,begin_big_arc}; quiet_leap; pending_big_jump; bound2	The show plays iff a chosen move opened it (a large same-row jump, a standing gap of BIG_GAP_FRAC during a hold, or a joyful word jump), never for a line change, wrap, snap home or post-burst trip; a snap home is one quiet bound; tiers by span (hop/pounce up to POUNCE_SPAN_MAX, bound beyond, two bounds past TWO_BOUND_FRAC unless the touch point is inked); every bound is paced at quiet_speed_max but the one that crosses after the writing's wrap (or back across it under a held delete): that one is paced at BIG_HOP_SPEED_MAX on the big bound's own arc for its span (PetBrain::brisk_shape), in the air no longer than BRISK_DUR_MAX (faster on a line wider than 80 columns, up to BRISK_SPEED_MAX, under its body a 60 Hz frame), and goes with no notice beat; no bound leaves ahead of a wrap that has not come.	0,1,2,3,7,10	11
 new-line-law	contract	PetBrain::{tick,on_move,caret_delta,notices,at_rest}	Every new-line shape (Enters onto 1- and 3-row prompts at any column and width, from any state or behind a one-frame hide, margin and scrolled wraps, printed lines, wide or suggested prompts through the ink seam) reacts with one or two lawful flights, no Startle, at most one notice beat (only from rest), no gather, dust or run, paws down within the shape's bound, rows at most 8 per second, ending on the prompt row without leaving the glass.	0,1,2,3,5,7	14
 retreat-reactions	contract	PetBrain::{on_move,age_gesture_windows}	A retreat under STARTLE_COLS flinches (Perk with a duck), a bigger one or a run of them Startles facing the caret, once a run of deletes for STARTLE_HOLD (a held Backspace neither extends it nor fires it again, and the pet follows the caret back; a forward move or a line change ends the run's bottle), FROLIC_REVERSALS reversals Frolic, and a Startle consumed by an ink hop is never replayed.	0,1,2,3,7	5
 settle-ladder	contract	PetBrain::{tick,enter_settled}; loaf_after; groom_after; groom_skip; wake arm	After arrival: Stand until SIT_AFTER, then Sit or Purr, loaf at loaf_after(seed), groom (second wash skipped iff groom_skip), Sleep at SLEEP_AFTER plus a tick at any cadence down to 1 Hz with a breathing swell; the next key wakes through front then hind stretch inside WAKE_DUR with one ZeePop; each arrival deals a fresh seed; even seeds yawn into the loaf; the loaf peeks before sleep.	0,1,2,3,5,7	14
@@ -735,7 +690,7 @@ bed-legibility-bar	table-property	ribbon::{bed_ink,bed_luma_budget}; aterm_rende
 bed-ink-even-and-chromatic	table-property	ribbon::bed_ink; spectrum::spectrum_with_min_saturation	The bed's stops composite at one weight (luminance spread <= 0.004), at full chroma, with no grey dip at the green-blue crossing, and every stop clears the scanner floor on Nord.	0,3,5,6,7,12	4
 rail-ink-band	table-property	ribbon::rail_ink	Each anchor's rail ink lies in [RAIL_LUMA_FLOOR, RAIL_LUMA_CEIL], carried pure inside the band, scaled through its hue above, lifted below.	0,3,6,7	1
 walk-pace-perceptual	table-property	ribbon::{walk_pace,walk_arc,CROSS_PACE}	walk_pace is monotone, the identity outside the crossing window, and CROSS_PACE equals its re-derivation by equal composited steps; it changes only the crossing leg and bounds the worst bed and rail steps.	0,3,5,6,7	2
-ember-seen-floor	table-property	ribbon::{seen_floor,cov_cap}; BedInkLut::{sync,at,seen_floor_at}	On every shipped ground, every stop visible at the cap stays visible at its ember floor, and floors spread at least 3x below UNDER_COV_CAP.	0,1,2,3,5,6,7,12	2
+ember-seen-floor	table-property	ribbon::{seen_floor,cov_cap}; BedInkLut::{sync,at,seen_floor_at}	On every shipped ground, every stop visible at the cap stays visible at its ember floor, and floors spread at least 3x below UNDER_COV_CAP. On a frame the bed draws by its glass (§15, Prism Glass 1.8, live since 1.12) the ember reads this floor of main's table (BedInkLut::main_seen_floor_at), which the glass leaves as it was, and moves the glass's height.	0,1,2,3,5,6,7,12	2
 walk-t-def	contract	ribbon::walk_t	walk_t(d) = d/WALK_FAST_CELLS up to WALK_FAST_CELLS, then 1 + (d - WALK_FAST_CELLS) WALK_LAY_RATE; non-finite gives 0.	0,3,6	1
 cohort-walk-invariant	invariant	Ribbon::{on_event,plan,lay_cell,place,shift_run,heal_seams,seat_fold_successor,relay_word,join_cohort,mint_cohort}; Cohort::{t_at,walk_d,walk_zero}; ribbon::walk_t	In every reachable ribbon every live cell's t equals its cohort's t_at(col) = walk_zero + walk_t(walk_d(col)) bitwise, and shift_run never moves anchor_col; cold walks start at zero; walk_origin_at agrees with field_at bitwise; a retyped cell takes back its stop. Corollaries: adjacent lit cells of one line step exactly one walk step, keys at a line's start take 0, 1/16, 2/16, and no column lit before and after an insert changes colour.	0,1,2,3,5,6,7	10
 walk-same-row-origin	contract	Ribbon::{join_cohort,mint_cohort,wake_origin,lay_reach_cell,heal_seams,seat_fold_successor,revive_sweep}	One row holds one walk: a cohort minted beside a lit one takes its walk by position, reach cells continue their own cohort, wakes share the band's origin, heal merges and fold successors re-seat onto the walk, and a named revive lays a retired run back on its own walk.	0,1,2,3,5,6,7	8
@@ -758,7 +713,7 @@ hot-edge-gain-and-cells	contract	ribbon::edge_cells; Ribbon::hot_edge_gain	edge_
 hot-edge-emission	contract	Ribbon::{emit_hot_edge,head_col}; ribbon::hot_edge_ink	The hot edge is additive only, never past the head cell nor more than edge_cells behind, within the caret band, capped at HOT_EDGE_COV_MAX, the head stop lifted brighter than the bed; it grows with surge and flow, sits at a leftward wake's landing, is absent on a cold arrow's wake, and embers out with its body.	0,1,2,3,5,6,7,12	6
 attack-and-boundary	contract	Ribbon::{plan_run,wipe_of,place,lay_cell}; ribbon::GlassTail	A new cell's light enters from the caret side (the flat spelling fades in place); a boundary takes the brighter side's coverage, so neighbours never sag; a key re-laid on a lit cell keeps the old attack. On a glass frame (§15, Prism Glass 1.8) the attack is the glass's opacity (the edge-in and its wipe), a boundary takes the brighter side's opacity with no RUN_TAIL_EASE, the run's oldest end eases in by height instead (GlassTail), and a key re-laid on a lit cell relights from its level in the glass's height.	0,1,2,3,5,6,7	3
 light-theme-and-spellings	contract	Ribbon::{emit,head_rgb,comet,rail_lit}; ribbon::light_role	On light themes the ribbon is source-over ink and never additive, within the Leading cap on main's paper arm and whole (over that cap, at most 255) under the glass (§14); head_rgb is None before a caret, then the authored stop on dark and its ink on light; the flat spelling draws no comet or rail and stays legible.	0,1,2,3,6	3
-body-ceiling-rail-and-pane	contract	Ribbon::{emit,pane_bot}; BedInkLut::rail_at	A hot body rides near its ceiling without passing BODY_FRAME_TOP; the rail shows its anchor below the row while text stays at the bar; nothing is drawn below the focused pane's last row.	0,1,2,3,5,6,7,12	3
+body-ceiling-rail-and-pane	contract	Ribbon::{emit,pane_bot}; BedInkLut::rail_at	A hot body rides near its ceiling without passing BODY_FRAME_TOP; the rail shows its anchor below the row while text stays at the bar; nothing is drawn below the focused pane's last row. On a frame the bed draws by its glass (§14, Prism Glass 1.7, live since 1.12) no rail is laid and nothing lies on or below its row's bottom.	0,1,2,3,5,6,7,12	3
 ribbon-quad-budget	invariant	Ribbon::{emit,slabs_for,repaint_capped_run_from_head}; Ribbon::{glass_slabs_for,glass_slabs_per_cell}; ribbon::{glass_slab_rows,glass_tail_wedge_lights,glass_frame_price}	emit stays within RIBBON_QUAD_BUDGET, keeps the hand's row whole, gives up density first and then sheds the oldest row's distant tail contiguously; below the cap it equals the per-run concatenation. On a glass frame (§15, Prism Glass 1.8) the plan keeps main's density and the glass lays the densest whole number of slabs to each of its vertices that its price allows (Ribbon::glass_slabs_for over glass_frame_price: the glass's rows and the lip's reserved rows a slab, glass_slab_rows, and each row's open oldest end's wedge rows, glass_tail_wedge_lights, whose runs ride no ramp under RAMP_COST and are each charged whole against RIBBON_QUAD_BUDGET); its frame lays no more lights than that price less the lip's reserve, and a dark frame chooses main's density.	0,1,2,3,6,7	3
 ribbon-frame-determinism	equivalence	Ribbon::{on_event,plan,emit}	Two ribbons fed the same events produce identical frames, and re-planning at the same instant gives the same frame.	0,1,2,5,7	1
 ribbon-translate	contract	Ribbon::{translate_band,translate_scroll,re_anchor,translate_run,carry_glass_wrap,lift_hand}; FieldIndex::{translate,translate_band}	A band move carries cells in the band with their clocks, drops what leaves and retires empty cohorts, and moves fields, the floor, the seam and the hand row; a scroll moves every row up with clocks kept and the frame shifted exactly; a re-anchor on the scroll's own tick drains nothing. The wrap's light-only side table (GlassWrap, §17) rides the same moves, touched only when it holds a record: a scroll and a band move take each record with its row and its left_at, and a row scrolled off the screen or moved out of its band drops its record; a carry (translate_run) takes a whole run's record to its new row, gives a split's carried part a copy under its own cohort and leaves the part behind its own, and drops the record carried off the pane; the hand's lift maps a record on the hand's row with the hand.	0,1,2,3,7	9
@@ -1076,11 +1031,14 @@ refused-presses-are-forgotten	invariant	custody::forget_typed_credits; seam::{ec
 own-glyph-echo-lights	contract	seam::{echo_anchor_pass,spawn,sweep_born}; CursorGlow::{tick,note_typed_expected,note_return}	A one-cell anchored advance witnessed with the press's own glyph (or on the caret row, or hidden, or glyph-less) within TYPE_HINT_FRESH is licensed and lays exactly that cell, born within 100 ms; Enter takes the hand off its row.	0,1,2,3,4,5,7	2
 torn-lay-recall	contract	seam::CursorGlow::recall_torn_lay; torn_lay tracking; rainbow_kitty Event::Rewrite	A torn lay printed off its row, with the hand elsewhere and only its own cells right of the caret, is recalled once the caret has rested TORN_REST_S (a Rewrite back to the caret, one recall record, and the hand the lay put on its row and the doubt it settled there handed back while each stands as the lay left it, less a doubt a navigation key or Enter settled during the wait); a lift of the hand's line carries the lay and what it saved of that row; a boundary through clear_typed drops the lay unrecalled; a key press or a caret resting right of the lay never triggers it; recalled ink is gone within about 330 ms.	0,1,2,3,5,7,10	5
 aos-lease-refines-model	refinement	aos_momentum::lease::Ledger::{join,hello,begin,assign,lease,result,progress,tick,lost,cancelled,void,finish,outcome,job,worker,counts,awaiting,next_deadline}; aterm_models_aos::aos_worker_lease_model	The M5b worker-lease ledger with one open job, two workers and max_attempts = MaxAttempts in {2, 1} refines AosWorkerLease (design §11.5, §11.7): the projection of the opened search (job state and attempts; each worker's state, lease epoch and Gone reason; the accepted claim and the late claim awaiting it as truth or lie; the outcome; the frames in flight, the one resend and the duplicate/stale/post-void/ignored ghosts kept by the harness) is the model's Init, and every real call is a model transition the model admits by the action's own name: lease and assign to an Idle worker; result as accept, compare, late result or drop; tick at a holder's deadline as ExpireX (the job Pending, or Exhausted and voided at the limit, or NoWorkers voided when no other worker is left) and at a drain's end as DrainTimeoutX; lost as LoseX; cancelled as AckX; void(Interrupted) as Cancel; finish as Finish. Each such call kills exactly the workers the model makes Gone and sends Cancel to exactly the holders it drains. The calls the model rules out leave the projection and the counters unchanged: a lease the model has no LeaseX for (a worker not Idle, no job Pending, a settled search), assign when it has neither, a tick before every deadline, a second void, an earlier now, and finish before completion. Every transition of the bounded space (1456 at MaxAttempts 2, 349 at 1) is taken this way, and each Buggy dial 1-6 is caught: the additive dial 1's step is refused by the real tick, and each of dials 2-6 makes the real step one the mutant does not admit while the mutant's own step breaks its law.	0,1,2,3,7,10,12	8
+aos-key-hold	contract	aos_momentum::MomentumHost::{aos_hold,aos_release,aos_holding,taint,aos_tainted,on_key,reset,tick,next_change_deadline,is_active,settling,aos_pause,aos_status,aos_detach,aos_attach}; aos_momentum::RAW_KEY	While MomentumHost::aos_hold(deadline) holds an attached, running glow for typed keys that wait for their echo (ATERM-KI-1025-1), the boundary appends nothing: tick returns the held frame and delivers no Tick, next_change_deadline returns max(deadline, now + the lane's frame) and records no Query, is_active is false and settling true so the lane wakes, aos_pause refuses MidStep and records nothing, and aos_status reads as without a hold. aos_release(now, keys, tau, rest) ends the hold, delivers keys Key events at now through the ordinary path, then holds again until rest when Some; with no hold it hands the keys to the glow unrecorded, detaching with RAW_KEY and tainting. on_key or reset while held detaches by itself with RAW_KEY. Every drop of a hold (a detach, a new attach, the horizon) taints the glow, as taint does, and the next attach starts its glow from rest and takes the taint; an unattached or paused host holds nothing.	0,1,2,3,7	8
+aos-key-hold-refines-model	refinement	aos_momentum::MomentumHost::{aos_hold,aos_release,on_key,tick,next_change_deadline,aos_detach,aos_attach,taint,aos_take_retired}; aterm_models_aos::aos_key_hold_model	Driven as aterm-gui drives it, the host refines AosKeyHold (aterm_models_aos::aos_key_hold_model) with Cap = 2: the projection (att and glow off the host, held and echoed the harness's, the host's own aos_holding agreeing with held; leak = the log growing across a held Hold, Echo or Tick; gap = the exported checkpoint and log replayed to a state digest other than the live one; dirty = an attach checkpoint carrying a typing-rate stamp while the harness knows the glow took an unlogged key) equals the model's state after every step, and the model admits each real step by its own name, over seeded walks and every transition of the bounded space. Private and Refute are private_key's stop (retired segments taken, the recording dropped, the glow tainted) with the held keys handed over; Detach is aos detach. Dials 1, 3 and 4 are each caught: the real step is one the mutant does not admit by that name while the mutant's own step breaks its law, and the test-only HELD_TICK_DELIVERS seam makes the projection see leak = 1, which only dial 1 admits. Claim 2 (OnlyEchoedKeysLogged) is bound in aterm-gui (aos-echo-proof), the host never seeing a character.	0,1,2,3,7,10,12	6
 ```
 
 ## 2. Test → spec map (TSV)
 
-Paths are relative to `crates/aterm-effects/`. `primary` is the spec that retires the test; `also` lists other specs the same test samples. Tests of §4 are not listed here.
+`primary` is the spec that retires the test; `also` lists other specs it samples. The tests of §4
+are not listed.
 
 ```tsv
 file	test	primary	also
@@ -1396,6 +1354,7 @@ src/cursor_glow/tests/seam_laws.rs	a_lifted_word_is_not_refused_by_the_landing_g
 src/cursor_glow/tests/seam_laws.rs	a_mid_line_park_is_not_released_by_the_tails_re_lay	glow-park	
 src/cursor_glow/tests/seam_laws.rs	a_one_shot_licensed_plus_one_lays_no_typed_cell	glow-no-licence-no-light	
 src/cursor_glow/tests/seam_laws.rs	a_recall_at_the_next_key_leaves_that_key_s_hand_on_its_row	glow-hand-row-hold	
+src/cursor_glow/tests/seam_laws.rs	a_row_doubts_boundary_follows_coordinates_and_settles_with_the_doubt	glow-status-row	-
 src/cursor_glow/tests/seam_laws.rs	a_soft_wrapped_re_anchor_is_witnessed_at_the_origin_it_lays	glow-landing-glyph-gate	
 src/cursor_glow/tests/seam_laws.rs	a_stamp_banks_split_and_merge_match_one_by_one_banking_at_every_fill	typed-stamps-split-merge	
 src/cursor_glow/tests/seam_laws.rs	a_superseding_key_cancels_a_composer_home_even_without_a_move	glow-one-shot-once	
@@ -3267,6 +3226,20 @@ src/aos_momentum/lease_conformance_tests.rs	negative_control_stale_a_late_result
 src/aos_momentum/lease_conformance_tests.rs	negative_control_post_an_interrupt_drains_the_holder_and_drops_its_result	aos-lease-refines-model	
 src/aos_momentum/lease_conformance_tests.rs	negative_control_ignored_every_differing_claim_is_compared_and_voids	aos-lease-refines-model	
 src/aos_momentum/lease_conformance_tests.rs	negative_control_attempts_the_last_expiry_exhausts_the_job	aos-lease-refines-model	
+src/aos_momentum/hold_tests.rs	a_hold_appends_nothing_and_a_release_appends_keys_at_the_release_instant	aos-key-hold	
+src/aos_momentum/hold_tests.rs	a_partial_release_holds_again_until_the_rest_s_deadline	aos-key-hold	
+src/aos_momentum/hold_tests.rs	on_key_or_reset_during_a_hold_detaches_and_taints	aos-key-hold	
+src/aos_momentum/hold_tests.rs	a_dropped_hold_taints_and_the_next_attach_starts_from_rest	aos-key-hold	
+src/aos_momentum/hold_tests.rs	aos_pause_refuses_while_a_key_is_held	aos-key-hold	
+src/aos_momentum/hold_tests.rs	a_hold_names_its_deadline_unlogged_and_never_at_or_before_now	aos-key-hold	
+src/aos_momentum/hold_tests.rs	aos_status_is_unchanged_by_a_hold	aos-key-hold	
+src/aos_momentum/hold_tests.rs	a_release_with_no_hold_reaches_only_the_glow	aos-key-hold	
+src/aos_momentum/hold_conformance_tests.rs	the_real_host_follows_the_hold_model_in_lock_step	aos-key-hold-refines-model	
+src/aos_momentum/hold_conformance_tests.rs	every_transition_of_the_hold_model_is_a_real_step	aos-key-hold-refines-model	
+src/aos_momentum/hold_conformance_tests.rs	negative_control_a_held_tick_is_caught_by_the_model_and_by_the_projection	aos-key-hold-refines-model	
+src/aos_momentum/hold_conformance_tests.rs	negative_control_a_refute_that_keeps_recording	aos-key-hold-refines-model	
+src/aos_momentum/hold_conformance_tests.rs	negative_control_an_attach_that_keeps_an_unlogged_key	aos-key-hold-refines-model	
+src/aos_momentum/hold_conformance_tests.rs	a_release_logs_exactly_the_keys_it_names	aos-key-hold-refines-model	
 ```
 
 
@@ -3284,17 +3257,12 @@ Status 2026-10-15: the 30 rows marked **deleted** below were removed from the cr
 
 | test | action | why |
 |---|---|---|
-| `src/cat_baker.rs::bake_is_deterministic_across_bakers` | **deleted** (was delete) | Pure function determinism by construction; band contents are stated in catbaker-atlas-lru. |
-| `src/cat_baker.rs::v4_cache_respects_bake_budget` | **deleted** (was delete) | Tests CatBakerV4, which is #[cfg(test)] with no production caller. |
 | `src/cat_glyphs_codegen.rs::animal_glyphs_gen_matches_assets` | **move-to-bench** | Drift gate over art/animal (fs read). |
-| `src/cat_glyphs_codegen.rs::cat_glyphs_codegen_is_deterministic` | **deleted** (was delete) | Determinism of a pure generator over sorted input, by construction. |
 | `src/cat_glyphs_codegen.rs::cat_glyphs_gen_matches_assets` | **move-to-bench** | Drift gate over art/glyphs (fs read). |
 | `src/cat_glyphs_codegen.rs::dog_glyphs_gen_matches_assets` | **move-to-bench** | Drift gate over art/dogs (fs read). |
 | `src/cat_glyphs_codegen.rs::pet_glyphs_gen_matches_assets` | **move-to-bench** | Drift gate over art/pet (fs read). |
-| `src/cursor_glow/tests/fire.rs::fire_field_is_deterministic` | **deleted** (was delete) | Two runs from the same t0 compare equal by construction; it cannot detect absolute-time dependence. |
-| `src/cursor_glow/tests/rainbow.rs::rainbow_occupied_coverage_derived_model_proves_and_catches_regression` | **becomes-spec-after-fix** | Test-local ty_model with a hand-copied Cap = 236 and no binding to the ribbon; becomes ribbon-occupied-cov-cap. |
-| `src/cursor_glow/tests/rainbow.rs::rainbow_retract_rearm_model_proves_and_catches_brightness_snap` | **becomes-spec-after-fix** | Test-local ty_model whose claimed Tier-1 projection does not exist; becomes ribbon-retract-rearm. |
-| `src/cursor_glow/tests/tint.rs::glyph_tint_box_corner_is_stronger_than_its_endpoints` | **deleted** (was delete) | Negative control on the guard's design; samples nothing beyond glyph-tint-palette. |
+| `src/cursor_glow/tests/rainbow.rs::rainbow_occupied_coverage_derived_model_proves_and_catches_regression` | **becomes-spec-after-fix** | Test-local ty_model whose Cap = 236 is checked against `ribbon::UNDER_COV_CAP` but bound to no ribbon code; becomes ribbon-occupied-cov-cap. |
+| `src/cursor_glow/tests/rainbow.rs::rainbow_retract_rearm_model_proves_and_catches_brightness_snap` | **becomes-spec-after-fix** | Test-local ty_model bound to no code; becomes ribbon-retract-rearm. |
 | `src/cursor_glow/tests/water.rs::water_scales_from_trickle_to_torpedo` | **move-to-bench** | Aesthetic ratio between two scripted cadences. |
 | `src/cursor_rainbow.rs::active_rim_reuses_its_warmed_scratch` | **move-to-bench** | Vec capacity property, an allocator-dependent performance budget. |
 | `src/cursor_trail.rs::full_u16_jump_reuses_bounded_spawn_scratch` | **move-to-bench** | Allocation-capacity property; the length bound is line-cells-tail-is-bounded-bresenham-suffix. |
@@ -3305,39 +3273,11 @@ Status 2026-10-15: the 30 rows marked **deleted** below were removed from the cr
 | `src/genome.rs::magic_windows_hit_expected_rates` | **move-to-bench** | 1e6-sample rate test; window widths are definitional; reads #[cfg(test)] cat_accessory. |
 | `src/genome.rs::simhash_locality` | **move-to-bench** | Statistical locality check of SimHash. |
 | `src/genome.rs::v4_magic_windows_hit_expected_rates` | **move-to-bench** | Statistical rate test; widths are definitional. |
-| `src/host.rs::press_outcomes_cross_the_boundary_as_their_u8` | **deleted** (was delete) | Tautology: the #[repr(u8)] discriminants fix the casts. |
-| `src/kitty_cursor.rs::on_summon_presents_without_ever_changing_the_look` | **deleted** (was delete) | Tests the #[cfg(test)] CursorCat::on_summon (no production caller); its live content, on_delight never changes look, is reactions-gate-and-preserve-identity. |
 | `src/kitty_pet.rs::a_lone_key_on_a_quiet_screen_costs_the_pet_a_counted_census` | **move-to-bench** | A wake-budget census; its correctness half repeats offer-soundness. |
-| `src/kitty_sing.rs::note_ring_never_exceeds_the_cap` | **deleted** (was delete) | The bounds are type facts of a fixed array; frames() is #[cfg(test)]. |
-| `src/matrix_rain/bake.rs::bake_bytes_are_deterministic` | **deleted** (was delete) | Determinism of a pure integer function; rb-box-filter states the bytes. |
-| `src/matrix_rain/field.rs::field_is_deterministic` | **deleted** (was delete) | Compares pure functions with themselves; glyph_at is #[cfg(test)]. |
-| `src/motion.rs::effect_set_is_complete` | **deleted** (was delete) | Checks #[cfg(test)] ALL bookkeeping; exhaustive matches already catch it. |
-| `src/motion.rs::ignoring_the_system_flag_is_caught` | **deleted** (was delete) | Negative control on a test-local closure; the model's Buggy twin is the real control. |
-| `src/motion.rs::serious_effect_set_is_complete_and_ordered` | **deleted** (was delete) | Same, for SeriousEffect. |
-| `src/motion.rs::serious_mode_policy_catches_an_ungated_effect` | **deleted** (was delete) | Negative control on a test-local closure. |
-| `src/output_streak.rs::identical_scripts_replay_identical_light` | **deleted** (was delete) | Determinism by construction. |
-| `src/output_streak.rs::sound_edges_have_one_canonical_output_gesture_mapping` | **deleted** (was delete) | Restates an exhaustive match. |
-| `src/pet_world.rs::safe_endpoints_do_not_license_crossing_text` | **deleted** (was delete) | Exercises the #[cfg(test)] corridor_clear. |
-| `src/pipeline_input_tests.rs::glow_frame_equality_rejects_equal_count_changed_content` | **deleted** (was delete) | Tests the test harness's own equality. |
 | `src/rainbow_kitty/stardust.rs::a_point_query_reads_one_cell_not_the_whole_sky` | **move-to-bench** | A performance ratio through #[cfg(test)] counters. |
-| `src/rainbow_kitty/timing.rs::the_two_coverage_ceilings_hold_every_class` | **deleted** (was delete) | Compares literals with constants; the relations are already const assertions. |
 | `src/tone.rs::holdout_sanity_set_clears_documented_floors` | **move-to-bench** | Model-quality accuracy gate of the trained weights. |
-| `src/trail_sound/rainbow_kitty_v2.rs::a_pause_the_render_clock_never_saw_still_rests_the_phrase` | **deleted** (was delete) | Exercises the #[cfg(test)] resume_after; the shipped half is mb-fallback-clock. |
-| `src/trail_sweep.rs::row_sweep_lays_exactly_the_skipped_cells` | **deleted** (was delete) | Tests the #[cfg(test)] row_sweep_cells, which no production code calls. |
-| `tests/console_pet_escort_lead.rs::escort_feel_trace` | **deleted** (was delete) | An #[ignore]d diagnostic trace. |
-| `tests/nova_channel_budget.rs::four_panes_of_build_output_push_the_channel_past_the_backstop` | **deleted** (was delete) | Pins the absence of a cap; a premise, not a property. |
-| `tests/nova_channel_budget.rs::the_resident_scratch_grows_once_not_every_frame` | **deleted** (was delete) | Exercises a test-local replica of the host scratch. |
 | `tests/ribbon_arrival_conformance.rs::the_2026_09_23_writer_is_caught_on_the_copies_that_stood` | **delete** | Becomes the mutation control of witness-arrival-evidence-refines-model. |
 | `tests/torn_repaint_hidden_caret.rs::a_raw_echo_anchor_spends_a_torn_space_at_the_line_end` | **delete** | Becomes the mutation control of motion-caret-contract (the echo anchor handed over raw). |
-| `web_binding_parity::effects_api_requires_matrix_rain_surface` | **deleted** (was becomes-spec-after-fix) | A symbol floor on another crate's text; single-sourcing makes it a compile error. |
-| `web_binding_parity::effects_api_requires_output_streak_surface` | **deleted** (was becomes-spec-after-fix) | Same as effects_api_requires_matrix_rain_surface. |
-| `web_binding_parity::every_cpu_only_web_binding_module_is_declared` | **deleted** (was delete) | Meta-test of a registry policed by a test. |
-| `web_binding_parity::every_duplicated_web_binding_module_is_covered` | **deleted** (was delete) | Meta-test of the guard's own coverage set. |
-| `web_binding_parity::messages_api_requires_band_surface` | **deleted** (was becomes-spec-after-fix) | Same as effects_api_requires_matrix_rain_surface. |
-| `web_binding_parity::normalizer_does_not_mask_code_drift` | **deleted** (was delete) | Self-tests the test-local normalizer. |
-| `web_binding_parity::production_binding_surface_is_identical` | **deleted** (was becomes-spec-after-fix) | Single-source the shared wasm-bindgen modules so parity holds by construction; until then an aterm-census guard. |
-| `web_binding_parity::wasm_lib_facade_surface_is_mirrored_by_gpu_web` | **deleted** (was becomes-spec-after-fix) | A shared trait both facades implement makes the mirror type-checked. |
-| `tests/wrap_code_reflow.rs::diagnostic_sweep` | **deleted** (was delete) | An #[ignore]d census that prints. |
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
@@ -3415,65 +3355,59 @@ Status 2026-10-15: the 30 rows marked **deleted** below were removed from the cr
 
 ## 6. Proof order (easiest high-value first)
 
-Rule: prefer specs blocked only by gap 0, then those that add only gap 3 (straight-line scalar
-or float bodies) or gap 1 (a small carrier), then the table properties decidable by evaluation,
-then the small state machines, and the large engines last.
+Specs blocked only by gap 0 first, then those adding only gap 1 or 3, then table properties
+decidable by evaluation, then small state machines, and the large engines last.
 
-1. **Gap 0 only** (provable as soon as the seal publishes Clean rows):
-   `momentum-glow-allowed` (`u && h && !r`), `mo-load-shed-exempt` (a two-variant enum match),
-   `mo-serious` (`!serious` for every effect), `rkc-heroes` (`Delight → 1`). Each retires its one
-   test and is a seal smoke test with an obvious negative control.
-2. **Pure scalar and small-carrier laws** (gaps 0 plus 1 or 3): `companion-gates` (4 tests,
-   seven bool/f32 predicates, including `pet_output_burst` and `sing_face_live`),
-   `caret-style-law`, `companion-precedence`, `shed-companion-alpha`, `head-dx`, `catbaker-slot-count`
-   (with the `cell_h <= 256` precondition of §5), `evict-step`, `os-clipped-span`, `pl-chrome-geom`,
-   `wd-cat-stacked-on`, `wd-peek-timing`, `kr-canonical-app-id`, `mo-parse`, `ksum-merge`,
-   `config-from-glow`, `engine-fresh-state`, the two pack source caps, and the matrix-rain field
-   kernels `rf-hash`, `rf-bits`, `rf-stammer`, `rf-trail-level`, `rf-quad-cap`, `rf-quanta`
-   (`rf-col-params` next: 4 tests and the WCAG flash floor).
-3. **Small contracts with a real payoff**: `caret-delta-fold` (3 tests; the pet's wrap/new-line
-   classifier, the cheapest behavioural kernel in kitty_pet), `station-wall`, `quiet-pace-law`,
+1. **Gap 0 only**: `momentum-glow-allowed` (`u && h && !r`), `mo-load-shed-exempt` (a two-variant
+   enum match), `mo-serious` (`!serious` for every effect), `rkc-heroes` (`Delight → 1`). Each is a
+   seal smoke test with an obvious negative control.
+2. **Pure scalar and small-carrier laws** (gaps 0 plus 1 or 3): `companion-gates` (seven bool/f32
+   predicates), `caret-style-law`, `companion-precedence`, `shed-companion-alpha`, `head-dx`,
+   `catbaker-slot-count` (with the `cell_h <= 256` precondition of §5), `evict-step`,
+   `os-clipped-span`, `pl-chrome-geom`, `wd-cat-stacked-on`, `wd-peek-timing`,
+   `kr-canonical-app-id`, `mo-parse`, `ksum-merge`, `config-from-glow`, `engine-fresh-state`,
+   `toy-pack-source-cap`, and the matrix-rain field kernels `rf-hash`, `rf-bits`, `rf-stammer`,
+   `rf-trail-level`, `rf-quad-cap`, `rf-quanta`, then `rf-col-params` (with the WCAG flash floor).
+3. **Small contracts with a real payoff**: `caret-delta-fold` (the pet's wrap/new-line classifier,
+   the cheapest behavioural kernel in kitty_pet), `station-wall`, `quiet-pace-law`,
    `flight-pose-schedule`, `pet-geometry-maps`, `wrap-fact-edge`, `erase-poof-drive`,
    `classic-ring-grade`, `fold-register`, `tt-back-chars-arith`, `mix-nonzero`,
-   `ks-song-signature-bijective` (a bijection on u32, decidable by bit-vector),
-   `walk-t-def` and `tri-triangle-wave` (the ribbon's colour walk; they unlock the bit-for-bit
-   landing specs), `spark-cull-exact`, `bridge-reach-contract`, `sweep-physical-margin-fold`.
-4. **Table properties decidable by evaluating constant data**: `outline-contrast` (5 tests),
-   `color-key-quantize`, `kr-coat-distance`, `dog-skin-table` (best as a `const _: () = assert!`),
-   `spectrum-lut-table-properties` (6 tests) and `spectrum-lut-is-generated`, `rail-ink-band`,
-   `bed-luma-budget-def`, `glyph-rank-table`, `glyph-class-table`, `theme-form-tables`,
-   `song-pulse-table`, `rom-classic-table`, `bf-table-lookup`, `seat-deal-arithmetic` (all 256 seeds).
+   `ks-song-signature-bijective` (a bijection on u32, decidable by bit-vector), `walk-t-def` and
+   `tri-triangle-wave` (the ribbon's colour walk; they unlock the bit-for-bit landing specs),
+   `spark-cull-exact`, `bridge-reach-contract`, `sweep-physical-margin-fold`.
+4. **Table properties decidable by evaluating constant data**: `outline-contrast`,
+   `color-key-quantize`, `kr-coat-distance`, `dog-skin-table`, `spectrum-lut-table-properties`,
+   `spectrum-lut-is-generated`, `rail-ink-band`, `bed-luma-budget-def`, `glyph-rank-table`,
+   `glyph-class-table`, `theme-form-tables`, `song-pulse-table`, `rom-classic-table`,
+   `bf-table-lookup`, `seat-deal-arithmetic` (all 256 seeds).
 5. **Small state machines** (gaps 1 and 2): `tenure-gate` and `roster-rate-law` (companion_look),
-   `claim-cache`, `exact-tile-baker-lru` (10 tests across the animal, pet and robi bakers, and a generic over
-   `ExactTileKey`, so it also needs gap 11), `catbaker-atlas-lru`, `typing-rate-value`,
-   `momentum-read-and-decay` / `momentum-advance-credit-law` / `momentum-delete-kill-drain`,
-   `ks-arm-threshold` (10 tests), `tt-*` (the typed-trick listener: 17 specs; `tt-fire-licence-safety`
-   is the master safety law), `ps-stroke-contract`, `wd-ignition-limiter` (the WCAG 2.3.1 limiter),
-   `wd-done-mark-lru`, `spine-*` (the rainbow kitty spine, ten small specs).
-6. **The model refinements** wait on gap 10; each already has a model with a negative control:
-   `glow-licence-refines-model`, `echo-ledger-refinement` (16 tests), `witness-follow-refines-twin-model`,
-   `witness-arrival-evidence-refines-model`, `mr-*-refinement`, `output-streak-attribution` (17 tests),
-   `wd-identity-model`, `wd-alignment-cardinality` (13 tests), `console-life-episode-refines-model`,
-   `pet-surface-seam-refines-model` (16 tests).
+   `claim-cache`, `exact-tile-baker-lru` (generic over `ExactTileKey`, so also gap 11),
+   `catbaker-atlas-lru`, `typing-rate-value`, `momentum-read-and-decay`,
+   `momentum-advance-credit-law`, `momentum-delete-kill-drain`, `ks-arm-threshold`, `tt-*` (the
+   typed-trick listener; `tt-fire-licence-safety` is the master safety law), `ps-stroke-contract`,
+   `wd-ignition-limiter` (the WCAG 2.3.1 limiter), `wd-done-mark-lru`, `spine-*` (the rainbow kitty
+   spine).
+6. **The model refinements** wait on gap 10; each has a model with a negative control:
+   `glow-licence-refines-model`, `echo-ledger-refinement`, `witness-follow-refines-twin-model`,
+   `witness-arrival-evidence-refines-model`, `mr-*-refinement`, `output-streak-attribution`,
+   `wd-identity-model`, `wd-alignment-cardinality`, `console-life-episode-refines-model`,
+   `pet-surface-seam-refines-model`.
 7. **The big engines last**: the CursorGlow seam (`glow-no-licence-no-light`, `glow-exact-payment`,
    `glow-park`, `insert-licence`, …), the ribbon (`cohort-walk-invariant` first, since
    `landing-walk-is-band-field` and the walk specs are its corollaries), the PetBrain trace specs
    (`no-teleport-law` and `pet-idle-to-zero` first), the synth, and the host-seam laws
    (`copy-is-not-arrival`, `move-is-followed`, `typed-columns-owned`), which need nearly every gap
-   at once. Factoring three pure functions out of `PetBrain::tick` (the reduced-motion arm, the
-   settle ladder, `settle_gaze`) would move `reduced-motion-static`, `settle-ladder`,
-   `idle-frame-laws` and `sleeper-gaze-brakes` into step 3. The bounded host-seam sweeps can hold at
-   Trusted grade under a bounded model checker over the compiled code before any Clean proof exists.
+   at once. Factoring the reduced-motion arm, the settle ladder and `settle_gaze` out of
+   `PetBrain::tick` as pure functions would move `reduced-motion-static`, `settle-ladder`,
+   `idle-frame-laws` and `sleeper-gaze-brakes` into step 3.
 
-## 7. Added 2026-10-23: the distributed search (aos M5b)
+## 7. The distributed search (aos M5b)
 
-`aos_momentum::dist` (the wire, the claim check and the coordinator core) and `m4::Distributed`
-(the fold over claims) are new since the recovery, and their tests are read the same way as §1.
-Design of record: `docs/DESIGN-aos-hosted-execution-2026-10-21.md` §11. The ledger
-(`aos_momentum::lease`) has its call table here as `aos-lease-calls` and its refinement of the
-model as `aos-lease-refines-model` (§1).
-*Local* means judged by this process's `Evaluator`; a *claim* is a worker's reply, which is never
-evidence.
+Specs and tests of `aos_momentum::dist` (the wire, the claim check and the coordinator core),
+`aos_momentum::lease` (the worker-lease ledger) and `m4::Distributed` (the fold over claims), in
+the formats of §1 and §2; the design is `docs/DESIGN-aos-hosted-execution-2026-10-21.md` §11. The
+ledger's refinement of its model, `aos-lease-refines-model`, is in §1. *Local* means judged by this
+process's `Evaluator`; a *claim* is a worker's reply, never evidence.
 
 ```tsv
 id	kind	functions	statement	blocking_gaps	primary_tests
@@ -3717,27 +3651,29 @@ tests/light_latch_conformance.rs	negative_control_every_buggy_latch_is_left_on_s
 
 `rainbow_kitty::prism_glass` solves a light page's tables: the glass behind text, the deep lip
 under it, the caret, and a lip-forward page's own lip (design of record:
-`docs/design/PRISM-GLASS.md` §1, §3 and §15.2 1.4). The bed's glass draws from them (§13). The six glass
-pages and two lip-forward pages ship as `prism_glass/tables.rs`, which the first test regenerates;
+`docs/design/PRISM-GLASS.md` §1, §3 and §15.2 1.4). The bed's glass draws from them (§13). The five glass
+pages and three lip-forward pages ship as `prism_glass/tables.rs`, which the first test regenerates;
 any other pair is solved by `PaletteSolve` in counted units. Its tests are read the same way as
 §1. `palette-solve-budget` is a fourth row beside the three the design names, for the solve's
 units and cache.
 
 ```tsv
 id	kind	functions	statement	blocking_gaps	primary_tests
-glass-legibility-bar	table-property	prism_glass::{glass_ink,glass_bar,glass_anchors,headroom,solve,tables::SHIPPED,SHIPPED_PAGES}; prism_glass::scan::{scan,breakpoints,origins,Ground::pair_min}; ribbon::BedInkLut::sample; aterm_render::{over_premul,premul_rgb,glow_lerp_rgb}	The light partner of bed-legibility-bar. tables::SHIPPED is solve()'s output for SHIPPED_PAGES byte for byte, and those are the light built-in schemes and the effects tests' fixture (#24292f on white). On each glass page, with bar = min(5.25, 0.9 cr(fg, bg)): for every origin interval between the breakpoints of BedInkLut::sample(glass, t) and sample(glass, t + step), t in [0, 2), at one, two and three slabs per cell (step 1/16, 1/32, 1/48) and on the lay leg (1/36), every colour a slab lays under both column models (lerp_rgb at k/16; glow_lerp_rgb between the premul_rgb ends across 15, 8 + 7 or 5 px), composited by over_premul over the page at every alpha 1..=255, keeps cr(fg, ·) >= bar + LERP_BAR_GUARD (5.35), and so does every arc-table glass entry at every alpha. glass_ink lays each entry at the anchors' cusp L interpolated with the hue along the arc, raised to the fg's floor (bar + SOLVE_GUARD) and to the ORANGE FLOOR's room, C at the gamut edge capped at .24, L capped at .93; the lift raises every entry a ramp under the target brackets by LIFT_STEP_L until no ramp is (2 raising rounds, 25 entries on Default Light, one-slab worst 5.3844), and a page it cannot clear in MAX_LIFT_ROUNDS draws lip-forward. A page takes glass (Mode::Glass) iff every glass anchor keeps C >= HEADROOM_C (.12) at its floor; one without draws no glass (LipForward: Solarized Light, Catppuccin Latte), and a page that is not light draws nothing (Paper).	0,1,3,5,6,7,12	5
+glass-legibility-bar	table-property	prism_glass::{glass_ink,glass_bar,glass_anchors,headroom,solve,tables::SHIPPED,SHIPPED_PAGES}; prism_glass::scan::{scan,breakpoints,origins,Ground::pair_min}; ribbon::BedInkLut::sample; aterm_render::{over_premul,premul_rgb,glow_lerp_rgb}	The light partner of bed-legibility-bar. tables::SHIPPED is solve()'s output for SHIPPED_PAGES byte for byte, and those are the light built-in schemes and the effects tests' fixture (#24292f on white). On each glass page, with bar = glass_bar(fg, bg) = min(GLASS_BAR 5.25, PAGE_SHARE 0.9 × colour::seen(fg, bg, bg)), the fg's own reading on its page read as every reading the bar bars is (PRISM-GLASS.md §15.8 amendment 55; the leg binds on Solarized Light, Catppuccin Latte, Dawnfox, Kanagawa Lotus, TokyoNight Day and the four sweep pages, each lip-forward, and PAGE_SHARE of the bare contrast lies over each one's own seen reading, the_low_contrast_bar_is_a_share_of_the_fgs_own_seen_reading): for every origin interval between the breakpoints of BedInkLut::sample(glass, t) and sample(glass, t + step), t in [0, 2), at one, two and three slabs per cell (step 1/16, 1/32, 1/48) and on the lay leg (1/36), every colour a slab lays under both column models (lerp_rgb at k/16; glow_lerp_rgb between the premul_rgb ends across 15, 8 + 7 or 5 px), composited by over_premul over the page at every alpha 1..=255, keeps colour::seen(fg, bg, ·) >= bar + LERP_BAR_GUARD (5.35), and so does every arc-table glass entry at every alpha. Every bar is read on the fg's glyph as it is seen (PRISM-GLASS.md §15.8 amendment 49): colour::seen_y is its dimmest solid ink, rim_share(fg, page, THIN_INK_SHARE) of the way from the ink to the colour in linear light (the census's SOLID_SHARE .85 of a glyph's extreme, the window's thinnest glyph's darkest pixel THIN_INK_SHARE .007 toward the page), against the colour; aterm-render's glass_letters_read (render_suite) measures it: every printable ASCII glyph of the window's face at the window's cell (24 px) over every glass129 entry of every shipped glass page keeps GLASS_BAR by the census's glyph minimum (least 5.4698, GitHub Light's '"'), the solver's reading at most ROUNDING (.02) over the census's, and a ground darkened to §1's bare floor (bar + SOLVE_GUARD bare) reads under the bar on every page. glass_ink lays each entry at the anchors' cusp L interpolated with the hue along the arc, raised to the fg's seen floor (bar + SOLVE_GUARD) and to the ORANGE FLOOR's room, C at the gamut edge capped at .24, L capped at .93; the lift raises every entry a ramp under the target brackets by LIFT_STEP_L until no ramp is (1 raising round, 11 entries on Default Light, one-slab worst 5.3597), and a page it cannot clear in MAX_LIFT_ROUNDS draws lip-forward. A page takes glass (Mode::Glass) iff every glass anchor it draws (glass_anchors: the fg's seen floor, bar + SOLVE_GUARD at THIN_INK_SHARE) keeps C >= HEADROOM_C (.12) at its floor, §1's HEADROOM gate read at the drawn glass (PRISM-GLASS.md §15.8 amendment 52; every_glass_pages_drawn_anchors_keep_headroom_c, whose negative control is amendment 49's read at the bar alone, which admitted Gruvbox Light's drawn #ffa7a3 at C .105); one without draws no glass (LipForward: Gruvbox Light, Solarized Light, Catppuccin Latte), and a page that is not light draws nothing (Paper).	0,1,3,5,6,7,12	7
 light-mud-census	table-property	prism_glass::{mud_spec,mud_bands,mud_broad,mud,deep_ink,deep_forward,amber_hold_forward,cyan_fold,FOLD_ARC,FOLD_AT,FOLD_AT_ARC,CYAN_AT,CYAN_AT_ARC,AMBER_HOLD_HUE,ORANGE_FLOOR_L,LIP_FORWARD_CR,LIP_FORWARD_GOLD_CR,LIP_FORWARD_GOLD_L,Palette::cyan_snap}; prism_glass::scan::all_lerps	mud_spec(c) = C < .12, or h in 85..125 at L < .82, or h in 40..85 at L < .62 (mud_bands is the two bands); mud_broad(c) = L < .75 and (C < .10 or h in 60..115). On every shipped page, on every light page of the theme pack (the light rows of contrib/themes/pack/manifest.tsv, solved at test time), and on four synthetic lip-forward pages that tell the lip-forward rules from their rejected forms (#e7e7e7, #e6e7ed and #eee8b8 on #616161, #eff0f6 on #676767, solved at test time), no entry of lip129, lip511, caret129 or caret511, and no colour all_lerps draws between neighbours of them except across a snap (the lip's fold snap at FOLD_AT 39 and FOLD_AT_ARC 155, its cyan snap at CYAN_AT 76 and CYAN_AT_ARC 310 where cyan_snap is set, the caret's snaps), is mud under either rule; the glass tables are held to mud_bands and mud_broad (their chroma is the HEADROOM gate's), and Default Light's glass to both whole rules. all_lerps reaches every distinct lerp_rgb colour of a pair (one u inside each interval between its channels' breakpoints) and none outside the pair's channel ranges. The lip: hues [27, 50, 84, 145, 205, 264, 290, 315] at the anchors, gold's 84 held to FOLD_ARC (.3051) and 132 after it; L the argmax of C − 0.10 |L − L_pref| at least .10 under the quantised glass and 1.6:1 against the page; held at h 58.5 while L < .765 on 58.5 < h < 85 (the AMBER HOLD); and no darker than .625 from h 38.5 up the orange band, the glass raised to leave it room (the ORANGE FLOOR). A lip-forward lip keeps 2.0:1 against the page, 1.95:1 where h 60..115 needs it to reach L .755; on every page above drawn lip-forward, each lip129 and lip511 entry keeps 2.0:1, or 1.95:1 where its own hue is in 60..115. Once both lip-forward lip tables are solved (in the last ForwardArc unit, before the caret, so no unit is added): when an entry of either on the gold stretch (58.5 < deep hue < 85, walk entries 20..39 and arc entries 77..155) is mud, every stretch entry of both takes one colour, the lip-forward lip at h 58.5 (the LIP-FORWARD AMBER HOLD: Kanagawa Lotus #fb8a00 and TokyoNight Day #f18500, within 0.5° of h 58.5 at 2.0:1); then, in each table by itself, with an entry thin at C < .12 and the caret fold's zones, the warm and green zones' first thin entry through the zone's end take the zone's last clean entry before it, and the blue zone's start through its last thin entry take the zone's first clean entry after it, a zone with no clean entry on that side left as it is (the LIP-FORWARD CYAN FOLD: on TokyoNight Day walk 73..76 take entry 72's #00b4ab and 77 takes 78's #00b1c7, arc 292..310 take 291's #00b4ab and 311..317 take 318's #00b1c6, each at C >= .12 and 2.0:1); cyan_snap is set when an entry of the pair straddling the cyan waypoint (walk (76, 77), arc (310, 311)) folded, and is false on every shipped page. Without the fold snap Default Light's fold pair lerps through spec-rule mud, and without the cyan snap TokyoNight Day's cyan pairs lerp through mud; #e7e7e7, #e6e7ed and #eee8b8 set cyan_snap, and #eff0f6's unheld gold stretch is mud in its arc table alone while its gold anchor reaches L .755 at 1.95:1, so the hold's trigger reads both tables' entries.	0,1,3,5,6,7,12	6
 caret-cut-out	table-property	prism_glass::{caret_entry,caret_fill,caret_fold,caret_table,vivid,CARET_BAR,CARET_SOLVE}	caret_fill solves a lip entry to CARET_SOLVE (4.65) against a side, its lightness moved away from the side with chroma held to the lip's and the gamut edge. caret_entry cuts out the fg or the page on a glass page (whichever solved fill keeps more chroma, the page on a tie) and the page on a lip-forward one. The CARET FOLD gives a fill that is mud, or a page-side fill that is not vivid (C >= .15 and no h 35..135 under L .65), its nearest clean entry's fill and side within its zone (warm before FOLD_ARC, green before the cyan waypoint, blue after); the caret snaps at a side flip, across FOLD_ARC, where a folded entry meets another zone, and between folded entries of different fills. On every shipped page, every light page of the theme pack and the four synthetic pages light-mud-census names, at both lengths, every entry keeps cr(fill, side) >= CARET_BAR (4.6), and so does every colour all_lerps draws between unsnapped neighbours (Solarized Light's walk caret worst 4.6306, its folded runs 6..43 -> #d03400 | #3f7d00 and 61..95 -> #00812b | #0071c6). On each of those pages the walk caret (fill, sides, folds and snaps) is caret_table over the walk lip the page ships with, so a lip-forward page's caret is solved from its held and folded lip; no page yet shows the lip-forward rules changing a caret entry (every walk entry whose lip they change has its caret folded, before them and after), so the order is held by the solve, not seen in a table.	0,1,3,5,6,7,12	1
-palette-solve-budget	contract	prism_glass::{PaletteSolve::{new,advance,done,units,next_unit},PaletteCache::{frame,holds,pending,len},take_solves,SOLVE_UNITS_PER_FRAME,MAX_SOLVE_UNITS,PALETTE_CACHE_LEN}	PaletteSolve(fg, bg) runs in counted units, never timed: the page's class, the 8 anchors, each walk and arc glass entry, the scan's ground, each lift round's three densities' origins and its 128 table intervals, each walk and arc lip entry, each caret entry, and the fold; it runs at most MAX_SOLVE_UNITS and ends at solve(fg, bg)'s palette (on a shipped glass page 1,682 units when its lift takes one raising round, as Gruvbox Light's does, and 1,813 when it takes two, as every other's does; 779 on a lip-forward one). PaletteCache::frame runs no unit for a shipped pair or a kept one, and at most SOLVE_UNITS_PER_FRAME (4) for the pair it is solving, returning None (main's paper arm) until the solve is done; a request for another pair that is neither shipped nor kept drops the solve in progress, and a shipped or kept pair answers without touching it; it keeps the PALETTE_CACHE_LEN (8) most recently asked pairs. take_solves() is this thread's units since the last take, the host's prism_glass_solves == 0 pin. SOLVE_UNITS_PER_FRAME is the units of the most costly kind that fit 1 ms, from aterm-bench's prism_glass_units release bench (2026-10-27: 243 µs, a lift round's interval scan).	0,1,2,3,7	4
+palette-solve-budget	contract	prism_glass::{PaletteSolve::{new,advance,done,units,next_unit},PaletteCache::{frame,holds,pending,len},take_solves,SOLVE_UNITS_PER_FRAME,MAX_SOLVE_UNITS,PALETTE_CACHE_LEN}	PaletteSolve(fg, bg) runs in counted units, never timed: the page's class, the 8 anchors, each walk and arc glass entry, the scan's ground, each lift round's three densities' origins and its 128 table intervals, each walk and arc lip entry, each caret entry, and the fold; it runs at most MAX_SOLVE_UNITS and ends at solve(fg, bg)'s palette (on a shipped glass page 1,682 units when its lift takes one raising round, as Default Light's, Aterm Day's, Linen's and GitHub Light's do, and 1,813 when it takes two, as the fixture's does; 779 on a lip-forward one, as Gruvbox Light's, Solarized Light's and Catppuccin Latte's are). PaletteCache::frame runs no unit for a shipped pair or a kept one, and at most SOLVE_UNITS_PER_FRAME (4) for the pair it is solving, returning None (main's paper arm) until the solve is done; a request for another pair that is neither shipped nor kept drops the solve in progress, and a shipped or kept pair answers without touching it; it keeps the PALETTE_CACHE_LEN (8) most recently asked pairs. take_solves() is this thread's units since the last take, the host's prism_glass_solves == 0 pin. SOLVE_UNITS_PER_FRAME is the units of the most costly kind that fit 1 ms, from aterm-bench's prism_glass_units release bench (2026-10-27: 243 µs, a lift round's interval scan; re-run 2026-10-30 on the seen solve: 208.92 µs, the same kind, on Default Light).	0,1,2,3,7	4
 ```
 
 ```tsv
 file	test	primary	also
 src/rainbow_kitty/prism_glass/tests.rs	the_shipped_tables_are_the_generators_output	glass-legibility-bar	light-mud-census,caret-cut-out
 src/rainbow_kitty/prism_glass/tests.rs	the_shipped_pages_are_every_light_builtin_scheme	glass-legibility-bar	
-src/rainbow_kitty/prism_glass/tests.rs	default_lights_glass_anchors_are_the_spec_hex	glass-legibility-bar	
+src/rainbow_kitty/prism_glass/tests.rs	default_lights_glass_anchors_are_solved_against_the_seen_glyph	glass-legibility-bar	
 src/rainbow_kitty/prism_glass/tests.rs	the_light_glass_keeps_every_glyph_at_its_bar_at_every_alpha	glass-legibility-bar	
+src/rainbow_kitty/prism_glass/tests.rs	the_low_contrast_bar_is_a_share_of_the_fgs_own_seen_reading	glass-legibility-bar	
 src/rainbow_kitty/prism_glass/tests.rs	a_theme_without_headroom_draws_no_glass	glass-legibility-bar	light-mud-census
+src/rainbow_kitty/prism_glass/tests.rs	every_glass_pages_drawn_anchors_keep_headroom_c	glass-legibility-bar	
 src/rainbow_kitty/prism_glass/tests.rs	no_table_is_mud_on_any_light_theme	light-mud-census	
 src/rainbow_kitty/prism_glass/tests.rs	no_lerp_between_entries_is_mud	light-mud-census	
 src/rainbow_kitty/prism_glass/tests.rs	default_lights_lip_folds_at_39_and_holds_its_amber	light-mud-census	
@@ -3755,8 +3691,9 @@ src/rainbow_kitty/prism_glass/tests.rs	a_request_for_another_pair_drops_the_solv
 
 The bed's ink table gains Prism Glass's glass (design of record: `docs/design/PRISM-GLASS.md`
 §15.2 1.5): under `glass_lit` the bed draws by the page's solved glass129, with main's table built
-beside it on every frame. Nothing sets a light yet (`prism_glass::LIVE` is `Live::Off` and no host
-latches one), so every frame draws main's table. Its tests are read the same way as §1; the host's
+beside it on every frame. Since 1.12 (`prism_glass::LIVE` is `Live::Glass`) a frame the host
+latches light draws by the glass where `glass_lit` holds; every other frame, every dark one
+included, draws main's table. Its tests are read the same way as §1; the host's
 dark pin (`aterm-gui` `light_fork_pin_tests.rs`) holds the bed's glass and the light words absent on
 every dark ground.
 
@@ -3780,14 +3717,14 @@ src/pipeline_native.rs	a_glass_step_reports_the_glass_arm_and_main_none	bed-glas
 A frame the bed draws by its glass (§13) lays the glass's own geometry (design of record:
 `docs/design/PRISM-GLASS.md` §2.2 and §15.2 1.7): standing on its row's bottom with nothing below
 it, 0.96 ch tall at the hand and 0.86 ch behind it on the comet, whole opacity under a 2.5 px top
-melt, laid through `aterm_render::ribbon_glass_into`. Nothing sets a light yet
-(`prism_glass::LIVE` is `Live::Off` and no host latches one), so every frame draws main's geometry
+melt, laid through `aterm_render::ribbon_glass_into`. Since 1.12 (`prism_glass::LIVE` is
+`Live::Glass`) every frame `glass_lit` admits lays it; every other frame draws main's geometry,
 and the host's dark pin (`aterm-gui` `light_fork_pin_tests.rs`) holds the glass slabs and the
 glass plan absent on every dark ground. Its tests are read the same way as §1.
 
 ```tsv
 id	kind	functions	statement	blocking_gaps	primary_tests
-light-glass-geometry	contract	ribbon::{GLASS_BODY,GLASS_UP_CH,GLASS_TAIL_UP_CH,GLASS_CORE_SHARE,LIGHT_GLASS_WAVE_CH,GLASS_EDGE_PX,GLASS_MIN_PX,GLASS_ALPHA,GLASS_HARD_STEP_T,Segment::{glass_up,glass_jump},Ribbon::{plan_run,emit,glass_planned,glass_up_at,cov_of}}; cursor_glow::Light::{on_page,sheer,glass}; host::{PageFacts,TrailGround::ground}; aterm_render::{ribbon_glass_into,glass_profile,WEDGE_EDGE_PX}	Under glass_lit the plan keeps main's segments and geometry (band() main's for every cell) and adds per boundary the glass's reach glass_up: GLASS_UP_CH at the hand, easing to GLASS_TAIL_UP_CH over COMET_TAPER_CELLS on the comet (the flat spelling holds GLASS_UP_CH), its top swinging LIGHT_GLASS_WAVE_CH with main's wave, under the flow's settle and breath, and scaled by the frame's intensity: half intensity is half height at the same whole opacity, and a run none of whose boundaries reaches GLASS_MIN_PX draws no body, though its frame is still the glass arm's (glass_drew_at, with no glass_span for the guard or the yield): main's paper lays its body there. Coverage is planned under GLASS_ALPHA and never scaled by intensity. Between two cells of a run whose walk differs by more than GLASS_HARD_STEP_T, and at a cohort seam, the glass steps hard: the boundary closes its left cell at that cell's walk and opens its right one at its own (glass_jump), two vertices at one x, each in its side's ink; a cell boundary lerps (one vertex at the mean of its cells' walk), and main's frame lerps across both. Emit lays each run as vertices at spine = the row's bottom (under the pane's bottom and the effect's top), up = the kept glass_up, dn 0, core half the reach, through ribbon_glass_into (source-over, wedges at WEDGE_EDGE_PX, a GLASS_EDGE_PX top melt): nothing on or below the row's bottom, no rail span, no hot edge, its tail easing in without a stair (by its height and with no strip lift or head feather since Prism Glass 1.8, §15; by its opacity until then). A see-through page (PageFacts: a translucent window or a ready wallpaper) gives the light its sheer bit (Light::on_page), under which glass() is false: the bed syncs main's paper table and the frame is main's paper frame byte for byte, with no glass planned or laid and no arm.	0,1,2,3,12	8
+light-glass-geometry	contract	ribbon::{GLASS_BODY,GLASS_UP_CH,GLASS_TAIL_UP_CH,GLASS_CORE_SHARE,LIGHT_GLASS_WAVE_CH,GLASS_EDGE_PX,GLASS_MIN_PX,GLASS_ALPHA,GLASS_HARD_STEP_T,Segment::{glass_up,glass_jump},Ribbon::{plan_run,emit,glass_planned,glass_up_at,cov_of}}; cursor_glow::Light::{on_page,sheer,glass}; host::{PageFacts::{clear,glass,thin_ink},TrailGround::ground}; prism_glass::colour::THIN_INK_SHARE; aterm_render::{ribbon_glass_into,glass_profile,WEDGE_EDGE_PX,GlyphInk::thin_share}	Under glass_lit the plan keeps main's segments and geometry (band() main's for every cell) and adds per boundary the glass's reach glass_up: GLASS_UP_CH at the hand, easing to GLASS_TAIL_UP_CH over COMET_TAPER_CELLS on the comet (the flat spelling holds GLASS_UP_CH), its top swinging LIGHT_GLASS_WAVE_CH with main's wave, under the flow's settle and breath, and scaled by the frame's intensity: half intensity is half height at the same whole opacity, and a run none of whose boundaries reaches GLASS_MIN_PX draws no body, though its frame is still the glass arm's (glass_drew_at, with no glass_span for the guard or the yield): main's paper lays its body there. Coverage is planned under GLASS_ALPHA and never scaled by intensity. Between two cells of a run whose walk differs by more than GLASS_HARD_STEP_T, and at a cohort seam, the glass steps hard: the boundary closes its left cell at that cell's walk and opens its right one at its own (glass_jump), two vertices at one x, each in its side's ink; a cell boundary lerps (one vertex at the mean of its cells' walk), and main's frame lerps across both. Emit lays each run as vertices at spine = the row's bottom (under the pane's bottom and the effect's top), up = the kept glass_up, dn 0, core half the reach, through ribbon_glass_into (source-over, wedges at WEDGE_EDGE_PX, a GLASS_EDGE_PX top melt): nothing on or below the row's bottom, no rail span, no hot edge, its tail easing in without a stair (by its height and with no strip lift or head feather since Prism Glass 1.8, §15; by its opacity until then). A page the glass does not draw on (PageFacts::glass false: a see-through page, a translucent window or a ready wallpaper, or a page whose face lays its thinnest printable glyph's darkest pixel further toward the page than colour::THIN_INK_SHARE (PageFacts::thin_ink, aterm_render::GlyphInk::thin_share of the window's face in the page's fg on its bg), the share the glass is solved for, PRISM-GLASS.md §15.8 amendment 53, which aterm-render's glass_letters_read (render_suite) measures in the_glass_draws_where_the_windows_face_lays_its_letters_full: the window's face loaded by path (SF Mono on macOS) at every whole px from 10 to 48 and line heights 1.0, 1.1 and 1.2 keeps GLASS_BAR by the census's glyph minimum over each glass page's SWEPT_ENTRIES (8) least-seen entries wherever the share admits it, 12 and 14 px are refused and 24 px admitted, and a refused size on cells of 24 px or more (SF Mono's 26 px `_`, 5.09) holds a glyph under the bar, which amendment 50's cell rule admitted; a 12 pt window at scale 1 draws main's arm; the host names the window's face, App::page_facts by the glyph ink its glow last observed, a window not read yet taking none near the full ink, and PageFacts::OPAQUE, a host that names none, takes its face as laying its full ink; the Settings card's terminal draws main's arm at every scale, its own judge reading the 2x card's letters under its bar on the glass, amendment 54) gives the light its sheer bit (Light::on_page), under which glass() is false: the bed syncs main's paper table and the frame is main's paper frame byte for byte, with no glass planned or laid and no arm.	0,1,2,3,12	9
 ```
 
 ```tsv
@@ -3796,9 +3733,10 @@ src/rainbow_kitty/ribbon.rs	a_single_row_composer_draws_v4s_glass	light-glass-ge
 src/rainbow_kitty/ribbon.rs	a_seam_or_walk_jump_is_a_hard_step_on_light_and_a_cell_boundary_is_not	light-glass-geometry	
 src/rainbow_kitty/ribbon.rs	glass_at_half_intensity_is_half_height_at_full_alpha	light-glass-geometry	ribbon-occupied-cov-cap
 src/rainbow_kitty/ribbon.rs	a_translucent_page_draws_mains_paper_arm	light-glass-geometry	bed-glass-arm
-src/rainbow_kitty/ribbon.rs	no_rail_quad_under_glass	light-glass-geometry	
+src/rainbow_kitty/ribbon.rs	no_rail_quad_under_glass	light-glass-geometry	body-ceiling-rail-and-pane
 src/rainbow_kitty/ribbon.rs	the_glass_run_s_tail_eases_in_by_height_without_a_stair	glass-exits-by-height	light-glass-geometry,attack-and-boundary
 src/host/trail_ground.rs	a_see_through_page_draws_no_glass	light-glass-geometry	
+src/host/trail_ground.rs	a_page_whose_face_lays_no_full_ink_draws_no_glass	light-glass-geometry	
 ```
 
 ## 15. Added 2026-10-28: the glass's exits, price and cadence (Prism Glass 1.8)
@@ -3806,9 +3744,9 @@ src/host/trail_ground.rs	a_see_through_page_draws_no_glass	light-glass-geometry
 A frame the bed draws by its glass (§13, §14) leaves by its height (design of record:
 `docs/design/PRISM-GLASS.md` §2.2 Exits by height and Quad budget, §15.2 1.8): the glass's opacity
 moves only at §2.2's four places (its 2.5 px edge, the 18 ms edge-in, BAYER4 and the 120 ms
-reduced-motion fade), and the plan's density and every state word stay main's. Nothing sets a
-light yet (`prism_glass::LIVE` is `Live::Off` and no host latches one), so no frame runs any of it,
-and the host's dark pin (`aterm-gui` `light_fork_pin_tests.rs`) holds the glass's exits absent on
+reduced-motion fade), and the plan's density and every state word stay main's. Since 1.12
+(`prism_glass::LIVE` is `Live::Glass`) every glass frame runs it and no other frame does, and the
+host's dark pin (`aterm-gui` `light_fork_pin_tests.rs`) holds the glass's exits absent on
 every dark ground (`take_glass_exits`). Its tests are read the same way as §1.
 
 ```tsv
@@ -3821,7 +3759,7 @@ glass-quad-price	invariant	ribbon::{GLASS_LIP_RESERVE_CH,GLASS_WEDGE_ROW_LIGHTS,
 file	test	primary	also
 src/rainbow_kitty/ribbon.rs	the_glass_leaves_by_height	glass-exits-by-height	abandon-retract,focus-ember,curtain-law,attack-and-boundary
 src/rainbow_kitty/ribbon.rs	a_settled_glass_idles_to_exactly_zero	glass-exits-by-height	
-src/rainbow_kitty/ribbon.rs	a_glass_ribbon_folds_its_paper_twins_state_through_every_exit	glass-exits-by-height	focus-ember
+src/rainbow_kitty/ribbon.rs	a_glass_ribbon_folds_its_paper_twins_state_through_every_exit	glass-exits-by-height	focus-ember,ember-seen-floor
 src/pipeline_native.rs	a_glass_frame_leaves_its_paper_twins_state_words	glass-exits-by-height	
 src/rainbow_kitty/ribbon.rs	a_glass_frame_stays_within_the_ribbon_quad_budget	glass-quad-price	ribbon-quad-budget,rk-ribbon-quad-share
 src/rainbow_kitty/ribbon.rs	dark_slabs_for_is_mains	glass-quad-price	ribbon-quad-budget
@@ -3833,17 +3771,17 @@ On a frame whose cursor step laid the light glass (§13, §14), the glass yields
 words (design of record: `docs/design/PRISM-GLASS.md` §4 and §15.2 1.9): every host's word
 publish (`EffectsPipeline::publish_words`) cuts the glass in the under stream, word by word, to
 the cap each word's ink keeps its bar under, after the word pass and before the word icons' shade.
-The glass is light-owned: the letter guard neither weighs nor cuts it. Nothing sets a light yet
-(`prism_glass::LIVE` is `Live::Off` and no host latches one), so no frame lays glass, notes a
-light-owned span or yields, and the host's dark pin (`aterm-gui` `light_fork_pin_tests.rs`) holds
+The glass is light-owned: the letter guard neither weighs nor cuts it. Since 1.12
+(`prism_glass::LIVE` is `Live::Glass`) a glass frame lays the glass, notes its light-owned span
+and yields, and no other frame does; the host's dark pin (`aterm-gui` `light_fork_pin_tests.rs`) holds
 the light-owned glass and the yield absent on every dark ground. The selection's half on both
 backends is `aterm-gpu`'s `glow_under_parity::a_selected_word_under_the_light_glass_shows_its_selection`.
 The crown's twin of the first candy frame waits for 3.10. Its tests are read the same way as §1.
 
 ```tsv
 id	kind	functions	statement	blocking_gaps	primary_tests
-glass-yield	contract	cursor_glow::glass_yield::{cap,scale_end,GlassLaid::{new,in_pane,record,clear},GlassYield::apply,YIELD_BAR,K_MIN,ORPHAN_CELLS,RAMP_KNOT_PX}; CursorGlow::{record_glass,yield_glass,yielded_at,last_yield,glass_laid,forget_glass,yield_held}; GlassYield::forget; EffectsPipeline::{yield_glass,yield_glass_unworded,publish_words,light_arms}; Ribbon::glass_span	The glass a step laid (its light-owned span of the under stream, recorded as the step left it) is found in the published stream by its pieces in draw order, each whole or narrowed by a clip, and only it is cut; no other light (a lip, a meteor, a star) is. Per cell of each glass row of the step's pane (a composed frame's cells outside the pane's columns, another session's, the record's pane, are read as no cell: they take no glass and bound no run, ease or orphan run): a ground off the page (the cell's own bg, a default-bg span off the page, a selection by RenderInput::selection_hit, an image, a wallpaper, a line of another size, an under-text sprite) takes 0; a theme-fg glyph or a blank takes 255; a maximal run of other glyphs takes cap = the least over its inks and the glass composites under it (every row of a ramp by its own ends) of the largest alpha at which the ink keeps YIELD_BAR (GLASS_BAR, §4's bar 5.25) at every lower alpha, 0 under K_MIN (200); a glyph the word pass animates (an InkCell) takes 0 on each frame it animates. A blank run between yielded cells is yielded, and so is a run of blanks and theme-fg glyphs shorter than ORPHAN_CELLS between two yielded words or a yielded word and the caret, the caret's cell with it (a ground off the page is no word and bounds no such run); a blank beside a yielded cell eases back to whole across its cell in RAMP_KNOT_PX knots. Cut pieces continue their gradient (an edge lerp), each end scaled with no channel over its alpha, and an end whose alpha rounds to 0 carries no colour. A frame whose step laid no glass is published as it came, and so is the stream the step's last cut left (CursorGlow's yield_spent and yield_left: a second word pass over its own frame leaves it as it is); every other stream holding the step's glass is cut as the frame's own was, a copy of the glow's uncut stream a retained projection lays (a windowed composed capture's publish) and the heterogeneous route's, which runs no word pass and yields over the frame's cells with no free sprites (yield_glass_unworded; aterm-gui's glass_yield_host_tests.rs drives both host routes); the light report names the yield's arm (`yield`) with the under streams it cut. The yield's state goes with the light (§10.1): every tick starts by forgetting the record, the last cut's report and the spent step (forget_glass), so a step that lays no glass, the first dark step after a light one included, holds none of them (last_yield None, yield_held (None, 0)), and a tick with the light off drops the memo of caps too.	0,1,2,3,12	13
-letter-guard-light-owned	contract	InkLedger::{note_light_owned_laid,light_owned,in_light_owned,in_light_owned_ramp,fold_rails,clear_rails,guard_judged}; CursorGlow::{guard_letters,guard_judges,guard_judged}; EffectsPipeline::light_arms; letter_guard::{row_lights,FrameMemo}; InkLedger::{guard_mask_stream,guard_mask_quads,guard_mask_ramps}	The under stream's light-owned spans (quads and ramps, noted from the ribbon's glass span) are never weighed by the letter guard (its judging skips them, as it skips a foot rail) and never cut by its masks; every other light, before or after them, is guarded as before, and the guard's frame memo keys on the spans. With no span noted (every frame until a light latches) the guard's streams are its parent's, word for word. On a frame the glass drew the guard's dims are the glass frame's own (the glass under the letters is not main's paper body, and the light-owned spans go unweighed), so wherever the guard judged the frame's lights against its letters (guard_judges: not spared, with text and some light; InkLedger::guard_judged, forgotten with the rails) the light report names the guard's arm (`guard`) with every stream it cuts: glow_under, glow_under_ramps, cursor_glow_add, cursor_glow_add_ramps and glow_halo.	0,1,2,3	3
+glass-yield	contract	cursor_glow::glass_yield::{cap,scale_end,GlassLaid::{new,in_pane,record,clear},GlassYield::apply,YIELD_BAR,K_MIN,ORPHAN_CELLS,RAMP_KNOT_PX}; CursorGlow::{record_glass,yield_glass,yielded_at,last_yield,glass_laid,forget_glass,yield_held}; GlassYield::forget; CursorGlow::{observe_glyph_ink,observe_glyph_ink_unavailable}; aterm_render::GlyphInk::for_frame; EffectsPipeline::{yield_glass,yield_glass_unworded,publish_words,light_arms}; Ribbon::glass_span	The glass a step laid (its light-owned span of the under stream, recorded as the step left it) is found in the published stream by its pieces in draw order, each whole or narrowed by a clip, and only it is cut; no other light (a lip, a meteor, a star) is. Per cell of each glass row of the step's pane (a composed frame's cells outside the pane's columns, another session's, the record's pane, are read as no cell: they take no glass and bound no run, ease or orphan run): a ground off the page (the cell's own bg, a default-bg span off the page, a selection by RenderInput::selection_hit, an image, a wallpaper, a line of another size, an under-text sprite) takes 0; a theme-fg glyph or a blank takes 255; a maximal run of other glyphs takes cap = the least over its inks and the glass composites under it (every row of a ramp by its own ends) of the largest alpha at which the ink keeps YIELD_BAR (GLASS_BAR, §4's bar 5.25, read on its glyph as it is seen: the ground's luminance at least colour::seen_floor_y(ink, page, bar), PRISM-GLASS.md §15.8 amendment 49) at every lower alpha, 0 under K_MIN (200); a glyph the word pass animates (an InkCell) takes 0 on each frame it animates. That is the colour law (GlassYield::apply), and the hosts' yield (CursorGlow::yield_glass) keeps it while the glow holds no glyph table (no host observed one, or the last observe_glyph_ink said None): every glyph's ink is then judged solid. Once a host has observed a glyph table the yield is strict, each glyph judged by its raster in the frame's own glyph evidence (GlyphInk::for_frame of that observation; none while the host marks the frame's renderer unavailable, observe_glyph_ink_unavailable): its solid pixels keep YIELD_BAR (a theme-fg glyph's no more than PAGE_SHARE of its own reading on the page) and its core pixel 4.5 (no more than 0.97 of its own), blended as the renderer blends text; a maximal run of glyphs the word pass does not animate, theme-fg ones with the rest, takes the least over its glyphs and the glass composites under it of the largest alpha at which, and under which, the glyph keeps its bars over the composite scaled; a run holding a glyph no current evidence vouches for (no evidence for the frame, no raster for its cell, or a raster with no solid pixel or core) takes 0, so a theme-fg glyph fails closed there; a measured theme-fg glyph stays plain for the orphan rule below, and one under 255 bounds an orphan run as a word does. A strict cap of at least K_MIN is then stepped down until the gradient the lay publishes at it keeps every judged glyph's bars: each glass span under the run cut at the run's cell edges, its ends continuing the gradient there (edge_end), each end scaled and the two lerped across the piece as the renderer lerps a light, which rounds apart from the composite scaled; 0 under K_MIN. A blank run between yielded cells is yielded, and so is a run of blanks and theme-fg glyphs shorter than ORPHAN_CELLS between two yielded words or a yielded word and the caret, the caret's cell with it (a ground off the page is no word and bounds no such run); a blank beside a yielded cell eases back to whole across its cell in RAMP_KNOT_PX knots. Cut pieces continue their gradient (an edge lerp), each end scaled with no channel over its alpha, and an end whose alpha rounds to 0 carries no colour. A frame whose step laid no glass is published as it came, and so is the stream the step's last cut left (CursorGlow's yield_spent and yield_left: a second word pass over its own frame leaves it as it is); every other stream holding the step's glass is cut as the frame's own was, a copy of the glow's uncut stream a retained projection lays (a windowed composed capture's publish) and the heterogeneous route's, which runs no word pass and yields over the frame's cells with no free sprites (yield_glass_unworded; aterm-gui's glass_yield_host_tests.rs drives both host routes); the light report names the yield's arm (`yield`) with the under streams it cut. The yield's state goes with the light (§10.1): every tick starts by forgetting the record, the last cut's report and the spent step (forget_glass), so a step that lays no glass, the first dark step after a light one included, holds none of them (last_yield None, yield_held (None, 0)), and a tick with the light off drops the memo of caps too.	0,1,2,3,12	17
+letter-guard-light-owned	contract	InkLedger::{note_light_owned_laid,light_owned,in_light_owned,in_light_owned_ramp,fold_rails,clear_rails,guard_judged}; CursorGlow::{guard_letters,guard_judges,guard_judged}; EffectsPipeline::light_arms; letter_guard::{row_lights,FrameMemo}; InkLedger::{guard_mask_stream,guard_mask_quads,guard_mask_ramps}	The under stream's light-owned spans (quads and ramps, noted from the ribbon's glass span) are never weighed by the letter guard (its judging skips them, as it skips a foot rail) and never cut by its masks (§18's verify pass reads them as the frame draws them under the other lights, as it reads a foot rail, and cuts neither); every other light, before or after them, is guarded as before, and the guard's frame memo keys on the spans. With no span noted (every frame until a light latches) the guard's streams are its parent's, word for word. On a frame the glass drew the guard's dims are the glass frame's own (the glass under the letters is not main's paper body, and the light-owned spans go unweighed), so wherever the guard judged the frame's lights against its letters (guard_judges: not spared, with text and some light; InkLedger::guard_judged, forgotten with the rails) the light report names the guard's arm (`guard`) with every stream it cuts: glow_under, glow_under_ramps, cursor_glow_add, cursor_glow_add_ramps and glow_halo.	0,1,2,3	3
 ```
 
 ```tsv
@@ -3858,6 +3796,10 @@ src/cursor_glow/glass_yield.rs	the_first_candy_frame_over_glass_meets_its_bar	gl
 src/cursor_glow/glass_yield.rs	a_ground_off_the_page_takes_no_glass	glass-yield	
 src/cursor_glow/glass_yield.rs	only_the_glass_yields	glass-yield	
 src/cursor_glow/glass_yield.rs	a_neighbour_pane_bounds_nothing	glass-yield	
+src/cursor_glow/glass_yield.rs	actual_raster_coverage_keeps_safe_glass_and_caps_thin_ink	glass-yield	
+src/cursor_glow/glass_yield.rs	published_caps_keep_synthetic_ink_readable_after_gradient_rounding	glass-yield	
+src/cursor_glow/glass_yield.rs	observed_safe_theme_ink_still_bridges_between_yielded_words_and_caret	glass-yield	
+src/cursor_glow/glass_yield.rs	unavailable_frame_evidence_keeps_the_guard_table_and_yields_glass	glass-yield	
 src/pipeline_native.rs	a_glass_frame_s_words_take_the_yield_and_main_none	glass-yield	letter-guard-light-owned
 src/pipeline_native.rs	a_step_s_glass_yields_once_per_stream	glass-yield	
 src/pipeline_native.rs	the_yield_s_state_goes_with_the_light	glass-yield	
@@ -3872,9 +3814,8 @@ A frame the bed draws by its glass (§13, §14, §15) on a wrapped composer (des
 `docs/design/PRISM-GLASS.md` §2.4 and §15.2 1.10) sinks each row the hand has left to a low glass by
 its height, and keeps 3 px of page above the hand's row's glass, so the wrapped band reads as one
 pane. Its state is a light-only side table beside main's cells, empty on every other frame, and main's
-row hold runs unchanged with no hand on the glass's height. Nothing sets a light yet
-(`prism_glass::LIVE` is `Live::Off` and no host latches one), so no frame runs any of it, and the
-host's dark pin (`aterm-gui` `light_fork_pin_tests.rs`) holds `left_at` and the hand's row absent on
+row hold runs unchanged with no hand on the glass's height. Since 1.12 (`prism_glass::LIVE` is
+`Live::Glass`) every glass frame runs it and no other frame does, and the host's dark pin (`aterm-gui` `light_fork_pin_tests.rs`) holds `left_at` and the hand's row absent on
 every dark ground. Its tests are read the same way as §1.
 
 ```tsv
@@ -3891,4 +3832,37 @@ src/rainbow_kitty/ribbon.rs	the_structural_set_is_the_hand_s_open_phrase_rows_ca
 src/rainbow_kitty/ribbon.rs	main_s_row_hold_runs_and_leaves_the_glass_s_height_alone	glass-wrap-sink	light-glass-geometry
 src/rainbow_kitty/ribbon.rs	a_scroll_keeps_each_sink_on_its_row	ribbon-translate	glass-wrap-sink
 src/rainbow_kitty/ribbon.rs	a_carry_moves_each_sink_with_its_row	ribbon-translate	glass-wrap-sink
+```
+
+## 18. Added 2026-11-01: the letter's ring (round 27)
+
+The letter guard and the trail judges read a letter by one model, what a reader sees round each
+stroke. The judges (`aterm-lab trail-contrast`'s `local_contrast`, which its thresholds judge, and
+aterm-render's `trail_letters_read`, `Letter::judged`) read each solid ink pixel of the clean glyph
+(at least `SOLID_SHARE` of its most contrasting pixel's ratio against the cell's ground) against each
+channel's median (the upper of an even count) of the frame's pixels on its nearest Chebyshev ring
+(1 px out, else 2) that are the cell's ground in the clean frame; a pixel row reads the lower median
+of its pixels' ratios, and the letter its worst row. The whole cell's median ground is not judged: a
+light laid away from the strokes or a companion's coat over part of the cell is not what the letter
+is read against. The guard reads that same ring from the glyph's own raster and its neighbours'
+(`aterm_render::GlyphInk::raster`), composites the frame as the renderer draws it, keeps
+`letter_bar` of the letter's own reading (the judge on the clean frame), and reads every such cell
+again on the streams its cuts leave, with the night grounds laid after it. Its laws are
+aterm-render's `trail_letters_read` (`every_letter_a_trail_lies_on_reads_at_the_bar`,
+`every_letter_on_a_dim_theme_keeps_its_own_reading`, `a_dim_letter_keeps_its_own_reading`, through
+every scene, the wrapped line too, the replays passing the frame's glyph ink as the GUI does, and
+`the_cursor_trail_s_fill_is_a_letter_s_ground`, and for letters with no raster
+`a_dim_letter_with_no_raster_keeps_its_own_reading`), aterm-gui's settings card
+(`the_cards_letters_read_under_every_light`) and aterm-lab's
+`a_light_away_from_the_strokes_leaves_the_letter_its_reading`. Its tests are read the
+same way as §1.
+
+```tsv
+id	kind	functions	statement	blocking_gaps	primary_tests
+letter-guard-ring	contract	letter_guard::ring::{RingCell::{read,reading,own,base},Neighbour,FramePx}; letter_guard::ring_cells; LetterGuard::{cell_lights,paint_ring,holds_ring,judge,share}; CursorGlow::{guard_letters,lay_cuts,verify_cuts,set_letter_guard_ring,set_letter_guard_trail,set_letter_guard_room}; CursorFx::tick (the trail before the guard); letter_guard::{letter_bar,OWN_ROOM,VERIFY_PASSES,VERIFY_STEP,VERIFY_FLOOR}; FrameText::plain; aterm_render::{GlyphInk::{raster,corrected},GlyphRaster,TextLevel}	For a lettered cell whose glyph the face's table holds a raster for and which draws that raster alone (FrameText::plain: narrow, unmarked, no slant, decoration line, emoji presentation or script shift), RingCell::read lays its neighbourhood's grounds and glyphs (a neighbour the frame did not read as the cell's page, a block caret's cell and a glyph with no raster as no ground) in draw order through TextLevel, each cell's ground under the lights the cursor trail's fill where the frame's trail lays one (its colour at its coverage, as the renderer's draw_trail blends it), and RingCell::reading(frame) is the judges' reading of that frame: each solid ink pixel (clean ratio at least SOLID_SHARE of the cell's extreme) against the per-channel upper median of the frame on its nearest Chebyshev ring within RING of clean-ground pixels, each row's lower median, the worst row, and own is that reading on the clean frame. guard_letters keeps every such cell's reading on the frame its cut streams compose (the flames' and night grounds ground_the_frame lays first in the under stream) at least letter_bar(own) (LETTER_FLOOR, or OWN_SHARE of own under it), lowering a cell's share by VERIFY_STEP a pass, to none under VERIFY_FLOOR or after VERIFY_PASSES. A cell with no such raster is read by its solid ink against its grounds' least and greatest luminance, as before, and its bar keeps OWN_ROOM over OWN_SHARE (letter_bar's room: that reading is not the judges' ring). A frame with no cut is byte-identical.	0,1,3,7,12	src/cursor_glow/ink_ledger/letter_guard/ring.rs::a_stroke_reads_against_its_ring_s_channel_medians
+```
+
+```tsv
+file	test	primary	also
+src/cursor_glow/ink_ledger/letter_guard/ring.rs	a_stroke_reads_against_its_ring_s_channel_medians	letter-guard-ring	
 ```

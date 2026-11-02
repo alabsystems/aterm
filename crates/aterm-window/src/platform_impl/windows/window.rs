@@ -45,6 +45,7 @@ use crate::cursor::Cursor;
 use crate::dpi::{PhysicalPosition, PhysicalSize, Position, Size};
 use crate::error::{ExternalError, NotSupportedError, OsError as RootOsError};
 use crate::icon::Icon;
+use crate::min_track;
 use crate::platform_impl::platform::dark_mode::try_theme;
 use crate::platform_impl::platform::definitions::{
     CLSID_TaskbarList, IID_ITaskbarList, IID_ITaskbarList2, ITaskbarList, ITaskbarList2,
@@ -219,6 +220,36 @@ impl Window {
         None
     }
 
+    /// LOCAL PATCH (aterm): restored, with upstream's `WM_GETMINMAXINFO` answer, which gives
+    /// Windows the least at the window's DPI ([`crate::min_track`]): an edge drag stops at it,
+    /// and `DefWindowProc`'s `WM_WINDOWPOSCHANGING` holds every `SetWindowPos` to it. A window in
+    /// its normal state under a new least grows to it at once; a minimized, maximized or full
+    /// screen one is held to it when it is restored, and one taking a new scale by the scale
+    /// change's new rectangle ([`min_track::Standing`]).
+    #[inline]
+    pub fn set_min_inner_size(&self, size: Option<Size>) {
+        let (scale_factor, fullscreen, rescaling) = {
+            let mut window_state = self.window_state_lock();
+            window_state.min_size = size;
+            let fullscreen = window_state.fullscreen.is_some();
+            (window_state.scale_factor, fullscreen, window_state.rescaling)
+        };
+        let Some(least) = size.map(|size| min_track::least_client(size, scale_factor)) else {
+            return;
+        };
+        let hwnd = self.hwnd();
+        let standing = if rescaling {
+            min_track::Standing::Rescaling
+        } else if fullscreen || util::is_minimized(hwnd) || util::is_maximized(hwnd) {
+            min_track::Standing::Placed
+        } else {
+            min_track::Standing::Normal
+        };
+        if let Some(grown) = min_track::grown(self.inner_size(), least, standing) {
+            let _ = self.request_inner_size(grown.into());
+        }
+    }
+
     #[inline]
     pub fn set_resize_increments(&self, increments: Option<Size>) {
         self.window_state_lock().resize_increments = increments;
@@ -368,7 +399,7 @@ impl Window {
             (Some(Fullscreen::Borderless(Some(monitor))), Some(Fullscreen::Borderless(None)))
                 if *monitor == monitor::current_monitor(window.get()) =>
             {
-                return
+                return;
             },
             _ => {},
         }
@@ -662,14 +693,18 @@ impl InitData<'_> {
 
         win.set_visible(attributes.visible);
 
-        // LOCAL PATCH (aterm): no aterm crate sets a minimum size or a position on Windows, so the
-        // size is clamped to upstream's defaults (no minimum, no maximum) and the window stays
-        // where Windows put it (`CW_USEDEFAULT`).
+        // LOCAL PATCH (aterm): no aterm crate sets a maximum size or a position on Windows, so
+        // the size is held to the least alone ([`crate::min_track`]) and the window stays where
+        // Windows put it (`CW_USEDEFAULT`).
+        let scale_factor = win.scale_factor();
         let size = attributes.inner_size.unwrap_or_else(|| PhysicalSize::new(800, 600).into());
-        let max_size = PhysicalSize::new(f64::MAX, f64::MAX).into();
-        let min_size = PhysicalSize::new(0, 0).into();
-        let clamped_size = Size::clamp(size, min_size, max_size, win.scale_factor());
-        win.request_inner_size(clamped_size);
+        let size = size.to_physical::<u32>(scale_factor);
+        let size = attributes
+            .min_inner_size
+            .map(|min| min_track::least_client(min, scale_factor))
+            .and_then(|least| min_track::grown(size, least, min_track::Standing::Normal))
+            .unwrap_or(size);
+        win.request_inner_size(size.into());
     }
 }
 unsafe fn init(

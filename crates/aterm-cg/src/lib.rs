@@ -90,11 +90,12 @@ impl CGDisplay {
         // SAFETY: the sizing call — a NULL list of capacity 0 is written to
         // nowhere, and `count` receives the number of active displays.
         check(unsafe { CGGetActiveDisplayList(0, ptr::null_mut(), &raw mut count) })?;
-        let mut ids = vec![0; count as usize];
-        // SAFETY: `ids` has room for `count` IDs; CoreGraphics writes at most
-        // that many and stores how many it wrote in `count`.
-        check(unsafe { CGGetActiveDisplayList(count, ids.as_mut_ptr(), &raw mut count) })?;
-        ids.truncate(count as usize);
+        let cap = count.saturating_add(8).min(4096);
+        let mut ids = vec![0; cap as usize];
+        // SAFETY: `ids` has room for `cap` (`>= 8`) IDs; CoreGraphics writes at
+        // most `cap` entries and stores how many it wrote in `count`.
+        check(unsafe { CGGetActiveDisplayList(cap, ids.as_mut_ptr(), &raw mut count) })?;
+        ids.truncate((count as usize).min(ids.len()));
         Ok(ids)
     }
 

@@ -126,8 +126,14 @@ impl Record {
         else {
             return None;
         };
+        if !start.bytes().all(|b| b.is_ascii_digit())
+            || !pid.bytes().all(|b| b.is_ascii_digit())
+            || !seq.bytes().all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
         (start.parse::<u64>().is_ok() && seq.parse::<u64>().is_ok())
-            .then(|| pid.parse::<u32>().ok())
+            .then(|| pid.parse::<u32>().ok().filter(|&p| p > 0))
             .flatten()
     }
 
@@ -269,6 +275,7 @@ impl Record {
             checkout: None,
             alone: head.get("alone").and_then(Value::as_bool) == Some(true),
             covers: head.get("covers").and_then(Value::as_bool) == Some(true),
+            stuck_ends: None,
         };
         // The lines after the head, in the order they were added: a quiet waiter's `next_ms`,
         // the admission, then the measured writes' (written over in place) and each credit,
@@ -397,6 +404,91 @@ impl Laid {
         self.lock.write_all(Record::wrote_line(bytes).as_bytes())?;
         *at = Some(offset);
         Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Laid {
+    /// A close-on-exec copy of the claim file's descriptor: the same open file description, so
+    /// the same lock, which the kernel lets go only once every descriptor of it is closed (or one
+    /// of them lets it go).
+    pub(crate) fn descriptor(&self) -> io::Result<std::os::fd::OwnedFd> {
+        use std::os::fd::AsFd as _;
+        self.lock.as_fd().try_clone_to_owned()
+    }
+
+    /// HAND THE CLAIM OFF: this process's copy is forgotten, neither letting the lock go nor
+    /// removing the file, so a copy of its descriptor held elsewhere ([`Self::descriptor`],
+    /// another process's inherited one) keeps the claim. The forgotten descriptor is
+    /// close-on-exec: it closes at this process's exec or exit, and closing it lets nothing go
+    /// while that copy is open.
+    pub(crate) fn hand_off(self) {
+        std::mem::forget(self);
+    }
+
+    /// ADOPT the claim file at `path` whose open file description `fd` is a copy of (an
+    /// inherited descriptor of [`Self::hand_off`]'s claim), proved three ways before its record
+    /// is read, none of which takes or lets go of the claim's lock until the last: `fd` opens the
+    /// file at `path` (its device and inode), never one a link there names; taking the lock
+    /// through a fresh open of `path`, which follows no link and opens only a regular file, is
+    /// refused, so some description holds it; and taking it through `fd` succeeds, so that
+    /// description is `fd`'s. Its record, and the claim as this process's to let go. A proof that
+    /// fails lets nothing go, and so does a record that cannot be read once all three held (the
+    /// claim is handed off, as [`Self::hand_off`] does).
+    ///
+    /// # Errors
+    /// A proof that fails (`InvalidData` naming it), the fresh open's error, or the file could not
+    /// be read or its record decoded.
+    pub(crate) fn adopt(fd: std::os::fd::OwnedFd, path: &Path) -> io::Result<(Record, Laid)> {
+        use std::os::unix::fs::MetadataExt as _;
+        let refused = |why: &str| io::Error::new(io::ErrorKind::InvalidData, why.to_owned());
+        let file = File::from(fd);
+        let held = file.metadata()?;
+        let named = std::fs::symlink_metadata(path)?;
+        if (held.dev(), held.ino()) != (named.dev(), named.ino()) {
+            return Err(refused(
+                "the descriptor opens another file than the claim's path",
+            ));
+        }
+        match RecordLock::try_lock(crate::open_regular_reader(path)?, RECORD_MAX) {
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Ok(stray) => {
+                drop(stray);
+                return Err(refused("no description holds the claim's lock"));
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(e),
+        }
+        let lock = match RecordLock::try_lock(file, RECORD_MAX) {
+            Ok(lock) => lock,
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(refused("another description holds the claim's lock"));
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(e),
+        };
+        let laid = Laid {
+            lock,
+            path: path.to_path_buf(),
+            granted: None,
+        };
+        let mut text = String::new();
+        let read = crate::open_regular_reader(path)
+            .and_then(|f| f.take(RECORD_MAX).read_to_string(&mut text));
+        let held = path.to_str().is_some_and(|p| p.ends_with(CLAIM));
+        match read.map(|_| Record::decode(&text, held)) {
+            Ok(Some(record)) => {
+                let mut laid = laid;
+                laid.granted = record.held;
+                Ok((record, laid))
+            }
+            Ok(None) => {
+                laid.hand_off();
+                Err(refused("the claim's record does not decode"))
+            }
+            Err(e) => {
+                laid.hand_off();
+                Err(e)
+            }
+        }
     }
 }
 
@@ -536,9 +628,13 @@ impl Ledger {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
         }
         let file: File = options.open(&taking)?;
+        #[cfg(unix)]
+        let _ = aterm_uds::keep_out_of_children(&file);
         let lock = match RecordLock::try_lock(file, RECORD_MAX) {
             Ok(lock) => lock,
             Err(e) => {
@@ -583,20 +679,38 @@ impl Ledger {
     }
 }
 
+/// Whether `e` means a ledger directory entry is gone or is not a regular claim file (a stray
+/// link, directory or pipe), which [`probe`] skips without aborting the scan.
+fn ignored_claim_entry(e: &io::Error) -> bool {
+    if matches!(
+        e.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::InvalidInput | io::ErrorKind::IsADirectory
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    if e.raw_os_error() == Some(libc::ELOOP) {
+        return true;
+    }
+    false
+}
+
 /// The pid the admissions' lock at `path` names: its holder's, unless it was let go meanwhile.
 fn lock_holder(path: &Path) -> Option<u32> {
-    let mut text = String::new();
-    File::open(path)
-        .and_then(|f| f.take(64).read_to_string(&mut text))
-        .ok()?;
-    text.trim().parse().ok()
+    let file = crate::open_regular_reader(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(64).read_to_end(&mut bytes).ok()?;
+    let text = std::str::from_utf8(&bytes).ok()?.trim();
+    (!text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| text.parse::<u32>().ok().filter(|&p| p > 0))
+        .flatten()
 }
 
 /// Test one claim file: `Some(record)` while its holder lives, `None` for a dead holder's (removed when `reap`) or one gone meanwhile.
 fn probe(path: &Path, held: bool, reap: bool) -> io::Result<Option<Record>> {
-    let file = match File::open(path) {
+    let file = match crate::open_regular_reader(path) {
         Ok(f) => f,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if ignored_claim_entry(&e) => return Ok(None),
         Err(e) => return Err(e),
     };
     match RecordLock::try_lock(file, RECORD_MAX) {
@@ -608,23 +722,35 @@ fn probe(path: &Path, held: bool, reap: bool) -> io::Result<Option<Record>> {
             Ok(None)
         }
         Err(std::fs::TryLockError::WouldBlock) => {
-            let mut text = String::new();
-            File::open(path)
-                .and_then(|f| f.take(RECORD_MAX).read_to_string(&mut text))
-                .or_else(|e| match e.kind() {
-                    io::ErrorKind::NotFound => Ok(0),
-                    _ => Err(e),
-                })?;
-            Ok(Record::decode(&text, held))
+            let mut bytes = Vec::new();
+            match crate::open_regular_reader(path)
+                .and_then(|f| f.take(RECORD_MAX).read_to_end(&mut bytes))
+            {
+                Ok(_) => Ok(std::str::from_utf8(&bytes)
+                    .ok()
+                    .and_then(|text| Record::decode(text, held))),
+                Err(e) if ignored_claim_entry(&e) => Ok(None),
+                Err(e) => Err(e),
+            }
         }
         Err(std::fs::TryLockError::Error(e)) => Err(e),
     }
 }
 
 /// The ledger's directory, made if absent: private (`0700`) on Unix, since a record names a checkout.
-fn ensure_dir(dir: &Path) -> io::Result<()> {
-    if dir.is_dir() {
-        return Ok(());
+pub(crate) fn ensure_dir(dir: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) => {
+            if !meta.file_type().is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "ledger directory path is not a regular directory",
+                ));
+            }
+            return Ok(());
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
     }
     #[cfg(unix)]
     {
@@ -632,24 +758,69 @@ fn ensure_dir(dir: &Path) -> io::Result<()> {
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
-            .create(dir)
+            .create(dir)?;
     }
     #[cfg(not(unix))]
     {
-        std::fs::create_dir_all(dir)
+        std::fs::create_dir_all(dir)?;
     }
+    if !std::fs::symlink_metadata(dir)?.file_type().is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ledger directory path is not a regular directory",
+        ));
+    }
+    Ok(())
 }
 
-/// Open (creating) a lock file: `0600`, never truncated.
-fn open_rendezvous(path: &Path) -> io::Result<File> {
+/// Open (creating) a lock file: `0600`, never truncated, refusing a symlink or non-regular file.
+pub(crate) fn open_rendezvous(path: &Path) -> io::Result<File> {
+    #[cfg(not(any(unix, windows)))]
+    if let Ok(meta) = std::fs::symlink_metadata(path)
+        && !meta.file_type().is_file()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing non-regular lock file",
+        ));
+    }
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
     }
-    options.open(path)
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "lock path is not a regular file",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "lock path is a reparse point",
+            ));
+        }
+    }
+    #[cfg(unix)]
+    let _ = aterm_uds::keep_out_of_children(&file);
+    Ok(file)
 }
 
 /// The working directory's enclosing git checkout (the nearest directory holding `.git`), else the working directory; empty where it cannot be read.

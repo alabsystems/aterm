@@ -41,8 +41,15 @@ pub(crate) const CLAIMS: Ring = Ring {
     period_s: crate::accounts::claims::EPOCH_S,
 };
 
+/// Short-lived requests for another root-authorized account preparation.
+pub(crate) const RECOVERIES: Ring = Ring {
+    application: "accounts",
+    role: "recoveries",
+    period_s: 86_400,
+};
+
 /// Every ring the replica subscribes to.
-const RINGS: [&Ring; 1] = [&CLAIMS];
+const RINGS: [&Ring; 2] = [&CLAIMS, &RECOVERIES];
 
 const DOMAIN: &[u8] = b"aterm/commons/ring-table/1\0";
 const STATE_MAGIC: &[u8; 5] = b"ATRS1";

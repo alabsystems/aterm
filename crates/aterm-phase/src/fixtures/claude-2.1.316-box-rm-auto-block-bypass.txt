@@ -1,0 +1,30 @@
+# claude-code 2.1.316 · MEASURED 2026-11-01, `aterm ctl text` of a private headless aterm (144x50, aterm 0.148.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · bypass mode, the rm safety check's box with its countdown, drawn 4.2 s after a person's keystroke (`ctl send as=person x`), the harness holding it 15 s from that key
+ ▐▛███▛█   Claude Code v2.1.316
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.UxZb/proj
+
+
+❯ xtoolstart
+
+⏺ Bash(sleep 4)
+  ⎿  (No output)
+
+⏺ Bash(S=/private/tmp/at-nonexistent-lab; for p in a b; do set -- $p; rm -rf $S/$1; done; touch /private/tmp/at.UxZb/proj/ran.txt)
+  ⎿  Waiting…
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command
+ Delete temporary directories
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ │ S=/private/tmp/at-nonexistent-lab; for p in a b; do set -- $p; rm -rf $S/$1; done; touch /private/tmp/at.UxZb/proj/ran.txt
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ │ Dangerous rm operation on possibly-empty variable path: $S/$1 in `rm -rf $S/$1` (bind $1 and rewrite its $S as "${S:?}" or use a literal
+ │ path)
+ ⚠ Claude Code will automatically block this request in 1:59, to avoid holding up an unattended session
+
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. No
+
+ Esc to cancel · Tab to amend

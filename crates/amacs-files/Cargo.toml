@@ -37,6 +37,9 @@ aterm-hash = { workspace = true }
 aterm-time = { workspace = true }
 # open(2) flags and errnos.
 libc = { workspace = true }
+# The one read rule for `aterm.toml` the switch readers hold too
+# (`dirs::aterm_config_file_refusal`). Not a new edge in the graph: amacs links it already.
+aterm-types = { workspace = true }
 
 [dev-dependencies]
 # Exclusive scratch directories whose cleanup belongs to the fixture.

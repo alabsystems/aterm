@@ -287,7 +287,7 @@ fn a_phase4_successor_adopts_a_2a_carry_and_a_2b_carry() {
             .iter()
             .filter_map(|l| l.strip_prefix("r "))
             .map(|l| aterm_slog::decode(l).expect("a record"))
-            .filter(Rec::is_bus_class)
+            .filter(Rec::is_mirrored)
             .map(|r| r.seq)
             .collect();
         let (mut next, _, _) =
@@ -296,7 +296,7 @@ fn a_phase4_successor_adopts_a_2a_carry_and_a_2b_carry() {
         assert!(next.is_open(turn), "{who}");
         let ms: Vec<(u64, u64)> = next
             .window()
-            .filter(|r| r.is_bus_class())
+            .filter(|r| r.is_mirrored())
             .map(|r| (r.seq, next.ms_of(r.seq).expect("live")))
             .collect();
         let mut want: Vec<(u64, u64)> = carried_bus
@@ -916,7 +916,7 @@ fn bus_fold_equals_local_bus_view() {
         assert!(offered > 0);
         assert!(view.holes().is_empty(), "seed {seed}: {:?}", view.holes());
         assert_eq!(view.max_ms(), log.ms_head(), "seed {seed}");
-        let bus_count = log.window().filter(|r| r.is_bus_class()).count();
+        let bus_count = log.window().filter(|r| r.is_mirrored()).count();
         assert_eq!(view.len(), bus_count, "seed {seed}: each record once");
         let (bus, partial) = view.fold();
         assert!(!partial, "seed {seed}");
@@ -2027,4 +2027,225 @@ fn a_step_escalation_crosses_with_its_node_and_ends_with_its_step() {
         late.state().needs
     );
     assert!(late.state().needs.iter().all(Option::is_none));
+}
+
+/// Whether `body` is an amend that carries no field (`op=amend` with nothing past its header).
+fn fieldless_amend(body: &str) -> bool {
+    let b = decode_bus(body).expect("a bus body decodes");
+    b.rec.op == Op::Amend && b.rec.f.is_empty()
+}
+
+/// An amend of a turn with `f`, attributed as Claude Code's transcript match writes it.
+fn vendor_amend(log: &mut Log, turn: Node, f: Fields, ms: u64) -> u64 {
+    log.amend(
+        turn,
+        aterm_slog::Amend::new(Kind::Turn, Src::Transcript, Conf::Strong, f).by(Actor::Vendor),
+        at(ms),
+    )
+    .expect("the turn amends")
+}
+
+/// AN AMEND WITH NOTHING THE BUS MAY CARRY TAKES NO SLOT (fix unit E5, E2E-16): Claude Code's
+/// transcript match amends a turn with `vref=` alone, a host fact the bus never carries, so it
+/// takes no `ms` and no take publishes it as an amend of nothing; an amend that carries a
+/// W field beside it takes the next `ms` and crosses with that field alone, and one with a
+/// W* field alone takes one too (the positive control). The take keeps the bus dense and the
+/// remote fold the local one's. NEGATIVE CONTROL (scratch): `Log::push` giving an `ms` to every
+/// bus-class record (`rec.is_bus_class()`) gives the `vref=` amend a slot, and its field-less
+/// body is in the take.
+#[test]
+fn an_amend_with_nothing_the_bus_carries_takes_no_slot() {
+    let mut log = Log::new(1);
+    let run = agent_session(&mut log, 0);
+    let turn = log
+        .open(
+            Open::new(Kind::Turn, Src::Screen, Conf::Strong).under(run),
+            at(10),
+        )
+        .expect("a turn");
+    let head = log.ms_head();
+    let vref = Fields::new().id(Key::Vref, "vqzp7a1").expect("vref");
+    let named = vendor_amend(&mut log, turn, vref, 20);
+    assert_eq!(log.ms_of(named), Some(0), "a host-only amend takes no ms");
+    assert_eq!(log.ms_head(), head, "and the head does not move");
+    let both = Fields::new()
+        .id(Key::Vref, "vqzp7a2")
+        .and_then(|f| f.u(Key::VdurMs, 1234))
+        .expect("fields");
+    let timed = vendor_amend(&mut log, turn, both, 30);
+    assert_eq!(
+        log.ms_of(timed),
+        Some(head + 1),
+        "a W field takes the next ms"
+    );
+    let ver = Fields::new().tok(Key::Ver, "2.1.311").expect("ver");
+    let versioned = vendor_amend(&mut log, turn, ver, 40);
+    assert_eq!(
+        log.ms_of(versioned),
+        Some(head + 2),
+        "a W* field alone takes one too (the positive control)"
+    );
+    let mirrored = log.window().filter(|r| r.is_mirrored()).count();
+    let take = log.bus_copy(64, at(50)).encode(Tier::WireMeta, &alias);
+    assert!(
+        take.slots.iter().all(|s| s.at.seq != named),
+        "no slot for the host-only amend: {take:#?}"
+    );
+    assert!(
+        !take.slots.iter().any(|s| fieldless_amend(&s.body)),
+        "no amend of nothing crosses: {take:#?}"
+    );
+    let body = |seq: u64| {
+        take.slots
+            .iter()
+            .find(|s| s.kind == SlotKind::Record && s.at.seq == seq)
+            .map(|s| s.body.clone())
+            .unwrap_or_else(|| panic!("a record slot for {seq}: {take:#?}"))
+    };
+    let timed = body(timed);
+    assert!(
+        timed.contains(" vdur_ms=1234 ") && !timed.contains("vref="),
+        "{timed}"
+    );
+    assert!(body(versioned).contains(" ver=2.1.311 "), "{take:#?}");
+    let mut view = BusSpace::new(log.base_ep());
+    for s in &take.slots {
+        view.offer(decode_bus(&s.body).expect("decodes"));
+    }
+    assert!(view.holes().is_empty(), "{:?}", view.holes());
+    assert_eq!(view.len(), mirrored, "each mirrored record once");
+    assert_eq!(view.max_ms(), log.ms_head());
+    let (bus, partial) = view.fold();
+    assert!(!partial);
+    assert_eq!(bus.bus_facts(&same), log.fold().bus_facts(&alias));
+    assert_eq!(bus.bus_totals(), log.fold().bus_totals());
+}
+
+/// AN OLDER WRITER'S FIELD-LESS AMEND STILL CROSSES AS A RECORD (fix unit E5): a carry from a
+/// build that gave every bus-class amend an `ms` holds a host-only amend at `ms=k`; the
+/// successor keeps that `ms`, its take encodes the slot as a record (an amend of nothing,
+/// which folds to nothing), never a cover, and a reader takes it as a record of its class,
+/// so the fold stays whole. NEGATIVE CONTROLS (scratch): `encode_mirror` refusing what
+/// `Rec::is_mirrored` refuses turns the slot into a `gap why=dropped` cover and the fold
+/// partial; `BusSpace::offer` taking only mirrored records answers the amend `Foreign`.
+#[test]
+fn an_older_writers_fieldless_amend_still_crosses_as_a_record() {
+    let mut log = Log::new(1);
+    let run = agent_session(&mut log, 0);
+    let turn = log
+        .open(
+            Open::new(Kind::Turn, Src::Screen, Conf::Strong).under(run),
+            at(10),
+        )
+        .expect("a turn");
+    let mut view = BusSpace::new(log.base_ep());
+    drain(&mut log, &mut view, 15);
+    let head = log.ms_head();
+    let vref = Fields::new().id(Key::Vref, "vqzp7a3").expect("vref");
+    let named = vendor_amend(&mut log, turn, vref, 20);
+    assert_eq!(
+        log.ms_of(named),
+        Some(0),
+        "PRECONDITION: this build gives it none"
+    );
+    let mut lines = log.carry(CarryBudget::SESSION, &[]).expect("carries").lines;
+    let own = format!("r {named} ");
+    let at_line = lines
+        .iter()
+        .position(|l| l.starts_with(&own))
+        .unwrap_or_else(|| panic!("the amend's carry line: {lines:#?}"));
+    lines[at_line] = format!("R {} {}", head + 1, &lines[at_line][2..]);
+    let was = format!(" ms={head} ");
+    assert!(lines[0].contains(&was), "PRECONDITION: {}", lines[0]);
+    lines[0] = lines[0].replace(&was, &format!(" ms={} ", head + 1));
+    let (mut next, _, _) =
+        Log::from_carry(&lines, adopt(&log, 100)).expect("an older writer's carry reads");
+    assert_eq!(next.ms_of(named), Some(head + 1), "its ms is kept");
+    let take = next.bus_copy(64, at(200)).encode(Tier::WireMeta, &alias);
+    let slot = take
+        .slots
+        .iter()
+        .find(|s| s.at.seq == named)
+        .unwrap_or_else(|| panic!("the amend's slot: {take:#?}"));
+    assert_eq!(slot.kind, SlotKind::Record, "{}", slot.body);
+    assert!(fieldless_amend(&slot.body), "{}", slot.body);
+    assert_eq!(
+        BusSpace::new(next.base_ep()).offer(decode_bus(&slot.body).expect("decodes")),
+        Offered::Record,
+        "a reader folds it as its class's record, never as foreign"
+    );
+    for s in &take.slots {
+        view.offer(decode_bus(&s.body).expect("decodes"));
+    }
+    if let Some(last) = take.slots.last() {
+        next.land(last.at).expect("lands");
+    }
+    assert!(view.holes().is_empty(), "{:?}", view.holes());
+    assert!(view.covers().is_empty(), "{:?}", view.covers());
+    let (bus, partial) = view.fold();
+    assert!(!partial, "the fold stays whole");
+    assert_eq!(bus.bus_facts(&same), next.fold().bus_facts(&alias));
+}
+
+/// AN UNMIRRORED CARRY NUMBERS ONLY WHAT THE MIRROR PUBLISHES (fix unit E5): a log whose mirror
+/// never engaged carries no `ms`, so its successor numbers the carried records afresh; a turn's
+/// host-only `vref=` amend among them takes no `ms` there either, the head is the count of
+/// mirrored records, and the successor's first take is dense, whole and holds no amend of
+/// nothing. NEGATIVE CONTROL (scratch): the carry's dense recompute numbering every bus-class
+/// record (`rec.is_bus_class()`) gives the amend an `ms` and publishes it empty.
+#[test]
+fn an_unmirrored_carrys_host_only_amend_takes_no_slot_in_its_successor() {
+    let mut log = Log::new(1);
+    let run = agent_session(&mut log, 0);
+    let turn = log
+        .open(
+            Open::new(Kind::Turn, Src::Screen, Conf::Strong).under(run),
+            at(10),
+        )
+        .expect("a turn");
+    let vref = Fields::new().id(Key::Vref, "vqzp7a4").expect("vref");
+    let named = vendor_amend(&mut log, turn, vref, 20);
+    bell(&mut log, 30);
+    assert_eq!(log.mirror_landed(), None, "PRECONDITION: never engaged");
+    let carry = log.carry(CarryBudget::SESSION, &[]).expect("carries").lines;
+    assert!(
+        !carry[0].contains(" ms=") && carry.iter().all(|l| !l.starts_with("R ")),
+        "PRECONDITION: an unmirrored carry: {carry:#?}"
+    );
+    assert!(
+        carry.iter().any(|l| l.starts_with(&format!("r {named} "))),
+        "PRECONDITION: the amend is carried: {carry:#?}"
+    );
+    let (mut next, _, _) =
+        Log::from_carry(&carry, adopt(&log, 100)).expect("an unmirrored carry reads");
+    assert_eq!(
+        next.ms_of(named),
+        Some(0),
+        "the host-only amend takes no ms"
+    );
+    let mirrored = next.window().filter(|r| r.is_mirrored()).count();
+    assert_eq!(
+        next.ms_head(),
+        mirrored as u64,
+        "the head counts what is mirrored"
+    );
+    let take = next.bus_copy(64, at(200)).encode(Tier::WireMeta, &alias);
+    assert!(
+        take.slots.iter().all(|s| s.at.seq != named),
+        "no slot for the host-only amend: {take:#?}"
+    );
+    assert!(
+        !take.slots.iter().any(|s| fieldless_amend(&s.body)),
+        "no amend of nothing crosses: {take:#?}"
+    );
+    let mut view = BusSpace::new(next.base_ep());
+    for s in &take.slots {
+        view.offer(decode_bus(&s.body).expect("decodes"));
+    }
+    assert!(view.holes().is_empty(), "{:?}", view.holes());
+    assert!(view.covers().is_empty(), "{:?}", view.covers());
+    assert_eq!(view.len(), mirrored, "each mirrored record once");
+    let (bus, partial) = view.fold();
+    assert!(!partial, "the fold is whole");
+    assert_eq!(bus.bus_facts(&same), next.fold().bus_facts(&alias));
 }

@@ -1,0 +1,50 @@
+# grok 1.0.70 · MEASURED 2026-10-29, `aterm ctl text` of a private headless aterm (144x50, aterm 0.146.0) running the real Grok Build, launched by path in the lab's jail with a scratch `HOME` and `GROK_HOME`, the lab's `XAI_API_KEY` and `GROK_XAI_API_BASE_URL`/`GROK_CLI_CHAT_PROXY_BASE_URL=http://127.0.0.1:<port>/v1` (a local stub of xAI's API, crates/aterm-lab) · a shell prompt for `rm -r cache-dir`, Esc pressed on it: nothing answered; the card stays, focus moves to the scrollback (the prompt row framed by corner marks `┌ ┐ └ ┘`), and the key row becomes `Tab/Space:permission  │  Ctrl+e:collapse thinking  │  Ctrl+c:cancel  │  Ctrl+b:send to bg  │  Ctrl+x:shortcuts` · cursor=34,124 (hidden) · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+  /p/t/at.lab0/proj                                                                                                   12K / 256K │ [Dashboard]
+ ┌                                                                                                                                            ┐
+ │                                                                                                                                            │
+ │   ❯ toolstart clear the cache                                                                                                     1:59 PM  │
+ │                                                                                                                                            │
+ └                                                                                                                                            ┘
+     ◆ Running remove the cache.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+
+    ◆ Remove the cache.… 11s                                                                                              11s ⇣12.6k [↓][stop]
+
+  ┃
+  ┃  ›  Remove the cache.
+  ┃  │ rm -r cache-dir
+  ┃  ← → narrow scope  ·  e edit pattern
+  ┃
+  ┃  1 (○) Yes, and don't ask again for anything (always-approve mode)
+  ┃  2 (○) Always allow: rm -r cache-dir
+  ┃  3 (●) Yes, proceed
+  ┃  4 (○) No, reject (type to add feedback)
+  ┃  5 (○) Never allow: rm -r
+  ┃
+
+  Tab/Space:permission  │  Ctrl+e:collapse thinking  │  Ctrl+c:cancel  │  Ctrl+b:send to bg  │  Ctrl+x:shortcuts

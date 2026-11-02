@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aterm_agent::harness::acts::RULE_UPGRADE;
-use aterm_agent::supervise::policy::turn_end::{RULE_LEFT, says_done};
+use aterm_agent::supervise::policy::turn_end::{RULE_LAND_CHECK, RULE_LEFT, says_done};
 use aterm_uds::spawnfd::Stdio;
 
 use crate::bus::Fabric;
@@ -23,6 +23,8 @@ use crate::codex_rig;
 mod policy_proof;
 #[path = "codex_alab_upgrade_proof.rs"]
 mod upgrade_proof;
+#[path = "codex_alab_window_proof.rs"]
+mod window_proof;
 use crate::forever::pct_decode;
 use crate::instance::{self, Instance, Launch, World};
 use crate::pyjson::J;
@@ -214,6 +216,37 @@ fn acted_in_log(log: &str, act: &str, holder: &str) -> bool {
         })
 }
 
+/// The pad of a codex screen `text` (`text`'s rows): the row right above its last `›` prompt
+/// row, as the program drew it, trimmed of its blanks (empty where it left the pad blank); `None`
+/// where no row starts with the prompt. codex-alab's ALab interface draws its own Autopilot line
+/// there; a blank pad is where aterm's chip lays (design §14.8).
+pub(crate) fn pad_of(text: &str) -> Option<String> {
+    let rows: Vec<&str> = text.lines().collect();
+    let prompt = rows.iter().rposition(|r| r.starts_with('\u{203a}'))?;
+    let pad = rows.get(prompt.checked_sub(1)?)?;
+    Some(pad.trim().to_string())
+}
+
+/// codex-alab's dev build number off its package's version (`alab-build.json`'s
+/// `0.1.0-dev.14249+codex.0.166.0.g…`: 14249), the count of its main's commits; `None` for a
+/// version with none.
+pub(crate) fn dev_build(version: &str) -> Option<u32> {
+    let (_, rest) = version.split_once("-dev.")?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// The first codex-alab build that tells its own Land hold on its claim (`meta set harness_land`,
+/// design §14.3.3; codex-alab `a4fbe68079`, its 13942nd commit): from it on, a land act under
+/// Land shows `status land_since=` and the window's hold surfaces. 13916, the owner's installed
+/// build, tells none.
+pub(crate) const TELLS_LAND_HOLD: u32 = 13_942;
+
+/// The first codex-alab build that writes its mode's word on its own Autopilot line (`∞`,
+/// `⤓ land`, `✓ landed`, `○ off` before `[Cruise]─[Land]─[Off]`; codex-alab `7eed4c4b49`, its
+/// 14176th commit, parity gap 12). Before it the line lights the mode's button and names no mode.
+pub(crate) const SAYS_ITS_MODE: u32 = 14_176;
+
 pub(crate) fn task_face(status: &str) -> String {
     field(status, "task").unwrap_or_else(|| "-".to_string())
 }
@@ -316,6 +349,20 @@ fn rollout_holds(measured: bool, said: &TapSaid, turns: &[String]) -> bool {
             .any(|l| from_rollout(l) && l.contains(" conf=exact "));
         said.word == "partial" && opened && theirs && reached && !exact
     }
+}
+
+/// Land's contradiction among a leg's request tags ([`model::contradiction_tag`]):
+/// `None` where no request carried it, else the tags whose words were not aterm's (none where all
+/// were).
+fn contradiction_seen(tags: &[String]) -> Option<Vec<&str>> {
+    tags.iter()
+        .any(|t| t.contains(model::CONTRADICTED_TAG))
+        .then(|| {
+            tags.iter()
+                .filter(|t| t.contains(model::CONTRADICTED_WRONG_TAG))
+                .map(String::as_str)
+                .collect()
+        })
 }
 
 fn nudges_seen(tags: &[String]) -> Vec<usize> {
@@ -823,6 +870,9 @@ pub(crate) struct Proof {
     fails: Vec<String>,
     /// The checks that held.
     oks: usize,
+    /// The wants this run could not observe, each a named skip the verdict line carries
+    /// ([`verdict_line`]), never a pass.
+    unobserved: Vec<String>,
     /// What the rollout leg expects of the package's build: `Some(true)` bound, `Some(false)`
     /// partial (a build nobody measured), `None` what the lab's compiled `CODEX_MEASURED_BUILDS` says
     /// (`--expect-rollout`; `codex-measure` passes it, since the lab measuring a build was
@@ -851,11 +901,31 @@ pub(crate) struct Run {
     pub took: Option<Duration>,
 }
 
+/// THE PASSING PROOF'S VERDICT LINE: `PASS`, and every want it could not observe named beside it
+/// (`PASS, 1 unobserved: land: …`), so no reader takes a skip for a pass.
+fn verdict_line(unobserved: &[String]) -> String {
+    if unobserved.is_empty() {
+        "PASS".to_string()
+    } else {
+        format!(
+            "PASS, {} unobserved: {}",
+            unobserved.len(),
+            unobserved.join("; ")
+        )
+    }
+}
+
 fn sleep(d: Duration) -> Result<(), Stopped> {
     stop::sleep(d)
 }
 
 impl Proof {
+    /// A want this run could not observe ([`Self::unobserved`]).
+    fn unobserved(&mut self, label: &str) {
+        println!("  UNOBSERVED {label}");
+        self.unobserved.push(label.to_string());
+    }
+
     fn check(&mut self, label: &str, held: bool) -> bool {
         if held {
             println!("  ok   {label}");
@@ -1136,6 +1206,11 @@ impl Proof {
         .unwrap_or_else(|| "?".to_string())
     }
 
+    /// The aterm the rig's instance runs.
+    pub(crate) fn aterm_path(&self) -> &Path {
+        &self.inst.aterm
+    }
+
     /// Every process the rig started ended, by pid, and the instance stopped.
     pub(crate) fn finish(mut self) {
         self.end_all();
@@ -1267,7 +1342,10 @@ impl Proof {
     /// folder of its own: it runs the codex-alab the instance's `codex` link
     /// names, under `$HOME/.codex` (no codex started it, so no `CODEX_HOME`
     /// rides along), or `None` when the spawn was refused.
-    fn spawn_worker(&mut self) -> Result<Option<Leg>, Fail> {
+    /// A worker on [`model::WORKER_TASK`] under Land, by `spawn agent=codex`: from the lab's own
+    /// socket, or, with `manager`, from that tab's (`@<manager> spawn … from=<manager>`), as a
+    /// manager's agent spawns one, so it is that tab's worker.
+    fn spawn_worker(&mut self, manager: Option<&str>) -> Result<Option<Leg>, Fail> {
         let name = "worker";
         let dir = self.s.join("legs").join(name);
         let home = self.h.join(".codex");
@@ -1287,15 +1365,19 @@ impl Proof {
         })();
         let proj = made.map_err(|e| format!("cannot lay out leg {name}: {e}"))?;
         let task = format!("LEG-{name} {}", model::WORKER_TASK);
-        let spawned = self.inst.ctl_stdin(
-            &[
-                "spawn",
-                "agent=codex",
-                &format!("cwd={}", proj.display()),
-                "-",
-            ],
-            task.as_bytes(),
-        );
+        let cwd = format!("cwd={}", proj.display());
+        let (at, from) =
+            manager.map_or_else(Default::default, |m| (format!("@{m}"), format!("from={m}")));
+        let mut argv: Vec<&str> = Vec::new();
+        if manager.is_some() {
+            argv.push(&at);
+        }
+        argv.extend(["spawn", "agent=codex"]);
+        if manager.is_some() {
+            argv.push(&from);
+        }
+        argv.extend([cwd.as_str(), "-"]);
+        let spawned = self.inst.ctl_stdin(&argv, task.as_bytes());
         let sid = spawned
             .first()
             .strip_prefix("OK ")
@@ -2218,6 +2300,41 @@ impl Proof {
             ),
             landed && landed_face,
         );
+        // §14.17 item 5: codex-alab carries its own Land, which reads aterm's act texts from
+        // `harness policy` (`land_check_text=`); until its fork types the land check, the want
+        // is a named skip, never a pass.
+        if acts.iter().any(|a| a == RULE_LAND_CHECK) {
+            self.check(
+                "land: codex-alab's Land types the land check (land-check@v1) before it lands",
+                landed,
+            );
+        } else {
+            self.unobserved(
+                "land: no land-check@v1 typed (codex-alab's fork has not adopted the land check; aterm serves land_check_text=)",
+            );
+        }
+        // v6 §14.4's slice 4c: Land's contradiction of a false defense needs the repository's
+        // and the list's legs, which `harness policy`'s reply does not carry to codex-alab, so its
+        // fork keeps its generic nudge until A3 gives it the legs (§14.14): a named skip, never
+        // a pass, until a request carries the contradiction's head, whose words are then judged.
+        match contradiction_seen(&self.tags("land")) {
+            Some(wrong) => {
+                self.check(
+                &format!(
+                    "land: codex-alab's Land types the contradiction in aterm's words (the fact or the list after the head, the no-repository sentence, never delete work, no way out){}",
+                    if wrong.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": not in {wrong:?}")
+                    }
+                ),
+                wrong.is_empty(),
+                );
+            }
+            None => self.unobserved(
+                "land: no contradiction (codex-alab's fork keeps its generic land-nudge@v1 until A3's legs reach it; §14.14)",
+            ),
+        }
         println!(
             "    land: landed {:.0} s into the leg's check",
             started.elapsed().as_secs_f64()
@@ -3519,7 +3636,7 @@ pub(crate) fn proof_lock(path: &Path, limit: Duration) -> Result<crate::aos_lear
     })
 }
 
-/// `codex-alab-proof [--package DIR] [--upgrade-package DIR] [--aterm PATH] [--keep] [--expect-rollout bound|partial] [--policy-only|--upgrade-only|--raw-upgrade-only]`.
+/// `codex-alab-proof [--package DIR] [--upgrade-package DIR] [--aterm PATH] [--keep] [--expect-rollout bound|partial] [--policy-only|--upgrade-only|--raw-upgrade-only|--window-only]`.
 /// # Errors
 /// Usage, a run that could not start, or an interrupt.
 pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
@@ -3529,6 +3646,7 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
     let policy_only = instance::take_flag(&mut a, "--policy-only");
     let upgrade_only = instance::take_flag(&mut a, "--upgrade-only");
     let raw_upgrade_only = instance::take_flag(&mut a, "--raw-upgrade-only");
+    let window_only = instance::take_flag(&mut a, "--window-only");
     let aterm = instance::take_value(&mut a, "--aterm")?;
     let given = instance::take_value(&mut a, "--package")?;
     let upgrade_given = instance::take_value(&mut a, "--upgrade-package")?;
@@ -3541,6 +3659,11 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
     if upgrade_only && raw_upgrade_only {
         return Err(Fail::usage(
             "codex-alab-proof: choose one upgrade-only mode",
+        ));
+    }
+    if window_only && (policy_only || upgrade_only || raw_upgrade_only || upgrade_given.is_some()) {
+        return Err(Fail::usage(
+            "codex-alab-proof: --window-only cannot be combined with another lane or upgrade options",
         ));
     }
     if let Some(extra) = a.first() {
@@ -3598,6 +3721,8 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
         upgrade_proof::legs(&mut proof, &pkg_a, &pkg_b)
     } else if policy_only {
         policy_proof::legs(&mut proof, &pkg_a)
+    } else if window_only {
+        window_proof::legs(&mut proof, &pkg_a)
     } else {
         legs(&mut proof, &pkg_a, &pkg_b)
     };
@@ -3608,7 +3733,7 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
         return Err(f);
     }
     if proof.fails.is_empty() {
-        println!("PASS");
+        println!("{}", verdict_line(&proof.unobserved));
         Ok(0)
     } else {
         println!("FAIL: {} check(s)", proof.fails.len());
@@ -3662,13 +3787,29 @@ pub(crate) fn run(aterm: PathBuf, pkg: &Path, expect: Option<bool>) -> Result<Ru
     })
 }
 
-/// The proof's rig: its scratch world (always kept), the fake model on one loopback port, the
-/// lab's bus, the package (`pkg`, and `upgrade` for the handoff, else `pkg` again) copied in as
-/// `pkg-a` and `pkg-b`, and a headless sandboxed aterm started with `args` (its grid) and `top`
-/// at the head of its `aterm.toml` (`autopilot-captures`' theme; the proof's own is empty). No
-/// package is linked and no leg runs: [`legs`] does that, and so does `autopilot-captures`
-/// ([`Proof::captures_rig`]). It first takes [`PROOF_LOCK`], held until the rig drops, so every
-/// proof run (this verb's, verify's stage's, `codex-measure`'s two) runs alone on this Mac.
+/// `world` with the rig's bus standing ([`Fabric::start`] of `aterm`'s broker) and named in its
+/// `aterm.toml`, before anything is copied into it or served from it: an aterm whose broker
+/// cannot stand (one older than the lifeline is NOT RUN) leaves no copy and no fake model behind,
+/// and the world goes with it unless it was kept.
+/// # Errors
+/// The bus did not stand ([`crate::bus::Unstarted::fail`]), or its table could not be named.
+fn stand_rig_bus(world: World, aterm: &Path) -> Result<(World, Fabric), Fail> {
+    let fabric = Fabric::start(aterm, &world.dir.join("fabric"))
+        .map_err(|e| e.fail("codex-alab-proof", aterm))?;
+    fabric
+        .name_in(&world.cfg.join("aterm/aterm.toml"))
+        .map_err(|e| format!("codex-alab-proof: {e}"))?;
+    Ok((world, fabric))
+}
+
+/// The proof's rig: its scratch world (kept once its bus stands, [`stand_rig_bus`]), the fake
+/// model on one loopback port, the lab's bus, the package (`pkg`, and `upgrade` for the handoff,
+/// else `pkg` again) copied in as `pkg-a` and `pkg-b`, and a headless sandboxed aterm started with
+/// `args` (its grid) and `top` at the head of its `aterm.toml` (`autopilot-captures`' theme; the
+/// proof's own is empty). No package is linked and no leg runs: [`legs`] does that, and so does
+/// `autopilot-captures` ([`Proof::captures_rig`]). It first takes [`PROOF_LOCK`], held until the
+/// rig drops, so every proof run (this verb's, verify's stage's, `codex-measure`'s two) runs alone
+/// on this Mac.
 /// # Errors
 /// Another proof held the lock past [`PROOF_LOCK_WAIT`]; the world, the bus, a copy or the
 /// instance could not be made.
@@ -3690,6 +3831,7 @@ fn start(
     if keep {
         world.keep();
     }
+    let (mut world, fabric) = stand_rig_bus(world, &aterm)?;
     let s = world.dir.clone();
     let h = world.home.clone();
     let prefix = h.join("Library/Application Support/aterm/pkg");
@@ -3723,11 +3865,6 @@ fn start(
     })();
     let port =
         made.map_err(|e| format!("codex-alab-proof: cannot lay out {}: {e}", s.display()))?;
-    let fabric = Fabric::start(&aterm, &s.join("fabric"))
-        .map_err(|e| format!("codex-alab-proof: cannot start the lab's bus: {e}"))?;
-    fabric
-        .name_in(&world.cfg.join("aterm/aterm.toml"))
-        .map_err(|e| format!("codex-alab-proof: {e}"))?;
     let (pkg_a, pkg_b) = (s.join("pkg-a"), s.join("pkg-b"));
     for (from, to) in [
         (pkg, pkg_a.as_path()),
@@ -3793,6 +3930,7 @@ fn start(
         port,
         fails: Vec::new(),
         oks: 0,
+        unobserved: Vec::new(),
         expect: None,
         fences: Vec::new(),
         took: None,
@@ -3878,7 +4016,7 @@ fn legs(proof: &mut Proof, pkg: &Path, pkg_b: &Path) -> Result<(), Fail> {
     // opening message under Land, and the control's, a control write, is Cruise's to go on with.
     let exchange = proof.start_leg("exchange", None, "", Folder::Scratch, Some("land"))?;
     let control = proof.start_leg("control", None, "", Folder::Scratch, None)?;
-    let worker = proof.spawn_worker()?;
+    let worker = proof.spawn_worker(None)?;
     let all = [
         &first, &land, &reland, &repo, &hold, &off, &needs, &cont, &approval, &question, &usage,
         &carry, &exchange, &control,
@@ -4025,6 +4163,37 @@ fn legs(proof: &mut Proof, pkg: &Path, pkg_b: &Path) -> Result<(), Fail> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A PASS NAMES WHAT IT DID NOT OBSERVE: the land check's skip (no codex-alab build types it
+    /// yet) rides the verdict line, never a bare `PASS`. Negative control: the line without the
+    /// skips.
+    #[test]
+    fn a_pass_names_what_it_did_not_observe() {
+        assert_eq!(verdict_line(&[]), "PASS");
+        let line = verdict_line(&["land: no land-check@v1 typed".to_string()]);
+        assert_eq!(line, "PASS, 1 unobserved: land: no land-check@v1 typed");
+    }
+
+    /// CODEX-ALAB'S CONTRADICTION IS JUDGED ONLY WHERE ITS FORK TYPED ONE (aterm's slice 4c): no
+    /// request tagged with it is a named skip (`None`); one tagged in aterm's words passes; one
+    /// in other words names its tag. Negative control: the want unconditional (always the skip)
+    /// never judges the wrong words.
+    #[test]
+    fn the_contradiction_is_judged_only_where_it_was_typed() {
+        let tags = |t: &[&str]| t.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            contradiction_seen(&tags(&["land:land", "land:nudge1+repo"])),
+            None
+        );
+        assert_eq!(
+            contradiction_seen(&tags(&["land:land", "land:other+contradicted"])),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            contradiction_seen(&tags(&["land:land", "land:other+contradicted-wrong"])),
+            Some(vec!["land:other+contradicted-wrong"])
+        );
+    }
 
     fn reached(profile: &str, tag: &str, a: &Path, s: &Path, w: &Path) -> Vec<String> {
         let mut cmd = aterm_uds::spawnfd::command("/usr/bin/sandbox-exec");
@@ -4909,6 +5078,45 @@ try sh -c 'echo x > "$1/new-$2"' _ "$W" "$TAG"
         );
         drop(first);
         proof_lock(&path, Duration::ZERO).expect("let go");
+    }
+
+    /// A RIG WHOSE BUS CANNOT STAND LEAVES NOTHING BEHIND: an aterm whose broker refuses its
+    /// lifeline as one older than the lifeline does is NOT RUN with nothing copied into the world,
+    /// which goes with it; one whose broker listens stands the bus, its table named in the world's
+    /// `aterm.toml`, with nothing copied in yet. Each is a stand-in aterm whose `link mint`
+    /// answers every grant.
+    #[test]
+    fn a_rig_whose_bus_cannot_stand_leaves_nothing_behind() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = aterm_tempfile::tempdir().expect("a scratch dir");
+        let aterm = |name: &str, broker: &str| {
+            let path = tmp.path().join(name);
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\ncase \"$2\" in\nmint) echo \"$3 00\" ;;\nbroker) {broker} ;;\nesac\n"
+                ),
+            )
+            .expect("the stand-in");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("its mode");
+            path
+        };
+        let old = aterm(
+            "old",
+            "echo 'aterm link broker: unknown flag `--lifeline-fd`' >&2; exit 2",
+        );
+        let world = World::new("").expect("a world");
+        let dir = world.dir.clone();
+        let f = stand_rig_bus(world, &old).err().expect("NOT RUN");
+        assert_eq!(f.code, 3, "{:?}", f.msg);
+        assert!(!dir.exists(), "{} is left", dir.display());
+        let current = aterm("current", ": > \"$3\"; read x");
+        let (world, fabric) =
+            stand_rig_bus(World::new("").expect("a world"), &current).expect("the bus stands");
+        let toml = std::fs::read_to_string(world.cfg.join("aterm/aterm.toml")).expect("its toml");
+        assert!(toml.contains(&fabric.table), "{toml}");
+        assert!(!world.dir.join("bin").exists(), "nothing copied in yet");
     }
 
     /// A LAB ACT A MODEL'S HOLD TIMES SAYS WHO WAS LATE: a lab that came and acted inside the hold

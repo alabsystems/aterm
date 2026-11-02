@@ -296,6 +296,7 @@ pub fn starts(
     owner_now: bool,
     moving: bool,
 ) -> Result<(), &'static str> {
+    let holds = crate::harness::first_exec::holds_dir(&opts.state);
     gate(
         opts,
         r,
@@ -304,13 +305,16 @@ pub fn starts(
         owner_now,
         false,
         moving,
-        run_probe,
+        |exe| run_probe(exe, &holds),
     )
 }
 
 /// WHETHER A CRASHED AGENT'S RELAUNCH MAY MOVE ONTO `to` AT `now` ([`starts`] where the build must be PROVED to start, failure noted or not: the module's "A crashed agent").
 pub fn proved(opts: &Opts, r: &Report, to: &Candidate, now: u64) -> Result<(), &'static str> {
-    gate(opts, r, &Build::of(to), now, false, true, true, run_probe)
+    let holds = crate::harness::first_exec::holds_dir(&opts.state);
+    gate(opts, r, &Build::of(to), now, false, true, true, |exe| {
+        run_probe(exe, &holds)
+    })
 }
 
 /// [`proved`] for a build named by its program `exe` (what the move types), its `version` as its store record spells it and its install `source` — a build whose version the Claude lane's [`Candidate`] cannot hold: Muse Code's revision form (`1.4.11-R6500.1`), which its live upgrade moves onto only once proved (`upgrade_drive`'s `muse` module).
@@ -327,7 +331,10 @@ pub fn proved_named(
         version: version.to_string(),
         source,
     };
-    gate(opts, r, &build, now, false, true, true, run_probe)
+    let holds = crate::harness::first_exec::holds_dir(&opts.state);
+    gate(opts, r, &build, now, false, true, true, |exe| {
+        run_probe(exe, &holds)
+    })
 }
 
 /// The build a start probe runs and its note is filed under: its program,
@@ -351,8 +358,8 @@ impl<'a> Build<'a> {
 
 /// The probe [`starts`] and [`proved`] run: [`probe`] itself.
 #[cfg(not(test))]
-fn run_probe(exe: &Path) -> Probe {
-    probe(exe)
+fn run_probe(exe: &Path, holds: &Path) -> Probe {
+    probe(exe, holds)
 }
 
 /// A probe a test names in place of [`probe`] ([`PROBE`]).
@@ -369,10 +376,10 @@ thread_local! {
 /// [`run_probe`] in a test: the probe its thread names ([`PROBE`]), else
 /// the real one.
 #[cfg(test)]
-fn run_probe(exe: &Path) -> Probe {
+fn run_probe(exe: &Path, holds: &Path) -> Probe {
     match PROBE.with(|named| named.borrow().clone()) {
         Some(run) => run(exe),
-        None => probe(exe),
+        None => probe(exe, holds),
     }
 }
 
@@ -532,26 +539,36 @@ impl Probe {
     }
 }
 
-/// `<exe> --help` ([`PROBE_ARG`]), bounded by [`VERSION_WAIT`], output discarded, in its own process group, killed whole at the bound.
+/// `<exe> --help` ([`PROBE_ARG`]), bounded by [`VERSION_WAIT`], output discarded, in its own process group, killed whole at the bound; the program is held from before its start until it exits with a code of its own or never started ([`crate::harness::first_exec::hold`], under `holds` unless atpkg's store holds it).
 #[must_use]
-pub fn probe(exe: &Path) -> Probe {
-    probe_within(exe, VERSION_WAIT)
+pub fn probe(exe: &Path, holds: &Path) -> Probe {
+    probe_within(exe, VERSION_WAIT, Some(holds))
 }
 
-/// [`probe`] with an explicit bound.
-pub(super) fn probe_within(exe: &Path, limit: Duration) -> Probe {
+/// [`probe`] with an explicit bound; with no `holds`, the program is not held.
+pub(super) fn probe_within(exe: &Path, limit: Duration, holds: Option<&Path>) -> Probe {
     let now = std::time::Instant::now();
     let deadline = now
         .checked_add(limit)
         .unwrap_or_else(|| now + Duration::from_secs(3600));
-    let mut cmd = aterm_uds::spawnfd::command(exe);
-    cmd.arg(PROBE_ARG)
-        .stdin(aterm_uds::spawnfd::Stdio::null())
+    let Ok(crate::harness::first_exec::Prepared {
+        command: mut cmd,
+        mut hold,
+    }) = crate::harness::first_exec::prepare(
+        exe,
+        holds,
+        crate::harness::first_exec::ProbeWord::Help,
+    )
+    else {
+        return Probe::NoExec;
+    };
+    cmd.stdin(aterm_uds::spawnfd::Stdio::null())
         .stdout(aterm_uds::spawnfd::Stdio::null())
         .stderr(aterm_uds::spawnfd::Stdio::null());
     #[cfg(unix)]
     cmd.process_group(0);
     let Ok(mut child) = cmd.spawn() else {
+        crate::harness::first_exec::never_started(&mut hold);
         return Probe::NoExec;
     };
     #[cfg(unix)]
@@ -559,6 +576,10 @@ pub(super) fn probe_within(exe: &Path, limit: Duration) -> Probe {
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
+                // a signal's end shows nothing of a run: the hold stands
+                if status.code().is_some() {
+                    crate::harness::first_exec::ran(&mut hold);
+                }
                 return if status.success() {
                     Probe::Starts
                 } else {

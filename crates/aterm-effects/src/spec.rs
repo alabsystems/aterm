@@ -195,6 +195,9 @@ impl SpecTable {
     #[must_use]
     #[inline]
     pub fn consumer_capabilities(&self) -> SpecConsumerCapabilities {
+        if self.specs.is_empty() || self.overrides.is_empty() {
+            return SpecConsumerCapabilities::NONE;
+        }
         let mut capabilities = SpecConsumerCapabilities::default();
         let mut seen = 0u128;
         for &id in self.overrides.values() {
@@ -229,6 +232,14 @@ impl SpecTable {
                 capabilities.sparkle_or_starburst_burst |=
                     rolls && matches!(burst.kind, BurstKind::Sparkle | BurstKind::Starburst);
                 capabilities.nova_twotone_ink |= burst.kind == BurstKind::Nova && twotone;
+            }
+            if capabilities.rainbow_ink
+                && capabilities.twotone_ink
+                && capabilities.nova_burst
+                && capabilities.sparkle_or_starburst_burst
+                && capabilities.nova_twotone_ink
+            {
+                break;
             }
         }
         capabilities
@@ -302,6 +313,9 @@ impl SpecTable {
     /// Overlay another table onto this one.
     #[inline]
     pub fn overlay(&mut self, other: SpecTable) {
+        if other.specs.is_empty() || other.overrides.is_empty() {
+            return;
+        }
         let mut remap = Vec::with_capacity(other.specs.len());
         let specs = other.specs.as_slice();
         let mut i = 0;
@@ -399,12 +413,11 @@ const fn parse_hex_bytes(bytes: &[u8]) -> Option<u32> {
 #[must_use]
 pub const fn custom_colorway_is_valid(s: &str) -> bool {
     let bytes = crate::cursor_glow::spellings::trim_whitespace_bytes(s);
-    matches!(bytes, b"rainbow") || parse_two_tone(s).is_some()
+    matches!(bytes, b"rainbow") || parse_two_tone(bytes).is_some()
 }
 
 #[inline]
-const fn parse_two_tone(s: &str) -> Option<(u32, u32)> {
-    let bytes = crate::cursor_glow::spellings::trim_whitespace_bytes(s);
+const fn parse_two_tone(bytes: &[u8]) -> Option<(u32, u32)> {
     let [b't', b'w', b'o', b't', b'o', b'n', b'e', b':', rest @ ..] = bytes else {
         return None;
     };
@@ -439,7 +452,8 @@ const fn parse_two_tone(s: &str) -> Option<(u32, u32)> {
 /// `"twotone:#RRGGBB,#RRGGBB"`.
 #[inline]
 const fn parse_colorway(s: &str) -> Colorway {
-    if let Some((c0, c1)) = parse_two_tone(s) {
+    let bytes = crate::cursor_glow::spellings::trim_whitespace_bytes(s);
+    if let Some((c0, c1)) = parse_two_tone(bytes) {
         return Colorway::TwoTone { c0, c1 };
     }
     match rainbow_ink().colorway {

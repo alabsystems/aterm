@@ -1660,7 +1660,7 @@ pub(crate) mod tests {
     fn the_dock_pins_the_aterm_in_the_accounts_own_applications_folder() {
         let who = user("alice", 501);
         let usual_path = DOCK_APPS[0].0;
-        let own = "/Users/alice/Applications/aterm.app";
+        let own = "/Users//alice/Applications/aterm.app";
         let pins_at = |aterm: &str| {
             let mut apps = vec![(aterm.to_owned(), DOCK_APPS[0].1, DOCK_APPS[0].2)];
             apps.extend(
@@ -1764,8 +1764,8 @@ pub(crate) mod tests {
     fn the_dock_pins_the_running_copy_where_it_lasts_and_never_a_copy_that_goes_away() {
         let who = user("alice", 501);
         let usual_path = DOCK_APPS[0].0;
-        let own = "/Users/alice/Applications/aterm.app";
-        let lasting = "/Users/alice/Developer/aterm.app";
+        let own = "/Users//alice/Applications/aterm.app";
+        let lasting = "/Users//alice/Developer/aterm.app";
         let translocated = "/private/var/folders/x/AppTranslocation/Y/d/aterm.app";
         for (running, usual, pinned) in [
             (lasting, false, Ok(lasting)),
@@ -1866,7 +1866,7 @@ pub(crate) mod tests {
     #[test]
     fn an_applications_folder_reached_through_a_link_still_pins_the_running_copy() {
         let who = user("alice", 501);
-        let own = "/Users/alice/Applications/aterm.app";
+        let own = "/Users//alice/Applications/aterm.app";
         let real = "/Volumes/Apps/alice/aterm.app";
         let pins_at = |aterm: &str| {
             let mut apps = usual_dock_apps();
@@ -1875,7 +1875,7 @@ pub(crate) mod tests {
         };
         let (mut sys, desk) = desktop_of(&who, Desk::before());
         installed_at(&sys, &who, own, DOCK_APPS[0].1);
-        sys.link("/Users/alice/Applications", "/Volumes/Apps/alice");
+        sys.link("/Users//alice/Applications", "/Volumes/Apps/alice");
         sys.running_app = Some(PathBuf::from(real));
         let run = pass(
             &sys,
@@ -1993,11 +1993,11 @@ pub(crate) mod tests {
         let finder = "alice$ /usr/bin/defaults export com.apple.finder -";
         let c = ctx(std::slice::from_ref(&who));
         let chain = [
-            "/Users/alice/Library/Application Support/aterm/init-activation",
-            "/Users/alice/Library/Application Support/aterm",
-            "/Users/alice/Library/Application Support",
-            "/Users/alice/Library",
-            "/Users/alice",
+            "/Users//alice/Library/Application Support/aterm/init-activation",
+            "/Users//alice/Library/Application Support/aterm",
+            "/Users//alice/Library/Application Support",
+            "/Users//alice/Library",
+            "/Users//alice",
             "/Users",
             "/",
         ];
@@ -2710,7 +2710,7 @@ pub(crate) mod tests {
             run.rows[4].why.as_deref(),
             Some(
                 "aterm is not installed at /Applications/aterm.app or \
-                 /Users/alice/Applications/aterm.app; Dock left untouched"
+                 /Users//alice/Applications/aterm.app; Dock left untouched"
             ),
             "{:?}",
             run.rows[4]

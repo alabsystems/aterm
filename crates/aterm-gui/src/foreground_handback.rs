@@ -497,7 +497,7 @@ pub(crate) fn group_has_stopped_member(master: i32, pgid: i32) -> bool {
 #[cfg(target_os = "linux")]
 fn linux_group_has_stopped_member(master: i32, pgid: i32) -> bool {
     let stopped = |pid: i32| {
-        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        aterm_uds::process::read_proc_text(std::path::Path::new(&format!("/proc/{pid}/stat")))
             .is_ok_and(|stat| proc_stat_is_stopped_in(&stat, pgid))
     };
     let sid = if master >= 0 {
@@ -520,6 +520,7 @@ fn linux_group_has_stopped_member(master: i32, pgid: i32) -> bool {
         entry
             .file_name()
             .to_str()
+            .filter(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
             .and_then(|pid| pid.parse::<i32>().ok())
             .is_some_and(stopped)
     })
@@ -550,6 +551,7 @@ const TREE_CAP: usize = 4096;
 #[cfg(any(target_os = "linux", test))]
 fn parse_children(list: &str) -> impl Iterator<Item = i32> + '_ {
     list.split_ascii_whitespace()
+        .filter(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
         .filter_map(|pid| pid.parse::<i32>().ok())
         .filter(|pid| *pid > 0)
 }

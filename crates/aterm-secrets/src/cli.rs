@@ -6,6 +6,9 @@
 use std::ffi::OsString;
 use std::process::ExitCode;
 
+#[cfg(unix)]
+mod inventory;
+
 /// The verb's help.
 pub const USAGE: &str = "\
 aterm secrets: one credentials file for every machine (aterm help secrets).
@@ -23,9 +26,13 @@ aterm secrets: one credentials file for every machine (aterm help secrets).
                                          --diagnostic prints one value-free outcome record
   aterm secrets watch                    the subscriber (agent on installs it): apply each
                                          new version; on an admin of a <url> vault, also
-                                         the approver, which lets in a machine that types
-                                         the join password (any that asks, when open)
-  aterm secrets ls                       the names this machine holds
+                                         the approver, which lets in a machine allowed on
+                                         any member or one that types the join password
+                                         (at the open ALab vault, also one on the home
+                                         ALab LAN, where members answer)
+  aterm secrets ls [--describe | --json]  the names this machine holds; descriptions and
+                                         file pointers with --describe, metadata JSON
+                                         with --json; neither prints secret values
   aterm secrets get <name>               print one value to stdout
   aterm secrets need ls [--all] [--json] this machine's needs (a credential it lacks, asked
                                          of the lab's Macs or a person), --all every request
@@ -61,13 +68,17 @@ admin (a machine in [admins]):
   aterm secrets password [show|set|new|open|off] [--no-agent]
                                          the join password: show (the default), set (typed
                                          or piped), new (generated), open (none: a
-                                         machine allowed on any member is let in), off
-                                         (drop the password: an Allow on a member or
-                                         approval by code); show and new print it only at a
-                                         terminal; for a <url>, set, new and open also
-                                         install the subscriber where it does not run,
-                                         unless --no-agent
-  aterm secrets requests                 machines asking to join, with their codes
+                                         machine allowed on any member is let in, and at
+                                         the ALab vault one that asks on the home ALab
+                                         LAN, where members answer), off
+                                         (close the vault or drop the password: an Allow on
+                                         a member or approval by code); show and new print
+                                         it only at a terminal; for a <url>, set, new and
+                                         open also install the subscriber where it does not
+                                         run, unless --no-agent
+  aterm secrets requests [--json]        queued requests, with their codes; JSON includes
+                                         the server's LAN observation and whether known
+                                         members could be excluded, never proof values
   aterm secrets approve <code>... | --all | <age1...> --name <host>
                                          let in machines by the code each shows (--all:
                                          every one, asked at a terminal), or a key by name
@@ -104,18 +115,22 @@ server and services:
                                          25 s; a relative --store is under ~). A vault the
                                          store lacks takes its first version only from this
                                          machine, unless --pin names the key that signs it
-                                         (alab's is built in). On macOS only, it keeps the
-                                         Mac from idle sleep unless --no-keep-awake, and
+                                         (alab's is built in on ALab's server and an ALab
+                                         member's Mac). On macOS only, it keeps the Mac
+                                         from idle sleep unless --no-keep-awake, and
                                          advertises <name>.local over mDNS: by default, on
-                                         every address at port 7484, the ALab vault's name
-                                         once the store holds the ALab vault (a new ALab
-                                         server: --advertise alab-secrets; --no-advertise:
-                                         none)
+                                         every address at port 7484, an ALab member's own
+                                         label, and the ALab vault's name once its store
+                                         holds that vault and no other server has answered
+                                         there for 90 s; on any other Mac, the ALab vault's
+                                         name once its store holds the vault this Mac follows
+                                         (a new ALab server: --advertise alab-secrets;
+                                         --no-advertise: none)
   aterm secrets agent [on|off|status] [--program <path>] [--force]
                                          the subscriber as a launchd or systemd user job
                                          (--program: the aterm it runs, pinned so no
-                                         mend moves it, else this aterm; on leaves one
-                                         running as set up, unless --force)
+                                         mend moves it, else this aterm; on leaves a
+                                         launchd job running as set up, unless --force)
   aterm secrets server [on|off|status] [--program <path>] [serve flags]
                                          serve as a launchd or systemd user job
 ";
@@ -193,7 +208,10 @@ enum Command {
         diagnostic: bool,
     },
     Watch,
-    Ls,
+    Ls {
+        describe: bool,
+        json: bool,
+    },
     Get(String),
     GitCredential {
         dev_user: Option<String>,
@@ -221,7 +239,9 @@ enum Command {
         action: Password,
         agent: bool,
     },
-    Requests,
+    Requests {
+        json: bool,
+    },
     Approve {
         which: Vec<String>,
         all: bool,
@@ -491,36 +511,116 @@ pub(crate) fn served_by(
 /// Decide the advertised mDNS name and ALab pin for one tick of `serve` (`DESIGN-fluid-swarm`
 /// §4.1 F1: evaluated on each advert tick rather than once at start).
 #[cfg(unix)]
-pub(crate) fn decide_serve_role(
-    advertise: &Advertise,
-    store: &std::path::Path,
-    paths: &crate::client::Paths,
-    pins: &mut Vec<(String, [u8; 32])>,
-    alab_key: Option<[u8; 32]>,
-) -> (Option<String>, Option<String>) {
-    // A copy alone does not make this ALab's server: its Mac must follow the ALab vault too, by
-    // the vault's line, so a release that retires its key changes nothing here.
-    let follows = crate::client::config(paths)
-        .ok()
-        .flatten()
-        .is_some_and(|config| {
-            config.signer.is_some_and(|signer| {
-                crate::envelope::Retired::compiled().lineage(&signer, &config.followed)
-            })
-        });
-    let here = match (crate::server::holds_alab(store), follows) {
-        (true, true) => AlabHere::Server,
-        (true, false) => AlabHere::Copy,
-        (false, _) => AlabHere::Empty,
-    };
-    let (advertised, held_back) = alab_role(advertise.clone(), here, pins, alab_key);
-    alab_policy_role(
-        advertised,
-        held_back,
-        crate::client::steward_alab_policy_role(paths),
-        pins,
-        alab_key,
-    )
+#[derive(Default)]
+pub(crate) struct ServeRole {
+    scoped: bool,
+    last: Option<(crate::client::AlabRoleContext, String)>,
+}
+
+#[cfg(unix)]
+impl ServeRole {
+    fn apply(
+        &mut self,
+        observation: crate::client::AlabRoleObservation,
+        fallback: (Option<String>, Option<String>),
+        pins: &mut Vec<(String, [u8; 32])>,
+        alab_key: Option<[u8; 32]>,
+    ) -> (Option<String>, Option<String>) {
+        use crate::client::AlabRoleObservation::{
+            Allowed, Denied, Missing, NotApplicable, Unavailable,
+        };
+        let held = || {
+            (
+                None,
+                Some("ALab server role is not currently established".to_owned()),
+            )
+        };
+        let label = match observation {
+            Missing if !self.scoped => return fallback,
+            NotApplicable => {
+                self.last = None;
+                return if self.scoped && fallback.0.as_deref() == Some(crate::alab_advertised()) {
+                    held()
+                } else {
+                    fallback
+                };
+            }
+            Missing | Denied => {
+                self.scoped = true;
+                self.last = None;
+                return held();
+            }
+            Unavailable(context) => {
+                self.scoped = true;
+                self.last = self
+                    .last
+                    .take()
+                    .filter(|(prior, _)| Some(prior) == context.as_ref());
+                self.last.as_ref().map(|(_, label)| label.clone())
+            }
+            Allowed { context, own_label } => {
+                self.scoped = true;
+                self.last = own_label
+                    .filter(|label| {
+                        !label.is_empty()
+                            && label != crate::alab_advertised()
+                            && crate::text::valid_machine_name(label)
+                    })
+                    .map(|label| (context, label));
+                self.last.as_ref().map(|(_, label)| label.clone())
+            }
+        };
+        let Some(label) = label else {
+            return held();
+        };
+        alab_policy_role(
+            fallback.0,
+            fallback.1,
+            Some((true, Some(label))),
+            pins,
+            alab_key,
+        )
+    }
+
+    pub(crate) fn decide(
+        &mut self,
+        advertise: &Advertise,
+        store: &std::path::Path,
+        paths: &crate::client::Paths,
+        pins: &mut Vec<(String, [u8; 32])>,
+        alab_key: Option<[u8; 32]>,
+    ) -> (Option<String>, Option<String>) {
+        self.decide_after_store(advertise, store, paths, pins, alab_key, || {})
+    }
+
+    pub(crate) fn decide_after_store(
+        &mut self,
+        advertise: &Advertise,
+        store: &std::path::Path,
+        paths: &crate::client::Paths,
+        pins: &mut Vec<(String, [u8; 32])>,
+        alab_key: Option<[u8; 32]>,
+        before_observation: impl FnOnce(),
+    ) -> (Option<String>, Option<String>) {
+        let holds = crate::server::holds_alab(store);
+        before_observation();
+        // Fallback and eligibility must use one observation. In particular, an older ALab
+        // config read cannot make a later missing-config observation a standalone server.
+        let observation = crate::client::observe_alab_role(paths);
+        let follows = matches!(
+            &observation,
+            crate::client::AlabRoleObservation::Allowed { .. }
+                | crate::client::AlabRoleObservation::Denied
+                | crate::client::AlabRoleObservation::Unavailable(_)
+        );
+        let here = match (holds, follows) {
+            (true, true) => AlabHere::Server,
+            (true, false) => AlabHere::Copy,
+            (false, _) => AlabHere::Empty,
+        };
+        let (advertised, held_back) = alab_role(advertise.clone(), here, pins, alab_key);
+        self.apply(observation, (advertised, held_back), pins, alab_key)
+    }
 }
 
 fn serve_settings(f: &Flags) -> Result<ServeSettings, String> {
@@ -550,6 +650,7 @@ fn serve_settings(f: &Flags) -> Result<ServeSettings, String> {
         Some(secs) => Some(std::time::Duration::from_secs(
             secs.parse::<u64>()
                 .ok()
+                .filter(|_| !secs.is_empty() && secs.bytes().all(|b| b.is_ascii_digit()))
                 .filter(|n| (1..=MAX_HOLD_SECS).contains(n))
                 .ok_or_else(|| format!("--hold {secs}: seconds from 1 to {MAX_HOLD_SECS}"))?,
         )),
@@ -638,8 +739,12 @@ fn parse(words: &[String]) -> Result<Command, String> {
             Ok(Command::Watch)
         }
         "ls" => {
-            no_operands(&flags(rest, &[], &[])?, "ls")?;
-            Ok(Command::Ls)
+            let f = flags(rest, &[], &["--describe", "--json"])?;
+            no_operands(&f, "ls")?;
+            Ok(Command::Ls {
+                describe: f.has("--describe"),
+                json: f.has("--json"),
+            })
         }
         "get" => {
             let f = flags(rest, &[], &[])?;
@@ -774,8 +879,11 @@ fn parse(words: &[String]) -> Result<Command, String> {
             })
         }
         "requests" => {
-            no_operands(&flags(rest, &[], &[])?, "requests")?;
-            Ok(Command::Requests)
+            let f = flags(rest, &[], &["--json"])?;
+            no_operands(&f, "requests")?;
+            Ok(Command::Requests {
+                json: f.has("--json"),
+            })
         }
         "approve" => {
             let f = flags(rest, &["--name"], &["--all"])?;
@@ -941,7 +1049,7 @@ mod unix {
     use zeroize::Zeroize;
 
     /// What an open vault means, said where one is made or shown.
-    const OPEN_VAULT: &str = "this vault is open: a machine joins with no password or code once a person presses Allow on any member and types the phrase it shows, and reads [everyone]'s entries; a key you let go comes back only by its code, but a machine that makes a new key asks as a new machine (aterm secrets password set also lets in a machine that types the join password)";
+    const OPEN_VAULT: &str = "this vault is open: a machine joins with no password or code once a person presses Allow on any member and types the phrase it shows (at the ALab vault, a machine that asks on the home ALab LAN, where members answer, joins with no Allow; one on a phone hotspot or any other network waits for an Allow), and reads [everyone]'s entries; a key you let go comes back only by its code, but a machine that makes a new key asks as a new machine (aterm secrets password set also lets in a machine that types the join password, and ends the ALab vault's home-LAN rule)";
 
     /// What a vault at a path says where one served at a URL says whom its `[join]` lets in: a
     /// path has no join queue, so nothing lets a machine in by itself there.
@@ -949,7 +1057,7 @@ mod unix {
 
     /// What a publish that let a machine go from an open vault says: only its key is kept out,
     /// since a new key still joins by a person's Allow on any member.
-    const KEPT_OUT: &str = "the vault stays open, but not to the key you let go: it is a `code-only` line in [join], so that key is let back in only by its code (aterm secrets approve), never by a member's Allow. A new key still joins when a person presses Allow on any member, so if the machine was lost or compromised, let go any machine in [machines] (aterm secrets edit) it may have joined as since, even under its old name, and only then rotate what it could read";
+    const KEPT_OUT: &str = "the vault stays open, but not to the key you let go: it is a `code-only` line in [join], so that key is let back in only by its code (aterm secrets approve), never by a member's Allow. A new key still joins when a person presses Allow on any member (at the ALab vault, also when it asks on the home ALab LAN), so if the machine was lost or compromised, let go any machine in [machines] (aterm secrets edit) it may have joined as since, even under its old name, and only then rotate what it could read";
 
     /// [`KEPT_OUT`] for a vault at a path: only an admin's approve of a key lets a machine in
     /// there, which a `code-only` line does not stop. A server may still serve the file
@@ -1018,10 +1126,9 @@ mod unix {
                 })?;
                 Ok(ExitCode::SUCCESS)
             }
-            Command::Ls => {
-                for name in client::status(&paths)?.names {
-                    println!("{name}");
-                }
+            Command::Ls { describe, json } => {
+                let names = client::registered_names(&paths)?;
+                print!("{}", super::inventory::listing(&names, describe, json)?);
                 Ok(ExitCode::SUCCESS)
             }
             Command::Get(name) => get(&paths, &name),
@@ -1062,7 +1169,7 @@ mod unix {
                 Ok(published(&format!("removed {name}"), &done))
             }
             Command::Password { action, agent } => password(&paths, action, agent, &subscriber),
-            Command::Requests => requests(&paths),
+            Command::Requests { json } => requests(&paths, json),
             Command::Approve { which, all, name } => approve(&paths, &which, all, name),
             Command::Revoke {
                 host,
@@ -1634,8 +1741,10 @@ mod unix {
         doc.open().then_some(OPEN_VAULT)
     }
 
-    /// Who an approver for `approval` lets in: an open vault admits nothing new by itself, only
-    /// a machine a person allowed on a member (docs/DESIGN-fluid-swarm-2026-10-28.md F10).
+    /// Who an approver for `approval` lets in: a personal open vault admits nothing new by
+    /// itself, only a machine a person allowed on a member (docs/DESIGN-fluid-swarm-2026-10-28.md
+    /// F10); the ALab vault also admits one its server observed on the home ALab LAN, where
+    /// members answered (docs/DESIGN-automatic-alab-lan-admission-2026-10-29.md).
     pub(super) const fn joiner(approval: Approval) -> &'static str {
         match approval {
             Approval::Password => "a machine that types the join password",
@@ -1902,7 +2011,7 @@ mod unix {
         let given = Cell::new(from_pipe);
         let ask_password = || -> Option<SecretBytes> {
             let password = ask_hidden(
-                "Join password (an admin Mac shows it: aterm secrets password; Enter joins without one and waits for Allow on any member, or for approval by code): ",
+                "Join password (an admin Mac shows it: aterm secrets password; Enter joins without one and waits for Allow on any member, or for approval by code; the ALab vault lets a Mac on the home ALab LAN in by itself): ",
             )
             .filter(|typed| !typed.as_slice().trim_ascii().is_empty());
             given.set(password.is_some());
@@ -2512,7 +2621,7 @@ mod unix {
             syncs = approver.runs();
         } else {
             println!(
-                "machines that join it must pin this key: add #{} to the URL, or confirm the fingerprint",
+                "machines that join it must pin this key: add #{} to the path, or confirm the fingerprint",
                 created.signer
             );
             println!(
@@ -2597,7 +2706,8 @@ mod unix {
 
     /// Wait until a GET of `url` hears any answer from a vault server, for at most `hang`.
     pub(super) fn answering(url: &str, hang: Duration) -> crate::Result<()> {
-        let deadline = std::time::Instant::now() + hang;
+        let deadline =
+            std::time::Instant::now() + hang.min(Duration::from_secs(365 * 24 * 60 * 60));
         loop {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             match crate::transport::get_within(url, left.clamp(ANSWER_STEP, ANSWER_LOOK)) {
@@ -2963,7 +3073,7 @@ mod unix {
                 }
                 None => {
                     eprintln!(
-                        "this vault has no join password (aterm secrets password new makes one); joining machines wait for approval by code"
+                        "this vault has no join password (aterm secrets password new makes one); joining machines wait for an Allow on a member or approval by code"
                     );
                     Ok(ExitCode::FAILURE)
                 }
@@ -3039,7 +3149,7 @@ mod unix {
                     doc.set_open(false).map_err(text_error)?;
                     let done = client::admin_publish(paths, &admin, &doc)?;
                     return Ok(published(
-                        "closed the vault (joining machines now wait for approval by code)",
+                        "closed the vault (joining machines now wait for an Allow on a member or approval by code)",
                         &done,
                     ));
                 }
@@ -3050,7 +3160,7 @@ mod unix {
                 doc.set_join_password(None).map_err(text_error)?;
                 let done = client::admin_publish(paths, &admin, &doc)?;
                 Ok(published(
-                    "removed the join password (joining machines now wait for approval by code)",
+                    "removed the join password (joining machines now wait for an Allow on a member or approval by code)",
                     &done,
                 ))
             }
@@ -3151,9 +3261,50 @@ mod unix {
         Ok(admitted)
     }
 
-    fn requests(paths: &Paths) -> crate::Result<ExitCode> {
+    /// Render the configured source's queue after `client::requests` applies any
+    /// available administrator document. Missing metadata leaves code-only state
+    /// unknown and may leave already-admitted members in the queue.
+    pub(super) fn requests_json(
+        pending: &[client::Request],
+        doc: Option<&text::Document>,
+    ) -> aterm_json::Value {
+        let code_only = doc.map(text::Document::code_only);
+        let requests: Vec<_> = pending
+            .iter()
+            .map(|request| {
+                aterm_json::json!({
+                    "recipient": request.recipient,
+                    "host": request.host,
+                    "code": request.code,
+                    "requested_at": request.at,
+                    "lan_observed": request.home.is_some(),
+                    "member_allow_present": request.allowed.is_some(),
+                    "password_proof_present": request.proof.is_some(),
+                    "code_only": code_only.as_ref().map(|keys| keys.contains(&request.recipient)),
+                })
+            })
+            .collect();
+        aterm_json::json!({
+            "schema": 1,
+            "kind": "vault-join-requests",
+            "scope": "configured-vault-source",
+            "known_members_filtered": doc.is_some(),
+            "requests": requests,
+        })
+    }
+
+    fn requests(paths: &Paths, json: bool) -> crate::Result<ExitCode> {
         let admin = client::admin_open(paths).ok();
         let pending = client::requests(paths, admin.as_ref().map(|a| &a.doc))?;
+        if json {
+            let value = requests_json(&pending, admin.as_ref().map(|a| &a.doc));
+            println!(
+                "{}",
+                aterm_json::to_string(&value)
+                    .map_err(|error| Error::new(format!("cannot encode join requests: {error}")))?
+            );
+            return Ok(ExitCode::SUCCESS);
+        }
         let code_only = admin
             .as_ref()
             .map(|a| a.doc.code_only())
@@ -3431,8 +3582,9 @@ mod unix {
         let alab_key = crate::b64::decode_padded(crate::ALAB_SIGNER)
             .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok());
         let advertise_mode = settings.advertise.clone();
+        let mut role = super::ServeRole::default();
         let (advertise, held_back) =
-            super::decide_serve_role(&advertise_mode, &store, paths, &mut settings.pins, alab_key);
+            role.decide(&advertise_mode, &store, paths, &mut settings.pins, alab_key);
         crate::log_line(&format!(
             "{} serving on {}, store {}",
             stamp(),
@@ -3447,7 +3599,8 @@ mod unix {
                 let store = store.clone();
                 let paths = paths.clone();
                 Box::new(move |pins: &mut Vec<(String, [u8; 32])>| {
-                    super::decide_serve_role(&advertise_mode, &store, &paths, pins, alab_key).0
+                    role.decide(&advertise_mode, &store, &paths, pins, alab_key)
+                        .0
                 }) as crate::server::RoleDecider
             });
         crate::server::serve_with_role(
@@ -3550,7 +3703,109 @@ mod unix {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn secret_listing_accepts_metadata_flags_without_operands() {
+        use super::{Command, parse};
+        assert_eq!(
+            parse(&["ls".into(), "--describe".into()]).unwrap(),
+            Command::Ls {
+                describe: true,
+                json: false
+            }
+        );
+        assert_eq!(
+            parse(&["ls".into(), "--json".into()]).unwrap(),
+            Command::Ls {
+                describe: false,
+                json: true
+            }
+        );
+        assert!(parse(&["ls".into(), "--json".into(), "token".into()]).is_err());
+    }
     use super::*;
+
+    #[test]
+    fn join_requests_json_is_an_optional_flag_without_operands() {
+        assert_eq!(
+            parse(&["requests".into()]).unwrap(),
+            Command::Requests { json: false }
+        );
+        assert_eq!(
+            parse(&["requests".into(), "--json".into()]).unwrap(),
+            Command::Requests { json: true }
+        );
+        assert!(parse(&["requests".into(), "--json".into(), "extra".into()]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn join_requests_report_server_observations_without_disclosing_proofs() {
+        let request = crate::client::Request {
+            recipient: crate::age::Identity::from_secret_bytes([41; 32])
+                .recipient()
+                .to_bech32(),
+            host: "new-machine".into(),
+            code: "abcd-efgh-ijkl-mnop".into(),
+            at: Some(1793460000),
+            home: Some(crate::home_lan::HomeTag::test()),
+            allowed: Some("private-member-allow".into()),
+            proof: Some("private-password-proof".into()),
+        };
+        let report = unix::requests_json(&[request], None);
+        assert_eq!(report["known_members_filtered"].as_bool(), Some(false));
+        let row = &report["requests"][0];
+        assert_eq!(row["host"].as_str(), Some("new-machine"));
+        assert_eq!(row["requested_at"].as_u64(), Some(1793460000));
+        assert_eq!(row["lan_observed"].as_bool(), Some(true));
+        assert_eq!(row["member_allow_present"].as_bool(), Some(true));
+        assert_eq!(row["password_proof_present"].as_bool(), Some(true));
+        assert!(row["code_only"].is_null());
+        let encoded = aterm_json::to_string(&report).unwrap();
+        assert!(!encoded.contains("private-member-allow"));
+        assert!(!encoded.contains("private-password-proof"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn join_requests_code_only_state_requires_administrator_metadata() {
+        let owner = crate::age::Identity::from_secret_bytes([42; 32])
+            .recipient()
+            .to_bech32();
+        let held = crate::age::Identity::from_secret_bytes([43; 32])
+            .recipient()
+            .to_bech32();
+        let other = crate::age::Identity::from_secret_bytes([44; 32])
+            .recipient()
+            .to_bech32();
+        let mut doc = crate::text::Document::new_vault("admin", &owner);
+        doc.add_code_only(&held).unwrap();
+        let requests: Vec<_> = [held, other]
+            .into_iter()
+            .map(|recipient| crate::client::Request {
+                recipient,
+                host: "queued-machine".into(),
+                code: "abcd-efgh-ijkl-mnop".into(),
+                at: None,
+                home: None,
+                allowed: None,
+                proof: None,
+            })
+            .collect();
+        let report = unix::requests_json(&requests, Some(&doc));
+        assert_eq!(report["known_members_filtered"].as_bool(), Some(true));
+        assert_eq!(report["requests"][0]["code_only"].as_bool(), Some(true));
+        assert_eq!(report["requests"][1]["code_only"].as_bool(), Some(false));
+        assert_eq!(report["requests"][1]["lan_observed"].as_bool(), Some(false));
+        assert!(report["requests"][1]["requested_at"].is_null());
+        assert_eq!(
+            report["requests"][1]["member_allow_present"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            report["requests"][1]["password_proof_present"].as_bool(),
+            Some(false)
+        );
+    }
 
     #[test]
     fn sync_diagnostic_is_an_opt_in_flag_without_operands() {
@@ -3960,7 +4215,7 @@ mod tests {
             host: host.to_owned(),
             code: String::new(),
             at: None,
-            lan: false,
+            home: None,
             allowed: None,
             proof: None,
         };
@@ -4117,7 +4372,7 @@ mod tests {
             host: host.into(),
             code: code.into(),
             at: None,
-            lan: false,
+            home: None,
             allowed: None,
             proof: None,
         };
@@ -4206,7 +4461,7 @@ mod tests {
             host: host.to_owned(),
             code: String::new(),
             at: None,
-            lan: false,
+            home: None,
             allowed: None,
             proof: None,
         };
@@ -5418,7 +5673,12 @@ mod tests {
                         .find_map(|line| {
                             let (name, value) = line.split_once(':')?;
                             name.eq_ignore_ascii_case("content-length")
-                                .then(|| value.trim().parse::<usize>().ok())
+                                .then(|| {
+                                    let s = value.trim();
+                                    (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                                        .then(|| s.parse::<usize>().ok())
+                                        .flatten()
+                                })
                                 .flatten()
                         })
                         .unwrap_or(0);

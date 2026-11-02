@@ -30,6 +30,20 @@ pub(super) fn require_host_holds(need: RawFd, what: &str) {
     }
 }
 
+/// THE RAISED SOFT LIMIT IS THE FLOOR CAPPED AT THE HARD LIMIT, and only
+/// where that raises anything: a stock 256 shell gets the floor, a low
+/// hard limit caps it, an already-high soft limit is left alone.
+#[test]
+fn the_raised_soft_nofile_target_is_the_floor_capped_at_the_hard_limit() {
+    assert_eq!(
+        raised_soft_nofile_target(256, u64::MAX),
+        Some(SOFT_NOFILE_FLOOR)
+    );
+    assert_eq!(raised_soft_nofile_target(256, 1024), Some(1024));
+    assert_eq!(raised_soft_nofile_target(8192, u64::MAX), None);
+    assert_eq!(raised_soft_nofile_target(256, 256), None);
+}
+
 /// Raise the soft descriptor limit toward `request`, and end the calling test COULD NOT RUN when it
 /// cannot pass `floor`.
 #[track_caller]
@@ -145,6 +159,12 @@ fn release_held() {
     }
 }
 
+/// How long a staged child may run: a hang detector past its stage's own, never a budget. A
+/// stage waits in turn on things that must happen, each under its one-minute hang detector
+/// (`shell-probe` races two of them, each overrun by its last round, and `signals` waits on two
+/// probes and a child), so a stage whose own wait hangs fails by its own message first.
+const STAGE_HANG: Duration = Duration::from_secs(10 * crate::deadline::ECHO_HANG.as_secs());
+
 fn launch_staged(mut launch: std::process::Command, stage: &str) -> String {
     launch.env(STAGE_ENV, stage);
     let strip = InheritStrip::prepare();
@@ -156,7 +176,7 @@ fn launch_staged(mut launch: std::process::Command, stage: &str) -> String {
             Ok(())
         });
     }
-    let out = launch.output().expect("start the staged child");
+    let out = crate::deadline::std_ends_within(&mut launch, STAGE_HANG);
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     if !out.status.success()
         && let Some(why) = String::from_utf8_lossy(&out.stderr).lines().find_map(|l| {
@@ -554,6 +574,62 @@ fn the_search_passes_over_what_it_may_not_run_and_a_script_without_a_shebang_run
     );
 }
 
+/// The search a tethered spawn judges before it routes (`platform::findable`) answers what the
+/// spawn itself answers: it passes exactly when a plain spawn of the program starts, and refuses
+/// with that spawn's own error, for a bare name on `PATH`, a relative path in the child's folder,
+/// an absolute path and an empty name.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_search_judged_before_the_spawn_answers_what_the_spawn_answers() {
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = aterm_tempfile::tempdir().expect("scratch");
+    let dir = scratch.path();
+    std::fs::write(dir.join("tool"), b"#!/bin/sh\nexit 0\n").expect("write");
+    std::fs::set_permissions(dir.join("tool"), std::fs::Permissions::from_mode(0o755))
+        .expect("chmod");
+    std::fs::write(dir.join("plain"), b"#!/bin/sh\nexit 0\n").expect("write");
+    std::fs::create_dir(dir.join("folder")).expect("mkdir");
+    let here = dir.display().to_string();
+    let gone_first = format!("{here}/gone:{here}");
+    let tool = format!("{here}/tool");
+    let plain = format!("{here}/plain");
+    let cases: [(&str, &str, bool); 14] = [
+        ("tool", &here, false),
+        ("tool", &gone_first, false),
+        ("plain", &here, false),
+        ("folder", &here, false),
+        ("missing", &here, false),
+        ("plain", "/usr/bin:/bin", false),
+        ("./tool", "/usr/bin", true),
+        ("./plain", "/usr/bin", true),
+        ("./folder", "/usr/bin", true),
+        ("./missing", "/usr/bin", true),
+        (&tool, "/usr/bin", false),
+        (&plain, "/usr/bin", false),
+        ("", &here, false),
+        ("tool", "gone:.", true),
+    ];
+    for (program, path, in_dir) in cases {
+        let base = in_dir.then_some(dir);
+        let judged = platform::findable(program.as_bytes(), Some(OsStr::new(path)), base, false);
+        let mut cmd = command(program);
+        cmd.env("PATH", path).stdin(Stdio::null());
+        if in_dir {
+            cmd.current_dir(dir);
+        }
+        let spawned = cmd.status();
+        assert_eq!(
+            judged.as_ref().map(|_| ()).map_err(io::Error::raw_os_error),
+            spawned
+                .as_ref()
+                .map(|_| ())
+                .map_err(io::Error::raw_os_error),
+            "{program:?} on PATH {path:?}{}: judged {judged:?}, spawned {spawned:?}",
+            if in_dir { ", in the folder" } else { "" }
+        );
+    }
+}
+
 #[test]
 fn a_helper_spawned_without_lanes_holds_its_stdio_and_nothing_else() {
     let held = unflagged_at_or_above(64);
@@ -773,6 +849,197 @@ fn a_stripped_child_inherits_nothing_above_stdio() {
         "CONTROL: an unflagged descriptor must reach a leaky child"
     );
     assert!(!stripped, "the strip must keep fd {fd} out of the child");
+}
+
+/// The number a pipe made now puts its write end at, with every free number below 10 filled
+/// first (the files come back to be held until the spawn): the number `std`'s exec-error pipe
+/// takes at the next spawn of a command with inherited stdio, which opens nothing before that
+/// pipe, and leaves where it is (Trust's `std` moves the pipe's end to 10 or above when hooks
+/// run). Only a process where nothing else opens descriptors (a staged child) can name it ahead.
+fn next_pipe_write_end() -> (RawFd, Vec<std::fs::File>) {
+    let mut low = Vec::new();
+    loop {
+        let null = std::fs::File::open("/dev/null").expect("open /dev/null");
+        if null.as_raw_fd() >= 10 {
+            break;
+        }
+        low.push(null);
+    }
+    let (_rd, wr) = std::io::pipe().expect("a probe pipe");
+    (wr.as_raw_fd(), low)
+}
+
+fn staged_pass_at() {
+    let child_reads = |pass_before_the_strip: bool, same_number: bool| -> String {
+        let (rd, mut wr) = std::io::pipe().expect("a pipe");
+        wr.write_all(b"x").expect("write the byte");
+        let at = if same_number {
+            rd.as_raw_fd()
+        } else {
+            wr.as_raw_fd()
+        };
+        drop(wr);
+        let rd = OwnedFd::from(rd);
+        let source = rd.as_raw_fd();
+        #[cfg(target_vendor = "apple")]
+        assert_eq!(
+            flags(source) & FD_CLOFORK,
+            0,
+            "the ordinary pipe is unmarked"
+        );
+        let source_held = test_support::sh_held(source);
+        let script = format!(
+            "v=$(dd if=/dev/fd/{at} bs=1 count=1 2>/dev/null); \
+             [ {source} -ne {at} ] && {source_held} && v=\"$v+{source}\"; printf %s \"$v\""
+        );
+        let mut cmd = std::process::Command::new("/bin/sh");
+        if pass_before_the_strip {
+            cmd.pass_at(rd, at).expect("pass the read end");
+            cmd.inherit_nothing();
+        } else {
+            cmd.inherit_nothing();
+            cmd.pass_at(rd, at).expect("pass the read end");
+        }
+        let out = cmd
+            .args(["-c", &script])
+            .stderr(std::process::Stdio::null())
+            .output()
+            .expect("run the probe");
+        let read = String::from_utf8_lossy(&out.stdout).into_owned();
+        format!("{read} at {at} from {source}")
+    };
+    for same_number in [false, true] {
+        let read = child_reads(false, same_number);
+        assert!(
+            read.starts_with("x at "),
+            "the child reads the passed pipe, including when its number is unchanged: {read}"
+        );
+        let read = child_reads(true, same_number);
+        assert!(
+            read.starts_with(" at "),
+            "CONTROL: a strip added after the pass closes the number at the exec: {read}"
+        );
+    }
+
+    #[cfg(target_vendor = "apple")]
+    for same_number in [true, false] {
+        let (lane, mut peer) = crate::kept_out(UnixStream::pair).expect("a kept-out pair");
+        // NEGATIVE CONTROL: accepting the same number loses the lane at fork; copying a
+        // marked input first instead exposes an unmarked copy to other forks while held.
+        let at = if same_number {
+            lane.as_raw_fd()
+        } else {
+            let free = std::fs::File::open("/dev/null").expect("reserve a different number");
+            let at = free.as_raw_fd();
+            assert_ne!(at, lane.as_raw_fd());
+            drop(free);
+            at
+        };
+        let supported = crate::spawn_lock::tests::clofork_supported();
+        assert_eq!(
+            flags(lane.as_raw_fd()) & FD_CLOFORK,
+            if supported { FD_CLOFORK } else { 0 },
+            "the input lane agrees with the kernel's supported flags"
+        );
+        let mut marked = std::process::Command::new("/bin/sh");
+        marked.inherit_nothing();
+        if !supported {
+            peer.write_all(b"x").expect("the byte to pass");
+            drop(peer);
+            marked
+                .pass_at(lane.into(), at)
+                .expect("an unmarked input is supported");
+            let script = format!("dd if=/dev/fd/{at} bs=1 count=1 2>/dev/null");
+            let out = marked
+                .args(["-c", &script])
+                .output()
+                .expect("read the passed input");
+            assert!(out.status.success());
+            assert_eq!(
+                out.stdout, b"x",
+                "close-on-exec passing still works without CLOFORK"
+            );
+            continue;
+        }
+        let error = marked
+            .pass_at(lane.into(), at)
+            .map(|_| ())
+            .expect_err("a marked input is refused before any copy or pass hook");
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported, "{error}");
+        assert_eq!(flags(at), -1, "a refusal retains nothing at the target");
+        let out = marked
+            .args(["-c", "printf refused"])
+            .output()
+            .expect("a refusal left no pass hook in the command");
+        assert!(out.status.success());
+        assert_eq!(out.stdout, b"refused");
+        assert_ne!(
+            flags(peer.as_raw_fd()) & FD_CLOFORK,
+            0,
+            "the other lane remains kept out while the command lives"
+        );
+    }
+
+    let mut missing = std::process::Command::new("/nonexistent/aterm-uds-pass-at-no-such-prog");
+    missing.inherit_nothing();
+    let null = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/null")
+        .expect("open /dev/null");
+    let (at, _below_ten) = next_pipe_write_end();
+    missing
+        .pass_at(OwnedFd::from(null), at)
+        .expect("pass /dev/null");
+    let started = missing.status();
+    assert_eq!(
+        started.as_ref().map_err(io::Error::kind).err(),
+        Some(io::ErrorKind::NotFound),
+        "a failed exec is an Err though the pass names {at}, where std's exec-error pipe would \
+         put its write end: {started:?}"
+    );
+
+    let mut cmd = std::process::Command::new("/bin/sh");
+    let low = std::fs::File::open("/dev/null").expect("open /dev/null");
+    let refused = cmd.pass_at(OwnedFd::from(low), 2).map(|_| ()).unwrap_err();
+    assert_eq!(
+        refused.kind(),
+        io::ErrorKind::InvalidInput,
+        "a pass onto the child's stdio is refused: {refused}"
+    );
+    let held = std::fs::File::open("/dev/null").expect("open /dev/null");
+    let other = std::fs::File::open("/dev/null").expect("open /dev/null");
+    let refused = cmd
+        .pass_at(OwnedFd::from(other), held.as_raw_fd())
+        .map(|_| ())
+        .unwrap_err();
+    assert_eq!(
+        refused.kind(),
+        io::ErrorKind::ResourceBusy,
+        "a pass onto a number this process holds is refused: {refused}"
+    );
+    println!("STAGED pass-at ok");
+}
+
+/// A `std` command given a pipe's read end after the strip holds it at the number it names, the
+/// same open file (the child reads the byte written before the spawn), and nothing at the number
+/// it came from; a strip added after the pass marks that number close-on-exec again and the exec
+/// closes it. The command holds the number from the pass on, so a failed exec is an `Err` even
+/// when the number is the one `std`'s exec-error pipe would otherwise take, and a number this
+/// process already holds is refused. Staged, so those numbers are known ahead.
+/// An ordinary descriptor already at its number also reaches the child. On Apple, a
+/// close-on-fork input is refused at both the same and a different number before a copy or pass
+/// hook is installed, and the command still runs normally after that refusal.
+#[test]
+fn a_descriptor_passed_after_the_strip_reaches_the_child_at_its_number() {
+    const NAME: &str =
+        "spawnfd::tests::a_descriptor_passed_after_the_strip_reaches_the_child_at_its_number";
+    if std::env::var(STAGE_ENV).is_ok() {
+        staged_pass_at();
+        return;
+    }
+    let out = run_staged(NAME, "pass-at");
+    assert!(out.contains("STAGED pass-at ok"), "{out}");
 }
 
 #[test]
@@ -1182,5 +1449,55 @@ fn a_lane_spawn_refused_as_text_busy_starts_once_the_writer_lets_go() {
         refused.kind(),
         io::ErrorKind::ExecutableFileBusy,
         "{refused}"
+    );
+}
+
+/// A DETACHED child leads a session of its own, so it leads its own process group too and no
+/// job's signal reaches it, while it holds the two lanes at 3 and 4 and stdio on `/dev/null`:
+/// it says its pid on fd 4 and waits on fd 3, and its session and group, read while it waits,
+/// are its own pid. NEGATIVE CONTROL: the same child by [`spawn_with_two_fds`] stays in this
+/// process's session and group.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_detached_child_leads_a_session_of_its_own() {
+    let run = |detached: bool| {
+        let (mut near_verb, far_verb) = UnixStream::pair().expect("socketpair");
+        let (near_push, far_push) = UnixStream::pair().expect("socketpair");
+        test_support::bound_read(&near_push).expect("bound the read");
+        let mut cmd = LaneCommand::new("/bin/sh");
+        cmd.args(["-c", "echo $$ >&4; read line <&3"])
+            .stdin(ChildStdio::Null)
+            .stdout(ChildStdio::Null)
+            .stderr(ChildStdio::Null);
+        let mut child = if detached {
+            detached_with_two_fds(cmd, far_verb.into(), far_push.into())
+        } else {
+            spawn_with_two_fds(cmd, far_verb.into(), far_push.into())
+        }
+        .expect("spawn sh");
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(&near_push), &mut line)
+            .expect("its pid on fd 4");
+        let pid: i32 = line.trim().parse().expect("a pid");
+        assert_eq!(u32::try_from(pid).ok(), Some(child.id()));
+        // SAFETY: two integer reads of a live child's ids.
+        let (sid, pgid) = unsafe { (libc::getsid(pid), libc::getpgid(pid)) };
+        near_verb.write_all(b"done\n").expect("write fd 3");
+        assert!(child.wait().expect("reap").success());
+        (pid, sid, pgid)
+    };
+    let (pid, sid, pgid) = run(true);
+    assert_eq!(
+        (sid, pgid),
+        (pid, pid),
+        "detached: its own session and group"
+    );
+    // SAFETY: integer reads of this process's own ids.
+    let (my_sid, my_pgid) = unsafe { (libc::getsid(0), libc::getpgrp()) };
+    let (_, sid, pgid) = run(false);
+    assert_eq!(
+        (sid, pgid),
+        (my_sid, my_pgid),
+        "a lane spawn stays in this job"
     );
 }

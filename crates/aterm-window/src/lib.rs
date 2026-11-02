@@ -4,6 +4,11 @@
 // Derived from winit 0.30.13 src/lib.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
+//! Modified by the aterm project in 2026; see the repository NOTICE. (Cut the Android, iOS,
+//! Orbital and Web backends, the `rwh_04`/`rwh_05`/`serde`/`mint` features and the changelog.
+//! Upstream's crate-level `deny` lint levels are `warn`: aterm's lints warn and `verify lint`
+//! denies them, so a build never fails on one, and the cross-cell lint denies only bans.)
+//!
 //! Cross-platform window creation and event loop management library.
 //!
 //! You can retrieve events by calling `EventLoop::run_app()`:
@@ -103,6 +108,11 @@ mod frame_shadow;
 #[cfg(not(macos_platform))]
 mod icon;
 pub mod keyboard;
+/// The least window size on Windows as pixels (tested on every host, used only by the Windows
+/// backend).
+#[cfg(any(test, windows_platform))]
+#[cfg_attr(not(windows_platform), allow(dead_code))]
+mod min_track;
 pub mod monitor;
 mod platform_impl;
 mod utils;

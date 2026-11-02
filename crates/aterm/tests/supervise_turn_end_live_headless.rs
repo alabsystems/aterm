@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime};
 use aterm_agent::supervise::config::CONTINUE_TEXT;
 use aterm_agent::supervise::policy::needs::NEEDS_HINT;
 use aterm_agent::supervise::policy::turn_end::{
-    Cleared, Clearing, Outage, TurnEndTiming, cleared_text,
+    Cleared, Clearing, FORWARD_RECOVERY, Outage, TurnEndTiming, cleared_text,
 };
 use aterm_agent::supervise::prompt::fixtures::{
     BOX_BASH_TOUCH, END_529, GOAL_ACTIVE_SUGGESTION, composer, screen,
@@ -842,6 +842,15 @@ fn journal_when(inst: &Instance, ok: impl Fn(&str) -> bool) -> String {
     .unwrap_or_else(|_| journal(inst))
 }
 
+/// The loop's journal once it says it typed under `rule` (`CONTINUED seq=… rule=<rule> …`), or
+/// when the chain hangs ([`moving`]). A test that reads the line in the loop's output waits for
+/// it here before [`Supervisor::stop`]: the worker sees the submit before the loop has said it,
+/// and a stop in between cuts the line off.
+fn continued_when(inst: &Instance, rule: &str) -> String {
+    let named = format!(r#""kind":"continued","phase":"{rule}""#);
+    journal_when(inst, |j| j.lines().any(|l| l.contains(&named)))
+}
+
 /// The points the loop read, as its journal holds them (`EVENT …`).
 fn looks(journal: &str) -> usize {
     journal
@@ -943,6 +952,7 @@ fn a_529_end_is_resumed_once_on_its_first_rung_with_the_one_line() {
     drawn(&inst, "e529");
     let submitted = submits_when(&inst, &subs, 2);
     let sup = sup.saw(&inst, &sid, "I.need.your.decision");
+    continued_when(&inst, "outage-resume@v1");
     let out = sup.stop();
     let ev = evidence(&inst, &out);
     assert_eq!(submitted.len(), 2, "{ev}");
@@ -1009,6 +1019,7 @@ fn narrow_composer(want: &str, mangle: bool) {
     drawn(&inst, "done");
     if !mangle {
         let sup = sup.saw(&inst, &sid, "I.need.your.decision");
+        continued_when(&inst, "continue@v1");
         let out = sup.stop();
         let ev = evidence(&inst, &out);
         let submitted = submits_when(&inst, &subs, 2);
@@ -1105,6 +1116,7 @@ fn a_decision_is_answered_with_the_answer_text() {
     let sup = sup.saw(&inst, &sid, "I.need.your.decision");
     let submitted = submits_when(&inst, &subs, 2);
     let meta = ctl_ok(&inst, &[&format!("@{sid}"), "meta"]);
+    continued_when(&inst, "answer@v1");
     let out = sup.stop();
     let ev = evidence(&inst, &out);
     assert_eq!(
@@ -1119,13 +1131,18 @@ fn a_decision_is_answered_with_the_answer_text() {
     assert!(!meta.contains("attention_owner=supervisor"), "{meta}\n{ev}");
 }
 
-/// Under full power, a worker whose every turn is short (`min_work` an hour) and says the same is continued twice, then held under the stalled exception without escalating.
+/// Under full power, a worker whose every turn is short (`min_work` an hour) and says the same is
+/// continued twice. Cruise never stops on that held reply and never escalates it: it journals its
+/// short back-off first, then types the forward recovery ([`FORWARD_RECOVERY`]) where a third
+/// continuation would go (`docs/DESIGN-continuous-forward-2026-11-01.md`: a repeated no-work
+/// reply changes approach on the pacing ladder rather than stopping Cruise).
 #[test]
-fn a_short_turn_loop_saying_the_same_is_continued_twice_then_held_and_never_escalates() {
-    const HELD: &str = "kind=stalled when=later held=same-reply Its program answers aterm's acts with the same reply";
+fn a_short_turn_loop_saying_the_same_is_continued_twice_then_recovered_after_its_backoff() {
+    /// The wait the held reply gets before the recovery goes (`act_past_walls`).
+    const PACED: &str = "repeated report; changing approach on the next turn";
     let inst = boot("b");
     let sid = boot_session(&inst);
-    let (_keys, _subs, events) = start_looping_worker(&inst, &sid, "done");
+    let (_keys, subs, _events) = start_looping_worker(&inst, &sid, "done");
     let sec = Duration::from_secs(1);
     submit(&inst, &sid, "go");
     await_match(&inst, &sid, "Deliberating|suite.is.green");
@@ -1140,28 +1157,55 @@ fn a_short_turn_loop_saying_the_same_is_continued_twice_then_held_and_never_esca
         },
         SupervisorConfig::default(),
     );
-    // The hold told, or a third continuation typed past it: the chain moves on either way.
-    let submits = || {
-        worker_events(&events)
-            .iter()
-            .filter(|(_, kind, _)| kind == "submit")
-            .count()
+    // A fourth submit, and the loop's own word that it typed the recovery: the worker sees the
+    // submit before the loop has said it ([`continued_when`]).
+    let submitted = submits_when(&inst, &subs, 4);
+    let records = |j: &str| -> Vec<aterm_agent::supervise::journal::JournalRecord> {
+        j.lines()
+            .filter_map(|l| aterm_agent::supervise::journal::JournalRecord::from_json(l).ok())
+            .collect()
     };
-    let told = moving(&inst, || {
-        let j = journal(&inst);
-        (j.contains(HELD) || submits() > 3).then_some(j)
-    })
-    .unwrap_or_else(|_| journal(&inst));
+    let recovery = |r: &aterm_agent::supervise::journal::JournalRecord| {
+        r.kind == "continued" && !r.summary.is_empty() && FORWARD_RECOVERY.starts_with(&r.summary)
+    };
+    let told = journal_when(&inst, |j| records(j).iter().any(recovery));
     let meta = ctl_ok(&inst, &[&format!("@{sid}"), "meta"]);
     let out = sup.stop();
-    let at = stamps_when(&inst, "submit", 3);
     let ev = evidence(&inst, &out);
-    assert!(told.contains(HELD), "{ev}");
     assert_eq!(
-        at.len(),
-        3,
-        "`go` and two continuations, then nothing; {ev}"
+        submitted.iter().take(4).cloned().collect::<Vec<String>>(),
+        [
+            "SUBMIT:go".to_string(),
+            cruise_submit(),
+            cruise_submit(),
+            format!("SUBMIT:{FORWARD_RECOVERY}"),
+        ],
+        "`go`, two continuations, then the recovery in a third's place; {ev}"
     );
+    // Paced: the held reply's back-off is journaled after the second continuation and before the
+    // recovery goes, never the recovery at once.
+    let journaled = records(&told);
+    let recovered = journaled
+        .iter()
+        .position(recovery)
+        .unwrap_or_else(|| panic!("the recovery journaled; {ev}"));
+    let before = &journaled[..recovered];
+    let continued: Vec<usize> = before
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.kind == "continued")
+        .map(|(i, _)| i)
+        .collect();
+    let paced = before
+        .iter()
+        .rposition(|r| r.kind == "waiting" && r.summary.ends_with(PACED));
+    assert_eq!(continued.len(), 2, "two continuations before it; {ev}");
+    assert!(
+        matches!((continued.last(), paced), (Some(&c), Some(p)) if c < p),
+        "the back-off journaled between the second continuation and the recovery; {ev}"
+    );
+    assert!(!journaled.iter().any(|r| r.kind == "escalated"), "{ev}");
+    assert!(!told.contains("held=same-reply"), "no hold told; {ev}");
     assert!(!meta.contains("attention_owner=supervisor"), "{meta}\n{ev}");
 }
 
@@ -1224,6 +1268,7 @@ fn a_weekly_wall_behind_a_shell_is_published_waited_out_and_continued_once() {
         wall.then_some(())
     });
     let submitted = submits_when(&inst, &subs, 2);
+    continued_when(&inst, "usage-resume@v1");
     let out = sup.stop();
     let ev = evidence(&inst, &out);
     assert!(
@@ -1259,6 +1304,7 @@ fn a_weekly_wall_on_a_displaced_grid_is_continued_with_the_resume_not_a_bare_ent
     );
     submit(&inst, &sid, "go");
     let submitted = submits_when(&inst, &subs, 2);
+    continued_when(&inst, "usage-resume@v1");
     let out = sup.stop();
     let ev = evidence(&inst, &out);
     assert_eq!(
@@ -1290,6 +1336,7 @@ fn a_draft_left_at_the_wall_is_submitted_after_the_reset_not_keep_going() {
     );
     submit(&inst, &sid, "go");
     let submitted = submits_when(&inst, &subs, 2);
+    continued_when(&inst, "usage-resume@v1");
     let out = sup.stop();
     let ev = evidence(&inst, &out);
     assert_eq!(
@@ -1323,6 +1370,7 @@ fn a_weekly_wall_scrolled_out_of_view_is_still_continued_at_its_reset() {
     submit(&inst, &sid, "go");
     drawn(&inst, "wallscrolled");
     let submitted = submits_when(&inst, &subs, 2);
+    continued_when(&inst, "usage-resume@v1");
     let out = sup.stop();
     let ev = evidence(&inst, &out);
     assert_eq!(
@@ -1358,6 +1406,7 @@ fn a_loop_that_replaces_another_at_a_scrolled_wall_goes_on_waiting_for_its_reset
     );
     let second = Supervisor::start(&inst, &sid, timing(Duration::from_secs(1)));
     let submitted = submits_when(&inst, &subs, 2);
+    continued_when(&inst, "usage-resume@v1");
     let said_second = second.stop();
     assert_eq!(
         submitted,

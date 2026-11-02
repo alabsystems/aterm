@@ -14,8 +14,8 @@ use crate::devtools_helper::{
     test_arms,
 };
 use crate::permission_walk::{
-    GRANT_POLL, REOPEN_MARKER, REOPEN_WITHIN, START_KEYS_QUIET, Started, Subject, UNREAD_WAIT,
-    Walk, WalkLane, WalkReach, leave_reopen_in, take_reopen_in,
+    GRANT_POLL, REOPEN_MARKER, Started, Subject, UNREAD_WAIT, Walk, WalkLane, WalkReach,
+    leave_reopen_in, take_reopen_in,
 };
 use aterm_containment::DevToolGrant;
 use aterm_containment::consent::FdaState;
@@ -177,6 +177,9 @@ fn walk_app_with_parts(
     QUIT_ASKED.with(|asked| asked.set(false));
     RECORDS.with(|records| records.borrow_mut().clear());
     let mut app = new_mac(devtools, fda);
+    // A walk page is a person's stage: its time and its grant reads count while they are at the
+    // Mac (`App::count_walk_page_time`). A test that models them away says so.
+    app.user_input_recent = |_| true;
     app.devtools_helper = Lane::windowed_with_fda_for_test(devtools, fda, arm);
     app.consent
         .set_devtools_arms_for_test(no_probe, || Some(test_arms::SUBJECT));
@@ -749,144 +752,9 @@ fn not_now_on_developer_tools_goes_on_to_the_debugger_step() {
     assert_eq!(test_arms::fda_counts().0, fda_opens + 1, "its page opened");
 }
 
-/// The walk starts by itself on a cold first launch with System State in front and the person
-/// there (input 30 s ago) and not typing: a key 1 s ago holds it until the keyboard has rested
-/// [`START_KEYS_QUIET`]. An update's successor, a Mac whose pages came up before, nobody at the
-/// Mac for a minute, or System State away never starts it.
-#[test]
-fn the_walk_starts_on_a_cold_first_launch_once_the_keyboard_rests() {
-    fn starts(app: &mut App, now: Instant) -> bool {
-        app.tick_permission_walk(now);
-        app.permission_walk.active()
-    }
-    fn cold() -> App {
-        let mut app = walk_app();
-        app.devtools_helper.note_cold_start();
-        app.user_input_recent = |within| within >= Duration::from_secs(30);
-        app
-    }
-    let t0 = Instant::now();
-    let mut app = cold();
-    app.last_keystroke_at = Some(t0 - Duration::from_secs(1));
-    assert!(!starts(&mut app, t0), "a key typed 1 s ago");
-    assert!(
-        starts(&mut app, t0 - Duration::from_secs(1) + START_KEYS_QUIET),
-        "the keyboard rested 2 s"
-    );
-    assert_eq!(
-        app.permission_walk
-            .walk()
-            .map(|walk| walk.subjects().to_vec()),
-        Some(vec![Subject::FullDiskAccess, Subject::DeveloperTools])
-    );
-
-    let later = t0 + Duration::from_secs(10);
-    let mut successor = walk_app();
-    successor.user_input_recent = |_| true;
-    assert!(!starts(&mut successor, later), "an update's successor");
-
-    let mut seen = cold();
-    seen.devtools_helper = Lane::windowed_with_fda_for_test(
-        test_arms::marked_as(|_| Some((atpkg::devtools::revision_key(1), 1))),
-        test_arms::fda_opening(),
-        counting_arm(),
-    );
-    seen.devtools_helper.note_cold_start();
-    assert!(!starts(&mut seen, later), "a page came up before");
-
-    let mut away = cold();
-    away.user_input_recent = |_| false;
-    assert!(!starts(&mut away, later), "nobody at the Mac for a minute");
-
-    let mut elsewhere = cold();
-    set_front(false);
-    assert!(!starts(&mut elsewhere, later), "System State not in front");
-    set_front(true);
-    assert!(starts(&mut elsewhere, later), "and once it is");
-}
-
 thread_local! {
     static FDA_MARKER: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
-}
-
-/// A first launch whose person stepped away (the last touch two minutes ago: inside the steps'
-/// five minutes, past the walk's one) keeps the window's own Full Disk Access step queued through
-/// the real tick, however many parks pass, so its page and the marker it writes do not take this
-/// Mac's first walk from it; once the person is back the walk starts and its panel takes the
-/// page, step 1 of 2. NEGATIVE CONTROL: an update's successor, which never walks by itself, opens
-/// the same step's page at the same moment and writes the marker.
-#[test]
-fn a_step_never_takes_the_first_page_from_a_walk_still_to_come() {
-    use crate::devtools_helper::RECHECK_EVERY;
-    fn opened_as(_key: &str) -> Option<(String, u64)> {
-        FDA_MARKER.with(|marker| marker.borrow().clone().map(|word| (word, 1)))
-    }
-    fn note_opened(word: &str) {
-        FDA_MARKER.with(|marker| *marker.borrow_mut() = Some(word.to_owned()));
-    }
-    fn marker() -> Option<String> {
-        FDA_MARKER.with(|marker| marker.borrow().clone())
-    }
-    fn launched(cold: bool) -> App {
-        FDA_MARKER.with(|marker| *marker.borrow_mut() = None);
-        let mut app = walk_app_with_fda(
-            test_arms::opening(),
-            test_arms::fda_marking(opened_as, note_opened),
-        );
-        if cold {
-            app.devtools_helper.note_cold_start();
-        }
-        app.user_input_recent = |within| within >= Duration::from_secs(120);
-        assert!(app.consent_card.begin_deciding(Instant::now()));
-        app.decide_macos_access_card(crate::consent_card::PendingDecision::launch(None));
-        assert_eq!(app.devtools_helper.fda_queued(), Some(Origin::Automatic));
-        app
-    }
-    let parks = |app: &mut App, t: Instant| {
-        for park in 0..3 {
-            app.tick_consent_lanes(t + RECHECK_EVERY * park);
-        }
-    };
-
-    let mut successor = launched(false);
-    let opens = test_arms::fda_counts().0;
-    let t0 = Instant::now();
-    parks(&mut successor, t0);
-    assert_eq!(
-        test_arms::fda_counts().0,
-        opens + 1,
-        "the successor's step opens its page"
-    );
-    assert!(marker().is_some(), "and writes the marker");
-
-    let mut app = launched(true);
-    let opens = test_arms::fda_counts().0;
-    parks(&mut app, t0);
-    assert_eq!(
-        test_arms::fda_counts().0,
-        opens,
-        "nobody at the Mac: no page"
-    );
-    assert_eq!(marker(), None, "and no marker");
-    assert_eq!(app.devtools_helper.fda_queued(), Some(Origin::Automatic));
-    assert!(!app.permission_walk.active());
-
-    app.user_input_recent = |within| within >= Duration::from_secs(1);
-    app.tick_consent_lanes(t0 + RECHECK_EVERY * 3);
-    assert_eq!(
-        app.permission_walk
-            .walk()
-            .map(|walk| walk.subjects().to_vec()),
-        Some(vec![Subject::FullDiskAccess, Subject::DeveloperTools]),
-        "the person is back: the walk starts"
-    );
-    assert_eq!(test_arms::fda_counts().0, opens + 1, "its page comes up");
-    assert_eq!(
-        page_and_step(&app),
-        Some((Page::FullDiskAccess, Some((1, 2)))),
-        "in the walk's panel"
-    );
 }
 
 thread_local! {
@@ -896,92 +764,6 @@ thread_local! {
     /// The LAN re-probe's outcome, as its thread leaves it for the window.
     static LAN_PROBE: Cell<Option<(u64, crate::system_state_access::LocalNetworkProbe)>> =
         const { Cell::new(None) };
-}
-
-/// A first launch on a fresh Mac, the person at System State and the keyboard at rest, starts no
-/// walk while System State's Local Network step is still to run (not yet its quiet moment), nor
-/// once it has run while its alert's hold stands, so System Settings does not come up beside
-/// macOS's Local Network alert; the walk starts, its page with it, as the hold ends after 30 s.
-/// The step runs while the walk is due, the person away or not, and the LAN re-probe's answer
-/// ends the hold early: the walk starts at the park after it, with the person back. NEGATIVE
-/// CONTROL: on a Mac whose access record holds Local Network the walk starts at the first look.
-#[test]
-fn the_first_walk_waits_for_the_local_network_question() {
-    use crate::system_state_access::LocalNetworkProbe;
-    fn fresh() -> App {
-        STEPS_QUIET.with(|quiet| quiet.set(false));
-        LAN_PROBE.with(|probe| probe.set(None));
-        let mut app = walk_app();
-        app.access_steps.set_reach(StepsReach {
-            recorded: |_, _| None,
-            quiet: |_, _| STEPS_QUIET.with(Cell::get),
-            take_local_network_probe: || LAN_PROBE.with(Cell::take),
-            ..app.access_steps.reach
-        });
-        app.devtools_helper.note_cold_start();
-        app.user_input_recent = |within| within >= Duration::from_secs(5);
-        app
-    }
-    let walking = Some(vec![Subject::FullDiskAccess, Subject::DeveloperTools]);
-    let subjects = |app: &App| {
-        app.permission_walk
-            .walk()
-            .map(|walk| walk.subjects().to_vec())
-    };
-    let t0 = Instant::now();
-    let mut app = fresh();
-    let (fired, fda_opens) = (triggers(), test_arms::fda_counts().0);
-    app.tick_consent_lanes(t0);
-    assert_eq!(triggers(), fired, "not yet the step's moment");
-    assert_eq!(subjects(&app), None, "the Local Network step is to come");
-
-    STEPS_QUIET.with(|quiet| quiet.set(true));
-    let asked = t0 + Duration::from_secs(1);
-    app.tick_consent_lanes(asked);
-    assert_eq!(triggers(), fired + 1, "the step runs while the walk is due");
-    app.tick_consent_lanes(asked + LOCAL_NETWORK_ALERT_HOLD - GRANT_POLL);
-    assert_eq!(subjects(&app), None, "its alert's hold stands");
-    assert_eq!(
-        test_arms::fda_counts().0,
-        fda_opens,
-        "no page beside the alert"
-    );
-    app.tick_consent_lanes(asked + LOCAL_NETWORK_ALERT_HOLD);
-    assert_eq!(subjects(&app), walking, "the hold is over: the walk starts");
-    assert_eq!(
-        test_arms::fda_counts().0,
-        fda_opens + 1,
-        "its page comes up"
-    );
-
-    let mut app = fresh();
-    app.user_input_recent = |within| within >= Duration::from_secs(120);
-    STEPS_QUIET.with(|quiet| quiet.set(true));
-    app.tick_consent_lanes(t0);
-    assert_eq!(
-        triggers(),
-        fired + 2,
-        "the person away: the step still runs"
-    );
-    app.user_input_recent = |within| within >= Duration::from_secs(1);
-    app.tick_consent_lanes(t0 + Duration::from_secs(2));
-    assert_eq!(subjects(&app), None, "back, under the alert's hold");
-    let answered = t0 + Duration::from_secs(4);
-    LAN_PROBE.with(|probe| probe.set(Some((1, LocalNetworkProbe::Granted))));
-    // The re-probe's wake drains it, then the park looks.
-    app.on_local_network_probe_ready(answered);
-    app.tick_consent_lanes(answered);
-    assert_eq!(subjects(&app), walking, "the answer ended the hold");
-
-    let mut asked_before = walk_app();
-    asked_before.devtools_helper.note_cold_start();
-    asked_before.user_input_recent = |within| within >= Duration::from_secs(5);
-    asked_before.tick_consent_lanes(t0);
-    assert_eq!(
-        subjects(&asked_before),
-        walking,
-        "Local Network on record: the walk starts at once"
-    );
 }
 
 /// A first launch on a fresh Mac whose System State Local Network step is still to come and whose
@@ -999,679 +781,6 @@ fn walk_app_held_by_local_network(devtools: crate::devtools_helper::Reach) -> Ap
     app.devtools_helper.note_cold_start();
     app.user_input_recent = |within| within >= Duration::from_secs(5);
     app
-}
-
-/// The walk's wait for System State's Local Network step ends: while the step's moment does not
-/// come (here its quiet moment, held for good), the walk starts [`LOCAL_NETWORK_WAIT`] after the
-/// first look nothing else held, says so in aterm.log with what held the step (read before the
-/// walk counted among it), and the step asks only once the walk is over, never beside it, nor
-/// while System Settings, left up by the walk, still asks something: a window over its main one
-/// (Quit & Reopen's sheet) or a quit of this process. The hold aterm.log names then says the walk
-/// once, though both the window's gestures and the quiet moment name it.
-/// NEGATIVE CONTROL: a look a park before that end starts no walk.
-#[test]
-fn the_walk_stops_waiting_for_a_local_network_step_that_does_not_come() {
-    use crate::permission_walk::LOCAL_NETWORK_WAIT;
-    let mut app = walk_app_held_by_local_network(test_arms::opening());
-    let walking = Some(vec![Subject::FullDiskAccess, Subject::DeveloperTools]);
-    let subjects = |app: &App| {
-        app.permission_walk
-            .walk()
-            .map(|walk| walk.subjects().to_vec())
-    };
-    let t0 = Instant::now();
-    let fired = triggers();
-    app.tick_consent_lanes(t0);
-    assert_eq!(subjects(&app), None, "the Local Network step is to come");
-    app.tick_consent_lanes(t0 + LOCAL_NETWORK_WAIT - GRANT_POLL);
-    assert_eq!(subjects(&app), None, "a park before the wait's end");
-    let said = crate::test_log::logged_while(|| app.tick_consent_lanes(t0 + LOCAL_NETWORK_WAIT));
-    assert_eq!(
-        subjects(&app),
-        walking,
-        "the wait is over: the walk goes first"
-    );
-    let ahead: Vec<_> = said
-        .iter()
-        .filter(|line| line.contains("the walk goes first"))
-        .collect();
-    assert!(
-        ahead.len() == 1
-            && ahead[0].contains("it waits: ")
-            && !ahead[0].contains("walk is under way"),
-        "said once, with what held the step before the walk: {said:?}"
-    );
-    assert_eq!(triggers(), fired, "the step has not asked");
-    let held = app
-        .access_steps
-        .local_network_held
-        .clone()
-        .expect("the step names its hold");
-    assert_eq!(
-        held.iter()
-            .filter(|words| *words == "a permission walk is under way")
-            .count(),
-        1,
-        "a part the gestures and the quiet moment both name is said once: {held:?}"
-    );
-
-    STEPS_QUIET.with(|quiet| quiet.set(true));
-    let walked = t0 + LOCAL_NETWORK_WAIT + GRANT_POLL;
-    app.tick_consent_lanes(walked);
-    assert_eq!(
-        triggers(),
-        fired,
-        "its moment came, but never beside the walk"
-    );
-    app.devtools_helper.press_for_test(PanelEvent::CloseBox);
-    app.tick_consent_lanes(walked + GRANT_POLL);
-    assert!(
-        !app.permission_walk.active(),
-        "the close box ended the walk"
-    );
-    SETTINGS_ASKS.with(|asks| asks.set(true));
-    app.tick_consent_lanes(walked + GRANT_POLL * 2);
-    assert_eq!(
-        triggers(),
-        fired,
-        "System Settings' sheet stands: never beside it"
-    );
-    assert_eq!(
-        app.access_steps.local_network_held.as_deref(),
-        Some(
-            &[
-                "System Settings shows a window of its own over its main one (its password \
-                 window, or Quit & Reopen's sheet), or, with its main window off screen, the one \
-                 last seen there is still listed over it (for at most 10 min after the person \
-                 left it)"
-                    .to_owned()
-            ][..]
-        )
-    );
-    SETTINGS_ASKS.with(|asks| asks.set(false));
-    QUIT_ASKED.with(|asked| asked.set(true));
-    app.tick_consent_lanes(walked + GRANT_POLL * 3);
-    assert_eq!(triggers(), fired, "a quit is asked of this process");
-    assert_eq!(
-        app.access_steps.local_network_held.as_deref(),
-        Some(&["a quit is asked of this process (System Settings' Quit & Reopen)".to_owned()][..])
-    );
-    QUIT_ASKED.with(|asked| asked.set(false));
-    app.tick_consent_lanes(walked + GRANT_POLL * 4);
-    assert_eq!(triggers(), fired + 1, "the step asks once the walk is over");
-}
-
-/// The walk's wait for the Local Network step counts only an unbroken run of looks at which the
-/// walk was ready and only that step held it, and never runs out at a look where the step's own
-/// moment has come: a look away from System State starts the count again, and the step asks first
-/// whenever its moment comes, the wait spent or not. NEGATIVE CONTROLS: the person back at
-/// System State with the step's moment met after more than [`LOCAL_NETWORK_WAIT`] away gets the
-/// step, not the walk; a run of ready looks as long as the wait, unbroken, still starts it.
-#[test]
-fn the_walks_wait_for_local_network_counts_only_unbroken_readiness() {
-    use crate::permission_walk::LOCAL_NETWORK_WAIT;
-    let subjects = |app: &App| {
-        app.permission_walk
-            .walk()
-            .map(|walk| walk.subjects().to_vec())
-    };
-    let walking = Some(vec![Subject::FullDiskAccess, Subject::DeveloperTools]);
-    let t0 = Instant::now();
-    let fired = triggers();
-
-    // Away for longer than the wait, then back with the step still held: the count starts again.
-    let mut app = walk_app_held_by_local_network(test_arms::opening());
-    app.tick_consent_lanes(t0);
-    set_front(false);
-    app.tick_consent_lanes(t0 + Duration::from_secs(1));
-    app.tick_consent_lanes(t0 + LOCAL_NETWORK_WAIT + Duration::from_secs(5));
-    set_front(true);
-    let back = t0 + LOCAL_NETWORK_WAIT * 2;
-    app.tick_consent_lanes(back);
-    assert_eq!(
-        subjects(&app),
-        None,
-        "back at System State: the wait counts from the return"
-    );
-    app.tick_consent_lanes(back + LOCAL_NETWORK_WAIT - GRANT_POLL);
-    assert_eq!(subjects(&app), None, "a park before the wait's end");
-    app.tick_consent_lanes(back + LOCAL_NETWORK_WAIT);
-    assert_eq!(subjects(&app), walking, "unbroken: the walk goes first");
-    assert_eq!(triggers(), fired);
-
-    // The step's moment comes at the very look the wait would run out: the step goes first.
-    let mut app = walk_app_held_by_local_network(test_arms::opening());
-    app.tick_consent_lanes(t0);
-    app.tick_consent_lanes(t0 + LOCAL_NETWORK_WAIT - GRANT_POLL);
-    STEPS_QUIET.with(|quiet| quiet.set(true));
-    app.tick_consent_lanes(t0 + LOCAL_NETWORK_WAIT);
-    assert_eq!(triggers(), fired + 1, "the step asks at its own moment");
-    assert_eq!(subjects(&app), None, "and the walk waits for its alert");
-
-    // Away for longer than the wait, back with the step's moment met: the step, not the walk.
-    let mut app = walk_app_held_by_local_network(test_arms::opening());
-    app.tick_consent_lanes(t0);
-    set_front(false);
-    app.tick_consent_lanes(t0 + Duration::from_secs(1));
-    set_front(true);
-    STEPS_QUIET.with(|quiet| quiet.set(true));
-    app.tick_consent_lanes(t0 + LOCAL_NETWORK_WAIT * 3);
-    assert_eq!(triggers(), fired + 2, "back at its moment: the step asks");
-    assert_eq!(subjects(&app), None, "no walk beside its alert");
-}
-
-/// Any walk that starts spends the walk's wait for the Local Network step: no look counts while
-/// it is under way, so once a person's walk that lasted past [`LOCAL_NETWORK_WAIT`] is over, a
-/// walk by itself over a subject missing since (Developer Tools, read on at the press, now off)
-/// waits a fresh, unbroken
-/// [`LOCAL_NETWORK_WAIT`] of ready looks before it goes ahead of the step.
-/// NEGATIVE CONTROL: that fresh run, unbroken, starts it.
-#[test]
-fn a_walk_that_starts_spends_the_walks_wait_for_local_network() {
-    use crate::permission_walk::LOCAL_NETWORK_WAIT;
-    let subjects = |app: &App| {
-        app.permission_walk
-            .walk()
-            .map(|walk| walk.subjects().to_vec())
-    };
-    let t0 = Instant::now();
-    let fired = triggers();
-    let mut app = walk_app_held_by_local_network(test_arms::opening());
-    app.tick_consent_lanes(t0);
-    assert_eq!(subjects(&app), None, "the Local Network step is to come");
-    let pressed = t0 + Duration::from_secs(1);
-    app.devtools_helper.note_reading(
-        test_arms::reading(DevToolGrant::Granted, test_arms::on()),
-        pressed,
-    );
-    assert_eq!(
-        app.start_permission_walk(&[Subject::FullDiskAccess], "a person's press", pressed),
-        walking_over(&[Subject::FullDiskAccess])
-    );
-    app.tick_consent_lanes(pressed + GRANT_POLL);
-    app.devtools_helper.press_for_test(PanelEvent::CloseBox);
-    let ended = t0 + LOCAL_NETWORK_WAIT + Duration::from_secs(5);
-    app.tick_consent_lanes(ended);
-    assert!(!app.permission_walk.active(), "the close box ended it");
-    app.devtools_helper.note_reading(
-        test_arms::reading(DevToolGrant::NotGranted, test_arms::absent(2)),
-        ended,
-    );
-    let back = ended + GRANT_POLL;
-    app.tick_consent_lanes(back);
-    assert_eq!(
-        subjects(&app),
-        None,
-        "the person's walk spent the wait: it counts again from here"
-    );
-    app.tick_consent_lanes(back + LOCAL_NETWORK_WAIT - GRANT_POLL);
-    assert_eq!(subjects(&app), None, "a park before the fresh wait's end");
-    app.tick_consent_lanes(back + LOCAL_NETWORK_WAIT);
-    assert_eq!(
-        subjects(&app),
-        Some(vec![Subject::DeveloperTools]),
-        "unbroken: the walk goes first"
-    );
-    assert_eq!(triggers(), fired, "the step has not asked");
-}
-
-/// System State's Local Network step and the walk that starts by itself read System Settings
-/// asking something alike: while a window of its own stands over its main one (a sheet the
-/// person left there) or a quit of this process is asked, the walk is not ready, so its wait for
-/// the step never runs out on that question and System Settings' page never comes up under it.
-/// NEGATIVE CONTROL: once the question goes, an unbroken [`LOCAL_NETWORK_WAIT`] of ready looks
-/// starts the walk.
-#[test]
-fn the_walk_never_goes_first_while_system_settings_asks() {
-    use crate::permission_walk::LOCAL_NETWORK_WAIT;
-    let t0 = Instant::now();
-    let mut app = walk_app_held_by_local_network(test_arms::opening());
-    let fda_opens = test_arms::fda_counts().0;
-    SETTINGS_ASKS.with(|asks| asks.set(true));
-    app.tick_consent_lanes(t0);
-    app.tick_consent_lanes(t0 + LOCAL_NETWORK_WAIT);
-    app.tick_consent_lanes(t0 + LOCAL_NETWORK_WAIT * 2);
-    assert!(!app.permission_walk.active(), "a sheet stands: no walk");
-    SETTINGS_ASKS.with(|asks| asks.set(false));
-    QUIT_ASKED.with(|asked| asked.set(true));
-    app.tick_consent_lanes(t0 + LOCAL_NETWORK_WAIT * 3);
-    assert!(!app.permission_walk.active(), "a quit is asked: no walk");
-    assert_eq!(test_arms::fda_counts().0, fda_opens, "no page under it");
-    QUIT_ASKED.with(|asked| asked.set(false));
-    let gone = t0 + LOCAL_NETWORK_WAIT * 3 + GRANT_POLL;
-    app.tick_consent_lanes(gone);
-    app.tick_consent_lanes(gone + LOCAL_NETWORK_WAIT - GRANT_POLL);
-    assert!(
-        !app.permission_walk.active(),
-        "a park before the wait's end"
-    );
-    app.tick_consent_lanes(gone + LOCAL_NETWORK_WAIT);
-    assert!(
-        app.permission_walk.active(),
-        "unbroken since it went: the walk"
-    );
-}
-
-/// The walk's look reads System Settings asking (which may read the window list) last, once,
-/// and only at a look that would start a walk, and a wait for the Local Network step reads the
-/// page markers, the declines and System Settings once per wait, not once per park: the look
-/// that begins it works out the walk (markers and declines read, System Settings not), the looks
-/// between read memory alone however many parks pass with the person at System State, and the
-/// look that finds it run out works the walk out again and reads System Settings once. A Mac
-/// whose markers hold the walk for good reads System Settings at no park. A look at which the
-/// wait ran out but the step's own moment has come lets the step ask first, reading nothing.
-/// NEGATIVE CONTROL: the look that finds the wait run out reads them, and starts the walk.
-#[test]
-fn the_walks_look_reads_files_and_system_settings_once_per_wait() {
-    use crate::permission_walk::LOCAL_NETWORK_WAIT;
-    thread_local! {
-        static READS: Cell<u32> = const { Cell::new(0) };
-        static MARKS: Cell<u32> = const { Cell::new(0) };
-        static DECLINES: Cell<u32> = const { Cell::new(0) };
-    }
-    fn every_mac(key: &str) -> Option<(String, u64)> {
-        Some((key.to_owned(), 1))
-    }
-    let reads = || READS.with(Cell::get);
-    let files = || {
-        (
-            MARKS.with(Cell::get),
-            DECLINES.with(Cell::get) + AX_DECLINE_READS.with(Cell::get),
-        )
-    };
-    let arm = || {
-        test_arms::asking(counting_arm(), || {
-            bump(&READS);
-            false
-        })
-    };
-    let mut fda = test_arms::fda_opening();
-    fda.opened_as = every_mac;
-    let mut held = walk_app_with_parts(test_arms::opening(), fda, arm());
-    held.devtools_helper.note_cold_start();
-    held.user_input_recent = |_| true;
-    let t0 = Instant::now();
-    let before = reads();
-    for tick in 0..8 {
-        held.tick_permission_walk(t0 + GRANT_POLL * tick);
-    }
-    assert!(!held.permission_walk.active(), "the markers hold it");
-    assert_eq!(
-        reads(),
-        before,
-        "no walk can start: System Settings is not read"
-    );
-
-    let mut fda = test_arms::fda_opening();
-    fda.opened_as = |_| {
-        bump(&MARKS);
-        None
-    };
-    fda.last_declined = || {
-        bump(&DECLINES);
-        None
-    };
-    let mut waiting = walk_app_with_parts(test_arms::opening(), fda, arm());
-    STEPS_QUIET.with(|quiet| quiet.set(false));
-    waiting.access_steps.set_reach(StepsReach {
-        recorded: |_, _| None,
-        quiet: |_, _| STEPS_QUIET.with(Cell::get),
-        names_holds: true,
-        ..waiting.access_steps.reach
-    });
-    waiting.devtools_helper.note_cold_start();
-    waiting.user_input_recent = |_| true;
-    let (marks, declines) = files();
-    let before = reads();
-    waiting.tick_permission_walk(t0);
-    assert!(!waiting.permission_walk.active(), "the wait begins");
-    let begun = files();
-    assert!(
-        begun.0 > marks && begun.1 > declines,
-        "the look that begins the wait works out the walk: {begun:?} after {:?}",
-        (marks, declines)
-    );
-    assert_eq!(reads(), before, "the wait begins: System Settings not read");
-    for tick in 1..40 {
-        waiting.tick_permission_walk(t0 + LOCAL_NETWORK_WAIT * tick / 40);
-    }
-    assert!(!waiting.permission_walk.active(), "waiting");
-    assert_eq!(
-        files(),
-        begun,
-        "the looks between read no markers, declines or grants"
-    );
-    assert_eq!(reads(), before, "nor System Settings");
-    // The wait ran out at this look, but the step's own moment has come: it asks first.
-    STEPS_QUIET.with(|quiet| quiet.set(true));
-    waiting.tick_permission_walk(t0 + LOCAL_NETWORK_WAIT);
-    assert!(
-        !waiting.permission_walk.active(),
-        "the step's moment: it asks first"
-    );
-    assert_eq!(
-        (files(), reads()),
-        (begun, before),
-        "the step's moment: nothing read"
-    );
-    STEPS_QUIET.with(|quiet| quiet.set(false));
-    waiting.tick_permission_walk(t0 + LOCAL_NETWORK_WAIT + GRANT_POLL);
-    assert!(waiting.permission_walk.active(), "the wait ran out");
-    let ended = files();
-    assert!(
-        ended.0 > begun.0 && ended.1 > begun.1,
-        "the look that starts it works out the walk again"
-    );
-    assert_eq!(reads(), before + 1, "and reads System Settings once");
-}
-
-/// The question System Settings asks is read while the person is with it, so a sheet left
-/// standing holds the walk once System Settings is off screen, whatever order the person's leave
-/// takes its windows away in: with System Settings in front nothing of the window's steps reads
-/// it (System State is not in front), but the watch
-/// (`devtools_helper::DevToolsHelperArm::watch_settings`) has the lane read it as System Settings
-/// comes and every `devtools_helper::SETTINGS_FRONT_READ` while it stays the active app, so the
-/// sheet that comes up there is seen on screen and remembered by its number
-/// (`devtools_helper::settings_asking`). The person then swipes to aterm's full-screen Space (or
-/// presses Cmd-H): its windows leave the screen before System Settings resigns the active app,
-/// so the reading at the leave finds none on screen. Back at System State, the walk is not ready
-/// while that sheet is still listed over that main window, and its wait runs out once the
-/// sheet's number leaves the list. NEGATIVE CONTROL: the same person with no watch (the sheet
-/// seen by no reading on screen) has the walk start beside the sheet.
-#[test]
-fn a_sheet_left_standing_is_read_while_the_person_is_with_system_settings() {
-    use std::cell::RefCell;
-
-    use crate::devtools_helper::{
-        Asking, Rect, SETTINGS_FRONT_READ, SeenAsking, SettingsMoves, SettingsWindow,
-        settings_asking,
-    };
-    use crate::permission_walk::LOCAL_NETWORK_WAIT;
-    thread_local! {
-        static ON_SCREEN: RefCell<Vec<SettingsWindow>> = const { RefCell::new(Vec::new()) };
-        static LISTED: RefCell<Vec<SettingsWindow>> = const { RefCell::new(Vec::new()) };
-        static SEEN: Cell<Option<SeenAsking>> = const { Cell::new(None) };
-        static ACTIVE: Cell<bool> = const { Cell::new(false) };
-        static MOVES: RefCell<Option<SettingsMoves>> = const { RefCell::new(None) };
-    }
-    // The live reading's rule over the windows the test lists.
-    fn asks() -> bool {
-        let on_screen = ON_SCREEN.with(|windows| windows.borrow().clone());
-        let (asking, seen) = settings_asking(
-            &on_screen,
-            0,
-            SEEN.with(Cell::get),
-            Instant::now(),
-            ACTIVE.with(Cell::get),
-            || LISTED.with(|windows| windows.borrow().clone()),
-        );
-        SEEN.with(|cell| cell.set(seen));
-        asking == Asking::Asks
-    }
-    let main = Rect {
-        x: 142.0,
-        y: 86.0,
-        w: 740.0,
-        h: 625.0,
-    };
-    let sheet = Rect {
-        x: 382.0,
-        y: 300.0,
-        w: 260.0,
-        h: 199.0,
-    };
-    let window = |number, bounds| SettingsWindow {
-        number,
-        layer: 0,
-        alpha: 1.0,
-        bounds,
-    };
-    let standing = vec![window(57, main), window(82, sheet)];
-    let answered = vec![window(57, main)];
-    let set = |cell: &'static std::thread::LocalKey<RefCell<Vec<SettingsWindow>>>,
-               windows: &[SettingsWindow]| {
-        cell.with(|cell| *cell.borrow_mut() = windows.to_vec());
-    };
-    // System Settings becomes or resigns the active app, as the live watch hears it.
-    let moved = |active: bool| {
-        ACTIVE.with(|cell| cell.set(active));
-        if let Some(moves) = MOVES.with(|slot| slot.borrow().clone()) {
-            if active { moves.came() } else { moves.left() }
-        }
-    };
-    let run = |watch: bool| -> (bool, bool) {
-        SEEN.with(|cell| cell.set(None));
-        ACTIVE.with(|cell| cell.set(false));
-        MOVES.with(|slot| *slot.borrow_mut() = None);
-        let mut arm = test_arms::asking(counting_arm(), asks);
-        arm.watch_settings = if watch {
-            |moves| {
-                MOVES.with(|slot| *slot.borrow_mut() = Some(moves));
-                true
-            }
-        } else {
-            |_| false
-        };
-        STEPS_QUIET.with(|quiet| quiet.set(false));
-        let mut app = walk_app_with_arm(test_arms::opening(), arm);
-        app.access_steps.set_reach(StepsReach {
-            recorded: |_, _| None,
-            quiet: |_, _| STEPS_QUIET.with(Cell::get),
-            names_holds: true,
-            ..app.access_steps.reach
-        });
-        app.devtools_helper.note_cold_start();
-        app.user_input_recent = |within| within >= Duration::from_secs(5);
-        let t0 = Instant::now();
-        // The person goes to System Settings, at Full Disk Access, nothing asked yet.
-        set_front(false);
-        set(&ON_SCREEN, &answered);
-        set(&LISTED, &answered);
-        app.tick_consent_lanes(t0);
-        assert!(app.devtools_helper.watch_tried(), "the window watches");
-        moved(true);
-        app.tick_consent_lanes(t0 + GRANT_POLL / 2);
-        // They switch aterm on: macOS's Quit & Reopen sheet comes up over the page.
-        set(&ON_SCREEN, &standing);
-        set(&LISTED, &standing);
-        app.tick_consent_lanes(t0 + GRANT_POLL / 2 + SETTINGS_FRONT_READ);
-        // They swipe back to aterm's full-screen Space, the sheet unanswered: the windows leave
-        // the screen before System Settings resigns the active app.
-        set(&ON_SCREEN, &[]);
-        moved(false);
-        app.tick_consent_lanes(t0 + GRANT_POLL + SETTINGS_FRONT_READ);
-        set_front(true);
-        let back = t0 + GRANT_POLL * 2 + SETTINGS_FRONT_READ;
-        for at in [
-            back,
-            back + LOCAL_NETWORK_WAIT,
-            back + LOCAL_NETWORK_WAIT * 2,
-        ] {
-            app.tick_consent_lanes(at);
-        }
-        let held = !app.permission_walk.active();
-        // Later, pressed on System Settings' Space: the sheet's number leaves the list.
-        set(&LISTED, &answered);
-        let gone = back + LOCAL_NETWORK_WAIT * 3;
-        app.tick_consent_lanes(gone);
-        app.tick_consent_lanes(gone + LOCAL_NETWORK_WAIT);
-        (held, app.permission_walk.active())
-    };
-    assert_eq!(
-        run(true),
-        (true, true),
-        "read while the person was with System Settings: the sheet holds the walk off screen \
-         until it goes"
-    );
-    assert_eq!(
-        run(false),
-        (false, true),
-        "control: never read on screen, the sheet is not known and the walk goes beside it"
-    );
-}
-
-/// A question System Settings was seen asking that is still listed over its main window off
-/// screen past `devtools_helper::ASKING_KEPT_FOR` after the person left it (lapsed: maybe still
-/// standing, maybe an answered sheet's number kept) holds what opens System Settings' pages (the
-/// step moment of the steps after Local Network, the walk's start), whose `open` under a standing
-/// sheet is lost, until a reading on screen shows it gone; the Local Network alert's moment and
-/// the debugger step's no longer wait for it. NEGATIVE CONTROL: with nothing lapsed the same
-/// moments come and the walk starts.
-#[test]
-fn a_lapsed_question_holds_only_what_opens_system_settings() {
-    thread_local! {
-        static LAPSED: Cell<bool> = const { Cell::new(false) };
-    }
-    LAPSED.with(|lapsed| lapsed.set(true));
-    let mut arm = counting_arm();
-    arm.settings_lapsed = || LAPSED.with(Cell::get);
-    let mut app = walk_app_with_arm(test_arms::opening(), arm);
-    app.access_steps.set_reach(StepsReach {
-        recorded: |_, _| Some(AccessOutcome::Triggered),
-        quiet: |_, _| true,
-        names_holds: true,
-        ..app.access_steps.reach
-    });
-    let t0 = Instant::now();
-    // The Local Network step is on record for this revision: done at this look.
-    app.tick_local_network_step(t0);
-    assert!(!app.local_network_pending(), "Local Network done");
-    assert!(!app.system_settings_asks(), "lapsed: it does not ask");
-    assert!(app.system_settings_may_ask(), "but it may");
-    assert!(
-        app.local_network_moment(t0),
-        "the Local Network alert's moment does not wait for it"
-    );
-    assert!(
-        !app.debugger_step_moment().settings_asks,
-        "nor the debugger step's"
-    );
-    assert!(
-        !app.access_step_moment(t0),
-        "a step that opens a System Settings page waits for it"
-    );
-    LAPSED.with(|lapsed| lapsed.set(false));
-    assert!(
-        app.access_step_moment(t0),
-        "control: nothing lapsed, the step's moment"
-    );
-    LAPSED.with(|lapsed| lapsed.set(true));
-    app.devtools_helper.note_cold_start();
-    app.user_input_recent = |_| true;
-    app.tick_permission_walk(t0);
-    app.tick_permission_walk(t0 + GRANT_POLL);
-    assert!(!app.permission_walk.active(), "the walk waits for it");
-    LAPSED.with(|lapsed| lapsed.set(false));
-    app.tick_permission_walk(t0 + GRANT_POLL * 2);
-    assert!(
-        app.permission_walk.active(),
-        "control: read on screen gone, the walk starts"
-    );
-}
-
-/// Where macOS's idle time cannot be read, the walk that starts by itself reads the person as the
-/// steps do ([`App::person_present_within`]): with no key, click or scroll in an aterm window it
-/// never starts, its wait for the Local Network step never running out however long the look
-/// lasts, and the later steps wait with it ([`App::walk_waits_for_the_person`]); one click in
-/// aterm is the person there, the wait counts from it, and the person read present at the look
-/// that began it stays present through it, so that one click lets it run out though no other
-/// touch follows. NEGATIVE CONTROLS: a look a park before the wait's end starts no walk; the same
-/// Mac with its idle time read starts the walk at [`LOCAL_NETWORK_WAIT`].
-#[test]
-fn an_unreadable_idle_time_holds_the_walk_until_the_person_touches_aterm() {
-    use crate::permission_walk::LOCAL_NETWORK_WAIT;
-    let t0 = Instant::now();
-    let unreadable = || {
-        let mut app = walk_app_held_by_local_network(test_arms::opening());
-        // What the live reading answers when `HIDIdleTime` cannot be read.
-        app.user_input_recent = |_| true;
-        app.user_input_readable = || false;
-        app
-    };
-    let mut app = unreadable();
-    for at in [t0, t0 + LOCAL_NETWORK_WAIT, t0 + LOCAL_NETWORK_WAIT * 2] {
-        app.tick_consent_lanes(at);
-    }
-    assert!(!app.permission_walk.active(), "nobody known there: no walk");
-    assert!(
-        app.walk_waits_for_the_person(t0 + LOCAL_NETWORK_WAIT * 2),
-        "the later steps wait with it"
-    );
-    let clicked = t0 + LOCAL_NETWORK_WAIT * 2 + Duration::from_secs(1);
-    app.last_person_input_at = Some(clicked);
-    assert!(!app.walk_waits_for_the_person(clicked), "a click in aterm");
-    app.tick_consent_lanes(clicked);
-    app.tick_consent_lanes(clicked + LOCAL_NETWORK_WAIT - GRANT_POLL);
-    assert!(
-        !app.permission_walk.active(),
-        "the wait counts from the click"
-    );
-    app.tick_consent_lanes(clicked + LOCAL_NETWORK_WAIT);
-    assert!(
-        app.permission_walk.active(),
-        "one click, no touch since: the wait runs out, and the walk"
-    );
-
-    let mut read = unreadable();
-    read.user_input_readable = || true;
-    read.tick_consent_lanes(t0);
-    read.tick_consent_lanes(t0 + LOCAL_NETWORK_WAIT);
-    assert!(read.permission_walk.active(), "control: an idle time read");
-}
-
-/// A flick of keyboard focus shorter than `FOCUS_AWAY_FOR`, which holds no typing for the steps
-/// (`App::note_keyboard_focus`), breaks no run of the walk's wait for the Local Network step: a
-/// look while no aterm window has had focus for 5 ms neither starts the walk nor counts against
-/// the wait, and the walk starts at [`LOCAL_NETWORK_WAIT`]. NEGATIVE CONTROLS: focus away
-/// `FOCUS_AWAY_FOR` at a look, or taken back after that long away with no look between, starts
-/// the count again.
-#[test]
-fn a_focus_flick_breaks_no_wait_for_local_network() {
-    use crate::permission_walk::LOCAL_NETWORK_WAIT;
-    /// A case: its name, what happens by `mid`, and whether the wait runs unbroken.
-    type Case = (&'static str, fn(&mut App, Instant), bool);
-    let t0 = Instant::now();
-    let mid = t0 + Duration::from_secs(30);
-    let cases: [Case; 3] = [
-        (
-            "a 5 ms flick",
-            |app, mid| {
-                set_front(false);
-                app.keyboard_focus_lost_at = mid.checked_sub(Duration::from_millis(5));
-            },
-            true,
-        ),
-        (
-            "away for FOCUS_AWAY_FOR at a look",
-            |app, mid| {
-                set_front(false);
-                app.keyboard_focus_lost_at = mid.checked_sub(crate::FOCUS_AWAY_FOR);
-            },
-            false,
-        ),
-        (
-            "back after FOCUS_AWAY_FOR away, no look between",
-            |app, mid| {
-                app.keyboard_focus_lost_at = mid.checked_sub(crate::FOCUS_AWAY_FOR * 2);
-                app.keyboard_focus_back_at = Some(mid);
-            },
-            false,
-        ),
-    ];
-    for (name, at_mid, unbroken) in cases {
-        let mut app = walk_app_held_by_local_network(test_arms::opening());
-        app.tick_consent_lanes(t0);
-        at_mid(&mut app, mid);
-        app.tick_consent_lanes(mid);
-        assert!(!app.permission_walk.active(), "{name}: no walk mid-way");
-        set_front(true);
-        app.tick_consent_lanes(t0 + LOCAL_NETWORK_WAIT);
-        assert_eq!(app.permission_walk.active(), unbroken, "{name}");
-        if !unbroken {
-            app.tick_consent_lanes(t0 + LOCAL_NETWORK_WAIT * 2);
-            assert!(app.permission_walk.active(), "{name}: counted again");
-        }
-    }
 }
 
 /// System State's debugger step waits on the run's order as the access steps do
@@ -2662,7 +1771,8 @@ fn the_control_verbs_walk_waits_out_another_macos_question_and_answers_at_once()
     assert!(!macos_dialog_up());
 
     let mut app = guarded();
-    app.access_steps.local_network_until = Some(t0 + LOCAL_NETWORK_ALERT_HOLD);
+    app.access_steps.alert_seen_at_for_test(t0);
+    app.user_input_recent = |_| true;
     app.access_steps.dialog = Some(MacosDialog::up());
     let fda_opens = test_arms::fda_counts().0;
     assert_eq!(
@@ -2723,7 +1833,8 @@ fn a_persons_install_press_goes_before_the_control_verbs_walk_waiting_with_it() 
         ..app.access_steps.reach
     });
     let hold_ends = t0 + LOCAL_NETWORK_ALERT_HOLD;
-    app.access_steps.local_network_until = Some(hold_ends);
+    app.access_steps.alert_seen_at_for_test(t0);
+    app.user_input_recent = |_| true;
     app.access_steps.dialog = Some(MacosDialog::up());
     // The person pressed Install… under the alert's hold: the press waits for the slot.
     app.workstation_setup.developer_tools = Install::PressedQueued { wanted: None };
@@ -2779,7 +1890,7 @@ fn a_persons_install_press_goes_before_the_control_verbs_walk_waiting_with_it() 
 fn a_persons_press_on_the_row_a_verbs_walk_waits_at_opens_its_page_now() {
     let t0 = Instant::now();
     let mut app = walk_app();
-    app.access_steps.local_network_until = Some(t0 + LOCAL_NETWORK_ALERT_HOLD);
+    app.access_steps.alert_seen_at_for_test(t0);
     let fda_opens = test_arms::fda_counts().0;
     assert_eq!(
         app.ask_permission_walk(&[Subject::FullDiskAccess], t0),
@@ -2869,174 +1980,8 @@ thread_local! {
     static MARKER_READS: Cell<u32> = const { Cell::new(0) };
 }
 
-/// The walk's start is looked at every park, so it reads the page markers only once every
-/// in-memory reading says start: an update's successor, or a window whose System State is
-/// away, reads none, and once a look finds one no later look reads them again. NEGATIVE
-/// CONTROL: the look that would start the walk reads them.
-#[test]
-fn the_walks_start_reads_the_page_markers_last_and_never_again_once_one_is_found() {
-    fn unseen(_key: &str) -> Option<(String, u64)> {
-        bump(&MARKER_READS);
-        None
-    }
-    fn seen(_key: &str) -> Option<(String, u64)> {
-        bump(&MARKER_READS);
-        Some((atpkg::devtools::revision_key(1), 1))
-    }
-    fn present(devtools: crate::devtools_helper::Reach, cold: bool) -> App {
-        let mut app = walk_app_with(devtools);
-        if cold {
-            app.devtools_helper.note_cold_start();
-        }
-        app.user_input_recent = |_| true;
-        app
-    }
-    let reads = || MARKER_READS.with(Cell::get);
-    let t0 = Instant::now();
-    let ticks = |app: &mut App, n: u32| {
-        for tick in 0..n {
-            app.tick_permission_walk(t0 + GRANT_POLL * tick);
-        }
-    };
-
-    let mut successor = present(test_arms::marked_as(unseen), false);
-    let before = reads();
-    ticks(&mut successor, 3);
-    assert_eq!(reads(), before, "an update's successor reads no marker");
-
-    let mut away = present(test_arms::marked_as(unseen), true);
-    set_front(false);
-    ticks(&mut away, 3);
-    set_front(true);
-    assert_eq!(reads(), before, "System State away: no marker read");
-
-    let mut seen_before = present(test_arms::marked_as(seen), true);
-    ticks(&mut seen_before, 1);
-    let first = reads();
-    assert!(
-        first > before,
-        "the look that would start the walk reads them"
-    );
-    ticks(&mut seen_before, 4);
-    assert_eq!(reads(), first, "a marker found is never read again");
-    assert!(!seen_before.permission_walk.active());
-}
-
-/// A Mac whose `<state>` came from another Mac (Migration Assistant, a network home) holds that
-/// Mac's openings of both pages: Full Disk Access's line names that Mac, and the plain Developer
-/// Tools word has that Mac's identity written beside it. Neither is this Mac's, so the walk
-/// starts by itself over both pages. NEGATIVE CONTROL: this bundle's opening on this Mac, of
-/// either page, holds the walk back (the tests' key names no Mac, so this Mac's Developer Tools
-/// line stands as the key's words with this Mac's after them).
-#[test]
-fn the_walk_starts_on_a_mac_whose_pages_came_up_only_on_another_mac() {
-    fn elsewhere() -> Option<(String, u64)> {
-        Some((
-            "r1@com.aterm.aterm@5B1E0C2A-7F3D-4E8B-9A61-0D2C4F6E8A10".to_owned(),
-            1,
-        ))
-    }
-    fn plain() -> Option<(String, u64)> {
-        Some((atpkg::devtools::revision_key(1), 1))
-    }
-    fn here(key: &str) -> Option<(String, u64)> {
-        Some((key.to_owned(), 1))
-    }
-    fn devtools_here(key: &str) -> Option<(String, u64)> {
-        Some((
-            format!("{key}@com.aterm.aterm@0E1D2C3B-4A59-4867-8F70-9A8B7C6D5E4F"),
-            1,
-        ))
-    }
-    fn cold(
-        devtools: crate::devtools_helper::Reach,
-        fda_as: fn(&str) -> Option<(String, u64)>,
-    ) -> App {
-        let mut fda = test_arms::fda_opening();
-        fda.last_opened = elsewhere;
-        fda.opened_as = fda_as;
-        let mut app = walk_app_with_fda(devtools, fda);
-        app.devtools_helper.note_cold_start();
-        app.user_input_recent = |_| true;
-        app
-    }
-    let t0 = Instant::now();
-    let mut moved = cold(test_arms::marked(plain), |_| None);
-    moved.tick_permission_walk(t0);
-    assert_eq!(
-        moved
-            .permission_walk
-            .walk()
-            .map(|walk| walk.subjects().to_vec()),
-        Some(vec![Subject::FullDiskAccess, Subject::DeveloperTools]),
-        "another Mac's pages leave this Mac's walk"
-    );
-
-    let mut fda_here = cold(test_arms::marked(plain), here);
-    fda_here.tick_permission_walk(t0);
-    assert!(
-        !fda_here.permission_walk.active(),
-        "this Mac's Full Disk Access page came up"
-    );
-    let mut devtools_here = cold(test_arms::marked_as(devtools_here), |_| None);
-    devtools_here.tick_permission_walk(t0);
-    assert!(
-        !devtools_here.permission_walk.active(),
-        "this Mac's Developer Tools page came up"
-    );
-}
-
 thread_local! {
     static HELD_READS: Cell<u32> = const { Cell::new(0) };
-}
-
-/// Until the key names this Mac (the tests' key carries no bundle id or Mac, as before both are
-/// read), an opening that names a Mac might be this one's or another's: it holds the start, and
-/// a look under the same key finds the same, so however many parks pass the markers are read
-/// once. Once the key changes they are read again, and an opening that reads as another Mac's
-/// under the new key leaves the look to start the walk. The tests' key never gains the Mac, so a
-/// new approved revision changes it here, and the stand-in answers the new key as it would a key
-/// that names this Mac: the opening is another Mac's. NEGATIVE CONTROL: an opening that names no
-/// Mac is every Mac's and holds the walk for good
-/// (`the_walks_start_reads_the_page_markers_last_and_never_again_once_one_is_found`).
-#[test]
-fn an_opening_that_names_a_mac_holds_the_start_and_is_read_again_only_under_a_new_key() {
-    fn opened_as(key: &str) -> Option<(String, u64)> {
-        bump(&HELD_READS);
-        (key == atpkg::devtools::revision_key(1)).then(|| {
-            (
-                format!("{key}@com.aterm.aterm@5B1E0C2A-7F3D-4E8B-9A61-0D2C4F6E8A10"),
-                1,
-            )
-        })
-    }
-    let reads = || HELD_READS.with(Cell::get);
-    let mut fda = test_arms::fda_opening();
-    fda.opened_as = opened_as;
-    let mut app = walk_app_with_fda(test_arms::opening(), fda);
-    app.devtools_helper.note_cold_start();
-    app.user_input_recent = |_| true;
-    let t0 = Instant::now();
-    let before = reads();
-    for tick in 0..4 {
-        app.tick_permission_walk(t0 + GRANT_POLL * tick);
-    }
-    assert!(
-        !app.permission_walk.active(),
-        "the opening might be this Mac's"
-    );
-    assert_eq!(
-        reads(),
-        before + 1,
-        "the looks under one key read the markers once"
-    );
-    approve(&mut app, 2);
-    app.tick_permission_walk(t0 + GRANT_POLL * 4);
-    assert!(reads() > before + 1, "a new key reads them again");
-    assert!(
-        app.permission_walk.active(),
-        "under a key that names this Mac, the opening is another Mac's"
-    );
 }
 
 thread_local! {
@@ -3048,93 +1993,6 @@ thread_local! {
 
 /// The Mac a released aterm wrote [`STATE`] on, and another.
 const MAC_A: &str = "1D683F62-5C4B-4E3A-9F21-7B8C6D5E4A30";
-const MAC_B: &str = "8F2E6A41-0B3C-4D5E-A697-C8D9E0F1A2B3";
-
-/// `key` with this bundle's and [`THIS_MAC`]'s words after it, as the key carries them once both
-/// are read (the tests' key carries neither).
-fn on_this_mac(key: &str) -> String {
-    format!("{key}@com.aterm.aterm@{}", THIS_MAC.with(Cell::get))
-}
-
-/// A page marker read from [`STATE`], a real `<state>` folder.
-fn from_state(
-    read: impl FnOnce(&std::path::Path) -> Option<(String, u64)>,
-) -> Option<(String, u64)> {
-    STATE.with(|state| state.borrow().as_deref().and_then(read))
-}
-
-/// A Mac set up from another Mac's `<state>` (Migration Assistant, a network home) where a
-/// released aterm walked both pages: `<state>` holds exactly what v0.145.0's window wrote there
-/// (its Full Disk Access line, which names that Mac, and its Developer Tools marker's plain word,
-/// with no file beside either). The plain word names no Mac, and the Full Disk Access marker
-/// names another, so the walk starts by itself on this Mac over both pages. NEGATIVE CONTROL:
-/// the Mac that wrote them gets no walk, and neither does this Mac when no Full Disk Access
-/// opening tells whose the plain word is (the page came up there with no Full Disk Access page).
-#[test]
-fn a_mac_set_up_from_a_released_aterms_state_gets_its_first_walk() {
-    use atpkg::devtools::{DEVELOPER_TOOLS, FULL_DISK_ACCESS};
-    fn fda_opened_as(key: &str) -> Option<(String, u64)> {
-        from_state(|state| FULL_DISK_ACCESS.opened_as_in(state, &on_this_mac(key)))
-    }
-    fn fda_last_opened() -> Option<(String, u64)> {
-        from_state(|state| FULL_DISK_ACCESS.last_opened_in(state))
-    }
-    fn devtools_opened_as(key: &str) -> Option<(String, u64)> {
-        from_state(|state| DEVELOPER_TOOLS.opened_as_in(state, &on_this_mac(key)))
-    }
-    fn devtools_last_opened() -> Option<(String, u64)> {
-        from_state(|state| DEVELOPER_TOOLS.last_opened_in(state))
-    }
-    fn cold(mac: &'static str) -> App {
-        THIS_MAC.with(|this| this.set(mac));
-        let mut fda = test_arms::fda_opening();
-        fda.opened_as = fda_opened_as;
-        fda.last_opened = fda_last_opened;
-        let mut devtools = test_arms::marked_as(devtools_opened_as);
-        devtools.last_opened = devtools_last_opened;
-        let mut app = walk_app_with_fda(devtools, fda);
-        app.devtools_helper.note_cold_start();
-        app.user_input_recent = |_| true;
-        app
-    }
-    let dir = aterm_tempfile::tempdir().expect("a scratch <state>");
-    let state = dir.path();
-    // v0.145.0's `fda_page_brought_up` (`fda_opened_key`) and `mark_devtools_page_up`
-    // (`revision_key`) under revision 1 on Mac A: one line in each marker.
-    std::fs::write(
-        state.join("fda-pane-opened"),
-        format!("r1@com.aterm.aterm@{MAC_A} 1793163273\n"),
-    )
-    .expect("v0.145.0's Full Disk Access marker");
-    std::fs::write(state.join("devtools-pane-opened"), "r1 1793163534\n")
-        .expect("v0.145.0's Developer Tools marker");
-    STATE.with(|cell| *cell.borrow_mut() = Some(state.to_path_buf()));
-    let t0 = Instant::now();
-
-    let mut moved = cold(MAC_B);
-    moved.tick_permission_walk(t0);
-    assert_eq!(
-        moved
-            .permission_walk
-            .walk()
-            .map(|walk| walk.subjects().to_vec()),
-        Some(vec![Subject::FullDiskAccess, Subject::DeveloperTools]),
-        "Mac A's pages are not Mac B's"
-    );
-
-    let mut home = cold(MAC_A);
-    home.tick_permission_walk(t0);
-    assert!(!home.permission_walk.active(), "Mac A's own pages came up");
-
-    std::fs::remove_file(state.join("fda-pane-opened")).expect("no Full Disk Access page");
-    let mut unknown = cold(MAC_B);
-    unknown.tick_permission_walk(t0);
-    assert!(
-        !unknown.permission_walk.active(),
-        "nothing says whose the plain word is, so it may be this Mac's"
-    );
-    STATE.with(|cell| *cell.borrow_mut() = None);
-}
 
 /// The pages of a walk with System State's debugger step still to come.
 const LEFT: [Subject; 3] = [
@@ -3211,217 +2069,6 @@ fn a_quit_and_reopen_leaves_the_walks_pages_from_the_one_it_is_at() {
     idle.leave_walk_at_quit(true);
     assert!(!marker.exists(), "no walk under way");
     STATE.with(|cell| *cell.borrow_mut() = None);
-}
-
-/// The aterm System Settings' Quit & Reopen opens, on [`STATE`]: a cold start with the person at
-/// System State, Full Disk Access reading on, Developer Tools not, the debugger's step to come, and
-/// the access record holding the Developer Tools page handed this revision. `<state>` holds the
-/// Full Disk Access opening of the walk in the process that quit (the tests' key names no Mac),
-/// so the look starts no first walk by itself (`App::fresh_mac`).
-fn reopened_aterm() -> App {
-    use atpkg::devtools::FULL_DISK_ACCESS;
-    fn fda_opened_as(key: &str) -> Option<(String, u64)> {
-        from_state(|state| FULL_DISK_ACCESS.opened_as_in(state, key))
-    }
-    fn fda_last_opened() -> Option<(String, u64)> {
-        from_state(|state| FULL_DISK_ACCESS.last_opened_in(state))
-    }
-    let state = state().expect("a <state> named");
-    std::fs::write(
-        state.join("fda-pane-opened"),
-        format!(
-            "{} {}\n",
-            atpkg::devtools::revision_key(1),
-            aterm_time::unix_secs().expect("the clock")
-        ),
-    )
-    .expect("the Full Disk Access marker");
-    let mut fda = test_arms::fda_opening();
-    fda.opened_as = fda_opened_as;
-    fda.last_opened = fda_last_opened;
-    let mut app = with_debugger_step(walk_app_with_fda(test_arms::opening(), fda));
-    app.access_steps.set_reach(StepsReach {
-        handed: |_, access| access == Access::DeveloperTools,
-        ..app.access_steps.reach
-    });
-    app.devtools_helper.note_cold_start();
-    app.user_input_recent = |_| true;
-    grant_fda(&mut app);
-    app
-}
-
-/// The pages the walk under way has still to show.
-fn walk_ahead(app: &App) -> Option<Vec<Subject>> {
-    app.permission_walk.walk().map(|walk| walk.ahead().to_vec())
-}
-
-/// The aterm System Settings' Quit & Reopen opens is a cold start whose Full Disk Access page
-/// came up before, so its look starts no first walk (`App::fresh_mac`). With the pages the walk
-/// in the process that quit left in `<state>`'s reopen marker, this bundle's on this Mac and
-/// within [`REOPEN_WITHIN`], its first look takes the marker and walks on: Full Disk Access,
-/// which reads held now, is left out, and Developer Tools' page opens at once, "Step 1 of 2"
-/// before the debugger's step, though the access record holds that page handed this revision
-/// (the walk's page is the owner's press). The marker is gone. A marker a dev bundle beside the
-/// release left, or another Mac on the same network home, starts nothing here and stays in
-/// place: the aterm on that Mac takes it and walks on. NEGATIVE CONTROL: with no marker, or one
-/// older than [`REOPEN_WITHIN`], the same aterm starts nothing, and the marker is gone.
-#[test]
-fn the_aterm_quit_and_reopen_opens_walks_on_though_its_pages_came_up_before() {
-    let dir = aterm_tempfile::tempdir().expect("a scratch <state>");
-    let state = dir.path();
-    STATE.with(|cell| *cell.borrow_mut() = Some(state.to_path_buf()));
-    let marker = state.join(REOPEN_MARKER);
-    let bundle = std::path::Path::new(BUNDLE);
-    let now = aterm_time::unix_secs().expect("the clock");
-    let t0 = Instant::now();
-
-    leave_reopen_in(state, now, &LEFT, bundle, MAC_A).expect("the reopen marker");
-    let mut app = reopened_aterm();
-    assert!(app.devtools_shown_this_revision(), "handed before the quit");
-    let opens = test_arms::opens();
-    app.tick_permission_walk(t0);
-    assert_eq!(
-        walk_ahead(&app),
-        Some(vec![Subject::DeveloperTools, Subject::Debugger]),
-        "the walk goes on"
-    );
-    assert_eq!(test_arms::opens(), opens + 1, "Developer Tools' page opens");
-    assert_eq!(
-        page_and_step(&app),
-        Some((Page::DeveloperTools, Some((1, 2))))
-    );
-    assert!(!marker.exists(), "the marker is taken");
-
-    let dev = std::path::Path::new("/Applications/aterm (dev).app");
-    for (left_by, on, why) in [
-        (dev, MAC_A, "a dev bundle's"),
-        (bundle, MAC_B, "another Mac's"),
-    ] {
-        leave_reopen_in(state, now, &LEFT, left_by, on).expect("the reopen marker");
-        let mut app = reopened_aterm();
-        let opens = test_arms::opens();
-        app.tick_permission_walk(t0);
-        assert!(!app.permission_walk.active(), "{why}: no walk");
-        assert_eq!(test_arms::opens(), opens, "{why}: no page");
-        assert!(marker.exists(), "{why}: left for the aterm it names");
-    }
-    THIS_MAC.with(|this| this.set(MAC_B));
-    let mut there = reopened_aterm();
-    there.tick_permission_walk(t0);
-    assert_eq!(
-        walk_ahead(&there),
-        Some(vec![Subject::DeveloperTools, Subject::Debugger]),
-        "the aterm on the Mac that quit walks on"
-    );
-    assert!(!marker.exists(), "and takes the marker");
-    THIS_MAC.with(|this| this.set(MAC_A));
-
-    let old = now - REOPEN_WITHIN.as_secs() - 1;
-    for (left, why) in [(None, "no marker"), (Some(old), "an older one")] {
-        if let Some(at) = left {
-            leave_reopen_in(state, at, &LEFT, bundle, MAC_A).expect("the reopen marker");
-        }
-        let mut app = reopened_aterm();
-        let opens = test_arms::opens();
-        app.tick_permission_walk(t0);
-        assert!(!app.permission_walk.active(), "{why}: no walk");
-        assert_eq!(test_arms::opens(), opens, "{why}: no page");
-        assert!(!marker.exists(), "{why}: no marker left");
-    }
-    STATE.with(|cell| *cell.borrow_mut() = None);
-}
-
-/// Pages a Quit & Reopen left wait in memory for the start's rules: the first look takes the
-/// marker while System State is away and starts nothing, a later look still starts nothing while
-/// the person types, and the first look with the keyboard at rest walks on. A walk that starts
-/// first (a person's press on a row here; the control verb's starts the same way) ends that
-/// wait: once it is over, no look walks on from the marker's pages.
-#[test]
-fn pages_quit_and_reopen_left_wait_for_the_start_and_give_way_to_a_walk_started_first() {
-    let dir = aterm_tempfile::tempdir().expect("a scratch <state>");
-    let state = dir.path();
-    STATE.with(|cell| *cell.borrow_mut() = Some(state.to_path_buf()));
-    let marker = state.join(REOPEN_MARKER);
-    let bundle = std::path::Path::new(BUNDLE);
-    let now = aterm_time::unix_secs().expect("the clock");
-    let t0 = Instant::now();
-
-    for press_first in [false, true] {
-        leave_reopen_in(state, now, &LEFT, bundle, MAC_A).expect("the reopen marker");
-        let mut app = reopened_aterm();
-        set_front(false);
-        app.tick_permission_walk(t0);
-        set_front(true);
-        assert!(!app.permission_walk.active(), "System State away");
-        assert!(!marker.exists(), "taken at the first look");
-        if press_first {
-            assert_eq!(
-                app.start_permission_walk(&[Subject::DeveloperTools], "a person's press", t0),
-                walking_over(&[Subject::DeveloperTools, Subject::Debugger])
-            );
-            // The press's walk goes past Developer Tools to the debugger's step, which waits up
-            // to UNREAD_WAIT for its rule's first reading, and is over.
-            let opens = test_arms::opens();
-            app.devtools_helper.press_for_test(PanelEvent::SwitchedOn);
-            app.tick_devtools_hand_over(t0 + GRANT_POLL);
-            let over = t0 + GRANT_POLL + UNREAD_WAIT;
-            app.drive_permission_walk(over);
-            assert!(!app.permission_walk.active());
-            assert!(app.devtools_helper.panel().is_none(), "its panel is gone");
-            app.tick_permission_walk(over + GRANT_POLL);
-            assert_eq!(walk_ahead(&app), None, "the press came first");
-            assert_eq!(test_arms::opens(), opens, "no page from the marker");
-            continue;
-        }
-        app.last_keystroke_at = Some(t0);
-        app.tick_permission_walk(t0 + GRANT_POLL);
-        assert_eq!(walk_ahead(&app), None, "a key typed just now");
-        app.tick_permission_walk(t0 + START_KEYS_QUIET);
-        assert_eq!(
-            walk_ahead(&app),
-            Some(vec![Subject::DeveloperTools, Subject::Debugger]),
-            "the keyboard at rest: the walk goes on"
-        );
-    }
-    STATE.with(|cell| *cell.borrow_mut() = None);
-}
-
-/// A walk that starts by itself leaves out a page the owner said Not now to (a re-ask after a
-/// decline is the automatic hand-over's, at a quiet moment), and does not start over another
-/// of the window's gestures. NEGATIVE CONTROL: a person's press over the same decline walks
-/// that page (`the_owners_not_now_holds_a_page_back_from_the_control_verbs_walk`).
-#[test]
-fn a_walk_by_itself_leaves_a_declined_page_and_never_starts_over_another_gesture() {
-    fn cold(devtools: crate::devtools_helper::Reach) -> App {
-        let mut app = walk_app_with(devtools);
-        app.devtools_helper.note_cold_start();
-        app.user_input_recent = |_| true;
-        app
-    }
-    let t0 = Instant::now();
-    let mut declined = cold(test_arms::declining());
-    declined.tick_permission_walk(t0);
-    assert_eq!(
-        declined
-            .permission_walk
-            .walk()
-            .map(|walk| walk.subjects().to_vec()),
-        Some(vec![Subject::FullDiskAccess]),
-        "Developer Tools was declined"
-    );
-
-    let mut busy = cold(test_arms::opening());
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a press's page, through its own door, is the gesture up"
-    )]
-    let opened = busy.open_fda_page(Origin::Settings, true, t0);
-    assert_eq!(opened, crate::devtools_helper::HandOver::Opened);
-    busy.tick_permission_walk(t0);
-    assert!(
-        !busy.permission_walk.active(),
-        "a press's panel is up: no walk over it"
-    );
 }
 
 /// The debugger is a page of the walk only while System State's once-per-Mac step is still to
@@ -3825,54 +2472,77 @@ fn a_persons_press_never_waits_behind_a_panel_out_of_sight() {
     assert!(app.permission_walk.active());
 }
 
-/// A first launch's walk that gave way to a person's press elsewhere is not spent: once the
-/// press's own gesture is over (here the Local Network pane's bounded hold) and a quiet moment
-/// comes with System State in front, the walk starts again by itself over the pages it never got
-/// past, its Full Disk Access page first, which comes up again. A press is no answer to a page
-/// the person never saw.
-/// NEGATIVE CONTROL: a give-way that spends the walk (every subject still read walked, as when it
-/// only ended the walk) never starts it again: Full Disk Access and Developer Tools then wait
-/// for a press on their rows.
+/// A control client's walk (`aterm doctor`, `aterm init`, `permissions walk now`) opens no page
+/// while System Settings shows a window of its own over its main one (its password window, Quit &
+/// Reopen's sheet): a page opened under that sheet is lost, its panel left beside the question.
+/// Its page comes up once the question is gone.
 #[test]
-fn a_walk_that_gave_way_starts_again_at_the_next_quiet_moment() {
+fn the_control_verbs_walk_opens_no_page_under_system_settings_sheet() {
     let t0 = Instant::now();
     let mut app = walk_app();
-    app.devtools_helper.note_cold_start();
-    app.user_input_recent = |_| true;
-    app.tick_permission_walk(t0);
-    let walking = || Some(vec![Subject::FullDiskAccess, Subject::DeveloperTools]);
-    assert_eq!(
-        app.permission_walk
-            .walk()
-            .map(|walk| walk.subjects().to_vec()),
-        walking()
-    );
-    assert_eq!(
-        page_and_step(&app),
-        Some((Page::FullDiskAccess, Some((1, 2))))
-    );
+    SETTINGS_ASKS.with(|asks| asks.set(true));
     let fda_opens = test_arms::fda_counts().0;
+    let started = app.ask_permission_walk(&[Subject::FullDiskAccess], t0);
+    app.tick_consent_lanes(t0 + GRANT_POLL);
+    assert_eq!(
+        test_arms::fda_counts().0,
+        fda_opens,
+        "no page under System Settings' own sheet ({started:?})"
+    );
+    SETTINGS_ASKS.with(|asks| asks.set(false));
+    app.tick_consent_lanes(t0 + GRANT_POLL * 2);
+    assert_eq!(
+        test_arms::fda_counts().0,
+        fda_opens + 1,
+        "the question gone, its page comes up"
+    );
+}
 
-    assert!(app.open_access_from_system_state(Access::LocalNetwork, true));
-    assert!(!app.permission_walk.active(), "it stepped aside");
-    app.tick_permission_walk(t0 + Duration::from_secs(1));
+/// A walk page held off (here behind the walk's own unanswered Automation question) ends the
+/// walk once it has waited as long as a panel stays up ([`PANEL_FOR`]) of the person's time at
+/// the Mac, as the rest of the walk counts it: twenty minutes with nobody there count nothing,
+/// and the walk is still there when they come back.
+/// NEGATIVE CONTROL: count the wall clock since the page fell due (`Walk::count_held_off`
+/// counting every gap): the walk ends while the person is away.
+#[test]
+fn a_held_off_walk_page_counts_only_the_persons_time() {
+    let t0 = Instant::now();
+    let mut app = walk_app();
+    assert_eq!(
+        app.start_permission_walk(&[Subject::Accessibility], "a test", t0),
+        walking_over(&[
+            Subject::Accessibility,
+            Subject::FullDiskAccess,
+            Subject::DeveloperTools
+        ])
+    );
+    AX_TRUSTED.with(|trusted| trusted.set(true));
+    app.tick_consent_lanes(t0 + GRANT_POLL);
+    assert!(AUTOMATION_OUT.with(Cell::get), "macOS's question is up");
+    let step = Duration::from_secs(30);
+    let mut now = t0 + GRANT_POLL + DONE_FOR;
+    app.user_input_recent = |_| false;
+    while now < t0 + PANEL_FOR * 2 {
+        app.tick_consent_lanes(now);
+        now += step;
+    }
+    assert!(
+        app.permission_walk.active(),
+        "twenty minutes away count nothing toward the held-off page's bound"
+    );
+    app.user_input_recent = |within| within >= Duration::from_secs(5);
+    let back = now;
+    while now <= back + PANEL_FOR + step && app.permission_walk.active() {
+        app.tick_consent_lanes(now);
+        now += step;
+    }
     assert!(
         !app.permission_walk.active(),
-        "not over the pane's own hold"
+        "ten minutes of the person's time with the page held off end the walk"
     );
-
-    let quiet = Instant::now() + crate::system_state_access::PANE_HOLD + Duration::from_secs(1);
-    app.tick_permission_walk(quiet);
-    assert_eq!(
-        app.permission_walk
-            .walk()
-            .map(|walk| walk.subjects().to_vec()),
-        walking(),
-        "the pages it never got past"
+    assert!(
+        now > back + PANEL_FOR - step,
+        "not before ten minutes of theirs"
     );
-    assert_eq!(test_arms::fda_counts().0, fda_opens + 1, "its page again");
-    assert_eq!(
-        page_and_step(&app),
-        Some((Page::FullDiskAccess, Some((1, 2))))
-    );
+    AUTOMATION_OUT.with(|out| out.set(false));
 }

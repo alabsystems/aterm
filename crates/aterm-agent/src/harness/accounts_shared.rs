@@ -39,9 +39,13 @@ pub struct Intent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome {
     Pending,
+    /// The provider proved no external sign-in started; this exact attempt may resume.
+    NotStarted,
     Unknown,
     Held,
-    Published { generation: u64 },
+    Published {
+        generation: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,8 +55,8 @@ pub struct Attempt {
     pub finished_at: Option<i64>,
 }
 
-/// One in-memory completion handle. No clone or public constructor permits a
-/// second completion; the retained state still fences stale handles on reload.
+/// One in-memory completion handle. Recovery may reconstruct the exact pending
+/// handle; retained state still refuses every completion after the first.
 pub struct Token {
     source: Source,
     decision: [u8; 32],
@@ -137,8 +141,81 @@ impl State {
             .map(|(source, _)| *source)
     }
 
+    /// A provider proof cannot replace a retained identity or use another source's identity.
+    pub(in crate::harness) fn principal_allowed(
+        &self,
+        source: Source,
+        principal: [u8; 32],
+    ) -> bool {
+        principal != [0; 32]
+            && self
+                .pins
+                .get(&source)
+                .is_some_and(|pin| pin.principal.is_none_or(|old| old == principal))
+            && self
+                .principal_source(principal)
+                .is_none_or(|owner| owner == source)
+    }
+
+    pub(in crate::harness) fn staging_paths(&self) -> impl Iterator<Item = &str> {
+        self.pins
+            .values()
+            .map(|pin| pin.attempt.intent.staging.as_str())
+    }
+
     pub fn latest(&self, source: Source) -> Option<&Attempt> {
         self.pins.get(&source).map(|pin| &pin.attempt)
+    }
+
+    /// Recover the exact unfinished attempt. Only an explicitly retained
+    /// `NotStarted` result permits its provider action to resume.
+    pub fn pending_token(&self, source: Source, decision: [u8; 32]) -> Option<Token> {
+        let attempt = self.latest(source)?;
+        (matches!(attempt.outcome, Outcome::Pending | Outcome::NotStarted)
+            && attempt.intent.decision == decision)
+            .then_some(Token {
+                source,
+                decision,
+                request: attempt.intent.request,
+            })
+    }
+
+    /// Retain a typed provider proof that no external sign-in started. This
+    /// records a fact even if authority became unavailable; resuming requires
+    /// the caller's fresh root and local authority checks.
+    pub(in crate::harness) fn not_started(&mut self, token: &Token, at: i64) -> Result<(), String> {
+        let pin = self
+            .pins
+            .get_mut(&token.source)
+            .ok_or("shared preparation is absent")?;
+        if pin.attempt.intent.decision != token.decision
+            || pin.attempt.intent.request != token.request
+            || pin.attempt.outcome != Outcome::Pending
+            || at <= 0
+        {
+            return Err("shared no-effect result is stale".into());
+        }
+        pin.attempt.outcome = Outcome::NotStarted;
+        pin.attempt.finished_at = Some(at);
+        Ok(())
+    }
+
+    /// Re-arm only the same provably unstarted attempt before another provider
+    /// call. An uncertain or completed attempt can never enter this transition.
+    pub(in crate::harness) fn resume_not_started(&mut self, token: &Token) -> Result<(), String> {
+        let pin = self
+            .pins
+            .get_mut(&token.source)
+            .ok_or("shared preparation is absent")?;
+        if pin.attempt.intent.decision != token.decision
+            || pin.attempt.intent.request != token.request
+            || pin.attempt.outcome != Outcome::NotStarted
+        {
+            return Err("shared attempt has no retained no-effect proof".into());
+        }
+        pin.attempt.outcome = Outcome::Pending;
+        pin.attempt.finished_at = None;
+        Ok(())
     }
 
     /// Reject consumed generations and conflicting identity constraints before
@@ -205,10 +282,7 @@ impl State {
         pin.attempt.intent.label == row.label
             && pin.attempt.intent.staging == staging
             && pin.attempt.intent.before_generation == parent.generation
-            && matches!(
-                pin.attempt.outcome,
-                Outcome::Pending | Outcome::Published { .. }
-            )
+            && pin.attempt.outcome == Outcome::Pending
             && principal.is_some_and(|p| pin.principal.is_none_or(|old| old == p))
     }
 
@@ -232,19 +306,18 @@ impl State {
             return Ok(());
         };
         let attempt = &self.pins[&source].attempt;
-        if attempt.outcome != Outcome::Pending {
-            return Err("shared preparation checkpoint is already completed".into());
+        if !super::email_matches(&checkpoint.email, &attempt.intent.identity) {
+            return Err("shared preparation checkpoint has a different identity".into());
         }
         let token = Token {
             source,
             decision: attempt.intent.decision,
             request: attempt.intent.request,
         };
-        let email = attempt.intent.identity.clone();
         self.finish(
             token,
             Outcome::Published { generation },
-            principal.map(|p| (email.as_str(), p)),
+            principal.map(|p| (checkpoint.email.as_str(), p)),
             checkpoint.checked_at,
         )
     }
@@ -329,7 +402,7 @@ impl State {
         if pin.attempt.intent.decision != token.decision
             || pin.attempt.intent.request != token.request
             || pin.attempt.outcome != Outcome::Pending
-            || outcome == Outcome::Pending
+            || matches!(outcome, Outcome::Pending | Outcome::NotStarted)
             || finished_at <= 0
         {
             return Err("shared preparation completion is stale".into());
@@ -339,12 +412,8 @@ impl State {
                 .ok_or_else(|| "shared preparation has no proved provider identity".to_owned())?;
             if generation == 0
                 || generation <= pin.attempt.intent.before_generation.unwrap_or(0)
-                || principal == [0; 32]
                 || identity(email)? != pin.attempt.intent.identity
-                || pin.principal.is_some_and(|old| old != principal)
-                || self
-                    .principal_source(principal)
-                    .is_some_and(|source| source != token.source)
+                || !self.principal_allowed(token.source, principal)
             {
                 return Err("shared preparation proved another account or generation".into());
             }
@@ -370,7 +439,10 @@ impl State {
                     && (new.attempt.intent.generation > old.attempt.intent.generation
                         || (new.attempt.intent == old.attempt.intent
                             && (new.attempt == old.attempt
-                                || old.attempt.outcome == Outcome::Pending)))
+                                || old.attempt.outcome == Outcome::Pending
+                                || (old.attempt.outcome == Outcome::NotStarted
+                                    && new.attempt.outcome == Outcome::Pending
+                                    && new.attempt.finished_at.is_none()))))
             })
         })
     }
@@ -453,7 +525,7 @@ impl State {
         use aterm_codec::hex::encode_lower as hex;
         Value::Array(self.pins.iter().map(|(source,pin)| {
             let i=&pin.attempt.intent;
-            let (outcome,generation)=match pin.attempt.outcome {Outcome::Pending=>("pending",None),Outcome::Unknown=>("unknown",None),Outcome::Held=>("held",None),Outcome::Published {generation}=>("published",Some(generation))};
+            let (outcome,generation)=match pin.attempt.outcome {Outcome::Pending=>("pending",None),Outcome::NotStarted=>("not-started",None),Outcome::Unknown=>("unknown",None),Outcome::Held=>("held",None),Outcome::Published {generation}=>("published",Some(generation))};
             json!({"network":hex(&source.network),"account":hex(&source.account),"labels":pin.labels.iter().collect::<Vec<_>>(),"identities":pin.identities.iter().collect::<Vec<_>>(),
                 "principal":pin.principal.as_ref().map(|p|hex(p)),"decision":hex(&i.decision),"generation":i.generation,"configuration":hex(&i.configuration),
                 "request":hex(&i.request),"label":i.label,"identity":i.identity,"staging":i.staging,"before_generation":i.before_generation,
@@ -545,6 +617,7 @@ impl State {
             let published = optional_u64(&row["published_generation"])?;
             let outcome = match (word("outcome")?, published) {
                 ("pending", None) => Outcome::Pending,
+                ("not-started", None) => Outcome::NotStarted,
                 ("unknown", None) => Outcome::Unknown,
                 ("held", None) => Outcome::Held,
                 ("published", Some(generation))

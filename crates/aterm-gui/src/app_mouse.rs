@@ -851,6 +851,8 @@ pub(crate) enum PointerAction {
         col: u16,
     },
     MoveNative(NativePointerTarget),
+    /// The centre of the open overlay card's row for item `n` ([`App::overlay_card_item_px`]).
+    MoveItem(usize),
     MoveChrome {
         up: u16,
         col: u16,
@@ -975,6 +977,43 @@ impl App {
         let local_x = (frame_x - transform.origin_x) / f64::from(transform.scale);
         let local_y = (frame_y - transform.origin_y) / f64::from(transform.scale);
         Some((transform, local_x as f32, local_y as f32))
+    }
+
+    /// The window pixel at the centre of the open card's row for `item` — the palette's filtered
+    /// row, as `menu` counts `selected=`, or the Overview's item, as `controls overview` counts
+    /// it — where a person's pointer selects that row, or why there is none.
+    pub(crate) fn overlay_card_item_px(
+        &self,
+        wid: WindowId,
+        item: usize,
+    ) -> Result<(f64, f64), String> {
+        let window = self.windows.get(&wid).ok_or("no window")?;
+        if window.palette().is_none() && window.overview().is_none() {
+            return Err("no palette or Overview is open".into());
+        }
+        let transform = self
+            .overlay_coordinate_transform(wid)
+            .ok_or("the open card has no room in the window")?;
+        let local = match (window.palette(), window.overview()) {
+            (Some(palette), _) => {
+                crate::palette::palette_row_centre(palette, &transform.geom, item)
+            }
+            (None, Some(card)) => {
+                crate::overview::overview_item_centre(card, &transform.geom, item)
+            }
+            (None, None) => None,
+        };
+        let (x, y) = local.ok_or_else(|| format!("item {item} is not a row the card shows"))?;
+        let (ox, oy) = self.frame_origin(wid);
+        let scale = f64::from(transform.scale);
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "window pixel coordinates; the f64 mantissa covers every representable window size"
+        )]
+        Ok((
+            ox as f64 + transform.origin_x + f64::from(x) * scale,
+            oy as f64 + transform.origin_y + f64::from(y) * scale,
+        ))
     }
 
     /// Keep the OS cursor aligned with an overlay card's hover.
@@ -1933,6 +1972,7 @@ impl App {
             action,
             PointerAction::Move { .. }
                 | PointerAction::MoveNative(_)
+                | PointerAction::MoveItem(_)
                 | PointerAction::Click
                 | PointerAction::Wheel { .. }
         ) {
@@ -1940,7 +1980,10 @@ impl App {
         }
         if matches!(
             action,
-            PointerAction::Move { .. } | PointerAction::MoveChrome { .. } | PointerAction::Click
+            PointerAction::Move { .. }
+                | PointerAction::MoveItem(_)
+                | PointerAction::MoveChrome { .. }
+                | PointerAction::Click
         ) {
             let _ = self.lay_glassless_terminal_chrome(wid);
         }
@@ -1993,6 +2036,10 @@ impl App {
                 let (x, y) = self
                     .cell_centre_px(wid, row, col)
                     .ok_or("cell is outside the grid")?;
+                self.on_cursor_moved(wid, x, y);
+            }
+            PointerAction::MoveItem(item) => {
+                let (x, y) = self.overlay_card_item_px(wid, item)?;
                 self.on_cursor_moved(wid, x, y);
             }
             PointerAction::MoveChrome { up, col } => {
@@ -8791,6 +8838,83 @@ mod tests {
         }
     }
 
+    /// `pointer move item=<n>` aims where the hover reads row `n` back on a window whose frame
+    /// sits inside a larger window (a non-zero frame origin), on the terminal route and over a
+    /// Settings page on a Retina window, where the card's geometry is points the transform scales
+    /// by 2: each aim, read back through the hover's own path ([`App::overlay_card_point`]), is
+    /// the centre of that row and selects it (§14.16).
+    #[test]
+    fn an_item_aim_is_the_rows_centre_on_a_letterboxed_or_retina_window() {
+        use crate::{App, WindowId};
+        use aterm_window::dpi::PhysicalSize;
+
+        let wid = WindowId(0);
+        let letterbox = |app: &mut App| {
+            let (cw, ch) = app.win_cell_size(wid);
+            let (rows, cols) = {
+                let ws = &app.windows[&wid];
+                (
+                    usize::from(ws.rows) + usize::from(app.chrome_rows(wid)),
+                    usize::from(ws.cols),
+                )
+            };
+            let (pad, top) = (app.win_pad(wid), app.win_pad_top(wid) + app.win_head(wid));
+            app.windows.get_mut(&wid).expect("the window").win_px = Some(PhysicalSize::new(
+                (cols * cw + 2 * pad + cw - 1) as u32,
+                (rows * ch + top + pad + ch - 1) as u32,
+            ));
+            assert!(
+                app.frame_origin(wid).0 > 0,
+                "the frame sits inside its window"
+            );
+        };
+        let mut terminal = App::headless_for_test();
+        terminal
+            .windows
+            .get_mut(&wid)
+            .expect("the window")
+            .input_scratch
+            .cells = vec![Vec::new(); 24];
+        terminal.palette_enter();
+        letterbox(&mut terminal);
+        let mut retina = App::headless_for_test();
+        assert!(retina.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        retina.windows.get_mut(&wid).expect("the window").scale = 2.0;
+        retina.palette_enter();
+        letterbox(&mut retina);
+        assert_eq!(
+            retina.overlay_coordinate_transform(wid).map(|t| t.scale),
+            Some(2.0),
+            "over a page the card's points are scaled to the window's pixels"
+        );
+        for (what, app) in [
+            ("letterboxed", &terminal),
+            ("Retina, over Settings", &retina),
+        ] {
+            let palette = app.windows[&wid].palette().expect("the open palette");
+            let mut rows = 0;
+            while let Ok((x, y)) = app.overlay_card_item_px(wid, rows) {
+                let (t, lx, ly) = app
+                    .overlay_card_point(wid, x, y)
+                    .expect("the card's transform");
+                let (cx, cy) = crate::palette::palette_row_centre(palette, &t.geom, rows)
+                    .expect("a row the card shows");
+                assert!(
+                    (lx - cx).abs() < 1e-3 && (ly - cy).abs() < 1e-3,
+                    "{what}: item {rows} aims at ({x}, {y}), which the hover reads as card point \
+                     ({lx}, {ly}), not the row's centre ({cx}, {cy})"
+                );
+                assert_eq!(
+                    app.palette_row_at_pointer(wid, x, y),
+                    Some(rows),
+                    "{what}: item {rows}"
+                );
+                rows += 1;
+            }
+            assert!(rows >= 3, "{what}: the card shows {rows} rows");
+        }
+    }
+
     #[test]
     fn click_below_terminal_palette_is_swallowed_without_starting_selection() {
         use crate::{App, WindowId};
@@ -9315,55 +9439,6 @@ mod tests {
             right_press_plan(false, false, false, false),
             RightPressPlan::Seam
         );
-    }
-
-    #[test]
-    fn pointer_reaches_reserved_header_pixels_without_regridding() {
-        let mut app = crate::App::headless_for_test();
-        let wid = crate::WindowId(0);
-        let (_, ch) = app.win_cell_size(wid);
-        let head = 18 * ch + ch / 3;
-        app.windows.get_mut(&wid).unwrap().metrics.head = head;
-        app.backend.set_head(head);
-        let before = (
-            app.windows[&wid].rows,
-            app.windows[&wid].cols,
-            app.chrome_rows(wid),
-        );
-        let rows = (head + usize::from(before.2) * ch).div_ceil(ch);
-        for up in 1..=rows {
-            let up = u16::try_from(up).unwrap();
-            assert_eq!(
-                app.pointer_cmd(PointerAction::MoveChrome { up, col: 3 }),
-                Ok(Some((-i32::from(up), 3))),
-            );
-            let y = app.windows[&wid].last_cursor_px.1;
-            assert!(y >= app.win_pad_top(wid) as f64);
-            assert!(y < (app.win_pad_top(wid) + head + usize::from(before.2) * ch) as f64);
-        }
-        assert!(
-            app.pointer_cmd(PointerAction::MoveChrome {
-                up: u16::try_from(rows + 1).unwrap(),
-                col: 3,
-            })
-            .is_err()
-        );
-        assert_eq!(
-            (
-                app.windows[&wid].rows,
-                app.windows[&wid].cols,
-                app.chrome_rows(wid)
-            ),
-            before
-        );
-        let id = app.post_message(toolchain_row());
-        let col = u16::try_from(capsule_col(&app, wid)).unwrap();
-        assert_eq!(
-            app.pointer_cmd(PointerAction::MoveChrome { up: 1, col }),
-            Ok(Some((-1, col))),
-        );
-        app.pointer_cmd(PointerAction::Click).unwrap();
-        assert_eq!(acted(&app, id), Some(aterm_messages::ActionIndex(0)));
     }
 
     #[test]
@@ -11203,859 +11278,6 @@ mod tests {
         let ch = app.win_cell_size(wid).1 as f64;
         assert!(app.selection_autoscroll(wid, -4.0 * ch));
         assert_eq!(crate::term_lock(&term).grid().display_offset(), 6);
-    }
-
-    fn band_pixel(app: &crate::App, wid: crate::WindowId) -> impl Fn(usize) -> (f64, f64) + use<> {
-        let (cw, ch) = app.win_cell_size(wid);
-        let pad = app.win_pad(wid) as f64;
-        let top = (app.win_pad_top(wid) + app.win_head(wid)) as f64
-            + f64::from(app.tab_strip_rows) * ch as f64;
-        move |col: usize| (pad + (col as f64 + 0.5) * cw as f64, top + ch as f64 * 0.5)
-    }
-
-    fn toolchain_row() -> aterm_messages::Message {
-        aterm_messages::Message::new(
-            aterm_messages::tags::TOOLCHAIN,
-            aterm_messages::Severity::Info,
-            "Installing ALab toolchain",
-        )
-        .line("trust — extracting")
-        .action(aterm_messages::Intent::OpenSettings {
-            route: "/packages".into(),
-        })
-        .hold(aterm_messages::Hold::Live {
-            stale_after: aterm_messages::STALE_TAILED,
-        })
-    }
-
-    fn band_row(app: &crate::App, wid: crate::WindowId) -> aterm_messages::RowLayout {
-        let cols = usize::from(app.windows[&wid].cols);
-        app.band_presentation(cols).rows[0].clone()
-    }
-
-    fn capsule_col(app: &crate::App, wid: crate::WindowId) -> usize {
-        band_row(app, wid)
-            .capsules
-            .iter()
-            .find(|c| !c.action.is_details())
-            .expect("an authored capsule")
-            .col
-            + 1
-    }
-
-    fn acted(
-        app: &crate::App,
-        id: aterm_messages::MessageId,
-    ) -> Option<aterm_messages::ActionIndex> {
-        app.messages.live(id).and_then(|l| l.acted.map(|(k, _)| k))
-    }
-
-    fn settings_route(
-        app: &crate::App,
-        wid: crate::WindowId,
-    ) -> Option<crate::native_settings::SettingsRoute> {
-        let (_, view) = app.active_native_view(wid)?;
-        match app.native_runtime.view_state(view)? {
-            crate::native_app::AppViewState::Settings(state) => Some(state.route),
-            _ => None,
-        }
-    }
-
-    fn selected_message(app: &crate::App, wid: crate::WindowId) -> Option<u64> {
-        let (_, view) = app.active_native_view(wid)?;
-        match app.native_runtime.view_state(view)? {
-            crate::native_app::AppViewState::Settings(state) => state.messages_selected,
-            _ => None,
-        }
-    }
-
-    #[test]
-    fn a_press_on_a_band_capsule_performs_its_intent_and_stops_there() {
-        use aterm_window::event::{ElementState, MouseButton as WinitMouseButton};
-        let mut app = crate::App::headless_for_test();
-        let wid = crate::WindowId(0);
-        let id = app.post_message(toolchain_row());
-        assert_eq!(app.message_band_rows, 1);
-        assert_eq!(
-            settings_route(&app, wid),
-            None,
-            "a terminal fronts the window"
-        );
-        let at = band_pixel(&app, wid);
-        let (x, y) = at(capsule_col(&app, wid));
-        app.on_cursor_moved(wid, x, y);
-        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
-        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
-        assert!(
-            app.messages.live(id).is_some(),
-            "an OpenSettings press keeps the row"
-        );
-        assert_eq!(
-            acted(&app, id),
-            Some(aterm_messages::ActionIndex(0)),
-            "the engine recorded the press"
-        );
-        assert_eq!(
-            settings_route(&app, wid),
-            Some(crate::native_settings::SettingsRoute::Packages),
-            "Settings ▸ Packages opened in the pressed window"
-        );
-        {
-            let ws = &app.windows[&wid];
-            assert!(
-                !ws.selecting && ws.held_mouse_button.is_none(),
-                "the press never reached the grid"
-            );
-        }
-
-        let ch = app.win_cell_size(wid).1 as f64;
-        assert!(
-            !app.press_band_at(wid, x, y + ch),
-            "one row below the band is the grid's"
-        );
-
-        let mut app = crate::App::headless_for_test();
-        let id = app.post_message(toolchain_row());
-        let details = band_row(&app, wid)
-            .capsules
-            .into_iter()
-            .find(|c| c.action.is_details())
-            .expect("the row's Details \u{203a}");
-        let at = band_pixel(&app, wid);
-        let (x, y) = at(details.col + 1);
-        assert!(app.press_band_at(wid, x, y));
-        assert_eq!(acted(&app, id), None);
-        assert_eq!(selected_message(&app, wid), Some(id.raw()));
-    }
-
-    #[test]
-    fn a_press_on_the_paste_question_over_the_band_answers_no_first() {
-        let mut app = crate::App::headless_for_test();
-        let wid = crate::WindowId(0);
-        app.prepare_terminal_capture_grid(wid)
-            .expect("the scratch composes headless");
-        let id = app.post_message(toolchain_row());
-        let question = |wid: crate::WindowId| {
-            crate::paste_banner::PendingPaste::new(
-                wid,
-                Some(0),
-                "line one\nline two\n".to_string(),
-                crate::input::Source::Human,
-                crate::input::PasteFraming::AtDrain,
-            )
-        };
-        app.paste_banner = Some(question(wid));
-        assert!(
-            app.paste_banner_tray_floor_y(wid) > 0,
-            "the question owns the top rows of this window"
-        );
-        let at = band_pixel(&app, wid);
-        let (x, y) = at(capsule_col(&app, wid));
-        assert!(app.press_band_at(wid, x, y), "consumed");
-        assert!(app.paste_banner.is_none(), "the question is answered: no");
-        assert_eq!(
-            acted(&app, id),
-            None,
-            "the capsule under the question was not pressed"
-        );
-        assert_eq!(settings_route(&app, wid), None);
-        assert!(app.press_band_at(wid, x, y));
-        assert_eq!(
-            acted(&app, id),
-            Some(aterm_messages::ActionIndex(0)),
-            "answered, the same press is the capsule's"
-        );
-
-        let mut app = crate::App::headless_for_test();
-        app.prepare_terminal_capture_grid(wid)
-            .expect("the scratch composes headless");
-        let id = app.post_message(toolchain_row());
-        app.paste_banner = Some(question(crate::WindowId(7)));
-        assert_eq!(
-            app.paste_banner_tray_floor_y(wid),
-            0,
-            "another window's question owns none of this window's rows"
-        );
-        let at = band_pixel(&app, wid);
-        let (x, y) = at(capsule_col(&app, wid));
-        assert!(app.press_band_at(wid, x, y));
-        assert_eq!(acted(&app, id), Some(aterm_messages::ActionIndex(0)));
-        assert!(
-            app.paste_banner.is_some(),
-            "the other window's question stands"
-        );
-
-        let mut app = crate::App::headless_for_test();
-        app.prepare_terminal_capture_grid(wid)
-            .expect("the scratch composes headless");
-        assert_eq!(app.message_band_rows, 0, "no band row is committed");
-        app.paste_banner = Some(question(wid));
-        assert!(
-            app.paste_banner_tray_floor_y(wid) > 0,
-            "the question owns the top rows without a band under it"
-        );
-        let at = band_pixel(&app, wid);
-        let (x, y) = at(4);
-        assert!(
-            app.press_band_at(wid, x, y),
-            "consumed: the question's answer"
-        );
-        assert!(app.paste_banner.is_none(), "answered: no");
-        assert_eq!(settings_route(&app, wid), None);
-        app.paste_banner = Some(question(wid));
-        let ch = app.win_cell_size(wid).1 as f64;
-        let cols = app.windows[&wid].cols as usize;
-        let rows = app.paste_banner.as_ref().map_or(0, |p| p.wanted_rows(cols)) as f64;
-        assert!(
-            !app.press_band_at(wid, x, y + rows * ch),
-            "below the question, with no band: nobody's press"
-        );
-        assert!(app.paste_banner.is_some(), "the question stands");
-    }
-
-    #[test]
-    fn band_capsules_work_on_a_window_fronting_settings() {
-        use aterm_window::event::{ElementState, MouseButton as WinitMouseButton};
-        let mut app = crate::App::headless_for_test();
-        let wid = crate::WindowId(0);
-        assert!(app.open_settings_tab_in_window(wid, crate::native_settings::SettingsRoute::Home));
-        assert_eq!(
-            settings_route(&app, wid),
-            Some(crate::native_settings::SettingsRoute::Home),
-            "Settings fronts the window"
-        );
-        let id = app.post_message(toolchain_row());
-        assert_eq!(app.message_band_rows, 1);
-        let at = band_pixel(&app, wid);
-        let (x, y) = at(capsule_col(&app, wid));
-        app.on_cursor_moved(wid, x, y);
-        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
-        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
-        assert_eq!(
-            acted(&app, id),
-            Some(aterm_messages::ActionIndex(0)),
-            "the band took the press over the native view"
-        );
-        assert_eq!(
-            settings_route(&app, wid),
-            Some(crate::native_settings::SettingsRoute::Packages),
-            "the same Settings tab, now on Packages"
-        );
-    }
-
-    #[test]
-    fn a_pointer_over_the_chrome_above_a_native_page_reads_back_the_chrome_row() {
-        use super::PointerAt;
-        let (mut app, wid, _) =
-            settings_at_1000_by_600(crate::native_settings::SettingsRoute::KeyboardInput);
-        let _ = app.post_message(toolchain_row());
-        assert!(app.chrome_rows(wid) >= 1, "the band holds a chrome row");
-        let col = u16::try_from(capsule_col(&app, wid)).unwrap();
-        let cell = app
-            .pointer_cmd(PointerAction::MoveChrome { up: 1, col })
-            .expect("the band's row is a chrome row");
-        assert_eq!(cell, Some((-1, col)));
-        assert!(
-            app.windows[&wid].band_hover.is_some(),
-            "the band is hovered"
-        );
-        match app.pointer_reply(cell) {
-            Ok(PointerAt::Grid { cell: at, .. }) => assert_eq!(at, (-1, col)),
-            other => panic!("the reply is the chrome cell: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn the_pointer_verb_reaches_the_band_and_clicks_a_capsule() {
-        use crate::message_band::{BandHover, HoverTarget};
-        let mut app = crate::App::headless_for_test();
-        let wid = crate::WindowId(0);
-        assert_eq!(
-            app.pointer_cmd(PointerAction::Click),
-            Err("the pointer holds no position (move it first)".to_string())
-        );
-        let id = app.post_message(toolchain_row());
-        assert_eq!(app.message_band_rows, 1);
-        let chrome = app.chrome_rows(wid);
-        assert_eq!(
-            app.pointer_cmd(PointerAction::MoveChrome {
-                up: chrome + 1,
-                col: 0
-            }),
-            Err("cell is outside the chrome rows".to_string())
-        );
-        assert_eq!(app.pointer_cmd(PointerAction::Status), Ok(None));
-        let col = capsule_col(&app, wid);
-        let col16 = u16::try_from(col).unwrap();
-        assert_eq!(
-            app.pointer_cmd(PointerAction::MoveChrome { up: 1, col: col16 }),
-            Ok(Some((-1, col16))),
-            "the band's row, read back where the pointer is"
-        );
-        assert_eq!(
-            app.windows[&wid].band_hover,
-            Some(BandHover {
-                row: 0,
-                target: HoverTarget::Capsule(aterm_messages::ActionIndex(0))
-            }),
-            "the capsule is lit, as under a hand"
-        );
-        assert_eq!(acted(&app, id), None);
-        assert_eq!(app.pointer_cmd(PointerAction::Click), Ok(Some((-1, col16))));
-        assert_eq!(
-            acted(&app, id),
-            Some(aterm_messages::ActionIndex(0)),
-            "the click pressed the capsule"
-        );
-        let (_, y) = band_pixel(&app, wid)(col);
-        assert!((app.windows[&wid].last_cursor_px.1 - y).abs() < 1.0);
-        assert!(app.pointer_cmd(PointerAction::Leave).is_ok());
-        assert_eq!(app.windows[&wid].band_hover, None, "off the band, unlit");
-    }
-
-    #[test]
-    fn a_pointer_click_on_a_capsule_spends_the_bands_press_budget() {
-        use aterm_messages::wire::spend_press;
-        let mut app = crate::App::headless_for_test();
-        let wid = crate::WindowId(0);
-        app.post_message(toolchain_row());
-        let col = u16::try_from(capsule_col(&app, wid)).unwrap();
-        assert!(
-            app.pointer_cmd(PointerAction::MoveChrome { up: 1, col })
-                .is_ok()
-        );
-        assert!(app.pointer_cmd(PointerAction::Click).is_ok());
-        let now = std::time::Instant::now();
-        for _ in 0..9 {
-            assert!(spend_press(&mut app.wire_gate, now).is_ok());
-        }
-        assert!(
-            spend_press(&mut app.wire_gate, now).is_err(),
-            "the click took one of the ten"
-        );
-        let mut app = crate::App::headless_for_test();
-        let id = app.post_message(toolchain_row());
-        let col = u16::try_from(capsule_col(&app, wid)).unwrap();
-        for _ in 0..10 {
-            assert!(spend_press(&mut app.wire_gate, now).is_ok());
-        }
-        assert!(
-            app.pointer_cmd(PointerAction::MoveChrome { up: 1, col })
-                .is_ok()
-        );
-        let refused = app
-            .pointer_cmd(PointerAction::Click)
-            .expect_err("no press left in the window");
-        assert!(
-            refused.starts_with("busy notice: 10 presses a minute retry_ms="),
-            "{refused}"
-        );
-        assert_eq!(acted(&app, id), None, "a refused click presses nothing");
-        assert!(
-            app.pointer_cmd(PointerAction::Move { row: 3, col: 5 })
-                .is_ok()
-        );
-        assert!(app.pointer_cmd(PointerAction::Click).is_ok());
-    }
-
-    #[test]
-    fn a_details_press_opens_the_entry_in_the_clicked_window() {
-        let mut app = crate::App::headless_for_test();
-        let first = crate::WindowId(0);
-        let session = app.next_session_id;
-        let second = app.insert_logical_window(crate::stub_session(session), 24, 80);
-        assert_eq!(
-            app.frontmost_window,
-            Some(second),
-            "the new window is frontmost; the press below lands in the other one"
-        );
-        let id = app.post_message(toolchain_row());
-        assert_eq!(app.message_band_rows, 1);
-        let tabs = |app: &crate::App, wid: crate::WindowId| app.windows[&wid].tab_set.tabs().len();
-        assert_eq!((tabs(&app, first), tabs(&app, second)), (1, 1));
-
-        let at = band_pixel(&app, first);
-        let (x, y) = at(band_row(&app, first).title.0);
-        assert!(app.press_band_at(first, x, y), "consumed by the band");
-        assert_eq!(
-            settings_route(&app, first),
-            Some(crate::native_settings::SettingsRoute::Messages),
-            "Settings \u{25b8} Messages, in the pressed window"
-        );
-        assert_eq!(selected_message(&app, first), Some(id.raw()));
-        assert_eq!(
-            (tabs(&app, first), tabs(&app, second)),
-            (2, 1),
-            "the Settings tab went to the pressed window, not the frontmost one"
-        );
-        assert_eq!(settings_route(&app, second), None);
-        assert_eq!(acted(&app, id), None, "the body is no capsule");
-        assert!(
-            app.messages.live(id).is_some_and(|l| l.seen),
-            "the row is read and — a live meter — stays"
-        );
-
-        let at = band_pixel(&app, second);
-        let (x, y) = at(band_row(&app, second).title.0);
-        assert!(app.press_band_at(second, x, y));
-        assert_eq!(
-            settings_route(&app, second),
-            Some(crate::native_settings::SettingsRoute::Messages)
-        );
-        assert_eq!(selected_message(&app, second), Some(id.raw()));
-        assert_eq!((tabs(&app, first), tabs(&app, second)), (2, 2));
-        let (instance_a, view_a) = app
-            .active_native_view(first)
-            .expect("Settings fronts the first window");
-        let (instance_b, view_b) = app
-            .active_native_view(second)
-            .expect("Settings fronts the second window");
-        assert_eq!(instance_a, instance_b, "one Settings controller");
-        assert_ne!(view_a, view_b, "…presented by a view of each window's own");
-
-        let warning = app.post_message(
-            aterm_messages::Message::new(
-                aterm_messages::tags::CONFIG,
-                aterm_messages::Severity::Warn,
-                "aterm.toml: unknown key `foo`",
-            )
-            .line("at line 12"),
-        );
-        assert_eq!(app.message_band_rows, 2);
-        let cols = usize::from(app.windows[&first].cols);
-        let rows = app.band_presentation(cols).rows;
-        let row = rows
-            .iter()
-            .position(|r| matches!(r.kind, aterm_messages::RowKind::Message(m) if m == warning))
-            .expect("the warning is on the band");
-        let at = band_pixel(&app, first);
-        let ch = app.win_cell_size(first).1 as f64;
-        let (x, y) = at(rows[row].title.0);
-        assert!(app.press_band_at(first, x, y + row as f64 * ch));
-        assert_eq!(selected_message(&app, first), Some(warning.raw()));
-        assert_eq!(tabs(&app, first), 2, "one Settings tab per window");
-        assert_eq!(
-            selected_message(&app, second),
-            Some(id.raw()),
-            "the other window's view is its own"
-        );
-    }
-
-    #[test]
-    fn the_overflow_row_opens_the_page_unselected() {
-        use crate::message_band::{BandHover, HoverTarget};
-        let mut app = crate::App::headless_for_test();
-        let wid = crate::WindowId(0);
-        let ids: Vec<_> = (0..5)
-            .map(|i| {
-                app.post_message(
-                    aterm_messages::Message::new(
-                        aterm_messages::tags::CONFIG,
-                        aterm_messages::Severity::Warn,
-                        format!("config warning {i}"),
-                    )
-                    .line("why"),
-                )
-            })
-            .collect();
-        assert_eq!(app.message_band_rows, aterm_messages::MAX_ROWS);
-        let cols = usize::from(app.windows[&wid].cols);
-        let rows = app.band_presentation(cols).rows;
-        let overflow = rows
-            .iter()
-            .position(|r| matches!(r.kind, aterm_messages::RowKind::Overflow { .. }))
-            .expect("five rows on a three-row band: an overflow row");
-        let at = band_pixel(&app, wid);
-        let ch = app.win_cell_size(wid).1 as f64;
-        let dy = overflow as f64 * ch;
-        for col in [4, cols - 3] {
-            let (x, y) = at(col);
-            let target = app.band_hit_at(wid, x, y + dy).expect("on the band");
-            assert_eq!(
-                app.band_hover_for(wid, target),
-                Some(BandHover {
-                    row: overflow as u8,
-                    target: HoverTarget::Body
-                }),
-                "the link lights from column {col}"
-            );
-            assert!(app.press_band_at(wid, x, y + dy), "consumed by the band");
-            assert_eq!(
-                settings_route(&app, wid),
-                Some(crate::native_settings::SettingsRoute::Messages),
-                "Settings \u{25b8} Messages, in the pressed window (column {col})"
-            );
-            assert_eq!(
-                selected_message(&app, wid),
-                None,
-                "nothing expanded (column {col})"
-            );
-            assert_eq!(
-                app.windows[&wid].tab_set.tabs().len(),
-                2,
-                "the terminal and one Settings tab"
-            );
-        }
-        for id in &ids {
-            let live = app.messages.live(*id).expect("every row is still live");
-            assert!(!live.seen, "a link to the log reads no row");
-            assert_eq!(acted(&app, *id), None);
-        }
-        assert_eq!(app.message_band_rows, aterm_messages::MAX_ROWS);
-    }
-
-    #[test]
-    fn hover_over_the_body_lights_details() {
-        use crate::message_band::{BandHover, HoverTarget, paint_rows};
-        let mut app = crate::App::headless_for_test();
-        let wid = crate::WindowId(0);
-        app.post_message(toolchain_row());
-        let layout = band_row(&app, wid);
-        let packages = layout
-            .capsules
-            .iter()
-            .find(|c| !c.action.is_details())
-            .expect("Packages")
-            .clone();
-        let details = layout
-            .capsules
-            .iter()
-            .find(|c| c.action.is_details())
-            .expect("Details \u{203a}")
-            .clone();
-        let cols = usize::from(app.windows[&wid].cols);
-        let theme = aterm_render::Theme::default();
-        let c = crate::chrome_band::band_colors(theme);
-        let lit = |app: &crate::App, cap: &aterm_messages::CapsuleLayout| {
-            let p = app.band_presentation(cols);
-            let still =
-                app.messages
-                    .motion(&p, std::time::Instant::now(), aterm_messages::Look::STILL);
-            let painted = paint_rows(&p, theme, app.windows[&wid].band_hover, &still);
-            painted[0][cap.col].bg == c.capsule_hover
-                && painted[0][cap.col + 1].fg == c.capsule_hover_ink
-        };
-        let hover = |app: &crate::App| app.windows[&wid].band_hover;
-        let cursor = |app: &crate::App| {
-            let ws = &app.windows[&wid];
-            (ws.hover_pointer, ws.native_text_cursor)
-        };
-        assert_eq!(hover(&app), None);
-        assert!(
-            !lit(&app, &details) && !lit(&app, &packages),
-            "at rest nothing is lit"
-        );
-        let at = band_pixel(&app, wid);
-        let mut body_cols = vec![layout.title.0, layout.glyph.0];
-        body_cols.extend(layout.detail.as_ref().map(|(col, _)| *col));
-        for col in body_cols {
-            let (x, y) = at(col);
-            app.on_cursor_moved(wid, x, y);
-            assert_eq!(
-                hover(&app),
-                Some(BandHover {
-                    row: 0,
-                    target: HoverTarget::Body
-                }),
-                "column {col} is the body"
-            );
-            assert!(
-                lit(&app, &details),
-                "column {col}: the Details \u{203a} lights"
-            );
-            assert!(
-                !lit(&app, &packages),
-                "column {col}: the authored chip does not"
-            );
-            assert_eq!(cursor(&app), (true, false), "column {col}: the hand");
-        }
-        let (x, y) = at(packages.col + 1);
-        app.on_cursor_moved(wid, x, y);
-        assert_eq!(
-            hover(&app),
-            Some(BandHover {
-                row: 0,
-                target: HoverTarget::Capsule(packages.action)
-            })
-        );
-        assert!(lit(&app, &packages) && !lit(&app, &details));
-        assert_eq!(cursor(&app), (true, false), "the hand over a capsule");
-        let (x, y) = at(details.col + 1);
-        app.on_cursor_moved(wid, x, y);
-        assert_eq!(
-            hover(&app),
-            Some(BandHover {
-                row: 0,
-                target: HoverTarget::Capsule(aterm_messages::ActionIndex::DETAILS)
-            })
-        );
-        assert!(lit(&app, &details) && !lit(&app, &packages));
-        assert_eq!(cursor(&app), (true, false));
-        let ch = app.win_cell_size(wid).1 as f64;
-        let (x, y) = at(layout.title.0);
-        app.on_cursor_moved(wid, x, y + 2.0 * ch);
-        assert_eq!(hover(&app), None);
-        assert!(!lit(&app, &details) && !lit(&app, &packages));
-        assert_eq!(cursor(&app), (false, true), "the grid's I-beam");
-        let (x, y) = at(packages.col + 1);
-        app.on_cursor_moved(wid, x, y);
-        assert!(hover(&app).is_some());
-        app.on_cursor_left(wid);
-        assert_eq!(hover(&app), None, "leaving the window clears the lit chip");
-
-        let mut app = crate::App::headless_for_test();
-        app.post_message(
-            aterm_messages::Message::new(
-                aterm_messages::tags::CONFIG,
-                aterm_messages::Severity::Warn,
-                "aterm.toml: unknown key `foo`",
-            )
-            .line("at line 12"),
-        );
-        let layout = band_row(&app, wid);
-        assert_eq!(layout.capsules.len(), 1, "its Details \u{203a} alone");
-        let link = layout.capsules[0].clone();
-        assert!(link.action.is_details());
-        let at = band_pixel(&app, wid);
-        let (x, y) = at(layout.title.0);
-        app.on_cursor_moved(wid, x, y);
-        assert_eq!(
-            hover(&app),
-            Some(BandHover {
-                row: 0,
-                target: HoverTarget::Body
-            })
-        );
-        assert!(lit(&app, &link), "the body lights the row's one link");
-    }
-
-    #[test]
-    fn r44_hb7_a_pointer_click_that_presses_nothing_on_the_band_spends_nothing() {
-        use aterm_messages::wire::spend_press;
-        let blank_row_click = |app: &mut crate::App| {
-            let wid = crate::WindowId(0);
-            let id = app.post_message(toolchain_row());
-            assert!(app.withdraw_message(id));
-            assert_eq!(app.message_band_rows, 1, "the shrink waits out its quiet");
-            let (x, y) = band_pixel(app, wid)(4);
-            let target = app.band_hit_at(wid, x, y).expect("still the band");
-            assert!(
-                !app.band_press_acts(wid, target),
-                "a press there does nothing"
-            );
-            assert!(
-                app.pointer_cmd(PointerAction::MoveChrome { up: 1, col: 4 })
-                    .is_ok()
-            );
-            app.pointer_cmd(PointerAction::Click)
-        };
-        let mut app = crate::App::headless_for_test();
-        assert!(blank_row_click(&mut app).is_ok());
-        let now = std::time::Instant::now();
-        for k in 0..10 {
-            assert!(
-                spend_press(&mut app.wire_gate, now).is_ok(),
-                "press {k}: the click that pressed nothing spent one"
-            );
-        }
-        let mut app = crate::App::headless_for_test();
-        for _ in 0..10 {
-            assert!(spend_press(&mut app.wire_gate, now).is_ok());
-        }
-        let clicked = blank_row_click(&mut app);
-        assert!(clicked.is_ok(), "{clicked:?}");
-    }
-
-    #[test]
-    fn r44_review_a_withdrawn_rows_chip_goes_out_under_a_still_pointer() {
-        let mut app = crate::App::headless_for_test();
-        let wid = crate::WindowId(0);
-        let id = app.post_message(toolchain_row());
-        let packages = band_row(&app, wid).capsules[0].clone();
-        let (x, y) = band_pixel(&app, wid)(packages.col + 1);
-        app.on_cursor_moved(wid, x, y);
-        assert!(app.windows[&wid].band_hover.is_some(), "the chip is lit");
-        assert!(app.withdraw_message(id));
-        let under = app
-            .band_hit_at(wid, x, y)
-            .and_then(|target| app.band_hover_for(wid, target));
-        assert_eq!(under, None, "nothing a press acts on is under the pointer");
-        assert_eq!(
-            app.windows[&wid].band_hover, under,
-            "the withdrawn row's chip stayed lit"
-        );
-    }
-
-    #[test]
-    fn r44_review_a_native_fronts_hand_leaves_with_its_capsule_under_a_still_pointer() {
-        let mut app = crate::App::headless_for_test();
-        let wid = crate::WindowId(0);
-        assert!(
-            app.open_settings_tab_in_window(wid, crate::native_settings::SettingsRoute::Messages)
-        );
-        assert!(app.active_native_view(wid).is_some(), "a native front");
-        let id = app.post_message(toolchain_row());
-        let packages = band_row(&app, wid).capsules[0].clone();
-        let (x, y) = band_pixel(&app, wid)(packages.col + 1);
-        app.on_cursor_moved(wid, x, y);
-        assert!(app.windows[&wid].hover_pointer, "the hand over the capsule");
-        assert!(app.withdraw_message(id));
-        assert_eq!(app.message_band_rows, 1, "the shrink waits out its quiet");
-        let target = app.band_hit_at(wid, x, y).expect("still the band");
-        assert!(
-            !app.band_press_acts(wid, target),
-            "a press there does nothing now"
-        );
-        assert_eq!(app.windows[&wid].band_hover, None, "the chip went out");
-        assert!(
-            !app.windows[&wid].hover_pointer,
-            "the hand stood over a band row that presses nothing"
-        );
-    }
-
-    #[test]
-    fn a_band_press_over_a_mixed_splits_other_pane_presses_the_band() {
-        use crate::message_band::{BandHover, HoverTarget};
-        let mut app = crate::App::headless_for_test();
-        let wid = crate::WindowId(0);
-        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
-        app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Horizontal);
-        assert!(
-            app.focused_session_id(wid).is_some(),
-            "premise: the terminal half is focused"
-        );
-        let id = app.post_message(toolchain_row());
-        assert_eq!(app.message_band_rows, 1);
-        let col = u16::try_from(band_row(&app, wid).title.0).unwrap();
-        assert_eq!(
-            app.pointer_cmd(PointerAction::MoveChrome { up: 1, col }),
-            Ok(Some((-1, col)))
-        );
-        assert_eq!(
-            app.windows[&wid].band_hover,
-            Some(BandHover {
-                row: 0,
-                target: HoverTarget::Body
-            }),
-            "premise: the body is lit — its press is the band's Details"
-        );
-        assert!(app.pointer_cmd(PointerAction::Click).is_ok());
-        assert!(
-            app.messages.live(id).is_some_and(|l| l.seen),
-            "the band's Details press never happened: the click went to the pane under the band"
-        );
-        assert_eq!(
-            settings_route(&app, wid),
-            Some(crate::native_settings::SettingsRoute::Messages),
-            "Settings \u{25b8} Messages opens at the row"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn band_hover_never_reports_motion_to_the_front_program() {
-        use std::io::{ErrorKind, Read};
-        use std::os::unix::net::UnixStream;
-        fn read(reader: &mut UnixStream) -> Vec<u8> {
-            let mut all = Vec::new();
-            let mut bytes = [0; 256];
-            loop {
-                match reader.read(&mut bytes) {
-                    Ok(0) => break,
-                    Ok(n) => all.extend_from_slice(&bytes[..n]),
-                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-                    Err(e) => panic!("reading input: {e}"),
-                }
-            }
-            all
-        }
-        let (mut reader, writer) = UnixStream::pair().unwrap();
-        reader.set_nonblocking(true).unwrap();
-        let mut app = crate::App::headless_for_test_with_sink(std::sync::Arc::new(
-            aterm_session::sink::SinkWriter::new_owned(writer.into()),
-        ));
-        let wid = crate::WindowId(0);
-        app.post_message(toolchain_row());
-        assert_eq!(app.message_band_rows, 1);
-        let term = app.front_terminal(wid).unwrap().term.clone();
-        crate::term_lock(&term).process(b"\x1b[?1003h\x1b[?1006h");
-        let _ = read(&mut reader);
-        let col = u16::try_from(band_row(&app, wid).title.0 + 2).unwrap();
-        app.pointer_cmd(PointerAction::MoveChrome { up: 1, col })
-            .unwrap();
-        app.pointer_cmd(PointerAction::MoveChrome {
-            up: 1,
-            col: col + 1,
-        })
-        .unwrap();
-        assert!(
-            app.windows[&wid].band_hover.is_some(),
-            "premise: the band row is lit"
-        );
-        let bytes = read(&mut reader);
-        assert!(
-            bytes.is_empty(),
-            "a band hover reached the program as a mouse report: {:?}",
-            String::from_utf8_lossy(&bytes)
-        );
-        app.pointer_cmd(PointerAction::Move { row: 3, col: 5 })
-            .unwrap();
-        let grid = read(&mut reader);
-        assert!(grid.starts_with(b"\x1b[<35;"), "{grid:?}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_pointer_click_on_a_capsule_while_parked_is_refused() {
-        let mut app = crate::App::headless_for_test();
-        let wid = crate::WindowId(0);
-        let id = app.post_message(
-            aterm_messages::Message::new(
-                aterm_messages::tags::PRIVACY,
-                aterm_messages::Severity::Info,
-                "File access not confirmed",
-            )
-            .action(aterm_messages::Intent::OpenSystemPane {
-                pane: "full-disk-access".into(),
-            })
-            .action(aterm_messages::Intent::NotNow {
-                decision: aterm_messages::Decision::FileAccess,
-            }),
-        );
-        assert_eq!(app.message_band_rows, 1);
-        let not_now = band_row(&app, wid)
-            .capsules
-            .iter()
-            .find(|c| c.action == aterm_messages::ActionIndex(1))
-            .expect("the Not now capsule")
-            .col
-            + 1;
-        let col = u16::try_from(not_now).unwrap();
-        assert!(
-            app.pointer_cmd(PointerAction::MoveChrome { up: 1, col })
-                .is_ok()
-        );
-        app.pending_update_handoff = Some(crate::messages_host::tests::parked());
-        let reply = app.pointer_cmd(PointerAction::Click);
-        let live = app.messages.live(id).is_some();
-        let pressed = acted(&app, id);
-        assert_eq!(
-            reply,
-            Err(aterm_messages::wire::switching_reply()
-                .strip_prefix("ERR ")
-                .unwrap()
-                .to_string()),
-            "parked, the click is not refused (row live: {live}, acted: {pressed:?})"
-        );
-        assert!(live, "the question stands");
-        assert_eq!(pressed, None, "nothing was pressed");
-        let now = std::time::Instant::now();
-        for k in 0..10 {
-            assert!(
-                aterm_messages::wire::spend_press(&mut app.wire_gate, now).is_ok(),
-                "press {k}: the refused click spent one"
-            );
-        }
     }
 }
 

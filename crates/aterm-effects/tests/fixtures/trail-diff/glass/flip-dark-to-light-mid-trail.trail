@@ -5,6 +5,7 @@
 # compares the glass's frames on each side of the flip. A dark-to-light flip mid-trail: the owner's
 # sentence typed on Default's colours and switched to Default Light's half way.
 
+scale 2
 grid 24 100
 style rainbow kitty
 hz 60

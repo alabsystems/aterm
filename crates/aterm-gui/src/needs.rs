@@ -70,6 +70,10 @@ pub(crate) enum GrokSignin {
     /// Signed out, or the login was refused by this session's grok (written before it started),
     /// and no sign-in runs.
     Idle,
+    /// No look at the sign-in has answered yet for the walled program (a look reads files off the
+    /// event loop, `app_presence::GrokLooks`): the wall waits on the look and raises no need,
+    /// since a sign-in that runs would make one false.
+    Reading,
 }
 
 /// The one need every Grok session on a sign-in wall shares while this machine is signed out
@@ -81,6 +85,9 @@ pub(crate) const GROK_SIGNIN_WHAT: &str =
 
 /// A Grok session's sign-in wall while this machine's sign-in runs.
 pub(crate) const GROK_SIGNIN_WAIT: &str = "signing Grok Build in for this machine";
+
+/// A Grok session's sign-in wall until the first look at the sign-in answers.
+pub(crate) const GROK_SIGNIN_READING: &str = "reading where Grok Build's sign-in stands";
 
 /// A Grok session's sign-in wall once this machine is signed in.
 pub(crate) const GROK_SIGNED_IN_WHAT: &str =
@@ -340,6 +347,9 @@ pub(crate) struct HarnessAsk {
     pub(crate) others: Vec<String>,
     /// The program whose entry it is.
     pub(crate) program: aterm_phase::Program,
+    /// What the entry says the harness does beside the need (` — carrying on`, or ` — waits on
+    /// you` where Land rests on it or the work landed beside it).
+    pub(crate) tail: NeedTail,
 }
 
 impl HarnessAsk {
@@ -350,6 +360,7 @@ impl HarnessAsk {
             more: words.more,
             others: Vec::new(),
             program: words.program,
+            tail: words.tail,
         }
     }
 
@@ -367,6 +378,7 @@ impl HarnessAsk {
             more: u16::try_from(others.len()).unwrap_or(u16::MAX),
             others,
             program,
+            tail: NeedTail::CarryingOn,
         })
     }
 
@@ -441,10 +453,14 @@ pub(crate) struct NeedWords<'a> {
     pub(crate) more: u16,
     /// The program the entry names.
     pub(crate) program: aterm_phase::Program,
+    /// What the entry says the harness does beside the need ([`NeedTail::CarryingOn`] where its
+    /// tail was cut away whole).
+    pub(crate) tail: NeedTail,
 }
 
 const NEEDS_YOU: &str = " needs you: ";
-const CARRYING_ON: &str = " \u{2014} carrying on";
+
+pub(crate) use aterm_agent::harness::hold_said::NeedTail;
 
 /// The need without aterm's frame.
 #[must_use]
@@ -454,11 +470,11 @@ pub(crate) fn need_words(text: &str) -> Option<NeedWords<'_>> {
     let program = aterm_phase::Program::ALL
         .into_iter()
         .find(|program| program.name().eq_ignore_ascii_case(head))?;
-    let (rest, tail_seen) = without_carrying_on(rest);
+    let (rest, tail_seen) = without_tail(rest);
     let rest = rest.trim_end();
     let (first, more) = match more_count(rest) {
         Some(read) => read,
-        None if tail_seen => (rest, 0),
+        None if tail_seen.is_some() => (rest, 0),
         None => return None,
     };
     let first = first.trim();
@@ -466,25 +482,37 @@ pub(crate) fn need_words(text: &str) -> Option<NeedWords<'_>> {
         first,
         more,
         program,
+        tail: tail_seen.unwrap_or_default(),
     })
 }
 
-fn without_carrying_on(rest: &str) -> (&str, bool) {
+/// `rest` without the entry's tail (` — carrying on`, ` — waits on you`), whole or cut short
+/// to its dash, and which tail it was: the one whose words the longest cut kept, the default
+/// where only the dash is left.
+fn without_tail(rest: &str) -> (&str, Option<NeedTail>) {
     let dash = " \u{2014}".len();
-    let cuts = CARRYING_ON
-        .char_indices()
-        .map(|(at, _)| at)
-        .chain(std::iter::once(CARRYING_ON.len()))
-        .filter(|&at| at >= dash);
-    let mut best = None;
-    for at in cuts {
-        if rest.ends_with(&CARRYING_ON[..at]) {
-            best = Some(at);
+    let mut best: Option<(usize, NeedTail)> = None;
+    for tail in NeedTail::ALL {
+        let whole = format!(" \u{2014} {}", tail.words());
+        let cuts = whole
+            .char_indices()
+            .map(|(at, _)| at)
+            .chain(std::iter::once(whole.len()))
+            .filter(|&at| at >= dash);
+        for at in cuts {
+            if rest.ends_with(&whole[..at]) && best.is_none_or(|(len, _)| at > len) {
+                let read = if at > dash + 1 {
+                    tail
+                } else {
+                    NeedTail::default()
+                };
+                best = Some((at, read));
+            }
         }
     }
     match best {
-        Some(at) => (&rest[..rest.len() - at], true),
-        None => (rest, false),
+        Some((at, tail)) => (&rest[..rest.len() - at], Some(tail)),
+        None => (rest, None),
     }
 }
 
@@ -542,7 +570,8 @@ pub(crate) fn wait_words(wait: &Waiting, unsupervised: bool) -> String {
         (WaitWord::Api, _) => "can't reach the API".to_string(),
         (WaitWord::Overloaded, _) => "retrying an overloaded service".to_string(),
         (WaitWord::MemoryRestart, _) => "memory restart queued for the next idle point".to_string(),
-        // A Grok sign-in wall's wait carries its words ([`GROK_SIGNIN_WAIT`]).
+        // A Grok sign-in wall's wait carries its words ([`GROK_SIGNIN_WAIT`],
+        // [`GROK_SIGNIN_READING`]).
         (WaitWord::Login, _) => wait
             .entry
             .as_ref()
@@ -768,6 +797,19 @@ fn wall_outcome(
             }),
             None,
         ),
+        "auth" if facts.grok_signin == Some(GrokSignin::Reading) => (
+            None,
+            Some(Waiting {
+                word: WaitWord::Login,
+                wall: Some(kind),
+                reset: None,
+                entry: Some(WaitEntry {
+                    owner: aterm_agent::harness::grok_signin::NEED_OWNER.to_string(),
+                    text: GROK_SIGNIN_READING.to_string(),
+                }),
+            }),
+            None,
+        ),
         "auth" if facts.grok_signin == Some(GrokSignin::Idle) => (
             need(NeedWord::Login, GROK_SIGNIN_WHAT.to_string()),
             None,
@@ -920,16 +962,19 @@ fn harness_ask(text: &str, told: Option<&[String]>) -> Option<HarnessAsk> {
         .find(|program| program.name().eq_ignore_ascii_case(head.trim()))?;
     let parsed = need_words(text);
     let counted = parsed.map_or(0, |words| words.more);
+    let tail = without_tail(rest).1.unwrap_or_default();
     told.and_then(|needs| HarnessAsk::told_counted(needs, program, counted))
+        .map(|ask| HarnessAsk { tail, ..ask })
         .or_else(|| parsed.map(HarnessAsk::of))
         .or_else(|| {
-            let (first, _) = without_carrying_on(rest);
+            let (first, tail) = without_tail(rest);
             let first = first.trim();
             (!first.is_empty()).then(|| {
                 HarnessAsk::of(NeedWords {
                     first,
                     more: 0,
                     program,
+                    tail: tail.unwrap_or_default(),
                 })
             })
         })

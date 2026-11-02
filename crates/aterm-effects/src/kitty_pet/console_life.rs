@@ -292,16 +292,24 @@ enum MoteGate {
     Clearance,
 }
 
+#[inline]
+const fn mote_cell_geom((cell_w, cell_h): (u16, u16)) -> (f32, f32, f32, f32, f32) {
+    let min_ch = (if cell_h > 6 { cell_h } else { 6 }) as f32;
+    let cw = (if cell_w > 1 { cell_w } else { 1 }) as f32;
+    let ch = (if cell_h > 1 { cell_h } else { 1 }) as f32;
+    (min_ch, cw, ch, 1.0 / cw, 1.0 / ch)
+}
+
 /// Whether the console draws mote `m`: a box a tile's radius around the pixel its centre draws at
 /// ([`crate::kitty_pet::mote_box_px`]) clears the ink by [`CLEARANCE`]. Judged at that pixel, the
 /// verdict turns only where the mote's drawn box does, at one of its own edges
 /// ([`PetBrain::hidden_mote_offer`]).
 #[inline]
-const fn mote_clears(world: &PetWorld, m: &PetMoteSprite, (cell_w, cell_h): (u16, u16)) -> bool {
-    let min_ch = (if cell_h > 6 { cell_h } else { 6 }) as f32;
-    let cw = (if cell_w > 1 { cell_w } else { 1 }) as f32;
-    let ch = (if cell_h > 1 { cell_h } else { 1 }) as f32;
-    let (inv_cw, inv_ch) = (1.0 / cw, 1.0 / ch);
+const fn mote_clears(
+    world: &PetWorld,
+    m: &PetMoteSprite,
+    (min_ch, cw, ch, inv_cw, inv_ch): (f32, f32, f32, f32, f32),
+) -> bool {
     let (col, row) = ((m.col * cw).round() * inv_cw, (m.row * ch).round() * inv_ch);
     let radius = min_ch * m.scale + 1.0;
     let rw = radius * inv_cw;
@@ -426,7 +434,7 @@ pub(super) struct ConsoleLife {
     anchor: Option<PetAnchor>,
     pub(super) target: Option<PetRect>,
     gaze: Option<(f32, f32)>,
-    resident: bool,
+    pub(super) resident: bool,
     resident_handoff: bool,
     moving: bool,
     clipped: bool,
@@ -825,6 +833,7 @@ impl PetBrain {
                 None => None,
             }
         }
+        self.rearm_idle_ears();
         let repair_live = matches!(self.console.repair_until, Some(end) if now < end);
         let erases = matches!(
             kind,
@@ -1151,11 +1160,19 @@ impl PetBrain {
             self.console.faux_caret = None;
         }
         self.note_row_signatures(input, pane, prior_stamp);
+        let prior_faux = if matches!(
+            (prior_stamp, self.console.world.as_deref().and_then(PetWorld::stamp)),
+            (Some(a), Some(b)) if a.surface == b.surface
+        ) {
+            self.console.faux_caret
+        } else {
+            None
+        };
         self.console.faux_caret = if !input.cursor_visible
             && input.display_offset == 0
             && input.cursor_row + 2 >= pane.row + pane.rows
         {
-            match detect_faux_composer_caret(input, pane) {
+            match detect_faux_composer_caret_with_prior(input, pane, prior_faux) {
                 Some((r, c)) if pane.row + usize::from(r) < input.cursor_row => Some((r, c)),
                 _ => None,
             }
@@ -1627,8 +1644,8 @@ impl PetBrain {
                     max_y,
                     body_rows: dest_h as f32 * inv_ch,
                     body_cols: dest_w as f32 * inv_cw,
-                    rh: reach_px / ch_f,
-                    rw: reach_px / cw_f,
+                    rh: reach_px * inv_ch,
+                    rw: reach_px * inv_cw,
                     step: note_lane_step(sense.cell_w, sense.cell_h),
                     width,
                 }
@@ -2588,10 +2605,10 @@ impl PetBrain {
             self.console.caret_held = false;
             return sense;
         }
-        self.console.hidden_hold += dt.max(0.0);
         if self.console.presentable
             && let Some(faux) = self.console.faux_caret
         {
+            self.console.hidden_hold = 0.0;
             self.console.cursor_home = Some(faux);
             self.console.caret_held = true;
             return PetSense {
@@ -2600,6 +2617,7 @@ impl PetBrain {
                 ..sense
             };
         }
+        self.console.hidden_hold += dt.max(0.0);
         let now_stamp = match &self.console.world {
             Some(w) => w.stamp(),
             None => None,
@@ -2799,7 +2817,7 @@ impl PetBrain {
             self.console.trip = None;
             self.speed = 0.0;
             self.last_caret = sense.caret;
-            self.last_burst = sense.output_burst;
+            self.note_burst_twitch(sense.output_burst, false);
             self.twitch_t = 0.0;
             self.stumble_t = 0.0;
             self.clear_play();
@@ -2834,8 +2852,6 @@ impl PetBrain {
         };
         self.last_caret = sense.caret;
         self.quiet += dt;
-        let burst_edge = sense.output_burst && !self.last_burst;
-        self.last_burst = sense.output_burst;
         self.twitch_t = if sense.reduced_motion {
             0.0
         } else {
@@ -3097,17 +3113,13 @@ impl PetBrain {
                     });
                 }
             }
-            if !holding
+            let can_twitch = !holding
                 && !sense.reduced_motion
                 && !self.console.clipped
                 && self.action != PetAction::Sleep
-                && self.console.pose == Some(PetGlyphId::PetSit)
-            {
-                if burst_edge && self.twitch_t <= 0.0 {
-                    self.twitch_t = TWITCH_DUR;
-                    self.twitch_up = self.mote_serial.is_multiple_of(2);
-                    self.mote_serial = self.mote_serial.wrapping_add(1);
-                }
+                && self.console.pose == Some(PetGlyphId::PetSit);
+            self.note_burst_twitch(sense.output_burst, can_twitch);
+            if can_twitch {
                 if self.twitch_t > 0.0 {
                     self.console.pose = Some(if self.twitch_up {
                         PetGlyphId::PetSitEar
@@ -3118,16 +3130,16 @@ impl PetBrain {
             } else {
                 self.twitch_t = 0.0;
             }
-        } else if self.speed.abs() > f32::EPSILON {
-            self.twitch_t = 0.0;
-            self.facing_left = self.speed < 0.0;
-        } else if let Some(trip) = self.console.trip
-            && (trip.to.0 - trip.from.0).abs() > f32::EPSILON
-        {
-            self.twitch_t = 0.0;
-            self.facing_left = trip.to.0 < trip.from.0;
         } else {
+            self.note_burst_twitch(sense.output_burst, false);
             self.twitch_t = 0.0;
+            if self.speed.abs() > f32::EPSILON {
+                self.facing_left = self.speed < 0.0;
+            } else if let Some(trip) = self.console.trip
+                && (trip.to.0 - trip.from.0).abs() > f32::EPSILON
+            {
+                self.facing_left = trip.to.0 < trip.from.0;
+            }
         }
         Some(self.emit(sense, width))
     }
@@ -3890,7 +3902,7 @@ impl PetBrain {
             (seat.1 - walk_row).abs() < 0.5
         }
         #[inline]
-        fn kept_seat(
+        const fn kept_seat(
             world: &PetWorld,
             seat: (f32, f32),
             rows: u16,
@@ -4484,15 +4496,17 @@ impl PetBrain {
         };
         let cw = f32::from(sense.cell_w.max(1));
         let ch = f32::from(sense.cell_h.max(1));
+        let inv_cw = 1.0 / cw;
+        let inv_ch = 1.0 / ch;
         let natural_h = (ART_ROWS * ch).round();
         let natural_w = ((natural_h * ART_ASPECT).round() as i32).clamp(1, i32::from(u16::MAX));
         let dest_w = (rect.cols * cw).round() as i32;
         let dest_h = (rect.rows * ch).round();
         let safe_bottom_px = (safe.row * ch).round() + dest_h;
-        let ground_row = safe_bottom_px / ch - 1.0;
+        let ground_row = safe_bottom_px * inv_ch - 1.0;
         let shifted = PetFrame {
-            col: ((safe.col * cw).round() - (natural_w / 2) as f32 + (dest_w / 2) as f32) / cw,
-            row: (safe_bottom_px + (frame.lift * ch).round()) / ch - 1.0,
+            col: ((safe.col * cw).round() - (natural_w / 2) as f32 + (dest_w / 2) as f32) * inv_cw,
+            row: (safe_bottom_px + (frame.lift * ch).round()) * inv_ch - 1.0,
             ..*frame
         };
         if !matches!(body_rect(&shifted, sense), Some(r) if world.under_text_clear(r, 0.0)) {
@@ -4584,6 +4598,12 @@ impl PetBrain {
 
     #[inline]
     pub(super) fn finish_console_frame(&mut self, frame: &mut PetFrame, sense: PetSense) {
+        if !self.console.presentable {
+            self.console_posed = false;
+            self.console.mote_gate = MoteGate::Open;
+            self.console.hidden_motes = [false; PET_MOTES_MAX];
+            return;
+        }
         let mut drawn_mask = 0u8;
         let mut i = 0;
         while i < PET_MOTES_MAX {
@@ -4593,7 +4613,7 @@ impl PetBrain {
             i += 1;
         }
         self.console.mote_gate = MoteGate::Open;
-        self.console_frame_pass(frame, sense);
+        self.console_frame_pass(frame, sense, drawn_mask != 0);
         if drawn_mask == 0 {
             self.console.hidden_motes = [false; PET_MOTES_MAX];
             return;
@@ -4606,7 +4626,7 @@ impl PetBrain {
     }
 
     #[inline]
-    fn console_frame_pass(&mut self, frame: &mut PetFrame, sense: PetSense) {
+    fn console_frame_pass(&mut self, frame: &mut PetFrame, sense: PetSense, has_motes: bool) {
         self.console_posed = false;
         if !self.console.presentable {
             return;
@@ -4733,15 +4753,18 @@ impl PetBrain {
             return;
         }
         self.console.on_glass = true;
-        let mut i = 0;
-        while i < PET_MOTES_MAX {
-            if let Some(m) = &frame.motes[i] {
-                self.console.mote_gate = MoteGate::Clearance;
-                if !mote_clears(world, m, (sense.cell_w, sense.cell_h)) {
-                    frame.motes[i] = None;
+        if has_motes && self.console.mote_gate != MoteGate::Shut {
+            let geom = mote_cell_geom((sense.cell_w, sense.cell_h));
+            let mut i = 0;
+            while i < PET_MOTES_MAX {
+                if let Some(m) = &frame.motes[i] {
+                    self.console.mote_gate = MoteGate::Clearance;
+                    if !mote_clears(world, m, geom) {
+                        frame.motes[i] = None;
+                    }
                 }
+                i += 1;
             }
-            i += 1;
         }
         let base_lane_alpha = frame.lane_alpha;
         let mut refused = 0u16;
@@ -4799,11 +4822,9 @@ impl PetBrain {
         if refused > 0 {
             frame.alpha = (u16::from(frame.alpha) + refused).min(u16::from(frame.lane_alpha)) as u8;
         }
-        if handed > 0.0 {
-            let remaining = self.arrive_t / self.arrive_in;
-            if remaining > 0.0 {
-                self.arrive_from = (self.arrive_from + handed / remaining).min(1.0);
-            }
+        if handed > 0.0 && self.arrive_t > 0.0 && self.arrive_in > 0.0 {
+            self.arrive_from =
+                (self.arrive_from + handed * self.arrive_in / self.arrive_t).min(1.0);
         }
     }
 
@@ -5019,6 +5040,11 @@ impl PetBrain {
         };
         let cells = (self.last_cell_w, self.last_cell_h);
         let check_clearance = matches!(self.console.mote_gate, MoteGate::Clearance);
+        let geom = if check_clearance && world.is_some() {
+            mote_cell_geom(cells)
+        } else {
+            (0.0, 1.0, 1.0, 1.0, 1.0)
+        };
         let mut i = 0;
         while i < PET_MOTES_MAX {
             if let Some(m) = self.motes[i]
@@ -5028,7 +5054,7 @@ impl PetBrain {
                     return true;
                 };
                 if check_clearance
-                    && matches!(world, Some(w) if mote_clears(w, &sprite, cells))
+                    && matches!(world, Some(w) if mote_clears(w, &sprite, geom))
                         == self.console_hid_mote(i)
                 {
                     return true;
@@ -5041,6 +5067,7 @@ impl PetBrain {
 
     #[inline]
     pub(super) fn note_console_completion(&mut self, now: Instant, failed: bool) {
+        self.rearm_idle_ears();
         self.console.completion_seq = self.console.completion_seq.wrapping_add(1).max(1);
         self.console.completion = Some((now, failed));
         self.console.failure_quiet_until = if failed {
@@ -5175,10 +5202,20 @@ const fn bg_eq(a: [u8; 3], b: [u8; 3]) -> bool {
     a[0] == b[0] && a[1] == b[1] && a[2] == b[2]
 }
 
+#[cfg(test)]
 #[inline]
 const fn detect_faux_composer_caret(
     input: &aterm_core::render::RenderInput,
     pane: PetPane,
+) -> Option<(u16, u16)> {
+    detect_faux_composer_caret_with_prior(input, pane, None)
+}
+
+#[inline]
+const fn detect_faux_composer_caret_with_prior(
+    input: &aterm_core::render::RenderInput,
+    pane: PetPane,
+    prior_faux: Option<(u16, u16)>,
 ) -> Option<(u16, u16)> {
     let start_r = pane.rows / 2;
     let max_end_r = pane.rows.saturating_sub(1);
@@ -5193,7 +5230,7 @@ const fn detect_faux_composer_caret(
             continue;
         }
         let row = cells[frame_r].as_slice();
-        let mut prompt_c = None;
+        let mut prompt = None;
         let mut boxed = false;
         let scan_cols = if pane.cols < 6 { pane.cols } else { 6 };
         let mut local_c = 0;
@@ -5206,23 +5243,18 @@ const fn detect_faux_composer_caret(
                 '│' | '┃' | '║' | '|' if local_c == 0 => boxed = true,
                 ' ' => {}
                 '>' | '❯' | '›' => {
-                    prompt_c = Some(local_c);
+                    prompt = Some((local_c, row[idx].bg));
                     break;
                 }
                 _ => break,
             }
             local_c += 1;
         }
-        let Some(prompt_c) = prompt_c else {
+        let Some((prompt_c, base_bg)) = prompt else {
             continue;
         };
-        let prompt_idx = pane.col + prompt_c;
-        let base_bg = if prompt_idx < row.len() {
-            Some(row[prompt_idx].bg)
-        } else {
-            None
-        };
         let mut last_text: Option<(usize, usize, usize)> = None;
+        let mut end_comp_r = local_r;
         let mut comp_r = local_r;
         while comp_r < end_r {
             let comp_frame_r = pane.row + comp_r;
@@ -5233,6 +5265,7 @@ const fn detect_faux_composer_caret(
             if pane.col >= comp_row.len() {
                 break;
             }
+            let avail_cols = comp_row.len() - pane.col;
             let first_cell = &comp_row[pane.col];
             if matches!(first_cell.ch, '╰' | '└' | '╭' | '┌' | '─' | '━' | '═' | '+')
             {
@@ -5244,11 +5277,13 @@ const fn detect_faux_composer_caret(
                         break;
                     }
                 } else {
+                    if prompt_c >= avail_cols {
+                        break;
+                    }
                     let mut indented = true;
                     let mut c = 0;
                     while c <= prompt_c {
-                        let idx = pane.col + c;
-                        if idx >= comp_row.len() || comp_row[idx].ch != ' ' {
+                        if comp_row[pane.col + c].ch != ' ' {
                             indented = false;
                             break;
                         }
@@ -5259,16 +5294,17 @@ const fn detect_faux_composer_caret(
                     }
                 }
             }
+            end_comp_r = comp_r;
             let mut right_limit = pane.cols.saturating_sub(1);
             if boxed {
-                let mut c = pane.cols;
+                let mut c = if pane.cols < avail_cols {
+                    pane.cols
+                } else {
+                    avail_cols
+                };
                 while c > prompt_c + 1 {
                     c -= 1;
-                    let idx = pane.col + c;
-                    if idx >= comp_row.len() {
-                        continue;
-                    }
-                    let ch = comp_row[idx].ch;
+                    let ch = comp_row[pane.col + c].ch;
                     if ch == ' ' {
                         continue;
                     }
@@ -5279,16 +5315,18 @@ const fn detect_faux_composer_caret(
                 }
             }
             let start_c = prompt_c + 1;
+            let scan_end = if right_limit < avail_cols {
+                right_limit
+            } else {
+                avail_cols
+            };
             let mut row_has_ink = false;
             let mut scan_c = start_c;
-            while scan_c < right_limit {
+            while scan_c < scan_end {
                 let idx = pane.col + scan_c;
-                if idx >= comp_row.len() {
-                    break;
-                }
                 let cell = &comp_row[idx];
                 if cell.ch == '█'
-                    || (matches!(base_bg, Some(bg) if !bg_eq(cell.bg, bg))
+                    || (!bg_eq(cell.bg, base_bg)
                         && (idx == 0 || !bg_eq(comp_row[idx - 1].bg, cell.bg))
                         && (idx + 1 >= comp_row.len() || !bg_eq(comp_row[idx + 1].bg, cell.bg)))
                 {
@@ -5316,6 +5354,31 @@ const fn detect_faux_composer_caret(
             let next_c = prompt_c + 2;
             let col = if next_c < limit_m1 { next_c } else { limit_m1 };
             return Some((local_r as u16, col as u16));
+        }
+        if let Some((pf_r, pf_c)) = prior_faux {
+            let r = pf_r as usize;
+            let c = pf_c as usize;
+            let pane_limit = pane.cols.saturating_sub(1);
+            if r >= local_r && r <= end_comp_r && c > prompt_c && c <= pane_limit {
+                if let Some((tr, tc, right_limit)) = last_text {
+                    let limit_m1 = right_limit.saturating_sub(1);
+                    let next_c = tc + 1;
+                    let max_c = if next_c < limit_m1 { next_c } else { limit_m1 };
+                    if r < tr || (r == tr && c <= max_c) {
+                        return Some((pf_r, pf_c));
+                    }
+                } else {
+                    let next_c = prompt_c + 2;
+                    let max_c = if next_c < pane_limit {
+                        next_c
+                    } else {
+                        pane_limit
+                    };
+                    if r == local_r && c <= max_c {
+                        return Some((pf_r, pf_c));
+                    }
+                }
+            }
         }
     }
     None
@@ -9470,6 +9533,169 @@ mod tests {
     }
 
     #[test]
+    fn interactive_caret_idle_status_bursts_do_not_loop_ear_flapping() {
+        let mut s = Scene::new();
+        s.executing();
+        s.term.process(b"\x1b[4;17H");
+        for _ in 0..120 {
+            s.frame(0.016);
+            if s.pet.console.resident && !s.pet.console.moving && !s.pet.needs_frames() {
+                break;
+            }
+        }
+        assert_eq!(s.frame(0.016).pose, PetGlyphId::PetSit);
+
+        let pulse = |s: &mut Scene, dt: f32, burst: bool| -> PetFrame {
+            s.now += Duration::from_secs_f32(dt);
+            let input = s.term.cell_frame(20, 80);
+            let facts = PetWorldFacts::read(&s.term, 17);
+            s.pet.observe_console(&input, &facts, PetPane::full(&input));
+            s.pet.set_console_presentable(true);
+            let c = s.term.cursor();
+            s.pet.tick(PetSense {
+                caret_drawn: true,
+                now: s.now,
+                caret: Some((c.row, c.col)),
+                wrapped: false,
+                rows: 20,
+                cols: 80,
+                cell_w: 10,
+                cell_h: 20,
+                reduced_motion: false,
+                output_burst: burst,
+                pointer: None,
+            })
+        };
+
+        let first = pulse(&mut s, 0.016, true);
+        assert!(matches!(
+            first.pose,
+            PetGlyphId::PetSitEar | PetGlyphId::PetSitEarFar
+        ));
+        let _ = s.watch(TWITCH_DUR + 0.1);
+        assert_eq!(s.frame(0.016).pose, PetGlyphId::PetSit);
+        assert!(!s.pet.needs_frames());
+
+        for gap in [0.4_f32, 0.4, 1.0, 1.0, 5.0, 5.0] {
+            let f = pulse(&mut s, gap, true);
+            assert_eq!(
+                f.pose,
+                PetGlyphId::PetSit,
+                "idle spinner/clock output burst after {gap}s must not flap ears"
+            );
+            assert!(
+                !s.pet.needs_frames(),
+                "ignored idle status burst after {gap}s must not wake the frame train"
+            );
+            assert_eq!(pulse(&mut s, 0.016, false).pose, PetGlyphId::PetSit);
+        }
+
+        s.input(PetInputKind::Text);
+        let _ = s.watch(2.0);
+        assert_eq!(s.frame(0.016).pose, PetGlyphId::PetSit);
+        let rearmed = pulse(&mut s, 0.016, true);
+        assert!(
+            matches!(
+                rearmed.pose,
+                PetGlyphId::PetSitEar | PetGlyphId::PetSitEarFar
+            ),
+            "genuine console input rearms a single ear flick once cooldown has elapsed, got {:?}",
+            rearmed.pose
+        );
+        let _ = s.watch(TWITCH_DUR + 0.1);
+        assert_eq!(pulse(&mut s, 1.0, true).pose, PetGlyphId::PetSit);
+
+        for (step, gap) in [0.5_f32, 1.0, 5.0, 5.0].into_iter().enumerate() {
+            let col1 = 17 + (step & 1);
+            s.term.process(format!("\x1b[4;{col1}H").as_bytes());
+            let moved = pulse(&mut s, 0.016, true);
+            assert!(
+                !matches!(moved.pose, PetGlyphId::PetSitEar | PetGlyphId::PetSitEarFar),
+                "program-driven spinner cursor jitter must not flap ears on move"
+            );
+            let _ = s.watch(0.4);
+            let f = pulse(&mut s, gap, true);
+            assert!(
+                !matches!(f.pose, PetGlyphId::PetSitEar | PetGlyphId::PetSitEarFar),
+                "program-driven spinner cursor jitter after {gap}s must not rearm ear flapping, got {:?}",
+                f.pose
+            );
+            assert_eq!(s.pet.twitch_t, 0.0);
+        }
+    }
+
+    #[test]
+    fn blinking_unboxed_faux_composer_caret_does_not_oscillate_idle_pose() {
+        let mut s = Scene::new();
+        s.executing();
+        s.term.process(
+            "\x1b[6;1Hstreaming output above composer\
+             \x1b[19;1H> hello\u{2588}            \
+             \x1b[20;1H  26 files changed\x1b[?25l"
+                .as_bytes(),
+        );
+        let step = |s: &mut Scene, dt: f32| -> PetFrame {
+            s.now += Duration::from_secs_f32(dt);
+            let input = s.term.cell_frame(20, 80);
+            let facts = PetWorldFacts::read(&s.term, 17);
+            s.pet.observe_console(&input, &facts, PetPane::full(&input));
+            s.pet.set_console_presentable(true);
+            let c = s.term.cursor();
+            s.pet.tick(PetSense {
+                caret_drawn: s.term.cursor_visible(),
+                now: s.now,
+                caret: Some((c.row, c.col)),
+                wrapped: false,
+                rows: 20,
+                cols: 80,
+                cell_w: 10,
+                cell_h: 20,
+                reduced_motion: false,
+                output_burst: false,
+                pointer: None,
+            })
+        };
+        for _ in 0..160 {
+            let _ = step(&mut s, 0.02);
+            if s.pet.console.resident && !s.pet.console.moving && !s.pet.needs_frames() {
+                break;
+            }
+        }
+        assert_eq!(s.pet.console.faux_caret, Some((18, 7)));
+        assert_eq!(step(&mut s, 0.016).pose, PetGlyphId::PetSit);
+
+        for phase in 0..8 {
+            if phase % 2 == 0 {
+                s.term.process(b"\x1b[19;8H \x1b[20;19H\x1b[?25l");
+            } else {
+                s.term
+                    .process("\x1b[19;8H\u{2588}\x1b[20;19H\x1b[?25l".as_bytes());
+            }
+            for _ in 0..25 {
+                let f = step(&mut s, 0.02);
+                assert_eq!(
+                    s.pet.console.faux_caret,
+                    Some((18, 7)),
+                    "blinking unboxed composer caret must hold across blink phase {phase}"
+                );
+                assert_eq!(
+                    f.pose,
+                    PetGlyphId::PetSit,
+                    "blinking unboxed composer caret must not flip pose on phase {phase}"
+                );
+            }
+        }
+
+        s.term
+            .process(b"\x1b[19;1H  running checks... \x1b[20;19H\x1b[?25l");
+        let _ = step(&mut s, 0.02);
+        assert_eq!(
+            s.pet.console.faux_caret, None,
+            "replacing the composer row must drop the held faux caret immediately"
+        );
+    }
+
+    #[test]
     fn protected_surface_resident_retires_pending_bell_and_look_and_regrid_shifts_console_trip() {
         let mut s = Scene::new();
         s.term.process(b"\x1b[3;3Hread this");
@@ -11201,15 +11427,13 @@ mod tests {
     /// ([`PetBrain::waking_moves`]); the z the wake pops rises into the ink, which hides it and
     /// then drops it, and a hidden pop waits at the offer for the moment it could show again or
     /// drop ([`PetMoteKind::offers_hidden`]). So the host sleeps from one offered edge to the
-    /// next, and a host that also ticks every [`DENSE`] draws the same ([`dense_case`]). The
-    /// key is a space: a letter typed at the sleeper's feet springs it ahead of the keys
-    /// instead of stretching ([`PetBrain::first_keys_spring`]).
+    /// next, and a host that also ticks every [`DENSE`] draws the same ([`dense_case`]).
     #[test]
     fn a_wake_below_scrollback_trains_no_frames_while_its_stretch_holds() {
         const FRAME: Duration = Duration::from_nanos(16_666_667);
         let start = Instant::now();
         let key = Duration::from_secs(1);
-        let keys = [(key, b" ".to_vec())];
+        let keys = [(key, b"a".to_vec())];
         let make = || {
             let mut doze = Dozing::new(DOZE_INK, start, false);
             doze.pet.sense_ink(0, &DOZE_INK_SPANS, None);
@@ -11419,6 +11643,10 @@ mod tests {
             pet.deferred_arc = None;
             pet.touched_on_chrome = false;
             pet.chrome_hop = false;
+            // A whole copy of `f`, not `..f` on the capture: a closure that captures `f`'s array
+            // fields one by one (their lengths are named consts) is broken MIR to stock rustc
+            // 1.95, an ICE that failed `verify cells`' win-arm cell.
+            let base = f;
             let mut frame = PetFrame {
                 col: pet.col,
                 row: pet.row,
@@ -11427,7 +11655,7 @@ mod tests {
                 scale_x: 1.0,
                 scale_y: 1.0,
                 alpha: 255,
-                ..f
+                ..base
             };
             pet.place_console_body_at_home(&mut frame, sense(start + Duration::from_millis(32)));
             frame

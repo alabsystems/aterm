@@ -522,13 +522,13 @@ fn a_records_title_names_its_tab_within_the_title_rule() {
         ("in window 2, tab 3", "Autopilot landed in window 2, tab 3"),
         ("in its tab", "Autopilot landed"),
     ] {
-        let m = task_record("s-1", place, place, TaskFace::Landed).expect("a record");
+        let m = task_record("s-1", place, place, TaskFace::Landed, None).expect("a record");
         assert_eq!(m.title, title, "{place}");
         assert_eq!(aterm_messages::text::glass_title_fault(&m.title), None);
     }
     for face in [TaskFace::Open, TaskFace::Theirs] {
         assert!(
-            task_record("s-1", "in tab 3", "in tab 3", face).is_none(),
+            task_record("s-1", "in tab 3", "in tab 3", face, None).is_none(),
             "{face:?}"
         );
     }
@@ -536,7 +536,8 @@ fn a_records_title_names_its_tab_within_the_title_rule() {
         ("in tab 3, left pane", "Tab 3, left pane: "),
         ("in window 2, tab 3, pane 3", "Window 2, tab 3, pane 3: "),
     ] {
-        let m = task_record("s-1", "in tab 3", line_place, TaskFace::Landed).expect("a record");
+        let m =
+            task_record("s-1", "in tab 3", line_place, TaskFace::Landed, None).expect("a record");
         assert!(!m.title.contains("pane"), "{}", m.title);
         let line = &m.detail[0];
         assert!(line.starts_with(lead), "{line}");
@@ -594,8 +595,9 @@ fn reading(said: &str, worked: Option<Duration>, person: Option<Duration>) -> Tu
         said_cut: false,
         opens_cut: false,
         turn_said: None,
+        said_lines: None,
+        turn_lines: None,
         opened_by: None,
-        opened_words: None,
         message_drawn: true,
         submits: None,
         inputs_before: None,
@@ -612,7 +614,9 @@ fn reading(said: &str, worked: Option<Duration>, person: Option<Duration>) -> Tu
         upgrading: false,
         taskless: false,
         person,
+        key: person,
         reach: Default::default(),
+        witness: None,
         login_back: false,
         auto_continue: None,
         since_limit: None,
@@ -624,6 +628,7 @@ fn reading(said: &str, worked: Option<Duration>, person: Option<Duration>) -> Tu
         account: None,
         autopilot: Autopilot::Land,
         login_label: None,
+        autopilot_by_person: false,
         login_superseded: false,
         login_notice: None,
         finished_record: None,
@@ -689,13 +694,19 @@ fn a_persons_own_exchange_typed_into_the_app_reads_task_theirs_only_where_it_ope
             st.observe(&first, back);
             let act = decide_turn_end(&st, &first, &SupervisorConfig::default(), back);
             st.acted(&act, &first, back);
-            let done = back + Duration::from_secs(120);
+            let defended = back + Duration::from_secs(120);
+            let defense = reading(
+                "Nothing left: committed, merged and pushed it all to origin/main.",
+                Some(Duration::from_secs(120)),
+                None,
+            );
+            st.observe(&defense, defended);
+            // The defense gets the land check (§14.17 item 5); its `LANDED` lands.
+            let check = decide_turn_end(&st, &defense, &SupervisorConfig::default(), defended);
+            st.acted(&check, &defense, defended);
+            let done = defended + Duration::from_secs(10);
             st.observe(
-                &reading(
-                    "Nothing left: committed, merged and pushed it all to origin/main.",
-                    Some(Duration::from_secs(120)),
-                    None,
-                ),
+                &reading("LANDED", Some(Duration::from_secs(10)), None),
                 done,
             );
             let told = st.face_moved();
@@ -930,8 +941,8 @@ fn a_proven_self_claims_landing_shows_and_anyones_later_turn_reopens_it() {
         records[0]
             .1
             .iter()
-            .any(|line| line.contains(aterm_agent::supervise::mode_words::LANDED_WORDS)),
-        "codex-alab's landing says the one landing sentence, which names no checker: {records:?}"
+            .any(|line| line.contains(aterm_agent::supervise::mode_words::NO_RECORD)),
+        "codex-alab's landing says aterm checked nothing: {records:?}"
     );
     app.reopen_self_claim_landing(0);
     assert_eq!(face(&app), Some(TaskFace::Landed), "quiet: still landed");

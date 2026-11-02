@@ -10,6 +10,7 @@ repository.workspace = true
 description = "aterm — `aterm machines`: configure and manage a lab of Macs from one controller over SSH (docs/DESIGN-machines-2026-10-16.md). The controller (inventory, signed envelopes, SSH fan-out, Screen Sharing person steps) and the host agent (a probe/plan/apply/verify engine over macOS's own tools)."
 
 [dependencies]
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
 # Exclusive owned ephemeral staging; shared by controller and agent writers.
 aterm-tempfile = { workspace = true }
 # Child processes (spawnfd::command), bounded runs (deadline), this process's euid (peer).
@@ -51,7 +52,9 @@ aterm-toolchain = { workspace = true }
 # (docs/DESIGN-init-system-2026-10-20.md §3): the model, the ordered run and the journal
 # `init` and `here` keep.
 aterm-converge = { workspace = true }
-# The native initial repository inventory uses agh's routed credential and HTTP doors.
+# The native initial repository inventory uses agh's routed credential and HTTP doors; and
+# machines 5a and 5b (docs/DESIGN-agh-2026-10-19.md §16.4): the fleet key calls over agh's
+# library, `users().keys()` under `Router::single_identity`.
 agh = { workspace = true }
 # The free space the window's disk watch keeps on a volume (`reading::Volume`), which a
 # repository clone leaves free.
@@ -76,6 +79,10 @@ aterm-objc = { workspace = true }
 # The app macOS holds responsible for this process (`System::responsible_app`), which the
 # sign-out's Accessibility grant goes to.
 aterm-containment = { workspace = true }
+
+[dev-dependencies]
+# The loopback GitHub the key calls are tested against.
+agh-fake = { workspace = true }
 
 # Dev only (AGENTS.md: `aterm` is the one shipped executable): the crate as a standalone
 # executable, `aterm-machines-dev machines <verb>`, so the agent can be enrolled into a test VM

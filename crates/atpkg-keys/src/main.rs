@@ -6,147 +6,14 @@
 #[cfg(unix)]
 use atpkg_keys::fsio::{concat, read_bytes, write_bytes};
 #[cfg(unix)]
+use atpkg_keys::{Argv, MAX_ARGS, flag, positional, vet_args};
+#[cfg(unix)]
 use std::process::ExitCode;
 
 #[cfg(windows)]
 fn main() {
     eprintln!("atpkg-keys: unsupported on Windows (POSIX-only owner signing tool)");
     std::process::exit(2);
-}
-
-/// Most tokens read after the verb (`setup` and `join` take up to 8), held in a fixed
-/// [`Argv`] array.
-#[cfg(unix)]
-const MAX_ARGS: usize = 14;
-
-/// Bounded argument vector (`None` from the first unset slot onwards).
-#[cfg(unix)]
-type Argv = [Option<String>; MAX_ARGS];
-
-/// Value following `--<name>`, or `None` (two-token `--name value` form; [`vet_args`] runs first).
-#[cfg(unix)]
-fn flag<'a>(argv: &'a Argv, name: &str) -> Option<&'a str> {
-    let mut want = String::from("--");
-    want.push_str(name);
-    for i in 0..MAX_ARGS {
-        if argv[i].as_deref() == Some(want.as_str()) && i + 1 < MAX_ARGS {
-            return argv[i + 1].as_deref();
-        }
-    }
-    None
-}
-
-/// Flag names that would carry the master key on argv, refused with a compromise warning.
-#[cfg(unix)]
-const MASTER_FLAGS: &[&str] = &[
-    "master",
-    "master-file",
-    "phrase",
-    "phrase-file",
-    "seed",
-    "paper",
-    "secret",
-];
-
-/// Refuse any argument shape outside `allowed` flags and `max_positional` bare arguments.
-#[cfg(unix)]
-fn vet_args(
-    verb: &str,
-    argv: &Argv,
-    allowed: &[&str],
-    max_positional: usize,
-) -> Result<(), String> {
-    let mut positional = 0usize;
-    let mut i = 0usize;
-    while i < MAX_ARGS {
-        let Some(tok) = argv[i].as_deref() else {
-            return Ok(());
-        };
-        if !tok.starts_with("--") {
-            positional += 1;
-            if positional > max_positional {
-                return Err(concat(&[
-                    "unexpected argument '",
-                    tok,
-                    "' for `atpkg-keys ",
-                    verb,
-                    "`",
-                ]));
-            }
-            i += 1;
-            continue;
-        }
-        let name = tok.get(2..).unwrap_or("");
-        if let Some(eq) = name.find('=') {
-            return Err(concat(&[
-                "'",
-                tok,
-                "' uses the `--name=value` form; write it as two tokens: `--",
-                name.get(..eq).unwrap_or(""),
-                " <value>`",
-            ]));
-        }
-        if MASTER_FLAGS.contains(&name) {
-            return Err(concat(&[
-                "'",
-                tok,
-                "' does not exist: the master phrase is read only from /dev/tty. If you \
-                 typed your real phrase on this command line, TREAT THAT MASTER AS \
-                 COMPROMISED (it may be in shell history and was visible to `ps`): destroy \
-                 the paper and generate a new master on a tree whose anchor is not armed.",
-            ]));
-        }
-        if !allowed.contains(&name) {
-            let mut msg = concat(&["unknown flag '", tok, "' for `atpkg-keys ", verb, "`"]);
-            for (n, a) in allowed.iter().enumerate() {
-                msg.push_str(if n == 0 { " (it accepts " } else { ", " });
-                msg.push_str("--");
-                msg.push_str(a);
-            }
-            if !allowed.is_empty() {
-                msg.push(')');
-            }
-            return Err(msg);
-        }
-        match argv.get(i + 1).and_then(|v| v.as_deref()) {
-            None => {
-                return Err(concat(&["'", tok, "' needs a value after it"]));
-            }
-            Some(v) if v.starts_with("--") => {
-                return Err(concat(&[
-                    "'",
-                    tok,
-                    "' was given '",
-                    v,
-                    "' as its value, which is another flag",
-                ]));
-            }
-            Some(_) => {}
-        }
-        i += 2;
-    }
-    Ok(())
-}
-
-/// The `i`th positional argument (skipping `--flag value` pairs), 0-based after the verb.
-#[cfg(unix)]
-fn positional(argv: &Argv, want: usize) -> Option<&str> {
-    let mut seen = 0usize;
-    let mut i = 0usize;
-    while i < MAX_ARGS {
-        match argv[i].as_deref() {
-            None => return None,
-            Some(a) if a.starts_with("--") => i += 2,
-            Some(a) => {
-                if seen == want {
-                    return Some(a);
-                }
-                seen += 1;
-                i += 1;
-            }
-        }
-    }
-    None
 }
 
 #[cfg(unix)]
@@ -241,8 +108,12 @@ fn read_key(path: &str) -> Result<Vec<u8>, String> {
 
 #[cfg(unix)]
 fn pubkey(key: Option<&str>) -> Result<(), String> {
+    atpkg_keys::master::forbid_core_dumps();
     let key = key.ok_or("usage: atpkg-keys pubkey <key-file>")?;
-    print_line(&atpkg_keys::pubkey_b64(&read_key(key)?)?);
+    let mut pkcs8 = read_key(key)?;
+    let encoded = atpkg_keys::pubkey_b64(&pkcs8);
+    atpkg_keys::master::scrub(&mut pkcs8);
+    print_line(&encoded?);
     Ok(())
 }
 
@@ -288,10 +159,14 @@ fn verify_signed(argv: &Argv) -> Result<(), String> {
 
 #[cfg(unix)]
 fn sign(key: Option<&str>, msg: Option<&str>, sig_out: Option<&str>) -> Result<(), String> {
+    atpkg_keys::master::forbid_core_dumps();
     let key = key.ok_or("usage: atpkg-keys sign <key-file> <file> [<sig-out>]")?;
     let msg = msg.ok_or("usage: atpkg-keys sign <key-file> <file> [<sig-out>]")?;
     let bytes = read_bytes(msg).map_err(|e| concat(&["read ", msg, ": ", &e.to_string()]))?;
-    let sig = atpkg_keys::sign(&read_key(key)?, &bytes)?;
+    let mut pkcs8 = read_key(key)?;
+    let sig = atpkg_keys::sign(&pkcs8, &bytes);
+    atpkg_keys::master::scrub(&mut pkcs8);
+    let sig = sig?;
     let path = match sig_out {
         Some(path) => path.to_string(),
         None => concat(&[msg, ".sig"]),
@@ -601,7 +476,7 @@ fn machine_revoke(argv: &Argv) -> Result<(), String> {
         .ok_or("usage: atpkg-keys machine-revoke --id <machine-id> [--roster <path>]")?;
     let roster_path = flag(argv, "roster").unwrap_or(DEFAULT_ROSTER);
     let now = now_unix()?;
-    if matches!(std::fs::metadata(roster_path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+    if matches!(std::fs::symlink_metadata(roster_path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
         && atpkg_keys::provision::refuse_pending_roster_transaction(roster_path).is_ok()
     {
         return Err(concat(&[

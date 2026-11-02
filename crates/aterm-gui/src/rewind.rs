@@ -111,6 +111,8 @@ static NEXT_VIEW: AtomicU64 = AtomicU64::new(1);
 
 /// One session's open Rewind view.
 pub(crate) struct RewindView {
+    /// An open view needs promptly recorded states and verdicts until it closes.
+    _recording_demand: crate::temporal::RecordingDemand,
     /// The replayed past screen every render of the session shows, once the first fold lands.
     pub(crate) shown: Option<Arc<Mutex<Terminal>>>,
     /// How many rows higher [`Self::shown`] is drawn than its screen was ([`lift_for_band`]): its row `r` is the screen's row `r + lift`.
@@ -158,6 +160,7 @@ pub(crate) struct RewindView {
 impl RewindView {
     fn new(live_base: u64) -> Self {
         Self {
+            _recording_demand: crate::temporal::consumer_demand(),
             shown: None,
             at: Ticks(0),
             state: (0, 0),
@@ -784,16 +787,21 @@ impl App {
         }
     }
 
+    /// Local UTC offset in seconds at `shown_unix_ms`, falling back to now's offset or UTC.
+    pub(crate) fn rewind_offset_s(&self, shown_unix_ms: i64) -> i64 {
+        self.messages_wall
+            .offset_at(shown_unix_ms.div_euclid(1000))
+            .or_else(|| self.messages_wall.offset_s())
+            .unwrap_or(0)
+    }
+
     /// A person's key or press the rewound `session` withheld: say so once on the message band.
     pub(crate) fn note_rewind_withheld(&mut self, session: u64) {
         let Some(view) = self.pool.rewind(session) else {
             return;
         };
         let shown = if view.shown.is_some() {
-            clock(
-                view.shown_unix_ms,
-                crate::presence::local_offset_s().unwrap_or(0),
-            )
+            clock(view.shown_unix_ms, self.rewind_offset_s(view.shown_unix_ms))
         } else {
             "an earlier screen".to_string()
         };
@@ -1145,6 +1153,11 @@ impl App {
             return;
         };
         let lane = ws.effect_present_interval();
+        if rewound {
+            // A key held for its echo cannot be proven against a rewound pane: the recording stops
+            // for it here, before the pause below would be refused mid-step.
+            crate::aos_host::refute_hold(ws, Instant::now());
+        }
         let held = ws.rewind_paused.take();
         let momentum = &mut ws.fx.cursor_mut().momentum;
         let kept = match (rewound, held) {

@@ -297,16 +297,22 @@ impl SlotGrid {
                 origin_ms: 0,
             };
         };
-        let mut widest = (first + len - last, last);
+        let mut widest = (len - last + first, last);
         for pair in phases.windows(2) {
             let gap = pair[1] - pair[0];
             if gap > widest.0 {
                 widest = (gap, pair[0]);
             }
         }
+        let half = widest.0 / 2;
+        let origin_ms = if widest.1 >= len - half {
+            widest.1 - (len - half)
+        } else {
+            widest.1 + half
+        };
         Self {
             slot_ms: len,
-            origin_ms: (widest.1 + widest.0 / 2).rem_euclid(len),
+            origin_ms,
         }
     }
 }
@@ -700,17 +706,27 @@ pub fn columns_of(
     let per_b = i64::from((per_s / 10).max(1));
     let now_k = now_unix_ms.div_euclid(BUCKET_MS);
     let last_start = now_k.div_euclid(per_b) * per_b;
-    let first_k = last_k + 1 - cells.len() as i64;
     let at = |k: i64| -> Option<Cell> {
-        (k >= first_k && k <= last_k && k <= now_k)
-            .then(|| usize::try_from(k - first_k).ok())
-            .flatten()
-            .and_then(|i| cells.get(i).copied())
+        if k > last_k || k > now_k {
+            return None;
+        }
+        let back = usize::try_from(i128::from(last_k) - i128::from(k)).ok()?;
+        let idx = cells.len().checked_sub(1 + back)?;
+        cells.get(idx).copied()
     };
     (0..ncols)
         .map(|j| {
-            let start = last_start - (ncols - 1 - j) as i64 * per_b;
-            Cell::merge((start..start + per_b).filter_map(at))
+            let steps_back = i128::from((ncols - 1 - j) as u64) * i128::from(per_b);
+            let col_lo = i128::from(last_start) - steps_back;
+            let col_hi = col_lo + i128::from(per_b);
+            if col_hi <= i128::from(i64::MIN) || col_lo > i128::from(i64::MAX) {
+                Cell::default()
+            } else {
+                let lo = i64::try_from(col_lo.max(i128::from(i64::MIN))).unwrap_or(i64::MIN);
+                let hi_incl =
+                    i64::try_from((col_hi - 1).min(i128::from(i64::MAX))).unwrap_or(i64::MAX);
+                Cell::merge((lo..=hi_incl).filter_map(at))
+            }
         })
         .collect()
 }
@@ -1122,15 +1138,22 @@ pub fn multi_scale_cells(
     let slots = spec.slots();
     let now_k = now_unix_ms.div_euclid(BUCKET_MS);
     let (ring_cells, last_k, recent) = (tiers.ring, tiers.ring_k, tiers.recent);
-    let first_k = last_k + 1 - ring_cells.len() as i64;
     let ring_at = |k: i64| -> Option<Cell> {
-        (k >= first_k && k <= last_k && k <= now_k)
-            .then(|| usize::try_from(k - first_k).ok())
-            .flatten()
-            .and_then(|i| ring_cells.get(i).copied())
+        if k > last_k || k > now_k {
+            return None;
+        }
+        let back = usize::try_from(i128::from(last_k) - i128::from(k)).ok()?;
+        let idx = ring_cells.len().checked_sub(1 + back)?;
+        ring_cells.get(idx).copied()
     };
-    let long_first = tiers.long_k + 1 - tiers.long.len() as i64;
+    let long_first_wide = i128::from(tiers.long_k) + 1 - tiers.long.len() as i128;
+    let long_first =
+        i64::try_from(long_first_wide.clamp(i128::from(i64::MIN), i128::from(i64::MAX)))
+            .unwrap_or(i64::MIN);
     let long_cell = |lo_ms: i64, hi_ms: i64| -> Cell {
+        if tiers.long.is_empty() {
+            return Cell::default();
+        }
         let (k_lo, k_hi) = (
             lo_ms.div_euclid(LONG_BUCKET_MS),
             hi_ms
@@ -1140,12 +1163,13 @@ pub fn multi_scale_cells(
         );
         Cell::merge_weighted(
             (k_lo.max(long_first)..=k_hi.min(tiers.long_k)).filter_map(|k| {
-                let cell = tiers
-                    .long
-                    .get(usize::try_from(k - long_first).ok()?)
-                    .copied()?;
-                let (b_lo, b_hi) = (k * LONG_BUCKET_MS, (k + 1) * LONG_BUCKET_MS);
-                Some((cell, hi_ms.min(b_hi) - lo_ms.max(b_lo)))
+                let back = usize::try_from(i128::from(tiers.long_k) - i128::from(k)).ok()?;
+                let idx = tiers.long.len().checked_sub(1 + back)?;
+                let cell = tiers.long.get(idx).copied()?;
+                let b_lo = i128::from(k) * i128::from(LONG_BUCKET_MS);
+                let b_hi = (i128::from(k) + 1) * i128::from(LONG_BUCKET_MS);
+                let ov = i128::from(hi_ms).min(b_hi) - i128::from(lo_ms).max(b_lo);
+                Some((cell, i64::try_from(ov).unwrap_or(i64::MAX)))
             }),
         )
     };
@@ -1319,6 +1343,11 @@ mod tests {
         let cols = sparse.columns(20, 3, T0 + 40_000);
         assert_eq!(cols[1].mean, None);
         assert_eq!(cols[0].mean, Some(1.0));
+        assert_eq!(columns_of(&[], i64::MAX, 10, 2, i64::MAX).len(), 2);
+        assert_eq!(
+            columns_of(&[Cell::default()], i64::MIN, 10, 4, i64::MIN).len(),
+            4
+        );
     }
 
     #[test]
@@ -1468,6 +1497,9 @@ mod tests {
         assert_eq!(one.opened(T0 + 650, T0 + 750), 1);
         assert_eq!(one.opened(T0 + 750, T0 + 1_650), 0);
         assert!(one.clear(T0 + 200, SLOT_GUARD_MS) && !one.clear(T0 + 690, SLOT_GUARD_MS));
+        let extreme = SlotGrid::clear_of(&[1, i64::MAX - 1], i64::MAX);
+        assert_eq!(extreme.slot_ms, i64::MAX);
+        assert!(extreme.origin_ms >= 0 && extreme.origin_ms < i64::MAX);
     }
 
     #[test]
@@ -1827,5 +1859,22 @@ mod tests {
                 "the earlier run's buckets at {lo}..{hi} ms"
             );
         }
+        assert_eq!(
+            multi_scale_cells(
+                Tiers {
+                    ring: &[Cell::default()],
+                    ring_k: i64::MAX,
+                    long: &[Cell::default()],
+                    long_k: i64::MAX.div_euclid(LONG_BUCKET_MS),
+                    recent: &[],
+                },
+                i64::MAX,
+                MultiScaleSpec::FULL_6H,
+                2_500,
+                &[],
+            )
+            .len(),
+            MultiScaleSpec::FULL_6H.slot_count()
+        );
     }
 }

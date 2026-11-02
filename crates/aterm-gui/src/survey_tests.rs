@@ -754,6 +754,9 @@ fn each_level_emits_exactly_its_fields() {
         "state",
         "program",
         "program_kind",
+        "wait",
+        "wait_gib",
+        "wait_ahead",
         "agent",
         "agent_detail",
         "agent_ms",
@@ -1749,4 +1752,130 @@ fn survey_rows_emits_c16_facts_and_round_trips_with_drive_isolation() {
     assert!(drive_reply.lines().nth(1).unwrap().contains(" drive=1"));
     let again = survey_rows(&store, SurveyLevel::Facts, usize::MAX, &non_drive);
     assert!(!again.lines().nth(1).unwrap().contains(" drive=1"));
+}
+
+/// A record of where a worker works, for the work rows' tests: branch `feat/x` in `/repo`, three
+/// behind `origin/main`, 70 files of which it names three, one holding a credential-shaped word
+/// and one a fleet join code, read 40 s before `now_ms`.
+fn work_record_at(now_ms: u64) -> aterm_agent::harness::work_record::WorkRecord {
+    aterm_agent::harness::work_record::WorkRecord {
+        host: "m7.local".into(),
+        common_dir: "/repo/.git".into(),
+        tree: "/repo/wt".into(),
+        branch: Some("feat/x".into()),
+        detached: None,
+        main_ref: "origin/main".into(),
+        base: Some("e23254f84a67131e6cad7724c7f749073b190dd2".into()),
+        behind: Some(3),
+        paths: vec![
+            "src/lib.rs".into(),
+            format!("keys/sk-proj-{}.env", "a1B2c3D4".repeat(4)),
+            "notes/atf1-q7xk-29fa-pm3c.md".into(),
+        ],
+        files: 70,
+        read_ms: now_ms.saturating_sub(40_000),
+        starts: 11,
+    }
+}
+
+/// A CONTENT ROW SAYS WHERE A WORKER WORKS, THROUGH THE REDACTOR: `work=` its branch,
+/// `work_repo=` and `work_tree=`, `work_base=` its main ref at the base's first 12 hex digits,
+/// `work_behind=`, `work_files=` (past the names), `work_paths=` every name it holds, one a line,
+/// a credential-shaped word and a fleet join code in them redacted, and `work_ms=` the record's
+/// age. NEGATIVE CONTROL: the same session's facts-level row carries no work field, so a fleet
+/// peer without a content grant sees none.
+#[test]
+fn a_content_row_says_where_a_worker_works_through_the_redactor() {
+    let store = crate::session_store::new_store();
+    let claude = crate::session_store::test_handle(5);
+    claude_session(&claude);
+    let now = aterm_time::unix_millis().expect("the clock");
+    assert!(
+        claude
+            .ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .set_work(4242, Some(work_record_at(now)))
+    );
+    store.write().unwrap().register(claude);
+    let row = |level| {
+        let out = survey_rows(&store, level, usize::MAX, &here());
+        fields(out.lines().nth(2).expect("the claude row"))
+    };
+    let content = row(SurveyLevel::Content);
+    for (key, want) in [
+        ("work", "feat/x"),
+        ("work_repo", "/repo/.git"),
+        ("work_tree", "/repo/wt"),
+        ("work_base", "origin/main@e23254f84a67"),
+        ("work_behind", "3"),
+        ("work_files", "70"),
+    ] {
+        assert_eq!(content[key], want, "{key}: {content:?}");
+    }
+    let paths: Vec<&str> = content["work_paths"].split('\n').collect();
+    assert_eq!(paths.len(), 3, "every name the record holds: {paths:?}");
+    assert_eq!(paths[0], "src/lib.rs");
+    assert!(
+        !paths[1].contains("a1B2c3D4") && paths[1].contains("[redacted"),
+        "a credential-shaped word is redacted: {paths:?}"
+    );
+    assert!(
+        paths[2].starts_with("notes/atf1-[redacted]") && !paths[2].contains("q7xk"),
+        "a join code is redacted: {paths:?}"
+    );
+    let age: u64 = content["work_ms"].parse().expect("an age");
+    assert!((40_000..600_000).contains(&age), "the record's age: {age}");
+
+    let facts = row(SurveyLevel::Facts);
+    let leaked: Vec<&String> = facts.keys().filter(|k| k.starts_with("work")).collect();
+    assert!(
+        leaked.is_empty(),
+        "CONTROL: a facts row says nothing of where it works: {leaked:?}"
+    );
+}
+
+/// A RECORD SHOWS ONLY WHILE ITS GROUP IS IN FRONT: a record put for the agent's group shows in
+/// its content row; one put for another group is not taken; once a shell's group is in front the
+/// row shows none. NEGATIVE CONTROL: with the agent's group in front again, the same group's
+/// record is shown.
+#[test]
+fn a_record_shows_only_while_its_group_is_in_front() {
+    let store = crate::session_store::new_store();
+    let claude = crate::session_store::test_handle(5);
+    claude_session(&claude);
+    let now = aterm_time::unix_millis().expect("the clock");
+    store.write().unwrap().register(claude.clone());
+    let work = || {
+        let out = survey_rows(&store, SurveyLevel::Content, usize::MAX, &here());
+        fields(out.lines().nth(2).expect("the row"))
+            .get("work")
+            .cloned()
+    };
+    assert_eq!(work(), None, "no record read yet");
+    let mut tl = claude.ctx.timeline.lock().unwrap();
+    assert!(tl.set_work(4242, Some(work_record_at(now))));
+    assert!(
+        !tl.set_work(4243, Some(work_record_at(now))),
+        "another group's record is not taken"
+    );
+    drop(tl);
+    assert_eq!(work().as_deref(), Some("feat/x"));
+    let mut tl = claude.ctx.timeline.lock().unwrap();
+    tl.note_foreground_group(4243);
+    tl.set_program(4243, Some("zsh".into()));
+    drop(tl);
+    assert_eq!(work(), None, "a shell in front shows no record");
+    claude
+        .ctx
+        .timeline
+        .lock()
+        .unwrap()
+        .note_foreground_group(4242);
+    assert_eq!(
+        work().as_deref(),
+        Some("feat/x"),
+        "CONTROL: the record's own group in front again"
+    );
 }

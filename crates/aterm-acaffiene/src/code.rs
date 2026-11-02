@@ -27,7 +27,30 @@ pub fn mark_ran(code_dir: &Path) {
         return;
     };
     let home = dir.join(label).join(id);
-    if let Err(e) = std::fs::write(home.join(RAN), b"") {
+    let ran_path = home.join(RAN);
+    #[cfg(unix)]
+    let wrote = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&ran_path)
+            .and_then(|file| {
+                if !file.metadata()?.is_file() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("{} is not a regular file", ran_path.display()),
+                    ));
+                }
+                Ok(())
+            })
+    };
+    #[cfg(not(unix))]
+    let wrote = std::fs::write(&ran_path, b"");
+    if let Err(e) = wrote {
         eprintln!(
             "aterm acaffiene: cannot mark {} as run from: {e}",
             home.display()
@@ -77,7 +100,7 @@ fn is_under(exe: &Path, dir: &Path) -> bool {
         .is_ok_and(|rest| rest.components().next().is_some())
 }
 
-/// Copy the bundle `origin` belongs to into `code_dir` (replacing an earlier copy for `label`) and return the copy's executable.
+/// Copy the bundle `origin` belongs to into `code_dir` (replacing an earlier copy for `label`) and return the copy's executable, or, when a mug already ran from the copy for `label` and the bundle is unchanged since it was made ([`ran_copy`]), that copy's: a start again (launchd's retry, a window's kickstart) copies no bundle.
 ///
 /// # Errors
 /// The copy cannot be made: `label` is not a plain name, `code_dir` is not a directory of
@@ -132,7 +155,14 @@ fn copy_bundle(origin: &Path, bundle: &Path, code_dir: &Path, label: &str) -> io
         .file_name()
         .ok_or_else(|| io::Error::other("the bundle has no name"))?;
     private_dir(code_dir)?;
-    sweep(code_dir, std::time::SystemTime::now())?.say();
+    let print = bundle_print(origin, bundle).ok();
+    let reused = print
+        .as_deref()
+        .and_then(|print| ran_copy(code_dir, label, print, &inner));
+    sweep(code_dir, std::time::SystemTime::now(), reused.as_deref())?.say();
+    if let Some(home) = reused {
+        return Ok(home.join(inner));
+    }
     let slot = code_dir.join(label);
     match std::fs::create_dir(&slot) {
         Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e),
@@ -155,6 +185,11 @@ fn copy_bundle(origin: &Path, bundle: &Path, code_dir: &Path, label: &str) -> io
     let partial = slot.join(format!("{id}.partial"));
     let made = std::fs::create_dir(&partial)
         .and_then(|()| copy_tree(bundle, &partial.join(top)))
+        .and_then(|()| {
+            print
+                .as_ref()
+                .map_or(Ok(()), |print| std::fs::write(partial.join(SOURCE), print))
+        })
         .and_then(|()| std::fs::rename(&partial, &home));
     if let Err(e) = made {
         let _ = std::fs::remove_dir_all(&partial);
@@ -171,14 +206,117 @@ fn copy_bundle(origin: &Path, bundle: &Path, code_dir: &Path, label: &str) -> io
     Ok(home.join(inner))
 }
 
+/// The file in a copy's directory, beside [`RAN`], naming the bundle it was copied from
+/// ([`bundle_print`]).
+#[cfg(unix)]
+const SOURCE: &str = "source";
+
+/// What names `bundle`'s code, for a reuse of a copy of it ([`ran_copy`]): `origin`, and every
+/// entry under the bundle by its path, kind, size, permissions and modification time (a link by
+/// its target too), hashed. Only metadata is read, so a start that reuses a copy walks the
+/// bundle and copies none of its bytes; an update, which puts a new bundle in place, and a
+/// rebuild, which writes new files, both change it.
+#[cfg(unix)]
+fn bundle_print(origin: &Path, bundle: &Path) -> io::Result<String> {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+    fn walk(at: &Path, rel: &Path, hash: &mut u64, entries: &mut u64) -> io::Result<()> {
+        let meta = std::fs::symlink_metadata(at)?;
+        let kind = meta.file_type();
+        *entries += 1;
+        let mut row = rel.as_os_str().as_bytes().to_vec();
+        row.push(0);
+        row.extend_from_slice(
+            format!(
+                "{}:{}:{:o}:{}.{:09}\n",
+                if kind.is_dir() {
+                    'd'
+                } else if kind.is_symlink() {
+                    'l'
+                } else {
+                    'f'
+                },
+                meta.len(),
+                meta.mode(),
+                meta.mtime(),
+                meta.mtime_nsec()
+            )
+            .as_bytes(),
+        );
+        if kind.is_symlink() {
+            row.extend_from_slice(std::fs::read_link(at)?.as_os_str().as_bytes());
+            row.push(0);
+        }
+        *hash = aterm_hash::fnv1a_64_extend(*hash, &row);
+        if kind.is_dir() {
+            let mut names = std::fs::read_dir(at)?
+                .map(|entry| entry.map(|entry| entry.file_name()))
+                .collect::<io::Result<Vec<_>>>()?;
+            names.sort();
+            for name in names {
+                walk(&at.join(&name), &rel.join(&name), hash, entries)?;
+            }
+        }
+        Ok(())
+    }
+    let (mut hash, mut entries) = (aterm_hash::fnv1a_64(b""), 0);
+    walk(bundle, Path::new(""), &mut hash, &mut entries)?;
+    Ok(format!(
+        "origin={}\nentries={entries}\ntree={hash:016x}\n",
+        origin.display()
+    ))
+}
+
+/// The copy for `label` under `code_dir` that a mug already ran from (its [`RAN`] marker) and
+/// whose [`SOURCE`] is `print`, with its executable at `inner`: macOS assessed its first exec
+/// when that mug ran, and the bundle has not changed since it was made.
+#[cfg(unix)]
+fn ran_copy(code_dir: &Path, label: &str, print: &str, inner: &Path) -> Option<PathBuf> {
+    let slot = code_dir.join(label);
+    if !std::fs::symlink_metadata(&slot).ok()?.file_type().is_dir() {
+        return None;
+    }
+    std::fs::read_dir(&slot)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|home| {
+            std::fs::symlink_metadata(home).is_ok_and(|meta| meta.file_type().is_dir())
+                && home.extension().is_none_or(|e| e != "partial")
+                && home.join(RAN).is_file()
+                && read_capped(&home.join(SOURCE)).is_some_and(|text| text == print.as_bytes())
+                && home.join(inner).is_file()
+        })
+}
+
 #[cfg(unix)]
 fn private_dir(dir: &Path) -> io::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+    use std::os::unix::fs::{
+        DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
+    };
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(dir)?;
-    let meta = std::fs::symlink_metadata(dir)?;
+    let link_meta = std::fs::symlink_metadata(dir)?;
+    if !link_meta.file_type().is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a directory", dir.display()),
+        ));
+    }
+    let dir_fd = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(dir)
+        .map_err(|err| match err.raw_os_error() {
+            Some(code) if code == libc::ELOOP || code == libc::ENOTDIR => io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is not a directory", dir.display()),
+            ),
+            _ => err,
+        })?;
+    let meta = dir_fd.metadata()?;
     if !meta.file_type().is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -192,64 +330,11 @@ fn private_dir(dir: &Path) -> io::Result<()> {
         ));
     }
     if meta.permissions().mode() & 0o777 != 0o700 {
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        dir_fd.set_permissions(std::fs::Permissions::from_mode(0o700))?;
     }
-    #[cfg(target_os = "macos")]
-    exclude_from_backup(dir);
+    // Best effort, as it was: a copy with no backup mark still runs.
+    let _ = aterm_uds::backup::Backups::SYSTEM.exclude(&dir_fd);
     Ok(())
-}
-
-#[cfg(target_os = "macos")]
-const BACKUP_EXCLUDE: &std::ffi::CStr = c"com.apple.metadata:com_apple_backup_excludeItem";
-
-#[cfg(target_os = "macos")]
-const TRUE_BPLIST: &[u8] = &[
-    0x62, 0x70, 0x6c, 0x69, 0x73, 0x74, 0x30, 0x30, 0x09, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x09,
-];
-
-#[cfg(target_os = "macos")]
-#[cfg_attr(trust_verify, trust::skip)]
-fn backup_excluded(dir: &std::ffi::CStr) -> bool {
-    let mut have = [0u8; 64];
-    // SAFETY: `dir` and the name are NUL-terminated strings live for the call, and `have` is
-    // a writable buffer of the length passed; `getxattr` writes at most that many bytes and
-    // answers how many, or -1.
-    let n = unsafe {
-        libc::getxattr(
-            dir.as_ptr(),
-            BACKUP_EXCLUDE.as_ptr(),
-            have.as_mut_ptr().cast(),
-            have.len(),
-            0,
-            0,
-        )
-    };
-    usize::try_from(n).is_ok_and(|n| have.get(..n) == Some(TRUE_BPLIST))
-}
-
-#[cfg(target_os = "macos")]
-#[cfg_attr(trust_verify, trust::skip)]
-fn exclude_from_backup(dir: &Path) {
-    use std::os::unix::ffi::OsStrExt as _;
-    let Ok(name) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
-        return;
-    };
-    if backup_excluded(&name) {
-        return;
-    }
-    // SAFETY: both strings are NUL-terminated and live for the call, and the value is a `'static` slice of the length passed.
-    unsafe {
-        libc::setxattr(
-            name.as_ptr(),
-            BACKUP_EXCLUDE.as_ptr(),
-            TRUE_BPLIST.as_ptr().cast(),
-            TRUE_BPLIST.len(),
-            0,
-            0,
-        );
-    }
 }
 
 /// Remove `code_dir` and every copy in it that may go ([`sweep`]), and return the copies kept.
@@ -270,7 +355,7 @@ pub fn discard_copies(code_dir: &Path) -> io::Result<Kept> {
             format!("{} is not this user's directory", code_dir.display()),
         ));
     }
-    let kept = sweep(code_dir, std::time::SystemTime::now())?;
+    let kept = sweep(code_dir, std::time::SystemTime::now(), None)?;
     if std::fs::read_dir(code_dir)?.next().is_none() {
         std::fs::remove_dir(code_dir)?;
     }
@@ -310,28 +395,50 @@ pub fn kept_line(copy: &Path) -> String {
 #[cfg(unix)]
 const PROBE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Whether the executable `origin` still has the `acaffiene` verb.
+/// Whether the executable `origin` still has the `acaffiene` verb ([`answers_help`]).
 #[cfg(unix)]
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn serves_acaffiene(origin: &Path) -> Option<bool> {
-    serves_acaffiene_within(origin, PROBE_WAIT)
+    answers_help(origin, "acaffiene")
+}
+
+/// Whether the executable `origin` answers `help <topic>` with exit status 0, as an aterm does for
+/// a verb it has. `None` when it gave no answer: it could not be run, did not exit within ten
+/// seconds, or was ended by a signal.
+#[cfg(unix)]
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn answers_help(origin: &Path, topic: &str) -> Option<bool> {
+    answers(origin, ["help", topic])
+}
+
+/// Whether the executable `origin`, run with `args`, exits with status 0. `None` when it gave no
+/// answer, as for [`answers_help`].
+#[cfg(unix)]
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn answers(origin: &Path, args: [&str; 2]) -> Option<bool> {
+    answers_within(origin, args, PROBE_WAIT)
 }
 
 #[cfg(unix)]
 #[cfg_attr(trust_verify, trust::skip)]
-fn serves_acaffiene_within(origin: &Path, wait: std::time::Duration) -> Option<bool> {
-    let out = aterm_uds::deadline::output_until(
-        aterm_uds::spawnfd::command(origin).args(["help", "acaffiene"]),
-        std::time::Instant::now() + wait,
-    )
-    .ok()?;
+fn answers_within(origin: &Path, args: [&str; 2], wait: std::time::Duration) -> Option<bool> {
+    let now = std::time::Instant::now();
+    let deadline = now
+        .checked_add(wait)
+        .unwrap_or_else(|| now + std::time::Duration::from_secs(86_400 * 365));
+    let out =
+        aterm_uds::deadline::output_until(aterm_uds::spawnfd::command(origin).args(args), deadline)
+            .ok()?;
     out.status.code().map(|code| code == 0)
 }
 
-/// Remove each copy in `dir` that may go at `now` ([`may_go`]), and return the ones kept.
+/// Remove each copy in `dir` that may go at `now` ([`may_go`]) but `keep`, the copy a start
+/// reuses ([`ran_copy`]), and return the ones kept because they may not go yet.
 #[cfg(unix)]
-fn sweep(dir: &Path, now: std::time::SystemTime) -> io::Result<Kept> {
+fn sweep(dir: &Path, now: std::time::SystemTime, keep: Option<&Path>) -> io::Result<Kept> {
     let mut kept_copies = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -349,6 +456,10 @@ fn sweep(dir: &Path, now: std::time::SystemTime) -> io::Result<Kept> {
             let copy = copy?;
             let at = copy.path();
             let dir = copy.file_type()?.is_dir();
+            if dir && keep == Some(at.as_path()) {
+                kept = true;
+                continue;
+            }
             if dir && !may_go(&at, now) {
                 kept_copies.push(at);
                 kept = true;
@@ -459,12 +570,19 @@ fn xml_unescape(text: &str) -> String {
 
 fn read_capped(path: &Path) -> Option<Vec<u8>> {
     use std::io::Read as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
     let mut bytes = Vec::new();
-    std::fs::File::open(path)
-        .ok()?
-        .take(PLIST_CAP + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
+    file.take(PLIST_CAP + 1).read_to_end(&mut bytes).ok()?;
     (bytes.len() as u64 <= PLIST_CAP).then_some(bytes)
 }
 
@@ -722,9 +840,12 @@ mod tests {
         assert_eq!(mode & 0o777, 0o700);
         #[cfg(target_os = "macos")]
         {
-            use std::os::unix::ffi::OsStrExt as _;
-            let name = std::ffi::CString::new(code.as_os_str().as_bytes()).expect("no NUL");
-            assert!(backup_excluded(&name), "{}", code.display());
+            let code_file = std::fs::File::open(&code).expect("open code");
+            assert!(
+                aterm_uds::backup::Backups::SYSTEM.excluded(&code_file),
+                "{}",
+                code.display()
+            );
         }
 
         std::fs::write(app.join("Contents").join("new.txt"), "new").expect("new");
@@ -748,6 +869,7 @@ mod tests {
             sweep(
                 &code,
                 std::time::SystemTime::now() + aterm_uds::deadline::FIRST_EXEC_HANG,
+                None,
             )
             .expect("sweep"),
             Kept::default(),
@@ -758,6 +880,50 @@ mod tests {
             !home_of(&code, &third).exists(),
             "and so is the third, by then"
         );
+    }
+
+    /// A start again of an unchanged bundle (launchd's retry, a window's kickstart) runs the
+    /// copy a mug already ran from, copying nothing; one no mug ran from yet is not taken; a
+    /// changed bundle is copied anew, and the copy that ran is swept.
+    #[cfg(unix)]
+    #[test]
+    fn a_start_again_reuses_the_copy_that_ran() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let app = stand_in_bundle(root.path(), "com.example.fake");
+        let origin = app.join("Contents").join("MacOS").join("aterm");
+        let code = root.path().join("state").join("acaffiene-code.noindex");
+        let copies = || {
+            let mut copies: Vec<_> = std::fs::read_dir(code.join("lbl"))
+                .expect("list")
+                .map(|e| e.expect("entry").path())
+                .collect();
+            copies.sort();
+            copies
+        };
+        let first = prepare_copy(&origin, &code, "lbl")
+            .expect("copy")
+            .expect("a bundle");
+        let home = home_of(&code, &first);
+        let unran = prepare_copy(&origin, &code, "lbl")
+            .expect("copy")
+            .expect("a bundle");
+        assert_ne!(unran, first, "no mug ran from the first: not taken");
+        std::fs::write(home.join(RAN), "").expect("ran");
+        let before = copies();
+        let again = prepare_copy(&origin, &code, "lbl")
+            .expect("copy")
+            .expect("a bundle");
+        assert_eq!(again, first, "the copy that ran is run again");
+        assert_eq!(copies(), before, "and nothing is copied");
+        assert_same_tree(&app, &home.join("Fake (dev).app"));
+
+        std::fs::write(&origin, "#!/bin/sh\nexit 10\n").expect("a rebuild");
+        let rebuilt = prepare_copy(&origin, &code, "lbl")
+            .expect("copy")
+            .expect("a bundle");
+        assert_ne!(rebuilt, first, "a changed bundle is copied anew");
+        assert!(!home.exists(), "and the copy that ran is swept");
+        assert_same_tree(&app, &home_of(&code, &rebuilt).join("Fake (dev).app"));
     }
 
     #[cfg(unix)]
@@ -811,17 +977,18 @@ mod tests {
     #[test]
     fn the_probe_reads_the_verb_from_the_exit_status() {
         let hang = std::time::Duration::from_secs(60);
+        let args = ["help", "acaffiene"];
         assert_eq!(
-            serves_acaffiene_within(Path::new("/usr/bin/true"), hang),
+            answers_within(Path::new("/usr/bin/true"), args, hang),
             Some(true)
         );
         assert_eq!(
-            serves_acaffiene_within(Path::new("/usr/bin/false"), hang),
+            answers_within(Path::new("/usr/bin/false"), args, hang),
             Some(false)
         );
         let root = aterm_tempfile::tempdir().expect("tempdir");
         assert_eq!(
-            serves_acaffiene_within(&root.path().join("missing"), hang),
+            answers_within(&root.path().join("missing"), args, hang),
             None
         );
     }

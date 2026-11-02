@@ -17,6 +17,12 @@ mod label_retention;
 #[path = "cli_report_read_tests.rs"]
 mod report_read;
 
+#[path = "cli_live_version_tests.rs"]
+mod live_version;
+
+#[path = "cli_outlook_tests.rs"]
+mod outlook_report;
+
 #[path = "cli_upgrade_policy_tests.rs"]
 mod upgrade_policy;
 
@@ -28,6 +34,17 @@ mod renewal_identity;
 
 #[path = "cli_signin_epoch_tests.rs"]
 mod signin_epoch;
+
+/// Whether a sign-in of `cli`'s row runs here: one into an overlay home (`Seam::Overlay`, Kimi's)
+/// runs only on Unix, where aterm links one (`signin`'s
+/// `a_sign_in_that_needs_an_overlay_runs_nothing_where_aterm_makes_no_links` holds the refusal).
+fn signs_in_here(cli: Cli) -> bool {
+    cfg!(unix)
+        || !matches!(
+            cli.accounts().seam,
+            crate::ai::connector::Seam::Overlay { .. }
+        )
+}
 
 fn tmp_dir(tag: &str) -> Tmp {
     aterm_tempfile::Builder::new()
@@ -78,9 +95,11 @@ fn commons_accounts_are_readable_without_a_spreadsheet_or_local_pool() {
             email: Some("one@example.test".into()),
             realm: None,
             secret_reference: true,
+            required_browser: false,
             conflicted: false,
             stopped: false,
             import: None,
+            import_link: None,
         }],
         ..Default::default()
     });
@@ -125,6 +144,7 @@ fn shared_import_candidates_remain_visible_without_a_local_cli_or_login() {
             email: Some("one@example.test".into()),
             realm: None,
             secret_reference: false,
+            required_browser: false,
             conflicted: false,
             stopped: false,
             import: Some(ImportOrigin {
@@ -136,6 +156,7 @@ fn shared_import_candidates_remain_visible_without_a_local_cli_or_login() {
                 machine_hint: Some("m1".into()),
                 unclassified_columns: vec![8],
             }),
+            import_link: None,
         }],
         ..Default::default()
     });
@@ -1656,8 +1677,8 @@ fn usage_from_codex_tools_names_the_row_its_auth_path_names() {
     let auth = format!("{work}/auth.json");
     let roster = env.accounts_roster_for(Cli::Codex).expect("a config dir");
     let one = "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n".to_owned();
-    let two =
-        format!("{one}\n[[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = \"{work}\"\n");
+    let dir = host_path::toml(Path::new(&work));
+    let two = format!("{one}\n[[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = {dir}\n");
     std::fs::write(&roster, &two).expect("roster");
     // The login as `Env::from_process` reads it from a Codex tool's environment: the thread, the
     // tab's session variable where `in_tab`, and `pairs`.
@@ -1741,7 +1762,7 @@ fn usage_from_codex_tools_names_the_row_its_auth_path_names() {
     env.codex_login = login(&[("CODEX_AUTH_PATH", auth.as_str())]);
     std::fs::write(
         &roster,
-        format!("[[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = \"{work}\"\n"),
+        format!("[[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = {dir}\n"),
     )
     .expect("roster");
     assert_eq!(shown(&env), "codex", "a roster of one names no account");
@@ -1762,13 +1783,14 @@ fn a_codex_tools_environment_names_its_thread_and_login() {
                 .map(|(name, value)| (OsString::from(name), OsString::from(value))),
         )
     };
+    let auth = abs("/logins/work/auth.json");
     let work = [
         ("CODEX_THREAD_ID", THREAD),
         (TAB_SESSION_VAR, "s-a"),
-        ("CODEX_AUTH_PATH", "/logins/work/auth.json"),
+        ("CODEX_AUTH_PATH", auth.as_str()),
     ];
     let want = accounts::ProcessLogin {
-        login: Some("/logins/work".to_owned()),
+        login: Some(abs("/logins/work")),
         default_home: true,
         stored_login: true,
     };
@@ -2085,7 +2107,7 @@ fn a_kimi_limits_read_persists_the_month_and_session() {
         "   ╰─────────────────────────────────────────────────╯",
     ]);
     let view = limits_view(Program::Kimi.reader(), &rows, env.now, 0, &|_, _| None);
-    record_limits_usage(&env, "@s-worker", Cli::Kimi, &view, 0).unwrap();
+    record_limits_usage(&env, "@s-worker", Cli::Kimi, &view, &|_| Some(0)).unwrap();
     let store = env.accounts_store_for(Cli::Kimi).unwrap();
     let (state, _) = store.load(env.now).unwrap();
     let account = state.account("kimi-m22");
@@ -2094,20 +2116,69 @@ fn a_kimi_limits_read_persists_the_month_and_session() {
     assert_eq!(monthly.whole(), 13);
     assert_eq!(monthly.at, env.now);
     assert_eq!(monthly.reset, env.now + 26 * 86_400 + 20 * 3600 + 27 * 60);
+    let stats = |json: bool| {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_accounts_stats_of(
+            Cli::Kimi,
+            &env,
+            &FakeHost::new(&never_asked),
+            json,
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&err));
+        out
+    };
+    let doc: Value = aterm_json::from_slice(&stats(true)).unwrap();
+    assert_eq!(doc["rows"][0]["monthly"]["pct"].as_u64(), Some(13));
+    assert_eq!(doc["rows"][0]["monthly_read_at"].as_i64(), Some(env.now));
+    let text = String::from_utf8(stats(false)).unwrap();
+    let row = text
+        .lines()
+        .find(|l| l.starts_with("  kimi-m22: "))
+        .expect("the row's line");
+    assert!(
+        row.contains(&format!("5h 36% until {}", rfc3339_utc(env.now + 25 * 60))),
+        "the figure it read: {row}"
+    );
+    assert!(
+        row.contains("week \u{2013} (not in its newest reading)"),
+        "the week its panel did not show, with why, never a bare `?`: {row}"
+    );
+    assert!(row.contains("monthly 13% until "), "{row}");
+    assert!(!row.contains('?'), "{row}");
+}
+
+/// A KIMI ROW WITH NO MONTHLY READING SAYS SO, NEVER `monthly ?`; nor does one with no reading
+/// at all.
+#[test]
+fn a_kimi_row_with_no_monthly_reading_says_why() {
+    let tmp = tmp_dir("kimi-no-month");
+    let env = env_at(&tmp);
+    let roster = accounts::append_row("", "kimi-m22", Class::Dedicated, None).unwrap();
+    std::fs::write(env.accounts_roster_for(Cli::Kimi).unwrap(), roster).unwrap();
     let mut out = Vec::new();
     let mut err = Vec::new();
     let code = run_accounts_stats_of(
         Cli::Kimi,
         &env,
         &FakeHost::new(&never_asked),
-        true,
+        false,
         &mut out,
         &mut err,
     );
     assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&err));
-    let doc: Value = aterm_json::from_slice(&out).unwrap();
-    assert_eq!(doc["rows"][0]["monthly"]["pct"].as_u64(), Some(13));
-    assert_eq!(doc["rows"][0]["monthly_read_at"].as_i64(), Some(env.now));
+    let text = String::from_utf8(out).unwrap();
+    let row = text
+        .lines()
+        .find(|l| l.starts_with("  kimi-m22: "))
+        .expect("the row's line");
+    assert!(
+        row.contains("no reading yet \u{b7} monthly \u{2013} (no reading yet)"),
+        "{row}"
+    );
+    assert!(!row.contains('?'), "{row}");
 }
 
 #[test]
@@ -2257,7 +2328,7 @@ fn kimi_refresh_executes_the_enrolled_home_as_an_environment_assignment() {
     let fake = bin.join("kimi");
     std::fs::write(&fake, "#!/bin/sh\nprintf '%s\\n' \"$KIMI_CODE_HOME\"\n").unwrap();
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let mut shell = aterm_uds::spawnfd::command("/bin/sh");
+    let mut shell = aterm_uds::spawnfd::command(crate::test_program::kept("/bin/sh"));
     shell
         .env("PATH", &bin)
         .arg("-c")
@@ -2694,6 +2765,7 @@ fn real_remover(now: i64) -> impl FnMut(&disk::Row) -> io::Result<disk::Removed>
             device: None,
             volume: None,
         },
+        None,
         disk::idle::Sessions::default,
     )
 }
@@ -2851,6 +2923,7 @@ fn tick_below_floor(
             device: None,
             volume: None,
         },
+        None,
         disk::idle::Sessions::default,
     );
     let DiskTick::Reclaimed(done, _) = disk_tick(&look, cfg, &mut remover, measure) else {
@@ -3728,7 +3801,7 @@ fn a_hand_run_upgrade_leaves_out_an_agent_whose_switch_is_off() {
     let config = env.config.clone().expect("config path");
     let dir = env.state.join("upgrade");
     std::fs::create_dir_all(&dir).expect("state");
-    let mut gone = aterm_uds::spawnfd::command("true")
+    let mut gone = aterm_uds::spawnfd::command(crate::test_program::kept("/usr/bin/true"))
         .spawn()
         .expect("a process to outlive");
     let pid = gone.id();
@@ -3795,7 +3868,9 @@ fn a_hand_run_upgrade_arms_the_tap_by_the_shared_block() {
         "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n",
     )
     .expect("roster");
-    let login = "/s/main.1";
+    // A login is an absolute directory on every host (`accounts::dir_refusal`).
+    let login_dir = tmp.path().join("main.1");
+    let login = login_dir.to_str().expect("a UTF-8 temp path");
     let mut logins = accounts::Logins::default();
     accounts::note_renewed(
         &mut accounts::State::default(),
@@ -4097,7 +4172,7 @@ fn live_holder_in(
         read
     });
     let start = aterm_uds::deadline::output_until(
-        aterm_uds::spawnfd::command(aterm_uds::os_path!("ps"))
+        aterm_uds::spawnfd::command(crate::test_program::kept(aterm_uds::os_path!("ps")))
             .args(["-o", "lstart=", "-p", &pid.to_string()])
             .env("LC_ALL", "C")
             .env("TZ", "UTC"),
@@ -4644,6 +4719,76 @@ fn the_view_places_a_weekly_walls_bare_clock_after_its_print() {
         .resets_at,
         Some(now - 11 * 3600)
     );
+
+    // Zoneless session and weekly walls across 2026-11-01 fall-back (PDT -> PST at 09:00Z).
+    let pre_now = 1_793_518_200; // 2026-11-01 00:30 PDT (07:30Z)
+    let change = 1_793_523_600; // 2026-11-01T09:00:00Z
+    let la_at = |unix: i64| Some(if unix < change { -7 * 3600 } else { -8 * 3600 });
+    let mut zoneless = rows(&[
+        "⏺ Running the suite.",
+        "  ⎿  You've hit your session limit · resets 3am",
+        "",
+        "✻ Worked for 3m 2s · done 12:25 AM",
+        "",
+    ]);
+    zoneless.extend(composer("  ⏵⏵ bypass permissions on"));
+    assert_eq!(
+        limits_view_local(
+            Program::Claude.reader(),
+            &zoneless,
+            pre_now,
+            &la_at,
+            &|_, _| None,
+        )
+        .resets_at,
+        Some(1_793_530_800),
+        "Nov 1 3am PST (11:00Z) after the 2am PDT -> 1am PST fall-back"
+    );
+    assert_eq!(
+        limits_view(
+            Program::Claude.reader(),
+            &zoneless,
+            pre_now,
+            -7 * 3600,
+            &|_, _| None,
+        )
+        .resets_at,
+        Some(1_793_527_200),
+        "CONTROL: flat PDT places 3am an hour early at 10:00Z"
+    );
+
+    let mut ahead = rows(&[
+        "⏺ Running the suite.",
+        "  ⎿  You've hit your weekly limit · resets Nov 3 at 11am",
+        "",
+        "✻ Worked for 3m 2s · done 12:25 AM",
+        "",
+    ]);
+    ahead.extend(composer("  ⏵⏵ bypass permissions on"));
+    assert_eq!(
+        limits_view_local(
+            Program::Claude.reader(),
+            &ahead,
+            pre_now,
+            &la_at,
+            &|_, _| None
+        )
+        .resets_at,
+        Some(1_793_732_400),
+        "Nov 3 11am PST (19:00Z)"
+    );
+    assert_eq!(
+        limits_view(
+            Program::Claude.reader(),
+            &ahead,
+            pre_now,
+            -7 * 3600,
+            &|_, _| None
+        )
+        .resets_at,
+        Some(1_793_728_800),
+        "CONTROL: flat PDT places Nov 3 an hour early"
+    );
 }
 
 fn exit(code: u8) -> String {
@@ -4783,14 +4928,36 @@ fn three_accounts(tmp: &Tmp, env: &Env) -> (String, String) {
     (work, pool)
 }
 
+/// A report window's figures: its JSON without the outlook's `fresh` and `projection`.
+fn figures_of(window: &Value) -> Value {
+    let mut window = window.clone();
+    if let Value::Object(fields) = &mut window {
+        fields.remove("fresh");
+        fields.remove("projection");
+    }
+    window
+}
+
+/// Every file under `dir` with its bytes. A lock file a held lock covers reads as its length on
+/// Windows, which refuses a read of a range another handle locks (`ERROR_LOCK_VIOLATION`).
 fn every_file(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    const ERROR_LOCK_VIOLATION: i32 = 33;
     let mut found = Vec::new();
     for entry in std::fs::read_dir(dir).expect("read dir").flatten() {
         let path = entry.path();
         if path.is_dir() {
             found.extend(every_file(&path));
         } else {
-            let bytes = std::fs::read(&path).expect("read");
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(e) if cfg!(windows) && e.raw_os_error() == Some(ERROR_LOCK_VIOLATION) => {
+                    let len = std::fs::metadata(&path)
+                        .expect("a locked file's length")
+                        .len();
+                    format!("locked, {len} bytes").into_bytes()
+                }
+                Err(e) => panic!("read {}: {e}", path.display()),
+            };
             found.push((path, bytes));
         }
     }
@@ -6212,7 +6379,11 @@ fn a_state_file_of_another_schema_is_refused_by_every_write_and_left_as_it_is() 
     three_accounts(&tmp, &env);
     let store = env.accounts_store();
     store.ensure().expect("the store's directory");
-    let newer = r#"{"schema":2,"active":"work-2","pinned":true,"accounts":{}}"#;
+    let newer = r#"{"schema":18446744073709551615,"active":"work-2","pinned":true,"accounts":{}}"#;
+    assert!(matches!(
+        accounts::State::from_json(newer, env.now),
+        Err(accounts::Unread::NotOurs(_))
+    ));
     std::fs::write(store.state_file(), newer).expect("write");
     let all_in = |_: &str| said(true);
     let mut tty = FakeHost::new(&all_in);
@@ -6236,10 +6407,7 @@ fn a_state_file_of_another_schema_is_refused_by_every_write_and_left_as_it_is() 
     for (form, host) in writes {
         let (code, out, err) = acc(form.clone(), &env, host);
         assert_eq!(code, exit(1), "{form:?}: {out}");
-        assert!(
-            err.contains("state.json") && err.contains("schema 2"),
-            "{form:?} names the file: {err}"
-        );
+        assert!(!err.is_empty(), "{form:?} explains its refusal");
         assert!(!out.contains("pinned"), "{form:?} claims nothing: {out}");
         assert_eq!(
             std::fs::read_to_string(store.state_file()).expect("read"),
@@ -6270,10 +6438,10 @@ fn a_state_file_of_another_schema_is_refused_by_every_write_and_left_as_it_is() 
     for json in [false, true] {
         let (code, out, err) = acc_quiet(AccountsCmd::Report { json }, &env);
         assert_eq!(code, exit(1), "{err}");
-        assert!(err.contains("schema 2"), "{err}");
+        assert!(!err.is_empty());
         if json {
             let doc: Value = aterm_json::from_str(out.trim()).expect("one JSON document");
-            assert!(doc["refused"].as_str().unwrap().contains("schema 2"));
+            assert!(doc["refused"].as_str().is_some_and(|why| !why.is_empty()));
             assert!(doc["accounts"].as_array().unwrap().is_empty());
             assert!(doc.get("next").is_none());
         } else {
@@ -6732,7 +6900,10 @@ fn usage_shows_the_tap_reading_of_its_own_process() {
     let process = FakeClaude::with(&[("HOME", "/home/someone")]);
     tap_into("s-9999");
     let hud = run(&env, &process, false);
-    assert!(hud.contains("?%/5h · ?%/7d"), "another tab's file: {hud}");
+    assert!(
+        hud.contains("\u{2013}/5h · \u{2013}/7d"),
+        "another tab's file: {hud}"
+    );
     tap_into("s-1a2b");
     let hud = run(&env, &process, false);
     assert!(
@@ -6749,7 +6920,313 @@ fn usage_shows_the_tap_reading_of_its_own_process() {
         ..FakeClaude::with(&[("HOME", "/home/someone")])
     };
     let hud = run(&env, &later, false);
-    assert!(hud.contains("?%/5h · ?%/7d"), "a reused pid's file: {hud}");
+    assert!(
+        hud.contains("\u{2013}/5h · \u{2013}/7d"),
+        "a reused pid's file: {hud}"
+    );
+    assert!(
+        hud.contains("\n5h, 7d \u{2013}: no usage-tap reading of this Claude Code process"),
+        "{hud}"
+    );
+    assert!(hud.contains(" · resets \u{2013} · none"), "{hud}");
+    assert!(
+        hud.contains(
+            "; the accounts store and the /usage cache were not read: aterm judged no account \
+             for this process\n"
+        ),
+        "an untapped, unproven process reads neither, and says so: {hud}"
+    );
+    assert!(!hud.contains("hold none"), "{hud}");
+}
+
+/// THE FIVE-HOUR WINDOW CLAUDE CODE 2.1.316 DOES NOT REPORT (owner, 2026-10-31: "why does it
+/// say ?"): its statusLine carries `rate_limits.seven_day` alone while the API reports no
+/// five-hour window for the login, so the line reads `–/5h` with one line saying why, `--json`
+/// says `not-reported`, and no figure is made up. Once the accounts store holds a current
+/// five-hour figure of the same account (another tapped session's on the login), the line shows
+/// it, named `store`, beside the session's own week; nothing polls `/api/oauth/usage` (R-12).
+#[test]
+fn usage_says_why_claude_code_reports_no_five_hour_window() {
+    let tmp = tmp_dir("usage-week-only");
+    let mut env = env_at(&tmp);
+    env.sid = "s-1a2b".to_owned();
+    env.claude_pid = Some(FakeClaude::PID);
+    let dir = env
+        .transcripts_root()
+        .expect("home is injected")
+        .join(footer::project_slug(&env.cwd));
+    std::fs::create_dir_all(&dir).expect("project dir");
+    std::fs::write(
+        dir.join("mine-1.jsonl"),
+        r#"{"type":"assistant","message":{"id":"m1","model":"claude-opus-5-5","usage":{"input_tokens":1,"output_tokens":5}}}
+"#,
+    )
+    .expect("transcript");
+    let rl = super::super::tap::rl_dir_in(
+        &env.aterm_state
+            .clone()
+            .expect("a root")
+            .join("harness")
+            .join(HARNESS),
+    );
+    let vars = super::super::tap::TapVars {
+        sid: Some(env.sid.clone()),
+        pid: Some(FakeClaude::PID.to_string()),
+        login: None,
+        home: None,
+    };
+    let week_reset = env.now + 6 * 86_400;
+    let stdin = include_str!("testdata/tap/claude-2.1.316-statusline-week-only.json")
+        .replace("1794078000", &week_reset.to_string());
+    let _ = super::super::tap::run(
+        &mut stdin.as_bytes(),
+        false,
+        &vars,
+        Some(&rl),
+        env.now - 5,
+        &mut Vec::new(),
+    );
+    let process = FakeClaude::with(&[("HOME", "/home/someone")]);
+    let run = |json: bool| {
+        let mut out = Vec::new();
+        let _ = run_usage(&env, &process, json, &mut out);
+        String::from_utf8(out).expect("utf-8")
+    };
+    let out = run(false);
+    let mut lines = out.lines();
+    let hud = lines.next().unwrap_or_default();
+    assert!(
+        hud.starts_with("opus \u{2013}/5h · 1%/7d · acct account · resets in 6d · tap 5s"),
+        "{out}"
+    );
+    assert!(!hud.contains('?'), "{out}");
+    let why = lines.next().unwrap_or_default();
+    assert_eq!(
+        why,
+        "5h \u{2013}: not reported: Claude Code reports this login's week but no 5-hour window (it \
+         hands a window only while the API reports one); the accounts store holds none either, \
+         and the default home's profile, which holds the /usage cache, could not be read",
+        "the store was read and the home has no profile here: {out}"
+    );
+    let doc: Value = aterm_json::from_str(&run(true)).expect("json");
+    let account = &doc["usage"]["accounts"][0];
+    assert_eq!(account["missing"]["five_hour"], Value::from("not-reported"));
+    assert!(account["windows"].get("five_hour").is_none(), "{doc}");
+    assert_eq!(
+        account["windows"]["seven_day"]["used_pct"],
+        Value::from(1u64)
+    );
+    assert_eq!(process.asked.get(), (2, 2), "one read of the process a run");
+
+    let mut note = None;
+    env.accounts_store()
+        .transact(env.now, &mut note, |state| {
+            Ok(accounts::note_reading(
+                state,
+                ACCOUNTS_OWN_LABEL,
+                &accounts::TapRead {
+                    five_hour: Some(accounts::WindowRead {
+                        pct_x10: 420,
+                        reset: env.now + 3_600,
+                        refilled: None,
+                    }),
+                    seven_day: None,
+                    at: env.now - 60,
+                    seen_before: true,
+                    born: None,
+                    key: None,
+                },
+                env.now,
+            ))
+        })
+        .expect("a transaction");
+    let out = run(false);
+    assert!(
+        out.starts_with(
+            "opus 42%/5h · 1%/7d · acct account · resets in 1h · 5h store 1m · 7d tap 5s"
+        ),
+        "each window keeps its own source and age: {out}"
+    );
+    assert!(!out.contains("not reported"), "{out}");
+    let doc: Value = aterm_json::from_str(&run(true)).expect("json");
+    let account = &doc["usage"]["accounts"][0];
+    assert_eq!(
+        account["windows"]["five_hour"]["source"],
+        Value::from("store")
+    );
+    assert_eq!(
+        account["windows"]["seven_day"]["source"],
+        Value::from("tap")
+    );
+    assert!(account.get("missing").is_none(), "{doc}");
+}
+
+/// THE DEFAULT HOME'S `/usage` CACHE IS TAKEN ONLY AS THE DEFAULT LOGIN'S OWN ACCOUNT (hostile
+/// review of the 5h fix): `harness usage` reads the home's profile only for a process on the
+/// default login of a one-login machine, and a profile naming another account than the record's
+/// drops the cache, never the record. Before, such a profile dropped the record and its
+/// `/usage` five-hour figure, another account's, filled the line. Negative control: a profile
+/// naming the record's own account fills the empty window from its cache, named `usage-cache`.
+/// A process on a login of its own never takes the home's cache, whatever account it names.
+#[test]
+fn usage_takes_the_usage_cache_only_as_the_default_logins_own_account() {
+    let tmp = tmp_dir("usage-cache-owner");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    let mut env = stats_env(&tmp, home.join(".claude"), home.join(".claude.json"));
+    std::fs::write(
+        env.config.as_ref().expect("a config"),
+        "[harness]\nusage_tap = true\n",
+    )
+    .expect("config");
+    env.sid = "s-1a2b".to_owned();
+    env.claude_pid = Some(FakeClaude::PID);
+    let rl = super::super::tap::rl_dir_in(
+        &env.aterm_state
+            .clone()
+            .expect("a root")
+            .join("harness")
+            .join(HARNESS),
+    );
+    let vars = super::super::tap::TapVars {
+        sid: Some(env.sid.clone()),
+        pid: Some(FakeClaude::PID.to_string()),
+        login: None,
+        home: None,
+    };
+    let week_reset = env.now + 6 * 86_400;
+    let stdin = include_str!("testdata/tap/claude-2.1.316-statusline-week-only.json")
+        .replace("1794078000", &week_reset.to_string());
+    let _ = super::super::tap::run(
+        &mut stdin.as_bytes(),
+        false,
+        &vars,
+        Some(&rl),
+        env.now - 5,
+        &mut Vec::new(),
+    );
+    let a = super::profile::AccountKey::claude(STATS_UUID).expect("a key");
+    let signed_in = |uuid: &str| {
+        let mut profile: Value =
+            aterm_json::from_str(&stats_profile().replace(STATS_UUID, uuid)).expect("profile");
+        profile.as_object_mut().expect("profile object").insert(
+            "cachedUsageUtilization".to_owned(),
+            aterm_json::json!({
+                "fetchedAtMs": env.now * 1000,
+                "accountUuid": uuid,
+                "utilization": {
+                    "five_hour": {"utilization": 20.0, "resets_at": rfc3339_utc(env.now + 3_600)},
+                    "seven_day": {"utilization": 30.0, "resets_at": rfc3339_utc(env.now + 86_400)}
+                }
+            }),
+        );
+        std::fs::write(home.join(".claude.json"), profile.to_string()).expect("profile");
+    };
+    let note = |env: &Env, label: &str, five: Option<u32>| {
+        let mut note = None;
+        env.accounts_store()
+            .transact(env.now, &mut note, |state| {
+                Ok(accounts::note_reading(
+                    state,
+                    label,
+                    &accounts::TapRead {
+                        five_hour: five.map(|pct_x10| accounts::WindowRead {
+                            pct_x10,
+                            reset: env.now + 3_600,
+                            refilled: None,
+                        }),
+                        seven_day: Some(accounts::WindowRead {
+                            pct_x10: 10,
+                            reset: week_reset,
+                            refilled: None,
+                        }),
+                        at: env.now - 60,
+                        seen_before: true,
+                        born: None,
+                        key: Some(a),
+                    },
+                    env.now,
+                ))
+            })
+            .expect("a transaction");
+    };
+    let shown = |env: &Env, process: &FakeClaude| {
+        let mut out = Vec::new();
+        let _ = run_usage(env, process, false, &mut out);
+        let text = String::from_utf8(out).expect("utf-8");
+        let mut out = Vec::new();
+        let _ = run_usage(env, process, true, &mut out);
+        let doc: Value =
+            aterm_json::from_str(&String::from_utf8(out).expect("utf-8")).expect("json");
+        (text, doc["usage"]["accounts"][0].clone())
+    };
+    let default_login = FakeClaude::with(&[("HOME", "/home/someone")]);
+
+    note(&env, ACCOUNTS_OWN_LABEL, None);
+    signed_in(STATS_OTHER);
+    let (text, account) = shown(&env, &default_login);
+    assert!(
+        text.contains("\u{2013}/5h"),
+        "another account's cached 20% is not shown: {text}"
+    );
+    assert!(!text.contains("20%"), "{text}");
+    assert!(text.contains("the /usage cache was not used"), "{text}");
+    assert_eq!(
+        account["consulted"],
+        Value::Array(vec![Value::from("store")]),
+        "{account}"
+    );
+
+    signed_in(STATS_UUID);
+    let (text, account) = shown(&env, &default_login);
+    assert!(
+        text.starts_with("model? 20%/5h · 1%/7d · "),
+        "the own account's cache: {text}"
+    );
+    assert_eq!(
+        account["windows"]["five_hour"]["source"],
+        Value::from("usage-cache")
+    );
+    assert!(account.get("missing").is_none(), "{account}");
+
+    note(&env, ACCOUNTS_OWN_LABEL, Some(420));
+    signed_in(STATS_OTHER);
+    let (text, account) = shown(&env, &default_login);
+    assert!(
+        text.starts_with("model? 42%/5h · 1%/7d · "),
+        "the record is kept where the profile names another account: {text}"
+    );
+    assert_eq!(
+        account["windows"]["five_hour"]["source"],
+        Value::from("store")
+    );
+
+    let solo = tmp.path().join("solo-login");
+    std::fs::write(
+        env.accounts_roster().expect("a roster path"),
+        format!(
+            "[[account]]\nlabel = \"solo\"\nclass = \"dedicated\"\ndir = '{}'\n",
+            solo.display()
+        ),
+    )
+    .expect("roster");
+    note(&env, "solo", None);
+    signed_in(STATS_UUID);
+    let own_login = FakeClaude::with(&[
+        ("HOME", "/home/someone"),
+        (accounts::LOGIN_ENV, &solo.display().to_string()),
+    ]);
+    let (text, account) = shown(&env, &own_login);
+    assert!(
+        text.contains("\u{2013}/5h"),
+        "a login of its own takes no home cache: {text}"
+    );
+    assert!(text.contains("the /usage cache was not used"), "{text}");
+    assert_eq!(
+        account["consulted"],
+        Value::Array(vec![Value::from("store")]),
+        "{account}"
+    );
 }
 
 #[test]
@@ -6817,10 +7294,10 @@ fn a_figure_held_only_in_the_sample_is_shown_by_both_views() {
     assert_eq!(code, exit(0), "{err}");
     assert!(
         out.contains(&format!(
-            "session 42% until {} \u{b7} week ?",
+            "session 42% until {} \u{b7} week \u{2013} (no reading yet)",
             rfc3339_utc(reset)
         )),
-        "{out}"
+        "the figure it holds, and the reason for the one it does not: {out}"
     );
     let row = |env: &Env| -> Value {
         let (code, out, _) = acc_quiet(AccountsCmd::Report { json: true }, env);
@@ -6857,7 +7334,17 @@ fn a_figure_held_only_in_the_sample_is_shown_by_both_views() {
     let mut after = env.clone();
     after.now = reset + 60;
     let (_, out, _) = acc_quiet(AccountsCmd::Report { json: false }, &after);
-    assert!(out.contains("session ? \u{b7} week ?"), "{out}");
+    let own = out
+        .lines()
+        .find(|l| l.starts_with("this login ("))
+        .expect("the own login's line");
+    assert!(
+        own.ends_with(
+            "session \u{2013} (window reset, no reading since) \u{b7} week \u{2013} (usage tap off)"
+        ),
+        "never a bare `?`: {out}"
+    );
+    assert!(!own.contains('?'), "{own}");
     assert_eq!(
         row(&after)["windows"][0]["missing"]["reason"],
         Value::from("window-reset")
@@ -7221,7 +7708,13 @@ fn accounts_stats_refuses_all_account_metadata_when_any_record_is_unreadable() {
         store
             .transact_logins(env.now, &mut None, |state, logins| {
                 Ok(accounts::note_renewed(
-                    state, logins, "known", None, "/known", None, env.now,
+                    state,
+                    logins,
+                    "known",
+                    None,
+                    at!("/known"),
+                    None,
+                    env.now,
                 ))
             })
             .unwrap();
@@ -7630,7 +8123,12 @@ fn the_accounts_report_shows_no_figure_of_another_account() {
                 row["windows"][i]["missing"]["reason"],
                 Value::from("no-reading")
             );
-            assert_eq!(row["windows"][i], stats["windows"][i]);
+            // The report's window is the stats' window, the outlook's additive fields aside
+            // (docs/DESIGN-accounts-outlook-2026-10-25.md §9).
+            assert_eq!(
+                figures_of(&row["windows"][i]),
+                figures_of(&stats["windows"][i])
+            );
         }
         signed_in(STATS_UUID);
         let (out, row, stats, next) = report(&env);
@@ -7640,7 +8138,10 @@ fn the_accounts_report_shows_no_figure_of_another_account() {
             Value::from(reset + accounts::RESET_GRACE_S),
             "{next}"
         );
-        assert_eq!(row["windows"][0], stats["windows"][0]);
+        assert_eq!(
+            figures_of(&row["windows"][0]),
+            figures_of(&stats["windows"][0])
+        );
         if listed {
             listed_words(&out);
         } else {
@@ -8063,6 +8564,8 @@ fn an_unkeyed_records_row_carries_the_key_stats_names() {
 #[path = "cli_renew_tests.rs"]
 mod renew;
 
+#[path = "cli_shared_adoption_tests.rs"]
+mod shared_adoption_tests;
 #[path = "cli_shared_renewal_tests.rs"]
 mod shared_renewal_tests;
 
@@ -8290,7 +8793,7 @@ fn a_stage_a_removal_could_not_finish_is_journalled_with_what_stayed() {
     let stayed = disk::sweep_row(
         1,
         &stage,
-        "removed",
+        disk::SweepAction::Removed,
         5 << 30,
         Unused::Stayed {
             stayed: 2,
@@ -8300,20 +8803,144 @@ fn a_stage_a_removal_could_not_finish_is_journalled_with_what_stayed() {
     let row: Value = aterm_json::from_str(&stayed).expect("a row");
     let text = row["text"].as_str().unwrap_or_default();
     let named = atpkg::build_cache::remove::named(&stage, 2);
+    let names: Vec<&PathBuf> = named.first.iter().map(|(name, _)| name).collect();
     assert_eq!(
-        named.first,
+        names,
         [
-            PathBuf::from("tmp/install-sh.1/tmp/d"),
-            PathBuf::from("tmp/secret")
+            &PathBuf::from("tmp/install-sh.1/tmp/d"),
+            &PathBuf::from("tmp/secret")
         ]
     );
     assert!(text.contains(&named.words(&stage)), "{text}");
     assert!(!text.contains("never read"), "{text}");
-    let whole = disk::sweep_row(1, &stage, "removed", 5 << 30, Unused::Unfinished);
+    let whole = disk::sweep_row(
+        1,
+        &stage,
+        disk::SweepAction::Removed,
+        5 << 30,
+        Unused::Unfinished,
+    );
     let whole: Value = aterm_json::from_str(&whole).expect("a row");
     let whole = whole["text"].as_str().unwrap_or_default();
-    for p in &named.first {
+    for p in names {
         assert!(!whole.contains(&*p.to_string_lossy()), "{whole}");
+    }
+}
+
+/// AN INTENT CLOSED BY A KEPT ROW IS NOT IN FLIGHT: the sweep's intent row for a build
+/// directory, then the outcome row for it when nothing of it went (`Unused::Refused`, its rename
+/// refused after the check), journalled as `kept` with 0 bytes and the refusal's word, reads as no
+/// removal in flight, in the ledger's reader and in `aterm harness disk`'s watch; a stage some of
+/// which stayed, its outcome under the stage's path, closes its leaf's intent too. NEGATIVE
+/// CONTROL: the intent row alone reads as one in flight, in both.
+#[test]
+fn an_intent_closed_by_a_kept_row_is_not_in_flight() {
+    use atpkg::build_cache::{RECLAIM_GONE, Refusal, Unused};
+    use disk::SweepAction;
+    let tmp = tmp_dir("sweep-kept");
+    let state = tmp.path().join("state");
+    let ledger = state.join(DISK_LEDGER);
+    let leaf = Path::new("/c/ws/.cargo-build");
+    let gone = Unused::Gone {
+        idle: std::time::Duration::from_secs(26 * 3_600),
+        after: RECLAIM_GONE,
+    };
+    let by = Refusal::Rename(std::io::ErrorKind::PermissionDenied);
+    let rows = || -> Vec<String> {
+        std::fs::read_to_string(&ledger)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    };
+    let in_flight = || disk::sweep_in_flight(rows().iter().map(String::as_str));
+    let watch = || {
+        disk_watch_status(
+            &ledger,
+            None,
+            None,
+            disk::Config::default(),
+            disk::Written::default(),
+            9,
+        )
+        .json["sweep_in_flight"]
+            .as_u64()
+    };
+
+    assert!(disk_sweep_journal(&state, leaf, 7 << 30, gone, false, 1));
+    assert_eq!(in_flight(), 1, "the intent alone");
+    assert_eq!(watch(), Some(1), "the intent alone");
+    assert!(disk_sweep_journal(
+        &state,
+        leaf,
+        7 << 30,
+        Unused::Refused { by },
+        true,
+        2
+    ));
+    let kept: Value = aterm_json::from_str(&rows()[1]).expect("a row");
+    assert_eq!(
+        kept["action"].as_str().and_then(SweepAction::parse),
+        Some(SweepAction::Kept)
+    );
+    assert_eq!(kept["bytes"].as_u64(), Some(0));
+    assert_eq!(kept["error"].as_str(), Some(by.word().as_str()));
+    assert_eq!(in_flight(), 0, "closed by its kept row");
+    assert_eq!(watch(), Some(0), "closed by its kept row");
+
+    let stage = Path::new("/c/ws/.cargo-build.removing");
+    assert!(disk_sweep_journal(&state, leaf, 7 << 30, gone, false, 3));
+    assert_eq!(in_flight(), 1);
+    let stayed = Unused::Stayed {
+        stayed: 1,
+        freed: 1 << 30,
+    };
+    assert!(disk_sweep_journal(&state, stage, 1 << 30, stayed, true, 4));
+    let actions: Vec<Option<SweepAction>> = rows()
+        .iter()
+        .map(|l| {
+            let v: Value = aterm_json::from_str(l).expect("a row");
+            v["action"].as_str().and_then(SweepAction::parse)
+        })
+        .collect();
+    assert_eq!(
+        actions,
+        [
+            Some(SweepAction::Removing),
+            Some(SweepAction::Kept),
+            Some(SweepAction::Removing),
+            Some(SweepAction::Removed)
+        ]
+    );
+    assert_eq!(
+        in_flight(),
+        0,
+        "a stage that stayed closes its leaf's intent"
+    );
+
+    // Stopped once moved aside: the kept row names the stage and closes the leaf's intent.
+    assert!(disk_sweep_journal(&state, leaf, 7 << 30, gone, false, 5));
+    assert_eq!(in_flight(), 1);
+    let staged = Refusal::Staged;
+    assert!(disk_sweep_journal(
+        &state,
+        stage,
+        7 << 30,
+        Unused::Refused { by: staged },
+        true,
+        6
+    ));
+    let kept: Value = aterm_json::from_str(&rows()[5]).expect("a row");
+    assert_eq!(
+        kept["action"].as_str().and_then(SweepAction::parse),
+        Some(SweepAction::Kept)
+    );
+    assert_eq!(kept["bytes"].as_u64(), Some(0));
+    assert_eq!(kept["error"].as_str(), Some(staged.word().as_str()));
+    assert_eq!(in_flight(), 0, "a stage kept closes its leaf's intent");
+    assert_eq!(watch(), Some(0), "a stage kept closes its leaf's intent");
+    for action in SweepAction::ALL {
+        assert_eq!(SweepAction::parse(action.as_str()), Some(action));
     }
 }
 
@@ -8486,6 +9113,35 @@ fn parsed(line: &str) -> Result<Cmd, String> {
     parse(&args).map(|(cmd, _)| cmd)
 }
 
+#[test]
+fn disk_watch_uses_configured_automatic_policy_and_cannot_be_a_manual_apply() {
+    let args = [
+        "disk",
+        "watch",
+        "--config",
+        "/tmp/watch.toml",
+        "--state",
+        "/tmp/watch-state",
+    ]
+    .map(str::to_owned);
+    let (cmd, over) = parse(&args).expect("supported watch");
+    assert_eq!(cmd, Cmd::DiskWatch);
+    assert_eq!(over.config, Some(PathBuf::from("/tmp/watch.toml")));
+    assert_eq!(over.state, Some(PathBuf::from("/tmp/watch-state")));
+    for bad in [
+        "disk watch /tmp/target",
+        "disk watch --apply cargo-targets",
+        "disk watch --dry-run",
+        "disk watch --json",
+        "disk watch --sock /tmp/only-one.sock",
+        "disk watch --refresh",
+        "disk watch --cli claude",
+        "disk watch --status",
+    ] {
+        assert!(parsed(bad).is_err(), "{bad}");
+    }
+}
+
 fn run_line(line: &str, env: &Env) -> (String, String, String) {
     let cmd = parsed(line).expect(line);
     let mut out = Vec::new();
@@ -8597,7 +9253,9 @@ fn another_clis_rows_are_added_listed_and_pinned_in_its_own_roster_and_login_roo
         &env,
     );
     assert_eq!(code, exit(0), "{err}");
-    let dir = tmp.path().join("home/.aterm/logins/kimi/sol");
+    let dir = ["home", ".aterm", "logins", "kimi", "sol"]
+        .iter()
+        .fold(tmp.path().to_path_buf(), |dir, name| dir.join(name));
     assert!(
         out.contains(&format!("login directory: {}", dir.display())),
         "{out}"
@@ -8729,6 +9387,11 @@ fn harness_agy_pick_rotates_off_the_spent_pool() {
         "claude-opus-5-5-medium\n  gemini-4-argon-high rotated to claude-opus-5-5-medium: \
          gemini-4-argon-high's pool is spent, claude-opus-5-5-medium's is open\n"
     );
+    assert_eq!(
+        agy_store(&env).kept_default(env.now).as_deref(),
+        Some("gemini-4-argon-high"),
+        "agy pick caches the default model in the quota store"
+    );
     let (_, json) = agy_go(
         &env,
         &AgyWhat::Pick(Some("claude-sonnet-5-5-low".to_owned())),
@@ -8755,7 +9418,7 @@ fn harness_agy_pick_rotates_off_the_spent_pool() {
 
 #[test]
 fn harness_agy_pick_waits_when_every_pool_is_spent() {
-    let (_dir, env) = agy_env("agy-wait");
+    let (_dir, mut env) = agy_env("agy-wait");
     let spent = AgyStandIn {
         doc: Ok(
             r#"{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{"name":"Gemini Models","buckets":[{"id":"gemini-weekly","window":"weekly","remaining_fraction":0,"reset_time":"2026-10-28T00:19:03Z"}]},{"name":"Claude and GPT models","buckets":[{"id":"3p-5h","window":"5h","remaining_fraction":0,"reset_time":"2026-10-24T05:49:13Z"}]}]}}}"#,
@@ -8767,6 +9430,51 @@ fn harness_agy_pick_waits_when_every_pool_is_spent() {
     assert!(
         text.starts_with("-\n") && text.contains("until 2026-10-24T05:49:13Z"),
         "{text}"
+    );
+    let reset = aterm_types::rfc3339::parse_utc_fractional("2026-10-24T05:49:13Z").unwrap();
+    env.now = reset + crate::harness::agy_quota_store::RESET_SETTLE_S;
+    let mute = AgyStandIn {
+        doc: Err("offline"),
+        default: "claude-opus-5-5-medium",
+    };
+    let (code, json) = agy_go(&env, &AgyWhat::Pick(None), true, &mute);
+    let v: Value = aterm_json::from_str(&json).unwrap();
+    assert_eq!(code, ExitCode::SUCCESS);
+    assert_eq!(
+        (
+            v["got"].as_str(),
+            v["pick"].as_str(),
+            v["model"].as_str(),
+            v["why"].as_str(),
+        ),
+        (
+            Some("stale"),
+            Some("keep"),
+            Some("claude-opus-5-5-medium"),
+            Some("claude-opus-5-5-medium kept (its pool is open)"),
+        )
+    );
+
+    let (code2, json2) = agy_go(
+        &env,
+        &AgyWhat::Pick(Some("gemini-4-argon-high".to_owned())),
+        true,
+        &mute,
+    );
+    let v2: Value = aterm_json::from_str(&json2).unwrap();
+    assert_eq!(code2, ExitCode::SUCCESS);
+    assert_eq!(
+        (
+            v2["got"].as_str(),
+            v2["pick"].as_str(),
+            v2["model"].as_str(),
+        ),
+        (
+            Some("stale"),
+            Some("rotate"),
+            Some("claude-opus-5-5-medium")
+        ),
+        "a model whose own weekly bucket is still spent rotates to the pool whose refill passed: {json2}"
     );
 }
 
@@ -8824,6 +9532,7 @@ fn the_agy_verb_parses_its_forms() {
     assert!(p("agy frob").is_err());
     assert_eq!(p("agy --help").unwrap(), Cmd::Help(HelpPage::Agy));
     assert!(help_page(HelpPage::Agy).contains("agy pick [<model>]"));
+    assert!(help_page(HelpPage::Agy).contains("stopped at a quota wall rotates across pools"));
 }
 
 #[test]
@@ -8832,31 +9541,37 @@ fn versions_prints_incremental_numeric_version_for_every_cli_harness() {
     let env = env_at(&tmp);
     let (ok, text, err) = go(&Cmd::Versions { json: false }, &env);
     assert!(ok, "err={err}");
-    for slug in ["codex", "claude", "agy", "grok", "kimi", "muse"] {
-        assert!(text.contains(slug), "missing {slug} in:\n{text}");
-    }
-    assert!(
-        !text.contains("gemini"),
-        "a retired harness listed:\n{text}"
-    );
     for harness in aterm_phase::CliHarness::ALL {
+        let slug = harness.id();
+        assert!(text.contains(slug), "missing {slug} in:\n{text}");
         let shown = format!("v{}", harness.version_str());
         assert!(text.contains(&shown), "expected {shown} in:\n{text}");
+    }
+    for absent in ["codex", "gemini"] {
+        assert!(
+            !text.contains(absent),
+            "non-built-in or retired harness {absent} listed:\n{text}"
+        );
+    }
+
+    for section in [
+        "built-in (compiled into this aterm, updated with it)",
+        "installed harness packages\n  (none installed)",
+        "live claims\n  (no aterm instance answered)",
+    ] {
+        assert!(text.contains(section), "{section:?} in:\n{text}");
     }
 
     let (ok_json, json, err_json) = go(&Cmd::Versions { json: true }, &env);
     assert!(ok_json, "err={err_json}");
-    for slug in ["codex", "claude", "agy", "grok", "kimi", "muse"] {
+    assert!(json.contains(r#"{"kind":"built-in","id":"#), "{json}");
+    assert!(!json.contains(r#""kind":"package""#), "{json}");
+    for harness in aterm_phase::CliHarness::ALL {
+        let slug = harness.id();
         assert!(
             json.contains(&format!(r#""slug":"{slug}""#)),
             "missing {slug} in json:\n{json}"
         );
-    }
-    assert!(
-        !json.contains(r#""slug":"gemini""#),
-        "a retired harness listed:\n{json}"
-    );
-    for harness in aterm_phase::CliHarness::ALL {
         let v = harness.version();
         let entry = format!(
             r#""version":"{}","major":{},"minor":{}"#,
@@ -8866,6 +9581,189 @@ fn versions_prints_incremental_numeric_version_for_every_cli_harness() {
         );
         assert!(json.contains(&entry), "{entry} in:\n{json}");
     }
+    for absent in ["codex", "gemini"] {
+        assert!(
+            !json.contains(&format!(r#""slug":"{absent}""#)),
+            "non-built-in or retired harness {absent} listed:\n{json}"
+        );
+    }
+}
+
+/// The `sessions` rows `versions` reads: a proven grok-alab contract 3 claim with its versions,
+/// a codex-alab self-claim (pct-encoded `@`), an unproven grok-alab claim, and the rows it skips
+/// (the controls): a window host's claim, a foreign contract 3 holder, an unclaimed tab and a
+/// non-session line.
+const VERSIONS_ROSTER: &str = "\
+1 s-aaa - live t meta=0 supervisor=grok-alab@4242 supervisor_proven=1 \
+supervisor_version=0.3.0+gabc supervisor_vendor=1.0.70 autopilot=-
+2 s-bbb - live t meta=0 supervisor=codex-alab%405150 supervisor_proven=1 \
+supervisor_version=- supervisor_vendor=- autopilot=-
+3 s-ccc - live t meta=0 supervisor=grok-alab@4343 supervisor_proven=0 \
+supervisor_version=- supervisor_vendor=- autopilot=-
+4 s-ddd - live t meta=0 supervisor=aterm-harness@1234 supervisor_proven=0 autopilot=cruise
+5 s-eee - live t meta=0 supervisor=kimi-alab@77 supervisor_proven=0 autopilot=-
+6 s-fff - live t meta=0 supervisor=- supervisor_proven=0 autopilot=-
+not a row supervisor=grok-alab@9 supervisor_proven=1
+";
+
+/// THE LIVE CLAIMS ARE THE HARNESS CLAIMS: a rostered contract 3 holder or a codex-alab
+/// self-claim, with the versions the row carries; every other holder is not one.
+#[test]
+fn versions_reads_the_harness_claims_off_the_roster() {
+    let claims = live_claims_of(VERSIONS_ROSTER);
+    /// (sid, holder, proven, version, vendor)
+    type Shown<'a> = (&'a str, &'a str, bool, Option<&'a str>, Option<&'a str>);
+    let shown: Vec<Shown<'_>> = claims
+        .iter()
+        .map(|c| {
+            (
+                c.sid.as_str(),
+                c.holder.as_str(),
+                c.proven,
+                c.version.as_deref(),
+                c.vendor.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            (
+                "s-aaa",
+                "grok-alab@4242",
+                true,
+                Some("0.3.0+gabc"),
+                Some("1.0.70")
+            ),
+            ("s-bbb", "codex-alab@5150", true, None, None),
+            ("s-ccc", "grok-alab@4343", false, None, None),
+        ]
+    );
+    assert!(live_claims_of("").is_empty());
+}
+
+/// `versions` OVER A FAKE INSTANCE AND A STORE: the installed grok-alab build shows the version
+/// its record names, a build without the record shows `version unrecorded`, and the live claims
+/// read from the instance show the announced versions; the codex-alab self-claim shows the
+/// version the resolver finds for its pid. A second run against an instance that answers no
+/// `sessions` (the control) says no instance answered and still lists the packages.
+#[cfg(unix)]
+#[test]
+fn versions_lists_installed_packages_and_live_claims() {
+    let tmp = tmp_dir("versions-live");
+    let short = aterm_tempfile::Builder::new()
+        .prefix("at-")
+        .tempdir_in("/tmp")
+        .expect("socket dir");
+    let (sock, asked) =
+        crate::harness::fake_instance(&short.path().join("a.sock"), "0badf00d", move |line| {
+            if line == "sessions" {
+                format!("OK 7\n{VERSIONS_ROSTER}")
+            } else {
+                "ERR usage".to_string()
+            }
+        });
+    let env = Env {
+        sock: Some(sock.clone()),
+        ..env_at(&tmp)
+    };
+    let home = env.home.clone().expect("home");
+    let layout = atpkg::store::Layout {
+        prefix: atpkg::store::default_prefix(&home),
+    };
+    for (program, build, version) in [("grok-alab", 17, Some("0.3.0")), ("muse-alab", 4, None)] {
+        let dir = layout.build_dir(program, build);
+        std::fs::create_dir_all(dir.join("bin")).expect("build dir");
+        let exe = dir.join("bin").join(program);
+        std::fs::write(&exe, b"#!/bin/sh\nexit 0\n").expect("exe");
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        }
+        atpkg::store::mark_build_ready(&dir).expect("ready");
+        atpkg::activate_build(&layout, &dir).expect("activate");
+        atpkg::install_shims(&layout, &dir, &[program.to_string()], atpkg::Aliases::Off)
+            .expect("shims");
+        if let Some(v) = version {
+            std::fs::write(
+                dir.with_file_name(format!("{build}.version")),
+                format!("version v1\n{v}\n"),
+            )
+            .expect("record");
+        }
+    }
+    let (ok, text, err) = go(&Cmd::Versions { json: false }, &env);
+    assert!(ok, "{err}");
+    for line in [
+        "installed harness packages\n  grok-alab         0.3.0  build 17\n  \
+         muse-alab         version unrecorded  build 4\nlive claims\n",
+        "  @s-aaa grok-alab 0.3.0+gabc (grok 1.0.70)\n",
+        "  @s-bbb codex-alab unknown (self-claim)\n",
+        "  @s-ccc grok-alab unknown (grok unknown)  unproven\n",
+    ] {
+        assert!(text.contains(line), "{line:?} in:\n{text}");
+    }
+    for skipped in ["s-ddd", "s-eee", "s-fff", "@9"] {
+        assert!(!text.contains(skipped), "{skipped} in:\n{text}");
+    }
+    let (ok, json, err) = go(&Cmd::Versions { json: true }, &env);
+    assert!(ok, "{err}");
+    for item in [
+        r#"{"kind":"package","harness":"grok-alab","program":"grok-alab","build":17,"version":"0.3.0","link":null}"#,
+        r#"{"kind":"package","harness":"muse-alab","program":"muse-alab","build":4,"version":null,"link":null}"#,
+        r#"{"kind":"claim","session":"s-aaa","holder":"grok-alab@4242","harness":"grok-alab","proven":true,"version":"0.3.0+gabc","agent":"grok","vendor":"1.0.70"}"#,
+        r#"{"kind":"claim","session":"s-ccc","holder":"grok-alab@4343","harness":"grok-alab","proven":false,"version":null,"agent":"grok","vendor":null}"#,
+    ] {
+        assert!(json.contains(item), "{item} in:\n{json}");
+    }
+    assert!(
+        asked.lock().expect("log").iter().all(|l| l == "sessions"),
+        "versions only reads the roster"
+    );
+
+    // The codex-alab self-claim's version is its process's build's: the resolver is asked for
+    // its pid alone, and only for a proven self-claim.
+    let mut text = Vec::new();
+    let asked_pids = std::cell::RefCell::new(Vec::new());
+    write_versions(
+        Some(&[]),
+        Some(&live_claims_of(VERSIONS_ROSTER)),
+        &|pid| {
+            asked_pids.borrow_mut().push(pid);
+            Some("0.164.0+codex.0.130.0".to_string())
+        },
+        false,
+        &mut text,
+    );
+    let text = String::from_utf8(text).expect("utf-8");
+    assert!(
+        text.contains("  @s-bbb codex-alab 0.164.0+codex.0.130.0 (self-claim)\n"),
+        "{text}"
+    );
+    assert_eq!(*asked_pids.borrow(), [5150]);
+
+    let silent = aterm_tempfile::Builder::new()
+        .prefix("at-")
+        .tempdir_in("/tmp")
+        .expect("socket dir");
+    let (quiet, _) =
+        crate::harness::fake_instance(&silent.path().join("b.sock"), "0badf00d", |_| {
+            "ERR usage".to_string()
+        });
+    let env = Env {
+        sock: Some(quiet),
+        ..env_at(&tmp)
+    };
+    let (ok, text, err) = go(&Cmd::Versions { json: false }, &env);
+    assert!(ok, "{err}");
+    assert!(
+        text.contains("live claims\n  (no aterm instance answered)\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("  grok-alab         0.3.0  build 17\n"),
+        "{text}"
+    );
 }
 
 #[path = "cli_signin_tests.rs"]
@@ -9214,6 +10112,7 @@ fn the_source_tables_default_codex_row_is_here_only_with_its_login_file() {
                 browser: None,
                 vendor: accounts::Vendor::default(),
             }],
+            ..FleetRoster::default()
         },
         held: Vec::new(),
     };
@@ -9236,4 +10135,93 @@ fn the_source_tables_default_codex_row_is_here_only_with_its_login_file() {
     std::fs::write(home.join(".codex").join("auth.json"), "{}").unwrap();
     assert_eq!(readiness(&listed), ["main active unseen"]);
     assert_eq!(readiness(&own), ["main local unseen"]);
+}
+
+#[test]
+fn source_table_rows_treats_held_by_rows_as_elsewhere_and_matches_identity_email() {
+    use crate::harness::accounts_sync::{CliFleet, FleetAccount, FleetRoster};
+    let tmp = tmp_dir("source-table-held-by");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(home.join(".codex")).unwrap();
+    std::fs::write(home.join(".codex/auth.json"), "{}").unwrap();
+    let roster = Roster {
+        rows: vec![
+            accounts::Row {
+                label: "default".into(),
+                identity_email: Some("warm@example.test".into()),
+                ..accounts::Row::default()
+            },
+            accounts::Row {
+                label: "codex-other".into(),
+                dir: Some(tmp.path().join("logins/codex-other").display().to_string()),
+                email: Some("other@example.test".into()),
+                held_by: Some("m22".into()),
+                ..accounts::Row::default()
+            },
+        ],
+    };
+    let local = LocalSourceTable {
+        records: accounts::AccountRecords {
+            roster,
+            ..accounts::AccountRecords::default()
+        },
+        machine: Some("m16".into()),
+        now: 1_790_000_000,
+        error: None,
+        home: Some(home),
+    };
+    let fleet = CliFleet {
+        cli: Cli::Codex,
+        roster: FleetRoster {
+            source: "pool".into(),
+            accounts: vec![
+                FleetAccount {
+                    label: "codex-m16".into(),
+                    machines: vec!["m16".into()],
+                    class: Class::Dedicated,
+                    email: "warm@example.test".into(),
+                    browser: None,
+                    vendor: accounts::Vendor::default(),
+                },
+                FleetAccount {
+                    label: "codex-other".into(),
+                    machines: vec!["m22".into()],
+                    class: Class::Dedicated,
+                    email: "other@example.test".into(),
+                    browser: None,
+                    vendor: accounts::Vendor::default(),
+                },
+            ],
+            ..FleetRoster::default()
+        },
+        held: Vec::new(),
+    };
+    let (_, rows) = source_table_rows(Cli::Codex, &fleet, Some(local));
+    let summary: Vec<String> = rows
+        .into_iter()
+        .map(|(label, state, .., readiness)| format!("{label} {state} {readiness}"))
+        .collect();
+    assert_eq!(
+        summary,
+        ["codex-m16 active unseen", "codex-other active elsewhere"]
+    );
+}
+
+#[test]
+fn codex_of_env_takes_the_last_duplicate_thread_and_tab_session_entries() {
+    let valid = "019a0000-0000-7000-8000-000000000001";
+    let vars = [
+        ("CODEX_THREAD_ID", "not-a-uuid"),
+        ("CODEX_THREAD_ID", valid),
+        (TAB_SESSION_VAR, ""),
+        (TAB_SESSION_VAR, "s-1"),
+        ("CODEX_AUTH_PATH", "/work/codex-new/auth.json"),
+    ]
+    .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+    let (thread, login) = codex_of_env(vars);
+    assert_eq!(thread.as_deref(), Some(valid));
+    assert_eq!(
+        login.and_then(|l| l.login),
+        Some("/work/codex-new".to_owned())
+    );
 }

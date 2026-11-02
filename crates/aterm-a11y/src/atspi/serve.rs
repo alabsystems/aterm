@@ -316,15 +316,44 @@ fn scroll_type(value: u32) -> Result<ScrollType, Fault> {
     }
 }
 
+pub(crate) fn parse_machine_id(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    (trimmed.len() == 32 && trimmed.bytes().all(|b| b.is_ascii_hexdigit())).then_some(trimmed)
+}
+
+pub(crate) fn machine_id_from_files(paths: &[&std::path::Path]) -> Option<String> {
+    use std::io::Read as _;
+    for path in paths {
+        let Ok(file) = std::fs::File::open(path) else {
+            continue;
+        };
+        if !file.metadata().is_ok_and(|m| m.is_file()) {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        if file.take(128).read_to_end(&mut bytes).is_err() || bytes.len() >= 128 {
+            continue;
+        }
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        if let Some(id) = parse_machine_id(text) {
+            return Some(id.to_owned());
+        }
+    }
+    None
+}
+
 fn peer(member: &str, body: &[Value]) -> Result<Vec<Value>, Fault> {
     args(body, "")?;
     match member {
         "Ping" => Ok(Vec::new()),
-        "GetMachineId" => ["/etc/machine-id", "/var/lib/dbus/machine-id"]
-            .iter()
-            .find_map(|p| std::fs::read_to_string(p).ok())
-            .map(|id| vec![id.trim().into()])
-            .ok_or_else(|| fault(FAILED, "no machine id")),
+        "GetMachineId" => machine_id_from_files(&[
+            std::path::Path::new("/etc/machine-id"),
+            std::path::Path::new("/var/lib/dbus/machine-id"),
+        ])
+        .map(|id| vec![id.into()])
+        .ok_or_else(|| fault(FAILED, "no machine id")),
         _ => Err(fault(UNKNOWN_METHOD, format!("Unknown method '{member}'"))),
     }
 }

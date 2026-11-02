@@ -116,16 +116,22 @@ pub(crate) struct Request {
     pub(crate) chunked: bool,
     /// Whether the request head was malformed.
     pub(crate) malformed: bool,
+    /// Whether the peer's bytes ended before its `Content-Length` (or before the server's
+    /// bound, for a longer one): the connection closes unanswered, and nothing lands.
+    pub(crate) cut: bool,
+    /// Whether its `Content-Length` is over the server's bound, which the fake never reads
+    /// whole: the answer is 413 and a violation naming the bound, and nothing lands.
+    pub(crate) over: bool,
 }
 
 impl Request {
     /// The value of header `name`.
-    fn header(&self, name: &str) -> Option<&str> {
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
         crate::header_in(&self.headers, name)
     }
 
     /// The path, without the query.
-    fn path(&self) -> &str {
+    pub(crate) fn path(&self) -> &str {
         self.target.split_once('?').map_or(&self.target, |(p, _)| p)
     }
 
@@ -141,12 +147,13 @@ impl Request {
             .collect()
     }
 
-    /// The decoded value of query parameter `name`.
-    fn query(&self, name: &str) -> Option<String> {
+    /// The value of query parameter `name`, form-decoded as GitHub reads a query: a `+` is a
+    /// space, and `%2B` a `+`.
+    pub(crate) fn query(&self, name: &str) -> Option<String> {
         self.raw_query()
             .into_iter()
             .find(|(k, _)| *k == name)
-            .map(|(_, v)| aterm_codec::pct::decode(v))
+            .map(|(_, v)| aterm_codec::pct::decode(&v.replace('+', " ")))
     }
 
     /// Whether the method is a read.
@@ -191,11 +198,14 @@ fn is_credential(state: &State, origin: FakeOrigin, name: &str, value: &str) -> 
             .any(|(t, _)| !t.is_empty() && value.contains(t.as_str()))
 }
 
-/// The number of headers of `req` that carry a credential at its origin.
+/// The number of headers of `req` that carry a credential at its origin, less the Basic
+/// `Authorization` a git path of the web origin takes (`git_http::allowed_basic`).
 fn credentials(state: &State, req: &Request) -> usize {
     req.headers
         .iter()
-        .filter(|(n, v)| is_credential(state, req.origin, n, v))
+        .filter(|(n, v)| {
+            is_credential(state, req.origin, n, v) && !crate::git_http::allowed_basic(req, n, v)
+        })
         .count()
 }
 
@@ -295,7 +305,9 @@ fn violations(state: &mut State, req: &Request) {
     if req.is_read() && req.header("content-length").is_some() {
         found.push(format!("Content-Length on a {m}: {path}"));
     }
-    if let Some(n) = req.query("per_page").and_then(|v| v.parse::<u64>().ok())
+    if let Some(n) = req
+        .query("per_page")
+        .and_then(|v| crate::parse_uint::<u64>(&v))
         && n > 100
     {
         found.push(format!("per_page {n} over 100: {path}"));
@@ -308,7 +320,12 @@ pub(crate) fn handle(state: &mut State, req: &Request) -> Outcome {
     state.requests += 1;
     let n = state.requests;
     let token = req.token();
-    let login = token.as_deref().and_then(|t| state.login_of(t));
+    let login = if crate::git_http::is_git(req) {
+        crate::git_http::basic_token_login(state, req)
+            .or_else(|| token.as_deref().and_then(|t| state.login_of(t)))
+    } else {
+        token.as_deref().and_then(|t| state.login_of(t))
+    };
     let headers: Vec<(String, String)> = req
         .headers
         .iter()
@@ -327,12 +344,30 @@ pub(crate) fn handle(state: &mut State, req: &Request) -> Outcome {
         as_login: login.clone(),
     });
     violations(state, req);
+    if req.cut {
+        return Outcome::Close;
+    }
+    if !req.over {
+        capture_body(state, req);
+    }
     let ctx = Ctx {
         token: login.as_ref().and(token),
         login,
         n,
     };
-    let outcome = if req.malformed {
+    let outcome = if req.over {
+        let shown = shown_target(state, req);
+        state.violations.push(format!(
+            "body over agh-fake's 16 MiB bound: {} {shown}",
+            req.method
+        ));
+        Outcome::Answer(finish(
+            state,
+            req,
+            &ctx,
+            Answer::error(413, "request body over agh-fake's 16 MiB bound"),
+        ))
+    } else if req.malformed {
         Outcome::Answer(finish(
             state,
             req,
@@ -364,6 +399,28 @@ pub(crate) fn handle(state: &mut State, req: &Request) -> Outcome {
         state.count_answered(req.origin, &req.method, &req.target);
     }
     outcome
+}
+
+/// The largest body `SeenBody::json` keeps the text of.
+const BODY_JSON_MAX: usize = 64 * 1024;
+
+/// Record a request's body, read whole, as a `SeenBody` of its `seen()` entry: its length,
+/// its sha256, and its text when it is JSON of at most `BODY_JSON_MAX` bytes.
+fn capture_body(state: &mut State, req: &Request) {
+    if req.body.is_empty() {
+        return;
+    }
+    let json = (req.body.len() <= BODY_JSON_MAX
+        && aterm_json::from_slice::<Value>(&req.body).is_ok())
+    .then(|| String::from_utf8(req.body.clone()).ok())
+    .flatten();
+    let digest = aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(&req.body));
+    state.bodies.push(crate::SeenBody {
+        seen: state.seen.len().saturating_sub(1),
+        len: u64::try_from(req.body.len()).unwrap_or(u64::MAX),
+        sha256: format!("sha256:{digest}"),
+        json,
+    });
 }
 
 /// Caller identity and request metadata.
@@ -440,6 +497,55 @@ fn faulted(state: &mut State, req: &Request, ctx: &Ctx, fault: Fault) -> Outcome
             let a = Answer::redirect(302, format!("http://127.0.0.1:{cdn}{}", req.target));
             Outcome::Answer(finish(state, req, ctx, a))
         }
+        Fault::LandThenClose => {
+            let _landed = answer(state, req, ctx);
+            Outcome::Close
+        }
+        Fault::LandThenStatus { status } => {
+            let landed = answer(state, req, ctx);
+            Outcome::Answer(lost(&landed, status))
+        }
+        Fault::StarterThen { status } => {
+            let landed = answer(state, req, ctx);
+            let created = (req.origin == FakeOrigin::Uploads && landed.status == 201)
+                .then(|| aterm_json::from_slice::<Value>(&landed.body).ok())
+                .flatten()
+                .and_then(|v| v.get("id").and_then(Value::as_u64));
+            match created {
+                Some(id) => {
+                    starve(state, id);
+                    Outcome::Answer(lost(&landed, status))
+                }
+                None => Outcome::Answer(landed),
+            }
+        }
+    }
+}
+
+/// The answer to a write that landed but whose answer was lost to `status`: GitHub's error
+/// body for that status, carrying the landed answer's `X-…` headers (its request id and
+/// rate), so the request is charged once.
+fn lost(landed: &Answer, status: u16) -> Answer {
+    let mut a = Answer::error(status, crate::server::reason(status));
+    a.headers.extend(
+        landed
+            .headers
+            .iter()
+            .filter(|(n, _)| n.get(..2).is_some_and(|p| p.eq_ignore_ascii_case("x-")))
+            .cloned(),
+    );
+    a
+}
+
+/// Asset `id` left as a cut upload leaves it: no bytes, state `starter`.
+fn starve(state: &mut State, id: u64) {
+    if let Some(asset) = state
+        .releases
+        .iter_mut()
+        .find_map(|r| r.assets.iter_mut().find(|a| a.id == id))
+    {
+        asset.spec.bytes.clear();
+        asset.spec.state = "starter".to_string();
     }
 }
 
@@ -451,7 +557,7 @@ fn repo_of_path(state: &State, path: &str) -> Option<usize> {
             aterm_codec::pct::decode(o),
             aterm_codec::pct::decode(r)
         )),
-        ["repositories", id, ..] => state.repo_by_id(id.parse().ok()?),
+        ["repositories", id, ..] => state.repo_by_id(crate::parse_uint(id)?),
         _ => None,
     }
 }
@@ -462,6 +568,9 @@ fn answer(state: &mut State, req: &Request, ctx: &Ctx) -> Answer {
         FakeOrigin::Api | FakeOrigin::Uploads => {
             let a = if req.header(CREDENTIAL).is_some() && ctx.login.is_none() {
                 Answer::error(401, "Bad credentials")
+            } else if !req.is_read() && over_limit(state, req, ctx, None) {
+                let refused = Answer::error(403, "API rate limit exceeded.");
+                return finish_with(state, req, ctx, refused, Some(RESET));
             } else {
                 let a = if req.origin == FakeOrigin::Uploads {
                     upload(state, req, ctx)
@@ -470,7 +579,7 @@ fn answer(state: &mut State, req: &Request, ctx: &Ctx) -> Answer {
                 } else {
                     write(state, req, ctx)
                 };
-                if over_limit(state, req, ctx, a.status) {
+                if req.is_read() && over_limit(state, req, ctx, Some(a.status)) {
                     let refused = Answer::error(403, "API rate limit exceeded.");
                     return finish_with(state, req, ctx, refused, Some(RESET));
                 }
@@ -478,14 +587,16 @@ fn answer(state: &mut State, req: &Request, ctx: &Ctx) -> Answer {
             };
             finish(state, req, ctx, a)
         }
+        FakeOrigin::Web if crate::git_http::is_git(req) => crate::git_http::answer(state, req),
         FakeOrigin::Web => web(state, req),
         FakeOrigin::Cdn => cdn(state, req),
     }
 }
 
-/// Whether `req`, answered `status`, goes past its rate's limit.
-fn over_limit(state: &State, req: &Request, ctx: &Ctx, status: u16) -> bool {
-    if req.origin != FakeOrigin::Api || is_free(req, ctx, Some(status)) {
+/// Whether `req` goes past its rate's limit: a read once answered `status` (a 304 is free),
+/// a write before it is applied (`status` `None`), since GitHub refuses it unapplied.
+fn over_limit(state: &State, req: &Request, ctx: &Ctx, status: Option<u16>) -> bool {
+    if req.origin != FakeOrigin::Api || is_free(req, ctx, status) {
         return false;
     }
     let resource = resource_of(req);
@@ -511,7 +622,7 @@ fn etag(req: &Request, mut a: Answer) -> Answer {
     let hit = req.header("if-none-match").is_some_and(|v| {
         v.split(',')
             .map(str::trim)
-            .any(|c| c == "*" || c == tag || c.trim_start_matches("W/") == &tag[2..])
+            .any(|c| c == "*" || c == tag || c.strip_prefix("W/").unwrap_or(c) == &tag[2..])
     });
     if hit {
         return Answer {
@@ -540,6 +651,9 @@ fn finish_with(
     let api = req.origin == FakeOrigin::Api;
     if matches!(req.origin, FakeOrigin::Api | FakeOrigin::Uploads) {
         a.or_header("X-GitHub-Request-Id", format!("FAKE:{}", ctx.n));
+        if let Some(scopes) = ctx.token.as_deref().and_then(|t| scopes_of(state, t)) {
+            a.or_header("X-OAuth-Scopes", scopes.join(", "));
+        }
     }
     if !api && exhausted.is_none() {
         return a;
@@ -640,6 +754,8 @@ fn api(state: &State, req: &Request, ctx: &Ctx) -> Answer {
         },
         ["users", login] => user(state, &aterm_codec::pct::decode(login)),
         ["user", "repos"] => user_repos(state, req, ctx),
+        ["user", "keys"] => keys_list(state, req, ctx),
+        ["user", "keys", id] => key_one(state, ctx, id),
         ["users", login, "repos"] => {
             let login = aterm_codec::pct::decode(login);
             match state.owner_named(&login).map(|o| o.id) {
@@ -674,7 +790,7 @@ fn api(state: &State, req: &Request, ctx: &Ctx) -> Answer {
             }
         }
         ["repositories", id, rest @ ..] => {
-            match id.parse().ok().and_then(|id| state.repo_by_id(id)) {
+            match crate::parse_uint(id).and_then(|id| state.repo_by_id(id)) {
                 Some(i) => repo_route(state, req, ctx, i, rest),
                 None => Answer::not_found(),
             }
@@ -685,7 +801,7 @@ fn api(state: &State, req: &Request, ctx: &Ctx) -> Answer {
 
 /// The owner id a numeric segment names, when it is an owner's.
 fn owner_by_id(state: &State, id: &str) -> Option<u64> {
-    let id = id.parse::<u64>().ok()?;
+    let id = crate::parse_uint::<u64>(id)?;
     state.owners.iter().any(|o| o.id == id).then_some(id)
 }
 
@@ -799,12 +915,12 @@ impl Paging {
     fn of(req: &Request, total: usize) -> Paging {
         let per_page = req
             .query("per_page")
-            .and_then(|v| v.parse::<usize>().ok())
+            .and_then(|v| crate::parse_uint::<usize>(&v))
             .filter(|n| *n > 0)
             .map_or(DEFAULT_PER_PAGE, |n| n.min(100));
         let number = req
             .query("page")
-            .and_then(|v| v.parse::<usize>().ok())
+            .and_then(|v| crate::parse_uint::<usize>(&v))
             .filter(|n| *n > 0)
             .unwrap_or(1);
         Paging {
@@ -963,6 +1079,7 @@ fn repo_route(state: &State, req: &Request, ctx: &Ctx, index: usize, rest: &[&st
         }
         ["releases", "assets", id] => asset(state, req, ctx, repo, id),
         ["releases", id] => release_by_id(state, ctx, repo, id),
+        ["releases", id, "assets"] => release_assets(state, req, ctx, repo, id),
         ["contents", path @ ..] => contents(state, req, repo, &joined(path)),
         ["git", "trees", reference @ ..] if !reference.is_empty() => {
             tree(state, req, repo, &joined(reference))
@@ -972,38 +1089,74 @@ fn repo_route(state: &State, req: &Request, ctx: &Ctx, index: usize, rest: &[&st
             commit(state, repo, &joined(reference))
         }
         ["compare", range] => compare(state, req, repo, range),
+        ["git", "ref" | "refs", name @ ..] if !name.is_empty() => {
+            let reference = format!("refs/{}", joined(name));
+            repo.ref_sha(&reference)
+                .map_or_else(Answer::not_found, |sha| {
+                    Answer::json(200, &ref_json(state, repo, &reference, &sha))
+                })
+        }
         ["branches"] => branches(state, req, repo),
         ["tags"] => tags(state, req, repo),
         _ => Answer::not_found(),
     }
 }
 
-/// `/releases/tags/{tag}`: the newest published release of that tag.
+/// `/releases/tags/{tag}`: the newest published release of that tag the listing lag does not
+/// hide.
 fn release_by_tag(state: &State, repo: &Repo, tag: &str) -> Answer {
     let found = published(state, repo)
         .into_iter()
-        .filter(|r| r.spec.tag == tag)
+        .filter(|r| r.spec.tag == tag && !r.hidden)
         .max_by(|a, b| (&a.spec.created_at, a.id).cmp(&(&b.spec.created_at, b.id)));
     found.map_or_else(Answer::not_found, |r| {
         Answer::json(200, &release_json(state, repo, r))
     })
 }
 
-/// `/releases/{id}`: the release of the repository, a draft only to a push login.
-fn release_by_id(state: &State, ctx: &Ctx, repo: &Repo, id: &str) -> Answer {
-    let found = id
-        .parse::<u64>()
-        .ok()
+/// The release `id` of the repository as a by-id read sees it: a draft only to a push login,
+/// and a release the listing lag hides included.
+fn release_seen<'s>(state: &'s State, ctx: &Ctx, repo: &Repo, id: &str) -> Option<&'s Release> {
+    crate::parse_uint::<u64>(id)
         .and_then(|id| {
             state
                 .releases
                 .iter()
                 .find(|r| r.id == id && r.repo == repo.id)
         })
-        .filter(|r| !r.spec.draft || repo.is_push(ctx.login()));
-    found.map_or_else(Answer::not_found, |r| {
+        .filter(|r| !r.spec.draft || repo.is_push(ctx.login()))
+}
+
+/// `/releases/{id}`: the release of the repository, a draft only to a push login.
+fn release_by_id(state: &State, ctx: &Ctx, repo: &Repo, id: &str) -> Answer {
+    release_seen(state, ctx, repo, id).map_or_else(Answer::not_found, |r| {
         Answer::json(200, &release_json(state, repo, r))
     })
+}
+
+/// `/releases/{id}/assets`: the assets of the release `release_by_id` would answer (a draft's
+/// only to a push login; the listing lag does not hide it), by id, paged by `per_page` with
+/// M1's `Link` header; 404 otherwise.
+fn release_assets(state: &State, req: &Request, ctx: &Ctx, repo: &Repo, id: &str) -> Answer {
+    let Some(release) = release_seen(state, ctx, repo, id) else {
+        return Answer::not_found();
+    };
+    let mut assets: Vec<&crate::state::Asset> = release.assets.iter().collect();
+    assets.sort_by_key(|a| a.id);
+    let items = assets
+        .into_iter()
+        .map(|a| asset_json(state, repo, release, a))
+        .collect();
+    let api = state.ports.api;
+    let full = repo.full_name();
+    page(
+        req,
+        items,
+        &format!(
+            "http://127.0.0.1:{api}/repos/{full}/releases/{}/assets",
+            release.id
+        ),
+    )
 }
 
 /// `/commits/{ref}`: one commit, or 422 for a reference the history does not hold.
@@ -1081,13 +1234,14 @@ fn published<'s>(state: &'s State, repo: &Repo) -> Vec<&'s Release> {
         .collect()
 }
 
-/// Handles `/releases` newest first; a page starting past item [`RELEASES_RESULT_CAP`] is 422.
+/// Handles `/releases` newest first, without what the listing lag hides; a page starting past
+/// item [`RELEASES_RESULT_CAP`] is 422.
 fn releases(state: &State, req: &Request, ctx: &Ctx, repo: &Repo) -> Answer {
     let push = repo.is_push(ctx.login());
     let mut list: Vec<&Release> = state
         .releases
         .iter()
-        .filter(|r| r.repo == repo.id && (push || !r.spec.draft))
+        .filter(|r| r.repo == repo.id && (push || !r.spec.draft) && !r.hidden)
         .collect();
     let paging = Paging::of(req, list.len());
     if (paging.number - 1).saturating_mul(paging.per_page) >= RELEASES_RESULT_CAP {
@@ -1109,19 +1263,17 @@ fn releases(state: &State, req: &Request, ctx: &Ctx, repo: &Repo) -> Answer {
     )
 }
 
-/// `/releases/latest`: the `set_latest` release, else the newest published non-prerelease.
+/// `/releases/latest`: the `set_latest` release, else the newest published non-prerelease,
+/// without what the listing lag hides.
 fn latest(state: &State, repo: &Repo) -> Answer {
     let set = match repo.latest {
         Latest::None => return Answer::not_found(),
-        Latest::Set(id) => published(state, repo).into_iter().find(|r| r.id == id),
+        Latest::Set(id) => published(state, repo)
+            .into_iter()
+            .find(|r| r.id == id && !r.hidden),
         Latest::Auto => None,
     };
-    let found = set.or_else(|| {
-        published(state, repo)
-            .into_iter()
-            .filter(|r| !r.spec.prerelease)
-            .max_by(|a, b| (&a.spec.created_at, a.id).cmp(&(&b.spec.created_at, b.id)))
-    });
+    let found = set.or_else(|| auto_latest(state, repo, None));
     found.map_or_else(Answer::not_found, |r| {
         Answer::json(200, &release_json(state, repo, r))
     })
@@ -1218,7 +1370,7 @@ fn release_json(state: &State, repo: &Repo, release: &Release) -> Value {
 
 /// `/releases/assets/{id}`.
 fn asset(state: &State, req: &Request, ctx: &Ctx, repo: &Repo, id: &str) -> Answer {
-    let Ok(id) = id.parse::<u64>() else {
+    let Some(id) = crate::parse_uint::<u64>(id) else {
         return Answer::not_found();
     };
     let push = repo.is_push(ctx.login());
@@ -1550,7 +1702,8 @@ fn compare(state: &State, req: &Request, repo: &Repo, raw_range: &str) -> Answer
     a
 }
 
-/// The web origin.
+/// The web origin: a release asset by tag and name (`/{o}/{r}/releases/download/{tag}/{name}`),
+/// of a published release the listing lag does not hide.
 fn web(state: &State, req: &Request) -> Answer {
     let path = req.path().to_string();
     let segs = segments(&path);
@@ -1560,7 +1713,11 @@ fn web(state: &State, req: &Request) -> Answer {
     if tag.is_empty() || !req.is_read() {
         return Answer::text(404, "Not Found");
     }
-    let slug = format!("{}/{}", segs[0], segs[1]);
+    let slug = format!(
+        "{}/{}",
+        aterm_codec::pct::decode(segs[0]),
+        aterm_codec::pct::decode(segs[1])
+    );
     let (tag, name) = (joined(tag), aterm_codec::pct::decode(name));
     let found = state
         .repo_index(&slug)
@@ -1569,7 +1726,7 @@ fn web(state: &State, req: &Request) -> Answer {
         .and_then(|r| {
             published(state, r)
                 .into_iter()
-                .filter(|rel| rel.spec.tag == tag)
+                .filter(|rel| rel.spec.tag == tag && !rel.hidden)
                 .find_map(|rel| rel.assets.iter().find(|a| a.spec.name == name))
         });
     match found {
@@ -1583,7 +1740,7 @@ fn cdn(state: &mut State, req: &Request) -> Answer {
     let path = req.path().to_string();
     let segs = segments(&path);
     let id = match segs.as_slice() {
-        ["assets", id] if req.is_read() => id.parse::<u64>().ok(),
+        ["assets", id] if req.is_read() => crate::parse_uint::<u64>(id),
         _ => None,
     };
     let Some(id) = id else {
@@ -1633,13 +1790,56 @@ fn unwritable(repo: &Repo, ctx: &Ctx) -> Option<Answer> {
     } else if !repo.visible_to(ctx.login()) {
         Some(Answer::not_found())
     } else if !repo.is_push(ctx.login()) {
-        Some(Answer::error(
-            403,
-            "Resource not accessible by personal access token",
-        ))
+        let mut a = Answer::error(403, "Resource not accessible by personal access token");
+        a.headers.push((
+            "X-Accepted-GitHub-Permissions".into(),
+            "contents=write".into(),
+        ));
+        Some(a)
     } else {
         None
     }
+}
+
+/// Body I: the fake's stand-in for GitHub's refusal of a write to an immutable release.
+fn immutable() -> Answer {
+    Answer::json(
+        422,
+        &json!({
+            "message": "Validation Failed",
+            "errors": [{"resource": "Release", "code": "custom",
+                "message": "Cannot modify an immutable release."}],
+            "documentation_url": DOCS,
+            "status": "422",
+        }),
+    )
+}
+
+/// A 204 with no body.
+fn no_content() -> Answer {
+    Answer {
+        status: 204,
+        headers: Vec::new(),
+        body: Vec::new(),
+    }
+}
+
+/// The tag rule for a publish of `tag` (design: a publish makes the tag a release names when
+/// it has no ref): `Ok(Some(sha))` when `refs/tags/{tag}` must be made at `sha`, `Ok(None)`
+/// when nothing is made (the tag exists, or the fake models none of the repository's git:
+/// no ref and no commit), 422 `tag_name` `invalid` when `refs/tags/{tag}` is a name
+/// `well_formed_ref` refuses (no ref store or git endpoint here could carry it), and body T
+/// when `target` (or, with none, the default branch) names no sha.
+fn tag_rule(repo: &Repo, tag: &str, target: Option<&str>) -> Result<Option<String>, Answer> {
+    if repo.tags.iter().any(|(n, _)| n == tag) || !repo.models_git() {
+        return Ok(None);
+    }
+    if !well_formed_ref(&format!("refs/tags/{tag}")) {
+        return Err(invalid("Release", "tag_name", "invalid"));
+    }
+    repo.target_sha(target)
+        .map(Some)
+        .ok_or_else(|| invalid("Release", "target_commitish", "invalid"))
 }
 
 /// A boolean field of a JSON request: absent is `None`; a value of another type is `Err`.
@@ -1661,11 +1861,17 @@ fn text_field(body: &Value, name: &str) -> Result<Option<String>, ()> {
 }
 
 /// The api origin's writes: create (`POST /repos/{o}/{r}/releases`), edit (`PATCH
-/// …/releases/{id}`) and delete (`DELETE …/releases/{id}`) a release, and rename (`PATCH
-/// …/releases/assets/{id}`) and delete (`DELETE …/releases/assets/{id}`) an asset.
+/// …/releases/{id}`) and delete (`DELETE …/releases/{id}`) a release; rename (`PATCH
+/// …/releases/assets/{id}`) and delete (`DELETE …/releases/assets/{id}`) an asset; create a
+/// ref (`POST …/git/refs`) and delete one (`DELETE …/git/refs/{name}`: 204, or 422
+/// `{"message":"Reference does not exist"}`); and add (`POST /user/keys`) and delete (`DELETE
+/// /user/keys/{id}`) an SSH key.
 fn write(state: &mut State, req: &Request, ctx: &Ctx) -> Answer {
     let path = req.path().to_string();
     let segs = segments(&path);
+    if let ["user", "keys", rest @ ..] = segs.as_slice() {
+        return key_write(state, req, ctx, rest);
+    }
     let ["repos", o, r, rest @ ..] = segs.as_slice() else {
         return Answer::not_found();
     };
@@ -1682,6 +1888,17 @@ fn write(state: &mut State, req: &Request, ctx: &Ctx) -> Answer {
     }
     match (req.method.as_str(), rest) {
         ("POST", ["releases"]) => create_release(state, req, index),
+        ("POST", ["git", "refs"]) => create_ref(state, req, index),
+        ("DELETE", ["git", "refs", name @ ..]) if !name.is_empty() => {
+            let reference = format!("refs/{}", joined(name));
+            let repo = &mut state.repos[index];
+            if repo.ref_sha(&reference).is_some() {
+                repo.delete_ref(&reference);
+                no_content()
+            } else {
+                Answer::error(422, "Reference does not exist")
+            }
+        }
         ("PATCH", ["releases", id]) => match release_of(state, index, id) {
             Some(at) => edit_release(state, req, index, at),
             None => Answer::not_found(),
@@ -1691,11 +1908,7 @@ fn write(state: &mut State, req: &Request, ctx: &Ctx) -> Answer {
         ("DELETE", ["releases", id]) => match release_of(state, index, id) {
             Some(at) => {
                 state.releases.remove(at);
-                Answer {
-                    status: 204,
-                    headers: Vec::new(),
-                    body: Vec::new(),
-                }
+                no_content()
             }
             None => Answer::not_found(),
         },
@@ -1703,10 +1916,206 @@ fn write(state: &mut State, req: &Request, ctx: &Ctx) -> Answer {
     }
 }
 
+/// A ref object: `{ref, url, object{sha, type, url}}`.
+fn ref_json(state: &State, repo: &Repo, reference: &str, sha: &str) -> Value {
+    let api = state.ports.api;
+    let full = repo.full_name();
+    let name = reference.trim_start_matches("refs/");
+    json!({
+        "ref": reference,
+        "url": format!("http://127.0.0.1:{api}/repos/{full}/git/refs/{name}"),
+        "object": {
+            "sha": sha,
+            "type": "commit",
+            "url": format!("http://127.0.0.1:{api}/repos/{full}/git/commits/{sha}"),
+        },
+    })
+}
+
+/// Whether `reference` passes git's `check-ref-format` and fits
+/// [`crate::git_http::REF_NAME_MAX`]: no empty component, none that starts with `.` or ends
+/// `.lock`; no `..`, `@{`, control byte, space or any of `~^:?*[\`; no trailing `.`; not `@`.
+fn well_formed_ref(reference: &str) -> bool {
+    let banned = |c: char| c.is_ascii_control() || " ~^:?*[\\".contains(c);
+    reference.len() <= crate::git_http::REF_NAME_MAX
+        && reference != "@"
+        && !reference.ends_with('.')
+        && !reference.contains("..")
+        && !reference.contains("@{")
+        && !reference.contains(banned)
+        && reference
+            .split('/')
+            .all(|c| !c.is_empty() && !c.starts_with('.') && !c.ends_with(".lock"))
+}
+
+/// `POST …/git/refs {ref, sha}`: a `refs/heads/…` or `refs/tags/…` ref at a sha the
+/// repository knows; 422 body R when it exists, body O when the sha is unknown, and
+/// `{"message":"Reference name is invalid"}` for another namespace or a name
+/// `well_formed_ref` refuses.
+fn create_ref(state: &mut State, req: &Request, index: usize) -> Answer {
+    let Ok(body) = aterm_json::from_slice::<Value>(&req.body) else {
+        return Answer::error(400, "Problems parsing JSON");
+    };
+    let (Ok(reference), Ok(sha)) = (text_field(&body, "ref"), text_field(&body, "sha")) else {
+        return Answer::error(400, "Problems parsing JSON");
+    };
+    let named = reference.filter(|r| {
+        ["refs/heads/", "refs/tags/"]
+            .iter()
+            .any(|p| r.strip_prefix(p).is_some_and(|n| !n.is_empty()))
+            && well_formed_ref(r)
+    });
+    let Some(reference) = named else {
+        return Answer::error(422, "Reference name is invalid");
+    };
+    let repo = &state.repos[index];
+    let Some(sha) = sha.filter(|s| crate::state::is_sha(s) && repo.knows_sha(s)) else {
+        return Answer::error(422, "Object does not exist");
+    };
+    if repo.ref_sha(&reference).is_some() {
+        return Answer::error(422, "Reference already exists");
+    }
+    state.repos[index].set_ref(&reference, &sha);
+    let repo = &state.repos[index];
+    Answer::json(201, &ref_json(state, repo, &reference, &sha))
+}
+
+/// The `/user/keys` scope GitHub asks for.
+const KEY_SCOPE: &str = "admin:public_key";
+/// The `X-Accepted-OAuth-Scopes` a `/user/keys` call without [`KEY_SCOPE`] answers: the
+/// value aterm-machines measured.
+const KEY_SCOPES_ACCEPTED: &str = "admin:public_key, read:public_key, write:public_key";
+/// When a key was added.
+const KEY_CREATED_AT: &str = "2026-11-01T00:00:00Z";
+
+/// The scopes `set_scopes` gave `token`, if any.
+fn scopes_of<'s>(state: &'s State, token: &str) -> Option<&'s [String]> {
+    state
+        .scopes
+        .iter()
+        .find(|(t, _)| t == token)
+        .map(|(_, s)| s.as_slice())
+}
+
+/// Why this caller may not reach `/user/keys`, if it may not: no token is 401, and a token
+/// whose scopes omit [`KEY_SCOPE`] is GitHub's 404 with the accepted scopes.
+fn keys_refused(state: &State, ctx: &Ctx) -> Option<Answer> {
+    let Some(token) = ctx.token.as_deref() else {
+        return Some(Answer::error(401, "Requires authentication"));
+    };
+    let scoped = scopes_of(state, token).is_none_or(|s| s.iter().any(|x| x == KEY_SCOPE));
+    if scoped {
+        return None;
+    }
+    let mut a = Answer::not_found();
+    a.headers
+        .push(("X-Accepted-OAuth-Scopes".into(), KEY_SCOPES_ACCEPTED.into()));
+    Some(a)
+}
+
+/// A key object: `{created_at, id, key, title}`.
+fn key_json(key: &crate::FakeKey) -> Value {
+    json!({"created_at": KEY_CREATED_AT, "id": key.id, "key": key.key, "title": key.title})
+}
+
+/// `GET /user/keys`: the login's keys by id, paged by `per_page`.
+fn keys_list(state: &State, req: &Request, ctx: &Ctx) -> Answer {
+    if let Some(refused) = keys_refused(state, ctx) {
+        return refused;
+    }
+    let login = ctx.login().unwrap_or_default();
+    let mut keys: Vec<&crate::FakeKey> = state
+        .keys
+        .iter()
+        .filter(|k| k.login.eq_ignore_ascii_case(login))
+        .map(|k| &k.key)
+        .collect();
+    keys.sort_by_key(|k| k.id);
+    let items = keys.into_iter().map(key_json).collect();
+    let api = state.ports.api;
+    page(req, items, &format!("http://127.0.0.1:{api}/user/keys"))
+}
+
+/// `GET /user/keys/{id}`: one of the login's keys, or 404.
+fn key_one(state: &State, ctx: &Ctx, id: &str) -> Answer {
+    if let Some(refused) = keys_refused(state, ctx) {
+        return refused;
+    }
+    let login = ctx.login().unwrap_or_default();
+    crate::parse_uint::<u64>(id)
+        .and_then(|id| {
+            state
+                .keys
+                .iter()
+                .find(|k| k.key.id == id && k.login.eq_ignore_ascii_case(login))
+        })
+        .map_or_else(Answer::not_found, |k| Answer::json(200, &key_json(&k.key)))
+}
+
+/// `POST /user/keys {title, key}` (201, ids from 20000; 422 body K when any login holds the
+/// key) and `DELETE /user/keys/{id}` (204, or 404 when the key is not this login's).
+fn key_write(state: &mut State, req: &Request, ctx: &Ctx, rest: &[&str]) -> Answer {
+    if let Some(refused) = keys_refused(state, ctx) {
+        return refused;
+    }
+    let login = ctx.login().unwrap_or_default().to_string();
+    match (req.method.as_str(), rest) {
+        ("POST", []) => {
+            let Ok(body) = aterm_json::from_slice::<Value>(&req.body) else {
+                return Answer::error(400, "Problems parsing JSON");
+            };
+            let (Ok(title), Ok(key)) = (text_field(&body, "title"), text_field(&body, "key"))
+            else {
+                return Answer::error(400, "Problems parsing JSON");
+            };
+            let Some(key) = key
+                .map(|k| crate::state::key_kept(&k))
+                .filter(|k| !k.is_empty())
+            else {
+                return invalid("PublicKey", "key", "missing_field");
+            };
+            if state.keys.iter().any(|k| k.key.key == key) {
+                return Answer::json(
+                    422,
+                    &json!({
+                        "message": "Validation Failed",
+                        "errors": [{"resource": "PublicKey", "code": "custom", "field": "key",
+                            "message": "key is already in use"}],
+                        "documentation_url": DOCS,
+                        "status": "422",
+                    }),
+                );
+            }
+            let id = state.add_key(&login, &title.unwrap_or_default(), &key);
+            state
+                .keys
+                .iter()
+                .find(|k| k.key.id == id)
+                .map_or_else(Answer::not_found, |k| Answer::json(201, &key_json(&k.key)))
+        }
+        ("DELETE", [id]) => {
+            let at = crate::parse_uint::<u64>(id).and_then(|id| {
+                state
+                    .keys
+                    .iter()
+                    .position(|k| k.key.id == id && k.login.eq_ignore_ascii_case(&login))
+            });
+            match at {
+                Some(at) => {
+                    state.keys.remove(at);
+                    no_content()
+                }
+                None => Answer::not_found(),
+            }
+        }
+        _ => Answer::not_found(),
+    }
+}
+
 /// The index in `state.releases` of release `id` of repository `index`.
 fn release_of(state: &State, index: usize, id: &str) -> Option<usize> {
     let repo = state.repos[index].id;
-    let id = id.parse::<u64>().ok()?;
+    let id = crate::parse_uint::<u64>(id)?;
     state
         .releases
         .iter()
@@ -1721,24 +2130,61 @@ fn published_tag(state: &State, repo: u64, tag: &str, except: Option<u64>) -> bo
         .any(|r| r.repo == repo && r.spec.tag == tag && !r.spec.draft && Some(r.id) != except)
 }
 
-/// What `make_latest` does once release `id` of repository `index` is written: `"true"` makes
-/// a published non-prerelease the latest; `"false"` keeps the latest where it is (an
-/// automatic one is pinned to what it names now, so this release cannot take it).
-fn apply_make_latest(state: &mut State, index: usize, id: u64, make_latest: Option<&str>) {
+/// The automatic latest of `repo`, as `releases/latest` picks it with no pin: the newest
+/// published non-prerelease the listing lag does not hide (by `created_at`, then id), other
+/// than `except`.
+fn auto_latest<'s>(state: &'s State, repo: &Repo, except: Option<u64>) -> Option<&'s Release> {
+    published(state, repo)
+        .into_iter()
+        .filter(|r| !r.spec.prerelease && !r.hidden && Some(r.id) != except)
+        .max_by(|a, b| (&a.spec.created_at, a.id).cmp(&(&b.spec.created_at, b.id)))
+}
+
+/// What `make_latest` does once release `id` of repository `index` is written.
+///
+/// A write that leaves `id` a draft or a prerelease leaves the latest alone, except that one
+/// which disqualifies a release that was a published non-prerelease (`was_candidate`) and
+/// is the pinned latest hands the latest back to [`auto_latest`], so `releases/latest` never
+/// serves a release a write made a prerelease or a draft. A fixture's `set_latest` pin of a
+/// prerelease is no candidate before the write, and stays.
+///
+/// For a published non-prerelease: `"true"` makes it the latest; `"legacy"` hands the
+/// latest to [`auto_latest`]; `"false"` keeps the latest where it is (an automatic one is
+/// pinned to what [`auto_latest`] names now apart from this release, or to none when it
+/// names nothing). With no `make_latest`, a release `published_now` by this write takes the
+/// latest unless the automatic latest already names it, as GitHub's default of `"true"` for
+/// a newly published release does.
+fn apply_make_latest(
+    state: &mut State,
+    index: usize,
+    id: u64,
+    make_latest: Option<&str>,
+    published_now: bool,
+    was_candidate: bool,
+) {
     let repo = &state.repos[index];
     let is_candidate = state
         .releases
         .iter()
         .find(|r| r.id == id)
         .is_some_and(|r| !r.spec.draft && !r.spec.prerelease);
+    if !is_candidate {
+        if was_candidate && repo.latest == Latest::Set(id) {
+            state.repos[index].latest = Latest::Auto;
+        }
+        return;
+    }
     match make_latest {
-        Some("true") if is_candidate => state.repos[index].latest = Latest::Set(id),
+        Some("true") => state.repos[index].latest = Latest::Set(id),
+        Some("legacy") => state.repos[index].latest = Latest::Auto,
+        None if published_now
+            && (repo.latest != Latest::Auto
+                || auto_latest(state, repo, None).map(|r| r.id) != Some(id)) =>
+        {
+            state.repos[index].latest = Latest::Set(id);
+        }
         Some("false") if repo.latest == Latest::Auto => {
-            let current = published(state, repo)
-                .into_iter()
-                .filter(|r| r.id != id && !r.spec.prerelease)
-                .max_by(|a, b| (&a.spec.created_at, a.id).cmp(&(&b.spec.created_at, b.id)))
-                .map(|r| r.id);
+            let current = auto_latest(state, repo, Some(id)).map(|r| r.id);
             state.repos[index].latest = current.map_or(Latest::None, Latest::Set);
         }
         _ => {}
@@ -1772,7 +2218,20 @@ fn create_release(state: &mut State, req: &Request, index: usize) -> Answer {
         return invalid("Release", "tag_name", "already_exists");
     }
     let draft = draft.unwrap_or(false);
+    let made_tag = if draft {
+        None
+    } else {
+        match tag_rule(repo, &tag, target.as_deref()) {
+            Ok(made) => made,
+            Err(refused) => return refused,
+        }
+    };
+    if let Some(sha) = made_tag {
+        state.repos[index].set_ref(&format!("refs/tags/{tag}"), &sha);
+    }
+    let repo = &state.repos[index];
     let created_at = "2026-11-01T00:00:00Z".to_string();
+    let sent_target = target.clone();
     let spec = ReleaseSpec {
         tag,
         name,
@@ -1786,7 +2245,11 @@ fn create_release(state: &mut State, req: &Request, index: usize) -> Answer {
     };
     let full = repo.full_name();
     let id = state.add_release(&full, spec);
-    apply_make_latest(state, index, id, make_latest.as_deref());
+    if let Some(at) = state.release_index(id) {
+        state.releases[at].sent_target = sent_target;
+        state.releases[at].make_latest.clone_from(&make_latest);
+    }
+    apply_make_latest(state, index, id, make_latest.as_deref(), !draft, false);
     let repo = &state.repos[index];
     match state.releases.iter().find(|r| r.id == id) {
         Some(release) => Answer::json(201, &release_json(state, repo, release)),
@@ -1799,11 +2262,12 @@ fn edit_release(state: &mut State, req: &Request, index: usize, at: usize) -> An
     let Ok(body) = aterm_json::from_slice::<Value>(&req.body) else {
         return Answer::error(400, "Problems parsing JSON");
     };
-    let (Ok(tag), Ok(name), Ok(notes), Ok(make_latest)) = (
+    let (Ok(tag), Ok(name), Ok(notes), Ok(make_latest), Ok(target)) = (
         text_field(&body, "tag_name"),
         text_field(&body, "name"),
         text_field(&body, "body"),
         text_field(&body, "make_latest"),
+        text_field(&body, "target_commitish"),
     ) else {
         return Answer::error(400, "Problems parsing JSON");
     };
@@ -1819,6 +2283,28 @@ fn edit_release(state: &mut State, req: &Request, index: usize, at: usize) -> An
     if !final_draft && published_tag(state, repo_id, &final_tag, Some(id)) {
         return invalid("Release", "tag_name", "already_exists");
     }
+    let final_target = target.clone().or_else(|| {
+        Some(state.releases[at].spec.target_commitish.clone()).filter(|t| !t.is_empty())
+    });
+    let publishes = state.releases[at].spec.draft && !final_draft;
+    let was_candidate = !state.releases[at].spec.draft && !state.releases[at].spec.prerelease;
+    let made_tag = if publishes {
+        match tag_rule(&state.repos[index], &final_tag, final_target.as_deref()) {
+            Ok(made) => made,
+            Err(refused) => return refused,
+        }
+    } else {
+        None
+    };
+    if let Some(sha) = made_tag {
+        state.repos[index].set_ref(&format!("refs/tags/{final_tag}"), &sha);
+    }
+    if make_latest.is_some() {
+        state.releases[at].make_latest.clone_from(&make_latest);
+    }
+    if let Some(target) = target {
+        state.releases[at].spec.target_commitish = target;
+    }
     let spec = &mut state.releases[at].spec;
     if let Some(tag) = tag {
         spec.tag = tag;
@@ -1833,16 +2319,23 @@ fn edit_release(state: &mut State, req: &Request, index: usize, at: usize) -> An
         spec.prerelease = prerelease;
     }
     if let Some(draft) = draft {
+        // A publish sets `published_at` to `created_at`, as M1's `Change::Publish` does; a
+        // `draft:false` of a release already published leaves it as it was.
+        if draft {
+            spec.published_at = None;
+        } else if publishes {
+            spec.published_at = Some(spec.created_at.clone());
+        }
         spec.draft = draft;
-        spec.published_at = if draft {
-            None
-        } else {
-            spec.published_at
-                .clone()
-                .or_else(|| Some(spec.created_at.clone()))
-        };
     }
-    apply_make_latest(state, index, id, make_latest.as_deref());
+    apply_make_latest(
+        state,
+        index,
+        id,
+        make_latest.as_deref(),
+        publishes,
+        was_candidate,
+    );
     let repo = &state.repos[index];
     Answer::json(200, &release_json(state, repo, &state.releases[at]))
 }
@@ -1857,7 +2350,7 @@ fn edit_asset(state: &mut State, req: &Request, index: usize, id: &str) -> Answe
         return Answer::error(400, "Problems parsing JSON");
     };
     let repo = state.repos[index].id;
-    let Ok(id) = id.parse::<u64>() else {
+    let Some(id) = crate::parse_uint::<u64>(id) else {
         return Answer::not_found();
     };
     let Some(at) = state
@@ -1867,6 +2360,9 @@ fn edit_asset(state: &mut State, req: &Request, index: usize, id: &str) -> Answe
     else {
         return Answer::not_found();
     };
+    if state.releases[at].spec.immutable {
+        return immutable();
+    }
     if let Some(name) = name.filter(|n| !n.is_empty()) {
         let release = &mut state.releases[at];
         if release
@@ -1889,20 +2385,19 @@ fn edit_asset(state: &mut State, req: &Request, index: usize, id: &str) -> Answe
 }
 
 /// `DELETE …/releases/assets/{id}`: the asset, from whichever release of the repository holds
-/// it.
+/// it; body I on an immutable release.
 fn delete_asset(state: &mut State, index: usize, id: &str) -> Answer {
     let repo = state.repos[index].id;
-    let Ok(id) = id.parse::<u64>() else {
+    let Some(id) = crate::parse_uint::<u64>(id) else {
         return Answer::not_found();
     };
     for release in state.releases.iter_mut().filter(|r| r.repo == repo) {
         if let Some(at) = release.assets.iter().position(|a| a.id == id) {
+            if release.spec.immutable {
+                return immutable();
+            }
             release.assets.remove(at);
-            return Answer {
-                status: 204,
-                headers: Vec::new(),
-                body: Vec::new(),
-            };
+            return no_content();
         }
     }
     Answer::not_found()
@@ -1933,6 +2428,9 @@ fn upload(state: &mut State, req: &Request, ctx: &Ctx) -> Answer {
     let Some(at) = release_of(state, index, id) else {
         return Answer::not_found();
     };
+    if state.releases[at].spec.immutable {
+        return immutable();
+    }
     let Some(name) = req.query("name").filter(|n| !n.is_empty()) else {
         return invalid("ReleaseAsset", "name", "missing_field");
     };

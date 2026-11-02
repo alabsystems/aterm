@@ -4,6 +4,7 @@
 //! Host GitHub key registration and revocation ([`login`], [`crate::git_credential`],
 //! [`TOKEN_HOST`], [`System::github_rest`], [`KEY_SCOPE`]).
 
+use super::inventory::KeysVia;
 use crate::git_credential::Git;
 use crate::github_pages;
 use crate::port::{GithubResponse, RestMethod, Secret, System};
@@ -329,6 +330,44 @@ pub fn login(sys: &dyn System, account: &str, token: Secret) -> Result<(), Strin
         ));
     }
     git.store(sys, None, TOKEN_HOST, account, &session.token)
+}
+
+/// The agh key path's refusal until WP13 writes it (plan §17).
+const AGH_KEYS_NOT_YET: &str = "not yet: the agh key path lands in WP13";
+
+/// [`register`] by the path `github.keys_via()` names: `Gh` is
+/// `register(sys, &github.account, host_name, keys)`, unchanged; `AghInline` and `AghFleet`
+/// are the agh path (§17).
+///
+/// # Errors
+///
+/// As `register`, or the agh path's refusal, one line naming the key call.
+pub fn register_via(
+    sys: &dyn System,
+    github: &super::inventory::Github,
+    host_name: &str,
+    keys: &[(String, String)],
+) -> Result<Vec<Registered>, String> {
+    match github.keys_via() {
+        KeysVia::Gh => register(sys, &github.account, host_name, keys),
+        KeysVia::AghInline | KeysVia::AghFleet => Err(AGH_KEYS_NOT_YET.to_string()),
+    }
+}
+
+/// [`revoke`] by the path `github.keys_via()` names, as `register_via`.
+///
+/// # Errors
+///
+/// As `revoke`, or the agh path's refusal.
+pub fn revoke_via(
+    sys: &dyn System,
+    github: &super::inventory::Github,
+    ids: &[u64],
+) -> Result<Vec<String>, String> {
+    match github.keys_via() {
+        KeysVia::Gh => revoke(sys, &github.account, ids),
+        KeysVia::AghInline | KeysVia::AghFleet => Err(AGH_KEYS_NOT_YET.to_string()),
+    }
 }
 
 #[cfg(test)]

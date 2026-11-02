@@ -125,6 +125,10 @@ pub fn composer_row(agent: &str, screen: &str) -> Option<String> {
         let (_, lines) = aterm_phase::agy::composer_draft(&rows)?;
         return lines.into_iter().next();
     }
+    if agent == "kimi" {
+        let (_, lines) = aterm_phase::kimi::composer(&rows)?;
+        return lines.into_iter().next();
+    }
     let idx: Vec<usize> = rows
         .iter()
         .enumerate()
@@ -371,6 +375,23 @@ mod tests {
             composer_row("claude", &body(f::DRAFT)).as_deref(),
             Some("hello there")
         );
+    }
+
+    /// The current Kimi's measured boxed composer reaches the lab's guarded turn helper.
+    #[test]
+    fn kimi_composers_are_read_without_treating_its_trust_prompt_as_input() {
+        use aterm_phase::kimi::fixtures;
+        let measured = fixtures::STUB_REPLY;
+        assert_eq!(composer_row("kimi", measured).as_deref(), Some(""));
+        assert_eq!(
+            composer_row("kimi", fixtures::DRAFT).as_deref(),
+            Some("hello")
+        );
+        assert_eq!(
+            composer_row("kimi", "Trust this folder?\n ❯ Trust and continue\n Exit"),
+            None
+        );
+        assert_eq!(composer_row("kimi", "no composer"), None);
     }
 
     #[test]

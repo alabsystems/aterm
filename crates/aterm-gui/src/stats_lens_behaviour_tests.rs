@@ -231,10 +231,7 @@ impl Rig {
     fn sentence(&self, focus: Instrument) -> String {
         let snap = self.app.vitals.snapshot.clone().expect("a snapshot");
         let panes = self.app.deck_tab_panes(self.wid);
-        let loc = aterm_vitals::words::Locale {
-            platform: aterm_vitals::words::Platform::host(),
-            utc_offset_s: crate::presence::local_offset_s().unwrap_or(0),
-        };
+        let loc = crate::stats_deck::host_locale(Some(&snap));
         super::lens_sentence(&snap, focus, &panes, &loc)
     }
 }
@@ -659,6 +656,7 @@ fn the_decks_rows_cells_and_state_labels_open_their_lens() {
     let loc = aterm_vitals::words::Locale {
         platform: aterm_vitals::words::Platform::host(),
         utc_offset_s: 0,
+        utc_offset_at: None,
     };
     assert!(
         aterm_vitals::words::state(res, &trouble, &loc).is_some(),
@@ -1216,4 +1214,340 @@ fn switching_between_the_sill_and_off_regrids_nothing() {
         before
     );
     assert_eq!(r.lens(), None, "the lens closes with its form");
+}
+
+fn compose_lens_input(r: &mut Rig) -> Option<super::LensPaintReceipt> {
+    let plan = r.app.active_visible_leaf_plan(r.wid).expect("visible plan");
+    r.app
+        .compose_route_chrome(
+            r.wid,
+            crate::VisibleContentRoute::Terminal { composed: false },
+            &plan,
+        )
+        .expect("composed chrome")
+        .lens_input
+}
+
+fn network_input_rig() -> Rig {
+    crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+    let mut r = rig("sill");
+    let (cw, _) = r.app.win_cell_size(r.wid);
+    let width = usize::from(r.app.windows[&r.wid].cols) * cw + 2 * r.app.win_pad(r.wid);
+    let height = r.app.stats_frame_h(r.wid);
+    r.app.windows.get_mut(&r.wid).unwrap().win_px = Some(aterm_window::dpi::PhysicalSize::new(
+        width as u32,
+        height as u32,
+    ));
+    r.app.open_stats_lens(
+        r.wid,
+        Instrument::NetworkState,
+        Bar::Global,
+        Opened::Keyboard,
+    );
+    let paint = compose_lens_input(&mut r);
+    assert!(paint.is_some(), "the initial lens is composed visibly");
+    r.app.stats_lens_presented(r.wid, paint, true, false);
+    r
+}
+
+fn add_input_tab(r: &mut Rig) {
+    let session = r.app.next_session_id;
+    r.app.push_stub_tab(r.wid, crate::stub_session(session));
+    r.app.switch_tab_in(r.wid, 0);
+    assert_eq!(r.app.windows[&r.wid].tab_set.len(), 2);
+}
+
+fn tab_input_rig() -> Rig {
+    let mut r = network_input_rig();
+    add_input_tab(&mut r);
+    r.app
+        .open_stats_lens(r.wid, Instrument::Cpu, Bar::Tab, Opened::Keyboard);
+    let paint = compose_lens_input(&mut r).expect("visible resource lens");
+    r.app.stats_lens_presented(r.wid, Some(paint), true, false);
+    r
+}
+
+fn lens_readback_selections(r: &Rig) -> (String, String) {
+    let line = r
+        .app
+        .stats_lens_chrome_lines()
+        .pop()
+        .expect("fixture window");
+    let field = |prefix: &str| {
+        line.split_whitespace()
+            .find_map(|word| word.strip_prefix(prefix))
+            .expect("selection field")
+            .to_owned()
+    };
+    (field("desired="), field("presented="))
+}
+
+#[test]
+fn another_tabs_frame_cannot_pay_a_resource_arrow_from_the_previous_tab() {
+    let mut r = tab_input_rig();
+    let original = r.app.windows[&r.wid].tab_set.active_id().unwrap();
+    r.named(KeyCode::ArrowRight, NamedKey::ArrowRight);
+    let old = r.app.windows[&r.wid]
+        .stats_lens
+        .input
+        .token()
+        .expect("arrow armed");
+    let old_paint = compose_lens_input(&mut r).expect("composed on the original tab");
+    assert_eq!(old_paint.input, Some(old));
+
+    r.app.switch_tab_in(r.wid, 1);
+    let current = r.app.windows[&r.wid].tab_set.active_id().unwrap();
+    assert_ne!(original, current);
+    assert_eq!(r.app.windows[&r.wid].stats_lens.input.token(), None);
+    let paint = compose_lens_input(&mut r).expect("visible on the second tab");
+    assert_eq!(paint.selection.unwrap().tab, Some(current));
+    assert_eq!(paint.input, None, "the other tab is not this key's answer");
+    r.app
+        .stats_lens_presented(r.wid, Some(old_paint), true, false);
+    assert_eq!(r.app.windows[&r.wid].stats_lens.input.token(), None);
+    r.app.stats_lens_presented(r.wid, Some(paint), true, false);
+
+    r.named(KeyCode::ArrowRight, NamedKey::ArrowRight);
+    let fresh = compose_lens_input(&mut r).expect("new second-tab answer");
+    assert_eq!(fresh.selection.unwrap().tab, Some(current));
+    assert!(fresh.input.is_some_and(|token| token != old));
+    r.app.stats_lens_presented(r.wid, Some(fresh), true, false);
+
+    r.app.switch_tab_in(r.wid, 0);
+    let (desired, presented) = lens_readback_selections(&r);
+    assert_ne!(
+        desired, presented,
+        "the same lens now names a different tab"
+    );
+    let paint = compose_lens_input(&mut r).expect("returned tab painted");
+    r.app.stats_lens_presented(r.wid, Some(paint), true, false);
+    let (desired, presented) = lens_readback_selections(&r);
+    assert_eq!(desired, presented, "the own frame acknowledged this scope");
+}
+
+#[test]
+fn returning_to_a_tab_without_painting_cannot_revive_its_pending_arrow() {
+    let mut r = tab_input_rig();
+    let original = r.app.windows[&r.wid].tab_set.active_id();
+    r.named(KeyCode::ArrowRight, NamedKey::ArrowRight);
+    let old = r.app.windows[&r.wid]
+        .stats_lens
+        .input
+        .token()
+        .expect("arrow armed");
+
+    // No composition observes the intervening tab. The host's real cycle/sync path must
+    // retire the edge, rather than letting the restored stable identity revive it.
+    r.app.cycle_tab_in(r.wid, true);
+    r.app.cycle_tab_in(r.wid, false);
+    assert_eq!(r.app.windows[&r.wid].tab_set.active_id(), original);
+    assert_eq!(r.app.windows[&r.wid].stats_lens.input.token(), None);
+    let paint = compose_lens_input(&mut r).expect("returned resource lens");
+    assert_eq!(paint.input, None, "returning does not revive the old key");
+    r.app.stats_lens_presented(r.wid, Some(paint), true, false);
+
+    r.named(KeyCode::ArrowLeft, NamedKey::ArrowLeft);
+    assert!(
+        compose_lens_input(&mut r)
+            .unwrap()
+            .input
+            .is_some_and(|token| token != old)
+    );
+}
+
+#[test]
+fn machine_network_arrows_do_not_acquire_a_tab_scope() {
+    let mut r = network_input_rig();
+    add_input_tab(&mut r);
+    r.named(KeyCode::ArrowDown, NamedKey::ArrowDown);
+    let token = r.app.windows[&r.wid]
+        .stats_lens
+        .input
+        .token()
+        .expect("network arrow armed");
+    r.app.cycle_tab_in(r.wid, true);
+    r.app.cycle_tab_in(r.wid, false);
+    assert_eq!(r.app.windows[&r.wid].stats_lens.input.token(), Some(token));
+    let paint = compose_lens_input(&mut r).expect("same machine observation");
+    assert_eq!(paint.selection.unwrap().tab, None);
+    assert_eq!(paint.input, Some(token));
+}
+
+#[test]
+fn lens_arrows_wait_for_their_own_paint_and_superseded_selections_have_no_sample() {
+    let mut r = network_input_rig();
+    r.named(KeyCode::ArrowDown, NamedKey::ArrowDown);
+    let first = r.app.windows[&r.wid]
+        .stats_lens
+        .input
+        .token()
+        .expect("arrow armed");
+    let old_paint = compose_lens_input(&mut r);
+    assert_eq!(old_paint.unwrap().input, Some(first));
+    r.named(KeyCode::ArrowDown, NamedKey::ArrowDown);
+    let latest = r.app.windows[&r.wid]
+        .stats_lens
+        .input
+        .token()
+        .expect("new arrow armed");
+    assert_ne!(latest, first);
+    r.app.stats_lens_presented(r.wid, old_paint, true, false);
+    assert_eq!(
+        r.app.windows[&r.wid].stats_lens.input.token(),
+        Some(latest),
+        "an older frame cannot acknowledge the new selection"
+    );
+    let paint = compose_lens_input(&mut r);
+    assert_eq!(paint.unwrap().input, Some(latest));
+    r.app.stats_lens_presented(r.wid, paint, true, false);
+    assert_eq!(r.app.windows[&r.wid].stats_lens.input.token(), None);
+    assert_eq!(r.sent(), "", "navigation sends no program input");
+}
+
+#[test]
+fn returning_to_the_selection_already_on_glass_does_not_manufacture_latency() {
+    let mut r = network_input_rig();
+    let shown = r.app.windows[&r.wid].stats_lens.presented_selection;
+    r.named(KeyCode::ArrowDown, NamedKey::ArrowDown);
+    r.named(KeyCode::ArrowUp, NamedKey::ArrowUp);
+    assert!(r.app.windows[&r.wid].stats_lens.input.token().is_some());
+    let paint = compose_lens_input(&mut r).expect("visible unchanged selection");
+    assert_eq!(Some(paint.selection), shown);
+    assert_eq!(
+        paint.input, None,
+        "neither intermediate selection reached glass"
+    );
+    assert_eq!(r.app.windows[&r.wid].stats_lens.input.token(), None);
+}
+
+#[test]
+fn covered_captured_and_unseen_lens_frames_do_not_acknowledge_keys() {
+    for (visible, capture) in [(false, false), (true, true)] {
+        let mut r = network_input_rig();
+        let shown = r.app.windows[&r.wid].stats_lens.presented_selection;
+        r.named(KeyCode::ArrowDown, NamedKey::ArrowDown);
+        let paint = compose_lens_input(&mut r);
+        r.app.stats_lens_presented(r.wid, paint, visible, capture);
+        assert_eq!(r.app.windows[&r.wid].stats_lens.presented_selection, shown);
+        assert_eq!(r.app.windows[&r.wid].stats_lens.input.token(), None);
+    }
+    for scrim in [None, Some([0, 0, 0, 128])] {
+        let mut r = network_input_rig();
+        r.named(KeyCode::ArrowDown, NamedKey::ArrowDown);
+        r.app.windows.get_mut(&r.wid).unwrap().settings_card = Some(crate::SettingsCard {
+            rgba: vec![0; 4],
+            pw: 1,
+            ph: 1,
+            dx: 0,
+            dy: 0,
+            fp: 1,
+            geom: 1,
+            raster_fingerprint_once: std::sync::OnceLock::new(),
+            scrim,
+            serial: 0,
+            delta: None,
+        });
+        r.app.fold_stats_deck(r.wid);
+        assert!(
+            r.app.stats_lens_input_receipt(r.wid).is_none(),
+            "a cached lens under a higher card is not proof of visibility"
+        );
+        assert_eq!(r.app.windows[&r.wid].stats_lens.input.token(), None);
+    }
+}
+
+/// A lens the renderer folds as a layer of the window's tray stack (a Metal window,
+/// `App::stack_or_fold_stats_deck`, keeps no CPU fold) reaches the glass as a folded one does:
+/// its frame acknowledges the key that moved it and keeps the selection it shows.
+#[test]
+fn a_stacked_lens_frame_acknowledges_its_keys() {
+    let mut r = network_input_rig();
+    r.named(KeyCode::ArrowDown, NamedKey::ArrowDown);
+    let token = r.app.windows[&r.wid]
+        .stats_lens
+        .input
+        .token()
+        .expect("arrow armed");
+    let folded = compose_lens_input(&mut r).expect("the folded lens is composed visibly");
+    assert_eq!(folded.input, Some(token));
+    // The window's cards as a Metal window leaves them: a stack for the renderer, no fold.
+    let ws = r.app.windows.get_mut(&r.wid).unwrap();
+    ws.deck_fold = None;
+    ws.tray_stacked = true;
+    assert!(
+        ws.tray_stack().is_some(),
+        "CONTROL: the deck and the lens are a tray stack"
+    );
+    let paint = r
+        .app
+        .stats_lens_input_receipt(r.wid)
+        .expect("a stacked lens reaches the glass");
+    assert_eq!(paint.selection, folded.selection);
+    assert_eq!(
+        paint.input,
+        Some(token),
+        "the stacked frame carries the key's token"
+    );
+    r.app.stats_lens_presented(r.wid, Some(paint), true, false);
+    assert_eq!(
+        r.app.windows[&r.wid].stats_lens.presented_selection,
+        Some(paint.selection),
+        "the stacked frame keeps the selection it shows"
+    );
+    assert_eq!(
+        r.app.windows[&r.wid].stats_lens.input.token(),
+        None,
+        "the key is acknowledged"
+    );
+    // CONTROL: with neither a fold nor a stack the lens is not on glass.
+    r.app.windows.get_mut(&r.wid).unwrap().tray_stacked = false;
+    assert!(
+        r.app.stats_lens_input_receipt(r.wid).is_none(),
+        "CONTROL: a lens neither folded nor stacked is not proof of visibility"
+    );
+}
+
+#[test]
+fn lens_copy_modifiers_and_pointer_displacement_do_not_create_navigation_samples() {
+    let mut r = network_input_rig();
+    r.key(KeyCode::ShiftLeft, Key::Named(NamedKey::Shift), None);
+    r.app.with_gesture_source(true, |app| {
+        assert!(app.stats_lens_key(
+            r.wid,
+            ModifiersState::SUPER,
+            &Key::Character("c".into()),
+            true,
+            false
+        ));
+    });
+    assert_eq!(r.app.windows[&r.wid].stats_lens.input.token(), None);
+    r.named(KeyCode::ArrowDown, NamedKey::ArrowDown);
+    assert!(r.app.windows[&r.wid].stats_lens.input.token().is_some());
+    r.app.stats_pointer_left(r.wid, Instant::now());
+    assert_eq!(r.app.windows[&r.wid].stats_lens.input.token(), None);
+}
+
+#[test]
+fn unknown_or_clipped_glass_requires_a_new_visible_baseline() {
+    let mut r = network_input_rig();
+    r.app.stats_lens_presented(r.wid, None, true, false);
+    r.named(KeyCode::ArrowDown, NamedKey::ArrowDown);
+    let paint = compose_lens_input(&mut r).expect("visible baseline");
+    assert_eq!(paint.input, None);
+    r.app.stats_lens_presented(r.wid, Some(paint), true, false);
+    r.named(KeyCode::ArrowDown, NamedKey::ArrowDown);
+    assert!(compose_lens_input(&mut r).unwrap().input.is_some());
+    r.app.windows.get_mut(&r.wid).unwrap().win_px =
+        Some(aterm_window::dpi::PhysicalSize::new(1, 1));
+    assert!(
+        r.app.stats_lens_input_receipt(r.wid).is_none(),
+        "a cropped selection is unmeasured"
+    );
+    assert_eq!(r.app.windows[&r.wid].stats_lens.input.token(), None);
+    r.app.windows.get_mut(&r.wid).unwrap().win_px = None;
+    r.named(KeyCode::ArrowDown, NamedKey::ArrowDown);
+    assert!(
+        compose_lens_input(&mut r).is_none(),
+        "unknown physical bounds are unmeasured"
+    );
 }

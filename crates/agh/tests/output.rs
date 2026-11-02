@@ -204,6 +204,29 @@ fn commit_derives_date_subject_and_author() {
         Value::from("Fixture Ext"),
         "no login: the name"
     );
+
+    let crlf_and_empty_login = json!({
+        "sha": "0123456789abcdef0123456789abcdef01234567",
+        "author": {"login": ""},
+        "commit": {
+            "message": "crlf title\r\nbody line",
+            "author": {"name": "Fallback Name"},
+            "committer": {"date": "2026-10-18T12:05:00Z"}
+        }
+    });
+    let out = emit_with(
+        object(Noun::Commit, crlf_and_empty_login),
+        &OutputOpts::default(),
+    );
+    assert_eq!(
+        parse(&out.stdout),
+        json!({
+            "author": "Fallback Name",
+            "date": "2026-10-18T12:05:00Z",
+            "sha": "0123456789abcdef0123456789abcdef01234567",
+            "subject": "crlf title"
+        })
+    );
 }
 
 #[test]
@@ -1067,6 +1090,15 @@ fn a_partial_list_prints_the_receipt_without_meta() {
     assert!(line.contains(" complete=0"), "{line}");
     assert!(line.contains(" partial=\""), "a quoted why: {line}");
     assert!(line.contains("20-page"), "{line}");
+
+    let del_out = emit_with(
+        receipt_outcome(Completeness::Partial {
+            why: "bad\u{7f}byte".into(),
+        }),
+        &OutputOpts::default(),
+    );
+    let del_line = del_out.stderr.lines().next().expect("the receipt");
+    assert!(del_line.contains(r#" partial="bad\x7fbyte""#), "{del_line}");
 }
 
 #[test]

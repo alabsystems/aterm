@@ -280,19 +280,32 @@ impl<C: Ctl> Session<'_, C> {
         ));
     }
 
-    /// THE COMPOSER A POINT DECIDES ON (`r`'s), under `cfg`: a draft standing while a line left
-    /// stands whose grant is no longer in force (the owner's `prompt`, or the stuck line's
-    /// `stuck_break_note`) reads as aterm's own words (`Composer::Own`), which the policy asks a
-    /// person about and never sends (`FactsState::draft_may_go`): nothing `prompt` typed goes
-    /// under `observe` or `off`. The person sends or clears it, and the next look settles it.
+    /// THE COMPOSER A POINT DECIDES ON (`r`'s, read off `screen`), under `cfg`: a draft standing
+    /// while a line left stands whose grant is no longer in force (the owner's `prompt`, or the
+    /// stuck line's `stuck_break_note`) reads as aterm's own words (`Composer::Own`), which the
+    /// policy asks a person about and never sends (`FactsState::draft_may_go`): nothing `prompt`
+    /// typed goes under `observe` or `off`. So does a draft that holds the line this loop wrote
+    /// and left with a person's words joined to it (`OwnLine::joined_in`: their keys landed before
+    /// its Enter): neither the loop's act nor the person's own draft, so the policy's draft step
+    /// sends neither as the other. The person sends or clears it, and the next look settles it.
     pub(in crate::supervise::run) fn left_composer(
         &self,
         r: &mut TurnEndReading,
         cfg: &SupervisorConfig,
+        screen: &Screen,
     ) {
         let prompt = cfg.occupancy.grant().is_some();
         let stuck = cfg.stuck_break_grant().is_some();
         if r.composer == Composer::Typed && !self.facts.state.draft_may_go(prompt, stuck) {
+            r.composer = Composer::Own;
+        }
+        if r.composer == Composer::Typed
+            && let Some(own) = self.own_line.as_ref()
+            && self
+                .reader(&screen.rows)
+                .composer(&screen.rows)
+                .is_some_and(|(_, lines)| own.joined_in(&lines.join(" ")))
+        {
             r.composer = Composer::Own;
         }
     }

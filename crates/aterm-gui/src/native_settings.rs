@@ -72,6 +72,7 @@ pub(crate) enum SettingsRoute {
     Security,
     SoftwareUpdate,
     Packages,
+    Lab,
     Harness,
     Ai,
     Tabs,
@@ -81,7 +82,7 @@ pub(crate) enum SettingsRoute {
 }
 
 impl SettingsRoute {
-    pub(crate) const ALL: [Self; 22] = [
+    pub(crate) const ALL: [Self; 23] = [
         Self::Home,
         Self::Modified,
         Self::Manual,
@@ -100,6 +101,7 @@ impl SettingsRoute {
         Self::Ai,
         Self::Tabs,
         Self::Security,
+        Self::Lab,
         Self::SoftwareUpdate,
         Self::Packages,
         Self::Messages,
@@ -124,6 +126,7 @@ impl SettingsRoute {
             Self::Security => "/security",
             Self::SoftwareUpdate => "/updates",
             Self::Packages => "/packages",
+            Self::Lab => "/lab",
             Self::Harness => "/harness",
             Self::Ai => "/ai",
             Self::Tabs => "/tabs",
@@ -151,6 +154,7 @@ impl SettingsRoute {
             Self::Security => "Security",
             Self::SoftwareUpdate => "Software Update",
             Self::Packages => "Packages",
+            Self::Lab => "Lab shared state",
             Self::Harness => "Harness",
             Self::Ai => "AI CLIs",
             Self::Tabs => "Tab Control",
@@ -218,6 +222,7 @@ impl SettingsRoute {
             | Self::Wallpaper
             | Self::SoftwareUpdate
             | Self::Packages
+            | Self::Lab
             | Self::Ai
             | Self::Tabs
             | Self::Messages
@@ -250,7 +255,12 @@ impl WriteKind {
                 format!("Kept {label}'s colors and your type settings")
             }
         };
-        ChangeWords { status, ..change }
+        let [_, undone, redone] = change.briefs;
+        ChangeWords {
+            status,
+            briefs: [Vec::new(), undone, redone],
+            ..change
+        }
     }
 
     fn refused_words(&self, why: &str) -> Option<String> {
@@ -727,7 +737,7 @@ impl ChoicePicker {
         } else {
             current.strip_suffix(" (default)").unwrap_or(current).trim()
         };
-        let current = trail_style_row_value(key, current);
+        let current = choice_row_value(key, current);
         let option_label = |value: &str| setting_choice_label(key, value);
         let options = options.into_iter().collect::<Vec<_>>();
         let mut means = options.clone();
@@ -1118,11 +1128,13 @@ impl ChoicePicker {
     }
 
     fn option_index(&self, key: &UiKey) -> Option<usize> {
-        key.as_str()
+        let raw = key
+            .as_str()
             .strip_prefix("settings/choice/")?
             .strip_prefix(self.key.as_str())?
-            .strip_prefix('/')?
-            .parse::<usize>()
+            .strip_prefix('/')?;
+        (!raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit())).then_some(())?;
+        raw.parse::<usize>()
             .ok()
             .filter(|index| *index < self.options.len())
     }
@@ -1553,6 +1565,8 @@ pub(crate) struct SettingsViewState {
     /// ([`SettingsViewState::unlaid`]).
     laid_context: RefCell<Option<(scroll::ScrollContext, LogicalRect, u32)>>,
     status_set_aside: Option<String>,
+    /// Statuses' shorter forms, by the status, the latest last ([`Self::keep_status_forms`]).
+    status_forms: Vec<(String, Vec<String>)>,
     presented_motion: Cell<crate::native_app::ViewMotionCx>,
     presented_package_admission: Cell<PackageAdmission>,
     presented_update_installable: Cell<UpdateInstallability>,
@@ -1632,6 +1646,8 @@ pub(crate) struct SettingsViewState {
     /// Whether a list took the toolbar from the list's head this build
     /// ([`SettingsViewState::take_list_head`]).
     toolbar_head_taken: Cell<bool>,
+    /// Whether that list took the toolbar only for the row the demo would lead it under.
+    toolbar_head_lent: Cell<bool>,
     /// Whether the page drawn last took the toolbar to lead its list ([`page_children`]): only
     /// then does the toolbar leave the window's top.
     toolbar_listed_drawn: Cell<bool>,
@@ -1686,7 +1702,7 @@ pub(crate) struct SettingsViewState {
     reveal_as: scroll::Reveal,
     /// The first result a pinned filter's change revealed, and the reveal it replaced (R5).
     first_beside: Option<(UiKey, Option<UiKey>)>,
-    /// Whether this render's seats let go a start held for a stop moved in at the top ([`page`]).
+    /// Whether this render's seats let go a start held as the screen before drew it ([`page`]).
     start_let_go: Cell<bool>,
     /// The control a press that moved the keyboard revealed ([`SettingsViewState::reveal_press`]).
     press_left: Option<UiKey>,
@@ -1704,6 +1720,9 @@ pub(crate) struct SettingsViewState {
     /// no side of the list holds it with the Undo and nothing pressed moves; the Undo stays on
     /// Cmd-Z and the command palette ([`settings_tree`]).
     status_bare: Cell<bool>,
+    /// Whether this render's bare bar stands with no room about its words, where only that
+    /// clears the control a press found ([`scroll::BarForm::Tight`]).
+    status_tight: Cell<bool>,
     /// Whether the event being handled seated the list on its stops again
     /// ([`SettingsViewState::drop_list_nudge`]): a press in it holds no place on the screen it
     /// was pressed on (a Timer closed gives back the place its opening scrolled).
@@ -1830,6 +1849,7 @@ impl SettingsViewState {
             presented_plain_dock: Cell::new(false),
             laid_context: RefCell::new(None),
             status_set_aside: None,
+            status_forms: Vec::new(),
             presented_motion: Cell::new(crate::native_app::ViewMotionCx::default()),
             presented_package_admission: Cell::new(PackageAdmission::Unobserved),
             presented_update_installable: Cell::new(UpdateInstallability::Unobserved),
@@ -1895,6 +1915,7 @@ impl SettingsViewState {
             search_reach: RefCell::new(None),
             list_head: RefCell::new(Vec::new()),
             toolbar_head_taken: Cell::new(false),
+            toolbar_head_lent: Cell::new(false),
             toolbar_listed_drawn: Cell::new(false),
             bar_seats: RefCell::new(Vec::new()),
             give_ways_untaken: RefCell::new(Vec::new()),
@@ -1928,6 +1949,7 @@ impl SettingsViewState {
             status_place: Cell::new(StatusPlace::Rule),
             status_band: Cell::new(None),
             status_bare: Cell::new(false),
+            status_tight: Cell::new(false),
             laid_list_top: Cell::new(None),
             list_reseated: Cell::new(false),
             style_trial_undo: None,
@@ -2254,6 +2276,29 @@ impl SettingsViewState {
                 viewport,
                 settings_text_scale().to_bits(),
             ))
+    }
+
+    /// Keep `forms`, shorter forms of status `full`, for its bar to say where `full` does not
+    /// fit ([`shown_status`]); the last few statuses keep theirs (a change's status and its Undo's
+    /// and Redo's words).
+    fn keep_status_forms(&mut self, full: &str, forms: Vec<String>) {
+        const KEPT: usize = 9;
+        self.status_forms.retain(|(kept, _)| kept != full);
+        if forms.is_empty() {
+            return;
+        }
+        if self.status_forms.len() >= KEPT {
+            self.status_forms.remove(0);
+        }
+        self.status_forms.push((full.to_string(), forms));
+    }
+
+    fn status_forms_of(&self, full: &str) -> Option<&[String]> {
+        self.status_forms
+            .iter()
+            .rev()
+            .find(|(kept, _)| kept == full)
+            .map(|(_, forms)| forms.as_slice())
     }
 
     fn bar_feedback(&self) -> Option<&String> {
@@ -3618,6 +3663,7 @@ impl SettingsViewState {
         let (key, index) = match focus.strip_prefix("settings/segment/") {
             Some(rest) => {
                 let (key, index) = rest.rsplit_once('/')?;
+                (!index.is_empty() && index.bytes().all(|b| b.is_ascii_digit())).then_some(())?;
                 (key, Some(index.parse::<usize>().ok()?))
             }
             None => (focus.strip_prefix("settings/control/")?, None),
@@ -3994,6 +4040,17 @@ impl SettingsApp {
         self.harness_revision = revision.max(self.harness_revision);
     }
 
+    /// Periodic Lab observations leave the other harness projections intact.
+    pub(crate) fn replace_lab(&mut self, lab: crate::lab_screen::LabState, revision: u64) {
+        self.harness.lab = lab;
+        self.harness_revision = revision.max(self.harness_revision);
+    }
+
+    /// Retained names from the host's latest session lifecycle publication.
+    pub(crate) fn lab_session_names(&self) -> Vec<crate::harness_screen::HarnessSession> {
+        self.harness.sessions.clone()
+    }
+
     /// The Settings ▸ Harness snapshot last published.
     #[cfg(test)]
     pub(crate) fn harness_snapshot(&self) -> &HarnessState {
@@ -4216,6 +4273,9 @@ impl SettingsApp {
             .collect();
         let shown_before = view.shown_before(&patch);
         let words = change_words(view, &patch, &shown_before);
+        let [_, undone_briefs, redone_briefs] = words.briefs;
+        view.keep_status_forms(&words.undone, undone_briefs);
+        view.keep_status_forms(&words.redone, redone_briefs);
         let restores = patch
             .edits
             .iter()
@@ -4463,9 +4523,11 @@ impl SettingsApp {
         }
         let manual_override = action
             .strip_prefix("settings/manual/open-override/")
+            .filter(|ordinal| !ordinal.is_empty() && ordinal.bytes().all(|b| b.is_ascii_digit()))
             .and_then(|ordinal| ordinal.parse::<usize>().ok());
         let manual_match = action
             .strip_prefix("settings/manual/open-match/")
+            .filter(|ordinal| !ordinal.is_empty() && ordinal.bytes().all(|b| b.is_ascii_digit()))
             .and_then(|ordinal| ordinal.parse::<usize>().ok());
         if action == "settings/manual/open" || manual_override.is_some() || manual_match.is_some() {
             let target = if let Some(ordinal) = manual_match {
@@ -4564,6 +4626,9 @@ impl SettingsApp {
         if action.starts_with(harness_page::HARNESS_ACTION_PREFIX) {
             return self.reduce_harness_action(view, action, invocation.value.as_ref(), cx);
         }
+        if action.starts_with(lab_page::LAB_ACTION_PREFIX) {
+            return self.reduce_lab_action(view, action, cx);
+        }
         if action.starts_with(ai_page::AI_ACTION_PREFIX) {
             return self.reduce_ai_action(view, action, cx);
         }
@@ -4582,6 +4647,9 @@ impl SettingsApp {
             }
             if route == SettingsRoute::Ai {
                 cx.harness(crate::native_app::HarnessRequest::AiLook);
+            }
+            if route == SettingsRoute::Lab {
+                cx.harness(crate::native_app::HarnessRequest::LabRefresh);
             }
             cx.invalidate_presentation();
             cx.repaint(crate::native_app::DamageRegion::All);
@@ -4796,6 +4864,8 @@ impl SettingsApp {
         }
         if let Some(rest) = action.strip_prefix("settings/choice-open-file/")
             && let Some((key, raw_index)) = rest.rsplit_once('/')
+            && !raw_index.is_empty()
+            && raw_index.bytes().all(|b| b.is_ascii_digit())
             && let Ok(index) = raw_index.parse::<usize>()
         {
             let id = view
@@ -4834,6 +4904,8 @@ impl SettingsApp {
         }
         if let Some(rest) = action.strip_prefix("settings/choice/")
             && let Some((key, raw_index)) = rest.rsplit_once('/')
+            && !raw_index.is_empty()
+            && raw_index.bytes().all(|b| b.is_ascii_digit())
             && let Ok(index) = raw_index.parse::<usize>()
         {
             let option = view
@@ -4953,6 +5025,8 @@ impl SettingsApp {
 
         if let Some(rest) = action.strip_prefix("settings/segment/")
             && let Some((key, raw_index)) = rest.rsplit_once('/')
+            && !raw_index.is_empty()
+            && raw_index.bytes().all(|b| b.is_ascii_digit())
             && let Ok(index) = raw_index.parse::<usize>()
         {
             let Some(choice) = view.field_by_key(key).and_then(|field| {
@@ -5323,6 +5397,7 @@ impl SettingsApp {
 
         if let Some(index) = action
             .strip_prefix("settings/reset-manual/")
+            .filter(|index| !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()))
             .and_then(|index| index.parse::<usize>().ok())
         {
             let Some(entry) = manual_reset_schema_entry(index) else {
@@ -5352,6 +5427,7 @@ impl SettingsApp {
 
         if let Some(index) = action
             .strip_prefix("settings/reset-retired/")
+            .filter(|index| !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()))
             .and_then(|index| index.parse::<usize>().ok())
         {
             let Some((retired, _)) = prefs::RETIRED_SPELLINGS.get(index) else {
@@ -6123,6 +6199,7 @@ impl SettingsApp {
                     undone: "Restored".to_string(),
                     redone: "Restored".to_string(),
                     rows: 1,
+                    briefs: Default::default(),
                 });
                 let mut feedback = vec![words.status.clone()];
                 if words.rows <= 2 {
@@ -6142,6 +6219,22 @@ impl SettingsApp {
                     ));
                 }
                 let status = feedback.join(FACT_SEPARATOR);
+                let [briefs, undone_briefs, redone_briefs] = words.briefs;
+                let facts = &feedback[1..];
+                view.keep_status_forms(
+                    &status,
+                    briefs
+                        .into_iter()
+                        .map(|brief| {
+                            std::iter::once(brief)
+                                .chain(facts.iter().cloned())
+                                .collect::<Vec<_>>()
+                                .join(FACT_SEPARATOR)
+                        })
+                        .collect(),
+                );
+                view.keep_status_forms(&words.undone, undone_briefs);
+                view.keep_status_forms(&words.redone, redone_briefs);
                 view.last_undo = undo.map(|token| UndoOffer {
                     target: UndoTarget::Token(token),
                     status: status.clone(),
@@ -6465,6 +6558,9 @@ impl SettingsApp {
                 let Some(SemanticInput::Text(id)) = value else {
                     return EventResult::Bubble;
                 };
+                if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+                    return EventResult::Bubble;
+                }
                 let Ok(id) = id.parse::<u64>() else {
                     return EventResult::Bubble;
                 };
@@ -6532,6 +6628,9 @@ impl SettingsApp {
                     let Some((id, verb)) = row.split_once('/') else {
                         return EventResult::Bubble;
                     };
+                    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+                        return EventResult::Bubble;
+                    }
                     let Ok(id) = id.parse::<u64>() else {
                         return EventResult::Bubble;
                     };
@@ -6626,6 +6725,7 @@ impl SettingsApp {
             _ => {
                 let Some(index) = verb
                     .strip_prefix("action/")
+                    .filter(|k| !k.is_empty() && k.bytes().all(|b| b.is_ascii_digit()))
                     .and_then(|k| k.parse::<u8>().ok())
                 else {
                     return false;
@@ -6703,12 +6803,12 @@ impl SettingsApp {
             return false;
         }
         let Some(id) = view.common.last_focus.as_ref().and_then(|focus| {
-            focus
+            let id = focus
                 .as_str()
                 .strip_prefix("settings/messages/row/")?
-                .strip_suffix("/title")?
-                .parse::<u64>()
-                .ok()
+                .strip_suffix("/title")?;
+            (!id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())).then_some(())?;
+            id.parse::<u64>().ok()
         }) else {
             return false;
         };
@@ -7446,6 +7546,10 @@ struct ChangeWords {
     undone: String,
     redone: String,
     rows: usize,
+    /// `status`, `undone` and `redone` in their shorter forms, in that order
+    /// ([`SettingsViewState::keep_status_forms`]): each row as "Name: Value", then as
+    /// "Value: Name", the outcome first.
+    briefs: [Vec<String>; 3],
 }
 
 fn edit_changes_nothing(edit: &ConfigEdit) -> bool {
@@ -7502,6 +7606,7 @@ fn change_words(
             redone: status.clone(),
             status,
             rows: 0,
+            briefs: Default::default(),
         };
     }
     let leaves_serious_mode = patch
@@ -7548,6 +7653,7 @@ fn change_words(
             undone: format!("Restored {counted}"),
             redone: forward,
             rows: rows.len(),
+            briefs: Default::default(),
         };
     }
     let after = |key: &str| {
@@ -7560,6 +7666,9 @@ fn change_words(
     let mut status = Vec::new();
     let mut undone = Vec::new();
     let mut redone = Vec::new();
+    // Each row as its value beside its name, and as its value before its name.
+    let mut was_named = Vec::new();
+    let mut now_named = Vec::new();
     let shown_words = |row: &str, raw: &dyn Fn(&str) -> Option<String>| {
         matches!(
             row,
@@ -7611,17 +7720,27 @@ fn change_words(
         });
         undone.push(format!("{name}: {was}"));
         redone.push(format!("{name}: {now}"));
+        was_named.push(format!("{was}: {name}"));
+        now_named.push(format!("{now}: {name}"));
     }
     if leaves_serious_mode {
         status.push("Serious Mode off".to_string());
         undone.push("Serious Mode: On".to_string());
         redone.push("Serious Mode: Off".to_string());
+        was_named.push("On: Serious Mode".to_string());
+        now_named.push("Off: Serious Mode".to_string());
     }
+    let joined = |parts: &[String]| parts.join(FACT_SEPARATOR);
     ChangeWords {
-        status: status.join(FACT_SEPARATOR),
-        undone: format!("Restored {}", undone.join(FACT_SEPARATOR)),
-        redone: format!("Restored {}", redone.join(FACT_SEPARATOR)),
+        status: joined(&status),
+        undone: format!("Restored {}", joined(&undone)),
+        redone: format!("Restored {}", joined(&redone)),
         rows: rows.len(),
+        briefs: [
+            vec![joined(&redone), joined(&now_named)],
+            vec![joined(&undone), joined(&was_named)],
+            vec![joined(&redone), joined(&now_named)],
+        ],
     }
 }
 
@@ -8148,7 +8267,7 @@ fn special_page_of(key: &str) -> Option<SettingsRoute> {
 
 fn row_available_here(key: &str, availability: SettingsAvailability) -> bool {
     match key {
-        prefs::EDIT_ALLOW_NOTIFICATIONS | prefs::EDIT_DESKTOP_ALERTS => availability.notifications,
+        prefs::EDIT_ALLOW_NOTIFICATIONS => availability.notifications,
         prefs::EDIT_SECURE_KEYBOARD_ENTRY
         | prefs::EDIT_FONT_THICKEN
         | prefs::EDIT_BACKGROUND_OPACITY
@@ -8186,7 +8305,6 @@ enum AdvancedEffectPath {
     SecurityPolicy,
     PackageRuntime,
     HarnessRuntime,
-    DesktopNotifier,
     UpdaterRuntime,
     RendererSelection,
     FocusQos,
@@ -8280,8 +8398,7 @@ fn advanced_effect_of(key: &str) -> Option<AdvancedEffectPath> {
         | prefs::EDIT_TAB_STATUS_QUIET_AFTER_MS
         | prefs::EDIT_TAB_STATUS_DWELL_MS
         | prefs::EDIT_TAB_STATUS_BADGE
-        | prefs::EDIT_TAB_CONNECTION_BADGE
-        | prefs::EDIT_PRESENCE_RIM => Some(Effect::WindowRuntime),
+        | prefs::EDIT_TAB_CONNECTION_BADGE => Some(Effect::WindowRuntime),
         prefs::EDIT_ACTIVE_TAB_COLOR => Some(Effect::WindowRuntime),
         prefs::EDIT_ACCENT_COLOR | prefs::EDIT_BORDER_COLOR | prefs::EDIT_SEARCH_MATCH_COLOR => {
             Some(Effect::WindowRuntime)
@@ -8329,7 +8446,6 @@ fn advanced_effect_of(key: &str) -> Option<AdvancedEffectPath> {
         | prefs::EDIT_PACKAGES_AUTO_INSTALL
         | prefs::EDIT_REROUTE_ANNOUNCE => Some(Effect::PackageRuntime),
         prefs::EDIT_UPDATE_ENABLED | "update.auto_apply" => Some(Effect::UpdaterRuntime),
-        prefs::EDIT_DESKTOP_ALERTS => Some(Effect::DesktopNotifier),
         prefs::EDIT_MACHINE_UNIVERSAL_CONTROL => Some(Effect::PackageRuntime),
         _ => None,
     }
@@ -9119,6 +9235,9 @@ impl NativeAppModel for SettingsApp {
         if view.route == SettingsRoute::Harness {
             out.extend(harness_page::harness_commands(&self.harness));
         }
+        if view.route == SettingsRoute::Lab {
+            out.extend(lab_page::lab_commands(&self.harness.lab));
+        }
         if view.route == SettingsRoute::Ai {
             out.extend(ai_page::ai_commands(&self.harness.ai));
         }
@@ -9247,7 +9366,6 @@ fn raw_bool_value(config: &Config, key: &str) -> Option<bool> {
         "sparkle_words.ink.enabled" => ink.and_then(|i| i.enabled),
         "sparkle_words.ink.loop" => ink.and_then(|i| i.loop_),
         "sparkle_words.emphasis.enabled" => emphasis.and_then(|e| e.enabled),
-        prefs::EDIT_PRESENCE_RIM => config.presence.as_ref().and_then(|p| p.rim),
         "font_synthetic_style" => config.font_synthetic_style,
         "ligatures" => config.ligatures,
         "underline_skip_descenders" => config.underline_skip_descenders,
@@ -9303,7 +9421,7 @@ fn semantic_value_for_field(
             Some((!current).to_string())
         }
         None if let EditKind::Enum { options } = field.kind => cycle_choice(
-            trail_style_row_value(field.key, SettingsState::display_value(field)),
+            choice_row_value(field.key, SettingsState::display_value(field)),
             options,
             field.seed.is_some(),
         ),
@@ -9454,14 +9572,16 @@ fn apply_text_input_event(
     }
 }
 
-fn trail_style_row_value<'a>(key: &str, value: &'a str) -> &'a str {
-    if matches!(
-        key,
-        prefs::EDIT_CURSOR_TRAIL_STYLE | prefs::EDIT_CURSOR_TRAIL_STYLE_BEFORE_OFF
-    ) {
-        prefs::cursor_trail_style_canonical(value).unwrap_or(value)
-    } else {
-        value
+/// The row a choice field's written `value` selects: a trail style's documented alias is its
+/// canonical row, and a Motion spelling the engine reads as a mode is that mode's row
+/// ([`prefs::motion_row_value`]).
+fn choice_row_value<'a>(key: &str, value: &'a str) -> &'a str {
+    match key {
+        prefs::EDIT_CURSOR_TRAIL_STYLE | prefs::EDIT_CURSOR_TRAIL_STYLE_BEFORE_OFF => {
+            prefs::cursor_trail_style_canonical(value).unwrap_or(value)
+        }
+        prefs::EDIT_MOTION => prefs::motion_row_value(value),
+        _ => value,
     }
 }
 
@@ -9529,6 +9649,9 @@ pub(crate) fn setting_choice_label(key: &str, value: &str) -> String {
     }
     if key == prefs::EDIT_MOTION && motion_value_is_auto(value) {
         return choice_label("auto");
+    }
+    if key == prefs::EDIT_MOTION && prefs::motion_row_value(value) != value {
+        return setting_choice_label(key, prefs::motion_row_value(value));
     }
     if key == prefs::EDIT_WINDOW_THEME && value.eq_ignore_ascii_case("auto") {
         return prefs::window_theme_auto(std::env::consts::OS)
@@ -9838,6 +9961,7 @@ fn trail_knob(key: &str) -> Option<aterm_effects::cursor_glow::TrailKnob> {
         prefs::EDIT_CURSOR_TRAIL_COLOR => TrailKnob::Color,
         prefs::EDIT_CURSOR_TRAIL_ACCENT => TrailKnob::Accent,
         prefs::EDIT_CURSOR_FIRE_SHIMMER => TrailKnob::FireShimmer,
+        prefs::EDIT_CURSOR_TRAIL_MS => TrailKnob::Duration,
         _ => return None,
     })
 }
@@ -10329,7 +10453,7 @@ fn segment_candidate(state: &SettingsViewState, key: &str) -> Option<String> {
             .as_str()
             .strip_prefix("settings/segment/")?
             .rsplit_once('/')?;
-        (segment_key == key)
+        (segment_key == key && !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()))
             .then(|| index.parse::<usize>().ok())
             .flatten()
     };
@@ -10351,7 +10475,9 @@ fn picker_choice<'a>(state: &'a SettingsViewState, key: &str) -> Option<&'a Choi
         .filter(|picker| picker.key == key)?;
     let choice_index = |focus: &UiKey| {
         let prefix = format!("settings/choice/{key}/");
-        focus.as_str().strip_prefix(&prefix)?.parse::<usize>().ok()
+        let raw = focus.as_str().strip_prefix(&prefix)?;
+        (!raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit())).then_some(())?;
+        raw.parse::<usize>().ok()
     };
     let hovered = state
         .common
@@ -11680,6 +11806,39 @@ pub(crate) fn settings_text_scale() -> f32 {
     crate::native_appearance::text_scale().clamp(0.85, 2.0)
 }
 
+/// The least view, in points, Settings is given at text scale `scale`: what the least window
+/// gives it ([`crate::App::least_window_size`]), the one measured at `scale` or the next scale
+/// up, which holds every scale under it to the next one down. Drawn straight between two
+/// measured scales, the least at 1.1× (221x220) left Harness's Answer questions priority's
+/// segments with no line of its name.
+pub(crate) fn least_view(scale: f32) -> (f32, f32) {
+    LEAST_VIEWS
+        .iter()
+        .find(|(measured, _)| scale <= measured + 0.001)
+        .unwrap_or(&LEAST_VIEWS[LEAST_VIEWS.len() - 1])
+        .1
+}
+
+/// THE LEAST VIEW SETTINGS HOLDS ITSELF IN, BY TEXT SCALE, MEASURED: at each scale, the least
+/// width and height (a 14pt row at a time) at and above which every page, in a dark and a light
+/// theme, shows each control whole on some screen with a line of its name, a Tab to any control
+/// lands on a screen showing a line of its name, a press's one-line status neither covers nor
+/// moves the control pressed, and each Messages entry is whole on a screen: the toolbar, a
+/// card's heading, a line of a name, the tallest control under it and a status's line. At 1×
+/// the width is the most: under 220pt a nested card's rows (Packages, Tab Color) wrap their
+/// names so a control and its name share no screen. A fixed 164x98 window squeezed 2× text
+/// into a 164x96 view, where 127 of 282 Tab landings showed no line of the control's name and 41
+/// controls were never whole; at 1× in 164x96, 58 landings showed none. At 0.85× a short
+/// window's page keeps its heading row from 204pt on, so the least is taller than at 1×.
+const LEAST_VIEWS: [(f32, (f32, f32)); 6] = [
+    (0.85, (220.0, 236.0)),
+    (1.0, (220.0, 208.0)),
+    (1.25, (222.0, 236.0)),
+    (1.5, (246.0, 250.0)),
+    (1.75, (287.0, 278.0)),
+    (2.0, (328.0, 292.0)),
+];
+
 pub(crate) fn scaled_control_height() -> f32 {
     scaled_control_height_at_scale(settings_text_scale())
 }
@@ -11781,6 +11940,7 @@ fn settings_tree_once(
     state.observe_semantic_font(cx.semantic_font.as_ref());
     state.status_place.set(StatusPlace::Rule);
     state.status_bare.set(false);
+    state.status_tight.set(false);
     let bar_most_unsettled = || {
         state.status_bar_most.set(None);
         #[cfg(test)]
@@ -11829,11 +11989,15 @@ fn settings_tree_once(
     let record = weighing.then(|| state.scroll_record.borrow().clone());
     // The most the bar, `bare` of its Undo or not, may take over the top of the list: the room
     // above the control, less a little clear where its least leaves that.
-    let band = |bare: bool| {
+    let band = |form: scroll::BarForm| {
         let room = state.press_band()?;
-        let was = state.status_bare.replace(bare);
+        let was = (
+            state.status_bare.replace(form.bare()),
+            state.status_tight.replace(form.tight()),
+        );
         let least = plain_bar_least(state, width, cx.viewport);
-        state.status_bare.set(was);
+        state.status_bare.set(was.0);
+        state.status_tight.set(was.1);
         if least + BAND_CLEAR <= room + 0.01 {
             Some(room - BAND_CLEAR)
         } else {
@@ -11863,13 +12027,13 @@ fn settings_tree_once(
                 holds
             }
     };
-    let fits = |side: scroll::BarSide, bare: bool| match side {
+    let fits = |side: scroll::BarSide, form: scroll::BarForm| match side {
         scroll::BarSide::Under => true,
-        scroll::BarSide::Over => band(bare).is_some(),
+        scroll::BarSide::Over => band(form).is_some(),
         scroll::BarSide::Dock => {
             let was = (
                 state.status_place.replace(StatusPlace::Dock),
-                state.status_bare.replace(bare),
+                state.status_bare.replace(form.bare()),
             );
             let holds = dock_holds();
             state.status_place.set(was.0);
@@ -11886,13 +12050,17 @@ fn settings_tree_once(
         };
         list_top_in(page).map(|top| header + top)
     };
-    // A side's trial draws no frame: the page rebuilt weighs its chrome on the frame before (R2).
-    let chrome_at_was = state.page_chrome_at.get();
-    // Lay the page out again from the frame's record, the bar at `place`, `bare` or not.
-    let stand = |place: StatusPlace, bare: bool| {
-        state.page_chrome_at.set(chrome_at_was);
+    // A side's trial draws no frame: the page rebuilt weighs its chrome as the frame before did.
+    let chrome_was = weighing.then(|| (state.page_chrome.get(), state.page_chrome_at.get()));
+    // Lay the page out again from the frame's record, the bar at `place` in `form`.
+    let stand = |place: StatusPlace, form: scroll::BarForm| {
+        if let Some((chrome, at)) = chrome_was {
+            state.page_chrome.set(chrome);
+            state.page_chrome_at.set(at);
+        }
         state.status_place.set(place);
-        state.status_bare.set(bare);
+        state.status_bare.set(form.bare());
+        state.status_tight.set(form.tight());
         state.scroll_record.replace(record.clone().flatten());
         bar_most_unsettled();
         bars_weighed.forget();
@@ -11900,19 +12068,21 @@ fn settings_tree_once(
     let mut built = None;
     let side = weighing.then(|| {
         let side = match state.press_side() {
-            Some((side, bare, true)) if fits(side, bare) => (side, bare),
-            Some((side, false, false)) if side != scroll::BarSide::Under && fits(side, false) => {
-                (side, false)
+            Some((side, form, true)) if fits(side, form) => (side, form),
+            Some((side, scroll::BarForm::Whole, false))
+                if side != scroll::BarSide::Under && fits(side, scroll::BarForm::Whole) =>
+            {
+                (side, scroll::BarForm::Whole)
             }
             _ => {
                 let under = build_page();
                 if !state.press_moved(list_top(&under)) {
                     built = Some(under);
-                    (scroll::BarSide::Under, false)
-                } else if band(false).is_some() {
-                    (scroll::BarSide::Over, false)
+                    (scroll::BarSide::Under, scroll::BarForm::Whole)
+                } else if band(scroll::BarForm::Whole).is_some() {
+                    (scroll::BarSide::Over, scroll::BarForm::Whole)
                 } else if dock_holds() {
-                    (scroll::BarSide::Dock, false)
+                    (scroll::BarSide::Dock, scroll::BarForm::Whole)
                 } else {
                     // A WINDOW NO SIDE OF WHOSE LIST HOLDS THE BAR WITH ITS UNDO stands it bare,
                     // its words alone: under the list where the list keeps the control there,
@@ -11922,21 +12092,54 @@ fn settings_tree_once(
                     // 100pt list at 2x in 178x152, the bar's words alone too tall to go under
                     // it), its words alone take the toolbar's place, as a dock's do: the bar
                     // stood under the list over all of it, the switch with it.
-                    stand(StatusPlace::Rule, true);
+                    stand(StatusPlace::Rule, scroll::BarForm::Bare);
                     let bare = build_page();
                     if !state.press_moved(list_top(&bare)) {
                         built = Some(bare);
-                        (scroll::BarSide::Under, true)
-                    } else if band(true).is_some() {
-                        (scroll::BarSide::Over, true)
-                    } else if fits(scroll::BarSide::Dock, true) {
-                        (scroll::BarSide::Dock, true)
+                        (scroll::BarSide::Under, scroll::BarForm::Bare)
+                    } else if band(scroll::BarForm::Bare).is_some() {
+                        (scroll::BarSide::Over, scroll::BarForm::Bare)
+                    } else if fits(scroll::BarSide::Dock, scroll::BarForm::Bare) {
+                        (scroll::BarSide::Dock, scroll::BarForm::Bare)
                     } else {
-                        // Nowhere holds even its words alone clear of the control (a 64pt switch
-                        // at the top of a 98pt window at 2x): its words alone, the least it
-                        // covers, under the list; with its Undo it stood over the whole window.
-                        built = Some(bare);
-                        (scroll::BarSide::Under, true)
+                        // NOTHING PRESSED IS COVERED: where nowhere holds even its words alone
+                        // clear of the control, they stand under the list with no room about
+                        // them, where that clears it (a 64pt switch at the top of a 98pt window
+                        // at 2x: with the bar's room about its words it covered the switch's
+                        // foot by 8pt); else so, the least they cover. With its Undo it stood
+                        // over the whole window.
+                        // Tried only where the bar covers the control's foot: under the list
+                        // where that is by no more than the room a tight bar gives back, else
+                        // over the top of the list, above the control, where that holds its
+                        // tight words (the line naming the control's row over it).
+                        let given = 2.0 * (PLAIN_BAR_ROOM - TIGHT_BAR_ROOM);
+                        let covered = state
+                            .pressed_end()
+                            .zip(state.scroll_plan())
+                            .map(|(end, plan)| end - plan.room())
+                            .filter(|over| *over > 0.01);
+                        let tight = covered.filter(|over| *over <= given + 0.01).map(|_| {
+                            stand(StatusPlace::Rule, scroll::BarForm::Tight);
+                            build_page()
+                        });
+                        match tight {
+                            Some(tight) if !state.press_moved(list_top(&tight)) => {
+                                built = Some(tight);
+                                (scroll::BarSide::Under, scroll::BarForm::Tight)
+                            }
+                            _ if covered.is_some() && band(scroll::BarForm::Tight).is_some() => {
+                                (scroll::BarSide::Over, scroll::BarForm::Tight)
+                            }
+                            Some(_) => {
+                                stand(StatusPlace::Rule, scroll::BarForm::Bare);
+                                built = Some(build_page());
+                                (scroll::BarSide::Under, scroll::BarForm::Bare)
+                            }
+                            None => {
+                                built = Some(bare);
+                                (scroll::BarSide::Under, scroll::BarForm::Bare)
+                            }
+                        }
                     }
                 }
             }
@@ -11944,25 +12147,31 @@ fn settings_tree_once(
         state.settle_press_side(side.0, side.1);
         side
     });
-    let (place, bare) = match side {
-        Some((scroll::BarSide::Over, bare)) => (StatusPlace::Over, bare),
-        Some((scroll::BarSide::Dock, bare)) => (StatusPlace::Dock, bare),
-        Some((scroll::BarSide::Under, bare)) => (StatusPlace::Rule, bare),
-        None => (StatusPlace::Rule, false),
+    let (place, form) = match side {
+        Some((scroll::BarSide::Over, form)) => (StatusPlace::Over, form),
+        Some((scroll::BarSide::Dock, form)) => (StatusPlace::Dock, form),
+        Some((scroll::BarSide::Under, form)) => (StatusPlace::Rule, form),
+        None => (StatusPlace::Rule, scroll::BarForm::Whole),
     };
+    let bare = form.bare();
     let mut page = match built {
         Some(page) => page,
         None => {
-            if (place, bare) != (state.status_place.get(), state.status_bare.get())
+            if (place, bare, form.tight())
+                != (
+                    state.status_place.get(),
+                    state.status_bare.get(),
+                    state.status_tight.get(),
+                )
                 || side.is_some()
             {
-                stand(place, bare);
+                stand(place, form);
             }
             build_page()
         }
     };
     let mut laid_top = list_top(&page);
-    let band = (place == StatusPlace::Over).then(|| band(bare)).flatten();
+    let band = (place == StatusPlace::Over).then(|| band(form)).flatten();
     let over = band.and_then(|band| {
         state.status_place.set(StatusPlace::Rule);
         state.status_bar_most.set(Some(band));
@@ -11978,8 +12187,8 @@ fn settings_tree_once(
     state.status_band.set(over);
     if place == StatusPlace::Over && over.is_none() {
         // No list to stand over: the bar stands under the page after all.
-        state.settle_press_side(scroll::BarSide::Under, false);
-        stand(StatusPlace::Rule, false);
+        state.settle_press_side(scroll::BarSide::Under, scroll::BarForm::Whole);
+        stand(StatusPlace::Rule, scroll::BarForm::Whole);
         page = build_page();
         laid_top = list_top(&page);
     }
@@ -13015,7 +13224,14 @@ fn feedback_bar(
         )
         .layout(
             flow.height(Length::Fixed(bar.height))
-                .padding(Insets::symmetric(16.0, 5.0)),
+                .padding(Insets::symmetric(
+                    16.0,
+                    if state.status_tight.get() && !bar.undo_under {
+                        TIGHT_BAR_ROOM
+                    } else {
+                        PLAIN_BAR_ROOM
+                    },
+                )),
         )
         .children(children),
     )
@@ -13323,6 +13539,7 @@ fn rail_row_words(
             SettingsRoute::Security => "Security",
             SettingsRoute::SoftwareUpdate => "Update",
             SettingsRoute::Packages => "Packages",
+            SettingsRoute::Lab => "Lab",
             SettingsRoute::Harness => "Harness",
             SettingsRoute::Ai => "AI CLIs",
             SettingsRoute::Tabs => "Tabs",
@@ -13565,6 +13782,30 @@ impl Drop for StatusWordsShared {
     }
 }
 
+/// The words a bar shows of status `feedback`, `width` wide on at most `most` lines: the status
+/// where those lines hold it, else the first of its shorter forms they hold, else its last, which
+/// leads with what changed ([`SettingsViewState::keep_status_forms`]). A STATUS IS NEVER CUT TO
+/// READ AS ITS OPPOSITE: in a one-line bar 50pt wide "Copy on select turned off" showed
+/// "Copy on", its outcome scrolled out of sight; it shows "Off: Copy on select".
+fn shown_status<'a>(
+    state: &'a SettingsViewState,
+    feedback: &'a str,
+    width: f32,
+    most: usize,
+) -> &'a str {
+    let fits = |text: &str| status_word_lines(text, width).len() <= most.max(1);
+    if fits(feedback) {
+        return feedback;
+    }
+    state.status_forms_of(feedback).map_or(feedback, |forms| {
+        forms
+            .iter()
+            .find(|form| fits(form))
+            .or(forms.last())
+            .map_or(feedback, String::as_str)
+    })
+}
+
 fn status_word_lines(text: &str, width: f32) -> Vec<String> {
     StatusWordsShared::once(
         text,
@@ -13657,18 +13898,23 @@ fn plain_bar_least(state: &SettingsViewState, width: SettingsWidth, viewport: Lo
 /// The path of child indices from `node` to the list under it that holds control `key`, or to
 /// its first list.
 fn path_to_list(node: &UiNode, key: Option<&UiKey>) -> Option<Vec<usize>> {
+    path_among(&node.children, key)
+}
+
+/// [`path_to_list`] from a node holding `children`.
+fn path_among(children: &[UiNode], key: Option<&UiKey>) -> Option<Vec<usize>> {
     fn holds(node: &UiNode, key: &UiKey) -> bool {
         node.key == *key || node.children.iter().any(|child| holds(child, key))
     }
-    fn walk(node: &UiNode, key: Option<&UiKey>, path: &mut Vec<usize>) -> bool {
-        for (index, child) in node.children.iter().enumerate() {
+    fn walk(children: &[UiNode], key: Option<&UiKey>, path: &mut Vec<usize>) -> bool {
+        for (index, child) in children.iter().enumerate() {
             if key.is_some_and(|key| !holds(child, key)) {
                 continue;
             }
             path.push(index);
             let list =
                 matches!(&child.content, UiContent::Group(spec) if spec.role == SemanticRole::List);
-            if list || walk(child, key, path) {
+            if list || walk(&child.children, key, path) {
                 return true;
             }
             path.pop();
@@ -13676,28 +13922,34 @@ fn path_to_list(node: &UiNode, key: Option<&UiKey>) -> Option<Vec<usize>> {
         false
     }
     let mut path = Vec::new();
-    walk(node, key, &mut path).then_some(path)
+    walk(children, key, &mut path).then_some(path)
 }
 
 /// How far down `page` its first list starts, as the page lays its children out: `None` where
 /// something over it takes no fixed height.
 fn list_top_in(page: &UiNode) -> Option<f32> {
-    let path = path_to_list(page, None)?;
-    let mut node = page;
+    list_top_among(&page.layout, &page.children)
+}
+
+/// [`list_top_in`] for a page laid out as `layout` holding `children`.
+fn list_top_among(layout: &Layout, children: &[UiNode]) -> Option<f32> {
+    let path = path_among(children, None)?;
+    let (mut layout, mut children) = (layout, children);
     let mut top = 0.0;
     for &index in &path {
-        top += node.layout.padding.top;
-        if node.layout.flow == crate::native_ui::Flow::Column {
-            top -= node.layout.offset;
-            for sibling in &node.children[..index] {
+        top += layout.padding.top;
+        if layout.flow == crate::native_ui::Flow::Column {
+            top -= layout.offset;
+            for sibling in &children[..index] {
                 let Length::Fixed(height) = sibling.layout.height else {
                     return None;
                 };
-                top += height + node.layout.gap;
+                top += height + layout.gap;
             }
         }
-        node = node.children.get(index)?;
+        let node = children.get(index)?;
         top -= node.layout.outdent.top;
+        (layout, children) = (&node.layout, &node.children);
     }
     Some(top)
 }
@@ -13828,16 +14080,28 @@ fn plain_bar_layout(
         feedback.hash(&mut hasher);
         hasher.finish()
     };
-    weighed(
+    let mut laid = weighed(
         |bars| &mut bars.plain,
-        (width, viewport, text),
+        (width, viewport, text, state.status_bare.get()),
         || plain_bar_laid(state, feedback, width, viewport),
     )
-    .under(feedback, state.status_bar_most.get())
+    .under(state, feedback, state.status_bar_most.get());
+    // A tight bar keeps no room about its words ([`scroll::BarForm::Tight`]).
+    if state.status_tight.get() && state.status_bare.get() && !laid.undo_under {
+        laid.height -= 2.0 * (PLAIN_BAR_ROOM - TIGHT_BAR_ROOM);
+    }
+    laid
 }
 
+/// The room a plain status's bar keeps over and under its words.
+const PLAIN_BAR_ROOM: f32 = 5.0;
+
+/// [`PLAIN_BAR_ROOM`] in a tight bar ([`scroll::BarForm::Tight`]): none, its words' line keeping
+/// the room its leading gives them.
+const TIGHT_BAR_ROOM: f32 = 0.0;
+
 /// A plain status's words laid out in its bar, beside its Undo (`[0]`) and under it (`[1]`).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct PlainBarWords {
     undo: bool,
     widths: [f32; 2],
@@ -13849,7 +14113,7 @@ struct PlainBarWords {
 
 impl PlainBarWords {
     /// The bar these words lay out to under a bar at `most`.
-    fn under(self, feedback: &str, most: Option<f32>) -> PlainBarLayout {
+    fn under(self, state: &SettingsViewState, feedback: &str, most: Option<f32>) -> PlainBarLayout {
         // The lines the bar shows of its words, with its Undo under them or beside them.
         let most_with = |undo_under: bool| {
             let most_lines = self.most_lines[usize::from(undo_under)];
@@ -13880,7 +14144,10 @@ impl PlainBarWords {
             && broken_words(feedback, set_at(false)) > broken_words(feedback, set_at(true));
         let at = usize::from(undo_under);
         let most_lines = most_with(undo_under);
-        let words = self.lines[at].clamp(1, most_lines) as f32 * status_line_height();
+        // The lines of the words shown on at most those lines ([`shown_status`]).
+        let shown = shown_status(state, feedback, self.widths[at], most_lines);
+        let lines = status_word_lines(shown, self.widths[at]).len();
+        let words = lines.clamp(1, most_lines) as f32 * status_line_height();
         let height = if undo_under {
             words + 4.0 + scaled_control_height()
         } else if self.bare {
@@ -13933,14 +14200,18 @@ fn plain_bar_laid(
             .floor()
             .max(1.0) as usize
     };
-    let lines_beside = status_word_lines(feedback, beside).len();
+    // The lines of the words the bar shows there ([`shown_status`]).
+    let lines_at = |width: f32, most: usize| {
+        status_word_lines(shown_status(state, feedback, width, most), width).len()
+    };
+    let lines_beside = lines_at(beside, most_at(false));
     PlainBarWords {
         undo,
         widths: [beside, full],
         lines: [
             lines_beside,
             if undo {
-                status_word_lines(feedback, full).len()
+                lines_at(full, most_at(true))
             } else {
                 lines_beside
             },
@@ -14019,6 +14290,7 @@ fn status_words_node_styled(
     style: StyleRef,
 ) -> UiNode {
     let most = most.max(1);
+    let feedback = shown_status(state, feedback, width, most);
     let mut lines = status_word_lines(feedback, width);
     let scrolls = lines.len() > most;
     if scrolls {
@@ -14132,6 +14404,8 @@ fn status_words_node_styled(
             focusable: false,
             focused: false,
             focus_visible: false,
+            progress: None,
+            motion: None,
         }),
     )
     .layout(
@@ -14151,6 +14425,8 @@ fn status_words_node_styled(
             focusable: true,
             focused: false,
             focus_visible: false,
+            progress: None,
+            motion: None,
         }),
     )
     .layout(
@@ -14255,7 +14531,7 @@ const DOCK_WORDS_LEAST: f32 = 96.0;
 
 const DOCK_WORDS_MIN: f32 = 40.0;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct CompactDockLayout {
     dock_width: f32,
     watcher_share: f32,
@@ -14472,10 +14748,25 @@ struct BarsWeighed {
     headers: Weighed<LogicalRect, f32>,
     costs: Weighed<(SettingsWidth, LogicalRect, bool), f32>,
     heights: Weighed<(SettingsWidth, LogicalRect, Option<f32>), f32>,
-    plain: Weighed<(SettingsWidth, LogicalRect, u64), PlainBarWords>,
-    /// The Customize sheet's least list by column width: its open pickers laid out once a render.
-    sheet: Weighed<u32, f32>,
+    /// By the bar's words and whether it stands bare, its Undo dropped: words alone reuse it wrong.
+    plain: Weighed<(SettingsWidth, LogicalRect, u64, bool), PlainBarWords>,
+    /// The Customize sheet's least list by column width and whether the seat stacks its rows.
+    sheet: Weighed<(u32, bool), f32>,
     wordless: Weighed<LogicalRect, bool>,
+    /// Whether a test holds each bar reused here to one weighed again ([`reuses_checked`]).
+    #[cfg(test)]
+    checked: bool,
+}
+
+impl BarsWeighed {
+    /// Nothing weighed yet, a test's check on its reuses read once for the render.
+    fn new() -> Self {
+        Self {
+            #[cfg(test)]
+            checked: reuses_checked(),
+            ..Self::default()
+        }
+    }
 }
 
 /// What a render weighed of one of its bars, by what it was weighed at.
@@ -14490,13 +14781,13 @@ struct BarsShared;
 
 impl BarsShared {
     fn open() -> Self {
-        BARS_WEIGHED.with(|bars| bars.replace(Some(BarsWeighed::default())));
+        BARS_WEIGHED.with(|bars| bars.replace(Some(BarsWeighed::new())));
         Self
     }
 
     /// Forget what the render weighed so far: its bars are about to stand elsewhere.
     fn forget(&self) {
-        BARS_WEIGHED.with(|bars| bars.replace(Some(BarsWeighed::default())));
+        BARS_WEIGHED.with(|bars| bars.replace(Some(BarsWeighed::new())));
     }
 }
 
@@ -14512,7 +14803,7 @@ impl Drop for BarsShared {
 fn unseen<R>(check: impl FnOnce() -> R) -> R {
     let bars = BARS_WEIGHED.with(|bars| {
         let open = bars.borrow().is_some();
-        bars.replace(open.then(BarsWeighed::default))
+        bars.replace(open.then(BarsWeighed::new))
     });
     let out = crate::work_counts::page_work_uncounted(check);
     BARS_WEIGHED.with(|was| was.replace(bars));
@@ -14526,16 +14817,37 @@ fn reuses_checked() -> bool {
 }
 
 /// `weigh`, once a render for `key` while [`BarsShared`] is open.
-fn weighed<K: PartialEq, V: Copy>(
+fn weighed<K: PartialEq + std::fmt::Debug, V: Copy + PartialEq + std::fmt::Debug>(
     of: fn(&mut BarsWeighed) -> &mut Weighed<K, V>,
     key: K,
     weigh: impl FnOnce() -> V,
 ) -> V {
+    #[cfg(test)]
+    let mut checked = false;
     let seen = BARS_WEIGHED.with(|bars| {
-        bars.borrow_mut()
-            .as_mut()
-            .and_then(|bars| of(bars).iter().find(|(at, _)| *at == key).map(|(_, v)| *v))
+        bars.borrow_mut().as_mut().and_then(|bars| {
+            #[cfg(test)]
+            {
+                checked = bars.checked;
+            }
+            of(bars).iter().find(|(at, _)| *at == key).map(|(_, v)| *v)
+        })
     });
+    // A test holds each bar it reuses to the one weighed again now: its key tells all it reads.
+    #[cfg(test)]
+    if let Some(seen) = seen
+        && checked
+    {
+        let fresh = unseen(weigh);
+        if fresh != seen {
+            REUSES_CHECKED.with(|checked| {
+                if let Some(said) = checked.borrow_mut().as_mut() {
+                    said.push(format!("weighed {seen:?} again as {fresh:?} at {key:?}"));
+                }
+            });
+        }
+        return seen;
+    }
     seen.unwrap_or_else(|| {
         let weighed = weigh();
         BARS_WEIGHED.with(|bars| {
@@ -15248,7 +15560,7 @@ fn packages_route_attention(route: SettingsRoute, packages: &PackagesProjection)
     crate::packages_screen::attention_headline(&packages.attention)
 }
 
-const NAVIGATION_GROUPS: [(&str, &[SettingsRoute]); 4] = [
+const NAVIGATION_GROUPS: [(&str, &[SettingsRoute]); 5] = [
     (
         "",
         &[
@@ -15279,6 +15591,7 @@ const NAVIGATION_GROUPS: [(&str, &[SettingsRoute]); 4] = [
             SettingsRoute::Security,
         ],
     ),
+    ("System", &[SettingsRoute::Lab]),
     (
         "aterm",
         &[
@@ -15537,6 +15850,8 @@ fn navigation(
                 focusable: false,
                 focused: false,
                 focus_visible: false,
+                progress: None,
+                motion: None,
             }),
         )
         .layout(
@@ -15612,6 +15927,7 @@ const fn route_icon(route: SettingsRoute) -> ButtonIcon {
         SettingsRoute::Security => ButtonIcon::Security,
         SettingsRoute::SoftwareUpdate => ButtonIcon::Update,
         SettingsRoute::Packages => ButtonIcon::Packages,
+        SettingsRoute::Lab => ButtonIcon::Diagnostics,
         SettingsRoute::Harness => ButtonIcon::Agents,
         SettingsRoute::Ai => ButtonIcon::Spark,
         SettingsRoute::Tabs => ButtonIcon::Tabs,
@@ -15633,6 +15949,7 @@ fn page(
     state.start_let_go.set(false);
     let _shared = showcase_page::BlocksShared::open(state);
     let _plans = scroll::PlansShared::open();
+    let _widths = scroll::RowWidths::open();
     let _words = scroll::KeyboardWords::watch(state.common.last_focus.clone());
     let _status = StatusWordsShared::open();
     let bars_height = settings_status_bars_height(state, width, cx.viewport);
@@ -15773,12 +16090,16 @@ fn page(
         };
         // A page whose list did not take the toolbar it was told to lead with holds nothing:
         // the toolbar stays over it ([`compact_toolbar_lists`]).
-        let (holds, cuts) =
-            if chrome.toolbar_listed && compact_toolbar_can_list(state, cx.viewport) && !built.2 {
-                (false, (usize::MAX, usize::MAX))
-            } else {
-                (holds, cuts)
-            };
+        // Nor does one led by the toolbar only for its row: R2's give-way alone takes that rung.
+        let lent = state.toolbar_head_lent.get();
+        let (holds, cuts) = if chrome.toolbar_listed
+            && compact_toolbar_can_list(state, cx.viewport)
+            && (!built.2 || lent)
+        {
+            (false, (usize::MAX, usize::MAX))
+        } else {
+            (holds, cuts)
+        };
         state.measuring_calm.set(false);
         (built, holds, cuts)
     };
@@ -15803,12 +16124,16 @@ fn page(
             state.status_overrun.replace(0.0),
         );
         let (rooms, list_calm) = ready(chrome, calm);
+        // A rung lending its toolbar measures as the rung it lends from where its panel lends none.
+        let lent =
+            chrome.toolbar_lent && showcase_page::PanelAt::of(state, width, cx, None).lends();
         let at: MeasureAt = [
             settings_list_body_height(state, width, cx.viewport),
             list_calm,
             state.status_extra.get(),
             state.status_slack.get(),
             feedback_bar_height(state, width, cx.viewport),
+            f32::from(u8::from(lent)),
         ]
         .map(f32::to_bits);
         let seen = measures
@@ -16079,18 +16404,40 @@ fn page(
     };
     let pin_fits = showcase_page::ChooserFits::default();
     let panels: RefCell<Vec<RungPanel>> = RefCell::new(Vec::new());
-    // A rung's panel under the bar at `most`, once a render.
+    // The panel `lay` lays out for a rung under the bar at `most`, kept for the render.
+    let kept =
+        |trial: PageChrome, most: Option<f32>, lay: &dyn Fn() -> (showcase_page::PanelAt, f32)| {
+            let at = (trial, most.map(f32::to_bits));
+            let known = panels
+                .borrow()
+                .iter()
+                .find(|(was, by, _)| (*was, *by) == at)
+                .map(|(_, _, panel)| *panel);
+            known.unwrap_or_else(|| {
+                let panel = lay();
+                panels.borrow_mut().push((at.0, at.1, panel));
+                panel
+            })
+        };
+    // A rung's panel under the bar at `most`, once a render; a lending rung's is [`PanelAt::lent`].
     let panel_once = |trial: PageChrome, most: Option<f32>| {
-        let at = (trial, most.map(f32::to_bits));
-        let known = panels
-            .borrow()
-            .iter()
-            .find(|(was, by, _)| (*was, *by) == at)
-            .map(|(_, _, panel)| *panel);
-        known.unwrap_or_else(|| {
-            let panel = panel_at(trial, most);
-            panels.borrow_mut().push((at.0, at.1, panel));
-            panel
+        let rung = PageChrome {
+            toolbar_lent: false,
+            ..trial
+        };
+        let laid = kept(rung, most, &|| panel_at(rung, most));
+        if !trial.toolbar_lent {
+            return laid;
+        }
+        kept(trial, most, &|| {
+            let was = (
+                state.page_chrome.replace(trial),
+                state.status_bar_most.replace(most),
+            );
+            let lent = laid.0.lent(state, cx);
+            state.page_chrome.set(was.0);
+            state.status_bar_most.set(was.1);
+            (lent, laid.1)
         })
     };
     // The room a rung's list has under the bar at `most`, what stands apart, and its panel's width.
@@ -17350,19 +17697,66 @@ fn page(
     })
     .filter(|(shown, _)| !state.keyboard_kept(Some(shown)))
     .map(|(shown, tall)| tall.map(|tall| shown.owed_least(tall)));
-    // A chrome that cuts the keyboard's control yields to the first rung that shows it (R2).
+    #[cfg(test)]
+    let leans = !TOOLBAR_LEAN_REFUSED.with(Cell::get);
+    #[cfg(not(test))]
+    let leans = true;
+    // The page's frame, its padding as wide a page as `layout` lays out takes.
+    let page_layout = |layout: PageLayout| {
+        Layout::column()
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .padding(page_frame_insets(
+                state,
+                cx.viewport,
+                width,
+                layout.maximum(width),
+            ))
+            .gap(settings_page_gap(state, width, cx.viewport))
+            .clipped()
+    };
+    // Whether the seat may lay past the clip: its rows from `top` do, or a control is off its list.
+    let rows_past = |top: Option<f32>| {
+        let (Some(top), Some(rows)) = (top, state.rows_laid_to()) else {
+            return true;
+        };
+        if state
+            .common
+            .last_focus
+            .as_ref()
+            .is_some_and(|key| !state.listed_on_page(key))
+        {
+            return true;
+        }
+        let clip = cx.viewport.height
+            - compact_undocked_toolbar_height(state, cx.viewport)
+            - settings_status_bars_height(state, width, cx.viewport);
+        top + rows > clip + 0.5
+    };
+    // A listed toolbar its list left untaken is seated unlisted where its rows run past the clip.
+    let leaning = |chrome: PageChrome,
+                   (children, layout, listed): &(Vec<UiNode>, PageLayout, bool)| {
+        leans
+            && chrome.toolbar_listed
+            && !listed
+            && compact_toolbar_can_list(state, cx.viewport)
+            && rows_past(list_top_among(&page_layout(*layout), children))
+    };
+    // A chrome that cuts the keyboard's control yields to the first rung that shows it (R2). A
+    // press holding its place keeps the chrome though the control it found lays out anew: a
+    // segment chosen takes its segmented control's key, so that key named a segment of another
+    // height, and Cursor & Motion's Motion, Animate chosen at the list's top, listed the toolbar
+    // and went up under it by its 52pt (2x in 178x152).
+    let relaid = || !held && !state.press_holds_place() && state.keyboard_relaid(record.as_ref());
     if doomed.is_some()
         || rechosen.is_some()
         || (ahead_told.is_none()
-            && (gives_way || press_moved || (!held && state.keyboard_relaid(record.as_ref())))
+            && (gives_way || press_moved || relaid())
             && state.keyboard_short_of(record.as_ref())
             && state.keyboard_cut())
     {
         let ladder = PageChrome::ladder_for(state, width, cx.viewport);
-        let at = ladder
-            .iter()
-            .position(|rung| rung.giving_bar_room() == chrome.giving_bar_room())
-            .unwrap_or_default();
+        let at = chrome.place_on(&ladder).unwrap_or_default();
         let mut tried = false;
         let owed = doomed
             .or(rechosen)
@@ -17372,16 +17766,40 @@ fn page(
             Some(_) => drawn_told(chrome).and_then(|told| state.reading(told, left)),
             None => left(state),
         };
+        #[cfg(test)]
+        let from_giving = !GIVING_UNDER_BARS_ONLY.with(Cell::get);
+        #[cfg(not(test))]
+        let from_giving = true;
         // Each rung from the chrome's, giving bar room under bars or from a chrome giving it.
-        let giving = bars || chrome.bar_room_given;
+        let giving = bars || (from_giving && chrome.bar_room_given);
         // A bar gone and none up, each rung giving its room is tried after every rung keeping it.
         let after = !giving && bar_left;
         let order = || (at..ladder.len()).chain((0..at).rev());
-        let trials = || {
+        let rungs = || {
             order()
-                .flat_map(|index| [Some(ladder[index]), giving.then(|| ladder[index].giving_bar_room())])
+                .flat_map(|index| {
+                    [
+                        Some(ladder[index]),
+                        giving.then(|| ladder[index].giving_bar_room()),
+                    ]
+                })
                 .chain(order().map(|index| after.then(|| ladder[index].giving_bar_room())))
                 .flatten()
+        };
+        // Then each listed rung, lending the toolbar where the demo leads its list under its row.
+        let lends = |trial: PageChrome| {
+            [bar_most, Some(0.0)]
+                .into_iter()
+                .any(|most| panel_once(trial, most).0.lends())
+        };
+        let trials = || {
+            rungs()
+                .chain(
+                    rungs()
+                        .filter(|rung| rung.toolbar_listed)
+                        .map(PageChrome::lending_toolbar)
+                        .filter(|trial| lends(*trial)),
+                )
                 .filter(|trial| *trial != chrome)
                 .filter(|trial| {
                     // No bar up, a rung whose list lays out as the chrome's cuts the control alike.
@@ -17411,16 +17829,16 @@ fn page(
                 && laid_least(trial).is_none_or(|laid| laid.room() + 0.5 >= wheel_room)
                 && holds_owed(trial, owed.map(|owed| owed.min(wheel)))
         };
-        // Whether the chrome's screen held the start of a stop moved in at the list's top.
-        let moved_in = match doomed {
+        // Whether the screen held a start now seated otherwise: moved in at the top, or grown.
+        let start_held = match doomed {
             Some(_) => drawn_told(chrome)
                 .flatten()
-                .is_some_and(|told| told.holds_moved_start()),
+                .is_some_and(|told| told.holds_start()),
             None => state
                 .scroll_record
                 .borrow()
                 .as_ref()
-                .is_some_and(scroll::ScrollRecord::holds_moved_start),
+                .is_some_and(scroll::ScrollRecord::holds_start),
         };
         // Seats letting such a start go tell their own overruns and screens: drop what was told.
         let let_go = |go: bool| {
@@ -17452,12 +17870,14 @@ fn page(
             .find_map(|trial| {
                 tried = true;
                 let built = seat_drawn(trial);
-                (!state.keyboard_short_of(record.as_ref()) || !state.keyboard_cut())
-                    .then_some((trial, built))
+                // A rung drawn as the one it leans on draws no screen its seat showed.
+                (!leaning(trial, &built)
+                    && (!state.keyboard_short_of(record.as_ref()) || !state.keyboard_cut()))
+                .then_some((trial, built))
             })
             .or_else(|| {
-                // No rung shows it holding a start moved in at the top: the chrome lets it go.
-                if !moved_in {
+                // No rung shows it holding such a start: the chrome lets it go.
+                if !start_held {
                     return None;
                 }
                 tried = true;
@@ -17575,7 +17995,7 @@ fn page(
                     .reduce(|best, next| if next.1.kept_by(&best.1) { best } else { next })?;
                 tried = true;
                 let built = seat_drawn(trial);
-                let more = state.keyboard_shows_more(was);
+                let more = !leaning(trial, &built) && state.keyboard_shows_more(was);
                 more.then_some((trial, built))
             });
         // Where a trial was seated last and none was taken, the kept chrome is seated again.
@@ -17592,7 +18012,7 @@ fn page(
         drawn = Some(seat_drawn(chrome));
     }
     let mut gave_way = None;
-    // A cut counts for a landing before any event (R3), a new or painted result, the control (R5).
+    // A cut counts for a landing before any event (R3), a new result, the control (R5).
     let cuts = |state: &SettingsViewState| {
         state.reveal_cut()
             && if state.landing_owed() {
@@ -17600,7 +18020,6 @@ fn page(
                     && state.scroll_plan().is_some_and(|plan| plan.room() > 0.5)
             } else {
                 drawn_at.is_none()
-                    || state.reveal_painted()
                     || (state.keyboard_cut()
                         && state.keyboard_on_page().is_some_and(|left| left.shows()))
             }
@@ -17645,18 +18064,60 @@ fn page(
             state.status_bar_most.set(was.1);
             page
         };
-        // Whether a rung's list, told unseated under the bar at its least, shows it so.
-        let shows = |trial: PageChrome| {
+        // New results first take no rung newly drawn that cuts the control it shows whole (R2).
+        let anew = drawn_at.is_none() && !state.landing_owed();
+        // Leaving the chrome drawn last anyway, staying keeps no R2: a rung cutting it comes next.
+        #[cfg(test)]
+        let strict_only = GIVE_WAY_STRICT_ONLY.with(Cell::get);
+        #[cfg(not(test))]
+        let strict_only = false;
+        let lax = anew && chrome != drawn_chrome && !strict_only;
+        // Whether `trial`'s screen passes `strict`: a new rung cuts no control it can show whole.
+        let uncut = |state: &SettingsViewState, trial: PageChrome, strict: bool| {
+            !strict || trial == drawn_chrome || !state.keyboard_cut_here()
+        };
+        // Whether the screen seated in `trial` shows the reveal and keeps the keyboard's control.
+        let keeps = |state: &SettingsViewState, trial: PageChrome, strict: bool| {
+            !state.reveal_cut() && state.keyboard_kept(left.as_ref()) && uncut(state, trial, strict)
+        };
+        // What a rung's list, told unseated under the bar at its least, keeps: strictly, and not.
+        let tell = |trial: PageChrome, strict: bool| {
             let Some((there, _, list)) = rows_at(trial, least()) else {
-                return false;
+                return (false, false);
             };
             let given = there.extra();
             let mut plan = list.planned(there.room(), given).0.clone();
             plan.pin_keyboard(there.keyboard_pin());
             let told = state.seated_under(plan, record.clone());
             state.reading(told, |state| {
-                !state.reveal_cut() && state.keyboard_kept(left.as_ref())
+                let lax = keeps(state, trial, false);
+                (lax && uncut(state, trial, strict), lax)
             })
+        };
+        // What each rung told keeps without the strict test: the lax pass tells none again.
+        let told_lax = RefCell::new(Vec::new());
+        // Whether a rung's list, told unseated under the bar at its least, shows it so.
+        let shows = |trial: PageChrome, strict: bool| {
+            let known = told_lax
+                .borrow()
+                .iter()
+                .find(|(was, _)| *was == trial)
+                .map(|(_, lax)| *lax);
+            if let Some(lax) = known.filter(|_| !strict) {
+                // A test holds each told screen the lax pass reuses to the one told again now.
+                #[cfg(test)]
+                if reuses_checked() && unseen(|| tell(trial, false).1) != lax {
+                    REUSES_CHECKED.with(|checked| {
+                        if let Some(seen) = checked.borrow_mut().as_mut() {
+                            seen.push(format!("told {lax} again as {} in {trial:?}", !lax));
+                        }
+                    });
+                }
+                return lax;
+            }
+            let (kept, lax) = tell(trial, strict);
+            told_lax.borrow_mut().push((trial, lax));
+            kept
         };
         // Whether a rung's page leaves its list room for what it must show.
         let rung_fits = |trial: PageChrome| {
@@ -17672,10 +18133,29 @@ fn page(
                         || cover <= rung.below() + beside.5 + 0.51)
             })
         };
+        // No bar up, whether a rung's list bodies hold the reveal beside the keyboard's control.
+        let bodies_hold = |trial: PageChrome| {
+            let was = (
+                state.page_chrome.replace(trial),
+                state.status_bar_most.replace(least()),
+            );
+            let bodies = settings_list_bodies_kept(state, width, cx.viewport);
+            let roomy = bodies.into_iter().any(|body| {
+                let panel = showcase_page::PanelAt::of(state, width, cx, Some(body));
+                let (room, held) = panel.list_room(state, &pin_fits);
+                beside(((panel.width(), panel.framed(state)), room))
+                    .is_none_or(|beside| need_pinned(beside, (room, held)) <= room + 0.5)
+            });
+            state.page_chrome.set(was.0);
+            state.status_bar_most.set(was.1);
+            roomy
+        };
         // Each rung, as drawn and giving a bar room under bars, whose list is told to show it so.
-        let shown = || {
+        let shown = |strict: bool| {
             let mut laid_out = Vec::new();
-            let (pin_fits, rung_fits) = (&pin_fits, &rung_fits);
+            let (rung_fits, bodies_hold, shows) = (&rung_fits, &bodies_hold, &shows);
+            #[cfg(test)]
+            let tell = &tell;
             // The listed toolbar is a last resort no reveal is told in ([`compact_toolbar_lists`]).
             PageChrome::ladder(width, cx.viewport)
                 .into_iter()
@@ -17690,7 +18170,7 @@ fn page(
                     if !bars && trial.giving_bar_room() == chrome {
                         #[cfg(test)]
                         assert!(
-                            !unseen(|| shows(*trial)),
+                            !unseen(|| tell(*trial, strict).0),
                             "a rung keeping a status's bar room shows what the rung giving it cut: {trial:?}"
                         );
                         return false;
@@ -17708,27 +18188,14 @@ fn page(
                                     need_least(beside) <= panel.room_most(state) + 0.5
                                 })
                             } else {
-                                let was = (
-                                    state.page_chrome.replace(trial),
-                                    state.status_bar_most.replace(least()),
-                                );
-                                let bodies = settings_list_bodies_kept(state, width, cx.viewport);
-                                let roomy = bodies.into_iter().any(|body| {
-                                    let panel = showcase_page::PanelAt::of(state, width, cx, Some(body));
-                                    let (room, held) = panel.list_room(state, pin_fits);
-                                    beside(((panel.width(), panel.framed(state)), room))
-                                        .is_none_or(|beside| need_pinned(beside, (room, held)) <= room + 0.5)
-                                });
-                                state.page_chrome.set(was.0);
-                                state.status_bar_most.set(was.1);
-                                roomy
+                                bodies_hold(trial)
                             }
                     };
                     // Under bars that bound is cheaper than the rung's room: it spares a dock.
                     if bars && !kept(*trial) {
                         #[cfg(test)]
                         assert!(
-                            !unseen(|| shows(*trial)),
+                            !unseen(|| tell(*trial, strict).0),
                             "a rung too short for the reveal beside the keyboard's control shows them: {trial:?}"
                         );
                         return false;
@@ -17746,7 +18213,7 @@ fn page(
                     #[cfg(test)]
                     if !fits {
                         assert!(
-                            !unseen(|| shows(*trial)),
+                            !unseen(|| tell(*trial, strict).0),
                             "a rung told too short, or too covered, to show the reveal beside the keyboard's control shows them: {trial:?}"
                         );
                     }
@@ -17755,7 +18222,7 @@ fn page(
                     #[cfg(test)]
                     if fits && !told {
                         assert!(
-                            !unseen(|| shows(*trial)),
+                            !unseen(|| tell(*trial, strict).0),
                             "a rung too short for the reveal beside the keyboard's control shows them: {trial:?}"
                         );
                     }
@@ -17764,7 +18231,7 @@ fn page(
                     }
                     told
                 })
-                .filter(|trial| shows(*trial))
+                .filter(move |trial| shows(*trial, strict))
         };
         // A give-way no rung was told to show is not told again while what decides it stands.
         let at = GiveWayAt {
@@ -17778,25 +18245,30 @@ fn page(
             }
             .map(|plan| plan.unseated()),
             settled: settled.map(f32::to_bits),
+            anew: (anew, lax),
         };
         let untaken = state.give_ways_untaken.borrow().contains(&at);
         #[cfg(test)]
         if untaken {
             assert!(
-                unseen(|| shown().next().is_none()),
+                unseen(|| shown(anew)
+                    .chain(shown(false).filter(|_| lax))
+                    .next()
+                    .is_none()),
                 "a give-way kept as showing no rung shows none: {at:?}"
             );
         }
         let mut tried = false;
-        let taken = (!untaken)
-            .then(|| {
-                shown().find_map(|trial| {
-                    tried = true;
-                    let built = seat_drawn(trial);
-                    (!state.reveal_cut() && state.keyboard_kept(left.as_ref()))
-                        .then_some((trial, built))
-                })
+        // The first rung told to show it so that, seated, does.
+        let mut take = |strict: bool| {
+            shown(strict).find_map(|trial| {
+                tried = true;
+                let built = seat_drawn(trial);
+                keeps(state, trial, strict).then_some((trial, built))
             })
+        };
+        let taken = (!untaken)
+            .then(|| take(anew).or_else(|| lax.then(|| take(false)).flatten()))
             .flatten();
         // Where no rung keeping the toolbar shows both under bars, it is listed and seated (R3).
         let resort = (bars && !untaken && taken.is_none())
@@ -17810,7 +18282,7 @@ fn page(
         let taken = taken.or_else(|| {
             let trial = resort?;
             let built = seat_drawn(trial);
-            (!state.reveal_cut() && state.keyboard_kept(left.as_ref())).then_some((trial, built))
+            (!leaning(trial, &built) && keeps(state, trial, anew && !lax)).then_some((trial, built))
         });
         if !untaken && taken.is_none() && !tried {
             let mut untaken = state.give_ways_untaken.borrow_mut();
@@ -17827,19 +18299,17 @@ fn page(
             None => {}
         }
     }
-    let (children, layout, toolbar_listed) = drawn.unwrap_or_else(|| seat_drawn(chrome));
-    // A chrome listing the toolbar its list left untaken draws as the rung it leans on (R2).
-    let (mut children, layout, toolbar_listed) =
-        if chrome.toolbar_listed && !toolbar_listed && compact_toolbar_can_list(state, cx.viewport)
-        {
-            chrome = PageChrome {
-                toolbar_listed: false,
-                ..chrome
-            };
-            seat_drawn(chrome)
-        } else {
-            (children, layout, toolbar_listed)
+    let built = drawn.unwrap_or_else(|| seat_drawn(chrome));
+    let (mut children, layout, toolbar_listed) = if leaning(chrome, &built) {
+        chrome = PageChrome {
+            toolbar_listed: false,
+            toolbar_lent: false,
+            ..chrome
         };
+        seat_drawn(chrome)
+    } else {
+        built
+    };
     state.toolbar_listed_drawn.set(toolbar_listed);
     state.start_let_go.set(false);
     let held = state
@@ -17875,14 +18345,7 @@ fn page(
         )
     };
     UiNode::new(page_key, UiContent::Group(GroupSpec::new(page_label)))
-        .layout(
-            Layout::column()
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .padding(insets)
-                .gap(settings_page_gap(state, width, cx.viewport))
-                .clipped(),
-        )
+        .layout(page_layout(layout))
         .children(children)
 }
 
@@ -17907,6 +18370,7 @@ fn page_children(
     // A name the last page built left for a list it did not seat is never another page's.
     state.list_head.replace(Vec::new());
     state.toolbar_head_taken.set(false);
+    state.toolbar_head_lent.set(false);
     let (children, layout) =
         page_children_laid(state, update, packages, messages, harness, cx, width);
     (children, layout, state.toolbar_head_taken.get())
@@ -17963,6 +18427,7 @@ fn page_children_laid(
                     SettingsRoute::Harness => {
                         harness_page::harness_page(state, harness, update, width, cx)
                     }
+                    SettingsRoute::Lab => lab_page::lab_page(state, &harness.lab, width, cx),
                     SettingsRoute::Ai => ai_page::ai_page(state, &harness.ai, width, cx),
                     SettingsRoute::Tabs => tabs_page::tabs_page(state, &harness.tabs, width, cx),
                     SettingsRoute::Messages => messages_page(state, messages, width, cx.viewport),
@@ -18424,6 +18889,8 @@ pub(crate) struct PageChrome {
     /// The compact toolbar leads the page's list, scrolling away with it, where it can
     /// ([`compact_toolbar_lists`]): the last chrome a short window sheds.
     toolbar_listed: bool,
+    /// The listed toolbar leads a list the demo leads only under its row: a rung R2 alone tries.
+    toolbar_lent: bool,
 }
 
 impl PageChrome {
@@ -18433,6 +18900,7 @@ impl PageChrome {
         bar_room_given: false,
         preview_listed: false,
         toolbar_listed: false,
+        toolbar_lent: false,
     };
 
     const fn giving_bar_room(self) -> Self {
@@ -18454,6 +18922,26 @@ impl PageChrome {
             toolbar_listed: true,
             ..self
         }
+    }
+
+    /// This rung, its listed toolbar leading a list the demo leads only under the toolbar's row.
+    const fn lending_toolbar(self) -> Self {
+        Self {
+            toolbar_lent: self.toolbar_listed,
+            ..self
+        }
+    }
+
+    /// Where this chrome stands on `ladder`, bar room given or not, a lent one where it lends from.
+    fn place_on(self, ladder: &[Self]) -> Option<usize> {
+        let rung = Self {
+            toolbar_lent: false,
+            ..self
+        }
+        .giving_bar_room();
+        ladder
+            .iter()
+            .position(|step| step.giving_bar_room() == rung)
     }
 
     /// The chrome a page on `viewport` may keep, fullest first: the subtitle where the window
@@ -18546,6 +19034,16 @@ thread_local! {
     pub(crate) static REUSES_CHECKED: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
     /// Whether a least bar's keyboard span is told on the list laid out now (a control).
     pub(crate) static LEAST_TOLD_BY_NOW: Cell<bool> = const { Cell::new(false) };
+    /// Whether a list the toolbar's row would leave led by the demo is laid out unled (a control).
+    pub(crate) static TOOLBAR_LENT_REFUSED: Cell<bool> = const { Cell::new(false) };
+    /// Whether a chrome listing a toolbar its list left untaken draws as it is (a control).
+    pub(crate) static TOOLBAR_LEAN_REFUSED: Cell<bool> = const { Cell::new(false) };
+    /// Whether R2's give-way gives bars room only under bars, as c5ef831d7f did (a control).
+    pub(crate) static GIVING_UNDER_BARS_ONLY: Cell<bool> = const { Cell::new(false) };
+    /// Whether new results' give-way skips its second pass off the chrome drawn last (a control).
+    pub(crate) static GIVE_WAY_STRICT_ONLY: Cell<bool> = const { Cell::new(false) };
+    /// Whether a focused Reset color is laid at its hug width past the column (a control).
+    pub(crate) static RESET_COLOR_UNCAPPED: Cell<bool> = const { Cell::new(false) };
     /// Whether this thread's renders stack a compact window's statuses under
     /// the page rather than dock them in the toolbar.
     pub(crate) static STATUS_UNDOCKED: Cell<bool> = const { Cell::new(false) };
@@ -18582,6 +19080,7 @@ struct GiveWayAt {
     chrome: PageChrome,
     plan: Option<scroll::ScrollPlan>,
     settled: Option<u32>,
+    anew: (bool, bool),
 }
 
 /// What a bar is settled at ([`page`]): the page's inputs, chrome, bar and record, and a let-go.
@@ -18615,8 +19114,8 @@ type Beside = (
 /// A rung's panel under a bar's most, what a bar there takes of its list, and what it covers.
 type RungPanel = (PageChrome, Option<u32>, (showcase_page::PanelAt, f32));
 
-/// What a list's measure reads of its chrome and bars ([`page`]).
-type MeasureAt = [u32; 5];
+/// What a list's measure reads of its chrome and bars ([`page`]), a lent toolbar's row last.
+type MeasureAt = [u32; 6];
 
 /// A list measured in a chrome, calm or not: its room, overrun and rows ([`page`]).
 type ListMeasure = (
@@ -19068,15 +19567,28 @@ fn compact_page_effective_height(viewport_height: f32) -> f32 {
     viewport_height / settings_text_scale()
 }
 
+/// Whether a compact page goes without its heading row: in a short window, and A HEADING ROW
+/// NEVER TAKES THE ROOM THE LEAST WINDOW GIVES ITS LIST: it shows only where the window keeps
+/// the least view's height ([`least_view`]) under it. Shown from 240pt (at 1×) on, it left a
+/// 250pt window's list 22pt less than a 236pt window's, too little for a control under a line of
+/// its name.
 fn compact_page_omits_heading(viewport_height: f32) -> bool {
     compact_page_effective_height(viewport_height) <= 240.0
+        || viewport_height - compact_heading_row_height()
+            < least_view(settings_text_scale()).1 - 0.01
+}
+
+/// The most a compact page's heading row takes of its window: the heading, the 12pt insets over
+/// and under the page where a heading shows ([`compact_page_vertical_inset`]), and its gap.
+fn compact_heading_row_height() -> f32 {
+    page_heading_height() + 2.0 * 12.0 + 5.0
 }
 
 fn compact_page_vertical_inset(viewport_height: f32) -> f32 {
     let effective = compact_page_effective_height(viewport_height);
     if effective <= 190.0 {
         0.0
-    } else if effective <= 240.0 {
+    } else if compact_page_omits_heading(viewport_height) {
         4.0
     } else if effective <= 420.0 {
         12.0
@@ -19679,6 +20191,8 @@ fn choice_picker_card(
                 focusable: false,
                 focused: false,
                 focus_visible: false,
+                progress: None,
+                motion: None,
             }),
         )
         .layout(Layout::default().width(Length::Fill).height(Length::Fill))
@@ -21194,7 +21708,11 @@ fn theme_card_row(
         (false, true),
     );
     let detail = row_second_line(&placement, None, None, text_width);
-    (with_row_detail(row, key, &detail, stacked), stacked)
+    let row = with_row_detail(row, key, &detail, stacked);
+    if stacked {
+        scroll::note_row_width(&row.key, text_width);
+    }
+    (if stacked { end_stacked_row(row) } else { row }, stacked)
 }
 
 fn fit_stacked_controls(row: &mut UiNode, text_width: f32) {
@@ -21928,7 +22446,11 @@ fn top_card_row(
     let hold = name_holds_state((&name, &worst, room), worst_timing, note, text_width);
     let placement = lay_out_row_label(&mut row, &name, &tags, &worst, room, stacked, (false, hold));
     let detail = row_second_line(&placement, timing, note, text_width);
-    let row = with_row_detail(row, key, &detail, stacked);
+    let mut row = with_row_detail(row, key, &detail, stacked);
+    if stacked {
+        scroll::note_row_width(&row.key, text_width);
+        row = end_stacked_row(row);
+    }
     let height = top_row_height(&row, row_width);
     Some((row, height))
 }
@@ -22175,6 +22697,8 @@ fn display_face_rows(
                 focusable: false,
                 focused: false,
                 focus_visible: false,
+                progress: None,
+                motion: None,
             }),
         )
         .layout(Layout::default().width(Length::Fill).height(Length::Fill));
@@ -22392,14 +22916,18 @@ fn display_faces_head(
         }
         lines
     } else {
-        // The line kept for it says the caption's state at rest too ([`resting_state`]).
-        let rest = RowTags {
-            state: resting_state(&worst.state),
+        // The line kept for it says the caption's state at rest too, in the longest form it
+        // holds in the lines it takes at worst ([`resting_state_held`]).
+        let lines_of = |tags: &RowTags| wrapped_words_lines(&words(tags), style, room).len();
+        let at_worst = lines_of(&worst);
+        let resting = |state: &[String]| RowTags {
+            state: state.to_vec(),
             facts: Vec::new(),
         };
-        let reserved = wrapped_words_lines(&words(&worst), style, room)
-            .len()
-            .max(wrapped_words_lines(&words(&rest), style, room).len());
+        let rest = resting(&resting_state_held(&worst.state, |rest| {
+            lines_of(&resting(rest)) <= at_worst
+        }));
+        let reserved = at_worst.max(lines_of(&rest));
         let shown = if tags.state.is_empty() { &rest } else { &tags };
         let mut lines = wrapped_words_lines(&words(shown), style, room);
         lines.resize(reserved.max(lines.len()), String::new());
@@ -22959,12 +23487,12 @@ fn cursor_style_tuning_bound(
                 state, index, field, false, width, text_width, None, None, None,
             );
             let whole = finished.whole();
-            let noted = with_row_detail(
+            let noted = finished.ended(with_row_detail(
                 finished.row.clone(),
                 finished.key,
                 &["Inactive".to_string()],
                 finished.stacked,
-            );
+            ));
             let refused = with_row_error(whole.clone(), finished.key, "Not saved", text_width);
             let height = fixed_height(&refused).max(fixed_height(&noted));
             Some((whole, height))
@@ -23620,7 +24148,7 @@ fn wallpaper_page(state: &SettingsViewState, width: SettingsWidth, cx: &ViewCx<'
         .map_or("Wallpaper image", |field| field.label);
     let (tags, worst) = changed_tags(state, prefs::EDIT_WALLPAPER);
     let placement = place_row_tags(name, &tags, &worst, text_width, false);
-    let said = placement.said_below();
+    let said = placement.said_below(|line| row_label_fits(&line.join(FACT_SEPARATOR), text_width));
     let mut name_lines = placement.lines;
     let name_count = name_lines.len() + usize::from(!placement.worst_below.is_empty());
     if !said.is_empty() {
@@ -24193,6 +24721,8 @@ fn rainbow_banner_node() -> UiNode {
             focusable: false,
             focused: false,
             focus_visible: false,
+            progress: None,
+            motion: None,
         }),
     )
     .layout(
@@ -24764,6 +25294,21 @@ fn route_keywords(route: SettingsRoute) -> &'static [&'static str] {
             "release",
         ],
         SettingsRoute::Packages => &["toolchain", "tools", "alab", "atpkg", "cargo", "rustc"],
+        SettingsRoute::Lab => &[
+            "lab",
+            "shared state",
+            "network state",
+            "machines",
+            "accounts",
+            "secrets",
+            "vault",
+            "quota",
+            "claude",
+            "login",
+            "rotation",
+            "synchronization",
+            "cache",
+        ],
         SettingsRoute::Messages => &["notices", "log", "history", "alerts"],
         SettingsRoute::About => &["version", "build", "license", "credits"],
         SettingsRoute::Harness => harness_route_keywords(),
@@ -25900,12 +26445,19 @@ fn settings_fields_page(
                     let height = fixed_height(&node);
                     let limit = footnote_room - head - 4.0;
                     let parts = if height > body - used + 0.01 {
-                        scroll::row_parts((node, height), limit.max(1.0), body - used - 4.0, 4.0)
+                        scroll::named_row_parts(
+                            (node, height),
+                            (limit.max(1.0), body - used - 4.0, 4.0),
+                            (body - used, body - used - head - 4.0),
+                        )
                     } else {
                         vec![(node, height)]
                     };
                     for (part, (node, height)) in parts.into_iter().enumerate() {
                         plan.row(id, height + 4.0, scroll::focus_keys(&node));
+                        // A part that holds a row's words alone is led by its name on a screen
+                        // that starts with it ([`scroll::words_caption_marker`]).
+                        plan.set_stop_lead(scroll::words_lead(&node, 4.0));
                         plan.set_ids(vec![node.key.clone()]);
                         plan.measure(&node, height);
                         plan.add_segments(&node);
@@ -25962,7 +26514,11 @@ fn settings_fields_page(
             let parts = if row_height > limit + 0.01
                 && !(scroll::holds_open_disclosure(&row) && row_height <= footnote_room + 0.01)
             {
-                scroll::row_parts((row, row_height), limit.max(1.0), body - used - 4.0, 4.0)
+                scroll::named_row_parts(
+                    (row, row_height),
+                    (limit.max(1.0), body - used - 4.0, 4.0),
+                    (body - used, body - used - head - 4.0),
+                )
             } else {
                 vec![(row, row_height)]
             };
@@ -25985,6 +26541,7 @@ fn settings_fields_page(
                     .cloned()
                     .collect::<Vec<_>>();
                 plan.row(id, height + 4.0, part_keys);
+                plan.set_stop_lead(scroll::words_lead(&node, 4.0));
                 plan.set_ids(vec![node.key.clone()]);
                 plan.measure(&node, height);
                 plan.add_segments(&node);
@@ -26244,8 +26801,9 @@ fn settings_fields_page(
                 });
                 let mut nodes = Vec::new();
                 let mut anchor = None;
+                let first = rows.start;
                 for stop in rows {
-                    let node = match &stops[stop] {
+                    let mut node = match &stops[stop] {
                         FieldStop::Row { position, node } => {
                             anchor.get_or_insert_with(|| key_fragment(fields[*position].2.key));
                             UiNode::clone(node)
@@ -26254,6 +26812,16 @@ fn settings_fields_page(
                         FieldStop::ManualRow(node) => node.clone(),
                         FieldStop::Card(_) | FieldStop::SplitRows(_) => continue,
                     };
+                    // A run that starts with a row's words parted from its name starts the
+                    // screen: they are led by the name, in the room its plan keeps for it
+                    // ([`scroll::words_lead`]).
+                    if stop == first
+                        && let Some((caption, _)) = scroll::take_words_caption(&mut node)
+                    {
+                        nodes.push(caption);
+                    } else {
+                        scroll::strip_words_caption(&mut node);
+                    }
                     nodes.push(node);
                 }
                 let anchor = anchor.unwrap_or_else(|| group_anchor.clone());
@@ -26401,6 +26969,7 @@ fn push_field_card(
                         .flat_map(|(row, _)| scroll::focus_keys(row))
                         .collect(),
                 );
+                plan.set_stop_lead(split.stop_lead(&rows));
                 plan.set_ids(
                     split.rows[rows.clone()]
                         .iter()
@@ -27190,8 +27759,8 @@ fn registered_value_unavailability(
             EffectDisclosure::new(
                 EffectNoteKind::Constraint,
                 "This draft is not a hex color like #D0D0D0, so it was not saved; the current color still applies",
-                "Not a hex color",
-                "Not a hex color",
+                NOT_A_HEX_COLOR,
+                NOT_A_HEX_COLOR,
             )
         });
     }
@@ -27278,11 +27847,6 @@ fn platform_unavailability(
                 "Unavailable on this platform; saved for portability",
             ))
         }
-        prefs::EDIT_DESKTOP_ALERTS if !row_available_here(key, availability) => Some(unavailable(
-            "aterm's own alerts go to the desktop through a notifier this platform lacks. The saved value is preserved for portability",
-            "Unavailable on this platform",
-            "Unavailable on this platform; saved for portability",
-        )),
         prefs::EDIT_FOCUS_BOOST if !row_available_here(key, availability) => Some(unavailable(
             "Shell-priority focus boost is implemented only on Windows. This saved value has no effect on the current platform",
             "Windows only: no effect here",
@@ -27911,6 +28475,18 @@ fn parent_or_motion_inactivity(
                 let ctx = trail_knob_context(state, patch, motion);
                 if !trail_style_uses(&trail_resolution, key, ctx.bar) {
                     let name = cursor_style_name(trail_resolution.canonical.unwrap_or_default());
+                    // The ribbon has no life to lengthen: it follows the typing
+                    // (`TrailKnob::Duration`), and the row says so, not just that it is unused.
+                    if key == prefs::EDIT_CURSOR_TRAIL_MS {
+                        return Some(EffectDisclosure::new(
+                            EffectNoteKind::Inactive,
+                            format!(
+                                "Trail duration is not used by {name}: its ribbon follows your typing speed, staying while you type and sweeping away when you pause"
+                            ),
+                            "Inactive: follows your typing speed",
+                            format!("Currently inactive: {name} follows your typing speed"),
+                        ));
+                    }
                     return Some(EffectDisclosure::new(
                         EffectNoteKind::Inactive,
                         if row_value_written(state, patch, key) {
@@ -28590,7 +29166,15 @@ fn setting_effect_projection(
             "No effect in this build",
         ));
     } else {
-        let registered_value_issue = registered_value_unavailability(state, patch, key);
+        // A draft that is no colour says so and leaves the setting as it is: whatever keeps
+        // the setting from taking effect still says so ("Inactive: not used by Rainbow kitty"
+        // under Trail accent color went away while a draft was no colour, and the row with it).
+        let (registered_value_issue, draft_issue) =
+            match registered_value_unavailability(state, patch, key) {
+                Some(note) if note.kind == EffectNoteKind::Constraint => (None, Some(note)),
+                issue => (issue, None),
+            };
+        notes.extend(draft_issue);
         if let Some(note) = registered_value_issue {
             notes.push(note);
         } else {
@@ -31613,15 +32197,20 @@ fn finished_setting_row_as(
     )
     .then(|| unset_field_words(state, field))
     .flatten();
+    // A slider's field, opened to type an exact value, keeps the slider's one line.
+    let band = (entry_on_demand(field) && !font_picker_key(field.key)).then_some(1);
     fit_row_field_placeholder(
         &mut row,
         (&name, text_width, stacked),
         unset
             .as_deref()
             .map(|words| (words, field.kind == EditKind::Color)),
-        field.seed.as_deref(),
+        (field.seed.as_deref(), band),
     );
     let label_width = row_label_room(&row, stacked, text_width);
+    if stacked {
+        scroll::note_row_width(&row.key, text_width);
+    }
     FinishedRow {
         row,
         key: field.key,
@@ -31665,6 +32254,47 @@ fn stacked_switch_line_holds(switch_width: f32, reset_width: f32, text_width: f3
 
 const STACKED_CONTROL_GAP: f32 = 6.0;
 
+/// The room a stacked row keeps under the last thing it draws. ROWS READ AS SEPARATE UNITS: a
+/// stacked row's name, control and words stand 4pt apart, and with nothing under its words
+/// the next row's name stood 4pt under them too, so a narrow list read as one run of words and
+/// controls (Keyboard & Input at 178pt: Copy on select's "Unchanged" 4pt over "Confirm
+/// multiline paste", as far as from its own switch), where a one-line row's box keeps its
+/// words a row's height apart.
+fn stacked_row_end() -> f32 {
+    8.0 * settings_text_scale().clamp(1.0, 1.5)
+}
+
+/// `node`, a stacked row's last stop, with [`stacked_row_end`] under what it draws.
+fn end_stacked_row(mut node: UiNode) -> UiNode {
+    let end = stacked_row_end();
+    node.layout.padding.bottom += end;
+    if let Length::Fixed(height) = node.layout.height {
+        node.layout.height = Length::Fixed(height + end);
+    }
+    node
+}
+
+/// Whether `lines`, a name's lines, break one of the words of `name` across two lines (a line
+/// ending with the hyphen a break adds, which the word does not have there).
+fn breaks_a_word(lines: &[String], name: &str) -> bool {
+    let words: Vec<&str> = name.split_whitespace().collect();
+    lines.windows(2).any(|pair| {
+        let Some(head) = pair[0].split_whitespace().last() else {
+            return false;
+        };
+        let Some(stem) = head.strip_suffix('-') else {
+            return false;
+        };
+        let tail = pair[1].split_whitespace().next().unwrap_or_default();
+        let bare = |word: &str| {
+            word.trim_matches(|ch: char| !ch.is_alphanumeric())
+                .to_string()
+        };
+        let joined = bare(&format!("{stem}{tail}"));
+        words.iter().any(|word| bare(word) == joined)
+    })
+}
+
 fn seat_stacked_reset(row: &mut UiNode, name: &str, text_width: f32) {
     seat_stacked_switch_reset(row, text_width);
     let Some(line) = row
@@ -31675,15 +32305,22 @@ fn seat_stacked_reset(row: &mut UiNode, name: &str, text_width: f32) {
         return;
     };
     let room = one_line_label_room(line, text_width);
-    if pieces_fit(name, room, &row_label_width) {
-        // Weighed with the room its name keeps for Changed ([`row_name_lines_holding`]).
-        let changed = [CHANGED_WORD.to_string()];
-        let beside = row_name_lines_holding(name, &changed, room).len();
-        let alone = row_name_lines_holding(name, &changed, text_width).len();
-        let cost = beside.saturating_sub(alone) as f32 * row_detail_line_height();
-        if cost <= fixed_height(line) + row.layout.gap + 0.01 {
-            return;
-        }
+    // THE RESET NEVER STARVES THE NAME: it stands beside the name where the name takes there, as
+    // it is laid out (with the room it keeps for Changed, [`row_name_lines_holding`]), at most a
+    // line more than the fewest it takes across the row, and breaks no word there; else it takes
+    // a line of its own under the row. Weighed against the name's lines across the row with that
+    // room kept too, which already broke the name, Copy on select at 178pt took three lines beside
+    // the Reset's 72pt, a word each ("Copy", "on", "select"), and Predictive echo "Pre-", "dictive",
+    // "echo". Moved for any line it cost, the Reset's line, empty while the key is not written,
+    // stood as a blank band under every such row at the least window's width (SDR glow boost's
+    // slider over 22pt of nothing at 220pt).
+    let changed = [CHANGED_WORD.to_string()];
+    let beside = row_name_lines_holding(name, &changed, room);
+    if pieces_fit(name, room, &row_label_width)
+        && beside.len() <= row_name_lines(name, text_width).len() + 1
+        && !breaks_a_word(&beside, name)
+    {
+        return;
     }
     let mut line = row.children.remove(0);
     let key = line
@@ -31922,7 +32559,26 @@ impl FinishedRow {
         if let (Some(color), Some(words)) = (self.default_chip, chip_words) {
             set_detail_chip(&mut row, self.key, &words, color, self.text_width);
         }
-        self.with_error(row)
+        self.ended(self.with_error(row))
+    }
+
+    /// `node`, the row's last stop, ended as a stacked row ends ([`stacked_row_end`]): under the
+    /// note its run shares where it has one ([`Self::shared_note_stops`]), the note the run's.
+    fn ended(&self, node: UiNode) -> UiNode {
+        if self.end() > 0.0 {
+            end_stacked_row(node)
+        } else {
+            node
+        }
+    }
+
+    /// The room [`Self::ended`] keeps under the row's last stop.
+    fn end(&self) -> f32 {
+        if self.stacked && self.shared_note.is_none() {
+            stacked_row_end()
+        } else {
+            0.0
+        }
     }
 
     fn split(&self, most: f32) -> (UiNode, Vec<(UiNode, f32)>) {
@@ -31932,7 +32588,7 @@ impl FinishedRow {
         // page a band of empty card (Text & Fonts at 2x in 178x152). Listed apart from the row,
         // they keep nothing in place: what the note comes to say lists under the row.
         if detail.iter().all(String::is_empty) {
-            return (self.with_error(row), Vec::new());
+            return (self.ended(self.with_error(row)), Vec::new());
         }
         // A ROW SPLIT ACROSS STOPS KEEPS A WHOLE ROW'S ORDER: what it says under its control, then
         // the line its Reset takes ([`with_row_detail`]). Left in the row, that line stood empty
@@ -31941,10 +32597,33 @@ impl FinishedRow {
         // "Default").
         let gap = row.layout.gap;
         let reset_line = take_reset_line(&mut row);
-        let (blocks, unplaced) =
-            row_note_blocks(self.key, &detail, most, reset_line.map(|line| (line, gap)));
+        // Each stop of its words keeps the row's name for a screen that starts with it, and the
+        // room the name takes there ([`scroll::words_caption_marker`]).
+        let named =
+            row_name_lines(&self.name, self.text_width).len() as f32 * row_caption_line_height();
+        // Its last stop holds the room the row ends with ([`Self::ended`]).
+        let (blocks, unplaced) = row_note_blocks(
+            self.key,
+            &detail,
+            (most - self.end() - named).max(1.0),
+            reset_line.map(|line| (line, gap)),
+        );
+        let mut blocks: Vec<(UiNode, f32)> = blocks
+            .into_iter()
+            .map(|(block, height)| {
+                let marker = scroll::words_caption_marker(self.key, &self.name, self.text_width);
+                (scroll::mark_words(block, marker), height)
+            })
+            .collect();
         if let Some(line) = unplaced {
             put_back_reset_line(&mut row, line);
+        }
+        // The row ends under its last words, where the stops of a whole row end it.
+        if let Some((last, height)) = blocks.pop() {
+            let last = self.ended(last);
+            let ended = fixed_height(&last);
+            debug_assert!(ended >= height);
+            blocks.push((last, ended));
         }
         (self.with_error(row), blocks)
     }
@@ -31957,10 +32636,27 @@ impl FinishedRow {
     }
 
     fn shared_note_stops(&self, most: Option<f32>) -> Vec<(UiNode, f32)> {
-        self.shared_note
+        let end = if self.stacked { stacked_row_end() } else { 0.0 };
+        let mut stops = self
+            .shared_note
             .as_deref()
-            .map(|note| shared_note_blocks(self.key, note, self.text_width, most))
-            .unwrap_or_default()
+            .map(|note| {
+                shared_note_blocks(
+                    self.key,
+                    note,
+                    self.text_width,
+                    most.map(|most| (most - end).max(1.0)),
+                )
+            })
+            .unwrap_or_default();
+        if self.stacked
+            && let Some((last, _)) = stops.pop()
+        {
+            let last = end_stacked_row(last);
+            let height = fixed_height(&last);
+            stops.push((last, height));
+        }
+        stops
     }
 }
 
@@ -32100,13 +32796,13 @@ fn row_second_line(
     {
         return shared;
     }
-    // Where the state has a line of its own, the line says it at rest too ([`resting_state`]),
-    // laid out for the longer of what it says at rest and at worst, so it breaks alike either
-    // way: laid out by each, "Default · Applies after restart" took one line where "Changed ·
-    // Applies after restart" took two, and the second read as blank (Initial columns at 234pt).
+    // Where the state has a line of its own, the line says it at rest too, in the longest form
+    // it holds in the lines the state takes once written ([`resting_state_held`]), laid out for
+    // the longer of what it says at rest and once written, so it breaks alike either way: laid
+    // out by each, "Default · Applies after restart" took one line where "Changed · Applies
+    // after restart" took two, and the second read as blank (Initial columns at 234pt).
     let (mut lines, reserved) = match &placement.state_below {
         Some(state) => {
-            let state = &*rest_breaking_alike(state, px, text_width);
             let measure = |words: &[String]| {
                 crate::tray_raster::ui_text_width_for(
                     crate::widget::TextFace::Ui,
@@ -32114,19 +32810,20 @@ fn row_second_line(
                     px,
                 )
             };
-            let widest = if measure(&state.rest) > measure(&state.worst) {
-                &state.rest
-            } else {
-                &state.worst
+            let laid = |lead: &[String]| {
+                led_fact_lines(lead, lead, &with_timing(&state.worst_facts), px, text_width).len()
             };
+            let written = written_state(&state.worst);
+            let at_worst = laid(&written);
+            let rest = resting_state_held(&state.worst, |rest| laid(rest) <= at_worst);
+            let widest = if measure(&rest) > measure(&written) {
+                &rest
+            } else {
+                &written
+            };
+            let said = state.written.as_ref().unwrap_or(&rest);
             (
-                led_fact_lines(
-                    &state.said,
-                    widest,
-                    &with_timing(&state.facts),
-                    px,
-                    text_width,
-                ),
+                led_fact_lines(said, widest, &with_timing(&state.facts), px, text_width),
                 led_fact_lines(
                     widest,
                     widest,
@@ -32149,36 +32846,6 @@ fn row_second_line(
         lines.extend(wrapped_copy_lines(note, px, text_width));
     }
     lines
-}
-
-/// `state`, Font size's resting [`AUTOMATIC_WORD`] said as [`DEFAULT_WORD`] where that word
-/// breaks inside itself on its line and "Changed" does not: THE LINE KEPT FOR THE STATE BREAKS
-/// ALIKE FOR BOTH WORDS. Laid out for the longer, "Auto-" / "matic" kept two lines, and once a
-/// size was written "Changed" took the first and left the second blank (the Linux lane's Noto
-/// Sans with 2x text in a 164pt window). "Default" takes a line as "Changed" does, as on every
-/// other row.
-fn rest_breaking_alike(
-    state: &StateBelow,
-    px: f32,
-    width: f32,
-) -> std::borrow::Cow<'_, StateBelow> {
-    let one_line =
-        |word: &str| fact_lines(std::slice::from_ref(&word.to_string()), px, width).len() == 1;
-    let automatic = [AUTOMATIC_WORD.to_string()];
-    if state.rest != automatic || one_line(AUTOMATIC_WORD) || !one_line(CHANGED_WORD) {
-        return std::borrow::Cow::Borrowed(state);
-    }
-    let default = vec![DEFAULT_WORD.to_string()];
-    std::borrow::Cow::Owned(StateBelow {
-        said: if state.said == automatic {
-            default.clone()
-        } else {
-            state.said.clone()
-        },
-        worst: vec![CHANGED_WORD.to_string()],
-        rest: default,
-        ..state.clone()
-    })
 }
 
 /// A ROW'S FACTS THAT MAY COME TAKE ROOM ON ITS NOTE'S FIRST LINE: the note wraps with that
@@ -32461,11 +33128,21 @@ struct RowTagPlacement {
 
 impl RowTagPlacement {
     /// What goes under the name: [`Self::below`], the state said at rest too where it has a line
-    /// there ([`resting_state`]).
-    fn said_below(&self) -> Vec<String> {
+    /// there, in the longest form whose words that line `holds` ([`resting_state_held`]).
+    fn said_below(&self, holds: impl Fn(&[String]) -> bool) -> Vec<String> {
         self.state_below.as_ref().map_or_else(
             || self.below.clone(),
-            |state| state.said.iter().chain(&state.facts).cloned().collect(),
+            |state| {
+                let said = state.written.clone().unwrap_or_else(|| {
+                    resting_state_held(&state.worst, |rest| {
+                        let line: Vec<String> = rest.iter().chain(&state.facts).cloned().collect();
+                        holds(&line)
+                    })
+                });
+                said.into_iter()
+                    .chain(state.facts.iter().cloned())
+                    .collect()
+            },
         )
     }
 }
@@ -32473,31 +33150,65 @@ impl RowTagPlacement {
 /// The line under a row's name its state takes, where the state does not fit beside the name.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct StateBelow {
-    /// The state as it is now, at rest too ([`resting_state`]).
-    said: Vec<String>,
-    /// The state at worst ("Changed") and at rest ("Default"): the line is laid out for the
-    /// longer, so it breaks alike whichever it says ([`led_fact_lines`]).
+    /// The state while the key is written ("Changed"); `None` at rest, where the line says the
+    /// longest resting form it holds in the lines the state takes once written
+    /// ([`resting_state_held`]).
+    written: Option<Vec<String>>,
+    /// The state at worst ("Changed", or Font size's "Automatic" where that is wider): the line
+    /// is laid out for the longer of what it says once written ([`written_state`]) and at rest,
+    /// so it breaks alike whichever it says ([`led_fact_lines`]).
     worst: Vec<String>,
-    rest: Vec<String>,
     /// The facts that go under the name with it, now and at worst.
     facts: Vec<String>,
     worst_facts: Vec<String>,
 }
 
 /// The words a row whose state goes on a line under its name says there while its key is not
-/// written: "Default" for "Changed", "Follows theme" for "Overrides theme". THE LINE KEPT FOR A
-/// ROW'S STATE ALWAYS SAYS IT: kept empty while the key was not written, it read as a blank line
-/// under a short name in a narrow window (623 such lines between 164 and 304pt wide with 2x
-/// text, Top's Color theme and Font family cards at 1074x900).
-fn resting_state(worst: &[String]) -> Vec<String> {
+/// written, the longest form first: "Unchanged", else "Default", for "Changed"; Font size's
+/// "Automatic", else "Default"; "Follows theme" for "Overrides theme". THE LINE KEPT FOR A
+/// ROW'S STATE ALWAYS SAYS IT: kept empty while the key was not written, it read as a blank
+/// line under a short name in a narrow window (623 such lines between 164 and 304pt wide with
+/// 2x text, Top's Color theme and Font family cards at 1074x900).
+fn resting_states(worst: &[String]) -> [Vec<String>; 2] {
+    let at_rest = |long: bool| -> Vec<String> {
+        worst
+            .iter()
+            .map(|word| match word.as_str() {
+                CHANGED_WORD if long => UNCHANGED_WORD.to_string(),
+                CHANGED_WORD | AUTOMATIC_WORD if !long => DEFAULT_WORD.to_string(),
+                OVERRIDES_THEME_WORD => FOLLOWS_THEME_WORD.to_string(),
+                other => other.to_string(),
+            })
+            .collect()
+    };
+    [at_rest(true), at_rest(false)]
+}
+
+/// What a row whose state goes on a line under its name says there once its key is written:
+/// its state at worst, Font size's "Automatic" (its state at rest, kept room for where it is
+/// wider) said as "Changed".
+fn written_state(worst: &[String]) -> Vec<String> {
     worst
         .iter()
         .map(|word| match word.as_str() {
-            CHANGED_WORD => DEFAULT_WORD.to_string(),
-            OVERRIDES_THEME_WORD => FOLLOWS_THEME_WORD.to_string(),
+            AUTOMATIC_WORD => CHANGED_WORD.to_string(),
             other => other.to_string(),
         })
         .collect()
+}
+
+/// The state a row says at rest on the line kept for it ([`resting_states`]): "Unchanged" (Font
+/// size's "Automatic") where that line `holds` it as it holds "Changed", else "Default". A
+/// ROW'S STATE AT REST NEVER READS AS A VALUE: "Default" under Color theme's picker read as the
+/// theme's name twice, the picker saying "Default" too. THE LINE BREAKS ALIKE FOR EVERY WORD IT
+/// SAYS: "Unchanged" took two lines where "Changed" takes one in a 164pt window with 2x text,
+/// and Font size's "Auto-" / "matic" two (the Linux lane's Noto Sans), and the second read as
+/// blank once the key was written. So each line says the longest form it holds in the lines
+/// "Changed" takes, decided by the room alone, and nothing moves when the key is written or
+/// reset.
+fn resting_state_held(worst: &[String], holds: impl Fn(&[String]) -> bool) -> Vec<String> {
+    let [long, short] = resting_states(worst);
+    if holds(&long) { long } else { short }
 }
 
 fn place_row_tags(
@@ -32568,19 +33279,14 @@ fn place_row_tags_held(
             tags.facts.clone()
         }
     };
-    let state_below = (!fit.state && !worst.state.is_empty()).then(|| {
-        let rest = resting_state(&worst.state);
-        StateBelow {
-            said: if tags.state.is_empty() {
-                rest.clone()
-            } else {
-                tags.state.clone()
-            },
-            worst: worst.state.clone(),
-            rest,
-            facts: facts(tags),
-            worst_facts: facts(worst),
-        }
+    // A state said at rest (Font size's Automatic) is no key written: the line says the form of
+    // it its room holds ([`resting_state_held`]).
+    let [resting, _] = resting_states(&worst.state);
+    let state_below = (!fit.state && !worst.state.is_empty()).then(|| StateBelow {
+        written: (!tags.state.is_empty() && tags.state != resting).then(|| tags.state.clone()),
+        worst: worst.state.clone(),
+        facts: facts(tags),
+        worst_facts: facts(worst),
     });
     RowTagPlacement {
         lines,
@@ -32641,6 +33347,8 @@ fn chip_after_line(
                 focusable: false,
                 focused: false,
                 focus_visible: false,
+                progress: None,
+                motion: None,
             }),
         )
         .layout(
@@ -32915,15 +33623,23 @@ fn row_note_blocks(
         .map(|(line, gap)| ((most - gap - fixed_height(line)) / line_height + 0.01).floor());
     if let Some(beside) = beside {
         let last = chunks.last().map_or(0, |chunk| chunk.len());
-        if beside < 1.0 {
+        if last == 0 {
             unplaced = trailing.take().map(|(line, _)| line);
-        } else if last > beside as usize {
-            // The last stop gives its last words to one of their own with the trailing line.
-            let keep = beside as usize;
-            let split = chunks.pop().unwrap_or_default();
-            let (head, tail) = split.split_at(split.len() - keep);
-            chunks.push(head);
-            chunks.push(tail);
+        } else {
+            // The last stop gives its last words to one of their own with the trailing line: at
+            // least one, where a stop holds no line of words with it, that stop the least taller
+            // than the room. THE RESET'S LINE NEVER STANDS BETWEEN A CONTROL AND ITS WORDS: kept
+            // in the row where no stop held a line of words with it, it stood empty under the
+            // control while the key was not written, a blank band between the control and what
+            // the row says (Appearance at 164x292: 22pt between Window appearance's Dark and
+            // "Unchanged", its stops one line each under the preview's least height).
+            let keep = (beside.max(1.0) as usize).min(last);
+            if last > keep {
+                let split = chunks.pop().unwrap_or_default();
+                let (head, tail) = split.split_at(split.len() - keep);
+                chunks.push(head);
+                chunks.push(tail);
+            }
         }
     }
     let count = chunks.len();
@@ -33046,6 +33762,12 @@ fn fact_lines(facts: &[String], px: f32, width: f32) -> Vec<String> {
 
 fn row_detail_line_height() -> f32 {
     18.0_f32.max(16.0 * settings_text_scale())
+}
+
+/// The height of the line a split row's part names its row on ([`scroll::named_row_parts`]): a
+/// line of its name.
+fn row_caption_line_height() -> f32 {
+    row_detail_line_height()
 }
 
 fn with_row_error(row: UiNode, key: &str, message: &str, text_width: f32) -> UiNode {
@@ -33619,8 +34341,11 @@ struct SettingRowParts {
 
 const CHANGED_WORD: &str = "Changed";
 
-/// What a row whose state has a line of its own says there while its key is not written
-/// ([`resting_state`]).
+/// What a row whose state has a line of its own says there while its key is not written, where
+/// that line holds it as it holds "Changed" ([`resting_state_held`]).
+const UNCHANGED_WORD: &str = "Unchanged";
+
+/// [`UNCHANGED_WORD`]'s short form, where its line does not hold it.
 const DEFAULT_WORD: &str = "Default";
 
 /// [`DEFAULT_WORD`]'s counterpart for "Overrides theme".
@@ -33650,6 +34375,23 @@ fn changed_tags(state: &SettingsViewState, key: &str) -> (RowTags, RowTags) {
 }
 
 const UNSAVED_HINT: &str = "Unsaved";
+
+/// What a colour row says of a draft that is no colour.
+const NOT_A_HEX_COLOR: &str = "Not a hex color";
+
+/// What a colour row whose draft is no colour says where it says its state, the longest form
+/// the room its state keeps holds: that room is laid out for `worst` (Changed), so the words
+/// stand where Changed would. WHAT TYPING BRINGS TAKES NO LINE OF ITS OWN: said as a fact under
+/// the row, "Not a hex color" came and went as each character was typed ("#12" no colour,
+/// "#123" one, "#1234" none again), and the rows under the field moved with it (Appearance at
+/// 584x348 with 2x text: Background went out of view on the first "#").
+fn invalid_draft_state(worst: &[String]) -> Option<Vec<String>> {
+    let room = row_label_width(&worst.join(FACT_SEPARATOR));
+    ["Not a color", "Invalid"]
+        .into_iter()
+        .find(|words| row_label_width(words) <= room + 0.01)
+        .map(|words| vec![words.to_string()])
+}
 
 fn row_shown_value(state: &SettingsViewState, field: &EditField, modified_only: bool) -> String {
     if field.key == prefs::EDIT_CURSOR_TRAIL_STYLE {
@@ -33891,8 +34633,23 @@ fn setting_row_parts(
             echo_always.then_some("Can show a password"),
         );
     }
+    // A colour draft that is no colour says so where the row says its state
+    // ([`invalid_draft_state`]), never on a line of its own.
+    let draft_not_a_color = field.kind == EditKind::Color
+        && !modified_only
+        && has_draft
+        && !state.field_errors.contains_key(field.key)
+        && retained_input.is_some_and(|input| {
+            let draft = input.value().trim();
+            !draft.is_empty() && !prefs::color_value_is_valid(field.key, draft)
+        });
     for note in &setting_effect.notes {
-        fact(note.visual.clone(), note.semantic.clone(), None);
+        let visual = if draft_not_a_color && note.visual == NOT_A_HEX_COLOR {
+            String::new()
+        } else {
+            note.visual.clone()
+        };
+        fact(visual, note.semantic.clone(), None);
     }
     let facts_after = |timing: Option<&str>| -> String {
         timing
@@ -34148,6 +34905,9 @@ fn setting_row_parts(
     } else {
         changed_tags(state, field.key)
     };
+    if draft_not_a_color && let Some(said) = invalid_draft_state(&worst.state) {
+        tags.state = said;
+    }
     if automatic && !modified_only {
         if field.seed.is_none() {
             tags.state = vec![AUTOMATIC_WORD.to_string()];
@@ -34496,7 +35256,7 @@ fn fit_row_field_placeholder(
     row: &mut UiNode,
     (name, text_width, stacked): (&str, f32, bool),
     unset: Option<(&str, bool)>,
-    held: Option<&str>,
+    (held, band): (Option<&str>, Option<usize>),
 ) {
     // A one-line row's field takes the width its unset words need from the name's column,
     // down to the name's floor ([`one_line_name_floor`]), as a row's button does
@@ -34522,7 +35282,7 @@ fn fit_row_field_placeholder(
         node: &mut UiNode,
         room: f32,
         unset: Option<(&str, bool)>,
-        held: Option<&str>,
+        (held, band): (Option<&str>, Option<usize>),
     ) -> Option<usize> {
         let siblings: f32 = node
             .children
@@ -34543,6 +35303,23 @@ fn fit_row_field_placeholder(
                 };
                 let chip_line = field.spec.swatch_line;
                 let swatch = field.spec.swatch.is_some() && !chip_line;
+                // A FIELD OPENED IN PLACE OF A SLIDER KEEPS THE SLIDER'S LINES (`band`): where its
+                // words at rest take more, it says them in their number alone, the slider having
+                // said them whole. Laid out for "24 cells" on two lines, Cursor trail length's
+                // field stood a line taller than its slider at 120pt with 2x text, and every
+                // row under it moved as the person opened it to type.
+                let short = |words: &str| -> Option<String> {
+                    let most = band?;
+                    (field_placeholder_lines(words, width, swatch).1 > most)
+                        .then(|| words.split_whitespace().next().map(str::to_string))
+                        .flatten()
+                };
+                let unset_short = unset.and_then(|(words, _)| short(words));
+                let unset =
+                    unset.map(|(words, chip)| (unset_short.as_deref().unwrap_or(words), chip));
+                if let Some(placeholder) = field.spec.placeholder.as_deref().and_then(short) {
+                    field.spec.placeholder = Some(placeholder);
+                }
                 let empty = field
                     .spec
                     .visual_value
@@ -34568,18 +35345,45 @@ fn fit_row_field_placeholder(
                     })
                     .unwrap_or(1);
                 let words_room = crate::native_ui::text_field_words_room(field, width);
-                let kept = held
-                    .filter(|held| !held.is_empty())
-                    .map_or(kept, |held| kept.max(field_value_lines(held, words_room).1));
+                // A COLOUR FIELD KEEPS THE LINES THE WIDEST COLOUR IT CAN HOLD TAKES, its swatch
+                // beside it and no hint: kept for its words at rest ("Theme"), it wrapped a colour
+                // written or typed ("#808\n080") and every row under it moved (Foreground at
+                // 130pt with 2x text: 64pt, then 97pt).
+                let colour = unset.is_some_and(|(_, chip)| chip);
+                // What the field holds at rest is measured as it stands at rest: with no hint,
+                // which only a draft brings, and then over the draft's words, not the value it
+                // keeps. Measured beside the hint, Scrollback lines' 100000 took two lines once a
+                // draft was typed at 120pt with 2x text, a line more than at rest.
+                let mut resting = field.clone();
+                resting.spec.trailing_hint = None;
+                let kept = if colour {
+                    resting.spec.swatch = Some([0, 0, 0]);
+                    let room = crate::native_ui::text_field_words_room(&resting, width);
+                    kept.max(field_value_lines(&widest_color_words(), room).1)
+                } else {
+                    let room = crate::native_ui::text_field_words_room(&resting, width);
+                    held.filter(|held| !held.is_empty())
+                        .map_or(kept, |held| kept.max(field_value_lines(held, room).1))
+                };
                 let mut lines = kept;
                 if let (Some((words, count)), Some(slot)) =
                     (painted, field.spec.placeholder.as_mut())
                 {
-                    if empty {
+                    // The lines its words take at rest are kept whatever it holds: counted only
+                    // while it was empty, a colour typed into Trail accent color's three lines
+                    // of "Brighter cursor color" made it one line high, the rows under it
+                    // moving up.
+                    if empty || colour {
                         lines = lines.max(count);
                     }
                     *slot = words;
                 }
+                // WHAT A FIELD SHOWS TAKES THE LINES IT KEEPS: a draft, or a colour the file holds
+                // in a form no colour takes, longer than those lines ends in an ellipsis there (the
+                // field reads it whole once focused, and says it whole), so typing a value and
+                // leaving the field moves nothing under it.
+                let draft = held.unwrap_or_default()
+                    != field.spec.visual_value.as_deref().unwrap_or_default();
                 if field.spec.input.is_none()
                     && let Some(value) = field
                         .spec
@@ -34587,19 +35391,23 @@ fn fit_row_field_placeholder(
                         .as_mut()
                         .filter(|value| !value.is_empty())
                 {
-                    let (shown, count) = field_value_lines(value, words_room);
+                    let (shown, count) = if colour || draft {
+                        field_value_lines_within(value, words_room, lines)
+                    } else {
+                        field_value_lines(value, words_room)
+                    };
                     lines = lines.max(count);
                     *value = shown;
                 }
                 return Some(lines.saturating_sub(1) + usize::from(chip_line));
             }
-            if let Some(extra) = fit(child, room, unset, held) {
+            if let Some(extra) = fit(child, room, unset, (held, band)) {
                 return Some(extra);
             }
         }
         None
     }
-    if let Some(extra) = fit(row, text_width, unset, held).filter(|extra| *extra > 0) {
+    if let Some(extra) = fit(row, text_width, unset, (held, band)).filter(|extra| *extra > 0) {
         grow_row(
             row,
             extra as f32 * crate::native_ui::native_button_line_height(),
@@ -34636,6 +35444,54 @@ fn field_placeholder_lines(placeholder: &str, width: f32, swatch: bool) -> (Stri
         word_placeholder_lines(&plain, room, &measure, field_lines_most())
     };
     let count = lines.len().max(1);
+    (lines.join("\n"), count)
+}
+
+/// The widest value a colour field holds: "#" and six of the widest hex digit, so any colour
+/// written or typed takes no more lines than the field keeps for it.
+fn widest_color_words() -> String {
+    let px = crate::native_ui::native_type_px(crate::type_scale::TypeStep::Secondary).get();
+    let widest = "0123456789abcdefABCDEF"
+        .chars()
+        .max_by(|one, other| {
+            let width = |digit: &char| crate::tray_raster::ui_text_width(&digit.to_string(), px);
+            width(one).total_cmp(&width(other))
+        })
+        .unwrap_or('D');
+    format!("#{}", widest.to_string().repeat(6))
+}
+
+/// [`field_value_lines`] on at most `most` lines, the last ending in an ellipsis where the value
+/// takes more.
+fn field_value_lines_within(value: &str, room: f32, most: usize) -> (String, usize) {
+    let (shown, count) = field_value_lines(value, room);
+    let most = most.max(1);
+    if count <= most {
+        return (shown, count);
+    }
+    let px = crate::native_ui::native_type_px(crate::type_scale::TypeStep::Secondary).get();
+    let fits = |line: &str| {
+        crate::tray_raster::ui_text_width(line, px) <= room + crate::native_ui::TEXT_FIT_SLACK
+    };
+    let mut lines: Vec<String> = shown.split('\n').take(most).map(str::to_string).collect();
+    if let Some(last) = lines.last_mut() {
+        let mut cut = last.trim_end_matches('-').trim_end().to_string();
+        while !cut.is_empty()
+            && !fits(&format!(
+                "{}{}",
+                cut.trim_end(),
+                crate::native_ui::TEXT_FIELD_ELLIPSIS
+            ))
+        {
+            cut.pop();
+        }
+        *last = format!(
+            "{}{}",
+            cut.trim_end(),
+            crate::native_ui::TEXT_FIELD_ELLIPSIS
+        );
+    }
+    let count = lines.len();
     (lines.join("\n"), count)
 }
 
@@ -35227,6 +36083,8 @@ fn about_page(
             focusable: false,
             focused: false,
             focus_visible: false,
+            progress: None,
+            motion: None,
         }),
     )
     .layout(Layout::default().height(Length::Fixed(wordmark_height)));
@@ -35564,7 +36422,12 @@ fn about_fact_value(key: &str, value: &str, clock: &MessagesState) -> String {
             .unwrap_or_default();
         return format!("{date} {} UTC", time.get(..5).unwrap_or(time));
     }
-    aterm_messages::words::local_words(clock.now_unix_ms, built_ms, clock.utc_offset_s)
+    aterm_messages::words::local_words_at(
+        clock.now_unix_ms,
+        clock.utc_offset_s,
+        built_ms,
+        clock.offset_for(built_ms),
+    )
 }
 
 const fn metadata_value_is_code(label: &str) -> bool {
@@ -37582,6 +38445,10 @@ fn update_automatic_cards(
         );
         let detail = row_second_line(&placement, None, None, text_width);
         let mut row = with_row_detail(row, key, &detail, row_width == SettingsWidth::Compact);
+        if row_width == SettingsWidth::Compact {
+            scroll::note_row_width(&row.key, text_width);
+            row = end_stacked_row(row);
+        }
         if !native_updater_here(availability) && !linux_updater {
             fn disable_switch(node: &mut UiNode) -> bool {
                 if let UiContent::Switch(switch) = &mut node.content {
@@ -38281,11 +39148,12 @@ fn ui_node_holds(node: &UiNode, key: &str) -> bool {
 }
 
 fn messages_row_of(key: &str) -> Option<u64> {
-    key.strip_prefix("settings/messages/row/")?
+    let id = key
+        .strip_prefix("settings/messages/row/")?
         .split('/')
-        .next()?
-        .parse()
-        .ok()
+        .next()?;
+    (!id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())).then_some(())?;
+    id.parse().ok()
 }
 
 fn first_focusable_key(node: &UiNode) -> Option<UiKey> {
@@ -38504,6 +39372,7 @@ fn messages_count_line(
     note: Option<&str>,
     content_width: f32,
     can_copy: bool,
+    room: Option<f32>,
 ) -> (UiNode, f32) {
     let (spx, sface) = crate::native_ui::text_paint_metrics(SemanticRole::Status, StyleRef::Quiet);
     let words_w = words.as_deref().map_or(0.0, |w| {
@@ -38528,27 +39397,49 @@ fn messages_count_line(
         true,
     );
     let button_h = messages_small_button_height();
-    let fit = |(mut node, width): (UiNode, f32), label: &str| -> (UiNode, f32, f32) {
+    // A BUTTON IS WHOLE ON SOME SCREEN: one wider than the line stacks its words, and where they
+    // would stand taller than the list's room it takes the first of its shorter labels whose
+    // lines the room holds (its name stays whole for a screen reader). Stacked, "Open / Log /
+    // Folder" stood 107pt tall in a 96pt list at 2x in a 164x96 window, its foot never shown.
+    let fit = |(mut node, width): (UiNode, f32), forms: &[&str]| -> (UiNode, f32, f32) {
         if width <= content_width + crate::native_ui::TEXT_FIT_SLACK {
             return (node, width, button_h);
         }
-        let (words, lines) = button_words(label, &[], content_width);
+        let laid: Vec<(String, f32)> = forms
+            .iter()
+            .map(|form| {
+                let (words, lines) = button_words(form, &[], content_width);
+                (
+                    words,
+                    crate::native_ui::native_button_height_for_lines(lines, button_h),
+                )
+            })
+            .collect();
+        let (words, height) = laid
+            .iter()
+            .find(|(_, height)| room.is_none_or(|room| *height <= room + 0.01))
+            .or_else(|| laid.iter().min_by(|one, other| one.1.total_cmp(&other.1)))
+            .cloned()
+            .unwrap_or_default();
         if let UiContent::Button(button) = &mut node.content {
             button.spec.visual_label = Some(words);
         }
-        let height = crate::native_ui::native_button_height_for_lines(lines, button_h);
         node.layout.width = Length::Fixed(content_width);
         node.layout.height = Length::Fixed(height);
         (node, content_width, height)
     };
-    let (copy, copy_w, copy_h) = fit((copy, copy_w), aterm_messages::page::COPY_ALL);
-    let (folder, folder_w, folder_h) = fit((folder, folder_w), "Open Log Folder");
+    let (copy, copy_w, copy_h) = fit((copy, copy_w), &[aterm_messages::page::COPY_ALL, "Copy"]);
+    let (folder, folder_w, folder_h) = fit(
+        (folder, folder_w),
+        &["Open Log Folder", "Log Folder", "Folder"],
+    );
     let beside = words_w + copy_w + folder_w + 16.0 <= content_width;
     let status_w = if beside {
         (content_width - copy_w - folder_w - 16.0).max(24.0)
     } else {
         content_width
     };
+    let said = words.is_some();
     let (status, status_lines) = match words {
         Some(words) => messages_count_status(words, count.as_deref(), note, status_w),
         None => (
@@ -38613,13 +39504,13 @@ fn messages_count_line(
     let line_h = messages_line_height();
     let mut status = status;
     status.layout.height = Length::Fixed(status_lines as f32 * line_h);
-    let height = status_lines as f32 * line_h
-        + button_rows
-            .iter()
-            .map(|row| 6.0 + fixed_height(row))
-            .sum::<f32>();
-    let mut children = vec![status];
+    // A LINE THAT SAYS NOTHING TAKES NO ROOM: with no count or note to say, the line kept for
+    // them over the buttons was a band of empty card, a screen of its own at 2x in a 164x96
+    // window, Copy All under it never shown.
+    let mut children = if said { vec![status] } else { Vec::new() };
     children.extend(button_rows);
+    let height = children.iter().map(fixed_height).sum::<f32>()
+        + 6.0 * children.len().saturating_sub(1) as f32;
     (
         UiNode::new(
             "settings/messages/header",
@@ -38929,6 +39820,8 @@ fn messages_rule(key: &str) -> UiNode {
             focusable: false,
             focused: false,
             focus_visible: false,
+            progress: None,
+            motion: None,
         }),
     )
     .layout(
@@ -38948,20 +39841,37 @@ struct MessagesLead {
     stacked: bool,
     when_lines: usize,
     title_lines: usize,
+    /// Whether a stacked head keeps the room under its last line that sets a row's height
+    /// ([`messages_head_height`]); not where that room would make it taller than the list's
+    /// ([`messages_plan_opening`]).
+    trailing_room: bool,
 }
 
 impl MessagesLead {
+    #[cfg(test)]
     fn measure(
         visible: &[&MessageView],
         clock: MessagesClock,
         compact: bool,
         content_width: f32,
     ) -> Self {
+        Self::measure_local(visible, clock, &|_| clock.offset_s, compact, content_width)
+    }
+
+    fn measure_local(
+        visible: &[&MessageView],
+        clock: MessagesClock,
+        offset_for: &dyn Fn(u64) -> i64,
+        compact: bool,
+        content_width: f32,
+    ) -> Self {
         let scale = settings_text_scale();
         let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Quiet);
         let width = |s: &str| crate::tray_raster::ui_text_width_for(face, s, px);
-        let whens: std::collections::BTreeSet<String> =
-            visible.iter().map(|e| clock.when(e.at_unix_ms)).collect();
+        let whens: std::collections::BTreeSet<String> = visible
+            .iter()
+            .map(|e| clock.when_at(e.at_unix_ms, offset_for(e.at_unix_ms)))
+            .collect();
         let when = [
             "yesterday",
             "2026-09-22",
@@ -38991,6 +39901,7 @@ impl MessagesLead {
             stacked: false,
             when_lines: 0,
             title_lines: 1,
+            trailing_room: true,
         };
         if lead.title_x() + MESSAGES_CHEVRON_END > content_width * 0.6 {
             lead.tag = 0.0;
@@ -39012,7 +39923,8 @@ impl MessagesLead {
                 lead.when_lines = visible
                     .iter()
                     .map(|entry| {
-                        let forms = clock.when_forms(entry.at_unix_ms);
+                        let forms =
+                            clock.when_forms_at(entry.at_unix_ms, offset_for(entry.at_unix_ms));
                         let when = messages_when_words(&forms, under, &width);
                         wrap_to_box(&when, under, &width).len()
                     })
@@ -39048,14 +39960,20 @@ impl MessagesLead {
     /// The words an entry at `at_unix_ms` shows for its time in a head laid out as this lead:
     /// under a stacked head's mark, the most of its forms that hold the line
     /// ([`messages_when_words`]); beside the mark or on one row, all of them.
-    fn when_words(self, clock: MessagesClock, at_unix_ms: u64, content_width: f32) -> String {
+    fn when_words(
+        self,
+        clock: MessagesClock,
+        at_unix_ms: u64,
+        at_offset_s: i64,
+        content_width: f32,
+    ) -> String {
         if !self.stacked || self.when_lines == 0 {
-            return clock.when(at_unix_ms);
+            return clock.when_at(at_unix_ms, at_offset_s);
         }
         let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Quiet);
         let width = |s: &str| crate::tray_raster::ui_text_width_for(face, s, px);
         let under = messages_stacked_width(content_width, self);
-        messages_when_words(&clock.when_forms(at_unix_ms), under, &width)
+        messages_when_words(&clock.when_forms_at(at_unix_ms, at_offset_s), under, &width)
     }
 }
 
@@ -39134,7 +40052,11 @@ fn messages_head_height(lead: MessagesLead) -> f32 {
     let line_h = messages_line_height();
     messages_head_first_row(lead)
         + (lead.when_lines + lead.title_lines) as f32 * line_h
-        + (row_h - line_h) / 2.0
+        + if lead.trailing_room {
+            (row_h - line_h) / 2.0
+        } else {
+            0.0
+        }
 }
 
 /// Where a line ends in a head laid out for `lead`, down from its top: a screen that holds part of
@@ -39157,6 +40079,7 @@ fn messages_head_node(
     lead: MessagesLead,
     content_width: f32,
     clock: MessagesClock,
+    at_offset_s: i64,
 ) -> UiNode {
     #[cfg(test)]
     MESSAGES_ROWS_BUILT.with(|rows| rows.set(rows.get() + 1));
@@ -39216,6 +40139,8 @@ fn messages_head_node(
             focusable: false,
             focused: false,
             focus_visible: false,
+            progress: None,
+            motion: None,
         }),
     )
     .layout(
@@ -39224,7 +40149,7 @@ fn messages_head_node(
             .height(Length::Fixed(row_h)),
     )
     .paint_only();
-    let when = lead.when_words(clock, entry.at_unix_ms, content_width);
+    let when = lead.when_words(clock, entry.at_unix_ms, at_offset_s, content_width);
     let visual = if lead.stacked {
         let line_h = messages_line_height();
         let under = messages_stacked_width(content_width, lead);
@@ -39428,10 +40353,21 @@ fn messages_footer_row_height(row: &[MessagesButton]) -> f32 {
 }
 
 impl MessagesBody {
+    #[cfg(test)]
     fn of(entry: &MessageView, text_width: f32, utc_offset_s: i64, now_unix_ms: u64) -> Self {
+        Self::of_at(entry, text_width, utc_offset_s, utc_offset_s, now_unix_ms)
+    }
+
+    fn of_at(
+        entry: &MessageView,
+        text_width: f32,
+        now_offset_s: i64,
+        began_offset_s: i64,
+        now_unix_ms: u64,
+    ) -> Self {
         let (qpx, _) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Quiet);
         let (ppx, _) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Primary);
-        let meta = entry.meta_words(now_unix_ms, utc_offset_s);
+        let meta = entry.meta_words_at(now_unix_ms, now_offset_s, began_offset_s);
         let (sentence, technical) = entry.sentence_and_technical();
         let diagram = entry.is_diagram();
         let sentence = sentence
@@ -39858,7 +40794,14 @@ fn messages_list_node(
             height += plan.day_h;
         }
         let expanded = selected == Some(entry.id);
-        let head = messages_head_node(entry, expanded, plan.lead, plan.content_width, plan.clock);
+        let head = messages_head_node(
+            entry,
+            expanded,
+            plan.lead,
+            plan.content_width,
+            plan.clock,
+            plan.offset_for(entry.at_unix_ms),
+        );
         let row_h = fixed_height(&head);
         let key = format!("settings/messages/row/{}", entry.id);
         let body = plan
@@ -39976,6 +40919,8 @@ fn messages_scroll_node(
             focusable: false,
             focused: false,
             focus_visible: false,
+            progress: None,
+            motion: None,
         }),
     )
     .layout(Layout::default().width(Length::Fill).height(Length::Fill))
@@ -40113,7 +41058,13 @@ fn messages_filter_items(
         .feedback
         .as_deref()
         .filter(|_| messages_feedback_inline(state));
-    items.push(messages_count_line(words, note, content_width, visible > 0));
+    items.push(messages_count_line(
+        words,
+        note,
+        content_width,
+        visible > 0,
+        room.map(|room| (room - 2.0 * MESSAGES_FILTERS_PAD_Y).max(0.0)),
+    ));
     if total > 0 && visible == 0 {
         items.push(messages_no_match_node(content_width));
     }
@@ -40214,6 +41165,7 @@ struct MessagesPlan {
     heights: Vec<f32>,
     body: Option<(u64, MessagesBody)>,
     clock: MessagesClock,
+    entry_offsets: Vec<(u64, i64)>,
     sections: Option<Vec<i64>>,
     day_h: f32,
     /// The entries taller than the list's room, in order ([`MessagesTall`]).
@@ -40318,6 +41270,12 @@ struct MessagesAnchor {
 }
 
 impl MessagesPlan {
+    fn offset_for(&self, unix_ms: u64) -> i64 {
+        self.entry_offsets
+            .binary_search_by_key(&unix_ms, |(ms, _)| *ms)
+            .map_or(self.clock.offset_s, |idx| self.entry_offsets[idx].1)
+    }
+
     const fn lead_stops(&self) -> usize {
         if self.scrolls { self.header.len() } else { 0 }
     }
@@ -40653,24 +41611,65 @@ fn messages_plan_opening(
     let all: Vec<&MessageView> = messages.entries.iter().collect();
     // The lead laid out for `clock` (the log's, `log_clock`, measures its column), its stacked
     // title as many lines as leave the head room under its day; and that day's height.
+    let offset_for = |ms| messages.offset_for(ms);
     let fitted = |clock: MessagesClock, log_clock: MessagesClock| {
-        let mut lead = MessagesLead::measure(&all, log_clock, compact, content_width);
-        let day = if clock.sections(visible).is_some() {
+        let mut lead =
+            MessagesLead::measure_local(&all, log_clock, &offset_for, compact, content_width);
+        let day = if clock.sections_local(visible, &offset_for).is_some() {
             messages_day_height()
         } else {
             0.0
         };
         if lead.stacked {
-            while lead.title_lines > 1
-                && messages_head_height(lead) > room - 2.0 * MESSAGES_LIST_PAD - day + 0.01
-            {
+            let held = |lead: MessagesLead| {
+                messages_head_height(lead) <= room - 2.0 * MESSAGES_LIST_PAD - day + 0.01
+            };
+            let wrapped = lead.title_lines;
+            while lead.title_lines > 1 && !held(lead) {
                 lead.title_lines -= 1;
+            }
+            // AN ENTRY'S HEAD FITS ONE SCREEN WHERE ITS LINES DO: still taller than the room,
+            // it gives up the room under its last line, so a screen holds it whole rather than
+            // a part of it each (its mark, time and one line of title at 2x in a 164x140
+            // window: 140pt over a 132pt list, 132pt without that room).
+            let tight = MessagesLead {
+                trailing_room: false,
+                ..lead
+            };
+            if !held(lead) && held(tight) {
+                lead = tight;
+            } else if !held(lead) {
+                // A HEAD NO SCREEN HOLDS FILLS THE SCREENS IT TAKES: stepped through a screen of
+                // lines at a time, its title takes the lines its last screen has room for, up to
+                // all of them. Cut to one line, the head's last screen showed that line alone
+                // over a line of nothing (2x in a 164x96 window: "aterm…" under each entry's
+                // mark and time, the next entry too tall to start under it).
+                let line_h = messages_line_height();
+                let per = (((room - 2.0 * MESSAGES_LIST_PAD - day) / line_h + 0.01).floor()
+                    as usize)
+                    .max(1);
+                let lines = 1 + lead.when_lines + lead.title_lines;
+                lead = MessagesLead {
+                    title_lines: (lines.div_ceil(per) * per - 1 - lead.when_lines)
+                        .clamp(lead.title_lines, wrapped.max(lead.title_lines)),
+                    ..tight
+                };
             }
         }
         (lead, day)
     };
-    let clock = MessagesClock::of(visible, messages.now_unix_ms, messages.utc_offset_s);
-    let log_clock = MessagesClock::of(&all, messages.now_unix_ms, messages.utc_offset_s);
+    let clock = MessagesClock::of_local(
+        visible,
+        messages.now_unix_ms,
+        messages.utc_offset_s,
+        &offset_for,
+    );
+    let log_clock = MessagesClock::of_local(
+        &all,
+        messages.now_unix_ms,
+        messages.utc_offset_s,
+        &offset_for,
+    );
     let (mut lead, day) = fitted(clock, log_clock);
     // WHERE A DAY'S HEADING CANNOT STAND OVER AN ENTRY, EACH ENTRY SAYS ITS OWN DAY: the log is
     // sectioned by day only where a screen holds an entry under its day (a wide page's list
@@ -40702,7 +41701,8 @@ fn messages_plan_opening(
         heights: Vec::new(),
         body: None,
         clock,
-        sections: clock.sections(visible),
+        entry_offsets: messages.entry_offsets.clone(),
+        sections: clock.sections_local(visible, &offset_for),
         day_h: messages_day_height(),
         talls: Vec::new(),
     };
@@ -40715,10 +41715,11 @@ fn messages_plan_opening(
     plan.body = open
         .and_then(|id| visible.iter().find(|entry| entry.id == id))
         .map(|entry| {
-            let mut body = MessagesBody::of(
+            let mut body = MessagesBody::of_at(
                 entry,
                 body_width,
                 messages.utc_offset_s,
+                messages.offset_for(entry.began_unix_ms),
                 messages.now_unix_ms,
             );
             if messages_head_title(entry, plan.lead, content_width).1 {
@@ -41390,6 +42391,8 @@ fn registry_switch_row(
             insert_before_reset_line(&mut row, detail);
             row.layout.height = Length::Fixed(fixed_height(&row) + detail_height + 4.0);
         }
+        scroll::note_row_width(&row.key, text_width);
+        let row = end_stacked_row(row);
         let height = fixed_height(&row);
         return Some((row, height));
     }
@@ -42370,6 +43373,7 @@ const fn route_subtitle(route: SettingsRoute) -> &'static str {
         | SettingsRoute::Manual
         | SettingsRoute::SoftwareUpdate
         | SettingsRoute::Packages
+        | SettingsRoute::Lab
         | SettingsRoute::Harness
         | SettingsRoute::Ai
         | SettingsRoute::Tabs
@@ -42420,6 +43424,9 @@ use color_picker::{
 
 #[path = "native_settings_harness.rs"]
 mod harness_page;
+
+#[path = "native_settings_lab.rs"]
+mod lab_page;
 
 #[path = "native_settings_ai.rs"]
 pub(crate) mod ai_page;

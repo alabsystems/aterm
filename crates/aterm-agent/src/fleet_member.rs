@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! CLI front-end for `aterm fleet init|join|peers|allow|leave` over [`aterm_net::fleet_member`].
+//! CLI front-end for `aterm fleet init|join|peers|allow|publish|sync|census|name|leave` over
+//! [`aterm_net::fleet_member`].
 
 use std::ffi::OsString;
-use std::io::{self, BufRead as _, IsTerminal as _, Read as _, Write as _};
+use std::io::{self, IsTerminal as _, Read as _, Write as _};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -16,7 +17,7 @@ use aterm_net::fleet::{
 use aterm_net::fleet_member::{
     self as member, Began, BookRead, BookUnread, CODE_FILE, Held, HeldBook, ISSUER_BOOK_FILE,
     JoinCode, Keyring, Leaving, Leveling, NODE_FILE, NODE_KEY_FILE, PEERS_FILE, Peer, Recorded,
-    Registration, Unreached, Unwritten, Via, target_of,
+    Registration, Unreached, Unwritten, Via, automatic_host, target_of,
 };
 use aterm_uds::atomic_file::{ConfigFile, EditLanded};
 use aterm_uds::private_file::ANOTHER_LINK;
@@ -47,6 +48,9 @@ USAGE:
                          member, the book of the member that answered its
                          join too
   aterm fleet peers add <host[:port]> | rm <host[:port]|node>
+  aterm fleet name [set <name>]
+                         show this machine's name, or assign a better primary
+                         name; its automatic node-<id> alias stays valid
   aterm fleet allow facts|content
   aterm fleet allow drive --all | --from <host|node> [--from …]
                          what a peer may do here: read facts or content, or
@@ -159,12 +163,14 @@ fn issuer_read_within() -> Duration {
     seamed_within(ISSUER_WITHIN_SEAM, PEER_CHECK_WITHIN)
 }
 
+const SEAM_WITHIN_MAX_MS: u64 = 86_400_000;
+
 /// The milliseconds the dev seam `seam` names, or `or` where it names none.
 fn seamed_within(seam: &str, or: Duration) -> Duration {
     aterm_types::dev_seam!(seam)
-        .and_then(|ms| ms.to_str()?.trim().parse::<u64>().ok())
+        .and_then(|ms| crate::parse_uint::<u64>(ms.to_str()?.trim()))
         .filter(|&ms| ms > 0)
-        .map_or(or, Duration::from_millis)
+        .map_or(or, |ms| Duration::from_millis(ms.min(SEAM_WITHIN_MAX_MS)))
 }
 
 /// The dev seam that sets [`issuer_read_within`] for a test of the binary.
@@ -219,13 +225,16 @@ pub(crate) fn main_entry(verb: &str, args: &[OsString]) -> ExitCode {
         "init" => init(&places, &args),
         "join" => parse_join(&args).and_then(|opts| {
             let (code, from) = read_code(opts.code_file.as_deref())?;
-            join(&places, &opts, &code).map(|report| report + from.left_behind())
+            let out = join(&places, &opts, &code).map(|report| report + from.left_behind());
+            scrub_string(code);
+            out
         }),
         "peers" => peers(&places, &args),
         "allow" => allow(&places, &args),
         "publish" => publish(&places, &args),
         "sync" => sync(&places, &args),
         "census" => census(&places, &args),
+        "name" => name_machine(&places, &args),
         "leave" => leave(&places, &args),
         _ => Err(Failure::Usage(format!("no such command `{verb}`"))),
     });
@@ -242,6 +251,59 @@ pub(crate) fn main_entry(verb: &str, args: &[OsString]) -> ExitCode {
             eprintln!("aterm fleet {verb}: {why}");
             ExitCode::from(1)
         }
+    }
+}
+
+fn name_machine(places: &Places, args: &[String]) -> Result<String, Failure> {
+    match args {
+        [] => {
+            let node =
+                own_node(places).ok_or_else(|| failed("this machine has no fleet identity yet"))?;
+            let temporary = member::temporary_name(&node);
+            let name = member::read_primary_name(&places.state)
+                .map_err(failed)?
+                .unwrap_or_else(|| temporary.clone());
+            Ok(format!("name={name} alias={temporary} node={node}"))
+        }
+        [verb, name] if verb == "set" => {
+            let name = name.to_ascii_lowercase();
+            if !member::valid_primary_name(&name) {
+                return Err(Failure::Usage("name set takes a name of 1–63 lowercase letters, digits and internal hyphens; node- is reserved for permanent temporary aliases".into()));
+            }
+            let mut notice = String::new();
+            private_state(places, &mut notice)?;
+            let me = member::node_identity(&places.state).map_err(failed)?;
+            let identities = roster_identities(places);
+            if identities.iter().any(|identity| {
+                identity.node.as_deref() != Some(me.node())
+                    && (identity
+                        .label
+                        .as_deref()
+                        .is_some_and(|label| label.eq_ignore_ascii_case(&name))
+                        || identity
+                            .aliases
+                            .iter()
+                            .any(|alias| alias.eq_ignore_ascii_case(&name)))
+            }) {
+                return Err(failed(format!(
+                    "{name} already names another registered machine"
+                )));
+            }
+            member::write_held(&places.state, Began::Here, |_held| {
+                let book = member::read_peers(&places.state).map_err(|e| failed(e.to_string()))?;
+                let others = others_listed(places, &book);
+                if let Some(other) = member::all_named_with(&book, &others, &identities, &name)
+                    .into_iter().find(|peer| peer.node.as_deref() != Some(me.node())) {
+                    return Err(failed(format!("{name} already names {}; use its node alias to disambiguate", other.node.as_deref().unwrap_or(&other.host))));
+                }
+                aterm_uds::private_file::write_private(&places.state, member::NAME_FILE, format!("{name}\n").as_bytes())
+                    .map_err(|e| failed(e.to_string()))?;
+                Ok(format!("{notice}name={name} alias={} node={}; the next fleet heartbeat publishes the signed name", member::temporary_name(me.node()), me.node()))
+            }).map_err(|e| failed(format!("cannot write fleet name: {e}")))?
+        }
+        _ => Err(Failure::Usage(
+            "name takes no arguments, or: name set <name>".into(),
+        )),
     }
 }
 
@@ -370,9 +432,7 @@ fn parse_opts(args: &[String], takes: &[&str], code_words: bool) -> Result<Opts,
             "--allow" => opts.allow = Some(allow_of(&value)?),
             "--port" => {
                 opts.port = Some(
-                    value
-                        .parse::<u16>()
-                        .ok()
+                    crate::parse_uint::<u16>(&value)
                         .filter(|port| *port != 0)
                         .ok_or_else(|| Failure::Usage("--port is 1 to 65535".to_owned()))?,
                 );
@@ -461,30 +521,58 @@ impl CodeFrom {
     }
 }
 
+fn scrub_vec(mut bytes: Vec<u8>) {
+    bytes.resize(bytes.capacity(), 0);
+    aterm_uds::secret::scrub(&mut bytes);
+}
+
+pub(crate) fn scrub_string(s: String) {
+    scrub_vec(s.into_bytes());
+}
+
 fn read_code(code_file: Option<&Path>) -> Result<(String, CodeFrom), Failure> {
     let mut text = String::new();
-    let from = if let Some(path) = code_file {
-        std::fs::File::open(path)
-            .and_then(|file| file.take(CODE_READ_MAX).read_to_string(&mut text))
-            .map_err(|e| failed(format!("the --code-file file: {e}")))?;
-        CodeFrom::File
-    } else if !io::stdin().is_terminal() {
-        io::stdin()
-            .lock()
-            .take(CODE_READ_MAX)
-            .read_to_string(&mut text)
-            .map_err(|e| failed(format!("reading the code on stdin: {e}")))?;
-        CodeFrom::Piped
-    } else {
-        text = read_unshown("Join code (not shown): ")
-            .map_err(|e| failed(format!("reading the code at the terminal: {e}")))?;
-        CodeFrom::Typed
+    let read_result: Result<CodeFrom, Failure> = (|| {
+        if let Some(path) = code_file {
+            astream_sys::open_nonblocking(path, astream_sys::Links::Follow)
+                .and_then(|file| {
+                    if !file.metadata()?.is_file() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "not a regular file",
+                        ));
+                    }
+                    file.take(CODE_READ_MAX).read_to_string(&mut text)
+                })
+                .map_err(|e| failed(format!("the --code-file file: {e}")))?;
+            Ok(CodeFrom::File)
+        } else if !io::stdin().is_terminal() {
+            io::stdin()
+                .lock()
+                .take(CODE_READ_MAX)
+                .read_to_string(&mut text)
+                .map_err(|e| failed(format!("reading the code on stdin: {e}")))?;
+            Ok(CodeFrom::Piped)
+        } else {
+            text = read_unshown("Join code (not shown): ")
+                .map_err(|e| failed(format!("reading the code at the terminal: {e}")))?;
+            Ok(CodeFrom::Typed)
+        }
+    })();
+    let from = match read_result {
+        Ok(from) => from,
+        Err(err) => {
+            scrub_string(text);
+            return Err(err);
+        }
     };
-    text.lines()
+    let picked = text
+        .lines()
         .map(str::trim)
         .find(|line| !line.is_empty())
-        .map(|code| (code.to_owned(), from))
-        .ok_or_else(|| failed("no join code came: pipe it in, or name its file with --code-file"))
+        .map(|code| (code.to_owned(), from));
+    scrub_string(text);
+    picked.ok_or_else(|| failed("no join code came: pipe it in, or name its file with --code-file"))
 }
 
 static UNSHOWN_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
@@ -532,7 +620,11 @@ extern "C" fn restore_and_end(signal: libc::c_int) {
     }
 }
 
-fn read_unshown(prompt: &str) -> io::Result<String> {
+/// One line typed at the controlling terminal after `prompt`, with nothing echoed but its newline
+/// while it reads, the terminal's settings (and SIGINT's disposition) put back however the
+/// program leaves; the line keeps its newline. A join code's prompt, and `aterm members join`'s
+/// phrase prompt.
+pub(crate) fn read_unshown(prompt: &str) -> io::Result<String> {
     use std::os::fd::AsRawFd as _;
     use std::sync::atomic::Ordering;
     struct Restore {
@@ -574,10 +666,11 @@ fn read_unshown(prompt: &str) -> io::Result<String> {
     #[allow(clippy::unnecessary_cast)]
     let saved_lflag = saved.c_lflag as u64;
     let claimed = UNSHOWN_FD
-        .compare_exchange(-1, fd, Ordering::SeqCst, Ordering::SeqCst)
+        .compare_exchange(-1, -2, Ordering::SeqCst, Ordering::SeqCst)
         .is_ok();
     if claimed {
         UNSHOWN_LFLAG.store(saved_lflag, Ordering::SeqCst);
+        UNSHOWN_FD.store(fd, Ordering::SeqCst);
     }
     let interrupt = claimed
         .then(|| {
@@ -607,12 +700,30 @@ fn read_unshown(prompt: &str) -> io::Result<String> {
     }
     tty.write_all(prompt.as_bytes())?;
     tty.flush()?;
-    let mut line = String::new();
-    io::BufReader::new(&tty)
-        .take(CODE_READ_MAX)
-        .read_line(&mut line)?;
+    let mut raw = Vec::with_capacity(128);
+    let mut byte = [0u8; 1];
+    while (raw.len() as u64) < CODE_READ_MAX {
+        match tty.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => {
+                raw.push(byte[0]);
+                byte[0] = 0;
+                if raw.last() == Some(&b'\n') {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => {
+                scrub_vec(raw);
+                return Err(e);
+            }
+        }
+    }
     drop(restore);
-    Ok(line)
+    String::from_utf8(raw).map_err(|bad| {
+        scrub_vec(bad.into_bytes());
+        io::Error::new(io::ErrorKind::InvalidData, "join code is not valid UTF-8")
+    })
 }
 
 fn short(node: &str) -> &str {
@@ -1152,10 +1263,16 @@ fn follows(unserved: Option<&str>, then: &str) -> String {
 /// the state directory holds, the one heard last first.
 fn join_places(places: &Places, opts: &Opts, code: &JoinCode) -> Vec<(String, u16)> {
     let own = member::read_node_id(&places.state).ok().flatten();
+    let (denied, log) = denied_and_log(places);
     let mut book: Vec<Peer> = member::read_peers(&places.state)
         .unwrap_or_default()
         .into_iter()
-        .filter(|peer| peer.via != Via::Manual && peer.node.is_some() && peer.node != own)
+        .filter(|peer| {
+            peer.via != Via::Manual
+                && peer.node.is_some()
+                && peer.node != own
+                && !peer_is_denied_or_held_out(peer, &denied, log.as_deref())
+        })
         .collect();
     book.sort_by_key(|peer| std::cmp::Reverse(peer.seen_ms));
     let mut dials: Vec<(String, u16)> = Vec::new();
@@ -1222,6 +1339,23 @@ fn advertised_places(opts: &Opts, known: &[(String, u16)]) -> Vec<(String, u16)>
     found
 }
 
+fn reserve_fleet_port(host: &str, preferred: Option<u16>) -> io::Result<std::net::TcpListener> {
+    let address = host
+        .parse::<IpAddr>()
+        .ok()
+        .filter(|ip| ip.is_loopback())
+        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    let loopback = address.is_loopback();
+    let port = preferred.unwrap_or_else(|| if loopback { 0 } else { member::default_port() });
+    aterm_uds::kept_out(|| std::net::TcpListener::bind((address, port))).or_else(|error| {
+        if error.kind() == io::ErrorKind::AddrInUse {
+            aterm_uds::kept_out(|| std::net::TcpListener::bind((address, 0)))
+        } else {
+            Err(error)
+        }
+    })
+}
+
 fn join(places: &Places, opts: &Opts, code_text: &str) -> Result<String, Failure> {
     let code = JoinCode::parse(code_text).map_err(failed)?;
     let secret = FleetSecret::new(&code.secret).map_err(failed)?;
@@ -1252,6 +1386,11 @@ fn join(places: &Places, opts: &Opts, code_text: &str) -> Result<String, Failure
     let host = match (opts.host.clone(), first.0.parse::<IpAddr>()) {
         (Some(host), _) => host,
         (None, Ok(ip)) if ip.is_loopback() => ip.to_string(),
+        (None, _) if opts.synced.is_some() => {
+            automatic_host(aterm_secrets::server::route_sources()).ok_or_else(|| {
+                failed("no local LAN address is available yet; automatic fleet joining will retry")
+            })?
+        }
         (None, _) => aterm_uds::process::lan_host_name()
             .filter(|host| member::is_host(host))
             .ok_or_else(|| {
@@ -1263,8 +1402,21 @@ fn join(places: &Places, opts: &Opts, code_text: &str) -> Result<String, Failure
     };
     let config = ConfigFile::open(&places.config).map_err(failed)?;
     let table = fleet_table(text_of(&config)?).map_err(failed)?;
-    // A fleet's members listen on one port: a join's is the member's it dials.
-    let port = opts.port.or_else(|| table.listen_port()).unwrap_or(first.1);
+    // An automatic join keeps its chosen port bound through registration and the
+    // config write. The service takes it over when this call drops the reservation.
+    let reservation = if opts.synced.is_some() && opts.port.is_none() {
+        Some(reserve_fleet_port(&host, table.listen_port()).map_err(|e| failed(e.to_string()))?)
+    } else {
+        None
+    };
+    let port = reservation
+        .as_ref()
+        .map(|listener| listener.local_addr().map(|at| at.port()))
+        .transpose()
+        .map_err(|e| failed(e.to_string()))?
+        .or(opts.port)
+        .or_else(|| table.listen_port())
+        .unwrap_or(first.1);
     // An issuer's own code is refused as its own fleet ([`not_an_issuer`]).
     let issues = !matches!(
         std::fs::symlink_metadata(places.state.join(CODE_FILE)),
@@ -1320,13 +1472,23 @@ fn join(places: &Places, opts: &Opts, code_text: &str) -> Result<String, Failure
         key: None,
         signed: None,
     }
-    .signed_by(&me, aterm_time::unix_millis().unwrap_or_default());
+    .signed_by(&me, aterm_time::unix_millis().unwrap_or_default())
+    .with_primary_name(
+        &me,
+        member::read_primary_name(&places.state)
+            .ok()
+            .flatten()
+            .as_deref(),
+    );
     let keys = Keyring::read(&places.state);
+    let (denied, log) = denied_and_log(places);
     let (joined, at, issuer_key) = match register_with(
         &dials,
         (&secret, &me),
         (&keys, bound.as_ref()),
+        (&denied, log.as_deref()),
         &registration,
+        reservation.is_some(),
         &|| {
             if browsed {
                 Vec::new()
@@ -1744,6 +1906,8 @@ enum JoinFailed {
     OtherKey(String),
     /// It answered as this node, which this machine binds to a key, and proved none.
     Unproved(String),
+    /// It proved or answered as a node the swarm roster or membership log denies.
+    Denied(String),
     /// It was; the machine that answered refused, or answered no join (its words).
     Registration(String),
     /// It was; no answer to the registration came.
@@ -1760,6 +1924,7 @@ impl JoinFailed {
             Self::PlaceHeld { .. }
             | Self::OtherKey(_)
             | Self::Unproved(_)
+            | Self::Denied(_)
             | Self::Registration(_) => false,
         }
     }
@@ -1777,6 +1942,11 @@ impl std::fmt::Display for JoinFailed {
             Self::Unproved(node) => write!(
                 f,
                 "it answered as node {}, which this machine binds to a node key, and proved none",
+                short(node)
+            ),
+            Self::Denied(node) => write!(
+                f,
+                "node {} is denied by the swarm roster or membership log",
                 short(node)
             ),
             Self::PlaceHeld { place, node } => write!(
@@ -1832,7 +2002,7 @@ impl JoinFailed {
     /// shorter word names ([`named_here`]).
     fn bound_node(&self) -> &str {
         match self {
-            Self::OtherKey(node) | Self::Unproved(node) => node,
+            Self::OtherKey(node) | Self::Unproved(node) | Self::Denied(node) => node,
             _ => "<its node>",
         }
     }
@@ -1845,7 +2015,7 @@ impl JoinFailed {
             Self::Registration(words) if words.contains(member::REBIND) => Advice::NodeBound,
             Self::Registration(words) if words.contains(member::OWN_NODE) => Advice::IssuersNode,
             Self::Registration(words) if words.contains(member::MOVED_ON) => Advice::MovedOn,
-            Self::OtherKey(_) | Self::Unproved(_) => Advice::IssuerKey,
+            Self::OtherKey(_) | Self::Unproved(_) | Self::Denied(_) => Advice::IssuerKey,
             Self::Dial(Unreached::NotFleet(_)) => Advice::PastTheLan,
             Self::Dial(e) if e.not_permitted() => Advice::Sandbox,
             Self::Dial(e) if e.no_route() => Advice::LocalNetwork,
@@ -2125,27 +2295,31 @@ fn bound_issuer(
 fn register_with(
     dials: &[(String, u16)],
     (secret, me): (&FleetSecret, &NodeIdentity),
-    (keys, _bound): (&Keyring, Option<&(String, NodeKey)>),
+    (keys, bound): (&Keyring, Option<&(String, NodeKey)>),
+    (denied, log): (&[String], Option<&member::MemberKeys>),
     registration: &Registration,
+    place_reserved: bool,
     more: &dyn Fn() -> Vec<(String, u16)>,
 ) -> Result<(member::Joined, IpAddr, Option<NodeKey>), JoinFailed> {
     // Only another node's proof there is evidence the place is taken: nothing answering, another
     // secret or this machine's own listener registers as before.
-    if let Ok(there) = member::dial(
-        &registration.host,
-        None,
-        registration.port,
-        (secret, Some(me)),
-        FleetOp::Book,
-        peer_read_within(),
-    ) && let Some(other) = there.peer.filter(|proof| proof.node != me.node())
+    if !place_reserved
+        && let Ok(there) = member::dial(
+            &registration.host,
+            None,
+            registration.port,
+            (secret, Some(me)),
+            FleetOp::Book,
+            peer_read_within(),
+        )
+        && let Some(other) = there.peer.filter(|proof| proof.node != me.node())
     {
         return Err(JoinFailed::PlaceHeld {
             place: member::host_port(&registration.host, registration.port),
             node: other.node,
         });
     }
-    let started = Instant::now();
+    let deadline = after_now(join_within());
     // The first place's failure is the one the report names: the place named, or heard last.
     let mut first = None;
     // The places it knows, then, once none of them answered, those members advertise.
@@ -2155,14 +2329,15 @@ fn register_with(
         .next()
         .or_else(|| advertised.get_or_insert_with(|| more().into_iter()).next())
     {
-        let left = (started + join_within()).saturating_duration_since(Instant::now());
+        let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() && first.is_some() {
             break;
         }
         match register_at(
             (host.as_str(), port),
             (secret, me),
-            keys,
+            (keys, bound),
+            (denied, log),
             registration,
             left,
         ) {
@@ -2186,18 +2361,29 @@ fn register_with(
 fn register_at(
     (host, port): (&str, u16),
     (secret, me): (&FleetSecret, &NodeIdentity),
-    keys: &Keyring,
+    (keys, bound): (&Keyring, Option<&(String, NodeKey)>),
+    (denied, log): (&[String], Option<&member::MemberKeys>),
     registration: &Registration,
     within: Duration,
 ) -> Result<(member::Joined, IpAddr, Option<NodeKey>), JoinFailed> {
+    let bound_key = |node: &str| {
+        keys.bound(node)
+            .or_else(|| bound.filter(|(n, _)| n == node).map(|(_, k)| *k))
+    };
     let started = Instant::now();
     let within = within.max(Duration::from_secs(1));
     let mut reached = member::dial(host, None, port, (secret, Some(me)), FleetOp::Join, within)
         .map_err(JoinFailed::Dial)?;
-    if let Some(proof) = &reached.peer
-        && keys.bound(&proof.node).is_some_and(|key| key != proof.key)
-    {
-        return Err(JoinFailed::OtherKey(proof.node.clone()));
+    if let Some(proof) = &reached.peer {
+        if aterm_net::fleet::is_denied_node(&proof.node, denied)
+            || aterm_net::fleet::is_denied_key(&proof.key, denied)
+            || log.is_some_and(|log| log.holds_out(&proof.key))
+        {
+            return Err(JoinFailed::Denied(proof.node.clone()));
+        }
+        if bound_key(&proof.node).is_some_and(|key| key != proof.key) {
+            return Err(JoinFailed::OtherKey(proof.node.clone()));
+        }
     }
     let deadline = started
         .checked_add(within)
@@ -2208,6 +2394,9 @@ fn register_at(
             member::Unregistered::Answered(why) => JoinFailed::Registration(why),
             member::Unregistered::Unanswered(why) => JoinFailed::Unanswered(why),
         })?;
+    if aterm_net::fleet::is_denied_node(&joined.issuer.node, denied) {
+        return Err(JoinFailed::Denied(joined.issuer.node));
+    }
     let key = match &reached.peer {
         Some(proof) if proof.node == joined.issuer.node => Some(proof.key),
         Some(proof) => {
@@ -2217,7 +2406,7 @@ fn register_at(
                 short(&proof.node)
             )));
         }
-        None if keys.bound(&joined.issuer.node).is_some() => {
+        None if bound_key(&joined.issuer.node).is_some() => {
             return Err(JoinFailed::Unproved(joined.issuer.node));
         }
         None => None,
@@ -2901,11 +3090,19 @@ fn known_peers(places: &Places) -> Result<Known, Failure> {
 }
 
 fn issuer_copies(places: &Places, book: &[Peer]) -> Vec<Peer> {
-    book.iter()
-        .find(|peer| peer.via == Via::Issuer)
-        .and_then(|issuer| issuer.node.as_deref())
-        .map(|issuer| member::read_issuer_book(&places.state, issuer))
-        .unwrap_or_default()
+    let Some(issuer) = book.iter().find(|peer| peer.via == Via::Issuer) else {
+        return Vec::new();
+    };
+    let Some(issuer_node) = issuer.node.as_deref() else {
+        return Vec::new();
+    };
+    let (denied, log) = denied_and_log(places);
+    if peer_is_denied_or_held_out(issuer, &denied, log.as_deref()) {
+        return Vec::new();
+    }
+    let mut copies = member::read_issuer_book(&places.state, issuer_node);
+    copies.retain(|copy| !peer_is_denied_or_held_out(copy, &denied, log.as_deref()));
+    copies
 }
 
 fn manual_peer(host: String, port: u16) -> Peer {
@@ -3494,6 +3691,36 @@ fn vault_paths_for(places: &Places) -> Option<aterm_secrets::client::Paths> {
     None
 }
 
+fn denied_and_log(places: &Places) -> (Vec<String>, Option<std::sync::Arc<member::MemberKeys>>) {
+    let vault_paths = vault_paths_for(places);
+    let denied = vault_paths
+        .as_ref()
+        .and_then(|paths| {
+            aterm_secrets::client::swarm_denied_nodes(paths)
+                .ok()
+                .flatten()
+        })
+        .unwrap_or_default();
+    let log = vault_paths
+        .as_ref()
+        .and_then(|paths| crate::fleet_log::LocalLog::of(paths).keys());
+    (denied, log)
+}
+
+fn peer_is_denied_or_held_out(
+    peer: &Peer,
+    denied: &[String],
+    log: Option<&member::MemberKeys>,
+) -> bool {
+    peer.node
+        .as_deref()
+        .is_some_and(|node| aterm_net::fleet::is_denied_node(node, denied))
+        || peer.key.is_some_and(|key| {
+            aterm_net::fleet::is_denied_key(&key, denied)
+                || log.is_some_and(|log| log.holds_out(&key))
+        })
+}
+
 /// Swarm-roster [`member::PeerIdentity`] rows from the locally applied vault copy, if any.
 fn roster_identities(places: &Places) -> Vec<member::PeerIdentity> {
     let Some(paths) = vault_paths_for(places) else {
@@ -3502,22 +3729,20 @@ fn roster_identities(places: &Places) -> Vec<member::PeerIdentity> {
     let Ok(Some(mut roster)) = aterm_secrets::client::swarm_roster(&paths) else {
         return Vec::new();
     };
+    let log = crate::fleet_log::LocalLog::of(&paths).keys();
     let own_id = own_identity(places);
     let bound = member::bound_peers(&places.state);
     std::mem::take(&mut roster.members)
         .into_iter()
         .filter_map(|member| {
-            let label_denied = roster.is_label_denied(&member.label)
-                || (!member.vault_name.is_empty() && roster.is_label_denied(&member.vault_name))
-                || member.aliases.iter().any(|a| roster.is_label_denied(a));
-            if label_denied {
+            if roster.is_member_denied(&member) {
                 return None;
             }
-            if member
-                .node_key
-                .as_deref()
-                .is_some_and(|k| roster.is_node_denied(k))
-            {
+            if member.node_key.as_deref().is_some_and(|k| {
+                roster.is_node_denied(k)
+                    || NodeKey::from_hex(&k.trim().to_ascii_lowercase())
+                        .is_some_and(|key| log.as_ref().is_some_and(|log| log.holds_out(&key)))
+            }) {
                 return None;
             }
             let node = member.node_id.or_else(|| {
@@ -3538,7 +3763,9 @@ fn roster_identities(places: &Places) -> Vec<member::PeerIdentity> {
             if node.as_deref().is_some_and(|n| roster.is_node_denied(n)) {
                 return None;
             }
-            let vault_name = (!member.vault_name.is_empty()).then_some(member.vault_name);
+            let vault_name = (!member.vault_name.is_empty()
+                && !roster.is_label_denied(&member.vault_name))
+            .then_some(member.vault_name);
             let host = if node.is_none() {
                 vault_name.clone()
             } else {
@@ -3561,7 +3788,8 @@ fn roster_identities(places: &Places) -> Vec<member::PeerIdentity> {
 }
 
 /// This machine's own node, where `word` names it ([`member::names_node`]). Also matches `[fleet]
-/// machine` in aterm.toml and this machine's non-denied swarm roster label or alias.
+/// machine` in aterm.toml, the locally assigned primary name, and this machine's non-denied
+/// swarm roster label or alias.
 fn names_this_machine(places: &Places, word: &str) -> Option<String> {
     let own = own_node(places)?;
     if member::names_node(&own, word) {
@@ -3584,6 +3812,13 @@ fn names_this_machine(places: &Places, word: &str) -> Option<String> {
         .is_some_and(|roster| roster.is_label_denied(word));
     if denied_by_roster {
         return None;
+    }
+    if member::read_primary_name(&places.state)
+        .ok()
+        .flatten()
+        .is_some_and(|name| name.eq_ignore_ascii_case(word))
+    {
+        return Some(own);
     }
     if roster_identities(places).iter().any(|id| {
         id.node
@@ -3662,34 +3897,22 @@ fn keep_book(
     (reads, read): (&[member::PeerRead], &BookRead),
     own: Option<&str>,
 ) -> Option<String> {
-    let vault_paths = vault_paths_for(places);
-    let log = vault_paths
-        .as_ref()
-        .and_then(|paths| crate::fleet_log::LocalLog::of(paths).keys());
-    let denied = vault_paths
-        .as_ref()
-        .and_then(|paths| {
-            aterm_secrets::client::swarm_denied_nodes(paths)
-                .ok()
-                .flatten()
-        })
-        .unwrap_or_default();
+    let (denied, log) = denied_and_log(places);
     let checked_peers: Vec<Peer> = reads.iter().map(|r| r.peer.clone()).collect();
     member::prune_pushed_facts(&places.state, &checked_peers, &denied, log.as_deref());
+    let issuer_denied = |issuer_node: &str| {
+        aterm_net::fleet::is_denied_node(issuer_node, &denied)
+            || reads.iter().any(|r| {
+                (r.peer.via == Via::Issuer || r.peer.node.as_deref() == Some(issuer_node))
+                    && peer_is_denied_or_held_out(&r.peer, &denied, log.as_deref())
+            })
+    };
     let copy = match read {
+        BookRead::Fetched(book) if issuer_denied(&book.node) => Some(None),
         BookRead::Fetched(book) => {
             member::prune_pushed_facts(&places.state, &book.peers, &denied, log.as_deref());
             let mut copies = member::copies_of(book, own);
-            copies.retain(|copy| {
-                !copy
-                    .node
-                    .as_deref()
-                    .is_some_and(|node| aterm_net::fleet::is_denied_node(node, &denied))
-                    && !copy.key.is_some_and(|key| {
-                        aterm_net::fleet::is_denied_key(&key, &denied)
-                            || log.as_ref().is_some_and(|log| log.holds_out(&key))
-                    })
-            });
+            copies.retain(|copy| !peer_is_denied_or_held_out(copy, &denied, log.as_deref()));
             Some(Some((book.node.as_str(), copies)))
         }
         BookRead::Refused(_) | BookRead::NoIssuer => Some(None),
@@ -3699,7 +3922,8 @@ fn keep_book(
     if copy.is_none() && answers.is_empty() {
         return None;
     }
-    let proven = matches!(read, BookRead::Fetched(book) if book.proven);
+    let proven =
+        matches!(read, BookRead::Fetched(book) if book.proven && !issuer_denied(&book.node));
     at_step("keep");
     member::write_held(
         &places.state,
@@ -3832,6 +4056,9 @@ fn book_note(peers: &[Peer], read: &BookRead) -> Option<String> {
 }
 
 fn shown_name(peer: &Peer) -> String {
+    if let Some(name) = peer.primary_name() {
+        return name.to_owned();
+    }
     if peer.port == member::default_port() {
         peer.host.clone()
     } else {
@@ -3878,8 +4105,8 @@ fn list_peers(places: &Places, within: Duration) -> Result<String, Failure> {
     let mut answered_ms = None;
     let mut last_answers = Vec::new();
     out.push_str(&format!(
-        "  {:<8}  {:<11}  {:<23}  {:<21}  {:<15}  {:<7}  {:<8}  CHECK\n",
-        "NODE", "VIA", "HOST", "ADDRESS", "VERSION", "JOINED", "KEY"
+        "  {:<8}  {:<11}  {:<23}  {:<21}  {:<15}  {:<7}  {:<8}  {:<37}  CHECK\n",
+        "NODE", "VIA", "HOST", "ADDRESS", "VERSION", "JOINED", "KEY", "NAME"
     ));
     for row in &listing.rows {
         let peer = &row.peer;
@@ -3930,7 +4157,7 @@ fn list_peers(places: &Places, within: Duration) -> Result<String, Failure> {
             }
         };
         out.push_str(&format!(
-            "  {:<8}  {:<11}  {:<23}  {:<21}  {:<15}  {:<7}  {:<8}  {check}\n",
+            "  {:<8}  {:<11}  {:<23}  {:<21}  {:<15}  {:<7}  {:<8}  {:<37}  {check}\n",
             peer.node.as_deref().map_or("-", short),
             if row.configured.is_some() {
                 "config"
@@ -3949,20 +4176,25 @@ fn list_peers(places: &Places, within: Duration) -> Result<String, Failure> {
                 (Some(_), None) => "unbound".to_owned(),
                 (None, None) => "-".to_owned(),
             },
+            peer.primary_name()
+                .map(str::to_owned)
+                .or_else(|| peer.node.as_deref().map(member::temporary_name))
+                .unwrap_or_else(|| "-".into()),
         ));
     }
-    let offset_s = i64::try_from(now_ms / 1000)
-        .ok()
-        .and_then(aterm_uds::zone::local_offset_at);
     if let Some(away) = away_words(
         (reached, unreached),
         (last_heard_ms, answered_ms),
         now_ms,
-        offset_s,
+        aterm_uds::zone::local_offset_at,
     ) {
         out.push_str(&away);
     }
-    out.push_str(&last_answer_words(&last_answers, now_ms, offset_s));
+    out.push_str(&last_answer_words(
+        &last_answers,
+        now_ms,
+        aterm_uds::zone::local_offset_at,
+    ));
     if no_route > 0 && no_route == unreached {
         out.push_str(
             "Every peer not reached had no route: on a Mac that is local-network privacy, \
@@ -4262,13 +4494,13 @@ fn in_aterm_toml(places: &Places, entry: &str) -> String {
 /// `unreached`): this machine is away from every member, and the last this book heard of one
 /// (`last_heard_ms`, the newest `seen_ms` of those dialled, a register or heartbeat it took);
 /// then, where [`member::ANSWERED_FILE`] holds one, since when (`answered_ms`, the newest time a
-/// member not answering now last answered this machine). Each time is a clock at `offset_s`
-/// east of UTC (UTC when the zone is unknown) and an age at `now_ms`.
+/// member not answering now last answered this machine). Each clock uses the local offset at
+/// that event (UTC when the zone is unknown), and each age uses `now_ms`.
 fn away_words(
     (reached, unreached): (usize, usize),
     (last_heard_ms, answered_ms): (Option<u64>, Option<u64>),
     now_ms: u64,
-    offset_s: Option<i64>,
+    mut local_offset_at: impl FnMut(i64) -> Option<i64>,
 ) -> Option<String> {
     if reached > 0 || unreached == 0 {
         return None;
@@ -4283,7 +4515,7 @@ fn away_words(
         |ms| {
             format!(
                 "the last this book heard of one was at {}",
-                clock_ago(ms, now_ms, offset_s)
+                clock_ago(ms, now_ms, &mut local_offset_at)
             )
         },
     );
@@ -4291,7 +4523,7 @@ fn away_words(
     if let Some(ms) = answered_ms {
         words.push_str(&format!(
             "Away from every member since {}: the last answer one gave this Mac.\n",
-            clock_ago(ms, now_ms, offset_s)
+            clock_ago(ms, now_ms, &mut local_offset_at)
         ));
     }
     Some(words)
@@ -4301,9 +4533,13 @@ fn away_words(
 /// its node's first eight digits, or its place for a peer with no node id, and when it last
 /// answered this machine, [`member::ANSWERED_FILE`]), in the table's order: one line each, which
 /// starts with words no row starts with, so a script that reads the rows reads them as it did.
-/// Each time is a clock at `offset_s` east of UTC (UTC when the zone is unknown) and an age at
-/// `now_ms`.
-fn last_answer_words(last: &[(String, Option<u64>)], now_ms: u64, offset_s: Option<i64>) -> String {
+/// Each clock uses the local offset at that answer (UTC when the zone is unknown), and each
+/// age uses `now_ms`.
+fn last_answer_words(
+    last: &[(String, Option<u64>)],
+    now_ms: u64,
+    mut local_offset_at: impl FnMut(i64) -> Option<i64>,
+) -> String {
     last.iter()
         .map(|(who, ms)| {
             format!(
@@ -4311,17 +4547,18 @@ fn last_answer_words(last: &[(String, Option<u64>)], now_ms: u64, offset_s: Opti
                 aterm_codec::tty::one_line(who, 64),
                 ms.map_or_else(
                     || "none recorded".to_owned(),
-                    |ms| clock_ago(ms, now_ms, offset_s)
+                    |ms| clock_ago(ms, now_ms, &mut local_offset_at)
                 )
             )
         })
         .collect()
 }
 
-/// `ms` (Unix milliseconds) as a clock at `offset_s` east of UTC (`UTC` said when the zone is
+/// `ms` (Unix milliseconds) as a local clock at that event (`UTC` said when the zone is
 /// unknown) and its age at `now_ms`: `09:00 (2h ago)`.
-fn clock_ago(ms: u64, now_ms: u64, offset_s: Option<i64>) -> String {
+fn clock_ago(ms: u64, now_ms: u64, mut local_offset_at: impl FnMut(i64) -> Option<i64>) -> String {
     let at = i64::try_from(ms).unwrap_or(i64::MAX);
+    let offset_s = local_offset_at(at / 1000);
     format!(
         "{}{} ({} ago)",
         crate::supervise::occupancy::said::clock_words(at, offset_s.unwrap_or(0)),
@@ -5507,7 +5744,7 @@ fn leave(places: &Places, args: &[String]) -> Result<String, Failure> {
         leave_within_node(
             places,
             home.as_deref(),
-            Some(&crate::node_service::LiveSupervisor),
+            Some(crate::node_service::supervisor_here()),
             PEER_CHECK_WITHIN,
         )
     }
@@ -5524,7 +5761,7 @@ fn leave_within(places: &Places, within: Duration) -> Result<String, Failure> {
 }
 
 /// [`leave_within`], also removing `systems.alab.aterm-node` under `home` via `supervisor` when
-/// provided (C20).
+/// provided (C20), once the book's lock is let go.
 fn leave_within_node(
     places: &Places,
     node_home: Option<&Path>,
@@ -5650,17 +5887,26 @@ fn leave_within_node(
             left = true;
         }
         at_step("unlisten");
-        if let Some((home, sup)) = node_home.zip(node_supervisor)
-            && let Some(unit) =
-                crate::node_service::remove_with(home, &places.state, false, sup).map_err(failed)?
-        {
-            out.push_str(&format!("  removed    {} (the node job)\n", unit.display()));
-            left = true;
-        }
         Ok(())
     })
     .map_err(failed)?
     .inspect_err(|_| say(&out))?;
+    // Outside the book's lock, which covers one read-modify-write: the job's stop waits on launchd
+    // and its exit. Recheck absence under node-admin before stopping: a new join may already have
+    // started a node for its fleet since this leave released the book.
+    if let Some((home, sup)) = node_home.zip(node_supervisor) {
+        match crate::node_service::remove_after_fleet_leave_with(home, &places.state, sup) {
+            Ok(Some(unit)) => {
+                out.push_str(&format!("  removed    {} (the node job)\n", unit.display()));
+                left = true;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                say(&out);
+                return Err(failed(e));
+            }
+        }
+    }
     if !left {
         return Ok(format!(
             "aterm fleet leave: this machine is in no fleet\n{out}"
@@ -5979,6 +6225,22 @@ fn drive_fleet_in(
             });
         }
     };
+    if let Some(node) = peer.node.as_deref() {
+        let (denied, log) = denied_and_log(places);
+        let peer_key = peer.key.or_else(|| keys.bound(node));
+        if aterm_net::fleet::is_denied_node(node, &denied)
+            || peer_key.is_some_and(|key| {
+                aterm_net::fleet::is_denied_key(&key, &denied)
+                    || log.as_ref().is_some_and(|log| log.holds_out(&key))
+            })
+        {
+            return Err(aterm_ctl::DriveRefused::once(format!(
+                "`{shown}` is node {}, which the swarm roster or membership log denies: a \
+                 revoked node may not be driven",
+                short(node)
+            )));
+        }
+    }
     let label = shown_name(&peer);
     let driven =
         member::drive(&target_of(&peer), &keys, (&secret, &me), deadline).map_err(|why| {
@@ -6103,32 +6365,20 @@ fn copy_again(
     }) else {
         return Ok(false);
     };
+    let (denied, log) = denied_and_log(places);
+    if peer_is_denied_or_held_out(&issuer, &denied, log.as_deref()) {
+        let _ = member::keep_issuer_book(&places.state, secret, None);
+        return Ok(false);
+    }
     let book = member::fetch_book(&target_of(&issuer), (secret, me), deadline)
         .map_err(|why| Missed::of(&why))?;
-    let vault_paths = vault_paths_for(places);
-    let log = vault_paths
-        .as_ref()
-        .and_then(|paths| crate::fleet_log::LocalLog::of(paths).keys());
-    let denied = vault_paths
-        .as_ref()
-        .and_then(|paths| {
-            aterm_secrets::client::swarm_denied_nodes(paths)
-                .ok()
-                .flatten()
-        })
-        .unwrap_or_default();
     member::prune_pushed_facts(&places.state, &book.peers, &denied, log.as_deref());
+    if aterm_net::fleet::is_denied_node(&book.node, &denied) {
+        let _ = member::keep_issuer_book(&places.state, secret, None);
+        return Ok(false);
+    }
     let mut copies = member::copies_of(&book, own.as_deref());
-    copies.retain(|copy| {
-        !copy
-            .node
-            .as_deref()
-            .is_some_and(|node| aterm_net::fleet::is_denied_node(node, &denied))
-            && !copy.key.is_some_and(|key| {
-                aterm_net::fleet::is_denied_key(&key, &denied)
-                    || log.as_ref().is_some_and(|log| log.holds_out(&key))
-            })
-    });
+    copies.retain(|copy| !peer_is_denied_or_held_out(copy, &denied, log.as_deref()));
     Ok(book.proven
         && member::keep_issuer_book(&places.state, secret, Some((&book.node, &copies)))
             .unwrap_or(false))

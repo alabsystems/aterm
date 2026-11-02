@@ -306,9 +306,10 @@ fn install_inner(
     cask: &Cask,
     dry_run: bool,
     force: bool,
-    // Kept for the install/upgrade/reinstall caller shape; an
-    // outdated install is replaced whichever verb brought us here.
-    _upgrade: bool,
+    // An outdated install is replaced whichever verb brought us
+    // here; `upgrade` only says the command layer already printed
+    // brew's Upgrading headline.
+    upgrade: bool,
     reinstall: bool,
     on_request: bool,
 ) -> Result<String, InstallError> {
@@ -331,6 +332,7 @@ fn install_inner(
     }
     let mut replacing = false;
     let mut same_version_reinstall = false;
+    let mut old_version: Option<String> = None;
     let mut effective_on_request = on_request;
     if let Some(inst) = prefix.installed_one(Kind::Cask, &cask.token) {
         if let Some(old) = super::prefix::receipt_word(
@@ -349,6 +351,7 @@ fn install_inner(
             // (its "Not upgrading" notice below is the current case),
             // preserving the receipt's on-request intent read above.
             replacing = true;
+            old_version = Some(inst.version.clone());
         } else if force || reinstall {
             return Err(InstallError::Unsupported(format!(
                 "replacement of cask {} needs brew",
@@ -506,13 +509,50 @@ fn install_inner(
         }
         extract_nested_tars(&payload, &artifacts, &cask.token)?;
     }
-    println!(
-        "{}",
-        super::tty::oh1(&format!(
-            "Installing Cask {}",
-            super::tty::ident(&cask.token)
-        ))
-    );
+    if let Some(old) = &old_version {
+        // Brew routes an outdated cask through its upgrade flow:
+        // an Upgrading headline (printed by the upgrade command
+        // itself, so only narrated here on the install path), the
+        // old artifacts backed up and removed, then the new ones.
+        if !upgrade {
+            println!(
+                "{}",
+                super::tty::oh1(&format!("Upgrading {}", super::tty::ident(&cask.token)))
+            );
+            println!("  {old} -> {}", cask.version);
+        }
+        if let Ok(Some(destinations)) =
+            recorded_artifacts(prefix, &prefix.cask_dir(&cask.token, old))
+        {
+            narrate_recorded_removal(prefix, &destinations);
+        }
+    } else {
+        if same_version_reinstall {
+            // Brew's reinstall uninstalls the existing cask first:
+            // headline, artifact removal, purge, then the install.
+            println!(
+                "{}",
+                super::tty::oh1(&format!(
+                    "Uninstalling Cask {}",
+                    super::tty::ident(&cask.token)
+                ))
+            );
+            if let Ok(Some(destinations)) = recorded_artifacts(prefix, &staged) {
+                narrate_recorded_removal(prefix, &destinations);
+            }
+            println!(
+                "==> Purging files for version {} of Cask {}",
+                cask.version, cask.token
+            );
+        }
+        println!(
+            "{}",
+            super::tty::oh1(&format!(
+                "Installing Cask {}",
+                super::tty::ident(&cask.token)
+            ))
+        );
+    }
     stage_wrappers(prefix, cask, &payload, &staged)?;
     for (relative, _, app, exec) in &artifacts {
         let src = payload.join(relative);
@@ -602,6 +642,18 @@ fn install_inner(
         )?;
     } else {
         publish_payload(prefix, &payload, &staged, &links)?;
+    }
+    if let Some(old) = &old_version {
+        // Brew's upgrade finalizes by purging the predecessor's
+        // staged files; the new links already point at the new
+        // staged path, so the old directory can go.
+        println!("==> Purging files for version {old} of Cask {}", cask.token);
+        let old_dir = prefix.cask_dir(&cask.token, old);
+        match std::fs::remove_dir_all(&old_dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("abrew: {e}").into()),
+        }
     }
     prefix.rebuild_state()?;
     let verb = if replacing && !same_version_reinstall {
@@ -716,6 +768,37 @@ fn recorded_artifact_paths(
 }
 
 /// Missing, unreadable and malformed receipts are not an absent restriction.
+/// Brew's per-artifact removal narration for recorded destinations:
+/// moved artifacts are backed up to their staged path, then every
+/// artifact is removed or unlinked.
+fn narrate_recorded_removal(prefix: &Prefix, destinations: &BTreeSet<PathBuf>) {
+    for dst in destinations {
+        if std::fs::symlink_metadata(dst).is_err() {
+            continue;
+        }
+        let (label, linked) = destination_label(prefix, dst);
+        if !linked && let Ok(target) = std::fs::read_link(dst) {
+            let joined = if target.is_absolute() {
+                target.clone()
+            } else {
+                dst.parent()
+                    .map_or_else(|| target.clone(), |p| p.join(&target))
+            };
+            let source = std::fs::canonicalize(&joined).unwrap_or(joined);
+            let base = dst
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            println!("==> Backing up {label} '{base}' to '{}'", source.display());
+        }
+        println!(
+            "==> {} {label} '{}'",
+            if linked { "Unlinking" } else { "Removing" },
+            dst.display()
+        );
+    }
+}
+
 fn recorded_artifacts(
     prefix: &Prefix,
     payload: &Path,
@@ -810,7 +893,7 @@ pub(super) fn fetch_git_raw(
     for (source, url) in plan {
         let dest = prefix.cache().join(format!("{}-{}", cask.token, source));
         fetch::curl_to_file(url, &dest, &[])?;
-        let head = std::fs::read(&dest).map_err(|e| format!("abrew: {e}"))?;
+        let head = crate::metadata_io::read_head(&dest, 64).map_err(|e| format!("abrew: {e}"))?;
         if head.starts_with(b"version https://git-lfs.github.com") {
             let _ = std::fs::remove_file(&dest);
             return Err(InstallError::Unsupported(format!(
@@ -886,7 +969,7 @@ fn artifact_source(a: &Artifact) -> Option<&str> {
 /// (or delegated) instead, like brew's container autodetect.
 fn archive_magic(path: &Path) -> bool {
     use std::io::Read;
-    let Ok(mut f) = std::fs::File::open(path) else {
+    let Ok(mut f) = crate::metadata_io::open_regular(path) else {
         return false;
     };
     let mut magic = [0u8; 6];
@@ -1420,7 +1503,54 @@ pub fn uninstall(
     cask: Option<&super::formula::Cask>,
 ) -> Result<(), InstallError> {
     let directories = artifact_directories(prefix, PathBuf::from("/Applications"))?;
-    uninstall_from(prefix, token, dry_run, &directories, cask)
+    uninstall_from(prefix, token, dry_run, &directories, cask, &BTreeSet::new())
+}
+
+/// The destinations `token`'s installed receipts record that
+/// `new_cask` would also install, with brew's artifact display
+/// (`Caffeine.app (App)`): the shared set a cask migration keeps.
+pub(super) fn migration_shared_artifacts(
+    prefix: &Prefix,
+    token: &str,
+    new_cask: &super::formula::Cask,
+) -> Result<Vec<(PathBuf, String)>, InstallError> {
+    let Some(inst) = prefix.installed_one(Kind::Cask, token) else {
+        return Ok(Vec::new());
+    };
+    let mut recorded: BTreeSet<PathBuf> = BTreeSet::new();
+    for version in &inst.versions {
+        if let Some(paths) = recorded_artifacts(prefix, &prefix.cask_dir(token, version))? {
+            recorded.extend(paths);
+        }
+    }
+    let new_destinations: BTreeSet<PathBuf> = artifact_paths(prefix, new_cask)?
+        .into_iter()
+        .map(|(_, destination, _, _)| destination)
+        .collect();
+    Ok(recorded
+        .intersection(&new_destinations)
+        .map(|destination| {
+            let (label, _) = destination_label(prefix, destination);
+            let base = destination
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            (destination.clone(), format!("{base} ({label})"))
+        })
+        .collect())
+}
+
+/// Migration's uninstall of the old cask: receipt-driven like an
+/// ordinary uninstall, minus the stanza directives (the old
+/// definition is renamed away) and minus shared destinations
+/// the new cask installs too.
+pub(super) fn uninstall_for_migration(
+    prefix: &Prefix,
+    token: &str,
+    keep: &BTreeSet<PathBuf>,
+) -> Result<(), InstallError> {
+    let directories = artifact_directories(prefix, PathBuf::from("/Applications"))?;
+    uninstall_from(prefix, token, false, &directories, None, keep)
 }
 
 /// Legacy unrecorded artifacts used these roots.
@@ -1839,6 +1969,8 @@ pub fn zap(
             );
         }
         plan.apply(prefix)?;
+    } else if prefix.cask_pin_link_present(token) {
+        prefix.unpin_cask(token)?;
     }
     zap_rmdir(prefix, &cask.uninstall_rmdir);
     zap_rmdir(prefix, &cask.zap_rmdir);
@@ -1855,6 +1987,7 @@ fn uninstall_from(
     dry_run: bool,
     directories: &[PathBuf],
     cask: Option<&super::formula::Cask>,
+    keep: &BTreeSet<PathBuf>,
 ) -> Result<(), InstallError> {
     let Some(inst) = prefix.installed_one(Kind::Cask, token) else {
         return Err(InstallError::Failed(format!(
@@ -1865,7 +1998,8 @@ fn uninstall_from(
         println!("Would uninstall cask {token}");
         return Ok(());
     }
-    let plan = UninstallPlan::prepare(prefix, token, &inst.versions, directories)?;
+    let mut plan = UninstallPlan::prepare(prefix, token, &inst.versions, directories)?;
+    plan.links.retain(|path, _| !keep.contains(path));
     println!(
         "{}",
         super::tty::oh1(&format!("Uninstalling Cask {}", super::tty::ident(token)))
@@ -2095,6 +2229,9 @@ impl UninstallPlan {
             self.check_link(prefix, link)?;
             std::fs::remove_file(link).map_err(|e| format!("abrew: {e}"))?;
         }
+        if prefix.cask_pin_link_present(&self.token) {
+            prefix.unpin_cask(&self.token)?;
+        }
         for version in self.payloads.keys() {
             self.check_payload(prefix, version)?;
             std::fs::remove_dir_all(self.base.join(version)).map_err(|e| format!("abrew: {e}"))?;
@@ -2160,6 +2297,9 @@ mod tests {
         ));
     }
 
+    /// Unix only: abrew tells a cask directory's identity only there
+    /// (`install::same_path_identity`), so elsewhere every removal is refused.
+    #[cfg(unix)]
     #[test]
     fn uninstall_runs_stanza_trash_and_deferred_rmdir() {
         let tmp = aterm_tempfile::TempDir::new().unwrap();
@@ -2196,10 +2336,26 @@ mod tests {
         };
         let directories = [prefix.applications(), prefix.bin()];
         // Dry run: nothing is touched.
-        uninstall_from(&prefix, "demo", true, &directories, Some(&cask)).unwrap();
+        uninstall_from(
+            &prefix,
+            "demo",
+            true,
+            &directories,
+            Some(&cask),
+            &BTreeSet::new(),
+        )
+        .unwrap();
         assert!(payload.exists());
         assert!(leftover.is_dir());
-        uninstall_from(&prefix, "demo", false, &directories, Some(&cask)).unwrap();
+        uninstall_from(
+            &prefix,
+            "demo",
+            false,
+            &directories,
+            Some(&cask),
+            &BTreeSet::new(),
+        )
+        .unwrap();
         assert!(!payload.exists());
         assert!(
             !leftover.exists(),
@@ -3430,7 +3586,9 @@ mod tests {
         assert_eq!(std::fs::read(&artifact).unwrap(), b"owned payload");
         std::fs::remove_file(&man).unwrap();
         let directories = [prefix.applications(), prefix.bin(), local_applications];
-        assert!(uninstall_from(&prefix, "demo", false, &directories, None).is_err());
+        assert!(
+            uninstall_from(&prefix, "demo", false, &directories, None, &BTreeSet::new()).is_err()
+        );
         assert_eq!(std::fs::read(&artifact).unwrap(), b"owned payload");
         assert_eq!(
             std::fs::read_link(&external_link).unwrap(),
@@ -3444,14 +3602,16 @@ mod tests {
         assert!(payload.join("INSTALL_RECEIPT.json").is_file());
         std::fs::remove_file(prefix.bin()).unwrap();
         std::fs::write(prefix.bin(), b"foreign root file").unwrap();
-        assert!(uninstall_from(&prefix, "demo", false, &directories, None).is_err());
+        assert!(
+            uninstall_from(&prefix, "demo", false, &directories, None, &BTreeSet::new()).is_err()
+        );
         assert_eq!(std::fs::read(&artifact).unwrap(), b"owned payload");
         assert_eq!(std::fs::read(prefix.bin()).unwrap(), b"foreign root file");
         std::fs::remove_file(prefix.bin()).unwrap();
         std::fs::create_dir(prefix.bin()).unwrap();
         let foreign = prefix.bin().join("foreign");
         super::super::prefix::symlink_file(&outside.join("marker"), &foreign).unwrap();
-        uninstall_from(&prefix, "demo", false, &directories, None).unwrap();
+        uninstall_from(&prefix, "demo", false, &directories, None, &BTreeSet::new()).unwrap();
         assert!(std::fs::symlink_metadata(&artifact).is_err());
         assert!(!payload.exists());
         assert_eq!(

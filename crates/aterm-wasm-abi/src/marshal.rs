@@ -227,9 +227,9 @@ unsafe fn take_vec<T>(ptr: usize, len: usize) -> Vec<T> {
 #[inline]
 fn give_vec<T>(v: Vec<T>) -> (usize, u32) {
     let b = v.into_boxed_slice();
-    let len = b.len();
+    let len = u32::try_from(b.len()).expect("wasm buffer length exceeds u32::MAX");
     let ptr = Box::into_raw(b).cast::<T>() as usize;
-    (ptr, len as u32)
+    (ptr, len)
 }
 
 /// A string argument's bytes as a `String`.

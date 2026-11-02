@@ -716,9 +716,14 @@ pub fn place_published(
         }
     }
     let range = format!("{commit}..origin/main");
-    let main_ahead = git_ok(git, &["rev-list", "--count", &range])?
-        .stdout_utf8()
-        .trim()
+    let count_out = git_ok(git, &["rev-list", "--count", &range])?.stdout_utf8();
+    let count_trimmed = count_out.trim();
+    if !count_trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(Error::new(format!(
+            "git rev-list --count {range}: invalid count {count_trimmed:?}"
+        )));
+    }
+    let main_ahead = count_trimmed
         .parse::<u64>()
         .map_err(|e| Error::new(format!("git rev-list --count {range}: {e}")))?;
     let tree = place_cut_tree(git, repo, commit)?;
@@ -1018,20 +1023,8 @@ pub fn record_verified(git: &dyn GitRunner, commit: &str, macho_sha256: &str) ->
     };
     let text = aterm_toml::to_string(&record)
         .map_err(|e| Error::new(format!("serialize the verified record: {e}")))?;
-    let dir = path.parent().unwrap_or(&path);
-    let tmp = dir.join(format!(".verified.{}.tmp", std::process::id()));
-    let write = || -> std::io::Result<()> {
-        fs::create_dir_all(dir)?;
-        let mut file = fs::File::create(&tmp)?;
-        std::io::Write::write_all(&mut file, text.as_bytes())?;
-        crate::durable::sync_all(&file)?;
-        fs::rename(&tmp, &path)?;
-        crate::durable::sync_dir(dir)
-    };
-    write().map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        Error::new(format!("write {}: {e}", path.display()))
-    })?;
+    crate::durable::write_atomic_durable(&path, text.as_bytes(), 0o600)
+        .map_err(|e| Error::new(format!("write {}: {e}", path.display())))?;
     Ok(path)
 }
 
@@ -1041,7 +1034,7 @@ pub fn record_verified(git: &dyn GitRunner, commit: &str, macho_sha256: &str) ->
 /// git cannot name the tree, or the record cannot be read at all: no answer either way.
 pub fn verified(git: &dyn GitRunner, commit: &str, macho_sha256: &str) -> Result<(bool, String)> {
     let (path, tree) = verified_path(git, commit)?;
-    let text = match fs::read_to_string(&path) {
+    let text = match crate::durable::read_regular_text(&path, 1024 * 1024) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok((
@@ -2463,6 +2456,9 @@ pub(crate) fn libtest_tally(stdout: &str) -> (usize, usize, Vec<&str>) {
             let (Some(kind), Some(count)) = (words.next(), words.next()) else {
                 continue;
             };
+            if !count.bytes().all(|b| b.is_ascii_digit()) {
+                continue;
+            }
             let Ok(count) = count.parse::<usize>() else {
                 continue;
             };
@@ -2753,6 +2749,7 @@ pub fn disk_gate(repo: &Path) -> Result<u64> {
         .lines()
         .nth(1)
         .and_then(|l| l.split_whitespace().nth(3))
+        .filter(|f| f.bytes().all(|b| b.is_ascii_digit()))
         .and_then(|f| f.parse().ok())
         .ok_or_else(|| Error::new(format!("could not parse df -Pk output:\n{text}")))?;
     let free_gib = avail_kib / (1024 * 1024);

@@ -40,6 +40,24 @@ pub fn marker_at(dir: &Path, name: &str, policy: &Policy) -> Result<Option<Marke
     Ok(one)
 }
 
+/// The device and inode of a directory, without listing it or following links.
+///
+/// # Errors
+/// The path, volume and cloud-placeholder refusals of a walk apply to this
+/// bounded identity check too.
+pub fn directory_identity(dir: &Path, policy: &Policy) -> Result<(u64, u64), Refusal> {
+    let canon = tested(dir, policy)?;
+    #[cfg(unix)]
+    {
+        crate::walk::imp::directory_identity(&canon)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = canon;
+        Err(Refusal::Unsupported)
+    }
+}
+
 /// What each of `names` is inside `dir` through one open of `dir`.
 /// # Errors
 /// The [`Refusal`] `dir` earned before anything was opened, or the open's or a `stat`'s
@@ -50,6 +68,14 @@ pub fn markers_at<const N: usize>(
     policy: &Policy,
 ) -> Result<[Option<Marker>; N], Refusal> {
     let canon = tested(dir, policy)?;
+    for name in names {
+        if !one_name(name) {
+            return Err(Refusal::Relative);
+        }
+        if let Some(why) = refuse_look(None, &canon.join(name), &policy.mounts, &policy.deny) {
+            return Err(why);
+        }
+    }
     #[cfg(unix)]
     {
         use std::os::fd::AsFd as _;
@@ -82,6 +108,12 @@ pub fn markers_at<const N: usize>(
 /// The [`Refusal`] `dir` earned, or the open's.
 pub fn link_target(dir: &Path, name: &str, policy: &Policy) -> Result<Option<PathBuf>, Refusal> {
     let canon = tested(dir, policy)?;
+    if !one_name(name) {
+        return Err(Refusal::Relative);
+    }
+    if let Some(why) = refuse_look(None, &canon.join(name), &policy.mounts, &policy.deny) {
+        return Err(why);
+    }
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd as _;
@@ -90,24 +122,35 @@ pub fn link_target(dir: &Path, name: &str, policy: &Policy) -> Result<Option<Pat
         let Ok(cname) = std::ffi::CString::new(name) else {
             return Ok(None);
         };
-        let mut buf = vec![0u8; 4_096];
-        // SAFETY: `fd` is an open directory, `cname` is NUL-terminated, and the buffer's length bounds the write.
-        let n = unsafe {
-            libc::readlinkat(
-                fd.as_raw_fd(),
-                cname.as_ptr(),
-                buf.as_mut_ptr().cast(),
-                buf.len(),
-            )
-        };
-        if n < 0 {
-            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-            return match errno {
-                libc::EINVAL | libc::ENOENT => Ok(None),
-                e => Err(crate::walk::errno_refusal(e)),
+        let mut cap = 4_096usize;
+        let buf = loop {
+            let mut buf = vec![0u8; cap];
+            // SAFETY: `fd` is an open directory, `cname` is NUL-terminated, and the buffer's length bounds the write.
+            let n = unsafe {
+                libc::readlinkat(
+                    fd.as_raw_fd(),
+                    cname.as_ptr(),
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                )
             };
-        }
-        buf.truncate(usize::try_from(n).unwrap_or(0));
+            if n < 0 {
+                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                return match errno {
+                    libc::EINVAL | libc::ENOENT => Ok(None),
+                    e => Err(crate::walk::errno_refusal(e)),
+                };
+            }
+            let len = usize::try_from(n).unwrap_or(0);
+            if len < buf.len() {
+                buf.truncate(len);
+                break buf;
+            }
+            if cap >= 65_536 {
+                return Err(Refusal::Unreadable(libc::ENAMETOOLONG));
+            }
+            cap = cap.saturating_mul(4).min(65_536);
+        };
         let target = Path::new(std::ffi::OsStr::from_bytes(&buf));
         Ok(Some(lexical_join(&canon, target)))
     }
@@ -176,6 +219,10 @@ pub fn build_dir_above(start: &Path, policy: &Policy) -> Option<PathBuf> {
         }
     }
     profile
+}
+
+fn one_name(name: &str) -> bool {
+    !(name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0'))
 }
 
 fn tested(dir: &Path, policy: &Policy) -> Result<PathBuf, Refusal> {

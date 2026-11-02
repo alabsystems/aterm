@@ -427,6 +427,11 @@ pub struct TurnTracker {
     word: Verdict,
     settle: Option<Settle>,
     interrupted: bool,
+    /// The screen reported the interrupt since the last verdict published to [`Self::observe`]
+    /// (the host reports it with the verdict it reads off the same screen): an approval step that
+    /// verdict closes was declined. Never carried: the host reports it and publishes the verdict
+    /// under one hold of the session's timeline.
+    interrupt_fresh: bool,
     /// A `ctl turn`'s ledger id, its sender, when it arrived and what it
     /// said it acted on (`cause=`): it labels the next turn only when that
     /// turn opens within [`ATTRIBUTION_MS`] and is attributed to the same
@@ -474,6 +479,7 @@ impl TurnTracker {
             word: Verdict::Unknown,
             settle: None,
             interrupted: false,
+            interrupt_fresh: false,
             pending_ledger: None,
             last_input: None,
             last_close: None,
@@ -513,6 +519,7 @@ impl TurnTracker {
         detail: Option<&str>,
         at: Stamp,
     ) -> Option<u64> {
+        let fresh = std::mem::take(&mut self.interrupt_fresh);
         self.resync(log);
         if !log.is_open(self.run) {
             return self.wake_at();
@@ -536,7 +543,12 @@ impl TurnTracker {
             _ => {}
         }
         if self.step.as_ref().is_some_and(|s| !s.what.held_by(v)) {
-            self.close_step(log, StepOut::Passed, at);
+            let declined = fresh
+                && self
+                    .step
+                    .as_ref()
+                    .is_some_and(|s| matches!(s.what, ScreenStep::Approval(_)));
+            self.close_step_as(log, StepOut::Passed, declined, at);
         }
         let wall_detail = || detail.map(str::to_string);
         match v {
@@ -740,10 +752,11 @@ impl TurnTracker {
         self.tx.stopped = true;
     }
 
-    /// The screen reported the turn interrupted (`aterm_phase::turn::interrupted`): its idle close is `out=interrupted`.
+    /// The screen reported the turn interrupted (`aterm_phase::turn::interrupted`): its idle close is `out=interrupted`, and an approval step the next published verdict closes was declined (Claude Code's `⎿  Interrupted · What should Claude do instead?` under the call its box asked about: the person's Esc, or the box's own "No"), unless an act bound to it said otherwise.
     pub const fn note_interrupted(&mut self) {
         if self.turn.is_some() {
             self.interrupted = true;
+            self.interrupt_fresh = true;
         }
     }
 
@@ -983,7 +996,12 @@ impl TurnTracker {
         }
         let kv: Vec<(&str, &str)> = toks.filter_map(|t| t.split_once('=')).collect();
         let get = |k: &str| kv.iter().find(|(key, _)| *key == k).map(|(_, v)| *v);
-        let wall = |k: &str| get(k).and_then(|v| v.parse::<u64>().ok());
+        let parse_u64 = |v: &str| {
+            (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| v.parse::<u64>().ok())
+                .flatten()
+        };
+        let wall = |k: &str| get(k).and_then(parse_u64);
         let run = Node::parse(get("run")?).filter(|n| n.lvl == crate::vocab::Lvl::Run)?;
         let turn = match get("turn")? {
             "none" => None,
@@ -1015,7 +1033,11 @@ impl TurnTracker {
                     "1" => true,
                     _ => return None,
                 };
-                let detail = get("step_detail").map(aterm_codec::pct::decode);
+                let detail = get("step_detail")
+                    .and_then(|d| {
+                        crate::field::BoundedToken::new(Key::Detail, &aterm_codec::pct::decode(d))
+                    })
+                    .map(|d| d.as_str().to_owned());
                 Some(Held {
                     node,
                     what,
@@ -1053,7 +1075,7 @@ impl TurnTracker {
         let pending_ledger = match get("ledger") {
             None => None,
             Some(id) => {
-                let id: u64 = id.parse().ok()?;
+                let id: u64 = parse_u64(id)?;
                 let by = Actor::from_word(get("ledger_by")?);
                 let w = wall("ledger_wall")?;
                 let c = cause("ledger_cause")?;
@@ -1075,6 +1097,7 @@ impl TurnTracker {
             word,
             settle,
             interrupted,
+            interrupt_fresh: false,
             pending_ledger,
             last_input,
             last_close: None,
@@ -1093,6 +1116,7 @@ impl TurnTracker {
             self.turn = None;
             self.settle = None;
             self.interrupted = false;
+            self.interrupt_fresh = false;
         }
         if self.step.as_ref().is_some_and(|s| !log.is_open(s.node)) {
             self.forget_step();
@@ -1254,6 +1278,7 @@ impl TurnTracker {
         let node = log.open(open, at).ok()?;
         self.turn = Some(node);
         self.interrupted = false;
+        self.interrupt_fresh = false;
         self.pending_ledger = None;
         Some(node)
     }
@@ -1318,6 +1343,13 @@ impl TurnTracker {
     }
 
     fn close_step(&mut self, log: &mut Log, out: StepOut, at: Stamp) {
+        self.close_step_as(log, out, false, at);
+    }
+
+    /// [`Self::close_step`], `declined` when the screen reported the interrupt at the verdict that
+    /// closes it (an approval box the person stopped the turn under): a close no act decided is
+    /// then `out=declined`, by whoever's input is attributed, and an act's own word stands.
+    fn close_step_as(&mut self, log: &mut Log, out: StepOut, declined: bool, at: Stamp) {
         if let Some(h) = self.step.as_ref()
             && log.is_open(h.node)
         {
@@ -1325,6 +1357,11 @@ impl TurnTracker {
                 self.attribution_of(h, at)
             } else {
                 (Actor::Nobody, out, None)
+            };
+            let out = if declined && out == StepOut::Passed {
+                StepOut::Declined
+            } else {
+                out
             };
             let f = orphan
                 .and_then(|a| Fields::new().word(Key::Act, a.word()).ok())
@@ -1367,6 +1404,7 @@ impl TurnTracker {
         };
         self.settle = None;
         self.interrupted = false;
+        self.interrupt_fresh = false;
         if self.step.as_ref().is_some_and(|h| h.under_turn) {
             self.forget_step();
         }
@@ -1690,10 +1728,19 @@ impl TxJoin {
     }
 
     fn from_carry<'l>(get: &dyn Fn(&str) -> Option<&'l str>, now: Stamp) -> TxJoin {
-        let hex = |v: &str| u64::from_str_radix(v, 16).ok();
+        let hex = |v: &str| {
+            (!v.is_empty() && v.bytes().all(|b| b.is_ascii_hexdigit()))
+                .then(|| u64::from_str_radix(v, 16).ok())
+                .flatten()
+        };
+        let dec = |v: &str| {
+            (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| v.parse().ok())
+                .flatten()
+        };
         let through = (|| {
             let fp = hex(get("tx_fp")?)?;
-            let off = get("tx_off")?.parse().ok()?;
+            let off = dec(get("tx_off")?)?;
             let id = match get("tx_id") {
                 None => None,
                 Some(v) => {
@@ -1708,8 +1755,8 @@ impl TxJoin {
             node: get("tx_vt")
                 .and_then(Node::parse)
                 .filter(|n| n.lvl == Lvl::Turn),
-            end_ms: get("tx_ve").and_then(|v| v.parse().ok()),
-            at_ms: get("tx_vp").and_then(|v| v.parse().ok()).unwrap_or(0),
+            end_ms: get("tx_ve").and_then(dec),
+            at_ms: get("tx_vp").and_then(dec).unwrap_or(0),
         });
         TxJoin {
             through,
@@ -1719,7 +1766,7 @@ impl TxJoin {
             state: get("tx_st").and_then(TxState::from_word),
             refuted: get("tx_ref").and_then(WallKind::from_name),
             desync: get("tx_ds") == Some("1"),
-            dropped: get("tx_dr").and_then(|v| v.parse().ok()).unwrap_or(0),
+            dropped: get("tx_dr").and_then(dec).unwrap_or(0),
             unsaid: get("tx_du") == Some("1"),
             rebuild: true,
             stopped: false,

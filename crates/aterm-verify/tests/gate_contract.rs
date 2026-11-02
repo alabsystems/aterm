@@ -289,6 +289,36 @@ fn a_failing_driver_fails_every_stage_that_drives_it_and_nothing_else() {
     );
 }
 
+/// A TEST COMPILE THAT DID NOT PASS STARTS NO CARGO BEHIND IT: its stand-in compile exits 101,
+/// and the test stage, behind it in the main lane, is one COULD NOT RUN row naming the failed
+/// compile and starts no compile of its own, so the trace holds the test compile's start line
+/// alone. NEGATIVE CONTROL: without the flag the test stage compiled again, a second line.
+#[test]
+fn a_failed_test_compile_starts_no_cargo_behind_it() {
+    let repo = FakeRepo::new();
+    let trace = repo.scratch.join("starts");
+    repo.with_stage2_body(&format!(
+        "echo \"start: $*\" >> {}\nexit 101",
+        sh_quote(&trace.display().to_string())
+    ));
+    let (ladder, code) = repo.run(&[Check::Test], Scope::crate_only("aterm-grid"));
+
+    assert_eq!(code, exit::FAILED, "{ladder}");
+    let starts = fs::read_to_string(&trace).expect("the compile started");
+    assert_eq!(starts.lines().count(), 1, "{starts}");
+    assert!(
+        starts.contains("-p aterm-grid --no-fail-fast --tests --no-run"),
+        "{starts}"
+    );
+    let behind = labels_with(&ladder, "NOT RUN");
+    assert_eq!(behind.len(), 1, "{ladder}");
+    assert!(
+        behind[0].starts_with("targo test -p aterm-grid --tests")
+            && behind[0].contains("the compile above failed"),
+        "{ladder}"
+    );
+}
+
 #[test]
 fn a_scoped_run_narrows_the_driver_where_the_check_reads_the_selection() {
     let repo = FakeRepo::new();

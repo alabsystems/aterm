@@ -260,12 +260,24 @@ pub fn each_on<T: Sync, R: Send>(
     items: &[T],
     work: impl Fn(&T) -> R + Sync,
 ) -> Vec<R> {
+    each_after(workers, |_| {}, items, work)
+}
+
+/// [`each_on`], each worker running `first` before it claims an item; what `first` is given says
+/// whether every item has been claimed already.
+pub(crate) fn each_after<T: Sync, R: Send>(
+    workers: usize,
+    first: impl Fn(&dyn Fn() -> bool) + Sync,
+    items: &[T],
+    work: impl Fn(&T) -> R + Sync,
+) -> Vec<R> {
     let next = AtomicUsize::new(0);
     let workers = workers.clamp(1, items.len().max(1));
     let mut done: Vec<(usize, R)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..workers)
             .map(|_| {
                 scope.spawn(|| {
+                    first(&|| next.load(Ordering::Relaxed) >= items.len());
                     let mut done = Vec::new();
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);

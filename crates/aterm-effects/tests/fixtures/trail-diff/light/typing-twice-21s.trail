@@ -8,6 +8,7 @@
 # Flexoki Light, GitHub Light High Contrast, Iceberg Light) light their glass before the run ends.
 
 foreach-scheme light {
+  scale 2
   grid 24 100
   style rainbow kitty
   hz 60

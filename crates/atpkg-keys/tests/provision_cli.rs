@@ -539,6 +539,14 @@ fn unknown_and_malformed_arguments_are_refused_by_name() {
         stderr_of(&out)
     );
 
+    let out = run(&dir, None, &["setup", "--id", "m3", "--id", "m11"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr_of(&out).contains("'--id' was given more than once"),
+        "{}",
+        stderr_of(&out)
+    );
+
     let out = run(
         &dir,
         None,

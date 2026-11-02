@@ -759,3 +759,41 @@ fn history_lines_from_matches_get_history_line_over_a_corrupt_segment() {
         "one placeholder per unreadable line, and every later line keeps its row"
     );
 }
+
+#[test]
+fn borrowed_checkpoints_preserve_all_history_tiers_and_missing_rows() {
+    use aterm_scrollback::{serialize_line_views, serialize_lines};
+    use std::borrow::Cow;
+
+    for corrupt in [0, 5] {
+        let grid = three_source_history_grid(corrupt);
+        let total = grid.scrollback_lines();
+        for bound in [0, 1, 6, 30, total, usize::MAX] {
+            let keep = total.min(bound);
+            let views = grid.checkpoint_line_views_bounded(bound);
+            let owned = grid.checkpoint_lines_bounded(bound);
+            assert_eq!(views.len(), keep + usize::from(grid.rows()));
+            assert_eq!(serialize_line_views(&views), serialize_lines(&owned));
+            assert!(
+                views[keep..]
+                    .iter()
+                    .all(|line| matches!(line, Cow::Owned(_)))
+            );
+            if bound == usize::MAX {
+                assert!(
+                    views[..keep]
+                        .iter()
+                        .any(|line| matches!(line, Cow::Borrowed(_))),
+                    "materialized history is borrowed, not cloned"
+                );
+                assert!(
+                    views[..keep]
+                        .iter()
+                        .any(|line| matches!(line, Cow::Owned(_))),
+                    "compressed and raw ring history still own their conversion"
+                );
+            }
+        }
+        grid.assert_invariants();
+    }
+}

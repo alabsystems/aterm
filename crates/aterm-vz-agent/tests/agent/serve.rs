@@ -119,6 +119,21 @@ fn a_command_that_never_ran_is_not_started_and_one_that_exits_127_is_exited() {
 
     let empty = agent.request(&Frame::Exec(agent.exec(&[]))).ended();
     assert_eq!(empty.exit, Exit::NotStarted("an empty argv".into()));
+
+    for bad_env in [
+        (Vec::new(), b"val".to_vec()),
+        (b"BAD=KEY".to_vec(), b"val".to_vec()),
+        (b"BAD\0KEY".to_vec(), b"val".to_vec()),
+        (b"KEY".to_vec(), b"bad\0val".to_vec()),
+    ] {
+        let mut exec = agent.stand_in(&["exit", "0"]);
+        exec.env = vec![bad_env];
+        let ended = agent.request(&Frame::Exec(exec)).ended();
+        assert!(
+            matches!(ended.exit, Exit::NotStarted(_)),
+            "invalid env must fail cleanly without panicking: {ended:?}"
+        );
+    }
 }
 
 #[test]

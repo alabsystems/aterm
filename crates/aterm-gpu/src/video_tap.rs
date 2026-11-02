@@ -728,8 +728,10 @@ impl VideoTap {
         let _ = CaptureEncoding::new(format, color_space, sdr_white_scale)
             .map_err(|error| format!("video: {error}"))?;
         let padded = padded_row_bytes(src_w, bpp);
-        let size = usize::try_from(padded * u64::from(src_h))
-            .map_err(|_| "video: staging size overflows usize".to_owned())?;
+        let size = padded
+            .checked_mul(u64::from(src_h))
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| "video: staging size overflows usize".to_owned())?;
         #[cfg(not(target_arch = "wasm32"))]
         let worker = usize::try_from(padded)
             .ok()
@@ -1020,8 +1022,13 @@ impl VideoTap {
             .map_err(|_| format!("video: unsupported swapchain format {format:?}"))?;
         let _ = CaptureEncoding::new(format, color_space, sdr_white_scale)
             .map_err(|error| format!("video: {error}"))?;
+        let padded = padded_row_bytes(src_w, bpp);
+        let _ = padded
+            .checked_mul(u64::from(src_h))
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| "video: staging size overflows usize".to_owned())?;
         #[cfg(not(target_arch = "wasm32"))]
-        let worker = usize::try_from(padded_row_bytes(src_w, bpp))
+        let worker = usize::try_from(padded)
             .ok()
             .and_then(|row| spawn_convert_worker(src_w, src_h, row, format, opts.half_res));
         let slots = (0..RING)
@@ -1641,15 +1648,10 @@ impl RawCapture {
     ) -> Result<Self, String> {
         let format = crate::device_layer::TexelFormat::Rgba8Unorm;
         let encoding = CaptureEncoding::new(format, CaptureColorSpace::Srgb, 1.0)?;
-        Self::new(
-            bytes,
-            width,
-            height,
-            width as usize * 4,
-            format,
-            encoding,
-            t_us,
-        )
+        let padded_row = (width as usize)
+            .checked_mul(4)
+            .ok_or_else(|| "capture: row stride overflows usize".to_string())?;
+        Self::new(bytes, width, height, padded_row, format, encoding, t_us)
     }
 
     /// A tightly or loosely padded 8-bit sRGB `Bgra8Unorm` destination, as a swapchain tap maps one, for tests in other crates.
@@ -1946,9 +1948,12 @@ impl PresentedFrameTap {
             .map_err(|_| format!("presented snapshot: unsupported format {format:?}"))?;
         let _ = CaptureEncoding::new(format, color_space, sdr_white_scale)
             .map_err(|error| format!("presented snapshot: {error}"))?;
-        if src_w == 0 || src_h == 0 {
+        let size = presented_snapshot_len(src_w, src_h, format)?;
+        if size == 0 {
             return Err("presented snapshot: destination has zero area".to_string());
         }
+        let _ = usize::try_from(size)
+            .map_err(|_| "presented snapshot: staging size overflows usize".to_string())?;
         Ok(Self {
             buffer: SlotBuf::Gl(Vec::new()),
             state: PresentedFrameState::Armed,
@@ -2828,6 +2833,14 @@ mod tests {
                 crate::device_layer::TexelFormat::Bgra8Unorm,
                 CaptureColorSpace::Unknown,
                 1.0,
+            )
+            .is_err()
+        );
+        assert!(
+            presented_snapshot_len(
+                u32::MAX,
+                1 << 30,
+                crate::device_layer::TexelFormat::Rgba16Float,
             )
             .is_err()
         );

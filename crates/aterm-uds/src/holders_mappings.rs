@@ -132,6 +132,14 @@ mod procfs {
     const MAX_BYTES: usize = 16 << 20;
 
     fn number(bytes: &[u8], radix: u32) -> Result<u64, ()> {
+        let valid = match radix {
+            10 => bytes.iter().all(u8::is_ascii_digit),
+            16 => bytes.iter().all(u8::is_ascii_hexdigit),
+            _ => false,
+        };
+        if !valid {
+            return Err(());
+        }
         u64::from_str_radix(std::str::from_utf8(bytes).map_err(|_| ())?, radix).map_err(|_| ())
     }
 
@@ -361,6 +369,9 @@ mod procfs {
                 b"1000-2000 r--p 0000 01:02 7\n",
                 b"2000-1000 r--p 0000 01:02 7 /other\n",
                 b"1000-2000 ---- 0000 01:02 0\n",
+                b"+1000-2000 r--p 0000 01:02 7 /other\n",
+                b"1000-2000 r--p 0000 01:+02 7 /other\n",
+                b"1000-2000 r--p 0000 01:02 +7 /other\n",
                 b"1000-2000 r--p 0000 01:02 0\n1000-2000 r--p 0000 01:02 0\n",
             ] {
                 assert!(

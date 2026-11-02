@@ -295,6 +295,85 @@ __aterm_path_front() {
             ;;
     esac
 }
+# While aterm installs Apple's Command Line Tools, `$ATERM_CLT_SHIM` names the
+# directory whose `git`, `cc` and kin say the tools are on their way instead of
+# raising Apple's install dialog, and its `.wanted` mark is there. A profile's
+# `path_helper` puts `/usr/bin` back in front of it, so it moves to just ahead
+# of the first `/usr/bin` (else `/bin`): never ahead of a person's own earlier
+# entry. A PATH that already has it there is not assigned, which would flush
+# the command hash. Without the mark nothing installs them: the shim is put
+# back nowhere.
+__aterm_clt_shim_place() {
+    local LC_ALL=C
+    local __aterm_dir="${ATERM_CLT_SHIM:-}"
+    __aterm_clt_bash_env "$__aterm_dir"
+    [[ -n "$__aterm_dir" && -f "${__aterm_dir%/}.wanted" && -d "$__aterm_dir" ]] || return 0
+    local __aterm_p=":$PATH:" __aterm_q __aterm_sys
+    while :; do
+        __aterm_q="${__aterm_p//":$__aterm_dir:"/:}"
+        [ "$__aterm_q" = "$__aterm_p" ] && break
+        __aterm_p="$__aterm_q"
+    done
+    case "$__aterm_p" in
+        *:/usr/bin:*) __aterm_sys=/usr/bin ;;
+        *:/bin:*) __aterm_sys=/bin ;;
+        *) return 0 ;;
+    esac
+    # Split at the first `:<sys>:` by pattern removal: a `${p/x/y}` replacement
+    # keeps its quotes in bash 3.2 and reads `&` in bash 5.2.
+    __aterm_q="${__aterm_p#*":$__aterm_sys:"}"
+    __aterm_p="${__aterm_p%%":$__aterm_sys:"*}:$__aterm_dir:$__aterm_sys:$__aterm_q"
+    __aterm_p="${__aterm_p#:}"
+    __aterm_p="${__aterm_p%:}"
+    [ "$__aterm_p" = "$PATH" ] || export PATH="$__aterm_p"
+}
+# A bash started inside the tab (`bash -lc`, an agent's own shell) runs its
+# login profile after this file and loads no integration, so while the shim at
+# `$1` is wanted `BASH_ENV` names aterm's `bash/clt_env`, which that bash reads
+# after its profile to put the shim back; the person's own `BASH_ENV` waits in
+# `ATERM_CLT_BASH_ENV_BEFORE` and runs first. The exact hook owner in
+# `ATERM_CLT_BASH_ENV_HOOK` preserves that predecessor across script-set changes;
+# an older hook's `ATERM_CLT_BASH_ENV` stays its context. Once the shim is not wanted, the
+# person's own comes back (`__aterm_clt_env_on` has each prompt look).
+__aterm_clt_env_on="${__aterm_clt_env_on:-0}"
+__aterm_clt_bash_env() {
+    local __aterm_si="${ATERM_SHELL_INTEGRATION_DIR:-}"
+    local __aterm_hook="$__aterm_si/bash/clt_env"
+    local __aterm_before="${BASH_ENV-}"
+    if [[ -n "${ATERM_CLT_BASH_ENV_HOOK+set}" ]] && [ "${BASH_ENV-}" = "$ATERM_CLT_BASH_ENV_HOOK" ]; then
+        __aterm_before="${ATERM_CLT_BASH_ENV_BEFORE-}"
+    fi
+    # Keep an old hook from sourcing itself when this parent restores it.
+    if [[ -n "$__aterm_before" ]] && [ "${ATERM_CLT_BASH_ENV-}" = "$__aterm_before" ]; then
+        unset ATERM_CLT_BASH_ENV
+    fi
+    if [[ -n "$1" && -n "$__aterm_si" && -f "${1%/}.wanted" && -f "$__aterm_hook" ]]; then
+        if [ "${BASH_ENV-}" != "$__aterm_hook" ]; then
+            if [[ -z "${ATERM_CLT_BASH_ENV_HOOK+set}" ]] || [ "${BASH_ENV-}" != "$ATERM_CLT_BASH_ENV_HOOK" ]; then
+                if [[ -n "${BASH_ENV+set}" ]]; then
+                    export ATERM_CLT_BASH_ENV_BEFORE="$BASH_ENV"
+                else
+                    unset ATERM_CLT_BASH_ENV_BEFORE
+                fi
+            fi
+            export BASH_ENV="$__aterm_hook"
+        fi
+        export ATERM_CLT_BASH_ENV_HOOK="$__aterm_hook"
+        __aterm_clt_env_on=1
+        return 0
+    fi
+    if [[ -n "${ATERM_CLT_BASH_ENV_HOOK+set}" ]]; then
+        if [ "${BASH_ENV-}" = "$ATERM_CLT_BASH_ENV_HOOK" ]; then
+            if [[ -n "${ATERM_CLT_BASH_ENV_BEFORE+set}" ]]; then
+                export BASH_ENV="$ATERM_CLT_BASH_ENV_BEFORE"
+            else
+                unset BASH_ENV
+            fi
+        fi
+        unset ATERM_CLT_BASH_ENV_BEFORE ATERM_CLT_BASH_ENV_HOOK
+    fi
+    __aterm_clt_env_on=0
+}
 # Record the expected PATH prefix in `$__aterm_managed_want` and whether each
 # managed dir existed at the last check (`__aterm_managed_agents_on` /
 # `__aterm_managed_reroute_on`) so the per-prompt hot path avoids `-d` stats in
@@ -326,6 +405,7 @@ __aterm_reroute_path_front() {
         __aterm_managed_want="$ATERM_REROUTE_DIR${__aterm_managed_want:+:$__aterm_managed_want}"
         __aterm_managed_reroute_on=1
     fi
+    __aterm_clt_shim_place
 }
 __aterm_reroute_path_front
 
@@ -401,6 +481,10 @@ fi
 # Per-prompt and per-command managed PATH check (builtin-only).
 __aterm_managed_path_live() {
     (( __aterm_managed_live )) || return 0
+    # 0. Give the person's own `BASH_ENV` back once nothing wants the shim.
+    if (( __aterm_clt_env_on )) && [[ -z "${ATERM_CLT_SHIM:-}" || ! -f "${ATERM_CLT_SHIM%/}.wanted" ]]; then
+        __aterm_clt_bash_env ""
+    fi
     # 1. Re-source hook if its content changed (`[ != ]` avoids pattern/nocasematch).
     #    Guard non-zero statuses with `|| :` so `set -e` / `set -E` are unaffected.
     __aterm_atpkg_hook_read
@@ -953,22 +1037,33 @@ __aterm_start_mark() {
     return 0
 }
 
-# Hold a warm spare at its first prompt until the host writes `go` to its FIFO.
+# Hold a warm spare at its first prompt until the host writes `go` on fd 10, the
+# end it handed the shell (`$__aterm_spare_fifo` is only the mark). A spare whose
+# startup files closed or replaced fd 10 has no hold left: it signs `cold` and
+# goes on as the cold shell it now is. Once the host is gone each read is
+# end-of-file and the shell exits; the retries are for a read a signal fails.
+# Released, it closes fd 10 so nothing it starts from then on holds the end.
 # Unsets `HISTFILE` while held so a discarded spare writes no history, and
 # reloads history on release unless the startup files populated their own list.
 __aterm_spare_hold() {
+    if [[ ! -p /dev/fd/10 ]]; then
+        unset __aterm_spare_mode __aterm_spare_fifo __aterm_spare_rc_list
+        __aterm_start_mark cold
+        return 0
+    fi
     local __aterm_rc=$SECONDS __aterm_go="" __aterm_n=0 __aterm_own=${__aterm_spare_rc_list-}
     local __aterm_hf_set=${HISTFILE+x} __aterm_hf=${HISTFILE-}
     unset HISTFILE 2>/dev/null || :
     __aterm_start_mark spare
     while :; do
-        if IFS= read -r __aterm_go < "$__aterm_spare_fifo"; then
+        if IFS= read -r -u 10 __aterm_go; then
             [[ $__aterm_go == go ]] && break
         else
             __aterm_n=$((__aterm_n + 1))
-            { [[ $__aterm_n -lt 50 ]] && [[ -p $__aterm_spare_fifo ]]; } || exit 0
+            [[ $__aterm_n -lt 50 ]] || exit 0
         fi
     done 2>/dev/null
+    exec 10<&-
     unset __aterm_spare_mode __aterm_spare_fifo __aterm_spare_rc_list
     if [[ -n $__aterm_hf_set ]]; then
         [[ -n ${HISTFILE+x} ]] || HISTFILE=$__aterm_hf

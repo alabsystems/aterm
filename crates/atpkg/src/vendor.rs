@@ -117,7 +117,7 @@ pub fn is_archive_payload(payload: &str) -> bool {
 /// The host of an `https://` URL, or `None` when the URL is not admissible at all.
 #[must_use]
 pub fn https_host(url: &str) -> Option<&str> {
-    if url.bytes().any(|b| b <= b' ' || b == 0x7f) {
+    if url.bytes().any(|b| b <= b' ' || b == 0x7f || b == b'\\') {
         return None;
     }
     let rest = url.strip_prefix("https://")?;

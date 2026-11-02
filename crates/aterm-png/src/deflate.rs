@@ -627,4 +627,42 @@ mod tests {
             assert_eq!(stream.finish(), whole_buffer_zlib(&data), "split {split}");
         }
     }
+
+    #[test]
+    fn deflate_code_tables_cover_every_length_and_distance() {
+        for sym in 0..=287u16 {
+            let (code, bits) = fixed_litlen(sym);
+            let expected = match sym {
+                0..=143 => (0x30 + sym, 8),
+                144..=255 => (0x190 + (sym - 144), 9),
+                256..=279 => (sym - 256, 7),
+                _ => (0xC0 + (sym - 280), 8),
+            };
+            assert_eq!((code, bits), expected, "sym {sym}");
+        }
+        for l in 3..=258u16 {
+            let (code, extra_val, extra_bits) = length_code(l);
+            assert!((257..=285).contains(&code), "len {l}");
+            let idx = usize::from(code - 257);
+            assert_eq!(extra_bits, LENGTH_EXTRA[idx], "len {l}");
+            assert!(extra_val < (1u32 << extra_bits), "len {l}");
+            assert_eq!(
+                u32::from(LENGTH_BASE[idx]) + extra_val,
+                u32::from(l),
+                "len {l}"
+            );
+        }
+        for d in 1..=32768u16 {
+            let (code, extra_val, extra_bits) = distance_code(d);
+            assert!(code <= 29, "dist {d}");
+            let idx = usize::from(code);
+            assert_eq!(extra_bits, DIST_EXTRA[idx], "dist {d}");
+            assert!(extra_val < (1u32 << extra_bits), "dist {d}");
+            assert_eq!(
+                u32::from(DIST_BASE[idx]) + extra_val,
+                u32::from(d),
+                "dist {d}"
+            );
+        }
+    }
 }

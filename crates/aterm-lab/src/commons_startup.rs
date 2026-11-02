@@ -19,10 +19,46 @@ use std::net::Ipv4Addr;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+mod conflict;
+mod peer_cycle;
+mod readiness;
 pub(crate) mod table;
 
 const HANG: Duration = Duration::from_secs(60);
-const USAGE: &str = "commons-startup <aterm> <new-output-directory> [--log-backed] [--suppressed | --observe SECONDS]";
+const USAGE: &str = "commons-startup <aterm> <new-output-directory> [--log-backed] [--suppressed | --observe SECONDS | --peer-cycle [--peer-details]]";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    Normal,
+    Suppressed,
+    Observe(u64),
+    PeerCycle { details: bool },
+}
+
+fn options(options: &[String]) -> Result<(bool, Mode), Fail> {
+    let (log_backed, options) = match options {
+        [flag, options @ ..] if flag == "--log-backed" => (true, options),
+        _ => (false, options),
+    };
+    let mode = match options {
+        [] => Mode::Normal,
+        [flag] if flag == "--suppressed" => Mode::Suppressed,
+        [flag] if flag == "--peer-cycle" => Mode::PeerCycle { details: false },
+        [cycle, details] if cycle == "--peer-cycle" && details == "--peer-details" => {
+            Mode::PeerCycle { details: true }
+        }
+        [flag, seconds] if flag == "--observe" => {
+            let seconds = seconds
+                .parse::<u64>()
+                .ok()
+                .filter(|seconds| (1..=60).contains(seconds))
+                .ok_or_else(|| Fail::usage("--observe takes 1 to 60 seconds"))?;
+            Mode::Observe(seconds)
+        }
+        _ => return Err(Fail::usage(USAGE)),
+    };
+    Ok((log_backed, mode))
+}
 
 fn fail(error: impl std::fmt::Display) -> Fail {
     Fail::die(error.to_string())
@@ -79,8 +115,8 @@ fn require_attachment(world: &World, aterm: &Path, port: u16, out: &Path) -> Res
 struct Node(Child);
 
 impl Node {
-    fn start(world: &World, aterm: &Path, port: u16) -> Result<Self, Fail> {
-        let log = std::fs::File::create_new(world.dir.join("node.log")).map_err(fail)?;
+    fn start(world: &World, aterm: &Path, port: u16, log_name: &str) -> Result<Self, Fail> {
+        let log = std::fs::File::create_new(world.dir.join(log_name)).map_err(fail)?;
         let err = log.try_clone().map_err(fail)?;
         let child = aterm_uds::spawnfd::command(aterm)
             .env_clear()
@@ -95,6 +131,15 @@ impl Node {
             .map_err(fail)?;
         println!("commons-startup node_pid={}", child.id());
         Ok(Self(child))
+    }
+
+    fn stop(mut self) -> Result<aterm_json::Value, Fail> {
+        let pid = self.0.id();
+        aterm_uds::deadline::kill_within(&mut self.0, HANG);
+        let status = self.0.try_wait().map_err(fail)?.ok_or_else(|| {
+            Fail::die("owned source node did not exit before peer-loss observation")
+        })?;
+        Ok(aterm_json::json!({"pid":pid,"exit_status":status.to_string(),"reaped":true}))
     }
 }
 
@@ -231,9 +276,17 @@ fn received(
     }
 }
 
-fn image(window: &Instance, out: &Path, name: &str) -> Result<(), Fail> {
+/// Capture by an allowed image name and save the returned file in the lab output.
+/// # Errors
+/// A failed capture, a malformed reply or an unreadable source or destination file.
+pub(crate) fn image(window: &Instance, out: &Path, name: &str) -> Result<(), Fail> {
     let reply = window.ctl(&["image", name]);
-    let image = reply.stdout.split_whitespace().nth(3);
+    let image = reply
+        .stdout
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("OK "))
+        .and_then(|body| body.splitn(3, ' ').nth(2));
     match (reply.code, image) {
         (0, Some(image)) => {
             std::fs::copy(image, out.join(name)).map_err(fail)?;
@@ -273,35 +326,30 @@ fn require_enrolled(paths: &Paths, log_backed: bool) -> Result<(), Fail> {
 /// `--log-backed` seeds a synthetic vault log only on the source. The recipient
 /// starts without log records; ordinary enrollment must obtain its membership
 /// history before it can repair application data.
+/// `--peer-cycle` then stops the source, restores the recipient's history across
+/// its own restart with the source still absent, and reconnects the source.
+/// It checks authenticated reachability and retained local account data separately.
+/// `--peer-details` adds selected-peer native captures and requires a bundled executable.
 /// # Errors
 /// Usage or I/O, custody setup, failed host startup, interruption, or an observer,
 /// enrollment or exact eligible application value missing after the hang detector.
 pub fn cmd(args: &[String]) -> Res {
-    let [aterm, out, options @ ..] = args else {
+    let [aterm, out, flags @ ..] = args else {
         return Err(Fail::usage(USAGE));
     };
-    let (log_backed, options) = match options {
-        [flag, options @ ..] if flag == "--log-backed" => (true, options),
-        _ => (false, options),
-    };
-    let (suppressed, observe) = match options {
-        [] => (false, 0),
-        [flag] if flag == "--suppressed" => (true, 0),
-        [flag, seconds] if flag == "--observe" => {
-            let seconds = seconds
-                .parse::<u64>()
-                .ok()
-                .filter(|seconds| (1..=60).contains(seconds))
-                .ok_or_else(|| Fail::usage("--observe takes 1 to 60 seconds"))?;
-            (false, seconds)
-        }
-        _ => return Err(Fail::usage(USAGE)),
-    };
+    let (log_backed, mode) = options(flags)?;
+    let suppressed = mode == Mode::Suppressed;
     stop::install();
     for key in ["forward", "reverse", "after-restart"] {
         aterm_db::accounts::validate(&proposal_value(key)).map_err(fail)?;
     }
-    let aterm = std::fs::canonicalize(crate::paths::from_caller(aterm)).map_err(fail)?;
+    let requested = crate::paths::from_caller(aterm);
+    let peer_details = if matches!(mode, Mode::PeerCycle { details: true }) {
+        Some(peer_cycle::bundle_for_details(Path::new(&requested))?)
+    } else {
+        None
+    };
+    let aterm = std::fs::canonicalize(requested).map_err(fail)?;
     let out = crate::paths::from_caller(out);
     std::fs::create_dir(&out).map_err(fail)?;
     let out = std::fs::canonicalize(out).map_err(fail)?;
@@ -399,18 +447,38 @@ pub fn cmd(args: &[String]) -> Res {
     )?;
     drop(before);
 
-    let node = Node::start(&source, &aterm, port)?;
+    let mut node = Node::start(&source, &aterm, port, "node.log")?;
     active(&source, node.0.id(), &out, "source-active.json")?;
-    let window = start_window(&recipient, &aterm, port, suppressed)?;
+    let mut window = start_window(&recipient, &aterm, port, suppressed)?;
     image(&window, &out, "initial.png")?;
     let pid = window
         .aterm_pid()
         .ok_or_else(|| Fail::die("window has no child pid"))?;
     active(&recipient, pid as u32, &out, "recipient-active.json")?;
+    readiness::wait(
+        [&source, &recipient],
+        &mut node,
+        &mut window,
+        log_backed,
+        &out,
+    )?;
 
-    // The table is first published only after both ordinary executable hosts run.
+    // Publish once after observed two-writer readiness; that read is not an atomic write lease.
     // Reads below observe existing authenticated data; none drives a repair.
-    let (forward, forward_value) = publish(&paths[0], 1, "forward")?;
+    let (forward, forward_value) = match publish(&paths[0], 1, "forward") {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            save(
+                &out,
+                "first-publication-failed.json",
+                &aterm_json::json!({
+                    "passed":false,"publication_attempts":1,"readiness_observed":true,
+                    "scope":"The following publication was refused after read-only readiness; it was not retried",
+                }),
+            )?;
+            return Err(error);
+        }
+    };
     received(&paths[1], forward, "forward", &forward_value, &out)?;
     require_enrolled(&paths[1], log_backed)?;
     let application = table::Table::declare(&paths, &out)?;
@@ -428,6 +496,7 @@ pub fn cmd(args: &[String]) -> Res {
     let (reverse, reverse_value) = publish(&paths[1], 2, "reverse")?;
     received(&paths[0], reverse, "reverse", &reverse_value, &out)?;
     drop(window);
+    drop(node);
 
     let (after_restart, after_restart_value) = publish(&paths[0], 3, "after-restart")?;
     let (generic_after_restart, value) = application.write(&paths[0], "after-restart")?;
@@ -439,6 +508,10 @@ pub fn cmd(args: &[String]) -> Res {
         &out,
         "table-source-final.json",
     )?;
+    // Both hosts are stopped: neither offline value can observe the other.
+    let conflict = conflict::Probe::offline(&paths, [forward, reverse, after_restart], &out)?;
+    let node = Node::start(&source, &aterm, port, "node-restarted.log")?;
+    active(&source, node.0.id(), &out, "source-restarted-active.json")?;
     // A fresh launch directory preserves the first window's logs while the
     // restarted instance uses exactly the recipient's existing home and config.
     let mut restarted = World::new(&config).map_err(fail)?;
@@ -466,7 +539,44 @@ pub fn cmd(args: &[String]) -> Res {
         &out,
         "table-recipient-final.json",
     )?;
+    conflict.received(&paths[0], &out, "conflict-source-final.json")?;
+    conflict.received(&paths[1], &out, "conflict-recipient-final.json")?;
     image(&window, &out, "restarted.png")?;
+    let (_node, window, peer_cycle) = if matches!(mode, Mode::PeerCycle { .. }) {
+        peer_cycle::Cycle {
+            source: &source,
+            recipient: &restarted,
+            window,
+            port,
+            out: &out,
+            peer_details,
+            accounts: &[
+                (forward, "forward", &forward_value),
+                (reverse, "reverse", &reverse_value),
+                (after_restart, "after-restart", &after_restart_value),
+            ],
+        }
+        .run(node)?
+    } else {
+        (node, window, None)
+    };
+    if let Mode::Observe(observe) = mode {
+        println!("commons-startup observing the running window for {observe}s");
+        let until = stop::deadline_after(Duration::from_secs(observe));
+        while Instant::now() < until {
+            stop::sleep(Duration::from_millis(100))?;
+        }
+        let reply = window.cli(None, &["db", "network-state"]);
+        if reply.code != 0 {
+            return Err(Fail::die(format!(
+                "observed network-state: {}",
+                reply.first()
+            )));
+        }
+        let observed = aterm_json::from_str(&reply.stdout).map_err(fail)?;
+        save(&out, "observed-live.json", &observed)?;
+        image(&window, &out, "observed.png")?;
+    }
     save(
         &out,
         "result.json",
@@ -483,27 +593,12 @@ pub fn cmd(args: &[String]) -> Res {
             "forward": aterm_codec::hex::encode_lower(&forward),
             "reverse": aterm_codec::hex::encode_lower(&reverse),
             "after_restart": aterm_codec::hex::encode_lower(&after_restart),
+            "offline_conflict": conflict.summary(),
+            "peer_cycle": peer_cycle,
             "runtime_constructed_by_lab": false,
             "repair_driven_by_lab": false,
         }),
     )?;
-    if observe != 0 {
-        println!("commons-startup observing the running window for {observe}s");
-        let until = Instant::now() + Duration::from_secs(observe);
-        while Instant::now() < until {
-            stop::sleep(Duration::from_millis(100))?;
-        }
-        let reply = window.cli(None, &["db", "network-state"]);
-        if reply.code != 0 {
-            return Err(Fail::die(format!(
-                "observed network-state: {}",
-                reply.first()
-            )));
-        }
-        let observed = aterm_json::from_str(&reply.stdout).map_err(fail)?;
-        save(&out, "observed-live.json", &observed)?;
-        image(&window, &out, "observed.png")?;
-    }
     println!("commons-startup PASS output={}", out.display());
     Ok(0)
 }
@@ -511,6 +606,50 @@ pub fn cmd(args: &[String]) -> Res {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peer_cycle_is_exclusive_with_startup_suppression_and_delayed_observation() {
+        let parse =
+            |words: &[&str]| options(&words.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>());
+        assert_eq!(parse(&[]).unwrap(), (false, Mode::Normal));
+        assert_eq!(
+            parse(&["--peer-cycle"]).unwrap(),
+            (false, Mode::PeerCycle { details: false })
+        );
+        assert_eq!(
+            parse(&["--log-backed", "--peer-cycle"]).unwrap(),
+            (true, Mode::PeerCycle { details: false })
+        );
+        assert_eq!(
+            parse(&["--peer-cycle", "--peer-details"]).unwrap(),
+            (false, Mode::PeerCycle { details: true })
+        );
+        assert_eq!(
+            parse(&["--log-backed", "--peer-cycle", "--peer-details"]).unwrap(),
+            (true, Mode::PeerCycle { details: true })
+        );
+        assert_eq!(
+            parse(&["--log-backed", "--observe", "60"]).unwrap(),
+            (true, Mode::Observe(60))
+        );
+        for words in [
+            vec!["--suppressed", "--peer-cycle"],
+            vec!["--peer-cycle", "--suppressed"],
+            vec!["--observe", "1", "--peer-cycle"],
+            vec!["--peer-cycle", "--observe", "1"],
+            vec!["--peer-cycle", "--peer-cycle"],
+            vec!["--peer-cycle", "--log-backed"],
+            vec!["--peer-details"],
+            vec!["--peer-details", "--peer-cycle"],
+            vec!["--suppressed", "--peer-details"],
+            vec!["--observe", "1", "--peer-details"],
+            vec!["--peer-cycle", "--peer-details", "--peer-details"],
+            vec!["--observe", "0"],
+            vec!["--observe", "61"],
+        ] {
+            assert!(parse(&words).is_err(), "incompatible options: {words:?}");
+        }
+    }
 
     #[test]
     fn an_ordinary_host_environment_keeps_private_roots_without_suppressing_startup() {

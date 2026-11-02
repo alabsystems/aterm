@@ -1,0 +1,50 @@
+# grok 1.0.70 · MEASURED 2026-10-29, `aterm ctl text` of a private headless aterm (144x50, aterm 0.146.0) running the real Grok Build, launched by path in the lab's jail with a scratch `HOME` and `GROK_HOME`, the lab's `XAI_API_KEY` and `GROK_XAI_API_BASE_URL`/`GROK_CLI_CHAT_PROXY_BASE_URL=http://127.0.0.1:<port>/v1` (a local stub of xAI's API, crates/aterm-lab) · the turn ended with a shell command left in the background (`run_terminal_command` `sleep 120` with `block_until_ms: 0`, run unasked): the header row gains `◆ 1 │`, a `▾ Tasks 1` pane under it (`⋅ Task Wait in the background.  40s [↗][✗]`), and `○ 1 command still running` above the box (its mark cycles); the composer idle with the side request's suggestion and the idle key row · cursor=45,6 (visible, blinking_block) · in this run the stub answered every side request, the prompt predictor's among them, `Lab stub session`, so that is the suggestion · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+  /p/t/at.lab0/proj                                                                                             ◆ 1 │ 11K / 256K │ [Dashboard]
+
+     ▾ Tasks 1
+     ⁙ Task Wait in the background.                                                                                               45s [↗][✗]
+
+
+     ❯ toolstart wait in the background                                                                                              2:09 PM
+
+
+     ◆ Task started: Wait in the background.
+
+     Tool call done.                                                                                                                 2:09 PM
+
+     Worked for 0.5s
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    ◎ 1 command still running
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ ❯ Lab stub session                                                                                                                       │
+  ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── lab-stub ─╯
+
+  Tab/→:accept suggestion  │  Shift+Tab:mode  │  Ctrl+x:shortcuts

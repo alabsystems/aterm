@@ -93,21 +93,20 @@ Result: **66 specs**, covering the **180 tests** of §2.
   for `[R]`, sorted by `(path, line)`. `spots(fs)` = `[path:line]`. `PRODUCT`, `ENGINE_CRATES` and the
   other upper-case names are the crate's own const tables, quantified as they stand.
 - `CENSUSES`: the 6-row table (mainloop, locks, wasm, scope, lazy-init, guards) in declaration order.
-- **Gaps.** `blocking_gaps` lists rows of the gap table in
-  `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7. Gap 0 (a seal that publishes
-  Clean-discharged rows) is a prerequisite of every row, so it is left out of the column. Seal
-  `150efe4a`, built locally rather than taken from the machine's `trust` channel, closes it
-  (`docs/PLAN-tests-to-specs-2026-10-15.md`). No spec here is blocked by gap 0 alone: every one
-  carries `&str`, `String`, `Vec` or slice data (gap 1) and a non-straight-line body (gap 3).
+- **Gaps.** `blocking_gaps` numbers are rows of the gap table in
+  `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7: 1 non-scalar carriers, 2 certified
+  `&self`/`&mut self` views, 3 E6 body widening, 4 callee-ensures composition, 5 quantified clauses,
+  7 loops, 8 effects, 11 generics, 13 threads and closures. Gap 0, a seal that publishes
+  Clean-discharged rows, precedes every row and is left out of the column.
 
 ## 1. Specs (TSV)
 
 Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (primary tests; shared ones in §2),
-`rust_features` (what the proof must handle), `blocking_gaps` (audit §7 numbers).
+`rust_features` (what the proof must handle), `blocking_gaps` (§0).
 
 ```tsv
 id	kind	functions	statement	subsumes	rust_features	blocking_gaps
-census-lex-spans-refine	refinement	lex::{spans,cooked_string,raw_string,char_literal,block_comment,utf8_len}	∀ src: spans(src) is the ordered, non-overlapping list of the comment, string and char-literal tokens LexRef finds. Each span has start < end ≤ |src|, spans are sorted by start, and kind ∈ {Comment, Str, Char} is LexRef's class. For a Str, quotes = Some((open, close)) ⇔ the literal is terminated, and then src[open] = src[close] = b'"'. An unterminated literal or comment extends to |src|. Every span boundary is a UTF-8 char boundary of src. Lifetimes ('a), labels ('outer:) and raw identifiers (r#type) produce no span.	lex.rs::lifetimes_labels_and_raw_identifiers_are_code	&str/byte slices, Vec<Span>, while loops with index arithmetic, nested match on (u8, Option<&u8>), a nesting counter in place of recursion	1,3,5,7; fragment: `lex::utf8_len` F1 (VF5 first target, docs/PLAN-tests-to-specs-2026-10-15.md "F1-ready specs").
+census-lex-spans-refine	refinement	lex::{spans,cooked_string,raw_string,char_literal,block_comment,utf8_len}	∀ src: spans(src) is the ordered, non-overlapping list of the comment, string and char-literal tokens LexRef finds. Each span has start < end ≤ |src|, spans are sorted by start, and kind ∈ {Comment, Str, Char} is LexRef's class. For a Str, quotes = Some((open, close)) ⇔ the literal is terminated, and then src[open] = src[close] = b'"'. An unterminated literal or comment extends to |src|. Every span boundary is a UTF-8 char boundary of src. Lifetimes ('a), labels ('outer:) and raw identifiers (r#type) produce no span.	lex.rs::lifetimes_labels_and_raw_identifiers_are_code	&str/byte slices, Vec<Span>, while loops with index arithmetic, nested match on (u8, Option<&u8>), a nesting counter in place of recursion	1,3,5,7; fragment: `lex::utf8_len` F1 (VF5 first target, docs/PLAN-tests-to-specs-2026-10-15.md "F1-ready specs"; proved via mirror: Clean R212 row `lex_utf8_len` (row 7, `VF5AtermRows.row_lex_utf8_len`); not yet credited: counts once Trust mints calculus rows and the owner's E4.7 ruling grades them).
 census-lex-views	contract	lex::{lex,blank,utf8}	∀ src, with L = lex(src): (a) |L.code| = |L.text| = |src|. (b) ∀ i: src[i] = b'\n' ⇔ L.code[i] = b'\n' ⇔ L.text[i] = b'\n'. (c) L.code = Code(src) and L.text = Text(src) (§0): L.code[i] = src[i] when i lies in no span or at a kept quote, else b' '; L.text[i] = b' ' ⇔ i lies in a Comment span ∧ src[i] ≠ b'\n'. (d) Both views are valid UTF-8, so the lossy arm of utf8 is unreachable.	lex.rs::the_code_view_blanks_every_literal_and_comment_in_place, lex.rs::the_text_view_keeps_literals_and_drops_comments_byte_aligned	Vec<u8> mutation through &mut slices, String::from_utf8, for loops over Vec<Span>	1,2,3,5,7
 census-blank-non-code	contract	lex::blank_non_code	∀ src: Lines(blank_non_code(src)) = [l.trim_end() | l ∈ Lines(Code(src))], every output line ends in '\n', so the line count is |Lines(src)|. This holds with no trailing newline and with trailing blank lines.	lex.rs::the_code_view_blanks_every_literal_and_comment_in_place	String building, str::lines, trim_end	1,3,5,7
 census-cfg-entails	contract	lib::{cfg_attr_never_ships,cfg_pred_entails_unshipped}	∀ attr: cfg_attr_never_ships(attr) ⇔ attr = "#[cfg(" ++ p ++ ")]" for some p with EntailsTest(p.trim()). Soundness: if cfg_attr_never_ships(attr), then p is false under every cfg valuation with test = false (any target_os, unix, windows, debug_assertions or feature values), so a masked item never compiles into a non-test build.	lib.rs::cfg_predicate_entails_unshipped_only_when_it_really_does	&str strip_prefix/strip_suffix, recursion over a string grammar, iterator any/all, Vec<&str> from split	1,3,5,7
@@ -140,7 +139,7 @@ census-wasm-term-hops	contract	wasm_census::wasm_term_hops	∀ body: &[String]: 
 census-wasm-verdict	contract	wasm_census::{run_wasm_census,crate_source_files,spawn_sites,unloaded_files}, wasm_cfg::{unloaded_on_wasm32,mod_decl_name,include_arg,path_attr}	∀ T, with W = the derive_linked_scan_set(T, WASM_ROOT_CRATES, wasm_cfg::target_links_on_wasm32) closure (its unlinked edges printed): run_wasm_census(T).ok ⇔ [OB-8] W derives (else "[OB-8] SCAN-SET DERIVATION FAILED") and the engine crates are in W with their marked sinks ∧ [OB-10] no fn reachable from a public wasm export, in the name-merged graph over Mask_{wasm_cfg::attr_never_on_wasm32} sources, has a wasm_term_hops hazard or calls a registered sink directly ("DIRECT call"); the log prints the export -> … -> fn path and file:line ∧ [OB-12] no SPAWN_TOKENS occurrence lies on a W-crate line kept by that mask (so #[test] fns and items or blocks under a one-line #[cfg(p)] with p false on wasm32-unknown-unknown, e.g. cfg(not(target_arch = "wasm32")) or cfg(windows), are excluded; an unknown p keeps them), and none lies in a file U = wasm_cfg::unloaded_on_wasm32 leaves out, which OB-10's sources skip too: a file is left out ⇔ it is no crate root (src/lib.rs, src/main.rs, a manifest `path`) and it has a loader, and every loader (a body-less `mod` resolved as rustc resolves it, `#[path]` and `include!` paths from the loading file's directory, a #[path]-loaded or root file read both ways; an `include!` of a plain path) is masked by that mask or sits in a file left out; a crate with a live loader the reader cannot place (a `mod` inside an inline item, an `include!` of a computed path, a `mod` in an included file, a `cfg_attr` or unreadable `path`) leaves nothing out and its tree is named; the log counts the files left out, the test-only cuts, and names every other cut with its gate. On green the log states the threading posture.	wasm_census.rs::synthetic_wasm_tree_with_offloaded_resize_is_green_with_zero_findings, wasm_census.rs::synthetic_reintroduced_sync_resize_is_red_ob10, wasm_census.rs::synthetic_new_unregistered_reach_is_red_ob10_with_path, wasm_census.rs::synthetic_direct_sink_call_is_red_ob10, wasm_census.rs::synthetic_unmasked_spawn_in_closure_is_red_ob12_and_gated_spawn_is_not, wasm_census.rs::synthetic_spawn_behind_a_native_target_table_is_not_in_the_closure, wasm_census.rs::synthetic_spawn_in_a_file_only_a_false_mod_loads_is_not_swept, wasm_census.rs::synthetic_missing_root_crate_fails_closed_ob8, wasm_cfg.rs::a_module_only_a_false_gate_loads_is_no_wasm32_file, wasm_cfg.rs::a_crate_root_is_never_left_out, wasm_cfg.rs::a_module_tree_this_reader_cannot_place_leaves_every_file_in, wasm_cfg.rs::an_include_is_a_loader_like_a_mod	fs walk, BTreeMap call-graph BFS, String log	1,3,4,5,7,8
 census-cli-parse	contract	main::parse	∀ argument lists A, scanned left to right: the first -h/--help before any error gives Ok(None). An error is a `--x` with x ∉ {all, verbose} ∪ CENSUSES names, any other `-x` except -v, or a second positional; the first error gives Err. Otherwise Ok(Some(inv)) with inv.verbose ⇔ some a ∈ {-v, --verbose}, inv.root = the unique positional if any, and, with N = the names given as `--name` plus every name if --all occurs, inv.selected = [c ∈ CENSUSES | N = ∅ ∨ c.name ∈ N] in CENSUSES order, each census once.	main.rs::a_root_and_flags_mix_in_any_order, main.rs::bare_and_all_select_every_census_once_in_table_order, main.rs::census_flags_combine_instead_of_the_last_one_winning, main.rs::unknown_flags_and_a_second_root_are_usage_errors, main.rs::verbose_is_a_flag_not_a_root	impl IntoIterator<Item=String>, Vec<&'static Census>, sort_by_key/dedup_by_key, Option<PathBuf>, Result<Option<_>, String>	1,3,5,7,11
 census-shell-word	round-trip	main::shell_word	∀ path p, s = p.display().to_string(): shell_word(p) = s if s is nonempty and every char is ASCII alphanumeric or one of /._-+:@; otherwise "'" ++ s.replace("'", "'\\''") ++ "'". Either way, POSIX sh word splitting and quote removal of shell_word(p) yields exactly the one word [s].	main.rs::a_root_with_shell_metacharacters_is_quoted_for_the_rerun_line	String, chars().all, str::replace, format!	1,3,5
-census-guard-calls	contract	guards::{calls,is_word}	∀ code: calls(code) = in order of '(' occurrence, the identifiers w where w is the maximal run of word bytes ending right before the '(' (spaces and tabs skipped), leading ASCII digits removed, w nonempty. A '(' after a non-word byte (`(1, 2)`, `f[0](`) contributes nothing.	guards/mod.rs::calls_are_the_identifiers_before_each_paren	&str match_indices loop, byte backward scans, Vec<&str>	1,3,5,7; fragment: `guards::is_word` F1 (VF5 first target, docs/PLAN-tests-to-specs-2026-10-15.md "F1-ready specs").
+census-guard-calls	contract	guards::{calls,is_word}	∀ code: calls(code) = in order of '(' occurrence, the identifiers w where w is the maximal run of word bytes ending right before the '(' (spaces and tabs skipped), leading ASCII digits removed, w nonempty. A '(' after a non-word byte (`(1, 2)`, `f[0](`) contributes nothing.	guards/mod.rs::calls_are_the_identifiers_before_each_paren	&str match_indices loop, byte backward scans, Vec<&str>	1,3,5,7; fragment: `guards::is_word` F1 (VF5 first target, docs/PLAN-tests-to-specs-2026-10-15.md "F1-ready specs"; proved via mirror: Clean R212 row `is_word` (row 6, `VF5AtermRows.row_is_word`); not yet credited: counts once Trust mints calculus rows and the owner's E4.7 ruling grades them).
 census-guard-hits	contract	guards::{hits,has}	∀ hay, needle: hits(hay, needle, Sub) = the offsets of str::match_indices(needle), in order; hits(hay, needle, Word) = the subsequence of offsets i that are word-boundary hits (§0). has(…) ⇔ hits(…) ≠ [].	guards/mod.rs::word_hits_respect_identifier_edges	iterator adaptors with closures capturing slices, impl Iterator return	1,3,5,7,13
 census-guard-run-rules	contract	guards::{run_rules,scope_findings,run_guards,run_guard_census,Corpus::under}	∀ C, Rs: run_rules(tree, Rs) = concat over R ∈ Rs in order of R.check's findings sorted by (path, line) if R.check returns, or the single finding {R.id, "", 0, "the rule could not run: …"} if it panics. scope_findings(C, Rs) has exactly one finding {R.id, prefix, 0} for each R and each prefix ∈ R.scope under which no file of C lies. run_guard_census is ok ⇔ run_guards yields no finding ∧ the floors hold (≥ 1500 Rust files and ≥ 17 scripts read).	guards/mod.rs::a_panicking_rule_is_one_finding_not_a_crash, guards/mod.rs::a_scope_no_file_lies_under_is_a_finding	std::thread::scope + spawn_scoped + join panic capture, fn pointers, Vec<Finding> sort_by	1,3,4,5,8,13
 census-rule-engine-platform	contract	guards::rules::{engine_platform,engine_shipped,links_by_name,grouped_std_modules}	∀ C: spots(Run(ENGINE_PLATFORM, C)) = sorted {f.rel:l | f under an ENGINE_CRATES prefix ∧ engine_shipped(f.rel) (not test_path, not a build.rs, an /examples/ path or aterm-effects' file_feed.rs) ∧ l a Shipped line ∧ (Code(l) has a word or substring hit of an ENGINE_BANNED needle (std::fs, thread::spawn, thread::Builder, the word-bounded modules std::thread and std::net, …) ∨ l holds the first segment fs, net or thread of a grouped `use std::{…}` import, however it wraps ∨ Text(l) names an ENGINE_FRAMEWORKS name (AppKit, Metal, …) word-bounded ∨ l links a native library: link(name = …) in #[link] or #[cfg_attr(.., link(..))], possibly over several lines)}. One line carries one detail per distinct cause, ordered banned, framework, link. Prose, an identifier containing a framework name (MetalLayer) and a fn named link( are not hits.	guards/rules.rs::the_engine_names_no_platform_in_shipped_code, guards/rules.rs::an_engine_framework_named_in_a_literal_or_a_cfg_attr_link_is_found	iteration over corpus files and lines, const tables of (&str, Bound, &str), Vec<Finding>	1,3,5,7
@@ -177,7 +176,7 @@ census-rule-checked-mktemp	contract	guards::mktemp::{checked_mktemp,fused_mktemp
 
 ## 2. Test → spec map (TSV)
 
-`primary` is the spec whose proof retires the test. `also` lists the other specs the same test samples.
+`primary` is the spec whose proof retires the test; `also` lists the other specs it samples.
 
 ```tsv
 file	test	primary	also
@@ -417,81 +416,40 @@ None: every test in §2 samples a spec.
 
 ## 6. Proof order (easiest high-value first)
 
-No spec is blocked only by gap 0, so the order starts with the specs that need the least beyond
-string carriers (gap 1) and widened bodies (gap 3), and then the lemmas that the rule and census
-specs are built on.
+Every row needs string carriers (gap 1) and a widened body (gap 3). The order starts with the rows
+that need least beyond those, then the lemmas the rule and census rows build on.
 
-1. **`census-key-file-name`** and **`census-launcher-source`** (gaps 1, 3). Equality against string
-   literals, `ends_with`, `starts_with` and `split_once`, with no loops. They are the first `&str`
-   specs Trust can certify once gap 1 lands, and each retires one test.
-   **On seal `150efe4a` both are blocked.** Each fn was wrapped in
-   `trust_contract_fn!` with `ensures result == (<spec>) by <thm>`. Each `<thm>` was a
-   `verify_island! { clean { … } }` theorem `∀ s : String, trust_import_aterm_census__<fn> s = <spec>`.
-   The seal reported three refusals for each fn, the same for both:
-   - **Gap 1, then gap 3 (no import).** `Clean island declaration rejected: AutoBoundHeadOverApplied
-     { name: "trust_import_aterm_census__key_file_name", func_type: "fvar#9223372036854775808",
-     remaining_args: 1 }`, and the same for `…__launcher_source`. E6 minted no kernel definition
-     for either `&str` body: the name is an unbound free variable. Because nothing was imported, no
-     negative control could be run.
-   - **Gap 1 (ensures).** `compiler contract predicate was not lowered into a typed verifier formula:
-     unsupported contract predicate expression` (`==` on `&str`, `ends_with`, `starts_with`,
-     `split_once`), so an `unsupported_mir` row and a `SpecEnsuresUnparseable` row were added.
-   - **Gap 1 (citation).** ``citation `key_file_name_is_key_names` cannot be validated because this
-     clause is outside the exact statement fragment: missing supported type for clause variable
-     `name` `` (`rel` for `launcher_source`).
-   The fn rows in `report.json` were both Inconclusive: `key_file_name` 0 of 4 proved, `launcher_source`
-   2 of 13. **A crate-wide blocker that is not gap 1 or 3** also showed up. 707 of the crate's 902 fn
-   rows carry `unsupported MIR UnmodeledThreadSpawnEffect` unknowns. Two of them are on
-   `key_file_name` and nine on `launcher_source`. These are "may spawn (indirect)" chains that end in
-   `guards::run_rules`'s `std::thread::scope` spawn (for example `guards::keys::key_file_name →
-   guards::run_guard_census → guards::run_guards → … → spawn_scoped`, and
-   `core::str::<impl str>::split_once → … → spawn_scoped`). That is a Trust precision gap: the
-   effect is charged to a pure callee from its callers' callable key. Even with gap 1 closed, no fn
-   in this crate reaches Certified until this gap is closed. The PM-1 proc-macro boundary did not
-   refuse the crate.
-2. **`census-test-path`** (gaps 1, 3, 5). One quantified clause over the `'/'` and `'_'` pieces. It
-   retires one test, and it is the scope lemma of six rule specs (engine-platform, renderer-terminal,
-   protected-folder, runloop-timer, store-current, handoff-name).
-3. **`census-key-synthetic`** (gaps 1, 3, 5, 7). `u8` modular arithmetic over a slice window, the
-   closest thing here to the scalar code Trust already admits. With `census-key-phrases` it retires
-   both keys phrase tests.
+1. **`census-key-file-name`** and **`census-launcher-source`** (gaps 1, 3): equality with string
+   literals, `ends_with`, `starts_with`, `strip_prefix` and `split_once`, with no loops.
+2. **`census-test-path`** (gaps 1, 3, 5): one quantified clause over the `'/'` and `'_'` pieces, and
+   the scope lemma of many `census-rule-*` rows.
+3. **`census-key-synthetic`** (gaps 1, 3, 5, 7): `u8` modular arithmetic over a slice window. With
+   `census-key-phrases` it retires both keys phrase tests.
 4. **`census-shell-word`**, **`census-scope-returns-token`** and **`census-lazy-field-cell-name`**
-   (gaps 1, 3, 5). Short straight-line string predicates, one test each.
-5. **`census-guard-hits`** and **`census-guard-calls`**. The word-bound and call-site lemmas behind
-   every rule spec's `Match`.
-   **On seal `150efe4a`, `census-guard-calls` is blocked; the code and its test stay as they are.**
-   `calls` is `&str -> Vec<&str>` (gap 1). `trust_contract_fn!`'s `-> $ret:ident`
-   arm cannot even spell its result type, and `&str` has no clause type (item 1). So the spec's main
-   statement was not contracted. Its scalar half, `is_word(b: u8) -> bool`, was contracted with
-   `ensures result == ((b >= 48 && b <= 57) || ((b >= 65 && b <= 90) || ((b >= 97 && b <= 122) ||
-   b == 95))) by is_word_is_identifier_byte`, citing a theorem over
-   `trust_import_aterm_census__guards__is_word` (the import name carries the module path). The seal
-   refused it: `Clean island declaration rejected: AutoBoundHeadOverApplied { name:
-   "trust_import_aterm_census__guards__is_word", func_type: "fvar#9223372036854775808",
-   remaining_args: 1 }`. E6 mints no import for the body `b.is_ascii_alphanumeric() || b == b'_'`.
-   That is gap 3 (a call): a single-file probe of the same body shows `Alloca without an internally
-   bound extent` for the `&self` receiver. Without an import, the fn row was 2 of 2 proved by
-   `trust-full-verifier` (PDR, smt-backed), not by `clean-kernel-citation`. The PM-1 boundary did
-   not refuse the crate. A probe gives a route for the scalar half: write the body as `matches!(b, b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' | b'_')`,
-   with no behaviour change. E6 imports that body as
-   `decide (48 <= b) && decide (b <= 57) || (… || decide (b = 95))`. The theorem stated in exactly
-   that `<=` form closes with `simp only [import]`, and the row is Verified with every postcondition
-   `clean-kernel-citation`. Mutating `b'z'` to `b'y'` makes the island fail. The `<` form does
-   not unify with the import, and rustc's lexer refuses `≤` inside `verify_island!`. The spec stays
-   blocked on `calls` (gaps 1, 3, 5, 7) until `&str`/`Vec` carriers and loops land.
-6. **`census-lex-spans-refine`**, then **`census-lex-views`** and **`census-blank-non-code`**. These
-   are harder (a loop-heavy tokenizer, gap 7), but `Code`/`Text` are the views that every rule, lock
-   and lazy-init spec is stated over, so they come before those specs.
+   (gaps 1, 3, 5): short straight-line string predicates.
+5. **`census-guard-hits`** and **`census-guard-calls`**: the word-bound and call-site lemmas behind
+   every rule row's match.
+6. **`census-lex-spans-refine`**, then **`census-lex-views`** and **`census-blank-non-code`**: a
+   loop-heavy tokenizer (gap 7), but `Code` and `Text` are the views every rule, lock and lazy-init
+   row is stated over.
 7. **`census-cfg-entails`**, **`census-split-commas`**, then **`census-mask-gated-items`**: the
    `Shipped` lemma.
-8. The pure line-scan specs: the lock-order helpers (`census-impl-self-type`,
-   `census-guard-final-value`, `census-return-type-guard`, `census-lock-receiver-identity`), the
-   lazy-init helpers, `census-wasm-term-hops`, `census-term-hop`, `census-cli-parse` (gap 11), then
-   the `census-rule-*` specs over `Corpus::of`.
+8. The pure line scans: the lock-order helpers (`census-impl-self-type`, `census-guard-final-value`,
+   `census-return-type-guard`, `census-lock-receiver-identity`), the lazy-init helpers,
+   `census-wasm-term-hops`, `census-term-hop`, `census-cli-parse` (gap 11), then the `census-rule-*`
+   rows over `Corpus::of`.
 9. Last, the effectful whole-census verdicts (gap 8, plus 4 and often 13): `census-scan-set-*`,
    `census-lock-hold-edges`, `census-lock-site-classification`, `census-lock-order-verdict`,
-   `census-lazy-init-verdict` (pure over `&[(path, text)]`, so it goes first of these),
+   `census-lazy-init-verdict` (pure over `&[(path, text)]`, so first of these),
    `census-held-guard-scan`, `census-wasm-verdict`, `census-mainloop-verdict`, `census-scope-verdict`
-   (after §5.1), `census-run-censuses` and `census-guard-run-rules`. Factoring each census into a
-   pure core over an in-memory tree, with the fs walk as a thin shell, moves most of this group off
-   gap 8. Returning typed findings (§5.2) makes the verdict specs statable without parsing prose.
+   (after §5.1), `census-run-censuses` and `census-guard-run-rules`. Factoring each census into a pure
+   core over an in-memory tree, with the fs walk as a thin shell, moves most of them off gap 8, and
+   typed findings (§5.2) make the verdicts statable without parsing prose.
+
+Seal `150efe4a` refused `trust_contract_fn!` contracts on `key_file_name`, `launcher_source` and
+`guards::is_word`: E6 minted no kernel import for their bodies (`AutoBoundHeadOverApplied`), and an
+`ensures` over `&str` did not lower, `&str` having no clause type. The same seal charged
+`UnmodeledThreadSpawnEffect` to most of the crate's fns through `guards::run_rules`'s
+`std::thread::scope` spawn; until Trust stops charging a pure callee its callers' effects, no fn here
+certifies. Written as `matches!(b, b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' | b'_')`, `is_word` does
+import, and its theorem closes when stated in the import's `<=` form.

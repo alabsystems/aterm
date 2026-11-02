@@ -107,7 +107,7 @@ fn every_write_method_is_refused_before_anything_happens() {
             assert_eq!(error.sub, Sub::Policy(RefusalCode::MethodNotRead));
             assert_eq!(error.sub.slug().as_deref(), Some("policy.method_not_read"));
             assert!(error.why.contains(method.as_str()));
-            assert!(error.next.contains("M2"));
+            assert!(error.next.contains("Router::permit"));
             assert_eq!(error.repo.as_deref(), Some("fixture-dev/repo"));
         }
     }

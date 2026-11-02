@@ -588,6 +588,8 @@ fn session_row(
         hold_by,
         ask,
         goal,
+        build_wait,
+        work,
     ) = {
         let timeline = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
         let need = timeline.need();
@@ -617,6 +619,11 @@ fn session_row(
                 .filter(|need| need.word == aterm_types::needs::NeedWord::Ask)
                 .map(|need| need.key),
             timeline.goal().map(str::to_owned),
+            timeline.build_wait().copied(),
+            // Only a content row says where its agent works, as only it says `cwd=`.
+            (level == SurveyLevel::Content)
+                .then(|| timeline.work().cloned())
+                .flatten(),
         )
     };
     let (user_title, role, supervisor, attention) = {
@@ -688,7 +695,7 @@ fn session_row(
     });
     let held_from = h.ctx.fabric.holds().remote().map(|hold| hold.node.clone());
     let mut row = format!(
-        "session local={} sid={} state={} program={} program_kind={} agent={} agent_detail={} \
+        "session local={} sid={} state={} program={} program_kind={}{} agent={} agent_detail={} \
          agent_ms={} human_ms={} bg={} task={} task_rev={} task_from={} task_ms={} model={} \
          effort={} ctx_left_pct={} usage_5h_pct={} usage_7d_pct={} account={} detail={} \
          doing={} role={} supervisor={} \
@@ -699,6 +706,7 @@ fn session_row(
         h.state.as_str(),
         word_token(agent.program.as_deref()),
         program_kind(is_agent, agent.program.as_deref()),
+        crate::session_status::program::BuildWait::fields(build_wait.as_ref()),
         agent_word,
         word_token(agent.detail.as_deref()),
         agent_ms,
@@ -772,12 +780,65 @@ fn session_row(
             excerpt_token(engine.command.as_deref()),
             excerpt_token(engine.rows.as_deref()),
         );
+        if let Some(work) = &work {
+            row.push(' ');
+            row.push_str(&work_fields(work, now_unix_ms));
+        }
     }
     Row {
         text: row,
         keep,
         cut: false,
     }
+}
+
+/// How many hex digits of a commit a row shows.
+const COMMIT_HEX: usize = 12;
+
+/// A content row's fields saying where its agent works, from the harness host's last read
+/// (`work`, read at `read_ms`): `work=` the branch (`@<commit>` while detached), `work_repo=` and
+/// `work_tree=` (home as `~`), `work_base=` (`<main ref>@<commit>`), `work_behind=`,
+/// `work_files=`, `work_paths=` (every name the record holds, one a line) and `work_ms=` (its
+/// age). Every name goes through the redactor, as the row's other excerpts do.
+fn work_fields(work: &aterm_agent::harness::work_record::WorkRecord, now_unix_ms: u64) -> String {
+    use aterm_agent::harness::repo_work::printable;
+    let short = |commit: &str| commit.chars().take(COMMIT_HEX).collect::<String>();
+    let at = match (&work.branch, &work.detached) {
+        (Some(branch), _) => branch_token(Some(branch)),
+        (None, Some(head)) => format!("@{}", short(head)),
+        (None, None) => "-".to_string(),
+    };
+    let place = |path: &Path| {
+        excerpt_token(
+            path.to_str()
+                .map(crate::app_tabs::home_abbreviated)
+                .as_deref(),
+        )
+    };
+    let base = work
+        .base
+        .as_deref()
+        .map(|base| format!("{}@{}", printable(&work.main_ref), short(base)));
+    let paths: Vec<String> = work
+        .paths
+        .iter()
+        .map(|path| redact(&printable(path)))
+        .collect();
+    format!(
+        "work={at} work_repo={} work_tree={} work_base={} work_behind={} work_files={} \
+         work_paths={} work_ms={}",
+        place(&work.common_dir),
+        place(&work.tree),
+        branch_token(base.as_deref()),
+        number_token(work.behind.map(u64::from)),
+        work.files,
+        if paths.is_empty() {
+            "-".to_string()
+        } else {
+            pct_encode(&paths.join("\n"))
+        },
+        now_unix_ms.saturating_sub(work.read_ms),
+    )
 }
 
 fn program_kind(is_agent: bool, program: Option<&str>) -> &'static str {

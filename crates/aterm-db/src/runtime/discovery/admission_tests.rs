@@ -11,6 +11,9 @@ fn peer(state: i64, seen: Instant) -> Peer {
         verified: matches!(state, 4 | 5 | 6 | 8),
         busy: matches!(state, 2 | 6 | 7 | 8),
         failed: matches!(state, 3 | 5 | 7 | 8),
+        hurried: false,
+        quiet_push: false,
+        failures: 0,
         repair: Repair::default(),
     }
 }

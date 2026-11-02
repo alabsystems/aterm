@@ -48,7 +48,7 @@ fn parse(parts: &[String]) -> Option<Wait> {
                 continue;
             }
         };
-        if timeout.is_some() {
+        if timeout.is_some() || value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
             return None;
         }
         timeout = Some(Duration::from_millis(value.parse::<u64>().ok()?));
@@ -340,6 +340,8 @@ mod tests {
             "inbox since=4",
             "agent idle",
             "await inbox since=4 timeout=soon",
+            "await inbox since=4 timeout=+5000",
+            "await inbox since=4 timeout +5000",
             "await inbox since=4 timeout=1 timeout=2",
         ] {
             assert_eq!(parse(&parts(refused)), None, "{refused}");

@@ -47,6 +47,11 @@ impl Credentials {
             .map_err(|_| Error::new("invalid database configuration"))?;
         let manifest = Manifest::decode(&unhex(field(&v, "manifest")?, 256)?)?;
         let capability = Capability::decode(&manifest, &unhex(field(&v, "capability")?, 256)?)?;
+        if capability.control {
+            return Err(Error::new(
+                "installation capability cannot be an administrative control certificate",
+            ));
+        }
         let (seed, actor) = identity(dir)?;
         if actor != capability.actor {
             return Err(Error::new(
@@ -54,11 +59,11 @@ impl Credentials {
             ));
         }
         let key = decode_hex(field(&v, "key")?)?;
-        let root_seed = v
-            .get("root_seed")
-            .and_then(Value::as_str)
-            .map(decode_hex)
-            .transpose()?;
+        let root_seed = match v.get("root_seed") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) => Some(decode_hex(s)?),
+            Some(_) => return Err(Error::new("invalid database configuration")),
+        };
         if root_seed
             .as_ref()
             .is_some_and(|s| crypto::public(s).ok() != Some(manifest.root))
@@ -97,6 +102,22 @@ impl Credentials {
         let capability = Capability::issue(&self.manifest, root, actor)?;
         let v = json!({"manifest":hex::encode_lower(self.manifest.bytes()),"capability":hex::encode_lower(capability.bytes()),"key":hex::encode_lower(&self.key)});
         aterm_json::to_vec(&v).map_err(|_| Error::new("invitation encoding failed"))
+    }
+    pub(crate) fn has_control_authority(&self) -> bool {
+        self.root_seed.is_some()
+    }
+}
+
+#[cfg(test)]
+mod frontier_tests;
+impl Drop for Credentials {
+    fn drop(&mut self) {
+        use zeroize::Zeroize as _;
+        self.seed.zeroize();
+        self.key.zeroize();
+        if let Some(root_seed) = &mut self.root_seed {
+            root_seed.zeroize();
+        }
     }
 }
 
@@ -200,6 +221,11 @@ pub fn join(dir: &Path, invitation: &[u8], trusted_root: [u8; 32]) -> Result<()>
         ));
     }
     let capability = Capability::decode(&manifest, &unhex(field(&v, "capability")?, 256)?)?;
+    if capability.control {
+        return Err(Error::new(
+            "installation capability cannot be an administrative control certificate",
+        ));
+    }
     let (seed, actor) = identity(dir)?;
     if actor != capability.actor {
         return Err(Error::new("invitation is for another installation"));
@@ -214,7 +240,12 @@ pub fn join(dir: &Path, invitation: &[u8], trusted_root: [u8; 32]) -> Result<()>
     .save(dir)
 }
 fn unhex(s: &str, max: usize) -> Result<Vec<u8>> {
-    if s.len() > max * 2 || !s.len().is_multiple_of(2) {
+    if s.len() > max * 2
+        || !s.len().is_multiple_of(2)
+        || !s
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
         return Err(Error::new("invalid encoded database bytes"));
     }
     s.as_bytes()
@@ -259,7 +290,10 @@ impl Database {
                 break;
             }
             for record in &batch {
-                if record.subject != "db/operation/2" || record.body.len() < 8 {
+                if record.seq != offset
+                    || record.subject != "db/operation/2"
+                    || record.body.len() < 8
+                {
                     return Err(Error::new("foreign record in database journal"));
                 }
                 let received_at = u64::from_le_bytes(
@@ -281,6 +315,9 @@ impl Database {
                         .ok_or_else(|| Error::new("journal offset exhausted"))?,
                 );
             }
+        }
+        if log.stats().head != offset {
+            return Err(Error::new("foreign record in database journal"));
         }
         Ok(Self {
             credentials,
@@ -364,143 +401,185 @@ impl Database {
         Ok(true)
     }
     /// Author a durable transaction, retrying its previously stored request identity.
+    /// Catalog writes join wide frontiers with value-free records. Fixed-share
+    /// receipts depend on their grant and this writer's predecessor.
     pub fn commit(&mut self, command: Command) -> Result<Digest> {
         if self.append_failed {
             return Err(Error::new(
                 "an earlier append had an uncertain outcome; reopen before retrying the same request identity",
             ));
         }
-        let control = command.is_control();
-        let control_capability = if control {
-            Some(Capability::control(
-                &self.credentials.manifest,
-                self.credentials.root_seed.as_ref().ok_or_else(|| {
-                    Error::new("this replica does not hold administrative signing authority")
-                })?,
-            )?)
-        } else {
-            None
-        };
-        let capability = control_capability
-            .as_ref()
-            .unwrap_or(&self.credentials.capability);
-        let actor = capability.actor;
-        if let Some(id) = self.history.retry(&actor, &command)? {
-            return Ok(id);
-        }
-        let view = self.view();
-        if command.changes().is_some() && !control && view.revocations.contains_key(&actor) {
-            return Err(Error::new(
-                "this installation's catalog writes have been retired; bounded grant receipts remain valid",
-            ));
-        }
-        if let Some(changes) = command.changes() {
+        loop {
+            let control = command.is_control();
+            let control_capability = if control {
+                Some(Capability::control(
+                    &self.credentials.manifest,
+                    self.credentials.root_seed.as_ref().ok_or_else(|| {
+                        Error::new("this replica does not hold administrative signing authority")
+                    })?,
+                )?)
+            } else {
+                None
+            };
+            let capability = control_capability
+                .as_ref()
+                .unwrap_or(&self.credentials.capability);
+            let actor = capability.actor;
             let view = self.view();
-            for change in changes {
-                if view
-                    .cells
-                    .get(&(change.collection.clone(), change.key.clone()))
-                    .is_some_and(|cell| cell.stopped)
+            if let Some(id) = self.history.retry(&actor, &command)? {
+                // A valid debit remains liability evidence when one of its catalog
+                // ancestors is withdrawn. Its retry must use that same projection.
+                let eligible = if matches!(&command, Command::Spend { .. }) && !view.authority_fault
                 {
+                    self.history.index.project().ordered.contains(&id)
+                } else {
+                    view.causal.ordered.contains(&id)
+                };
+                if !eligible || view.invalid.contains(&id) {
                     return Err(Error::new(
-                        "object generation stopped; use a new object key",
+                        "the prior operation receipt is not currently eligible",
                     ));
                 }
-                if change.collection == "machines"
-                    && let Some(value) = &change.value
-                {
-                    for name in crate::machines::names(value) {
-                        if view
-                            .machine_names
-                            .get(&name)
-                            .is_some_and(|owners| owners.iter().any(|owner| owner != &change.key))
-                        {
-                            return Err(Error::new(
-                                "machine name is already in another machine's history; keep the proposal for review",
-                            ));
+                return Ok(id);
+            }
+            if command.changes().is_some() && !control && view.revocations.contains_key(&actor) {
+                return Err(Error::new(
+                    "this installation's catalog writes have been retired; bounded grant receipts remain valid",
+                ));
+            }
+            if let Some(changes) = command.changes() {
+                let view = self.view();
+                for change in changes {
+                    if view
+                        .cells
+                        .get(&(change.collection.clone(), change.key.clone()))
+                        .is_some_and(|cell| cell.stopped)
+                    {
+                        return Err(Error::new(
+                            "object generation stopped; use a new object key",
+                        ));
+                    }
+                    if change.collection == "machines"
+                        && let Some(value) = &change.value
+                    {
+                        for name in crate::machines::names(value) {
+                            if view.machine_names.get(&name).is_some_and(|owners| {
+                                owners.iter().any(|owner| owner != &change.key)
+                            }) {
+                                return Err(Error::new(
+                                    "machine name is already in another machine's history; keep the proposal for review",
+                                ));
+                            }
                         }
                     }
                 }
             }
-        }
-        let projection = if control || matches!(&command, Command::Spend { .. }) {
-            self.history.index.project()
-        } else {
-            view.causal
-        };
-        if projection
-            .quarantined
-            .iter()
-            .any(|a| a == &actor || a[..32] == self.credentials.manifest.root)
-        {
-            return Err(Error::new(
-                "local writer or admission authority equivocated; recovery required",
-            ));
-        }
-        let previous = projection
-            .ordered
-            .iter()
-            .filter_map(|id| self.history.index.get(id))
-            .filter(|h| h.actor == actor)
-            .max_by_key(|h| h.sequence);
-        let sequence = previous
-            .map_or(Some(1), |h| h.sequence.checked_add(1))
-            .ok_or_else(|| Error::new("actor sequence exhausted"))?;
-        if self
-            .history
-            .index
-            .inventory()
-            .filter_map(|id| self.history.index.get(id))
-            .any(|h| h.actor == actor && h.sequence >= sequence)
-        {
-            return Err(Error::new(
-                "local actor has unprojected history; repair before writing",
-            ));
-        }
-        let previous = previous.map(|h| h.id);
-        let mut parents = projection.heads;
-        if control {
-            parents.clear();
-        }
-        // A peer may have observed our last write, leaving only its descendant
-        // as a maximal head. The dense writer chain still names its exact predecessor.
-        if let Some(previous) = previous {
-            parents.insert(previous);
-        }
-        let parents: Vec<_> = parents.into_iter().collect();
-        let plaintext = command.encode()?;
-        if Command::decode(&plaintext)? != command {
-            return Err(Error::new(
-                "database command encoding would change its meaning",
-            ));
-        }
-        if let Command::Revoke { actor: revoked, .. } = &command
-            && *revoked == actor
-        {
-            return Err(Error::new("authority stream cannot revoke itself"));
-        }
-        let wire = crypto::seal(
-            &self.credentials.manifest,
-            &self.credentials.key,
-            if control {
-                self.credentials
-                    .root_seed
-                    .as_ref()
-                    .ok_or_else(|| Error::new("administrative key unavailable"))?
+            let projection = if control || matches!(&command, Command::Spend { .. }) {
+                self.history.index.project()
             } else {
-                &self.credentials.seed
-            },
-            capability,
-            crypto::Causal {
-                sequence,
-                previous,
-                parents: &parents,
-            },
-            &plaintext,
-        )?;
-        let id = aterm_digest::Sha256::digest(&wire);
-        self.ingest(&wire)?;
-        Ok(id)
+                view.causal
+            };
+            if projection
+                .quarantined
+                .iter()
+                .any(|a| a == &actor || a[..32] == self.credentials.manifest.root)
+            {
+                return Err(Error::new(
+                    "local writer or admission authority equivocated; recovery required",
+                ));
+            }
+            let previous = projection
+                .ordered
+                .iter()
+                .filter_map(|id| self.history.index.get(id))
+                .filter(|h| h.actor == actor)
+                .max_by_key(|h| h.sequence);
+            let sequence = previous
+                .map_or(Some(1), |h| h.sequence.checked_add(1))
+                .ok_or_else(|| Error::new("actor sequence exhausted"))?;
+            if self
+                .history
+                .index
+                .inventory()
+                .filter_map(|id| self.history.index.get(id))
+                .any(|h| h.actor == actor && h.sequence >= sequence)
+            {
+                return Err(Error::new(
+                    "local actor has unprojected history; repair before writing",
+                ));
+            }
+            let previous = previous.map(|h| h.id);
+            let mut parents = projection.heads;
+            if control {
+                parents.clear();
+            } else if let Command::Spend { grant, .. } = &command {
+                // Fixed allocations need no other writer's current frontier. Keep
+                // only the authenticated grant and the dense local receipt chain.
+                parents.clear();
+                if projection.ordered.contains(grant) {
+                    parents.insert(*grant);
+                }
+            }
+            let joining = !control
+                && !matches!(&command, Command::Spend { .. })
+                && parents.len() + usize::from(previous.is_some_and(|id| !parents.contains(&id)))
+                    > astream_wire::sync::MAX_PARENTS;
+            if joining {
+                parents = parents
+                    .into_iter()
+                    .take(astream_wire::sync::MAX_PARENTS - 1)
+                    .collect();
+            }
+            // A peer may have observed our last write, leaving only its descendant
+            // as a maximal head. The dense writer chain still names its exact predecessor.
+            if let Some(previous) = previous {
+                parents.insert(previous);
+            }
+            let parents: Vec<_> = parents.into_iter().collect();
+            let plaintext = command.encode()?;
+            if Command::decode(&plaintext)? != command {
+                return Err(Error::new(
+                    "database command encoding would change its meaning",
+                ));
+            }
+            if let Command::Revoke { actor: revoked, .. } = &command
+                && *revoked == actor
+            {
+                return Err(Error::new("authority stream cannot revoke itself"));
+            }
+            let plaintext = if joining {
+                Command::Merge {
+                    request: crypto::random()?,
+                }
+                .encode()?
+            } else {
+                plaintext
+            };
+            let wire = crypto::seal(
+                &self.credentials.manifest,
+                &self.credentials.key,
+                if control {
+                    self.credentials
+                        .root_seed
+                        .as_ref()
+                        .ok_or_else(|| Error::new("administrative key unavailable"))?
+                } else {
+                    &self.credentials.seed
+                },
+                capability,
+                crypto::Causal {
+                    sequence,
+                    previous,
+                    parents: &parents,
+                },
+                &plaintext,
+            )?;
+            let id = aterm_digest::Sha256::digest(&wire);
+            self.ingest(&wire)?;
+            if !joining {
+                return Ok(id);
+            }
+        }
     }
     /// Append a compensation only while every affected key still has the exact
     /// target as its sole current candidate. Concurrent or later edits require
@@ -511,17 +590,23 @@ impl Database {
             .command(&operation)
             .map(|(_, c)| c.clone())
             .ok_or_else(|| Error::new("target is not a supported retained command"))?;
+        if target.is_control() && self.credentials.root_seed.is_none() {
+            return Err(Error::new(
+                "this replica does not hold administrative signing authority",
+            ));
+        }
         let actor = if target.is_control() {
             self.credentials.manifest.control_actor()
         } else {
             self.credentials.capability.actor
         };
-        if let Some((_, old)) = self.history.find_request(&actor, request) {
-            if matches!(old,Command::Revert{operation:prior,..}if *prior==operation) {
-                return self
-                    .history
-                    .retry(&actor, old)?
-                    .ok_or_else(|| Error::new("revert receipt is absent"));
+        if let Some((_, old)) = self
+            .history
+            .find_request(&actor, request)
+            .map(|(id, c)| (id, c.clone()))
+        {
+            if matches!(&old, Command::Revert { operation: prior, .. } if *prior == operation) {
+                return self.commit(old);
             }
             return Err(Error::new(
                 "request identity already belongs to another command",
@@ -586,17 +671,23 @@ impl Database {
         total: u64,
         shares: BTreeMap<Actor, u64>,
     ) -> Result<Digest> {
+        if self.credentials.root_seed.is_none() {
+            return Err(Error::new(
+                "this replica does not hold administrative signing authority",
+            ));
+        }
         let command = Command::Budget {
             request,
             name: name.clone(),
             total,
             shares,
         };
-        if let Some(id) = self
+        if self
             .history
             .retry(&self.credentials.manifest.control_actor(), &command)?
+            .is_some()
         {
-            return Ok(id);
+            return self.commit(command);
         }
         if self.history.has_budget(&name) {
             return Err(Error::new(
@@ -660,18 +751,21 @@ impl Database {
         let actor = self.credentials.capability.actor;
         if view.disputed_shares.contains(&(grant, actor)) {
             return Err(Error::new(
-                "disputed expenditure evidence locks this machine's share until reconciliation",
+                "incomplete or disputed accounting history locks this machine's share until reconciliation",
             ));
         }
         if view.invalid.iter().any(|id|matches!(self.history.command(id),Some((author,Command::Spend{grant:bad,..}))if *author==actor&&bad==&grant)){return Err(Error::new("invalid accounting evidence locks this machine's share until reconciliation"));}
-        if let Some((id, old)) = self.history.find_request(&actor, request) {
-            self.history.retry(&actor, old)?;
-            return match old {
+        if let Some((_, old)) = self
+            .history
+            .find_request(&actor, request)
+            .map(|(id, c)| (id, c.clone()))
+        {
+            return match &old {
                 Command::Spend {
                     grant: old_grant,
                     cost: old_cost,
                     ..
-                } if *old_grant == grant && *old_cost == cost => Ok(id),
+                } if *old_grant == grant && *old_cost == cost => self.commit(old),
                 _ => Err(Error::new("request identity reused for another debit")),
             };
         }

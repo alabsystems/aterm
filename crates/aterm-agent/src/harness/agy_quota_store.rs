@@ -53,21 +53,64 @@ impl Reading {
             .iter()
             .any(|g| g.standing(low) != Standing::Open);
         let ttl = if tight { FRESH_TIGHT_S } else { FRESH_OPEN_S };
-        if now < self.as_of || now - self.as_of >= ttl {
+        if now < self.as_of || now.saturating_sub(self.as_of) >= ttl {
             return false;
         }
         !self.refill_passed(now)
     }
 
-    /// Whether a spent bucket's recorded refill has passed its settling interval.
-    fn refill_passed(&self, now: i64) -> bool {
+    /// Whether an active non-full bucket's recorded refill has passed its settling interval.
+    #[must_use]
+    pub fn refill_passed(&self, now: i64) -> bool {
         self.quota
             .groups
             .iter()
             .flat_map(|g| g.buckets.iter())
-            .filter(|b| b.spent())
+            .filter(|b| !b.disabled && b.remaining.is_some_and(|f| f + f64::EPSILON < 1.0))
+            .filter_map(|b| {
+                let settled = b.reset_at()?.saturating_add(RESET_SETTLE_S);
+                (b.spent() || self.as_of < settled).then_some(settled)
+            })
+            .any(|settled| now >= settled)
+    }
+
+    /// Whether an active non-full bucket's recorded refill timestamp arrived since `self.as_of`.
+    fn refill_crossed(&self, now: i64) -> bool {
+        self.quota
+            .groups
+            .iter()
+            .flat_map(|g| g.buckets.iter())
+            .filter(|b| !b.disabled && b.remaining.is_some_and(|f| f + f64::EPSILON < 1.0))
             .filter_map(agy_quota::Bucket::reset_at)
-            .any(|at| now >= at + RESET_SETTLE_S)
+            .any(|at| self.as_of < at && now >= at)
+    }
+
+    /// `self.quota` projected for a stale reading at `now`: each active non-full bucket whose
+    /// recorded refill has arrived (`now >= reset_at` when read before `reset_at`, or past
+    /// [`RESET_SETTLE_S`] when read at or after `reset_at`) refills to `1.0`, while buckets whose
+    /// refill is still in the future keep their recorded standing.
+    #[must_use]
+    pub fn quota_at_stale(&self, now: i64) -> Quota {
+        let mut quota = self.quota.clone();
+        for group in &mut quota.groups {
+            for b in &mut group.buckets {
+                if !b.disabled
+                    && b.remaining.is_some_and(|f| f + f64::EPSILON < 1.0)
+                    && b.reset_at().is_some_and(|at| {
+                        let settled = at.saturating_add(RESET_SETTLE_S);
+                        if self.as_of < at {
+                            now >= at
+                        } else {
+                            (b.spent() || self.as_of < settled) && now >= settled
+                        }
+                    })
+                {
+                    b.remaining = Some(1.0);
+                    b.reset = None;
+                }
+            }
+        }
+        quota
     }
 }
 
@@ -140,15 +183,30 @@ impl Store {
             .flatten()?;
         let (at, model) = text.trim().split_once(' ')?;
         let at: i64 = at.parse().ok()?;
-        (now >= at && now - at < FRESH_OPEN_S && !model.is_empty()).then(|| model.to_owned())
+        (now >= at && now.saturating_sub(at) < FRESH_OPEN_S && !model.is_empty())
+            .then(|| model.to_owned())
+    }
+
+    /// agy's default model as last read, regardless of age.
+    #[must_use]
+    pub fn last_default(&self) -> Option<String> {
+        let text = super::accounts::read_bounded(&self.model_path(), 64 * 1024)
+            .ok()
+            .flatten()?;
+        let (_, model) = text.trim().split_once(' ')?;
+        (!model.is_empty()).then(|| model.to_owned())
     }
 
     /// Keep agy's default model as read at `now`.
     pub fn keep_default(&self, model: &str, now: i64) {
+        let clean = model.trim();
+        if clean.is_empty() || clean.contains(['\r', '\n']) {
+            return;
+        }
         if std::fs::create_dir_all(&self.dir).is_ok() {
             let _ = super::upgrade_models::write_atomic(
                 &self.model_path(),
-                &format!("{now} {model}\n"),
+                &format!("{now} {clean}\n"),
             );
         }
     }
@@ -165,12 +223,12 @@ impl Store {
             .flatten()?;
         let (at, why) = text.trim().split_once(' ')?;
         let at: i64 = at.parse().ok()?;
-        (now >= at && now - at < FAIL_BACKOFF_S).then(|| (at, why.to_owned()))
+        (now >= at && now.saturating_sub(at) < FAIL_BACKOFF_S).then(|| (at, why.to_owned()))
     }
 
     fn note_failure(&self, why: &str, now: i64) {
         if std::fs::create_dir_all(&self.dir).is_ok() {
-            let one_line = why.replace('\n', " ");
+            let one_line = why.replace(['\r', '\n'], " ");
             let _ = super::upgrade_models::write_atomic(
                 &self.failed_path(),
                 &format!("{now} {one_line}\n"),
@@ -261,12 +319,14 @@ impl Store {
             open.open(&path).ok()
         };
         if take().is_none() {
-            let stale = std::fs::symlink_metadata(&path)
-                .ok()
-                .filter(std::fs::Metadata::is_file)
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.elapsed().ok())
-                .is_none_or(|age| age.as_secs() >= LOCK_STALE_S);
+            let stale = match std::fs::symlink_metadata(&path) {
+                Ok(m) if m.file_type().is_dir() => false,
+                Ok(m) if m.file_type().is_file() => match m.modified() {
+                    Ok(t) => t.elapsed().is_ok_and(|age| age.as_secs() >= LOCK_STALE_S),
+                    Err(_) => true,
+                },
+                Ok(_) | Err(_) => true,
+            };
             if !stale {
                 return None;
             }
@@ -338,7 +398,10 @@ impl Sample {
                 Some((
                     id.clone(),
                     Point {
-                        left: p.get("left").and_then(Value::as_f64),
+                        left: p
+                            .get("left")
+                            .and_then(Value::as_f64)
+                            .filter(|f| f.is_finite()),
                         reset: p.get("reset").and_then(Value::as_i64),
                         off: p.get("off").and_then(Value::as_bool).unwrap_or(false),
                     },
@@ -380,21 +443,32 @@ pub fn burn(history: &[Sample], id: &str) -> Option<Burn> {
     })?;
     let first = history
         .iter()
-        .filter(|s| s.at >= last.at - BURN_LOOKBACK_S && s.at < last.at)
+        .filter(|s| s.at >= last.at.saturating_sub(BURN_LOOKBACK_S) && s.at < last.at)
         .find_map(|s| {
             s.point(id)
                 .filter(|p| !p.off && p.reset == last_point.reset && p.left.is_some())
                 .map(|p| (s.at, *p))
         })?;
-    let span = last.at - first.0;
+    let span = last.at.checked_sub(first.0)?;
     if span < BURN_MIN_SPAN_S {
         return None;
     }
     let used = first.1.left? - last_point.left?;
+    if !used.is_finite() {
+        return None;
+    }
     let per_hour = (used * 3_600.0 / span as f64).max(0.0);
+    if !per_hour.is_finite() {
+        return None;
+    }
     let left = last_point.left?;
-    let empty_at = (per_hour > 0.0)
-        .then(|| last.at + (left / per_hour * 3_600.0) as i64)
+    let secs_left = left / per_hour * 3_600.0;
+    let empty_at = (per_hour > 0.0
+        && secs_left.is_finite()
+        && secs_left >= 0.0
+        && secs_left <= i64::MAX as f64)
+        .then(|| last.at.checked_add(secs_left as i64))
+        .flatten()
         .filter(|at| last_point.reset.is_none_or(|reset| *at < reset));
     Some(Burn { per_hour, empty_at })
 }
@@ -547,11 +621,18 @@ pub fn current(
     }
 }
 
+/// Minimum age in seconds of a kept reading before a quota wall on screen forces a fresh
+/// `agy -p /usage` read ([`rotate_launch_at`]), bounding wall-triggered reads to at most one per
+/// 30 seconds.
+pub const WALL_FORCE_FLOOR_S: i64 = 30;
+
 /// What [`rotate_launch`] decided, with the reading it decided on.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LaunchPick {
     /// The decision.
     pub pick: agy_quota::Pick,
+    /// The parsed quota snapshot `pick` was decided from.
+    pub quota: agy_quota::Quota,
     /// The model was named by the caller (`model=`), not agy's default.
     pub named: bool,
     /// Where the reading came from.
@@ -570,34 +651,139 @@ pub fn rotate_launch(
     rotation: &agy_quota::Rotation,
     now: i64,
 ) -> Option<LaunchPick> {
+    rotate_launch_at(asked, store, source, rotation, now, false)
+}
+
+/// [`rotate_launch`] with `at_wall`: when `true` (a running `agy` session is stopped at a quota
+/// wall on screen), a kept reading at least [`WALL_FORCE_FLOOR_S`] old is refreshed and
+/// [`agy_quota::pick_at_wall`] decides the model.
+#[must_use]
+pub fn rotate_launch_at(
+    asked: Option<&str>,
+    store: &Store,
+    source: &dyn Source,
+    rotation: &agy_quota::Rotation,
+    now: i64,
+    at_wall: bool,
+) -> Option<LaunchPick> {
     if !rotation.enabled {
         return None;
     }
-    let (reading, got) = current(store, source, now, rotation.low, false).ok()?;
-    // A stale reading past its refill can neither show what is available now nor hold the
-    // launch for a reset that already passed.
-    if got == Got::Stale && reading.refill_passed(now) {
+    let force = store.recent_failure(now).is_none()
+        && store.last().map_or(at_wall, |r| {
+            r.refill_crossed(now) || (at_wall && now.saturating_sub(r.as_of) >= WALL_FORCE_FLOOR_S)
+        });
+    let (reading, got) = current(store, source, now, rotation.low, force).ok()?;
+    // At a live quota wall, a stale reading past any recorded refill cannot justify restarting the
+    // running session.
+    if got == Got::Stale && at_wall && (reading.refill_passed(now) || reading.refill_crossed(now)) {
         return None;
     }
     let (model, named) = match asked {
         Some(m) => (m.to_owned(), true),
         None => {
-            let model = match store.kept_default(now) {
+            let kept = store
+                .kept_default(now)
+                .filter(|_| !(at_wall && got == Got::Read));
+            let model = match kept {
                 Some(m) => m,
-                None => {
-                    let m = source.default_model().ok()?;
-                    store.keep_default(&m, now);
-                    m
-                }
+                None => match source.default_model() {
+                    Ok(m) => {
+                        store.keep_default(&m, now);
+                        m
+                    }
+                    Err(_) => store.kept_default(now)?,
+                },
             };
             (model, false)
         }
     };
+    let effective_quota;
+    let quota_for_pick = if got == Got::Stale && !at_wall {
+        effective_quota = reading.quota_at_stale(now);
+        &effective_quota
+    } else {
+        &reading.quota
+    };
+    let pick = if at_wall {
+        agy_quota::pick_at_wall(quota_for_pick, &model, rotation)
+    } else {
+        agy_quota::pick(quota_for_pick, &model, named, rotation)
+    };
+    // A stale reading past its refill cannot hold a launch in Wait or assert Keep; it may still
+    // rotate off a pool whose own blocker has not yet refilled.
+    if got == Got::Stale
+        && ((reading.refill_passed(now) && !matches!(pick, agy_quota::Pick::Rotate { .. }))
+            || matches!(
+                pick,
+                agy_quota::Pick::Wait {
+                    until: Some(until),
+                    ..
+                } if until <= now
+            ))
+    {
+        return None;
+    }
     Some(LaunchPick {
-        pick: agy_quota::pick(&reading.quota, &model, named, rotation),
+        pick,
+        quota: reading.quota,
         named,
         got,
     })
+}
+
+/// When an agy launch for `asked` (or the kept default model when `None`) that [`rotate_launch`]
+/// refused with [`agy_quota::Pick::Wait`] may start, from `store`'s kept reading as it stands
+/// (reading no usage): the earliest refill `until > now` (or `until + RESET_SETTLE_S` when a read
+/// at or after `until` still saw the pre-refill zero inside the settling window) while
+/// `rotation.enabled` holds and [`agy_quota::pick`] still waits, else `None`.
+#[must_use]
+pub fn launch_opening(
+    asked: Option<&str>,
+    store: &Store,
+    rotation: &agy_quota::Rotation,
+    now: i64,
+) -> Option<i64> {
+    if !rotation.enabled {
+        return None;
+    }
+    let reading = store.last()?;
+    let (model, named) = match asked {
+        Some(m) => (m.to_owned(), true),
+        None => (store.last_default()?, false),
+    };
+    match agy_quota::pick(&reading.quota, &model, named, rotation) {
+        agy_quota::Pick::Wait {
+            until: Some(until), ..
+        } => {
+            if until > now {
+                Some(until)
+            } else {
+                let settled = until.saturating_add(RESET_SETTLE_S);
+                (reading.as_of >= until && settled > now).then_some(settled)
+            }
+        }
+        _ => None,
+    }
+}
+
+/// [`launch_opening`] for a worker started with `env` and `flags`.
+#[must_use]
+pub fn worker_opening(
+    asked: Option<&str>,
+    env: &[(String, String)],
+    flags: &[String],
+    now: i64,
+) -> Option<i64> {
+    let state = machine_state()?;
+    let home = env
+        .iter()
+        .find(|(n, _)| n == super::upgrade_agy::HOME_ENV)
+        .map(|(_, v)| v.as_str());
+    let store = Store::new(&state, &launch_key(home, flags));
+    let (rotation, _) =
+        agy_quota::Rotation::from_path(aterm_types::dirs::aterm_config_path().as_deref());
+    launch_opening(asked, &store, &rotation, now)
 }
 
 /// [`rotate_launch`] for a worker started as `exe` under the starter's `env` and `flags`: this
@@ -610,6 +796,19 @@ pub fn rotate_worker(
     env: &[(String, String)],
     flags: &[String],
     now: i64,
+) -> Option<LaunchPick> {
+    rotate_worker_at(asked, exe, env, flags, now, false)
+}
+
+/// [`rotate_worker`] with `at_wall` ([`rotate_launch_at`]).
+#[must_use]
+pub fn rotate_worker_at(
+    asked: Option<&str>,
+    exe: &Path,
+    env: &[(String, String)],
+    flags: &[String],
+    now: i64,
+    at_wall: bool,
 ) -> Option<LaunchPick> {
     let state = machine_state()?;
     let home = env
@@ -625,7 +824,7 @@ pub fn rotate_worker(
     };
     let (rotation, _) =
         agy_quota::Rotation::from_path(aterm_types::dirs::aterm_config_path().as_deref());
-    rotate_launch(asked, &store, &source, &rotation, now)
+    rotate_launch_at(asked, &store, &source, &rotation, now, at_wall)
 }
 
 #[cfg(test)]

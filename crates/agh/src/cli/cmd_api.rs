@@ -2,7 +2,8 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! `agh api`: read requests against any API-origin path.
+//! `agh api`: reads of any API-origin path, and POST, PATCH, PUT and DELETE writes to a
+//! repository's path under a permit.
 
 use std::ffi::OsStr;
 
@@ -10,22 +11,27 @@ use aterm_json::{Map, Value};
 
 use super::args::{Format, Invocation};
 use super::verbs::Noun;
+use super::write_out::WriteReport;
 use super::{Answer, Completeness, Ctx, Outcome, Receipt};
-use crate::error::Result;
+use crate::error::{Error, Kind, Result, SideEffect, Sub};
+use crate::github::raw::RawSend;
 use crate::github::{RawAnswer, RawGet};
+use crate::journal::{Intent, IntentDraft, IntentId, IntentStore, IntentView, Settled};
 use crate::policy::{ExplicitTarget, Named, RouteRequest, RouteTarget, Router};
 use crate::slug::Slug;
 use crate::wire::{Method, Origin};
+use crate::write::{Outcome as WriteOutcome, WriteOp};
 
 fn method(inv: &Invocation) -> Result<Method> {
     let text = inv.flag("--method").unwrap_or("GET").to_ascii_uppercase();
     match text.as_str() {
         "GET" => Ok(Method::Get),
         "HEAD" => Ok(Method::Head),
-        "POST" | "PATCH" | "PUT" | "DELETE" => {
-            Err(inv.usage("writes arrive in M2: agh api reads with GET or HEAD"))
-        }
-        _ => Err(inv.usage("-X wants GET or HEAD")),
+        "POST" => Ok(Method::Post),
+        "PATCH" => Ok(Method::Patch),
+        "PUT" => Ok(Method::Put),
+        "DELETE" => Ok(Method::Delete),
+        _ => Err(inv.usage("-X wants GET, HEAD, POST, PATCH, PUT or DELETE")),
     }
 }
 
@@ -91,7 +97,7 @@ fn fields(inv: &Invocation) -> Result<Vec<(String, String)>> {
             return Err(inv.usage(format!("{flag} wants KEY=VALUE")));
         };
         if flag == "-F" && value.starts_with('@') {
-            return Err(inv.usage("-F k=@file is not supported: agh api reads"));
+            return Err(inv.usage("-F k=@file is not supported: agh api reads no file"));
         }
         pairs.push((key.to_string(), value.to_string()));
     }
@@ -184,15 +190,23 @@ fn headers_value(headers: &[(String, String)]) -> Value {
     Value::Object(joined)
 }
 
-/// Executes `agh api PATH` with `GET` or `HEAD` on the API origin.
+/// Executes `agh api PATH` on the API origin: a read with `GET` or `HEAD`, a write with
+/// `POST`, `PATCH`, `PUT` or `DELETE` (`api_write`).
 ///
 /// # Errors
 ///
-/// Usage for a write method, HEAD or `--include` with `--all`, another origin, a dot-segment, a
-/// bad field, an unroutable path, a `/repositories/{id}` that is not `-R`'s, or object pages
-/// with neither ndjson nor `--jq`; the read's error.
+/// Usage for another method, HEAD or `--include` with `--all`, `--dry-run` or `--confirm` on a
+/// read, another origin, a dot-segment, a bad field, an unroutable path, a `/repositories/{id}`
+/// that is not `-R`'s, or object pages with neither ndjson nor `--jq`; the read's error; the
+/// write's (`api_write`).
 pub(crate) fn api(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     let method = method(inv)?;
+    if !method.is_read() {
+        return api_write(ctx, inv, method);
+    }
+    if inv.has("--dry-run") || inv.has("--confirm") {
+        return Err(inv.usage("--dry-run and --confirm are a write's flags"));
+    }
     let all = inv.has("--all");
     if method == Method::Head && all {
         return Err(inv.usage("-X HEAD reads no body, so --all has no pages to walk"));
@@ -283,4 +297,335 @@ pub(crate) fn api(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
         receipt.repo = Some(slug.to_string());
     }
     Ok(Outcome { answer, receipt })
+}
+
+/// GitHub's answer as a write's report carries it: its JSON body, `null` for an empty body
+/// (a 204), its text for a body that is not JSON, or `{body, headers, status}` under
+/// `--include`.
+fn answer_value(answer: RawAnswer) -> Value {
+    match answer {
+        RawAnswer::Json(value) => value,
+        RawAnswer::Pages(pages) => Value::Array(pages),
+        RawAnswer::Bytes(bytes) if bytes.is_empty() => Value::Null,
+        RawAnswer::Bytes(bytes) => Value::String(String::from_utf8_lossy(&bytes).into_owned()),
+        RawAnswer::Included {
+            status,
+            headers,
+            body,
+        } => {
+            let mut value = Map::new();
+            value.insert("body".into(), body);
+            value.insert("headers".into(), headers_value(&headers));
+            value.insert("status".into(), Value::from(u64::from(status)));
+            Value::Object(value)
+        }
+    }
+}
+
+/// The `-f` and `-F` pairs as a write's JSON body: one object of strings, the last value of
+/// a key kept; `None` when no field was given.
+fn body_of(pairs: Vec<(String, String)>) -> Option<Value> {
+    if pairs.is_empty() {
+        return None;
+    }
+    let object: Map = pairs
+        .into_iter()
+        .map(|(key, value)| (key, Value::String(value)))
+        .collect();
+    Some(Value::Object(object))
+}
+
+/// The journal as `Raw::send` writes it, keeping the id its `begin` returned: the report names
+/// this run's intent with no second read, which could fail after the write landed or find
+/// another process's intent of the same key. A PATCH, PUT or DELETE is never journaled, so it
+/// opens no journal (`journal` is `None`) and `Raw::send` calls none of these.
+struct Begun<'a> {
+    journal: Option<&'a dyn IntentStore>,
+    id: std::sync::Mutex<Option<IntentId>>,
+}
+
+impl Begun<'_> {
+    /// The intent this run began, if it began one.
+    fn id(&self) -> Option<IntentId> {
+        self.id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The journal, or could_not_run when this write opened none.
+    fn journal(&self) -> Result<&dyn IntentStore> {
+        self.journal.ok_or_else(|| {
+            Error::could_not_run("a PATCH, PUT or DELETE is not journaled").with_sub(Sub::Local)
+        })
+    }
+}
+
+impl IntentStore for Begun<'_> {
+    fn begin(&self, draft: &IntentDraft) -> Result<IntentId> {
+        let id = self.journal()?.begin(draft)?;
+        *self
+            .id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(id.clone());
+        Ok(id)
+    }
+
+    fn settle(&self, id: &IntentId, outcome: &Settled) -> Result<()> {
+        self.journal()?.settle(id, outcome)
+    }
+
+    fn observe(&self, id: &IntentId, found: Option<u64>) -> Result<()> {
+        self.journal()?.observe(id, found)
+    }
+
+    fn open(&self) -> Result<Vec<Intent>> {
+        self.journal()?.open()
+    }
+
+    fn latest(&self, op: WriteOp, key: &str) -> Result<Option<IntentView>> {
+        self.journal()?.latest(op, key)
+    }
+}
+
+/// The outcome a write's error prints in its report: `unknown` when the kind is
+/// OutcomeUnknown or `side_effect` is unknown or applied (a settle that failed after a 2xx:
+/// GitHub took the write, so it is not `refused`), `not_sent` when agh could not run and
+/// nothing was written, `refused` for anything else. It is WP6's `outcome_of` rule as WP3
+/// amends it (plan §7, the sixth pass; §10 body 1.5); once `write_out::outcome_of` lands,
+/// `agh api` calls it and this copy goes.
+fn outcome_word(error: &Error) -> &'static str {
+    if error.kind == Kind::OutcomeUnknown
+        || matches!(error.side_effect, SideEffect::Unknown | SideEffect::Applied)
+    {
+        "unknown"
+    } else if error.kind == Kind::CouldNotRun {
+        "not_sent"
+    } else {
+        "refused"
+    }
+}
+
+/// `agh api` with `POST`, `PATCH`, `PUT` or `DELETE` (design §9.4, plan §7 body 8). The
+/// repository is the literal the typed PATH holds, a `DELETE` needs `--confirm PATH` typed
+/// again, and `--dry-run` routes and mints the permit and sends and journals nothing. Off
+/// unix every write, a dry run included, prints `not_sent` and exits 3 (`write::unix_only`).
+/// The answer is a `WriteReport`, op `api`, key `api {METHOD} {path}`.
+///
+/// # Errors
+///
+/// Usage for `--all`, a path outside `/repos/{owner}/{repo}/…`, and the read path's path and
+/// field rules; Refused (exit 1) for a DELETE without its `--confirm`; the permit's refusal;
+/// `Raw::send`'s Usage. Every other error of the journal or `Raw::send` is a refused,
+/// unknown or not-sent write, which prints its report and exits 1 (an answered 401, 403 or
+/// 429 its own 4, 5 or 11), 13 or 3, or the error's own exit.
+fn api_write(ctx: &mut Ctx, inv: &Invocation, method: Method) -> Result<Outcome> {
+    if inv.has("--all") {
+        return Err(inv.usage("--all pages a read"));
+    }
+    let typed = inv.require(0, "PATH")?;
+    if method == Method::Delete && inv.flag("--confirm") != Some(typed) {
+        return Err(Error::refused(format!("a DELETE needs --confirm {typed}"))
+            .with_next(format!("type the path again: --confirm {typed}")));
+    }
+    let gh = ctx.github()?;
+    let (path, query) = path_and_query(inv, typed, gh.endpoints().api())?;
+    let body = body_of(fields(inv)?);
+    let (route_target, named, path_id) = target(inv, &path, gh.router())?;
+    let slug = match (&route_target, path_id) {
+        (RouteTarget::Repo(slug), None) => slug.clone(),
+        _ => {
+            return Err(inv.usage(format!(
+                "a write names its repository in its path: /repos/OWNER/NAME/…, not {path}"
+            )));
+        }
+    };
+    let path = if query.is_empty() {
+        path
+    } else {
+        format!("{path}?{}", crate::path::query(&query))
+    };
+    let route = RouteRequest::write(route_target)
+        .with_anonymous(inv.global.anonymous)
+        .with_as(inv.global.as_profile.clone())
+        .with_named(named);
+    let permit = gh.permit(&route)?;
+    let key = crate::github::raw::journal_key(method, &path);
+    let report = |outcome: &str| WriteReport::new(outcome, WriteOp::Api, &slug, &key);
+    let receipt = |gh: &crate::client::Github| {
+        let mut receipt = Receipt::new(&inv.verb_name()).metered(&gh.meter());
+        receipt.repo = Some(slug.to_string());
+        receipt
+    };
+    // Off unix every write answers `write::unix_only()` before anything is journaled or sent
+    // (`Raw::send`'s and `gh.journal`'s first step), so a dry run answers it too: it
+    // predicts the real run, which never sends.
+    if cfg!(not(unix)) {
+        return Ok(Outcome {
+            answer: Answer::FailedWith {
+                value: report("not_sent").to_value(),
+                error: crate::write::unix_only(),
+            },
+            receipt: receipt(&gh),
+        });
+    }
+    if inv.has("--dry-run") {
+        let value = report("would_send").dry_run().to_value();
+        return Ok(Outcome {
+            answer: Answer::Object {
+                noun: Noun::Write,
+                value,
+            },
+            receipt: receipt(&gh),
+        });
+    }
+    let mut send = RawSend::new(method, &path, route);
+    send.body = body;
+    send.accept = inv.flag("--accept").map(str::to_string);
+    send.include = inv.has("--include");
+    // Only a POST is journaled (plan §7 body 7): a PATCH, PUT or DELETE opens no journal.
+    let journal = if method == Method::Post {
+        gh.journal(&slug).map(Some)
+    } else {
+        Ok(None)
+    };
+    let begun = Begun {
+        journal: journal
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .map(|journal| journal as &dyn IntentStore),
+        id: std::sync::Mutex::new(None),
+    };
+    let sent = match &journal {
+        Ok(_) => gh.raw().send(&permit, &send, &begun),
+        Err(error) => Err(error.clone()),
+    };
+    let mut receipt = receipt(&gh);
+    let answer = match sent {
+        Ok(WriteOutcome::Done(raw)) => {
+            receipt.as_ = Some(raw.as_.clone());
+            let intent = begun.id();
+            let value = answer_value(raw.answer);
+            // Under `--include` the answer is `{body, headers, status}`: the object is its body.
+            let object = if send.include {
+                value.get("body").unwrap_or(&Value::Null)
+            } else {
+                &value
+            };
+            let id = object.get("id").and_then(Value::as_u64);
+            let url = ["html_url", "url"]
+                .iter()
+                .find_map(|name| object.get(name).and_then(Value::as_str))
+                .map(str::to_string);
+            let report = report("created")
+                .with_object(id, url.as_deref())
+                .with_intent(intent.as_ref())
+                .with_answer(Some(value));
+            Answer::Object {
+                noun: Noun::Write,
+                value: report.to_value(),
+            }
+        }
+        Ok(WriteOutcome::NeverSent(error)) => Answer::FailedWith {
+            value: report("not_sent").to_value(),
+            error,
+        },
+        Ok(WriteOutcome::Refused(error)) => {
+            // A refused write exits 1 (plan §7 body 8), but an answered 401, 403 or 429 keeps
+            // its own exit (4, 5 or 11), which a script that backs off or re-authenticates reads.
+            let error = if matches!(
+                error.kind,
+                Kind::Unauthenticated | Kind::Forbidden | Kind::RateLimited
+            ) {
+                error
+            } else {
+                let why = error.why.clone();
+                error.recast(Kind::Refused, why)
+            };
+            Answer::FailedWith {
+                value: report("refused").to_value(),
+                error,
+            }
+        }
+        Ok(WriteOutcome::Unknown { intent, error }) => {
+            let value = report("unknown").with_intent(Some(&intent)).to_value();
+            // `into_result` of an Unknown is always its OutcomeUnknown error (exit 13).
+            let unknown = WriteOutcome::<()>::Unknown { intent, error }.into_result();
+            Answer::FailedWith {
+                value,
+                error: unknown.err().unwrap_or_else(|| {
+                    Error::new(Kind::OutcomeUnknown, "the write's outcome is unknown")
+                }),
+            }
+        }
+        // A PATCH, PUT or DELETE that may have landed has no intent: it is OutcomeUnknown
+        // (exit 13), and its next reads the state before anything is sent again. A POST's
+        // error (its settle failed after an unknown answer) keeps its own next, `agh intent
+        // show`, and its report names the intent it left open.
+        Err(error) if error.side_effect == SideEffect::Unknown => {
+            let why = error.why.clone();
+            let error = error.recast(Kind::OutcomeUnknown, why);
+            let error = if method == Method::Post {
+                error
+            } else {
+                error.with_next(format!("agh api {path}"))
+            };
+            Answer::FailedWith {
+                value: report("unknown")
+                    .with_intent(begun.id().as_ref())
+                    .to_value(),
+                error,
+            }
+        }
+        Err(error) if error.kind == Kind::Usage => return Err(error),
+        // Every other error prints its report and keeps its own exit: an open intent's
+        // refusal at `begin` (OutcomeUnknown, exit 13) names that intent, a settle that failed
+        // after a 2xx (could_not_run, side effect applied) names the intent it left open, and
+        // a journal that would not open is not sent.
+        Err(error) => {
+            let intent = match &error.sub {
+                Sub::IntentOpen { intent } => IntentId::parse(intent),
+                _ => begun.id(),
+            };
+            Answer::FailedWith {
+                value: report(outcome_word(&error))
+                    .with_intent(intent.as_ref())
+                    .to_value(),
+                error,
+            }
+        }
+    };
+    Ok(Outcome { answer, receipt })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::outcome_word;
+    use crate::error::{Error, Kind, SideEffect, Sub};
+
+    /// Each row of the outcome rule: a settle that failed after a 2xx (could_not_run, side
+    /// effect applied) is `unknown`, not `refused`, and not `not_sent`.
+    #[test]
+    fn the_outcome_rule_row_by_row() {
+        let after_a_2xx = Error::could_not_run("GitHub answered 201, and the journal could not")
+            .with_sub(Sub::Local)
+            .with_side_effect(SideEffect::Applied);
+        let rows = [
+            (after_a_2xx, "unknown"),
+            (
+                Error::could_not_run("no answer").with_side_effect(SideEffect::Unknown),
+                "unknown",
+            ),
+            (
+                Error::new(Kind::OutcomeUnknown, "an open intent"),
+                "unknown",
+            ),
+            (crate::write::unix_only(), "not_sent"),
+            (Error::refused("a refusal"), "refused"),
+        ];
+        for (error, word) in rows {
+            assert_eq!(outcome_word(&error), word, "{error:?}");
+        }
+    }
 }

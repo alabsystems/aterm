@@ -82,9 +82,9 @@ pub fn expand(spec: &J, now: i64) -> J {
     match spec {
         J::Str(s) => {
             if let Some(n) = offset(s, "@ISO+") {
-                J::s(crate::util::utc_iso(now + n))
+                J::s(crate::util::utc_iso(now.saturating_add(n)))
             } else if let Some(n) = offset(s, "@NOW+") {
-                J::Int(now + n)
+                J::Int(now.saturating_add(n))
             } else {
                 spec.clone()
             }

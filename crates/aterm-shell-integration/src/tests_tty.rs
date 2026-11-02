@@ -299,31 +299,44 @@ fn unfixed_folder(root: &Path) -> PathBuf {
     )
 }
 
+/// One file of a control folder and its edits: a script by its extension (`zsh`, `bash`, `fish`), or a wrapper by its path in the folder (`zdotdir/.zshenv`, `bash/rcfile`, `bash/bashrc`), with the text it starts from.
 #[cfg(unix)]
 type ScriptEdits<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
 
+/// This build's script set in `root/rev`, each file `edits` names rewritten from its text with each `(from, to)` applied: a script with its body file (and fish's copy in the folder's vendor `conf.d`, which a fish given the folder's `fish-xdg` reads), a wrapper alone.
 #[cfg(unix)]
 fn folder_with_edits(root: &Path, rev: &str, edits: &[ScriptEdits<'_>]) -> PathBuf {
     let dir = root.join(rev);
     ensure_scripts(&dir).expect("control scripts");
-    for (ext, script, edits) in edits {
+    for (name, script, edits) in edits {
         let mut edited = (*script).to_owned();
         for (from, to) in *edits {
             assert_eq!(
                 edited.matches(from).count(),
                 1,
-                "{ext}: `{}` moved — keep the control in step",
+                "{name}: `{}` moved — keep the control in step",
                 from.trim()
             );
             edited = edited.replace(from, to);
         }
+        if name.contains('/') {
+            std::fs::write(dir.join(name), &edited).unwrap();
+            continue;
+        }
         let body = scripts::body(&edited).expect("markers").to_owned();
-        std::fs::write(dir.join(format!("aterm_shell_integration.{ext}")), &edited).unwrap();
+        std::fs::write(dir.join(format!("aterm_shell_integration.{name}")), &edited).unwrap();
         std::fs::write(
-            dir.join(format!("{BODY_FILE_STEM}.{ext}")),
+            dir.join(format!("{BODY_FILE_STEM}.{name}")),
             format!("{BODY_FILE_HEADER}{body}"),
         )
         .unwrap();
+        if *name == "fish" {
+            std::fs::write(
+                dir.join("fish-xdg/fish/vendor_conf.d/aterm_shell_integration.fish"),
+                &edited,
+            )
+            .unwrap();
+        }
     }
     dir
 }

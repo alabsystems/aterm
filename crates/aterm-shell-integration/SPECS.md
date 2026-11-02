@@ -1,84 +1,28 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-shell-integration: spec recovery from its 166 unit tests
+# aterm-shell-integration: spec recovery from its unit tests
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 1 test it
-> deleted are gone. Counts elsewhere in this file were taken before.
-
-> Status 2026-10-16: this is the crate's migration worklist. Each spec below is proved through
-> Trust/Clean, and then the tests it subsumes are deleted. The 6 checks in §4 sample no spec and can
-> be deleted now. Nothing has been deleted yet.
->
-> Added later on 2026-10-16: `sh-pwsh-keys` (the PowerShell readline key layer), sampled by the 6
-> tests in `src/tests_pwsh_keys.rs`. Its §1 and §2 rows and its place in the tables below are
-> written; the headline counts (166 tests, 45 specs, 160 covered) predate it.
->
-> 2026-10-20 (predictive editing, review of increment 4): a signed `133;B` that stands where the buffer starts
-> says so (`aterm_input=start`): bash's and fish's, which end the prompt, always; zsh's, sent from zle-line-init,
-> only over an empty buffer (a line pre-filled from the buffer stack is drawn first). `sh-bash-ps1-one-133b`'s test
-> also checks the word and that a PS1 an older body marked sheds its mark; `sh-zsh-line-init-marks` gains
-> `an_integrated_zsh_says_its_b_starts_the_buffer_only_over_an_empty_one`. The fish lane did not run on the
-> host that wrote it (no fish there).
-
-Source: `crates/aterm-shell-integration` (read only). The `#[test]` fns are src/lib.rs 2,
-src/tests.rs 129, src/tests_loader.rs 21, src/tests_tty.rs 12, tests/prepare_fish_xdg_default.rs 1
-and tests/prepare_zsh_unset_zdotdir.rs 1, for 166 in all. `grep -c '#\[test\]'` reports 167 because
-`tests/shell_suite.rs` mentions `#[test]` in a doc comment but defines no test. Nothing was compiled or run.
-The claims below come from reading the code.
-
-Result: **45 specs** cover **160 tests**. **6 tests are not spec samples** (§4). 20 specs are about
-compiled Rust in `src/lib.rs` and retire 40 tests as their primary spec. 25 specs (`sh-*`) are about the
-embedded shell programs and retire 120 tests.
+The specs the crate's tests sample, recovered by reading the code. §1 holds the spec rows; §2 maps each
+test to the spec that retires it once that spec is proved.
 
 ## 0. Notation used in the statements
 
-**Two layers.** Specs whose id does not start with `sh-` are about compiled Rust in `src/lib.rs`, and
-Trust/Clean can prove them about the compiled fn. Specs whose id starts with `sh-` are about the
-**embedded shell programs**: `scripts::{ZSH,BASH,FISH,POWERSHELL}`, `ZSH_WRAPPER`, `BASH_WRAPPER` and
-`WSL_LAUNCH_SH`. Each one says what a real zsh, bash, fish, pwsh or cmd does when it runs those bytes.
-No Rust fn body implements these properties, so a Trust proof about a compiled fn cannot discharge them.
-They need a shell-language semantics: a Clean model of the POSIX-sh/zsh/bash/fish/PowerShell subset the
-scripts use, plus a refinement from that model to the real interpreters. Audit §7 has no row for this.
-This file calls it gap **SH** and proposes it as a new §7 row. The nearest existing rows are 8 (effects:
-process, pty, fs, env) and 10 (model→code refinement), so every `sh-*` row lists `SH,8,10`. Until SH
-exists, the `sh-*` specs stay written down here and their live tests stay.
+**Two layers.** An id without `sh-` is about compiled Rust in `src/lib.rs`. An `sh-*` id is about the
+embedded shell programs (`scripts::{ZSH,BASH,FISH,POWERSHELL}`, `ZSH_WRAPPER`, `BASH_WRAPPER`,
+`WSL_LAUNCH_SH`): what a real zsh, bash, fish, pwsh or cmd does when it runs those bytes. No Rust fn
+implements these, so a proof about compiled code cannot discharge them. They need a shell-language
+semantics (a Clean model of the shell subset the scripts use, refined to the real interpreters), which
+this file calls gap **SH**. Until it exists, the `sh-*` tests stay.
 
-Gap 0 (a seal that publishes Clean rows) is a prerequisite for every row, so the blocking-gaps column
-leaves it out. No spec here is blocked by gap 0 alone, because every Rust fn in the crate handles at least
-`&str`, `String`, `Vec`, `Option` or the filesystem.
-
-- `last_seg(p)`: the suffix of p after its last `/` or `\` (all of p if it has neither).
-- `lc`: ASCII lowercase. `strip1(x,s)`: s with one trailing x removed, if present.
-- `PH` = `NONCE_PLACEHOLDER` = `"@ATERM_SHELL_NONCE@"`. `TITLE` = `CMD_PROMPT_TITLE` = `"$e]0;$P$e\"`.
-- `OURS` = `WSLENV_ENTRIES` = `["ATERM_SHELL_INTEGRATION_DIR/p","ATERM_SHELL_NONCE","ATERM_WSL_CWD"]`.
-  `name(e)` is the prefix of e before its first `/`, and `names(OURS)` = {name(o) | o ∈ OURS}.
-- `pev(p)` = `path_env_value(p)` = `String::from_utf8_lossy(p.as_os_str().as_encoded_bytes())`.
-- `SET` = `script_set()`: the 14 (relative path, bytes) pairs. `ADDR` = `script_set_address()`.
-- `Match(d)` ⇔ ∀(r,b)∈SET: `fs::read(d/r) = Ok(b)`.
-- `pct(s)`: the OSC 7 percent encoding. Bytes in `[A-Za-z0-9_.~/-]` are kept. Every other byte becomes
-  `%XX` in uppercase hex.
-- `enc633(s)`: the OSC 633;E encoding. `\` becomes `\\`, `;` becomes `\x3b`, a space becomes `\x20`, and
-  each byte in 0x00..=0x1F or 0x7F becomes `\xNN` in lowercase hex. Every other byte is kept.
-- `Frame(p)` = ESC `]` p BEL. `suffix(n)` = `";id="++n` if n≠"" else "".
 - `Session(env)` ⇔ `ATERM_CHILD` or `ATERM_SESSION_ID` is non-empty.
-- `Bare(sh)`: the same interpreter run with no integration sourced. `Obs\OSC`: a shell's stdout/stderr
-  with every OSC frame removed.
-
-**Refactors that shrink the effect surface (gap 8).** Each one turns an effectful spec into a pure one
-that the gap-1/3/5 lanes can prove:
-- Factor `prepare_zsh`, `prepare_fish`, `prepare_wsl` and `prepare_cmd` into pure functions of the
-  inherited value, as `cmd_prompt` already is: `zsh_env(base, Option<zdotdir>)`, `fish_env(base,
-  Option<xdg>)`, `wsl_env(base, existing)`. This moves `injection-shape` and `cmd-prompt` off gap 8.
-- Factor `collect_old_script_sets` into a pure selector over `[(name, is_dir, mtime)]` plus a delete loop.
-  This moves the selection half of `gc-policy` off gap 8.
-- Make `prepare_into` skip `ensure_scripts` for `Cmd`, which reads no file (see §5.1).
+- `READLINE_ROWS`, `PRESS_SEEDS` and `PRESSES` are tables in `src/tests_pwsh_keys.rs`.
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (primary and secondary tests; the primary
-choice is in §2), `rust_features` (what the proof must handle), and `blocking_gaps` (audit §7 row
-numbers, with `SH` for the proposed shell-semantics row).
+Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (the tests it samples), `rust_features`
+(what the proof must handle), and `blocking_gaps` (audit §7 rows: 8 effects, 10 model→code refinement;
+`SH` as above).
 
 The table holds two rows, `sh-pwsh-keys` and `sh-hook-order` (added 2026-10-27, unit H2). The
 rows for the other 45 specs that §2 and the tables below name (the Rust specs on `src/lib.rs` and
@@ -122,7 +66,7 @@ Gaps 0, 4, 6, 9, 11 and 14–17 appear in no row. 4 (callee-ensures composition)
 
 ## 2. Test → spec map (TSV)
 
-`primary` is the spec that retires the test. `also` lists the other specs the same test samples. A test in §4 shows `(none; …)`.
+`primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 
 ```tsv
 file	test	primary	also
@@ -209,7 +153,7 @@ src/tests_pwsh_keys.rs	test_powershell_readline_layer_honours_the_opt_out_and_st
 src/tests_pwsh_keys.rs	test_powershell_ctrl_e_accepts_a_suggestion_only_at_the_end_of_the_line	sh-pwsh-keys	
 ```
 
-## 3. Coverage
+## 3. Open findings
 
 - The biggest collapses are `sh-nonce-capture` (17 primary), `sh-live-managed` (12), `sh-typed-upgrade` (8),
   `injection-shape` (7), `sh-body-pointer` (7), `sh-tty-sanity` (7), `script-const-lints` (6) and

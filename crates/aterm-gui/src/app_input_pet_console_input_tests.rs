@@ -150,6 +150,14 @@ fn an_ime_composition_is_a_person_typing() {
         "{:?}",
         human(&app)
     );
+    let typed = app
+        .pool
+        .get(session)
+        .expect("pooled")
+        .ctx
+        .human_input
+        .typed_ms_since(crate::metrics::now_us());
+    assert!(typed.is_some_and(|ms| ms < 60_000), "typing: {typed:?}");
 }
 
 #[test]

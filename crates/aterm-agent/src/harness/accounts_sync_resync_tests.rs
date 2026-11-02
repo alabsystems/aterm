@@ -640,4 +640,38 @@ fn an_ai_pool_without_claude_accounts_for_this_machine_reaches_current() {
         &fx,
     );
     assert!(!quiet.changed && quiet.failed.is_none(), "{quiet:?}");
+
+    fs::write(
+        secrets.join(super::super::ai_pool::AI_POOL_FILE),
+        "version = 1\n\n[[account]]\nprovider = \"codex\"\nemail = \"codex-one@example.test\"\nwarm = [\"m22\"]\n",
+    )
+    .unwrap();
+    assert!(
+        due(NOW + 61)
+            .as_deref()
+            .is_some_and(|why| why.contains("codex's pool has accounts to add (codex-m16)")),
+        "holder change on existing Codex row is due: {:?}",
+        due(NOW + 61)
+    );
+    let reassigned = resync_with(
+        &desk.home,
+        &desk.state,
+        (&desk.roster(), NOW + 62, false),
+        &fx,
+    );
+    assert!(
+        reassigned.synced
+            && reassigned.changed
+            && reassigned.failed.is_none()
+            && reassigned.cli_failed.is_empty(),
+        "{reassigned:?}"
+    );
+    let codex_roster = Roster::load_for(Cli::Codex, &codex).unwrap();
+    assert_eq!(
+        codex_roster
+            .row("codex-m16")
+            .and_then(|row| row.held_by.as_deref()),
+        Some("m22")
+    );
+    assert_eq!(due(NOW + 63), None);
 }

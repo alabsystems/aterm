@@ -199,8 +199,9 @@ impl DevToolsWatch {
         std::mem::take(&mut self.refresh_owed)
     }
 
-    /// Holds a verdict refresh asked for while macOS's program check is backed up: its prime would
-    /// wait in the same line.
+    /// Holds a verdict refresh until a view stands in no episode of macOS's program check: one asked
+    /// for while the check is backed up (its prime would wait in the same line), one that did not
+    /// settle, or one that did not start.
     pub(crate) const fn hold_prime(&mut self) {
         self.prime_held = true;
     }

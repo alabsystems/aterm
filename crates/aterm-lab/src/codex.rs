@@ -36,7 +36,25 @@ pub fn need_codex(run: &Run) -> Result<(), Fail> {
 }
 
 fn q(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\u{08}' => out.push_str("\\b"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\u{0c}' => out.push_str("\\f"),
+            '\r' => out.push_str("\\r"),
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 || c == '\u{7f}' => {
+                out.push_str(&format!("\\u{:04X}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// `CODEX_HOME/config.toml` for a login (`lab`, `chatgpt`, `signed-out`).
@@ -136,7 +154,7 @@ pub fn auth_json(label: &str, account: &str, plan: &str, now: i64) -> String {
     let jwt = |mut claims: Vec<(String, J)>| {
         claims.push(("lab".into(), J::s(label)));
         claims.push(("iat".into(), J::Int(now)));
-        claims.push(("exp".into(), J::Int(now + 30 * 86_400)));
+        claims.push(("exp".into(), J::Int(now.saturating_add(30 * 86_400))));
         format!(
             "{}.{}.bGFiLW5vdC1zaWduZWQ",
             seg(&J::obj([("alg", J::s("none")), ("typ", J::s("JWT"))])),
@@ -276,39 +294,72 @@ pub fn names_no_daemon(bin: &Path) -> bool {
     }
 }
 
-/// The launcher: the line the tab types (`clear`, then `exec`), or `codex-run`'s (`exec`).
-#[must_use]
-pub fn launcher(run: &Run, tab: bool, mode: &str, envs: &[String], args: &[String]) -> String {
+const UNSET_ENV: [&str; 3] = ["OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL"];
+
+/// The canonical launcher's environment, grouped by shell line, values already shell words.
+fn launcher_env(run: &Run, mode: &str) -> Vec<Vec<(&'static str, String)>> {
     let w = run.w.to_string_lossy();
     let shim = run.run.join("shim");
     let px = shell_quote(&run.proxy);
+    let mut rows = vec![
+        vec![
+            ("PATH", shell_prepend_path(&shim.to_string_lossy())),
+            ("HOME", shell_quote(&format!("{w}/home"))),
+            ("CODEX_HOME", shell_quote(&format!("{w}/codex-home"))),
+        ],
+        crate::lab::PROXY_KEYS
+            .into_iter()
+            .map(|name| (name, px.clone()))
+            .collect(),
+        vec![
+            ("NO_PROXY", "127.0.0.1,localhost".into()),
+            ("no_proxy", "127.0.0.1,localhost".into()),
+        ],
+        vec![
+            (
+                "LAB_SECURITY_LOG",
+                shell_quote(&format!("{w}/security.log")),
+            ),
+            ("LAB_OPEN_LOG", shell_quote(&format!("{w}/open.log"))),
+            ("BROWSER", shell_quote(&shim.join("open").to_string_lossy())),
+        ],
+        vec![
+            (
+                "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
+                shell_quote(&format!("http://127.0.0.1:{}/oauth/token", run.port)),
+            ),
+            (
+                "CODEX_REVOKE_TOKEN_URL_OVERRIDE",
+                shell_quote(&format!("http://127.0.0.1:{}/oauth/revoke", run.port)),
+            ),
+        ],
+    ];
+    if mode == "lab" {
+        rows.push(vec![("LAB_CODEX_KEY", LAB_CODEX_KEY.into())]);
+    }
+    rows
+}
+
+/// The launcher: the line the tab types (`clear`, then `exec`), or `codex-run`'s (`exec`).
+#[must_use]
+pub fn launcher(run: &Run, tab: bool, mode: &str, envs: &[String], args: &[String]) -> String {
     let mut s = String::from("#!/bin/sh\n");
     if tab {
         s.push_str("clear\n");
     }
-    s.push_str(&format!(
-        "exec env -u OPENAI_API_KEY -u CODEX_API_KEY -u OPENAI_BASE_URL PATH={} HOME={} CODEX_HOME={} \\\n",
-        shell_prepend_path(&shim.to_string_lossy()),
-        shell_quote(&format!("{w}/home")),
-        shell_quote(&format!("{w}/codex-home"))
-    ));
-    s.push_str(&format!(
-        "  HTTP_PROXY={px} HTTPS_PROXY={px} http_proxy={px} https_proxy={px} ALL_PROXY={px} all_proxy={px} \\\n"
-    ));
-    s.push_str("  NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \\\n");
-    s.push_str(&format!(
-        "  LAB_SECURITY_LOG={} LAB_OPEN_LOG={} BROWSER={} \\\n",
-        shell_quote(&format!("{w}/security.log")),
-        shell_quote(&format!("{w}/open.log")),
-        shell_quote(&shim.join("open").to_string_lossy())
-    ));
-    s.push_str(&format!(
-        "  CODEX_REFRESH_TOKEN_URL_OVERRIDE={} CODEX_REVOKE_TOKEN_URL_OVERRIDE={} \\\n",
-        shell_quote(&format!("http://127.0.0.1:{}/oauth/token", run.port)),
-        shell_quote(&format!("http://127.0.0.1:{}/oauth/revoke", run.port))
-    ));
-    if mode == "lab" {
-        s.push_str(&format!("  LAB_CODEX_KEY={LAB_CODEX_KEY} \\\n"));
+    s.push_str("exec env");
+    for name in UNSET_ENV {
+        s.push_str(&format!(" -u {name}"));
+    }
+    for (index, row) in launcher_env(run, mode).iter().enumerate() {
+        s.push_str(if index == 0 { " " } else { "  " });
+        s.push_str(
+            &row.iter()
+                .map(|(name, value)| format!("{name}={value}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+        s.push_str(" \\\n");
     }
     for kv in envs {
         s.push_str(&format!("  {} \\\n", shell_quote(kv)));
@@ -341,6 +392,8 @@ pub struct Launch {
     pub envs: Vec<String>,
     /// `--no-wait`.
     pub no_wait: bool,
+    /// Emit a jailed child launch plan without typing into the preparation host.
+    pub prepare_only: bool,
     /// `-- <codex args>`.
     pub args: Vec<String>,
 }
@@ -361,6 +414,7 @@ pub fn parse_launch(args: &[String]) -> Result<Launch, String> {
                 .envs
                 .push(it.next().cloned().ok_or("codex: -e needs K=V")?),
             "--no-wait" => l.no_wait = true,
+            "--prepare-only" => l.prepare_only = true,
             "--signed-out" => l.mode = "signed-out".into(),
             "--chatgpt" => l.mode = "chatgpt".into(),
             "--" => l.args.extend(it.by_ref().cloned()),
@@ -370,11 +424,19 @@ pub fn parse_launch(args: &[String]) -> Result<Launch, String> {
                     l.plan = plan.to_string();
                 } else {
                     return Err(format!(
-                        "codex: unknown option '{other}' (use --signed-out, --chatgpt[=PLAN], -e K=V, --no-wait, -- <codex args>)"
+                        "codex: unknown option '{other}' (use --signed-out, --chatgpt[=PLAN], -e K=V, --no-wait, --prepare-only, -- <codex args>)"
                     ));
                 }
             }
         }
+    }
+    validate_login(&l)?;
+    Ok(l)
+}
+
+fn validate_login(l: &Launch) -> Result<(), String> {
+    if !matches!(l.mode.as_str(), "lab" | "chatgpt" | "signed-out") {
+        return Err("codex: login mode must be lab, chatgpt or signed-out".into());
     }
     if l.plan.is_empty()
         || !l
@@ -384,13 +446,65 @@ pub fn parse_launch(args: &[String]) -> Result<Launch, String> {
     {
         return Err("codex: --chatgpt=PLAN is a plan_type (plus, pro, free, team, ...)".into());
     }
-    Ok(l)
+    Ok(())
+}
+
+fn write_login(run: &Run, l: &Launch) -> Result<(), Fail> {
+    write_config(run, &l.mode)?;
+    crate::sys::scratch_remove(&run.w.join("codex-home/auth.json"))
+        .map_err(|error| Fail::die(format!("codex: cannot remove auth.json: {error}")))?;
+    if l.mode == "chatgpt" {
+        write_auth(run, "A", "acct-lab-1", &l.plan)?;
+    }
+    Ok(())
+}
+
+/// Prepare a CLI-only jail plan without connecting input or changing the saved host.
+/// The managed binary, arguments, login and environment validate before any file writes.
+fn prepare_with(
+    run: &Run,
+    l: &Launch,
+    user: &str,
+    witness: impl FnOnce(&Run) -> Result<(), String>,
+) -> Result<crate::lab::PreparedChild, Fail> {
+    need_codex(run)?;
+    validate_login(l).map_err(Fail::usage)?;
+    safe_args(true, &l.args).map_err(Fail::usage)?;
+    let fixed: Vec<_> = UNSET_ENV
+        .into_iter()
+        .map(str::to_string)
+        .chain(
+            launcher_env(run, "lab")
+                .into_iter()
+                .flatten()
+                .map(|(name, _)| name.to_string()),
+        )
+        .collect();
+    let vars = crate::lab::prepared_child_vars(run, user, "codex", &l.envs, &fixed, &l.args)?;
+    witness(run).map_err(Fail::die)?;
+    let plan = crate::lab::PreparedChild::new(
+        run,
+        "codex-prepared",
+        run.run.join("codex-prepared.sh"),
+        &vars,
+    )?;
+    write_login(run, l)?;
+    write_launcher(
+        &plan.launcher,
+        &launcher(run, true, &l.mode, &l.envs, &l.args),
+    )?;
+    Ok(plan)
 }
 
 /// Launch the managed Codex in the lab's first tab.
 /// # Errors
 /// No Codex, no witness, a refused argument, or the launch line could not be typed.
 pub fn launch(run: &Run, l: &Launch) -> Result<String, Fail> {
+    if l.prepare_only {
+        return Err(Fail::usage(
+            "--prepare-only emits a child launch plan; it cannot type a launch",
+        ));
+    }
     need_codex(run)?;
     crate::procs::need_witness(run)?;
     safe_args(true, &l.args)?;
@@ -401,11 +515,7 @@ pub fn launch(run: &Run, l: &Launch) -> Result<String, Fail> {
     run.codex_mode.clone_from(&l.mode);
     run.agent = "codex".into();
     run.save();
-    write_config(&run, &l.mode)?;
-    let _ = fs::remove_file(run.w.join("codex-home/auth.json"));
-    if l.mode == "chatgpt" {
-        write_auth(&run, "A", "acct-lab-1", &l.plan)?;
-    }
+    write_login(&run, l)?;
     let script = run.run.join("codex.sh");
     write_launcher(&script, &launcher(&run, true, &l.mode, &l.envs, &l.args))?;
     let door = Door::new(&run)?;
@@ -413,7 +523,13 @@ pub fn launch(run: &Run, l: &Launch) -> Result<String, Fail> {
     if door.ctl(&["send", &line])?.code != 0 {
         return Err(Fail::die("could not type the launch line"));
     }
-    door.ctl(&["key", "enter"])?;
+    let entered = door.ctl(&["key", "enter"])?;
+    if entered.code != 0 {
+        return Err(Fail::die(format!(
+            "could not submit the launch line (exit {}): {}{}",
+            entered.code, entered.stdout, entered.stderr
+        )));
+    }
     Ok(format!(
         "launched: {} ({}) in lab '{}', login: {}{}  (launcher: {})",
         run.codex_bin,
@@ -429,10 +545,20 @@ pub fn launch(run: &Run, l: &Launch) -> Result<String, Fail> {
     ))
 }
 
-/// `codex [tag] [--signed-out|--chatgpt[=PLAN]] [-e K=V]... [--no-wait] [-- codex args]`.
+/// `codex [tag] [--signed-out|--chatgpt[=PLAN]] [-e K=V]... [--no-wait] [--prepare-only] [-- codex args]`.
 pub fn cmd_codex(args: &[String]) -> Res {
     let (run, a) = lab(args)?;
     let l = parse_launch(&a)?;
+    if l.prepare_only {
+        let plan = prepare_with(
+            &run,
+            &l,
+            &crate::paths::paths().user,
+            crate::procs::need_witness,
+        )?;
+        println!("{}", plan.json(&run.tag).dump(COMPACT));
+        return Ok(0);
+    }
     println!("{}", launch(&run, &l)?);
     let run = Run::load(&run.tag)?;
     if !l.no_wait
@@ -651,6 +777,10 @@ pub fn cmd_rollout(args: &[String]) -> Res {
 }
 
 #[cfg(test)]
+#[path = "codex_prepared_tests.rs"]
+mod prepared_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -703,6 +833,12 @@ mod tests {
         assert_eq!(lab.matches("[projects.").count(), 1);
         let out = config_text("signed-out", "5", "/p", "/p", "");
         assert!(!out.contains("model_provider") && !out.contains("[model_providers.lab]"));
+        let ctrl = config_text("lab", "5", "/p\n\"q\"\r\t\x00\x7f", "/p", "gpt-\n\"x\"");
+        let parsed: aterm_toml::Value = aterm_toml::from_str(&ctrl).unwrap();
+        assert_eq!(
+            parsed.get("model").and_then(|v| v.as_str()),
+            Some("gpt-\n\"x\"")
+        );
     }
 
     #[test]

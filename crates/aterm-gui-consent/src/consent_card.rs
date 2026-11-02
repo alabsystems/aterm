@@ -332,7 +332,11 @@ impl AccessRecord {
             let Some((key, value)) = line.split_once('=') else {
                 return Self::default();
             };
-            let Ok(value) = value.trim().parse::<u64>() else {
+            let value = value.trim();
+            if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                return Self::default();
+            }
+            let Ok(value) = value.parse::<u64>() else {
                 return Self::default();
             };
             let slot = match key.trim() {
@@ -832,11 +836,11 @@ impl SettleLook {
     /// A launch check that concluded `Settling` at process age `age`, at `now`: the settled look
     /// waits out the rest of [`LAUNCH_SETTLE`] (at least a second).
     pub fn after_launch(age: Duration, now: Instant) -> Self {
+        let wait = LAUNCH_SETTLE
+            .saturating_sub(age)
+            .max(Duration::from_secs(1));
         Self::Due {
-            at: now
-                + LAUNCH_SETTLE
-                    .saturating_sub(age)
-                    .max(Duration::from_secs(1)),
+            at: now.checked_add(wait).unwrap_or(now),
         }
     }
 
@@ -952,9 +956,11 @@ impl CardState {
     pub fn lifecycle_deadline(self) -> Option<Instant> {
         match self.phase {
             CardPhase::Idle | CardPhase::Settled => None,
-            CardPhase::Deciding { since } => Some(since + DECIDE_TIMEOUT),
-            CardPhase::Due => self.due_since.map(|since| since + WATCH_FOR),
-            CardPhase::Watching { since } => Some(since + WATCH_FOR),
+            CardPhase::Deciding { since } => since.checked_add(DECIDE_TIMEOUT),
+            CardPhase::Due => self
+                .due_since
+                .and_then(|since| since.checked_add(WATCH_FOR)),
+            CardPhase::Watching { since } => since.checked_add(WATCH_FOR),
         }
     }
 
@@ -1044,7 +1050,7 @@ impl CardState {
     /// The worker's verdict has not arrived within [`DECIDE_TIMEOUT`].
     pub fn deciding_lapsed(&self, now: Instant) -> bool {
         matches!(self.phase, CardPhase::Deciding { since }
-            if now.duration_since(since) >= DECIDE_TIMEOUT)
+            if now.saturating_duration_since(since) >= DECIDE_TIMEOUT)
     }
 
     /// A lapsed decision: back to `Idle` to ask again (`true`), or settled once
@@ -2515,6 +2521,10 @@ mod tests {
         let mut s = CardState::new();
         for attempt in 1..=DECIDE_ATTEMPTS {
             assert!(s.begin_deciding(t0), "attempt {attempt} starts");
+            assert!(
+                !s.deciding_lapsed(t0.checked_sub(Duration::from_millis(1)).unwrap_or(t0)),
+                "an older cached frame instant never panics or lapses"
+            );
             assert!(!s.deciding_lapsed(t0), "not lapsed on the same instant");
             assert!(!s.deciding_lapsed(t0 + DECIDE_TIMEOUT - Duration::from_millis(1)));
             assert!(s.deciding_lapsed(t0 + DECIDE_TIMEOUT));

@@ -119,71 +119,85 @@ impl CursorGlow {
         }
     }
 
-    /// Per-style spark lifetime for this move.
+    /// Per-style spark lifetime for this move. A typed spark lives the life tuned at the
+    /// default duration times [`super::typed_life_scale`] ([`super::typed_life_basis`]), so
+    /// Trail duration lengthens and shortens every style's typed trail, chained keys too.
     #[inline]
     pub(super) const fn move_spark_life(&self, mv: &MoveCtx, gap: f32) -> f32 {
         let &MoveCtx { cfg, typing, .. } = mv;
-        let full_life = cfg.duration.as_secs_f32().max(0.001);
         if typing {
-            match cfg.style {
-                GlowStyle::Phaser => {
-                    if gap <= Self::PHASER_CHAIN_GAP_MAX {
-                        (Self::PHASER_CHAIN_KEYS * gap + Self::CHAIN_MARGIN)
-                            .min(Self::PHASER_CHAIN_LIFE_MAX)
-                    } else {
-                        (full_life * 2.0).clamp(0.40, 0.75)
-                    }
-                }
-                GlowStyle::Water => {
-                    let heat_life = (full_life * 0.42).clamp(0.06, 0.14) * (1.0 + 3.0 * self.heat);
-                    if gap <= Self::CHAIN_GAP_MAX {
-                        heat_life.max(
-                            (Self::WATER_CHAIN_KEYS * gap + Self::CHAIN_MARGIN)
-                                .min(Self::WATER_CHAIN_LIFE_MAX),
-                        )
-                    } else {
-                        heat_life
-                    }
-                }
-                GlowStyle::Fire => {
-                    let heat_life =
-                        (full_life * 0.38).clamp(0.10, 0.60) * (1.0 + 2.5 * self.fire_t());
-                    if gap <= Self::CHAIN_GAP_MAX {
-                        heat_life.max((gap + Self::CHAIN_MARGIN).min(Self::CHAIN_LIFE_MAX))
-                    } else {
-                        heat_life
-                    }
-                }
-                GlowStyle::Beam => {
-                    if gap <= Self::BEAM_CHAIN_GAP_MAX {
-                        (Self::BEAM_CHAIN_KEYS * gap + Self::CHAIN_MARGIN)
-                            .min(Self::BEAM_CHAIN_LIFE_MAX)
-                    } else {
-                        (full_life * 0.5).clamp(0.13, 0.40)
-                    }
-                }
-                GlowStyle::Laser => {
-                    let charge_life =
-                        (full_life * 0.30).clamp(0.08, 0.40) * (1.0 + 1.8 * self.heat);
-                    if gap <= Self::CHAIN_GAP_MAX {
-                        charge_life.max((gap + Self::CHAIN_MARGIN).min(Self::CHAIN_LIFE_MAX))
-                    } else {
-                        charge_life
-                    }
-                }
-                _ => {
-                    let heat_life = (full_life * 0.38).clamp(0.05, 0.11) * (1.0 + 1.3 * self.heat);
-                    if gap <= Self::CHAIN_GAP_MAX {
-                        heat_life.max((gap + Self::CHAIN_MARGIN).min(Self::CHAIN_LIFE_MAX))
-                    } else {
-                        heat_life
-                    }
+            let (tuned, scale) = super::typed_life_basis(cfg.duration, self.typed_life_unscaled());
+            super::scaled_typed_life(self.typed_spark_life(cfg, tuned.max(0.001), gap), scale)
+        } else if matches!(cfg.style, GlowStyle::Phaser) {
+            (cfg.duration.as_secs_f32().max(0.001) * 0.5).clamp(0.30, 0.90)
+        } else {
+            cfg.duration.as_secs_f32().max(0.001)
+        }
+    }
+
+    /// A typed spark's life at a duration of `full_life` s, `gap` s after the last key.
+    #[inline]
+    const fn typed_spark_life(&self, cfg: &GlowConfig, full_life: f32, gap: f32) -> f32 {
+        match cfg.style {
+            GlowStyle::Phaser => {
+                if gap <= Self::PHASER_CHAIN_GAP_MAX {
+                    (Self::PHASER_CHAIN_KEYS * gap + Self::CHAIN_MARGIN)
+                        .min(Self::PHASER_CHAIN_LIFE_MAX)
+                } else {
+                    (full_life * 2.0).clamp(0.40, 0.75)
                 }
             }
-        } else if matches!(cfg.style, GlowStyle::Phaser) {
-            (full_life * 0.5).clamp(0.30, 0.90)
-        } else {
-            full_life
+            GlowStyle::Water => {
+                let heat_life = (full_life * 0.42).clamp(0.06, 0.14) * (1.0 + 3.0 * self.heat);
+                if gap <= Self::CHAIN_GAP_MAX {
+                    heat_life.max(
+                        (Self::WATER_CHAIN_KEYS * gap + Self::CHAIN_MARGIN)
+                            .min(Self::WATER_CHAIN_LIFE_MAX),
+                    )
+                } else {
+                    heat_life
+                }
+            }
+            GlowStyle::Fire => {
+                let heat_life = (full_life * 0.38).clamp(0.10, 0.60) * (1.0 + 2.5 * self.fire_t());
+                if gap <= Self::CHAIN_GAP_MAX {
+                    heat_life.max((gap + Self::CHAIN_MARGIN).min(Self::CHAIN_LIFE_MAX))
+                } else {
+                    heat_life
+                }
+            }
+            GlowStyle::Beam => {
+                if gap <= Self::BEAM_CHAIN_GAP_MAX {
+                    (Self::BEAM_CHAIN_KEYS * gap + Self::CHAIN_MARGIN)
+                        .min(Self::BEAM_CHAIN_LIFE_MAX)
+                } else {
+                    (full_life * 0.5).clamp(0.13, 0.40)
+                }
+            }
+            GlowStyle::Laser => {
+                let charge_life = (full_life * 0.30).clamp(0.08, 0.40) * (1.0 + 1.8 * self.heat);
+                if gap <= Self::CHAIN_GAP_MAX {
+                    charge_life.max((gap + Self::CHAIN_MARGIN).min(Self::CHAIN_LIFE_MAX))
+                } else {
+                    charge_life
+                }
+            }
+            GlowStyle::Lumen if !cfg.dark_theme && !self.lumen_paper_brief() => {
+                if gap <= Self::CHAIN_GAP_MAX {
+                    (Self::LUMEN_PAPER_CHAIN_KEYS * gap + Self::CHAIN_MARGIN)
+                        .min(Self::LUMEN_PAPER_LIFE_MAX)
+                } else {
+                    (full_life * 1.6).clamp(0.30, Self::LUMEN_PAPER_LIFE_MAX)
+                }
+            }
+            _ => {
+                let heat_life = (full_life * 0.38).clamp(0.05, 0.11) * (1.0 + 1.3 * self.heat);
+                if gap <= Self::CHAIN_GAP_MAX {
+                    heat_life.max((gap + Self::CHAIN_MARGIN).min(Self::CHAIN_LIFE_MAX))
+                } else {
+                    heat_life
+                }
+            }
         }
     }
 
@@ -284,8 +298,8 @@ impl CursorGlow {
                 self.snuff_off_line((cr, cc), back_leap, now, geom);
             }
             let (cwf, chf) = (geom.cw as f32, geom.ch as f32);
-            let (x1, y1) = geom.cell_center(cr, cc);
-            let (o_x, o_y) = geom.cell_center(pr, pc);
+            let (x1, y1) = cfg.caret_center(&geom, cr, cc);
+            let (o_x, o_y) = cfg.caret_center(&geom, pr, pc);
             let life = (0.16 + 0.005 * dist).clamp(0.20, 0.45);
             let mut retarget_idx = None;
             let mut mi = self.fire_meteors.len();
@@ -498,8 +512,8 @@ impl CursorGlow {
             if dist >= 2.0 {
                 if self.admit_bolt(now, false) {
                     self.spawn_bolt(
-                        geom.cell_center(pr, pc),
-                        geom.cell_center(cr, cc),
+                        cfg.caret_center(&geom, pr, pc),
+                        cfg.caret_center(&geom, cr, cc),
                         chf,
                         true,
                         now,
@@ -624,7 +638,7 @@ impl CursorGlow {
                 .style
                 .reads_knob(TrailKnob::Ring, KnobContext::widest(false));
         if ring_on && dist >= 2.0 && !fire_meteor && !navigation {
-            let (cx, cy) = geom.cell_center(cr, cc);
+            let (cx, cy) = cfg.caret_center(&geom, cr, cc);
             let scale = crate::rainbow_kitty::timing::impact(dist);
             self.ring = Some(Ring {
                 cx,
@@ -661,9 +675,9 @@ impl CursorGlow {
             self.snuff_sparks_off_line(cr, true, now, geom, 0.0);
         }
         if cfg.style.has_particles() && !fire_meteor && !navigation {
-            let (ox, oy) = geom.cell_center(cr, cc);
+            let (ox, oy) = cfg.caret_center(&geom, cr, cc);
             let leap_from = {
-                let (fx, fy) = geom.cell_center(pr, pc);
+                let (fx, fy) = cfg.caret_center(&geom, pr, pc);
                 let k = if leaves_line {
                     (Self::LEAP_BIRTH_SKIP_CELLS / dist.max(1.0)).min(0.5)
                 } else {

@@ -112,7 +112,21 @@ struct State {
     /// reads no split, so a `why` keeps its own gap (the probe still spaces
     /// every pull's reading [`crate::vitals_host::MIN_WINDOW`] apart).
     last_split_pull: Option<Instant>,
+    /// The last pull a `sys jobs` sent, the engine armed: another view's pull keeps the
+    /// engine's cadence, so a `sys jobs` keeps its own gap too.
+    last_jobs_pull: Option<Instant>,
     pacing: Pacing,
+}
+
+/// Which part of a snapshot a reply's freshness is judged by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Part {
+    /// The snapshot: when it landed.
+    Whole,
+    /// Its split set (`sys why`), carried from its last split tick.
+    Split,
+    /// Its jobs view (`sys jobs`), carried from the engine's last pass.
+    Jobs,
 }
 
 /// How the workers pull: at most one pull per `gap`, each waited for at most
@@ -214,31 +228,48 @@ impl Shared {
 
     /// A whole snapshot at most `fresh` old, pulling one when needed.
     pub(crate) fn fresh(&self, fresh: Duration, force: bool) -> (Option<Held>, Freshness) {
-        self.fresh_by(fresh, force, false)
+        self.fresh_by(fresh, force, Part::Whole)
     }
 
     /// [`Self::fresh`] for a `sys why`, judged by its split set's age while the coalition lane reads.
     pub(crate) fn fresh_why(&self, fresh: Duration, force: bool) -> (Option<Held>, Freshness) {
-        self.fresh_by(fresh, force, true)
+        self.fresh_by(fresh, force, Part::Split)
     }
 
-    /// The snapshot `q` reads, as fresh as it asks.
-    pub(crate) fn fresh_for(&self, q: &SysQuery, split: &Arming) -> (Option<Held>, Freshness) {
+    /// The snapshot `q` reads, as fresh as it asks: a `sys why` by its split set, arming `split`
+    /// while it waits, and a `sys jobs` by its jobs view, arming `jobs` (the stuck engine) while
+    /// it waits.
+    pub(crate) fn fresh_for(
+        &self,
+        q: &SysQuery,
+        split: &Arming,
+        jobs: &Arming,
+    ) -> (Option<Held>, Freshness) {
         let fresh_ms = q.fresh_ms.unwrap_or_else(|| q.freshness_default_ms());
         let fresh = Duration::from_millis(fresh_ms);
-        if q.view == View::Why {
-            let _armed = split.arm();
-            self.fresh_why(fresh, fresh_ms == 0)
-        } else {
-            self.fresh(fresh, fresh_ms == 0)
+        match q.view {
+            View::Why => {
+                let _armed = split.arm();
+                self.fresh_why(fresh, fresh_ms == 0)
+            }
+            View::Jobs => {
+                let _armed = jobs.arm();
+                self.fresh_by(fresh, fresh_ms == 0, Part::Jobs)
+            }
+            _ => self.fresh(fresh, fresh_ms == 0),
         }
     }
 
-    fn fresh_by(&self, fresh: Duration, force: bool, split: bool) -> (Option<Held>, Freshness) {
+    fn fresh_by(&self, fresh: Duration, force: bool, part: Part) -> (Option<Held>, Freshness) {
+        let split = part == Part::Split;
         let now = Instant::now();
         let mut g = self.lock();
         let have = g.held.clone();
-        let landed = |h: &Held| if split { split_landed(h) } else { Some(h.at) };
+        let landed = |h: &Held| match part {
+            Part::Whole => Some(h.at),
+            Part::Split => split_landed(h),
+            Part::Jobs => Some(jobs_landed(h)),
+        };
         if let Some(h) = have.as_ref()
             && !force
             && landed(h).is_some_and(|t| t.elapsed() <= fresh)
@@ -257,6 +288,8 @@ impl Shared {
         let armed = split && have.as_ref().is_none_or(|h| h.snap.coal_lane.on());
         let last_pull = if armed {
             g.last_split_pull
+        } else if part == Part::Jobs {
+            g.last_jobs_pull
         } else {
             g.last_pull
         };
@@ -284,6 +317,9 @@ impl Shared {
                     if armed {
                         g.last_split_pull = Some(now);
                     }
+                    if part == Part::Jobs {
+                        g.last_jobs_pull = Some(now);
+                    }
                 }
             }
         }
@@ -298,6 +334,7 @@ impl Shared {
                 && (!split
                     || !h.snap.coal_lane.on()
                     || split_ns(&h.snap).is_some_and(|ns| Some(ns) != old_split))
+                && (part != Part::Jobs || h.snap.jobs_age_ms == 0)
             {
                 return (Some(h.clone()), Freshness::Fresh);
             }
@@ -335,8 +372,9 @@ impl Shared {
     /// `privacy`'s `program_check=` ([`crate::vitals_jobs::program_check_of`]) from the newest jobs view this copy holds, pulled once when none speaks for now (leftover §9); `None` with no view that speaks for now after it. A control worker's call: the pull waits for the probe.
     pub(crate) fn program_check_now(&self) -> Option<(u32, u64)> {
         let read = || {
-            let (view, at, reader) = self.jobs_view()?;
-            crate::vitals_jobs::program_check_of(&view, at.elapsed(), reader)
+            let (snap, at, reader) = self.jobs_snapshot()?;
+            let view = snap.jobs.as_deref()?;
+            crate::vitals_jobs::program_check_of(view, snap.left.as_deref(), at.elapsed(), reader)
         };
         read().or_else(|| {
             let _ = self.fresh(crate::vitals_jobs::JOBS_FRESH, false);
@@ -344,11 +382,13 @@ impl Shared {
         })
     }
 
-    /// The newest snapshot's jobs view, when it landed, and whether its reader runs.
-    pub(crate) fn jobs_view(&self) -> Option<(Arc<aterm_vitals::jobs::JobsView>, Instant, bool)> {
+    /// The newest snapshot when it holds a jobs view (read with its leftover view), when that view
+    /// was made ([`jobs_landed`]: the snapshot's landing, less the view's age then), and whether
+    /// its reader runs.
+    pub(crate) fn jobs_snapshot(&self) -> Option<(Arc<Snapshot>, Instant, bool)> {
         let g = self.lock();
-        let h = g.held.as_ref()?;
-        Some((Arc::clone(h.snap.jobs.as_ref()?), h.at, g.tx.is_some()))
+        let h = g.held.as_ref().filter(|h| h.snap.jobs.is_some())?;
+        Some((Arc::clone(&h.snap), jobs_landed(h), g.tx.is_some()))
     }
 
     fn facts(&self) -> (Vec<PaneFact>, Machine) {
@@ -428,6 +468,13 @@ fn split_landed(h: &Held) -> Option<Instant> {
     }
     let ns = split_ns(&h.snap)?;
     h.at.checked_sub(Duration::from_nanos(h.snap.at_ns.saturating_sub(ns)))
+}
+
+/// When `h`'s jobs view was made, on the landing's clock: `h` landed [`Snapshot::jobs_age_ms`]
+/// after the engine's pass that made it (at once, for a view its own reading made).
+fn jobs_landed(h: &Held) -> Instant {
+    h.at.checked_sub(Duration::from_millis(h.snap.jobs_age_ms))
+        .unwrap_or(h.at)
 }
 
 fn split_ns(snap: &Snapshot) -> Option<u64> {
@@ -1020,7 +1067,11 @@ pub(crate) fn cmd_sys(
     if q.name.is_some() {
         return "ERR unavailable name why=not_sampled\n".to_owned();
     }
-    let (held, state) = SYS.fresh_for(&q, &crate::vitals_host::SPLIT_ARMED);
+    let (held, state) = SYS.fresh_for(
+        &q,
+        &crate::vitals_host::SPLIT_ARMED,
+        &crate::vitals_host::JOBS_ARMED,
+    );
     let held = with_services(
         &q,
         held,
@@ -1283,7 +1334,10 @@ fn await_machine(
     wait: &AwaitSys,
     exited: &dyn Fn() -> bool,
 ) -> String {
-    let deadline = Instant::now() + Duration::from_millis(wait.timeout_ms);
+    let now = Instant::now();
+    let deadline = now
+        .checked_add(Duration::from_millis(wait.timeout_ms))
+        .unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 3600));
     let _slots = names_slots(wait).then(|| crate::occupancy_host::SLOTS_ARMED.arm());
     let mut state = MachineWait::default();
     let mut seen: Option<u64> = None;
@@ -1351,21 +1405,23 @@ pub(crate) fn job_event_payload(
     out
 }
 
+/// The jobs view of `snap`, which landed or was adopted at its `Instant`, while it speaks for now
+/// read with that snapshot's leftover view ([`crate::vitals_jobs::speaks_for_now`]).
 fn fresh_jobs(
-    view: Option<(Arc<aterm_vitals::jobs::JobsView>, Instant)>,
+    snap: Option<(Arc<Snapshot>, Instant)>,
     now: Instant,
     reader: bool,
 ) -> Option<Arc<aterm_vitals::jobs::JobsView>> {
-    view.filter(|(v, at)| {
-        crate::vitals_jobs::speaks_for_now(v, now.saturating_duration_since(*at), reader)
-    })
-    .map(|(v, _)| v)
+    let (snap, at) = snap?;
+    let view = snap.jobs.clone()?;
+    let age = now.saturating_duration_since(at);
+    crate::vitals_jobs::speaks_for_now(&view, snap.left.as_deref(), age, reader).then_some(view)
 }
 
 /// `brief`'s jobs line for `session` from the workers' copy without pulling.
 pub(crate) fn brief_jobs_line(session: u64) -> Option<String> {
-    let (view, at, reader) = SYS.jobs_view()?;
-    let view = fresh_jobs(Some((view, at)), Instant::now(), reader)?;
+    let (snap, at, reader) = SYS.jobs_snapshot()?;
+    let view = fresh_jobs(Some((snap, at)), Instant::now(), reader)?;
     aterm_vitals::sys::jobs_view::brief_line(&view, &[session])
 }
 
@@ -1403,17 +1459,33 @@ pub(crate) fn splice_brief_line(text: &str, line: &str, budget: usize) -> String
     format!("{}\n{body}", head(used))
 }
 
+/// What a `sys` request that names no `@` target reads of the `left` view: with no target it
+/// sees every session's rows, so it is Owner's alone (`Err` for any other caller), and with no
+/// `scope=` it reads `scope=aterm` (the widened request). `Ok(None)`: any other request, read as
+/// written.
+pub(crate) fn untargeted_left(
+    verb: &str,
+    rest: &str,
+    owner_class: bool,
+) -> Result<Option<String>, ()> {
+    let Ok(q) = SysQuery::parse(rest) else {
+        return Ok(None);
+    };
+    if verb != "sys" || q.view != View::Left {
+        return Ok(None);
+    }
+    if !owner_class {
+        return Err(());
+    }
+    Ok(q.scope.is_none().then(|| format!("{rest} scope=aterm")))
+}
+
 impl crate::App {
     /// `status`'s `job=`, `job_quiet_ms=` and `program_check=` fields for `session`, from one
     /// adopted view at one age; `program_check=-` off macOS, where nothing is held at a check.
     pub(crate) fn status_job_fields(&self, session: u64) -> String {
         let now = Instant::now();
-        let view = self
-            .vitals
-            .snapshot
-            .as_ref()
-            .and_then(|s| s.jobs.clone())
-            .zip(self.vitals.adopted_at);
+        let view = self.vitals.snapshot.clone().zip(self.vitals.adopted_at);
         let age_ms = self.vitals.adopted_at.map_or(0, |at| {
             u64::try_from(now.saturating_duration_since(at).as_millis()).unwrap_or(u64::MAX)
         });

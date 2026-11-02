@@ -244,13 +244,19 @@ impl Agent {
     /// Per-tab upgrade record key (`<word>-<tab>`) for non-Claude lanes.
     #[must_use]
     pub fn record_key(self, tab: &str) -> Option<String> {
-        self.record_prefix().map(|prefix| format!("{prefix}{tab}"))
+        let plain = !tab.is_empty() && tab.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+        plain
+            .then(|| self.record_prefix())
+            .flatten()
+            .map(|prefix| format!("{prefix}{tab}"))
     }
 
     /// Extracts the tab id from a per-tab record key for this agent.
     #[must_use]
     pub fn record_tab(self, key: &str) -> Option<&str> {
-        key.strip_prefix(self.record_prefix()?)
+        key.strip_prefix(self.record_prefix()?).filter(|tab| {
+            !tab.is_empty() && tab.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
     }
 
     /// Identifies the non-Claude agent lane that owns the per-tab record `key`.
@@ -558,6 +564,12 @@ pub(super) fn carried_names(argv: &[String]) -> Result<Vec<&str>, ArgvRefusal> {
     Ok(carried(argv)?.into_iter().map(|(name, _)| name).collect())
 }
 
+pub(super) fn carries_tap(argv: &[String]) -> bool {
+    parsed(argv)
+        .into_iter()
+        .any(|(name, _, tokens)| name == "--settings" && tap_tokens(&tokens))
+}
+
 /// Each option of an argv as [`parsed`] reads it: its name, its fate where a table knows it, and
 /// its tokens (the name and the values it took).
 type Options<'a> = Vec<(&'a str, Option<Fate>, Vec<String>)>;
@@ -619,16 +631,23 @@ fn walked(argv: &[String]) -> (Options<'_>, Option<&str>) {
                 Some((n, _)) => (n, true),
                 None => (tok.as_str(), false),
             };
-            let known = flag_entry(raw_name);
+            let known =
+                flag_entry(raw_name).filter(|(_, arity, _)| !inline || *arity != Arity::None);
             let name = known.map_or(raw_name, |(n, _, _)| n);
             let start = i;
             i += 1;
             if !inline && let Some((_, arity, _)) = known {
                 take_values(argv, &mut i, arity);
             }
+            let missing_val = !inline
+                && known.is_some_and(|(_, arity, fate)| {
+                    fate == Fate::Keep
+                        && matches!(arity, Arity::One | Arity::Many)
+                        && i == start + 1
+                });
             out.push((
                 name,
-                known.map(|(_, _, fate)| fate),
+                known.filter(|_| !missing_val).map(|(_, _, fate)| fate),
                 argv[start..i].to_vec(),
             ));
             continue;
@@ -656,7 +675,10 @@ fn walked(argv: &[String]) -> (Options<'_>, Option<&str>) {
                 take_values(argv, &mut next, arity);
                 let mut tokens = vec![candidate];
                 tokens.extend(argv[start..next].iter().cloned());
-                out.push((name, Some(fate), tokens));
+                let missing_val = fate == Fate::Keep
+                    && matches!(arity, Arity::One | Arity::Many)
+                    && next == start;
+                out.push((name, (!missing_val).then_some(fate), tokens));
             }
             break;
         }
@@ -666,6 +688,73 @@ fn walked(argv: &[String]) -> (Options<'_>, Option<&str>) {
         i = next;
     }
     (out, operand)
+}
+
+/// Token spans of `flags` (without a required `argv[0]`), paired with each known option's canonical name.
+pub(super) fn parse_flag_spans(flags: &[String]) -> Vec<(Option<&str>, Vec<String>)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < flags.len() {
+        let tok = &flags[i];
+        if tok == "--" {
+            out.push((None, flags[i..].to_vec()));
+            break;
+        }
+        if !maybe_option(tok) {
+            out.push((None, vec![tok.clone()]));
+            i += 1;
+            continue;
+        }
+        if tok.starts_with("--") {
+            let (raw_name, inline) = match tok.split_once('=') {
+                Some((n, _)) => (n, true),
+                None => (tok.as_str(), false),
+            };
+            let known =
+                flag_entry(raw_name).filter(|(_, arity, _)| !inline || *arity != Arity::None);
+            let name = known.map(|(n, _, _)| n);
+            let start = i;
+            i += 1;
+            if !inline && let Some((_, arity, _)) = known {
+                take_values(flags, &mut i, arity);
+            }
+            out.push((name, flags[start..i].to_vec()));
+            continue;
+        }
+        let cluster = &tok[1..];
+        let mut next = i + 1;
+        let mut spans = Vec::new();
+        let mut unknown = false;
+        for (off, c) in cluster.char_indices() {
+            let candidate = format!("-{c}");
+            let Some((name, arity, _)) = flag_entry(&candidate) else {
+                unknown = true;
+                break;
+            };
+            if arity == Arity::None {
+                spans.push((Some(name), vec![candidate]));
+                continue;
+            }
+            let rest = &cluster[off + c.len_utf8()..];
+            if !rest.is_empty() {
+                spans.push((Some(name), vec![format!("-{c}{rest}")]));
+            } else {
+                let start = next;
+                take_values(flags, &mut next, arity);
+                let mut tokens = vec![candidate];
+                tokens.extend(flags[start..next].iter().cloned());
+                spans.push((Some(name), tokens));
+            }
+            break;
+        }
+        if unknown {
+            out.push((None, vec![tok.clone()]));
+        } else {
+            out.extend(spans);
+        }
+        i = next;
+    }
+    out
 }
 
 const ONE_SHOT: &[&str] = &["-p", "--print", "-h", "--help", "-v", "--version"];
@@ -920,12 +1009,12 @@ pub(super) fn with_shim_env<'a>(
 /// ([`atpkg::shim_env::turns_updater_off`]): the record's other pairs (Claude Code's survey switch)
 /// are niceties a line drops before it is refused for length, as a caller drops its own, and the
 /// updater switch it never drops.
-fn with_store_env(
+fn with_store_env<T>(
     env: &[(&str, &str)],
     unset: Option<&[&str]>,
     exe: &Path,
-    build: impl Fn(&[(&str, &str)]) -> Result<String, String>,
-) -> Result<String, String> {
+    build: impl Fn(&[(&str, &str)]) -> Result<T, String>,
+) -> Result<T, String> {
     let shim = atpkg::shim_env::of_store_binary(exe);
     let unset = unset.unwrap_or_default();
     let all = with_shim_env(env, unset, shim.entries());
@@ -943,6 +1032,68 @@ fn with_store_env(
             Err(refused)
         }
     })
+}
+
+/// A rendered command and the exact environment selected by its store/line-length fallback.
+/// The native launcher retains this selection instead of independently choosing its flags
+/// or accidentally inheriting the launcher's own package environment.
+pub(super) struct SelectedLine {
+    pub(super) line: String,
+    pub(super) env: Vec<(String, String)>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn relaunch_line_selected(
+    dialect: Dialect,
+    heal: Option<&Path>,
+    cd: Option<&str>,
+    env: &[(&str, &str)],
+    unset: Option<&[&str]>,
+    exe: &Path,
+    args: &[String],
+) -> Result<SelectedLine, String> {
+    with_store_env(env, unset, exe, |selected| {
+        relaunch_line_exact(
+            LineDiscipline::HOST,
+            dialect,
+            heal,
+            cd,
+            selected,
+            unset,
+            exe,
+            args,
+        )
+        .map(|line| SelectedLine {
+            line,
+            env: selected
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                .collect(),
+        })
+    })
+}
+
+/// Render an already selected command without adding or dropping package environment pairs.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn relaunch_line_fixed(
+    dialect: Dialect,
+    heal: Option<&Path>,
+    cd: Option<&str>,
+    env: &[(&str, &str)],
+    unset: Option<&[&str]>,
+    exe: &Path,
+    args: &[String],
+) -> Result<String, String> {
+    relaunch_line_exact(
+        LineDiscipline::HOST,
+        dialect,
+        heal,
+        cd,
+        env,
+        unset,
+        exe,
+        args,
+    )
 }
 
 /// What a bash relaunch line that changes directory opens with when no heal precedes it: a
@@ -1243,7 +1394,9 @@ fn with_rekey_on(
     path: &Path,
 ) -> Result<String, String> {
     let p = path.to_string_lossy();
-    if p.chars().any(char::is_control) {
+    if p.chars()
+        .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+    {
         return Err("a control character in the re-key path".to_string());
     }
     let shell = match dialect {
@@ -1332,9 +1485,11 @@ pub const STOPPING_POINT: &str = "Please get to a good stopping point first: let
 pub const RESTART_WATCHES: &str =
     "If you stopped a watch or loop for this restart, start it again now.";
 
-pub const RELAUNCH_RESTORES: &str = "Anything this session ran in the background before (a \
-     watch, a monitor, a loop, a shell) may not have come back: start again only what is no \
-     longer running and you still rely on.";
+/// What a restart ended, said in every continuation of a resumed conversation: the agent's own
+/// process went, and whatever it ran inside it went too.
+pub const RELAUNCH_RESTORES: &str = "Work this session ran inside its own process (subagents, \
+     workflows, background shells) ended with it: check what was running, read your handoff if \
+     you left one, and start again what you still need.";
 
 /// Child process running under the agent that blocks a restart.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1565,7 +1720,7 @@ pub fn continue_prompt_with_model(
     format!(
         "{HARNESS_MARK} Upgraded: this session was restarted {build} and resumed; {runs} \
          {model}, {why} (for this session only: your default model is unchanged). \
-         {RESTART_WATCHES} {CARRY_ON}"
+         {RESTART_WATCHES} {RELAUNCH_RESTORES} {CARRY_ON}"
     )
 }
 
@@ -1578,16 +1733,37 @@ pub fn continue_prompt(from: &Version, to: &Version, ran: Option<&str>) -> Strin
     };
     format!(
         "{HARNESS_MARK} Upgraded: this session was restarted on Claude Code {to} (from \
-         {from}){resumed}. {RESTART_WATCHES} {CARRY_ON}"
+         {from}){resumed}. {RESTART_WATCHES} {RELAUNCH_RESTORES} {CARRY_ON}"
     )
 }
 
-/// Appends the post-restart verification instruction to `text`.
+/// Whether `words`, an agent's last reply, claim the work done, and whether that claim names an
+/// irreversible act ([`checking`]).
 #[must_use]
-pub fn checking(text: &str, irreversible: bool) -> String {
+pub fn done_said(words: &str) -> (bool, bool) {
+    let done = turn_end::says_done(Some(words));
+    let irreversible = done
+        && matches!(
+            turn_end::classify_said(Some(words)),
+            turn_end::Said::Irreversible(_)
+        );
+    (done, irreversible)
+}
+
+/// Appends the post-restart verification instruction to `text`: Cruise's done check, without its
+/// sentence that the go-ahead is no need where the person's hour `held` it, as the loop's own
+/// check within that hour ([`crate::supervise::policy::go_ahead::unless_held`]).
+#[must_use]
+pub fn checking(text: &str, irreversible: bool, held: bool) -> String {
     text.strip_suffix(CARRY_ON).map_or_else(
         || text.to_string(),
-        |facts| format!("{facts}{}", turn_end::done_check_text(None, irreversible)),
+        |facts| {
+            let check = turn_end::done_check_text(None, irreversible);
+            format!(
+                "{facts}{}",
+                crate::supervise::policy::go_ahead::unless_held(&check, held)
+            )
+        },
     )
 }
 
@@ -1791,13 +1967,21 @@ pub struct FinishedScan {
     done_said: bool,
     notice: bool,
     done_irreversible: bool,
+    defended: bool,
     cut: bool,
     command: bool,
     turn: Option<String>,
     ours: Vec<Typed>,
     turn_fold: TurnFold,
     land_typed: bool,
+    /// The prompt [`Self::land`] answers is the land check: only its `LANDED` lands.
+    land_checked: bool,
+    /// The prompt [`Self::land`] answers is an older build's Land act, which landed on a clean
+    /// defense: that build's landing stands in its record.
+    land_retired: bool,
     settled: bool,
+    /// When the newest prompt of someone else's was written ([`Self::theirs_at`]).
+    theirs_at: Option<u64>,
 }
 
 enum Asked {
@@ -1805,6 +1989,8 @@ enum Asked {
     Command,
     Check,
     Land,
+    LandCheck,
+    LandRetired,
     Challenge,
     Nobody,
     Nothing,
@@ -1859,6 +2045,20 @@ impl FinishedScan {
         self.done_said
     }
 
+    /// Returns whether the model's last text turn is a clean defense of its work
+    /// ([`turn_end::clean_defense`]), with no prompt written after it.
+    #[must_use]
+    pub const fn defended(&self) -> bool {
+        self.defended
+    }
+
+    /// The unix second the newest prompt no supervisor typed was written, as far as this scan
+    /// read: what tells a person's own message from a relaunch's restored records.
+    #[must_use]
+    pub const fn theirs_at(&self) -> Option<u64> {
+        self.theirs_at
+    }
+
     /// Key identifying the turn on which the scanned transcript ends.
     #[must_use]
     pub fn last_turn_key(&self) -> Option<String> {
@@ -1904,14 +2104,17 @@ impl FinishedScan {
             return;
         };
         if !self.notice {
-            self.done_said = turn_end::says_done(Some(&words));
-            self.done_irreversible = self.done_said
-                && matches!(
-                    turn_end::classify_said(Some(&words)),
-                    turn_end::Said::Irreversible(_)
-                );
+            (self.done_said, self.done_irreversible) = done_said(&words);
         }
-        if self.land && turn_end::clean_defense(Some(&words)) {
+        self.defended = turn_end::clean_defense(Some(&words));
+        // THE LAND CHECK'S ANSWER LANDS A TASK (`land-check@v1`): `LANDED` alone, read as
+        // the policy reads it; a defense's words land nothing, but where an older build's act
+        // asked for it, as that build landed there.
+        let checked_landed = self.land_checked
+            && crate::supervise::policy::land_check::land_check_answer(&words, None, false)
+                == crate::supervise::policy::land_check::CheckAnswer::Landed;
+        let retired_landed = self.land_retired && turn_end::clean_defense(Some(&words));
+        if self.land && (checked_landed || retired_landed) {
             (self.finished, self.said, self.settled) = (true, true, true);
         } else if self.said {
             (self.finished, self.said) = (false, false);
@@ -1937,6 +2140,7 @@ impl FinishedScan {
         if matches!(asked, Asked::Nothing) && !anew {
             return;
         }
+        self.defended = false;
         let notice = row.get("message").is_some_and(is_announcement);
         // A RESUME PAST A CONDITION ([`turn_end::cleared_text`], or a wall's plain retry the
         // ledger names) delivers the prompt the condition cut again, as the vendor's own
@@ -1958,14 +2162,17 @@ impl FinishedScan {
             Asked::Theirs => {
                 (self.finished, self.command, self.done_said) = (false, false, false);
                 (self.land_typed, self.settled) = (false, true);
+                self.theirs_at = row_time(row);
             }
             Asked::Command => self.command = true,
             Asked::Check | Asked::Challenge => {
                 (self.finished, self.command, self.settled) = (false, false, true);
             }
-            Asked::Land => {
+            Asked::Land | Asked::LandCheck | Asked::LandRetired => {
                 (self.finished, self.land, self.command) = (false, true, false);
                 (self.land_typed, self.settled) = (true, true);
+                self.land_checked = matches!(asked, Asked::LandCheck);
+                self.land_retired = matches!(asked, Asked::LandRetired);
             }
             Asked::Nobody => self.command = false,
             Asked::Nothing => {}
@@ -2296,7 +2503,13 @@ fn asked_by(row: &Value, ours: &[Typed]) -> Asked {
     if words.is_some_and(is_done_check) {
         return Asked::Check;
     }
-    if words.is_some_and(is_land_check) {
+    if words.is_some_and(is_land_check_prompt) {
+        return Asked::LandCheck;
+    }
+    if words.is_some_and(is_retired_land) {
+        return Asked::LandRetired;
+    }
+    if words.is_some_and(is_land_instruction) {
         return Asked::Land;
     }
     if words.is_some_and(turn_end::is_challenge_text) {
@@ -2322,17 +2535,40 @@ fn is_done_check(text: &str) -> bool {
         })
 }
 
-fn is_land_check(text: &str) -> bool {
-    [turn_end::LAND, turn_end::LAND_NUDGE]
+/// Whether `text` opens Land's instruction or its nudge (its contradiction among them), today's
+/// or an older build's, the switch's why before it (v6 §14.17 item 3) read past.
+fn is_land_instruction(text: &str) -> bool {
+    let text = turn_end::past_switch_why(text);
+    let text = text.as_ref();
+    [
+        turn_end::LAND,
+        turn_end::LAND_NUDGE,
+        turn_end::LAND_CONTRADICTED_HEAD,
+    ]
+    .into_iter()
+    .chain(turn_end::RETIRED_LANDS)
+    .chain(turn_end::RETIRED_LAND_NUDGES)
+    .any(|head| opens_with(head, text))
+}
+
+/// Whether `text` opens a Land instruction or nudge only an older build typed (one that landed on
+/// a clean defense, before the land check).
+fn is_retired_land(text: &str) -> bool {
+    turn_end::RETIRED_LANDS
         .into_iter()
-        .chain(turn_end::RETIRED_LANDS)
         .chain(turn_end::RETIRED_LAND_NUDGES)
         .any(|head| opens_with(head, text))
 }
 
-/// Returns whether `text` opens an Autopilot Land instruction or nudge.
+/// Whether `text` opens the land check (`land-check@v1`), plain or hinted.
+pub(crate) fn is_land_check_prompt(text: &str) -> bool {
+    opens_with(turn_end::LAND_CHECK_HEAD, text)
+}
+
+/// Returns whether `text` opens an Autopilot Land act: its instruction, nudge, answer or check.
 pub(crate) fn is_land_act(text: &str) -> bool {
-    is_land_check(text)
+    is_land_instruction(text)
+        || is_land_check_prompt(text)
         || std::iter::once(turn_end::LAND_ANSWER)
             .chain(turn_end::RETIRED_LAND_ANSWERS)
             .any(|answer| opens_with(answer, text))
@@ -2581,6 +2817,24 @@ fn is_announcement(message: &Value) -> bool {
     }
 }
 
+fn announcement_has(message: &Value, marker: &str) -> bool {
+    if marker.is_empty() {
+        return false;
+    }
+    let has = |t: &str| {
+        let words = typed_words(t);
+        words.starts_with(ANNOUNCE_HEAD) && words.contains(marker)
+    };
+    match message.get("content") {
+        Some(Value::String(t)) => has(t),
+        Some(Value::Array(parts)) => parts.iter().any(|part| {
+            part.get("type").and_then(Value::as_str) == Some("text")
+                && part.get("text").and_then(Value::as_str).is_some_and(has)
+        }),
+        _ => false,
+    }
+}
+
 fn is_auth_wall_row(v: &Value) -> bool {
     v.get("type").and_then(Value::as_str) == Some("assistant")
         && v.get("isSidechain").and_then(Value::as_bool) != Some(true)
@@ -2803,6 +3057,9 @@ pub fn queue_rest(untaken: u32) -> u64 {
 /// Scans `jsonl` for the fate and queue state of the latest notice carrying `marker`.
 #[must_use]
 pub fn notice_scan(jsonl: &str, marker: &str) -> Option<Scan> {
+    if marker.is_empty() {
+        return None;
+    }
     let (mut armed, mut fate, mut until) = (false, None, None);
     let (mut answered_at, mut typed_at, mut untaken) = (None, None, 0_u32);
     for line in jsonl.lines() {
@@ -2824,9 +3081,9 @@ pub fn notice_scan(jsonl: &str, marker: &str) -> Option<Scan> {
         }
         match v.get("type").and_then(Value::as_str) {
             Some("user") => {
-                if v.get("message").is_some_and(is_announcement) {
+                if let Some(m) = v.get("message").filter(|m| is_announcement(m)) {
                     untaken = untaken.saturating_add(1);
-                    if line.contains(marker) {
+                    if announcement_has(m, marker) {
                         (armed, fate, until, answered_at) =
                             (true, Some(NoticeFate::Open), None, None);
                         typed_at = row_time(&v);
@@ -3671,7 +3928,7 @@ pub fn quiet_s() -> u64 {
     static SETTLE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *SETTLE.get_or_init(|| {
         aterm_types::dev_seam!(QUIET_SEAM)
-            .and_then(|v| v.to_str()?.trim().parse::<u64>().ok())
+            .and_then(|v| crate::parse_uint::<u64>(v.to_str()?.trim()))
             .filter(|&s| s > 0)
             .unwrap_or(QUIET_S)
     })
@@ -4514,7 +4771,7 @@ impl Request {
             "now" => Some(Self::Now),
             _ => {
                 if let Some(t) = word.strip_prefix("defer-until:") {
-                    return t.parse().ok().map(Self::DeferUntil);
+                    return crate::parse_uint(t).map(Self::DeferUntil);
                 }
                 let v = word.strip_prefix("skip:")?;
                 build_identity(agent, v).map(|v| Self::Skip(v.to_string()))

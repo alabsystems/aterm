@@ -181,8 +181,9 @@ impl Accounts {
     /// This machine's accounts from `root`'s `etc` and `run` (`/` outside the tests).
     #[must_use]
     pub fn read_under(root: &Path) -> Option<Self> {
+        const ACCOUNT_FILE_MAX: u64 = 16 * 1024 * 1024;
         let under = |path: &str| root.join(path.trim_start_matches('/'));
-        let nsswitch = match std::fs::read(under("/etc/nsswitch.conf")) {
+        let nsswitch = match read_regular_bounded(&under("/etc/nsswitch.conf"), ACCOUNT_FILE_MAX) {
             Ok(bytes) => Some(String::from_utf8(bytes).ok()?),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(_) => return None,
@@ -199,8 +200,12 @@ impl Accounts {
             return None;
         }
         Some(Self {
-            passwd: Self::parse_passwd(&std::fs::read(under("/etc/passwd")).ok()?)?,
-            groups: Self::parse_group(&std::fs::read(under("/etc/group")).ok()?)?,
+            passwd: Self::parse_passwd(
+                &read_regular_bounded(&under("/etc/passwd"), ACCOUNT_FILE_MAX).ok()?,
+            )?,
+            groups: Self::parse_group(
+                &read_regular_bounded(&under("/etc/group"), ACCOUNT_FILE_MAX).ok()?,
+            )?,
         })
     }
 
@@ -246,6 +251,33 @@ impl Accounts {
         }
         saw_account
     }
+}
+
+fn read_regular_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>, std::io::Error> {
+    use std::io::Read as _;
+    let meta = std::fs::metadata(path)?;
+    if !meta.is_file() || meta.len() > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "not a bounded regular file",
+        ));
+    }
+    let file = std::fs::File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "not a regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(max_bytes + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            "account file grew past cap",
+        ));
+    }
+    Ok(bytes)
 }
 
 fn entries(text: &[u8]) -> impl Iterator<Item = Vec<&[u8]>> {

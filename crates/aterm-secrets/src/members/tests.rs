@@ -161,52 +161,6 @@ fn address(n: u8) -> IpAddr {
 }
 
 #[test]
-fn lan_bootstrap_delivers_credentials_without_an_allow_or_typed_phrase() {
-    let root = aterm_tempfile::tempdir().unwrap();
-    let desk = member(root.path(), "member");
-    let (paths, device) = mac(root.path(), "newcomer");
-    let value = token();
-    let (served, bundle) = exchange(&desk, "192.168.1.20".parse().unwrap(), &value, |stream| {
-        let greeting = joiner::greeting(stream)?;
-        joiner::run_lan(stream, &greeting, &joining(&device, [8; 32], "newcomer"))
-    });
-    assert!(served.unwrap().is_some());
-    let bundle = bundle.unwrap();
-    let report = client::write_from_bundle(&paths, &bundle).unwrap();
-    assert!(!report.written.is_empty());
-    assert_eq!(
-        std::fs::read(paths.home.join(".secrets/gh_access_token")).unwrap(),
-        value.as_bytes()
-    );
-    assert!(
-        desk.lock()
-            .unwrap()
-            .rows(Instant::now())
-            .iter()
-            .all(|row| row.state == RowState::Closed)
-    );
-}
-
-#[test]
-fn automatic_bootstrap_refuses_non_lan_connections() {
-    let root = aterm_tempfile::tempdir().unwrap();
-    let desk = member(root.path(), "member");
-    let (_, device) = mac(root.path(), "newcomer");
-    let (served, received) = exchange(
-        &desk,
-        "203.0.113.20".parse().unwrap(),
-        "never-sent",
-        |stream| {
-            let greeting = joiner::greeting(stream)?;
-            joiner::run_lan(stream, &greeting, &joining(&device, [8; 32], "newcomer"))
-        },
-    );
-    assert!(served.is_err());
-    assert!(received.is_err());
-    assert!(desk.lock().unwrap().rows(Instant::now()).is_empty());
-}
-
-#[test]
 fn an_allowed_round_trips_and_refuses_a_changed_byte_or_its_own_writer() {
     let root = aterm_tempfile::tempdir().unwrap();
     let (_, joiner) = mac(root.path(), "j");
@@ -652,46 +606,145 @@ fn a_flood_from_a_few_addresses_never_takes_a_new_macs_row() {
     );
 }
 
-/// A row that asked again and then stopped asking is a waiting Mac's only for
-/// [`desk::STILL_ASKING`]: past it, L (which asked first, asked again, then went quiet) is the
-/// oldest of the rows that may go and goes before any fresh one, rather than holding its place
-/// for the rest of a request's day.
-/// NEGATIVE CONTROL: a row that asked again once counting as a waiting Mac's for good (the first
-/// form of this fix) drops a fresh row instead ("L, which stopped asking, went first").
+/// A row follows its Mac (D3): L, which asked first, asked again, then went quiet, lapses
+/// [`desk::STILL_ASKING`] after its last ask, so it holds no place ahead of a fresh row, while K,
+/// which asks again every 15 minutes, keeps its row and its handle; when L asks again it shows
+/// under the handle it had, so its entry is the same one. A row whose phrase can still admit
+/// stays past the lapse until the phrase ends.
+/// NEGATIVE CONTROLS: rows kept for a day from their first ask (the old `REQUEST_LIFETIME`
+/// rule) still show L ("L lapsed: [Row { … name: \"l\" …"); a counter for handles gives L's
+/// second row another handle ("L's handle is its request's"); `lapsed` without the live-phrase
+/// keep drops J's Allowed row ("J's live phrase keeps its row").
 #[test]
-fn a_row_that_stopped_asking_holds_no_place_ahead_of_a_fresh_one() {
+fn a_row_lapses_once_its_mac_stops_asking_and_keeps_its_handle() {
     let root = aterm_tempfile::tempdir().unwrap();
     let m1 = member(root.path(), "m1");
-    let source = |n: usize| {
-        IpAddr::from([
-            10,
-            0,
-            u8::try_from(n / 200).unwrap(),
-            u8::try_from(n % 200 + 1).unwrap(),
-        ])
-    };
     let first = Instant::now();
     let (_, l) = mac(root.path(), "l");
+    let (_, k) = mac(root.path(), "k");
     assert_eq!(hear_at(&m1, &l, "l", address(20), first), Answer::Asking);
-    for n in 1..desk::MAX_HEARD {
-        let name = format!("f{n}");
-        let (_, device) = mac(root.path(), &name);
-        assert_eq!(
-            hear_at(&m1, &device, &name, source(n), first),
-            Answer::Asking
-        );
-    }
+    assert_eq!(hear_at(&m1, &k, "k", address(21), first), Answer::Asking);
     let again = first + desk::ASKED_AGAIN_AFTER;
     assert_eq!(hear_at(&m1, &l, "l", address(20), again), Answer::Asking);
-
+    let handle = |name: &str, now: Instant| {
+        m1.lock()
+            .unwrap()
+            .rows(now)
+            .into_iter()
+            .find(|row| row.name == name)
+            .map(|row| row.id)
+    };
+    let (l_id, k_id) = (handle("l", again).unwrap(), handle("k", again).unwrap());
+    for minutes in [15, 30] {
+        let now = first + Duration::from_secs(minutes * 60);
+        assert_eq!(hear_at(&m1, &k, "k", address(21), now), Answer::Asking);
+    }
     let quiet = again + desk::STILL_ASKING;
-    let (_, x) = mac(root.path(), "x");
-    assert_eq!(hear_at(&m1, &x, "x", address(21), quiet), Answer::Asking);
     let held = m1.lock().unwrap().rows(quiet);
-    assert_eq!(held.len(), desk::MAX_HEARD, "the desk stays bounded");
     assert!(
         !held.iter().any(|row| row.name == "l"),
-        "L, which stopped asking, went first: {held:?}"
+        "L lapsed: {held:?}"
+    );
+    assert_eq!(
+        handle("k", quiet),
+        Some(k_id),
+        "K, still asking, keeps its row"
+    );
+    assert_eq!(hear_at(&m1, &l, "l", address(20), quiet), Answer::Asking);
+    assert_eq!(
+        handle("l", quiet),
+        Some(l_id),
+        "L's handle is its request's"
+    );
+
+    let (_, j) = mac(root.path(), "j");
+    assert_eq!(hear_at(&m1, &j, "j", address(22), quiet), Answer::Asking);
+    let pressed = quiet + desk::STILL_ASKING - Duration::from_secs(1);
+    let j_id = m1
+        .lock()
+        .unwrap()
+        .rows(quiet)
+        .into_iter()
+        .find(|row| row.name == "j")
+        .unwrap()
+        .id;
+    let phrase = m1.lock().unwrap().allow(j_id, pressed).expect("allowed");
+    let past = quiet + desk::STILL_ASKING + Duration::from_secs(1);
+    let held = m1.lock().unwrap().rows(past);
+    assert!(
+        held.iter()
+            .any(|row| row.id == j_id && row.state == RowState::Allowed(phrase)),
+        "J's live phrase keeps its row: {held:?}"
+    );
+}
+
+/// Rows heard on a network this Mac left go when it moves (D3): a Mac that asked at home is not
+/// at the café to be let in, so its row and the phrase allowed for it end there, while a row
+/// heard on the network this Mac is on stays, and a moment with no network to name changes
+/// nothing.
+/// NEGATIVE CONTROL: `on_network` that only records the network keeps A's row and its phrase
+/// across the move (the move's count reads `left: 0`, `right: 1`).
+#[test]
+fn rows_heard_on_another_network_go_when_this_mac_moves() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let m1 = member(root.path(), "m1");
+    let now = Instant::now();
+    assert_eq!(m1.lock().unwrap().on_network(Some("home".into())), 0);
+    let (_, a) = mac(root.path(), "a");
+    assert_eq!(hear_at(&m1, &a, "a", address(30), now), Answer::Asking);
+    let a_id = m1.lock().unwrap().rows(now)[0].id;
+    let phrase = m1.lock().unwrap().allow(a_id, now).expect("allowed");
+    assert_eq!(m1.lock().unwrap().on_network(None), 0);
+    assert_eq!(m1.lock().unwrap().on_network(Some("home".into())), 0);
+    assert_eq!(
+        m1.lock().unwrap().rows(now).len(),
+        1,
+        "same network, same rows"
+    );
+
+    assert_eq!(m1.lock().unwrap().on_network(Some("cafe".into())), 1);
+    let held = m1.lock().unwrap().rows(now);
+    assert!(held.is_empty(), "A's row went with the move: {held:?}");
+    assert!(
+        m1.lock().unwrap().words(phrase, now).is_none(),
+        "its phrase ended with it"
+    );
+    let (_, b) = mac(root.path(), "b");
+    assert_eq!(hear_at(&m1, &b, "b", address(31), now), Answer::Asking);
+    assert_eq!(m1.lock().unwrap().on_network(Some("cafe".into())), 0);
+    assert_eq!(m1.lock().unwrap().rows(now).len(), 1, "B was heard here");
+}
+
+/// A row closes on any admission this Mac reads (D3): once the Commons roster binds the asking
+/// Mac's writer key (an approver enrolled it from another member's `Allowed`), its row here
+/// closes, as an `Admit` in the membership log closes it.
+/// NEGATIVE CONTROL: `refresh` reading only the log's admissions leaves J's row asking ("J's row
+/// closed once the roster bound it").
+#[test]
+fn a_row_closes_once_the_commons_roster_binds_its_mac() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let (_, m1_device) = mac(root.path(), "m1");
+    let m1 = Mutex::new(Desk::new(
+        Local::with(m1_device, TRUST, true, "m1").expect("member"),
+    ));
+    let now = Instant::now();
+    let (_, j) = mac(root.path(), "j");
+    assert_eq!(hear_at(&m1, &j, "j", address(40), now), Answer::Asking);
+    let writer = *j
+        .request(TRUST.network, TRUST.authority)
+        .unwrap()
+        .binding()
+        .writer();
+    let (_, again) = mac(root.path(), "m1");
+    m1.lock().unwrap().refresh(
+        Local::with(again, TRUST, true, "m1")
+            .expect("member")
+            .with_bound(std::iter::once(writer).collect()),
+    );
+    assert_eq!(
+        states(&m1),
+        [RowState::Closed],
+        "J's row closed once the roster bound it"
     );
 }
 
@@ -782,6 +835,15 @@ fn a_joiner_shown_several_phrases_is_told_each_ones_address() {
     let picked = |member| join::pick(&heard, Some(member)).map(|heard| heard.at.clone());
     assert_eq!(picked("10.0.0.66:7100").unwrap(), "10.0.0.66:7100");
     assert_eq!(picked("10.0.0.7").unwrap(), "10.0.0.7:7100");
+    let v6_heard = [at("[fd00::7]:7100", 0xef), at("10.0.0.66:7100", 0xcd)];
+    assert_eq!(
+        join::pick(&v6_heard, Some("fd00::7")).unwrap().at,
+        "[fd00::7]:7100"
+    );
+    assert_eq!(
+        join::pick(&v6_heard, Some("[fd00::7]")).unwrap().at,
+        "[fd00::7]:7100"
+    );
     assert_eq!(picked("ABABABAB").unwrap(), "10.0.0.7:7100", "a key prefix");
     assert!(
         picked("abab").is_err(),
@@ -980,6 +1042,41 @@ fn a_fourth_run_from_one_address_in_a_minute_is_refused() {
     let (served, _) = run(&m1, address(9), &j, &words, "");
     let why = served.err().expect("refused").to_string();
     assert!(why.contains("too many join runs"), "{why}");
+    // IPv4-mapped IPv6 for the same IPv4 source shares its rate-limit bucket.
+    let mapped_9 = IpAddr::from([0, 0, 0, 0, 0, 0xffff, 0xc000, 0x0209]);
+    let (served, _) = run(&m1, mapped_9, &j, &words, "");
+    let why = served.err().expect("refused").to_string();
+    assert!(why.contains("too many join runs"), "{why}");
+    // Different interface identifiers inside one IPv6 /64 share one rate-limit bucket.
+    for host in 1u16..=3 {
+        let v6 = IpAddr::from([0xfd00, 0, 0, 1, 0, 0, 0, host]);
+        let (served, _) = run(&m1, v6, &j, &wrong, "");
+        let why = served.err().expect("refused").to_string();
+        assert!(!why.contains("too many"), "{why}");
+    }
+    let v6_fourth = IpAddr::from([0xfd00, 0, 0, 1, 0, 0, 0, 4]);
+    let (served, _) = run(&m1, v6_fourth, &j, &words, "");
+    let why = served.err().expect("refused").to_string();
+    assert!(why.contains("too many join runs"), "{why}");
+    // Direct `Desk::hear` also enforces the 64-byte `model` bound.
+    let over_model = "M".repeat(65);
+    let req_bytes = j.request(&joiner_greeting(&m1)).unwrap().bytes().to_vec();
+    let mut desk = m1.lock().unwrap();
+    let err = desk
+        .hear(
+            &desk::Asking {
+                wire: &req_bytes,
+                node: [7; 32],
+                name: "j",
+                model: &over_model,
+                signature: &[0; 64],
+            },
+            address(10),
+            Instant::now(),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no model"), "{err}");
 }
 
 #[test]
@@ -1072,4 +1169,327 @@ fn a_run_relayed_between_the_node_job_and_the_window_gets_its_bundle() {
             .as_slice(),
         value.as_bytes()
     );
+}
+
+#[test]
+fn a_removed_mac_cannot_burn_a_live_invite_phrase_and_refresh_cancels_newly_removed_allows() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let (_, m1_device) = mac(root.path(), "m1");
+    let (_, removed_device) = mac(root.path(), "removed");
+    let (_, honest_device) = mac(root.path(), "honest");
+    let removed_rec = removed_device
+        .request(TRUST.network, TRUST.authority)
+        .unwrap()
+        .binding()
+        .recipient()
+        .to_bech32();
+    let removed_joining = joining(&removed_device, [0x44; 32], "removed");
+    let honest_joining = joining(&honest_device, [0x55; 32], "honest");
+
+    let mut notes = crate::client::RemovedNotes::default();
+    notes.by_recipient.insert(
+        removed_rec.clone(),
+        crate::client::RemovedNote {
+            label: "m44".to_owned(),
+            by: vec!["m1".to_owned()],
+            on_ms: 1_700_000_000_000,
+            quorum: false,
+        },
+    );
+    let m1 = Mutex::new(Desk::new(
+        Local::with(m1_device, TRUST, true, "m1")
+            .unwrap()
+            .with_removed(notes),
+    ));
+    let (invite_id, words) = {
+        let mut desk = m1.lock().unwrap();
+        let now = Instant::now();
+        let id = desk.invite(now).unwrap();
+        let words = desk.words(id, now).unwrap().join(" ");
+        (id, words)
+    };
+
+    // 1. Removed Mac attempts a run while an invite phrase is live: refused before touching the
+    //    invite phrase, leaving the invite `Live` for the honest Mac.
+    let (served_rem, got_rem) = run(&m1, address(44), &removed_joining, &words, "");
+    assert!(served_rem.is_err() && got_rem.is_err());
+    assert!(
+        got_rem.unwrap_err().to_string().contains("Allow again"),
+        "removed Mac must be told Allow again is required"
+    );
+    assert_eq!(
+        m1.lock().unwrap().phrase_state(invite_id),
+        Some(crate::pake::PhraseState::Live),
+        "removed Mac must not burn a live invite phrase"
+    );
+
+    // Honest Mac can still use the same invite phrase and receive its bundle.
+    let value = token();
+    let (served_ok, got_ok) = run(&m1, address(55), &honest_joining, &words, &value);
+    assert!(served_ok.unwrap().is_some());
+    assert!(got_ok.is_ok());
+
+    // 2. Refreshing a desk when an allowed Mac becomes quorum-removed cancels its phrase.
+    assert_eq!(ask(&m1, address(44), &removed_joining), Answer::Asking);
+    let allow_again_id = {
+        let mut desk = m1.lock().unwrap();
+        let now = Instant::now();
+        let row = desk
+            .rows(now)
+            .into_iter()
+            .find(|r| r.name == "removed")
+            .unwrap()
+            .id;
+        desk.allow_again(row, now).unwrap()
+    };
+    let mut quorum_notes = crate::client::RemovedNotes::default();
+    quorum_notes.by_recipient.insert(
+        removed_rec,
+        crate::client::RemovedNote {
+            label: "m44".to_owned(),
+            by: vec!["m1".to_owned(), "m2".to_owned()],
+            on_ms: 1_700_000_000_000,
+            quorum: true,
+        },
+    );
+    let (_, m1_device2) = mac(root.path(), "m1");
+    m1.lock().unwrap().refresh(
+        Local::with(m1_device2, TRUST, true, "m1")
+            .unwrap()
+            .with_removed(quorum_notes),
+    );
+    assert_eq!(
+        m1.lock().unwrap().phrase_state(allow_again_id),
+        Some(crate::pake::PhraseState::Burned),
+        "quorum removal on refresh must cancel an active Allow again phrase"
+    );
+}
+
+/// A node key's record signature of a proof, as `NodeIdentity::sign_record(PROVE_RECORD, ..)`
+/// makes it.
+fn node_signer(seed: u8) -> (impl Fn(&[u8]) -> [u8; 64] + Sync, [u8; 32]) {
+    use ring::signature::{Ed25519KeyPair, KeyPair as _};
+    let pair = Ed25519KeyPair::from_seed_unchecked(&[seed; 32]).expect("node key");
+    let key: [u8; 32] = pair.public_key().as_ref().try_into().expect("32 bytes");
+    let prefix = format!("aterm-fleet/v3 record {}\0", desk::PROVE_RECORD);
+    let sign = move |message: &[u8]| -> [u8; 64] {
+        pair.sign(&[prefix.as_bytes(), message].concat())
+            .as_ref()
+            .try_into()
+            .expect("64 bytes")
+    };
+    (sign, key)
+}
+
+/// One `prove` connection: the member serves it with `proof` (its `decide` hands
+/// [`files_bundle`] signed by `signer`, the member's own device) while `joiner` speaks.
+fn proving<T>(
+    desk: &Mutex<Desk>,
+    fleet: Option<[u8; 32]>,
+    decide: &(dyn Fn(&desk::Proving<'_>) -> Result<SecretBytes> + Sync),
+    joiner: impl FnOnce(&mut UnixStream) -> T,
+) -> (Result<Option<desk::Let>>, T) {
+    let (mut ours, mut theirs) = UnixStream::pair().expect("pair");
+    for end in [&ours, &theirs] {
+        end.set_read_timeout(Some(Duration::from_secs(60)))
+            .expect("timeout");
+    }
+    std::thread::scope(|scope| {
+        let bundle = bundle_of("");
+        let served = scope.spawn(move || {
+            desk::serve_with(
+                desk,
+                &mut ours,
+                address(5),
+                &bundle,
+                Some(desk::Proof { decide, fleet }),
+            )
+        });
+        let said = joiner(&mut theirs);
+        drop(theirs);
+        (served.join().expect("member"), said)
+    })
+}
+
+/// The member's `decide` for these tests: [`files_bundle`] holding `value`, its `Allowed`
+/// signed by the member's device at `paths`.
+fn hands(paths: &Paths, value: &str) -> impl Fn(&desk::Proving<'_>) -> Result<SecretBytes> + Sync {
+    let paths = paths.clone();
+    let value = value.to_owned();
+    move |proving| {
+        let device = Device::open(&paths)?.expect("member device");
+        let allowed = device
+            .with_seed(|seed| Allowed::sign(proving.request.binding(), proving.name, seed))?;
+        files_bundle(&allowed, &value)
+    }
+}
+
+/// A Mac that signs this connection's challenge with its writer key and its fleet node key, and
+/// proves its age identity, gets the bundle the member's `decide` hands, sealed to it; `decide`
+/// runs with the desk's lock free (the vault's state lock and the log are taken there, and a
+/// window's desk must not wait on them).
+///
+/// NEGATIVE CONTROL: `prove` holding the desk's lock across `(proof.decide)(..)` (taken just
+/// before it, dropped just after): the hook's `try_lock` fails and the "the desk's lock is free
+/// while decide runs" assert fails.
+#[test]
+fn a_mac_that_proves_its_node_key_gets_the_bundle_sealed_to_it() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let (m_paths, device) = mac(root.path(), "m");
+    let desk = Mutex::new(Desk::new(
+        Local::with(device, TRUST, true, "m").expect("member"),
+    ));
+    let (_, j_device) = mac(root.path(), "j");
+    let (sign_node, node) = node_signer(0x31);
+    let value = token();
+    let handed = hands(&m_paths, &value);
+    let free = std::sync::atomic::AtomicBool::new(false);
+    let seen = Mutex::new(None);
+    let decide = |proving: &desk::Proving<'_>| {
+        free.store(desk.try_lock().is_ok(), std::sync::atomic::Ordering::SeqCst);
+        *seen.lock().unwrap() = Some((proving.node, proving.fleet, proving.name.to_owned()));
+        handed(proving)
+    };
+    let j = joining(&j_device, node, "m7");
+    let (served, got) = proving(&desk, None, &decide, |stream| {
+        let greeting = joiner::greeting(stream)?;
+        joiner::prove(stream, &greeting, &j, &sign_node, &mut false)
+    });
+    served.expect("the member served the proof");
+    let bundle = got.expect("the Mac took its bundle");
+    let entries = text::parse_locker(bundle.files().expect("files").as_slice()).unwrap();
+    assert_eq!(entries[0].value.as_slice(), value.as_bytes());
+    assert!(
+        free.load(std::sync::atomic::Ordering::SeqCst),
+        "the desk's lock is free while decide runs"
+    );
+    assert_eq!(
+        seen.lock().unwrap().clone(),
+        Some((node, false, "m7".to_owned()))
+    );
+}
+
+/// A proof proves nothing on another connection or for another Mac: a `prove` line replayed on a
+/// new connection (a new challenge) is refused before any possession challenge, and a Mac that
+/// names another Mac's node key, with that key's signature from an earlier proof, is refused too.
+///
+/// NEGATIVE CONTROLS: `prove_message` without the challenge: the replayed line passes and the
+/// member answers `OK challenge=`, so the "refused at the prove line" assert fails. The node
+/// key's signature check cut from `begin_proof`: the borrowing Mac answers its own possession
+/// challenge and takes a bundle, and the "a borrowed node key" assert fails.
+#[test]
+fn a_replayed_or_borrowed_proof_proves_nothing() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let (m_paths, device) = mac(root.path(), "m");
+    let desk = Mutex::new(Desk::new(
+        Local::with(device, TRUST, true, "m").expect("member"),
+    ));
+    let (_, j_device) = mac(root.path(), "j");
+    let (sign_node, node) = node_signer(0x32);
+    let decide = hands(&m_paths, "v");
+    let j = joining(&j_device, node, "m7");
+    // Record the honest Mac's prove line as a LAN host would see it.
+    let recorded = Mutex::new(String::new());
+    let (served, _) = proving(&desk, None, &decide, |stream| {
+        let greeting = joiner::greeting(stream)?;
+        let mut tee = Tee {
+            inner: stream,
+            first: &recorded,
+        };
+        joiner::prove(&mut tee, &greeting, &j, &sign_node, &mut false)
+    });
+    served.expect("the honest proof");
+    let line = recorded.lock().unwrap().clone();
+    assert!(line.starts_with("prove "), "{line}");
+
+    let (served, answer) = proving(&desk, None, &decide, |stream| {
+        joiner::greeting(stream)?;
+        super::wire::write_line(stream, line.trim_end())?;
+        super::wire::read_line(stream)
+    });
+    let answer = answer.expect("an answer");
+    assert!(
+        answer.starts_with("NO"),
+        "a replayed prove line is refused at the prove line: {answer}"
+    );
+    assert!(served.is_err());
+
+    // Another Mac names `node` with the signature `node` made for the honest Mac's proof.
+    let (_, other) = mac(root.path(), "x");
+    let x = joining(&other, node, "m7");
+    let honest_sig = super::wire::Line::parse(&line)
+        .hex::<64>("nodesig")
+        .expect("nodesig");
+    let borrowed = move |_: &[u8]| honest_sig;
+    let (served, got) = proving(&desk, None, &decide, |stream| {
+        let greeting = joiner::greeting(stream)?;
+        joiner::prove(stream, &greeting, &x, &borrowed, &mut false)
+    });
+    assert!(
+        served.is_err() && got.is_err(),
+        "a borrowed node key proves nothing"
+    );
+}
+
+/// A proof that came over the fleet's channel (`vault-join`) must name the node key that
+/// channel proved, and only then is it a proof of the fleet's key too.
+///
+/// NEGATIVE CONTROL: the `fleet.is_some_and(..)` check cut from `begin_proof`: the proof of
+/// another node key than the channel's goes through and the first assert fails.
+#[test]
+fn a_proof_over_the_fleet_names_the_node_key_its_channel_proved() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let (m_paths, device) = mac(root.path(), "m");
+    let desk = Mutex::new(Desk::new(
+        Local::with(device, TRUST, true, "m").expect("member"),
+    ));
+    let (_, j_device) = mac(root.path(), "j");
+    let (sign_node, node) = node_signer(0x33);
+    let handed = hands(&m_paths, "v");
+    let fleet_seen = std::sync::atomic::AtomicBool::new(false);
+    let decide = |proving: &desk::Proving<'_>| {
+        fleet_seen.store(proving.fleet, std::sync::atomic::Ordering::SeqCst);
+        handed(proving)
+    };
+    let j = joining(&j_device, node, "m7");
+    let (served, got) = proving(&desk, Some([0x44; 32]), &decide, |stream| {
+        let greeting = joiner::greeting(stream)?;
+        joiner::prove(stream, &greeting, &j, &sign_node, &mut false)
+    });
+    assert!(
+        served.is_err() && got.is_err(),
+        "a proof of another node key than the channel's"
+    );
+    let (served, got) = proving(&desk, Some(node), &decide, |stream| {
+        let greeting = joiner::greeting(stream)?;
+        joiner::prove(stream, &greeting, &j, &sign_node, &mut false)
+    });
+    served.expect("served");
+    got.expect("the bundle");
+    assert!(fleet_seen.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+/// A stream that keeps the first line written through it.
+struct Tee<'a, S: ?Sized> {
+    inner: &'a mut S,
+    first: &'a Mutex<String>,
+}
+
+impl<S: std::io::Read + ?Sized> std::io::Read for Tee<'_, S> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl<S: std::io::Write + ?Sized> std::io::Write for Tee<'_, S> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut first = self.first.lock().unwrap();
+        if !first.ends_with('\n') {
+            first.push_str(&String::from_utf8_lossy(buf));
+        }
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }

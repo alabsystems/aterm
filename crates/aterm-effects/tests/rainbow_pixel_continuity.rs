@@ -5,7 +5,7 @@
 //!
 //! Renders the real production quad + `GlowRamps` + `RainHalo` streams onto an
 //! exact integer-pixel RGB buffer (`theme_bg` -> `glow_under` -> `cursor_glow_add`
-//! -> `glow_halo`, including `shade_word_icons` and `veil_pet_letters`) and scans
+//! -> `glow_halo`, including `shade_word_icons`) and scans
 //! horizontal pixel columns and character cells between the active trail tail and
 //! the cursor/pet head for unexpected dark holes or seam pinches.
 

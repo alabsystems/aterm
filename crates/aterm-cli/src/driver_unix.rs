@@ -99,14 +99,18 @@ pub(crate) fn shell_check(path: &str) -> crate::ShellCheck {
     }
 }
 
-fn set_raw(fd: libc::c_int) -> libc::termios {
+fn set_raw(fd: libc::c_int) -> Option<libc::termios> {
     unsafe {
         let mut t: libc::termios = std::mem::zeroed();
-        libc::tcgetattr(fd, &mut t);
+        if libc::tcgetattr(fd, &mut t) != 0 {
+            return None;
+        }
         let orig = t;
         libc::cfmakeraw(&mut t);
-        libc::tcsetattr(fd, libc::TCSANOW, &t);
-        orig
+        if libc::tcsetattr(fd, libc::TCSANOW, &t) != 0 {
+            return None;
+        }
+        Some(orig)
     }
 }
 
@@ -242,11 +246,7 @@ pub(crate) fn run(shell: aterm_pty::SpawnedShell, verbose: bool) -> i32 {
     let shell_pid = shell.pid;
 
     let stdin_is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
-    let orig = if stdin_is_tty {
-        Some(set_raw(libc::STDIN_FILENO))
-    } else {
-        None
-    };
+    let orig = stdin_is_tty.then(|| set_raw(libc::STDIN_FILENO)).flatten();
     let wake_rd = wake_pipe();
     catch(libc::SIGWINCH, 0);
     catch(libc::SIGCHLD, libc::SA_NOCLDSTOP);
@@ -260,7 +260,7 @@ pub(crate) fn run(shell: aterm_pty::SpawnedShell, verbose: bool) -> i32 {
     let mut spoke = false;
     let mut pass = |out: &[u8]| {
         write_all(libc::STDOUT_FILENO, out);
-        bytes_in += out.len() as u64;
+        bytes_in = bytes_in.saturating_add(out.len() as u64);
         if !spoke {
             spoke = true;
             crate::first_shell_output();
@@ -733,7 +733,9 @@ mod tests {
         let code = run(shell, false);
         // SAFETY: restores `harness_stdout`, a descriptor this test owns, onto `STDOUT_FILENO`.
         unsafe { libc::dup2(harness_stdout, libc::STDOUT_FILENO) };
+        aterm_pty::close_fd(harness_stdout);
         let out = drained.join().expect("host drain");
+        aterm_pty::close_fd(host);
         let text = String::from_utf8_lossy(&out);
         assert!(
             text.contains("SIZE 40 120"),
@@ -790,6 +792,37 @@ mod tests {
         };
         // SAFETY: `info` was zero-initialized and populated by `waitid`.
         r == 0 && unsafe { info.si_pid() } == pid
+    }
+
+    /// The slave-side node of the pty whose master is `master`, asked of the kernel by
+    /// ioctl (`TIOCPTYGNAME` / `ptsname_r`) — never `ttyname`, which scans `/dev` and
+    /// hangs on one wedged node. A child that must reopen its terminal by name is handed
+    /// this instead of resolving it itself (the slave-holding job below).
+    fn slave_name(master: libc::c_int) -> String {
+        let mut buf = [0 as libc::c_char; 128];
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        // SAFETY: `TIOCPTYGNAME` writes a NUL-terminated name of at most 128 bytes into
+        // `buf`, which has exactly that many.
+        let rc = unsafe {
+            libc::ioctl(
+                master,
+                libc::TIOCPTYGNAME as libc::c_ulong,
+                buf.as_mut_ptr(),
+            )
+        };
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        // SAFETY: `ptsname_r` writes a NUL-terminated name of at most `buf.len()` bytes.
+        let rc = unsafe { libc::ptsname_r(master, buf.as_mut_ptr(), buf.len()) };
+        assert_eq!(
+            rc,
+            0,
+            "the slave's name: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: `rc == 0`: `buf` holds a NUL-terminated name.
+        unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }
+            .to_string_lossy()
+            .into_owned()
     }
 
     #[test]
@@ -894,7 +927,9 @@ mod tests {
         let code = run(shell, false);
         // SAFETY: restores `harness_stdout` onto `STDOUT_FILENO`.
         unsafe { libc::dup2(harness_stdout, libc::STDOUT_FILENO) };
+        aterm_pty::close_fd(harness_stdout);
         let out = drained.join().expect("host drain");
+        aterm_pty::close_fd(host);
         let text = String::from_utf8_lossy(&out);
         assert!(FIRED.load(Ordering::SeqCst), "the seam never ran");
         assert!(
@@ -918,12 +953,11 @@ mod tests {
             );
             return;
         }
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-driver-job-holds-slave-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let hold = aterm_tempfile::Builder::new()
+            .prefix("aterm-driver-job-holds-slave-")
+            .tempdir()
+            .expect("scratch dir");
+        let dir = hold.path().to_path_buf();
         // SAFETY: isolated test child launch point.
         let authority = unsafe { aterm_cap::Authority::root_authority() };
         let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
@@ -931,10 +965,10 @@ mod tests {
         let command: [std::ffi::OsString; 3] = [
             "/bin/sh".into(),
             "-c".into(),
-            r#"t=$(tty); d=$ATERM_TEST_DIR
+            r#"d=$ATERM_TEST_DIR
             ( trap '' HUP; : >"$d/armed"; exec </dev/null >/dev/null 2>&1
               i=0; while [ ! -e "$d/go" ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done
-              exec 3<>"$t"; : >"$d/held"
+              exec 3<>"$(cat "$d/slave")"; : >"$d/held"
               i=0; while [ ! -e "$d/release" ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done
               [ -e "$d/release" ] || : >"$d/held-to-the-end"
               : >"$d/done" ) &
@@ -957,6 +991,12 @@ mod tests {
             aterm_sandbox::Limits::shell_default(),
         )
         .expect("protected shell spawn");
+        // The job reopens its terminal by name once `go` lands; the name is the parent's
+        // to give (an ioctl on the master, never the child's `ttyname` scan of `/dev`),
+        // and written here it is whole before the seam can write `go` — the seam runs
+        // only inside `run`'s poll.
+        std::fs::write(dir.join("slave"), slave_name(shell.master))
+            .expect("name the slave for the job");
         SHELL.store(shell.pid, Ordering::SeqCst);
         assert!(
             DIR.set(dir.clone()).is_ok(),
@@ -988,7 +1028,7 @@ mod tests {
         let held_to_the_end = dir.join("held-to-the-end").exists();
         std::fs::write(dir.join("release"), "").expect("let the job go");
         wait_until("the job has not finished", || dir.join("done").exists());
-        let _ = std::fs::remove_dir_all(&dir);
+        drop(hold);
         assert!(FIRED.load(Ordering::SeqCst), "the seam never ran");
         assert!(
             !held_to_the_end,

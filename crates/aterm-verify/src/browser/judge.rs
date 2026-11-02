@@ -514,6 +514,11 @@ pub(crate) fn glow(
     let mut v = Verdict::default();
     let mut bloomed = Vec::new();
     let mut read = Vec::new();
+    // The styles and pages some ramps run reached the route on, and the
+    // runs that lay no ramp at all (a style drawn by its quads alone there,
+    // as Lumen and Fire are on paper): each style and each page must reach
+    // the route somewhere.
+    let (mut ramped_styles, mut ramped_pages, mut rampless) = (Vec::new(), Vec::new(), Vec::new());
     let run = |style: &str, page: &str, bloom: bool, ramps: bool| {
         gpu.glow
             .iter()
@@ -555,9 +560,10 @@ pub(crate) fn glow(
                 .fold((0, 0), |(m, l), &[n, k, _]| (m.max(n), l.max(k)));
             let added = r.laid.iter().filter(|[_, _, add]| *add > 0).count();
             if ramp_frames == 0 {
-                v.failures.push(format!(
-                    "{what}: the ramps run laid no lit ramp: it does not reach the route it holds"
-                ));
+                rampless.push(what.trim_start_matches("glow ").to_string());
+            } else {
+                ramped_styles.push(style);
+                ramped_pages.push(page);
             }
             if q.laid.iter().any(|[n, _, _]| *n > 0) {
                 v.failures
@@ -621,6 +627,24 @@ pub(crate) fn glow(
                 ));
             }
         }
+    }
+    for style in styles.iter().filter(|s| !ramped_styles.contains(s)) {
+        v.failures.push(format!(
+            "glow [{style}]: its ramps runs laid no lit ramp on any page: it does not reach the \
+             route it holds"
+        ));
+    }
+    for page in pages.iter().filter(|p| !ramped_pages.contains(p)) {
+        v.failures.push(format!(
+            "glow [{page} page]: no style's ramps run laid a lit ramp: the page does not reach \
+             the route it holds"
+        ));
+    }
+    if !rampless.is_empty() {
+        v.lines.push(format!(
+            "glow: laid no ramp, drawn by its quads alone: {}",
+            rampless.join(", ")
+        ));
     }
     if read.is_empty() {
         v.failures.push(
@@ -818,6 +842,31 @@ mod tests {
         }
         let v = glow(&a, &[STYLE], &["dark", "light"], &[], 3);
         assert!(v.failures.is_empty(), "{:?}", v.failures);
+        // A style drawn by its quads alone on one page passes while it and
+        // that page reach the ramps' route elsewhere, and is named.
+        let mut a = glowing(&["dark", "light"]);
+        let other = |r: &GlowRun| GlowRun {
+            style: "lumen".to_string(),
+            ..r.clone()
+        };
+        let lumen: Vec<GlowRun> = a.glow.iter().map(other).collect();
+        a.glow.extend(lumen);
+        for r in a
+            .glow
+            .iter_mut()
+            .filter(|r| r.style == "lumen" && r.page == "light")
+        {
+            r.laid = vec![[0, 0, 0]; 3];
+        }
+        let v = glow(&a, &[STYLE, "lumen"], &["dark", "light"], &[], 3);
+        assert!(v.failures.is_empty(), "{:?}", v.failures);
+        assert!(
+            v.lines
+                .iter()
+                .any(|l| l.contains("drawn by its quads alone: [lumen, light page")),
+            "{:?}",
+            v.lines
+        );
     }
 
     #[test]
@@ -838,8 +887,19 @@ mod tests {
         a.glow[0].last.rgba[0] ^= 1;
         fails(&a, "the last frame's ramps differ from its quads");
         let mut a = glowing(&pages);
-        a.glow[0].laid = vec![[0, 0, 0]; 3];
-        fails(&a, "laid no lit ramp");
+        for r in a.glow.iter_mut().filter(|r| r.ramps) {
+            r.laid = vec![[0, 0, 0]; 3];
+        }
+        fails(&a, "laid no lit ramp on any page");
+        let mut a = glowing(&pages);
+        for r in a
+            .glow
+            .iter_mut()
+            .filter(|r| r.ramps && r.page == "dark art")
+        {
+            r.laid = vec![[0, 0, 0]; 3];
+        }
+        fails(&a, "no style's ramps run laid a lit ramp");
         let mut a = glowing(&pages);
         a.glow[1].laid[2] = [1, 3, 0];
         fails(&a, "it is no oracle");

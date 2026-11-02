@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! In-terminal `drain` and `vte` halves for the arena performance lanes.
+//! In-terminal `drain` and `vte` halves for the arena performance lanes, and the `vte-engine`
+//! lane's payload capture child ([`crate::perf::vte_engine::capture_main`]).
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -13,6 +14,11 @@ use super::report;
 
 pub(crate) fn main(args: &[String]) -> ExitCode {
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    if let Some((verb, rest)) = argv.split_first()
+        && *verb == crate::perf::vte_engine::CAPTURE_VERB
+    {
+        return crate::perf::vte_engine::capture_main(rest);
+    }
     let (sock, outcome) = match argv.as_slice() {
         ["drain", corpus, sock] => (*sock, drain(Path::new(corpus))),
         [

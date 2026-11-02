@@ -75,14 +75,18 @@ fn fire(
 }
 
 /// The model's `held` input at one tick: the job waits, and the process it waits in is one the
-/// view's findings name as held at macOS's program check. Read from the findings (what the host
-/// handed the engine), never from the row's wait name, so an engine that does not name the wait
-/// still drives `Hold`.
+/// view's findings name as kept from its first instruction in line, held at macOS's program check
+/// or translated by Rosetta. Read from the findings (what the host handed the engine), never from
+/// the row's wait name, so an engine that does not name the wait still drives `Hold`.
 fn held(r: &JobRow, view: &JobsView) -> bool {
+    let f = &view.findings;
     r.class == Class::Waiting
-        && r.wait
-            .as_ref()
-            .is_some_and(|w| view.findings.program_check.iter().any(|n| n.pid == w.leaf))
+        && r.wait.as_ref().is_some_and(|w| {
+            f.program_check
+                .iter()
+                .chain(&f.translating)
+                .any(|n| n.pid == w.leaf)
+        })
 }
 
 /// Replay `t` on `m`: the error names the first tick the model refuses.
@@ -284,6 +288,16 @@ fn ignoring_the_program_check_is_caught_by_held_wait_never_quiet() {
     caught(
         Fault::IgnoreProgramCheck,
         "held.setsid",
+        7,
+        "HeldWaitNeverQuiet",
+    );
+}
+
+#[test]
+fn ignoring_rosettas_translation_is_caught_by_held_wait_never_quiet() {
+    caught(
+        Fault::IgnoreProgramCheck,
+        "translating.setsid",
         7,
         "HeldWaitNeverQuiet",
     );

@@ -156,7 +156,7 @@ pub const MAX_RECORD_PAYLOAD: usize = MAX_PAYLOAD_LEN - RECORD_MARGIN;
 /// timestamp and mark INSIDE the payload the at-rest layer seals, so a record at the cap
 /// must still fit the frame with all three (`40 + 9 + 5 = 54 <= 56`).
 const RECORD_MARGIN: usize = 56;
-#[cfg(feature = "aead")]
+#[cfg(any(feature = "aead", feature = "at-rest"))]
 const _: () = assert!(RECORD_MARGIN >= astream_aead::OVERHEAD + SEAL_LEN + BT_LEN);
 
 /// One durable message on the broker log.

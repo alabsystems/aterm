@@ -11,8 +11,8 @@ use aterm_uds::spawnfd::command;
 
 use super::cat::{Term, inner_argv, order, run_in};
 use super::{
-    COOLDOWN, Halt, Inbox, Ledger, arena_dir, build_aterm, ghostty_tip, macos_version, pins,
-    preflight, run_ok, sha256_file, spawn_halt,
+    COOLDOWN, Halt, Inbox, Ledger, RepoPin, arena_dir, build_aterm, ghostty_tip, macos_version,
+    pins, preflight, run_ok, sha256_file, spawn_halt,
 };
 use crate::perf::stats::median;
 use crate::perf::trend::utc_date;
@@ -33,7 +33,7 @@ pub(crate) fn trim_tty(text: &str) -> Result<(String, bool), String> {
 }
 
 /// Copy the pinned benchmarks and trim their tty lookup.
-fn trimmed_benchmarks(stock: &Path, copy: &Path) -> Result<usize, String> {
+pub(crate) fn trimmed_benchmarks(stock: &Path, copy: &Path) -> Result<usize, String> {
     let _ = std::fs::remove_dir_all(copy);
     run_ok(
         command(aterm_uds::os_path!("cp"))
@@ -63,7 +63,8 @@ fn trimmed_benchmarks(stock: &Path, copy: &Path) -> Result<usize, String> {
     Ok(trimmed)
 }
 
-fn benchmark_dirs(dir: &Path) -> Result<Vec<PathBuf>, String> {
+/// The benchmark folders under `dir`, by name: vtebench's order.
+pub(crate) fn benchmark_dirs(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
         .map_err(|e| format!("{}: {e}", dir.display()))?
         .filter_map(Result::ok)
@@ -171,18 +172,9 @@ fn clone_pin(repo: &str, dir: &Path) -> Result<(), Halt> {
     }
 }
 
-fn run_inner(args: &Args) -> Result<String, Halt> {
-    let trials = args.trials.unwrap_or(3);
-    let (cols, grid_rows) = (args.columns.unwrap_or(120), args.rows.unwrap_or(40));
-    let max_secs = args.max_secs.unwrap_or(10);
-    let (machine, ledgers) = preflight(args.dev_smoke)?;
-    let pins = pins()?;
-    let ghostty = ghostty_tip(&pins, args.dmg.as_deref())?;
-    let aterm = build_aterm()?;
-
-    let arena = arena_dir()?;
-    let pin = &pins.harness.vtebench;
-    let vte_dir = arena.join(format!("vtebench-{}", pin.commit));
+/// The pinned vtebench checkout in the arena cache, cloned once, at the pin and unmodified.
+pub(crate) fn pinned_checkout(pin: &RepoPin) -> Result<PathBuf, Halt> {
+    let vte_dir = arena_dir()?.join(format!("vtebench-{}", pin.commit));
     clone_pin(&pin.repo, &vte_dir)?;
     run_ok(
         command(aterm_uds::os_path!("git"))
@@ -204,6 +196,21 @@ fn run_inner(args: &Args) -> Result<String, Halt> {
             vte_dir.display()
         )));
     }
+    Ok(vte_dir)
+}
+
+fn run_inner(args: &Args) -> Result<String, Halt> {
+    let trials = args.trials.unwrap_or(3);
+    let (cols, grid_rows) = (args.columns.unwrap_or(120), args.rows.unwrap_or(40));
+    let max_secs = args.max_secs.unwrap_or(10);
+    let (machine, ledgers) = preflight(args.dev_smoke)?;
+    let pins = pins()?;
+    let ghostty = ghostty_tip(&pins, args.dmg.as_deref())?;
+    let aterm = build_aterm()?;
+
+    let arena = arena_dir()?;
+    let pin = &pins.harness.vtebench;
+    let vte_dir = pinned_checkout(pin)?;
     let driver = crate::perf::driver::cargo_driver()?;
     let build_args = ["--release", "--locked", "--target-dir", "target"];
     let built = driver

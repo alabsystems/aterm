@@ -10,6 +10,61 @@ use super::*;
 const OWNER: &str = "owner@example.com";
 const WORK: &str = "w2@example.com";
 
+#[cfg(unix)]
+struct NativeRenewal {
+    program: PathBuf,
+    user_home: OsString,
+    within: std::time::Duration,
+}
+
+#[cfg(unix)]
+impl AccountsHost for NativeRenewal {
+    fn stdin_is_terminal(&self) -> bool {
+        false
+    }
+    fn auth_status(&self, _: &str) -> Result<Captured, String> {
+        panic!("a failed renewal must not check a live login")
+    }
+    fn unaskable(&self) -> Option<String> {
+        None
+    }
+    fn login(&self, _: Option<&str>) -> Result<i32, String> {
+        panic!("a named renewal must not use plain login")
+    }
+    fn now(&self) -> i64 {
+        0
+    }
+    fn current_exe(&self) -> Option<PathBuf> {
+        Some(self.program.clone())
+    }
+    fn renew_flow(&self, home: &str, email: &str, browser: &RenewBrowser) -> Result<i32, String> {
+        self.renew_outcome(home, email, browser)
+            .map(|exit| exit.code)
+    }
+    fn renew_outcome(
+        &self,
+        home: &str,
+        email: &str,
+        browser: &RenewBrowser,
+    ) -> Result<RenewalExit, String> {
+        renew_flow_of(
+            self.program.as_os_str(),
+            home,
+            email,
+            browser,
+            &|name| match name {
+                "HOME" => Some(self.user_home.clone()),
+                "USER" => Some("fixture-user".into()),
+                _ => None,
+            },
+            Some(self.within),
+        )
+    }
+    fn status_in_home(&self, _: &str) -> Result<Captured, String> {
+        panic!("a failed sign-in must not be considered successful")
+    }
+}
+
 #[test]
 fn a_running_renewal_blocks_readoption_of_its_removed_label() {
     let (_tmp, env) = renew_env("renew-readoption");
@@ -112,10 +167,14 @@ struct RenewHost {
     obstruct_checkpoint: bool,
     during_flow: Option<Box<dyn Fn()>>,
     during_status: Option<Box<dyn Fn()>>,
-    ssh_exit: i32,
+    remote_exit: i32,
     flows: RefCell<Vec<(String, String, RenewBrowser)>>,
     checked: RefCell<Vec<String>>,
-    sshed: RefCell<Vec<(String, Vec<String>)>>,
+    remotes: RefCell<Vec<String>>,
+    /// The mailbox the host's environment names ([`AccountsHost::machine_var`]), if any.
+    env_mailbox: Option<PathBuf>,
+    env_browser: Option<PathBuf>,
+    agent: bool,
 }
 
 impl RenewHost {
@@ -130,10 +189,13 @@ impl RenewHost {
             obstruct_checkpoint: false,
             during_flow: None,
             during_status: None,
-            ssh_exit: 0,
+            remote_exit: 0,
             flows: RefCell::new(Vec::new()),
             checked: RefCell::new(Vec::new()),
-            sshed: RefCell::new(Vec::new()),
+            remotes: RefCell::new(Vec::new()),
+            env_mailbox: None,
+            env_browser: None,
+            agent: false,
         }
     }
 }
@@ -220,11 +282,13 @@ impl AccountsHost for RenewHost {
         Ok(status_for(email.as_deref()))
     }
 
-    fn ssh(&self, host: &str, argv: &[String]) -> Result<i32, String> {
-        self.sshed
-            .borrow_mut()
-            .push((host.to_string(), argv.to_vec()));
-        Ok(self.ssh_exit)
+    fn renew_remote(&self, host: &str) -> Result<crate::harness::remote_renew::Output, String> {
+        self.remotes.borrow_mut().push(host.to_owned());
+        Ok(crate::harness::remote_renew::Output {
+            code: self.remote_exit,
+            stdout: "remote due pass completed\n".into(),
+            stderr: "remote observation\n".into(),
+        })
     }
 
     fn under_ssh(&self) -> bool {
@@ -233,6 +297,16 @@ impl AccountsHost for RenewHost {
 
     fn current_exe(&self) -> Option<PathBuf> {
         self.exe.clone()
+    }
+
+    fn machine_var(&self, name: &str) -> Option<OsString> {
+        match name {
+            crate::harness::open_url::MAILBOX_ENV => self.env_mailbox.as_ref(),
+            crate::harness::headless_oauth::BROWSER_BIN_ENV => self.env_browser.as_ref(),
+            "CLAUDECODE" if self.agent => return Some("1".into()),
+            _ => None,
+        }
+        .map(|path| path.clone().into_os_string())
     }
 }
 
@@ -274,11 +348,11 @@ fn the_new_forms_parse_and_their_flags_belong_to_them() {
         Ok(Cmd::Accounts(renew(&[], true, None)))
     );
     assert_eq!(
-        p("accounts renew main work-2 --on m3,m4:/opt/aterm").map(|(c, _)| c),
+        p("accounts renew main work-2 --on m3,m4:17100").map(|(c, _)| c),
         Ok(Cmd::Accounts(renew(
             &["main", "work-2"],
             false,
-            Some(&["m3", "m4:/opt/aterm"])
+            Some(&["m3", "m4:17100"])
         )))
     );
     assert!(p("accounts renew").is_err(), "nothing to renew");
@@ -362,7 +436,7 @@ fn a_completed_claude_renewal_refuses_changed_policy_or_binding_without_a_checkp
                                 logins,
                                 "main",
                                 None,
-                                "/another-login",
+                                at!("/another-login"),
                                 None,
                                 1,
                             ))
@@ -1050,9 +1124,9 @@ fn due_renewal_refuses_foreign_state_before_local_or_remote_actions() {
     assert!(host.flows.borrow().is_empty(), "no local renewal");
     assert!(host.checked.borrow().is_empty(), "no local status check");
     assert!(
-        host.sshed.borrow().is_empty(),
+        host.remotes.borrow().is_empty(),
         "state uncertainty must not launch remote renewals: {:?}",
-        host.sshed.borrow()
+        host.remotes.borrow()
     );
     assert_eq!(code, exit(1), "{out}{err}");
     assert_eq!(
@@ -1073,7 +1147,7 @@ fn uncertain_binding_bytes_refuse_renewal_before_local_or_remote_actions() {
     let (code, out, err) = acc(renew(&["main"], false, Some(&["m3"])), &env, &host);
     assert!(host.flows.borrow().is_empty(), "no local renewal");
     assert!(host.checked.borrow().is_empty(), "no local status check");
-    assert!(host.sshed.borrow().is_empty(), "no remote renewal");
+    assert!(host.remotes.borrow().is_empty(), "no remote renewal");
     assert_eq!(code, exit(1), "{out}{err}");
     assert_eq!(
         std::fs::read_to_string(store.logins_file()).unwrap(),
@@ -1083,31 +1157,29 @@ fn uncertain_binding_bytes_refuse_renewal_before_local_or_remote_actions() {
 }
 
 #[test]
-fn other_machines_are_renewed_over_ssh_in_one_sitting() {
+#[cfg(unix)]
+fn renewal_accepts_a_native_fleet_endpoint_with_a_port() {
+    let (_tmp, env) = renew_env("renew-native-endpoint");
+    let host = RenewHost::new();
+    let (code, out, err) = acc(renew(&[], true, Some(&["192.0.2.19:17100"])), &env, &host);
+    assert_eq!(code, exit(0), "{out}{err}");
+    assert!(out.contains("renewing on 192.0.2.19:17100:"), "{out}");
+}
+
+#[test]
+#[cfg(unix)]
+fn other_machines_are_renewed_through_native_fleet_in_one_sitting() {
     let (_tmp, env) = renew_env("renew-on");
     let host = RenewHost::new();
-    let (code, out, err) = acc(
-        renew(&[], true, Some(&["m3", "m4:/opt/aterm"])),
-        &env,
-        &host,
-    );
+    let (code, out, err) = acc(renew(&[], true, Some(&["m3", "m4:17100"])), &env, &host);
     assert_eq!(code, exit(0), "{out}{err}");
-    let argv = |aterm: &str| -> Vec<String> {
-        [aterm, "harness", "accounts", "renew", "--due", "--here"]
-            .map(str::to_string)
-            .to_vec()
-    };
-    assert_eq!(
-        *host.sshed.borrow(),
-        vec![
-            ("m3".to_string(), argv("aterm")),
-            ("m4".to_string(), argv("/opt/aterm"))
-        ]
-    );
+    assert_eq!(*host.remotes.borrow(), ["m3", "m4:17100"]);
     assert!(
-        out.contains("renewing on m3:") && out.contains("renewing on m4:"),
+        out.contains("renewing on m3:") && out.contains("renewing on m4:17100:"),
         "{out}"
     );
+    assert_eq!(out.matches("remote due pass completed").count(), 2);
+    assert_eq!(err.matches("remote observation").count(), 2);
     std::fs::write(
         env.config.as_ref().expect("a config"),
         "[harness]\nhosts = [\"m5\"]\n",
@@ -1116,18 +1188,19 @@ fn other_machines_are_renewed_over_ssh_in_one_sitting() {
     let host = RenewHost::new();
     let (code, ..) = acc(renew(&[], true, None), &env, &host);
     assert_eq!(code, exit(0));
-    assert_eq!(host.sshed.borrow().len(), 1);
-    assert_eq!(host.sshed.borrow()[0].0, "m5");
-    let remote = host.sshed.borrow()[0].1[2..].to_vec();
+    assert_eq!(*host.remotes.borrow(), ["m5"]);
+    let remote = ["accounts", "renew", "--due", "--here"]
+        .map(str::to_owned)
+        .to_vec();
     let Ok((Cmd::Accounts(there), _)) = parse(&remote) else {
         panic!("{remote:?} parses");
     };
     let host = RenewHost::new();
     let (code, out, err) = acc(there, &env, &host);
     assert_eq!(code, exit(0), "{out}{err}");
-    assert!(host.sshed.borrow().is_empty(), "one machine deep: {out}");
+    assert!(host.remotes.borrow().is_empty(), "one machine deep: {out}");
     let mut failing = RenewHost::new();
-    failing.ssh_exit = 1;
+    failing.remote_exit = 1;
     let (code, _, err) = acc(renew(&[], true, None), &env, &failing);
     assert_eq!(code, exit(1));
     assert!(err.contains("on m5: exited 1"), "{err}");
@@ -1135,13 +1208,48 @@ fn other_machines_are_renewed_over_ssh_in_one_sitting() {
     let host = RenewHost::new();
     let (code, ..) = acc(renew(&[], true, None), &env, &host);
     assert_eq!(code, exit(0));
-    assert!(host.sshed.borrow().is_empty(), "no machine named, no ssh");
-    for bad in ["-oProxyCommand=x", "m3;rm", "m3:relative/aterm", "m3:/a b"] {
+    assert!(
+        host.remotes.borrow().is_empty(),
+        "no machine named, no remote call"
+    );
+    for bad in [
+        "-oProxyCommand=x",
+        "m3;rm",
+        "m3:relative/aterm",
+        "m3:/a b",
+        "user@m3",
+        "m3:/opt/aterm",
+        "m3:0",
+        "m3:65536",
+    ] {
         let host = RenewHost::new();
         let (code, _, err) = acc(renew(&["main"], false, Some(&[bad])), &env, &host);
         assert_eq!(code, exit(1), "{bad}");
-        assert!(err.contains("is not a machine ("), "{err}");
-        assert!(host.flows.borrow().is_empty() && host.sshed.borrow().is_empty());
+        assert!(err.contains("is not a native fleet host ("), "{err}");
+        assert!(host.flows.borrow().is_empty() && host.remotes.borrow().is_empty());
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn local_interactive_rows_do_not_prevent_a_native_remote_pass() {
+    let (_tmp, env) = renew_env("renew-remote-without-tty");
+    let mut note = None;
+    env.accounts_store()
+        .transact_logins(env.now, &mut note, |_, logins| {
+            accounts::note_login_notice(logins, "work-2", 2, env.now);
+            Ok(Vec::new())
+        })
+        .expect("make the local interactive account due");
+    for (labels, wanted_code) in [(&[][..], exit(0)), (&["main"][..], exit(1))] {
+        let mut host = RenewHost::new();
+        host.tty = false;
+        let (code, out, err) = acc(renew(labels, true, Some(&["m3"])), &env, &host);
+        assert_eq!(code, wanted_code, "{out}{err}");
+        assert!(host.flows.borrow().is_empty());
+        assert_eq!(*host.remotes.borrow(), ["m3"]);
+        assert!(out.contains("renewing on m3:"), "{out}");
+        assert!(err.contains("stdin is not a terminal"), "{err}");
     }
 }
 
@@ -1195,6 +1303,164 @@ fn each_line_that_signs_a_row_in_names_its_own_verb() {
             )),
             "{err}"
         );
+    }
+}
+
+/// A row's page stopped its sign-in: no later automatic run passes that, so the report names the
+/// person's own sign-in instead of leaving the row to aterm, in the verb such a row takes.
+/// NEGATIVE CONTROL: the same row with `Failed` is left to aterm, naming no step.
+#[test]
+fn a_page_that_stopped_a_sign_in_names_the_persons_renewal() {
+    let (_tmp, env) = renew_env("renew-blocked");
+    let host = RenewHost::new();
+    let (code, out, err) = acc(
+        AccountsCmd::Add {
+            label: "w3".into(),
+            class: Class::Dedicated,
+            email: Some("w3@example.com".into()),
+            identity_email: None,
+            browser: None,
+        },
+        &env,
+        &host,
+    );
+    assert_eq!(code, exit(0), "{out}{err}");
+    let at = host.now() - 60;
+    let store = env.accounts_store();
+    let record = |outcome| {
+        store
+            .transact_logins(at, &mut None, |_, logins| {
+                Ok(accounts::note_sign_in_attempt(
+                    logins, "w3", outcome, "mailbox", at,
+                ))
+            })
+            .expect("recorded");
+    };
+    let step = "sign-in needed: Run aterm harness accounts renew w3 --cli claude in a terminal";
+    record(accounts::AttemptOutcome::Failed);
+    let (_, left, _) = acc(AccountsCmd::Report { json: false }, &env, &host);
+    assert!(!left.contains(step), "CONTROL: {left}");
+    record(accounts::AttemptOutcome::Blocked);
+    let (_, report, _) = acc(AccountsCmd::Report { json: false }, &env, &host);
+    assert!(report.contains(step), "{report}");
+    assert!(report.contains("sign-in: error blocked since"), "{report}");
+    assert!(
+        report.contains(
+            "w3: not-enrolled (no login made yet: a page stopped aterm's sign-in: run `aterm \
+             harness accounts renew w3` in a terminal"
+        ),
+        "{report}"
+    );
+    assert!(
+        !report.contains("`aterm harness accounts renew w3` runs that now"),
+        "{report}"
+    );
+    assert!(!report.contains("accounts login w3"), "{report}");
+}
+
+/// The step that report names does what it says: a person at this Mac's terminal signs in a row
+/// its page stopped in that row's own browser profile, or with none named in their default
+/// browser, since another headless run would meet that page again and a default browser signed in
+/// to another account answers `wrong-account` every time. NEGATIVE CONTROLS: the same row with
+/// `Failed` goes headless, and a `Blocked` one goes headless too with nobody at a terminal, over
+/// SSH, or at an agent's terminal, since no window may open on this Mac for any of them.
+#[test]
+fn a_person_signs_a_row_its_page_stopped_in_its_own_browser() {
+    use accounts::AttemptOutcome::{Blocked, Failed};
+    #[derive(Debug, PartialEq, Eq)]
+    enum Opens {
+        OwnProfile,
+        Default,
+        Headless,
+    }
+    let own = if cfg!(unix) {
+        Opens::OwnProfile
+    } else {
+        Opens::Default
+    };
+    for (tag, outcome, tty, ssh, agent, named, opens) in [
+        ("failed", Failed, true, false, false, true, Opens::Headless),
+        ("stopped", Blocked, true, false, false, true, own),
+        (
+            "unnamed",
+            Blocked,
+            true,
+            false,
+            false,
+            false,
+            Opens::Default,
+        ),
+        (
+            "nobody",
+            Blocked,
+            false,
+            false,
+            false,
+            true,
+            Opens::Headless,
+        ),
+        ("ssh", Blocked, true, true, false, true, Opens::Headless),
+        ("agent", Blocked, true, false, true, true, Opens::Headless),
+    ] {
+        let (_tmp, env) = renew_env(&format!("renew-page-{tag}"));
+        cached_profile_only(&env);
+        if !named {
+            let path = env.accounts_roster().expect("a config dir");
+            let text = std::fs::read_to_string(&path).expect("the roster");
+            let lines: Vec<_> = text
+                .lines()
+                .filter(|line| !line.starts_with("browser"))
+                .collect();
+            std::fs::write(&path, lines.join("\n")).expect("the roster");
+        }
+        let at = env.now - 60;
+        env.accounts_store()
+            .transact_logins(at, &mut None, |_, logins| {
+                Ok(accounts::note_sign_in_attempt(
+                    logins, "main", outcome, "mailbox", at,
+                ))
+            })
+            .expect("recorded");
+        let mut host = RenewHost::new();
+        host.tty = tty;
+        host.ssh_session = ssh;
+        host.agent = agent;
+        let (_, out, err) = acc(renew(&["main"], false, None), &env, &host);
+        let flows = host.flows.borrow();
+        let first = flows.first().unwrap_or_else(|| panic!("{tag}: {out}{err}"));
+        let opened = match first.2 {
+            RenewBrowser::OwnProfile { .. } => Opens::OwnProfile,
+            RenewBrowser::Default => Opens::Default,
+            RenewBrowser::Remote { .. } => Opens::Headless,
+            RenewBrowser::Profile { .. } => panic!("{tag}: {:?}", first.2),
+        };
+        assert_eq!(opened, opens, "{tag}: {:?}", first.2);
+        assert_eq!(flows.len(), 1, "{tag}: one run");
+    }
+}
+
+/// An agent's terminal opens no browser on this Mac: a row with no headless route is left to a
+/// person, and a headless run that failed gets no second, interactive one. CONTROL: a person at
+/// the same terminal gets both.
+#[test]
+fn an_agents_terminal_opens_no_browser_for_a_row() {
+    for (agent, code, flows) in [(false, 0, 1), (true, 1, 0)] {
+        let (_tmp, env) = renew_env("renew-agent-no-route");
+        let mut host = RenewHost::new();
+        host.agent = agent;
+        let (got, out, err) = acc(renew(&["main"], false, None), &env, &host);
+        assert_eq!(got, exit(code), "{out}{err}");
+        assert_eq!(host.flows.borrow().len(), flows, "{out}{err}");
+    }
+    for (agent, flows) in [(false, 2), (true, 1)] {
+        let (_tmp, env) = renew_env("renew-agent-fallback");
+        cached_profile_only(&env);
+        let mut host = RenewHost::new();
+        host.agent = agent;
+        host.flow = 1;
+        host.flow_after_first = Some(0);
+        let (_, out, err) = acc(renew(&["main"], false, None), &env, &host);
+        assert_eq!(host.flows.borrow().len(), flows, "{out}{err}");
     }
 }
 
@@ -1371,10 +1637,26 @@ fn the_sign_in_and_the_check_are_built_exactly() {
         envs(&cmd),
         BTreeSet::from([
             gone(accounts::LOGIN_ENV),
+            gone(crate::harness::open_url::INPUT_ENV),
             set(accounts::HOME_ENV, "/s/logins/main+1"),
+            gone(crate::harness::open_url::NO_HEADLESS_ENV),
             set("BROWSER", "/s/bin/aterm-open-url"),
             set(crate::harness::open_url::PROFILE_ENV, "Claude main"),
         ])
+    );
+    let own = renew_command(
+        program,
+        "/h",
+        OWNER,
+        &RenewBrowser::OwnProfile {
+            opener: PathBuf::from("/s/bin/aterm-open-url"),
+            profile: "Claude main".into(),
+        },
+    );
+    assert!(envs(&own).contains(&set(crate::harness::open_url::PROFILE_ENV, "Claude main")));
+    assert!(
+        envs(&own).contains(&set(crate::harness::open_url::NO_HEADLESS_ENV, "1")),
+        "a row its page stopped opens with no headless try first"
     );
     let remote = renew_command(
         program,
@@ -1394,6 +1676,9 @@ fn the_sign_in_and_the_check_are_built_exactly() {
     let default = renew_command(program, "/h", OWNER, &RenewBrowser::Default);
     assert!(!envs(&default).iter().any(|(k, _)| k == "BROWSER"));
     assert!(envs(&default).contains(&gone(crate::harness::open_url::PROFILE_ENV)));
+    for command in [&remote, &bare, &default] {
+        assert!(envs(command).contains(&gone(crate::harness::open_url::INPUT_ENV)));
+    }
 }
 
 #[cfg(unix)]
@@ -1436,9 +1721,15 @@ fn a_whole_sitting_through_a_stand_in_checks_only_in_staging_homes() {
         }
         fn renew_flow(&self, home: &str, email: &str, b: &RenewBrowser) -> Result<i32, String> {
             let user_home = self.1.clone();
-            renew_flow_of(self.0.as_os_str(), home, email, b, &move |name| {
-                (name == "HOME").then(|| user_home.clone())
-            })
+            renew_flow_of(
+                self.0.as_os_str(),
+                home,
+                email,
+                b,
+                &move |name| (name == "HOME").then(|| user_home.clone()),
+                None,
+            )
+            .map(|exit| exit.code)
         }
         fn status_in_home(&self, home: &str) -> Result<Captured, String> {
             let user = |name: &str| (name == "USER").then(|| OsString::from("someone"));
@@ -1520,13 +1811,14 @@ fn a_mailbox_directory_runs_accounts_renew_without_a_terminal_through_the_opener
         &program,
         &format!(
             "#!/bin/sh\nlog=\"${{0%/*}}/ran\"\necho \"$1 $2 browser=${{BROWSER##*/}} \
-             mailbox=${{{mailbox_env}+set}} email=${{{email_env}+set}}\" >> \"$log\"\n\
+             mailbox=${{{mailbox_env}+set}} email=${{{email_env}+set}} webmail=${{{webmail_env}+set}}\" >> \"$log\"\n\
              if [ \"$2\" = login ]; then printf '%s' \"$5\" > \"$CLAUDE_CONFIG_DIR/.email\"; \
              echo '{{}}' > \"$CLAUDE_CONFIG_DIR/.claude.json\"; exit 0; fi\n\
              printf '{{\"loggedIn\":true,\"authMethod\":\"claude.ai\",\"email\":\"%s\",\"subscriptionType\":\"max\"}}' \
              \"$(cat \"$CLAUDE_CONFIG_DIR/.email\")\"\n",
             mailbox_env = crate::harness::open_url::MAILBOX_ENV,
             email_env = crate::harness::open_url::EMAIL_ENV,
+            webmail_env = crate::harness::headless_oauth::WEBMAIL_URL_ENV,
         ),
     )
     .expect("stand-in");
@@ -1553,9 +1845,22 @@ fn a_mailbox_directory_runs_accounts_renew_without_a_terminal_through_the_opener
         }
         fn renew_flow(&self, home: &str, email: &str, b: &RenewBrowser) -> Result<i32, String> {
             let user_home = self.1.clone();
-            renew_flow_of(self.0.as_os_str(), home, email, b, &move |name| {
-                (name == "HOME").then(|| user_home.clone())
-            })
+            renew_flow_of(
+                self.0.as_os_str(),
+                home,
+                email,
+                b,
+                &move |name| match name {
+                    "HOME" => Some(user_home.clone()),
+                    "USER" => Some("fixture-user".into()),
+                    crate::harness::headless_oauth::WEBMAIL_URL_ENV => {
+                        Some("https://mailbox.example.test".into())
+                    }
+                    _ => None,
+                },
+                Some(aterm_spec::wait::MUST_HAPPEN),
+            )
+            .map(|exit| exit.code)
         }
         fn status_in_home(&self, home: &str) -> Result<Captured, String> {
             let user = |name: &str| (name == "USER").then(|| OsString::from("someone"));
@@ -1578,8 +1883,330 @@ fn a_mailbox_directory_runs_accounts_renew_without_a_terminal_through_the_opener
     assert_eq!(
         lines,
         [
-            "auth login browser=aterm-open-url mailbox=set email=set",
-            "auth status browser= mailbox= email=",
+            "auth login browser=aterm-open-url mailbox=set email=set webmail=set",
+            "auth status browser= mailbox= email= webmail=",
         ]
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unattended_renewal_timeout_releases_the_machine_signin_lock() {
+    let (tmp, env) = renew_env("renew-unattended-timeout");
+    let store = env.accounts_store();
+    std::fs::create_dir_all(
+        store
+            .dir
+            .join(crate::harness::open_url::DEFAULT_MAILBOX_DIR),
+    )
+    .unwrap();
+    let program = tmp.path().join("bin").join("claude");
+    std::fs::create_dir_all(program.parent().unwrap()).unwrap();
+    aterm_tempfile::stand_in(
+        &program,
+        "#!/bin/sh\nprintf '%s' \"$$\" > \"${0%/*}/pid\"\nexec /bin/sleep 3600\n",
+    )
+    .unwrap();
+    let pid_file = program.parent().unwrap().join("pid");
+    let before = logins_of(&env).get("work-2").and_then(|b| b.dir.clone());
+
+    let worker_env = env.clone();
+    let host = NativeRenewal {
+        program,
+        user_home: env.home.clone().unwrap().into_os_string(),
+        within: std::time::Duration::from_millis(100),
+    };
+    let (done, result) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let answer = acc(renew(&["work-2"], false, None), &worker_env, &host);
+        let _ = done.send(answer);
+    });
+    // The short interval is the configured behavior under test. This separate
+    // one-minute wait detects a return to an unbounded child wait.
+    let answer = result.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+    let hung = answer.is_err();
+    let answer = answer.unwrap_or_else(|_| {
+        let pid: i32 = std::fs::read_to_string(&pid_file).unwrap().parse().unwrap();
+        // The fixture wrote its own PID before exec and owns this process group.
+        aterm_uds::process::kill_group_until_empty(pid).unwrap();
+        result.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap()
+    });
+    worker.join().unwrap();
+    assert!(
+        !hung,
+        "an unattended renewal kept the machine sign-in lock indefinitely"
+    );
+    assert_ne!(answer.0, exit(0));
+    assert!(
+        store.signin_now().unwrap().is_some(),
+        "the next account can renew"
+    );
+    assert_eq!(
+        logins_of(&env).get("work-2").and_then(|b| b.dir.clone()),
+        before
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unattended_nonzero_exit_reports_its_browser_cause_without_changing_retries() {
+    for (code, expected) in [(1, Renewal::AuthFailed), (130, Renewal::Failed)] {
+        let (tmp, env) = renew_env("renew-browser-exit");
+        let program = tmp.path().join("provider");
+        aterm_tempfile::stand_in(
+            &program,
+            &format!(
+                "#!/bin/sh\nprintf 'bot-check claude.ai\\n' > \"$ATERM_OPEN_URL_OUTCOME\"\nexit {code}\n"
+            ),
+        )
+        .unwrap();
+        let host = NativeRenewal {
+            program,
+            user_home: env.home.clone().unwrap().into_os_string(),
+            within: aterm_spec::wait::MUST_HAPPEN,
+        };
+        let store = env.accounts_store();
+        let roster_path = env.accounts_roster().unwrap();
+        let roster = Roster::load(&roster_path).unwrap();
+        let row = roster.row("work-2").unwrap();
+        let logins = logins_of(&env);
+        let before = logins.get("work-2").cloned();
+        let signin = store.signin_now().unwrap().unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let result = renew_one(
+            &env,
+            &host,
+            &store,
+            &signin,
+            accounts::RenewalPolicy {
+                roster_path: &roster_path,
+                roster: &roster,
+                row,
+                logins: &logins,
+            },
+            row.dir.as_deref(),
+            &RenewBrowser::Remote { opener: None },
+            &mut out,
+            &mut err,
+        );
+        let err = String::from_utf8(err).unwrap();
+        assert_eq!(result, expected, "{err}");
+        assert_eq!(result.can_retry_authentication(), code == 1, "{err}");
+        assert!(err.contains(&format!("exited {code}")), "{err}");
+        assert!(err.contains("Cloudflare"), "{err}");
+        assert!(err.contains("claude.ai"), "{err}");
+        assert_eq!(logins_of(&env).get("work-2").cloned(), before);
+    }
+}
+
+#[test]
+fn an_unattended_renewal_keeps_the_safe_browser_outcome_after_capture_fails() {
+    use crate::harness::open_url::{Met, MetWord, OUTCOME_ENV};
+
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let stale = tmp.path().join("stale-outcome");
+    std::fs::write(&stale, "block-page stale.example\n").unwrap();
+    let reason = "it ran past its 300000 ms deadline";
+    for (text, expected) in [
+        (
+            "bot-check claude.ai\n",
+            Some(Met::new(MetWord::BotCheck, Some("claude.ai"))),
+        ),
+        (
+            "bot-check https://claude.ai/login?code=private-code\n",
+            None,
+        ),
+    ] {
+        let mut cmd = aterm_uds::spawnfd::Command::new("unused-provider");
+        cmd.env(OUTCOME_ENV, &stale);
+        let mut actual_path = None;
+        let failure = capture_unattended_renewal_with(cmd, |cmd| {
+            let path = cmd
+                .get_envs()
+                .find(|(key, _)| *key == OUTCOME_ENV)
+                .and_then(|(_, value)| value)
+                .map(PathBuf::from)
+                .expect("this attempt has its own outcome file");
+            assert_ne!(path, stale);
+            std::fs::write(&path, text).unwrap();
+            actual_path = Some(path);
+            Err(reason.to_owned())
+        })
+        .unwrap_err();
+        assert_eq!(failure.met, expected);
+        let diagnostic = failure.to_string();
+        assert!(diagnostic.contains(reason), "{diagnostic}");
+        assert!(!diagnostic.contains("private-code"), "{diagnostic}");
+        if expected.is_some() {
+            assert!(diagnostic.contains("Cloudflare"), "{diagnostic}");
+            assert!(diagnostic.contains("claude.ai"), "{diagnostic}");
+        } else {
+            assert_eq!(diagnostic, reason);
+        }
+        assert!(
+            !actual_path.unwrap().exists(),
+            "the private run is cleaned up"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(stale).unwrap(),
+        "block-page stale.example\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unattended_provider_exit_keeps_its_browser_outcome() {
+    use crate::harness::open_url::{Met, MetWord};
+
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let program = tmp.path().join("provider");
+    aterm_tempfile::stand_in(
+        &program,
+        "#!/bin/sh\nprintf 'block-page claude.ai\\n' > \"$ATERM_OPEN_URL_OUTCOME\"\nexit 1\n",
+    )
+    .unwrap();
+    let cmd = aterm_uds::spawnfd::Command::new(&program);
+    let (ran, met) = capture_unattended_renewal(cmd, aterm_spec::wait::MUST_HAPPEN).unwrap();
+    assert_eq!(ran.code, Some(1));
+    assert_eq!(met, Some(Met::new(MetWord::BlockPage, Some("claude.ai"))));
+}
+
+/// `accounts renew`'s choice of rows reads the machine through its host alone: a row whose
+/// mailbox only the host's environment names renews with no terminal. CONTROL: under a host
+/// whose environment names none, the same row is only reported due and nothing runs.
+#[test]
+fn renews_choice_of_rows_reads_the_environment_through_its_host() {
+    let (tmp, env) = renew_env("renew-host-env");
+    let mailbox = tmp.path().join("mail-the-host-names");
+    std::fs::create_dir_all(&mailbox).expect("mailbox");
+    let mut quiet = RenewHost::new();
+    quiet.tty = false;
+    let (code, out, err) = acc(renew(&["work-2"], false, None), &env, &quiet);
+    assert_eq!(code, exit(1), "{out}{err}");
+    assert_eq!(out, "due here: work-2\n", "CONTROL");
+    assert!(quiet.flows.borrow().is_empty());
+
+    let mut named = RenewHost::new();
+    named.tty = false;
+    named.env_mailbox = Some(mailbox);
+    let (code, out, err) = acc(renew(&["work-2"], false, None), &env, &named);
+    assert_eq!(code, exit(0), "{out}{err}");
+    let renewed: Vec<_> = named
+        .flows
+        .borrow()
+        .iter()
+        .map(|(_, e, _)| e.clone())
+        .collect();
+    assert_eq!(renewed, [WORK], "{out}{err}");
+}
+
+#[test]
+fn renews_profile_route_uses_only_the_browser_its_host_names() {
+    let (tmp, env) = renew_env("renew-host-browser");
+    let store = env.accounts_store();
+    let profile = crate::harness::headless_oauth::resolve_browser_profile_dir(
+        &store.dir,
+        Some("work-2"),
+        Some(WORK),
+    );
+    std::fs::create_dir_all(&profile).unwrap();
+    let browser = tmp.path().join("fixture-browser");
+    std::fs::write(&browser, "fixture; never executed").unwrap();
+    let mut quiet = RenewHost::new();
+    quiet.tty = false;
+    assert!(!quiet.system_browsers());
+    let (code, out, err) = acc(renew(&["work-2"], false, None), &env, &quiet);
+    assert_eq!(code, exit(1), "{out}{err}");
+    assert!(quiet.flows.borrow().is_empty());
+    let mut named = RenewHost::new();
+    named.tty = false;
+    named.env_browser = Some(browser);
+    let (code, out, err) = acc(renew(&["work-2"], false, None), &env, &named);
+    assert_eq!(code, exit(0), "{out}{err}");
+    assert_eq!(named.flows.borrow().len(), 1);
+}
+
+#[test]
+fn a_repaired_browser_reopens_noninteractive_renewal_without_proving_its_identity() {
+    for (repaired, reported) in [(false, WORK), (true, WORK), (true, OWNER)] {
+        let (tmp, env) = renew_env("renew-repaired-browser");
+        let store = env.accounts_store();
+        let profile = crate::harness::headless_oauth::resolve_browser_profile_dir(
+            &store.dir,
+            Some("work-2"),
+            Some(WORK),
+        );
+        std::fs::create_dir_all(profile).unwrap();
+        let browser = tmp.path().join("fixture-browser");
+        std::fs::write(&browser, "fixture; never executed").unwrap();
+        let wrong_at = env.now - 2;
+        store
+            .transact_logins(env.now, &mut None, |state, logins| {
+                let mut events =
+                    accounts::note_auth(state, "work-2", accounts::Auth::SignedOut, wrong_at);
+                events.extend(accounts::note_wrong_account(logins, "work-2", wrong_at));
+                if repaired {
+                    events.push(
+                        accounts::Event::new(env.now - 1, accounts::Kind::SignIn, "work-2")
+                            .because("claude.ai window done session-kept"),
+                    );
+                }
+                Ok(events)
+            })
+            .unwrap();
+        let mut host = RenewHost::new();
+        host.tty = false;
+        host.env_browser = Some(browser);
+        host.signs_in_as = Some(reported);
+        let before_check = store.clone();
+        let now = env.now;
+        host.during_flow = Some(Box::new(move || {
+            assert_eq!(
+                before_check.load(now).unwrap().0.account("work-2").auth,
+                accounts::Auth::SignedOut
+            );
+            assert_eq!(
+                before_check
+                    .load_logins(now)
+                    .unwrap()
+                    .0
+                    .get("work-2")
+                    .unwrap()
+                    .wrong_at,
+                Some(wrong_at)
+            );
+        }));
+        let (code, out, err) = acc(renew(&["work-2"], false, None), &env, &host);
+        assert_eq!(
+            host.flows.borrow().len(),
+            usize::from(repaired),
+            "{out}{err}"
+        );
+        assert_eq!(
+            host.checked.borrow().len(),
+            usize::from(repaired),
+            "{out}{err}"
+        );
+        let accepted = repaired && reported == WORK;
+        assert_eq!(code, exit(u8::from(!accepted)), "{out}{err}");
+        let auth = store.load(env.now).unwrap().0.account("work-2").auth;
+        assert_eq!(
+            auth,
+            if accepted {
+                accounts::Auth::Ok
+            } else {
+                accounts::Auth::SignedOut
+            }
+        );
+        let logins = logins_of(&env);
+        assert_eq!(logins.get("work-2").unwrap().wrong_at.is_none(), accepted);
+        if repaired {
+            assert!(matches!(
+                host.flows.borrow()[0].2,
+                RenewBrowser::Remote { .. }
+            ));
+        }
+    }
 }

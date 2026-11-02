@@ -172,9 +172,9 @@ pub enum RunOut {
     Ok,
     /// A nonzero exit status.
     Fail,
-    /// Killed by a signal.
+    /// Ended on a signal aterm delivered on an ask; `by=` names who asked.
     Signal,
-    /// It went away with its parent, or unobserved.
+    /// Went away with its parent: a program whose command failed, or unobserved.
     Gone,
     /// A newer run replaced it.
     Superseded,

@@ -222,7 +222,7 @@ impl SwarmSurveyFacts {
             if line.starts_with("instance ") {
                 let fields = parse_fields(line);
                 return field_raw(&fields, "cpu_headroom")
-                    .and_then(|v| v.parse::<u32>().ok())
+                    .and_then(crate::parse_uint::<u32>)
                     .map(|pct| pct.min(100));
             }
         }
@@ -318,9 +318,8 @@ impl SwarmSurveyFacts {
         let header =
             instance.ok_or_else(|| "missing instance header in survey reply".to_owned())?;
         let version = required_nonempty(&header, "version")?;
-        let sessions = required_raw(&header, "sessions")?
-            .parse::<usize>()
-            .map_err(|_| "invalid sessions field in instance header".to_owned())?;
+        let sessions = crate::parse_uint::<usize>(required_raw(&header, "sessions")?)
+            .ok_or_else(|| "invalid sessions field in instance header".to_owned())?;
         let window = parse_bool01(required_raw(&header, "window")?, "window")?;
         let window_last = parse_opt_u64(required_raw(&header, "window_last")?, "window_last")?;
         let label = optional_word(required_raw(&header, "label")?);
@@ -330,7 +329,12 @@ impl SwarmSurveyFacts {
         let accounts_unread = field_raw(&header, "accounts_unread")
             .and_then(optional_word)
             .map_or_else(Vec::new, |pools| {
-                pools.split(',').map(str::to_owned).collect()
+                pools
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .collect()
             });
 
         Ok(Self {
@@ -392,27 +396,27 @@ fn parse_opt_u64(raw: &str, key: &str) -> Result<Option<u64>, String> {
     if raw == "-" {
         return Ok(None);
     }
-    raw.parse::<u64>()
+    crate::parse_uint::<u64>(raw)
         .map(Some)
-        .map_err(|_| format!("invalid `{key}` field"))
+        .ok_or_else(|| format!("invalid `{key}` field"))
 }
 
 fn parse_opt_u32(raw: &str, key: &str) -> Result<Option<u32>, String> {
     if raw == "-" {
         return Ok(None);
     }
-    raw.parse::<u32>()
+    crate::parse_uint::<u32>(raw)
         .map(Some)
-        .map_err(|_| format!("invalid `{key}` field"))
+        .ok_or_else(|| format!("invalid `{key}` field"))
 }
 
 fn parse_opt_i64(raw: &str, key: &str) -> Result<Option<i64>, String> {
     if raw == "-" {
         return Ok(None);
     }
-    raw.parse::<i64>()
+    crate::parse_int::<i64>(raw)
         .map(Some)
-        .map_err(|_| format!("invalid `{key}` field"))
+        .ok_or_else(|| format!("invalid `{key}` field"))
 }
 
 fn parse_account_line(fields: &[(String, String)]) -> Result<SurveyAccountFact, String> {
@@ -432,9 +436,8 @@ fn parse_account_line(fields: &[(String, String)]) -> Result<SurveyAccountFact, 
 fn parse_server_heard_line(fields: &[(String, String)]) -> Result<ServerHeardFact, String> {
     let vault = required_nonempty(fields, "vault")?;
     let subject = required_nonempty(fields, "subject")?;
-    let at = required_raw(fields, "at")?
-        .parse::<u64>()
-        .map_err(|_| "invalid `at` field on server_heard".to_owned())?;
+    let at = crate::parse_uint::<u64>(required_raw(fields, "at")?)
+        .ok_or_else(|| "invalid `at` field on server_heard".to_owned())?;
     Ok(ServerHeardFact { vault, subject, at })
 }
 
@@ -444,7 +447,7 @@ fn touch_or_read_window_last(state_dir: &Path, window: bool, now: u64) -> Option
     let stored = crate::harness::accounts::read_bounded(&path, 256)
         .ok()
         .flatten()
-        .and_then(|s| s.trim().parse::<u64>().ok());
+        .and_then(|s| crate::parse_uint::<u64>(s.trim()));
     if !window {
         return stored;
     }
@@ -808,6 +811,8 @@ mod tests {
                 "removing `{missing_token}` must be rejected: {broken}"
             );
         }
+        let plus_time = wire.replacen(" last_used=1793159900", " last_used=+1793159900", 1);
+        assert!(SwarmSurveyFacts::from_survey_reply(&plus_time).is_err());
     }
 
     /// The header counts the account lines and names the pools that could not be read, which an
@@ -1085,6 +1090,15 @@ mod tests {
         let facts_ok =
             SwarmSurveyFacts::collect_at(&state, Some(&home), None, 0, false, None, 1_793_160_000);
         assert_eq!(facts_ok.label.as_deref(), Some("m100"));
+        assert_eq!(
+            SwarmSurveyFacts::parse_cpu_headroom_pct("instance cpu_headroom=+50\n"),
+            None
+        );
+        let parsed = SwarmSurveyFacts::from_survey_reply(
+            "OK 1\ninstance version=0.148.0 sessions=0 window=0 window_last=- label=- ssh_host_key=- accounts_unread=claude,%20codex%20,\n",
+        )
+        .expect("parse survey reply");
+        assert_eq!(parsed.accounts_unread, ["claude", "codex"]);
 
         running.stop();
     }

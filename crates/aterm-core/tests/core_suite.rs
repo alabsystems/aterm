@@ -17,6 +17,7 @@ mod conformance_read_image_seq;
 mod conformance_recording;
 mod conformance_repaint_nudge;
 mod control_string_cancel;
+mod double_width_margin_wrap;
 mod empty_param_default;
 mod fuzz_alt_screen;
 mod fuzz_process_never_panics;

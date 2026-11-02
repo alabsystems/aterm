@@ -158,3 +158,87 @@ fn a_newer_or_unreadable_kept_record_is_left_and_honored() {
     initial::kept::forget_at(root.path(), None).unwrap();
     assert!(initial::kept::Kept::load(root.path()).is_ok());
 }
+
+/// A newer aterm's record of the keys the person changed names a row this build does not know (a
+/// setting the newer build added), under a later format or this build's own (a newer aterm that
+/// added the row without a new format). It is a newer aterm's record: an unattended pass still
+/// runs, honouring what it can read and leaving the key on the unknown row as the person set it,
+/// and Restore, Set up now and `doctor --apply` never write over it, which would drop the row the
+/// key is on. Before, the unknown row made the record unreadable: the pass set nothing, and a
+/// Restore replaced the newer record with an empty one.
+#[test]
+fn a_newer_kept_record_with_a_new_row_is_frozen_not_damaged() {
+    let root = aterm_tempfile::tempdir().expect("scratch");
+    let path = root.path().join(initial::kept::KEPT_RECORD);
+    for format in [2, 1] {
+        let newer = aterm_json::json!({
+            "profile": PROFILE,
+            "format": format,
+            "applied": [],
+            "kept": [
+                {"item": "init.new@me", "setting": 63, "held": null},
+                {"item": "init.dock@me", "setting": Setting::Dock as u64, "held": null},
+            ],
+        });
+        std::fs::write(&path, aterm_json::to_vec(&newer).unwrap()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let kept = initial::kept::Kept::load(root.path()).expect("a newer record reads");
+        assert!(
+            kept.keeps("init.new@me"),
+            "the unknown row's key is still the person's (format {format})"
+        );
+        assert!(kept.keeps("init.dock@me"));
+        assert_eq!(kept.changed_by_you(), {
+            let mut dock = Selection::none();
+            dock.set(Setting::Dock, true);
+            dock
+        });
+        let mut host = Fake::default();
+        let pass = automatic_pass(&mut host, root.path(), BUILD, at(0));
+        assert!(pass.is_ok(), "the pass runs: {:?}", pass.err());
+        initial::kept::forget_at(root.path(), None).unwrap();
+        initial::kept::forget_at(root.path(), Some(Selection::all())).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "a newer record is never written (format {format})"
+        );
+    }
+
+    // One of a later format this build cannot read at all is left as it is too.
+    let unreadable = aterm_json::json!({"profile": PROFILE, "format": 2, "kept": "later"});
+    std::fs::write(&path, aterm_json::to_vec(&unreadable).unwrap()).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    initial::kept::forget_at(root.path(), None).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+/// A key the person changed after aterm set it is theirs (design §6.6): System State reads
+/// Changed by you, and `aterm init` leaves it. `aterm doctor --check` judges the same Mac and
+/// reads that key as theirs, not as drift needing attention (exit 1), as it reads a group left
+/// as is or out of scope.
+#[test]
+fn check_reads_a_key_the_person_changed_as_theirs_not_as_drift() {
+    let root = aterm_tempfile::tempdir().expect("scratch");
+    let dock = wanted()[0].0.clone();
+    let mut host = Fake::default();
+    automatic_pass(&mut host, root.path(), BUILD, at(0)).expect("first pass");
+    host.values.insert(dock.clone(), PValue::Bool(true));
+    automatic_pass(&mut host, root.path(), BUILD, at(1)).expect("retry");
+    assert!(
+        initial::kept::changed_by_you_at(root.path()).contains(Setting::Dock),
+        "the record keeps the person's Dock"
+    );
+    // `aterm doctor --check` runs in a process of its own: it holds only what it read.
+    host.hold(&[]);
+    let report = execute(&mut host, root.path(), Action::Check).expect("check");
+    let row = report
+        .rows
+        .iter()
+        .find(|row| row.name == dock.describe())
+        .expect("the Dock's row");
+    assert!(
+        !row.needs_attention() && !report.needs_attention(),
+        "doctor --check reads the Dock the person changed as needing attention: {row:?}"
+    );
+}

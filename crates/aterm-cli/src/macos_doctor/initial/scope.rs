@@ -7,8 +7,8 @@
 //! Sync rows ride it) and Rust in Spotlight (this login's rustup docs and aterm's
 //! build caches kept out of Spotlight). The rest of the profile
 //! — the workstation preferences, Dock, Repositories and the Messages and FaceTime
-//! sign-outs — once the pinned ALab service is found on this LAN or this login
-//! already holds ALab membership. Elsewhere the
+//! sign-outs — only on an ALab Mac, which is one whose login opened a locker in the
+//! ALab vault under this Mac's own freshly minted recipient key. Elsewhere the
 //! automatic plan is the base plan, saved as provisional, and the launch that finds
 //! the signal, this one or a later one, widens it to the whole profile as a new
 //! revision. A plan a person shaped is never changed, and this scoping never narrows
@@ -342,30 +342,20 @@ fn vault_member() -> bool {
 /// some vault, and none of that is a reason to set up a Mac as ALab's or sign it out
 /// of Messages and FaceTime.
 fn member_of_the_alab_vault(status: &aterm_secrets::client::Status) -> bool {
-    use aterm_secrets::client::{self, Membership};
-    let Some(config) = status.config.as_ref() else {
-        return false;
-    };
-    match status.membership {
-        Membership::In { .. } => client::alab_vault(config),
-        Membership::Pending
-        | Membership::Plain
-        | Membership::Unconfigured
-        | Membership::Revoked { .. } => false,
-    }
+    aterm_machines::init_secrets::member_of_the_alab_vault(status)
 }
 
-/// The full default profile applies once the pinned ALab service is discovered on
-/// this LAN, or this login already holds membership. Credential delivery remains a
-/// dependency of repositories and shared data, not of unrelated workstation setup.
-/// This performs a bounded network probe and must run off the UI thread.
+/// Whether this is an ALab Mac (§3.5): a membership opened under this Mac's own
+/// recipient key in the ALab vault ([`member_of_the_alab_vault`]), kept for the
+/// process once seen. Reads this login's secrets records only, with no network
+/// probe. Nothing else is the signal: a probe that found the vault's address, a
+/// pending request to it, a plain file, another vault, or a fleet key (`aterm fleet
+/// init` makes a fleet of anyone's Macs) each start a join at most. The Secrets lane
+/// every Mac runs ([`scoped`]) does the join; this gates only the workstation
+/// profile and the sign-outs.
 pub fn alab_mac() -> bool {
     static ALAB: AtomicBool = AtomicBool::new(false);
-    kept_if_found(&ALAB, || profile_ready(vault_member(), probe_vault))
-}
-
-fn profile_ready(member: bool, discover: impl FnOnce() -> VaultHere) -> bool {
-    member || discover() == VaultHere::Found
+    kept_if_found(&ALAB, vault_member)
 }
 
 /// `found`, read only until it says yes once.
@@ -385,8 +375,8 @@ fn kept_if_found(kept: &AtomicBool, found: impl FnOnce() -> bool) -> bool {
 /// ([`aterm_types::macos_setup::BASE_PLAN`]) — aterm's own Permissions, the Secrets
 /// vault lane (the discovery look and the Sync rows ride it) and Rust in Spotlight (this
 /// login's rustup docs and aterm's build caches kept out of Spotlight). The workstation
-/// preferences, Dock, Repositories and the Messages and FaceTime sign-outs wait for
-/// verified LAN discovery or existing membership ([`alab_mac`]); the base plan reaches every Mac so sync is on by default
+/// preferences, Dock, Repositories and the Messages and FaceTime sign-outs wait for the
+/// ALab signal ([`alab_mac`]); the base plan reaches every Mac so sync is on by default
 /// (§8.1).
 fn scoped(mut plan: Plan, alab: bool) -> Plan {
     if !alab {
@@ -411,13 +401,16 @@ impl InitialSetupAuthorization {
     }
 }
 
-/// The plan a provisional `saved` one widens to once this Mac shows the ALab
-/// signal, or `None` when it stays: a person-shaped, stopped, cancelled or
-/// restored plan (a widen a Stop put back is the person's, [`put_back_held_widen`]),
-/// or one that is already the whole profile. A Restore's record
-/// holds it for as long as it stands ([`Restored`]), whatever was admitted since:
-/// widening would set again the groups the Restore put back and sign Messages and
-/// FaceTime out, which nothing undoes.
+/// The plan a provisional `saved` one widens to, or `None` when it stays: the whole profile once
+/// this Mac shows the ALab signal (`alab`); otherwise, for a plan an older aterm saved before
+/// every Mac got the base plan (releases v0.130.0 to v0.144 saved aterm's permissions alone on a
+/// Mac that was not yet an ALab member), the base plan joined to it
+/// ([`aterm_types::macos_setup::BASE_PLAN`]), whatever `alab` says, so that Mac syncs and an ALab
+/// Mac can join its vault and widen. A plan a person shaped (a choice, a declined widen), stopped,
+/// cancelled or restored stays exactly as it is (a widen a Stop put back is the person's,
+/// [`put_back_held_widen`]), and nothing narrows a plan. A Restore's record holds it for as long
+/// as it stands ([`Restored`]), whatever was admitted since: widening would set again the groups
+/// the Restore put back and sign Messages and FaceTime out, which nothing undoes.
 pub(super) fn upgrade_of(records: &Records, alab: impl FnOnce() -> bool) -> Option<Plan> {
     let Some((plan, true)) = records.plan.as_ref() else {
         return None;
@@ -427,12 +420,16 @@ pub(super) fn upgrade_of(records: &Records, alab: impl FnOnce() -> bool) -> Opti
         || matches!(records.decision, Decision::Stopped(_))
         || records.restored.is_some()
         || plan.selection == Selection::all()
-        || !alab()
     {
         return None;
     }
-    Some(Plan {
-        selection: Selection::all(),
+    let selection = if alab() {
+        Selection::all()
+    } else {
+        plan.selection.union(aterm_types::macos_setup::BASE_PLAN)
+    };
+    (selection != plan.selection).then(|| Plan {
+        selection,
         vault_url: plan.vault_url.clone(),
     })
 }
@@ -440,7 +437,7 @@ pub(super) fn upgrade_of(records: &Records, alab: impl FnOnce() -> bool) -> Opti
 /// Whether a look for the ALab signal has work ([`provisional_setup_widened`]): the saved
 /// plan is aterm's own provisional one, which it offers to widen once this Mac shows the ALab
 /// signal. Reads aterm's records only: no probe. An error when they cannot be read just now (a
-/// pass writing them, say) or whose person is not settled yet.
+/// pass writing them, say) or whose person is not settled yet; a newer aterm's widen nothing.
 pub fn provisional_setup_widens() -> Result<bool, String> {
     if aterm_types::dirs::runs_under_private_state_root() {
         return Ok(false);
@@ -453,8 +450,14 @@ pub fn provisional_setup_widens() -> Result<bool, String> {
     widens_at(&state_root()?)
 }
 
+/// A newer aterm's records widen nothing: they are final for this binary, so a watch of them
+/// ends rather than read them again ([`NEWER_SETUP`]).
 fn widens_at(root: &Path) -> Result<bool, String> {
-    let records = watch_ticket(root)?.baseline_records()?;
+    let records = match watch_ticket(root).and_then(|ticket| ticket.baseline_records()) {
+        Ok(records) => records,
+        Err(why) if setup_is_newer(&why) => return Ok(false),
+        Err(why) => return Err(why),
+    };
     Ok(upgrade_of(&records, || true).is_some())
 }
 
@@ -481,18 +484,24 @@ pub struct SetupUpgrade {
     pub to: u64,
 }
 
-/// A provisional upgrade retaining its exact admission through a failed publication.
+/// A provisional upgrade retaining its exact admission while a retry can finish it.
 #[derive(Default)]
 pub struct InitialSetupUpgrade {
     attempt: Option<(InitialSetupAuthorization, Plan)>,
+    /// The attempt the last persist let go after a write whose publication it could not
+    /// identify, kept only for what it published ([`Self::published`]): Stop evidence, never
+    /// authority to write or admit again.
+    unidentified: Option<InitialSetupAuthorization>,
     /// Said the moment this upgrade's write finds the profile lock another setup holds and
     /// starts waiting for it ([`Self::noting_wait`]).
     waits: Option<Box<dyn FnMut() + Send>>,
 }
 
 impl InitialSetupUpgrade {
-    /// A published prefix still owes this attempt's final admission even though the
-    /// expanded plan is no longer eligible to widen.
+    /// Whether this upgrade holds an attempt a retry can finish: a write that failed part-way,
+    /// its publication identified, which the next persist finishes from where it stopped, or
+    /// one that met the profile lock another setup holds and waits for it to let go
+    /// ([`Self::persist`]). Every other end lets the attempt go.
     pub fn pending(&self) -> bool {
         self.attempt.is_some()
     }
@@ -502,21 +511,24 @@ impl InitialSetupUpgrade {
         self.attempt.as_ref().map(|(ticket, _)| ticket.revision())
     }
 
-    /// The held attempt's exact published target. A read failure leaves its ownership unknown.
+    /// The held attempt's exact published target, or, once the last persist let an attempt go
+    /// after a write it could not identify, the target that attempt reserved for Stop: an
+    /// error while that is unknown. A read failure leaves its ownership unknown.
     pub fn published(&self) -> Result<Option<SetupUpgrade>, String> {
         self.published_at(&state_root()?)
     }
 
     fn published_at(&self, root: &Path) -> Result<Option<SetupUpgrade>, String> {
-        match &self.attempt {
-            Some((ticket, _)) => ticket.published_upgrade_at(root),
-            None => Ok(None),
+        match (&self.attempt, &self.unidentified) {
+            (Some((ticket, _)), _) | (None, Some(ticket)) => ticket.published_upgrade_at(root),
+            (None, None) => Ok(None),
         }
     }
 
     /// Retire a definitively unpublished or replaced attempt without creating another revision.
     pub fn forget(&mut self) {
         self.attempt = None;
+        self.unidentified = None;
     }
 
     /// Say `waits` the moment this upgrade's write finds the profile lock another setup holds
@@ -532,7 +544,11 @@ impl InitialSetupUpgrade {
     /// waits for the profile lock while another setup holds it, at most a choice's wait, and
     /// is then admitted against the records as they are, while it still widens the plan in
     /// force ([`InitialSetupAuthorization::upgrade_observed`]); past that wait it fails with
-    /// [`SETUP_BUSY`], its attempt kept.
+    /// [`SETUP_BUSY`], its attempt kept. So is one whose write failed part-way. Every other
+    /// error lets the attempt go ([`Self::pending`]): a newer aterm's records, which are final
+    /// for this binary, records it cannot read before writing, or a write whose publication it
+    /// cannot identify, which this binary cannot finish (the next launch settles a publication
+    /// cut short; [`Self::published`] keeps what it reserved for Stop).
     pub fn persist(&mut self) -> Result<Option<SetupUpgrade>, String> {
         if aterm_types::dirs::runs_under_private_state_root() {
             self.attempt = None;
@@ -569,23 +585,34 @@ impl InitialSetupUpgrade {
         read: impl FnOnce() -> Result<Option<ConfiguredVault>, String>,
         admit: impl FnOnce(&mut InitialSetupAuthorization, &Plan) -> Result<Option<u64>, String>,
     ) -> Result<Option<SetupUpgrade>, String> {
+        self.unidentified = None;
         if self.attempt.is_none() {
             self.attempt = prepare_upgrade(root, alab, read)?;
         }
         let Some((ticket, full)) = self.attempt.as_mut() else {
             return Ok(None);
         };
-        if ticket.publication_unknown() {
-            // Generic authorization is terminal, but a watch must retain the
-            // unresolved shutdown debt and must not rebind a later publication.
-            return Err("the failed setup publication could not be identified".into());
-        }
         let result = admit(ticket, full);
         // Read after the admission: one that met records another writer changed meanwhile, and
         // still widened the plan in force, widened their revision.
         let from = ticket.revision();
-        if result.is_ok() || (!ticket.pending() && !ticket.publication_unknown()) {
-            self.attempt = None;
+        // Kept only while a retry can finish it: a write that failed part-way, its publication
+        // identified, or one waiting for the profile lock another setup holds. A newer aterm's
+        // records are final for this binary, as a Restore is, whatever the ticket says.
+        let retry_finishes = match &result {
+            Ok(_) => false,
+            Err(why) if setup_is_newer(why) => false,
+            Err(why) => ticket.write_unfinished() || (why == SETUP_BUSY && ticket.pending()),
+        };
+        if !retry_finishes {
+            // A write this binary cannot identify is never written again, nor rebound to a
+            // later publication: the next launch settles its records. Only what it reserved for
+            // Stop is kept, as a startup admission's is.
+            self.unidentified = self
+                .attempt
+                .take()
+                .map(|(ticket, _)| ticket)
+                .filter(InitialSetupAuthorization::publication_unknown);
         }
         result.map(|to| to.map(|to| SetupUpgrade { from, to }))
     }
@@ -593,11 +620,10 @@ impl InitialSetupUpgrade {
 
 /// The provisional plan in force and the plan it would widen to on this Mac now, saving
 /// nothing: the whole profile, in the vault a fresh offer names, once this Mac shows the ALab
-/// signal. `None` when the plan stays as it is ([`upgrade_of`]) or no signal is heard yet.
-/// System State offers it as a review of its own before anything is widened (design §3.5); the
-/// review's answer then widens it ([`InitialSetupUpgrade::persist`]) or declines it
-/// ([`decline_provisional_setup_widen`]). It may probe the network for a few seconds, so call
-/// it off the UI thread.
+/// signal. `None` when the plan stays as it is ([`upgrade_of`]) or no signal is heard yet. The
+/// watch then widens it at once ([`InitialSetupUpgrade::persist`]), with no offer and no
+/// question (init-on-by-default design §6.1). It may probe the network for a few seconds, so
+/// call it off the UI thread.
 pub fn provisional_setup_widened() -> Result<Option<(Plan, Plan)>, String> {
     if aterm_types::dirs::runs_under_private_state_root() {
         return Ok(None);
@@ -624,27 +650,6 @@ fn widened_at(
         .map(|(plan, _)| plan)
         .ok_or("the provisional plan in force is no longer saved")?;
     Ok(Some((in_force, full)))
-}
-
-/// A person's Cancel of the review that offered to widen the provisional plan in force
-/// ([`provisional_setup_widened`]): that plan becomes theirs, saved as it is and no longer
-/// provisional, so no look or launch widens it or offers to again (design §3.5). One write of
-/// the plan's record, under the profile lock; its run, finished or not, stays as it was.
-/// `Ok(false)` when the plan in force is no longer aterm's provisional one.
-pub fn decline_provisional_setup_widen() -> Result<bool, String> {
-    observe_person_choice(decline_widen_at).result
-}
-
-fn decline_widen_at(root: &Path) -> Result<bool, String> {
-    let records = Records::read(root)?;
-    let Some((plan, true)) = records.plan else {
-        return Ok(false);
-    };
-    if !records.provisional {
-        return Ok(false);
-    }
-    save_plan_as(root, &plan, false)?;
-    Ok(true)
 }
 
 fn prepare_upgrade(
@@ -972,10 +977,9 @@ pub fn put_back_held_initial_setup(revision: u64) -> Result<bool, String> {
     if aterm_types::dirs::runs_under_private_state_root() {
         return Ok(false);
     }
-    observe_person_mutation(
-        Err("another doctor profile pass is running".into()),
-        |root| put_back_held_widen(root, revision),
-    )
+    observe_person_mutation(Err(super::super::SETTING_UP.into()), |root| {
+        put_back_held_widen(root, revision)
+    })
     .result
 }
 
@@ -1112,21 +1116,6 @@ pub(super) fn settle_put_back(root: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn verified_lan_discovery_enables_defaults_before_membership() {
-        assert!(super::profile_ready(false, || super::VaultHere::Found));
-        assert!(super::profile_ready(true, || panic!(
-            "membership needs no probe"
-        )));
-        for here in [
-            super::VaultHere::Unasked,
-            super::VaultHere::Absent,
-            super::VaultHere::Unreached,
-        ] {
-            assert!(!super::profile_ready(false, || here));
-        }
-    }
-
     use super::*;
 
     /// One look per network: another vault's answer at the ALab vault's address, kept by any
@@ -1382,11 +1371,10 @@ mod tests {
     }
 
     /// A look that hears the ALab signal saves nothing: it names the plan in force and the plan
-    /// System State's review offers to widen it to (design §3.5). A person's Cancel of that
-    /// review keeps the plan in force as it is, theirs for good: no look offers it again, its
-    /// run stays as it was, and only its record changes.
+    /// the watch widens it to (design §3.5). A plan the person made theirs is widened by no look,
+    /// and its run stays as it was.
     #[test]
-    fn a_widen_is_offered_before_anything_widens_and_a_cancel_keeps_the_plan_for_good() {
+    fn a_look_saves_nothing_and_a_persons_plan_is_never_widened() {
         let root = aterm_tempfile::tempdir().unwrap();
         let narrow = provisional(root.path());
         let before = observation_at(root.path()).unwrap();
@@ -1405,8 +1393,7 @@ mod tests {
         );
         let revision = revision_at(root.path()).unwrap();
         let progress_before = std::fs::read(root.path().join("initial-setup.json")).unwrap();
-        assert!(decline_widen_at(root.path()).unwrap());
-        assert_eq!(saved_plan(root.path()).unwrap(), Some(narrow));
+        save_plan_as(root.path(), &narrow, false).unwrap();
         assert!(!widens_at(root.path()).unwrap(), "the person's plan now");
         assert_eq!(widened_at(root.path(), || true, || Ok(None)).unwrap(), None);
         assert_eq!(revision_at(root.path()).unwrap(), revision);
@@ -1414,10 +1401,6 @@ mod tests {
             std::fs::read(root.path().join("initial-setup.json")).unwrap(),
             progress_before,
             "its run stays as it was"
-        );
-        assert!(
-            !decline_widen_at(root.path()).unwrap(),
-            "nothing left to decline"
         );
     }
 
@@ -1471,7 +1454,7 @@ mod tests {
             || Ok(None),
             |ticket, full| ticket.upgrade_at(root.path(), full).result,
         );
-        assert_eq!(first, Err("busy".to_string()));
+        assert_eq!(first, Err(SETUP_BUSY.to_string()));
         assert!(upgrade.pending(), "the busy look keeps the attempt");
         // The pass that held the lock saves its progress (any write: a new publication).
         let history = progress(root.path()).unwrap().unwrap();
@@ -1498,12 +1481,12 @@ mod tests {
     }
 
     /// The same busy look, but the writer that held the lock changed the plan in force: a Stop of
-    /// its run, the person's Cancel of the widen, a Restore, or another plan. The widen no longer
-    /// applies to the plan in force, so the next look writes nothing and ends the attempt; the
-    /// watch then refuses the review's Apply and the page shows the plan in force.
+    /// its run, the person's own choice of it, a Restore, or another plan. The widen no longer
+    /// applies to the plan in force, so the next look writes nothing and ends the attempt, and
+    /// the page shows the plan in force.
     #[test]
     fn a_widen_apply_that_met_a_busy_lock_is_not_admitted_over_a_changed_plan() {
-        for change in ["stop", "cancel", "restore", "another plan"] {
+        for change in ["stop", "chosen", "restore", "another plan"] {
             let root = aterm_tempfile::tempdir().unwrap();
             let narrow = provisional(root.path());
             if change == "stop" {
@@ -1520,13 +1503,13 @@ mod tests {
                 || Ok(None),
                 |ticket, full| ticket.upgrade_at(root.path(), full).result,
             );
-            assert_eq!(first, Err("busy".to_string()), "{change}");
+            assert_eq!(first, Err(SETUP_BUSY.to_string()), "{change}");
             match change {
                 "stop" => {
                     let revision = progress(root.path()).unwrap().unwrap().revision;
                     request_stop_at(root.path(), revision).unwrap();
                 }
-                "cancel" => assert!(decline_widen_at(root.path()).unwrap()),
+                "chosen" => save_plan_as(root.path(), &narrow, false).unwrap(),
                 "restore" => write_json(
                     &root.path().join("first-run.json"),
                     &json!({"profile":PROFILE,"state":"restored"}),
@@ -1553,6 +1536,111 @@ mod tests {
                 observation_at(root.path()).unwrap() == changed,
                 "{change}: nothing written"
             );
+        }
+    }
+
+    /// The same busy look, but the setup that held the lock was a newer aterm's, which saved
+    /// this Mac's setup in its newer format before it let go. Its records are final for this
+    /// binary: the held attempt's next look fails NEWER_SETUP, writes nothing and ends the
+    /// attempt, so the watch settles the review's Apply, and no later look widens or retries.
+    #[test]
+    fn a_held_widen_apply_meeting_a_newer_aterms_records_ends() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        provisional(root.path());
+        let mut upgrade = InitialSetupUpgrade::default();
+        let held = HeldLock::try_take(root.path()).unwrap().unwrap();
+        let first = upgrade.persist_with(
+            root.path(),
+            || true,
+            || Ok(None),
+            |ticket, full| ticket.upgrade_at(root.path(), full).result,
+        );
+        assert_eq!(first, Err(SETUP_BUSY.to_string()));
+        assert!(upgrade.pending(), "the busy look keeps the attempt");
+        // The newer aterm that held the lock saves its decision in its own format.
+        write_json(
+            &root.path().join("first-run.json"),
+            &json!({"profile": PROFILE, "state": "pending", "format": FORMAT + 1}),
+        )
+        .unwrap();
+        drop(held);
+        let newer = std::fs::read(root.path().join("first-run.json")).unwrap();
+        let again = upgrade.persist_with(
+            root.path(),
+            || panic!("the held attempt is finished, not looked for again"),
+            || Ok(None),
+            |ticket, full| ticket.upgrade_at(root.path(), full).result,
+        );
+        assert!(
+            again.as_ref().is_err_and(|why| setup_is_newer(why)),
+            "{again:?}"
+        );
+        assert!(
+            !upgrade.pending(),
+            "a newer aterm's records end the attempt"
+        );
+        assert_eq!(upgrade.published_at(root.path()), Ok(None));
+        assert_eq!(widens_at(root.path()), Ok(false), "the watch ends");
+        let later = upgrade.persist_with(
+            root.path(),
+            || panic!("a newer aterm's records are not looked at for the signal"),
+            || Ok(None),
+            |_, _| panic!("nothing is admitted over a newer aterm's records"),
+        );
+        assert!(later.is_err_and(|why| setup_is_newer(&why)));
+        assert!(!upgrade.pending(), "never kept");
+        assert_eq!(
+            std::fs::read(root.path().join("first-run.json")).unwrap(),
+            newer,
+            "the newer aterm's record is never written"
+        );
+    }
+
+    /// A widen whose write fails and whose publication cannot be read back is one this binary
+    /// cannot identify, so it cannot finish it: the attempt is let go at once, never written
+    /// again nor rebound to a later publication, keeping only the target it reserved for Stop
+    /// (known once its plan's checkpoint landed, unknown otherwise) until the next persist.
+    #[test]
+    fn a_widen_whose_write_cannot_be_identified_is_let_go_keeping_its_stop_evidence() {
+        for (at, published) in [(1, false), (0, true)] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            provisional(root.path());
+            let from = revision_at(root.path()).unwrap();
+            let mut upgrade = InitialSetupUpgrade::default();
+            let lost = upgrade.persist_with(
+                root.path(),
+                || true,
+                || Ok(None),
+                |ticket, full| {
+                    ticket.lose_publication_for_watch_test(root.path(), full, at, published)
+                },
+            );
+            assert!(lost.is_err(), "{at}: {lost:?}");
+            assert!(!upgrade.pending(), "{at}: let go");
+            assert_eq!(upgrade.widens_from(), None);
+            let evidence = upgrade.published_at(root.path());
+            if at == 1 {
+                let target = evidence
+                    .unwrap()
+                    .expect("the plan's checkpoint reserved it");
+                assert_eq!(target.from, from);
+                assert!(target.to > from);
+            } else {
+                assert!(evidence.is_err(), "unknown, not unwritten: {evidence:?}");
+            }
+            let before = observation_at(root.path()).unwrap();
+            let again = upgrade.persist_with(
+                root.path(),
+                || true,
+                || Ok(None),
+                |ticket, full| ticket.upgrade_at(root.path(), full).result,
+            );
+            assert!(!matches!(again, Ok(Some(_))), "{at}: {again:?}");
+            assert!(
+                observation_at(root.path()).unwrap() == before,
+                "{at}: never written again"
+            );
+            assert_eq!(upgrade.published_at(root.path()), Ok(None));
         }
     }
 
@@ -2126,5 +2214,69 @@ mod tests {
             assert!(saved_plan_provisional(root.path()).unwrap());
             assert!(!widens_at(root.path()).unwrap(), "{state:?}");
         }
+    }
+
+    /// A provisional plan an older aterm saved before every Mac got the base plan (aterm's
+    /// permissions alone, releases v0.130.0 to v0.144), on a Mac that is not yet an ALab member:
+    /// it widens to the base plan whatever the ALab answer is, so the Mac syncs (its Secrets
+    /// lane), and an ALab Mac can join, become `In` and widen to the whole profile. A plan a
+    /// person shaped stays exactly as it is, and the base plan itself widens no further.
+    #[test]
+    fn an_older_builds_permissions_only_provisional_plan_reaches_the_base_plan() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let mut old = Plan {
+            selection: Selection::none(),
+            ..Plan::default()
+        };
+        old.selection.set(Setting::Permissions, true);
+        authorize_at(root.path(), &old).unwrap().unwrap();
+        save_plan_as(root.path(), &old, true).unwrap();
+        let mut history = progress(root.path()).unwrap().unwrap();
+        history.done = Stage::Permissions.bit();
+        history.completed = true;
+        save_progress(root.path(), history).unwrap();
+        let records = observation_at(root.path()).unwrap().records;
+        assert!(records.provisional, "precondition: aterm's own plan");
+        assert!(!keeps_vault_sync(&records), "precondition: it never syncs");
+        let reached = upgrade_of(&records, || false).expect("widens with no ALab signal");
+        assert_eq!(reached.selection, aterm_types::macos_setup::BASE_PLAN);
+        assert_eq!(reached.vault_url, old.vault_url);
+        assert_eq!(
+            upgrade_of(&records, || true).map(|plan| plan.selection),
+            Some(Selection::all()),
+            "the ALab signal still widens it to the whole profile"
+        );
+        assert!(widens_at(root.path()).unwrap(), "the watch has work");
+        assert_eq!(
+            widened_at(root.path(), || false, || Ok(None))
+                .unwrap()
+                .map(|(_, widened)| widened.selection),
+            Some(aterm_types::macos_setup::BASE_PLAN)
+        );
+        let (mut ticket, base) = prepare_upgrade(root.path(), || false, || Ok(None))
+            .unwrap()
+            .unwrap();
+        ticket
+            .upgrade_at(root.path(), &base)
+            .result
+            .unwrap()
+            .unwrap();
+        let records = observation_at(root.path()).unwrap().records;
+        assert!(keeps_vault_sync(&records), "the base plan syncs");
+        assert_eq!(
+            upgrade_of(&records, || false),
+            None,
+            "nothing past the base"
+        );
+
+        let person = aterm_tempfile::tempdir().unwrap();
+        authorize_at(person.path(), &old).unwrap().unwrap();
+        save_plan_as(person.path(), &old, false).unwrap();
+        let records = observation_at(person.path()).unwrap().records;
+        assert_eq!(
+            upgrade_of(&records, || false),
+            None,
+            "a plan a person shaped stays as it is"
+        );
     }
 }

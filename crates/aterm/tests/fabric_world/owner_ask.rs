@@ -38,6 +38,12 @@ impl Drop for Owner {
 
 impl Owner {
     fn boot() -> Self {
+        Self::boot_at_rest(false)
+    }
+
+    /// [`Owner::boot`], its broker's log sealed at rest when `at_rest`: a `rest.key` beside it, what
+    /// `aterm fabric on` leaves.
+    fn boot_at_rest(at_rest: bool) -> Self {
         let scratch = aterm_tempfile::Builder::new()
             .prefix("oa-")
             .tempdir_in("/tmp")
@@ -52,6 +58,17 @@ impl Owner {
         }
         let state = tmp.join("broker");
         std::fs::create_dir_all(&state).expect("the broker's state dir");
+        if at_rest {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700))
+                .expect("chmod 700");
+            aterm_uds::private_file::write_private(
+                &state,
+                aterm_link::at_rest::REST_KEY,
+                &harness::REST_KEY,
+            )
+            .expect("the at-rest key");
+        }
         let sock = state.join("b.sock").to_string_lossy().into_owned();
         let log = state.join("b.log").to_string_lossy().into_owned();
         let secret_arg = secret.to_string_lossy().into_owned();
@@ -100,7 +117,8 @@ struct Opts {
 
 /// One private instance on an [`Owner`] fabric: its own HOME, `XDG_CONFIG_HOME`,
 /// `XDG_RUNTIME_DIR` and `ATERM_STATE_HOME`, a private `--control-sock`, `USER` and `LOGNAME`,
-/// and the lab desk seam (`ATERM_DEBUG_HEADLESS_RESTORE=1`).
+/// the lab desk seam (`ATERM_DEBUG_HEADLESS_RESTORE=1`), and its [`fake_path`] named as the one
+/// stand-in agent its harness may type into.
 struct Inst {
     name: String,
     root: PathBuf,
@@ -196,10 +214,8 @@ impl Inst {
         let err = out.try_clone().expect("the log, twice");
         let mut cmd = aterm_uds::spawnfd::command(harness::aterm_to_launch());
         for (name, _) in std::env::vars_os() {
-            let text = name.to_string_lossy();
-            if (text.starts_with("ATERM_") || text.starts_with("ATPKG_"))
-                && text != aterm_uds::process::VERIFY_RUN_VAR
-            {
+            let atpkg = name.to_string_lossy().starts_with("ATPKG_");
+            if aterm_uds::process::stripped_from_child(&name) || atpkg {
                 cmd.env_remove(&name);
             }
         }
@@ -229,6 +245,10 @@ impl Inst {
                 self.opts.shell.clone().unwrap_or_else(|| "/bin/sh".into()),
             )
             .env("ATERM_DEBUG_HEADLESS_RESTORE", "1")
+            .env(
+                aterm_agent::harness::agent_image::STANDINS_SEAM,
+                fake_path_in(&self.root),
+            )
             .env("ATERM_DEBUG_SYSTEM_PRESSURE", "none")
             .env("ATERM_LOG", "info")
             .env(
@@ -348,6 +368,9 @@ fn sids(inst: &Inst) -> Vec<String> {
 /// D;0, its command line `line` (OSC 633;E, a `;` spelled `\\x3b` as the integrations escape it,
 /// no other backslash) and its output `ran-42`, each mark signed with the tab's nonce when the
 /// shell was handed one. Nothing runs `line`: the shell's marks report it, as a shell runs it.
+/// The session's shell sources it (`.`), so its block runs no program: a script run by `sh`
+/// would have run `sh` (and the shell `sh` becomes) just before its C, which a gather that read
+/// that `exec` only while the PTY held the write's C and not yet its D would place in the block.
 fn marked_command(root: &Path, name: &str, line: &str) -> PathBuf {
     let script = format!(
         "#!/bin/sh\n\
@@ -361,9 +384,12 @@ fn marked_command(root: &Path, name: &str, line: &str) -> PathBuf {
 }
 
 /// [`marked_command`]'s block, its run real: after C the script `exec`s `/usr/bin/env`, which
-/// `exec`s `/bin/sh` to write the output and D;0. The session's process watch hears both images
-/// in the block's window, so a detail that names `env` names a program the kernel saw run, while
-/// `line`'s own program never runs.
+/// `exec`s `/bin/sh` to write the output and D;0. The kernel merges a process's `exec` notes, so
+/// the block hears whichever image the process holds when the gather reads it, or none once the
+/// process is gone: `env`, `sh` (macOS's `/bin/sh` stub, by its own file's name), or the shell
+/// `sh` becomes ([`sh_hands_off_to`]), which also runs the script itself, read in the block when
+/// its `exec` is read only after C. A detail that names `env` names a program the kernel saw
+/// run, while `line`'s own program never runs.
 fn ran_command(root: &Path, name: &str, line: &str) -> PathBuf {
     let script = format!(
         "#!/bin/sh\n\
@@ -375,6 +401,26 @@ fn ran_command(root: &Path, name: &str, line: &str) -> PathBuf {
     let path = root.join(name);
     std::fs::write(&path, script).expect("write the run command");
     path
+}
+
+/// The file names of the shell a `/bin/sh` run may become, as a stand-in shows a file of one
+/// name (its canonical file's name): on macOS the shell `/private/var/select/sh` links to, which
+/// the `/bin/sh` stub re-execs in its own process (bash by default), or, when that link names
+/// none of the shells the stub runs, each of them, as sh(1) says the stub then uses one;
+/// elsewhere `/bin/sh`'s own file.
+fn sh_hands_off_to() -> Vec<String> {
+    let name = |path: &str| {
+        std::fs::canonicalize(path)
+            .ok()
+            .and_then(|file| file.file_name().map(|n| n.to_string_lossy().into_owned()))
+    };
+    if cfg!(target_vendor = "apple") {
+        const STUB_RUNS: [&str; 3] = ["bash", "dash", "zsh"];
+        return name("/private/var/select/sh")
+            .filter(|shell| STUB_RUNS.contains(&shell.as_str()))
+            .map_or_else(|| STUB_RUNS.map(String::from).to_vec(), |shell| vec![shell]);
+    }
+    vec![name("/bin/sh").expect("the file `/bin/sh` runs")]
 }
 
 /// [`marked_command`]'s block, the script sourced (`.`) so the session's shell writes its marks and
@@ -397,10 +443,11 @@ fn exec_in_block(root: &Path, name: &str, line: &str, chain: &str) -> PathBuf {
     path
 }
 
-/// How a privacy plant's block runs: its marks alone ([`marked_command`]), its `env` chain
-/// ([`ran_command`]), or a chain the shell starts as its job ([`exec_in_block`]). A program a child of the
-/// job forks is heard by no watch (it hears the shell's children and their own `exec`s), so a
-/// plant whose programs ran there could not fail for a detail that confirms by what they ran.
+/// How a privacy plant's block runs: its marks alone, the session's shell writing them
+/// ([`marked_command`]), its `env` chain ([`ran_command`]), or a chain the shell starts as its
+/// job ([`exec_in_block`]). A program a child of the job forks is heard by no watch (it hears the
+/// shell's children and their own `exec`s), so a plant whose programs ran there could not fail
+/// for a detail that confirms by what they ran.
 enum PlantRun {
     Marks,
     Env,
@@ -457,7 +504,8 @@ fn body(fixture: &str) -> String {
         .to_string()
 }
 
-/// The stand-in Claude Code (after `host_live`'s): it draws each scene file it is given in turn.
+/// The stand-in Claude Code (after `host_live`'s): it draws each scene file it is given in turn,
+/// each a whole frame one `cat` writes ([`frame`]).
 /// After a `*.gate` scene it waits for `$log.<n>` (the scene's ordinal, from 1), which the test
 /// makes; after a `*.type` scene ONE bounded read takes what was typed, logged `text:`; after a
 /// `*.drain` scene it reads until half a second passes with nothing to read, logged `drained`;
@@ -473,9 +521,7 @@ const FAKE: &str = "#!/bin/sh\n\
      i=0\n\
      for scene in \"$@\"; do\n\
      \x20 i=$((i+1))\n\
-     \x20 printf '\\033[2J\\033[H'\n\
      \x20 cat \"$scene\"\n\
-     \x20 r=$(grep -n '^❯' \"$scene\" | tail -n 1 | cut -d: -f1); [ -n \"$r\" ] && printf '\\033[%s;3H' \"$r\"\n\
      \x20 case \"$scene\" in\n\
      \x20 *.gate) while [ ! -e \"$log.$i\" ]; do sleep 0.1; done; continue ;;\n\
      \x20 *.type) t=$(dd bs=4096 count=1 2>/dev/null); printf 'text:%s\\n' \"$t\" >> \"$log\"; continue ;;\n\
@@ -496,10 +542,52 @@ const FAKE: &str = "#!/bin/sh\n\
 /// Where the stand-in lives: the managed store's `agents/claude` under the instance's home, as
 /// `host_live`'s does.
 fn fake_path(inst: &Inst) -> PathBuf {
-    atpkg::store::default_prefix(&inst.root.join("home")).join("agents/claude")
+    fake_path_in(&inst.root)
 }
 
-/// Writes the stand-in and its scenes into `inst`'s scratch (`sc/`, `work/`).
+/// [`fake_path`] for the instance whose scratch is `root`: what every [`Inst::launch`] names
+/// through [`aterm_agent::harness::agent_image::STANDINS_SEAM`], since a debug build's harness
+/// types into an agent only when it confirms the agent's image, and a script's identity is all
+/// that confirms the stand-in (`/bin/sh <path>`); an unnamed one is only observed, its box raised
+/// and nothing typed.
+fn fake_path_in(root: &Path) -> PathBuf {
+    atpkg::store::default_prefix(&root.join("home")).join("agents/claude")
+}
+
+/// A scene as the stand-in draws it ([`FAKE`]): the screen cleared, the scene's rows, and last the
+/// first two cells of its last row that opens with `❯`, the prompt, reached by moving up from the
+/// frame's end (on the prompt's own row in a scene taller than the screen too), then the cursor on
+/// row `n` column 3, `n` the prompt's line in the scene: its caret, where Claude Code leaves it,
+/// in a scene the screen holds. A read of the frame half written finds that row without its `❯`,
+/// so only the frame's last bytes could show the prompt with the cursor off its caret, where a
+/// dim suggestion reads as a draft a person typed, which holds the harness off for their grace
+/// (two minutes, past the wait for the carry-on a wall's reset brings).
+fn frame(scene: &str) -> String {
+    let rows: Vec<&str> = scene.split_inclusive('\n').collect();
+    let caret = rows.iter().rposition(|row| row.starts_with('❯'));
+    let mut out = String::from("\x1b[2J\x1b[H");
+    let mut tail = String::new();
+    for (i, row) in rows.iter().enumerate() {
+        if Some(i) != caret {
+            out.push_str(row);
+            continue;
+        }
+        let head: String = row.chars().take_while(|c| *c != '\n').take(2).collect();
+        out.push_str(&format!("\x1b[{}C", head.chars().count()));
+        out.push_str(&row[head.len()..]);
+        let up = rows[i..].iter().filter(|r| r.ends_with('\n')).count();
+        let up = if up == 0 {
+            String::new()
+        } else {
+            format!("\x1b[{up}A")
+        };
+        tail = format!("\r{up}{head}\x1b[{};3H", i + 1);
+    }
+    out + &tail
+}
+
+/// Writes the stand-in and its scenes, each as its [`frame`], into `inst`'s scratch (`sc/`,
+/// `work/`).
 fn write_fake(inst: &Inst, wall: &str) {
     let fake = fake_path(inst);
     let sc = inst.root.join("sc");
@@ -532,7 +620,7 @@ fn write_fake(inst: &Inst, wall: &str) {
         ("busy3.gate", body(SPINNER)),
         ("wall.type", wall_screen),
     ] {
-        std::fs::write(sc.join(name), text).expect("a scene");
+        std::fs::write(sc.join(name), frame(&text)).expect("a scene");
     }
 }
 
@@ -628,44 +716,30 @@ fn quit(inst: &mut Inst) {
 
 const HARNESS_HANDS_OVER: &str = "[harness]\napprove = \"none\"\n";
 
-/// The reset wait's development seam ([`aterm_agent::supervise::policy::turn_end::RESET_SCALE_SEAM`])
-/// at a thousandth: the harness's carry-on comes at the wall's own reset (`in 1m`), its grace and
-/// jitter a fraction of a second, so the wait for it is that reset and the hang detector.
-fn reset_at_once() -> (String, String) {
-    (
-        aterm_agent::supervise::policy::turn_end::RESET_SCALE_SEAM.to_string(),
-        "0.001".to_string(),
-    )
+/// The factor the world's harness runs the time to a wall's reset at ([`reset_soon`]): the
+/// wall's `in 1m` is three seconds on its clock.
+const RESET_SPAN: f64 = 0.05;
+
+/// The reset's development seams: the time to the wall's reset at [`RESET_SPAN`]
+/// ([`aterm_agent::supervise::policy::turn_end::RESET_SPAN_SCALE_SEAM`]) and the grace and jitter
+/// past it at a thousandth ([`aterm_agent::supervise::policy::turn_end::RESET_SCALE_SEAM`]), so
+/// the harness's carry-on comes three seconds after the wall that says `in 1m`, its grace and
+/// jitter a fraction of a second, and the wait for it is that reset and the hang detector.
+fn reset_soon() -> Vec<(String, String)> {
+    use aterm_agent::supervise::policy::turn_end;
+    vec![
+        (
+            turn_end::RESET_SPAN_SCALE_SEAM.to_string(),
+            RESET_SPAN.to_string(),
+        ),
+        (turn_end::RESET_SCALE_SEAM.to_string(), "0.001".to_string()),
+    ]
 }
 
-/// `aterm <args>` run as a program on `inst`'s machine would run it: its HOME, config and
-/// runtime dirs, nothing of the test's `ATERM_*`; its exit code and both outputs, within the
-/// hang detector. A `ctl survey`'s probe of each instance and a `fabric brief`'s read of the
-/// bus, which serve, wait half that ([`aterm_ctl::PROBE_WITHIN_SEAM`],
-/// [`harness::FABRIC_IO_WAIT`]), not their 2 s and 3 s, so one that never answers is reported
-/// before the run is killed.
+/// `aterm <args>` run as a program on `inst`'s machine would run it ([`cli_command`]); its exit
+/// code and both outputs, within the hang detector.
 fn cli(inst: &Inst, args: &[&str]) -> (i32, String, String) {
-    let mut cmd = aterm_uds::spawnfd::command(harness::aterm_to_launch());
-    for (name, _) in std::env::vars_os() {
-        if name.to_string_lossy().starts_with("ATERM_") {
-            cmd.env_remove(&name);
-        }
-    }
-    cmd.args(args)
-        .env(
-            aterm_ctl::PROBE_WITHIN_SEAM,
-            (DEADLINE / 2).as_millis().to_string(),
-        )
-        .env(
-            harness::FABRIC_IO_WAIT.0,
-            harness::FABRIC_IO_WAIT.1.as_millis().to_string(),
-        )
-        .env("HOME", inst.root.join("home"))
-        .env("XDG_CONFIG_HOME", inst.root.join("cfg"))
-        .env("XDG_RUNTIME_DIR", inst.root.join("run"))
-        .env("ATERM_STATE_HOME", inst.root.join("astate"))
-        .env("TMPDIR", inst.root.join("tmp"))
-        .stdin(OwnedStdio::null());
+    let mut cmd = cli_command(harness::aterm_to_launch(), &inst.root, args);
     let out = aterm_uds::deadline::output_until_complete_stdout(
         &mut cmd,
         std::time::Instant::now() + DEADLINE,
@@ -676,6 +750,33 @@ fn cli(inst: &Inst, args: &[&str]) -> (i32, String, String) {
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
+}
+
+/// `<aterm> <args>` as [`cli`] runs it on the machine whose scratch is `root`: its HOME, config,
+/// runtime, state and temporary dirs, and nothing of the test's `ATERM_*` but the verify run's
+/// mark ([`harness::kept_from_runner`]). A `ctl survey`'s probe of each instance and a `fabric
+/// brief`'s read of the bus, which serve, wait half the hang detector
+/// ([`aterm_ctl::PROBE_WITHIN_SEAM`], [`harness::FABRIC_IO_WAIT`]), not their 2 s and 3 s, so
+/// one that never answers is reported before the run is killed.
+pub(crate) fn cli_command(aterm: &str, root: &Path, args: &[&str]) -> aterm_uds::spawnfd::Command {
+    let mut cmd = aterm_uds::spawnfd::command(aterm);
+    harness::kept_from_runner(&mut cmd)
+        .args(args)
+        .env(
+            aterm_ctl::PROBE_WITHIN_SEAM,
+            (DEADLINE / 2).as_millis().to_string(),
+        )
+        .env(
+            harness::FABRIC_IO_WAIT.0,
+            harness::FABRIC_IO_WAIT.1.as_millis().to_string(),
+        )
+        .env("HOME", root.join("home"))
+        .env("XDG_CONFIG_HOME", root.join("cfg"))
+        .env("XDG_RUNTIME_DIR", root.join("run"))
+        .env("ATERM_STATE_HOME", root.join("astate"))
+        .env("TMPDIR", root.join("tmp"))
+        .stdin(OwnedStdio::null());
+    cmd
 }
 
 /// The rows of the tab menu of `sid`, the `tab`th tab, read headless (`tab <n>`, `open
@@ -908,7 +1009,7 @@ fn the_owners_ask_over_the_stream() {
         NODE_A,
         Opts {
             config: HARNESS_HANDS_OVER.into(),
-            env: vec![reset_at_once()],
+            env: reset_soon(),
             ..Opts::default()
         },
     );
@@ -984,8 +1085,13 @@ fn the_owners_ask_over_the_stream() {
     // Leg 5: B's bus need word is A's clause head at the same moment: A's clause read on both
     // sides of B's read, and B's `"need":"<word>:<what>"` for S said as the clause says it.
     let json = brief_json(&b);
+    // The clause's word and what: its age (`just now`, `10s ago`) moves with the clock alone.
     let head_after = clause(&a, &s).expect("a now: row");
-    assert_eq!(head_after, head_a, "A's clause moved across B's read");
+    assert_eq!(
+        clause_head(&head_after),
+        clause_head(&head_a),
+        "A's clause moved across B's read: {head_after:?}, was {head_a:?}"
+    );
     let bus_need = bus_str(&json, &s, "need").unwrap_or_else(|| panic!("S's need: {json}"));
     let (word, what) = bus_need.split_once(':').expect("<word>:<what>");
     assert_eq!(
@@ -1065,10 +1171,11 @@ fn the_owners_ask_over_the_stream() {
         "the note reached S's PTY: {:?}",
         keys_read(&a, "k1")
     );
+    let after_note = clause(&a, &s);
     assert_eq!(
-        clause(&a, &s).as_deref(),
-        Some(head_a.as_str()),
-        "the note moved the clause"
+        after_note.as_deref().map(clause_head),
+        Some(clause_head(&head_a)),
+        "the note moved the clause: {after_note:?}, was {head_a:?}"
     );
     for body in bus_bodies(&owner, &format!("/f/{FLEET}/pub/>")) {
         for leak in [
@@ -1085,12 +1192,14 @@ fn the_owners_ask_over_the_stream() {
     }
 
     // Leg 5: the approval; B's next read clears the approval chip; the wall's clause, no author.
+    // `walled` comes before the approval is sent: the stand-in draws the wall only once it has
+    // read that key, so the harness reads the wall, and places its reset, after `walled`.
+    let walled = Instant::now();
     let r = a.verb(&format!("@{s} key act=approve 1"));
     assert!(r.ok(), "key act=approve: {}", r.header());
     until("the stand-in to read the approval", || {
         (keys_read(&a, "k1") == ["1"]).then_some(())
     });
-    let walled = Instant::now();
     let wall = until_on(&a, &s, DEADLINE, "the wall's clause", || {
         clause(&a, &s).filter(|c| c.starts_with("now: limit"))
     });
@@ -1128,15 +1237,24 @@ fn the_owners_ask_over_the_stream() {
     );
     assert_eq!(menu(&a, &s, 1).first(), Some(&title));
 
-    // Leg 5: the harness waits out the reset (`in 1m`), then its grace and jitter, which the
-    // reset seam makes a fraction of a second ([`reset_at_once`]), and types its carry-on: the
-    // menu shows its label with its author once the wall closes. The wait is the wall's own
-    // reset, counted from before the wall showed, and the hang detector.
-    let reset = (walled + Duration::from_secs(60)).saturating_duration_since(Instant::now());
+    // Leg 5: the harness waits out the reset (`in 1m`, three seconds on its clock), then its grace
+    // and jitter, a fraction of a second ([`reset_soon`]), and types its carry-on: the menu shows
+    // its label with its author once the wall closes. The wait is that reset, counted from
+    // `walled`, before the approval the wall follows, and the hang detector; the carry-on, as the
+    // test sees it, never comes before the reset. The harness places `in 1m` from the whole second
+    // it read the wall in, up to a twentieth of a second early at this scale, which its grace
+    // covers, and it read the wall after `walled`.
+    let scaled_reset = Duration::from_secs(60).mul_f64(RESET_SPAN);
+    let reset = (walled + scaled_reset).saturating_duration_since(Instant::now());
     until_on(&a, &s, reset + DEADLINE, "the harness's carry-on", || {
         (keys_read(&a, "k1").len() == 2).then_some(())
     });
     let resumed_after = walled.elapsed();
+    assert!(
+        resumed_after >= scaled_reset,
+        "the carry-on came {resumed_after:?} after the approval the wall follows, before the \
+         wall's reset ({scaled_reset:?})"
+    );
     assert_eq!(
         keys_read(&a, "k1")[1],
         "text:",
@@ -1844,8 +1962,11 @@ fn idle_composer() -> String {
 
 /// The stand-in a relaunch restarts (after `host_live`'s): it logs each launch's pid and
 /// arguments, keeps a conversation (`--resume <id>` picks it) with its session file where Claude
-/// Code keeps one, draws an idle composer, logs what it reads, and kills itself by SIGKILL once
-/// the scratch `die` file appears.
+/// Code keeps one, draws an idle composer, logs what it reads, kills itself by SIGKILL once the
+/// scratch `die` file appears, and exits 0 (a clean `/exit`) once the scratch `quit` file does.
+/// While the scratch `hold-register` file exists, a launch that resumes (`--resume`) writes its
+/// session file, and draws its composer, only once the scratch `register` file appears: an agent
+/// that registers its conversation late.
 fn write_relaunch_fake(inst: &Inst) {
     let fake = fake_path(inst);
     for d in [
@@ -1865,6 +1986,8 @@ fn write_relaunch_fake(inst: &Inst) {
          sid={CONVERSATION}; prev=\n\
          for a in \"$@\"; do [ \"$prev\" = --resume ] && sid=$a; prev=$a; done\n\
          start=$(LC_ALL=C TZ=UTC ps -o lstart= -p $$ | awk '{{$1=$1; print}}')\n\
+         case \" $* \" in *' --resume '*) [ -e \"$tmp/hold-register\" ] && \
+         while [ ! -e \"$tmp/register\" ]; do sleep 0.1; done ;; esac\n\
          mkdir -p \"$HOME/.claude/sessions\" \"$HOME/.claude/projects/-w\"\n\
          printf '{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"hi\"}}}}\\n' \
          >> \"$HOME/.claude/projects/-w/$sid.jsonl\"\n\
@@ -1878,6 +2001,7 @@ fn write_relaunch_fake(inst: &Inst) {
          cr=$(printf '\\r'); nl=$(printf '\\n.'); nl=${{nl%.}}; esc=$(printf '\\033')\n\
          while :; do\n\
          \x20 if [ -e \"$tmp/die\" ]; then rm -f \"$tmp/die\"; kill -KILL $$; fi\n\
+         \x20 if [ -e \"$tmp/quit\" ]; then rm -f \"$tmp/quit\"; exit 0; fi\n\
          \x20 got=$(dd bs=4096 count=1 2>/dev/null; echo .); got=${{got%.}}\n\
          \x20 [ -n \"$got\" ] && printf '%s' \"$got\" >> \"$tmp/typed-$$.log\"\n\
          \x20 case \"$got\" in\n\
@@ -1935,56 +2059,41 @@ fn program_is(inst: &Inst, sid: &str, want: &str) {
 /// subdirectory the shell is not in, dies by SIGKILL unasked; the harness relaunches it on its
 /// conversation and types its continuation; the failure it caused is lifted (`seen` by the
 /// harness), the brief counts its two acts, and the tab menu says `now: restarting · … · by the
-/// harness`. The relaunch's line, as the shell's integration recorded its block, is returned.
-fn relaunch_leg(shell: &str, rc: Option<&str>, elsewhere: bool) -> String {
-    let owner = Owner::boot();
-    // Its tabs' shell runs aterm's shell integration, so a command's end says its exit code, and
-    // the relaunch's line opens a command of its own.
-    let opts = Opts {
-        shell: Some(shell.into()),
-        ..Opts::default()
-    };
-    let a = Inst::boot(&owner, "a", NODE_A, opts);
-    a.wait_ready(&owner);
-    if let Some(rc) = rc {
-        std::fs::write(a.root.join("home").join(rc), "").expect("an rc file");
+/// harness`. With `late`, the relaunched agent registers its conversation only after the
+/// relaunch's own step gave up waiting for it (`step=wait:resume`) and the tab's loop took the
+/// agent over (`supervising`), so no retry of that step can see it: the loop's carry-on adopts it.
+/// The relaunch's line, as the shell's integration recorded its block, is returned.
+fn relaunch_leg(shell: &str, rc: Option<&str>, elsewhere: bool, late: bool) -> String {
+    let (_owner, a, s) = hosted_stand_in(shell, rc, elsewhere);
+    if late {
+        std::fs::write(a.root.join("hold-register"), "").expect("the late registration");
     }
-    write_relaunch_fake(&a);
-    let s = spawn_tab(&a);
-    until_on(&a, &s, DEADLINE, "the shell's integration", || {
-        (kv(&status_of(&a, &s), "integration") == Some("on")).then_some(())
-    });
-    let work = a.root.join("work");
-    let fake = fake_path(&a);
-    let line = if elsewhere {
-        std::fs::create_dir_all(work.join("sub")).expect("a subdirectory");
-        format!(
-            "cd {} && (cd sub && exec '{}' --model opus)",
-            work.display(),
-            fake.display()
-        )
-    } else {
-        format!("cd {} && '{}' --model opus", work.display(), fake.display())
-    };
-    type_line(&a, &s, &line);
-    program_is(&a, &s, "claude");
-    until_on(&a, &s, DEADLINE, "the host attached", || {
-        kv(&status_of(&a, &s), "supervisor")
-            .is_some_and(|v| v.starts_with("aterm-harness"))
-            .then_some(())
-    });
-    until_on(
-        &a,
-        &s,
-        DEADLINE,
-        "the harness at the agent's first idle point",
-        || host_log(&a).contains("EVENT idle").then_some(()),
-    );
     std::fs::write(a.root.join("die"), "").expect("the crash");
     let got = until_on(&a, &s, DEADLINE, "the relaunch", || {
         let got = launches(&a);
         (got.len() >= 2).then_some(got)
     });
+    if late {
+        // The relaunch's own row gave up (`relaunch … step=wait:resume`), and only then did the
+        // tab's loop take the relaunched agent over, which ends that relaunch's worker.
+        let (row, supervising) = (
+            format!("harness @{s}: relaunch "),
+            format!("harness @{s}: supervising"),
+        );
+        until_on(
+            &a,
+            &s,
+            DEADLINE,
+            "the loop over the relaunched agent, after its relaunch gave up waiting",
+            || {
+                let log = host_log(&a);
+                let mut lines = log.lines();
+                lines.find(|l| l.contains(&row) && l.ends_with(" step=wait:resume"))?;
+                lines.any(|l| l.contains(&supervising)).then_some(())
+            },
+        );
+        std::fs::write(a.root.join("register"), "").expect("the registration");
+    }
     assert_eq!(got.len(), 2, "relaunched once: {got:?}");
     assert_eq!(
         got[1].1,
@@ -2028,12 +2137,63 @@ fn relaunch_leg(shell: &str, rc: Option<&str>, elsewhere: bool) -> String {
         .unwrap_or_else(|| panic!("no block holds the relaunch's line: {blocks}"))
 }
 
+/// Legs 6's world: on `shell` (its rc file `rc`, made empty), a tab whose shell runs aterm's
+/// integration, with the relaunch stand-in typed into it (in the shell's own directory, or
+/// `elsewhere`: a subdirectory the shell is not in), the harness hosting it and at its first idle
+/// point.
+fn hosted_stand_in(shell: &str, rc: Option<&str>, elsewhere: bool) -> (Owner, Inst, String) {
+    let owner = Owner::boot();
+    // Its tabs' shell runs aterm's shell integration, so a command's end says its exit code, and
+    // the relaunch's line opens a command of its own.
+    let opts = Opts {
+        shell: Some(shell.into()),
+        ..Opts::default()
+    };
+    let a = Inst::boot(&owner, "a", NODE_A, opts);
+    a.wait_ready(&owner);
+    if let Some(rc) = rc {
+        std::fs::write(a.root.join("home").join(rc), "").expect("an rc file");
+    }
+    write_relaunch_fake(&a);
+    let s = spawn_tab(&a);
+    until_on(&a, &s, DEADLINE, "the shell's integration", || {
+        (kv(&status_of(&a, &s), "integration") == Some("on")).then_some(())
+    });
+    let work = a.root.join("work");
+    let fake = fake_path(&a);
+    let line = if elsewhere {
+        std::fs::create_dir_all(work.join("sub")).expect("a subdirectory");
+        format!(
+            "cd {} && (cd sub && exec '{}' --model opus)",
+            work.display(),
+            fake.display()
+        )
+    } else {
+        format!("cd {} && '{}' --model opus", work.display(), fake.display())
+    };
+    type_line(&a, &s, &line);
+    program_is(&a, &s, "claude");
+    until_on(&a, &s, DEADLINE, "the host attached", || {
+        kv(&status_of(&a, &s), "supervisor")
+            .is_some_and(|v| v.starts_with("aterm-harness"))
+            .then_some(())
+    });
+    until_on(
+        &a,
+        &s,
+        DEADLINE,
+        "the harness at the agent's first idle point",
+        || host_log(&a).contains("EVENT idle").then_some(()),
+    );
+    (owner, a, s)
+}
+
 /// **LEG 6, THE RELAUNCH ON zsh** (macOS's login shell), the agent in the shell's own directory:
 /// the session file spells it as the agent's logical `$PWD` (`/tmp/…`), the kernel as its real
 /// path (`/private/tmp/…`), one directory, so the relaunch's line changes no directory.
 #[test]
 fn a_relaunch_lifts_the_failure_it_caused_and_says_so() {
-    let line = relaunch_leg("/bin/zsh", Some(".zshrc"), false);
+    let line = relaunch_leg("/bin/zsh", Some(".zshrc"), false, false);
     eprintln!("zsh relaunch line: {line}");
     assert!(
         !line.contains("cd --"),
@@ -2047,7 +2207,7 @@ fn a_relaunch_lifts_the_failure_it_caused_and_says_so() {
 /// failure it follows is lifted.
 #[test]
 fn on_bash_a_relaunch_into_another_directory_lifts_the_failure_too() {
-    let line = relaunch_leg("/bin/bash", None, true);
+    let line = relaunch_leg("/bin/bash", None, true, false);
     eprintln!("bash relaunch line: {line}");
     // The block holds the whole line where bash saved it to history, else the simple command
     // the trap saw (`$BASH_COMMAND`).
@@ -2055,6 +2215,145 @@ fn on_bash_a_relaunch_into_another_directory_lifts_the_failure_too() {
         line.trim_start().starts_with("builtin :"),
         "the relaunch's line: {line}"
     );
+}
+
+/// **LEG 6R (fix E2; E2E-2, E2E-17): AN ASKED RESTART PAGES NOTHING AND SAYS WHO ASKED**, on zsh,
+/// in leg 6's world: `@<s> restart` (a `ctl` client's ask) in place of the crash. The act writes
+/// `act word=restart by=ctl` before its `SIGTERM`, the command it ended closes `out=signal
+/// code=143 by=ctl` with no `failure` (so no `seen` lifts one), the harness relaunches it once
+/// on its conversation with its `restarting` label, and a need watch over the bus pages nothing.
+/// Then the relaunched agent exits 0 (`/exit`): its run reads `ok`.
+#[test]
+fn an_asked_restart_pages_nothing_and_says_who_asked() {
+    let (owner, a, s) = hosted_stand_in("/bin/zsh", Some(".zshrc"), false);
+    let first = launches(&a).first().map(|l| l.0).expect("the first launch");
+    let reply = a.text(&format!("@{s} restart"));
+    assert!(
+        reply.starts_with(&format!("OK restarting pid {first} cause=asked")),
+        "{reply}"
+    );
+    let got = until_on(&a, &s, DEADLINE, "the relaunch", || {
+        let got = launches(&a);
+        (got.len() >= 2).then_some(got)
+    });
+    assert_eq!(got.len(), 2, "relaunched once: {got:?}");
+    assert_eq!(
+        got[1].1,
+        format!("--model opus --resume {CONVERSATION}"),
+        "{got:?}"
+    );
+    let label = until_on(&a, &s, DEADLINE, "the harness's restarting label", || {
+        clause(&a, &s).filter(|c| c.starts_with("now: restarting"))
+    });
+    let ended = |l: &str| l.contains(" close ") && l.contains(" cmd ") && l.contains(" code=143 ");
+    let log = until_on(&a, &s, DEADLINE, "the restarted command's close", || {
+        let log = a.text(&format!("@{s} log tier=host n=400"));
+        log.lines().any(ended).then_some(log)
+    });
+    let brief = a.text(&format!("@{s} brief"));
+    // The need watch over the bus, once the mirror has carried that close.
+    let ev = format!("/f/{FLEET}/pub/{NODE_A}/*/ev");
+    until_on(&a, &s, DEADLINE, "the mirror to carry the close", || {
+        bus_bodies(&owner, &ev)
+            .iter()
+            .any(|b| b.contains(" op=close ") && b.contains(" k=cmd ") && b.contains(" code=143 "))
+            .then_some(())
+    });
+    let cap = a.root.join("watch.cap");
+    std::fs::write(&cap, cap_line(&format!("ro:/f/{FLEET}/pub/>"))).expect("the watch's cap");
+    let state = a.root.join("watch");
+    std::fs::create_dir_all(&state).expect("the watch's state");
+    let fired = a.root.join("fired.log");
+    let exec = format!(
+        "printf '%s %s %s\\n' \"$ATERM_NOTIFY_SID\" \"$ATERM_NOTIFY_NEED\" \"$ATERM_NOTIFY_DETAIL\" >> '{}'",
+        fired.display()
+    );
+    let (code, out, err) = cli(
+        &a,
+        &[
+            "link",
+            "notify",
+            "--fleet",
+            FLEET,
+            "--broker",
+            &owner.sock,
+            "--cap-file",
+            &cap.to_string_lossy(),
+            "--state",
+            &state.to_string_lossy(),
+            "--on",
+            "need",
+            "--exec",
+            &exec,
+            "--since",
+            "start",
+            "--once",
+        ],
+    );
+    let pages = std::fs::read_to_string(&fired).unwrap_or_default();
+    eprintln!("asked restart: notify exit {code}: {out}{err}pages: {pages:?}\nbrief: {brief}");
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(pages.is_empty(), "an asked restart pages nothing: {pages}");
+    let lines: Vec<&str> = log.lines().collect();
+    let act = lines
+        .iter()
+        .position(|l| l.contains(" act word=restart ") && l.contains(" by=ctl "));
+    let close = lines
+        .iter()
+        .position(|l| ended(l) && l.contains(" cmd out=signal ") && l.contains(" by=ctl "));
+    assert!(
+        act.is_some() && act < close,
+        "the act's mark, then its command's end, by its asker: {log}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains(" agent out=signal ") && l.contains(" by=ctl ")),
+        "{log}"
+    );
+    assert!(!log.contains(" cmd out=fail "), "{log}");
+    assert!(
+        !lines.iter().any(|l| l.contains(" mark - seen ")),
+        "no failure, so no seen: {log}"
+    );
+    assert!(!brief.contains("need=failure"), "{brief}");
+    assert!(label.contains(" \u{b7} by the harness"), "{label}");
+
+    // A clean exit of the relaunched agent: its run takes its command's `ok`.
+    let agent = |log: &str| -> Option<String> {
+        log.lines()
+            .rfind(|l| l.contains(" open ") && l.contains(" agent "))
+            .and_then(|l| l.split(' ').nth(2))
+            .map(str::to_string)
+    };
+    let new = until_on(&a, &s, DEADLINE, "the relaunched agent's run", || {
+        let log = a.text(&format!("@{s} log tier=host n=400"));
+        agent(&log).filter(|n| !log.contains(&format!(" close {n} ")))
+    });
+    std::fs::write(a.root.join("quit"), "").expect("a clean exit");
+    let log = until_on(&a, &s, DEADLINE, "the clean exit's close", || {
+        let log = a.text(&format!("@{s} log tier=host n=400"));
+        log.lines()
+            .any(|l| l.contains(" cmd out=ok ") && l.contains(" code=0 "))
+            .then_some(log)
+    });
+    assert!(
+        log.lines().any(|l| {
+            l.contains(&format!(" close {new} agent out=ok "))
+                || l.contains(&format!(" amend {new} agent out=ok "))
+        }),
+        "the agent that exited 0 reads ok: {log}"
+    );
+}
+
+/// **LEG 6, A LATE REGISTRATION**, on zsh: the relaunched agent registers its conversation only
+/// after the relaunch's own step gave up waiting for it and the tab's loop took the agent over, so
+/// the loop's carry-on is the first to see the new agent; it adopts it as the relaunch would have,
+/// so the failure is lifted and the restart labelled all the same.
+#[test]
+fn a_relaunch_whose_agent_registers_after_its_row_gave_up_still_lifts_the_failure() {
+    let line = relaunch_leg("/bin/zsh", Some(".zshrc"), false, true);
+    eprintln!("late zsh relaunch line: {line}");
 }
 
 /// The sentinels (`QZP6SECRET<n>`, any case, `<n>` its whole run of digits) `bytes` holds, by
@@ -2143,8 +2442,9 @@ fn restore_store(rel: &Path) -> bool {
 /// 0600; the Messages store (0600) and stderr keep the config warning the person is shown, which
 /// names the font they wrote; the restore store (0600) keeps the title, the person's own
 /// attention and the standing hold's reason (B23's ruled reading of A11), and never the
-/// supervisor's attention; the broker's log is the bus's own store, so it holds the bus's
-/// records: the presence row's attention (the supervisor's while it stands, the person's), and
+/// supervisor's attention; the broker's log is the bus's own store, so a plaintext one holds the
+/// bus's records (a sealed one, none of it readable; [`privacy_sweep`] runs both arms): the
+/// presence row's attention (the supervisor's while it stands, the person's), and
 /// the mail's own record, its body and hop (never the post's key, which stays on the node); the
 /// test's own inputs hold what it wrote. Each is recorded with its reason in DESIGN-session-log
 /// §10 (Phase 6, the end to end). The harness keeps the review it acted on, screen text included
@@ -2274,7 +2574,22 @@ fn quit_by_signal(inst: &mut Inst) {
 /// and the broker hold a sentinel only where the design keeps one.
 #[test]
 fn the_privacy_sweep_finds_each_sentinel_only_where_the_design_keeps_it() {
-    let owner = Owner::boot();
+    privacy_sweep(true);
+}
+
+/// THE NEGATIVE CONTROL of the sweep over the broker's files: the same run with no key beside the
+/// log, whose bytes hold what the sealed run's must not.
+#[test]
+fn the_plaintext_arm_of_the_privacy_sweep_finds_the_bus_records_in_the_log() {
+    privacy_sweep(false);
+}
+
+/// The sweep, its broker's log sealed at rest when `sealed`, as `aterm fabric on` leaves it: then
+/// no file of the broker's holds a sentinel; a plaintext log holds the bus's own records
+/// (`kept_on_disk`). This world compacts nothing, so `.state` and `.held` hold none in either arm:
+/// `aterm_link::at_rest`'s tests hold those two to the sentinel, with a plaintext control.
+fn privacy_sweep(sealed: bool) {
+    let owner = Owner::boot_at_rest(sealed);
     let mut a = Inst::boot(
         &owner,
         "a",
@@ -2294,20 +2609,25 @@ fn the_privacy_sweep_finds_each_sentinel_only_where_the_design_keeps_it() {
 
     // The plants: a command's later word (1); a wrapper's flag value (11), which a program-name
     // reader without the wrapper's grammar keeps as the program (PRIV-1), its run real so the
-    // kernel can confirm the `env` that ran (its `make` never does); an array's element (12); a
-    // comment's text (13); a lone directory, the line zsh reports when AUTO_CD runs it as `cd` (14:
-    // this world's shell has no AUTO_CD, so its marks report the line); a title (2). A detail names
-    // only a builtin (`echo`, `true`), a program whose file ran, or a program the command's own job
-    // ran standing in for a word that is no program file (H2 rule 2). Which image of a chain the
-    // kernel's merged `exec` notes leave heard depends on when the gather drains them, so the
-    // wrapper's run reads `env`, the `sh` it ran, or none. The directory's path names no file, so
-    // it reads none, and no stand-in: the `sh` that ran the script writing the marks ran before the
-    // block's C. Each later plant's job is programs that are their own images, started once the
-    // block's C is written, which this world's process watch hears ([`exec_in_block`]), each handed
-    // the plant's sentinel path as an argument (`--rcfile`, which a `-c` bash never reads), as a
-    // zoxide-shaped hook or `mkdir` and `cat` are: AUTO_CD into a directory the line made (15) or a
-    // lone one (16) reads none, never the directory, nor its job's program (no program of the
-    // command's own ran); a path handed to a program and then typed (17: `x` a data file) reads
+    // kernel can confirm the `env` that ran (its `make` never does), the value an executable
+    // `#!/usr/bin/env /bin/sh` script, which such a reader would find confirmed by any image of
+    // that run it heard; an array's element (12); a comment's text (13); a lone directory, the
+    // line zsh reports when AUTO_CD runs it as `cd` (14: this world's shell has no AUTO_CD, so its
+    // marks report the line); a title (2). The session's shell writes 1, 12, 13 and 14's marks
+    // ([`marked_command`]), so their blocks run no program. A detail names only a builtin
+    // (`echo`, `true`), a program whose file ran, or a program the command's own job ran standing
+    // in for a word that is no program file (H2 rule 2). Which image of a chain the kernel's
+    // merged `exec` notes leave heard depends on when the gather reads them, so the wrapper's run
+    // reads `env`, the `sh` it ran, the shell `sh` becomes ([`sh_hands_off_to`]: bash on a default
+    // macOS), or none ([`ran_command`]). That shell is the session's own too, so this plant tells
+    // no stand-in from a misplaced image of the session's shell; `standin.sh`, which reads exactly
+    // `qzrun`, fails for one. The directory's path names no file, so it reads none, and no
+    // stand-in: its block runs no program. Each later plant's job is programs that are their own
+    // images, started once the block's C is written, which this world's process watch hears
+    // ([`exec_in_block`]), each handed the plant's sentinel path as an argument (`--rcfile`, which
+    // a `-c` bash never reads), as a zoxide-shaped hook or `mkdir` and `cat` are: AUTO_CD into a
+    // directory the line made (15) or a lone one (16) reads none, never the directory, nor its
+    // job's program (no program of the command's own ran); a path handed to a program and then typed (17: `x` a data file) reads
     // none or the job's program `qzcat` standing in, never `x`; an alias whose expansion runs
     // `true` handed the sentinel (18) reads none or the `true` that ran (H5 is not built: only a
     // stand-in names it); one whose expansion is an `env` handed the sentinel (19) that runs
@@ -2320,12 +2640,24 @@ fn the_privacy_sweep_finds_each_sentinel_only_where_the_design_keeps_it() {
         std::fs::create_dir(a.root.join(dir)).expect("a plant's directory");
     }
     std::fs::write(a.root.join("QZP6SECRET17").join("x"), "data\n").expect("a data file");
+    let flag_value = a.root.join("QZP6SECRET11");
+    std::fs::write(&flag_value, "#!/usr/bin/env /bin/sh\n").expect("the flag value's script");
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&flag_value, std::fs::Permissions::from_mode(0o755))
+            .expect("an executable flag value");
+    }
     let handed_to = |name: &str, path: &str| {
         format!(
             "{} --rcfile {path}",
-            harness::own_image(&a.root, name, "/bin/bash").display()
+            harness::own_image(&a.root, name).display()
         )
     };
+    let handed_off = sh_hands_off_to();
+    let wrapped: Vec<Option<&str>> = [None, Some("env"), Some("sh")]
+        .into_iter()
+        .chain(handed_off.iter().map(|shell| Some(shell.as_str())))
+        .collect();
     let plants: Vec<(&str, String, PlantRun, &[Option<&str>])> = vec![
         (
             "marked.sh",
@@ -2335,9 +2667,9 @@ fn the_privacy_sweep_finds_each_sentinel_only_where_the_design_keeps_it() {
         ),
         (
             "wrapped.sh",
-            "env -C /tmp/QZP6SECRET11 make".into(),
+            format!("env -C {} make", flag_value.display()),
             PlantRun::Env,
-            &[None, Some("env"), Some("sh")],
+            wrapped.as_slice(),
         ),
         (
             "array.sh",
@@ -2386,14 +2718,14 @@ fn the_privacy_sweep_finds_each_sentinel_only_where_the_design_keeps_it() {
             "qzs".into(),
             PlantRun::Execs(format!(
                 "/usr/bin/env QZP6SECRET19=1 {}",
-                harness::own_image(&a.root, "qzrun", "/bin/bash").display()
+                harness::own_image(&a.root, "qzrun").display()
             )),
             &[Some("qzrun")],
         ),
     ];
     for (i, (name, line, ran, _)) in plants.iter().enumerate() {
         let (run, script) = match ran {
-            PlantRun::Marks => ("sh", marked_command(&a.root, name, line)),
+            PlantRun::Marks => (".", marked_command(&a.root, name, line)),
             PlantRun::Env => ("sh", ran_command(&a.root, name, line)),
             PlantRun::Execs(chain) => (".", exec_in_block(&a.root, name, line, chain)),
         };
@@ -2666,13 +2998,43 @@ fn the_privacy_sweep_finds_each_sentinel_only_where_the_design_keeps_it() {
     }
     sweep.files("A", &a.root, &kept_on_disk);
     sweep.files("B", &b.root, &kept_on_disk);
-    sweep.files("broker", &owner.tmp.join("broker"), &|rel| {
-        if rel == Path::new("b.log") {
+    let broker_dir = owner.tmp.join("broker");
+    sweep.files("broker", &broker_dir, &|rel| {
+        if !sealed && rel == Path::new("b.log") {
             kept_on_disk(rel)
         } else {
             Vec::new()
         }
     });
+    let in_log = sentinels(&std::fs::read(broker_dir.join("b.log")).expect("the log"));
+    let word = std::fs::read_to_string(broker_dir.join("stderr.log")).expect("the broker's stderr");
+    let (_, report, _) = cli(&b, &["fabric"]);
+    let (_, doctor, _) = cli(&b, &["fabric", "doctor"]);
+    let told = if sealed { "sealed" } else { "plaintext" };
+    assert!(
+        report
+            .lines()
+            .any(|l| l.trim_start().starts_with("at-rest") && l.ends_with(told)),
+        "`aterm fabric`'s row: {report}"
+    );
+    assert!(
+        doctor.contains(&format!("at-rest={told}")),
+        "`aterm fabric doctor`: {doctor}"
+    );
+    if sealed {
+        assert_eq!(in_log, Vec::<u8>::new(), "the sealed log's bytes");
+        assert!(word.contains("at-rest=sealed"), "{word}");
+    } else {
+        // The mail's body and hop, and the attention that stands: the supervisor's before it (3)
+        // may never reach a presence row, which publishes only the latest.
+        for n in [6, 9, 10] {
+            assert!(
+                in_log.contains(&n),
+                "CONTROL: the plaintext log holds {n}: {in_log:?}"
+            );
+        }
+        assert!(word.contains("at-rest=plaintext"), "{word}");
+    }
     eprintln!("found:\n{}", sweep.found.join("\n"));
     let journals = journals(&a);
     for detail in &written {
@@ -2799,7 +3161,7 @@ fn the_harness_review_reaches_aterm_log_only_as_words() {
         ("box22.gate", box22, "QZP6SECRET22", 2),
     ] {
         assert_eq!(text.matches(plant).count(), rows, "{name}: {text}");
-        std::fs::write(sc.join(name), text).expect("a scene");
+        std::fs::write(sc.join(name), frame(&text)).expect("a scene");
     }
     let s = spawn_tab(&a);
     start_fake(

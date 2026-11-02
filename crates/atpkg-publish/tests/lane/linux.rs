@@ -8,6 +8,7 @@ use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
 use atpkg_publish::artifact::lineage_switch::Switch;
+use atpkg_publish::artifact::upload::VERSION_RESERVATION;
 use atpkg_publish::ctx::Ctx;
 use atpkg_publish::error::Result;
 use atpkg_publish::lane::LaneKind;
@@ -431,6 +432,15 @@ fn a_keyed_box_signs_uploads_to_both_owners_and_publishes_the_follow_up_index() 
     assert!(
         w.fx.public_asset("clean", 20, &format!("clean-20-{ARM}.tar.zst"))
             .is_some()
+    );
+    let reservation = w.fx.staging_asset("clean", 20, VERSION_RESERVATION);
+    assert!(
+        reservation.is_some(),
+        "the signed target extension reserves its unchanged version"
+    );
+    assert_eq!(
+        w.fx.public_asset("clean", 20, VERSION_RESERVATION),
+        reservation
     );
     let ready = w.ready();
     assert!(

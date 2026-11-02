@@ -21,20 +21,20 @@ impl<'s> BitReader<'s> {
         Self { idx: 0, source }
     }
 
-    /// Bits read so far, including any returned with [`Self::return_bit`].
+    /// Bits read so far.
     pub(crate) const fn bits_read(&self) -> usize {
         self.idx
     }
 
-    /// Un-reads the last bit read.
-    pub(crate) const fn return_bit(&mut self) {
-        self.idx = self.idx.saturating_sub(1);
-    }
-
     /// The next `n` bits (`n <= 32`), the first read in the lowest bit.
     pub(crate) fn get_bits(&mut self, n: usize) -> Result<u32, DecodeError> {
-        let end = self.idx + n;
-        if n > 32 || end > self.source.len() * 8 {
+        if n > 32 {
+            return Err(DecodeError::Corrupt("FSE table description ends early"));
+        }
+        let Some(end) = self.idx.checked_add(n) else {
+            return Err(DecodeError::Corrupt("FSE table description ends early"));
+        };
+        if self.source.len().checked_mul(8).is_none_or(|cap| end > cap) {
             return Err(DecodeError::Corrupt("FSE table description ends early"));
         }
         let mut value: u64 = 0;
@@ -87,7 +87,13 @@ impl<'s> BitReaderReversed<'s> {
 
     /// Bits left to read; negative once reads have run past the start.
     pub(crate) fn bits_remaining(&self) -> isize {
-        self.index as isize * 8 + (64 - isize::from(self.bits_consumed)) - self.extra_bits as isize
+        let index_bits = isize::try_from(self.index)
+            .unwrap_or(isize::MAX)
+            .saturating_mul(8);
+        let extra = isize::try_from(self.extra_bits).unwrap_or(isize::MAX);
+        index_bits
+            .saturating_add(64 - isize::from(self.bits_consumed))
+            .saturating_sub(extra)
     }
 
     /// Skips the padding at the end of a stream: zero bits, then the one
@@ -146,14 +152,20 @@ impl<'s> BitReaderReversed<'s> {
             self.bits_consumed -= 8 * self.index as u8;
             self.index = 0;
             self.bit_container <<= self.bits_consumed;
-            self.extra_bits += usize::from(self.bits_consumed);
+            self.extra_bits = self
+                .extra_bits
+                .saturating_add(usize::from(self.bits_consumed));
             self.bits_consumed = 0;
         } else if self.bits_consumed < 64 {
             self.bit_container <<= self.bits_consumed;
-            self.extra_bits += usize::from(self.bits_consumed);
+            self.extra_bits = self
+                .extra_bits
+                .saturating_add(usize::from(self.bits_consumed));
             self.bits_consumed = 0;
         } else {
-            self.extra_bits += usize::from(self.bits_consumed);
+            self.extra_bits = self
+                .extra_bits
+                .saturating_add(usize::from(self.bits_consumed));
             self.bits_consumed = 0;
             self.bit_container = 0;
         }
@@ -263,10 +275,10 @@ mod tests {
         let mut br = BitReader::new(&data);
         assert_eq!(br.get_bits(3).unwrap(), 0b110);
         assert_eq!(br.get_bits(7).unwrap(), 0b111_0110);
-        br.return_bit();
-        assert_eq!(br.bits_read(), 9);
-        assert_eq!(br.get_bits(15).unwrap(), 0b111_1111_1110_0001);
+        assert_eq!(br.bits_read(), 10);
+        assert_eq!(br.get_bits(14).unwrap(), 0b11_1111_1111_0000);
         assert!(br.get_bits(1).is_err());
+        assert!(br.get_bits(usize::MAX).is_err());
         assert_eq!(BitReader::new(&[]).get_bits(0).unwrap(), 0);
     }
 }

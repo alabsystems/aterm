@@ -97,14 +97,16 @@ fn push_write_confinement(
 }
 
 /// Append the [`HISTORY_FILES`] allows under `canon_home`: for each row whose
-/// history file is absent or a plain regular file with one link, every name of
-/// the row as ` (require-all (literal "<home>/<name>") (vnode-type <type>))`.
+/// regular-file entries are all absent or plain single-link files (and whose
+/// symlink entries are absent or symlinks), every name of the row as
+/// ` (require-all (literal "<home>/<name>") (vnode-type <type>))`.
 fn push_history_allows(out: &mut String, canon_home: &Path) {
     for row in HISTORY_FILES {
-        let Some((file, _)) = row.first() else {
-            continue;
-        };
-        if !plain_or_absent(&canon_home.join(file)) {
+        if row.is_empty()
+            || !row.iter().all(|(name, vnode_type)| {
+                history_entry_admitted(&canon_home.join(name), vnode_type)
+            })
+        {
             continue;
         }
         for (name, vnode_type) in *row {
@@ -117,12 +119,31 @@ fn push_history_allows(out: &mut String, canon_home: &Path) {
     }
 }
 
+/// Whether `path` is absent, or matches the expected `vnode_type` without
+/// widening write access (for `"REGULAR-FILE"`, a regular file not followed
+/// through a symlink with exactly one link; for `"SYMLINK"`, a symlink).
+fn history_entry_admitted(path: &Path, vnode_type: &str) -> bool {
+    match vnode_type {
+        "REGULAR-FILE" => plain_or_absent(path),
+        "SYMLINK" => symlink_or_absent(path),
+        _ => false,
+    }
+}
+
 /// Whether `path` is absent, or a regular file (not followed through a symlink)
 /// with exactly one link.
 fn plain_or_absent(path: &Path) -> bool {
     match std::fs::symlink_metadata(path) {
         Err(e) => e.kind() == std::io::ErrorKind::NotFound,
         Ok(meta) => meta.file_type().is_file() && single_link(&meta),
+    }
+}
+
+/// Whether `path` is absent, or a symlink.
+fn symlink_or_absent(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+        Ok(meta) => meta.file_type().is_symlink(),
     }
 }
 
@@ -288,39 +309,104 @@ fn profile_scoped(
 }
 
 /// Emit the deny clause(s) for the secret/private entry `<canon_home>/<entry>`,
-/// resolving symlinks as Seatbelt does.
+/// resolving symlinks at the leaf and along every ancestor component as Seatbelt does.
 fn push_resolved_clause(
     out: &mut String,
     canon_home: &Path,
     entry: &str,
     push: fn(&mut String, &Path),
 ) {
-    let lexical = canon_home.join(entry);
-    if let Ok(canonical) = std::fs::canonicalize(&lexical) {
-        push(out, &canonical);
-        if canonical != lexical {
-            push(out, &lexical);
-        }
-    } else {
-        push(out, &lexical);
-        if let Some(resolved) = resolve_existing_prefix(&lexical)
-            && resolved != lexical
-        {
-            push(out, &resolved);
-        }
+    for path in resolved_entry_paths(canon_home, entry) {
+        push(out, &path);
     }
 }
 
-/// Resolve symlinks in the deepest existing ancestor of `path` and re-append
-/// the missing trailing components, for a path whose leaf does not exist yet.
-fn resolve_existing_prefix(path: &Path) -> Option<PathBuf> {
-    for ancestor in path.ancestors().skip(1) {
-        if let Ok(canon_ancestor) = std::fs::canonicalize(ancestor) {
-            let tail = path.strip_prefix(ancestor).ok()?;
-            return Some(canon_ancestor.join(tail));
+const MAX_SYMLINK_HOPS: usize = 16;
+
+/// All distinct paths `<canon_home>/<entry>` resolves to across symlink hops at
+/// each component (the final canonical target first when it exists, then the
+/// lexical path, then any intermediate or dangling-symlink targets).
+fn resolved_entry_paths(canon_home: &Path, entry: &str) -> Vec<PathBuf> {
+    let lexical = canon_home.join(entry);
+    let mut paths = Vec::new();
+    let push_unique = |paths: &mut Vec<PathBuf>, candidate: PathBuf| {
+        if !paths.iter().any(|p| p == &candidate) {
+            paths.push(candidate);
+        }
+    };
+    if let Ok(canonical) = std::fs::canonicalize(&lexical) {
+        push_unique(&mut paths, canonical);
+    }
+    push_unique(&mut paths, lexical);
+
+    let components: Vec<&std::ffi::OsStr> = Path::new(entry)
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(part) => Some(part),
+            _ => None,
+        })
+        .collect();
+    let with_tail = |base: &Path, tail: &[&std::ffi::OsStr]| -> PathBuf {
+        let mut out = base.to_path_buf();
+        for part in tail {
+            out.push(part);
+        }
+        out
+    };
+    let mut cur = canon_home.to_path_buf();
+    let mut hops = 0;
+    for (idx, part) in components.iter().enumerate() {
+        cur.push(part);
+        let rem = &components[idx + 1..];
+        push_unique(&mut paths, with_tail(&cur, rem));
+        cur = resolve_symlink_node(cur, &mut hops);
+        push_unique(&mut paths, with_tail(&cur, rem));
+    }
+    paths
+}
+
+/// Resolve `node` through `canonicalize` when its target exists, or by stepping
+/// through `read_link` (bounded by `hops < MAX_SYMLINK_HOPS`) when the leaf or an
+/// intermediate symlink target does not exist yet.
+fn resolve_symlink_node(mut node: PathBuf, hops: &mut usize) -> PathBuf {
+    if let Ok(canon) = std::fs::canonicalize(&node) {
+        return canon;
+    }
+    while *hops < MAX_SYMLINK_HOPS {
+        let Ok(target) = std::fs::read_link(&node) else {
+            break;
+        };
+        *hops += 1;
+        let base = node.parent().unwrap_or_else(|| Path::new("/"));
+        node = step_symlink_target(base, &target, hops);
+        if let Ok(canon) = std::fs::canonicalize(&node) {
+            return canon;
         }
     }
-    None
+    node
+}
+
+fn step_symlink_target(base: &Path, target: &Path, hops: &mut usize) -> PathBuf {
+    let mut cur = if target.is_absolute() {
+        PathBuf::from("/")
+    } else {
+        base.to_path_buf()
+    };
+    for comp in target.components() {
+        match comp {
+            std::path::Component::RootDir => cur = PathBuf::from("/"),
+            std::path::Component::CurDir | std::path::Component::Prefix(_) => {}
+            std::path::Component::ParentDir => {
+                cur = resolve_symlink_node(cur, hops);
+                cur.pop();
+            }
+            std::path::Component::Normal(part) => {
+                cur.push(part);
+                cur = resolve_symlink_node(cur, hops);
+            }
+        }
+    }
+    cur
 }
 
 /// Append ` (literal "<node>")` write-deny operands for the existing ancestor
@@ -332,16 +418,8 @@ fn push_existing_ancestor_write_denies(
     entry: &str,
     denied: &mut Vec<PathBuf>,
 ) {
-    let lexical = canon_home.join(entry);
-    let resolved = match std::fs::canonicalize(&lexical) {
-        Ok(c) => Some(c),
-        Err(_) => resolve_existing_prefix(&lexical),
-    };
-    push_ancestor_literals(out, canon_home, &lexical, denied);
-    if let Some(resolved) = resolved
-        && resolved != lexical
-    {
-        push_ancestor_literals(out, canon_home, &resolved, denied);
+    for path in resolved_entry_paths(canon_home, entry) {
+        push_ancestor_literals(out, canon_home, &path, denied);
     }
 }
 
@@ -579,45 +657,70 @@ mod tests {
                 std::fs::hard_link(home.join(".zshrc"), hist).unwrap();
             }),
         ];
-        for (shape, plant) in plant {
+        for target_name in [".zsh_history", ".zsh_history.new"] {
+            for (shape, plant) in plant {
+                let home = aterm_tempfile::tempdir().unwrap();
+                let canon_home = std::fs::canonicalize(home.path()).unwrap();
+                std::fs::write(canon_home.join(".zshrc"), "echo original\n").unwrap();
+                if target_name != ".zsh_history" {
+                    std::fs::write(canon_home.join(".zsh_history"), ": 0:0;ls\n").unwrap();
+                }
+                plant(&canon_home, &canon_home.join(target_name));
+
+                let profile = profile_for_home(canon_home.to_str(), None, FsCapability::TmpOnly);
+                let allows = write_allows(&profile);
+                for (name, _) in zsh_row {
+                    let named = format!("\"{}\"", sbpl_str(&canon_home.join(name)));
+                    assert!(
+                        !allows.contains(&named),
+                        "{target_name} ({shape}): {name} must get no allowance; got {allows}"
+                    );
+                }
+                for shape_of_home in [&canon_home, &canon_home.join(".zshrc")] {
+                    let named = format!("\"{}\")", sbpl_str(shape_of_home));
+                    assert!(
+                        !allows.contains(&named),
+                        "{target_name} ({shape}): {} must not be writable; got {allows}",
+                        shape_of_home.display()
+                    );
+                }
+                for (name, vnode_type) in bash_row {
+                    let expect = history_allow(&canon_home, name, vnode_type);
+                    assert!(
+                        allows.contains(&expect),
+                        "{target_name} ({shape}): {expect} must stay allowed; got {allows}"
+                    );
+                }
+            }
+        }
+        {
             let home = aterm_tempfile::tempdir().unwrap();
             let canon_home = std::fs::canonicalize(home.path()).unwrap();
             std::fs::write(canon_home.join(".zshrc"), "echo original\n").unwrap();
-            plant(&canon_home, &canon_home.join(".zsh_history"));
-
+            std::fs::hard_link(
+                canon_home.join(".zshrc"),
+                canon_home.join(".zsh_history.LOCK"),
+            )
+            .unwrap();
             let profile = profile_for_home(canon_home.to_str(), None, FsCapability::TmpOnly);
             let allows = write_allows(&profile);
             for (name, _) in zsh_row {
                 let named = format!("\"{}\"", sbpl_str(&canon_home.join(name)));
                 assert!(
                     !allows.contains(&named),
-                    "{shape}: {name} must get no allowance; got {allows}"
-                );
-            }
-            for shape_of_home in [&canon_home, &canon_home.join(".zshrc")] {
-                let named = format!("\"{}\")", sbpl_str(shape_of_home));
-                assert!(
-                    !allows.contains(&named),
-                    "{shape}: {} must not be writable; got {allows}",
-                    shape_of_home.display()
-                );
-            }
-            for (name, vnode_type) in bash_row {
-                let expect = history_allow(&canon_home, name, vnode_type);
-                assert!(
-                    allows.contains(&expect),
-                    "{shape}: {expect} must stay allowed; got {allows}"
+                    "hard-linked .zsh_history.LOCK: {name} must get no allowance; got {allows}"
                 );
             }
         }
         let home = aterm_tempfile::tempdir().unwrap();
         let canon_home = std::fs::canonicalize(home.path()).unwrap();
         std::fs::write(canon_home.join(".zsh_history"), ": 0:0;ls\n").unwrap();
+        std::os::unix::fs::symlink("1234-host", canon_home.join(".zsh_history.LOCK")).unwrap();
         let profile = profile_for_home(canon_home.to_str(), None, FsCapability::TmpOnly);
         let expect = history_allow(&canon_home, ".zsh_history", "REGULAR-FILE");
         assert!(
             write_allows(&profile).contains(&expect),
-            "a plain history file keeps {expect}; got {profile}"
+            "a plain history file and symlink lock keep {expect}; got {profile}"
         );
         assert!(!plain_or_absent(&canon_home.join(".zsh_history").join("x")));
     }
@@ -966,6 +1069,44 @@ mod tests {
                     "{node} must be write-denied (secret present: {present}); got {profile}"
                 );
             }
+        }
+
+        // Chained symlink ancestor + symlink leaf: ~/.config -> ~/dotfiles/config
+        // and ~/dotfiles/config/gh -> ~/vault/gh, plus a dangling ~/.aws -> ~/dangling/aws.
+        std::fs::remove_dir_all(store.join("gh")).unwrap();
+        let vault_gh = canon_home.join("vault/gh");
+        std::fs::create_dir_all(&vault_gh).unwrap();
+        symlink(&vault_gh, store.join("gh")).unwrap();
+        std::fs::create_dir_all(canon_home.join("dangling")).unwrap();
+        symlink(canon_home.join("dangling/aws"), canon_home.join(".aws")).unwrap();
+
+        let profile = profile_for_home(canon_home.to_str(), None, FsCapability::HomeReadWrite);
+        for subpath in [
+            canon_home.join(".config/gh"),
+            store.join("gh"),
+            vault_gh,
+            canon_home.join(".aws"),
+            canon_home.join("dangling/aws"),
+        ] {
+            let clause = format!("(subpath \"{}\")", subpath.display());
+            assert!(
+                profile.contains(&clause),
+                "chained/dangling symlink target {clause} must be denied; got {profile}"
+            );
+        }
+        let vault_parent = format!("(literal \"{}\")", canon_home.join("vault").display());
+        let dangling_parent = format!("(literal \"{}\")", canon_home.join("dangling").display());
+        for node in [
+            &lex,
+            &real_store,
+            &real_parent,
+            &vault_parent,
+            &dangling_parent,
+        ] {
+            assert!(
+                profile.contains(node.as_str()),
+                "chained/dangling ancestor {node} must be write-denied; got {profile}"
+            );
         }
     }
 

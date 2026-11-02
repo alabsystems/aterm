@@ -6,7 +6,7 @@
 
 use super::*;
 use AbArm::{Cruise, Land};
-use AbPhase::{AtPrompt, Busy};
+use AbPhase::{AtBox, AtPrompt, Busy};
 
 /// A local day: 2024-10-06, in UTC.
 const DAY: i64 = 20_002;
@@ -166,4 +166,178 @@ fn busy_time_under_off_is_no_task_work() {
     book.set_calendar(AbCalendar::read(130 * SEC, NOON_MS + 130_000, utc));
     book.observe(1, Some(AtPrompt), None, AbArm::Off, 140 * SEC);
     assert_eq!(book.worked(1, 150 * SEC), 45 * SEC, "nor across a read");
+}
+
+/// THE LAND CHECK'S TURN IS NOT THE TASK'S WORK (v6 §14.17.13, departure 16): 20 s of work, the
+/// check's act at 30 s, its turn busy 32 s → 42 s, is 20 s of the task's work; a busy piece the
+/// book had open before the check (a late read of the turn before it) charges up to the check;
+/// the next act typed ends the audit, so the turn after it counts again.
+/// Negative control: the check's turn charged as any other (30 s).
+#[test]
+fn the_land_checks_turn_is_not_the_tasks_work() {
+    let mut book = book();
+    book.observe(1, Some(Busy), None, Land, 0);
+    book.observe(1, Some(AtPrompt), None, Land, 20 * SEC);
+    book.act_typed(1, Act::LandCheck, 30 * SEC);
+    book.observe(1, Some(Busy), None, Land, 32 * SEC);
+    assert_eq!(book.worked(1, 40 * SEC), 20 * SEC, "open, the check's turn");
+    book.observe(1, Some(AtPrompt), None, Land, 42 * SEC);
+    assert_eq!(
+        book.worked(1, 50 * SEC),
+        20 * SEC,
+        "the check's turn closed"
+    );
+    book.observe(1, Some(Busy), None, Land, 60 * SEC);
+    book.observe(1, Some(AtPrompt), None, Land, 70 * SEC);
+    assert_eq!(
+        book.worked(1, 80 * SEC),
+        30 * SEC,
+        "the turn after it counts"
+    );
+    // A nudge typed ends the audit before its turn.
+    book.act_typed(3, Act::LandCheck, 0);
+    book.act_typed(3, Act::Nudged, 5 * SEC);
+    book.observe(3, Some(Busy), None, Land, 6 * SEC);
+    book.observe(3, Some(AtPrompt), None, Land, 16 * SEC);
+    assert_eq!(book.worked(3, 20 * SEC), 10 * SEC, "a nudge's turn counts");
+}
+
+/// THE CHECK'S TURN IS NEVER WORK, HOWEVER IT IS INTERRUPTED (the post-landing review,
+/// 2026-11-01): 20 s of work, then the check's turn busy 32 s → 35 s, a box at 35 s approved at
+/// 40 s (its act inside the turn), a dropped phase read at 44 s, busy again to 52 s: still 20 s.
+/// A wall's prompt inside the check's turn and the resume aterm types past it charge nothing
+/// either. CONTROL: the same box and the same resume in a nudge's turn are its work.
+#[test]
+fn a_box_or_a_wall_inside_the_land_checks_turn_charges_nothing() {
+    let mut book = book();
+    let at = |s: u64| s * SEC;
+    book.observe(1, Some(Busy), None, Land, 0);
+    book.observe(1, Some(AtPrompt), None, Land, at(20));
+    book.act_typed(1, Act::LandCheck, at(30));
+    book.observe(1, Some(Busy), None, Land, at(32));
+    book.observe(1, Some(AtBox), None, Land, at(35));
+    book.act_typed(1, Act::Approved, at(40));
+    book.observe(1, Some(Busy), None, Land, at(40));
+    book.observe(1, None, None, Land, at(44));
+    book.observe(1, Some(Busy), None, Land, at(45));
+    assert_eq!(book.worked(1, at(50)), at(20), "open, past the box");
+    book.observe(1, Some(AtPrompt), None, Land, at(52));
+    assert_eq!(book.worked(1, at(60)), at(20), "the box charged nothing");
+    // A wall's prompt cut the check's turn; the resume aterm types goes on with it.
+    book.act_typed(2, Act::LandCheck, 0);
+    book.observe(2, Some(Busy), None, Land, at(1));
+    book.observe(2, Some(AtPrompt), None, Land, at(5));
+    book.act_typed(2, Act::Resumed, at(65));
+    book.observe(2, Some(Busy), None, Land, at(66));
+    book.observe(2, Some(AtPrompt), None, Land, at(80));
+    assert_eq!(
+        book.worked(2, at(90)),
+        0,
+        "the resumed check charged nothing"
+    );
+    // CONTROL: the same in a nudge's turn.
+    book.act_typed(3, Act::Nudged, 0);
+    book.observe(3, Some(Busy), None, Land, at(1));
+    book.observe(3, Some(AtBox), None, Land, at(5));
+    book.act_typed(3, Act::Approved, at(6));
+    book.observe(3, Some(Busy), None, Land, at(6));
+    book.observe(3, Some(AtPrompt), None, Land, at(10));
+    book.act_typed(3, Act::Resumed, at(20));
+    book.observe(3, Some(Busy), None, Land, at(20));
+    book.observe(3, Some(AtPrompt), None, Land, at(30));
+    assert_eq!(book.worked(3, at(40)), at(18), "a nudge's turn is work");
+}
+
+/// THE CHECK'S ACT REACHES THE BOOK AFTER ITS TURN BEGAN (the post-landing review, 2026-11-01):
+/// the busy run open when it arrives is left out from its start, what of it was charged taken
+/// back. That run may be the check's or the turn before it read late, so the prompt it comes back
+/// to ends nothing; the next run, begun past the act, is taken as the check's own, and the prompt
+/// after it ends the audit: the person's turn there is left out, and the turn after it counts. A
+/// task opened past the check ends it too. A run open at the act that was the turn before it read
+/// late charges nothing, and the check's turn after it charges nothing: a missing cheer, never a
+/// false one.
+#[test]
+fn the_checks_act_arriving_inside_its_turn_takes_the_turn_back() {
+    let mut book = book();
+    let at = |s: u64| s * SEC;
+    book.observe(1, Some(Busy), None, Land, 0);
+    book.observe(1, Some(AtPrompt), None, Land, at(20));
+    book.observe(1, Some(Busy), None, Land, at(30));
+    book.set_calendar(AbCalendar::read(at(31), NOON_MS + 31_000, utc));
+    book.act_typed(1, Act::LandCheck, at(32));
+    assert_eq!(
+        book.worked(1, at(35)),
+        at(20),
+        "the running check taken back"
+    );
+    book.observe(1, Some(AtPrompt), None, Land, at(42));
+    // The person's next turn.
+    book.observe(1, Some(Busy), None, Land, at(50));
+    book.observe(1, Some(AtPrompt), None, Land, at(60));
+    book.observe(1, Some(Busy), None, Land, at(61));
+    book.observe(1, Some(AtPrompt), None, Land, at(71));
+    assert_eq!(
+        book.worked(1, at(80)),
+        at(30),
+        "the turn after the check's own: one turn left out, then work again"
+    );
+    // A task opened past the check ends its audit.
+    book.observe(2, Some(Busy), None, Land, 0);
+    book.act_typed(2, Act::LandCheck, at(1));
+    book.observe(2, Some(AtPrompt), None, Land, at(5));
+    book.task_opened(2, at(10));
+    book.observe(2, Some(Busy), None, Land, at(11));
+    book.observe(2, Some(AtPrompt), None, Land, at(21));
+    assert_eq!(book.worked(2, at(30)), at(10), "the new task's turn counts");
+    // The turn before the check, read late: left out, and the check's turn after it too.
+    book.observe(4, Some(Busy), None, Land, 0);
+    book.act_typed(4, Act::LandCheck, at(10));
+    book.observe(4, Some(AtPrompt), None, Land, at(12));
+    book.observe(4, Some(Busy), None, Land, at(13));
+    book.observe(4, Some(AtPrompt), None, Land, at(25));
+    assert_eq!(book.worked(4, at(30)), 0, "nothing past what is certain");
+    book.observe(4, Some(Busy), None, Land, at(40));
+    book.observe(4, Some(AtPrompt), None, Land, at(50));
+    assert_eq!(book.worked(4, at(60)), at(10), "the turn after the check's");
+}
+
+/// A PROSE ANSWER ATERM TYPED PAST THE CHECK OPENS A TURN OF ITS OWN (the second review of the
+/// post-landing fixes, 2026-11-01): the check's act read late inside its turn (busy 30 s → 42 s),
+/// then `go-ahead@v1` typed at its answer, an `Answered` that opens a turn: its run 50 s → 60 s
+/// is the task's work, 10 s past the 20 s before the check. CONTROL: a dialog's keys answered
+/// inside the check's turn (an `Answered` that opens none) end nothing, and the check's turn past
+/// them charges nothing. Negative control: the typed answer read as a dialog's keys
+/// (`AbBook::turn_opened` ending nothing) leaves the go-ahead's run out (20 s).
+#[test]
+fn a_prose_answer_typed_past_the_check_is_the_tasks_work() {
+    let mut book = book();
+    let at = |s: u64| s * SEC;
+    book.observe(1, Some(Busy), None, Land, 0);
+    book.observe(1, Some(AtPrompt), None, Land, at(20));
+    book.observe(1, Some(Busy), None, Land, at(30));
+    book.act_typed(1, Act::LandCheck, at(32));
+    book.observe(1, Some(AtPrompt), None, Land, at(42));
+    book.act_typed(1, Act::Answered, at(45));
+    book.turn_opened(1, Act::Answered);
+    book.observe(1, Some(Busy), None, Land, at(50));
+    book.observe(1, Some(AtPrompt), None, Land, at(60));
+    assert_eq!(
+        book.worked(1, at(70)),
+        at(30),
+        "the go-ahead's turn is work"
+    );
+    // CONTROL: a dialog's keys inside the check's turn.
+    book.observe(2, Some(Busy), None, Land, 0);
+    book.observe(2, Some(AtPrompt), None, Land, at(20));
+    book.act_typed(2, Act::LandCheck, at(30));
+    book.observe(2, Some(Busy), None, Land, at(32));
+    book.observe(2, Some(AbPhase::Asked), None, Land, at(35));
+    book.act_typed(2, Act::Answered, at(36));
+    book.observe(2, Some(Busy), None, Land, at(36));
+    book.observe(2, Some(AtPrompt), None, Land, at(42));
+    assert_eq!(
+        book.worked(2, at(50)),
+        at(20),
+        "the keys' turn is the check's"
+    );
 }

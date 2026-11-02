@@ -298,7 +298,7 @@ fn err_halted_parks_until_the_hold_lifts_and_the_loop_goes_on() {
     assert!(rows[0].contains("\"decision\":\"deferred\""), "{rows:?}");
     assert!(rows[1].contains("\"decision\":\"approved\""), "{rows:?}");
     assert!(
-        rows[1].contains("\"rule_id\":\"read-only@classify-v10\""),
+        rows[1].contains("\"rule_id\":\"read-only@classify-v11\""),
         "{rows:?}"
     );
     let _ = std::fs::remove_dir_all(&jdir);
@@ -458,7 +458,7 @@ fn the_rm_breaker_is_approved_under_a_scratch_root_and_escalated_otherwise() {
     let rows = ledger_rows(&ledger);
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert!(
-        rows[0].contains("\"rule_id\":\"rm-breaker@v9\""),
+        rows[0].contains("\"rule_id\":\"rm-breaker@v10\""),
         "{rows:?}"
     );
     assert!(rows[0].contains("\"decision\":\"approved\""), "{rows:?}");
@@ -509,7 +509,7 @@ fn the_rm_breaker_is_approved_under_a_scratch_root_and_escalated_otherwise() {
 }
 
 /// THE RM BREAKER'S TOO-MANY BOX OVER A PROVEN READ IS PRESSED AND LEDGERED UNDER
-/// `breaker-read-only@v10`, in a bypass session, under the safe rules alone: Claude Code 2.1.307
+/// `breaker-read-only@v11`, in a bypass session, under the safe rules alone: Claude Code 2.1.307
 /// draws that box over any command with more than 64 command substitutions, rm or none
 /// (MEASURED). The box is the MEASURED one with its command made thirteen barred lines of `echo`
 /// and five `$(true)`; the press is guarded by its first command row, and the one ledger row is
@@ -543,7 +543,7 @@ fn the_too_many_breaker_over_a_proven_read_is_ledgered_under_its_rule() {
     let rows = ledger_rows(&ledger);
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert!(
-        rows[0].contains("\"rule_id\":\"breaker-read-only@v10\""),
+        rows[0].contains("\"rule_id\":\"breaker-read-only@v11\""),
         "{rows:?}"
     );
     assert!(rows[0].contains("\"decision\":\"approved\""), "{rows:?}");
@@ -604,7 +604,7 @@ fn breaker_run(
     (lines, m, rows, host.asks())
 }
 
-/// A TOO-MANY BOX READS NO TRANSCRIPT AND WAITS FOR NONE (`breaker-read-only@v10`): breaker-4's
+/// A TOO-MANY BOX READS NO TRANSCRIPT AND WAITS FOR NONE (`breaker-read-only@v11`): breaker-4's
 /// lane read the agent's transcript for every too-many box the screen did not prove, retried
 /// it while it named no call and waited a 1 s settle, and the call it found could only add a
 /// reading, so it decided nothing. Now the measured box (one line of `echo` and 65 `$(true)`,
@@ -653,7 +653,7 @@ fn a_too_many_box_reads_no_transcript_and_waits_for_none() {
     assert_eq!(m.presses().len(), 1, "{:?}", m.requests);
     assert!(out[0].starts_with("APPROVED seq=102 "), "{out:?}");
     assert!(
-        rows[0].contains("\"rule_id\":\"breaker-read-only@v10\""),
+        rows[0].contains("\"rule_id\":\"breaker-read-only@v11\""),
         "{rows:?}"
     );
     assert_eq!(asks, 0, "a proven box asks the transcript nothing");
@@ -841,7 +841,7 @@ fn loop_scratch(tag: &str) -> PathBuf {
 #[cfg(unix)]
 fn loop_git(dir: &Path, args: &[&str]) {
     let out = aterm_uds::deadline::output_until(
-        aterm_uds::spawnfd::command(aterm_uds::os_path!("git"))
+        aterm_uds::spawnfd::command(crate::test_program::git())
             .args(args)
             .current_dir(dir)
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -884,7 +884,7 @@ fn worker_vars(sid: &str, home: &Path) -> Vec<(String, String)> {
     vec![
         (
             "PATH".to_string(),
-            std::env::var("PATH").unwrap_or_default(),
+            crate::supervise::policy::git_config::test_worker_path(),
         ),
         ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),
         ("GIT_CONFIG_GLOBAL".to_string(), "/dev/null".to_string()),
@@ -1111,6 +1111,91 @@ fn a_git_box_reads_the_transcripts_under_the_workers_claude_config_dir() {
         "{rows:?}"
     );
     drop(worker);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The loop reads where a session's Bash tool stands (its transcript's last cwd) for every Bash
+/// box, not only a git read, and the secrets check reads a relative operand from there: from
+/// `proj/sub`, `cat ../../.claude.json` is the home's and is not pressed; with the Bash tool at
+/// the launch folder it names `<root>/.claude.json`, no secret, and is.
+#[cfg(unix)]
+#[test]
+fn a_bash_box_reads_a_relative_operand_where_the_bash_tool_stands() {
+    let root = loop_scratch("worker-stand");
+    let home = root.join("home");
+    let launch = home.join("proj");
+    let nested = launch.join("sub");
+    std::fs::create_dir_all(&nested).expect("dirs");
+    let claude = root.join("identity-claude");
+    write_snapshot(&claude, "");
+    let sid = format!("s-{:020x}", u64::from(std::process::id()) << 8 | 6);
+    let mut vars = worker_vars(&sid, &home);
+    vars.push((
+        "CLAUDE_CONFIG_DIR".to_string(),
+        claude.display().to_string(),
+    ));
+    let judge = |stand: &Path| {
+        let worker = StandIn::spawn(&vars);
+        let sessions = claude.join("sessions");
+        let _ = std::fs::remove_dir_all(&sessions);
+        std::fs::create_dir_all(&sessions).expect("sessions");
+        std::fs::write(
+            sessions.join(format!("{}.json", worker.pid())),
+            aterm_json::to_string(&aterm_json::json!({
+                "pid": worker.pid(),
+                "sessionId": "t-1",
+                "cwd": launch.to_string_lossy().as_ref(),
+            }))
+            .expect("json"),
+        )
+        .expect("session file");
+        let project = claude
+            .join("projects")
+            .join(crate::harness::footer::project_slug(&launch));
+        std::fs::create_dir_all(&project).expect("project");
+        let row = aterm_json::to_string(&aterm_json::json!({
+            "type": "assistant",
+            "cwd": stand.to_string_lossy().as_ref(),
+        }))
+        .expect("json");
+        std::fs::write(project.join("t-1.jsonl"), format!("{row}\n")).expect("transcript");
+        let (ldir, ledger) = ledger_file(&format!("worker-stand-{}", worker.pid()));
+        let mut screen = bash_one_row();
+        screen[4] = "   cat ../../.claude.json".to_string();
+        let mut m = fenced(vec![screen]);
+        m.cwd = Some(launch.display().to_string());
+        m.status_sid = "3";
+        m.who = Some(format!(
+            "3 {sid} driving=- watchers=0 turns=0 alive nonce=0 fgpgid={}\n",
+            worker.pid()
+        ));
+        let mut s = session(&mut m, None);
+        s.set_approval_env(ApprovalEnv {
+            home: Some(home.clone()),
+            worker: WorkerSource::Session,
+            ..owner_env()
+        });
+        s.set_approval_ledger(Some(ledger.clone()));
+        let opts = SuperviseOpts {
+            policy: SupervisorConfig {
+                approve: Approve::Safe,
+                ..auto(30).policy
+            },
+            ..auto(30)
+        };
+        s.supervise(&opts).expect("supervise");
+        let rows = ledger_rows(&ledger);
+        let _ = std::fs::remove_dir_all(&ldir);
+        (m.presses().len(), rows)
+    };
+    let (presses, rows) = judge(&nested);
+    assert_eq!(presses, 0, "{rows:?}");
+    assert!(
+        rows.iter().any(|r| r.contains("a read of a secret")),
+        "{rows:?}"
+    );
+    let (presses, rows) = judge(&launch);
+    assert_eq!(presses, 1, "from the launch folder no secret: {rows:?}");
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -2556,6 +2641,104 @@ fn a_file_box_the_agents_own_ask_rule_sends_is_held_in_the_loop() {
             }
         }
     }
+}
+
+/// A box judged while a look at the disk does not answer (the probe's gate stays shut past its
+/// bound, as a dead mount's `lstat` never returns) is escalated, never approved; once that look
+/// ends, the box still standing is decided again on what the disk says and pressed. The negative
+/// control: with the disk answering, the same box is pressed at once and nothing is escalated.
+#[test]
+fn a_box_escalated_for_a_look_left_out_is_decided_again_once_it_ends() {
+    use crate::supervise::policy::probe_live_tests::{
+        LookGate, OpensAtEnd, hold_looks, left_out_ends,
+    };
+    const WRITE: &str = include_str!("policy/fixtures/claude-2.1.295-box-write-ask-rule.txt");
+    let scratch = crate::supervise::ScratchDir::new("left-out", "loop");
+    let claude = scratch.join("claude");
+    std::fs::create_dir_all(&claude).expect("the Claude Code directory");
+    let worker = WorkerEnv::hermetic(None).with(&format!("CLAUDE_CONFIG_DIR={}", claude.display()));
+    let opts = SuperviseOpts {
+        max: Duration::from_secs(30),
+        ..SuperviseOpts::hosted_with(&crate::supervise::SupervisorConfig::default())
+    };
+    let rows = aterm_phase::prompt::fixtures::screen(WRITE);
+    let mock = || {
+        let mut m = fenced(vec![rows.clone(), busy_screen()]);
+        m.vanish_after = Some(0);
+        m.whole_sees_the_tail = true;
+        m
+    };
+    // The run left out is not replayed: a look's end is no door's, and its tape says so.
+    let run = |m: &mut Mock, replays: bool| {
+        watch_lines_with(m, &opts, |s| {
+            s.set_approval_env(ApprovalEnv {
+                worker: WorkerSource::Fixed(Ok(worker.clone())),
+                ..owner_env()
+            });
+            if !replays {
+                s.seeds_learned_state("a look's end is no door's");
+            }
+        })
+        .0
+    };
+    let mut answered = mock();
+    let lines = run(&mut answered, true);
+    assert_eq!(answered.presses().len(), 1, "{:?}", answered.requests);
+    assert!(lines[0].starts_with("APPROVED seq="), "{lines:?}");
+    assert_eq!(badge(&answered), None, "{:?}", answered.requests);
+
+    let gate = LookGate::shut();
+    let _opens = OpensAtEnd(Arc::clone(&gate));
+    let mut held = Some(hold_looks(Arc::clone(&gate), Duration::from_millis(50)));
+    let mut m = mock();
+    // The box stands, handed over, until a key answers it.
+    m.vanish_after = None;
+    m.key_releases = Some(0);
+    let opener = Arc::clone(&gate);
+    // The first call after the look started comes after its bound refused it (the loop's own
+    // thread waits that bound): the disk answers from then on, each look waited the shipped
+    // bound.
+    m.after_call = Some(Box::new(move || {
+        if held.is_some() && opener.looks() > 0 {
+            opener.open();
+            assert!(
+                left_out_ends(),
+                "the look left out ended once its gate opened"
+            );
+            held = None;
+        }
+    }));
+    let lines = run(&mut m, false);
+    let badged = m
+        .requests
+        .iter()
+        .position(|r| r.starts_with("meta set attention owner=supervisor "))
+        .unwrap_or_else(|| panic!("escalated first: {:?}", m.requests));
+    // The badge is clipped before the look's own words; the rules it could not read are named.
+    assert!(
+        m.requests[badged].contains("they are unknown: the agent's own ask rules"),
+        "for the look that did not answer: {}",
+        m.requests[badged]
+    );
+    let pressed = m
+        .requests
+        .iter()
+        .position(|r| verb_of(r) == "key")
+        .unwrap_or_else(|| panic!("decided again and pressed: {:?}", m.requests));
+    assert!(badged < pressed, "{:?}", m.requests);
+    assert!(
+        m.requests[pressed..]
+            .iter()
+            .any(|r| r == "meta unset attention owner=supervisor"),
+        "the escalation's badge came down: {:?}",
+        m.requests
+    );
+    assert_eq!(m.presses().len(), 1, "{:?}", m.requests);
+    assert!(m.presses()[0].ends_with(" 1"), "{:?}", m.requests);
+    assert!(
+        lines.iter().any(|l| l.starts_with("APPROVED seq=")),
+        "{lines:?}"
+    );
 }
 
 #[derive(Debug)]
@@ -4269,8 +4452,14 @@ fn the_tasks_end_at_a_withheld_point_is_settled_once_its_done_is_said() {
             let mut first = Mock::new(vec![
                 busy_screen(),
                 resumed_answer("Fixed the parser; pushing it next."),
+                busy_screen(),
+                resumed_answer(
+                    "Fixed the parser and pushed it.\nNothing left: all of it is merged into \
+                     the remote main branch.",
+                ),
             ]);
             first.autopilot = Some(word);
+            first.turn_gates = vec![1, 3];
             first.vanish_after = Some(4);
             first.cursor_on_caret = true;
             let opts = SuperviseOpts {
@@ -4289,11 +4478,14 @@ fn the_tasks_end_at_a_withheld_point_is_settled_once_its_done_is_said() {
                     ..TurnEndTiming::default()
                 });
             });
-            assert_eq!(count(&first, "turn"), 1, "the instruction: {lines:#?}");
+            assert_eq!(
+                count(&first, "turn"),
+                2,
+                "the instruction, then the land check at its defense: {lines:#?}"
+            );
         }
         let said = if done {
-            "Fixed the parser and pushed it.\nNothing left: all of it is merged into the \
-             remote main branch."
+            crate::supervise::policy::land_check::LANDED
         } else {
             "Fixed the parser; the suite is green."
         };
@@ -7329,6 +7521,49 @@ fn a_wall_the_session_worked_past_and_came_back_to_is_told_again() {
         [wall, None, wall],
         "told at each break at the wall, and over at the live read between: {lasting:?}"
     );
+}
+
+/// A LASTING WITHHOLD ENDS WITH ITS CAUSE, NOT WITH THE LOOP THAT TOLD IT (2026-10-29): a loop
+/// that told a sign-in wall and ended at it (its body restarted, or the agent relaunched in the
+/// tab) leaves the host holding the session, and the next loop for the tab, signed in again, tells
+/// it over at its first decided break. Before, a loop told only changes from what it had told
+/// itself, so the host held the session at a sign-in long gone for as long as the tab lived
+/// (`disk-free@v1` waited on it). NEGATIVE CONTROL: a next loop still at the wall tells it again.
+#[test]
+fn a_new_loop_tells_over_the_wall_a_loop_before_it_told() {
+    let full = SuperviseOpts {
+        max: Duration::from_secs(30),
+        ..SuperviseOpts::hosted()
+    };
+    let wall = Some(crate::supervise::Lasting::Wall {
+        wire: aterm_phase::WallKind::Auth.wire(),
+    });
+    let run = |next: Vec<String>| {
+        let host = Arc::new(TestHost::default());
+        host.owns.store(true, Ordering::SeqCst);
+        host.finds_nothing.store(true, Ordering::SeqCst);
+        for (screen, told) in [(login_lost_screen(), 1), (next, 2)] {
+            let mut m = Mock::new(vec![screen]);
+            m.stall_sleep = Some(Duration::from_millis(5));
+            m.vanish_after = Some(0);
+            m.cursor_on_caret = true;
+            let _ = hosted_with_host(
+                &mut m,
+                &full,
+                &host,
+                Stop::reached(
+                    move |h| h.lasting.lock().unwrap().len() >= told,
+                    Duration::from_secs(60),
+                ),
+                None,
+            );
+        }
+        host.lasting.lock().unwrap().clone()
+    };
+    let signed_in = run(idle_screen());
+    assert_eq!(signed_in, [wall, None], "{signed_in:?}");
+    let still = run(login_lost_screen());
+    assert_eq!(still, [wall, wall], "{still:?}");
 }
 
 #[test]
@@ -12149,7 +12384,7 @@ fn a_return_to_the_bucket_model_the_host_defers_never_holds_the_continuation() {
 }
 
 #[test]
-fn a_restarted_loop_at_a_wall_its_predecessor_continued_past_waits_out_the_back_off() {
+fn a_restarted_loop_at_a_wall_its_predecessor_continued_past_waits_out_the_new_reset() {
     let run = |seed: bool| {
         let (dir, ledger) = ledger_file("restart-rs");
         let (jdir, journal) = journal_file("restart-rs");
@@ -12176,14 +12411,9 @@ fn a_restarted_loop_at_a_wall_its_predecessor_continued_past_waits_out_the_back_
             journal: Some(journal.clone()),
             ..SuperviseOpts::hosted()
         };
-        let stop = if seed {
-            Stop::After(Duration::from_secs(3))
-        } else {
-            Stop::reached(
-                move |_| continued_on_usage(&journal),
-                Duration::from_millis(300),
-            )
-        };
+        // This helper drives a ScriptedClock; three seconds are a controlled virtual
+        // observation window past the one-second reset, not a native latency budget.
+        let stop = Stop::After(Duration::from_secs(3));
         let (r, lines) = hosted_with_host_ledger(
             &mut m,
             &opts,
@@ -12201,11 +12431,10 @@ fn a_restarted_loop_at_a_wall_its_predecessor_continued_past_waits_out_the_back_
         let _ = std::fs::remove_dir_all(&jdir);
         lines.iter().filter(|l| l.starts_with("CONTINUED")).count()
     };
-    assert_eq!(run(false), 1, "unseeded: continued at once");
-    assert_eq!(
-        run(true),
-        0,
-        "seeded: the predecessor's act stands, ten minutes"
+    assert!(run(false) > 0, "ordinary first wall resumes at its reset");
+    assert!(
+        run(true) > 0,
+        "a new reset past the predecessor's meet must not inherit its old retry floor"
     );
 }
 
@@ -13785,6 +14014,8 @@ fn a_retry_mark_with_any_signed_stamp_can_be_taken_up_by_the_session() {
             said: Default::default(),
             said_reset_ms: None,
             checks: 0,
+            land: Default::default(),
+            pass: Default::default(),
         };
         let body = Row {
             rule_id: RULE_POINT,
@@ -13927,6 +14158,50 @@ fn a_session_that_worked_under_a_loop_before_is_seeded_as_worked() {
                 .is_none()
         );
         assert_eq!(s.turn_end.worked_before(), want, "{case}: {body}");
+    }
+}
+
+/// A SESSION THAT RAN UNDER OFF IS SEEDED AS WORKED (D2-2): nobody judged its points, but a person
+/// may have driven it by hand, so a loop lifted off Off, or one after it whose books hold only the
+/// `autopilot-off@v1` row that lift wrote, marks it worked and under Land a person's quick turn
+/// interrupts that work, unless its first point shows its opening exchange (`reads_opening`, R1).
+/// NEGATIVE CONTROLS: another session's row, or no row and no lift, mark nothing. MUTANTS: with
+/// `off_stood_in` out of the seed, the row case fails; with `worked_before` out of
+/// `seed_off_stood`, both fail.
+#[test]
+fn a_session_that_ran_under_off_is_seeded_as_worked() {
+    use crate::supervise::approvals::{OFF_STOOD, Outcome, RULE_OFF_STOOD, Row};
+    let dir = crate::supervise::ScratchDir::new("worked-before", "off-stood");
+    let path = dir.join("books.jsonl");
+    let now_ms = 1_790_000_000_000_i64;
+    let stood = |sid| {
+        Row {
+            rule_id: RULE_OFF_STOOD,
+            outcome: Outcome::Waiting,
+            command: "",
+            reason: OFF_STOOD,
+            box_seq: 0,
+        }
+        .to_json(now_ms - 1_000, Some(sid))
+    };
+    for (case, body, lifted, want) in [
+        ("its Off stood", stood("@s-9"), false, true),
+        ("lifted off Off now", String::new(), true, true),
+        ("another's Off stood", stood("@s-8"), false, false),
+        ("none", String::new(), false, false),
+    ] {
+        let mut ctl = Mock::new(vec![busy_screen()]);
+        let mut s = session(&mut ctl, Some("@s-9".to_string()));
+        assert!(
+            s.seed_from_ledger_text(&path, &body, now_ms, lifted)
+                .is_none()
+        );
+        assert_eq!(s.turn_end.worked_before(), want, "{case}: {body}");
+        assert_eq!(
+            s.turn_end.reads_opening(),
+            want,
+            "{case}: reads its opening"
+        );
     }
 }
 
@@ -14233,4 +14508,127 @@ fn unknown_reset_allowances_never_become_a_generic_question_answer() {
         );
         assert!(m.presses()[0].ends_with(" enter"), "{:?}", m.requests);
     }
+}
+
+/// [`super::observe_table`]'s row of the folder-trust dialog: a confirmed focus move, then Enter
+/// ([`the_trust_dialog_is_answered_by_a_confirmed_focus_move_then_enter`]).
+pub(super) fn observe_row_trust() -> &'static [&'static str] {
+    let mut m = fenced(vec![trust_dialog(false), trust_dialog(true), idle_screen()]);
+    m.cwd = Some(TRUST_FOLDER.to_string());
+    m.vanish_after = Some(0);
+    let _ = watch_lines_with(&mut m, &auto(30), |s| s.set_approval_env(owner_env()));
+    &[" down", " enter"]
+}
+
+/// [`super::observe_table`]'s row of the launch's folder-trust dialog, answered at once inside a
+/// person's grace ([`a_launch_the_server_witnesses_is_answered_within_the_grace`]).
+pub(super) fn observe_row_launch() -> &'static [&'static str] {
+    let mut m = launched(
+        vec![trust_dialog(false), trust_dialog(true), idle_screen()],
+        "claude",
+    );
+    m.input = INPUT_CLEAR;
+    m.input_after = vec![(1, INPUT_CLEAR)];
+    let _ = full_power_watch(&mut m, "observe-launch");
+    &[" down", " enter"]
+}
+
+/// [`super::observe_table`]'s row of a question answered by its focus and Enter
+/// ([`the_harness_says_its_question_enter_answers`]).
+pub(super) fn observe_row_question() -> &'static [&'static str] {
+    use aterm_phase::prompt::fixtures as f;
+    let base = q(f::QUESTION_FREE_TEXT_FOCUSED);
+    let mut m = questioned(vec![
+        base.clone(),
+        focused_on(&base, "3. High contrast"),
+        focused_on(&base, "2. Light"),
+        focused_on(&base, "1. Dark"),
+        idle_screen(),
+    ]);
+    m.help = ACT_KEY_HELP.to_string();
+    let mut s = session(&mut m, None);
+    s.set_approval_env(owner_env());
+    let _ = s.supervise(&answering(30));
+    &[" up", " enter"]
+}
+
+/// [`super::observe_table`]'s row of the usage-limit options dialog
+/// ([`the_limit_options_dialog_waits_for_the_reset_by_itself`]).
+pub(super) fn observe_row_limit_dialog() -> &'static [&'static str] {
+    let (dir, ledger) = ledger_file("observe-limit-wait");
+    let opts = SuperviseOpts {
+        max: Duration::from_secs(30),
+        ..SuperviseOpts::hosted_with(&crate::supervise::SupervisorConfig::default())
+    };
+    let first =
+        aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::LIMIT_OPTIONS_DIALOG);
+    let mut m = fenced(vec![
+        first,
+        limit_dialog(&[LIMIT_STOP, LIMIT_WAIT, LIMIT_UPGRADE], 1),
+        idle_screen(),
+    ]);
+    m.vanish_after = Some(0);
+    let _ = watch_lines_with(&mut m, &opts, |s| {
+        s.set_approval_env(owner_env());
+        s.set_approval_ledger(Some(ledger.clone()));
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+    &[" down", " enter"]
+}
+
+/// [`super::observe_table`]'s row of the autocompact offer
+/// ([`the_autocompact_offer_is_answered_at_400k_without_the_owner`]).
+pub(super) fn observe_row_autocompact() -> &'static [&'static str] {
+    let (dir, ledger) = ledger_file("observe-autocompact-offer");
+    let mut cfg = crate::supervise::SupervisorConfig::default();
+    cfg.set("approve", "all").expect("a level");
+    let opts = SuperviseOpts {
+        max: Duration::from_secs(30),
+        ..SuperviseOpts::hosted_with(&cfg)
+    };
+    let mut m = fenced(vec![
+        autocompact_offer(false, "400k"),
+        autocompact_offer(true, "400k"),
+        idle_screen(),
+    ]);
+    m.human_seq = Some(3);
+    m.vanish_after = Some(0);
+    let _ = watch_lines_with(&mut m, &opts, |s| {
+        s.set_approval_env(owner_env());
+        s.set_approval_ledger(Some(ledger.clone()));
+        s.set_autocompact_settle(Duration::ZERO);
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+    &[" down", " enter"]
+}
+
+/// [`super::observe_table`]'s row of Claude Code's auto-mode setup offer, put off
+/// ([`the_auto_mode_setup_offer_is_put_off_at_every_level_and_the_turn_continued`]).
+pub(super) fn observe_row_auto_mode() -> &'static [&'static str] {
+    use aterm_phase::prompt::fixtures as f;
+    let (dir, ledger) = ledger_file("observe-auto-mode-setup");
+    let (jdir, journal) = journal_file("observe-auto-mode-setup");
+    let mut cfg = SupervisorConfig::default();
+    cfg.set("approve", "all").expect("a level");
+    let opts = SuperviseOpts {
+        max: Duration::from_secs(30),
+        journal: Some(journal),
+        ..SuperviseOpts::hosted_with(&cfg)
+    };
+    let (offer, gone) = auto_mode_offer(f::AUTO_MODE_SETUP_FULLSCREEN);
+    let mut m = fenced(vec![busy_screen(), offer, gone]);
+    m.human_seq = Some(3);
+    m.vanish_after = Some(2);
+    let _ = watch_lines_with(&mut m, &opts, |s| {
+        s.set_approval_env(owner_env());
+        s.set_approval_ledger(Some(ledger.clone()));
+        s.set_autocompact_settle(Duration::ZERO);
+        s.set_turn_end_timing(TurnEndTiming {
+            min_work: Duration::ZERO,
+            ..TurnEndTiming::default()
+        });
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&jdir);
+    &[" 2"]
 }

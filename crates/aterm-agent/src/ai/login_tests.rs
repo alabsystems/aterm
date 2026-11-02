@@ -29,8 +29,11 @@ fn facts(c: &'static Connector, shim: PathBuf) -> Facts {
         accounts: None,
         limited_until: None,
         record: Record::default(),
+        record_scope: (c.id == "codex").then_some("file"),
+        credential_store_error: None,
         env_credentials: Vec::new(),
         pool: None,
+        review_source: None,
     }
 }
 
@@ -274,7 +277,11 @@ fn codexs_login_runs_only_when_codex_is_signed_out_because_it_revokes_first() {
         );
     }
     assert_eq!(
-        store.load().expect("load").of("codex").used_how,
+        store
+            .load()
+            .expect("load")
+            .of_scope("codex", Some("file"))
+            .used_how,
         Some(How::Login)
     );
 }
@@ -338,9 +345,13 @@ fn claude_signs_in_only_through_accounts_v2s_renewal() {
     let mut f = facts(&CLAUDE, shim.clone());
     f.accounts = Some(ClaudeAccounts {
         label: "m7".into(),
+        store: None,
+        roster: None,
         listed: false,
         refused: None,
         unread: None,
+        launch_refused: None,
+        sign_in_refused: None,
         renews: true,
         login: None,
         made: true,
@@ -382,10 +393,14 @@ fn claude_signs_in_only_through_accounts_v2s_renewal() {
 
 fn listed_view(renews: bool, refused: Option<&str>) -> ClaudeAccounts {
     ClaudeAccounts {
+        store: None,
+        roster: None,
         label: "work".into(),
         listed: true,
         refused: refused.map(str::to_string),
         unread: None,
+        launch_refused: None,
+        sign_in_refused: None,
         renews,
         login: None,
         made: false,
@@ -493,15 +508,21 @@ fn a_sign_in_under_another_home_records_nothing() {
     });
     let other = b.dir.path().join("identity-codex");
     let rig = Rig::new(&[("CODEX_HOME", other.to_str().expect("utf8"))]);
+    let mut explicit = facts(&CODEX, b.pkg.agents_dir().join("codex"));
+    explicit.home_var = Some(other.display().to_string());
+    explicit.home = Ok(other);
     let done = rig.sign_in(
         &runner,
         &store,
-        &facts(&CODEX, b.pkg.agents_dir().join("codex")),
+        &explicit,
         &row(&CODEX, State::SignedOut),
         &[],
     );
     assert_eq!(done, Done::SignedOut);
-    assert_eq!(store.load().expect("load").of("codex"), Record::default());
+    assert_eq!(
+        store.load().expect("load").of_scope("codex", Some("file")),
+        Record::default()
+    );
     let done = Rig::new(&[]).sign_in(
         &runner,
         &store,
@@ -510,7 +531,277 @@ fn a_sign_in_under_another_home_records_nothing() {
         &[],
     );
     assert_eq!(done, Done::SignedOut);
-    assert!(store.load().expect("load").of("codex").ended());
+    assert!(
+        store
+            .load()
+            .expect("load")
+            .of_scope("codex", Some("file"))
+            .ended()
+    );
+}
+
+#[test]
+fn codex_sign_in_health_belongs_to_its_observed_backend() {
+    for initial in ["file", "keyring", "auto", "ephemeral"] {
+        for current in ["file", "keyring", "auto", "ephemeral"] {
+            for switch_at in [0, 1, 2] {
+                for signed_in in [false, true] {
+                    let b = machine(&["codex"]);
+                    let store = Store::at(&b.state);
+                    store
+                        .note("codex", How::Login, Outcome::Worked, 10)
+                        .unwrap();
+                    let legacy = store.load().unwrap().of("codex");
+                    let mut f = facts(&CODEX, b.pkg.agents_dir().join("codex"));
+                    let home = b.home.join(".codex");
+                    std::fs::create_dir_all(&home).unwrap();
+                    let config = home.join("config.toml");
+                    std::fs::write(
+                        &config,
+                        format!("cli_auth_credentials_store = {initial:?}\n"),
+                    )
+                    .unwrap();
+                    f.home = Ok(home);
+                    f.record_scope = Some(initial);
+                    f.hidden_store = initial != "file";
+                    let terminal_config = config.clone();
+                    let status_config = config.clone();
+                    let runner = FakeRunner::with(move |_| {
+                        if switch_at == 2 {
+                            std::fs::write(
+                                &status_config,
+                                format!("cli_auth_credentials_store = {current:?}\n"),
+                            )
+                            .unwrap();
+                        }
+                        Ok(if signed_in {
+                            ran(0, "", "Logged in using ChatGPT\n")
+                        } else {
+                            ran(1, "", "Not logged in\n")
+                        })
+                    })
+                    .exiting(move |_| {
+                        if switch_at == 1 {
+                            std::fs::write(
+                                &terminal_config,
+                                format!("cli_auth_credentials_store = {current:?}\n"),
+                            )
+                            .unwrap();
+                        }
+                        0
+                    });
+                    if switch_at == 0 {
+                        std::fs::write(
+                            &config,
+                            format!("cli_auth_credentials_store = {current:?}\n"),
+                        )
+                        .unwrap();
+                    }
+                    let done = Rig::new(&[]).sign_in(
+                        &runner,
+                        &store,
+                        &f,
+                        &row(&CODEX, State::SignedOut),
+                        &[],
+                    );
+                    let after = store.load().unwrap();
+                    assert_eq!(after.of("codex"), legacy);
+                    if initial == current {
+                        assert_eq!(runner.calls().len(), 2);
+                        assert_eq!(
+                            done,
+                            if signed_in {
+                                Done::SignedIn(Some("chatgpt"))
+                            } else {
+                                Done::SignedOut
+                            }
+                        );
+                        let record = after.of_scope("codex", Some(initial));
+                        assert_eq!(record.ended(), !signed_in);
+                        assert_eq!(record.used_at.is_some(), signed_in);
+                        assert_eq!(after.by_scope["codex"].len(), 1);
+                    } else {
+                        assert!(
+                            after.by_scope.is_empty(),
+                            "{initial} -> {current}, phase {switch_at}"
+                        );
+                        assert_eq!(runner.calls().len(), switch_at);
+                        if switch_at == 0 {
+                            assert!(matches!(done, Done::Refused(_)));
+                        } else {
+                            assert_eq!(done, Done::NotChecked);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn an_unknown_codex_backend_cannot_start_a_sign_in() {
+    let b = machine(&["codex"]);
+    let store = Store::at(&b.state);
+    let mut f = facts(&CODEX, b.pkg.agents_dir().join("codex"));
+    let home = b.home.join(".codex");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("config.toml"),
+        "cli_auth_credentials_store = 'future'\n",
+    )
+    .unwrap();
+    f.home = Ok(home);
+    let runner = FakeRunner::quiet();
+    assert!(matches!(
+        Rig::new(&[]).sign_in(&runner, &store, &f, &row(&CODEX, State::SignedOut), &[]),
+        Done::Refused(_)
+    ));
+    assert!(runner.calls().is_empty());
+    assert_eq!(
+        store.load().unwrap(),
+        super::super::store::Records::default()
+    );
+}
+
+#[test]
+fn a_file_roster_cannot_redirect_or_hold_a_hidden_backend_sign_in() {
+    use crate::ai::facts::CliAccounts;
+    for backend in ["keyring", "auto", "ephemeral"] {
+        for refused in [false, true] {
+            let b = machine(&["codex"]);
+            let store = Store::at(&b.state);
+            let mut f = facts(&CODEX, b.pkg.agents_dir().join("codex"));
+            let home = b.home.join(".codex");
+            std::fs::create_dir_all(&home).unwrap();
+            std::fs::write(
+                home.join("config.toml"),
+                format!("cli_auth_credentials_store = {backend:?}\n"),
+            )
+            .unwrap();
+            f.home = Ok(home);
+            f.record_scope = Some(backend);
+            f.hidden_store = true;
+            f.record.apply(
+                How::Review,
+                Outcome::Ended(Ended::ReviewAuth),
+                1_800_000_000,
+            );
+            f.pool = Some(CliAccounts {
+                refused: refused.then(|| "a broken inactive file roster".into()),
+                state: Some("expired"),
+                next: Some("inactive-file-row".into()),
+                off: Some("an inactive pool switch"),
+                bot_check_at: Some(1_800_000_000),
+                sign_in_refused: Some("an inactive file-account refusal".into()),
+                ..CliAccounts::default()
+            });
+            let row = crate::ai::state::assess(&f, true, 1_800_000_000);
+            assert_eq!(row.state, State::SignedOut);
+            assert_eq!(row.actor, Some(crate::ai::state::Actor::Person));
+            assert_eq!(row.fix.as_deref(), Some("aterm ai login codex"));
+            assert!(refusal(&f, &row).is_none());
+            assert!(crate::ai::state::held(&f, 1_800_000_000).is_none());
+            let runner = FakeRunner::with(|_| Ok(ran(0, "", "Logged in using ChatGPT\n")));
+            assert_eq!(
+                Rig::new(&[]).sign_in(&runner, &store, &f, &row, &[]),
+                Done::SignedIn(Some("chatgpt"))
+            );
+            assert!(runner.calls().iter().all(|call| call.program == "codex"));
+            assert_eq!(runner.calls().len(), 2);
+            assert_eq!(
+                store
+                    .load()
+                    .unwrap()
+                    .of_scope("codex", Some(backend))
+                    .used_how,
+                Some(How::Login)
+            );
+        }
+    }
+}
+
+#[test]
+fn a_login_status_cannot_replace_a_newer_health_observation() {
+    for during_status in [false, true] {
+        let b = machine(&["codex"]);
+        let store = Store::at(&b.state);
+        let terminal_store = store.clone();
+        let status_store = store.clone();
+        let runner = FakeRunner::with(move |_| {
+            if during_status {
+                status_store
+                    .note_scope(
+                        "codex",
+                        Some("file"),
+                        How::Review,
+                        Outcome::Ended(Ended::ReviewAuth),
+                        200,
+                    )
+                    .unwrap();
+            }
+            Ok(ran(0, "", "Logged in using ChatGPT\n"))
+        })
+        .exiting(move |_| {
+            if !during_status {
+                terminal_store
+                    .note_scope(
+                        "codex",
+                        Some("file"),
+                        How::Review,
+                        Outcome::Ended(Ended::ReviewAuth),
+                        100,
+                    )
+                    .unwrap();
+            }
+            0
+        });
+        let f = facts(&CODEX, b.pkg.agents_dir().join("codex"));
+        assert_eq!(
+            Rig::new(&[]).sign_in(&runner, &store, &f, &row(&CODEX, State::SignedOut), &[]),
+            Done::SignedIn(Some("chatgpt"))
+        );
+        let after = store.load().unwrap().of_scope("codex", Some("file"));
+        assert_eq!(after.ended(), during_status);
+        assert_eq!(after.used_at.is_some(), !during_status);
+        assert_eq!(after.used_how, (!during_status).then_some(How::Login));
+    }
+}
+
+#[test]
+fn explicit_codex_login_refuses_unknown_or_changed_storage() {
+    for during_login in [false, true] {
+        let b = machine(&["codex"]);
+        let store = Store::at(&b.state);
+        let explicit = b.dir.path().join("explicit-codex");
+        std::fs::create_dir_all(&explicit).unwrap();
+        let config = explicit.join("config.toml");
+        std::fs::write(
+            &config,
+            if during_login {
+                "cli_auth_credentials_store = 'file'"
+            } else {
+                "not TOML"
+            },
+        )
+        .unwrap();
+        let mut f = facts(&CODEX, b.pkg.agents_dir().join("codex"));
+        f.home_var = Some(explicit.display().to_string());
+        f.home = Ok(explicit.clone());
+        let runner = FakeRunner::quiet().exiting(move |_| {
+            std::fs::write(&config, "not TOML").unwrap();
+            0
+        });
+        let rig = Rig::new(&[("CODEX_HOME", explicit.to_str().unwrap())]);
+        let result = rig.sign_in(&runner, &store, &f, &row(&CODEX, State::SignedOut), &[]);
+        if during_login {
+            assert_eq!(result, Done::NotChecked);
+            assert_eq!(runner.calls().len(), 1);
+        } else {
+            assert!(matches!(result, Done::Refused(_)));
+            assert!(runner.calls().is_empty());
+        }
+        assert_eq!(store.load().unwrap(), crate::ai::store::Records::default());
+    }
 }
 
 #[test]
@@ -544,9 +835,13 @@ fn claude_limited_with_next_sign_in_renews_the_successor_account() {
     let mut f = facts(&CLAUDE, shim);
     f.accounts = Some(ClaudeAccounts {
         label: "m27-3".into(),
+        store: None,
+        roster: None,
         listed: true,
         refused: None,
         unread: None,
+        launch_refused: None,
+        sign_in_refused: None,
         renews: true,
         login: None,
         made: true,
@@ -677,7 +972,16 @@ fn a_codex_default_row_on_a_build_that_ignores_codex_auth_path_signs_in_by_codex
     let config = b.dir.path().join("config");
     std::fs::create_dir_all(&config).expect("config");
     std::fs::create_dir_all(b.home.join(".codex")).expect("default home");
-    std::fs::write(b.home.join(".codex/auth.json"), "{}").expect("default login");
+    let token = crate::harness::codex_app_login::tests::make_chatgpt_jwt(
+        Some("own@example.com"),
+        "plus",
+        now + 3600,
+    );
+    std::fs::write(
+        b.home.join(".codex/auth.json"),
+        aterm_json::json!({"tokens":{"access_token":token}}).to_string(),
+    )
+    .expect("default login");
     let work = b.home.join(".aterm/logins/codex/work");
     std::fs::create_dir_all(&work).expect("work's empty login folder");
     let main_row =
@@ -759,6 +1063,7 @@ fn a_codex_default_row_on_a_build_that_ignores_codex_auth_path_signs_in_by_codex
     );
     let (logins, _) = pool_store.load_logins(now).expect("pool logins");
     assert_eq!(logins.get("main").and_then(|b| b.dir.clone()), None);
+    assert_eq!(logins.sign_in_receipts.get("main"), Some(&1));
     let seat = crate::harness::accounts_pool::Seat {
         config_dir: &config,
         state: &b.state,
@@ -854,6 +1159,229 @@ fn a_codex_default_row_on_a_build_that_ignores_codex_auth_path_signs_in_by_codex
         runner.calls()[0].args,
         ["harness", "accounts", "renew", "work", "--cli", "codex"]
     );
+}
+
+#[test]
+fn a_managed_default_login_records_failure_without_overwriting_a_newer_sign_in() {
+    use crate::ai::facts::CliAccounts;
+    use crate::harness::accounts::{self, Auth, Cli};
+    use crate::harness::codex_alab::DefaultRow;
+    let now = 1_800_000_000;
+    for superseded in [false, true] {
+        let b = machine(&["codex"]);
+        let store = Store::at(&b.state);
+        let account_store = accounts::Store::at_for(&b.state, Cli::Codex, &b.home);
+        let roster = b.dir.path().join("accounts-codex.toml");
+        std::fs::write(
+            &roster,
+            accounts::append_rows_for(
+                Cli::Codex,
+                "",
+                &[accounts::Row {
+                    label: "main".into(),
+                    ..accounts::Row::default()
+                }],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut f = facts(&CODEX, b.pkg.agents_dir().join("codex"));
+        f.home = Ok(b.home.join(".codex"));
+        f.pool = Some(CliAccounts {
+            store: Some(account_store.clone()),
+            roster,
+            unread: true,
+            next: Some("main".into()),
+            default_label: Some("main".into()),
+            default_row: Some(DefaultRow::SignedOut {
+                label: "main".into(),
+                stored: false,
+            }),
+            serving_label: Some("main".into()),
+            serving_login: Some(("CODEX_HOME", None)),
+            ..CliAccounts::default()
+        });
+        let current_store = account_store.clone();
+        let runner = FakeRunner::with(move |_| {
+            if superseded {
+                current_store
+                    .transact_logins(now, &mut None, |state, logins| {
+                        let mut events = accounts::note_auth(state, "main", Auth::SignedOut, now);
+                        events.extend(accounts::note_signed_back(state, logins, "main", now));
+                        Ok(events)
+                    })
+                    .unwrap();
+            }
+            Ok(ran(1, "", "Not logged in\n"))
+        });
+        assert_eq!(
+            Rig::new(&[]).sign_in(&runner, &store, &f, &row(&CODEX, State::SignedOut), &[]),
+            Done::SignedOut
+        );
+        assert_eq!(runner.calls().len(), 2);
+        assert_eq!(
+            account_store.load(now).unwrap().0.accounts["main"].auth,
+            if superseded {
+                Auth::Ok
+            } else {
+                Auth::SignedOut
+            }
+        );
+        assert_eq!(
+            store.load().unwrap().of_scope("codex", Some("file")),
+            Record::default()
+        );
+    }
+}
+
+fn unbound_default_login(
+    b: &crate::ai::testing::Box3,
+    email: Option<&str>,
+) -> (Facts, crate::harness::accounts::Store) {
+    use crate::ai::facts::CliAccounts;
+    use crate::harness::accounts::{self, Cli};
+    use crate::harness::codex_alab::DefaultRow;
+    let store = accounts::Store::at_for(&b.state, Cli::Codex, &b.home);
+    let roster = b.dir.path().join("accounts-codex.toml");
+    std::fs::write(
+        &roster,
+        accounts::append_rows_for(
+            Cli::Codex,
+            "",
+            &[accounts::Row {
+                label: "main".into(),
+                email: email.map(str::to_owned),
+                ..accounts::Row::default()
+            }],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut f = facts(&CODEX, b.pkg.agents_dir().join("codex"));
+    f.home = Ok(b.home.join(".codex"));
+    f.pool = Some(CliAccounts {
+        store: Some(store.clone()),
+        roster,
+        unread: true,
+        next: Some("main".into()),
+        default_label: Some("main".into()),
+        default_row: Some(DefaultRow::SignedOut {
+            label: "main".into(),
+            stored: false,
+        }),
+        serving_label: Some("main".into()),
+        serving_login: Some(("CODEX_HOME", None)),
+        ..CliAccounts::default()
+    });
+    (f, store)
+}
+
+#[test]
+fn a_first_default_sign_in_checks_identity_and_supersedes_older_reviews() {
+    use crate::harness::accounts::{self, Auth, Cli, Mode};
+    use crate::harness::accounts_sync::{capture_current_review, record_current_review};
+    let now = 1_800_000_000;
+    for initial in [None, Some(Auth::Ok), Some(Auth::SignedOut)] {
+        for matching in [false, true] {
+            let b = machine(&["codex"]);
+            let store = Store::at(&b.state);
+            let (f, account_store) = unbound_default_login(&b, Some("owner@example.com"));
+            if let Some(auth) = initial {
+                account_store
+                    .transact(now, &mut None, |state| {
+                        Ok(accounts::note_auth(state, "main", auth, now - 1))
+                    })
+                    .unwrap();
+            }
+            let observed = capture_current_review(
+                &account_store,
+                Cli::Codex,
+                Some(&f.pool.as_ref().unwrap().roster),
+                Mode::Early,
+                None,
+                now,
+            )
+            .unwrap()
+            .witness;
+            let home = b.home.join(".codex");
+            let login_home = home.clone();
+            let runner = FakeRunner::with(move |_| {
+                std::fs::create_dir_all(&login_home).unwrap();
+                let email = if matching {
+                    "owner@example.com"
+                } else {
+                    "other@example.com"
+                };
+                let token = crate::harness::codex_app_login::tests::make_chatgpt_jwt(
+                    Some(email),
+                    "plus",
+                    now + 3600,
+                );
+                std::fs::write(
+                    login_home.join("auth.json"),
+                    aterm_json::json!({"tokens":{"access_token":token}}).to_string(),
+                )
+                .unwrap();
+                Ok(ran(0, "", "Logged in using ChatGPT\n"))
+            });
+            let done =
+                Rig::new(&[]).sign_in(&runner, &store, &f, &row(&CODEX, State::SignedOut), &[]);
+            if matching {
+                assert_eq!(done, Done::SignedIn(Some("chatgpt")));
+            } else {
+                assert!(matches!(done, Done::Failed(_)), "{done:?}");
+            }
+            assert_eq!(runner.calls().len(), 2);
+            assert_eq!(
+                account_store.load(now).unwrap().0.accounts["main"].auth,
+                if matching { Auth::Ok } else { Auth::SignedOut }
+            );
+            assert_eq!(
+                account_store
+                    .load_logins(now)
+                    .unwrap()
+                    .0
+                    .sign_in_receipts
+                    .get("main")
+                    .copied(),
+                matching.then_some(1)
+            );
+            assert_eq!(
+                store.load().unwrap().of_scope("codex", Some("file")),
+                Record::default()
+            );
+            if matching {
+                assert!(
+                    record_current_review(
+                        &account_store,
+                        Cli::Codex,
+                        &observed,
+                        &home,
+                        Outcome::Ended(Ended::ReviewAuth),
+                        now
+                    )
+                    .is_err()
+                );
+                assert_eq!(
+                    account_store.load(now).unwrap().0.accounts["main"].auth,
+                    Auth::Ok
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_default_sign_in_requires_its_account_witness_before_running() {
+    let b = machine(&["codex"]);
+    let store = Store::at(&b.state);
+    let (f, account_store) = unbound_default_login(&b, None);
+    std::fs::create_dir_all(account_store.state_file().parent().unwrap()).unwrap();
+    std::fs::write(account_store.state_file(), "damaged state").unwrap();
+    let runner = FakeRunner::quiet();
+    let done = Rig::new(&[]).sign_in(&runner, &store, &f, &row(&CODEX, State::SignedOut), &[]);
+    assert!(matches!(done, Done::Refused(_)), "{done:?}");
+    assert!(runner.calls().is_empty());
 }
 
 /// ON A CODEX BUILD THAT SERVES THIS MACHINE'S OWN LOGIN'S ROW ALONE, `aterm ai login` SIGNS IN

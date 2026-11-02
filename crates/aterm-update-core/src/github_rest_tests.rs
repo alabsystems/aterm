@@ -282,6 +282,39 @@ fn a_redirect_off_the_cdn_origin_is_refused_and_never_followed() {
         !refused.to_string().contains("sig="),
         "the Location's query is not repeated"
     );
+    fake.fault(
+        Match::api(&asset_path),
+        Fault::RedirectTo {
+            status: 302,
+            location: "/elsewhere?sig=secret_rel&next=https://cdn.example/x".into(),
+        },
+    );
+    let rel_refused = rest.download_asset(&asset_path, &dest, 1024).unwrap_err();
+    assert!(
+        matches!(rel_refused, RestError::Redirect(_)),
+        "{rel_refused}"
+    );
+    assert!(
+        !rel_refused.to_string().contains("sig=")
+            && !rel_refused.to_string().contains("/elsewhere"),
+        "a relative Location with :// in its query never leaks path or query: {rel_refused}"
+    );
+    fake.fault(
+        Match::api(&asset_path),
+        Fault::RedirectTo {
+            status: 302,
+            location: format!("http://secret_user:secret_pw@127.0.0.1:{web}/elsewhere?sig=1"),
+        },
+    );
+    let cred_refused = rest.download_asset(&asset_path, &dest, 1024).unwrap_err();
+    assert!(
+        matches!(cred_refused, RestError::Redirect(_)),
+        "{cred_refused}"
+    );
+    assert!(
+        !cred_refused.to_string().contains("secret_") && !cred_refused.to_string().contains("sig="),
+        "userinfo and query are never repeated: {cred_refused}"
+    );
     assert!(
         !fake.seen().iter().any(|s| s.origin == FakeOrigin::Web),
         "never asked"
@@ -413,6 +446,19 @@ fn a_token_that_could_write_a_header_is_refused() {
     );
     std::fs::write(dir.path().join("two"), "one\ntwo\n").unwrap();
     assert!(Token::from_file(&dir.path().join("two")).is_err());
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+        let fifo = dir.path().join("token.fifo");
+        let c_fifo = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_fifo` is a valid NUL-terminated path inside the private scratch directory.
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+        assert!(
+            Token::from_file(&fifo).is_err(),
+            "a FIFO at the token path must be refused without blocking"
+        );
+    }
     assert_eq!(
         format!("{:?}", Token::new(b"ghp_abc").unwrap()),
         "Token(<redacted>)"

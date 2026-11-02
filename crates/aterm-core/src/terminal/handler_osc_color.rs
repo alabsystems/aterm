@@ -75,6 +75,14 @@ fn osc_21_key_is_echoable(key: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
+#[inline]
+fn parse_palette_index(key: &str) -> Option<u8> {
+    key.bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| key.parse::<u8>().ok())
+        .flatten()
+}
+
 impl TerminalHandler<'_> {
     /// The per-sequence OSC palette-query response cap ([`LEGACY_PALETTE_PER_SEQUENCE_MAX`]).
     #[inline]
@@ -115,7 +123,7 @@ impl TerminalHandler<'_> {
                 continue;
             };
 
-            let Ok(index) = index_str.parse::<u8>() else {
+            let Some(index) = parse_palette_index(index_str) else {
                 i += 2;
                 continue;
             };
@@ -333,7 +341,7 @@ impl TerminalHandler<'_> {
                 .selection_foreground
                 .map_or(Osc21QueryValue::Undefined, Osc21QueryValue::Color);
         }
-        let Ok(index) = key.parse::<u8>() else {
+        let Some(index) = parse_palette_index(key) else {
             return Osc21QueryValue::Unknown;
         };
         Osc21QueryValue::Color(self.color.palette().get(index))
@@ -369,7 +377,7 @@ impl TerminalHandler<'_> {
             self.reset_selection_foreground();
             return;
         }
-        let Ok(index) = key.parse::<u8>() else {
+        let Some(index) = parse_palette_index(key) else {
             return;
         };
         let color = if let Some(ref configured) = self.color.configured_palette {
@@ -396,7 +404,7 @@ impl TerminalHandler<'_> {
             self.note_color_change(super::ColorTarget::SelectionForeground);
             return;
         }
-        if let Ok(index) = key.parse::<u8>() {
+        if let Some(index) = parse_palette_index(key) {
             if !self.modes.allow_palette_reconfigure {
                 self.note_palette_set_refused();
                 return;
@@ -419,7 +427,7 @@ impl TerminalHandler<'_> {
             let mut any_reset = false;
             for param in &params[1..] {
                 if let Ok(index_str) = std::str::from_utf8(param)
-                    && let Ok(index) = index_str.parse::<u8>()
+                    && let Some(index) = parse_palette_index(index_str)
                 {
                     let configured_color = self
                         .color
@@ -853,7 +861,7 @@ mod osc_color_response_cap_tests {
             Some(b"\x1b]21;transparent_background_color1=?\x1b\\".to_vec()),
         );
 
-        term.process(b"\x1b]21;bad key=?;x\x7f=?\x1b\\");
+        term.process(b"\x1b]21;bad key=?;x\x7f=?;+1=?\x1b\\");
         assert_eq!(term.take_response(), None, "nothing echoable, no reply");
     }
 

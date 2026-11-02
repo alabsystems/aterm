@@ -396,11 +396,13 @@ fn render(status: &Status) -> io::Result<String> {
 }
 
 fn write_durably(layout: &Layout, text: &str) -> io::Result<()> {
+    static STATUS_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let dest = layout.status();
-    let tmp = dest.with_file_name(format!("status.toml.tmp-{}", std::process::id()));
+    let seq = STATUS_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dest.with_file_name(format!("status.toml.tmp-{}-{seq}", std::process::id()));
     let written = (|| {
         use std::io::Write as _;
-        let mut f = crate::platform::open_create_write(&tmp, 0o644)?;
+        let mut f = crate::platform::open_create_new_write(&tmp, 0o644)?;
         f.write_all(text.as_bytes())?;
         crate::store::sync_contents_or_accept_refusal(&f)?;
         drop(f);

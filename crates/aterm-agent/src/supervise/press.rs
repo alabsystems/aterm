@@ -168,6 +168,7 @@ impl<C: Ctl> Session<'_, C> {
         seen: &Screen,
         grace: Duration,
     ) -> Result<Pressing, Fail> {
+        let _duty = self.duty_guard(Scope::Questions);
         let unconfirmed = |why: &str| {
             Ok(Pressing::Unconfirmed {
                 why: why.to_string(),
@@ -550,7 +551,7 @@ impl<C: Ctl> Session<'_, C> {
         self.note_hand(&r.stdout);
         let field = |name| super::escalate::status_field(&r.stdout, name);
         Ok((
-            field("human_ms").and_then(|v| v.parse().ok()),
+            field("human_ms").and_then(crate::parse_uint),
             field("gen").map(str::to_string),
         ))
     }

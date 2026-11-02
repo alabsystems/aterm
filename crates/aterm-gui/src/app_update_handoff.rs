@@ -10,86 +10,175 @@ use crate::App;
 use crate::Wake;
 #[cfg(unix)]
 use crate::app_input::paste_order;
-use crate::app_update_handoff_boundary::{self, MAX_BOUNDARY_WAIT};
+use crate::app_update_handoff_boundary::{self, HANDOFF_PENDING_BOUND, MAX_BOUNDARY_WAIT};
 
 thread_local! {
-    /// When this handoff first found a boundary guard held, so it holds for it at most
-    /// [`MAX_BOUNDARY_WAIT`] across its retries, then proceeds (design §6.7).
+    /// When this handoff try first found a boundary guard held: the try holds for an item at
+    /// most [`MAX_BOUNDARY_WAIT`], one budget across its start's retries and its Commit, then is
+    /// refused (design §6.7). Cleared when the try ends: refused past the budget, or the handoff
+    /// over without a Commit ([`App::settle_update_boundary_latch`]).
     static BOUNDARY_WAIT_SINCE: std::cell::Cell<Option<std::time::Instant>> =
         const { std::cell::Cell::new(None) };
 }
 
-/// Whether a non-idempotent item at a boundary still holds the update handoff: `Some(reason)`
-/// while an item holds the guard and the wait has not reached [`MAX_BOUNDARY_WAIT`], else `None`
-/// (the guard is free, or the budget is spent and the handoff proceeds — the successor resumes
-/// the item from the ledger). `now` is the clock (injected in tests).
+#[cfg(all(test, unix))]
+thread_local! {
+    /// A GUI re-entry after the collected facts, before the final setup-state check.
+    static BEFORE_FINAL_SETUP_CHECK: std::cell::Cell<Option<fn(&mut App)>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+/// Whether a non-idempotent item at a boundary holds the update handoff: `Some(reason)` while an
+/// item holds the guard (the handoff is refused: as activity within this try's budget, which
+/// tries it again, and for this try past it, which the updater's next check tries again), else
+/// `None`. `now` is the clock (injected in tests).
 fn boundary_guard_holds_handoff(now: std::time::Instant) -> Option<String> {
     boundary_wait_decision(app_update_handoff_boundary::any_held(), now)
 }
 
+/// The handoff's start at the boundary (§6.7): the registry's latch first, so from now until
+/// this handoff commits or is refused no item enters its critical section, and none takes the
+/// guard between this reading and the Commit's; then the guard. `Err` while an item already in
+/// its section holds the handoff, the latch dropped with it; otherwise the latch, which the
+/// handoff keeps while it is in flight.
+fn start_at_boundary(
+    now: std::time::Instant,
+) -> Result<app_update_handoff_boundary::HandoffLatch<'static>, String> {
+    let latch = app_update_handoff_boundary::latch_handoff(HANDOFF_PENDING_BOUND);
+    match boundary_guard_holds_handoff(now) {
+        Some(reason) => Err(reason),
+        None => Ok(latch),
+    }
+}
+
 /// The pure core of [`boundary_guard_holds_handoff`]: given whichever item holds the guard now,
-/// hold the handoff for it until [`MAX_BOUNDARY_WAIT`] passes, then let it proceed. The wait's
-/// start is kept per thread across the handoff's retries.
+/// refuse the handoff while it does, never cutting the item in half. The try's wait starts at
+/// the first reading that finds an item there and runs across the start's retries and the
+/// Commit, which a free reading leaves standing: one budget, [`MAX_BOUNDARY_WAIT`]. Within it the
+/// refusal says the update follows the item; past it this try is refused, its wait ends, and the
+/// updater's next check starts a new try with a new budget.
 fn boundary_wait_decision(
     held: Option<app_update_handoff_boundary::GuardedItem>,
     now: std::time::Instant,
 ) -> Option<String> {
-    let Some(item) = held else {
-        BOUNDARY_WAIT_SINCE.with(|since| since.set(None));
-        return None;
-    };
+    let item = held?;
     let since = BOUNDARY_WAIT_SINCE.with(|cell| {
         let started = cell.get().unwrap_or(now);
         cell.set(Some(started));
         started
     });
-    if now.duration_since(since) < MAX_BOUNDARY_WAIT {
+    if now.saturating_duration_since(since) < MAX_BOUNDARY_WAIT {
         Some(format!(
             "{item:?} is at a boundary that cannot be cut in half; the update follows it \
              (up to {}s)",
             MAX_BOUNDARY_WAIT.as_secs()
         ))
     } else {
-        BOUNDARY_WAIT_SINCE.with(|since| since.set(None));
-        None
+        end_boundary_wait();
+        Some(format!(
+            "{item:?} held the update at a boundary for {}s; this try is refused, and the \
+             update tries again at its next check",
+            MAX_BOUNDARY_WAIT.as_secs()
+        ))
+    }
+}
+
+/// This handoff try is over: the next starts its boundary wait afresh.
+fn end_boundary_wait() {
+    BOUNDARY_WAIT_SINCE.with(|since| since.set(None));
+}
+
+impl App {
+    /// The update handoff the boundary latch was taken for ended, refused, stood down or
+    /// abandoned: release the latch, so an item waiting at a boundary goes on (§6.7). Each turn
+    /// of the event loop asks; a Commit ends the process with the latch held.
+    pub(crate) fn settle_update_boundary_latch(&mut self) {
+        if self.update_boundary_latch.is_some() && !self.update_handoff_in_flight() {
+            self.update_boundary_latch = None;
+            // The try is over without a Commit: the next starts its boundary wait afresh.
+            end_boundary_wait();
+        }
     }
 }
 
 #[cfg(test)]
 mod boundary_wait_tests {
-    use super::{BOUNDARY_WAIT_SINCE, MAX_BOUNDARY_WAIT, boundary_wait_decision};
+    use super::{
+        BOUNDARY_WAIT_SINCE, MAX_BOUNDARY_WAIT, boundary_wait_decision, end_boundary_wait,
+    };
     use crate::app_update_handoff_boundary::GuardedItem;
     use std::time::{Duration, Instant};
 
-    fn reset() {
-        BOUNDARY_WAIT_SINCE.with(|since| since.set(None));
-    }
-
-    /// While a non-idempotent item holds the guard, the handoff is held — until the budget, when
-    /// it proceeds so the successor can resume the item from the ledger.
+    /// While a non-idempotent item holds the guard, the handoff is refused, never cutting it in
+    /// half: as activity within the budget, and for this try at it, which ends the try's wait.
     #[test]
     fn the_handoff_follows_a_held_item_for_at_most_the_budget() {
-        reset();
+        end_boundary_wait();
         let start = Instant::now();
-        // The item holds the guard; the handoff is held at first and as the wait grows, up to
+        let item = Some(GuardedItem::ClonePublishRename);
+        // The item holds the guard; the handoff follows it at first and as the wait grows, up to
         // just under the budget.
-        assert!(boundary_wait_decision(Some(GuardedItem::ClonePublishRename), start).is_some());
+        let first = boundary_wait_decision(item, start).expect("held");
+        assert!(first.contains("follows it"), "{first}");
         let near = start + MAX_BOUNDARY_WAIT - Duration::from_millis(1);
-        assert!(boundary_wait_decision(Some(GuardedItem::ClonePublishRename), near).is_some());
-        // At the budget it proceeds, even though the item is still held.
+        assert!(boundary_wait_decision(item, near).is_some_and(|why| why.contains("follows it")));
+        // At the budget this try is refused, even though nothing was cut, and its wait ends.
         let at = start + MAX_BOUNDARY_WAIT;
-        assert!(
-            boundary_wait_decision(Some(GuardedItem::ClonePublishRename), at).is_none(),
-            "the handoff proceeds at the budget"
-        );
-        reset();
+        let spent = boundary_wait_decision(item, at).expect("never proceeds over a held item");
+        assert!(spent.contains("next check"), "{spent}");
+        assert_eq!(BOUNDARY_WAIT_SINCE.with(std::cell::Cell::get), None);
+        end_boundary_wait();
     }
 
     /// The control: no item holds the guard, so the handoff is never held and nothing waits.
     #[test]
     fn a_free_guard_holds_nothing() {
-        reset();
+        end_boundary_wait();
         assert!(boundary_wait_decision(None, Instant::now()).is_none());
+        assert_eq!(BOUNDARY_WAIT_SINCE.with(std::cell::Cell::get), None);
+    }
+
+    /// One budget for the whole try: an item the start waited on, then another that took the
+    /// guard after the start, hold the handoff at most [`MAX_BOUNDARY_WAIT`] together, across the
+    /// start and the Commit. A free reading between them keeps the try's wait; past the budget the
+    /// Commit is refused for this try, never given a fresh 10 s, and the next check starts afresh.
+    /// Before, the start that reached the budget let the handoff go and the Commit began a new
+    /// budget, so while the item stayed in its section the Commit was never written and the
+    /// design's "at most 10 s across both" did not hold.
+    #[test]
+    fn one_item_holds_the_handoff_at_most_the_budget_across_start_and_commit() {
+        end_boundary_wait();
+        let t0 = Instant::now();
+        let item = Some(GuardedItem::SignOutSequence);
+        assert!(
+            boundary_wait_decision(item, t0).is_some(),
+            "the start follows the item in its section"
+        );
+        // The item lets go: the start goes on, and the try's wait stands.
+        assert!(boundary_wait_decision(None, t0 + Duration::from_secs(4)).is_none());
+        // Another item takes the guard after the start: the Commit follows it within what is
+        // left of the one budget...
+        let commit = boundary_wait_decision(item, t0 + Duration::from_secs(8));
+        assert!(
+            commit
+                .as_deref()
+                .is_some_and(|why| why.contains("follows it")),
+            "{commit:?}"
+        );
+        // ...and past it is refused for this try, not held for a fresh budget.
+        let commit = boundary_wait_decision(item, t0 + MAX_BOUNDARY_WAIT + Duration::from_secs(2));
+        assert!(
+            commit
+                .as_deref()
+                .is_some_and(|why| why.contains("next check")),
+            "the Commit held a fresh budget for an item the try already waited the whole budget \
+             on: {commit:?}"
+        );
+        // The updater's next check is a new try, with a new budget.
+        let next = t0 + MAX_BOUNDARY_WAIT + Duration::from_secs(30);
+        assert!(boundary_wait_decision(item, next).is_some_and(|why| why.contains("follows it")));
+        end_boundary_wait();
     }
 }
 
@@ -860,7 +949,10 @@ fn handoff_candidate_terminated(candidate: HandoffCandidate) -> bool {
     let Ok(pid) = libc::pid_t::try_from(candidate.pid) else {
         return false;
     };
-    // SAFETY: signal 0 checks process existence and permission without delivering a signal.
+    if pid <= 1 {
+        return false;
+    }
+    // SAFETY: signal 0 with `pid > 1` checks single-process existence without delivering a signal.
     if unsafe { libc::kill(pid, 0) } != 0
         && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
     {
@@ -1416,13 +1508,20 @@ impl ColdLaneBudget {
             Some("0") => Some(false),
             _ => None,
         };
-        if field("build")?.parse::<u64>().ok()? != build || field("artifact")? != artifact {
+        let uint = |s: &str| {
+            (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| s.parse::<u64>().ok())
+                .flatten()
+        };
+        if uint(field("build")?)? != build || field("artifact")? != artifact {
             return None;
         }
         let failures = (|| {
+            let cycles = field("cycles")?;
+            (!cycles.is_empty() && cycles.bytes().all(|b| b.is_ascii_digit())).then_some(())?;
             Some(CarriedFailures {
-                cycles: field("cycles")?.parse().ok()?,
-                since_secs: field("since")?.parse().ok()?,
+                cycles: cycles.parse().ok()?,
+                since_secs: uint(field("since")?)?,
                 activation: flag("activation")?,
             })
         })();
@@ -1430,7 +1529,7 @@ impl ColdLaneBudget {
             Some(CarriedVerdict {
                 resample_in_secs: match field("verdict")? {
                     "spent" => None,
-                    secs => Some(secs.parse().ok()?),
+                    secs => Some(uint(secs)?),
                 },
                 activation: flag("verdict_activation")?,
             })
@@ -1542,7 +1641,12 @@ impl ColdRelaunch {
         if updated_from? != std::ffi::OsStr::new(running) {
             return None;
         }
-        let build = build?.to_str()?.parse::<u64>().ok().filter(|b| *b != 0)?;
+        let build = build?
+            .to_str()
+            .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))?
+            .parse::<u64>()
+            .ok()
+            .filter(|b| *b != 0)?;
         let commit = commit?.to_str().filter(|c| !c.is_empty())?.to_string();
         let artifact = digest?.to_str().filter(|d| !d.is_empty())?.to_string();
         let budget = budget
@@ -2151,7 +2255,10 @@ fn run_handoff_worker(
     if handoff_preparation_cancelled(&job, &proxy, Some(nonce.clone())) {
         return;
     }
-    let child = match job.command.spawn() {
+    let spawning = aterm_uds::spawn_lock::spawning();
+    let spawned = job.command.spawn();
+    drop(spawning);
+    let child = match spawned {
         Ok(child) => child,
         Err(error) => {
             send_handoff_producer_failure(
@@ -4247,18 +4354,24 @@ impl App {
             ));
         }
         // An item that cannot be repeated safely (a sign-out click sequence, a clone's publish
-        // rename, a launchd bootstrap) holds a boundary guard; the handoff follows it, at most
-        // MAX_BOUNDARY_WAIT, then proceeds and the successor resumes it from the ledger (§6.7).
-        if let Some(reason) = boundary_guard_holds_handoff(std::time::Instant::now()) {
-            #[cfg(unix)]
-            return Err(crate::UpdateHandoffStartError::activity(reason));
-            #[cfg(not(unix))]
-            return Err(crate::UpdateHandoffStartError::refused(reason));
-        }
+        // rename, a launchd bootstrap) holds a boundary guard; the handoff is refused while it
+        // does, never cutting it in half: as activity within MAX_BOUNDARY_WAIT, one budget here
+        // and at its Commit together, and for this try past it, which the updater's next check
+        // tries again (§6.7). The latch it takes first keeps every other item out of its critical
+        // section until this handoff commits or is refused.
+        let latch = match start_at_boundary(std::time::Instant::now()) {
+            Ok(latch) => latch,
+            Err(reason) => {
+                #[cfg(unix)]
+                return Err(crate::UpdateHandoffStartError::activity(reason));
+                #[cfg(not(unix))]
+                return Err(crate::UpdateHandoffStartError::refused(reason));
+            }
+        };
         #[cfg(target_os = "macos")]
-        if self.workstation_setup.pending() {
+        if self.workstation_setup_holds_handoff() {
             return Err(crate::UpdateHandoffStartError::activity(
-                "the Mac setup offer is still open",
+                "the Mac setup offer has unfinished input or work",
             ));
         }
         #[cfg(target_os = "macos")]
@@ -4339,6 +4452,11 @@ impl App {
                 apply_attempt,
                 same_image,
             );
+            // The latch stays while the handoff is in flight, and goes when it ends
+            // (`settle_update_boundary_latch`); a handoff that did not start drops it here.
+            if started.is_ok() && self.update_handoff_in_flight() {
+                self.update_boundary_latch = Some(latch);
+            }
             if let Err(error) = &started
                 && error.held_for_read_of().is_none()
             {
@@ -4357,6 +4475,8 @@ impl App {
         #[cfg(windows)]
         {
             let _ = mode;
+            // Held until the spawn's exit, or dropped with this attempt.
+            let _latch = latch;
             let live_ptys = self.pool.iter().count();
             let facts = crate::native_update_admission::AdmissionFacts {
                 staged_verified: same_image.is_some() || apply_attempt.is_some(),
@@ -7011,7 +7131,7 @@ impl App {
             );
         }
         let exact_activity = self.update_handoff_activity_epoch == pending_activity_epoch
-            && !self.workstation_setup.pending()
+            && !self.workstation_setup_holds_handoff()
             && !self.system_state_handoff_pending()
             && self.tab_spawns.is_empty()
             && {
@@ -7396,6 +7516,10 @@ impl App {
             if let Some(begin) = self.handoff_before_egress_fence.take() {
                 begin();
             }
+            #[cfg(test)]
+            if let Some(reenter) = BEFORE_FINAL_SETUP_CHECK.take() {
+                reenter(self);
+            }
             let sinks = self
                 .pending_update_handoff
                 .as_ref()
@@ -7403,6 +7527,8 @@ impl App {
             let replies = crate::control::input_replies_of(&self.store);
             let mut claims_fence_missed = false;
             let mut write_attempted = false;
+            #[cfg(target_os = "macos")]
+            let mut cut_off_noted = false;
             let commit_result = match sinks
                 .as_deref()
                 .and_then(|sinks| fence_handoff_egress(sinks, &replies))
@@ -7418,7 +7544,20 @@ impl App {
                     // after they finish, and release before any failed-Commit rollback.
                     // Setup's pending fields are GUI-owned; the remaining write path
                     // dispatches no action or status callback that can change them.
-                    let sources = if self.system_state_handoff_pending() {
+                    // An item that cannot be cut in half and took its guard after the
+                    // handoff's start (its wait on the latch ran out, or it runs on this
+                    // thread) refuses the Commit too, as activity, so the handoff is tried
+                    // again: within what is left of the try's one MAX_BOUNDARY_WAIT it follows
+                    // the item, and past it this try ends and the updater's next check tries
+                    // again. The Commit is never written over an item in its section (§6.7).
+                    let boundary = boundary_guard_holds_handoff(std::time::Instant::now());
+                    if let Some(reason) = &boundary {
+                        aterm_log::info!("update apply: {reason}; the Commit is not written");
+                    }
+                    let sources = if boundary.is_some()
+                        || self.system_state_handoff_pending()
+                        || self.workstation_setup_holds_handoff()
+                    {
                         None
                     } else {
                         self.pending_update_handoff.as_ref().and_then(|pending| {
@@ -7429,6 +7568,14 @@ impl App {
                             )
                         })
                     };
+                    // The setup stages this Commit cuts off are noted right before it is
+                    // written, never earlier: a refusal after a note would leave it, and
+                    // aterm stopping in that stage later would not count (design §6.5).
+                    #[cfg(target_os = "macos")]
+                    if sources.is_some() {
+                        self.note_system_state_cut_off_at_commit();
+                        cut_off_noted = true;
+                    }
                     let committed = sources.as_deref().and_then(|sources| {
                         let write = || {
                             write_attempted = true;
@@ -7489,6 +7636,12 @@ impl App {
             }
             if let Some(pid) = child_pid {
                 crate::identity_claim::withdraw_successor_markers(&carried, pid);
+            }
+            // A written Commit never returns: this one did not go, so the setup stages it noted
+            // are no longer cut off.
+            #[cfg(target_os = "macos")]
+            if cut_off_noted {
+                self.take_back_system_state_cut_off();
             }
             match commit_result {
                 Some(Err(_)) => commit_write_failed = true,
@@ -9462,7 +9615,12 @@ fn handoff_proof_deadline(
 ) -> std::time::Instant {
     use crate::native_updater_service::ApplyMode;
     let ms = aterm_types::dev_seam!("ATERM_HANDOFF_PROOF_TIMEOUT_MS")
-        .and_then(|value| value.to_str()?.parse::<u64>().ok())
+        .and_then(|value| {
+            let s = value.to_str()?;
+            (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| s.parse::<u64>().ok())
+                .flatten()
+        })
         .unwrap_or(match mode {
             ApplyMode::Immediate => 30_000,
             ApplyMode::Automatic | ApplyMode::AutomaticPastGrace => match prior_physical_failures {
@@ -9478,7 +9636,12 @@ fn handoff_proof_deadline(
 #[must_use]
 fn handoff_ready_deadline() -> std::time::Instant {
     let timeout_ms = aterm_types::dev_seam!("ATERM_HANDOFF_READY_TIMEOUT_MS")
-        .and_then(|v| v.to_str()?.parse::<u64>().ok())
+        .and_then(|v| {
+            let s = v.to_str()?;
+            (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| s.parse::<u64>().ok())
+                .flatten()
+        })
         .unwrap_or(30_000)
         .clamp(1_000, 120_000);
     std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms)

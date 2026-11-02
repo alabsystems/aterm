@@ -72,6 +72,9 @@ ring = { workspace = true, features = ["alloc"] }
 # is astream-wire (dependency-free, vendor/astream), whose byte loop it runs.
 aterm-hash = { workspace = true }
 libc = { workspace = true }
+# The buffer `aterm members join` reads a typed phrase into is wiped when dropped. Already in the
+# graph through aterm-secrets, with the same (no) features.
+zeroize = { version = "1", default-features = false }
 # How each write is finished: durable (F_FULLFSYNC) or ordered (F_BARRIERFSYNC).
 aterm-durable = { workspace = true }
 # The control protocol's shared halves, so the supervisor speaks the wire the
@@ -133,6 +136,8 @@ aterm-messages = { workspace = true }
 # Exclusive owned staging directories for atomic replacements; already a test dependency,
 # first-party and zero dependencies. No new package or dependency cycle.
 aterm-tempfile = { workspace = true }
+# Background node workers report through the host's logger; this facade has no dependencies.
+aterm-log = { workspace = true }
 
 # THE HARNESS TAPE (`supervise::tape`): a supervising loop recorded so it can be
 # run again offline. Its records ARE astream-effects' `EffectRecord`s — the
@@ -177,18 +182,21 @@ aterm-zstd = { workspace = true }
 # unix, where aterm-gui already links it; on Windows it is one, a workspace
 # crate with no dependencies (its FFI is kernel32, ntdll and advapi32).
 aterm-dirfd = { workspace = true }
+# The default ALab fleet's join code is read from and published to the signed
+# vault without materializing it as a plaintext secret file. This matches
+# aterm-gui's vault dependency on every target; shared provider buffers use
+# aterm-uds's portable scrubbed type.
+aterm-secrets = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
-# `aterm fleet init|join|peers|allow|leave` (`fleet_member`): the fleet's key
+# `aterm fleet init|join|peers|allow|publish|sync|census|leave` (`fleet_member`): the fleet's key
 # file, join code, book of peers and the join's handshake and registration. Not
 # a new edge in the shipped graph — aterm-gui already links it — and unix-only,
 # as the key file's reader is.
 aterm-net = { workspace = true }
-# The default ALab fleet's join code is read from and published to the signed
-# vault without materializing it as a plaintext secret file.
-aterm-secrets = { workspace = true }
 
 [dev-dependencies]
+aterm-mail = { workspace = true }
 aterm-spec = { workspace = true }
 # The models its tests drive (a model edit rebuilds only their tests).
 aterm-models-harness = { workspace = true }

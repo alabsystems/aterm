@@ -7,6 +7,7 @@ use aterm_secrets::{
     commons::{
         binding::Request,
         constraints::Fact,
+        hearing::Version,
         journal::{Journal, Trust},
         node::{Edit, Node},
     },
@@ -17,6 +18,7 @@ struct Lab {
     dirs: [std::path::PathBuf; 2],
     trust: Trust,
     endpoints: [Arc<Endpoint>; 2],
+    recipient: aterm_secrets::age::Recipient,
     genesis: Node,
     update: Node,
 }
@@ -99,6 +101,7 @@ impl Lab {
             dirs,
             trust,
             endpoints,
+            recipient: identities[0].recipient(),
             genesis,
             update,
         }
@@ -141,8 +144,18 @@ fn one_discovered_address_repairs_both_directions_and_cancellation_drains() {
         Repair::default(),
     )
     .unwrap();
-    assert!(client.task.join().unwrap().2);
-    assert!(server.task.join().unwrap().2);
+    let (_, repair, success, round) = client.task.join().unwrap();
+    assert!(success);
+    let (actor, endpoint) = round.authenticated_endpoint().unwrap();
+    assert_eq!(Some(actor), repair.authenticated_actor());
+    assert_eq!(endpoint.address, addr);
+    assert_eq!(endpoint.observed_at_ms, round.completed_at_ms);
+    let (_, _, success, round) = server.task.join().unwrap();
+    assert!(success);
+    assert!(
+        round.authenticated_endpoint().is_none(),
+        "inbound source is not a service endpoint"
+    );
     let journal = Journal::open_existing(&lab.dirs[1], lab.trust).unwrap();
     assert!(journal.node(&lab.genesis.id()).is_some());
     assert!(journal.node(&lab.update.id()).is_some());
@@ -172,7 +185,8 @@ fn one_discovered_address_repairs_both_directions_and_cancellation_drains() {
         port: 0,
         contacts: Vec::new(),
         completed: VecDeque::new(),
-        failed: false,
+        push: None,
+        failure: None,
         bound: false,
         stand_in: None,
         permission: None,
@@ -199,6 +213,94 @@ fn one_discovered_address_repairs_both_directions_and_cancellation_drains() {
 }
 
 #[test]
+fn transferred_control_history_keeps_a_follow_up_then_yields_when_caught_up() {
+    let lab = Lab::new();
+    let mut parent = lab.update.id();
+    {
+        let mut source = Journal::open_existing(&lab.dirs[0], lab.trust).unwrap();
+        for n in 0..crate::control::RECORDS_PER_ROUND {
+            let update = Node::test_seal(
+                &[21; 32],
+                [9; 16],
+                Edit::Update {
+                    parent,
+                    hosts: &[],
+                    payload: b"control backlog",
+                },
+                std::slice::from_ref(&lab.recipient),
+                n as u64 + 1,
+                &[],
+            )
+            .unwrap();
+            source.ingest(update.bytes()).unwrap();
+            parent = update.id();
+        }
+    }
+    let listener = Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap();
+    let address = listener.local_addr().unwrap();
+    let other = SocketAddr::from(([127, 0, 0, 2], address.port()));
+    let mut transport = Transport::unopened(None, Scope::Loopback, 0).unwrap();
+    let mut now = Instant::now();
+    for (index, peer) in [address, other].into_iter().enumerate() {
+        transport.hints.observe(
+            &Hints::new([index as u8 + 71; 32]).wire(peer.port()),
+            peer,
+            now,
+        );
+    }
+    let exchange = |repair| {
+        let client = Worker::start(
+            lab.endpoints[1].clone(),
+            None,
+            Some(address),
+            Scope::Loopback,
+            repair,
+        )
+        .unwrap();
+        let server = Worker::start(
+            lab.endpoints[0].clone(),
+            Some(accept_ready(&listener)),
+            None,
+            Scope::Loopback,
+            Repair::default(),
+        )
+        .unwrap();
+        assert!(server.task.join().unwrap().2);
+        client
+    };
+
+    for received in [crate::control::RECORDS_PER_ROUND, 2, 0] {
+        let (chosen, repair) = transport.hints.next(now).unwrap();
+        assert_eq!(chosen, address, "control progress lost its follow-up");
+        transport.finish(exchange(repair), now);
+        let round = transport.reports().next().unwrap();
+        assert!(round.membership.is_none());
+        assert!(round.application.is_none());
+        assert_eq!(round.control.unwrap().received, received);
+        if received != 0 {
+            // Advance a virtual scheduler clock past the short follow-up jitter,
+            // still before the ordinary interval. No wall-clock latency budget.
+            now += Duration::from_millis(500);
+        }
+    }
+    assert_eq!(
+        transport.hints.next(now).unwrap().0,
+        other,
+        "a caught-up control peer must yield to ordinary discovery"
+    );
+    let inventory = |index: usize| {
+        Journal::open_existing(lab.dirs[index].as_path(), lab.trust)
+            .unwrap()
+            .inventory()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let expected = inventory(0);
+    assert_eq!(expected.len(), crate::control::RECORDS_PER_ROUND + 2);
+    assert_eq!(inventory(1), expected);
+}
+
+#[test]
 fn cancellation_before_socket_install_cannot_be_reversed() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let connection = Connection::connect(
@@ -221,33 +323,43 @@ fn repeated_listener_restarts_do_not_pin_failed_verified_discovery_ports() {
     let listeners: Vec<_> = (0..3)
         .map(|_| Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap())
         .collect();
-    let now = Instant::now();
+    let mut now = Instant::now();
     let mut old_addresses = Vec::new();
     for listener in &listeners[..2] {
         let address = listener.local_addr().unwrap();
         hints.observe(&Hints::new([62; 32]).wire(address.port()), address, now);
-        let (chosen, repair) = hints.next(now).unwrap();
-        assert_eq!(chosen, address);
-        let client = Worker::start(
-            lab.endpoints[1].clone(),
-            None,
-            Some(address),
-            Scope::Loopback,
-            repair,
-        )
-        .unwrap();
-        let server = Worker::start(
-            lab.endpoints[0].clone(),
-            Some(accept_ready(listener)),
-            None,
-            Scope::Loopback,
-            Repair::default(),
-        )
-        .unwrap();
-        let (_, repair, success, _) = client.task.join().unwrap();
-        assert!(server.task.join().unwrap().2);
-        assert!(success);
-        hints.finish(address, repair, success, now);
+        // Finish any real control follow-up before observing another listener.
+        // The first round copies this fixture's two nodes; the next is empty.
+        for turn in 0..2 {
+            let (chosen, repair) = hints.next(now).unwrap();
+            assert_eq!(chosen, address);
+            let client = Worker::start(
+                lab.endpoints[1].clone(),
+                None,
+                Some(address),
+                Scope::Loopback,
+                repair,
+            )
+            .unwrap();
+            let server = Worker::start(
+                lab.endpoints[0].clone(),
+                Some(accept_ready(listener)),
+                None,
+                Scope::Loopback,
+                Repair::default(),
+            )
+            .unwrap();
+            let (_, repair, success, round) = client.task.join().unwrap();
+            assert!(server.task.join().unwrap().2);
+            assert!(success);
+            let outcome = Outcome::of(success, &repair, round.control.ok());
+            hints.finish(address, repair, outcome, now);
+            if outcome != (Outcome::Repaired { transferred: true }) {
+                break;
+            }
+            assert_eq!(turn, 0, "the caught-up control round must yield");
+            now += Duration::from_millis(500);
+        }
         old_addresses.push(address);
     }
     let mut listeners = listeners;
@@ -266,9 +378,10 @@ fn repeated_listener_restarts_do_not_pin_failed_verified_discovery_ports() {
             repair,
         )
         .unwrap();
-        let (_, repair, success, _) = client.task.join().unwrap();
+        let (_, repair, success, round) = client.task.join().unwrap();
         assert!(!success);
-        hints.finish(address, repair, success, retry);
+        let outcome = Outcome::of(success, &repair, round.control.ok());
+        hints.finish(address, repair, outcome, retry);
     }
     let address = current.local_addr().unwrap();
     hints.observe(&Hints::new([63; 32]).wire(address.port()), address, retry);
@@ -298,6 +411,294 @@ fn repeated_listener_restarts_do_not_pin_failed_verified_discovery_ports() {
 
 fn loopback(endpoint: Arc<Endpoint>, port: u16, token: [u8; 32]) -> Transport {
     loopback_mode(Some(endpoint), port, token)
+}
+
+#[test]
+fn incoming_acceptance_rotates_after_a_connection_not_idle_ticks() {
+    let lab = Lab::new();
+    let mut transport = loopback(lab.endpoints[0].clone(), 0, [91; 32]);
+    let first = transport.links[0]
+        .listener
+        .as_ref()
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let listener = Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap();
+    let second = listener.local_addr().unwrap();
+    // Distinct loopback listeners stand in for two physical attachment entries.
+    transport.links.push(Link {
+        source: second.ip(),
+        listener: Some(listener),
+        hints: Multicast::bind(Ipv4Addr::LOCALHOST, GROUP, 0, Scope::Loopback).unwrap(),
+        permission: None,
+    });
+    let mut held = vec![std::net::TcpStream::connect(first).unwrap()];
+    let now = Instant::now();
+    transport.tick(now).unwrap();
+    assert_eq!(transport.workers.len(), 1);
+    // Polls with no newly accepted connection must not change who goes next.
+    for tick in 1..=3 {
+        transport
+            .tick(now + Duration::from_millis(tick * 100))
+            .unwrap();
+        assert_eq!(transport.workers.len(), 1);
+    }
+    held.push(std::net::TcpStream::connect(first).unwrap());
+    held.push(std::net::TcpStream::connect(second).unwrap());
+    transport.tick(now + Duration::from_millis(400)).unwrap();
+    let accepted: Vec<_> = transport
+        .workers
+        .iter()
+        .map(|worker| {
+            assert!(worker.incoming);
+            worker.channel.lock().unwrap().local_endpoint.unwrap()
+        })
+        .collect();
+    assert_eq!(
+        accepted,
+        [first, second],
+        "a busy first attachment took the second attachment's incoming slot"
+    );
+    transport.stop();
+    assert!(
+        transport.take_contacts().is_empty(),
+        "unproved connections grant no peer identity"
+    );
+    drop(held);
+}
+
+#[test]
+fn stalled_outgoing_repairs_leave_room_for_an_incoming_peer() {
+    let lab = Lab::new();
+    let stalled: Vec<_> = (0..4)
+        .map(|_| Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap())
+        .collect();
+    let mut transport = loopback(lab.endpoints[0].clone(), 0, [11; 32]);
+    let mut held = Vec::new();
+    for listener in &stalled[..2] {
+        transport.workers.push(
+            Worker::start(
+                lab.endpoints[0].clone(),
+                None,
+                Some(listener.local_addr().unwrap()),
+                Scope::Loopback,
+                Repair::default(),
+            )
+            .unwrap(),
+        );
+        held.push(accept_ready(listener));
+    }
+    let now = Instant::now() + Duration::from_secs(1);
+    for (index, listener) in stalled[2..].iter().enumerate() {
+        let address = listener.local_addr().unwrap();
+        transport.hints.observe(
+            &Hints::new([index as u8 + 12; 32]).wire(address.port()),
+            address,
+            now,
+        );
+    }
+    transport.tick(now).unwrap();
+    transport.tick(now + Duration::from_secs(1)).unwrap();
+    let connection = Connection::connect(
+        transport.links[0]
+            .listener
+            .as_ref()
+            .unwrap()
+            .local_addr()
+            .unwrap(),
+        Scope::Loopback,
+        Duration::from_secs(60),
+    )
+    .unwrap();
+    let peer = lab.endpoints[1].clone();
+    thread::scope(|tasks| {
+        // On an assertion failure, drop the listener and cancel its workers
+        // before the scope waits for the queued peer.
+        let mut transport = transport;
+        let incoming =
+            tasks.spawn(move || peer.exchange(connection, Side::Initiator, &mut Repair::default()));
+        transport.tick(now + Duration::from_secs(2)).unwrap();
+        assert!(
+            transport.workers.iter().any(|worker| worker.incoming),
+            "stalled outgoing repairs must leave capacity to accept a peer"
+        );
+        incoming.join().unwrap().unwrap();
+        transport.stop();
+    });
+    drop(held);
+    assert!(
+        Journal::open_existing(&lab.dirs[1], lab.trust)
+            .unwrap()
+            .node(&lab.update.id())
+            .is_some()
+    );
+}
+
+#[test]
+fn unproved_candidates_leave_an_outgoing_slot_for_an_established_peer() {
+    let lab = Lab::new();
+    let mut listeners: Vec<_> = (0..3)
+        .map(|_| Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap())
+        .collect();
+    listeners.sort_by_key(|listener| listener.local_addr().unwrap());
+    let known = listeners.pop().unwrap();
+    let address = known.local_addr().unwrap();
+    let mut transport = loopback(lab.endpoints[0].clone(), 0, [47; 32]);
+    let mut now = Instant::now();
+    transport
+        .hints
+        .observe(&Hints::new([48; 32]).wire(address.port()), address, now);
+    for turn in 0..2 {
+        let (selected, repair) = transport.hints.next(now).unwrap();
+        assert_eq!(selected, address);
+        let client = Worker::start(
+            lab.endpoints[0].clone(),
+            None,
+            Some(address),
+            Scope::Loopback,
+            repair,
+        )
+        .unwrap();
+        let server = Worker::start(
+            lab.endpoints[1].clone(),
+            Some(accept_ready(&known)),
+            None,
+            Scope::Loopback,
+            Repair::default(),
+        )
+        .unwrap();
+        let (_, repair, success, report) = client.task.join().unwrap();
+        assert!(success);
+        assert!(server.task.join().unwrap().2);
+        let outcome = Outcome::of(success, &repair, report.control.ok());
+        if turn == 1 {
+            assert_eq!(outcome, Outcome::Repaired { transferred: false });
+        }
+        transport.hints.finish(address, repair, outcome, now);
+        now += Duration::from_secs(1);
+    }
+    // A new signed update arrives only after the peer has completed a real round.
+    let update = Node::test_seal(
+        &[21; 32],
+        [9; 16],
+        Edit::Update {
+            parent: lab.update.id(),
+            hosts: &[],
+            payload: b"after the established round",
+        },
+        std::slice::from_ref(&lab.recipient),
+        0,
+        &[],
+    )
+    .unwrap();
+    Journal::open_existing(&lab.dirs[0], lab.trust)
+        .unwrap()
+        .ingest(update.bytes())
+        .unwrap();
+
+    // One unanswered candidate already holds an outgoing slot. Keep every
+    // real socket on portable 127.0.0.1; only the two queued peers need hints.
+    transport.workers.push(
+        Worker::start(
+            lab.endpoints[0].clone(),
+            None,
+            Some(listeners[0].local_addr().unwrap()),
+            Scope::Loopback,
+            Repair::default(),
+        )
+        .unwrap(),
+    );
+    let mut held = vec![accept_ready(&listeners[0])];
+    let candidate = listeners[1].local_addr().unwrap();
+    transport
+        .hints
+        .observe(&Hints::new([49; 32]).wire(candidate.port()), candidate, now);
+    transport.dial = now;
+    transport.tick(now + Duration::from_millis(300)).unwrap();
+    if transport
+        .workers
+        .iter()
+        .any(|worker| worker.target == Some(candidate))
+    {
+        held.push(accept_ready(&listeners[1]));
+    }
+    // Virtual time passes the normal retry. Neither silent TLS peer has been
+    // released: an established peer must not wait for their network deadlines.
+    transport.tick(now + Duration::from_secs(6)).unwrap();
+    assert!(
+        transport
+            .workers
+            .iter()
+            .any(|worker| worker.target == Some(address)),
+        "unproved candidates occupied the established peer's outgoing capacity"
+    );
+    let server = Worker::start(
+        lab.endpoints[1].clone(),
+        Some(accept_ready(&known)),
+        None,
+        Scope::Loopback,
+        Repair::default(),
+    )
+    .unwrap();
+    assert!(server.task.join().unwrap().2);
+    transport.stop();
+    drop(held);
+    assert!(
+        Journal::open_existing(&lab.dirs[1], lab.trust)
+            .unwrap()
+            .node(&update.id())
+            .is_some(),
+        "the established peer did not retain the new signed update"
+    );
+}
+
+#[test]
+fn pending_enrollment_uses_all_workers_without_a_listener() {
+    let lab = crate::control::enrollment::tests::Lab::new(true);
+    let endpoint = Arc::new(lab.pending());
+    let stalled: Vec<_> = (0..WORKERS)
+        .map(|_| Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap())
+        .collect();
+    let mut transport = loopback(endpoint.clone(), 0, [81; 32]);
+    assert!(transport.links.iter().all(|link| link.listener.is_none()));
+    let mut held = Vec::new();
+    for listener in &stalled[..WORKERS / 2] {
+        transport.workers.push(
+            Worker::start(
+                endpoint.clone(),
+                None,
+                Some(listener.local_addr().unwrap()),
+                Scope::Loopback,
+                Repair::default(),
+            )
+            .unwrap(),
+        );
+        held.push(accept_ready(listener));
+    }
+    let now = Instant::now() + Duration::from_secs(1);
+    for (index, listener) in stalled[WORKERS / 2..].iter().enumerate() {
+        let address = listener.local_addr().unwrap();
+        transport.hints.observe(
+            &Hints::new([index as u8 + 82; 32]).wire(address.port()),
+            address,
+            now,
+        );
+    }
+    for tick in 0..WORKERS / 2 {
+        transport
+            .tick(now + Duration::from_secs(tick as u64))
+            .unwrap();
+    }
+    assert_eq!(
+        transport.workers.len(),
+        WORKERS,
+        "a pending device has no incoming traffic to reserve workers for"
+    );
+    for listener in &stalled[WORKERS / 2..] {
+        held.push(accept_ready(listener));
+    }
+    assert_eq!(held.len(), WORKERS);
+    transport.stop();
 }
 
 #[test]
@@ -348,7 +749,8 @@ fn loopback_mode(endpoint: Option<Arc<Endpoint>>, port: u16, token: [u8; 32]) ->
         port,
         contacts: Vec::new(),
         completed: VecDeque::new(),
-        failed: false,
+        push: None,
+        failure: None,
         bound: false,
         stand_in: None,
         permission: None,
@@ -495,6 +897,43 @@ fn converge(
 }
 
 #[test]
+fn a_round_refused_before_versions_never_hides_the_round_it_lost_to() {
+    let own = Said::Version(Version::own());
+    let start = Instant::now();
+    let after = |ms| start + Duration::from_millis(ms);
+    // A crossed dial: the loser authenticated just after the round it lost to and finished
+    // first, refused at admission before versions were traded.
+    let mut contact = Contact::new([7; 48], after(2), Said::Unknown);
+    contact.heard(after(1), own);
+    assert_eq!(
+        (contact.at, contact.said, contact.said_at),
+        (after(2), own, after(1))
+    );
+    // A later round that traded nothing keeps that version, as does an older one that said
+    // nothing valid; a newer one that said nothing valid replaces it.
+    contact.heard(after(5), Said::Unknown);
+    contact.heard(after(0), Said::Nothing);
+    assert_eq!(
+        (contact.at, contact.said, contact.said_at),
+        (after(5), own, after(1))
+    );
+    contact.heard(after(3), Said::Nothing);
+    assert_eq!(
+        (contact.at, contact.said, contact.said_at),
+        (after(5), Said::Nothing, after(3))
+    );
+    // Rounds that all said nothing of their version leave nothing to record apart from the
+    // latest contact, whichever order they finished in.
+    let mut silent = Contact::new([7; 48], after(2), Said::Unknown);
+    silent.heard(after(5), Said::Unknown);
+    silent.heard(after(1), Said::Unknown);
+    assert_eq!(
+        (silent.at, silent.said, silent.said_at),
+        (after(5), Said::Unknown, after(5))
+    );
+}
+
+#[test]
 fn authenticated_transport_contacts_become_unconfirmed_retained_network_history() {
     use crate::{
         catalog::Directory,
@@ -551,18 +990,16 @@ fn authenticated_transport_contacts_become_unconfirmed_retained_network_history(
     assert!(
         contacts
             .iter()
-            .any(|(actor, _, _)| *actor == remote.request().unwrap().binding().actor())
+            .any(|contact| contact.actor == remote.request().unwrap().binding().actor())
     );
-    let (actor, at, said) = contacts.into_iter().max_by_key(|(_, at, _)| *at).unwrap();
-    assert_eq!(actor, remote.request().unwrap().binding().actor());
+    let newest = contacts
+        .into_iter()
+        .max_by_key(|contact| contact.at)
+        .unwrap();
+    assert_eq!(newest.actor, remote.request().unwrap().binding().actor());
     // The completed round traded signed versions (C26).
-    assert_eq!(
-        said,
-        aterm_secrets::commons::hearing::Said::Version(
-            aterm_secrets::commons::hearing::Version::own()
-        )
-    );
-    let contact = (actor, at);
+    assert_eq!(newest.said, Said::Version(Version::own()));
+    let contact = (newest.actor, newest.at);
     // Drive freshness from the real exchange's timestamp, not test execution speed.
     let at = contact.1;
     let wall = 100_000;
@@ -576,9 +1013,13 @@ fn authenticated_transport_contacts_become_unconfirmed_retained_network_history(
             bootstrap.trust(),
         )
         .unwrap();
-    super::super::observe_contacts(&bootstrap, &mut observer, vec![([0xff; 48], at)], || {
-        (wall, at)
-    });
+    super::super::observe_contacts(
+        &bootstrap,
+        &mut observer,
+        vec![([0xff; 48], at)],
+        &[],
+        || (wall, at),
+    );
     observer.observe(
         Visibility::Active,
         0,
@@ -587,7 +1028,38 @@ fn authenticated_transport_contacts_become_unconfirmed_retained_network_history(
         at,
     );
     assert!(published.snapshot().peers.is_empty());
-    super::super::observe_contacts(&bootstrap, &mut observer, vec![contact], || (wall, at));
+    super::super::observe_contacts(&bootstrap, &mut observer, vec![contact], &[], || (wall, at));
+    let mut round = RepairRound::panicked(Some("127.0.0.1:41384".parse().unwrap()));
+    round.actor = Some(newest.actor);
+    round.exchange_started = true;
+    round.control = Ok(crate::control::Report::default());
+    round.completed_at_ms = wall;
+    let mut wrong = round.clone();
+    wrong.actor = Some(bootstrap.request().unwrap().binding().actor());
+    let mut unknown = round.clone();
+    unknown.actor = Some([0xff; 48]);
+    super::super::observe_contacts(
+        &bootstrap,
+        &mut observer,
+        Vec::new(),
+        &[wrong, unknown],
+        || (wall, at),
+    );
+    let mut failed = round.clone();
+    failed.control = Err("failed after authentication".into());
+    super::super::observe_contacts(&bootstrap, &mut observer, Vec::new(), &[failed], || {
+        (wall, at)
+    });
+    observer.observe(Visibility::Active, 0, "before endpoint", wall, at);
+    assert!(
+        published.snapshot().peers[0]
+            .last_authenticated_endpoint
+            .is_none()
+    );
+    let endpoint = round.authenticated_endpoint().unwrap().1;
+    super::super::observe_contacts(&bootstrap, &mut observer, Vec::new(), &[round], || {
+        (wall, at)
+    });
     observer.observe(
         Visibility::Active,
         0,
@@ -599,6 +1071,10 @@ fn authenticated_transport_contacts_become_unconfirmed_retained_network_history(
     assert_eq!(live.peers.len(), 1);
     assert_eq!(live.peers[0].identity, expected);
     assert_eq!(live.peers[0].reachability, Reachability::Reachable);
+    assert_eq!(
+        live.peers[0].last_authenticated_endpoint.as_ref(),
+        Some(&endpoint)
+    );
     let slot = live.peers[0].slot;
     let last_contact = live.peers[0].last_seen_ms;
     assert_eq!(last_contact, wall);
@@ -623,6 +1099,10 @@ fn authenticated_transport_contacts_become_unconfirmed_retained_network_history(
     assert_eq!(retained.peers[0].last_seen_ms, last_contact);
     assert_eq!(retained.peers[0].reachability, Reachability::Unknown);
     assert_eq!(retained.peers[0].last_checked_ms, None);
+    assert_eq!(
+        retained.peers[0].last_authenticated_endpoint.as_ref(),
+        Some(&endpoint)
+    );
     let reopened = Observer::open(&config, published.clone()).unwrap();
     let restored = published.snapshot();
     assert_eq!(restored.observer, None);
@@ -745,7 +1225,7 @@ fn native_discovery_repairs_two_replicas_and_an_offline_replica_rejoins() {
     assert!(
         a.take_contacts()
             .iter()
-            .any(|(actor, _, _)| actor[32..] == [4; 16]),
+            .any(|contact| contact.actor[32..] == [4; 16]),
         "completed authenticated exchanges, not beacon addresses, feed the observer"
     );
     drop(b);
@@ -841,6 +1321,7 @@ fn failed_transport_observation_replaces_the_active_reason_and_retains_history()
         })
         .collect();
     transport.links[0].hints.withdraw();
+    let socket_error = transport.links[0].hints.recheck().unwrap_err().to_string();
     transport.tick(Instant::now()).unwrap();
     assert!(transport.unavailable());
     let unavailable: Vec<_> = modes
@@ -851,6 +1332,8 @@ fn failed_transport_observation_replaces_the_active_reason_and_retains_history()
             let state = handle.snapshot();
             assert_eq!(state.visibility, Visibility::Unavailable);
             assert!(!state.detail.is_empty());
+            assert!(state.detail.contains(&socket_error), "{}", state.detail);
+            assert!(state.detail.contains("127.0.0.1"), "{}", state.detail);
             assert_ne!(state.detail, active[index]);
             assert_eq!(state.peers[0].identity, identity);
             assert_eq!(state.peers[0].last_seen_ms, contact_ms);
@@ -874,6 +1357,7 @@ fn failed_transport_observation_replaces_the_active_reason_and_retains_history()
     assert!(unavailable.windows(2).all(|pair| pair[0] != pair[1]));
     transport.refresh(&[]);
     assert!(!transport.unavailable());
+    assert!(transport.failure().is_none());
     for (index, mode) in modes.iter().enumerate() {
         observe_transport(&mut observer, &transport, *mode, false);
         let state = handle.snapshot();
@@ -1009,6 +1493,52 @@ fn a_refusal_made_mid_session_is_said_whatever_peers_were_heard_before_it() {
     }
 }
 
+/// A peer whose port refuses the connection is dialed later each time, through the real tick,
+/// worker and dial: 5, 10 and 20 s apart, each plus under 2 s of jitter, where contention keeps
+/// 3-5 s. Virtual time drives the tick; only the dials themselves run. NEGATIVE CONTROL: with
+/// `Outcome::of` calling an unauthenticated dial `Busy`, the dials come 3-5 s apart.
+#[test]
+fn a_peer_that_refuses_its_connections_is_dialed_later_each_time() {
+    let lab = Lab::new();
+    let dead = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let mut transport = loopback(lab.endpoints[0].clone(), 0, [41; 32]);
+    let start = Instant::now();
+    transport
+        .hints
+        .observe(&Hints::new([42; 32]).wire(dead.port()), dead, start);
+    let mut dials = Vec::new();
+    let mut at = start;
+    while dials.len() < 4 && at < start + Duration::from_secs(44) {
+        transport.tick(at).unwrap();
+        if !transport.workers.is_empty() {
+            dials.push(at - start);
+            let until = Instant::now() + Duration::from_secs(60);
+            while !transport
+                .workers
+                .iter()
+                .all(|worker| worker.task.is_finished())
+            {
+                assert!(Instant::now() < until, "a refused dial did not finish");
+                thread::yield_now();
+            }
+            // Reaped at the same virtual instant: the next dial is due only after its wait.
+            transport.tick(at).unwrap();
+            assert!(transport.workers.is_empty(), "{dials:?}");
+        }
+        at += Duration::from_millis(100);
+    }
+    let waits: Vec<_> = dials.windows(2).map(|pair| pair[1] - pair[0]).collect();
+    let fives: Vec<_> = waits.iter().map(|wait| wait.as_secs() / 5).collect();
+    assert_eq!(fives, [1, 2, 4], "dials at {dials:?}");
+    assert!(
+        transport.reports().all(|round| round.actor.is_none()),
+        "a refused port authenticated a peer"
+    );
+}
+
 #[test]
 fn panicked_worker_releases_the_hint_slot_for_retry() {
     let lab = Lab::new();
@@ -1025,6 +1555,7 @@ fn panicked_worker_releases_the_hint_slot_for_retry() {
         incoming: false,
         target: Some(address),
         task: thread::spawn(|| panic!("intentional worker failure")),
+        started: now,
     });
     let until = now + Duration::from_secs(60);
     while !transport.workers.is_empty() {
@@ -1048,8 +1579,18 @@ fn panicked_worker_releases_the_hint_slot_for_retry() {
 fn a_bind_that_failed_after_its_socket_reached_the_lan() {
     // A socket with no address reuse holds the group's port: the join's socket binds and fails.
     let held = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
-    let transport = Transport::isolated(None, held.local_addr().unwrap().port(), None).unwrap();
+    let mut transport = Transport::isolated(None, held.local_addr().unwrap().port(), None).unwrap();
     assert_eq!(transport.interfaces(), 0, "no link opened");
     assert!(transport.bound(), "its socket was made: a LAN use");
+    assert!(transport.unavailable());
+    assert!(
+        transport.failure().unwrap().contains("multicast bind"),
+        "{:?}",
+        transport.failure()
+    );
     drop(held);
+    transport.refresh(&["127.0.0.1:0".parse().unwrap()]);
+    assert_eq!(transport.interfaces(), 1, "the released port opens");
+    assert!(!transport.unavailable());
+    assert!(transport.failure().is_none(), "no stale bind error");
 }

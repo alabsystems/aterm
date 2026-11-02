@@ -66,6 +66,7 @@ mod pet_escort_primacy;
 mod pet_follows_a_hidden_caret;
 mod pet_follows_a_running_caret;
 mod pet_holds_through_a_torn_frame;
+mod pet_jumps_are_brisk;
 mod pet_position_authority;
 mod pet_resident_standoff;
 mod pet_rests_off_the_printed_line;

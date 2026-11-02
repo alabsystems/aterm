@@ -49,6 +49,7 @@ fn cfg(dark: bool) -> MomentumGlowConfig {
         theme_fg: if dark { 0x00C8_C8D2 } else { 0x0024_292F },
         theme_bg: if dark { 0x0010_1016 } else { 0x00FF_FFFF },
         block: true,
+        bar: false,
         glyph_span: None,
         light_vivid: false,
         chosen_hue: false,

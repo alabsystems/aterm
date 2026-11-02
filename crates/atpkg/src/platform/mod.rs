@@ -53,6 +53,35 @@ pub(crate) fn create_private_new(path: &Path) -> io::Result<std::fs::File> {
     options.open(path)
 }
 
+/// Exclusively create a fresh temporary beside `path`, without opening or removing any
+/// occupied name. Only the successfully created file belongs to this operation; callers may
+/// rename or clean that returned path. A dead writer's legacy name is left intact.
+pub(crate) fn create_temp_beside(path: &Path, mode: u32) -> io::Result<(PathBuf, std::fs::File)> {
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "temporary target has no file name",
+        )
+    })?;
+    for _ in 0..8 {
+        let salt = aterm_uds::rand::hex_token::<8>()?;
+        let temp = path.with_file_name(format!(
+            ".{}.tmp.{}.{salt}",
+            name.to_string_lossy(),
+            std::process::id()
+        ));
+        match open_create_new_write(&temp, mode) {
+            Ok(file) => return Ok((temp, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "temporary names are occupied; existing files were left intact",
+    ))
+}
+
 /// Create `dir` exclusively ([`io::ErrorKind::AlreadyExists`] if present).
 pub(crate) fn make_dir_born(dir: &Path, mode: u32) -> io::Result<()> {
     #[cfg(unix)]
@@ -201,14 +230,26 @@ pub(crate) fn install_shim(
 }
 
 /// `install_shim` whose wrapper also exports `env` ([`crate::shim_env`]) before it execs the
-/// target.
+/// target. When the target sits in a store build and the env is non-empty, the build's
+/// sidecar is recorded in the same step: a launcher that reaches the binary by its own
+/// path reads its environment from there ([`crate::shim_env::of_store_binary`]), never from
+/// this shim's text, so the two records must not be left to separate callers to keep in
+/// step. An empty env records nothing: the build's declaration stands over a shim laid
+/// plain ([`crate::ops::exec_env`]), and only a landing undeclares.
 pub fn install_shim_env(
     build_bin_dir: &Path,
     tool: &crate::store::ToolName,
     shim: &Path,
     env: &crate::shim_env::ShimEnv,
 ) -> io::Result<()> {
-    install_shim_to_env(shim, &build_bin_dir.join(tool.exe_file()), env)
+    let target = build_bin_dir.join(tool.exe_file());
+    install_shim_to_env(shim, &target, env)?;
+    if !env.is_empty()
+        && let Some(build_dir) = crate::shim_env::store_build_of(&target)
+    {
+        crate::shim_env::write_sidecar(&build_dir, env)?;
+    }
+    Ok(())
 }
 
 /// The `(shim path, target)` form of `install_shim`, for callers that already hold the target path.
@@ -382,8 +423,17 @@ pub(crate) fn cmd_target_is_injection_safe(target: &Path) -> bool {
 /// The body of a Windows **tombstone** shim.
 #[cfg(any(windows, test))]
 pub(crate) fn cmd_tombstone_content(message: &str) -> String {
+    let clean: String = message
+        .chars()
+        .map(|c| match c {
+            '\u{2014}' => '-',
+            '\r' | '\n' | '\0' => ' ',
+            c if !c.is_ascii() || c.is_ascii_control() => '?',
+            c => c,
+        })
+        .collect();
     let mut s = String::from("@echo ");
-    s.push_str(&cmd_echo_escape(message));
+    s.push_str(&cmd_echo_escape(&clean));
     s.push_str(" 1>&2\r\n@exit /b 70\r\n");
     cmd_framed(&s)
 }
@@ -521,12 +571,30 @@ fn cmd_embedded_path(path: &Path) -> Option<String> {
 
 /// THE PRELUDE of an agent program's `agents/` twin and its `bin/` shim.
 #[must_use]
-pub(crate) fn twin_prelude(
+pub fn twin_prelude(
     program: &str,
     prefix: &Path,
     atpkg: Option<&Path>,
     verbs: &[&str],
     yolo: &crate::yolo::Policy,
+) -> String {
+    let launcher = if program == "codex" && !cfg!(windows) {
+        crate::native_defaults::Launcher::of_current_image(atpkg)
+    } else {
+        None
+    };
+    twin_prelude_with_launcher(program, prefix, atpkg, verbs, yolo, launcher.as_ref())
+}
+
+/// Re-render a recorded producer during whole-body inspection. Only `twin_prelude`
+/// admits a launcher to newly published shims.
+pub(crate) fn twin_prelude_with_launcher(
+    program: &str,
+    prefix: &Path,
+    atpkg: Option<&Path>,
+    verbs: &[&str],
+    yolo: &crate::yolo::Policy,
+    launcher: Option<&crate::native_defaults::Launcher>,
 ) -> String {
     if cfg!(windows) {
         return String::new();
@@ -545,7 +613,9 @@ pub(crate) fn twin_prelude(
             .collect();
         s.push_str(&sh_signin_prelude(program, row.product, gate, &skip));
     }
-    s.push_str(&sh_yolo_prelude(program, yolo, verbs));
+    s.push_str(&sh_yolo_prelude_with_launcher(
+        program, yolo, verbs, launcher,
+    ));
     #[cfg(any(unix, test))]
     s.push_str(&sh_harness_prelude(program, prefix));
     s
@@ -922,12 +992,23 @@ pub(crate) fn sh_selfupdate_prelude(
 }
 
 /// THE `--yolo` BLOCK of an agent program's twin and `bin/` shim ([`crate::yolo`]).
+#[cfg(test)]
 #[must_use]
 pub(crate) fn sh_yolo_prelude(
     program: &str,
     policy: &crate::yolo::Policy,
     skip_extra: &[&str],
 ) -> String {
+    sh_yolo_prelude_with_launcher(program, policy, skip_extra, None)
+}
+
+fn sh_yolo_prelude_with_launcher(
+    program: &str,
+    policy: &crate::yolo::Policy,
+    skip_extra: &[&str],
+    launcher: Option<&crate::native_defaults::Launcher>,
+) -> String {
+    let launcher = launcher.filter(|_| program == "codex");
     let crate::yolo::Policy {
         flags,
         markers,
@@ -980,15 +1061,32 @@ pub(crate) fn sh_yolo_prelude(
         v.push('"');
         v
     };
-    let mut s = String::from("# atpkg: yolo by default — this name runs ");
-    s.push_str(program);
-    s.push_str(" with every approval and sandbox off (");
-    s.push_str(&spelled);
-    s.push_str(
-        "); `--yolo` ahead of a literal `--` spells the same, a launch that types \
+    let mut s = String::new();
+    if launcher.is_some() {
+        s.push_str("# atpkg: the exact Codex executable decides implicit permission defaults when its compiled defaults support them; legacy builds keep the wrapper flags.\n");
+    } else {
+        s.push_str("# atpkg: yolo by default — this name runs ");
+        s.push_str(program);
+        s.push_str(" with every approval and sandbox off (");
+        s.push_str(&spelled);
+        s.push_str(
+            "); `--yolo` ahead of a literal `--` spells the same, a launch that types \
          its own posture runs as typed, and the command as run is printed on stderr \
          (aterm help pkg).\n",
-    );
+        );
+    }
+    if let Some(launcher) = launcher {
+        s.push_str(&launcher.shell_assignment());
+        s.push_str("__atpkg_codex_default=0\n");
+    }
+    let delegate = |s: &mut String| {
+        if launcher.is_some() {
+            s.push_str(
+                "  if [ -n \"$__atpkg_say\" ] && [ -x \"$__atpkg_codex_launcher\" ]; then\n    \
+                 __atpkg_codex_default=1\n    __atpkg_say=\n  fi\n",
+            );
+        }
+    };
     s.push_str(
         "__atpkg_no_harness=0\n\
          __atpkg_nh_stop=0\n\
@@ -1053,6 +1151,26 @@ pub(crate) fn sh_yolo_prelude(
         s.push_str(") __atpkg_posture=1 ;;\n");
     }
     s.push_str("  esac\ndone\n");
+    if crate::yolo::cli_name(program) == "codex" {
+        s.push_str(
+            "__atpkg_cfg_next=0\n\
+             for __atpkg_a in \"$@\"; do\n  \
+             case \"$__atpkg_a\" in --) break ;; esac\n  \
+             if [ \"$__atpkg_cfg_next\" = 1 ]; then\n    \
+             __atpkg_cfg_value=$__atpkg_a\n    __atpkg_cfg_next=0\n  \
+             else\n    case \"$__atpkg_a\" in\n      \
+             '-c'|'--config') __atpkg_cfg_next=1; continue ;;\n      \
+             '--config='*) __atpkg_cfg_value=${__atpkg_a#--config=} ;;\n      \
+             '-c'?*) __atpkg_cfg_value=${__atpkg_a#-c}; __atpkg_cfg_value=${__atpkg_cfg_value#=} ;;\n      \
+             *) continue ;;\n    esac\n  fi\n  \
+             case \"$__atpkg_cfg_value\" in\n    *=*)\n      \
+             __atpkg_cfg_key=${__atpkg_cfg_value%%=*}\n      \
+             __atpkg_cfg_key=\"${__atpkg_cfg_key#\"${__atpkg_cfg_key%%[![:space:]]*}\"}\"\n      \
+             __atpkg_cfg_key=\"${__atpkg_cfg_key%\"${__atpkg_cfg_key##*[![:space:]]}\"}\"\n      \
+             case \"$__atpkg_cfg_key\" in sandbox_mode|approval_policy) __atpkg_posture=1 ;; esac\n      \
+             ;;\n  esac\ndone\n",
+        );
+    }
     let crate::yolo::WordOptions {
         values,
         optional,
@@ -1234,9 +1352,19 @@ pub(crate) fn sh_yolo_prelude(
     if !words {
         s.push_str("  __atpkg_say=");
         s.push_str(&say(crate::yolo::DEFAULT_ECHO_PREFIX));
-        s.push_str("\n  set -- ");
+        if launcher.is_some() {
+            s.push('\n');
+            delegate(&mut s);
+            s.push_str("  if [ -n \"$__atpkg_say\" ]; then set -- ");
+        } else {
+            s.push_str("\n  set -- ");
+        }
         s.push_str(&spelled);
-        s.push_str(" \"$@\"\n");
+        s.push_str(if launcher.is_some() {
+            " \"$@\"; fi\n"
+        } else {
+            " \"$@\"\n"
+        });
     } else {
         if skip_all.is_empty() {
             s.push_str("  __atpkg_say=");
@@ -1259,6 +1387,7 @@ pub(crate) fn sh_yolo_prelude(
             s.push_str(&say(crate::yolo::DEFAULT_ECHO_PREFIX));
             s.push_str("\n  fi\n");
         }
+        delegate(&mut s);
         if after.is_empty() {
             s.push_str("  if [ -n \"$__atpkg_say\" ]; then\n    set -- ");
             s.push_str(&spelled);
@@ -1344,6 +1473,17 @@ fn sh_shim_body(
     launch: Option<&Path>,
     prelude: &str,
 ) -> String {
+    let launcher = crate::native_defaults::Launcher::recorded(prelude);
+    let native_exec = |target: &str| {
+        launcher.as_ref().map_or_else(String::new, |launcher| {
+            format!(
+                "if [ \"$__atpkg_codex_default\" = 1 ]; then exec {} {}{} 'codex' {target} -- \"$@\"; fi\n",
+                sh_shim_quote(&launcher.path),
+                if launcher.pkg { "pkg " } else { "" },
+                crate::native_defaults::VERB,
+            )
+        })
+    };
     let mut s = String::from(
         "#!/bin/sh\n# atpkg shim — exec so the tool authenticates at its real path.\n",
     );
@@ -1369,6 +1509,14 @@ fn sh_shim_body(
     let target_q = sh_shim_quote(target);
     if let Some(launch) = launch {
         let launch = sh_shim_quote(launch);
+        if launcher.is_some() {
+            s.push_str("[ -L ");
+            s.push_str(&launch);
+            s.push_str(" ] && [ -x ");
+            s.push_str(&launch);
+            s.push_str(" ] && ");
+            s.push_str(&native_exec(&launch));
+        }
         s.push_str("[ -L ");
         s.push_str(&launch);
         s.push_str(" ] && [ -x ");
@@ -1389,6 +1537,7 @@ fn sh_shim_body(
             .map_or_else(|| route.to_path_buf(), crate::compat::root_marker);
         let (r, m) = (sh_shim_quote(route), sh_shim_quote(&marker));
         s.push_str(SH_SHIM_ROUTE_NOTE);
+        let mut guards = String::new();
         for (test, path) in [
             ("[ ! -h ", &r),
             ("[ -f ", &r),
@@ -1397,15 +1546,21 @@ fn sh_shim_body(
             ("[ ! -h ", &m),
             ("[ -f ", &m),
         ] {
-            s.push_str(test);
-            s.push_str(path);
-            s.push_str(" ] && ");
+            guards.push_str(test);
+            guards.push_str(path);
+            guards.push_str(" ] && ");
         }
+        if launcher.is_some() {
+            s.push_str(&guards);
+            s.push_str(&native_exec(&r));
+        }
+        s.push_str(&guards);
         s.push_str("exec ");
         s.push_str(&r);
         s.push_str(" \"$@\"\n");
     }
     let target = target_q;
+    s.push_str(&native_exec(&target));
     s.push_str("exec ");
     s.push_str(&target);
     s.push_str(" \"$@\"\n");
@@ -1444,7 +1599,6 @@ pub(crate) fn parse_sh_shim_env(content: &str) -> crate::shim_env::ShimEnv {
 }
 
 /// Single-quote a path for the `sh` stub, escaping embedded quotes POSIX-style.
-#[cfg(any(unix, test))]
 pub(crate) fn sh_shim_quote(target: &Path) -> String {
     sh_quote_str(&target.to_string_lossy())
 }
@@ -1463,15 +1617,28 @@ pub(crate) fn sh_quote_str(s: &str) -> String {
     out
 }
 
+/// Decode one exact forward line written by the Unix shim producer. Only its single-quote
+/// spelling is accepted; shell expansion, commands and differently quoted operands are not.
+#[must_use]
+pub fn sh_exec_target(line: &str) -> Option<PathBuf> {
+    let quoted = line.strip_prefix("exec ")?.strip_suffix(" \"$@\"")?;
+    let inner = quoted.strip_prefix('\'')?.strip_suffix('\'')?;
+    let target = inner.replace("'\\''", "'");
+    (sh_quote_str(&target) == quoted).then(|| PathBuf::from(target))
+}
+
+#[cfg(unix)]
+mod probe_shim;
+#[cfg(unix)]
+pub use probe_shim::{ProbeForwarder, ProbeImage, ProbeShim, probe_shim};
+
 /// The target a Unix shim execs (its first `exec '…' "$@"` line).
 #[cfg(any(unix, test))]
 pub(crate) fn parse_sh_shim_target(content: &str) -> Option<PathBuf> {
     for line in content.lines() {
         let line = line.trim();
-        if let Some(rest) = line.strip_prefix("exec '")
-            && let Some(end) = rest.rfind("' \"$@\"")
-        {
-            return Some(PathBuf::from(rest[..end].replace("'\\''", "'")));
+        if let Some(target) = sh_exec_target(line) {
+            return Some(target);
         }
     }
     None
@@ -1625,6 +1792,20 @@ mod tests {
         assert!(c.contains("exit /b 70"), "exits 70: {c}");
         assert!(c.is_ascii(), "a .cmd tombstone is ASCII: {c}");
         assert_eq!(parse_cmd_shim_target(&c), None);
+
+        let multiline = cmd_tombstone_content("bad \u{26a0}\n@\"C:\\evil.exe\" %*\r\nmore");
+        assert!(
+            multiline.is_ascii(),
+            "all non-ASCII neutralized: {multiline}"
+        );
+        assert_eq!(parse_cmd_shim_target(&multiline), None);
+        assert_eq!(
+            multiline
+                .lines()
+                .filter(|l| l.starts_with("@echo "))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -2711,15 +2892,75 @@ mod sh_shim_tests {
             &["-sread-only", "exec", "x"][..],
             &["-a=never", "exec", "x"][..],
             &["-c", "sandbox_mode=\"read-only\"", "exec", "x"][..],
-            &["resume", "thread-id"][..],
+            &["--config", "approval_policy=\"on-request\""][..],
+            &["--config=sandbox_mode=\"workspace-write\""][..],
+            &["-csandbox_mode=\"read-only\""][..],
+            &["-c=approval_policy=\"never\""][..],
+            &["-c", " \tapproval_policy \t=\"on-request\""][..],
+            &[
+                "resume",
+                "thread-id",
+                "--config",
+                "sandbox_mode=\"read-only\"",
+            ][..],
+            &[
+                "-c",
+                "model=opus",
+                "--config=approval_policy=\"on-request\"",
+            ][..],
         ] {
             let (stdout, stderr) = run(&codex, args);
             assert_eq!(stderr, "", "{args:?}");
-            assert!(
-                !stdout.contains("--dangerously-bypass-approvals-and-sandbox"),
-                "{args:?}: {stdout}"
+            assert_eq!(
+                stdout,
+                format!(
+                    "{}\n",
+                    args.iter()
+                        .map(|arg| format!("<{arg}>"))
+                        .collect::<String>()
+                ),
+                "{args:?}"
             );
         }
+        for args in [
+            &["--model", "opus", "resume", "thread-id"][..],
+            &["-m", "opus", "fork", "thread-id"][..],
+            &["--model=opus", "resume", "thread-id"][..],
+            &["-mopus", "fork", "thread-id"][..],
+            &["--cd", "/owned/path", "resume", "thread-id"][..],
+            &["resume", "thread-id"][..],
+            &["fork", "thread-id"][..],
+            &["-c", "model_reasoning_effort=high", "resume", "thread-id"][..],
+            &[
+                "--config=model=\"sandbox_mode=read-only\"",
+                "fork",
+                "thread-id",
+            ][..],
+            &["--profile", "work", "resume", "thread-id"][..],
+        ] {
+            let (stdout, stderr) = run(&codex, args);
+            let expected = format!(
+                "<--dangerously-bypass-approvals-and-sandbox>{}\n",
+                args.iter()
+                    .map(|arg| format!("<{arg}>"))
+                    .collect::<String>()
+            );
+            assert_eq!(stdout, expected, "{args:?}");
+            assert!(stderr.starts_with(crate::yolo::DEFAULT_ECHO_PREFIX));
+        }
+        let explicit = [
+            "--yolo",
+            "-c",
+            "sandbox_mode=\"read-only\"",
+            "resume",
+            "thread-id",
+        ];
+        let (stdout, stderr) = run(&codex, &explicit);
+        assert_eq!(
+            stdout,
+            "<--dangerously-bypass-approvals-and-sandbox><-c><sandbox_mode=\"read-only\"><resume><thread-id>\n"
+        );
+        assert!(stderr.starts_with(crate::yolo::ECHO_PREFIX));
         let (stdout, stderr) = run(
             &claude,
             &["--model", "opus", "--yolo", "-p", "it's $x `y`", ""],
@@ -2780,11 +3021,6 @@ mod sh_shim_tests {
             )
         );
         for args in [
-            &["--model", "opus", "resume", "thread-id"][..],
-            &["-m", "opus", "fork", "thread-id"][..],
-            &["--model=opus", "resume", "thread-id"][..],
-            &["-mopus", "fork", "thread-id"][..],
-            &["--cd", "/owned/path", "resume", "thread-id"][..],
             &["--new-option", "value", "resume", "thread-id"][..],
             &["--image", "one.png", "two.png", "resume", "thread-id"][..],
         ] {
@@ -3306,5 +3542,49 @@ mod sh_shim_tests {
         );
         assert!(block.contains(crate::yolo::ECHO_PREFIX), "{block}");
         assert!(block.contains(crate::yolo::DEFAULT_ECHO_PREFIX), "{block}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rosetta_present_and_open_create_write_refuse_symlinks_and_enforce_mode() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = crate::testdir::dir("atpkg-platform-unix-harden-");
+        let real = root.join("real");
+        std::fs::write(&real, b"runtime").unwrap();
+        assert_eq!(rosetta_present(&real), Ok(true));
+
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(
+            rosetta_present(&link),
+            Ok(false),
+            "rosetta_present must not follow symlinks"
+        );
+        assert!(
+            open_create_write(&link, 0o600).is_err(),
+            "open_create_write must refuse symlinks"
+        );
+        assert_eq!(std::fs::read(&real).unwrap(), b"runtime");
+
+        let loose = root.join("loose");
+        std::fs::write(&loose, b"stale-longer-bytes").unwrap();
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut f = open_create_write(&loose, 0o600).unwrap();
+        f.write_all(b"fresh").unwrap();
+        drop(f);
+        assert_eq!(std::fs::read(&loose).unwrap(), b"fresh");
+        assert_eq!(
+            std::fs::symlink_metadata(&loose)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "open_create_write must tighten permissions on an existing file"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

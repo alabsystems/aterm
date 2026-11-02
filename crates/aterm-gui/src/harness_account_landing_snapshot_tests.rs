@@ -53,7 +53,8 @@ fn run(state: &aterm_spec::interp::State, action: &str) -> [(&'static str, i64);
     {
         let _held = gate.lock().unwrap();
         let pending =
-            PendingAccountLanding::observe(&idle.sid, &idle.kept, &idle.hooks, &gate).unwrap();
+            PendingAccountLanding::observe(&idle.sid, &idle.kept, &idle.hooks, None, &gate)
+                .unwrap();
         context(&a, &idle, &observed, state["before"]);
         let before = images(&a);
         let receipt = pending.record(&idle.sid, &idle.kept, &idle.hooks, &gate);
@@ -275,10 +276,11 @@ fn recorded_completion_leaves_a_newer_generation_or_attempt_intact() {
             let (a, idle) = super::account_landing::pending(same_login);
             let gate = with_kept_of(&idle.kept, |k| Arc::clone(&k.account.landing));
             let _held = gate.lock().unwrap();
-            let receipt = PendingAccountLanding::observe(&idle.sid, &idle.kept, &idle.hooks, &gate)
-                .unwrap()
-                .record(&idle.sid, &idle.kept, &idle.hooks, &gate)
-                .unwrap();
+            let receipt =
+                PendingAccountLanding::observe(&idle.sid, &idle.kept, &idle.hooks, None, &gate)
+                    .unwrap()
+                    .record(&idle.sid, &idle.kept, &idle.hooks, &gate)
+                    .unwrap();
             with_kept_of(&idle.kept, |k| {
                 if new_gate {
                     k.account.landing = Arc::new(Mutex::new(()));

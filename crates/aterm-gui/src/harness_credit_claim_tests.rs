@@ -8,7 +8,7 @@ use std::cell::Cell;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use aterm_agent::harness::credit_offers::{self, Offer, OfferId};
+use aterm_agent::harness::credit_offers::{self, Offer};
 use aterm_agent::harness::profile::NoProfile;
 use aterm_agent::supervise::Autopilot;
 
@@ -109,12 +109,15 @@ fn a_shut_gate_looks_at_nothing_and_starts_nothing() {
     }
 }
 
+/// Unix only, as the owner-only ledger a try is recorded in is (`read_ledger`); off Unix,
+/// `a_live_offer_starts_no_worker_where_no_ledger_can_be_kept` holds the refusal.
+#[cfg(unix)]
 #[test]
 fn a_live_offer_is_recorded_before_its_worker_and_tried_once() {
     let fx = Fixture::new(&profile_text(false));
     let (stepped, started) = fx.look(OPEN, NOW_MS);
     assert_eq!(started.len(), 1);
-    assert_eq!(started[0].id, OfferId::CloudCredit);
+    assert_eq!(started[0].id, credit_offers::OfferId::CloudCredit);
     assert_eq!(stepped, Stepped::Started(started.clone()));
     let book = read_ledger(&fx.ledger).expect("a ledger");
     assert_eq!(
@@ -143,6 +146,9 @@ fn a_live_offer_is_recorded_before_its_worker_and_tried_once() {
     );
 }
 
+/// Unix only, as the owner-only ledger a try is recorded in is (`read_ledger`); off Unix,
+/// `a_live_offer_starts_no_worker_where_no_ledger_can_be_kept` holds the refusal.
+#[cfg(unix)]
 #[test]
 fn an_offer_is_tried_again_once_after_a_week_while_it_stands() {
     let fx = Fixture::new(&profile_text(false));
@@ -166,6 +172,9 @@ fn an_offer_is_tried_again_once_after_a_week_while_it_stands() {
     }
 }
 
+/// Unix only, as the owner-only ledger a try is recorded in is (`read_ledger`); off Unix,
+/// `a_live_offer_starts_no_worker_where_no_ledger_can_be_kept` holds the refusal.
+#[cfg(unix)]
 #[test]
 fn an_offer_gone_by_its_retry_is_not_tried_again() {
     let fx = Fixture::new(&profile_text(false));
@@ -192,6 +201,9 @@ fn nothing_live_starts_nothing_and_an_unmoved_profile_is_not_parsed_again() {
     assert_eq!(fx.parses.get(), 1, "no file: nothing to parse");
 }
 
+/// Unix only, as the owner-only ledger a try is recorded in is (`read_ledger`); off Unix,
+/// `a_live_offer_starts_no_worker_where_no_ledger_can_be_kept` holds the refusal.
+#[cfg(unix)]
 #[test]
 fn an_unrecordable_try_starts_no_worker() {
     let fx = Fixture::new(&profile_text(false));
@@ -207,6 +219,18 @@ fn an_unrecordable_try_starts_no_worker() {
     let (stepped, started) = fx.look(OPEN, NOW_MS);
     assert!(matches!(stepped, Stepped::Unrecorded(_)), "{stepped:?}");
     assert!(started.is_empty(), "an unreadable ledger tries nothing");
+}
+
+/// Where no owner-only file can be kept (off Unix), no try can be recorded, so a live offer is
+/// never tried: the look is unrecorded, starts no worker and writes nothing.
+#[cfg(not(unix))]
+#[test]
+fn a_live_offer_starts_no_worker_where_no_ledger_can_be_kept() {
+    let fx = Fixture::new(&profile_text(false));
+    let (stepped, started) = fx.look(OPEN, NOW_MS);
+    assert!(matches!(stepped, Stepped::Unrecorded(_)), "{stepped:?}");
+    assert!(started.is_empty(), "no record, no worker");
+    assert!(!fx.ledger.exists(), "nothing written");
 }
 
 #[test]

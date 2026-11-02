@@ -4,6 +4,12 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/util/cursor.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
+// Modified by the aterm project in 2026; see the repository NOTICE. (A window shows one of the
+// named icons aterm sets: custom cursor images and the hidden cursor are cut. A cursor that cannot
+// be set is reported, not a panic: `XConnection::report`; none is loaded once the connection is
+// broken: `set_cursor_icon`. The cursors follow the resource database's theme and size as it
+// changes: `follow_cursor_settings`.)
+
 use std::ffi::{CStr, CString};
 use std::iter;
 
@@ -27,7 +33,10 @@ impl CursorSettings {
         let value = |name| database.get_string(name, "").map(str::trim).filter(|v| !v.is_empty());
         CursorSettings {
             theme: value("Xcursor.theme").map(str::to_owned),
-            size: value("Xcursor.size").and_then(|size| size.parse().ok()).filter(|&s| s > 0),
+            size: value("Xcursor.size")
+                .filter(|size| size.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|size| size.parse().ok())
+                .filter(|&s| s > 0),
         }
     }
 }

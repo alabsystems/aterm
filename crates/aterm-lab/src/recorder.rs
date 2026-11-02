@@ -128,8 +128,12 @@ pub fn main(args: &[String]) -> i32 {
 #[must_use]
 pub fn hold(args: &[String]) -> i32 {
     let (Some(port), Some(secs)) = (
-        args.first().and_then(|p| p.parse::<u16>().ok()),
-        args.get(1).and_then(|s| s.parse::<u64>().ok()),
+        args.first()
+            .filter(|p| p.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|p| p.parse::<u16>().ok()),
+        args.get(1)
+            .filter(|s| s.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|s| s.parse::<u64>().ok()),
     ) else {
         eprintln!("usage: aterm-lab hold <port> <secs>");
         return 2;

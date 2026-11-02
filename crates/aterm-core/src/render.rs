@@ -54,6 +54,14 @@ pub enum BloomGate {
     /// The trail's own lights are drawn whole; only their blur and crown are
     /// withheld near the text.
     SparesLetters,
+    /// The page's text holds the bloom ([`Self::Held`]), and the post pass
+    /// left, the SDR crown, takes no light from within its reach of a lettered
+    /// cell ([`Self::SparesLetters`]): a dim page's letter keeps the share of
+    /// its own reading the letter guard weighed on the light the frame
+    /// composites, and the crown screened Beam's light over a selected row's
+    /// letter on the dim grey from 97.1% of its own reading to 95.8% (round
+    /// 27).
+    HeldSparesLetters,
 }
 
 impl BloomGate {
@@ -64,13 +72,15 @@ impl BloomGate {
         if held { Self::Held } else { Self::Open }
     }
 
-    /// [`Self::Held`] when `held`, else [`Self::SparesLetters`] when `spares`,
-    /// else [`Self::Open`].
+    /// The gate whose bloom is `held` and whose post passes `spares` the
+    /// letters: [`Self::HeldSparesLetters`], [`Self::Held`],
+    /// [`Self::SparesLetters`] or [`Self::Open`].
     #[must_use]
     #[inline]
     pub const fn sparing(held: bool, spares: bool) -> Self {
         match (held, spares) {
-            (true, _) => Self::Held,
+            (true, true) => Self::HeldSparesLetters,
+            (true, false) => Self::Held,
             (false, true) => Self::SparesLetters,
             (false, false) => Self::Open,
         }
@@ -80,14 +90,14 @@ impl BloomGate {
     #[must_use]
     #[inline]
     pub const fn held(self) -> bool {
-        matches!(self, Self::Held)
+        matches!(self, Self::Held | Self::HeldSparesLetters)
     }
 
     /// Whether the post passes keep their source off the lettered cells.
     #[must_use]
     #[inline]
     pub const fn spares_letters(self) -> bool {
-        matches!(self, Self::SparesLetters)
+        matches!(self, Self::SparesLetters | Self::HeldSparesLetters)
     }
 }
 

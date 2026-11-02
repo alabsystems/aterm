@@ -402,6 +402,23 @@ fn complete_read(generation: u64, read: impl FnOnce() -> ResultRows) -> Completi
 }
 
 #[cfg(test)]
+impl App {
+    /// Hold every account read in flight, as the worker had not answered yet.
+    pub(crate) fn hold_account_menu_reads_for_test(&mut self) {
+        self.account_menu_read.hold_for_test = true;
+    }
+
+    /// Answer the account read in flight with `rows`, as the worker would: whether one was.
+    pub(crate) fn complete_account_menu_read_for_test(&mut self, rows: ResultRows) -> bool {
+        let Some(generation) = self.account_menu_read.in_flight else {
+            return false;
+        };
+        self.on_account_menu_read(Completion { generation, rows });
+        true
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use aterm_agent::harness::footer::FooterFacts;

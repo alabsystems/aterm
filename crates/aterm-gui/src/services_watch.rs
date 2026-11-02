@@ -309,7 +309,7 @@ impl crate::App {
             crate::tab_spawn::SpawnPlace::Tab,
             crate::tab_spawn::SpawnAsk {
                 unasked: true,
-                exec_command: Some(crate::clt_install::waiting_shell_command()),
+                exec_command: Some(waiting_shell_command()),
                 ..crate::tab_spawn::SpawnAsk::default()
             },
             crate::tab_spawn::TabSpawnThen::Run(Box::new(move |app, landed| match landed {
@@ -323,6 +323,15 @@ impl crate::App {
         );
         true
     }
+}
+
+/// The restart tab's program: a plain `/bin/sh` that sources no `ENV` or `BASH_ENV` file, waiting
+/// for the line typed into the tab once it lands.
+fn waiting_shell_command() -> Vec<std::ffi::OsString> {
+    ["/usr/bin/env", "-u", "ENV", "-u", "BASH_ENV", "/bin/sh"]
+        .into_iter()
+        .map(Into::into)
+        .collect()
 }
 
 /// Starts the background watcher thread, in the installed app on macOS only: a lab instance,

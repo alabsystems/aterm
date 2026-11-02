@@ -75,17 +75,23 @@ pub fn look(hang: Duration) -> Look {
     }
 }
 
-/// One `ps` of `daemon`'s pool, under `hang`.
+/// One `ps` of `daemon`'s pool, under `hang`. A program, not an in-process read: `/bin/ps` is
+/// setuid root, and libproc answers an unprivileged read of a root process's workqueue `EPERM`
+/// (M29 of `docs/DESIGN-leftover-processes-2026-10-16.md`); `-p` with no argument column does
+/// not hang in the wedge it reads.
 #[cfg(target_os = "macos")]
 fn read_daemon(daemon: Daemon, hang: Duration) -> Option<Reading> {
     let mut cmd = crate::spawnfd::command("/bin/ps");
     cmd.args(["-o", "wq=,wql=", "-p", &daemon.pid.to_string()])
         .env("LC_ALL", "C");
-    let out =
-        crate::deadline::outputs_until(&mut [&mut cmd], std::time::Instant::now() + hang, PS_REAP)
-            .into_iter()
-            .next()?
-            .ok()?;
+    let out = crate::deadline::outputs_until(
+        &mut [&mut cmd],
+        crate::deadline::saturating_after(std::time::Instant::now(), hang),
+        PS_REAP,
+    )
+    .into_iter()
+    .next()?
+    .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -107,7 +113,11 @@ pub fn parse(out: &str) -> Option<(u64, bool)> {
         return None;
     }
     let mut words = line.split_whitespace();
-    let workers = words.next()?.parse::<u64>().ok()?;
+    let workers = words
+        .next()
+        .filter(|w| !w.is_empty() && w.bytes().all(|b| b.is_ascii_digit()))?
+        .parse::<u64>()
+        .ok()?;
     let limit = words.next()?;
     if words.next().is_some() {
         return None;
@@ -134,6 +144,7 @@ mod tests {
         assert_eq!(parse("WQ WQL\n 1 -\n"), None);
         assert_eq!(parse(" 1 -\n 2 -\n"), None);
         assert_eq!(parse(" x -\n"), None);
+        assert_eq!(parse(" +1 -\n"), None);
         assert_eq!(parse(" 1 ?\n"), None);
         assert_eq!(parse(" 1\n"), None);
         assert_eq!(parse(" 1 - 3\n"), None);

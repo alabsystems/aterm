@@ -49,7 +49,11 @@ pub fn read_bytes(path: &str) -> std::io::Result<Vec<u8>> {
 /// [`read_bytes`] with a caller's bound, for a release's `SHA256SUMS`.
 pub fn read_bytes_up_to(path: &str, cap: u64) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
-    let f = std::fs::File::open(path)?;
+    let mut open = std::fs::OpenOptions::new();
+    open.read(true);
+    #[cfg(unix)]
+    open.custom_flags(libc::O_NONBLOCK);
+    let f = open.open(path)?;
     let ft = f.metadata()?.file_type();
     if !ft.is_file() {
         return Err(std::io::Error::other(concat(&[
@@ -76,10 +80,9 @@ pub fn read_bytes_up_to(path: &str, cap: u64) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Write `bytes` to `path`, the one plain-file-write site.
+/// Write `bytes` to `path` atomically and durably.
 pub fn write_bytes(path: &str, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write as _;
-    std::fs::File::create(path)?.write_all(bytes)
+    write_bytes_atomic(path, bytes)
 }
 
 /// Replace `path` atomically via a synced sibling temporary ([`stage_sibling_temp_with_mode`]).
@@ -307,6 +310,21 @@ mod tests {
         let fresh = dir.join("new.rs").to_str().unwrap().to_string();
         write_bytes_atomic(&fresh, b"hello").unwrap();
         assert_eq!(std::fs::read(&fresh).unwrap(), b"hello");
+
+        let link = dir.join("sig-link.sig");
+        std::os::unix::fs::symlink(&fresh, &link).unwrap();
+        let _ = recording.take();
+        write_bytes(link.to_str().unwrap(), b"detached-sig").unwrap();
+        assert_eq!(recording.take(), [aterm_durable::Flush::Durable; 2]);
+        assert!(
+            !std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "write_bytes replaces a symlink rather than writing through it"
+        );
+        assert_eq!(std::fs::read(&fresh).unwrap(), b"hello");
+        assert_eq!(std::fs::read(&link).unwrap(), b"detached-sig");
     }
 
     /// A parent obstructed before staging fails without changing the original, even as root.
@@ -371,6 +389,18 @@ mod tests {
         let mib_err = read_bytes(&path).unwrap_err();
         assert!(mib_err.to_string().contains("1 MiB read cap"), "{mib_err}");
         assert!(read_bytes(dir.to_str().unwrap()).is_err(), "a directory");
+        let fifo = dir.join("pipe");
+        let fifo_str = fifo.to_str().unwrap().to_string();
+        let c_fifo = std::ffi::CString::new(fifo_str.as_str()).unwrap();
+        // SAFETY: `c_fifo` is a valid NUL-terminated path owned across `mkfifo`.
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+        let fifo_err = read_bytes(&fifo_str).unwrap_err();
+        assert!(
+            fifo_err
+                .to_string()
+                .contains("is a FIFO, not a regular file"),
+            "{fifo_err}"
+        );
     }
 
     /// Mutation check: with a fixed temporary name the write below fails with EEXIST.

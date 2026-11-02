@@ -1255,7 +1255,6 @@ fn three_rapid_serious_mode_intents_rebase_through_each_completion() {
             NativeConfigOrigin::SeriousMode { desired } => desired,
             NativeConfigOrigin::View { .. }
             | NativeConfigOrigin::Control { .. }
-            | NativeConfigOrigin::Presence { .. }
             | NativeConfigOrigin::ThemeChoice { .. }
             | NativeConfigOrigin::StatsBars { .. }
             | NativeConfigOrigin::DeckSize { .. }
@@ -1327,7 +1326,6 @@ fn three_rapid_serious_mode_intents_rebase_through_each_completion() {
                 NativeConfigOrigin::SeriousMode { desired } => desired,
                 NativeConfigOrigin::View { .. }
                 | NativeConfigOrigin::Control { .. }
-                | NativeConfigOrigin::Presence { .. }
                 | NativeConfigOrigin::ThemeChoice { .. }
                 | NativeConfigOrigin::StatsBars { .. }
                 | NativeConfigOrigin::DeckSize { .. }
@@ -3860,53 +3858,6 @@ fn a_later_refusal_of_another_cause_names_the_standing_block() {
             "{cause:?}: released by its own cause's evidence"
         );
     }
-}
-
-/// The OS banner of an update-health announcement is owed to one cause: the copy in Applications
-/// is not the signed release, so no lane can install over it until the owner acts
-/// (`NeedsPerson`).
-#[cfg(unix)]
-#[test]
-fn the_health_banner_is_posted_for_an_install_only_the_owner_can_mend() {
-    use crate::messages_host::UPDATE_HEALTH_BANNERS;
-    use crate::update_apply_trouble::{ApplyRetry, PersonRemedy};
-    use crate::update_words::HealthKind;
-    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
-    let take = || UPDATE_HEALTH_BANNERS.with(|b| std::mem::take(&mut *b.borrow_mut()));
-    let title = aterm_update::health_failing_title("apply");
-    let body = "3 failed attempts to install in a row since 2026-09-24T01:00:00Z: why.";
-    let mut app = App::headless_for_test();
-    app.config.desktop_alerts = Some(true);
-    app.native_updater_service = NativeUpdaterService::new(10, "test", true);
-    stage_one_build_for_test(&mut app, 11);
-    assert!(!matches!(
-        app.apply_retry_for(Some(11)),
-        ApplyRetry::NeedsPerson(_)
-    ));
-    let _ = take();
-    assert!(!app.post_update_health_banner(HealthKind::Install, title, body));
-    assert!(take().is_empty(), "the lane will try again");
-    app.block_native_auto_apply_environment(11, [0xab; 32], EnvironmentBlockCause::InstalledSource);
-    assert_eq!(
-        app.apply_retry_for(Some(11)),
-        ApplyRetry::NeedsPerson(PersonRemedy::InstallSignedRelease)
-    );
-    assert!(app.post_update_health_banner(HealthKind::Install, title, body));
-    let posted = take();
-    assert_eq!(posted.len(), 1, "{posted:?}");
-    for kind in HealthKind::ALL
-        .into_iter()
-        .filter(|k| *k != HealthKind::Install)
-    {
-        assert!(
-            !app.post_update_health_banner(kind, title, body),
-            "{kind:?}"
-        );
-    }
-    assert!(take().is_empty());
-    app.config.desktop_alerts = Some(false);
-    assert!(!app.post_update_health_banner(HealthKind::Install, title, body));
-    assert!(take().is_empty(), "desktop_alerts off decides last");
 }
 
 #[test]
@@ -7872,9 +7823,9 @@ fn tab_walks_the_whole_settings_list() {
 }
 
 /// TAB WALKS SYSTEM STATE'S WHOLE LIST, as it walks a Settings list: from
-/// the last control the list's screen shows, Tab goes on to the groups under
-/// it and the vault's fields, each scrolled into view, then out of the list
-/// and round to its first control again.
+/// the last control the list's screen shows, Tab goes on to the lines under
+/// it, the open line's vault fields and the lines after it, each scrolled into
+/// view, then out of the list and round to its first control again.
 #[test]
 fn tab_walks_the_whole_system_state_list() {
     use crate::native_ui::UiKey;
@@ -7885,35 +7836,45 @@ fn tab_walks_the_whole_system_state_list() {
     window.cols = 100;
     assert!(app.open_system_state_tab());
     app.native_runtime
-        .publish_system_state(crate::system_state::fixture_status("vault").expect("a scenario"));
+        .publish_system_state(crate::system_state::fixture_status("set-up").expect("a scenario"));
     let (_, view) = app
         .active_native_view(wid)
         .expect("active System State view");
-    // The person opened the vault's fields under its row.
-    app.dispatch_native_view_event(
-        wid,
-        view,
-        crate::native_app::AppEvent::Action(crate::native_app::ActionInvocation {
-            id: crate::native_ui::ActionId::new("system-state/row/secrets/disclose"),
-            value: None,
-        }),
-    )
-    .unwrap();
+    // The person opened Secrets & identity, then the fields of another vault under its row.
+    for key in [
+        "system-state/line/secrets/disclose",
+        "system-state/row/secrets/disclose",
+    ] {
+        app.dispatch_native_view_event(
+            wid,
+            view,
+            crate::native_app::AppEvent::Action(crate::native_app::ActionInvocation {
+                id: crate::native_ui::ActionId::new(key),
+                value: None,
+            }),
+        )
+        .unwrap();
+    }
     let compiled = app.compiled_native_ui(wid).unwrap();
-    // Every group's choice, then the vault's disclosure, fields and Join.
+    // Each line's disclosure and switch, the open line's vault fields and Join among them.
     let stops: Vec<&str> = compiled.list_stops.iter().map(UiKey::as_str).collect();
     assert_eq!(
         stops,
         [
-            "system-state/group/0/set-up",
-            "system-state/group/1/set-up",
-            "system-state/group/2/set-up",
-            "system-state/group/3/set-up",
-            "system-state/group/4/set-up",
+            "system-state/line/mac/disclose",
+            "system-state/line/mac/switch",
+            "system-state/line/permissions/disclose",
+            "system-state/line/permissions/switch",
+            "system-state/line/secrets/disclose",
+            "system-state/line/secrets/switch",
             "system-state/row/secrets/disclose",
             "system-state/url",
             "system-state/password",
             "system-state/vault/join",
+            "system-state/line/developer/disclose",
+            "system-state/line/developer/switch",
+            "system-state/line/accounts/disclose",
+            "system-state/line/accounts/switch",
         ]
     );
     let stops = compiled.list_stops.clone();
@@ -10005,7 +9966,8 @@ fn a_controllers_macro_replay_reads_none_of_the_persons_typing() {
 /// A CONTROL CLIENT'S C-s C-s RECALLS NONE OF THE PERSON'S SEARCHES: the person searches an
 /// Editor document for `hunter2` (not in it) and accepts; a control client's `key ctrl+s`
 /// `key ctrl+s` recalls a query of the client's own (none), so the minibuffer it reads (`inspect`
-/// shows its value) never gets the person's typed query; the person's C-s C-s recalls it.
+/// shows its value) never gets the person's typed query; the person's C-s C-s recalls it. On
+/// Windows, where C-s saves, the search chord is M-s (amacs' `WINDOWS_CHORDS`), and the same holds.
 /// NEGATIVE CONTROL: with amacs' `remembered_search` mutated to pick the person's query for
 /// every input (main's one query per view, `147b22abdc`), the client's C-s C-s opened the search
 /// on the person's `hunter2`.
@@ -10031,7 +9993,13 @@ fn a_controllers_search_recall_reads_none_of_the_persons_queries() {
         let ev = crate::control::parse_key(key).expect("a key");
         let _ = app.input(wid, ev, Source::Controller);
     };
-    let c_s = || editor_key(Key::Character('s'), Modifiers::CTRL);
+    // This platform's search chord: M-s on Windows, where C-s saves.
+    let (search, chord) = if cfg!(windows) {
+        (Modifiers::ALT, "alt+s")
+    } else {
+        (Modifiers::CTRL, "ctrl+s")
+    };
+    let c_s = || editor_key(Key::Character('s'), search);
     person(&mut app, c_s());
     person(&mut app, InputEvent::Text(SECRET.to_string()));
     person(
@@ -10040,8 +10008,8 @@ fn a_controllers_search_recall_reads_none_of_the_persons_queries() {
     );
     assert_eq!(recalled(&app), None, "PRECONDITION: the person accepted it");
 
-    client(&mut app, "ctrl+s");
-    client(&mut app, "ctrl+s");
+    client(&mut app, chord);
+    client(&mut app, chord);
     assert_eq!(recalled(&app).as_deref(), Some(""), "the client's C-s C-s");
     client(&mut app, "ctrl+g");
     assert_eq!(recalled(&app), None, "the client's C-g");

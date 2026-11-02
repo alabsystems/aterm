@@ -1091,8 +1091,11 @@ impl Host for System {
 
     fn developer_id(&self, path: &Path, team: &str) -> Result<(), String> {
         let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        let deadline =
-            std::time::Instant::now() + aterm_update_core::codesign::verify_timeout_for(len);
+        let now = std::time::Instant::now();
+        let wait = aterm_update_core::codesign::verify_timeout_for(len);
+        let deadline = now
+            .checked_add(wait)
+            .unwrap_or_else(|| now + std::time::Duration::from_secs(365 * 24 * 3600));
         aterm_update_core::codesign::verify_developer_id_until(path, team, false, deadline)
             .map_err(|e| e.to_string())
     }

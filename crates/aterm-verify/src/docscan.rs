@@ -59,14 +59,25 @@ pub const NOT_RUST: [&str; 34] = [
 pub fn src_holds_a_doctest(src: &Path) -> bool {
     let mut files: Vec<PathBuf> = Vec::new();
     let mut dirs = vec![src.to_path_buf()];
+    let mut seen_dirs: BTreeSet<PathBuf> =
+        BTreeSet::from([src.canonicalize().unwrap_or_else(|_| normalized(src))]);
     while let Some(dir) = dirs.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             return true;
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let Ok(entry) = entry else {
+                return true;
+            };
             let path = entry.path();
-            if entry.file_type().is_ok_and(|t| t.is_dir()) {
-                dirs.push(path);
+            let Ok(meta) = std::fs::metadata(&path) else {
+                return true;
+            };
+            if meta.is_dir() {
+                let key = path.canonicalize().unwrap_or_else(|_| normalized(&path));
+                if seen_dirs.insert(key) {
+                    dirs.push(path);
+                }
             } else if path.extension().is_some_and(|e| e == "rs") {
                 files.push(normalized(&path));
             }
@@ -128,31 +139,99 @@ pub enum Pull {
 pub fn pulled_in(text: &str) -> Option<Vec<Pull>> {
     const CALL_LINES: usize = 8;
     let lines: Vec<&str> = text.lines().collect();
-    let literal = |rest: &str| Some(rest.strip_prefix('"')?.split('"').next()?.to_string());
     let mut v = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         let t = line.trim_start();
-        if let Some(r) = t.strip_prefix("#[path") {
-            v.push(Pull::Beside(literal(
-                r.trim_start().strip_prefix('=')?.trim_start(),
-            )?));
-        } else if t.starts_with("include!(") {
-            let call: String = lines[i..]
+        if let Some(attr) = t.strip_prefix("#[").map(str::trim_start) {
+            if let Some(r) = attr
+                .strip_prefix("path")
+                .filter(|r| r.starts_with(char::is_whitespace) || r.starts_with('='))
+            {
+                let rhs = r.trim_start().strip_prefix('=')?.trim_start();
+                v.push(Pull::Beside(parse_string_literal(rhs)?.0.to_string()));
+            } else if attr.starts_with("cfg_attr")
+                && let Some(path_rhs) = cfg_attr_path_rhs(attr)
+            {
+                v.push(Pull::Beside(parse_string_literal(path_rhs)?.0.to_string()));
+            }
+        } else if let Some(after_inc) = t.strip_prefix("include!")
+            && after_inc.trim_start().starts_with(['(', '[', '{'])
+        {
+            let joined = lines[i..]
                 .iter()
                 .take(CALL_LINES)
-                .flat_map(|l| l.chars())
-                .filter(|c| !c.is_whitespace())
-                .collect();
-            let rest = call.strip_prefix("include!(")?;
-            v.push(
-                match rest.strip_prefix("concat!(env!(\"CARGO_MANIFEST_DIR\"),") {
-                    Some(lit) => Pull::InCrate(literal(lit)?),
-                    None => Pull::Beside(literal(rest)?),
-                },
-            );
+                .copied()
+                .collect::<Vec<_>>()
+                .join(" ");
+            v.push(parse_include_call(&joined)?);
         }
     }
     Some(v)
+}
+
+fn parse_string_literal(rest: &str) -> Option<(&str, &str)> {
+    let rest = rest.trim_start();
+    if let Some(after_r) = rest.strip_prefix('r') {
+        let hashes = after_r.bytes().take_while(|&b| b == b'#').count();
+        let body = after_r[hashes..].strip_prefix('"')?;
+        let close = format!("\"{}", "#".repeat(hashes));
+        let end = body.find(&close)?;
+        return Some((&body[..end], &body[end + close.len()..]));
+    }
+    let body = rest.strip_prefix('"')?;
+    let end = closing_quote(body)?;
+    Some((&body[..end], &body[end + 1..]))
+}
+
+fn cfg_attr_path_rhs(attr: &str) -> Option<&str> {
+    let mut from = 0;
+    while let Some(at) = attr[from..].find("path") {
+        let idx = from + at;
+        from = idx + 4;
+        let before = attr[..idx].trim_end();
+        if !before.ends_with([',', '(']) {
+            continue;
+        }
+        let after = &attr[from..];
+        if let Some(rhs) = after.trim_start().strip_prefix('=')
+            && !rhs.starts_with('=')
+        {
+            return Some(rhs.trim_start());
+        }
+    }
+    None
+}
+
+fn strip_open_delim(s: &str) -> Option<&str> {
+    let s = s.trim_start();
+    s.strip_prefix('(')
+        .or_else(|| s.strip_prefix('['))
+        .or_else(|| s.strip_prefix('{'))
+}
+
+fn strip_close_delim(s: &str) -> Option<&str> {
+    let s = s.trim_start();
+    s.strip_prefix(')')
+        .or_else(|| s.strip_prefix(']'))
+        .or_else(|| s.strip_prefix('}'))
+}
+
+fn parse_include_call(joined: &str) -> Option<Pull> {
+    let rest = joined.trim_start().strip_prefix("include!")?;
+    let rest = strip_open_delim(rest)?.trim_start();
+    if let Some(after_concat) = rest.strip_prefix("concat!") {
+        let inner = strip_open_delim(after_concat)?.trim_start();
+        let after_env = inner.strip_prefix("env!")?;
+        let env_inner = strip_open_delim(after_env)?.trim_start();
+        let (key, after_key) = parse_string_literal(env_inner)?;
+        if key != "CARGO_MANIFEST_DIR" {
+            return None;
+        }
+        let after_env_call = strip_close_delim(after_key)?.trim_start();
+        let lit_rest = after_env_call.strip_prefix(',')?.trim_start();
+        return Some(Pull::InCrate(parse_string_literal(lit_rest)?.0.to_string()));
+    }
+    Some(Pull::Beside(parse_string_literal(rest)?.0.to_string()))
 }
 
 /// Does `text` hold a doctest rustdoc would compile?
@@ -473,5 +552,43 @@ mod tests {
         );
         std::fs::write(src.join("lib.rs"), "include!(\"../../b/src/gone.rs\");\n").expect("write");
         assert!(src_holds_a_doctest(&src), "an unreadable pull fails wide");
+    }
+
+    #[test]
+    fn pulled_in_handles_raw_strings_cfg_attr_and_alternate_include_delimiters() {
+        let text = "#[path = r\"a/b.rs\"]\nmod b;\n\
+                    #[cfg_attr(unix, path = r#\"c/d.rs\"#)]\nmod d;\n\
+                    include! [r\"e.rs\"];\n\
+                    include!{concat![env!(\"CARGO_MANIFEST_DIR\"), r\"/src/f.rs\"]}\n";
+        assert_eq!(
+            pulled_in(text),
+            Some(vec![
+                Pull::Beside("a/b.rs".to_string()),
+                Pull::Beside("c/d.rs".to_string()),
+                Pull::Beside("e.rs".to_string()),
+                Pull::InCrate("/src/f.rs".to_string()),
+            ])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn src_holds_a_doctest_follows_symlinked_subdirectories_and_handles_cycles() {
+        let tmp = aterm_tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("a/src");
+        let ext = tmp.path().join("ext");
+        std::fs::create_dir_all(&src).expect("mkdir");
+        std::fs::create_dir_all(&ext).expect("mkdir");
+        std::fs::write(src.join("lib.rs"), "pub fn plain() {}\n").expect("write");
+        std::fs::write(ext.join("sub.rs"), "pub fn no_doc() {}\n").expect("write");
+        std::os::unix::fs::symlink(&ext, src.join("linked")).expect("symlink");
+        std::os::unix::fs::symlink(&src, ext.join("cycle")).expect("cycle symlink");
+        assert!(!src_holds_a_doctest(&src));
+        std::fs::write(
+            ext.join("sub.rs"),
+            "/// ```\n/// f();\n/// ```\npub fn f() {}\n",
+        )
+        .expect("write");
+        assert!(src_holds_a_doctest(&src));
     }
 }

@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::forever::{Cover, Row};
+use aterm_agent::supervise::tape::show;
 
 /// The first prompt (unix ms): 2026-10-24T18:40:20Z.
 const T0: i64 = 1_792_867_220_000;
@@ -41,6 +42,7 @@ fn j(t: i64, line: &str) -> (i64, String) {
 fn row(t: i64, rule: &str, decision: &str) -> Row {
     Row {
         ts: T0 + t,
+        box_seq: None,
         rule: rule.into(),
         decision: decision.into(),
         command: String::new(),
@@ -56,6 +58,15 @@ fn switched(t: i64, word: &'static str) -> Switched {
         reply: "OK".into(),
         took: true,
         phase: "idle".into(),
+        person: false,
+    }
+}
+
+/// The person's press of `word` at `t` after [`T0`], taken.
+fn pressed(t: i64, word: &'static str) -> Switched {
+    Switched {
+        person: true,
+        ..switched(t, word)
     }
 }
 
@@ -109,11 +120,11 @@ fn only_the_switch_chains_switch_and_only_the_measured_land_chains_land_at_once(
 
 #[test]
 fn the_switch_mode_runs_its_five_cruise_chains_and_the_off_control() {
-    use Chain::{Off, SwitchAgent, SwitchBusy, SwitchFlip, SwitchHeld, SwitchSeq};
+    use Chain::{Off, SwitchAgent, SwitchBusy, SwitchFlip, SwitchOverHeld, SwitchSeq};
     assert_eq!(
         Chain::of_mode(crate::forever::Mode::Switch),
         [
-            SwitchHeld,
+            SwitchOverHeld,
             SwitchAgent,
             SwitchSeq,
             SwitchFlip,
@@ -129,13 +140,13 @@ fn the_switch_mode_runs_its_five_cruise_chains_and_the_off_control() {
             "{c:?}"
         );
     }
-    assert!(SwitchHeld.same_reply() && !SwitchAgent.same_reply());
+    assert!(SwitchOverHeld.same_reply() && !SwitchAgent.same_reply());
     assert_eq!(
         Chain::SWITCH[..5]
             .iter()
             .map(|c| c.scenarios()[0].id())
             .collect::<Vec<_>>(),
-        ["SWH", "SWA", "SWS", "SWF", "SWB"]
+        ["SWO", "SWA", "SWS", "SWF", "SWB"]
     );
 }
 
@@ -150,6 +161,11 @@ fn the_at_once_want_folds_into_a_measured_land_chains_first_scenario_alone() {
     let first = Chain::LandA.scenarios()[0];
     let ok = with_at_once(first, &at_rest(5_000), &cx(Chain::LandA), own());
     assert!(matches!(ok, Verdict::Pass(_)), "{ok:?}");
+    // No tape read: the note's want is named skipped and leaves the word as it was.
+    assert!(
+        ok.why().contains(&format!("{HELD_NOTED}: SKIPPED")),
+        "{ok:?}"
+    );
     // Control: main's land@v1, typed at the back-off's due.
     let late = at_rest(124_300);
     let Verdict::Fail(why) = with_at_once(first, &late, &cx(Chain::LandA), own()) else {
@@ -196,6 +212,272 @@ fn land_at_once_wants_the_instruction_within_ten_seconds_of_the_first_point() {
         ..at_rest(5_000)
     };
     assert!(matches!(land_at_once(&unlanded, T0), Verdict::Fail(_)));
+}
+
+/// rv1-l2's land-n (2026-11-01), as its tape and records say it: the point at +24.0 s, aterm's
+/// decision there and its write 70 ms on, Claude Code drawing nothing of the text until the read
+/// at +48.9 s (a `status` read at +34.1 s finding its 565 bytes unread; 24.8 s of hold aterm
+/// watched), the Enter at +49.5 s, and the journal's `CONTINUED` with it. `tape` false: no tape
+/// read.
+fn held_seen(tape: bool) -> Seen {
+    let typed = Typed {
+        rule: Some(turn_end::RULE_LAND.to_string()),
+        seq: 868,
+        decided_ms: Some(T0 + 24_000),
+        sent_ms: T0 + 24_070,
+        drawn_ms: Some(T0 + 48_910),
+        held_ms: Some(24_780),
+        unshown_ms: None,
+        unread: Some(show::Unread {
+            at_ms: T0 + 34_080,
+            word: "pending".to_string(),
+            bytes: Some(565),
+            wait_ms: Some(10_004),
+        }),
+        reaction: Some(false),
+        enter_ms: Some(T0 + 49_460),
+    };
+    Seen {
+        journal: vec![
+            j(
+                24_000,
+                "EVENT idle seq=868 ⏺ Implemented the parser module.",
+            ),
+            j(49_470, LAND),
+        ],
+        ledger: vec![
+            row(24_000, RULE_POINT, "waiting"),
+            row(49_470, turn_end::RULE_LAND, "typed"),
+        ],
+        end_ms: T0 + 960_000,
+        cover: Cover {
+            typed: tape.then(|| vec![typed]),
+            ..Cover::default()
+        },
+        ..Seen::default()
+    }
+}
+
+/// [`held_seen`] with its write shaped by `shape`.
+fn held_shaped(shape: impl FnOnce(&mut Typed)) -> Seen {
+    let mut seen = held_seen(true);
+    if let Some(a) = seen.cover.typed.as_mut().and_then(|t| t.first_mut()) {
+        shape(a);
+    }
+    seen
+}
+
+/// THE WANT TIMES ATERM'S SHARE, AND THE PROGRAM'S HOLD IS ITS OWN NUMBER: land-n's write 70 ms
+/// after its point and its Enter 0.6 s after the read that showed the text pass, aterm's share
+/// 0.7 s, the 24.8 s Claude Code held the text said beside it with the unread bytes. Control: the
+/// same records with no tape read fall back to the journal's line, 25.5 s past the point, and
+/// fail: the old clock's verdict on the program's stall.
+#[test]
+fn land_at_once_times_aterms_share_and_says_the_programs_hold_apart() {
+    let v = land_at_once(&held_seen(true), T0);
+    let Verdict::Pass(said) = &v else {
+        panic!("{v:?}");
+    };
+    for number in ["+24.1 s", "0.7 s", "24.8 s", "input_bytes=565", "+49.5 s"] {
+        assert!(said.contains(number), "{number}: {said}");
+    }
+    let v = land_at_once(&held_seen(false), T0);
+    let Verdict::Fail(why) = &v else {
+        panic!("the journal's clock passed: {v:?}");
+    };
+    assert!(why.contains("+49.5 s"), "{why}");
+    let line = typed_line(held_seen(true).cover.typed.as_deref(), T0);
+    for number in ["+24.1 s land@v1", "+24.0 s", "+48.9 s", "24.8 s", "+49.5 s"] {
+        assert!(line.contains(number), "{number}: {line}");
+    }
+}
+
+/// ATERM'S OWN TIME AFTER THE DRAW IS ATERM'S (the at1 review, 2026-11-01): a text the program drew
+/// at once and aterm sent 30 s later fails, and so does one it drew and aterm never sent; the
+/// write alone would have passed both (negative control: a judge of the write alone). A text the
+/// program held unshown 75 s and aterm sent 0.7 s after it showed passes.
+#[test]
+fn aterms_own_wait_after_the_draw_fails_land_at_once() {
+    let late_enter = held_shaped(|a| {
+        a.drawn_ms = Some(a.sent_ms + 200);
+        a.held_ms = Some(5);
+        a.unread = None;
+        a.enter_ms = Some(a.sent_ms + 30_000);
+    });
+    let v = land_at_once(&late_enter, T0);
+    assert!(
+        matches!(&v, Verdict::Fail(why) if why.contains("30.1 s")),
+        "{v:?}"
+    );
+    let never_sent = held_shaped(|a| {
+        a.drawn_ms = Some(a.sent_ms + 200);
+        a.held_ms = Some(5);
+        a.enter_ms = None;
+    });
+    let v = land_at_once(&never_sent, T0);
+    assert!(
+        matches!(&v, Verdict::Fail(why) if why.contains("+24.3 s")),
+        "{v:?}"
+    );
+    let late_draw = held_shaped(|a| {
+        a.drawn_ms = Some(a.sent_ms + 75_000);
+        a.held_ms = Some(74_900);
+        a.enter_ms = Some(a.sent_ms + 75_700);
+    });
+    let v = land_at_once(&late_draw, T0);
+    assert!(
+        matches!(&v, Verdict::Pass(said) if said.contains("74.9 s")),
+        "{v:?}"
+    );
+}
+
+/// A PROGRAM THAT NEVER DRAWS THE TEXT BY THE WATCH'S END HAS ATERM'S WRITE JUDGED (rv1-ab3's
+/// land-n: 565 bytes unread 60.5 s, never submitted on that build): the write at the point passes,
+/// the program said to have drawn none of it by the end.
+#[test]
+fn a_text_never_drawn_still_judges_aterms_write() {
+    let mut seen = held_shaped(|a| {
+        a.drawn_ms = None;
+        a.held_ms = None;
+        a.unshown_ms = Some(T0 + 900_000);
+        a.enter_ms = None;
+        a.unread = Some(show::Unread {
+            at_ms: T0 + 84_580,
+            word: "pending".to_string(),
+            bytes: Some(565),
+            wait_ms: Some(60_510),
+        });
+    });
+    seen.journal.retain(|(_, l)| !l.starts_with("CONTINUED "));
+    seen.ledger.retain(|r| r.rule == RULE_POINT);
+    let v = land_at_once(&seen, T0);
+    let Verdict::Pass(said) = &v else {
+        panic!("{v:?}");
+    };
+    for number in ["+24.1 s", "+900.0 s", "input_wait_ms=60510"] {
+        assert!(said.contains(number), "{number}: {said}");
+    }
+}
+
+/// THE OLD CLOCK'S FAILING CASE STILL FAILS ON THE NEW ONE: a doctored record whose decision itself
+/// came late (main's +124.3 s, the first short turn's back-off waited out, then written at once
+/// and drawn at once) fails, the back-off named; so does a decision at the point whose write came
+/// 30 s on. A tape that shows other writes but no land@v1 falls back to the journal's line.
+#[test]
+fn a_late_decision_fails_land_at_once_by_aterms_own_act() {
+    let late = |decided: i64, sent: i64| {
+        let mut seen = at_rest(sent + 400);
+        seen.cover.typed = Some(vec![Typed {
+            rule: Some(turn_end::RULE_LAND.to_string()),
+            seq: 1791,
+            decided_ms: Some(T0 + decided),
+            sent_ms: T0 + sent,
+            drawn_ms: Some(T0 + sent + 5),
+            held_ms: Some(5),
+            unshown_ms: None,
+            unread: None,
+            reaction: Some(true),
+            enter_ms: Some(T0 + sent + 400),
+        }]);
+        seen
+    };
+    let v = land_at_once(&late(124_300, 124_400), T0);
+    let Verdict::Fail(why) = &v else {
+        panic!("a late decision passed: {v:?}");
+    };
+    assert!(
+        why.contains("+124.4 s") && why.contains("+124.3 s") && why.contains("2 min back-off"),
+        "{why}"
+    );
+    assert!(matches!(
+        land_at_once(&late(REST_AT, 33_700), T0),
+        Verdict::Fail(_)
+    ));
+    assert!(matches!(
+        land_at_once(&late(REST_AT, REST_AT + 100), T0),
+        Verdict::Pass(_)
+    ));
+    let mut other = late(REST_AT, REST_AT + 100);
+    if let Some(a) = other.cover.typed.as_mut().and_then(|t| t.first_mut()) {
+        a.rule = Some(turn_end::RULE_CONTINUE.to_string());
+    }
+    let v = land_at_once(&other, T0);
+    assert!(
+        matches!(&v, Verdict::Pass(s) if s.contains("no write of it on the tapes")),
+        "{v:?}"
+    );
+}
+
+/// LAND'S INSTRUCTION IS NEVER TYPED TWICE IN A ROW (the at1 review's real run, 2026-11-01): a
+/// land@v1 sent late and then typed again at the agent's defense fails; the land check between
+/// them passes, and so does one land@v1. Negative control: the same records with the check taken
+/// out fail.
+#[test]
+fn land_once_fails_the_instruction_typed_again_with_no_act_between() {
+    const CHECK: &str = "CONTINUED seq=1781 rule=land-check@v1 [aterm harness] Land check";
+    let twice = Seen {
+        journal: vec![j(212_300, LAND), j(216_400, LAND)],
+        ..Seen::default()
+    };
+    let v = land_once(&twice, T0);
+    assert!(
+        matches!(&v, Verdict::Fail(why) if why.contains("+212.3 s") && why.contains("+216.4 s")),
+        "{v:?}"
+    );
+    let checked = Seen {
+        journal: vec![j(212_300, LAND), j(216_400, CHECK), j(300_000, LAND)],
+        ..Seen::default()
+    };
+    assert!(matches!(land_once(&checked, T0), Verdict::Pass(_)));
+    let once = Seen {
+        journal: vec![j(212_300, LAND), j(216_400, CHECK)],
+        ..Seen::default()
+    };
+    assert!(matches!(land_once(&once, T0), Verdict::Pass(_)));
+}
+
+/// THE HELD TEXT IS NOTED ONCE PER WRITE (slice at1's item 3): where the first look past land@v1's
+/// write ran out, one `NOTE … rule=land@v1` naming the program passes, and none or two fail; where
+/// it saw the screen move, a note fails and none passes; with no tape, it is unobserved.
+#[test]
+fn held_noted_wants_one_note_where_the_first_look_ran_out() {
+    let note = |t: i64| {
+        j(
+            t,
+            &format!(
+                "NOTE seq=868 rule=land@v1 {} 10 s after the write: input=pending \
+                 input_bytes=565 input_wait_ms=10004",
+                aterm_agent::supervise::journal::TEXT_HELD
+            ),
+        )
+    };
+    let with = |reaction: bool, notes: &[i64]| {
+        let mut seen = held_shaped(|a| a.reaction = Some(reaction));
+        seen.journal.extend(notes.iter().map(|&t| note(t)));
+        seen.journal.sort_by_key(|(t, _)| *t);
+        seen
+    };
+    assert!(matches!(
+        held_noted(&with(false, &[34_080]), T0),
+        Verdict::Pass(_)
+    ));
+    assert!(matches!(
+        held_noted(&with(false, &[]), T0),
+        Verdict::Fail(_)
+    ));
+    assert!(matches!(
+        held_noted(&with(false, &[34_080, 44_080]), T0),
+        Verdict::Fail(_)
+    ));
+    assert!(matches!(
+        held_noted(&with(true, &[34_080]), T0),
+        Verdict::Fail(_)
+    ));
+    assert!(matches!(held_noted(&with(true, &[]), T0), Verdict::Pass(_)));
+    assert!(matches!(
+        held_noted(&held_seen(false), T0),
+        Verdict::Unobserved(_)
+    ));
 }
 
 #[test]
@@ -263,21 +545,85 @@ fn drafted(land_at: i64) -> Seen {
     seen
 }
 
+/// [`drafted`] with the hands-off holds the loop journals for the person at `holds` (when, and
+/// `until` as the journal stamps it).
+fn person_held(holds: &[(i64, &str)], land_at: i64) -> Seen {
+    let mut seen = drafted(land_at);
+    for &(t, until) in holds {
+        let at = seen
+            .journal
+            .iter()
+            .position(|(at, _)| *at > T0 + t)
+            .unwrap_or(seen.journal.len());
+        let hold = format!("WAITING seq=912 until={until} {PERSON_HOLD}");
+        seen.journal.insert(at, j(t, &hold));
+    }
+    seen
+}
+
+/// The hold the loop journals at the switch's wake for the draft standing (+135 s).
+const AT_THE_SWITCH: (i64, &str) = (15_800, "2026-10-24T18:42:35Z");
+/// The hold it journals once it read the person's last key, their clearing, at +24.5 s: their
+/// grace from it (+144.5 s).
+const AT_THE_CLEARING: (i64, &str) = (24_500, "2026-10-24T18:42:44Z");
+
+/// SWS (ATERM-KI-1031-1): nothing typed while the draft stands, nor inside the person's grace from
+/// its clearing, timed by the lab (+23.7 s to +143.7 s); the hold the loop journals for them ends
+/// no sooner than that and within [`CLEAR_READ_MS`] past it, and land@v1 comes within
+/// [`LAND_WITHIN_MS`] of its end.
 #[test]
-fn a_switch_under_a_draft_types_nothing_until_the_draft_clears() {
-    let v = judge_draft(&drafted(25_000), T0);
-    assert!(matches!(v, Verdict::Pass(_)), "{v:?}");
-    // Control: land@v1 typed over the standing draft.
+fn a_switch_under_a_draft_waits_out_the_persons_grace_from_its_clearing() {
+    assert_eq!(person_grace_ms(), 120_000, "the policy's default grace");
+    let v = judge_draft(&person_held(&[AT_THE_SWITCH, AT_THE_CLEARING], 144_900), T0);
+    let Verdict::Pass(said) = v else {
+        panic!("{v:?}")
+    };
+    assert!(said.contains("the hold for the person to +144"), "{said}");
+    // Controls. Main's agy run (2026-10-31): no hold after the clearing, land@v1 at once.
+    let Verdict::Fail(why) = judge_draft(&person_held(&[AT_THE_SWITCH], 25_000), T0) else {
+        panic!("land@v1 1.3 s after the clearing passed");
+    };
+    assert!(
+        why.contains("typed inside the person's grace from the clearing"),
+        "{why}"
+    );
+    // Nothing journaled for the person at all, whatever was typed when.
+    let Verdict::Fail(why) = judge_draft(&drafted(144_000), T0) else {
+        panic!("a run that journaled no hold for the person passed");
+    };
+    assert!(why.contains("no hold for the person journaled"), "{why}");
+    // Main's Claude Code run: the hold from the draft's sighting, waited out, land@v1 after it.
+    let Verdict::Fail(why) = judge_draft(&person_held(&[AT_THE_SWITCH], 135_500), T0) else {
+        panic!("land@v1 at the end of the hold from the draft's sighting passed");
+    };
+    assert!(
+        why.contains("inside their grace from the clearing"),
+        "{why}"
+    );
+    // A hold past the grace by more than the loop's late read of their last key.
+    let late = (24_500, "2026-10-24T18:43:05Z");
+    let Verdict::Fail(why) = judge_draft(&person_held(&[AT_THE_SWITCH, late], 165_400), T0) else {
+        panic!("a hold 21 s past the person's grace passed");
+    };
+    assert!(why.contains("past 15 s"), "{why}");
+    // land@v1 too long after the hold.
+    let Verdict::Fail(why) =
+        judge_draft(&person_held(&[AT_THE_SWITCH, AT_THE_CLEARING], 151_000), T0)
+    else {
+        panic!("land@v1 7 s past the hold passed");
+    };
+    assert!(why.contains("past 5 s"), "{why}");
+    // land@v1 typed over the standing draft.
     let Verdict::Fail(why) = judge_draft(&drafted(15_200), T0) else {
         panic!("land@v1 over the draft passed");
     };
     assert!(why.contains("typed while the draft stood"), "{why}");
-    let mut unstood = drafted(25_000);
+    let mut unstood = drafted(144_900);
     if let Some(d) = unstood.cover.draft.as_mut() {
         d.stood = false;
     }
     assert!(matches!(judge_draft(&unstood, T0), Verdict::Unobserved(_)));
-    let mut uncleared = drafted(25_000);
+    let mut uncleared = drafted(144_900);
     if let Some(d) = uncleared.cover.draft.as_mut() {
         d.emptied = false;
     }
@@ -287,58 +633,60 @@ fn a_switch_under_a_draft_types_nothing_until_the_draft_clears() {
     ));
 }
 
-/// [`drafted`] with the hands-off hold the loop journals at its wake for the person who typed the
-/// draft, `until` its grace from the draft's sighting runs out (+134 s, past the back-off's due,
-/// as the real lab's run held; +100 s, before it).
-fn person_held(until: &str, land_at: i64) -> Seen {
-    let mut seen = drafted(land_at);
-    let hold = format!("WAITING seq=912 until={until} {PERSON_HOLD}");
-    let at = seen
-        .journal
-        .iter()
-        .position(|(_, l)| l == WAKE)
-        .expect("the wake")
-        + 1;
-    seen.journal.insert(at, j(15_800, &hold));
-    seen
-}
-
-/// The real lab's SWS (2026-10-26): the loop held its hands off for the person who typed the draft
-/// until their grace ran out, past the back-off's due, and typed land@v1 0.7 s after; the judge
-/// read that as the back-off waited out.
+/// A DRAFT TYPED AND CLEARED IS NO NEW POINT (ATERM-KI-1101-2): the passing run journals no
+/// `EVENT` line from the draft's typing to land@v1. NEGATIVE CONTROL: main's agy run (base-sws,
+/// 2026-11-01) read the draft and its clearing as two points, `EVENT idle seq=924` and `seq=938`,
+/// with no turn between.
 #[test]
-fn a_switch_under_a_draft_lands_at_the_end_of_the_hold_for_the_person_who_typed_it() {
-    const PAST_DUE: &str = "2026-10-24T18:42:34Z";
-    const BEFORE_DUE: &str = "2026-10-24T18:42:00Z";
-    let v = judge_draft(&person_held(PAST_DUE, 134_700), T0);
+fn a_draft_typed_and_cleared_is_no_new_point() {
+    let v = judge_draft(&person_held(&[AT_THE_SWITCH, AT_THE_CLEARING], 144_900), T0);
     assert!(matches!(v, Verdict::Pass(_)), "{v:?}");
-    let Verdict::Pass(said) = v else {
-        unreachable!()
-    };
-    assert!(said.contains("the hold for the person to +134"), "{said}");
-    let v = judge_draft(&person_held(BEFORE_DUE, 101_000), T0);
-    assert!(matches!(v, Verdict::Pass(_)), "{v:?}");
-    // Controls: typed inside the hold; too long after it; past the due where the hold ended first.
-    let Verdict::Fail(why) = judge_draft(&person_held(PAST_DUE, 40_000), T0) else {
-        panic!("land@v1 inside the hold passed");
+    let mut repointed = person_held(&[AT_THE_SWITCH, AT_THE_CLEARING], 144_900);
+    for (t, line) in [
+        (9_900, "EVENT idle seq=924 ⏺ Implemented the parser module."),
+        (
+            24_600,
+            "EVENT idle seq=938 ⏺ Implemented the parser module.",
+        ),
+    ] {
+        let at = repointed
+            .journal
+            .iter()
+            .position(|(at, _)| *at > T0 + t)
+            .unwrap_or(repointed.journal.len());
+        repointed.journal.insert(at, j(t, line));
+    }
+    let Verdict::Fail(why) = judge_draft(&repointed, T0) else {
+        panic!("a draft read as two points passed");
     };
     assert!(
-        why.contains("typed inside the hold for the person"),
+        why.contains(DRAFT_REPOINTED) && why.contains("+9.9") && why.contains("+24.6"),
         "{why}"
     );
-    let Verdict::Fail(why) = judge_draft(&person_held(PAST_DUE, 145_000), T0) else {
-        panic!("land@v1 11 s past the hold passed");
-    };
-    assert!(why.contains("past 5 s"), "{why}");
-    let Verdict::Fail(why) = judge_draft(&person_held(BEFORE_DUE, DUE_AT + 500), T0) else {
-        panic!("land@v1 past the due, the hold ended before it, passed");
-    };
-    assert!(why.contains("waited out the back-off's due"), "{why}");
-    // Without the hold journaled the clearing is what land@v1 is timed from, as before.
-    let Verdict::Fail(why) = judge_draft(&drafted(134_700), T0) else {
-        panic!("land@v1 110 s past the clearing, no hold journaled, passed");
-    };
-    assert!(why.contains("past 5 s"), "{why}");
+}
+
+/// A person's clearing keys buy their grace again, so the hold a later read journals is the one
+/// land@v1 waits out, however late the loop reads it: agy decides again once its footer is back,
+/// where Claude Code decides at the first hold's end.
+#[test]
+fn a_switch_under_a_draft_lands_at_the_end_of_the_last_hold_for_the_person() {
+    const LAST: &str = "2026-10-24T18:42:50Z";
+    let last_held =
+        |land_at: i64, read_at: i64| person_held(&[AT_THE_SWITCH, (read_at, LAST)], land_at);
+    for read_at in [29_000, 134_700] {
+        let v = judge_draft(&last_held(150_700, read_at), T0);
+        assert!(matches!(v, Verdict::Pass(_)), "{read_at}: {v:?}");
+    }
+    // Controls: typed between the clearing and the first hold's end, and between the two ends.
+    for land_at in [35_000, 140_000] {
+        let Verdict::Fail(why) = judge_draft(&last_held(land_at, 29_000), T0) else {
+            panic!("land@v1 at +{land_at} ms, inside the last hold, passed");
+        };
+        assert!(
+            why.contains("typed inside the person's grace from the clearing"),
+            "{why}"
+        );
+    }
 }
 
 /// A Cruise tab at rest flipped to Land then Off 100 ms apart at +13.7 s, woken, nothing typed,
@@ -416,34 +764,86 @@ fn a_write_meta_set_refused_or_failed_is_not_taken() {
     assert!(!taken(&reply(0, "", "")));
 }
 
-/// When `switch-held`'s hold was journaled, after [`T0`].
+/// When `switch-over-held`'s hold was journaled, after [`T0`].
 const HELD_AT: i64 = 372_000;
 
-/// A tab held at the same reply under Cruise, switched to Land [`HELD_SWITCH_MS`] past its hold,
-/// woken, every `status` read from then on `autopilot=land held=<arm>`, watched [`WATCH_MS`] past.
-fn held() -> Seen {
-    let sw = HELD_AT + HELD_SWITCH_MS;
+/// The stand-in's one reply, which held the tab.
+const HELD_REPLY: &str = "Merged the parser and pushed it to origin/main. All done.";
+
+/// When the person pressed Land, after [`T0`]: past `meta set`'s Land [`HELD_SWITCH_MS`] past the
+/// hold and its Cruise [`CTL_WATCH_MS`] later, as the lab's word step makes them.
+const PRESS_AT: i64 = HELD_AT + HELD_SWITCH_MS + CTL_WATCH_MS + SWITCH_SETTLE_MS;
+
+/// How long after the switch Land's one ask was typed.
+const ASK_AFTER: i64 = 1_300;
+
+/// How long after the ask its answer held the tab again.
+const AGAIN_AFTER: i64 = 16_000;
+
+/// Land's one ask as the loop types it at the switch (`turn_end::switch_why` before [`LAND`]'s own
+/// words).
+fn asked_text() -> String {
+    let mark = "[aterm harness]";
+    format!(
+        "{mark} {}{}",
+        turn_end::switch_why(&turn_end::held_quote(HELD_REPLY)),
+        turn_end::LAND.strip_prefix(mark).unwrap_or(turn_end::LAND)
+    )
+}
+
+/// A tab held at the same reply under Cruise, switched to Land by `meta set` [`HELD_SWITCH_MS`]
+/// past its hold with nothing typed, back to Cruise, then by the person's press at [`PRESS_AT`] and
+/// woken; Land's one ask typed [`ASK_AFTER`] past the press, `status land_asked=switch` read while
+/// it stood, held again [`AGAIN_AFTER`] past it, every `status` read from then on `held=<arm>
+/// land_asked=-`, watched [`WATCH_MS`] past the second hold.
+fn over_held() -> Seen {
+    let sw = PRESS_AT;
+    let ask = sw + ASK_AFTER;
+    let again = ask + AGAIN_AFTER;
     let arm = arm_of(STALL).word();
+    let idle = format!("EVENT idle seq=2681 ⏺ {HELD_REPLY}");
     Seen {
         journal: vec![
-            j(
-                HELD_AT,
-                "EVENT idle seq=2681 ⏺ Nothing left: the parser is committed and pushed.",
-            ),
+            j(HELD_AT, &idle),
             j(HELD_AT, STALL),
             j(sw + 1_100, WAKE),
+            j(
+                sw + 1_250,
+                "CLEARED seq=2681 exception=stalled the agent was asked again",
+            ),
+            j(
+                ask,
+                &format!("CONTINUED seq=2681 rule=land@v1 {}", asked_text()),
+            ),
+            j(again, &idle.replace("2681", "2702")),
+            j(again, &STALL.replace("2681", "2702")),
         ],
+        ledger: vec![Row {
+            command: asked_text(),
+            ..row(ask, turn_end::RULE_LAND, "typed")
+        }],
         status: vec![
             (
                 T0 + HELD_AT + 1_000,
-                format!("task=- autopilot=cruise held={arm}"),
+                format!("task=- autopilot=cruise held={arm} land_asked=-"),
             ),
-            (T0 + sw + 1_200, format!("task=- autopilot=land held={arm}")),
+            (
+                T0 + ask + 2_000,
+                "task=- autopilot=land held=- land_asked=switch".into(),
+            ),
+            (
+                T0 + again + 1_000,
+                format!("task=- autopilot=land held={arm} land_asked=-"),
+            ),
         ],
-        status_reads: (0..12).map(|i| T0 + sw + 5_000 * (i + 1)).collect(),
-        end_ms: T0 + sw + WATCH_MS,
+        status_reads: (0..30).map(|i| T0 + sw + 3_000 * (i + 1)).collect(),
+        end_ms: T0 + again + WATCH_MS,
         cover: Cover {
-            words: vec![switched(sw, "land")],
+            words: vec![
+                switched(HELD_AT + HELD_SWITCH_MS, "land"),
+                switched(HELD_AT + HELD_SWITCH_MS + CTL_WATCH_MS, "cruise"),
+                pressed(sw, "land"),
+            ],
             ..Cover::default()
         },
         ..Seen::default()
@@ -451,65 +851,158 @@ fn held() -> Seen {
 }
 
 #[test]
-fn a_held_tab_switched_to_land_stays_held_and_types_nothing() {
-    let v = judge_held(&held(), T0);
-    assert!(matches!(v, Verdict::Pass(_)), "{v:?}");
-    // Controls: the hold lifted at the switch; Land's instruction typed; the arm dropped.
-    let mut lifted = held();
-    lifted.journal.push(j(
-        HELD_AT + HELD_SWITCH_MS + 1_500,
-        "CLEARED seq=2681 exception=stalled the Autopilot word moved",
-    ));
-    let Verdict::Fail(why) = judge_held(&lifted, T0) else {
-        panic!("a lifted hold passed");
+fn a_held_tab_switched_to_land_asks_once_and_is_held_again_at_the_same_answer() {
+    let v = judge_over_held(&over_held(), T0);
+    let Verdict::Pass(said) = &v else {
+        panic!("{v:?}");
     };
-    assert!(why.contains("the hold lifted"), "{why}");
-    let mut typed = held();
-    typed
+    assert!(
+        said.contains("opened by the why") && said.contains("land_asked=switch"),
+        "{said}"
+    );
+    // Controls, each a fail naming its fault: nothing typed at the switch (a build before 10b);
+    // Land's plain instruction; the ask typed twice; no hold again; the ask unsaid by `status`.
+    let mut silent = over_held();
+    silent
         .journal
-        .push(j(HELD_AT + HELD_SWITCH_MS + 1_500, LAND));
-    let Verdict::Fail(why) = judge_held(&typed, T0) else {
-        panic!("land@v1 over a hold passed");
+        .retain(|(_, l)| !l.starts_with("CONTINUED ") && !l.starts_with("CLEARED "));
+    let Verdict::Fail(why) = judge_over_held(&silent, T0) else {
+        panic!("no ask passed");
     };
-    assert!(why.contains("typed after the hold"), "{why}");
-    let mut unheld = held();
-    unheld.status[1].1 = "task=- autopilot=land held=-".into();
-    let Verdict::Fail(why) = judge_held(&unheld, T0) else {
-        panic!("a status with no hold passed");
+    assert!(why.contains("NO ASK"), "{why}");
+    let mut plain = over_held();
+    plain.ledger[0].command = turn_end::LAND.into();
+    let Verdict::Fail(why) = judge_over_held(&plain, T0) else {
+        panic!("Land's plain instruction passed");
     };
-    assert!(why.contains("held=-"), "{why}");
+    assert!(why.contains("opens with no why"), "{why}");
+    let mut twice = over_held();
+    let ask = PRESS_AT + ASK_AFTER;
+    twice.journal.push(j(
+        ask + AGAIN_AFTER + 30_000,
+        &format!("CONTINUED seq=2702 rule=land@v1 {}", asked_text()),
+    ));
+    let Verdict::Fail(why) = judge_over_held(&twice, T0) else {
+        panic!("a second prompt passed");
+    };
+    assert!(why.contains("typed again after the ask"), "{why}");
+    let mut unheld = over_held();
+    unheld.journal.truncate(5);
+    let Verdict::Fail(why) = judge_over_held(&unheld, T0) else {
+        panic!("no second hold passed");
+    };
+    assert!(why.contains("not held again"), "{why}");
+    let mut misquoted = over_held();
+    misquoted.ledger[0].command = asked_text().replace("Merged the parser", "Wrote the lexer");
+    let Verdict::Fail(why) = judge_over_held(&misquoted, T0) else {
+        panic!("a why quoting another reply passed");
+    };
+    assert!(why.contains("quotes no \"Merged the parser"), "{why}");
+    let mut unsaid = over_held();
+    unsaid.status[1].1 = "task=- autopilot=land held=- land_asked=-".into();
+    let Verdict::Fail(why) = judge_over_held(&unsaid, T0) else {
+        panic!("an ask status never said passed");
+    };
+    assert!(why.contains("never said land_asked=switch"), "{why}");
     let short = Seen {
-        end_ms: T0 + HELD_AT + HELD_SWITCH_MS + WATCH_MS - 1,
-        ..held()
+        end_ms: T0 + ask + AGAIN_AFTER + WATCH_MS - 1,
+        ..over_held()
     };
-    assert!(matches!(judge_held(&short, T0), Verdict::Unobserved(_)));
+    assert!(matches!(
+        judge_over_held(&short, T0),
+        Verdict::Unobserved(_)
+    ));
+    // LIMIT 1 AT A SWITCH NO PERSON MADE: the ask typed at `meta set`'s Land (the build before
+    // the review's fix) fails, named; with no `meta set` Land, or no press, nothing is judged.
+    let mut ctl_asked = over_held();
+    ctl_asked.journal.insert(
+        2,
+        j(
+            HELD_AT + HELD_SWITCH_MS + ASK_AFTER,
+            &format!("CONTINUED seq=2681 rule=land@v1 {}", asked_text()),
+        ),
+    );
+    let Verdict::Fail(why) = judge_over_held(&ctl_asked, T0) else {
+        panic!("an ask at the switch no person made passed");
+    };
+    assert!(why.contains("typed at the switch no person made"), "{why}");
+    let mut unpressed = over_held();
+    unpressed.cover.words.pop();
+    assert!(matches!(
+        judge_over_held(&unpressed, T0),
+        Verdict::Unobserved(_)
+    ));
+    let mut no_ctl = over_held();
+    no_ctl.cover.words.drain(..2);
+    assert!(matches!(
+        judge_over_held(&no_ctl, T0),
+        Verdict::Unobserved(_)
+    ));
+}
+
+/// The hold is read at a new point (the agent's same answer), so the switch's one ask after it is
+/// no act typed twice for one point. NEGATIVE CONTROL: the same two acts with no point read
+/// between are.
+#[test]
+fn the_switchs_ask_after_a_hold_is_no_doubled_act() {
+    let doubled = |seen: &Seen| {
+        crate::forever::chain_faults(seen, T0, false)
+            .into_iter()
+            .filter(|f| f.contains("no point judged between"))
+            .collect::<Vec<_>>()
+    };
+    let mut seen = over_held();
+    seen.journal.insert(
+        0,
+        j(
+            HELD_AT - 3_500,
+            "CONTINUED seq=2660 rule=continue-done-check@v1 [aterm harness] x",
+        ),
+    );
+    assert_eq!(doubled(&seen), Vec::<String>::new());
+    seen.journal
+        .retain(|(_, l)| !l.starts_with("EVENT idle seq=2681 "));
+    assert_eq!(doubled(&seen).len(), 1, "CONTROL: no point read between");
 }
 
 #[test]
-fn a_held_tabs_state_line_still_leads_with_its_stop_after_the_switch() {
-    let lead = stop_words(arm_of(STALL), StopForm::Line);
-    let sw = T0 + HELD_AT + HELD_SWITCH_MS;
+fn a_held_tabs_state_line_says_lands_ask_then_its_stop_again() {
+    let lead = stop_words(arm_of(STALL), StopForm::Line, false);
+    let ask = T0 + PRESS_AT + ASK_AFTER;
+    let again = ask + AGAIN_AFTER;
     let cx = Ctx {
-        chain: Chain::SwitchHeld,
+        chain: Chain::SwitchOverHeld,
         program: "claude",
         t0: T0,
     };
-    let mut seen = held();
-    seen.window.page = vec![(sw + 4_000, format!("row=1\nstate={lead} · the same reply"))];
-    seen.window.page_reads = vec![sw + 4_000, sw + 9_000];
-    let v = held_line(&seen, &cx);
+    let mut seen = over_held();
+    seen.window.page = vec![
+        (ask + 3_000, format!("row=1\nstate={}", acts::SWITCH_ASKED)),
+        (
+            again + 5_000,
+            format!("row=1\nstate={lead} · the same reply"),
+        ),
+    ];
+    seen.window.page_reads = vec![ask + 3_000, ask + 9_000, again + 5_000, again + 9_000];
+    let v = asked_line(&seen, &cx);
     assert!(matches!(v, Verdict::Pass(_)), "{v:?}");
-    // Control: the line the Land word would draw over the hold, no stop leading it.
+    // Controls: the ask never said while it stood; the stop not said again after the second hold.
+    let mut unasked = seen.clone();
+    unasked.window.page[0].1 = "row=1\nstate=landing".into();
+    let Verdict::Fail(why) = asked_line(&unasked, &cx) else {
+        panic!("an ask unsaid passed");
+    };
+    assert!(why.contains("leads with \""), "{why}");
     seen.window
         .page
-        .push((sw + 9_000, "row=1\nstate=landing".into()));
-    let Verdict::Fail(why) = held_line(&seen, &cx) else {
-        panic!("a state line with no stop passed");
+        .push((again + 9_000, "row=1\nstate=landing".into()));
+    let Verdict::Fail(why) = asked_line(&seen, &cx) else {
+        panic!("a state line with no stop after the second hold passed");
     };
     assert!(why.contains("leads with no stop"), "{why}");
     seen.window.page.clear();
     seen.window.page_reads.clear();
-    assert!(matches!(held_line(&seen, &cx), Verdict::Unobserved(_)));
+    assert!(matches!(asked_line(&seen, &cx), Verdict::Unobserved(_)));
 }
 
 /// A long busy turn switched to Land at +5 s, its point at +40 s, land@v1 typed at `land_at`, the
@@ -591,10 +1084,15 @@ fn each_switch_chains_watch_ends_where_its_verdict_can_be_read() {
     let due = T0 + DUE_AT;
     assert!(!watched(Chain::SwitchFlip, &flip, off + WATCH_MS));
     assert!(watched(Chain::SwitchFlip, &flip, due + PAST_DUE_MS));
-    let hold = held();
-    let hsw = T0 + HELD_AT + HELD_SWITCH_MS;
-    assert!(!watched(Chain::SwitchHeld, &hold, hsw + WATCH_MS - 1));
-    assert!(watched(Chain::SwitchHeld, &hold, hsw + WATCH_MS));
+    let hold = over_held();
+    let hsw = T0 + PRESS_AT;
+    let again = hsw + ASK_AFTER + AGAIN_AFTER;
+    assert!(!watched(Chain::SwitchOverHeld, &hold, again + WATCH_MS - 1));
+    assert!(watched(Chain::SwitchOverHeld, &hold, again + WATCH_MS));
+    let mut silent = over_held();
+    silent.journal.truncate(3);
+    assert!(!watched(Chain::SwitchOverHeld, &silent, again + WATCH_MS));
+    assert!(watched(Chain::SwitchOverHeld, &silent, hsw + LAND_WATCH_MS));
     let mut draft = drafted(25_000);
     draft.journal.retain(|(_, l)| !l.starts_with("DONE "));
     assert!(!watched(

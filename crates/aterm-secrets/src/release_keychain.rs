@@ -82,7 +82,7 @@ pub fn signing_lease(home: &Path) -> Result<SigningLease, String> {
             .create(true)
             .truncate(false)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(dir.join(".signing.lock"))
             .map_err(|error| format!("signing lock: {error}"))?;
         let meta = file
@@ -95,6 +95,7 @@ pub fn signing_lease(home: &Path) -> Result<SigningLease, String> {
             file.set_permissions(std::fs::Permissions::from_mode(0o600))
                 .map_err(|error| format!("secure signing lock: {error}"))?;
         }
+        aterm_uds::keep_out_of_children(&file).map_err(|error| format!("signing lock: {error}"))?;
         #[expect(
             clippy::disallowed_methods,
             reason = "nonblocking private keychain transaction lease, released by LockedFile"
@@ -131,6 +132,35 @@ const PARTITIONS: &str = "apple-tool:,apple:,codesign:";
 /// The release keychain under `home`.
 pub fn keychain_path(home: &Path) -> PathBuf {
     home.join("Library").join("Keychains").join(FILE_NAME)
+}
+
+/// Make the release keychain this user's private file (0600). `security create-keychain`
+/// leaves it as the umask says, and a signing proof binds only a private, singly-linked
+/// keychain (`client::release::signing`); a link, another user's file or a hard-linked one is
+/// left as it is, for that check to refuse.
+fn make_private(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Ok(()),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if !meta.is_file()
+        || meta.uid() != crate::fsx::euid()
+        || meta.nlink() != 1
+        || meta.mode() & 0o7777 == 0o600
+    {
+        return Ok(());
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("make {} private: {e}", path.display()))
 }
 
 /// The file holding the release keychain's password: beside the Developer ID key it guards,
@@ -510,7 +540,15 @@ impl<'a> Keychains<'a> {
     /// create or modify it, whether the caller provisions or adopts an existing identity.
     fn check_release_path(&self) -> Result<(), Refusal> {
         let release = self.release();
-        if crate::keychain_tools::protected(&release, &[]) {
+        let named = [
+            login_keychain_path(&self.home),
+            self.home
+                .join("Library")
+                .join("Keychains")
+                .join("login.keychain"),
+            PathBuf::from("/Library/Keychains/System.keychain"),
+        ];
+        if crate::keychain_tools::protected(&release, &named) {
             return Err(Refusal::new(
                 format!(
                     "{} is, or leads to, the login or System keychain — refusing to touch it",
@@ -556,6 +594,7 @@ impl<'a> Keychains<'a> {
                 "set-keychain-settings",
             )
             .map_err(fail)?;
+            make_private(&release).map_err(fail)?;
             return Ok(password);
         }
         // No keychain uses the file, so its fix makes way for a new one; a moved-aside keychain
@@ -601,6 +640,7 @@ impl<'a> Keychains<'a> {
             "create-keychain",
         )
         .map_err(fail)?;
+        make_private(&release).map_err(fail)?;
         self.open_with(&password)?;
         self.security_ok(
             &[&"set-keychain-settings", &release],
@@ -944,15 +984,57 @@ enum Stored {
 /// Reads the password file. Bytes that are not the hex provision writes, text or not, are
 /// malformed: a file that reads is never sent to be made readable.
 fn stored_password(home: &Path) -> Stored {
-    match std::fs::read(password_path(home)) {
-        Ok(bytes) => match std::str::from_utf8(&bytes).map(str::trim) {
-            Ok(text) if aterm_codec::hex::is_hex(text, 64) => {
-                Stored::Password(Password(text.to_string()))
-            }
-            _ => Stored::Malformed,
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Stored::Absent,
-        Err(e) => Stored::Unreadable(e.to_string()),
+    use std::io::Read as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    const MAX_PASSWORD_BYTES: u64 = 4096;
+    let path = password_path(home);
+    let meta = match std::fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Stored::Absent,
+        Err(e) => return Stored::Unreadable(e.to_string()),
+    };
+    if meta.file_type().is_symlink() {
+        return Stored::Unreadable("refusing symbolic link".into());
+    }
+    if !meta.is_file() {
+        return Stored::Unreadable("not a regular file".into());
+    }
+    if meta.uid() != aterm_uds::peer::our_uid() {
+        return Stored::Unreadable("not owned by this user".into());
+    }
+    if meta.len() > MAX_PASSWORD_BYTES {
+        return Stored::Malformed;
+    }
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Stored::Absent,
+        Err(e) => return Stored::Unreadable(e.to_string()),
+    };
+    match file.metadata() {
+        Ok(fmeta) if !fmeta.is_file() => return Stored::Unreadable("not a regular file".into()),
+        Ok(fmeta) if fmeta.uid() != aterm_uds::peer::our_uid() => {
+            return Stored::Unreadable("not owned by this user".into());
+        }
+        Ok(fmeta) if fmeta.len() > MAX_PASSWORD_BYTES => return Stored::Malformed,
+        Ok(_) => {}
+        Err(e) => return Stored::Unreadable(e.to_string()),
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
+    if let Err(e) = file.take(MAX_PASSWORD_BYTES + 1).read_to_end(&mut bytes) {
+        return Stored::Unreadable(e.to_string());
+    }
+    if bytes.len() as u64 > MAX_PASSWORD_BYTES {
+        return Stored::Malformed;
+    }
+    match std::str::from_utf8(&bytes).map(str::trim) {
+        Ok(text) if aterm_codec::hex::is_hex(text, 64) => {
+            Stored::Password(Password(text.to_string()))
+        }
+        _ => Stored::Malformed,
     }
 }
 
@@ -1004,7 +1086,7 @@ fn create_password_with(
     fill: &dyn Fn(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
 ) -> Result<Password, Refusal> {
     use ring::rand::SecureRandom as _;
-    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    use std::os::unix::fs::OpenOptionsExt as _;
 
     let path = password_path(home);
     let fail = |e: String| {
@@ -1019,9 +1101,7 @@ fn create_password_with(
     let dir = path
         .parent()
         .ok_or_else(|| fail(format!("{} has no folder", path.display())))?;
-    std::fs::create_dir_all(dir).map_err(|e| fail(format!("{}: {e}", dir.display())))?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-        .map_err(|e| fail(format!("{}: {e}", dir.display())))?;
+    crate::fsx::ensure_private_dir(dir).map_err(|e| fail(e.to_string()))?;
     let mut bytes = [0u8; 32];
     ring::rand::SystemRandom::new()
         .fill(&mut bytes)
@@ -1055,6 +1135,7 @@ pub mod fake {
     use super::*;
     use std::cell::RefCell;
     use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt as _;
     use std::os::unix::process::ExitStatusExt as _;
 
     /// One modelled keychain.
@@ -1209,6 +1290,11 @@ pub mod fake {
                         return out(48, "", "A keychain with the same name already exists.");
                     }
                     std::fs::write(&last, b"").expect("the modelled keychain's file");
+                    // `security create-keychain` leaves the file as the umask says. The model
+                    // makes it 0644, as the default umask does, whatever this test's umask is,
+                    // so a keychain left unnarrowed to 0600 fails on every host.
+                    std::fs::set_permissions(&last, std::fs::Permissions::from_mode(0o644))
+                        .expect("the modelled keychain's mode");
                     let password = rest[1].clone();
                     self.keychains.insert(
                         last,
@@ -1414,6 +1500,7 @@ mod tests {
             let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode(&pass), 0o600);
             assert_eq!(mode(pass.parent().unwrap()), 0o700);
+            assert_eq!(mode(&release), 0o600, "the made keychain is private");
         }
         let world = fake.0.borrow();
         assert_eq!(
@@ -1490,6 +1577,50 @@ mod tests {
                 Ok(Some(release.clone()))
             );
         }
+        // A keychain an earlier aterm made as the umask said is made private when opened.
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&release, std::fs::Permissions::from_mode(0o644)).unwrap();
+            kc.install_pair(
+                &home.join(".aterm/apple/c.cer"),
+                &home.join(".aterm/apple/k.key"),
+            )
+            .expect("install again");
+            assert_eq!(
+                std::fs::metadata(&release).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    /// Only this user's singly-linked keychain file is made private; a link and a hard-linked
+    /// file are left as they are, for the signing proof's stamp to refuse.
+    #[test]
+    fn only_an_owned_single_keychain_file_is_made_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let open = |p: &Path| {
+            std::fs::write(p, b"keychain").unwrap();
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        };
+        let plain = dir.path().join("plain.keychain-db");
+        open(&plain);
+        make_private(&plain).unwrap();
+        assert_eq!(mode(&plain), 0o600);
+
+        let target = dir.path().join("target.keychain-db");
+        open(&target);
+        let link = dir.path().join("link.keychain-db");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        make_private(&link).unwrap();
+        assert_eq!(mode(&target), 0o644, "a link's target is not changed");
+
+        let twice = dir.path().join("twice.keychain-db");
+        open(&twice);
+        std::fs::hard_link(&twice, dir.path().join("again.keychain-db")).unwrap();
+        make_private(&twice).unwrap();
+        assert_eq!(mode(&twice), 0o644, "a hard-linked file is not changed");
     }
 
     /// Converging an existing release keychain changes nothing a second time: no keychain is
@@ -1875,6 +2006,32 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+
+        let (_dir, home) = self::home();
+        let login = login_keychain_path(&home);
+        let release = keychain_path(&home);
+        std::fs::write(&login, b"scratch login keychain").unwrap();
+        std::fs::hard_link(&login, &release).unwrap();
+        let password = "0".repeat(64);
+        std::fs::write(password_path(&home), format!("{password}\n")).unwrap();
+        let mut world = World::new(SHA1);
+        world.keychains.insert(
+            release.clone(),
+            Kc {
+                password,
+                locked: true,
+                partition: false,
+                ..Kc::holding(SHA1)
+            },
+        );
+        world.search_list = vec![release];
+        let fake = Fake::new(world);
+        let kc = Keychains::new(&home, &fake);
+        let refused = kc
+            .signing_keychain(TEAM, SHA1, Leave::Write)
+            .expect_err("hard link to login must be refused");
+        assert!(refused.contains("login or System keychain"), "{refused}");
+        assert!(fake.calls("security", "unlock-keychain").is_empty());
     }
 
     /// Whichever `security` step fails, the refusal says which, never the password itself; the
@@ -2032,6 +2189,12 @@ mod tests {
         assert!(fake.calls("security", "create-keychain").is_empty());
 
         let (_dir, home) = self::home();
+        let outside = home.join("outside.pass");
+        std::fs::write(&outside, "0".repeat(64)).unwrap();
+        std::os::unix::fs::symlink(&outside, password_path(&home)).unwrap();
+        assert!(matches!(stored_password(&home), Stored::Unreadable(_)));
+
+        let (_dir, home) = self::home();
         let mut world = World::new(SHA1);
         world.search_list = vec![login_keychain_path(&home)];
         let fake = Fake::new(world);
@@ -2075,6 +2238,15 @@ mod tests {
             stored_password(&home),
             Stored::Password(stored) if stored.0 == written.0
         ));
+
+        let linked_root = aterm_tempfile::tempdir().unwrap();
+        let linked_home = linked_root.path();
+        let elsewhere = linked_home.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::create_dir_all(linked_home.join(".aterm")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, linked_home.join(".aterm/apple")).unwrap();
+        create_password(linked_home).expect_err("a symlinked .aterm/apple directory is refused");
+        assert!(!elsewhere.join("release-keychain.pass").exists());
     }
 }
 
@@ -2327,16 +2499,27 @@ fn issuer_matches(leaf: &str, candidate: &str) -> bool {
 /// timeout is not. Renaming a symlink preserves the link itself, never its target.
 fn recover_owned_keychain(kc: &Keychains<'_>) -> Result<(), Refusal> {
     use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+    let inspect = |path: &Path| match std::fs::symlink_metadata(path) {
+        Ok(meta) => Ok(Some(meta)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(Refusal::new(
+            format!("inspect {}: {error}", path.display()),
+            "automatic setup will retry",
+        )),
+    };
     let release = kc.release();
     let password = password_path(kc.home());
-    let release_meta = std::fs::symlink_metadata(&release).ok();
-    let password_meta = std::fs::symlink_metadata(&password).ok();
+    let release_meta = inspect(&release)?;
+    let password_meta = inspect(&password)?;
     for (path, meta) in [
         (&release, release_meta.as_ref()),
         (&password, password_meta.as_ref()),
     ] {
         if let Some(meta) = meta {
-            if meta.uid() != aterm_uds::peer::our_uid() || meta.is_dir() || meta.nlink() != 1 {
+            if meta.uid() != aterm_uds::peer::our_uid()
+                || (!meta.is_file() && !meta.file_type().is_symlink())
+                || meta.nlink() != 1
+            {
                 return Err(Refusal::new(
                     "owned signing material has an unexpected owner or file type",
                     "automatic setup will retry",
@@ -2396,7 +2579,9 @@ fn recover_owned_keychain(kc: &Keychains<'_>) -> Result<(), Refusal> {
         .into_iter()
         .flatten()
     {
-        if meta.uid() != aterm_uds::peer::our_uid() || meta.is_dir() {
+        if meta.uid() != aterm_uds::peer::our_uid()
+            || (!meta.is_file() && !meta.file_type().is_symlink())
+        {
             return Err(Refusal::new(
                 "the unusable keychain material is not an owned file",
                 "automatic repair awaits ownership of its own files",
@@ -2702,5 +2887,21 @@ mod automatic_tests {
             assert_eq!(fake.calls("security", "create-keychain").len(), 1);
             assert_eq!(fake.calls("codesign", "--force").len(), 1);
         }
+
+        let root = aterm_tempfile::tempdir().unwrap();
+        let home = root.path();
+        std::fs::create_dir_all(home.join("Library/Keychains")).unwrap();
+        let release = keychain_path(home);
+        std::fs::write(&release, b"keep when password lstat fails").unwrap();
+        std::fs::create_dir_all(home.join(".aterm")).unwrap();
+        let apple_dir = home.join(".aterm/apple");
+        std::os::unix::fs::symlink(&apple_dir, &apple_dir).unwrap();
+        let fake = Fake::new(World::new("A1B2C3D4E5F60718293A4B5C6D7E8F9012345678"));
+        let kc = Keychains::new(home, &fake);
+        assert!(recover_owned_keychain(&kc).is_err());
+        assert_eq!(
+            std::fs::read(&release).unwrap(),
+            b"keep when password lstat fails"
+        );
     }
 }

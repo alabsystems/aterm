@@ -466,7 +466,7 @@ fn report_over(cargo: &Cargo, root: &Path, cells: &[Cell]) -> Verdict {
         );
     }
     for c in &carved {
-        if root.join(&c.path).exists() {
+        if std::fs::symlink_metadata(root.join(&c.path)).is_ok() {
             fails += 1;
             let _ = writeln!(
                 log,
@@ -1029,7 +1029,13 @@ fn parse_carve_ledger(text: &str, whence: &Path) -> Result<Vec<Carved>, String> 
                 i + 1
             ));
         };
-        if path.is_empty() || Path::new(&path).is_absolute() || path.split('/').any(|s| s == "..") {
+        if path.is_empty()
+            || Path::new(&path).is_absolute()
+            || path.contains('\\')
+            || path
+                .split('/')
+                .any(|s| s.is_empty() || s == "." || s == "..")
+        {
             return Err(format!(
                 "{}: `[[carved]]` row {} has path `{path}` — carved paths are REPO-RELATIVE and \
                  may not escape the tree. Fix: write it relative to the workspace root, e.g. \
@@ -1405,6 +1411,11 @@ reason = \"no arch intrinsics reach the shipped build\"
             "[[carved]]\npath = \"/etc/passwd\"\n",
             "[[carved]]\npath = \"../outside\"\n",
             "[[carved]]\npath = \"vendor/../../x\"\n",
+            "[[carved]]\npath = \"./vendor/x\"\n",
+            "[[carved]]\npath = \"vendor/./x\"\n",
+            "[[carved]]\npath = \"vendor//x\"\n",
+            "[[carved]]\npath = \"vendor/x/\"\n",
+            "[[carved]]\npath = \"vendor\\\\x\"\n",
             "carved = \"vendor/x\"\n",
         ] {
             assert!(parse_carve_ledger(text, Path::new("f")).is_err(), "{text}");
@@ -1729,5 +1740,23 @@ windows-sys-052 = { package = \"windows-sys\", path = \"crates/aterm-windows-sys
             .map(|c| (c.package != "broken").then(|| c.package.clone()))
             .collect();
         assert_eq!(roots, own, "each cell's own graph, in cells order");
+
+        std::fs::create_dir_all(root.join("vendor")).expect("vendor dir");
+        std::fs::write(
+            root.join("vendor/forge.toml"),
+            "[[carved]]\npath = \"crates/foo/src/carved.rs\"\nreason = \"dead\"\n",
+        )
+        .expect("forge.toml");
+        std::os::unix::fs::symlink(
+            root.join("crates/foo/src/missing-target.rs"),
+            root.join("crates/foo/src/carved.rs"),
+        )
+        .expect("broken symlink");
+        let v = report_over(&cargo, root, &[bare, native]);
+        assert!(
+            !v.ok && v.log.contains("FAIL [OB-13]"),
+            "a broken symlink at a carved path must fail OB-13:\n{}",
+            v.log
+        );
     }
 }

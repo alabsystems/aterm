@@ -1618,6 +1618,57 @@ fn drop_history_below_matches_fresh_rebuild_including_completeness() {
         dropped.search_with_positions("row 39").len(),
         fresh.search_with_positions("row 39").len()
     );
+
+    // Emptying via drop_history_below resets first_cached_line so sparse rows skip the gap,
+    // and retain_history_from below first_cached_line still records the eviction boundary.
+    let mut emptied = SearchIndex::new();
+    emptied.index_line(0, "old");
+    emptied.drop_history_below(1);
+    emptied.index_line(1_000_000, "Needle A");
+    let _ = SearchIndex::take_case_insensitive_candidate_visits();
+    assert_eq!(
+        emptied.search_with_positions_opts("a", false, false),
+        Ok(vec![SearchMatch::new(1_000_000, 7, 8)])
+    );
+    assert_eq!(SearchIndex::take_case_insensitive_candidate_visits(), 1);
+
+    let mut sparse_retained = SearchIndex::new();
+    sparse_retained.index_line(20, "needle");
+    sparse_retained.retain_history_from(10);
+    assert!(sparse_retained.results_may_be_incomplete());
+    assert_eq!(sparse_retained.lowest_retained_line(), 10);
+
+    // Forward wrap and short/backward parity when a row below lowest_retained_line is indexed.
+    let mut prefixed = TerminalSearch::new();
+    prefixed.index_visible_content(10, ["early needle"]);
+    prefixed.index_visible_content(25, ["later needle"]);
+    prefixed.set_history_prefix_eviction(Some(20));
+    assert_eq!(
+        prefixed
+            .search_results_opts_direction("e", true, false, SearchDirection::Forward)
+            .unwrap()
+            .matches
+            .first()
+            .map(|m| m.line),
+        Some(10),
+    );
+    assert_eq!(
+        prefixed
+            .find_direction_opts(
+                "needle",
+                true,
+                false,
+                DirectedFind {
+                    anchor: (25, 6),
+                    direction: SearchDirection::Forward,
+                    inclusive: false,
+                    wrap: true,
+                },
+            )
+            .unwrap()
+            .map(|m| m.line),
+        Some(10),
+    );
 }
 
 #[test]

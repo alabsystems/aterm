@@ -1,0 +1,51 @@
+# claude-code 2.1.316 · MEASURED 2026-11-01, `aterm ctl text` of a private headless aterm (144x50, aterm 0.148.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, tools/real-claude-lab), `--permission-mode default` · three Bash calls, the first two granted in their approval boxes and the third box declined with Esc: Claude Code writes `⎿  Interrupted · What should Claude do instead?` under the declined call and returns to an idle composer; the question is the vendor's to the person after their Esc, not the agent asking (fix J2-4); the lab's scratch folder renamed /private/tmp/x
+ ▐▛███▛█   Claude Code v2.1.316
+▝▜██████▀  Sonnet 5.5 · Claude API
+ ▝▝   ▝▝   /private/tmp/x/proj
+
+
+❯ toolstart qzpword
+
+⏺ Bash(touch /private/tmp/x/proj/qzpone.txt)
+  ⎿  Done
+
+⏺ Done.
+
+✻ Brewed for 0s · done 10:45 AM
+
+❯ toolstart qzpword
+
+⏺ Bash(touch /private/tmp/x/proj/qzptwo.txt)
+  ⎿  Done
+
+⏺ Done again.
+
+✻ Baked for 0s · done 10:46 AM
+
+❯ toolstart qzpword
+
+⏺ Bash(touch /private/tmp/x/proj/qzpthree.txt)
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Brewed for 0s · done 10:46 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts                                                                                        ◐ medium · /effort
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

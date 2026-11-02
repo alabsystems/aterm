@@ -178,12 +178,15 @@ fn read_os_random(buf: &mut [u8]) -> bool {
         fn BCryptGenRandom(h: *mut core::ffi::c_void, p: *mut u8, n: u32, f: u32) -> i32;
     }
     const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
-    // SAFETY: buf is a live &mut [u8] for the duration of the call; NULL algorithm handle + the flag is the documented system-RNG form; 0 == STATUS_SUCCESS.
+    let Ok(len) = u32::try_from(buf.len()) else {
+        return false;
+    };
+    // SAFETY: buf is a live &mut [u8] for the duration of the call and `len` is its exact length; NULL algorithm handle + the flag is the documented system-RNG form; 0 == STATUS_SUCCESS.
     unsafe {
         BCryptGenRandom(
             core::ptr::null_mut(),
             buf.as_mut_ptr(),
-            buf.len() as u32,
+            len,
             BCRYPT_USE_SYSTEM_PREFERRED_RNG,
         ) == 0
     }
@@ -374,7 +377,7 @@ impl TempDir {
             {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "a temporary directory prefix must not contain a path",
+                    "a temporary directory name must not contain a path",
                 ));
             }
             let path = dir.join(name);
@@ -428,10 +431,11 @@ impl AsRef<Path> for TempDir {
     }
 }
 
-/// Builder for temporary directories with a custom prefix.
+/// Builder for temporary directories with a custom prefix and suffix.
 #[derive(Debug, Default)]
 pub struct Builder {
     prefix: Option<String>,
+    suffix: Option<String>,
     heard: bool,
 }
 
@@ -442,6 +446,7 @@ impl Builder {
     pub const fn new() -> Self {
         Self {
             prefix: None,
+            suffix: None,
             heard: false,
         }
     }
@@ -461,6 +466,14 @@ impl Builder {
     #[must_use]
     pub fn prefix(mut self, prefix: &str) -> Self {
         self.prefix = Some(prefix.to_owned());
+        self
+    }
+
+    /// Set the suffix after the unique temporary name, such as `.noindex`.
+    #[cfg_attr(trust_verify, trust::skip)]
+    #[must_use]
+    pub fn suffix(mut self, suffix: &str) -> Self {
+        self.suffix = Some(suffix.to_owned());
         self
     }
 
@@ -484,11 +497,18 @@ impl Builder {
     /// # Errors
     /// Returns an error if the directory cannot be created.
     pub fn tempdir_in(&self, dir: impl AsRef<Path>) -> io::Result<TempDir> {
-        if self.heard {
-            TempDir::made_in(self.prefix_str(), &outside_quiet(dir.as_ref()))
+        let dir = if self.heard {
+            outside_quiet(dir.as_ref())
         } else {
-            TempDir::with_prefix_in(self.prefix_str(), dir)
-        }
+            placed(dir.as_ref())
+        };
+        TempDir::made_in_with(&dir, || {
+            let mut name = unique_name(self.prefix_str());
+            if let Some(suffix) = &self.suffix {
+                name.push_str(suffix);
+            }
+            name
+        })
     }
 }
 
@@ -756,6 +776,44 @@ mod tests {
         assert_eq!(inner.path().parent(), Some(dir.path()));
         let name = inner.path().file_name().unwrap().to_str().unwrap();
         assert!(name.starts_with("inner_"), "name: {name}");
+    }
+
+    #[test]
+    fn a_suffix_stays_in_the_name_and_keeps_directory_cleanup() {
+        let root = tempdir().expect("root");
+        let parent = root.path().join("inside");
+        fs::create_dir(&parent).expect("parent");
+        let path;
+        {
+            let dir = Builder::new()
+                .prefix("scratch_")
+                .suffix(".noindex")
+                .tempdir_in(&parent)
+                .expect("a suffixed directory");
+            path = dir.path().to_path_buf();
+            assert_eq!(path.parent(), Some(parent.as_path()));
+            let name = path.file_name().unwrap().to_str().unwrap();
+            assert!(name.starts_with("scratch_") && name.ends_with(".noindex"));
+            fs::write(path.join("artifact"), b"owned").expect("artifact");
+        }
+        assert!(!path.exists());
+        for suffix in ["/../outside", "/nested/child", "/"] {
+            let error = Builder::new()
+                .suffix(suffix)
+                .tempdir_in(&parent)
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{suffix:?}");
+        }
+        #[cfg(windows)]
+        for suffix in [r"\..\outside", r"\nested\child", r"\"] {
+            let error = Builder::new()
+                .suffix(suffix)
+                .tempdir_in(&parent)
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{suffix:?}");
+        }
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(parent).unwrap().count(), 0);
     }
 
     #[test]
@@ -1128,8 +1186,10 @@ mod tests {
         let quiet = quiet_place(tmp, true).expect("a shared root is made quiet");
         assert_eq!(quiet, Path::new("/tmp/.ubd"));
         let made = quiet.join("al-sim1_0123456789abcdef_0");
+        let sep = std::path::MAIN_SEPARATOR;
         assert!(
-            made.to_str().is_some_and(|p| p.contains("/.ubd/")),
+            made.to_str()
+                .is_some_and(|p| p.contains(&format!("{sep}.ubd{sep}"))),
             "{made:?}"
         );
         assert!(is_quiet(&quiet) && is_quiet(&made));

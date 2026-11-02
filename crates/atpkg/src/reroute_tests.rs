@@ -1802,6 +1802,43 @@ fn escape_hatch_dispatch_and_fail_closed_run_in_a_real_shell() {
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
+#[cfg(unix)]
+#[test]
+fn no_reroute_preserves_the_callers_build_directory_environment() {
+    let l = layout("shell-build-dir");
+    let d = dir(&l);
+    std::fs::create_dir_all(&d).unwrap();
+    let upstream = l.prefix.join("upstream");
+    std::fs::create_dir(&upstream).unwrap();
+    let cargo = upstream.join("cargo");
+    std::fs::write(&cargo, "#!/bin/sh\nprintf 'build-dir=%s\\n' \"${CARGO_BUILD_BUILD_DIR-unset}\"\nprintf 'arg=%s\\n' \"$@\"\n").unwrap();
+    std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let stub = d.join("cargo");
+    std::fs::write(
+        &stub,
+        stub_body_sh("cargo", Path::new("/unused/atpkg"), &d, false),
+    )
+    .unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for value in [None, Some("/caller-selected"), Some("")] {
+        let mut command = sh(&stub);
+        command
+            .args(["tippy"])
+            .env("PATH", std::env::join_paths([&d, &upstream]).unwrap())
+            .env(PASSTHROUGH_ENV, "1")
+            .env_remove(crate::build_cache::BUILD_DIR_ENV);
+        if let Some(value) = value {
+            command.env(crate::build_cache::BUILD_DIR_ENV, value);
+        }
+        let output = output_within(command, aterm_spec::wait::MUST_HAPPEN.as_secs());
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("build-dir={}\narg=tippy\n", value.unwrap_or("unset"))
+        );
+    }
+}
+
 /// A child of a command the reroute ran, in a real `/bin/sh`: a `cargo`/`rustc` stub under
 /// [`ANNOUNCED_ENV`] runs upstream with no atpkg and no line, unless the directory may be
 /// inside a Rust source checkout, physically (a `$PWD` through a symlink hides nothing),

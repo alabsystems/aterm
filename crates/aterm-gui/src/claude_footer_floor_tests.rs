@@ -159,8 +159,15 @@ fn every_fact_mark_reads_on_every_ground() {
                     ]
                     .map(Some),
                 ) {
-                    let paint =
-                        compose_rule_spans(&fit, None, rule, blank, instance.accent, room, lit);
+                    let paint = compose_rule_spans(
+                        &fit,
+                        None,
+                        rule,
+                        blank,
+                        (instance.accent, WARN_FG),
+                        room,
+                        lit,
+                    );
                     let marks: Vec<&RenderCell> = paint
                         .cells
                         .iter()
@@ -278,8 +285,15 @@ fn every_fact_word_reads_on_every_ground() {
                     ]
                     .map(Some),
                 ) {
-                    let paint =
-                        compose_rule_spans(&fit, None, rule, blank, instance.accent, room, lit);
+                    let paint = compose_rule_spans(
+                        &fit,
+                        None,
+                        rule,
+                        blank,
+                        (instance.accent, WARN_FG),
+                        room,
+                        lit,
+                    );
                     let what = |c: &RenderCell| {
                         format!(
                             "{}'s accent on {tab} over {:?}, {lit:?} lit: {:?}",
@@ -426,7 +440,6 @@ fn ghost_glyphs(
         &TopKey {
             frame_row: 30,
             term_row: 20,
-            line: TopLine::Rule,
             run,
             program: aterm_phase::Program::Claude,
             build: Build::Vendor,
@@ -443,7 +456,6 @@ fn ghost_glyphs(
             clip: aterm_core::render::PxRect::EVERYWHERE,
             mark_hover: false,
             title_gen: 0,
-            chip: TopChip::NONE,
         },
         &mut top,
         None,

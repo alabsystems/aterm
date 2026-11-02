@@ -17,16 +17,16 @@ Result: **9 specs**, covering **8 tests**. **0 remaining non-spec tests** (§4).
 
 ## 0. Notation used in the statements
 
-- `D` = `core::time::Duration`. It is modelled as the natural number of nanoseconds
+- `D` = `core::time::Duration`, modelled as the natural number of nanoseconds
   `‖d‖ = secs·10^9 + subsec_nanos`, with `‖D::MAX‖ = (2^64−1)·10^9 + 999_999_999`.
   `‖D::from_millis(m)‖ = m·10^6` and `‖D::from_nanos(n)‖ = n`. `D`'s order and `+`/`−` are those of `‖·‖`.
 - `Ishim(x)` and `Sshim(x)` are the shim newtypes `shim::Instant(x)` and `shim::SystemTime(x)` over
-  `x: D`. `.0` is the field. `UNIX_EPOCH = Sshim(D::ZERO)`.
+  `x: D`; `.0` is the field. `UNIX_EPOCH = Sshim(D::ZERO)`.
 - `conv(ms)` = `shim::duration_from_millis_f64(ms)` for `ms: f64` (IEEE-754 binary64).
-  `trunc` is `f64::trunc`. `fl(a·b)` is the round-to-nearest-even product. `⌊x⌋` is the `as u64` /
-  `as u32` cast of a non-negative finite float (truncation, saturating).
-- `from_js_millis` = `Instant::from_js_millis` / `SystemTime::from_js_millis`. These are private
-  seams. Their production caller is the wasm-only `now()`.
+  `trunc` is `f64::trunc`, `fl(a·b)` the round-to-nearest-even product, and `⌊x⌋` the `as u64` /
+  `as u32` cast of a non-negative finite float (truncating, saturating).
+- `from_js_millis` = `Instant::from_js_millis` / `SystemTime::from_js_millis`, private seams whose
+  production caller is the wasm-only `now()`.
 - `now_w` = one read of the platform wall clock: `std::time::SystemTime::now` natively, and `Sshim`
   over `Date.now()` on `wasm32-unknown-unknown`. Effect model: each call of `since_epoch` performs
   exactly one `now_w` read, and the accessors are stated per read.
@@ -43,8 +43,8 @@ Result: **9 specs**, covering **8 tests**. **0 remaining non-spec tests** (§4).
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes (primary tests; secondary in §2)`,
-`difficulty (Rust features the proof must handle)`, `blocking gaps`.
+Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (primary tests; secondary in §2),
+`difficulty` (the Rust features the proof must handle), `blocking gaps` (§0's gap labels).
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking gaps
@@ -59,25 +59,9 @@ time-systime-shift	contract	shim::SystemTime::{checked_add,checked_sub}, <shim::
 time-epoch-accessors	contract (effectful)	since_epoch, since_epoch_at, unix_secs, unix_secs_at, unix_millis, unix_millis_at	Pure per-reading core: since_epoch_at(w) = (w ≥ UNIX_EPOCH ? Some(w − UNIX_EPOCH) : None); unix_secs_at(w) = since_epoch_at(w).map(as_secs); unix_millis_at(w) = since_epoch_at(w).map(|d| min(d.as_millis(), u64::MAX) as u64). Effect model: each of since_epoch(), unix_secs(), unix_millis() does one now_w read with value w and returns the corresponding *_at(w). None of them panics. So for reads w0 ≤ w ≤ w1, each accessor lies in [w0 − E, w1 − E] in its unit.	lib::the_epoch_accessors_read_the_wall_clock	MEDIUM: a platform clock effect with two arms (std re-export natively, the shim on wasm), Result::ok, Option::map with closures, and u128→u64 try_from().unwrap_or saturation. The pure *_at(w) helpers can be proved first without effects.	1, 3, 4, 8, 12, 13
 ```
 
-### Distribution by kind (9)
-
-| kind | count | ids |
-|---|---|---|
-| contract | 7 | time-conv-exact, time-conv-monotone-resolution, time-instant-difference, time-instant-shift, time-systime-duration-since, time-systime-shift, time-epoch-accessors |
-| no-panic + contract | 1 | time-conv-total-floor |
-| refinement | 1 | time-from-js-millis |
-
-### Proof dependency order
-
-`cfg` fix → `time-instant-difference`, `time-instant-shift`, `time-systime-shift`,
-`time-systime-duration-since` (Duration arithmetic only, no floats) → the float model `F` →
-`time-conv-total-floor` → `time-conv-exact` → `time-conv-monotone-resolution` and
-`time-from-js-millis` (they compose on conv's ensures, gap 4) → `time-epoch-accessors` (effects, gap 8).
-
 ## 2. Test → spec map (TSV)
 
-`primary` is the spec that retires the test. `also` lists the other specs the same test samples. The
-tests of §4 are deleted and have no row.
+`primary` is the spec that retires the test; `also` lists the other specs it samples.
 
 ```tsv
 file	test	primary	also
@@ -103,11 +87,10 @@ src/lib.rs	the_epoch_accessors_read_the_wall_clock	time-epoch-accessors
 
 ## 4. Tests that are not spec samples
 
-> Status 2026-10-16: all 4 tests below are deleted from `src/lib.rs`.
->
-> Status 2026-10-17: their table and their rows in §2 are gone. They exercised std's `Instant` and
-> `SystemTime` (plain re-exports on native), one of them by timing a sleep, and one checked that the
-> host wall clock reads between 2020 and 2200; none sampled a property of aterm code.
+`src/lib.rs::timestamp_96_wire_codecs_and_monotonic_helpers_round_trip` has no row: it checks the
+96-bit timestamp codecs (`encode_timestamp_96_le`/`_be` and their decoders), the canonical-parts
+and saturating unit conversions, `monotonic_watermark_ms` and `deadline_remaining_ms`, which no spec
+in §1 states.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
@@ -138,9 +121,9 @@ src/lib.rs	the_epoch_accessors_read_the_wall_clock	time-epoch-accessors
 
 ## 6. Proof order (easiest high-value first)
 
-No spec here is blocked only by gap 0. Every spec needs at least gap 1 (newtype/`Option`/`Result`
-carriers) and gap 3 (calls into core `Duration`). The order below takes the specs with no floats and
-no effects first:
+Every spec needs gap 1 (newtype, `Option` and `Result` carriers) and gap 3 (calls into core
+`Duration`), and every shim spec needs the `cfg` fix first. The specs with no floats and no effects
+come first:
 
 1. **`time-instant-difference`**. A newtype over `Duration`, `checked_sub`/`saturating_sub` and derived
    order. Once Duration is modelled as `‖·‖ ∈ ℕ`, it is linear arithmetic. It is the template for the

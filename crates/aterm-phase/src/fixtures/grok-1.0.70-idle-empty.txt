@@ -1,0 +1,50 @@
+# grok 1.0.70 · MEASURED 2026-10-29, `aterm ctl text` of a private headless aterm (144x50, aterm 0.146.0) running the real Grok Build, launched by path in the lab's jail with a scratch `HOME` and `GROK_HOME`, the lab's `XAI_API_KEY` and `GROK_XAI_API_BASE_URL`/`GROK_CLI_CHAT_PROXY_BASE_URL=http://127.0.0.1:<port>/v1` (a local stub of xAI's API, crates/aterm-lab) · launched with no prompt: its welcome card (logo, `Grok Build  1.0.70`, Resume session ctrl+r, New worktree ctrl+w, Changelog, Quit ctrl+q) over an empty composer box (`❯` and the model `lab-stub` in its bottom edge), `Logged in with API key` under it; alt screen, bracketed paste on · cursor=45,6 (visible, blinking_block) (0-based row,col: the cell after `❯ `) · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+  /p/t/at.lab0/proj
+
+
+
+
+
+
+
+
+
+
+            ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+            │                                                                                                                      │
+            │  ⠀⠀⠀⠀⠀⠀⣀⣀⡀⠀⠀⠀⢀⠄   Grok Build  1.0.70                                                                                 │
+            │  ⠀⠀⠀⣠⣾⠿⠛⠛⠛⠛⢀⡴⠁⠀   Thanks for trying Grok Build, give feedback with /feedback!                                        │
+            │  ⠀⠀⣼⡟⠁⠀⠀⠀⢀⡴⠻⣿⡀⠀                                                                                                      │
+            │  ⠀⠀⣿⡇⠀⠀⠀⠔⠁⠀⠀⣿⡇⠀   Resume session                                                                             ctrl+r  │
+            │  ⠀⠀⢹⣷⠀⠀⠀⠀⠀⢀⣴⡿⠀⠀   New worktree                                                                               ctrl+w  │
+            │  ⠀⢀⠞⠁⠠⢶⣶⣶⣶⠿⠋⠀⠀⠀   Changelog                                                                                          │
+            │  ⠐⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀   Quit                                                                                       ctrl+q  │
+            │                                                                                                                      │
+            ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ ❯                                                                                                                                        │
+  ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── lab-stub ─╯
+
+                                                                                                                        Logged in with API key

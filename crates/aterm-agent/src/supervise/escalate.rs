@@ -8,9 +8,11 @@ use super::super::journal::{
     ESCALATED_BEHIND, NEEDS,
 };
 use super::*;
+use crate::harness::hold_said::NeedTail;
+
+use crate::supervise::policy::turn_end::REASON_CELLS;
 
 const SUBJECT_CELLS: usize = APPROVAL_LINE_CELLS;
-const REASON_CELLS: usize = 120;
 
 /// `s` on one line and within `cells` terminal cells ([`cut_cells`]).
 fn clip_to(s: &str, cells: usize) -> String {
@@ -234,6 +236,15 @@ pub(super) enum AttentionTarget {
     Clear,
 }
 
+/// An ask badge withheld for [`Session::stall_suspect`], raised if the next probe finds no stall.
+#[derive(Clone, Debug)]
+pub(super) struct WithheldAsk {
+    pub(super) text: String,
+    pub(super) duty: Option<Scope>,
+    pub(super) again: String,
+    pub(super) turn_end_badge: bool,
+}
+
 impl<C: Ctl> Session<'_, C> {
     /// Current desired text, or an adopted entry before this loop changed it.
     pub(super) fn attention_text(&self) -> Option<&str> {
@@ -245,7 +256,9 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     fn forget_attention(&mut self) {
+        self.withheld_ask = None;
         self.attention_desired = None;
+        self.attention_duty = None;
         self.attention_ours = None;
         self.attention_pending = false;
         self.attention_retry_at = None;
@@ -263,6 +276,10 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     pub(super) fn write_attention_target(&mut self) -> Result<String, Fail> {
+        let _duty = self
+            .attention_duty
+            .or(self.duty.get())
+            .map(|scope| self.metadata_duty_guard(scope));
         if self.handing_over() {
             self.arm_attention_retry();
             return Ok("skipped: the watcher is handing its badges over".to_string());
@@ -362,6 +379,7 @@ impl<C: Ctl> Session<'_, C> {
 
     /// Request cleanup even where the original SET was never acknowledged.
     pub(super) fn clear_attention_entry(&mut self) -> Result<String, Fail> {
+        self.withheld_ask = None;
         self.attention_desired = Some(AttentionTarget::Clear);
         self.write_attention_target()
     }
@@ -409,6 +427,9 @@ impl<C: Ctl> Session<'_, C> {
         opts: &SuperviseOpts,
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
+        let _duty = self
+            .attention_duty
+            .map(|scope| self.metadata_duty_guard(scope));
         self.metadata_global = opts.policy.autopilot;
         self.arm_attention_retry();
         match self.metadata_authority(false) {
@@ -557,6 +578,7 @@ impl<C: Ctl> Session<'_, C> {
         opts: &SuperviseOpts,
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
+        let _duty = self.metadata_duty_guard(Scope::TurnEnd);
         self.metadata_global = opts.policy.autopilot;
         // A refused or lost policy read also waits before another attempt.
         self.arm_needs_retry();
@@ -576,7 +598,7 @@ impl<C: Ctl> Session<'_, C> {
             }
         }
         self.metadata_only(false, |s| {
-            if s.turn_end.needs_key() != 0 && s.metadata_mode().is_none() {
+            if s.turn_end.shown_key() != 0 && s.metadata_mode().is_none() {
                 s.arm_needs_retry();
                 return Ok(());
             }
@@ -605,14 +627,10 @@ impl<C: Ctl> Session<'_, C> {
             ));
             return Ok(());
         }
-        if self.withhold_badge(seq, kind, review)? {
-            return Ok(());
-        }
-        self.attention_desired = Some(AttentionTarget::Set {
-            text: fit_bytes(text, ATTENTION_BYTES),
-            kind,
+        let duty = self.duty.get().or(match kind {
+            Escalation::Limit { .. } => Some(Scope::Walls),
+            Escalation::Ask => None,
         });
-        let said = self.write_attention_target()?;
         let adopted =
             matches!(kind, Escalation::Limit { .. }) && std::mem::take(&mut self.adopted_limit);
         let again = match again {
@@ -620,6 +638,20 @@ impl<C: Ctl> Session<'_, C> {
             None if adopted => format!(" again={AGAIN_ADOPTED}"),
             None => String::new(),
         };
+        let text = fit_bytes(text, ATTENTION_BYTES);
+        if self.withhold_badge(seq, kind, review)? {
+            self.withheld_ask = Some(WithheldAsk {
+                text,
+                duty,
+                again,
+                turn_end_badge: false,
+            });
+            return Ok(());
+        }
+        self.withheld_ask = None;
+        self.attention_duty = duty;
+        self.attention_desired = Some(AttentionTarget::Set { text, kind });
+        let said = self.write_attention_target()?;
         review.note(&format!("ESCALATED seq={seq} attention={}{again}", said));
         Ok(())
     }
@@ -632,6 +664,17 @@ impl<C: Ctl> Session<'_, C> {
         reason: Option<&str>,
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
+        let reader = self.reader(&point.screen.rows);
+        let scope = if let Some(prompt) = reader.prompt(&point.screen.rows) {
+            duty::prompt_scope(prompt.kind)
+        } else if reader.wall(&point.screen.rows).is_some() {
+            Some(Scope::Walls)
+        } else if point.phase == Phase::Question {
+            Some(Scope::Questions)
+        } else {
+            Some(Scope::TurnEnd)
+        };
+        let _duty = scope.map(|scope| self.metadata_duty_guard(scope));
         let key = self.review_key(point);
         if std::mem::take(&mut self.adopted_box)
             && self.box_ask.as_ref().is_some_and(|b| b.key == key)
@@ -666,6 +709,9 @@ impl<C: Ctl> Session<'_, C> {
     /// Unset this loop's own attention entry (`meta unset attention owner=supervisor`) when
     /// `ours` says its text is the kind being closed.
     pub(super) fn unset_if_ours(&mut self, ours: fn(&str) -> bool) -> Result<String, Fail> {
+        if self.withheld_ask.as_ref().is_some_and(|w| ours(&w.text)) {
+            self.withheld_ask = None;
+        }
         Ok(match self.attention_text() {
             Some(text) if ours(text) => return self.clear_attention_entry(),
             Some(_) => ATTENTION_KEPT.to_string(),
@@ -760,6 +806,10 @@ pub(super) const NEEDS_LEFT: u64 = 0;
 /// Why the entry a loop before this one left ([`NEEDS_LEFT`]) is taken down.
 pub(super) const NEEDS_LEFT_DOWN: &str = "no need stands at the loop's start";
 
+/// Why the entry is taken down where every need standing is a line the owner's standing go-ahead
+/// answers (DESIGN-harness-autopilot §15.6).
+pub(super) const NEEDS_ANSWERED_DOWN: &str = "the go-ahead answers what stood";
+
 /// Whether a `meta` reply's `attention_kinds=` (`<ask|wait|->:<owner>` per entry, comma-joined,
 /// oldest first; an owner may hold a `:`) names an entry of `owner`.
 pub(super) fn kinds_name_owner(kinds: &str, owner: &str) -> bool {
@@ -768,23 +818,48 @@ pub(super) fn kinds_name_owner(kinds: &str, owner: &str) -> bool {
         .any(|entry| entry.split_once(':').is_some_and(|(_, o)| o == owner))
 }
 
-/// The needs entry's text: the first need and a count of the rest, within [`ATTENTION_BYTES`].
-pub(super) fn needs_attention_text(program: &str, needs: &[String]) -> String {
+/// The needs entry's text: the first need and a count of the rest, then what the harness does
+/// beside them (`tail`), within [`ATTENTION_BYTES`].
+pub(super) fn needs_attention_text(program: &str, needs: &[String], tail: NeedTail) -> String {
     let first = needs.first().map_or("", String::as_str);
     let more = match needs.len() {
         0 | 1 => String::new(),
         n => format!(" (+{} more)", n - 1),
     };
     let head = format!("{program} needs you: ");
-    let tail = format!("{more} — carrying on");
+    let tail = format!("{more} \u{2014} {}", tail.words());
     let room = ATTENTION_BYTES.saturating_sub(head.len() + tail.len());
     let need = clip_bytes(clip_to(first, SUBJECT_CELLS), room);
     fit_bytes(&format!("{head}{need}{tail}"), ATTENTION_BYTES)
 }
 
+/// The key the needs entry is told under ([`Session::needs_told`]): the set's own
+/// (`TurnEndState::shown_key`, `0` for none) where the harness carries on beside it, another
+/// where the work waits only on the person, so the entry's words follow a rest or a landing that
+/// leaves the set as it was.
+fn entry_key(shown: u64, tail: NeedTail) -> u64 {
+    match (shown, tail) {
+        (0, _) | (_, NeedTail::CarryingOn) => shown,
+        (key, NeedTail::WaitsOnYou) => (key ^ 0x5741_4954_535f_4f4e).max(1),
+    }
+}
+
 impl<C: Ctl> Session<'_, C> {
-    /// Bring the needs entry in line with the worker's standing needs: raise it (loud, never
-    /// blocking; not under Off), or take it down when none stands or another supervisor holds it.
+    /// WHAT THE NEEDS ENTRY SAYS THE HARNESS DOES BESIDE THE NEEDS under `mode` ([`NeedTail`]):
+    /// under Land, where it rests on them or the work landed beside them, the work waits only on
+    /// the person; it carries on otherwise.
+    fn need_tail(&self, mode: Autopilot) -> NeedTail {
+        if mode == Autopilot::Land && (self.turn_end.land_resting() || self.turn_end.landed()) {
+            NeedTail::WaitsOnYou
+        } else {
+            NeedTail::CarryingOn
+        }
+    }
+
+    /// Bring the needs entry in line with the worker's standing needs less the lines the owner's
+    /// standing go-ahead answers (`TurnEndState::shown_needs`, DESIGN-harness-autopilot §15.6):
+    /// raise it (loud, never blocking; not under Off), or take it down when none of them stands or
+    /// another supervisor holds it.
     pub(super) fn sync_needs(
         &mut self,
         screen: &Screen,
@@ -802,6 +877,7 @@ impl<C: Ctl> Session<'_, C> {
         cfg: &super::super::config::SupervisorConfig,
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
+        let _duty = self.metadata_duty_guard(Scope::TurnEnd);
         self.metadata_global = cfg.autopilot;
         if self.needs_not_ours() {
             return self.needs_down(
@@ -811,10 +887,13 @@ impl<C: Ctl> Session<'_, C> {
             );
         }
         let seq = screen.seq;
-        let key = self.turn_end.needs_key();
+        let tail = self.need_tail(cfg.autopilot_for(self.autopilot.word()));
+        let key = entry_key(self.turn_end.shown_key(), tail);
         if key == 0 {
             let why = if self.needs_told == Some(NEEDS_LEFT) {
                 NEEDS_LEFT_DOWN
+            } else if self.turn_end.needs_answered() > 0 {
+                NEEDS_ANSWERED_DOWN
             } else {
                 "none stands now"
             };
@@ -827,9 +906,9 @@ impl<C: Ctl> Session<'_, C> {
         if cfg.autopilot_for(self.autopilot.word()) == Autopilot::Off {
             return Ok(());
         }
-        let needs = self.turn_end.standing_needs().to_vec();
+        let needs = self.turn_end.shown_needs().to_vec();
         let program = self.reader(&screen.rows).program().name();
-        let mut text = needs_attention_text(program, &needs);
+        let mut text = needs_attention_text(program, &needs, tail);
         let owner = format!("owner={NEEDS_ATTENTION_OWNER}");
         let kind = format!("kind={}", aterm_types::needs::AttentionKind::Ask.word());
         self.arm_needs_retry();
@@ -858,13 +937,28 @@ impl<C: Ctl> Session<'_, C> {
             self.needs_retry_at = None;
         }
         let first = needs.first().map_or("", String::as_str);
+        let answered = match self.turn_end.needs_answered() {
+            0 => String::new(),
+            n => format!(" answered={n}"),
+        };
         review.note(&format!(
-            "{NEEDS} seq={seq} count={} attention={} {}",
+            "{NEEDS} seq={seq} count={} attention={}{answered} {}",
             needs.len(),
             reply_word(&r),
             clip_to(first, SUBJECT_CELLS)
         ));
         Ok(())
+    }
+
+    /// Whether the needs entry is owed a write, its retry due ([`Self::arm_needs_retry`]): a write
+    /// of it is pending, or the set it was told is not the one the menu bar shows
+    /// (`TurnEndState::shown_key`). An entry a loop before this one left ([`NEEDS_LEFT`]) where
+    /// none is shown is owed nothing here: a point takes it down ([`NEEDS_LEFT_DOWN`]).
+    pub(super) fn needs_owed(&self) -> bool {
+        let told = self.needs_told.unwrap_or(NEEDS_LEFT);
+        let tail = self.need_tail(self.autopilot.word().unwrap_or(self.metadata_global));
+        (self.needs_pending || told != entry_key(self.turn_end.shown_key(), tail))
+            && self.needs_retry_at.is_none_or(|at| self.fx.mono() >= at)
     }
 
     /// Take the needs entry down for `why` (none stands now, an Off park, the loop's end).
@@ -874,6 +968,7 @@ impl<C: Ctl> Session<'_, C> {
         why: &str,
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
+        let _duty = self.metadata_duty_guard(Scope::TurnEnd);
         if self.handing_over() {
             return Ok(());
         }
@@ -944,7 +1039,7 @@ impl<C: Ctl> Session<'_, C> {
         if self.stall_host.is_none() || self.needs_heard_as(key, &self.needs_told_text) {
             return;
         }
-        let needs = self.turn_end.standing_needs().to_vec();
+        let needs = self.turn_end.shown_needs().to_vec();
         let entry = self.needs_told_text.clone();
         self.tell_needs(key, &needs, &entry);
     }
@@ -1075,7 +1170,7 @@ mod tests {
     fn the_needs_entry_keeps_its_frame_for_a_long_need_in_any_script() {
         for letter in ["\u{915}", "\u{e01}", "\u{9a8}", "\u{25b8}"] {
             let needs = vec![letter.repeat(80), "sign 0.48.0".to_string()];
-            let t = needs_attention_text("Muse Code", &needs);
+            let t = needs_attention_text("Muse Code", &needs, NeedTail::CarryingOn);
             assert!(t.len() <= ATTENTION_BYTES, "{letter}: {}", t.len());
             assert!(
                 t.starts_with(&format!("Muse Code needs you: {letter}"))
@@ -1085,8 +1180,12 @@ mod tests {
         }
         let need = "grant Screen Recording to com.aterm.aterm".to_string();
         assert_eq!(
-            needs_attention_text("claude", &[need]),
+            needs_attention_text("claude", std::slice::from_ref(&need), NeedTail::CarryingOn),
             "claude needs you: grant Screen Recording to com.aterm.aterm \u{2014} carrying on"
+        );
+        assert_eq!(
+            needs_attention_text("agy", &[need], NeedTail::WaitsOnYou),
+            "agy needs you: grant Screen Recording to com.aterm.aterm \u{2014} waits on you"
         );
     }
 
@@ -1197,6 +1296,94 @@ mod tests {
                 &turn(Phase::Prompt, f::screen(text)),
             );
             assert_eq!(kind, want, "{}", text.lines().next().unwrap_or(""));
+        }
+    }
+
+    /// THE SIGN-IN STEP IS NEVER CUT OFF THE BADGE: a lost login's escalation through the badge's
+    /// own cut ([`attention_text`]: its reason within [`REASON_CELLS`] and within the bytes the
+    /// wall's label leaves), on agy's 401 and 400, Muse Code's rejected key, and Claude Code's
+    /// lost login at every length of its wall's words from a short one to past the badge, with
+    /// `retry_api_errors` off and over a draft (`turn_end::login_gone`).
+    #[test]
+    fn a_lost_logins_sign_in_step_survives_the_badges_own_cut() {
+        use crate::supervise::SupervisorConfig;
+        use crate::supervise::policy::turn_end::{
+            self, Composer, TurnEndAction, TurnEndReading, TurnEndState, decide_turn_end,
+        };
+        let t = std::time::Instant::now() + std::time::Duration::from_secs(10 * 3600);
+        let off = SupervisorConfig {
+            retry_api_errors: false,
+            ..SupervisorConfig::default()
+        };
+        // Read as `turn_end`'s own tests read each program's screen.
+        let badge =
+            |program: &str, rows: &[String], composer: Option<Composer>, c: &SupervisorConfig| {
+                let claude = program == "claude";
+                let reading = aterm_phase::read(Some(program), rows, claude.then_some(2));
+                let mut r = TurnEndReading::of(
+                    &reading,
+                    rows,
+                    false,
+                    Some(std::time::Duration::from_secs(180)),
+                    None,
+                    None,
+                );
+                r.restartable = claude;
+                if let Some(composer) = composer {
+                    r.composer = composer;
+                }
+                let how = turn_end::sign_in_how(r.program, &r.wall_message);
+                let mut st = TurnEndState::default();
+                st.observe(&r, t);
+                let a = decide_turn_end(&st, &r, c, t);
+                let TurnEndAction::Escalate { reason } = &a else {
+                    panic!("{program}: not an escalation: {a:?}");
+                };
+                let text = attention_text(
+                    r.program.reader(),
+                    &turn(Phase::Idle, rows.to_vec()),
+                    reason,
+                );
+                (text, how)
+            };
+        let screen = aterm_phase::prompt::fixtures::screen;
+        for (program, text) in [
+            ("agy", aterm_phase::agy::fixtures::lab::ERROR_401),
+            ("agy", aterm_phase::agy::fixtures::lab::ERROR_400_KEY),
+            ("muse", aterm_phase::muse::fixtures::KEY_REJECTED),
+        ] {
+            for c in [SupervisorConfig::default(), off.clone()] {
+                let (text, how) = badge(program, &screen(text), None, &c);
+                assert!(
+                    text.contains(&how),
+                    "{program}: the badge {text:?} lost {how:?}"
+                );
+            }
+        }
+        let wall_rows = |words: &str| {
+            let mut rows = screen(aterm_phase::prompt::fixtures::LOGIN_EXPIRED);
+            let at = rows
+                .iter()
+                .position(|row| row.starts_with("⏺ Login expired"))
+                .expect("the wall row");
+            rows[at] = format!("⏺ {words}");
+            rows
+        };
+        // From a wall that fits both cuts to one past the cells, in plain and in multibyte words
+        // (`—` is three bytes in one cell): between them the bytes the label leaves run out first.
+        for (n, filler) in (0..=100).flat_map(|n| [(n, "x"), (n, "—")]) {
+            let words = format!("Please run /login · API Error: 401 {}", filler.repeat(n));
+            let rows = wall_rows(&words);
+            for (composer, c) in [
+                (None, &off),
+                (Some(Composer::Typed), &SupervisorConfig::default()),
+            ] {
+                let (text, how) = badge("claude", &rows, composer.clone(), c);
+                assert!(
+                    text.contains(&how) && text.contains("the login is gone"),
+                    "{n} ({composer:?}): the badge {text:?} lost {how:?}"
+                );
+            }
         }
     }
 

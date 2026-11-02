@@ -130,6 +130,9 @@ fn an_event_only_open_of_a_fifo_returns_at_once_refused() {
     assert!(not_regular(
         &open_evtonly(&root.join("real/file"), Kind::Dir).expect_err("refused")
     ));
+    assert!(not_regular(
+        &open_evtonly(&root.join("chain/secret"), Kind::Other).expect_err("refused before open")
+    ));
 }
 
 /// A WATCH HEARS A WRITE IN ITS FOLDER and a file's going, and the bell ends a wait. The waits
@@ -150,12 +153,30 @@ fn a_watch_hears_its_folder_change_and_its_file_go() {
     assert!(fired.gone, "the file's watch says it left its name");
     watcher.ring().expect("rung");
     assert!(
-        watcher
-            .wait(Duration::from_secs(60))
-            .expect("woken")
-            .is_empty(),
-        "the bell returns an empty wait"
+        watcher.wait(Duration::MAX).expect("woken").is_empty(),
+        "the bell returns an empty wait even at Duration::MAX"
     );
+}
+
+/// A rename and removal of a replacement cannot certify deletion of the watched inode.
+/// Its own directory removal supplies a distinct deletion note, consumed without waiting.
+#[test]
+fn a_deletion_note_binds_the_held_directory_and_excludes_a_rename() {
+    let (_dir, root) = scratch();
+    let named = root.join("held-directory");
+    let aside = root.join("renamed-directory");
+    std::fs::create_dir(&named).unwrap();
+    let held = std::fs::File::open(&named).unwrap();
+    let watcher = Watcher::new().unwrap();
+    watcher.add(held.as_fd(), 19).unwrap();
+    assert!(!watcher.deleted(19).unwrap());
+    std::fs::rename(&named, &aside).unwrap();
+    std::fs::create_dir(&named).unwrap();
+    std::fs::remove_dir(&named).unwrap();
+    assert!(!watcher.deleted(19).unwrap());
+    std::fs::remove_dir(&aside).unwrap();
+    assert!(watcher.deleted(19).unwrap());
+    assert!(!watcher.deleted(19).unwrap());
 }
 
 fn until_fired(watcher: &Watcher, id: u64) -> Fired {

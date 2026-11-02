@@ -18,27 +18,53 @@ pub type CtlStream = std::os::unix::net::UnixStream;
 #[cfg(unix)]
 pub type CtlListener = std::os::unix::net::UnixListener;
 
-/// Unix-domain connections bounded by an absolute deadline.
+/// Unix-domain and TCP connections bounded by a deadline, each socket kept out of children from
+/// its creation ([`kept_out`]) with no spawn held back for the connect.
 #[cfg(unix)]
 pub mod connect;
 
-/// Keep a socket out of every child this process forks or spawns (`FD_CLOFORK`).
+/// Connect to `addr` within `timeout`, as `TcpStream::connect_timeout` does: every TCP dial of
+/// aterm's, refused before any socket is made where a debug build's partition cut lists `addr`
+/// ([`partition::check`]). On Unix the socket is kept out of every child from its creation, with
+/// no spawn held back for the connect ([`connect::tcp_within`]).
 ///
-/// On macOS a socket is drained for good when one of its descriptors closes while another
-/// process is inside a call on that descriptor (a same-user descriptor scan such as lsof or
-/// aterm's job sampler, `aterm_sysprobe::jobs`, or an `fstat`): every later blocking read of
-/// the socket answers `EBADF` at once, and a drained listener hands that to every connection it
-/// accepts. A spawned child holds a copy of each of its parent's descriptors until its `exec`
-/// closes it, even under `POSIX_SPAWN_CLOEXEC_DEFAULT`, so a scan of a child being spawned
-/// drains the parent's sockets. Mark each long-lived socket (a listener, what it accepts, a
-/// connection kept open) as it is created. Off Apple it does nothing
-/// (`astream_sys::close_on_fork`).
+/// # Errors
+/// As [`connect::tcp_within`].
+#[cfg(unix)]
+pub fn connect_tcp(
+    addr: &std::net::SocketAddr,
+    timeout: std::time::Duration,
+) -> std::io::Result<std::net::TcpStream> {
+    connect::tcp_within(addr, timeout)
+}
+
+/// Elsewhere: the partition cut, then `TcpStream::connect_timeout`, as a socket reaches a child
+/// only when it is made inheritable.
+///
+/// # Errors
+/// The cut (`HostUnreachable`), or `TcpStream::connect_timeout`'s.
+#[cfg(not(unix))]
+pub fn connect_tcp(
+    addr: &std::net::SocketAddr,
+    timeout: std::time::Duration,
+) -> std::io::Result<std::net::TcpStream> {
+    partition::check(*addr)?;
+    std::net::TcpStream::connect_timeout(addr, timeout)
+}
+
+/// Request that a supporting kernel exclude a socket from forked children (`FD_CLOFORK`).
+///
+/// [`kept_out`] makes this request before a concurrent spawn can copy the descriptor table.
+/// Some Apple kernels accept but ignore the flag: this best-effort wrapper does not establish
+/// fork exclusion there. The spawn's close-on-exec policy remains necessary. Callers requiring
+/// an observed capability result can use `astream_sys::close_on_fork` directly. Off Apple the
+/// request does nothing.
 ///
 /// # Errors
 /// The `fcntl(2)` errno of reading or setting the descriptor's flags.
 #[cfg(unix)]
 pub fn keep_out_of_children(socket: &impl std::os::fd::AsFd) -> std::io::Result<()> {
-    astream_sys::close_on_fork(socket.as_fd())
+    astream_sys::close_on_fork(socket.as_fd()).map(|_| ())
 }
 
 /// Windows: nothing to do, as a handle reaches a child only when it is made inheritable.
@@ -50,11 +76,122 @@ pub fn keep_out_of_children<T>(_socket: &T) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Create descriptors and request close-on-fork before a concurrent spawn can copy them:
+/// `create` makes them (a connect, a bind, an `accept`, a `socketpair`, a `try_clone`) and each
+/// receives [`keep_out_of_children`] under [`spawn_lock`]. Kernels that ignore the requested
+/// flag retain ordinary fork inheritance and the spawn's close-on-exec policy.
+/// `create` must not block (an `accept` is on a nonblocking listener, a
+/// connect is a Unix-domain one or only the `socket(2)`), and must not spawn: every spawn of this
+/// process waits for it. A descriptor made here still reaches a child it is handed to through
+/// [`spawnfd`] (stdio or a lane), which unmarks it for that child alone.
+///
+/// # Errors
+/// `create`'s error, or the mark's `fcntl(2)` errno (the descriptors are then closed).
+#[cfg(unix)]
+pub fn kept_out<T: spawn_lock::Descriptors, E: From<std::io::Error>>(
+    create: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    spawn_lock::creating(create, |made| made.mark().map_err(E::from))
+}
+
+/// A listener [`accept`] takes connections from: a Unix-domain or a TCP one.
+#[cfg(unix)]
+pub trait Listens: std::os::fd::AsFd {
+    /// The connection one accept answers.
+    type Stream: spawn_lock::Descriptors;
+    /// The peer's address, answered beside it.
+    type Peer: spawn_lock::Descriptors;
+    /// Make the listener's accepts answer at once (`O_NONBLOCK`).
+    ///
+    /// # Errors
+    /// The `fcntl(2)` errno.
+    fn nonblocking(&self) -> std::io::Result<()>;
+    /// One `accept(2)`.
+    ///
+    /// # Errors
+    /// Its errno (`WouldBlock` with no connection waiting).
+    fn accept_now(&self) -> std::io::Result<(Self::Stream, Self::Peer)>;
+    /// Make an accepted connection's I/O wait again (it took the listener's nonblocking mode).
+    ///
+    /// # Errors
+    /// The `fcntl(2)` errno.
+    fn blocking(stream: &Self::Stream) -> std::io::Result<()>;
+}
+
+#[cfg(unix)]
+macro_rules! listens {
+    ($($listener:ty => $stream:ty, $peer:ty);* $(;)?) => {$(
+        impl Listens for $listener {
+            type Stream = $stream;
+            type Peer = $peer;
+            fn nonblocking(&self) -> std::io::Result<()> {
+                self.set_nonblocking(true)
+            }
+            fn accept_now(&self) -> std::io::Result<($stream, $peer)> {
+                self.accept()
+            }
+            fn blocking(stream: &$stream) -> std::io::Result<()> {
+                stream.set_nonblocking(false)
+            }
+        }
+    )*};
+}
+
+#[cfg(unix)]
+listens!(
+    std::os::unix::net::UnixListener => std::os::unix::net::UnixStream, std::os::unix::net::SocketAddr;
+    std::net::TcpListener => std::net::TcpStream, std::net::SocketAddr;
+);
+
+/// Accept the next connection on `listener` as a blocking `accept` would, the connection kept out
+/// of every child from its creation: the wait for one is a `poll(2)` that holds nothing
+/// ([`ready::one`]), and only the `accept(2)` and its mark hold the spawn lock ([`kept_out`]), so
+/// no spawn waits for a connection to come. The listener is left nonblocking; the connection comes
+/// back blocking.
+///
+/// # Errors
+/// The mode's `fcntl(2)`, the `poll(2)`, the `accept(2)` (other than `EAGAIN` and `EINTR`) or
+/// the mark.
+#[cfg(unix)]
+pub fn accept<L: Listens>(listener: &L) -> std::io::Result<(L::Stream, L::Peer)> {
+    listener.nonblocking()?;
+    loop {
+        match kept_out(|| listener.accept_now()) {
+            Ok(accepted) => {
+                L::blocking(&accepted.0)?;
+                return Ok(accepted);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                ready::one(listener.as_fd())?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Windows: `create`'s answer, as a handle reaches a child only when it is made inheritable.
+///
+/// # Errors
+/// `create`'s error.
+#[cfg(windows)]
+pub fn kept_out<T, E>(create: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
+    create()
+}
+
+/// The process-wide lock between a spawn and a descriptor's creation: every spawn and fork
+/// holds [`spawn_lock::spawning`] across its descriptor table's copy, and [`kept_out`] creates
+/// and marks with none in flight.
+pub mod spawn_lock;
+
 /// The Windows AF_UNIX-over-winsock implementation of [`CtlStream`] / [`CtlListener`] (afunix.sys; raw `ws2_32` FFI, no external deps).
 #[cfg(windows)]
 pub mod win;
 #[cfg(windows)]
 pub use win::{CtlListener, CtlStream};
+
+/// Leaving a file or a folder out of backups, behind an injected platform field.
+pub mod backup;
 
 /// Unix-only: the one writer of a whole file (a new temp beside it, its mode on the descriptor, synced, renamed) and aterm.toml's, under the config service's write lock.
 #[cfg(unix)]
@@ -74,6 +211,9 @@ pub mod asleep;
 /// A deadline on a call that can block forever: in this process ([`deadline::Gate`], the shared [`deadline::TRUST`] gate) or in a child ([`deadline::output_until`]).
 #[cfg(not(target_arch = "wasm32"))]
 pub mod deadline;
+/// Unix directory identities read from one descriptor, with a persistent volume UUID where supported.
+#[cfg(unix)]
+pub mod directory_identity;
 /// Whether this process runs elevated (a Windows administrator's full token), which gives it a control directory of its own ([`control_socket_dir`]).
 pub mod elevation;
 /// A kernel witness of another process's death with its `wait(2)` status (the PTY keeper's death classifier), and the moment of it ([`exitwatch::ExitMoment`], read by `aterm ctl subscribe`'s redial).
@@ -106,7 +246,7 @@ pub mod nofollow;
 pub mod output;
 /// Who holds a file's owner lock (the PTY keeper reads a dead window's crash marker with it).
 pub mod ownerlock;
-/// The partition lane's cut: in a debug build, `ATERM_DEBUG_PARTITION` names the `ip:port`s aterm-net's and aterm-http's connect funnels refuse to dial (fleet dials, a loopback-scope `lan::Connection`, vault requests; [`partition::check`]); a LAN-scope `lan::Connection` and a direct `TcpStream` connect are not cut.
+/// The partition lane's cut: in a debug build, `ATERM_DEBUG_PARTITION` names the `ip:port`s the one TCP connect funnel, [`connect_tcp`], refuses to dial (fleet dials, a loopback-scope `lan::Connection`, vault requests, atpkg's peer fetches; [`partition::check`]); a LAN-scope `lan::Connection` and a direct `TcpStream` connect are not cut.
 pub mod partition;
 /// The kernel's record of a socket peer: its uid and (Darwin) audit token.
 pub mod peer;
@@ -118,6 +258,15 @@ pub mod private_file;
 /// `KERN_PROCARGS2`, a process's exec path, argument words and initial environment: the one reader ([`procargs::read`], macOS) and the one parser ([`procargs::parse`]) every crate reads it through, aterm-sysprobe's (its `kproc` reads a process with it, and this crate depends on that one).
 #[cfg(any(unix, windows))]
 pub use aterm_sysprobe::procargs;
+/// The hidden verbs a build's memory claim runs as (BUILD-ADMIT): atpkg's front, which claims and
+/// then becomes the build, and the holder it leaves behind; named here so the census, which does
+/// not link atpkg, names their processes.
+pub mod build_front;
+/// The leftover view's reader (`sys left`): which of this uid's processes are candidates, and each one's kernel facts for the pure judge (`aterm_vitals::left`), composed from this crate's readers through one injected seam, never reading a held program's environment or arguments.
+pub mod left;
+/// Linux's proc connector as one listener for the whole process: a subscription proven by the kernel's ack and a probe child's `exec`, each `exec` routed to the session whose shell leads the process's session (Linux 6.6 on, no capability asked).
+#[cfg(unix)]
+pub mod proc_connector;
 pub mod process;
 /// A kernel witness of a session's `exec`s (card engine §3.3): one kqueue per shell, its forks and the `exec`s and exits of its children and of the terminal's holder.
 #[cfg(unix)]
@@ -127,13 +276,18 @@ pub mod procwatch;
 pub mod program_check;
 /// `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT`: a child that inherits nothing but a `/dev/null` stdio (the PTY keeper's one spawn).
 pub mod pspawn;
+/// macOS-only: the calling thread's requested QoS class, and its lift to the default class while it does short work a thread at a higher class waits on ([`qos::lift`], [`qos::restore`]: a holder of a lock another thread wants, a fork in flight).
+#[cfg(target_os = "macos")]
+pub mod qos;
 pub mod rand;
-/// Unix-only: one wait on two descriptors with no timeout, ended by whichever is readable, at its end or in error first, reading neither (the standby bridge's wait for its lock or its aterm's word, an [`exitwatch::ExitMoment`]'s for the exit or its cancel).
+/// Unix-only: one wait on two descriptors (or one, [`ready::one`]) with no timeout, ended by whichever is readable, at its end or in error first, reading neither (the standby bridge's wait for its lock or its aterm's word, an [`exitwatch::ExitMoment`]'s for the exit or its cancel, a blocking accept loop's wait before its nonblocking `accept` under [`kept_out`]).
 #[cfg(unix)]
 pub mod ready;
 /// Unix-only: the process-wide reaper of children nobody else waits for (a dropped `spawnfd` child still running, a PTY shell past its deadline).
 #[cfg(unix)]
 pub mod reaper;
+/// Verify's run records read back: their format, the bounded read of an admitted snapshot, the `dead_seen` append, what the live runs claim and the A1–A7 verdict on one process; the window's `sys left` and doctor read them, and aterm-verify writes them.
+pub mod runs;
 /// Secret bytes: scrubbed on drop, a redacted `Debug`, no `Clone`; and the process's no-core-dump switch.
 pub mod secret;
 /// macOS's own services' footprints read without root: each resource coalition of the system's accounts alone, for the service-memory judge.
@@ -147,13 +301,29 @@ pub mod shared_write;
 pub mod shm;
 /// Which Windows console a child process gets: a windowless one when this process has none (the window), so no console flashes on screen, and nothing changed when it has one or off Windows.
 pub mod spawn;
-/// Child spawns that inherit only what they are handed: [`spawnfd::command`], the `Command` every child is built with (on Darwin one `posix_spawn`, no fork); the fabric bridge's spawn with two descriptors at fixed numbers; the inheritance strip for a spawn that must fork (the PTY child's); and [`spawnfd::transparent`], the pass-throughs' spawn, whose child inherits this process's whole table.
+/// Child spawns that inherit only what they are handed: [`spawnfd::command`], the `Command` every child is built with (on Darwin one `posix_spawn`, no fork); the fabric bridge's spawn with two descriptors at fixed numbers; the inheritance strip for a spawn that must fork (the PTY child's), and the one descriptor such a spawn may pass at a fixed number ([`spawnfd::PassAt`]); and [`spawnfd::transparent`], the pass-throughs' spawn, whose child inherits this process's whole table.
 #[cfg(unix)]
 pub mod spawnfd;
 /// Off Unix, [`spawnfd::command`] (there: the Windows console rule of [`spawn`]), [`spawnfd::transparent`], [`spawnfd::InheritNothing`] and std's `Command`, `Stdio` and `Child` under spawnfd's names, so a shared spawn site reads the same on every platform.
 #[cfg(not(unix))]
 #[path = "spawnfd_nonunix.rs"]
 pub mod spawnfd;
+
+/// The soft descriptor floor a process that fans work out over many threads
+/// and children raises itself toward ([`spawnfd::raise_soft_nofile`]): a stock
+/// macOS shell's 256 is passed by one test binary's threads together, so a run
+/// fails `Too many open files` on the caller's limit alone. One value for
+/// every raise in the tree (the GUI's successor floor, verify's stage spawn,
+/// the generated `targo` shim).
+pub const SOFT_NOFILE_FLOOR: u64 = 4096;
+
+/// The raised soft limit for `(soft, hard)`: [`SOFT_NOFILE_FLOOR`] capped at
+/// the hard limit, where that raises anything. Never a lowering.
+#[must_use]
+pub fn raised_soft_nofile_target(soft: u64, hard: u64) -> Option<u64> {
+    let target = SOFT_NOFILE_FLOOR.min(hard);
+    (target > soft).then_some(target)
+}
 /// Pure-Rust, read-only SQLite 3 B-tree and WAL snapshot reader (`#![forbid(unsafe_code)]`), paired with [`foreign_db::read_bytes`].
 pub mod sqlite_read;
 /// A verb's answer on stdout, where a reader that closed the pipe (`| head -1`) ends the answer instead of panicking the process.

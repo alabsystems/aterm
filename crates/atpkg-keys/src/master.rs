@@ -10,7 +10,8 @@ pub const MASTER_PHRASE_LEN: usize = 52;
 
 const ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
 
-fn scrub(buf: &mut [u8]) {
+/// Overwrites `buf` with zeroes via volatile writes and a sequential-consistency compiler fence.
+pub fn scrub(buf: &mut [u8]) {
     for b in buf.iter_mut() {
         // SAFETY: `b` is a live, uniquely borrowed, aligned `u8` from a mutable slice, so a
         // one-byte volatile write is in bounds and unaliased.
@@ -130,25 +131,32 @@ impl MasterPhrase {
 
     /// Decodes the phrase into its 32-byte [`MasterSeed`] ([`generate_master`], [`parse_master`]).
     pub fn seed(&self) -> MasterSeed {
-        let mut bytes = [0u8; 32];
-        let mut acc: u32 = 0;
-        let mut nbits: u32 = 0;
-        let mut out = 0usize;
-        for &c in &self.chars {
-            acc = (acc << 5) | u32::from(b32_val(c));
-            nbits += 5;
-            if nbits >= 8 {
-                nbits -= 8;
-                bytes[out] = ((acc >> nbits) & 0xff) as u8;
-                out += 1;
-            }
-        }
-        debug_assert_eq!(out, 32);
+        let mut bytes = b32_decode(&self.chars);
         let seed = MasterSeed::new(bytes);
         scrub(&mut bytes);
-        scrub_u32(&mut acc);
         seed
     }
+}
+
+/// Decodes 52 Crockford Base32 characters into the 32-byte seed, masking the 4 trailing pad bits.
+#[must_use]
+pub fn b32_decode(chars: &[u8; MASTER_PHRASE_LEN]) -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    let mut acc: u32 = 0;
+    let mut nbits: u32 = 0;
+    let mut out = 0usize;
+    for &c in chars {
+        acc = (acc << 5) | u32::from(b32_val(c));
+        nbits += 5;
+        if nbits >= 8 {
+            nbits -= 8;
+            bytes[out] = ((acc >> nbits) & 0xff) as u8;
+            out += 1;
+        }
+    }
+    debug_assert_eq!(out, 32);
+    scrub_u32(&mut acc);
+    bytes
 }
 
 const fn b32_val(c: u8) -> u8 {
@@ -238,7 +246,9 @@ pub fn generate_master() -> Result<MasterPhrase, String> {
     Ok(phrase)
 }
 
-fn encode_phrase(raw: &[u8; 32]) -> MasterPhrase {
+/// Encodes a 32-byte seed into 52 lowercase Crockford Base32 characters (`chars[51]` is `0` or `g`).
+#[must_use]
+pub fn b32_encode(raw: &[u8; 32]) -> [u8; MASTER_PHRASE_LEN] {
     let mut chars = [0u8; MASTER_PHRASE_LEN];
     let mut acc: u32 = 0;
     let mut nbits: u32 = 0;
@@ -254,6 +264,11 @@ fn encode_phrase(raw: &[u8; 32]) -> MasterPhrase {
     }
     chars[out] = ALPHABET[((acc << (5 - nbits)) & 31) as usize];
     scrub_u32(&mut acc);
+    chars
+}
+
+fn encode_phrase(raw: &[u8; 32]) -> MasterPhrase {
+    let chars = b32_encode(raw);
     let phrase = MasterPhrase { chars };
     try_lock(&phrase.chars);
     phrase
@@ -324,6 +339,26 @@ impl std::fmt::Debug for Tty {
     }
 }
 
+/// Byte length of a 52-character master phrase formatted in 4-character space-separated groups plus `\n`.
+pub const GROUPED_PHRASE_LEN: usize = MASTER_PHRASE_LEN + MASTER_PHRASE_LEN / 4 - 1 + 1;
+
+/// Formats a 52-character master phrase into 13 space-separated 4-character groups terminated by `\n`.
+#[must_use]
+pub fn format_phrase_line(chars: &[u8; MASTER_PHRASE_LEN]) -> [u8; GROUPED_PHRASE_LEN] {
+    let mut buf = [0u8; GROUPED_PHRASE_LEN];
+    let mut at = 0usize;
+    for (i, &c) in chars.iter().enumerate() {
+        if i > 0 && i % 4 == 0 {
+            buf[at] = b' ';
+            at += 1;
+        }
+        buf[at] = c;
+        at += 1;
+    }
+    buf[GROUPED_PHRASE_LEN - 1] = b'\n';
+    buf
+}
+
 impl Tty {
     /// Opens `/dev/tty` and verifies it is a terminal.
     pub fn open() -> Result<Self, String> {
@@ -352,19 +387,8 @@ impl Tty {
     /// Writes the formatted master phrase to `/dev/tty`.
     pub fn write_phrase(&mut self, phrase: &MasterPhrase) -> Result<(), String> {
         use std::io::Write as _;
-        const GROUPED: usize = MASTER_PHRASE_LEN + MASTER_PHRASE_LEN / 4 - 1 + 1;
-        let mut buf = [0u8; GROUPED];
+        let mut buf = format_phrase_line(&phrase.chars);
         try_lock(&buf);
-        let mut at = 0usize;
-        for (i, &c) in phrase.chars.iter().enumerate() {
-            if i > 0 && i % 4 == 0 {
-                buf[at] = b' ';
-                at += 1;
-            }
-            buf[at] = c;
-            at += 1;
-        }
-        buf[GROUPED - 1] = b'\n';
         let wrote = self.file.write_all(&buf).and_then(|()| self.file.flush());
         scrub(&mut buf);
         try_unlock(&buf);
@@ -695,5 +719,30 @@ mod tests {
         assert!(buf.iter().any(|b| *b != 0), "the fixture must start dirty");
         scrub(&mut buf);
         assert!(buf.iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn b32_encode_decode_and_format_phrase_line_preserve_invariants() {
+        for raw in [
+            [0x00; 32],
+            [0xFF; 32],
+            [0x01; 32],
+            *b"0123456789abcdefghijklmnopqrstuv",
+        ] {
+            let encoded = b32_encode(&raw);
+            assert!(encoded.iter().all(|c| ALPHABET.contains(c)));
+            assert!(matches!(encoded[51], b'0' | b'g'));
+            assert_eq!(b32_decode(&encoded), raw);
+            let line = format_phrase_line(&encoded);
+            assert_eq!(line.len(), 65);
+            assert_eq!(line[64], b'\n');
+            for (i, &b) in line[..64].iter().enumerate() {
+                if i % 5 == 4 {
+                    assert_eq!(b, b' ');
+                } else {
+                    assert!(ALPHABET.contains(&b));
+                }
+            }
+        }
     }
 }

@@ -20,6 +20,12 @@ pub struct Cell {
 }
 
 const _: () = assert!(std::mem::size_of::<Cell>() == 8);
+const _: () = {
+    // The NEON scrollback converter reads four interleaved u16 fields.
+    assert!(std::mem::offset_of!(Cell, char_data) == 0);
+    assert!(std::mem::offset_of!(Cell, colors) == 2);
+    assert!(std::mem::offset_of!(Cell, flags) == 6);
+};
 
 impl Default for Cell {
     #[inline]

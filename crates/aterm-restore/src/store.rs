@@ -312,15 +312,7 @@ impl<S: RegionView> Touched<S> {
     /// Whether any byte of `[at, at + len)` lies on a page this region has written.
     #[must_use]
     pub fn touches(&self, at: usize, len: usize) -> bool {
-        if len == 0 {
-            return false;
-        }
-        let last = at.saturating_add(len - 1) / PAGE;
-        (at / PAGE..=last).any(|page| {
-            self.bits
-                .get(page / 64)
-                .is_some_and(|word| word.load(Ordering::Relaxed) & (1 << (page % 64)) != 0)
-        })
+        self.touched_bytes_in(at, len) != 0
     }
 
     /// The byte ranges of the pages a store has reached, in address order.
@@ -781,6 +773,7 @@ mod touched_range_tests {
     fn written_page_ranges_survive_zeroing_and_clip_untrusted_bounds() {
         let store = Touched::new(VecStore::new(130 * PAGE + 1), None);
         assert_eq!(store.touched_bytes_in(0, usize::MAX), 0);
+        assert!(!store.touches(0, usize::MAX));
         for page in [0, 63, 64, 129, 130] {
             store
                 .write(page * PAGE, &[9])
@@ -788,12 +781,18 @@ mod touched_range_tests {
         }
         assert_eq!(store.touched_bytes(), 5 * PAGE);
         assert_eq!(store.touched_bytes_in(0, usize::MAX), 5 * PAGE);
+        assert!(store.touches(0, usize::MAX));
         assert_eq!(store.touched_bytes_in(63 * PAGE, 2 * PAGE), 2 * PAGE);
         assert_eq!(store.touched_bytes_in(64 * PAGE - 1, 2), 2 * PAGE);
         assert_eq!(store.touched_bytes_in(PAGE, 62 * PAGE), 0);
+        assert!(!store.touches(PAGE, 62 * PAGE));
         assert_eq!(store.touched_bytes_in(130 * PAGE, usize::MAX), PAGE);
+        assert!(store.touches(130 * PAGE, usize::MAX));
+        assert!(!store.touches(130 * PAGE + 1, usize::MAX));
         assert_eq!(store.touched_bytes_in(0, 0), 0);
+        assert!(!store.touches(0, 0));
         assert_eq!(store.touched_bytes_in(usize::MAX, usize::MAX), 0);
+        assert!(!store.touches(usize::MAX, usize::MAX));
         for page in [0, 63, 64, 129, 130] {
             store.write(page * PAGE, &[0]).expect("zero the old byte");
         }

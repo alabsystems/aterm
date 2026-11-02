@@ -327,7 +327,8 @@ impl<C: Ctl> Session<'_, C> {
         else {
             return None;
         };
-        let (now, local) = (self.now_unix(), self.local_offset_s());
+        let now = self.now_unix();
+        let local = self.local_offset_s(now);
         let about = named_year(when).map_or(now, |year| {
             limit::days_from_civil(year, *month, *day) * 86_400 + 43_200
         });
@@ -503,7 +504,7 @@ impl<C: Ctl> Session<'_, C> {
             }
             return Ok(false);
         }
-        if self.stall_look(seq, state, review)? {
+        if self.stall_look(turn, state, review)? {
             let step = self.reset_wait(None, deadline);
             self.wait(&["seq", &seq.to_string()], step)?;
             return Ok(true);
@@ -519,6 +520,7 @@ impl<C: Ctl> Session<'_, C> {
         opts: &SuperviseOpts,
         review: &mut dyn Review,
     ) -> Result<bool, Fail> {
+        let _duty = self.duty_guard(Scope::Walls);
         let waits = self.setup.reset_waits;
         let mut screen = match first {
             Some(screen) => screen,

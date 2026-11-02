@@ -1,0 +1,15 @@
+# kimi 2.4.0 · MEASURED 2026-10-29, `aterm ctl text` of a private headless aterm (110x32, aterm 0.146.0) running the real Kimi Code, launched by path with a scratch `HOME` and `KIMI_CODE_HOME` whose `config.toml` names one `openai`-type provider at `http://127.0.0.1:<port>/v1` with a fake key (a local stub of the Chat Completions API, crates/aterm-lab), no login · first launch in a fresh folder: the folder-trust prompt, `Trust and continue` selected
+ ────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Trust this folder?
+  ↑↓ navigate · Enter select · Esc exit
+
+  /private/tmp/at.H2aa/proj
+
+  No project integrations or instructions to activate.
+
+  Trust is remembered for this folder, including future project config changes.
+  Tool approvals follow your permission settings.
+
+   ❯ Trust and continue
+     Exit
+ ────────────────────────────────────────────────────────────────────────────────────────────────────────────

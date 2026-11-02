@@ -1063,6 +1063,22 @@ impl App {
         self.redraw_claude_footer(session);
     }
 
+    /// Ask the resolver to read `session`'s footer now (the account card's store look rides it).
+    pub(crate) fn request_account_read(&self, session: u64) {
+        let pgid = self.pool.get(session).map(|entry| {
+            entry
+                .ctx
+                .timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .agent()
+                .program_pgid
+        });
+        if let Some(pgid) = pgid.filter(|pgid| *pgid > 0) {
+            self.request_footer_now(session, pgid);
+        }
+    }
+
     fn request_footer_now(&self, session: u64, pgid: i32) {
         #[cfg(test)]
         {

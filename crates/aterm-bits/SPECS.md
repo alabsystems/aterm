@@ -1,31 +1,17 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-bits: spec recovery from its 7 unit tests
+# aterm-bits: spec recovery from unit tests
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 1 test it
-> deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
-> were taken before.
-
-> Status 2026-10-16: this is the crate's migration worklist. Each spec below is proved
-> through Trust/Clean about the compiled Rust function, and then the tests it subsumes are
-> deleted. No test has been deleted yet. The crate's floor today is 5 of 20 obligations
-> proved (`crates/aterm-release/trust/floors.tsv`, seal `321aaeda7`).
-
-Source: `crates/aterm-bits/src/lib.rs` (read only). All 7 `#[test]` fns are in its
-`mod tests`, and I read each one and the code it reaches. Nothing was compiled or run. The
-claims below come from reading the code.
-
-Result: **6 specs**, covering **all 7 tests**. **0 tests are not spec samples** (§4).
-Gap numbers refer to the table in
-`AUDIT-trust-for-test-migration-2026-10-15.md` (historical internal audit) §7.
+The specs that the tests in `src/lib.rs`'s `mod tests` sample. Once a spec is proved through
+Trust/Clean about the compiled function, the tests it subsumes are deleted.
 
 ## 0. Notation used in the statements
 
 - `sA = size_of::<A>()`, `sB = size_of::<B>()`, `alB = align_of::<B>()`.
 - `addr(s) = s.as_ptr() as usize`.
-- `byte_len(src) = size_of_val(src) = sA · src.len()`. This cannot overflow: a slice spans at most
-  `isize::MAX` bytes.
+- `byte_len(src) = size_of_val(src) = sA · src.len()`, which cannot overflow: a slice spans at
+  most `isize::MAX` bytes.
 - `Bytes(s, n)`: the `n` initialized bytes reachable from `s`'s data pointer (the object
   representation). For a `Pod` type every such byte sequence is a valid value.
   `Bytes(&[v], size_of::<T>())` is `v`'s native-endian representation, for example
@@ -45,17 +31,16 @@ Gap numbers refer to the table in
   4. Otherwise `Ok(out)` with `out.len() = byte_len(src) / sB`, `addr(out) = addr(src)`, and
      `Bytes(out) = Bytes(src)`. The `ptr_b as usize == 0` guard before it is unreachable.
 
-  **The order matters.** Alignment is decided before slop. An empty non-ZST `src` whose address is
-  under-aligned for `B` is an `Err`, not `Ok(empty)`.
+  Alignment is decided before slop, so an empty non-ZST `src` whose address is under-aligned for
+  `B` is an `Err`, not `Ok(empty)`.
+- `blocking_gaps` numbers are rows of the gap table in
+  `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7. Gap 0 (an installed seal that publishes
+  Clean rows) blocks every row.
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes (primary tests; secondary in §2)`,
-`difficulty (Rust features the proof must handle)`, `blocking gaps (audit §7)`.
-
-Gap 0 (an installed seal that publishes Clean rows) blocks every row. Seal `150efe4a` fixes it
-locally, but admitting it to the machine's `trust` channel is owner-gated. No spec here is blocked
-by gap 0 alone.
+`subsumes` lists the primary tests (secondary ones are in §2); `difficulty` names the Rust
+features the proof must handle.
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
@@ -66,39 +51,6 @@ cast-slice-bytes-round-trip	round-trip	cast_slice, try_cast_slice	∀ A: Pod wit
 bytes-of-view	contract	bytes_of	∀ T: Pod, v: &T: bytes_of(v).len() = size_of::<T>(), bytes_of(v).as_ptr() = v as *const T as *const u8 (it aliases v; the is_null branch is unreachable), and Bytes(bytes_of(v)) is v's object representation. For every primitive integer/float T: T::from_ne_bytes(bytes_of(&x)) = x (bitwise for floats). Never panics.	bytes_of_single_value	EASY-MEDIUM: generic T over an unsafe trait, ptr::from_ref + cast + is_null, unsafe slice::from_raw_parts, slice result; from_ne_bytes/try_into for the corollary	0, 1, 3, 8, 11
 zeroed-is-all-zero-bits	contract	Zeroable::zeroed	∀ T: Zeroable: every byte of the object representation of T::zeroed() is 0. Hence T::zeroed() = 0 for each integer primitive, +0.0 (bits 0) for f32/f64, [T::zeroed(); N] for [T; N], and each field's zeroed() for a #[repr(C)] struct of Zeroable fields. For T: Pod: bytes_of(&T::zeroed()) = [0u8; size_of::<T>()].	-	EASY once core::mem::zeroed has an intrinsic model: an unsafe trait default method, generics over every impl (primitives via macro, arrays with const generic N, unit), float bit patterns	0, 1, 8, 11
 ```
-
-### Distribution by kind (6)
-
-| kind | count | ids |
-|---|---|---|
-| contract | 3 | try-cast-slice-classify, bytes-of-view, zeroed-is-all-zero-bits |
-| refinement | 1 | cast-slice-refines-try |
-| table-property | 1 | pod-cast-error-display-table |
-| round-trip | 1 | cast-slice-bytes-round-trip |
-
-### Gap histogram (gap → specs blocked)
-
-| gap | specs | ids |
-|---|---|---|
-| 0 | 6 | all |
-| 1 | 6 | all |
-| 3 | 4 | try-cast-slice-classify, cast-slice-refines-try, pod-cast-error-display-table, bytes-of-view |
-| 4 | 3 | cast-slice-refines-try, pod-cast-error-display-table, cast-slice-bytes-round-trip |
-| 5 | 2 | try-cast-slice-classify, cast-slice-bytes-round-trip |
-| 8 | 4 | try-cast-slice-classify, cast-slice-bytes-round-trip, bytes-of-view, zeroed-is-all-zero-bits |
-| 11 | 5 | try-cast-slice-classify, cast-slice-refines-try, cast-slice-bytes-round-trip, bytes-of-view, zeroed-is-all-zero-bits |
-
-Gap 11 (generics) is the crate's defining gap. Every public fn is generic over `Pod`, and the
-uninstantiated generic emits nothing today. Until gap 11 closes, the practical route is to prove
-each spec at the concrete instances aterm uses (`aterm-gpu`'s vertex and uniform types and `u8`).
-Gap 8 here is the unsafe-block discharge part only (`from_raw_parts`, `mem::zeroed`), not platform
-effects.
-
-### Proof dependency order
-
-`pod-cast-error-display-table` → `try-cast-slice-classify` → `cast-slice-refines-try` →
-`cast-slice-bytes-round-trip` (free). `bytes-of-view` and `zeroed-is-all-zero-bits` are independent of
-the cast chain. `zeroed-is-all-zero-bits`'s `bytes_of` corollary uses `bytes-of-view`.
 
 ## 2. Test → spec map (TSV)
 
@@ -114,27 +66,47 @@ src/lib.rs	exact_panic_message_matches_display	cast-slice-refines-try	pod-cast-e
 src/lib.rs	empty_slice_cast	try-cast-slice-classify	cast-slice-refines-try, cast-slice-bytes-round-trip
 ```
 
-## 3. Coverage
+## 3. Tests with no row
 
-- 7 original tests read. All 7 map to one of the 6 specs. None is a non-spec check.
-- `try-cast-slice-classify` is the keystone. It has 2 primary tests, but it makes
-  `cast-slice-bytes-round-trip` (2 primary) free and supplies the `Ok`/`Err` facts that
-  `cast-slice-refines-try` composes.
-- `pod-cast-error-display-table` retires no test alone. It is the lemma that makes the panic-message
-  half of `cast-slice-refines-try` hold by construction.
+`pod_layout_and_cast_wire_roundtrip` samples `validate_pod_cast_params` and the `PODL`/`PODC`
+wire codecs (`encode_pod_layout_wire`, `decode_pod_layout_wire`, `encode_pod_cast_wire`,
+`decode_pod_cast_wire`), which no spec row covers.
 
-## 4. Tests that are not spec samples
+## 4. Open findings
 
-None. Every test samples one of the specs above.
+1. **`SizeMismatch`'s doc and message describe a short slice.** The doc says "The source slice is
+   not large enough to cover one target value" and `Display` "input slice is smaller than one
+   output value", but `try_cast_slice` returns `SizeMismatch` only for a ZST mismatch: 0 bytes to
+   `u32` is `Ok(empty)` when aligned, and 3 bytes is `OutputSliceWouldHaveSlop`. A new message
+   changes the literal in `panic_cast_failed!` too.
+2. **`cast_slice`'s `# Panics` names only the ZST mismatch.** It also panics on misalignment and
+   on slop (`cast-slice-refines-try`).
+3. **Two tests pass because of where their slice lives.** Alignment is checked before length.
+   `empty_slice_cast` gets `Ok` only because its empty `&[u8]` inherits the 4-aligned address of a
+   `[u32; 0]`; an empty `u8` slice is only guaranteed 1-aligned, and at an address that is not
+   4-aligned `try_cast_slice::<u8, u32>` is `Err(TargetAlignmentGreaterAndInputNotAligned)`.
+   `try_cast_slice_slop_returns_err` reaches the slop branch only because `bytes[..6]` starts
+   `u32`-aligned. `try-cast-slice-classify` states the address-dependent rule.
+4. **`bytes_of`'s non-null guard is a call.** It calls `ptr.is_null()`, where `try_cast_slice`
+   compares `ptr_b as usize == 0`. Give `bytes_of` the integer compare before Trust lowers
+   `bytes-of-view`; the branch is unreachable either way, since a reference is never null.
 
-Actions that come with the migration:
+## 5. Proof order (easiest high-value first)
 
 | item | action |
 |---|---|
 | The `panic_message` helper (`catch_unwind` + downcast) | **delete with `exact_panic_message_matches_display`**. |
 | The doc comment on `panic_cast_failed!` | *(Resolved)* Already states the `PodCastError` `Display` text contract directly without citing a test name. |
 
-## 5. Implied specs that look wrong, or disagree with the code
+1. **`pod-cast-error-display-table`**: a three-arm enum match to string literals with no
+   generics, loops or unsafe code; gaps 3 and 4 enter only through `f.write_str` and `ToString`.
+   It is the lemma `cast-slice-refines-try` uses for its message.
+2. **`try-cast-slice-classify`**, at `<u8, u32>`, `<u32, u8>`, `<f32, u8>`, `<u8, f32>` and
+   `<(), u8>`, then generically. The body is straight-line integer arithmetic and branches; the
+   hard part is the "same bytes" clause over `from_raw_parts` (gap 8), so the length, address and
+   `Err` parts come first. It makes `cast-slice-bytes-round-trip` free.
+3. **`cast-slice-refines-try`**: composition (gap 4) with a match whose arms are static panics.
+   It needs a panic-payload observation in the spec language.
 
 1. *(Partially resolved)* **`SizeMismatch`'s doc now names the ZST mismatch**; its `Display` text is
    kept unchanged while `panic_cast_failed!` and `exact_panic_message_matches_display` pin it.

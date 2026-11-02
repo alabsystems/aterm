@@ -36,6 +36,9 @@ pub const HEARD_7D_S: u64 = 7 * 24 * 60 * 60;
 /// Twenty-four-hour horizon for release version & converge checks (`DESIGN-alab-swarm` §12.6 P2, P5).
 pub const HEARD_24H_S: u64 = 24 * 60 * 60;
 
+/// Window-observation horizon for reported warm-slot eligibility (`DESIGN-alab-swarm` §6.3).
+pub const WARM_WINDOW_S: u64 = 24 * 60 * 60;
+
 /// Nine-minute horizon within which a member is considered live/awake (`DESIGN-alab-swarm` §7.2).
 pub const LIVE_HEARD_S: u64 = 9 * 60;
 
@@ -113,7 +116,8 @@ pub struct CensusMember {
     pub last_seen: Option<u64>,
     /// Count of failed `aterm init --converge --check` rows in the last 24 h (`0` when clean).
     pub converge_failures: usize,
-    /// True when eligible for normal pool fill (`window` open or recently active, enrolled, healthy).
+    /// True when fleet membership, convergence and recent window evidence qualify for this report.
+    /// This is not a credential or connection check.
     pub eligible: bool,
     /// True when present in the fleet book or heartbeat set.
     pub in_fleet: bool,
@@ -220,7 +224,7 @@ pub struct FleetBookPeerInput {
     pub seen_at: Option<u64>,
 }
 
-/// One C16 heartbeat record (`<state_dir>/swarm-facts/<node>.txt`) fed into [`CensusInputs`].
+/// One admitted cached C16 heartbeat snapshot fed into [`CensusInputs`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeartbeatInput {
     /// Proved 32-hex fleet node identifier.
@@ -249,7 +253,7 @@ pub struct CensusInputs {
     pub server_heard: Vec<ServerHeardFact>,
     /// Fleet book peers (`fleet-peers.toml` + `fleet-issuer-book-*.toml`).
     pub fleet_book: Vec<FleetBookPeerInput>,
-    /// Pushed C16 survey-facts heartbeats (`<state_dir>/swarm-facts/*.txt`).
+    /// Admitted pushed C16 survey-facts heartbeats, from current records or legacy text.
     pub heartbeats: Vec<HeartbeatInput>,
     /// Canonical `m<N>` labels (or recipient/node ids) enrolled in Commons, when known.
     pub commons_labels: BTreeSet<String>,
@@ -316,6 +320,7 @@ impl SwarmCensus {
             .map(|n| n.trim_ascii().to_ascii_lowercase())
             .collect();
         let mut active_labels: BTreeSet<String> = BTreeSet::new();
+        let mut active_nodes: BTreeSet<String> = BTreeSet::new();
         for member in &inputs.roster.members {
             let member_denied = deny_labels.contains(&canonical_host_stem(&member.label))
                 || member
@@ -325,20 +330,26 @@ impl SwarmCensus {
                 || member
                     .node_id
                     .as_deref()
-                    .is_some_and(|n| deny_nodes.contains(&n.to_ascii_lowercase()))
+                    .is_some_and(|n| deny_nodes.contains(&n.trim_ascii().to_ascii_lowercase()))
                 || member
                     .node_key
                     .as_deref()
-                    .is_some_and(|k| deny_nodes.contains(&k.to_ascii_lowercase()));
-            if member_denied {
+                    .is_some_and(|k| deny_nodes.contains(&k.trim_ascii().to_ascii_lowercase()));
+            if !member_denied {
+                if let Some((_, canon)) = ai_pool::leading_m_label(&member.label) {
+                    active_labels.insert(canon);
+                }
+                for alias in &member.aliases {
+                    if let Some((_, calias)) = ai_pool::leading_m_label(alias) {
+                        active_labels.insert(calias);
+                    }
+                }
                 if let Some(n) = member.node_id.as_deref() {
-                    deny_nodes.insert(n.trim_ascii().to_ascii_lowercase());
+                    active_nodes.insert(n.trim_ascii().to_ascii_lowercase());
                 }
                 if let Some(k) = member.node_key.as_deref() {
-                    deny_nodes.insert(k.trim_ascii().to_ascii_lowercase());
+                    active_nodes.insert(k.trim_ascii().to_ascii_lowercase());
                 }
-            } else if let Some((_, canon)) = ai_pool::leading_m_label(&member.label) {
-                active_labels.insert(canon);
             }
         }
         for member in &inputs.roster.members {
@@ -350,21 +361,34 @@ impl SwarmCensus {
                 || member
                     .node_id
                     .as_deref()
-                    .is_some_and(|n| deny_nodes.contains(&n.to_ascii_lowercase()))
+                    .is_some_and(|n| deny_nodes.contains(&n.trim_ascii().to_ascii_lowercase()))
                 || member
                     .node_key
                     .as_deref()
-                    .is_some_and(|k| deny_nodes.contains(&k.to_ascii_lowercase()));
-            if member_denied
-                && let Some((_, canon)) = ai_pool::leading_m_label(&member.label)
-                && !active_labels.contains(&canon)
-            {
-                deny_labels.insert(canon);
-                for alias in &member.aliases {
-                    if let Some((_, calias)) = ai_pool::leading_m_label(alias)
-                        && !active_labels.contains(&calias)
-                    {
-                        deny_labels.insert(calias);
+                    .is_some_and(|k| deny_nodes.contains(&k.trim_ascii().to_ascii_lowercase()));
+            if member_denied {
+                if let Some(n) = member.node_id.as_deref() {
+                    let norm = n.trim_ascii().to_ascii_lowercase();
+                    if !active_nodes.contains(&norm) {
+                        deny_nodes.insert(norm);
+                    }
+                }
+                if let Some(k) = member.node_key.as_deref() {
+                    let norm = k.trim_ascii().to_ascii_lowercase();
+                    if !active_nodes.contains(&norm) {
+                        deny_nodes.insert(norm);
+                    }
+                }
+                if let Some((_, canon)) = ai_pool::leading_m_label(&member.label)
+                    && !active_labels.contains(&canon)
+                {
+                    deny_labels.insert(canon);
+                    for alias in &member.aliases {
+                        if let Some((_, calias)) = ai_pool::leading_m_label(alias)
+                            && !active_labels.contains(&calias)
+                        {
+                            deny_labels.insert(calias);
+                        }
                     }
                 }
             }
@@ -389,11 +413,11 @@ impl SwarmCensus {
                 || member
                     .node_id
                     .as_deref()
-                    .is_some_and(|n| deny_nodes.contains(&n.to_ascii_lowercase()))
+                    .is_some_and(|n| deny_nodes.contains(&n.trim_ascii().to_ascii_lowercase()))
                 || member
                     .node_key
                     .as_deref()
-                    .is_some_and(|k| deny_nodes.contains(&k.to_ascii_lowercase()))
+                    .is_some_and(|k| deny_nodes.contains(&k.trim_ascii().to_ascii_lowercase()))
             {
                 continue;
             }
@@ -417,14 +441,16 @@ impl SwarmCensus {
                     alias_to_primary.insert(calias, canon.clone());
                 }
             }
-            if !member.vault_name.trim_ascii().is_empty() {
+            if !member.vault_name.trim_ascii().is_empty()
+                && !deny_labels.contains(&canonical_host_stem(&member.vault_name))
+            {
                 vault_name_to_primary.insert(
                     member.vault_name.trim_ascii().to_ascii_lowercase(),
                     canon.clone(),
                 );
             }
             if let Some(node) = member.node_id.as_deref() {
-                node_to_primary.insert(node.to_ascii_lowercase(), canon.clone());
+                node_to_primary.insert(node.trim_ascii().to_ascii_lowercase(), canon.clone());
             }
             match roster_by_label.get_mut(&canon) {
                 None => {
@@ -857,7 +883,7 @@ impl SwarmCensus {
             let in_commons = inputs.commons_labels.contains(&canon);
             let eligible = in_fleet
                 && converge_failures == 0
-                && (window || window_last.is_some_and(|wl| heard_within(now_s, wl, HEARD_7D_S)));
+                && window_last.is_some_and(|wl| heard_within(now_s, wl, WARM_WINDOW_S));
 
             let host = fleet_host_by_label
                 .get(&canon)
@@ -1137,19 +1163,26 @@ impl SwarmCensus {
                             .collect()
                     })
                     .unwrap_or_default();
+                let to_usize = |n: u64| usize::try_from(n).unwrap_or(usize::MAX);
                 let acc_obj = m.get("accounts").and_then(aterm_json::Value::as_object);
-                let warm = acc_obj
-                    .and_then(|a| a.get("warm"))
-                    .and_then(aterm_json::Value::as_u64)
-                    .unwrap_or(0) as usize;
-                let leased = acc_obj
-                    .and_then(|a| a.get("leased"))
-                    .and_then(aterm_json::Value::as_u64)
-                    .unwrap_or(0) as usize;
-                let walled = acc_obj
-                    .and_then(|a| a.get("walled"))
-                    .and_then(aterm_json::Value::as_u64)
-                    .unwrap_or(0) as usize;
+                let warm = to_usize(
+                    acc_obj
+                        .and_then(|a| a.get("warm"))
+                        .and_then(aterm_json::Value::as_u64)
+                        .unwrap_or(0),
+                );
+                let leased = to_usize(
+                    acc_obj
+                        .and_then(|a| a.get("leased"))
+                        .and_then(aterm_json::Value::as_u64)
+                        .unwrap_or(0),
+                );
+                let walled = to_usize(
+                    acc_obj
+                        .and_then(|a| a.get("walled"))
+                        .and_then(aterm_json::Value::as_u64)
+                        .unwrap_or(0),
+                );
                 members.push(CensusMember {
                     label,
                     aliases,
@@ -1170,20 +1203,22 @@ impl SwarmCensus {
                         .and_then(aterm_json::Value::as_bool)
                         .unwrap_or(false),
                     window_last: m.get("window_last").and_then(aterm_json::Value::as_u64),
-                    sessions: m
-                        .get("sessions")
-                        .and_then(aterm_json::Value::as_u64)
-                        .unwrap_or(0) as usize,
+                    sessions: to_usize(
+                        m.get("sessions")
+                            .and_then(aterm_json::Value::as_u64)
+                            .unwrap_or(0),
+                    ),
                     accounts: MemberAccountSummary {
                         warm,
                         leased,
                         walled,
                     },
                     last_seen: m.get("last_seen").and_then(aterm_json::Value::as_u64),
-                    converge_failures: m
-                        .get("converge_failures")
-                        .and_then(aterm_json::Value::as_u64)
-                        .unwrap_or(0) as usize,
+                    converge_failures: to_usize(
+                        m.get("converge_failures")
+                            .and_then(aterm_json::Value::as_u64)
+                            .unwrap_or(0),
+                    ),
                     eligible: m
                         .get("eligible")
                         .and_then(aterm_json::Value::as_bool)
@@ -1231,16 +1266,17 @@ impl SwarmCensus {
                 .and_then(aterm_json::Value::as_u64)
                 .unwrap_or(0)
         };
+        let to_usize = |n: u64| usize::try_from(n).unwrap_or(usize::MAX);
         let summary = CensusSummary {
-            members_total: u("members_total") as usize,
-            distinct_heard_7d: u("distinct_heard_7d") as usize,
-            p2_ratio_bps: u32::try_from(u("p2_ratio_bps")).unwrap_or(0),
-            fleet_members: u("fleet_members") as usize,
-            commons_members: u("commons_members") as usize,
-            converge_failed_24h: u("converge_failed_24h") as usize,
-            unlabeled: u("unlabeled") as usize,
-            label_conflicts: u("label_conflicts") as usize,
-            shortfall_accounts: u("shortfall_accounts") as usize,
+            members_total: to_usize(u("members_total")),
+            distinct_heard_7d: to_usize(u("distinct_heard_7d")),
+            p2_ratio_bps: u32::try_from(u("p2_ratio_bps")).unwrap_or(u32::MAX),
+            fleet_members: to_usize(u("fleet_members")),
+            commons_members: to_usize(u("commons_members")),
+            converge_failed_24h: to_usize(u("converge_failed_24h")),
+            unlabeled: to_usize(u("unlabeled")),
+            label_conflicts: to_usize(u("label_conflicts")),
+            shortfall_accounts: to_usize(u("shortfall_accounts")),
             shortfall_hours: u("shortfall_hours"),
         };
 
@@ -1327,6 +1363,26 @@ impl SwarmCensus {
 #[cfg(unix)]
 static CENSUS_CACHE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+#[cfg(unix)]
+const CENSUS_FILE_MAX_BYTES: usize = 4 << 20;
+
+#[cfg(unix)]
+fn read_regular_nofollow_bounded(path: &Path, max_bytes: usize) -> Option<String> {
+    use std::io::Read as _;
+    let file = astream_sys::open_nonblocking(path, astream_sys::Links::Refuse).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > max_bytes as u64 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take((max_bytes as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() <= max_bytes)
+        .then_some(bytes)
+        .and_then(|b| String::from_utf8(b).ok())
+}
+
 /// Read `<state_dir>/swarm-census.json` when present and valid.
 #[cfg(unix)]
 #[must_use]
@@ -1334,7 +1390,10 @@ pub fn read_cached_census(state_dir: &Path) -> Option<SwarmCensus> {
     let _guard = CENSUS_CACHE_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let raw = std::fs::read_to_string(state_dir.join(CENSUS_CACHE_FILE)).ok()?;
+    let bytes =
+        aterm_uds::private_file::read_private(state_dir, CENSUS_CACHE_FILE, CENSUS_FILE_MAX_BYTES)
+            .ok()?;
+    let raw = String::from_utf8(bytes).ok()?;
     SwarmCensus::from_json(&raw).ok()
 }
 
@@ -1363,7 +1422,7 @@ pub fn collect_local_census_inputs(
     bonjour_hosts: Vec<BonjourHostInput>,
     now_s: u64,
 ) -> CensusInputs {
-    use aterm_net::fleet_member::{Via, read_issuer_book, read_peers, read_pushed_facts};
+    use aterm_net::fleet_member::{Via, read_admitted_pushed_facts, read_issuer_book, read_peers};
 
     let config_path = home_dir.map(|h| h.join(".config/aterm/aterm.toml"));
     let steward = ai_pool::resolve_local_pool_identity(home_dir, config_path.as_deref(), None)
@@ -1376,53 +1435,22 @@ pub fn collect_local_census_inputs(
     let mut commons_labels = BTreeSet::new();
     let mut commons_member_count = None;
 
-    if let Some(home) = home_dir {
-        let paths = aterm_secrets::client::Paths::for_home(home);
-        let mut has_roster = false;
-        if let Ok(Some(r)) = aterm_secrets::client::swarm_roster(&paths) {
+    let mut has_roster = false;
+    let home_paths = home_dir.map(aterm_secrets::client::Paths::for_home);
+    if let (Some(home), Some(paths)) = (home_dir, home_paths.as_ref()) {
+        if let Ok(Some(r)) = aterm_secrets::client::swarm_roster_now(paths) {
             has_roster = !r.members.is_empty();
             roster = r;
-        } else if let Ok(Some(denied)) = aterm_secrets::client::swarm_denied_nodes(&paths) {
+        } else if let Ok(Some(denied)) = aterm_secrets::client::swarm_denied_nodes_now(paths) {
             roster.deny_nodes.extend(denied);
             roster.canonicalize();
         }
-        log_keys = crate::fleet_log::LocalLog::of(&paths).keys();
-        if (paths.dir.join("commons").is_dir() || paths.records_file().is_file())
-            && let Ok(Some(bootstrap)) =
-                aterm_secrets::commons::bootstrap::Bootstrap::cached(&paths)
-            && let Ok(Some(access)) = bootstrap.access()
-        {
-            let mut count = 0usize;
-            for member in access.members() {
-                let rec = member.binding().recipient().to_bech32();
-                if let Some(rm) = roster.member_by_recipient(&rec) {
-                    let is_denied = roster.is_label_denied(&rm.label)
-                        || (!rm.vault_name.is_empty() && roster.is_label_denied(&rm.vault_name))
-                        || rm.aliases.iter().any(|a| roster.is_label_denied(a))
-                        || rm
-                            .node_id
-                            .as_deref()
-                            .is_some_and(|n| roster.is_node_denied(n))
-                        || rm
-                            .node_key
-                            .as_deref()
-                            .is_some_and(|k| roster.is_node_denied(k));
-                    if is_denied {
-                        continue;
-                    }
-                    commons_labels.insert(rm.label.clone());
-                } else if has_roster {
-                    continue;
-                }
-                count += 1;
-            }
-            commons_member_count = Some(count);
-        }
+        log_keys = crate::fleet_log::LocalLog::of(paths).keys();
         for (vault, subject, at) in aterm_secrets::server::read_last_heard(&paths.served()) {
             server_heard.push(ServerHeardFact { vault, subject, at });
         }
         let pool_path = home.join(".secrets").join(ai_pool::AI_POOL_FILE);
-        if let Ok(raw) = std::fs::read_to_string(&pool_path)
+        if let Some(raw) = read_regular_nofollow_bounded(&pool_path, CENSUS_FILE_MAX_BYTES)
             && let Ok(parsed) = Pool::from_toml(&raw, &pool_path.display().to_string())
         {
             pool = Some(parsed);
@@ -1444,31 +1472,6 @@ pub fn collect_local_census_inputs(
             }
         }
     }
-    aterm_net::fleet_member::prune_pushed_facts(
-        state_dir,
-        &raw_peers,
-        &roster.deny_nodes,
-        log_keys.as_deref(),
-    );
-    let mut deny_nodes_changed = false;
-    raw_peers.retain(|p| {
-        let held_out = p.key.is_some_and(|k| {
-            aterm_net::fleet::is_denied_key(&k, &roster.deny_nodes)
-                || log_keys.as_ref().is_some_and(|l| l.holds_out(&k))
-        });
-        if held_out && let Some(node) = p.node.as_deref() {
-            roster.deny_nodes.push(node.to_ascii_lowercase());
-            deny_nodes_changed = true;
-        }
-        !held_out
-            && !p
-                .node
-                .as_deref()
-                .is_some_and(|n| aterm_net::fleet::is_denied_node(n, &roster.deny_nodes))
-    });
-    if deny_nodes_changed {
-        roster.canonicalize();
-    }
     let own_identity = aterm_net::fleet_member::read_node_identity(state_dir)
         .ok()
         .flatten();
@@ -1489,6 +1492,93 @@ pub fn collect_local_census_inputs(
             }
         }
     }
+    let mut deny_nodes_changed = false;
+    if let Some(ref log) = log_keys {
+        let mut extra_denied = Vec::new();
+        for member in &roster.members {
+            if let Some(key_hex) = member.node_key.as_deref()
+                && let Some(key) = aterm_net::fleet::NodeKey::from_hex(key_hex.trim_ascii())
+                && log.holds_out(&key)
+            {
+                extra_denied.push(key.hex());
+                if let Some(node) = member.node_id.as_deref() {
+                    extra_denied.push(node.trim_ascii().to_ascii_lowercase());
+                }
+            }
+        }
+        if !extra_denied.is_empty() {
+            roster.deny_nodes.extend(extra_denied);
+            deny_nodes_changed = true;
+        }
+    }
+    if let Some(ref own) = own_identity
+        && (aterm_net::fleet::is_denied_key(&own.key(), &roster.deny_nodes)
+            || log_keys.as_ref().is_some_and(|l| l.holds_out(&own.key())))
+    {
+        roster.deny_nodes.push(own.node().to_ascii_lowercase());
+        roster.deny_nodes.push(own.key().hex());
+        deny_nodes_changed = true;
+    }
+    raw_peers.retain(|p| {
+        let held_out = p.key.is_some_and(|k| {
+            aterm_net::fleet::is_denied_key(&k, &roster.deny_nodes)
+                || log_keys.as_ref().is_some_and(|l| l.holds_out(&k))
+        });
+        if held_out {
+            if let Some(node) = p.node.as_deref() {
+                roster.deny_nodes.push(node.to_ascii_lowercase());
+                deny_nodes_changed = true;
+            }
+            if let Some(key) = p.key {
+                roster.deny_nodes.push(key.hex());
+                deny_nodes_changed = true;
+            }
+        }
+        !held_out
+            && !p
+                .node
+                .as_deref()
+                .is_some_and(|n| aterm_net::fleet::is_denied_node(n, &roster.deny_nodes))
+    });
+    if deny_nodes_changed {
+        roster.canonicalize();
+    }
+    if let Some(ref paths) = home_paths
+        && (paths.dir.join("commons").is_dir() || paths.records_file().is_file())
+        && let Ok(Some(bootstrap)) = aterm_secrets::commons::bootstrap::Bootstrap::cached(paths)
+        && let Ok(Some(access)) = bootstrap.access()
+    {
+        let mut count = 0usize;
+        let mut counted_recipients = BTreeSet::new();
+        for member in access.members() {
+            let rec = member.binding().recipient().to_bech32();
+            if !counted_recipients.insert(rec.clone()) {
+                continue;
+            }
+            if let Some(rm) = roster.member_by_recipient(&rec) {
+                if roster.is_member_denied(rm) {
+                    continue;
+                }
+                commons_labels.insert(rm.label.clone());
+            } else if has_roster {
+                continue;
+            }
+            count += 1;
+        }
+        commons_member_count = Some(count);
+    }
+    aterm_net::fleet_member::prune_pushed_facts(
+        state_dir,
+        &raw_peers,
+        &roster.deny_nodes,
+        log_keys.as_deref(),
+    );
+    let pushed_facts = read_admitted_pushed_facts(
+        state_dir,
+        &raw_peers,
+        &roster.deny_nodes,
+        log_keys.as_deref(),
+    );
     let mut fleet_book: Vec<FleetBookPeerInput> = raw_peers
         .into_iter()
         .map(|p| FleetBookPeerInput {
@@ -1504,11 +1594,23 @@ pub fn collect_local_census_inputs(
             .ok()
             .flatten();
         let st_stem = canonical_host_stem(st);
+        let own_denied = own_node
+            .as_deref()
+            .is_some_and(|n| roster.is_node_denied(n))
+            || own_identity.as_ref().is_some_and(|id| {
+                roster.is_node_denied(&id.key().hex())
+                    || log_keys.as_ref().is_some_and(|l| l.holds_out(&id.key()))
+            })
+            || (roster.is_label_denied(&st_stem)
+                && !roster
+                    .members
+                    .iter()
+                    .any(|m| !roster.is_member_denied(m) && m.matches_label_or_alias(&st_stem)));
         let already_in_book = fleet_book.iter().any(|p| {
             (own_node.is_some() && p.node.as_deref() == own_node.as_deref())
                 || canonical_host_stem(&p.host) == st_stem
         });
-        if !already_in_book {
+        if !own_denied && !already_in_book {
             fleet_book.push(FleetBookPeerInput {
                 node: own_node,
                 host: format!("{st_stem}.local"),
@@ -1517,13 +1619,25 @@ pub fn collect_local_census_inputs(
         }
     }
 
-    let facts_dir = state_dir.join(aterm_net::fleet_member::SWARM_FACTS_DIR);
     let mut heartbeats = Vec::new();
-    for (node, payload) in read_pushed_facts(state_dir) {
+    for record in pushed_facts {
+        let node = record.node;
+        let payload = record.payload;
+        if roster.is_node_denied(&node) {
+            continue;
+        }
         if let Ok(facts) = SwarmSurveyFacts::from_survey_reply(&payload) {
-            let received_at = std::fs::metadata(facts_dir.join(format!("{node}.txt")))
-                .and_then(|m| m.modified())
-                .ok()
+            if facts.label.as_deref().is_some_and(|lbl| {
+                roster.is_label_denied(lbl)
+                    && !roster
+                        .members
+                        .iter()
+                        .any(|m| !roster.is_member_denied(m) && m.matches_label_or_alias(lbl))
+            }) {
+                continue;
+            }
+            let received_at = record
+                .received_at
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_secs());
             heartbeats.push(HeartbeatInput {
@@ -1571,6 +1685,145 @@ pub fn refresh_local_census(
     Ok(census)
 }
 
+#[cfg(unix)]
+fn cached_census_admitted(cached: &SwarmCensus, state_dir: &Path, home_dir: Option<&Path>) -> bool {
+    use aterm_net::fleet_member::{Via, read_admitted_pushed_facts, read_issuer_book, read_peers};
+
+    let mut roster = aterm_secrets::swarm_roster::SwarmRoster::default();
+    let mut log_keys = None;
+    let home_paths = home_dir.map(aterm_secrets::client::Paths::for_home);
+    if let Some(paths) = home_paths.as_ref() {
+        if let Ok(Some(r)) = aterm_secrets::client::swarm_roster_now(paths) {
+            roster = r;
+        } else if let Ok(Some(denied)) = aterm_secrets::client::swarm_denied_nodes_now(paths) {
+            roster.deny_nodes.extend(denied);
+            roster.canonicalize();
+        }
+        log_keys = crate::fleet_log::LocalLog::of(paths).keys();
+    }
+
+    let mut raw_peers = read_peers(state_dir).unwrap_or_default();
+    if let Some(issuer_node) = raw_peers
+        .iter()
+        .find(|p| p.via == Via::Issuer)
+        .and_then(|p| p.node.clone())
+    {
+        for copy in read_issuer_book(state_dir, &issuer_node) {
+            if !raw_peers
+                .iter()
+                .any(|p| p.node == copy.node && p.node.is_some())
+            {
+                raw_peers.push(copy);
+            }
+        }
+    }
+    let own_identity = aterm_net::fleet_member::read_node_identity(state_dir)
+        .ok()
+        .flatten();
+    for member in &mut roster.members {
+        if member.node_id.is_none()
+            && let Some(key_hex) = member.node_key.as_deref()
+        {
+            if let Some(ref own) = own_identity
+                && own.key().hex().eq_ignore_ascii_case(key_hex)
+            {
+                member.node_id = Some(own.node().to_owned());
+            } else if let Some(node) = raw_peers
+                .iter()
+                .find(|p| p.key.is_some_and(|k| k.hex().eq_ignore_ascii_case(key_hex)))
+                .and_then(|p| p.node.clone())
+            {
+                member.node_id = Some(node);
+            }
+        }
+    }
+    let mut deny_nodes_changed = false;
+    if let Some(ref log) = log_keys {
+        let mut extra_denied = Vec::new();
+        for member in &roster.members {
+            if let Some(key_hex) = member.node_key.as_deref()
+                && let Some(key) = aterm_net::fleet::NodeKey::from_hex(key_hex.trim_ascii())
+                && log.holds_out(&key)
+            {
+                extra_denied.push(key.hex());
+                if let Some(node) = member.node_id.as_deref() {
+                    extra_denied.push(node.trim_ascii().to_ascii_lowercase());
+                }
+            }
+        }
+        if !extra_denied.is_empty() {
+            roster.deny_nodes.extend(extra_denied);
+            deny_nodes_changed = true;
+        }
+    }
+    if let Some(ref own) = own_identity
+        && (aterm_net::fleet::is_denied_key(&own.key(), &roster.deny_nodes)
+            || log_keys.as_ref().is_some_and(|l| l.holds_out(&own.key())))
+    {
+        roster.deny_nodes.push(own.node().to_ascii_lowercase());
+        roster.deny_nodes.push(own.key().hex());
+        deny_nodes_changed = true;
+    }
+    raw_peers.retain(|p| {
+        let held_out = p.key.is_some_and(|k| {
+            aterm_net::fleet::is_denied_key(&k, &roster.deny_nodes)
+                || log_keys.as_ref().is_some_and(|l| l.holds_out(&k))
+        });
+        if held_out {
+            if let Some(node) = p.node.as_deref() {
+                roster.deny_nodes.push(node.to_ascii_lowercase());
+                deny_nodes_changed = true;
+            }
+            if let Some(key) = p.key {
+                roster.deny_nodes.push(key.hex());
+                deny_nodes_changed = true;
+            }
+        }
+        !held_out
+            && !p
+                .node
+                .as_deref()
+                .is_some_and(|n| aterm_net::fleet::is_denied_node(n, &roster.deny_nodes))
+    });
+    if deny_nodes_changed {
+        roster.canonicalize();
+    }
+
+    let all_facts_count = aterm_net::fleet_member::read_pushed_facts(state_dir).len();
+    let admitted_facts = read_admitted_pushed_facts(
+        state_dir,
+        &raw_peers,
+        &roster.deny_nodes,
+        log_keys.as_deref(),
+    );
+    aterm_net::fleet_member::prune_pushed_facts(
+        state_dir,
+        &raw_peers,
+        &roster.deny_nodes,
+        log_keys.as_deref(),
+    );
+    if admitted_facts.len() != all_facts_count {
+        return false;
+    }
+
+    !cached.members.iter().any(|cm| {
+        let has_active_match = roster.members.iter().any(|m| {
+            !roster.is_member_denied(m)
+                && (m.matches_label_or_alias(&cm.label)
+                    || (cm.node.is_some() && m.node_id == cm.node))
+        });
+        cm.node.as_deref().is_some_and(|n| roster.is_node_denied(n))
+            || ((roster.is_label_denied(&cm.label)
+                || cm.aliases.iter().any(|a| roster.is_label_denied(a)))
+                && !has_active_match)
+            || (roster.members.iter().any(|m| {
+                roster.is_member_denied(m)
+                    && (m.matches_label_or_alias(&cm.label)
+                        || (cm.node.is_some() && m.node_id == cm.node))
+            }) && !has_active_match)
+    })
+}
+
 /// Serve a `FleetOp::Census` request: returns the cached `<state_dir>/swarm-census.json` when
 /// fresh (`<= CENSUS_REFRESH_S`), or recomputes and caches it on the spot. Every Mac computes the
 /// census of its own book (C24; `docs/DESIGN-fluid-swarm-2026-10-28.md` §4.1, F17).
@@ -1587,6 +1840,7 @@ pub fn serve_fleet_census(
         && now_s
             .checked_sub(cached.generated_at)
             .is_some_and(|age| age < CENSUS_REFRESH_S)
+        && cached_census_admitted(&cached, state_dir, home_dir)
     {
         return Ok(cached.to_json());
     }
@@ -1613,6 +1867,7 @@ pub fn read_or_compute_census(
         && now_s
             .checked_sub(cached.generated_at)
             .is_some_and(|age| age < CENSUS_REFRESH_S)
+        && cached_census_admitted(&cached, state_dir, home_dir)
     {
         return Ok(cached);
     }

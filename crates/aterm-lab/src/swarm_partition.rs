@@ -3,11 +3,24 @@
 
 //! `swarm partition`: the lab partition lane (`docs/DESIGN-fluid-swarm-2026-10-28.md` §4.1 F8).
 //!
-//! Five private headless aterms and one vault-only Mac share this Mac's loopback as two islands.
-//! Island A: a1 founds the vault, is its first admin, serves it to island A and issues the
-//! fleet; a2 follows a1's server; a3 asks to join the vault during the cut. Island B: b1 serves
-//! the vault to island B and, unless `--writers a`, is an admin too; b2 follows b1's server; b3
-//! asks to join the vault and the fleet during the cut. Each Mac's subscriber and approver is the
+//! Seven private headless aterms and one vault-only Mac share this Mac's loopback as two islands.
+//! Island A: a1 founds the vault, is its first admin, serves it to island A and mints the
+//! fleet's secret; a2 follows a1's server; a3 asks to join the vault during the cut; a4 is in the
+//! fleet alone, joined at a2. Island B: b1 serves the vault to island B and, unless `--writers
+//! a`, is an admin too; b2 follows b1's server; b3 asks to join the vault and, at b1, the fleet
+//! during the cut; b4 is in the fleet alone, joined at b2. So each fleet Mac has more members
+//! than one heartbeat round asks (three), and three of them joined at a member other than the
+//! minter: a check of the fleet surveys from every fleet Mac, drives every fleet Mac from every
+//! other once the heal settles, and reads whether each one's heartbeat reached every member, by
+//! its own `fleet-answered` stamps, before the cut and after the heal, each time before any of
+//! them surveys (a survey stamps who answered it as a heartbeat does)
+//! (`docs/DESIGN-fluid-swarm-2026-10-28.md` §4.2, F17's lab item). Every Mac registers from
+//! 127.0.0.1, so the instances run with room for sixteen members at one address
+//! (`aterm_net::fleet_member::JOINED_PER_ADDRESS_SEAM`) where production's four would refuse
+//! the fifth. `--minter-away` stops a1's aterm instance (its fleet listener and heartbeat; its
+//! vault server and subscriber run on) just before the heal, so what membership spreads after it
+//! spreads with no minter.
+//! Each Mac's subscriber and approver is the
 //! loop of `aterm secrets watch` ([`aterm_secrets::client::watch`]), which this lab runs in a
 //! process per Mac ([`agent_main`]), so the converge runner it starts is this lab's stand-in
 //! ([`converge_standin`]), which notes the start and runs no pass. Every act a person would type
@@ -40,6 +53,8 @@
 //!
 //! A run whose cut held is a measurement of the build, whatever it finds, so `--record` writes it
 //! under `docs/measured/` red or green. Only a run whose cut leaked is never recorded there.
+//! `--label WORD` names the record for what it measured (a negative control's build, say) beside
+//! its arm's name, so it never replaces another run's record of the same day.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -71,6 +86,12 @@ const VAULT: &str = "f8lab";
 /// production's is 180 s), so a heartbeat lands within the cut and soon after the heal.
 const HEARTBEAT_MS: &str = "5000";
 
+/// How many members each Mac's book records from one address
+/// (`aterm_net::fleet_member::JOINED_PER_ADDRESS_SEAM`; production's is 4): every Mac here
+/// registers from 127.0.0.1, so a member that already holds four refused the fifth one's join
+/// (the first widened run's b3 at b1, "127.0.0.1 registered 4 members already").
+const JOINED_PER_ADDRESS: &str = "16";
+
 /// How long a member's copy of the issuer's book binds a drive alone
 /// (`aterm_net::fleet_member::COPY_DRIVES_FOR`), plus a margin: the late drive waits for it.
 const COPY_WINDOW: Duration = Duration::from_secs(62);
@@ -89,14 +110,14 @@ pub const AGENT_SEAM: &str = "ATERM_LAB_PARTITION_AGENT";
 const RUNNERS_FILE: &str = ".lab-converge-runs";
 
 /// The usage line.
-pub const USAGE: &str = "swarm partition [--one-url] [--writers both|a] [--hold SECS] [--aterm PATH] [--keep] [--record]";
+pub const USAGE: &str = "swarm partition [--one-url] [--writers both|a] [--minter-away] [--hold SECS] [--aterm PATH] [--keep] [--record] [--label WORD]";
 
 /// One of the two islands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Island {
-    /// a1, a2 and a3: the vault's founder and the fleet's issuer are here.
+    /// a1, a2, a3 and a4: the vault's founder and the fleet's minter are here.
     A,
-    /// b1, b2 and b3.
+    /// b1, b2, b3 and b4.
     B,
 }
 
@@ -138,12 +159,28 @@ pub struct Opts {
     pub publish: Publish,
     /// `--writers`.
     pub writers: Writers,
+    /// `--minter-away`: a1's aterm instance (its fleet listener and heartbeat) is stopped just
+    /// before the heal; its vault server and subscriber run on.
+    pub minter_away: bool,
     /// `--hold`: the least the cut lasts (longer where the work in it takes longer).
     pub hold: Duration,
     /// `--keep`: leave the worlds behind.
     pub keep: bool,
     /// `--record`: write the record under `docs/measured/`.
     pub record: bool,
+    /// `--label`: a word the record's name carries beside its arm's.
+    pub label: Option<String>,
+}
+
+/// Whether `word` may name a record (`--label`): 1 to 40 lowercase ASCII letters, digits and
+/// inner hyphens, so it is one plain part of a file name.
+fn label_word(word: &str) -> bool {
+    (1..=40).contains(&word.len())
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !word.starts_with('-')
+        && !word.ends_with('-')
 }
 
 /// Parse `swarm partition`'s arguments.
@@ -155,17 +192,32 @@ pub fn parse(args: &[String]) -> Result<Opts, Fail> {
         aterm: None,
         publish: Publish::Policy,
         writers: Writers::Both,
+        minter_away: false,
         hold: DEFAULT_HOLD,
         keep: false,
         record: false,
+        label: None,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "-h" | "--help" => return Err(Fail::usage(USAGE)),
             "--one-url" => opts.publish = Publish::OneUrl,
+            "--minter-away" => opts.minter_away = true,
             "--keep" => opts.keep = true,
             "--record" => opts.record = true,
+            "--label" => {
+                opts.label = Some(
+                    it.next()
+                        .filter(|w| label_word(w))
+                        .ok_or_else(|| {
+                            Fail::usage(
+                                "--label is 1 to 40 lowercase letters, digits and inner hyphens",
+                            )
+                        })?
+                        .clone(),
+                );
+            }
             "--aterm" => {
                 opts.aterm = Some(
                     it.next()
@@ -319,6 +371,9 @@ pub enum Phase {
     LateCut,
     /// After the heal.
     Healed,
+    /// At the run's end: once every survey after the heal heard every member and every member's
+    /// heartbeat reached every other, or the hang detector ran out waiting for it.
+    End,
 }
 
 impl Phase {
@@ -330,6 +385,7 @@ impl Phase {
             Phase::EarlyCut => "early in the cut",
             Phase::LateCut => "late in the cut",
             Phase::Healed => "after the heal",
+            Phase::End => "at the end",
         }
     }
 }
@@ -372,26 +428,53 @@ pub struct FleetJoin {
     pub phase: Phase,
     /// Whether it exited 0 and the instance listens.
     pub ok: bool,
-    /// Its words when it did not (one line).
+    /// Its words when it did not (one line), or, where it did, what its `allow drive --all`
+    /// said when that failed.
     pub words: String,
 }
 
-/// A member's heartbeats as the issuer's book shows them.
+/// A member's heartbeats to the issuer (a1), as the member's own `fleet-answered` stamps show
+/// them: when a1 last answered it, read only while nothing but heartbeats asks (a survey from the
+/// member stamps a1's answer too). Never a1's book: since F17 a Mac merges each member's signed
+/// entry from any book it reads, so a1's `seen_ms` for a member moves when a1 reads another
+/// member's book, whether or not that member's heartbeat ever reached a1.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Heartbeat {
     /// The member.
     pub mac: String,
     /// Its island.
     pub island: Island,
-    /// Whether its `seen_ms` advanced between the cut and the heal.
+    /// Whether a1's answer to it advanced between the cut's first reads and the heal: for a
+    /// member of island B, a heartbeat that crossed the cut.
     pub advanced_in_cut: bool,
-    /// Milliseconds after the heal its `seen_ms` first passed the heal.
+    /// Milliseconds after the heal a1 first answered it after the heal.
     pub back_ms: Option<u64>,
+}
+
+/// The members one Mac's heartbeat reached in a span (before the cut, or after the heal): each
+/// whose answer to it its `fleet-answered` stamps (`aterm_net::fleet_member::read_answered`) put
+/// in the span. A round that asked the same three members every time would leave the rest out
+/// for good.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reach {
+    /// The Mac whose heartbeats these are.
+    pub mac: String,
+    /// The members that answered it in the span.
+    pub reached: Vec<String>,
+    /// Of the members it did not reach, each whose last dial by its heartbeat missed after it
+    /// last answered (`aterm_net::fleet_member::read_missed`): a round asks such a member only
+    /// behind every member that answers, so one never asked at all is told from one passed over.
+    pub dark: Vec<String>,
 }
 
 /// The fleet plane's evidence.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FleetEvidence {
+    /// The fleet Macs going into the cut (b3 arrives during it): every one must hear every
+    /// other, and after the heal, with b3 where it joined and less the Macs [`Self::away`] names.
+    pub before_members: Vec<String>,
+    /// The fleet Macs whose instance stopped before the heal (`--minter-away`: a1).
+    pub away: Vec<String>,
     /// Every survey read.
     pub surveys: Vec<SurveyRead>,
     /// Every drive.
@@ -402,12 +485,39 @@ pub struct FleetEvidence {
     pub heartbeats: Vec<Heartbeat>,
     /// Why the late drives did not run, when they did not.
     pub late_skipped: Option<String>,
-    /// Milliseconds after the heal when both surveys first heard every member, if they did
-    /// within the hang detector.
+    /// Milliseconds after the heal when the surveys after it began: once the heartbeat reads
+    /// ended ([`Self::reach`]), so it is bounded by their wait, not by the fleet.
+    pub surveys_ms: Option<u64>,
+    /// Milliseconds after those surveys began when every member's survey first heard every
+    /// member, if they did within the hang detector.
     pub whole_ms: Option<u64>,
-    /// Milliseconds after the heal of the first survey read after it (they start once the
-    /// vault's wait ends, so `whole_ms` is never earlier than this).
+    /// Milliseconds after the heal of the first heartbeat read after it (it starts once the
+    /// vault's wait ends, so `reach_ms` is never earlier than this).
     pub first_read_ms: Option<u64>,
+    /// Each fleet Mac's heartbeats before the cut, from the fleet's forming until just before
+    /// any Mac surveyed: a survey stamps the members that answer it as a heartbeat does.
+    pub reach_before: Vec<Reach>,
+    /// Each member's heartbeats after the heal, as last read before any member surveyed.
+    pub reach: Vec<Reach>,
+    /// Milliseconds after the heal when every member's heartbeat had first reached every other,
+    /// if it had within the hang detector.
+    pub reach_ms: Option<u64>,
+}
+
+/// The fleet Macs that must be members after the heal: each going into the cut, and b3 where a
+/// join of it joined, less each Mac stopped before the heal.
+#[must_use]
+pub fn members_after(f: &FleetEvidence) -> Vec<String> {
+    let mut out: Vec<String> = f
+        .before_members
+        .iter()
+        .filter(|m| !f.away.contains(m))
+        .cloned()
+        .collect();
+    if f.joins.iter().any(|j| j.ok) && !out.iter().any(|m| m == "b3") {
+        out.push("b3".to_owned());
+    }
+    out
 }
 
 /// What a run saw.
@@ -455,6 +565,10 @@ pub const CUT_HELD: &str = "vault: the cut held";
 pub const FLEET_CUT_HELD: &str = "fleet: the cut held";
 /// F8's own check, which `--one-url` must fail.
 pub const ONE_HEAD: &str = "vault: one head on every server and Mac after the heal";
+/// The fleet's heartbeat-reach check before the cut.
+pub const REACHED_BEFORE: &str = "fleet: every Mac's heartbeat reached every member before the cut";
+/// The fleet's heartbeat-reach check after the heal.
+pub const REACHED_AFTER: &str = "fleet: every Mac's heartbeat reached every member after the heal";
 
 /// How long one head must hold after the heal before it counts: a reconcile still in flight
 /// would have moved it.
@@ -783,6 +897,105 @@ fn vault_checks(v: &VaultEvidence) -> Vec<Check> {
     out
 }
 
+/// The members of `want` that `s` did not hear, with the survey's words for each where it had
+/// some.
+fn unheard(s: &SurveyRead, want: &[String]) -> Option<String> {
+    let missing: Vec<String> = want
+        .iter()
+        .filter(|m| !s.answered.contains(m))
+        .cloned()
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    let why: Vec<&str> = s
+        .silent
+        .iter()
+        .filter(|w| missing.iter().any(|m| w.starts_with(&format!("{m}:"))))
+        .map(String::as_str)
+        .collect();
+    Some(format!(
+        "{} did not hear {}{}",
+        s.from,
+        missing.join(", "),
+        if why.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", why.join("; "))
+        }
+    ))
+}
+
+/// The last survey `mac` read in `phase`.
+fn survey_of<'a>(f: &'a FleetEvidence, mac: &str, phase: Phase) -> Option<&'a SurveyRead> {
+    f.surveys
+        .iter()
+        .rev()
+        .find(|s| s.phase == phase && s.from == mac)
+}
+
+/// Whether each of `members` has a heartbeat read in `reach` that reached every other one of
+/// them; `span` names when (`before the cut`, `after the heal`) and `by` adds what the passing
+/// row says of its time.
+fn reach_check(
+    name: &'static str,
+    members: &[String],
+    reach: &[Reach],
+    span: &str,
+    by: &str,
+) -> Check {
+    let mut short_of = Vec::new();
+    for mac in members {
+        match reach.iter().find(|r| r.mac == *mac) {
+            None => short_of.push(format!("{mac}'s heartbeats were not read")),
+            Some(r) => {
+                let missing: Vec<String> = members
+                    .iter()
+                    .filter(|m| *m != mac && !r.reached.contains(m))
+                    .cloned()
+                    .collect();
+                if !missing.is_empty() {
+                    let dark: Vec<&String> =
+                        missing.iter().filter(|m| r.dark.contains(m)).collect();
+                    short_of.push(format!(
+                        "{mac}'s heartbeat reached {} and never {}{}",
+                        names(&r.reached),
+                        missing.join(", "),
+                        if dark.is_empty() {
+                            String::new()
+                        } else {
+                            format!(
+                                " (its last dial of {} missed)",
+                                dark.iter()
+                                    .map(|m| m.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )
+                        }
+                    ));
+                }
+            }
+        }
+    }
+    if members.len() < 2 {
+        short_of.push(format!("fewer than two fleet Macs {span}"));
+    }
+    Check {
+        name,
+        pass: short_of.is_empty(),
+        detail: if short_of.is_empty() {
+            format!(
+                "each of {} reached all {} others{by}",
+                names(members),
+                members.len().saturating_sub(1)
+            )
+        } else {
+            short_of.join("; ")
+        },
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 fn fleet_checks(f: &FleetEvidence) -> Vec<Check> {
     let mut out = Vec::new();
     let island_of = |mac: &str| {
@@ -793,7 +1006,8 @@ fn fleet_checks(f: &FleetEvidence) -> Vec<Check> {
         }
     };
 
-    // The cut held: a survey from each side during the cut answered its own island alone.
+    // The cut held: each survey during the cut answered its own island alone, and the cut was
+    // surveyed from both islands.
     let during: Vec<&SurveyRead> = f
         .surveys
         .iter()
@@ -823,7 +1037,10 @@ fn fleet_checks(f: &FleetEvidence) -> Vec<Check> {
             leaks.push(format!("{} drove {} across the cut", d.from, d.to));
         }
     }
-    if during.len() < 2 {
+    if [Island::A, Island::B]
+        .iter()
+        .any(|i| !during.iter().any(|s| island_of(&s.from) == *i))
+    {
         leaks.push("the cut was not surveyed from both islands".to_owned());
     }
     out.push(Check {
@@ -874,7 +1091,7 @@ fn fleet_checks(f: &FleetEvidence) -> Vec<Check> {
         },
     });
 
-    // A newcomer joined the fleet on the island without the issuer.
+    // A newcomer joined the fleet on the island without the minter.
     let in_cut = f.joins.iter().find(|j| j.phase == Phase::EarlyCut);
     out.push(Check {
         name: "fleet: b3 joined on island B during the cut",
@@ -891,57 +1108,56 @@ fn fleet_checks(f: &FleetEvidence) -> Vec<Check> {
         ),
     });
 
-    // After the heal the fleet is whole again: every survey answers every member, every
-    // member's heartbeat reaches the issuer, every late refusal is admitted, and b3 is in.
-    let mut broken = Vec::new();
-    let healed: Vec<&SurveyRead> = f
-        .surveys
-        .iter()
-        .filter(|s| s.phase == Phase::Healed)
-        .collect();
-    let mut everyone: Vec<String> = f
-        .surveys
-        .iter()
-        .filter(|s| s.phase == Phase::Before)
-        .flat_map(|s| s.answered.clone())
-        .collect();
-    // b3 joined the fleet (in the cut, or after the heal), so the issuer's book holds it and
-    // every survey must hear it.
-    if f.joins.iter().any(|j| j.ok) && !everyone.iter().any(|m| m == "b3") {
-        everyone.push("b3".to_owned());
-    }
-    for s in &healed {
-        let missing: Vec<String> = everyone
-            .iter()
-            .filter(|m| !s.answered.contains(m))
-            .cloned()
-            .collect();
-        if !missing.is_empty() {
-            let why: Vec<&String> = s
-                .silent
-                .iter()
-                .filter(|w| missing.iter().any(|m| w.starts_with(&format!("{m}:"))))
-                .collect();
-            broken.push(format!(
-                "{} did not hear {}{}",
-                s.from,
-                missing.join(", "),
-                if why.is_empty() {
-                    String::new()
-                } else {
-                    format!(
-                        " ({})",
-                        why.iter()
-                            .map(|w| w.as_str())
-                            .collect::<Vec<_>>()
-                            .join("; ")
-                    )
-                }
-            ));
+    // Before the cut every fleet Mac heard every other, those that joined at a member other than
+    // the minter too: membership spread member to member, not through the minter's book alone.
+    let mut deaf = Vec::new();
+    for mac in &f.before_members {
+        match survey_of(f, mac, Phase::Before) {
+            None => deaf.push(format!("no survey from {mac} before the cut")),
+            Some(s) => deaf.extend(unheard(s, &f.before_members)),
         }
     }
-    if healed.is_empty() {
-        broken.push("no survey after the heal".to_owned());
+    if f.before_members.is_empty() {
+        deaf.push("no fleet Mac was named before the cut".to_owned());
+    }
+    out.push(Check {
+        name: "fleet: every Mac heard every member before the cut",
+        pass: deaf.is_empty(),
+        detail: if deaf.is_empty() {
+            format!(
+                "each of {} heard all {}",
+                names(&f.before_members),
+                f.before_members.len()
+            )
+        } else {
+            deaf.join("; ")
+        },
+    });
+
+    // Before the cut every fleet Mac's heartbeat asked every other member in turn: a round asks
+    // three, and six Macs have five others each, so a round that asked the same three every time
+    // (F17's second review fix undone) leaves two out for good. Read before any Mac surveyed.
+    out.push(reach_check(
+        REACHED_BEFORE,
+        &f.before_members,
+        &f.reach_before,
+        "before the cut",
+        "",
+    ));
+
+    // After the heal the fleet is whole again: every member's survey answers every member,
+    // every member's heartbeat reaches the minter while it runs, every refusal of the cut's is
+    // admitted, and b3 is in.
+    let members = members_after(f);
+    let mut broken = Vec::new();
+    for mac in &members {
+        match survey_of(f, mac, Phase::Healed) {
+            None => broken.push(format!("no survey from {mac} after the heal")),
+            Some(s) => broken.extend(unheard(s, &members)),
+        }
+    }
+    if members.is_empty() {
+        broken.push("no fleet Mac was named after the heal".to_owned());
     }
     for h in &f.heartbeats {
         if h.back_ms.is_none() {
@@ -966,21 +1182,77 @@ fn fleet_checks(f: &FleetEvidence) -> Vec<Check> {
         pass: broken.is_empty(),
         detail: if broken.is_empty() {
             format!(
-                "{}heartbeats back: {}",
+                "{} surveyed; {}heartbeats back at the issuer: {}",
+                members.len(),
                 f.whole_ms.map_or(String::new(), |ms| format!(
-                    "every survey whole +{:.1}s{}; ",
+                    "every survey whole {:.1}s after the surveys began{}; ",
                     secs(ms),
-                    f.first_read_ms.map_or(String::new(), |first| format!(
-                        " (first read +{:.1}s)",
-                        secs(first)
+                    f.surveys_ms.map_or(String::new(), |from| format!(
+                        " (+{:.1}s after the heal, once the heartbeat reads ended)",
+                        secs(from)
                     ))
                 )),
-                names(&back)
+                if f.away.is_empty() {
+                    names(&back)
+                } else {
+                    format!("not read, {} stopped before the heal", names(&f.away))
+                }
             )
         } else {
             broken.join("; ")
         },
     });
+
+    // Every member drove every other once the heal settled: each binds each other's key, the
+    // minter's or not, wherever each joined.
+    let mut refused = Vec::new();
+    let mut admitted = 0;
+    for from in &members {
+        for to in members.iter().filter(|to| *to != from) {
+            match f
+                .drives
+                .iter()
+                .rev()
+                .find(|d| d.phase == Phase::End && d.from == *from && d.to == *to)
+            {
+                None => refused.push(format!("{from} -> {to} never tried")),
+                Some(d) if d.ok => admitted += 1,
+                Some(d) => refused.push(format!("{from} -> {to} refused: {}", d.words)),
+            }
+        }
+    }
+    if members.len() < 2 {
+        refused.push("fewer than two fleet Macs after the heal".to_owned());
+    }
+    out.push(Check {
+        name: "fleet: every Mac drove every other after the heal",
+        pass: refused.is_empty(),
+        detail: if refused.is_empty() {
+            format!("{admitted} drives among {}, each admitted", names(&members))
+        } else {
+            refused.join("; ")
+        },
+    });
+
+    // Every member's heartbeat asked every other member in turn after the heal, so each reads
+    // every member's book, not the same three forever, and a member the cut kept out comes back.
+    let by = f.reach_ms.map_or(String::new(), |ms| {
+        format!(
+            ", every one by +{:.1}s{}",
+            secs(ms),
+            f.first_read_ms.map_or(String::new(), |first| format!(
+                " (first read +{:.1}s)",
+                secs(first)
+            ))
+        )
+    });
+    out.push(reach_check(
+        REACHED_AFTER,
+        &members,
+        &f.reach,
+        "after the heal",
+        &by,
+    ));
     out
 }
 
@@ -1003,15 +1275,22 @@ struct Spec {
     instance: bool,
     /// It arrives during the cut.
     late: bool,
+    /// It is in the vault (founds it, joins it, or asks to during the cut).
+    vault: bool,
+    /// The member it joins the fleet at; `None` where it mints the fleet's secret or runs no
+    /// instance. Each Mac comes after the member it joins at.
+    joins_at: Option<&'static str>,
 }
 
-const MACS: [Spec; 6] = [
+const MACS: [Spec; 8] = [
     Spec {
         name: "a1",
         island: Island::A,
         slot: 0,
         instance: true,
         late: false,
+        vault: true,
+        joins_at: None,
     },
     Spec {
         name: "a2",
@@ -1019,6 +1298,8 @@ const MACS: [Spec; 6] = [
         slot: 1,
         instance: true,
         late: false,
+        vault: true,
+        joins_at: Some("a1"),
     },
     Spec {
         name: "b1",
@@ -1026,6 +1307,8 @@ const MACS: [Spec; 6] = [
         slot: 2,
         instance: true,
         late: false,
+        vault: true,
+        joins_at: Some("a1"),
     },
     Spec {
         name: "b2",
@@ -1033,6 +1316,8 @@ const MACS: [Spec; 6] = [
         slot: 3,
         instance: true,
         late: false,
+        vault: true,
+        joins_at: Some("a1"),
     },
     Spec {
         name: "b3",
@@ -1040,6 +1325,8 @@ const MACS: [Spec; 6] = [
         slot: 4,
         instance: true,
         late: true,
+        vault: true,
+        joins_at: Some("b1"),
     },
     Spec {
         name: "a3",
@@ -1047,6 +1334,26 @@ const MACS: [Spec; 6] = [
         slot: 5,
         instance: false,
         late: true,
+        vault: true,
+        joins_at: None,
+    },
+    Spec {
+        name: "a4",
+        island: Island::A,
+        slot: 6,
+        instance: true,
+        late: false,
+        vault: false,
+        joins_at: Some("a2"),
+    },
+    Spec {
+        name: "b4",
+        island: Island::B,
+        slot: 7,
+        instance: true,
+        late: false,
+        vault: false,
+        joins_at: Some("b2"),
     },
 ];
 
@@ -1055,6 +1362,59 @@ fn spec(name: &str) -> Spec {
         .iter()
         .find(|s| s.name == name)
         .unwrap_or_else(|| unreachable!("no Mac {name}"))
+}
+
+/// The fleet Macs that run from the start: every instance Mac but the one that arrives during
+/// the cut.
+fn fleet_before() -> Vec<&'static str> {
+    MACS.iter()
+        .filter(|s| s.instance && !s.late)
+        .map(|s| s.name)
+        .collect()
+}
+
+/// The Macs in the vault.
+fn vault_macs() -> impl Iterator<Item = &'static Spec> {
+    MACS.iter().filter(|s| s.vault)
+}
+
+/// Run an in-process request with the same current cut as the Mac's child processes.
+fn in_partition<T>(cut_file: &Path, send: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    #[cfg(debug_assertions)]
+    {
+        let cut = std::fs::read_to_string(cut_file)
+            .map_err(|e| format!("the cut file {}: {e}", cut_file.display()))?;
+        aterm_uds::partition::cut_here(&cut, send)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = (cut_file, send);
+        Err("swarm partition needs a debug lab image for its in-process cut".into())
+    }
+}
+
+/// When the member whose state directory is `member_state` last answered the Mac whose state
+/// directory is `mac_state`, and when that Mac's heartbeat last dialled it and missed (Unix ms):
+/// the Mac's own `fleet-answered` stamps (`aterm_net::fleet_member::read_answered`,
+/// `read_missed`), keyed `node=<id>` as `aterm_net::fleet_member` writes them, against the
+/// member's own node id. Only the Mac's own dials write them (a heartbeat, a survey, `fleet
+/// peers`), so nothing the member's entry in another Mac's book says moves them.
+fn stamps_for(mac_state: &Path, member_state: &Path) -> (Option<u64>, Option<u64>) {
+    let Some(key) = aterm_net::fleet_member::read_node_identity(member_state)
+        .ok()
+        .flatten()
+        .map(|id| format!("node={}", id.node()))
+    else {
+        return (None, None);
+    };
+    (
+        aterm_net::fleet_member::read_answered(mac_state)
+            .get(&key)
+            .copied(),
+        aterm_net::fleet_member::read_missed(mac_state)
+            .get(&key)
+            .copied(),
+    )
 }
 
 /// A Mac's vault state, as its `state.toml` says.
@@ -1090,6 +1450,8 @@ struct Lane {
     values: BTreeMap<String, Vec<u8>>,
     /// Every line said, for the record.
     said: RefCell<Vec<String>>,
+    /// When the fleet was formed: every member joined and allows drives.
+    formed: Option<Instant>,
 }
 
 impl Drop for Lane {
@@ -1493,8 +1855,11 @@ impl Lane {
                 .map_err(|e| e.to_string())
         })?
         .ok_or_else(|| format!("{member}'s desk sent {mac} no bundle"))?;
-        client::post_allowed(&by, &let_in.allowed)
-            .map_err(|e| format!("{member} posting the request it allowed: {e}"))
+        let cut_file = &self.cut_files[usize::from(spec(member).island == Island::B)];
+        in_partition(cut_file, || {
+            client::post_allowed(&by, &let_in.allowed)
+                .map_err(|e| format!("{member} posting the request it allowed: {e}"))
+        })
     }
 
     /// Wait (the hang detector) until both servers and every member hold one head.
@@ -1652,6 +2017,46 @@ impl Lane {
         (!missing.is_empty()).then(|| format!("{mac} binds no key for {}", missing.join(", ")))
     }
 
+    /// Which of `members` (other than `mac`) answered `mac`'s heartbeat after `since` (Unix ms),
+    /// by `mac`'s own stamps ([`stamps_for`]), and which of the rest its last dial missed.
+    fn reached(&self, mac: &str, members: &[&str], since: u64) -> Reach {
+        let state = self.root(mac).join("state");
+        let mut reach = Reach {
+            mac: mac.to_owned(),
+            reached: Vec::new(),
+            dark: Vec::new(),
+        };
+        for member in members.iter().copied().filter(|member| *member != mac) {
+            let (answered, missed) = stamps_for(&state, &self.root(member).join("state"));
+            if answered.is_some_and(|ms| ms > since) {
+                reach.reached.push(member.to_owned());
+            } else if missed > answered {
+                reach.dark.push(member.to_owned());
+            }
+        }
+        reach
+    }
+
+    /// When a1 last answered `mac`, by `mac`'s own stamps ([`stamps_for`]).
+    fn issuer_answered(&self, mac: &str) -> Option<u64> {
+        stamps_for(
+            &self.root(mac).join("state"),
+            &self.root("a1").join("state"),
+        )
+        .0
+    }
+
+    /// Stop `mac`'s instance as a Mac that left with no word would: `SIGKILL`, its listener and
+    /// heartbeat gone, its descendants noted for the teardown.
+    fn stop_instance(&mut self, mac: &str) -> Result<(), Fail> {
+        let inst = &mut self.world.insts[self.insts[mac]];
+        inst.note_descendants();
+        crate::sys::kill(inst.pid, libc::SIGKILL)
+            .map_err(|e| Fail::die(format!("{mac}: SIGKILL of its instance: {e}")))?;
+        inst.killed = true;
+        Ok(())
+    }
+
     /// `aterm ctl --host 127.0.0.1:<to's port> @<to's boot sid> status` from `from`.
     fn drive(&self, from: &str, to: &str, phase: Phase) -> DriveTry {
         let host = format!("127.0.0.1:{}", self.fleet_ports[to]);
@@ -1670,23 +2075,6 @@ impl Lane {
             },
             copy_age_s,
         }
-    }
-
-    /// Each member's `seen_ms` in the issuer's book, by Mac.
-    fn seen(&self) -> BTreeMap<&'static str, u64> {
-        let state = self.root("a1").join("state");
-        let book = aterm_net::fleet_member::read_peers(&state).unwrap_or_default();
-        let mut out = BTreeMap::new();
-        for (mac, port) in &self.fleet_ports {
-            if let Some(seen) = book
-                .iter()
-                .find(|p| p.port == *port && p.via == aterm_net::fleet_member::Via::Joined)
-                .and_then(|p| p.seen_ms)
-            {
-                out.insert(*mac, seen);
-            }
-        }
-        out
     }
 
     /// Whether `mac`'s `~/.secrets/<name>` holds the fixture `name` was set to.
@@ -1779,13 +2167,15 @@ fn write_whole(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
 /// Bring the Macs up, form the fleet, found the vault and admit every Mac.
 fn bring_up(aterm: &Path, opts: &Opts) -> Result<Lane, Fail> {
     let mut world = World::new(aterm, opts.keep).map_err(Fail::die)?;
-    let ports = world::free_ports(8).map_err(|e| Fail::die(format!("free ports: {e}")))?;
+    // A fleet port for each instance Mac, then each island's vault server's.
+    let fleet = MACS.iter().filter(|s| s.instance).count();
+    let ports = world::free_ports(fleet + 4).map_err(|e| Fail::die(format!("free ports: {e}")))?;
     // Never a live service's port on this Mac: the fleet's 7100 or the vault's 7484.
     let ports: Vec<u16> = ports
         .into_iter()
         .filter(|p| *p != aterm_net::fleet_member::DEFAULT_PORT && *p != 7484)
         .collect();
-    if ports.len() < 7 {
+    if ports.len() < fleet + 2 {
         return Err(Fail::die("too few free loopback ports"));
     }
     let cut_files = [world.base.join("cut-a"), world.base.join("cut-b")];
@@ -1808,6 +2198,12 @@ fn bring_up(aterm: &Path, opts: &Opts) -> Result<Lane, Fail> {
                     "ATERM_DEBUG_FLEET_HEARTBEAT_MS".to_owned(),
                     HEARTBEAT_MS.to_owned(),
                 ),
+                // Every Mac here registers from 127.0.0.1, where a LAN gives each its own
+                // address: room for all of them at one address.
+                (
+                    aterm_net::fleet_member::JOINED_PER_ADDRESS_SEAM.to_owned(),
+                    JOINED_PER_ADDRESS.to_owned(),
+                ),
             ],
         );
     }
@@ -1816,7 +2212,7 @@ fn bring_up(aterm: &Path, opts: &Opts) -> Result<Lane, Fail> {
         opts: opts.clone(),
         t0: Instant::now(),
         fleet_ports,
-        vault_ports: [ports[5], ports[6]],
+        vault_ports: [ports[fleet], ports[fleet + 1]],
         cut_files,
         insts: BTreeMap::new(),
         sids: BTreeMap::new(),
@@ -1826,6 +2222,7 @@ fn bring_up(aterm: &Path, opts: &Opts) -> Result<Lane, Fail> {
         kids: Vec::new(),
         values: BTreeMap::new(),
         said: RefCell::new(Vec::new()),
+        formed: None,
     };
     lane.set_cut(false)?;
     lane.say(&format!(
@@ -1841,11 +2238,11 @@ fn bring_up(aterm: &Path, opts: &Opts) -> Result<Lane, Fail> {
         world::make_world(&lane.world.root_of(s.slot))
             .map_err(|e| Fail::die(format!("{}: its world: {e}", s.name)))?;
     }
-    for s in MACS.iter().filter(|s| s.instance && !s.late) {
-        lane.start_instance(s.name)?;
+    for mac in fleet_before() {
+        lane.start_instance(mac)?;
         stop::check()?;
     }
-    lane.say("a1, a2, b1 and b2 run headless");
+    lane.say(&format!("{} run headless", fleet_before().join(", ")));
     form_fleet(&mut lane)?;
     found_vault(&mut lane)?;
     Ok(lane)
@@ -1871,19 +2268,27 @@ fn form_fleet(lane: &mut Lane) -> Result<(), Fail> {
     lane.world.await_listening(issuer).map_err(Fail::die)?;
     lane.code = std::fs::read_to_string(lane.root("a1").join("state/fleet-join-code"))
         .map_err(|e| Fail::die(format!("the fleet's join code: {e}")))?;
-    for mac in ["a2", "b1", "b2"] {
-        let (ok, words) = lane.fleet_join(mac, "a1");
+    let mut joined = Vec::new();
+    for s in MACS.iter().filter(|s| s.instance && !s.late) {
+        let Some(at) = s.joins_at else { continue };
+        let (ok, words) = lane.fleet_join(s.name, at);
         if !ok {
-            return Err(Fail::die(format!("{mac}: fleet join: {words}")));
+            return Err(Fail::die(format!(
+                "{}: fleet join at {at}: {words}",
+                s.name
+            )));
         }
+        joined.push(format!("{} at {at}", s.name));
         stop::check()?;
     }
-    for mac in ["a1", "a2", "b1", "b2"] {
+    for mac in fleet_before() {
         lane.aterm_ok(mac, &["fleet", "allow", "drive", "--all"], None)?;
     }
-    lane.say(
-        "fleet formed: a1 minted its secret; a2, b1 and b2 joined; every member allows drive --all",
-    );
+    lane.formed = Some(Instant::now());
+    lane.say(&format!(
+        "fleet formed: a1 minted its secret; joined: {}; every member allows drive --all",
+        joined.join(", ")
+    ));
     Ok(())
 }
 
@@ -2000,7 +2405,11 @@ fn run(lane: &mut Lane) -> Result<Evidence, Fail> {
         members_before: members_before.map(str::to_owned).to_vec(),
         ..VaultEvidence::default()
     };
-    let mut f = FleetEvidence::default();
+    let fleet = fleet_before();
+    let mut f = FleetEvidence {
+        before_members: fleet.iter().map(|m| (*m).to_owned()).collect(),
+        ..FleetEvidence::default()
+    };
     let t0_ms = u64::try_from(crate::util::now_ms()).unwrap_or(0) - ms_since(lane.t0);
     let mut load = Vec::new();
     let mut mark = |at: &str| {
@@ -2011,8 +2420,7 @@ fn run(lane: &mut Lane) -> Result<Evidence, Fail> {
     mark("start");
 
     let mut plane = commons::Plane {
-        macs: MACS
-            .iter()
+        macs: vault_macs()
             .map(|s| commons::Mac {
                 name: s.name.to_owned(),
                 paths: aterm_secrets::client::Paths::for_home(&lane.home(s.name)),
@@ -2035,18 +2443,52 @@ fn run(lane: &mut Lane) -> Result<Evidence, Fail> {
         ),
     });
 
-    // The cut must split a whole fleet: every survey hears every member, a drive inside each
-    // island and one across are admitted, and b1 and b2, the members that must outlast a1, each
-    // bind every member's key (by its own book since F17, which a heartbeat fills from a
-    // member's; before it, by a copy of a1's book, fetched when it surveyed or when a driver it
-    // must bind dialled it). A fleet still settling would make the run measure bring-up, so this
-    // waits for it within the hang detector, and a fleet never whole is a run that could not run.
+    // The cut must split a whole fleet: the surveys from a1 and b1 hear the vault's four Macs, a
+    // drive inside each island and one across are admitted, and b1 and b2, the members that must
+    // outlast a1, each bind those four's keys (by its own book since F17, which a heartbeat fills
+    // from a member's; before it, by a copy of a1's book, fetched when it surveyed or when a
+    // driver it must bind dialled it). A fleet still settling would make the run measure
+    // bring-up, so this waits for it within the hang detector, and a fleet never whole is a run
+    // that could not run. Meanwhile every fleet Mac surveys too, until each hears every other:
+    // that is evidence (a4 and b4 joined at members other than the minter), never a gate, so a
+    // build whose membership does not spread is still cut, and measured.
+    // First, before any Mac surveys (a survey stamps the members that answer it, as a heartbeat
+    // does), whom each fleet Mac's heartbeat reached since the fleet formed: rounds that take each
+    // member in turn reach every other within a couple of rounds, so this waits, within the hang
+    // detector from the forming, until each did; the last read is the evidence.
+    let formed = lane.formed.unwrap_or(lane.t0);
+    let formed_unix =
+        t0_ms + u64::try_from(formed.saturating_duration_since(lane.t0).as_millis()).unwrap_or(0);
+    f.reach_before = loop {
+        stop::check()?;
+        let reach: Vec<Reach> = fleet
+            .iter()
+            .map(|mac| lane.reached(mac, &fleet, formed_unix))
+            .collect();
+        if reach.iter().all(|r| r.reached.len() + 1 >= fleet.len()) || formed.elapsed() >= HANG {
+            break reach;
+        }
+        stop::sleep(Duration::from_millis(500))?;
+    };
+    for r in &f.reach_before {
+        lane.say(&format!(
+            "before: {}'s heartbeat reached {}{}",
+            r.mac,
+            names(&r.reached),
+            if r.dark.is_empty() {
+                String::new()
+            } else {
+                format!(" (its last dial of {} missed)", r.dark.join(", "))
+            }
+        ));
+    }
+
     let settle = Instant::now();
     let pairs = [("a1", "a2"), ("b1", "b2"), ("a1", "b1")];
     let mut admitted: BTreeMap<(&str, &str), DriveTry> = BTreeMap::new();
     loop {
         stop::check()?;
-        let surveys: Vec<SurveyRead> = ["a1", "b1"]
+        let surveys: Vec<SurveyRead> = fleet
             .iter()
             .map(|mac| lane.survey(mac, Phase::Before))
             .collect();
@@ -2064,29 +2506,36 @@ fn run(lane: &mut Lane) -> Result<Evidence, Fail> {
         }
         let unbound: Vec<String> = ["b1", "b2"]
             .into_iter()
-            .filter_map(|mac| lane.unbound(mac, &["a1", "a2", "b1", "b2"]))
+            .filter_map(|mac| lane.unbound(mac, &members_before))
             .collect();
+        let hears =
+            |s: &SurveyRead, want: &[&str]| want.iter().all(|m| s.answered.iter().any(|a| a == m));
+        let said = |s: &SurveyRead| {
+            format!(
+                "{} hears {}{}",
+                s.from,
+                names(&s.answered),
+                if s.silent.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", s.silent.join("; "))
+                }
+            )
+        };
         let deaf: Vec<String> = surveys
             .iter()
-            .filter(|s| {
-                ["a1", "a2", "b1", "b2"]
-                    .iter()
-                    .any(|m| !s.answered.iter().any(|a| a == m))
-            })
-            .map(|s| {
-                format!(
-                    "{} hears {}{}",
-                    s.from,
-                    names(&s.answered),
-                    if s.silent.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" ({})", s.silent.join("; "))
-                    }
-                )
-            })
+            .filter(|s| ["a1", "b1"].contains(&s.from.as_str()) && !hears(s, &members_before))
+            .map(said)
             .collect();
-        if deaf.is_empty() && refused.is_empty() && unbound.is_empty() {
+        let gate = deaf.is_empty() && refused.is_empty() && unbound.is_empty();
+        let spread = surveys.iter().all(|s| hears(s, &fleet));
+        if gate && (spread || settle.elapsed() >= HANG) {
+            if !spread {
+                lane.say(&format!(
+                    "before: not every fleet Mac heard every other within {}s; cutting anyway",
+                    HANG.as_secs()
+                ));
+            }
             f.surveys.extend(surveys);
             break;
         }
@@ -2120,9 +2569,21 @@ fn run(lane: &mut Lane) -> Result<Evidence, Fail> {
     let cut = Instant::now();
     mark("cut");
     let cut_ms = ms_since(lane.t0);
-    lane.say("CUT: island A (a1, a2, a3) and island B (b1, b2, b3) cannot reach each other");
+    lane.say(&format!(
+        "CUT: island A ({}) and island B ({}) cannot reach each other",
+        MACS.iter()
+            .filter(|s| s.island == Island::A)
+            .map(|s| s.name)
+            .collect::<Vec<_>>()
+            .join(", "),
+        MACS.iter()
+            .filter(|s| s.island == Island::B)
+            .map(|s| s.name)
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
 
-    for mac in ["a1", "b1"] {
+    for mac in &fleet {
         let s = lane.survey(mac, Phase::EarlyCut);
         lane.say(&format!(
             "in the cut: {} hears {}",
@@ -2144,9 +2605,14 @@ fn run(lane: &mut Lane) -> Result<Evidence, Fail> {
         f.drives.push(d);
     }
 
-    // The issuer's book now: a heartbeat in flight when the cut fell has landed by the time
-    // the early surveys and drives are done, so a later one crossed the cut.
-    let seen_at_cut = lane.seen();
+    // When a1 last answered each heartbeat Mac, by that Mac's own stamps: a heartbeat in flight
+    // when the cut fell has landed by the time the early surveys and drives are done, so a later
+    // answer to an island B Mac crossed the cut.
+    let heartbeat_macs = [("a2", Island::A), ("b1", Island::B), ("b2", Island::B)];
+    let answered_at_cut: BTreeMap<&str, Option<u64>> = heartbeat_macs
+        .iter()
+        .map(|(mac, _)| (*mac, lane.issuer_answered(mac)))
+        .collect();
 
     // Each side writes.
     let mut sets = vec![("a1", "f8-a-1"), ("a1", "f8-a-2"), ("b1", "f8-b-1")];
@@ -2229,20 +2695,7 @@ fn run(lane: &mut Lane) -> Result<Evidence, Fail> {
             in_during_cut_ms: None,
         });
     }
-    let (ok, words) = lane.fleet_join("b3", "b1");
-    lane.say(&format!(
-        "in the cut: b3 fleet join: {}",
-        if ok {
-            "joined".to_owned()
-        } else {
-            format!("refused: {words}")
-        }
-    ));
-    f.joins.push(FleetJoin {
-        phase: Phase::EarlyCut,
-        ok,
-        words,
-    });
+    f.joins.push(join_b3(lane, Phase::EarlyCut));
 
     // Hold the cut: watch the newcomers, and drive late once the copies are past the window.
     let heal_at = cut + lane.opts.hold;
@@ -2272,11 +2725,12 @@ fn run(lane: &mut Lane) -> Result<Evidence, Fail> {
             commons_in_cut(lane, &mut plane, &v);
             commons_done = true;
         }
-        // Island B's copies of the issuer's book stopped refreshing at the cut; once the cut
+        // Island B's copies of the minter's book stopped refreshing at the cut; once the cut
         // outlasts the window they bind a drive for, drive on both sides (island A's is the
-        // control: its issuer is still there).
+        // control: its minter is still there), each island's Mac that joined at a member other
+        // than the minter too, from a Mac that is not the minter.
         if !late_done && cut.elapsed() >= COPY_WINDOW {
-            for (from, to) in [("a1", "a2"), ("b1", "b2")] {
+            for (from, to) in [("a1", "a2"), ("b1", "b2"), ("a2", "a4"), ("b1", "b4")] {
                 let d = lane.drive(from, to, Phase::LateCut);
                 lane.say(&format!(
                     "late in the cut: drive {from} -> {to} ({}s copy): {}",
@@ -2296,18 +2750,8 @@ fn run(lane: &mut Lane) -> Result<Evidence, Fail> {
     if !commons_done {
         commons_in_cut(lane, &mut plane, &v);
     }
-    let seen_at_heal = lane.seen();
-    for (mac, island) in [("a2", Island::A), ("b1", Island::B), ("b2", Island::B)] {
-        f.heartbeats.push(Heartbeat {
-            mac: mac.to_owned(),
-            island,
-            advanced_in_cut: seen_at_heal.get(mac) > seen_at_cut.get(mac),
-            back_ms: None,
-        });
-    }
     for island in [Island::A, Island::B] {
-        let macs: Vec<(String, Option<Head>)> = MACS
-            .iter()
+        let macs: Vec<(String, Option<Head>)> = vault_macs()
             .filter(|s| s.island == island)
             .filter(|s| lane.held(s.name).membership == "in")
             .map(|s| (s.name.to_owned(), lane.held(s.name).head))
@@ -2342,6 +2786,24 @@ fn run(lane: &mut Lane) -> Result<Evidence, Fail> {
         ));
     }
 
+    // `--minter-away`: the minter leaves before the heal, so what spreads after it spreads
+    // member to member, and no heartbeat can come back to its book.
+    if lane.opts.minter_away {
+        lane.stop_instance("a1")?;
+        f.away.push("a1".to_owned());
+        lane.say("a1's instance stopped (SIGKILL): the minter is gone before the heal");
+    } else {
+        for (mac, island) in heartbeat_macs {
+            f.heartbeats.push(Heartbeat {
+                mac: mac.to_owned(),
+                island,
+                advanced_in_cut: lane.issuer_answered(mac)
+                    > answered_at_cut.get(mac).copied().flatten(),
+                back_ms: None,
+            });
+        }
+    }
+
     // The heal.
     lane.set_cut(false)?;
     let heal = Instant::now();
@@ -2354,7 +2816,12 @@ fn run(lane: &mut Lane) -> Result<Evidence, Fail> {
         secs(cut_for_ms)
     ));
 
-    for (from, to) in [("b1", "b2"), ("a1", "b1")] {
+    // At once, before any heartbeat: each drive is bound by the driven Mac's own book, not by a
+    // copy of the minter's that the cut aged.
+    for (from, to) in [("b1", "b2"), ("a1", "b1"), ("a2", "b1")] {
+        if f.away.iter().any(|m| m == from || m == to) {
+            continue;
+        }
         let d = lane.drive(from, to, Phase::Healed);
         lane.say(&format!(
             "healed: drive {from} -> {to}: {}",
@@ -2367,23 +2834,23 @@ fn run(lane: &mut Lane) -> Result<Evidence, Fail> {
         f.drives.push(d);
     }
     if !f.joins.iter().any(|j| j.ok) {
-        let (ok, words) = lane.fleet_join("b3", "b1");
-        lane.say(&format!(
-            "healed: b3 fleet join again: {}",
-            if ok {
-                "joined".to_owned()
-            } else {
-                format!("refused: {words}")
-            }
-        ));
-        f.joins.push(FleetJoin {
-            phase: Phase::Healed,
-            ok,
-            words,
-        });
+        f.joins.push(join_b3(lane, Phase::Healed));
     }
 
-    // Vault: wait for one head on both servers and every member; meanwhile, heartbeats.
+    // Vault: wait for one head on both servers and every member; meanwhile, heartbeats (by each
+    // heartbeat Mac's own stamps: nothing but heartbeats asks until the surveys after the heal).
+    let note_back = |lane: &Lane, heartbeats: &mut Vec<Heartbeat>| {
+        let now_ms = ms_since(heal);
+        for h in heartbeats.iter_mut() {
+            if h.back_ms.is_none()
+                && lane
+                    .issuer_answered(&h.mac)
+                    .is_some_and(|ms| ms > heal_unix)
+            {
+                h.back_ms = Some(now_ms);
+            }
+        }
+    };
     let mut samples: BTreeMap<&'static str, Vec<(u64, String)>> = BTreeMap::new();
     let end = heal + HANG;
     let mut stable_since: Option<(Instant, String)> = None;
@@ -2391,17 +2858,12 @@ fn run(lane: &mut Lane) -> Result<Evidence, Fail> {
     loop {
         stop::check()?;
         let now_ms = ms_since(heal);
-        let seen = lane.seen();
-        for h in &mut f.heartbeats {
-            if h.back_ms.is_none() && seen.get(h.mac.as_str()).is_some_and(|s| *s > heal_unix) {
-                h.back_ms = Some(now_ms);
-            }
-        }
+        note_back(lane, &mut f.heartbeats);
         if v.healed.is_none() {
             let a = lane.served(Island::A)?;
             let b = lane.served(Island::B)?;
             let mut all_one = matches!((&a, &b), (Some(a), Some(b)) if a.digest == b.digest);
-            for s in &MACS {
+            for s in vault_macs() {
                 if !expected.iter().any(|e| e == s.name) {
                     continue;
                 }
@@ -2441,14 +2903,12 @@ fn run(lane: &mut Lane) -> Result<Evidence, Fail> {
                 stable_since = None;
             }
         }
-        let heartbeats_back = f.heartbeats.iter().all(|h| h.back_ms.is_some());
         // A one-head window that opened before the hang detector ran out may finish, so a head
-        // first held at 58 s still counts as within the minute.
+        // first held at 58 s still counts as within the minute. The heartbeats are read on
+        // through the fleet's own wait below.
         let now = Instant::now();
         let window_open = v.healed.is_none() && stable_since.is_some();
-        if (v.healed.is_some() && heartbeats_back)
-            || (now >= end && (!window_open || now >= end + SETTLE))
-        {
+        if v.healed.is_some() || (now >= end && (!window_open || now >= end + SETTLE)) {
             break;
         }
         stop::sleep(Duration::from_millis(250))?;
@@ -2467,7 +2927,7 @@ fn run(lane: &mut Lane) -> Result<Evidence, Fail> {
         (Island::B, lane.served(Island::B)?),
     ];
     let final_digest = v.healed.as_ref().map(|(_, h)| h.digest.clone());
-    for s in &MACS {
+    for s in vault_macs() {
         let held = lane.held(s.name);
         let at_ms = final_digest.as_ref().and_then(|d| {
             samples.get(s.name).and_then(|list| {
@@ -2501,48 +2961,104 @@ fn run(lane: &mut Lane) -> Result<Evidence, Fail> {
             missing,
         });
     }
-    for s in &MACS {
+    for s in vault_macs() {
         v.runners.push((
             s.name.to_owned(),
             lane.runners(s.name, cut_ms, heal_ms, t0_ms),
         ));
     }
 
-    // Fleet: the surveys after the heal, until both hear every member the surveys before the
-    // cut heard (the hang detector bounds it; the last pair read is the evidence).
-    let mut everyone: Vec<String> = f
-        .surveys
-        .iter()
-        .filter(|s| s.phase == Phase::Before)
-        .flat_map(|s| s.answered.clone())
-        .collect();
-    if f.joins.iter().any(|j| j.ok) && !everyone.iter().any(|m| m == "b3") {
-        everyone.push("b3".to_owned());
-    }
-    let looking = Instant::now();
+    // Fleet: each member's heartbeat stamps are read first, while nothing but heartbeats has
+    // asked the others since the heal (a survey stamps the members that answer it too, so a read
+    // after one would credit the survey), until each member's heartbeat reached every other or
+    // the hang detector, counted from the heal, runs out; the last read is the evidence.
+    let fleet_after = members_after(&f);
+    let fleet_after: Vec<&str> = fleet_after.iter().map(String::as_str).collect();
     f.first_read_ms = Some(ms_since(heal));
-    let last = loop {
+    let reach = loop {
         stop::check()?;
-        let pair: Vec<SurveyRead> = ["a1", "b1"]
+        note_back(lane, &mut f.heartbeats);
+        let reach: Vec<Reach> = fleet_after
             .iter()
-            .map(|mac| lane.survey(mac, Phase::Healed))
+            .map(|mac| lane.reached(mac, &fleet_after, heal_unix))
             .collect();
-        if pair
+        if reach
             .iter()
-            .all(|s| everyone.iter().all(|m| s.answered.contains(m)))
+            .all(|r| r.reached.len() + 1 >= fleet_after.len())
         {
-            f.whole_ms = Some(ms_since(heal));
-            break pair;
+            f.reach_ms = Some(ms_since(heal));
+            break reach;
         }
-        if looking.elapsed() >= HANG {
-            break pair;
+        if heal.elapsed() >= HANG {
+            break reach;
         }
         stop::sleep(Duration::from_millis(500))?;
     };
-    for s in last {
+    note_back(lane, &mut f.heartbeats);
+    for r in reach {
+        lane.say(&format!(
+            "healed: {}'s heartbeat reached {}{}",
+            r.mac,
+            names(&r.reached),
+            if r.dark.is_empty() {
+                String::new()
+            } else {
+                format!(" (its last dial of {} missed)", r.dark.join(", "))
+            }
+        ));
+        f.reach.push(r);
+    }
+    // Then every member surveys, until each survey hears every member (the hang detector bounds
+    // it; the last read is the evidence).
+    let looking = Instant::now();
+    f.surveys_ms = Some(ms_since(heal));
+    let surveys = loop {
+        stop::check()?;
+        let surveys: Vec<SurveyRead> = fleet_after
+            .iter()
+            .map(|mac| lane.survey(mac, Phase::Healed))
+            .collect();
+        if surveys.iter().all(|s| {
+            fleet_after
+                .iter()
+                .all(|m| s.answered.iter().any(|a| a == m))
+        }) {
+            f.whole_ms = Some(ms_since(looking));
+            break surveys;
+        }
+        if looking.elapsed() >= HANG {
+            break surveys;
+        }
+        stop::sleep(Duration::from_millis(500))?;
+    };
+    for s in surveys {
         lane.say(&format!("healed: {} hears {}", s.from, names(&s.answered)));
         f.surveys.push(s);
     }
+
+    // Every member drives every other, once each.
+    let mut refused = Vec::new();
+    let before = f.drives.len();
+    for from in &fleet_after {
+        for to in fleet_after.iter().filter(|to| *to != from) {
+            let d = lane.drive(from, to, Phase::End);
+            if !d.ok {
+                refused.push(format!("{from} -> {to}: {}", d.words));
+            }
+            f.drives.push(d);
+        }
+    }
+    lane.say(&format!(
+        "at the end: {} of {} drives among {} admitted{}",
+        f.drives.len() - before - refused.len(),
+        f.drives.len() - before,
+        fleet_after.join(", "),
+        if refused.is_empty() {
+            String::new()
+        } else {
+            format!("; refused: {}", refused.join("; "))
+        }
+    ));
 
     // Commons: exchange across, then repair round a ring of every enrolled Mac and read each.
     plane.after_heal();
@@ -2587,6 +3103,41 @@ fn run(lane: &mut Lane) -> Result<Evidence, Fail> {
         load,
         cut_ms: cut_for_ms,
     })
+}
+
+/// b3's `aterm fleet join` at the member its spec names, and, where it joined, its `allow drive
+/// --all`, as every other member's, said on the timeline.
+fn join_b3(lane: &Lane, phase: Phase) -> FleetJoin {
+    let at = spec("b3").joins_at.unwrap_or("b1");
+    let (ok, mut words) = lane.fleet_join("b3", at);
+    if ok {
+        let out = lane.aterm("b3", &["fleet", "allow", "drive", "--all"], None);
+        if out.code != 0 {
+            words = format!(
+                "joined; allow drive --all exited {}: {}",
+                out.code,
+                one_line(&format!("{} {}", out.stdout, out.stderr))
+            );
+        }
+    }
+    lane.say(&format!(
+        "{}: b3 fleet join at {at}: {}",
+        if phase == Phase::Healed {
+            "healed"
+        } else {
+            "in the cut"
+        },
+        if ok {
+            if words.is_empty() {
+                "joined".to_owned()
+            } else {
+                words.clone()
+            }
+        } else {
+            format!("refused: {words}")
+        }
+    ));
+    FleetJoin { phase, ok, words }
 }
 
 /// The Commons plane's work in the cut, said on the timeline.
@@ -2752,7 +3303,9 @@ pub fn report(ev: &Evidence, checks: &[Check]) -> String {
             }
         );
     }
-    for d in &f.drives {
+    // The drives at the end are every member to every other: the refusals are listed, the rest
+    // counted.
+    for d in f.drives.iter().filter(|d| d.phase != Phase::End || !d.ok) {
         let _ = writeln!(
             out,
             "- drive {} {} -> {}{}: {}",
@@ -2768,6 +3321,41 @@ pub fn report(ev: &Evidence, checks: &[Check]) -> String {
             }
         );
     }
+    let at_end = f.drives.iter().filter(|d| d.phase == Phase::End).count();
+    if at_end > 0 {
+        let _ = writeln!(
+            out,
+            "- drives at the end, every member to every other: {} of {at_end} admitted",
+            f.drives
+                .iter()
+                .filter(|d| d.phase == Phase::End && d.ok)
+                .count()
+        );
+    }
+    for m in &f.away {
+        let _ = writeln!(
+            out,
+            "- {m}'s instance was stopped before the heal (--minter-away)"
+        );
+    }
+    for (span, reach) in [
+        ("before the cut", &f.reach_before),
+        ("after the heal", &f.reach),
+    ] {
+        for r in reach {
+            let _ = writeln!(
+                out,
+                "- {}'s heartbeat {span} reached {}{}",
+                r.mac,
+                names(&r.reached),
+                if r.dark.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (its last dial of {} missed)", r.dark.join(", "))
+                }
+            );
+        }
+    }
     if let Some(why) = &f.late_skipped {
         let _ = writeln!(out, "- late drives not tried: {why}");
     }
@@ -2776,17 +3364,17 @@ pub fn report(ev: &Evidence, checks: &[Check]) -> String {
             out,
             "- b3 fleet join {}: {}",
             j.phase.word(),
-            if j.ok {
-                "joined".to_owned()
-            } else {
-                format!("refused ({})", j.words)
+            match (j.ok, j.words.is_empty()) {
+                (true, true) => "joined".to_owned(),
+                (true, false) => j.words.clone(),
+                (false, _) => format!("refused ({})", j.words),
             }
         );
     }
     for h in &f.heartbeats {
         let _ = writeln!(
             out,
-            "- {} (island {}) heartbeat: {} in the cut; back at the issuer {}",
+            "- {} (island {}) heartbeat, by its own stamps: {} in the cut; back at the issuer {}",
             h.mac,
             h.island.word(),
             if h.advanced_in_cut {
@@ -2867,9 +3455,15 @@ pub fn report(ev: &Evidence, checks: &[Check]) -> String {
 pub fn cmd_partition(args: &[String]) -> Res {
     stop::install();
     let opts = parse(args)?;
+    if !cfg!(debug_assertions) {
+        return Err(Fail::exit(
+            3,
+            "swarm partition needs a debug lab image for its in-process cut",
+        ));
+    }
     let aterm = crate::instance::resolve_aterm(opts.aterm.clone()).map_err(|e| Fail::exit(3, e))?;
     println!(
-        "aterm-lab swarm partition: two islands on this Mac's loopback; {}, writers {}, cut held at least {}s",
+        "aterm-lab swarm partition: two islands on this Mac's loopback; {}, writers {}, cut held at least {}s{}",
         match opts.publish {
             Publish::Policy => "publish to every server aterm-swarm-policy lists",
             Publish::OneUrl => "one-URL publish (the negative control)",
@@ -2878,7 +3472,12 @@ pub fn cmd_partition(args: &[String]) -> Res {
             Writers::Both => "a1 and b1",
             Writers::A => "a1 alone",
         },
-        opts.hold.as_secs()
+        opts.hold.as_secs(),
+        if opts.minter_away {
+            "; a1's instance stops before the heal"
+        } else {
+            ""
+        }
     );
     let mut lane = bring_up(&aterm, &opts).map_err(could_not_run)?;
     let ev = run(&mut lane).map_err(could_not_run)?;
@@ -2917,6 +3516,30 @@ fn could_not_run(f: Fail) -> Fail {
     }
 }
 
+/// The part of a record's name after `swarm-partition` for `opts`'s arm, and the flags that
+/// chose it: each flag that changes what runs, in this order, then `--label`'s word.
+fn record_arm(opts: &Opts) -> (String, String) {
+    let mut arm = String::new();
+    let mut flags = String::new();
+    if opts.publish == Publish::OneUrl {
+        arm.push_str("-one-url");
+        flags.push_str(" --one-url");
+    }
+    if opts.writers == Writers::A {
+        arm.push_str("-writers-a");
+        flags.push_str(" --writers a");
+    }
+    if opts.minter_away {
+        arm.push_str("-minter-away");
+        flags.push_str(" --minter-away");
+    }
+    if let Some(label) = &opts.label {
+        let _ = write!(arm, "-{label}");
+        let _ = write!(flags, " --label {label}");
+    }
+    (arm, flags)
+}
+
 /// Write the run's record under `docs/measured/` when `to_docs`, else under the lab's results.
 fn write_record(
     lane: &Lane,
@@ -2927,12 +3550,7 @@ fn write_record(
     let p = crate::paths::paths();
     let stamp = crate::util::utc_stamp(crate::util::now_secs());
     let date = stamp.get(..10).unwrap_or("undated").to_owned();
-    let (arm, flags) = match (lane.opts.publish, lane.opts.writers) {
-        (Publish::Policy, Writers::Both) => ("", ""),
-        (Publish::OneUrl, Writers::Both) => ("-one-url", " --one-url"),
-        (Publish::Policy, Writers::A) => ("-writers-a", " --writers a"),
-        (Publish::OneUrl, Writers::A) => ("-one-url-writers-a", " --one-url --writers a"),
-    };
+    let (arm, flags) = record_arm(&lane.opts);
     let path = if to_docs {
         p.repo
             .join("docs/measured")
@@ -2974,7 +3592,7 @@ fn write_record(
     let _ = writeln!(body);
     let _ = writeln!(
         body,
-        "The aterm under test is `{}`; every Mac is a private world on this Mac's loopback, and the cut is the `ATERM_DEBUG_PARTITION` seam (`crates/aterm-uds/src/partition.rs`), which both cut checks show it honoured (a run where either leaked is never written here). The fleet heartbeat runs every {HEARTBEAT_MS} ms here (production: 180 s); every other period is production's. The Commons plane is the lab driving production's repair exchange on each Mac's custody; the accounts plane is a model run of main's account claims on two Macs' table replicas on a simulated clock.",
+        "The aterm under test is `{}`; every Mac is a private world on this Mac's loopback, and the cut is the `ATERM_DEBUG_PARTITION` seam (`crates/aterm-uds/src/partition.rs`), which both cut checks show it honoured (a run where either leaked is never written here). The fleet heartbeat runs every {HEARTBEAT_MS} ms here (production: 180 s), and since every Mac registers from 127.0.0.1, a book records up to {JOINED_PER_ADDRESS} members from one address (production: 4); every other period and bound is production's. The Commons plane is the lab driving production's repair exchange on each Mac's custody; the accounts plane is a model run of main's account claims on two Macs' table replicas on a simulated clock.",
         lane.world
             .aterm
             .strip_prefix(&p.repo)

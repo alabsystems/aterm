@@ -50,7 +50,7 @@ fn to_rgba8(mut buf: Vec<u8>, color_type: ColorType, w: usize, h: usize) -> Opti
     if color_type == ColorType::Rgba {
         return Some(buf);
     }
-    let mut out = Vec::with_capacity(n * 4);
+    let mut out = Vec::with_capacity(n.checked_mul(4)?);
     match color_type {
         ColorType::Rgb => {
             for px in buf.as_chunks::<3>().0 {

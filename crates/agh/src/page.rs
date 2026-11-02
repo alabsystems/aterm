@@ -502,7 +502,7 @@ pub fn next_link(
     }
     let page = pages
         .first()
-        .and_then(|v| v.parse::<u32>().ok())
+        .and_then(|v| crate::path::digits::<u32>(v))
         .ok_or_else(|| unnumbered_link(next_url, query))?;
     if page <= last_page {
         return Err(refuse(&format!(
@@ -514,9 +514,8 @@ pub fn next_link(
         return Err(refuse("it names more than one per_page"));
     }
     if let Some(&per_page) = per_pages.first() {
-        let per_page = per_page
-            .parse::<u64>()
-            .map_err(|_| refuse("its per_page is not a number"))?;
+        let per_page = crate::path::digits::<u64>(per_page)
+            .ok_or_else(|| refuse("its per_page is not a number"))?;
         if per_page == 0 {
             return Err(refuse("per_page 0 is below 1"));
         }
@@ -581,7 +580,7 @@ fn numeric_link(url: &str) -> bool {
 }
 
 /// The fields of a repository object that move with every star, fork, issue and push (design
-/// plan §13.1's volatile fields), which a repository listing's stable form leaves out.
+/// §13.1's volatile fields), which a repository listing's stable form leaves out.
 const REPOSITORY_VOLATILE: [&str; 10] = [
     "stargazers_count",
     "watchers_count",
@@ -663,7 +662,7 @@ impl Walk<'_> {
         let start = self.first.path_and_query();
         let start_query = start.split_once('?').map_or("", |(_, query)| query);
         let mut page_no = query_value(start_query, "page")
-            .and_then(|v| v.parse::<u32>().ok())
+            .and_then(crate::path::digits::<u32>)
             .unwrap_or(1);
         let mut pages: Vec<PageRead> = Vec::new();
         let mut items: Vec<Value> = Vec::new();
@@ -846,9 +845,8 @@ fn walk_as(
     let first = match named.as_slice() {
         [] => first.query("per_page", opts.per_page.to_string()),
         [value]
-            if value
-                .parse::<u64>()
-                .is_ok_and(|n| (1..=MAX_PER_PAGE).contains(&n)) =>
+            if crate::path::digits::<u64>(value)
+                .is_some_and(|n| (1..=MAX_PER_PAGE).contains(&n)) =>
         {
             first
         }

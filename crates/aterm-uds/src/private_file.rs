@@ -24,6 +24,13 @@ pub enum PrivateFileError {
     Io(io::Error),
 }
 
+/// A mark's or another call's I/O error ([`crate::kept_out`] over [`open_private`]).
+impl From<io::Error> for PrivateFileError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
 impl fmt::Display for PrivateFileError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -100,8 +107,20 @@ fn file_verdict(
 /// As [`open_private`], and [`PrivateFileError::Malformed`] when the file holds more than
 /// `max` bytes or [`PrivateFileError::Io`] when it cannot be read.
 pub fn read_private(dir: &Path, name: &str, max: usize) -> Result<Vec<u8>, PrivateFileError> {
-    let (file, _meta) = open_private(dir, name)?;
-    read_capped(file, max)
+    read_private_with_metadata(dir, name, max).map(|(bytes, _metadata)| bytes)
+}
+
+/// Read private bytes and the metadata of the same opened file, even if its name is atomically
+/// replaced meanwhile. The read has [`read_private`]'s byte cap and privacy checks.
+/// # Errors
+/// As [`read_private`].
+pub fn read_private_with_metadata(
+    dir: &Path,
+    name: &str,
+    max: usize,
+) -> Result<(Vec<u8>, std::fs::Metadata), PrivateFileError> {
+    let (file, metadata) = open_private(dir, name)?;
+    read_capped(file, max).map(|bytes| (bytes, metadata))
 }
 
 /// `file`'s bytes, refused when there are more than `max` ([`read_capped_into`] for a vector).
@@ -121,7 +140,7 @@ fn read_capped(file: std::fs::File, max: usize) -> Result<Vec<u8>, PrivateFileEr
 const ONE_COMPONENT: &str = "a private file's name is one path component";
 
 fn one_component(name: &str) -> bool {
-    !(name.is_empty() || name == "." || name == ".." || name.contains('/'))
+    !(name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0'))
 }
 
 fn one_component_io(name: &str) -> io::Result<()> {
@@ -423,7 +442,8 @@ pub struct OwnedRead {
 /// - a second link;
 /// - a group or other **write** bit on either.
 ///
-/// agh's `legacy_loose` profiles alone call it (design §6.6, M2 only).
+/// Use this for owned metadata whose read bits may remain open, including legacy
+/// profiles. Credentials still require [`read_private_into`]'s strict read mode.
 ///
 /// # Errors
 ///
@@ -652,6 +672,51 @@ pub fn write_private(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
     crate::atomic_file::write(&dir.join(name), bytes, 0o600)
 }
 
+/// Writes `bytes` to a NEW `name` in private directory `dir` with mode `0600`, and never over one
+/// that is there: for a secret whose replacement would strand what it protects. `prepare` runs on
+/// the file before it gets its name, so whatever it marks is on the file from the name's first
+/// moment. The name comes from a hard link, because a link fails on a name that exists where a
+/// rename would replace it, so from the link until the temporary is unlinked `name` has two links.
+///
+/// A crash leaves no `name` and maybe the temporary, holding the bytes, or `name` whole and flushed
+/// with that temporary still its second link. A reader that refuses a second link (astream's
+/// owner-only secret rule) refuses `name` until the temporary is gone, so a caller of such a reader
+/// runs [`crate::atomic_file::sweep_temps_beside`] on `name` before it reads. A reader that meets a
+/// live writer inside that moment refuses too, and the next read does not.
+///
+/// Answers whether it wrote: `false` when `name` already exists, which is left as it was.
+/// # Errors
+/// Returns an error if `name` spans multiple components, `dir` is not private, or `prepare`, a
+/// write or a flush fails; `name` then does not exist unless it did before, or the flush of the
+/// directory failed after the name was made.
+pub fn write_private_new(
+    dir: &Path,
+    name: &str,
+    bytes: &[u8],
+    prepare: impl FnOnce(&std::fs::File) -> io::Result<()>,
+) -> io::Result<bool> {
+    use std::io::Write as _;
+    one_component_io(name)?;
+    check_private_dir(dir)?;
+    let path = dir.join(name);
+    let (temp, mut file) = crate::atomic_file::create_temp_beside(&path, 0o600)?;
+    let linked = (|| {
+        prepare(&file)?;
+        file.write_all(bytes)?;
+        aterm_durable::Flush::Durable.file(&file)?;
+        // A hard link fails on a name that exists, where a rename would replace it.
+        std::fs::hard_link(&temp, &path)
+    })();
+    let removed = std::fs::remove_file(&temp);
+    match linked {
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
+        other => other?,
+    }
+    removed?;
+    aterm_durable::Flush::Durable.dir(dir)?;
+    Ok(true)
+}
+
 /// Removes single-component file `name` from `dir`, returning `Ok(true)` if it existed (none does where `dir` is no directory).
 /// # Errors
 /// Returns an error if `name` spans multiple components or unlinking fails.
@@ -716,6 +781,7 @@ pub fn lock_exclusive_until_with(
     busy: &str,
     mut held: impl FnMut(),
 ) -> io::Result<()> {
+    crate::keep_out_of_children(file)?;
     let mut backoff = Duration::from_millis(1);
     loop {
         #[expect(
@@ -834,6 +900,7 @@ impl PrivateLock {
                 format!("{} is no regular file", path.display()),
             ));
         }
+        crate::keep_out_of_children(&file)?;
         // `None`: a wait no clock can represent, which has no deadline.
         let deadline = Instant::now().checked_add(within);
         let mut backoff = Duration::from_millis(1);
@@ -875,7 +942,7 @@ mod tests {
     use super::{
         OwnedRead, PrivateDir, PrivateFileError, PrivateLock, PrivateRead, create_private_dir,
         ensure_private_dir, judge_private_dir, open_private_rw, read_owned_into, read_private,
-        read_private_into, remove_private, write_private,
+        read_private_into, remove_private, write_private, write_private_new,
     };
 
     /// The busy text the lock tests hand [`PrivateLock::take`].
@@ -1089,13 +1156,12 @@ mod tests {
             println!("STAGED narrow umask ok");
             return;
         }
-        let out = crate::deadline::output_within(
+        let out = crate::deadline::ends_within(
             crate::spawnfd::command(std::env::current_exe().expect("the test binary"))
                 .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
                 .env(STAGE_ENV, "1"),
-            std::time::Duration::from_secs(60),
-        )
-        .expect("the child ran within the hang detector");
+            crate::deadline::ECHO_HANG,
+        );
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
             out.status.success() && stdout.contains("STAGED narrow umask ok"),
@@ -1327,7 +1393,7 @@ mod tests {
         let sub = dir_in(&dir, "sub", 0o700);
         file_in(&sub, "token", b"x", 0o600);
         let mut buf = [0u8; 64];
-        for name in ["sub/token", "../state/sub/token", "..", ".", ""] {
+        for name in ["sub/token", "../state/sub/token", "..", ".", "", "a\0b"] {
             assert!(
                 matches!(
                     read_private_into(&dir, name, 64, &mut buf),
@@ -1347,7 +1413,7 @@ mod tests {
         let root = aterm_tempfile::tempdir().unwrap();
         let dir = dir_in(root.path(), "state", 0o700);
         file_in(root.path(), "beside", b"x", 0o600);
-        for name in ["sub/token", "../token", "..", ".", ""] {
+        for name in ["sub/token", "../token", "..", ".", "", "a\0b"] {
             assert_eq!(
                 write_private(&dir, name, b"t").unwrap_err().kind(),
                 std::io::ErrorKind::InvalidInput,
@@ -1732,5 +1798,47 @@ mod tests {
             read_private(&dir, "book", 64),
             Err(PrivateFileError::NotPrivate(super::ANOTHER_LINK))
         ));
+    }
+
+    /// A new private file is made whole, `prepare` seeing it before it has its name, and one that
+    /// is there stays: writing a secret twice can strand nothing it protects.
+    #[test]
+    fn a_new_private_file_never_replaces_one_and_leaves_no_temporary() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let dir = root.path().join("d");
+        create_private_dir(&dir).unwrap();
+        let names = || {
+            let mut names: Vec<_> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect();
+            names.sort();
+            names
+        };
+        let mut prepared = false;
+        assert!(
+            write_private_new(&dir, "key", b"one", |file| {
+                prepared = !dir.join("key").exists()
+                    && file.metadata()?.permissions().mode() & 0o777 == 0o600;
+                Ok(())
+            })
+            .unwrap()
+        );
+        assert!(prepared, "prepare ran on a 0600 file with no name yet");
+        assert_eq!(read_private(&dir, "key", 64).unwrap(), b"one");
+        assert!(!write_private_new(&dir, "key", b"two", |_| Ok(())).unwrap());
+        assert_eq!(read_private(&dir, "key", 64).unwrap(), b"one", "kept");
+        assert_eq!(names(), ["key"], "no temporary left");
+
+        let refused = write_private_new(&dir, "other", b"x", |_| Err(std::io::Error::other("no")))
+            .unwrap_err();
+        assert_eq!(refused.to_string(), "no");
+        assert_eq!(names(), ["key"], "a failed prepare leaves no name");
+        assert_eq!(
+            write_private_new(&dir, "a/b", b"x", |_| Ok(()))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
     }
 }

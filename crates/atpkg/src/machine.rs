@@ -703,7 +703,10 @@ pub fn record_applied(layout: &crate::store::Layout, cfg: &crate::config::Machin
     let tmp = layout
         .prefix
         .join(format!("machine.applied.tmp-{}", std::process::id()));
-    if std::fs::write(&tmp, text).is_err() || std::fs::rename(&tmp, &path).is_err() {
+    let _ = std::fs::remove_file(&tmp);
+    let wrote = crate::platform::open_create_new_write(&tmp, 0o644)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, text.as_bytes()));
+    if wrote.is_err() || std::fs::rename(&tmp, &path).is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
 }
@@ -1372,5 +1375,21 @@ mod tests {
         assert_eq!(left.level, Level::Ok);
         assert!(left.text.contains("rosetta = false"), "{}", left.text);
         assert_eq!(row(RosettaPosture::Unknown, true).level, Level::Warn);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn record_applied_does_not_follow_temp_symlink() {
+        let layout = crate::testdir::layout("atpkg-machine-applied-symlink-");
+        let cfg = crate::config::MachineConfig::default();
+        let victim = layout.prefix.join("victim.txt");
+        std::fs::write(&victim, "untouched").unwrap();
+        let tmp = layout
+            .prefix
+            .join(format!("machine.applied.tmp-{}", std::process::id()));
+        std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+        record_applied(&layout, &cfg);
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "untouched");
+        assert!(!changed_since_applied(&layout, &cfg));
     }
 }

@@ -5,6 +5,7 @@
 //! receive a packet before the caller explicitly connects or starts listening.
 
 use super::{Socket, bind_interface, refuse, restrict_hops, set_option, socket_policy};
+use aterm_uds::connect::Inet;
 use std::{
     io,
     net::{SocketAddr, TcpStream},
@@ -15,54 +16,6 @@ use std::{
 #[cfg(target_os = "macos")]
 pub(super) const NO_SIGPIPE: i32 = 0x1022;
 
-pub(super) enum Address {
-    V4(libc::sockaddr_in),
-    V6(libc::sockaddr_in6),
-}
-impl Address {
-    pub(super) fn new(address: SocketAddr) -> Self {
-        match address {
-            SocketAddr::V4(address) => {
-                // SAFETY: all-zero padding is valid for a sockaddr_in.
-                let mut raw: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-                raw.sin_family = libc::AF_INET as _;
-                #[cfg(target_os = "macos")]
-                {
-                    raw.sin_len = std::mem::size_of_val(&raw) as _;
-                }
-                raw.sin_port = address.port().to_be();
-                raw.sin_addr.s_addr = u32::from_ne_bytes(address.ip().octets());
-                Self::V4(raw)
-            }
-            SocketAddr::V6(address) => {
-                // SAFETY: all-zero padding is valid for a sockaddr_in6.
-                let mut raw: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
-                raw.sin6_family = libc::AF_INET6 as _;
-                #[cfg(target_os = "macos")]
-                {
-                    raw.sin6_len = std::mem::size_of_val(&raw) as _;
-                }
-                raw.sin6_port = address.port().to_be();
-                raw.sin6_addr.s6_addr = address.ip().octets();
-                raw.sin6_scope_id = address.scope_id();
-                Self::V6(raw)
-            }
-        }
-    }
-    pub(super) fn parts(&self) -> (*const libc::sockaddr, libc::socklen_t) {
-        match self {
-            Self::V4(raw) => (
-                std::ptr::from_ref(raw).cast(),
-                std::mem::size_of_val(raw) as _,
-            ),
-            Self::V6(raw) => (
-                std::ptr::from_ref(raw).cast(),
-                std::mem::size_of_val(raw) as _,
-            ),
-        }
-    }
-}
-
 pub(super) fn bound(source: SocketAddr, interface: Option<(u32, &str)>) -> io::Result<TcpStream> {
     if !super::super::unambiguous(source) || interface.is_some_and(|(index, _)| index == 0) {
         return Err(refuse("invalid local socket binding"));
@@ -72,8 +25,8 @@ pub(super) fn bound(source: SocketAddr, interface: Option<(u32, &str)>) -> io::R
     } else {
         libc::AF_INET6
     };
+    // Kept out of children as it was created (`Socket::of_kind`).
     let stream = TcpStream::from(Socket::of_kind(family, libc::SOCK_STREAM, libc::IPPROTO_TCP)?.0);
-    aterm_uds::keep_out_of_children(&stream)?;
     // Adopting an OwnedFd does not run std's Apple socket constructor.
     #[cfg(target_os = "macos")]
     set_option(&stream, libc::SOL_SOCKET, NO_SIGPIPE, 1)?;
@@ -84,7 +37,7 @@ pub(super) fn bound(source: SocketAddr, interface: Option<(u32, &str)>) -> io::R
         bind_interface(&stream, index, name)?;
         restrict_hops(&stream)?;
     }
-    let address = Address::new(source);
+    let address = Inet::new(source);
     let (pointer, length) = address.parts();
     // SAFETY: address owns the initialized sockaddr for the complete call.
     if unsafe { libc::bind(stream.as_raw_fd(), pointer, length) } != 0 {

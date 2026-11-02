@@ -112,7 +112,7 @@ impl Setting {
         let found = match self {
             Self::Enabled => text.lines().find_map(|l| {
                 let n = l.split_once("(State = ")?.1.split_once(')')?.0;
-                n.trim().parse::<u32>().ok().map(|n| n != 0)
+                crate::parse_uint::<u32>(n.trim()).map(|n| n != 0)
             }),
             Self::Stealth => text.lines().find_map(|l| {
                 let state = l.trim().strip_prefix("Firewall stealth mode is ")?;

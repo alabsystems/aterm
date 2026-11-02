@@ -3,6 +3,9 @@
 
 use super::*;
 
+#[cfg(test)]
+thread_local! {pub(super) static READS: std::cell::Cell<usize> = const {std::cell::Cell::new(0)};}
+
 /// State of all locally retained root decisions for one account. None of these
 /// states establishes current Commons membership or provider authentication.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -24,6 +27,8 @@ pub(super) struct History {
 
 impl History {
     pub fn read(session: &Session<'_>, store: &Store, trust: Trust) -> Result<Self> {
+        #[cfg(test)]
+        READS.with(|count| count.set(count.get() + 1));
         let mut history = Self {
             records: BTreeMap::new(),
             requests: BTreeMap::new(),
@@ -48,7 +53,9 @@ impl History {
                 Some((request, decision))
             })();
             let Some((request, decision)) = decoded else {
-                history.ignored += 1;
+                if crate::documents::application::decode_merge(payload).is_none() {
+                    history.ignored += 1;
+                }
                 continue;
             };
             history
@@ -110,14 +117,32 @@ impl History {
         )
     )]
     pub fn status(&self, account: Digest) -> State {
-        if self.unavailable > 0 {
-            return State::Pending;
-        }
         let nodes: BTreeMap<_, _> = self
             .records
             .iter()
             .filter(|(_, r)| r.request().account == account)
             .collect();
+        self.status_nodes(account, nodes)
+    }
+
+    pub fn statuses(&self) -> BTreeMap<Digest, State> {
+        let mut accounts: BTreeMap<Digest, BTreeMap<&Digest, &Record>> = BTreeMap::new();
+        for (id, record) in &self.records {
+            accounts
+                .entry(record.request().account)
+                .or_default()
+                .insert(id, record);
+        }
+        accounts
+            .into_iter()
+            .map(|(account, nodes)| (account, self.status_nodes(account, nodes)))
+            .collect()
+    }
+
+    fn status_nodes(&self, account: Digest, nodes: BTreeMap<&Digest, &Record>) -> State {
+        if self.unavailable > 0 {
+            return State::Pending;
+        }
         if nodes.is_empty() {
             return State::Empty;
         }

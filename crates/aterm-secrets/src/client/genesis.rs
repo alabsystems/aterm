@@ -146,6 +146,9 @@ pub(super) fn sign_genesis(
     let machines = doc
         .machines()
         .into_iter()
+        .filter(|machine| {
+            !enrollment::machine_denied_in_doc(doc, &machine.name, &machine.recipient)
+        })
         .map(|machine| {
             Ok(Machine {
                 recipient: Recipient::parse(&machine.recipient)
@@ -164,7 +167,8 @@ pub(super) fn sign_genesis(
         .iter()
         .filter_map(|row| {
             let recipient = Recipient::parse(&row.recipient).ok()?;
-            Some((recipient, row.label.clone()))
+            let row = roster.member_by_recipient(&row.recipient)?;
+            (!roster.is_member_denied(row)).then(|| (recipient, row.label.clone()))
         })
         .collect();
     let policy = SwarmPolicy::from_document(doc)?.unwrap_or_default();

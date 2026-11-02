@@ -174,6 +174,65 @@ fn go() -> bool {
     false
 }
 
+#[test]
+fn unattended_sign_in_fetches_the_pinned_browser_once_and_obeys_stop() {
+    let temp = aterm_tempfile::tempdir().unwrap();
+    let root = temp.path().join("browsers.noindex");
+    let bytes = shell_zip();
+    let archive = archive_of(&bytes);
+    let mut fetch = StandIn::serving(bytes);
+    let browser = ensure_headless_with(
+        None,
+        || Ok((root.clone(), archive.clone())),
+        &mut fetch,
+        &go,
+    )
+    .unwrap();
+    assert_eq!(fetch.calls, 1);
+    assert!(browser.path.is_file());
+    assert_eq!(
+        super::super::headless_oauth::shell_in(&root),
+        Some(browser.path.clone())
+    );
+    let same = ensure_headless_with(
+        Some(browser),
+        || panic!("a usable browser needs no download source"),
+        &mut fetch,
+        &go,
+    )
+    .unwrap();
+    assert!(same.path.is_file());
+    assert_eq!(fetch.calls, 1);
+    assert_eq!(
+        ensure_headless_with(
+            None,
+            || panic!("stopped sign-in must not resolve a source"),
+            &mut fetch,
+            &|| true
+        )
+        .unwrap_err(),
+        STOPPED
+    );
+
+    let failed_root = temp.path().join("failed.noindex");
+    let mut failed = StandIn::serving(shell_zip());
+    failed.fail = Some("synthetic network outage");
+    assert!(
+        ensure_headless_with(
+            None,
+            || Ok((failed_root.clone(), archive.clone())),
+            &mut failed,
+            &go
+        )
+        .is_err()
+    );
+    assert!(ensure_headless_with(None, || Ok((failed_root, archive)), &mut failed, &go).is_err());
+    assert_eq!(
+        failed.calls, 1,
+        "a transient failure uses the bounded existing cooldown"
+    );
+}
+
 /// What `root` holds, by name.
 fn names(root: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(root)
@@ -224,7 +283,16 @@ fn a_download_off_its_pin_installs_nothing() {
     let mut flipped = bytes.clone();
     let last = flipped.len() - 1;
     flipped[last] ^= 1;
-    let no_shell = zip(&[(SHELL, 0o100_644, b"not executable\n")]);
+    // Off Unix a file has no execute bit, so there the archive holds no file at the binary's path.
+    let no_shell = if cfg!(unix) {
+        zip(&[(SHELL, 0o100_644, b"not executable\n")])
+    } else {
+        zip(&[(
+            "chrome-headless-shell-mac-arm64/libsomething.dylib",
+            0o100_644,
+            b"lib",
+        )])
+    };
     let cases: Vec<(&str, StandIn, Archive, &str)> = vec![
         (
             "one byte more",
@@ -319,7 +387,7 @@ fn a_stop_ends_a_running_download() {
     // Stopped once the child has been looked at running, so the kill is what ends it.
     let stopped = || looks.fetch_add(1, Ordering::SeqCst) >= 3;
     let started = Instant::now();
-    let mut sleep = aterm_uds::spawnfd::command("/bin/sleep");
+    let mut sleep = aterm_uds::spawnfd::command(crate::test_program::kept("/bin/sleep"));
     sleep.arg("120");
     let ran = run_stoppable(sleep, Duration::from_secs(600), &stopped);
     assert_eq!(ran, Err(STOPPED.to_owned()));
@@ -329,7 +397,7 @@ fn a_stop_ends_a_running_download() {
     );
     for (program, code) in [("/usr/bin/true", 0), ("/usr/bin/false", 1)] {
         let ran = run_stoppable(
-            aterm_uds::spawnfd::command(program),
+            aterm_uds::spawnfd::command(crate::test_program::kept(program)),
             Duration::from_secs(60),
             &go,
         );
@@ -416,6 +484,10 @@ fn window_in(root: &Path) -> Option<PathBuf> {
 /// record is left. NEGATIVE CONTROL: off its pin (one byte changed) it installs nothing, the
 /// finder finds nothing, and the failure is kept, so the route is `Unreachable` naming it; a
 /// later install held to the pin succeeds and removes that record.
+///
+/// Unix only: the window build's archive carries a framework's symbolic link, which the
+/// unpacker lays only on Unix, as a window opens only there (`browser_window::no_window_desk_in`).
+#[cfg(unix)]
 #[test]
 fn a_window_build_held_to_its_pin_is_found_and_one_off_it_is_kept_as_unreachable() {
     use super::super::browser_window::{WindowRoute, window_route_in};
@@ -676,6 +748,10 @@ fn a_kept_failure_is_read_for_an_hour() {
 /// either takes the sign-in lock, so the one that finishes second finds the first's tree in place
 /// (a browser may already run from it) and returns it, its own tree going with its scratch.
 /// CONTROL: a directory left without the executable (a copy cut short) is set aside and replaced.
+///
+/// Unix only: the window build's archive carries a framework's symbolic link, which the
+/// unpacker lays only on Unix, as a window opens only there (`browser_window::no_window_desk_in`).
+#[cfg(unix)]
 #[test]
 fn a_tree_placed_meanwhile_is_never_moved() {
     let tmp = aterm_tempfile::tempdir().expect("tmp");
@@ -728,6 +804,10 @@ fn a_tree_placed_meanwhile_is_never_moved() {
 /// the build is returned only where it is a browser that opens a window; a stop noted as it was
 /// put in place leaves it there and opens nothing. NEGATIVE CONTROLS: a headless shell placed
 /// by the same path is refused (`window_capable`), and the stop says so and keeps no failure.
+///
+/// Unix only: the window build's archive carries a framework's symbolic link, which the
+/// unpacker lays only on Unix, as a window opens only there (`browser_window::no_window_desk_in`).
+#[cfg(unix)]
 #[test]
 fn the_window_fetch_places_the_full_build_where_the_window_finder_reads() {
     use super::super::browser_window::{

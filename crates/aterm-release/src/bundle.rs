@@ -70,7 +70,7 @@ pub(crate) fn set_plist_string(plist: &str, key: &str, value: &str) -> Result<St
             .find("</string>")
             .map(|i| sstart + i)
             .ok_or_else(|| format!("Info.plist template: unterminated <string> for {key}"))?;
-        if plist[after..sstart].contains("<key>") {
+        if !plist[after..sstart - "<string>".len()].trim().is_empty() {
             return Err(format!(
                 "Info.plist template: {key} is not a <string> value"
             ));
@@ -213,6 +213,20 @@ pub fn prune_staging_dirs(
         .collect()
 }
 
+pub(crate) fn exists_or_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+pub(crate) fn remove_path_any(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => std::fs::remove_file(path),
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(path),
+        Ok(_) => std::fs::remove_file(path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// Remove this claim's staging directory once a real cut is done, so no finished cut leaves a launchable copy of the app behind: a copy left in `dist/` is offered by Spotlight for "aterm", launched through LaunchServices, and then runs as a second copy under the release's bundle id (main 70ba9c074).
 pub fn discard_staged_app(dist: &Path, build: u64) -> Result<(), String> {
     discard_staged_dir(dist, build, running_processes().as_deref())
@@ -225,7 +239,7 @@ fn discard_staged_dir(
     processes: Option<&[RunningProcess]>,
 ) -> Result<(), String> {
     let dir = dist.join(staging_dir_name(build));
-    if !dir.exists() {
+    if !exists_or_symlink(&dir) {
         return Ok(());
     }
     let Some(processes) = processes else {
@@ -248,7 +262,7 @@ fn discard_staged_dir(
     if let Some(why) = unproven(&dir) {
         return Err(format!("{why}; the next cut's staging removes it then"));
     }
-    std::fs::remove_dir_all(&dir).map_err(|e| format!("rm -rf {}: {e}", dir.display()))
+    remove_path_any(&dir).map_err(|e| format!("rm -rf {}: {e}", dir.display()))
 }
 
 /// Prepare this claim's staging directory and return where its bundle goes, [`staged_app_path`], absent on return: the cut copies the verified bundle there to sign it.
@@ -256,7 +270,7 @@ pub fn prepare_staging(dist: &Path, build: u64) -> Result<PathBuf, String> {
     let app = staged_app_path(dist, build);
     let staging_dir = dist.join(staging_dir_name(build));
     let processes = running_processes();
-    if app.exists() {
+    if exists_or_symlink(&app) {
         match processes.as_deref() {
             None => {
                 return Err(format!(
@@ -289,8 +303,8 @@ pub fn prepare_staging(dist: &Path, build: u64) -> Result<PathBuf, String> {
     }
     std::fs::create_dir_all(&staging_dir)
         .map_err(|e| format!("create {}: {e}", staging_dir.display()))?;
-    if app.exists() {
-        std::fs::remove_dir_all(&app).map_err(|e| format!("rm -rf {}: {e}", app.display()))?;
+    if exists_or_symlink(&app) {
+        remove_path_any(&app).map_err(|e| format!("rm -rf {}: {e}", app.display()))?;
     }
     Ok(app)
 }
@@ -298,7 +312,7 @@ pub fn prepare_staging(dist: &Path, build: u64) -> Result<PathBuf, String> {
 /// Lay out the release's bundle at `app`, which must not exist yet.
 pub fn assemble_at(spec: &BundleSpec, app: &Path) -> Result<(), String> {
     let mac_dir = spec.repo_root.join("apps/aterm-mac");
-    if app.exists() {
+    if exists_or_symlink(app) {
         return Err(format!(
             "{} already exists — a bundle is laid out once, into a fresh place",
             app.display()
@@ -437,7 +451,10 @@ pub fn write_provenance(
 ) -> Result<PathBuf, String> {
     let shipped = app.join("Contents/MacOS/aterm");
     let binary_sha256 = crate::dmg::sha256_file(&shipped)?;
-    let bare_commit = spec.git_commit.trim_end_matches("-dirty");
+    let bare_commit = spec
+        .git_commit
+        .strip_suffix("-dirty")
+        .unwrap_or(&spec.git_commit);
     let dwarf = spec
         .out_dir
         .join("aterm.dSYM/Contents/Resources/DWARF/aterm");
@@ -507,6 +524,22 @@ mod staging_tests {
         let app = dist.join(name).join("aterm.app/Contents/MacOS");
         std::fs::create_dir_all(&app).expect("create staging bundle");
         dist.join(name)
+    }
+
+    #[test]
+    fn set_plist_string_rejects_non_string_values_without_overwriting_later_strings() {
+        let plist = "<plist><dict>\n\
+            \t<key>Flag</key>\n\t<false/>\n\
+            \t<key>Items</key>\n\t<array><string>keep-me</string></array>\n\
+            \t<key>Name</key>\n\t<string>old</string>\n\
+            </dict></plist>";
+        let err = set_plist_string(plist, "Flag", "new").unwrap_err();
+        assert!(err.contains("Flag is not a <string> value"), "{err}");
+        let err = set_plist_string(plist, "Items", "new").unwrap_err();
+        assert!(err.contains("Items is not a <string> value"), "{err}");
+        let updated = set_plist_string(plist, "Name", "new").unwrap();
+        assert!(updated.contains("<string>keep-me</string>"));
+        assert!(updated.contains("<key>Name</key>\n\t<string>new</string>"));
     }
 
     #[test]

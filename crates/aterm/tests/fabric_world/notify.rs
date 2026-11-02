@@ -747,9 +747,11 @@ fn an_ordered_brokers_attention_pages_once_it_is_durable() {
     let w = Watch::attention(&fleet, "ordered");
     let _daemon = w.follow("attention");
     let held = raise_attention(&fleet, "s-one", 1, "one");
-    let said = format!("off={held} waits until the broker says it is durable");
+    // The follower says its durable wait once for the log, at the first record it holds
+    // (fix unit E5, E2E-15), in the words the notifier exports.
+    const SAID: &str = aterm_link::notify::DURABLE_WAIT_WORDS;
     until("the follower to hold the row for its durable mark", || {
-        w.follow_out().contains(&said).then_some(())
+        w.follow_out().contains(SAID).then_some(())
     });
     assert!(w.fired().is_empty(), "held, not paged: {:?}", w.fired());
     assert!(broker.durable_head() <= held, "and not durable");
@@ -762,6 +764,20 @@ fn an_ordered_brokers_attention_pages_once_it_is_durable() {
             .then_some(())
     });
     assert_eq!(w.fired(), vec![format!("{held} dup=0 sup=0")]);
+    let again = raise_attention(&fleet, "s-three", 3, "three");
+    assert!(broker.flush_durable().expect("a full flush") > again);
+    until("the durable mark to page the second row", || {
+        w.journal()
+            .iter()
+            .any(|l| l.starts_with(&format!("{again} fired")))
+            .then_some(())
+    });
+    let out = w.follow_out();
+    assert_eq!(
+        out.matches(SAID).count(),
+        1,
+        "two pages on one log, one durable-wait line: {out}"
+    );
 
     let early = Watch::attention(&fleet, "early");
     let _control = early.follow_env(
@@ -782,5 +798,251 @@ fn an_ordered_brokers_attention_pages_once_it_is_durable() {
         broker.durable_head() <= raised,
         "the control paged @{raised} while the broker's durable head was {}",
         broker.durable_head()
+    );
+}
+
+/// A session log this test writes and mirrors as its bridge would: every take at the session's
+/// own hand-set clock, each landed as the bus took it.
+struct Sess {
+    log: aterm_slog::Log,
+    ms: u64,
+}
+
+impl Sess {
+    fn open() -> Self {
+        let mut log = aterm_slog::Log::new(1);
+        log.open_session(
+            aterm_slog::Kind::Spawn,
+            aterm_slog::Src::Aterm,
+            aterm_slog::Conf::Exact,
+            aterm_slog::Actor::Aterm,
+            aterm_slog::Fields::new(),
+            aterm_slog::Stamp::new(1_760_000_000_000, 0),
+        )
+        .expect("opens");
+        Self { log, ms: 0 }
+    }
+
+    fn at(&mut self) -> aterm_slog::Stamp {
+        self.ms += 1;
+        aterm_slog::Stamp::new(1_760_000_000_000 + self.ms, self.ms)
+    }
+
+    /// `n` marks that move no need.
+    fn quiet(&mut self, n: usize) {
+        for _ in 0..n {
+            let at = self.at();
+            self.log
+                .mark(
+                    aterm_slog::Mark::new(
+                        aterm_slog::Kind::Handoff,
+                        aterm_slog::Src::Aterm,
+                        aterm_slog::Conf::Exact,
+                    )
+                    .at(aterm_slog::Node::SESSION)
+                    .by(aterm_slog::Actor::Aterm),
+                    at,
+                )
+                .expect("a handoff mark");
+        }
+    }
+
+    /// An agent run, a turn and a usage wall under it: `wall:usage-session`.
+    fn wall(&mut self) {
+        let at = self.at();
+        let run = self
+            .log
+            .open(
+                aterm_slog::Open::new(
+                    aterm_slog::Kind::Agent,
+                    aterm_slog::Src::Status,
+                    aterm_slog::Conf::Strong,
+                ),
+                at,
+            )
+            .expect("an agent run");
+        let at = self.at();
+        let turn = self
+            .log
+            .open(
+                aterm_slog::Open::new(
+                    aterm_slog::Kind::Turn,
+                    aterm_slog::Src::Screen,
+                    aterm_slog::Conf::Strong,
+                )
+                .under(run),
+                at,
+            )
+            .expect("a turn");
+        let at = self.at();
+        self.log
+            .open(
+                aterm_slog::Open::new(
+                    aterm_slog::Kind::Wall,
+                    aterm_slog::Src::Screen,
+                    aterm_slog::Conf::Strong,
+                )
+                .under(turn)
+                .fields(
+                    aterm_slog::Fields::new()
+                        .word(aterm_slog::Key::Wall, "usage-session")
+                        .expect("wall"),
+                ),
+                at,
+            )
+            .expect("the wall opens");
+    }
+
+    /// A failed shell command: `failure`.
+    fn fail(&mut self) {
+        let at = self.at();
+        let cmd = self
+            .log
+            .open(
+                aterm_slog::Open::new(
+                    aterm_slog::Kind::Cmd,
+                    aterm_slog::Src::Shell,
+                    aterm_slog::Conf::Strong,
+                ),
+                at,
+            )
+            .expect("a command");
+        let at = self.at();
+        self.log
+            .close(
+                cmd,
+                aterm_slog::Close::new(
+                    aterm_slog::Out::Run(aterm_slog::RunOut::Fail),
+                    aterm_slog::Src::Shell,
+                    aterm_slog::Conf::Exact,
+                ),
+                at,
+            )
+            .expect("closes");
+    }
+
+    /// Mail delivered (a local mark): the next take ends with a snapshot.
+    fn mail(&mut self) {
+        let at = self.at();
+        self.log
+            .mark(
+                aterm_slog::Mark::new(
+                    aterm_slog::Kind::Mail,
+                    aterm_slog::Src::Fabric,
+                    aterm_slog::Conf::Exact,
+                )
+                .fields(
+                    aterm_slog::Fields::new()
+                        .word(aterm_slog::Key::Dir, "in")
+                        .expect("dir"),
+                ),
+                at,
+            )
+            .expect("mail");
+    }
+
+    /// Every body the mirror takes now, oldest first.
+    fn bodies(&mut self) -> Vec<String> {
+        let at = aterm_slog::Stamp::new(1_760_000_000_000 + self.ms, self.ms);
+        let mut out = Vec::new();
+        loop {
+            let take = self
+                .log
+                .bus_copy(64, at)
+                .encode(aterm_slog::Tier::Wire, &|_| None);
+            if take.slots.is_empty() {
+                return out;
+            }
+            out.extend(take.slots.iter().map(|s| s.body.clone()));
+            self.log
+                .land(take.slots.last().expect("a slot").at)
+                .expect("lands");
+            if !take.more {
+                return out;
+            }
+        }
+    }
+}
+
+/// A NEED WHOSE RAISE THE BUS LOST PAGES ONCE WHERE A SNAPSHOT NAMES IT (fix unit J0-3, gap
+/// G2-g6), on the real broker and the shipped follower: `notify --on need` follows a session
+/// from its start; the bus loses the record that raised its usage wall (a hole), and the
+/// snapshot the same take ends with names the wall. The follower runs its command once for it,
+/// at the snapshot, and not again at a later record or snapshot that still names it; a failure
+/// after them pages as ever.
+#[test]
+fn a_need_whose_raise_the_bus_lost_pages_once_where_a_snapshot_names_it() {
+    let fleet = Fleet::boot("notify-need-hole");
+    let w = Watch::attention(&fleet, "need-hole");
+    let face = format!("/f/{FLEET}/pub/n-alpha/s-hole/ev");
+    let mut god = fleet.god();
+    let mut seq = 0;
+    let mut publish = |bodies: &[String]| -> Vec<u64> {
+        bodies
+            .iter()
+            .map(|b| {
+                seq += 1;
+                god.publish(9_300, seq, &face, b.as_bytes())
+                    .expect("publish an ev body")
+                    .0
+            })
+            .collect()
+    };
+    let snap = |b: &String| b.contains(" op=snap ");
+    let mut s = Sess::open();
+    publish(&s.bodies());
+    let exec = format!(
+        "printf '%s %s\\n' \"$ATERM_NOTIFY_OFFSET\" \"$ATERM_NOTIFY_NEED\" >> {}",
+        w.log.display()
+    );
+    let _daemon = w.follow_with("need", &exec, &[]);
+    s.quiet(4);
+    publish(&s.bodies());
+    s.wall();
+    s.mail();
+    let take = s.bodies();
+    let raise = |b: &String| b.contains(" op=open ") && b.contains(" k=wall ");
+    let kept: Vec<String> = take.iter().filter(|b| !raise(b)).cloned().collect();
+    assert!(
+        kept.len() + 1 == take.len() && kept.last().is_some_and(snap),
+        "PRECONDITION: the wall's raise, then the snapshot naming it: {take:?}"
+    );
+    let snapped = *publish(&kept).last().expect("the snapshot's offset");
+    s.quiet(2);
+    publish(&s.bodies());
+    s.ms += aterm_slog::MAIL_SNAP_GAP_MS;
+    s.mail();
+    s.quiet(1);
+    let again = s.bodies();
+    assert!(
+        again.iter().any(snap),
+        "PRECONDITION: a later snapshot names the wall again: {again:?}"
+    );
+    publish(&again);
+    s.fail();
+    let closes = s.bodies();
+    let at = publish(&closes);
+    let failed = closes
+        .iter()
+        .zip(at)
+        .find(|(b, _)| b.contains(" op=close ") && b.contains(" out=fail"))
+        .map(|(_, off)| off)
+        .expect("the failed run's close");
+    until(
+        "the follower to page the failure after the lost raise",
+        || {
+            w.fired()
+                .iter()
+                .any(|l| l.starts_with(&format!("{failed} ")))
+                .then_some(())
+        },
+    );
+    assert_eq!(
+        w.fired(),
+        [
+            format!("{snapped} wall:usage-session"),
+            format!("{failed} failure")
+        ],
+        "the wall pages once, at the snapshot past its lost raise, and the failure once"
     );
 }

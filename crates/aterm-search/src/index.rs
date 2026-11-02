@@ -542,17 +542,40 @@ impl SearchIndex {
     }
 
     fn line_range(&self, first: usize, end: usize) -> CandidateSource {
-        CandidateSource::range(
-            self.key_base,
-            self.posting_key(first)..self.posting_key(end),
-        )
+        let keys = self.posting_key(first)..self.posting_key(end);
+        match self.held_keys_if_sparse(&keys) {
+            Some(held) => CandidateSource::listed(self.key_base, held),
+            None => CandidateSource::range(self.key_base, keys),
+        }
     }
 
     fn line_range_rev(&self, first: usize, end: usize) -> CandidateSource {
-        CandidateSource::range_rev(
-            self.key_base,
-            self.posting_key(first)..self.posting_key(end),
-        )
+        let keys = self.posting_key(first)..self.posting_key(end);
+        match self.held_keys_if_sparse(&keys) {
+            Some(held) => CandidateSource::listed_rev(self.key_base, held),
+            None => CandidateSource::range_rev(self.key_base, keys),
+        }
+    }
+
+    /// The keys of the cached lines in `keys`, sorted, when `keys` is so much wider than the cache
+    /// that listing them costs less than walking it: a line number no line holds yields nothing,
+    /// and far-apart lines leave up to [`MAX_KEY_SPAN`] of them, so a search stays bound by the
+    /// lines held and not by how far apart their numbers are. Walking a number took about a
+    /// quarter of what listing a held line did (release, 2026-10-31), and a walk can stop at its
+    /// first match, hence four.
+    fn held_keys_if_sparse(&self, keys: &std::ops::Range<u32>) -> Option<Vec<u32>> {
+        let span = usize::try_from(keys.end.saturating_sub(keys.start)).unwrap_or(usize::MAX);
+        if span <= self.lines.len().saturating_mul(4) {
+            return None;
+        }
+        let mut held: Vec<u32> = self
+            .lines
+            .keys()
+            .filter_map(|line| u32::try_from(line.checked_sub(self.key_base)?).ok())
+            .filter(|key| keys.contains(key))
+            .collect();
+        held.sort_unstable();
+        Some(held)
     }
 
     fn postings_forward(&self, postings: Vec<&SparseBitmap>, from_line: usize) -> CandidateSource {
@@ -583,7 +606,7 @@ impl SearchIndex {
             self.key_base = line;
             return true;
         }
-        let newest = self.line_count.saturating_sub(1).max(line);
+        let newest = self.lines.keys().copied().max().unwrap_or(line).max(line);
         let floor = newest.saturating_sub(MAX_KEY_SPAN);
         if line < floor {
             self.note_window_eviction(floor);
@@ -633,13 +656,16 @@ impl SearchIndex {
                 bitmap.drop_below(watermark);
                 !bitmap.is_empty()
             });
+            self.first_cached_line = oldest.unwrap_or(usize::MAX);
             self.note_window_eviction(floor);
         }
         oldest
     }
 
     fn note_window_eviction(&mut self, floor: usize) {
-        self.first_cached_line = self.first_cached_line.max(floor);
+        if !self.lines.is_empty() {
+            self.first_cached_line = self.first_cached_line.max(floor);
+        }
         self.lowest_retained_line = self.lowest_retained_line.max(floor);
         self.eviction_occurred = true;
         if !self.first_eviction_warned {
@@ -750,11 +776,9 @@ impl SearchIndex {
             self.column_maps.remove(&line);
         }
 
-        self.lowest_retained_line = line_nums
-            .get(evict_count)
-            .copied()
-            .unwrap_or(self.next_line);
-        self.first_cached_line = self.lowest_retained_line;
+        let next_retained = line_nums.get(evict_count).copied();
+        self.lowest_retained_line = next_retained.unwrap_or(self.next_line);
+        self.first_cached_line = next_retained.unwrap_or(usize::MAX);
         self.eviction_occurred = true;
         self.drop_truncated_below(self.lowest_retained_line);
 
@@ -963,7 +987,6 @@ impl SearchIndex {
         match lowest_retained_line {
             Some(base) if base > 0 => {
                 self.lowest_retained_line = base;
-                self.first_cached_line = self.first_cached_line.max(base);
                 self.eviction_occurred = true;
             }
             _ => {
@@ -976,31 +999,7 @@ impl SearchIndex {
     /// Drop cached absolute rows below a newly-retained history boundary.
     #[cfg(test)]
     pub(crate) fn retain_history_from(&mut self, first_retained_line: usize) {
-        let old_first = self.first_cached_line.min(first_retained_line);
-        if first_retained_line <= old_first {
-            return;
-        }
-        let distance = first_retained_line.saturating_sub(old_first);
-        let stale: Vec<usize> = if distance <= self.lines.len().saturating_mul(2) {
-            (old_first..first_retained_line).collect()
-        } else {
-            self.lines
-                .keys()
-                .copied()
-                .filter(|line| *line < first_retained_line)
-                .collect()
-        };
-        for line in stale {
-            self.lines.remove(&line);
-            self.column_maps.remove(&line);
-        }
-        self.drop_truncated_below(first_retained_line);
-        let watermark = self.posting_key(first_retained_line);
-        self.trigrams.retain(|_, bitmap| {
-            bitmap.drop_below(watermark);
-            !bitmap.is_empty()
-        });
-        self.first_cached_line = first_retained_line.min(self.line_count);
+        self.drop_history_below(first_retained_line);
         self.lowest_retained_line = self.lowest_retained_line.max(first_retained_line);
         self.eviction_occurred = true;
     }
@@ -1031,7 +1030,11 @@ impl SearchIndex {
             bitmap.drop_below(watermark);
             !bitmap.is_empty()
         });
-        self.first_cached_line = first_retained_line.min(self.line_count);
+        self.first_cached_line = if self.lines.is_empty() {
+            usize::MAX
+        } else {
+            first_retained_line.min(self.line_count)
+        };
     }
 
     /// Current maximum cached-lines cap.
@@ -1323,6 +1326,8 @@ impl SearchIndex {
             SearchDirection::Backward => self.line_range_rev(first, self.line_count),
         };
         'lines: while let Some(line_num) = line_nums.next_candidate() {
+            #[cfg(test)]
+            count_search_from_line_candidate();
             let Some(text) = self.lines.get(&line_num) else {
                 continue;
             };

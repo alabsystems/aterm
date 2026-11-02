@@ -1042,7 +1042,11 @@ fn a_signed_upload_is_verified_by_the_client_and_staged() {
         .host
         .release_of(&Slug::new("alabsystems", "trust"), "atpkg-trust-1")
         .expect("staged");
-    assert_eq!(rel.assets.len(), 3);
+    assert!(
+        rel.assets
+            .contains_key(atpkg_publish::artifact::upload::VERSION_RESERVATION)
+    );
+    assert_eq!(rel.assets.len(), 4);
 }
 
 #[test]

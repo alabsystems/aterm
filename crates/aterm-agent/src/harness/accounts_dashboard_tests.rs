@@ -9,7 +9,7 @@ const OTHER: &str = "7d1e4a90-5b2c-4f3e-8a6d-0c9b8e7f6a5d";
 
 #[test]
 fn shared_account_metadata_is_visible_without_a_local_login_or_action() {
-    let catalog = Ok(super::super::account_catalog::Catalog {
+    let mut catalog = Ok(super::super::account_catalog::Catalog {
         table: "shared-table".into(),
         history_complete: true,
         rows: vec![super::super::account_catalog::Account {
@@ -21,9 +21,11 @@ fn shared_account_metadata_is_visible_without_a_local_login_or_action() {
             email: Some("one@example.test".into()),
             realm: None,
             secret_reference: true,
+            required_browser: false,
             conflicted: false,
             stopped: false,
             import: None,
+            import_link: None,
         }],
         ..Default::default()
     });
@@ -35,6 +37,11 @@ fn shared_account_metadata_is_visible_without_a_local_login_or_action() {
     assert!(!html.contains("/use"));
     assert!(!html.contains("renew"));
     assert!(html.contains("one@example.test"));
+    catalog.as_mut().unwrap().rows[0].required_browser = true;
+    let html = shared_accounts_html(Some(&catalog), None, &[], NOW);
+    assert!(html.contains("data-state=\"unsupported-preparation\""));
+    assert!(html.contains(super::super::account_catalog::NAMED_BROWSER_UNSUPPORTED));
+    assert!(!html.contains("/use"));
 }
 
 #[test]
@@ -50,6 +57,7 @@ fn imported_unknown_provider_is_visible_with_pending_auth_and_source_evidence() 
             email: Some("one@example.test".into()),
             realm: None,
             secret_reference: false,
+            required_browser: false,
             conflicted: false,
             stopped: false,
             import: Some(ImportOrigin {
@@ -61,6 +69,7 @@ fn imported_unknown_provider_is_visible_with_pending_auth_and_source_evidence() 
                 machine_hint: Some("m3".into()),
                 unclassified_columns: vec![9],
             }),
+            import_link: None,
         }],
         history_complete: true,
         ..Default::default()

@@ -73,15 +73,24 @@ pub fn send_raw(stream: &mut dyn Rw, bytes: &[u8]) -> Result<(), String> {
 /// One line, its newline dropped (empty at the end of the stream).
 ///
 /// # Errors
-/// A read failed with no byte of the line read.
+/// A read failed with no byte of the line read, or the line exceeds 1 MiB.
 pub fn read_line(stream: &mut dyn Rw) -> std::io::Result<String> {
+    const MAX_LINE_BYTES: usize = 1024 * 1024;
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
     loop {
         match stream.read(&mut byte) {
             Ok(0) => break,
             Ok(_) if byte[0] == b'\n' => break,
-            Ok(_) => line.push(byte[0]),
+            Ok(_) => {
+                if line.len() >= MAX_LINE_BYTES {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "line exceeds 1 MiB",
+                    ));
+                }
+                line.push(byte[0]);
+            }
             Err(e) if line.is_empty() => return Err(e),
             Err(_) => break,
         }
@@ -115,16 +124,14 @@ pub fn reflected_proof_refused(port: u16) -> Result<String, String> {
 
 /// Whether the peer has closed: the next read ends with nothing more, never by the read's timeout.
 pub fn closed(stream: &mut dyn Rw) -> bool {
-    let mut rest = Vec::new();
-    match stream.read_to_end(&mut rest) {
-        Ok(_) => rest.is_empty(),
-        Err(e) => {
-            rest.is_empty()
-                && !matches!(
-                    e.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                )
-        }
+    let mut byte = [0u8; 1];
+    match stream.read(&mut byte) {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(e) => !matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ),
     }
 }
 

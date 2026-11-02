@@ -1,33 +1,12 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-parser: spec recovery from its 172 unit tests
+# aterm-parser: spec recovery from its unit tests
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 2 tests it
-> deleted and 1 spec whose functions it deleted are gone, and the spec rows no longer cite those
-> tests. Counts elsewhere in this file were taken before.
-
-> Status 2026-10-15: the 13 checks in §4 that sample no spec and the test-only
-> `advance_batch` path were deleted in `a1d10c265`. Its shared UTF-8/control case is
-> retained on production `advance_fast`.
-> Status 2026-10-16: 64 more were deleted as duplicates of the exhaustive and differential
-> tests (the small `simd`/`utf8_simd` scan cases, the `assert_invariants_after_*` samples,
-> the `utf8_errors` cases `ill_formed_utf8_is_replaced_per_maximal_subpart` subsumes,
-> `refinement.rs` and `table_validity.rs`); their rows are gone from §2, and since 2026-10-24
-> from §1's `subsumes` column too.
-> Status 2026-10-16 (later): `Parser::advance` and its byte path (`process_byte`, Latin-1 at
-> Ground) were deleted, since only tests called them; `advance_fast` is the one entry point. The
-> specs `advance-is-byte-fold`, `advance-fast-agrees-with-advance` and `byte-path-ground-high-bytes`
-> went with them. The 39 specs below are the crate's migration worklist: each is proved through
-> Trust/Clean, then the tests it subsumes are deleted.
-
-Source: `crates/aterm-parser` (read only). I read every `#[test]`
-(simd.rs 15, utf8_simd.rs 11, tests/{basic 17, csi 18, subparams 8, empty_params 2, c1 19,
-string_cancel 4, batch 17, carry 18, invariants 12, utf8_errors 13, utf8_parity 7, refinement 3,
-table_validity 3, performance 3}, tests/fuzz_parser.rs 2 = 172) and the code each one reaches.
-Nothing was compiled or run. The claims below come from reading the code.
-
-Result: **42 specs**, covering **159 tests**. **13 tests are not spec samples** (§4).
+Each §1 row is a property of `crates/aterm-parser` that its tests sample, recovered by reading the
+tests and the code they reach; nothing was compiled or run. Once a spec is proved through
+Trust/Clean, the tests it subsumes are deleted. `Parser::advance_fast` is the one entry point; the
+rows' `advance_simd_loop` names `Parser::advance_plain`, the state-machine loop under it.
 
 ## 0. Notation used in the statements
 
@@ -50,8 +29,10 @@ Result: **42 specs**, covering **159 tests**. **13 tests are not spec samples** 
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes (primary tests; secondary in §2)`,
-`difficulty (Rust features the proof must handle)`.
+Columns: `id`, `kind`, `functions`, `statement`, `subsumes` and `difficulty` (Rust features the
+proof must handle). `subsumes` names mostly primary tests, as `file::test` for a test in
+`src/tests/file.rs` (`simd` and `utf8_simd` are in `src/`, `fuzz_parser` in `tests/`) or as a bare
+name whose file §2 gives; §2 also lists the secondary ones.
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty
@@ -66,7 +47,7 @@ bulk-decode-run-refines-scalar	equivalence	utf8_simd::{bulk_decode_run,bulk_2byt
 advance-fast-refines-utf8-step-fold	equivalence (refinement)	dispatch::Parser::{advance_fast,advance_simd_loop,advance_string_states_bulk,decode_multibyte_run}, csi::try_parse_csi_fast and helpers	∀ p∈Reach, x: Obs(advance_fast(p,x)) = Obs(foldl(step_u,p,x)) and View(advance_fast(p,x)) = View(foldl(step_u,p,x)). This is the master simulation. The bulk printable run, the CSI fast parser (65-byte window, fallbacks), the OSC/DCS/APC bulk copies and the multibyte run decoder each refine a run of step_u.	(none primary; sampled through its corollary advance-fast-chunk-invariance, whose byte-by-byte reads are foldl step_u)	VERY HARD: one loop with three FnMut closure params and bool mode flags, slice split_first/get, SIMD scanner calls (use the scan-* contracts), try_parse_csi_fast (three nested scan loops with early return), ArrayVec params, Vec osc_data extend, generic sink, &mut self. Needs the osc-bulk-copy-len and bulk-decode-run lemmas.
 advance-fast-chunk-invariance	equivalence	Parser::advance_fast	∀ p∈Reach, x, y: Obs(advance_fast(p,x++y)) = Obs(advance_fast(p,x)) ++ Obs(advance_fast(p',y)) where p' = advance_fast(p,x), and the final Views are equal. (A corollary of the previous spec plus List.foldl_append.)	utf8_parity::incomplete_trailing_lead_after_complete_char_matches_bytewise	FREE once advance-fast-refines-utf8-step-fold is proved; otherwise as hard as it
 ground-utf8-lossy	equivalence (to a reference decoder)	step_u at Ground: utf8::{process_utf8_byte,start_utf8,decode_utf8_validated}, dispatch::{process_ground_special_byte,decode_multibyte_run}	∀ p∈Reach with state=Ground, utf8_len=0, C1 off; ∀ b ∈ ({0x20..0x7E}∪{0x80..0xFF})*, z ∈ 0x20..0x7E: Obs(advance_fast(p,b++[z])) = [print(c) | c ← String::from_utf8_lossy(b++[z]).chars()] (one U+FFFD per maximal subpart, Unicode §3.9), and it ends at Ground with utf8_len=0. Without z, the prints cover the lossy decoding of b minus its trailing well-formed incomplete prefix, which stays buffered (utf8_buffer[..utf8_len]).	utf8_parity::bulk_path_matches_continuation_path_for_sampled_codepoints, fuzz_random_valid_utf8_has_exact_parity, ill_formed_utf8_is_replaced_per_maximal_subpart	MEDIUM-HARD: needs a Clean model of the Table 3-7 maximal-subpart decoder as the reference (std's from_utf8_lossy is not modeled); state over [u8;4]+u8+u8; prove on foldl step_u, then lift with the master spec
-osc-bulk-copy-len	contract (arithmetic)	dispatch::{osc_bulk_copy_len,osc_put_keeps}	∀ len ≤ MAX_OSC_DATA, n: (a) len + osc_bulk_copy_len(len,n) = min(len+n, MAX_OSC_DATA); (b) ∀ i<n: osc_put_keeps(min(len+i,MAX)) ⇔ i < osc_bulk_copy_len(len,n), and min(len+i+1,MAX) = min(len+i,MAX) + [osc_put_keeps(min(len+i,MAX))]. So the bulk copy keeps exactly what n OscPut steps keep.	batch::osc_bulk_copy_agrees_with_per_byte_puts_at_every_breakpoint	TRIVIAL: usize min/saturating_sub, linear arithmetic (omega); fragment: `dispatch::osc_put_keeps` F1 (VF5 first target, docs/PLAN-tests-to-specs-2026-10-15.md "F1-ready specs").
+osc-bulk-copy-len	contract (arithmetic)	dispatch::{osc_bulk_copy_len,osc_put_keeps}	∀ len ≤ MAX_OSC_DATA, n: (a) len + osc_bulk_copy_len(len,n) = min(len+n, MAX_OSC_DATA); (b) ∀ i<n: osc_put_keeps(min(len+i,MAX)) ⇔ i < osc_bulk_copy_len(len,n), and min(len+i+1,MAX) = min(len+i,MAX) + [osc_put_keeps(min(len+i,MAX))]. So the bulk copy keeps exactly what n OscPut steps keep.	batch::osc_bulk_copy_agrees_with_per_byte_puts_at_every_breakpoint	TRIVIAL: usize min/saturating_sub, linear arithmetic (omega); fragment: `dispatch::osc_put_keeps` F1 (VF5 first target, docs/PLAN-tests-to-specs-2026-10-15.md "F1-ready specs"). Proved via mirror: Clean R208 row `aterm_osc_put_keeps` (the F1 mirror of the PM-1-free rows, over a verbatim copy at aterm 5285726838; graded proved in Clean's rows.out.tsv); not yet credited: Trust's compiler mints no calculus row until it pins a VF5 base (E4.7).
 param-accumulator	contract	dispatch::{add_param_digit,finalize_param,clear}, csi::{push_current_param,close_params}	add_param_digit(d∈'0'..='9'): current' = current.saturating_mul(10).saturating_add(d−'0') ∧ started' ∧ params unchanged. add_param_digit(';'|':'): if |params|<MAX_PARAMS then params' = params++[min(current,65535) as u16] and mask' = mask | (old last_was_colon ? 1<<|params| : 0), else params and mask unchanged; current'=0, started'=false, last_was_colon' = (byte==':'). close_params(c) pushes iff started ∨ (params≠[] ∧ ¬c). All four preserve |params| ≤ MAX_PARAMS and mask>>|params| = 0.	csi::add_param_digit_saturates_and_finalize_param_clamps, parameter_digits_saturate_and_finalize_clamps, parse_csi_many_params	EASY: &mut self, saturating u32, ArrayVec<u16,24> push with a capacity check, u32 shifts (index < 24)
 csi-dispatch-denotation	contract (sequence semantics)	Parser::advance_fast on CSI input; csi::try_parse_csi_fast; table CsiEntry/CsiParam/CsiIntermediate rows	∀ p∈Reach at Ground with utf8_len=0, either C1 mode, whole or one byte per read: for s = ESC '[' M P I F with M ∈ {ε}∪{0x3C..0x3F}, P ∈ [0-9;:]*, I ∈ [0x20..0x2F]*, F ∈ 0x40..0x7E, the trace is exactly one call and the run ends at Ground. Split P on ';'/':' into segments s0..sk with separators sep1..sepk. Segment i is a parameter iff i<k ∨ sk≠ε ∨ (k>0 ∧ sepk=';'). params = take(MAX_PARAMS, [min(dec(si),65535)]) with dec(ε)=0 (decimal saturating at u32::MAX). mask bit i ⇔ i≥1 ∧ sepi=':'. ims = take(MAX_INTERMEDIATES, M++I). The call is csi_dispatch(params,ims,F) if mask=0, else csi_dispatch_with_subparams(params,ims,F,mask).	parse_csi_kakoune_sgr, csi_fast_path_multiple_sequences, csi_fast_path_interleaved_with_text; subparams::parse_csi_colon_subparams, parse_csi_mixed_colon_semicolon, parse_csi_no_colon_no_subparams, parse_csi_subparam_flag_survives_past_index_16, parse_csi_subparam_flag_at_last_param_index; empty_params::an_empty_parameter_reaches_the_handler_as_the_default	MEDIUM on the per-byte state machine (induction over P with the param-accumulator lemmas; table lookups as evaluated facts). The CSI fast parser comes free via advance-fast-refines-utf8-step-fold.
 dcs-header-denotation	contract	advance_fast on DCS headers; table DcsEntry/DcsParam/DcsIntermediate rows; close_params	For ESC 'P' M P I F with P ∈ [0-9;]* (a ':' sends the string to DcsIgnore), F ∈ 0x40..0x7E: exactly one dcs_hook(params,ims,F), with params computed by the CSI rule (empty trailing parameter after ';' → 0), and the run ends in DcsPassthrough with dcs_active.	empty_params::a_dcs_header_keeps_its_empty_last_parameter	MEDIUM (same shape as CSI)
@@ -285,24 +266,27 @@ fast/slow split) is an instance of one of the general specs above.
    and single-byte reads.
 10. *(Resolved)* **The stale `assert_invariants_after_subparams` NOTE in `invariants.rs` was removed.**
 
-## 6. The three specs I would prove first (easiest, high value)
+1. **`osc-bulk-copy-len`**: pure linear `usize` arithmetic (`min`, `saturating_sub`), an
+   `omega`-class proof. It retires the breakpoint-enumeration test and is the arithmetic core of
+   the OSC half of the master simulation. Trust's E6 gives no arithmetic body an import
+   (`AutoBoundHeadOverApplied`, seal `150efe4a`), so it waits on the proven-core route.
+2. **`param-accumulator`** (`add_param_digit`, `finalize_param`, `push_current_param`,
+   `close_params`): `&mut self` field updates, saturating `u32` and one bounded
+   `ArrayVec<u16,24>` push. `csi-dispatch-denotation` and the strengthened `type-invariant` build
+   on it.
+3. **`bulk-decode-run-refines-scalar`** with **`decode-multibyte-char`**: safe code with no
+   intrinsics, slice patterns, `ArrayVec<char,256>` and a fixed-stride loop with an obvious
+   invariant (`i = k·|appended|`). It retires the `utf8_simd` tests, including the exhaustive one,
+   removes the copied oracle (§5.6) and forces `requires is_utf8_lead(lead)` (§5.5).
 
-1. **`osc-bulk-copy-len`**. This is pure linear `usize` arithmetic (`min`, `saturating_sub`) with no
-   loops, so it is an `omega`-class proof. *Blocked on seal `150efe4a` (2026-10-19):* E6 gives no
-   arithmetic body an import (`AutoBoundHeadOverApplied`), so it waits on the proven-core route; its
-   test stays. It retires the breakpoint-enumeration test and is the
-   arithmetic core of the OSC half of the master simulation (the 8 MiB cap parity tests).
-2. **`param-accumulator`** (`add_param_digit`/`finalize_param`/`push_current_param`/`close_params`).
-   This is `&mut self` field updates, saturating `u32` and one bounded `ArrayVec<u16,24>` push. It
-   retires 5 tests outright (including a 70,000-value loop) and is the lemma `csi-dispatch-denotation`
-   (17 tests) and the strengthened `type-invariant` are built on.
-3. **`bulk-decode-run-refines-scalar`** together with **`decode-multibyte-char`**. This is safe code
-   written for Trust: no intrinsics, slice patterns, `ArrayVec<char,256>`, and a fixed-stride loop with an
-   obvious invariant (`i = k·|appended|`). It retires all 11 utf8_simd tests, including the
-   256×256×10×10 exhaustive one, removes the duplicated oracle (§5.6), and forces the missing
-   `requires is_utf8_lead(lead)` (§5.5).
+Next come the table properties (`dcs-header-gr-ignored`, `state-name-roundtrip`, and the table
+halves of `dcs-ignore-bisimilar-passthrough` and `hooked-string-carry-bisimilar`), decidable by
+evaluating `const fn generate_table()`; the bisimilar ones retire their tests only with their
+bisimulation halves.
 
-Runner-up: the four **table properties** (`dcs-header-gr-ignored`, and the table halves of
-`dcs-ignore-bisimilar-passthrough` and `hooked-string-carry-bisimilar`, plus `state-name-roundtrip`).
-They are decidable by evaluating the `const fn generate_table()`, so they are almost free, but they only
-retire their tests fully once the bisimulation halves are proved.
+The full dependency order: `osc-bulk-copy-len`, `param-accumulator`, the `scan-*` scalar and NEON
+contracts, `decode-multibyte-char`, the table properties and `utf8prefix-*` →
+`bulk-decode-run-refines-scalar` → the per-step contracts (`c1-guard`, `can-sub-cancel`,
+`esc-interrupts`, the denotations on the per-byte state machine) → `type-invariant` → the master
+simulation → its free corollaries (chunk invariance, the fast-path halves of the denotations) →
+the carry specs.

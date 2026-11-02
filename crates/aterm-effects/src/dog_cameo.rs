@@ -107,7 +107,7 @@ impl DogCameo {
     #[must_use]
     pub fn active(&self, now: Instant) -> bool {
         match self.since {
-            Some(at) => now.saturating_duration_since(at) < VISIT_LIFE,
+            Some(at) => now.saturating_duration_since(at).as_nanos() < VISIT_LIFE.as_nanos(),
             None => false,
         }
     }
@@ -120,16 +120,17 @@ impl DogCameo {
             return 0;
         };
         let t = now.saturating_duration_since(at);
-        if t < FADE_IN {
+        let t_ns = t.as_nanos();
+        if t_ns >= VISIT_LIFE.as_nanos() {
+            0
+        } else if t_ns < FADE_IN.as_nanos() {
             let f = t.as_secs_f32() * INV_FADE_IN_SECS;
             (f * 255.0).round().clamp(0.0, 255.0) as u8
-        } else if t < FADE_IN_HOLD {
+        } else if t_ns < FADE_IN_HOLD.as_nanos() {
             255
-        } else if t < VISIT_LIFE {
-            let f = (t - FADE_IN_HOLD).as_secs_f32() * INV_FADE_OUT_SECS;
-            ((1.0 - f) * 255.0).round().clamp(0.0, 255.0) as u8
         } else {
-            0
+            let f = t.saturating_sub(FADE_IN_HOLD).as_secs_f32() * INV_FADE_OUT_SECS;
+            ((1.0 - f) * 255.0).round().clamp(0.0, 255.0) as u8
         }
     }
 

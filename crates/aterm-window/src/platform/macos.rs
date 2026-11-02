@@ -34,12 +34,70 @@ pub fn set_application_should_terminate_handler(handler: fn() -> bool) {
     crate::platform_impl::set_quit_confirm_hook(handler);
 }
 
+/// The original native key before Option handling or input-method interpretation.
+///
+/// LOCAL PATCH (aterm): identity only; the window layer assigns it no input authority.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NativeKeyEvent {
+    /// `NSEventTypeKeyDown` (10) or `NSEventTypeKeyUp` (11).
+    pub kind: usize,
+    /// The native virtual keycode.
+    pub keycode: u16,
+    /// The native timestamp in seconds since boot.
+    pub timestamp: f64,
+}
+
+/// Install the application's classifier before its first window receives a key.
+///
+/// The first registration takes effect. Each native key is classified once before it can
+/// generate window callbacks; that application's decision is retained through deferred
+/// delivery. The window layer does not interpret the decision or grant any authority.
+#[inline]
+pub fn set_window_key_classifier(classifier: fn(NativeKeyEvent) -> bool) {
+    crate::platform_impl::set_window_key_classifier(classifier);
+}
+
+/// The application's retained source-key decision for this window-event callback.
+///
+/// `None` means outside retained callback delivery. `Some(false)` also names callbacks
+/// generated without a source key, so they never borrow a later AppKit event's identity.
+#[inline]
+pub fn window_event_posted() -> Option<bool> {
+    crate::platform_impl::window_event_posted()
+}
+
 /// Printable ASCII character produced only via an Option chord on `key` under the active keyboard layout.
 ///
 /// LOCAL PATCH (aterm): added; reads the layout with `UCKeyTranslate`, on the main thread.
 #[inline]
 pub fn option_only_character(key: crate::keyboard::PhysicalKey, shift: bool) -> Option<char> {
     crate::platform_impl::option_only_character(key, shift)
+}
+
+/// LOCAL PATCH (aterm): a weak reference (`objc_initWeak`) to the `CADisplayLink` that `window`'s
+/// view holds now for its frame clock (`Window::set_frame_clock`); `None` before the clock's first
+/// run, once the window closed, and off the main thread. A seam for `aterm-gui`'s
+/// `objc_frame_clock_drive`, which reads the link's own `-isPaused` through it, and takes it
+/// before a close and loads it (`objc_loadWeakRetained`) after: the main run loop the link was
+/// added to retains it until `-invalidate`, so it loads nil only once the link was invalidated and
+/// nothing else holds it.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+#[must_use]
+pub fn frame_clock_link(window: &Window) -> Option<aterm_objc::WeakObj> {
+    window.window.frame_clock_link()
+}
+
+/// LOCAL PATCH (aterm): a weak reference to every `CADisplayLink` that `window`'s view made for its
+/// frame clock, in the order made, each recorded where the link's maker returned it; empty off the
+/// main thread. A seam for `aterm-gui`'s `objc_frame_clock_drive`, which takes them before a close
+/// and requires each to load nil after it, so a link the view replaced without `-invalidate`
+/// (which the main run loop goes on retaining) is seen as well as the one it held at the close.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+#[must_use]
+pub fn frame_clock_links(window: &Window) -> Vec<aterm_objc::WeakObj> {
+    window.window.frame_clock_links()
 }
 
 /// Additional methods on [`Window`] that are specific to macOS.

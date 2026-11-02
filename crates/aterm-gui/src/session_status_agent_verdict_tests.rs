@@ -1202,8 +1202,8 @@ fn the_status_record_counts_the_history_an_update_could_not_carry() {
         record.contains(
             " history_lost=0 journal=off journal_off=keeper-off integration_rev=- born=cold render=ok \
              resizes=0 flaps=0 land_at=- task=- pause=- land_held=- land_nudges=- land_since=- \
-             held=- waiting=- end=- end_seen=- end_cheered=- goal=- task_state=- task_rev=0 \
-             log_seq=1 log_ep=1 log_base=1 run=- turn=- step=- need=- need_since_ms=- rollout=- rollout_asks=0 editing=0 editor=- bells=0 bells_sounded=0 last_bell=- gen="
+             held=- waiting=- land_asked=- landed_head=- landed_on=- landed_leg=- landed_repo=- end=- end_seen=- end_cheered=- goal=- task_state=- task_rev=0 \
+             log_seq=1 log_ep=1 log_base=1 run=- turn=- step=- need=- need_since_ms=- rollout=- rollout_asks=0 log_journal=off log_journal_why=- exec_watch=none exec_watch_why=- editing=0 editor=- bells=0 bells_sounded=0 last_bell=- gen="
         ),
         "{record}"
     );
@@ -1245,8 +1245,8 @@ fn the_status_record_counts_the_history_an_update_could_not_carry() {
         record.contains(
             " history_lost=1234 journal=off journal_off=keeper-off integration_rev=- born=cold render=ok \
              resizes=0 flaps=0 land_at=- task=- pause=- land_held=- land_nudges=- land_since=- \
-             held=- waiting=- end=- end_seen=- end_cheered=- goal=- task_state=- task_rev=0 \
-             log_seq=1 log_ep=1 log_base=1 run=- turn=- step=- need=- need_since_ms=- rollout=- rollout_asks=0 editing=0 editor=- bells=0 bells_sounded=0 last_bell=- gen="
+             held=- waiting=- land_asked=- landed_head=- landed_on=- landed_leg=- landed_repo=- end=- end_seen=- end_cheered=- goal=- task_state=- task_rev=0 \
+             log_seq=1 log_ep=1 log_base=1 run=- turn=- step=- need=- need_since_ms=- rollout=- rollout_asks=0 log_journal=off log_journal_why=- exec_watch=none exec_watch_why=- editing=0 editor=- bells=0 bells_sounded=0 last_bell=- gen="
         ),
         "{record}"
     );
@@ -1880,6 +1880,57 @@ fn a_box_the_zone_cuts_is_read_whole_and_a_hosted_agent_raises_no_row() {
     assert!(crate::needs::of(&bare).need.is_some());
 }
 
+/// An agent the host observes only (its image unconfirmed, `supervisor_act=observe`) keeps its
+/// box the person's: the host types nothing into it, so its hosting suppresses no need. A
+/// confirmed agent's box stays the host's. NEGATIVE CONTROL (by hand, run): with `need_facts_with`
+/// reading the host's hosting alone, the observed session raises no need.
+#[test]
+fn an_observed_agents_box_stays_the_persons() {
+    let (mut app, sid) = app_with_stub();
+    let fixture = aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::TRUST);
+    {
+        let pooled = app.pool.get(sid).expect("pooled");
+        let mut t = crate::term_lock(&pooled.term);
+        t.resize(45, 120);
+        let mut bytes = String::from("\x1b[H\x1b[2J");
+        for (i, row) in fixture[8..=23].iter().enumerate() {
+            bytes.push_str(&format!("\x1b[{};1H{row}", i + 1));
+        }
+        t.process(bytes.as_bytes());
+    }
+    let _ = take_posts();
+    looking_at(&app, &[]);
+    sweep(&mut app, Instant::now());
+    assert_eq!(published(&app, sid).word, "prompt");
+    let handle = app.store.read().unwrap().by_local(sid).cloned();
+    let handle = handle.as_ref().expect("the session");
+    let (agent, group) = {
+        let timeline = handle.ctx.timeline.lock().unwrap();
+        (
+            crate::harness_host::agent_of(timeline.agent()).expect("an agent"),
+            timeline.agent().program_pgid,
+        )
+    };
+    let read = |act| {
+        crate::agent_act::keep_for_test(handle.ctx.self_id.as_str(), agent, group, act);
+        let f = app.need_facts_with(
+            handle,
+            |_| true,
+            &Default::default(),
+            crate::metrics::now_us(),
+            0,
+        );
+        (f.supervised, crate::needs::of(&f).need.is_some())
+    };
+    use aterm_agent::harness::agent_image::Act;
+    assert_eq!(
+        read(Act::Observe),
+        (false, true),
+        "observed: the person's box"
+    );
+    assert_eq!(read(Act::On), (true, false), "confirmed: the host's");
+}
+
 /// `NeedFacts::other_supervisor` distinguishes another holder's live supervisor claim from this host's.
 #[test]
 fn another_holders_claim_is_named_apart_from_this_hosts() {
@@ -2452,4 +2503,82 @@ fn the_verdict_reads_a_frame_past_its_hang_detector() {
         crate::presence::classifier_calls() > calls,
         "past its hang detector the frame is read as it stands"
     );
+}
+
+/// A BUILD'S FRONT WAITING FOR MEMORY IS READ AGAIN ON A STILL SCREEN: once its group is named
+/// `targo` and the name confirmed, a still screen resolves it no more; noted as a front whose
+/// claim waits, it is due again each [`PROGRAM_RECHECK`] and the observer wakes for it, so
+/// `status`'s `wait_gib=`/`wait_ahead=` follow its ledger within a recheck, not only when the
+/// front writes its once-a-minute line, and its admission is read on a still screen. NEGATIVE
+/// CONTROL: the same group noted as waiting no more is not due on that still screen, and the
+/// observer's wake is what it was.
+#[test]
+fn a_waiting_fronts_wait_is_read_again_on_a_still_screen() {
+    let t0 = Instant::now();
+    let floor = Duration::from_millis(100);
+    let id = 9;
+    let pgid = 44;
+    let still = crate::control::ScreenGen { epoch: 0, seq: 1 };
+    let policy = StatusPolicy::default();
+    let mut observer = StatusObserver::new(policy, floor);
+    observer.sessions.insert(
+        id,
+        SessionSlot {
+            next_due: t0 + floor,
+            ..SessionSlot::new(policy, t0)
+        },
+    );
+    let rows = || Some(vec!["atpkg: waiting for memory".into()]);
+    observer.note_program_request(id, pgid, t0);
+    for (at, resolving) in [(t0, true), (t0 + floor, false)] {
+        observer.agent_observe(
+            id,
+            still,
+            rows(),
+            Cursor::Unknown,
+            Some("targo".into()),
+            pgid,
+            resolving,
+            at,
+        );
+    }
+    let confirm = t0 + floor + PROGRAM_NAME_CONFIRM;
+    assert!(observer.program_due(id, false, Some("targo"), still, confirm));
+    observer.note_program_request(id, pgid, confirm);
+    observer.agent_observe(
+        id,
+        still,
+        rows(),
+        Cursor::Unknown,
+        Some("targo".into()),
+        pgid,
+        false,
+        confirm,
+    );
+    let later = confirm + PROGRAM_RECHECK;
+    assert!(
+        !observer.program_due(id, false, Some("targo"), still, later),
+        "a still screen is resolved no more"
+    );
+    let quiet = observer.next_wake();
+    let recheck = confirm + PROGRAM_RECHECK;
+    assert!(quiet.is_none_or(|q| q > recheck), "{quiet:?}");
+
+    observer.note_build_wait(id, true);
+    assert!(
+        !observer.program_due(
+            id,
+            false,
+            Some("targo"),
+            still,
+            later - Duration::from_millis(1)
+        ),
+        "not before its recheck"
+    );
+    assert!(observer.program_due(id, false, Some("targo"), still, later));
+    assert_eq!(observer.next_wake(), Some(recheck));
+
+    observer.note_build_wait(id, false);
+    assert!(!observer.program_due(id, false, Some("targo"), still, later));
+    assert_eq!(observer.next_wake(), quiet);
 }

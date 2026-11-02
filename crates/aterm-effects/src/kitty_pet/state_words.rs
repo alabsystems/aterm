@@ -61,10 +61,12 @@ impl PetBrain {
         w.f32("pet.fit", self.fit);
         w.f32("pet.fit_from", self.fit_from);
         w.f32("pet.fit_to", self.fit_to);
-        w.opt("pet.sink_seat", self.sink_seat, |f, (at, over)| {
+        w.opt("pet.sink_seat", self.sink_seat, |f, (at, over, page)| {
             pair(f, at);
             pair(f, over);
+            f.put("page", page);
         });
+        w.opt("pet.walk_to", self.walk_to, pair);
         w.f32("pet.land_t", self.land_t);
         w.flag("pet.hop_crouch", self.hop_crouch);
         w.f32("pet.coil_d", self.coil_d);
@@ -275,6 +277,8 @@ impl PetBrain {
             f.f32("hide_t", self.hide_t);
             f.f32("wriggle_t", self.wriggle_t);
             f.f32("twitch_t", self.twitch_t);
+            f.f32("twitch_cool", self.twitch_cool);
+            f.flag("twitch_spent", self.twitch_spent);
             f.flag("twitch_up", self.twitch_up);
             f.flag("last_burst", self.last_burst);
             f.flag("droop_seated", self.droop_seated);
@@ -286,6 +290,8 @@ impl PetBrain {
             f.flag("room_hold", self.room_hold);
             f.put("room_turn", self.room_turn);
             f.flag("room_sibling", self.room_sibling);
+            f.at_opt("room_sibling_at", self.room_sibling_at);
+            f.flag("room_sibling_spent", self.room_sibling_spent);
             f.put("room_unseen", self.room_unseen);
             f.flag("room_overdue", self.room_overdue);
             f.flag("room_turn_seeded", self.room_turn_seeded);
@@ -557,7 +563,6 @@ fn flight_kind_words(f: &mut Fold, k: FlightKind) {
     f.flag("hop", k.hop);
     f.flag("drop", k.drop);
     f.flag("brisk", k.brisk);
-    f.flag("spring", k.spring);
 }
 
 #[inline]
@@ -578,8 +583,8 @@ fn flight_words(f: &mut Fold, fl: Flight) {
     f.flag("late_move", fl.late_move);
     f.flag("running", fl.running);
     f.flag("brisk", fl.brisk);
+    f.f32("cap", fl.cap);
     f.put("stage", u64::from(fl.stage));
-    f.flag("spring", fl.spring);
 }
 
 #[inline]
@@ -670,7 +675,7 @@ mod tests {
         use super::super::PetMoteKind;
         let t0 = Instant::now();
         let base = words(&PetBrain::new(), t0);
-        let cases: [Case; 30] = [
+        let cases: [Case; 35] = [
             ("the surface", |p, _| p.surface = Some((7, true))),
             ("a held stand", |p, _| {
                 p.held_stash[1] = Some(HeldStand {
@@ -769,10 +774,17 @@ mod tests {
             }),
             ("the head law's sink", |p, _| {
                 p.sink_to = 0.78;
-                p.sink_seat = Some(((4.0, 5.0), (4.0, 7.5)));
+                p.sink_seat = Some(((4.0, 5.0), (4.0, 7.5), 0));
             }),
+            ("the walk's stand", |p, _| p.walk_to = Some((6.0, 5.0))),
             ("the head law's fit", |p, _| p.fit_to = 0.54),
             ("the run's wide steps", |p, _| p.wide_steps = 2),
+            ("the ear twitch cooldown", |p, _| p.twitch_cool = 2.0),
+            ("the spent idle ear twitch", |p, _| p.twitch_spent = true),
+            ("the sibling burst stamp", |p, t0| {
+                p.room_sibling_at = Some(t0 + Duration::from_millis(20))
+            }),
+            ("the spent sibling look", |p, _| p.room_sibling_spent = true),
         ];
         for (what, set) in cases {
             let mut pet = PetBrain::new();

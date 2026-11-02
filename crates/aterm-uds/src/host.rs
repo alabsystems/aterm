@@ -7,6 +7,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+pub mod bash;
 pub mod chrome;
 mod tools;
 pub use tools::TOOLS;
@@ -130,8 +131,11 @@ pub fn could_not_run_as_root(fixture: &str) {
 /// Who provides a [`Tool`], and so the one command a COULD NOT RUN for it names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Provider {
-    /// The operating system ships it, and the OS is the answer.
+    /// A Unix operating system ships it (macOS, or for a Linux lane Linux), and that OS is
+    /// the answer there; Windows ships none.
     Os,
+    /// Windows ships it, and Windows is the answer.
+    Windows,
     /// Apple's Command Line Tools (the `base.clt` item), which nobody may redistribute.
     Clt,
     /// ALab's default set (the `base.pkg.toolset` item).
@@ -245,7 +249,13 @@ pub struct Tool {
     pub pin: Option<Pin>,
     /// Who provides it.
     pub provider: Provider,
+    /// The Linux lane's guest builds this row's pin too, at the first of `at`: on a Linux host
+    /// the pin does not cover, the guest is its provider ([`Tool::remedy_on`]).
+    pub in_guest: bool,
 }
+
+/// How a refusal sends a test to the Linux lane's guest.
+const GUEST_RUNS: &str = "`targo --unverified verify linux` runs this there";
 
 /// A fixed place or `$PATH` entry a lookup may take: on Unix a file with an execute bit, as a
 /// shell's `$PATH` search and `execvp` take one, so a mode-0644 `rustup` early on `$PATH` is
@@ -466,8 +476,27 @@ impl Tool {
     /// [`Tool::remedy`] on the host `platform` (`<os>-<arch>`).
     #[must_use]
     pub fn remedy_on(&self, platform: &str) -> String {
+        let windows = platform.starts_with("windows-");
         match self.provider {
+            Provider::Os if windows => {
+                let looked: Vec<&str> = self
+                    .at
+                    .iter()
+                    .copied()
+                    .filter(|path| path.as_bytes().get(1) == Some(&b':'))
+                    .collect();
+                if looked.is_empty() {
+                    "Windows ships none, and aterm provides none".into()
+                } else {
+                    format!(
+                        "Windows ships none, and aterm looks for one at {}",
+                        looked.join(" or ")
+                    )
+                }
+            }
             Provider::Os => "it comes with the operating system, and no command adds it".into(),
+            Provider::Windows if windows => "it comes with Windows, and no command adds it".into(),
+            Provider::Windows => format!("only Windows ships it, and this host is {platform}"),
             Provider::Clt => "Apple's Command Line Tools provide it (`aterm init --only base.clt` \
                               installs them, asking one password in the terminal)"
                 .into(),
@@ -476,6 +505,13 @@ impl Tool {
             ),
             Provider::Workspace { when } => {
                 if let Some(pin) = self.pin.filter(|p| !p.pinned_for(platform)) {
+                    if self.in_guest && platform.starts_with("linux-") {
+                        return format!(
+                            "the Linux guest builds the pinned {} as {}: {GUEST_RUNS}",
+                            pin.version,
+                            self.at.first().copied().unwrap_or(self.name)
+                        );
+                    }
                     return format!(
                         "aterm provides none for {platform}: `{}` pins it for {} only",
                         when.command(),
@@ -494,10 +530,7 @@ impl Tool {
                  --check` audits one)"
                     .into()
             }
-            Provider::Guest => {
-                "the Linux guest provides it: `targo --unverified verify linux` runs this there"
-                    .into()
-            }
+            Provider::Guest => format!("the Linux guest provides it: {GUEST_RUNS}"),
             Provider::Unprovided { because } => format!("aterm provides none: {because}"),
             Provider::Hardware(_) => "no command adds it".into(),
         }
@@ -528,6 +561,7 @@ impl Tool {
     pub fn provided_by(&self) -> String {
         match self.provider {
             Provider::Os => "OS".to_string(),
+            Provider::Windows => "Windows".to_string(),
             Provider::Clt => "CLT".to_string(),
             Provider::Toolset { .. } => "default set".to_string(),
             Provider::Workspace { when } => when.verb(),

@@ -66,7 +66,7 @@ pub enum SoundKind {
         /// Diagonal cell distance of the Return's own flight.
         cells: u16,
     },
-    /// A paste landed: the up-strum (§28), four tines of the music box's live chord swept upward at 0 / 22 / 44 / 66 ms.
+    /// A paste landed: the up-strum (§8.2), four tines of the music box's live chord swept upward at 0 / 22 / 44 / 66 ms.
     Strum,
     /// A hero star was born and the shared token bucket paid for it (§13): one glint.
     Stardust {
@@ -2017,37 +2017,48 @@ impl TrailSynth {
         let dt = self.inv_sr;
         v.k_a = crate::color_math::exp_f32(-dt / v.attack.max(2e-4));
         v.k_d = crate::color_math::exp_f32(-dt / v.decay.max(1e-3));
-        v.k_n = if v.n_glide > 0.0 {
-            crate::color_math::exp_f32(-dt / v.n_glide)
-        } else {
-            1.0
-        };
         v.env_run = false;
         v.env_n = 0;
-        v.k_nd = if v.n_decay > 0.0 {
-            crate::color_math::exp_f32(-dt / v.n_decay)
+        if v.n_lvl > 0.0 {
+            v.k_n = if v.n_glide > 0.0 {
+                crate::color_math::exp_f32(-dt / v.n_glide)
+            } else {
+                1.0
+            };
+            v.k_nd = if v.n_decay > 0.0 {
+                crate::color_math::exp_f32(-dt / v.n_decay)
+            } else {
+                1.0
+            };
         } else {
-            1.0
-        };
+            v.k_n = 1.0;
+            v.k_nd = 1.0;
+        }
         let mut p_idx = 0;
         while p_idx < 3 {
             let part = &mut v.p[p_idx];
             part.ph = ph[p_idx];
-            part.k_g = if part.glide > 0.0 {
-                crate::color_math::exp_f32(-dt / part.glide)
+            if part.lvl > 0.0 {
+                part.k_g = if part.glide > 0.0 {
+                    crate::color_math::exp_f32(-dt / part.glide)
+                } else {
+                    1.0
+                };
+                part.k_f = if part.fm_ratio > 0.0 {
+                    crate::color_math::exp_f32(-dt / part.fm_tau.max(1e-3))
+                } else {
+                    1.0
+                };
+                part.k_p = if part.decay > 0.0 {
+                    crate::color_math::exp_f32(-dt / part.decay)
+                } else {
+                    1.0
+                };
             } else {
-                1.0
-            };
-            part.k_f = if part.fm_ratio > 0.0 {
-                crate::color_math::exp_f32(-dt / part.fm_tau.max(1e-3))
-            } else {
-                1.0
-            };
-            part.k_p = if part.decay > 0.0 {
-                crate::color_math::exp_f32(-dt / part.decay)
-            } else {
-                1.0
-            };
+                part.k_g = 1.0;
+                part.k_f = 1.0;
+                part.k_p = 1.0;
+            }
             p_idx += 1;
         }
         v.lp = 0.0;

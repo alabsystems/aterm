@@ -1763,6 +1763,13 @@ impl TerminalHandler<'_> {
         if let Some(animation) = t.kitty_frames.get_mut(&id) {
             animation.shown_at = now;
         }
+        self.replace_shown_kitty_image(id, frame);
+    }
+
+    /// Make `frame` image `id`'s entry and repoint its placements to it, the
+    /// animation's clock untouched.
+    fn replace_shown_kitty_image(&mut self, id: u32, frame: Arc<ImageData>) {
+        let t = &mut *self.transient;
         let new = frame.bytes.len();
         let old = t
             .kitty_images
@@ -1895,7 +1902,7 @@ impl TerminalHandler<'_> {
     }
 
     fn build_kitty_frame(
-        &self,
+        &mut self,
         id: u32,
         cmd: &mut KittyCommand,
         edit: Option<usize>,
@@ -1906,8 +1913,8 @@ impl TerminalHandler<'_> {
             .get(&id)
             .ok_or("ENOENT:no such image")?
             .frames;
-        let root = &frames.first().ok_or("ENOENT:no such image")?.image;
-        let (canvas_w, canvas_h) = raster_size(root).ok_or("EINVAL:image has no pixel size")?;
+        let root = Arc::clone(&frames.first().ok_or("ENOENT:no such image")?.image);
+        let (canvas_w, canvas_h) = raster_size(&root).ok_or("EINVAL:image has no pixel size")?;
         let at = (cmd.x.unwrap_or(0), cmd.y.unwrap_or(0));
         let base = cmd.columns.filter(|&n| n != 0);
         let background = cmd.cell_y_offset.unwrap_or(0);
@@ -1932,36 +1939,34 @@ impl TerminalHandler<'_> {
             && (data_w, data_h) == (canvas_w, canvas_h)
             && (background == 0 || !blend);
         if whole {
-            return Ok(KittyLayout::of(root).image(data.bytes, data.format));
+            return Ok(KittyLayout::of(&root).image(data.bytes, data.format));
         }
         let (Ok(width), Ok(height)) = (u16::try_from(canvas_w), u16::try_from(canvas_h)) else {
             return Err("ENOSPC:frame too large");
         };
-        let size = kitty_rgba_len(width, height)?;
+        let size = usize::from(width) * usize::from(height) * 4;
+        if size > MAX_KITTY_IMAGE_BYTES {
+            return Err("ENOSPC:frame too large");
+        }
         let under = match (edit, base) {
-            (Some(index), _) => Some(&frames.get(index).ok_or("EINVAL:no such frame")?.image),
-            (None, Some(n)) => Some(
-                &usize::try_from(n - 1)
-                    .ok()
-                    .and_then(|index| frames.get(index))
-                    .ok_or("EINVAL:no such frame")?
-                    .image,
-            ),
+            (Some(index), _) => Some(index),
+            (None, Some(n)) => Some(usize::try_from(n - 1).map_err(|_| "EINVAL:no such frame")?),
             (None, None) => None,
         };
-        let pixels = kitty_rgba(&data)?.pixels;
+        if let Some(index) = under {
+            let under = &frames.get(index).ok_or("EINVAL:no such frame")?.image;
+            if kitty_rgba_size(under)? != (width, height) {
+                return Err("EINVAL:the frames differ in size");
+            }
+            self.decode_kitty_frame(id, index)?;
+        }
+        let pixels = kitty_rgba(&data)?;
         let mut canvas = Vec::new();
         canvas
             .try_reserve_exact(size)
             .map_err(|_| "ENOSPC:out of memory")?;
         match under {
-            Some(under) => {
-                let under = kitty_rgba(under)?;
-                if under.size != (width, height) {
-                    return Err("EINVAL:the frames differ in size");
-                }
-                canvas.extend_from_slice(&under.pixels);
-            }
+            Some(index) => canvas.extend_from_slice(&kitty_rgba(self.kitty_frame(id, index)?)?),
             None => {
                 for _ in 0..usize::from(width) * usize::from(height) {
                     canvas.extend_from_slice(&background.to_be_bytes());
@@ -1978,7 +1983,91 @@ impl TerminalHandler<'_> {
             (0, 0, to_usize(data_w), to_usize(data_h)),
             blend,
         );
-        Ok(raw_frame(canvas, width, height, root))
+        Ok(raw_frame(canvas, width, height, &root))
+    }
+
+    /// Frame `index` of image `id`.
+    fn kitty_frame(&self, id: u32, index: usize) -> Result<&Arc<ImageData>, &'static str> {
+        let animation = self
+            .transient
+            .kitty_frames
+            .get(&id)
+            .ok_or("ENOENT:no such image")?;
+        Ok(&animation
+            .frames
+            .get(index)
+            .ok_or("EINVAL:no such frame")?
+            .image)
+    }
+
+    /// Store frame `index` of image `id` decoded if it is a PNG, before a
+    /// compose or a frame load reads its pixels. A PNG costs a decode
+    /// (`aterm_png` bounds its work by the image's size) on every read;
+    /// stored decoded, the frame costs a copy, so a command repeated against
+    /// one frame decodes it once. Only the store's representation changes:
+    /// the pixels, and so the placements' pictures and the animation's clock,
+    /// stay as they were. A PNG that does not decode keeps its bytes and is
+    /// marked, so every later read refuses it without decoding it again.
+    /// Refuses, decoding nothing, when the decoded frame would not fit the
+    /// store.
+    fn decode_kitty_frame(&mut self, id: u32, index: usize) -> Result<(), &'static str> {
+        let t = &*self.transient;
+        let slot = t
+            .kitty_frames
+            .get(&id)
+            .ok_or("ENOENT:no such image")?
+            .frames
+            .get(index)
+            .ok_or("EINVAL:no such frame")?;
+        if !matches!(slot.image.format, ImageFormat::Png) {
+            return Ok(());
+        }
+        if slot.undecodable {
+            return Err(KITTY_BAD_PNG);
+        }
+        let frame = Arc::clone(&slot.image);
+        let (width, height) = kitty_rgba_size(&frame)?;
+        // The frame's slot and, when it is the frame shown, the image entry.
+        let shown = t
+            .kitty_images
+            .get(&id)
+            .is_some_and(|shown| Arc::ptr_eq(shown, &frame));
+        let copies = if shown { 2 } else { 1 };
+        let decoded = usize::from(width) * usize::from(height) * 4;
+        let projected = t
+            .kitty_total_bytes
+            .saturating_sub(frame.bytes.len() * copies)
+            .saturating_add(decoded * copies);
+        if projected > MAX_KITTY_STORE_BYTES {
+            return Err("ENOSPC:image store full");
+        }
+        let pixels = kitty_rgba(&frame).map(Cow::into_owned);
+        let t = &mut *self.transient;
+        let Some(slot) = t
+            .kitty_frames
+            .get_mut(&id)
+            .and_then(|animation| animation.frames.get_mut(index))
+        else {
+            return Err("EINVAL:no such frame");
+        };
+        let pixels = match pixels {
+            Ok(pixels) => pixels,
+            Err(refused) => {
+                slot.undecodable = true;
+                return Err(refused);
+            }
+        };
+        let decoded = Arc::new(raw_frame(pixels, width, height, &frame));
+        slot.image = Arc::clone(&decoded);
+        t.kitty_total_bytes = t
+            .kitty_total_bytes
+            .saturating_sub(frame.bytes.len())
+            .saturating_add(decoded.bytes.len());
+        charge_released_kitty(t, frame.payload_bytes());
+        if shown {
+            self.replace_shown_kitty_image(id, decoded);
+        }
+        Ok(())
     }
 
     fn commit_kitty_frame(
@@ -2006,6 +2095,7 @@ impl TerminalHandler<'_> {
             animation.frames.push(KittyFrame {
                 image: frame,
                 gap_ms: gap.map_or(KITTY_DEFAULT_GAP_MS, gap_ms),
+                undecodable: false,
             });
             t.kitty_total_bytes = total.saturating_add(add);
             return "OK";
@@ -2023,6 +2113,7 @@ impl TerminalHandler<'_> {
             slot.gap_ms = gap_ms(gap);
         }
         let old = std::mem::replace(&mut slot.image, Arc::clone(&frame));
+        slot.undecodable = false;
         t.kitty_total_bytes = projected;
         charge_released_kitty(t, old.payload_bytes());
         if t.kitty_images
@@ -2047,7 +2138,7 @@ impl TerminalHandler<'_> {
     }
 
     fn composed_kitty_frame(
-        &self,
+        &mut self,
         id: u32,
         cmd: &KittyCommand,
     ) -> Result<(usize, ImageData), &'static str> {
@@ -2063,10 +2154,8 @@ impl TerminalHandler<'_> {
         };
         let (src_index, src) = pick(cmd.rows).ok_or("ENOENT:no such source frame")?;
         let (dst_index, dst) = pick(cmd.columns).ok_or("ENOENT:no such destination frame")?;
-        let src_rgba = kitty_rgba(src)?;
-        let dst_rgba = kitty_rgba(dst)?;
-        let (width, height) = dst_rgba.size;
-        if src_rgba.size != dst_rgba.size {
+        let (width, height) = kitty_rgba_size(dst)?;
+        if kitty_rgba_size(src)? != (width, height) {
             return Err("EINVAL:the frames differ in size");
         }
         let (image_w, image_h) = (u64::from(width), u64::from(height));
@@ -2088,17 +2177,24 @@ impl TerminalHandler<'_> {
         if src_index == dst_index && overlaps(src_x, dst_x, w) && overlaps(src_y, dst_y, h) {
             return Err("EINVAL:the rectangles overlap in one frame");
         }
+        self.decode_kitty_frame(id, src_index)?;
+        self.decode_kitty_frame(id, dst_index)?;
+        let (src, dst) = (
+            self.kitty_frame(id, src_index)?,
+            self.kitty_frame(id, dst_index)?,
+        );
+        let (src_pixels, dst_pixels) = (kitty_rgba(src)?, kitty_rgba(dst)?);
         let mut canvas = Vec::new();
         canvas
-            .try_reserve_exact(dst_rgba.pixels.len())
+            .try_reserve_exact(dst_pixels.len())
             .map_err(|_| "ENOSPC:out of memory")?;
-        canvas.extend_from_slice(&dst_rgba.pixels);
+        canvas.extend_from_slice(&dst_pixels);
         let to_usize = |v: u64| usize::try_from(v).unwrap_or(usize::MAX);
         kitty_graphics::compose_rgba(
             &mut canvas,
             usize::from(width),
             (to_usize(dst_x), to_usize(dst_y)),
-            &src_rgba.pixels,
+            &src_pixels,
             usize::from(width),
             (to_usize(src_x), to_usize(src_y), to_usize(w), to_usize(h)),
             !cmd.cursor_stays,
@@ -2313,42 +2409,42 @@ impl KittyLayout {
     }
 }
 
-struct KittyRgba<'a> {
-    pixels: Cow<'a, [u8]>,
-    size: (u16, u16),
-}
-
-/// Bound decoded frame bytes before allocation, including on 32-bit targets.
-fn kitty_rgba_len(width: u16, height: u16) -> Result<usize, &'static str> {
-    usize::from(width)
-        .checked_mul(usize::from(height))
-        .and_then(|pixels| pixels.checked_mul(4))
-        .filter(|&bytes| bytes <= MAX_KITTY_IMAGE_BYTES)
-        .ok_or("ENOSPC:frame too large")
-}
-
-fn kitty_rgba(frame: &ImageData) -> Result<KittyRgba<'_>, &'static str> {
+/// The pixel size [`kitty_rgba`] would decode `frame` to, read from its header
+/// alone, so a command can refuse its arguments before it decodes anything.
+fn kitty_rgba_size(frame: &ImageData) -> Result<(u16, u16), &'static str> {
     let (width, height) = raster_size(frame).ok_or(KITTY_BAD_PNG)?;
     let (Ok(width), Ok(height)) = (u16::try_from(width), u16::try_from(height)) else {
         return Err("ENOSPC:frame too large");
     };
-    kitty_rgba_len(width, height)?;
-    let pixels = match frame.format {
-        ImageFormat::RawRgba8 { .. } => Cow::Borrowed(frame.bytes.as_slice()),
+    if usize::from(width) * usize::from(height) * 4 > MAX_KITTY_IMAGE_BYTES {
+        return Err("ENOSPC:frame too large");
+    }
+    Ok((width, height))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// PNG frames [`kitty_rgba`] has decoded on this thread.
+    static KITTY_PNG_DECODES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// `frame`'s RGBA8 pixels at [`kitty_rgba_size`], decoding a PNG.
+fn kitty_rgba(frame: &ImageData) -> Result<Cow<'_, [u8]>, &'static str> {
+    let (width, height) = kitty_rgba_size(frame)?;
+    match frame.format {
+        ImageFormat::RawRgba8 { .. } => Ok(Cow::Borrowed(frame.bytes.as_slice())),
         ImageFormat::Png => {
+            #[cfg(test)]
+            KITTY_PNG_DECODES.with(|n| n.set(n.get() + 1));
             let (pixels, w, h) =
                 aterm_png::decode_rgba8(&frame.bytes, u32::from(u16::MAX)).ok_or(KITTY_BAD_PNG)?;
             if (w, h) != (usize::from(width), usize::from(height)) {
                 return Err(KITTY_BAD_PNG);
             }
-            Cow::Owned(pixels)
+            Ok(Cow::Owned(pixels))
         }
-        ImageFormat::Unknown => return Err(KITTY_BAD_PNG),
-    };
-    Ok(KittyRgba {
-        pixels,
-        size: (width, height),
-    })
+        ImageFormat::Unknown => Err(KITTY_BAD_PNG),
+    }
 }
 
 #[inline]
@@ -2720,18 +2816,6 @@ impl TerminalHandler<'_> {
 mod kitty_display_tests {
     use crate::terminal::Terminal;
     use crate::terminal::kitty_graphics::zlib_zeros;
-
-    #[test]
-    fn rgba_frame_size_rejects_oversize_and_32_bit_overflow_dimensions() {
-        assert_eq!(super::kitty_rgba_len(1, 1), Ok(4));
-        assert_eq!(super::kitty_rgba_len(1024, 1024), Ok(4 * 1024 * 1024));
-        for (width, height) in [(1024, 1025), (32768, 32768), (u16::MAX, u16::MAX)] {
-            assert_eq!(
-                super::kitty_rgba_len(width, height),
-                Err("ENOSPC:frame too large")
-            );
-        }
-    }
 
     fn apc_g(control: &str, raw_payload: &[u8]) -> Vec<u8> {
         let mut v = b"\x1b_G".to_vec();
@@ -4260,6 +4344,195 @@ mod kitty_display_tests {
         assert!(reply(&mut term).contains(";ENOENT"), "no frame 9");
         term.process(&apc_g("a=c,i=7,r=2,c=2,w=2", b""));
         assert!(reply(&mut term).contains(";EINVAL"), "overlapping itself");
+    }
+
+    #[test]
+    fn compose_refuses_its_arguments_before_it_decodes_and_decodes_a_frame_once() {
+        const RED: [u8; 4] = [255, 0, 0, 255];
+        const GREEN: [u8; 4] = [0, 255, 0, 255];
+        let decodes = || super::KITTY_PNG_DECODES.with(std::cell::Cell::get);
+        let mut term = Terminal::new(24, 80);
+        term.set_cell_pixel_size(10, 20);
+        // A 2x1 header and no image data: it is stored, and it never decodes.
+        let mut header = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13];
+        header.extend_from_slice(b"IHDR");
+        header.extend_from_slice(&2u32.to_be_bytes());
+        header.extend_from_slice(&1u32.to_be_bytes());
+        term.process(&apc_g("a=t,f=100,i=7,q=2", &header));
+        let before = decodes();
+        for (control, verdict) in [
+            (
+                "a=c,i=7,r=1,c=1",
+                "EINVAL:the rectangles overlap in one frame",
+            ),
+            (
+                "a=c,i=7,r=1,c=1,w=3",
+                "EINVAL:the destination rectangle is out of bounds",
+            ),
+            (
+                "a=c,i=7,r=1,c=1,w=1,X=2",
+                "EINVAL:the source rectangle is out of bounds",
+            ),
+        ] {
+            term.process(&apc_g(control, b""));
+            assert_eq!(
+                reply(&mut term),
+                format!("\x1b_Gi=7;{verdict}\x1b\\"),
+                "{control}"
+            );
+        }
+        assert_eq!(decodes(), before, "a refused compose decodes nothing");
+        for _ in 0..3 {
+            term.process(&apc_g("a=c,i=7,r=1,c=1,w=1,x=1", b""));
+            assert!(
+                reply(&mut term).contains(";EBADPNG"),
+                "the header alone does not decode"
+            );
+        }
+        assert_eq!(
+            decodes() - before,
+            1,
+            "a frame that did not decode is not decoded again"
+        );
+
+        term.process(&apc_g("a=t,f=100,i=8,q=2", &png(2, 1, &[RED, GREEN])));
+        let before = decodes();
+        term.process(&apc_g("a=c,i=8,r=1,c=1,w=1,x=1", b""));
+        assert_eq!(reply(&mut term), "\x1b_Gi=8;OK\x1b\\");
+        assert_eq!(
+            decodes() - before,
+            1,
+            "a frame composed onto itself decodes once"
+        );
+        assert_eq!(
+            term.transient.kitty_frames[&8].frames[0].image.bytes,
+            [RED, RED].concat(),
+            "the PNG frame's (0,0) onto its own (1,0)"
+        );
+    }
+
+    #[test]
+    fn a_png_frame_is_decoded_once_however_many_commands_read_it() {
+        const RED: [u8; 4] = [255, 0, 0, 255];
+        const GREEN: [u8; 4] = [0, 255, 0, 255];
+        const BLUE: [u8; 4] = [0, 0, 255, 255];
+        let decodes = || super::KITTY_PNG_DECODES.with(std::cell::Cell::get);
+        let mut term = Terminal::new(24, 80);
+        term.set_cell_pixel_size(10, 20);
+        term.process(&apc_g("a=T,f=100,i=7,q=2", &png(2, 1, &[RED, GREEN])));
+        term.process(&apc_g("a=f,f=32,s=2,v=1,i=7,q=2", &[BLUE, BLUE].concat()));
+        let before = decodes();
+        for _ in 0..3 {
+            term.process(&apc_g("a=c,i=7,r=1,c=2,w=1,x=1", b""));
+            assert_eq!(reply(&mut term), "\x1b_Gi=7;OK\x1b\\");
+        }
+        for frame in 3..=5 {
+            term.process(&apc_g("a=f,f=32,s=1,v=1,i=7,c=1,x=1", &BLUE));
+            assert_eq!(reply(&mut term), format!("\x1b_Gi=7,r={frame};OK\x1b\\"));
+        }
+        assert_eq!(
+            decodes() - before,
+            1,
+            "six commands read the PNG frame; the first decodes it"
+        );
+        let t = &term.transient;
+        let frames = &t.kitty_frames[&7].frames;
+        assert!(matches!(
+            frames[0].image.format,
+            aterm_grid::ImageFormat::RawRgba8 {
+                width: 2,
+                height: 1
+            }
+        ));
+        assert_eq!(frames[0].image.bytes, [RED, GREEN].concat(), "same pixels");
+        assert_eq!(frames[1].image.bytes, [BLUE, RED].concat());
+        assert_eq!(frames[4].image.bytes, [RED, BLUE].concat());
+        assert!(
+            std::sync::Arc::ptr_eq(&t.kitty_images[&7], &frames[0].image),
+            "the frame shown is the one stored decoded"
+        );
+        let shown = image_at(&term, 0, 0).expect("still placed");
+        assert_eq!(shown.image.bytes, [RED, GREEN].concat());
+        assert_eq!(
+            term.transient.kitty_total_bytes,
+            super::kitty_bytes_held(&term.transient, 7),
+            "the store charges the decoded frame"
+        );
+    }
+
+    #[test]
+    fn reading_the_shown_png_frame_keeps_the_animation_clock() {
+        const RED: [u8; 4] = [255, 0, 0, 255];
+        const BLUE: [u8; 4] = [0, 0, 255, 255];
+        let at = clock();
+        let mut term = Terminal::new(24, 80);
+        term.set_cell_pixel_size(10, 20);
+        for control in [
+            "a=T,f=100,i=7,q=2",
+            "a=f,f=32,s=2,v=1,i=7,z=100,q=2",
+            "a=a,i=7,r=1,z=40",
+            "a=a,i=7,s=3",
+        ] {
+            let payload = match control.split(',').nth(1) {
+                Some("f=100") => png(2, 1, &[RED, RED]),
+                Some("f=32") => [BLUE, BLUE].concat(),
+                _ => Vec::new(),
+            };
+            term.process_at(&apc_g(control, &payload), at(0));
+        }
+        term.process_at(&apc_g("a=c,i=7,r=1,c=2,w=1,x=1,q=2", b""), at(35));
+        assert!(
+            matches!(
+                term.transient.kitty_frames[&7].frames[0].image.format,
+                aterm_grid::ImageFormat::RawRgba8 { .. }
+            ),
+            "the compose read the shown PNG frame and stored it decoded"
+        );
+        assert!(
+            term.advance_kitty_animations(at(40).monotonic).advanced,
+            "frame 1's 40 ms run from when it went up, not from the read"
+        );
+        assert_eq!(placed_frame(&term), Some(BLUE[0]));
+    }
+
+    #[test]
+    fn a_png_frame_that_does_not_decode_is_kept_and_refused_without_a_second_decode() {
+        const BLUE: [u8; 4] = [0, 0, 255, 255];
+        let decodes = || super::KITTY_PNG_DECODES.with(std::cell::Cell::get);
+        let mut term = Terminal::new(24, 80);
+        term.set_cell_pixel_size(10, 20);
+        let mut header = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13];
+        header.extend_from_slice(b"IHDR");
+        header.extend_from_slice(&2u32.to_be_bytes());
+        header.extend_from_slice(&1u32.to_be_bytes());
+        term.process(&apc_g("a=T,f=100,i=7,q=2", &header));
+        let origin = clock()(0).monotonic;
+        let before = decodes();
+        for (control, payload) in [
+            ("a=c,i=7,r=1,c=1,w=1,x=1", &[][..]),
+            ("a=f,f=32,s=1,v=1,i=7,c=1,x=1", &BLUE[..]),
+        ] {
+            for _ in 0..2 {
+                term.process(&apc_g(control, payload));
+                assert!(reply(&mut term).contains(";EBADPNG"), "{control}");
+                let carry = crate::terminal::PaneStepCarry::capture(&term, origin, 100);
+                if let Err(fault) =
+                    crate::terminal::PaneStepCarry::from_canonical(&carry.canonical())
+                {
+                    panic!("after {control}, the pane carry does not decode: {fault}");
+                }
+            }
+        }
+        assert_eq!(decodes() - before, 1, "four reads, one decode");
+        let root = &term.transient.kitty_frames[&7].frames[0].image;
+        assert!(matches!(root.format, aterm_grid::ImageFormat::Png));
+        assert_eq!(root.bytes, header, "the frame keeps its PNG");
+        term.process(&apc_g("a=f,f=32,s=2,v=1,i=7", &[BLUE, BLUE].concat()));
+        assert_eq!(
+            reply(&mut term),
+            "\x1b_Gi=7,r=2;OK\x1b\\",
+            "a whole frame needs the root's size alone, which its header still gives"
+        );
     }
 
     #[test]

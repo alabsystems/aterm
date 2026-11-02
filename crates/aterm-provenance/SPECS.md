@@ -1,42 +1,26 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-provenance: spec recovery from its 5 unit tests
+# aterm-provenance: spec recovery from its unit tests
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 3 tests it
-> deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
-> were taken before.
-
-> Status 2026-10-16: this is the crate's migration worklist. Each spec below is proved through
-> Trust/Clean against the compiled Rust function, and then the tests it subsumes are deleted.
-> Nothing has been proved or deleted yet.
-
-Source: `crates/aterm-provenance` (read only). I read every `#[test]`
-(`src/pty_wrap.rs` 3, plus 2 in an integration-test file since deleted = 5) and the code each one reaches
-(`src/pty_wrap.rs::pty_wrap_ref`, `src/provenance.rs::{Provenance, Provenance::from_pty, Provenance::as_ref}`).
-Nothing was compiled or run. The claims below come from reading the code.
-
-Result: **3 specs**, covering **5 tests**. **0 tests are not spec samples** (§4).
+Each row states a property its tests sample, so that a Trust/Clean proof against the compiled Rust
+function can retire them; none is proved yet. The code is `src/provenance.rs` (`Provenance`,
+`from_pty`, `as_ref`) and `src/pty_wrap.rs` (`pty_wrap_ref`, the crate's one `unsafe` block).
 
 ## 0. Notation used in the statements
 
-- `Prov<T>` = `aterm_provenance::Provenance<T, Pty>`: `#[repr(transparent)]` over `T`, with one other
-  field, `_origin: PhantomData<fn() -> Pty>`, a 1-aligned ZST. `Provenance<T, O>` is the same for any
-  `O: Origin`.
+- `Prov<T>` = `Provenance<T, Pty>`: `#[repr(transparent)]` over `T`; its other field,
+  `_origin: PhantomData<fn() -> Pty>`, is a 1-aligned ZST. `Provenance<T, O>` is the same for any `O: Origin`.
 - `wrap` = `pty_wrap_ref`, `inner(p)` = `Provenance::as_ref(p)` (returns `&p.value`),
   `mk` = `Provenance::from_pty`.
-- For a reference `r: &T` with `T: ?Sized`, `addr(r)` is its data pointer and `meta(r)` its pointer
-  metadata (`()` for a sized `T`, the element length for `[U]`, the byte length for `str`).
-- "`r1` is `r2`" means `addr(r1) = addr(r2) ∧ meta(r1) = meta(r2)`: the same fat pointer
-  (`core::ptr::eq` over address and metadata), hence equal contents.
-- Every spec is generic over `T`, unsized `T` included. A proof has to be per-definition (gap 11); checking
-  it only at `u8`, `[u8]` and `str` is the sampling the tests already do.
+- "`r1` is `r2`" means the same fat pointer: equal address and pointer metadata (`core::ptr::eq`).
+- Every spec is generic over `T`, unsized `T` included, and needs a per-definition proof (gap 11).
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes`, `difficulty (Rust features the proof must
-handle)`, `blocking gaps` (numbers from §7 of `docs/AUDIT-trust-for-test-migration-2026-10-15.md`; gap 0,
-the installed seal, is the prerequisite for every row).
+Columns: `id`, `kind`, `functions`, `statement`, `subsumes`, `difficulty` (Rust features the proof must
+handle), `blocking gaps` (rows of §7 of `docs/AUDIT-trust-for-test-migration-2026-10-15.md`; gap 0,
+the installed seal, blocks every row).
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking gaps
@@ -72,21 +56,22 @@ src/pty_wrap.rs	wrap_scalar_reference_preserves_identity	pty-wrap-ref-identity	f
 src/pty_wrap.rs	wrap_str_preserves_bytes	pty-wrap-ref-identity	from-pty-as-ref-roundtrip (as_ref projection), layout-transparent (unsized str)
 ```
 
-## 3. Coverage
+## 3. Tests outside the map
 
-- 5 tests read. All 5 map to one of the 3 specs.
-- `pty-wrap-ref-identity` retires 2 of the 3 tests in `src/pty_wrap.rs`, and the crate's only `unsafe`
-  block gets a proof in place of two samples (one scalar, one `str`). `layout-transparent` retires the third.
-- Once all three specs are proved and their tests deleted, the `#[cfg(test)] mod tests` in
-  `src/pty_wrap.rs` is empty and goes away.
+`src/provenance.rs::pty_slice_inspectors_preserve_provenance_and_bounds` samples the slice readers
+(`pty_slice_*`), the byte classifiers and the CSI parameter and rectangle codecs, which no row states.
 
-## 4. Tests that are not spec samples
+## 4. Where the tests fall short of the specs
 
-None. Every test samples one of the specs above.
+1. `provenance_adds_no_bytes` checks only `size_of` at three sized `T` (`u8`, `u32`, `&[u8]`, the last a
+   sized reference field): not alignment, not an unsized `Prov<[u8]>` or `Prov<str>`, and not the
+   attribute, without which the sizes would likely still match. A const assertion of size and alignment
+   at sized `T` plus `size_of_val` on `&Prov<[u8]>` and `&Prov<str>` is the faithful replacement, and
+   needs no Trust lane.
+2. The identity tests compare a thin pointer (`u8`) and `str`'s `as_ptr` and `len` separately; neither
+   tries another element type or a ZST `T`.
 
-| test | why | action |
-|---|---|---|
-| (none) | | |
+## 5. Proof order (easiest, high value first)
 
 ## 5. Implied specs that look wrong, or disagree with the code
 

@@ -141,6 +141,49 @@ impl<T, const N: usize> SmallVec<T, N> {
         }
     }
 
+    /// Keep the first `new_len` elements, dropping the suffix in place.
+    #[cfg_attr(trust_verify, trust::skip)]
+    pub fn truncate(&mut self, new_len: usize) {
+        match &mut self.data {
+            SmallVecData::Inline { buf, len } if new_len < *len => {
+                let end = (*len).min(N);
+                let start = new_len.min(end);
+                *len = start;
+                // SAFETY: start..end contains initialized elements; len is lowered
+                // before dropping, including when an element destructor unwinds.
+                unsafe { crate::drop_initialized(&mut buf[start..end]) }
+            }
+            SmallVecData::Inline { .. } => {}
+            SmallVecData::Heap(vec) => vec.truncate(new_len),
+        }
+    }
+
+    /// Insert `value` at `index`, shifting the following elements right.
+    /// # Panics
+    /// Panics if `index > len()`.
+    pub fn insert(&mut self, index: usize, value: T) {
+        assert!(
+            index <= self.len(),
+            "index out of bounds: {index} > {}",
+            self.len()
+        );
+        self.push(value);
+        self.as_mut_slice()[index..].rotate_right(1);
+    }
+
+    /// Remove and return the element at `index`, shifting the following elements left.
+    /// # Panics
+    /// Panics if `index >= len()`.
+    pub fn remove(&mut self, index: usize) -> T {
+        assert!(
+            index < self.len(),
+            "index out of bounds: {index} >= {}",
+            self.len()
+        );
+        self.as_mut_slice()[index..].rotate_left(1);
+        self.pop().expect("the checked index names an element")
+    }
+
     /// Remove the element at `index` by swapping it with the last element.
     ///
     /// # Panics
@@ -259,14 +302,31 @@ impl<T, const N: usize> SmallVec<T, N> {
     fn ensure_heap(&mut self) {
         if let SmallVecData::Inline { buf, len } = &mut self.data {
             let current_len = if *len < N { *len } else { N };
-            let mut vec = Vec::with_capacity(current_len.max(N) * 2);
-            // SAFETY: Elements 0..current_len are initialized.
+            let mut vec = Vec::with_capacity(heap_spill_capacity::<T>(current_len, N));
+            *len = 0;
+            // SAFETY: Elements 0..current_len were initialized when pushed, and `*len` is
+            // already 0 so dropping `self` cannot drop them again.
             for elem in &buf[..current_len] {
                 vec.push(unsafe { elem.assume_init_read() });
             }
-            *len = 0;
             self.data = SmallVecData::Heap(vec);
         }
+    }
+}
+
+#[inline]
+const fn heap_spill_capacity<T>(current_len: usize, inline_cap: usize) -> usize {
+    if core::mem::size_of::<T>() == 0 {
+        0
+    } else {
+        let base = if current_len > inline_cap {
+            current_len
+        } else {
+            inline_cap
+        };
+        let max_cap = (isize::MAX as usize) / core::mem::size_of::<T>();
+        let doubled = base.saturating_mul(2);
+        if doubled < max_cap { doubled } else { max_cap }
     }
 }
 
@@ -510,6 +570,35 @@ impl<'a, T, const N: usize> IntoIterator for &'a mut SmallVec<T, N> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ordered_edits_match_vec<const N: usize>() {
+        for len in 0..8 {
+            for at in 0..=len {
+                let mut actual = SmallVec::<usize, N>::new();
+                let mut expected: Vec<_> = (0..len).collect();
+                for value in &expected {
+                    actual.push(*value);
+                }
+                actual.insert(at, 99);
+                expected.insert(at, 99);
+                assert_eq!(actual.as_slice(), expected);
+                assert_eq!(actual.remove(at), expected.remove(at));
+                assert_eq!(actual.as_slice(), expected);
+                for keep in (0..=len + 1).rev() {
+                    actual.truncate(keep);
+                    expected.truncate(keep);
+                    assert_eq!(actual.as_slice(), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordered_edits_match_vec_before_and_after_spilling() {
+        ordered_edits_match_vec::<0>();
+        ordered_edits_match_vec::<1>();
+        ordered_edits_match_vec::<4>();
+    }
     use std::format;
     use std::string::{String, ToString};
     use std::vec::Vec;
@@ -551,6 +640,15 @@ mod tests {
         assert_eq!(it.next_back(), Some(3));
         assert_eq!(it.next(), None);
         assert_eq!(it.next_back(), None);
+        assert_eq!(
+            heap_spill_capacity::<()>((usize::MAX / 2) + 1, usize::MAX),
+            0
+        );
+        assert_eq!(heap_spill_capacity::<i32>(4, 4), 8);
+        assert_eq!(
+            heap_spill_capacity::<u8>((isize::MAX as usize / 2) + 1, (isize::MAX as usize / 2) + 1),
+            isize::MAX as usize
+        );
     }
 
     fn drops_each_once<const N: usize>(len: usize, front: usize, back: usize) {

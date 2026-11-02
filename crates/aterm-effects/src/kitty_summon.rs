@@ -159,7 +159,11 @@ impl TypedKittySummon {
         self.keys_typed = self.keys_typed.saturating_add(1);
         self.buf.push(ch);
         self.trim();
-        if !(aterm_lexicon::is_token_char(ch) || aterm_lexicon::is_no_space_script(ch)) {
+        if ch.is_ascii() {
+            if !(ch.is_ascii_alphanumeric() || ch == '_') {
+                return TypedHit::NONE;
+            }
+        } else if !(aterm_lexicon::is_token_char(ch) || aterm_lexicon::is_no_space_script(ch)) {
             return TypedHit::NONE;
         }
         let start = Self::trailing_scan_start(&self.buf, ch);

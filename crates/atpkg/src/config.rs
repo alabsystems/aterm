@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Maximum `aterm.toml` size read, matching the native config service's 512 KiB budget.
-pub const MAX_PACKAGES_CONFIG_BYTES: usize = 512 * 1024;
+pub const MAX_PACKAGES_CONFIG_BYTES: usize = aterm_toolchain::discovery::MAX_ATERM_CONFIG_BYTES;
 
 /// The one channel whose pin set drives install/update.
 pub const CHANNEL: &str = "stable";
@@ -1216,6 +1216,44 @@ mod tests {
             .unwrap();
         assert!(load_from_path(&path).exclude().is_empty());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Store discovery must honour the same admitted config as the package reader, including
+    /// a prefix after a large valid comment. A file beyond their shared budget remains refused.
+    #[cfg(any(debug_assertions, feature = "dev-seams"))]
+    #[test]
+    fn store_discovery_reads_a_prefix_through_the_full_config_budget() {
+        let root = crate::testdir::dir("atpkg-discovery-config-budget-");
+        let home = root.join("home");
+        let xdg = root.join("config");
+        let path = xdg.join("aterm/aterm.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let settings = "[packages]\nprefix = '~/.configured-store'\n";
+        let expected = home.join(".configured-store");
+        for bytes in [settings.len(), super::MAX_PACKAGES_CONFIG_BYTES] {
+            let body = if bytes == settings.len() {
+                settings.to_string()
+            } else {
+                format!("#{}\n{settings}", "x".repeat(bytes - settings.len() - 2))
+            };
+            assert_eq!(body.len(), bytes);
+            std::fs::write(&path, &body).unwrap();
+            let admitted = super::load_live(&path).expect("admitted package config");
+            assert_eq!(admitted.prefix.as_deref(), Some("~/.configured-store"));
+            assert_eq!(
+                aterm_toolchain::discovery::atpkg_prefix(&home, Some(&xdg)),
+                expected,
+                "the actual package reader admits this {bytes}-byte config"
+            );
+        }
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len((super::MAX_PACKAGES_CONFIG_BYTES + 1) as u64)
+            .unwrap();
+        assert!(super::load_live(&path).is_none());
+        assert_eq!(
+            aterm_toolchain::discovery::atpkg_prefix(&home, Some(&xdg)),
+            aterm_toolchain::discovery::default_atpkg_prefix(&home)
+        );
     }
 
     /// `[reroute].announce` defaults on, `false` silences, and a table that does not parse announces.

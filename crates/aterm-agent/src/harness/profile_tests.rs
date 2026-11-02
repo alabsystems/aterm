@@ -1934,6 +1934,34 @@ fn a_muse_login_store_names_its_account_alone() {
         muse_sub(&["muse", "--", "--provider", "echo"], &env).is_some(),
         "a prompt's words are not its flags"
     );
+    assert!(
+        muse_sub(&["muse", "-c", "--", "--provider", "echo"], &env).is_some(),
+        "a flag before `--` does not consume `--` and parse the prompt"
+    );
+    assert!(
+        muse_sub(&["muse", "--preset", "--provider", "--", "echo"], &env).is_some(),
+        "a value of another root option is not read as --provider"
+    );
+    assert!(
+        muse_sub(&["muse", "--base-url", "-cprovider=echo"], &env).is_some(),
+        "a value of another root option is not read as -c"
+    );
+    assert!(
+        muse_sub(
+            &["muse"],
+            &["HOME=".to_owned(), format!("HOME={}", home.display())],
+        )
+        .is_some(),
+        "an earlier empty HOME= entry does not shadow a non-empty HOME"
+    );
+    assert!(
+        muse_sub(&["muse"], &["HOME=relative/home".to_owned()]).is_some(),
+        "a relative HOME falls back to user_home"
+    );
+    assert!(
+        muse_sub(&["-cprovider=echo"], &env).is_some(),
+        "argv[0] is the executable name, not a flag"
+    );
     let settings = store.join("settings.json");
     std::fs::write(&settings, r#"{"provider":"echo"}"#).expect("settings");
     assert_eq!(muse_sub(&["muse"], &env), None, "its settings' provider");
@@ -2088,6 +2116,15 @@ I1022 09:30:56.364166 375 server_oauth.go:224] applyAuthResult: email=interviews
     assert_eq!(
         parse_agy_auth_log(log_bytes).as_deref(),
         Some("interviewstreetuser@gmail.com")
+    );
+    let mut partial_auth = log_bytes.to_vec();
+    partial_auth.extend_from_slice(
+        b"I1022 09:31:00.000000 375 server_oauth.go:224] applyAuthResult: email=truncated@gmail.com, authM",
+    );
+    assert_eq!(
+        parse_agy_auth_log(&partial_auth).as_deref(),
+        Some("interviewstreetuser@gmail.com"),
+        "a tail auth line truncated mid-write falls back to the previous complete line"
     );
     let usage_json = br#"{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{"name":"Gemini Models","buckets":[{"id":"gemini-weekly","name":"Weekly Limit Remaining","window":"weekly","remaining_fraction":0.782786,"reset_time":"2026-10-29T16:31:22Z"}]},{"name":"Claude and GPT models","buckets":[{"id":"3p-weekly","name":"Weekly Limit Remaining","window":"weekly","remaining_fraction":1.0,"reset_time":"2026-10-31T00:51:20Z"}]}]}}}"#;
     let now = 1_792_796_000;
@@ -2298,15 +2335,9 @@ I1022 09:30:56.364166 375 server_oauth.go:224] applyAuthResult: email=interviews
             (now, None),
         );
     }
-    let switched_bucket = agy_subscription_for(
-        &argv,
-        &env,
-        &home,
-        &expired_prev,
-        Some("Claude Opus 4.6"),
-        now,
-    )
-    .expect("switched model bucket");
+    let switched_bucket =
+        agy_subscription_for(&argv, &env, &home, &expired_prev, Some("Opus 5.5"), now)
+            .expect("switched model bucket");
     assert_eq!(
         switched_bucket.email.as_deref(),
         Some("interviewstreetuser@gmail.com")
@@ -2345,11 +2376,35 @@ fn agy_and_muse_model_effort_read_argv_settings_and_log() {
         parse_agy_model_label("Claude Sonnet 4.6"),
         Some(("Claude Sonnet 4.6".to_owned(), None))
     );
+    assert_eq!(
+        parse_agy_model_label("claude-opus-5-5-medium"),
+        Some(("Opus 5.5".to_owned(), Some("medium".to_owned())))
+    );
+    assert_eq!(
+        parse_agy_model_label("gemini-4-argon-high"),
+        Some(("gemini-4-argon-high".to_owned(), Some("high".to_owned())))
+    );
 
     let log = b"I1023 17:50:20.231653 404 model_config_manager.go:340] Propagating selected model override to backend: label=\"Gemini 4 Argon (High)\"\n";
     assert_eq!(
         parse_agy_model_log(log),
         Some(("Gemini 4 Argon".to_owned(), Some("high".to_owned())))
+    );
+    assert_eq!(
+        parse_agy_model_log(
+            b"I1023 17:50:20.231653 404 model_config_manager.go:340] Propagating selected model override to backend: label=\"Gemini 4"
+        ),
+        None,
+        "an unclosed quote on a truncated log line is rejected"
+    );
+    let mut log_with_truncated_tail = log.to_vec();
+    log_with_truncated_tail.extend_from_slice(
+        b"I1023 17:51:00.000000 404 model_config_manager.go:340] Propagating selected model override to backend: label=\"Claude Opus 4.6",
+    );
+    assert_eq!(
+        parse_agy_model_log(&log_with_truncated_tail),
+        Some(("Gemini 4 Argon".to_owned(), Some("high".to_owned()))),
+        "a truncated tail model log line falls back to the previous complete line"
     );
 
     let dir = tmp_dir("agy-model-effort");
@@ -2373,14 +2428,54 @@ fn agy_and_muse_model_effort_read_argv_settings_and_log() {
         )
     );
 
-    // Pinned on argv closes model_open and effort_open (including Go single-dash flags).
+    // Pinned on argv closes model_open and effort_open (including Go single-dash flags,
+    // and after `-c` which is agy's `--continue` switch rather than muse's `--config`).
     let pinned = vec![
         "agy".to_owned(),
+        "-c".to_owned(),
         "-model=Claude Opus 4.6".to_owned(),
         "-effort=max".to_owned(),
     ];
     assert_eq!(
         agy_model_effort_for(&pinned, &env, &home),
+        (
+            Some("Claude Opus 4.6".to_owned()),
+            Some("max".to_owned()),
+            false,
+            false
+        )
+    );
+    // A value of another value-taking agy flag (`-i`) is not misread as `--model` or `--effort`.
+    assert_eq!(
+        agy_model_effort_for(
+            &[
+                "agy".to_owned(),
+                "-i".to_owned(),
+                "--model=Claude Opus 4.6".to_owned(),
+            ],
+            &env,
+            &home,
+        ),
+        (
+            Some("Gemini 4 Argon".to_owned()),
+            Some("high".to_owned()),
+            true,
+            true
+        )
+    );
+
+    // Agy's `-c` is its continue switch, not Muse's config spec: it must not
+    // swallow the `--model` flag that follows it.
+    let continued = vec![
+        "agy".to_owned(),
+        "-c".to_owned(),
+        "--model".to_owned(),
+        "Claude Opus 4.6".to_owned(),
+        "--effort".to_owned(),
+        "max".to_owned(),
+    ];
+    assert_eq!(
+        agy_model_effort_for(&continued, &env, &home),
         (
             Some("Claude Opus 4.6".to_owned()),
             Some("max".to_owned()),
@@ -2468,6 +2563,45 @@ fn agy_and_muse_model_effort_read_argv_settings_and_log() {
             false,
             false
         )
+    );
+    assert_eq!(
+        muse_model_effort_for(
+            &[
+                "muse".to_owned(),
+                "-c".to_owned(),
+                "--".to_owned(),
+                "--model=Claude Opus 4.6".to_owned(),
+                "--effort=max".to_owned(),
+            ],
+            &env,
+            &home
+        ),
+        (
+            Some("Muse Spark".to_owned()),
+            Some("medium".to_owned()),
+            true,
+            true
+        ),
+        "a flag before `--` does not consume `--` and treat prompt tokens as model/effort flags"
+    );
+    assert_eq!(
+        muse_model_effort_for(
+            &[
+                "muse".to_owned(),
+                "--preset".to_owned(),
+                "--model".to_owned(),
+                "Claude Opus 4.6".to_owned(),
+            ],
+            &env,
+            &home
+        ),
+        (
+            Some("Muse Spark".to_owned()),
+            Some("medium".to_owned()),
+            true,
+            true
+        ),
+        "a value of another value-taking muse flag is not misread as --model"
     );
 
     let cid = "dfaaf1c5-98ff-4412-9226-76412af952a5";
@@ -2659,11 +2793,11 @@ fn agy_and_muse_model_effort_read_argv_settings_and_log() {
             Some(&[std::fs::canonicalize(muse_dir.join(".session.lock")).unwrap()])
         )
         .as_deref(),
-        Some(format!("muse resume {muse_sid}").as_str())
+        Some(format!("muse --contributor-mode off resume {muse_sid}").as_str())
     );
     assert_eq!(
         muse_resume_for(0, &muse_resumed_argv, &env, &home, None).as_deref(),
-        Some(format!("muse resume {muse_old_sid}").as_str()),
+        Some(format!("muse --contributor-mode off resume {muse_old_sid}").as_str()),
         "without an observed lock the explicit launch UUID remains available"
     );
     let (muse_exc, muse_len) = muse_excerpts_for(
@@ -2931,7 +3065,11 @@ fn agy_jsonl_tail_reads_only_regular_files_with_the_same_window() {
     let env = vec![format!("XDG_DATA_HOME={}", data.display())];
     let resume = || muse_resume_for(4242, &argv, &env, dir.path(), Some(&files.borrow()));
     let excerpts = || muse_excerpts_for(4242, &argv, &env, dir.path(), Some(&files.borrow()));
-    assert!(resume().unwrap().ends_with(&format!("muse resume {sid_a}")));
+    assert!(
+        resume()
+            .unwrap()
+            .ends_with(&format!("muse --contributor-mode off resume {sid_a}"))
+    );
     assert_eq!(
         excerpts().unwrap().0.said.as_deref(),
         Some("own Muse reply")
@@ -2950,7 +3088,7 @@ fn agy_jsonl_tail_reads_only_regular_files_with_the_same_window() {
             Some(std::slice::from_ref(&other_lock))
         )
         .unwrap()
-        .ends_with(&format!("muse resume {sid_b}"))
+        .ends_with(&format!("muse --contributor-mode off resume {sid_b}"))
     );
     assert_eq!(
         muse_excerpts_for(
@@ -3001,7 +3139,7 @@ fn agy_jsonl_tail_reads_only_regular_files_with_the_same_window() {
     assert!(
         muse_resume_for(0, &explicit_a, &env, dir.path(), None)
             .unwrap()
-            .ends_with(&format!("muse resume {sid_a}"))
+            .ends_with(&format!("muse --contributor-mode off resume {sid_a}"))
     );
     assert!(muse_excerpts_for(0, &explicit_a, &env, dir.path(), None).is_none());
 }
@@ -3040,7 +3178,11 @@ fn no_weekly_gap_tells_the_person_to_act() {
                 assert!(!lower.contains(asks), "{gap:?}: {said:?} asks {asks:?}");
             }
         }
-        assert!(gap.words().starts_with("weekly ? "), "{gap:?}");
+        assert!(
+            gap.words().starts_with("weekly \u{2013} \u{b7} "),
+            "{gap:?}"
+        );
+        assert!(!gap.words().contains('?'), "never a bare `?`: {gap:?}");
         assert!(gap.spoken().starts_with("weekly figure unknown"), "{gap:?}");
     }
 }

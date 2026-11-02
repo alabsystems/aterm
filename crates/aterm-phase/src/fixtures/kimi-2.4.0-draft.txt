@@ -1,0 +1,21 @@
+# kimi 2.4.0 · MEASURED 2026-10-29, `aterm ctl text` of a private headless aterm (110x32, aterm 0.146.0) running the real Kimi Code, launched by path with a scratch `HOME` and `KIMI_CODE_HOME` whose `config.toml` names one `openai`-type provider at `http://127.0.0.1:<port>/v1` with a fake key (a local stub of the Chat Completions API, crates/aterm-lab), no login · `lab draft one` typed and unsent in the composer
+
+ ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │                                                                                                          │
+ │  ▐█▛█▛█▌  Welcome to Kimi Code!                                                                          │
+ │  ▐█████▌  Send /help for help information.                                                               │
+ │                                                                                                          │
+ │  Directory: /private/tmp/at.H2aa/proj                                                                    │
+ │  Session:                                                                                                │
+ │  Model:     lab-model                                                                                    │
+ │  Version:   2.4.0                                                                                        │
+ │                                                                                                          │
+ ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+   No session yet — one will be created on your first message.
+
+ ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │ > lab draft one                                                                                          │
+ ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ lab-model  …/tmp/at.H2aa/proj
+                                                                                        context: 0% (0/97.7k)

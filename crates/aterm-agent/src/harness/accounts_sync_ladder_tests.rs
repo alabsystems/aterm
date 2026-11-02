@@ -143,6 +143,218 @@ fn attempt_of(desk: &Desk, label: &str) -> Option<accounts::SignInAttempt> {
         .and_then(|b| b.sign_in_attempt.clone())
 }
 
+#[cfg(unix)]
+#[test]
+fn a_repaired_profile_reopens_the_ladder_inside_its_wrong_account_wait_and_backoff() {
+    let desk = Desk::new("m30");
+    hand_roster(&desk, false);
+    let store = desk.store();
+    fs::create_dir_all(crate::harness::headless_oauth::browser_profile_dir(
+        &store.dir,
+        Some("w3"),
+    ))
+    .unwrap();
+    store
+        .transact_logins(NOW, &mut None, |state, logins| {
+            let mut events = accounts::note_auth(state, "w3", accounts::Auth::SignedOut, NOW);
+            events.extend(accounts::note_wrong_account(logins, "w3", NOW));
+            Ok(events)
+        })
+        .unwrap();
+    assert!(latest_mailbox_mtime(Some(&desk.home), &store).is_none());
+    let bench = Bench {
+        browser: true,
+        ..Bench::ending(Renewal::Failed)
+    };
+    assert!(!bench.pass(&desk, NOW));
+    assert!(bench.handed().is_empty());
+    assert_eq!(
+        attempt_of(&desk, "w3").unwrap().outcome,
+        accounts::AttemptOutcome::NoRoute
+    );
+    {
+        let mut guard = bench.guard.lock().unwrap();
+        let clock = Instant::now();
+        assert!(guard.ladder.retry_at("w3", clock).is_some());
+        guard.last_attempt.insert("w3".into(), clock);
+        guard.parked.insert("w3".into(), clock);
+        guard.bot_checked.insert("w3".into(), clock);
+    }
+    store
+        .transact_logins(NOW + 1, &mut None, |_, _| {
+            Ok(vec![
+                accounts::Event::new(NOW + 1, accounts::Kind::SignIn, "w3")
+                    .because("claude.ai window done session-kept"),
+            ])
+        })
+        .unwrap();
+
+    assert!(
+        bench.pass(&desk, NOW + 2),
+        "the repaired profile starts a fresh check"
+    );
+    assert!(matches!(
+        bench.handed().as_slice(),
+        [RenewBrowser::Remote { .. }]
+    ));
+    let (state, _) = store.load(NOW + 2).unwrap();
+    let (logins, _) = store.load_logins(NOW + 2).unwrap();
+    assert_eq!(state.account("w3").auth, accounts::Auth::SignedOut);
+    assert_eq!(logins.get("w3").unwrap().wrong_at, Some(NOW));
+    assert_eq!(
+        attempt_of(&desk, "w3").unwrap().outcome,
+        accounts::AttemptOutcome::Failed
+    );
+    assert!(
+        !bench.pass(&desk, NOW + 3),
+        "the new attempt has its own backoff"
+    );
+    assert_eq!(bench.handed().len(), 1);
+}
+
+#[test]
+fn a_repaired_profile_reopens_non_ladder_admission_inside_the_wrong_account_wait() {
+    for repaired in [false, true] {
+        let desk = Desk::new("m30");
+        hand_roster(&desk, false);
+        let store = desk.store();
+        fs::create_dir_all(crate::harness::headless_oauth::browser_profile_dir(
+            &store.dir,
+            Some("w3"),
+        ))
+        .unwrap();
+        let browser = desk.home.join(
+            ".cache/aterm/browser.noindex/chrome-headless-shell-fixture/chrome-headless-shell",
+        );
+        fs::create_dir_all(browser.parent().unwrap()).unwrap();
+        fs::write(browser, b"inert browser marker; no queued work is run").unwrap();
+        store
+            .transact_logins(NOW, &mut None, |state, logins| {
+                let mut events = accounts::note_auth(state, "w3", accounts::Auth::SignedOut, NOW);
+                events.extend(accounts::note_wrong_account(logins, "w3", NOW));
+                if repaired {
+                    events.push(
+                        accounts::Event::new(NOW + 1, accounts::Kind::SignIn, "w3")
+                            .because("claude.ai window quit session-unknown"),
+                    );
+                }
+                Ok(events)
+            })
+            .unwrap();
+        assert!(latest_mailbox_mtime(Some(&desk.home), &store).is_none());
+        let raw = Roster::load(&desk.roster()).unwrap();
+        let logins = store.load_logins(NOW + 2).unwrap().0;
+        let row = accounts::bound(&raw, &logins).row("w3").unwrap().clone();
+        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let queued_work = Arc::clone(&queued);
+        let spawn = move |work: Box<dyn FnOnce() + Send>| {
+            queued_work.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            drop(work);
+            Ok(())
+        };
+        let admitted = spawn_row_renewal(
+            Cli::Claude,
+            &desk.home,
+            &desk.state,
+            &desk.roster(),
+            raw,
+            &logins,
+            row,
+            (None, false),
+            NOW + 2,
+            &guard,
+            &spawn,
+            None,
+        );
+        assert_eq!(admitted.progressed(), repaired);
+        assert_eq!(
+            queued.load(std::sync::atomic::Ordering::SeqCst),
+            usize::from(repaired)
+        );
+        assert_eq!(store.load_logins(NOW + 2).unwrap().0, logins);
+        assert_eq!(
+            store.load(NOW + 2).unwrap().0.account("w3").auth,
+            accounts::Auth::SignedOut
+        );
+    }
+}
+
+#[test]
+fn a_browser_completion_at_its_tasks_timestamp_still_answers_that_task() {
+    let desk = Desk::new("m30");
+    let store = desk.store();
+    store
+        .transact_logins(NOW, &mut None, |_, logins| {
+            accounts::note_sign_in_task(logins, "w3", accounts::SignInAction::Browser, NOW);
+            Ok(vec![
+                accounts::Event::new(NOW, accounts::Kind::SignIn, "w3")
+                    .because("claude.ai window done session-unknown"),
+            ])
+        })
+        .unwrap();
+    let logins = store.load_logins(NOW).unwrap().0;
+    assert_eq!(
+        browser_window_signed_in_token(&store, "w3", NOW),
+        Some((NOW, 1))
+    );
+    assert_eq!(unaddressed_sign_in_task_at(&store, &logins, "w3"), None);
+}
+
+#[test]
+fn a_damaged_ledger_suffix_cannot_leave_an_earlier_browser_completion_usable() {
+    let desk = Desk::new("m30");
+    let store = desk.store();
+    let accepted = accounts::Event::new(NOW, accounts::Kind::SignIn, "w3")
+        .because("claude.ai window done session-kept");
+    store.append(std::slice::from_ref(&accepted)).unwrap();
+    assert_eq!(
+        browser_window_signed_in_token(&store, "w3", NOW),
+        Some((NOW, 1))
+    );
+    let prefix = fs::read(store.ledger_path()).unwrap();
+    for suffix in [
+        "not an event\n".to_owned(),
+        "{\"t\":".to_owned(),
+        format!(
+            r#"{{"t":{},"kind":"sign-in","account":"w3","why":7}}"#,
+            NOW + 1
+        ),
+    ] {
+        let mut damaged = prefix.clone();
+        damaged.extend_from_slice(suffix.as_bytes());
+        fs::write(store.ledger_path(), damaged).unwrap();
+        let paths = [
+            store.state_file(),
+            store.state_witness_file(),
+            store.logins_file(),
+            store.logins_witness_file(),
+            store.ledger_path(),
+            store.wake_path(),
+        ];
+        let before = paths.each_ref().map(|path| fs::read(path).ok());
+        assert!(store.tail(10).unwrap().contains(&accepted));
+        assert_eq!(
+            store.tail_validated(10).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(browser_window_signed_in_token(&store, "w3", NOW), None);
+        assert_eq!(paths.each_ref().map(|path| fs::read(path).ok()), before);
+    }
+    let mut legacy = prefix;
+    legacy.extend_from_slice(
+        format!(r#"{{"t":{},"kind":"sign-in","account":"w3"}}"#, NOW + 1).as_bytes(),
+    );
+    fs::write(store.ledger_path(), &legacy).unwrap();
+    assert_eq!(store.tail_validated(10).unwrap().last().unwrap().why, "");
+    assert_eq!(browser_window_signed_in_token(&store, "w3", NOW), None);
+    assert_eq!(fs::read(store.ledger_path()).unwrap(), legacy);
+}
+
+/// Unix only, where aterm links the opener an unattended run's page is handed to
+/// (`cli::opener_link`); off Unix `an_unattended_run_is_handed_nothing_where_aterm_links_no_opener`
+/// holds what runs.
+#[cfg(unix)]
 #[test]
 fn an_expired_retry_keeps_its_owner_when_another_sign_in_is_running() {
     let desk = Desk::new("m30");
@@ -524,6 +736,11 @@ fn a_replaced_login_stops_the_automatic_retry_and_failure_summary() {
 /// profile, the default browser) is tried in its place. The run that failed is on record with
 /// its route, how it ended and every route read, is one log line, and sets the row's backoff:
 /// the next pass, past the sign-in cooldown, starts nothing and logs nothing.
+///
+/// Unix only, where aterm links the opener an unattended run's page is handed to
+/// (`cli::opener_link`); off Unix `an_unattended_run_is_handed_nothing_where_aterm_links_no_opener`
+/// holds what runs.
+#[cfg(unix)]
 #[test]
 fn an_unattended_run_is_never_handed_a_window_and_its_failure_is_on_record_and_held() {
     let desk = Desk::new("m30");
@@ -571,9 +788,53 @@ fn an_unattended_run_is_never_handed_a_window_and_its_failure_is_on_record_and_h
     assert_eq!(bench.logged(), lines, "nothing logged while held");
 }
 
+/// Off Unix aterm links no opener for a sign-in's page (`cli::opener_link`), so an unattended
+/// run is handed no browser at all, never a window in its place: the row is not signed in, its
+/// failure is one log line saying why, and the row's backoff holds the next pass.
+#[cfg(not(unix))]
+#[test]
+fn an_unattended_run_is_handed_nothing_where_aterm_links_no_opener() {
+    let desk = Desk::new("m30");
+    hand_roster(&desk, true);
+    fs::create_dir_all(crate::harness::headless_oauth::browser_profile_dir(
+        &desk.store().dir,
+        Some("w3"),
+    ))
+    .unwrap();
+    let bench = Bench {
+        browser: true,
+        ..Bench::ending(Renewal::Renewed)
+    };
+    assert!(bench.pass(&desk, NOW), "the profile route started");
+    assert!(bench.handed().is_empty(), "{:?}", bench.handed());
+    assert_ne!(
+        attempt_of(&desk, "w3").map(|a| a.outcome),
+        Some(accounts::AttemptOutcome::SignedIn)
+    );
+    let lines = bench.logged();
+    let failed: Vec<&String> = lines
+        .iter()
+        .filter(|l| {
+            l.contains(
+                "account w3: automatic sign-in failed: profile: no opener link could be made",
+            )
+        })
+        .collect();
+    assert_eq!(failed.len(), 1, "{lines:?}");
+
+    bench.cool();
+    assert!(!bench.pass(&desk, NOW + 60), "the backoff holds");
+    assert_eq!(bench.logged(), lines, "nothing logged while held");
+}
+
 /// On a vault member whose subscriber rewrites `state.toml` to say when it last heard the vault,
 /// a row whose mailbox route ran and failed stays in its backoff: the rewrite delivered nothing.
 /// A file the vault delivers to `~/.secrets` ends the backoff at once.
+///
+/// Unix only, where aterm links the opener an unattended run's page is handed to
+/// (`cli::opener_link`); off Unix `an_unattended_run_is_handed_nothing_where_aterm_links_no_opener`
+/// holds what runs.
+#[cfg(unix)]
 #[test]
 fn the_vaults_own_bookkeeping_never_ends_a_backoff_and_a_delivery_does() {
     let desk = Desk::new("m30");
@@ -639,6 +900,11 @@ fn the_vaults_own_bookkeeping_never_ends_a_backoff_and_a_delivery_does() {
 /// among them; a row no session needs yet is signed in only where Claude Code's own files show
 /// its account, never for an address only a credential names. CONTROL: the row a Claude Code
 /// backup shows is signed in.
+///
+/// Unix only, where aterm links the opener an unattended run's page is handed to
+/// (`cli::opener_link`); off Unix `an_unattended_run_is_handed_nothing_where_aterm_links_no_opener`
+/// holds what runs.
+#[cfg(unix)]
 #[test]
 fn a_row_only_a_credential_names_is_not_signed_in_before_a_session_needs_it() {
     let desk = Desk::new("m27");
@@ -692,6 +958,11 @@ fn a_row_only_a_credential_names_is_not_signed_in_before_a_session_needs_it() {
 
 /// `[harness] logins = "off"` stops the ladder: a window's upkeep starts no sign-in and records
 /// none. CONTROL: with the switch as it ships, the same upkeep starts one.
+///
+/// Unix only, where aterm links the opener an unattended run's page is handed to
+/// (`cli::opener_link`); off Unix `an_unattended_run_is_handed_nothing_where_aterm_links_no_opener`
+/// holds what runs.
+#[cfg(unix)]
 #[test]
 fn a_person_turning_logins_off_stops_the_ladder() {
     for logins in ["off", "renew"] {

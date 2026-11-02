@@ -67,6 +67,125 @@ fn each_door_serves_its_record() {
 }
 
 #[test]
+fn replay_reports_typed_metadata_and_task_acts_with_their_exact_authority() {
+    use crate::harness::contract::Scope;
+    use crate::supervise::Ctl;
+    use crate::supervise::tape::ctl;
+
+    struct NoLiveCtl;
+    impl Ctl for NoLiveCtl {
+        fn call(&mut self, _: &[&str]) -> Result<CtlReply, String> {
+            panic!("a report fixture never calls a live host")
+        }
+    }
+    let mut no_live = NoLiveCtl;
+    let setup = Session::new(&mut no_live, Some("@s-1".to_string()))
+        .setup()
+        .clone();
+    let header = Header::capture(
+        "typed-report",
+        Entry::Hosted,
+        None,
+        &setup,
+        &SuperviseOpts::default(),
+    );
+    let cases: [(Scope, u64, &[&str]); 5] = [
+        (
+            Scope::Questions,
+            41,
+            &["@s-1", "meta", "set", "attention", "question"],
+        ),
+        (Scope::TurnEnd, 42, &["@s-1", "meta", "unset", "attention"]),
+        (Scope::TurnEnd, 43, &["@s-1", "task", "mark", "done"]),
+        (
+            Scope::TurnEnd,
+            44,
+            &["@s-1", "meta", "set", "supervisor", "holder"],
+        ),
+        (Scope::Walls, 45, &["@s-1", "status"]),
+    ];
+    let reply = Some(Ok(CtlReply {
+        code: 0,
+        stdout: "OK\n".to_string(),
+        stderr: String::new(),
+    }));
+    let mut records = Vec::new();
+    let mut expected = Vec::new();
+    for (scope, revision, argv) in cases {
+        records.push(exchange(
+            doors::CTL_DUTY,
+            &ctl::duty_request(scope, revision, argv),
+            &ctl::encoded_reply(doors::CTL_DUTY, reply.clone()),
+        ));
+        let mut words: Vec<String> = argv.iter().map(|word| (*word).to_string()).collect();
+        words.extend([
+            format!("harness-duty={}", scope.word()),
+            format!("if-supervisor-revision={revision}"),
+        ]);
+        expected.push(words);
+    }
+    records.push(exchange(
+        doors::CTL,
+        &codec::ctl_request(&["@s-1", "key", "1"]),
+        &ctl::encoded_reply(doors::CTL, reply),
+    ));
+    expected.push(vec!["@s-1".to_string(), "key".to_string(), "1".to_string()]);
+    let end = End::Returned {
+        how: "done".to_string(),
+    };
+    for acts in [false, true] {
+        let core = if acts {
+            ReplayCore::start_acts(
+                records.clone(),
+                vec![None; records.len()],
+                VERBATIM,
+                VERBATIM,
+                "test",
+                None,
+            )
+        } else {
+            core_of(records.clone())
+        };
+        for record in &records {
+            let EffectRecord::Exchange {
+                door,
+                request,
+                reply,
+            } = record
+            else {
+                unreachable!()
+            };
+            assert_eq!(core.exchange(door, request), *reply);
+        }
+        let report = if acts {
+            core.report_acts(
+                &header,
+                Ok("done".to_string()),
+                Some(&end),
+                None,
+                None,
+                &Candidate::default(),
+            )
+        } else {
+            core.report(&header, Ok("done".to_string()), Some(&end), None, None)
+        };
+        assert_eq!(report.verdict, Verdict::Reproduced);
+        assert_eq!(report.requests, expected, "acts={acts}");
+        let rendered = report.render();
+        let acts_shown: Vec<&str> = rendered
+            .lines()
+            .filter_map(|line| line.strip_prefix("  > "))
+            .collect();
+        let expected_acts: Vec<String> = expected[..3]
+            .iter()
+            .chain(&expected[5..])
+            .map(|words| words.join(" "))
+            .collect();
+        assert_eq!(acts_shown, expected_acts, "acts={acts}:\n{rendered}");
+    }
+}
+
+#[test]
 fn an_acts_row_replays_in_the_boot_spelling_its_tape_recorded() {
     use crate::supervise::approvals::{Ledger, Outcome, Row};
     use crate::supervise::policy::sleeps::{Boot, SleepStamp};

@@ -1,0 +1,33 @@
+# kimi 2.4.0 · MEASURED 2026-10-29, `aterm ctl text` of a private headless aterm (110x32, aterm 0.146.0) running the real Kimi Code, launched by path with a scratch `HOME` and `KIMI_CODE_HOME` whose `config.toml` names one `openai`-type provider at `http://127.0.0.1:<port>/v1` with a fake key (a local stub of the Chat Completions API, crates/aterm-lab), no login · Ctrl-C about 4 s into a held turn: `Interrupted by user` under the person's message, the spinner gone, the composer empty
+ ❯ lab draft one
+
+ ● lab held reply, sent after 30 s
+
+ ❯ lab line one
+   lab line two
+   lab line three
+
+ ● Hi! I am the local lab stub, not a model. (reply 2)
+
+ ❯ lab text then cr
+
+ ● Hi! I am the local lab stub, not a model. (reply 3)
+
+ ❯ lab via ctl turn
+
+ ● Hi! I am the local lab stub, not a model. (reply 4)
+
+ ❯ lab streaming turn
+
+ ● tick 1 tick 2 tick 3 tick 4 tick 5 tick 6 tick 7 tick 8 tick 9 tick 10 tick 11 tick 12 tick 13 tick 14
+   tick 15 tick 16 tick 17 tick 18 tick 19 tick 20 tick 21 tick 22 tick 23 tick 24 tick 25 tick 26 tick 27
+   tick 28 tick 29 tick 30
+
+ ❯ lab interrupt with ctrl-c
+   Interrupted by user
+
+ ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │ >                                                                                                        │
+ ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ lab-model  …/tmp/at.H2aa/proj                            ask Kimi to schedule tasks, e.g. "remind me at 5pm"
+                                                                                   context: 22% (20.9k/97.7k)

@@ -93,7 +93,7 @@ fn hex(bytes: &[u8]) -> String {
 
 /// The bytes `s` spells in hex; `None` when it does not.
 fn unhex(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
+    if !s.len().is_multiple_of(2) || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     (0..s.len())
@@ -128,8 +128,20 @@ impl Record {
         for line in text.lines() {
             let (k, v) = line.split_once(' ')?;
             match k {
-                "pid" => pid = v.parse().ok(),
-                "start" => start = v.parse().ok(),
+                "pid" => {
+                    pid = v
+                        .bytes()
+                        .all(|b| b.is_ascii_digit())
+                        .then(|| v.parse().ok())
+                        .flatten();
+                }
+                "start" => {
+                    start = v
+                        .bytes()
+                        .all(|b| b.is_ascii_digit())
+                        .then(|| v.parse().ok())
+                        .flatten();
+                }
                 "selected" => selected = Some(v.to_string()),
                 "enabled" => enabled.push(v.to_string()),
                 "pref" => {

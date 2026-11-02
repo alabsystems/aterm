@@ -5,6 +5,7 @@
 # paper arm: a Claude Code composer relaid by -3 rows under a key in flight.
 
 foreach-scheme light {
+  scale 2
   grid 30 90
   style rainbow kitty
   hz 60

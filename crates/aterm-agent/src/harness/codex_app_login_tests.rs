@@ -859,6 +859,10 @@ fn native_wham_usage_reads_windows_walls_and_refreshes_expired_or_unauthorized_t
         "https://chatgpt.com/backend-api/wham/usage"
     );
     assert_eq!(
+        usage_url_from_base("HTTPS://ChatGPT.com:443"),
+        "HTTPS://ChatGPT.com:443/backend-api/wham/usage"
+    );
+    assert_eq!(
         usage_url_from_base("https://chatgpt.com/backend-api/"),
         "https://chatgpt.com/backend-api/wham/usage"
     );
@@ -1224,6 +1228,20 @@ fn native_wham_usage_reads_windows_walls_and_refreshes_expired_or_unauthorized_t
     let mut unterminated = b"GET /auth/callback?code=c&state=s HTTP/1.1\r\nX-Pad: ".to_vec();
     unterminated.resize(CALLBACK_REQ_MAX, b'a');
     assert!(parse_callback_request_target(&unterminated, 1455).is_none());
+    assert!(
+        parse_callback_request_target(
+            b"GET //evil.example/callback HTTP/1.1\r\nHost: 127.0.0.1:1455\r\n\r\n",
+            1455,
+        )
+        .is_none()
+    );
+    assert!(
+        parse_callback_request_target(
+            b"GET /auth/callback HTTP/1.9\r\nHost: 127.0.0.1:1455\r\n\r\n",
+            1455,
+        )
+        .is_none()
+    );
 
     #[cfg(unix)]
     {
@@ -2443,7 +2461,7 @@ fn auth_reads_are_bounded_regular_non_symlink_files_and_expired_or_portless_logi
         let fifo_home = tmp.path().join("fifo_home");
         std::fs::create_dir_all(&fifo_home).expect("create fifo_home");
         let fifo_auth = fifo_home.join(AUTH_FILE);
-        let made = aterm_uds::spawnfd::command("mkfifo")
+        let made = aterm_uds::spawnfd::command(crate::test_program::kept("/usr/bin/mkfifo"))
             .arg(&fifo_auth)
             .status()
             .expect("mkfifo");
@@ -2882,6 +2900,347 @@ fn a_refresh_sends_nothing_while_another_holds_the_logins_lock() {
 }
 
 #[test]
+fn an_uncertain_refresh_is_not_sent_again_after_reloading_the_login() {
+    let now = 1_790_000_000;
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join("login");
+    hour_login(&home, now, Some("single-use"));
+    let before = std::fs::read(home.join(AUTH_FILE)).expect("auth");
+    // The provider accepted the request, but its reply lost the access token.
+    let (port, server) = provider(|_, _| ("200 OK", json!({"refresh_token":"rotated"})));
+    for _ in 0..2 {
+        let stored = load_stored_auth(&home).expect("reload unchanged login");
+        let got = refresh_outcome(
+            &home,
+            &stored,
+            &format!("http://127.0.0.1:{port}/oauth/token"),
+            aterm_spec::wait::MUST_HAPPEN,
+            now,
+            None,
+        );
+        assert!(matches!(got, Refreshed::Failed), "{got:?}");
+    }
+    assert_eq!(std::fs::read(home.join(AUTH_FILE)).expect("auth"), before);
+    assert_eq!(
+        provider_seen(port, server),
+        ["POST /oauth/token"],
+        "reloading must not send the possibly spent token twice"
+    );
+}
+
+#[test]
+fn refresh_attempts_survive_metadata_changes_and_allow_a_new_token() {
+    let now = 1_790_000_000;
+    for refused in [false, true] {
+        let tmp = aterm_tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("login.json");
+        let stored = hour_login(&home, now, Some("single-use"));
+        let (port, server) = provider(move |_, _| {
+            if refused {
+                ("400 Bad Request", json!({"error":"invalid_grant"}))
+            } else {
+                ("500 Internal Server Error", json!({"error":"server_error"}))
+            }
+        });
+        let refresh = |stored: &StoredAuth| {
+            let result = refresh_outcome(
+                &home,
+                stored,
+                &format!("http://127.0.0.1:{port}/oauth/token"),
+                aterm_spec::wait::MUST_HAPPEN,
+                now,
+                None,
+            );
+            assert_eq!(matches!(result, Refreshed::Rejected), refused, "{result:?}");
+            assert!(!matches!(result, Refreshed::Done(_)), "{result:?}");
+        };
+        refresh(&stored);
+        let mut changed = stored.doc.clone();
+        let object = changed.as_object_mut().expect("auth object");
+        object
+            .get_mut("tokens")
+            .expect("tokens")
+            .as_object_mut()
+            .expect("token object")
+            .insert("account_id".into(), json!("another-workspace"));
+        object.insert("last_refresh".into(), json!("2026-11-02T00:00:00Z"));
+        write_auth_doc(&home, &changed).expect("metadata edit");
+        refresh(&load_stored_auth(&home).expect("reload metadata edit"));
+        let next = hour_login(&home, now, Some("new-sign-in-token"));
+        refresh(&next);
+        assert_eq!(
+            provider_seen(port, server),
+            ["POST /oauth/token", "POST /oauth/token"]
+        );
+    }
+}
+
+#[test]
+fn a_lost_refresh_reply_keeps_usage_available_without_reusing_the_token() {
+    let now = 1_790_000_000;
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join("login");
+    let mut stored = hour_login(&home, now, Some("single-use"));
+    // Make both usage reads attempt a proactive refresh.
+    stored
+        .doc
+        .as_object_mut()
+        .expect("auth object")
+        .insert("last_refresh".into(), json!("2000-01-01T00:00:00Z"));
+    write_auth_doc(&home, &stored.doc).expect("old refresh timestamp");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("provider");
+    let port = listener.local_addr().expect("address").port();
+    let server = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        while let Ok((mut stream, _)) = listener.accept() {
+            let Some(request) = read_http_request(&mut stream) else {
+                break;
+            };
+            if request.method == "GET" {
+                send_http_json(
+                    &mut stream,
+                    "200 OK",
+                    &json!({"plan_type":"pro", "rate_limit":{}}),
+                );
+            }
+            // The refresh request reached the provider; no response reaches its caller.
+            seen.push(request);
+        }
+        seen
+    });
+    for _ in 0..2 {
+        assert!(matches!(
+            read_login_with(
+                &home,
+                &format!("http://127.0.0.1:{port}/usage"),
+                &format!("http://127.0.0.1:{port}/oauth/token"),
+                aterm_spec::wait::MUST_HAPPEN,
+                now,
+                None,
+            ),
+            Reading::Usage(_)
+        ));
+    }
+    assert_eq!(
+        provider_seen(port, server),
+        ["POST /oauth/token", "GET /usage", "GET /usage"]
+    );
+}
+
+#[test]
+fn an_unreadable_refresh_journal_never_starts_another_refresh() {
+    let now = 1_790_000_000;
+    for directory in [false, true] {
+        let tmp = aterm_tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("login");
+        let stored = hour_login(&home, now, Some("single-use"));
+        let path = beside_auth(&home, JOURNAL_SUFFIX);
+        if directory {
+            std::fs::create_dir(&path).expect("journal directory");
+        } else {
+            std::fs::write(&path, b"interrupted journal").expect("malformed journal");
+        }
+        let (port, server) = provider(|_, _| ("200 OK", json!({"access_token":"new"})));
+        assert!(matches!(
+            refresh_outcome(
+                &home,
+                &stored,
+                &format!("http://127.0.0.1:{port}/oauth/token"),
+                aterm_spec::wait::MUST_HAPPEN,
+                now,
+                None,
+            ),
+            Refreshed::Failed
+        ));
+        assert!(provider_seen(port, server).is_empty());
+        assert!(path.exists(), "uncertain evidence remains in place");
+    }
+}
+
+#[test]
+fn a_failed_refresh_directory_flush_sends_nothing_and_can_retry() {
+    let now = 1_790_000_000;
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join("login");
+    let stored = hour_login(&home, now, Some("single-use"));
+    let (port, server) = provider(|_, _| {
+        (
+            "200 OK",
+            json!({"access_token":"new", "refresh_token":"next"}),
+        )
+    });
+    let refresh = || {
+        refresh_outcome(
+            &home,
+            &stored,
+            &format!("http://127.0.0.1:{port}/oauth/token"),
+            aterm_spec::wait::MUST_HAPPEN,
+            now,
+            None,
+        )
+    };
+    let fault = aterm_durable::seam::FailingDirs::with(aterm_durable::seam::EIO);
+    assert!(matches!(refresh(), Refreshed::Failed));
+    drop(fault);
+    assert!(matches!(refresh(), Refreshed::Done(_)));
+    assert_eq!(provider_seen(port, server), ["POST /oauth/token"]);
+}
+
+#[test]
+fn a_refresh_tls_failure_before_sending_can_retry() {
+    let now = 1_790_000_000;
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join("login");
+    let stored = hour_login(&home, now, Some("single-use"));
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("TLS peer");
+    let port = listener.local_addr().expect("address").port();
+    // Close after ClientHello. TLS has not admitted any HTTP request bytes.
+    let peer = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("TLS connection");
+        stream
+            .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
+            .expect("timeout");
+        stream.read(&mut [0; 1024]).expect("ClientHello")
+    });
+    let unavailable = format!("https://127.0.0.1:{port}/oauth/token");
+    assert!(matches!(
+        refresh_outcome(
+            &home,
+            &stored,
+            &unavailable,
+            aterm_spec::wait::MUST_HAPPEN,
+            now,
+            None,
+        ),
+        Refreshed::Failed
+    ));
+    let _ = TcpStream::connect(("127.0.0.1", port));
+    assert!(peer.join().expect("TLS peer") > 0);
+    assert!(RefreshJournal::read(&home).expect("journal").is_none());
+    let (port, server) = provider(|_, _| {
+        (
+            "200 OK",
+            json!({"access_token":"new", "refresh_token":"next"}),
+        )
+    });
+    assert!(matches!(
+        refresh_outcome(
+            &home,
+            &stored,
+            &format!("http://127.0.0.1:{port}/oauth/token"),
+            aterm_spec::wait::MUST_HAPPEN,
+            now,
+            None,
+        ),
+        Refreshed::Done(_)
+    ));
+    assert_eq!(provider_seen(port, server), ["POST /oauth/token"]);
+}
+
+#[test]
+fn an_applied_refresh_with_the_same_token_survives_a_failed_directory_flush() {
+    let now = 1_790_000_000;
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join("login");
+    let stored = hour_login(&home, now, Some("unchanged-refresh"));
+    let (port, server) = provider(|_, _| ("200 OK", json!({"access_token":"new"})));
+    // The attempt and response are durable, but the login rename's flush fails.
+    let fault = aterm_durable::seam::FailingDirs::after(2, aterm_durable::seam::EIO);
+    assert!(matches!(
+        refresh_outcome(
+            &home,
+            &stored,
+            &format!("http://127.0.0.1:{port}/oauth/token"),
+            aterm_spec::wait::MUST_HAPPEN,
+            now,
+            None,
+        ),
+        Refreshed::Failed
+    ));
+    drop(fault);
+    assert!(RefreshJournal::read(&home).expect("journal").is_some());
+    recover_journal(&home, Instant::now() + aterm_spec::wait::MUST_HAPPEN);
+    let current = load_stored_auth(&home).expect("applied response");
+    assert_eq!(current.access_token, "new");
+    assert_eq!(current.refresh_token.as_deref(), Some("unchanged-refresh"));
+    assert!(RefreshJournal::read(&home).expect("journal").is_none());
+    assert_eq!(provider_seen(port, server), ["POST /oauth/token"]);
+}
+
+#[test]
+fn a_saved_refresh_reply_cannot_be_bypassed_by_editing_the_workspace() {
+    let now = 1_790_000_000;
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join("login");
+    let stored = hour_login(&home, now, Some("single-use"));
+    let (port, server) = provider(|_, _| {
+        (
+            "200 OK",
+            json!({"access_token":"new", "refresh_token":"next"}),
+        )
+    });
+    let token_url = format!("http://127.0.0.1:{port}/oauth/token");
+    assert!(matches!(
+        refresh_admitted(
+            &home,
+            &stored,
+            &token_url,
+            aterm_spec::wait::MUST_HAPPEN,
+            now,
+            |_| true,
+            |_, _| Err(std::io::Error::other("injected publication failure")),
+        ),
+        Refreshed::Failed
+    ));
+    let mut changed = stored.doc.clone();
+    changed
+        .as_object_mut()
+        .expect("auth")
+        .get_mut("tokens")
+        .expect("tokens")
+        .as_object_mut()
+        .expect("token object")
+        .insert("account_id".into(), json!("different-workspace"));
+    write_auth_doc(&home, &changed).expect("workspace change");
+    let changed = load_stored_auth(&home).expect("changed login");
+    assert!(matches!(
+        refresh_outcome(
+            &home,
+            &changed,
+            &token_url,
+            aterm_spec::wait::MUST_HAPPEN,
+            now,
+            None,
+        ),
+        Refreshed::Failed
+    ));
+    assert_eq!(
+        load_stored_auth(&home).expect("preserved login").doc,
+        changed.doc
+    );
+    assert!(matches!(
+        RefreshJournal::read(&home).expect("journal"),
+        Some(RefreshJournal::Response { .. })
+    ));
+
+    // Restoring the original authentication lets the saved response publish without a POST.
+    write_auth_doc(&home, &stored.doc).expect("restore original authentication");
+    let refreshed = refresh_outcome(
+        &home,
+        &stored,
+        &token_url,
+        aterm_spec::wait::MUST_HAPPEN,
+        now,
+        None,
+    )
+    .done()
+    .expect("recovered response");
+    assert_eq!(refreshed.refresh_token.as_deref(), Some("next"));
+    assert!(RefreshJournal::read(&home).expect("journal").is_none());
+    assert_eq!(provider_seen(port, server), ["POST /oauth/token"]);
+}
+
+#[test]
 fn a_refresh_response_a_failed_publication_left_is_published_by_the_next_read() {
     let now = 1_790_000_000;
     let tmp = aterm_tempfile::tempdir().expect("tempdir");
@@ -2904,12 +3263,24 @@ fn a_refresh_response_a_failed_publication_left_is_published_by_the_next_read() 
     assert!(matches!(got, Refreshed::Failed), "{got:?}");
     assert_eq!(std::fs::read(home.join(AUTH_FILE)).expect("auth"), before);
     let journal = RefreshJournal::read(&home)
-        .flatten()
+        .expect("read journal")
         .expect("the response is kept beside the login");
-    assert_eq!(
-        journal.tokens.refresh_token.as_deref(),
-        Some("rotated-refresh")
-    );
+    // Earlier aterm versions kept version-one responses without a spent-token digest.
+    // They must still recover. New response records are covered by the tests above.
+    let mut legacy = journal.to_value();
+    legacy
+        .as_object_mut()
+        .expect("journal object")
+        .remove("refresh_token_digest");
+    super::super::upgrade_models::write_atomic(
+        &beside_auth(&home, JOURNAL_SUFFIX),
+        &aterm_json::to_string(&legacy).expect("legacy JSON"),
+    )
+    .expect("legacy journal");
+    let RefreshJournal::Response { tokens, .. } = journal else {
+        panic!("the usable response replaces the attempt");
+    };
+    assert_eq!(tokens.refresh_token.as_deref(), Some("rotated-refresh"));
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -2923,7 +3294,7 @@ fn a_refresh_response_a_failed_publication_left_is_published_by_the_next_read() 
     // A file that cannot be read now keeps the journal for a later read.
     std::fs::write(home.join(AUTH_FILE), b"half-written").expect("garbage");
     recover_journal(&home, Instant::now() + aterm_spec::wait::MUST_HAPPEN);
-    assert!(RefreshJournal::read(&home).flatten().is_some());
+    assert!(RefreshJournal::read(&home).expect("read journal").is_some());
     std::fs::write(home.join(AUTH_FILE), &before).expect("restore");
 
     // The next read publishes it onto the login it was refreshed from.
@@ -2932,15 +3303,16 @@ fn a_refresh_response_a_failed_publication_left_is_published_by_the_next_read() 
     assert_eq!(now_stored.refresh_token.as_deref(), Some("rotated-refresh"));
     assert_eq!(now_stored.access_token, fresh);
     assert!(
-        RefreshJournal::read(&home).is_none(),
+        RefreshJournal::read(&home).expect("read journal").is_none(),
         "spent once published"
     );
 
     // CONTROL: a journal refreshed from another login is dropped, never published over this one.
     let published = std::fs::read(home.join(AUTH_FILE)).expect("auth");
-    RefreshJournal {
+    RefreshJournal::Response {
         base: "another-login".to_owned(),
-        tokens: journal.tokens,
+        token: None,
+        tokens,
     }
     .write(&home)
     .expect("a stale journal");
@@ -2949,7 +3321,7 @@ fn a_refresh_response_a_failed_publication_left_is_published_by_the_next_read() 
         std::fs::read(home.join(AUTH_FILE)).expect("auth"),
         published
     );
-    assert!(RefreshJournal::read(&home).is_none());
+    assert!(RefreshJournal::read(&home).expect("read journal").is_none());
 
     // A response naming another account than the row expects is neither kept nor published.
     let stored = hour_login(&home, now, Some("spent-refresh"));
@@ -2968,8 +3340,11 @@ fn a_refresh_response_a_failed_publication_left_is_published_by_the_next_read() 
     assert_eq!(provider_seen(port, server), ["POST /oauth/token"]);
     assert!(matches!(got, Refreshed::Failed), "{got:?}");
     assert!(
-        RefreshJournal::read(&home).is_none(),
-        "another account's answer is not kept"
+        matches!(
+            RefreshJournal::read(&home).expect("read journal"),
+            Some(RefreshJournal::Attempted { .. })
+        ),
+        "only the attempt is kept, not another account's answer"
     );
     assert_eq!(std::fs::read(home.join(AUTH_FILE)).expect("auth"), before);
 }
@@ -3128,34 +3503,4 @@ fn auth_lock_coordinates_refresh_reloads_rotated_tokens_and_refuses_symlinks() {
         "symlinked lock must refuse refresh before any request"
     );
     assert!(!elsewhere.exists());
-}
-
-#[test]
-fn credential_debug_redacts_stored_and_refreshed_tokens() {
-    let marker = "synthetic-private-token-value";
-    let stored = super::StoredAuth {
-        doc: json!({"private": marker}),
-        id_token: Some(marker.into()),
-        access_token: marker.into(),
-        refresh_token: Some(marker.into()),
-        account_id: Some(marker.into()),
-        last_refresh_secs: None,
-        id_claims: None,
-        access_claims: None,
-    };
-    let refreshed = super::RefreshedTokens {
-        access_token: marker.into(),
-        id_token: Some(marker.into()),
-        refresh_token: Some(marker.into()),
-        account_id: Some(marker.into()),
-        last_refresh: marker.into(),
-    };
-    for output in [
-        format!("{stored:?}"),
-        format!("{stored:#?}"),
-        format!("{refreshed:?}"),
-        format!("{refreshed:#?}"),
-    ] {
-        assert!(!output.contains(marker));
-    }
 }

@@ -200,6 +200,23 @@ impl Resources {
         self.dispatch_with(request, cost, operation, || {}, run)
     }
 
+    /// Honor a caller's admission deadline before committing a new debit.
+    /// Completion evidence still gets its own bounded local persistence budget
+    /// after the adapter returns; this deadline is not a provider timeout.
+    pub fn dispatch_once_until(
+        &self,
+        request: [u8; 16],
+        cost: u64,
+        operation: Digest,
+        deadline: std::time::Instant,
+        run: impl FnOnce() -> Option<Observation>,
+    ) -> Result<Attempt> {
+        match self.admit_with_deadline(request, cost, operation, Some(deadline))? {
+            Admission::Existing(attempt) => Ok(attempt),
+            Admission::Fresh(permit) => Ok(self.record(permit.invoke(run))),
+        }
+    }
+
     pub(super) fn dispatch_with(
         &self,
         request: [u8; 16],
@@ -232,12 +249,30 @@ impl Resources {
         cost: u64,
         operation: Digest,
     ) -> Result<Admission> {
+        self.admit_with_deadline(request, cost, operation, None)
+    }
+
+    fn admit_with_deadline(
+        &self,
+        request: [u8; 16],
+        cost: u64,
+        operation: Digest,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Admission> {
+        let current = || {
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                Err(Error::new("resource admission deadline expired"))
+            } else {
+                Ok(())
+            }
+        };
+        current()?;
         if request == [0; 16] || cost == 0 || operation == [0; 32] {
             return Err(Error::new(
                 "dispatch requires a nonzero request, cost and operation",
             ));
         }
-        self.with_store(false, |session, store, _| {
+        self.with_store_deadline(false, deadline, |session, store, _| {
             self.pin(session, store, false)?;
             session.writer()?;
             let ledger = ledger::Ledger::read(&self.allocation, session, store)?;
@@ -249,6 +284,7 @@ impl Resources {
                 }
                 return Ok(Admission::Existing(report(session, store, old)?));
             }
+            current()?;
             let debit = self.new_debit(session, &ledger, request, cost)?;
             let receipt = store.commit_liability(session, &debit.encode_attempt(operation))?;
             Ok(Admission::Fresh(Permit {

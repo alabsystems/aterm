@@ -161,6 +161,7 @@ impl Reader<'_> {
                             .b
                             .get(j + 2..j + 6)
                             .and_then(|h| std::str::from_utf8(h).ok())
+                            .filter(|h| h.bytes().all(|b| b.is_ascii_hexdigit()))
                             .and_then(|h| u32::from_str_radix(h, 16).ok())
                             .ok_or_else(|| self.fail("a bad \\u escape"))?;
                         out.push(char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER));

@@ -3,8 +3,7 @@
 
 //! The escort is the pet's default life: ordinary typing matches a twin brain with
 //! `set_console_presentable(false)` that hears the same keys (the hand's keys are the
-//! host's fact, not the console layer's: the first key springs both cats ahead of the
-//! writing, `PetBrain::first_keys_spring`).
+//! host's fact, not the console layer's).
 
 use std::time::{Duration, Instant};
 

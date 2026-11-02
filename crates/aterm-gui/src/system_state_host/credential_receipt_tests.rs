@@ -70,14 +70,14 @@ fn start_join(app: &mut App, wid: WindowId, view: ViewId) -> InitialSetupApplyRe
 }
 
 fn preempt_join(app: &mut App, view: ViewId) -> InitialSetupApplyReceipt {
-    // This is a live enabled control while Join waits for its receipt; group
-    // preemption must remain available during an admission or running pass.
-    let key = "system-state/group/2/leave";
+    // This is a live enabled control while Join waits for its receipt; a line's
+    // switch must remain available during an admission or running pass.
+    let key = "system-state/line/mac/switch";
     app.act_app(ActRequest {
         view,
         ui_key: key.into(),
         action: key.into(),
-        value: None,
+        value: Some("false".into()),
     })
     .unwrap();
     assert!(SUBMISSIONS.with(|submissions| {

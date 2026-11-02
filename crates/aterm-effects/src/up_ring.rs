@@ -19,6 +19,7 @@ use aterm_core::render::{
 
 use crate::cli_marks::ICON_CONTRAST;
 use crate::color_math::{floor_contrast_keeping_hue, hypot_f32};
+use crate::effect_util::lerp_rgb as mix;
 use crate::harness_card::{CardPalette, dark_ground};
 
 /// Where the ring takes its hue: the hue of the rule it closes.
@@ -56,17 +57,6 @@ pub const RING_CELLS: u16 = 3;
 
 /// The wash inside the ring.
 pub const RING_WASH: f32 = 0.14;
-
-/// `a` moved `t` of the way toward `b`, per channel (`0x00RRGGBB`).
-#[inline]
-const fn mix(a: u32, b: u32, t: f32) -> u32 {
-    #[inline]
-    const fn ch(a: u32, b: u32, t: f32, s: u32) -> u32 {
-        let (x, y) = (((a >> s) & 0xff) as f32, ((b >> s) & 0xff) as f32);
-        (x + (y - x) * t).round().clamp(0.0, 255.0) as u32
-    }
-    (ch(a, b, t, 16) << 16) | (ch(a, b, t, 8) << 8) | ch(a, b, t, 0)
-}
 
 /// The ring's ink: the rule's tint at the line's end (the arc lifted a quarter toward the ink,
 /// laid 68% over the rule, as the gui inks the rule's `─`), floored to 3:1 on the ground.
@@ -156,6 +146,9 @@ const fn geometry((cw, ch): (u16, u16)) -> ((f32, f32, f32, f32), f32) {
 pub fn raster(key: &RingKey) -> (u16, u16, Vec<u8>) {
     let (cw, ch) = key.cell;
     let w = RING_CELLS.saturating_mul(cw);
+    if w == 0 || ch == 0 {
+        return (w, ch, Vec::new());
+    }
     let ((x0, y0, x1, y1), rim) = geometry(key.cell);
     let r = ((y1 - y0) * 0.5).max(0.0);
     let cy = (y0 + y1) * 0.5;
@@ -245,13 +238,10 @@ pub fn raster(key: &RingKey) -> (u16, u16, Vec<u8>) {
 #[inline]
 pub fn content(key: &RingKey) -> Arc<FxContent> {
     let (w, h, bytes) = raster(key);
-    let art = if w == 0 || h == 0 {
-        None
-    } else {
-        FxArt::new(w, h, FxTexels::Rgba8Premul, bytes)
-    };
-    let item = art.map(|art| {
-        FxItem::Sprite(FxSprite {
+    let items = if w == 0 || h == 0 {
+        Vec::new()
+    } else if let Some(art) = FxArt::new(w, h, FxTexels::Rgba8Premul, bytes) {
+        vec![FxItem::Sprite(FxSprite {
             x: 0,
             y: 0,
             dw: w,
@@ -260,9 +250,11 @@ pub fn content(key: &RingKey) -> Arc<FxContent> {
             art: Arc::new(art),
             ink: 0,
             clip: PxRect::EVERYWHERE,
-        })
-    });
-    Arc::new(FxContent::new(item.into_iter().collect(), Vec::new()))
+        })]
+    } else {
+        Vec::new()
+    };
+    Arc::new(FxContent::new(items, Vec::new()))
 }
 
 /// The [`FxLayer`] placing `content` under the terminal glyphs at grid `offset`, inside `clip`.

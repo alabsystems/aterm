@@ -21,7 +21,7 @@ use crate::session_timeline::{
 use crate::turn_ledger::TurnBy;
 use crate::{SessionCtx, term_lock};
 
-/// `sessions` -> list the process-wide registry: `OK <n>\n` then one line per session, sorted by local id: `<local> <sid> <parent|-> <state> <title> meta=<1|0> nonce=<hex32> window=<id|none|-> active=<1|0|-> wfocus=<1|0|-> detail=<pct|-> path=<frozen|live> program=<name|-> agent=<word|-> agent_detail=<pct|-> agent_rev=<n> agent_since_ms=<ms> agent_gen=<e.s|-> agent_fp=<hex16|-> program_state=<word[:kind]|-> … supervisor=<holder|-> supervisor_proven=<0|1> autopilot=<off|cruise|land|-> path_evidence=<measured:<ms>|unconfirmed:<ms>|carried|-> copy=<managed|foreign|-> upgrade=<-|<state>/<to>/<why>/<age>> land_at=<unix s|-> task=<open|landed|theirs|-> pause=<unix s|-> task_state=<working|done|exited|stalled|-> task_rev=<n>`.
+/// `sessions` -> list the process-wide registry: `OK <n>\n` then one line per session, sorted by local id: `<local> <sid> <parent|-> <state> <title> meta=<1|0> nonce=<hex32> window=<id|none|-> active=<1|0|-> wfocus=<1|0|-> detail=<pct|-> path=<frozen|live> program=<name|-> agent=<word|-> agent_detail=<pct|-> agent_rev=<n> agent_since_ms=<ms> agent_gen=<e.s|-> agent_fp=<hex16|-> wait=<memory|-> wait_gib=<GiB|-> wait_ahead=<n|-> program_state=<word[:kind]|-> … supervisor=<holder|-> supervisor_proven=<0|1> autopilot=<off|cruise|land|-> path_evidence=<measured:<ms>|unconfirmed:<ms>|carried|-> copy=<managed|foreign|-> upgrade=<-|<state>/<to>/<why>/<age>> land_at=<unix s|-> task=<open|landed|theirs|-> pause=<unix s|-> task_state=<working|done|exited|stalled|-> task_rev=<n>`.
 pub(crate) fn cmd_sessions_store(store: &Store, proxy: Option<&EventLoopProxy<Wake>>) -> String {
     let (snapshot, frozen, posture) = {
         let g = store.read().unwrap_or_else(|p| p.into_inner());
@@ -158,6 +158,8 @@ pub(crate) fn sessions_lines(
             word,
             land_at,
             (claimed_here, proven, shown_proven),
+            (claim_version, claim_vendor),
+            authority,
         ) = {
             let meta = h.ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
             let opt = |v: Option<&str>| v.map_or_else(|| "-".to_string(), pct_encode);
@@ -176,6 +178,8 @@ pub(crate) fn sessions_lines(
                     meta.supervisor_proven(now),
                     meta.claim_proven(now),
                 ),
+                crate::harness_claim::wire_versions(meta.live_scoped(now)),
+                meta.supervisor_authority(now).wire_fields(),
             )
         };
         let flag = |set: bool| if set { "1" } else { "0" };
@@ -204,7 +208,11 @@ pub(crate) fn sessions_lines(
         ) = {
             let timeline = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             (
-                timeline.agent().wire_fields(),
+                format!(
+                    "{}{}",
+                    timeline.agent().wire_fields(),
+                    crate::session_status::program::BuildWait::fields(timeline.build_wait())
+                ),
                 crate::program_state::column(timeline.program_shown()),
                 timeline.owner_columns(frozen_path(h.local_id), crate::upgrade_host::now_s()),
                 crate::task_record::status_tokens(timeline.task()),
@@ -228,7 +236,9 @@ pub(crate) fn sessions_lines(
             "{} {} {} {} {} meta={has_meta} nonce={nonce} window={window} active={active} \
              wfocus={wfocus} detail={detail} path={path} {agent} program_state={program_state} \
              human_ms={human} role={role} attention={attention} user_title={user_title} \
-             supervisor={supervisor} supervisor_proven={proven} autopilot={autopilot} {owner} \
+             {authority} supervisor={supervisor} supervisor_proven={proven} \
+             supervisor_version={claim_version} supervisor_vendor={claim_vendor} \
+             autopilot={autopilot} {owner} \
              land_at={land_at} task={task} pause={pause} {task_record}",
             h.local_id,
             h.sid.as_str(),
@@ -328,8 +338,11 @@ fn lease_acquire<'a>(ctx: &SessionCtx, args: impl Iterator<Item = &'a str>) -> S
     let mut here = false;
     for t in args {
         if let Some(v) = t.strip_prefix("ttl=") {
-            match v.parse::<u64>() {
-                Ok(n) if n >= 1 => ttl_ms = n.min(LEASE_TTL_MAX_MS),
+            match (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| v.parse::<u64>().ok())
+                .flatten()
+            {
+                Some(n) if n >= 1 => ttl_ms = n.min(LEASE_TTL_MAX_MS),
                 _ => {
                     return format!(
                         "ERR lease acquire: bad ttl '{t}' (a positive ms count, capped at \
@@ -796,6 +809,9 @@ pub(crate) fn cmd_await(
         let mut since = None;
         for arg in &args[2..] {
             if let Some(v) = arg.strip_prefix("since=") {
+                if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+                    return USAGE.to_string();
+                }
                 let Ok(rev) = v.parse::<u64>() else {
                     return USAGE.to_string();
                 };
@@ -836,10 +852,19 @@ pub(crate) fn cmd_await(
             return USAGE.to_string();
         };
         let range = match (args.get(2), args.get(3), args.get(4)) {
-            (Some(&"rows"), Some(a), Some(b)) => match (a.parse::<usize>(), b.parse::<usize>()) {
-                (Ok(start), Ok(end)) => RowRange::Span { start, end },
-                _ => return USAGE.to_string(),
-            },
+            (Some(&"rows"), Some(a), Some(b)) => {
+                if a.is_empty()
+                    || b.is_empty()
+                    || !a.bytes().all(|b| b.is_ascii_digit())
+                    || !b.bytes().all(|b| b.is_ascii_digit())
+                {
+                    return USAGE.to_string();
+                }
+                match (a.parse::<usize>(), b.parse::<usize>()) {
+                    (Ok(start), Ok(end)) => RowRange::Span { start, end },
+                    _ => return USAGE.to_string(),
+                }
+            }
             _ => RowRange::All,
         };
         let matcher = match aterm_observe::row_matcher(pat) {
@@ -858,9 +883,14 @@ pub(crate) fn cmd_await(
         }
     } else {
         let mut t = term_lock(term);
+        let uint = |s: &&str| {
+            (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| s.parse::<u64>().ok())
+                .flatten()
+        };
         match kind {
             "idle" => {
-                let Some(ms) = args.get(1).and_then(|s| s.parse::<u64>().ok()) else {
+                let Some(ms) = args.get(1).and_then(uint) else {
                     return USAGE.to_string();
                 };
                 t.watch(
@@ -872,10 +902,7 @@ pub(crate) fn cmd_await(
             }
             "seq" => {
                 let current = t.content_seq();
-                let after = args
-                    .get(1)
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(current);
+                let after = args.get(1).and_then(uint).unwrap_or(current);
                 if after > current {
                     drop(t);
                     return autopilot_moved(ctx, autopilot)
@@ -2262,16 +2289,17 @@ pub(crate) fn turn_options(rest: &str) -> Result<TurnOptions<'_>, String> {
     let mut if_gen: Option<crate::control::ScreenGen> = None;
     let mut if_rows: Option<aterm_types::control_verbs::RowsFence> = None;
     let mut cause_opt: Option<crate::session_log::CauseRef> = None;
+    let is_digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     let (options, text) = aterm_types::control_verbs::turn_option_words(rest);
     for (k, v) in options {
         match k {
-            "idle" => match v.parse::<u64>() {
-                Ok(ms) => idle_ms = ms.clamp(1, 600_000),
-                Err(_) => return Err(USAGE.to_string()),
+            "idle" => match is_digits(v).then(|| v.parse::<u64>().ok()).flatten() {
+                Some(ms) => idle_ms = ms.clamp(1, 600_000),
+                None => return Err(USAGE.to_string()),
             },
-            "timeout" => match v.parse::<u64>() {
-                Ok(ms) => timeout_ms = ms,
-                Err(_) => return Err(USAGE.to_string()),
+            "timeout" => match is_digits(v).then(|| v.parse::<u64>().ok()).flatten() {
+                Some(ms) => timeout_ms = ms,
+                None => return Err(USAGE.to_string()),
             },
             "submit" => match v.strip_prefix("guarded:") {
                 Some("") => return Err(USAGE.to_string()),
@@ -2284,12 +2312,12 @@ pub(crate) fn turn_options(rest: &str) -> Result<TurnOptions<'_>, String> {
                     submit_guard = None;
                 }
             },
-            "submit_window" => match v.parse::<u64>() {
-                Ok(ms) => submit_window_ms = ms.clamp(1, 600_000),
-                Err(_) => return Err(USAGE.to_string()),
+            "submit_window" => match is_digits(v).then(|| v.parse::<u64>().ok()).flatten() {
+                Some(ms) => submit_window_ms = ms.clamp(1, 600_000),
+                None => return Err(USAGE.to_string()),
             },
-            "presses" => match v.parse::<u32>() {
-                Ok(n) if n >= 1 => presses = n.min(10),
+            "presses" => match is_digits(v).then(|| v.parse::<u32>().ok()).flatten() {
+                Some(n) if n >= 1 => presses = n.min(10),
                 _ => return Err(USAGE.to_string()),
             },
             "submit_verify" => match v {
@@ -2323,16 +2351,19 @@ pub(crate) fn turn_options(rest: &str) -> Result<TurnOptions<'_>, String> {
                 "0" => typed = false,
                 _ => return Err(USAGE.to_string()),
             },
-            "cadence" => match v.parse::<u64>() {
-                Ok(ms) => cadence_ms = ms.clamp(1, 2_000),
-                Err(_) => return Err(USAGE.to_string()),
+            "cadence" => match is_digits(v).then(|| v.parse::<u64>().ok()).flatten() {
+                Some(ms) => cadence_ms = ms.clamp(1, 2_000),
+                None => return Err(USAGE.to_string()),
             },
-            "cap" => match v.parse::<usize>() {
-                Ok(n) if n >= 1 => typed_cap = n.min(TYPED_CAP_MAX),
+            "cap" => match is_digits(v).then(|| v.parse::<usize>().ok()).flatten() {
+                Some(n) if n >= 1 => typed_cap = n.min(TYPED_CAP_MAX),
                 _ => return Err(USAGE.to_string()),
             },
-            "yield" => match v.parse::<f32>() {
-                Ok(f) if f.is_finite() && (0.0..=1.0).contains(&f) => yield_floor = Some(f),
+            "yield" => match (!v.starts_with('+'))
+                .then(|| v.parse::<f32>().ok())
+                .flatten()
+            {
+                Some(f) if f.is_finite() && (0.0..=1.0).contains(&f) => yield_floor = Some(f),
                 _ => return Err(USAGE.to_string()),
             },
             "if-gen" => match crate::control::ScreenGen::parse(v) {
@@ -2415,6 +2446,8 @@ pub(crate) fn cmd_turn(
     ctx: &SessionCtx,
     io: &TurnIo<'_>,
 ) -> String {
+    let _producer = io.mark.and_then(|mark| mark.supervisor_producer());
+    let _native_producer = io.mark.and_then(|mark| mark.native_producer());
     let wrote = std::cell::Cell::new(false);
     let reply = turn_attempt(term, store, session, rest, ctx, io, &wrote);
     if !wrote.get()
@@ -3015,6 +3048,9 @@ fn turn_attempt(
     let submitted = submit_by.is_some();
 
     drop(committed);
+    if let Some(mark) = io.mark {
+        mark.seal_supervisor_input();
+    }
 
     if submitted {
         crate::presence::post_lease_changed(&ctx.self_id);
@@ -3330,8 +3366,14 @@ impl RingPage {
         let mut page = RingPage { n: 0, since: None };
         for tok in rest.split_whitespace() {
             if let Some(v) = tok.strip_prefix("since=") {
+                if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(usage());
+                }
                 page.since = Some(v.parse::<u64>().map_err(|_| usage())?);
-            } else if let Ok(v) = tok.parse::<usize>() {
+            } else if !tok.is_empty()
+                && tok.bytes().all(|b| b.is_ascii_digit())
+                && let Ok(v) = tok.parse::<usize>()
+            {
                 page.n = v;
             } else {
                 return Err(usage());
@@ -3646,9 +3688,10 @@ pub(crate) fn cmd_meta_supervisor(
             return Some((USAGE.to_string(), false));
         }
         let changed = match holder {
-            Some(h) => crate::session_timeline::release_supervisor_held_by(ctx, h, now, by),
-            None => crate::session_timeline::release_supervisor(ctx, None, now, by),
-        };
+            Some(h) => crate::session_timeline::publish_release_supervisor_held_by(ctx, h, now, by),
+            None => crate::session_timeline::publish_release_supervisor(ctx, None, now, by),
+        }
+        .acknowledge();
         return Some(("OK\n".to_string(), changed));
     }
     let Some(holder) = toks.next() else {
@@ -3658,7 +3701,7 @@ pub(crate) fn cmd_meta_supervisor(
         return Some((USAGE.to_string(), false));
     }
     let words: Vec<&str> = toks.collect();
-    let words = match aterm_agent::harness::contract::read(holder, &words) {
+    let words = match ctx.native_policy.read(holder, &words) {
         aterm_agent::harness::contract::Words::V2(words) => words,
         aterm_agent::harness::contract::Words::Refused(why) => {
             return Some((
@@ -3673,7 +3716,7 @@ pub(crate) fn cmd_meta_supervisor(
             return Some(claim_reply(
                 ctx,
                 conn,
-                crate::session_timeline::claim_supervisor_as(
+                crate::session_timeline::publish_claim_supervisor_as(
                     ctx, holder, conn, None, None, now, by,
                 ),
                 None,
@@ -3697,10 +3740,10 @@ pub(crate) fn cmd_meta_supervisor(
             let versions = claim.versions();
             let scope = claim.scopes.words();
             let scoped = crate::harness_claim::Scoped { proven, claim };
-            let claimed = crate::session_timeline::claim_supervisor_scoped(
+            let claimed = crate::session_timeline::publish_claim_supervisor_scoped(
                 ctx, holder, conn, scoped, now, by,
             );
-            if claimed.as_ref().is_ok_and(|c| c.changed) {
+            if claimed.as_ref().is_ok_and(|c| c.published_ref().changed) {
                 aterm_log::info!(
                     "harness @{}: {versions} holds the session under contract 3, scope={scope}; \
                      aterm's built-in engine stands down from exactly that",
@@ -3732,7 +3775,7 @@ pub(crate) fn cmd_meta_supervisor(
         prove(holder)
     };
     let proof = proven.clone();
-    let claimed = crate::session_timeline::claim_supervisor_as(
+    let claimed = crate::session_timeline::publish_claim_supervisor_as(
         ctx, holder, bound, expires_us, proven, now, by,
     );
     Some(claim_reply(ctx, bound, claimed, proof))
@@ -3743,10 +3786,13 @@ pub(crate) fn cmd_meta_supervisor(
 fn claim_reply(
     ctx: &SessionCtx,
     bound: Option<u64>,
-    claimed: Result<crate::session_timeline::Claimed, String>,
+    claimed: Result<
+        crate::session_timeline::SupervisorTransition<crate::session_timeline::Claimed>,
+        String,
+    >,
     proof: Option<crate::self_claim::Proven>,
 ) -> (String, bool) {
-    match claimed {
+    match claimed.map(crate::session_timeline::SupervisorTransition::acknowledge) {
         Ok(claimed) => {
             if bound.is_some() {
                 super::note_connection_claim();
@@ -3899,8 +3945,12 @@ pub(super) fn cmd_meta_harness_act_with_clock(
             if until_us - now > HARNESS_ACT_LEASE_MS * 1_000 {
                 return Some((HARNESS_ACT_USAGE.to_string(), false));
             }
+            // A submitted TUI turn may already have written its begin before core accepts it.
+            // Neither standing face may count that begin into its own mark. The unbounded
+            // spelling retains its legacy semantics; the bounded form reads this fresh snapshot
+            // under the act barrier, so an earlier working report refuses the publication.
             if crate::harness_task::self_claim_act_face(act)
-                == Some(aterm_agent::harness::acts::TaskFace::Theirs)
+                .is_some_and(crate::harness_task::holds_until_another_turn)
                 && !snapshot.is_some_and(|point| point.left_at_rest)
             {
                 return Some(("ERR busy harness_act\n".to_string(), false));
@@ -3980,7 +4030,7 @@ pub(crate) fn is_harness_act_set(rest: &str) -> bool {
     )
 }
 
-/// Whether `meta <rest>` is a `set harness_act` that reads the session's counts ([`HarnessActSnapshot`], under `crate::act_barrier`): a face that stands until another turn (its mark, and a point left to a person's rest check) or an opening act that types a turn ([`aterm_agent::harness::acts::self_claim_types_turn`]). Any other act reads none and waits for no barrier.
+/// Whether `meta <rest>` is a `set harness_act` that reads the session's counts ([`HarnessActSnapshot`], under `crate::act_barrier`): a face that stands until another turn (its mark and, when leased, its rest check) or an opening act that types a turn ([`aterm_agent::harness::acts::self_claim_types_turn`]). Any other act reads none and waits for no barrier.
 pub(crate) fn harness_act_reads_counts(rest: &str) -> bool {
     let Some(Ok(HarnessActRequest::Set { act, .. })) = harness_act_request(rest) else {
         return false;
@@ -4588,8 +4638,12 @@ pub(crate) fn cmd_cast_frames(
 ) -> String {
     let mut count = 8usize;
     for tok in rest.split_whitespace() {
-        match tok.strip_prefix("count=").map(|v| v.parse::<usize>()) {
-            Some(Ok(n)) if n >= 1 => count = n.min(240),
+        match tok
+            .strip_prefix("count=")
+            .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            Some(n) if n >= 1 => count = n.min(240),
             _ => return "ERR usage: cast frames [count=N]\n".to_string(),
         }
     }
@@ -4770,7 +4824,7 @@ pub(crate) fn cmd_temporal(ctx: &SessionCtx, term: &Mutex<Terminal>, rest: &str)
             "OK enabled={enabled} latest_tick={} reachable_from={reachable_from} keyframes={} \
              live_events={} dropped_events={} lost_resizes={} dropped_input={} \
              dropped_replies={} pending_resizes={} witnessed={} diverged={} pool_used={} \
-             pool_limit={}{}\n",
+             pool_limit={}{}{}\n",
             rec.latest_tick().0,
             rec.keyframe_count(),
             rec.live_events(),
@@ -4784,14 +4838,20 @@ pub(crate) fn cmd_temporal(ctx: &SessionCtx, term: &Mutex<Terminal>, rest: &str)
             crate::temporal::pool().used(),
             crate::temporal::pool().limit(),
             rec.status_tail(),
+            rec.writer_status(),
         );
     }
     let at = match rest {
         "" => None,
-        s => match s.parse::<u64>() {
-            Ok(t) => Some(aterm_buffer::Ticks(t)),
-            Err(_) => return USAGE.to_string(),
-        },
+        s => {
+            if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+                return USAGE.to_string();
+            }
+            match s.parse::<u64>() {
+                Ok(t) => Some(aterm_buffer::Ticks(t)),
+                Err(_) => return USAGE.to_string(),
+            }
+        }
     };
     let pending = pending();
     let (enabled, plan, at_end) = {
@@ -4812,6 +4872,7 @@ pub(crate) fn cmd_temporal(ctx: &SessionCtx, term: &Mutex<Terminal>, rest: &str)
     let Some(plan) = plan else {
         return "ERR temporal unreachable\n".to_string();
     };
+    let _consumer = crate::temporal::consumer_demand();
     let crate::temporal::Fold { term, judged } = plan.fold();
     ctx.temporal
         .lock()
@@ -5784,6 +5845,7 @@ mod tests {
             frame: Default::default(),
             witness: Default::default(),
             fenced_writes: Default::default(),
+            native_policy: Default::default(),
         });
         SessionHandle {
             sid,
@@ -5808,7 +5870,18 @@ mod tests {
         }
     }
 
-    const AGENT_COLUMNS: [&str; 23] = [
+    fn assert_roster_fields(line: &str, expected: &[(&str, &str)]) {
+        for &(key, value) in expected {
+            let mut found = line
+                .split_whitespace()
+                .filter_map(|word| word.split_once('='))
+                .filter_map(|(name, value)| (name == key).then_some(value));
+            assert_eq!(found.next(), Some(value), "{key}: {line}");
+            assert_eq!(found.next(), None, "duplicate {key}: {line}");
+        }
+    }
+
+    const AGENT_COLUMNS: [&str; 31] = [
         "program=",
         "agent=",
         "agent_detail=",
@@ -5816,13 +5889,21 @@ mod tests {
         "agent_since_ms=",
         "agent_gen=",
         "agent_fp=",
+        "wait=",
+        "wait_gib=",
+        "wait_ahead=",
         "program_state=",
         "human_ms=",
         "role=",
         "attention=",
         "user_title=",
+        "supervisor_contract=",
+        "supervisor_scope=",
+        "supervisor_revision=",
         "supervisor=",
         "supervisor_proven=",
+        "supervisor_version=",
+        "supervisor_vendor=",
         "autopilot=",
         "path_evidence=",
         "copy=",
@@ -5897,14 +5978,17 @@ mod tests {
             |_| false,
         );
         let line = out.lines().nth(1).unwrap();
-        assert!(
-            line.contains(
-                " role=reviewer attention=stuck%20on%20CI user_title=my%20build supervisor=- \
-                 supervisor_proven=0 "
-            ),
-            "{line}"
+        assert_roster_fields(
+            line,
+            &[
+                ("role", "reviewer"),
+                ("attention", "stuck%20on%20CI"),
+                ("user_title", "my%20build"),
+                ("supervisor", "-"),
+                ("supervisor_proven", "0"),
+                ("meta", "1"),
+            ],
         );
-        assert!(line.contains(" meta=1 "), "{line}");
     }
 
     #[test]
@@ -6224,11 +6308,47 @@ mod tests {
     }
 
     /// `supervisor_proven=` on `ls` is `status supervisor_proven=`: `1` only while the live claim
-    /// is a proven self-claim, `0` for an unproven one and for a tab nobody claims.
+    /// is a proven self-claim, `0` for an unproven one and for a tab nobody claims. A proven
+    /// contract v3 claim carries the versions it announced (`supervisor_version=`,
+    /// `supervisor_vendor=`, `docs/DESIGN-harness-repos-2026-10-24.md` §5); every other row, the
+    /// proven codex-alab self-claim among them (the control), carries `-` for both.
     #[test]
     fn the_roster_says_whether_the_live_claim_is_proven() {
         let t0 = Arc::new(Mutex::new(Terminal::new(24, 80)));
         let (proven, unproven, plain) = (handle(0, &t0), handle(1, &t0), handle(2, &t0));
+        let (scoped, bare) = (handle(3, &t0), handle(4, &t0));
+        for (h, words) in [
+            (
+                &scoped,
+                &[
+                    "contract=3",
+                    "scope=relaunch,upgrade",
+                    "version=0.3.0+gabc",
+                    "vendor=1.0.70",
+                ][..],
+            ),
+            (&bare, &["contract=3", "scope=relaunch"][..]),
+        ] {
+            let aterm_agent::harness::contract::Words::Scoped(claim) =
+                aterm_agent::harness::contract::read("grok-alab@4243", words)
+            else {
+                panic!("grok-alab's claim reads as a scoped claim: {words:?}");
+            };
+            h.ctx.meta.lock().unwrap().supervisor =
+                Some(crate::session_timeline::SupervisorClaim {
+                    holder: "grok-alab@4243".to_string(),
+                    conn: Some(2),
+                    expires_us: None,
+                    proven: None,
+                    scoped: Some(crate::harness_claim::Scoped {
+                        proven: crate::self_claim::Proven {
+                            pid: 4243,
+                            start: "stand-in".to_string(),
+                        },
+                        claim,
+                    }),
+                });
+        }
         for (h, proof) in [(&proven, true), (&unproven, false)] {
             h.ctx.meta.lock().unwrap().supervisor =
                 Some(crate::session_timeline::SupervisorClaim {
@@ -6243,16 +6363,40 @@ mod tests {
                 });
         }
         let out = sessions_lines(
-            &[proven, unproven, plain],
+            &[proven, unproven, plain, scoped, bare],
             Ok(&[]),
             crate::autopilot::HarnessPosture::default(),
             |_| false,
         );
         let rows: Vec<&str> = out.lines().skip(1).collect();
+        assert_eq!(rows.len(), 5, "{out}");
+        for (row, contract, scopes) in [
+            (
+                rows[0],
+                "2",
+                "relaunch,upgrade,turn-end,approvals,questions,walls",
+            ),
+            (
+                rows[1],
+                "-",
+                "relaunch,upgrade,turn-end,approvals,questions,walls",
+            ),
+            (rows[2], "-", "-"),
+            (rows[3], "3", "relaunch,upgrade"),
+            (rows[4], "3", "relaunch"),
+        ] {
+            assert!(row.contains(&format!(" supervisor_contract={contract} supervisor_scope={scopes} supervisor_revision=0 ")), "{row}");
+        }
         for (row, want) in rows.iter().zip([
-            " supervisor=codex-alab@4242 supervisor_proven=1 autopilot=",
-            " supervisor=codex-alab@4242 supervisor_proven=0 autopilot=",
-            " supervisor=- supervisor_proven=0 autopilot=",
+            " supervisor=codex-alab@4242 supervisor_proven=1 supervisor_version=- \
+             supervisor_vendor=- autopilot=",
+            " supervisor=codex-alab@4242 supervisor_proven=0 supervisor_version=- \
+             supervisor_vendor=- autopilot=",
+            " supervisor=- supervisor_proven=0 supervisor_version=- supervisor_vendor=- autopilot=",
+            " supervisor=grok-alab@4243 supervisor_proven=1 supervisor_version=0.3.0+gabc \
+             supervisor_vendor=1.0.70 autopilot=",
+            " supervisor=grok-alab@4243 supervisor_proven=1 supervisor_version=- \
+             supervisor_vendor=- autopilot=",
         ]) {
             assert!(row.contains(want), "{want}: {row}");
         }
@@ -6299,13 +6443,21 @@ mod tests {
                 "agent_since_ms",
                 "agent_gen",
                 "agent_fp",
+                "wait",
+                "wait_gib",
+                "wait_ahead",
                 "program_state",
                 "human_ms",
                 "role",
                 "attention",
                 "user_title",
+                "supervisor_contract",
+                "supervisor_scope",
+                "supervisor_revision",
                 "supervisor",
                 "supervisor_proven",
+                "supervisor_version",
+                "supervisor_vendor",
                 "autopilot",
                 "path_evidence",
                 "copy",
@@ -6838,7 +6990,10 @@ mod tests {
         );
         let line = out.lines().nth(1).unwrap();
         assert!(
-            line.contains(" supervisor=- supervisor_proven=0 autopilot=- "),
+            line.contains(
+                " supervisor=- supervisor_proven=0 supervisor_version=- supervisor_vendor=- \
+                 autopilot=- "
+            ),
             "no agent: {line}"
         );
         let (_, cols) = line.split_once(" path=live ").expect("after path=");
@@ -6883,14 +7038,36 @@ mod tests {
             line.contains(" agent_gen=2.40 agent_fp=00000000000000ab "),
             "the verdict's stamp rides the row: {line}"
         );
-        assert!(
-            line.ends_with(
-                " agent_fp=00000000000000ab program_state=- human_ms=- role=- attention=- \
-                 user_title=- supervisor=- supervisor_proven=0 autopilot=off path_evidence=- \
-                 copy=- upgrade=- land_at=- task=- pause=- task_state=- task_rev=0"
-            ),
-            "{line}"
+        let unclaimed_fields = [
+            ("supervisor", "-"),
+            ("supervisor_proven", "0"),
+            ("supervisor_version", "-"),
+            ("supervisor_vendor", "-"),
+            ("autopilot", "off"),
+            ("path_evidence", "-"),
+            ("copy", "-"),
+            ("upgrade", "-"),
+            ("land_at", "-"),
+            ("task", "-"),
+            ("pause", "-"),
+            ("task_state", "-"),
+            ("task_rev", "0"),
+        ];
+        assert_roster_fields(
+            line,
+            &[
+                ("agent_fp", "00000000000000ab"),
+                ("wait", "-"),
+                ("wait_gib", "-"),
+                ("wait_ahead", "-"),
+                ("program_state", "-"),
+                ("human_ms", "-"),
+                ("role", "-"),
+                ("attention", "-"),
+                ("user_title", "-"),
+            ],
         );
+        assert_roster_fields(line, &unclaimed_fields);
         crate::app_input::note_person(&h.ctx, crate::human_input::Gesture::Other);
         let out = sessions_lines(
             std::slice::from_ref(&h),
@@ -6904,13 +7081,7 @@ mod tests {
             .find_map(|t| t.strip_prefix("human_ms="))
             .unwrap();
         assert!(human.parse::<u64>().is_ok(), "{line}");
-        assert!(
-            line.ends_with(
-                " supervisor=- supervisor_proven=0 autopilot=off path_evidence=- copy=- \
-                 upgrade=- land_at=- task=- pause=- task_state=- task_rev=0"
-            ),
-            "{line}"
-        );
+        assert_roster_fields(line, &unclaimed_fields);
         let cruise =
             crate::autopilot::HarnessPosture::On(aterm_agent::supervise::Autopilot::Cruise);
         let autopilot = |posture| {
@@ -6963,6 +7134,46 @@ mod tests {
         assert_eq!(
             tail(lines[3]),
             "2 - alive tab-2 meta=0 window=none active=0 wfocus=0 detail=- path=live"
+        );
+    }
+
+    /// THE ROSTER NAMES A WAITING FRONT'S WAIT, as `status` does: a tab whose leader in front is a
+    /// build's front waiting for memory reads `program=targo … wait=memory wait_gib=12.0
+    /// wait_ahead=1` between the agent's columns and `program_state=`, so `ls` never reads it as
+    /// running. NEGATIVE CONTROL: once admitted (its wait read away) the same row says `wait=-`.
+    #[test]
+    fn sessions_lines_name_a_waiting_fronts_wait() {
+        let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
+        let snapshot = vec![handle(0, &term)];
+        let rows = vec![row(0, 0, true, true)];
+        let wait = crate::session_status::program::BuildWait {
+            mem: Some(12 << 30),
+            ahead: Some(1),
+        };
+        let line = |wait: Option<crate::session_status::program::BuildWait>| {
+            {
+                let mut timeline = snapshot[0].ctx.timeline.lock().unwrap();
+                timeline.note_foreground_group(5100);
+                timeline.set_program(5100, Some("targo".to_owned()));
+                timeline.set_build_wait(5100, wait);
+            }
+            sessions_lines(
+                &snapshot,
+                Ok(&rows),
+                crate::autopilot::HarnessPosture::default(),
+                |_| false,
+            )
+        };
+        let waiting = line(Some(wait));
+        assert!(waiting.contains(" program=targo "), "{waiting}");
+        assert!(
+            waiting.contains(" wait=memory wait_gib=12.0 wait_ahead=1 program_state="),
+            "{waiting}"
+        );
+        let admitted = line(None);
+        assert!(
+            admitted.contains(" wait=- wait_gib=- wait_ahead=- program_state="),
+            "{admitted}"
         );
     }
 
@@ -7324,6 +7535,7 @@ mod tests {
             frame: Default::default(),
             witness: Default::default(),
             fenced_writes: Default::default(),
+            native_policy: Default::default(),
         }
     }
 

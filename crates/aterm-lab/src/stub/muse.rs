@@ -4,10 +4,13 @@
 //! Stub Meta model API (`/muse-code/models` and `/responses`) for Muse Code lab runs.
 
 use std::io;
+#[cfg(test)]
 use std::time::Duration;
 
 use super::{Dialect, Out, RInfo, Stub, ToolTurn, analyse_responses, auth_label, bump};
-use super::{call_input, call_name, closed, est_tokens, item_text, rand_hex, script_calls};
+use super::{
+    call_input, call_name, closed, est_tokens, item_text, rand_hex, script_calls, sleep_secs,
+};
 use crate::pyjson::{COMPACT, J};
 use crate::util::one_line;
 
@@ -322,9 +325,7 @@ impl Sse {
             at(vec![("part", part(""))]),
         )?;
         for d in deltas {
-            if pace > 0.0 {
-                std::thread::sleep(Duration::from_secs_f64(pace));
-            }
+            sleep_secs(pace);
             self.ev(
                 out,
                 "response.output_text.delta",
@@ -443,6 +444,11 @@ impl Stub {
         if role == "main" {
             return self.responses(method, path, body, mode, auth, Dialect::Muse, out);
         }
+        let mode = match self.mode_for_request(mode, false) {
+            Ok(mode) => mode,
+            Err(refusal) => return refusal.answer(self, method, path, body.len(), out),
+        };
+        let mode = mode.as_str();
         let info = analyse_responses(body);
         bump(&mut self.st().by_kind, "muse-side");
         let tools = tool_names(body);

@@ -502,9 +502,23 @@ fn hovering_any_part_of_the_account_lights_the_whole_unit() {
             "{col}: the mark and every join take the lit accent: {lit_marks:?}, at rest {rest_marks:?}"
         );
         // The underline lies under the ink, so an end glyph nudged off its cell's middle may
-        // stand past it; every glyph between, the joins among them, is under it.
+        // stand past it; every glyph between, the joins among them, is under it where its ink
+        // is drawn (its cell moved by its nudge: small type runs ahead of the cells).
+        let under_ink = |c: usize| {
+            let cells = &app.windows[&wid].input_scratch.cells[row];
+            let n = isize::from(aterm_agent::harness::footer::NUDGES_PER_CELL);
+            let nudge = match cells[c].script {
+                aterm_core::terminal::Script::Sub { nudge } => isize::from(nudge),
+                _ => 0,
+            };
+            let drawn = (c as isize * n + nudge + n / 2).div_euclid(n);
+            usize::try_from(drawn)
+                .ok()
+                .and_then(|d| cells.get(d))
+                .is_some_and(|cell| cell.underline == UnderlineStyle::Single)
+        };
         assert!(
-            lit[1..lit.len() - 1].iter().all(|g| g.3),
+            lit[1..lit.len() - 1].iter().all(|g| under_ink(g.0)),
             "{col}: the whole unit is underlined: {lit:?}"
         );
         assert_eq!(

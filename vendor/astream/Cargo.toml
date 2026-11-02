@@ -32,7 +32,9 @@ astream-digest = { path = "crates/astream-digest", version = "0.2.0" }
 # move, and the bumped workspace stops resolving (measured 2026-09-29: broker's
 # `astream-aead = "^0.1.0"` against a 0.2.0 crate, so `pub bump` undid itself).
 astream-cap = { path = "crates/astream-cap", version = "0.2.0" }
-astream-aead = { path = "crates/astream-aead", version = "0.2.0" }
+# Default features off: a member names the sealed stream (`astream-aead/stream`) when it
+# speaks the sealed wire, so seal/open alone compiles none of it.
+astream-aead = { path = "crates/astream-aead", version = "0.2.0", default-features = false }
 # The OS cordon (F_BARRIERFSYNC, the boot session id, the owner-only file rule): zero
 # dependencies, its only unsafe confined to two modules, cfg(target_vendor = "apple")
 # and cfg(unix).

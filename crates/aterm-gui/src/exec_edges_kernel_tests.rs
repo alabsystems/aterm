@@ -39,6 +39,7 @@ impl Zsh {
             None,
             aterm_sandbox::Limits::inherit(),
             None,
+            None,
         )
         .expect("zsh must spawn");
         aterm_pty::set_nonblocking(shell.master, true).expect("nonblocking master");

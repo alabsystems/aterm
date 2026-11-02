@@ -158,7 +158,11 @@ impl Header {
         let digits = f.get(..end).unwrap_or(&[]);
         let text =
             std::str::from_utf8(digits).map_err(|_| bad(&format!("non-text {what} field")))?;
-        u64::from_str_radix(text.trim(), 8)
+        let trimmed = text.trim();
+        if !trimmed.bytes().all(|b| matches!(b, b'0'..=b'7')) {
+            return Err(bad(&format!("{what} field is not an octal number")));
+        }
+        u64::from_str_radix(trimmed, 8)
             .map_err(|_| bad(&format!("{what} field is not an octal number")))
     }
 
@@ -513,6 +517,9 @@ struct PaxRecords {
 fn pax_record(line: &[u8]) -> Option<(&[u8], &[u8])> {
     let sp = line.iter().position(|&b| b == b' ')?;
     let digits = line.get(..sp)?;
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
     let reported: usize = std::str::from_utf8(digits).ok()?.parse().ok()?;
     if line.len().checked_add(1)? != reported {
         return None;
@@ -539,7 +546,9 @@ fn parse_pax(body: &[u8]) -> PaxRecords {
             b"linkpath" if out.link.is_none() => out.link = Some(value.to_vec()),
             b"size" if !size_settled => {
                 size_settled = true;
-                out.size = std::str::from_utf8(value).ok().and_then(|v| v.parse().ok());
+                out.size = (!value.is_empty() && value.iter().all(u8::is_ascii_digit))
+                    .then(|| std::str::from_utf8(value).ok()?.parse().ok())
+                    .flatten();
             }
             _ => {}
         }
@@ -1199,6 +1208,18 @@ mod tests {
         assert!(
             entry.header().mode().is_err(),
             "a base-256 mode must not parse as a number"
+        );
+
+        let mut h = header("x.txt", b'0', 0);
+        h[100..108].copy_from_slice(b"+000755\0");
+        seal(&mut h);
+        let bytes = [&h[..], &end()].concat();
+        let mut archive = Archive::new(&bytes[..]);
+        let mut entries = archive.entries().expect("entries");
+        let entry = entries.next_entry().expect("ok").expect("some");
+        assert!(
+            entry.header().mode().is_err(),
+            "a plus-prefixed mode must not parse as octal"
         );
 
         let mut h = header("x.txt", b'0', 0);

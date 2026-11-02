@@ -487,9 +487,11 @@ pub(crate) fn spawn_mend_lane(headless: bool, config_path: Option<PathBuf>) -> b
 
 /// The vault server's job, mended when the program it names is gone (an `aterm.app` moved or
 /// deleted, which launchd can then never start again): installed again from this aterm, where
-/// this aterm lasts, with the arguments it had (`aterm_secrets::service::repair_server`). Its
-/// own job, not the subscriber's: an admin Mac serves whatever System State's plan says of its
-/// sync. Logged; nothing is asked or posted.
+/// this aterm lasts, with the arguments it had (`aterm_secrets::service::repair_server`). Left
+/// as it is while the system LaunchDaemon `aterm machines apply` installs is there, installed or
+/// running: that daemon serves this Mac's vaults on the port the job would take, so the job is
+/// not installed beside it. Its own job, not the subscriber's: an admin Mac serves whatever
+/// System State's plan says of its sync. Logged; nothing is asked or posted.
 #[cfg(target_os = "macos")]
 fn mend_server() {
     let Ok(paths) = Paths::live() else {
@@ -512,10 +514,10 @@ fn mend_server() {
 /// The vault's server and approver, moved off a held program (an admin's `--program`
 /// snapshot) onto this installed release under the managed ALab update or admin-locker
 /// compatibility policy, and only where no person pinned the job
-/// (`aterm_secrets::client::mend_held`); the subscriber only while
-/// System State's plan keeps the vault in sync (`subscriber`). A job whose mend failed this
-/// launch (`failed`, [`held_pass`]) is not tried again until the next. A move is logged; nothing
-/// is asked or posted.
+/// (`aterm_secrets::client::mend_held`); the subscriber only while System State's plan keeps
+/// the vault in sync (`subscriber`). A job whose mend failed this launch (`failed`,
+/// [`held_pass`]) is not tried again until the next. A move is logged with why it moved
+/// (`aterm_secrets::client::HeldMoved`); nothing is asked or posted.
 #[cfg(target_os = "macos")]
 fn mend_held(subscriber: bool, failed: &mut Vec<aterm_secrets::service::Job>) {
     use aterm_secrets::client::HeldMend;
@@ -528,12 +530,22 @@ fn mend_held(subscriber: bool, failed: &mut Vec<aterm_secrets::service::Job>) {
     } else {
         &[Job::Server]
     };
-    let mut mend = |job| aterm_secrets::client::mend_held(&paths, job).map_err(|e| e.to_string());
+    let mut mend = |job| {
+        if job != Job::Subscriber {
+            return aterm_secrets::client::mend_held(&paths, job).map_err(|e| e.to_string());
+        }
+        let mut result = Ok(HeldMend::NotHeld);
+        crate::secrets_sync_while_wanted(&mut || {
+            result = aterm_secrets::client::mend_subscriber(&paths).map_err(|e| e.to_string());
+        });
+        result
+    };
     for (job, mended) in held_pass(jobs, failed, &mut mend) {
         match mended {
-            Ok(HeldMend::Moved(line)) => aterm_log::info!(
-                "secrets vault: the {} job moved from its held aterm; {line}",
-                job.label()
+            Ok(HeldMend::Moved(line, moved)) => aterm_log::info!(
+                "secrets vault: the {} job now runs this aterm ({}); {line}",
+                job.label(),
+                moved.why()
             ),
             Ok(HeldMend::NotHeld | HeldMend::Kept(_) | HeldMend::Unread(_)) => {}
             Err(error) => aterm_log::warn!(

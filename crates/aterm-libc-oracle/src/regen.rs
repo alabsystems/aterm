@@ -610,6 +610,7 @@ mod tests {
             &[],
         );
         let args: Vec<&OsStr> = command.get_args().collect();
+        let manifest = Path::new("/w/reference").join("Cargo.toml");
         assert_eq!(
             args,
             [
@@ -617,7 +618,7 @@ mod tests {
                 "--target",
                 "x86_64-unknown-linux-gnu",
                 "--manifest-path",
-                "/w/reference/Cargo.toml",
+                manifest.to_str().expect("UTF-8"),
                 "--offline",
                 "--target-dir",
                 "/w/target",

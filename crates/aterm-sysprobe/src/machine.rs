@@ -1216,7 +1216,7 @@ pub fn process_limits() -> ProcessLimits {
     #[cfg(target_os = "linux")]
     {
         let read = |path: &str| {
-            crate::with_bounded(Path::new(path), |t| t.trim().parse::<u64>().ok()).flatten()
+            crate::with_bounded(Path::new(path), |t| crate::parse_uint::<u64>(t.trim())).flatten()
         };
         ProcessLimits {
             system: smaller(

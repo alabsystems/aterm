@@ -62,7 +62,21 @@ pub fn output_until_complete_stdout(
     cmd: &mut Command,
     deadline: Instant,
 ) -> Result<Output, CompleteOutputError> {
-    output_until_complete_stdout_from(cmd, Stdio::null(), deadline)
+    output_until_complete_stdout_observed(cmd, deadline, || {})
+}
+
+/// As [`output_until_complete_stdout`], reporting successful process creation before any
+/// output reader starts. A later reader-start error must not be treated as no dispatch.
+/// If the observer unwinds, the owned child is terminated and reaped before unwinding continues.
+///
+/// # Errors
+/// The same errors as [`output_until_complete_stdout`].
+pub fn output_until_complete_stdout_observed(
+    cmd: &mut Command,
+    deadline: Instant,
+    on_started: impl FnOnce(),
+) -> Result<Output, CompleteOutputError> {
+    output_until_complete_stdout_from_observed(cmd, Stdio::null(), deadline, on_started)
 }
 
 /// Runs `cmd` with `stdin` until `deadline`, requiring complete stdout up to [`OUTPUT_KEEP`].
@@ -74,6 +88,30 @@ pub fn output_until_complete_stdout_from(
     stdin: Stdio,
     deadline: Instant,
 ) -> Result<Output, CompleteOutputError> {
+    output_until_complete_stdout_from_observed(cmd, stdin, deadline, || {})
+}
+
+/// As [`output_until_complete_stdout_from`], with the successful process-creation witness
+/// described by [`output_until_complete_stdout_observed`].
+///
+/// # Errors
+/// The same errors as [`output_until_complete_stdout_from`].
+pub fn output_until_complete_stdout_from_observed(
+    cmd: &mut Command,
+    stdin: Stdio,
+    deadline: Instant,
+    on_started: impl FnOnce(),
+) -> Result<Output, CompleteOutputError> {
+    capture(cmd, stdin, deadline, on_started, drain_stdout)
+}
+
+fn capture(
+    cmd: &mut Command,
+    stdin: Stdio,
+    deadline: Instant,
+    on_started: impl FnOnce(),
+    stdout_reader: impl FnOnce(Option<PipeEnd>, std::process::ChildStdout) -> io::Result<CompleteDrain>,
+) -> Result<Output, CompleteOutputError> {
     #[cfg(unix)]
     cmd.process_group(0);
     let mut child = cmd
@@ -82,8 +120,9 @@ pub fn output_until_complete_stdout_from(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| CompleteOutputError::Run(RunError::Spawn(error)))?;
+    observe_started(&mut child, on_started);
     let stdout = match child.stdout.take() {
-        Some(stream) => match drain_stdout(pipe_end(&stream), stream) {
+        Some(stream) => match stdout_reader(pipe_end(&stream), stream) {
             Ok(stdout) => stdout,
             Err(error) => {
                 end_bounded(&mut child);
@@ -142,6 +181,23 @@ pub fn output_until_complete_stdout_from(
         stdout,
         stderr,
     })
+}
+
+fn observe_started(child: &mut Child, observer: impl FnOnce()) {
+    struct Guard<'a> {
+        child: &'a mut Child,
+        armed: bool,
+    }
+    impl Drop for Guard<'_> {
+        fn drop(&mut self) {
+            if self.armed {
+                end_bounded(self.child);
+            }
+        }
+    }
+    let mut guard = Guard { child, armed: true };
+    observer();
+    guard.armed = false;
 }
 
 fn end_bounded(child: &mut Child) {

@@ -270,7 +270,7 @@ pub fn parse_dscl_list(text: &str) -> Vec<(String, i64)> {
         .filter_map(|l| {
             let mut words = l.split_whitespace();
             let name = words.next()?;
-            let uid = words.next()?.parse().ok()?;
+            let uid = crate::parse_int(words.next()?)?;
             words.next().is_none().then(|| (name.to_owned(), uid))
         })
         .collect()
@@ -320,7 +320,7 @@ pub fn parse_boottime(text: &str) -> Option<u64> {
 pub fn parse_idle_ns(text: &str) -> Option<u64> {
     text.lines().find_map(|l| {
         let (_, value) = l.split_once("\"HIDIdleTime\" = ")?;
-        value.trim().parse().ok()
+        crate::parse_uint(value.trim())
     })
 }
 
@@ -472,7 +472,7 @@ fn read_user(sys: &dyn System, name: &str, admins: &[String]) -> Result<User, St
     };
     let number = |key: &str| {
         get(key)
-            .and_then(|v| v.trim().parse::<u32>().ok())
+            .and_then(|v| crate::parse_uint::<u32>(v.trim()))
             .ok_or_else(|| format!("account {name}: no {key} in {}", cmd.display()))
     };
     let uid = number("UniqueID")?;
@@ -552,17 +552,21 @@ fn floor_boundary(s: &str, at: usize) -> usize {
 }
 
 fn parse_hex(text: &str) -> Option<u32> {
-    u32::from_str_radix(text.strip_prefix("0x")?, 16).ok()
+    let hex = text.strip_prefix("0x")?;
+    (!hex.starts_with('+'))
+        .then(|| u32::from_str_radix(hex, 16).ok())
+        .flatten()
 }
 
 /// Gather live system telemetry ([`crate::protocol::HostVitals`]) from non-privileged OS
 /// readers (`sysctl`, `vm_stat`, `df -k <account-home>`, `ioreg -r -d 1 -c IOAccelerator`).
 #[must_use]
 pub fn gather_vitals(sys: &dyn System, facts: &HostFacts) -> Option<crate::protocol::HostVitals> {
-    let cpu_cores = line(sys, &Cmd::new("/usr/sbin/sysctl").args(["-n", "hw.ncpu"]))
-        .parse::<u32>()
-        .ok()
-        .filter(|n| *n > 0);
+    let cpu_cores = crate::parse_uint::<u32>(&line(
+        sys,
+        &Cmd::new("/usr/sbin/sysctl").args(["-n", "hw.ncpu"]),
+    ))
+    .filter(|n| *n > 0);
     let load_avg_100 = run(
         sys,
         &Cmd::new("/usr/sbin/sysctl").args(["-n", "vm.loadavg"]),
@@ -656,16 +660,21 @@ pub fn gather_vitals(sys: &dyn System, facts: &HostFacts) -> Option<crate::proto
 }
 
 /// Parse `sysctl -n vm.loadavg` (`{ 1.80 1.49 1.58 }`) or `/proc/loadavg` (`1.10 1.59 1.22 ...`)
-/// into `[1m, 5m, 15m]` scaled by 100.
+/// into `[1m, 5m, 15m]` scaled by 100. Each of the first three fields must be a finite,
+/// nonnegative load; Linux's trailing counts and PID cannot replace an invalid field.
 #[must_use]
 pub fn parse_loadavg(text: &str) -> Option<[u32; 3]> {
     let mut vals = text
         .split(|c: char| c.is_whitespace() || matches!(c, '{' | '}'))
         .filter(|tok| !tok.is_empty())
-        .filter_map(|tok| tok.parse::<f64>().ok());
-    let l1 = (vals.next()?.max(0.0) * 100.0).round() as u32;
-    let l5 = (vals.next()?.max(0.0) * 100.0).round() as u32;
-    let l15 = (vals.next()?.max(0.0) * 100.0).round() as u32;
+        .map(|tok| {
+            tok.parse::<f64>()
+                .ok()
+                .filter(|v| !tok.starts_with('+') && v.is_finite() && *v >= 0.0)
+        });
+    let l1 = (vals.next()?? * 100.0).round() as u32;
+    let l5 = (vals.next()?? * 100.0).round() as u32;
+    let l15 = (vals.next()?? * 100.0).round() as u32;
     Some([l1, l5, l15])
 }
 
@@ -744,15 +753,19 @@ pub fn parse_vm_stat(text: &str) -> Option<MemoryVitals> {
 pub fn parse_swapusage(text: &str) -> Option<u64> {
     let (_, after) = text.split_once("used =")?;
     let tok = after.split_whitespace().next()?;
-    let unit = tok.chars().last()?;
-    let num: f64 = tok[..tok.len().saturating_sub(1)].parse().ok()?;
+    let (unit_idx, unit) = tok.char_indices().next_back()?;
+    let raw = &tok[..unit_idx];
+    let num = raw
+        .parse::<f64>()
+        .ok()
+        .filter(|v| !raw.starts_with('+') && v.is_finite() && *v >= 0.0)?;
     let mult = match unit {
         'G' | 'g' => 1024.0 * 1024.0 * 1024.0,
         'M' | 'm' => 1024.0 * 1024.0,
         'K' | 'k' => 1024.0,
         _ => return None,
     };
-    Some((num.max(0.0) * mult).round() as u64)
+    Some((num * mult).round() as u64)
 }
 
 /// Parse `df -k <account-home>` into `(total_bytes, used_bytes, avail_bytes)`.
@@ -761,9 +774,9 @@ pub fn parse_df_k(text: &str) -> Option<(u64, u64, u64)> {
     let row = text.lines().skip(1).find(|l| !l.trim().is_empty())?;
     let mut cols = row.split_whitespace();
     let _fs = cols.next()?;
-    let total_kb = cols.next()?.parse::<u64>().ok()?;
-    let used_kb = cols.next()?.parse::<u64>().ok()?;
-    let avail_kb = cols.next()?.parse::<u64>().ok()?;
+    let total_kb = crate::parse_uint::<u64>(cols.next()?)?;
+    let used_kb = crate::parse_uint::<u64>(cols.next()?)?;
+    let avail_kb = crate::parse_uint::<u64>(cols.next()?)?;
     let total = total_kb.saturating_mul(1024);
     let avail = avail_kb.saturating_mul(1024).min(total);
     let used = used_kb.saturating_mul(1024).min(total);
@@ -797,7 +810,7 @@ pub fn parse_ioreg_gpu(text: &str) -> Option<GpuVitals> {
         }
         if cores.is_none()
             && let Some((_, rest)) = line.split_once("\"gpu-core-count\" = ")
-            && let Ok(c) = rest.trim().parse::<u32>()
+            && let Some(c) = crate::parse_uint::<u32>(rest.trim())
             && c > 0
         {
             cores = Some(c);
@@ -874,7 +887,7 @@ mod tests {
             name: "owner".into(),
             uid: 501,
             gid: 20,
-            home: "/Users/owner".into(),
+            home: "/Users//owner".into(),
             shell: "/bin/zsh".into(),
             admin: true,
         });
@@ -884,7 +897,7 @@ mod tests {
                  Pages active: 100.\nAnonymous pages: 0.\nPages purgeable: 0.\n\
                  Pages wired down: 0.\nPages occupied by compressor: 0.\n",
             ))
-            .on("/bin/df -k /Users/owner", Ran::ok(
+            .on("/bin/df -k /Users//owner", Ran::ok(
                 "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/disk 1000 600 200 75% /\n",
             ))
             .on("/bin/df -k /", Ran::ok(
@@ -914,7 +927,7 @@ mod tests {
         assert!(
             sys.calls()
                 .iter()
-                .any(|call| call == "/bin/df -k /Users/owner")
+                .any(|call| call == "/bin/df -k /Users//owner")
         );
         assert!(!sys.calls().iter().any(|call| call == "/bin/df -k /"));
         assert_eq!(v.gpu_name.as_deref(), Some("Apple M5 Max"));
@@ -1010,7 +1023,7 @@ nobody                   -2
 root                     0
 ";
 
-    const VM_DSCL_ADMIN: &str = "NFSHomeDirectory: /Users/admin
+    const VM_DSCL_ADMIN: &str = "NFSHomeDirectory: /Users//admin
 PrimaryGroupID: 20
 UniqueID: 501
 UserShell: /bin/zsh
@@ -1083,7 +1096,7 @@ UserShell: /bin/zsh
             Ran::ok(VM_ADMIN_GROUP),
         )
         .on(
-            "/usr/bin/dscl . -read /Users/admin UniqueID PrimaryGroupID NFSHomeDirectory UserShell",
+            "/usr/bin/dscl . -read /Users//admin UniqueID PrimaryGroupID NFSHomeDirectory UserShell",
             Ran::ok(VM_DSCL_ADMIN),
         )
         .on(&hidutil_keyboards().display(), Ran::ok(VM_HIDUTIL))
@@ -1135,7 +1148,7 @@ UserShell: /bin/zsh
                 name: "admin".into(),
                 uid: 501,
                 gid: 20,
-                home: "/Users/admin".into(),
+                home: "/Users//admin".into(),
                 shell: "/bin/zsh".into(),
                 admin: true,
             }]
@@ -1329,7 +1342,7 @@ VendorID ProductID LocationID UsagePage Usage RegistryID  Transport            C
         assert_eq!(attrs, vec![("RealName".into(), "Managed via Tart".into())]);
         let attrs = parse_dscl_read(VM_DSCL_ADMIN);
         assert_eq!(attrs.len(), 4);
-        assert_eq!(attrs[0], ("NFSHomeDirectory".into(), "/Users/admin".into()));
+        assert_eq!(attrs[0], ("NFSHomeDirectory".into(), "/Users//admin".into()));
     }
 
     #[test]
@@ -1348,7 +1361,7 @@ VendorID ProductID LocationID UsagePage Usage RegistryID  Transport            C
             Ran::ok(VM_ADMIN_GROUP),
         )
         .on(
-            "/usr/bin/dscl . -read /Users/nosuchuser UniqueID PrimaryGroupID NFSHomeDirectory UserShell",
+            "/usr/bin/dscl . -read /Users//nosuchuser UniqueID PrimaryGroupID NFSHomeDirectory UserShell",
             Ran::exit(56, "<dscl_cmd> DS Error: -14136 (eDSRecordNotFound)"),
         );
         assert_eq!(
@@ -1363,7 +1376,7 @@ VendorID ProductID LocationID UsagePage Usage RegistryID  Transport            C
     fn one_account_resolves_with_its_admin_bit() {
         let u = user(&vm(), "admin").unwrap();
         assert_eq!((u.uid, u.gid, u.admin), (501, 20, true));
-        assert_eq!(u.home, "/Users/admin");
+        assert_eq!(u.home, "/Users//admin");
     }
 
     #[test]
@@ -1530,6 +1543,35 @@ VendorID ProductID LocationID UsagePage Usage RegistryID  Transport            C
     }
 
     #[test]
+    fn load_average_fields_do_not_shift_past_an_invalid_window() {
+        assert_eq!(parse_loadavg("{ 1.80 1.49 1.58 }\n"), Some([180, 149, 158]));
+        assert_eq!(
+            parse_loadavg("1.10 1.59 1.22 3/99 1234\n"),
+            Some([110, 159, 122])
+        );
+        assert_eq!(parse_loadavg("{ 0 0 0.25 }"), Some([0, 0, 25]));
+        for short in ["", "1.10 1.59", "{ 1.10 1.59 }"] {
+            assert_eq!(parse_loadavg(short), None, "missing load: {short}");
+        }
+
+        for bad in ["NaN", "inf", "-inf", "1e999", "-1.0", "invalid"] {
+            for at in 0..3 {
+                let mut fields = ["1.10", "1.59", "1.22"];
+                fields[at] = bad;
+                let values = fields.join(" ");
+                let linux = format!("{values} 3/99 1234");
+                assert_eq!(
+                    parse_loadavg(&linux),
+                    None,
+                    "load field {at} must not be repaired by the trailing PID: {linux}"
+                );
+                assert_eq!(parse_loadavg(&format!("{{ {values} }}")), None);
+            }
+        }
+        assert_eq!(parse_loadavg("1.10 1.59 3/99 1234"), None);
+    }
+
+    #[test]
     fn boot_time_and_idle_time_parse_the_tools_own_formats() {
         assert_eq!(
             parse_boottime("{ sec = 1792190170, usec = 411172 } Fri Oct 16 22:36:10 2026\n"),
@@ -1547,6 +1589,14 @@ VendorID ProductID LocationID UsagePage Usage RegistryID  Transport            C
             Some("IOCommand is not serializable")
         );
         assert_eq!(ioreg_string(VM_IOREG, "missing"), None);
+        assert_eq!(parse_swapusage("used = 100\u{b5}"), None);
+        assert_eq!(parse_swapusage("used = NaNM"), None);
+        assert_eq!(parse_swapusage("used = -1.0M"), None);
+        assert_eq!(parse_swapusage("used = +1.0M"), None);
+        assert_eq!(parse_loadavg("{ NaN 1.0 2.0 }"), None);
+        assert_eq!(parse_loadavg("{ -1.0 1.0 2.0 }"), None);
+        assert_eq!(parse_loadavg("{ +1.0 1.0 2.0 }"), None);
+        assert!(parse_dscl_list("admin +501\n").is_empty());
     }
 
     #[test]

@@ -39,6 +39,18 @@ impl AghHost {
         }
     }
 
+    /// The production host serving `home` (design §10.3): `Router::from_validated` of
+    /// `config::load_for_host(&dirs)`, the journal, the caller `atpkg-publish`, and
+    /// `RetryPolicy::STANDARD`.
+    ///
+    /// # Errors
+    ///
+    /// `Err(why)` when agh.toml is missing (`None`) or invalid, for `Ctx::from_env_hosts`.
+    pub fn production(dirs: &agh::config::Dirs, home: agh::Slug) -> Result<AghHost, String> {
+        let _ = (dirs, home);
+        Err("not yet: AghHost::production lands in WP11".to_string())
+    }
+
     /// Tests: another pause (the contract uses zero).
     #[cfg(any(test, debug_assertions))]
     #[must_use]

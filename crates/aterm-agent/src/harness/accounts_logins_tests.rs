@@ -908,6 +908,7 @@ fn a_login_end_is_advised_the_sessions_own_label_and_never_another() {
             ahead: false,
             rotates: true,
             takes_canary: false,
+            yields: None,
         }
     );
     let mut logins = Logins::default();
@@ -942,6 +943,7 @@ fn a_login_end_is_advised_the_sessions_own_label_and_never_another() {
                     ahead,
                     rotates: false,
                     takes_canary: false,
+                    yields: None,
                 },
                 "{mode:?} {point:?}"
             );
@@ -1021,6 +1023,7 @@ fn a_renewal_made_under_a_wall_is_followed_at_once() {
                         ahead,
                         rotates: false,
                         takes_canary: false,
+                        yields: None,
                     },
                     "{window} {mode:?} {point:?}: the renewed login followed"
                 );

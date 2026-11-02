@@ -640,7 +640,9 @@ impl Bench for WindowBench<'_> {
     }
 
     fn cool(&mut self, seconds: f64) {
-        std::thread::sleep(Duration::from_secs_f64(seconds));
+        if let Ok(d) = Duration::try_from_secs_f64(seconds) {
+            std::thread::sleep(d);
+        }
     }
 }
 

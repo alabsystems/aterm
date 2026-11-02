@@ -169,7 +169,7 @@ fn streamed(
             Some(Event::End) => ended = true,
             Some(Event::Exited(s)) => {
                 status = Some(s);
-                until = Some(std::time::Instant::now() + drain);
+                until = Some(crate::durable::deadline_after(drain));
             }
             None => break,
         }
@@ -216,11 +216,8 @@ impl World for Real {
 
     fn download(&mut self, url: &str, limit: u64) -> Result<Vec<u8>, String> {
         if let Some(path) = url.strip_prefix("file://") {
-            let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
-            if bytes.len() as u64 > limit {
-                return Err(format!("larger than {limit} bytes"));
-            }
-            return Ok(bytes);
+            return crate::durable::read_regular_bytes(Path::new(path), limit)
+                .map_err(|e| format!("{path}: {e}"));
         }
         aterm_update_core::download_bytes(url, limit)
     }

@@ -73,6 +73,7 @@ impl Line {
         let attrs_size = if self.attrs.is_some() {
             super::attr_runs(self.attrs.as_deref())
                 .len()
+                .min(u32::MAX as usize)
                 .saturating_mul(14)
                 .saturating_add(5)
         } else {
@@ -81,7 +82,7 @@ impl Line {
         let hyperlinks_size = match self.hyperlinks() {
             Some(spans) => {
                 let mut size = 2usize;
-                for span in spans {
+                for span in spans.iter().take(usize::from(u16::MAX)) {
                     size = size.saturating_add(span.serialized_size());
                 }
                 size
@@ -89,7 +90,11 @@ impl Line {
             None => 2,
         };
         let underline_colors_size = match self.underline_colors() {
-            Some(spans) => spans.len().saturating_mul(8).saturating_add(2),
+            Some(spans) => spans
+                .len()
+                .min(usize::from(u16::MAX))
+                .saturating_mul(8)
+                .saturating_add(2),
             None => 0,
         };
         6usize
@@ -132,7 +137,7 @@ impl Line {
             result.push(1);
             let run_count = u32::try_from(runs.len()).unwrap_or(u32::MAX);
             result.extend_from_slice(&run_count.to_le_bytes());
-            for run in runs {
+            for run in runs.iter().take(run_count as usize) {
                 result.extend_from_slice(&run.value.serialize());
                 result.extend_from_slice(&run.length.to_le_bytes());
             }
@@ -143,19 +148,19 @@ impl Line {
         if let Some(spans) = self.hyperlinks() {
             let count = u16::try_from(spans.len()).unwrap_or(u16::MAX);
             result.extend_from_slice(&count.to_le_bytes());
-            for span in spans {
+            for span in spans.iter().take(usize::from(count)) {
                 result.extend_from_slice(&span.start_col.to_le_bytes());
                 result.extend_from_slice(&span.end_col.to_le_bytes());
                 let url_len = u32::try_from(span.url.len()).unwrap_or(u32::MAX);
                 result.extend_from_slice(&url_len.to_le_bytes());
-                result.extend_from_slice(span.url.as_bytes());
+                result.extend_from_slice(&span.url.as_bytes()[..url_len as usize]);
                 let id_len = span
                     .id
                     .as_ref()
                     .map_or(0u32, |id| u32::try_from(id.len()).unwrap_or(u32::MAX));
                 result.extend_from_slice(&id_len.to_le_bytes());
                 if let Some(id) = &span.id {
-                    result.extend_from_slice(id.as_bytes());
+                    result.extend_from_slice(&id.as_bytes()[..id_len as usize]);
                 }
             }
         } else {
@@ -165,7 +170,7 @@ impl Line {
         if let Some(spans) = self.underline_colors() {
             let count = u16::try_from(spans.len()).unwrap_or(u16::MAX);
             result.extend_from_slice(&count.to_le_bytes());
-            for span in spans {
+            for span in spans.iter().take(usize::from(count)) {
                 result.extend_from_slice(&span.start_col.to_le_bytes());
                 result.extend_from_slice(&span.end_col.to_le_bytes());
                 result.extend_from_slice(&span.color.to_le_bytes());
@@ -336,7 +341,12 @@ impl Line {
             }
             offset = end;
         }
-        Some((Some(rle), offset))
+        let next_offset = if clamped_count < run_count {
+            data.len()
+        } else {
+            offset
+        };
+        Some((Some(rle), next_offset))
     }
 
     /// Deserialize v2 hyperlink spans (no IDs) starting at `offset`.
@@ -417,60 +427,65 @@ impl Line {
         let mut pushed = 0usize;
         let mut pos = header_end;
         for _ in 0..count {
-            if pushed >= MAX_HYPERLINK_SPANS {
-                break;
-            }
             let Some(hdr_end) = pos.checked_add(8) else {
+                pos = data.len();
                 break;
             };
             let Some(hdr) = data.get(pos..hdr_end) else {
+                pos = data.len();
                 break;
             };
             if hdr.len() < 8 {
+                pos = data.len();
                 break;
             }
             let start_col = u16::from_le_bytes([hdr[0], hdr[1]]);
             let end_col = u16::from_le_bytes([hdr[2], hdr[3]]);
             let url_len = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
-            pos = hdr_end;
-            let Some(url_end) = pos.checked_add(url_len) else {
+            let Some(url_end) = hdr_end.checked_add(url_len) else {
+                pos = data.len();
                 break;
             };
-            let Some(url_bytes) = data.get(pos..url_end) else {
+            let Some(url_bytes) = data.get(hdr_end..url_end) else {
+                pos = data.len();
                 break;
             };
-            pos = url_end;
 
-            let Some(id_hdr_end) = pos.checked_add(4) else {
+            let Some(id_hdr_end) = url_end.checked_add(4) else {
+                pos = data.len();
                 break;
             };
-            let Some(id_hdr) = data.get(pos..id_hdr_end) else {
+            let Some(id_hdr) = data.get(url_end..id_hdr_end) else {
+                pos = data.len();
                 break;
             };
             if id_hdr.len() < 4 {
+                pos = data.len();
                 break;
             }
             let id_len = u32::from_le_bytes([id_hdr[0], id_hdr[1], id_hdr[2], id_hdr[3]]) as usize;
-            pos = id_hdr_end;
-            let id = if id_len > 0 {
-                let Some(id_end) = pos.checked_add(id_len) else {
+            let (id, span_end) = if id_len > 0 {
+                let Some(id_end) = id_hdr_end.checked_add(id_len) else {
+                    pos = data.len();
                     break;
                 };
-                let Some(id_bytes) = data.get(pos..id_end) else {
+                let Some(id_bytes) = data.get(id_hdr_end..id_end) else {
+                    pos = data.len();
                     break;
                 };
-                let id_str = if id_len <= MAX_HYPERLINK_ID_BYTES {
+                let id_str = if pushed < MAX_HYPERLINK_SPANS && id_len <= MAX_HYPERLINK_ID_BYTES {
                     std::str::from_utf8(id_bytes).ok()
                 } else {
                     None
                 };
-                pos = id_end;
-                id_str.map(Arc::from)
+                (id_str.map(Arc::from), id_end)
             } else {
-                None
+                (None, id_hdr_end)
             };
+            pos = span_end;
 
-            if url_len <= MAX_HYPERLINK_URL_BYTES
+            if pushed < MAX_HYPERLINK_SPANS
+                && url_len <= MAX_HYPERLINK_URL_BYTES
                 && let Ok(url) = std::str::from_utf8(url_bytes)
             {
                 spans.push(HyperlinkSpan::with_id(
@@ -562,5 +577,5 @@ pub(crate) use super::line_codec_block::{
 pub use super::line_codec_block::{
     deserialize_lines, deserialize_lines_strict, deserialize_lines_strict_dropping_over_cap_links,
     deserialize_lines_tail_strict, deserialize_page_lines, max_linked_record_bytes,
-    serialize_lines, serialize_lines_bounded,
+    serialize_line_views, serialize_lines, serialize_lines_bounded,
 };

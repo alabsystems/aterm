@@ -400,6 +400,7 @@ pub fn cmd_disk_lane(args: &[String]) -> Res {
     )?;
     let lock = std::fs::File::open(home.join("locked/target/debug/.cargo-lock"))
         .map_err(|e| format!("lock: {e}"))?;
+    aterm_uds::keep_out_of_children(&lock).map_err(|e| format!("lock clofork: {e}"))?;
     #[expect(
         clippy::disallowed_methods,
         reason = "the lane's build holds the lock for its life"

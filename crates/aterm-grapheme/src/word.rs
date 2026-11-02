@@ -80,7 +80,7 @@ pub fn word_start_before<F: Fn(char) -> bool>(
 
 /// The largest character boundary of `text` at or before `position`.
 #[inline]
-const fn floor_char_boundary(text: &str, position: usize) -> usize {
+pub(crate) const fn floor_char_boundary(text: &str, position: usize) -> usize {
     let mut at = if position < text.len() {
         position
     } else {

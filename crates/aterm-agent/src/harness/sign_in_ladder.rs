@@ -136,7 +136,7 @@ impl Vault {
             let failed = first
                 .rsplit_once(", ")
                 .and_then(|(_, tail)| tail.strip_suffix(" failed"))
-                .and_then(|n| n.parse::<u64>().ok());
+                .and_then(crate::parse_uint::<u64>);
             return match failed {
                 Some(0) => Self::Applied(seq),
                 Some(_) => Self::AppliedPartly(seq),
@@ -314,6 +314,25 @@ pub(super) fn how_it_ended(
     }
 }
 
+/// [`how_it_ended`], then why a run that ended [`Renewal::Failed`] could not be started or read
+/// (`cause`): the words of a failure the run itself gave no exit or page for.
+///
+/// [`Renewal::Failed`]: super::cli::Renewal::Failed
+pub(super) fn how_it_ended_because(
+    renewal: super::cli::Renewal,
+    code: Option<i32>,
+    met: Option<&super::open_url::Met>,
+    cause: Option<&str>,
+) -> String {
+    let words = how_it_ended(renewal, code, met);
+    match cause {
+        Some(why) if renewal == super::cli::Renewal::Failed && met.is_none() => {
+            format!("{words}: {why}")
+        }
+        _ => words,
+    }
+}
+
 /// [`how_it_ended`] without what the page met.
 fn run_words(renewal: super::cli::Renewal, code: Option<i32>) -> String {
     use super::cli::Renewal;
@@ -367,6 +386,8 @@ struct Backoff {
     step: u32,
     /// What the ladder read when it failed ([`Ladder::held`]'s `inputs`).
     inputs: String,
+    /// A page stopped this failure ([`Ladder::page_stopped`]).
+    page_stopped: bool,
 }
 
 /// The vault refresh's own clock: one `aterm secrets sync` at a time, and none sooner than its
@@ -498,9 +519,19 @@ impl Ladder {
                 next: now + wait,
                 step,
                 inputs: inputs.to_owned(),
+                page_stopped: false,
             },
         );
         wait
+    }
+
+    /// Notes that a page stopped `label`'s last failure: Cloudflare's check judges this Mac's
+    /// address and browser, which a peer's return changes neither of, so no peer ends this wait
+    /// ([`Self::peer_heard`]) while a move ([`Self::moved`]) does.
+    pub(super) fn page_stopped(&mut self, label: &str) {
+        if let Some(backoff) = self.backoff.get_mut(label) {
+            backoff.page_stopped = true;
+        }
     }
 
     /// Whether a retry step is retained, even after its deadline has passed.
@@ -510,6 +541,11 @@ impl Ladder {
 
     /// Notes that `label` signed in: its backoff ends.
     pub(super) fn signed_in(&mut self, label: &str) {
+        self.backoff.remove(label);
+    }
+
+    /// A newly checked preparation replaces the authority behind the prior attempt.
+    pub(super) fn preparation_changed(&mut self, label: &str) {
         self.backoff.remove(label);
     }
 
@@ -632,6 +668,18 @@ impl Ladder {
     pub(super) fn moved(&mut self, now: Instant) {
         self.invalidate_vault_result();
         for backoff in self.backoff.values_mut() {
+            backoff.next = backoff.next.min(now);
+        }
+    }
+
+    /// A peer was heard at `now`, on a beacon or a browse row: what this Mac reaches through a peer
+    /// (the vault, a relay's stewards) may answer now, so the waits end as at a move
+    /// ([`Self::moved`]), and the upkeep can reach a vault a row's own wait held it from. A row a
+    /// page stopped waits on ([`Self::page_stopped`]): a fleet's peers come and go all day, and
+    /// ending its wait on each would load that page back to back.
+    pub(super) fn peer_heard(&mut self, now: Instant) {
+        self.invalidate_vault_result();
+        for backoff in self.backoff.values_mut().filter(|b| !b.page_stopped) {
             backoff.next = backoff.next.min(now);
         }
     }

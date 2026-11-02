@@ -335,13 +335,15 @@ pub(crate) enum DrawPrim {
         fill: Rgba,
     },
     /// A ring: a faint full-circle `track` and a bold arc filling `frac` of
-    /// the turn (clockwise from 12 o'clock) in `fill`.
+    /// the turn in `fill`, clockwise from `start` turns past 12 o'clock (0 is
+    /// 12 o'clock, 0.25 is 3 o'clock), so an arc can turn in place.
     Ring {
         cx: f32,
         cy: f32,
         r_outer: f32,
         thickness: f32,
         track: Rgba,
+        start: f32,
         frac: f32,
         fill: Rgba,
     },
@@ -480,13 +482,15 @@ pub(crate) enum DrawPrim {
         color: Rgba,
     },
     /// A bitmap in the `w`×`h` rect at `(x, y)`, baked from `art` at the rect's exact device
-    /// size (cached per size), so it is never resampled.
+    /// size (cached per size), so it is never resampled, drawn at `alpha` (255 opaque, 0
+    /// nothing), so one pose can dissolve into the next.
     Image {
         x: f32,
         y: f32,
         w: f32,
         h: f32,
         art: ImageArt,
+        alpha: u8,
     },
 }
 
@@ -516,10 +520,11 @@ impl DrawPrim {
                 r_outer,
                 thickness,
                 track,
+                start,
                 frac,
                 fill,
             } => {
-                f32_bits(state, &[*cx, *cy, *r_outer, *thickness, *frac]);
+                f32_bits(state, &[*cx, *cy, *r_outer, *thickness, *start, *frac]);
                 (track, fill).hash(state);
             }
             Self::Capsule {
@@ -616,9 +621,16 @@ impl DrawPrim {
                 f32_bits(state, &[*x, *y, *size]);
                 (icon, color).hash(state);
             }
-            Self::Image { x, y, w, h, art } => {
+            Self::Image {
+                x,
+                y,
+                w,
+                h,
+                art,
+                alpha,
+            } => {
                 f32_bits(state, &[*x, *y, *w, *h]);
-                art.hash(state);
+                (art, alpha).hash(state);
             }
         }
     }
@@ -635,28 +647,35 @@ fn f32_bits(state: &mut impl Hasher, values: &[f32]) {
 /// device size it is drawn at.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum ImageArt {
-    /// The aterm · ALab rainbow kitty: the pet roster's tabby in the `PetStretchHind` pose of
-    /// `assets/aterm-rainbow-kitty.png`, in the brand coat, its keyline pale on a dark ground.
-    BrandKitty { dark: bool },
+    /// The aterm · ALab rainbow kitty in one of the pet roster's poses (the setup screen's lockup
+    /// draws the run's moments with them, `docs/DESIGN-init-on-by-default-2026-10-25.md` §4.5),
+    /// in the brand coat, its keyline pale on a dark ground.
+    Kitty {
+        pose: aterm_effects::pet_glyphs_gen::PetGlyphId,
+        dark: bool,
+    },
 }
 
 impl ImageArt {
-    const BRAND_POSE: aterm_effects::pet_glyphs_gen::PetGlyphId =
+    /// The pose of the brand image `assets/aterm-rainbow-kitty.png`, the tail raised behind the
+    /// caret.
+    #[cfg(test)]
+    pub(crate) const BRAND_POSE: aterm_effects::pet_glyphs_gen::PetGlyphId =
         aterm_effects::pet_glyphs_gen::PetGlyphId::PetStretchHind;
 
     /// The art's authored width ÷ height: a caller sizes its rect from it, so
     /// the bake is never stretched.
     pub(crate) fn aspect(self) -> f32 {
         match self {
-            Self::BrandKitty { .. } => aterm_effects::pet_baker::PetBaker::aspect(Self::BRAND_POSE),
+            Self::Kitty { pose, .. } => aterm_effects::pet_baker::PetBaker::aspect(pose),
         }
     }
 
     /// Straight-alpha RGBA8 rows of the art at exactly `w`×`h` device pixels.
     pub(crate) fn bake(self, w: u32, h: u32) -> Vec<u8> {
         match self {
-            Self::BrandKitty { dark } => aterm_effects::pet_baker::bake_pose(
-                Self::BRAND_POSE,
+            Self::Kitty { pose, dark } => aterm_effects::pet_baker::bake_pose(
+                pose,
                 &aterm_effects::cat_baker::ResolvedFills::from_indices(13, 4, dark),
                 w,
                 h,
@@ -666,28 +685,95 @@ impl ImageArt {
         }
     }
 
-    /// Where the art draws, baked once per process at [`ArtMask::HEIGHT`]
+    /// The art baked at exactly `w`×`h` device pixels: from the bakes kept ([`IMAGES_KEPT`]),
+    /// else baked now, on the calling thread, and kept. The setup screen bakes the poses it draws
+    /// ahead, on a background thread (`system_state::kitty`), so a raster thread finds them here.
+    pub(crate) fn baked(self, w: u32, h: u32) -> std::sync::Arc<[u8]> {
+        let key = (self, w, h);
+        if let Some(pixels) = with_baked_images(|kept| {
+            kept.iter()
+                .find(|(baked, _)| *baked == key)
+                .map(|(_, pixels)| std::sync::Arc::clone(pixels))
+        }) {
+            return pixels;
+        }
+        let pixels: std::sync::Arc<[u8]> = self.bake(w, h).into();
+        with_baked_images(|kept| {
+            kept.retain(|(baked, _)| *baked != key);
+            if kept.len() >= IMAGES_KEPT {
+                kept.remove(0);
+            }
+            kept.push((key, std::sync::Arc::clone(&pixels)));
+        });
+        pixels
+    }
+
+    /// Whether a bake of the art at `w`×`h` device pixels is kept now.
+    pub(crate) fn is_baked(self, w: u32, h: u32) -> bool {
+        with_baked_images(|kept| kept.iter().any(|(baked, _)| *baked == (self, w, h)))
+    }
+
+    /// Where the art draws, baked once per process for each art at [`ArtMask::HEIGHT`]
     /// pixels tall: its visible edges, whatever size it is drawn at.
     pub(crate) fn mask(self) -> &'static ArtMask {
-        static MASKS: [std::sync::OnceLock<ArtMask>; 2] = [
-            const { std::sync::OnceLock::new() },
-            const { std::sync::OnceLock::new() },
-        ];
-        let slot = match self {
-            Self::BrandKitty { dark } => usize::from(dark),
-        };
-        MASKS[slot].get_or_init(|| {
-            let h = ArtMask::HEIGHT;
-            let w = (h as f32 * self.aspect()).round().max(1.0) as u32;
-            ArtMask::new(
-                w,
-                h,
-                self.bake(w, h)
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|pixel| pixel[3]),
-            )
+        // A handful of poses on two grounds: each mask is made once and kept for the process.
+        static MASKS: std::sync::Mutex<Vec<(ImageArt, &'static ArtMask)>> =
+            std::sync::Mutex::new(Vec::new());
+        let mut masks = MASKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((_, mask)) = masks.iter().find(|(art, _)| *art == self) {
+            return mask;
+        }
+        let h = ArtMask::HEIGHT;
+        let w = (h as f32 * self.aspect()).round().max(1.0) as u32;
+        let mask: &'static ArtMask = Box::leak(Box::new(ArtMask::new(
+            w,
+            h,
+            self.bake(w, h)
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|pixel| pixel[3]),
+        )));
+        masks.push((self, mask));
+        mask
+    }
+}
+
+/// How many baked [`ImageArt`] bitmaps are kept: the setup screen's working set, each pose its
+/// lockup draws (nine) on both grounds at two display scales.
+pub(crate) const IMAGES_KEPT: usize = 9 * 2 * 2;
+
+/// A bake kept: the art and its device width and height, and its pixels.
+type BakedImage = ((ImageArt, u32, u32), std::sync::Arc<[u8]>);
+
+/// The bakes, newest last: one set for the process, which the setup screen's bake thread fills
+/// and every raster thread reads.
+#[cfg(not(test))]
+static BAKED_IMAGES: std::sync::Mutex<Vec<BakedImage>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+thread_local! {
+    /// A test thread's own bakes, so tests running side by side never evict each other's.
+    static BAKED_IMAGES: std::sync::Mutex<Vec<BakedImage>> =
+        const { std::sync::Mutex::new(Vec::new()) };
+}
+
+/// Run `f` on the bakes kept.
+fn with_baked_images<T>(f: impl FnOnce(&mut Vec<BakedImage>) -> T) -> T {
+    #[cfg(not(test))]
+    {
+        f(&mut BAKED_IMAGES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
+    }
+    #[cfg(test)]
+    {
+        BAKED_IMAGES.with(|kept| {
+            f(&mut kept
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner))
         })
     }
 }
@@ -919,8 +1005,18 @@ mod tests {
             -0.3, 0.0, 0.01, 0.1, 0.25, 0.333, 0.5, 0.6, 0.77, 0.9, 0.999, 1.0, 1.4,
         ];
         for art in [
-            ImageArt::BrandKitty { dark: false },
-            ImageArt::BrandKitty { dark: true },
+            ImageArt::Kitty {
+                pose: ImageArt::BRAND_POSE,
+                dark: false,
+            },
+            ImageArt::Kitty {
+                pose: ImageArt::BRAND_POSE,
+                dark: true,
+            },
+            ImageArt::Kitty {
+                pose: aterm_effects::pet_glyphs_gen::PetGlyphId::PetLoaf,
+                dark: true,
+            },
         ] {
             let mask = art.mask();
             let alpha: Vec<u8> = art
@@ -1017,6 +1113,7 @@ mod tests {
                 r_outer: 6.0,
                 thickness: 1.5,
                 track: ink,
+                start: 0.25,
                 frac: 0.5,
                 fill: other,
             },
@@ -1119,7 +1216,11 @@ mod tests {
                 y: 3.0,
                 w: 24.0,
                 h: 12.0,
-                art: ImageArt::BrandKitty { dark: true },
+                art: ImageArt::Kitty {
+                    pose: ImageArt::BRAND_POSE,
+                    dark: true,
+                },
+                alpha: 200,
             },
         ]
     }
@@ -1194,10 +1295,25 @@ mod tests {
         }
     }
 
+    impl Nudge for u8 {
+        /// The low bit.
+        fn nudges(&self) -> Vec<Self> {
+            vec![*self ^ 1]
+        }
+    }
+
     impl Nudge for ImageArt {
         fn nudges(&self) -> Vec<Self> {
-            let Self::BrandKitty { dark } = *self;
-            vec![Self::BrandKitty { dark: !dark }]
+            let Self::Kitty { pose, dark } = *self;
+            let other = if pose == ImageArt::BRAND_POSE {
+                aterm_effects::pet_glyphs_gen::PetGlyphId::PetSit
+            } else {
+                ImageArt::BRAND_POSE
+            };
+            vec![
+                Self::Kitty { pose, dark: !dark },
+                Self::Kitty { pose: other, dark },
+            ]
         }
     }
 
@@ -1291,7 +1407,10 @@ mod tests {
         match p {
             DrawPrim::Panel { .. } => nudged!(p, Panel(x, y, w, h, radius, fill)),
             DrawPrim::Ring { .. } => {
-                nudged!(p, Ring(cx, cy, r_outer, thickness, track, frac, fill))
+                nudged!(
+                    p,
+                    Ring(cx, cy, r_outer, thickness, track, start, frac, fill)
+                )
             }
             DrawPrim::Capsule { .. } => nudged!(p, Capsule(x, y, w, h, frac, fill, track)),
             DrawPrim::Dot { .. } => nudged!(p, Dot(cx, cy, r, color)),
@@ -1311,7 +1430,7 @@ mod tests {
             DrawPrim::ClipPush { .. } => nudged!(p, ClipPush(x, y, w, h)),
             DrawPrim::FadePush { .. } => nudged!(p, FadePush(y, h, from, to)),
             DrawPrim::BandIcon { .. } => nudged!(p, BandIcon(x, y, size, icon, color)),
-            DrawPrim::Image { .. } => nudged!(p, Image(x, y, w, h, art)),
+            DrawPrim::Image { .. } => nudged!(p, Image(x, y, w, h, art, alpha)),
             DrawPrim::ClipPop
             | DrawPrim::FadePop
             | DrawPrim::SubpixelPush

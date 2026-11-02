@@ -99,66 +99,6 @@ fn state_line(app: &App) -> Option<String> {
 }
 
 #[test]
-fn a_background_end_is_a_done_for_you_row_and_chrome_counts_it() {
-    let (mut app, sid, host) = desk();
-    app.take_status_rebuild();
-    end_after(&mut app, &sid, 45 * SEC);
-    assert!(app.end_unseen(0), "PRECONDITION: it stands unseen");
-    assert!(
-        app.take_status_rebuild(),
-        "the end that marks dirties the glance"
-    );
-    let g = app.status_glance();
-    assert_eq!(g.done.len(), 1, "{:?}", g.done);
-    let row = &g.done[0];
-    assert_eq!(row.label, app.tab_label_of_session(0));
-    assert!(row.landed, "Land's end is a landing");
-    assert_eq!(row.result_bytes, 0);
-    let DoneAt::Go(at) = row.at else {
-        panic!("an end's row goes to the session: {row:?}")
-    };
-    assert_eq!(g.go[usize::from(at)], 0);
-    let face_ms = app
-        .pool
-        .get(0)
-        .expect("session 0")
-        .ctx
-        .timeline
-        .lock()
-        .expect("timeline")
-        .task_face();
-    assert_eq!(
-        face_ms.map(|(_, at)| u64::try_from(at).unwrap_or(0)),
-        Some(row.since_unix_ms),
-        "the instant the face moved to landed"
-    );
-    let line = app.status_item_chrome_line();
-    assert!(
-        line.starts_with("statusitem title=\u{276f}\u{2022} needs=0 stuck=0 ")
-            && line.contains(" done=1 "),
-        "{line}"
-    );
-    tell(&mut app, &sid, None);
-    assert_eq!(app.status_glance().done, g.done, "kept through unknown");
-    drop(host);
-
-    let (mut front, sid, host) = desk();
-    front.switch_tab_in(WindowId(0), 0);
-    end_after(&mut front, &sid, 45 * SEC);
-    assert!(!front.end_unseen(0), "seen as it lands");
-    let g = front.status_glance();
-    assert!(g.done.is_empty(), "{:?}", g.done);
-    assert_eq!(g.button_title(), "\u{276f}");
-    assert!(front.status_item_chrome_line().contains(" done=0 "));
-    drop(host);
-
-    let (mut quick, sid, host) = desk();
-    end_after(&mut quick, &sid, 8 * SEC);
-    assert!(quick.status_glance().done.is_empty(), "8 s: no end, no row");
-    drop(host);
-}
-
-#[test]
 fn an_act_and_a_trail_move_leave_the_end_row_as_it_was() {
     let (mut app, sid, host) = desk();
     end_after(&mut app, &sid, 45 * SEC);
@@ -166,8 +106,13 @@ fn an_act_and_a_trail_move_leave_the_end_row_as_it_was() {
     let before = app.status_glance();
     let line_before = state_line(&app);
     assert_eq!(before.done.len(), 1, "PRECONDITION: the row stands");
-    app.apply_harness_fact(&sid, crate::HarnessFact::Act(Act::Approved));
-    app.apply_harness_fact(&sid, crate::HarnessFact::Act(Act::Continued));
+    for act in [Act::Approved, Act::Continued] {
+        let taken = aterm_agent::harness::acts::TakenAct {
+            act,
+            opens_turn: act == Act::Continued,
+        };
+        app.apply_harness_fact(&sid, crate::HarnessFact::Act(taken));
+    }
     app.apply_harness_fact(
         &sid,
         crate::HarnessFact::Pause(Some(crate::PausePlan {

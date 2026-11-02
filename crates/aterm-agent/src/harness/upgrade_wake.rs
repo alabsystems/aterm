@@ -587,7 +587,8 @@ fn wait_exit_inner(
 /// `kill(pid, 0)` still finds.
 #[cfg(target_os = "linux")]
 fn zombie(pid: u32) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| stat_exited(&stat))
+    aterm_uds::process::read_proc_text(std::path::Path::new(&format!("/proc/{pid}/stat")))
+        .is_ok_and(|stat| stat_exited(&stat))
 }
 
 /// Whether one `/proc/<pid>/stat` line names a process that has exited: its

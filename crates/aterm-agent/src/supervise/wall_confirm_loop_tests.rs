@@ -509,6 +509,113 @@ fn a_wall_the_transcript_names_otherwise_is_refused() {
     }
 }
 
+/// The 529 transcript cut after its second prompt: the API never answered it, so the transcript
+/// ends on the user's turn while the screen shows the program's API error.
+fn unanswered_tail() -> String {
+    transcript("529")
+        .lines()
+        .take(5)
+        .map(|l| format!("{l}\n"))
+        .collect()
+}
+
+/// G1 (v6 §14.17.5): an overload or a lost connection drawn over a prompt the API never answered
+/// (the transcript ends on the prompt) is the outage's wait, never a plain point Cruise types
+/// into; the same error words as the model's prose (its transcript ends on its reply) are still
+/// refused.
+#[test]
+fn an_outage_over_a_prompt_the_api_never_answered_is_a_wait_not_a_turn_end() {
+    let read = |capture: &str| fx::screen(capture);
+    let tail = unanswered_tail();
+    assert!(
+        tail.trim_end().ends_with('}') && tail.contains("lag-e5"),
+        "the cut ends on the second prompt: {tail}"
+    );
+    for (name, wall, words) in [
+        ("a 529", read(fx::END_529), "API overload"),
+        (
+            "a lost connection",
+            read(fx::API_ERROR_ENOTFOUND_MEASURED),
+            "connection error",
+        ),
+    ] {
+        let host = TranscriptHost::of(&[Some(tail.as_str())]);
+        let (lines, m, records) = run_at("wc-unanswered", wall, Some(host), true);
+        let acts = wall_acts(&lines, &records);
+        assert!(
+            acts.iter()
+                .any(|a| a.starts_with("WAITING until=")
+                    && a.ends_with(&format!(" waiting: {words}"))),
+            "{name}: waits for the clearing — {acts:#?}\n{lines:#?}"
+        );
+        assert!(
+            !acts.iter().any(|a| a.starts_with("CONTINUED")),
+            "{name}: no Cruise prompt into the wall — {acts:#?}"
+        );
+        assert!(refusals(&records).is_empty(), "{name}: {records:#?}");
+        assert_eq!(count(&m, "turn"), 0, "{name}: {:#?}", m.requests);
+    }
+    // THE CONTROL: the same words as the model's prose (its transcript ends on its reply) are
+    // still refused, and the turn end is the agent's.
+    let host = TranscriptHost::of(&[Some(transcript("mcp-wall-phrase"))]);
+    let (lines, _, records) = run_at("wc-unanswered-prose", read(fx::END_529), Some(host), true);
+    let said = refusals(&records);
+    assert_eq!(said.len(), 1, "{said:#?}\n{lines:#?}");
+    assert!(
+        said[0].contains("the transcript ends on the model's reply"),
+        "{said:#?}"
+    );
+}
+
+/// G1's guard (v6 §14.17.5): an outage's words in a tool's own output (an MCP block quoting an
+/// API error), over a transcript that ends on that tool's result, are the tool's: refused as a
+/// wall the transcript does not confirm, never the outage's wait, and the turn end stays the
+/// agent's.
+#[test]
+fn an_outage_quoted_in_a_tools_output_over_its_result_is_no_wait() {
+    let tail: String = transcript("mcp-wall-phrase")
+        .lines()
+        .take(4)
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert!(
+        tail.lines()
+            .last()
+            .is_some_and(|l| l.contains("\"tool_result\"")),
+        "the cut ends on the tool's result: {tail}"
+    );
+    for (name, words) in [
+        (
+            "a 529",
+            "API Error: Repeated 529 Overloaded errors. The API is at capacity — this is usually \
+             temporary. Try again in a moment.",
+        ),
+        (
+            "a lost connection",
+            "API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)",
+        ),
+    ] {
+        let host = TranscriptHost::of(&[Some(tail.as_str())]);
+        let (lines, _, records) = run_at(
+            "wc-unanswered-tool",
+            mcp_second_block(words),
+            Some(host),
+            true,
+        );
+        let acts = wall_acts(&lines, &records);
+        assert!(
+            !acts.iter().any(|a| a.starts_with("WAITING")),
+            "{name}: a tool's output is no outage — {acts:#?}\n{lines:#?}"
+        );
+        let said = refusals(&records);
+        assert_eq!(said.len(), 1, "{name}: {said:#?}\n{lines:#?}");
+        assert!(
+            said[0].contains("the transcript ends on a tool's result"),
+            "{name}: {said:#?}"
+        );
+    }
+}
+
 #[test]
 fn with_no_transcript_a_wall_under_a_tools_call_is_not_acted_on() {
     let read = |capture: &str| fx::screen(capture);
@@ -4265,4 +4372,12 @@ fn a_standing_weekly_limit_over_a_refused_generic_banner_and_transcript_only_row
         s.turn_end.wall_since(WallKind::UsageWeekly).is_some(),
         "weekly wall recorded in turn_end"
     );
+}
+
+/// [`super::observe_table`]'s row of a context wall, `/compact` typed
+/// ([`a_wall_the_transcript_confirms_is_acted_on`]'s real wall under a monitor event).
+pub(super) fn observe_row_compact() -> &'static [&'static str] {
+    let wall = fx::screen(fx::MONITOR_EVENT_THEN_CONTEXT_WALL_MEASURED);
+    let _ = run_at::<TranscriptHost>("observe-wc-label-real", wall, None, false);
+    &["/compact"]
 }

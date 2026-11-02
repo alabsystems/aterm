@@ -761,11 +761,9 @@ fn all_subscription_policy_interleavings_conform_and_mutants_fail() {
     let projected: BTreeMap<_, _> = first
         .iter()
         .map(|(flags, _)| flags.clone())
-        .zip(aterm_spec::check::each_on(
-            aterm_spec::fs_lane::PLACES,
-            &first,
-            |(_, (state, action))| subscription_transition(state, action),
-        ))
+        .zip(aterm_spec::fs_lane::each(&first, |(_, (state, action))| {
+            subscription_transition(state, action)
+        }))
         .collect();
     for (state, action) in &steps {
         let next = &projected[&subscription_flags(state, action)];

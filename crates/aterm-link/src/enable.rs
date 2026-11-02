@@ -3,6 +3,7 @@
 
 //! `aterm fabric on|off|doctor`: provision, tear down, or diagnose the local fabric.
 
+#[cfg(test)]
 use aterm_uds::spawnfd::Stdio;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
@@ -28,6 +29,8 @@ pub const SUN_PATH_MAX: usize = 104;
 
 /// The mint secret's name in the fabric root, and beside the socket.
 pub const MINT_SECRET: &str = "mint.secret";
+/// The log's file name in a fabric root.
+pub(crate) const BUS_LOG: &str = "bus.log";
 
 /// A mint secret is 32 bytes.
 pub use astream_cap::capfile::SECRET_MIN as SECRET_LEN;
@@ -358,7 +361,7 @@ impl Paths {
         self.root.join("bus.sock").to_string_lossy().into_owned()
     }
     fn log(&self) -> String {
-        self.root.join("bus.log").to_string_lossy().into_owned()
+        self.root.join(BUS_LOG).to_string_lossy().into_owned()
     }
     pub(crate) fn cap(&self) -> PathBuf {
         self.root.join("node.cap")
@@ -1064,9 +1067,9 @@ pub fn argv_safe(word: &str) -> Result<(), String> {
     if let Some(c) = bad {
         return Err(format!(
             "`{}` holds {}; every word of the fabric's commands must be plain — no whitespace \
-             (aterm splits `[fabric] command` on it, and `ps` is how the broker is found), no \
-             quote or backslash (the systemd unit quotes the broker's words in a `sh -c` \
-             script), no `%` or `$` (systemd expands them) and no control character",
+             (aterm splits `[fabric] command` on it), no quote or backslash (the systemd unit \
+             quotes the broker's words in a `sh -c` script), no `%` or `$` (systemd expands \
+             them) and no control character",
             safe(word, 256),
             match c {
                 c if c.is_whitespace() => "whitespace".to_string(),
@@ -1649,7 +1652,7 @@ fn mint_caps(p: &Paths, node: &str) -> Result<usize, String> {
         )
     })?;
     let fail_at: Option<usize> =
-        aterm_types::dev_seam!(FAIL_MINT_ENV).and_then(|v| v.to_str()?.parse().ok());
+        aterm_types::dev_seam!(FAIL_MINT_ENV).and_then(|v| crate::parse_uint(v.to_str()?));
     let cap = p.cap();
     let staged = p.root.join(format!(".node.cap.{}", std::process::id()));
     let result = (|| -> Result<usize, String> {
@@ -2226,6 +2229,50 @@ fn by_default_in(
     }
 }
 
+/// What a new key's backups come to on this system: a dry run promises no mark there is none of.
+const fn rest_key_backup_word() -> &'static str {
+    if aterm_uds::backup::Backups::system_has_a_mark() {
+        "left out of Time Machine backups"
+    } else {
+        "this system has no backup mark: tell a backup tool to skip it"
+    }
+}
+
+/// The key `bus.log` is sealed under, beside the mint secret ([`crate::at_rest`]): minted where there
+/// is none and no log is sealed, and refused, naming the way out, where a sealed log has lost it.
+fn rest_key_step(p: &Paths, dry_run: bool, out: &mut Out) -> bool {
+    let log = PathBuf::from(p.log());
+    let key = crate::at_rest::key_path(&log);
+    match crate::at_rest::ensure_key(&log, aterm_uds::backup::Backups::SYSTEM, dry_run) {
+        Ok(step) => {
+            if step.minted {
+                out.done(
+                    "rest key",
+                    &format!(
+                        "mint 32 random bytes into {} (0600, {})",
+                        key.display(),
+                        rest_key_backup_word()
+                    ),
+                    &format!(
+                        "minted {}; a broker already running seals its log at its next start",
+                        key.display()
+                    ),
+                );
+            } else {
+                out.already("rest key", &format!("{} (0600)", key.display()));
+            }
+            if let Some(why) = step.unmarked {
+                out.warn("rest key", &why);
+            }
+            true
+        }
+        Err(refused) => {
+            out.fail("rest key", &format!("{}; {}", refused.why, refused.remedy));
+            false
+        }
+    }
+}
+
 fn program_step(p: &Paths, out: &mut Out) -> bool {
     if p.program() == p.aterm {
         return true;
@@ -2335,9 +2382,7 @@ fn binary_has_link(p: &Paths) -> Result<(), String> {
     if !p.is_link_shim() {
         cmd.arg("link");
     }
-    let out = cmd
-        .stdin(Stdio::null())
-        .output()
+    let out = aterm_uds::deadline::output_within(&mut cmd, Duration::from_secs(15))
         .map_err(|e| format!("{}: {e}", safe(&p.aterm, 256)))?;
     let text = format!(
         "{}{}",
@@ -2432,10 +2477,9 @@ fn launchctl_program() -> std::ffi::OsString {
 
 /// `launchctl <args>`.
 pub(crate) fn launchctl(args: &[&str]) -> Result<(), String> {
-    let out = aterm_uds::spawnfd::command(launchctl_program())
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
+    let mut cmd = aterm_uds::spawnfd::command(launchctl_program());
+    cmd.args(args);
+    let out = aterm_uds::deadline::output_within(&mut cmd, Duration::from_secs(30))
         .map_err(|e| format!("launchctl: {e}"))?;
     if out.status.success() {
         Ok(())
@@ -2452,11 +2496,9 @@ pub(crate) fn launchctl(args: &[&str]) -> Result<(), String> {
 /// `launchctl list`'s `PID Status Label` rows.
 #[cfg(target_os = "macos")]
 pub(crate) fn launchctl_list() -> String {
-    aterm_uds::spawnfd::command(launchctl_program())
-        .arg("list")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
+    let mut cmd = aterm_uds::spawnfd::command(launchctl_program());
+    cmd.arg("list");
+    aterm_uds::deadline::output_within(&mut cmd, Duration::from_secs(30))
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .unwrap_or_default()
 }
@@ -2486,12 +2528,9 @@ pub(crate) fn launchd_job(label: &str) -> LaunchdJob {
 /// `launchctl print gui/<uid>/<label>`'s exit code and stdout; `(None, "")` where it could not
 /// run, which [`job_of`] reads as unread.
 fn launchd_print(label: &str) -> (Option<i32>, String) {
-    match aterm_uds::spawnfd::command(launchctl_program())
-        .args(["print", &format!("gui/{}/{label}", uid())])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-    {
+    let mut cmd = aterm_uds::spawnfd::command(launchctl_program());
+    cmd.args(["print", &format!("gui/{}/{label}", uid())]);
+    match aterm_uds::deadline::output_within(&mut cmd, Duration::from_secs(30)) {
         Ok(out) => (
             out.status.code(),
             String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -2546,7 +2585,7 @@ fn job_of(code: Option<i32>, stdout: &str) -> LaunchdJob {
         Some(0) => LaunchdJob::Loaded(stdout.lines().find_map(|l| {
             l.trim()
                 .strip_prefix("pid = ")
-                .and_then(|p| p.trim().parse().ok())
+                .and_then(|p| crate::parse_uint(p.trim()))
         })),
         Some(LAUNCHCTL_NO_DOMAIN) => LaunchdJob::NoGuiLogin,
         Some(LAUNCHCTL_NO_SERVICE) => LaunchdJob::Absent,
@@ -2561,11 +2600,9 @@ fn job_of(code: Option<i32>, stdout: &str) -> LaunchdJob {
 /// # Errors
 /// `print-disabled` could not run or failed: whether the job is disabled is not known.
 pub(crate) fn launchd_disabled(label: &str) -> Result<bool, String> {
-    let out = aterm_uds::spawnfd::command(launchctl_program())
-        .args(["print-disabled", &format!("gui/{}", uid())])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
+    let mut cmd = aterm_uds::spawnfd::command(launchctl_program());
+    cmd.args(["print-disabled", &format!("gui/{}", uid())]);
+    let out = aterm_uds::deadline::output_within(&mut cmd, Duration::from_secs(30))
         .map_err(|e| format!("`launchctl print-disabled` could not run: {e}"))?;
     if !out.status.success() {
         return Err(format!(
@@ -2898,11 +2935,9 @@ fn systemd_user_manager() -> Result<(), String> {
 }
 
 pub(crate) fn systemctl(args: &[&str]) -> Result<(), String> {
-    let out = aterm_uds::spawnfd::command("systemctl")
-        .arg("--user")
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
+    let mut cmd = aterm_uds::spawnfd::command("systemctl");
+    cmd.arg("--user").args(args);
+    let out = aterm_uds::deadline::output_within(&mut cmd, Duration::from_secs(30))
         .map_err(|e| format!("systemctl: {e}"))?;
     if out.status.success() {
         Ok(())
@@ -2922,18 +2957,17 @@ pub(crate) fn systemctl(args: &[&str]) -> Result<(), String> {
 /// # Errors
 /// No systemd user manager answered (a login with no user bus): nothing is known of the unit.
 fn systemd_unit(label: &str) -> Result<(Option<u32>, bool), String> {
-    let out = aterm_uds::spawnfd::command("systemctl")
-        .args([
-            "--user",
-            "show",
-            "-p",
-            "MainPID",
-            "-p",
-            "UnitFileState",
-            label,
-        ])
-        .stdin(Stdio::null())
-        .output()
+    let mut cmd = aterm_uds::spawnfd::command("systemctl");
+    cmd.args([
+        "--user",
+        "show",
+        "-p",
+        "MainPID",
+        "-p",
+        "UnitFileState",
+        label,
+    ]);
+    let out = aterm_uds::deadline::output_within(&mut cmd, Duration::from_secs(30))
         .map_err(|e| format!("systemctl: {e}"))?;
     if !out.status.success() {
         return Err(format!(
@@ -2955,7 +2989,7 @@ fn systemd_shown(text: &str) -> (Option<u32>, bool) {
     };
     (
         value("MainPID")
-            .and_then(|pid| pid.parse::<u32>().ok())
+            .and_then(crate::parse_uint::<u32>)
             .filter(|&pid| pid != 0),
         value("UnitFileState")
             .is_some_and(|state| matches!(state, "disabled" | "masked" | "masked-runtime")),
@@ -2999,20 +3033,13 @@ fn systemd_up(
 }
 
 fn systemd_main_pid(label: &str) -> Option<u32> {
-    let out = aterm_uds::spawnfd::command("systemctl")
-        .args(["--user", "show", "-p", "MainPID", "--value", label])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+    let mut cmd = aterm_uds::spawnfd::command("systemctl");
+    cmd.args(["--user", "show", "-p", "MainPID", "--value", label]);
+    let out = aterm_uds::deadline::output_within(&mut cmd, Duration::from_secs(30)).ok()?;
     if !out.status.success() {
         return None;
     }
-    String::from_utf8_lossy(&out.stdout)
-        .trim()
-        .parse::<u32>()
-        .ok()
-        .filter(|&pid| pid != 0)
+    crate::parse_uint::<u32>(String::from_utf8_lossy(&out.stdout).trim()).filter(|&pid| pid != 0)
 }
 
 fn not_current(p: &Paths, view: &fabric::BrokerView) -> Option<&'static str> {
@@ -3418,9 +3445,10 @@ struct Found {
 /// loaded as `on` does it, then waited for), nothing else of `on`: the converge pass's
 /// `sync.fabric`. Where `[fabric] command` is unset nothing is read and nothing changes, so it
 /// never turns the fabric on; a broker the person keeps (`--service none`, or one that is not the
-/// job `on` installed), one at another socket than the command's root's, one whose job launchd
-/// has disabled or cannot be asked about here, and any broker of a root where `aterm fabric
-/// off`'s record stands are left as they are. [`Renew::Look`] reads alone.
+/// job `on` installed, or may not be, as which process holds its socket is unknown), one at
+/// another socket than the command's root's, one whose job launchd has disabled or cannot be
+/// asked about here, and any broker of a root where `aterm fabric off`'s record stands are left
+/// as they are. [`Renew::Look`] reads alone.
 ///
 /// # Errors
 /// aterm.toml, the root's role or installed job, or the command cannot be read, or the step
@@ -3556,13 +3584,13 @@ fn unserved(found: &Found, why: &str) -> String {
 /// Why `on`'s broker step leaves `found`'s broker as it is, where it does: no job of `on`'s, a
 /// socket other than its root's, a job launchd has disabled (the person's choice) or cannot be
 /// asked about here, or a broker that is not the process `on`'s job runs (one the person started
-/// by hand, with that job not loaded or running another process), which the step would refuse
-/// as unmanaged, or start the job over.
+/// by hand, with that job not loaded or running another process), or may not be (which process
+/// holds the socket is unknown), which the step would refuse as unmanaged, or start the job over.
 fn kept(found: &Found) -> Option<String> {
     if found.service == Service::None {
         return Some(format!(
             "no job of `aterm fabric on`'s keeps it (it runs as `--service none`): {} it yourself",
-            if found.view.pid.is_some() {
+            if found.view.held() {
                 "restart"
             } else {
                 "start"
@@ -3595,6 +3623,13 @@ fn kept(found: &Found) -> Option<String> {
     if let Err(why) = &found.loaded {
         return Some(format!(
             "{why}, so nothing here loads {label}: `aterm fabric on` from a desktop login here does"
+        ));
+    }
+    if let Some(why) = &found.view.pid_unknown {
+        return Some(format!(
+            "which process holds {sock} is unknown ({}), so it may be a broker you run: it is \
+             left as it is while that stays unknown",
+            safe(why, 256)
         ));
     }
     match found.view.pid {
@@ -3654,8 +3689,8 @@ fn look_at(command: &[String]) -> Result<Found, String> {
         ..fabric::BrokerView::default()
     };
     view.locate();
-    let answers = asked_twice(
-        view.pid.is_some(),
+    let answers = answered(
+        &view,
         || fabric::answers(&view.endpoint),
         || std::thread::sleep(RETRY_PAUSE),
     );
@@ -3712,9 +3747,19 @@ fn systemd_state(
     }
 }
 
-/// Whether a broker answers, by `ask`: a socket a process holds (`held`) is asked once more,
-/// after `pause`, before it reads as unanswered, so a broker busy past one `Hello`'s timeout is
-/// not restarted for it.
+/// Whether a broker answers on `view`'s socket, by `ask` ([`asked_twice`]): one whose holder the
+/// view names or does not know ([`fabric::BrokerView::held`]) is asked twice.
+fn answered(
+    view: &fabric::BrokerView,
+    ask: impl Fn() -> Result<(), String>,
+    pause: impl FnOnce(),
+) -> Result<(), String> {
+    asked_twice(view.held(), ask, pause)
+}
+
+/// Whether a broker answers, by `ask`: a socket a process holds, or may hold (`held`, which
+/// process is unknown), is asked once more, after `pause`, before it reads as unanswered, so a
+/// broker busy past one `Hello`'s timeout is not restarted for it.
 fn asked_twice(
     held: bool,
     ask: impl Fn() -> Result<(), String>,
@@ -4049,7 +4094,11 @@ fn session_sids(ctl: &mut Ctl) -> Vec<String> {
 
 fn inbox_wait_cursor(header: &str) -> Option<u64> {
     let mut fields = header.strip_prefix("OK inbox ")?.split_whitespace();
-    let cursor = fields.next()?.parse::<u64>().ok()?;
+    let cursor = fields
+        .next()
+        .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))?
+        .parse::<u64>()
+        .ok()?;
     if let Some(field) = fields.next() {
         let id = field.strip_prefix("fleet=f")?;
         if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) || id.parse::<u64>().ok()? == 0
@@ -4111,7 +4160,7 @@ fn prove(armed: &[Instance], out: &mut Out) -> Result<u64, String> {
         .rows()
         .iter()
         .filter(|r| r.starts_with("msg "))
-        .filter_map(|r| r.split_whitespace().nth(1)?.parse().ok())
+        .filter_map(|r| crate::parse_uint(r.split_whitespace().nth(1)?))
         .max()
         .unwrap_or(0);
     let nonce = format!("{:x}", crate::now_ms());
@@ -4128,7 +4177,7 @@ fn prove(armed: &[Instance], out: &mut Out) -> Result<u64, String> {
         )
     })?;
     let off = kv(posted.header(), "off")
-        .and_then(|v| v.parse::<u64>().ok())
+        .and_then(crate::parse_uint::<u64>)
         .ok_or_else(|| {
             format!(
                 "the post answered {} without a bus offset",
@@ -4481,6 +4530,10 @@ fn on_steps(
                 }
             }
         }
+    }
+
+    if !rest_key_step(p, opts.dry_run, out) {
+        return Err(ExitCode::from(2));
     }
 
     let cap = p.cap();
@@ -5067,6 +5120,25 @@ fn quoted_broker_fix(w: &str, again: &str) -> Option<String> {
                  disk under its log is failing flushes"
             )
         }
+    } else if s(crate::at_rest::UNFINISHED_RETIRE_REMEDY) {
+        format!(
+            "a `--retire-log` of the broker's log stopped part way, and the broker refuses the \
+             log until it has finished: run `{} <log>` again, which moves the rest to the same \
+             folder (the whole line is the last of broker.err); then {again} restarts the broker",
+            crate::at_rest::RETIRE_VERB
+        )
+    } else if s(crate::at_rest::SEALED_LOG_REMEDY) {
+        format!(
+            "the broker refuses its log, sealed at rest, and restarting it meets the same \
+             refusal (the whole line is the last of broker.err). A key missing or not the log's: \
+             put the log's `{}` back beside it. A damaged record: `aterm link broker --repair \
+             <log>` cuts it there under its key, dropping the records from there on (possibly \
+             acked mail) and printing how many bytes went. The key gone for good: `{} <log>` \
+             moves the log aside, its records kept, for a new log with a new identity. Then \
+             {again} restarts the broker",
+            crate::at_rest::REST_KEY,
+            crate::at_rest::RETIRE_VERB
+        )
     } else if s(crate::cli::CORRUPT_LOG_REMEDY) {
         format!(
             "the broker refuses its log for a corrupt record, and restarting it meets the same \
@@ -5392,7 +5464,7 @@ fn lift_hold_in(warning: &str) -> String {
     let (pid, sock) = at
         .split_once(", --sock ")
         .map_or((at, None), |(pid, sock)| (pid, Some(sock)));
-    lift_hold(sid, pid.parse().unwrap_or(0), sock)
+    lift_hold(sid, crate::parse_uint(pid).unwrap_or(0), sock)
 }
 
 fn arm_command(pid: u32, sock: &str, argv: &[String]) -> String {
@@ -5723,6 +5795,9 @@ pub fn doctor(retire_ghosts: bool, yes: bool) -> ExitCode {
                         report.broker.guarded
                     )
                 );
+            }
+            if let Some(word) = report.broker.at_rest() {
+                println!("  at-rest={word}");
             }
             if let Some(row) = fabric::health_row(&report.broker) {
                 println!("  health: {row}");
@@ -6158,12 +6233,12 @@ mod tests {
     /// holds it running nothing, or runs a broker that does not answer, and where systemd runs
     /// none. A broker that answers reads current whether or not the listener scan named it. It is
     /// left as it is under `--service none`, at another socket, for a process the person started
-    /// that holds the socket, where launchd or systemd has the job disabled (or masked) or cannot
-    /// be asked about it, and where `aterm fabric off`'s record stands in the root, which keeps a
-    /// replaced broker too.
+    /// that holds the socket, where which process holds it is unknown (the scan could not tell),
+    /// where launchd or systemd has the job disabled (or masked) or cannot be asked about it, and
+    /// where `aterm fabric off`'s record stands in the root, which keeps a replaced broker too.
     /// NEGATIVE CONTROLS: a renewal that reads a broker nobody answers for as current (as
     /// measured), one blind to the off record, to a disabled job, to a login launchd cannot be
-    /// asked in, or to an answering broker the scan missed each fail it.
+    /// asked in, to an answering broker the scan missed, or to an unknown holder each fail it.
     #[test]
     fn a_broker_that_does_not_answer_is_due_where_the_job_on_installed_serves_none() {
         use std::cell::Cell;
@@ -6248,6 +6323,18 @@ mod tests {
             matches!(&by_hand, Ok(BrokerRenewal::Kept(why)) if why.contains("not the job")),
             "{by_hand:?}"
         );
+        for (loaded, job) in [(false, None), (true, Some(4242))] {
+            let mut unknown = silent(Service::Launchd, loaded, job, None);
+            unknown.view.pid_unknown =
+                Some("the listener scan cannot tell (connection refused)".to_string());
+            let unknown = renew(Renew::Apply, unknown);
+            assert!(
+                matches!(&unknown, Ok(BrokerRenewal::Kept(why))
+                    if why.contains(&format!("which process holds {sock} is unknown"))
+                        && why.contains("connection refused")),
+                "job {job:?}: {unknown:?}"
+            );
+        }
         let mut disabled = silent(Service::Launchd, false, None, None);
         disabled.disabled = true;
         let disabled = renew(Renew::Apply, disabled);
@@ -6840,6 +6927,40 @@ mod tests {
             Err("connect: refused 1".to_string())
         );
         assert_eq!(asks.get(), 1);
+    }
+
+    /// A view whose holder is unknown is asked twice, as one naming its holder is; a view nobody
+    /// holds once. NEGATIVE CONTROL: asking by `view.pid.is_some()` asks the unknown one once.
+    #[test]
+    fn an_unknown_holder_is_asked_twice_as_a_named_one_is() {
+        use std::cell::Cell;
+        let asks = Cell::new(0);
+        let pauses = Cell::new(0);
+        let never = || {
+            asks.set(asks.get() + 1);
+            Err("hello: timed out".to_string())
+        };
+        let unknown = fabric::BrokerView {
+            pid_unknown: Some("2 processes hold its listener (71, 72)".to_string()),
+            ..fabric::BrokerView::default()
+        };
+        let named = fabric::BrokerView {
+            pid: Some(71),
+            ..fabric::BrokerView::default()
+        };
+        for (view, what) in [(&unknown, "an unknown holder"), (&named, "a named holder")] {
+            asks.set(0);
+            pauses.set(0);
+            assert!(answered(view, never, || pauses.set(pauses.get() + 1)).is_err());
+            assert_eq!((asks.get(), pauses.get()), (2, 1), "{what} is asked twice");
+        }
+        asks.set(0);
+        let nobody = fabric::BrokerView::default();
+        assert!(answered(&nobody, never, || panic!(
+            "nothing holds the socket: no pause"
+        ))
+        .is_err());
+        assert_eq!(asks.get(), 1, "a socket nobody holds is asked once");
     }
 
     /// A kept `Out` prints nothing and hands back what it said; a step it ran without a node id
@@ -8944,6 +9065,10 @@ mod tests {
         let role = Role::default();
         let corrupt = fix_for(&warning(&line(K::InvalidData)), &role);
         assert!(corrupt.contains("`aterm link broker --repair"), "{corrupt}");
+        // Its real length is `fabric::tests::a_sealed_logs_refusal_gets_its_remedy_at_real_lengths`.
+        let sealed = fix_for(&warning(crate::at_rest::SEALED_LOG_REMEDY), &role);
+        assert!(sealed.contains("--retire-log"), "{sealed}");
+        assert_ne!(sealed, corrupt);
         let newer = fix_for(&warning(&line(K::Unsupported)), &role);
         assert!(!newer.contains("--repair"), "{newer}");
         assert_ne!(newer, corrupt);

@@ -144,6 +144,102 @@ impl Repo {
         let sha = self.resolve(reference);
         self.commits.iter().position(|c| c.sha == sha)
     }
+
+    /// Whether `sha` is a branch or tag head, or a commit `add_commit` gave.
+    pub(crate) fn knows_sha(&self, sha: &str) -> bool {
+        self.branches.values().any(|s| s == sha)
+            || self.tags.iter().any(|(_, s)| s == sha)
+            || self.commits.iter().any(|c| c.sha == sha)
+    }
+
+    /// Whether the fake models any of this repository's git: a ref or a commit.
+    pub(crate) fn models_git(&self) -> bool {
+        !self.branches.is_empty() || !self.tags.is_empty() || !self.commits.is_empty()
+    }
+
+    /// The sha a release's `target_commitish` names: a branch's head, a sha the repository
+    /// knows, or with none the default branch's head (its newest commit when no branch of
+    /// that name is set).
+    pub(crate) fn target_sha(&self, target: Option<&str>) -> Option<String> {
+        let name = target.unwrap_or(&self.spec.default_branch);
+        if let Some(sha) = self.branches.get(name) {
+            return Some(sha.clone());
+        }
+        if is_sha(name) && self.knows_sha(name) {
+            return Some(name.to_string());
+        }
+        if name == self.spec.default_branch {
+            return self.commits.last().map(|c| c.sha.clone());
+        }
+        None
+    }
+
+    /// The sha `reference` (`refs/heads/…` or `refs/tags/…`) points at.
+    pub(crate) fn ref_sha(&self, reference: &str) -> Option<String> {
+        if let Some(name) = reference.strip_prefix("refs/heads/") {
+            return self.branches.get(name).cloned();
+        }
+        let name = reference.strip_prefix("refs/tags/")?;
+        self.tags
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, s)| s.clone())
+    }
+
+    /// Point `reference` (`refs/heads/…` or `refs/tags/…`) at `sha`; a reference of another
+    /// namespace, or with an empty name, changes nothing (callers check it first).
+    pub(crate) fn set_ref(&mut self, reference: &str, sha: &str) {
+        if let Some(name) = reference
+            .strip_prefix("refs/heads/")
+            .filter(|n| !n.is_empty())
+        {
+            self.branches.insert(name.to_string(), sha.to_string());
+        } else if let Some(name) = reference
+            .strip_prefix("refs/tags/")
+            .filter(|n| !n.is_empty())
+        {
+            self.tags.retain(|(n, _)| n != name);
+            self.tags.push((name.to_string(), sha.to_string()));
+        }
+    }
+
+    /// Remove `reference` (`refs/heads/…` or `refs/tags/…`).
+    pub(crate) fn delete_ref(&mut self, reference: &str) {
+        if let Some(name) = reference.strip_prefix("refs/heads/") {
+            self.branches.remove(name);
+        } else if let Some(name) = reference.strip_prefix("refs/tags/") {
+            self.tags.retain(|(n, _)| n != name);
+        }
+    }
+
+    /// Every ref, `refs/heads/…` and `refs/tags/…` with its sha, sorted.
+    pub(crate) fn refs(&self) -> Vec<(String, String)> {
+        let mut refs: Vec<(String, String)> = self
+            .branches
+            .iter()
+            .map(|(name, sha)| (format!("refs/heads/{name}"), sha.clone()))
+            .chain(
+                self.tags
+                    .iter()
+                    .map(|(name, sha)| (format!("refs/tags/{name}"), sha.clone())),
+            )
+            .collect();
+        refs.sort();
+        refs
+    }
+}
+
+/// Whether `text` is forty lowercase hex digits.
+pub(crate) fn is_sha(text: &str) -> bool {
+    text.len() == 40 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// A public key as GitHub keeps it: its type and its base64, without the comment.
+pub(crate) fn key_kept(key: &str) -> String {
+    key.split_ascii_whitespace()
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// An asset.
@@ -164,10 +260,26 @@ pub(crate) struct Release {
     pub(crate) id: u64,
     /// Its repository's id.
     pub(crate) repo: u64,
-    /// What it says.
+    /// What it says. A create that sent no `target_commitish` holds the default branch here,
+    /// which the wire answers and a publish makes its tag at, as GitHub does.
     pub(crate) spec: ReleaseSpec,
+    /// The `target_commitish` its create sent, if any (`FakeGithub::releases_of`): a
+    /// fixture's is its spec's, when not empty.
+    pub(crate) sent_target: Option<String>,
     /// Its assets, in the order added.
     pub(crate) assets: Vec<Asset>,
+    /// Whether the listing lag hides it (`FakeGithub::set_listing_lag`).
+    pub(crate) hidden: bool,
+    /// The `make_latest` the last create or PATCH sent, if any.
+    pub(crate) make_latest: Option<String>,
+}
+
+/// One SSH key a login holds.
+pub(crate) struct Key {
+    /// The login.
+    pub(crate) login: String,
+    /// The key as `FakeGithub::keys` answers it.
+    pub(crate) key: crate::FakeKey,
 }
 
 /// A fault waiting for its request.
@@ -222,10 +334,19 @@ pub(crate) struct State {
     pub(crate) violations: Vec<String>,
     /// Every [`crate::Fault::Hang`] ends now, held or asked for later ([`crate::FakeGithub::end_hangs`]).
     pub(crate) hangs_ended: bool,
+    /// Token to the `X-OAuth-Scopes` its answers carry (`FakeGithub::set_scopes`).
+    pub(crate) scopes: Vec<(String, Vec<String>)>,
+    /// The repositories whose new releases the listing lag hides (`set_listing_lag`).
+    pub(crate) listing_lag: Vec<String>,
+    /// Every SSH key, in the order added.
+    pub(crate) keys: Vec<Key>,
+    /// Every write body, in arrival order.
+    pub(crate) bodies: Vec<crate::SeenBody>,
     next_owner: u64,
     next_repo: u64,
     next_release: u64,
     next_asset: u64,
+    next_key: u64,
 }
 
 fn split_slug(slug: &str) -> (&str, &str) {
@@ -264,11 +385,32 @@ impl State {
             requests: 0,
             seen: Vec::new(),
             violations: Vec::new(),
+            scopes: Vec::new(),
+            listing_lag: Vec::new(),
+            keys: Vec::new(),
+            bodies: Vec::new(),
             next_owner: 100,
             next_repo: 1000,
             next_release: 5000,
             next_asset: 9000,
+            next_key: 20000,
         }
+    }
+
+    /// See `FakeGithub::add_key`. The key is kept as GitHub keeps it (`key_kept`), so a
+    /// pre-registered key and a POSTed one are stored, listed and compared in one form.
+    pub(crate) fn add_key(&mut self, login: &str, title: &str, key: &str) -> u64 {
+        let id = self.next_key;
+        self.next_key += 1;
+        self.keys.push(Key {
+            login: login.to_string(),
+            key: crate::FakeKey {
+                id,
+                title: title.to_string(),
+                key: key_kept(key),
+            },
+        });
+        id
     }
 
     fn owner(&mut self, login: &str) -> u64 {
@@ -377,14 +519,22 @@ impl State {
 
     /// See `FakeGithub::add_release`.
     pub(crate) fn add_release(&mut self, slug: &str, spec: ReleaseSpec) -> u64 {
-        let repo = self.repo_mut(slug).id;
+        let repo = self.repo_mut(slug);
+        let (repo, full) = (repo.id, repo.full_name());
+        let hidden = self
+            .listing_lag
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case(slug) || s.eq_ignore_ascii_case(&full));
         let id = self.next_release;
         self.next_release += 1;
         self.releases.push(Release {
             id,
             repo,
+            sent_target: Some(spec.target_commitish.clone()).filter(|t| !t.is_empty()),
             spec,
             assets: Vec::new(),
+            hidden,
+            make_latest: None,
         });
         id
     }
@@ -481,6 +631,7 @@ impl State {
     fn missing(&self, change: &Change) -> Option<String> {
         match change {
             Change::Publish { release_id }
+            | Change::Reveal { release_id }
             | Change::AddAsset { release_id, .. }
             | Change::DeleteRelease { release_id } => self
                 .release_index(*release_id)
@@ -500,6 +651,11 @@ impl State {
                     let spec = &mut self.releases[index].spec;
                     spec.draft = false;
                     spec.published_at = Some(spec.created_at.clone());
+                }
+            }
+            Change::Reveal { release_id } => {
+                if let Some(index) = self.release_index(release_id) {
+                    self.releases[index].hidden = false;
                 }
             }
             Change::AddAsset { release_id, spec } => {

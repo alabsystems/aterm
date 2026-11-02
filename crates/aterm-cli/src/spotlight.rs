@@ -195,8 +195,9 @@ fn measure_kept(
             .rustup
             .as_ref()
             .is_none_or(|(_, pages)| pages.docs.is_empty())
+        && let Some(encoded) = encode(lit)
     {
-        atpkg::probe_cache::put(file, key, &encode(lit));
+        atpkg::probe_cache::put(file, key, &encoded);
     }
     measured
 }
@@ -205,20 +206,26 @@ fn measure_kept(
 const FIELD: char = '\u{1c}';
 
 /// A clean verdict as one line: `clean`, then rustup's home and each other page source with its
-/// count.
-fn encode(lit: &Spotlit) -> String {
+/// count; `None` if a field is empty or holds a delimiter or line break.
+fn encode(lit: &Spotlit) -> Option<String> {
     let mut out = String::from("clean");
     if let Some((home, pages)) = &lit.rustup {
+        if home.is_empty() || home.contains([FIELD, '\n', '\r', '\u{1e}']) {
+            return None;
+        }
         out.push(FIELD);
         out.push_str(home);
         for (source, n) in &pages.other {
+            if source.is_empty() || source.contains([FIELD, '\n', '\r', '\u{1e}']) {
+                return None;
+            }
             out.push(FIELD);
             out.push_str(source);
             out.push(FIELD);
             out.push_str(&n.to_string());
         }
     }
-    out
+    Some(out)
 }
 
 fn decode(kept: &str) -> Option<Spotlit> {
@@ -229,9 +236,20 @@ fn decode(kept: &str) -> Option<Spotlit> {
     let rustup = match fields.next() {
         None => None,
         Some(home) => {
+            if home.is_empty() {
+                return None;
+            }
             let mut other = Vec::new();
             while let Some(source) = fields.next() {
-                other.push((source.to_owned(), fields.next()?.parse().ok()?));
+                if source.is_empty() {
+                    return None;
+                }
+                let count = fields
+                    .next()
+                    .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))?
+                    .parse()
+                    .ok()?;
+                other.push((source.to_owned(), count));
             }
             Some((
                 home.to_owned(),
@@ -309,7 +327,7 @@ struct Tally(Vec<(String, usize)>);
 impl Tally {
     fn add(&mut self, name: String) {
         match self.0.iter_mut().find(|(n, _)| *n == name) {
-            Some((_, k)) => *k += 1,
+            Some((_, k)) => *k = k.saturating_add(1),
             None => self.0.push((name, 1)),
         }
     }
@@ -433,7 +451,11 @@ fn mdfind_run(dir: &Path, pattern: &str, count: bool) -> Result<String, String> 
     }
     cmd.arg("-onlyin").arg(dir).arg("-0");
     cmd.arg(format!("kMDItemFSName == \"{pattern}\""));
-    let out = aterm_uds::deadline::output_until(&mut cmd, Instant::now() + QUERY)
+    let now = Instant::now();
+    let deadline = now
+        .checked_add(QUERY)
+        .unwrap_or_else(|| now + Duration::from_secs(365 * 86_400));
+    let out = aterm_uds::deadline::output_until(&mut cmd, deadline)
         .map_err(|e| format!("mdfind did not answer: {e}"))?;
     if !out.status.success() {
         return Err(format!(
@@ -487,7 +509,9 @@ fn largest(counts: &[(String, usize)], more: &str) -> String {
 }
 
 fn total(counts: &[(String, usize)]) -> usize {
-    counts.iter().map(|(_, n)| n).sum()
+    counts
+        .iter()
+        .fold(0usize, |acc, (_, n)| acc.saturating_add(*n))
 }
 
 /// The row's fact and whether it is clean, pure over the count.
@@ -753,6 +777,28 @@ mod tests {
         );
         let _ = measure_kept(None, clean);
         assert_eq!(measured.get(), 6, "no state folder: measured");
+
+        let unframeable = Spotlit {
+            docs_kept: None,
+            builds: Vec::new(),
+            rustup: Some((
+                "~/.rustup".to_owned(),
+                Pages {
+                    docs: Vec::new(),
+                    other: vec![(format!("bad{FIELD}1{FIELD}injected"), 6)],
+                },
+            )),
+        };
+        assert_eq!(
+            encode(&unframeable),
+            None,
+            "a source holding FIELD must not forge extra fields in the cache"
+        );
+        assert_eq!(decode(&format!("clean{FIELD}")), None);
+        assert_eq!(
+            decode(&format!("clean{FIELD}~/.rustup{FIELD}{FIELD}3")),
+            None
+        );
     }
 
     #[cfg(unix)]

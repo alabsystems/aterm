@@ -180,7 +180,10 @@ fn a_dry_run_before_any_clone_decides_nothing_and_writes_nothing() {
     let state = w.state();
     assert!(!state.dir.join("progs").exists());
     assert!(!state.index_seen.exists(), "a dry run writes no state");
-    assert!(w.fx.notes.shown().is_empty(), "a dry run notifies nobody");
+    assert!(
+        w.fx.notes.entries().is_empty(),
+        "a dry run records no notices"
+    );
 }
 
 #[test]
@@ -325,7 +328,7 @@ fn a_pin_ahead_of_the_newest_signed_release_is_ok_and_a_clean_no_op() {
     );
     assert_eq!(w.fx.indexer.count(), 0);
     assert!(
-        w.fx.notes.shown().is_empty(),
+        w.fx.notes.entries().is_empty(),
         "an AHEAD pin notifies nobody"
     );
 }
@@ -660,19 +663,19 @@ fn the_gap_to_trust_main_is_counted_on_the_graph_and_told_once_a_day() {
     );
     assert_eq!(
         w.fx.notes
-            .shown()
+            .entries()
             .iter()
             .filter(|n| n.contains("behind trust main"))
             .count(),
         1
     );
-    let before = w.fx.notes.shown().len();
+    let before = w.fx.notes.entries().len();
     ok(w.run(true));
-    assert_eq!(w.fx.notes.shown().len(), before);
+    assert_eq!(w.fx.notes.entries().len(), before);
     ok(w.run(false));
     assert_eq!(
         w.fx.notes
-            .shown()
+            .entries()
             .iter()
             .filter(|n| n.contains("behind trust main"))
             .count(),
@@ -683,7 +686,7 @@ fn the_gap_to_trust_main_is_counted_on_the_graph_and_told_once_a_day() {
     ok(w.run_as(&tomorrow, false));
     assert_eq!(
         w.fx.notes
-            .shown()
+            .entries()
             .iter()
             .filter(|n| n.contains("behind trust main"))
             .count(),
@@ -751,7 +754,7 @@ fn a_pin_at_main_owes_nothing() {
     assert!(
         !w.fx
             .notes
-            .shown()
+            .entries()
             .iter()
             .any(|n| n.contains("behind trust main"))
     );
@@ -769,7 +772,12 @@ fn a_run_in_flight_covers_this_one_and_a_stalled_one_is_refused() {
     let (r, _) = w.run(false);
     let e = r.expect_err("a stalled run is refused");
     assert!(e.to_string().contains("a stalled run"), "{e}");
-    assert!(w.fx.notes.shown().iter().any(|n| n.contains("stalled run")));
+    assert!(
+        w.fx.notes
+            .entries()
+            .iter()
+            .any(|n| n.contains("stalled run"))
+    );
     drop(holder);
     let (o, _) = ok(w.run(true));
     assert!(!o.covered);
@@ -787,9 +795,13 @@ fn a_finished_run_leaves_no_start_stamp_for_the_next_lock_holder_to_be_read_as()
     let (o, _) = ok(w.run_as(&later, false));
     assert!(o.covered);
     assert!(
-        !w.fx.notes.shown().iter().any(|n| n.contains("stalled run")),
+        !w.fx
+            .notes
+            .entries()
+            .iter()
+            .any(|n| n.contains("stalled run")),
         "{:?}",
-        w.fx.notes.shown()
+        w.fx.notes.entries()
     );
     drop(holder);
 }
@@ -1017,9 +1029,13 @@ fn a_horizon_inside_thirty_days_is_told() {
     w.fx.publish_index_text(6, &text);
     ok(w.run(false));
     assert!(
-        !w.fx.notes.shown().iter().any(|n| n.contains(&at_boundary)),
+        !w.fx
+            .notes
+            .entries()
+            .iter()
+            .any(|n| n.contains(&at_boundary)),
         "exact 30-day boundary does not warn: {:?}",
-        w.fx.notes.shown()
+        w.fx.notes.entries()
     );
 
     let inside = aterm_types::rfc3339::format_rfc3339(
@@ -1031,7 +1047,7 @@ fn a_horizon_inside_thirty_days_is_told() {
             .replace(atpkg_publish::testkit::FAR_FUTURE, &inside);
     w.fx.publish_index_text(6, &text);
     ok(w.run(false));
-    let shown = w.fx.notes.shown();
+    let shown = w.fx.notes.entries();
     assert!(shown.iter().any(|n| n.contains(&inside)), "{shown:?}");
 }
 

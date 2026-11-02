@@ -91,15 +91,27 @@ struct Compiler {
 impl Compiler {
     fn push(&mut self, inst: Inst) -> Result<usize, Error> {
         self.insts.push(inst);
-        if self.insts.len() * INST_COST + self.class_bytes > self.limit {
+        if self
+            .insts
+            .len()
+            .saturating_mul(INST_COST)
+            .saturating_add(self.class_bytes)
+            > self.limit
+        {
             return Err(Error::CompiledTooBig(self.limit));
         }
         Ok(self.insts.len() - 1)
     }
 
     fn add_class(&mut self, class: &ClassSet) -> Result<usize, Error> {
-        self.class_bytes += class.byte_size();
-        if self.insts.len() * INST_COST + self.class_bytes > self.limit {
+        self.class_bytes = self.class_bytes.saturating_add(class.byte_size());
+        if self
+            .insts
+            .len()
+            .saturating_mul(INST_COST)
+            .saturating_add(self.class_bytes)
+            > self.limit
+        {
             return Err(Error::CompiledTooBig(self.limit));
         }
         self.classes.push(class.clone());

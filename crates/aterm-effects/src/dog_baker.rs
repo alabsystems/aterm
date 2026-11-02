@@ -129,7 +129,9 @@ impl ExactTileKey for DogBakeKey {
     fn bake_tile_with(&self, recycled: Option<Tile>, _mask_scratch: &mut Option<Tile>) -> Tile {
         let (w, h) = (u32::from(self.w), u32::from(self.h));
         let mut tile = take_or_new_tile(recycled, w, h);
-        paint_breed_onto(&mut tile, self.breed, &self.fills(), w, h);
+        if w != 0 && h != 0 {
+            paint_breed_onto(&mut tile, self.breed, &self.fills(), w, h);
+        }
         tile
     }
 }

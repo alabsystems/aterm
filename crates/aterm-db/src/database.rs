@@ -34,6 +34,11 @@ pub struct Change {
 /// A typed application command inside the encrypted operation.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
+    /// Join causal history without changing values, authority or resource accounting.
+    Merge {
+        /// Durable identity of this merge record, separate from the user's edit.
+        request: [u8; 16],
+    },
     /// Generic collection transaction; Accounts applies a closed schema.
     Write {
         /// Durable retry identity supplied before the first attempt.
@@ -88,7 +93,8 @@ impl Command {
     /// Retry identity independent of transport acknowledgments.
     pub fn request(&self) -> [u8; 16] {
         match self {
-            Self::Write { request, .. }
+            Self::Merge { request }
+            | Self::Write { request, .. }
             | Self::Revert { request, .. }
             | Self::Budget { request, .. }
             | Self::Spend { request, .. } => *request,
@@ -96,8 +102,10 @@ impl Command {
         }
     }
     /// A catalog transaction's keys and complete values, including compensations.
+    /// A causal merge is a catalog operation with an empty change list.
     pub fn changes(&self) -> Option<&[Change]> {
         match self {
+            Self::Merge { .. } => Some(&[]),
             Self::Write { changes, .. } | Self::Revert { changes, .. } => Some(changes),
             _ => None,
         }
@@ -112,6 +120,9 @@ impl Command {
     /// Encode the closed versioned payload. All maps use the workspace's sorted map.
     pub fn encode(&self) -> Result<Vec<u8>> {
         let value = match self {
+            Self::Merge { request } => {
+                json!({"v":1,"request":hex::encode_lower(request),"kind":"merge"})
+            }
             Self::Write { request, changes } => {
                 json!({"v":1,"request":hex::encode_lower(request),"kind":"write","changes":changes.iter().map(|c|json!({"collection":c.collection,"key":c.key,"value":c.value})).collect::<Vec<_>>()})
             }
@@ -164,6 +175,10 @@ impl Command {
         }
         let request = decode_hex(field(&v, "request")?)?;
         let command = match field(&v, "kind")? {
+            "merge" => {
+                keys(&v, &["v", "request", "kind"])?;
+                Self::Merge { request }
+            }
             "write" | "revert" => {
                 let reverts = field(&v, "kind")? == "revert";
                 if reverts {
@@ -645,9 +660,12 @@ impl History {
             .collect();
         for (grant, (_, command)) in &self.records {
             if let Command::Budget { shares, .. } = command {
+                // Retaining an allocation reserves its name, but cannot authorize
+                // work before its required authority history is projected.
+                let grant_eligible = evidence.ordered.contains(grant);
                 for actor in shares
                     .keys()
-                    .filter(|actor| refused_actors.contains(*actor))
+                    .filter(|actor| !grant_eligible || refused_actors.contains(*actor))
                 {
                     view.disputed_shares.insert((*grant, *actor));
                 }
@@ -666,15 +684,31 @@ impl History {
                         continue;
                     }
                     let reverting = matches!(command, Command::Revert { .. });
-                    if let Command::Revert { operation, .. } = command
-                        && (!self.index.observes(id, operation)
-                            || self
-                                .command(operation)
-                                .and_then(|(_, c)| c.changes())
-                                .is_none())
-                    {
-                        view.invalid.insert(*id);
-                        continue;
+                    if let Command::Revert { operation, .. } = command {
+                        let keys = |items: &[Change]| {
+                            items
+                                .iter()
+                                .map(|c| (c.collection.clone(), c.key.clone()))
+                                .collect::<BTreeSet<_>>()
+                        };
+                        let target_changes = self.command(operation).and_then(|(_, c)| match c {
+                            Command::Write { changes, .. }
+                                if changes.iter().all(|c| c.value.is_some()) =>
+                            {
+                                Some(changes.as_slice())
+                            }
+                            Command::Revert { changes, .. } => Some(changes.as_slice()),
+                            _ => None,
+                        });
+                        if id == operation
+                            || !self.index.observes(id, operation)
+                            || !eligible.contains(operation)
+                            || view.invalid.contains(operation)
+                            || !target_changes.is_some_and(|target| keys(target) == keys(changes))
+                        {
+                            view.invalid.insert(*id);
+                            continue;
+                        }
                     }
                     for change in changes {
                         if change.collection == "machines"
@@ -690,7 +724,7 @@ impl History {
                     }
                     crate::documents::apply(&self.index, &mut view.cells, *id, changes, reverting);
                 }
-                Command::Budget { .. } => {}
+                Command::Merge { .. } | Command::Budget { .. } => {}
                 Command::Spend {
                     grant,
                     cumulative,

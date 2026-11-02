@@ -164,7 +164,7 @@ pub fn variant_wakes(line: &str, variant: &str) -> u64 {
         .filter_map(|pair| pair.split_once([':', '=']))
         .filter(|(name, _)| *name == variant)
         .filter_map(|(_, n)| n.parse::<u64>().ok())
-        .sum()
+        .fold(0, u64::saturating_add)
 }
 
 /// A `ms` decimal field as whole microseconds, rounded up.
@@ -186,7 +186,7 @@ pub fn chain_text(bytes: usize) -> String {
             31 + n % 6,
             String::from(fill).repeat(LINE - 1 - digits.len())
         );
-        if out.len() + line.len() > bytes {
+        if out.len().saturating_add(line.len()) > bytes {
             break;
         }
         out.push_str(&line);
@@ -490,6 +490,13 @@ mod tests {
         assert_eq!(variant_wakes("OK wakes_by_variant=none", "RewindDone"), 0);
         assert_eq!(ms_field_us(line, "rewind_step_p99_ms"), Some(7_250));
         assert_eq!(ms_field_us(line, "frames_ms"), None);
+        assert_eq!(
+            variant_wakes(
+                &format!("OK wakes_by_variant=RewindDone:{},RewindDone:1", u64::MAX),
+                "RewindDone"
+            ),
+            u64::MAX
+        );
     }
 
     #[test]

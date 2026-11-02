@@ -90,7 +90,12 @@ impl EndCarry {
                         _ => return None,
                     });
                 }
-                "worked" if worked.is_none() => worked = Some(value.parse::<u64>().ok()?),
+                "worked" if worked.is_none() => {
+                    if !value.bytes().all(|b| b.is_ascii_digit()) {
+                        return None;
+                    }
+                    worked = Some(value.parse::<u64>().ok()?);
+                }
                 "end" | "face" | "seen" | "worked" => return None,
                 _ => {}
             }
@@ -131,7 +136,11 @@ fn task_face_at(value: &str) -> Option<(TaskFace, i64)> {
 
 /// A wall time after the epoch, unix ms.
 fn unix_ms(at: &str) -> Option<i64> {
-    at.parse::<i64>().ok().filter(|at| *at > 0)
+    at.bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| at.parse::<i64>().ok())
+        .flatten()
+        .filter(|at| *at > 0)
 }
 
 #[cfg(test)]

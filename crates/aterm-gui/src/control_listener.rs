@@ -935,9 +935,8 @@ fn drain(
 ) -> Option<usize> {
     let mut accepted = 0;
     while accepted < DRAIN_MAX {
-        match listener.accept() {
+        match aterm_uds::kept_out(|| listener.accept()) {
             Ok((stream, _)) => {
-                let _ = aterm_uds::keep_out_of_children(&stream);
                 accepted += 1;
                 *backoff = None;
                 HEALTH.accepts.fetch_add(1, Ordering::Relaxed);
@@ -1055,11 +1054,8 @@ pub(crate) fn rebind_socket(path: &str, expected: &mut Option<(u64, u64)>) -> Op
     let dir = crate::control_auth::dir_of_socket(path);
     let temp = dir.join(format!(".r{}", std::process::id()));
     let _ = std::fs::remove_file(&temp);
-    let fresh = match CtlListener::bind(&temp) {
-        Ok(listener) => {
-            let _ = aterm_uds::keep_out_of_children(&listener);
-            listener
-        }
+    let fresh = match aterm_uds::kept_out(|| CtlListener::bind(&temp)) {
+        Ok(listener) => listener,
         Err(error) => {
             aterm_log::warn!("control rebind: bind at {} failed: {error}", temp.display());
             return None;

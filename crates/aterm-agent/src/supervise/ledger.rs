@@ -131,7 +131,7 @@ pub(crate) fn history_floor(reply: &CtlReply) -> Option<u64> {
         .into_iter()
         .chain(reply.stderr.lines())
         .flat_map(str::split_whitespace)
-        .find_map(|word| word.strip_prefix("unheld_below=")?.parse().ok())
+        .find_map(|word| crate::parse_uint(word.strip_prefix("unheld_below=")?))
 }
 
 /// Parse `turn` records from a `history` reply body.
@@ -218,7 +218,7 @@ fn inbox_rows(body: &str, worker: &str) -> (Vec<(u64, u64, Mail)>, Vec<u64>) {
                 },
             ));
         } else if let Some(rest) = row.strip_prefix("post ")
-            && field(row, "to").map(bare_sid) == Some(bare_sid(worker))
+            && field(row, "to").map(pct_decode).as_deref().map(bare_sid) == Some(bare_sid(worker))
             && let Some(id) = rest.split(' ').next().and_then(decimal)
         {
             pending.push(id);
@@ -1392,6 +1392,16 @@ pub fn zone(offset_s: i64) -> String {
 
 /// Parse a `--since` argument (Unix ms, `YYYY-MM-DD`, or ISO-8601 timestamp).
 pub fn parse_since(s: &str, local_offset_s: i64) -> Option<i64> {
+    parse_since_local(s, local_offset_s, &|_| Some(local_offset_s))
+}
+
+/// [`parse_since`], reading the local zone at the parsed instant (`local_at`, unix seconds to UTC
+/// offset seconds) when `s` names no zone.
+pub fn parse_since_local(
+    s: &str,
+    now_offset_s: i64,
+    local_at: &dyn Fn(i64) -> Option<i64>,
+) -> Option<i64> {
     let s = s.trim();
     if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
         return s.parse().ok();
@@ -1412,9 +1422,9 @@ pub fn parse_since(s: &str, local_offset_s: i64) -> Option<i64> {
     if parts.next().is_some() || !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
         return None;
     }
-    let (mut offset, mut secs) = (local_offset_s, 0i64);
+    let (mut explicit_zone, mut secs) = (None, 0i64);
     if let Some(time) = time {
-        let (clock, zone) = if let Some(c) = time.strip_suffix('Z') {
+        let (clock, zone) = if let Some(c) = time.strip_suffix(['Z', 'z']) {
             (c, Some(0))
         } else if let Some(at) = time.rfind(['+', '-']) {
             let (c, z) = time.split_at(at);
@@ -1422,9 +1432,14 @@ pub fn parse_since(s: &str, local_offset_s: i64) -> Option<i64> {
             let (zh, zm) = match z.split_once(':') {
                 Some(pair) => pair,
                 None if z.len() == 4 && z.is_char_boundary(2) => z.split_at(2),
-                None => (z, "0"),
+                None if z.len() <= 2 => (z, "0"),
+                None => return None,
             };
-            let v = i64::from(num(zh)?) * 3600 + i64::from(num(zm)?) * 60;
+            let (zh, zm) = (num(zh)?, num(zm)?);
+            if zh > 23 || zm > 59 {
+                return None;
+            }
+            let v = i64::from(zh) * 3600 + i64::from(zm) * 60;
             (c, Some(if sign == "-" { -v } else { v }))
         } else {
             (time, None)
@@ -1437,15 +1452,16 @@ pub fn parse_since(s: &str, local_offset_s: i64) -> Option<i64> {
             return None;
         }
         secs = i64::from(h) * 3600 + i64::from(m) * 60 + i64::from(sec);
-        if let Some(z) = zone {
-            offset = z;
-        }
+        explicit_zone = zone;
     }
-    days_from_civil(y, mo, d)
+    let local = days_from_civil(y, mo, d)
         .checked_mul(86_400)?
-        .checked_add(secs)?
-        .checked_sub(offset)?
-        .checked_mul(1000)
+        .checked_add(secs)?;
+    let offset = match explicit_zone {
+        Some(z) => z,
+        None => local_at(local.checked_sub(now_offset_s)?).unwrap_or(now_offset_s),
+    };
+    local.checked_sub(offset)?.checked_mul(1000)
 }
 
 /// The time column: `HH:MM:SS`, with the date when the rows span more than

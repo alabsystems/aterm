@@ -176,3 +176,124 @@ fn tier_mismatch_and_method_not_read_are_refusals() {
         assert_eq!(error.repo.as_deref(), Some("fixture-dev/repo"));
     }
 }
+
+/// M1's identity rule, kept outside the model (whose `ident` binds `--as` with dev): an
+/// Identity Read with `--as release` sends the release token when it is present.
+#[test]
+fn release_as_on_the_identity_sends_the_release_token() {
+    let root = scratch();
+    let router = Router::from_validated(canonical(root.path()));
+    let sent = router.decide(
+        &RouteRequest::read(RouteTarget::Identity).with_as(Some("release".into())),
+        &present,
+    );
+    assert_eq!(
+        sent,
+        Decision::Send {
+            profile: "release".into(),
+            tier: Tier::Release
+        }
+    );
+}
+
+#[test]
+fn permit_decided_takes_the_decision_it_is_given() {
+    let root = scratch();
+    let router = Router::from_validated(canonical(root.path()));
+    let write = RouteRequest::write(RouteTarget::Repo(repo("alabsystems/aterm")))
+        .with_named(literal("alabsystems/aterm"));
+    let send = || Decision::Send {
+        profile: "release".into(),
+        tier: Tier::Release,
+    };
+    for router in [&router, &Router::empty()] {
+        let permit = router
+            .permit_decided(&write, send())
+            .expect("a Send mints a permit");
+        assert_eq!(
+            permit.target(),
+            &PermitTarget::Repo(repo("alabsystems/aterm"))
+        );
+        assert_eq!(permit.profile(), "release");
+        assert_eq!(permit.tier(), Tier::Release);
+        assert_eq!(permit.provenance(), Some(Provenance::Argv));
+        assert_eq!(permit.grant(), None);
+        assert_eq!(permit.named(), literal("alabsystems/aterm"));
+    }
+    let anonymous = router
+        .permit_decided(
+            &write,
+            Decision::Anonymous {
+                why: AnonymousWhy::Asked,
+            },
+        )
+        .expect_err("a write is never anonymous");
+    assert_eq!(anonymous.kind, Kind::Refused);
+    assert_eq!(
+        anonymous.sub,
+        crate::error::Sub::Policy(RefusalCode::WriteNone)
+    );
+    let refusal = Refusal {
+        code: RefusalCode::WriterAbsent,
+        why: "absent".into(),
+        next: "add it".into(),
+        tried: Vec::new(),
+    };
+    let expected = refusal.clone().into_error(Some(&repo("alabsystems/aterm")));
+    let refused = router
+        .permit_decided(&write, Decision::Refuse(refusal))
+        .expect_err("a refusal mints nothing");
+    assert_eq!(refused.kind, expected.kind);
+    assert_eq!(refused.sub, expected.sub);
+}
+
+/// A grant made from a scratch agh.toml that `config::load` read decides exactly as the argv
+/// literal of the same slug, for every access, with the release token present and absent.
+#[cfg(unix)]
+#[test]
+fn a_granted_literal_decides_as_an_argv_literal() {
+    let root = scratch();
+    let dirs = config::Dirs::under(root.path());
+    std::fs::create_dir_all(dirs.config.parent().expect("a parent")).expect("the parent");
+    aterm_uds::private_file::create_private_dir(&dirs.config).expect("the config directory");
+    let text = format!(
+        "{}\n[[writers]]\ncaller = \"fixture-caller\"\nrepos = [\"alabsystems/aterm\"]\n",
+        canonical_text(root.path())
+    );
+    aterm_uds::private_file::write_private(&dirs.config, "agh.toml", text.as_bytes())
+        .expect("agh.toml");
+    let router = Router::from_validated(
+        config::load(&dirs)
+            .expect("agh.toml loads")
+            .expect("agh.toml is there"),
+    );
+    let slug = repo("alabsystems/aterm");
+    let granted = router
+        .grant("fixture-caller", &slug)
+        .expect("the row grants it");
+    assert_eq!(granted.provenance(), Provenance::Granted);
+    for release in [Presence::Present, Presence::Absent] {
+        let presence = |name: &str| {
+            if name == "release" {
+                release
+            } else {
+                Presence::Present
+            }
+        };
+        for target in [
+            RouteRequest::read(RouteTarget::Repo(slug.clone())),
+            RouteRequest::writer_read(RouteTarget::Repo(slug.clone())),
+            RouteRequest::write(RouteTarget::Repo(slug.clone())),
+        ] {
+            let by_grant = router.decide(
+                &target.clone().with_named(Named::Literal(granted.clone())),
+                &presence,
+            );
+            let by_argv = router.decide(
+                &target.clone().with_named(literal("alabsystems/aterm")),
+                &presence,
+            );
+            assert_eq!(by_grant, by_argv, "{target:?} with release {release:?}");
+        }
+    }
+}

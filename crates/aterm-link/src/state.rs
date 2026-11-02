@@ -7,7 +7,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+pub(crate) mod asks;
 pub(crate) mod journal;
+
+use journal::Replay as _;
 
 /// One outstanding deadline.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,12 +45,17 @@ impl Deadline {
     #[must_use]
     pub fn parse(line: &str) -> Option<Self> {
         let (mut off, mut sid, mut at, mut dl, mut to) = (None, None, None, None, None);
+        let dec = |v: &str| {
+            (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| v.parse().ok())
+                .flatten()
+        };
         for tok in line.split_whitespace() {
             match tok.split_once('=') {
-                Some(("off", v)) => off = v.parse().ok(),
+                Some(("off", v)) => off = dec(v),
                 Some(("sid", v)) => sid = Some(v.to_string()),
-                Some(("at", v)) => at = v.parse().ok(),
-                Some(("dl", v)) => dl = v.parse().ok(),
+                Some(("at", v)) => at = dec(v),
+                Some(("dl", v)) => dl = dec(v),
                 Some(("to", v)) => to = Some(v.to_string()),
                 _ => {}
             }
@@ -89,7 +97,11 @@ impl Asked {
     #[must_use]
     pub fn parse(line: &str) -> Option<Self> {
         let mut toks = line.split_whitespace();
-        let off = toks.next()?.parse().ok()?;
+        let off = toks
+            .next()
+            .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))?
+            .parse()
+            .ok()?;
         let to = toks.next()?.to_string();
         toks.next().is_none().then_some(Self { off, to })
     }
@@ -401,17 +413,22 @@ impl IncLease {
     /// Parse one back: all four fields once each, `used` at or below `top`, a boot that is `-` or a boot id, and a file that is `-` or `<dev>:<dir>:<ino>`.
     pub(crate) fn parse(text: &str) -> Option<Self> {
         let (mut used, mut top, mut boot, mut file) = (None, None, None, None);
+        let dec = |v: &str| {
+            (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| v.parse::<u64>().ok())
+                .flatten()
+        };
         for tok in text.split_whitespace() {
             match tok.split_once('=')? {
-                ("used", v) if used.is_none() => used = Some(v.parse().ok()?),
-                ("top", v) if top.is_none() => top = Some(v.parse().ok()?),
+                ("used", v) if used.is_none() => used = Some(dec(v)?),
+                ("top", v) if top.is_none() => top = Some(dec(v)?),
                 ("boot", "-") if boot.is_none() => boot = Some(None),
                 ("boot", v) if boot.is_none() => {
                     boot = Some(Some(astream_sys::parse_boot_id(v.as_bytes())?));
                 }
                 ("file", "-") if file.is_none() => file = Some(None),
                 ("file", v) if file.is_none() => {
-                    let mut ids = v.split(':').map(|n| n.parse::<u64>().ok());
+                    let mut ids = v.split(':').map(dec);
                     let (dev, dir, ino) = (ids.next()??, ids.next()??, ids.next()??);
                     if ids.next().is_some() {
                         return None;
@@ -580,6 +597,54 @@ impl Posts {
     }
 }
 
+/// The asks journal in one open ([`asks`]): what it holds, read at the first use, what is
+/// owed to it, and where its file stands.
+#[derive(Debug, Default)]
+struct Asks {
+    /// What the journal holds, the tables of a build before it taken in, and every fact noted
+    /// since, written or not; `None` until the first use reads it ([`StateDir::asks`]).
+    index: Option<asks::Index>,
+    /// Facts noted ([`StateDir::note_asks`]) that no write has taken yet: the next
+    /// ([`StateDir::write_asks`]) appends them in one write.
+    owed: Vec<asks::Frame>,
+    /// The journal, held open for appends until a rewrite replaces the file.
+    file: Option<std::fs::File>,
+    /// Where its whole records end: where the next one goes.
+    len: u64,
+    /// The step the next record carries.
+    next_step: u64,
+    /// The file may not hold what the index does (a write refused, a cut or torn tail, damage,
+    /// a table taken in): it is rewritten from the index at the next write. No file yet is not
+    /// this: the first write appends, and makes it.
+    dirty: bool,
+    /// The size from which the next write rewrites it ([`journal::COMPACT_AT`]).
+    compact_at: u64,
+}
+
+impl Asks {
+    fn index(&self) -> &asks::Index {
+        static EMPTY: asks::Index = asks::Index::EMPTY;
+        self.index.as_ref().unwrap_or(&EMPTY)
+    }
+}
+
+/// What a read of the asks journal found ([`StateDir::read_asks`]).
+#[derive(Debug, Default)]
+struct AsksRead {
+    /// What it holds, reconciled with the tables of a build before it ([`asks::Index::take_in`]).
+    index: asks::Index,
+    /// Where its intact run of records ends, its whole length where it reads whole; 0 where it
+    /// holds damage, or does not read at all.
+    len: u64,
+    /// The step its next record carries.
+    next_step: u64,
+    /// The file does not hold all of `index`, or holds more than its whole records: the next
+    /// write rewrites it.
+    dirty: bool,
+    /// Its exact bytes, where it does not read whole.
+    damaged: Option<Vec<u8>>,
+}
+
 /// The reservations a moved generation resets ([`StateDir::publication_offset_resets`]).
 #[derive(Debug)]
 struct OffsetResets {
@@ -595,6 +660,8 @@ pub struct StateDir {
     disk: crate::fx::Disk,
     /// The post journal ([`journal`]).
     posts: std::sync::Mutex<Posts>,
+    /// The asks journal ([`asks`]).
+    asks: std::sync::Mutex<Asks>,
     /// Whether a read of the journal takes an older build's files into it: an open that may
     /// write, not a peek.
     adopts_legacy: bool,
@@ -711,8 +778,13 @@ impl PublishPin {
                 "invalid publication reservation",
             )
         };
+        let dec = |s: &str| {
+            (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| s.parse::<u64>().ok())
+                .flatten()
+        };
         let mut words = text.split_whitespace();
-        let seq = words.next().and_then(|s| s.parse().ok()).ok_or_else(bad)?;
+        let seq = words.next().and_then(dec).ok_or_else(bad)?;
         let mut tail: Vec<&str> = words.collect();
         let via_key = tail.first() == Some(&"key");
         if via_key {
@@ -725,7 +797,8 @@ impl PublishPin {
                 owner = Some(
                     parts
                         .get(1)
-                        .and_then(|s| s.parse::<u64>().ok())
+                        .copied()
+                        .and_then(dec)
                         .filter(|id| *id > 0)
                         .ok_or_else(bad)?,
                 );
@@ -733,7 +806,7 @@ impl PublishPin {
                 continue;
             }
             if parts[0] == "original-off" && original_off.is_none() {
-                original_off = Some(parts.get(1).and_then(|s| s.parse().ok()).ok_or_else(bad)?);
+                original_off = Some(parts.get(1).copied().and_then(dec).ok_or_else(bad)?);
                 parts = &parts[2..];
                 continue;
             }
@@ -958,12 +1031,12 @@ impl AckedLog {
         let tail = pieces.pop().unwrap_or_default();
         for piece in pieces {
             log.entries += 1;
-            if let Ok(off) = piece.trim().parse() {
+            if let Some(off) = crate::parse_uint(piece.trim()) {
                 log.offsets.insert(off);
             }
         }
         if tail.ends_with('\n') {
-            if let Ok(off) = tail.trim().parse() {
+            if let Some(off) = crate::parse_uint(tail.trim()) {
                 log.entries += 1;
                 log.offsets.insert(off);
             }
@@ -995,8 +1068,9 @@ pub(crate) enum TornKind {
     Keys,
     /// `unhandled/<sid>` ([`StateDir::topic_floors`]).
     Unhandled,
-    /// `journal/posts`, the post journal ([`journal`]): the sweep reads it by its records
-    /// ([`StateDir::sweep_journal`]), never as text.
+    /// `journal/posts`, the post journal ([`journal`]), and `journal/asks`, the asks journal
+    /// ([`asks`]): the sweep reads each by its records ([`StateDir::sweep_journal`]), never as
+    /// text.
     Journal,
 }
 
@@ -1047,14 +1121,18 @@ impl TornKind {
                 .all(|line| key_line(line).is_ok()),
             Self::Unhandled => parse_topic_floors(rel, text).is_ok(),
             Self::Journal => matches!(
-                journal::read(text.as_bytes()).end,
+                if name == asks::NAME {
+                    asks::read(text.as_bytes()).end
+                } else {
+                    journal::read(text.as_bytes()).end
+                },
                 journal::End::Clean | journal::End::Cut
             ),
         }
     }
 
     fn entry(name: &str, text: &str) -> Option<InFlight> {
-        name.parse().ok().and_then(|seq| InFlight::parse(seq, text))
+        crate::parse_uint(name).and_then(|seq| InFlight::parse(seq, text))
     }
 
     fn names(self, name: &str) -> bool {
@@ -1062,7 +1140,7 @@ impl TornKind {
             && !name.contains('/')
             && !name.starts_with('.')
             && (self != Self::InFlight || name.bytes().all(|b| b.is_ascii_digit()))
-            && (self != Self::Journal || name == journal::NAME)
+            && (self != Self::Journal || name == journal::NAME || name == asks::NAME)
     }
 }
 
@@ -1347,6 +1425,7 @@ impl StateDir {
             root,
             disk,
             posts: std::sync::Mutex::default(),
+            asks: std::sync::Mutex::default(),
             adopts_legacy,
             unflushed: std::sync::Mutex::default(),
             logpin_fence: std::sync::Mutex::default(),
@@ -2137,8 +2216,42 @@ impl StateDir {
         written
     }
 
-    fn write_post_frame(&self, posts: &mut Posts, frame: &journal::Frame) -> io::Result<()> {
+    /// Open the journal at `path` to append to it, created where it is not there: an owned
+    /// regular single-link file of `len` bytes, the bytes this open holds it to.
+    ///
+    /// # Errors
+    /// Its directory or its open, or a file that is none of those (`InvalidData`, naming the
+    /// journal as `what`): it is rewritten from what the open holds before its next record.
+    fn open_journal(&self, path: &Path, what: &str, len: u64) -> io::Result<std::fs::File> {
         use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+        std::fs::create_dir_all(self.path(journal::DIR))?;
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .mode(STATE_FILE_MODE)
+            .custom_flags(crate::enable::LOCK_OPEN_FLAGS)
+            .open(path)?;
+        let meta = file.metadata()?;
+        if !meta.is_file() || meta.uid() != aterm_uds::peer::our_uid() || meta.nlink() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("the {what} is not an owned regular single-link file"),
+            ));
+        }
+        if meta.len() != len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "the {what} holds {} bytes where this open wrote {len}; it is rewritten from \
+                     what this open holds before the next record",
+                    meta.len(),
+                ),
+            ));
+        }
+        Ok(file)
+    }
+
+    fn write_post_frame(&self, posts: &mut Posts, frame: &journal::Frame) -> io::Result<()> {
         if posts.dirty || posts.len >= posts.compact_at.max(journal::COMPACT_AT) {
             self.rewrite_posts(posts, None)?;
         }
@@ -2170,32 +2283,7 @@ impl StateDir {
         self.disk.before(w)?;
         let written = (|| -> io::Result<()> {
             if posts.file.is_none() {
-                std::fs::create_dir_all(self.path(journal::DIR))?;
-                let file = std::fs::OpenOptions::new()
-                    .append(true)
-                    .create(true)
-                    .mode(STATE_FILE_MODE)
-                    .custom_flags(crate::enable::LOCK_OPEN_FLAGS)
-                    .open(&path)?;
-                let meta = file.metadata()?;
-                if !meta.is_file() || meta.uid() != aterm_uds::peer::our_uid() || meta.nlink() != 1
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "the post journal is not an owned regular single-link file",
-                    ));
-                }
-                if meta.len() != posts.len {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "the post journal holds {} bytes where this open wrote {}; it is \
-                             rewritten from what this open holds before the next record",
-                            meta.len(),
-                            posts.len
-                        ),
-                    ));
-                }
+                let file = self.open_journal(&path, "post journal", posts.len)?;
                 if !posts.exists {
                     posts.entry_on_media = false;
                 }
@@ -2389,7 +2477,7 @@ impl StateDir {
             };
             let post = name
                 .rsplit_once('.')
-                .and_then(|(sid, id)| Some((sid, id.parse::<u64>().ok()?)));
+                .and_then(|(sid, id)| Some((sid, crate::parse_uint::<u64>(id)?)));
             let (Some(pin), Some((sid, id))) = (pin, post) else {
                 posts.held_sent.insert(name.clone());
                 continue;
@@ -2408,10 +2496,9 @@ impl StateDir {
         for (name, rel) in &in_flight {
             let entry = match self.read_reservation(rel) {
                 Ok(None) => continue,
-                Ok(Some(text)) => name
-                    .parse()
-                    .ok()
-                    .and_then(|seq| InFlight::parse(seq, &text)),
+                Ok(Some(text)) => {
+                    crate::parse_uint(name).and_then(|seq| InFlight::parse(seq, &text))
+                }
                 Err(_) => None,
             };
             let Some(entry) = entry else {
@@ -2479,6 +2566,281 @@ impl StateDir {
             let _ = self.remove_path(&handed);
         }
         Ok(())
+    }
+
+    /// WHAT THE ASKS JOURNAL SAYS, read from the disk now ([`asks`]): its whole records, or,
+    /// where it does not read whole (damage, or a broken last record), every whole record
+    /// before and after the damage ([`journal::salvage_as`]); then reconciled with the tables a
+    /// build before the journal reads ([`asks::Index::take_in`]), an empty one included, since
+    /// that build writes an empty table where it holds nothing. Nothing is written: a journal
+    /// that does not read whole, or that took a table in, is rewritten whole at the next write
+    /// ([`AsksRead::dirty`]). A journal that cannot be read at all is read as empty, as a build
+    /// before the journal read a table it could not.
+    fn read_asks(&self) -> AsksRead {
+        let mut read = AsksRead::default();
+        let mut lost = false;
+        match self.read_regular(&self.path(asks::FILE)) {
+            Ok(None) => {}
+            Ok(Some(bytes)) => {
+                let whole = asks::read(&bytes);
+                match whole.end {
+                    journal::End::Clean | journal::End::Cut => {
+                        read.dirty = whole.end != journal::End::Clean;
+                        read.index = whole.index;
+                        read.len = whole.valid_len;
+                        read.next_step = whole.next_step;
+                    }
+                    journal::End::Torn | journal::End::Fault { .. } => {
+                        read.index = journal::salvage_as(&bytes);
+                        read.dirty = true;
+                        read.damaged = Some(bytes);
+                        lost = true;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "aterm-link: the asks journal does not read ({e}); it is read as empty and \
+                     written whole from what this bridge notes"
+                );
+                read.dirty = true;
+                lost = true;
+            }
+        }
+        let table = |name: &str| std::fs::read_to_string(self.path(name)).ok();
+        let (asked, deadlines) = (table(asks::ASKED), table(asks::DEADLINES));
+        read.dirty |= read
+            .index
+            .take_in(asked.as_deref(), deadlines.as_deref(), lost);
+        read
+    }
+
+    /// The asks journal as this open holds it, read at the first use ([`StateDir::read_asks`]).
+    /// A journal that does not read whole is copied into the quarantine first, its exact bytes
+    /// kept for whoever repairs it. A refused copy is said and stops nothing, since a bridge
+    /// cannot go on without its asks: the next write replaces the journal with its whole
+    /// records all the same, and those bytes are gone. The sweep after an earlier boot, which
+    /// a refused copy does stop ([`StateDir::sweep_asks`]), has already kept them where it ran.
+    fn asks(&self) -> std::sync::MutexGuard<'_, Asks> {
+        let mut held = self.asks.lock().unwrap_or_else(|e| e.into_inner());
+        if held.index.is_none() {
+            let read = self.read_asks();
+            if let Some(bytes) = read.damaged {
+                match self.copy_into_quarantine(&[(asks::FILE.to_string(), bytes)], "") {
+                    Ok(moved) => {
+                        for SetAside { from, to } in moved {
+                            eprintln!(
+                                "aterm-link: {from} does not read whole: a copy is kept as {to}, \
+                                 and it is written again from its whole records"
+                            );
+                        }
+                    }
+                    Err(e) => eprintln!(
+                        "aterm-link: {} does not read whole and could not be copied into the \
+                         quarantine ({e}); it is written again from its whole records",
+                        asks::FILE
+                    ),
+                }
+            }
+            *held = Asks {
+                index: Some(read.index),
+                owed: Vec::new(),
+                file: None,
+                len: read.len,
+                next_step: read.next_step,
+                dirty: read.dirty,
+                compact_at: journal::COMPACT_AT,
+            };
+        }
+        held
+    }
+
+    /// Every ask's recipient and every deadline owed a verdict, oldest offset first, as this
+    /// open holds them: what the bridge starts from.
+    pub(crate) fn asks_tables(&self) -> (Vec<Asked>, Vec<Deadline>) {
+        let asks = self.asks();
+        (asks.index().asked_rows(), asks.index().deadline_rows())
+    }
+
+    /// Whether the deadline of `sid`'s ask at `off` is settled, as this open holds the journal:
+    /// a settle written, or one this open noted that no write has taken yet.
+    pub(crate) fn deadline_settled(&self, off: u64, sid: &str) -> bool {
+        self.asks().index().settled(off, sid)
+    }
+
+    /// Note `frames` in the asks journal as this open holds it, for the next write
+    /// ([`StateDir::write_asks`]) to append in one. The open holds each as true from now on,
+    /// written or not: a write the disk refuses leaves the journal to be rewritten whole from
+    /// what the open holds.
+    ///
+    /// # Errors
+    /// A fact whose record would not read back (`InvalidInput`, [`asks::Frame::carried`]): it is
+    /// noted nowhere, and those after it are not noted.
+    pub(crate) fn note_asks(
+        &self,
+        frames: impl IntoIterator<Item = asks::Frame>,
+    ) -> io::Result<()> {
+        let mut asks = self.asks();
+        for frame in frames {
+            if !frame.carried() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("an asks journal record would not read back: {frame:?}"),
+                ));
+            }
+            if let Some(index) = asks.index.as_mut() {
+                index.apply(frame.clone());
+            }
+            asks.owed.push(frame);
+        }
+        Ok(())
+    }
+
+    /// Write what the asks journal owes as this open holds it: every fact noted since the last
+    /// write, appended in one write, or, where the file may not hold what the open does (a write
+    /// refused, a broken tail, a table taken in) or has grown past its bound, the file rewritten
+    /// from what the open holds ([`StateDir::rewrite_asks`]), noted facts or none. A file that
+    /// holds what the open does, with nothing noted, is not written.
+    /// Ok means the file holds everything the open does. Never flushed: a clean stop flushes
+    /// it with the other journal ([`StateDir::end_run_clean`]).
+    ///
+    /// # Errors
+    /// The append or the rewrite: the open still holds every fact, and the file is rewritten
+    /// from it at the next write.
+    pub(crate) fn write_asks(&self) -> io::Result<()> {
+        let mut asks = self.asks();
+        self.write_owed_asks(&mut asks)
+    }
+
+    fn write_owed_asks(&self, asks: &mut Asks) -> io::Result<()> {
+        let owed = std::mem::take(&mut asks.owed);
+        let written = self.write_ask_records(asks, &owed);
+        if written.is_err() {
+            asks.dirty = true;
+            asks.file = None;
+        }
+        written
+    }
+
+    fn write_ask_records(&self, asks: &mut Asks, owed: &[asks::Frame]) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            self.refused_by_a_test(asks::FILE)?;
+            for frame in owed {
+                if let Some(file) = frame.written_file() {
+                    self.refused_by_a_test(file)?;
+                }
+            }
+        }
+        if asks.dirty || asks.len >= asks.compact_at.max(journal::COMPACT_AT) {
+            return self.rewrite_asks(asks, None);
+        }
+        if owed.is_empty() {
+            return Ok(());
+        }
+        let (bytes, step) = asks::encode_from(asks.next_step, owed)?;
+        let path = self.path(asks::FILE);
+        let w = crate::fx::Write::Append {
+            path: &path,
+            bytes: &bytes,
+        };
+        let _timed = self.timed(crate::wait_tally::Row::DirAppend);
+        self.count(|ops| ops.appends += 1);
+        self.disk.before(w)?;
+        if asks.file.is_none() {
+            asks.file = Some(self.open_journal(&path, "asks journal", asks.len)?);
+        }
+        asks.file
+            .as_mut()
+            .map_or(Ok(()), |file| file.write_all(&bytes))?;
+        self.disk.after(w)?;
+        asks.len += bytes.len() as u64;
+        asks.next_step = step;
+        let mut unflushed = self.unflushed.lock().unwrap_or_else(|e| e.into_inner());
+        if !unflushed.contains(asks::FILE) {
+            unflushed.insert(asks::FILE.to_string());
+        }
+        Ok(())
+    }
+
+    /// Replace the asks journal by one that holds exactly what the open does
+    /// ([`asks::Index::encode`]), flushed by `flush`: an atomic replace, so a reader sees the old
+    /// journal or the new. The next rewrite at the size bound waits for twice this one's size.
+    fn rewrite_asks(&self, asks: &mut Asks, flush: Option<aterm_durable::Flush>) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            // A rewrite writes both tables a build before the journal kept apart.
+            self.refused_by_a_test(asks::DEADLINES)?;
+            self.refused_by_a_test(asks::ASKED)?;
+        }
+        let (bytes, next_step) = asks.index().encode()?;
+        asks.file = None;
+        self.replace_bytes_as(asks::FILE, &bytes, flush, STATE_FILE_MODE)?;
+        asks.len = bytes.len() as u64;
+        asks.next_step = next_step;
+        asks.dirty = false;
+        asks.compact_at = journal::COMPACT_AT.max(2 * asks.len);
+        Ok(())
+    }
+
+    /// FOR WHICHEVER BUILD RUNS NEXT: what the asks journal holds as this open holds it, written
+    /// back as the tables a build before the journal reads ([`asks::ASKED`], [`asks::DEADLINES`]),
+    /// one replace each, unflushed as that build wrote them, each opened by the line that names
+    /// this hand-off ([`asks::legacy_text`]); then the hand-off recorded in the journal
+    /// ([`asks::Frame::Handed`]), so the next open of this build takes nothing in from tables that
+    /// name it ([`StateDir::read_asks`]). A rollback, or a dev bundle sharing the dir, finds every
+    /// ask's recipient and every deadline where it looks. A stop calls it, and a log reset after
+    /// it clamps the journal ([`StateDir::forget_log_offsets`]). A dir that never asked, with no
+    /// table, writes nothing.
+    ///
+    /// # Errors
+    /// A table's write, or the journal's: the open still holds everything, and the tables are
+    /// written again at the next hand-off.
+    pub(crate) fn hand_asks_to_files(&self) -> io::Result<()> {
+        let mut asks = self.asks();
+        let index = asks.index();
+        let holds_nothing =
+            index.asked.is_empty() && index.deadlines.is_empty() && index.gone.is_empty();
+        let tables = [asks::ASKED, asks::DEADLINES]
+            .iter()
+            .any(|name| std::fs::symlink_metadata(self.path(name)).is_ok());
+        if holds_nothing && !tables {
+            return Ok(());
+        }
+        let handed = index.handed.map_or(1, |n| n.saturating_add(1));
+        let asked = asks::legacy_text(handed, index.asked_rows().iter().map(Asked::render));
+        let deadlines =
+            asks::legacy_text(handed, index.deadline_rows().iter().map(Deadline::render));
+        self.write(asks::ASKED, &asked)?;
+        self.write(asks::DEADLINES, &deadlines)?;
+        let frame = asks::Frame::Handed(handed);
+        if let Some(index) = asks.index.as_mut() {
+            index.apply(frame.clone());
+        }
+        asks.owed.push(frame);
+        self.write_owed_asks(&mut asks)
+    }
+
+    /// A log reset's clamp of the asks journal: every ask's recipient, deadline and settle at an
+    /// offset `kept` does not take is forgotten, the journal rewritten without them, and the
+    /// tables handed back without them where a stop wrote them or an older build did
+    /// ([`StateDir::hand_asks_to_files`]), so no build reads an offset of the old log as one of
+    /// the new. The rewrite comes first and stands alone: a reset that leaves the journal
+    /// holding nothing, in a dir with no table, hands nothing back, and the journal on disk
+    /// must still lose the old log's offsets.
+    fn forget_asks_where(&self, kept: impl Fn(u64) -> bool) -> io::Result<()> {
+        {
+            let mut asks = self.asks();
+            if let Some(index) = asks.index.as_mut() {
+                let before = index.clone();
+                index.retain(kept);
+                if *index != before {
+                    asks.dirty = true;
+                }
+            }
+            self.write_owed_asks(&mut asks)?;
+        }
+        self.hand_asks_to_files()
     }
 
     pub(crate) fn receipt_pin(&self, sid: &str, rid: u64) -> io::Result<Option<PublishPin>> {
@@ -2794,6 +3156,7 @@ impl StateDir {
                 format!("the bridge lock {} is not a regular file", path.display()),
             ));
         }
+        aterm_uds::keep_out_of_children(&file)?;
         Ok(file)
     }
 
@@ -2833,7 +3196,7 @@ impl StateDir {
     /// The pid the `pid` file names.
     #[must_use]
     pub fn holder(&self) -> Option<u32> {
-        self.read("pid").and_then(|s| s.parse().ok())
+        self.read("pid").and_then(|s| crate::parse_uint(&s))
     }
 
     /// This node's id, minted once and kept ([`StateDir::provision_node`]).
@@ -2883,7 +3246,9 @@ impl StateDir {
     }
 
     fn incarnation_top(&self) -> u64 {
-        self.read("inc").and_then(|s| s.parse().ok()).unwrap_or(0)
+        self.read("inc")
+            .and_then(|s| crate::parse_uint(&s))
+            .unwrap_or(0)
     }
 
     /// What `inc-lease` holds, if it holds a whole one ([`IncLease::parse`]).
@@ -3005,7 +3370,9 @@ impl StateDir {
     /// The highest producer sequence this bridge has reserved (not necessarily published).
     #[must_use]
     pub fn sequence(&self) -> u64 {
-        self.read("seq").and_then(|s| s.parse().ok()).unwrap_or(0)
+        self.read("seq")
+            .and_then(|s| crate::parse_uint(&s))
+            .unwrap_or(0)
     }
 
     /// Reserve the next producer sequence of incarnation `inc` and persist it before it is used.
@@ -3043,7 +3410,7 @@ impl StateDir {
     #[must_use]
     pub fn seen_off(&self, sid: &str) -> Option<u64> {
         self.read(&format!("seen/{sid}"))
-            .and_then(|s| s.parse().ok())
+            .and_then(|s| crate::parse_uint(&s))
     }
 
     /// Record a session's refill watermark ([`Self::seen_off`]).
@@ -3572,8 +3939,51 @@ impl StateDir {
     /// sessions, its records in flight are retired next
     /// ([`StateDir::retire_in_flight_of_an_earlier_boot`]), and the bytes are kept for whoever
     /// repairs it. A journal that ends at a whole record, or in the next record cut short (an
-    /// append cut, which its reader drops as the `acked` log's reader does), stays.
+    /// append cut, which its reader drops as the `acked` log's reader does), stays. The asks
+    /// journal is swept the same way ([`StateDir::sweep_asks`]).
     fn sweep_journal(&self) -> io::Result<Vec<SetAside>> {
+        let mut moved = self.sweep_posts()?;
+        moved.extend(self.sweep_asks()?);
+        Ok(moved)
+    }
+
+    /// THE SWEEP OF THE ASKS JOURNAL ([`StateDir::sweep_journal`]): one whose last record is
+    /// broken, or that holds damage, has its exact bytes copied into the quarantine
+    /// (`journal.asks`) and is then replaced, in full and flushed, by one that holds what its
+    /// whole records say and what a table of a build before it holds that they do not
+    /// ([`StateDir::read_asks`]). The deadlines the damaged bytes held are unknown: an ask whose
+    /// deadline they held does not expire, and one whose settle they held is swept again, the
+    /// sweep reading its answer, or its `expired`, back from the bus before it publishes one.
+    fn sweep_asks(&self) -> io::Result<Vec<SetAside>> {
+        let Some(bytes) = self.read_regular(&self.path(asks::FILE))? else {
+            return Ok(Vec::new());
+        };
+        if matches!(
+            asks::read(&bytes).end,
+            journal::End::Clean | journal::End::Cut
+        ) {
+            return Ok(Vec::new());
+        }
+        let moved = self.copy_into_quarantine(&[(asks::FILE.to_string(), bytes)], "")?;
+        let read = self.read_asks();
+        let mut held = self.asks.lock().unwrap_or_else(|e| e.into_inner());
+        *held = Asks {
+            index: Some(read.index),
+            dirty: true,
+            compact_at: journal::COMPACT_AT,
+            ..Asks::default()
+        };
+        self.rewrite_asks(&mut held, Some(aterm_durable::Flush::Durable))?;
+        drop(held);
+        self.quarantine_tried
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(asks::FILE);
+        Ok(moved)
+    }
+
+    /// The post journal's part of [`StateDir::sweep_journal`].
+    fn sweep_posts(&self) -> io::Result<Vec<SetAside>> {
         let Some(bytes) = self.read_regular(&self.path(journal::FILE))? else {
             return Ok(Vec::new());
         };
@@ -3639,7 +4049,7 @@ impl StateDir {
             if copies.iter().any(|m| &m.from == from) {
                 if let Some(seq) = from
                     .strip_prefix("inflight/")
-                    .and_then(|s| s.parse::<u64>().ok())
+                    .and_then(crate::parse_uint::<u64>)
                 {
                     done.insert(seq, bytes.clone());
                 }
@@ -4181,7 +4591,7 @@ impl StateDir {
     /// The highest fleet-halt offset this node has published an `ack` for, so a reconnect does not re-answer the halt row its `Last` read returns again, nor a row that arrives both on a `Last` page and on the fleet tail.
     #[must_use]
     pub fn halt_acked(&self) -> Option<u64> {
-        self.read("halt-acked").and_then(|s| s.parse().ok())
+        self.read("halt-acked").and_then(|s| crate::parse_uint(&s))
     }
 
     /// Record the halt offset this node has answered.
@@ -4195,7 +4605,7 @@ impl StateDir {
     /// The inbox-group commit a bridge owed when it exited with no broker connection to make it on (`Bridge::hand_over_inbox_commit`).
     #[must_use]
     pub fn inbox_owed(&self) -> Option<u64> {
-        self.read("inbox-owed").and_then(|s| s.parse().ok())
+        self.read("inbox-owed").and_then(|s| crate::parse_uint(&s))
     }
 
     /// Hand over the inbox-group commit through `off` ([`Self::inbox_owed`]).
@@ -4306,12 +4716,6 @@ impl StateDir {
         } = self.publication_offset_resets(keep_below)?;
         let in_flight = self.in_flight()?;
         let owed = self.inbox_owed();
-        let deadlines: Vec<Deadline> = self
-            .deadlines()
-            .into_iter()
-            .filter(|d| kept(d.off))
-            .collect();
-        let asked: Vec<Asked> = self.asked().into_iter().filter(|a| kept(a.off)).collect();
         for path in seen_removed.into_iter().chain(unhandled_removed) {
             match self.remove_path(&path) {
                 Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
@@ -4338,8 +4742,7 @@ impl StateDir {
         if !owed.is_some_and(kept) {
             self.clear_inbox_owed()?;
         }
-        self.set_deadlines(&deadlines)?;
-        self.set_asked(&asked)?;
+        self.forget_asks_where(kept)?;
         let mut dropped = Vec::new();
         let mut posts = self.posts()?;
         let mut moved = false;
@@ -4736,34 +5139,38 @@ impl StateDir {
         self.write(&format!("keys/{sid}"), &kept.join("\n"))
     }
 
-    /// Every deadline this node still owes a verdict on, oldest offset first.
+    /// Every deadline this node still owes a verdict on, oldest offset first, as the disk holds
+    /// them now: the asks journal, reconciled with the tables of a build before it
+    /// ([`StateDir::read_asks`]). Read afresh at each call, so another open sees what the bridge
+    /// wrote since.
     #[must_use]
     pub fn deadlines(&self) -> Vec<Deadline> {
-        self.read("deadlines")
-            .map(|s| s.lines().filter_map(Deadline::parse).collect())
-            .unwrap_or_default()
+        self.read_asks().index.deadline_rows()
     }
 
-    /// Every ask this node remembers the recipient of, oldest offset first.
+    /// Every ask this node remembers the recipient of, oldest offset first, as the disk holds
+    /// them now ([`StateDir::deadlines`]).
     #[must_use]
     pub fn asked(&self) -> Vec<Asked> {
-        self.read("asked")
-            .map(|s| s.lines().filter_map(Asked::parse).collect())
-            .unwrap_or_default()
+        self.read_asks().index.asked_rows()
     }
 
-    /// Replace the asked table, keeping the newest [`ASKED_KEEP`] by position.
-    pub fn set_asked(&self, list: &[Asked]) -> io::Result<()> {
+    /// Write the asked table as a build before the asks journal wrote it: its last
+    /// [`ASKED_KEEP`] rows, no hand-off named.
+    #[cfg(test)]
+    pub(crate) fn set_asked_as_an_older_build(&self, list: &[Asked]) -> io::Result<()> {
         let over = list.len().saturating_sub(ASKED_KEEP);
         let lines: Vec<String> = list[over..].iter().map(Asked::render).collect();
-        self.write("asked", &lines.join("\n"))
+        self.write(asks::ASKED, &lines.join("\n"))
     }
 
-    /// Replace the deadline table, keeping the newest [`DEADLINES_KEEP`] by position.
-    pub fn set_deadlines(&self, list: &[Deadline]) -> io::Result<()> {
+    /// Write the deadline table as a build before the asks journal wrote it: its last
+    /// [`DEADLINES_KEEP`] rows, no hand-off named.
+    #[cfg(test)]
+    pub(crate) fn set_deadlines_as_an_older_build(&self, list: &[Deadline]) -> io::Result<()> {
         let over = list.len().saturating_sub(DEADLINES_KEEP);
         let lines: Vec<String> = list[over..].iter().map(Deadline::render).collect();
-        self.write("deadlines", &lines.join("\n"))
+        self.write(asks::DEADLINES, &lines.join("\n"))
     }
 
     /// The directory itself, for what this type does not model.
@@ -6607,8 +7014,10 @@ mod tests {
             st.set_topic_floors("s-y", &floors(&[("c", 6)])).unwrap();
             st.set_halt_acked(2).unwrap();
             st.set_inbox_owed(4).unwrap();
-            st.set_deadlines(&[deadline(3), deadline(6)]).unwrap();
-            st.set_asked(&[asked(3), asked(6)]).unwrap();
+            st.set_deadlines_as_an_older_build(&[deadline(3), deadline(6)])
+                .unwrap();
+            st.set_asked_as_an_older_build(&[asked(3), asked(6)])
+                .unwrap();
             st.set_key_pin("s-x", "low", &pin(Some(1))).unwrap();
             st.set_key_pin("s-x", "high", &pin(Some(6))).unwrap();
             st.set_in_flight(&in_flight(1, 2)).unwrap();
@@ -6820,12 +7229,13 @@ mod tests {
             dl: 240_000,
             to: Some("n-0123456789abcdef".to_string()),
         };
-        st.set_deadlines(std::slice::from_ref(&one)).expect("write");
+        st.set_deadlines_as_an_older_build(std::slice::from_ref(&one))
+            .expect("write");
         assert_eq!(
             StateDir::open(&dir).expect("reopen").deadlines(),
             vec![one.clone()]
         );
-        st.set_deadlines(&[]).expect("clear");
+        st.set_deadlines_as_an_older_build(&[]).expect("clear");
         assert!(st.deadlines().is_empty());
         for damaged in [
             "",
@@ -6853,7 +7263,8 @@ mod tests {
                 to: None,
             })
             .collect();
-        st.set_deadlines(&many).expect("write many");
+        st.set_deadlines_as_an_older_build(&many)
+            .expect("write many");
         let kept = st.deadlines();
         assert_eq!(kept.len(), DEADLINES_KEEP);
         assert_eq!(kept[0].off, 3, "the three oldest are gone");
@@ -6875,7 +7286,7 @@ mod tests {
                 to: "h-andrew".to_string(),
             },
         ];
-        st.set_asked(&two).expect("write");
+        st.set_asked_as_an_older_build(&two).expect("write");
         assert_eq!(StateDir::open(&dir).expect("reopen").asked(), two);
         for damaged in ["", "7", "x n-a", "7 n-a extra"] {
             assert_eq!(Asked::parse(damaged), None, "{damaged:?}");
@@ -6886,11 +7297,620 @@ mod tests {
                 to: "n-a".to_string(),
             })
             .collect();
-        st.set_asked(&many).expect("write many");
+        st.set_asked_as_an_older_build(&many).expect("write many");
         let kept = st.asked();
         assert_eq!(kept.len(), ASKED_KEEP);
         assert_eq!(kept[0].off, 2, "the two oldest are gone");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn ask_deadline(off: u64, sid: &str) -> Deadline {
+        Deadline {
+            off,
+            sid: sid.to_string(),
+            at: 1_700_000_000_000 + off,
+            dl: 60_000,
+            to: Some("n-b".to_string()),
+        }
+    }
+
+    fn ask_recipient(off: u64) -> Asked {
+        Asked {
+            off,
+            to: "n-b".to_string(),
+        }
+    }
+
+    /// **AN ASK COSTS THE STATE DIR ONE APPEND** (C04): its recipient and its deadline noted
+    /// together are one write of the asks journal, and nothing is replaced; a settle is one more.
+    /// What a build before the journal did instead: two whole tables replaced an ask.
+    #[test]
+    fn an_ask_costs_one_append_and_its_settle_one_more() {
+        let dir = scratch("asks-cost");
+        let st = StateDir::open(&dir).expect("open");
+        for off in [5, 9] {
+            let before = st.ops();
+            st.note_asks([
+                asks::Frame::Asked(ask_recipient(off)),
+                asks::Frame::Deadline(ask_deadline(off, "s-a")),
+            ])
+            .expect("noted");
+            st.write_asks().expect("written");
+            let spent = st.ops() - before;
+            assert_eq!(
+                (spent.appends, spent.replaces, spent.renames, spent.fsyncs),
+                (1, 0, 0, 0),
+                "the ask at {off}"
+            );
+        }
+        let before = st.ops();
+        st.note_asks([asks::Frame::DeadlineGone {
+            off: 5,
+            sid: "s-a".to_string(),
+        }])
+        .expect("noted");
+        st.write_asks().expect("written");
+        assert_eq!((st.ops() - before).appends, 1, "the settle");
+        let before = st.ops();
+        st.write_asks().expect("nothing owed");
+        assert_eq!(
+            st.ops() - before,
+            FileOps::default(),
+            "nothing owed, nothing written"
+        );
+        let reopened = StateDir::open(&dir).expect("reopen");
+        assert_eq!(reopened.asked(), [ask_recipient(5), ask_recipient(9)]);
+        assert_eq!(reopened.deadlines(), [ask_deadline(9, "s-a")]);
+        assert!(!dir.join(asks::DEADLINES).exists() && !dir.join(asks::ASKED).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A SETTLED DEADLINE IS REMEMBERED ACROSS A REOPEN** (C04): the settle replays at the
+    /// next open, after a rewrite from the index too, and after a stop's hand-off to the tables
+    /// a build before the journal reads, so the next bridge's retry of the ask arms nothing
+    /// (`Bridge::note_deadline`). CONTROL: another asker's is not.
+    #[test]
+    fn a_settled_deadline_is_remembered_across_a_reopen_a_rewrite_and_a_hand_off() {
+        let dir = scratch("asks-settled");
+        let st = StateDir::open(&dir).expect("open");
+        st.note_asks([
+            asks::Frame::Asked(ask_recipient(5)),
+            asks::Frame::Deadline(ask_deadline(5, "s-a")),
+        ])
+        .expect("noted");
+        st.write_asks().expect("written");
+        st.note_asks([asks::Frame::DeadlineGone {
+            off: 5,
+            sid: "s-a".to_string(),
+        }])
+        .expect("noted");
+        st.write_asks().expect("written");
+        let reopened = StateDir::open(&dir).expect("reopen");
+        assert!(reopened.deadline_settled(5, "s-a"), "the settle replays");
+        assert!(!reopened.deadline_settled(5, "s-b"), "only its asker's");
+        assert!(reopened.deadlines().is_empty());
+
+        reopened.refuse_writes_of(Some(asks::FILE));
+        reopened
+            .note_asks([asks::Frame::Asked(ask_recipient(6))])
+            .expect("noted");
+        assert!(reopened.write_asks().is_err(), "refused: rewritten next");
+        reopened.refuse_writes_of(None);
+        let before = reopened.ops();
+        reopened.write_asks().expect("the rewrite");
+        assert_eq!(
+            (reopened.ops() - before).replaces,
+            1,
+            "a rewrite, from the index"
+        );
+        assert!(StateDir::open(&dir)
+            .expect("reopen")
+            .deadline_settled(5, "s-a"));
+        assert_eq!(
+            StateDir::open(&dir).expect("reopen").asked(),
+            [ask_recipient(5), ask_recipient(6)],
+            "the refused record, rewritten"
+        );
+
+        reopened.hand_asks_to_files().expect("the hand-off");
+        let table = std::fs::read_to_string(dir.join(asks::DEADLINES)).expect("handed back");
+        assert_eq!(asks::legacy_mark(&table), Some(1));
+        assert!(table.lines().all(|line| Deadline::parse(line).is_none()));
+        assert!(StateDir::open(&dir)
+            .expect("reopen")
+            .deadline_settled(5, "s-a"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Settle deadline `off`, then more than the index remembers, so that settle ages out.
+    fn settle_past_the_memory(st: &StateDir, off: u64) {
+        let settle = |off| asks::Frame::DeadlineGone {
+            off,
+            sid: "s-a".to_string(),
+        };
+        st.note_asks([settle(off)]).expect("noted");
+        st.note_asks((0..=DEADLINES_KEEP as u64).map(|n| settle(off + 1 + n)))
+            .expect("noted");
+        st.write_asks().expect("written");
+        assert!(!st.deadline_settled(off, "s-a"), "aged out");
+    }
+
+    /// **AN UNMARKED TABLE IS TAKEN IN ONCE** (C04 review): an older build's seamless hand-off
+    /// leaves its table with no hand-off named, and no stop of this build replaces it. The
+    /// deadline it holds is settled here, and the settle ages out of what the index remembers;
+    /// a kill and the next open take nothing in, so the deadline is not armed again for a sweep
+    /// to expire an answered ask. CONTROL: with the journal gone, what took it is gone too, so
+    /// the table's row is the only word there is, and it stands.
+    #[test]
+    fn an_unmarked_table_is_taken_in_once_and_a_settle_that_aged_out_stays_settled() {
+        let dir = scratch("asks-taken-once");
+        let st = StateDir::open(&dir).expect("the older build's dir");
+        st.set_deadlines_as_an_older_build(&[ask_deadline(3, "s-a")])
+            .expect("its table");
+        drop(st);
+        let st = StateDir::open(&dir).expect("this build");
+        assert_eq!(st.asks_tables().1, [ask_deadline(3, "s-a")], "taken in");
+        settle_past_the_memory(&st, 3);
+        drop(st);
+        let reopened = StateDir::open(&dir).expect("after a kill");
+        assert!(reopened.asks_tables().1.is_empty(), "armed again nowhere");
+        assert!(StateDir::peek(&dir).deadlines().is_empty(), "nor by a peek");
+        assert!(
+            Deadline::parse(
+                std::fs::read_to_string(dir.join(asks::DEADLINES))
+                    .expect("the table, left where it was")
+                    .trim()
+            )
+            .is_some(),
+            "what keeps it out is the journal's record, not the file"
+        );
+        drop(reopened);
+        std::fs::remove_file(dir.join(asks::FILE)).expect("CONTROL: the journal gone");
+        assert_eq!(
+            StateDir::open(&dir).expect("reopen").asks_tables().1,
+            [ask_deadline(3, "s-a")],
+            "CONTROL: the table is the only word"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A TABLE THAT NAMES THIS JOURNAL'S HAND-OFF IS NOT READ, HOWEVER OLD THE SETTLE** (C04
+    /// review): a stop hands deadline 3 back and records the hand-off (`Frame::Handed`). The next
+    /// run settles 3 and more than the index remembers, and is killed, so the table still holds
+    /// the row and the settle has aged out. The next open reads the table's line and arms
+    /// nothing. Without the record the journal would name no hand-off, and the table's row would
+    /// come back.
+    #[test]
+    fn a_table_of_this_journals_hand_off_arms_nothing_a_later_run_settled() {
+        let dir = scratch("asks-handed-record");
+        let st = StateDir::open(&dir).expect("open");
+        st.note_asks([asks::Frame::Deadline(ask_deadline(3, "s-a"))])
+            .expect("noted");
+        st.write_asks().expect("written");
+        st.hand_asks_to_files().expect("the hand-off");
+        assert_eq!(
+            asks::read(&std::fs::read(dir.join(asks::FILE)).expect("the journal"))
+                .index
+                .handed,
+            Some(1),
+            "the hand-off is recorded"
+        );
+        drop(st);
+        let next = StateDir::open(&dir).expect("the next run");
+        settle_past_the_memory(&next, 3);
+        drop(next);
+        assert!(
+            StateDir::open(&dir)
+                .expect("after a kill")
+                .asks_tables()
+                .1
+                .is_empty(),
+            "the row its own hand-off left in the table is not armed again"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **AN OLDER BUILD THAT MET A MOVE OF THE LOG BETWEEN TWO RUNS OF THIS ONE HAS THE LAST WORD**
+    /// (C04 review): this build stops with asks 40 and 50 to `n-old`, deadline 50 standing and 40
+    /// settled. An older build runs, forgets everything on the move, and s-a's next ask lands at
+    /// 40 on the new log, to `n-new`. The next open holds that build's rows alone: 40 expires
+    /// (no remembered settle keeps its deadline out), no sweep of old 50 runs on the new log, and
+    /// a reply from `n-new` to 40 is no stray. Once taken, that table is not read again. CONTROL:
+    /// the same build holding nothing leaves empty tables, which say the same.
+    #[test]
+    fn an_older_builds_move_of_the_log_between_runs_has_the_last_word() {
+        let to = |off, node: &str| Asked {
+            off,
+            to: node.to_string(),
+        };
+        let at_old = |off| Deadline {
+            to: Some("n-old".to_string()),
+            ..ask_deadline(off, "s-a")
+        };
+        for leaves_nothing in [false, true] {
+            let dir = scratch("asks-older-move");
+            let st = StateDir::open(&dir).expect("open");
+            st.note_asks([
+                asks::Frame::Asked(to(40, "n-old")),
+                asks::Frame::Deadline(at_old(40)),
+                asks::Frame::Asked(to(50, "n-old")),
+                asks::Frame::Deadline(at_old(50)),
+                asks::Frame::DeadlineGone {
+                    off: 40,
+                    sid: "s-a".to_string(),
+                },
+            ])
+            .expect("noted");
+            st.write_asks().expect("written");
+            st.hand_asks_to_files().expect("the stop");
+
+            let on_the_new_log = Deadline {
+                to: Some("n-new".to_string()),
+                ..ask_deadline(40, "s-a")
+            };
+            let (asked, deadlines) = if leaves_nothing {
+                (Vec::new(), Vec::new())
+            } else {
+                (vec![to(40, "n-new")], vec![on_the_new_log])
+            };
+            st.set_asked_as_an_older_build(&asked).expect("its table");
+            st.set_deadlines_as_an_older_build(&deadlines)
+                .expect("its table");
+            drop(st);
+
+            let back = StateDir::open(&dir).expect("this build again");
+            assert_eq!(back.asks_tables(), (asked.clone(), deadlines.clone()));
+            assert!(
+                !back.deadline_settled(40, "s-a"),
+                "no settle of the old log"
+            );
+            assert_eq!(
+                StateDir::peek(&dir).deadlines(),
+                deadlines,
+                "a peek reads so"
+            );
+            back.write_asks().expect("what it took, written");
+            drop(back);
+            let again = StateDir::open(&dir).expect("reopen");
+            assert_eq!(again.asks_tables(), (asked, deadlines));
+            let before = again.ops();
+            again.write_asks().expect("nothing owed");
+            assert_eq!(
+                (again.ops() - before).replaces,
+                0,
+                "taken once, so nothing is rewritten"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// **DAMAGE AHEAD OF A HAND-OFF'S RECORD TAKES THE ROW BACK FROM THE TABLE** (C04 review): two
+    /// deadlines are written and a stop hands them off, so the tables name the hand-off the
+    /// journal records. A power cut after a hand-off stop, which flushes nothing, damages the
+    /// first deadline's record. The open and the sweep read that deadline back from the table,
+    /// and the rewrite holds it. CONTROL: undamaged, the same open reads the same rows, taking
+    /// nothing in.
+    #[test]
+    fn damage_ahead_of_a_hand_off_takes_the_row_back_from_the_table() {
+        for sweep in [false, true] {
+            let dir = aterm_tempfile::Builder::new()
+                .prefix("asks-damage-handed")
+                .tempdir_in("/tmp")
+                .expect("scratch");
+            let root = dir.path();
+            let st = StateDir::open(root).expect("open");
+            st.set_inc_seam(in_boot(1));
+            st.take_incarnation(0).expect("the last attach, in boot 1");
+            for off in [3, 4] {
+                st.note_asks([asks::Frame::Deadline(ask_deadline(off, "s-a"))])
+                    .expect("noted");
+                st.write_asks().expect("written");
+            }
+            st.hand_asks_to_files().expect("the hand-off");
+            drop(st);
+
+            let control = StateDir::open(root).expect("CONTROL");
+            assert_eq!(
+                control.asks_tables().1,
+                [ask_deadline(3, "s-a"), ask_deadline(4, "s-a")]
+            );
+            let before = control.ops();
+            control.write_asks().expect("nothing owed");
+            assert_eq!(
+                (control.ops() - before).replaces,
+                0,
+                "CONTROL: nothing taken in"
+            );
+            drop(control);
+
+            let path = root.join(asks::FILE);
+            let mut bytes = std::fs::read(&path).expect("the journal");
+            bytes[20] ^= 0x01;
+            std::fs::write(&path, &bytes).expect("damage");
+            assert!(matches!(
+                asks::read(&bytes).end,
+                journal::End::Fault { .. } | journal::End::Torn
+            ));
+            let rows = [ask_deadline(3, "s-a"), ask_deadline(4, "s-a")];
+            let st = StateDir::open(root).expect("the next bridge");
+            if sweep {
+                st.set_inc_seam(in_boot(2));
+                st.set_aside_torn().expect("the sweep");
+            }
+            assert_eq!(st.asks_tables().1, rows, "the lost row back");
+            st.write_asks().expect("the rewrite");
+            assert_eq!(
+                asks::read(&std::fs::read(&path).expect("rewritten"))
+                    .index
+                    .deadline_rows(),
+                rows,
+                "the rewrite holds it"
+            );
+        }
+    }
+
+    /// **THE ASKS JOURNAL IS REWRITTEN FROM ITS INDEX PAST ITS BOUND AND KEEPS WHAT IS LIVE**
+    /// (C04 review): nothing below the bound is rewritten, a rewrite holds only what the index
+    /// does, so a journal of settled asks shrinks, the file never runs past the bound by more
+    /// than a few records, and it reopens to the same index.
+    #[test]
+    fn the_asks_journal_is_rewritten_past_its_bound_and_keeps_what_is_live() {
+        let dir = scratch("asks-bound");
+        let st = StateDir::open(&dir).expect("open");
+        st.note_asks([
+            asks::Frame::Asked(ask_recipient(1)),
+            asks::Frame::Deadline(ask_deadline(1, "s-live")),
+        ])
+        .expect("a live deadline");
+        st.write_asks().expect("written");
+        let path = dir.join(asks::FILE);
+        let size = || std::fs::metadata(&path).expect("the journal").len();
+        let (mut rewrites, mut bound, mut off) = (0, journal::COMPACT_AT, 1_000u64);
+        while rewrites < 2 {
+            off += 1;
+            st.note_asks([
+                asks::Frame::Asked(ask_recipient(off)),
+                asks::Frame::Deadline(ask_deadline(off, "s-a")),
+                asks::Frame::DeadlineGone {
+                    off,
+                    sid: "s-a".to_string(),
+                },
+            ])
+            .expect("noted");
+            let before = (size(), st.ops().replaces);
+            assert!(
+                before.0 < bound + 4096,
+                "past its bound of {bound} by more than one write: {} bytes",
+                before.0
+            );
+            st.write_asks().expect("written");
+            if st.ops().replaces > before.1 {
+                rewrites += 1;
+                assert!(size() < before.0, "a rewrite holds only what is live");
+                assert!(
+                    before.0 >= bound,
+                    "CONTROL: nothing is rewritten below the bound ({} bytes)",
+                    before.0
+                );
+                bound = journal::COMPACT_AT.max(2 * size());
+            }
+        }
+        let held = st.asks_tables();
+        assert!(held.1.contains(&ask_deadline(1, "s-live")), "what is live");
+        assert_eq!(
+            StateDir::open(&dir).expect("reopen").asks_tables(),
+            held,
+            "reopens to what the open held"
+        );
+        assert_eq!(held.0.len(), ASKED_KEEP.min(off as usize - 999));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A CLEAN STOP FLUSHES THE ASKS JOURNAL, APPENDED OR REWRITTEN** (C04 review): each kind
+    /// of write leaves its file for the stop to flush, so a power cut after a clean stop loses no
+    /// ask. CONTROL: a run that wrote nothing to it flushes nothing of it.
+    #[test]
+    fn a_clean_stop_flushes_the_asks_journal_appended_or_rewritten() {
+        let stop_flushes = |write: &dyn Fn(&StateDir)| {
+            let dir = aterm_tempfile::Builder::new()
+                .prefix("asks-stop")
+                .tempdir_in("/tmp")
+                .expect("scratch");
+            let st = StateDir::open(dir.path()).expect("open");
+            st.set_inc_seam(in_boot(1));
+            st.begin_run().expect("the run");
+            write(&st);
+            st.end_run_clean().expect("the stop").files
+        };
+        let note = |st: &StateDir| {
+            st.note_asks([asks::Frame::Asked(ask_recipient(3))])
+                .expect("noted");
+        };
+        assert_eq!(stop_flushes(&|_| {}), 0, "CONTROL: nothing written");
+        assert_eq!(
+            stop_flushes(&|st| {
+                note(st);
+                let before = st.ops();
+                st.write_asks().expect("an append");
+                assert_eq!((st.ops() - before).replaces, 0, "appended");
+            }),
+            1,
+            "after an append"
+        );
+        assert_eq!(
+            stop_flushes(&|st| {
+                note(st);
+                st.refuse_writes_of(Some(asks::FILE));
+                assert!(st.write_asks().is_err(), "refused");
+                st.refuse_writes_of(None);
+                let before = st.ops().replaces;
+                st.write_asks().expect("the rewrite");
+                assert_eq!(st.ops().replaces, before + 1, "rewritten");
+            }),
+            1,
+            "after a rewrite"
+        );
+    }
+
+    /// **A HAND-OFF READS ROW FOR ROW TO A BUILD BEFORE THE JOURNAL, AND WHAT THAT BUILD WRITES
+    /// IS TAKEN BACK** (C04): a stop writes each table whole, its rows as that build's parse
+    /// reads them; the next open of this build takes nothing in from tables that name its own
+    /// hand-off. An older build that ran after it (a rollback) rewrites a table with no
+    /// hand-off named, and that table is the next open's word on what it holds: what that build
+    /// settled stays settled, and what it armed stands. The tables are never unlinked.
+    #[test]
+    fn a_hand_off_reads_to_an_older_build_and_its_tables_are_taken_back() {
+        let dir = scratch("asks-hand-off");
+        let st = StateDir::open(&dir).expect("open");
+        st.hand_asks_to_files().expect("nothing to hand off");
+        assert!(
+            !dir.join(asks::ASKED).exists() && !dir.join(asks::FILE).exists(),
+            "a dir that never asked writes nothing"
+        );
+        st.note_asks([
+            asks::Frame::Asked(ask_recipient(3)),
+            asks::Frame::Deadline(ask_deadline(3, "s-a")),
+            asks::Frame::Asked(ask_recipient(4)),
+            asks::Frame::Deadline(ask_deadline(4, "s-a")),
+            asks::Frame::DeadlineGone {
+                off: 4,
+                sid: "s-a".to_string(),
+            },
+        ])
+        .expect("noted");
+        st.write_asks().expect("written");
+        st.hand_asks_to_files().expect("the hand-off");
+        let rows = |name: &str| -> Vec<String> {
+            std::fs::read_to_string(dir.join(name))
+                .expect("a table")
+                .lines()
+                .skip(1)
+                .map(str::to_string)
+                .collect()
+        };
+        let older_deadlines: Vec<Deadline> = std::fs::read_to_string(dir.join(asks::DEADLINES))
+            .expect("the table")
+            .lines()
+            .filter_map(Deadline::parse)
+            .collect();
+        assert_eq!(
+            older_deadlines,
+            [ask_deadline(3, "s-a")],
+            "what an older build reads"
+        );
+        assert_eq!(rows(asks::ASKED), ["3 n-b", "4 n-b"]);
+        let reopened = StateDir::open(&dir).expect("reopen");
+        let before = reopened.ops();
+        assert_eq!(reopened.asks_tables().1, [ask_deadline(3, "s-a")]);
+        reopened.write_asks().expect("nothing owed");
+        assert_eq!(
+            (reopened.ops() - before).replaces,
+            0,
+            "its own hand-off takes nothing in, so nothing is rewritten"
+        );
+        drop(reopened);
+
+        // A rollback: a build before the journal settles 3, asks 7 and 8, and arms 4 again
+        // (its retry of a held post, which knew no settle) and 8.
+        st.set_deadlines_as_an_older_build(&[ask_deadline(4, "s-a"), ask_deadline(8, "s-a")])
+            .expect("its table");
+        st.set_asked_as_an_older_build(&[
+            ask_recipient(3),
+            ask_recipient(4),
+            ask_recipient(7),
+            ask_recipient(8),
+        ])
+        .expect("its table");
+        let back = StateDir::open(&dir).expect("this build again");
+        assert_eq!(
+            back.asks_tables(),
+            (
+                vec![
+                    ask_recipient(3),
+                    ask_recipient(4),
+                    ask_recipient(7),
+                    ask_recipient(8)
+                ],
+                vec![ask_deadline(4, "s-a"), ask_deadline(8, "s-a")]
+            ),
+            "its word: 3 it settled stays settled, and 4 it armed again stands, for the sweep to \
+             read its answer back from the bus"
+        );
+        let before = back.ops();
+        back.write_asks().expect("the rewrite");
+        assert_eq!(
+            (back.ops() - before).replaces,
+            1,
+            "what was taken in is written"
+        );
+        assert!(dir.join(asks::ASKED).exists() && dir.join(asks::DEADLINES).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE SWEEP OF A TORN ASKS JOURNAL (C04), after an unclean stop in an earlier boot: its
+    /// exact bytes are kept in the quarantine, and it is rewritten with every whole record,
+    /// those after the damage too. CONTROL: a journal whose last record is cut short stays.
+    #[test]
+    fn the_sweep_keeps_every_whole_record_after_damage_in_the_asks_journal() {
+        for cut in [false, true] {
+            let dir = aterm_tempfile::Builder::new()
+                .prefix("asks-salvage")
+                .tempdir_in("/tmp")
+                .expect("scratch");
+            let root = dir.path();
+            let st = StateDir::open(root).expect("open");
+            st.set_inc_seam(in_boot(1));
+            st.take_incarnation(0).expect("the last attach, in boot 1");
+            for off in [3, 4] {
+                st.note_asks([
+                    asks::Frame::Asked(ask_recipient(off)),
+                    asks::Frame::Deadline(ask_deadline(off, "s-a")),
+                ])
+                .expect("noted");
+                st.write_asks().expect("written");
+            }
+            drop(st);
+            let path = root.join(asks::FILE);
+            let mut bytes = std::fs::read(&path).expect("the journal");
+            if cut {
+                bytes.truncate(bytes.len() - 3);
+            } else {
+                let first =
+                    journal::encode(0, &asks::Frame::Asked(ask_recipient(3))).expect("a record");
+                bytes[first.len() + 20] ^= 0x01;
+            }
+            std::fs::write(&path, &bytes).expect("damage");
+            let st = StateDir::open(root).expect("boot 2's bridge");
+            st.set_inc_seam(in_boot(2));
+            let moved = st.set_aside_torn().expect("the sweep");
+            if cut {
+                assert!(moved.is_empty(), "CONTROL: a cut tail stays");
+                assert_eq!(std::fs::read(&path).expect("kept"), bytes);
+                assert_eq!(st.asks_tables().1, [ask_deadline(3, "s-a")]);
+                continue;
+            }
+            assert_eq!(
+                moved.iter().map(|m| m.from.as_str()).collect::<Vec<_>>(),
+                [asks::FILE]
+            );
+            assert_eq!(
+                std::fs::read(root.join("quarantine/journal.asks")).expect("kept"),
+                bytes
+            );
+            assert_eq!(
+                st.asks_tables(),
+                (
+                    vec![ask_recipient(3), ask_recipient(4)],
+                    vec![ask_deadline(4, "s-a")]
+                ),
+                "every whole record, those after the damaged deadline too"
+            );
+            assert_eq!(
+                StateDir::open(root).expect("reopen").deadlines(),
+                [ask_deadline(4, "s-a")],
+                "rewritten whole"
+            );
+        }
     }
 
     #[test]

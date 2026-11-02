@@ -1564,9 +1564,11 @@ pub(super) fn use_statements(file: &SourceFile) -> UseStatements {
         let mut start = 0;
         loop {
             if !open {
-                if !starts_use(rest) {
+                let Some(offset) = next_use_item(rest) else {
                     break;
-                }
+                };
+                start += offset;
+                rest = &rest[offset..];
                 out.statements.push((line.no, String::new()));
             }
             let end = rest.find(';').map(|at| at + 1);
@@ -1589,6 +1591,32 @@ pub(super) fn use_statements(file: &SourceFile) -> UseStatements {
         }
     }
     out
+}
+
+/// Byte offset of the next `use` item in `code` (including any `pub` visibility prefix), when
+/// `use` stands at the start of `code` or after `{`, `}`, `;` or `]`.
+fn next_use_item(code: &str) -> Option<usize> {
+    for at in hits(code, "use", Bound::Word) {
+        if !code[at + 3..].starts_with(|c: char| c.is_ascii_whitespace() || c == ':') {
+            continue;
+        }
+        let boundary = code[..at].rfind(['{', '}', ';', ']']).map_or(0, |p| p + 1);
+        let prefix = code[boundary..at].trim();
+        if prefix.is_empty() || is_pub_vis(prefix) {
+            let item_start =
+                boundary + (code[boundary..at].len() - code[boundary..at].trim_start().len());
+            return Some(item_start);
+        }
+    }
+    None
+}
+
+fn is_pub_vis(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix("pub") else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    rest.is_empty() || (rest.starts_with('(') && rest.ends_with(')'))
 }
 
 /// One name a `use` statement — or a `type` alias ([`type_alias`]) — binds.
@@ -1672,16 +1700,18 @@ fn top_level_members(group: &str) -> Vec<&str> {
 /// (`type Mono = std::time::Instant;` binds `Instant` as `Mono`, as a `use … as Mono` does).
 pub(super) fn type_alias(code: &str) -> Option<UseLeaf<'_>> {
     let at = hits(code, "type", Bound::Word).next()?;
-    let head = code[..at].trim();
-    if !(head.is_empty() || head.starts_with("pub")) {
+    let head = code[..at]
+        .rsplit(['{', '}', ';', ']'])
+        .next()
+        .unwrap_or(&code[..at])
+        .trim();
+    if !(head.is_empty() || is_pub_vis(head)) {
         return None;
     }
     let rest = code[at + 4..].trim_start();
     let len = rest.bytes().take_while(|&b| is_word(b)).count();
-    let rhs = after_ws(&rest[len..], "=")?
-        .trim()
-        .strip_suffix(';')?
-        .trim();
+    let (rhs, _) = after_ws(&rest[len..], "=")?.trim().split_once(';')?;
+    let rhs = rhs.trim();
     if len == 0 || rhs.is_empty() || !rhs.bytes().all(|b| is_word(b) || b == b':') {
         return None;
     }
@@ -2058,10 +2088,7 @@ fn supervise_look(code: &str) -> Option<(&'static str, &'static str)> {
 
 /// Whether a line of code begins a `use` statement.
 fn starts_use(code: &str) -> bool {
-    let head = code.trim_start();
-    ["use ", "pub use ", "pub(crate) use ", "pub(super) use "]
-        .iter()
-        .any(|u| head.starts_with(u))
+    next_use_item(code).is_some_and(|offset| code[..offset].trim().is_empty())
 }
 
 /// The first included name that sits in `code` in its shape.
@@ -3221,6 +3248,16 @@ mod tests {
             (
                 "the ledger's module renamed",
                 "use super::approvals as ledger;\n",
+                1,
+            ),
+            (
+                "an inline sleep import inside a function body on one line",
+                "fn f() { use std::thread::{self, sleep}; sleep(D); }\n",
+                1,
+            ),
+            (
+                "an inline type alias inside a function body on one line",
+                "fn f() { type Mono = std::time::Instant; let _ = Mono::now(); }\n",
                 1,
             ),
         ];

@@ -748,7 +748,7 @@ impl Log {
     /// Whether this log holds at least one effective [`Body::Epoch`] record.
     #[must_use]
     pub fn has_epochs(&self) -> bool {
-        let effective = eval::effective_records(&self.order);
+        let effective = self.effective();
         self.order
             .iter()
             .enumerate()
@@ -760,7 +760,7 @@ impl Log {
     /// record (`F18`).
     #[must_use]
     pub fn has_commons_epochs(&self) -> bool {
-        let effective = eval::effective_records(&self.order);
+        let effective = self.effective();
         self.order.iter().enumerate().skip(1).any(|(i, r)| {
             effective.counts(i)
                 && matches!(
@@ -1030,10 +1030,7 @@ impl Log {
         for m in membership.members().values() {
             if m.binding.recipient() == *recipient {
                 any_for_recipient = true;
-                let node_removed = m.node_key.is_some_and(|nk| {
-                    nk != [0; 32] && matches!(membership.node(&nk), eval::NodeStanding::Removed(_))
-                });
-                if !node_removed {
+                if !membership.member_node_removed(m) {
                     return false;
                 }
             }
@@ -1055,7 +1052,7 @@ impl Log {
     /// Whether an effective [`Body::Wrap`] in this log is addressed to `recipient`.
     #[must_use]
     pub fn wraps_to(&self, recipient: &Recipient) -> bool {
-        let effective = eval::effective_records(&self.order);
+        let effective = self.effective();
         self.order.iter().enumerate().skip(1).any(|(i, record)| {
             effective.counts(i)
                 && matches!(record.body(), Body::Wrap { recipient: to, .. } if to == recipient)
@@ -1071,7 +1068,7 @@ impl Log {
         target_audience: &EpochAudience,
         recipient: &Recipient,
     ) -> bool {
-        let effective = eval::effective_records(&self.order);
+        let effective = self.effective();
         let mut epochs: Vec<(usize, RecordId)> = Vec::new();
         let mut wrapped_epochs: BTreeSet<RecordId> = BTreeSet::new();
         for (i, record) in self.order.iter().enumerate().skip(1) {
@@ -1125,7 +1122,7 @@ impl Log {
         if self.recipient_is_removed(&my_recipient) {
             return Ok(BTreeMap::new());
         }
-        let effective = eval::effective_records(&self.order);
+        let effective = self.effective();
         let mut epochs: BTreeMap<RecordId, (&EpochAudience, u64, &[u8; 32])> = BTreeMap::new();
         for (i, record) in self.order.iter().enumerate().skip(1) {
             if !effective.counts(i) {
@@ -1190,17 +1187,14 @@ impl Log {
             || self.audience_left_out_recipient(&EpochAudience::Everyone, &my_recipient)
             || !membership.members().iter().any(|(actor, m)| {
                 m.binding.recipient() == my_recipient
-                    && !m.node_key.is_some_and(|nk| {
-                        nk != [0; 32]
-                            && matches!(membership.node(&nk), eval::NodeStanding::Removed(_))
-                    })
+                    && !membership.member_node_removed(m)
                     && !self.audience_left_out(&EpochAudience::Commons, actor)
                     && !self.audience_left_out(&EpochAudience::Everyone, actor)
             })
         {
             return Ok(None);
         }
-        let effective = eval::effective_records(&self.order);
+        let effective = self.effective();
         let mut list: Vec<(usize, RecordId, u64, [u8; 32])> = Vec::new();
         for (i, record) in self.order.iter().enumerate().skip(1) {
             if !effective.counts(i) {
@@ -1285,17 +1279,14 @@ impl Log {
             || self.audience_left_out_recipient(&EpochAudience::Everyone, &my_recipient)
             || !membership.members().iter().any(|(actor, m)| {
                 m.binding.recipient() == my_recipient
-                    && !m.node_key.is_some_and(|nk| {
-                        nk != [0; 32]
-                            && matches!(membership.node(&nk), eval::NodeStanding::Removed(_))
-                    })
+                    && !membership.member_node_removed(m)
                     && !self.audience_left_out(&EpochAudience::Commons, actor)
                     && !self.audience_left_out(&EpochAudience::Everyone, actor)
             })
         {
             return Ok(None);
         }
-        let effective = eval::effective_records(&self.order);
+        let effective = self.effective();
         let Some((generation, commitment)) =
             self.order.iter().enumerate().skip(1).find_map(|(i, rec)| {
                 if !effective.counts(i) || rec.id() != basis {
@@ -1361,7 +1352,10 @@ impl Log {
     /// next epoch on a vault pass (F16's review).
     #[must_use]
     pub fn hosts_rotation_due(&self, my_recipient: &Recipient) -> Vec<Vec<String>> {
-        let effective = eval::effective_records(&self.order);
+        if self.recipient_is_removed(my_recipient) {
+            return Vec::new();
+        }
+        let effective = self.effective();
         let mut epochs: BTreeMap<Vec<String>, Vec<(usize, RecordId)>> = BTreeMap::new();
         let mut wrapped: BTreeMap<RecordId, BTreeSet<Recipient>> = BTreeMap::new();
         for (i, record) in self.order.iter().enumerate().skip(1) {
@@ -1436,7 +1430,7 @@ impl Log {
         if active_recipients.is_empty() || !active_recipients.contains(my_recipient) {
             return false;
         }
-        let effective = eval::effective_records(&self.order);
+        let effective = self.effective();
         let mut commons_epochs: Vec<(usize, RecordId)> = Vec::new();
         let mut everyone_epochs: Vec<(usize, RecordId)> = Vec::new();
         let mut everyone_puts: Vec<(usize, RecordId)> = Vec::new();
@@ -1537,13 +1531,19 @@ impl Log {
             return false;
         }
         let membership = self.membership();
+        let mut latest_entry_by_recipient: BTreeMap<Recipient, usize> = BTreeMap::new();
+        for seat in membership.members().values() {
+            if let Some(&entry_at) = self.held.get(&seat.entry) {
+                latest_entry_by_recipient
+                    .entry(seat.binding.recipient())
+                    .and_modify(|cur| *cur = (*cur).max(entry_at))
+                    .or_insert(entry_at);
+            }
+        }
         let left_out_of = |maximal: &[RecordId]| -> BTreeSet<Recipient> {
-            membership
-                .members()
-                .values()
-                .filter_map(|seat| {
-                    let entry_at = *self.held.get(&seat.entry)?;
-                    let recipient = seat.binding.recipient();
+            latest_entry_by_recipient
+                .iter()
+                .filter_map(|(&recipient, &entry_at)| {
                     let left_out = maximal.iter().any(|epoch| {
                         let is_wrapped = wrapped
                             .get(epoch)
@@ -1635,10 +1635,7 @@ impl Log {
         let permitted = if has_member_seat {
             membership.members().iter().any(|(actor, m)| {
                 m.binding.recipient() == my_recipient
-                    && !m.node_key.is_some_and(|nk| {
-                        nk != [0; 32]
-                            && matches!(membership.node(&nk), eval::NodeStanding::Removed(_))
-                    })
+                    && !membership.member_node_removed(m)
                     && !self.audience_left_out(&EpochAudience::Commons, actor)
                     && !self.audience_left_out(&EpochAudience::Everyone, actor)
             })
@@ -1657,7 +1654,7 @@ impl Log {
         if !permitted {
             return Ok(None);
         }
-        let effective = eval::effective_records(&self.order);
+        let effective = self.effective();
         let mut commons_epochs: BTreeMap<RecordId, (u64, &[u8; 32])> = BTreeMap::new();
         for (i, record) in self.order.iter().enumerate().skip(1) {
             if !effective.counts(i) {
@@ -1765,7 +1762,7 @@ impl Log {
             return Ok(None);
         }
         let unwrapped = self.unwrap_epochs(identity)?;
-        let effective = eval::effective_records(&self.order);
+        let effective = self.effective();
 
         let mut epochs_by_aud: BTreeMap<EpochAudience, Vec<(usize, RecordId)>> = BTreeMap::new();
         let mut max_generation: BTreeMap<EpochAudience, u64> = BTreeMap::new();
@@ -1908,8 +1905,8 @@ impl Log {
             // A carry changes nothing, so it loses to a concurrent sibling that changes the
             // register, a `Delete` included: a reseal on one side of a split never undoes an edit
             // made on the other. Siblings that write the same thing are no conflict.
-            let register = Register::classify(&candidates, &effective);
-            let siblings = register.siblings(&effective);
+            let register = Register::classify(&candidates, effective);
+            let siblings = register.siblings(effective);
             let Some(winner) = register.winner(&siblings).map(|i| &candidates[i]) else {
                 continue;
             };
@@ -2060,7 +2057,7 @@ impl Log {
 mod tests {
     use super::*;
     use crate::commons::binding::Request;
-    use crate::membership_log::{Entrant, Evidence};
+    use crate::membership_log::{Entrant, Evidence, Inserted};
 
     const NETWORK: [u8; 16] = [0x31; 16];
     const AUTHORITY: [u8; 32] = [0x42; 32];
@@ -2080,6 +2077,55 @@ mod tests {
             label: label.to_owned(),
         };
         (writer, incarnation, identity, member, entrant)
+    }
+
+    #[test]
+    fn epoch_visibility_tracks_waiting_wraps_and_new_denials_without_changing_old_clones() {
+        let (writer, incarnation, _, actor, first) = make_entrant(1, "m1");
+        let (_, _, identity, _, second) = make_entrant(2, "m2");
+        let original =
+            Log::new(Record::found(&[7; 32], vec![first, second], 1_000).unwrap()).unwrap();
+        assert!(!original.has_epochs());
+        assert!(!original.has_commons_epochs());
+        let mut sender = original.clone();
+        let (draft, key) = sender
+            .draft_epoch(&actor, 1_001, EpochAudience::Commons, 1)
+            .unwrap();
+        let epoch = draft.sign(&writer, incarnation).unwrap();
+        sender.insert(epoch.clone()).unwrap();
+        assert!(sender.has_commons_epochs());
+        assert!(sender.audience_left_out_recipient(&EpochAudience::Commons, &identity.recipient()));
+        let wrap = sender
+            .draft_wrap(&actor, 1_002, *epoch.id(), &key, identity.recipient())
+            .unwrap()
+            .sign(&writer, incarnation)
+            .unwrap();
+
+        let mut receiver = original.clone();
+        assert_eq!(receiver.insert(wrap).unwrap(), Inserted::Waiting);
+        assert!(!receiver.has_epochs());
+        assert_eq!(receiver.insert(epoch).unwrap(), Inserted::Held);
+        assert_eq!(receiver.waiting(), 0);
+        assert!(receiver.has_commons_epochs());
+        assert!(receiver.wraps_to(&identity.recipient()));
+        assert!(
+            !receiver.audience_left_out_recipient(&EpochAudience::Commons, &identity.recipient())
+        );
+        assert!(!original.has_epochs());
+
+        let mut rotated = receiver.clone();
+        let (draft, _) = rotated
+            .draft_epoch(&actor, 1_003, EpochAudience::Commons, 2)
+            .unwrap();
+        rotated
+            .insert(draft.sign(&writer, incarnation).unwrap())
+            .unwrap();
+        assert!(
+            rotated.audience_left_out_recipient(&EpochAudience::Commons, &identity.recipient())
+        );
+        assert!(
+            !receiver.audience_left_out_recipient(&EpochAudience::Commons, &identity.recipient())
+        );
     }
 
     #[test]

@@ -625,3 +625,45 @@ fn a_floating_chrome_card_on_a_native_page_ignores_terminal_color_overrides() {
         "over the terminal the badge wears the terminal's foreground"
     );
 }
+
+/// The build badge's raster follows its window's scale: the badge's type floor, corner cap and
+/// border are points, so a window that moves to a Retina screen with the same cells re-rasters
+/// its badge as a fresh 2x splice draws it, never keeping the 1x card (§14.16).
+#[test]
+fn the_build_badge_rerasters_when_its_window_changes_scale() {
+    let wid = WindowId(0);
+    let mut app = App::headless_for_test();
+    app.config.show_build_badge = Some(true);
+    app.prepare_terminal_capture_grid(wid).unwrap();
+    let raster = |app: &App| {
+        app.windows[&wid]
+            .badge_card
+            .as_ref()
+            .map(|card| (card.pw, card.ph, card.rgba.clone()))
+            .expect("the badge painted")
+    };
+    app.splice_build_badge(wid);
+    let at_1x = raster(&app);
+    let cells = (app.win_cell_size(wid), app.win_font_px(wid).to_bits());
+    app.windows.get_mut(&wid).unwrap().scale = 2.0;
+    assert_eq!(
+        (app.win_cell_size(wid), app.win_font_px(wid).to_bits()),
+        cells,
+        "the same cells: only the scale moved"
+    );
+    app.splice_build_badge(wid);
+    let kept = raster(&app);
+    app.windows.get_mut(&wid).unwrap().badge_card = None;
+    app.splice_build_badge(wid);
+    let fresh = raster(&app);
+    assert!(fresh != at_1x, "a 2x badge is not the 1x badge");
+    assert!(
+        kept == fresh,
+        "after the scale moved the badge is what a fresh 2x splice draws ({}x{}), not the 1x \
+         raster it kept ({}x{})",
+        fresh.0,
+        fresh.1,
+        kept.0,
+        kept.1
+    );
+}

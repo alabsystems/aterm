@@ -5,6 +5,7 @@
 # paper arm: load-shed at 60 Hz.
 
 foreach-scheme light {
+  scale 2
   grid 16 80
   style rainbow kitty
   hz 60

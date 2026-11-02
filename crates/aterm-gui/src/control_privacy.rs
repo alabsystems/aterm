@@ -419,10 +419,21 @@ fn parse_consent_args(rest: &str) -> Result<ConsentArgs, String> {
             args.kind = ConsentKind::Debugger;
             i += 1;
         } else if let Some(v) = toks[i].strip_prefix("timeout=") {
-            args.timeout_ms = v.parse().map_err(|_| USAGE.to_string())?;
+            args.timeout_ms = v
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+                .then(|| v.parse().ok())
+                .flatten()
+                .ok_or_else(|| USAGE.to_string())?;
             i += 1;
         } else if toks[i] == "timeout" && i + 1 < toks.len() {
-            args.timeout_ms = toks[i + 1].parse().map_err(|_| USAGE.to_string())?;
+            let v = toks[i + 1];
+            args.timeout_ms = v
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+                .then(|| v.parse().ok())
+                .flatten()
+                .ok_or_else(|| USAGE.to_string())?;
             i += 2;
         } else {
             return Err(USAGE.to_string());

@@ -129,7 +129,7 @@ fn window(slot: Slot, v: Option<&Value>) -> Option<Window> {
     let v = v?;
     Some(Window {
         slot,
-        used_percent: v.get("used_percent")?.as_f64()?,
+        used_percent: v.get("used_percent")?.as_f64().filter(|n| n.is_finite())?,
         window_minutes: v.get("window_minutes").and_then(Value::as_u64),
         resets_at: v.get("resets_at").and_then(Value::as_i64),
     })
@@ -1084,9 +1084,12 @@ mod tests {
         let now = unix("2026-10-23T12:00:00Z");
         let roster = Roster::parse_for(
             Cli::Codex,
-            "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n[[account]]\n\
-             label = \"work\"\nclass = \"dedicated\"\ndir = \"/logins/codex/work\"\n\
-             flow = \"device\"\n",
+            &format!(
+                "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n[[account]]\n\
+                 label = \"work\"\nclass = \"dedicated\"\ndir = \"{}\"\n\
+                 flow = \"device\"\n",
+                crate::harness::host_path::abs("/logins/codex/work")
+            ),
         )
         .expect("a roster");
         let enrolled = roster.rows.iter().map(|r| r.label.clone()).collect();
@@ -1127,6 +1130,7 @@ mod tests {
                 ahead: true,
                 rotates: true,
                 takes_canary: false,
+                yields: None,
             }
         );
         assert_eq!(ask(50.0), Advice::Stay(StayWhy::NothingDue));
@@ -1253,5 +1257,19 @@ mod tests {
         let sample =
             thread_sample(home.path(), ROOT, started_unix, now_unix).expect("escaped sub sample");
         assert_eq!(sample.week_pct, Some(42));
+
+        let inf_line = format!(
+            "{{\"timestamp\":\"2026-08-01T17:36:39.000Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"rate_limits\":{{\"limit_id\":\"codex\",\"primary\":{{\"used_percent\":1e400,\"window_minutes\":300,\"resets_at\":{week}}}}}}}}}"
+        );
+        assert_eq!(
+            limits_line(&inf_line),
+            None,
+            "overflowed JSON float 1e400 must be rejected"
+        );
+        let str_inf_line = format!(
+            "{{\"timestamp\":\"2026-08-01T17:36:39.000Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"rate_limits\":{{\"limit_id\":\"codex\",\"individual_limit\":\"Infinity\",\"primary\":{{\"used_percent\":25.0,\"window_minutes\":300,\"resets_at\":{week}}}}}}}}}"
+        );
+        let parsed = limits_line(&str_inf_line).expect("token_count with string limit parses");
+        assert_eq!(parsed.individual_limit, None);
     }
 }

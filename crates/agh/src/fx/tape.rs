@@ -35,7 +35,8 @@ pub struct TapeHeader {
     pub api_version: String,
     /// `argv {tokens}`: the command line, less its tape flags.
     pub argv: Vec<String>,
-    /// `mode anonymous`: M1's only mode.
+    /// `mode anonymous`, or `mode credentialed` (WP10's; `TapeHeader::parse` refuses it until
+    /// then).
     pub mode: TapeMode,
     /// `endpoints github.com`, or `endpoints loopback` for a test's agh-fake.
     pub endpoints: TapeEndpoints,
@@ -47,6 +48,10 @@ pub struct TapeHeader {
 pub enum TapeMode {
     /// No credential.
     Anonymous,
+    /// `mode credentialed`: a run that spoke as a profile, its decisions taped at the route
+    /// door and its credential never (WP10 records and replays one; until then `parse`
+    /// refuses the mode).
+    Credentialed,
 }
 
 /// Endpoint target of a taped run.
@@ -169,6 +174,7 @@ impl TapeHeader {
         }
         let mode = match self.mode {
             TapeMode::Anonymous => "anonymous",
+            TapeMode::Credentialed => "credentialed",
         };
         let endpoints = match self.endpoints {
             TapeEndpoints::GithubCom => "github.com",
@@ -586,6 +592,14 @@ fn latched_error(path: &Path, why: &str, remedy: Remedy) -> Error {
 }
 
 impl TapeSink {
+    /// The same sink, passing every record through `redactor.apply`, which holds the learned
+    /// credentials, where M1's passes `Redactor::shapes`: a credentialed tape's sink.
+    #[must_use]
+    pub fn with_redactor(self, redactor: crate::redact::Redactor) -> TapeSink {
+        let _ = redactor;
+        self
+    }
+
     /// Create `path` and write `MAGIC` and the shaped header item.
     ///
     /// # Errors

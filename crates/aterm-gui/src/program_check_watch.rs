@@ -149,7 +149,7 @@ pub(crate) fn step(board: &mut Board, at_ms: u64, look: Look) -> Option<HostNote
 }
 
 /// Overrides a live daemon reading as at-limit when `full` is active.
-fn stood_in(look: Look, full: bool) -> Look {
+pub(crate) fn stood_in(look: Look, full: bool) -> Look {
     match look {
         Look::Read(reading) if full => Look::Read(Reading {
             at_limit: true,
@@ -205,8 +205,13 @@ fn parse(
         ["full"] => Ask::Pool(true),
         ["live"] => Ask::Pool(false),
         ["held", "-"] => Ask::Held(None),
-        ["held", pid] => match pid.parse::<u32>() {
-            Ok(pid) if pid > 0 => Ask::Held(Some(pid)),
+        ["held", pid] => match pid
+            .bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| pid.parse::<u32>().ok())
+            .flatten()
+        {
+            Some(pid) if pid > 0 => Ask::Held(Some(pid)),
             _ => return Err(USAGE),
         },
         _ => return Err(USAGE),
@@ -256,6 +261,20 @@ pub(crate) fn stuck(board: &Mutex<Board>) -> bool {
             .judge
             .state(),
         State::Stuck { .. }
+    )
+}
+
+/// Whether `board` holds new starts back: macOS's program check reads full or stuck, so a start
+/// aterm can put off waits for it. Unread (off macOS, or before the first reading) and answering
+/// hold nothing.
+pub(crate) fn starts_held(board: &Mutex<Board>) -> bool {
+    matches!(
+        board
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .judge
+            .state(),
+        State::Full { .. } | State::Stuck { .. }
     )
 }
 
@@ -484,6 +503,35 @@ mod tests {
             ]),
             ["unstuck", "-", "stuck", "unstuck"]
         );
+    }
+
+    /// STARTS ARE HELD ONLY WHILE THE CHECK READS FULL OR STUCK ([`starts_held`]): a board that
+    /// `program-check full`'s stand-in drives to full, and on to stuck, holds them. NEGATIVE
+    /// CONTROL: a board nothing has read, and one a live reading left answering, hold none.
+    #[test]
+    fn starts_held_reads_full_and_stuck_only() {
+        let board = Mutex::new(Board::new());
+        assert!(!starts_held(&board), "CONTROL: unread holds nothing");
+        let healthy = reading(2, false);
+        let at = |ms: u64, full: bool| {
+            step(
+                &mut board.lock().unwrap_or_else(PoisonError::into_inner),
+                ms,
+                stood_in(healthy, full),
+            );
+        };
+        at(0, false);
+        assert!(!starts_held(&board), "CONTROL: answering holds nothing");
+        at(MIN, true);
+        assert!(starts_held(&board), "full");
+        at(MIN + STUCK_AFTER_MS, true);
+        assert!(
+            matches!(board.lock().unwrap().judge.state(), State::Stuck { .. })
+                && starts_held(&board),
+            "stuck"
+        );
+        at(2 * MIN + STUCK_AFTER_MS, false);
+        assert!(!starts_held(&board), "live again: answering");
     }
 
     #[test]

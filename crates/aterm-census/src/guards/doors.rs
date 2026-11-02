@@ -1061,6 +1061,8 @@ fn arm_findings(file: &SourceFile, code: &str, arm: &str, flags: &mut Flags) {
         }
         if let Some(close) = closing(code, open) {
             arm_variants(code, (open, close), arm, &shipped, flags);
+        } else {
+            flags.at(at, format!("unclosed `enum {arm}`"));
         }
     }
 }
@@ -1080,12 +1082,18 @@ fn arm_variants(
         from += chunk.len() + 1;
         // Past the variant's attributes to its name.
         let mut rest = chunk.trim_start();
+        let mut malformed = false;
         while rest.starts_with("#[") {
             let base = start + (chunk.len() - rest.len());
-            let Some(end) = closing(code, base + 1) else {
-                return;
+            let Some(end) = closing(code, base + 1).filter(|&end| end < start + chunk.len()) else {
+                flags.at(base, format!("unclosed or split attribute in `{arm}`"));
+                malformed = true;
+                break;
             };
             rest = code[end + 1..start + chunk.len()].trim_start();
+        }
+        if malformed {
+            continue;
         }
         let name_len = rest.bytes().take_while(|&b| is_word(b)).count();
         if name_len == 0 {
@@ -1338,14 +1346,15 @@ fn one_spaced(s: &str) -> String {
 /// `s` split at `sep` outside any bracket.
 fn top_level_split(s: &str, sep: char) -> Vec<&str> {
     let mut out = Vec::new();
-    let (mut depth, mut start) = (0i64, 0usize);
+    let (mut delim, mut angle, mut start) = (0i64, 0i64, 0usize);
     let b = s.as_bytes();
     for (i, c) in s.char_indices() {
         match c {
-            '(' | '[' | '{' | '<' => depth += 1,
-            ')' | ']' | '}' => depth -= 1,
-            '>' if i == 0 || b[i - 1] != b'-' => depth -= 1,
-            c if c == sep && depth == 0 => {
+            '(' | '[' | '{' => delim += 1,
+            ')' | ']' | '}' => delim = (delim - 1).max(0),
+            '<' if delim == 0 => angle += 1,
+            '>' if delim == 0 && (i == 0 || b[i - 1] != b'-') => angle = (angle - 1).max(0),
+            c if c == sep && delim == 0 && angle == 0 => {
                 out.push(&s[start..i]);
                 start = i + 1;
             }
@@ -2928,6 +2937,14 @@ impl Default for PagePress {}
             (
                 "    Nobody,\n    #[cfg(test)]\n    Fixed(Option<bool>),\n    #[cfg(test)]\n    StandIn(",
                 vec!["    Fixed("],
+            ),
+            (
+                "    Nobody,\n    #[allow(a > b > c, d)]\n    Fixed(Option<bool>),\n    #[cfg(test)]\n    StandIn(",
+                vec!["    Fixed("],
+            ),
+            (
+                "    Nobody,\n    #[allow\n    Alert,\n    #[cfg(test)]\n    StandIn(",
+                vec!["    #[allow"],
             ),
         ] {
             let yes = YES.replace(arm, new);

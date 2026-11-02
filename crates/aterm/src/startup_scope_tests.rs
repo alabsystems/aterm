@@ -7,8 +7,8 @@
 
 use super::{
     DoctorStartupEnv, PreparedSetup, SetupAdmission, SetupStartup, doctor_startup_env,
-    doctor_startup_env_from, first_lan_uses_wait_for_the_step, first_run_window_eligible,
-    ordinary_window, prepare_setup,
+    doctor_startup_env_from, first_lan_uses_wait_for_the_step, first_run_start,
+    first_run_window_eligible, ordinary_window, prepare_setup,
 };
 use aterm_cli::macos_doctor::{
     AutomaticSetupClaim, InitialSetupObservation, InitialSetupSnapshot, ProvisionalSetupWatchTest,
@@ -49,10 +49,6 @@ struct Startup {
     offered: Vec<Plan>,
     /// A real local read failure that starts after the startup captured readable state.
     after_bind: Option<AfterBind>,
-    /// An update successor's startup, which may show no review.
-    successor: bool,
-    /// The reviews it withheld.
-    withheld: usize,
     /// The admitted runs whose plan the startup offered back for the window's own answer.
     resumed: Vec<SetupAdmission>,
 }
@@ -151,17 +147,11 @@ impl SetupStartup for Startup {
         self.resumed.push(admission.clone());
     }
 
-    fn may_offer(&mut self) -> bool {
-        self.withheld += usize::from(self.successor);
-        !self.successor
-    }
-
     fn initial(&mut self) -> Result<Plan, String> {
         assert!(
             self.fresh,
             "an admitted pending run resumes without another offer"
         );
-        assert!(!self.successor, "a withheld review reads no plan");
         Ok(self.snapshot()?.plan)
     }
 
@@ -242,67 +232,69 @@ fn startup(home: &Path) -> Startup {
         fresh: false,
         offered: Vec::new(),
         after_bind: None,
-        successor: false,
-        withheld: 0,
         resumed: Vec::new(),
     }
 }
 
-/// An update successor never shows a review: on records nobody admitted a run of, it reads no
-/// plan, offers nothing and leaves setup as it was, where a launch the person started offers the
-/// plan. A run already admitted resumes in the successor as in any launch, and either offers its
-/// admitted plan back for the window's own answer (design §3.3, §6): the page answers it only with
-/// a person at this Mac.
+/// An update successor starts setup as every launch does (init-on-by-default design §6.1): its
+/// window takes the launch's start, and the startup has no successor's path of its own, so on
+/// records nobody admitted a run of (a plan still pending, a rev-3 review closed unanswered, a
+/// first offer an automatic handoff let go) it admits the in-scope plan at once, and a run
+/// already admitted resumes, its plan offered back for the window's own answer (design §3.3,
+/// §6).
 #[test]
-fn an_update_successor_resumes_an_admitted_run_and_never_offers_a_review() {
-    for successor in [true, false] {
-        let scratch = aterm_tempfile::tempdir().unwrap();
-        let home = scratch.path().join("home");
-        let (_, before) = pending(&home);
-        let mut host = startup(&home);
-        host.fresh = true;
-        host.successor = successor;
-        let prepared = prepare_setup(&mut host).unwrap();
-        if successor {
-            assert!(matches!(prepared, PreparedSetup::Unavailable));
-            assert!(host.offered.is_empty(), "{:?}", host.offered);
-            assert_eq!(host.withheld, 1);
-            assert_eq!(host.snapshot().unwrap().observation, before);
-        } else {
-            assert!(matches!(
-                prepared,
-                PreparedSetup::Authorized { revision: 1, .. }
-            ));
-            assert_eq!(host.offered.len(), 1, "a cold launch offers its plan");
-            assert_eq!(host.withheld, 0);
-        }
+fn an_update_successor_admits_a_pending_plan() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let account = scratch.path().join("account");
+    std::fs::create_dir(&account).unwrap();
+    let env = doctor_startup_env_from(
+        |_| None,
+        lasting_scope_refusal_at(&account, &account),
+        || false,
+    );
+    let window = [OsString::from("--window")];
+    let launch = first_run_start(&window, false, env).expect("a launch starts setup");
+    let successor = first_run_start(&window, true, env).expect("a successor starts setup");
+    assert!(
+        std::ptr::fn_addr_eq(launch, successor),
+        "a successor's window takes the launch's start"
+    );
 
-        let scratch = aterm_tempfile::tempdir().unwrap();
-        let home = scratch.path().join("home");
-        let (revision, _) = pending(&home);
-        let mut host = startup(&home);
-        host.successor = successor;
-        assert!(matches!(
-            prepare_setup(&mut host).unwrap(),
-            PreparedSetup::Authorized { revision: resumed, .. } if resumed == revision
-        ));
-        assert!(host.offered.is_empty());
-        assert_eq!(
-            host.withheld, 0,
-            "an admitted run asks nothing of the review"
-        );
-        let saved = host.snapshot().unwrap().plan;
-        assert!(saved.selection.contains(Setting::Permissions));
-        assert_eq!(
-            host.resumed,
-            [SetupAdmission {
-                plan: saved,
-                revision,
-                completed: false,
-            }],
-            "a launch and a successor alike offer the admitted plan back (successor {successor})"
-        );
-    }
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let home = scratch.path().join("home");
+    let _ = pending(&home);
+    let mut host = startup(&home);
+    host.fresh = true;
+    let prepared = prepare_setup(&mut host).unwrap();
+    assert!(
+        matches!(prepared, PreparedSetup::Authorized { revision: 1, .. }),
+        "the pending plan is admitted at once"
+    );
+    assert_eq!(host.offered.len(), 1, "offered once, answered by the page");
+
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let home = scratch.path().join("home");
+    let (revision, _) = pending(&home);
+    let mut host = startup(&home);
+    assert!(matches!(
+        prepare_setup(&mut host).unwrap(),
+        PreparedSetup::Authorized { revision: resumed, .. } if resumed == revision
+    ));
+    assert!(
+        host.offered.is_empty(),
+        "an admitted run is not offered again"
+    );
+    let saved = host.snapshot().unwrap().plan;
+    assert!(saved.selection.contains(Setting::Permissions));
+    assert_eq!(
+        host.resumed,
+        [SetupAdmission {
+            plan: saved,
+            revision,
+            completed: false,
+        }],
+        "its plan is offered back for the window's own answer"
+    );
 }
 
 /// The window gate's scope input is the doctor's lasting refusal, through the one composition
@@ -613,4 +605,33 @@ fn startup_recovery_keeps_its_bound_revision_through_a_transient_local_read_erro
         "an I/O error is no corrupt record"
     );
     assert_eq!(host.snapshot().unwrap().observation, before);
+}
+
+/// The Secrets lane runs beside Workstation (design §6.2): the Secrets stage's end leaves
+/// Workstation's settings and rows painting busy (`SetupStatus::running`) while it still runs,
+/// and Workstation's own end clears them. Before, each stage event replaced the record whole, so
+/// the Secrets stage's end told the page nothing ran.
+#[test]
+fn the_secrets_lanes_end_leaves_workstation_running() {
+    use aterm_types::macos_setup::Subject;
+    let mut activity = super::SetupActivity {
+        epoch: 0,
+        settings: Vec::new(),
+        subjects: Vec::new(),
+        touched: Vec::new(),
+    };
+    let dock = Subject::Setting(Setting::Dock);
+    let secrets = Subject::Setting(Setting::Secrets);
+    activity.mark(&[Setting::Dock], &[dock], true);
+    activity.mark(&[Setting::Secrets], &[secrets], true);
+    assert_eq!(activity.settings, [Setting::Dock, Setting::Secrets]);
+    activity.mark(&[Setting::Secrets], &[secrets], false);
+    assert_eq!(
+        (activity.settings.as_slice(), activity.subjects.as_slice()),
+        ([Setting::Dock].as_slice(), [dock].as_slice()),
+        "Workstation still runs"
+    );
+    activity.mark(&[Setting::Dock], &[dock], false);
+    assert!(activity.settings.is_empty() && activity.subjects.is_empty());
+    assert_eq!(activity.epoch, 4);
 }

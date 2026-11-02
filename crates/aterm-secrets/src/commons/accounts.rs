@@ -10,9 +10,11 @@ use crate::{Error, Result, SecretBytes, age};
 use astream_wire::sync::{Digest, MAX_PARENTS};
 use aterm_digest::Sha256;
 use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
+use zeroize::Zeroize;
 
 const DOMAIN: &[u8] = b"aterm/commons/account-decision/1\0";
 const CONTEXT: &[u8] = b"aterm/commons/account-binding-context/1\0";
+const ISSUER: &[u8] = b"aterm/commons/account-issuer-recipient/1\0";
 const MAX_CAPSULE: usize = 2048;
 /// Reject larger frames before signature verification or allocation.
 pub const MAX_RECORD: usize = 8192;
@@ -37,6 +39,82 @@ pub struct Preparation {
     pub method: String,
     pub device: Binding,
     pub secret: Option<SecretRef>,
+    /// An exact fleet intent revision, rechecked by the application before use.
+    /// Legacy single-device decisions carry none.
+    pub intent: Option<IntentRef>,
+}
+
+/// A root-authorized policy for preparing this exact account configuration on
+/// current and future admitted machines. It grants no paid execution.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Intent {
+    pub table: Digest,
+    pub key: String,
+    pub proposal: Digest,
+    pub configuration: Digest,
+    pub provider: String,
+    pub method: String,
+    /// The root host originally designated to issue children. Its unique
+    /// currently admitted machine identity may succeed this writer incarnation.
+    pub issuer: Binding,
+    pub secret: Option<SecretRef>,
+}
+
+/// The root intent account and immutable decision authorizing a device lane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IntentRef {
+    pub account: Digest,
+    pub decision: Digest,
+}
+
+impl Intent {
+    /// Match the designated machine against authenticated current membership.
+    /// The caller separately requires a current writer and the pinned root key;
+    /// a duplicate machine binding, label, or address cannot establish succession.
+    pub fn issued_by(&self, current: &Binding, current_writers: usize) -> bool {
+        current_writers == 1
+            && current.network() == self.issuer.network()
+            && current.authority() == self.issuer.authority()
+            && current.machine() == self.issuer.machine()
+    }
+
+    /// Bind this exact approved configuration to one currently admitted device.
+    pub fn for_device(&self, intent: IntentRef, device: Binding) -> Preparation {
+        Preparation {
+            table: self.table,
+            key: self.key.clone(),
+            proposal: self.proposal,
+            configuration: self.configuration,
+            provider: self.provider.clone(),
+            method: self.method.clone(),
+            device,
+            secret: self.secret.clone(),
+            intent: Some(intent),
+        }
+    }
+
+    /// All configuration and secret-selector terms must remain exact.
+    pub fn matches(&self, preparation: &Preparation) -> bool {
+        self.table == preparation.table
+            && self.key == preparation.key
+            && self.proposal == preparation.proposal
+            && self.configuration == preparation.configuration
+            && self.provider == preparation.provider
+            && self.method == preparation.method
+            && self.secret == preparation.secret
+    }
+}
+
+impl IntentRef {
+    /// Stable across intent revisions and an installation's key succession,
+    /// separate from every other admitted machine's preparation history.
+    pub fn device_account(&self, device: &Binding) -> Digest {
+        let mut hash = Sha256::new();
+        hash.update(b"aterm/commons/intent-device-account/1\0");
+        hash.update(self.account);
+        hash.update(device.machine());
+        hash.finalize()
+    }
 }
 
 /// A preparation capability never grants metered requests or refresh-token
@@ -44,6 +122,7 @@ pub struct Preparation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
     Prepare(Box<Preparation>),
+    Intent(Box<Intent>),
     Stop,
 }
 
@@ -57,7 +136,9 @@ pub struct Request {
 }
 
 /// Immutable root-signed evidence, not a live capability. The secret-content
-/// commitment, when present, is sealed to the one named age recipient.
+/// commitment, when present, is sealed to the target device. Fleet intent
+/// commitments and intent-bound device commitments are also sealed to their
+/// root issuer, allowing recovery to compare credentials without publishing a hash.
 #[derive(Clone, Debug)]
 pub struct Record {
     trust: Trust,
@@ -91,14 +172,50 @@ impl Request {
         {
             return Err(Error::new("invalid account decision ancestry"));
         }
-        if let Action::Prepare(p) = &self.action {
-            if p.table == [0; 32]
-                || p.proposal == [0; 32]
-                || p.configuration == [0; 32]
-                || !name(&p.key)
-                || !name(&p.provider)
+        let terms = match &self.action {
+            Action::Stop => None,
+            Action::Prepare(p) => {
+                if p.device.network() != &trust.network
+                    || p.device.authority() != &trust.authority
+                    || p.intent
+                        .is_some_and(|i| i.account == [0; 32] || i.decision == [0; 32])
+                {
+                    return Err(Error::new("invalid account preparation target"));
+                }
+                Some((
+                    p.table,
+                    p.proposal,
+                    p.configuration,
+                    &p.key,
+                    &p.provider,
+                    &p.method,
+                    &p.secret,
+                ))
+            }
+            Action::Intent(p) => {
+                if p.issuer.network() != &trust.network || p.issuer.authority() != &trust.authority
+                {
+                    return Err(Error::new("invalid fleet account issuer"));
+                }
+                Some((
+                    p.table,
+                    p.proposal,
+                    p.configuration,
+                    &p.key,
+                    &p.provider,
+                    &p.method,
+                    &p.secret,
+                ))
+            }
+        };
+        if let Some((table, proposal, configuration, key, provider, method, secret)) = terms {
+            if table == [0; 32]
+                || proposal == [0; 32]
+                || configuration == [0; 32]
+                || !name(key)
+                || !name(provider)
                 || !matches!(
-                    p.method.as_str(),
+                    method.as_str(),
                     "oauth"
                         | "device"
                         | "api-key"
@@ -108,12 +225,10 @@ impl Request {
                         | "phone"
                         | "passkey"
                 )
-                || p.device.network() != &trust.network
-                || p.device.authority() != &trust.authority
             {
                 return Err(Error::new("invalid account preparation terms"));
             }
-            if let Some(s) = &p.secret
+            if let Some(s) = secret
                 && (!name(&s.vault)
                     || s.signer == [0; 32]
                     || s.entry.len() > 1024
@@ -163,14 +278,23 @@ impl Record {
         let authored_ms = u64::from_le_bytes(r.array()?);
         let action = match r.byte()? {
             0 => Action::Stop,
-            1 => {
+            tag @ 1..=3 => {
                 let table = r.array()?;
                 let key = r.word(64)?;
                 let proposal = r.array()?;
                 let configuration = r.array()?;
                 let provider = r.word(64)?;
                 let method = r.word(64)?;
-                let device = Binding::decode(r.take(super::binding::BINDING_LEN)?)?;
+                let device = if tag == 2 {
+                    None
+                } else {
+                    Some(Binding::decode(r.take(super::binding::BINDING_LEN)?)?)
+                };
+                let issuer = if tag == 2 {
+                    Some(Binding::decode(r.take(super::binding::BINDING_LEN)?)?)
+                } else {
+                    None
+                };
                 let secret = match r.byte()? {
                     0 => None,
                     1 => Some(SecretRef {
@@ -180,16 +304,38 @@ impl Record {
                     }),
                     _ => return Err(Error::new("unknown account binding kind")),
                 };
-                Action::Prepare(Box::new(Preparation {
-                    table,
-                    key,
-                    proposal,
-                    configuration,
-                    provider,
-                    method,
-                    device,
-                    secret,
-                }))
+                if let Some(device) = device {
+                    let intent = if tag == 3 {
+                        Some(IntentRef {
+                            account: r.array()?,
+                            decision: r.array()?,
+                        })
+                    } else {
+                        None
+                    };
+                    Action::Prepare(Box::new(Preparation {
+                        table,
+                        key,
+                        proposal,
+                        configuration,
+                        provider,
+                        method,
+                        device,
+                        secret,
+                        intent,
+                    }))
+                } else {
+                    Action::Intent(Box::new(Intent {
+                        table,
+                        key,
+                        proposal,
+                        configuration,
+                        provider,
+                        method,
+                        issuer: issuer.unwrap(),
+                        secret,
+                    }))
+                }
             }
             _ => return Err(Error::new("unknown account decision kind")),
         };
@@ -204,7 +350,11 @@ impl Record {
             action,
         };
         request.validate(trust)?;
-        let has_secret = matches!(&request.action, Action::Prepare(p) if p.secret.is_some());
+        let has_secret = match &request.action {
+            Action::Prepare(p) => p.secret.is_some(),
+            Action::Intent(p) => p.secret.is_some(),
+            Action::Stop => false,
+        };
         if has_secret == capsule.is_empty() {
             return Err(Error::new(
                 "account decision has an inconsistent secret binding",
@@ -239,17 +389,35 @@ impl Record {
         }
         let mut bytes = body(trust, &request, control, authored_ms);
         let capsule = match (&request.action, commitment) {
-            (Action::Prepare(p), Some(hash)) if p.secret.is_some() && hash.len() == 32 => {
+            (action, Some(hash))
+                if hash.len() == 32
+                    && match action {
+                        Action::Prepare(p) => p.secret.is_some(),
+                        Action::Intent(p) => p.secret.is_some(),
+                        Action::Stop => false,
+                    } =>
+            {
                 let plain = SecretBytes::new(
                     [b"AAEB1".as_slice(), &context(&bytes), hash.as_slice()].concat(),
                 );
-                let encrypted = age::encrypt(&[p.device.recipient()], plain.as_slice())
+                let mut recipients = match action {
+                    Action::Prepare(p) => vec![p.device.recipient()],
+                    Action::Intent(_) => Vec::new(),
+                    Action::Stop => unreachable!(),
+                };
+                if matches!(action, Action::Intent(_))
+                    || matches!(action, Action::Prepare(p) if p.intent.is_some())
+                {
+                    recipients.push(issuer_identity(seed).recipient());
+                }
+                let encrypted = age::encrypt(&recipients, plain.as_slice())
                     .map_err(|_| Error::new("cannot seal account entry binding"))?;
                 // Keep the plaintext lifetime bounded to this sealing step.
                 drop(plain);
                 encrypted
             }
             (Action::Prepare(p), None) if p.secret.is_none() => Vec::new(),
+            (Action::Intent(p), None) if p.secret.is_none() => Vec::new(),
             (Action::Stop, None) => Vec::new(),
             _ => return Err(Error::new("account decision needs its exact entry binding")),
         };
@@ -290,6 +458,26 @@ impl Record {
         if p.secret.is_none() || identity.recipient() != p.device.recipient() {
             return Ok(false);
         }
+        self.matches_capsule(identity, commitment)
+    }
+
+    /// Only the issuer's private key can check the non-public commitment in a
+    /// fleet intent or its device decision. Legacy device-only capsules refuse.
+    pub(crate) fn matches_issuer_entry(&self, seed: &[u8; 32], commitment: &[u8]) -> Result<bool> {
+        if !matches!(&self.request.action, Action::Intent(p) if p.secret.is_some())
+            && !matches!(&self.request.action, Action::Prepare(p) if p.secret.is_some() && p.intent.is_some())
+        {
+            return Ok(false);
+        }
+        let pair = Ed25519KeyPair::from_seed_unchecked(seed)
+            .map_err(|_| Error::new("invalid account authority seed"))?;
+        if pair.public_key().as_ref() != self.trust.authority {
+            return Err(Error::new("account binding belongs to another issuer"));
+        }
+        self.matches_capsule(&issuer_identity(seed), commitment)
+    }
+
+    fn matches_capsule(&self, identity: &age::Identity, commitment: &[u8]) -> Result<bool> {
         let plain = age::decrypt(std::slice::from_ref(identity), &self.capsule)
             .map_err(|_| Error::new("cannot open account entry binding"))?;
         let expected = [
@@ -306,6 +494,16 @@ impl Record {
         let expected = SecretBytes::new(expected);
         Ok(aterm_digest::ct_eq(plain.as_slice(), expected.as_slice()))
     }
+}
+
+fn issuer_identity(seed: &[u8; 32]) -> age::Identity {
+    let mut hash = Sha256::new();
+    hash.update(ISSUER);
+    hash.update(seed);
+    let mut secret = hash.finalize();
+    let identity = age::Identity::from_secret_bytes(secret);
+    secret.zeroize();
+    identity
 }
 
 fn context(body: &[u8]) -> Digest {
@@ -334,7 +532,7 @@ fn body(trust: Trust, request: &Request, control: Digest, authored_ms: u64) -> V
     match &request.action {
         Action::Stop => out.push(0),
         Action::Prepare(p) => {
-            out.push(1);
+            out.push(if p.intent.is_some() { 3 } else { 1 });
             out.extend_from_slice(&p.table);
             word(&mut out, &p.key);
             out.extend_from_slice(&p.proposal);
@@ -342,6 +540,26 @@ fn body(trust: Trust, request: &Request, control: Digest, authored_ms: u64) -> V
             word(&mut out, &p.provider);
             word(&mut out, &p.method);
             out.extend_from_slice(&p.device.bytes());
+            out.push(u8::from(p.secret.is_some()));
+            if let Some(s) = &p.secret {
+                word(&mut out, &s.vault);
+                out.extend_from_slice(&s.signer);
+                word(&mut out, &s.entry);
+            }
+            if let Some(i) = p.intent {
+                out.extend_from_slice(&i.account);
+                out.extend_from_slice(&i.decision);
+            }
+        }
+        Action::Intent(p) => {
+            out.push(2);
+            out.extend_from_slice(&p.table);
+            word(&mut out, &p.key);
+            out.extend_from_slice(&p.proposal);
+            out.extend_from_slice(&p.configuration);
+            word(&mut out, &p.provider);
+            word(&mut out, &p.method);
+            out.extend_from_slice(&p.issuer.bytes());
             out.push(u8::from(p.secret.is_some()));
             if let Some(s) = &p.secret {
                 word(&mut out, &s.vault);

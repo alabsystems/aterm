@@ -81,6 +81,8 @@ aterm_objc::declare_class! {
         @sel(windowWillClose:)
         fn window_will_close(&self, _sender: Id) {
             trace_scope!("windowWillClose:");
+            // LOCAL PATCH (aterm): the frame clock's link lets go of the view.
+            self.view().end_frame_clock();
             aterm_objc::autoreleasepool(|_| {
                 // SAFETY: `-setDelegate:` is `v@:@` on `NSWindow`; nil clears it.
                 unsafe { send_v_id(self.win(), sel!(setDelegate:), Id::NIL) };
@@ -292,7 +294,9 @@ aterm_objc::declare_class! {
                 && unsafe { send_bool_id(key_path, sel!(isEqualToString:), want.id()) };
             if matches {
                 assert!(!change.is_null(), "requested a change dictionary in `addObserver`, but none was provided");
-                // SAFETY: `-objectForKey:` is `@@:@` on `NSDictionary`.
+                // SAFETY: `-objectForKey:` is `@@:@` on `NSDictionary`; both keys were asked for by
+                // `addObserver:…options:` below, so both are present, and each value is an
+                // `NSAppearance`.
                 let (old, new) = unsafe {
                     (
                         send_id_id(change, sel!(objectForKey:), seam::NS_KEY_VALUE_CHANGE_OLD_KEY),
@@ -704,6 +708,23 @@ impl WindowDelegate {
 
     pub fn request_redraw(&self) {
         self.ivars().app_delegate.queue_redraw(self.window().id());
+    }
+
+    /// LOCAL PATCH (aterm): `Window::set_frame_clock` (`frame_clock.rs`).
+    pub fn set_frame_clock(&self, want: bool) -> bool {
+        self.view().set_frame_clock(want)
+    }
+
+    /// LOCAL PATCH (aterm): `platform::macos::frame_clock_link`, a debug seam.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn frame_clock_link(&self) -> Option<aterm_objc::WeakObj> {
+        self.view().frame_clock_link()
+    }
+
+    /// LOCAL PATCH (aterm): `platform::macos::frame_clock_links`, a debug seam.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn frame_clock_links(&self) -> Vec<aterm_objc::WeakObj> {
+        self.view().frame_clock_links()
     }
 
     pub fn outer_position(&self) -> Result<PhysicalPosition<i32>, NotSupportedError> {

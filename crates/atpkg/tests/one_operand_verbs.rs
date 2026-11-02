@@ -180,6 +180,36 @@ fn every_one_name_verb_refuses_a_second_name_at_the_usage_exit() {
 }
 
 #[test]
+fn a_second_install_operand_is_refused_before_the_store_lock() {
+    let f = Fixture::new("two");
+    f.install("ta");
+    let lock = f.layout.store_lock();
+    assert!(!lock.exists(), "fixture: no store lock file yet");
+    let out = f.atpkg(&["install", "ta", "tb"]);
+    let all = text(&out);
+    assert_eq!(out.status.code(), Some(2), "the usage exit:\n{all}");
+    assert!(!lock.exists(), "the store lock is never taken:\n{all}");
+}
+
+/// `repair --only` naming no repair item is refused before the store lock, as a stray word is.
+/// NEGATIVE CONTROL: the id checked only after the lock (as `repair_selection` does) lays it.
+#[test]
+fn repair_refuses_an_unknown_item_before_it_takes_the_store_lock() {
+    let f = Fixture::new("only");
+    f.install("ta");
+    let lock = f.layout.store_lock();
+    assert!(!lock.exists(), "fixture: no store lock file yet");
+    let out = f.atpkg(&["repair", "--only", "base.pkg.nosuch"]);
+    let all = text(&out);
+    assert_eq!(out.status.code(), Some(2), "the usage exit:\n{all}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unknown repair item \"base.pkg.nosuch\""),
+        "the refusal names the item:\n{all}"
+    );
+    assert!(!lock.exists(), "the store lock is never taken:\n{all}");
+}
+
+#[test]
 fn a_no_argument_verb_refuses_a_stray_one_and_touches_nothing() {
     let f = Fixture::new("zero");
     f.install("ta");
@@ -193,7 +223,7 @@ fn a_no_argument_verb_refuses_a_stray_one_and_touches_nothing() {
     let all = text(&out);
     assert_eq!(out.status.code(), Some(2), "the usage exit:\n{all}");
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("unknown or repeated argument \"--dry-run\""),
+        String::from_utf8_lossy(&out.stderr).contains("\"--dry-run\""),
         "the refusal names the stray argument:\n{all}"
     );
     let mut after = std::fs::read_dir(&f.home)

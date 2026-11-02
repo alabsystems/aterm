@@ -585,7 +585,7 @@ fn build_date(p: &Path) -> Option<String> {
 
 #[cfg_attr(trust_verify, trust::skip)]
 fn civil_from_unix_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
+    let z = days.saturating_add(719_468);
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
@@ -593,7 +593,10 @@ fn civil_from_unix_days(days: i64) -> (i64, u32, u32) {
     let mp = (5 * doy + 2) / 153;
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(m <= 2);
+    let y = era
+        .saturating_mul(400)
+        .saturating_add(yoe)
+        .saturating_add(i64::from(m <= 2));
     (
         y,
         u32::try_from(m).unwrap_or(0),
@@ -623,11 +626,11 @@ fn probe_output_within(
         .stderr(Stdio::piped())
         .spawn()
         .ok()?;
-    let deadline = Instant::now() + bound;
+    let deadline = Instant::now().checked_add(bound);
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < deadline => {
+            Ok(None) if deadline.is_none_or(|d| Instant::now() < d) => {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             _ => {
@@ -1211,7 +1214,10 @@ pub(crate) fn ty_states_explored(evidence: &str) -> Option<u64> {
     evidence
         .lines()
         .find_map(|l| l.trim().strip_prefix("States found:"))
-        .and_then(|n| n.trim().parse().ok())
+        .and_then(|n| {
+            let n = n.trim();
+            (!n.starts_with('+')).then(|| n.parse().ok()).flatten()
+        })
 }
 
 #[cfg_attr(trust_verify, trust::skip)]

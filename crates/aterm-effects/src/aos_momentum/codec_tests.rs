@@ -84,6 +84,7 @@ fn extreme_tick() -> MomentumEvent {
             theme_fg: u32::MAX,
             theme_bg: 1,
             block: true,
+            bar: false,
             glyph_span: Some((i32::MIN, i32::MAX)),
             light_vivid: true,
             chosen_hue: true,
@@ -237,13 +238,14 @@ fn a_bool_or_option_byte_no_encoding_writes_is_refused_naming_its_field() {
             Err(WireFault::BadTag { field, tag: 2 })
         );
     }
-    // The ink byte: `light_vivid`, `chosen_hue` and `chosen_base` as bits 0, 1 and 2, each
-    // one byte's difference, written `1` for `light_vivid` alone as its bool was; a fourth bit
-    // is refused naming the byte.
-    let inks: [(u8, Flip); 3] = [
+    // The ink byte: `light_vivid`, `chosen_hue`, `chosen_base` and `bar` as bits 0, 1, 2 and
+    // 3, each one byte's difference, written `1` for `light_vivid` alone as its bool was; a
+    // fifth bit is refused naming the byte.
+    let inks: [(u8, Flip); 4] = [
         (1, |c| c.light_vivid = true),
         (2, |c| c.chosen_hue = true),
         (4, |c| c.chosen_base = true),
+        (8, |c| c.bar = true),
     ];
     let mut ink_at = None;
     for (bit, flip) in inks {
@@ -261,7 +263,7 @@ fn a_bool_or_option_byte_no_encoding_writes_is_refused_naming_its_field() {
         );
     }
     let at = ink_at.expect("the ink byte");
-    for tag in 0..8u8 {
+    for tag in 0..16u8 {
         let mut all = base.clone();
         all[at] = tag;
         assert_eq!(
@@ -271,12 +273,12 @@ fn a_bool_or_option_byte_no_encoding_writes_is_refused_naming_its_field() {
         );
     }
     let mut bad = base.clone();
-    bad[at] = 8;
+    bad[at] = 16;
     assert_eq!(
         decode_input(&schema, &bad),
         Err(WireFault::BadTag {
             field: "cfg.ink",
-            tag: 8
+            tag: 16
         })
     );
     let mut bad = base.clone();

@@ -11,7 +11,9 @@
 //! interpolated with the hue along the arc, raised to the theme fg's floor (its bar plus
 //! [`SOLVE_GUARD`]) and capped at [`GLASS_L_CAP`], with chroma at the edge capped at
 //! [`GLASS_C_CAP`]. The lerp-aware lift then raises the walk table's entries until every colour
-//! a slab can lay keeps the bar plus [`LERP_BAR_GUARD`] at every alpha ([`scan`]). The DEEP tone
+//! a slab can lay keeps the bar plus [`LERP_BAR_GUARD`] at every alpha ([`scan`]). Every bar is
+//! read off the glyph as it is seen ([`colour::seen`]): the theme fg's dimmest solid ink, the
+//! antialiased edge the judge still counts, against the glass. The DEEP tone
 //! ([`deep_ink`]) is the lip under the glass, the caret and the stars: full chroma at least
 //! [`DEEP_UNDER_GLASS_L`] under the glass, held at [`AMBER_HOLD_HUE`] while it would be dark
 //! amber, kept at [`ORANGE_FLOOR_L`] on the orange band, and folded over the olive at
@@ -39,12 +41,13 @@ pub mod colour;
 pub mod scan;
 pub mod tables;
 
-use colour::{contrast, cusp_l, edge_ink, gamut_edge, lch};
+use colour::{THIN_INK_SHARE, contrast, cusp_l, edge_ink, gamut_edge, lch, seen_edge_y};
 
 /// The live phase level every frame's [`Light`](crate::cursor_glow::Light) carries (§15.0.4):
-/// each phase's last commit raises it one level, and until then a latched light scheme keeps
-/// main's paper arm.
-pub const LIVE: Live = Live::Off;
+/// each phase's last commit raises it one level. Phase 1's (1.12) raised it to the glass, so a
+/// latched light scheme draws the glass where its palette has headroom, and main's paper arm
+/// where it has none (the lip-forward pages) until Phase 2's raises it to the lip.
+pub const LIVE: Live = Live::Glass;
 
 /// Entries in a walk table: the bed's ink table's length.
 pub const GLASS_LEN: usize = BED_INK_LUT_LEN;
@@ -83,11 +86,12 @@ pub const ANCHOR_AT: [usize; 8] = [
 /// The deep tone's hues at the anchors, degrees.
 pub const DEEP_HUES: [f64; 8] = [27.0, 50.0, 84.0, 145.0, 205.0, 264.0, 290.0, 315.0];
 
-/// The theme fg's bar over the glass where its own page allows it: the dark bed's 5.25:1.
+/// The theme fg's bar over the glass where its own page allows it: the dark bed's 5.25:1, read
+/// off the glyph as it is seen ([`colour::seen`]), its dimmest solid ink against the glass.
 pub const GLASS_BAR: f64 = crate::cursor_glow::BODY_CONTRAST_BAR as f64;
 
-/// The share of its own page contrast a low-contrast theme fg keeps instead: the bar is
-/// `min(GLASS_BAR, 0.9 × fg/bg)`.
+/// The share of its own page reading a low-contrast theme fg keeps instead: the bar is
+/// `min(GLASS_BAR, 0.9 × the fg's seen reading on its page)` ([`glass_bar`]).
 pub const PAGE_SHARE: f64 = 0.9;
 
 /// What the glass is solved to above the bar: 5.45 on a 5.25 bar.
@@ -108,7 +112,9 @@ pub const GLASS_C_CAP: f64 = 0.24;
 /// The glass's lightness cap.
 pub const GLASS_L_CAP: f64 = 0.93;
 
-/// The chroma every glass anchor keeps at its floor on a page with headroom.
+/// The chroma every glass anchor keeps at its floor on a page with headroom: the anchor the page
+/// draws ([`glass_anchors`]), solved so the window's thinnest glyph as it is seen keeps the bar
+/// plus [`SOLVE_GUARD`].
 pub const HEADROOM_C: f64 = 0.12;
 
 /// How far the lip sits under the rounded glass, OKLab L.
@@ -280,17 +286,20 @@ fn glass_at(l: f64, h: f64) -> u32 {
     edge_ink(l, h, GLASS_C_CAP)
 }
 
-/// The theme fg's bar on page `bg`: [`GLASS_BAR`], or [`PAGE_SHARE`] of its own page contrast
-/// when that is lower.
+/// The theme fg's bar on page `bg`: [`GLASS_BAR`], or [`PAGE_SHARE`] of the fg's own reading on
+/// its page when that is lower, read as every reading the bar bars is, by [`colour::seen`]
+/// (`docs/design/PRISM-GLASS.md` §15.8 amendment 55): the glyph as it is seen, its thinnest
+/// glyph's darkest pixel [`colour::THIN_INK_SHARE`] of the way to the page.
 #[must_use]
 pub fn glass_bar(fg: u32, bg: u32) -> f64 {
-    GLASS_BAR.min(PAGE_SHARE * contrast(fg, bg))
+    GLASS_BAR.min(PAGE_SHARE * colour::seen(fg, bg, bg))
 }
 
-/// The least lightness at hue `h` whose glass keeps `target` on `fg`, under the cap; `None` when
-/// none does.
-fn floor_l(fg: u32, h: f64, target: f64) -> Option<f64> {
-    let meets = |l: f64| contrast(fg, glass_at(l, h)) >= target;
+/// The least lightness at hue `h` whose glass keeps `target` for `fg`'s glyphs set on `bg`, each
+/// read as a glyph whose darkest pixel lies `edge` of the way to the page ([`seen_edge_y`]),
+/// under the cap; `None` when none does.
+fn floor_l(fg: u32, bg: u32, h: f64, (target, edge): (f64, f64)) -> Option<f64> {
+    let meets = |l: f64| reads(fg, bg, glass_at(l, h), edge) >= target;
     if !meets(GLASS_L_CAP) {
         return None;
     }
@@ -306,11 +315,24 @@ fn floor_l(fg: u32, h: f64, target: f64) -> Option<f64> {
     Some(hi)
 }
 
-/// The glass point at `arc`, solved to `target` on `fg`: its lightness and hue, or `None` when
-/// no lightness under the cap keeps the target.
-fn glass_point(fg: u32, arc: f64, target: f64) -> Option<(f64, f64)> {
+/// What `fg`'s glyph set on `bg`, its darkest pixel `edge` of the way to the page, reads over
+/// `ground` ([`seen_edge_y`]).
+#[inline]
+fn reads(fg: u32, bg: u32, ground: u32, edge: f64) -> f64 {
+    seen_edge_y(
+        colour::luminance(fg),
+        colour::luminance(bg),
+        colour::luminance(ground),
+        edge,
+    )
+}
+
+/// The glass point at `arc`, solved to `target` for `fg`'s glyphs set on `bg`, each read as a
+/// glyph whose darkest pixel lies `edge` of the way to the page: its lightness and hue, or `None`
+/// when no lightness under the cap keeps the target.
+fn glass_point(fg: u32, bg: u32, arc: f64, (target, edge): (f64, f64)) -> Option<(f64, f64)> {
     let (pref, h) = glass_pref(arc);
-    let floor = floor_l(fg, h, target)?;
+    let floor = floor_l(fg, bg, h, (target, edge))?;
     let room = if orange(deep_hue(arc)) {
         ORANGE_FLOOR_L + DEEP_UNDER_GLASS_L
     } else {
@@ -319,7 +341,7 @@ fn glass_point(fg: u32, arc: f64, target: f64) -> Option<(f64, f64)> {
     let mut l = pref.max(floor).max(room).min(GLASS_L_CAP);
     for _ in 0..MAX_NUDGES {
         let ink = glass_at(l, h);
-        if contrast(fg, ink) >= target && (lch(ink).l >= room || l >= GLASS_L_CAP) {
+        if reads(fg, bg, ink, edge) >= target && (lch(ink).l >= room || l >= GLASS_L_CAP) {
             return Some((l, h));
         }
         l = (l + NUDGE_L).min(GLASS_L_CAP);
@@ -328,12 +350,13 @@ fn glass_point(fg: u32, arc: f64, target: f64) -> Option<(f64, f64)> {
 }
 
 /// The glass at `arc` (a share of the arc) on theme fg `fg` and page `bg`, before the lift: its
-/// cusp lightness raised to the fg's floor ([`glass_bar`] plus [`SOLVE_GUARD`]), chroma at the
-/// gamut edge. `None` when no lightness under [`GLASS_L_CAP`] keeps the floor.
+/// cusp lightness raised to the fg's floor ([`glass_bar`] plus [`SOLVE_GUARD`], as the fg's
+/// glyphs are seen), chroma at the gamut edge. `None` when no lightness under [`GLASS_L_CAP`]
+/// keeps the floor.
 #[must_use]
 pub fn glass_ink(fg: u32, bg: u32, arc: f64) -> Option<u32> {
     let target = glass_bar(fg, bg) + SOLVE_GUARD;
-    glass_point(fg, arc, target).map(|(l, h)| glass_at(l, h))
+    glass_point(fg, bg, arc, (target, THIN_INK_SHARE)).map(|(l, h)| glass_at(l, h))
 }
 
 /// The glass anchors on `fg` and `bg`, red to violet; `None` where an anchor has no floor.
@@ -349,8 +372,10 @@ pub fn light_page(fg: u32, bg: u32) -> bool {
     colour::luminance(fg) < colour::luminance(bg) && contrast(fg, bg) >= 3.0
 }
 
-/// Whether the page takes glass: every glass anchor keeps its floor with chroma at least
-/// [`HEADROOM_C`]. A page without it is LIP-FORWARD.
+/// Whether the page takes glass: every glass anchor it draws ([`glass_anchors`], at the fg's
+/// floor as its glyphs are seen) keeps chroma at least [`HEADROOM_C`]. A page without it is
+/// LIP-FORWARD (§1's HEADROOM gate, read at the drawn anchors, `docs/design/PRISM-GLASS.md`
+/// §15.8 amendment 52).
 #[must_use]
 pub fn headroom(fg: u32, bg: u32) -> bool {
     light_page(fg, bg)
@@ -852,16 +877,16 @@ impl Palette {
     }
 }
 
-/// The light pages whose tables ship ([`tables::SHIPPED`], in this order): the six glass pages,
-/// then the two lip-forward ones. The sixth glass page is the effects tests' light fixture, ink
+/// The light pages whose tables ship ([`tables::SHIPPED`], in this order): the five glass pages,
+/// then the three lip-forward ones. The fifth glass page is the effects tests' light fixture, ink
 /// `#24292f` on white.
 pub const SHIPPED_PAGES: [(&str, u32, u32); 8] = [
     ("Default Light", 0x002B_2D33, 0x00F6_F7F9),
     ("Aterm Day", 0x0020_2733, 0x00F8_FAFD),
     ("Linen", 0x003C_291E, 0x00F9_F3E6),
-    ("Gruvbox Light", 0x003C_3836, 0x00FB_F1C7),
     ("GitHub Light", 0x001F_2328, 0x00FF_FFFF),
     ("the test fixture", 0x0024_292F, 0x00FF_FFFF),
+    ("Gruvbox Light", 0x003C_3836, 0x00FB_F1C7),
     ("Solarized Light", 0x0058_6E75, 0x00FD_F6E3),
     ("Catppuccin Latte", 0x004C_4F69, 0x00EF_F1F5),
 ];
@@ -870,9 +895,13 @@ pub const SHIPPED_PAGES: [(&str, u32, u32); 8] = [
 /// costly kind that fit 1 ms, an eighth of a 120 Hz frame. Set from aterm-bench's
 /// `prism_glass_units` release bench, which times every unit of every shipped page's solve: on
 /// 2026-10-27 the most costly was a lift round's interval scan on Linen, 243 µs (a glass page's
-/// whole solve is 1,682 units when its lift takes one raising round, as Gruvbox Light's does, and
-/// 1,813 when it takes two, as every other shipped glass page's does, 54 to 61 ms; a lip-forward
-/// page's is 779 units and 29 to 34 ms).
+/// whole solve was then 1,682 or 1,813 units, 54 to 61 ms; a lip-forward page's 779 units and 29
+/// to 34 ms). Re-run on 2026-10-30, solved against the glyph as it is seen with headroom read at
+/// the drawn anchors (`docs/design/PRISM-GLASS.md` §15.8 amendment 52): the most costly unit is
+/// still a lift round's interval scan, 208.92 µs on Default Light, so 4 units fit; a glass page's
+/// solve is 1,682 units when its lift takes one raising round (Default Light, Aterm Day, Linen,
+/// GitHub Light) and 1,813 when it takes two (the fixture), 54 to 58 ms, and a lip-forward page's
+/// (Gruvbox Light, Solarized Light, Catppuccin Latte) 779 units, 33 to 37 ms.
 pub const SOLVE_UNITS_PER_FRAME: usize = 4;
 
 /// The most units a [`PaletteSolve`] runs: its ground, the anchors, both tables' glass, the
@@ -1088,8 +1117,9 @@ impl PaletteSolve {
         self.stage = match self.stage {
             Stage::Ground => {
                 if light_page(self.fg, self.bg) {
-                    self.target = glass_bar(self.fg, self.bg) + SOLVE_GUARD;
-                    self.lift_target = glass_bar(self.fg, self.bg) + LERP_BAR_GUARD;
+                    let bar = glass_bar(self.fg, self.bg);
+                    self.target = bar + SOLVE_GUARD;
+                    self.lift_target = bar + LERP_BAR_GUARD;
                     Stage::Anchor(0)
                 } else {
                     Stage::Done
@@ -1097,8 +1127,8 @@ impl PaletteSolve {
             }
             Stage::Anchor(k) => {
                 let at = ANCHOR_AT[k] as f64 / (ARC_LEN - 1) as f64;
-                self.anchors[k] =
-                    glass_point(self.fg, at, self.target).map(|(l, h)| glass_at(l, h));
+                self.anchors[k] = glass_point(self.fg, self.bg, at, (self.target, THIN_INK_SHARE))
+                    .map(|(l, h)| glass_at(l, h));
                 if k + 1 < 8 {
                     Stage::Anchor(k + 1)
                 } else if self
@@ -1113,7 +1143,12 @@ impl PaletteSolve {
                     Stage::Forward(0)
                 }
             }
-            Stage::Glass(i) => match glass_point(self.fg, self.arcs[i], self.target) {
+            Stage::Glass(i) => match glass_point(
+                self.fg,
+                self.bg,
+                self.arcs[i],
+                (self.target, THIN_INK_SHARE),
+            ) {
                 Some(point) => {
                     self.points[i] = point;
                     self.palette.glass[i] = glass_at(point.0, point.1);

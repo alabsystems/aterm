@@ -17,33 +17,27 @@ Gap 0 (a seal that publishes Clean-discharged rows) blocks every spec, so every 
 
 ## 0. Notation used in the statements
 
-- `FIPS.SHA256(m)`: a Clean model of FIPS 180-4 SHA-256 over `List UInt8`. It pads per §5.1.1,
-  parses into 512-bit blocks, folds `FIPS.compress` from `H_INIT` per §6.2.2, and serialises the
-  eight words big-endian. It is defined for |m| < 2^61 bytes (2^64 bits). The published
-  FIPS/NIST vectors (empty, "abc", 448-bit, 896-bit, 10^6 'a') become kernel-evaluated
-  (`decide`/`rfl`) facts about the **model**: they validate the model against the standard and
-  are no longer tests of the Rust.
+- `FIPS.SHA256(m)`: a Clean model of FIPS 180-4 SHA-256 over `List UInt8` (pad per §5.1.1, fold
+  `FIPS.compress` from `H_INIT` over the 512-bit blocks per §6.2.2, serialise the eight words
+  big-endian), defined for |m| < 2^61 bytes. The FIPS/NIST vectors become kernel-evaluated
+  (`decide`/`rfl`) facts that validate the **model**, no longer tests of the Rust.
 - `FIPS.compress(H, B)`: the §6.2.2 compression function on `[u32;8] × [u8;64]`.
-- `Pad(st, tail, n)`: given chaining state `st`, a live tail with |tail| < 64, and a byte count
-  `n : u64`, the result of absorbing `tail ++ [0x80] ++ 0^k ++ be64(n·8 mod 2^64)` with
-  `FIPS.compress` (k minimal so the total is a multiple of 64: one block if |tail| ≤ 55, two if
-  56..=63), then serialising big-endian.
-- `ShaInv(h, M)`: the abstraction of a `Sha256` value `h` that has absorbed the ghost message `M`:
-  `h.buf_len < 64` ∧ `h.buf_len = |M| mod 64` ∧ `h.len = |M| mod 2^64` ∧
-  `h.buf[..buf_len]` = the last `|M| mod 64` bytes of M ∧
-  `h.state` = foldl FIPS.compress H_INIT (the first ⌊|M|/64⌋ blocks of M).
-  The bytes `h.buf[buf_len..]` are dead (unconstrained).
-- `feed(h, [x1..xn])` = `h.update(x1); …; h.update(xn)` (any n ≥ 0, any slice lengths, empty
-  pieces included).
-- **Precondition everywhere:** total absorbed length < 2^61 bytes (a legal FIPS message).
-  `update_slice` adds to `len` with `wrapping_add` and `finalize` takes `len * 8` with
-  `wrapping_mul`, so longer messages silently diverge from FIPS. The `len` field's doc states the
-  bound, but no `requires` does (§4.5).
+- `Pad(st, tail, n)`: for chaining state `st`, a tail with |tail| < 64 and a byte count `n : u64`,
+  absorb `tail ++ [0x80] ++ 0^k ++ be64(n·8 mod 2^64)` with `FIPS.compress` (k minimal for a
+  multiple of 64: one block if |tail| ≤ 55, two if 56..=63) and serialise big-endian.
+- `ShaInv(h, M)`: `h` has absorbed the ghost message `M`: `h.buf_len < 64` ∧
+  `h.buf_len = |M| mod 64` ∧ `h.len = |M| mod 2^64` ∧ `h.buf[..buf_len]` = the last `|M| mod 64`
+  bytes of M ∧ `h.state` = foldl FIPS.compress H_INIT (the first ⌊|M|/64⌋ blocks of M).
+  `h.buf[buf_len..]` is unconstrained.
+- `feed(h, [x1..xn])` = `h.update(x1); …; h.update(xn)` (n ≥ 0, empty pieces included).
+- **Precondition everywhere:** total absorbed length < 2^61 bytes (a legal FIPS message; §4.5).
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes (primary tests; secondary in §2)`,
-`difficulty (Rust features the proof must handle)`, `blocking_gaps (audit §7)`.
+Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (primary tests; secondary in §2),
+`difficulty` (Rust features the proof must handle), `blocking_gaps` (rows of §7 of
+`docs/AUDIT-trust-for-test-migration-2026-10-15.md`; gap 0, a seal that publishes Clean-discharged
+rows, blocks every row).
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
@@ -84,36 +78,30 @@ HMAC, HKDF and `ct_eq` tests are mapped in its own file.
 ## 3. Tests that are not spec samples
 
 - `the_digest_still_evaluates_at_compile_time` pins that `update_slice`, `compress` and
-  `finalize` stay `const fn` (a const item calls them). Its values are instances of
-  `sha256-digest-refines-fips`, but a proof does not keep a function `const`.
+  `finalize` stay `const fn`; its values are instances of `sha256-digest-refines-fips`, but a proof
+  does not keep a function `const`.
 - `clean_origin_streaming_sha256_kernels_enforce_tla_invariants` samples the streaming buffer's
   Clean-island kernels (`buf_len_is_partial`, `sha256_partial_take`, `sha256_clamp_partial_len`,
-  `sha256_next_buf_len`); no row here states them.
+  `sha256_next_buf_len`), which no row here states.
 
 ## 4. Where the specs and the code disagree, or could
 
-1. **astream-digest's `fips_448_bit_message` has a wrong comment about 56 bytes.** It calls the
-   56-byte message "the tightest single-block case" with "exactly 8 bytes free". After the 0x80
-   byte `pos = 57 > 56`, so `finalize` spills the length into a second block. 55 bytes is the
-   tightest single-block case, as `finalize`'s own comment says (messages of 56..=63 bytes mod 64
-   spill).
-2. **astream-digest's `fips_896_bit_message` miscounts the 112-byte message.** It says "two blocks
-   plus a padding block". 112 bytes is 1 full block plus a 48-byte tail, and 48+1+8 ≤ 64, so the
-   digest takes 2 compressions, not 3. The 896-bit string is the SHA-384/512 two-block example
-   message.
-3. **`the_length_field_is_64_bits_wide` samples finalize, not digest.** It sets the private field
-   `h.len = 2^32` with `buf_len = 0` and calls the private `compress` as its own oracle. The state
-   is consistent with `ShaInv` mod 64 but unreachable without 4 GiB of input. It is therefore a
-   sample of `sha256-finalize-pads` over arbitrary `(state, tail, len)`, which is why that spec is
-   stated for every `h` with `buf_len < 64`, not only reachable ones.
-4. **The sweep oracles cannot be regenerated.** `SHA256_SWEEP` (`tests/lengths_and_streaming.rs`)
-   and `SWEEP` and `BOUNDARIES` (`tests/lengths_and_splits.rs`) are recorded answers that matched
-   the `sha2` crate when they were taken; nothing recomputes them. Under
-   `sha256-digest-refines-fips` the oracle becomes the Clean FIPS model.
-5. **An implicit precondition.** `update_slice`'s `len` uses `wrapping_add` and `finalize`'s
-   `len * 8` uses `wrapping_mul`, so digests of messages ≥ 2^61 bytes silently diverge from FIPS.
-   Every spec here carries |M| < 2^61, but no `requires` states it. Add one (as a ghost
-   precondition on the abstraction) when the specs land.
+1. **`fips_448_bit_message`'s comment is wrong.** It calls 56 bytes "the tightest single-block
+   case". After the 0x80, `pos = 57 > 56`, so `finalize` spills the length into a second block;
+   55 bytes is the tightest single-block case, as `finalize`'s own comment says.
+2. **`fips_896_bit_message`'s comment miscounts.** It says "two blocks plus a padding block", but
+   112 bytes is one block plus a 48-byte tail with room for the padding (48+1+8 ≤ 64): two
+   compressions, not three.
+3. **`the_length_field_is_64_bits_wide` samples `finalize` over an unreachable state.** It sets
+   the private `h.len = 2^32` with `buf_len = 0` and uses the private `compress` as its oracle,
+   which is why `sha256-finalize-pads` is stated for every `h` with `buf_len < 64`.
+4. **The sweep oracles are recorded answers.** `SHA256_SWEEP` and `SWEEP`/`BOUNDARIES` matched the
+   `sha2` crate when taken; nothing recomputes them. Under `sha256-digest-refines-fips` the Clean
+   FIPS model is the oracle.
+5. **An unstated precondition.** `update_slice` adds to `len` with `wrapping_add` and `finalize`
+   takes `len * 8` with `wrapping_mul`, so messages ≥ 2^61 bytes silently diverge from FIPS. The
+   `len` field's doc states the bound; no `requires` does. Add one (a ghost precondition on the
+   abstraction) when the specs land.
 
 ## 5. Proof order (easiest, high value first)
 

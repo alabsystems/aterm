@@ -116,7 +116,6 @@ fn a_needs_a_person_line_names_the_reason_by_its_length() {
     let action = "Run /goal again in this tab.";
     let planted = |when: Urgency, why: &str| Exception {
         held: None,
-        title: None,
         kind: ExceptionKind::GoalCleared,
         when,
         why: why.to_string(),

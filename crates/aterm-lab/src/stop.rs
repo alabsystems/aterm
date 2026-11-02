@@ -96,12 +96,19 @@ pub fn check() -> Result<(), Stopped> {
     }
 }
 
+/// Compute `Instant::now() + d`, saturating at one year if `d` would overflow.
+pub(crate) fn deadline_after(d: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(d)
+        .unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 3600))
+}
+
 /// Wait `d`, or less when an interrupt arrives.
 ///
 /// # Errors
 /// The run was interrupted.
 pub fn sleep(d: Duration) -> Result<(), Stopped> {
-    let end = Instant::now() + d;
+    let end = deadline_after(d);
     let (lock, cv) = bell();
     let mut g = lock.lock().unwrap_or_else(|p| p.into_inner());
     loop {
@@ -122,7 +129,7 @@ pub fn sleep(d: Duration) -> Result<(), Stopped> {
 /// # Errors
 /// The run was interrupted before `done` was set.
 pub fn sleep_unless(d: Duration, done: &AtomicBool) -> Result<bool, Stopped> {
-    let end = Instant::now() + d;
+    let end = deadline_after(d);
     let (lock, cv) = bell();
     let mut g = lock.lock().unwrap_or_else(|p| p.into_inner());
     loop {
@@ -155,7 +162,7 @@ pub fn ring() {
 pub fn until(t: f64) -> Result<(), Stopped> {
     let d = t - crate::util::now();
     if d > 0.0 {
-        sleep(Duration::from_secs_f64(d))
+        sleep(Duration::try_from_secs_f64(d).unwrap_or(Duration::MAX))
     } else {
         check()
     }
@@ -233,6 +240,9 @@ mod tests {
             Ok(Ok(true)),
             "the ring woke the waiter within the one-minute hang detector (its own deadline is 10 minutes)"
         );
+        assert_eq!(super::sleep_unless(Duration::MAX, &done), Ok(true));
+        assert_eq!(super::until(f64::NAN), Ok(()));
+        assert_eq!(super::until(0.0), Ok(()));
     }
 
     fn hard_exit_act() {

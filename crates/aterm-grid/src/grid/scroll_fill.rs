@@ -337,6 +337,7 @@ impl Grid {
     }
 }
 
+#[cfg_attr(test, derive(Debug, PartialEq))]
 enum DeferredExtra {
     /// Combining marks on a BMP base, attached via `add_combining`.
     CombiningMarks(u16, aterm_alloc::SmallVec<char, 4>),
@@ -349,6 +350,87 @@ enum DeferredExtra {
 }
 
 fn fill_row_cells(row: &mut Row, text: &str, line: &Line, cols: u16) -> (Vec<DeferredExtra>, u16) {
+    if let Some(filled) = fill_ascii_row_cells(row, text, line, cols) {
+        return filled;
+    }
+    fill_row_cells_general(row, text, line, cols)
+}
+
+/// Printable ASCII with ordinary cell widths needs no grapheme walk. Restrict
+/// the whole line to the row's width, so the test is bounded and a following
+/// combining character cannot change the last cell we restore.
+fn fill_ascii_row_cells(
+    row: &mut Row,
+    text: &str,
+    line: &Line,
+    cols: u16,
+) -> Option<(Vec<DeferredExtra>, u16)> {
+    use crate::{CellFlags, PackedColor, PackedColors};
+    use aterm_scrollback::CellAttrs;
+
+    if text.len() > usize::from(cols)
+        || !text.bytes().all(|byte| (b' '..=b'~').contains(&byte))
+        || line.attrs().is_some_and(|attrs| {
+            let mut covered = 0usize;
+            for run in attrs.runs() {
+                if covered >= text.len() {
+                    break;
+                }
+                if run.length != 0
+                    && CellFlags::from_bits(run.value.flags).contains(CellFlags::WIDE)
+                {
+                    return true;
+                }
+                covered = covered.saturating_add(run.length as usize);
+            }
+            false
+        })
+    {
+        return None;
+    }
+
+    let mut deferred = Vec::new();
+    let mut cursor = line.attr_cursor();
+    let mut current = CellAttrs::DEFAULT;
+    let mut colors = PackedColors::DEFAULT;
+    let mut flags = CellFlags::empty();
+    let (mut fg_rgb, mut bg_rgb) = (None, None);
+    for (index, byte) in text.bytes().enumerate() {
+        let attrs = cursor.attr_at(index).with_opens_cell(false);
+        if attrs != current {
+            current = attrs;
+            let (fg, bg) = (PackedColor(attrs.fg), PackedColor(attrs.bg));
+            colors = Cell::convert_colors(fg, bg);
+            flags = CellFlags::from_bits(attrs.flags);
+            fg_rgb = fg.is_rgb().then(|| {
+                let (r, g, b) = fg.rgb_components();
+                [r, g, b]
+            });
+            bg_rgb = bg.is_rgb().then(|| {
+                let (r, g, b) = bg.rgb_components();
+                [r, g, b]
+            });
+        }
+        let col = row_u16(index);
+        row.set(col, Cell::from_ascii_styled(byte, colors, flags));
+        if let Some(rgb) = fg_rgb {
+            deferred.push(DeferredExtra::RgbFg(col, rgb));
+        }
+        if let Some(rgb) = bg_rgb {
+            deferred.push(DeferredExtra::RgbBg(col, rgb));
+        }
+    }
+    let col = row_u16(text.len());
+    finish_row_cells(row, col, cols);
+    Some((deferred, col))
+}
+
+fn fill_row_cells_general(
+    row: &mut Row,
+    text: &str,
+    line: &Line,
+    cols: u16,
+) -> (Vec<DeferredExtra>, u16) {
     use crate::{CellFlags, PackedColor};
 
     let mut deferred = Vec::new();
@@ -377,10 +459,14 @@ fn fill_row_cells(row: &mut Row, text: &str, line: &Line, cols: u16) -> (Vec<Def
         }
         col = new_col;
     }
+    finish_row_cells(row, col, cols);
+    (deferred, col)
+}
+
+fn finish_row_cells(row: &mut Row, col: u16, cols: u16) {
     row.update_len(col);
     row.set_early_wrap_hole(super::scroll_materialize::leaves_wrap_hole(col, cols));
     row.set_ends_at_len(u32::from(col) + 1 < u32::from(cols));
-    (deferred, col)
 }
 
 struct LineCellStyle {
@@ -515,6 +601,89 @@ fn apply_deferred_extras(extras: &mut CellExtras, row_idx: u16, deferred: Vec<De
 mod tests {
     use super::*;
     use aterm_scrollback::{CellAttrs, Line, Rle};
+
+    fn compare_fillers(line: &Line, cols: u16, expect_fast: bool) {
+        let mut fast = Grid::new(1, cols.max(1));
+        let mut reference = Grid::new(1, cols.max(1));
+        let text = line.as_str().expect("text fixture");
+        let direct = fill_ascii_row_cells(fast.row_mut(0).unwrap(), text, line, cols);
+        assert_eq!(direct.is_some(), expect_fast, "{text:?}, cols={cols}");
+        let actual =
+            direct.unwrap_or_else(|| fill_row_cells(fast.row_mut(0).unwrap(), text, line, cols));
+        let expected = fill_row_cells_general(reference.row_mut(0).unwrap(), text, line, cols);
+        assert_eq!(
+            actual, expected,
+            "deferred extras for {text:?}, cols={cols}"
+        );
+        let (actual, expected) = (fast.row(0).unwrap(), reference.row(0).unwrap());
+        assert_eq!(actual.as_slice(), expected.as_slice());
+        assert_eq!(actual.len(), expected.len());
+        assert_eq!(actual.flags(), expected.flags());
+    }
+
+    #[test]
+    fn ascii_restore_matches_general_cells_styles_lengths_and_holes() {
+        let palette = [
+            CellAttrs::DEFAULT,
+            CellAttrs::new(0x01_112233, 0x01_aabbcc, CellAttrs::OPENS_CELL),
+            CellAttrs::new(
+                crate::PackedColor::indexed(10).0,
+                crate::PackedColor::indexed(3).0,
+                crate::CellFlags::BOLD.bits(),
+            ),
+            CellAttrs::new(0x03_abcdef, 0x04_123456, crate::CellFlags::PROTECTED.bits()),
+            CellAttrs::new(0xFF_123456, 0xFF_654321, crate::CellFlags::COMPLEX.bits()),
+        ];
+        for cols in [0_u16, 1, 2, 7, 80, 256] {
+            for len in [0, cols.saturating_sub(1), cols] {
+                let text: String = "A~ 09".chars().cycle().take(usize::from(len)).collect();
+                compare_fillers(&Line::from(text.as_str()), cols, true);
+                let mut attrs = Rle::new();
+                for i in 0..usize::from(len) {
+                    attrs.push(palette[(i / 3) % palette.len()]);
+                }
+                compare_fillers(&Line::with_attrs(&text, attrs), cols, true);
+                let mut short_attrs = Rle::new();
+                for _ in 0..len / 2 {
+                    short_attrs.push(palette[1]);
+                }
+                compare_fillers(&Line::with_attrs(&text, short_attrs), cols, true);
+            }
+        }
+    }
+
+    #[test]
+    fn ascii_restore_does_not_scan_attributes_past_the_text() {
+        let mut attrs = Rle::with_value(CellAttrs::DEFAULT, 1);
+        for i in 0..4096 {
+            attrs.push(CellAttrs::new(i % 2, 0, 0));
+        }
+        attrs.push(CellAttrs::new(0, 0, crate::CellFlags::WIDE.bits()));
+        compare_fillers(&Line::with_attrs("a", attrs.clone()), 3, true);
+        compare_fillers(&Line::with_attrs("", attrs), 3, true);
+    }
+
+    #[test]
+    fn ascii_restore_keeps_unicode_wide_controls_and_truncation_on_general_walk() {
+        for text in [
+            "a\u{0301}",
+            "界",
+            "a\u{200d}👩",
+            "\t",
+            "\x7f",
+            "a\nb",
+            "longer-than-row",
+        ] {
+            compare_fillers(&Line::from(text), 5, false);
+        }
+        let mut wide = Rle::new();
+        wide.push(CellAttrs::new(
+            0xFF_FFFFFF,
+            0xFF_000000,
+            crate::CellFlags::WIDE.bits(),
+        ));
+        compare_fillers(&Line::with_attrs("a", wide), 5, false);
+    }
 
     #[test]
     fn fill_row_from_line_replaces_exactly_its_row() {

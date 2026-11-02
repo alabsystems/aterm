@@ -41,7 +41,8 @@ fn queue() -> *mut c_void {
 fn libdispatch_invokes_an_arity_zero_block() {
     let hits = Arc::new(AtomicUsize::new(0));
     let seen = Arc::clone(&hits);
-    // SAFETY: `dispatch_sync` calls a `void (^)(void)` block.
+    // SAFETY: `dispatch_sync` calls a `void (^)(void)` block, which is exactly the `Fn() -> ()`
+    // prototype declared here.
     let block = unsafe {
         RcBlock::new0(move || {
             seen.fetch_add(1, Ordering::SeqCst);
@@ -62,7 +63,8 @@ fn libdispatch_invokes_an_arity_zero_block() {
 fn libdispatch_invokes_an_arity_one_block_with_its_argument() {
     let sum = Arc::new(AtomicUsize::new(0));
     let acc = Arc::clone(&sum);
-    // SAFETY: `dispatch_apply` calls a `void (^)(size_t)` block.
+    // SAFETY: `dispatch_apply` calls a `void (^)(size_t)` block, the `Fn(usize)` prototype
+    // declared here.
     let block = unsafe {
         RcBlock::new1(move |i: usize| {
             acc.fetch_add(i, Ordering::SeqCst);
@@ -85,7 +87,8 @@ fn foundation_invokes_an_arity_two_block() {
     // SAFETY: prototype matches Foundation's `enumerateLinesUsingBlock:`.
     let block = unsafe {
         RcBlock::new2(move |line: Id, _stop: *mut aterm_objc::Bool| {
-            // SAFETY: Foundation passes a live, autoreleased NSString for the duration of the call.
+            // SAFETY (inherited from the enclosing block): Foundation passes a live, autoreleased
+            // NSString for the duration of the call; the bytes are copied out before returning.
             sink.lock()
                 .expect("uncontended")
                 .push(aterm_objc::ns_string_to_rust(line));

@@ -193,6 +193,7 @@ pub fn decode(s: &str) -> String {
         if b[i] == b'%'
             && let Some(v) = s
                 .get(i + 1..i + 3)
+                .filter(|h| h.bytes().all(|b| b.is_ascii_hexdigit()))
                 .and_then(|h| u8::from_str_radix(h, 16).ok())
         {
             out.push(v);
@@ -277,7 +278,7 @@ pub enum Chunk {
 }
 
 fn unhex(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
+    if !s.len().is_multiple_of(2) || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     (0..s.len())

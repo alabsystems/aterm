@@ -9,10 +9,19 @@
 //! of the doubling ladder, the wait's deadline that rung. The words are held here: every act the
 //! decider types at the wall is the line `cleared_text` says, and a decider typing main's retry
 //! words instead is caught.
+//!
+//! Slice 12c (v6 §14.17.5.4): the walk keeps the host's real book of answered turns
+//! (`harness::witness::Witnesses`), so a witness the model gives the wall's own route is another
+//! session's answer on Claude Code's default route and one it gives another route only is an
+//! answer on another endpoint, which the book never hands this session; and the model's rate
+//! limit is Muse Code's 429 with the `retry-after` its words name (the Responses API's sentence),
+//! `After` ticks: Claude Code's own 429 names no wait (the API gives it in a header Claude Code
+//! does not draw), so it keeps the ladder.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
+use aterm_agent::harness::witness::{Base, RouteKey, Target, Witnesses};
 use aterm_agent::supervise::SupervisorConfig;
 use aterm_agent::supervise::phase::Phase;
 use aterm_agent::supervise::policy::turn_end::{
@@ -39,6 +48,42 @@ const ENOTFOUND: &str =
 const OVERLOADED: &str = "API Error: 529 Overloaded. This is a server-side issue, usually \
                           temporary — try again in a moment. If it persists, check \
                           https://status.claude.com.";
+/// Muse Code's 429 as its screen draws it, the Responses API's sentence naming its
+/// `retry-after` in seconds.
+fn rate_limited(after: Duration) -> String {
+    format!(
+        "model failed: API error 429: Rate limit reached for requests per min. Please try again \
+         in {}s. (rate_limit_exceeded)",
+        after.as_secs()
+    )
+}
+
+/// This session, and the session whose answers witness its route: Claude Code on its default route.
+const ME: &str = "s-me";
+const MATE: &str = "s-mate";
+
+fn own_route() -> RouteKey {
+    RouteKey {
+        program: aterm_phase::Program::Claude,
+        base: Base::anthropic(),
+    }
+}
+
+/// Another route: Claude Code on another endpoint.
+fn other_route() -> RouteKey {
+    RouteKey {
+        program: aterm_phase::Program::Claude,
+        base: Base {
+            target: Target {
+                host: "gw.example.test".to_string(),
+                port: 443,
+                tls: true,
+            },
+            path: String::new(),
+        },
+    }
+}
+
 const GOAL_UNAVAILABLE: &str = "Goal still active · the API was unavailable or the connection \
                                 dropped · retrying in 5 min (2/3) · send a message to retry now";
 const GOAL_GAVE_UP: &str = "Goal paused after 3 automatic retries · the API was unavailable or \
@@ -57,34 +102,41 @@ fn timing(m: &Model) -> TurnEndTiming {
 
 /// The wall the model's `kind` stands for, as the reader reads its words.
 fn wall_of(st: &State) -> WallKind {
-    if st["kind"] == 1 {
-        WallKind::ApiError {
+    match st["kind"] {
+        1 => WallKind::ApiError {
             code: None,
             retryable: true,
             cause: ApiCause::Unreachable,
-        }
-    } else {
-        WallKind::Overloaded
+        },
+        3 => WallKind::ApiError {
+            code: Some(429),
+            retryable: true,
+            cause: ApiCause::Server,
+        },
+        _ => WallKind::Overloaded,
     }
 }
 
 /// The outage the model's `kind` stands for.
 fn outage_of(st: &State) -> Outage {
-    if st["kind"] == 1 {
-        Outage::Connection
-    } else {
-        Outage::Overload
+    match st["kind"] {
+        1 => Outage::Connection,
+        3 => Outage::ApiError,
+        _ => Outage::Overload,
     }
 }
 
-/// The real side of one walk: the decider's state, the loop's clock, and when the host last
-/// measured the route down and its edge up (a moment after whatever came before each).
+/// The real side of one walk: the decider's state, the loop's clock, when the host last
+/// measured the route down and its edge up (a moment after whatever came before each), the host's
+/// book of answered turns, and the `retry-after` the rate limit's words name.
 #[derive(Clone)]
 struct Real {
     st: TurnEndState,
     now: Instant,
     down_at: Instant,
     up_at: Instant,
+    book: Witnesses,
+    after: Duration,
 }
 
 /// The screen the model state stands for: at a wall that shows, the vendor's message as the
@@ -98,10 +150,11 @@ fn reading(st: &State, worked: Option<Duration>, real: &Real) -> TurnEndReading 
         authoritative: true,
         survey: false,
         wall: showing.then(|| wall_of(st)),
-        wall_message: match (showing, connection) {
+        wall_message: match (showing, st["kind"]) {
             (false, _) => String::new(),
-            (true, true) => ENOTFOUND.to_string(),
-            (true, false) => OVERLOADED.to_string(),
+            (true, 1) => ENOTFOUND.to_string(),
+            (true, 3) => rate_limited(real.after),
+            (true, _) => OVERLOADED.to_string(),
         },
         reset_at: None,
         jitter: Duration::ZERO,
@@ -111,8 +164,9 @@ fn reading(st: &State, worked: Option<Duration>, real: &Real) -> TurnEndReading 
         said_cut: false,
         opens_cut: false,
         turn_said: None,
+        said_lines: None,
+        turn_lines: None,
         opened_by: None,
-        opened_words: None,
         message_drawn: false,
         submits: None,
         inputs_before: None,
@@ -139,6 +193,7 @@ fn reading(st: &State, worked: Option<Duration>, real: &Real) -> TurnEndReading 
         notice_elsewhere: false,
         reset_clock: None,
         person: None,
+        key: None,
         reach: match (connection, st["reach"]) {
             (true, 1) => Reach::Down {
                 since: real.down_at,
@@ -146,11 +201,17 @@ fn reading(st: &State, worked: Option<Duration>, real: &Real) -> TurnEndReading 
             (true, 2 | 3) => Reach::Up { since: real.up_at },
             _ => Reach::Unknown,
         },
-        program: aterm_phase::Program::Claude,
+        witness: real.book.witness(&own_route(), ME),
+        program: if st["kind"] == 3 {
+            aterm_phase::Program::Muse
+        } else {
+            aterm_phase::Program::Claude
+        },
         seat: Default::default(),
         account: None,
         autopilot: aterm_agent::supervise::Autopilot::Cruise,
         login_label: None,
+        autopilot_by_person: false,
         login_superseded: false,
         login_notice: None,
         login_screen: None,
@@ -175,7 +236,7 @@ fn reading(st: &State, worked: Option<Duration>, real: &Real) -> TurnEndReading 
 
 /// An idle point with no wall after real work: the resume was taken.
 fn taken(real: &Real) -> TurnEndReading {
-    let quiet = State::from([("kind", 0), ("turn", 0), ("reach", 0)]);
+    let quiet = State::from([("kind", 0), ("turn", 0), ("reach", 0), ("witness", 0)]);
     TurnEndReading {
         phase: Phase::Idle,
         worked: Some(REAL_WORK),
@@ -200,10 +261,11 @@ enum Verdict {
 }
 
 /// What the model says the decider does at a wall that shows: the measured line where
-/// `ResumeMeasured` is enabled, the blind line where `TryBlind` is, else a wait, typing nothing
-/// while the route is measured down and else until the rung `gap` ticks from the wall's start.
+/// `ResumeMeasured` or `ResumeWitnessed` is enabled, the blind line where `TryBlind` is, else a
+/// wait, typing nothing while the route is measured down and else until the rung `gap` ticks from
+/// the wall's start.
 fn expected(m: &Model, st: &State) -> Verdict {
-    if m.action_enabled("ResumeMeasured", st) {
+    if m.action_enabled("ResumeMeasured", st) || m.action_enabled("ResumeWitnessed", st) {
         return Verdict::Line(Clearing::Measured);
     }
     if m.action_enabled("TryBlind", st) {
@@ -255,7 +317,7 @@ fn mirror(
     cfg: &SupervisorConfig,
 ) -> bool {
     match action {
-        "ConnectionMeets" | "OverloadMeets" | "MetAgain" => {
+        "ConnectionMeets" | "OverloadMeets" | "RateMeets" | "MetAgain" => {
             real.now += VENDOR_RETRIES;
             let r = reading(after, Some(VENDOR_RETRIES), real);
             real.st.observe(&r, real.now);
@@ -269,8 +331,16 @@ fn mirror(
             real.up_at = real.now;
         }
         "MeasureLost" => real.now += Duration::from_millis(1),
+        "SameRouteAnswers" => {
+            real.now += Duration::from_millis(1);
+            real.book.answered(own_route(), MATE, real.now);
+        }
+        "OtherRouteAnswers" => {
+            real.now += Duration::from_millis(1);
+            real.book.answered(other_route(), "s-far", real.now);
+        }
         "Tick" => real.now += MIN,
-        "ResumeMeasured" | "TryBlind" => {
+        "ResumeMeasured" | "ResumeWitnessed" | "TryBlind" => {
             let r = reading(before, None, real);
             real.st.observe(&r, real.now);
             let a = decide_turn_end(&real.st, &r, cfg, real.now);
@@ -325,6 +395,8 @@ fn walk(m: &Model, strict: bool, mains: bool) -> Walked {
         now: base,
         down_at: base,
         up_at: base,
+        book: Witnesses::default(),
+        after: MIN * u32::try_from(cnst(m, "After")).expect("a small constant"),
     };
     let mut seen: BTreeSet<Vec<i64>> = BTreeSet::new();
     let mut queue = VecDeque::from([(m.init_state(), init)]);
@@ -360,6 +432,9 @@ fn walk(m: &Model, strict: bool, mains: bool) -> Walked {
                 Verdict::Wait { tries, .. } => format!("wait tries={tries}"),
                 other => format!("{other:?}"),
             };
+            *words
+                .entry(format!("{word} at kind {}", st["kind"]))
+                .or_default() += 1;
             *words.entry(word).or_default() += 1;
         }
         for action in &m.actions {
@@ -396,7 +471,84 @@ fn tier1_the_real_decider_waits_out_an_outage_exactly_as_the_model_says() {
             walked.words
         );
     }
+    // A witness clears an overload (nothing measures it), the rate limit is tried blind on its
+    // own rung and waited out before it.
+    for word in [
+        "Line(Measured) at kind 2",
+        "Line(Blind) at kind 3",
+        "wait tries=true at kind 3",
+    ] {
+        assert!(
+            walked.words.get(word).copied().unwrap_or(0) > 0,
+            "{word} never occurred: {:?}",
+            walked.words
+        );
+    }
     assert!(walked.states > 50, "{} states", walked.states);
+}
+
+/// Negative controls on the witness (v6 §14.17.5.4): main's ladder, which no witness clears
+/// (`Buggy = 9`), tries blind at its rung over a witness the real decider resumes on at once; a
+/// witness on another route (`Buggy = 6`) resumes where the real decider, whose book never hands
+/// it that answer, waits; a second resume on a witness in one outage (`Buggy = 7`) types where
+/// the real decider leaves it to the ladder; and a witness taken at a rate limit or into a route
+/// measured down (`Buggy = 8`) types where the real decider waits.
+#[test]
+fn a_ladder_blind_to_witnesses_or_one_that_takes_any_disagrees_with_the_real_decider() {
+    let m = supervisor_outage_wait_model();
+    let mains = walk(&aterm_spec::interp::with_buggy(&m, 9), false, false);
+    assert!(
+        mains.off.iter().any(|(st, got, want)| st["witness"] == 1
+            && *got == Verdict::Line(Clearing::Measured)
+            && matches!(want, Verdict::Wait { tries: true, .. })),
+        "main's ladder agreed at every witness: {:?}",
+        mains.off
+    );
+    let crossed = walk(&aterm_spec::interp::with_buggy(&m, 6), false, false);
+    assert!(
+        crossed.off.iter().any(|(st, got, want)| st["witness"] == 2
+            && *want == Verdict::Line(Clearing::Measured)
+            && matches!(got, Verdict::Wait { tries: true, .. })),
+        "another route's witness agreed everywhere: {:?}",
+        crossed.off
+    );
+    let twice = walk(&aterm_spec::interp::with_buggy(&m, 7), false, false);
+    assert!(
+        twice.off.iter().any(|(st, got, want)| st["witnessed"] == 1
+            && st["witness"] == 1
+            && *want == Verdict::Line(Clearing::Measured)
+            && *got != Verdict::Line(Clearing::Measured)),
+        "a second witnessed resume agreed everywhere: {:?}",
+        twice.off
+    );
+    let any = walk(&aterm_spec::interp::with_buggy(&m, 8), false, false);
+    for (kind, reach, tries) in [(3, 0, true), (1, 1, false)] {
+        assert!(
+            any.off.iter().any(|(st, got, want)| st["kind"] == kind
+                && st["reach"] == reach
+                && st["witness"] == 1
+                && *want == Verdict::Line(Clearing::Measured)
+                && matches!(got, Verdict::Wait { tries: t, .. } if *t == tries)),
+            "a witness taken at kind {kind}, reach {reach} agreed everywhere: {:?}",
+            any.off
+        );
+    }
+}
+
+/// Negative control on the rate limit's own wait: a ladder deaf to the `retry-after` its words
+/// name (`Buggy = 5`) tries on the first rung, where the real decider still waits for it.
+#[test]
+fn a_ladder_deaf_to_the_retry_after_disagrees_with_the_real_decider() {
+    let m = supervisor_outage_wait_model();
+    let deaf = walk(&aterm_spec::interp::with_buggy(&m, 5), false, false);
+    assert!(
+        deaf.off.iter().any(|(st, got, want)| st["kind"] == 3
+            && st["waited"] < cnst(&m, "After")
+            && *want == Verdict::Line(Clearing::Blind)
+            && matches!(got, Verdict::Wait { tries: true, .. })),
+        "a deaf ladder agreed everywhere: {:?}",
+        deaf.off
+    );
 }
 
 /// Negative controls on main's rule: the `Buggy = 1` model (today's typed retry, a try whatever
@@ -521,6 +673,48 @@ fn each_buggy_dial_breaks_its_law_along_a_path_the_model_keeps_it_on() {
             ],
             &["OneResumePerMeasuredClearing", "TheLineSaysHowItCleared"],
         ),
+        (
+            5,
+            vec!["RateMeets", "Tick", "TryBlind"],
+            &["NoTryBeforeItsRetryAfter"],
+        ),
+        (
+            6,
+            vec!["OverloadMeets", "OtherRouteAnswers", "ResumeWitnessed"],
+            &["NoWitnessOfAnotherRouteClears"],
+        ),
+        (
+            7,
+            vec![
+                "OverloadMeets",
+                "SameRouteAnswers",
+                "ResumeWitnessed",
+                "MetAgain",
+                "SameRouteAnswers",
+                "ResumeWitnessed",
+            ],
+            &["OneWitnessedResumePerOutage"],
+        ),
+        (
+            8,
+            vec!["RateMeets", "SameRouteAnswers", "ResumeWitnessed"],
+            &["NoWitnessClearsARateLimit"],
+        ),
+        (
+            8,
+            vec![
+                "ConnectionMeets",
+                "MeasureDown",
+                "SameRouteAnswers",
+                "ResumeWitnessed",
+            ],
+            &["NothingTypedWhileMeasuredDown"],
+        ),
+        (
+            9,
+            vec!["OverloadMeets", "SameRouteAnswers", "Tick", "TryBlind"],
+            &["TheLineSaysHowItCleared"],
+        ),
     ] {
         let bad = aterm_spec::interp::with_buggy(&m, buggy);
         let mut st = bad.init_state();
@@ -552,7 +746,9 @@ fn each_buggy_dial_breaks_its_law_along_a_path_the_model_keeps_it_on() {
 /// reached, and an overload. The `/goal` echo that the API was unavailable, read alone (retrying
 /// or past its retries), is a generic API error, a wall the model's blind arm stands for as it
 /// does the overload: Claude Code gives that reason an overload and a server error too, so no
-/// measure of the route clears it.
+/// measure of the route clears it unless the route was measured down at the wall, which makes
+/// it the connection's outage (the model's measured arm), held by that Down only until the cap
+/// has passed since it began.
 #[test]
 fn the_models_words_read_as_the_walls_they_stand_for() {
     assert_eq!(
@@ -577,5 +773,27 @@ fn the_models_words_read_as_the_walls_they_stand_for() {
     assert_eq!(
         aterm_phase::classify_wall(OVERLOADED),
         Some(WallKind::Overloaded)
+    );
+    // The rate limit's words are Muse Code's own, as its reader reads them off its screen (a
+    // measured capture, its wait made 120 s).
+    let rate = rate_limited(Duration::from_secs(120));
+    let rows = aterm_phase::prompt::fixtures::screen(
+        &aterm_phase::muse::fixtures::RATE_LIMIT_FINAL.replace("in 5s.", "in 120s."),
+    );
+    let wall = aterm_phase::reader::read(Some("muse"), &rows, None)
+        .wall
+        .expect("Muse Code's rate limit is a wall");
+    assert_eq!(
+        wall.kind,
+        WallKind::ApiError {
+            code: Some(429),
+            retryable: true,
+            cause: ApiCause::Server,
+        }
+    );
+    assert!(wall.message.starts_with(&rate), "{}", wall.message);
+    assert_eq!(
+        aterm_phase::retry_after(&wall.message),
+        Some(Duration::from_secs(120))
     );
 }

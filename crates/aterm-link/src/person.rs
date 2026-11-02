@@ -773,8 +773,8 @@ fn write_cap(path: &Path, lines: &str, secret: &Path) -> Result<PathBuf, String>
             path.display()
         ));
     }
-    match std::fs::read(path) {
-        Ok(old) if old == lines.as_bytes() => match private_mode(path) {
+    match read_existing_cap(path, lines.len()) {
+        Ok(Some((file, old))) if old == lines.as_bytes() => match private_mode(&file) {
             Ok(None) => {}
             Ok(Some(was)) if (was & 0o077) == 0 => eprintln!(
                 "aterm fabric mint-for: {} held this cap at mode {was:03o}; now 0600",
@@ -791,13 +791,13 @@ fn write_cap(path: &Path, lines: &str, secret: &Path) -> Result<PathBuf, String>
             ),
             Err(e) => return Err(format!("{}: {e}", path.display())),
         },
-        Ok(_) => {
+        Ok(Some(_)) => {
             return Err(format!(
                 "{} exists and holds a different cap; remove it or choose another --out",
                 path.display()
             ));
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+        Ok(None) => {
             write_atomic(path, lines.as_bytes(), 0o600)
                 .map_err(|e| format!("{}: {e}", path.display()))?;
         }
@@ -835,16 +835,43 @@ fn person_guidance(person: &str, fleet: &str, broker: &str, cap: &str) -> String
     )
 }
 
-/// Make `path` 0600 if it is not.
+fn read_existing_cap(
+    path: &Path,
+    expected_len: usize,
+) -> io::Result<Option<(std::fs::File, Vec<u8>)>> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    let cap = u64::try_from(expected_len.saturating_add(1)).unwrap_or(u64::MAX);
+    let mut bytes = Vec::with_capacity(expected_len.min(4096));
+    (&file).take(cap).read_to_end(&mut bytes)?;
+    Ok(Some((file, bytes)))
+}
+
+/// Make `file` 0600 if it is not.
 /// # Errors
 /// The stat or the chmod.
-fn private_mode(path: &Path) -> io::Result<Option<u32>> {
+fn private_mode(file: &std::fs::File) -> io::Result<Option<u32>> {
     use std::os::unix::fs::PermissionsExt;
-    let was = std::fs::metadata(path)?.permissions().mode() & 0o777;
+    let was = file.metadata()?.permissions().mode() & 0o777;
     if was == 0o600 {
         return Ok(None);
     }
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     Ok(Some(was))
 }
 

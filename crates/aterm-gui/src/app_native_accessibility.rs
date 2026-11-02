@@ -845,18 +845,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// The published accessibility press on the Keyboard & Trackpad group's
-    /// `Leave as is` segment.
+    /// The published accessibility press on the Mac settings line's switch, which turns the
+    /// line off.
     fn publish_leave(app: &mut App, wid: WindowId, view: ViewId) -> ActionRequest {
         set_a11y_active(app, wid, true);
         assert!(app.prepare_native_input_scratch(wid));
         let (update, published) = app.take_native_accessibility_update(wid).unwrap().unwrap();
-        let node = stable_node_id_for_view(view, &UiKey::new("system-state/group/1/leave"));
+        let node = stable_node_id_for_view(view, &UiKey::new("system-state/line/mac/switch"));
         let context = update
             .nodes
             .iter()
             .find(|(id, _)| *id == node)
-            .expect("published Leave as is segment")
+            .expect("published Mac settings switch")
             .1
             .action_context();
         assert!(context.is_some());
@@ -885,6 +885,21 @@ mod tests {
             ..crate::SetupStatus::default()
         });
         let (instance, view) = app.active_native_view(wid).unwrap();
+        // The fields of another vault, under the open Secrets & identity line.
+        for key in [
+            "system-state/line/secrets/disclose",
+            "system-state/row/secrets/disclose",
+        ] {
+            app.dispatch_native_view_event(
+                wid,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: crate::native_ui::ActionId::new(key),
+                    value: None,
+                }),
+            )
+            .unwrap();
+        }
         for (key, text) in [
             ("system-state/url", "http://draft.invalid:7484/v1/team"),
             ("system-state/password", "inert-password"),
@@ -935,17 +950,18 @@ mod tests {
         }
     }
 
-    fn startup_review_ax_navigation(action: Action) {
+    fn launch_offer_ax_navigation(action: Action) {
         use crate::workstation_setup::{Request, WorkstationSetupDecision};
         use aterm_types::macos_setup::Plan;
         use std::sync::mpsc;
-        use std::time::{Duration, Instant};
+        use std::time::Instant;
 
-        // Nobody is at the screen yet, so the offer waits for its answer meanwhile.
+        // Nobody is at the screen: the page's first tick answers the offer all the same
+        // (init-on-by-default design §6.1), and navigation before it answers nothing.
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         let window = app.windows.get_mut(&wid).unwrap();
-        window.rows = 24;
+        window.rows = 18;
         window.cols = 90;
         window.os_window_for_test = true;
         assert!(app.open_system_state_tab());
@@ -961,12 +977,11 @@ mod tests {
         assert!(request.pending());
         assert!(app.commit_glassless_native_frame(wid));
         let start = Instant::now();
-        app.tick_system_state(start);
 
         let key = UiKey::new(if action == Action::ScrollIntoView {
-            "system-state/row/repositories"
+            "system-state/line/accounts"
         } else {
-            "system-state/group/0/set-up"
+            "system-state/line/mac/switch"
         });
         set_a11y_active(&mut app, wid, true);
         assert!(app.prepare_native_input_scratch(wid));
@@ -976,7 +991,7 @@ mod tests {
             .nodes
             .iter()
             .find(|(id, _)| *id == target_node)
-            .expect("the review publishes the target row or control")
+            .expect("the offer's page publishes the target row or control")
             .1;
         assert!(control.supports_action(action));
         if action == Action::ScrollIntoView {
@@ -987,7 +1002,7 @@ mod tests {
         app.windows.get_mut(&wid).unwrap().native_a11y_published = Some(published);
         let scroll = |app: &App| match app.native_runtime.view_state(view).unwrap() {
             AppViewState::SystemState(state) => state.list_scroll().0,
-            _ => panic!("the review remains System State"),
+            _ => panic!("the page remains System State"),
         };
         let before = scroll(&app);
         app.on_native_accessibility_action(
@@ -1023,15 +1038,17 @@ mod tests {
             );
         }
         assert!(request.pending(), "navigation answers nothing");
-        // A person comes to the screen: navigation held nothing (design revision 4).
-        app.user_input_recent = |_| true;
-        app.tick_system_state(start + Duration::from_secs(1));
+        // The first tick answers it with nobody here: navigation held nothing (design
+        // revision 4).
+        app.tick_system_state(start);
         let mut answer = receive
             .try_recv()
-            .expect("the page answers once a person is here");
+            .expect("the page answers at its first tick");
         assert_eq!(
             answer.decision,
-            WorkstationSetupDecision::Begin(Plan::default())
+            WorkstationSetupDecision::Begin(crate::workstation_setup::automatic_plan_for_test(
+                Plan::default()
+            ))
         );
         assert_eq!(
             answer.receipt.as_ref().unwrap().admission(),
@@ -1045,17 +1062,17 @@ mod tests {
     }
 
     #[test]
-    fn startup_review_ax_show_item_moves_the_list_and_holds_no_answer() {
-        startup_review_ax_navigation(Action::ScrollIntoView);
+    fn launch_offer_ax_show_item_moves_the_list_and_answers_nothing() {
+        launch_offer_ax_navigation(Action::ScrollIntoView);
     }
 
     #[test]
-    fn startup_review_ax_focus_holds_no_answer() {
-        startup_review_ax_navigation(Action::Focus);
+    fn launch_offer_ax_focus_answers_nothing() {
+        launch_offer_ax_navigation(Action::Focus);
     }
 
     #[cfg(target_os = "macos")]
-    mod exact_headline_open {
+    mod exact_card_open {
         use super::*;
         use aterm_types::macos_setup::{Access, Standing, Subject};
 
@@ -1140,17 +1157,18 @@ mod tests {
                 .iter()
                 .find(|node| {
                     node.role == SemanticRole::Button
-                        && node.key.as_str().starts_with("system-state/headline/")
+                        && node.key.as_str().starts_with("system-state/row/")
+                        && node.key.as_str().ends_with("/open")
                         && node.label.contains(access.name())
                 })
-                .expect("the headline names the permission this press opens")
+                .expect("the card's button names the permission this press opens")
                 .key
                 .clone();
             publish_vault_action(app, wid, view, key.as_str(), None)
         }
 
         #[test]
-        fn queued_headline_open_cannot_change_which_permission_the_person_pressed() {
+        fn a_queued_card_open_cannot_change_which_permission_the_person_pressed() {
             let (mut app, wid, view) = page(Access::FullDiskAccess);
             let old = published_open(&mut app, wid, view, Access::FullDiskAccess);
             let review = old.context;
@@ -1174,7 +1192,7 @@ mod tests {
         }
 
         #[test]
-        fn queued_headline_open_does_nothing_once_the_grant_is_in_place() {
+        fn a_queued_card_open_does_nothing_once_the_grant_is_in_place() {
             let (mut app, wid, view) = page(Access::FullDiskAccess);
             let old = published_open(&mut app, wid, view, Access::FullDiskAccess);
             app.publish_system_state(reading(None, false));
@@ -1183,7 +1201,7 @@ mod tests {
         }
 
         #[test]
-        fn queued_headline_open_keeps_its_current_permission_during_a_run() {
+        fn a_queued_card_open_keeps_its_permission_during_a_run() {
             for busy in [false, true] {
                 for access in [Access::FullDiskAccess, Access::Accessibility] {
                     let (mut app, wid, view) = page(access);
@@ -1217,6 +1235,12 @@ mod tests {
             }
             _ => {}
         }
+        // A Stop holds the changes to make: the one time Set up now is offered, in the footer
+        // (with nothing holding them they start by themselves).
+        status.run = Some(crate::InitialSetupRunPolicy {
+            revision: 1,
+            allowed: false,
+        });
         status
     }
 
@@ -1332,11 +1356,68 @@ mod tests {
     }
 
     #[test]
-    fn deferred_setup_start_runs_once_for_current_changes_and_manual_failures() {
+    fn deferred_setup_start_runs_once_for_current_changes() {
         use aterm_types::macos_setup::Standing;
         assert_deferred_setup_start(setup_start_reading(Standing::Differs), true);
-        // Once the worker stops retrying a failed step, Set up now tries it again.
-        assert_deferred_setup_start(setup_start_failed_result(false), true);
+    }
+
+    #[test]
+    fn failed_rows_publish_no_press_and_aterm_alone_runs_the_plan_again_once() {
+        // A whole Workstation-stage error publishes one error per setting: two card items that
+        // say aterm tries again by itself. The accessibility tree holds no press for either and
+        // no Set up now, and the page's own retry is one run, a minute on, however many failed.
+        use crate::system_state::SystemStateAction;
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let window = app.windows.get_mut(&wid).unwrap();
+        window.rows = 90;
+        window.cols = 160;
+        assert!(app.open_system_state_tab());
+        app.set_system_state_handlers_for_test(
+            crate::system_state_host::InitialSetupHandlers::inert_for_test(),
+        );
+        let failed = crate::system_state::fixture_status("named-results-failed").unwrap();
+        app.publish_system_state(failed);
+        let compiled = app.compiled_native_ui(wid).unwrap();
+        let items: Vec<&str> = compiled
+            .semantics
+            .iter()
+            .filter(|node| {
+                node.label
+                    .ends_with(crate::system_state::lines::TRIES_BY_ITSELF)
+            })
+            .map(|node| node.label.as_str())
+            .collect();
+        assert_eq!(items.len(), 2, "{items:?}");
+        let presses: Vec<&str> = compiled
+            .semantics
+            .iter()
+            .filter(|node| {
+                node.key.as_str().starts_with("system-state/card/")
+                    && node.role == crate::native_ui::SemanticRole::Button
+            })
+            .map(|node| node.key.as_str())
+            .collect();
+        assert!(presses.is_empty(), "{presses:?}");
+        assert!(
+            compiled
+                .semantic(&UiKey::new("system-state/headline/start"))
+                .is_none()
+        );
+        let page = app.native_runtime.system_state_mut().unwrap();
+        let now = aterm_time::Instant::now();
+        page.tick_at(now);
+        assert!(
+            page.take_action().is_none(),
+            "a failed run is not run again at once"
+        );
+        page.tick_at(now + std::time::Duration::from_secs(61));
+        assert!(matches!(
+            page.take_action(),
+            Some(SystemStateAction::Apply(..))
+        ));
+        page.tick_at(now + std::time::Duration::from_secs(62));
+        assert!(page.take_action().is_none(), "one run for both rows");
     }
 
     #[test]
@@ -1508,6 +1589,12 @@ mod tests {
                 },
             );
             let (_, view) = app.active_native_view(wid).unwrap();
+            // The worker's first read names the plan in force: until it does, no line shows an
+            // on or off to press.
+            app.publish_system_state(crate::SetupStatus {
+                plan: Some(Plan::default()),
+                ..crate::SetupStatus::default()
+            });
             let generation = app.native_runtime.view_generation(view).unwrap();
             let old_press = publish_leave(&mut app, wid, view);
 
@@ -1539,8 +1626,12 @@ mod tests {
             );
 
             let fresh = publish_leave(&mut app, wid, view);
-            app.native_runtime.tick_system_state(false, false, &[]);
-            app.native_runtime.tick_system_state(false, false, &[]);
+            // A tick answers an offer up at once (init-on-by-default design §6.1), so only the
+            // page with no offer up is ticked here.
+            if !by_offer {
+                app.native_runtime.tick_system_state();
+                app.native_runtime.tick_system_state();
+            }
             app.native_runtime.publish_system_state(crate::SetupStatus {
                 plan: Some(replacement.clone()),
                 ..crate::SetupStatus::default()
@@ -1554,10 +1645,15 @@ mod tests {
             );
             app.on_native_accessibility_action(wid, fresh.clone());
             let mut expected = replacement.clone();
-            for setting in Group::Input.settings() {
+            // The Mac settings line governs the Input and Desktop groups.
+            for setting in Group::Input
+                .settings()
+                .iter()
+                .chain(Group::Desktop.settings())
+            {
                 expected.selection.set(*setting, false);
             }
-            // The current offer's group press answers it at once, as a press on the page does
+            // The current offer's switch press answers it at once, as a press on the page does
             // with no offer up.
             assert_eq!(
                 APPLIED.with(|applied| std::mem::take(&mut *applied.borrow_mut())),
@@ -2505,79 +2601,6 @@ mod tests {
         assert!(
             pane_snug.0 > native_snug.0,
             "the terminal leaf sits right of its native sibling"
-        );
-    }
-
-    #[test]
-    fn a_native_tab_publishes_the_band_it_paints_and_its_buttons_act() {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        assert!(app.open_settings_tab(SettingsRoute::Home));
-        let id = app.post_message(
-            aterm_messages::Message::new(
-                aterm_messages::tags::TOOLCHAIN,
-                aterm_messages::Severity::Info,
-                "Toolchain ready",
-            )
-            .key("native-band")
-            .action(aterm_messages::Intent::OpenSettings {
-                route: "/packages".into(),
-            })
-            .hold(aterm_messages::Hold::Live {
-                stale_after: aterm_messages::STALE_TAILED,
-            }),
-        );
-        set_a11y_active(&mut app, wid, true);
-        assert!(app.prepare_native_input_scratch(wid));
-        let (update, published) = app
-            .take_native_accessibility_update(wid)
-            .expect("visible native leaf")
-            .expect("valid native tree");
-        let node = |id| &update.nodes.iter().find(|(node, _)| *node == id).unwrap().1;
-        let window_root = update.tree.as_ref().unwrap().root;
-        let children = node(window_root).children();
-        let band = children
-            .iter()
-            .copied()
-            .find(|child| node(*child).label() == Some("Toolchain ready"))
-            .expect("the painted band row is published");
-        let native_root = *children.last().unwrap();
-        assert!(
-            published.route_owner(native_root).is_some(),
-            "the native leaf follows the chrome: {children:?}"
-        );
-        assert!(
-            children.iter().position(|child| *child == band)
-                < children.iter().position(|child| *child == native_root),
-            "chrome reads before the tab's content"
-        );
-        assert!(
-            published.route_owner(update.focus).is_some(),
-            "with no menu or find open, focus stays on the native control"
-        );
-        let (capsule, button) = update
-            .nodes
-            .iter()
-            .find(|(_, node)| {
-                node.role() == aterm_a11y::model::Role::Button && node.label() == Some("Packages")
-            })
-            .expect("the band row's button is published");
-        assert!(node(band).children().contains(capsule));
-        app.windows.get_mut(&wid).unwrap().native_a11y_published = Some(published);
-        app.on_accessibility_action(
-            wid,
-            ActionRequest {
-                context: button.action_context(),
-                action: Action::Click,
-                target_tree: TreeId::ROOT,
-                target_node: *capsule,
-                data: None,
-            },
-        );
-        assert_eq!(
-            app.messages.live(id).unwrap().acted.map(|(index, _)| index),
-            Some(aterm_messages::ActionIndex(0)),
-            "the reader's press reaches the message"
         );
     }
 

@@ -32,6 +32,7 @@ mod keys;
 mod lifeline;
 mod machines;
 mod mint;
+mod mirror_rows;
 mod mktemp;
 mod rules;
 mod rustup_keg;
@@ -114,6 +115,7 @@ pub const GUARDS: &[Rule] = &[
     closure_anchor::CLOSURE_ANCHOR,
     rules::LICENCE_HEADER,
     generated::GENERATED_SEAL,
+    mirror_rows::MIRROR_ROWS,
     win_resources::WIN_RESOURCES,
 ];
 
@@ -306,11 +308,7 @@ impl Corpus {
         for path in paths {
             let raw = std::fs::read_to_string(&path)
                 .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-            let rel = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
+            let rel = crate::rel_path(root, &path);
             files.push(SourceFile::new(rel, raw));
         }
         let mut paths = Vec::new();

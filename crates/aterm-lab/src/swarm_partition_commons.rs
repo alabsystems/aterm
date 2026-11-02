@@ -329,12 +329,15 @@ fn bootstrap(mac: &Mac) -> Result<Bootstrap, String> {
         .map_err(|e| format!("{}: its Commons bootstrap: {e}", mac.name))
 }
 
-/// `mac`'s enrolled endpoint, or `None` while it is pending.
+/// `mac`'s enrolled endpoint, or `None` while it is pending. Every custody admission shares
+/// the same hang detector.
 fn endpoint(mac: &Mac) -> Result<Option<Endpoint>, String> {
-    let b = bootstrap(mac)?;
-    match Endpoint::from_bootstrap(&b).map_err(|e| format!("{}: {e}", mac.name))? {
+    let deadline = Instant::now() + BUSY;
+    let b = Bootstrap::required_until(&mac.paths, deadline)
+        .map_err(|e| format!("{}: its Commons bootstrap: {e}", mac.name))?;
+    match Endpoint::from_bootstrap_until(&b, deadline).map_err(|e| format!("{}: {e}", mac.name))? {
         Some(e) => e
-            .with_commons(mac.paths.clone(), mac.config.clone())
+            .with_commons_until(mac.paths.clone(), mac.config.clone(), deadline)
             .map(Some)
             .map_err(|e| format!("{}: {e}", mac.name)),
         None => Ok(None),

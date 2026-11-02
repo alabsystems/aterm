@@ -113,11 +113,7 @@ pub fn disable_feedback_survey(home: &Path) -> io::Result<()> {
         Ok(target) => home.join(target),
         Err(_) => path,
     };
-    let text = match std::fs::read_to_string(&target) {
-        Ok(text) => text,
-        Err(why) if why.kind() == io::ErrorKind::NotFound => String::new(),
-        Err(why) => return Err(why),
-    };
+    let text = super::accounts::read_bounded(&target, 1024 * 1024)?.unwrap_or_default();
     let mut doc: DocumentMut = text.parse().map_err(|why| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -246,7 +242,7 @@ fn make_link(target: &Path, at: &Path) -> io::Result<()> {
 fn make_link(_target: &Path, _at: &Path) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "an overlay home needs symbolic links",
+        "an overlay home needs symbolic links, which aterm makes only on Unix",
     ))
 }
 

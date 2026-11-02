@@ -117,9 +117,13 @@ pub(crate) fn current_release_uid() -> Result<u32, String> {
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    String::from_utf8(output.stdout)
-        .map_err(|error| format!("release user identity is not UTF-8: {error}"))?
-        .trim()
+    let raw = String::from_utf8(output.stdout)
+        .map_err(|error| format!("release user identity is not UTF-8: {error}"))?;
+    let trimmed = raw.trim();
+    if trimmed.starts_with('+') {
+        return Err("release user identity is malformed: invalid digit found in string".into());
+    }
+    trimmed
         .parse::<u32>()
         .map_err(|error| format!("release user identity is malformed: {error}"))
 }
@@ -1059,6 +1063,9 @@ pub(crate) fn build_static(
 }
 
 /// The stable `cargo check` of the x86_64 compat slice's snapshot of `commit`, its output into `log`.
+/// The slice builds with stable (the STOCK EXCEPTION), whose std refuses what Trust's allows (a
+/// `const fn` calling a method stable does not make const), so the stage step runs this first and
+/// such a tree refuses before the build after the stage.
 /// # Errors
 /// What [`Take::prepare`] refuses, no stable x86_64 std, and a check that fails (the tail of its log).
 pub(crate) fn compat_check(repo_root: &Path, commit: &str, log: &Path) -> Result<String, String> {
@@ -1865,15 +1872,19 @@ pub(crate) fn private_slice_scratch() -> Result<PathBuf, String> {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.subsec_nanos());
-    let dir = PathBuf::from(format!(
-        "/tmp/aterm-slice-probe-{}-{nanos}",
-        std::process::id()
-    ));
-    std::fs::DirBuilder::new()
-        .mode(0o700)
-        .create(&dir)
-        .map_err(|error| format!("create {}: {error}", dir.display()))?;
-    Ok(dir)
+    for _ in 0..128 {
+        let sequence = TEMP_SLICE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let dir = PathBuf::from(format!(
+            "/tmp/aterm-slice-probe-{}-{nanos}-{sequence}",
+            std::process::id()
+        ));
+        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("create {}: {error}", dir.display())),
+        }
+    }
+    Err("could not allocate a unique slice probe directory under /tmp".into())
 }
 
 /// A slice of `universal` DRIVES A SESSION.

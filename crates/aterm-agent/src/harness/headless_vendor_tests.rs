@@ -540,6 +540,62 @@ fn a_vendor_mailbox_read_takes_only_the_vendors_mail_sent_after_the_sign_in_bega
         since: Some(SINCE),
     };
     assert!(filter.admits(&item("noreply@kimi.ai")) && !filter.admits(&item("x@bank.example")));
+    assert!(filter.admits(&item(
+        "\\\"Kimi (Official) <admin@bank.example>\\\" <noreply@kimi.ai> (mailer <bounce@bank.example>)"
+    )));
+    for spoofed in [
+        "evil@bank.example (via <noreply@kimi.ai>)",
+        "<evil@bank.example> (via <noreply@kimi.ai>)",
+        "\\\"<noreply@kimi.ai>\\\"@bank.example",
+        "evil@bank.example <noreply@kimi.ai>",
+        "<evil@bank.example>, <noreply@kimi.ai>",
+        "@kimi.ai",
+        "noreply@-kimi.ai",
+    ] {
+        assert!(
+            !filter.admits(&item(spoofed)),
+            "spoofed From must be refused: {spoofed}"
+        );
+    }
+    let mixed_eol_body_smuggle = format!(
+        "Subject: Alert\n\r\nFrom: <noreply@kimi.ai>\r\nDate: {AFTER}\r\n\r\nCode 615204\r\n"
+    );
+    assert!(
+        !filter.admits(&mixed_eol_body_smuggle),
+        "blank line with mixed CRLF/LF must end header block before body lines"
+    );
+    for bad_date in [
+        "Fri, 23 Oct 2026 -01:20:00 +0000",
+        "Fri, 23 Oct 2026 23:-01:00 +0000",
+        "Fri, 23 Oct 2026 23:20:-01 +0000",
+        "Fri, 23 Oct 2026 23:20:00:00 +0000",
+        "Fri, 23 Oct 2026 23:20:00 +2500",
+        "Fri, 23 Oct 2026 23:20:00 +0060",
+        "Sun, 29 Feb 2026 23:20:00 +0000",
+        "Thu, 31 Apr 2026 23:20:00 +0000",
+        "Fri, 23 Oct -9223372036854775808 23:20:00 +0000",
+    ] {
+        assert_eq!(
+            parse_mail_date(bad_date),
+            None,
+            "invalid mail date: {bad_date}"
+        );
+    }
+    for bad_iso in [
+        "2026-10-23-01T23:20:00Z",
+        "2026-10-23T23:20:00:01Z",
+        "2026-10-23T23:20:00.Z",
+        "2026-02-29T23:20:00Z",
+        "2026-10-23T23:20:00+25:00",
+        "2026-10-23T23:20:00+02:0:0",
+    ] {
+        let bad_json =
+            format!("{{\"From\":\"noreply@kimi.ai\",\"Date\":\"{bad_iso}\",\"Text\":\"615204\"}}");
+        assert!(
+            !filter.admits(&bad_json),
+            "invalid ISO date must be refused: {bad_iso}"
+        );
+    }
 }
 
 /// Labels are per pool file, `<label>` secrets one name space: a label two pools give to
@@ -547,6 +603,13 @@ fn a_vendor_mailbox_read_takes_only_the_vendors_mail_sent_after_the_sign_in_bega
 #[test]
 fn a_label_two_pools_give_different_mailboxes_hands_its_password_to_no_other_pool() {
     let home = aterm_tempfile::tempdir().expect("tmp");
+    let kimi_toml = format!(
+        "[[account]]\nlabel = \"m16-1\"\nclass = \"dedicated\"\n\
+         email = \"personal@example.org\"\nregion = \"global\"\n\n[[account]]\n\
+         label = \"kimi-1\"\nclass = \"dedicated\"\nemail = \"kimi-box@example.net\"\n\
+         region = \"global\"\ndir = \"{}\"\n",
+        crate::harness::host_path::abs("/nonexistent/aterm-fixture/logins/kimi/kimi-1")
+    );
     for (path, text) in [
         (
             ".secrets/ai-mailbox.toml",
@@ -557,13 +620,7 @@ fn a_label_two_pools_give_different_mailboxes_hands_its_password_to_no_other_poo
             "[[account]]\nlabel = \"m16-1\"\nclass = \"dedicated\"\n\
              email = \"claude-box@example.com\"\n",
         ),
-        (
-            ".config/aterm/accounts-kimi.toml",
-            "[[account]]\nlabel = \"m16-1\"\nclass = \"dedicated\"\n\
-             email = \"personal@example.org\"\nregion = \"global\"\n\n[[account]]\n\
-             label = \"kimi-1\"\nclass = \"dedicated\"\nemail = \"kimi-box@example.net\"\n\
-             region = \"global\"\ndir = \"/nonexistent/aterm-fixture/logins/kimi/kimi-1\"\n",
-        ),
+        (".config/aterm/accounts-kimi.toml", kimi_toml.as_str()),
     ] {
         let at = home.path().join(path);
         std::fs::create_dir_all(at.parent().expect("parent")).expect("mkdir");
@@ -1011,6 +1068,19 @@ fn a_vendor_sign_in_presses_nothing_outside_the_flow_it_started() {
         ..consent(start)
     };
     assert!(matches!(vendor_step(&other_port, &gate), Step::Refuse(_)));
+    let remote_bound = FlowBound::of(
+        "https://auth.openai.com/oauth/authorize?client_id=app_CODEX\
+         &redirect_uri=https%3A%2F%2Fauth.openai.com%2Fauth%2Fcallback&state=s0",
+    )
+    .expect("remote callback flow");
+    let remote_gate = Gate {
+        bound: Some(&remote_bound),
+        ..gate
+    };
+    assert!(matches!(
+        vendor_step(&other_port, &remote_gate),
+        Step::Refuse(_)
+    ));
 
     // Negative: the started flow's own pages are pressed, and its callback ends the drive.
     assert_eq!(vendor_step(&consent(start), &gate), Step::Press(1));
@@ -2279,6 +2349,370 @@ fn claudes_headless_profile_is_claimed_for_its_authorization() {
     assert_eq!(profile_holder(&profile), None, "released after it");
 }
 
+/// A browser profile folder an automatic sign-in made and never signed in through is no profile
+/// to renew a row with: what the failed attempt wrote stays, but [`has_browser_profile`] (the
+/// ladder's `Profile::Ready`, the window's and `accounts renew`'s headless choice) does not take
+/// it, however often it fails there. CONTROLS: an authorization that reaches its callback there
+/// makes it a profile, and a later failure leaves it one; a folder no attempt of aterm's made
+/// (`accounts browser`'s, an earlier aterm's) is one already; `accounts browser`'s sign-in there
+/// ([`adopt_browser_profile`]) makes one too.
+#[cfg(unix)]
+#[test]
+fn a_profile_folder_no_sign_in_went_through_is_no_profile() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let store = tmp.path().join("accounts");
+    let (label, email) = ("fresh", Some("fresh@example.test"));
+    let fresh = resolve_browser_profile_dir(&store, Some(label), email);
+    assert!(!fresh.exists());
+    let failed = "headless browser requires sign-in, but no mailbox is configured";
+    for attempt in 1..=2 {
+        let got = with_browser_profile(Some(&store), Some(label), email, |dir| {
+            assert_eq!(dir, fresh);
+            assert_eq!(
+                std::fs::metadata(dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(dir.join(PROFILE_UNPROVEN_MARK))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            std::fs::write(dir.join("Cookies"), b"partial").expect("cookies");
+            Err(failed)
+        });
+        assert_eq!(got, Err(failed));
+        assert_eq!(
+            std::fs::read(fresh.join("Cookies")).expect("kept"),
+            b"partial"
+        );
+        assert!(
+            !has_browser_profile(&store, label, email),
+            "attempt {attempt}: a folder an automatic sign-in made and failed in is no profile"
+        );
+    }
+    assert_eq!(
+        with_browser_profile(Some(&store), Some(label), email, |_| Ok(())),
+        Ok(())
+    );
+    assert!(
+        has_browser_profile(&store, label, email),
+        "CONTROL: a sign-in that reached its callback there makes it a profile"
+    );
+    assert_eq!(
+        with_browser_profile(Some(&store), Some(label), email, |_| Err(failed)),
+        Err(failed)
+    );
+    assert!(
+        has_browser_profile(&store, label, email),
+        "CONTROL: a later failure leaves a profile a sign-in went through one"
+    );
+
+    let desk = browser_profile_dir(&store, Some("desk"));
+    std::fs::create_dir_all(&desk).expect("desk");
+    assert!(
+        has_browser_profile(&store, "desk", None),
+        "CONTROL: a folder no attempt of aterm's made is a profile"
+    );
+
+    let window = resolve_browser_profile_dir(&store, Some("window"), None);
+    assert_eq!(
+        with_browser_profile(Some(&store), Some("window"), None, |_| Err(failed)),
+        Err(failed)
+    );
+    assert!(!has_browser_profile(&store, "window", None));
+    adopt_browser_profile(&window).expect("adopt");
+    assert!(
+        has_browser_profile(&store, "window", None),
+        "CONTROL: `accounts browser`'s sign-in there makes it a profile"
+    );
+    adopt_browser_profile(&window).expect("adopting a profile twice is no error");
+}
+
+/// The injected full-device error happens after the private staging directory exists. The
+/// negative control executes the old ignored-error behavior and really publishes an unmarked
+/// failed profile; neither route fills the disk or opens a browser.
+#[cfg(unix)]
+#[test]
+fn a_profile_marker_write_failure_stops_before_publication_and_authorization() {
+    use std::cell::Cell;
+    for ignore_error in [false, true] {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let store = tmp.path().join("accounts");
+        let profile = resolve_browser_profile_dir(&store, Some("fresh"), None);
+        let writes = Cell::new(0);
+        let authorized = Cell::new(false);
+        let got = with_browser_profile_using(
+            Some(&store),
+            Some("fresh"),
+            None,
+            |dir| {
+                prepare_browser_profile_with(
+                    dir,
+                    |stage| {
+                        assert!(stage.is_dir());
+                        assert_eq!(stage.parent(), profile.parent());
+                        writes.set(writes.get() + 1);
+                        let failed: std::io::Result<()> =
+                            Err(std::io::Error::from_raw_os_error(libc::ENOSPC));
+                        if ignore_error {
+                            let _ = failed;
+                            Ok(())
+                        } else {
+                            failed
+                        }
+                    },
+                    publish_browser_profile,
+                )
+            },
+            |dir| {
+                authorized.set(true);
+                std::fs::write(dir.join("Cookies"), b"partial").unwrap();
+                Err("authorization failed")
+            },
+            |_| panic!("no authorization succeeded"),
+        );
+        assert_eq!(writes.get(), 1);
+        assert_eq!(authorized.get(), ignore_error);
+        assert_eq!(profile.exists(), ignore_error);
+        assert_eq!(has_browser_profile(&store, "fresh", None), ignore_error);
+        assert_eq!(
+            got,
+            Err(if ignore_error {
+                "authorization failed"
+            } else {
+                "could not prepare private browser profile"
+            })
+        );
+        assert!(
+            std::fs::read_dir(profile.parent().unwrap())
+                .unwrap()
+                .all(|entry| {
+                    !entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".aterm-profile-")
+                })
+        );
+    }
+}
+
+/// A pauses after staging, B publishes and finishes authorization, then A publishes. The
+/// negative control executes the old delayed marker write against B before the lock attempt.
+#[cfg(unix)]
+#[test]
+fn a_delayed_profile_creator_cannot_remark_or_replace_the_successful_winner() {
+    use std::cell::Cell;
+    use std::os::unix::fs::MetadataExt as _;
+    for remark_winner in [false, true] {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let store = tmp.path().join("accounts");
+        let profile = resolve_browser_profile_dir(&store, Some("raced"), None);
+        let winner = Cell::new(None);
+        let published = Cell::new(false);
+        let got = with_browser_profile_using(
+            Some(&store),
+            Some("raced"),
+            None,
+            |dir| {
+                prepare_browser_profile_with(dir, write_profile_unproven, |stage, target| {
+                    assert_eq!(stage.parent(), target.parent());
+                    assert!(stage.join(PROFILE_UNPROVEN_MARK).is_file());
+                    assert!(!target.exists());
+                    with_browser_profile(Some(&store), Some("raced"), None, |dir| {
+                        std::fs::write(dir.join("Cookies"), b"winner").unwrap();
+                        Ok(())
+                    })
+                    .unwrap();
+                    assert!(has_browser_profile(&store, "raced", None));
+                    let metadata = std::fs::metadata(target).unwrap();
+                    winner.set(Some((metadata.dev(), metadata.ino(), metadata.mode())));
+                    if remark_winner {
+                        write_profile_unproven(target).unwrap();
+                    }
+                    let refused = publish_browser_profile(stage, target);
+                    assert_eq!(
+                        refused.as_ref().unwrap_err().kind(),
+                        std::io::ErrorKind::AlreadyExists
+                    );
+                    published.set(true);
+                    refused
+                })
+            },
+            |dir| {
+                assert!(published.get());
+                assert_eq!(dir, profile);
+                assert_eq!(std::fs::read(dir.join("Cookies")).unwrap(), b"winner");
+                Err("later authorization failed")
+            },
+            |_| panic!("later authorization failed"),
+        );
+        assert_eq!(got, Err("later authorization failed"));
+        let metadata = std::fs::metadata(&profile).unwrap();
+        assert_eq!(
+            winner.get(),
+            Some((metadata.dev(), metadata.ino(), metadata.mode()))
+        );
+        assert_eq!(std::fs::read(profile.join("Cookies")).unwrap(), b"winner");
+        assert_eq!(has_browser_profile(&store, "raced", None), !remark_winner);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn successful_authorization_survives_and_reports_profile_adoption_failure() {
+    use std::cell::RefCell;
+    for obstruct in [false, true] {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let store = tmp.path().join("accounts");
+        let reported = RefCell::new(None);
+        let got = with_browser_profile_using(
+            Some(&store),
+            Some("success"),
+            None,
+            prepare_browser_profile,
+            |dir| {
+                std::fs::write(dir.join("Cookies"), b"authorized").unwrap();
+                if obstruct {
+                    std::fs::remove_file(dir.join(PROFILE_UNPROVEN_MARK)).unwrap();
+                    std::fs::create_dir(dir.join(PROFILE_UNPROVEN_MARK)).unwrap();
+                }
+                Ok(())
+            },
+            |e| *reported.borrow_mut() = Some(e.kind()),
+        );
+        assert_eq!(got, Ok(()), "metadata failure must not undo authorization");
+        assert_eq!(reported.borrow().is_some(), obstruct);
+        assert_eq!(has_browser_profile(&store, "success", None), !obstruct);
+        let profile = resolve_browser_profile_dir(&store, Some("success"), None);
+        assert_eq!(
+            std::fs::read(profile.join("Cookies")).unwrap(),
+            b"authorized"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unproven_marker_link_neither_proves_a_profile_nor_overwrites_its_target() {
+    use std::os::unix::fs::symlink;
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let store = tmp.path().join("accounts");
+    let profile = resolve_browser_profile_dir(&store, Some("legacy"), None);
+    std::fs::create_dir_all(&profile).unwrap();
+    assert!(has_browser_profile(&store, "legacy", None));
+    let outside = tmp.path().join("outside");
+    symlink(&outside, profile.join(PROFILE_UNPROVEN_MARK)).unwrap();
+    assert!(!has_browser_profile(&store, "legacy", None));
+    assert!(write_profile_unproven(&profile).is_err());
+    assert!(!outside.exists());
+    adopt_browser_profile(&profile).unwrap();
+    assert!(has_browser_profile(&store, "legacy", None));
+    assert!(!outside.exists());
+}
+
+/// A message whose every code a sign-in used is marked in the Maildir's root, never beside it in
+/// `new/` or `cur/`, where a mail client or server reads every file as a message. CONTROLS: the
+/// mark holds, so the next read takes the message again neither where it lies nor once a client
+/// moved it to `cur/` with its flags; a mark an earlier aterm left beside a message in `new/` is
+/// still honoured.
+#[test]
+fn a_used_messages_mark_stays_out_of_the_maildirs_message_folders() {
+    let listed = |dir: &Path| -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("list")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    let target = Some("user@example.test");
+    let mail = "To: <user@example.test>\r\n\r\nYour verification code: 778899";
+    let (_tmp, maildir) = maildir_with(&[("1700000000.1_1.host", mail)]);
+    std::fs::create_dir_all(maildir.join("cur")).expect("cur");
+    // No seen file: the mark alone keeps a used message from being taken again.
+    let only_marks = |dir: &Path| MailboxConfig {
+        dir: Some(dir.to_path_buf()),
+        ..MailboxConfig::default()
+    };
+    let cfg = only_marks(&maildir);
+    assert_eq!(
+        poll_mailbox_config_for_credential(&cfg, target, Duration::from_secs(60)),
+        Ok(MailboxCredential::Otp("778899".to_owned()))
+    );
+    assert_eq!(
+        listed(&maildir.join("new")),
+        ["1700000000.1_1.host"],
+        "new/ holds the message alone"
+    );
+    assert!(
+        listed(&maildir.join("cur")).is_empty(),
+        "cur/ holds nothing"
+    );
+    assert!(maildir.join("1700000000.1_1.host.clicked").is_file());
+    let timed_out = Err("timed out waiting for verification email in mailbox");
+    assert_eq!(
+        poll_mailbox_config_for_credential(&cfg, target, Duration::ZERO),
+        timed_out,
+        "CONTROL: the root's mark holds where the message lies"
+    );
+    std::fs::rename(
+        maildir.join("new").join("1700000000.1_1.host"),
+        maildir.join("cur").join("1700000000.1_1.host:2,S"),
+    )
+    .expect("a client reads it");
+    assert_eq!(
+        poll_mailbox_config_for_credential(&cfg, target, Duration::ZERO),
+        timed_out,
+        "CONTROL: and once a client moved it to cur/ with its flags"
+    );
+
+    let (_tmp, earlier) = maildir_with(&[("1700000001.2_1.host", mail)]);
+    std::fs::write(
+        earlier.join("new").join("1700000001.2_1.host.clicked"),
+        "1\n",
+    )
+    .expect("mark");
+    assert_eq!(
+        poll_mailbox_config_for_credential(&only_marks(&earlier), target, Duration::ZERO),
+        timed_out,
+        "CONTROL: an earlier aterm's mark beside the message holds"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_maildir_root_marker_write_does_not_follow_a_dangling_link() {
+    use std::os::unix::fs::symlink;
+    let (tmp, maildir) = maildir_with(&[(
+        "1.host",
+        "To: user@example.test\r\n\r\nYour verification code: 778899",
+    )]);
+    let outside = tmp.path().join("outside");
+    let marker = maildir.join("1.host.clicked");
+    symlink(&outside, &marker).unwrap();
+    let config = MailboxConfig {
+        dir: Some(maildir.clone()),
+        ..Default::default()
+    };
+    assert_eq!(
+        poll_mailbox_config_for_credential(&config, Some("user@example.test"), Duration::ZERO),
+        Ok(MailboxCredential::Otp("778899".into()))
+    );
+    assert!(!outside.exists());
+    assert!(
+        std::fs::symlink_metadata(marker)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(!maildir.join("new/1.host.clicked").exists());
+}
+
 #[test]
 fn plus_addressed_mail_with_base_delivered_to_and_json_vendor_filters() {
     // 1. Plus-addressed mail (`To: owner+2@example.com`) delivered into the base mailbox
@@ -3486,9 +3920,11 @@ fn the_headless_launch_hides_nothing_from_a_bot_check() {
             path: PathBuf::from("/opt/chrome-headless-shell"),
             is_headless_shell,
         };
+        // Linux's root alone adds `--no-sandbox`, which Chromium requires there.
         let args: Vec<String> = headless_launch_args(&browser, profile)
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
+            .filter(|a| a != "--no-sandbox")
             .collect();
         let want: Vec<&str> = lead.iter().chain(tail.iter()).copied().collect();
         assert_eq!(args, want);

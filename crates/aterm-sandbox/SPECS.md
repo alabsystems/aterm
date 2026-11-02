@@ -21,37 +21,34 @@ Gap numbers are the rows of `docs/AUDIT-trust-for-test-migration-2026-10-15.md` 
 
 ## 0. Notation used in the statements
 
-- `Gate(cap)` := `aterm_cap::require(cap, Tier::Trusted)`, which is `cap.satisfies(Tier::Trusted)`
-  (tier ≥ Trusted in the `Tier` order).
+- `Gate(cap)` := `aterm_cap::require(cap, Tier::Trusted)` is `Ok`, i.e. `cap.satisfies(Tier::Trusted)`.
 - `Fields(l)` := the four POSIX pairs, in order:
   `[(RLIMIT_CPU, l.cpu_seconds), (RLIMIT_AS, l.address_space), (RLIMIT_FSIZE, l.file_size),
   (RLIMIT_NOFILE, l.open_files)]`. `active_processes` and `restrict_ui` have no effect on POSIX.
-- `RL`: an abstract OS rlimit state, `resource -> (soft, hard)`. `getrlimit`/`setrlimit` are modelled
-  as a platform spec (gap 8): `setrlimit(r,(s,h))` succeeds only if `s ≤ h` and
-  (`h ≤ old hard` or the caller is privileged). Otherwise it leaves `RL` unchanged. An unprivileged
-  caller can never raise `hard`.
+- `RL`: an abstract OS rlimit state, `resource -> (soft, hard)`, under a platform spec (gap 8):
+  `setrlimit(r,(s,h))` succeeds only if `s ≤ h` and (`h ≤ old hard` or the caller is
+  privileged), and otherwise leaves `RL` unchanged.
 - `Eff(call)`: the ordered trace of syscalls a call issues (`getrlimit`/`setrlimit`, or
   `QueryInformationJobObject`/`SetInformationJobObject`). "No effect" means `Eff = []`.
 - `JobInfo`: the `repr(C)` `JobObjectExtendedLimitInformation`.
-- `Fold(I, l)` := `I` with these changes:
+- `Fold(I, l)` := `I` with these changes, every other field unchanged:
   - `ProcessMemoryLimit := usize::try_from(as).unwrap_or(usize::MAX)` if `l.address_space = Some(as)`;
   - `PerProcessUserTimeLimit := i64::try_from(s).unwrap_or(i64::MAX).saturating_mul(10_000_000)` if
     `l.cpu_seconds = Some(s)`;
   - `ActiveProcessLimit := m` if `l.active_processes = Some(m)`;
-  - `LimitFlags := I.LimitFlags | (MEM if as set) | (TIME if cpu set) | (ACTIVE if active set)`;
-  - every other field is unchanged.
+  - `LimitFlags := I.LimitFlags | (MEM if as set) | (TIME if cpu set) | (ACTIVE if active set)`.
 
-  **Recommendation:** factor `Fold` out of `windows::apply_to_job` as a pure function. That gives
-  the effect lane a pure core to wrap, and `sandbox-job-fold` can then be proved before gap 8 closes.
+  `apply_to_job` computes `Fold` inline; factored out as a pure function, `sandbox-job-fold`
+  can be proved before gap 8 closes.
 - `HARDENED_UI` := `0x02|0x04|0x08|0x10|0x20|0x40|0x80` = `0xFE`.
-- Per-target: specs about `cfg` arms are proved once per arm (unix with macOS / non-macOS, and windows).
-  The Windows specs need a Windows-target Trust build.
+- Per target: a spec about `cfg` arms is proved once per arm (unix with macOS / non-macOS, and
+  windows). The Windows specs, and the `cfg(windows)` tests they retire, need a Windows-target
+  Trust build; a macOS run executes none of those tests.
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes (primary tests; secondary in §2)`,
-`difficulty (Rust features the proof must handle)`, `blocking_gaps` (audit §7). Gap 0, the installed
-seal that publishes no Lean-discharged row, blocks every row, so it is listed on each one.
+Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (primary tests; secondary in §2),
+`difficulty` (Rust features the proof must handle), `blocking_gaps` (audit §7).
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
@@ -119,7 +116,7 @@ src/windows.rs	shell_default_hardens_the_job	sandbox-job-write-protocol	sandbox-
 src/windows.rs	apply_to_job_fails_closed_on_invalid_handle	sandbox-job-write-protocol	sandbox-apply-cap-gate
 ```
 
-## 3. Coverage
+## 3. Implied specs that look wrong, or disagree with the code
 
 - 17 live tests mapped across the 8 specs. None is a non-spec test (§4).
 - 9 of the 17 tests are `cfg(windows)` (8 in `windows.rs`, plus `lib.rs::windows_apply_is_a_capgated_noop`),

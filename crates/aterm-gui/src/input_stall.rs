@@ -365,24 +365,10 @@ pub(crate) fn pid_stopped(pid: libc::pid_t) -> Option<bool> {
     Some(info.pbi_status == SSTOP)
 }
 
-#[cfg(target_os = "macos")]
-#[repr(C)]
-struct ProcTaskInfo {
-    _virtual_size: u64,
-    resident_size: u64,
-    total_user: u64,
-    total_system: u64,
-    _threads_times: [u64; 2],
-    _counters: [i32; 12],
-}
-
-#[cfg(target_os = "macos")]
-const _: () = assert!(std::mem::size_of::<ProcTaskInfo>() == 96);
-
 /// `pid`'s resident set in MiB from `proc_pidinfo(PROC_PIDTASKINFO)`, read only when the kernel wrote exactly one whole record.
 #[cfg(target_os = "macos")]
 pub(crate) fn pid_rss_mb(pid: libc::pid_t) -> Option<u64> {
-    pid_task_info(pid).map(|info| info.resident_size / (1024 * 1024))
+    pid_task_info(pid).map(|info| info.pti_resident_size / (1024 * 1024))
 }
 
 /// `pid`'s total CPU time, user plus system, in nanoseconds.
@@ -390,18 +376,20 @@ pub(crate) fn pid_rss_mb(pid: libc::pid_t) -> Option<u64> {
 pub(crate) fn pid_cpu_ns(pid: libc::pid_t) -> Option<u64> {
     let (numer, denom) = aterm_sysprobe::procs::kernel_timebase()?;
     let info = pid_task_info(pid)?;
-    let ticks = u128::from(info.total_user) + u128::from(info.total_system);
+    let ticks = u128::from(info.pti_total_user) + u128::from(info.pti_total_system);
     u64::try_from(ticks * u128::from(numer) / u128::from(denom)).ok()
 }
 
+/// `pid`'s `proc_pidinfo(PROC_PIDTASKINFO)` record, read only when the kernel wrote exactly one
+/// whole record.
 #[cfg(target_os = "macos")]
-fn pid_task_info(pid: libc::pid_t) -> Option<ProcTaskInfo> {
+pub(crate) fn pid_task_info(pid: libc::pid_t) -> Option<libc::proc_taskinfo> {
     const PROC_PIDTASKINFO: libc::c_int = 4;
     if pid <= 0 {
         return None;
     }
-    let mut info = std::mem::MaybeUninit::<ProcTaskInfo>::uninit();
-    let size = i32::try_from(std::mem::size_of::<ProcTaskInfo>()).ok()?;
+    let mut info = std::mem::MaybeUninit::<libc::proc_taskinfo>::uninit();
+    let size = i32::try_from(std::mem::size_of::<libc::proc_taskinfo>()).ok()?;
     // SAFETY: `info` points to `size` writable bytes for `PROC_PIDTASKINFO`.
     let read =
         unsafe { libc::proc_pidinfo(pid, PROC_PIDTASKINFO, 0, info.as_mut_ptr().cast(), size) };
@@ -1117,7 +1105,7 @@ pub(crate) fn host_hand_refusal(ctx: &crate::SessionCtx, now_us: u64) -> Option<
     }
 }
 
-/// [`attention_text`] at `now`, with the zone read here.
+/// [`attention_text`] at `now`, with the zone read at `fact.since_unix`.
 pub(crate) fn attention_now(
     fact: &InputStallFact,
     program: Option<&str>,
@@ -1125,9 +1113,27 @@ pub(crate) fn attention_now(
     sid: &str,
     now: Instant,
 ) -> String {
+    attention_now_local(
+        fact,
+        program,
+        after,
+        sid,
+        now,
+        &crate::presence::local_offset_at,
+    )
+}
+
+pub(crate) fn attention_now_local(
+    fact: &InputStallFact,
+    program: Option<&str>,
+    after: &AfterRestart,
+    sid: &str,
+    now: Instant,
+    offset_at: &dyn Fn(i64) -> Option<i64>,
+) -> String {
     let clock = fact
         .since_unix
-        .and_then(|since_unix| since_hhmm(since_unix, crate::presence::local_offset_s()));
+        .and_then(|since_unix| since_hhmm(since_unix, offset_at(since_unix)));
     attention_text(
         fact,
         program,
@@ -2536,6 +2542,36 @@ pub(crate) mod tests {
             (before - 90..=after - 90).contains(&stamped),
             "{stamped} in {before}..={after}, 90 s back"
         );
+        // 2026-10-31 23:30 PDT (-7 h) read across the 2026-11-01 09:00Z fall-back into PST (-8 h).
+        let (pdt, pst, fall_back) = (-7 * 3600, -8 * 3600, 1_793_523_600);
+        let pre_dst = 1_793_514_600;
+        let mut fact = stalled(now.checked_sub(Duration::from_secs(3600)).unwrap_or(now));
+        fact.since_unix = Some(pre_dst);
+        let dst = attention_now_local(
+            &fact,
+            Some("claude"),
+            &AfterRestart::Unknown,
+            "s-1",
+            now,
+            &|t| Some(if t < fall_back { pdt } else { pst }),
+        );
+        let flat = attention_now_local(
+            &fact,
+            Some("claude"),
+            &AfterRestart::Unknown,
+            "s-1",
+            now,
+            &|_| Some(pst),
+        );
+        assert!(dst.contains("since 23:30"), "{dst}");
+        assert!(flat.contains("since 22:30"), "NEGATIVE CONTROL: {flat}");
+        assert_eq!(
+            crate::status_item::clock_words_local(pre_dst, &|t| {
+                Some(if t < fall_back { pdt } else { pst })
+            })
+            .as_deref(),
+            Some("23:30")
+        );
     }
 
     #[test]
@@ -3593,7 +3629,7 @@ pub(crate) mod tests {
                     "{refused}"
                 );
             }
-            let reply = crate::control::cmd_signal(master, "term", &sink, None);
+            let reply = crate::control::cmd_signal(master, "term", &sink, None, None);
             let dropped = if flush_first { "" } else { " discarded=1" };
             assert_eq!(reply, format!("OK signalled pgrp {leader}{dropped}\n"));
             assert_eq!(sink.restart_discards(), 1, "the restart is marked");
@@ -3642,7 +3678,7 @@ pub(crate) mod tests {
             let refused = refusal(&ctx, "send", "claude --continue", false).expect("refused");
             assert!(refused.contains("; end it: signal kill)"), "{refused}");
 
-            let reply = crate::control::cmd_signal(master, "kill", &sink, None);
+            let reply = crate::control::cmd_signal(master, "kill", &sink, None, None);
             assert_eq!(reply, format!("OK signalled pgrp {leader}\n"));
             let _ = job.0.wait();
             assert_eq!(
@@ -3717,7 +3753,7 @@ pub(crate) mod tests {
         };
         app.publish_input_stall(78, &ctx, Some(fact), t0);
 
-        let reply = crate::control::cmd_signal(master, "term", &sink, None);
+        let reply = crate::control::cmd_signal(master, "term", &sink, None, None);
         assert_eq!(reply, format!("OK signalled pgrp {leader} discarded=1\n"));
         assert!(
             app.observe_input_stalls(t0 + Duration::from_millis(300), Some(78))

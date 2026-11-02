@@ -13,6 +13,8 @@ use crate::stats_deck::DeckGeom;
 use crate::stats_paint::{Hit, HitKind, Painter, panel};
 use crate::widget::{DrawPrim, rgba};
 
+mod repair;
+
 /// Fixed headroom, independent of the number or state of peers.
 pub(crate) const HEIGHT_PT: f64 = 30.0;
 
@@ -120,9 +122,64 @@ pub(crate) fn fresh_snapshot(
     std::sync::Arc::new(expired)
 }
 
+/// A busy composition read supplies no new evidence. Keep known records and their
+/// original times, but withhold current claims until the producer can be read again.
+/// The producer's next publication applies its original monotonic expiry lease.
+pub(crate) fn snapshot_after_read(
+    publication: Option<std::sync::Arc<NetworkStateSnapshot>>,
+    retained: &std::sync::Arc<NetworkStateSnapshot>,
+    busy: &mut bool,
+    now_ms: Option<u64>,
+) -> std::sync::Arc<NetworkStateSnapshot> {
+    if let Some(publication) = publication {
+        *busy = false;
+        return fresh_snapshot(publication, now_ms);
+    }
+    if *busy {
+        return retained.clone();
+    }
+    *busy = true;
+    let mut snapshot = retained.as_ref().clone();
+    snapshot.network.visibility = Visibility::Unavailable;
+    snapshot.network.detail = if snapshot.network.detail.is_empty() {
+        "Network State reader is busy; current reachability is unknown".into()
+    } else {
+        format!(
+            "Network State reader is busy; current reachability is unknown. Last observation: {}",
+            snapshot.network.detail
+        )
+    };
+    for peer in &mut snapshot.network.peers {
+        peer.reachability = Reachability::Unknown;
+    }
+    for service in [
+        &mut snapshot.services.accounts,
+        &mut snapshot.services.secrets,
+    ] {
+        service.detail = if service.availability == ServiceAvailability::Unknown
+            && service.detail.is_empty()
+        {
+            "Network State reader is busy; current access is unknown".into()
+        } else {
+            format!(
+                "Network State reader is busy; current access is unknown. Last observed {:?}: {}",
+                service.availability, service.detail
+            )
+        };
+        service.availability = ServiceAvailability::Unknown;
+    }
+    std::sync::Arc::new(snapshot)
+}
+
 impl crate::App {
     pub(crate) fn network_state_deadline(&self) -> Option<std::time::Instant> {
         self.network_source.as_ref()?;
+        if self.lab_page_shown() {
+            return Some(
+                self.network_next_poll
+                    .unwrap_or_else(std::time::Instant::now),
+            );
+        }
         let deck_shown = self.stats_bars_form() == crate::stats_deck::StatsBars::Deck;
         self.windows
             .values()
@@ -147,11 +204,19 @@ impl crate::App {
         let Some(read) = self.network_source.as_ref() else {
             return;
         };
-        let snapshot = fresh_snapshot(read(), aterm_time::unix_millis());
+        let snapshot = snapshot_after_read(
+            read(),
+            &self.network_snapshot,
+            &mut self.network_source_busy,
+            aterm_time::unix_millis(),
+        );
         if snapshot.as_ref() == self.network_snapshot.as_ref() {
             return;
         }
         self.network_snapshot = snapshot;
+        if self.lab_page_shown() {
+            self.publish_native_lab_state();
+        }
         let deck_shown = self.stats_bars_form() == crate::stats_deck::StatsBars::Deck;
         let windows: Vec<_> = self
             .windows
@@ -210,7 +275,9 @@ fn observation_time(at_ms: u64) -> String {
 
 pub(crate) fn summary(snapshot: &NetworkStateSnapshot) -> String {
     let mut text = status_summary(snapshot);
-    if snapshot.network.visibility != Visibility::Active && !snapshot.network.peers.is_empty() {
+    if network_status(snapshot) != NetworkStatus::Visibility(Visibility::Active)
+        && !snapshot.network.peers.is_empty()
+    {
         text.push_str(&format!(" · {} known", snapshot.network.peers.len()));
     }
     if snapshot.network.retention_limited {
@@ -219,24 +286,37 @@ pub(crate) fn summary(snapshot: &NetworkStateSnapshot) -> String {
     text
 }
 
-fn status_summary(snapshot: &NetworkStateSnapshot) -> String {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NetworkStatus {
+    Visibility(Visibility),
+    HistoryUnavailable,
+    HistoryRestoring,
+}
+
+fn network_status(snapshot: &NetworkStateSnapshot) -> NetworkStatus {
     let network = &snapshot.network;
     if network.visibility == Visibility::Unavailable {
-        return "Network visibility unavailable".into();
+        NetworkStatus::Visibility(Visibility::Unavailable)
+    } else {
+        match network.history {
+            HistoryState::Unavailable => NetworkStatus::HistoryUnavailable,
+            HistoryState::Restoring => NetworkStatus::HistoryRestoring,
+            HistoryState::Ready => NetworkStatus::Visibility(network.visibility),
+        }
     }
-    if network.history == HistoryState::Unavailable {
-        return "Network history unavailable".into();
-    }
-    if network.history == HistoryState::Restoring {
-        return "Restoring network history".into();
-    }
+}
+
+fn status_summary(snapshot: &NetworkStateSnapshot) -> String {
+    let network = &snapshot.network;
     let reachable = network
         .peers
         .iter()
         .filter(|p| p.reachability == Reachability::Reachable)
         .count();
-    match network.visibility {
-        Visibility::Active => format!(
+    match network_status(snapshot) {
+        NetworkStatus::HistoryUnavailable => "Network history unavailable".into(),
+        NetworkStatus::HistoryRestoring => "Restoring network history".into(),
+        NetworkStatus::Visibility(Visibility::Active) => format!(
             "{reachable} reachable · {} known{}",
             network.peers.len(),
             if network.via_local_process.is_some() {
@@ -245,11 +325,15 @@ fn status_summary(snapshot: &NetworkStateSnapshot) -> String {
                 ""
             },
         ),
-        Visibility::Checking => "Checking network".into(),
-        Visibility::Offline => "Network offline · history retained".into(),
-        Visibility::Disabled => "Network visibility off".into(),
-        Visibility::Waiting => "Waiting for network observer".into(),
-        Visibility::Unavailable => "Network visibility unavailable".into(),
+        NetworkStatus::Visibility(Visibility::Checking) => "Checking network".into(),
+        NetworkStatus::Visibility(Visibility::Offline) => {
+            "Network offline · history retained".into()
+        }
+        NetworkStatus::Visibility(Visibility::Disabled) => "Network visibility off".into(),
+        NetworkStatus::Visibility(Visibility::Waiting) => "Waiting for network observer".into(),
+        NetworkStatus::Visibility(Visibility::Unavailable) => {
+            "Network visibility unavailable".into()
+        }
     }
 }
 
@@ -323,6 +407,28 @@ pub(crate) fn details(snapshot: &NetworkStateSnapshot, target: Target) -> Vec<(S
                         observation_time(peer.last_seen_ms)
                     ),
                 ));
+                rows.extend(repair::details(peer.last_repair.as_ref()));
+                rows.push((
+                    "Last outbound".into(),
+                    peer.last_authenticated_endpoint.as_ref().map_or_else(
+                        || "Not observed; older or inbound-only history".into(),
+                        |endpoint| {
+                            format!(
+                                "{} · authenticated {} (historical)",
+                                endpoint.address,
+                                observation_time(endpoint.observed_at_ms)
+                            )
+                        },
+                    ),
+                ));
+                rows.push((
+                    "Machine UUID".into(),
+                    aterm_codec::hex::encode_lower(&peer.identity.machine_id),
+                ));
+                rows.push((
+                    "Incarnation".into(),
+                    aterm_codec::hex::encode_lower(&peer.identity.incarnation),
+                ));
                 rows.push((
                     "Instances".into(),
                     peer.instances.map_or_else(
@@ -358,8 +464,8 @@ pub(crate) fn details(snapshot: &NetworkStateSnapshot, target: Target) -> Vec<(S
                 network.unverified_endpoints
             ),
         )),
-        Target::Accounts => rows.extend(account_service_details(&snapshot.services.accounts)),
-        Target::Secrets => rows.extend(service_details("Secrets", &snapshot.services.secrets)),
+        Target::Accounts => rows.extend(account_service_details(snapshot)),
+        Target::Secrets => rows.extend(secret_service_details(&snapshot.services.secrets)),
         Target::Overview => {
             rows.push((
                 "History".into(),
@@ -369,13 +475,13 @@ pub(crate) fn details(snapshot: &NetworkStateSnapshot, target: Target) -> Vec<(S
                     network.history
                 ),
             ));
-            rows.extend(account_service_details(&snapshot.services.accounts));
-            rows.extend(service_details("Secrets", &snapshot.services.secrets));
+            rows.extend(account_service_details(snapshot));
+            rows.extend(secret_service_details(&snapshot.services.secrets));
         }
     }
-    if matches!(target, Target::Accounts | Target::Secrets) {
-        // The selected service is the first detail the lens must keep when
-        // its height is constrained. General network context comes after it.
+    if matches!(target, Target::Peer(_) | Target::Accounts | Target::Secrets) {
+        // Keep the selected peer's evidence or service status before general
+        // network context when the lens has limited height.
         rows.rotate_left(context_rows);
     }
     if !observer_first && !network.detail.is_empty() {
@@ -390,12 +496,111 @@ pub(crate) fn details(snapshot: &NetworkStateSnapshot, target: Target) -> Vec<(S
     rows
 }
 
-fn account_service_details(service: &ServiceState) -> Vec<(String, String)> {
-    let mut rows = service_details("Commons account catalog", service);
+fn account_service_details(snapshot: &NetworkStateSnapshot) -> Vec<(String, String)> {
+    let mut rows = service_details("Commons account catalog", &snapshot.services.accounts);
     rows.insert(1, (
         "Scope".into(),
         "Shared account proposals in Commons. Harness rosters and provider sign-in are tracked separately.".into(),
     ));
+    match &snapshot.network.accounts_exchange {
+        Some(exchange) => {
+            rows.push((
+                "Peer inventory".into(),
+                format!(
+                    "{} retained operation IDs reported matching by {} during an authenticated exchange",
+                    exchange.inventory_count,
+                    machine_name(&exchange.peer),
+                ),
+            ));
+            rows.push((
+                "Peer inventory sampled".into(),
+                observation_time(exchange.sampled_at_ms),
+            ));
+            rows.push((
+                "Inventory scope".into(),
+                "Historical account-proposal IDs only. Current contents, conflict resolution, credentials, provider sign-in and quotas are not established by this observation.".into(),
+            ));
+        }
+        None => rows.push((
+            "Peer inventory".into(),
+            "No retained observation of an authenticated matching account-proposal inventory"
+                .into(),
+        )),
+    }
+    rows
+}
+
+fn secret_service_details(service: &ServiceState) -> Vec<(String, String)> {
+    let mut rows = service_details("Secrets", service);
+    if let Some(refresh) = service.network_refresh {
+        let outcome = match refresh.outcome {
+            aterm_types::network_state::VaultNetworkRefreshOutcome::Succeeded => "Completed",
+            aterm_types::network_state::VaultNetworkRefreshOutcome::Failed => "Failed",
+        };
+        rows.insert(1, ("Recorded network refresh".into(), outcome.into()));
+        rows.insert(
+            2,
+            (
+                "Refresh completed".into(),
+                observation_time(refresh.completed_at_ms),
+            ),
+        );
+        rows.insert(3, (
+            "Refresh scope".into(),
+            "Last retained outcome for this source. Cache availability and provider sign-in are separate.".into(),
+        ));
+    }
+    match service.network_materialization {
+        Some(receipt) => {
+            let route = match receipt.source {
+                aterm_types::network_state::VaultNetworkSource::ConfiguredUrl => "configured route",
+                aterm_types::network_state::VaultNetworkSource::PeerUrl => "peer route",
+            };
+            rows.push((
+                "Network sync".into(),
+                format!(
+                    "Signed vault version {} received via {route}; local vault checks passed",
+                    receipt.sequence,
+                ),
+            ));
+            rows.push((
+                "Network fetch started".into(),
+                observation_time(receipt.sampled_at_ms),
+            ));
+            rows.push((
+                "Network sync scope".into(),
+                "Historical receipt for the observed local version. Newer data elsewhere, other machines' state and provider sign-in are not established.".into(),
+            ));
+        }
+        None => rows.push((
+            "Network sync".into(),
+            "No verified network receipt is available in this observation".into(),
+        )),
+    }
+    match service.http204_response {
+        Some(response) => {
+            let route = match response.source {
+                aterm_types::network_state::VaultNetworkSource::ConfiguredUrl => "Configured route",
+                aterm_types::network_state::VaultNetworkSource::PeerUrl => "Peer route",
+            };
+            rows.push((
+                "Retained HTTP 204".into(),
+                format!("{route} answered HTTP 204"),
+            ));
+            rows.push((
+                "Response received".into(),
+                observation_time(response.responded_at_ms),
+            ));
+            rows.push((
+                "Response scope".into(),
+                "Historical unsigned HTTP status only. Vault contents, local access, newer data elsewhere and provider sign-in are not established.".into(),
+            ));
+        }
+        None => rows.push((
+            "Retained HTTP 204".into(),
+            "No retained HTTP 204 response is available in this observation".into(),
+        )),
+    }
     rows
 }
 
@@ -576,7 +781,7 @@ pub(crate) fn paint_with_inks(
         },
         inks.aterm,
         Target::Local,
-        snapshot.network.retention_limited,
+        snapshot.network.retention_limited || snapshot.network.history == HistoryState::Unavailable,
     );
     let available = (g.w - cell_x - 95.0 * scale).max(0.0);
     let slots = (available / (14.0 * scale)) as usize;
@@ -619,8 +824,12 @@ pub(crate) fn paint_with_inks(
         );
     }
     if next_x + 90.0 * scale < g.w {
-        let mut text = match snapshot.network.visibility {
-            Visibility::Active => format!(
+        let status = network_status(snapshot);
+        let room = g.w - next_x - 20.0 * scale;
+        let mut text = match status {
+            NetworkStatus::HistoryUnavailable => "History unavailable".into(),
+            NetworkStatus::HistoryRestoring => "Restoring history".into(),
+            NetworkStatus::Visibility(Visibility::Active) => format!(
                 "{} reachable",
                 snapshot
                     .network
@@ -629,42 +838,50 @@ pub(crate) fn paint_with_inks(
                     .filter(|p| p.reachability == Reachability::Reachable)
                     .count()
             ),
-            Visibility::Checking => "Checking".into(),
-            Visibility::Offline => "Offline".into(),
-            Visibility::Disabled => "Off".into(),
-            Visibility::Waiting => "Waiting".into(),
-            Visibility::Unavailable => "Unavailable".into(),
+            NetworkStatus::Visibility(Visibility::Checking) => "Checking".into(),
+            NetworkStatus::Visibility(Visibility::Offline) => "Offline".into(),
+            NetworkStatus::Visibility(Visibility::Disabled) => "Off".into(),
+            NetworkStatus::Visibility(Visibility::Waiting) => "Waiting".into(),
+            NetworkStatus::Visibility(Visibility::Unavailable) => "Unavailable".into(),
         };
-        if snapshot.network.visibility == Visibility::Active
+        if p.ui_text_w(&text, false) > room {
+            text = match status {
+                NetworkStatus::HistoryUnavailable => "History error".into(),
+                NetworkStatus::HistoryRestoring => "Restoring".into(),
+                _ => text,
+            };
+        }
+        if status == NetworkStatus::Visibility(Visibility::Active)
             && snapshot.network.via_local_process.is_some()
         {
             let full = format!("{text} · via local aterm");
-            let room = g.w - next_x - 20.0 * scale;
             text = if p.ui_text_w(&full, false) <= room {
                 full
             } else {
                 "via aterm".into()
             };
         }
-        if snapshot.network.visibility != Visibility::Active && !peers.is_empty() {
+        if status != NetworkStatus::Visibility(Visibility::Active) && !peers.is_empty() {
             let known = format!("{text} · {} known", peers.len());
-            if p.ui_text_w(&known, false) <= g.w - next_x - 20.0 * scale {
+            if p.ui_text_w(&known, false) <= room {
                 text = known;
             }
         }
         if snapshot.network.retention_limited {
             let partial = format!("{text} · partial history");
-            if p.ui_text_w(&partial, false) <= g.w - next_x - 20.0 * scale {
+            if p.ui_text_w(&partial, false) <= room {
                 text = partial;
             }
         }
-        p.ui_text(
-            next_x + 20.0 * scale,
-            first_y + 3.0 * scale,
-            text,
-            inks.words2,
-            false,
-        );
+        if p.ui_text_w(&text, false) <= room {
+            p.ui_text(
+                next_x + 20.0 * scale,
+                first_y + 3.0 * scale,
+                text,
+                inks.words2,
+                false,
+            );
+        }
     }
     let gap = 7.0 * scale;
     let accounts_cell_x = cell_x + p.ui_text_w("Accounts", false) + gap;
@@ -722,10 +939,194 @@ mod tests {
             first_seen_ms: 1,
             last_seen_ms: 1000,
             last_checked_ms: Some(2000),
+            last_repair: None,
+            last_authenticated_endpoint: None,
             reachability,
             instances: None,
             samples: Vec::new(),
         }
+    }
+
+    #[test]
+    fn an_initial_busy_read_invents_no_prior_observation() {
+        let unread = std::sync::Arc::new(NetworkStateSnapshot::default());
+        let mut busy = false;
+        let snapshot = snapshot_after_read(None, &unread, &mut busy, Some(100_000));
+        assert!(busy);
+        assert_eq!(snapshot.revision, 0);
+        assert_eq!(snapshot.network.observed_at_ms, 0);
+        assert_eq!(snapshot.network.history, HistoryState::Restoring);
+        assert_eq!(snapshot.network.visibility, Visibility::Unavailable);
+        assert!(snapshot.network.peers.is_empty());
+        assert!(snapshot.network.detail.contains("busy"));
+        assert!(!snapshot.network.detail.contains("Last observation"));
+        assert_eq!(snapshot.services.accounts.observed_at_ms, 0);
+        assert_eq!(snapshot.services.secrets.observed_at_ms, 0);
+        assert!(!snapshot.services.secrets.detail.contains("Last observed"));
+    }
+
+    #[test]
+    fn busy_reads_keep_known_history_and_warnings_without_current_claims() {
+        use aterm_types::network_state::{
+            PresenceSample, VaultNetworkMaterialization, VaultNetworkRefresh,
+            VaultNetworkRefreshOutcome, VaultNetworkSource,
+        };
+
+        let mut known = NetworkStateSnapshot {
+            revision: 9,
+            ..Default::default()
+        };
+        known.network.revision = 4;
+        known.network.observed_at_ms = 100_000;
+        known.network.visibility = Visibility::Active;
+        known.network.history = HistoryState::Ready;
+        known.network.detail = "authenticated observation".into();
+        let mut machine = peer(7, Reachability::Reachable);
+        machine.last_seen_ms = 100_000;
+        machine.last_checked_ms = Some(100_000);
+        machine.samples.push(PresenceSample {
+            at_ms: 100_000,
+            state: Reachability::Reachable,
+        });
+        known.network.peers.push(machine);
+        let service = &mut known.services.secrets;
+        service.availability = ServiceAvailability::Cached;
+        service.observed_at_ms = 100_000;
+        service.last_success_ms = Some(99_000);
+        service.revision = Some("signed sequence 7".into());
+        service.network_materialization = Some(VaultNetworkMaterialization {
+            source: VaultNetworkSource::PeerUrl,
+            sequence: 7,
+            sampled_at_ms: 99_000,
+        });
+        service.network_refresh = Some(VaultNetworkRefresh {
+            completed_at_ms: 99_500,
+            outcome: VaultNetworkRefreshOutcome::Failed,
+        });
+        service.refresh_failed = true;
+        service.detail = "Cache usable; latest refresh failed".into();
+        let known = std::sync::Arc::new(known);
+        let mut busy = false;
+        let retained = snapshot_after_read(None, &known, &mut busy, Some(100_001));
+        assert!(busy);
+        assert_eq!((retained.revision, retained.network.revision), (9, 4));
+        assert_eq!(retained.network.visibility, Visibility::Unavailable);
+        assert_eq!(retained.network.history, HistoryState::Ready);
+        assert_eq!(retained.network.observed_at_ms, 100_000);
+        let machine = &retained.network.peers[0];
+        assert_eq!(machine.reachability, Reachability::Unknown);
+        assert_eq!(machine.identity, known.network.peers[0].identity);
+        assert_eq!(machine.samples, known.network.peers[0].samples);
+        assert_eq!(
+            (
+                machine.first_seen_ms,
+                machine.last_seen_ms,
+                machine.last_checked_ms
+            ),
+            (1, 100_000, Some(100_000))
+        );
+        let service = &retained.services.secrets;
+        let prior = &known.services.secrets;
+        assert_eq!(service.availability, ServiceAvailability::Unknown);
+        assert_eq!(service.observed_at_ms, prior.observed_at_ms);
+        assert_eq!(service.last_success_ms, prior.last_success_ms);
+        assert_eq!(service.revision, prior.revision);
+        assert_eq!(
+            service.network_materialization,
+            prior.network_materialization
+        );
+        assert_eq!(service.network_refresh, prior.network_refresh);
+        assert!(service.refresh_failed);
+        assert!(service.detail.contains(&prior.detail));
+        assert!(service.detail.contains("busy"));
+        assert!(retained.network.detail.contains("busy"));
+        for wall in [Some(100_002), Some(99_999), None] {
+            let again = snapshot_after_read(None, &retained, &mut busy, wall);
+            assert!(std::sync::Arc::ptr_eq(&retained, &again));
+        }
+        let recovered =
+            snapshot_after_read(Some(known.clone()), &retained, &mut busy, Some(100_002));
+        assert!(!busy);
+        assert!(std::sync::Arc::ptr_eq(&known, &recovered));
+        assert_eq!(
+            recovered.network.peers[0].reachability,
+            Reachability::Reachable
+        );
+        assert_eq!(
+            recovered.services.secrets.availability,
+            ServiceAvailability::Cached
+        );
+    }
+
+    #[test]
+    fn the_app_keeps_a_known_peer_when_its_network_reader_is_busy() {
+        let mut app = crate::App::headless_for_test();
+        let mut known = NetworkStateSnapshot {
+            revision: 9,
+            ..Default::default()
+        };
+        known.network.history = HistoryState::Ready;
+        known.network.peers.push(peer(7, Reachability::Reachable));
+        known.services.accounts.refresh_failed = true;
+        app.network_snapshot = std::sync::Arc::new(known);
+        app.network_source = Some(std::sync::Arc::new(|| None));
+        let now = std::time::Instant::now();
+        app.service_network_state(now);
+        assert!(app.network_source_busy);
+        assert_eq!(app.network_snapshot.revision, 9);
+        assert_eq!(app.network_snapshot.network.history, HistoryState::Ready);
+        assert_eq!(app.network_snapshot.network.peers[0].slot, 7);
+        assert_eq!(
+            app.network_snapshot.network.peers[0].reachability,
+            Reachability::Unknown
+        );
+        assert!(app.network_snapshot.services.accounts.refresh_failed);
+        let retained = app.network_snapshot.clone();
+        app.service_network_state(now + std::time::Duration::from_secs(1));
+        assert!(std::sync::Arc::ptr_eq(&retained, &app.network_snapshot));
+        assert_eq!(
+            app.network_next_poll,
+            Some(now + std::time::Duration::from_secs(2))
+        );
+    }
+
+    fn cell_prims(prims: &[DrawPrim], hits: &[Hit], target: Target) -> Vec<DrawPrim> {
+        let rect = hits
+            .iter()
+            .find(|hit| hit.kind == HitKind::Network(target))
+            .expect("cell hit")
+            .rect;
+        prims
+            .iter()
+            .filter(|prim| match prim {
+                DrawPrim::Panel { x, y, w, h, .. } | DrawPrim::Stroke { x, y, w, h, .. } => {
+                    *x >= rect.0
+                        && *y >= rect.1
+                        && x + w <= rect.0 + rect.2
+                        && y + h <= rect.1 + rect.3
+                }
+                _ => false,
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn local_warning(prims: &[DrawPrim], hits: &[Hit], scale: f32, color: Rgb) -> bool {
+        cell_prims(prims, hits, Target::Local).iter().any(|prim| {
+            matches!(prim, DrawPrim::Panel { w, h, fill, .. }
+                if *w == 2.0 * scale && *h == 2.0 * scale && *fill == rgba(color, 255))
+        })
+    }
+
+    fn compact_caption(prims: &[DrawPrim], top: f32, scale: f32) -> Option<&str> {
+        prims.iter().find_map(|prim| match prim {
+            DrawPrim::Text { x, baseline, s, .. }
+                if *x > 100.0 * scale && *baseline == (top + 10.0 * scale).round() =>
+            {
+                Some(s.as_str())
+            }
+            _ => None,
+        })
     }
 
     #[test]
@@ -1048,6 +1449,91 @@ mod tests {
     }
 
     #[test]
+    fn selected_peer_keeps_verified_identity_and_original_outbound_evidence() {
+        use aterm_types::network_state::AuthenticatedEndpoint;
+
+        let mut snapshot = NetworkStateSnapshot::default();
+        snapshot.network.history = HistoryState::Ready;
+        let mut remote = peer(2, Reachability::LastSeen);
+        remote.identity.label = None;
+        remote.identity.machine_id = [0x23; 16];
+        remote.identity.incarnation = [0x42; 16];
+        remote.last_authenticated_endpoint = Some(AuthenticatedEndpoint {
+            address: "[fd00::12]:7414".parse().unwrap(),
+            observed_at_ms: 2000,
+        });
+        snapshot.network.peers.push(remote);
+
+        for (visibility, observer_time) in [
+            (Visibility::Active, 3000),
+            (Visibility::Offline, 1_000_000),
+            (Visibility::Unavailable, 0),
+        ] {
+            snapshot.network.visibility = visibility;
+            snapshot.network.observed_at_ms = observer_time;
+            let rows = details(&snapshot, Target::Peer(2));
+            assert_eq!(rows[0].0, "Machine");
+            let at = |key| rows.iter().position(|(name, _)| name == key).unwrap();
+            assert!(at("Observation") < at("Last repair"));
+            assert!(at("Last repair") < at("Last outbound"));
+            assert!(at("Last outbound") < at("Machine UUID"));
+            let value = |key| {
+                rows.iter()
+                    .find(|(name, _)| name == key)
+                    .map(|(_, value)| value.as_str())
+                    .unwrap()
+            };
+            assert_eq!(value("Machine UUID"), "23232323232323232323232323232323");
+            assert_eq!(value("Incarnation"), "42424242424242424242424242424242");
+            assert!(value("Last outbound").contains("[fd00::12]:7414"));
+            assert!(value("Last outbound").contains("1970-01-01T00:00:02Z"));
+            assert!(value("Last outbound").contains("historical"));
+            assert!(value("Observation").contains("1970-01-01T00:00:01Z"));
+        }
+    }
+
+    #[test]
+    fn selected_peer_does_not_infer_an_endpoint_for_a_replaced_incarnation() {
+        use aterm_types::network_state::AuthenticatedEndpoint;
+
+        let mut snapshot = NetworkStateSnapshot::default();
+        snapshot.network.visibility = Visibility::Active;
+        snapshot
+            .network
+            .peers
+            .push(peer(2, Reachability::Reachable));
+        let absent = details(&snapshot, Target::Peer(2))
+            .into_iter()
+            .find(|(name, _)| name == "Last outbound")
+            .unwrap();
+        snapshot.network.peers[0].last_authenticated_endpoint = Some(AuthenticatedEndpoint {
+            address: "192.0.2.12:7414".parse().unwrap(),
+            observed_at_ms: 2000,
+        });
+        assert!(
+            details(&snapshot, Target::Peer(2))
+                .iter()
+                .any(|(_, value)| value.contains("192.0.2.12:7414"))
+        );
+
+        // The observer clears endpoint evidence when a new verified incarnation replaces it.
+        snapshot.network.peers[0].identity.incarnation = [0x3a; 16];
+        snapshot.network.peers[0].last_authenticated_endpoint = None;
+        let replaced = details(&snapshot, Target::Peer(2));
+        assert!(replaced.contains(&absent));
+        assert!(
+            replaced
+                .iter()
+                .any(|(name, value)| { name == "Incarnation" && value == &"3a".repeat(16) })
+        );
+        assert!(
+            !replaced
+                .iter()
+                .any(|(_, value)| value.contains("192.0.2.12:7414"))
+        );
+    }
+
+    #[test]
     fn failed_refresh_preserves_available_cache_and_does_not_claim_peers() {
         let mut snapshot = NetworkStateSnapshot::default();
         snapshot.network.history = HistoryState::Ready;
@@ -1068,13 +1554,159 @@ mod tests {
         );
     }
     #[test]
-    fn unread_history_is_not_an_empty_network() {
+    fn history_failure_is_visible_on_active_and_relayed_compact_strips() {
         let mut snapshot = NetworkStateSnapshot::default();
         snapshot.network.visibility = Visibility::Active;
         snapshot.network.history = HistoryState::Ready;
-        let empty_network = summary(&snapshot);
-        snapshot.network.history = HistoryState::Unavailable;
-        assert_ne!(summary(&snapshot), empty_network);
+        snapshot.network.observer = Some(peer(1, Reachability::Reachable).identity);
+        // A failed journal retains known peers but the observer cannot accept contacts.
+        snapshot.network.peers.push(peer(2, Reachability::Unknown));
+        snapshot.network.unverified_endpoints = 3;
+        snapshot.services.accounts.availability = ServiceAvailability::Cached;
+        snapshot.services.secrets.availability = ServiceAvailability::Cached;
+        let inks = crate::stats_deck::cached_inks([20, 20, 20], [230, 230, 230], [100, 180, 200]);
+        for scale in [1.0, 2.0] {
+            let painter = Painter::new(&inks, scale, 14.0 * scale, false);
+            let full_width = painter.ui_text_w("History unavailable", false);
+            let short_width = painter.ui_text_w("History error", false);
+            let caption_x = 158.0 * scale;
+            // Caption admission leaves 70 points after the retained peer and offset.
+            let constrained_room = short_width.max(70.0 * scale + 1.0);
+            assert!(constrained_room < full_width);
+            let constrained_width = caption_x + constrained_room;
+            let no_caption_width = (caption_x + 70.0 * scale - 1.0).floor();
+            assert!(no_caption_width < constrained_width);
+            for (width, expect_caption, expect_short) in [
+                (no_caption_width, false, false),
+                (constrained_width, true, true),
+                (360.0 * scale, true, false),
+                (700.0 * scale, true, false),
+            ] {
+                let g = DeckGeom {
+                    w: width,
+                    h: 200.0 * scale,
+                    pad: 0.0,
+                    scale,
+                    font_px: 14.0 * scale,
+                };
+                let top = 170.0 * scale;
+                for relay in [None, Some(42)] {
+                    snapshot.network.via_local_process = relay;
+                    snapshot.network.history = HistoryState::Ready;
+                    let ready = paint_with_inks(&g, top, &snapshot, &inks, false);
+                    let ready_summary = summary(&snapshot);
+                    assert!(!local_warning(&ready.0, &ready.1, scale, inks.over));
+                    snapshot.network.history = HistoryState::Unavailable;
+                    let failed = paint_with_inks(&g, top, &snapshot, &inks, false);
+                    assert!(local_warning(&failed.0, &failed.1, scale, inks.over));
+                    assert_eq!(failed.1, ready.1);
+                    assert_ne!(summary(&snapshot), ready_summary);
+                    for target in [Target::Peer(2), Target::Accounts, Target::Secrets] {
+                        assert_eq!(
+                            crate::stats_deck::prims_fp(&cell_prims(&failed.0, &failed.1, target)),
+                            crate::stats_deck::prims_fp(&cell_prims(&ready.0, &ready.1, target)),
+                        );
+                    }
+                    if expect_caption {
+                        let caption =
+                            compact_caption(&failed.0, top, scale).expect("history caption");
+                        assert!(caption.contains("History"));
+                        assert!(!caption.contains("reachable") && !caption.contains("via"));
+                        if expect_short {
+                            assert!(painter.ui_text_w(caption, false) < full_width);
+                            assert!(painter.ui_text_w(caption, false) <= constrained_room);
+                        }
+                    } else {
+                        assert!(compact_caption(&failed.0, top, scale).is_none());
+                    }
+                    for prim in &failed.0 {
+                        if let DrawPrim::Text {
+                            x,
+                            baseline,
+                            s,
+                            px,
+                            face,
+                            ..
+                        } = prim
+                            && *x > 100.0 * scale
+                            && *baseline == (top + 10.0 * scale).round()
+                        {
+                            assert!(
+                                x + crate::tray_raster::ui_text_width_for(*face, s, *px).ceil()
+                                    <= g.w
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn history_health_and_partial_coverage_compose_without_changing_cells() {
+        let mut snapshot = NetworkStateSnapshot::default();
+        snapshot.network.observer = Some(peer(1, Reachability::Reachable).identity);
+        snapshot.network.peers.push(peer(2, Reachability::Unknown));
+        snapshot.network.via_local_process = Some(42);
+        snapshot.services.accounts.availability = ServiceAvailability::Cached;
+        snapshot.services.secrets.availability = ServiceAvailability::Cached;
+        let g = DeckGeom {
+            w: 700.0,
+            h: 200.0,
+            pad: 0.0,
+            scale: 1.0,
+            font_px: 14.0,
+        };
+        let inks = crate::stats_deck::cached_inks([20, 20, 20], [230, 230, 230], [100, 180, 200]);
+        for visibility in [
+            Visibility::Active,
+            Visibility::Checking,
+            Visibility::Offline,
+            Visibility::Disabled,
+            Visibility::Waiting,
+            Visibility::Unavailable,
+        ] {
+            snapshot.network.visibility = visibility;
+            snapshot.network.history = HistoryState::Ready;
+            snapshot.network.retention_limited = false;
+            let ready = paint_with_inks(&g, 170.0, &snapshot, &inks, false);
+            for history in [HistoryState::Restoring, HistoryState::Unavailable] {
+                snapshot.network.history = history;
+                for limited in [false, true] {
+                    snapshot.network.retention_limited = limited;
+                    let painted = paint_with_inks(&g, 170.0, &snapshot, &inks, false);
+                    assert_eq!(painted.1, ready.1);
+                    assert_eq!(
+                        local_warning(&painted.0, &painted.1, 1.0, inks.over),
+                        limited || history == HistoryState::Unavailable,
+                    );
+                    let caption = compact_caption(&painted.0, 170.0, 1.0).expect("status caption");
+                    assert!(caption.contains("1 known"));
+                    assert_eq!(caption.contains("partial history"), limited);
+                    assert!(!caption.contains("reachable") && !caption.contains("via"));
+                    if visibility == Visibility::Unavailable {
+                        assert_eq!(
+                            compact_caption(&ready.0, 170.0, 1.0),
+                            Some(caption.split(" · partial history").next().unwrap()),
+                        );
+                    } else {
+                        assert_ne!(Some(caption), compact_caption(&ready.0, 170.0, 1.0));
+                        assert_eq!(
+                            caption.contains("Restoring"),
+                            history == HistoryState::Restoring
+                        );
+                    }
+                    for target in [Target::Peer(2), Target::Accounts, Target::Secrets] {
+                        assert_eq!(
+                            crate::stats_deck::prims_fp(&cell_prims(
+                                &painted.0, &painted.1, target
+                            )),
+                            crate::stats_deck::prims_fp(&cell_prims(&ready.0, &ready.1, target)),
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -1234,7 +1866,7 @@ mod tests {
             .get_or_insert_with(Default::default)
             .stats_bars = Some("off".into());
         let snapshot = inactive_snapshot();
-        app.network_source = Some(std::sync::Arc::new(move || snapshot.clone()));
+        app.network_source = Some(std::sync::Arc::new(move || Some(snapshot.clone())));
         let due = std::time::Instant::now() + std::time::Duration::from_secs(1);
         app.network_next_poll = Some(due);
         assert_eq!(app.network_state_deadline(), None);
@@ -1349,6 +1981,254 @@ mod tests {
         let before = app.stats_lens_fp(wid);
         let mut snapshot = app.network_snapshot.as_ref().clone();
         snapshot.network.via_local_process = Some(42);
+        app.network_snapshot = std::sync::Arc::new(snapshot);
+        assert_ne!(app.stats_lens_fp(wid), before);
+    }
+
+    #[test]
+    fn account_inventory_history_survives_expiry_without_promoting_service_access() {
+        let mut snapshot = NetworkStateSnapshot::default();
+        snapshot.network.visibility = Visibility::Active;
+        snapshot.network.observed_at_ms = 100_000;
+        snapshot.services.accounts.availability = ServiceAvailability::Cached;
+        snapshot.services.accounts.observed_at_ms = 100_000;
+        let absent = details(&snapshot, Target::Accounts);
+        assert!(absent.iter().any(|(key, value)| {
+            key == "Peer inventory" && value.contains("No retained observation")
+        }));
+        snapshot.network.accounts_exchange =
+            Some(aterm_types::network_state::AccountsExchangeObservation {
+                scope_digest: [3; 32],
+                local_actor: [4; 48],
+                control_observation: [5; 64],
+                inventory_count: 2,
+                inventory_fingerprint: [6; 32],
+                peer: MachineIdentity {
+                    machine_id: [7; 16],
+                    incarnation: [8; 16],
+                    label: Some("fixture-peer".into()),
+                },
+                sampled_at_ms: 90_000,
+            });
+        let original = snapshot.network.accounts_exchange.clone();
+        let expired = fresh_snapshot(std::sync::Arc::new(snapshot), Some(160_001));
+        assert_eq!(expired.network.accounts_exchange, original);
+        assert_eq!(
+            expired.services.accounts.availability,
+            ServiceAvailability::Unknown
+        );
+        assert_eq!(
+            expired.services.secrets.availability,
+            ServiceAvailability::Unknown
+        );
+        let rows = details(&expired, Target::Accounts);
+        assert!(rows.iter().any(|(key, value)| {
+            key == "Peer inventory"
+                && value.contains("2 retained operation IDs")
+                && value.contains("fixture-peer")
+        }));
+        assert!(rows.iter().any(|(key, value)| {
+            key == "Peer inventory sampled" && value == &observation_time(90_000)
+        }));
+        assert!(
+            rows.iter()
+                .any(|(key, value)| { key == "Inventory scope" && value.contains("Historical") })
+        );
+        assert!(
+            !details(&expired, Target::Secrets)
+                .iter()
+                .any(|(key, _)| key == "Peer inventory")
+        );
+    }
+
+    #[test]
+    fn vault_network_history_keeps_original_time_and_scope_after_local_observation_expires() {
+        use aterm_types::network_state::{VaultNetworkMaterialization, VaultNetworkSource};
+        for source in [
+            VaultNetworkSource::ConfiguredUrl,
+            VaultNetworkSource::PeerUrl,
+        ] {
+            let mut snapshot = NetworkStateSnapshot::default();
+            snapshot.services.secrets.availability = ServiceAvailability::Cached;
+            snapshot.services.secrets.observed_at_ms = 100_000;
+            let absent = details(&snapshot, Target::Secrets);
+            assert!(absent.iter().any(|(key, value)| key == "Network sync"
+                && value.contains("No verified network receipt")));
+            snapshot.services.secrets.network_materialization = Some(VaultNetworkMaterialization {
+                source,
+                sequence: 17,
+                sampled_at_ms: 80_000,
+            });
+            let expired = fresh_snapshot(std::sync::Arc::new(snapshot), Some(160_001));
+            assert_eq!(
+                expired.services.secrets.availability,
+                ServiceAvailability::Unknown
+            );
+            let receipt = expired.services.secrets.network_materialization.unwrap();
+            assert_eq!(receipt.sampled_at_ms, 80_000);
+            let rows = details(&expired, Target::Secrets);
+            let route = match source {
+                VaultNetworkSource::ConfiguredUrl => "configured route",
+                VaultNetworkSource::PeerUrl => "peer route",
+            };
+            assert!(rows.iter().any(|(key, value)| key == "Network sync"
+                && value.contains("Signed vault version 17")
+                && value.contains(route)));
+            assert!(
+                rows.iter()
+                    .any(|(key, value)| key == "Network fetch started"
+                        && value == &observation_time(80_000))
+            );
+            assert!(
+                rows.iter().any(|(key, value)| key == "Network sync scope"
+                    && value.contains("Historical receipt"))
+            );
+            assert!(
+                !details(&expired, Target::Accounts)
+                    .iter()
+                    .any(|(key, _)| key == "Network sync")
+            );
+        }
+    }
+
+    #[test]
+    fn retained_204_details_do_not_turn_transport_contact_into_local_access() {
+        use aterm_types::network_state::{VaultHttp204Response, VaultNetworkSource};
+        for availability in [
+            ServiceAvailability::Unknown,
+            ServiceAvailability::Unavailable,
+            ServiceAvailability::Cached,
+        ] {
+            let mut snapshot = NetworkStateSnapshot::default();
+            snapshot.services.secrets.availability = availability;
+            snapshot.services.secrets.observed_at_ms = 100_000;
+            let absent = details(&snapshot, Target::Secrets);
+            assert!(
+                absent
+                    .iter()
+                    .any(|(key, value)| key == "Retained HTTP 204" && !value.is_empty())
+            );
+            let response = VaultHttp204Response {
+                source: VaultNetworkSource::ConfiguredUrl,
+                responded_at_ms: 80_000,
+            };
+            snapshot.services.secrets.http204_response = Some(response);
+            let rows = details(&snapshot, Target::Secrets);
+            assert_eq!(snapshot.services.secrets.availability, availability);
+            assert_eq!(snapshot.services.secrets.network_materialization, None);
+            assert_eq!(snapshot.services.secrets.last_success_ms, None);
+            assert!(rows.iter().any(|(key, value)| key == "Retained HTTP 204"
+                && value.contains("Configured route answered HTTP 204")));
+            assert!(rows.iter().any(|(key, value)| key == "Response received"
+                && value == &observation_time(response.responded_at_ms)));
+            assert!(
+                !details(&snapshot, Target::Accounts)
+                    .iter()
+                    .any(|(key, _)| key == "Retained HTTP 204")
+            );
+            let expired = fresh_snapshot(std::sync::Arc::new(snapshot), Some(160_001));
+            assert_eq!(expired.services.secrets.http204_response, Some(response));
+            assert_eq!(
+                expired.services.secrets.availability,
+                ServiceAvailability::Unknown
+            );
+        }
+    }
+
+    #[test]
+    fn network_refresh_failure_keeps_cache_and_success_receipt_separate_in_the_lens() {
+        use aterm_types::network_state::{
+            VaultNetworkMaterialization, VaultNetworkRefresh, VaultNetworkRefreshOutcome,
+            VaultNetworkSource,
+        };
+        let mut snapshot = NetworkStateSnapshot::default();
+        let service = &mut snapshot.services.secrets;
+        service.availability = ServiceAvailability::Cached;
+        service.observed_at_ms = 100_000;
+        service.refresh_failed = true;
+        let receipt = VaultNetworkMaterialization {
+            source: VaultNetworkSource::ConfiguredUrl,
+            sequence: 17,
+            sampled_at_ms: 80_000,
+        };
+        service.network_materialization = Some(receipt);
+        for outcome in [
+            VaultNetworkRefreshOutcome::Failed,
+            VaultNetworkRefreshOutcome::Succeeded,
+        ] {
+            let refresh = VaultNetworkRefresh {
+                completed_at_ms: 90_000,
+                outcome,
+            };
+            snapshot.services.secrets.network_refresh = Some(refresh);
+            snapshot.services.secrets.refresh_failed =
+                outcome == VaultNetworkRefreshOutcome::Failed;
+            let rows = details(&snapshot, Target::Secrets);
+            let expected = if outcome == VaultNetworkRefreshOutcome::Failed {
+                "Failed"
+            } else {
+                "Completed"
+            };
+            assert!(
+                rows.iter()
+                    .any(|(key, value)| key == "Recorded network refresh" && value == expected)
+            );
+            assert!(rows.iter().any(
+                |(key, value)| key == "Refresh completed" && value == &observation_time(90_000)
+            ));
+            assert!(
+                rows.iter()
+                    .any(|(key, value)| key == "Network fetch started"
+                        && value == &observation_time(80_000))
+            );
+            assert_eq!(
+                snapshot.services.secrets.availability,
+                ServiceAvailability::Cached
+            );
+            assert_eq!(
+                snapshot.services.secrets.network_materialization,
+                Some(receipt)
+            );
+            assert_eq!(snapshot.services.secrets.last_success_ms, None);
+            assert!(
+                !details(&snapshot, Target::Accounts)
+                    .iter()
+                    .any(|(key, _)| key == "Recorded network refresh")
+            );
+            let expired = fresh_snapshot(std::sync::Arc::new(snapshot.clone()), Some(160_001));
+            assert_eq!(
+                expired.services.secrets.availability,
+                ServiceAvailability::Unknown
+            );
+            assert_eq!(expired.services.secrets.network_refresh, Some(refresh));
+            assert_eq!(
+                expired.services.secrets.network_materialization,
+                Some(receipt)
+            );
+        }
+    }
+
+    #[test]
+    fn an_inventory_observation_invalidates_an_open_network_lens_without_revision_change() {
+        let mut app = crate::App::headless_for_test();
+        let wid = *app.windows.keys().next().expect("window");
+        assert!(app.open_network_lens());
+        let before = app.stats_lens_fp(wid);
+        let mut snapshot = app.network_snapshot.as_ref().clone();
+        snapshot.network.accounts_exchange =
+            Some(aterm_types::network_state::AccountsExchangeObservation {
+                scope_digest: [1; 32],
+                local_actor: [2; 48],
+                control_observation: [3; 64],
+                inventory_count: 0,
+                inventory_fingerprint: [4; 32],
+                peer: MachineIdentity {
+                    machine_id: [5; 16],
+                    incarnation: [6; 16],
+                    label: None,
+                },
+                sampled_at_ms: 1,
+            });
         app.network_snapshot = std::sync::Arc::new(snapshot);
         assert_ne!(app.stats_lens_fp(wid), before);
     }

@@ -15,8 +15,9 @@ use aterm_net::fleet::{
     FleetError, FleetOp, FleetScope, FleetSecret, KEY_FILE, NodeIdentity, NodeKey, client_handshake,
 };
 use aterm_net::fleet_member::{
-    BookRead, BookUnread, DEFAULT_PORT, Keyring, Registration, Target, Unregistered, Via, dial,
-    fetch_book, read_node_identity, read_peers, read_whole, register_by,
+    BookRead, BookUnread, DEFAULT_PORT, Keyring, LOCK_HELD_LINE, LOCK_TOLD_SEAM, LOCK_WAIT_SEAM,
+    Registration, Target, Unregistered, Via, dial, fetch_book, read_node_identity, read_peers,
+    read_whole, register_by,
 };
 
 use crate::headless_boot::{self, Instance, POLL_GAP, boot_session, ctl, ctl_ok, field, status};
@@ -37,6 +38,204 @@ fn hold_a_port() -> (TcpListener, u16) {
     (holder, port)
 }
 
+/// The handshake a test world's real `aterm` gives one address is the bound the world's seam names,
+/// not the 3 s a person's dial allows: the hang detector its other waits have, or here a tenth of a
+/// second, against a port that takes the connection and never answers, so that the words show it.
+#[test]
+fn a_dialers_handshake_at_one_address_is_bound_by_the_worlds_seam() {
+    let issuer = World(headless_boot::scratch_root("afbi"));
+    let (holder, port) = hold_a_port();
+    drop(holder);
+    fleet_ok(
+        &issuer.0,
+        &["init", "--host", "127.0.0.1", "--port", &port.to_string()],
+        None,
+    );
+    let code = std::fs::read_to_string(issuer.0.join("state/fleet-join-code")).expect("its code");
+    let (silent, silent_port) = hold_a_port();
+    let member = World(headless_boot::scratch_root("afbm"));
+    let (holder, member_port) = hold_a_port();
+    drop(holder);
+    let refused = fleet_with(
+        &member.0,
+        &[
+            "join",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &member_port.to_string(),
+            "--at",
+            &format!("127.0.0.1:{silent_port}"),
+        ],
+        Some(&code),
+        &[(HANDSHAKE_SEAM, "100")],
+    );
+    drop(silent);
+    let said = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        !refused.status.success() && said.contains("no fleet handshake within 0.1s"),
+        "{refused:?}"
+    );
+}
+
+/// A drive a test world's real `aterm ctl --host` makes is bound by the world's seam, not the 28 s
+/// a person's drive allows, and each leg of an `await task` over one by its wait and that seam,
+/// not the 8 s past it a person's allows: the hang detector its other waits have, or here a tenth
+/// of a second, against a node the book binds at a port that takes the connection and never
+/// answers.
+#[test]
+fn a_drives_deadline_is_the_worlds_seam() {
+    use aterm_net::fleet_member::{Began, Peer, node_identity, record, write_held};
+    let driver = World(headless_boot::scratch_root("afdw"));
+    let (holder, port) = hold_a_port();
+    drop(holder);
+    fleet_ok(
+        &driver.0,
+        &["init", "--host", "127.0.0.1", "--port", &port.to_string()],
+        None,
+    );
+    let elsewhere = driver.0.join("another-mac");
+    aterm_uds::private_file::ensure_private_dir(&elsewhere).expect("its state");
+    let other = node_identity(&elsewhere).expect("another Mac's node");
+    let (silent, silent_port) = hold_a_port();
+    write_held(&driver.0.join("state"), Began::Here, |book| {
+        book.update(|peers| {
+            record(
+                peers,
+                Peer {
+                    node: Some(other.node().to_owned()),
+                    key: Some(other.key()),
+                    key_from: None,
+                    host: "127.0.0.1".to_owned(),
+                    addr: Some(std::net::Ipv4Addr::LOCALHOST.into()),
+                    port: silent_port,
+                    version: Some("0.146.0".to_owned()),
+                    seen_ms: Some(1_793_160_000_000),
+                    via: Via::Joined,
+                    fleet: None,
+                    signed: None,
+                },
+            )
+        })
+        .expect("record the silent member");
+    })
+    .expect("its book");
+    for verb in [&["@s-1", "status"][..], &["await", "task", "@s-1"]] {
+        let mut args = vec!["--host", other.node()];
+        args.extend_from_slice(verb);
+        let refused = ctl_with(&driver.0, &args, None, &[(DRIVE_WITHIN_SEAM, "100")]);
+        let said = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            !refused.status.success() && said.contains("within 0.1s"),
+            "{verb:?}: {refused:?}"
+        );
+    }
+    drop(silent);
+}
+
+/// A test world's aterm gives each member its heartbeat dials the world's hang detector, not its
+/// share of a person's round: its dial of a member whose place takes the connection and answers
+/// nothing is still open a second past that share.
+/// NEGATIVE CONTROL: without the world's [`HEARTBEAT_WITHIN_SEAM`] the dial hangs up at the share.
+#[test]
+fn a_worlds_heartbeat_waits_the_hang_detector_at_each_member() {
+    use aterm_net::fleet_member::{
+        Began, HEARTBEAT_MEMBERS, Peer, node_identity, record, write_held,
+    };
+    let (silent, silent_port) = hold_a_port();
+    let (holder, port) = hold_a_port();
+    drop(holder);
+    let _inst = boot_world(
+        "afhb",
+        |tmp, cmd| {
+            let state = tmp.join("state");
+            write_key(&state, &SECRET);
+            node_identity(&state).expect("this Mac's node");
+            let elsewhere = tmp.join("another-mac");
+            aterm_uds::private_file::ensure_private_dir(&elsewhere).expect("its state");
+            let other = node_identity(&elsewhere).expect("another Mac's node");
+            write_held(&state, Began::Here, |book| {
+                book.update(|peers| {
+                    record(
+                        peers,
+                        Peer {
+                            node: Some(other.node().to_owned()),
+                            key: Some(other.key()),
+                            key_from: None,
+                            host: "127.0.0.1".to_owned(),
+                            addr: Some(std::net::Ipv4Addr::LOCALHOST.into()),
+                            port: silent_port,
+                            version: Some("0.146.0".to_owned()),
+                            seen_ms: Some(1_793_160_000_000),
+                            via: Via::Joined,
+                            fleet: None,
+                            signed: None,
+                        },
+                    )
+                })
+                .expect("record the silent member");
+            })
+            .expect("its book");
+            let config = tmp.join("cfg/aterm/aterm.toml");
+            let text = std::fs::read_to_string(&config).expect("the scratch config");
+            std::fs::write(&config, format!("{text}{}", fleet_table(port, "facts")))
+                .expect("write the fleet table");
+            cmd.env("ATERM_STATE_HOME", &state)
+                .args(["--lines", "24", "--columns", "80"]);
+        },
+        |_| true,
+    );
+    silent
+        .set_nonblocking(true)
+        .expect("poll the member's place");
+    let (mut dial, _) = aterm_spec::wait::within(HANG, POLL_GAP, || silent.accept().ok())
+        .expect("the heartbeat dials the member");
+    dial.set_nonblocking(false).expect("block on the dial");
+    let share = PERSONS_HEARTBEAT_ROUND / (HEARTBEAT_MEMBERS as u32 + 1);
+    let held = Instant::now() + share + Duration::from_secs(1);
+    let mut hello = [0u8; 4096];
+    loop {
+        let left = held.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        dial.set_read_timeout(Some(left)).expect("bound the read");
+        match dial.read(&mut hello) {
+            Ok(0) => panic!("the heartbeat hung up on the member within a person's {share:?}"),
+            Ok(_) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(e) => panic!("the heartbeat cut its dial of the member: {e}"),
+        }
+    }
+}
+
+/// A test world's aterm serves a proved connection as long as its client keeps it, not the 30 s a
+/// person's listener allows: a peer that asks past them is answered.
+/// NEGATIVE CONTROL: without the world's [`LIFETIME_SEAM`] the listener cuts it at 30 s.
+#[test]
+fn a_worlds_aterm_serves_a_connection_past_a_persons_lifetime() {
+    let (holder, port) = hold_a_port();
+    drop(holder);
+    let inst = boot(port);
+    let (_, sid) = boot_session(&inst);
+    fleet_reads(&inst, &sid, "listening");
+    let tcp = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    let secret = FleetSecret::new(&SECRET).expect("a fleet secret");
+    let (mut peer, _) =
+        client_handshake(tcp, &secret, FleetOp::Survey, HANG).expect("a proved peer");
+    peer.stream()
+        .get_ref()
+        .set_read_timeout(Some(HANG))
+        .expect("bound the reads");
+    std::thread::sleep(aterm_net::fleet::SERVED_WITHIN + Duration::from_secs(2));
+    let reply = ask(peer.stream(), "version");
+    assert!(reply.starts_with("OK version="), "{reply:?}");
+}
+
 fn write_key(state: &Path, secret: &[u8]) {
     use std::os::unix::fs::PermissionsExt as _;
     let key = state.join(KEY_FILE);
@@ -53,24 +252,43 @@ fn fleet_table(port: u16, allow: &str) -> String {
 const RETRY_MS: &str = "100";
 
 // The dev seams that set how long a verb's read of its issuer's book, a join's dial and
-// registration, a local `hold off`'s proof of a holder, each listener's TLS and proofs, a `peers`
-// read whose every listener must answer
+// registration, a local `hold off`'s proof of a holder, each listener's TLS and proofs and each
+// dialer's handshake at one address, a drive (`aterm ctl --host`, and each leg of an `await task`
+// over one past the wait it asks for), a `peers` read whose every listener must answer
 // ([`peers_answered`]) and a survey whose every peer must answer ([`survey_answered`]) wait. Each
-// issuer a verb here reads and each dialer of a listener is an aterm (or this test) on this
-// machine that serves, each holder a `hold off` proves serves or is refused at once, and so do
-// each listener a [`peers_answered`] read dials (with the aterm here whose status it asks, which
-// answers or runs nowhere) and each peer a [`survey_answered`] read dials, so each answer comes or
-// ends however loaded the machine is: each is given the hang detector (a survey's peer read twice
-// it, [`survey_answered`]), not the 3 s a person's verb or a listener allows nor the 10 s a
+// issuer a verb here reads, each Mac a drive here reaches and each dialer of a listener is an
+// aterm (or this test) on this machine that serves, each holder a `hold off` proves serves or is
+// refused at once, and so do each listener a [`peers_answered`] read dials (with the aterm here
+// whose status it asks, which answers or runs nowhere) and each peer a [`survey_answered`] read
+// dials, so each answer comes or ends however loaded the machine is: each is given the hang
+// detector (a survey's peer read twice it, [`survey_answered`]), not the 3 s a person's verb or a
+// listener allows, the 28 s a drive allows (8 s past an `await task` leg's wait), nor the 10 s a
 // survey's `--timeout` allows at most. The peers here that answer nothing (a held silent port, a
-// stopped aterm) are read under each verb's own wait (its `--timeout`, or the one it keeps), which
-// these seams do not reach: no [`peers_answered`] or [`survey_answered`] read meets one.
+// stopped aterm) are read under each verb's own wait (its `--timeout`, or the one it keeps),
+// which these seams do not reach but a drive's: no [`peers_answered`] or [`survey_answered`] read
+// meets one, and the drives that do name a tenth of a second for theirs
+// ([`a_drives_deadline_is_the_worlds_seam`]).
+// Every aterm here, and every verb, is given the hang detector for the book's lock too
+// ([`LOCK_WAIT_SEAM`]), not the 2 s a person's verb waits: each holder is an aterm (or this test)
+// on this machine that lets it go once its read-modify-write is made, which a loaded machine can
+// keep past those 2 s. And every aterm here gives each member its heartbeat dials the hang
+// detector ([`HEARTBEAT_WITHIN_SEAM`]), not its share of a person's 10 s round, and serves each
+// proved connection as long as its client keeps it ([`LIFETIME_SEAM`]), not the 30 s a person's
+// listener allows: each member and each client is an aterm (or this test) on this machine.
 const ISSUER_WITHIN_SEAM: &str = "ATERM_DEBUG_FLEET_ISSUER_WITHIN_MS";
 const JOIN_WITHIN_SEAM: &str = "ATERM_DEBUG_FLEET_JOIN_WITHIN_MS";
 const PEER_WITHIN_SEAM: &str = "ATERM_DEBUG_FLEET_PEER_WITHIN_MS";
 const SURVEY_WITHIN_SEAM: &str = "ATERM_DEBUG_FLEET_SURVEY_WITHIN_MS";
 const HOLDER_SEAM: &str = "ATERM_DEBUG_FLEET_HOLDER_WITHIN_MS";
-const HANDSHAKE_SEAM: &str = "ATERM_DEBUG_FLEET_HANDSHAKE_MS";
+const DRIVE_WITHIN_SEAM: &str = "ATERM_DEBUG_FLEET_DRIVE_WITHIN_MS";
+const HEARTBEAT_WITHIN_SEAM: &str = "ATERM_DEBUG_FLEET_HEARTBEAT_WITHIN_MS";
+const LIFETIME_SEAM: &str = "ATERM_DEBUG_FLEET_LIFETIME_MS";
+use aterm_net::fleet::HANDSHAKE_SEAM;
+
+/// The longest a person's heartbeat round takes, each member it dials given a share
+/// ([`aterm_net::fleet_member::HEARTBEAT_MEMBERS`] of them and the adverts): what
+/// [`HEARTBEAT_WITHIN_SEAM`] lifts.
+const PERSONS_HEARTBEAT_ROUND: Duration = Duration::from_secs(10);
 
 #[expect(
     clippy::disallowed_types,
@@ -85,10 +303,17 @@ fn boot_world(
         prefix,
         |tmp, cmd| {
             let hang = HANG.as_millis().to_string();
+            let round = HANG
+                .saturating_mul(aterm_net::fleet_member::HEARTBEAT_MEMBERS as u32 + 1)
+                .as_millis()
+                .to_string();
             cmd.env(aterm_net::loopback::SEAM, "1")
                 .env(ISSUER_WITHIN_SEAM, &hang)
                 .env(HOLDER_SEAM, &hang)
-                .env(HANDSHAKE_SEAM, &hang);
+                .env(HANDSHAKE_SEAM, &hang)
+                .env(LOCK_WAIT_SEAM, &hang)
+                .env(HEARTBEAT_WITHIN_SEAM, round)
+                .env(LIFETIME_SEAM, NEVER_MS);
             configure(tmp, cmd);
         },
         ready,
@@ -240,6 +465,7 @@ fn a_fleet_peer_reads_version_and_is_refused_everything_else() {
         "subscribe @* events".to_owned(),
         "inbox get 1".to_owned(),
         "sessions".to_owned(),
+        "accounts-renew start=0123456789abcdef0123456789abcdef".to_owned(),
         "help".to_owned(),
     ];
     for line in &refused {
@@ -391,6 +617,17 @@ fn fleet(root: &Path, args: &[&str], stdin: Option<&str>) -> Output {
 }
 
 fn fleet_with(root: &Path, args: &[&str], stdin: Option<&str>, env: &[(&str, &str)]) -> Output {
+    fleet_ended(args, spawn_fleet(root, args, stdin, env))
+}
+
+/// `aterm fleet` (`args`) started under `root`, its stdin written, with the seams every call
+/// takes and `env` over them.
+fn spawn_fleet(
+    root: &Path,
+    args: &[&str],
+    stdin: Option<&str>,
+    env: &[(&str, &str)],
+) -> std::process::Child {
     let aterm = crate::launch_isolation::aterm_executable();
     #[expect(
         clippy::disallowed_types,
@@ -410,13 +647,20 @@ fn fleet_with(root: &Path, args: &[&str], stdin: Option<&str>, env: &[(&str, &st
     cmd.env("ATERM_STATE_HOME", root.join("state"))
         .env(aterm_net::loopback::SEAM, "1")
         .env(ISSUER_WITHIN_SEAM, HANG.as_millis().to_string())
+        .env(HANDSHAKE_SEAM, HANG.as_millis().to_string())
         .env(JOIN_WITHIN_SEAM, HANG.as_millis().to_string())
+        .env(LOCK_WAIT_SEAM, HANG.as_millis().to_string())
         .envs(env.iter().copied());
     let mut child = cmd.spawn().expect("spawn aterm fleet");
     if let Some(text) = stdin {
         let mut pipe = child.stdin.take().expect("its stdin");
         pipe.write_all(text.as_bytes()).expect("write its stdin");
     }
+    child
+}
+
+/// What `aterm fleet` (`args`), started by [`spawn_fleet`], wrote and how it ended.
+fn fleet_ended(args: &[&str], child: std::process::Child) -> Output {
     crate::child_output::wait_and_read(child, Instant::now() + HANG)
         .unwrap_or_else(|| panic!("aterm fleet {args:?} did not exit"))
 }
@@ -455,6 +699,9 @@ fn ctl_with(root: &Path, args: &[&str], stdin: Option<&[u8]>, env: &[(&str, &str
         cmd.env("ATERM_STATE_HOME", root.join("state"))
             .env(aterm_net::loopback::SEAM, "1")
             .env(ISSUER_WITHIN_SEAM, HANG.as_millis().to_string())
+            .env(HANDSHAKE_SEAM, HANG.as_millis().to_string())
+            .env(DRIVE_WITHIN_SEAM, HANG.as_millis().to_string())
+            .env(LOCK_WAIT_SEAM, HANG.as_millis().to_string())
             .envs(env.iter().copied());
         let mut child = cmd.spawn().expect("spawn aterm ctl");
         if let Some(bytes) = stdin {
@@ -510,6 +757,71 @@ fn the_binary_places_a_host_named_with_no_port_at_the_default_port() {
     let added = fleet_ok(&world.0, &["peers", "add", "lab-maxi"], None);
     let want = format!("aterm fleet peers: added lab-maxi:{DEFAULT_PORT} to ");
     assert!(added.starts_with(&want), "{added}");
+}
+
+/// A verb that meets the book's lock held past the 2 s a shipped aterm waits for it: under
+/// [`LOCK_WAIT_SEAM`], which every [`fleet`] call passes, the debug binary waits for the holder
+/// to let it go, and without it the binary refuses as a shipped one does. The verb without the
+/// seam is the hold's clock: it starts once the waiting verb has said it found the lock held
+/// ([`LOCK_TOLD_SEAM`]), is refused only once it has found the lock held for its whole wait, and
+/// the lock is let go only after that, by when the waiting verb has waited past those 2 s too.
+#[test]
+fn a_verb_under_the_lock_seam_waits_out_a_holder_the_shipped_wait_refuses() {
+    let world = World(headless_boot::scratch_root("afbl"));
+    // The first verb makes the private state directory the lock lives in.
+    fleet_ok(&world.0, &["peers", "add", "lab-one"], None);
+    let state = world.0.join("state");
+    let held = aterm_net::fleet_member::hold_book(&state).expect("the book's lock");
+    let mut waiting = spawn_fleet(
+        &world.0,
+        &["peers", "add", "lab-two"],
+        None,
+        &[(LOCK_TOLD_SEAM, "1")],
+    );
+    let told = crate::child_output::await_stderr_line(
+        &mut waiting,
+        |line| line == LOCK_HELD_LINE,
+        Instant::now() + HANG,
+    );
+    match told {
+        Ok(()) => {}
+        Err(crate::child_output::NoLine::Exited(out)) => {
+            panic!("the waiting verb ended before it found the lock held: {out:?}")
+        }
+        Err(crate::child_output::NoLine::Hung(said)) => {
+            panic!("the waiting verb never said it found the lock held; its stderr: {said}")
+        }
+        Err(crate::child_output::NoLine::OutputLimit { stream, captured }) => {
+            panic!("the waiting verb filled its {stream} first: {captured}")
+        }
+    }
+    let shipped = fleet_with(
+        &world.0,
+        &["peers", "add", "lab-three"],
+        None,
+        &[(LOCK_WAIT_SEAM, "")],
+    );
+    let said = String::from_utf8_lossy(&shipped.stderr);
+    assert!(
+        shipped.status.code() == Some(1) && said.contains("another aterm is writing the book"),
+        "a verb with the shipped wait refuses a lock held past it: {shipped:?}"
+    );
+    drop(held);
+    succeeded(
+        &["peers", "add", "lab-two"],
+        fleet_ended(&["peers", "add", "lab-two"], waiting),
+    );
+    let hosts: Vec<String> = read_peers(&state)
+        .expect("the book")
+        .into_iter()
+        .map(|peer| peer.host)
+        .collect();
+    assert!(
+        hosts.iter().any(|host| host == "lab-one")
+            && hosts.iter().any(|host| host == "lab-two")
+            && !hosts.iter().any(|host| host == "lab-three"),
+        "the waiting verb wrote its peer once the lock was let go, the refused one none: {hosts:?}"
+    );
 }
 
 #[test]
@@ -955,6 +1267,172 @@ fn drive_ok(root: &Path, host: &str, args: &[&str]) -> (String, String) {
     )
 }
 
+#[test]
+fn a_driver_owns_a_plain_shell_without_ai_or_the_hosts_direct_command() {
+    let (held, issuer_port) = hold_a_port();
+    drop(held);
+    let issuer = boot_world(
+        "afs-issuer",
+        |tmp, cmd| {
+            fleet_ok(
+                tmp,
+                &[
+                    "init",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    &issuer_port.to_string(),
+                ],
+                None,
+            );
+            cmd.env("ATERM_STATE_HOME", tmp.join("state"));
+        },
+        |_| true,
+    );
+    let (_, original_issuer) = boot_session(&issuer);
+    fleet_reads(&issuer, &original_issuer, "listening");
+    let code = std::fs::read_to_string(issuer.tmp.join("state/fleet-join-code")).unwrap();
+    let (held, member_port) = hold_a_port();
+    drop(held);
+    let member = boot_world(
+        "afs-member",
+        |tmp, cmd| {
+            fleet_ok(
+                tmp,
+                &[
+                    "join",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    &member_port.to_string(),
+                    "--at",
+                    &listen_of(&issuer.tmp),
+                ],
+                Some(&code),
+            );
+            fleet_ok(tmp, &["allow", "drive", "--all"], None);
+            std::fs::create_dir_all(tmp.join("work")).unwrap();
+            cmd.env("SHELL", "/bin/zsh")
+                .env("ATERM_STATE_HOME", tmp.join("state"))
+                .args(["-e", "/bin/cat"]);
+        },
+        |_| true,
+    );
+    let (_, original) = boot_session(&member);
+    fleet_reads(&member, &original, "listening");
+    let target = format!("127.0.0.1:{member_port}");
+    let cwd = format!("cwd={}", member.tmp.join("work").display());
+    let (reply, _) = drive_ok(&issuer.tmp, &target, &["spawn", &cwd]);
+    let sid = reply.trim().strip_prefix("OK ").expect("plain shell sid");
+    let at = format!("@{sid}");
+    assert_eq!(
+        ctl_ok(&member, &[&at, "task"]).trim(),
+        "OK task -",
+        "no fake task"
+    );
+    aterm_spec::wait::until_within(HANG, "the plain shell's integrated prompt", || {
+        let (blocks, _) = drive_ok(&issuer.tmp, &target, &[&at, "blocks"]);
+        blocks.contains(" entering ").then_some(())
+    });
+    let command = "pwd; printf 'probe-before\\n'; i=0; while [ $i -lt 64 ]; do printf 'middle\\n'; i=$((i+1)); done; printf 'probe-after\\n'; (exit 7)";
+    let (_, turn) = drive_ok(
+        &issuer.tmp,
+        &target,
+        &[&at, "turn", "timeout=20000", command],
+    );
+    assert!(turn.contains("submitted=1"), "{turn}");
+    let block = aterm_spec::wait::until_within(HANG, "the exact command's exit", || {
+        let (blocks, _) = drive_ok(&issuer.tmp, &target, &[&at, "blocks"]);
+        blocks
+            .lines()
+            .find(|line| line.contains(" complete ") && line.contains(" exit=7 "))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .map(str::to_owned)
+    });
+    let (output, _) = drive_ok(&issuer.tmp, &target, &[&at, "blocktext", &block, "trim"]);
+    let other_session = format!("@{original}");
+    assert!(
+        drive_refused(&issuer.tmp, &target, &[&other_session, "blocktext", &block])
+            .contains("ERR denied"),
+        "a block id grants no read of another session"
+    );
+    let expected_cwd = member.tmp.join("work").canonicalize().unwrap();
+    let actual_cwd = output
+        .lines()
+        .find(|line| line.starts_with('/'))
+        .and_then(|line| Path::new(line).canonicalize().ok());
+    assert_eq!(
+        actual_cwd.as_ref(),
+        Some(&expected_cwd),
+        "the requested physical cwd: {output}"
+    );
+    assert!(
+        output.contains("probe-before") && output.contains("probe-after"),
+        "retained output beyond the visible grid: {output}"
+    );
+    assert_eq!(output.lines().filter(|line| *line == "middle").count(), 64);
+    let (idle, _) = drive_ok(
+        &issuer.tmp,
+        &target,
+        &[&at, "await", "idle", "1", "timeout=20000"],
+    );
+    assert!(idle.starts_with("OK idle "), "{idle}");
+    assert_eq!(
+        field(&status(&member, &original), "program"),
+        Some("cat"),
+        "global direct command remains in its original session"
+    );
+    drive_ok(
+        &issuer.tmp,
+        &target,
+        &[&at, "turn", "settle=submitted", "timeout=20000", "/bin/cat"],
+    );
+    aterm_spec::wait::until_within(HANG, "the owned shell's live foreground job", || {
+        (field(&status(&member, sid), "program") == Some("cat")).then_some(())
+    });
+    assert!(drive_refused(&issuer.tmp, &target, &[&at, "close"]).contains("running job"));
+    drive_ok(&issuer.tmp, &target, &[&at, "key", "ctrl+c"]);
+    aterm_spec::wait::until_within(HANG, "the shell after ordinary interrupt", || {
+        (field(&status(&member, sid), "phase") == Some("idle")).then_some(())
+    });
+
+    let other = World(headless_boot::scratch_root("afs-other"));
+    let (held, other_port) = hold_a_port();
+    drop(held);
+    fleet_ok(
+        &other.0,
+        &[
+            "join",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &other_port.to_string(),
+            "--at",
+            &listen_of(&issuer.tmp),
+        ],
+        Some(&code),
+    );
+    for args in [
+        vec![at.as_str(), "close"],
+        vec![at.as_str(), "blocks"],
+        vec![at.as_str(), "blocktext", block.as_str()],
+    ] {
+        let refused = drive_refused(&other.0, &target, &args);
+        assert!(refused.contains("ERR denied"), "{refused}");
+    }
+    let missing = format!("cwd={}", member.tmp.join("missing").display());
+    assert!(drive_refused(&issuer.tmp, &target, &["spawn", &missing]).contains("no such folder"));
+    drive_ok(&issuer.tmp, &target, &[&at, "close"]);
+    let left = ctl_ok(&member, &["sessions"]);
+    assert!(
+        !left
+            .lines()
+            .any(|line| line.split_whitespace().nth(1) == Some(sid)),
+        "only the owned shell closed: {left}"
+    );
+    assert!(left.contains(&original));
+}
+
 fn drive_refused(root: &Path, host: &str, args: &[&str]) -> String {
     let out = drive_in(root, host, args);
     assert_eq!(
@@ -1169,8 +1647,13 @@ fn a_mac_its_member_lets_drive_it_drives_a_worker_and_no_other_does() {
     assert!(stamp.contains("OK 0 fleet=1 head=f0"), "{stamp}");
     let refused = drive_refused(&issuer.tmp, &target, &[&at, "close"]);
     assert!(
-        refused.contains("ERR denied: a drive closes only a worker it spawned"),
+        refused.starts_with("aterm-ctl: ERR denied") || refused.starts_with("ERR denied"),
         "{refused}"
+    );
+    assert_ne!(
+        field(&status(&member, &worker), "phase"),
+        Some("exited"),
+        "the unowned session survives"
     );
     let work = member.tmp.join("work");
     let work = work.to_str().expect("a UTF-8 scratch path");
@@ -1326,6 +1809,51 @@ fn driven_pair(tags: (&str, &str)) -> (Instance, Instance, String, String) {
     driven_pair_beating(tags, None)
 }
 
+#[test]
+fn account_renewal_runs_over_native_fleet_with_no_ssh_or_interactive_terminal() {
+    let (issuer, member, _worker, target) = driven_pair(("arni", "arnm"));
+    let mut command = aterm_uds::spawnfd::command(crate::launch_isolation::aterm_executable());
+    command.args(["harness", "accounts", "renew", "--due", "--on", &target]);
+    command
+        .env_clear()
+        .env("HOME", issuer.tmp.join("home"))
+        .env("XDG_CONFIG_HOME", issuer.tmp.join("cfg"))
+        .env("XDG_RUNTIME_DIR", issuer.tmp.join("run"))
+        .env("XDG_CACHE_HOME", issuer.tmp.join("cache"))
+        .env("XDG_DATA_HOME", issuer.tmp.join("data"))
+        .env("XDG_STATE_HOME", issuer.tmp.join("state"))
+        .env("TMPDIR", issuer.tmp.join("tmp"))
+        .env("ATERM_LOG", "off")
+        .env("ATERM_STATE_HOME", issuer.tmp.join("state"))
+        .env(aterm_net::loopback::SEAM, "1")
+        .env(ISSUER_WITHIN_SEAM, HANG.as_millis().to_string())
+        .env(HANDSHAKE_SEAM, HANG.as_millis().to_string())
+        .env(LOCK_WAIT_SEAM, HANG.as_millis().to_string())
+        .env("PATH", issuer.tmp.join("no-programs"));
+    let output = aterm_uds::deadline::output_with_input_until(
+        &mut command,
+        aterm_uds::secret::Secret::new(&[]),
+        Instant::now() + HANG,
+        64 * 1024,
+    )
+    .expect("native renewal completed");
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{output:?}");
+    assert!(text.contains(&format!("renewing on {target}:")), "{text}");
+    assert!(
+        text.contains("nothing is due on this machine"),
+        "{output:?}"
+    );
+
+    // Losing the grant is a refusal, never an SSH fallback or an empty success.
+    fleet_ok(&member.tmp, &["allow", "facts"], None);
+    let _ = drive_refused(
+        &issuer.tmp,
+        &target,
+        &["accounts-renew", "start=1123456789abcdef0123456789abcdef"],
+    );
+}
+
 /// [`driven_pair`], the member's heartbeat every `beat_ms` (`ATERM_DEBUG_FLEET_HEARTBEAT_MS`)
 /// where one is named.
 fn driven_pair_beating(
@@ -1380,7 +1908,6 @@ fn driven_pair_beating(
             fleet_ok(tmp, &["allow", "drive", "--from", &issuer_node], None);
             cmd.env("ATERM_STATE_HOME", tmp.join("state"))
                 .env("ATERM_DEBUG_FLEET_RETRY_MS", RETRY_MS)
-                .env("ATERM_DEBUG_FLEET_LIFETIME_MS", NEVER_MS)
                 .args(["--lines", "24", "--columns", "80"]);
             if let Some(ms) = beat_ms {
                 cmd.env("ATERM_DEBUG_FLEET_HEARTBEAT_MS", ms);
@@ -1734,16 +2261,24 @@ fn an_all_member_grant_lets_every_member_drive_and_keeps_the_holds_they_take() {
     let member_state = member.tmp.join("state");
     let issuer_node =
         std::fs::read_to_string(issuer.tmp.join("state/fleet-node")).expect("the issuer node id");
-    let own_has_third = read_peers(&member_state)
-        .expect("the member's book")
-        .iter()
-        .any(|peer| peer.node.as_deref() == Some(third_node.as_str()));
-    let copy_has_third =
-        aterm_net::fleet_member::read_issuer_book(&member_state, issuer_node.trim())
+    let books = || {
+        let own = read_peers(&member_state)
+            .expect("the member's book")
             .iter()
             .any(|peer| peer.node.as_deref() == Some(third_node.as_str()));
+        let copy = aterm_net::fleet_member::read_issuer_book(&member_state, issuer_node.trim())
+            .iter()
+            .any(|peer| peer.node.as_deref() == Some(third_node.as_str()));
+        (own, copy)
+    };
+    // The member's heartbeat brings the issuer's current book every BEAT_MS: a round that read
+    // it before the removal, or a `peers` read a loaded machine kept from answering, leaves the
+    // older copy until that next round.
+    let cleared =
+        aterm_spec::wait::within(HANG, POLL_GAP, || (books() == (false, false)).then_some(()));
+    let (own_has_third, copy_has_third) = books();
     assert!(
-        !own_has_third && !copy_has_third,
+        cleared.is_some(),
         "removal from both books must leave no member binding: own={own_has_third} copy={copy_has_third}"
     );
     hold_ends(&member, &worker);

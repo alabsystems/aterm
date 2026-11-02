@@ -143,6 +143,15 @@ pub struct ViewState {
 
     marked_text: RefCell<Obj>,
 
+    /// LOCAL PATCH (aterm): the window's frame clock (`Window::set_frame_clock`), the display
+    /// link this view made on the first ask (`frame_clock.rs`); it retains the view until the
+    /// window closes ([`WinitView::end_frame_clock`]).
+    frame_link: RefCell<Option<Obj>>,
+
+    /// LOCAL PATCH (aterm): the window closed ([`WinitView::end_frame_clock`]): no display link
+    /// is made again, since none would be invalidated and it would retain the view for good.
+    frame_clock_ended: Cell<bool>,
+
     _ns_window: WeakObj,
 }
 
@@ -183,6 +192,15 @@ aterm_objc::declare_class! {
                 self.ivars().app_delegate.handle_redraw(WinitWindow::id_of(window.id()));
             }
 
+        }
+
+        // LOCAL PATCH (aterm): the frame clock's vsync (`frame_clock.rs`).
+        @sel(atermFrameTick:)
+        fn aterm_frame_tick(&self, link: Id) {
+            trace_scope!("atermFrameTick:");
+            // SAFETY: the display link calls its target with itself, live.
+            let (target, period) = unsafe { super::frame_clock::tick_of(link) };
+            self.queue_event(WindowEvent::FrameTick { target, period });
         }
 
         @sel(acceptsFirstResponder) @abort_on_exception
@@ -418,6 +436,7 @@ aterm_objc::declare_class! {
         @sel(keyDown:)
         fn key_down(&self, event: Id) {
             trace_scope!("keyDown:");
+            let _source = key_source(event);
             {
                 let mut prev_input_source = self.ivars().input_source.borrow_mut();
                 let current_input_source = self.current_input_source();
@@ -481,6 +500,7 @@ aterm_objc::declare_class! {
         @sel(keyUp:)
         fn key_up(&self, event: Id) {
             trace_scope!("keyUp:");
+            let _source = key_source(event);
             let event = replace_event(event, self.ivars().option_as_alt.get());
             self.update_modifiers(event.id(), false);
 
@@ -538,6 +558,7 @@ aterm_objc::declare_class! {
                 event
             };
 
+            let _source = key_source(event);
             self.update_modifiers(event, false);
             // SAFETY: `event` is the live `NSEvent` just read from AppKit.
             let event =
@@ -717,6 +738,8 @@ impl WinitView {
             forward_key_to_app: Default::default(),
             option_as_alt: Default::default(),
             marked_text: RefCell::new(new_marked_text()),
+            frame_link: RefCell::new(None),
+            frame_clock_ended: Cell::new(false),
             // SAFETY: `as_id()` is a live non-null object pointer.
             _ns_window: unsafe { WeakObj::new(window.as_id()) },
         })
@@ -810,6 +833,61 @@ impl WinitView {
     /// Returns the owning `NSWindow` as [`Obj`].
     fn window(&self) -> Obj {
         self.ivars()._ns_window.load().expect("view to have a window")
+    }
+
+    /// LOCAL PATCH (aterm): run (`want`) or pause the window's frame clock
+    /// (`Window::set_frame_clock`), making its display link on the first ask; whether the view
+    /// has one (macOS 14 and later; never once the window closed).
+    pub(super) fn set_frame_clock(&self, want: bool) -> bool {
+        let _ = self.mtm();
+        if self.ivars().frame_clock_ended.get() {
+            return false;
+        }
+        let mut link = self.ivars().frame_link.borrow_mut();
+        if link.is_none() {
+            if !want {
+                // SAFETY: `self` is a live `NSView`.
+                return unsafe { super::frame_clock::can_link(self.as_id()) };
+            }
+            // SAFETY: `self` is a live `NSView` on the main thread, and implements
+            // `atermFrameTick:`; `end_frame_clock` invalidates the link when the window closes.
+            *link = unsafe { super::frame_clock::make_link(self.as_id(), sel!(atermFrameTick:)) };
+        }
+        let Some(obj) = link.as_ref() else {
+            return false;
+        };
+        // SAFETY: `obj` is the live link this view made, `self` its live view, on the main thread.
+        unsafe { super::frame_clock::set_running(obj.id(), self.as_id(), want) };
+        true
+    }
+
+    /// LOCAL PATCH (aterm): a weak reference to the display link this view holds now; `None`
+    /// before its frame clock's first run and once its window closed
+    /// (`platform::macos::frame_clock_link`, a debug seam).
+    #[cfg(any(test, debug_assertions))]
+    pub(super) fn frame_clock_link(&self) -> Option<WeakObj> {
+        let _ = self.mtm();
+        self.ivars().frame_link.borrow().as_ref().map(WeakObj::from_obj)
+    }
+
+    /// LOCAL PATCH (aterm): weak references to every display link this view made for its frame
+    /// clock, in the order made, recorded where `frame_clock.rs`'s `make_link` returned
+    /// (`platform::macos::frame_clock_links`, a debug seam).
+    #[cfg(any(test, debug_assertions))]
+    pub(super) fn frame_clock_links(&self) -> Vec<WeakObj> {
+        let _ = self.mtm();
+        super::frame_clock::links_made_for(self.as_id())
+    }
+
+    /// LOCAL PATCH (aterm): the window is closing: stop its frame clock for good, so the link
+    /// lets go of this view, and make none again.
+    pub(super) fn end_frame_clock(&self) {
+        self.ivars().frame_clock_ended.set(true);
+        if let Some(link) = self.ivars().frame_link.borrow_mut().take() {
+            // SAFETY: `link` is the live link this view made, on the main thread (the delegate's
+            // `windowWillClose:`).
+            unsafe { super::frame_clock::invalidate(link.id()) };
+        }
     }
 
     fn queue_event(&self, event: WindowEvent) {
@@ -1094,6 +1172,21 @@ fn mouse_button(event: Id) -> MouseButton {
     }
 }
 
+/// Classify the original key before replacement, interpretation or a deferred callback.
+fn key_source(event: Id) -> super::key_origin::Scope {
+    // SAFETY: keyDown:/keyUp: receive a live NSEvent key, and cancelOperation: checks its
+    // current event is non-nil and key-down/up first. `-type` is Q16@0:8, `-keyCode` S16@0:8,
+    // and `-timestamp` d16@0:8; each getter is defined for these key events.
+    let key = unsafe {
+        crate::platform::macos::NativeKeyEvent {
+            kind: send_usize(event, sel!(type)),
+            keycode: send_u16(event, sel!(keyCode)),
+            timestamp: send_f64(event, sel!(timestamp)),
+        }
+    };
+    super::key_origin::source(key)
+}
+
 /// Returns a `+1` key event, stripping Option characters when [`option_is_alt`] holds.
 ///
 /// LOCAL PATCH (aterm): upstream's `replace_event`, which rebuilt any event; this one rebuilds only
@@ -1137,7 +1230,8 @@ fn replace_event(event: Id, option_as_alt: OptionAsAlt) -> Obj {
                 send_u16(event, sel!(keyCode)),
             )
         };
-        // SAFETY: `rebuilt` is nil or the live autoreleased event.
+        // SAFETY: `rebuilt` is nil or the live autoreleased event; `Obj::retain` takes its own +1
+        // before this pool drains, and answers `None` for nil.
         unsafe { Obj::retain(rebuilt) }.unwrap_or_else(|| copy_event(event))
     })
 }

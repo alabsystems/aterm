@@ -459,6 +459,10 @@ impl Dir {
                     let mut f = create_fresh(&tmp, &mut OpenOptions::new())?;
                     f.write_all(bytes)?;
                     astream_sys::full_sync(&f)?;
+                    // The power-loss model (`power_loss.rs`) learns the flush, as
+                    // `flush_file` tells it: the offline seal's crash tests read it.
+                    #[cfg(all(test, unix, feature = "retention"))]
+                    crate::power_loss::flushed(&tmp);
                 }
                 crate::store::rename_path(&tmp, &path)?;
                 sync_parent_dir(&path)

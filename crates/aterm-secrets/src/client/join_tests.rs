@@ -2313,6 +2313,14 @@ fn an_approver_record_is_its_own_process_s_and_a_failed_removal_is_tried_again()
     clear_dead_stuck(&paths).expect("cleared");
     assert_eq!(approver_stuck(&paths, live), Some("stuck".to_string()));
     assert_eq!(approver_stuck(&paths, gone), None);
+    let linked_home = root.path().join("linked-home");
+    let linked_paths = Paths::for_home(&linked_home);
+    std::fs::create_dir_all(linked_paths.dir.parent().unwrap()).expect("parent");
+    std::os::unix::fs::symlink(&paths.dir, &linked_paths.dir).expect("symlink dir");
+    std::fs::write(paths.stuck_file(gone), "stuck\n").expect("record");
+    assert!(clear_dead_stuck(&linked_paths).is_err());
+    assert!(paths.stuck_file(gone).exists());
+    std::fs::remove_file(paths.stuck_file(gone)).expect("rm gone");
 
     let mut approver = Approver {
         failing: true,
@@ -2839,12 +2847,16 @@ static NOBODY: crate::wake::Bell = crate::wake::Bell::new();
 /// What a subscriber loop hears in a test that hears nothing of the network.
 fn deaf() -> Hearing<'static> {
     Hearing {
-        found: &found_none,
+        found: &FOUND_NONE,
         bell: &NOBODY,
         routes: false,
         ask: &ask_nobody,
+        hold: &hold_nothing,
     }
 }
+
+/// A test loop's round `[swarm]` holds: it has no standing browse to drop.
+fn hold_nothing() {}
 
 /// A subscriber's ask of ALab's members that reaches none.
 fn ask_nobody(_: &Paths) -> crate::Result<usize> {
@@ -2914,10 +2926,11 @@ fn a_mac_waiting_for_alab_asks_its_members_from_its_subscriber() {
                     routes: &crate::server::route_sources,
                 },
                 &Hearing {
-                    found: &found_none,
+                    found: &FOUND_NONE,
                     bell: &NOBODY,
                     routes: false,
                     ask: &ask,
+                    hold: &hold_nothing,
                 },
             )
         });
@@ -2932,22 +2945,27 @@ fn a_mac_waiting_for_alab_asks_its_members_from_its_subscriber() {
             .expect("cleanly");
     });
     assert!(
-        logged.lock().expect("log").iter().any(
-            |line| line.contains("automatic LAN credential sync completed through 2 member(s)")
-        ),
+        logged
+            .lock()
+            .expect("log")
+            .iter()
+            .any(|line| line.contains("2 show its request; press Allow on any one")),
         "{:?}",
         logged.lock().expect("log")
     );
 }
 
-/// When a waiting Mac's subscriber asks ALab's members: once each minute while it waits for the
-/// ALab vault at a URL, saying a changed answer once; never for another vault, never on a Mac
+/// When a waiting Mac's subscriber asks ALab's members: at once as it starts waiting for the ALab
+/// vault at a URL, then after 1, 2, 4 and 8 minutes and every 15 minutes from then on, saying a
+/// changed answer once; at once again on another network or once a person's Join posted its
+/// request again, but not after its own hourly ask again; never for another vault, never on a Mac
 /// that is in, and never once a member's `Allowed` is held (the run let it in, and the vault
 /// records it).
-/// NEGATIVE CONTROLS: an `ask_members_if_due` without its `holds_allowed` check asks again
-/// after a run let this Mac in; one without its ALab check asks ALab's members for a team vault.
+/// NEGATIVE CONTROLS: a fixed minute's cadence asks within each longer pause; an
+/// `ask_members_if_due` without its `holds_allowed` check asks again after a run let this Mac in;
+/// one without its ALab check asks ALab's members for a team vault.
 #[test]
-fn a_waiting_mac_asks_alabs_members_once_a_minute_until_a_member_allows_it() {
+fn a_waiting_mac_asks_alabs_members_less_often_until_a_member_allows_it() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let server = serve_holding(&root.path().join("store"), Duration::from_millis(200));
     let (admin, mb, alab) = waiting_for_alab(root.path(), &server);
@@ -2956,12 +2974,23 @@ fn a_waiting_mac_asks_alabs_members_once_a_minute_until_a_member_allows_it() {
     let said = std::sync::Mutex::new(Vec::<String>::new());
     let log = |line: &str| said.lock().expect("log").push(line.to_owned());
     let count = || asks.load(Ordering::SeqCst);
-    let a_minute_ago = || {
-        Instant::now()
-            .checked_sub(ASK_MEMBERS_EVERY + Duration::from_secs(1))
-            .expect("an instant a minute ago")
+    let minutes: Vec<u64> = (1..=7)
+        .map(|asks| ask_members_pause(asks).as_secs() / 60)
+        .collect();
+    assert_eq!(minutes, [1, 2, 4, 8, 15, 15, 15]);
+    // The last ask, its pause gone by; and almost, a second short.
+    let passed = |asked: &mut MembersAsked| {
+        asked.at =
+            Instant::now().checked_sub(ask_members_pause(asked.asks) + Duration::from_secs(1));
     };
-    let mut asked = MembersAsked::default();
+    let nearly = |asked: &mut MembersAsked| {
+        asked.at =
+            Instant::now().checked_sub(ask_members_pause(asked.asks) - Duration::from_secs(1));
+    };
+    let mut asked = MembersAsked {
+        network: || Some("home".to_owned()),
+        ..MembersAsked::default()
+    };
     crate::envelope::TEST_RETIRED.with(|cell| *cell.borrow_mut() = None);
     ask_members_if_due(&mb, &mut asked, &ask, &log);
     assert_eq!(
@@ -2974,49 +3003,188 @@ fn a_waiting_mac_asks_alabs_members_once_a_minute_until_a_member_allows_it() {
     assert_eq!(count(), 1, "it asks as it starts waiting");
     ask_members_if_due(&mb, &mut asked, &ask, &log);
     assert_eq!(count(), 1, "and not again within the minute");
-    asked.at = Some(a_minute_ago());
-    ask_members_if_due(&mb, &mut asked, &ask, &log);
-    asked.at = Some(a_minute_ago());
-    ask_members_if_due(&mb, &mut asked, &ask, &log);
-    assert_eq!(count(), 3, "it asks again each minute");
+    for (asks, minutes) in [(1, 1), (2, 2), (3, 4), (4, 8), (5, 15), (6, 15)] {
+        assert_eq!(asked.asks, asks);
+        nearly(&mut asked);
+        ask_members_if_due(&mb, &mut asked, &ask, &log);
+        assert_eq!(count(), asks as usize, "not within {minutes} minutes");
+        passed(&mut asked);
+        ask_members_if_due(&mb, &mut asked, &ask, &log);
+        assert_eq!(count(), asks as usize + 1, "again after {minutes} minutes");
+    }
     assert_eq!(
         said.lock().expect("log").len(),
-        3,
-        "none, then 1, then 2 heard it: each said once {:?}",
+        7,
+        "none, then 1, 2, … 6 heard it: each said once {:?}",
         said.lock().expect("log")
+    );
+    // Another network: at once.
+    asked.network = || Some("office".to_owned());
+    ask_members_if_due(&mb, &mut asked, &ask, &log);
+    assert_eq!(
+        (count(), asked.asks),
+        (8, 1),
+        "another network asks at once"
+    );
+    ask_members_if_due(&mb, &mut asked, &ask, &log);
+    assert_eq!(count(), 8, "and then waits a minute");
+    // The subscriber's own hourly ask again moves the request: no new start.
+    let mut state = load_state(&mb).expect("state");
+    state.requested = state.requested.saturating_add(3_600);
+    save_state(&mb, &state).expect("saved");
+    asked.asked_again(Some(state.requested));
+    ask_members_if_due(&mb, &mut asked, &ask, &log);
+    assert_eq!(count(), 8, "its own ask again starts nothing over");
+    // A person's Join posts the request again: at once.
+    state.requested = state.requested.saturating_add(7);
+    save_state(&mb, &state).expect("saved");
+    ask_members_if_due(&mb, &mut asked, &ask, &log);
+    assert_eq!(
+        (count(), asked.asks),
+        (9, 1),
+        "a person's Join asks at once"
     );
     let mut theirs = MembersAsked::default();
     ask_members_if_due(&admin, &mut theirs, &ask, &log);
-    assert_eq!(count(), 3, "a Mac that is in asks nobody");
+    assert_eq!(count(), 9, "a Mac that is in asks nobody");
     super::handover::test_hand_allowed(&admin, &mb, "mb");
-    let mut complete = load_state(&mb).unwrap();
-    complete.failed = false;
-    save_state(&mb, &complete).unwrap();
-    asked.at = Some(a_minute_ago());
+    passed(&mut asked);
     ask_members_if_due(&mb, &mut asked, &ask, &log);
-    assert_eq!(count(), 3, "a Mac a member allowed asks nobody");
-    let mut incomplete = load_state(&mb).unwrap();
-    incomplete.failed = true;
-    incomplete.source_identity = None;
-    save_state(&mb, &incomplete).unwrap();
-    asked.at = Some(a_minute_ago());
-    ask_members_if_due(&mb, &mut asked, &ask, &log);
-    assert_eq!(
-        count(),
-        4,
-        "an incomplete credential bundle is requested again"
-    );
-    incomplete.failed = false;
-    save_state(&mb, &incomplete).unwrap();
-    asked.at = Some(a_minute_ago());
-    ask_members_if_due(&mb, &mut asked, &ask, &log);
-    assert_eq!(
-        count(),
-        4,
-        "a repaired bundle no longer needs a peer handoff"
-    );
+    assert_eq!(count(), 9, "a Mac a member allowed asks nobody");
+    assert_eq!(asked.asks, 0, "the Allow ends the asking");
     crate::envelope::TEST_RETIRED.with(|cell| *cell.borrow_mut() = None);
     server.stop();
+}
+
+/// `[swarm] enabled = false` holds all automatic vault work (`docs/DESIGN-alab-swarm-2026-10-27.md`
+/// §9: it sets `aterm secrets agent off` among the rest), so a subscriber already running for a
+/// Mac waiting on the ALab vault asks no member on the LAN, and starts no converge pass, once the
+/// switch is off, says so once, drops its standing browse at each round the switch holds
+/// ([`Hearing::hold`]), and asks again once a person turns it on.
+/// NEGATIVE CONTROL: a subscriber loop that reads no switch asks ALab's members at once.
+#[test]
+fn swarm_off_asks_no_alab_member_from_a_waiting_subscriber() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let server = serve_holding(&root.path().join("store"), Duration::from_millis(200));
+    let (_admin, mb, alab) = waiting_for_alab(root.path(), &server);
+    let config =
+        aterm_types::dirs::resolve_aterm_config_path(None, None, Some(mb.home.as_os_str()))
+            .expect("a config path under the test home");
+    std::fs::create_dir_all(config.parent().expect("its folder")).unwrap();
+    std::fs::write(&config, "[swarm]\nenabled = false\n").unwrap();
+    assert_eq!(crate::swarm::enabled_in_home(&mb.home), Ok(false));
+    let asks = std::sync::atomic::AtomicUsize::new(0);
+    let ask = |_: &Paths| {
+        asks.fetch_add(1, Ordering::SeqCst);
+        Ok(1)
+    };
+    let started = std::sync::atomic::AtomicUsize::new(0);
+    let start = |_: &Path| {
+        started.fetch_add(1, Ordering::SeqCst);
+        None
+    };
+    let stop = AtomicBool::new(false);
+    let holds = std::sync::atomic::AtomicUsize::new(0);
+    let hold = || {
+        holds.fetch_add(1, Ordering::SeqCst);
+    };
+    // Each round of the loop begins by asking whether to stop.
+    let rounds = std::sync::atomic::AtomicUsize::new(0);
+    let logged = std::sync::Mutex::new(Vec::<String>::new());
+    let said = |words: &str| {
+        logged
+            .lock()
+            .expect("log")
+            .iter()
+            .filter(|line| line.contains(words))
+            .count()
+    };
+    std::thread::scope(|scope| {
+        let _stops = StopsOnDrop(&stop);
+        let subscriber = scope.spawn(|| {
+            crate::envelope::TEST_RETIRED.with(|cell| *cell.borrow_mut() = Some(alab.clone()));
+            subscriber_loop_until(
+                &mb,
+                &|line| logged.lock().expect("log").push(line.to_owned()),
+                &|| {
+                    rounds.fetch_add(1, Ordering::SeqCst);
+                    stop.load(Ordering::SeqCst)
+                },
+                &Converging {
+                    start: &start,
+                    routes: &crate::server::route_sources,
+                },
+                &Hearing {
+                    found: &FOUND_NONE,
+                    bell: &NOBODY,
+                    routes: false,
+                    ask: &ask,
+                    hold: &hold,
+                },
+            )
+        });
+        until("the subscriber says sharing holds it", || {
+            said("sharing is off ([swarm] enabled = false)") > 0
+        });
+        let held = rounds.load(Ordering::SeqCst);
+        until("three more rounds the switch holds", || {
+            rounds.load(Ordering::SeqCst) >= held + 3
+        });
+        assert_eq!(asks.load(Ordering::SeqCst), 0, "swarm off: no member asked");
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            0,
+            "swarm off: no converge pass"
+        );
+        assert!(
+            holds.load(Ordering::SeqCst) >= 3,
+            "swarm off: each held round drops the standing browse"
+        );
+        assert_eq!(
+            said("sharing is off ([swarm] enabled = false)"),
+            1,
+            "said once"
+        );
+        std::fs::write(&config, "[swarm]\nenabled = true\n").unwrap();
+        until("the subscriber asks once sharing is on", || {
+            asks.load(Ordering::SeqCst) > 0
+        });
+        stop.store(true, Ordering::SeqCst);
+        server.stop();
+        subscriber
+            .join()
+            .expect("the subscriber ends")
+            .expect("cleanly");
+    });
+    assert_eq!(said("sharing is on again"), 1);
+}
+
+/// The subscriber's standing `_alab-vault._tcp` browse ends once `[swarm]` holds the rounds and
+/// a fresh one starts with the first pass of the ALab vault after sharing comes back on: no
+/// `dns-sd -B` runs while sharing is off. (A test build's `Watch::start` runs no browse.)
+/// NEGATIVE CONTROL: make `StandingBrowse::stop` keep the watch: it still runs while held.
+#[test]
+fn the_standing_browse_ends_while_sharing_is_off_and_starts_afresh() {
+    let bell = std::sync::Arc::new(crate::wake::Bell::default());
+    let standing = StandingBrowse::default();
+    let starts = std::sync::atomic::AtomicUsize::new(0);
+    let start = || {
+        starts.fetch_add(1, Ordering::SeqCst);
+        crate::discover::Watch::start(&bell, &[])
+    };
+    let first = standing.watch_or_start(start);
+    drop(standing.watch_or_start(|| panic!("one browse runs: no second start")));
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
+    drop(first);
+    standing.stop();
+    assert!(!standing.running(), "sharing off: no standing browse runs");
+    drop(standing.watch_or_start(start));
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        2,
+        "sharing on again: a fresh browse"
+    );
+    assert!(standing.running());
 }
 
 /// `mb`, let into `admin`'s vault at `source` and holding its version.
@@ -3171,23 +3339,32 @@ fn a_failing_subscriber_ends_its_nap_on_a_browse_add() {
             .iter()
             .any(|line| line.contains(what))
     };
+    let woken = "asking again now: woken by a vault server the browse heard";
     let stop = AtomicBool::new(false);
+    // The wake this test waits for stops the loop as it is said, before the next round begins.
+    let log = |line: &str| {
+        if line.contains(woken) {
+            stop.store(true, Ordering::SeqCst);
+        }
+        logged.lock().expect("log").push(line.to_owned());
+    };
     std::thread::scope(|scope| {
         let _stops = StopsOnDrop(&stop);
         let subscriber = scope.spawn(|| {
             subscriber_loop_until(
                 &mb,
-                &|line| logged.lock().expect("log").push(line.to_owned()),
+                &log,
                 &|| stop.load(Ordering::SeqCst),
                 &Converging {
                     start: &|_| None,
                     routes: &crate::server::route_sources,
                 },
                 &Hearing {
-                    found: &found_none,
+                    found: &FOUND_NONE,
                     bell: &bell,
                     routes: false,
                     ask: &ask_nobody,
+                    hold: &hold_nothing,
                 },
             )
         });
@@ -3195,9 +3372,7 @@ fn a_failing_subscriber_ends_its_nap_on_a_browse_add() {
             said("retrying with backoff")
         });
         watch.feed(&browse_add("m3"));
-        until("the nap ends on the browse's Add", || {
-            said("asking again now: woken by a vault server the browse heard")
-        });
+        until("the nap ends on the browse's Add", || said(woken));
         stop.store(true, Ordering::SeqCst);
         subscriber
             .join()
@@ -3231,12 +3406,18 @@ fn a_pass_healthy_after_errors_starts_a_runner() {
     drop(gone);
     save_config(&mb, &unreached).expect("saved");
     let starts = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    // The start this test waits for stops the loop as it is made, before the pause after its
+    // pass begins.
     let start = |_: &Path| {
-        starts.fetch_add(1, Ordering::SeqCst);
+        if starts.fetch_add(1, Ordering::SeqCst) == 1 {
+            stop.store(true, Ordering::SeqCst);
+        }
         None
     };
     let logged = std::sync::Mutex::new(Vec::<String>::new());
-    let stop = AtomicBool::new(false);
+    let bell = std::sync::Arc::new(crate::wake::Bell::default());
+    let watch = crate::discover::Watch::idle(&bell, &[]);
     std::thread::scope(|scope| {
         let _stops = StopsOnDrop(&stop);
         let subscriber = scope.spawn(|| {
@@ -3248,7 +3429,13 @@ fn a_pass_healthy_after_errors_starts_a_runner() {
                     start: &start,
                     routes: &|| HOME,
                 },
-                &deaf(),
+                &Hearing {
+                    found: &FOUND_NONE,
+                    bell: &bell,
+                    routes: false,
+                    ask: &ask_nobody,
+                    hold: &hold_nothing,
+                },
             )
         });
         until("one start as it starts", || {
@@ -3262,6 +3449,9 @@ fn a_pass_healthy_after_errors_starts_a_runner() {
                 .any(|line| line.contains("retrying with backoff"))
         });
         save_config(&mb, &reached).expect("put back");
+        // A vault server the browse heard ends the failed pass's nap, so the healthy pass comes
+        // at once.
+        watch.feed(&browse_add("m3"));
         until("one more for the healthy pass after errors", || {
             starts.load(Ordering::SeqCst) == 2
         });
@@ -3279,7 +3469,8 @@ fn a_pass_healthy_after_errors_starts_a_runner() {
 /// from there, its source left as it was. The browse is a watch fed the Add as the loop logs the
 /// failed pass, before its nap begins, so no timer can end that nap first.
 /// NEGATIVE CONTROL: a pass that reads its source only (no browsed server) never applies it,
-/// and a nap that waits on no bell never says the browse woke it: the hang detector fires.
+/// and the hang detector fires; a nap that waits on no bell runs to its timer, and the log never
+/// says the browse woke it.
 #[test]
 fn a_server_that_vanishes_and_returns_at_a_new_address_is_applied() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -3311,6 +3502,7 @@ fn a_server_that_vanishes_and_returns_at_a_new_address_is_applied() {
             }]
         }
     };
+    let found = PeerDiscovery::supplied(&found);
     let logged = std::sync::Mutex::new(Vec::<String>::new());
     let log = |line: &str| {
         if line.contains("retrying with backoff") {
@@ -3325,7 +3517,12 @@ fn a_server_that_vanishes_and_returns_at_a_new_address_is_applied() {
             subscriber_loop_until(
                 &mb,
                 &log,
-                &|| stop.load(Ordering::SeqCst),
+                // The version this test waits for stops the loop once it is applied, before the
+                // pause after the pass that applied it.
+                &|| {
+                    stop.load(Ordering::SeqCst)
+                        || load_state(&mb).is_ok_and(|state| state.seq == newer)
+                },
                 &Converging {
                     start: &|_| None,
                     routes: &crate::server::route_sources,
@@ -3335,6 +3532,7 @@ fn a_server_that_vanishes_and_returns_at_a_new_address_is_applied() {
                     bell: &bell,
                     routes: false,
                     ask: &ask_nobody,
+                    hold: &hold_nothing,
                 },
             )
         });
@@ -3604,7 +3802,7 @@ fn a_held_approver_moves_only_once_it_cannot_read_the_vaults_admin_locker() {
     assert_eq!(moves.get(), 0, "nothing moved yet");
     assert_eq!(
         mend(&admin, &release, &held, old),
-        HeldMend::Moved("moved".to_string()),
+        HeldMend::Moved("moved".to_string(), HeldMoved::Locker),
         "a 0.125 approver cannot read the locker 0.138 introduced"
     );
     assert_eq!(moves.get(), 1);
@@ -3699,7 +3897,7 @@ fn the_alab_admins_held_approver_older_than_0_146_moves_onto_this_release() {
     TEST_RETIRED.with(|cell| *cell.borrow_mut() = None);
     assert_eq!(
         moved,
-        HeldMend::Moved("moved".to_string()),
+        HeldMend::Moved("moved".to_string(), HeldMoved::OpenApprover),
         "the ALab admin's 0.145 approver moves onto 0.146"
     );
     assert_eq!(moves.get(), 1);
@@ -3816,7 +4014,7 @@ fn managed_alab_subscribers_follow_installed_releases_without_admin_or_downgrade
         for version in ["0.146.0", "0.147.0", "0.147.0+g1234"] {
             assert_eq!(
                 mend(&own, &held, version),
-                HeldMend::Moved("moved".into()),
+                HeldMend::Moved("moved".into(), HeldMoved::ManagedRelease),
                 "{version}"
             );
         }
@@ -3914,4 +4112,59 @@ fn the_approver_says_how_each_mac_it_let_in_got_in() {
         "{said:?}"
     );
     assert_eq!(by_of("mc"), ["the join password"], "{said:?}");
+}
+
+/// The members' asks back off 1, 2, 4, 8, then every 15 minutes, and only a move to another
+/// network (the default route) starts the pauses over. A laptop that sleeps past a pause wakes
+/// with its Wi-Fi not joined yet, and then with the gateway's hardware address not resolved yet:
+/// neither read is a move, so the asks go on every 15 minutes on the same network rather than
+/// start over at a minute after every wake. Another network still starts them over.
+/// NEGATIVE CONTROL: storing the read as it came (`None`, or a `-` part) reads the rejoined Wi-Fi
+/// as another network.
+#[test]
+fn a_wake_on_the_same_network_does_not_start_the_asks_over() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let server = serve_holding(&root.path().join("store"), Duration::from_millis(200));
+    let (_admin, mb, alab) = waiting_for_alab(root.path(), &server);
+    let asks = std::sync::atomic::AtomicUsize::new(0);
+    let ask = |_: &Paths| Ok(asks.fetch_add(1, Ordering::SeqCst));
+    let log = |_: &str| {};
+    let passed = |asked: &mut MembersAsked| {
+        asked.at =
+            Instant::now().checked_sub(ask_members_pause(asked.asks) + Duration::from_secs(1));
+    };
+    crate::envelope::TEST_RETIRED.with(|cell| *cell.borrow_mut() = Some(alab));
+    let mut asked = MembersAsked {
+        network: || Some("en0 192.168.1.20 00:11:22:33:44:55".to_owned()),
+        ..MembersAsked::default()
+    };
+    ask_members_if_due(&mb, &mut asked, &ask, &log);
+    for _ in 0..5 {
+        passed(&mut asked);
+        ask_members_if_due(&mb, &mut asked, &ask, &log);
+    }
+    assert_eq!(asked.asks, 6, "backed off to every 15 minutes");
+    // Asleep past the pause; the first turn after the wake comes before the Wi-Fi rejoins.
+    passed(&mut asked);
+    asked.network = || None;
+    ask_members_if_due(&mb, &mut asked, &ask, &log);
+    assert_eq!(asked.asks, 7);
+    // The Wi-Fi rejoins, its gateway not resolved yet, then resolved: the same network.
+    asked.network = || Some("en0 192.168.1.20 -".to_owned());
+    ask_members_if_due(&mb, &mut asked, &ask, &log);
+    asked.network = || Some("en0 192.168.1.20 00:11:22:33:44:55".to_owned());
+    ask_members_if_due(&mb, &mut asked, &ask, &log);
+    let after_wake = (asks.load(Ordering::SeqCst), asked.asks);
+    // Another network starts the pauses over.
+    asked.network = || Some("en0 10.0.4.9 00:11:22:33:44:66".to_owned());
+    ask_members_if_due(&mb, &mut asked, &ask, &log);
+    let elsewhere = (asks.load(Ordering::SeqCst), asked.asks);
+    crate::envelope::TEST_RETIRED.with(|cell| *cell.borrow_mut() = None);
+    server.stop();
+    assert_eq!(
+        after_wake,
+        (7, 7),
+        "a wake on the same network asked at once and started the pauses over at a minute"
+    );
+    assert_eq!(elsewhere, (8, 1), "another network asks at once");
 }

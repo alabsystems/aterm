@@ -324,7 +324,9 @@ fn update(
         extra,
     };
     let text = durable::to_toml(&file, MAX_STAMP_BYTES)?;
-    if std::fs::read(&path).is_ok_and(|have| have == text) {
+    if crate::metadata_io::read_bounded_regular_utf8(&path, MAX_STAMP_BYTES)
+        .is_ok_and(|have| have.as_bytes() == text)
+    {
         return Ok(());
     }
     durable::write_ordered(&path, &text)
@@ -725,6 +727,28 @@ mod tests {
             assert_eq!(ProgramStamp::read(&l, "claude"), None, "{bad:?}");
         }
         ProgramStamp::record_check(&l, "claude", 7, None, None).unwrap();
+        assert_eq!(
+            ProgramStamp::read(&l, "claude"),
+            Some(ProgramStamp {
+                last_checked_at: 7,
+                ..ProgramStamp::default()
+            })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_replaces_symlink_even_when_target_bytes_match() {
+        let l = layout("symlink-stamp");
+        ProgramStamp::record_check(&l, "claude", 7, None, None).unwrap();
+        let path = stamp_path(&l, "claude").unwrap();
+        let target = l.prefix.join("fake-stamp.toml");
+        std::fs::copy(&path, &target).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert_eq!(ProgramStamp::read(&l, "claude"), None);
+        ProgramStamp::record_check(&l, "claude", 7, None, None).unwrap();
+        assert!(std::fs::symlink_metadata(&path).unwrap().is_file());
         assert_eq!(
             ProgramStamp::read(&l, "claude"),
             Some(ProgramStamp {

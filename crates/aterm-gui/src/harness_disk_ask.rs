@@ -136,15 +136,27 @@ impl crate::App {
     /// worker: a Claude Code tab in the background under Autopilot Land, with no starting session
     /// and no fact line, its trusted folder the worker folder, so the harness's disk-worker rule
     /// fences its boxes. What the spawn did goes to the next disk look ([`worker_spawned`]).
+    ///
+    /// A folder with no canonical path starts none: without the worker folder as its trusted
+    /// folder, neither the disk-worker rule's fence nor the next look's check for an earlier
+    /// worker ([`earlier_worker`]) would know it.
     pub(crate) fn start_disk_worker(&mut self, task: String, folder: &Path) {
+        let Some(trusted) = folder
+            .to_str()
+            .and_then(crate::spawn_folder::canonical_folder)
+        else {
+            aterm_log::warn!(
+                "harness disk watch: the disk worker did not start: its folder has no canonical path"
+            );
+            worker_spawned(Err("no-folder".to_owned()));
+            return;
+        };
         let order = crate::task_launch::TaskOrder {
             task: task.into_bytes(),
             agent: Program::Claude,
             model: None,
             caller: None,
-            trusted_cwd: folder
-                .to_str()
-                .and_then(crate::spawn_folder::canonical_folder),
+            trusted_cwd: Some(trusted),
             fact_line: false,
             autopilot: aterm_agent::supervise::Autopilot::Land,
             chrome: false,
@@ -334,12 +346,10 @@ static FILLING: Mutex<Option<HostNote>> = Mutex::new(None);
 /// ([`ask::WORKER_FOLDER`]).
 fn worker_folder(state: &Path) -> Option<PathBuf> {
     let dir = state.join(ask::WORKER_FOLDER);
-    std::fs::create_dir_all(&dir).ok()?;
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).ok()?;
-    }
+    crate::control_auth::ensure_private_dir(&dir).ok()?;
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
 }
 
@@ -353,6 +363,77 @@ fn task_seen(store: &Store, sid: &str) -> Option<ask::TaskSeen> {
         TaskState::Done | TaskState::Exited => ask::TaskSeen::Ended,
         TaskState::Stalled => ask::TaskSeen::Stalled(record.why.unwrap_or("stalled").to_owned()),
     })
+}
+
+/// A live session of this process that an earlier disk worker still runs, its sid and its task
+/// record's state, the first found: the record trusts the worker folder
+/// ([`aterm_agent::harness::disk::fence::is_worker_folder`]) and is stalled, or working for less
+/// than [`ask::WORKER_MS`] since it last changed, and the session's own Autopilot is not Off.
+///
+/// Every live session is read, not only those whose foreground is Claude Code: a worker can stall
+/// before Claude Code runs at all (`stalled why=install` when installing it fails, as it may on a
+/// full disk, or `why=shell`), and one stopped at its start (`why=startup`: a sign-in or
+/// first-run screen where its composer should be) counts the same. A worker always carries its
+/// own Autopilot word (it starts under Land), so a person who switches it Off takes it over. One
+/// working past [`ask::WORKER_MS`] since its last change is one the lease no longer bounds (it
+/// ended it as held, and it worked on): it is past the time any worker is given.
+///
+/// While one runs this host starts no other ([`worker_ok_here`]): the next would share its folder,
+/// and one stopped at its start would stop again beside the one that already carries the
+/// attention asking a person to act. Once it is done, exits, is closed or is switched Off, the
+/// host may start one.
+fn earlier_worker(store: &Store, now_ms: i64) -> Option<(String, String)> {
+    let handles: Vec<_> = {
+        let g = store.read().unwrap_or_else(PoisonError::into_inner);
+        g.live_handles().cloned().collect()
+    };
+    handles.into_iter().find_map(|h| {
+        let state = {
+            let t = h
+                .ctx
+                .timeline
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let record = t.task()?;
+            let in_folder = record.trusted_cwd.as_deref().is_some_and(|folder| {
+                aterm_agent::harness::disk::fence::is_worker_folder(Path::new(folder))
+            });
+            let since = i64::try_from(record.since_unix_ms).unwrap_or(i64::MAX);
+            let runs = match record.state {
+                TaskState::Stalled => true,
+                TaskState::Working => now_ms.saturating_sub(since) < ask::WORKER_MS,
+                TaskState::Done | TaskState::Exited => false,
+            };
+            if !(in_folder && runs) {
+                return None;
+            }
+            match record.why {
+                Some(why) => format!("{} why={why}", record.state.as_str()),
+                None => record.state.as_str().to_owned(),
+            }
+        };
+        let off = h
+            .ctx
+            .meta
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .autopilot_word()
+            == Some(aterm_agent::supervise::Autopilot::Off);
+        (!off).then(|| (h.sid.as_str().to_owned(), state))
+    })
+}
+
+/// Whether this host may start a disk worker at `now_ms` ([`ask::Ahead::worker_ok`]): no earlier
+/// one still runs here ([`earlier_worker`]), which the look's debug log names when one does.
+fn worker_ok_here(store: &Store, now_ms: i64) -> bool {
+    let Some((sid, state)) = earlier_worker(store, now_ms) else {
+        return true;
+    };
+    aterm_log::debug!(
+        "harness disk watch: an earlier disk worker @{sid} is {state}: no other starts here while \
+         it runs"
+    );
+    false
 }
 
 /// The unix ms now.
@@ -555,7 +636,7 @@ pub(super) fn after_look(looked: &Looked, sids: &[String], store: &Store, note: 
         ahead: ask::Ahead {
             projected,
             cold,
-            worker_ok: true,
+            worker_ok: worker_ok_here(store, now),
             task: Some(&task),
             spawned: spawned.as_ref(),
         },
@@ -1086,7 +1167,8 @@ enum Drafted {
     /// One stands, and its screen is at a break of the agent's own background work: its turn is
     /// over, and only a shell or a monitor it left runs on
     /// ([`aterm_phase::turn_over_background`], the reader its loop offers a line there by). Its
-    /// agent reads `busy` there, and its loop refuses that line for the draft.
+    /// reader reads busy there and its published word is that turn's rest
+    /// ([`aterm_phase::background_rest`]), and its loop refuses that line for the draft.
     AtBackgroundBreak,
     /// One stands that a look read at a turn break, and every look since read unchanged
     /// ([`Kept::at_break`]), its screen now at no break of the agent's own background work: the
@@ -1254,7 +1336,8 @@ struct Read {
     cwd: Option<PathBuf>,
     /// It rests at a turn break.
     at_break: bool,
-    /// Its agent reads busy: it works.
+    /// Its agent reads busy: it works (a turn over under its own background work publishes its
+    /// rest, not busy).
     working: bool,
     /// Its agent's word ([`held_of`]).
     word: &'static str,
@@ -1266,8 +1349,8 @@ struct Read {
     /// What its composer holds, read only for a supervised session ([`Draft`]).
     draft: Draft,
     /// Its screen, read with [`Self::draft`], is at a break of the agent's own background work
-    /// ([`draft_on`]): its agent reads `busy`, but its loop offers a line there as at an idle
-    /// point ([`Drafted::AtBackgroundBreak`]).
+    /// ([`draft_on`]): its reader reads busy (its published word is the turn's rest), and its
+    /// loop offers a line there as at an idle point ([`Drafted::AtBackgroundBreak`]).
     background: bool,
 }
 
@@ -3293,6 +3376,127 @@ mod tests {
             "the turn break bars what the look bars"
         );
         assert_eq!(bar_at(&store, "s-not-here", key), None);
+    }
+
+    /// An earlier disk worker that still runs keeps the next from starting on this host
+    /// ([`worker_ok_here`]): one stalled at its start or before Claude Code ran, or working within
+    /// [`ask::WORKER_MS`] of its last change, until it is done, exits, is closed or a person
+    /// switches its Autopilot Off; a session in another folder keeps nothing.
+    ///
+    /// NEGATIVE CONTROL: with `earlier_worker` answering `None` (the look's old
+    /// `worker_ok: true`), the first assertion failed ("the disk worker stands at a sign-in
+    /// screen").
+    #[test]
+    fn an_earlier_disk_worker_that_still_runs_keeps_the_next_from_starting() {
+        use crate::task_record::{TaskMark, mark_session_task};
+        use aterm_agent::supervise::Autopilot;
+        let worker_folder = format!(
+            "/state/{}/{}",
+            aterm_agent::harness::cli::HARNESS,
+            ask::WORKER_FOLDER
+        );
+        let mut sessions = crate::session_store::SessionStore::default();
+        let handles: Vec<_> = (0..3u64)
+            .map(|local| {
+                let h = crate::session_store::test_handle(9_100 + local);
+                sessions.register(h.clone());
+                h
+            })
+            .collect();
+        let mark = |i: usize, state: TaskState, why: Option<&'static str>| {
+            let mark = TaskMark {
+                why,
+                ..TaskMark::new(state)
+            };
+            mark_session_task(&handles[i].ctx, handles[i].local_id, &mark).expect("unfenced");
+        };
+        let trust = |i: usize, folder: &str| {
+            handles[i]
+                .ctx
+                .timeline
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .set_task_worker(Program::Claude, Some(folder.to_owned()));
+        };
+        let autopilot = |i: usize, mode: Autopilot| {
+            handles[i]
+                .ctx
+                .meta
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .set_autopilot(Some(mode.word().to_owned()), None);
+        };
+        // 0: the disk worker, started under Land; 1: a worker in a folder of its own; 2: no task
+        // record.
+        mark(0, TaskState::Working, None);
+        trust(0, &worker_folder);
+        autopilot(0, Autopilot::Land);
+        mark(1, TaskState::Stalled, Some("startup"));
+        trust(1, "/Users//me/project");
+        let store: Store = std::sync::Arc::new(std::sync::RwLock::new(sessions));
+        let disk_worker = handles[0].sid.as_str().to_owned();
+        let now = now_ms();
+
+        mark(0, TaskState::Stalled, Some("startup"));
+        assert!(
+            !worker_ok_here(&store, now),
+            "the disk worker stands at a sign-in screen"
+        );
+        assert_eq!(
+            earlier_worker(&store, now),
+            Some((disk_worker.clone(), "stalled why=startup".to_owned())),
+            "the other stuck one is not a disk worker"
+        );
+
+        mark(0, TaskState::Stalled, Some("install"));
+        assert_eq!(
+            earlier_worker(&store, now),
+            Some((disk_worker.clone(), "stalled why=install".to_owned())),
+            "stopped before Claude Code ran, at a shell no agent roster names"
+        );
+
+        autopilot(0, Autopilot::Off);
+        assert!(
+            worker_ok_here(&store, now),
+            "a person switched its Autopilot Off: it is theirs now"
+        );
+        autopilot(0, Autopilot::Land);
+
+        mark(0, TaskState::Working, None);
+        assert_eq!(
+            earlier_worker(&store, now),
+            Some((disk_worker.clone(), "working".to_owned())),
+            "it works in the one worker folder"
+        );
+        let working_since = handles[0]
+            .ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .task()
+            .map(|record| i64::try_from(record.since_unix_ms).expect("a unix ms"))
+            .expect("its task record");
+        assert!(
+            !worker_ok_here(&store, working_since + ask::WORKER_MS - 1),
+            "within the time any worker is given, it holds the next back"
+        );
+        assert!(
+            worker_ok_here(&store, working_since + ask::WORKER_MS),
+            "working past the time any worker is given, it no longer holds the next back"
+        );
+
+        for ended in [TaskState::Done, TaskState::Exited] {
+            mark(0, ended, None);
+            assert!(worker_ok_here(&store, now), "{ended:?}");
+        }
+
+        mark(0, TaskState::Stalled, Some("startup"));
+        assert!(!worker_ok_here(&store, now));
+        store
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .deregister_local(handles[0].local_id);
+        assert!(worker_ok_here(&store, now), "a closed worker keeps nothing");
     }
 
     #[test]

@@ -421,26 +421,55 @@ impl GpuRenderer {
                 t.scrim.is_none(),
                 "the GL arm draws no tray scrim (`TrayQuad::scrim`): Linux shows none"
             );
-            let unchanged = win.gl_tray_card.as_ref().is_some_and(|c| {
-                c.tex.on(&live.dev) && c.w == t.pw && c.h == t.ph && c.pixels.as_slice() == t.rgba
-            });
-            if !unchanged {
-                let tex = live
-                    .dev
-                    .texture_2d(TexelFormat::Rgba8Unorm, t.pw, t.ph, None)?;
-                live.dev
-                    .upload_rows(&tex, 0, t.ph, t.rgba, t.pw * 4, t.pw)?;
-                self.tray_uploads += 1;
-                let mut pixels = win.gl_tray_card.take().map_or_else(Vec::new, |c| c.pixels);
-                pixels.clear();
-                pixels.extend_from_slice(t.rgba);
-                win.gl_tray_card = Some(gl_arm::GlTrayCard {
-                    tex,
-                    w: t.pw,
-                    h: t.ph,
-                    pixels,
-                    serial: self.tray_uploads,
-                });
+            let stride = t.pw as usize * 4;
+            let card = win.gl_tray_card.as_ref().filter(|c| c.tex.on(&live.dev));
+            let update = crate::renderer::tray_card_update(
+                card.map(|c| (c.w, c.h, c.quad_serial)),
+                t,
+                || card.and_then(|c| crate::renderer::changed_row_band(&c.pixels, t.rgba, stride)),
+                &mut self.tray_compare_bytes,
+            );
+            match update {
+                crate::renderer::TrayCardUpdate::Keep => {}
+                crate::renderer::TrayCardUpdate::Rows(y0, y1) => {
+                    let card = win.gl_tray_card.as_mut().expect("a resident card");
+                    let (b0, b1) = (y0 as usize * stride, y1 as usize * stride);
+                    live.dev.upload_rows(
+                        &card.tex,
+                        y0,
+                        y1 - y0,
+                        &t.rgba[b0..b1],
+                        t.pw * 4,
+                        t.pw,
+                    )?;
+                    self.tray_uploads += 1;
+                    self.tray_upload_bytes += (b1 - b0) as u64;
+                    card.pixels[b0..b1].copy_from_slice(&t.rgba[b0..b1]);
+                    card.serial = self.tray_uploads;
+                }
+                crate::renderer::TrayCardUpdate::Whole => {
+                    let tex = live
+                        .dev
+                        .texture_2d(TexelFormat::Rgba8Unorm, t.pw, t.ph, None)?;
+                    live.dev
+                        .upload_rows(&tex, 0, t.ph, t.rgba, t.pw * 4, t.pw)?;
+                    self.tray_uploads += 1;
+                    self.tray_upload_bytes += t.rgba.len() as u64;
+                    let mut pixels = win.gl_tray_card.take().map_or_else(Vec::new, |c| c.pixels);
+                    pixels.clear();
+                    pixels.extend_from_slice(t.rgba);
+                    win.gl_tray_card = Some(gl_arm::GlTrayCard {
+                        tex,
+                        w: t.pw,
+                        h: t.ph,
+                        pixels,
+                        serial: self.tray_uploads,
+                        quad_serial: 0,
+                    });
+                }
+            }
+            if let Some(card) = win.gl_tray_card.as_mut() {
+                card.quad_serial = t.serial;
             }
         }
         let bloom_uniforms = bloom_state.map(|_| {
@@ -450,17 +479,18 @@ impl GpuRenderer {
                     text_blend: text_blend as f32,
                     _pad: 0.0,
                 },
-                BloomUniform {
-                    texel: [1.0 / bw as f32, 1.0 / bh as f32],
-                    strength: page_bloom_strength(self.bloom_strength, input, self.theme.bg),
-                    radius: self.bloom_radius,
-                    chroma_radius: bloom_chroma_radius(self.bloom_radius),
-                    extent: win
-                        .gl_bloom_half
+                BloomUniform::new(
+                    (bw as f32, bh as f32),
+                    (fw, fh),
+                    (
+                        page_bloom_strength(self.bloom_strength, input, self.theme.bg),
+                        self.bloom_radius,
+                    ),
+                    win.gl_bloom_half
                         .as_ref()
                         .map_or([1.0; 2], crate::gl::resources::GlTexture::extent),
-                    _pad: 0.0,
-                },
+                    self.bloom_mask.as_ref(),
+                ),
             )
         });
         let mut bufs = live.present.take().expect("minted above");

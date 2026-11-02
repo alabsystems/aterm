@@ -8,18 +8,19 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::super::relaunch::{
-    ExitCause, NO_SHELL, NO_SHELL_DETAIL, WAIT_HAND_LIFTS, exit_clock, first_idle, hand_waits_out,
+    Continued, ExitCause, NO_SHELL, NO_SHELL_DETAIL, WAIT_HAND_LIFTS, exit_clock, first_idle,
+    hand_waits_out,
 };
 use super::super::upgrade_muse::{self as mz, ExitKind};
 use super::upgrade::{Agent, Dialect, Phase};
 use super::{
-    Client, Hand, Kernel, Live, LiveTab, NoPlan, Opts, Plan, PromptLook, RelaunchLineError, Report,
-    STALE_S, St, TURN_WAIT, TabLife, Typed, alive, connect, cwd_of, descendants_in, exe_of,
-    exit_status, file_holders, held, ids, is_generation, ledger, line_status, load,
-    managed_agent_twin, now_s, open_files, pause, registry_graph, registry_life, roster,
+    Client, Hand, Kernel, Live, LiveTab, NoPlan, NoSocket, Opts, Plan, PromptLook,
+    RelaunchLineError, Report, STALE_S, St, TURN_WAIT, TabLife, Typed, alive, connect, cwd_of,
+    descendants_in, exe_of, exit_status, file_holders, ids, is_generation, ledger, line_status,
+    load, managed_agent_twin, now_s, open_files, pause, registry_graph, registry_life, roster,
     running_block, said, save, screen, shell_dialect_of, squash, started_ms, state_dir,
     store_version, table, turn_takes_gen, turn_verdict, twin_version, type_relaunch_line_with,
-    under_hand, upgrade, wait_now, wait_until,
+    under_hand, unheld_hour, upgrade, wait_now, wait_until,
 };
 
 /// The process facts the Muse Code lane rests on, each read when asked.
@@ -51,6 +52,15 @@ pub(super) trait MuseKernel: Kernel {
     /// session's log begins to be this process's.
     fn started_ms(&self, pid: u32) -> Option<u64> {
         started_ms(pid)
+    }
+    /// What the session `st` relaunches was told at or after unix second `since`, by its own log
+    /// ([`super::super::upgrade_muse_live::prompts_since`]); `None` where that cannot be read.
+    fn prompts_since(&self, st: &St, since: u64) -> Option<Vec<String>> {
+        let log = session_log(&st_lock(st)?)?;
+        Some(super::super::upgrade_muse_live::prompts_since(
+            &log,
+            since.saturating_mul(1_000_000),
+        ))
     }
 }
 
@@ -345,13 +355,21 @@ pub(super) fn follow(snap: &mut super::super::relaunch::Snapshot) -> bool {
     true
 }
 
-/// The word the exit of `snap`'s Muse Code left ([`mz::exit_kind`]), or `None` while no status is drawn.
-fn shell_word(opts: &Opts, snap: &super::super::relaunch::Snapshot) -> Option<ExitKind> {
-    let block = snap.muse()?.block;
-    connect(opts, &snap.tab)
-        .ok()
-        .and_then(|mut c| exit_status(&mut c, &snap.tab, block))
-        .map(mz::exit_kind)
+/// The word the exit of `snap`'s Muse Code left ([`mz::exit_kind`]), or `None` while no status is
+/// drawn; [`NoSocket`] where the window left the read unanswered.
+fn shell_word(
+    opts: &Opts,
+    snap: &super::super::relaunch::Snapshot,
+) -> Result<Option<ExitKind>, NoSocket> {
+    let Some(run) = snap.muse() else {
+        return Ok(None);
+    };
+    let mut c = connect(opts, &snap.tab).map_err(|_| NoSocket)?;
+    match exit_status(&mut c, &snap.tab, run.block) {
+        Some(status) => Ok(Some(mz::exit_kind(status))),
+        None if c.reply_unread() => Err(NoSocket),
+        None => Ok(None),
+    }
 }
 
 /// The word of the session's own log for an exit whose shell said nothing ([`mz::log_verdict`]).
@@ -376,7 +394,7 @@ pub(super) fn look_at_exit(
     let word = if running {
         None
     } else {
-        shell_word(opts, snap)
+        shell_word(opts, snap).ok().flatten()
     };
     super::super::relaunch::ExitLook {
         running,
@@ -519,7 +537,11 @@ pub(super) fn after_exit_onto(
             if relaunched_before {
                 Some(ExitKind::Crashed)
             } else {
-                shell_word(opts, snap).or_else(|| log_word(snap))
+                let shell = shell_word(opts, snap);
+                match shell.ok().flatten().or_else(|| log_word(snap)) {
+                    None if shell == Err(NoSocket) => return said(r, "wait:no-socket"),
+                    word => word,
+                }
             }
         }
         ExitRecord::Unread | ExitRecord::Survived(_) => None,
@@ -652,12 +674,32 @@ fn expired(st: &St, now: u64, k: &dyn MuseKernel) -> Option<(&'static str, Strin
             "shell-gone",
             "the shell that ran Muse Code is gone: there is no prompt to relaunch at".to_owned(),
         )),
-        Phase::Relaunched { at_s } if now.saturating_sub(at_s) > STALE_S => Some((
-            "no-resume",
-            "the relaunched Muse Code never came up in the tab".to_owned(),
-        )),
+        // A carry-on a Muse Code that is up has not taken yet stays owed however long what holds it
+        // stands (a draft, Off, a box): this bound is of one that never came up.
+        Phase::Relaunched { at_s }
+            if now.saturating_sub(at_s) > STALE_S && !relaunch_present(st, k) =>
+        {
+            Some((
+                "no-resume",
+                "the relaunched Muse Code never came up in the tab".to_owned(),
+            ))
+        }
         _ => None,
     }
+}
+
+/// Whether the Muse Code the relaunch line started is up: found already and alive, or a child of
+/// the line's shell no look has found yet.
+fn relaunch_present(st: &St, k: &dyn MuseKernel) -> bool {
+    let lives = st.relaunched_pid != 0
+        && k.alive(st.relaunched_pid)
+        && (st.relaunched_start.is_empty()
+            || k.process_start(st.relaunched_pid)
+                .is_some_and(|s| squash(&s) == st.relaunched_start));
+    lives
+        || k.muse_children(st.shell)
+            .into_iter()
+            .any(|(pid, argv)| k.alive(pid) && relaunched_by_us(pid, &argv, st, k))
 }
 
 /// The lock of the session `st` relaunches, under the data home it records.
@@ -707,6 +749,7 @@ pub(super) fn plan(opts: &Opts, st: &St, k: &dyn MuseKernel) -> Result<Plan, NoP
         detail: e,
     })?;
     Ok(Plan {
+        command: None,
         shell: st.shell,
         dialect,
         line,
@@ -772,7 +815,7 @@ fn relaunch_held(
     st.line.clone_from(&line);
     save(opts, &key(&tab), st);
     let block = super::super::relaunch::line_block(c, &tab);
-    match type_relaunch_line_with(
+    let typed = type_relaunch_line_with(
         opts,
         c,
         shell,
@@ -782,8 +825,10 @@ fn relaunch_held(
         PromptLook::of(st),
         || lock_free(k),
         |c, pid, tab| k.in_tab(c, pid, tab),
-    ) {
-        Ok(()) => st.prompt = None,
+    );
+    let unanswered = typed == Err(RelaunchLineError::Unanswered);
+    match typed {
+        Ok(()) | Err(RelaunchLineError::Unanswered) => st.prompt = None,
         Err(RelaunchLineError::Wait(why)) => {
             st.note_wait(why, now_s());
             return said(r, format!("wait:{why}"));
@@ -811,6 +856,10 @@ fn relaunch_held(
         &format!("{} (resume)", st.line),
     );
     save(opts, &key(&tab), st);
+    if unanswered {
+        // The line may have run: the next step, on a new connection, reads what it started.
+        return said(r, "wait:unanswered");
+    }
     await_held(opts, r, st, c, hand, k)
 }
 
@@ -1108,7 +1157,7 @@ fn type_text(c: &mut Client, tab: &str, text: &str, generation: Option<&str>) ->
         .request_counted(&format!(
             "@{tab} turn {fence}submit=guarded:{guard} {TURN_WAIT} {text}"
         ))
-        .map_err(|e| Typed::Refused(format!("{e}")))?;
+        .map_err(|e| Typed::of_io(&e))?;
     turn_verdict(&head)
 }
 
@@ -1126,12 +1175,30 @@ fn carry_on(
     found(st, new, k);
     r.pid = new;
     let tab = st.tab.clone();
+    let land = !st.quiet && super::super::relaunch::carries_under_land(opts, c, &tab);
     let up = wait_until(opts.timings.muse_up, || {
         if let Some(h) = hand.as_deref_mut() {
             h.keep(c);
         }
-        screen(c, &tab).is_some_and(|s| aterm_phase::muse::composer(&s.rows).is_some())
-    });
+        c.reply_unread()
+            || screen(c, &tab).is_some_and(|s| aterm_phase::muse::composer(&s.rows).is_some())
+    }) && !c.reply_unread();
+    // A live Muse Code whose composer is not drawn owes the carry-on under Cruise as under Land: a
+    // box there stands as a draft does, and a boot ends. Cruise gives it up only for one that is gone.
+    if !up && !st.quiet && (land || (k.alive(new) && !c.reply_unread())) {
+        return said(
+            r,
+            if c.reply_unread() {
+                "wait:no-socket"
+            } else if !k.alive(new) {
+                "wait:resume"
+            } else if matches!(typing_fence(c, &tab), Err("box")) {
+                "wait:box"
+            } else {
+                "wait:composer"
+            },
+        );
+    }
     let mut typed = false;
     let lock_moved = up
         && st.quiet
@@ -1143,6 +1210,7 @@ fn carry_on(
                 std::fs::read_to_string(&lock).is_ok_and(|body| mz::lock_pid(&body) == Some(new))
             })
         });
+    let mut claim = (false, false);
     if up && !st.quiet {
         let lock = st_lock(st);
         let holds = wait_until(opts.timings.muse_lock, || {
@@ -1153,39 +1221,105 @@ fn carry_on(
                 .and_then(|l| k.holders_of(l))
                 .is_some_and(|h| h.contains(&new))
         });
+        if land && !holds {
+            return said(r, "wait:session-lock");
+        }
+        // Nothing is typed over unsent input, and the carry-on is not given up for it: what stands
+        // in the composer keeps it owed ([`super::super::relaunch::settled_for_carry`]).
         let settled = holds
-            && wait_until(opts.timings.carry_settle, || {
-                if let Some(h) = hand.as_deref_mut() {
-                    h.keep(c);
-                }
-                typing_fence(c, &tab).is_ok()
-            });
-        if settled && held(c, &tab, opts.human_grace_s) {
-            return said(r, "wait:held");
+            && match super::super::relaunch::settled_for_carry(
+                opts.timings.carry_settle,
+                c,
+                |c| typing_fence(c, &tab),
+                |c| {
+                    if let Some(h) = hand.as_deref_mut() {
+                        h.keep(c);
+                    }
+                },
+            ) {
+                Ok(settled) => settled,
+                Err(word) => return said(r, word),
+            };
+        if holds && !settled && !c.reply_unread() {
+            return said(r, "wait:unsettled");
+        }
+        if settled && super::super::relaunch::tab_off(c, &tab) {
+            return said(r, "wait:off");
+        }
+        // The person's hour, read off the same `status` as the hold, cuts the go-ahead's
+        // sentence from a carried done check ([`super::super::relaunch::carried_text`]).
+        let hour = match settled.then(|| unheld_hour(c, &tab, opts.human_grace_s)) {
+            Some(None) => return said(r, "wait:held"),
+            Some(Some(hour)) => hour,
+            None => true,
+        };
+        let since = super::super::relaunch::prompts_from(st);
+        if settled
+            && let Some(prompts) = k.prompts_since(st, since)
+            && let Some(r) = super::super::relaunch::reached_first(opts, &r, st, new, &prompts)
+        {
+            return r;
         }
         if settled && k.in_tab(c, new, &tab) {
-            let text = super::super::relaunch::resumed_prompt_as("Muse Code", &st.to, &st.cause);
+            let rows = screen(c, &tab).map(|s| s.rows);
+            let program = aterm_phase::Program::Muse;
+            if land
+                && rows
+                    .as_deref()
+                    .is_some_and(|rows| super::super::relaunch::defended_on_screen(program, rows))
+            {
+                return super::super::relaunch::landing(opts, r, st, new);
+            }
+            // Under Land the restart's facts are typed without Cruise's done check.
+            claim = if land {
+                (false, false)
+            } else {
+                rows.as_deref().map_or((false, false), |rows| {
+                    super::super::relaunch::said_on_screen(program, rows)
+                })
+            };
+            let text = super::super::relaunch::carried_text(
+                super::super::relaunch::resumed_prompt_as("Muse Code", &st.to, &st.cause),
+                claim,
+                hour,
+            );
             let tries = under_hand(c, &tab, hand, |c| {
-                for _ in 0..3 {
-                    let Ok(generation) = typing_fence(c, &tab) else {
-                        break;
-                    };
-                    match type_text(c, &tab, &text, generation.as_deref()) {
-                        Ok(()) => {
-                            typed = true;
-                            break;
-                        }
-                        Err(Typed::Changed | Typed::Yielded) => {
-                            pause(Duration::from_millis(400));
-                        }
-                        Err(Typed::Cut(_) | Typed::Refused(_)) => break,
-                    }
-                }
+                super::super::relaunch::type_carry(
+                    c,
+                    |c| typing_fence(c, &tab),
+                    |c, generation| type_text(c, &tab, &text, generation),
+                    Duration::from_millis(400),
+                )
             });
-            if tries.is_none() {
-                return said(r, "wait:held");
+            match tries {
+                None => return said(r, "wait:held"),
+                Some(Continued::Typed) => typed = true,
+                Some(Continued::Not) => {}
+                Some(Continued::Stands(word)) => return said(r, word),
+                // A line unanswered is read for what it did before it is typed again; a later look
+                // reads it the same way ([`super::super::relaunch::reached_first`]).
+                Some(Continued::Unanswered) => {
+                    if !wait_until(opts.timings.first_idle, || {
+                        k.prompts_since(st, since).is_some_and(|prompts| {
+                            prompts
+                                .iter()
+                                .any(|p| super::super::relaunch::harness_prompt(p))
+                        })
+                    }) {
+                        return said(r, "wait:unanswered");
+                    }
+                    typed = true;
+                }
             }
         }
+        if land && !typed {
+            return said(r, "wait:resume");
+        }
+    }
+    // A carry that typed nothing because the socket left a reply unread is asked again at the
+    // next step, on a new connection.
+    if !typed && c.reply_unread() {
+        return said(r, "wait:no-socket");
     }
     st.phase = Phase::Done;
     st.resumed_pid = new;
@@ -1202,7 +1336,7 @@ fn carry_on(
     let step = if !up {
         "done:unconfirmed"
     } else if typed {
-        "continued"
+        super::super::relaunch::continued_word(claim.0)
     } else if st.quiet && lock_moved {
         "done:resumed"
     } else if st.quiet {

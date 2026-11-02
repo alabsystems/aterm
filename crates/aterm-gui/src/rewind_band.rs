@@ -188,11 +188,6 @@ impl App {
             self.win_pad_top(wid) + self.win_head(wid),
         );
         let now_ms = crate::harness_screen::unix_ms_now();
-        let offset = if panes.is_empty() {
-            0
-        } else {
-            crate::presence::local_offset_s().unwrap_or(0)
-        };
         for (session, _) in &panes {
             self.refresh_rewind_faith(*session);
         }
@@ -203,6 +198,7 @@ impl App {
                 continue;
             };
             let effects = self.rewind_effects_status(wid);
+            let offset = self.rewind_offset_s(view.shown_unix_ms);
             let text =
                 crate::rewind::band_text(view, now_ms, offset, s.ctx.job_feed.bytes(), effects);
             let track = (band_rows(pane.rows) == 2).then(|| track_row(view, pane.cols, &inks));
@@ -284,7 +280,7 @@ impl App {
         let words = crate::rewind::band_text(
             view,
             crate::harness_screen::unix_ms_now(),
-            crate::presence::local_offset_s().unwrap_or(0),
+            self.rewind_offset_s(view.shown_unix_ms),
             s.ctx.job_feed.bytes(),
             self.rewind_effects_status(wid),
         );

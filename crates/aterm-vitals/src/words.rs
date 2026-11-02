@@ -150,12 +150,49 @@ pub fn services_word(family: &str) -> &'static str {
 }
 
 /// Platform wording and local UTC offset for formatting vitals text.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Locale {
     /// Whose wording.
     pub platform: Platform,
     /// The local time's offset from UTC, seconds east: times print as local `HH:MM`.
     pub utc_offset_s: i64,
+    /// Per-instant local UTC offset (`unix_s -> seconds east`), so an earlier
+    /// or later timestamp across a daylight-saving change reads its own offset
+    /// rather than `utc_offset_s`. `None` keeps `utc_offset_s` for every instant.
+    pub utc_offset_at: Option<fn(i64) -> Option<i64>>,
+}
+
+impl PartialEq for Locale {
+    fn eq(&self, other: &Self) -> bool {
+        self.platform == other.platform
+            && self.utc_offset_s == other.utc_offset_s
+            && self.utc_offset_at.is_some() == other.utc_offset_at.is_some()
+    }
+}
+
+impl Eq for Locale {}
+
+impl Locale {
+    /// The local UTC offset at `at_unix_ms`, falling back to `self.utc_offset_s`.
+    #[must_use]
+    pub fn offset_at_ms(&self, at_unix_ms: i64) -> i64 {
+        self.utc_offset_at
+            .and_then(|f| f(at_unix_ms.div_euclid(1000)))
+            .unwrap_or(self.utc_offset_s)
+    }
+
+    /// Format `at_unix_ms` as local `HH:MM` (with weekday prefix when on a
+    /// different local day from `now_unix_ms`), placing each instant on its own
+    /// local UTC offset.
+    #[must_use]
+    pub fn clock(&self, at_unix_ms: i64, now_unix_ms: i64) -> String {
+        clock_local(
+            at_unix_ms,
+            now_unix_ms,
+            self.offset_at_ms(at_unix_ms),
+            self.offset_at_ms(now_unix_ms),
+        )
+    }
 }
 
 /// Semantic ink role for a vitals phrase.
@@ -544,13 +581,25 @@ pub fn pct(share: Option<f32>) -> String {
 /// Format `at_unix_ms` as local `HH:MM` (with weekday prefix when on a different local day).
 #[must_use]
 pub fn clock(at_unix_ms: i64, now_unix_ms: i64, utc_offset_s: i64) -> String {
+    clock_local(at_unix_ms, now_unix_ms, utc_offset_s, utc_offset_s)
+}
+
+/// Format `at_unix_ms` at `at_offset_s` as local `HH:MM` (with weekday prefix
+/// when on a different local day from `now_unix_ms` at `now_offset_s`).
+#[must_use]
+pub fn clock_local(
+    at_unix_ms: i64,
+    now_unix_ms: i64,
+    at_offset_s: i64,
+    now_offset_s: i64,
+) -> String {
     const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-    let local = |ms: i64| ms.div_euclid(1000).saturating_add(utc_offset_s);
-    let at = local(at_unix_ms);
+    let at = at_unix_ms.div_euclid(1000).saturating_add(at_offset_s);
+    let now = now_unix_ms.div_euclid(1000).saturating_add(now_offset_s);
     let day = at.div_euclid(86_400);
     let secs = at.rem_euclid(86_400);
     let hm = format!("{:02}:{:02}", secs / 3600, secs % 3600 / 60);
-    if day == local(now_unix_ms).div_euclid(86_400) {
+    if day == now.div_euclid(86_400) {
         hm
     } else {
         format!("{} {hm}", WEEKDAYS[(day + 3).rem_euclid(7) as usize])
@@ -949,15 +998,22 @@ pub fn well(res: Resource, view: &ResourceView) -> Option<(Mark, InkKind)> {
     })
 }
 
-/// Strip-spanning status sentence forms when a resource has no live cells.
+/// Strip-spanning status sentence forms when a resource has no live cells. Known GPU hardware
+/// keeps its capacity caption even while utilization is unread.
 #[must_use]
 pub fn strip_words(res: Resource, snap: &Snapshot) -> Option<Vec<String>> {
     let view = &snap.resources[res.index()];
     match res {
-        Resource::Gpu if snap.seq > 0 && view.ring.iter().all(|c| c.mean.is_none()) => Some(vec![
-            "no GPU reading on this system".into(),
-            "no GPU reading".into(),
-        ]),
+        Resource::Gpu
+            if snap.seq > 0
+                && view.ring.iter().all(|c| c.mean.is_none())
+                && monitor_capacity(res, snap).is_empty() =>
+        {
+            Some(vec![
+                "no GPU reading on this system".into(),
+                "no GPU reading".into(),
+            ])
+        }
         Resource::Tokens if view.basis == CapBasis::Learning => {
             let (n, of) = (snap.facts.tokens_read_s / 60, TOKENS_LEARN_S / 60);
             Some(vec![
@@ -1076,7 +1132,7 @@ fn disk_states(snap: &Snapshot, loc: &Locale) -> Vec<DiskSaid> {
         });
     }
     if let Some(since) = w.stalled_since {
-        let t = clock(since, snap.at_unix_ms, loc.utc_offset_s);
+        let t = loc.clock(since, snap.at_unix_ms);
         out.push(DiskSaid {
             state: State::Warn,
             forms: vec![
@@ -1170,7 +1226,7 @@ pub fn state(res: Resource, snap: &Snapshot, loc: &Locale) -> Option<StateWords>
         }
         Resource::Gpu => {
             let (n, since) = snap.facts.gpu_resets?;
-            let t = clock(since, snap.at_unix_ms, loc.utc_offset_s);
+            let t = loc.clock(since, snap.at_unix_ms);
             (
                 worst,
                 vec![
@@ -1317,7 +1373,7 @@ fn gpu_details(snap: &Snapshot, loc: &Locale) -> Vec<Clause> {
     }
     let mut out = Vec::new();
     if let Some((n, since)) = snap.facts.gpu_resets {
-        let t = clock(since, snap.at_unix_ms, loc.utc_offset_s);
+        let t = loc.clock(since, snap.at_unix_ms);
         out.push(
             Clause::new(0, vec![format!("GPU reset {n}\u{d7} since {t}")])
                 .kept()
@@ -1620,7 +1676,7 @@ fn tokens_details(snap: &Snapshot, loc: &Locale) -> Vec<Clause> {
     match facts.plan.as_ref() {
         Some(plan) => {
             let p = half_up(f64::from(plan.used_x10) / 10.0);
-            let t = clock(plan.read_at, snap.at_unix_ms, loc.utc_offset_s);
+            let t = loc.clock(plan.read_at, snap.at_unix_ms);
             let w = &plan.window_word;
             out.push(
                 Clause::new(
@@ -1734,7 +1790,7 @@ pub fn disk_wrong(snap: &Snapshot, loc: &Locale) -> Option<String> {
         d.stalled_since.map(|t| {
             format!(
                 "The disk watch has stalled since {}.",
-                clock(t, snap.at_unix_ms, loc.utc_offset_s)
+                loc.clock(t, snap.at_unix_ms)
             )
         })
     })
@@ -2048,7 +2104,10 @@ fn speak_figure(w: &str) -> String {
         return format!("{} of {}", speak_figure(a), speak_figure(b));
     }
     for (suffix, word) in [('k', "thousand"), ('M', "million"), ('G', "billion")] {
-        if let Some(n) = w.strip_suffix(suffix).filter(|n| n.parse::<f64>().is_ok()) {
+        if let Some(n) = w
+            .strip_suffix(suffix)
+            .filter(|n| !n.starts_with('+') && n.parse::<f64>().is_ok())
+        {
             return format!("{n} {word}");
         }
     }
@@ -2189,7 +2248,7 @@ fn trend_sentences(view: &ResourceView, now_ms: i64, loc: &Locale) -> Vec<String
         out.push(format!(
             "Peak {} percent at {}.",
             p(f64::from(max) * 100.0),
-            clock(at, now_ms, loc.utc_offset_s)
+            loc.clock(at, now_ms)
         ));
     }
     let over = heat.iter().filter(|c| c.over).count();
@@ -2850,10 +2909,12 @@ mod tests {
     const MAC: Locale = Locale {
         platform: Platform::MacOs,
         utc_offset_s: 0,
+        utc_offset_at: None,
     };
     const LINUX: Locale = Locale {
         platform: Platform::Linux,
         utc_offset_s: 0,
+        utc_offset_at: None,
     };
 
     fn row(now: f64, capacity: f64) -> ResourceView {
@@ -2987,6 +3048,7 @@ mod tests {
             id: id.into(),
             tab: 2,
             kind: JobKind::Shell,
+            orphan_of: None,
             consumer: Consumer::default(),
             promoted_ms: None,
             task: None,
@@ -4294,6 +4356,17 @@ mod tests {
                 "no GPU reading"
             ]))
         );
+        s.facts.gpu = Some(GpuSample {
+            name: Some("Apple M5 Max".into()),
+            cores: Some(40),
+            ..GpuSample::default()
+        });
+        assert_eq!(
+            strip_words(Resource::Gpu, &s),
+            None,
+            "known hardware keeps its caption while utilization is unread"
+        );
+        assert!(s.resources[Resource::Gpu.index()].now.is_none());
         set(&mut s, Resource::Gpu, steady(row(12.0, 100.0), 0));
         assert_eq!(strip_words(Resource::Gpu, &s), None);
         let mut tokens = row(3_100.0, 1.0);
@@ -4614,6 +4687,23 @@ mod tests {
                 "18c \u{b7} 128G".to_owned()
             ]
         );
+
+        fn dst_offset(unix_s: i64) -> Option<i64> {
+            // 2026-11-01T09:00:00Z: PDT (-7h) -> PST (-8h).
+            Some(if unix_s < 1_793_523_600 {
+                -7 * 3600
+            } else {
+                -8 * 3600
+            })
+        }
+        let dst_loc = Locale {
+            platform: Platform::MacOs,
+            utc_offset_s: -8 * 3600,
+            utc_offset_at: Some(dst_offset),
+        };
+        let at_pdt_ms = 1_793_518_200_000; // 2026-11-01T00:30:00-07:00 (23:30 Sat under -8h)
+        let now_pst_ms = 1_793_529_000_000; // 2026-11-01T02:30:00-08:00
+        assert_eq!(dst_loc.clock(at_pdt_ms, now_pst_ms), "00:30");
     }
 
     #[test]

@@ -172,7 +172,8 @@ pub fn rejoined<'a>(log: &'a str, said: &str) -> Result<[&'a str; 3], String> {
 
 /// The row's verdict on `e`.
 /// # Errors
-/// Walk, log order, or aterm-gui check failed.
+/// The walk before or after did not read the window and its text, aterm.log does not show the
+/// loss and the rejoin in order, or aterm-gui panicked or was gone.
 pub fn judge(e: &Evidence, ordeal: Ordeal) -> Result<String, String> {
     let frame = read_back(&e.before, BEFORE_ECHO).map_err(|why| format!("before: {why}"))?;
     if let Some(line) = e.stderr.lines().find(|l| l.contains("panicked")) {

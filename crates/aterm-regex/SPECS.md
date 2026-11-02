@@ -1,30 +1,12 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-regex: spec recovery from its 86 unit tests
+# aterm-regex: spec recovery from its unit tests
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 22 tests it
-> deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
-> were taken before.
-
-> Status 2026-10-15: this is the crate's migration worklist. Each of the 44 specs below is
-> proved through Trust/Clean about the compiled Rust function, and then the tests it
-> subsumes are deleted. Nothing has been proved or deleted yet. The 3 tests in §4 that
-> sample no spec can be acted on now.
-
-Source: `crates/aterm-regex` (read only). I read every `#[test]`
-(src/{compile 12, lib 11, parse 11, pikevm 12, unicode 6}, tests/{bounds 17, differential 16,
-fuzz 1} = 86) and the code each one reaches. `tests/regex_suite.rs` has no `#[test]`; the
-wave count of 87 counted a doc-comment mention there (§5.1). Nothing was compiled or run. The
-claims below come from reading the code.
-
-Result: **44 specs**, covering **83 tests**. **3 tests are not spec samples** (§4).
-
-The `gaps` column cites the numbered rows of the gap table in
-the historical development audit `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7.
-Gap 0 (the installed seal publishes no Clean-discharged row) blocks every spec, so it is
-listed on every row. No spec is blocked by gap 0 alone: every one needs gap 1
-(non-scalar carriers), since the crate works on `&str`, `Vec` and enum trees throughout.
+Each §1 row states a property of `crates/aterm-regex` that its unit tests sample, to be proved through
+Trust/Clean against the compiled function; a proved spec retires the tests it subsumes. §2 maps each
+test to its specs, §3 orders the proofs, §4 names the tests that sample no spec, and §5 lists where the
+code and the intended spec disagree.
 
 ## 0. Notation used in the statements
 
@@ -38,14 +20,13 @@ listed on every row. No spec is blocked by gap 0 alone: every one needs gap 1
   `satisfied(kind,t,at)`; `A = TOP` makes every assertion passable.
 - `Lang_TOP(ast)`: the language of `ast` with every `Assert` read as epsilon.
 - `Runs(prog,t,q)`: the pairs `(q,e)` such that some path from `start` at position `q` reaches
-  `Match` at `e`, with consuming steps by `cons` and assertions by `SAT(t,pos)`. This is a match
-  beginning at `q`.
-- `BT(prog,t,s)`: the memoised leftmost-first backtracker over `prog`. It tries starts
-  `q ∈ Bnd(t)`, `q ≥ s`, in ascending order, and explores depth first: `Split.a` before
-  `Split.b`, `Jump`, `Assert` by `SAT(t,pos)`, consumption by `cons`. It prunes any `(pc,pos)`
-  already explored, with one visited set shared across all starts, and returns the first `(q,e)`
-  at which `Match` is reached, else `None`. This is the oracle the Pike VM must equal.
-  **Recommendation:** add it as a spec-only function. No Rust function implements it today.
+  `Match` at `e`, with consuming steps by `cons` and assertions by `SAT(t,pos)`.
+- `BT(prog,t,s)`: the memoised leftmost-first backtracker over `prog`, the oracle the Pike VM must
+  equal. It tries starts `q ∈ Bnd(t)`, `q ≥ s`, in ascending order, and explores depth first:
+  `Split.a` before `Split.b`, `Jump`, `Assert` by `SAT(t,pos)`, consumption by `cons`. It prunes any
+  `(pc,pos)` already explored, with one visited set shared across all starts, and returns the first
+  `(q,e)` at which `Match` is reached, else `None`. No Rust function implements it; add it as a
+  spec-only function.
 - `Ref(ast,t,s)`: the AST-level leftmost-first reference semantics, to be authored with
   `ty_model!`. `Alt` is a left-to-right preference. Greedy repeats try the body first and lazy
   ones try the exit first. The empty-iteration rule for nullable loop bodies is the regex
@@ -64,6 +45,9 @@ listed on every row. No spec is blocked by gap 0 alone: every one needs gap 1
   most 2048 instructions.
 - `mark(set,b)` := `(b < 0x80 ∧ set.matches(b as char)) ∨ (b ∈ 0xC2..=0xF4 ∧ (set.negated ∨ perls ≠ ∅ ∨ the last range's hi > 0x7F))`.
 - `orbit(c)` = the elements `fold_orbit(c)` yields. `utf8(c)` = the UTF-8 encoding of `c`.
+- The `gaps` column cites the rows of `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7. Every
+  row lists gap 0 (the installed seal publishes no Clean-discharged row) and gap 1 (non-scalar
+  carriers: the crate works on `&str`, `Vec` and enum trees throughout).
 
 ## 1. Specs (TSV)
 
@@ -120,28 +104,13 @@ compile-refines-reference	refinement	compile::compile, compile::Compiler::{emit,
 regex-reference-semantics	refinement	Regex::{new, find, is_match, find_iter}, parse::parse, compile::compile, pikevm::search	∀ p with Regex::new(p) = Ok(re), ∀ t, when no search is exhausted: [(m.start,m.end) | m ← re.find_iter(t)] = Iter(λs. Ref(P(p,default),t,s), t); re.find(t) is its head, and re.is_match(t) ⇔ it is non-empty. This is the composition of parse-grammar-denotation, compile-refines-reference, pikevm-refines-backtracker, prefilter-transparent, start-anchored-exact and find-iter-advance-rule. The corpora (the builtin selection rules, the syntax corpus, the exotic orbits and the generated fuzz grammar) pin Ref's agreement with the regex crate. That agreement is empirical, so once Ref is a ty_model! these digests become Ref's conformance test with a negative control, not tests to delete (§5.6).	tests/differential.rs::{builtin_selection_patterns_are_pinned, builtin_patterns_select_what_they_are_for, syntax_corpus_is_pinned, exotic_fold_orbits_are_pinned}, tests/fuzz.rs::generated_patterns_are_pinned	FREE once its parts are proved, but the parts include the hardest specs here; Arc<Program>, lifetimes on Match/Matches, the thread_local cache	0, 1, 2, 3, 4, 5, 7, 10, 12, 13
 ```
 
-### Proof dependency order
-
-Table properties (`range-tables-well-formed`, the table half of `fold-orbit-structure`) and the
-leaf contracts (`classset-byte-size`, `builder-knobs`, `assertion-semantics`,
-`thread-list-generation`, `nullable-predicate`, `complement-exact`) →
-`classset-normalize`, `fold-range-closure`, `literal-fold` → `class-denotation`,
-`ascii-bitmap-agrees` → the parser contracts (`parse-quantifier`, `parse-flag-scoping`,
-`parse-nesting-cap`, `parse-refusals`, `parse-error-render`) → the compiler contracts
-(`compile-inst-count` → `compile-size-ceiling`, `compile-terminates-linearly`,
-`compile-greed-arm-swap`, `start-anchored-exact`, `prefilter-sets`) → the VM
-(`pikevm-refines-backtracker` with `prefilter-transparent`; then `earliest-preserves-existence`,
-`step-budget-contract`, `pikevm-linear-cost`, `step-cost-lower-bound`) → the API
-(`fail-closed-wrappers`, `find-iter-advance-rule`, `find-iter-shared-budget`,
-`cut-short-sticky-shared`, `match-offsets-and-accessors`, `api-consistency`) → the refinements
-(`parse-grammar-denotation`, `compile-refines-reference`) → `regex-reference-semantics`.
-`no-panic-total`, `escape-literal`, `perl-class-tables` and `fold-table-derivation` sit beside
-this chain: the last two need a UCD model (gap 8), not the other specs.
-
 ## 2. Test → spec map (TSV)
 
-`primary` is the spec that retires the test. `also` lists the other specs the same test
-samples. `— (§4)` marks a test that samples no spec.
+`primary` is the spec that retires the test; `also` lists the other specs it samples, and `— (§4)`
+marks a test that samples no spec. A test with an `also` that splits its primary role
+(`lib::the_amplifiers_terminate_promptly_instead_of_hanging`, `lib::the_step_limit_is_the_thing_that_decides`,
+`fuzz::generated_patterns_are_pinned`) goes only when both specs are proved. `api-consistency` has no
+primary test.
 
 ```tsv
 file	test	primary	also
@@ -210,32 +179,44 @@ tests/differential.rs	zero_width_matches_are_pinned	find-iter-advance-rule	asser
 tests/fuzz.rs	generated_patterns_are_pinned	regex-reference-semantics	api-consistency
 ```
 
-## 3. Coverage
+## 3. Proof order
 
-- 86 tests read. 83 map to one of the 44 specs. 3 are not spec samples (§4).
-- The biggest collapses: `compile-size-ceiling` (5 primary), `step-budget-contract` (5),
-  `regex-reference-semantics` (5), `prefilter-sets` (4), `pikevm-refines-backtracker` (4),
-  `compile-refines-reference` (4).
-- `api-consistency` has no primary test. It is the secondary reading of
-  `fuzz::generated_patterns_are_pinned`, and it is free once `earliest-preserves-existence` and
-  `find-iter-advance-rule` are proved.
-- Three tests sample two specs that split their primary role:
-  `lib::the_amplifiers_terminate_promptly_instead_of_hanging` (`step-cost-lower-bound`, plus
-  `fail-closed-wrappers`), `lib::the_step_limit_is_the_thing_that_decides`
-  (`step-budget-contract`, plus `builder-knobs`) and `fuzz::generated_patterns_are_pinned`
-  (`regex-reference-semantics`, plus `api-consistency`). Each one is deleted only when both specs
-  are Certified.
-- The 5 digest tests under `regex-reference-semantics` are not deleted when it is proved. They
-  become the `Ref` model's conformance test with a negative control (§5.6).
+Start with the specs that need the fewest gaps beyond 0 and 1 and unblock others:
+
+1. **`classset-byte-size`** (gaps 3): straight-line `usize` arithmetic over `size_of` constants and
+   two `Vec::len` calls, and the class term of `cost`, which `compile-size-ceiling` builds on.
+2. **`range-tables-well-formed`** (gaps 5, 7): no function body, decidable by evaluating the three
+   static range tables and `FOLD`. It is the precondition of `in_ranges` and `fold_next`, under every
+   class, fold and perl spec.
+3. **`builder-knobs`** (gaps 2, 3) with **`regex-metadata`** (gaps 3, 11): by-value field updates
+   with no loops, which the `step_limit` plumbing of `step-budget-contract` and
+   `find-iter-shared-budget` depends on.
+4. **`assertion-semantics`** and **`parse-error-render`** (gaps 3, 5; loop-free `&str` work), then
+   **`thread-list-generation`**, the lemma that lets `pikevm-refines-backtracker` quantify over every
+   cache state.
+
+The rest follows the dependency chain. Table properties (`range-tables-well-formed`, the table half of
+`fold-orbit-structure`) and the leaf contracts (`classset-byte-size`, `builder-knobs`,
+`assertion-semantics`, `thread-list-generation`, `nullable-predicate`, `complement-exact`) →
+`classset-normalize`, `fold-range-closure`, `literal-fold` → `class-denotation`,
+`ascii-bitmap-agrees` → the parser contracts (`parse-quantifier`, `parse-flag-scoping`,
+`parse-nesting-cap`, `parse-refusals`, `parse-error-render`) → the compiler contracts
+(`compile-inst-count` → `compile-size-ceiling`, `compile-terminates-linearly`,
+`compile-greed-arm-swap`, `start-anchored-exact`, `prefilter-sets`) → the VM
+(`pikevm-refines-backtracker` with `prefilter-transparent`; then `earliest-preserves-existence`,
+`step-budget-contract`, `pikevm-linear-cost`, `step-cost-lower-bound`) → the API
+(`fail-closed-wrappers`, `find-iter-advance-rule`, `find-iter-shared-budget`,
+`cut-short-sticky-shared`, `match-offsets-and-accessors`, `api-consistency`) → the refinements
+(`parse-grammar-denotation`, `compile-refines-reference`) → `regex-reference-semantics`.
+`no-panic-total`, `escape-literal`, `perl-class-tables` and `fold-table-derivation` sit beside the
+chain; the last two need a UCD model (gap 8).
 
 ## 4. Tests that are not spec samples
 
-Status (2026-10-15): `instruction_cost_covers_the_whole_program` (the **delete** row) has been deleted, and its rows here with it.
-
 | test | why | action |
 |---|---|---|
-| src/lib.rs::every_builtin_selection_rule_stays_far_inside_the_default | Calibration of a tuning constant. It bisects measured unit counts for 11 rule/haystack pairs, prints them, and pins the documented numbers (`per_row ≤ 2^22/8`). That is a margin about chosen inputs, not a property. Its "still matches under the default" half is sampled by `regex-reference-semantics` and `step-budget-contract`. | **move to bench** (`aterm-bench`), then delete |
-| tests/bounds.rs::scanning_a_long_haystack_is_linear | A wall-clock hang detector for one pattern. No general spec says `find_iter` is linear: it is quadratic for `\w+=|\w` (see `find-iter-shared-budget`). Only the per-search cost (`pikevm-linear-cost`) is linear. Its count assertion is a point sample of `regex-reference-semantics`. | **move to bench** (`aterm-bench`), then delete |
+| src/lib.rs::every_builtin_selection_rule_stays_far_inside_the_default | Calibration of a tuning constant: it bisects measured unit counts for rule/haystack pairs, prints them, and pins `per_row ≤ 2^22/8`, a margin about chosen inputs. Its "still matches under the default" half is sampled by `regex-reference-semantics` and `step-budget-contract`. | **move to bench** (`aterm-bench`), then delete |
+| tests/bounds.rs::scanning_a_long_haystack_is_linear | A wall-clock hang detector for one pattern. `find_iter` is not linear in general (quadratic for `\w+=|\w`, see `find-iter-shared-budget`); only the per-search cost (`pikevm-linear-cost`) is. Its count assertion is a point sample of `regex-reference-semantics`. | **move to bench** (`aterm-bench`), then delete |
 
 Totals: move to bench 2. `lib::a_find_iter_is_held_to_one_budget_not_one_per_match` (§5.7) now
 checks `find-iter-shared-budget` directly against `4 * one_search` without asserting the
@@ -272,34 +253,27 @@ checks `find-iter-shared-budget` directly against `4 * one_search` without asser
 8. *(Resolved)* **Test-only `RegexBuilder::get_step_limit` removed.** `the_step_limit_is_the_thing_that_decides`
    now observes builder step limits through `build()?.step_limit()`, matching the shipped API.
 
-## 6. Proof order (easiest high-value first)
-
-No spec is blocked by gap 0 alone, since all need gap 1. So the order prefers the specs that
-need the fewest gaps beyond 0 and 1, and that unblock other specs.
-
-1. **`classset-byte-size`** (gaps 0, 1, 3). This is straight-line `usize` arithmetic over
-   `size_of` constants and two `Vec::len` calls: the length-only `Vec` carrier Trust already
-   has, plus E6 widening for the calls. It retires its test and is the class term of `cost`,
-   which `compile-size-ceiling` (5 tests) is built on.
-   **Measured 2026-10-16 on seal `150efe4a`: still blocked, by gaps 1 and 3.** With
-   `ensures result == 56 + self.ranges.len() * 8 + self.perls.len()` on `byte_size`, E6 reports
-   `admissible=false` (Pure/Total/Deterministic/NoPanic not established: `self` is
-   `&ClassSet`, whose `Vec` fields are "outside the v1 scalar fragment"), and the `&self`
-   parameter view refuses it ("local `_6` is a reference or raw pointer": the `&self.ranges`
-   borrow handed to `Vec::len`). So no `trust_import_aterm_regex__parse__ClassSet__byte_size`
-   is minted, and the clause itself is not lowered ("unsupported contract predicate
-   expression"). The fn's row: 0/10 proved, verdict `HasViolations`. Even an admitted view would
-   be graded below `Certified` (owner ruling R1), and the view vocabulary has no `usize`.
-   The code is unchanged and `classes_report_their_size` stays.
-2. **`range-tables-well-formed`** (gaps 0, 1, 5, 7). There is no function body: it is decidable
-   by evaluating three static range tables and `FOLD`. It retires its test, fixes the gaps that
-   §5.2 found in it, and is the precondition of `in_ranges` and `fold_next`, under every
-   class, fold and perl spec.
-3. **`builder-knobs`** (gaps 0, 1, 2, 3), with **`regex-metadata`** (gaps 0, 1, 3, 11) next to
-   it. These are by-value field updates and copies with no loops. They retire 2 tests, and
-   they fix the `step_limit` plumbing that `step-budget-contract` and `find-iter-shared-budget`
-   (8 tests) depend on.
-
-Next: **`assertion-semantics`** and **`parse-error-render`** (gaps 0, 1, 3, 5; loop-free
-`&str` work), then **`thread-list-generation`** (`&mut self` on a `Vec<u32>`). It is the
-lemma that lets `pikevm-refines-backtracker` quantify over every cache state.
+- **2. The table well-formedness test skips entries.** `src/unicode.rs::range_tables_are_well_formed`
+  checks `w[0].0 <= w[0].1` over `table.windows(2)`, so the last range's `lo ≤ hi`, a one-entry
+  table and `hi ≤ 0x10FFFF` go unchecked. `range-tables-well-formed` states all three.
+- **3. A pinned builtin rule differs from the shipped one.** The `file_path` rule in
+  `tests/differential.rs`'s `BUILTIN` (the corpus of `builtin_selection_patterns_are_pinned`) is not
+  `FILE_PATH_PATTERN` in `crates/aterm-selection/src/builtin_patterns.rs`, which the
+  `step_budget_tests` in `src/lib.rs` carry. Re-derive `BUILTIN` from the shipped list when the digest
+  becomes a conformance test.
+- **5. Half of a prefilter test is vacuous for most inputs.**
+  `src/compile.rs::the_prefilter_byte_map_marks_lead_bytes_only` checks that a pattern's possible
+  first code points have their lead bytes marked only when `re.is_match(one code point)`, which is
+  false for most of its patterns, so for them only the continuation-byte half runs. `prefilter-sets`
+  states the lead-byte half over every consuming pc in `K`.
+- **6. Golden digests cannot be retired by a proof alone.** The digests in `tests/differential.rs`
+  and `PINNED` in `tests/fuzz.rs` are FNV hashes recorded when the outputs agreed with the regex
+  crate. `Ref`'s agreement with the regex crate is empirical, so they become the `Ref` `ty_model!`'s
+  conformance test with a negative control, not tests to delete.
+- **7. One test mixes a spec with calibration.**
+  `src/lib.rs::a_find_iter_is_held_to_one_budget_not_one_per_match` checks a spec (one shared budget
+  truncates the iteration, `find-iter-shared-budget`) and a calibration (`one_search * 16 < 2^22`,
+  found by bisection), which goes to the bench (§4).
+- **8. The step-limit read-back is test-only.** `RegexBuilder::get_step_limit()` is `#[cfg(test)]`,
+  so `builder-knobs` states the field equality; the shipped build exposes it only through
+  `Regex::step_limit()`.

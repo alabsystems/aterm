@@ -348,11 +348,13 @@ fn unconsumed(name: &str) -> &str {
 }
 
 fn panic_report_pid(name: &str) -> Option<u32> {
-    unconsumed(name)
+    let pid = unconsumed(name)
         .strip_prefix("crash-")?
-        .strip_suffix(".log")?
-        .parse()
-        .ok()
+        .strip_suffix(".log")?;
+    pid.bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| pid.parse().ok())
+        .flatten()
 }
 
 fn marker_pid_birth(name: &str) -> Option<(u32, u64)> {
@@ -361,8 +363,16 @@ fn marker_pid_birth(name: &str) -> Option<(u32, u64)> {
         .strip_prefix(crate::crash_signal::markers::PREFIX)
         .or_else(|| body.strip_prefix("crash-signal-"))?;
     let mut parts = rest.splitn(3, '-');
-    let pid = parts.next()?.parse().ok()?;
-    let nanos: u128 = parts.next()?.parse().ok()?;
+    let pid = parts
+        .next()
+        .filter(|s| s.bytes().all(|b| b.is_ascii_digit()))?
+        .parse()
+        .ok()?;
+    let nanos: u128 = parts
+        .next()
+        .filter(|s| s.bytes().all(|b| b.is_ascii_digit()))?
+        .parse()
+        .ok()?;
     Some((pid, u64::try_from(nanos / 1_000_000_000).ok()?))
 }
 
@@ -372,7 +382,11 @@ fn panic_report_time(path: &Path) -> Option<u64> {
     let mut first = String::new();
     BufReader::new(file.take(512)).read_line(&mut first).ok()?;
     let at = first.split("crashed at unix ").nth(1)?;
-    at.split(['.', ' ', '\n']).next()?.parse().ok()
+    let secs = at.split(['.', ' ', '\n']).next()?;
+    secs.bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| secs.parse().ok())
+        .flatten()
 }
 
 fn marker_signal(path: &Path) -> Option<u8> {

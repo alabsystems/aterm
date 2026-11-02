@@ -12,7 +12,9 @@ use super::approval::{Choice, Decision};
 use super::guard::row_guard;
 use super::turn_end::{TurnEndAction, TurnEndReading, TurnEndState};
 
-/// Rule ID for selecting the session's login method in `/login`.
+/// Rule ID the loop once selected the session's login method in `/login` under. It selects none
+/// now ([`pick_method`]: the pick opens the browser, which aterm never brings forward by itself);
+/// the rule stays defined so older books, stats and tapes still read.
 pub const RULE_LOGIN_METHOD: &str = "login-method@v1";
 
 /// Rule ID for confirming `Login successful` with Enter.
@@ -21,80 +23,42 @@ pub const RULE_LOGIN_DONE: &str = "login-done@v1";
 /// Rule ID for backing out of the dialog of the loop's own `/login` with its Esc ([`backs_out`]).
 pub const RULE_LOGIN_BACK_OUT: &str = "login-back-out@v1";
 
-/// Returns whether the `/login` method picker can be answered with `method` ([`crate::supervise::IdleHost::login_method`]).
+/// Why the `/login` method picker is the person's to answer ([`pick_method`]): which method the
+/// session signs in with, as far as aterm reads it, for the escalation's words.
 ///
-/// Only a picker the inline renderer draws is: what Claude Code's fullscreen renderer draws in
-/// its bottom panel past a method pick (the browser hand-off, its error, its success) has not
-/// been read in the real-Claude lab yet, so the Enter that opens the browser sign-in there is
-/// left to a person, as every other method is.
-///
-/// # Errors
-///
-/// Why the picker is the person's: no method is known, the method is not the subscription's, the
-/// picker is drawn in the fullscreen renderer's panel, its focus was moved off the first row, or
-/// it draws no row of the method.
-pub fn picks(picker: &LoginPicker, method: Option<LoginMethod>) -> Result<usize, String> {
+/// Every method's pick opens a sign-in only a person can finish, the subscription's in the
+/// system browser, which comes forward over whatever the person is doing; aterm never brings a
+/// window forward by itself (v6 §14.17, rule 1). So the picker is never answered by the loop:
+/// the person picks, and the browser opens on their own key.
+fn why_persons(picker: &LoginPicker, method: Option<LoginMethod>) -> String {
     let Some(method) = method else {
-        return Err("nothing says which method this session signs in with".to_string());
+        return "nothing says which method this session signs in with".to_string();
     };
     if method != LoginMethod::Subscription {
-        return Err(format!(
+        return format!(
             "this session signs in with its {} method, which only you choose",
             method.word()
-        ));
-    }
-    if picker.renderer == aterm_phase::PanelRenderer::Fullscreen {
-        return Err(
-            "it is drawn in Claude Code's fullscreen view, past whose method pick aterm \
-             reads nothing yet"
-                .to_string(),
         );
     }
-    if picker.focused != Some(0) {
-        return Err("its focus was moved off the first row".to_string());
+    if picker.index_of(method).is_none() {
+        return format!("it draws no `{}` row", method.label());
     }
-    picker
-        .index_of(method)
-        .ok_or_else(|| format!("it draws no `{}` row", method.label()))
+    format!(
+        "its `{}` row opens the sign-in in your browser, which aterm never brings forward by \
+         itself",
+        method.label()
+    )
 }
 
-/// Returns the action to select `method` in `picker` ([`picks`], [`Choice::Focus`]).
+/// Returns the decision at the method picker of the loop's own `/login` ([`why_persons`]): the
+/// person's, escalated quietly with why, never a key pressed in it.
 #[must_use]
-pub fn pick_method(
-    prompt: &PromptV2,
-    picker: &LoginPicker,
-    method: Option<LoginMethod>,
-) -> Decision {
-    let target = match picks(picker, method) {
-        Ok(target) => target,
-        Err(why) => {
-            return Decision::escalate(format!(
-                "pick the sign-in method in the tab, then finish the browser sign-in \
-                 (Claude Code's login method picker: {why})"
-            ));
-        }
-    };
-    let Some(option) = prompt.options.get(target).filter(|o| {
-        o.label
-            .trim_start()
-            .starts_with(LoginMethod::Subscription.label())
-    }) else {
-        return Decision::escalate(
-            "pick the sign-in method in the tab, then finish the browser sign-in \
-             (Claude Code's login method picker: its rows read otherwise than its options)",
-        );
-    };
-    let label = option.label.clone();
-    Decision::Approve {
-        rule_id: RULE_LOGIN_METHOD,
-        choice: Choice::Focus {
-            steps: i32::try_from(target).unwrap_or(0),
-            label: label.clone(),
-        },
-        guard: row_guard(&picker.title_row),
-        subject: label,
-        unproven: None,
-    }
+pub fn pick_method(picker: &LoginPicker, method: Option<LoginMethod>) -> Decision {
+    Decision::escalate(format!(
+        "pick the sign-in method in the tab, then finish the browser sign-in (Claude Code's \
+         login method picker: {})",
+        why_persons(picker, method)
+    ))
 }
 
 /// Returns the action to back out of the method picker of the loop's own `/login` whose sign-in

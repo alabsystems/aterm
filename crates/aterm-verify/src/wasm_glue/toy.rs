@@ -315,9 +315,10 @@ pub(super) fn build_staged(
     // STOCK EXCEPTION: Trust lacks a wasm32 std (module doc).
     let stable = crate::rustup::Toolchain::resolve(rustup, "stable")?;
     let remap = stable.std_source_remap()?;
-    let neutral = std::env::temp_dir().join(format!("aterm-wasm-glue-{}", std::process::id()));
-    std::fs::create_dir_all(&neutral)
-        .map_err(|e| format!("could not create {}: {e}", neutral.display()))?;
+    let neutral = aterm_tempfile::Builder::new()
+        .prefix("aterm-wasm-glue-")
+        .tempdir()
+        .map_err(|e| format!("could not create neutral build directory: {e}"))?;
     let _ = writeln!(
         log,
         "  building {what} (wasm32, release) on {}",
@@ -328,7 +329,7 @@ pub(super) fn build_staged(
         .env_remove("RUSTFLAGS")
         .env("CARGO_ENCODED_RUSTFLAGS", remap)
         .env("CARGO_TARGET_DIR", target)
-        .current_dir(&neutral)
+        .current_dir(neutral.path())
         .args([
             "build",
             "--release",
@@ -339,7 +340,7 @@ pub(super) fn build_staged(
         ])
         .arg(manifest)
         .output_owned();
-    let _ = std::fs::remove_dir_all(&neutral);
+    drop(neutral);
     match built {
         Ok(o) if o.status.success() => {}
         Ok(o) => {

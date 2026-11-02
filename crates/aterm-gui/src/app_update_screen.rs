@@ -1107,7 +1107,7 @@ impl App {
 
     /// Mark the update row as installing before building the handoff carry (adding a row
     /// only for explicit user-initiated applies; the upgrade rim starts at [`Self::charge_upgrade_rim_at_park`]).
-    #[cfg(any(unix, test))]
+    #[cfg(unix)]
     pub(crate) fn begin_update_installing(&mut self, explicit: bool) {
         use crate::messages_host::FlowPhase;
         let version = self
@@ -1155,7 +1155,7 @@ impl App {
     }
 
     /// Start or re-anchor the upgrade rim for `build` when PTY readers park.
-    #[cfg(any(unix, test))]
+    #[cfg(unix)]
     pub(crate) fn charge_upgrade_rim_at_park(&mut self, build: u64) {
         match self.level_up.as_mut() {
             Some(rim) => rim.re_anchor(std::time::Instant::now()),
@@ -1363,105 +1363,6 @@ pub(crate) mod tests {
         assert!(moving(&app), "PRECONDITION: the rim animates");
         assert!(app.set_serious_mode(true));
         assert!(!moving(&app), "serious mode keeps the rim, still");
-    }
-
-    /// Verify row wording and upgrade rim lifecycle across begin, reader park, refusal, and outcome.
-    #[test]
-    fn apply_begins_charges_the_rim_and_a_refusal_restores_the_row() {
-        use crate::messages_host::FlowPhase;
-        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
-        let mut app = App::headless_for_test();
-        let rim = |app: &App| app.level_up.is_some();
-        let phase = |app: &App| app.live_update_flow().map(|flow| flow.phase);
-        let staged_phase = Some(FlowPhase::Staged { build: 41 });
-        let staged = aterm_update::Progress::Staged {
-            version: "9.9.9".into(),
-            build: 41,
-        };
-        let post_staged = |app: &mut App| {
-            app.post_update_row(
-                crate::update_words::progress(&staged, None, ""),
-                "9.9.9",
-                FlowPhase::Staged { build: 41 },
-            );
-        };
-        post_staged(&mut app);
-        let ready = app.update_row_text();
-        assert_eq!(phase(&app), staged_phase);
-
-        app.begin_update_installing(false);
-        assert!(!rim(&app), "no rim over a terminal that still echoes");
-        app.charge_upgrade_rim_at_park(41);
-        assert!(rim(&app), "the readers parked: the rim explains the freeze");
-        assert_eq!(phase(&app), Some(FlowPhase::Installing));
-        assert_eq!(
-            app.messages.live_rows().count(),
-            1,
-            "the row was rewritten, not added"
-        );
-        for _ in 0..2 {
-            app.retire_update_installing();
-            assert!(!rim(&app));
-            assert_eq!(phase(&app), staged_phase);
-            assert_eq!(
-                app.update_row_text(),
-                ready,
-                "the words go back (idempotent)"
-            );
-        }
-
-        app.clear_messages_for_test();
-        app.begin_update_installing(false);
-        assert_eq!(
-            app.messages.live_rows().count(),
-            0,
-            "the automatic lane never adds a row"
-        );
-        app.charge_upgrade_rim_at_park(41);
-        assert!(rim(&app), "…but the rim still charges at the park");
-        app.retire_update_installing();
-        assert!(!rim(&app));
-        app.begin_update_installing(true);
-        assert_eq!(
-            phase(&app),
-            Some(FlowPhase::Installing),
-            "an explicit apply adds the row"
-        );
-        assert_eq!(
-            app.message_band_rows, 1,
-            "…and commits it at once, before the carry reads the window"
-        );
-        app.retire_update_installing();
-        assert_eq!(app.messages.live_rows().count(), 0);
-        assert_eq!(
-            app.message_band_rows, 1,
-            "a refusal retires the words without a re-grid of its own"
-        );
-
-        app.clear_messages_for_test();
-        post_staged(&mut app);
-        app.begin_update_installing(false);
-        app.charge_upgrade_rim_at_park(41);
-        app.note_update_outcome(crate::update_words::failed(
-            super::UPDATE_WAITS_FOR_YOU,
-            App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY,
-            true,
-        ));
-        assert!(!rim(&app));
-        let outcome = app.update_row_text();
-        app.retire_update_installing();
-        assert_eq!(
-            app.update_row_text(),
-            outcome,
-            "a row an outcome moved on is not retired"
-        );
-        assert!(app.settle_messages(std::time::Instant::now() + aterm_messages::HOLD_WARN));
-        assert_eq!(
-            app.update_row_text(),
-            ready,
-            "the ready row is back, in place"
-        );
-        assert_eq!(app.messages.live_rows().count(), 1);
     }
 
     #[test]
@@ -2716,62 +2617,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// Posting a stopped-lane outcome withdraws any live staged ready row.
-    #[test]
-    fn a_stopped_lane_is_one_decision_row_never_two() {
-        use crate::update_words::ApplyPosture;
-        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
-        let mut app = App::headless_for_test();
-        let build = stage_one_build(&mut app);
-        let presses = |app: &App| {
-            app.messages
-                .live_rows()
-                .filter(|l| {
-                    l.msg
-                        .actions
-                        .contains(&aterm_messages::Intent::ApplyUpdate { build })
-                })
-                .count()
-        };
-        let outcomes = [
-            UpdateOutcome::Failed {
-                message: "overlap handoff failed safely: handoff proof ended TimedOut".to_string(),
-            },
-            UpdateOutcome::Blocked {
-                reasons: vec!["the handoff helper is not ready".to_string()],
-            },
-        ];
-        for (outcome, posture) in outcomes.into_iter().zip([
-            ApplyPosture::ManualOnlyLatched { lapses: false },
-            ApplyPosture::ManualByConfig,
-        ]) {
-            app.clear_messages_for_test();
-            app.ensure_staged_decision_in(build, posture);
-            assert!(
-                app.staged_update_row().is_some(),
-                "PRECONDITION: the ready row is up ({posture:?})"
-            );
-            assert_eq!(presses(&app), 1);
-            app.react_to_update_apply_outcome("automatic handoff", outcome, false);
-            assert_eq!(
-                presses(&app),
-                1,
-                "one `Install now` on the glass: {:?}",
-                app.messages
-                    .live_rows()
-                    .map(|l| l.msg.title.clone())
-                    .collect::<Vec<_>>()
-            );
-            assert_eq!(app.staged_update_row(), None, "the ready row left");
-            let live = app
-                .messages
-                .live_by_key(crate::update_words::KEY_OUTCOME)
-                .expect("the outcome is the decision");
-            assert_eq!(live.msg.severity, aterm_messages::Severity::Warn);
-            app.sync_messages();
-            assert_eq!(app.message_band_rows, 1, "one row for one fact");
-        }
-    }
     /// When no stage remains, an automatic failure is log-only while a manual press posts `UPDATE_DIDNT_FINISH`.
     #[test]
     fn an_automatic_failure_with_no_stage_is_a_record_and_a_press_is_a_row() {

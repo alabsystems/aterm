@@ -2,6 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use crate::harness::acts::{HoldLeg, LandHeld, TaskFace};
+use crate::harness::hold_said::HoldSaid;
 use crate::supervise::policy::turn_end::{RULE_LAND, RULE_LAND_NUDGE};
 
 const HOLD_DOOR: &str = "host.land_held";
@@ -9,6 +10,8 @@ const HOLD_DOOR: &str = "host.land_held";
 const PROGRESS: &str = "Committing the parser now; the lexer is next.";
 const TOKEN: &str = "Built and tested the parser.\nATERM-TASK-DONE";
 const OPEN_DEFENSE: &str = "Nothing left: the parser is pushed.\n- Its branch is not merged yet.";
+/// The land check's answer that lists what is left.
+const LIST: &str = "The parser's branch is not merged yet.";
 const LANDED_NOTE: &str = "DONE seq=104 rule=land@v1 the worker said it is done after the land \
      instruction (autopilot land): nothing more is typed until a person or an orchestrator types";
 const LANDING_REPLY: &str = "Committed and pushed the parser and its tests.\nNothing left: all of \
@@ -20,12 +23,16 @@ enum Told {
     Face(TaskFace),
     Hold(Option<LandHeld>),
     Point,
+    /// The switch's one ask standing or gone ([`IdleHost::switch_asked`]).
+    Switch(bool),
 }
 
-/// A host that records each face, each hold and each point it is told.
+/// A host that records each face, each hold and each point it is told, and apart from them the
+/// hold's words, each beside how many of the others came before it.
 #[derive(Debug, Default)]
 struct Holds {
     told: Mutex<Vec<Told>>,
+    said: Mutex<Vec<(usize, Option<HoldSaid>)>>,
 }
 
 impl Holds {
@@ -41,9 +48,26 @@ impl Holds {
             .into_iter()
             .filter_map(|t| match t {
                 Told::Hold(h) => Some(h),
-                Told::Face(_) | Told::Point => None,
+                Told::Face(_) | Told::Point | Told::Switch(_) => None,
             })
             .collect()
+    }
+
+    fn switches(&self) -> Vec<bool> {
+        self.told()
+            .into_iter()
+            .filter_map(|t| match t {
+                Told::Switch(asked) => Some(asked),
+                Told::Face(_) | Told::Hold(_) | Told::Point => None,
+            })
+            .collect()
+    }
+
+    fn said(&self) -> Vec<(usize, Option<HoldSaid>)> {
+        self.said
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     fn tells(&self) -> Vec<Told> {
@@ -76,11 +100,28 @@ impl IdleHost for Holds {
             .unwrap_or_else(PoisonError::into_inner)
             .push(Told::Hold(held));
     }
+    fn land_said(&self, said: Option<&HoldSaid>) {
+        let before = self
+            .told
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
+        self.said
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((before, said.cloned()));
+    }
     fn usage_tap(&self) {
         self.told
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(Told::Point);
+    }
+    fn switch_asked(&self, asked: bool) {
+        self.told
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Told::Switch(asked));
     }
 }
 
@@ -336,6 +377,8 @@ fn each_start_tells_the_seed_once() {
     assert_eq!(host.holds(), [None]);
 }
 
+/// THE HOLD ENDS AT A LANDING: the defense gets the land check, whose `LANDED` lands; a list
+/// answered instead holds on its Open leg and gets the nudge.
 #[test]
 fn the_hold_ends_at_a_landing() {
     let landing = |last: &str| {
@@ -355,17 +398,17 @@ fn the_hold_ends_at_a_landing() {
         let lines = run(&mut m, &host, None);
         (host.tells(), lines)
     };
-    let (told, lines) = landing(LANDING_REPLY);
+    let (told, lines) = landing(crate::supervise::policy::land_check::LANDED);
     let tail: Vec<Told> = told.iter().rev().take(2).rev().copied().collect();
     assert_eq!(
         tail,
         [Told::Face(TaskFace::Landed), Told::Hold(None)],
         "{told:#?}\n{lines:#?}"
     );
-    let (told, lines) = landing(OPEN_DEFENSE);
+    let (told, lines) = landing(LIST);
     let last = told.iter().rev().find_map(|t| match t {
         Told::Hold(h) => Some(*h),
-        Told::Face(_) | Told::Point => None,
+        Told::Face(_) | Told::Point | Told::Switch(_) => None,
     });
     let open = last.flatten().expect("held");
     assert!(
@@ -375,7 +418,71 @@ fn the_hold_ends_at_a_landing() {
     assert!(!told.contains(&Told::Face(TaskFace::Landed)), "{told:#?}");
 }
 
+/// THE HOLD'S WORDS ARE TOLD AHEAD OF THE HOLD THEY BELONG TO, ONCE PER MOVE (slice 4b): the
+/// agent's list, answering the check, is told just before the hold whose Open leg it is, never
+/// twice alike in a row; a hold with no words tells none.
+/// Negative controls: the words told after the hold fails the order; told at every tell of the
+/// hold fails once per move.
+#[test]
+fn the_holds_words_are_told_ahead_of_the_hold_once_per_move() {
+    let host = Arc::new(Holds::default());
+    let mut m = scripted(
+        vec![
+            busy_screen(),
+            ended(PROGRESS),
+            busy_screen(),
+            ended(OPEN_DEFENSE),
+            busy_screen(),
+            ended(LIST),
+            busy_screen(),
+            ended(LIST),
+        ],
+        "land",
+        vec![1, 3, 5],
+    );
+    m.vanish_after = Some(8);
+    let lines = run(&mut m, &host, None);
+    assert_eq!(
+        count(&m, "turn"),
+        3,
+        "the instruction, the check and one nudge: {lines:#?}"
+    );
+    let said = host.said();
+    let told = host.told();
+    let (at, first) = said.first().cloned().expect("words told");
+    assert_eq!(first, Some(HoldSaid::of(Some(LIST), &[])), "{said:#?}");
+    let first_open = told
+        .iter()
+        .position(|t| matches!(t, Told::Hold(Some(h)) if h.holds(HoldLeg::Open)))
+        .expect("a hold on the Open leg");
+    assert_eq!(
+        at, first_open,
+        "the words come just ahead of the first hold they belong to: {said:#?}\n{told:#?}"
+    );
+    assert!(
+        said.windows(2).all(|w| w[0].1 != w[1].1),
+        "once per move: {said:#?}"
+    );
+
+    let host = Arc::new(Holds::default());
+    let mut m = scripted(a_landing_with_someone_elses_turn(), "land", vec![1, 3, 7]);
+    let lines = run(&mut m, &host, None);
+    assert!(
+        host.said().is_empty(),
+        "no words, none told: {:#?}\n{lines:#?}",
+        host.said()
+    );
+}
+
 fn read_hold(st: &mut crate::supervise::policy::turn_end::TurnEndState) {
+    read_hold_over(st, None);
+}
+
+/// [`read_hold`], the reply's yield over a repository the probe read as `repo`.
+fn read_hold_over(
+    st: &mut crate::supervise::policy::turn_end::TurnEndState,
+    repo: Option<crate::harness::repo_work::RepoRead>,
+) {
     use crate::supervise::policy::turn_end::{TurnEndReading, decide_turn_end};
     let now = Instant::now();
     let point = |said: &str, worked: Option<Duration>| {
@@ -400,7 +507,10 @@ fn read_hold(st: &mut crate::supervise::policy::turn_end::TurnEndState) {
     assert_eq!(a.rule_id(), Some(RULE_LAND), "{a:?}");
     st.acted(&a, &first, now);
     st.ledgered(RULE_LAND, 1_771_000_000_000);
-    let reply = point(PROGRESS, Some(Duration::from_secs(240)));
+    let mut reply = point(PROGRESS, Some(Duration::from_secs(240)));
+    if let Some(repo) = repo {
+        reply.repo = repo;
+    }
     st.observe(&reply, now + Duration::from_secs(300));
     assert!(
         st.land_held().is_some_and(|h| h.read),
@@ -442,16 +552,49 @@ fn the_hold_is_told_gone_at_an_off_park_and_at_the_loops_end() {
     assert_eq!(host.holds(), [None], "the first ask alone");
 }
 
+/// THE HOLD'S WORDS ARE TAKEN DOWN WITH THE HOLD, at an Off park and at the loop's end: the
+/// files git found told with a read hold, then none.
+/// Negative control: the words left standing at the loop's end fails the last tell.
+#[test]
+fn the_holds_words_are_taken_down_at_an_off_park_and_at_the_loops_end() {
+    use crate::harness::repo_work::{RepoRead, RepoWork};
+    let mut notes = Alone;
+    let work = RepoWork {
+        repo: "/Users//a/Developer/parser".to_string(),
+        untracked: 1,
+        paths: vec!["wip-notes.txt".to_string()],
+        main_ref: "origin/main".to_string(),
+        ..RepoWork::default()
+    };
+    for at_off in [true, false] {
+        let mut m = Mock::new(vec![idle_screen()]);
+        let host = Arc::new(Holds::default());
+        {
+            let mut s = session(&mut m, None);
+            s.stall_host = Some(Arc::clone(&host) as Arc<dyn IdleHost>);
+            read_hold_over(&mut s.turn_end, Some(RepoRead::Found(work.clone())));
+            s.tell_hold();
+            if at_off {
+                s.off_stood(101);
+            } else {
+                s.release_attention(&mut notes);
+            }
+        }
+        let said: Vec<Option<HoldSaid>> = host.said().into_iter().map(|(_, s)| s).collect();
+        assert_eq!(
+            said,
+            [Some(HoldSaid::of(None, &work.paths)), None],
+            "at_off={at_off}"
+        );
+    }
+}
+
 #[test]
 fn a_cruise_act_at_a_held_point_tells_the_hold_gone_as_it_is_typed() {
     let host = Arc::new(Holds::default());
+    // A done claim Land's nudge waits its back-off on (a defense would get the check at once).
     let mut m = scripted(
-        vec![
-            busy_screen(),
-            ended(PROGRESS),
-            busy_screen(),
-            ended(OPEN_DEFENSE),
-        ],
+        vec![busy_screen(), ended(PROGRESS), busy_screen(), ended(TOKEN)],
         "land",
         vec![1, 3],
     );
@@ -476,7 +619,7 @@ fn a_cruise_act_at_a_held_point_tells_the_hold_gone_as_it_is_typed() {
         .find(|h| h.read)
         .copied()
         .unwrap_or_else(|| panic!("the yield's hold told, read: {told:#?}\n{lines:#?}"));
-    assert!(read.holds(HoldLeg::Open), "{read:?}");
+    assert!(read.holds(HoldLeg::Defense), "{read:?}");
     assert_eq!(
         told.last(),
         Some(&None),
@@ -604,4 +747,133 @@ fn an_old_tape_replays_in_acts_mode_and_strictly_differs_at_the_hold() {
         (0, 0, 0, 0),
         "{account:?}"
     );
+}
+
+/// A reply Claude Code says took seconds: no work.
+fn quick(said: &str) -> Vec<String> {
+    let mut r = rows(&[
+        &format!("⏺ {said}"),
+        "",
+        "✻ Worked for 6s · done 4:24 PM",
+        "",
+    ]);
+    r.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
+    r
+}
+
+/// A done claim that is no `Nothing left:` defense: Land reads it unlanded.
+const ALL_DONE: &str = "Merged the parser and pushed it to origin/main. All done.";
+
+/// The turn requests that typed the switch's one ask, opened by its why.
+fn switch_asks(m: &Mock) -> usize {
+    m.requests
+        .iter()
+        .filter(|r| {
+            r.starts_with("turn ")
+                && r.contains(crate::supervise::policy::turn_end::SWITCH_WHY_HEAD)
+        })
+        .count()
+}
+
+/// A stand-in that gives the same quick reply to every act, under Cruise until the screen after
+/// `switch_at` is read, then Land, the word set `by` (meta's `autopilot_by=`): its replies, the
+/// host's tells and the loop's lines.
+fn repeating(switch_at: Option<usize>, by: &'static str) -> (Mock, Arc<Holds>, Vec<String>) {
+    switching(by, |m| {
+        if let Some(at) = switch_at {
+            m.autopilot_on.insert(at + 1, Some("land"));
+        }
+    })
+}
+
+/// [`repeating`] with the word's moves `words` sets on the stand-in.
+fn switching(by: &'static str, words: impl FnOnce(&mut Mock)) -> (Mock, Arc<Holds>, Vec<String>) {
+    switching_from("cruise", by, words)
+}
+
+/// [`switching`] from the word `from`.
+fn switching_from(
+    from: &'static str,
+    by: &'static str,
+    words: impl FnOnce(&mut Mock),
+) -> (Mock, Arc<Holds>, Vec<String>) {
+    let host = Arc::new(Holds::default());
+    let mut screens = vec![busy_screen()];
+    for _ in 0..4 {
+        screens.extend([quick(ALL_DONE), busy_screen()]);
+    }
+    screens.push(quick(ALL_DONE));
+    let mut m = scripted(screens, from, vec![1, 3, 5, 7, 9]);
+    // The host's waits take the word, as every current one does: a switch wakes the held wait.
+    m.takes_word = true;
+    m.autopilot_by = Some(by);
+    words(&mut m);
+    m.vanish_after = Some(12);
+    let lines = run(&mut m, &host, None);
+    (m, host, lines)
+}
+
+/// LIMIT 1 HOLDS AT A SWITCH NO PERSON MADE, AT THE LOOP (v6 §14.17 item 3): the same switch to
+/// Land over the held tab made by `aterm ctl`, the timer or the harness (meta `autopilot_by=` not
+/// `human:…`) types nothing: no act past the hold, no ask, nothing told the host.
+#[test]
+fn a_switch_no_person_made_over_a_held_tab_types_nothing_at_the_loop() {
+    let (m, _, lines) = repeating(None, "ctl");
+    let held_after = count(&m, "turn");
+    assert!(held_after >= 1, "{lines:#?}");
+    let gate = 2 * held_after + 1;
+    for by in ["ctl", "aterm", "harness", "-"] {
+        let (m, host, lines) = repeating(Some(gate), by);
+        assert_eq!(
+            count(&m, "turn"),
+            held_after,
+            "{by}: no act past the hold: {:#?}\n{lines:#?}",
+            m.requests
+        );
+        assert_eq!(switch_asks(&m), 0, "{by}: {:#?}", m.requests);
+        assert!(host.switches().is_empty(), "{by}: {:#?}", host.told());
+    }
+}
+
+/// THE PERSON'S OWN LIFT FROM AN OFF NO PERSON SET OVER A TAB HELD UNDER LAND ASKS ONCE, AT THE
+/// LOOP (the second review, 2026-11-01): a stand-in that repeats its reply holds Land; Off by
+/// `aterm ctl` parks the loop with the hold kept, and Land set by the person (`human:chip`) at the
+/// park's second tick is their move from Off, so the switch's one ask is typed, once. CONTROL:
+/// the same lift by `aterm ctl` types nothing. Negative control: the park leaving the word it saw
+/// (Land) reads the person's lift as no move and types nothing.
+#[test]
+fn the_persons_own_lift_from_an_off_no_person_set_over_a_land_hold_asks_once_at_the_loop() {
+    let (m, _, lines) = switching_from("land", "ctl", |_| {});
+    let held_after = count(&m, "turn");
+    assert!(held_after >= 1, "{lines:#?}");
+    let gate = 2 * held_after + 1;
+    let parked = |m: &Mock| {
+        m.requests
+            .iter()
+            .position(|r| r.ends_with(" autopilot=off"))
+            .map(|at| m.requests[..at].iter().filter(|r| *r == "meta").count())
+    };
+    let (m, _, _) = switching_from("land", "ctl", |m| {
+        m.autopilot_once.insert(gate + 1, Some("off"));
+    });
+    let metas = parked(&m).unwrap_or_else(|| panic!("the Off parked: {:#?}", m.requests));
+    for (by, asks) in [("human:chip", 1), ("ctl", 0)] {
+        let (m, _, lines) = switching_from("land", "ctl", |m| {
+            m.autopilot_once.insert(gate + 1, Some("off"));
+            m.autopilot_at = vec![(metas + 2, Some("land"))];
+            m.autopilot_by_at = vec![(metas + 2, Some(by))];
+        });
+        assert!(
+            parked(&m).is_some() && m.requests.iter().any(|r| r.ends_with(" autopilot=land")),
+            "{by}: parked, then Land: {:#?}",
+            m.requests
+        );
+        assert_eq!(switch_asks(&m), asks, "{by}: {:#?}\n{lines:#?}", m.requests);
+        assert_eq!(
+            count(&m, "turn"),
+            held_after + asks,
+            "{by}: {:#?}",
+            m.requests
+        );
+    }
 }

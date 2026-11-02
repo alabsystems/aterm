@@ -188,7 +188,7 @@ pub fn sign_checked(
 /// An I/O failure.
 pub fn write_sig(pkg: &Path, sig: &[u8]) -> Result<PathBuf> {
     let out = sig_path(pkg);
-    std::fs::write(&out, sig).map_err(|e| Error::io(format!("write {}", out.display()), &e))?;
+    crate::lane::report::write_atomic_bytes(&out, sig)?;
     Ok(out)
 }
 

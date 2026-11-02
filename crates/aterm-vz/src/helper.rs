@@ -1553,7 +1553,12 @@ pub fn serve<M: Machine>(
         let accepted = std::thread::Builder::new()
             .name("vz-accept".into())
             .spawn(move || {
-                for (sid, stream) in (1u64..).zip(listener.incoming()) {
+                // Each connection kept out of children from its creation, its wait holding none
+                // of this process's spawns back (`aterm_uds::accept`).
+                let incoming = std::iter::repeat_with(|| {
+                    aterm_uds::accept(&listener).map(|(stream, _)| stream)
+                });
+                for (sid, stream) in (1u64..).zip(incoming) {
                     if done.load(Ordering::SeqCst) {
                         return;
                     }
@@ -1564,7 +1569,19 @@ pub fn serve<M: Machine>(
                             continue;
                         }
                     };
-                    let Ok(out) = stream.try_clone() else {
+                    #[cfg(any(
+                        target_vendor = "apple",
+                        all(
+                            target_os = "linux",
+                            any(target_arch = "x86_64", target_arch = "aarch64")
+                        )
+                    ))]
+                    if aterm_uds::peer::peer_uid(&stream) != Some(aterm_uds::peer::our_uid()) {
+                        note!("refused a control connection from another uid");
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        continue;
+                    }
+                    let Ok(out) = aterm_uds::kept_out(|| stream.try_clone()) else {
                         continue;
                     };
                     if inputs.send(Input::Opened(sid, out)).is_err() {
@@ -1657,9 +1674,9 @@ pub struct Held {
     )
 )]
 pub fn take(paths: &Paths, ident: &Ident, pids: &dyn Pids) -> Result<Held, String> {
+    use std::os::unix::fs::PermissionsExt as _;
     let socket = paths.checked_socket()?;
-    let run = paths.run_dir();
-    std::fs::create_dir_all(&run).map_err(|e| format!("{}: {e}", run.display()))?;
+    paths.prepare_run_dir()?;
     let lock_path = paths.disk_lock();
     if let Some(dir) = lock_path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -1699,8 +1716,10 @@ pub fn take(paths: &Paths, ident: &Ident, pids: &dyn Pids) -> Result<Held, Strin
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(format!("{}: {e}", socket.display())),
     }
-    let listener =
-        UnixListener::bind(&socket).map_err(|e| format!("bind {}: {e}", socket.display()))?;
+    let listener = aterm_uds::kept_out(|| UnixListener::bind(&socket))
+        .map_err(|e| format!("bind {}: {e}", socket.display()))?;
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("{}: {e}", socket.display()))?;
     let record = Record {
         pid: ident.pid,
         uniq: ident.uniq,

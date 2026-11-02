@@ -5,8 +5,8 @@
 //! frame on the trail-diff rig: the latch runs on every frame the window draws, keyed by the
 //! front session's configured scheme, which DECSCNM and OSC 10/11 never move and a reload moves
 //! only when it installs colours; a reader outside the frame drops the light the moment that
-//! scheme reads dark; a composed frame lights only its light-scheme panes. `LIVE` is still
-//! `Live::Off`, so a lit frame carries the latched bit alone and draws main's frame.
+//! scheme reads dark; a composed frame lights only its light-scheme panes. A lit frame carries
+//! the latched bit and the live level's arms ([`LIT`], `Light::admitted(true, LIVE)`).
 
 use crate::app_render::terminal_configured_colors;
 use crate::cursor_glow::{GlowConfig, Light};
@@ -27,6 +27,9 @@ const FIXTURE_FONT: &str = concat!(
 const BASE: &str =
     "trail_sounds = false\ncursor_trail_style = \"rainbow kitty\"\nmotion = \"full\"\n";
 
+/// Default Light's page, `(fg, bg)`: the live page of every rig on it.
+const DEFAULT_LIGHT: (u32, u32) = (0x002B_2D33, 0x00F6_F7F9);
+
 /// The light a lit frame carries at [`LIVE`].
 const LIT: Light = Light::admitted(true, LIVE);
 
@@ -35,12 +38,22 @@ fn rig_on(theme: &str) -> TrailRig {
     rig_with(theme, "")
 }
 
-/// [`rig_on`] with `extra` config lines.
+/// [`rig_on`] with `extra` config lines, on a scale-2 display, whose face the glass draws under
+/// (§15.8 amendment 53, `light_fork_pin_tests::at_scale_two`).
 fn rig_with(theme: &str, extra: &str) -> TrailRig {
+    rig_scaled(theme, extra, 2.0)
+}
+
+/// [`rig_with`] on a display of `scale`: 2, or the dump's own 1, whose face lays its thin glyphs
+/// with no pixel near the full ink (`host::PageFacts::glass`).
+fn rig_scaled(theme: &str, extra: &str, scale: f64) -> TrailRig {
     let mut rig = TrailRig::new(std::path::Path::new(FIXTURE_FONT)).expect("the rig");
     let t0 = rig.t0();
     rig.configure(&format!("{BASE}theme = {theme:?}\n{extra}"), t0)
         .expect("the config admits");
+    if scale > 1.0 {
+        crate::light_fork_pin_tests::at_scale_two(&mut rig, t0);
+    }
     rig.grid(8, 40, t0).expect("the grid");
     rig.pty(b"\x1b[4;1H$ ", t0);
     rig
@@ -119,7 +132,7 @@ fn a_light_scheme_decscnm_flash_draws_mains_dark_rules_during_the_flash() {
     let lit = frame(&mut rig, at(1));
     assert!(lit.out.on && lit.out.scheme_changed, "{:?}", lit.out);
     assert_eq!(lit.cfg.light, LIT);
-    assert!(lit.cfg.light.on(), "the latched bit, at `LIVE` off");
+    assert!(lit.cfg.light.on(), "the latched bit");
     assert!(!lit.cfg.dark_theme);
     assert_eq!(config_breaks(&lit.cfg, lit.page), Vec::<&str>::new());
     assert_eq!(lit.window_light, LIT);
@@ -163,7 +176,7 @@ fn a_translucent_window_lights_a_sheer_light() {
         let mut rig = rig_with("Default Light", extra);
         let t0 = rig.t0();
         let at = |ms: u64| t0 + Duration::from_millis(ms);
-        let page = rig.with_app(at(0), |app, _| app.page_facts());
+        let page = rig.with_app(at(0), |app, wid| app.page_facts(wid, DEFAULT_LIGHT));
         assert_eq!(page.opaque, !sheer, "{extra:?}");
         assert!(!page.wallpaper, "{extra:?}: no wallpaper configured");
         let lit = frame(&mut rig, at(1));
@@ -191,6 +204,43 @@ fn a_translucent_window_lights_a_sheer_light() {
     }
 }
 
+/// §15.8 amendment 53: a window on a scale-1 display (the dump's 12 px fixture face, whose
+/// thinnest glyph lays no pixel near the full ink) keeps the latch's verdict but lights a sheer
+/// light, which draws no glass, so the frame draws main's paper arm, and the light read outside
+/// the frame is the same; the same window on a scale-2 display (its face at 24 px) draws the glass
+/// (the negative control). The page reads the face the window's frame observed.
+#[test]
+fn a_window_whose_face_lays_no_full_ink_lights_a_sheer_light() {
+    use aterm_effects::cursor_glow::Live;
+    use aterm_effects::rainbow_kitty::prism_glass::colour::THIN_INK_SHARE;
+    for (scale, sheer) in [(1.0, true), (2.0, false)] {
+        let mut rig = rig_scaled("Default Light", "", scale);
+        let t0 = rig.t0();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let lit = frame(&mut rig, at(1));
+        let page = rig.with_app(at(1), |app, wid| app.page_facts(wid, DEFAULT_LIGHT));
+        assert!(page.clear(), "{scale}x: an opaque window, no wallpaper");
+        assert_eq!(
+            f64::from(page.thin_ink) > THIN_INK_SHARE,
+            sheer,
+            "{scale}x: {page:?}"
+        );
+        assert!(lit.out.on, "{scale}x: {:?}", lit.out);
+        assert_eq!(lit.cfg.light, LIT.on_page(!sheer), "{scale}x");
+        assert_eq!(lit.window_light, lit.cfg.light, "{scale}x");
+        rig.with_app(at(2), |app, wid| {
+            app.windows
+                .get_mut(&wid)
+                .expect("the window")
+                .trail_ground
+                .force_live(Some(Live::Glass));
+        });
+        let forced = frame(&mut rig, at(20));
+        assert!(forced.cfg.light.on(), "{scale}x");
+        assert_eq!(forced.cfg.light.glass(), !sheer, "{scale}x");
+    }
+}
+
 /// A window that stops drawing keeps its last frame's latch, but a reader outside the frame
 /// reads light off the moment its front session's scheme reads dark, without a frame; the next
 /// frame drops the latch on the new key.
@@ -213,12 +263,13 @@ fn an_unfocused_window_flipped_to_dark_reads_light_on_false() {
     assert!(latched, "no frame ran: the latch keeps its last verdict");
     assert_eq!(read, Light::OFF, "the scheme reads dark now");
     let line = line.expect("a front window");
+    let live = format!("live={}", LIVE.word());
     for word in [
         "on=1",
         "window_light=0",
         "front_scheme_light=0",
         "raw=1",
-        "live=off",
+        live.as_str(),
     ] {
         assert!(line.contains(word), "{word:?} in {line}");
     }

@@ -1,0 +1,18 @@
+{
+  "_comment": "aterm VTE-ENGINE baseline: per scenario, the best sample's MiB per 10^9 performance-core cycles (cycles per instruction on P-cores times all instructions, from the kernel's per-core-type counters) of the pinned vtebench's default suite (payloads captured from its own scripts) and the arena's 150 MB d1 ascii and unicode corpora, replayed into Terminal::process at 120x40 in 16 KiB slices on a live session's engine. BIGGER-IS-BETTER; the lane runs unadmitted at the load it finds, which moves its ms per MiB on both clocks, so cycles are what is judged. Re-record with targo --unverified verify perf --record vte-engine.",
+  "cursor_motion_best_mib_per_gcycle": 91.354,
+  "dense_cells_best_mib_per_gcycle": 143.611,
+  "light_cells_best_mib_per_gcycle": 512.925,
+  "medium_cells_best_mib_per_gcycle": 53.578,
+  "scrolling_best_mib_per_gcycle": 5.771,
+  "scrolling_bottom_region_best_mib_per_gcycle": 5.966,
+  "scrolling_bottom_small_region_best_mib_per_gcycle": 8.288,
+  "scrolling_fullscreen_best_mib_per_gcycle": 99.767,
+  "scrolling_top_region_best_mib_per_gcycle": 5.968,
+  "scrolling_top_small_region_best_mib_per_gcycle": 7.640,
+  "sync_medium_cells_best_mib_per_gcycle": 6.413,
+  "unicode_best_mib_per_gcycle": 159.005,
+  "d1_ascii_best_mib_per_gcycle": 155.348,
+  "d1_unicode_best_mib_per_gcycle": 47.388,
+  "pass_ratio": 0.450
+}

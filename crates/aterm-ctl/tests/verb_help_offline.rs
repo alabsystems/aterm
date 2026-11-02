@@ -8,7 +8,8 @@
 //! `help_is_answered_client_side_only_for_what_the_client_knows`.)
 //!
 //! No live aterm session is discovered or addressed: the socket named does not
-//! exist, and the child runs with every inherited `ATERM_*` variable removed.
+//! exist, and the child runs with every inherited `ATERM_*` variable but the
+//! verify run's mark removed.
 #![allow(
     clippy::disallowed_types,
     reason = "test code: a stand-in child may inherit descriptors"
@@ -21,14 +22,13 @@ fn ask_help(verb: &str) -> Output {
 }
 
 /// `aterm-ctl --sock <a path that cannot exist> <args…>`, every inherited
-/// `ATERM_*` and multiplexer variable removed.
+/// multiplexer variable removed and every `ATERM_*` one but the verify run's mark
+/// ([`aterm_uds::process::stripped_from_child`]).
 fn ctl(args: &[&str]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_aterm-ctl"));
     for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        // The verify run's mark is no authority and stays (`VERIFY_RUN_VAR`).
-        let aterm = name.starts_with("ATERM_") && name != aterm_uds::process::VERIFY_RUN_VAR;
-        if aterm || name == "TMUX" || name == "STY" || name == "ZELLIJ" {
+        let multiplexer = key == "TMUX" || key == "STY" || key == "ZELLIJ";
+        if aterm_uds::process::stripped_from_child(&key) || multiplexer {
             command.env_remove(key);
         }
     }

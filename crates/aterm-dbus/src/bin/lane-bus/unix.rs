@@ -234,9 +234,15 @@ impl Fail {
 
 pub(crate) fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let parse_pid = |p: &String| {
+        p.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| p.parse::<u32>().ok())
+            .flatten()
+    };
     let result = match args.first().map(String::as_str) {
-        Some("atspi-walk") => match (args.get(1), args.get(2).map(|p| p.parse::<u32>())) {
-            (Some(app), Some(Ok(pid))) if args.len() == 3 => walk(app, pid),
+        Some("atspi-walk") => match (args.get(1), args.get(2).and_then(parse_pid)) {
+            (Some(app), Some(pid)) if args.len() == 3 => walk(app, pid),
             _ => Err(Fail::Usage("atspi-walk <app> <pid>".into())),
         },
         Some("atspi-listen") => match (args.get(1), args.get(2), args.get(3)) {
@@ -246,25 +252,23 @@ pub(crate) fn main() -> ExitCode {
             _ => Err(Fail::Usage("atspi-listen <app> <out> <stop>".into())),
         },
         Some("seat") => match (
-            args.get(1).map(|p| p.parse::<u32>()),
+            args.get(1).and_then(parse_pid),
             args.get(2),
-            args.get(3).map(|p| p.parse::<u32>()),
+            args.get(3).and_then(parse_pid),
         ) {
-            (Some(Ok(mutter)), Some(app), Some(Ok(pid))) => {
-                parse_steps(args.get(4..).unwrap_or_default())
-                    .map_err(Fail::Usage)
-                    .and_then(|steps| seat(mutter, app, pid, &steps))
-            }
+            (Some(mutter), Some(app), Some(pid)) => parse_steps(args.get(4..).unwrap_or_default())
+                .map_err(Fail::Usage)
+                .and_then(|steps| seat(mutter, app, pid, &steps)),
             _ => Err(Fail::Usage(
                 "seat <mutter-pid> <app> <app-pid> <step>...".into(),
             )),
         },
-        Some("cast") => match (args.get(1).map(|p| p.parse::<u32>()), args.get(2)) {
-            (Some(Ok(mutter)), Some(out)) if args.len() == 3 => cast(mutter, Path::new(out)),
+        Some("cast") => match (args.get(1).and_then(parse_pid), args.get(2)) {
+            (Some(mutter), Some(out)) if args.len() == 3 => cast(mutter, Path::new(out)),
             _ => Err(Fail::Usage("cast <mutter-pid> <out.png>".into())),
         },
-        Some("xseat") => match (args.get(1), args.get(2).map(|p| p.parse::<u32>())) {
-            (Some(app), Some(Ok(pid))) => parse_steps(args.get(3..).unwrap_or_default())
+        Some("xseat") => match (args.get(1), args.get(2).and_then(parse_pid)) {
+            (Some(app), Some(pid)) => parse_steps(args.get(3..).unwrap_or_default())
                 .map_err(Fail::Usage)
                 .and_then(|steps| xseat(app, pid, &steps)),
             _ => Err(Fail::Usage("xseat <app> <app-pid> <step>...".into())),
@@ -856,8 +860,12 @@ fn listen(app: &str, out: &Path, stop: &Path) -> Result<(), Fail> {
 
 fn parse_window(word: &str) -> Option<u32> {
     match word.strip_prefix("0x") {
-        Some(hex) => u32::from_str_radix(hex, 16).ok(),
-        None => word.parse().ok(),
+        Some(hex) if hex.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            u32::from_str_radix(hex, 16).ok()
+        }
+        Some(_) => None,
+        None if word.bytes().all(|b| b.is_ascii_digit()) => word.parse().ok(),
+        None => None,
     }
 }
 
@@ -943,7 +951,11 @@ const KEYSYMS: [(&str, u32); 15] = [
 
 fn keysym(word: &str) -> Option<u32> {
     if let Some(hex) = word.strip_prefix("0x") {
-        return u32::from_str_radix(hex, 16).ok();
+        return hex
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit())
+            .then(|| u32::from_str_radix(hex, 16).ok())
+            .flatten();
     }
     if let Some((_, k)) = KEYSYMS.iter().find(|(n, _)| *n == word) {
         return Some(*k);
@@ -960,13 +972,15 @@ fn button(word: &str) -> Option<i32> {
         "left" => Some(0x110),
         "right" => Some(0x111),
         "middle" => Some(0x112),
-        n => n.parse().ok(),
+        n if !n.starts_with('+') => n.parse().ok(),
+        _ => None,
     }
 }
 
 fn motion(text: &str) -> Option<(i32, i32)> {
     let mut it = text.trim().split([',', ' ']).filter(|w| !w.is_empty());
-    let (dx, dy) = (it.next()?.parse().ok()?, it.next()?.parse().ok()?);
+    let mut num = || it.next().filter(|s| !s.starts_with('+'))?.parse().ok();
+    let (dx, dy) = (num()?, num()?);
     let reach = |d: i32| d.unsigned_abs() <= 100_000;
     (it.next().is_none() && reach(dx) && reach(dy)).then_some((dx, dy))
 }
@@ -1051,8 +1065,11 @@ fn parse_steps(words: &[String]) -> Result<Vec<Step>, String> {
             "finger-up" if arg.is_empty() => steps.push(Step::FingerUp),
             "finger-up" => return Err(format!("seat step '{w}': finger-up: takes nothing")),
             "sleep" => steps.push(Step::Sleep(
-                arg.parse()
-                    .map_err(|_| format!("seat step '{w}': milliseconds"))?,
+                arg.bytes()
+                    .all(|b| b.is_ascii_digit())
+                    .then(|| arg.parse().ok())
+                    .flatten()
+                    .ok_or_else(|| format!("seat step '{w}': milliseconds"))?,
             )),
             "touch" | "wait" if arg.starts_with('/') => steps.push(if verb == "touch" {
                 Step::Touch(arg.to_string())
@@ -1742,6 +1759,10 @@ mod tests {
         assert!(parse_steps(&w(&["finger-up:0"])).is_err());
         assert!(parse_steps(&w(&["finger-down:@relative"])).is_err());
         assert!(parse_steps(&w(&["finger-move:1"])).is_err());
+        assert!(parse_steps(&w(&["sleep:+5"])).is_err());
+        assert!(parse_steps(&w(&["tap:0x+41"])).is_err());
+        assert_eq!(parse_window("+123"), None);
+        assert_eq!(parse_window("0x+123"), None);
     }
 
     #[test]

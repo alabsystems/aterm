@@ -106,7 +106,10 @@ impl<'a> Parser<'a> {
     }
 
     fn at(&self, offset: usize) -> Option<u8> {
-        self.b.get(self.pos + offset).copied()
+        self.pos
+            .checked_add(offset)
+            .and_then(|i| self.b.get(i))
+            .copied()
     }
 
     const fn eof(&self) -> bool {
@@ -124,7 +127,7 @@ impl<'a> Parser<'a> {
 
     /// The first char boundary strictly after `at`, or the end of input.
     fn next_boundary(&self, at: usize) -> usize {
-        let mut end = (at + 1).min(self.b.len());
+        let mut end = at.saturating_add(1).min(self.b.len());
         while end < self.b.len() && !self.src.is_char_boundary(end) {
             end += 1;
         }
@@ -417,7 +420,7 @@ impl<'a> Parser<'a> {
     fn keyval(&mut self, doc: &mut DocumentMut, path: &[usize], trivia_start: usize) -> Result<()> {
         let key_start = self.pos;
         let segs = self.key_path()?;
-        self.check_depth(path.len() + segs.len(), key_start)?;
+        self.check_depth(path.len().saturating_add(segs.len()), key_start)?;
         if self.peek() != Some(b'=') {
             return self.here("expected `=` after a key");
         }
@@ -429,7 +432,7 @@ impl<'a> Parser<'a> {
         let value_prefix_start = self.pos;
         self.eat_ws();
         let value_prefix = self.src[value_prefix_start..self.pos].to_owned();
-        let mut value = self.value(path.len() + segs.len())?;
+        let mut value = self.value(path.len().saturating_add(segs.len()))?;
         let value_suffix_start = self.pos;
         self.eat_line_end()?;
         let decor = value.decor_mut();
@@ -608,7 +611,7 @@ impl<'a> Parser<'a> {
                 return self.err(self.b.len()..self.b.len(), "unterminated array");
             }
             let prefix = self.src[trivia_start..self.pos].to_owned();
-            let mut value = self.value(depth + 1)?;
+            let mut value = self.value(depth.saturating_add(1))?;
             let suffix_start = self.pos;
             self.eat_trivia()?;
             let decor = value.decor_mut();
@@ -649,7 +652,7 @@ impl<'a> Parser<'a> {
         loop {
             let entry_start = self.pos;
             let segs = self.key_path()?;
-            self.check_depth(depth + segs.len(), entry_start)?;
+            self.check_depth(depth.saturating_add(segs.len()), entry_start)?;
             if self.peek() != Some(b'=') {
                 return self.here("expected `=` after a key in an inline table");
             }
@@ -661,7 +664,7 @@ impl<'a> Parser<'a> {
             let value_prefix_start = self.pos;
             self.eat_ws();
             let value_prefix = self.src[value_prefix_start..self.pos].to_owned();
-            let mut value = self.value(depth + segs.len())?;
+            let mut value = self.value(depth.saturating_add(segs.len()))?;
             let value_suffix_start = self.pos;
             self.eat_ws();
             let decor = value.decor_mut();
@@ -878,7 +881,7 @@ impl<'a> Parser<'a> {
     }
 
     fn unicode_escape(&mut self, out: &mut String, digits: usize, start: usize) -> Result<()> {
-        if self.pos + digits > self.b.len() {
+        if self.b.len().saturating_sub(self.pos) < digits {
             return self.err(start..self.b.len(), "truncated unicode escape");
         }
         let window = &self.b[self.pos..self.pos + digits];

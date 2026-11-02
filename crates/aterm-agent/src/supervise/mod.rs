@@ -31,11 +31,11 @@ pub use background::{BackgroundCall, BackgroundEvidence};
 pub use blocks::View;
 pub use classify::{DEFAULT_PYTHON_ALLOW, classify_command_with};
 pub use config::{Autopilot, LandAt, Occupancy, SupervisorConfig};
-pub use facts::{Fact, FactsReading};
+pub use facts::{Fact, FactsReading, HeldCall, HeldReading};
 pub use journal::{Journal, read_journal};
 pub use ledger::{
     ANCHOR_REMOVED, Format as LedgerFormat, LedgerHost, LedgerOpts, gather, parse_since,
-    render as render_ledger,
+    parse_since_local, render as render_ledger,
 };
 pub use phase::{
     Busy, Phase, Zone, busy_signal, context_left, is_placeholder, limit_notice, survey_open,
@@ -45,12 +45,13 @@ pub use policy::approval::QuestionPriority;
 pub use policy::turn_end::{AgentResumed, Outage, WaitKind};
 pub use report::{DEFAULT_MAX_ROWS, Mark, Marker, Reason, Report, ReportOpts};
 pub use run::{
-    ATTENTION_OWNER, ATTENTION_PREFIX, AnswerOpts, ApprovalEnv, CLAIM_HELD, CLAIM_RENEW, Caps, Ctl,
-    CtlReply, EXIT_NO_BOX, EXIT_NOT_SERVED, EXIT_REFUSED, EXIT_TIMEOUT, Guard, HELD_HEAD, HostStep,
-    IdleHost, IdlePoint, Interrupter, Lasting, NEEDS_ATTENTION_OWNER, ProbeMiss, ProbeNo,
-    RELAUNCH_ATTENTION_OWNER, STARTUP_HEAD, Session, SessionSetup, StallSeen, StuckSurvey,
-    SuperviseOpts, Turn, UNBOUNDED, UsageSeen, WaitPlan, WorkerSource, deadline_attention,
-    event_line, exit_reason, mark_task_exited, render_phase, render_phase_and_survey,
+    ATTENTION_OWNER, ATTENTION_PREFIX, AnswerOpts, ApprovalEnv, BuiltinAuthority, CLAIM_HELD,
+    CLAIM_RENEW, Caps, Ctl, CtlReply, EXIT_NO_BOX, EXIT_NOT_SERVED, EXIT_REFUSED, EXIT_TIMEOUT,
+    Guard, HELD_HEAD, HostStep, IdleHost, IdlePoint, Interrupter, Lasting, NEEDS_ATTENTION_OWNER,
+    ProbeMiss, ProbeNo, RELAUNCH_ATTENTION_OWNER, STARTUP_HEAD, Session, SessionSetup, StallSeen,
+    StuckSurvey, SuperviseOpts, Turn, UNBOUNDED, UsageSeen, WaitPlan, WorkerSource,
+    deadline_attention, event_line, exit_reason, mark_task_exited, render_phase,
+    render_phase_and_survey,
 };
 pub use transport::{Endpoint, RelayCtl};
 

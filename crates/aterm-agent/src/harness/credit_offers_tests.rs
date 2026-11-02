@@ -363,8 +363,11 @@ fn the_profile_is_the_one_the_process_environment_names() {
         Some(Path::new("/Users//someone/.claude.json"))
     );
     assert_eq!(
-        path_for(&["CLAUDE_CONFIG_DIR=/elsewhere/claude".to_string()], home).as_deref(),
-        Some(Path::new("/elsewhere/claude/.claude.json"))
+        path_for(
+            &[at!("CLAUDE_CONFIG_DIR=", "/elsewhere/claude", "").to_string()],
+            home
+        ),
+        Some(Path::new(at!("/elsewhere/claude")).join(".claude.json"))
     );
 }
 
@@ -494,6 +497,8 @@ fn a_claim_page_is_https_on_the_vendor_with_no_money_word() {
             "https://claude.ai/claim?next=%2Fsettings%2Fbilling",
             "`billing`",
         ),
+        ("https://claude.ai/settings/%62illing", "`billing`"),
+        ("https://-sub.claude.ai/claim", "not the vendor's host"),
         ("https://claude.ai/upgrade", "`upgrade`"),
         ("https://claude.ai/Settings/Usage", "`usage`"),
         ("https://claude.ai/max-plan", "`plan`"),
@@ -511,4 +516,33 @@ fn a_claim_page_is_https_on_the_vendor_with_no_money_word() {
             assert!(!vendor_host(&format!("x{host}")), "{host}");
         }
     }
+}
+
+#[test]
+fn duplicate_org_status_keys_take_the_last_json_entry() {
+    let doc = r#"{
+        "oauthAccount": {"accountUuid": "acc-1", "organizationUuid": "org-1"},
+        "cachedGrowthBookFeatures": {
+            "tengu_snug_storm": {"text": "Claim API credits at https://clau.de/api-credits"}
+        },
+        "apiCreditLinkStatusCache": {
+            "org-1": {"eligibleSince": 1700000000},
+            "org-1": {"eligibleSince": null}
+        }
+    }"#;
+    let found = parse(doc.as_bytes()).expect("valid JSON");
+    assert!(found.is_empty(), "{found:?}");
+
+    let reversed = r#"{
+        "oauthAccount": {"accountUuid": "acc-1", "organizationUuid": "org-1"},
+        "cachedGrowthBookFeatures": {
+            "tengu_snug_storm": {"text": "Claim API credits at https://clau.de/api-credits"}
+        },
+        "apiCreditLinkStatusCache": {
+            "org-1": {"eligibleSince": null},
+            "org-1": {"eligibleSince": 1700000000}
+        }
+    }"#;
+    let found = parse(reversed.as_bytes()).expect("valid JSON");
+    assert_eq!(found.len(), 1, "{found:?}");
 }

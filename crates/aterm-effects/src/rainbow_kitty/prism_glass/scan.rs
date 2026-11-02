@@ -19,7 +19,7 @@
 use aterm_hash::{FxHashMap, FxHashSet};
 use aterm_render::{glow_lerp_rgb, over_premul, premul_rgb};
 
-use super::colour::{linear_levels, luminance};
+use super::colour::{THIN_INK_SHARE, linear_levels, luminance, rim_share, seen_floor_y};
 use crate::effect_util::lerp_rgb;
 use crate::rainbow_kitty::meteor::tri;
 use crate::rainbow_kitty::ribbon::{BED_INK_LUT_LEN, BedInkLut};
@@ -81,13 +81,19 @@ const PROBE: f64 = 2.0e-7;
 
 /// The glass page the scan composites over, and the theme fg it reads against.
 ///
-/// The scan works in WCAG luminance: the theme fg's contrast on a colour is monotone in the
-/// colour's luminance, so the darkest composite is the worst and each bar is one luminance.
+/// The scan works in WCAG luminance: the theme fg's glyph as it is seen ([`seen_y`](super::colour::seen_y), its
+/// dimmest solid ink against the colour) reads monotone in the colour's luminance, so the
+/// darkest composite is the worst and each bar is one luminance.
 #[derive(Clone, Debug)]
 pub struct Ground {
     /// WCAG's linear light of each 8-bit level.
     lin: [f64; 256],
     fg_y: f64,
+    /// The page's luminance, which sets how far the fg's dimmest solid ink lies toward its
+    /// ground ([`rim_share`]).
+    page_y: f64,
+    /// That share, for the window's thinnest glyph ([`THIN_INK_SHARE`]).
+    rim: f64,
     page: u32,
     /// Per channel, each 8-bit level's least composite over the page at any alpha 1..=255.
     least: [[u8; 256]; 3],
@@ -111,9 +117,12 @@ impl Ground {
                 }
             }
         }
+        let (fg_y, page_y) = (luminance(fg), luminance(page));
         Self {
             lin: *linear_levels(),
-            fg_y: luminance(fg),
+            fg_y,
+            page_y,
+            rim: rim_share(fg_y, page_y, THIN_INK_SHARE),
             page,
             least,
             column_memo: FxHashMap::default(),
@@ -128,20 +137,21 @@ impl Ground {
             + 0.0722 * self.lin[(c & 0xff) as usize]
     }
 
-    /// `y` over the theme fg's: its contrast when the colour is the lighter, under 1 when it is
-    /// the darker.
+    /// `y` over the theme fg's glyph seen on it ([`seen_y`](super::colour::seen_y)): its contrast when the colour is
+    /// the lighter, under 1 when it is the darker.
     #[inline]
     fn ratio(&self, y: f64) -> f64 {
-        (y + 0.05) / (self.fg_y + 0.05)
+        (y + 0.05) / (self.fg_y + self.rim * (y - self.fg_y) + 0.05)
     }
 
     /// The luminance under which a colour's [`Self::ratio`] is under `thr`.
     #[inline]
     fn y_bar(&self, thr: f64) -> f64 {
-        thr * (self.fg_y + 0.05) - 0.05
+        seen_floor_y(self.fg_y, self.page_y, thr)
     }
 
-    /// The contrast of the theme fg on `c`, under 1 when `c` is the darker.
+    /// The contrast of the theme fg's glyph as it is seen on `c` ([`seen_y`](super::colour::seen_y)), under 1 when `c`
+    /// is the darker.
     #[inline]
     #[must_use]
     pub fn contrast(&self, c: u32) -> f64 {
@@ -326,7 +336,7 @@ pub fn bracket(t: f64, step: f32) -> core::ops::RangeInclusive<usize> {
 /// The worst a scan found.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Worst {
-    /// The least contrast of the theme fg over any column at any alpha.
+    /// The least the theme fg's glyph reads as it is seen over any column at any alpha.
     pub contrast: f64,
     /// The origin that lays it.
     pub t: f64,

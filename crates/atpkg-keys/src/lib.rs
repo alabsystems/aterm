@@ -57,6 +57,144 @@ pub struct Signed {
     pub roster_seq: u64,
 }
 
+/// Most tokens read after the verb (`setup` and `join` take up to 8), held in a fixed
+/// [`Argv`] array.
+pub const MAX_ARGS: usize = 14;
+
+/// Bounded argument vector (`None` from the first unset slot onwards).
+pub type Argv = [Option<String>; MAX_ARGS];
+
+/// Flag names that would carry the master key on argv, refused with a compromise warning.
+pub const MASTER_FLAGS: &[&str] = &[
+    "master",
+    "master-file",
+    "phrase",
+    "phrase-file",
+    "seed",
+    "paper",
+    "secret",
+];
+
+/// Value following `--<name>`, or `None` (two-token `--name value` form; [`vet_args`] runs first).
+#[must_use]
+pub fn flag<'a>(argv: &'a Argv, name: &str) -> Option<&'a str> {
+    let mut want = String::from("--");
+    want.push_str(name);
+    for i in 0..MAX_ARGS {
+        if argv[i].as_deref() == Some(want.as_str()) && i + 1 < MAX_ARGS {
+            return argv[i + 1].as_deref();
+        }
+    }
+    None
+}
+
+/// The `want`th positional argument (skipping `--flag value` pairs), 0-based after the verb.
+#[must_use]
+pub fn positional(argv: &Argv, want: usize) -> Option<&str> {
+    let mut seen = 0usize;
+    let mut i = 0usize;
+    while i < MAX_ARGS {
+        match argv[i].as_deref() {
+            None => return None,
+            Some(a) if a.starts_with("--") => i += 2,
+            Some(a) => {
+                if seen == want {
+                    return Some(a);
+                }
+                seen += 1;
+                i += 1;
+            }
+        }
+    }
+    None
+}
+
+/// Refuse any argument shape outside `allowed` flags and `max_positional` bare arguments.
+pub fn vet_args(
+    verb: &str,
+    argv: &Argv,
+    allowed: &[&str],
+    max_positional: usize,
+) -> Result<(), String> {
+    let mut positional = 0usize;
+    let mut seen_flags = [""; MAX_ARGS];
+    let mut n_seen = 0usize;
+    let mut i = 0usize;
+    while i < MAX_ARGS {
+        let Some(tok) = argv[i].as_deref() else {
+            return Ok(());
+        };
+        if !tok.starts_with("--") {
+            positional += 1;
+            if positional > max_positional {
+                return Err(fsio::concat(&[
+                    "unexpected argument '",
+                    tok,
+                    "' for `atpkg-keys ",
+                    verb,
+                    "`",
+                ]));
+            }
+            i += 1;
+            continue;
+        }
+        let name = tok.get(2..).unwrap_or("");
+        if let Some(eq) = name.find('=') {
+            return Err(fsio::concat(&[
+                "'",
+                tok,
+                "' uses the `--name=value` form; write it as two tokens: `--",
+                name.get(..eq).unwrap_or(""),
+                " <value>`",
+            ]));
+        }
+        if MASTER_FLAGS.contains(&name) {
+            return Err(fsio::concat(&[
+                "'",
+                tok,
+                "' does not exist: the master phrase is read only from /dev/tty. If you \
+                 typed your real phrase on this command line, TREAT THAT MASTER AS \
+                 COMPROMISED (it may be in shell history and was visible to `ps`): destroy \
+                 the paper and generate a new master on a tree whose anchor is not armed.",
+            ]));
+        }
+        if !allowed.contains(&name) {
+            let mut msg = fsio::concat(&["unknown flag '", tok, "' for `atpkg-keys ", verb, "`"]);
+            for (n, a) in allowed.iter().enumerate() {
+                msg.push_str(if n == 0 { " (it accepts " } else { ", " });
+                msg.push_str("--");
+                msg.push_str(a);
+            }
+            if !allowed.is_empty() {
+                msg.push(')');
+            }
+            return Err(msg);
+        }
+        if seen_flags[..n_seen].contains(&name) {
+            return Err(fsio::concat(&["'", tok, "' was given more than once"]));
+        }
+        seen_flags[n_seen] = name;
+        n_seen += 1;
+        match argv.get(i + 1).and_then(|v| v.as_deref()) {
+            None => {
+                return Err(fsio::concat(&["'", tok, "' needs a value after it"]));
+            }
+            Some(v) if v.starts_with("--") => {
+                return Err(fsio::concat(&[
+                    "'",
+                    tok,
+                    "' was given '",
+                    v,
+                    "' as its value, which is another flag",
+                ]));
+            }
+            Some(_) => {}
+        }
+        i += 2;
+    }
+    Ok(())
+}
+
 /// Verify a detached Ed25519 signature over `file`'s exact bytes by a machine the
 /// master-signed roster authorizes, by the client's own appcast rule: the roster verifies
 /// under one of `master_pubkeys`, parses, is fresh at `now_unix`, and one of its live machines
@@ -232,5 +370,74 @@ mod tests {
     fn invalid_key_fails_closed() {
         assert!(sign(b"not a pkcs8 key", b"x").is_err());
         assert!(pubkey_b64(b"not a pkcs8 key").is_err());
+    }
+
+    fn argv(tokens: &[&str]) -> Argv {
+        let mut out: Argv = Default::default();
+        for (slot, tok) in out.iter_mut().zip(tokens.iter()) {
+            *slot = Some((*tok).to_string());
+        }
+        out
+    }
+
+    #[test]
+    fn vet_args_accepts_allowed_flags_and_positionals_and_refuses_bad_shapes() {
+        let a = argv(&["--id", "m3", "--pins", "/tmp/pins.rs"]);
+        assert_eq!(vet_args("setup", &a, &["id", "pins"], 0), Ok(()));
+        assert_eq!(flag(&a, "id"), Some("m3"));
+        assert_eq!(flag(&a, "pins"), Some("/tmp/pins.rs"));
+        assert_eq!(flag(&a, "roster"), None);
+
+        let pos = argv(&["key.pkcs8", "manifest.toml", "manifest.toml.sig"]);
+        assert_eq!(vet_args("sign", &pos, &[], 3), Ok(()));
+        assert_eq!(positional(&pos, 0), Some("key.pkcs8"));
+        assert_eq!(positional(&pos, 1), Some("manifest.toml"));
+        assert_eq!(positional(&pos, 2), Some("manifest.toml.sig"));
+        assert_eq!(positional(&pos, 3), None);
+
+        assert_eq!(
+            vet_args("setup", &argv(&["--id=m3"]), &["id"], 0),
+            Err(
+                "'--id=m3' uses the `--name=value` form; write it as two tokens: `--id <value>`"
+                    .to_string()
+            )
+        );
+        for &m in MASTER_FLAGS {
+            let tok = format!("--{m}");
+            let err = vet_args("setup", &argv(&[&tok, "x"]), &["id"], 0).unwrap_err();
+            assert!(err.contains("TREAT THAT MASTER AS COMPROMISED"), "{err}");
+        }
+        assert_eq!(
+            vet_args("setup", &argv(&["--bogus", "x"]), &["id", "pins"], 0),
+            Err(
+                "unknown flag '--bogus' for `atpkg-keys setup` (it accepts --id, --pins)"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            vet_args("master-check", &argv(&["--bogus", "x"]), &[], 0),
+            Err("unknown flag '--bogus' for `atpkg-keys master-check`".to_string())
+        );
+        assert_eq!(
+            vet_args("setup", &argv(&["--id"]), &["id"], 0),
+            Err("'--id' needs a value after it".to_string())
+        );
+        assert_eq!(
+            vet_args("setup", &argv(&["--id", "--pins"]), &["id", "pins"], 0),
+            Err("'--id' was given '--pins' as its value, which is another flag".to_string())
+        );
+        assert_eq!(
+            vet_args(
+                "setup",
+                &argv(&["--id", "m1", "--id", "m2"]),
+                &["id", "pins"],
+                0
+            ),
+            Err("'--id' was given more than once".to_string())
+        );
+        assert_eq!(
+            vet_args("setup", &argv(&["extra"]), &["id"], 0),
+            Err("unexpected argument 'extra' for `atpkg-keys setup`".to_string())
+        );
     }
 }

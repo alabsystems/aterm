@@ -114,7 +114,11 @@ fn value<'a>(args: &'a str, key: &str, end: &[char]) -> Option<&'a str> {
 }
 
 fn hex(s: &str) -> Option<u128> {
-    u128::from_str_radix(s.trim_start_matches("0x"), 16).ok()
+    let h = s.strip_prefix("0x").unwrap_or(s);
+    h.bytes()
+        .all(|b| b.is_ascii_hexdigit())
+        .then(|| u128::from_str_radix(h, 16).ok())
+        .flatten()
 }
 
 fn role(root: &str, own: &BTreeSet<String>, id: &str) -> String {
@@ -168,7 +172,7 @@ pub fn summary(log: &str) -> Vec<(&'static str, String)> {
             if let Some((n, name)) = rest.split_once("(\"")
                 && let Some(n) = hex(n)
             {
-                atom_names.insert(n, name.trim_end_matches("\")").to_string());
+                atom_names.insert(n, name.strip_suffix("\")").unwrap_or(name).to_string());
             }
             continue;
         }
@@ -249,7 +253,7 @@ pub fn summary(log: &str) -> Vec<(&'static str, String)> {
                 let data = value(r.args, "unparsed-data", &[';', ' ']).unwrap_or("?");
                 let bytes: String = data
                     .split(',')
-                    .map(|b| b.trim_start_matches("0x"))
+                    .map(|b| b.strip_prefix("0x").unwrap_or(b))
                     .collect();
                 selects.insert(format!("XKB {bytes}"));
             }
@@ -444,5 +448,6 @@ mod tests {
             .map(|l| format!("{l}\n"))
             .collect();
         assert_eq!(line("x11.wire.errors", &clean), "none");
+        assert_eq!(hex("0x0x1"), None);
     }
 }

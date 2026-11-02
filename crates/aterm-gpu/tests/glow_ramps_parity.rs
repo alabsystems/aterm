@@ -26,7 +26,8 @@
 //! near-opaque one, an additive end beside an opaque one) draws the same
 //! bytes on the CPU and on every GPU arm and route, laid under any cost, and
 //! so does a frame of the light glass's wedge, its flat runs beside ramps
-//! from zero opacity.
+//! from zero opacity, and a frame of the glass typed on Default Light with
+//! its wedge rows, its yield and a selection under it.
 
 use crate::common;
 use aterm_core::render::RenderInput;
@@ -1280,6 +1281,613 @@ fn a_wedge_frame_draws_the_same_bytes_on_cpu_and_gpu() {
         );
         draws_like_its_quads(TEST, &exact, &mut arms, theme, &laid, "the slab twin");
     }
+}
+
+/// Default Light, the shipped light theme the glass draws on (aterm-types' builtin): its
+/// glass129 ships, so the glass draws from the first lit frame.
+const DEFAULT_LIGHT: Theme = Theme {
+    fg: 0x002B_2D33,
+    bg: 0x00F6_F7F9,
+    cursor: 0x001A_7F37,
+    selection: 0x00BC_C9E0,
+};
+
+/// A typed line of words in upper half blocks, which the CPU and the GPU draw byte for byte (an
+/// antialiased glyph's edge may round a last bit apart), so a delta is the glass's. Procedural
+/// words have no mono-raster authority and yield; blank regions still exercise exact glass
+/// parity. The supported-raster word positive below checks retained text separately.
+/// Its fourth word is typed in an app's red.
+const GLASS_LINE: &str = "▀▀▀▀ ▀▀ ▀▀▀ ▀▀▀▀▀▀▀ ▀▀▀▀▀ ▀▀▀▀ ▀▀▀▀▀ ▀▀▀ ▀▀▀ ▀▀▀▀▀▀▀";
+/// The red word's keys in [`GLASS_LINE`], from its first (Default Light's ANSI red, #c4262e).
+const RED_WORD: (usize, usize) = (12, 19);
+/// The prompt the line is typed after, in the same blocks.
+const GLASS_PROMPT: &str = "▀▀▀ ";
+/// The key after which the cells [`GLASS_SELECTED`] behind the caret are selected.
+const GLASS_SELECT_AT: usize = 30;
+/// The selected cells, as offsets behind the caret: under the band's newest stretch.
+const GLASS_SELECTED: (u16, u16) = (9, 3);
+
+struct GlassParityScene {
+    name: &'static str,
+    px: f32,
+    line: &'static str,
+    prompt: &'static str,
+    red_word: (usize, usize),
+    select_at: usize,
+    selected: (u16, u16),
+    supported: bool,
+}
+
+impl GlassParityScene {
+    fn procedural() -> Self {
+        Self {
+            name: "the procedural corpus",
+            px: PX,
+            line: GLASS_LINE,
+            prompt: GLASS_PROMPT,
+            red_word: RED_WORD,
+            select_at: GLASS_SELECT_AT,
+            selected: GLASS_SELECTED,
+            supported: false,
+        }
+    }
+
+    fn supported() -> Self {
+        let line = "MMMM MMMM MMMM ";
+        let words: Vec<_> = line
+            .split_inclusive(' ')
+            .scan(0, |col, word| {
+                let start = *col;
+                *col += word.chars().count();
+                Some((start, start + word.trim_end_matches(' ').chars().count()))
+            })
+            .collect();
+        let select_at = words[2].0 + 1;
+        let caret = select_at + 1;
+        // Select the first word's last two letters while the third word's second letter
+        // arrives: selected ordinary ink, the red middle word and unselected ordinary ink
+        // all lie in the same live tail. No position belongs to the procedural corpus.
+        let selected = (
+            u16::try_from(caret - (words[0].1 - 2)).expect("a short selection"),
+            u16::try_from(caret - (words[0].1 - 1)).expect("a short selection"),
+        );
+        Self {
+            name: "the actual 24px word corridor",
+            px: 24.0,
+            line,
+            prompt: "MMM ",
+            red_word: words[1],
+            select_at,
+            selected,
+            supported: true,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct GlassMixCensus {
+    glass: usize,
+    emitted: usize,
+    unyielded_wedge: usize,
+    wedge: usize,
+    yielded: usize,
+    selected: usize,
+    mixed: usize,
+    selected_pixels_changed: usize,
+    font_page_delta: i32,
+}
+
+/// The glass's procedural corpus and an actual-font mixed frame (PRISM-GLASS §15.2 1.12):
+/// Rainbow Kitty on Default Light at [`Live::Glass`], yielded as the heterogeneous route
+/// yields it ([`EffectsPipeline::yield_glass_unworded`]). The original block words keep their
+/// byte comparisons and have no raster authority. A separate 24px M corridor supplies the
+/// retained wedge beside a red word and selected ordinary ink. Its actual font page can round
+/// a channel apart between raster backends (the measured 24px page differs by one before any
+/// glass), so its parity judge compares ramps with flattened quads within each backend. A
+/// supported frame must mix actual emission, final wedge rows, a yield cut and selected cells;
+/// its unyielded twin must change both backends, including pixels inside the selection. The
+/// original procedural corpus keeps every exact cross-backend comparison, its unyielded
+/// frames included; the font page delta remains in the census, never a global tolerance.
+#[test]
+fn procedural_glass_is_byte_exact_and_supported_glass_keeps_a_mixed_frame() {
+    let procedural = glass_frame_parity(GlassParityScene::procedural());
+    let supported = glass_frame_parity(GlassParityScene::supported());
+    let glass_frames = procedural.glass + supported.glass;
+    let mixed = procedural.mixed + supported.mixed;
+    assert!(glass_frames > 0, "premise: the glass drew");
+    assert!(
+        mixed > 0,
+        "a frame mixes the glass, its wedge rows, the yield and a selection \
+         ({glass_frames} glass frames; procedural {procedural:?}; supported {supported:?})"
+    );
+    assert!(
+        supported.mixed > 0 && supported.selected_pixels_changed > 0,
+        "the actual word corridor retains the mixed frame and a visible selection cut: \
+         {supported:?}"
+    );
+}
+
+/// Keep procedural cross-backend byte parity and actual supported ink's per-backend
+/// ramp/quad parity, where strict yielding can leave a body wedge beside its cuts.
+fn glass_frame_parity(scene: GlassParityScene) -> GlassMixCensus {
+    const TEST: &str = "procedural_glass_is_byte_exact_and_supported_glass_keeps_a_mixed_frame";
+    use aterm_core::selection::{SelectionSide, SelectionType};
+    use aterm_effects::cursor_glow::{Light, Live};
+    let exact = common::ByteExact::default();
+    let theme = DEFAULT_LIGHT;
+    let mut arms = common::arms(scene.px, theme);
+    for (_, _, gpu) in &arms {
+        common::byte_exact_or_could_not_run(gpu, TEST);
+    }
+    let (cw, ch) = arms[0].1.cell_size();
+    for (_, cpu, gpu) in &mut arms {
+        cpu.debug_block_on_lazy_fallbacks();
+        gpu.set_bloom(false);
+        gpu.set_shimmer(false);
+        gpu.set_ramps_fx_for_test(None);
+    }
+    let (frame_w, frame_h) = arms[0].1.frame_size(ROWS, COLS);
+    let px = |v: usize| u16::try_from(v).expect("a geometry within u16");
+    let geom = Geom {
+        cw,
+        ch,
+        rows: ROWS,
+        cols: COLS,
+        origin_x: px(arms[0].1.pad()),
+        origin_y: px(arms[0].1.grid_top()),
+        win_w: px(frame_w),
+        win_h: px(frame_h),
+        head: 0,
+    };
+    let light = if scene.supported {
+        let page = aterm_effects::host::PageFacts {
+            thin_ink: arms[0].1.glyph_ink().thin_share(
+                aterm_render::linear_luminance(theme.fg),
+                aterm_render::linear_luminance(theme.bg),
+            ),
+            ..aterm_effects::host::PageFacts::OPAQUE
+        };
+        assert!(page.glass(), "the actual 24px fixture face admits glass");
+        Light::at(Live::Glass).on_page(page.glass())
+    } else {
+        Light::at(Live::Glass)
+    };
+    let cfg = GlowConfig {
+        light,
+        ..config(theme, KITTY)
+    };
+    assert!(
+        cfg.light.glass() && !cfg.dark_theme,
+        "premise: a lit light page"
+    );
+    let mut term = Terminal::new(ROWS as u16, COLS as u16);
+    term.process(b"\x1b]10;rgb:2b/2d/33\x07\x1b]11;rgb:f6/f7/f9\x07");
+    for _ in 0..ROWS - 3 {
+        term.process(b"\r\n");
+    }
+    term.process(scene.prompt.as_bytes());
+    let prompt_row = ROWS - 3;
+    // The app's measured ramp cost, and every row a quad (where the wedge's rows show).
+    let (mut app, mut rows) = (
+        Side::new(None, true),
+        Side::new(Some(RampCost::NEVER), true),
+    );
+    let mut base = RenderInput::empty();
+    let t0 = Instant::now();
+    let period = Duration::from_secs(1) / HZ;
+    let line: Vec<char> = scene.line.chars().collect();
+    let keys = line.len();
+    let mut census = GlassMixCensus::default();
+    let mut wins: Vec<_> = arms
+        .iter()
+        .map(|_| {
+            (
+                [WindowCpu::new(), WindowCpu::new()],
+                [aterm_gpu::WindowGpu::new(), aterm_gpu::WindowGpu::new()],
+            )
+        })
+        .collect();
+    for tick in 0..keys * KEY_TICKS + RUNOUT {
+        let now = t0 + period * tick as u32;
+        if tick % KEY_TICKS == 0 && tick / KEY_TICKS < keys {
+            let k = tick / KEY_TICKS;
+            let mut key = Vec::new();
+            if k == scene.red_word.0 {
+                key.extend_from_slice(b"\x1b[38;2;196;38;46m");
+            }
+            if k == scene.red_word.1 {
+                key.extend_from_slice(b"\x1b[39m");
+            }
+            key.extend_from_slice(line[k].encode_utf8(&mut [0; 4]).as_bytes());
+            term.process(&key);
+            if k == scene.select_at {
+                let caret = term.cell_frame(ROWS, COLS).cursor_col as u16;
+                let row = i32::try_from(prompt_row).expect("a row within i32");
+                let selection = term.text_selection_mut();
+                selection.start_selection(
+                    row,
+                    caret - scene.selected.0,
+                    SelectionSide::Left,
+                    SelectionType::Simple,
+                );
+                selection.update_selection(row, caret - scene.selected.1, SelectionSide::Right);
+                selection.complete_selection();
+            }
+            for side in [&mut app, &mut rows] {
+                side.fx.cursor_mut().glow.note_synthetic_typed(now, 1);
+            }
+        }
+        let _ = term.cell_frame_damage_scoped_into(&mut base, ROWS, COLS);
+        base.selection_bg = theme.selection;
+        let _ = aterm_render::test_counters::take_glass_slabs();
+        let ink = arms[0].1.glyph_ink_for(&base);
+        let observed = ink
+            .for_frame(&base, (cw, ch))
+            .expect("the scene observes this exact frame");
+        for (row, cells) in base.cells.iter().enumerate() {
+            for (col, cell) in cells.iter().enumerate() {
+                if cell.ch == '▀' {
+                    assert!(
+                        observed.coverage(row, col).is_none(),
+                        "procedural blocks never gain mono-raster authority"
+                    );
+                } else if scene.supported && cell.ch == 'M' {
+                    assert!(
+                        observed
+                            .coverage(row, col)
+                            .is_some_and(|(_, ink)| ink.max > 0),
+                        "the word corridor uses the actual supported M raster"
+                    );
+                }
+            }
+        }
+        app.fx
+            .cursor_mut()
+            .glow
+            .observe_glyph_ink(Some(Arc::clone(&ink)));
+        rows.fx.cursor_mut().glow.observe_glyph_ink(Some(ink));
+        app.frame(&term, &base, &cfg, geom, now);
+        let glass_slabs = aterm_render::test_counters::take_glass_slabs();
+        rows.frame(&term, &base, &cfg, geom, now);
+        let mut unyielded = Vec::new();
+        for side in [&mut app, &mut rows] {
+            unyielded.push(side.input.clone());
+            side.fx.yield_glass_unworded(&mut side.input);
+        }
+        let arm_names: Vec<&str> = app.fx.light_arms().iter().map(|(arm, _)| arm).collect();
+        if !arm_names.contains(&"glass") {
+            continue;
+        }
+        census.glass += 1;
+        let wedge = rows.input.glow_under.iter().any(|q| q.alpha != q.alpha2);
+        let selected =
+            (0..COLS).any(|col| base.selection_hit(prompt_row, col, false, false).is_some());
+        let yielded = arm_names.contains(&"yield");
+        let mix = glass_slabs > 0 && wedge && yielded && selected;
+        census.emitted += usize::from(glass_slabs > 0);
+        census.unyielded_wedge +=
+            usize::from(unyielded[1].glow_under.iter().any(|q| q.alpha != q.alpha2));
+        census.wedge += usize::from(wedge);
+        census.yielded += usize::from(yielded);
+        census.selected += usize::from(selected);
+        census.mixed += usize::from(mix);
+        // The procedural page, selection and caret are byte-exact. Record the actual-font
+        // page's separate AA delta without treating it as a glass-stream tolerance.
+        let mut page = app.input.clone();
+        page.glow_under.clear();
+        page.cursor_glow_add.clear();
+        page.glow_halo.clear();
+        page.glow_under_ramps = Default::default();
+        page.cursor_glow_add_ramps = Default::default();
+        for ((arm, cpu, gpu), (cwins, gwins)) in arms.iter_mut().zip(&mut wins) {
+            let what = format!("{}: {arm} frame {tick}, its page", scene.name);
+            if exact.holds(gpu, &what) {
+                let cpu_page = cpu.render_input(&page).pixels;
+                let gpu_page = gpu
+                    .render_input(&mut aterm_gpu::WindowGpu::new(), &page, None)
+                    .pixels;
+                let delta = common::max_channel_delta(&cpu_page, &gpu_page);
+                if scene.supported {
+                    census.font_page_delta = census.font_page_delta.max(delta);
+                } else {
+                    assert_eq!(
+                        delta, 0,
+                        "{what}: the page and its blocks draw byte-exact, so a delta is the glass's"
+                    );
+                }
+            }
+            let sides = [
+                ("the measured cost", &app.input, &unyielded[0]),
+                ("every row a quad", &rows.input, &unyielded[1]),
+            ];
+            for (i, (side, input, twin)) in sides.into_iter().enumerate() {
+                let what = format!("{arm} frame {tick} ({side}, arms {arm_names:?})");
+                let cpu_frame = cpu
+                    .render_input_cached(&mut cwins[i], input)
+                    .pixels()
+                    .to_vec();
+                let gpu_frame = gpu.render_input(&mut gwins[i], input, None).pixels;
+                common::assert_arm(arm, gpu);
+                let delta = common::max_channel_delta(&cpu_frame, &gpu_frame);
+                if !scene.supported && exact.holds(gpu, &what) {
+                    common::assert_byte_exact(
+                        TEST,
+                        &what,
+                        gpu,
+                        delta,
+                        format_args!(
+                            "{what}: the glass frame must be BYTE-EXACT CPU==GPU (got {delta})"
+                        ),
+                    );
+                }
+                if scene.supported {
+                    let mut flat = input.clone();
+                    flat.glow_under_ramps.flatten_into(&mut flat.glow_under);
+                    let cpu_flat = cpu.render_input(&flat).pixels;
+                    let gpu_flat = gpu
+                        .render_input(&mut aterm_gpu::WindowGpu::new(), &flat, None)
+                        .pixels;
+                    common::assert_arm(arm, gpu);
+                    assert_eq!(
+                        cpu_frame, cpu_flat,
+                        "{what}: supported-word ramps equal their quads on CPU"
+                    );
+                    assert_eq!(
+                        gpu_frame, gpu_flat,
+                        "{what}: supported-word ramps equal their quads on GPU"
+                    );
+                }
+                // The protected corpus legitimately loses its final body wedges. Keep its
+                // unyielded byte comparisons and cut control live on every emitted/cut frame.
+                let cut_control = mix || !scene.supported && glass_slabs > 0 && yielded;
+                if !cut_control {
+                    continue;
+                }
+                let cpu_twin = cpu.render_input(twin).pixels;
+                let gpu_twin = gpu
+                    .render_input(&mut aterm_gpu::WindowGpu::new(), twin, None)
+                    .pixels;
+                assert!(
+                    cpu_twin != cpu_frame && gpu_twin != gpu_frame,
+                    "{what}, control: the frame unyielded draws other bytes on both backends"
+                );
+                if scene.supported {
+                    for pixels in [&cpu_frame, &gpu_frame, &cpu_twin, &gpu_twin] {
+                        assert_eq!(
+                            pixels.len(),
+                            frame_w * frame_h,
+                            "{what}: the selected-cell comparison has the frame's geometry"
+                        );
+                    }
+                    let changed = |lit: &[u32], twin: &[u32]| {
+                        (0..COLS).any(|col| {
+                            if base.selection_hit(prompt_row, col, false, false).is_none() {
+                                return false;
+                            }
+                            let x0 = usize::from(geom.origin_x) + col * cw;
+                            let y0 = usize::from(geom.origin_y) + prompt_row * ch;
+                            (y0..(y0 + ch).min(frame_h)).any(|y| {
+                                (x0..(x0 + cw).min(frame_w)).any(|x| {
+                                    let at = y * frame_w + x;
+                                    lit[at] & 0x00FF_FFFF != twin[at] & 0x00FF_FFFF
+                                })
+                            })
+                        })
+                    };
+                    census.selected_pixels_changed += usize::from(
+                        changed(&cpu_frame, &cpu_twin) && changed(&gpu_frame, &gpu_twin),
+                    );
+                }
+                let delta_twin = common::max_channel_delta(&cpu_twin, &gpu_twin);
+                if !scene.supported && exact.holds(gpu, &what) {
+                    common::assert_byte_exact(
+                        TEST,
+                        &format!("{what}, unyielded"),
+                        gpu,
+                        delta_twin,
+                        format_args!(
+                            "{what}: the unyielded twin must be BYTE-EXACT CPU==GPU (got \
+                             {delta_twin})"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    assert!(census.glass > 0, "{}: premise: the glass drew", scene.name);
+    assert!(census.emitted > 0, "{}: actual glass emitted", scene.name);
+    eprintln!("{TEST}: {}: {census:?}", scene.name);
+    census
+}
+
+/// Unlike the procedural parity corpus, these ordinary words have actual font rasters.
+/// The final yielded stream must retain glass beneath one, draw there on both backends,
+/// and keep ramp/quad parity within each backend. The unchanged same-frame letter judges
+/// live in render_suite's supported-word control and Settings' 2x card control.
+#[test]
+fn a_supported_word_keeps_final_glass_on_both_raster_backends() {
+    use aterm_effects::cursor_glow::{Light, Live};
+    let theme = DEFAULT_LIGHT;
+    let mut arms = common::arms(24.0, theme);
+    for (_, _, gpu) in &arms {
+        common::byte_exact_or_could_not_run(gpu, "supported-word glass census");
+    }
+    let (cw, ch) = arms[0].1.cell_size();
+    let (frame_w, frame_h) = arms[0].1.frame_size(ROWS, COLS);
+    let geom = Geom {
+        cw,
+        ch,
+        rows: ROWS,
+        cols: COLS,
+        origin_x: arms[0].1.pad() as u16,
+        origin_y: arms[0].1.grid_top() as u16,
+        win_w: frame_w as u16,
+        win_h: frame_h as u16,
+        head: 0,
+    };
+    for (_, cpu, gpu) in &mut arms {
+        cpu.debug_block_on_lazy_fallbacks();
+        gpu.set_bloom(false);
+        gpu.set_shimmer(false);
+    }
+    let page = aterm_effects::host::PageFacts {
+        thin_ink: arms[0].1.glyph_ink().thin_share(
+            aterm_render::linear_luminance(theme.fg),
+            aterm_render::linear_luminance(theme.bg),
+        ),
+        ..aterm_effects::host::PageFacts::OPAQUE
+    };
+    assert!(page.glass(), "the actual 24px fixture face admits glass");
+    let cfg = GlowConfig {
+        light: Light::at(Live::Glass).on_page(page.glass()),
+        ..config(theme, KITTY)
+    };
+    let mut term = Terminal::new(ROWS as u16, COLS as u16);
+    term.process(b"\x1b]10;rgb:2b/2d/33\x07\x1b]11;rgb:f6/f7/f9\x07\x1b[10;5H");
+    let mut side = Side::new(None, true);
+    let text = b"MMMM MMMM MMMM ";
+    let t0 = Instant::now();
+    for tick in 0..text.len() * KEY_TICKS + RUNOUT {
+        let now = t0 + (Duration::from_secs(1) / HZ) * tick as u32;
+        if tick % KEY_TICKS == 0 && tick / KEY_TICKS < text.len() {
+            side.fx.cursor_mut().glow.note_synthetic_typed(now, 1);
+            term.process(&text[tick / KEY_TICKS..tick / KEY_TICKS + 1]);
+        }
+        let base = term.cell_frame(ROWS, COLS);
+        let observed = arms[0].1.glyph_ink_for(&base);
+        side.fx
+            .cursor_mut()
+            .glow
+            .observe_glyph_ink(Some(Arc::clone(&observed)));
+        side.frame(&term, &base, &cfg, geom, now);
+        let no_glass = aterm_effects::cursor_glow::glass_yield::without_body_glass_for_test(
+            &side.input,
+            side.fx.cursor().glow.glass_laid(),
+        );
+        side.fx.yield_glass_unworded(&mut side.input);
+        if !side.fx.light_arms().iter().any(|(arm, _)| arm == "glass") {
+            continue;
+        }
+        let frame = observed.for_frame(&base, (cw, ch)).unwrap();
+        let mut final_quads = Vec::new();
+        side.input
+            .glow_under_ramps
+            .expand_into(&side.input.glow_under, &mut final_quads);
+        let retained: Vec<_> = base
+            .cells
+            .iter()
+            .enumerate()
+            .flat_map(|(row, cells)| {
+                cells
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(col, cell)| {
+                        let ink = frame
+                            .coverage(row, col)
+                            .is_some_and(|(_, coverage)| coverage.max > 0);
+                        let (x0, y0) = (
+                            usize::from(geom.origin_x) + col * cw,
+                            usize::from(geom.origin_y) + row * ch,
+                        );
+                        (cell.ch == 'M'
+                            && ink
+                            && final_quads.iter().any(|q| {
+                                let lo = x0.max(usize::from(q.x));
+                                let hi = (x0 + cw).min(usize::from(q.x) + usize::from(q.w));
+                                usize::from(q.y) < y0 + ch
+                                    && y0 < usize::from(q.y) + usize::from(q.h)
+                                    && (lo..hi).any(|x| {
+                                        aterm_render::glow_lerp(
+                                            u32::from(q.alpha),
+                                            u32::from(q.alpha2),
+                                            (x - usize::from(q.x)) as u32,
+                                            u32::from(q.w),
+                                        ) > 0
+                                    })
+                            }))
+                        .then_some((x0, y0))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        if retained.is_empty() {
+            continue;
+        }
+        let mut flat = side.input.clone();
+        flat.glow_under_ramps.flatten_into(&mut flat.glow_under);
+        for (arm, cpu, gpu) in &mut arms {
+            let cpu_lit = cpu.render_input(&side.input);
+            let cpu_flat = cpu.render_input(&flat);
+            let cpu_bare = cpu.render_input(&no_glass);
+            assert_eq!(
+                (cpu_lit.width, cpu_lit.height),
+                (cpu_flat.width, cpu_flat.height),
+                "{arm}: CPU ramps and quads have the same geometry"
+            );
+            assert_eq!(
+                (cpu_lit.width, cpu_lit.height),
+                (cpu_bare.width, cpu_bare.height),
+                "{arm}: CPU body-only twin has the actual frame's geometry"
+            );
+            assert_eq!(
+                cpu_lit.pixels, cpu_flat.pixels,
+                "{arm}: final supported-word ramps equal their quads on CPU"
+            );
+            let gpu_lit = gpu.render_input(&mut aterm_gpu::WindowGpu::new(), &side.input, None);
+            common::assert_arm(arm, gpu);
+            let gpu_flat = gpu.render_input(&mut aterm_gpu::WindowGpu::new(), &flat, None);
+            let gpu_bare = gpu.render_input(&mut aterm_gpu::WindowGpu::new(), &no_glass, None);
+            assert_eq!(
+                (gpu_lit.width, gpu_lit.height),
+                (gpu_flat.width, gpu_flat.height),
+                "{arm}: GPU ramps and quads have the same geometry"
+            );
+            assert_eq!(
+                (gpu_lit.width, gpu_lit.height),
+                (gpu_bare.width, gpu_bare.height),
+                "{arm}: GPU body-only twin has the actual frame's geometry"
+            );
+            assert_eq!(
+                gpu_lit.pixels, gpu_flat.pixels,
+                "{arm}: final supported-word ramps equal their quads on GPU"
+            );
+            for (lit, bare) in [(&cpu_lit, &cpu_bare), (&gpu_lit, &gpu_bare)] {
+                assert!(
+                    retained.iter().any(|&(x0, y0)| {
+                        final_quads.iter().any(|q| {
+                            if usize::from(q.row) >= side.input.rows {
+                                return false;
+                            }
+                            let left = x0.max(usize::from(q.x));
+                            let right = (x0 + cw)
+                                .min(lit.width)
+                                .min(usize::from(q.x) + usize::from(q.w));
+                            let top = y0.max(usize::from(q.y));
+                            let bottom = (y0 + ch)
+                                .min(lit.height)
+                                .min(usize::from(q.y) + usize::from(q.h));
+                            (left..right).any(|x| {
+                                aterm_render::glow_lerp(
+                                    u32::from(q.alpha),
+                                    u32::from(q.alpha2),
+                                    (x - usize::from(q.x)) as u32,
+                                    u32::from(q.w),
+                                ) > 0
+                                    && (top..bottom).any(|y| {
+                                        let at = y * lit.width + x;
+                                        lit.pixels[at] & 0x00FF_FFFF
+                                            != bare.pixels[at] & 0x00FF_FFFF
+                                    })
+                            })
+                        })
+                    }),
+                    "{arm}: final glass really changes a supported word's cell, not only blank regions"
+                );
+            }
+        }
+        return;
+    }
+    panic!("no frame retained final glass beneath an observed supported word");
 }
 
 /// A frame's glow rows laid four ways: the legacy stream (every row a

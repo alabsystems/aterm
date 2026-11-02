@@ -120,6 +120,32 @@ fn transparent_mask_probe_stage_if_asked() -> bool {
     true
 }
 
+/// Stage name for the stdio-probe child spawned inside [`staged_signals`].
+const STDIO_PROBE_STAGE: &str = "transparent-stdio-probe";
+
+/// Prints the `(device, inode)` of descriptors 7, 8 and 9 as `STDIO=…` when
+/// [`STAGE_ENV`] is [`STDIO_PROBE_STAGE`]: the staged shell dup'd its stdio there before
+/// its own stdout was turned to the output file. `fstat` names nothing — a shell's
+/// `stat` resolves device names (`devname`), which scans `/dev` and hangs on one wedged
+/// node, and the child here is this binary, which starts without naming any terminal.
+fn transparent_stdio_probe_stage_if_asked() -> bool {
+    if std::env::var(STAGE_ENV).as_deref() != Ok(STDIO_PROBE_STAGE) {
+        return false;
+    }
+    let ids = [7, 8, 9].map(|fd| {
+        // SAFETY: `stat` is plain integers; all-zero is valid, and `fstat` fails cleanly
+        // on a descriptor this process does not hold.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &raw mut st) } == 0 {
+            format!("{}:{}", st.st_dev, st.st_ino)
+        } else {
+            "closed".to_string()
+        }
+    });
+    println!("\nSTDIO={}", ids.join(","));
+    true
+}
+
 /// `sigset_t`: a 32-bit mask on Darwin, 1024 bits on Linux.
 #[cfg(target_vendor = "apple")]
 type SigSet = u32;
@@ -268,16 +294,16 @@ fn staged_signals() {
     let out: PathBuf = dir.join("out");
     let exe = std::env::current_exe().expect("the test binary");
     let exe = exe.to_str().expect("a UTF-8 test binary path");
-    #[cfg(target_vendor = "apple")]
-    let stat = "{ for n in 7 8 9; do /usr/bin/stat -f %d:%i <&$n; done; }";
-    #[cfg(not(target_vendor = "apple"))]
-    let stat = "stat -L -c %d:%i /dev/fd/7 /dev/fd/8 /dev/fd/9";
     let cases = [
         ("exit code", "exit 7".to_string()),
         ("death by signal", "kill -HUP $$".to_string()),
         (
             "stdio: the same three open files",
-            format!("exec 7<&0 8>&1 9>&2; {stat} >\"$1\""),
+            format!(
+                "exec 7<&0 8>&1 9>&2; {STAGE_ENV}={STDIO_PROBE_STAGE} exec '{exe}' \
+                 --exact spawnfd::transparent_tests::a_transparent_run_is_the_std_run_it_replaces \
+                 --nocapture --test-threads=1 >\"$1\""
+            ),
         ),
         (
             "dispositions: SIGPIPE at its default, SIGUSR2 still ignored",
@@ -295,15 +321,18 @@ fn staged_signals() {
         ),
     ];
     let read = |what: &str, wrote: String| {
-        if what.starts_with("the signal mask") {
-            wrote
-                .lines()
-                .find(|line| line.starts_with("MASK="))
-                .unwrap_or_else(|| panic!("the mask probe printed no mask: {wrote:?}"))
-                .to_string()
+        let tag = if what.starts_with("the signal mask") {
+            "MASK="
+        } else if what.starts_with("stdio") {
+            "STDIO="
         } else {
-            wrote
-        }
+            return wrote;
+        };
+        wrote
+            .lines()
+            .find(|line| line.starts_with(tag))
+            .unwrap_or_else(|| panic!("the probe printed no {tag} line: {wrote:?}"))
+            .to_string()
     };
     for (what, script) in &cases {
         let theirs = sh_run(false, script, &out);
@@ -319,7 +348,11 @@ fn staged_signals() {
     let (status, _) = sh_run(true, &cases[1].1, &out);
     assert_eq!(status.signal(), Some(SIGHUP));
     let (_, stdio) = sh_run(true, &cases[2].1, &out);
-    assert_eq!(stdio.lines().count(), 3, "{stdio:?}");
+    let stdio = read(cases[2].0, stdio);
+    assert!(
+        stdio.starts_with("STDIO=") && stdio.matches(',').count() == 2,
+        "{stdio:?}"
+    );
     let (_, dispositions) = sh_run(true, &cases[3].1, &out);
     assert_eq!(dispositions, "yes:141\nsurvived\n");
     let (_, mask) = sh_run(true, &cases[4].1, &out);
@@ -338,6 +371,9 @@ fn a_transparent_run_is_the_std_run_it_replaces() {
     if transparent_mask_probe_stage_if_asked() {
         return;
     }
+    if transparent_stdio_probe_stage_if_asked() {
+        return;
+    }
     if std::env::var(STAGE_ENV).is_ok() {
         staged_signals();
         return;
@@ -345,4 +381,213 @@ fn a_transparent_run_is_the_std_run_it_replaces() {
     let out = run_staged_hup_ignored(NAME, SIGNALS_STAGE);
     assert!(out.contains("STAGED transparent signals ok"), "{out}");
     print!("{out}");
+}
+
+#[test]
+fn a_refused_transparent_exec_preserves_the_original_mask_actions_and_descriptors() {
+    const NAME: &str = "spawnfd::transparent_tests::a_refused_transparent_exec_preserves_the_original_mask_actions_and_descriptors";
+    if std::env::var(STAGE_ENV).as_deref() != Ok("transparent-exec-refused") {
+        let out = run_staged_hup_ignored(NAME, "transparent-exec-refused");
+        assert!(out.contains("STAGED transparent exec refused ok"), "{out}");
+        return;
+    }
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("transparent-exec-refused")
+        .tempdir()
+        .unwrap();
+    let path = dir.path().join("not-executable");
+    std::fs::write(&path, b"not executable fixture data").unwrap();
+    let (_near, far) = std::os::unix::net::UnixStream::pair().unwrap();
+    let fd = far.as_raw_fd();
+    let before_flags = super::tests::flags(fd);
+    // SAFETY: this is an isolated subprocess; the two plain dispositions and the current
+    // thread's mask are intentionally changed before its attempted exec, never in the suite.
+    unsafe {
+        signal(libc::SIGPIPE, SIG_IGN);
+        signal(SIGUSR2, SIG_IGN);
+        let block = set_of(&[SIGUSR1]);
+        assert_eq!(pthread_sigmask(SIG_BLOCK, &block, std::ptr::null_mut()), 0);
+    }
+    let action = || {
+        // SAFETY: the query writes one fully initialized action into this live slot.
+        let mut action = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+        assert_eq!(
+            unsafe { libc::sigaction(libc::SIGPIPE, std::ptr::null(), action.as_mut_ptr()) },
+            0
+        );
+        // SAFETY: the successful query initialized the action.
+        unsafe { action.assume_init() }
+    };
+    let before = action();
+    let refused = transparent(&path).exec();
+    assert_eq!(refused.raw_os_error(), Some(libc::EACCES));
+    // The prepared path reaches the same real native refusal, then restores the same state.
+    let refused = transparent(&path)
+        .prepare_exec()
+        .expect("prepare the native data-file refusal")
+        .exec_until(u64::MAX);
+    assert_eq!(refused.raw_os_error(), Some(libc::EACCES));
+    let refused = transparent(&path)
+        .prepare_exec()
+        .expect("prepare without dispatch")
+        .exec_until(0);
+    assert_eq!(refused.kind(), io::ErrorKind::TimedOut);
+    let after = action();
+    assert_eq!(before.sa_sigaction, after.sa_sigaction);
+    assert_eq!(before.sa_flags, after.sa_flags);
+    assert_eq!(super::tests::flags(fd), before_flags);
+    let mut blocked = set_of(&[]);
+    // SAFETY: the existing platform-sized set is writable; a null input only reads the mask.
+    assert_eq!(
+        unsafe { pthread_sigmask(SIG_BLOCK, std::ptr::null(), &mut blocked) },
+        0
+    );
+    assert!(has(&blocked, SIGUSR1));
+    #[cfg(target_os = "linux")]
+    {
+        // Actual negative control: the ordinary stripping exec is deliberately unsuitable
+        // for a rollback-preserving failure. Its std/pre_exec path clears this mask/action.
+        let refused = command(&path).exec();
+        assert_eq!(refused.raw_os_error(), Some(libc::EACCES));
+        assert_ne!(action().sa_sigaction, before.sa_sigaction);
+        // SAFETY: the same read-only query into the live platform-sized set.
+        assert_eq!(
+            unsafe { pthread_sigmask(SIG_BLOCK, std::ptr::null(), &mut blocked) },
+            0
+        );
+        assert!(!has(&blocked, SIGUSR1));
+    }
+    println!("STAGED transparent exec refused ok");
+}
+
+/// Exercise the prepared platform dispatch path with a deterministic clock and a recording
+/// native-call substitute. Signal changes happen only in the existing isolated test child.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+#[test]
+fn a_prepared_exec_captures_before_go_and_checks_the_original_deadline_at_dispatch() {
+    const NAME: &str = "spawnfd::transparent_tests::a_prepared_exec_captures_before_go_and_checks_the_original_deadline_at_dispatch";
+    if std::env::var(STAGE_ENV).as_deref() != Ok("transparent-exec-prepared") {
+        let out = run_staged_hup_ignored(NAME, "transparent-exec-prepared");
+        assert!(out.contains("STAGED transparent exec prepared ok"), "{out}");
+        return;
+    }
+    use std::cell::Cell;
+    use std::os::unix::ffi::OsStrExt as _;
+    let flags = std::fs::File::open("/dev/null").unwrap();
+    let before_flags = super::tests::flags(flags.as_raw_fd());
+    // SAFETY: this is the isolated test child; no suite thread shares these dispositions.
+    unsafe {
+        signal(libc::SIGPIPE, SIG_IGN);
+        let mask = set_of(&[SIGUSR1]);
+        assert_eq!(pthread_sigmask(SIG_BLOCK, &mask, std::ptr::null_mut()), 0);
+    }
+    let before_mask = blocked();
+    let sigpipe = || {
+        let mut action = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+        // SAFETY: a read-only query initializes the writable, correctly sized action slot.
+        assert_eq!(
+            unsafe { libc::sigaction(libc::SIGPIPE, std::ptr::null(), action.as_mut_ptr()) },
+            0
+        );
+        // SAFETY: the successful query initialized this action.
+        unsafe { action.assume_init() }.sa_sigaction
+    };
+    let before_action = sigpipe();
+    let mut command = transparent("/nonexistent/prepared-native-image");
+    command
+        .arg("captured")
+        .env("ATERM_PREPARED_ENV", "before-go");
+    let prepared = command.prepare_exec().expect("prepare exact path");
+    command
+        .arg("too-late")
+        .env("ATERM_PREPARED_ENV", "after-go");
+    let (image, path) = prepared.captured();
+    assert_eq!(path.to_bytes(), b"/nonexistent/prepared-native-image");
+    assert_eq!(image.argv.len(), 2);
+    assert_eq!(image.argv[1].to_bytes(), b"captured");
+    assert!(
+        image
+            .envp
+            .iter()
+            .any(|word| word.to_bytes() == b"ATERM_PREPARED_ENV=before-go")
+    );
+    assert!(
+        !image
+            .envp
+            .iter()
+            .any(|word| word.to_bytes() == b"ATERM_PREPARED_ENV=after-go")
+    );
+
+    let dispatched = Cell::new(0);
+    // A pre-Go observation was timely; the actual platform path must reject the now-expired
+    // original deadline rather than accepting that stale observation or starting a new budget.
+    let observed = Cell::new(99);
+    assert!(observed.get() < 100);
+    observed.set(100);
+    let refused = prepared.exec_with(
+        100,
+        || Ok(observed.get()),
+        || {
+            dispatched.set(dispatched.get() + 1);
+            io::Error::from_raw_os_error(libc::EACCES)
+        },
+    );
+    assert_eq!(refused.kind(), io::ErrorKind::TimedOut);
+    assert_eq!(dispatched.get(), 0);
+    for (clock, expected, calls) in [
+        (99, io::ErrorKind::PermissionDenied, 1),
+        (101, io::ErrorKind::TimedOut, 0),
+    ] {
+        let before = dispatched.get();
+        let prepared = command
+            .prepare_exec()
+            .expect("fresh prepared dispatch control");
+        let refused = prepared.exec_with(
+            100,
+            || Ok(clock),
+            || {
+                dispatched.set(dispatched.get() + 1);
+                io::Error::from_raw_os_error(libc::EACCES)
+            },
+        );
+        assert_eq!(refused.kind(), expected);
+        assert_eq!(dispatched.get() - before, calls);
+        assert_eq!(sigpipe(), before_action);
+        assert_eq!(blocked(), before_mask);
+        assert_eq!(super::tests::flags(flags.as_raw_fd()), before_flags);
+    }
+    let refused = command.prepare_exec().unwrap().exec_with(
+        100,
+        || Err(io::Error::from_raw_os_error(libc::EIO)),
+        || {
+            dispatched.set(dispatched.get() + 1);
+            io::Error::from_raw_os_error(libc::EACCES)
+        },
+    );
+    assert_eq!(refused.raw_os_error(), Some(libc::EIO));
+    assert_eq!(dispatched.get(), 1);
+    assert_eq!(sigpipe(), before_action);
+    assert_eq!(blocked(), before_mask);
+    assert_eq!(super::tests::flags(flags.as_raw_fd()), before_flags);
+    let malformed = transparent(std::ffi::OsStr::from_bytes(b"bad\0program"))
+        .prepare_exec()
+        .err()
+        .expect("preparation rejects NUL before Go");
+    assert_eq!(malformed.kind(), io::ErrorKind::InvalidInput);
+
+    // Exact dispatch-gate ordering control: a gate that consumes the remaining budget must be
+    // entered before the clock is read. The native callback must not run after that wait.
+    let at = Cell::new(99);
+    let refused = exec_dispatch(
+        || at.set(100),
+        100,
+        || Ok(at.get()),
+        || {
+            dispatched.set(dispatched.get() + 1);
+            io::Error::from_raw_os_error(libc::EACCES)
+        },
+    );
+    assert_eq!(refused.kind(), io::ErrorKind::TimedOut);
+    assert_eq!(dispatched.get(), 1);
+    println!("STAGED transparent exec prepared ok");
 }

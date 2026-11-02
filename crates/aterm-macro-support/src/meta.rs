@@ -5,7 +5,7 @@
 
 use proc_macro::{Delimiter, Group, Ident, Punct, Span, TokenTree};
 
-use crate::cursor::{Cursor, is_punct};
+use crate::cursor::Cursor;
 use crate::error::Error;
 use crate::lit::{StrLit, str_lit};
 
@@ -109,15 +109,7 @@ pub fn parse_list(group: &Group) -> Result<Vec<Meta>, Error> {
             path.push(c.expect_ident("a path segment")?);
         }
         let kind = if let Some(eq) = c.eat_punct('=') {
-            let mut value = Vec::new();
-            while let Some(tt) = c.peek_raw() {
-                if is_punct(tt, ',') {
-                    break;
-                }
-                if let Some(tt) = c.next_raw() {
-                    value.push(tt);
-                }
-            }
+            let value = c.take_expr()?;
             if value.is_empty() {
                 return Err(Error::new(eq.span(), "expected a value after `=`"));
             }

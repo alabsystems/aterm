@@ -571,6 +571,12 @@ fn registered() -> BTreeMap<&'static str, Registered> {
                 );
                 if known.1.is_empty() {
                     known.1 = scenarios;
+                } else if !scenarios.is_empty() {
+                    assert_eq!(
+                        known.1, scenarios,
+                        "two registrations of `{}` ({} and {}) declare different scenarios",
+                        m.name, known.2, location
+                    );
                 }
             }
         }
@@ -645,7 +651,7 @@ impl MachineCoverage {
         if self.total_actions == 0 {
             return 1.0;
         }
-        let covered = self.bound.len().saturating_add(self.waived.len());
+        let covered = self.total_actions.saturating_sub(self.uncovered.len());
         covered as f64 / self.total_actions.max(1) as f64
     }
 }
@@ -944,6 +950,16 @@ mod tests {
             vec!["Ring::Evict @ batch"],
             "…and the site that never ran is reported instead of vanishing"
         );
+        // Overlapping `bound` and `waived` entries never double-count toward `ratio()`.
+        let overlap = MachineCoverage {
+            machine: "Ring".into(),
+            total_actions: 2,
+            bound: BTreeSet::from(["A".to_string()]),
+            waived: BTreeSet::from(["A".to_string()]),
+            uncovered: BTreeSet::from(["B".to_string()]),
+            active: true,
+        };
+        assert_eq!(overlap.ratio(), 0.5);
     }
 
     /// A worker's window reaches its owner only by take and merge: nothing crosses threads

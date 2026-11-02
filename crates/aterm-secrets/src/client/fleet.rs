@@ -210,8 +210,10 @@ pub fn swarm_denied_nodes(paths: &Paths) -> crate::Result<Option<Vec<String>>> {
             .flatten();
         // A Mac the log let back in (Allow again, a quorum Undo): the deny rows its removal wrote
         // no longer hold for it (`roster::restored_by_log`).
+        let mut active_roster_nodes = BTreeSet::new();
         if let Some(log) = &local_log {
-            let (_, mut nodes) = super::roster::restored_by_log(log);
+            let (_, nodes) = super::roster::restored_by_log(log);
+            active_roster_nodes.extend(nodes);
             if let Some(roster) = parsed_roster.as_mut() {
                 let _ = super::roster::lift_restored_from_roster(log, roster);
                 let remaining_deny_nodes: BTreeSet<String> = roster
@@ -222,36 +224,53 @@ pub fn swarm_denied_nodes(paths: &Paths) -> crate::Result<Option<Vec<String>>> {
                 denied.retain(|node| {
                     remaining_deny_nodes.contains(&node.trim().to_ascii_lowercase())
                 });
-            } else {
-                denied.retain(|node| !nodes.contains(&node.trim().to_ascii_lowercase()));
             }
-            for m in parsed_roster.iter().flat_map(|r| &r.members) {
-                if !steward::member_is_denied_in_roster(parsed_roster.as_ref().expect("some"), m) {
+        }
+        if let Some(roster) = &parsed_roster {
+            let is_removed_in_log = |m: &crate::swarm_roster::SwarmMember| {
+                local_log.as_ref().is_some_and(|log| {
+                    let nk_removed = m.node_key.as_deref().is_some_and(|nk_hex| {
+                        log.membership().nodes().iter().any(|(nk, standing)| {
+                            *nk != [0; 32]
+                                && matches!(
+                                    standing,
+                                    crate::membership_log::NodeStanding::Removed(_)
+                                )
+                                && aterm_codec::hex::encode_lower(nk)
+                                    .eq_ignore_ascii_case(nk_hex.trim())
+                        })
+                    });
+                    nk_removed
+                        || Recipient::parse(&m.recipient).is_ok_and(|rec| {
+                            log.recipient_is_removed(&rec)
+                                || log.audience_left_out_recipient(
+                                    &crate::membership_log::EpochAudience::Everyone,
+                                    &rec,
+                                )
+                                || log_entries::recipient_denied_by_roster_or_log(
+                                    Some(roster),
+                                    log,
+                                    &rec,
+                                )
+                        })
+                })
+            };
+            for m in &roster.members {
+                if !is_removed_in_log(m) && !steward::member_is_denied_in_roster(roster, m) {
                     if let Some(node_id) = &m.node_id {
-                        nodes.insert(node_id.trim().to_ascii_lowercase());
+                        active_roster_nodes.insert(node_id.trim().to_ascii_lowercase());
                     }
                     if let Some(node_key) = &m.node_key {
-                        nodes.insert(node_key.trim().to_ascii_lowercase());
+                        active_roster_nodes.insert(node_key.trim().to_ascii_lowercase());
                     }
                 }
             }
-            denied.retain(|node| !nodes.contains(&node.trim().to_ascii_lowercase()));
-        }
-        if let Some(roster) = &parsed_roster {
             for member in &roster.members {
-                let removed_in_log = local_log.as_ref().is_some_and(|log| {
-                    Recipient::parse(&member.recipient).is_ok_and(|rec| {
-                        log.recipient_is_removed(&rec)
-                            || log.audience_left_out_recipient(
-                                &crate::membership_log::EpochAudience::Everyone,
-                                &rec,
-                            )
-                    })
-                });
-                if removed_in_log || steward::member_is_denied_in_roster(roster, member) {
+                if is_removed_in_log(member) || steward::member_is_denied_in_roster(roster, member)
+                {
                     for raw in [&member.node_id, &member.node_key].into_iter().flatten() {
                         let trimmed = raw.trim_ascii().to_ascii_lowercase();
-                        if !trimmed.is_empty() {
+                        if !trimmed.is_empty() && !active_roster_nodes.contains(&trimmed) {
                             denied.push(trimmed);
                         }
                     }
@@ -260,6 +279,7 @@ pub fn swarm_denied_nodes(paths: &Paths) -> crate::Result<Option<Vec<String>>> {
         }
         if let Some(log) = &local_log {
             extend_denied_nodes_from_log(log, parsed_roster.as_ref(), &mut denied);
+            denied.retain(|node| !active_roster_nodes.contains(&node.trim().to_ascii_lowercase()));
         }
         denied.sort();
         denied.dedup();
@@ -284,6 +304,11 @@ pub fn swarm_denied_nodes(paths: &Paths) -> crate::Result<Option<Vec<String>>> {
             let local_log = log_entries::trusted_local_log(paths, &expected)?;
             if local_log.as_ref().is_some_and(|log| {
                 log.recipient_is_removed(&identity.recipient())
+                    || log_entries::recipient_denied_by_roster_or_log(
+                        None,
+                        log,
+                        &identity.recipient(),
+                    )
                     || log.audience_left_out_recipient(
                         &crate::membership_log::EpochAudience::Everyone,
                         &identity.recipient(),
@@ -313,6 +338,48 @@ fn extend_denied_nodes_from_log(
     denied: &mut Vec<String>,
 ) {
     let membership = log.membership();
+    let active_nodes: BTreeSet<[u8; 32]> = membership
+        .members()
+        .iter()
+        .filter(|(actor, member)| {
+            !log.recipient_is_removed(&member.binding.recipient())
+                && !log.audience_left_out(&crate::membership_log::EpochAudience::Everyone, actor)
+                && !roster.is_some_and(|r| log_entries::member_denied_by_roster(r, member))
+        })
+        .filter_map(|(_, member)| member.node_key.filter(|k| *k != [0; 32]))
+        .filter(|nk| {
+            !matches!(
+                membership.node(nk),
+                crate::membership_log::NodeStanding::Removed(_)
+            )
+        })
+        .chain(
+            membership
+                .unproved()
+                .iter()
+                .filter(|founder| {
+                    !log.recipient_is_removed(&founder.recipient)
+                        && !log.audience_left_out_recipient(
+                            &crate::membership_log::EpochAudience::Everyone,
+                            &founder.recipient,
+                        )
+                        && !roster.is_some_and(|r| {
+                            r.is_label_denied(&founder.label)
+                                || r.is_label_denied(&founder.name)
+                                || founder.node_key.filter(|k| *k != [0; 32]).is_some_and(|k| {
+                                    r.is_node_denied(&aterm_codec::hex::encode_lower(&k))
+                                })
+                        })
+                })
+                .filter_map(|founder| founder.node_key.filter(|k| *k != [0; 32]))
+                .filter(|nk| {
+                    !matches!(
+                        membership.node(nk),
+                        crate::membership_log::NodeStanding::Removed(_)
+                    )
+                }),
+        )
+        .collect();
     for (nk, standing) in membership.nodes() {
         if matches!(standing, crate::membership_log::NodeStanding::Removed(_)) && *nk != [0; 32] {
             denied.push(aterm_codec::hex::encode_lower(nk));
@@ -322,7 +389,9 @@ fn extend_denied_nodes_from_log(
         let roster_denied = roster.is_some_and(|r| log_entries::member_denied_by_roster(r, member));
         if (log.audience_left_out(&crate::membership_log::EpochAudience::Everyone, actor)
             || roster_denied)
-            && let Some(nk) = member.node_key.filter(|k| *k != [0; 32])
+            && let Some(nk) = member
+                .node_key
+                .filter(|k| *k != [0; 32] && !active_nodes.contains(k))
         {
             denied.push(aterm_codec::hex::encode_lower(&nk));
         }
@@ -334,7 +403,9 @@ fn extend_denied_nodes_from_log(
             &crate::membership_log::EpochAudience::Everyone,
             &founder.recipient,
         ) || roster_denied)
-            && let Some(nk) = founder.node_key.filter(|k| *k != [0; 32])
+            && let Some(nk) = founder
+                .node_key
+                .filter(|k| *k != [0; 32] && !active_nodes.contains(k))
         {
             denied.push(aterm_codec::hex::encode_lower(&nk));
         }
@@ -372,11 +443,18 @@ mod tests {
 
         let opened = admin_open(&admin_paths).expect("admin open");
         let mut doc = opened.doc.clone();
+        let m1_recipient = machine_identity(&admin_paths)
+            .expect("admin identity")
+            .recipient()
+            .to_bech32();
         let m9_recipient = Identity::from_secret_bytes([0x99; 32])
             .recipient()
             .to_bech32();
+        let m10_recipient = Identity::from_secret_bytes([0x98; 32])
+            .recipient()
+            .to_bech32();
         let roster_toml = format!(
-            "deny_labels = [\"m9\"]\ndeny_nodes = [\"aa11bb22cc33dd44\", \"ff00\"]\n\n[[member]]\nrecipient = \"{m9_recipient}\"\nvault_name = \"m9\"\nlabel = \"m9\"\nadmitted_ms = 1\nnode_id = \"1122334455667788\"\n"
+            "deny_labels = [\"m9\"]\ndeny_nodes = [\"aa11bb22cc33dd44\", \"ff00\"]\n\n[[member]]\nrecipient = \"{m1_recipient}\"\nvault_name = \"m1\"\nlabel = \"m1\"\nadmitted_ms = 2\nnode_id = \"9988776655443322\"\n\n[[member]]\nrecipient = \"{m9_recipient}\"\nvault_name = \"m9\"\nlabel = \"m9\"\nadmitted_ms = 1\nnode_id = \"1122334455667788\"\n\n[[member]]\nrecipient = \"{m10_recipient}\"\nvault_name = \"m9\"\nlabel = \"m9\"\nadmitted_ms = 1\nnode_id = \"9988776655443322\"\n"
         );
         doc.set_entry(
             &Audience::Everyone,

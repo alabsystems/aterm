@@ -247,10 +247,22 @@ fn delivered(res: std::io::Result<usize>, intended: usize) -> Delivery {
 fn delivered_receipt(
     result: Result<WriteReceipt, WriteReceiptError>,
     intended: usize,
+    drain: Option<&SinkWriter>,
 ) -> (Delivery, Option<AcceptedOrder>, bool, bool) {
+    let drained = drain.is_none_or(|sink| {
+        let (order, prefix) = match &result {
+            Ok(receipt) => (receipt.order(), receipt.kernel_prefix()),
+            Err(error) => (error.order(), error.kernel_prefix()),
+        };
+        order.is_none() || prefix.is_some_and(|prefix| sink.wait_prefix_to_kernel(prefix))
+    });
     match result {
         Ok(receipt) => (
-            delivered(Ok(receipt.accepted()), intended),
+            if drained {
+                delivered(Ok(receipt.accepted()), intended)
+            } else {
+                Delivery::Failed
+            },
             receipt.order(),
             receipt.is_direct(),
             false,
@@ -602,6 +614,8 @@ pub(crate) enum EgressMode {
     Interactive,
     /// An expendable egress thread (the per-session egress-order writer).
     Backpressured,
+    /// An expendable writer that owns and drains exactly each admitted frame's kernel prefix.
+    PrefixDrained,
     /// The UI thread where a write could block it (Windows: ConPTY has no non-blocking write), or behind a queued paste: produce exactly the bytes `Interactive` would and write nothing.
     Encode,
 }
@@ -614,11 +628,16 @@ fn emit(sink: &SinkWriter, mode: EgressMode, bytes: &[u8], accepted: &mut Accept
             delivered_receipt(
                 sink.write_frame_interactive_with_receipt(bytes),
                 bytes.len(),
+                None,
             )
         }
         EgressMode::Backpressured => {
             crate::echo_rtt::note_write_start();
-            delivered_receipt(sink.write_frame_with_receipt(bytes), bytes.len())
+            delivered_receipt(sink.write_frame_with_receipt(bytes), bytes.len(), None)
+        }
+        EgressMode::PrefixDrained => {
+            crate::echo_rtt::note_write_start();
+            delivered_receipt(sink.write_frame_with_prefix(bytes), bytes.len(), Some(sink))
         }
         EgressMode::Encode => {
             accepted.encoded.extend_from_slice(bytes);
@@ -638,11 +657,17 @@ fn emit_metered(
     bytes: &[u8],
     accepted: &mut Accepted,
     meter: &BulkMeter,
+    mode: EgressMode,
 ) -> Delivery {
     crate::echo_rtt::note_write_start();
     let (delivery, order, direct, _) = delivered_receipt(
-        sink.write_frame_metered_with_receipt(bytes, meter),
+        if mode == EgressMode::PrefixDrained {
+            sink.write_frame_metered_with_prefix(bytes, meter)
+        } else {
+            sink.write_frame_metered_with_receipt(bytes, meter)
+        },
         bytes.len(),
+        (mode == EgressMode::PrefixDrained).then_some(sink),
     );
     if order.is_some() {
         accepted.order = order;
@@ -686,7 +711,7 @@ pub(crate) fn seam_egress(
     )
 }
 
-/// The source-blind byte-producing core of the seam (design A.2 / A.7).
+/// The source-blind byte-producing core of the seam (design A.2.1).
 pub(crate) fn seam_egress_receipt(
     term: &Mutex<Terminal>,
     modes: &ModeMirror,
@@ -991,8 +1016,14 @@ fn seam_egress_inner(
                 t.format_paste_framed(text, framing.bracketed(t.modes().bracketed_paste))
             };
             let d = match meter {
-                Some(meter) if !out.is_empty() && mode == EgressMode::Backpressured => {
-                    emit_metered(sink, &out, accepted_order, meter)
+                Some(meter)
+                    if !out.is_empty()
+                        && matches!(
+                            mode,
+                            EgressMode::Backpressured | EgressMode::PrefixDrained
+                        ) =>
+                {
+                    emit_metered(sink, &out, accepted_order, meter, mode)
                 }
                 meter => {
                     let d = if out.is_empty() {

@@ -37,10 +37,11 @@ dirs, a private control socket, a lifeline; ended by its process group, never by
                 60 ms cadence (`targo --unverified build --release -p aterm`, then --aterm target/release/aterm)
   --theme       dark (the default theme), light (\"GitHub Light\") or both (the default)
   --scenario    typing (default), burst, context, steam, enter-bottom, idle10, redraw-stall, fold-rest, cjk, bidi,
-                split, move-up, focus-roundtrip, settings, or all; repeatable
+                split, move-up, focus-roundtrip, focus-wrap, settings, or all; repeatable
   --extra       a top-level aterm.toml line for every instance, replacing the base line of its key (the base lines:
                 the style, motion = \"full\", trail_sounds = false, and on light the theme)
-  --columns --lines --font-px   the grid (default 72x14 cells of 22 px; settings 110x40 of 16 px)
+  --columns --lines --font-px   the grid (default 72x14 cells of 22 px; settings 110x40 of 16 px;
+                focus-wrap always uses 32x14; its font-px override applies)
   --no-clean    skip each frame's `image clean` twin
   --keep        retain every instance's scratch world, including a roster probe's
 
@@ -49,12 +50,21 @@ Per instance <name> = <style-slug>-<theme>[-<scenario>] (typing has no suffix): 
 <name>.dims.txt, .status.txt, .status-end.txt (`trail status`), .admissions.txt (`trail 40`), .gui.log; and
 gallery.pids. Each terminal frame also keeps its .status.txt and image metadata. A settings frame keeps its
 cursor scene card's (`settings card`): .dims.txt (the card's grid in the window), .cursor.txt, .text.txt,
-.status.txt (its companion's pet_body) and, the card with no light drawn, .clean.png. The open `redraw-stall`
-frame has .read-notes.txt instead of cursor/text reads, which would wait for the very frame the fixture
-has not yet closed. Its restored frame judges the final instance configuration (including --extra):
+.status.txt (its companion's pet_body) and, the card with no light drawn, .clean.png. The `redraw-stall`
+scenario keeps typed/restored frames and .stalled.read-notes.txt with acknowledged key-request
+boundaries on the gallery controller clock.
+No image, tick or whole-frame read runs during that hold; recording follows redraw release, and no
+later state is substituted for an open-phase capture. Its restored frame judges the final instance
+configuration (including --extra):
 a requested rainbow that becomes unavailable is inconclusive, not a skip. Deliberately disabled
 or other trails are not applicable. An inconclusive return is retained and exits 1, not counted
 as a continuity pass.
+
+The `focus-wrap` scenario types 54 a's and `shared`, transfers focus with off-row status reports,
+then photographs every key of ` state` across the right edge. Its focus acknowledgments, per-key
+admissions (`trail 32`) and final post-echo drain accompany the frames. These records describe
+custody and resident ribbon state; continuity still requires judging exposed pixels against the
+clean twins.
 
 exit: 0 every frame taken and every instance ended; 1 a frame or an instance failed, a redraw return was
 inconclusive, or an instance outlived the run;
@@ -109,6 +119,8 @@ pub enum Scenario {
     RedrawStall,
     /// Focus reports paint status away from an empty composer before typing resumes.
     FocusRoundtrip,
+    /// Focus returns to a populated composer before a space and word cross the right edge.
+    FocusWrap,
     FoldRest,
     Cjk,
     Bidi,
@@ -126,7 +138,7 @@ pub enum Scenario {
 
 impl Scenario {
     /// Every scenario, in the order `all` runs them.
-    pub const ALL: [Scenario; 14] = [
+    pub const ALL: [Scenario; 15] = [
         Scenario::Typing,
         Scenario::Burst,
         Scenario::Context,
@@ -135,6 +147,7 @@ impl Scenario {
         Scenario::Idle10,
         Scenario::RedrawStall,
         Scenario::FocusRoundtrip,
+        Scenario::FocusWrap,
         Scenario::FoldRest,
         Scenario::Cjk,
         Scenario::Bidi,
@@ -154,6 +167,7 @@ impl Scenario {
             Scenario::Idle10 => "idle10",
             Scenario::RedrawStall => "redraw-stall",
             Scenario::FocusRoundtrip => "focus-roundtrip",
+            Scenario::FocusWrap => "focus-wrap",
             Scenario::FoldRest => "fold-rest",
             Scenario::Cjk => "cjk",
             Scenario::Bidi => "bidi",
@@ -175,10 +189,23 @@ impl Scenario {
 
     /// Its default grid: columns, lines, font px.
     fn grid(self) -> (u32, u32, u32) {
-        if self == Scenario::Settings {
-            (110, 40, 16)
+        match self {
+            Scenario::Settings => (110, 40, 16),
+            Scenario::FocusWrap => (32, 14, 22),
+            _ => (72, 14, 22),
+        }
+    }
+
+    fn configured_grid(self, args: &Args) -> (u32, u32, u32) {
+        let (columns, lines, font_px) = self.grid();
+        if self == Scenario::FocusWrap {
+            (columns, lines, args.font_px.unwrap_or(font_px))
         } else {
-            (72, 14, 22)
+            (
+                args.columns.unwrap_or(columns),
+                args.lines.unwrap_or(lines),
+                args.font_px.unwrap_or(font_px),
+            )
         }
     }
 }
@@ -616,15 +643,16 @@ pub fn burst_keys() -> Vec<String> {
     keys_of(BURST_TEXT)
 }
 
-/// The gallery's private PTY child: a stalled synchronized redraw, or bare echo for the fold probe.
+/// The gallery's private PTY child: typed data, a stalled redraw or a fold/focus probe.
 pub fn cmd_redraw_fixture(args: &[String]) -> Res {
     use std::io::Read as _;
 
     let fold = args == ["fold"];
     let focus = args == ["focus"];
-    if !args.is_empty() && !fold && !focus {
+    let typing = args == ["typing"];
+    if !args.is_empty() && !fold && !focus && !typing {
         return Err(Fail::usage(
-            "the redraw fixture takes only an optional fold or focus mode",
+            "the redraw fixture takes only an optional fold, focus or typing mode",
         ));
     }
     let _raw = crate::sys::RawMode::enter(0)
@@ -632,10 +660,18 @@ pub fn cmd_redraw_fixture(args: &[String]) -> Res {
     let mut input = std::io::stdin().lock();
     let mut output = std::io::stdout().lock();
     let io_error = |e| Fail::usage(format!("redraw fixture: {e}"));
+    if typing || focus {
+        let size = || crate::sys::winsize(0).map(|size| (size.ws_row, size.ws_col));
+        if typing {
+            typing_fixture(&mut input, &mut output, size)
+        } else {
+            line_fixture(&mut input, &mut output, true, size)
+        }
+        .map_err(io_error)?;
+        return Ok(0);
+    }
     output
-        .write_all(if focus {
-            b"\x1b[?1049h\x1b[?1004h\x1b[2J\x1b[8;1Hfocus ready\x1b[5;1H> "
-        } else if fold {
+        .write_all(if fold {
             b"\x1b[2J\x1b[8;1Hfold ready\x1b[5;1H> "
         } else {
             b"\x1b[2J\x1b[8;1Hredraw ready\x1b[5;1H> "
@@ -647,23 +683,6 @@ pub fn cmd_redraw_fixture(args: &[String]) -> Res {
     let mut restored = false;
     let mut key = [0u8; 1];
     while input.read_exact(&mut key).is_ok() {
-        if focus && key[0] == 27 {
-            let mut report = [0u8; 2];
-            input.read_exact(&mut report).map_err(io_error)?;
-            let label = match report {
-                [b'[', b'I'] => "in",
-                [b'[', b'O'] => "out",
-                _ => continue,
-            };
-            write!(
-                output,
-                "\x1b[?2026h\x1b[8;1H\x1b[2Kfocus {label}\x1b[5;{}H\x1b[?2026l",
-                text.len() + 3
-            )
-            .map_err(io_error)?;
-            output.flush().map_err(io_error)?;
-            continue;
-        }
         if fold {
             match key[0] {
                 3 | 4 => break,
@@ -682,10 +701,7 @@ pub fn cmd_redraw_fixture(args: &[String]) -> Res {
             0x20..=0x7e if text.len() < 80 => text.push(char::from(key[0])),
             _ => continue,
         }
-        if focus {
-            output.write_all(&key).map_err(io_error)?;
-            output.flush().map_err(io_error)?;
-        } else if !redraw {
+        if !redraw {
             write!(
                 output,
                 "\x1b[?2026h\x1b[?25l\x1b[5;1H\x1b[2K> {text}\x1b[5;{}H\x1b[?25h\x1b[?2026l",
@@ -712,6 +728,167 @@ pub fn cmd_redraw_fixture(args: &[String]) -> Res {
         }
     }
     Ok(0)
+}
+
+/// An ASCII line editor holding at most 80 bytes, never a command interpreter.
+/// The same byte stream can be exercised in memory without a PTY or child process.
+fn typing_fixture(
+    input: &mut impl std::io::Read,
+    output: &mut impl std::io::Write,
+    size: impl FnMut() -> Option<(u16, u16)>,
+) -> std::io::Result<()> {
+    line_fixture(input, output, false, size)
+}
+
+fn line_fixture(
+    input: &mut impl std::io::Read,
+    output: &mut impl std::io::Write,
+    focus: bool,
+    mut size: impl FnMut() -> Option<(u16, u16)>,
+) -> std::io::Result<()> {
+    let (rows, cols) = typing_size(size())?;
+    let mut line = TypingLine {
+        text: Vec::new(),
+        rows,
+        cols,
+        row: 4.min(usize::from(rows) - 1),
+        visible: true,
+        prompt: if focus { "> " } else { "$ " },
+    };
+    if focus {
+        output.write_all(b"\x1b[?1049h\x1b[?1004h")?;
+    }
+    output.write_all(b"\x1b[2J")?;
+    line.repaint(output, false)?;
+    if focus {
+        line.focus_report(output, "ready")?;
+    }
+    output.flush()?;
+    let mut key = [0u8; 1];
+    loop {
+        match input.read_exact(&mut key) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(error) => return Err(error),
+        }
+        let (rows, cols) = typing_size(size())?;
+        if (rows, cols) != (line.rows, line.cols) {
+            line.rows = rows;
+            line.cols = cols;
+            line.repaint(output, true)?;
+        }
+        if focus && key[0] == 27 {
+            let mut report = [0u8; 2];
+            input.read_exact(&mut report)?;
+            let label = match report {
+                [b'[', b'I'] => "in",
+                [b'[', b'O'] => "out",
+                _ => continue,
+            };
+            line.focus_report(output, label)?;
+            output.flush()?;
+            continue;
+        }
+        match key[0] {
+            3 | 4 => break,
+            b'\r' | b'\n' => {
+                let row = (line.cursor_row() + 1).min(usize::from(line.rows) - 1);
+                output.write_all(b"\r\n")?;
+                line.text.clear();
+                line.row = row;
+                line.visible = true;
+                line.repaint(output, false)?;
+            }
+            8 | 127 => {
+                if line.text.pop().is_some() {
+                    line.repaint(output, false)?;
+                }
+            }
+            12 => {
+                line.repaint(output, true)?;
+            }
+            21 => {
+                line.text.clear();
+                line.repaint(output, false)?;
+            }
+            0x20..=0x7e if line.text.len() < 80 => {
+                line.text.push(key[0]);
+                output.write_all(&key)?;
+                line.note_wrap();
+            }
+            _ => {}
+        }
+        output.flush()?;
+    }
+    Ok(())
+}
+
+fn typing_size(size: Option<(u16, u16)>) -> std::io::Result<(u16, u16)> {
+    size.filter(|&(rows, cols)| rows > 0 && cols > 0)
+        .ok_or_else(|| std::io::Error::other("the typing fixture needs a known nonzero PTY size"))
+}
+
+struct TypingLine {
+    text: Vec<u8>,
+    rows: u16,
+    cols: u16,
+    row: usize,
+    visible: bool,
+    prompt: &'static str,
+}
+
+impl TypingLine {
+    fn cursor_row(&self) -> usize {
+        self.cursor().0
+    }
+
+    /// Physical caret position, including the last cell while DEC wrap is pending.
+    fn cursor(&self) -> (usize, usize) {
+        let cols = usize::from(self.cols);
+        let end = self.text.len() + self.prompt.len();
+        let row = if self.visible {
+            self.row + (end - 1) / cols
+        } else {
+            usize::from(self.rows) - 1
+        };
+        let next = end % cols;
+        (row, if next == 0 { cols - 1 } else { next })
+    }
+
+    fn focus_report(&self, output: &mut impl std::io::Write, label: &str) -> std::io::Result<()> {
+        write!(
+            output,
+            // DECSC/DECRC retain pending wrap as well as the physical cursor.
+            // A CUP back to the same row and column would lose that state.
+            "\x1b[?2026h\x1b7\x1b[8;1H\x1b[2Kfocus {label}\x1b8\x1b[?2026l"
+        )
+    }
+
+    /// A full last cell has pending wrap; only the next byte advances a row.
+    fn note_wrap(&mut self) {
+        if self.visible {
+            let scroll = self.cursor_row().saturating_sub(usize::from(self.rows) - 1);
+            if let Some(row) = self.row.checked_sub(scroll) {
+                self.row = row;
+            } else {
+                self.visible = false;
+            }
+        }
+    }
+
+    fn repaint(&mut self, output: &mut impl std::io::Write, clear: bool) -> std::io::Result<()> {
+        // An offscreen prompt means this line fills the viewport. Rebuild its visible tail;
+        // a resize also starts a fresh view instead of guessing how the old rows reflowed.
+        if clear || !self.visible {
+            self.row = 0;
+            self.visible = true;
+            output.write_all(b"\x1b[H\x1b[2J")?;
+        }
+        write!(output, "\x1b[{};1H\x1b[J{}", self.row + 1, self.prompt)?;
+        output.write_all(&self.text)?;
+        self.note_wrap();
+        Ok(())
+    }
 }
 
 /// `p` relative to `base` when it is not absolute (git's own files).
@@ -833,17 +1010,17 @@ struct Live {
 }
 
 /// A human-readable `ctl` diagnostic: its stdout, then its stderr.
-fn reply_text(r: &Reply) -> String {
+pub(crate) fn reply_text(r: &Reply) -> String {
     format!("{}{}", r.stdout, r.stderr)
 }
 
 #[derive(Clone, Copy)]
-enum ReplyShape {
+pub(crate) enum ReplyShape {
     Line,
     Counted,
 }
 
-fn relay_reply<S: std::io::Read + std::io::Write>(
+pub(crate) fn relay_reply<S: std::io::Read + std::io::Write>(
     wire: &mut RelayClient<S>,
     request: &[&str],
     shape: ReplyShape,
@@ -925,8 +1102,11 @@ pub(crate) fn card_clean_twin(lit: &[u8], body: &str) -> Result<Vec<u8>, String>
         ));
     };
     let number = |v: &str| {
-        v.parse::<usize>()
-            .map_err(|_| format!("not a card clean line: {v}"))
+        v.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| v.parse::<usize>().ok())
+            .flatten()
+            .ok_or_else(|| format!("not a card clean line: {v}"))
     };
     let (x, y, w, h, bytes) = (
         number(x)?,
@@ -971,7 +1151,7 @@ pub(crate) fn card_clean_twin(lit: &[u8], body: &str) -> Result<Vec<u8>, String>
 }
 
 /// The counted `image --meta --bytes` body; unlike a filename reply, it needs no artifact ACK.
-fn image_bytes(body: &str) -> Result<(Vec<u8>, &str), String> {
+pub(crate) fn image_bytes(body: &str) -> Result<(Vec<u8>, &str), String> {
     let limit = aterm_types::control_verbs::MAX_CONTROL_REPLY_LINE_BYTES;
     let mut lines = body.lines();
     let metadata = lines.next().ok_or("image metadata is missing")?;
@@ -983,7 +1163,11 @@ fn image_bytes(body: &str) -> Result<(Vec<u8>, &str), String> {
         return Err("image payload exceeds its line bound or has extra rows".into());
     }
     let mut fields = payload.split_whitespace();
-    let number = |token: Option<&str>| token.and_then(|s| s.parse::<usize>().ok());
+    let number = |token: Option<&str>| {
+        token
+            .filter(|s| s.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|s| s.parse::<usize>().ok())
+    };
     let width = number(fields.next())
         .filter(|&n| n > 0)
         .ok_or("bad image width")?;
@@ -1018,34 +1202,41 @@ fn image_bytes(body: &str) -> Result<(Vec<u8>, &str), String> {
 #[derive(Clone, Copy)]
 enum FrameRead {
     Whole,
-    Open,
     Returned,
 }
 
 struct FrameEvidence {
     status: Reply,
-    cursor: Option<Reply>,
-    text: Option<Reply>,
+    cursor: Reply,
+    text: Reply,
 }
 
-fn frame_evidence(
-    phase: FrameRead,
-    mut request: impl FnMut(&[&str], ReplyShape) -> Reply,
-) -> FrameEvidence {
+fn frame_evidence(mut request: impl FnMut(&[&str], ReplyShape) -> Reply) -> FrameEvidence {
     let status = request(&["trail", "status"], ReplyShape::Counted);
-    let (cursor, text) = if matches!(phase, FrameRead::Open) {
-        (None, None)
-    } else {
-        (
-            Some(request(&["cursor"], ReplyShape::Line)),
-            Some(request(&["text"], ReplyShape::Counted)),
-        )
-    };
+    let cursor = request(&["cursor"], ReplyShape::Line);
+    let text = request(&["text"], ReplyShape::Counted);
     FrameEvidence {
         status,
         cursor,
         text,
     }
+}
+
+const REDRAW_HOLD_MS: u64 = 500;
+
+/// Keep capture and recording costs outside a held interval. Retain the transition callbacks'
+/// own marks by value; a failed wait still releases the hold before returning.
+fn record_after_hold<S, T, E>(
+    state: &mut S,
+    mut toggle: impl FnMut(&mut S) -> T,
+    hold: impl FnOnce(&mut S, &T) -> Result<(), E>,
+    record: impl FnOnce(&mut S, T, T) -> Result<(), E>,
+) -> Result<(), E> {
+    let opened = toggle(state);
+    let waited = hold(state, &opened);
+    let released = toggle(state);
+    waited?;
+    record(state, opened, released)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1308,18 +1499,10 @@ impl Shot<'_> {
         if !self.terminal {
             return true;
         }
-        let evidence = frame_evidence(phase, |request, shape| self.request(request, shape));
+        let evidence = frame_evidence(|request, shape| self.request(request, shape));
         self.keep(&format!("{frame}.status.txt"), &evidence.status);
-        match evidence.cursor {
-            Some(reply) => self.keep(&format!("{frame}.cursor.txt"), &reply),
-            None => self.keep(&format!("{frame}.read-notes.txt"), &Reply {
-                stdout: "cursor/text were not requested: DEC 2026 is deliberately open; whole-frame reads would delay its release. No later state is substituted.\n".into(),
-                ..Reply::default()
-            }),
-        }
-        if let Some(reply) = evidence.text {
-            self.keep(&format!("{frame}.text.txt"), &reply);
-        }
+        self.keep(&format!("{frame}.cursor.txt"), &evidence.cursor);
+        self.keep(&format!("{frame}.text.txt"), &evidence.text);
         if matches!(phase, FrameRead::Returned) {
             let note = match return_measurement(self.rainbow_expected, &evidence.status) {
                 Ok(ReturnMeasurement::NotApplicable) => {
@@ -1431,6 +1614,35 @@ impl Shot<'_> {
             Some(i) => self.paced(TYPING_KEY_MS, &[(i, "mid".to_string())], keys),
             None => self.paced(TYPING_KEY_MS, &[], keys),
         }
+    }
+
+    fn admissions(&mut self, frame: &str) -> Reply {
+        let reply = self.request(&["trail", "32"], ReplyShape::Counted);
+        self.keep(&format!("{frame}.admissions.txt"), &reply);
+        if reply.code != 0 {
+            self.note("could not retain the frame's admission records");
+            self.fails += 1;
+        }
+        reply
+    }
+
+    fn focus_roundtrip(&mut self) -> bool {
+        for (direction, expected) in [("out", "focus.out"), ("in", "focus.in")] {
+            let sent = self.request(&["focus", direction], ReplyShape::Line);
+            self.keep(&format!("focus-{direction}.sent.txt"), &sent);
+            let seen = self.request(
+                &["await", "match", expected, "timeout=60000"],
+                ReplyShape::Line,
+            );
+            self.keep(&format!("focus-{direction}.seen.txt"), &seen);
+            if sent.code != 0 || seen.code != 0 {
+                self.note("the focus report did not reach the fixture");
+                self.fails += 1;
+                return false;
+            }
+            self.tick();
+        }
+        true
     }
 
     /// A typed burst, a key per `every` ms unless a frame is slower, each
@@ -1670,40 +1882,120 @@ impl Shot<'_> {
             Scenario::RedrawStall => {
                 self.burst(None, &word)?;
                 self.snap("typed");
-                self.press("ctrl+g");
-                self.mark("redraw-start");
-                self.tick_until(500, Duration::from_millis(16))?;
-                self.snap_phase("stalled", FrameRead::Open);
-                self.press("ctrl+g");
-                self.mark("redraw-return");
-                let ready = self.request(
-                    &["await", "match", "redraw.restored", "timeout=60000"],
-                    ReplyShape::Line,
-                );
-                if ready.code != 0 {
-                    self.note("the redraw fixture did not restore its text");
-                    self.fails += 1;
-                }
-                self.snap_phase("restored", FrameRead::Returned);
+                record_after_hold(
+                    self,
+                    |shot| {
+                        shot.press("ctrl+g");
+                        Instant::now()
+                    },
+                    |_, opened| Shot::pace(*opened, REDRAW_HOLD_MS),
+                    |shot, opened, released| {
+                        shot.mark = released;
+                        let from = shot.since_start(opened);
+                        let to = shot.since_start(released);
+                        shot.row(&format!("@redraw-start\t{from}"));
+                        shot.row(&format!("@redraw-return\t{to}"));
+                        shot.keep("stalled.read-notes.txt", &Reply {
+                            stdout: format!(
+                                "Redraw key acknowledgments: start={from} ms release={to} ms interval={} ms on the gallery controller clock. These mark accepted key requests, not observed DEC 2026 phase transitions. No image, tick, status, cursor or text was requested during the driver hold; no open-phase image was captured. These marks were retained in memory until release. No later state is substituted.\n",
+                                released.duration_since(opened).as_millis(),
+                            ),
+                            ..Reply::default()
+                        });
+                        let ready = shot.request(
+                            &["await", "match", "redraw.restored", "timeout=60000"],
+                            ReplyShape::Line,
+                        );
+                        if ready.code != 0 {
+                            shot.note("the redraw fixture did not restore its text");
+                            shot.fails += 1;
+                        }
+                        shot.snap_phase("restored", FrameRead::Returned);
+                        Ok(())
+                    },
+                )?;
             }
             Scenario::FocusRoundtrip => {
                 self.tick();
-                for (direction, expected) in [("out", "focus.out"), ("in", "focus.in")] {
-                    let sent = self.request(&["focus", direction], ReplyShape::Line);
-                    let seen = self.request(
-                        &["await", "match", expected, "timeout=60000"],
-                        ReplyShape::Line,
-                    );
-                    if sent.code != 0 || seen.code != 0 {
-                        self.note("the focus report did not reach the fixture");
-                        self.fails += 1;
-                        return Ok(());
-                    }
-                    self.tick();
+                if !self.focus_roundtrip() {
+                    return Ok(());
                 }
                 self.snap("focused");
                 self.burst(None, &word)?;
                 self.snap_phase("typed", FrameRead::Returned);
+            }
+            Scenario::FocusWrap => {
+                let warm = format!("{}shared", "a".repeat(54));
+                self.burst(None, &keys_of(&warm))?;
+                let echoed = self.request(
+                    &["await", "match", "shared", "timeout=60000"],
+                    ReplyShape::Line,
+                );
+                self.keep("warm-echo.seen.txt", &echoed);
+                let cursor = self.request(&["cursor"], ReplyShape::Line);
+                self.keep("warm-echo.cursor.txt", &cursor);
+                let position: Vec<_> = cursor.stdout.split_whitespace().take(3).collect();
+                if echoed.code != 0 || cursor.code != 0 || position != ["OK", "5", "30"] {
+                    self.note("the populated composer did not reach row 5, column 30 before focus");
+                    self.fails += 1;
+                    return Ok(());
+                }
+                self.snap("warm");
+                if !self.focus_roundtrip() {
+                    return Ok(());
+                }
+                self.snap("focused");
+                let baseline = self.admissions("focus-baseline");
+                self.mark("tail-start");
+                let start = self.mark;
+                for (i, key) in keys_of(" state").iter().enumerate() {
+                    Shot::pace(start, i as u64 * TYPING_KEY_MS)?;
+                    self.press(key);
+                    sleep(TYPING_KEY_MS / 2)?;
+                    let frame = format!("tail{:02}-{key}", i + 1);
+                    self.snap(&frame);
+                    self.admissions(&frame);
+                }
+                // A key-request acknowledgment alone does not mean its PTY echo or
+                // verdict has arrived. Await the final visible word, render it, then
+                // retain the late records separately from the six per-key samples.
+                let echoed = self.request(
+                    &["await", "match", "tate", "timeout=60000"],
+                    ReplyShape::Line,
+                );
+                self.keep("tail-echo.seen.txt", &echoed);
+                if echoed.code != 0 {
+                    self.note("the wrapped tail did not reach the fixture");
+                    self.fails += 1;
+                    return Ok(());
+                }
+                self.snap_phase("tail-drained", FrameRead::Returned);
+                let drained = self.admissions("tail-drained");
+                if self.rainbow_expected && baseline.code == 0 && drained.code == 0 {
+                    let note = match crate::trail_replay::licensed_tail(
+                        &baseline.stdout,
+                        &drained.stdout,
+                        6,
+                    ) {
+                        Ok(true) => "observed: six consecutive licensed suffix verdicts with matching bound sources; pixel continuity has not been judged".to_string(),
+                        Ok(false) => {
+                            self.inconclusive += 1;
+                            "inconclusive: missing or coalesced suffix verdicts; no claim about coverage or pixels".to_string()
+                        }
+                        Err(error) => {
+                            self.fails += 1;
+                            format!("failed custody observation: {error}; pixel continuity has not been judged")
+                        }
+                    };
+                    self.keep(
+                        "tail-verdicts.measurement.txt",
+                        &Reply {
+                            stdout: format!("{note}\n"),
+                            ..Reply::default()
+                        },
+                    );
+                }
+                self.mark("tail-end");
             }
             Scenario::FoldRest => {
                 self.tick();
@@ -1745,6 +2037,39 @@ impl Shot<'_> {
     }
 }
 
+/// Prepare the actual PTY program. Compiled fixtures never create a shell script.
+fn gallery_program(
+    dir: &Path,
+    scenario: Scenario,
+    theme: Theme,
+    lab: &Path,
+) -> Result<Vec<String>, String> {
+    let mode = match scenario {
+        Scenario::Typing => Some("typing"),
+        Scenario::Settings | Scenario::RedrawStall => Some(""),
+        Scenario::FoldRest => Some("fold"),
+        Scenario::FocusRoundtrip | Scenario::FocusWrap => Some("focus"),
+        _ => None,
+    };
+    if let Some(mode) = mode {
+        let mut args = vec![
+            lab.to_string_lossy().into_owned(),
+            "__trail-redraw-fixture".to_string(),
+        ];
+        if !mode.is_empty() {
+            args.push(mode.to_string());
+        }
+        return Ok(args);
+    }
+    let script = dir.join("paint.sh");
+    std::fs::write(&script, paint(scenario, theme))
+        .map_err(|e| format!("cannot write {}: {e}", script.display()))?;
+    Ok(vec![
+        "/bin/sh".to_string(),
+        script.to_string_lossy().into_owned(),
+    ])
+}
+
 /// A whole run: where it writes, what it drives and what it counted.
 struct Gallery {
     out: PathBuf,
@@ -1775,9 +2100,6 @@ impl Gallery {
         if self.keep {
             world.keep();
         }
-        let script = world.dir.join("paint.sh");
-        std::fs::write(&script, paint(scenario, theme))
-            .map_err(|e| format!("cannot write {}: {e}", script.display()))?;
         let env = world
             .env()
             .into_iter()
@@ -1792,21 +2114,7 @@ impl Gallery {
             font_px.to_string(),
         ];
         args.push("-e".to_string());
-        if matches!(
-            scenario,
-            Scenario::RedrawStall | Scenario::FoldRest | Scenario::FocusRoundtrip
-        ) {
-            args.push(paths().exe.to_string_lossy().into_owned());
-            args.push("__trail-redraw-fixture".to_string());
-            if scenario == Scenario::FoldRest {
-                args.push("fold".to_string());
-            } else if scenario == Scenario::FocusRoundtrip {
-                args.push("focus".to_string());
-            }
-        } else {
-            args.push("/bin/sh".to_string());
-            args.push(script.to_string_lossy().into_owned());
-        }
+        args.extend(gallery_program(&world.dir, scenario, theme, &paths().exe)?);
         let inst = Instance::start(
             &world,
             Launch {
@@ -1886,15 +2194,12 @@ impl Gallery {
         remove_named(&self.out, &name);
         self.instances += 1;
         let before = (self.fails, self.inconclusive);
-        let (c, l, f) = scenario.grid();
-        let grid = (
-            a.columns.unwrap_or(c),
-            a.lines.unwrap_or(l),
-            a.font_px.unwrap_or(f),
-        );
+        let grid = scenario.configured_grid(a);
         let config = config_lines(style, theme, &a.extras);
-        let rainbow_expected = matches!(scenario, Scenario::RedrawStall | Scenario::FocusRoundtrip)
-            && expects_rainbow(&config).map_err(usage)?;
+        let rainbow_expected = matches!(
+            scenario,
+            Scenario::RedrawStall | Scenario::FocusRoundtrip | Scenario::FocusWrap
+        ) && expects_rainbow(&config).map_err(usage)?;
         match self.launch(&name, scenario, theme, grid, &config) {
             Err(e) => {
                 eprintln!("trail-gallery: [{name}] {e}");
@@ -2007,7 +2312,7 @@ fn settle(inst: &mut Instance) -> Result<(), Fail> {
 }
 
 /// Remove `<name>.*` from `dir`: a rerun replaces what an earlier one left.
-fn remove_named(dir: &Path, name: &str) {
+pub(crate) fn remove_named(dir: &Path, name: &str) {
     let prefix = format!("{name}.");
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;

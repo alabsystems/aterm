@@ -3,8 +3,8 @@
 
 //! A long-lived watch on the path this Mac's traffic takes ([`PathMonitor`]), over
 //! Network.framework's path monitor (`nw_path_monitor_t`): every update the monitor hands its
-//! handler reaches a sink as a [`PathReading`] (`nw_path_get_status` and
-//! `nw_path_is_constrained` of that path), on a private [`SerialQueue`].
+//! handler reaches a sink as a [`PathReading`] (`nw_path_get_status`, `nw_path_is_constrained`
+//! and `nw_path_is_expensive` of that path), on a private [`SerialQueue`].
 //!
 //! The monitor's first update is the path in use when it starts, and each later one a change
 //! of it. Network.framework is not linked: its functions are opened at the first start
@@ -39,6 +39,7 @@ struct Network {
     cancel: unsafe extern "C" fn(*mut c_void),
     status: unsafe extern "C" fn(*mut c_void) -> c_int,
     constrained: unsafe extern "C" fn(*mut c_void) -> bool,
+    expensive: unsafe extern "C" fn(*mut c_void) -> bool,
     release: unsafe extern "C" fn(*mut c_void),
 }
 
@@ -98,6 +99,10 @@ impl Network {
                     *mut c_void,
                     unsafe extern "C" fn(*mut c_void) -> bool,
                 >(symbol(c"nw_path_is_constrained")?),
+                expensive: std::mem::transmute::<
+                    *mut c_void,
+                    unsafe extern "C" fn(*mut c_void) -> bool,
+                >(symbol(c"nw_path_is_expensive")?),
                 release: std::mem::transmute::<*mut c_void, unsafe extern "C" fn(*mut c_void)>(
                     symbol(c"nw_release")?,
                 ),
@@ -141,6 +146,9 @@ pub struct PathReading {
     pub status: PathStatus,
     /// Whether the path uses an interface in Low Data Mode (`nw_path_is_constrained`).
     pub constrained: bool,
+    /// Whether the path uses an interface the system counts as expensive: cellular, or Wi-Fi
+    /// to a phone's hotspot (`nw_path_is_expensive`).
+    pub expensive: bool,
 }
 
 /// A started Network.framework path monitor, which hands every update to its sink until it is
@@ -193,11 +201,17 @@ impl PathMonitor {
         let update = move |path: *mut c_void| {
             // SAFETY: `path` is the live `nw_path_t` the monitor hands its handler, valid only
             // for this call and only read inside it.
-            let (raw, constrained) =
-                unsafe { ((network.status)(path), (network.constrained)(path)) };
+            let (raw, constrained, expensive) = unsafe {
+                (
+                    (network.status)(path),
+                    (network.constrained)(path),
+                    (network.expensive)(path),
+                )
+            };
             sink(PathReading {
                 status: PathStatus::from_raw(raw),
                 constrained,
+                expensive,
             });
         };
         // SAFETY: the monitor calls its update handler as `void (^)(nw_path_t)`, a block of one

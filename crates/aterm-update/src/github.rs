@@ -1054,12 +1054,21 @@ const CONTAINER_HASH_WAIT: std::time::Duration = std::time::Duration::from_secs(
 
 /// SHA-256 of the downloaded container, answered by `limit`.
 fn container_sha256(path: &std::path::Path, limit: std::time::Duration) -> Result<String, String> {
+    container_sha256_with(path, limit, aterm_update_core::sha256_file)
+}
+
+/// [`container_sha256`] by `hash`, which a test makes one that never finishes.
+fn container_sha256_with(
+    path: &std::path::Path,
+    limit: std::time::Duration,
+    hash: fn(&std::path::Path) -> Result<String, String>,
+) -> Result<String, String> {
     let (answer, answered) = std::sync::mpsc::sync_channel(1);
     let owned = path.to_path_buf();
     let started = std::thread::Builder::new()
         .name("aterm-update-hash".into())
         .spawn(move || {
-            let _ = answer.send(aterm_update_core::sha256_file(&owned));
+            let _ = answer.send(hash(&owned));
         });
     if let Err(error) = started {
         return Err(crate::verify::mark_passing(format!(
@@ -1919,6 +1928,7 @@ fn check_and_stage_in(
         version: manifest.version.clone(),
     });
     if let Err(e) = std::fs::rename(&part, &container_path) {
+        let _ = std::fs::remove_file(&part);
         let msg = format!("finalize download: {e}");
         crate::health::Health::record_failure(&staging.health(), "stage", &msg);
         return Err(msg);

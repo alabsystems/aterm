@@ -69,12 +69,27 @@ pub enum MotionEffect {
     /// their slots and the marker stands still; it still turns grey when readings stop, since that
     /// is information, not motion.
     DeckLive,
+    /// A native page's motion in place (`docs/DESIGN-init-on-by-default-2026-10-25.md` §5.5): a
+    /// working spinner's steps. Rotation in place is not travel, so Reduce Motion keeps it
+    /// ([`PageMotion::InPlace`]); Serious Mode, load shedding and Low Power still it to a static
+    /// working glyph ([`PageMotion::Fades`]).
+    NativeInPlace,
+    /// A native page's travel (§5.3–5.5): a glide, a walk, a run, a leap, a pulse, a sheen. Reduce
+    /// Motion stills it; its changes become dissolves ([`Self::NativeFade`]).
+    NativeTravel,
+    /// A native page's crossfade of at most [`NATIVE_FADE_MAX_MS`] (§5.5): what Reduce Motion,
+    /// Serious Mode, load shedding and Low Power keep, since a dissolve tells a change apart
+    /// without moving anything.
+    NativeFade,
 }
+
+/// The longest crossfade [`MotionEffect::NativeFade`] admits, in milliseconds (§5.5).
+pub const NATIVE_FADE_MAX_MS: u32 = 150;
 
 impl MotionEffect {
     /// The complete governed-effect set, which the totality proof iterates.
     #[cfg(test)]
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 13] = [
         Self::CursorGlow,
         Self::WordSparkles,
         Self::SmoothScroll,
@@ -85,6 +100,9 @@ impl MotionEffect {
         Self::BandProgress,
         Self::HarnessCard,
         Self::DeckLive,
+        Self::NativeInPlace,
+        Self::NativeTravel,
+        Self::NativeFade,
     ];
 
     /// Whether this effect is functional motion the host's load-shed latch (`perf_reduced`) must
@@ -101,7 +119,10 @@ impl MotionEffect {
             | Self::UpgradeSurge
             | Self::BandProgress
             | Self::HarnessCard
-            | Self::DeckLive => false,
+            | Self::DeckLive
+            | Self::NativeInPlace
+            | Self::NativeTravel
+            | Self::NativeFade => false,
         }
     }
 }
@@ -237,7 +258,10 @@ impl MotionPolicy {
                 | MotionEffect::UpgradeSurge
                 | MotionEffect::BandProgress
                 | MotionEffect::HarnessCard
-                | MotionEffect::DeckLive => 0.0,
+                | MotionEffect::DeckLive
+                | MotionEffect::NativeInPlace
+                | MotionEffect::NativeTravel
+                | MotionEffect::NativeFade => 0.0,
             },
         }
     }
@@ -248,13 +272,85 @@ impl MotionPolicy {
     pub const fn animate(self, effect: MotionEffect) -> bool {
         self.amplitude(effect) > 0.0
     }
+
+    /// Resolve how a native page may move (`docs/DESIGN-init-on-by-default-2026-10-25.md`
+    /// §5.5–5.6), a pure total function of the same facts [`Self::resolve`] reads and the ones
+    /// that quiet a page:
+    ///
+    /// * an unfocused window, or a page nobody sees, is [`PageMotion::Still`];
+    /// * Serious Mode is [`PageMotion::Fades`];
+    /// * load shedding (`shed`, the latch) and Low Power (`low_power`) are
+    ///   [`PageMotion::Fades`] unless the person asked for full motion (`motion = full`), which
+    ///   overrides them as it overrides the shed everywhere ([`MotionMode::admits_load_shed`]);
+    /// * otherwise [`Self::resolve`] decides: [`Self::Full`] is [`PageMotion::Full`], and Reduce
+    ///   Motion ([`Self::Reduced`] in a focused window) is [`PageMotion::InPlace`].
+    #[inline]
+    #[must_use]
+    pub const fn resolve_page(
+        mode: MotionMode,
+        system_reduce: bool,
+        focused: bool,
+        serious: bool,
+        shed: bool,
+        low_power: bool,
+    ) -> PageMotion {
+        if !focused {
+            return PageMotion::Still;
+        }
+        if serious || ((shed || low_power) && mode.admits_load_shed()) {
+            return PageMotion::Fades;
+        }
+        match Self::resolve(mode, system_reduce, true) {
+            Self::Full => PageMotion::Full,
+            Self::Reduced => PageMotion::InPlace,
+        }
+    }
+}
+
+/// How a native page may move, as [`MotionPolicy::resolve_page`] decides it: one home for the
+/// person's `motion` setting, Reduce Motion, Serious Mode, load shedding, Low Power and focus.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Default)]
+pub enum PageMotion {
+    /// Everything moves: travel, in place, crossfades.
+    #[default]
+    Full,
+    /// Reduce Motion: a spinner still steps in place and changes dissolve; nothing travels.
+    InPlace,
+    /// Serious Mode, load shedding or Low Power: a static working glyph, and crossfades of at
+    /// most [`NATIVE_FADE_MAX_MS`].
+    Fades,
+    /// An unfocused window or a page nobody sees: nothing moves, and on its return the page
+    /// jumps to where it stands, with no catch-up replay.
+    Still,
+}
+
+impl PageMotion {
+    /// Every resolution, for the totality proof.
+    #[cfg(test)]
+    pub const ALL: [Self; 4] = [Self::Full, Self::InPlace, Self::Fades, Self::Still];
+
+    /// Whether `effect` may animate under this resolution. A native effect follows the page's
+    /// rows of §5.5; any other effect animates only where the page is [`Self::Full`], as
+    /// [`MotionPolicy::Full`] would let it.
+    #[inline]
+    #[must_use]
+    pub const fn animate(self, effect: MotionEffect) -> bool {
+        match (self, effect) {
+            (Self::Full, _)
+            | (Self::InPlace, MotionEffect::NativeInPlace | MotionEffect::NativeFade)
+            | (Self::Fades, MotionEffect::NativeFade) => true,
+            (Self::InPlace | Self::Fades | Self::Still, _) => false,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
 
     //! These tests enumerate the invariant over the shipping `MotionPolicy`.
-    use super::{MotionEffect, MotionMode, MotionPolicy, SeriousEffect, SeriousModePolicy};
+    use super::{
+        MotionEffect, MotionMode, MotionPolicy, PageMotion, SeriousEffect, SeriousModePolicy,
+    };
 
     /// Reduce Motion dims the light without closing the key seam: audibility
     /// depends on focus and the brightness knob, never on the motion policy.
@@ -377,6 +473,83 @@ mod tests {
         }
         assert!(saw_full, "the Full policy must be reachable");
         assert!(saw_reduced, "the Reduced policy must be reachable");
+    }
+
+    /// A native page's motion is total over every fact that moves it, and its truth table is
+    /// §5.5's: an unfocused page is still; Serious Mode, and the shed or Low Power unless the
+    /// person asked for full motion, keep only crossfades (a static working glyph); Reduce Motion
+    /// keeps the spinner stepping in place and the crossfades but nothing that travels; anything
+    /// else moves in full. Every resolution is reached, and a non-native effect animates only
+    /// where the page is in full motion.
+    #[test]
+    fn page_motion_is_total_and_follows_the_reduced_motion_rows() {
+        let mut seen = std::collections::HashSet::new();
+        let bools = [false, true];
+        for mode in [MotionMode::Auto, MotionMode::Full, MotionMode::Reduced] {
+            for system_reduce in bools {
+                for focused in bools {
+                    for serious in bools {
+                        for shed in bools {
+                            for low_power in bools {
+                                let page = MotionPolicy::resolve_page(
+                                    mode,
+                                    system_reduce,
+                                    focused,
+                                    serious,
+                                    shed,
+                                    low_power,
+                                );
+                                let quiet =
+                                    serious || ((shed || low_power) && mode != MotionMode::Full);
+                                let reduced = mode == MotionMode::Reduced
+                                    || (mode == MotionMode::Auto && system_reduce);
+                                let want = if !focused {
+                                    PageMotion::Still
+                                } else if quiet {
+                                    PageMotion::Fades
+                                } else if reduced {
+                                    PageMotion::InPlace
+                                } else {
+                                    PageMotion::Full
+                                };
+                                assert_eq!(
+                                    page, want,
+                                    "{mode:?} sys={system_reduce} focused={focused} \
+                                     serious={serious} shed={shed} low_power={low_power}"
+                                );
+                                seen.insert(page);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            PageMotion::ALL.len(),
+            "every resolution is reached"
+        );
+        for page in PageMotion::ALL {
+            let spins = page.animate(MotionEffect::NativeInPlace);
+            let travels = page.animate(MotionEffect::NativeTravel);
+            let fades = page.animate(MotionEffect::NativeFade);
+            match page {
+                PageMotion::Full => assert!(spins && travels && fades),
+                PageMotion::InPlace => assert!(spins && !travels && fades, "§5.5 Reduce Motion"),
+                PageMotion::Fades => assert!(!spins && !travels && fades, "a static glyph"),
+                PageMotion::Still => assert!(!spins && !travels && !fades),
+            }
+            for effect in MotionEffect::ALL {
+                if !matches!(
+                    effect,
+                    MotionEffect::NativeInPlace
+                        | MotionEffect::NativeTravel
+                        | MotionEffect::NativeFade
+                ) {
+                    assert_eq!(page.animate(effect), page == PageMotion::Full, "{effect:?}");
+                }
+            }
+        }
     }
 
     /// The load-shed exemption is exactly the functional pair (wheel glide and

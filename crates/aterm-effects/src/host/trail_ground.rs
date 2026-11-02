@@ -8,31 +8,40 @@
 //! [`TrailGround::ground`] writes the glow config's page exactly as main's frame does, then runs
 //! the latch on every frame it grounds, never behind a short-circuit, and sets the config's
 //! light to [`Light::admitted`] its verdict at [`LIVE`], on the frame's page ([`PageFacts`],
-//! [`Light::on_page`]). A dark scheme is never admitted, so on every dark ground the config it
-//! hands on is main's. A composed frame's other panes take [`pane_light`].
+//! [`PageFacts::glass`], [`Light::on_page`]). A dark scheme is never admitted, so on every dark
+//! ground the config it hands on is main's. A composed frame's other panes take [`pane_light`].
 
 use crate::cursor_glow::{GlowConfig, Light, Live};
 use crate::host::light_latch::{LatchKey, LatchOut, LightLatch, raw_light, scheme_light};
 use crate::rainbow_kitty::prism_glass::LIVE;
+use crate::rainbow_kitty::prism_glass::colour::THIN_INK_SHARE;
 use aterm_time::Instant;
 
 /// What the host knows of the page under a window's text (§15.2 1.7, D1): whether the window is
-/// opaque (its `background_opacity` is 1) and whether a wallpaper or an image lies under the text.
-/// Glass draws only on a clear page ([`Self::clear`]); on any other the frame draws main's paper
-/// arm ([`Light::on_page`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// opaque (its `background_opacity` is 1), whether a wallpaper or an image lies under the text,
+/// and how near its face lays its thinnest glyph to the full ink. Glass draws only on a clear
+/// page whose face keeps its letters under it ([`Self::glass`]); on any other the frame draws
+/// main's paper arm ([`Light::on_page`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PageFacts {
     /// The window is opaque: nothing behind it shows through the page.
     pub opaque: bool,
     /// A wallpaper or an image lies under the text.
     pub wallpaper: bool,
+    /// How far toward the page, as a share of linear light, the darkest pixel of the window's
+    /// thinnest printable glyph lies, the face at the window's size laying the page's ink
+    /// (`aterm_render::GlyphInk::thin_share`): `0` for a host that does not know its face, which
+    /// takes it as laying its full ink; `1` for one that knows no glyph of it yet.
+    pub thin_ink: f32,
 }
 
 impl PageFacts {
-    /// An opaque window with nothing under its text: the scheme's page alone.
+    /// An opaque window with nothing under its text: the scheme's page alone, its face taken as
+    /// laying its full ink.
     pub const OPAQUE: Self = Self {
         opaque: true,
         wallpaper: false,
+        thin_ink: 0.0,
     };
 
     /// The page is the scheme's own colour alone: opaque, with no wallpaper or image under it.
@@ -40,6 +49,18 @@ impl PageFacts {
     #[must_use]
     pub const fn clear(self) -> bool {
         self.opaque && !self.wallpaper
+    }
+
+    /// The glass draws on this page (`docs/design/PRISM-GLASS.md` §15.8 amendment 53): it is
+    /// [`Self::clear`], and the window's face lays its thinnest glyph's darkest pixel no further
+    /// toward the page than [`THIN_INK_SHARE`], which the glass is solved for, so every letter's
+    /// solid ink keeps the glass's bar. A face that lays a 1 px stroke between two pixel rows
+    /// (most at small sizes, and SF Mono's `_` at 26 px) keeps main's paper arm, whatever its
+    /// cells' height.
+    #[inline]
+    #[must_use]
+    pub const fn glass(self) -> bool {
+        self.clear() && self.thin_ink <= THIN_INK_SHARE as f32
     }
 }
 
@@ -67,7 +88,7 @@ impl TrailGround {
     /// Ground `cfg` on the frame's live page `live` (`(fg, bg)`, DECSCNM and OSC 10/11 folded)
     /// at `now`: main's polarity (`dark_theme`) and page (`theme_fg`, `theme_bg`), then the
     /// latch's verdict on `scheme`, the front session's configured pair, on the window's `page`
-    /// ([`Light::on_page`]) as the config's light.
+    /// ([`PageFacts::glass`], [`Light::on_page`]) as the config's light.
     #[inline]
     pub fn ground(
         &mut self,
@@ -85,7 +106,7 @@ impl TrailGround {
         let out = self.latch.admits(now, scheme, raw);
         self.seen = Some((scheme, raw));
         self.page = page;
-        cfg.light = Light::admitted(out.on, self.live()).on_page(page.clear());
+        cfg.light = Light::admitted(out.on, self.live()).on_page(page.glass());
         out
     }
 
@@ -120,7 +141,7 @@ impl TrailGround {
     #[inline]
     #[must_use]
     pub const fn light(&self) -> Light {
-        Light::admitted(self.latch.last().on, self.live()).on_page(self.page.clear())
+        Light::admitted(self.latch.last().on, self.live()).on_page(self.page.glass())
     }
 
     /// The last grounded frame's key and its page's raw light; `None` before the first.
@@ -284,14 +305,14 @@ mod tests {
             (
                 PageFacts {
                     opaque: false,
-                    wallpaper: false,
+                    ..PageFacts::OPAQUE
                 },
                 false,
             ),
             (
                 PageFacts {
-                    opaque: true,
                     wallpaper: true,
+                    ..PageFacts::OPAQUE
                 },
                 false,
             ),
@@ -299,6 +320,7 @@ mod tests {
                 PageFacts {
                     opaque: false,
                     wallpaper: true,
+                    ..PageFacts::OPAQUE
                 },
                 false,
             ),
@@ -306,6 +328,7 @@ mod tests {
         assert_eq!(PageFacts::default(), PageFacts::OPAQUE);
         for (page, clear) in pages {
             assert_eq!(page.clear(), clear, "{page:?}");
+            assert_eq!(page.glass(), clear, "{page:?}");
             let mut ground = TrailGround::default();
             ground.force_live(Some(Live::Glass));
             let mut cfg = GlowConfig::default();
@@ -324,6 +347,50 @@ mod tests {
             assert_eq!(dark.light, Light::OFF, "{page:?}: a dark frame");
         }
         assert_eq!(Light::OFF.on_page(false), Light::OFF);
+    }
+
+    /// §15.8 amendment 53: a clear page whose face lays its thinnest glyph's darkest pixel further
+    /// toward the page than [`THIN_INK_SHARE`] (a 12 pt window at scale 1, SF Mono's `_` at 26 px,
+    /// a face not yet read) keeps the latch's verdict and its level but draws no glass, main's
+    /// paper arm, on the frame and read outside it; at the share and under it the glass draws.
+    /// Negative control: the same clear page at the share.
+    #[test]
+    fn a_page_whose_face_lays_no_full_ink_draws_no_glass() {
+        let t0 = Instant::now();
+        let share = THIN_INK_SHARE as f32;
+        for (thin_ink, glass) in [
+            (0.0, true),
+            (0.0044, true),
+            (share, true),
+            (share + 1e-4, false),
+            (0.0205, false),
+            (1.0, false),
+        ] {
+            let page = PageFacts {
+                thin_ink,
+                ..PageFacts::OPAQUE
+            };
+            assert!(page.clear(), "{page:?}");
+            assert_eq!(page.glass(), glass, "{page:?}");
+            let mut ground = TrailGround::default();
+            ground.force_live(Some(Live::Glass));
+            let mut cfg = GlowConfig::default();
+            let out = ground.ground(&mut cfg, LIGHT, key(1, LIGHT), page, t0);
+            assert!(
+                out.on && cfg.light.on(),
+                "{page:?}: the latch admits the light scheme"
+            );
+            assert_eq!(cfg.light.glass(), glass, "{page:?}");
+            assert_eq!(cfg.light.sheer(), !glass, "{page:?}");
+            assert_eq!(
+                ground.light(),
+                cfg.light,
+                "{page:?}: read outside the frame"
+            );
+            let mut dark = GlowConfig::default();
+            ground.ground(&mut dark, DARK, key(1, DARK), page, t0);
+            assert_eq!(dark.light, Light::OFF, "{page:?}: a dark frame");
+        }
     }
 
     /// A pane takes the frame's light only on a named light scheme over a light page.

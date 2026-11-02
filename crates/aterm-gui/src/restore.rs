@@ -614,6 +614,26 @@ impl AgentRestore {
         self.resume_line_at(None)
     }
 
+    /// One word of [`Self::resume_line_at`]'s line: as written when it holds only letters, digits
+    /// and `-_./:=@%+,`, else quoted for zsh; `None` for a word with a control or line-separator
+    /// character, which no typed line carries.
+    fn resume_word(w: &str) -> Option<String> {
+        use aterm_agent::harness::upgrade::{Dialect, quote};
+        if w.chars()
+            .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+        {
+            return None;
+        }
+        let plain = !w.is_empty()
+            && w.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_./:=@%+,".contains(&b));
+        Some(if plain {
+            w.to_string()
+        } else {
+            quote(Dialect::Zsh, w)
+        })
+    }
+
     /// THE LINE A PERSON TYPES IN THE REOPENED TAB TO RESUME THIS AGENT ON ITS CONVERSATION.
     ///
     /// Routes a Codex conversation off a pool row `seat`'s records mark limited, signed out or not
@@ -649,22 +669,8 @@ impl AgentRestore {
     ) -> Option<String> {
         use aterm_agent::harness::accounts::{Cli, HOME_ENV, LOGIN_ENV};
         use aterm_agent::harness::codex_alab::{AUTH_PATH_ENV, HOME_ENV as CODEX_HOME_ENV};
-        use aterm_agent::harness::upgrade::{Agent, Dialect, is_session_id, quote};
-        let word = |w: &str| -> Option<String> {
-            if w.chars()
-                .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
-            {
-                return None;
-            }
-            let plain = !w.is_empty()
-                && w.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"-_./:=@%+,".contains(&b));
-            Some(if plain {
-                w.to_string()
-            } else {
-                quote(Dialect::Zsh, w)
-            })
-        };
+        use aterm_agent::harness::upgrade::{Agent, Dialect, is_session_id};
+        let word = Self::resume_word;
         let run = match self.agent()? {
             Agent::Claude | Agent::Codex => &self.run,
             Agent::Muse => {
@@ -1023,6 +1029,11 @@ pub(crate) struct NativeLeafRestore {
 }
 
 impl NativeLeafRestore {
+    pub(crate) fn mail() -> Self {
+        let mut descriptor = Self::about();
+        descriptor.restore_tag = "mail".into();
+        descriptor
+    }
     pub(crate) fn about() -> Self {
         let mut descriptor = Self::settings("/".into());
         descriptor.restore_tag = "about".into();
@@ -1125,6 +1136,8 @@ impl NativeLeafRestore {
             return Some("config-editor identity requires an Editor restore");
         }
         match self.restore_tag.as_str() {
+            "mail" => (self.route.is_some() || self.uri.is_some())
+                .then_some("Mail has no document or Settings route"),
             "about" => (self.route.is_some() || self.uri.is_some())
                 .then_some("About has no document or Settings route"),
             "system-state" => (self.route.is_some() || self.uri.is_some())
@@ -1584,6 +1597,7 @@ impl PaneLayout {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum NativeTabRestore {
+    Mail,
     About,
     #[serde(rename = "system-state")]
     SystemState,
@@ -1602,7 +1616,7 @@ impl NativeTabRestore {
     #[cfg(test)]
     pub(crate) fn document_uri(&self) -> Option<&str> {
         match self {
-            Self::About | Self::Settings { .. } | Self::SystemState => None,
+            Self::Mail | Self::About | Self::Settings { .. } | Self::SystemState => None,
             Self::Markdown { uri } | Self::Editor { uri } => Some(uri),
         }
     }
@@ -1615,7 +1629,7 @@ impl NativeTabRestore {
 
     fn shape_is_valid(&self) -> bool {
         match self {
-            Self::About | Self::SystemState => true,
+            Self::Mail | Self::About | Self::SystemState => true,
             Self::Settings { route } => {
                 !route.is_empty()
                     && route.len() <= MAX_SETTINGS_ROUTE_BYTES
@@ -1953,6 +1967,7 @@ impl RestoredTab {
     pub(crate) fn from_legacy_native(descriptor: &NativeTabRestore) -> Option<Self> {
         let native = match descriptor {
             NativeTabRestore::About => NativeLeafRestore::about(),
+            NativeTabRestore::Mail => NativeLeafRestore::mail(),
             NativeTabRestore::SystemState => NativeLeafRestore::system_state(),
             NativeTabRestore::Settings { route } => NativeLeafRestore::settings(route.clone()),
             NativeTabRestore::Markdown { uri } => {
@@ -3184,6 +3199,7 @@ fn sweep_dead_restore_siblings(path: &Path) -> Vec<PathBuf> {
             .iter()
             .find_map(|purpose| rest.strip_prefix(purpose))
             .and_then(|tail| tail.split('-').next())
+            .filter(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
             .and_then(|pid| pid.parse::<u32>().ok());
         if pid.is_some_and(|pid| pid != own && !aterm_uds::process::pid_alive(pid))
             && entry.file_type().is_ok_and(|kind| kind.is_file())
@@ -3400,6 +3416,7 @@ fn parse_take_name(name: &OsStr, file: &str) -> Option<(TakeKind, JournalId)> {
         return Some((TakeKind::Taken, JournalId::parse_stem(stem)?));
     }
     let (stem, n) = rest.strip_prefix("retaken-")?.rsplit_once('-')?;
+    (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then_some(())?;
     n.parse::<usize>().ok()?;
     Some((TakeKind::Retaken, JournalId::parse_stem(stem)?))
 }
@@ -7121,7 +7138,13 @@ metadata = "opaque=copy-me"
         assert!(here.resumes(), "its own table's session resumes");
         assert_eq!(
             here.resume_line().as_deref(),
-            Some(format!("XDG_DATA_HOME=/Users//me/.local/share muse resume {MUSE}").as_str()),
+            Some(
+                format!(
+                    "XDG_DATA_HOME=/Users//me/.local/share muse --contributor-mode off resume \
+                     {MUSE}"
+                )
+                .as_str()
+            ),
             "Muse Code's own resume line, behind its data home"
         );
         let back = here
@@ -7489,7 +7512,9 @@ metadata = "opaque=copy-me"
         assert_eq!(
             on_work.resume_line_at(Some(&seat)),
             Some(format!(
-                "CODEX_AUTH_PATH={work_auth_str} {exe} --no-alt-screen resume {SESSION}"
+                "CODEX_AUTH_PATH={} {} --no-alt-screen resume {SESSION}",
+                AgentRestore::resume_word(&work_auth_str).expect("a typed word"),
+                AgentRestore::resume_word(exe).expect("a typed word")
             ))
         );
 

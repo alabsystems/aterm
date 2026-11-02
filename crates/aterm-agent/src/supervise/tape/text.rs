@@ -150,7 +150,7 @@ fn item_text(out: &mut String, item: &Item) {
 
 /// Whether `door` is a control lane's, written as words and a reply.
 fn is_control(door: &str) -> bool {
-    door == doors::CTL || door == doors::TELLER
+    super::ctl::is_control_door(door)
 }
 
 fn effect_text(out: &mut String, record: &EffectRecord, stamp: Option<Stamp>) {
@@ -175,12 +175,14 @@ fn effect_text(out: &mut String, record: &EffectRecord, stamp: Option<Stamp>) {
                 .then(|| {
                     codec::ctl_args(request)
                         .ok()
-                        .zip(codec::ctl_reply_of(reply).ok())
+                        .zip(super::ctl::control_reply(door, reply).ok().flatten())
                 })
                 .flatten()
                 .filter(|(words, back)| {
                     let words: Vec<&str> = words.iter().map(String::as_str).collect();
-                    codec::ctl_request(&words) == *request && codec::ctl_reply(back) == *reply
+                    codec::ctl_request(&words) == *request
+                        && super::ctl::encoded_reply(door, Some(back.clone())) == *reply
+                        && (door != doors::CTL_DUTY || super::ctl::duty_parts(request).is_ok())
                 });
             match control {
                 Some((words, reply)) => {
@@ -442,10 +444,15 @@ fn control(door: String, lines: &mut Lines<'_>, at: usize) -> Result<EffectRecor
         _ => return Err(format!("line {}: not a control reply: {head:?}", lines.at)),
     };
     let words: Vec<&str> = words.iter().map(String::as_str).collect();
+    let request = codec::ctl_request(&words);
+    if door == doors::CTL_DUTY {
+        super::ctl::duty_parts(&request).map_err(|error| format!("line {at}: {error}"))?;
+    }
+    let reply = super::ctl::encoded_reply(&door, Some(reply));
     Ok(EffectRecord::Exchange {
         door,
-        request: codec::ctl_request(&words),
-        reply: codec::ctl_reply(&reply),
+        request,
+        reply,
     })
 }
 

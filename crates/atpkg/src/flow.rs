@@ -781,6 +781,7 @@ fn install_inner(
             build: pinned,
             artifact,
             exposes: &pkg.exposes,
+            version: &pkg.version,
             shim_env: &shim_env,
             aliases: Aliases::for_program(program, index.program(program)),
             installed,
@@ -867,6 +868,9 @@ pub(crate) struct Landing<'a> {
     pub artifact: &'a crate::manifest::Artifact,
     /// The tool names the build exposes (admitted here).
     pub exposes: &'a [String],
+    /// The signed manifest's display version, recorded beside the build once it lands
+    /// ([`crate::store::write_version`]); empty where there is none to record.
+    pub version: &'a str,
     /// What the shims export, recorded beside the build before it is staged.
     pub shim_env: &'a crate::shim_env::ShimEnv,
     /// Whether the tools get `alab-<tool>` aliases.
@@ -1183,6 +1187,7 @@ fn activate_landed(
     let (tools, refused) = crate::store::split_exposed(l.exposes);
     // What an up-to-date install and `repair` re-lay from; a build without it falls back.
     let _ = crate::store::write_exposes(&build_dir, &tools);
+    let _ = crate::store::write_version(&build_dir, l.version);
     let aliases = l.aliases;
     let staged = Staged {
         build: pinned,
@@ -1508,7 +1513,10 @@ fn deliberately_absent<'a>(
     let removed = layout.removed_programs();
     let declined = layout.declined().is_file();
     move |m: &String| {
-        (declined || removed.contains(m) || excluded.contains(m)) && !installed.contains_key(m)
+        (declined
+            || removed.as_ref().map_or(true, |names| names.contains(m))
+            || excluded.contains(m))
+            && !installed.contains_key(m)
     }
 }
 
@@ -3318,6 +3326,7 @@ fn stage_fetched(
     }
     let (exposes, refused) = crate::store::split_exposed(&pkg.exposes);
     let _ = crate::store::write_exposes(&build_dir, &exposes);
+    let _ = crate::store::write_version(&build_dir, &pkg.version);
     let _ = crate::status::record_refused_shims(layout, program, pinned, &refused);
     Some(Staged {
         build: pinned,

@@ -152,46 +152,78 @@ pub fn no_core_dumps() {
     }
 }
 
-/// [`super::System::ask`]'s live arm ([`no_core_dumps`], [`io::ErrorKind::Interrupted`]).
-pub(super) fn ask_tty(prompt: &str, secret: bool) -> io::Result<Option<Secret>> {
-    use std::io::Write as _;
-    use std::os::unix::io::AsRawFd as _;
-    if secret {
+/// How [`ask_tty`] reads its one line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Read {
+    /// With echo on.
+    Shown,
+    /// With echo off, discarding whatever was typed before the prompt (a password: keys typed
+    /// ahead of it are no answer to it).
+    Hidden,
+    /// With echo off, keeping what was typed before the read (a line another program typed
+    /// ahead, as System State types the Command Line Tools tab's go line once it landed).
+    HiddenKept,
+}
+
+/// [`super::System::ask`]'s and [`super::System::ask_kept`]'s live arm ([`no_core_dumps`],
+/// [`io::ErrorKind::Interrupted`]).
+pub(super) fn ask_tty(prompt: &str, read: Read) -> io::Result<Option<Secret>> {
+    if read != Read::Shown {
         no_core_dumps();
     }
     let mut tty = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open("/dev/tty")?;
+    let stops = super::stops::catch();
+    let line = ask_on(&mut tty, prompt, read, &|| super::stops::caught().is_some());
+    drop(stops);
+    line
+}
+
+/// [`ask_tty`] on the terminal `tty`: the prompt, one line read as `read` says, echo put back,
+/// and a [`StopSignal`] once `stopped` says a stop came. `stopped` is [`super::stops::caught`]
+/// live, which is the process's one flag: a test hands its own, since another test's raised
+/// hang-up sets that flag for every reader in the binary.
+fn ask_on(
+    tty: &mut std::fs::File,
+    prompt: &str,
+    read: Read,
+    stopped: &dyn Fn() -> bool,
+) -> io::Result<Option<Secret>> {
+    use std::io::Write as _;
+    use std::os::unix::io::AsRawFd as _;
     let fd = tty.as_raw_fd();
     // SAFETY: `fd` is the open descriptor `tty` owns.
     if unsafe { libc::isatty(fd) } != 1 {
         return Err(io::Error::other("/dev/tty is not a terminal"));
     }
-    let echo = if secret {
-        Some(EchoOff::new(fd)?)
-    } else {
-        None
+    let echo = match read {
+        Read::Shown => None,
+        Read::Hidden => Some(EchoOff::new(fd, libc::TCSAFLUSH)?),
+        Read::HiddenKept => Some(EchoOff::new(fd, libc::TCSANOW)?),
     };
     tty.write_all(prompt.as_bytes())?;
     tty.flush()?;
-    let stops = super::stops::catch();
-    let line = read_tty_line(&mut tty, fd);
-    drop(stops);
+    let line = read_tty_line(tty, fd, stopped);
     drop(echo);
-    if secret {
+    if read != Read::Shown {
         let _ = tty.write_all(b"\n");
     }
     Ok(line?.filter(|s| !s.is_empty()))
 }
 
-/// Reads one line from `tty` a byte at a time, polling for stop signals.
-fn read_tty_line(tty: &mut std::fs::File, fd: i32) -> io::Result<Option<Secret>> {
-    struct Polled<'a>(&'a mut std::fs::File, i32);
+/// Reads one line from `tty` a byte at a time, asking `stopped` at least every 250 ms.
+fn read_tty_line(
+    tty: &mut std::fs::File,
+    fd: i32,
+    stopped: &dyn Fn() -> bool,
+) -> io::Result<Option<Secret>> {
+    struct Polled<'a>(&'a mut std::fs::File, i32, &'a dyn Fn() -> bool);
     impl io::Read for Polled<'_> {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
             loop {
-                if super::stops::caught().is_some() {
+                if (self.2)() {
                     return Err(io::Error::new(io::ErrorKind::Interrupted, StopSignal));
                 }
                 let mut pfd = libc::pollfd {
@@ -213,7 +245,7 @@ fn read_tty_line(tty: &mut std::fs::File, fd: i32) -> io::Result<Option<Secret>>
             }
         }
     }
-    Secret::read_line(&mut Polled(tty, fd))
+    Secret::read_line(&mut Polled(tty, fd, stopped))
 }
 
 /// The payload that marks an `Interrupted` as a person's stop (Ctrl-C at the prompt).
@@ -235,7 +267,9 @@ struct EchoOff {
 }
 
 impl EchoOff {
-    fn new(fd: i32) -> io::Result<Self> {
+    /// Echo off on `fd`, set `when` ([`libc::TCSAFLUSH`] discards what was typed before it,
+    /// [`libc::TCSANOW`] keeps it).
+    fn new(fd: i32, when: libc::c_int) -> io::Result<Self> {
         // SAFETY: all-zero is a valid `termios` (plain integers and an array); it is read
         // only after `tcgetattr` filled it.
         let mut saved: libc::termios = unsafe { std::mem::zeroed() };
@@ -246,7 +280,7 @@ impl EchoOff {
         let mut quiet = saved;
         quiet.c_lflag &= !libc::ECHO;
         // SAFETY: The same descriptor, and a fully initialized copy with one flag cleared.
-        if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &raw const quiet) } != 0 {
+        if unsafe { libc::tcsetattr(fd, when, &raw const quiet) } != 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(Self { fd, saved })
@@ -303,6 +337,146 @@ mod tests {
             (0, 0),
             "the hard limit too, so a child cannot raise it"
         );
+    }
+
+    /// A terminal pair a test types into as a person (or the window) would: the side that types
+    /// and reads the echo, and the side a reader reads.
+    #[cfg(unix)]
+    fn terminal() -> (std::fs::File, std::fs::File) {
+        use std::os::fd::FromRawFd as _;
+        let (mut typing, mut reading) = (0, 0);
+        // SAFETY: out-parameters of the right type; null name, termios and winsize.
+        let opened = unsafe {
+            libc::openpty(
+                &raw mut typing,
+                &raw mut reading,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(opened, 0, "openpty: {}", io::Error::last_os_error());
+        // SAFETY: `openpty` returned both descriptors open and owned by nobody else.
+        unsafe {
+            (
+                std::fs::File::from_raw_fd(typing),
+                std::fs::File::from_raw_fd(reading),
+            )
+        }
+    }
+
+    /// How many bytes wait to be read on `fd`.
+    #[cfg(unix)]
+    fn pending(fd: i32) -> libc::c_int {
+        let mut n: libc::c_int = 0;
+        // SAFETY: FIONREAD writes one int to a live out-parameter.
+        unsafe { libc::ioctl(fd, libc::FIONREAD, &raw mut n) };
+        n
+    }
+
+    /// `line` typed into `typing` before anything reads it, its echo read off (the window reads
+    /// a tab's output as it comes, so nothing is left for a flush to wait on).
+    #[cfg(unix)]
+    fn typed_ahead(typing: &mut std::fs::File, reading: &std::fs::File, line: &[u8]) {
+        use std::io::{Read as _, Write as _};
+        use std::os::unix::io::AsRawFd as _;
+        typing.write_all(line).unwrap();
+        let by = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while pending(reading.as_raw_fd()) == 0 {
+            assert!(
+                std::time::Instant::now() < by,
+                "the line never reached the reader"
+            );
+            std::thread::yield_now();
+        }
+        let fd = typing.as_raw_fd();
+        // SAFETY: `fd` is open; F_GETFL and F_SETFL take and return plain flags.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+        let mut echo = [0_u8; 256];
+        while typing.read(&mut echo).is_ok_and(|n| n > 0) {}
+    }
+
+    /// System State types the Command Line Tools tab's go line as soon as the tab lands, often
+    /// before the tab's program reaches its read: the reader with echo off that keeps what was
+    /// typed ahead (the go line's) reads that line, where one that discarded it would wait for a
+    /// line the window never types again.
+    #[cfg(unix)]
+    #[test]
+    fn a_go_line_typed_before_the_read_survives_echo_off() {
+        let (mut typing, mut reading) = terminal();
+        typed_ahead(&mut typing, &reading, b"install\r");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let line = ask_on(&mut reading, "", Read::HiddenKept, &|| false);
+            let _ = tx.send(line.map(|line| line.map(|line| line.bytes().to_vec())));
+        });
+        let line = rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the go line typed before the read was discarded: the read still waits");
+        assert_eq!(line.unwrap().as_deref(), Some(&b"install"[..]));
+        drop(typing);
+    }
+
+    /// A stop at the prompt (Ctrl-C, a closed tab) ends the read with [`StopSignal`] and puts the
+    /// echo back, though no line came. NEGATIVE CONTROL (scratch): the `(self.2)()` check in
+    /// `read_tty_line` made `false` leaves the read waiting, and this test's one-minute detector
+    /// fails.
+    #[cfg(unix)]
+    #[test]
+    fn a_stop_at_the_prompt_ends_the_read_and_puts_the_echo_back() {
+        use std::os::unix::io::AsRawFd as _;
+        let (typing, mut reading) = terminal();
+        let fd = reading.as_raw_fd();
+        let echoes = || {
+            // SAFETY: All-zero is a valid `termios`; `tcgetattr` fills it from the open `fd`.
+            let mut now: libc::termios = unsafe { std::mem::zeroed() };
+            // SAFETY: `fd` is the open terminal `reading` owns; `now` is a live out-parameter.
+            assert_eq!(unsafe { libc::tcgetattr(fd, &raw mut now) }, 0);
+            now.c_lflag & libc::ECHO != 0
+        };
+        assert!(echoes());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let read = ask_on(&mut reading, "", Read::Hidden, &|| true);
+            let _ = tx.send((read.map(|line| line.is_some()), reading));
+        });
+        let (read, _reading) = rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("a stop at the prompt left the read waiting for a line");
+        let stopped = read.expect_err("a stop is no line");
+        assert_eq!(stopped.kind(), io::ErrorKind::Interrupted);
+        assert!(
+            stopped
+                .get_ref()
+                .is_some_and(|inner| inner.downcast_ref::<StopSignal>().is_some()),
+            "a person's stop, not another interruption: {stopped}"
+        );
+        assert!(echoes(), "the echo the prompt turned off is back");
+        drop(typing);
+    }
+
+    /// The password prompt still discards keys typed before it, which are no answer to it.
+    #[cfg(unix)]
+    #[test]
+    fn a_password_prompt_discards_what_was_typed_before_it() {
+        use std::os::unix::io::AsRawFd as _;
+        let (mut typing, reading) = terminal();
+        typed_ahead(&mut typing, &reading, b"hunter2\r");
+        let fd = reading.as_raw_fd();
+        assert!(pending(fd) > 0);
+        let kept = EchoOff::new(fd, libc::TCSANOW).unwrap();
+        assert!(pending(fd) > 0, "echo off for a typed-ahead line keeps it");
+        drop(kept);
+        let quiet = EchoOff::new(fd, libc::TCSAFLUSH).unwrap();
+        assert_eq!(
+            pending(fd),
+            0,
+            "echo off for a password discards what came before it"
+        );
+        drop(quiet);
     }
 
     #[test]

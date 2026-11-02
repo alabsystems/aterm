@@ -106,6 +106,15 @@ fn the_number_is_the_heads_plus_one_and_everything_unnamed_is_carried() {
     assert_eq!(p.channel.min_build, 4);
     assert_eq!(p.channel.min_build_by_program.get("nn"), Some(&100));
     assert_eq!(p.valid_until, VU);
+
+    let max_first = Base::first("stable", u64::MAX).expect("first at u64::MAX");
+    let (max_plan, _) = ok(&max_first, &Delta::default());
+    assert_eq!(max_plan.index_build, u64::MAX);
+    let max_err = refused(&base(u64::MAX, &[("ay", 5)]), &Delta::default());
+    assert!(
+        max_err.contains("index_build overflowed u64::MAX"),
+        "{max_err}"
+    );
 }
 
 #[test]

@@ -43,17 +43,15 @@ impl At {
     /// Unparseable `seq=`/`door=` number or empty input.
     pub fn parse(text: &str) -> Result<Self, String> {
         if let Some(n) = text.strip_prefix("seq=") {
-            return n
-                .parse()
+            return crate::parse_uint(n)
                 .map(Self::Seq)
-                .map_err(|_| format!("--at seq= needs a number, not {n:?}"));
+                .ok_or_else(|| format!("--at seq= needs a number, not {n:?}"));
         }
         if let Some(n) = text.strip_prefix("door=") {
             let n = n.strip_prefix('#').unwrap_or(n);
-            return n
-                .parse()
+            return crate::parse_uint(n)
                 .map(Self::Door)
-                .map_err(|_| format!("--at door= needs an effect's ordinal, not {n:?}"));
+                .ok_or_else(|| format!("--at door= needs an effect's ordinal, not {n:?}"));
         }
         if let Some(secs) = time_of_day(text) {
             return Ok(Self::Time { day: None, secs });

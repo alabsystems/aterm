@@ -225,6 +225,7 @@ impl Look {
             theme_fg: if self.dark { 0x00C8_C8D2 } else { 0x0024_292F },
             theme_bg: if self.dark { 0x0010_1016 } else { 0x00FF_FFFF },
             block: self.block,
+            bar: false,
             glyph_span: Some((0, col as i32)),
             light_vivid: false,
             chosen_hue: false,

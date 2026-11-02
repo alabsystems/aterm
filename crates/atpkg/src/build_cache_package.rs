@@ -10,12 +10,13 @@ use std::path::{Path, PathBuf};
 use super::{Identity, Pending, Receipt};
 
 pub const VERB: &str = "__build_cache_package";
-pub const CAPABILITY: &str = "aterm-package-build-cache-v1";
+pub const CAPABILITY: &str = "aterm-package-build-cache-v2";
 pub const DEFAULT_BUDGET: u64 = 64 << 30;
 #[cfg(unix)]
 const DISK_FLOOR: u64 = 20 << 30;
-#[cfg(unix)]
-const COORDINATOR: &str = ".alab-package.lockf";
+/// The package producer's coordinator declares custody even before a target is admitted.
+/// Ordinary cache cleanup must not remove it or a directory containing it.
+pub const COORDINATOR: &str = ".alab-package.lockf";
 #[cfg(unix)]
 const ATTEMPT_ENV: &str = "ALAB_PACKAGE_CACHE_ATTEMPT";
 
@@ -29,6 +30,61 @@ struct Declaration {
     cache_identity: Identity,
     lock_identity: Identity,
     minimum_bytes: u64,
+    /// Absent on old v1 receipts: their custody remains readable, never disposable.
+    #[serde(default)]
+    preserve_if_present: Option<PreserveIfPresent>,
+}
+
+impl Declaration {
+    #[cfg(unix)]
+    fn same_coordinator(&self, other: &Self) -> bool {
+        self.cache == other.cache
+            && self.cache_identity == other.cache_identity
+            && self.lock_identity == other.lock_identity
+    }
+
+    #[cfg(unix)]
+    fn same_family(&self, other: &Self) -> bool {
+        self.preserve_if_present.is_some() && self.preserve_if_present == other.preserve_if_present
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct PreserveIfPresent {
+    path: PathBuf,
+    parent_identity: Identity,
+}
+
+impl PreserveIfPresent {
+    fn valid(&self) -> bool {
+        self.path.is_absolute() && self.path.file_name().is_some()
+    }
+
+    #[cfg(unix)]
+    fn capture(path: &Path) -> Option<Self> {
+        let parent = path.parent()?;
+        let guard = Self {
+            path: path.to_path_buf(),
+            parent_identity: super::identity(parent)?,
+        };
+        (guard.valid() && guard.absent()).then_some(guard)
+    }
+
+    #[cfg(unix)]
+    fn absent(&self) -> bool {
+        let Some(parent) = self.path.parent() else {
+            return false;
+        };
+        let current = || {
+            parent.canonicalize().ok().as_deref() == Some(parent)
+                && super::identity(parent).as_ref() == Some(&self.parent_identity)
+        };
+        self.valid()
+            && current()
+            && std::fs::symlink_metadata(&self.path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            && current()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -67,8 +123,17 @@ fn token(text: &str) -> bool {
 }
 
 impl Policy {
+    pub(super) fn cache_root(&self) -> &Path {
+        &self.declaration.cache
+    }
+
     pub(super) fn valid(&self) -> bool {
         self.declaration.cache.is_absolute()
+            && self
+                .declaration
+                .preserve_if_present
+                .as_ref()
+                .is_none_or(PreserveIfPresent::valid)
             && self.declaration.minimum_bytes > 0
             && self
                 .learned_budget
@@ -88,6 +153,56 @@ impl Policy {
                         .as_ref()
                         .is_none_or(|text| !text.is_empty() && text.len() <= 128)
             })
+    }
+
+    pub(super) fn schema(&self) -> u32 {
+        if self.declaration.preserve_if_present.is_some() {
+            3
+        } else {
+            2
+        }
+    }
+
+    #[cfg(unix)]
+    pub(super) fn creation_allowed(&self, home: &Path) -> bool {
+        self.valid()
+            && !self.superseded
+            && self.active.is_some()
+            && held_coordinator(home, &self.declaration)
+            && self
+                .declaration
+                .preserve_if_present
+                .as_ref()
+                .is_some_and(PreserveIfPresent::absent)
+    }
+
+    #[cfg(unix)]
+    pub(super) fn mark_created(&mut self) {
+        if let Some(active) = &mut self.active {
+            active.fresh = true;
+        }
+    }
+
+    #[cfg(unix)]
+    pub(super) fn same_creation(&self, requested: &Self) -> bool {
+        let mut requested = requested.clone();
+        if let Some(active) = &mut requested.active {
+            active.fresh = self.active.as_ref().is_some_and(|active| active.fresh);
+        }
+        *self == requested
+    }
+
+    #[cfg(unix)]
+    fn retirement_allowed(&self) -> bool {
+        self.declaration
+            .preserve_if_present
+            .as_ref()
+            .is_some_and(PreserveIfPresent::absent)
+    }
+
+    #[cfg(not(unix))]
+    fn retirement_allowed(&self) -> bool {
+        false
     }
 
     #[cfg(unix)]
@@ -116,8 +231,11 @@ pub(super) fn belongs(receipt: &Receipt, cache: &Path) -> bool {
 /// A durable authorization permits a partially removed payload, not a replaced directory
 /// or a newly added source project/sibling in its private retirement stage.
 pub(super) fn payload_safe(receipt: &Receipt, pending: &Pending) -> bool {
-    if receipt.package.is_none() {
+    let Some(policy) = &receipt.package else {
         return true;
+    };
+    if !policy.retirement_allowed() {
+        return false;
     }
     let payload = pending.directory.join("cache.noindex");
     let Ok(entries) = std::fs::read_dir(&pending.directory) else {
@@ -148,6 +266,7 @@ pub(super) fn payload_safe(receipt: &Receipt, pending: &Pending) -> bool {
                 && marker.nonce == receipt.nonce
                 && marker.schema == receipt.schema
                 && same_declaration(marker.package.as_ref(), receipt.package.as_ref())
+                && policy.retirement_allowed()
         }),
     }
 }
@@ -294,6 +413,7 @@ fn coordinator(home: &Path, cache: &Path) -> Option<(Declaration, std::fs::File)
             cache_identity,
             lock_identity,
             minimum_bytes: DEFAULT_BUDGET,
+            preserve_if_present: None,
         },
         file,
     ))
@@ -303,6 +423,7 @@ fn coordinator(home: &Path, cache: &Path) -> Option<(Declaration, std::fs::File)
 fn matches_coordinator(home: &Path, declaration: &Declaration) -> bool {
     coordinator(home, &declaration.cache).is_some_and(|(mut current, _)| {
         current.minimum_bytes = declaration.minimum_bytes;
+        current.preserve_if_present = declaration.preserve_if_present.clone();
         current == *declaration
     })
 }
@@ -313,6 +434,7 @@ fn held_coordinator(home: &Path, declaration: &Declaration) -> bool {
         return false;
     };
     current.minimum_bytes = declaration.minimum_bytes;
+    current.preserve_if_present = declaration.preserve_if_present.clone();
     current == *declaration
         && matches!(
             crate::lock::Flock::try_lock(file),
@@ -439,15 +561,19 @@ pub(super) fn coordinate(home: &Path, receipt: &Receipt) -> Result<Option<Coordi
     let Some(policy) = &receipt.package else {
         return Ok(None);
     };
+    if !policy.retirement_allowed() {
+        return Err(());
+    }
     let (mut declaration, file) = coordinator(home, &policy.declaration.cache).ok_or(())?;
     declaration.minimum_bytes = policy.declaration.minimum_bytes;
+    declaration.preserve_if_present = policy.declaration.preserve_if_present.clone();
     if declaration != policy.declaration
         || receipt.root.parent() != Some(declaration.cache.as_path())
     {
         return Err(());
     }
     let held = crate::lock::Flock::try_lock(file).map_err(|_| ())?;
-    if !matches_coordinator(home, &declaration) {
+    if !matches_coordinator(home, &declaration) || !policy.retirement_allowed() {
         return Err(());
     }
     Ok(Some(Coordination {
@@ -458,18 +584,32 @@ pub(super) fn coordinate(home: &Path, receipt: &Receipt) -> Result<Option<Coordi
 
 #[cfg(unix)]
 impl Coordination {
-    pub(super) fn current(&self, home: &Path, receipt: &Receipt) -> bool {
-        receipt
-            .package
+    /// The coordinator and receipt gate remain held by the caller. During removal the
+    /// embedded receipt may already be gone, so recheck the bound preservation guard alone.
+    pub(super) fn removal_allowed(&self) -> bool {
+        self.declaration
+            .preserve_if_present
             .as_ref()
-            .is_some_and(|policy| policy.declaration == self.declaration && policy.active.is_none())
-            && !receipt.owners_unknown
+            .is_some_and(PreserveIfPresent::absent)
+    }
+
+    pub(super) fn current(&self, home: &Path, receipt: &Receipt) -> bool {
+        receipt.package.as_ref().is_some_and(|policy| {
+            policy.declaration == self.declaration
+                && policy.active.is_none()
+                && policy.retirement_allowed()
+        }) && !receipt.owners_unknown
             && !receipt.owners.is_empty()
             && matches_coordinator(home, &self.declaration)
             && policies(home, &self.declaration.cache).is_ok_and(|records| {
-                records
-                    .iter()
-                    .all(|(_, other)| other.root == receipt.root || other.pending.is_none())
+                records.iter().all(|(_, other)| {
+                    other.package.as_ref().is_some_and(|policy| {
+                        policy.declaration.same_coordinator(&self.declaration)
+                            && (!policy.declaration.same_family(&self.declaration)
+                                || other.root == receipt.root
+                                || other.pending.is_none())
+                    })
+                })
             })
     }
 
@@ -529,6 +669,9 @@ fn recover_active(
     if policy.declaration != *declaration {
         return false;
     }
+    if !policy.retirement_allowed() {
+        return false;
+    }
     let Some(attempt) = policy.active.clone() else {
         return true;
     };
@@ -547,6 +690,7 @@ fn recover_active(
     if !fence.clear(&receipt.root, &receipt.root)
         || !matches_coordinator(home, declaration)
         || super::read(path).as_ref() != Some(receipt)
+        || !policy.retirement_allowed()
     {
         return false;
     }
@@ -605,6 +749,7 @@ struct Admission<'a> {
     cache: &'a Path,
     target: &'a Path,
     manifest: &'a Path,
+    preserve_if_present: &'a Path,
     budget: u64,
     attempt: &'a str,
     producer_pid: u32,
@@ -629,6 +774,7 @@ fn admit_on(
         || !args.target.is_absolute()
         || args.target.parent() != Some(args.cache)
         || !args.manifest.is_absolute()
+        || !args.preserve_if_present.is_absolute()
         || [home, args.cache].contains(&args.target)
     {
         return Err(
@@ -638,6 +784,10 @@ fn admit_on(
     let (mut declaration, _) = coordinator(home, args.cache)
         .ok_or("package coordinator is not a private canonical lock")?;
     declaration.minimum_bytes = args.budget;
+    declaration.preserve_if_present = Some(
+        PreserveIfPresent::capture(args.preserve_if_present)
+            .ok_or("package preservation marker or its parent keeps the generation")?,
+    );
     if !held_coordinator(home, &declaration) {
         return Err("package coordinator is not held by the producer guardian".into());
     }
@@ -645,6 +795,13 @@ fn admit_on(
         super::workspace(home, args.manifest).ok_or("package workspace cannot be established")?;
     let path = receipt_path(home, args.target).ok_or("package target cannot be addressed")?;
     let existing = super::read(&path);
+    if existing
+        .as_ref()
+        .and_then(|receipt| receipt.package.as_ref())
+        .is_some_and(|policy| !policy.declaration.same_family(&declaration))
+    {
+        return Err("package target belongs to another preservation declaration".into());
+    }
     if !compatible {
         if existing
             .as_ref()
@@ -661,11 +818,37 @@ fn admit_on(
     let producer = kernel
         .capture(args.producer_pid, args.producer_group)
         .ok_or("package producer birth or worker group cannot be established")?;
-    let prior_records = policies(home, args.cache)?;
-    if prior_records
-        .iter()
-        .any(|(_, receipt)| receipt.pending.is_some())
+    if !declaration
+        .preserve_if_present
+        .as_ref()
+        .is_some_and(PreserveIfPresent::absent)
     {
+        return Err("package preservation marker or its parent keeps the generation".into());
+    }
+    // The coordinator excludes producers while an interrupted creation is completed. Only
+    // the exact, still-empty created identity can finish; this grants no build or retirement.
+    let recovered_creation = if let Some(receipt) = super::read(&path)
+        && receipt.creating.is_some()
+    {
+        let gate = super::gate_path(&path).ok_or("creation receipt gate is unavailable")?;
+        let file = crate::metadata_io::open_regular(&gate)
+            .map_err(|_| "creation receipt gate cannot be opened")?;
+        let _held =
+            crate::lock::Flock::try_lock(file).map_err(|_| "creation receipt gate is busy")?;
+        super::creation::finish(home, &path, &receipt)
+            .ok_or("interrupted package creation cannot be proved")?;
+        true
+    } else {
+        false
+    };
+    let prior_records = policies(home, args.cache)?;
+    if prior_records.iter().any(|(_, receipt)| {
+        receipt.pending.is_some()
+            && receipt
+                .package
+                .as_ref()
+                .is_some_and(|policy| policy.declaration.same_family(&declaration))
+    }) {
         return Err("an unfinished retirement keeps the package generation".into());
     }
     let mut idempotent = None;
@@ -675,6 +858,24 @@ fn admit_on(
             .package
             .as_ref()
             .ok_or("package policy disappeared")?;
+        if !before.declaration.same_coordinator(&declaration) {
+            return Err("package policy coordinator changed".into());
+        }
+        if before.last_settled.as_deref() == Some(args.attempt) {
+            return Err("package attempt already settled".into());
+        }
+        if !before.declaration.same_family(&declaration) {
+            if before
+                .active
+                .as_ref()
+                .is_some_and(|active| active.token == args.attempt)
+            {
+                return Err(
+                    "package attempt was reused for another preservation declaration".into(),
+                );
+            }
+            continue;
+        }
         if before.declaration != declaration
             || receipt.owners_unknown
             || receipt.owners.is_empty()
@@ -693,7 +894,6 @@ fn admit_on(
                 || active.producer != producer
                 || active.workspace != workspace
                 || !super::same(home, &receipt)
-                || !receipt.owners.contains(&workspace)
             {
                 return Err("package attempt was reused for another producer or target".into());
             }
@@ -724,10 +924,13 @@ fn admit_on(
         }
     }
     if let Some(result) = idempotent {
-        return supersede
-            .is_empty()
-            .then_some(result)
-            .ok_or_else(|| "another materialized package generation must retire first".into());
+        return (supersede.is_empty()
+            && declaration
+                .preserve_if_present
+                .as_ref()
+                .is_some_and(PreserveIfPresent::absent))
+        .then_some(result)
+        .ok_or_else(|| "another materialized package generation must retire first".into());
     }
     if !supersede.is_empty() {
         // The producer already holds the coordinator. Request retirement under each exact
@@ -741,6 +944,10 @@ fn admit_on(
             if super::read(&other_path).as_ref() != Some(&receipt)
                 || !super::same(home, &receipt)
                 || !held_coordinator(home, &declaration)
+                || !receipt
+                    .package
+                    .as_ref()
+                    .is_some_and(Policy::retirement_allowed)
             {
                 return Err("package generation changed before retirement request".into());
             }
@@ -778,7 +985,7 @@ fn admit_on(
             .and_then(|policy| policy.last_settled.clone()),
         active: Some(Attempt {
             token: args.attempt.into(),
-            producer,
+            producer: producer.clone(),
             workspace: workspace.clone(),
             fresh: false,
         }),
@@ -787,6 +994,7 @@ fn admit_on(
     let (recorded, created) =
         super::create_with_policy(home, args.target, &workspace, Some(policy.clone()))
             .map_err(|_| "package cache owner publication refused")?;
+    let created = created || recovered_creation;
     if !recorded {
         return Ok(legacy(args.target, false));
     }
@@ -800,15 +1008,16 @@ fn admit_on(
         return Ok(legacy(args.target, created));
     };
     if current.declaration != declaration
-        || current
-            .active
-            .as_ref()
-            .is_some_and(|attempt| attempt.token != args.attempt)
+        || current.active.as_ref().is_some_and(|attempt| {
+            attempt.token != args.attempt
+                || attempt.workspace != workspace
+                || attempt.producer != producer
+        })
         || receipt.pending.is_some()
         || receipt.owners_unknown
-        || !receipt.owners.contains(&workspace)
         || !super::same(home, &receipt)
         || !held_coordinator(home, &declaration)
+        || !current.retirement_allowed()
     {
         return Err("package cache changed during owner publication".into());
     }
@@ -832,6 +1041,19 @@ fn settled_on(
     kernel: &dyn Kernel,
     fence: &super::super::fence::Fence<'_>,
 ) -> Result<aterm_json::Value, String> {
+    settled_with(home, cache, attempt, success, kernel, fence, false)
+}
+
+#[cfg(unix)]
+fn settled_with(
+    home: &Path,
+    cache: &Path,
+    attempt: &str,
+    success: bool,
+    kernel: &dyn Kernel,
+    fence: &super::super::fence::Fence<'_>,
+    absent_allowed: bool,
+) -> Result<aterm_json::Value, String> {
     if !token(attempt) {
         return Err("package settlement needs an exact attempt".into());
     }
@@ -844,6 +1066,24 @@ fn settled_on(
             .package
             .as_ref()
             .ok_or("package policy disappeared")?;
+        if !policy
+            .active
+            .as_ref()
+            .is_some_and(|active| active.token == attempt)
+            && !(policy.active.is_none() && policy.last_settled.as_deref() == Some(attempt))
+        {
+            continue;
+        }
+        // Legacy custody can still settle after a helper upgrade. A new guarded attempt
+        // cannot publish a successful baseline while preservation is requested or unknown.
+        if policy
+            .declaration
+            .preserve_if_present
+            .as_ref()
+            .is_some_and(|guard| !guard.absent())
+        {
+            return Err("package preservation marker or its parent keeps the generation".into());
+        }
         if !held_coordinator(home, &policy.declaration) {
             return Err("package settlement must remain inside its producer guardian".into());
         }
@@ -878,6 +1118,11 @@ fn settled_on(
         if !fence.clear(&receipt.root, &receipt.root)
             || !held_coordinator(home, &policy.declaration)
             || super::read(&path).as_ref() != Some(&receipt)
+            || policy
+                .declaration
+                .preserve_if_present
+                .as_ref()
+                .is_some_and(|guard| !guard.absent())
         {
             return Err("package target remains in use or was replaced".into());
         }
@@ -888,6 +1133,14 @@ fn settled_on(
             .package
             .as_mut()
             .ok_or("package policy disappeared")?;
+        if policy
+            .declaration
+            .preserve_if_present
+            .as_ref()
+            .is_some_and(|guard| !guard.absent())
+        {
+            return Err("package preservation marker or its parent keeps the generation".into());
+        }
         if let Some(bytes) = measured {
             policy.learned_budget = Some(
                 policy
@@ -904,7 +1157,11 @@ fn settled_on(
             aterm_json::json!({"status":"settled","budgeted":true,"attempt":attempt,"budget_bytes":budget,"learned":measured.is_some()}),
         );
     }
-    Err("package settlement names no current attempt".into())
+    if absent_allowed {
+        Ok(aterm_json::json!({"status":"absent","budgeted":true,"attempt":attempt}))
+    } else {
+        Err("package settlement names no current attempt".into())
+    }
 }
 
 #[cfg(unix)]
@@ -951,6 +1208,11 @@ fn capability(path: &Path, pkg: bool) -> bool {
 /// provide pre-registration. Ambiguity keeps a fresh target on the legacy v1 flow.
 #[cfg(unix)]
 fn compatible(home: &Path, driver: &Path, registrar: Option<&Path>) -> bool {
+    compatible_on(home, driver, registrar, false)
+}
+
+#[cfg(unix)]
+fn compatible_on(home: &Path, driver: &Path, registrar: Option<&Path>, in_process: bool) -> bool {
     use std::io::Read as _;
     if !driver.is_absolute() {
         return false;
@@ -1008,12 +1270,16 @@ fn compatible(home: &Path, driver: &Path, registrar: Option<&Path>) -> bool {
             && discovered.targo.canonicalize().ok().as_ref() == Some(&driver)
             && executable_stamp(&registrar).as_ref() == Some(&stamp)
             && executable_stamp(&physical_entry).as_ref() == Some(&stamp)
-            && capability(
-                &entry,
-                std::env::args_os().nth(1).is_some_and(|word| word == "pkg"),
-            )
+            && (in_process
+                || capability(
+                    &entry,
+                    std::env::args_os().nth(1).is_some_and(|word| word == "pkg"),
+                ))
             && executable_stamp(&registrar).as_ref() == Some(&stamp)
     } else {
+        if in_process {
+            return false;
+        }
         let Ok(text) = std::str::from_utf8(&head) else {
             return false;
         };
@@ -1076,6 +1342,11 @@ fn compact(
                                 })))
             })
     });
+    // What the pass kept, its intent closed with nothing of it gone, was not retired.
+    let removed: Vec<_> = removed
+        .into_iter()
+        .filter(|(_, why)| !why.nothing_went())
+        .collect();
     let status = if !removed.is_empty() && pending == 0 {
         "retired"
     } else if pending > 0 || unsettled || busy {
@@ -1090,6 +1361,11 @@ fn compact(
 
 #[cfg(unix)]
 fn invoke(args: &[std::ffi::OsString]) -> Result<aterm_json::Value, String> {
+    invoke_on(args, false)
+}
+
+#[cfg(unix)]
+fn invoke_on(args: &[std::ffi::OsString], in_process: bool) -> Result<aterm_json::Value, String> {
     let Some(verb) = args.first().and_then(|word| word.to_str()) else {
         return Err("package cache verb missing".into());
     };
@@ -1108,6 +1384,7 @@ fn invoke(args: &[std::ffi::OsString]) -> Result<aterm_json::Value, String> {
                 "--cache"
                     | "--target-dir"
                     | "--manifest-path"
+                    | "--preserve-if-present"
                     | "--budget-bytes"
                     | "--attempt"
                     | "--producer-pid"
@@ -1151,37 +1428,77 @@ fn invoke(args: &[std::ffi::OsString]) -> Result<aterm_json::Value, String> {
     match verb {
         "compact" => Ok(compact(&home, &cache, &fence)
             .unwrap_or_else(|reason| aterm_json::json!({"status":"deferred","reason":reason}))),
-        "settled" => settled_on(&home, &cache, text("--attempt")?, success, &Live, &fence),
+        "settled" => {
+            if in_process {
+                settled_with(
+                    &home,
+                    &cache,
+                    text("--attempt")?,
+                    success,
+                    &Live,
+                    &fence,
+                    true,
+                )
+            } else {
+                settled_on(&home, &cache, text("--attempt")?, success, &Live, &fence)
+            }
+        }
         "admit" => {
             let target = path("--target-dir")?;
             let manifest = path("--manifest-path")?;
+            let preserve_if_present = path("--preserve-if-present")?;
             let driver = path("--compiler-driver")?;
             let registrar = values.get("--registrar").map(|value| PathBuf::from(*value));
+            let parse_u64 = |flag, err| -> Result<u64, String> {
+                let s = text(flag)?;
+                if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(String::from(err));
+                }
+                s.parse().map_err(|_| String::from(err))
+            };
+            let parse_u32 = |flag, err| -> Result<u32, String> {
+                let s = text(flag)?;
+                if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(String::from(err));
+                }
+                s.parse().map_err(|_| String::from(err))
+            };
             let args = Admission {
                 cache: &cache,
                 target: &target,
                 manifest: &manifest,
-                budget: text("--budget-bytes")?
-                    .parse()
-                    .map_err(|_| "package budget is invalid")?,
+                preserve_if_present: &preserve_if_present,
+                budget: parse_u64("--budget-bytes", "package budget is invalid")?,
                 attempt: text("--attempt")?,
-                producer_pid: text("--producer-pid")?
-                    .parse()
-                    .map_err(|_| "package producer PID is invalid")?,
-                producer_group: text("--producer-group")?
-                    .parse()
-                    .map_err(|_| "package producer group is invalid")?,
+                producer_pid: parse_u32("--producer-pid", "package producer PID is invalid")?,
+                producer_group: parse_u32("--producer-group", "package producer group is invalid")?,
             };
-            admit_on(
-                &home,
-                &args,
-                compatible(&home, &driver, registrar.as_deref()),
-                &Live,
-                &fence,
-            )
+            let supported = if in_process {
+                compatible_on(&home, &driver, registrar.as_deref(), true)
+            } else {
+                compatible(&home, &driver, registrar.as_deref())
+            };
+            if in_process && !supported {
+                return Err("local package registration requires this image and its discovered raw Trust driver".into());
+            }
+            admit_on(&home, &args, supported, &Live, &fence)
         }
         _ => Err("unknown package cache verb".into()),
     }
+}
+
+/// The same v2 package protocol for a Rust producer linked to this library. Raw-driver
+/// pre-registration still binds the actual discovered Trust driver, explicit registrar,
+/// current executable and absolute argv0 by file identity; the current library supplies
+/// its protocol implementation directly instead of executing its own capability verb.
+/// Script drivers keep their external registrar contract and are refused by this entry.
+/// This API supplies no guardian: coordinator ownership, actual producer/group identity,
+/// source custody, preservation and complete retirement checks remain unchanged.
+/// # Errors
+/// The protocol's parse, ownership, compatibility, admission or settlement refusal.
+#[cfg(unix)]
+pub fn request_local(args: &[std::ffi::OsString]) -> Result<aterm_json::Value, String> {
+    invoke_on(args, true)
 }
 
 /// Internal producer protocol. This never runs global machine maintenance or chooses a

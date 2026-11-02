@@ -36,6 +36,7 @@ fn the_defaults_fill_what_the_words_leave_out() {
         (true, Log::Auto, None),
         "what ships: the default rules at every open, the auto mirror, astream's minute"
     );
+    assert!(spec.at_rest, "what ships: a fabric root's log is sealed");
     let again = parse(&format!("out=/tmp/x {}", spec.words())).expect("round trip");
     assert_eq!(again, spec);
 }
@@ -305,4 +306,57 @@ fn the_attach_backlog_is_named_only_when_set_and_reproduces() {
         let err = parse(&format!("out=/o {bad}")).expect_err(bad);
         assert!(err.contains("backlog="), "{bad}: {err}");
     }
+}
+
+/// C04's knob: the ask world's asked table pre-filled, named only when it
+/// is there, so every entry without it keeps its words.
+#[test]
+fn the_asked_prefill_is_named_only_when_set_and_reproduces() {
+    let bare = parse("out=/o").expect("bare");
+    assert_eq!(bare.asked_prefill, 0);
+    assert!(!bare.words().contains("asked_prefill"), "{}", bare.words());
+    for (words, rows) in [
+        ("asked_prefill=0", 0),
+        ("scenario=ask asked_prefill=1", 1),
+        (
+            &*format!("scenario=ask asked_prefill={ASKED_PREFILL_MAX}"),
+            ASKED_PREFILL_MAX,
+        ),
+    ] {
+        let spec = parse(&format!("out=/o {words}")).expect(words);
+        assert_eq!(spec.asked_prefill, rows, "{words}");
+        assert_eq!(
+            spec.words().contains(&format!(" asked_prefill={rows}")),
+            rows > 0,
+            "{words}"
+        );
+        assert_eq!(
+            parse(&format!("out=/o {}", spec.words())).expect("round trip"),
+            spec,
+            "{words}"
+        );
+    }
+    for bad in [
+        "asked_prefill=-1",
+        "asked_prefill=many",
+        &*format!("scenario=ask asked_prefill={}", ASKED_PREFILL_MAX + 1),
+        "scenario=attach asked_prefill=10",
+        "scenario=messaging asked_prefill=10",
+    ] {
+        let err = parse(&format!("out=/o {bad}")).expect_err(bad);
+        assert!(err.contains("asked_prefill="), "{bad}: {err}");
+    }
+}
+
+/// `at_rest=` reads, a plain run is sealed as what ships is, every entry says which it measured,
+/// and a word it does not know is refused.
+#[test]
+fn the_at_rest_word_round_trips() {
+    let plain = parse("out=/tmp/x").expect("parses");
+    assert!(plain.at_rest, "what ships");
+    assert!(plain.words().contains(" at_rest=on"), "{}", plain.words());
+    let off = parse("out=/tmp/x at_rest=off").expect("parses");
+    assert!(!off.at_rest);
+    assert!(off.words().contains(" at_rest=off"), "{}", off.words());
+    assert!(parse("out=/tmp/x at_rest=sealed").is_err());
 }

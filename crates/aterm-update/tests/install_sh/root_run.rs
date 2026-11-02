@@ -1220,10 +1220,14 @@ fn a_root_runs_bundle_gives_its_folders_group_write_alone() {
     let scratch = Scratch::new();
     let tmp = scratch.join("tmp");
     let mut lib = Lib::new();
+    // Model the archive's explicit modes under a private caller umask. The
+    // ownership pass narrows write access; it does not invent archive read bits.
     lib.step(
-        "chown() { :; }; mk() { mkdir -p \"$1/Contents/MacOS\" \"$1/Contents/Resources\" && \
+        "umask 077; chown() { :; }; mk() { mkdir -p \"$1/Contents/MacOS\" \"$1/Contents/Resources\" && \
+         chmod 755 \"$1\" \"$1/Contents\" \"$1/Contents/MacOS\" \"$1/Contents/Resources\" && \
          printf '#!/bin/sh\\n' >\"$1/Contents/MacOS/aterm\" && chmod 775 \"$1/Contents/MacOS/aterm\" && \
-         : >\"$1/Contents/Info.plist\" && : >\"$1/Contents/Resources/r\" && \
+         : >\"$1/Contents/Info.plist\" && chmod 644 \"$1/Contents/Info.plist\" && \
+         : >\"$1/Contents/Resources/r\" && \
          chmod 664 \"$1/Contents/Resources/r\"; }; \
          mkdir -p \"$TMPDIR/admin\" \"$TMPDIR/own\" && chmod 775 \"$TMPDIR/admin\" && chmod 755 \"$TMPDIR/own\" && \
          mk \"$TMPDIR/admin/aterm.app.installing.x\" && mk \"$TMPDIR/own/aterm.app.installing.x\" && \

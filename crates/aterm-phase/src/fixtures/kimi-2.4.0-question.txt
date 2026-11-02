@@ -1,0 +1,33 @@
+# kimi 2.4.0 · MEASURED 2026-10-29, `aterm ctl text` of a private headless aterm (110x32, aterm 0.146.0) running the real Kimi Code, launched by path with a scratch `HOME` and `KIMI_CODE_HOME` whose `config.toml` names one `openai`-type provider at `http://127.0.0.1:<port>/v1` with a fake key (a local stub of the Chat Completions API, crates/aterm-lab), no login · the stub calls `AskUserQuestion` with one question, two options (mode ask): the `question` card with a `Colour | Submit` tab row, `→ [1] Red (Recommended)` selected and an `Other` row Kimi adds
+
+   Approved: Running: echo lab-kimi-tool
+
+ ● lab tool turn done
+
+ ❯ lab run another shell command
+
+ ✗ Ran a command · $ echo lab-kimi-reject
+   Tool "Bash" was not run because the user rejected the approval request.
+
+   Rejected: Running: echo lab-kimi-reject
+
+ ● lab after the rejection
+
+ ❯ lab ask me a question
+ ────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  question
+
+   Colour    Submit
+
+  ? Which lab colour should the marker use?
+
+   → [1] Red (Recommended)
+         the lab default
+     [2] Blue
+         the other one
+     [3] Other
+
+   ↑↓ select  1-3 / ↵ choose  ←/→/tab switch  esc cancel
+ ────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ lab-model  …/tmp/at.H2aa/proj        /goal next to queue follow-up work while the current goal keeps running
+                                                                                   context: 22% (21.2k/97.7k)

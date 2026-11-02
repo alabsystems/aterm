@@ -642,6 +642,49 @@ fn held_rows(v: &JobsView) -> Vec<(u32, u64, Option<u64>)> {
 }
 
 #[test]
+fn an_unproved_fallback_does_not_lend_its_wait_to_an_exec_version() {
+    let mut w = World::new();
+    w.versions = false;
+    w.add(held_orphan(7001, "gh", true));
+    let _ = w.observe();
+    let before = w.tick(TICK_MS);
+    let old = &before.findings.program_check[0];
+    assert_eq!(
+        old.for_ms, TICK_MS,
+        "the fallback keeps its descriptive duration"
+    );
+    assert_eq!(old.exec_version, None);
+    let opened = before
+        .findings
+        .program_check_episode
+        .expect("the queue is backed up")
+        .opened_ms;
+    let version = w.p(7001).exec;
+    w.versions = true;
+    let proved = w.tick(TICK_MS);
+    let current = &proved.findings.program_check[0];
+    assert_eq!(current.exec_version, Some(version));
+    assert_eq!(
+        current.for_ms, 0,
+        "the same numeric fallback is no prior exec proof"
+    );
+    assert_eq!(
+        proved
+            .findings
+            .program_check_episode
+            .expect("the same queue episode")
+            .opened_ms,
+        opened,
+        "the queue episode does not follow per-process exec identity"
+    );
+    let next = w.tick(TICK_MS);
+    assert_eq!(
+        next.findings.program_check[0].for_ms, TICK_MS,
+        "the unchanged actual exec ages"
+    );
+}
+
+#[test]
 fn held_rows_count_from_their_first_sighting_and_open_one_episode_when_backed_up() {
     let mut w = World::new();
     let mut gh = sleeper(401, "gh");
@@ -739,6 +782,139 @@ fn held_rows_count_from_their_first_sighting_and_open_one_episode_when_backed_up
     );
 }
 
+/// A held program outside every job that only a session-mate's environment ties to tab 1 (the
+/// host's leftover reader reads the tie; the held program's own environment is never read)
+/// counts in that tab's `status program_check=`, as a held member of its jobs does. NEGATIVE
+/// CONTROL: name a held row by its job's tab alone (drop `.or(h.tab)` in the engine), and it
+/// counts for no tab.
+#[test]
+fn the_held_row_tied_by_a_session_mate_counts_in_the_tabs_program_check() {
+    use aterm_vitals::sys::jobs_view::program_check_field;
+    let mut w = World::new();
+    let mut tied = held_orphan(7001, "python3", false);
+    tied.tie = Some(1);
+    w.add(tied);
+    let v = w.observe();
+    assert_eq!(held_rows(&v), vec![(7001, 0, Some(1))]);
+    assert_eq!(
+        program_check_field(Some(&v), &[1], 2_000),
+        "program_check=1:2000"
+    );
+}
+
+/// A held program outside every job that nothing ties counts for no tab.
+#[test]
+fn a_held_row_with_no_mate_counts_for_no_tab() {
+    use aterm_vitals::sys::jobs_view::program_check_field;
+    let mut w = World::new();
+    w.add(held_orphan(7001, "python3", false));
+    let v = w.observe();
+    assert_eq!(held_rows(&v), vec![(7001, 0, None)]);
+    assert_eq!(
+        program_check_field(Some(&v), &[1], 2_000),
+        "program_check=0"
+    );
+}
+
+/// A HELD PROGRAM ATERM STARTED AFTER ITS DEVELOPER TOOLS GRANT TOOK COUNTS AGAINST THE GRANT:
+/// once a refresh took, macOS checks no new program aterm starts, so one held means the grant did
+/// not take. A program started before the grant may still wait, one aterm did not start is not
+/// the grant's, and a tab adopted from another aterm process may be checked whatever the grant
+/// says, so neither of those counts, and neither does a row outside every tab while any tab is
+/// adopted (it may be that tab's). With no grant time known nothing counts.
+#[test]
+fn a_held_program_started_after_the_grant_counts_against_it() {
+    let world = |adopted: bool| {
+        let mut w = World::new();
+        w.shell_tab(2, 2, 210);
+        w.tab(2).tab.adopted = adopted;
+        let grant = w.at - 60_000;
+        w.grant_ms = Some(grant);
+        let held = |pid, name, born| {
+            let mut p = sleeper(pid, name);
+            p.held = true;
+            p.born = Some(born);
+            p
+        };
+        w.call(1, 300, 400, held(401, "gh", grant + 1_000), None);
+        w.call(1, 300, 600, held(601, "make", grant - 1_000), None);
+        w.call(2, 310, 500, held(501, "git", grant + 1_000), None);
+        for (pid, name, aterm) in [(7001, "agy", true), (7002, "python3", false)] {
+            let mut orphan = held_orphan(pid, name, aterm);
+            orphan.born = Some(grant + 1_000);
+            w.add(orphan);
+        }
+        w
+    };
+    let mut w = world(true);
+    let v = w.observe();
+    assert_eq!(
+        held_rows(&v).len(),
+        5,
+        "every row is held: {:?}",
+        held_rows(&v)
+    );
+    assert_eq!(
+        v.findings.program_check_after_grant, 1,
+        "only the one aterm started after the grant in a tab not adopted"
+    );
+    let v = w.tick(TICK_MS);
+    assert_eq!(v.findings.program_check_after_grant, 1);
+    let mut w = world(false);
+    let _ = w.observe();
+    let v = w.tick(TICK_MS);
+    assert_eq!(
+        v.findings.program_check_after_grant, 3,
+        "no tab adopted: the second tab's, and aterm's row outside every tab"
+    );
+    w.grant_ms = None;
+    let v = w.tick(TICK_MS);
+    assert_eq!(
+        v.findings.program_check_after_grant, 0,
+        "no grant time: nothing counts against it"
+    );
+    assert_eq!(
+        v.findings.program_check_aterm.0, 4,
+        "aterm's are still held"
+    );
+}
+
+/// A TAB ADOPTED FROM ANOTHER ATERM PROCESS STAYS ADOPTED AFTER IT CLOSES: what its programs
+/// left running is still that tab's, so a held one never counts against the grant, neither
+/// while the unit it outlived keeps the closed tab's key nor once it is in no unit.
+#[test]
+fn a_program_an_adopted_tab_left_behind_never_counts_against_the_grant() {
+    let mut w = World::new();
+    w.shell_tab(2, 2, 210);
+    w.tab(2).tab.adopted = true;
+    let grant = w.at - 60_000;
+    w.grant_ms = Some(grant);
+    let mut git = sleeper(501, "git");
+    git.held = true;
+    git.aterm = true;
+    git.born = Some(grant + 1_000);
+    w.call(2, 310, 500, git, None);
+    let v = w.observe();
+    assert_eq!(held_rows(&v), [(501, 0, Some(2))]);
+    assert_eq!(
+        v.findings.program_check_after_grant, 0,
+        "in the adopted tab"
+    );
+    w.tabs.retain(|t| t.tab.key != 2);
+    w.exit(210, false);
+    w.exit(310, false);
+    w.p(500).ppid = 1;
+    for pass in 1..=4 {
+        let v = w.tick(TICK_MS);
+        assert_eq!(
+            v.findings.program_check_after_grant,
+            0,
+            "pass {pass} after the adopted tab closed: {:?}",
+            held_rows(&v)
+        );
+    }
+}
+
 #[test]
 fn a_held_program_leaves_demand_to_the_jobs() {
     let mut w = World::new();
@@ -762,14 +938,18 @@ fn a_held_finding_prints_one_row_with_its_age() {
         program_check: vec![
             Named {
                 pid: 25311,
+                exec_version: None,
                 name: "gh".into(),
                 tab: None,
+                job: None,
                 for_ms: 35_940_000,
             },
             Named {
                 pid: 72969,
+                exec_version: None,
                 name: "reroute codex\u{1b}[31m".into(),
                 tab: Some(3),
+                job: None,
                 for_ms: 1_140_000,
             },
         ],
@@ -786,8 +966,64 @@ fn a_held_finding_prints_one_row_with_its_age() {
     );
 }
 
-/// An x86_64 orphan Rosetta translates and one on a volume not proven local are named by their own
-/// kind (`translating`, `not-started`) from their first sighting, and neither counts as held nor
+/// A HELD FINDING NAMES THE KIND OF JOB IT IS A MEMBER OF: a held member of a live agent call
+/// reads `AgentCall`, and so does one an ended call left behind (its orphan unit, named by the job
+/// it outlived); one of a shell's foreground job reads `Shell`, and so does one the person's ended
+/// job left behind; a held row outside every job reads none. The harness's facts read it: an
+/// agent is told only of the programs held in its own calls and what they left, never of the
+/// person's.
+#[test]
+fn a_held_finding_names_the_kind_of_job_it_is_in() {
+    let mut w = World::new();
+    w.shell_tab(2, 2, 210);
+    w.shell_tab(3, 3, 230);
+    w.shell_tab(4, 4, 240);
+    w.call(1, 300, 400, sleeper(401, "gh"), None);
+    w.call(2, 310, 500, sleeper(501, "git-remote-https"), None);
+    w.run_fg(3, 51, "make", sleeper(2301, "cc"));
+    w.run_fg(4, 61, "git push", sleeper(2400, "git"));
+    let mut helper = Proc::new(2401, 2400, "git-remote-https");
+    helper.pgid = 2400;
+    helper.sid = 240;
+    helper.tty = true;
+    w.add(helper);
+    let _ = run_to(&mut w, 4_000, |_, _| {});
+    w.exit(500, false);
+    w.p(501).ppid = 1;
+    w.exit(2400, false);
+    w.p(2401).ppid = 1;
+    w.close_block(4, 130);
+    let _ = w.tick(TICK_MS);
+    let v = w.tick(TICK_MS);
+    for orphan in ["o501", "o2401"] {
+        assert!(v.row(orphan).is_some(), "{orphan}: {:?}", v.rows);
+    }
+    for pid in [401, 501, 2301, 2401] {
+        w.p(pid).held = true;
+    }
+    w.add(held_orphan(7001, "gh", true));
+    let v = w.tick(TICK_MS);
+    let kinds: Vec<(u32, Option<u64>, Option<JobKind>)> = v
+        .findings
+        .program_check
+        .iter()
+        .map(|n| (n.pid, n.tab, n.job))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            (401, Some(1), Some(JobKind::AgentCall)),
+            (501, Some(2), Some(JobKind::AgentCall)),
+            (2301, Some(3), Some(JobKind::Shell)),
+            (2401, Some(4), Some(JobKind::Shell)),
+            (7001, None, None),
+        ]
+    );
+}
+
+/// An x86_64 orphan Rosetta translates, one on a volume not proven local, and one that reads
+/// stopped or traced are named by their own kind (`translating`, `not-started`,
+/// `stopped-unstarted` with what it read) from their first sighting, and none counts as held nor
 /// opens a program-check episode.
 #[test]
 fn a_translating_or_unstarted_row_is_named_by_its_wait_and_opens_no_episode() {
@@ -797,6 +1033,22 @@ fn a_translating_or_unstarted_row_is_named_by_its_wait_and_opens_no_episode() {
         (7010, "x86tool", StartWait::Translating),
         (7011, "nfsprog", StartWait::NotStarted),
         (7012, "smbprog", StartWait::NotStarted),
+        (
+            7013,
+            "spawned",
+            StartWait::StoppedUnstarted {
+                stopped: true,
+                traced: false,
+            },
+        ),
+        (
+            7014,
+            "debuggee",
+            StartWait::StoppedUnstarted {
+                stopped: false,
+                traced: true,
+            },
+        ),
     ] {
         let mut p = held_orphan(pid, name, true);
         p.wait = wait;
@@ -810,6 +1062,14 @@ fn a_translating_or_unstarted_row_is_named_by_its_wait_and_opens_no_episode() {
         rows(&v.findings.not_started),
         [(7011, TICK_MS), (7012, TICK_MS)]
     );
+    assert_eq!(
+        v.findings
+            .stopped_unstarted
+            .iter()
+            .map(|s| (s.named.pid, s.named.for_ms, s.stopped, s.traced))
+            .collect::<Vec<_>>(),
+        [(7013, TICK_MS, true, false), (7014, TICK_MS, false, true)]
+    );
     assert!(v.findings.program_check.is_empty(), "{:?}", v.findings);
     assert_eq!(v.findings.program_check_aterm, (0, 0));
     assert_eq!(
@@ -820,15 +1080,96 @@ fn a_translating_or_unstarted_row_is_named_by_its_wait_and_opens_no_episode() {
     for line in [
         "finding kind=translating pid=7010 exe=x86tool for_ms=2000",
         "finding kind=not-started pid=7011 exe=nfsprog for_ms=2000",
+        "finding kind=stopped-unstarted pid=7013 exe=spawned stopped=yes traced=no for_ms=2000",
+        "finding kind=stopped-unstarted pid=7014 exe=debuggee stopped=no traced=yes for_ms=2000",
     ] {
         assert!(lines.contains(&line.to_owned()), "{lines:?}");
     }
 }
 
+/// A stopped-unstarted row keeps its time while what it reads changes: a debugger that attaches to
+/// a start-suspended spawn (stopped, then stopped and traced) has not let it run, so its `for_ms`
+/// counts on from its first sighting and its bits are this reading's. NEGATIVE CONTROL: key the
+/// time by the bits too, and the attach starts it again at 0.
+#[test]
+fn a_stopped_unstarted_row_keeps_its_time_when_a_debugger_attaches() {
+    use aterm_vitals::jobs::StartWait;
+    let mut w = World::new();
+    let mut p = held_orphan(7020, "spawned", true);
+    p.wait = StartWait::StoppedUnstarted {
+        stopped: true,
+        traced: false,
+    };
+    w.add(p);
+    w.observe();
+    let rows = |v: &JobsView| {
+        v.findings
+            .stopped_unstarted
+            .iter()
+            .map(|s| (s.named.pid, s.named.for_ms, s.stopped, s.traced))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(rows(&w.tick(TICK_MS)), [(7020, TICK_MS, true, false)]);
+    w.p(7020).wait = StartWait::StoppedUnstarted {
+        stopped: true,
+        traced: true,
+    };
+    assert_eq!(rows(&w.tick(TICK_MS)), [(7020, 2 * TICK_MS, true, true)]);
+}
+
+/// The host may hand its unstarted rows in any order: each kind's findings list by pid.
+/// NEGATIVE CONTROL: drop a kind's sort, and its rows list in the order they came.
+#[test]
+fn unstarted_findings_list_by_pid_whatever_order_they_come_in() {
+    use aterm_vitals::jobs::{HeldProc, JobTick, Jobs, StartWait};
+    let row = |pid, wait| HeldProc {
+        pid,
+        exec: u64::from(pid),
+        exec_version: Some(u64::from(pid)),
+        name: format!("p{pid}"),
+        aterm: true,
+        wait,
+        tab: None,
+        started_ms: None,
+    };
+    let su = |stopped, traced| StartWait::StoppedUnstarted { stopped, traced };
+    let held = vec![
+        row(7034, su(true, false)),
+        row(7033, su(false, true)),
+        row(7032, StartWait::NotStarted),
+        row(7031, StartWait::NotStarted),
+        row(7030, StartWait::Translating),
+        row(7029, StartWait::Translating),
+        row(7028, StartWait::ProgramCheck),
+        row(7027, StartWait::ProgramCheck),
+    ];
+    let v = Jobs::new().absorb(&JobTick {
+        at_ms: 1_000,
+        read_ms: 1_000,
+        probe_ms: 1_000,
+        self_uid: Some(world::UID),
+        held,
+        ..JobTick::default()
+    });
+    let pids = |list: &[Named]| list.iter().map(|n| n.pid).collect::<Vec<_>>();
+    let f = &v.findings;
+    assert_eq!(pids(&f.program_check), [7027, 7028]);
+    assert_eq!(pids(&f.translating), [7029, 7030]);
+    assert_eq!(pids(&f.not_started), [7031, 7032]);
+    assert_eq!(
+        f.stopped_unstarted
+            .iter()
+            .map(|s| s.named.pid)
+            .collect::<Vec<_>>(),
+        [7033, 7034]
+    );
+}
+
 /// Inside a backed-up episode, a started member that holds a fresh dylib open and used no CPU since
 /// the reading before is named "probably waiting for the same check" (a heuristic); never outside
 /// an episode, at its first reading, while its CPU moves, without a fresh dylib, when the check
-/// holds it itself, or once another process took its pid.
+/// holds it itself, while Rosetta translates it (it has not started), or once another process
+/// took its pid.
 #[test]
 fn inside_an_episode_a_member_flat_on_a_fresh_dylib_probably_waits_for_the_same_check() {
     use aterm_vitals::jobs::{Fd, FdKind};
@@ -903,6 +1244,18 @@ fn inside_an_episode_a_member_flat_on_a_fresh_dylib_probably_waits_for_the_same_
     let v = w.tick(TICK_MS);
     assert_eq!(held_rows(&v)[0].0, 401, "{:?}", v.findings);
     assert_eq!(probable(&v), [], "held at the check itself");
+
+    let mut w = world(true, 0, true);
+    w.p(401).held = true;
+    w.p(401).wait = aterm_vitals::jobs::StartWait::Translating;
+    w.observe();
+    let v = w.tick(TICK_MS);
+    assert_eq!(v.findings.translating[0].pid, 401, "{:?}", v.findings);
+    assert_eq!(
+        probable(&v),
+        [],
+        "Rosetta translates it: it has not started"
+    );
 
     let mut w = world(true, 0, true);
     w.observe();
@@ -8688,5 +9041,155 @@ fn a_nested_session_takes_none_of_its_openers_echo() {
         Some(Verdict::Fine),
         "{}",
         wire(&v, "n1310")
+    );
+}
+
+/// A BUILD'S FRONT WAITING FOR ITS CLAIM READS AS ITS BUILD WAITING FOR MEMORY: a `targo`
+/// typed in front whose process is still the shim's front (`atpkg`, its arguments read as one
+/// that becomes `targo`) sits 28 minutes with no CPU, waking 40 times a second to look at the
+/// ledger (a lab run's front read `class=polling` before its wait excused that): its row names
+/// `exe=targo`, waits on `memory`, a legit wait the stall detector never counts (`phi=0
+/// verdict=fine`). Once admitted, the front execs its build: the same pid runs `targo` and its
+/// row names no wait for memory from the first reading after (a lab run's row kept `wait=memory`
+/// for one more reading under the two-reading debounce). NEGATIVE CONTROL: the same process whose arguments name no
+/// front reads `exe=atpkg`, polling, and by then the stall detector's `stuck` (as the front read
+/// before its wait excused the waking: `class=polling … verdict=stuck`).
+#[test]
+fn a_build_front_waiting_for_its_claim_reads_as_its_build_waiting_for_memory() {
+    let front = |becomes: Option<&str>| {
+        let mut w = World::new();
+        let mut p = sleeper(1000, "atpkg");
+        p.exe = Some("atpkg".to_owned());
+        p.syscalls_per_s = 40;
+        p.wakeups_per_s = 20;
+        p.becomes = becomes.map(str::to_owned);
+        p.claims_ahead = becomes.map(|_| Vec::new());
+        w.run_fg(1, 7, "targo --unverified build", p);
+        let v = run_to(&mut w, 28 * 60_000, |_, _| {});
+        (w, v)
+    };
+    let (mut w, v) = front(Some("targo"));
+    assert_eq!(
+        wire(&v, "b7"),
+        "job id=b7 kind=shell consumer=person-fg exe=targo class=waiting wait=memory quiet_ms=1680000 phi=0 verdict=fine"
+    );
+    let p = w.p(1000);
+    p.name = "targo".to_owned();
+    p.exe = Some("targo".to_owned());
+    p.becomes = None;
+    p.claims_ahead = None;
+    p.syscalls_per_s = 0;
+    p.wakeups_per_s = 0;
+    w.advance(TICK_MS);
+    let v = w.observe();
+    let admitted = wire(&v, "b7");
+    assert!(admitted.contains(" exe=targo class=waiting "), "{admitted}");
+    assert!(!admitted.contains("wait=memory"), "{admitted}");
+
+    let (_, v) = front(None);
+    let plain = wire(&v, "b7");
+    assert!(plain.contains(" exe=atpkg class=polling "), "{plain}");
+    assert!(!plain.contains("wait=memory"), "{plain}");
+    assert_eq!(
+        v.row("b7").map(|r| r.verdict),
+        Some(Verdict::Stuck),
+        "{plain}"
+    );
+}
+
+/// The front of a `targo` typed in tab 1 (pid 1000, waking 40 times a second to look at its
+/// ledger), its claim behind the one claim held by `ahead`, and tab 2's `targo build` (pid 5120)
+/// compiling, or stopped outside job control (a `kill -STOP` while it holds its terminal), read
+/// at 28 minutes.
+fn front_behind(ahead: u32, holder_stopped: bool) -> (World, JobsView) {
+    let mut w = World::new();
+    w.shell_tab(2, 2, 210);
+    let mut holder = sleeper(5120, "targo");
+    holder.child_cpu_per_s = 1_800_000_000;
+    if holder_stopped {
+        holder.state = ProcState::Stopped;
+    }
+    w.run_fg(2, 61, "targo build", holder);
+    let mut p = sleeper(1000, "atpkg");
+    p.exe = Some("atpkg".to_owned());
+    p.syscalls_per_s = 40;
+    p.wakeups_per_s = 20;
+    p.becomes = Some("targo".to_owned());
+    p.claims_ahead = Some(vec![ahead]);
+    w.run_fg(1, 7, "targo --unverified build", p);
+    let v = run_to(&mut w, 28 * 60_000, |w, rel| {
+        if !holder_stopped {
+            scenarios::churn(w, 5120, 5120, rel, "rustc");
+        }
+    });
+    (w, v)
+}
+
+/// A FRONT'S WAIT FOR MEMORY COUNTS AS THE CLAIMS AHEAD OF IT PROGRESS, as a wait on a lock counts
+/// by its holder: behind a claim whose build compiles in another tab, or one held by a process in
+/// no tab (a build outside aterm, a holder whose build is gone), its wait is legitimate and it
+/// reads fine at 28 minutes; behind a claim whose build is stopped outside job control, which
+/// will not let go, its wait can reach stuck, and does. NEGATIVE CONTROL: the same front behind
+/// that stopped build with its wait held legitimate whatever is ahead (the branch's first form,
+/// broken by hand) reads fine, and this test fails.
+#[test]
+fn a_fronts_wait_for_memory_counts_as_the_claims_ahead_of_it_progress() {
+    let (_, v) = front_behind(5120, false);
+    assert_eq!(v.row("b61").map(|r| r.class), Some(Class::Running));
+    assert_eq!(
+        wire(&v, "b7"),
+        "job id=b7 kind=shell consumer=person-fg exe=targo class=waiting wait=memory quiet_ms=1680000 phi=0 verdict=fine"
+    );
+    let (_, v) = front_behind(9999, false);
+    assert_eq!(
+        wire(&v, "b7"),
+        "job id=b7 kind=shell consumer=person-fg exe=targo class=waiting wait=memory quiet_ms=1680000 phi=0 verdict=fine",
+        "a claim no tab's job holds"
+    );
+    let (_, v) = front_behind(5120, true);
+    let holder = wire(&v, "b61");
+    assert!(holder.contains(" class=stopped stop=held "), "{holder}");
+    let front = wire(&v, "b7");
+    assert!(
+        front.contains(" exe=targo class=waiting wait=memory "),
+        "{front}"
+    );
+    assert_eq!(
+        v.row("b7").map(|r| r.verdict),
+        Some(Verdict::Stuck),
+        "{front}"
+    );
+}
+
+/// A FRONT WAITS FOR MEMORY ONLY WHILE ITS LEDGER SAYS ITS CLAIM WAITS, and not while the kernel
+/// holds it: a front whose ledger holds its claim (admitted, handing it to its holder) is named
+/// by its build and reads by its own wait, and a waiting front in an uninterruptible kernel wait
+/// past its threshold reads `kernel`, a wait that can be stuck. NEGATIVE CONTROL: the same waiting
+/// front out of the kernel's wait reads `memory`.
+#[test]
+fn a_front_waits_for_memory_only_while_its_ledger_says_its_claim_waits() {
+    let front = |claims_ahead: Option<Vec<u32>>, d_state: bool| {
+        let mut w = World::new();
+        let mut p = sleeper(1000, "atpkg");
+        p.exe = Some("atpkg".to_owned());
+        p.becomes = Some("targo".to_owned());
+        p.claims_ahead = claims_ahead;
+        p.d_state = d_state;
+        w.run_fg(1, 7, "targo --unverified build", p);
+        let v = run_to(&mut w, 120_000, |_, _| {});
+        wire(&v, "b7")
+    };
+    let held = front(None, false);
+    assert!(held.contains(" exe=targo class=waiting "), "{held}");
+    assert!(!held.contains("wait=memory"), "{held}");
+    let kernel = front(Some(Vec::new()), true);
+    assert!(
+        kernel.contains(" exe=targo class=waiting wait=kernel "),
+        "{kernel}"
+    );
+    let waiting = front(Some(Vec::new()), false);
+    assert!(
+        waiting.contains(" exe=targo class=waiting wait=memory "),
+        "{waiting}"
     );
 }

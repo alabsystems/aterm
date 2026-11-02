@@ -41,6 +41,9 @@ pub(crate) enum Claim {
     Pending { tried: Instant },
     /// Held by this loop; last set at `renewed`.
     Held { renewed: Instant },
+    /// The private hosted adapter acts only for explicitly retained duties, without taking
+    /// the external harness's full-session claim.
+    Complement,
     /// Another supervisor holds it: this loop watches only; last tried at `tried`.
     Behind { holder: String, tried: Instant },
     /// The host has no claim to take (`why`): the loop acts without one.
@@ -143,7 +146,8 @@ impl<C: Ctl> Session<'_, C> {
     /// Ordinary explicitly unclaimed calls, or a host that lacked leases from
     /// the start, keep legacy metadata behavior. Timers never use this fallback.
     pub(super) fn metadata_requires_proof(&self) -> bool {
-        self.claim_managed
+        self.setup.builtin_duties
+            || self.claim_managed
             || self.beside_self_claim()
             || !matches!(self.claim, Claim::Off | Claim::Unavailable { .. })
     }
@@ -152,6 +156,18 @@ impl<C: Ctl> Session<'_, C> {
     /// read goes straight through the recorded transport, as claim writes do.
     pub(super) fn metadata_authority(&mut self, ending: bool) -> Result<MetadataAuthority, Fail> {
         self.metadata_mode = None;
+        if self.setup.builtin_duties {
+            self.refresh_builtin_authority();
+            if matches!(self.claim, Claim::Complement)
+                && !self
+                    .duty
+                    .get()
+                    .is_some_and(|duty| self.builtin_authority.keeps(duty))
+            {
+                return Ok(MetadataAuthority::Gone);
+            }
+        }
+        let complement = matches!(self.claim, Claim::Complement);
         if self.beside_self_claim()
             || matches!(
                 self.claim,
@@ -162,7 +178,7 @@ impl<C: Ctl> Session<'_, C> {
         }
         if self.handing_over()
             || (!ending && self.stopped())
-            || !matches!(self.claim, Claim::Held { .. })
+            || !(complement || matches!(self.claim, Claim::Held { .. }))
         {
             return Ok(MetadataAuthority::Unknown);
         }
@@ -202,6 +218,23 @@ impl<C: Ctl> Session<'_, C> {
                     word => Autopilot::parse(word).map(Some),
                 },
             );
+        if complement {
+            // Metadata has no paired server revision fence. Recheck ownership here and in
+            // HostCtl immediately before the call; this is a precheck, not act admission.
+            self.refresh_builtin_authority();
+            return Ok(
+                if self.duty.revision() == self.builtin_authority.revision()
+                    && self
+                        .duty
+                        .get()
+                        .is_some_and(|duty| self.builtin_authority.keeps(duty))
+                {
+                    MetadataAuthority::Ours
+                } else {
+                    MetadataAuthority::Gone
+                },
+            );
+        }
         let Some(holder) =
             super::super::screen::status_field(&r.stdout, "supervisor").filter(|h| !h.is_empty())
         else {
@@ -310,6 +343,9 @@ impl<C: Ctl> Session<'_, C> {
             }
             return;
         }
+        if self.refresh_builtin_authority() {
+            return;
+        }
         if let Some(line) = self.try_claim() {
             say_claim(&line, review);
         }
@@ -338,17 +374,42 @@ impl<C: Ctl> Session<'_, C> {
         if self.setup.beside.is_some() {
             return;
         }
+        if self.refresh_builtin_authority() {
+            return;
+        }
         self.claimed_at_naming = true;
         if let Some(line) = self.try_claim() {
             self.claim_said.push(line);
         }
     }
 
-    /// Before a request: once [`CLAIM_RENEW`] has passed, renew a held claim or retry one another holder had; retry a pending one before every request.
-    pub(super) fn renew_claim_if_due(&mut self) {
+    /// Before a request: once [`CLAIM_RENEW`] has passed, renew a held claim or retry one another holder had; retry a pending one before every request. Returns whether a claim exchange was attempted. A hosted semantic operation keeps its captured revision until it ends.
+    pub(super) fn renew_claim_if_due(&mut self) -> bool {
         // A stopped loop gives its claim back; it renews nothing.
-        if self.stopped() {
-            return;
+        if self.stopped() || (self.setup.builtin_duties && self.duty.get().is_some()) {
+            return false;
+        }
+        if self.setup.builtin_duties
+            && matches!(
+                self.builtin_authority,
+                BuiltinAuthority::Unknown | BuiltinAuthority::Complement { taken: 1.., .. }
+            )
+        {
+            return false;
+        }
+        // A scoped owner may have left since naming. Reacquire only an empty complement's
+        // visibility lease; the server arbitrates a competing claimant and fences input.
+        if self.setup.builtin_duties
+            && matches!(
+                self.builtin_authority,
+                BuiltinAuthority::Complement { taken: 0, .. }
+            )
+            && matches!(self.claim, Claim::Complement)
+        {
+            if let Some(line) = self.try_claim() {
+                self.claim_said.push(line);
+            }
+            return true;
         }
         let last = match &self.claim {
             Claim::Held { renewed } => Some(*renewed),
@@ -357,10 +418,11 @@ impl<C: Ctl> Session<'_, C> {
             Claim::Off
             | Claim::Unavailable { .. }
             | Claim::GivenBack { .. }
-            | Claim::Beside { .. } => return,
+            | Claim::Beside { .. } => return false,
+            Claim::Complement => return false,
         };
         if last.is_some_and(|t| self.fx.since(t) < self.setup.claim_renew) {
-            return;
+            return false;
         }
         match self.set_claim() {
             Some(r) => {
@@ -374,6 +436,7 @@ impl<C: Ctl> Session<'_, C> {
                 };
             }
         }
+        true
     }
 
     /// Say what the renewals changed since the last look.
@@ -385,6 +448,22 @@ impl<C: Ctl> Session<'_, C> {
 
     /// A write a watching-only loop may not send, and an input a loop whose claim is pending may not, refused locally as the server would refuse a turn: `ERR busy supervisor=<holder>` (`-` while pending).
     pub(super) fn claim_refuses(&self, args: &[&str]) -> Option<CtlReply> {
+        if self.setup.builtin_duties && is_write(args) && matches!(self.claim, Claim::Complement) {
+            if self
+                .duty
+                .get()
+                .is_some_and(|duty| self.builtin_authority.keeps(duty))
+            {
+                return None;
+            }
+            return Some(CtlReply {
+                code: 1,
+                stdout: String::new(),
+                stderr:
+                    "aterm-ctl: ERR denied supervisor input authority (no retained semantic duty)\n"
+                        .to_string(),
+            });
+        }
         let (holder, why) = match &self.claim {
             Claim::Behind { holder, .. } | Claim::Beside { holder } if is_write(args) => {
                 (holder.as_str(), "this loop watches only")
@@ -429,6 +508,8 @@ impl<C: Ctl> Session<'_, C> {
                 None
             }
             Claim::Behind { holder, .. } | Claim::Beside { holder } => Some(holder.clone()),
+            // A complement never owns the external harness's full-session claim.
+            Claim::Complement => None,
         };
         self.claim = Claim::GivenBack { behind };
     }
@@ -436,6 +517,9 @@ impl<C: Ctl> Session<'_, C> {
     /// The park is over on a word that is not `off`: a claim it gave back ([`Self::give_back_claim`]) is taken again as at the loop's start ([`Self::take_claim`]) — held, behind another holder (said only where it is not the one the loop was behind as it parked, and a loop that yields then ends), unavailable, or pending on an outage.
     pub(super) fn retake_claim(&mut self, review: &mut dyn Review) {
         if matches!(self.claim, Claim::GivenBack { .. }) {
+            if self.setup.builtin_duties {
+                self.claim = Claim::Off;
+            }
             self.take_claim(review);
         }
     }

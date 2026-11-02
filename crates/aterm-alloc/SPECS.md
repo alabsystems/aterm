@@ -1,70 +1,42 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-alloc: spec recovery from its 57 unit tests
+# aterm-alloc: spec recovery from unit tests
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 33 tests it
-> deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
-> were taken before.
-
-> Status 2026-10-15: this is the crate's migration worklist. Each of the 18 specs below is
-> proved through Trust/Clean about the compiled Rust function, and then the tests it
-> subsumes are deleted. The 2 tests in §4 that sample no spec can be deleted now. No test
-> has been deleted yet. The crate's floor is 17 of 105 rows
-> (`crates/aterm-release/trust/floors.tsv`), and no proved row today covers any of the 55
-> spec-sample tests.
-
-Source: `crates/aterm-alloc` (read only). I read every `#[test]`
-(`src/array_vec.rs` 8, `src/small_vec.rs` 27, `tests/arrayvec_differential.rs` 12,
-`tests/panic_drop_parity.rs` 10 = 57), `src/lib.rs` (`drop_initialized`), and every function
-those tests reach. Nothing was compiled or run. The claims below come from reading the code.
-
-Result: **18 specs**, covering **55 tests**. **2 tests are not spec samples** (§4).
-
-Plan: `docs/PLAN-tests-to-specs-2026-10-15.md` (historical development plan).
-The gap numbers in the `blocking_gaps` column are the rows of §7 of
-the historical development audit `docs/AUDIT-trust-for-test-migration-2026-10-15.md`.
-Format exemplar: [crates/aterm-parser/SPECS.md](../aterm-parser/SPECS.md).
+Each §1 row states, for all inputs, a property that unit tests in `crates/aterm-alloc` sample. A row
+proved through Trust/Clean about the compiled function retires the tests it subsumes; §2 maps each
+test to its rows. The statements come from reading the code.
 
 ## 0. Notation used in the statements
 
-- `Seq(v) : List T` is the abstract contents of an `ArrayVec<T,N>` or `SmallVec<[T;N]>`.
-  For `ArrayVec` it is `buf[0..len)` read as `T`. For `SmallVec` it is `buf[0..len)` for
-  `Inline{buf,len}` and `vec` for `Heap(vec)`. `as_slice` and `Deref` return exactly `Seq(v)`.
-- `Inv_AV(v)`: `len ≤ N`, `buf[0..len)` is initialized and owned by `v`, and `buf[len..N)`
-  is not owned. `Inv_SV(v)`: either `Inline{buf,len}` with `len ≤ N` and the same prefix
-  ownership, or `Heap(vec)`. Every spec assumes `Inv` on entry and proves it on exit,
-  **including every unwinding exit**. Today every body that touches `MaybeUninit` is
-  `#[cfg_attr(trust_verify, trust::skip)]`, so `Inv` is an audited comment, not a proved fact.
+- `Seq(v) : List T` is the abstract contents of an `ArrayVec<T,N>` or `SmallVec<T,N>`: `buf[0..len)`
+  read as `T` for `ArrayVec` and for `SmallVec`'s `Inline{buf,len}`, and `vec` for `Heap(vec)`.
+  `as_slice` and `Deref` return exactly `Seq(v)`.
+- `Inv_AV(v)`: `len ≤ N`, `buf[0..len)` is initialized and owned by `v`, and `buf[len..N)` is not
+  owned. `Inv_SV(v)`: either `Inline{buf,len}` with `len ≤ N` and the same prefix ownership, or
+  `Heap(vec)`. Every spec assumes `Inv` on entry and proves it on every exit, unwinding exits included.
 - `BV_N`: a `Vec` bounded to capacity `N` under upstream arrayvec's contract (the `model` in
-  `tests/arrayvec_differential.rs`). `push`, `insert`, `extend` and `collect` panic when full.
-  `try_push` and `try_extend_from_slice` refuse. An overflowing `extend` keeps the prefix it
-  already wrote.
-- `Panics(op)`: `op` unwinds. Where a spec says so, it also gives the post-state on the
-  unwinding exit.
-- `Ledger`: the sequence of element identities whose destructor ran. `ExactlyOnce(run)` holds
-  when every element that was moved into a container and never moved out by value appears
-  exactly once in the Ledger once the container, iterator or `Drain` is gone, and no element
-  appears twice. "Moved out by value" means `pop`, `remove`, `next`/`next_back`, `into_inner`,
-  a yielded drain element, or a `try_push` `Err`. The new owner drops an element that was
-  moved out, never the container. `ExactlyOnce` also holds when one element destructor panics:
-  the bulk drop continues through slice drop glue and the panic then propagates. A second
-  panic aborts the process and is out of scope.
-- `RangeRes(len, R) = (s, e)`: start `Unbounded → 0`, `Included(i) → i`,
-  `Excluded(i) → i sat+ 1`; end `Unbounded → len`, `Included(j) → j sat+ 1`, `Excluded(j) → j`.
-- Gap `U` (proposed new §7 row): **a model of unwinding and destructors**. It covers panic
-  edges as outcomes with a post-state, `Drop` glue, `drop_in_place`, and the Ledger. The audit
-  has no such row, and 8 specs here need it. It probably belongs beside gap 8 (effects) and
-  proven-core's SemR, because it is a semantics question and not a carrier question.
-- Gap 0 (the installed seal publishes no Clean-discharged row) is listed on every spec, because
-  the audit makes it a prerequisite for every row. Gap 11 (generics) is also on every spec:
-  both containers are generic in `T` and const-generic in `N`, and a proof at one instance
-  would be a sample, not the spec.
+  `tests/arrayvec_differential.rs`). `push`, `insert`, `extend` and `collect` panic when full;
+  `try_push` and `try_extend_from_slice` refuse; an overflowing `extend` keeps the prefix it wrote.
+- `Panics(op)`: `op` unwinds. Where a spec says so, it also gives the post-state on the unwinding exit.
+- `Ledger`: the sequence of element identities whose destructor ran. `ExactlyOnce(run)`: once the
+  container, iterator or `Drain` is gone, every element moved in and never moved out by value
+  appears in the Ledger exactly once. Moving out by value is `pop`, `remove`, `next`/`next_back`,
+  `into_inner`, a yielded drain element or a `try_push` `Err`; the new owner drops that element.
+  `ExactlyOnce` also holds when one destructor panics (slice drop glue drops the rest, then the panic
+  propagates); a second panic aborts and is out of scope.
+- `RangeRes(len, R) = (s, e)`: start `Unbounded → 0`, `Included(i) → i`, `Excluded(i) → i sat+ 1`;
+  end `Unbounded → len`, `Included(j) → j sat+ 1`, `Excluded(j) → j`.
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (primary tests; secondary ones are
-in §2), `rust_features` (what the proof must handle), `blocking_gaps` (audit §7 numbers, plus `U`).
+Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (primary tests; secondary ones are in
+§2), `rust_features` (what the proof must handle), `blocking_gaps` (rows of the gap table in
+`docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7, plus `U`). Gap `U` is no audit row: a model
+of unwinding and destructors (panic edges as outcomes with a post-state, `Drop` glue,
+`drop_in_place`, the Ledger). Every row lists gap 0 (the installed seal publishes no Lean-discharged
+row) and gap 11 (both containers are generic in `T` and const-generic in `N`, so a proof at one
+instance is a sample, not the spec).
 
 ```tsv
 id	kind	functions	statement	subsumes	rust_features	blocking_gaps
@@ -87,43 +59,6 @@ sv-representation	contract	SmallVec::{new,with_capacity,push,from_vec,from_slice
 sv-into-iter	contract	IntoIterator for SmallVec, IntoIter::{next,next_back,size_hint}, ExactSizeIterator/FusedIterator for IntoIter	∀ v with Seq v = xs, it = v.into_iter(): any interleaving of next and next_back yields xs from the front and the back with no repeats, then None from both ends forever (fused). size_hint = (r, Some r) and len() = r, where r is the number not yet yielded. Representation: into_iter of an Inline vec builds IntoIterRepr::Inline { start: 0, end: |xs| } and allocates nothing; a Heap vec builds IntoIterRepr::Heap(vec.into_iter()). The representation clause is stated on the private repr, not on the #[cfg(test)] helper IntoIter::is_inline.	src/small_vec.rs::test_into_iter_inline_double_ended	mem::replace of an enum field; by-value MaybeUninit array move; cursor invariant start ≤ end ≤ N; assume_init_read; std vec::IntoIter model; Iterator/DEI traits	0,1,2,8,11
 sv-drop-exactly-once	invariant	SmallVec::clear, Drop for SmallVec, Drop for IntoIter, IntoIter::{next,next_back}, drop_initialized	Inline or spilled alike: clear sets the length to 0 before any destructor runs, then drops Seq once each, in order, with slice drop glue. If one destructor panics, the rest are still dropped and v is empty on the unwinding exit. Drop for SmallVec = clear (Vec's drop when spilled). For it = v.into_iter() under any pattern of front and back consumption, yielded elements belong to the caller, and dropping it drops exactly the un-yielded range buf[start..end] once each, also when one destructor panics. So ExactlyOnce holds for every run, and the Ledger's contents do not depend on whether v spilled.	src/small_vec.rs::into_iter_drops_each_element_exactly_once, tests/panic_drop_parity.rs::small_vec_clear_drops_each_element_once_when_a_destructor_panics, tests/panic_drop_parity.rs::small_vec_drop_drops_each_element_once_when_a_destructor_panics, tests/panic_drop_parity.rs::small_vec_into_iter_drop_drops_each_element_once_when_a_destructor_panics	drop_in_place on a raw subslice; Drop impls; std Vec/vec::IntoIter drop semantics as an assumed model; Ledger; enum arms	0,1,2,8,11,U
 ```
-
-### Distribution by kind (18)
-
-| kind | count | ids |
-|---|---|---|
-| contract | 14 | av-accessors, av-push, av-extend-overflow, av-into-inner, av-drain, av-drain-unwind, av-retain, av-retain-unwind, av-into-iter, av-clone-from, av-slice-view, capacity-error-contract, sv-representation, sv-into-iter |
-| refinement | 2 | av-refines-bounded-vec, sv-seq-contracts |
-| invariant | 2 | av-bulk-drop-exactly-once, sv-drop-exactly-once |
-
-### Gap histogram (specs blocked by each gap)
-
-| gap | specs | note |
-|---|---|---|
-| 0 | 18 | prerequisite for every row |
-| 1 | 18 | `Seq` is a List model bound to a struct/enum over `MaybeUninit` |
-| 2 | 16 | all except `av-into-inner` (by-value `self`) and `capacity-error-contract` |
-| 3 | 5 | `saturating_sub`/`saturating_add`/`min` and enum matches in bodies |
-| 4 | 1 | the master simulation composes per-op contracts |
-| 5 | 3 | quantified over op sequences or ranges |
-| 7 | 7 | `while`/`for` loops (retain, extend, spill, clone_from) |
-| 8 | 13 | unsafe block discharge: every `MaybeUninit`/raw-pointer body is `trust::skip` |
-| 11 | 18 | generic `T` and const `N` everywhere |
-| 13 | 7 | `FnMut` predicates and caller-chosen iterators (higher-order specs) |
-| U | 8 | proposed new row: unwind and destructor model |
-
-Gaps 6, 9, 10, 12, 14, 15, 16 and 17 block no spec here directly. Gap 6 matters only if a
-spec is routed through SMT instead of Clean, and gap 17 only for running the bridge lane.
-
-### Proof dependency order
-
-`Inv_AV` as a type invariant, with `av-accessors` → `av-push` and `capacity-error-contract`
-→ `av-slice-view` (the `Seq` view every later spec reads) → `av-bulk-drop-exactly-once`
-(`truncate`/`clear`/`Drop`; `drop_initialized` is shared with SmallVec) → `av-into-inner`,
-`av-drain`, `av-retain`, `av-into-iter`, `av-clone-from`, `av-extend-overflow` → the unwind
-variants (`av-drain-unwind`, `av-retain-unwind`) → `av-refines-bounded-vec`, the conjunction.
-SmallVec: `Inv_SV` → `sv-representation` (the spill preserves `Seq`) → `sv-seq-contracts` →
-`sv-into-iter` → `sv-drop-exactly-once`.
 
 ## 2. Test → spec map (TSV)
 
@@ -163,24 +98,20 @@ tests/panic_drop_parity.rs	array_vec_retain_drops_each_element_once_when_a_rejec
 
 ## 3. Coverage
 
-- 57 tests read. 55 map to one of the 18 specs. 2 are not spec samples (§4).
-- The biggest collapses: `sv-seq-contracts` (11 primary), `sv-drop-exactly-once` (11),
-  `sv-into-iter` (5), `av-drain` (4), `av-bulk-drop-exactly-once` (4), `av-retain-unwind` (3),
-  `sv-representation` (3).
-- `av-retain` has no primary test. It is the non-panicking base case that the unwind tests
-  build on, and it is written down so that `av-retain-unwind` has a lemma to extend.
-- `av-refines-bounded-vec` has only 2 primary tests, but it is the statement the whole
-  differential file samples. Once it is proved, the per-op parity tests in
-  `tests/arrayvec_differential.rs` also have no remaining job.
+- `av-accessors`, `av-push`, `sv-seq-contracts` and `sv-representation` subsume no test (`-`); later
+  rows build on them. `av-retain` has no primary test either: it is the non-panicking base case that
+  `av-retain-unwind` extends.
+- `av-refines-bounded-vec` is what the whole differential file samples: once it is proved, the
+  per-op parity tests in `tests/arrayvec_differential.rs` have no remaining job.
 
-## 4. Tests that are not spec samples
+## 4. Tests missing from §2
 
-The two tests that sampled no spec are deleted: the negative control for the `Recorder` fixture
-in `tests/panic_drop_parity.rs` (every sibling drop test already asserts the unwind and the full
-drop log) and the shim-identity check (a compile-only type equality).
-
-No test is a pure regression of a removed bug with no general property. Every panic-safety and
-drop-count test samples one of the exactly-once specs.
+- `src/lib.rs::alloc_const_helpers_round_trip` samples no row: it checks `fits_inline`,
+  `next_capacity_for` and the `encode_alloc_counts_le`/`decode_alloc_counts_le` round trip.
+- `src/small_vec.rs::into_iter_keeps_the_storage_variant` samples `sv-into-iter`'s representation
+  clause (§5.1).
+- `src/small_vec.rs::into_iter_drops_each_element_exactly_once` samples `sv-drop-exactly-once` and
+  `sv-into-iter`.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
@@ -208,29 +139,23 @@ drop-count test samples one of the exactly-once specs.
 
 ## 6. Proof order (easiest high-value first)
 
-No spec here is blocked by gap 0 alone: gaps 1 and 11 block all 18, because both containers are
-generic and their contents are a List model over a struct. So the first step is gap 11
-(per-definition proofs of generic fns) together with a struct carrier for `ArrayVec { buf, len }`
-that is length-only in its first form. With those, the order is:
+Gaps 1 and 11 block every row, so the first step is gap 11 (per-definition proofs of generic fns)
+with a struct carrier for `ArrayVec { buf, len }`, length-only at first. Then:
 
-1. **`capacity-error-contract`** (gaps 0, 1, 3, 11). Safe code with no `&mut`, no loops and no
-   unsafe. `element`/`simplify` are moves; Display/Debug are constant strings and need only a
-   Formatter model. It retires `test_capacity_error_shape`.
-2. **`av-accessors`** (gaps 0, 1, 2, 3, 11). `&self` scalar reads and one `saturating_sub`. Its
-   length half needs only a length-only carrier (what Trust has today for `Vec`), so it is the
-   first step past the crate's current floor. It fixes `len ≤ N`, the core conjunct of `Inv_AV`.
-3. **`av-push`** without its panic clause (gaps 0, 1, 2, 11). `push` and `try_push` are not
-   `trust::skip`, and the `Ok` branch is one `MaybeUninit::write` plus `len += 1` under
-   `len < N`. The overflow clause waits on gap `U`. It is the first content (not length)
-   obligation for gap 1.
-4. **`av-slice-view`** (gaps 0, 1, 2, 8, 11). This is the single unsafe fact
-   (`from_raw_parts(buf, len)` is `Seq v`) that every later spec reads. Proving it is the
-   pilot for gap 8 in this crate. It retires 2 differential tests.
-5. **`av-bulk-drop-exactly-once`** and **`sv-drop-exactly-once`** (gaps 0, 1, 2, 8, 11, U).
-   They share `drop_initialized` and the "lower len, then drop the slice" shape, so a gap `U`
-   model proved once covers both. Together they retire 15 tests, the largest single gain in the
-   crate.
-
-Then `sv-representation` → `sv-seq-contracts` (11 tests) → `sv-into-iter`, then the ArrayVec
-specs with loops and closures (`av-retain`, `av-extend-overflow`, `av-clone-from`, gaps 7 and
-13), the unwind variants, and last the master simulation `av-refines-bounded-vec`.
+1. **`capacity-error-contract`**: safe code with no `&mut`, loops or unsafe; `element`/`simplify`
+   are moves, and Display/Debug write constant strings that need only a Formatter model.
+2. **`av-accessors`**: `&self` scalar reads and one `saturating_sub`. Its length half needs only a
+   length-only carrier, and it fixes `len ≤ N`, the core conjunct of `Inv_AV`.
+3. **`av-push`** without its panic clause: `push` and `try_push` are not `trust::skip`, and the `Ok`
+   branch is one `MaybeUninit` write plus a length step under `len < N`. It is the first content
+   obligation for gap 1; the overflow clause waits on gap `U`.
+4. **`av-slice-view`**: the one unsafe fact (`from_raw_parts(buf, len)` is `Seq v`) every later spec
+   reads, and this crate's pilot for gap 8.
+5. **`av-bulk-drop-exactly-once`** and **`sv-drop-exactly-once`**: they share `drop_initialized` and
+   the "lower len, then drop the slice" shape, so one gap `U` model covers both (the into-iter clause
+   of `sv-drop-exactly-once` also needs `sv-into-iter`).
+6. ArrayVec: `av-into-inner`, `av-drain`, `av-into-iter`, then the loop and closure specs
+   (`av-retain`, `av-extend-overflow`, `av-clone-from`; gaps 7 and 13), the unwind variants
+   (`av-drain-unwind`, `av-retain-unwind`), and last the conjunction `av-refines-bounded-vec`.
+7. SmallVec: `Inv_SV` → `sv-representation` (the spill preserves `Seq`) → `sv-seq-contracts` →
+   `sv-into-iter`.

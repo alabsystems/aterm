@@ -13,6 +13,7 @@ use crate::fold::{MailLink, Need, OpenNode, SessionState};
 use crate::log::{Cursor, Gap};
 use crate::rec::Rec;
 use crate::vocab::{Actor, Conf, Kind, Lvl, Node, Op, Src};
+use crate::words::{Out, RunOut};
 
 /// Default budget for one session.
 pub const DEFAULT_BUDGET: usize = 600;
@@ -147,7 +148,7 @@ impl TurnInfo<'_> {
             .split(',')
             .filter_map(|item| {
                 let (w, n) = item.split_once(':')?;
-                let n = n.parse::<u64>().ok()?;
+                let n = crate::line::parse_u::<u64>(n)?;
                 let less = self.tx_tools.get(w).copied().unwrap_or(0);
                 Some((n.saturating_sub(less), w))
             })
@@ -159,21 +160,132 @@ impl TurnInfo<'_> {
     }
 }
 
-/// Window records sorted into turns, steps, marks, and mark counts.
+/// Window records sorted into turns, steps, marks, and mark and run counts.
 struct Scan<'a> {
     turns: BTreeMap<u32, TurnInfo<'a>>,
     marks: Vec<&'a Rec>,
     acts: usize,
     stories: usize,
     shown: usize,
+    /// The window's closed shell runs ([`RunCount`]) and those closed `out=fail`.
+    runs: (usize, usize),
 }
 
 impl Scan<'_> {
     /// Whether any count line has a non-zero count.
     const fn counts_any(&self, totals: &crate::fold::Totals) -> bool {
-        self.acts + self.stories + self.shown > 0 || totals.mail_in > 0 || totals.mail_out > 0
+        self.acts + self.stories + self.shown + self.runs.0 > 0
+            || totals.mail_in > 0
+            || totals.mail_out > 0
     }
 }
+
+/// Whether a run's parent (its open's `par=`) is another run: a `prog` run beneath a `cmd`.
+fn beneath_a_run(par: Option<Node>) -> bool {
+    par.is_some_and(|p| p.lvl == Lvl::Run)
+}
+
+/// THE RUNS A BRIEF COUNTS (fix J1-2), each once, at the shell's own level:
+/// - a closed `cmd` run, a command the shell's integration reported with its exit status, so its
+///   `fail` count is exact;
+/// - a closed `prog` run that hung from the session: a program of a shell aterm does not
+///   integrate (§2.1: "without shell integration, it hangs directly from the session"), whose
+///   exit nobody observes, so it is never a `fail`. Its open's `par=` says where it hung; one
+///   whose open precedes the window (an evicted record, or a `since=` page) counts when nothing
+///   shows a command: no `cmd` record in the window and no command open in the fold
+///   ([`BriefInput::scanned`]).
+///
+/// A `prog` run beneath a `cmd` is that command's program, counted through it; an `agent` run's
+/// work is its turns' lines; an open run is the session line's.
+#[derive(Default)]
+struct RunCount {
+    /// The counted runs and those closed `out=fail`.
+    counted: (usize, usize),
+    /// Each run's parent, from its open in the window.
+    par: BTreeMap<u32, Option<Node>>,
+    /// Closed `prog` runs whose open precedes the window, and those closed `out=fail`.
+    orphans: (usize, usize),
+    /// The window holds a `cmd` run's record.
+    commands: bool,
+}
+
+impl RunCount {
+    fn see(&mut self, r: &Rec) {
+        if r.node.lvl != Lvl::Run {
+            return;
+        }
+        if r.op == Op::Open {
+            self.par.insert(r.node.n, r.par);
+        }
+        self.commands |= r.k == Kind::Cmd;
+        if r.op != Op::Close {
+            return;
+        }
+        let into = match (r.k, self.par.get(&r.node.n)) {
+            (Kind::Cmd, _) => &mut self.counted,
+            (Kind::Prog, Some(par)) if !beneath_a_run(*par) => &mut self.counted,
+            (Kind::Prog, None) => &mut self.orphans,
+            _ => return,
+        };
+        into.0 += 1;
+        into.1 += usize::from(r.out() == Some(RUN_FAIL));
+    }
+
+    /// The runs count line's `(runs, fail)`: the orphans count where nothing shows a command.
+    const fn total(&self, command_open: bool) -> (usize, usize) {
+        if self.commands || command_open {
+            self.counted
+        } else {
+            (
+                self.counted.0 + self.orphans.0,
+                self.counted.1 + self.orphans.1,
+            )
+        }
+    }
+}
+
+/// THE RUNS COUNT LINE (fix J1-2): `runs <n> · fail <k>`, the window's closed shell runs
+/// ([`RunCount`]) and those that closed `out=fail` (the outcome that raises `need=failure`). It
+/// sheds with the other count lines, and once shed `more=` names it `runs:<n>` ([`MORE_WORDS`]).
+#[must_use]
+pub fn runs_line(runs: impl std::fmt::Display, fail: impl std::fmt::Display) -> String {
+    format!("runs {runs} · {RUN_FAIL} {fail}")
+}
+
+/// The mail count line: the session's mail delivered and posted ([`crate::fold::Totals`]).
+#[must_use]
+pub fn mail_line(mail_in: impl std::fmt::Display, mail_out: impl std::fmt::Display) -> String {
+    format!("mail in {mail_in} · out {mail_out}")
+}
+
+/// The acts count line: the window's `act` and `story` marks.
+#[must_use]
+pub fn acts_line(acts: impl std::fmt::Display, stories: impl std::fmt::Display) -> String {
+    format!("acts {acts} · stories {stories}")
+}
+
+/// The shown count line: the window's `shown` marks, each a move of the need the person is shown.
+#[must_use]
+pub fn shown_line(shown: impl std::fmt::Display) -> String {
+    format!("shown {shown}")
+}
+
+/// THE COUNT LINES (§7.4) in the order a brief prints them, each with `<n>` (and `<k>`, a runs
+/// line's failures) for its counts: what `aterm ctl help brief` shows. Each prints only when a
+/// count in it is not zero, after the `need` lines and before the `claim` lines, and all of them
+/// shed together, before anything else.
+#[must_use]
+pub fn count_line_forms() -> [String; 4] {
+    [
+        runs_line("<n>", "<k>"),
+        mail_line("<n>", "<n>"),
+        acts_line("<n>", "<n>"),
+        shown_line("<n>"),
+    ]
+}
+
+/// The `out=` word a failed run closes with, which the runs count line counts.
+const RUN_FAIL: &str = Out::Run(RunOut::Fail).word();
 
 /// Whether a mark of kind `k` renders its own line in a brief.
 const fn mark_worth_a_line(k: Kind) -> bool {
@@ -250,7 +362,7 @@ fn open_path_seeds(st: &SessionState, window: &[&Rec]) -> Vec<Rec> {
 }
 
 /// Scan `window` without transcript records and return whether any were stripped.
-fn scan_stripped<'a>(window: &[&'a Rec], seeds: &'a [Rec]) -> (Scan<'a>, bool) {
+fn scan_stripped<'a>(window: &[&'a Rec], seeds: &'a [Rec], command_open: bool) -> (Scan<'a>, bool) {
     let mut tx_steps: BTreeMap<u32, u64> = BTreeMap::new();
     let mut tx_tools: BTreeMap<u32, BTreeMap<&'static str, u64>> = BTreeMap::new();
     let mut tx_nodes: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
@@ -283,7 +395,7 @@ fn scan_stripped<'a>(window: &[&'a Rec], seeds: &'a [Rec]) -> (Scan<'a>, bool) {
             kept.push(r);
         }
     }
-    let mut s = scan(&kept, seeds);
+    let mut s = scan(&kept, seeds, command_open);
     for (n, t) in &mut s.turns {
         t.tx_steps = tx_steps.get(n).copied().unwrap_or(0);
         t.tx_tools = tx_tools.remove(n).unwrap_or_default();
@@ -291,12 +403,16 @@ fn scan_stripped<'a>(window: &[&'a Rec], seeds: &'a [Rec]) -> (Scan<'a>, bool) {
     (s, any)
 }
 
-fn scan<'a>(window: &[&'a Rec], seeds: &'a [Rec]) -> Scan<'a> {
+/// Sort `window` and `seeds` into a [`Scan`]; `command_open` is whether the fold holds a command
+/// open ([`RunCount`]).
+fn scan<'a>(window: &[&'a Rec], seeds: &'a [Rec], command_open: bool) -> Scan<'a> {
     let mut turns: BTreeMap<u32, TurnInfo<'a>> = BTreeMap::new();
     let mut step_turn: BTreeMap<u32, u32> = BTreeMap::new();
     let mut marks = Vec::new();
     let (mut acts, mut stories, mut shown) = (0, 0, 0);
+    let mut runs = RunCount::default();
     for r in window.iter().copied().chain(seeds) {
+        runs.see(r);
         let turn_of = |node: Node, step_turn: &BTreeMap<u32, u32>| match node.lvl {
             Lvl::Turn => Some(node.n),
             Lvl::Step => step_turn.get(&node.n).copied(),
@@ -355,6 +471,7 @@ fn scan<'a>(window: &[&'a Rec], seeds: &'a [Rec]) -> Scan<'a> {
         acts,
         stories,
         shown,
+        runs: runs.total(command_open),
     }
 }
 
@@ -599,13 +716,31 @@ struct Rendered {
     units: usize,
 }
 
-/// Omitted turns and mark/need/claim counts for the `more=` line.
+/// Omitted turns, and the shed runs count line and mark/need/claim lines, for the `more=` line.
 #[derive(Default)]
 struct More {
     turns: std::collections::BTreeSet<u32>,
+    runs: usize,
     marks: usize,
     needs: usize,
     claims: usize,
+}
+
+/// THE WORDS `more=` NAMES WHAT IT LEFT OUT BY (§7.4), after its turn ids and ranges, in the order
+/// it prints them, each as `<word>:<n>`: the closed shell runs of a shed runs count line
+/// ([`runs_line`]), then the mark lines, need lines and claim lines left out.
+pub const MORE_WORDS: [&str; 4] = ["runs", "marks", "needs", "claims"];
+
+impl More {
+    /// [`MORE_WORDS`] with the count each names.
+    const fn counts(&self) -> [(&'static str, usize); 4] {
+        [
+            (MORE_WORDS[0], self.runs),
+            (MORE_WORDS[1], self.marks),
+            (MORE_WORDS[2], self.needs),
+            (MORE_WORDS[3], self.claims),
+        ]
+    }
 }
 
 /// Build the trailer's need and claim lines.
@@ -763,18 +898,24 @@ fn render(
         }
         lines.extend(needs);
         let t = &st.totals;
+        if counts && scan.runs.0 > 0 {
+            lines.push(runs_line(scan.runs.0, scan.runs.1));
+        } else {
+            more.runs = scan.runs.0;
+        }
         if counts && (t.mail_in > 0 || t.mail_out > 0) {
-            lines.push(format!("mail in {} · out {}", t.mail_in, t.mail_out));
+            lines.push(mail_line(t.mail_in, t.mail_out));
         }
         if counts && scan.acts + scan.stories > 0 {
-            lines.push(format!("acts {} · stories {}", scan.acts, scan.stories));
+            lines.push(acts_line(scan.acts, scan.stories));
         }
         if counts && scan.shown > 0 {
-            lines.push(format!("shown {}", scan.shown));
+            lines.push(shown_line(scan.shown));
         }
         lines.extend(claims);
     } else {
         more.turns.extend(turns.iter().map(|t| t.0));
+        more.runs = scan.runs.0;
         more.marks = scan.marks.len();
         more.needs = needs.len();
         more.claims = claims.len();
@@ -806,11 +947,7 @@ fn more_line(more: &More) -> String {
             items.extend((lo..=hi).rev().map(|n| format!("t{n}")));
         }
     }
-    for (word, n) in [
-        ("marks", more.marks),
-        ("needs", more.needs),
-        ("claims", more.claims),
-    ] {
+    for (word, n) in more.counts() {
         if n > 0 {
             items.push(format!("{word}:{n}"));
         }
@@ -880,14 +1017,24 @@ impl<'a> BriefInput<'a> {
         }
     }
 
+    /// Whether the fold holds a command open: its deepest open run is a `cmd`, or hangs from a
+    /// run (a command's program, or its agent). Then a closed `prog` run whose open the window
+    /// lacks is that command's program, not a run of its own ([`RunCount`]).
+    fn command_open(&self) -> bool {
+        self.st
+            .run()
+            .is_some_and(|o| o.kind == Kind::Cmd || beneath_a_run(o.par))
+    }
+
     /// Scan the window with and without transcript records.
     #[must_use]
     pub fn scanned(&self) -> Briefing<'_> {
         #[cfg(any(test, debug_assertions))]
         SCANS.with(|n| n.set(n.get() + 1));
-        let (stripped, transcript) = scan_stripped(&self.window, &self.seeds);
+        let open = self.command_open();
+        let (stripped, transcript) = scan_stripped(&self.window, &self.seeds, open);
         Briefing {
-            scan: scan(&self.window, &self.seeds),
+            scan: scan(&self.window, &self.seeds, open),
             stripped,
             transcript,
             gap: self.gap.as_ref(),

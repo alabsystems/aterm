@@ -252,6 +252,9 @@ fn survey_forks(root: &Path, patch: &[PatchRow]) -> Vec<VendoredFork> {
         }
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for entry in entries.flatten() {
+                if !entry.file_type().is_ok_and(|t| t.is_file()) {
+                    continue;
+                }
                 let name = entry.file_name().to_string_lossy().into_owned();
                 if is_licence_text(&name) {
                     fork.licenses.push(name);
@@ -436,20 +439,26 @@ impl Ver {
 
 /// Parse a dotted version, tolerant of omitted components and of a `-prerelease` / `+build` suffix.
 pub(crate) fn parse_version(text: &str) -> Option<Ver> {
+    let dec = |s: &str| {
+        let s = s.trim();
+        (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| s.parse().ok())
+            .flatten()
+    };
     let core = text.split(['-', '+']).next().unwrap_or(text);
     let mut parts = core.split('.');
-    let major = parts.next()?.trim().parse().ok()?;
+    let major = dec(parts.next()?)?;
     let minor_text = parts.next();
     let patch_text = parts.next();
     if parts.next().is_some() {
         return None;
     }
     let minor = match minor_text {
-        Some(m) => m.trim().parse().ok()?,
+        Some(m) => dec(m)?,
         None => 0,
     };
     let patch = match patch_text {
-        Some(p) => p.trim().parse().ok()?,
+        Some(p) => dec(p)?,
         None => 0,
     };
     Some(Ver {
@@ -1419,7 +1428,7 @@ fn ob4_provenance_files(forks: &[VendoredFork], log: &mut String) -> usize {
                  cannot be separated from upstream's",
             ),
         ] {
-            if fork.dir.join(file).exists() {
+            if std::fs::symlink_metadata(fork.dir.join(file)).is_ok_and(|m| m.is_file()) {
                 continue;
             }
             let _ = writeln!(
@@ -1634,15 +1643,20 @@ fn ob7_apache_modification_notices(
             .chain(added.iter().map(|r| (r, "added")))
         {
             let path = fork.dir.join(rel);
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
+            let regular = std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file());
+            let text = if regular {
+                std::fs::read(&path)
+                    .map(|b| String::from_utf8_lossy(&b).into_owned())
+                    .unwrap_or_default()
+            } else {
+                String::new()
             };
             if has_modification_notice(&text) {
                 continue;
             }
             // An added licence text is kept as its holder wrote it: its notice is the NOTICE
             // passage that names it by path, not a header in it.
-            if kind == "added" && is_licence_text(rel) {
+            if regular && kind == "added" && is_licence_text(rel) {
                 if notice.contains(&format!("`{}/{rel}`", fork.rel)) {
                     continue;
                 }
@@ -1722,7 +1736,7 @@ fn diff_against_pristine(pristine: &Path, fork: &Path) -> Option<Divergence> {
     while let Some(rel) = stack.pop() {
         let dir = fork.join(&rel);
         for entry in std::fs::read_dir(&dir).ok()? {
-            let Ok(entry) = entry else { continue };
+            let entry = entry.ok()?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if name == ".cargo-ok" || name == ".git" || name == "target" {
@@ -1733,8 +1747,17 @@ fn diff_against_pristine(pristine: &Path, fork: &Path) -> Option<Divergence> {
             } else {
                 rel.join(name.as_ref())
             };
-            if entry.path().is_dir() {
+            let file_type = entry.file_type().ok()?;
+            if file_type.is_dir() {
                 stack.push(child);
+                continue;
+            }
+            if !file_type.is_file() {
+                if std::fs::symlink_metadata(pristine.join(&child)).is_ok() {
+                    modified.push(child.to_string_lossy().into_owned());
+                } else {
+                    added.push(child.to_string_lossy().into_owned());
+                }
                 continue;
             }
             let ours = std::fs::read(entry.path()).ok()?;
@@ -2161,6 +2184,17 @@ mod tests {
             let Attestation { ok, log, .. } = report(fixture.0.path());
             assert!(!ok && log.contains(tag), "{name} must fail {tag}:\n{log}");
         }
+        let fixture = good_fixture("dir-provenance");
+        std::fs::remove_file(fixture.0.path().join("vendor/goodfork/Cargo.toml.orig")).unwrap();
+        std::fs::create_dir(fixture.0.path().join("vendor/goodfork/Cargo.toml.orig")).unwrap();
+        let Attestation { ok, log, .. } = report(fixture.0.path());
+        assert!(!ok && log.contains("FAIL [OB-4]"), "{log}");
+
+        let fixture = good_fixture("dir-license");
+        std::fs::remove_file(fixture.0.path().join("vendor/goodfork/LICENSE-MIT")).unwrap();
+        std::fs::create_dir(fixture.0.path().join("vendor/goodfork/LICENSE-MIT")).unwrap();
+        let Attestation { ok, log, .. } = report(fixture.0.path());
+        assert!(!ok && log.contains("FAIL [OB-5]"), "{log}");
     }
 
     #[test]
@@ -2563,5 +2597,26 @@ mod tests {
         .unwrap();
         let Attestation { ok, log, .. } = report_served(root, served());
         assert!(ok, "a header notice must discharge §4(b):\n{log}");
+
+        std::fs::write(
+            root.join("vendor/goodfork/src/non_utf8.bin"),
+            b"unmarked binary change \xff\xfe\n",
+        )
+        .unwrap();
+        let Attestation { ok, log, .. } = report_served(root, served());
+        assert!(
+            !ok && log.contains("FAIL [OB-7]"),
+            "non-UTF-8 added file without notice must fail OB-7:\n{log}"
+        );
+        std::fs::write(
+            root.join("vendor/goodfork/src/non_utf8.bin"),
+            b"// Added by aterm: binary test fixture.\n\xff\xfe\n",
+        )
+        .unwrap();
+        let Attestation { ok, log, .. } = report_served(root, served());
+        assert!(
+            ok,
+            "non-UTF-8 added file with header notice must pass OB-7:\n{log}"
+        );
     }
 }

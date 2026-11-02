@@ -537,18 +537,15 @@ fn dial_tcp(addr: impl ToSocketAddrs, timeout: Option<Duration>) -> io::Result<T
     Ok(stream)
 }
 
-/// Keep `socket` out of every child this process forks or spawns
-/// (`astream_sys::close_on_fork`, `FD_CLOFORK` on Apple): a child's exec-time close of
-/// its copy, under a descriptor scan, drains the socket for good. Every socket the
-/// broker and this client create, accept or duplicate passes through here: listeners,
-/// accepted and dialled connections, and their clones, each of which carries its own
-/// flag, since the flag belongs to the descriptor.
+/// Request close-on-fork for every socket the broker creates, accepts or duplicates.
+/// Kernels that ignore the request retain the existing close-on-exec behavior;
+/// this best-effort request does not establish pre-exec descriptor isolation there.
 ///
 /// # Errors
 /// The `fcntl(2)` errno of reading or setting the descriptor's flags.
 #[cfg(unix)]
 pub(crate) fn kept_from_children(socket: &impl std::os::fd::AsFd) -> io::Result<()> {
-    astream_sys::close_on_fork(socket.as_fd())
+    astream_sys::close_on_fork(socket.as_fd()).map(|_| ())
 }
 
 /// Off Unix there is no `fork`, so no child is ever given a copy (see the Unix twin).

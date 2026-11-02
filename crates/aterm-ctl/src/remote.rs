@@ -106,11 +106,44 @@ impl From<&str> for DriveRefused {
 /// spawn, a hold): under the peer's 30 s cut.
 const DRIVE_WITHIN: Duration = Duration::from_secs(28);
 
+/// The dev seam that sets, in milliseconds, [`drive_deadline`] and what an `await task` leg over
+/// a drive waits past the wait it asks for ([`crate::await_task`]) for a test of the binary: a
+/// test world whose every peer is an aterm on the same machine, which serves and so must answer
+/// however loaded the machine is, gives each drive its hang detector.
+const DRIVE_WITHIN_SEAM: &str = "ATERM_DEBUG_FLEET_DRIVE_WITHIN_MS";
+
+/// What [`DRIVE_WITHIN_SEAM`] names, where a test of the binary sets it.
+pub(crate) fn drive_seam() -> Option<Duration> {
+    aterm_types::dev_seam!(DRIVE_WITHIN_SEAM)
+        .and_then(|ms| crate::parse_uint::<u64>(ms.to_str()?.trim()))
+        .filter(|&ms| ms > 0)
+        .map(|ms| Duration::from_millis(ms.min(24 * 3_600_000)))
+}
+
+/// A drive connection's own deadline: [`DRIVE_WITHIN`], or what [`DRIVE_WITHIN_SEAM`] names.
+fn drive_deadline() -> Duration {
+    drive_seam().unwrap_or(DRIVE_WITHIN)
+}
+
+/// `within` as a cut names it: in whole seconds where it is whole (`28 s`), else to the
+/// millisecond (`0.1 s`, `9.5 s`), as a test world's seam, an `await task` leg's `timeout=` and a
+/// `--timeout` can make it.
+fn secs(within: Duration) -> String {
+    let ms = within.as_millis();
+    let part = format!("{:03}", ms % 1000);
+    let part = part.trim_end_matches('0');
+    if part.is_empty() {
+        format!("{} s", ms / 1000)
+    } else {
+        format!("{}.{part} s", ms / 1000)
+    }
+}
+
 /// A drive connection's deadline, its handshake's and its reply's, and whose it is, which a
 /// reply cut at it names ([`closed`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Within {
-    /// The drive's own: [`DRIVE_WITHIN`], or an `await task` leg's wait and its slack.
+    /// The drive's own: [`drive_deadline`], or an `await task` leg's wait and its slack.
     Drive(Duration),
     /// The caller's `--timeout` (the first), shorter than what the call waits with a longer one,
     /// or 0 (the second).
@@ -135,14 +168,13 @@ impl Within {
     }
 }
 
-/// A drive connection's deadline: [`DRIVE_WITHIN`], or a shorter `--timeout` (`total`, none for
+/// A drive connection's deadline: [`drive_deadline`], or a shorter `--timeout` (`total`, none for
 /// `--timeout 0`).
 fn drive_within(total: Option<Option<Duration>>) -> Within {
+    let own = drive_deadline();
     match total {
-        Some(Some(total)) if total < DRIVE_WITHIN => {
-            Within::Timeout(total, Longer::Drive(DRIVE_WITHIN))
-        }
-        _ => Within::Drive(DRIVE_WITHIN),
+        Some(Some(total)) if total < own => Within::Timeout(total, Longer::Drive(own)),
+        _ => Within::Drive(own),
     }
 }
 
@@ -213,9 +245,20 @@ pub(crate) fn run(
     if verb == "spawn" {
         if selector.is_some() {
             return Err(refused(
-                "a worker spawned over the fleet opens where that Mac's aterm puts it: name no \
+                "a session spawned over the fleet opens where that Mac's aterm puts it: name no \
                  @<sel>",
             ));
+        }
+        if !args.iter().any(|arg| arg.starts_with("agent=")) {
+            if is_any_host(host) {
+                return Err(refused(
+                    "a plain shell needs one explicit --host, never any",
+                ));
+            }
+            let head = shell_spawn_head(args)?;
+            return exchange_with_retry(&format!("{head}\n"), "spawn", within, |remaining| {
+                drive(host, remaining).map_err(io::Error::other)
+            });
         }
         let head = spawn_head(args, worker_starter(env::var(SELF_SID_ENV).ok()).as_deref())?;
         let chosen_host = if is_any_host(host) {
@@ -270,6 +313,36 @@ pub(crate) fn run(
             _ => io::Error::other(refused),
         })
     })
+}
+
+/// A plain remote shell carries no task or command and names its one destination folder.
+fn shell_spawn_head(args: &[String]) -> io::Result<String> {
+    let usage = || {
+        refused(
+            "a plain fleet shell is spawn cwd=/absolute [raise=false]; no task, command or other options",
+        )
+    };
+    let mut cwd = None;
+    let mut raised = false;
+    for arg in args {
+        if let Some(dir) = arg.strip_prefix("cwd=") {
+            if !dir.starts_with('/') || cwd.replace(dir).is_some() {
+                return Err(usage());
+            }
+        } else if arg == "raise=false" && !raised {
+            raised = true;
+        } else {
+            return Err(usage());
+        }
+    }
+    if cwd.is_none() {
+        return Err(usage());
+    }
+    let mut parts = vec!["spawn".to_owned()];
+    parts.extend(args.iter().cloned());
+    let head = spawn_wire_line(&parts)?;
+    validate_request_line_len(&head, Some("spawn"))?;
+    Ok(head)
 }
 
 /// A complete busy reply promises the request was not dispatched. Only that response may
@@ -452,7 +525,12 @@ fn turn_wait(args: &[String], session: Option<&str>, host: &str) -> io::Result<S
         .0
         .into_iter()
         .filter(|(key, _)| *key == "timeout")
-        .map(|(_, ms)| ms.parse::<u64>())
+        .map(|(_, ms)| {
+            (!ms.is_empty() && ms.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| ms.parse::<u64>().ok())
+                .flatten()
+                .ok_or(())
+        })
         .collect();
     match waits.as_deref() {
         Ok([]) => {
@@ -614,11 +692,13 @@ fn any_target_sid<'a>(
     ))
 }
 
+const MAX_ANY_HOSTS_BYTES: u64 = 64 * 1024;
+
 fn read_any_sid_hosts() -> Vec<(String, String)> {
     let Some(path) = any_hosts_path() else {
         return Vec::new();
     };
-    let Ok(text) = std::fs::read_to_string(path) else {
+    let Ok((text, _)) = crate::read_bounded_regular_utf8(&path, MAX_ANY_HOSTS_BYTES) else {
         return Vec::new();
     };
     text.lines()
@@ -771,9 +851,9 @@ pub(crate) fn closed(label: &str, request: &str, within: Within, e: io::Error) -
         WouldBlock | TimedOut => (
             match within {
                 Within::Drive(within) => format!(
-                    "{label} did not answer within {} s (its aterm is stopped, frozen or too \
+                    "{label} did not answer within {} (its aterm is stopped, frozen or too \
                      busy to answer, or the network between is down)",
-                    within.as_secs()
+                    secs(within)
                 ),
                 Within::Timeout(within, longer) => {
                     let turn = if verb == "turn" {
@@ -786,8 +866,8 @@ pub(crate) fn closed(label: &str, request: &str, within: Within, e: io::Error) -
                     };
                     let longer = match longer {
                         Longer::Drive(own) => format!(
-                            "a longer --timeout, or 0, waits up to the drive's own {} s",
-                            own.as_secs()
+                            "a longer --timeout, or 0, waits up to the drive's own {}",
+                            secs(own)
                         ),
                         Longer::Wait(Some(whole)) => format!(
                             "a longer --timeout waits as long as it names, up to the wait's \
@@ -801,9 +881,9 @@ pub(crate) fn closed(label: &str, request: &str, within: Within, e: io::Error) -
                         }
                     };
                     format!(
-                        "no answer came from {label} within this call's --timeout of {} s \
+                        "no answer came from {label} within this call's --timeout of {} \
                          ({turn}{longer})",
-                        within.as_secs()
+                        secs(within)
                     )
                 }
             },

@@ -466,7 +466,7 @@ pub(super) fn row_said(reason: &str) -> Option<RowSaid> {
     let mut declared = false;
     for word in words {
         if let Some(n) = word.strip_prefix("held_ms=") {
-            held_ms = Some(n.parse::<i64>().ok()?);
+            held_ms = Some(crate::parse_int::<i64>(n)?);
         } else if let Some(w) = word.strip_prefix("why=") {
             why = Some(match w {
                 "point" => Close::Point,

@@ -65,7 +65,7 @@ pub fn parse_aterm_roster_line(
     if state == "exited" {
         return None;
     }
-    let local_id = id_str.parse::<u64>().ok()?;
+    let local_id = crate::parse_uint::<u64>(id_str)?;
     let mut s = crate::protocol::HostedSession {
         instance_pid,
         local_id,
@@ -87,17 +87,17 @@ pub fn parse_aterm_roster_line(
             "program" => s.program = opt(),
             "agent" => s.agent = opt(),
             "agent_detail" => s.agent_detail = opt(),
-            "agent_since_ms" if val != "-" => s.agent_since_ms = val.parse().ok(),
+            "agent_since_ms" if val != "-" => s.agent_since_ms = crate::parse_uint(val),
             "program_state" => s.program_state = opt(),
-            "human_ms" if val != "-" => s.human_ms = val.parse().ok(),
+            "human_ms" if val != "-" => s.human_ms = crate::parse_uint(val),
             "autopilot" => s.autopilot = opt(),
             "role" => s.role = opt(),
             "attention" => s.attention = opt(),
             "supervisor" => s.supervisor = opt(),
             "task" => s.task = opt(),
             "user_title" => user_title = opt(),
-            "cols" if val != "-" => s.cols = val.parse().ok(),
-            "rows" if val != "-" => s.rows = val.parse().ok(),
+            "cols" if val != "-" => s.cols = crate::parse_uint(val),
+            "rows" if val != "-" => s.rows = crate::parse_uint(val),
             "cwd" => s.cwd = opt(),
             _ => {}
         }
@@ -125,6 +125,61 @@ pub fn shorten_home(path: &str) -> String {
     trimmed.to_owned()
 }
 
+#[cfg(any(
+    target_vendor = "apple",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+pub(crate) fn same_user_peer(stream: &UnixStream) -> bool {
+    aterm_uds::peer::peer_uid(stream) == Some(aterm_uds::peer::our_uid())
+}
+
+#[cfg(not(any(
+    target_vendor = "apple",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+)))]
+pub(crate) fn same_user_peer(_stream: &UnixStream) -> bool {
+    true
+}
+
+pub(crate) fn read_owned_text(path: &Path, max_bytes: usize) -> Option<String> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    let bound = max_bytes.checked_add(1)?;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    let meta = f.metadata().ok()?;
+    if !meta.is_file() || meta.uid() != aterm_uds::peer::our_uid() || meta.len() > max_bytes as u64
+    {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    f.take(bound as u64).read_to_end(&mut bytes).ok()?;
+    if bytes.len() > max_bytes {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+pub(crate) fn read_sock_token(sock_path: &Path) -> Option<String> {
+    let sock_dir = sock_path.parent()?;
+    let sock_name = sock_path.file_name()?.to_str()?;
+    aterm_types::control_socket::token_names_for_sock(sock_name)
+        .into_iter()
+        .find_map(|name| {
+            read_owned_text(&sock_dir.join(name), 4096)
+                .map(|t| t.trim().to_owned())
+                .filter(|t| !t.is_empty() && t.bytes().all(|b| b.is_ascii_graphic()))
+        })
+}
+
 fn enrich_sessions_dims_and_cwd(
     sock_path: &Path,
     token: &str,
@@ -136,6 +191,9 @@ fn enrich_sessions_dims_and_cwd(
     let Ok(mut stream) = UnixStream::connect(sock_path) else {
         return;
     };
+    if !same_user_peer(&stream) {
+        return;
+    }
     let timeout = Some(Duration::from_millis(80));
     let _ = stream.set_read_timeout(timeout);
     let _ = stream.set_write_timeout(timeout);
@@ -159,8 +217,8 @@ fn enrich_sessions_dims_and_cwd(
         {
             let mut parts = rest.split_whitespace();
             if let (Some(r), Some(c)) = (
-                parts.next().and_then(|x| x.parse::<u32>().ok()),
-                parts.next().and_then(|x| x.parse::<u32>().ok()),
+                parts.next().and_then(crate::parse_uint::<u32>),
+                parts.next().and_then(crate::parse_uint::<u32>),
             ) && c > 0
                 && r > 0
             {
@@ -187,31 +245,17 @@ fn query_instance_sessions(
     sock_path: &Path,
     wait: Duration,
 ) -> Vec<crate::protocol::HostedSession> {
-    let sock_dir = match sock_path.parent() {
-        Some(d) => d,
-        None => return Vec::new(),
-    };
-    let sock_name = match sock_path.file_name().and_then(|n| n.to_str()) {
-        Some(n) => n,
-        None => return Vec::new(),
+    let Some(token) = read_sock_token(sock_path) else {
+        return Vec::new();
     };
     let Ok(mut stream) = UnixStream::connect(sock_path) else {
         return Vec::new();
     };
+    if !same_user_peer(&stream) {
+        return Vec::new();
+    }
     let _ = stream.set_read_timeout(Some(wait));
     let _ = stream.set_write_timeout(Some(wait));
-
-    let token = aterm_types::control_socket::token_names_for_sock(sock_name)
-        .into_iter()
-        .find_map(|name| {
-            std::fs::read_to_string(sock_dir.join(name))
-                .ok()
-                .map(|t| t.trim().to_owned())
-                .filter(|t| !t.is_empty())
-        });
-    let Some(token) = token else {
-        return Vec::new();
-    };
     if stream
         .write_all(format!("AUTH {token}\nsessions\n").as_bytes())
         .and_then(|()| stream.flush())
@@ -227,7 +271,7 @@ fn query_instance_sessions(
     let Some(count) = header
         .trim_end()
         .strip_prefix("OK ")
-        .and_then(|n| n.parse::<usize>().ok())
+        .and_then(crate::parse_uint::<usize>)
         .filter(|&c| c <= 1024)
     else {
         return Vec::new();
@@ -282,7 +326,7 @@ pub fn scan_aterm_sessions_in_dir(
     }
     if let Ok(entries) = std::fs::read_dir(dir.join("graph")) {
         for e in entries.flatten() {
-            let Ok(body) = std::fs::read_to_string(e.path()) else {
+            let Some(body) = read_owned_text(&e.path(), 64 * 1024) else {
                 continue;
             };
             let Some(sock) = aterm_types::control_socket::graph_entry_sock(&body) else {
@@ -385,6 +429,15 @@ mod tests {
         assert_eq!(r.role.as_deref(), Some("operator"));
         assert_eq!(r.task.as_deref(), Some("build fleet"));
         assert_eq!(r.program_state, None, "a line with no report carries none");
+
+        let real_tok = dir.path().join("real.token");
+        std::fs::write(&real_tok, "cafef00d\n").unwrap();
+        let sym_sock = dir.path().join("aterm-9999.sock");
+        std::os::unix::fs::symlink(&real_tok, dir.path().join("aterm-9999.token")).unwrap();
+        assert_eq!(read_sock_token(&sym_sock), None);
+        let injected_sock = dir.path().join("aterm-8888.sock");
+        std::fs::write(dir.path().join("aterm-8888.token"), "bad\nsessions\n").unwrap();
+        assert_eq!(read_sock_token(&injected_sock), None);
     }
 
     /// A codex's own report (`program_state=`) rides the fleet row, so another Mac's Settings can

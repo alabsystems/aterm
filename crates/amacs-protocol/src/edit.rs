@@ -311,11 +311,7 @@ impl AwaitEdit {
                     key = Some(AwaitKey::Uri(value.to_string()));
                 }
                 "timeout" if timeout_ms.is_none() => {
-                    timeout_ms = Some(
-                        value
-                            .parse::<u64>()
-                            .map_err(|_| EditError::BadField("timeout", value.to_string()))?,
-                    );
+                    timeout_ms = Some(number(value, "timeout")?);
                 }
                 _ => return Err(EditError::UnknownOption(word.to_string())),
             }
@@ -697,6 +693,8 @@ mod tests {
             "edit ticket=1 uri=file:///x",
             "edit uri=/tmp/x",
             "edit ticket=1 timeout=2s",
+            "edit ticket=1 timeout=+1000",
+            "edit ticket=1 timeout=-0",
             "edit ticket=1 later",
         ] {
             assert!(AwaitEdit::parse(bad).is_err(), "{bad}");

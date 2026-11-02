@@ -927,11 +927,7 @@ impl MatrixRain {
         }
         self.occ_rows = rows;
         self.occ_cols = cols;
-        let bg = [
-            (default_bg >> 16) as u8,
-            (default_bg >> 8) as u8,
-            default_bg as u8,
-        ];
+        let bg = crate::word_decorations::u32_to_rgb3(default_bg);
         let last_col = cols.saturating_sub(1);
         let mut r = 0;
         while r < rows {

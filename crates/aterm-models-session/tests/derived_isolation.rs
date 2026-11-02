@@ -16,16 +16,34 @@ fn broken_at(m: &Model, dial: i64) -> Vec<&'static str> {
 }
 
 #[test]
-fn the_fork_exec_window_runs_only_safe_steps_and_closes_the_master() {
+fn the_fork_exec_window_runs_only_safe_steps_closes_the_master_and_keeps_what_it_passes() {
     let m = fork_exec_model();
     assert_eq!(broken_at(&m, 1), ["OnlySafeBeforeExec"]);
     assert_eq!(broken_at(&m, 2), ["MasterClosedBeforeExec"]);
     assert_eq!(broken_at(&m, 3), ["SafeImpliesEnvPrebuilt"]);
+    assert_eq!(broken_at(&m, 4), ["PassedHeldAtExec"]);
+    assert_eq!(broken_at(&m, 5), ["FailedExecIsTold"]);
     let mut s = m.init_state();
-    for action in ["Fork", "Setrlimit", "Chdir", "CloseMaster", "Exec"] {
+    for action in [
+        "Fork",
+        "Setrlimit",
+        "Chdir",
+        "CloseMaster",
+        "PassFd",
+        "Exec",
+    ] {
         assert!(m.fire(action, &mut s), "{action}: {s:?}");
     }
-    assert_eq!((s["pc"], s["masterClosed"], s["unsafeOpRan"]), (5, 1, 0));
+    assert_eq!(
+        (
+            s["pc"],
+            s["masterClosed"],
+            s["unsafeOpRan"],
+            s["passHeld"],
+            s["statusOpen"]
+        ),
+        (6, 1, 0, 1, 1)
+    );
     assert!(!m.action_enabled("UnsafeEnvOp", &m.init_state()));
 }
 

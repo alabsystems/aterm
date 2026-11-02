@@ -770,6 +770,7 @@ impl App {
                 .and_then(|app| match app.kind() {
                     crate::native_app::AppKind::Settings => Some("settings/search"),
                     crate::native_app::AppKind::Editor => Some("editor/find"),
+                    crate::native_app::AppKind::Mail => Some("mail/search"),
                     crate::native_app::AppKind::Markdown
                     | crate::native_app::AppKind::About
                     | crate::native_app::AppKind::SystemState

@@ -361,6 +361,18 @@ fn a_session_runs_only_under_its_own_live_runner_and_the_runner_waits_for_the_le
         Err("paused".to_owned())
     })
     .expect("a free lock is taken with no pause");
+    #[cfg(unix)]
+    {
+        let target = tmp.path().join("outside-lock");
+        fs::write(&target, "").expect("outside");
+        let link = tmp.path().join("symlink.lock");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        assert!(lock_within(&link, Duration::ZERO, &|_| Ok(())).is_err());
+        let bad_root = tmp.path().join("bad-runner-root");
+        fs::create_dir(&bad_root).expect("bad root");
+        std::os::unix::fs::symlink(&target, bad_root.join("runner.lock")).expect("runner symlink");
+        assert!(LabLog::need_runner_of(&bad_root, me).is_err());
+    }
 }
 
 #[test]

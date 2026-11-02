@@ -129,35 +129,6 @@ impl<'a> Driver<'a> {
         self
     }
 
-    /// The loop over screens that carry no submit count (`submits` unknown).
-    const fn uncounted(mut self) -> Self {
-        self.uncounted = true;
-        self
-    }
-
-    /// The `/usage` probe at `t`: its Enter, the session's submits one up, between its typed and closed ledger rows as `probe_owes` and `probe_closed` write them; the policy's memory unmoved.
-    fn probed(&mut self, t: i64) {
-        use crate::supervise::policy::turn_end::RULE_USAGE_PROBE;
-        self.to(t);
-        let (typed, closed) = (approvals::Outcome::Typed, approvals::Outcome::Waiting);
-        self.s.ledger_row(
-            RULE_USAGE_PROBE,
-            typed,
-            "/usage",
-            approvals::PROBE_TYPED_REASON,
-            self.seq,
-        );
-        self.submits += 1;
-        self.to(t + 5);
-        self.s.ledger_row(
-            RULE_USAGE_PROBE,
-            closed,
-            "/usage",
-            approvals::PROBE_CLOSED_REASON,
-            self.seq,
-        );
-    }
-
     /// The loop's monotonic clock runs `333 µs` past each point, so the wall clock's milliseconds lag it as the shipped loop's do.
     fn jittered(mut self) -> Self {
         self.jitter = Duration::from_micros(333);
@@ -363,91 +334,6 @@ fn unnamed(asks: &[Option<&str>]) -> Vec<String> {
     answered(&rows, asks)
 }
 
-#[test]
-fn a_wall_no_reader_names_is_typed_into_at_most_once_more_then_held_until_it_changes() {
-    for autopilot in [Autopilot::Cruise, Autopilot::Land] {
-        let tag = format!("same-reply-{autopilot:?}");
-        let (dir, ledger) = ledger_at(&tag);
-        let day = 86_400;
-        let out = replay(
-            &ledger,
-            autopilot,
-            CAPTURED,
-            false,
-            &[
-                r(&unnamed(&[]), 0, Some(600)),
-                r(&unnamed(&[None]), 60, Some(3)),
-                r(&unnamed(&[None]), 300, None),
-                r(&unnamed(&[None, None]), 360, Some(3)),
-                r(&unnamed(&[None, None]), 2 * day, None),
-            ],
-        );
-        let acts: Vec<&str> = out.iter().map(|o| o.act.as_str()).collect();
-        assert!(
-            acts[0].starts_with("act ") && acts[1] == "wait" && acts[2].starts_with("act "),
-            "{tag}: one act after the work, one more after the wall's first answer: {out:#?}"
-        );
-        assert_eq!(
-            acts[3..],
-            ["nothing", "nothing"],
-            "{tag}: the same reply again holds every act: {out:#?}"
-        );
-        assert!(out[..3].iter().all(|o| o.told.is_none()), "{out:#?}");
-        let held = Some(format!(
-            "stalled {}",
-            Exception::repeats(crate::harness::acts::HeldBy::SameReply).why
-        ));
-        assert!(
-            out[3..].iter().all(|o| o.told == held),
-            "{tag}: the tab's exception says so: {out:#?}"
-        );
-
-        let next = replay(
-            &ledger,
-            autopilot,
-            CAPTURED + 2 * day,
-            true,
-            &[
-                r(&unnamed(&[None, None]), 60, None),
-                sent(100, r(&unnamed(&[None, None, Some("hi")]), 200, Some(2))),
-                r(&unnamed(&[None, None, Some("hi")]), 7200, None),
-                r(&unnamed(&[None, None, Some("hi"), None]), 7260, Some(3)),
-                r(&unnamed(&[None, None, Some("hi"), None]), 9000, None),
-                r(&screen(muse::END_OF_TURN_1_4_10), 9600, Some(600)),
-            ],
-        );
-        let _ = std::fs::remove_dir_all(dir);
-        let acts: Vec<&str> = next.iter().map(|o| o.act.as_str()).collect();
-        assert_eq!(
-            acts[0], "nothing",
-            "{tag}: the next loop keeps the hold the ledger carried: {next:#?}"
-        );
-        assert!(
-            next[1].told.is_none() && acts[2].starts_with("act "),
-            "{tag}: a person's turn lets one more act go: {next:#?}"
-        );
-        assert_eq!(
-            acts[3..5],
-            ["nothing", "nothing"],
-            "{tag}: and the same reply to it holds again: {next:#?}"
-        );
-        assert!(
-            acts[5].starts_with("act ") && next[5].told.is_none(),
-            "{tag}: the agent working ends the hold: {next:#?}"
-        );
-    }
-}
-
-/// [`unnamed`] as a viewport 38 rows above the composer shows it: past the first answer every answer draws the same screen.
-fn steady(answers: usize) -> Vec<String> {
-    let rows = unnamed(&vec![None; answers]);
-    let composer = rows
-        .iter()
-        .position(|r| r.starts_with("── Voice input"))
-        .expect("the composer");
-    rows[composer - 38..].to_vec()
-}
-
 /// [`unnamed`] with its last wall drawn first as Muse Code's API error, the frame before it settles.
 fn api_frame(asks: &[Option<&str>]) -> Vec<String> {
     let mut rows = unnamed(asks);
@@ -460,71 +346,6 @@ fn api_frame(asks: &[Option<&str>]) -> Vec<String> {
         .to_owned();
     rows.remove(wall + 1);
     rows
-}
-
-#[test]
-fn a_wall_no_reader_names_on_a_screen_drawn_the_same_each_time_is_held_all_the_same() {
-    let held = Some(format!(
-        "stalled {}",
-        Exception::repeats(crate::harness::acts::HeldBy::SameReply).why
-    ));
-    assert_eq!(steady(1), steady(2), "the viewport repeats itself");
-    for autopilot in [Autopilot::Cruise, Autopilot::Land] {
-        let tag = format!("same-reply-steady-{autopilot:?}");
-        let (dir, ledger) = ledger_at(&tag);
-        let out = replay(
-            &ledger,
-            autopilot,
-            CAPTURED,
-            false,
-            &[
-                r(&screen(muse::END_OF_TURN_1_4_10), 0, Some(600)),
-                r(&steady(1), 60, Some(3)),
-                r(&steady(1), 300, None),
-                r(&steady(2), 360, Some(3)),
-                r(&steady(2), 86_400, None),
-            ],
-        );
-        let _ = std::fs::remove_dir_all(dir);
-        let acts: Vec<&str> = out.iter().map(|o| o.act.as_str()).collect();
-        assert!(
-            acts[0].starts_with("act ") && acts[1] == "wait" && acts[2].starts_with("act "),
-            "{tag}: one act after the work, one more after the wall's first answer: {out:#?}"
-        );
-        assert_eq!(
-            acts[3..],
-            ["nothing", "nothing"],
-            "{tag}: a screen that does not change is no excuse: {out:#?}"
-        );
-        assert!(out[3..].iter().all(|o| o.told == held), "{tag}: {out:#?}");
-    }
-}
-
-#[test]
-fn a_tab_already_looping_at_such_a_wall_gets_two_acts_at_most_from_a_loop_with_no_mark() {
-    for autopilot in [Autopilot::Cruise, Autopilot::Land] {
-        let tag = format!("same-reply-taken-up-{autopilot:?}");
-        let (dir, ledger) = ledger_at(&tag);
-        // The loop's first point, then each act's answer and the point an hour on past its back-off.
-        let mut points: Vec<R> = (0u32..3)
-            .flat_map(|k| {
-                let at = 7200 * i64::from(k);
-                let rows = steady(k as usize + 1);
-                [
-                    r(&rows, at, (k > 0).then_some(3)),
-                    r(&rows, at + 3600, None),
-                ]
-            })
-            .collect();
-        points.push(r(&steady(3), 3 * 86_400, None));
-        let out = replay(&ledger, autopilot, CAPTURED, false, &points);
-        let _ = std::fs::remove_dir_all(dir);
-        let acts = out.iter().filter(|o| o.act.starts_with("act ")).count();
-        assert!(
-            acts == 2 && out[4..].iter().all(|o| o.act == "nothing"),
-            "{tag}: {out:#?}"
-        );
-    }
 }
 
 /// The error frame is an outage wall (v6 §14.17.5.2): its answers count for no hold, and its
@@ -571,42 +392,6 @@ fn a_wall_no_reader_names_behind_an_api_error_frame_keeps_the_outages_ladder_nev
             "{tag}: {out:#?}"
         );
         assert!(out.iter().all(|o| o.told.is_none()), "{tag}: {out:#?}");
-    }
-}
-
-#[test]
-fn a_read_walls_reset_lets_the_same_reply_be_answered_once_more() {
-    for autopilot in [Autopilot::Cruise, Autopilot::Land] {
-        let tag = format!("same-reply-reset-{autopilot:?}");
-        let (dir, ledger) = ledger_at(&tag);
-        let past = RESET - CAPTURED + 3600;
-        let out = replay(
-            &ledger,
-            autopilot,
-            CAPTURED,
-            false,
-            &[
-                r(&unnamed(&[]), 0, Some(600)),
-                r(&unnamed(&[None]), 60, Some(3)),
-                r(&unnamed(&[None]), 300, None),
-                r(&before_hi(), 360, Some(3)),
-                r(&before_hi(), past, None),
-                r(&unnamed(&[None, None]), past + 60, Some(3)),
-                r(&unnamed(&[None, None]), past + 7200, None),
-                r(&unnamed(&[None, None, None]), past + 7260, Some(3)),
-            ],
-        );
-        let _ = std::fs::remove_dir_all(dir);
-        let acts: Vec<&str> = out.iter().map(|o| o.act.as_str()).collect();
-        assert!(
-            acts[2].starts_with("act ") && acts[3] == "wait" && acts[4] == "act usage-resume@v1",
-            "{tag}: the read wall is waited out and resumed: {out:#?}"
-        );
-        assert!(
-            acts[5] == "wait" && acts[6].starts_with("act "),
-            "{tag}: its reset is a change, the same reply after it answered once more: {out:#?}"
-        );
-        assert_eq!(acts[7], "nothing", "{tag}: and held again: {out:#?}");
     }
 }
 
@@ -670,72 +455,6 @@ fn the_same_reply_after_a_tool_run_each_time_is_no_repeat() {
     }
 }
 
-/// [`unnamed`] with each wall drawn in words of its own (no digit, so no one number): every answer a new reply.
-fn worded(answers: usize) -> Vec<String> {
-    let mut drawn = 0u8;
-    unnamed(&vec![None; answers])
-        .into_iter()
-        .map(|r| {
-            if r != "◆ Weekly allowance spent" {
-                return r;
-            }
-            drawn += 1;
-            format!("{r}, part {}", char::from(b'a' + drawn))
-        })
-        .collect()
-}
-
-#[test]
-fn a_wall_no_reader_names_answered_after_a_long_spell_that_ran_no_tool_is_held_all_the_same() {
-    let held = Some(format!(
-        "stalled {}",
-        Exception::repeats(crate::harness::acts::HeldBy::SameReply).why
-    ));
-    let walls: [(&'static str, WallRows); 3] = [
-        ("muse", |k| unnamed(&vec![None; k])),
-        ("claude", |k| {
-            vendor_walled("claude", &vec![None; k], claude_wall)
-        }),
-        ("agy", |k| vendor_walled("agy", &vec![None; k], agy_wall)),
-    ];
-    // Claude Code's measured no-work error turn (`Brewed for 2m 52s`), and Muse Code's 8 min of provider attempts.
-    for (program, rows) in walls {
-        for (autopilot, busy) in [Autopilot::Cruise, Autopilot::Land]
-            .into_iter()
-            .flat_map(|a| [172, 480].map(|b| (a, b)))
-        {
-            let tag = format!("same-reply-long-{program}-{autopilot:?}-{busy}s");
-            let (dir, ledger) = ledger_at(&tag);
-            let mut m = Mock::new(vec![busy_screen()]);
-            let mut d = Driver::new(&mut m, program, &ledger, autopilot, (CAPTURED, 0), false);
-            let (out, answers) = follow(&mut d, &r(&rows(0), 0, Some(600)), (60, busy), rows, 12);
-            let _ = std::fs::remove_dir_all(dir);
-            assert_eq!(
-                answers, 2,
-                "{tag}: the act after the work and one more, then held: {out:#?}"
-            );
-            let last = &out[out.len() - 3..];
-            assert!(
-                last.iter().all(|o| o.act == "nothing" && o.told == held),
-                "{tag}: {out:#?}"
-            );
-        }
-    }
-    // The control: a long answer in words of its own each time is work.
-    for autopilot in [Autopilot::Cruise, Autopilot::Land] {
-        let tag = format!("same-reply-long-worded-{autopilot:?}");
-        let (dir, ledger) = ledger_at(&tag);
-        let mut m = Mock::new(vec![busy_screen()]);
-        let mut d = Driver::new(&mut m, "muse", &ledger, autopilot, (CAPTURED, 0), false);
-        let (out, answers) = follow(&mut d, &r(&worded(0), 0, Some(600)), (60, 480), worded, 8);
-        let _ = std::fs::remove_dir_all(dir);
-        assert!(
-            answers == 8 && out.iter().all(|o| o.told.is_none()),
-            "{tag}: {out:#?}"
-        );
-    }
-}
-
 /// The harness's continuation as each program echoes it ([`vendor_walled`]).
 const ASK: &str = "[aterm harness] Continue the task.";
 
@@ -783,499 +502,91 @@ fn vendor_walled(
     out
 }
 
-/// A wall's rows at its `k`th answer ([`vendor_walled`]).
-type WallRows = fn(usize) -> Vec<String>;
-
-/// Claude Code's `⎿` row in words no reader names, under the message it answers.
-fn claude_wall(_: usize) -> Vec<String> {
-    vec![
-        "  ⎿  Allowance spent for now · back at 5:11pm (America/Los_Angeles)".to_owned(),
-        String::new(),
-        "✻ Cogitated for 0s · done 3:11 PM".to_owned(),
-    ]
-}
-
-/// agy's measured failed turn ([`aterm_phase::agy::fixtures::ERROR_TURN`]): a `⚠` row no reader
-/// names, its `Error ID:` fresh at each answer.
-fn agy_wall(k: usize) -> Vec<String> {
-    vec![
-        "⚠ failed to construct executor: plan model not specified; you must specify a valid model"
-            .to_owned(),
-        format!(
-            "Error ID: {:08x}-3c96-43a3-9843-826cfa2918db-{}",
-            0xe855_92f1_u32.wrapping_add(u32::try_from(k).unwrap_or(0) * 7919),
-            k + 1
-        ),
-    ]
-}
-
-fn reader_of(program: &str) -> &'static dyn aterm_phase::ScreenReader {
-    match program {
-        "claude" => aterm_phase::Program::Claude.reader(),
-        "agy" => aterm_phase::Program::Agy.reader(),
-        "muse" => aterm_phase::Program::Muse.reader(),
-        other => panic!("no reader named {other}"),
-    }
-}
-
+/// A HOST STEPPING AT A POINT IS TOLD THE STOP THE DECISION THERE READ
+/// ([`IdlePoint::replies_held`]): under Land none while the loop still answers the reply, the stop
+/// once it types nothing for it, so a carry-on owed there types nothing either. CONTROL: under Cruise
+/// the same answers get another turn each time, and it is told of no stop. MUTANT: `replies_held:
+/// false` at [`Session::host_steps_here`] fails under Land; read off [`TurnEndState::held_by`],
+/// under Cruise.
 #[test]
-fn a_vendor_row_no_reader_names_is_typed_into_at_most_once_more_then_held() {
-    let held = Some(format!(
-        "stalled {}",
-        Exception::repeats(crate::harness::acts::HeldBy::SameReply).why
-    ));
-    let walls: [(&'static str, WallRows); 2] = [("claude", claude_wall), ("agy", agy_wall)];
-    for (program, wall) in walls {
-        let rows = |asks: &[Option<&str>]| vendor_walled(program, asks, wall);
-        let reader = reader_of(program);
-        for answers in 0..3 {
-            let r = rows(&vec![None; answers]);
-            assert!(
-                reader.wall(&r).is_none() && reader.health_wall(&r).is_none(),
-                "{program}: no reader names the wall: {r:#?}"
-            );
+fn a_host_stepping_at_a_point_is_told_the_stop_the_decision_read() {
+    #[derive(Debug, Default)]
+    struct Told(Mutex<Vec<bool>>);
+    impl IdleHost for Told {
+        fn wants(&self) -> bool {
+            true
         }
-        // The person's turn timed or not: a point sees its busy spell, or only what it drew, which lifts nothing.
-        for (autopilot, took_hi) in [Autopilot::Cruise, Autopilot::Land]
-            .into_iter()
-            .flat_map(|a| [Some(2), None].map(|t| (a, t)))
-        {
-            let tag = format!("same-reply-{program}-{autopilot:?}-{took_hi:?}");
-            let hi = rows(&[None, None, Some("hi")]);
-            let points = [
-                r(&rows(&[]), 0, Some(600)),
-                r(&rows(&[None]), 60, Some(3)),
-                r(&rows(&[None]), 300, None),
-                r(&rows(&[None, None]), 360, Some(3)),
-                r(&rows(&[None, None]), 2 * 86_400, None),
-                sent(2 * 86_400 + 60, r(&hi, 2 * 86_400 + 120, took_hi)),
-                r(&hi, 2 * 86_400 + 7200, None),
-                // The one act it lets go answered the same, or the screen as it stood.
-                match took_hi {
-                    Some(_) => r(
-                        &rows(&[None, None, Some("hi"), None]),
-                        2 * 86_400 + 7260,
-                        Some(3),
-                    ),
-                    None => r(&hi, 2 * 86_400 + 10_800, None),
-                },
-            ];
-            let (dir, ledger) = ledger_at(&tag);
-            let out = replay_as(program, &ledger, autopilot, CAPTURED, false, &points);
-            let _ = std::fs::remove_dir_all(dir);
-            // A loop taking over at the person's `hi`, the session's submit count carried on.
-            let (dir, ledger) = ledger_at(&format!("{tag}-takeover"));
-            let (before, submits) = replay_counted(
-                program,
-                &ledger,
-                autopilot,
-                CAPTURED,
-                (false, 0),
-                &points[..5],
-            );
-            let (after, _) = replay_counted(
-                program,
-                &ledger,
-                autopilot,
-                CAPTURED,
-                (true, submits),
-                &points[5..],
-            );
-            let _ = std::fs::remove_dir_all(dir);
-            assert_eq!(before, out[..5], "{tag}: the same loop up to the hold");
-            let taken: Vec<&str> = after.iter().map(|o| o.act.as_str()).collect();
-            let acts: Vec<&str> = out.iter().map(|o| o.act.as_str()).collect();
-            assert!(
-                acts[0].starts_with("act ") && acts[1] == "wait" && acts[2].starts_with("act "),
-                "{tag}: one act after the work, one more after the wall's first answer: {out:#?}"
-            );
-            assert_eq!(
-                acts[3..5],
-                ["nothing", "nothing"],
-                "{tag}: the same reply again holds every act: {out:#?}"
-            );
-            assert!(out[3..5].iter().all(|o| o.told == held), "{tag}: {out:#?}");
-            if took_hi.is_some() {
-                assert!(
-                    acts[6].starts_with("act ") && acts[7] == "nothing",
-                    "{tag}: a person's turn a point saw busy lets one more act go, and the same \
-                     reply holds again: {out:#?}"
-                );
-                assert!(
-                    taken[1].starts_with("act ") && taken[2] == "nothing",
-                    "{tag}-takeover: so does one the new loop's first point saw busy: {after:#?}"
-                );
-            } else {
-                assert!(
-                    out[5..]
-                        .iter()
-                        .chain(&after)
-                        .all(|o| !o.act.starts_with("act "))
-                        && out[6..].iter().chain(&after[1..]).all(|o| o.told == held),
-                    "{tag}: a person's turn no point saw busy lifts nothing, in the loop or at a \
-                     takeover: {out:#?} {after:#?}"
-                );
-            }
+        fn at_idle(&self) -> Option<HostStep> {
+            None
+        }
+        fn at_idle_on(&self, point: IdlePoint) -> Option<HostStep> {
+            self.0.lock().unwrap().push(point.replies_held);
+            None
+        }
+        fn owns_turn_end(&self) -> bool {
+            false
         }
     }
-}
-
-/// Claude Code's reply in words no reader names, headed by `⏺` so the screen names the prompt it answers ([`aterm_phase::answered_prompt`]).
-fn claude_said(_: usize) -> Vec<String> {
-    vec![
-        "⏺ Allowance spent for now · back at 5:11pm (America/Los_Angeles)".to_owned(),
-        String::new(),
-        "✻ Cogitated for 0s · done 3:11 PM".to_owned(),
-    ]
-}
-
-#[test]
-fn a_persons_new_prompt_row_lifts_a_claude_hold_only_where_a_point_saw_it_busy() {
-    let held = Some(format!(
-        "stalled {}",
-        Exception::repeats(crate::harness::acts::HeldBy::SameReply).why
-    ));
-    let rows = |asks: &[Option<&str>]| vendor_walled("claude", asks, claude_said);
-    let reader = reader_of("claude");
-    for asks in [&[None][..], &[None, None, Some("hi")]] {
-        let r = rows(asks);
-        assert!(
-            reader.wall(&r).is_none() && reader.health_wall(&r).is_none(),
-            "no reader names the wall: {r:#?}"
-        );
-        assert_eq!(
-            aterm_phase::answered_prompt(&r).as_deref(),
-            asks.last().map(|a| a.unwrap_or(ASK)),
-            "the screen names the prompt answered: {r:#?}"
-        );
-    }
-    let stood = rows(&[None, None]);
-    let scrolled = stood[up(&stood)..].to_vec();
-    let hi = rows(&[None, None, Some("hi")]);
-    let (again, resumed) = (
-        rows(&[None, None, Some("hi"), Some("still there?")]),
-        rows(&[None, None, Some("hi"), Some("still there?"), None]),
-    );
-    let t = 2 * 86_400;
-    let keys = |typed: i64, rows: &[String], at: i64, took: Option<u64>| R {
-        typed: Some(typed),
-        ..r(rows, at, took)
-    };
-    for autopilot in [Autopilot::Cruise, Autopilot::Land] {
-        let tag = format!("claude-prompt-row-{autopilot:?}");
-        let (dir, ledger) = ledger_at(&tag);
+    let told_along = |autopilot: Autopilot, tag: &str| {
+        let (dir, ledger) = ledger_at(tag);
         let mut m = Mock::new(vec![busy_screen()]);
-        let mut d =
-            Driver::new(&mut m, "claude", &ledger, autopilot, (CAPTURED, 0), false).uncounted();
-        let out: Vec<Out> = [
-            r(&rows(&[]), 0, Some(600)),
-            r(&rows(&[None]), 60, Some(3)),
-            r(&rows(&[None]), 300, None),
-            r(&stood, 360, Some(3)),
-            r(&stood, t, None),
-            // Keys over the conversation scrolled a row: no new prompt row.
-            keys(t + 30, &scrolled, t + 60, None),
-            r(&scrolled, t + 3600, None),
-            // The person's `hi`, its busy spell unseen and its Enter uncounted: its prompt row alone shows it.
-            keys(t + 3660, &hi, t + 3720, None),
-            r(&hi, t + 7200, None),
-            // Their next prompt, its busy spell seen.
-            keys(t + 10_740, &again, t + 10_800, Some(2)),
-            r(&again, t + 18_000, None),
-            r(&resumed, t + 18_060, Some(3)),
-        ]
-        .iter()
-        .map(|p| d.point(p))
-        .collect();
-        let _ = std::fs::remove_dir_all(dir);
-        let acts: Vec<&str> = out.iter().map(|o| o.act.as_str()).collect();
-        assert!(
-            acts[0].starts_with("act ") && acts[1] == "wait" && acts[2].starts_with("act "),
-            "{tag}: {out:#?}"
-        );
-        assert!(
-            acts[5..9].iter().all(|a| !a.starts_with("act "))
-                && [3, 4, 6, 8]
-                    .iter()
-                    .all(|&i| acts[i] == "nothing" && out[i].told == held),
-            "{tag}: held, keys and a new prompt row no point saw busy included: {out:#?}"
-        );
-        assert!(
-            acts[9..11].iter().filter(|a| a.starts_with("act ")).count() == 1
-                && acts[11] == "nothing"
-                && out[11].told == held,
-            "{tag}: the prompt a point saw busy lets one more act go, then held again: {out:#?}"
-        );
-    }
-}
-
-/// Claude Code's walled turn of [`vendor_walled`], then each of `opens` under it answered by [`claude_wall`]: the harness's continuation (`None`), a person's prompt, or a Monitor's event opening the program's own turn, as 2.1.302 draws it (`Some("")`, the same event each time; `Some("+")`, the `k`th open's own step).
-fn self_started(opens: &[Option<&str>]) -> Vec<String> {
-    let base = vendor_walled("claude", &[], claude_wall);
-    let composer = base
-        .iter()
-        .position(|r| r.starts_with("────"))
-        .expect("the composer");
-    let mut out = base[..composer].to_vec();
-    for (k, open) in opens.iter().enumerate() {
-        match open {
-            Some("") => out.push("⏺ Monitor event: build step 3 done · build watch".to_owned()),
-            Some("+") => out.push(format!(
-                "⏺ Monitor event: build step {} done · build watch",
-                k + 3
-            )),
-            open => out.extend([format!("❯ {}", open.unwrap_or(ASK)), String::new()]),
-        }
-        out.extend(claude_wall(0));
-        out.push(String::new());
-    }
-    out.extend(base[composer..].iter().cloned());
-    out
-}
-
-/// A Claude Code loop at [`self_started`]'s wall, each act answered by the wall again: once held, the program opens `own` turns itself an hour apart (`events`, each a Monitor's event, `Some("+")` one of its own; else its own retry, the screen drawn as it stood), each answered by the wall in `took` seconds (`None`, a busy spell the loop never saw), then a person types `hi`. The acts typed, and what the last point told.
-fn own_turns(
-    tag: &str,
-    autopilot: Autopilot,
-    events: Option<&'static str>,
-    own: usize,
-    took_own: Option<u64>,
-) -> (Vec<String>, Option<String>) {
-    let (dir, ledger) = ledger_at(tag);
-    let mut m = Mock::new(vec![busy_screen()]);
-    let mut d = Driver::new(&mut m, "claude", &ledger, autopilot, (CAPTURED, 0), false);
-    let (mut opens, mut at, mut took, mut typed) = (Vec::new(), 0, Some(600), None);
-    let (mut out, mut turns, mut person) = (Vec::new(), 0, false);
-    while out.len() < 24 {
-        let o = d.point(&R {
-            entered: typed.is_some(),
-            typed: typed.take(),
-            ..r(&self_started(&opens), at, took.take())
-        });
-        match (&o.act[..], o.until) {
-            ("wait", Some(u)) => at = u - CAPTURED + 1,
-            ("nothing", _) if turns < own => {
-                turns += 1;
-                at += 3600;
-                if let Some(event) = events {
-                    opens.push(Some(event));
-                }
-                took = took_own;
-            }
-            ("nothing", _) if !person => {
-                person = true;
-                at += 3600;
-                typed = Some(at - 60);
-                opens.push(Some("hi"));
-                took = Some(2);
-            }
-            ("nothing", _) => at += 86_400,
-            _ => {
-                at += 60;
-                opens.push(None);
-                took = Some(3);
-            }
-        }
-        out.push(o);
-    }
-    let _ = std::fs::remove_dir_all(dir);
-    let acts = out
-        .iter()
-        .map(|o| o.act.clone())
-        .filter(|a| a.starts_with("act "))
-        .collect();
-    (acts, out.last().and_then(|o| o.told.clone()))
-}
-
-#[test]
-fn a_no_work_turn_the_program_opens_itself_counts_as_an_acts_answer() {
-    use crate::supervise::policy::turn_end::NO_WORK_ACTS;
-    let held = Some(format!(
-        "stalled {}",
-        Exception::repeats(crate::harness::acts::HeldBy::SameReply).why
-    ));
-    for autopilot in [Autopilot::Cruise, Autopilot::Land] {
-        let tag = format!("self-started-{autopilot:?}");
-        let (bare, told) = own_turns(&tag, autopilot, None, 0, Some(3));
-        assert_eq!(
-            bare.len(),
-            3,
-            "{tag}: two acts to the hold, the person's one more: {bare:?}"
-        );
-        assert_eq!(told, held, "{tag}: and its answer holds again");
-        // The program's own retry says the reply again: the hold stands.
-        for own in [1, 4] {
-            let (acts, told) = own_turns(&tag, autopilot, None, own, Some(3));
-            assert_eq!(acts, bare, "{tag}: {own} own retries keep the hold");
-            assert_eq!(told, held, "{tag}");
-        }
-        // A Monitor's event says new words, so the reply changed, but each such turn counts into the run of no-work answers: however many come, the acts stop at the same count.
-        let (four, told) = own_turns(&tag, autopilot, Some(""), 4, Some(3));
-        assert_eq!(told, held, "{tag}: {four:?}");
-        let (eight, told) = own_turns(&tag, autopilot, Some(""), 8, Some(3));
-        assert_eq!(told, held, "{tag}: {eight:?}");
-        assert!(
-            four.len() == eight.len() && four.len() < NO_WORK_ACTS,
-            "{tag}: the run holds the events' turns: {four:?} {eight:?}"
-        );
-        // Each event in words of its own, and each turn one whose busy spell no point saw: the same count, and held.
-        for (event, took) in [(Some("+"), Some(3)), (Some(""), None), (Some("+"), None)] {
-            let (ten, told) = own_turns(&tag, autopilot, event, 10, took);
-            assert!(
-                ten.len() == four.len() && told == held,
-                "{tag}: {event:?} {took:?}: {ten:?} {told:?}"
-            );
-        }
-    }
-}
-
-/// A Claude Code worker waiting on a background suite: `acts` continuations answered by the same words, then `events` Monitor events it answers itself, then `done`, the row that opens its report.
-fn waiting_on_suite(acts: usize, events: usize, done: Option<&str>) -> Vec<String> {
-    let base = vendor_walled("claude", &vec![None; acts], |_| {
-        [
-            "⏺ Still waiting on the background suite.",
-            "",
-            "✻ Churned for 3s",
-        ]
-        .map(str::to_owned)
-        .to_vec()
-    });
-    let composer = base
-        .iter()
-        .position(|r| r.starts_with("────"))
-        .expect("the composer");
-    let mut out = base[..composer].to_vec();
-    for e in 3..3 + events {
-        out.extend([
-            format!("⏺ Monitor event: suite step {e} passed · suite watch"),
-            String::new(),
-            format!("⏺ Step {e} passed; waiting for the rest."),
-            String::new(),
-            "✻ Churned for 2s".to_owned(),
-            String::new(),
-        ]);
-    }
-    if let Some(done) = done {
-        out.extend(
-            [
-                done,
-                "",
-                "⏺ The suite passed: 412 of 412.",
-                "",
-                "✻ Churned for 2s",
-                "",
-            ]
-            .map(str::to_owned),
-        );
-    }
-    out.extend(base[composer..].iter().cloned());
-    out
-}
-
-#[test]
-fn a_background_tasks_end_after_monitor_events_is_work() {
-    let held = Some(format!(
-        "stalled {}",
-        Exception::repeats(crate::harness::acts::HeldBy::NoWork).why
-    ));
-    // As claude-2.1.304-verbose-background-command-login-words.txt draws it, then as 2.1.268's notice builders draw a failure and a monitor's end; the control, in words.
-    let ends = [
-        "⏺ Background command \"Run the division suite\" completed (exit code 0)",
-        "⏺ Background command \"Run the division suite\" failed with exit code 1",
-        "⏺ Monitor \"suite watch\" stream ended",
-    ];
-    let words = "⏺ Background command \"Run the division suite\" is done.";
-    for (done, events, autopilot) in ends.into_iter().chain([words]).flat_map(|done| {
-        [0, 2, 4]
-            .into_iter()
-            .flat_map(move |e| [Autopilot::Cruise, Autopilot::Land].map(move |a| (done, e, a)))
-    }) {
-        let tag = format!("bg-done-{autopilot:?}-{events}-{}", done.len());
-        let (dir, ledger) = ledger_at(&tag);
-        let mut m = Mock::new(vec![busy_screen()]);
-        let mut d = Driver::new(&mut m, "claude", &ledger, autopilot, (CAPTURED, 0), false);
-        let (mut acts, mut at, mut took) = (0, 0, Some(600));
-        // The continuations, to the hold.
-        loop {
-            let o = d.point(&r(&waiting_on_suite(acts, 0, None), at, took.take()));
-            match (&o.act[..], o.until) {
-                ("wait", Some(u)) => at = u - CAPTURED + 1,
+        m.program = "muse";
+        let mut d = Driver::new(&mut m, "muse", &ledger, autopilot, (CAPTURED, 0), false);
+        let mut told = Vec::new();
+        let (mut answers, mut at, mut took) = (0, 0, Some(600));
+        for _ in 0..24 {
+            let p = r(&unnamed(&vec![None; answers]), at, took);
+            let out = d.point(&p);
+            let host = Arc::new(Told::default());
+            let opts = SuperviseOpts {
+                idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+                ..d.opts.clone()
+            };
+            let mut point = d.s.turn_of(Screen {
+                rows: p.rows.clone(),
+                seq: d.seq,
+                submits: Some(d.submits),
+                ..Screen::default()
+            });
+            point.screen.cursor_row = aterm_phase::muse::composer(&p.rows).expect("its caret");
+            // Standing for the wait's step, which offers the point the last step passed over.
+            d.s.host_passed = None;
+            let _ = d.s.host_steps_here(&point, &opts, &mut false, &mut Alone);
+            let heard = host.0.lock().unwrap().clone();
+            told.push((out.act.clone(), heard));
+            (at, took) = match (&out.act[..], out.until) {
+                ("wait", Some(until)) => (until - CAPTURED + 1, None),
                 ("nothing", _) => break,
-                _ => (acts, at, took) = (acts + 1, at + 60, Some(3)),
-            }
-            assert!(acts <= 2, "{tag}: the same words hold: {o:?}");
-        }
-        for e in 1..=events {
-            at += 600;
-            d.point(&r(&waiting_on_suite(acts, e, None), at, Some(2)));
-        }
-        at += 600;
-        let report = waiting_on_suite(acts, events, Some(done));
-        let mut o = d.point(&r(&report, at, Some(2)));
-        if let ("wait", Some(u)) = (&o.act[..], o.until) {
-            o = d.point(&r(&report, u - CAPTURED + 1, None));
+                _ => {
+                    answers += 1;
+                    (at + 60, Some(3))
+                }
+            };
         }
         let _ = std::fs::remove_dir_all(dir);
-        if done != words {
-            assert!(
-                o.act.starts_with("act ") && o.told.is_none(),
-                "{tag}: the task's end is work, so its report is answered: {o:?}"
-            );
-        } else if events > 2 {
-            assert!(
-                o.act == "nothing" && o.told == held,
-                "{tag}: in words it is the run's next no-work turn: {o:?}"
-            );
-        }
-    }
-}
-
-/// [`unnamed`] with its reset a countdown, each answer's a minute count of its own.
-fn counting_down(asks: &[Option<&str>]) -> Vec<String> {
-    let mut k = 0;
-    unnamed(asks)
-        .into_iter()
-        .map(|r| {
-            if r != "  Back on Oct 25 at 5:00 PM" {
-                return r;
-            }
-            k += 1;
-            format!("  Back in {} minutes", 900 - 37 * k)
-        })
-        .collect()
-}
-
-#[test]
-fn a_wall_no_reader_names_counting_down_its_reset_is_the_same_reply() {
-    let held = Some(format!(
-        "stalled {}",
-        Exception::repeats(crate::harness::acts::HeldBy::SameReply).why
-    ));
-    assert_ne!(counting_down(&[None]), counting_down(&[None, None])[..]);
-    for autopilot in [Autopilot::Cruise, Autopilot::Land] {
-        let tag = format!("same-reply-countdown-{autopilot:?}");
-        let (dir, ledger) = ledger_at(&tag);
-        let out = replay(
-            &ledger,
-            autopilot,
-            CAPTURED,
-            false,
-            &[
-                r(&counting_down(&[]), 0, Some(600)),
-                r(&counting_down(&[None]), 60, Some(3)),
-                r(&counting_down(&[None]), 300, None),
-                r(&counting_down(&[None, None]), 360, Some(3)),
-                r(&counting_down(&[None, None]), 86_400, None),
-            ],
-        );
-        let _ = std::fs::remove_dir_all(dir);
-        let acts: Vec<&str> = out.iter().map(|o| o.act.as_str()).collect();
-        assert!(
-            acts[2].starts_with("act ") && acts[3..] == ["nothing", "nothing"],
-            "{tag}: a count in the reply is no new reply: {out:#?}"
-        );
-        assert!(out[3..].iter().all(|o| o.told == held), "{tag}: {out:#?}");
-    }
+        told
+    };
+    let land = told_along(Autopilot::Land, "same-reply-told-land");
+    let (last, before) = land.split_last().expect("a point");
+    assert_eq!(last.0, "nothing", "the loop stops: {land:#?}");
+    assert_eq!(
+        last.1,
+        [true],
+        "the stop, as the decision read it: {land:#?}"
+    );
+    assert!(
+        before.iter().flat_map(|(_, heard)| heard).any(|held| !held),
+        "no stop before it, the host stepped: {land:#?}"
+    );
+    let cruise = told_along(Autopilot::Cruise, "same-reply-told-cruise");
+    assert!(
+        cruise.iter().flat_map(|(_, heard)| heard).all(|held| !held),
+        "another turn each time: {cruise:#?}"
+    );
+    assert!(
+        cruise.iter().any(|(_, heard)| !heard.is_empty()),
+        "the host stepped: {cruise:#?}"
+    );
 }
 
 /// `points` points of a loop that follows its own decisions from `first` and then `from`: each
@@ -1912,56 +1223,6 @@ fn a_held_wall_stays_held_in_the_loop_that_takes_over() {
     }
 }
 
-/// [`unnamed`] with its wall's answers in two wordings by turns: the first, the second, the first…
-fn alternating(answers: usize) -> Vec<String> {
-    let mut drawn = 0;
-    unnamed(&vec![None; answers])
-        .into_iter()
-        .map(|r| {
-            if r != "◆ Weekly allowance spent" {
-                return r;
-            }
-            drawn += 1;
-            // The viewport's top and the continuation's first answer, then each act's.
-            if drawn > 2 && drawn % 2 == 1 {
-                "◆ Allowance used up this week".to_owned()
-            } else {
-                r
-            }
-        })
-        .collect()
-}
-
-#[test]
-fn a_wall_no_reader_names_in_two_wordings_by_turns_is_held_at_its_first_repeat() {
-    let held = Some(format!(
-        "stalled {}",
-        Exception::repeats(crate::harness::acts::HeldBy::SameReply).why
-    ));
-    assert_ne!(alternating(1), unnamed(&[None]), "the second wording drawn");
-    for autopilot in [Autopilot::Cruise, Autopilot::Land] {
-        let tag = format!("same-reply-alternating-{autopilot:?}");
-        let (dir, ledger) = ledger_at(&tag);
-        let mut m = Mock::new(vec![busy_screen()]);
-        let mut d = Driver::new(&mut m, "muse", &ledger, autopilot, (CAPTURED, 0), false);
-        let (out, answers) = follow(
-            &mut d,
-            &r(&alternating(0), 0, Some(600)),
-            (60, 3),
-            alternating,
-            10,
-        );
-        let _ = std::fs::remove_dir_all(dir);
-        // The act after the work, one after each wording, held when the first comes again.
-        assert_eq!(answers, 3, "{tag}: {out:#?}");
-        let last = &out[out.len() - 3..];
-        assert!(
-            last.iter().all(|o| o.act == "nothing" && o.told == held),
-            "{tag}: {out:#?}"
-        );
-    }
-}
-
 /// Claude Code's 529 row as 2.1.283 draws it ([`aterm_phase::prompt::fixtures::API_ERROR_529`]) and the turn's end under it.
 fn claude_529(_: usize) -> Vec<String> {
     let rows = screen(aterm_phase::prompt::fixtures::API_ERROR_529);
@@ -2149,180 +1410,6 @@ fn a_build_that_fails_the_same_after_collapsed_shell_commands_is_work_each_time(
 }
 
 #[test]
-fn a_git_only_answer_that_says_the_same_is_work_each_time() {
-    let held = Some(format!(
-        "stalled {}",
-        Exception::repeats(crate::harness::acts::HeldBy::SameReply).why
-    ));
-    let reader = aterm_phase::Program::Claude.reader();
-    // wait_bg17.out's measured row and 2.1.268's renderer's (its shell count leaves git commands out), then the shell count's.
-    for group in [
-        "  Pushed to main, rebased onto origin/main",
-        "  Committed 1a2b3c4, pushed to main",
-        "  Ran 2 shell commands",
-    ] {
-        let rows = build_fails(group);
-        assert!(reader.turn_ran_tools(&rows(2)), "{group:?} is read");
-        for (autopilot, busy) in [Autopilot::Cruise, Autopilot::Land]
-            .into_iter()
-            .flat_map(|a| [30, 550].map(|b| (a, b)))
-        {
-            let tag = format!("git-work-{autopilot:?}-{busy}-{}", group.len());
-            let (dir, ledger) = ledger_at(&tag);
-            let mut m = Mock::new(vec![busy_screen()]);
-            let mut d = Driver::new(&mut m, "claude", &ledger, autopilot, (CAPTURED, 0), false);
-            let (out, answers) = follow(&mut d, &r(&rows(0), 0, Some(600)), (60, busy), &rows, 10);
-            let _ = std::fs::remove_dir_all(dir);
-            assert!(
-                answers > 2 && out.iter().all(|o| o.act != "nothing" && o.told.is_none()),
-                "{tag}: {group:?} is work, every act typed: {out:#?}"
-            );
-        }
-    }
-    // The control: the same answer with the row in words, a lone plain ref's included, is held.
-    for (autopilot, busy, words) in [Autopilot::Cruise, Autopilot::Land]
-        .into_iter()
-        .flat_map(|a| [30, 550].map(|b| (a, b)))
-        .flat_map(|(a, b)| {
-            [
-                "  Pushed to main, then waited for the checks",
-                "  Merged cleanly",
-                "  Pushed to production",
-            ]
-            .map(|w| (a, b, w))
-        })
-    {
-        let rows = build_fails(words);
-        assert!(!reader.turn_ran_tools(&rows(2)), "{words:?} is words");
-        let tag = format!("git-words-{autopilot:?}-{busy}-{}", words.len());
-        let (dir, ledger) = ledger_at(&tag);
-        let mut m = Mock::new(vec![busy_screen()]);
-        let mut d = Driver::new(&mut m, "claude", &ledger, autopilot, (CAPTURED, 0), false);
-        let (out, answers) = follow(&mut d, &r(&rows(0), 0, Some(600)), (60, busy), &rows, 10);
-        let _ = std::fs::remove_dir_all(dir);
-        assert!(
-            answers == 2
-                && out
-                    .last()
-                    .is_some_and(|o| o.act == "nothing" && o.told == held),
-            "{tag}: {out:#?}"
-        );
-    }
-}
-
-/// A Claude Code answer that ran no tool, its reply's last paragraph `paragraph`.
-fn paragraph_ends(paragraph: &'static str) -> impl Fn(usize) -> Vec<String> {
-    move |k: usize| {
-        let mut said = vec!["⏺ I can't land this until it is reviewed.", ""];
-        if paragraph.starts_with('⏺') {
-            said.clear();
-        }
-        said.extend([paragraph, "", "✻ Worked for 3s"]);
-        vendor_walled("claude", &vec![None; k], |_| {
-            said.iter().map(|&r| r.to_owned()).collect()
-        })
-    }
-}
-
-#[test]
-fn a_reply_ending_in_a_git_clauses_words_said_the_same_is_held() {
-    let held = Some(format!(
-        "stalled {}",
-        Exception::repeats(crate::harness::acts::HeldBy::SameReply).why
-    ));
-    let reader = aterm_phase::Program::Claude.reader();
-    for paragraph in [
-        "  Waiting on PR #12",
-        "  Pushed to main",
-        "  Merged cleanly",
-        "  Pushed to production",
-        "⏺ Pushed to main",
-    ] {
-        let rows = paragraph_ends(paragraph);
-        assert!(!reader.turn_ran_tools(&rows(2)), "{paragraph:?} is words");
-        for autopilot in [Autopilot::Cruise, Autopilot::Land] {
-            let tag = format!("git-paragraph-{autopilot:?}-{}", paragraph.len());
-            let (dir, ledger) = ledger_at(&tag);
-            let mut m = Mock::new(vec![busy_screen()]);
-            let mut d = Driver::new(&mut m, "claude", &ledger, autopilot, (CAPTURED, 0), false);
-            let (out, answers) = follow(&mut d, &r(&rows(0), 0, Some(600)), (60, 3), &rows, 12);
-            let _ = std::fs::remove_dir_all(dir);
-            assert!(
-                answers == 2
-                    && out
-                        .last()
-                        .is_some_and(|o| o.act == "nothing" && o.told == held),
-                "{tag}: {paragraph:?} said the same holds after two acts: {out:#?}"
-            );
-        }
-    }
-}
-
-/// A Claude Code answer that ran no other tool: the same words each turn, then `row(k)`, its `k`th answer's own group row, ending the turn.
-fn landed_ends(row: fn(usize) -> String) -> impl Fn(usize) -> Vec<String> {
-    move |k: usize| {
-        vendor_walled("claude", &vec![None; k], |j| {
-            vec![
-                "⏺ Landed the parser fix.".to_owned(),
-                String::new(),
-                row(j),
-                String::new(),
-                "✻ Worked for 3s".to_owned(),
-            ]
-        })
-    }
-}
-
-#[test]
-fn a_reply_ending_in_its_commits_row_is_work_each_time() {
-    let held = Some(format!(
-        "stalled {}",
-        Exception::repeats(crate::harness::acts::HeldBy::SameReply).why
-    ));
-    let reader = aterm_phase::Program::Claude.reader();
-    // Each answer's commit is its own; its sha is what a sentence lacks, wherever the row stands, alone or before a push.
-    let commits: [fn(usize) -> String; 2] = [
-        |j| format!("  Committed {:07x}, pushed to main", 0x1a2b3c4 + 16 * j),
-        |j| format!("  Committed {:07x}", 0x1a2b3c4 + 16 * j),
-    ];
-    let words = landed_ends(|_| "  Pushed to main".to_owned());
-    assert!(
-        !reader.turn_ran_tools(&words(2)),
-        "the control's row is words"
-    );
-    for autopilot in [Autopilot::Cruise, Autopilot::Land] {
-        for (n, commit) in commits.into_iter().enumerate() {
-            let rows = landed_ends(commit);
-            assert!(reader.turn_ran_tools(&rows(2)), "the commit row is read");
-            let tag = format!("commit-row-{autopilot:?}-{n}");
-            let (dir, ledger) = ledger_at(&tag);
-            let mut m = Mock::new(vec![busy_screen()]);
-            let mut d = Driver::new(&mut m, "claude", &ledger, autopilot, (CAPTURED, 0), false);
-            let (out, answers) = follow(&mut d, &r(&rows(0), 0, Some(600)), (60, 3), &rows, 10);
-            let _ = std::fs::remove_dir_all(dir);
-            assert!(
-                answers > 2 && out.iter().all(|o| o.act != "nothing" && o.told.is_none()),
-                "{tag}: each commit is work, every act typed: {out:#?}"
-            );
-        }
-        // The control: the same answers ending in a lone `  Pushed to main` are held after two acts.
-        let tag = format!("commit-words-{autopilot:?}");
-        let (dir, ledger) = ledger_at(&tag);
-        let mut m = Mock::new(vec![busy_screen()]);
-        let mut d = Driver::new(&mut m, "claude", &ledger, autopilot, (CAPTURED, 0), false);
-        let (out, answers) = follow(&mut d, &r(&words(0), 0, Some(600)), (60, 3), &words, 12);
-        let _ = std::fs::remove_dir_all(dir);
-        assert!(
-            answers == 2
-                && out
-                    .last()
-                    .is_some_and(|o| o.act == "nothing" && o.told == held),
-            "{tag}: {out:#?}"
-        );
-    }
-}
-
-#[test]
 fn collapsed_shell_work_cut_by_a_529_each_time_keeps_its_retries() {
     let reader = aterm_phase::Program::Claude.reader();
     let rows = |k: usize| {
@@ -2356,291 +1443,7 @@ fn collapsed_shell_work_cut_by_a_529_each_time_keeps_its_retries() {
     }
 }
 
-/// Muse Code's `loops` loops over `rows`, each ended by the act it types (its row written as the loop writes it), the next seeded from the ledger; the first answers 600 s of work, each act a 3 s one.
-fn restarting_each_act(
-    ledger: &Path,
-    autopilot: Autopilot,
-    rows: impl Fn(usize) -> Vec<String>,
-    loops: usize,
-) -> (Vec<Out>, usize) {
-    let (mut out, mut answers, mut at) = (Vec::new(), 0, 0);
-    for k in 0..loops {
-        let mut m = Mock::new(vec![busy_screen()]);
-        let mut d = Driver::new(&mut m, "muse", ledger, autopilot, (CAPTURED, at), k > 0);
-        let mut took = Some(if k == 0 { 600 } else { 3 });
-        loop {
-            let o = d.point(&r(&rows(answers), at, took.take()));
-            let (act, until) = (o.act.clone(), o.until);
-            out.push(o);
-            match (&act[..], until) {
-                ("wait", Some(u)) => at = u - CAPTURED + 1,
-                ("nothing", _) => return (out, answers),
-                _ => {
-                    let reason =
-                        approvals::act_reason_after(d.s.carried(), d.s.turn_end.limit_try());
-                    let rule = act.trim_start_matches("act ");
-                    let seq = d.seq;
-                    d.s.ledger_row(rule, approvals::Outcome::Typed, ASK, &reason, seq);
-                    (answers, at) = (answers + 1, at + 60);
-                    break;
-                }
-            }
-        }
-    }
-    (out, answers)
-}
-
-/// [`rotating`]'s four wordings of the wall no reader names.
-const WORDINGS: [&str; 4] = [
-    "◆ Weekly allowance spent",
-    "◆ Allowance used up this week",
-    "◆ This week's allowance is gone",
-    "◆ No allowance left this week",
-];
-
-/// [`unnamed`] with each act's answer in the next of four wordings: none is kept when it comes again ([`REPLIES_KEPT`]).
-fn rotating(answers: usize) -> Vec<String> {
-    let mut drawn = 0;
-    unnamed(&vec![None; answers])
-        .into_iter()
-        .map(|r| {
-            if r != WORDINGS[0] {
-                return r;
-            }
-            drawn += 1;
-            // The viewport's top and the continuation's first answer, then each act's.
-            if drawn > 2 {
-                WORDINGS[(drawn - 3) % WORDINGS.len()].to_owned()
-            } else {
-                r
-            }
-        })
-        .collect()
-}
-
-#[test]
-fn a_program_rotating_four_no_work_wordings_is_held_after_its_run_of_no_work_acts() {
-    use crate::supervise::policy::turn_end::{NO_WORK_ACTS, REPLIES_KEPT};
-    let held = Some(format!(
-        "stalled {}",
-        Exception::repeats(crate::harness::acts::HeldBy::NoWork).why
-    ));
-    const { assert!(REPLIES_KEPT < 4, "four wordings outrun the replies kept") };
-    for autopilot in [Autopilot::Cruise, Autopilot::Land] {
-        let tag = format!("rotate-4-{autopilot:?}");
-        let (dir, ledger) = ledger_at(&tag);
-        let mut m = Mock::new(vec![busy_screen()]);
-        let mut d = Driver::new(&mut m, "muse", &ledger, autopilot, (CAPTURED, 0), false);
-        let (out, answers) = follow(
-            &mut d,
-            &r(&rotating(0), 0, Some(600)),
-            (60, 3),
-            rotating,
-            24,
-        );
-        let _ = std::fs::remove_dir_all(dir);
-        assert_eq!(answers, NO_WORK_ACTS, "{tag}: {out:#?}");
-        let last = &out[out.len() - 3..];
-        assert!(
-            last.iter().all(|o| o.act == "nothing" && o.told == held),
-            "{tag}: {out:#?}"
-        );
-    }
-    // A loop that restarts after every act (the live record's pattern) takes the run up from the ledger.
-    for autopilot in [Autopilot::Cruise, Autopilot::Land] {
-        let tag = format!("rotate-4-restarting-{autopilot:?}");
-        let (dir, ledger) = ledger_at(&tag);
-        let (out, answers) = restarting_each_act(&ledger, autopilot, rotating, 12);
-        let _ = std::fs::remove_dir_all(dir);
-        assert!(
-            answers == NO_WORK_ACTS
-                && out
-                    .last()
-                    .is_some_and(|o| o.act == "nothing" && o.told == held),
-            "{tag}: {out:#?}"
-        );
-    }
-    // The control: the same wordings each after a call run are work, every act typed.
-    for autopilot in [Autopilot::Cruise, Autopilot::Land] {
-        let tag = format!("rotate-4-worked-{autopilot:?}");
-        let (dir, ledger) = ledger_at(&tag);
-        let mut m = Mock::new(vec![busy_screen()]);
-        let mut d = Driver::new(&mut m, "muse", &ledger, autopilot, (CAPTURED, 0), false);
-        let worked = |k: usize| ran_into(rotating, k);
-        let (out, answers) = follow(&mut d, &r(&worked(0), 0, Some(600)), (60, 600), worked, 24);
-        let _ = std::fs::remove_dir_all(dir);
-        assert!(
-            answers == 24 && out.iter().all(|o| o.told.is_none()),
-            "{tag}: {out:#?}"
-        );
-    }
-}
-
-/// [`rotating`]'s held screen, then Muse Code's own work while no loop watched (a person's message, the measured call row, new words), then `answers` answers in the four wordings by turns.
-fn worked_unwatched(answers: usize) -> Vec<String> {
-    use crate::supervise::policy::turn_end::NO_WORK_ACTS;
-    let call = screen(muse::TOOL_ROW_BASH_RAN_DESCRIBED)
-        .into_iter()
-        .find(|r| r.starts_with("◆ Ran command"))
-        .expect("the call row");
-    let held = rotating(NO_WORK_ACTS);
-    let composer = held
-        .iter()
-        .position(|r| r.starts_with("── Voice input"))
-        .expect("the composer");
-    let ask = held
-        .iter()
-        .position(|r| r.starts_with("❯ [aterm harness]"))
-        .expect("a continuation");
-    let mut out = held[..composer].to_vec();
-    out.extend([
-        "❯ fix the parser's lifetime and rerun the suite".to_owned(),
-        String::new(),
-        call,
-        String::new(),
-        "◆ Fixed `parse_expr`'s lifetime; the parser suite passes now.".to_owned(),
-        String::new(),
-    ]);
-    for k in 0..answers {
-        out.extend(held[ask..ask + 4].iter().cloned());
-        out.extend([
-            WORDINGS[k % WORDINGS.len()].to_owned(),
-            "  Back on Oct 25 at 5:00 PM".to_owned(),
-            String::new(),
-        ]);
-    }
-    out.extend(held[composer..].iter().cloned());
-    out
-}
-
-#[test]
-fn a_loop_that_takes_over_after_work_no_loop_watched_starts_its_run_afresh() {
-    use crate::supervise::policy::turn_end::NO_WORK_ACTS;
-    let held = Some(format!(
-        "stalled {}",
-        Exception::repeats(crate::harness::acts::HeldBy::NoWork).why
-    ));
-    let muse = aterm_phase::Program::Muse.reader();
-    assert!(
-        muse.turn_ran_tools(&worked_unwatched(0)),
-        "the call row is read"
-    );
-    // A ledger whose loop the four wordings held, its Autopilot then parked Off (`parked`) or not.
-    let held_books = |tag: &str, autopilot: Autopilot, parked: bool| {
-        let (dir, ledger) = ledger_at(tag);
-        let mut m = Mock::new(vec![busy_screen()]);
-        let mut d = Driver::new(&mut m, "muse", &ledger, autopilot, (CAPTURED, 0), false);
-        let (out, answers) = follow(
-            &mut d,
-            &r(&rotating(0), 0, Some(600)),
-            (60, 3),
-            rotating,
-            24,
-        );
-        assert!(
-            answers == NO_WORK_ACTS && out.last().is_some_and(|o| o.told == held),
-            "{tag}: held: {out:#?}"
-        );
-        if parked {
-            d.s.off_stood(d.seq);
-        }
-        (dir, ledger)
-    };
-    let at = 30 * 86_400;
-    // Autopilot lifted from Off; a loop taking over the books of a park; one taking over a hold's.
-    for (lifted, parked) in [(true, false), (false, true), (false, false)] {
-        for autopilot in [Autopilot::Cruise, Autopilot::Land] {
-            let tag = format!("taken-over-{lifted}-{parked}-{autopilot:?}");
-            let (dir, ledger) = held_books(&tag, autopilot, parked);
-            let mut m = Mock::new(vec![busy_screen()]);
-            let mut d = Driver::open(
-                &mut m,
-                "muse",
-                &ledger,
-                autopilot,
-                (CAPTURED, at),
-                Some(lifted),
-            );
-            let (out, answers) = follow(
-                &mut d,
-                &r(&worked_unwatched(0), at, None),
-                (at + 60, 3),
-                worked_unwatched,
-                24,
-            );
-            let _ = std::fs::remove_dir_all(dir);
-            assert!(
-                answers == NO_WORK_ACTS
-                    && out[..NO_WORK_ACTS].iter().all(|o| o.told.is_none())
-                    && out.last().is_some_and(|o| o.told == held),
-                "{tag}: the work ends the run, a new one runs its length: {out:#?}"
-            );
-
-            // The control: over the screen the loop before it was held at.
-            let (dir, ledger) = held_books(&format!("{tag}-still"), autopilot, parked);
-            let mut m = Mock::new(vec![busy_screen()]);
-            let mut d = Driver::open(
-                &mut m,
-                "muse",
-                &ledger,
-                autopilot,
-                (CAPTURED, at),
-                Some(lifted),
-            );
-            let o = d.point(&r(&rotating(NO_WORK_ACTS), at, None));
-            let _ = std::fs::remove_dir_all(dir);
-            if lifted || parked {
-                assert!(
-                    o.act.starts_with("act ") && o.told.is_none(),
-                    "{tag}: a person's Off ends the hold: {o:#?}"
-                );
-            } else {
-                assert!(
-                    o.act == "nothing" && o.told == held,
-                    "{tag}: the hold carries: {o:#?}"
-                );
-            }
-        }
-    }
-    // The loop that held, its screen moved with no turn timed: the run holds only while its newest reply shows.
-    for autopilot in [Autopilot::Cruise, Autopilot::Land] {
-        let tag = format!("moved-under-{autopilot:?}");
-        let (dir, ledger) = ledger_at(&tag);
-        let mut m = Mock::new(vec![busy_screen()]);
-        let mut d = Driver::new(&mut m, "muse", &ledger, autopilot, (CAPTURED, 0), false);
-        let (out, _) = follow(
-            &mut d,
-            &r(&rotating(0), 0, Some(600)),
-            (60, 3),
-            rotating,
-            24,
-        );
-        assert!(
-            out.last().is_some_and(|o| o.told == held),
-            "{tag}: {out:#?}"
-        );
-        let at = d.at + 600;
-        let o = d.point(&r(&worked_unwatched(0), at, None));
-        let _ = std::fs::remove_dir_all(dir);
-        assert!(
-            o.act != "nothing" && o.told.is_none(),
-            "{tag}: not held: {o:#?}"
-        );
-    }
-}
-
-/// A Claude Code answer that worked 9 min, its two builds and an edit drawn as call rows (`calls`) or none, and gave the same 45-line failure report.
-fn reported(calls: bool) -> impl Fn(usize) -> Vec<String> {
-    move |k: usize| {
-        vendor_walled("claude", &vec![None; k], |_| {
-            let mut v = report_rows(calls);
-            v.extend([String::new(), "✻ Worked for 9m 10s".to_owned()]);
-            v
-        })
-    }
-}
-
-/// [`reported`]'s calls and report.
+/// Calls and report rows for transcript fixtures.
 fn report_rows(calls: bool) -> Vec<String> {
     let mut v: Vec<String> = Vec::new();
     if calls {
@@ -2664,208 +1467,12 @@ fn report_rows(calls: bool) -> Vec<String> {
     v
 }
 
-/// [`reported`] as Muse Code draws it: each answer under the harness's continuation, its calls the measured row ([`muse::TOOL_ROW_BASH_RAN_DESCRIBED`]).
-fn muse_reported(calls: bool) -> impl Fn(usize) -> Vec<String> {
-    move |k: usize| {
-        let call = screen(muse::TOOL_ROW_BASH_RAN_DESCRIBED)
-            .into_iter()
-            .find(|r| r.starts_with("◆ Ran command"))
-            .expect("the call row");
-        let base = screen(muse::END_OF_TURN_1_4_10);
-        let composer = base
-            .iter()
-            .position(|r| r.starts_with("── Voice input"))
-            .expect("the composer");
-        let mut out = base[..composer].to_vec();
-        for _ in 0..k {
-            out.extend([format!("❯ {ASK}"), String::new()]);
-            if calls {
-                out.extend([call.clone(), String::new(), call.clone(), String::new()]);
-            }
-            out.push(
-                "◆ The build still fails the same way: `parse_expr` is missing a lifetime."
-                    .to_owned(),
-            );
-            out.extend(
-                (1..45)
-                    .map(|n| format!("  Step {n} of the parse still stops at the same lifetime.")),
-            );
-            out.push(String::new());
-        }
-        out.extend(base[composer..].iter().cloned());
-        out
-    }
-}
-
 /// `rows` through their last 40 rows, the rows above them served as history (`history`) or none.
 fn viewed(rows: &[String], history: bool, at: i64, worked: Option<u64>) -> R {
     let cut = rows.len().saturating_sub(40);
     R {
         above: history.then(|| rows[..cut].to_vec()),
         ..r(&rows[cut..], at, worked)
-    }
-}
-
-#[test]
-fn a_long_report_scrolled_over_its_calls_is_work_unless_its_whole_turn_shows_none() {
-    let held = Some(format!(
-        "stalled {}",
-        Exception::repeats(crate::harness::acts::HeldBy::SameReply).why
-    ));
-    type Drawn = fn(bool) -> Box<dyn Fn(usize) -> Vec<String>>;
-    let programs: [(&'static str, Drawn); 2] = [
-        ("claude", |calls| Box::new(reported(calls))),
-        ("muse", |calls| Box::new(muse_reported(calls))),
-    ];
-    for (program, drawn) in programs {
-        let reader = reader_of(program);
-        let full = drawn(true)(2);
-        let shown = &full[full.len() - 40..];
-        assert!(
-            reader.turn_ran_tools(&full)
-                && !reader.turn_ran_tools(shown)
-                && reader.turn_opens_above(shown),
-            "{program}: the calls scrolled above the screen"
-        );
-    }
-    // The whole turn read shows the calls, or no whole turn is read: work either way.
-    for ((program, drawn), (calls, history)) in programs
-        .into_iter()
-        .flat_map(|p| [(true, true), (true, false), (false, false)].map(|c| (p, c)))
-    {
-        for autopilot in [Autopilot::Cruise, Autopilot::Land] {
-            let tag = format!("scrolled-calls-{program}-{calls}-{history}-{autopilot:?}");
-            let rows = drawn(calls);
-            let (dir, ledger) = ledger_at(&tag);
-            let mut m = Mock::new(vec![busy_screen()]);
-            let mut d = Driver::new(&mut m, program, &ledger, autopilot, (CAPTURED, 0), false);
-            let (out, answers) = follow_r(
-                &mut d,
-                &viewed(&rows(0), history, 0, Some(600)),
-                (60, 550),
-                |k, at, took| viewed(&rows(k), history, at, took),
-                8,
-            );
-            let _ = std::fs::remove_dir_all(dir);
-            assert!(
-                answers == 8 && out.iter().all(|o| o.told.is_none()),
-                "{tag}: every act typed: {out:#?}"
-            );
-        }
-    }
-    // The control: the whole turn read shows no call, or the history holds nothing above the screen, so the same report is held.
-    for ((program, drawn), (above, autopilot)) in programs.into_iter().flat_map(|p| {
-        [true, false]
-            .into_iter()
-            .flat_map(|above| [Autopilot::Cruise, Autopilot::Land].map(|a| (above, a)))
-            .map(move |c| (p, c))
-    }) {
-        let tag = format!("scrolled-no-calls-{program}-{above}-{autopilot:?}");
-        let rows = drawn(false);
-        let view = |rows: &[String], at, took| match above {
-            true => viewed(rows, true, at, took),
-            false => R {
-                above: Some(Vec::new()),
-                ..viewed(rows, false, at, took)
-            },
-        };
-        let (dir, ledger) = ledger_at(&tag);
-        let mut m = Mock::new(vec![busy_screen()]);
-        let mut d = Driver::new(&mut m, program, &ledger, autopilot, (CAPTURED, 0), false);
-        let (out, answers) = follow_r(
-            &mut d,
-            &view(&rows(0), 0, Some(600)),
-            (60, 550),
-            |k, at, took| view(&rows(k), at, took),
-            8,
-        );
-        let _ = std::fs::remove_dir_all(dir);
-        assert_eq!(answers, 2, "{tag}: {out:#?}");
-        let last = &out[out.len() - 3..];
-        assert!(
-            last.iter().all(|o| o.act == "nothing" && o.told == held),
-            "{tag}: {out:#?}"
-        );
-    }
-}
-
-#[test]
-fn keys_over_a_long_report_held_with_its_prompt_above_the_screen_lift_nothing() {
-    let held = Some(format!(
-        "stalled {}",
-        Exception::repeats(crate::harness::acts::HeldBy::SameReply).why
-    ));
-    type Drawn = fn(bool) -> Box<dyn Fn(usize) -> Vec<String>>;
-    let programs: [(&'static str, Drawn); 2] = [
-        ("claude", |calls| Box::new(reported(calls))),
-        ("muse", |calls| Box::new(muse_reported(calls))),
-    ];
-    for ((program, drawn), (autopilot, takeover)) in programs.into_iter().flat_map(|p| {
-        [Autopilot::Cruise, Autopilot::Land]
-            .into_iter()
-            .flat_map(|a| [false, true].map(|k| (a, k)))
-            .map(move |c| (p, c))
-    }) {
-        let tag = format!("report-keys-{program}-{autopilot:?}-{takeover}");
-        let rows = drawn(false);
-        let (dir, ledger) = ledger_at(&tag);
-        let mut m = Mock::new(vec![busy_screen()]);
-        let mut d = Driver::new(&mut m, program, &ledger, autopilot, (CAPTURED, 0), false);
-        let (out, answers) = follow_r(
-            &mut d,
-            &viewed(&rows(0), true, 0, Some(600)),
-            (60, 550),
-            |k, at, took| viewed(&rows(k), true, at, took),
-            8,
-        );
-        // The held report's 40 rows a row up, the history served above them: its prompt above the screen either way.
-        let full = rows(answers);
-        let cut = full.len() - 40;
-        let reader = reader_of(program);
-        assert!(
-            reader.turn_opens_above(&full[cut..]) && reader.turn_opens_above(&full[cut + 1..]),
-            "{tag}: the turn opens above the screen on either read"
-        );
-        let scrolled = |at: i64| R {
-            above: Some(full[..=cut].to_vec()),
-            ..r(&full[cut + 1..], at, None)
-        };
-        let (at, submits) = (d.at, d.submits);
-        let mut m2 = Mock::new(vec![busy_screen()]);
-        // In a loop the books-turn arm holds the keys; a loop that takes over leaves keys typed after it started to the person, as main does.
-        let mut d = if takeover {
-            drop(d);
-            Driver::new(
-                &mut m2,
-                program,
-                &ledger,
-                autopilot,
-                (CAPTURED, at + 30),
-                true,
-            )
-            .submitted(submits)
-        } else {
-            d
-        };
-        // The person's keys ending on an Enter over the empty composer, the screen a row up.
-        let then = [
-            d.point(&sent(at + 30, scrolled(at + 60))),
-            d.point(&scrolled(at + 3600)),
-            d.point(&scrolled(at + 7200)),
-        ];
-        let _ = std::fs::remove_dir_all(dir);
-        assert!(
-            answers == 2
-                && out[out.len() - 3..]
-                    .iter()
-                    .all(|o| o.act == "nothing" && o.told == held),
-            "{tag}: held: {out:#?}"
-        );
-        assert!(
-            then.iter().all(|o| !o.act.starts_with("act "))
-                && then[1..].iter().all(|o| o.told == held),
-            "{tag}: keys that submitted nothing lift nothing: {then:#?}"
-        );
     }
 }
 
@@ -3197,425 +1804,6 @@ fn muse_held(answers: usize) -> Held {
     }
 }
 
-/// A loop of `program`'s at a wall held for good: Muse Code's dated wall stood past its reset with its tries spent ([`stood`]), or a vendor row no reader names said again ([`vendor_walled`]), `claude-said` Claude Code's `⏺` reply in such words, under the prompt the screen names ([`claude_said`]).
-fn held_wall<'a>(
-    m: &'a mut Mock,
-    program: &'static str,
-    ledger: &Path,
-    autopilot: Autopilot,
-) -> (Driver<'a>, Held) {
-    let (program, wall): (&'static str, WallRows) = match program {
-        "claude" => ("claude", claude_wall),
-        "claude-said" => ("claude", claude_said),
-        "agy" => ("agy", agy_wall),
-        "muse" => ("muse", claude_wall),
-        other => panic!("no held wall for {other}"),
-    };
-    let mut d = Driver::new(m, program, ledger, autopilot, (CAPTURED, 0), false);
-    if program == "muse" {
-        let (_, answers) = stood(&mut d, 16);
-        return (d, muse_held(answers));
-    }
-    let rows = |asks: &[Option<&str>]| vendor_walled(program, asks, wall);
-    for p in [
-        r(&rows(&[]), 0, Some(600)),
-        r(&rows(&[None]), 60, Some(3)),
-        r(&rows(&[None]), 300, None),
-        r(&rows(&[None, None]), 360, Some(3)),
-    ] {
-        d.point(&p);
-    }
-    let held = Held {
-        rows: rows(&[None, None]),
-        hi: rows(&[None, None, Some("hi")]),
-        resumed: rows(&[None, None, Some("hi"), None]),
-        act: None,
-        told: "stalled ",
-    };
-    (d, held)
-}
-
-/// How many top rows a scroll carries off to change the letters above the composer: through the first with any.
-fn up(rows: &[String]) -> usize {
-    rows.iter()
-        .position(|r| r.chars().any(char::is_alphabetic))
-        .expect("a row with letters")
-        + 1
-}
-
-/// `rows` with a person's two-line draft in the composer, each row it wraps onto indented as Muse Code draws one (muse-1.4.10-R6427.1-draft-wrapped.txt): the composer taller, the conversation [`up`] rows up, and the hint agy and Gemini CLI blank while a draft stands gone (agy-1.4.0-draft.txt, gemini-0.46.0-draft.txt).
-fn drafted(rows: &[String]) -> Vec<String> {
-    let input = rows
-        .iter()
-        .rposition(|r| r.trim_start().starts_with(['❯', '>']))
-        .expect("the composer's row");
-    let row = &rows[input];
-    let lead = &row[..row.len() - row.trim_start().len()];
-    let marker = row.trim_start().chars().next().unwrap_or('>');
-    let mut out = rows[up(rows)..input].to_vec();
-    out.push(format!(
-        "{lead}{marker} when the limit lifts, please rerun the division suite on the lane fix and then"
-    ));
-    out.push(format!("{lead}  report the number"));
-    out.extend(rows[input + 1..].iter().cloned());
-    out.iter()
-        .map(|r| r.replace("? for shortcuts", &" ".repeat(15)))
-        .collect()
-}
-
-/// What a person's keys at a held wall draw ([`person_at`]).
-#[derive(Debug, Clone, Copy)]
-enum Keys {
-    /// Keys that submit nothing over the conversation scrolled up.
-    Scroll,
-    /// The same keys ending on an Enter over the empty composer (after an arrow or an Escape): the session's submits one up.
-    ScrollEntered,
-    /// Keys into a two-line draft that grows the composer ([`drafted`]).
-    Draft,
-    /// The same draft, its keys ending on an Enter over them that left it standing (a `\`+Enter newline, a menu's completion): the session's submits one up.
-    Entered,
-    /// The same draft, the keys that clear it ending on an Enter over the emptied composer: the session's submits one up.
-    Cleared,
-}
-
-/// A person at `held` from `at` on: `keys`, more keys that clear what they drew, then their `hi` with its Enter ([`hi_at`]).
-fn person_at(
-    d: &mut Driver<'_>,
-    held: &Held,
-    at: i64,
-    took_hi: Option<u64>,
-    keys: Keys,
-) -> Vec<Out> {
-    let (keyed, cleared) = match keys {
-        Keys::Scroll | Keys::ScrollEntered => {
-            let scrolled = held.rows[up(&held.rows)..].to_vec();
-            (scrolled.clone(), scrolled)
-        }
-        Keys::Draft | Keys::Entered | Keys::Cleared => (drafted(&held.rows), held.rows.clone()),
-    };
-    let mut out: Vec<Out> = [
-        R {
-            typed: Some(at + 30),
-            entered: matches!(keys, Keys::ScrollEntered | Keys::Entered),
-            ..r(&keyed, at + 60, None)
-        },
-        r(&keyed, at + 3600, None),
-        R {
-            typed: Some(at + 3630),
-            entered: matches!(keys, Keys::Cleared),
-            ..r(&cleared, at + 3660, None)
-        },
-        r(&cleared, at + 7200, None),
-    ]
-    .iter()
-    .map(|p| d.point(p))
-    .collect();
-    out.extend(hi_at(d, held, at + 10_800, took_hi));
-    out
-}
-
-#[test]
-fn a_person_at_a_held_wall_lifts_its_hold_only_by_a_turn_a_point_saw_busy() {
-    for program in ["muse", "claude", "claude-said", "agy"] {
-        for (autopilot, took_hi, takeover, keys) in [Autopilot::Cruise, Autopilot::Land]
-            .into_iter()
-            .flat_map(|a| [Some(2), None].map(|t| (a, t)))
-            .flat_map(|(a, t)| [false, true].map(|k| (a, t, k)))
-            .flat_map(|(a, t, k)| {
-                [
-                    Keys::Scroll,
-                    Keys::ScrollEntered,
-                    Keys::Draft,
-                    Keys::Entered,
-                    Keys::Cleared,
-                ]
-                .map(|f| (a, t, k, f))
-            })
-        {
-            let tag = format!("person-at-{program}-{autopilot:?}-{took_hi:?}-{takeover}-{keys:?}");
-            let (dir, ledger) = ledger_at(&tag);
-            let mut m = Mock::new(vec![busy_screen()]);
-            let (mut d, held) = held_wall(&mut m, program, &ledger, autopilot);
-            let mark = |rows: &[String]| {
-                let read = reader_of(d.program).read(rows, None);
-                crate::supervise::policy::turn_end::conversation_mark(&read, rows)
-            };
-            let stands = mark(&held.rows);
-            assert!(
-                mark(&held.rows[up(&held.rows)..]) != stands
-                    && mark(&drafted(&held.rows)) != stands,
-                "{tag}: a scroll or a draft changes the letters above the composer"
-            );
-            let at = d.at + 86_400;
-            let first = d.point(&r(&held.rows, at, None));
-            assert!(held.holds(&first), "{tag}: {first:#?}");
-            let out = if takeover {
-                let (submits, program) = (d.submits, d.program);
-                drop(d);
-                let mut m = Mock::new(vec![busy_screen()]);
-                let mut d = Driver::new(
-                    &mut m,
-                    program,
-                    &ledger,
-                    autopilot,
-                    (CAPTURED, at + 30),
-                    true,
-                )
-                .submitted(submits);
-                person_at(&mut d, &held, at, took_hi, keys)
-            } else {
-                person_at(&mut d, &held, at, took_hi, keys)
-            };
-            let _ = std::fs::remove_dir_all(dir);
-            assert!(
-                out[..4].iter().all(|o| !o.act.starts_with("act ")),
-                "{tag}: keys that submit no turn type nothing, a draft standing never submitted: \
-                 {out:#?}"
-            );
-            assert!(
-                held.holds(&out[1]) && held.holds(&out[3]),
-                "{tag}: held past the person's grace: {out:#?}"
-            );
-            held.judged(&tag, took_hi, &out[4..]);
-        }
-    }
-}
-
-/// `rows` with the `/usage` probe's inline rows over the person's `hi`, or the composer's top rule where none stands ([`aterm_phase::prompt::fixtures::USAGE_DISMISSED_INLINE_2_1_307`]: `❯ /usage` and the dismissal under it).
-fn probed_over(rows: &[String]) -> Vec<String> {
-    let inline = screen(aterm_phase::prompt::fixtures::USAGE_DISMISSED_INLINE_2_1_307);
-    let probe = inline
-        .iter()
-        .position(|r| r == "❯ /usage")
-        .expect("the probe's row");
-    let caret = rows
-        .iter()
-        .rposition(|r| r.starts_with('❯'))
-        .expect("the composer");
-    let under = rows.iter().position(|r| r == "❯ hi").unwrap_or(caret - 1);
-    let mut out = rows[..under].to_vec();
-    out.extend(inline[probe..probe + 2].iter().cloned());
-    out.push(String::new());
-    out.extend(rows[under..].iter().cloned());
-    out
-}
-
-#[test]
-fn the_harnesss_own_enter_at_a_held_claude_wall_is_no_persons_turn() {
-    use aterm_phase::prompt::fixtures::{
-        USAGE_DISMISSED_FULLSCREEN_2_1_307 as FULLSCREEN, USAGE_DISMISSED_INLINE_2_1_307 as INLINE,
-    };
-    let probe_row = |rows: Vec<String>| rows.iter().any(|r| r == "❯ /usage");
-    assert!(
-        !probe_row(screen(FULLSCREEN)) && probe_row(screen(INLINE)),
-        "the measured probes: fullscreen draws no row of its own, inline its `❯ /usage`"
-    );
-    // Fullscreen, the renderer the probe runs in, leaves the conversation as it stood (claude-2.1.307-usage-dismissed-fullscreen.txt); inline draws the probe's rows, its own message, as a host's step may draw its own.
-    for (autopilot, took_hi, (inline, host), (takeover, entered)) in
-        [Autopilot::Cruise, Autopilot::Land]
-            .into_iter()
-            .flat_map(|a| [Some(2), None].map(|t| (a, t)))
-            .flat_map(|(a, t)| [(false, false), (true, false), (true, true)].map(|o| (a, t, o)))
-            .flat_map(|(a, t, o)| {
-                [(false, false), (false, true), (true, false), (true, true)].map(|k| (a, t, o, k))
-            })
-    {
-        let tag = format!("probed-{autopilot:?}-{took_hi:?}-{inline}-{host}-{takeover}-{entered}");
-        let (dir, ledger) = ledger_at(&tag);
-        let mut m = Mock::new(vec![busy_screen()]);
-        let (mut d, mut held) = held_wall(&mut m, "claude", &ledger, autopilot);
-        let at = d.at + 86_400;
-        let first = d.point(&r(&held.rows, at, None));
-        if host {
-            d.s.turn_end.host_moved();
-            d.submits += 1;
-        } else {
-            d.probed(at + 60);
-        }
-        if inline {
-            held = Held {
-                rows: probed_over(&held.rows),
-                hi: probed_over(&held.hi),
-                resumed: probed_over(&held.resumed),
-                ..held
-            };
-        }
-        let mut out: Vec<Out> = [
-            r(&held.rows, at + 120, None),
-            r(&held.rows, at + 3600, None),
-        ]
-        .iter()
-        .map(|p| d.point(p))
-        .collect();
-        // The loop goes on, or one takes over past the ledger's last point row; then a person's stray key, or keys ending on an Enter over the empty composer.
-        let (submits, at_keys) = (d.submits, at + 3630);
-        let mut m2 = Mock::new(vec![busy_screen()]);
-        let mut d = if takeover {
-            drop(d);
-            Driver::new(
-                &mut m2,
-                "claude",
-                &ledger,
-                autopilot,
-                (CAPTURED, at_keys),
-                true,
-            )
-            .submitted(submits)
-        } else {
-            d
-        };
-        out.extend(
-            [
-                R {
-                    typed: Some(at_keys),
-                    entered,
-                    ..r(&held.rows, at + 7200, None)
-                },
-                r(&held.rows, at + 10_800, None),
-            ]
-            .iter()
-            .map(|p| d.point(p)),
-        );
-        out.extend(hi_at(&mut d, &held, at + 18_000, took_hi));
-        let _ = std::fs::remove_dir_all(dir);
-        assert!(held.holds(&first), "{tag}: {first:#?}");
-        assert!(
-            out[..4].iter().all(|o| !o.act.starts_with("act "))
-                && [0, 1, 3].iter().all(|&i| held.holds(&out[i])),
-            "{tag}: the harness's Enter, what it drew and keys that submitted nothing are no \
-             person's turn: {out:#?}"
-        );
-        held.judged(&tag, took_hi, &out[4..]);
-    }
-}
-
-#[test]
-fn keys_over_a_claude_hold_scrolled_past_its_prompt_lift_nothing_whatever_history_is_served() {
-    let reader = reader_of("claude");
-    let stood = vendor_walled("claude", &[None, None], claude_said);
-    // The cuts that carry the last prompt row off the top and leave the reply on the screen: a turn opening above it, whose tools only a history read shows.
-    let cuts: Vec<usize> = (1..stood.len())
-        .filter(|&k| {
-            reader.turn_opens_above(&stood[k..])
-                && stood[k..]
-                    .iter()
-                    .any(|r| r.starts_with("⏺ Allowance spent"))
-        })
-        .collect();
-    assert!(
-        !cuts.is_empty(),
-        "a cut past the prompt keeps the reply: {stood:#?}"
-    );
-    for (k, autopilot, takeover, history) in cuts.iter().flat_map(|&k| {
-        [Autopilot::Cruise, Autopilot::Land]
-            .into_iter()
-            .flat_map(|a| [false, true].map(|t| (a, t)))
-            .flat_map(move |(a, t)| [false, true].map(|h| (k, a, t, h)))
-    }) {
-        let tag = format!("past-prompt-{k}-{autopilot:?}-{takeover}-{history}");
-        let (dir, ledger) = ledger_at(&tag);
-        let mut m = Mock::new(vec![busy_screen()]);
-        let (mut d, held) = held_wall(&mut m, "claude-said", &ledger, autopilot);
-        assert_eq!(held.rows, stood, "{tag}");
-        let at = d.at + 86_400;
-        let first = d.point(&r(&held.rows, at, None));
-        let cut = |t: i64| R {
-            above: history.then(|| held.rows[..k].to_vec()),
-            ..r(&held.rows[k..], t, None)
-        };
-        let (submits, program) = (d.submits, d.program);
-        let mut m2 = Mock::new(vec![busy_screen()]);
-        let mut d = if takeover {
-            drop(d);
-            Driver::new(
-                &mut m2,
-                program,
-                &ledger,
-                autopilot,
-                (CAPTURED, at + 20),
-                true,
-            )
-            .submitted(submits)
-        } else {
-            d
-        };
-        let mut out = Vec::new();
-        if takeover {
-            out.push(d.point(&r(&held.rows, at + 25, None)));
-        }
-        // The person's keys ending on an Enter over the empty composer, the screen redrawn past the prompt.
-        out.extend([
-            d.point(&sent(at + 30, cut(at + 3600))),
-            d.point(&cut(at + 7200)),
-            d.point(&cut(at + 10_800)),
-        ]);
-        let _ = std::fs::remove_dir_all(dir);
-        assert!(held.holds(&first), "{tag}: {first:#?}");
-        let n = out.len();
-        assert!(
-            out.iter().all(|o| !o.act.starts_with("act "))
-                && out[n - 2..].iter().all(|o| held.holds(o)),
-            "{tag}: keys that submitted no turn lift nothing, though no tool read was made: \
-             {out:#?}"
-        );
-    }
-}
-
-#[test]
-fn keys_over_a_taller_pane_lift_nothing_at_a_takeover() {
-    for program in ["muse", "claude", "agy"] {
-        for (autopilot, entered) in [Autopilot::Cruise, Autopilot::Land]
-            .into_iter()
-            .flat_map(|a| [false, true].map(|e| (a, e)))
-        {
-            let tag = format!("taller-pane-{program}-{autopilot:?}-{entered}");
-            let (dir, ledger) = ledger_at(&tag);
-            let mut m = Mock::new(vec![busy_screen()]);
-            let (mut d, held) = held_wall(&mut m, program, &ledger, autopilot);
-            let at = d.at + 86_400;
-            let first = d.point(&r(&held.rows, at, None));
-            // The pane grows a row: one more row of the history shows above the conversation, and no point moves.
-            let taller: Vec<String> =
-                std::iter::once("Earlier: the lane fix landed on its branch.")
-                    .map(str::to_owned)
-                    .chain(held.rows.iter().cloned())
-                    .collect();
-            let grown = d.point(&r(&taller, at + 600, None));
-            let submits = d.submits;
-            drop(d);
-            let mut m = Mock::new(vec![busy_screen()]);
-            let mut d = Driver::new(
-                &mut m,
-                program,
-                &ledger,
-                autopilot,
-                (CAPTURED, at + 630),
-                true,
-            )
-            .submitted(submits);
-            // The person's keys, ending on an Enter over the empty composer where `entered`.
-            let then = [
-                d.point(&R {
-                    typed: Some(at + 630),
-                    entered,
-                    ..r(&taller, at + 3600, None)
-                }),
-                d.point(&r(&taller, at + 7200, None)),
-            ];
-            let _ = std::fs::remove_dir_all(dir);
-            assert!(
-                held.holds(&first) && held.holds(&grown),
-                "{tag}: {first:#?} {grown:#?}"
-            );
-            assert!(
-                !then[0].act.starts_with("act ") && held.holds(&then[1]),
-                "{tag}: keys that submitted nothing at the new loop's first point lift nothing: \
-                 {then:#?}"
-            );
-        }
-    }
-}
-
 /// A Claude Code session's `k`th answer: `runs` runs of its suites (at most two), then `last` at each answer after.
 fn suites_then(runs: usize, last: &'static str) -> impl Fn(usize) -> Vec<String> {
     move |k: usize| match k {
@@ -3706,62 +1894,6 @@ fn a_persons_message_said_again_no_point_saw_busy_is_judged_as_one_in_new_words(
 }
 
 #[test]
-fn a_lead_agents_prompt_lets_one_act_go_only_above_claude_codes_reply_with_no_person_at_the_keys() {
-    const LEAD: &str = "Rerun the division suite on the lane fix and report the number.";
-    for (program, autopilot, person, took) in ["claude-said", "agy"]
-        .into_iter()
-        .flat_map(|p| [Autopilot::Cruise, Autopilot::Land].map(|a| (p, a)))
-        .flat_map(|(p, a)| [false, true].map(|k| (p, a, k)))
-        .flat_map(|(p, a, k)| [None, Some(2)].map(|t| (p, a, k, t)))
-    {
-        let tag = format!("lead-at-{program}-{autopilot:?}-{person}-{took:?}");
-        let (dir, ledger) = ledger_at(&tag);
-        let mut m = Mock::new(vec![busy_screen()]);
-        let (mut d, held) = held_wall(&mut m, program, &ledger, autopilot);
-        let (drawn, wall): (&str, WallRows) = match program {
-            "claude-said" => ("claude", claude_said),
-            "agy" => ("agy", agy_wall),
-            other => panic!("no held wall for {other}"),
-        };
-        let rows = |asks: &[Option<&str>]| vendor_walled(drawn, asks, wall);
-        let (sent_rows, resumed) = (
-            rows(&[None, None, Some(LEAD)]),
-            rows(&[None, None, Some(LEAD), None]),
-        );
-        let at = d.at + 86_400;
-        let first = d.point(&r(&held.rows, at, None));
-        // The lead's `aterm ctl send`: its prompt row and Enter, the session's submits one up and no person's keys, or beside a person's stray key; a point saw its busy spell or none did.
-        let mut out = vec![
-            d.point(&R {
-                typed: person.then_some(at + 30),
-                entered: true,
-                ..r(&sent_rows, at + 60, took)
-            }),
-            d.point(&r(&sent_rows, at + 7200, None)),
-        ];
-        let resumes = out.iter().any(|o| o.act.starts_with("act "));
-        out.push(d.point(&if resumes {
-            r(&resumed, at + 7260, Some(3))
-        } else {
-            r(&sent_rows, at + 10_800, None)
-        }));
-        let _ = std::fs::remove_dir_all(dir);
-        assert!(held.holds(&first), "{tag}: {first:#?}");
-        let acts = out[..2]
-            .iter()
-            .filter(|o| o.act.starts_with("act "))
-            .count();
-        // Claude Code's screen names the prompt its reply answers; the other programs' readers name none, so the lead's prompt and its answer are that program's own turn.
-        let lifts = (program == "claude-said" && !person) || (person && took.is_some());
-        assert!(
-            acts == usize::from(lifts) && held.holds(&out[2]) && (lifts || held.holds(&out[1])),
-            "{tag}: a lead's prompt above Claude Code's reply, or a person's turn a point saw \
-             busy, lets one more act go, then held again; nothing else lifts it: {out:#?}"
-        );
-    }
-}
-
-#[test]
 fn the_journal_names_the_holds_arm_and_only_a_holds() {
     use crate::harness::acts::HeldBy;
     let mut m = Mock::new(vec![busy_screen()]);
@@ -3769,7 +1901,7 @@ fn the_journal_names_the_holds_arm_and_only_a_holds() {
     let mut noted = Noted::default();
     let told = [
         (
-            Exception::repeats_land(HeldBy::SameReply, None),
+            Exception::repeats(HeldBy::SameReply),
             Some(HeldBy::SameReply),
         ),
         (Exception::repeats(HeldBy::NoWork), Some(HeldBy::NoWork)),
@@ -3801,9 +1933,181 @@ fn the_journal_names_the_holds_arm_and_only_a_holds() {
         .filter(|l| l.starts_with("EXCEPTION "))
         .collect();
     assert!(
-        lines[0].contains(" when=now held=same-reply "),
+        lines[0].contains(" when=later held=same-reply "),
         "{lines:#?}"
     );
     assert!(lines[1].contains(" when=later held=no-work "), "{lines:#?}");
     assert!(!lines[2].contains(" held="), "{lines:#?}");
+}
+
+/// agy 1.4.12's subscription quota (`RESOURCE_EXHAUSTED (code 429): Individual quota reached. …
+/// Resets in 4h29m33s.`, [`aterm_phase::agy::fixtures::lab::ERROR_429_INDIVIDUAL`]) answering
+/// each act, its Error ID fresh: the loop waits out the reset it names and types again there,
+/// never holding the session as the same reply twice. Read as no wall (m15, 2026-10-29), two
+/// Cruise prompts held the session for two days past the reset.
+#[test]
+fn an_agy_subscription_quota_is_waited_out_to_its_reset_not_held() {
+    use aterm_phase::agy::fixtures::lab::ERROR_429_INDIVIDUAL;
+    let block = |k: usize| -> Vec<String> {
+        let rows = screen(ERROR_429_INDIVIDUAL);
+        let head = rows
+            .iter()
+            .position(|r| r.starts_with("⚠ agent executor error"))
+            .expect("the quota block");
+        let id = rows
+            .iter()
+            .position(|r| r.starts_with("Error ID: "))
+            .expect("its Error ID");
+        rows[head..=id]
+            .iter()
+            .map(|row| {
+                if row.starts_with("Error ID: ") {
+                    format!("Error ID: 6f2a1c0e-3b7d-4e9a-8c55-1d2e3f4a5b6c-{}", k + 1)
+                } else {
+                    row.clone()
+                }
+            })
+            .collect()
+    };
+    let rows = |answers: usize| vendor_walled("agy", &vec![None; answers], block);
+    let reader = aterm_phase::Program::Agy.reader();
+    assert_eq!(
+        reader.wall(&rows(1)).and_then(|w| w.reset).as_deref(),
+        Some("in 16173s")
+    );
+    for autopilot in [Autopilot::Cruise, Autopilot::Land] {
+        let tag = format!("agy-individual-quota-{autopilot:?}");
+        let (dir, ledger) = ledger_at(&tag);
+        let mut m = Mock::new(vec![busy_screen()]);
+        let mut d = Driver::new(&mut m, "agy", &ledger, autopilot, (CAPTURED, 0), false);
+        let (out, answers) = follow(&mut d, &r(&rows(0), 0, Some(600)), (60, 3), rows, 4);
+        let _ = std::fs::remove_dir_all(dir);
+        assert!(
+            out[0].act.starts_with("act "),
+            "{tag}: the act after the work: {out:#?}"
+        );
+        let wait = &out[1];
+        assert_eq!(wait.act, "wait", "{tag}: the wall is waited out: {out:#?}");
+        let until = wait.until.expect("a wait names its end") - CAPTURED;
+        assert!(
+            (16_000..=16_400).contains(&(until - 60)),
+            "{tag}: to the reset it names, 16173 s on: {until} {out:#?}"
+        );
+        assert!(
+            answers >= 2 && out[2].act.starts_with("act "),
+            "{tag}: typed again at the reset: {out:#?}"
+        );
+        assert!(
+            out.iter()
+                .all(|o| o.told.as_deref().is_none_or(|t| !t.starts_with("stalled"))),
+            "{tag}: never held: {out:#?}"
+        );
+    }
+}
+
+/// A DRAFT A PERSON TYPES AND CLEARS UNDER A KEPT REPLY IS NO POINT ON agy, AS ON Claude Code
+/// (ATERM-KI-1101-2): its key is the turn's, so no observe moves the person's last key past it,
+/// and the program's own no-work turn after it starts the kept reply again from one answer, alike
+/// on both. NEGATIVE CONTROL: a point at the draft, as agy's key made one before, counts that turn
+/// into the hold instead.
+#[test]
+fn a_draft_cleared_under_a_kept_reply_lifts_it_alike_on_agy_and_claude() {
+    const SAID: &str = "Nothing is left to do here: the suite is green.";
+    let said = |program: &str| -> fn(usize) -> Vec<String> {
+        match program {
+            "claude" => |_| {
+                vec![
+                    format!("⏺ {SAID}"),
+                    String::new(),
+                    "✻ Cogitated for 0s · done 3:11 PM".to_owned(),
+                ]
+            },
+            _ => |_| vec![SAID.to_owned()],
+        }
+    };
+    let mut lifted = Vec::new();
+    for program in ["claude", "agy"] {
+        let rows = |asks: &[Option<&str>]| vendor_walled(program, asks, said(program));
+        let kept = rows(&[None, None]);
+        let reader = match program {
+            "claude" => aterm_phase::Program::Claude.reader(),
+            _ => aterm_phase::Program::Agy.reader(),
+        };
+        let (caret, glyph) = match program {
+            "claude" => (aterm_phase::phase::composer_index(&kept), "❯"),
+            _ => (aterm_phase::agy::composer(&kept), ">"),
+        };
+        let mut drafted = kept.clone();
+        drafted[caret.expect("the caret")] = format!("{glyph} a note for later");
+        let turn = |rows: &[String]| Turn {
+            phase: reader.phase(rows),
+            screen: Screen {
+                rows: rows.to_vec(),
+                submits: Some(3),
+                ..Screen::default()
+            },
+            timed_out: false,
+        };
+        assert_eq!(
+            point_key(reader, &turn(&kept)),
+            point_key(reader, &turn(&drafted)),
+            "{program}: the draft is no point"
+        );
+        let run = |tag: &str, draft_point: bool| {
+            let mut points = vec![
+                r(&rows(&[]), 0, Some(600)),
+                r(&rows(&[None]), 60, Some(3)),
+                r(&kept, 120, Some(3)),
+            ];
+            if draft_point {
+                points.push(R {
+                    typed: Some(180),
+                    ..r(&drafted, 200, None)
+                });
+                points.push(r(&kept, 3600, Some(3)));
+            } else {
+                points.push(R {
+                    typed: Some(180),
+                    ..r(&kept, 3600, Some(3))
+                });
+            }
+            let (dir, ledger) = ledger_at(tag);
+            let mut m = Mock::new(vec![busy_screen()]);
+            let mut d = Driver::new(
+                &mut m,
+                program,
+                &ledger,
+                Autopilot::Cruise,
+                (CAPTURED, 0),
+                false,
+            );
+            let out: Vec<Out> = points.iter().map(|p| d.point(p)).collect();
+            let answers = d.s.turn_end.replies().last().map(|k| k.answers);
+            drop(d);
+            let _ = std::fs::remove_dir_all(dir);
+            (out, answers)
+        };
+        let tag = format!("draft-under-kept-{program}");
+        let (out, answers) = run(&tag, false);
+        let (counted, counted_answers) = run(&format!("{tag}-pointed"), true);
+        assert_eq!(
+            out[..3],
+            counted[..3],
+            "{tag}: one loop up to the draft: {out:#?}"
+        );
+        assert_eq!(
+            answers,
+            Some(1),
+            "{tag}: the person's keys start the kept reply again: {out:#?}"
+        );
+        assert!(
+            counted_answers.is_some_and(|n| n >= 2),
+            "{tag}: a point at the draft counts the turn: {counted_answers:?} {counted:#?}"
+        );
+        lifted.push((answers, counted_answers));
+    }
+    assert_eq!(
+        lifted[0], lifted[1],
+        "agy keeps its replies as Claude Code does"
+    );
 }

@@ -256,6 +256,17 @@ fn mark(holds: bool) -> &'static str {
 /// The `occupancy why` form of `said` at `now_ms` (unix), its clocks `offset_s` east of UTC.
 #[must_use]
 pub fn why_lines(said: &OccupancySaid, now_ms: i64, offset_s: i64) -> Vec<String> {
+    why_lines_local(said, now_ms, &|_| Some(offset_s))
+}
+
+/// [`why_lines`], resolving each instant's local offset from `local_at`.
+#[must_use]
+pub fn why_lines_local(
+    said: &OccupancySaid,
+    now_ms: i64,
+    local_at: &dyn Fn(i64) -> Option<i64>,
+) -> Vec<String> {
+    let at = |at_ms: i64| clock_words(at_ms, local_at(at_ms.div_euclid(1000)).unwrap_or(0));
     let mut lines = Vec::new();
     let held_ms = said
         .hold
@@ -265,7 +276,7 @@ pub fn why_lines(said: &OccupancySaid, now_ms: i64, offset_s: i64) -> Vec<String
             "occupancy={} hold {} since {} held {} ready={}",
             said.mode.word(),
             said.hold_word(),
-            clock_words(hold.since_ms, offset_s),
+            at(hold.since_ms),
             span_words(held_ms),
             u8::from(said.ready)
         ),
@@ -275,14 +286,14 @@ pub fn why_lines(said: &OccupancySaid, now_ms: i64, offset_s: i64) -> Vec<String
     let r = &said.reading;
     for said_rule in &said.rules {
         let when = if said_rule.at_ms > 0 {
-            format!(" {}", clock_words(said_rule.at_ms, offset_s))
+            format!(" {}", at(said_rule.at_ms))
         } else {
             String::new()
         };
         if let (RuleId::Wake, Some(wake), SaidVerdict::Held(guard)) =
             (said_rule.rule, said.wake, said_rule.verdict)
         {
-            lines.push(wake_held_line(wake, guard, offset_s));
+            lines.push(wake_held_line_local(wake, guard, local_at));
             continue;
         }
         let head = format!(
@@ -293,13 +304,7 @@ pub fn why_lines(said: &OccupancySaid, now_ms: i64, offset_s: i64) -> Vec<String
         let terms = match said_rule.rule {
             RuleId::Wake => said.wake.map_or_else(
                 || "no wake ready".to_string(),
-                |wake| {
-                    format!(
-                        "wake #{} since {}",
-                        wake.ord,
-                        clock_words(wake.since_ms, offset_s)
-                    )
-                },
+                |wake| format!("wake #{} since {}", wake.ord, at(wake.since_ms)),
             ),
             RuleId::WaitNudge => format!(
                 "hold {} {}  undeclared {}",
@@ -348,7 +353,12 @@ pub fn why_lines(said: &OccupancySaid, now_ms: i64, offset_s: i64) -> Vec<String
 
 /// F14's wake line: `wake #<n> held: <guard> (since HH:MM; K at HH:MM)`, K the window's K looks
 /// past the wake's condition holding.
-fn wake_held_line(wake: SaidWake, guard: Guard, offset_s: i64) -> String {
+fn wake_held_line_local(
+    wake: SaidWake,
+    guard: Guard,
+    local_at: &dyn Fn(i64) -> Option<i64>,
+) -> String {
+    let at = |at_ms: i64| clock_words(at_ms, local_at(at_ms.div_euclid(1000)).unwrap_or(0));
     let k_ms = wake
         .since_ms
         .saturating_add(K_LOOKS.saturating_mul(LOOK_EVERY_MS));
@@ -356,8 +366,8 @@ fn wake_held_line(wake: SaidWake, guard: Guard, offset_s: i64) -> String {
         "wake #{} held: {} (since {}; K at {})",
         wake.ord,
         guard.word(),
-        clock_words(wake.since_ms, offset_s),
-        clock_words(k_ms, offset_s)
+        at(wake.since_ms),
+        at(k_ms)
     )
 }
 

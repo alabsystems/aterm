@@ -699,11 +699,10 @@ fn a_keeper_has_run_once_its_copy_says_so_or_it_wrote_a_line() {
     assert!(keeper_ran(424), "its line");
 }
 
-/// A keeper's start is judged in two waits ([`await_start`]): its own work up to its copy's
-/// exec stamp, then macOS's first-exec check of the copy up to the copy's mark. Each bound is
-/// zero here, so each wait looks once. Negative controls: no copy, or a copy not yet stamped,
-/// is [`Start::NoCopy`] (the first wait's, never the second's), a stamped copy unmarked is
-/// [`Start::NotRun`], and an exit or a line in its log ends either wait.
+/// A keeper's start is judged in three waits ([`await_start`]): copying, code admission up
+/// to its exec stamp, then macOS's first-exec check up to the copy's mark. Each bound is zero
+/// here, so each wait looks once. Negative controls distinguish no copy, an unchecked copy,
+/// and a stamped copy not yet run; an exit or a line in its log ends any wait.
 #[test]
 fn a_keeper_s_start_waits_for_its_copy_s_stamp_then_its_mark() {
     let scratch = aterm_tempfile::Builder::new()
@@ -717,7 +716,7 @@ fn a_keeper_s_start_waits_for_its_copy_s_stamp_then_its_mark() {
     assert_eq!(now(true), Start::Ended, "exited before it made one");
     let copy = keeper_code(root).join("4242-1792000000-7");
     std::fs::create_dir_all(&copy).expect("a copy");
-    assert_eq!(now(false), Start::NoCopy, "copied, not stamped");
+    assert_eq!(now(false), Start::NotStamped, "copied, not stamped");
     aterm_uds::deadline::stamp_exec(&copy);
     assert_eq!(now(false), Start::NotRun, "stamped, unmarked");
     aterm_keeper::code::mark_ran(&copy);

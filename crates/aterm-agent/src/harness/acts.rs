@@ -12,7 +12,7 @@ use crate::supervise::policy::go_ahead::RULE_GO_AHEAD;
 use crate::supervise::policy::question::{RULE_ANSWER_RECOMMENDED, is_question_rule};
 use crate::supervise::policy::turn_end::{
     RULE_ANSWER, RULE_API_BACK, RULE_API_CUTOFF, RULE_API_RETRY, RULE_COMPACT, RULE_CONTINUE,
-    RULE_DONE_CHECK, RULE_HOST_TURN, RULE_LAND, RULE_LAND_ANSWER, RULE_LAND_NUDGE,
+    RULE_DONE_CHECK, RULE_HOST_TURN, RULE_LAND, RULE_LAND_ANSWER, RULE_LAND_CHECK, RULE_LAND_NUDGE,
     RULE_LIMIT_RESUME, RULE_LOGIN_BACK, RULE_OPEN_ITEMS, RULE_OUTAGE_RESUME, RULE_SUGGESTION,
     RULE_UNCOMMITTED,
 };
@@ -34,11 +34,14 @@ pub enum Act {
     Landing,
     /// A land nudge typed (`land-nudge@v1`).
     Nudged,
+    /// The land check typed (`land-check@v1`): the agent audits its own report, answering
+    /// `LANDED` or what is left.
+    LandCheck,
 }
 
 impl Act {
     /// Every act, in display order.
-    pub const ALL: [Act; 7] = [
+    pub const ALL: [Act; 8] = [
         Act::Approved,
         Act::Declined,
         Act::Answered,
@@ -46,6 +49,7 @@ impl Act {
         Act::Resumed,
         Act::Landing,
         Act::Nudged,
+        Act::LandCheck,
     ];
 
     /// The act's glyph, drawn before its word.
@@ -57,7 +61,7 @@ impl Act {
             Act::Answered => "?",
             Act::Continued => "\u{21bb}",
             Act::Resumed => "\u{29d7}",
-            Act::Landing | Act::Nudged => "\u{2913}",
+            Act::Landing | Act::Nudged | Act::LandCheck => "\u{2913}",
         }
     }
 
@@ -72,6 +76,7 @@ impl Act {
             Act::Resumed => "resumed",
             Act::Landing => "landing",
             Act::Nudged => "nudged",
+            Act::LandCheck => "land check",
         }
     }
 
@@ -81,6 +86,31 @@ impl Act {
         match self {
             Act::Landing => "started landing",
             act => act.word(),
+        }
+    }
+}
+
+/// AN ACT AS THE LOOP TELLS THE WINDOW'S HOST (`IdleHost::act_taken`): the act, and whether
+/// aterm typed it at the prompt, opening a turn of its own, where a box's approval and a
+/// dialog's keys answer inside the turn that asked. A prose answer (`go-ahead@v1`, a prose
+/// question's rule, `land-answer@v1` typed) is [`Act::Answered`] as a dialog's keys are, and only
+/// this says which it was (the second review of the post-landing fixes, 2026-11-01): the
+/// window's book ends the land check's audit at a turn aterm opened past it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TakenAct {
+    /// The act the chip lights for a moment.
+    pub act: Act,
+    /// Whether aterm typed it at the prompt ([`Outcome::Typed`]).
+    pub opens_turn: bool,
+}
+
+impl TakenAct {
+    /// `act`, ledgered as `outcome`.
+    #[must_use]
+    pub fn of(act: Act, outcome: Outcome) -> Self {
+        Self {
+            act,
+            opens_turn: outcome == Outcome::Typed,
         }
     }
 }
@@ -162,6 +192,8 @@ fn typed_act(rule: &str, command: &str) -> Option<(Act, Counter)> {
         Some((Act::Landing, Counter::LandPrompts))
     } else if rule == RULE_LAND_NUDGE {
         Some((Act::Nudged, Counter::LandPrompts))
+    } else if rule == RULE_LAND_CHECK {
+        Some((Act::LandCheck, Counter::LandPrompts))
     } else if matches!(
         rule,
         RULE_LIMIT_RESUME
@@ -189,7 +221,7 @@ pub fn log_mark(rule_id: &str, outcome: Outcome, command: &str) -> Option<String
             Act::Declined => "deny",
             Act::Answered => "answer",
             Act::Continued | Act::Resumed => "continue",
-            Act::Landing | Act::Nudged => "dispatch",
+            Act::Landing | Act::Nudged | Act::LandCheck => "dispatch",
         }
     };
     let rule = log_rule(rule_id);
@@ -225,7 +257,7 @@ pub fn self_claim_act(act: &str) -> Option<(&'static str, String)> {
         RULE_CONTINUE | RULE_POLICY_CONTINUE | RULE_LIMIT_RESUME | RULE_DONE_CHECK
         | RULE_API_RETRY | RULE_API_BACK | RULE_API_CUTOFF | RULE_COMPACT => "continue",
         RULE_UPGRADE => "relaunch",
-        RULE_HOST_TURN | RULE_LAND | RULE_LAND_NUDGE => "dispatch",
+        RULE_HOST_TURN | RULE_LAND | RULE_LAND_NUDGE | RULE_LAND_CHECK => "dispatch",
         RULE_LANDED => LANDED_WORD,
         _ => return None,
     };
@@ -405,7 +437,8 @@ pub struct LandHeld {
     pub read: bool,
     /// What held the landing at that yield, a bit per [`HoldLeg`].
     pub legs: u8,
-    /// The first four words Land's strict reading found open ([`HoldLeg::Open`]).
+    /// The first four words Land's strict reading found open in the agent's list
+    /// ([`HoldLeg::Open`]): a description of the list, never what holds it.
     pub open: [Option<OpenWord>; 4],
     /// The repository's work at that yield.
     pub changed: u16,
@@ -413,6 +446,10 @@ pub struct LandHeld {
     pub stashes: u16,
     pub unpushed: u16,
     pub unlanded: u16,
+    /// Submodule commits no remote of theirs has, and commits parked on another branch the
+    /// session used (`RepoWork::sub_unpushed`, `RepoWork::parked`).
+    pub sub_unpushed: u16,
+    pub parked: u16,
 }
 
 impl LandHeld {
@@ -433,6 +470,9 @@ impl LandHeld {
     }
 }
 
+/// What aterm checked at a landing, beside why Land still holds before one (§14.9, slice 9b).
+pub use super::land_receipt::{LandReceipt, ReceiptLeg};
+
 /// One leg of a hold ([`LandHeld::legs`]), in the order the owner can act on them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum HoldLeg {
@@ -442,7 +482,7 @@ pub enum HoldLeg {
     Repo,
     /// The repository probe could not read the repository: what it holds is unknown.
     Unread,
-    /// Land's strict reading found open work in the reply.
+    /// The agent's own answer to the land check listed what is left (`land-check@v1`).
     Open,
     /// No `Nothing left:` defense in the reply.
     Defense,
@@ -506,6 +546,10 @@ impl HoldLeg {
         }
     }
 }
+
+/// THE OPEN LEG'S WORDS WHERE THE READER NAMES NOTHING IN THE AGENT'S LIST ([`HoldLeg::Open`]):
+/// the leg is the agent's own answer to the land check, never the reader's reading.
+pub const OPEN_LISTED: &str = "what it listed as left";
 
 /// What a hold's words begin with once its legs are read (`not landed yet: <legs>`).
 pub const NOT_LANDED_YET: &str = "not landed yet";
@@ -588,7 +632,7 @@ impl HeldBy {
     }
 
     /// How its program answered aterm's acts, as the hold's exception says it after `answered`
-    /// (`twice with the same reply and no work`; `Exception::repeats`, `Exception::repeats_land`).
+    /// (`twice with the same reply and no work`; `Exception::repeats`).
     #[must_use]
     pub fn answered(self) -> String {
         match self {
@@ -604,9 +648,24 @@ impl HeldBy {
 /// What every surface of a stopped tab begins with ([`stop_words`]), read without regard to case.
 pub const STOPPED_TYPING: &str = "stopped typing";
 
-/// What starts a stopped tab's typing again, in the written forms: a mode switch does not
-/// (`act_past_walls` answers a repeat with nothing in either mode), Off's park does.
+/// What starts a stopped tab's typing again, in the written forms: the person's turn or the
+/// agent's work. A switch to Cruise does not (`act_past_walls` answers a repeat with nothing),
+/// Off's park clears the hold, and a program that stopped its own typing under its proven claim
+/// (codex-alab, §14.3.2) restarts by its own loop's rule, of which aterm knows these two.
 pub const TYPES_AGAIN: &str = "types again at your turn or once the agent works";
+
+/// [`TYPES_AGAIN`] where the person's switch to Land would ask once more over the stop (v6
+/// §14.17 item 3, [`SWITCH_ASKED`]): under Cruise, over the agent's own reply, which no read wall
+/// said and no ask was spent on (the hold's exception says it,
+/// `Exception::lifted_by_switch`). Under Land there is no switch to make.
+pub const TYPES_AGAIN_OR_SWITCH: &str =
+    "types again at your turn, your switch to Land, or once the agent works";
+
+/// THE PERSON'S SWITCH TO LAND OVER A STOPPED TAB, AS THE TAB'S STATE LINE SAYS IT (v6 §14.17
+/// item 3), from Land's one ask until its answer is read: the switch counted as their turn, so
+/// Land typed `land@v1` once more, and the same answer holds again with no second prompt.
+pub const SWITCH_ASKED: &str = "Land asked once more because you switched to Land. It holds again \
+                                if the answer is the same.";
 
 /// THE FIVE PLACES A STOP IS SAID ([`stop_words`]), as a hold's words are said in five
 /// (`aterm-gui`'s `HoldForm`, which maps onto these one for one).
@@ -626,21 +685,21 @@ pub enum StopForm {
 
 /// A STOPPED AUTOPILOT, IN WORDS (§14.3): ONE function for every surface that says the stop —
 /// the chip's title and description, the state line, the hover and the Overview, a worker's tip —
-/// and for the lab that reads them.
+/// and for the lab that reads them. `switch`: the person's switch to Land would ask once more
+/// over it ([`TYPES_AGAIN_OR_SWITCH`]), else [`TYPES_AGAIN`].
 #[must_use]
-pub fn stop_words(held: HeldBy, form: StopForm) -> String {
+pub fn stop_words(held: HeldBy, form: StopForm, switch: bool) -> String {
+    let again = if switch {
+        TYPES_AGAIN_OR_SWITCH
+    } else {
+        TYPES_AGAIN
+    };
     match form {
-        StopForm::Title => format!("{STOPPED_TYPING}: {}; {TYPES_AGAIN}", held.why()),
-        StopForm::Line => format!(
-            "{STOPPED_TYPING}: {}{FACT_SEPARATOR}{TYPES_AGAIN}",
-            held.why()
-        ),
+        StopForm::Title => format!("{STOPPED_TYPING}: {}; {again}", held.why()),
+        StopForm::Line => format!("{STOPPED_TYPING}: {}{FACT_SEPARATOR}{again}", held.why()),
         StopForm::Hover => STOPPED_TYPING.to_owned(),
         StopForm::Tip => format!("{STOPPED_TYPING}: {}", held.why()),
-        StopForm::Spoken => format!(
-            "Stopped typing: {}. It types again at your turn, or once the agent works.",
-            held.spoken_why()
-        ),
+        StopForm::Spoken => format!("Stopped typing: {}. It {again}.", held.spoken_why()),
     }
 }
 
@@ -685,17 +744,30 @@ mod tests {
                 StopForm::Tip,
             ] {
                 assert!(
-                    stop_words(held, form).starts_with(STOPPED_TYPING),
+                    stop_words(held, form, false).starts_with(STOPPED_TYPING),
                     "{held:?} {form:?}"
                 );
             }
-            let spoken = stop_words(held, StopForm::Spoken);
+            let spoken = stop_words(held, StopForm::Spoken, true);
             assert!(spoken.ends_with('.'), "{spoken}");
+            for form in [StopForm::Title, StopForm::Line] {
+                assert!(
+                    stop_words(held, form, true).ends_with(TYPES_AGAIN_OR_SWITCH),
+                    "{held:?} {form:?}: the switch named where it asks"
+                );
+                assert!(
+                    stop_words(held, form, false).ends_with(TYPES_AGAIN),
+                    "{held:?} {form:?}: no switch named where it would not ask"
+                );
+            }
+            for form in [StopForm::Hover, StopForm::Tip] {
+                assert_eq!(stop_words(held, form, true), stop_words(held, form, false));
+            }
         }
         assert_eq!(HeldBy::of_word("-"), None);
         assert_ne!(
-            stop_words(HeldBy::SameReply, StopForm::Line),
-            stop_words(HeldBy::NoWork, StopForm::Line),
+            stop_words(HeldBy::SameReply, StopForm::Line, false),
+            stop_words(HeldBy::NoWork, StopForm::Line, false),
             "the arms say different whys"
         );
     }
@@ -751,7 +823,7 @@ mod tests {
             Act::Answered => Counter::Answered,
             Act::Continued => Counter::Continued,
             Act::Resumed => Counter::Resumed,
-            Act::Landing | Act::Nudged => Counter::LandPrompts,
+            Act::Landing | Act::Nudged | Act::LandCheck => Counter::LandPrompts,
         }
     }
 
@@ -833,6 +905,10 @@ mod tests {
         assert_eq!(
             sort(RULE_LAND_NUDGE, typed, "still landing?"),
             lit(Act::Nudged, Counter::LandPrompts)
+        );
+        assert_eq!(
+            sort(RULE_LAND_CHECK, typed, "land check"),
+            lit(Act::LandCheck, Counter::LandPrompts)
         );
         for rule in [
             RULE_LIMIT_RESUME,

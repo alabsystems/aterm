@@ -1685,6 +1685,22 @@ fn a_foreign_landing_restores_the_prior_licensed_hand_row() {
         Some(CursorGlow::DECLINE_PROGRAM_ROW),
         "precondition: the visible hop really was rejected"
     );
+    assert_eq!(
+        glow.admission_log().last().unwrap().program_row_refusal,
+        Some(ProgramRowRefusal::VisibleLanding {
+            landing_foreign: true,
+            parked_redisplay: false,
+        })
+    );
+    let line = glow.admission_log().last().unwrap().line(echo);
+    let fields: std::collections::BTreeMap<_, _> = line
+        .split_ascii_whitespace()
+        .filter_map(|field| field.split_once('='))
+        .collect();
+    assert_eq!(fields.get("program_row"), Some(&"visible-landing"));
+    assert_eq!(fields.get("landing_foreign"), Some(&"1"));
+    assert_eq!(fields.get("parked_redisplay"), Some(&"0"));
+    assert!(!fields.contains_key("spoken_for"));
     assert_eq!(glow.last_licensed_row, Some((3, t0)));
     let hidden = echo + ms(8);
     glow.tick(None, hidden, &c, g, &mut out);
@@ -1723,6 +1739,10 @@ fn a_lifted_word_is_not_refused_by_the_landing_gate() {
                 && r.2 == (4, 8)
                 && r.3 == (4, 1)),
         "the lift is judged, not refused: {rows:?}"
+    );
+    assert_eq!(
+        glow.admission_log().last().unwrap().program_row_refusal,
+        None
     );
     assert_eq!(glow.in_flight_tally().forgotten, 0, "spent, not forgotten");
     assert_eq!(glow.typed_credits_within(echo), 0, "the Space is paid");
@@ -1884,7 +1904,13 @@ fn a_key_after_the_walk_back_keeps_the_recall_and_hands_back_only_the_lay_s_own(
     let g = wide_geom();
     let c = cfg(GlowStyle::RainbowKitty, true);
     let row = |s: &str| -> Vec<char> { s.chars().collect() };
-    let doubt = |row: u16, parked: bool| Some(UnownedCaret { row, parked });
+    let doubt = |row: u16, parked: bool| {
+        Some(UnownedCaret {
+            row,
+            parked,
+            boundary: None,
+        })
+    };
     for leg in ["click", "arrow", "return", "parked elsewhere", "moves on"] {
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
@@ -1906,8 +1932,20 @@ fn a_key_after_the_walk_back_keeps_the_recall_and_hands_back_only_the_lay_s_own(
         } else {
             doubt(3, true)
         };
+        let saved_boundary = CaretBoundary {
+            seq: 7,
+            origin: BoundaryOrigin::ImeCommit,
+            at: t0,
+        };
+        lay.unowned_before.as_mut().unwrap().boundary = Some(saved_boundary);
+        let newer_boundary = CaretBoundary {
+            seq: 8,
+            origin: BoundaryOrigin::PhysicalPress,
+            at: e1,
+        };
         if leg == "parked elsewhere" {
             glow.unowned_caret = doubt(9, true);
+            glow.unowned_caret.as_mut().unwrap().boundary = Some(newer_boundary);
         }
         let back = e1 + ms(8);
         glow.observe_print_anchor(Some((4, 20, 2)));
@@ -1952,7 +1990,50 @@ fn a_key_after_the_walk_back_keeps_the_recall_and_hands_back_only_the_lay_s_own(
             (hand, doubt),
             "{leg}: the recall hands back the lay's own and keeps what came since"
         );
+        assert_eq!(
+            glow.unowned_caret.and_then(|u| u.boundary),
+            match leg {
+                "click" => Some(saved_boundary),
+                "arrow" | "return" => None,
+                _ => Some(newer_boundary),
+            }
+        );
     }
+}
+
+#[test]
+fn a_row_doubts_boundary_follows_coordinates_and_settles_with_the_doubt() {
+    let t0 = Instant::now();
+    let c = cfg(GlowStyle::RainbowKitty, true);
+    let mut glow = CursorGlow::default();
+    glow.tick(Some((5, 2)), t0, &c, geom(), &mut Vec::new());
+    glow.clear_typed_from(t0 + ms(1), BoundaryOrigin::ImeCommit);
+    let boundary = glow.unowned_caret.unwrap().boundary.unwrap();
+    assert_eq!(boundary.seq, 1);
+    assert_eq!(boundary.origin, BoundaryOrigin::ImeCommit);
+    glow.note_scroll(2);
+    assert_eq!(glow.unowned_caret.unwrap().row, 3);
+    glow.note_band_move(2, 6, 1);
+    assert_eq!(glow.unowned_caret.unwrap().row, 4);
+    glow.lift_hand_row(4, 3);
+    assert_eq!(glow.unowned_caret.unwrap().row, 3);
+    glow.clear_typed_keeping_hand(t0 + ms(10));
+    glow.supersede_typed_press();
+    assert_eq!(glow.unowned_caret.unwrap().boundary, Some(boundary));
+    glow.note_motion(t0 + ms(20));
+    assert!(glow.unowned_caret.is_none());
+    glow.clear_typed_from(t0 + ms(30), BoundaryOrigin::ControlFence);
+    let next = glow.unowned_caret.unwrap().boundary.unwrap();
+    assert_eq!(next.seq, 2);
+    assert_eq!(next.origin, BoundaryOrigin::ControlFence);
+    assert_eq!(next.at, t0 + ms(30));
+    glow.reset();
+    assert!(glow.unowned_caret.is_none());
+    glow.tick(Some((2, 0)), t0 + ms(40), &c, geom(), &mut Vec::new());
+    glow.clear_typed(t0 + ms(50));
+    let unknown = glow.unowned_caret.unwrap().boundary.unwrap();
+    assert_eq!(unknown.seq, 3);
+    assert_eq!(unknown.origin, BoundaryOrigin::Unknown);
 }
 
 /// A lift of the hand's line while a lay waits ([`CursorGlow::lift_hand_row`]) carries what the
@@ -1962,6 +2043,11 @@ fn a_key_after_the_walk_back_keeps_the_recall_and_hands_back_only_the_lay_s_own(
 #[test]
 fn a_lift_during_the_wait_carries_the_lay_s_saved_hand_and_doubt() {
     let t0 = Instant::now();
+    let boundary = Some(CaretBoundary {
+        seq: 7,
+        origin: BoundaryOrigin::ImeCommit,
+        at: t0,
+    });
     for (hand, doubt, lifted) in [
         (4, 4, (Some(HandRow::at(3)), Some((3, true)))),
         (3, 3, (None, None)),
@@ -1978,6 +2064,7 @@ fn a_lift_during_the_wait_carries_the_lay_s_saved_hand_and_doubt() {
                 unowned_before: Some(UnownedCaret {
                     row: doubt,
                     parked: true,
+                    boundary,
                 }),
                 anchor_seq: None,
                 printed_off_row: true,
@@ -1987,6 +2074,10 @@ fn a_lift_during_the_wait_carries_the_lay_s_saved_hand_and_doubt() {
         };
         glow.lift_hand_row(4, 3);
         let lay = glow.torn_lay.expect("a lift keeps the lay");
+        assert_eq!(
+            lay.unowned_before.and_then(|u| u.boundary),
+            if doubt == 3 { None } else { boundary }
+        );
         assert_eq!(
             (lay.row, lay.seen),
             (3, Some((3, 5))),

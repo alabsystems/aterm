@@ -1121,6 +1121,24 @@ fn a_fresh_region_is_given_the_control_record_whole() {
         .carry_into(&empty, &fresh, &geometry)
         .expect("nothing to copy");
     assert_eq!(fresh.stores(), 0, "an empty slot copies nothing");
+
+    let damaged = old.snapshot();
+    damaged
+        .write(geometry.ctl_off(), &[0xFF; 8])
+        .expect("corrupt control record");
+    let fresh_damaged = crate::store::CountdownStore::new(geometry.region_len, None);
+    ControlWriter::new()
+        .carry_into(&damaged, &fresh_damaged, &geometry)
+        .expect("damaged slot skipped");
+    assert_eq!(fresh_damaged.stores(), 0, "a damaged slot copies nothing");
+
+    let zero_len = old.snapshot();
+    zero_len.store_u64_release(OFF_CTL_LEN, 0).expect("word");
+    let fresh_zero = crate::store::CountdownStore::new(geometry.region_len, None);
+    ControlWriter::new()
+        .carry_into(&zero_len, &fresh_zero, &geometry)
+        .expect("zero-length slot skipped");
+    assert_eq!(fresh_zero.stores(), 0, "a zero-length slot copies nothing");
 }
 
 /// Single-byte corruption, mismatched commit sequence, or out-of-range length in the control

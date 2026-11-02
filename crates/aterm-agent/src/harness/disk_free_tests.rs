@@ -77,6 +77,159 @@ fn refusal(o: &Outcome) -> &str {
 }
 
 #[test]
+fn managed_custody_keeps_roots_descendants_and_containing_directories() {
+    for name in atpkg::build_cache::registered::CUSTODY_MARKERS {
+        let home = Home::new();
+        let mounts = whole();
+        let w = world(&home, &nobody, &mounts);
+        let outer = home.cache(".cache/tool", 1024);
+        let managed = home.cache(".cache/tool/nested/managed", 2048);
+        std::fs::write(managed.join(name), br#"{"schema":999}"#).unwrap();
+        for path in [&outer, &managed, &managed.join("blob")] {
+            let (outcomes, rows) = free(std::slice::from_ref(path), false, &w);
+            assert!(outcomes[0].refused());
+            assert!(
+                !rows
+                    .iter()
+                    .any(|row| row["action"] == Value::from("removing"))
+            );
+        }
+        assert!(outer.join("blob").is_file());
+        assert_eq!(
+            std::fs::read(managed.join("blob")).unwrap(),
+            vec![7u8; 2048]
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn registered_custody_without_an_embedded_marker_and_unknown_records_still_refuse() {
+    let home = Home::new();
+    let mounts = whole();
+    let w = world(&home, &nobody, &mounts);
+    let parent = home.cache(".cache/tool", 1024);
+    let target = parent.join("registered");
+    let owner = home.path.join("source");
+    std::fs::create_dir(&owner).unwrap();
+    std::fs::write(owner.join("Cargo.toml"), b"[workspace]\n").unwrap();
+    assert!(atpkg::build_cache::registered::create_checked(&home.path, &target, &owner).unwrap());
+    std::fs::write(target.join("payload"), b"keep").unwrap();
+    std::fs::remove_file(target.join(atpkg::build_cache::registered::MARKER)).unwrap();
+    for path in [&parent, &target, &target.join("payload")] {
+        let (outcomes, _) = free(std::slice::from_ref(path), false, &w);
+        assert!(outcomes[0].refused());
+    }
+    assert_eq!(std::fs::read(target.join("payload")).unwrap(), b"keep");
+    let unrelated = home.cache(".npm/unrelated", 512);
+    std::fs::write(
+        home.path
+            .join(atpkg::build_cache::registered::INDEX)
+            .join("unknown.json"),
+        br#"{"schema":999}"#,
+    )
+    .unwrap();
+    let (outcomes, _) = free(std::slice::from_ref(&unrelated), false, &w);
+    assert!(outcomes[0].refused());
+    assert!(unrelated.join("blob").is_file());
+}
+
+#[test]
+fn custody_created_by_the_journal_is_rechecked_before_any_removal() {
+    let home = Home::new();
+    let mounts = whole();
+    let w = world(&home, &nobody, &mounts);
+    let path = home.cache(".cache/tool", 4096);
+    let outcomes = run(std::slice::from_ref(&path), false, &w, &mut |row| {
+        let row: Value = aterm_json::from_str(row).unwrap();
+        if row["action"] == Value::from("removing") {
+            std::fs::write(
+                path.join(atpkg::build_cache::registered::package::COORDINATOR),
+                b"",
+            )
+            .unwrap();
+        }
+        true
+    });
+    assert!(outcomes[0].refused());
+    assert_eq!(std::fs::read(path.join("blob")).unwrap(), vec![7u8; 4096]);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_nested_link_is_removed_without_reading_or_deleting_its_protected_target() {
+    let home = Home::new();
+    let mounts = whole();
+    let w = world(&home, &nobody, &mounts);
+    let candidate = home.cache(".cache/tool", 4096);
+    let outside = home.cache("outside-protected", 2048);
+    let marker = outside.join(atpkg::build_cache::registered::MARKER);
+    std::fs::write(&marker, b"unsupported managed policy").unwrap();
+    std::os::unix::fs::symlink(&outside, candidate.join("link")).unwrap();
+    let (outcomes, _) = free(std::slice::from_ref(&candidate), false, &w);
+    assert!(matches!(outcomes[0].verdict, Verdict::Removed { .. }));
+    assert!(!candidate.exists());
+    assert_eq!(
+        std::fs::read(outside.join("blob")).unwrap(),
+        vec![7u8; 2048]
+    );
+    assert_eq!(
+        std::fs::read(marker).unwrap(),
+        b"unsupported managed policy"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn revoked_index_permission_reports_actual_partial_bytes_and_keeps_remaining_payload() {
+    use std::os::unix::fs::MetadataExt as _;
+    let home = Home::new();
+    let mounts = whole();
+    let w = world(&home, &nobody, &mounts);
+    let path = home.cache(".cache/tool", 64 << 10);
+    let second = path.join("second");
+    std::fs::write(&second, vec![9u8; 32 << 10]).unwrap();
+    let files = [path.join("blob"), second];
+    let blocks: Vec<_> = files
+        .iter()
+        .map(|file| std::fs::metadata(file).unwrap().blocks() * 512)
+        .collect();
+    let admitted = judge(&path, &w).unwrap();
+    let clearance = atpkg::build_cache::registered::ordinary_clearance(&home.path, &path).unwrap();
+    let mut permit = || {
+        if files.iter().any(|file| !file.exists()) {
+            let index = home.path.join(atpkg::build_cache::registered::INDEX);
+            std::fs::create_dir_all(&index).unwrap();
+            std::fs::write(index.join("new.json"), br#"{"schema":999}"#).unwrap();
+        }
+        if clearance.current() {
+            Ok(())
+        } else {
+            Err("registry changed".to_owned())
+        }
+    };
+    let removed = super::super::target::remove_unmanaged_tree(&path, admitted.id, &mut permit);
+    let verdict = record_removal(&admitted, removed, &w, &mut |_| true, "fixture removal");
+    let Verdict::Failed { freed, .. } = verdict else {
+        panic!("{verdict:?}");
+    };
+    let expected: u64 = files
+        .iter()
+        .zip(blocks)
+        .filter(|(file, _)| !file.exists())
+        .map(|(_, bytes)| bytes)
+        .sum();
+    assert!(freed > 0);
+    assert_eq!(freed, expected);
+    assert_eq!(files.iter().filter(|file| file.exists()).count(), 1);
+    for (file, byte, length) in [(&files[0], 7u8, 64 << 10), (&files[1], 9u8, 32 << 10)] {
+        if file.exists() {
+            assert_eq!(std::fs::read(file).unwrap(), vec![byte; length]);
+        }
+    }
+}
+
+#[test]
 fn a_cache_under_each_root_is_removed_and_journalled_before_and_after() {
     let home = Home::new();
     let mounts = whole();

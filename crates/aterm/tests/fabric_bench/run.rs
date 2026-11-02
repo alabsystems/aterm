@@ -416,18 +416,57 @@ fn refusals(w: &World, sids: &[String]) -> String {
 
 /// Stop the world's broker and read back every record it wrote.
 fn stop_and_read(w: &mut World) -> Vec<Rec> {
+    stop_read_then(w, |_| ()).0
+}
+
+/// [`stop_and_read`], running `stopped` on the world once its broker has let the log go.
+fn stop_read_then<T>(w: &mut World, stopped: impl FnOnce(&World) -> T) -> (Vec<Rec>, T) {
     if let Some(mut handle) = w.handle.take() {
         handle.shutdown();
     }
-    let recs = census::read_log(std::path::Path::new(&w.broker_log));
+    let recs = census::read_log(std::path::Path::new(&w.broker_log), w.opts.at_rest_key);
     w.broker.take();
+    let then = stopped(w);
     w.stop().unwrap_or_else(|why| {
         panic!(
             "fabric world cleanup incomplete: {why}; kept {}",
             w.tmp.display()
         )
     });
-    recs
+    (recs, then)
+}
+
+/// Opens of the stopped broker's log a backlog run times.
+const REOPENS: usize = 5;
+
+/// What a broker's start costs on the stopped world's whole log.
+struct Reopen {
+    /// The log's length.
+    bytes: u64,
+    /// [`REOPENS`] opens, each what `aterm link broker` does before it binds: the open (every
+    /// retained record scanned, under a key authenticated) and its retention rules.
+    ms: Vec<f64>,
+}
+
+/// Time [`REOPENS`] opens of `w`'s stopped log, under the options it served with.
+fn reopen(w: &World) -> Reopen {
+    let ms = (0..REOPENS)
+        .map(|_| {
+            let start = Instant::now();
+            let broker = if w.retained {
+                harness::open_broker(&w.broker_log, &w.opts)
+            } else {
+                harness::open_broker_unretained(&w.broker_log, &w.opts)
+            };
+            let took = start.elapsed().as_secs_f64() * 1e3;
+            drop(broker);
+            took
+        })
+        .collect();
+    Reopen {
+        bytes: std::fs::metadata(&w.broker_log).map_or(0, |m| m.len()),
+        ms,
+    }
 }
 
 /// Run `phases` beside a head sampler on `w`'s broker.
@@ -753,6 +792,9 @@ fn opts_for(spec: &Spec) -> OpenOptions {
         opts.durability = Durability::Ordered {
             horizon: Some(Duration::from_millis(ms)),
         };
+    }
+    if spec.at_rest {
+        opts = harness::sealed_opts(opts);
     }
     opts
 }
@@ -1603,7 +1645,13 @@ fn with_max(values: &[f64]) -> String {
 }
 
 /// The attach section's backlog part, pushed onto `md`: its JSON, `null` for a run without one.
-fn backlog_report(spec: &Spec, node: &str, backlogs: &[Backlog], md: &mut Vec<String>) -> Value {
+fn backlog_report(
+    spec: &Spec,
+    node: &str,
+    backlogs: &[Backlog],
+    reopened: &Reopen,
+    md: &mut Vec<String>,
+) -> Value {
     if spec.backlog == 0 {
         return Value::Null;
     }
@@ -1658,6 +1706,17 @@ fn backlog_report(spec: &Spec, node: &str, backlogs: &[Backlog], md: &mut Vec<St
         }));
     }
     md.push(String::new());
+    md.push(format!(
+        "**A broker's start on this log** ({:.1} MiB, the page cache warm, as an update's or a \
+         poisoned log's restart finds it): each open scans every retained record (under a key, \
+         authenticates it) and sets the retention rules, what `aterm link broker` does before it \
+         binds its socket.\n",
+        reopened.bytes as f64 / (1024.0 * 1024.0)
+    ));
+    md.push("| measure (ms) | n | mean | p50 | p95 | p99 |".to_string());
+    md.push("|---|---:|---:|---:|---:|---:|".to_string());
+    md.push(stats::row("open the stopped log", &reopened.ms));
+    md.push(String::new());
     json!({
         "records": spec.backlog,
         "body_bytes": backlog::FILL_BODY_LEN,
@@ -1665,6 +1724,10 @@ fn backlog_report(spec: &Spec, node: &str, backlogs: &[Backlog], md: &mut Vec<St
         "steady_every_ms": u64::try_from(backlog::STEADY_EVERY.as_millis()).unwrap_or(u64::MAX),
         "fetch_scan_max": astream_broker::broker::FETCH_SCAN_MAX,
         "sizes": Value::Array(sizes),
+        "reopen": {
+            "log_bytes": reopened.bytes,
+            "ms": stats::to_json(&reopened.ms),
+        },
     })
 }
 
@@ -1860,7 +1923,16 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     let (rounds, backlogs) = rounds;
     let cal_after = calibrate(&ruler, &w.node, clock, &mut cal_seq);
     let unit = yardstick(&cal_before, &cal_after);
-    let recs = stop_and_read(&mut w);
+    let (recs, reopened) = stop_read_then(&mut w, |w| {
+        if spec.backlog > 0 {
+            reopen(w)
+        } else {
+            Reopen {
+                bytes: 0,
+                ms: Vec::new(),
+            }
+        }
+    });
     let fired = census::will_firings(&recs);
 
     let mut by_size: BTreeMap<usize, Vec<Value>> = BTreeMap::new();
@@ -2057,7 +2129,7 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         ));
     }
     md.push(String::new());
-    let backlog_json = backlog_report(spec, &w.node, &backlogs, &mut md);
+    let backlog_json = backlog_report(spec, &w.node, &backlogs, &reopened, &mut md);
     md.extend(yardstick_rows(&ruler, &cal_before, &cal_after));
     md.extend(normalized);
     md.push(String::new());
@@ -2126,7 +2198,15 @@ fn retention_note(spec: &Spec) -> String {
         }
         (Log::Off, _) => "`--log off` (no bus mirror)",
     };
-    format!("**Retention:** the log {rules}{tick}; the bridge runs {mirror}.")
+    let at_rest = if spec.at_rest {
+        " **Sealed at rest:** the log and its `.state` and `.held` under a key, its `.seal` binding \
+         required (what ships: what `aterm link broker` opens with a `rest.key` beside it); the \
+         yardstick's brokers are not."
+    } else {
+        " **Not sealed at rest** (`--at-rest off`: a plaintext log, which a fabric root no longer \
+         ships)."
+    };
+    format!("**Retention:** the log {rules}{tick}; the bridge runs {mirror}.{at_rest}")
 }
 
 /// Run only the selected scenario.

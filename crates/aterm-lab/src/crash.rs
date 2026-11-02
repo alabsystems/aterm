@@ -45,10 +45,13 @@ fn parse_args(args: &[String]) -> Result<Option<Asked>, Fail> {
                 let v = words
                     .next()
                     .ok_or_else(|| usage("--gap needs SECS".into()))?;
-                a.gap =
-                    v.parse().ok().filter(|&g| g <= GAP_MAX).ok_or_else(|| {
-                        usage(format!("--gap {v}: whole seconds, at most {GAP_MAX}"))
-                    })?;
+                a.gap = v
+                    .bytes()
+                    .all(|b| b.is_ascii_digit())
+                    .then(|| v.parse().ok())
+                    .flatten()
+                    .filter(|&g| g <= GAP_MAX)
+                    .ok_or_else(|| usage(format!("--gap {v}: whole seconds, at most {GAP_MAX}")))?;
             }
             "--keep-tree" => a.keep_tree = true,
             "-h" | "--help" => return Ok(None),
@@ -316,7 +319,7 @@ impl Ops for Live {
     }
 
     fn ended(&mut self, pid: i32) -> bool {
-        !crate::procs::alive(pid) || crate::procs::state_of(pid).is_some_and(|s| s.starts_with('Z'))
+        !crate::procs::alive(pid) || crate::procs::zombie(pid)
     }
 
     fn lives(&mut self, p: &Proc) -> bool {

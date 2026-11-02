@@ -152,10 +152,10 @@ pub(crate) fn task_read(reply: &CtlReply) -> Option<TaskRead> {
             .find_map(|t| t.strip_prefix(key)?.strip_prefix('='))
     };
     Some(TaskRead {
-        rev: field("rev")?.parse().ok()?,
+        rev: crate::parse_uint(field("rev")?)?,
         state: field("state")?.to_string(),
         result_bytes: field("result_bytes")
-            .and_then(|n| n.parse().ok())
+            .and_then(crate::parse_uint)
             .unwrap_or(0),
         result_path: field("result_path").map(str::to_string),
         why: field("why").map(str::to_string),
@@ -181,6 +181,7 @@ impl<C: Ctl> Session<'_, C> {
         opts: &SuperviseOpts,
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
+        let _duty = self.metadata_duty_guard(Scope::TurnEnd);
         let Some(tasks) = opts.tasks.as_deref() else {
             return Ok(());
         };
@@ -206,9 +207,8 @@ impl<C: Ctl> Session<'_, C> {
     /// The landing of this point, published, its result snapshotted under
     /// `tasks`: `Ok(true)` once the record was read and, where it was
     /// `working` — or `done` and opened `again` by someone else's turn, or
-    /// `done` by an older build's word (no landing, [`is_landing`]) — marked
-    /// (or refused for good); `Ok(false)` where a request went unserved or a
-    /// committing update held the mark back.
+    /// `done` by an older build's word (no landing, [`is_landing`]) — marked;
+    /// `Ok(false)` where a request failed or its reply did not confirm the mark.
     fn publish_done(
         &mut self,
         seq: u64,
@@ -218,7 +218,7 @@ impl<C: Ctl> Session<'_, C> {
         review: &mut dyn Review,
     ) -> Result<bool, Fail> {
         let r = self.call(&["task"])?;
-        if r.lost() {
+        if !r.ok() {
             return Ok(false);
         }
         let mut record = task_read(&r);
@@ -227,10 +227,16 @@ impl<C: Ctl> Session<'_, C> {
             .is_some_and(|t| t.state == "done" && (again || !is_landing(t)))
         {
             let r = self.call(&["task", "mark", "working", "why=turn"])?;
-            if r.lost() || r.is_err("busy") {
+            if !r.ok() {
                 return Ok(false);
             }
             record = task_read(&r);
+            if record
+                .as_ref()
+                .is_none_or(|record| record.state != "working")
+            {
+                return Ok(false);
+            }
             if let Some(after) = &record {
                 review.note(&format!(
                     "TASK seq={seq} working why=turn rev={}",
@@ -252,6 +258,18 @@ impl<C: Ctl> Session<'_, C> {
                 .clone()
                 .filter(|(program, _)| crate::supervise::policy::turn_end::screen_alone(*program))
                 .map(|(program, said)| {
+                    // THE CHECK'S `LANDED` adds nothing: the result is the defense it audited.
+                    let said = match &self.land_defense_said {
+                        Some((by, defense))
+                            if *by == program
+                                && crate::supervise::policy::land_check::landed_reply(Some(
+                                    &said,
+                                )) =>
+                        {
+                            defense.clone()
+                        }
+                        _ => said,
+                    };
                     let report = self
                         .land_report
                         .as_ref()
@@ -263,6 +281,13 @@ impl<C: Ctl> Session<'_, C> {
             None
         };
         let shown = self.turn_end.done_shown().map(|t| self.unix_ms_of(t));
+        // WHAT ATERM CHECKED (§14.9, slice 9c): the receipt this landing told, on the record's
+        // `checked=` and in the result's sidecar; none where the landing has none.
+        let checked = self
+            .land_receipt
+            .as_ref()
+            .map(crate::harness::acts::LandReceipt::checked_word);
+        let mut unnoted: Option<String> = None;
         let request = || {
             let mut r = self.fx.path_bytes(tasks);
             r.push(b' ');
@@ -294,6 +319,11 @@ impl<C: Ctl> Session<'_, C> {
                 ),
             }
             .map_err(|e| e.to_string());
+            if let (Ok(s), Some(word)) = (&snap, &checked)
+                && let Err(e) = result::note_checked(&s.path, word)
+            {
+                unnoted = Some(format!(" (its sidecar does not say checked={word}: {e})"));
+            }
             if snap.is_ok() {
                 result::prune_results(tasks, &stem);
             }
@@ -315,6 +345,9 @@ impl<C: Ctl> Session<'_, C> {
             "done".to_string(),
             format!("why={why}"),
         ];
+        if let Some(word) = &checked {
+            args.push(format!("checked={word}"));
+        }
         let result = match &snap {
             Ok(s) => {
                 args.push(format!("result_bytes={}", s.bytes));
@@ -334,16 +367,18 @@ impl<C: Ctl> Session<'_, C> {
         if r.lost() || r.is_err("busy") {
             return Ok(false);
         }
-        match task_read(&r) {
-            Some(after) => review.note(&format!(
-                "TASK seq={seq} done why={why} rev={} {result}",
-                after.rev
-            )),
-            None => review.note(&format!(
+        let Some(after) = task_read(&r).filter(is_landing) else {
+            review.note(&format!(
                 "TASK seq={seq} done not marked: {}",
                 one_line(r.err_text())
-            )),
-        }
+            ));
+            return Ok(false);
+        };
+        review.note(&format!(
+            "TASK seq={seq} done why={why} rev={} {result}{}",
+            after.rev,
+            unnoted.unwrap_or_default()
+        ));
         Ok(true)
     }
 
@@ -408,6 +443,7 @@ impl<C: Ctl> Session<'_, C> {
     /// The task opened again by someone else's turn: a `done` record marked
     /// `working why=turn`.
     fn reopen_task(&mut self, seq: u64, review: &mut dyn Review) -> Result<(), Fail> {
+        let _duty = self.metadata_duty_guard(Scope::TurnEnd);
         let r = self.call(&["task"])?;
         if task_read(&r).is_none_or(|t| t.state != "done") {
             return Ok(());

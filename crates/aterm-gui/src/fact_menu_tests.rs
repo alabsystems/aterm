@@ -51,6 +51,9 @@ fn menu_facts(off: FactMask, side: bool) -> FactMenuFacts {
         key_row: Some(true),
         note: None,
         typing: false,
+        outlook: None,
+        account_row: None,
+        height: None,
     }
 }
 
@@ -395,7 +398,7 @@ fn traffic() -> TrafficView {
 fn texts(rows: &[MenuRow]) -> Vec<String> {
     rows.iter()
         .map(|row| match row {
-            MenuRow::Plot(cells) => cells.iter().map(|c| c.ch).collect(),
+            MenuRow::Plot { cells, .. } => cells.iter().map(|c| c.ch).collect(),
             MenuRow::Note { text, .. } => format!("note {text}"),
             other => format!("{other:?}"),
         })
@@ -410,7 +413,7 @@ fn the_traffic_card_paints_two_bands_and_its_axis() {
     assert!(
         rows[..5]
             .iter()
-            .all(|r| matches!(r, MenuRow::Plot(c) if c.len() == 30)),
+            .all(|r| matches!(r, MenuRow::Plot { cells: c, .. } if c.len() == 30)),
         "{text:#?}"
     );
     assert!(text[0].starts_with("\u{2191} in  "), "{:?}", text[0]);
@@ -426,7 +429,7 @@ fn the_traffic_card_paints_two_bands_and_its_axis() {
         ]
     );
     let ink = |row: usize| match &rows[row] {
-        MenuRow::Plot(cells) => cells[10].ink,
+        MenuRow::Plot { cells, .. } => cells[10].ink,
         _ => unreachable!("a graph row"),
     };
     assert_eq!(
@@ -647,7 +650,7 @@ fn the_account_menu_takes_the_footers_week_or_its_reason() {
 
 /// AN ACCOUNT ROW SAYS HOW OLD ITS STORE FIGURE IS (the footer's one age rule): current for
 /// fifteen minutes, then with its age, however old, while its week runs; never an old
-/// figure read as current, nor dropped to the `100% left` of an account nobody read.
+/// figure read as current, nor dropped to an inferred `100% left` for an account nobody read.
 #[test]
 fn an_account_rows_store_figure_carries_its_age() {
     use aterm_agent::harness::accounts;
@@ -1041,13 +1044,14 @@ fn account_menu_shows_weekly_meter_and_rotation_accounts() {
             },
             AccountMenuRow {
                 account: AccountLabel::new("m27-2").unwrap(),
-                label: "m27-2 \u{b7} dedicated \u{b7} 100% left (auto-login)".into(),
+                label: "m27-2 \u{b7} dedicated \u{b7} not-enrolled; quota unknown (auto-login)"
+                    .into(),
                 active: false,
                 enabled: true,
             },
             AccountMenuRow {
                 account: AccountLabel::new("m27-3").unwrap(),
-                label: "m27-3 \u{b7} pool \u{b7} 100% left (auto-login)".into(),
+                label: "m27-3 \u{b7} pool \u{b7} not-enrolled; quota unknown (auto-login)".into(),
                 active: false,
                 enabled: true,
             },
@@ -1314,9 +1318,9 @@ fn a_grok_pools_menu_offers_no_automatic_sign_in() {
         std::fs::write(
             config.join(format!("accounts-{id}.toml")),
             format!(
-                "[[account]]\nlabel = \"{id}-1\"\nclass = \"dedicated\"\ndir = \"{}\"\n\
+                "[[account]]\nlabel = \"{id}-1\"\nclass = \"dedicated\"\ndir = {}\n\
                  email = \"{id}-one@example.com\"\n{extra}",
-                login.display()
+                crate::test_host::toml(&login)
             ),
         )
         .unwrap();
@@ -1352,8 +1356,8 @@ fn a_default_rows_menu_entry_follows_its_login_file() {
         config.join("accounts-codex.toml"),
         format!(
             "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n[[account]]\n\
-             label = \"work\"\nclass = \"dedicated\"\ndir = \"{}\"\n",
-            work.display()
+             label = \"work\"\nclass = \"dedicated\"\ndir = {}\n",
+            crate::test_host::toml(&work)
         ),
     )
     .unwrap();
@@ -1423,7 +1427,7 @@ fn a_kimi_sessions_account_menu_reads_its_own_pool() {
     std::fs::write(
         config.join("accounts-kimi.toml"),
         format!(
-            "[[account]]\nlabel = \"kimi-1\"\nclass = \"dedicated\"\ndir = \"{}\"\n\
+            "[[account]]\nlabel = \"kimi-1\"\nclass = \"dedicated\"\ndir = '{}'\n\
              email = \"kimi-one@example.com\"\nregion = \"global\"\n",
             login.display()
         ),
@@ -1563,14 +1567,14 @@ fn select_menu_account_for_pins_enrolled_rows_and_dispatches_auto_login_per_cli_
     std::fs::write(
         &roster_path,
         format!(
-            "[[account]]\nlabel = \"codex-1\"\nclass = \"dedicated\"\ndir = \"{}\"\n\
+            "[[account]]\nlabel = \"codex-1\"\nclass = \"dedicated\"\ndir = {}\n\
              email = \"codex-one@example.com\"\n\n\
-             [[account]]\nlabel = \"codex-2\"\nclass = \"dedicated\"\ndir = \"{}\"\n\
+             [[account]]\nlabel = \"codex-2\"\nclass = \"dedicated\"\ndir = {}\n\
              email = \"codex-two@example.com\"\n\n\
-             [[account]]\nlabel = \"codex-3\"\nclass = \"dedicated\"\ndir = \"{}\"\n",
-            login_1.display(),
-            login_2.display(),
-            login_3.display(),
+             [[account]]\nlabel = \"codex-3\"\nclass = \"dedicated\"\ndir = {}\n",
+            crate::test_host::toml(&login_1),
+            crate::test_host::toml(&login_2),
+            crate::test_host::toml(&login_3),
         ),
     )
     .unwrap();
@@ -1698,4 +1702,60 @@ fn no_weekly_why_tells_the_person_to_open_usage() {
             assert!(!whole.contains(asks), "{gap:?}: {whole:?} asks {asks:?}");
         }
     }
+}
+
+/// T8 (`docs/DESIGN-accounts-outlook-2026-10-25.md` §6, §11): AN ACCOUNT ROW WITH NO FIGURE
+/// SHOWS NO NUMBER, NEVER AN INFERRED `100% left`: an account nobody read here (`Unseen`), one
+/// whose login is not made here but signs in by itself (`NotEnrolled` with an email), and one on
+/// record with no figure of its week (`Usable`, its login proven only) may each be spent
+/// elsewhere, so each says its condition and that its quota is unknown, and the one that signs
+/// in by itself keeps its `(auto-login)`. Negative control: the `100%` fallback restored.
+#[test]
+fn no_row_reads_full_without_a_figure() {
+    use aterm_agent::harness::accounts;
+    const NOW: i64 = 1_790_000_000;
+    let row = |label: &str, dir: Option<&str>, email: Option<&str>| accounts::Row {
+        label: label.into(),
+        class: accounts::Class::Dedicated,
+        dir: dir.map(str::to_owned),
+        email: email.map(str::to_owned),
+        ..accounts::Row::default()
+    };
+    let roster = accounts::Roster {
+        rows: vec![
+            row("unseen", None, None),
+            row("away", Some("/nonexistent/alt1"), Some("alt1@example.test")),
+            row("proven", None, None),
+        ],
+    };
+    let enrolled = ["unseen", "proven"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let mut state = accounts::State::default();
+    let _ = accounts::note_auth(&mut state, "proven", accounts::Auth::Ok, NOW - 60);
+    let conditions: Vec<_> = roster
+        .rows
+        .iter()
+        .map(|r| accounts::condition(r, &state, r.dir.is_none() || r.label != "away", NOW).as_str())
+        .collect();
+    assert_eq!(conditions, ["unseen", "not-enrolled", "usable"]);
+    let (rows, _) = account_menu_rows_from(
+        &roster,
+        &state,
+        &enrolled,
+        true,
+        None,
+        None,
+        SessionWeek::default(),
+        NOW,
+    );
+    let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
+    assert_eq!(labels.len(), 3);
+    for (label, cond) in labels.iter().zip(&conditions) {
+        assert!(!label.contains('%'), "no number: {label}");
+        assert!(label.contains(cond), "its condition: {label}");
+    }
+    assert!(labels[1].ends_with("(auto-login)"), "{}", labels[1]);
+    assert!(!labels[0].ends_with("(auto-login)") && !labels[2].ends_with("(auto-login)"));
 }

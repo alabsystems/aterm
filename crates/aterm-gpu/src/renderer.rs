@@ -307,6 +307,9 @@ impl_pod_zeroable!(HdrGlowUniform {
     _pad: [f32; 2],
 });
 
+/// Words of [`BloomUniform::bits`], four to a row: [`aterm_render::bloom::MASK_WORDS`].
+const BLOOM_MASK_ROWS: usize = aterm_render::bloom::MASK_WORDS / 4;
+
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq)]
 struct BloomUniform {
@@ -319,6 +322,19 @@ struct BloomUniform {
     /// it; the other arms' shaders take it as padding.
     extent: [f32; 2],
     _pad: f32,
+    /// The frame's size, px: `fs_bloom` places its fragment at `uv * screen`.
+    screen: [f32; 2],
+    /// The rest are the frame's [`aterm_render::bloom::LetterMask`], read by `fs_bloom`'s
+    /// `letter_mask` (its twin [`aterm_render::bloom::LetterMask::weight`]); `mask_on` 0 lays
+    /// the bloom whole.
+    origin: [f32; 2],
+    cell: [f32; 2],
+    grow: [f32; 2],
+    feather: [f32; 2],
+    mask_on: f32,
+    _pad2: f32,
+    window: [u32; 4],
+    bits: [[u32; 4]; BLOOM_MASK_ROWS],
 }
 impl_pod_zeroable!(BloomUniform {
     texel: [f32; 2],
@@ -326,8 +342,66 @@ impl_pod_zeroable!(BloomUniform {
     radius: f32,
     chroma_radius: f32,
     extent: [f32; 2],
-    _pad: f32
+    _pad: f32,
+    screen: [f32; 2],
+    origin: [f32; 2],
+    cell: [f32; 2],
+    grow: [f32; 2],
+    feather: [f32; 2],
+    mask_on: f32,
+    _pad2: f32,
+    window: [u32; 4],
+    bits: [[u32; 4]; BLOOM_MASK_ROWS]
 });
+
+impl BloomUniform {
+    /// The composite's uniform for a half-res target `half` (texels, as every arm's size type
+    /// reads in `f32`) over a `frame` (px), the bloom at `strength` and `radius`, `extent` of the
+    /// half texture's storage in use, and the frame's letter mask where its bloom spares its
+    /// letters.
+    fn new(
+        half: (f32, f32),
+        frame: (u32, u32),
+        (strength, radius): (f32, f32),
+        extent: [f32; 2],
+        mask: Option<&aterm_render::bloom::LetterMask>,
+    ) -> Self {
+        let mut u = Self {
+            texel: [1.0 / half.0, 1.0 / half.1],
+            strength,
+            radius,
+            chroma_radius: bloom_chroma_radius(radius),
+            extent,
+            _pad: 0.0,
+            screen: [frame.0 as f32, frame.1 as f32],
+            origin: [0.0; 2],
+            cell: [1.0; 2],
+            grow: [0.0; 2],
+            feather: [1.0; 2],
+            mask_on: 0.0,
+            _pad2: 0.0,
+            window: [0; 4],
+            bits: [[0; 4]; BLOOM_MASK_ROWS],
+        };
+        if let Some(m) = mask {
+            u.origin = m.origin;
+            u.cell = m.cell;
+            u.grow = m.grow;
+            u.feather = m.feather;
+            u.mask_on = 1.0;
+            u.window = m.window;
+            for (i, w) in m
+                .bits
+                .iter()
+                .take(aterm_render::bloom::MASK_WORDS)
+                .enumerate()
+            {
+                u.bits[i / 4][i % 4] = *w;
+            }
+        }
+        u
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq)]
@@ -485,6 +559,75 @@ impl BlitUniform {
     }
 }
 
+/// The largest side (px) of a window's tray stack card.
+#[cfg(target_os = "macos")]
+const MAX_TRAY_STACK_PX: u32 = 16_384;
+
+/// What a Submit B was asked for besides its frame and tray: an overlay-only present
+/// ([`GpuRenderer::present_overlay`]) shows the same frame only under the same shape. The
+/// effects transport shift is not part of it: the overlay-only present passes the window's
+/// resident shift, which is the one its last Submit B drew with, since a Submit A that encodes a
+/// new frame clears the record until that frame's own Submit B lands.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SubmitBShape {
+    invert: bool,
+    overlay: Option<DropOverlay>,
+    source_crop: Option<PresentCrop>,
+    frame: (u32, u32),
+    dest: (u32, u32),
+    dest_format: crate::device_layer::TexelFormat,
+    translucent: bool,
+    premult: bool,
+}
+
+/// A window's last Submit B: its shape, the union (frame px) of its bloom composite, shimmer
+/// region and band shift with its apron, whether it drew the crown, and its tray's footprint.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SubmitBRecord {
+    shape: SubmitBShape,
+    effects: Option<[u32; 4]>,
+    crown: bool,
+    tray: Option<[u32; 4]>,
+}
+
+/// Why [`GpuRenderer::present_overlay`] refused: the caller presents the frame in full instead,
+/// and the deck's change rides along with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OverlayRefusal {
+    /// This renderer does not present on the Metal arm of a live device (overlay-only presents
+    /// are Metal's alone), or its last frame did not draw there.
+    NotMetal,
+    /// The window holds no frame to show again: no full present yet, or not at this size, scale,
+    /// grid or cursor state, or one that left work pending.
+    NoResidentFrame,
+    /// The present's shape (invert, drop overlay, crop, destination, translucency) is not the
+    /// last full frame's.
+    ShapeChanged,
+    /// An effect of the last full frame (bloom composite, shimmer, band shift with its apron,
+    /// crown) overlaps the union of its tray and this one.
+    EffectOverlaps,
+    /// The tray is a stack this renderer cannot fold ([`GpuRenderer::tray_stack_supported`]).
+    NoStack,
+}
+
+/// A tray quad's union with the cards stacked above it ([`TrayQuad::above`]), frame px
+/// `x0, y0, x1, y1`: the base card's rect, widened by each layer's at its offset.
+#[cfg(target_os = "macos")]
+fn tray_stack_union(t: &TrayQuad<'_>) -> [i64; 4] {
+    let rect = |q: &TrayQuad<'_>, offset_y: i32| {
+        let (x, y) = (i64::from(q.dx), i64::from(q.dy) + i64::from(offset_y));
+        [x, y, x + i64::from(q.pw), y + i64::from(q.ph)]
+    };
+    t.above
+        .iter()
+        .map(|l| rect(&l.quad, l.offset_y))
+        .fold(rect(t, 0), |[a0, b0, a1, b1], [c0, d0, c1, d1]| {
+            [a0.min(c0), b0.min(d0), a1.max(c1), b1.max(d1)]
+        })
+}
+
 /// Tray-overlay uniform.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq)]
@@ -500,7 +643,7 @@ impl_pod_zeroable!(TrayUniform {
 });
 
 /// Drop-target highlight parameters, passed to [`GpuRenderer::present_input`].
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DropOverlay {
     pub accent: u32,
     pub wash_a: u8,
@@ -524,6 +667,120 @@ pub struct TrayQuad<'a> {
     pub dx: u32,
     pub dy: u32,
     pub scrim: Option<TrayScrim>,
+    /// The card's content serial (0: none known), so an arm that keeps a copy of the card
+    /// knows which card it holds: two quads of one nonzero serial and size hold the same bytes,
+    /// so the renderer neither compares nor uploads the second. 0 is a card the painter does not
+    /// track, which the renderer compares with what it last uploaded.
+    pub serial: u64,
+    /// What changed since an earlier card ([`TrayDelta`]): `None` where any row may have.
+    pub delta: Option<TrayDelta>,
+    /// The cards drawn over this one, bottom first: with any, the quad is a window's **tray
+    /// stack** (`docs/DESIGN-stats-deck-gpu-motion-2026-10-26.md` §3.3), which the renderer folds
+    /// on the GPU by the CPU fold's law and draws as one card over the stack's union. Only a
+    /// renderer whose [`GpuRenderer::tray_stack_supported`] says so takes one; elsewhere the
+    /// caller folds the cards itself and passes none.
+    pub above: &'a [TrayLayer<'a>],
+}
+
+/// One card of a tray stack above its base ([`TrayQuad::above`]): the card (its own `above`
+/// empty, its `scrim` none), the opacity it folds at (1 is the CPU fold) and the whole device px
+/// it is drawn below its place (`offset_y`, up when negative).
+#[derive(Clone, Copy)]
+pub struct TrayLayer<'a> {
+    pub quad: TrayQuad<'a>,
+    pub opacity: f32,
+    pub offset_y: i32,
+}
+
+/// What changed in a card since one a window may already hold: only rows `rows.0..rows.1`
+/// of this card differ from the card of serial `since`; every other row holds `since`'s bytes.
+/// A native page's motion frame repaints a few small rects of a card that is otherwise the one
+/// presented, and a stats deck frame a few of its rows, so an arm that holds card `since`
+/// uploads those rows alone, not the whole card; any other arm compares the whole card as
+/// before. A delta names its base serial because only an arm that holds that card may upload
+/// the band alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrayDelta {
+    pub since: u64,
+    pub rows: (u32, u32),
+}
+
+/// The band of rows of `new` (`stride` bytes a row) the arm uploads over `old`, the card it
+/// holds: where `delta` (already checked against the card `old` is) names the rows a motion
+/// frame patched, those rows, read without a compare; otherwise the band
+/// [`changed_row_band`] finds.
+#[doc(hidden)]
+pub fn tray_rows_to_upload(
+    old: &[u8],
+    new: &[u8],
+    stride: usize,
+    delta: Option<(u32, u32)>,
+) -> Option<(u32, u32)> {
+    let Some((y0, y1)) = delta else {
+        return changed_row_band(old, new, stride);
+    };
+    if stride == 0 || old.len() != new.len() {
+        return None;
+    }
+    let rows = u32::try_from(new.len() / stride).unwrap_or(u32::MAX);
+    let (y0, y1) = (y0.min(rows), y1.min(rows));
+    (y1 > y0).then_some((y0, y1))
+}
+
+/// What a present does with a window's resident tray card for its next quad
+/// ([`tray_card_update`]).
+#[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TrayCardUpdate {
+    /// The resident card is the quad's: draw it again.
+    Keep,
+    /// Upload rows `[y0, y1)` of the quad into the resident card (same size), then draw it.
+    Rows(u32, u32),
+    /// Make a card of the quad's size and upload all of it.
+    Whole,
+}
+
+/// What the resident card (`resident`: its width, height and the serial it holds, if any)
+/// needs for quad `t`: nothing where the quad is the serial it holds; the quad's delta band
+/// where that band is counted from the serial it holds; else the rows `compare` finds
+/// changed (`None` for none), comparing the whole card, whose bytes count into
+/// `compare_bytes`. In debug builds a delta band is checked to cover every changed row.
+#[cfg(any(target_os = "macos", gl_arm, d3d11_arm))]
+pub(crate) fn tray_card_update(
+    resident: Option<(u32, u32, u64)>,
+    t: &TrayQuad<'_>,
+    compare: impl FnOnce() -> Option<(u32, u32)>,
+    compare_bytes: &mut u64,
+) -> TrayCardUpdate {
+    let Some((_, h, serial)) = resident.filter(|&(w, h, _)| w == t.pw && h == t.ph) else {
+        return TrayCardUpdate::Whole;
+    };
+    if t.serial != 0 && t.serial == serial {
+        return TrayCardUpdate::Keep;
+    }
+    if t.serial != 0
+        && let Some(delta) = t.delta.filter(|d| d.since != 0 && d.since == serial)
+    {
+        let (y0, y1) = (delta.rows.0.min(h), delta.rows.1.min(h));
+        #[cfg(debug_assertions)]
+        if let Some((c0, c1)) = compare() {
+            debug_assert!(
+                y0 <= c0 && c1 <= y1,
+                "the tray card's delta band {y0}..{y1} misses changed rows {c0}..{c1} ({}x{h})",
+                t.pw
+            );
+        }
+        return if y0 < y1 {
+            TrayCardUpdate::Rows(y0, y1)
+        } else {
+            TrayCardUpdate::Keep
+        };
+    }
+    *compare_bytes += t.rgba.len() as u64;
+    match compare() {
+        Some((y0, y1)) => TrayCardUpdate::Rows(y0, y1),
+        None => TrayCardUpdate::Keep,
+    }
 }
 
 /// A modal's smoke layer under its tray card ([`TrayQuad::scrim`]).
@@ -1956,6 +2213,11 @@ struct MetalArmLive {
     ),
     /// What a pipeline warm is building for this arm and has not handed over.
     warm_owed: Vec<crate::metal::warm::WarmItem>,
+    /// The tray-prim pipelines ([`crate::tray_prims`]), built off this thread from the first
+    /// ask, or why they cannot be.
+    tray_prims: crate::metal::tray_prims::TrayPrimsSlot,
+    /// The card [`GpuRenderer::tray_prims_over`] draws into and reads back, at its last size.
+    tray_prims_scratch: Option<(crate::device_layer::LayerTexture, u32, u32)>,
     /// The pipeline states this arm built on its own thread, in order.
     #[cfg(test)]
     built_here: Vec<crate::metal::warm::WarmItem>,
@@ -1972,6 +2234,9 @@ struct PendingPresent {
 thread_local! {
     static INJECTED_MINT_FAILURE: std::cell::Cell<Option<&'static str>> =
         const { std::cell::Cell::new(None) };
+    /// The next tray card ring-slot mint fails (taken by the one mint it fails).
+    static INJECTED_TRAY_RING_MINT_FAILURE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 /// The fx hazard drill's record of a Metal arm (zero-sized outside test and debug builds).
@@ -2024,6 +2289,7 @@ impl FxHazard {
 #[cfg(target_os = "macos")]
 impl MetalArmLive {
     fn new(
+        device_policy: crate::DevicePolicy,
         latch: Arc<crate::metal::loss::LossLatch>,
         warm: &'static crate::metal::warm::WarmLatch,
     ) -> Result<Self, String> {
@@ -2031,7 +2297,7 @@ impl MetalArmLive {
         if let Some(injected) = INJECTED_MINT_FAILURE.with(std::cell::Cell::take) {
             return Err(injected.to_owned());
         }
-        let Some(dev) = crate::metal::ffi::Device::preferred() else {
+        let Some(dev) = crate::metal::ffi::Device::for_policy(device_policy) else {
             return Err("no Metal device on this machine".to_owned());
         };
         let session = crate::metal::encoder::EncodeSession::new(&dev, Arc::clone(&latch))?;
@@ -2097,6 +2363,8 @@ impl MetalArmLive {
             fx_shared_palette: None,
             warmed: std::sync::mpsc::channel(),
             warm_owed: Vec::new(),
+            tray_prims: crate::metal::tray_prims::TrayPrimsSlot::Unasked,
+            tray_prims_scratch: None,
             #[cfg(test)]
             built_here: Vec::new(),
         })
@@ -3803,6 +4071,16 @@ pub struct WindowGpu {
     pub(crate) metal_shimmer_scratch: Option<crate::metal::resources::SealedTexture>,
     #[cfg(target_os = "macos")]
     pub(crate) metal_tray_card: Option<MetalTrayCard>,
+    /// The resident cards of the tray stack's layers above the base ([`TrayQuad::above`]).
+    #[cfg(target_os = "macos")]
+    pub(crate) metal_tray_layers: Vec<Option<MetalTrayCard>>,
+    /// The tray stack's card, which the stack folds into and the tray pass draws.
+    #[cfg(target_os = "macos")]
+    pub(crate) metal_tray_stack: Option<crate::metal::resources::SealedTexture>,
+    /// The last Submit B's shape and what it drew, which an overlay-only present
+    /// ([`GpuRenderer::present_overlay`]) matches and keeps clear of.
+    #[cfg(target_os = "macos")]
+    pub(crate) last_submit_b: Option<SubmitBRecord>,
     #[cfg(target_os = "macos")]
     pub(crate) metal_virtual_off: Option<crate::metal::resources::SealedTexture>,
     occluded_hint: bool,
@@ -4234,6 +4512,10 @@ pub struct GpuRenderer {
     metal_armed: bool,
     #[cfg(target_os = "macos")]
     metal_mint_error: Option<String>,
+    /// The CPU raster's composite law, which the tray stack folds by
+    /// ([`GpuRenderer::set_tray_prim_law`]); none until the host hands it over.
+    #[cfg(target_os = "macos")]
+    tray_law: Option<Box<crate::tray_prims::TrayPrimLaw>>,
     #[cfg(target_os = "macos")]
     metal_arm: Option<MetalArmCell>,
     #[cfg(target_os = "macos")]
@@ -4295,6 +4577,9 @@ pub struct GpuRenderer {
     /// A frame whose bloom spares its letters: its post passes' lights, and
     /// the crown's and the bloom's of them ([`Self::build_spared_bloom_glow`]).
     bloom_spare_scratch: [Vec<aterm_render::GlowQuad>; 3],
+    /// The cells this frame's bloom keeps off at its composite
+    /// ([`aterm_render::bloom::LetterMask`], [`Self::build_spared_bloom_glow`]).
+    bloom_mask: Option<aterm_render::bloom::LetterMask>,
     /// The bloom's item list, the frame's bloom stream where
     /// [`Self::bloom_items_live`].
     bloom_items: aterm_render::bloom::BloomItems,
@@ -4319,6 +4604,7 @@ pub struct GpuRenderer {
     full_repaints: u64,
     tray_uploads: u64,
     tray_upload_bytes: u64,
+    tray_compare_bytes: u64,
     last_instances: usize,
     last_bg_instances: usize,
     last_frame_passes: u32,
@@ -4403,6 +4689,8 @@ pub(crate) struct MetalTrayCard {
     pub(crate) w: u32,
     pub(crate) h: u32,
     pixels: Vec<u8>,
+    /// The content serial of the card `pixels` holds ([`TrayQuad::serial`]; 0 when untracked).
+    serial: u64,
 }
 
 #[cfg(target_os = "macos")]
@@ -4415,7 +4703,6 @@ impl MetalTrayCard {
 }
 
 /// Return the dirty row band (`y0..y1`) where `old` and `new` differ.
-#[cfg(target_os = "macos")]
 pub(crate) fn changed_row_band(old: &[u8], new: &[u8], stride: usize) -> Option<(u32, u32)> {
     if stride == 0 || old.len() != new.len() {
         return None;
@@ -4671,14 +4958,27 @@ impl GpuRenderer {
         Self::new_with_family(None, px, theme)
     }
 
+    /// Acquire an offscreen GPU without a window-system default-device fallback on macOS.
+    /// # Errors
+    /// No permitted GPU or system monospace face, a font-load panic, or renderer assembly fails.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn new_headless(px: f32, theme: Theme) -> Result<Self, String> {
+        Self::new_loading(None, theme, crate::DevicePolicy::Headless, move || {
+            Renderer::from_system(px, theme)
+        })
+    }
+
     /// Like [`GpuRenderer::new`], but resolves a configured font family (or font file path) first,
     /// mirroring [`Renderer::from_system_with_family`].
     #[cfg(not(target_arch = "wasm32"))]
     pub fn new_with_family(family: Option<&str>, px: f32, theme: Theme) -> Result<Self, String> {
         let family_owned = family.map(String::from);
-        Self::new_loading(family.map(String::from), theme, move || {
-            Renderer::from_system_with_family(family_owned.as_deref(), px, theme)
-        })
+        Self::new_loading(
+            family.map(String::from),
+            theme,
+            crate::DevicePolicy::Windowed,
+            move || Renderer::from_system_with_family(family_owned.as_deref(), px, theme),
+        )
     }
 
     /// Like [`GpuRenderer::new_with_family`].
@@ -4689,15 +4989,19 @@ impl GpuRenderer {
         px: f32,
         theme: Theme,
     ) -> Result<Self, String> {
-        Self::new_loading(family.map(String::from), theme, move || {
-            Renderer::from_system_with_face(face.as_ref(), px, theme)
-        })
+        Self::new_loading(
+            family.map(String::from),
+            theme,
+            crate::DevicePolicy::Windowed,
+            move || Renderer::from_system_with_face(face.as_ref(), px, theme),
+        )
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     fn new_loading(
         family: Option<String>,
         theme: Theme,
+        device_policy: crate::DevicePolicy,
         load: impl FnOnce() -> Option<Renderer> + Send + 'static,
     ) -> Result<Self, String> {
         let font_handle = std::thread::spawn(move || {
@@ -4709,7 +5013,7 @@ impl GpuRenderer {
             );
             cpu
         });
-        let ctx = GpuContext::new()?;
+        let ctx = GpuContext::new_with_policy(device_policy)?;
         let font_join_started = aterm_time::Instant::now();
         let cpu = font_handle
             .join()
@@ -4732,6 +5036,11 @@ impl GpuRenderer {
         #[cfg(target_arch = "wasm32")]
         let _ = font_family; // no system font discovery in the browser
         let from_parts_started = aterm_time::Instant::now();
+        #[cfg(target_os = "macos")]
+        let first_frame = match ctx.device_policy {
+            crate::DevicePolicy::Windowed => &crate::metal::warm::FIRST_FRAME,
+            crate::DevicePolicy::Headless => &crate::metal::warm::HEADLESS_FIRST_FRAME,
+        };
 
         let uniform_atlas_started = aterm_time::Instant::now();
         crate::startup_probe::record(
@@ -4765,6 +5074,8 @@ impl GpuRenderer {
             metal_armed: crate::metal_backend_selected(),
             #[cfg(target_os = "macos")]
             metal_mint_error: None,
+            #[cfg(target_os = "macos")]
+            tray_law: None,
             #[cfg(target_os = "macos")]
             metal_arm: None,
             #[cfg(target_os = "macos")]
@@ -4826,6 +5137,7 @@ impl GpuRenderer {
             bloom_glow_scratch: Vec::new(),
             bloom_quad_scratch: Vec::new(),
             bloom_spare_scratch: [Vec::new(), Vec::new(), Vec::new()],
+            bloom_mask: None,
             bloom_items: aterm_render::bloom::BloomItems::default(),
             bloom_items_live: false,
             glow_fx_scratch: Vec::new(),
@@ -4840,6 +5152,7 @@ impl GpuRenderer {
             full_repaints: 0,
             tray_uploads: 0,
             tray_upload_bytes: 0,
+            tray_compare_bytes: 0,
             last_instances: 0,
             last_bg_instances: 0,
             last_frame_passes: 0,
@@ -4853,7 +5166,7 @@ impl GpuRenderer {
             #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
             fetch_probe_seam: None,
             #[cfg(target_os = "macos")]
-            first_frame: &crate::metal::warm::FIRST_FRAME,
+            first_frame,
             #[cfg(target_os = "macos")]
             metal_warm_wanted: false,
             #[cfg(target_os = "macos")]
@@ -5255,6 +5568,13 @@ impl GpuRenderer {
         self.cpu.glyph_ink()
     }
 
+    /// Actual input glyph evidence from the CPU raster cache the atlas uses
+    /// ([`aterm_render::Renderer::glyph_ink_for`]).
+    #[inline]
+    pub fn glyph_ink_for(&mut self, input: &RenderInput) -> Arc<aterm_render::GlyphInk> {
+        self.cpu.glyph_ink_for(input)
+    }
+
     /// Diagnostic.
     #[doc(hidden)]
     #[must_use]
@@ -5275,7 +5595,7 @@ impl GpuRenderer {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn rebuild_on_fresh_context(&self, px: f32) -> Result<Self, String> {
         let cpu = self.cpu.rebuild_from_admitted(px, self.theme)?;
-        let ctx = GpuContext::new()?;
+        let ctx = GpuContext::new_with_policy(self.ctx.device_policy)?;
         Self::from_parts(ctx, cpu, self.font_family.clone(), self.theme)
     }
 
@@ -5497,6 +5817,15 @@ impl GpuRenderer {
         self.tray_upload_bytes
     }
 
+    /// Test/diagnostic: tray card bytes compared against the card last uploaded to find what
+    /// changed, a whole card per compare.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub const fn tray_compare_bytes(&self) -> u64 {
+        self.tray_compare_bytes
+    }
+
     /// Test/diagnostic: total instances built in the last encoded frame.
     #[doc(hidden)]
     #[must_use]
@@ -5572,6 +5901,182 @@ impl GpuRenderer {
             return self.metal_arm.as_ref().and_then(|c| c.live_ref().fetch);
         }
         Some(FetchProbe::Unsupported)
+    }
+
+    /// Whether this renderer draws tray prims on the GPU ([`crate::tray_prims`]): the Metal arm,
+    /// on a device with framebuffer fetch whose tray-prim pipeline builds. Elsewhere the CPU
+    /// raster draws them. Waits for the pipelines' build, which runs off this thread from the
+    /// first ask ([`Self::tray_stack_supported`] does not wait).
+    pub fn tray_prims_supported(&mut self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.metal_tray_prims_ready(true) == Ok(true)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
+
+    /// Whether this renderer folds a tray stack ([`TrayQuad::above`]) itself: where it draws tray
+    /// prims ([`Self::tray_prims_supported`]) and the host handed it the CPU raster's composite law
+    /// ([`Self::set_tray_prim_law`]). Where it says no, the caller folds the cards on the CPU and
+    /// passes one. It never waits: the first ask starts the pipelines' build off this thread,
+    /// and until it lands the answer is no, so no frame waits on a shader compile.
+    pub fn tray_stack_supported(&mut self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.tray_law.is_some() && self.metal_tray_prims_ready(false) == Ok(true)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
+
+    /// A tray stack ([`TrayQuad::above`]) reaches only the arm that folds it: elsewhere the
+    /// caller folds the cards and passes one ([`Self::tray_stack_supported`]).
+    #[inline]
+    fn debug_assert_tray_takes(&self, tray: Option<&TrayQuad<'_>>) {
+        #[cfg(target_os = "macos")]
+        let folds = self.metal_armed && self.tray_law.is_some();
+        #[cfg(not(target_os = "macos"))]
+        let folds = false;
+        debug_assert!(
+            folds || tray.is_none_or(|t| t.above.is_empty()),
+            "a tray stack reached a renderer that does not fold one"
+        );
+    }
+
+    /// Hand over the CPU raster's composite law (`tray_raster`'s), by which a tray stack folds
+    /// ([`Self::tray_stack_supported`]); kept until a different one is handed over.
+    pub fn set_tray_prim_law(&mut self, law: &crate::tray_prims::TrayPrimLaw) {
+        #[cfg(target_os = "macos")]
+        if self.tray_law.as_deref() != Some(law) {
+            self.tray_law = Some(Box::new(*law));
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = law;
+    }
+
+    /// Whether the tray prims draw here ([`Self::tray_prims_supported`]): `Ok(true)` once built,
+    /// `Ok(false)` while their build is under way off this thread and `wait` is false (the first
+    /// ask starts it), and why not where they cannot.
+    #[cfg(target_os = "macos")]
+    fn metal_tray_prims_ready(&mut self, wait: bool) -> Result<bool, String> {
+        if !self.metal_arm_ready() {
+            return Err(self.metal_start_error());
+        }
+        let live = self
+            .metal_arm
+            .as_mut()
+            .ok_or("the Metal arm is not live")?
+            .live_mut();
+        match live.tray_prims.poll(&live.mint, wait) {
+            None => Ok(false),
+            Some(Ok(_)) => Ok(true),
+            Some(Err(why)) => Err(why.clone()),
+        }
+    }
+
+    /// Draw `prims` by `law` over `ground` (straight sRGB RGBA8, `size` pixels, its top-left at
+    /// device px `origin` of the prims' space), with `offsets` ([`crate::tray_prims::TrayPrim::offset`]),
+    /// and read the card back: the bytes `tray_raster` would land for the same prims over the same
+    /// ground, within the parity its tests declare. `Err` where the tray prims cannot draw
+    /// ([`Self::tray_prims_supported`]) or the GPU work fails.
+    pub fn tray_prims_over(
+        &mut self,
+        prims: &[crate::tray_prims::TrayPrim],
+        law: &crate::tray_prims::TrayPrimLaw,
+        offsets: &[[f32; 2]],
+        size: (u32, u32),
+        origin: (i32, i32),
+        ground: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        #[cfg(target_os = "macos")]
+        {
+            self.metal_tray_prims_over(prims, law, offsets, size, origin, ground)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (prims, law, offsets, size, origin, ground);
+            Err("the tray prims draw on the Metal arm alone".to_owned())
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn metal_tray_prims_over(
+        &mut self,
+        prims: &[crate::tray_prims::TrayPrim],
+        law: &crate::tray_prims::TrayPrimLaw,
+        offsets: &[[f32; 2]],
+        (w, h): (u32, u32),
+        origin: (i32, i32),
+        ground: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let _pool = crate::metal::ffi::AutoreleasePool::new();
+        if w == 0 || h == 0 {
+            return Ok(Vec::new());
+        }
+        let stride = w as usize * 4;
+        if ground.len() != stride * h as usize {
+            return Err(format!(
+                "the ground holds {} bytes, not the {}x{} card's {}",
+                ground.len(),
+                w,
+                h,
+                stride * h as usize
+            ));
+        }
+        self.metal_tray_prims_ready(true)?;
+        let live = self
+            .metal_arm
+            .as_mut()
+            .ok_or("the Metal arm is not live")?
+            .live_mut();
+        if live
+            .tray_prims_scratch
+            .as_ref()
+            .is_none_or(|(_, sw, sh)| (*sw, *sh) != (w, h))
+        {
+            let tex = live.layer().try_create_texture_2d(
+                "aterm-gpu tray prims card",
+                crate::device_layer::TexelFormat::Rgba8Unorm,
+                w,
+                h,
+                crate::device_layer::TexUsage::OFFSCREEN,
+                None,
+            )?;
+            live.tray_prims_scratch = Some((tex, w, h));
+        }
+        let (tex, ..) = live.tray_prims_scratch.as_ref().expect("minted above");
+        live.layer().upload_texture_full(tex, ground, w * 4, w, h);
+        let pass = live
+            .tray_prims
+            .poll(&live.mint, true)
+            .and_then(|built| built.as_mut().ok())
+            .ok_or("the tray prims pipeline is not built")?;
+        let staged = pass.stage(&live.mint, prims, law, offsets, (w, h), origin)?;
+        let mut cb = live.session.begin()?;
+        pass.encode(&mut cb, tex.metal(), &staged, None)?;
+        if cb.commit().wait_outcome() != crate::metal::loss::CbOutcome::Completed {
+            return Err("the tray prims' command buffer did not complete".to_owned());
+        }
+        let (readback, padded) = crate::device_layer::metal_stage_readback(
+            &live.session,
+            &live.mint,
+            tex.metal(),
+            w as usize,
+            h as usize,
+        )?;
+        // SAFETY: `readback` is shared storage of `padded * h` bytes, and `metal_stage_readback`
+        // returned after the copy that wrote it completed.
+        let bytes = unsafe { crate::metal::ffi::buffer_bytes(&readback, padded * h as usize) };
+        let mut out = Vec::with_capacity(stride * h as usize);
+        for row in 0..h as usize {
+            out.extend_from_slice(&bytes[row * padded..row * padded + stride]);
+        }
+        Ok(out)
     }
 
     /// Stand `verdict` in for the Metal arm's fetch verdict (`None`: the device's own), so a test
@@ -5779,7 +6284,11 @@ impl GpuRenderer {
         }
         self.first_frame
             .await_item(crate::metal::warm::WarmItem::Library(ShaderLibrary::Cell));
-        match MetalArmLive::new(self.ctx.metal_loss_latch_or_wire(), self.first_frame) {
+        match MetalArmLive::new(
+            self.ctx.device_policy,
+            self.ctx.metal_loss_latch_or_wire(),
+            self.first_frame,
+        ) {
             Ok(live) => {
                 self.metal_arm = Some(MetalArmCell::new(live));
                 if self.metal_warm_wanted {
@@ -5816,6 +6325,33 @@ impl GpuRenderer {
     #[inline]
     pub const fn metal_render_armed(&self) -> bool {
         self.metal_armed && self.metal_arm.is_some()
+    }
+
+    /// Mint the native offscreen arm before a headless caller starts its frame checks.
+    /// This prepares resources without drawing a frame or attaching a window surface.
+    /// # Errors
+    /// Device selection or native setup failed; the cause is the same as a later frame's.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn prepare_offscreen(&mut self) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        if !self.metal_arm_ready() {
+            return Err(self.metal_start_error());
+        }
+        #[cfg(gl_arm)]
+        if !self.gl_arm_ready() {
+            return Err(self
+                .gl_mint_error
+                .clone()
+                .unwrap_or_else(|| "no GL arm".to_owned()));
+        }
+        #[cfg(d3d11_arm)]
+        if !self.d3d11_arm_ready() {
+            return Err(self
+                .d3d11_mint_error
+                .clone()
+                .unwrap_or_else(|| "no D3D11 arm".to_owned()));
+        }
+        Ok(())
     }
 
     #[inline]
@@ -6968,27 +7504,45 @@ impl GpuRenderer {
     #[cfg(target_os = "macos")]
     fn ensure_metal_tray_card(
         live: &mut MetalArmLive,
-        win: &mut WindowGpu,
+        slot: &mut Option<MetalTrayCard>,
         t: &TrayQuad<'_>,
         reader: Option<u64>,
         tray_uploads: &mut u64,
         tray_upload_bytes: &mut u64,
+        tray_compare_bytes: &mut u64,
     ) -> Result<(), String> {
         debug_assert!(
             t.scrim.is_none(),
             "the Metal arm draws no tray scrim (`TrayQuad::scrim`): macOS shows none"
         );
         let stride = t.pw as usize * 4;
-        if let Some(card) = win.metal_tray_card.as_mut()
-            && card.w == t.pw
-            && card.h == t.ph
+        let held = slot.as_ref();
+        let update = tray_card_update(
+            held.map(|c| (c.w, c.h, c.serial)),
+            t,
+            || held.and_then(|c| changed_row_band(&c.pixels, t.rgba, stride)),
+            tray_compare_bytes,
+        );
+        if let Some(card) = slot.as_mut()
+            && update != TrayCardUpdate::Whole
         {
-            let Some(band) = changed_row_band(&card.pixels, t.rgba, stride) else {
+            // A card it holds already (one serial, one set of pixels) uploads nothing, and a
+            // card with a delta from the card held here names the rows it changed since.
+            let TrayCardUpdate::Rows(y0, y1) = update else {
                 card.ring.read_unchanged(reader);
+                card.serial = t.serial;
                 return Ok(());
             };
+            // The card claims `t`'s serial only once its rows landed: a failed mint below
+            // leaves it holding the serial its texture and `pixels` still are, so the next
+            // present counts its band from there (or compares) and uploads the change again.
+            let band = (y0, y1);
             let write = card.ring.plan_change(band);
             if write.mint {
+                #[cfg(test)]
+                if INJECTED_TRAY_RING_MINT_FAILURE.with(std::cell::Cell::take) {
+                    return Err("tray card mint: injected ring mint failure".to_owned());
+                }
                 let tex = live
                     .layer()
                     .try_create_texture_2d(
@@ -7020,6 +7574,9 @@ impl GpuRenderer {
             let (b0, b1) = (band.0 as usize * stride, band.1 as usize * stride);
             card.pixels[b0..b1].copy_from_slice(&t.rgba[b0..b1]);
             card.ring.land_change(write, band, reader);
+            // Publish only the pixels that landed: a failed mint must leave this serial
+            // retryable, and must not authorize a delta against pixels it never received.
+            card.serial = t.serial;
             return Ok(());
         }
         let layer = live.layer();
@@ -7036,18 +7593,16 @@ impl GpuRenderer {
         layer.upload_texture_full(&tex, t.rgba, t.pw * 4, t.pw, t.ph);
         *tray_uploads += 1;
         *tray_upload_bytes += t.rgba.len() as u64;
-        let mut pixels = win
-            .metal_tray_card
-            .take()
-            .map_or_else(Vec::new, |c| c.pixels);
+        let mut pixels = slot.take().map_or_else(Vec::new, |c| c.pixels);
         pixels.clear();
         pixels.extend_from_slice(t.rgba);
-        win.metal_tray_card = Some(MetalTrayCard {
+        *slot = Some(MetalTrayCard {
             texes: vec![tex],
             ring: crate::tray_card_ring::TrayCardRing::fresh(t.ph, reader),
             w: t.pw,
             h: t.ph,
             pixels,
+            serial: t.serial,
         });
         Ok(())
     }
@@ -7128,14 +7683,16 @@ impl GpuRenderer {
         )?;
         let bu = mint_bytes(
             live,
-            aterm_bits::bytes_of(&BloomUniform {
-                texel: [1.0 / bw as f32, 1.0 / bh as f32],
-                strength: page_bloom_strength(self.bloom_strength, input, self.theme.bg),
-                radius: self.bloom_radius,
-                chroma_radius: bloom_chroma_radius(self.bloom_radius),
-                extent: [1.0; 2],
-                _pad: 0.0,
-            }),
+            aterm_bits::bytes_of(&BloomUniform::new(
+                (bw as f32, bh as f32),
+                (fw, fh),
+                (
+                    page_bloom_strength(self.bloom_strength, input, self.theme.bg),
+                    self.bloom_radius,
+                ),
+                [1.0; 2],
+                self.bloom_mask.as_ref(),
+            )),
         )?;
         let clip = input.fx_clip.map(|(cx0, cy0, cx1, cy1)| {
             [
@@ -7364,6 +7921,9 @@ impl GpuRenderer {
     ) -> Result<(), String> {
         use crate::metal::encoder::{RenderPassDesc, StoreAction};
         use crate::metal::ffi::{self as mtl, LoadAction, PixelFormat as MPix};
+        if !t.above.is_empty() {
+            return Err("a readback bakes one tray card: the caller folds a stack first".into());
+        }
         let _pool = mtl::AutoreleasePool::new();
         let (fw, fh, off_tex) = {
             let off = win
@@ -7380,11 +7940,12 @@ impl GpuRenderer {
             .live_mut();
         Self::ensure_metal_tray_card(
             live,
-            win,
+            &mut win.metal_tray_card,
             &t,
             None,
             &mut self.tray_uploads,
             &mut self.tray_upload_bytes,
+            &mut self.tray_compare_bytes,
         )?;
         let tu = {
             let layer = live.layer();
@@ -7576,6 +8137,7 @@ impl GpuRenderer {
             tray,
             source_crop,
             effects_transport_shift_y,
+            false,
         );
         self.metal_seal_gpu_frame();
         out
@@ -7615,6 +8177,7 @@ impl GpuRenderer {
         tray: Option<TrayQuad<'_>>,
         source_crop: Option<PresentCrop>,
         effects_transport_shift_y: i32,
+        resident: bool,
     ) -> Result<(), SurfacePresentFailure> {
         let _pool = crate::metal::ffi::AutoreleasePool::new();
         let source_crop = self
@@ -7669,7 +8232,17 @@ impl GpuRenderer {
         let work_started = aterm_time::Instant::now();
         self.metal_open_gpu_frame();
 
-        let (fw, fh) = self.encode_present_frame(win, input);
+        // A resident present (`present_overlay`) shows the frame the offscreen already holds.
+        let (fw, fh) = if resident {
+            win.metal_offscreen
+                .as_ref()
+                .map(|o| (o.w, o.h))
+                .ok_or(SurfacePresentFailure::Validation)?
+        } else {
+            // A new frame: no Submit B drew it yet, so none may show it again.
+            win.last_submit_b = None;
+            self.encode_present_frame(win, input)
+        };
         if !self.last_frame_arm_metal {
             metal_arm_note("armed present dropped: the frame did not draw on Metal");
             return Err(SurfacePresentFailure::Validation);
@@ -7795,6 +8368,7 @@ impl GpuRenderer {
             source_crop,
             effects_transport_shift_y,
             destination,
+            false,
         );
         self.metal_seal_gpu_frame();
         out
@@ -7815,6 +8389,7 @@ impl GpuRenderer {
         source_crop: Option<PresentCrop>,
         effects_transport_shift_y: i32,
         destination: (u32, u32),
+        resident: bool,
     ) -> Result<(), String> {
         use crate::metal::ffi as mtl;
         let _pool = mtl::AutoreleasePool::new();
@@ -7825,7 +8400,16 @@ impl GpuRenderer {
         let h = self.clamp_fb_dim(destination.1.max(1));
         let work_started = aterm_time::Instant::now();
         self.metal_open_gpu_frame();
-        let (fw, fh) = self.encode_present_frame(win, input);
+        // A resident present (`present_overlay_virtual`) shows the frame the offscreen holds.
+        let (fw, fh) = if resident {
+            win.metal_offscreen
+                .as_ref()
+                .map(|o| (o.w, o.h))
+                .ok_or("an overlay-only present needs a resident offscreen")?
+        } else {
+            win.last_submit_b = None;
+            self.encode_present_frame(win, input)
+        };
         if !self.last_frame_arm_metal {
             return Err("the frame did not draw on Metal".to_owned());
         }
@@ -7922,9 +8506,10 @@ impl GpuRenderer {
         use crate::metal::ffi::{self as mtl, PixelFormat as MPix};
         use crate::metal::present::{
             ApronStripPass, BandShiftPass, BloomPasses, CrownPass, PostPass, PresentSequence,
-            ShimmerPass, TrayPass, encode_present_sequence,
+            ShimmerPass, TrayPass, TrayStackPass, encode_present_sequence,
         };
 
+        win.last_submit_b = None;
         let PresentUniforms {
             live_bg,
             want,
@@ -7971,13 +8556,10 @@ impl GpuRenderer {
         );
         let band_shift = band_shift_ops(band_y0, band_y1, i64::from(input.scroll_frac_px));
         let band_fx: Option<[u32; 4]> = band_shift.map(|_| [0, band_y0 as u32, fw, band_y1 as u32]);
-        let tray_fx: Option<[u32; 4]> = tray.as_ref().map(|t| {
-            [
-                t.dx.min(fw),
-                t.dy.min(fh),
-                t.dx.saturating_add(t.pw).min(fw),
-                t.dy.saturating_add(t.ph).min(fh),
-            ]
+        let tray_union = tray.as_ref().map(tray_stack_union);
+        let tray_fx: Option<[u32; 4]> = tray_union.map(|[x0, y0, x1, y1]| {
+            let fit = |v: i64, hi: u32| v.clamp(0, i64::from(hi)) as u32;
+            [fit(x0, fw), fit(y0, fh), fit(x1, fw), fit(y1, fh)]
         });
         let shift_scratch = match band_shift {
             Some(_) => Some(self.metal_ensure_shift_scratch(win, fw, fh)?),
@@ -8080,14 +8662,16 @@ impl GpuRenderer {
             let bu = MetalArmLive::upload_scratch_stream(
                 crate::device_layer::DeviceHandle::Metal(&live.mint),
                 &mut live.submit_b_slots[sb_idx].bloom_u,
-                aterm_bits::bytes_of(&BloomUniform {
-                    texel: [1.0 / bw as f32, 1.0 / bh as f32],
-                    strength: page_bloom_strength(self.bloom_strength, input, self.theme.bg),
-                    radius: self.bloom_radius,
-                    chroma_radius: bloom_chroma_radius(self.bloom_radius),
-                    extent: [1.0; 2],
-                    _pad: 0.0,
-                }),
+                aterm_bits::bytes_of(&BloomUniform::new(
+                    (bw as f32, bh as f32),
+                    (fw, fh),
+                    (
+                        page_bloom_strength(self.bloom_strength, input, self.theme.bg),
+                        self.bloom_radius,
+                    ),
+                    [1.0; 2],
+                    self.bloom_mask.as_ref(),
+                )),
             )?;
             let clip = input.fx_clip.map(|(cx0, cy0, cx1, cy1)| {
                 [
@@ -8206,24 +8790,106 @@ impl GpuRenderer {
             })
             .transpose()?;
 
+        let stacked = tray.as_ref().is_some_and(|t| !t.above.is_empty());
         if let Some(t) = tray.as_ref() {
             Self::ensure_metal_tray_card(
                 live,
-                win,
+                &mut win.metal_tray_card,
                 t,
                 tray_reader,
                 &mut self.tray_uploads,
                 &mut self.tray_upload_bytes,
+                &mut self.tray_compare_bytes,
             )?;
+            win.metal_tray_layers.resize_with(t.above.len(), || None);
+            for (slot, layer) in win.metal_tray_layers.iter_mut().zip(t.above) {
+                debug_assert!(
+                    layer.quad.above.is_empty() && layer.quad.scrim.is_none(),
+                    "a tray stack's card carries no stack and no scrim of its own"
+                );
+                Self::ensure_metal_tray_card(
+                    live,
+                    slot,
+                    &layer.quad,
+                    tray_reader,
+                    &mut self.tray_uploads,
+                    &mut self.tray_upload_bytes,
+                    &mut self.tray_compare_bytes,
+                )?;
+            }
+        } else {
+            win.metal_tray_layers.clear();
         }
-        let tray_parts = tray
-            .map(|t| -> Result<_, String> {
+        // A stack folds into its own card over its union, which the tray pass then draws as the
+        // one card (design §3.3).
+        let stack_parts = match (tray.as_ref(), tray_union) {
+            (Some(t), Some([x0, y0, x1, y1])) if stacked => {
+                let law = self.tray_law.as_deref().ok_or(
+                    "a tray stack folds by the CPU raster's law, which the host has not handed over \
+                     (GpuRenderer::set_tray_prim_law)",
+                )?;
+                let (uw, uh) = (
+                    u32::try_from(x1 - x0).map_err(|_| "the tray stack's union is empty")?,
+                    u32::try_from(y1 - y0).map_err(|_| "the tray stack's union is empty")?,
+                );
+                if uw == 0 || uh == 0 || uw > MAX_TRAY_STACK_PX || uh > MAX_TRAY_STACK_PX {
+                    return Err(format!("the tray stack's union is {uw}x{uh} px"));
+                }
+                if win
+                    .metal_tray_stack
+                    .as_ref()
+                    .is_none_or(|t| (t.width(), t.height()) != (uw as usize, uh as usize))
+                {
+                    win.metal_tray_stack = Some(mint_scratch(
+                        live,
+                        "aterm-gpu metal tray stack",
+                        uw as usize,
+                        uh as usize,
+                    )?);
+                }
+                let at = |q: &TrayQuad<'_>, offset_y: i32, opacity: f32| {
+                    crate::metal::tray_prims::StackCard {
+                        origin: (
+                            (i64::from(q.dx) - x0) as i32,
+                            (i64::from(q.dy) + i64::from(offset_y) - y0) as i32,
+                        ),
+                        size: (q.pw, q.ph),
+                        opacity,
+                    }
+                };
+                let cards: Vec<_> = std::iter::once(at(t, 0, 1.0))
+                    .chain(t.above.iter().map(|l| at(&l.quad, l.offset_y, l.opacity)))
+                    .collect();
+                // The caller stacked only once the build landed (`tray_stack_supported`); an
+                // arm rebuilt since (a device loss) waits for its own.
+                let built = live
+                    .tray_prims
+                    .poll(&live.mint, true)
+                    .ok_or("the tray-prim build did not answer")?
+                    .as_mut()
+                    .map_err(|e| format!("a tray stack needs the tray-prim pipelines: {e}"))?;
+                let staged = built.stage_stack(&live.mint, law, &cards, (uw, uh))?;
+                Some((
+                    staged,
+                    win.metal_tray_stack
+                        .as_ref()
+                        .expect("ensured above")
+                        .clone_handle(),
+                ))
+            }
+            _ => {
+                win.metal_tray_stack = None;
+                None
+            }
+        };
+        let tray_parts = tray_union
+            .map(|[x0, y0, x1, y1]| -> Result<_, String> {
                 let sb_idx = live.submit_b_idx;
                 let tu = MetalArmLive::upload_scratch_stream(
                     crate::device_layer::DeviceHandle::Metal(&live.mint),
                     &mut live.submit_b_slots[sb_idx].tray_u,
                     aterm_bits::bytes_of(&TrayUniform {
-                        rect: [t.dx as f32, t.dy as f32, t.pw as f32, t.ph as f32],
+                        rect: [x0 as f32, y0 as f32, (x1 - x0) as f32, (y1 - y0) as f32],
                         fb: [fw as f32, fh as f32],
                         _pad: [0.0, 0.0],
                     }),
@@ -8386,14 +9052,32 @@ impl GpuRenderer {
                 dst_y: strip.dst_y as usize,
                 rows: strip.rows as usize,
             }),
+            stack: stack_parts.as_ref().map(|(staged, target)| TrayStackPass {
+                target,
+                pso: &staged.pso,
+                law: &staged.law,
+                cards: std::iter::once(&win.metal_tray_card)
+                    .chain(win.metal_tray_layers.iter())
+                    .map(|card| {
+                        card.as_ref()
+                            .expect("ensured alongside the tray above")
+                            .tex()
+                            .obj()
+                    })
+                    .zip(staged.uniforms.iter())
+                    .collect(),
+            }),
             tray: tray_parts.as_ref().map(|(tu, pso, binds)| TrayPass {
                 pso,
-                card_tex: win
-                    .metal_tray_card
-                    .as_ref()
-                    .expect("ensured alongside the tray above")
-                    .tex()
-                    .obj(),
+                card_tex: match stack_parts.as_ref() {
+                    Some((_, stack)) => stack.obj(),
+                    None => win
+                        .metal_tray_card
+                        .as_ref()
+                        .expect("ensured alongside the tray above")
+                        .tex()
+                        .obj(),
+                },
                 tex_slot: binds.fragment_textures[0] as usize,
                 sampler: &live.linear,
                 sampler_slot: binds.fragment_samplers[0] as usize,
@@ -8442,6 +9126,32 @@ impl GpuRenderer {
             win.metal_last_present_blits =
                 crate::metal::encoder::blit_census::opened() - blits_before;
         }
+        // What an overlay-only present matches and leaves alone (`present_overlay`).
+        let mut effects: Option<[u32; 4]> = Some([0, 0, 0, 0]);
+        if let Some((.., sc)) = bloom_parts.as_ref() {
+            effects = union_rect_opt(effects, Some(sc.unwrap_or([0, 0, fw, fh])), (fw, fh));
+        }
+        if let Some((.., region)) = shimmer_parts.as_ref() {
+            effects = union_rect_opt(effects, Some(*region), (fw, fh));
+        }
+        if let Some(band) = band_fx {
+            effects = union_rect_opt(effects, Some(band), (fw, fh));
+        }
+        win.last_submit_b = Some(SubmitBRecord {
+            shape: SubmitBShape {
+                invert,
+                overlay,
+                source_crop,
+                frame: (fw, fh),
+                dest: (dw, dh),
+                dest_format,
+                translucent,
+                premult,
+            },
+            effects: effects.filter(|r| !rect_is_empty(*r)),
+            crown: crown_parts.is_some(),
+            tray: tray_fx,
+        });
         if use_present_off {
             let mut fx: Option<[u32; 4]> = Some([0, 0, 0, 0]);
             if let Some((.., sc)) = bloom_parts.as_ref() {
@@ -8774,6 +9484,9 @@ impl GpuRenderer {
         width: u32,
         height: u32,
     ) -> Result<GpuSurface, String> {
+        if self.ctx.device_policy == crate::DevicePolicy::Headless {
+            return Err("a headless GPU context cannot attach a window surface".to_owned());
+        }
         #[cfg(target_os = "macos")]
         let metal_parent = if self.metal_armed {
             crate::metal::present::parent_layer_of(&target)
@@ -8819,6 +9532,9 @@ impl GpuRenderer {
         height: u32,
         sink: Box<dyn FrameSink>,
     ) -> Result<GpuSurface, String> {
+        if self.ctx.device_policy == crate::DevicePolicy::Headless {
+            return Err("a headless GPU context cannot attach a window surface".to_owned());
+        }
         #[cfg(gl_arm)]
         {
             self.gl_create_window_surface(target, width, height, Some(sink))
@@ -8982,6 +9698,10 @@ impl GpuRenderer {
         width: u32,
         height: u32,
     ) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.ctx.device_policy == crate::DevicePolicy::Headless {
+            return;
+        }
         let w = self.clamp_fb_dim(width);
         let h = self.clamp_fb_dim(height);
         {
@@ -9076,6 +9796,9 @@ impl GpuRenderer {
         surf: &mut GpuSurface,
         target: &W,
     ) -> bool {
+        if self.ctx.device_policy == crate::DevicePolicy::Headless {
+            return false;
+        }
         #[cfg(gl_arm)]
         {
             let _ = (win, target);
@@ -9203,9 +9926,14 @@ impl GpuRenderer {
         source_crop: Option<PresentCrop>,
         effects_transport_shift_y: i32,
     ) -> Result<(), SurfacePresentFailure> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.ctx.device_policy == crate::DevicePolicy::Headless {
+            return Err(SurfacePresentFailure::Validation);
+        }
         self.cpu
             .checked_frame_size(input.rows, input.cols)
             .map_err(|_| SurfacePresentFailure::Validation)?;
+        self.debug_assert_tray_takes(tray.as_ref());
         win.begin_surface_present();
         #[cfg(target_os = "macos")]
         self.metal_disarm_sweep(&mut surf.metal);
@@ -9450,6 +10178,231 @@ impl GpuRenderer {
         )
     }
 
+    /// Whether this renderer shows a frame again under a new tray ([`Self::present_overlay`]):
+    /// the Metal arm of a live device. Elsewhere every frame presents in full.
+    pub fn presents_overlay_only(&mut self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.metal_arm_ready()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
+
+    /// An **overlay-only present** onto the window's surface
+    /// (`docs/DESIGN-stats-deck-gpu-motion-2026-10-26.md` §3.3): the frame the window last
+    /// presented in full, unchanged, with `tray` in place of its tray. The terminal frame is not
+    /// encoded again; the present copy is restored from it under the old tray and the new one,
+    /// the frame's effects, blit and crown run as a full present runs them, and the taps see the
+    /// result as they see any present. The arguments are the ones a full present of the same
+    /// state would take; the effects stay where the full present transported them.
+    ///
+    /// # Errors
+    ///
+    /// The outer `Err` is a refusal ([`OverlayRefusal`]) before any work: the caller presents
+    /// in full instead. The inner result is the present's own, as
+    /// [`Self::present_input_cropped_with_effects_transport`]'s.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the overlay-only present takes the full present's tuple, which it must match"
+    )]
+    pub fn present_overlay(
+        &mut self,
+        win: &mut WindowGpu,
+        surf: &mut GpuSurface,
+        invert: bool,
+        overlay: Option<DropOverlay>,
+        tray: Option<TrayQuad<'_>>,
+        crop: Option<PresentCrop>,
+    ) -> Result<Result<(), SurfacePresentFailure>, OverlayRefusal> {
+        #[cfg(target_os = "macos")]
+        {
+            if surf.metal.is_none() {
+                return Err(OverlayRefusal::NotMetal);
+            }
+            let (translucent, premult, _) = self.metal_present_want(win, surf);
+            let (dest_w, dest_h, dest_texel) = surf.neutral_config();
+            let shape = (
+                invert,
+                overlay,
+                crop,
+                (dest_w, dest_h),
+                dest_texel,
+                translucent,
+                premult,
+            );
+            self.overlay_admits(win, shape, tray.as_ref())?;
+            let input = std::mem::take(&mut win.prev_input);
+            win.begin_surface_present();
+            let shift = win.resident_input_effects_transport_shift_y;
+            let out = self.metal_present_input_with_crop_timed(
+                win, surf, &input, invert, overlay, tray, crop, shift, true,
+            );
+            self.metal_seal_gpu_frame();
+            win.prev_input = input;
+            Ok(out)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (win, surf, invert, overlay, tray, crop);
+            Err(OverlayRefusal::NotMetal)
+        }
+    }
+
+    /// [`Self::present_overlay`] into the window's virtual target, as
+    /// [`Self::present_virtual_cropped_with_effects_transport`] presents.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::present_overlay`]'s: the outer `Err` a refusal, the inner `false` a present
+    /// that failed (and dropped).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the overlay-only present takes the full present's tuple, which it must match"
+    )]
+    pub fn present_overlay_virtual(
+        &mut self,
+        win: &mut WindowGpu,
+        invert: bool,
+        overlay: Option<DropOverlay>,
+        tray: Option<TrayQuad<'_>>,
+        crop: Option<PresentCrop>,
+        destination: (u32, u32),
+    ) -> Result<bool, OverlayRefusal> {
+        #[cfg(target_os = "macos")]
+        {
+            let dest = (
+                self.clamp_fb_dim(destination.0.max(1)),
+                self.clamp_fb_dim(destination.1.max(1)),
+            );
+            let shape = (
+                invert,
+                overlay,
+                crop,
+                dest,
+                VIRTUAL_PRESENT_TEXEL,
+                false,
+                false,
+            );
+            self.overlay_admits(win, shape, tray.as_ref())?;
+            let input = std::mem::take(&mut win.prev_input);
+            let shift = win.resident_input_effects_transport_shift_y;
+            let out = self.metal_present_virtual_with_crop_timed(
+                win,
+                &input,
+                invert,
+                overlay,
+                tray,
+                crop,
+                shift,
+                destination,
+                true,
+            );
+            self.metal_seal_gpu_frame();
+            win.prev_input = input;
+            Ok(match out {
+                Ok(()) => true,
+                Err(e) => {
+                    metal_arm_note(&format!(
+                        "armed overlay-only present refused ({e}) — dropping this present"
+                    ));
+                    false
+                }
+            })
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (win, invert, overlay, tray, crop, destination);
+            Err(OverlayRefusal::NotMetal)
+        }
+    }
+
+    /// Whether an overlay-only present of `tray` under `shape` (invert, drop overlay, crop,
+    /// destination, its format, translucency, premultiplication) may show `win`'s resident frame
+    /// again: §3.3's refusal rules.
+    #[cfg(target_os = "macos")]
+    #[allow(
+        clippy::type_complexity,
+        reason = "the shape is the full present's own arguments, compared as one"
+    )]
+    fn overlay_admits(
+        &mut self,
+        win: &WindowGpu,
+        (invert, overlay, crop, dest, dest_format, translucent, premult): (
+            bool,
+            Option<DropOverlay>,
+            Option<PresentCrop>,
+            (u32, u32),
+            crate::device_layer::TexelFormat,
+            bool,
+            bool,
+        ),
+        tray: Option<&TrayQuad<'_>>,
+    ) -> Result<(), OverlayRefusal> {
+        if !self.metal_arm_ready() || !self.last_frame_arm_metal {
+            return Err(OverlayRefusal::NotMetal);
+        }
+        if tray.is_some_and(|t| !t.above.is_empty()) && !self.tray_stack_supported() {
+            return Err(OverlayRefusal::NoStack);
+        }
+        let input = &win.prev_input;
+        let (cw, ch) = self.cpu.cell_size();
+        let frame = (
+            self.clamp_fb_dim((input.cols * cw + 2 * self.cpu.pad()) as u32),
+            self.clamp_fb_dim((input.rows * ch + 2 * self.cpu.pad() + self.cpu.head()) as u32),
+        );
+        let resident = win.present_prev.as_ref().is_some_and(|p| {
+            p.on_metal
+                && p.grid_top == self.cpu.grid_top()
+                && p.blink_phase == self.cpu.cursor_blink_phase()
+                && p.cursor_style_override == self.cpu.cursor_style_override()
+        }) && matches!(&win.metal_offscreen, Some(o) if (o.w, o.h) == frame)
+            && self.metal_pending_band_shift.is_none();
+        let Some(last) = win.last_submit_b.filter(|_| resident) else {
+            return Err(OverlayRefusal::NoResidentFrame);
+        };
+        let source_crop = self
+            .resident_present_crop(input, crop)
+            .map_err(|()| OverlayRefusal::ShapeChanged)?;
+        let shape = SubmitBShape {
+            invert,
+            overlay,
+            source_crop,
+            frame,
+            dest,
+            dest_format,
+            translucent,
+            premult,
+        };
+        if shape != last.shape {
+            return Err(OverlayRefusal::ShapeChanged);
+        }
+        let fit = |[x0, y0, x1, y1]: [i64; 4]| {
+            let clamp = |v: i64, hi: u32| v.clamp(0, i64::from(hi)) as u32;
+            [
+                clamp(x0, frame.0),
+                clamp(y0, frame.1),
+                clamp(x1, frame.0),
+                clamp(y1, frame.1),
+            ]
+        };
+        let union = union_rect_opt(
+            Some(tray.map_or([0, 0, 0, 0], |t| fit(tray_stack_union(t)))),
+            Some(last.tray.unwrap_or([0, 0, 0, 0])),
+            frame,
+        )
+        .filter(|r| !rect_is_empty(*r));
+        let overlaps = |r: [u32; 4]| {
+            union.is_some_and(|u| r[0] < u[2] && u[0] < r[2] && r[1] < u[3] && u[1] < r[3])
+        };
+        if last.crown || last.effects.is_some_and(overlaps) {
+            return Err(OverlayRefusal::EffectOverlaps);
+        }
+        Ok(())
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "the internal shared virtual-present seam carries the existing present tuple plus source crop and destination geometry"
@@ -9465,6 +10418,7 @@ impl GpuRenderer {
         effects_transport_shift_y: i32,
         destination: (u32, u32),
     ) -> bool {
+        self.debug_assert_tray_takes(tray.as_ref());
         #[cfg(target_os = "macos")]
         if self.metal_armed {
             return match self.metal_present_virtual_with_crop(
@@ -9767,6 +10721,7 @@ impl GpuRenderer {
         items: bool,
     ) -> (u32, Option<[u32; 4]>, u32) {
         let f = self.fx_frame_for(input);
+        self.bloom_mask = None;
         if input.bloom_gate.spares_letters() {
             self.bloom_items_live = false;
             return self.build_spared_bloom_glow(input, &f);
@@ -9811,10 +10766,10 @@ impl GpuRenderer {
     }
 
     /// [`Self::build_bloom_glow`] for a frame whose bloom spares its letters
-    /// ([`aterm_core::render::BloomGate::SparesLetters`]): the crown draws its
-    /// lights kept off the lettered cells, the extract its lights kept a
-    /// whole blur's reach off them ([`aterm_render::bloom::spared_sources`]),
-    /// as the CPU law does. Each set is padded with empty instances to the
+    /// ([`aterm_core::render::BloomGate::SparesLetters`]): the crown and the
+    /// extract draw their lights kept off the kept cells, and the composite
+    /// keeps off them by the frame's mask ([`Self::bloom_mask`],
+    /// [`aterm_render::bloom::spared_sources`]), as the CPU law does. Each set is padded with empty instances to the
     /// longer's count, the extract's after the crown's.
     fn build_spared_bloom_glow(
         &mut self,
@@ -9836,7 +10791,7 @@ impl GpuRenderer {
             cell_w: cw,
             cell_h: ch,
         };
-        aterm_render::bloom::spared_sources(
+        self.bloom_mask = aterm_render::bloom::spared_sources(
             &src,
             input,
             grid,
@@ -12771,7 +13726,7 @@ fn theme_color_alpha(c: u32, a: f64) -> crate::device_layer::ClearColor4 {
 /// A GPU renderer for a test, on `family` (the system default for `None`).
 #[cfg(test)]
 pub(crate) fn gpu_renderer_for_test(family: Option<&str>, px: f32, theme: Theme) -> GpuRenderer {
-    let ctx = GpuContext::new()
+    let ctx = GpuContext::new_headless()
         .unwrap_or_else(|e| aterm_spec::host::could_not_run(format!("no GPU: {e}")));
     let cpu = Renderer::from_system_with_family(family, px, theme)
         .unwrap_or_else(|| aterm_spec::host::could_not_run("no system monospace font"));
@@ -12784,6 +13739,36 @@ mod tests {
     use aterm_render::{FaceId, GlowQuad, GlyphClass, StyleBits};
 
     use super::{FRAME_GROUPS, GROUP_SRGB, WindowGpu};
+
+    /// A MOTION FRAME'S ROWS UPLOAD WITHOUT A COMPARE (MOT-1): rows a card names as all it
+    /// changed since the card held upload as named, clamped to the card, and none where they
+    /// fall outside it; a card that names none is compared whole. NEGATIVE CONTROL: an unnamed
+    /// card whose rows match uploads nothing.
+    #[test]
+    fn a_motion_frames_rows_upload_as_named_and_an_unnamed_card_is_compared() {
+        let stride = 4 * 4;
+        let old = vec![0u8; stride * 8];
+        let mut new = old.clone();
+        new[stride * 5] = 9;
+        assert_eq!(
+            super::tray_rows_to_upload(&old, &new, stride, None),
+            Some((5, 6))
+        );
+        assert_eq!(super::tray_rows_to_upload(&old, &old, stride, None), None);
+        assert_eq!(
+            super::tray_rows_to_upload(&old, &new, stride, Some((2, 4))),
+            Some((2, 4)),
+            "named rows are trusted"
+        );
+        assert_eq!(
+            super::tray_rows_to_upload(&old, &new, stride, Some((6, 99))),
+            Some((6, 8))
+        );
+        assert_eq!(
+            super::tray_rows_to_upload(&old, &new, stride, Some((8, 9))),
+            None
+        );
+    }
 
     #[test]
     fn a_minimized_window_parks_all_but_a_captures_present() {
@@ -14150,6 +15135,9 @@ mod tests {
                 dx: 4,
                 dy: 4,
                 scrim: None,
+                serial: 0,
+                delta: None,
+                above: &[],
             }
         }
 
@@ -14181,15 +15169,331 @@ mod tests {
             dx: 4,
             dy: 4,
             scrim: None,
+            serial: 0,
+            delta: None,
+            above: &[],
         };
         let _ = gpu.render_input(&mut win, &input, Some(swapped));
         assert_eq!(gpu.tray_uploads(), 3, "a recreate must always upload");
     }
 
+    /// A tracked card's serial spares the compare: the same serial draws the card it
+    /// holds, a band counted from it uploads that band alone, and only an untracked card (or a
+    /// band from a serial it does not hold) is compared; a new size makes a new card.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_tray_card_update_compares_only_what_it_cannot_name() {
+        let (pw, ph) = (8u32, 6u32);
+        let rgba = vec![0u8; (pw * ph * 4) as usize];
+        let quad = |serial, delta| TrayQuad {
+            rgba: &rgba,
+            pw,
+            ph,
+            dx: 0,
+            dy: 0,
+            scrim: None,
+            serial,
+            delta,
+            above: &[],
+        };
+        let delta = |since, rows| Some(TrayDelta { since, rows });
+        let card = Some((pw, ph, 7));
+        let full = u64::from(pw * ph * 4);
+        let mut compared = 0;
+        // What each case's compare finds; `None`: the case must not compare (a debug build
+        // compares a named band only to check it, uncounted).
+        type Case<'a> = (
+            Option<(u32, u32, u64)>,
+            TrayQuad<'a>,
+            Option<Option<(u32, u32)>>,
+            TrayCardUpdate,
+            u64,
+        );
+        let cases: [Case<'_>; 7] = [
+            (card, quad(7, None), None, TrayCardUpdate::Keep, 0),
+            (
+                card,
+                quad(8, delta(7, (1, 3))),
+                Some(Some((1, 2))),
+                TrayCardUpdate::Rows(1, 3),
+                0,
+            ),
+            (
+                card,
+                quad(8, delta(7, (2, 99))),
+                Some(Some((2, 6))),
+                TrayCardUpdate::Rows(2, ph),
+                0,
+            ),
+            (
+                card,
+                quad(8, delta(7, (2, 2))),
+                Some(None),
+                TrayCardUpdate::Keep,
+                0,
+            ),
+            (
+                card,
+                quad(8, delta(6, (1, 3))),
+                Some(Some((0, 1))),
+                TrayCardUpdate::Rows(0, 1),
+                full,
+            ),
+            (
+                card,
+                quad(0, None),
+                Some(Some((0, 1))),
+                TrayCardUpdate::Rows(0, 1),
+                full,
+            ),
+            (
+                Some((pw, ph + 1, 7)),
+                quad(7, None),
+                None,
+                TrayCardUpdate::Whole,
+                0,
+            ),
+        ];
+        for (i, (resident, t, finds, want, bytes)) in cases.into_iter().enumerate() {
+            let before = compared;
+            let compare = || finds.unwrap_or_else(|| panic!("case {i} compares"));
+            assert_eq!(
+                tray_card_update(resident, &t, compare, &mut compared),
+                want,
+                "case {i}"
+            );
+            assert_eq!(compared - before, bytes, "case {i}: bytes compared");
+        }
+        assert_eq!(
+            tray_card_update(
+                None,
+                &quad(7, None),
+                || panic!("no card compares"),
+                &mut compared
+            ),
+            TrayCardUpdate::Whole,
+            "no card yet"
+        );
+    }
+
+    /// By the renderer's counters: a card presented again under its serial is neither
+    /// compared nor uploaded, a change counted from the serial the window holds uploads its
+    /// band (after the ring's second slot is minted whole), and the frames show each card.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_unchanged_card_is_neither_compared_nor_uploaded() {
+        if crate::metal::ffi::Device::preferred().is_none() {
+            aterm_spec::host::could_not_run("no Metal device");
+        }
+        let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
+        gpu.arm_metal_for_test();
+        let (rows, cols) = (4usize, 10usize);
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        term.process(b"\x1b[?25lhello");
+        let input = term.cell_frame(rows, cols);
+        let mut win = WindowGpu::new();
+        let (pw, ph) = (32u32, 16u32);
+        let stride = u64::from(pw * 4);
+        let red: Vec<u8> = [200, 40, 40, 255].repeat((pw * ph) as usize);
+        let mut banded = red.clone();
+        for px in banded[(4 * stride) as usize..(8 * stride) as usize]
+            .as_chunks_mut::<4>()
+            .0
+        {
+            *px = [40, 200, 40, 255];
+        }
+        fn tray(
+            rgba: &[u8],
+            pw: u32,
+            ph: u32,
+            serial: u64,
+            delta: Option<TrayDelta>,
+        ) -> TrayQuad<'_> {
+            TrayQuad {
+                rgba,
+                pw,
+                ph,
+                dx: 4,
+                dy: 4,
+                scrim: None,
+                serial,
+                delta,
+                above: &[],
+            }
+        }
+        let band = |since| {
+            Some(TrayDelta {
+                since,
+                rows: (4, 8),
+            })
+        };
+        let counters = |gpu: &GpuRenderer| {
+            (
+                gpu.tray_uploads(),
+                gpu.tray_upload_bytes(),
+                gpu.tray_compare_bytes(),
+            )
+        };
+        let full = stride * u64::from(ph);
+
+        let first = gpu.render_input(&mut win, &input, Some(tray(&red, pw, ph, 7, None)));
+        assert!(gpu.metal_render_armed(), "the frame took the Metal arm");
+        assert_eq!(counters(&gpu), (1, full, 0), "the first card uploads whole");
+        for again in 0..3 {
+            let same = gpu.render_input(&mut win, &input, Some(tray(&red, pw, ph, 7, None)));
+            assert_eq!(counters(&gpu), (1, full, 0), "present {again} of serial 7");
+            assert_eq!(
+                same.pixels, first.pixels,
+                "present {again} draws the card it holds"
+            );
+        }
+        let changed = gpu.render_input(&mut win, &input, Some(tray(&banded, pw, ph, 8, band(7))));
+        assert_eq!(
+            counters(&gpu),
+            (2, 2 * full, 0),
+            "the ring's second slot is minted and filled whole"
+        );
+        assert_ne!(
+            changed.pixels, first.pixels,
+            "CONTROL: the band reaches the frame"
+        );
+        let back = gpu.render_input(&mut win, &input, Some(tray(&red, pw, ph, 9, band(8))));
+        assert_eq!(
+            counters(&gpu),
+            (3, 2 * full + 4 * stride, 0),
+            "a change counted from the serial held uploads its four rows"
+        );
+        assert_eq!(
+            back.pixels, first.pixels,
+            "the band alone restores the card"
+        );
+        let _ = gpu.render_input(&mut win, &input, Some(tray(&red, pw, ph, 0, None)));
+        assert_eq!(
+            counters(&gpu),
+            (3, 2 * full + 4 * stride, full),
+            "CONTROL: an untracked card is compared whole"
+        );
+    }
+
+    /// Asking whether the renderer folds a tray stack never waits on the tray prims' shader
+    /// compile: the first ask starts the build off this thread and says no while it is under
+    /// way (the caller folds on the CPU), and once it lands the renderer stacks. A renderer that
+    /// compiled on the ask (the mutant) would not return while the build is held, which the
+    /// hang detector ends.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_tray_stack_never_waits_for_the_tray_prims_build() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        if crate::metal::ffi::Device::preferred().is_none_or(|d| !crate::metal::fetch::capable(&d))
+        {
+            aterm_spec::host::could_not_run("no Metal device with framebuffer fetch");
+        }
+        let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
+        gpu.arm_metal_for_test();
+        gpu.set_tray_prim_law(&crate::tray_prims::TrayPrimLaw {
+            to_linear: [0.0; 256],
+            unit: [0.0; 256],
+            thresholds: [0.0; 256],
+        });
+        let hold = std::sync::Arc::new(std::sync::Mutex::new(Some(
+            crate::metal::tray_prims::held::hold(),
+        )));
+        let hung = std::sync::Arc::new(AtomicBool::new(false));
+        let detector = {
+            let (hold, hung) = (std::sync::Arc::clone(&hold), std::sync::Arc::clone(&hung));
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(60));
+                if let Some(h) = hold.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    hung.store(true, Ordering::SeqCst);
+                    drop(h);
+                }
+            })
+        };
+        let first = gpu.tray_stack_supported();
+        let again = gpu.tray_stack_supported();
+        assert!(
+            !hung.load(Ordering::SeqCst),
+            "the ask waited on the held build"
+        );
+        assert!(!first && !again, "under way, the renderer folds no stack");
+        drop(hold.lock().unwrap_or_else(|e| e.into_inner()).take());
+        assert!(gpu.tray_prims_supported(), "the build lands");
+        assert!(gpu.tray_stack_supported(), "and then the renderer stacks");
+        drop(detector);
+    }
+
+    /// A band whose ring-slot mint fails leaves the card holding the serial its pixels are:
+    /// the same quad presented again uploads the band and shows it, where a card that claimed
+    /// the lost serial would keep drawing the old bytes.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_failed_ring_mint_leaves_the_card_on_the_serial_it_holds() {
+        if crate::metal::ffi::Device::preferred().is_none() {
+            aterm_spec::host::could_not_run("no Metal device");
+        }
+        let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
+        gpu.arm_metal_for_test();
+        let (rows, cols) = (4usize, 10usize);
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        term.process(b"\x1b[?25lhello");
+        let input = term.cell_frame(rows, cols);
+        let (pw, ph) = (32u32, 16u32);
+        let stride = (pw * 4) as usize;
+        let red: Vec<u8> = [200, 40, 40, 255].repeat((pw * ph) as usize);
+        let mut banded = red.clone();
+        for px in banded[4 * stride..8 * stride].as_chunks_mut::<4>().0 {
+            *px = [40, 200, 40, 255];
+        }
+        fn tray(rgba: &[u8], pw: u32, ph: u32, serial: u64) -> TrayQuad<'_> {
+            TrayQuad {
+                rgba,
+                pw,
+                ph,
+                dx: 4,
+                dy: 4,
+                scrim: None,
+                serial,
+                delta: (serial == 8).then_some(TrayDelta {
+                    since: 7,
+                    rows: (4, 8),
+                }),
+                above: &[],
+            }
+        }
+        let want = gpu
+            .render_input(
+                &mut WindowGpu::new(),
+                &input,
+                Some(tray(&banded, pw, ph, 1)),
+            )
+            .pixels;
+
+        let mut win = WindowGpu::new();
+        let first = gpu.render_input(&mut win, &input, Some(tray(&red, pw, ph, 7)));
+        assert_ne!(first.pixels, want, "CONTROL: the band changes the frame");
+        INJECTED_TRAY_RING_MINT_FAILURE.with(|f| f.set(true));
+        let _lost = gpu.render_input(&mut win, &input, Some(tray(&banded, pw, ph, 8)));
+        assert!(
+            !INJECTED_TRAY_RING_MINT_FAILURE.with(std::cell::Cell::get),
+            "the band's present reached the ring-slot mint"
+        );
+        let uploads = gpu.tray_uploads();
+        let again = gpu.render_input(&mut win, &input, Some(tray(&banded, pw, ph, 8)));
+        assert_eq!(
+            gpu.tray_uploads(),
+            uploads + 1,
+            "the serial the failed present lost is uploaded again"
+        );
+        assert_eq!(
+            again.pixels, want,
+            "the card shows the band once the mint succeeds"
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn a_tray_card_drawn_and_waited_inline_records_no_reader() {
-        if crate::metal::ffi::Device::preferred().is_none() {
+        if crate::metal::ffi::Device::preferred_listed().is_none() {
             aterm_spec::host::could_not_run("no Metal device");
         }
         let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
@@ -14212,6 +15516,9 @@ mod tests {
                 dx: 4,
                 dy: 4,
                 scrim: None,
+                serial: 0,
+                delta: None,
+                above: &[],
             }
         }
         let readers = |win: &WindowGpu| {
@@ -14266,6 +15573,9 @@ mod tests {
             dx,
             dy,
             scrim: None,
+            serial: 0,
+            delta: None,
+            above: &[],
         };
 
         input.scroll_frac_px = 0;
@@ -14294,7 +15604,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_failed_first_frame_warm_leaves_the_inline_mint_and_its_failure_route() {
-        let dev = crate::metal::ffi::Device::preferred()
+        let dev = crate::metal::ffi::Device::preferred_listed()
             .unwrap_or_else(|| aterm_spec::host::could_not_run("no Metal device"));
         static LATCH: crate::metal::warm::WarmLatch =
             crate::metal::warm::WarmLatch::new(crate::metal::warm::DEADLINE);
@@ -14377,7 +15687,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_device_that_did_not_pass_the_probe_draws_its_unorm_light_on_the_split() {
-        let dev = crate::metal::ffi::Device::preferred()
+        let dev = crate::metal::ffi::Device::preferred_listed()
             .unwrap_or_else(|| aterm_spec::host::could_not_run("no Metal device"));
         let failed = FetchProbe::Failed {
             stage: crate::FetchStage::InPass,
@@ -14428,7 +15738,7 @@ mod tests {
             UnormRoute::initial(Some(OsStr::new("fetch"))),
             UnormRoute::Fetch
         );
-        let dev = crate::metal::ffi::Device::preferred()
+        let dev = crate::metal::ffi::Device::preferred_listed()
             .unwrap_or_else(|| aterm_spec::host::could_not_run("no Metal device"));
         if cfg!(target_arch = "aarch64") {
             assert!(
@@ -14540,7 +15850,7 @@ mod tests {
     fn the_first_frame_warm_builds_what_a_default_windows_first_frames_build() {
         use crate::device_layer::TexelFormat;
         use crate::metal::warm::{FirstFrameKnobs, WarmItem, first_frame_rows, first_frame_twins};
-        if crate::metal::ffi::Device::preferred().is_none() {
+        if crate::metal::ffi::Device::preferred_listed().is_none() {
             aterm_spec::host::could_not_run("no Metal device");
         }
         let mut built: Vec<WarmItem> = Vec::new();
@@ -14598,7 +15908,7 @@ mod tests {
     fn a_warmed_arm_builds_no_pipeline_on_the_render_thread() {
         use crate::device_layer::TexelFormat;
         use crate::metal::warm::{PresentKnobs, bindable};
-        if crate::metal::ffi::Device::preferred().is_none() {
+        if crate::metal::ffi::Device::preferred_listed().is_none() {
             aterm_spec::host::could_not_run("no Metal device");
         }
         const HANG: std::time::Duration = std::time::Duration::from_secs(60);
@@ -14662,7 +15972,7 @@ mod tests {
     fn a_pass_switched_on_after_the_warm_is_warmed_then() {
         use crate::metal::ffi::PixelFormat;
         use crate::metal::warm::WarmItem;
-        if crate::metal::ffi::Device::preferred().is_none() {
+        if crate::metal::ffi::Device::preferred_listed().is_none() {
             aterm_spec::host::could_not_run("no Metal device");
         }
         const HANG: std::time::Duration = std::time::Duration::from_secs(60);
@@ -14693,7 +16003,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn armed_present_composes_the_stale_rect_and_matches_a_full_copy() {
-        if crate::metal::ffi::Device::preferred().is_none() {
+        if crate::metal::ffi::Device::preferred_listed().is_none() {
             aterm_spec::host::could_not_run("no Metal device");
         }
         let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
@@ -14831,7 +16141,7 @@ mod tests {
     fn a_compose_rect_past_the_offscreen_is_refused() {
         use crate::device_layer::{TexUsage, TexelFormat};
         use crate::metal::present::{PostPass, PresentSequence, encode_present_sequence};
-        if crate::metal::ffi::Device::preferred().is_none() {
+        if crate::metal::ffi::Device::preferred_listed().is_none() {
             aterm_spec::host::could_not_run("no Metal device");
         }
         let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
@@ -14879,6 +16189,7 @@ mod tests {
                 shimmer: None,
                 band_shift: None,
                 apron: None,
+                stack: None,
                 tray: None,
                 blit: post(&blit_pso, copy.obj()),
                 clear: crate::metal::ffi::ClearColor {
@@ -14912,7 +16223,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn tray_present_composes_by_draw_at(opacity: f32) {
         use crate::device_layer::TexelFormat;
-        if crate::metal::ffi::Device::preferred().is_none() {
+        if crate::metal::ffi::Device::preferred_listed().is_none() {
             aterm_spec::host::could_not_run("no Metal device");
         }
         let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
@@ -14936,6 +16247,9 @@ mod tests {
                 dx,
                 dy,
                 scrim: None,
+                serial: 0,
+                delta: None,
+                above: &[],
             })
         };
         let present = |gpu: &mut GpuRenderer,
@@ -15298,8 +16612,9 @@ mod atlas_upload_sync_tests {
 
     fn live_or_skip() -> MetalArmLive {
         match MetalArmLive::new(
+            crate::DevicePolicy::Headless,
             std::sync::Arc::new(LossLatch::new()),
-            &crate::metal::warm::FIRST_FRAME,
+            &crate::metal::warm::HEADLESS_FIRST_FRAME,
         ) {
             Ok(live) => live,
             Err(error) => aterm_spec::host::could_not_run(format!("no Metal arm: {error}")),
@@ -15571,8 +16886,9 @@ mod atlas_upload_sync_tests {
     fn an_in_place_atlas_upload_settles_every_frame_reader() {
         let _pool = AutoreleasePool::new();
         let mut live = match MetalArmLive::new(
+            crate::DevicePolicy::Headless,
             std::sync::Arc::new(LossLatch::new()),
-            &crate::metal::warm::FIRST_FRAME,
+            &crate::metal::warm::HEADLESS_FIRST_FRAME,
         ) {
             Ok(live) => live,
             Err(error) => {
@@ -15777,7 +17093,7 @@ mod fx_hazard_tests {
 
     #[test]
     fn animating_fx_frames_settle_no_reader() {
-        if crate::metal::ffi::Device::preferred().is_none() {
+        if crate::metal::ffi::Device::preferred_listed().is_none() {
             aterm_spec::host::could_not_run("no Metal device");
         }
         let ((settles, settle_ns, park_ns), bound) = episode(false);

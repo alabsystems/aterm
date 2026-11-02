@@ -26,8 +26,8 @@ move to those crates' `SPECS.md` (§5.12).
 
 ## 0. Notation used in the statements
 
-- `ALPH` = `b"0123456789abcdefghjkmnpqrstvwxyz"` (32 symbols). `val(c)` = the index of `c` in `ALPH`,
-  that is, `master::b32_val` restricted to `ALPH`. Table fact: `∀ i<32: b32_val(ALPH[i]) = i`.
+- `ALPH` = `b"0123456789abcdefghjkmnpqrstvwxyz"` (`master::ALPHABET`). `val(c)` = the index of `c` in
+  `ALPH`; `master::b32_val(ALPH[i]) = i` for every `i < 32`.
 - `norm(s)` = `map(fold, filter(|c| ¬c.is_ascii_whitespace() ∧ c ≠ b'-', s.bytes()))`, where
   `fold(c)` = `match c.to_ascii_lowercase() { b'o' => b'0', b'i' | b'l' => b'1', x => x }`.
 - `B32dec(cs: [u8;52]) : [u8;32]` = the first 256 bits of the big-endian concatenation of the 5-bit
@@ -37,10 +37,9 @@ move to those crates' `SPECS.md` (§5.12).
 - `Id(seed)` = the Ed25519 public key of `from_seed_unchecked(seed)`. `b64` =
   `aterm_codec::base64::encode`. `FP(pk)` = `hex(SHA256(pk)[0..2]) ++ "-" ++ hex(SHA256(pk)[2..4])`,
   lowercase. `dec(n)` = the decimal rendering of `n`.
-- **CRYPTO** (assumed, never proved): EUF-CMA for Ed25519 (no valid signature on `m` under `pk`
-  without the secret key), and collision resistance of SHA-256 and of `Id`. Every "a different X
-  gives a different Y" and every "a tampered message or a foreign key is rejected" assertion rests on
-  these. Such assertions are cited as axioms, not proof obligations. `ring`'s Ed25519, SHA-256 and
+- **CRYPTO** (assumed, never proved): EUF-CMA for Ed25519 and collision resistance of SHA-256 and of
+  `Id`. Every "a different X gives a different Y" and every "a tampered message or a foreign key is
+  rejected" rests on it as an axiom, not a proof obligation. `ring`'s Ed25519, SHA-256 and
   `SystemRandom` enter as assumed (FFI) specs.
 - **Anchor grammar** for `pins_edit::read_anchor(src, name)`. `L` = `lines_with_spans(src)`: each line
   keeps its newline in its span, and its text has the trailing `\n` and `\r` stripped. `D` = the lines
@@ -48,25 +47,33 @@ move to those crates' `SPECS.md` (§5.12).
   `OPEN ++ "];"`. For an entry line `t' = t.trim()`: **Blank** if `t' = ""`; **Comment** if `t'` starts
   with `//`; **Member(x)** if `t' = "\"" x "\","` and `x` contains no `"` and no `\`; otherwise
   unrecognised.
-- `FS`: the filesystem projection `Path → Option<Bytes>`, plus mode bits. `FS'` is the state after the
-  call. `entries(dir)` is the set of names in `dir`. A **run** is `preflight`, then `plan`, then
+- `FS`: the filesystem projection `Path → Option<Bytes>`, plus mode bits; `FS'` is the state after the
+  call, and `entries(dir)` the set of names in `dir`. A **run** is `preflight`, then `plan`, then
   `write_pins`, then `write_rest`.
-- `RosterPairRedo`: the `ty_model!` model `aterm_models_release::roster_pair_redo_model`. Its projection
-  is the one in `tests/roster_redo_model.rs::project`: body and signature are each classified 0 =
-  predecessor-or-absent, 1 = target, 2 = foreign; plus redo-marker presence, `writer_lock`, and outcome
+- `RosterPairRedo`: the `ty_model!` model `aterm_models_release::roster_pair_redo_model`, under the
+  projection `tests/roster_redo_model.rs::project`: body and signature each classified 0 =
+  predecessor-or-absent, 1 = target, 2 = foreign; plus redo-marker presence, `writer_lock` and outcome
   counters.
-- "Contains K" in an error statement means the error's text contains the literal `K`. The spec fixes the
-  error variant and the facts it names (counts, positions, paths), not the surrounding prose.
+- An error that "contains K" has the literal `K` in its text. A spec fixes the error variant and the
+  facts it names (counts, positions, paths), not the rest of the prose.
+- Test ids are `module::test` for a `src/` test and `file::test` for a `tests/` file. A composite
+  (`owner-client-roundtrip`, `provision-setup-join-e2e`) follows from its parts once they are proved.
+  `(secondary only: …)` in `subsumes` marks a spec no test samples as primary: the general statement
+  behind asserts in other tests.
+- Gaps are the rows of `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7: 1 non-scalar carriers, 2
+  `&self`/`&mut self` views, 3 E6 body widening, 4 callee-ensures composition, 5 quantified clauses, 7
+  loops, 8 effects, 10 model refinement, 11 generics, 12 cross-crate citation, 13 threads/closures, 16
+  soundness (relational reasoning).
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes (primary tests; secondary in §2)`,
-`difficulty (Rust features the proof must handle)`, `blocking gaps` (audit §7 numbers). Gap 0, the
-seal that publishes Clean rows, blocks every row and is not repeated per row (§6).
+Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (primary tests; the secondary ones are §2's
+`also`), `difficulty` (Rust features the proof must handle), `blocking gaps`. Gap 0, the seal that
+publishes Clean rows, blocks every row and is not listed.
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking gaps
-master-seed-decode	contract	master::MasterPhrase::seed, master::b32_val	∀ phrase p with every p.chars[i] ∈ ALPH (the invariant parse_master and generate_master establish): seed(p).bytes = B32dec(p.chars), and the loop's out index reaches exactly 32. Hence seed depends only on the first 256 bits: two phrases that differ only in the low 4 bits of val(chars[51]) give equal seeds, so equal Id, pubkey_b64 and fingerprint. Phrases that differ in any of the first 256 bits give different seeds (pure fact); the step to a different Id is CRYPTO.	master::the_padding_bits_of_the_last_character_are_masked	EASY-MEDIUM: for-loop over [u8;52] with a u32 shift/or accumulator, a conditional emit into [u8;32] (loop invariant out = ⌊5j/8⌋), range match on u8, the unsafe scrub on exit	3, 5, 7; fragment: `master::b32_val` F1 (VF5 first target, docs/PLAN-tests-to-specs-2026-10-15.md "F1-ready specs").
+master-seed-decode	contract	master::MasterPhrase::seed, master::b32_val	∀ phrase p with every p.chars[i] ∈ ALPH (the invariant parse_master and generate_master establish): seed(p).bytes = B32dec(p.chars), and the loop's out index reaches exactly 32. Hence seed depends only on the first 256 bits: two phrases that differ only in the low 4 bits of val(chars[51]) give equal seeds, so equal Id, pubkey_b64 and fingerprint. Phrases that differ in any of the first 256 bits give different seeds (pure fact); the step to a different Id is CRYPTO.	master::the_padding_bits_of_the_last_character_are_masked	EASY-MEDIUM: for-loop over [u8;52] with a u32 shift/or accumulator, a conditional emit into [u8;32] (loop invariant out = ⌊5j/8⌋), range match on u8, the unsafe scrub on exit	3, 5, 7; fragment: `master::b32_val` F1 (VF5 first target, docs/PLAN-tests-to-specs-2026-10-15.md "F1-ready specs", row 104). Proved via mirror: Clean R216 row `b32_val` (`RowProved`; the verbatim function is in the artifact and certifies, the harness's copy writes its ranges and or-patterns as the equivalent `if` chain), with a false-clause control; not yet credited: Trust's compiler mints no calculus row until it pins a VF5 base (E4.7).
 master-base32-roundtrip	round-trip	master::generate_master, master::encode_phrase, master::MasterPhrase::seed	Factor out the CSPRNG draw raw: [u8;32]; then generate_master's chars = encode_phrase(&raw).chars = B32enc(raw). ∀ raw: (a) every chars[i] ∈ ALPH (so the phrase is lowercase); (b) B32dec(B32enc(raw)) = raw, so seed(generate) = seed(encode_phrase(raw)) = raw; (c) ∀ cs ∈ ALPH^52 with the low 4 bits of val(cs[51]) = 0: B32enc(B32dec(cs)) = cs; (d) parse_master(str(chars)) = Ok with the same chars. Freshness (two calls differ) is a property of SystemRandom, not of this code, and is not part of the spec.	master::generate_produces_a_fresh_fifty_two_character_phrase, master::a_phrase_decodes_to_exactly_the_seed_it_spells	MEDIUM: nested while loop with a shift accumulator, array index by out (invariant 5·out ≤ 8·k), u32 shifts; the RNG call must be split out as an opaque input	3, 5, 7, 8
 master-parse-contract	contract	master::parse_master	∀ input: &str, t = norm(input). If ∃ i: t[i] ∉ ALPH, then parse_master(input) = Err(BadChar{position: i0+1}) for the least such i0, whatever |t| is (the character check precedes the length check). Else if |t| ≠ 52: Err(Length{got: |t|}). Else Ok(p) with p.chars = t. No write goes outside chars[0..52] for any |t| (no panic). Corollaries: parse_master(s) = parse_master(s.to_ascii_uppercase()); o/i/l parse as 0/1/1; separators do not count toward positions.	master::exactly_fifty_two_characters_is_accepted_and_case_folds, master::o_i_and_l_are_read_as_the_characters_they_resemble, master::fifty_one_and_fifty_three_characters_are_refused_with_the_count, master::a_bad_character_is_refused_by_position_and_never_echoed, master::a_bad_character_is_reported_even_when_the_length_is_also_wrong, master::separators_are_stripped_and_positions_count_significant_characters	EASY-MEDIUM: loop over str::bytes, a fixed [u8;52] with a guarded index, early return, u8 ascii helpers, contains over a const array, an enum result; scrub (unsafe write_volatile) on the error paths	1, 3, 5, 7
 phrase-error-message	contract	master::PhraseError::message	∀ p: BadChar{position: p}.message() = "character " ++ dec(p) ++ K1. ∀ g: Length{got: g}.message() = K2 ++ dec(g), with K1, K2 the fixed literals. The message is a function of the PhraseError value alone; since PhraseError holds no input byte, no character of the phrase can appear in it (non-disclosure by construction).	(secondary only: master::fifty_one_and_fifty_three_characters_are_refused_with_the_count, master::a_bad_character_is_refused_by_position_and_never_echoed)	EASY: String push_str, usize::to_string (needs a decimal-rendering model), match on an enum	1, 3
@@ -160,7 +167,9 @@ Only `master-seed-decode` (gaps 3, 5, 7), `master-base32-roundtrip` (3, 5, 7, 8)
 
 ## 2. Test → spec map (TSV)
 
-`primary` is the spec that retires the test. `also` lists the other specs the same test samples.
+`primary` is the spec whose proof retires the test (`NON-SPEC` for the §4 test); `also` lists the other
+specs it samples, and a parenthesis there points to a §5 finding. Paths are relative to
+`crates/atpkg-keys`.
 
 ```tsv
 file	test	primary	also
@@ -168,6 +177,7 @@ src/lib.rs	verify_signed_accepts_a_rostered_signature_and_nothing_else	verify-si
 src/lib.rs	produces_signatures_the_client_verifier_accepts	sign-verify-roundtrip	keygen-pubkey-consistency
 src/lib.rs	pubkey_b64_recovers_the_published_key	keygen-pubkey-consistency	
 src/lib.rs	invalid_key_fails_closed	keygen-pubkey-consistency	
+src/lib.rs	vet_args_accepts_allowed_flags_and_positionals_and_refuses_bad_shapes	cli-vet-args	
 src/fsio.rs	an_atomic_write_replaces_the_file_and_leaves_nothing_behind	fsio-atomic-replace	
 src/fsio.rs	a_failed_atomic_write_leaves_the_original_intact	fsio-atomic-replace	
 src/fsio.rs	a_crash_left_temp_never_wedges_the_next_atomic_write	fsio-atomic-replace	
@@ -187,6 +197,7 @@ src/master.rs	the_fingerprint_matches_on_a_correct_transcription_and_differs_oth
 src/master.rs	the_fingerprint_is_taken_over_the_public_key	master-identity-function	fingerprint-format
 src/master.rs	debug_never_prints_secret_material	secret-debug-redaction	
 src/master.rs	scrub_zeroes_the_buffer	scrub-zeroes	
+src/master.rs	b32_encode_decode_and_format_phrase_line_preserve_invariants	master-base32-roundtrip	master-seed-decode, cli-setup-ceremony
 src/pins_edit.rs	both_declaration_shapes_are_read_and_the_head_is_index_zero	anchor-read-contract	
 src/pins_edit.rs	appending_the_same_key_twice_produces_one_entry	anchor-append-contract	
 src/pins_edit.rs	the_existing_keys_survive_and_the_head_stays_at_index_zero	anchor-append-contract	
@@ -231,6 +242,7 @@ src/provision.rs	write_pins_reports_a_write_that_did_not_land	provision-write-pi
 src/provision.rs	the_report_carries_no_secret_material	render-report-contract	master-secret-noninterference
 src/provision.rs	debug_renderings_carry_no_secret_material	secret-debug-redaction	
 src/provision.rs	no_file_written_by_a_run_contains_the_phrase_or_its_seed	master-secret-noninterference	
+src/provision.rs	home_path_from_rejects_unset_empty_or_root_only_home_and_trims_trailing_slashes	provision-preflight-table	
 src/roster_ops.rs	adding_a_machine_lists_it_and_advances_the_sequence	roster-add-contract	roster-edits-preserve-validity
 src/roster_ops.rs	reusing_a_machine_id_is_refused_rather_than_overwriting_the_key	roster-add-contract	
 src/roster_ops.rs	reusing_a_key_under_a_second_id_is_refused_because_revocation_names_ids	roster-add-contract	roster-edits-preserve-validity
@@ -271,9 +283,18 @@ tests/roster_redo_model.rs	stale_snapshot_and_clean_read_only_decisions_refine_t
 tests/roster_redo_model.rs	the_pre_redo_torn_pair_is_the_model_s_mutant_and_nothing_can_replay_it	roster-redo-refines-model	
 ```
 
-(Paths in the map are relative to `crates/atpkg-keys`.)
+## 3. Proof order
 
-## 3. Coverage
+Dependencies: `master-seed-decode`, `master-base32-roundtrip` (pure core), `scrub-zeroes`,
+`phrase-error-message`, `vet-key-contract`, `fingerprint-format` → `master-parse-contract` →
+`master-identity-function` (assumed crypto) → `keygen-pubkey-consistency`, `sign-verify-roundtrip`,
+`verify-signed-is-roster-chain` → `roster-add-contract`, `roster-revoke-contract` →
+`roster-edits-preserve-validity`, `forever-admits`; `leading-ws-no-panic` → `anchor-read-contract` →
+`verify-members-contract` → `anchor-append-contract` → `shipped-pins-readable`; `fsio-*` (effects) →
+`provision-preflight-table`, `provision-verify-master`, `provision-load-roster-table` →
+`provision-plan-contract` → `provision-write-pins-cas`, `roster-redo-refines-model` →
+`provision-write-rest-order` → the composites (`provision-setup-join-e2e`, `owner-client-roundtrip`) →
+`render-report-contract`, `cli-*` → `master-secret-noninterference`.
 
 - 105 tests read. Every test maps to one of the 44 specs (0 non-spec samples left, §4).
 - The biggest collapses: `anchor-append-contract` (9 primary), `roster-redo-refines-model` (9),
@@ -294,7 +315,7 @@ None left: `provision::a_broken_signature_target_leaves_the_roster_document_unch
 unexpected `.sig` directory without committing a redo marker), and the test-only `publish_roster`
 wrapper has been deleted.
 
-## 5. Implied specs that look wrong, or disagree with the code
+The numbers are the ones the rows cite.
 
 1. **Resolved — `master::the_fingerprint_is_taken_over_the_public_key` negative control.** It now
    fingerprints `&seed.bytes` (`SYNTHETIC`'s actual decoded 32-byte seed) rather than `[0x01; 32]`.
@@ -330,10 +351,12 @@ wrapper has been deleted.
     `atpkg::resolve_verified_index` and `aterm_update_core::roster`. Move these three specs to
     `crates/atpkg/SPECS.md` (and `crates/aterm-update-core/SPECS.md` for the roster parts); atpkg-keys
     supplies only the fixtures.
-13. **The CLI specs are on binary-only code.** `vet_args`, `flag`, `confirm_transcription` and the verb
-    orchestration live in `src/main.rs`. Factor the pure parts (`vet_args`, `flag`, `write_phrase`'s
-    layout) into the library so they can carry Trust clauses; the effect-order specs need the binary
-    verified as a crate.
+13. **Resolved — Pure CLI and Base32 helpers factored into the library.** `vet_args`, `flag`, `positional`,
+    `MAX_ARGS`, `Argv`, and `MASTER_FLAGS` now live in `src/lib.rs` (with duplicate-flag rejection in
+    `vet_args`), `b32_decode`, `b32_encode`, and `format_phrase_line` live in `src/master.rs`, and
+    `home_path_from` in `src/provision.rs` refuses unset, empty, or `/` `HOME` values; the effect-order
+    ceremony specs (`confirm_transcription` and verb orchestration in `src/main.rs`) still need the
+    binary verified as a crate.
 
 ## 6. The specs I would prove first (easiest, high value)
 
@@ -342,14 +365,13 @@ closed locally by seal `150efe4a` (PLAN §"Seal 150efe4a"), but that seal is not
 machine's `trust` channel. The order below starts with the specs whose gaps are smallest and
 whose code is closest to scalar.
 
-1. **`master-seed-decode`**, after factoring the decode loop into a pure
-   `b32_decode(&[u8;52]) -> [u8;32]`. With spec 2 it is one of the two gap-1-free specs over pure code: fixed arrays,
-   shifts, a range `match` on `u8` (already admitted for E6 import by seal `150efe4a`), and one loop with
-   an obvious invariant (`out = ⌊5j/8⌋`). Gaps 3, 5 and 7 are needed. It retires the padding test and
-   underlies every identity claim.
-2. **`master-base32-roundtrip`**, with the RNG draw factored out as an argument
-   (`b32_encode(&[u8;32]) -> [u8;52]`). This removes gap 8 from the pure core, leaving 3, 5 and 7. It proves
-   `B32dec ∘ B32enc = id`, so with spec 1 the whole phrase codec is closed.
+1. **`master-seed-decode`** (`master::b32_decode(&[u8; 52]) -> [u8; 32]`). With spec 2 it is one of the two
+   gap-1-free specs over pure code: fixed arrays, shifts, a range `match` on `u8` (already admitted for E6
+   import by seal `150efe4a`), and one loop with an obvious invariant (`out = ⌊5j/8⌋`). Gaps 3, 5 and 7 are
+   needed. It retires the padding test and underlies every identity claim.
+2. **`master-base32-roundtrip`** (`master::b32_encode(&[u8; 32]) -> [u8; 52]`). With the RNG draw factored out,
+   only gaps 3, 5 and 7 remain on the pure core. It proves `B32dec ∘ B32enc = id`, so with spec 1 the whole
+   phrase codec is closed.
 3. **`vet-key-contract`** and **`phrase-error-message`**. Small `&str` predicates and message builders
    (gaps 1 and 3, plus 5 and 7 for the byte scan). They are the cheapest gap-1 probes in this crate and
    retire a test and two secondary asserts. `master-parse-contract` (6 tests) follows directly once gap 1

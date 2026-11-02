@@ -861,6 +861,7 @@ fn with_log_anchors<'h>(handshake: &'h str, watches: &[Watch]) -> std::borrow::C
         let watch = line
             .strip_prefix("sub ")
             .and_then(|rest| rest.split_whitespace().next())
+            .filter(|local| local.bytes().all(|b| b.is_ascii_digit()))
             .and_then(|local| local.parse::<u64>().ok())
             .and_then(|local| watches.iter().find(|w| w.local_id == local));
         match (watch.map(log_anchor), line.strip_suffix('\n')) {

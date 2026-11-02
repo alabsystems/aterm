@@ -6,6 +6,7 @@
 # colours, the latch shed by the present cost, the colours switched to Default's while it holds,
 # then the restore.
 
+scale 2
 grid 16 80
 style rainbow kitty
 hz 60

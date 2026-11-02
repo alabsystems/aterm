@@ -107,7 +107,7 @@ mod probe {
     pub(super) fn run() {
         let mut tb = Timebase::default();
         // SAFETY: a timebase of our own to fill.
-        if unsafe { mach_timebase_info(&raw mut tb) } != 0 || tb.denom == 0 {
+        if unsafe { mach_timebase_info(&raw mut tb) } != 0 || tb.numer == 0 || tb.denom == 0 {
             tb = Timebase { numer: 1, denom: 1 };
         }
         let began = Instant::now();

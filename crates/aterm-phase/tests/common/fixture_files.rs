@@ -29,11 +29,12 @@ fn dir_screens(crate_dir: &Path, dir: &Path, into: &mut Vec<(String, Vec<String>
     assert!(!paths.is_empty(), "{}: no fixtures", dir.display());
     for p in paths {
         let text = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+        // The sweeps name a fixture with `/` on every host.
         let name = p
             .strip_prefix(crate_dir)
             .unwrap_or(&p)
-            .display()
-            .to_string();
+            .to_string_lossy()
+            .replace('\\', "/");
         into.push((name, file_rows(&text)));
     }
 }

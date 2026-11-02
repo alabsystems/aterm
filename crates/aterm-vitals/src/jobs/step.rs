@@ -58,7 +58,7 @@ pub enum Effective {
     /// Progress within the running window.
     #[default]
     Running,
-    /// A legitimate class, in effect (held 2 ticks after a suspect run).
+    /// A legitimate class, in effect (normally held 2 ticks after a suspect run).
     Legit,
     /// A stuck-capable suspect.
     Capable,
@@ -100,7 +100,8 @@ pub enum Fault {
     UnnamedReachesStuck,
     /// A named stuck-capable wait is never raised to stuck.
     NeverRaiseNamed,
-    /// A process macOS's program check holds is not named: its wait reads unnamed.
+    /// A process that has not started for a named reason (macOS's program check holds it, Rosetta
+    /// translates it) is not named: its wait reads unnamed.
     IgnoreProgramCheck,
 }
 
@@ -323,6 +324,12 @@ fn fault(cx: &Cx, f: Fault) -> bool {
     cx.fault == Some(f)
 }
 
+/// Whether `name` keeps a program from its first instruction: macOS's program check holds it, or
+/// Rosetta translates it.
+const fn starts(name: WaitName) -> bool {
+    matches!(name, WaitName::ProgramCheck | WaitName::Translating)
+}
+
 /// One tick of one job.
 pub fn classify_tick(t: &mut Track, ev: &Evidence, cx: &Cx) -> Out {
     let at = ev.at_ms;
@@ -371,7 +378,18 @@ pub fn classify_tick(t: &mut Track, ev: &Evidence, cx: &Cx) -> Out {
         t.suspect_since_ms = at;
     }
 
-    if !ev.refused && ev.dt_ms > 0 {
+    // A build's front wakes to look at the ledger (its nap slices) while its claim waits: that
+    // waking is its wait for memory, not polling with no progress, and none of it carries into the
+    // build it execs. A program that has not started (held at macOS's program check, translated
+    // by Rosetta) runs nothing at all: what the job did before it is none of its wait's, and
+    // carries into neither that wait nor what the program does once it starts.
+    let memory_wait = ev.wait.name == WaitName::Memory;
+    let in_line = memory_wait || starts(ev.wait.name);
+    if in_line {
+        t.busy = Band::default();
+        t.polling = Band::default();
+        t.thrash = Band::default();
+    } else if !ev.refused && ev.dt_ms > 0 {
         if let Some(cpu) = ev.cpu_ns {
             let wall_ns = u128::from(ev.dt_ms) * 1_000_000;
             let fair = wall_ns * 1000 / u128::from(cx.stretch_milli.max(1000));
@@ -410,6 +428,10 @@ pub fn classify_tick(t: &mut Track, ev: &Evidence, cx: &Cx) -> Out {
         Class::Stopped
     } else if holds_fg && ev.gate.word == GateWord::Pending {
         Class::UnreadInput
+    } else if in_line {
+        // The front names its memory wait, or the leaf its start's, now; earlier rate bands
+        // cannot hide that state.
+        Class::Waiting
     } else if t.thrash.on {
         Class::Thrashing
     } else if t.busy.on {
@@ -426,14 +448,18 @@ pub fn classify_tick(t: &mut Track, ev: &Evidence, cx: &Cx) -> Out {
     };
     out.class = class;
 
-    // A held reading is no flicker: the host reads one only 20 s past a fork, and a normal start
-    // reads held for under 0.3 ms (leftover M2). So the wait shows and counts at the reading
-    // that names it, with neither debounce below.
-    let held = class == Class::Waiting && ev.wait.name == WaitName::ProgramCheck;
+    // A start wait is no flicker: the host reads one (held at macOS's program check, translated
+    // by Rosetta) only 20 s past a fork, and a normal start reads held for under 0.3 ms (leftover
+    // M2). Nor is a build's front's wait for memory, read off its arguments, which only its exec
+    // ends. Each shows and counts at the reading that names it, and the wait after it shows at
+    // the reading that ends it, with neither debounce below.
+    let held = class == Class::Waiting && starts(ev.wait.name);
+    let memory = class == Class::Waiting && memory_wait;
+    let at_once = |n: WaitName| starts(n) || n == WaitName::Memory;
     if class == Class::Waiting {
         let cand = ev.wait.clone();
         match &t.shown {
-            Some(s) if s.name != cand.name && !held => {
+            Some(s) if s.name != cand.name && !at_once(s.name) && !at_once(cand.name) => {
                 if t.cand == Some(cand.name) {
                     t.cand_streak += 1;
                 } else {
@@ -527,7 +553,7 @@ pub fn classify_tick(t: &mut Track, ev: &Evidence, cx: &Cx) -> Out {
     let was_suspect = matches!(t.effective, Some(Effective::Capable | Effective::Capped));
     let eff = if raw == Effective::Legit {
         t.legit_streak += 1;
-        if was_suspect && t.legit_streak < 2 && !held {
+        if was_suspect && t.legit_streak < 2 && !held && !memory {
             if t.capable {
                 Effective::Capable
             } else {

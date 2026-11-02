@@ -68,6 +68,9 @@ mod needs_store_tests;
 #[path = "harness_hold_store_tests.rs"]
 mod hold_store_tests;
 
+#[path = "harness_receipt_store_tests.rs"]
+mod receipt_store_tests;
+
 #[path = "harness_needs_whole_tests.rs"]
 mod needs_whole_tests;
 
@@ -76,6 +79,9 @@ mod commit_stop_tests;
 
 #[path = "harness_host_passive_snapshot_tests.rs"]
 mod passive_snapshot_tests;
+
+#[path = "harness_host_off_thread_tests.rs"]
+mod off_thread_tests;
 
 #[test]
 fn phase_follow_reads_only_the_changed_workers_record() {
@@ -412,6 +418,8 @@ fn hooks(world: &Arc<World>, body: Arc<BodyFn>) -> Hooks {
         fact: Arc::new(|_, _| {}),
         needs: Arc::new(|_, _, _| false),
         hold: Arc::new(|_, _| false),
+        said: Arc::new(|_, _| false),
+        receipt: Arc::new(|_, _| false),
         claim_epoch: Arc::new(move || w4.released.load(Ordering::SeqCst)),
         acts: Acts::inert(),
         backoff: Arc::new(quick_backoff),
@@ -557,6 +565,7 @@ fn idle_host(sid: &str, agent: Program, switches: Arc<Switches>, hooks: Hooks) -
         settle_later: AtomicBool::default(),
         told: AtomicU8::new(0),
         repo_probe: Default::default(),
+        group: Arc::default(),
     }
 }
 
@@ -4459,6 +4468,65 @@ fn a_host_thread_that_panicked_is_started_again_in_place() {
     });
 }
 
+/// The host thread's two restart lines name a panic by its kind and length: a panic's message
+/// can quote what the host held, a session's screen (DESIGN §3.6). The lines are written on the
+/// host thread, so they are read from the process-wide capture by their sentinels' absence and
+/// their own lengths.
+#[test]
+fn a_host_and_its_restarts_panics_reach_the_log_as_their_kind_and_length() {
+    const RAN: &str = "QZP7E7R1 the host run quotes a screen row";
+    const RESTARTED: &str = "QZP7E7R2 its restart quotes a box";
+    crate::test_log::install();
+    let world = Arc::new(World::default());
+    world.set(&[("s-e7r", Program::Claude)]);
+    let mut h = hooks(&world, parking_body(&world));
+    let (w, reads) = (Arc::clone(&world), Arc::new(AtomicUsize::new(0)));
+    let r = Arc::clone(&reads);
+    h.roster = Arc::new(move || {
+        if r.fetch_add(1, Ordering::SeqCst) == 0 {
+            std::panic::panic_any(RAN.to_string());
+        }
+        w.roster
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(sid, program)| (sid.clone(), *program, FollowStamp::default()))
+            .collect()
+    });
+    let backoffs = Arc::new(AtomicUsize::new(0));
+    let b = Arc::clone(&backoffs);
+    h.backoff = Arc::new(move |attempt| {
+        if b.fetch_add(1, Ordering::SeqCst) == 0 {
+            std::panic::panic_any(RESTARTED.to_string());
+        }
+        quick_backoff(attempt)
+    });
+    let host = HostHandle::start(on(), false, false, h);
+    until("supervised again past both panics", || {
+        world.runs.load(Ordering::SeqCst) == 1
+    });
+    host.shutdown_and_join();
+    for (head, len) in [
+        ("harness host stopped after an internal panic (", RAN.len()),
+        (
+            "harness host's restart stopped after an internal panic (",
+            RESTARTED.len(),
+        ),
+    ] {
+        let kind = format!("other panic ({len}B)");
+        assert!(
+            crate::test_log::containing(head)
+                .iter()
+                .any(|record| record.message.starts_with(head) && record.message.contains(&kind)),
+            "{head:?} names the panic as {kind:?}"
+        );
+    }
+    assert!(
+        crate::test_log::containing("QZP7E7R").is_empty(),
+        "the log keeps the panics' text"
+    );
+}
+
 #[test]
 fn one_tabs_part_of_a_host_pass_that_panics_is_that_tabs_alone() {
     for panics in [true, false] {
@@ -6883,19 +6951,20 @@ impl Acting {
         Hooks {
             roster: Arc::new(move || {
                 w1.passes.fetch_add(1, Ordering::SeqCst);
-                let stamp = FollowStamp {
-                    group: w1.group.load(Ordering::SeqCst),
-                    rev: w1.rev.load(Ordering::SeqCst),
-                    screen: w1.screen.load(Ordering::SeqCst),
-                    ..FollowStamp::default()
+                let named: Vec<_> = {
+                    // A replacement published by set must not inherit a stamp read before it.
+                    let roster = w1.roster.lock().unwrap();
+                    let stamp = FollowStamp {
+                        group: w1.group.load(Ordering::SeqCst),
+                        rev: w1.rev.load(Ordering::SeqCst),
+                        screen: w1.screen.load(Ordering::SeqCst),
+                        ..FollowStamp::default()
+                    };
+                    roster
+                        .iter()
+                        .map(|(sid, program)| (sid.clone(), *program, stamp))
+                        .collect()
                 };
-                let named: Vec<_> = w1
-                    .roster
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .map(|(sid, program)| (sid.clone(), *program, stamp))
-                    .collect();
                 if named.is_empty() && w1.hold_empty_read.swap(false, Ordering::SeqCst) {
                     w1.empty_read_held.store(true, Ordering::SeqCst);
                     until("the step over, its idle point answered", || {
@@ -7017,9 +7086,12 @@ impl Acting {
             fact: Arc::new(|_, _| {}),
             needs: Arc::new(|_, _, _| false),
             hold: Arc::new(|_, _| false),
+            said: Arc::new(|_, _| false),
+            receipt: Arc::new(|_, _| false),
             claim_epoch: Arc::new(|| 0),
             acts: Acts {
                 tap_born: Arc::new(|_| None),
+                account_screen_wall: Arc::new(|_, _| None),
                 open: Arc::new(move |sid| {
                     a1.open_asked.fetch_add(1, Ordering::SeqCst);
                     a1.open.lock().unwrap().contains(sid)
@@ -7029,6 +7101,7 @@ impl Acting {
                     *a16.holds.lock().unwrap()
                 }),
                 launch: Arc::new(|_| None),
+                due_read: INERT_POINT_READ,
                 due: Arc::new(move |_| {
                     a2.due_says.lock().unwrap().pop_front().unwrap_or(
                         if a2.due.load(Ordering::SeqCst) {
@@ -7061,6 +7134,7 @@ impl Acting {
                 disk_board: Acts::inert().disk_board,
                 jobs_board: Acts::inert().jobs_board,
                 leader_lives: Acts::inert().leader_lives,
+                held_now: Acts::inert().held_now,
                 program_check: Acts::inert().program_check,
                 occupancy: Acts::inert().occupancy,
                 occupancy_pace: Acts::inert().occupancy_pace,
@@ -7070,6 +7144,7 @@ impl Acting {
                 wake_claim: Acts::inert().wake_claim,
                 wake_release: Acts::inert().wake_release,
                 wakes_left: Acts::inert().wakes_left,
+                carry_owed: Acts::inert().carry_owed,
                 resume: Arc::new(move |_, _, carry: CarryPoint| {
                     a9.landing.lock().unwrap().push(carry.land);
                     a9.onlys.lock().unwrap().push(carry.only);
@@ -7079,11 +7154,7 @@ impl Acting {
                     if step.starts_with("done")
                         && !matches!(
                             step,
-                            "done:resumed"
-                                | "done:finished"
-                                | "done:taskless"
-                                | "done:no-continue"
-                                | "done:landing"
+                            "done:resumed" | "done:finished" | "done:taskless" | "done:no-continue"
                         )
                     {
                         a9.owed.store(false, Ordering::SeqCst);
@@ -7404,6 +7475,8 @@ impl Acting {
                 limit_reset: Arc::new(|_| None),
                 transcript_tail: Arc::new(|_| None),
                 repo_work: Arc::new(|_| Default::default()),
+                work_read: Acts::inert().work_read,
+                work_put: Acts::inert().work_put,
                 transcript: Arc::new(|_| None),
                 task_exited: Arc::new(move |sid| {
                     a27.tasks_exited.lock().unwrap().push(sid.to_string());
@@ -7424,6 +7497,12 @@ impl Acting {
                 codex_cold: Arc::new(|_| None),
                 hold: Arc::new(|_, _| true),
                 route: Arc::new(|_, _, _| Route::Custom("inert".to_string())),
+                claude_env: Arc::new(|_, _, _| {
+                    Err(aterm_agent::harness::netwatch::Unnamed::Conflict(
+                        "inert".to_string(),
+                    ))
+                }),
+                agy_backend: Acts::inert().agy_backend,
                 net_path: Arc::new(crate::harness_netprobe::InertPath),
                 memory: Arc::new(|_, _| None),
                 watch: Arc::new(move |sid, _, how| {
@@ -7749,6 +7828,164 @@ fn a_settled_carry_on_leaves_a_move_due_beside_it_a_look() {
     }
 }
 
+/// A QUESTION RESTS ONLY FOR AN OWED CARRY-ON ([`IdlePoint::carry_only`]): the carry-on steps there
+/// and an upgrade due beside it does not; none owed, nothing of the host's steps there. Under Off
+/// nothing steps, its record kept. Cruise's stop for repeated replies reaches the act.
+#[test]
+fn a_point_resting_only_for_the_carry_on_steps_nothing_else() {
+    let world = Arc::new(World::default());
+    let owed = Arc::new(AtomicBool::new(true));
+    let held: Arc<Mutex<Vec<bool>>> = Arc::default();
+    let upgraded = Arc::new(AtomicUsize::new(0));
+    let off = Arc::new(AtomicBool::new(false));
+    let mut hooks = hooks(&world, parking_body(&world));
+    let (o, h, u) = (Arc::clone(&owed), Arc::clone(&held), Arc::clone(&upgraded));
+    hooks.acts = Acts {
+        due: Arc::new(|_| Due::Yes),
+        owed: Arc::new(move |_, _| o.load(Ordering::SeqCst)),
+        resume: Arc::new(move |_, _, carry: CarryPoint| {
+            h.lock().unwrap().push(carry.replies_held);
+            "continued".to_string()
+        }),
+        step: Arc::new(move |_, _, _| {
+            u.fetch_add(1, Ordering::SeqCst);
+            "wait:held".to_string()
+        }),
+        ..Acts::inert()
+    };
+    let word = Arc::clone(&off);
+    hooks.autopilot = Arc::new(move || {
+        let mode = if word.load(Ordering::SeqCst) {
+            Autopilot::Off
+        } else {
+            Autopilot::Cruise
+        };
+        HashMap::from([("s-question".to_string(), mode)])
+    });
+    let switches = Arc::new(Switches::default());
+    switches.set(&on(), false);
+    let idle = WorkerIdle {
+        stop: Arc::default(),
+        tap: Mutex::default(),
+        login_latches: Arc::default(),
+        lifted_off: false,
+        beside: Arc::default(),
+        sid: "s-question".to_string(),
+        agent: Program::Claude,
+        grace: 0,
+        park: Arc::default(),
+        look_at: Arc::default(),
+        acting: Arc::default(),
+        stepped: Arc::default(),
+        switches,
+        kept: Arc::default(),
+        hooks,
+        run: Mutex::default(),
+        owns: AtomicBool::new(false),
+        background_at: Mutex::default(),
+        tasked: Mutex::default(),
+        finished: Mutex::default(),
+        note: Arc::default(),
+        clock_hold: Mutex::default(),
+        net: NetProbe::new(),
+        route: Mutex::default(),
+        memory: Mutex::default(),
+        points: Arc::default(),
+        settle_later: AtomicBool::default(),
+        activations: Arc::default(),
+        told: AtomicU8::new(0),
+        repo_probe: Default::default(),
+        group: Arc::default(),
+    };
+    let question = IdlePoint {
+        carry_only: true,
+        ..IdlePoint::default()
+    };
+    let step = idle.at_idle_on(question).expect("the carry-on's step");
+    assert_eq!(step.line, "carry-on step=continued");
+    idle.at_idle_on(IdlePoint {
+        replies_held: true,
+        ..question
+    })
+    .expect("the carry-on's step");
+    assert_eq!(*held.lock().unwrap(), [false, true]);
+    off.store(true, Ordering::SeqCst);
+    assert_eq!(idle.at_idle_on(question), None, "nothing under Off");
+    assert_eq!(held.lock().unwrap().len(), 2, "its act not taken under Off");
+    off.store(false, Ordering::SeqCst);
+    owed.store(false, Ordering::SeqCst);
+    assert_eq!(idle.at_idle_on(question), None, "none owed");
+    assert_eq!(
+        upgraded.load(Ordering::SeqCst),
+        0,
+        "no upgrade at a question"
+    );
+}
+
+/// THE LOOP'S OWN ACT WAITS ON A CARRY-ON OWED, FOR A BOUNDED TIME A PERSON'S HOLD RENEWS: owed, the
+/// worker owns the turn ends from its first sight of it and refuses a fact line as the carry-on's;
+/// its hold run out it owns nothing, so Cruise and Land never park on a carry-on nothing takes; a
+/// look that found a person's hold (`wait:draft`) runs the wait on, one that found work
+/// (`wait:unsettled`) does not; the look after the carry-on (`owed` still, `carry_owed` not) holds
+/// nothing. MUTANT: `owns_turn_end` without `carry_holds` fails the first assertion; the hold kept
+/// with no bound fails the second.
+#[test]
+fn a_carry_on_owed_holds_the_loops_act_for_a_bounded_wait_a_persons_hold_renews() {
+    use aterm_agent::supervise::occupancy::PaceRefusal;
+    let run = |agent: Program| {
+        let world = Arc::new(World::default());
+        let owed = Arc::new(AtomicBool::new(true));
+        let word: Arc<Mutex<&'static str>> = Arc::new(Mutex::new("wait:draft"));
+        let mut hooks = hooks(&world, parking_body(&world));
+        let (o, w) = (Arc::clone(&owed), Arc::clone(&word));
+        hooks.acts = Acts {
+            due: Arc::new(|_| Due::No),
+            owed: Arc::new(|_, _| true),
+            carry_owed: Arc::new(move |_, _| o.load(Ordering::SeqCst)),
+            resume: Arc::new(move |_, _, _| (*w.lock().unwrap()).to_string()),
+            ..Acts::inert()
+        };
+        let switches = Arc::new(Switches::default());
+        switches.set(&on(), false);
+        (idle_host("s-hold", agent, switches, hooks), owed, word)
+    };
+    for agent in [Program::Claude, Program::Muse, Program::Agy] {
+        let (idle, owed, word) = run(agent);
+        let run_out = || with_kept_of(&idle.kept, |k| k.carry_hold = Some(Instant::now()));
+        assert!(idle.owns_turn_end(), "{agent:?}: held from the first sight");
+        assert_eq!(idle.pace_refusal(), Some(PaceRefusal::CarryOwed));
+        run_out();
+        assert!(!idle.owns_turn_end(), "{agent:?}: its bound");
+        assert_eq!(idle.pace_refusal(), None);
+        let step = idle
+            .at_idle_on(IdlePoint::default())
+            .expect("the carry-on's step");
+        assert_eq!(step.line, "carry-on step=wait:draft");
+        assert!(
+            idle.owns_turn_end(),
+            "{agent:?}: a person's hold runs it on"
+        );
+        run_out();
+        *word.lock().unwrap() = "wait:unsettled";
+        idle.at_idle_on(IdlePoint::default())
+            .expect("the carry-on's step");
+        assert!(!idle.owns_turn_end(), "{agent:?}: work going on does not");
+        owed.store(false, Ordering::SeqCst);
+        assert!(!idle.owns_turn_end(), "{agent:?}: none owed");
+        assert_eq!(with_kept_of(&idle.kept, |k| k.carry_hold), None);
+        owed.store(true, Ordering::SeqCst);
+        assert!(
+            idle.owns_turn_end(),
+            "{agent:?}: a later relaunch's own wait"
+        );
+    }
+    let (beside, ..) = run(Program::Codex);
+    assert!(
+        !beside.owns_turn_end(),
+        "a lane that carries itself owes this loop no wait"
+    );
+}
+
 #[test]
 fn a_task_done_under_land_is_carried_on_with_nothing_typed() {
     let told: Arc<Mutex<Vec<bool>>> = Arc::default();
@@ -7801,6 +8038,7 @@ fn a_task_done_under_land_is_carried_on_with_nothing_typed() {
         activations: Arc::default(),
         told: AtomicU8::new(0),
         repo_probe: Default::default(),
+        group: Arc::default(),
     };
     let done = idle
         .at_idle_on(IdlePoint {
@@ -7872,6 +8110,7 @@ fn a_relaunchs_owed_carry_on_is_settled_where_its_loop_takes_a_point() {
         settle_later: AtomicBool::default(),
         told: AtomicU8::new(0),
         repo_probe: Default::default(),
+        group: Arc::default(),
         activations: Arc::default(),
     };
     let told = || {
@@ -7989,30 +8228,128 @@ fn a_note_behind_that_panics_on_the_host_ends_its_ask_and_no_pass() {
     a.open.lock().unwrap().insert("s-na".to_string());
     a.set(&[("s-na", Program::Claude)]);
     let mut hooks = a.hooks();
-    let calls = Arc::new(AtomicUsize::new(0));
+    let calls: Arc<Mutex<Vec<String>>> = Arc::default();
     let c = Arc::clone(&calls);
-    hooks.acts.behind = Arc::new(move |_, _| {
-        c.fetch_add(1, Ordering::SeqCst);
-        panic!("the note's ask fails (a test's)");
+    hooks.acts.behind = Arc::new(move |sid, _| {
+        c.lock().unwrap().push(sid.to_string());
+        assert!(sid != "s-na", "the note's ask fails (a test's)");
+        Behind::Noted
     });
+    let of = |sid: &str| calls.lock().unwrap().iter().filter(|s| *s == sid).count();
     let host = HostHandle::start(on(), false, false, hooks);
     a.attached(&host, "s-na");
     host.note_activation();
-    until("the host's ask, which panicked", || {
-        calls.load(Ordering::SeqCst) >= 1
-    });
+    until("the host's ask, which panicked", || of("s-na") >= 1);
     a.open.lock().unwrap().insert("s-nb".to_string());
     a.set(&[("s-na", Program::Claude), ("s-nb", Program::Claude)]);
-    until("the next tab's worker", || {
-        host.live().contains(&"s-nb".to_string())
+    until("the next tab's worker read its agent", || {
+        host.live().contains(&"s-nb".to_string()) && a.read_in("s-nb")
     });
     a.passes();
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        1,
-        "asked once on the host: the note ended"
-    );
+    assert_eq!(of("s-na"), 1, "asked once on the host: the note ended");
     host.shutdown_and_join();
+}
+
+#[test]
+fn a_failed_note_is_forgotten_before_unwind_wakes_its_next_ask() {
+    struct Unwinding {
+        entered: std::sync::mpsc::SyncSender<bool>,
+        resume: std::sync::mpsc::Receiver<()>,
+    }
+    impl Drop for Unwinding {
+        fn drop(&mut self) {
+            let _ = self.entered.send(std::thread::panicking());
+            // A failed assertion is reported only after this unwind can finish.
+            let _ = self.resume.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+        }
+    }
+
+    let note: Note = Arc::default();
+    owe_note(&note, 11);
+    assert_eq!(take_note(&note, true), Some(11));
+    let world = Arc::new(World::default());
+    let mut h = hooks(&world, parking_body(&world));
+    h.acts.behind = Arc::new(|_, _| panic!("the note's ask fails (a test's)"));
+    let (entered, boundary) = std::sync::mpsc::sync_channel(1);
+    let (resume, paused) = std::sync::mpsc::sync_channel(1);
+    let reading_note = Arc::clone(&note);
+    let reading = std::thread::spawn(move || {
+        catch_note_ask("s-failed-note", || {
+            let _boundary = Unwinding {
+                entered,
+                resume: paused,
+            };
+            asked_note("s-failed-note", &reading_note, 11, &h)
+        })
+    });
+    let unwinding = boundary.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+    let forgotten = note.lock().unwrap().is_none();
+    let retaken = take_note(&note, false);
+    owe_note(&note, 22);
+    let resumed = resume.send(());
+    let result = reading.join();
+    assert_eq!(unwinding.ok(), Some(true));
+    assert!(resumed.is_ok());
+    assert_eq!(result.unwrap(), None);
+    assert!(forgotten, "failed work is gone before the outer catch");
+    assert_eq!(retaken, None, "the host cannot re-ask the failed note");
+    assert_eq!(
+        take_note(&note, false),
+        Some(22),
+        "new work survives the catch"
+    );
+    let mut h = hooks(&world, parking_body(&world));
+    h.acts.behind = Arc::new(|_, _| Behind::Noted);
+    assert_eq!(
+        asked_caught("s-failed-note", &note, 22, &h),
+        Some(Behind::Noted)
+    );
+    assert!(note.lock().unwrap().is_none());
+}
+
+#[test]
+fn a_note_reowed_during_its_failed_ask_is_still_owed() {
+    let note: Note = Arc::default();
+    owe_note(&note, 11);
+    assert_eq!(take_note(&note, true), Some(11));
+    let world = Arc::new(World::default());
+    let mut h = hooks(&world, parking_body(&world));
+    let reowed = Arc::clone(&note);
+    h.acts.behind = Arc::new(move |_, _| {
+        owe_note(&reowed, 22);
+        panic!("the note's ask fails (a test's)");
+    });
+    assert_eq!(asked_caught("s-reowed-note", &note, 11, &h), None);
+    assert_eq!(
+        take_note(&note, false),
+        Some(11),
+        "the earlier owed second stands"
+    );
+    h.acts.behind = Arc::new(|_, _| Behind::Noted);
+    assert_eq!(
+        asked_caught("s-reowed-note", &note, 11, &h),
+        Some(Behind::Noted)
+    );
+    assert!(note.lock().unwrap().is_none());
+}
+
+#[test]
+fn a_note_pause_that_panics_forgets_the_uncommitted_ask() {
+    for said in [Behind::Busy, Behind::Unread(upgrade_drive::UNREAD_RECORD)] {
+        let note: Note = Arc::default();
+        owe_note(&note, 11);
+        assert_eq!(take_note(&note, true), Some(11));
+        let world = Arc::new(World::default());
+        let mut h = hooks(&world, parking_body(&world));
+        h.acts.behind = Arc::new(move |_, _| said);
+        h.pause = Arc::new(|_| panic!("the pause fails (a test's)"));
+        assert_eq!(asked_caught("s-pause-note", &note, 11, &h), None);
+        assert!(
+            note.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_none()
+        );
+    }
 }
 
 #[test]
@@ -8156,6 +8493,7 @@ fn the_workers_own_readers_follow_the_agents_record_first() {
             lifted_off: false,
             told: AtomicU8::new(0),
             repo_probe: Default::default(),
+            group: Arc::default(),
             beside: Arc::default(),
             sid: sid.to_string(),
             agent: Program::Claude,
@@ -8235,6 +8573,7 @@ fn the_limits_named_reset_is_read_from_the_kept_conversation() {
                 .push(snap.session.clone().unwrap_or_default());
             Some(1_790_000_000)
         }),
+        due: Arc::new(|_| Due::Yes),
         ..Acts::inert()
     };
     let host = |agent: Program| idle_host("s-reset", agent, switched(&on()), hooks.clone());
@@ -8254,6 +8593,25 @@ fn the_limits_named_reset_is_read_from_the_kept_conversation() {
     kept(&codex);
     assert_eq!(codex.limit_until(), None, "a Codex names none");
     assert_eq!(asked.lock().unwrap().len(), 1, "and is not asked");
+    // An agy quota wall arms the relaunch park where an upgrade is due ([`Acts::due`]); with none
+    // due it arms none.
+    let agy_under = |hooks: Hooks| {
+        let agy = idle_host("s-reset", Program::Agy, switched(&on()), hooks);
+        agy.kept.lock().unwrap().snapshot = Some(Snapshot {
+            session: None,
+            ..snap("s-reset")
+        });
+        assert_eq!(agy.limit_until(), Some(1_790_000_000));
+        agy.wants()
+    };
+    let mut not_due = hooks.clone();
+    not_due.acts.due = Arc::new(|_| Due::No);
+    assert!(!agy_under(not_due), "no upgrade due arms no relaunch park");
+    assert!(
+        agy_under(hooks.clone()),
+        "an agy quota wall with a rotation due arms the relaunch park"
+    );
+    assert_eq!(*asked.lock().unwrap(), ["c0ffee", "", ""]);
 
     let reads = std::cell::Cell::new(0);
     let read = |reset: Option<u64>| {
@@ -8356,7 +8714,7 @@ fn a_landed_agent_missed_is_read_again_a_production_pause_later() {
         }),
         ..Acts::inert()
     };
-    let kept = Mutex::new(Kept::default());
+    let kept = Arc::new(Mutex::new(Kept::default()));
     assert!(
         read_landed(SID, &kept, &hooks, 1, &|| true),
         "read at its second look"
@@ -8604,8 +8962,14 @@ fn the_recorder_is_handed_this_process_wall_for_the_account_its_environment_name
         dir: dir.map(str::to_string),
         ..accounts::Row::default()
     };
+    // Logins as this host reads them absolute: a roster refuses a relative one.
+    let (work_dir, elsewhere, probe) = (
+        crate::test_host::abs("/logins/work-2"),
+        crate::test_host::abs("/logins/elsewhere"),
+        crate::test_host::abs("/identities/probe/.claude"),
+    );
     let roster = accounts::Roster {
-        rows: vec![row("main", None), row("work-2", Some("/logins/work-2"))],
+        rows: vec![row("main", None), row("work-2", Some(work_dir.as_str()))],
     };
     let wall = StandingWall {
         at: u64::try_from(NOW - 10).unwrap(),
@@ -8626,6 +8990,7 @@ fn the_recorder_is_handed_this_process_wall_for_the_account_its_environment_name
             env,
             settled,
             wall: wall.cloned(),
+            screen_wall: None,
             started: age.map(|age| NOW - age),
         }
     }
@@ -8637,13 +9002,13 @@ fn the_recorder_is_handed_this_process_wall_for_the_account_its_environment_name
     let untouched =
         |store: &accounts::Store| !store.dir.exists() && !tmp.path().join("state").exists();
     let work = env(&[
-        (accounts::LOGIN_ENV, "/logins/work-2"),
+        (accounts::LOGIN_ENV, work_dir.as_str()),
         ("PATH", "/usr/bin"),
     ]);
     let main = env(&[("PATH", "/usr/bin")]);
     let keyed = env(&[(accounts::CREDENTIAL_KEYS[0], "k")]);
-    let moved = env(&[(accounts::HOME_ENV, "/identities/probe/.claude")]);
-    let other = env(&[(accounts::LOGIN_ENV, "/logins/elsewhere")]);
+    let moved = env(&[(accounts::HOME_ENV, probe.as_str())]);
+    let other = env(&[(accounts::LOGIN_ENV, elsewhere.as_str())]);
 
     let said = |sid: &str, r: &WallRead<'_>| account_wall_of(&store, &roster, sid, r, NOW);
     assert_eq!(
@@ -9001,6 +9366,7 @@ fn the_live_recorder_reads_a_stand_ins_environment_and_its_transcripts_wall() {
     let said = |roster: Option<&Path>, pid: u32| {
         let snap = capture(pid);
         let agent = WalledAgent {
+            screen_wall: None,
             snap: &snap,
             session: TALK,
             own: false,
@@ -9071,6 +9437,7 @@ fn the_live_recorder_reads_a_stand_ins_environment_and_its_transcripts_wall() {
     let mut stale = capture(work.id());
     stale.login = None;
     let agent = WalledAgent {
+        screen_wall: None,
         snap: &stale,
         session: TALK,
         own: false,
@@ -9106,6 +9473,9 @@ const ACCT_TALK_B: &str = "0badf00d-1111-2222-3333-444455557777";
 
 #[path = "harness_account_read_tests.rs"]
 mod account_read_tests;
+
+#[path = "harness_account_screen_wall_tests.rs"]
+mod account_screen_wall;
 
 #[path = "harness_account_process_tests.rs"]
 mod account_process;
@@ -9543,6 +9913,7 @@ impl Accts {
                 let read = WallRead {
                     env: env.as_deref().unwrap_or(&[]),
                     settled: settled(),
+                    screen_wall: agent.screen_wall,
                     wall: upgrade_drive::named_standing_wall(
                         &a.tmp.path().join("home"),
                         agent.snap,
@@ -9700,7 +10071,7 @@ fn move_to(label: &str, at: AccountAt) -> Restart {
 
 fn moves(advice: &Option<AccountAdvice>) -> Option<&str> {
     match decided(advice) {
-        Some(AccountAdvice::Move { to }) => Some(to.as_str()),
+        Some(AccountAdvice::Move { to, .. }) => Some(to.as_str()),
         _ => None,
     }
 }
@@ -9717,6 +10088,75 @@ fn at_wall_only() -> SupervisorConfig {
     let mut cfg = on();
     cfg.set("accounts", "wall").unwrap();
     cfg
+}
+
+/// ACCOUNT ADVICE THAT CANNOT BE JUDGED SAYS WHY, ONCE: each read advice needs that fails (no
+/// account seat, the process's login unread, the process changed while its login was read, the
+/// accounts state unread) gives no advice, keeps the word that says why
+/// ([`AccountKept::unjudged`]) and logs it once per change of word, not once per call; the same
+/// worker over a readable state is judged and the word clears. NEGATIVE CONTROL: before, each
+/// of these exits returned `None` with no word, so a wall waited out said nothing of the
+/// skipped rotation.
+#[test]
+fn account_advice_that_cannot_be_judged_keeps_and_logs_why() {
+    let a = Accts::new();
+    let unjudged = |idle: &WorkerIdle| idle.kept.lock().unwrap().account.unjudged;
+    // Two looks at a wall: no advice either time, the word kept, one log line between them.
+    let judge_twice = |idle: &WorkerIdle, why: &'static str| {
+        let said = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let into = std::rc::Rc::clone(&said);
+        let mark = format!("harness @{}: account advice: none: {why}", idle.sid);
+        crate::test_log::observe(
+            move |record| {
+                let message = format!("{}", record.args());
+                if message.starts_with(&mark) {
+                    into.borrow_mut().push(message);
+                }
+            },
+            || {
+                for _ in 0..2 {
+                    assert_eq!(idle.account(usage_wall()), None, "{why}");
+                }
+            },
+        );
+        assert_eq!(unjudged(idle), Some(why));
+        assert_eq!(
+            said.borrow().len(),
+            1,
+            "{why}: logged once: {:?}",
+            said.borrow()
+        );
+    };
+
+    let mut seatless = a.worker("s-acct-seatless", &on());
+    seatless.hooks.acts.account_seat = Arc::new(|| None);
+    judge_twice(&seatless, "no account seat (no harness state directory)");
+
+    let unseen = a.worker("s-acct-unseen", &on());
+    judge_twice(&unseen, "its process's login could not be read");
+
+    // The process's tab lands a new account generation while its login is read.
+    a.spawn("s-acct-changing", ACCT_TALK_A, "main");
+    a.wall(ACCT_TALK_A, ACCT_NOW - 10);
+    let mut changing = a.worker("s-acct-changing", &on());
+    let kept = Arc::clone(&changing.kept);
+    let env = Arc::clone(&changing.hooks.acts.account_env);
+    changing.hooks.acts.account_env = Arc::new(move |snap| {
+        if let Ok(mut k) = kept.try_lock() {
+            k.account.landing = Arc::new(Mutex::new(()));
+        }
+        env(snap)
+    });
+    judge_twice(&changing, "its process changed while its login was read");
+
+    a.spawn("s-acct-unread", ACCT_TALK_A, "main");
+    a.store().ensure().unwrap();
+    std::fs::write(a.store().state_file(), "{").unwrap();
+    let idle = a.worker("s-acct-unread", &on());
+    judge_twice(&idle, "the accounts state could not be read");
+    std::fs::remove_file(a.store().state_file()).unwrap();
+    let _ = idle.account(usage_wall());
+    assert_eq!(unjudged(&idle), None, "CONTROL: judged, the word clears");
 }
 
 #[test]
@@ -9877,11 +10317,13 @@ fn the_rosters_advice_is_mapped_for_the_policy() {
         ahead: false,
         rotates: true,
         takes_canary: false,
+        yields: None,
     };
     assert_eq!(
         of(&moving, &held, true),
         Some(AccountAdvice::Move {
-            to: "work-2".to_string()
+            to: "work-2".to_string(),
+            yields: None,
         })
     );
     assert_eq!(
@@ -9963,6 +10405,7 @@ fn the_rosters_advice_is_mapped_for_the_policy() {
     };
     let moved = AccountAdvice::Move {
         to: "work-2".to_string(),
+        yields: None,
     };
     let nothing_due = Advice::Stay(StayWhy::NothingDue);
     assert_eq!(
@@ -10038,6 +10481,33 @@ fn a_kimi_wall_stays_unmeasured_until_a_real_wall_is_seen() {
 
 #[test]
 fn a_kimi_pool_turn_end_proves_its_own_row_ignoring_claude_settings_and_keys() {
+    assert!(kimi_turn_end_proves(&on()));
+}
+
+/// THE OTHER POOLS READ THEIR OWN SWITCHES: Claude Code switched off (`[harness.claude] enabled
+/// = false`) leaves Kimi Code's pool on, so its turn end still proves its row, while the
+/// switches Kimi Code's pool reads stop it: `[harness] accounts = "off"` with `logins = "off"`
+/// (either alone leaves the pool's look on), and the harness switched off (Kimi Code has no
+/// `[harness.kimi]` table, so no config turns it off alone).
+/// NEGATIVE CONTROL: before, the host read Claude Code's switch for every pool, so Claude Code
+/// off stopped Grok's and Kimi's rotation bookkeeping too.
+#[test]
+fn claude_code_switched_off_leaves_the_other_pools_on() {
+    let claude_off = SupervisorConfig::from_aterm_toml("[harness.claude]\nenabled = false\n").0;
+    assert!(claude_off.off.contains(&Program::Claude));
+    assert!(kimi_turn_end_proves(&claude_off), "Claude Code off");
+    let mut pool_off = on();
+    pool_off.set("accounts", "off").unwrap();
+    pool_off.set("logins", "off").unwrap();
+    assert!(
+        !kimi_turn_end_proves(&pool_off),
+        "CONTROL: rotation and sign-ins off"
+    );
+    assert!(!kimi_turn_end_proves(&off()), "CONTROL: the harness off");
+}
+
+/// Whether a Kimi pool session's turn end under `cfg` proves the row a rotation moved it to.
+fn kimi_turn_end_proves(cfg: &SupervisorConfig) -> bool {
     let a = Accts::new();
     let kimi_roster = a.roster_path().with_file_name("accounts-kimi.toml");
     std::fs::rename(a.roster_path(), &kimi_roster).unwrap();
@@ -10089,7 +10559,7 @@ fn a_kimi_pool_turn_end_proves_its_own_row_ignoring_claude_settings_and_keys() {
     );
 
     let accts = a.clone();
-    let mut kimi = a.worker("s-kimi-prove", &on());
+    let mut kimi = a.worker("s-kimi-prove", cfg);
     kimi.agent = Program::Kimi;
     kimi.hooks.acts.account_seat = Arc::new(move || {
         Some(AccountSeat {
@@ -10102,14 +10572,18 @@ fn a_kimi_pool_turn_end_proves_its_own_row_ignoring_claude_settings_and_keys() {
     });
     assert_eq!(kimi.account(AccountPoint::TurnEnd), None);
     let after = store.load(ACCT_NOW).unwrap().0;
-    assert_eq!(after.canary, None, "TurnEnd on work-2 proves its canary");
+    if after.canary.is_some() {
+        return false;
+    }
     assert_eq!(
         after
             .sessions
             .get("s-kimi-prove")
             .map(|r| r.account.as_str()),
-        Some("work-2")
+        Some("work-2"),
+        "TurnEnd on work-2 proves its canary"
     );
+    true
 }
 
 #[test]
@@ -10219,7 +10693,8 @@ fn codex_pool_advice_records_thread_rollout_sample_and_plans_at_measured_wall() 
             usage_wall(),
         ),
         Some(AccountAdvice::Move {
-            to: "main".to_string()
+            to: "main".to_string(),
+            yields: None,
         }),
         "measured Codex wall moves without needing a Claude transcript row"
     );
@@ -10604,6 +11079,7 @@ fn a_relaunch_that_was_not_made_is_taken_back_exactly() {
     let read = WallRead {
         env: &env,
         settled: true,
+        screen_wall: None,
         wall: upgrade_drive::named_standing_wall(&a.tmp.path().join("home"), &agent),
         started: process_started(&agent.start),
     };
@@ -11110,7 +11586,8 @@ fn early_moves_a_session_off_a_low_account_ahead_of_its_limit() {
     assert_eq!(
         idle.account(AccountPoint::TurnEnd),
         Some(AccountAdvice::Move {
-            to: "work-2".to_string()
+            to: "work-2".to_string(),
+            yields: None,
         }),
         "low, a fresh candidate, its sample thirty seconds old: the move, and no probe"
     );
@@ -11193,7 +11670,8 @@ fn early_moves_a_session_off_a_low_account_ahead_of_its_limit() {
     assert_eq!(
         idle.account(AccountPoint::TurnEnd),
         Some(AccountAdvice::Move {
-            to: "work-2".to_string()
+            to: "work-2".to_string(),
+            yields: None,
         })
     );
     assert_eq!(
@@ -11220,6 +11698,7 @@ fn a_due_probe_is_handed_on_with_the_move_behind_it_and_refuses_no_commit() {
     };
     let moved = AccountAdvice::Move {
         to: "work-2".to_string(),
+        yields: None,
     };
     let sid = "s-acct-due";
     let (a, idle) = world(sid, &on());
@@ -11238,6 +11717,7 @@ fn a_due_probe_is_handed_on_with_the_move_behind_it_and_refuses_no_commit() {
                 ahead: true,
                 rotates: true,
                 takes_canary: false,
+                yields: None,
             } if to == "work-2"
         ),
         "{:?}",
@@ -11580,7 +12060,8 @@ fn a_sample_is_recorded_only_for_the_process_the_probe_was_claimed_for() {
     assert_eq!(
         idle.account(AccountPoint::TurnEnd),
         Some(AccountAdvice::Move {
-            to: "work-2".to_string()
+            to: "work-2".to_string(),
+            yields: None,
         })
     );
 
@@ -12808,6 +13289,7 @@ fn nobody_is_advised_off_an_account_whose_limit_reset_is_in_flight() {
     let wait = Some(AccountAdvice::Wait { until: again });
     let to = |label: &str| AccountAdvice::Move {
         to: label.to_string(),
+        yields: None,
     };
     for advised in [
         None,
@@ -13880,6 +14362,7 @@ fn a_limit_row_that_lags_the_screen_is_asked_for_again_a_few_times() {
     for decided in [
         AccountAdvice::Move {
             to: "work-2".to_string(),
+            yields: None,
         },
         AccountAdvice::Resume {
             cleared_at: ACCT_NOW,
@@ -14742,8 +15225,8 @@ fn the_cold_codex_act_judges_the_program_its_resume_line_runs() {
         cfg.join("accounts-codex.toml"),
         format!(
             "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n\
-             [[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = \"{}\"\n",
-            work.display()
+             [[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = {}\n",
+            crate::test_host::toml(&work)
         ),
     )
     .expect("roster");
@@ -17380,6 +17863,433 @@ fn a_worker_peeks_its_reach_under_the_reachs_gate_and_probes_nothing() {
     net.stop();
 }
 
+/// THE ROUTE A SESSION'S LAUNCH NAMES (v6 §14.17.5.4): an agy whose verified environment names
+/// `GOOGLE_GEMINI_BASE_URL`, a Muse Code whose argv names `--base-url` and a Claude Code whose
+/// route variables name `ANTHROPIC_BASE_URL` are probed at that endpoint (plain HTTP, never the
+/// Anthropic host), and a session whose launch names none reads the path alone and probes
+/// nothing (the probe's own book of endpoints says so, no wait). A turn one of them answers is a
+/// witness for another session of the same program on the same endpoint only: not for itself,
+/// another endpoint, another program there, or a session whose route is a gap. NEGATIVE CONTROL
+/// (run): with `WorkerIdle::measured` naming Claude Code's route alone, as main's
+/// `measures_reach` did, the agy session's endpoint is never probed and the test fails; with
+/// Claude Code's route variables never read, its session reads the path alone and the test fails;
+/// with a gap's session probed at the Anthropic host's sibling endpoint, the book of endpoints
+/// names it and the test fails.
+#[test]
+fn a_session_is_probed_and_witnessed_on_the_route_its_own_launch_names() {
+    use crate::harness_netprobe::Probe;
+    /// A probe that records each endpoint it resolves and answers none.
+    #[derive(Default)]
+    struct Recorded(Mutex<Vec<(String, u16)>>);
+    impl Probe for Recorded {
+        fn resolve(&self, host: &str, port: u16) -> std::io::Result<Vec<std::net::SocketAddr>> {
+            self.0.lock().unwrap().push((host.to_string(), port));
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        }
+        fn connect(
+            &self,
+            _: std::net::SocketAddr,
+            _: Duration,
+        ) -> std::io::Result<std::net::TcpStream> {
+            unreachable!()
+        }
+        fn handshake(
+            &self,
+            _: std::net::TcpStream,
+            _: &str,
+            _: aterm_http::Deadline,
+        ) -> std::io::Result<()> {
+            unreachable!()
+        }
+    }
+    let env = |base: &str| {
+        Some(vec![
+            "PATH=/usr/bin".to_string(),
+            "HTTPS_PROXY=http://127.0.0.1:9".to_string(),
+            "NO_PROXY=127.0.0.1,localhost".to_string(),
+            "GEMINI_API_KEY=lab-key".to_string(),
+            format!("GOOGLE_GEMINI_BASE_URL={base}"),
+        ])
+    };
+    let mut hooks = hooks(
+        &Arc::new(World::default()),
+        Arc::new(|_: &WorkerJob| BodyEnd::Stopped),
+    );
+    hooks.acts = Acts {
+        route: Arc::new(|pid, _, _| {
+            if pid >= 4950 {
+                Route::Custom("ANTHROPIC_BASE_URL in settings.json".to_string())
+            } else {
+                Route::Default
+            }
+        }),
+        claude_env: Arc::new(|pid, _, _| match pid {
+            4950 | 4951 => Ok(vec![
+                "ANTHROPIC_BASE_URL=http://127.0.0.1:4100".to_string(),
+                "HTTP_PROXY=http://127.0.0.1:9".to_string(),
+                "NO_PROXY=127.0.0.1,localhost".to_string(),
+            ]),
+            _ => Err(aterm_agent::harness::netwatch::Unnamed::Conflict(
+                "ANTHROPIC_BASE_URL is set differently in user and project".to_string(),
+            )),
+        }),
+        account_env: Arc::new(move |snap| match snap.pid {
+            4747 | 4748 | 4848 => env("http://127.0.0.1:4100"),
+            4749 => env("http://127.0.0.1:4200"),
+            _ => None,
+        }),
+        ..Acts::inert()
+    };
+    let probe = Arc::new(Recorded::default());
+    let net = NetProbe::with(Arc::clone(&probe) as Arc<dyn Probe>, Duration::from_secs(2));
+    let switches = switched(&on());
+    let host = |sid: &str, agent: Program, pid: u32, argv: &str| {
+        let mut idle = idle_host(sid, agent, Arc::clone(&switches), hooks.clone());
+        idle.net = Arc::clone(&net);
+        idle.kept.lock().unwrap().snapshot = Some(Snapshot {
+            pid,
+            argv: argv.split_whitespace().map(str::to_string).collect(),
+            cwd: "/tmp".to_string(),
+            ..snap(sid)
+        });
+        idle
+    };
+    let agy = host("s-agy", Program::Agy, 4747, "agy");
+    let mate = host("s-mate", Program::Agy, 4748, "agy");
+    let far = host("s-far", Program::Agy, 4749, "agy");
+    let muse = host(
+        "s-muse",
+        Program::Muse,
+        4848,
+        "muse --base-url http://127.0.0.1:4100 --trust-workspace",
+    );
+    let unread = host("s-unread", Program::Agy, 4750, "agy");
+    let bare = host("s-bare", Program::Muse, 4848, "muse --trust-workspace");
+    let claude = host("s-claude", Program::Claude, 4950, "claude");
+    let claude_mate = host("s-claude-mate", Program::Claude, 4951, "claude");
+    let split = host("s-split", Program::Claude, 4952, "claude");
+
+    assert_eq!(agy.reach(), Reach::Unknown, "nothing measured yet");
+    let asked = Instant::now();
+    while !probe
+        .0
+        .lock()
+        .unwrap()
+        .contains(&("127.0.0.1".to_string(), 4100))
+        && asked.elapsed() < aterm_spec::wait::MUST_HAPPEN
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        probe
+            .0
+            .lock()
+            .unwrap()
+            .contains(&("127.0.0.1".to_string(), 4100)),
+        "agy's own endpoint is probed: {:?}",
+        probe.0.lock().unwrap()
+    );
+    // Claude Code's base URL is agy's endpoint, so it reads that probe's failed resolve; a
+    // session whose route is a gap reads the path alone, which nothing has measured.
+    let asked = Instant::now();
+    while !matches!(claude.reach(), Reach::Down { .. })
+        && asked.elapsed() < aterm_spec::wait::MUST_HAPPEN
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        matches!(claude.reach(), Reach::Down { .. }),
+        "its base URL's probe, which resolves nothing"
+    );
+    for (what, idle) in [
+        ("no environment read", &unread),
+        ("no --base-url", &bare),
+        ("two base URLs", &split),
+    ] {
+        assert_eq!(idle.reach(), Reach::Unknown, "{what}: the path alone");
+    }
+    let stub = Target {
+        host: "127.0.0.1".to_string(),
+        port: 4100,
+        tls: false,
+    };
+    assert_eq!(
+        net.others(),
+        [stub],
+        "only the named endpoint has a probe of its own; the gaps asked none"
+    );
+
+    for idle in [
+        &agy,
+        &mate,
+        &far,
+        &muse,
+        &unread,
+        &bare,
+        &claude,
+        &claude_mate,
+        &split,
+    ] {
+        assert_eq!(idle.witness(), None, "{}: no turn answered yet", idle.sid);
+    }
+    agy.answered(0);
+    unread.answered(0);
+    bare.answered(0);
+    split.answered(0);
+    assert!(
+        mate.witness().is_some(),
+        "the same program on the same endpoint"
+    );
+    assert_eq!(agy.witness(), None, "its own answer witnesses nothing");
+    assert_eq!(far.witness(), None, "another endpoint");
+    assert_eq!(muse.witness(), None, "another program on the endpoint");
+    assert_eq!(claude.witness(), None, "another program on the endpoint");
+    assert_eq!(unread.witness(), None, "a gap takes no witness");
+    assert_eq!(bare.witness(), None, "a gap takes no witness");
+    assert_eq!(split.witness(), None, "a gap takes no witness");
+    mate.answered(0);
+    assert!(agy.witness().is_some());
+    claude.answered(0);
+    assert!(
+        claude_mate.witness().is_some(),
+        "Claude Code on its own base URL"
+    );
+    assert_eq!(split.witness(), None, "a gap takes no witness");
+    net.stop();
+}
+
+/// AN ENVIRONMENT NOT READ IS READ AGAIN AT EACH ASK, ITS GAP SAID ONCE (v6 §14.17.5.4): an agy
+/// whose environment could not be read reads as a gap, says why once however often it is asked,
+/// and once read its base URL names its route. A Claude Code whose route variables' source could
+/// not be read (`Unnamed::Unread`, a settings file mid-write) is read again the same way; one
+/// whose sources disagree (`Unnamed::Conflict`) is a gap kept for its process, its variables
+/// never read again. NEGATIVE CONTROLS (run): with the unread gap logged at no ask, the log
+/// assertion fails; with Claude Code's unread source kept as settled, its second ask is still a
+/// gap and the test fails.
+#[test]
+fn an_environment_not_read_is_read_again_and_its_gap_said_once() {
+    use aterm_agent::harness::netwatch::Unnamed;
+    let agy_reads = Arc::new(AtomicUsize::new(0));
+    let claude_reads = Arc::new(Mutex::new(HashMap::<u32, usize>::new()));
+    let (a, c) = (Arc::clone(&agy_reads), Arc::clone(&claude_reads));
+    let mut hooks = hooks(
+        &Arc::new(World::default()),
+        Arc::new(|_: &WorkerJob| BodyEnd::Stopped),
+    );
+    hooks.acts = Acts {
+        route: Arc::new(|_, _, _| Route::Custom("ANTHROPIC_BASE_URL in settings.json".to_string())),
+        claude_env: Arc::new(move |pid, _, _| {
+            let mut reads = c.lock().unwrap();
+            let n = reads.entry(pid).or_default();
+            *n += 1;
+            match (pid, *n) {
+                (5050, 1) => Err(Unnamed::Unread("local could not be parsed".to_string())),
+                (5050, _) => Ok(vec!["ANTHROPIC_BASE_URL=http://127.0.0.1:4100".to_string()]),
+                _ => Err(Unnamed::Conflict(
+                    "ANTHROPIC_BASE_URL is set differently in user and project".to_string(),
+                )),
+            }
+        }),
+        account_env: Arc::new(move |_| {
+            (a.fetch_add(1, Ordering::SeqCst) >= 2).then(|| {
+                vec![
+                    "GEMINI_API_KEY=lab-key".to_string(),
+                    "GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:4100".to_string(),
+                ]
+            })
+        }),
+        ..Acts::inert()
+    };
+    let switches = switched(&on());
+    let host = |sid: &str, agent: Program, pid: u32| {
+        let idle = idle_host(sid, agent, Arc::clone(&switches), hooks.clone());
+        idle.kept.lock().unwrap().snapshot = Some(Snapshot {
+            pid,
+            cwd: "/tmp".to_string(),
+            ..snap(sid)
+        });
+        idle
+    };
+    let named = |e: Option<witness::Endpoint>| matches!(e, Some(witness::Endpoint::Named(_)));
+    let agy = host("s-agy", Program::Agy, 4747);
+    let logged = crate::test_log::logged_while(|| {
+        assert!(!named(agy.endpoint()), "not read: a gap");
+        assert!(!named(agy.endpoint()), "not read again: a gap");
+    });
+    let said: Vec<&String> = logged
+        .iter()
+        .filter(|l| l.contains("no probe and no witness of pid 4747's own route yet"))
+        .collect();
+    assert_eq!(said.len(), 1, "said once: {logged:#?}");
+    assert!(
+        said[0].contains("environment could not be read"),
+        "{said:?}"
+    );
+    assert!(named(agy.endpoint()), "read at the third ask");
+    assert!(named(agy.endpoint()));
+    assert_eq!(agy_reads.load(Ordering::SeqCst), 3, "kept once read");
+
+    let unread = host("s-claude", Program::Claude, 5050);
+    assert!(!named(unread.endpoint()), "a source not read: a gap");
+    assert!(named(unread.endpoint()), "read again, it names its route");
+    let split = host("s-split", Program::Claude, 5051);
+    assert!(!named(split.endpoint()));
+    assert!(!named(split.endpoint()));
+    assert_eq!(
+        claude_reads.lock().unwrap().get(&5051),
+        Some(&1),
+        "two sources that disagree are not read again"
+    );
+}
+
+/// agy's `<config>/settings.json` is re-read while unread (truncated mid-write) and cached once
+/// settled — whether it selects `"modelProvider": "gemini"` (default `generativelanguage.googleapis.com`)
+/// or Google sign-in (even when `GEMINI_API_KEY` sits in `env`). NEGATIVE CONTROLS (run): caching
+/// `AgyBackend::Unread` keeps the second ask a gap; ignoring `settings.json` names a signed-in agy
+/// as on its env's API key.
+#[test]
+fn agy_settings_are_reread_when_unread_and_settled_when_signed_in() {
+    let dir = aterm_tempfile::tempdir().expect("tempdir");
+    let gemini_home = dir.path().join("gemini");
+    let signin_home = dir.path().join("signin");
+    let gemini_cfg = gemini_home.join(".gemini").join("antigravity-cli");
+    let signin_cfg = signin_home.join(".gemini").join("antigravity-cli");
+    std::fs::create_dir_all(&gemini_cfg).expect("gemini cfg");
+    std::fs::create_dir_all(&signin_cfg).expect("signin cfg");
+    let gemini_settings = gemini_cfg.join("settings.json");
+    std::fs::write(&gemini_settings, "").expect("truncated mid-write");
+    std::fs::write(signin_cfg.join("settings.json"), "{\"theme\":\"dark\"}\n")
+        .expect("signin settings");
+
+    let backend_reads = Arc::new(Mutex::new(HashMap::<u32, usize>::new()));
+    let reads = Arc::clone(&backend_reads);
+    let g_home = gemini_home.display().to_string();
+    let s_home = signin_home.display().to_string();
+    let mut hooks = hooks(
+        &Arc::new(World::default()),
+        Arc::new(|_: &WorkerJob| BodyEnd::Stopped),
+    );
+    hooks.acts = Acts {
+        account_env: Arc::new(move |snap| {
+            let home = if snap.pid == 6060 { &g_home } else { &s_home };
+            Some(vec![
+                format!("HOME={home}"),
+                "GEMINI_API_KEY=lab-key".to_string(),
+            ])
+        }),
+        agy_backend: Arc::new(move |snap, env| {
+            *reads.lock().unwrap().entry(snap.pid).or_default() += 1;
+            witness::agy_backend_on_disk(&snap.argv, env, None)
+        }),
+        ..Acts::inert()
+    };
+    let switches = switched(&on());
+    let host = |sid: &str, pid: u32| {
+        let idle = idle_host(sid, Program::Agy, Arc::clone(&switches), hooks.clone());
+        idle.kept.lock().unwrap().snapshot = Some(Snapshot {
+            pid,
+            argv: vec!["agy".to_string()],
+            cwd: "/tmp".to_string(),
+            ..snap(sid)
+        });
+        idle
+    };
+
+    let gemini = host("s-agy-gemini", 6060);
+    let logged = crate::test_log::logged_while(|| {
+        assert!(matches!(gemini.endpoint(), Some(witness::Endpoint::Gap(_))));
+        assert!(matches!(gemini.endpoint(), Some(witness::Endpoint::Gap(_))));
+    });
+    let said: Vec<&String> = logged
+        .iter()
+        .filter(|l| l.contains("no probe and no witness of pid 6060's own route yet"))
+        .collect();
+    assert_eq!(said.len(), 1, "unread settings logged once: {logged:#?}");
+    std::fs::write(&gemini_settings, "{\"modelProvider\":\"gemini\"}\n")
+        .expect("finish writing settings");
+    assert_eq!(
+        gemini.endpoint(),
+        Some(witness::Endpoint::Named(witness::Base::gemini()))
+    );
+    assert_eq!(
+        gemini.endpoint(),
+        Some(witness::Endpoint::Named(witness::Base::gemini()))
+    );
+    assert_eq!(
+        backend_reads.lock().unwrap().get(&6060),
+        Some(&3),
+        "reread twice while truncated, then cached once settled"
+    );
+
+    let signin = host("s-agy-signin", 6061);
+    assert!(
+        matches!(
+            signin.endpoint(),
+            Some(witness::Endpoint::Gap(ref why)) if why.contains("omits modelProvider")
+        ),
+        "signed-in agy with GEMINI_API_KEY in env is not on Gemini API"
+    );
+    assert!(matches!(signin.endpoint(), Some(witness::Endpoint::Gap(_))));
+    assert_eq!(
+        backend_reads.lock().unwrap().get(&6061),
+        Some(&1),
+        "settled sign-in gap is cached for the process"
+    );
+}
+
+/// An unknown or unrepresentable reply age cannot become a fresh clearing. Exercise the real
+/// host book without asking any network probe; a current answer remains a positive control.
+#[test]
+fn an_unrepresentable_witness_age_is_not_booked_as_now() {
+    use crate::harness_netprobe::Probe;
+    struct NoIo;
+    impl Probe for NoIo {
+        fn resolve(&self, _: &str, _: u16) -> std::io::Result<Vec<std::net::SocketAddr>> {
+            panic!("witness bookkeeping must not probe");
+        }
+        fn connect(
+            &self,
+            _: std::net::SocketAddr,
+            _: Duration,
+        ) -> std::io::Result<std::net::TcpStream> {
+            panic!("witness bookkeeping must not connect");
+        }
+        fn handshake(
+            &self,
+            _: std::net::TcpStream,
+            _: &str,
+            _: aterm_http::Deadline,
+        ) -> std::io::Result<()> {
+            panic!("witness bookkeeping must not handshake");
+        }
+    }
+    let mut hooks = hooks(
+        &Arc::new(World::default()),
+        Arc::new(|_: &WorkerJob| BodyEnd::Stopped),
+    );
+    hooks.acts.route = Arc::new(|_, _, _| Route::Default);
+    let net = NetProbe::with(Arc::new(NoIo), Duration::from_secs(2));
+    let switches = switched(&on());
+    let host = |sid: &str| {
+        let mut idle = idle_host(sid, Program::Claude, Arc::clone(&switches), hooks.clone());
+        idle.net = Arc::clone(&net);
+        idle.kept.lock().unwrap().snapshot = Some(snap(sid));
+        idle
+    };
+    let first = host("s-old");
+    let mate = host("s-mate");
+    first.answered(u64::MAX);
+    first.answered(u64::try_from(witness::WITNESS_KEPT.as_millis()).unwrap());
+    assert_eq!(mate.witness(), None, "an old or unknown age is no clearing");
+    first.answered(0);
+    assert!(
+        mate.witness().is_some(),
+        "a current known reply is still booked"
+    );
+    assert_eq!(first.witness(), None, "a session never witnesses itself");
+    net.stop();
+}
+
 #[test]
 fn a_worker_measures_its_agents_memory_at_most_once_per_cadence() {
     use aterm_agent::supervise::memory;
@@ -17911,6 +18821,108 @@ fn a_workers_facts_are_its_sessions_calls_that_made_no_progress_proved_alive() {
     assert_eq!(worker(Acts::inert().jobs_board).facts(), None);
 }
 
+/// A WORKER'S HELD PROGRAMS ARE PROVED HELD AT THE ASK ([`IdleHost::facts`]' held part,
+/// `docs/DESIGN-leftover-processes-2026-10-16.md` §6.3): of the two programs the board names for
+/// its session, only the one [`Acts::held_now`] still proves held, in a process as old as its told
+/// wait, is named (602 is held now in a later process, 30 s old, that took the pid), held for its
+/// view's time plus the view's age, and the part is as of the re-proof, so a fact may be told from
+/// it (`HeldReading::tells_at`) whatever the view's age. A view whose held rows the re-proof proves
+/// none of is a part unread, which closes no episode (a program held since that view is in none of
+/// its rows); a view that names none for the session is a part with none, which closes one.
+/// NEGATIVE CONTROLS: a view past [`crate::vitals_jobs::JOBS_FRESH`], and a board no view was
+/// posted to, read nothing.
+#[test]
+fn a_workers_held_programs_are_proved_held_at_the_ask() {
+    use aterm_vitals::jobs::{Findings, JobKind, JobsView, Named};
+    static BOARD: crate::vitals_jobs::JobsBoard = crate::vitals_jobs::JobsBoard::new();
+    static NONE: crate::vitals_jobs::JobsBoard = crate::vitals_jobs::JobsBoard::new();
+    static STALE: crate::vitals_jobs::JobsBoard = crate::vitals_jobs::JobsBoard::new();
+    static RELEASED: crate::vitals_jobs::JobsBoard = crate::vitals_jobs::JobsBoard::new();
+    // 601 is still held; 602 is held in a later process, 30 s old, that took the pid; 603 was let
+    // go since the view was read.
+    fn held_now(held: &aterm_agent::supervise::HeldCall) -> bool {
+        held.exec_version == Some(u64::from(held.pid))
+            && (held.pid == 601 || (held.pid == 602 && held.held_ms <= 30_000))
+    }
+    let worker = |board: &'static crate::vitals_jobs::JobsBoard| {
+        let mut hooks = hooks(
+            &Arc::new(World::default()),
+            Arc::new(|_: &WorkerJob| BodyEnd::Stopped),
+        );
+        hooks.acts = Acts {
+            jobs_board: board,
+            held_now,
+            ..Acts::inert()
+        };
+        idle_host("s-held", Program::Claude, switched(&on()), hooks)
+    };
+    let held = |pid, for_ms| Named {
+        pid,
+        exec_version: Some(u64::from(pid)),
+        name: "git-remote-https".into(),
+        tab: Some(4),
+        job: Some(JobKind::AgentCall),
+        for_ms,
+    };
+    let view = Arc::new(JobsView {
+        findings: Findings {
+            program_check: vec![held(601, 600_000), held(602, 1_140_000)],
+            ..Findings::default()
+        },
+        ..JobsView::default()
+    });
+    let sids = std::collections::BTreeMap::from([(4, "s-held".to_string())]);
+    let read_at = Instant::now()
+        .checked_sub(Duration::from_secs(20))
+        .expect("a clock past 20 s");
+    BOARD.post(Arc::clone(&view), sids.clone(), read_at);
+    let reading = worker(&BOARD).facts().expect("a fresh view");
+    let now_ms = i64::try_from(aterm_time::unix_millis().expect("the clock")).unwrap();
+    let part = reading.held.clone().expect("the held part");
+    let named: Vec<u32> = part.programs.iter().map(|h| h.pid).collect();
+    assert_eq!(named, [601], "only what is held at the ask");
+    assert_eq!(part.programs[0].exec_version, Some(601));
+    assert!(
+        (620_000..680_000).contains(&part.programs[0].held_ms),
+        "the view's time plus its age: {}",
+        part.programs[0].held_ms
+    );
+    assert!(part.tells_at(now_ms), "{} at {now_ms}", part.as_of_ms);
+    assert!(
+        !reading.tells_at(now_ms),
+        "the view itself is 20 s old: {} at {now_ms}",
+        reading.as_of_ms
+    );
+    let released = Arc::new(JobsView {
+        findings: Findings {
+            program_check: vec![held(603, 600_000)],
+            ..Findings::default()
+        },
+        ..JobsView::default()
+    });
+    RELEASED.post(released, sids.clone(), read_at);
+    let unread = worker(&RELEASED).facts().expect("a fresh view");
+    assert_eq!(
+        unread.held, None,
+        "a re-proof that proves none of the view's rows proves no absence"
+    );
+    NONE.post(Arc::new(JobsView::default()), sids.clone(), Instant::now());
+    assert_eq!(
+        worker(&NONE)
+            .facts()
+            .and_then(|r| r.held)
+            .map(|h| h.programs),
+        Some(Vec::new()),
+        "a view naming none: none held"
+    );
+    let old = Instant::now()
+        .checked_sub(crate::vitals_jobs::JOBS_FRESH + Duration::from_secs(1))
+        .expect("a clock past the bound");
+    STALE.post(view, sids, old);
+    assert_eq!(worker(&STALE).facts(), None);
+    assert_eq!(worker(Acts::inert().jobs_board).facts(), None);
+}
+
 /// The live measure ([`agent_memory`]) of a real stand-in.
 #[cfg(target_os = "macos")]
 #[test]
@@ -18073,9 +19085,13 @@ fn an_owed_note_is_asked_by_one_asker_at_a_time() {
     let o = owed().expect("re-owed: still owed");
     assert!(o.since == 50 && !o.flying && o.by.is_some_and(|by| by <= at));
     word.send(Some(Behind::Noted)).unwrap();
-    assert_eq!(host_note("s-1", &note, Instant::now(), &hooks), None);
+    assert_eq!(
+        host_note("s-1", &note, Instant::now(), &hooks),
+        None,
+        "the host's ask is in flight off its thread"
+    );
     assert_eq!(wait_inside(), 50, "asked with the notice's second");
-    assert!(owed().is_none(), "noted: nothing more owed");
+    until("noted: nothing more owed", || owed().is_none());
 
     owe_note(&note, 7);
     let before = acts.load(Ordering::SeqCst);
@@ -18085,11 +19101,22 @@ fn an_owed_note_is_asked_by_one_asker_at_a_time() {
     word.send(None).unwrap();
     let (said, rings) = asker.join().unwrap();
     assert_eq!(said, None, "the act panicked");
-    assert!(rings >= 1, "the unwound flight rings for the skip");
-    assert!(owed().is_some_and(|o| !o.flying && o.since == 7));
+    assert_eq!(rings, 0, "failed work wakes no retry");
+    assert!(owed().is_none(), "the failed note was forgotten");
+    assert_eq!(ask_note("s-1", &note, &hooks), None);
+    assert_eq!(
+        acts.load(Ordering::SeqCst),
+        before + 1,
+        "no failed-note retry"
+    );
+    owe_note(&note, 7);
     word.send(Some(Behind::Noted)).unwrap();
     assert_eq!(ask_note("s-1", &note, &hooks), Some(Behind::Noted));
-    assert_eq!(acts.load(Ordering::SeqCst), before + 2, "asked again");
+    assert_eq!(
+        acts.load(Ordering::SeqCst),
+        before + 2,
+        "new work was asked"
+    );
     assert_eq!(wait_inside(), 7, "with the owed second");
 }
 
@@ -21498,6 +22525,19 @@ fn a_readers_panic_reaches_the_log_as_its_kind_and_length() {
         quoted.message.contains("QZP7E7C1"),
         "CONTROL: the panic's text quotes the row"
     );
+    // A follow whose read of the tab panics over the row, as a reader's comparison does.
+    let acting = Arc::new(Acting::default());
+    acting.set(&[("s-e7c5", Program::Claude)]);
+    let mut hooks = acting.hooks();
+    let row = rows[0].clone();
+    hooks.acts.follow = Arc::new(move |_, _| {
+        assert_eq!(row, "a box", "the box's row");
+        Foreground::Agent
+    });
+    let kept = Mutex::new(Kept {
+        snapshot: Some(snap("s-e7c5")),
+        ..Kept::default()
+    });
     let logged = logged_while(|| {
         assert_eq!(
             crate::reader_guard::read_or_none(0xE7C1_u64, "E7 cut", &rows, cut),
@@ -21509,6 +22549,14 @@ fn a_readers_panic_reaches_the_log_as_its_kind_and_length() {
         );
         assert_eq!(host_caught("s-e7c3", "the E7 check", compared), None);
         assert_eq!(caught("the E7 pass", "it runs again", compared), None);
+        assert!(
+            catch_note_ask("s-e7c4", || {
+                let _ = compared();
+                aterm_agent::harness::upgrade_drive::Behind::Nothing
+            })
+            .is_none()
+        );
+        assert_eq!(follow_caught("s-e7c5", &kept, &hooks), None);
     });
     for (head, kind) in [
         (
@@ -21534,6 +22582,17 @@ fn a_readers_panic_reaches_the_log_as_its_kind_and_length() {
         ),
         (
             "harness: the E7 pass stopped after an internal panic; it runs again: assert panic ("
+                .to_string(),
+            "assert panic (",
+        ),
+        (
+            "harness @s-e7c4: its note behind stopped after an internal panic: assert panic ("
+                .to_string(),
+            "assert panic (",
+        ),
+        (
+            "harness @s-e7c5: following its agent stopped after an internal panic; it is not \
+             followed again for this tab: assert panic ("
                 .to_string(),
             "assert panic (",
         ),
@@ -23806,16 +24865,29 @@ fn an_agent_read_back_keeps_the_hosts_mark_through_a_commits_stop() {
         a.group.store(4300, Ordering::SeqCst);
         a.set(&[("s-a", Program::Claude)]);
         let mut h = a.hooks();
-        let (end, waiting) = gated_waiting("s-a");
-        h.waiting = waiting;
+        let end = Arc::new(PauseGate::default());
+        let returned = Arc::new(Mutex::new(None));
+        end.shut();
+        h.body = {
+            let body = Arc::clone(&h.body);
+            let end = Arc::clone(&end);
+            let returned = Arc::clone(&returned);
+            Arc::new(move |job: &WorkerJob| {
+                let result = body(job);
+                *returned.lock().unwrap() =
+                    Some((job.left.read(), job.stop.load(Ordering::SeqCst)));
+                end.pass();
+                result
+            })
+        };
         let host = HostHandle::start(on(), false, false, h);
         a.attached(&host, "s-a");
-        // The gate holds an exit unread only once the body runs: one handed before that is read
-        // at the worker loop's top, and the gate then holds the worker only at its end.
         until("its body runs", || a.runs.load(Ordering::SeqCst) == 1);
-        end.shut();
         a.set(&[]);
-        until("the exit handed, the worker held", || end.held());
+        until("the body returned before the worker read its exit", || {
+            end.held()
+        });
+        assert_eq!(*returned.lock().unwrap(), Some((Word::Left, true)));
         a.group.store(4400, Ordering::SeqCst);
         a.set(&[("s-a", Program::Codex)]);
         let kept = Arc::clone(&host.shared.kept.lock().unwrap()["s-a"]);
@@ -24222,6 +25294,10 @@ fn an_agent_started_under_the_harness_switched_off_is_noted_behind_and_shown() {
             until("looked at again", || {
                 last_look().is_some_and(|(look, off)| look && off == aside)
             });
+            // The view stood down forgot the tab's note (`note_off_tabs`), so the view back notes
+            // it again, on a thread of its own (`fly_note`): its landing is waited for here, or
+            // the count read once the harness is on again could be taken before it.
+            until("noted again as the view came back", || counts() == (4, 0));
         }
         host.set_config(on());
         until("supervised again", || host.live() == ["s-claude", "s-muse"]);
@@ -25135,6 +26211,8 @@ impl Probe {
             fact: Arc::new(|_, _| {}),
             needs: Arc::new(|_, _, _| false),
             hold: Arc::new(|_, _| false),
+            said: Arc::new(|_, _| false),
+            receipt: Arc::new(|_, _| false),
             claim_epoch: Arc::new(move || p4.released.load(Ordering::SeqCst)),
             acts,
             backoff: Arc::new(quick_backoff),
@@ -25929,6 +27007,8 @@ impl LookWorld {
             fact: Arc::new(|_, _| {}),
             needs: Arc::new(|_, _, _| false),
             hold: Arc::new(|_, _| false),
+            said: Arc::new(|_, _| false),
+            receipt: Arc::new(|_, _| false),
             claim_epoch: Arc::new(|| 0),
             acts,
             backoff: Arc::new(quick_backoff),
@@ -26311,8 +27391,24 @@ impl RealAgent {
 
     fn restart(&self, a: &Acting, rest: &str) -> String {
         crate::harness_host::with_harness_state(a.stamp_dir(), || {
-            crate::control::restart_verb(self.master, rest, &self.ctx)
+            crate::control::restart_verb(self.master, rest, &self.ctx, aterm_slog::Actor::Ctl)
         })
+    }
+
+    /// How many `act word=<word> by=ctl src=aterm` marks its session's log holds: one for each
+    /// signal an asked end sent (fix E2), none for an act that sent nothing.
+    fn acts(&self, word: &str) -> usize {
+        let g = self.ctx.timeline.lock().unwrap();
+        g.slog()
+            .log()
+            .window()
+            .filter(|r| {
+                r.k == aterm_slog::Kind::Act
+                    && r.src == aterm_slog::Src::Aterm
+                    && r.by == aterm_slog::Actor::Ctl
+                    && r.f.get_word(aterm_slog::Key::Word) == Some(word)
+            })
+            .count()
     }
 }
 
@@ -26539,7 +27635,12 @@ fn the_real_restart_act_conforms_to_its_model() {
                 true
             }
             Case::BareSignal => {
-                let reply = crate::control::signal_verb(agent.master, "term", &agent.ctx);
+                let reply = crate::control::signal_verb(
+                    agent.master,
+                    "term",
+                    &agent.ctx,
+                    aterm_slog::Actor::Ctl,
+                );
                 assert_eq!(reply, format!("OK signalled pgrp {}\n", agent.pid));
                 false
             }
@@ -26580,6 +27681,38 @@ fn the_real_restart_act_conforms_to_its_model() {
             Case::BareSignal => &[],
         };
         assert_eq!(&a.asked_exits.lock().unwrap()[..], want, "{case:?}");
+        assert_eq!(
+            (agent.acts("restart"), agent.acts("signal")),
+            match case {
+                Case::Hearing | Case::Deaf => (1, 0),
+                Case::Carried => (0, 0),
+                Case::BareSignal => (0, 1),
+            },
+            "{case:?}: one act mark for the act's SIGTERM or the verb's signal; none for the \
+             SIGKILL, nor for the carried act, whose predecessor wrote it"
+        );
+        let stands = u64::try_from(crate::session_log::ASKED_END_STANDS.as_millis()).unwrap();
+        let asked = agent.ctx.timeline.lock().unwrap().slog().asked_end();
+        let (by, renewed) = match case {
+            Case::Hearing | Case::BareSignal => (aterm_slog::Actor::Ctl, false),
+            Case::Deaf => (aterm_slog::Actor::Ctl, true),
+            Case::Carried => (aterm_slog::Actor::Aterm, false),
+        };
+        assert!(
+            asked.is_some_and(|(pgid, who, ms)| pgid == agent.pid
+                && who == by
+                && if renewed { ms > stands } else { ms >= stands }),
+            "{case:?}: the end it asked stands by {by:?} (the carrier's own for a carried act), \
+             and the SIGKILL that followed a deaf one's SIGTERM by its grace renewed it past \
+             {stands} ms: {asked:?}"
+        );
+        if matches!(case, Case::Hearing | Case::BareSignal) {
+            assert_eq!(
+                asked.map(|(_, _, ms)| ms),
+                Some(stands),
+                "{case:?}: no SIGKILL"
+            );
+        }
         seen.read = if by_act { 1 } else { 2 };
         seen.stamped = stamped();
         assert!(!seen.stamped, "{case:?}: consumed as its relaunch is filed");
@@ -26639,6 +27772,7 @@ fn a_second_restart_that_sends_nothing_leaves_the_first_acts_stamp() {
             &format!("pid={pid}"),
             &agent.ctx,
             Some(a.stamp_dir()),
+            aterm_slog::Actor::Ctl,
         )
         .expect("act B passes its fences");
         seen.stamped = stamp_now().is_some();
@@ -26652,7 +27786,12 @@ fn a_second_restart_that_sends_nothing_leaves_the_first_acts_stamp() {
         step(&seen, "act B's first half");
         if !joined {
             assert_eq!(
-                crate::control::signal_verb(agent.master, "term", &agent.ctx),
+                crate::control::signal_verb(
+                    agent.master,
+                    "term",
+                    &agent.ctx,
+                    aterm_slog::Actor::Ctl
+                ),
                 format!("OK signalled pgrp {pid}\n")
             );
         }
@@ -26669,6 +27808,11 @@ fn a_second_restart_that_sends_nothing_leaves_the_first_acts_stamp() {
         assert!(seen.at_end, "nothing has read the exit yet");
         step(&seen, "the agent ended");
         assert_eq!(second.signal(), format!("OK restart gone pid {pid}\n"));
+        assert_eq!(
+            (agent.acts("restart"), agent.acts("signal")),
+            (usize::from(joined), usize::from(!joined)),
+            "joined {joined}: act B sent nothing and wrote no act mark"
+        );
         assert_eq!(
             stamp_now(),
             first,
@@ -26708,7 +27852,7 @@ fn the_real_restart_verb_refuses_what_it_cannot_carry_and_sends_nothing() {
     let lone = aterm_tempfile::TempDir::new().expect("a state dir");
     assert_eq!(
         crate::harness_host::with_harness_state(lone.path(), || {
-            crate::control::restart_verb(agent.master, "", &agent.ctx)
+            crate::control::restart_verb(agent.master, "", &agent.ctx, aterm_slog::Actor::Ctl)
         }),
         "ERR restart unavailable: not-the-hosts-agent\n",
         "no host keeps a snapshot of it"
@@ -26728,7 +27872,7 @@ fn the_real_restart_verb_refuses_what_it_cannot_carry_and_sends_nothing() {
             }),
         );
         crate::harness_host::with_harness_state(lone.path(), || {
-            crate::control::restart_verb(agent.master, "", &agent.ctx)
+            crate::control::restart_verb(agent.master, "", &agent.ctx, aterm_slog::Actor::Ctl)
         })
     };
     assert_eq!(
@@ -26752,6 +27896,7 @@ fn the_real_restart_verb_refuses_what_it_cannot_carry_and_sends_nothing() {
             restart_stamp::read(a.stamp_dir(), &agent.sid).is_none(),
             "{why}: no stamp"
         );
+        assert_eq!(agent.acts("restart"), 0, "{why}: no act mark");
         assert!(
             agent.ended().is_none() && agent.record_left(),
             "{why}: nothing sent"
@@ -26796,13 +27941,18 @@ fn the_real_restart_verb_refuses_what_it_cannot_carry_and_sends_nothing() {
     assert!(busy.starts_with("ERR busy person human_ms="), "{busy}");
     untouched("a person's input");
     assert_eq!(
-        crate::restart_act::restart_in(agent.master, "", &agent.ctx, None),
+        crate::restart_act::restart_in(agent.master, "", &agent.ctx, None, aterm_slog::Actor::Ctl),
         "ERR restart unavailable: no-state\n"
     );
     untouched("no state directory");
     assert_eq!(
         agent.restart(&a, &format!("pid={pid} quiet=0")),
         format!("OK restarting pid {pid} cause=asked\n")
+    );
+    assert_eq!(
+        agent.acts("restart"),
+        1,
+        "CONTROL: the act that signals marks"
     );
     until("restarted", || agent.ended().is_some());
     host.shutdown_and_join();
@@ -27936,9 +29086,21 @@ fn a_stopped_program_named_again_before_its_watchs_kill_is_relaunched() {
             name();
         } else {
             name();
-            until("the agent's next worker runs", || {
-                a.runs.load(Ordering::SeqCst) >= 2 && host.live() == [sid.clone()]
-            });
+            let seen = aterm_spec::wait::within(
+                aterm_spec::wait::MUST_HAPPEN,
+                Duration::from_millis(5),
+                || {
+                    (a.runs.load(Ordering::SeqCst) >= 2 && host.live() == [sid.clone()])
+                        .then_some(())
+                },
+            );
+            assert!(
+                seen.is_some(),
+                "not within 60 s: the agent's next worker runs; runs={} live={:?} expected_sid={sid} pending={:?}",
+                a.runs.load(Ordering::SeqCst),
+                host.live(),
+                host.pending_restored_snapshot_for(&sid)
+            );
             assert_eq!(
                 host.pending_restored_snapshot_for(&sid),
                 None,
@@ -28118,6 +29280,7 @@ fn the_restart_acts_kill_waits_out_another_hand() {
             &format!("pid={pid} if-stalled"),
             &agent.ctx,
             Some(a.stamp_dir()),
+            aterm_slog::Actor::Ctl,
         )
         .expect("the act passes its fences");
         seen.stamped = stamped();
@@ -29562,7 +30725,8 @@ fn a_renewable_login_s_end_is_recorded_and_its_renewal_followed() {
     assert_eq!(
         idle.account(ended),
         Some(AccountAdvice::Move {
-            to: "main".to_string()
+            to: "main".to_string(),
+            yields: None,
         }),
         "the move onto the renewed login"
     );
@@ -29654,7 +30818,8 @@ fn a_superseded_logins_end_strikes_nothing_and_follows_under_a_wall() {
     assert_eq!(
         idle.account(lost),
         Some(AccountAdvice::Move {
-            to: "main".to_string()
+            to: "main".to_string(),
+            yields: None,
         }),
         "the move onto the renewed login"
     );
@@ -29675,7 +30840,8 @@ fn a_superseded_logins_end_strikes_nothing_and_follows_under_a_wall() {
         assert_eq!(
             idle.account(point),
             Some(AccountAdvice::Move {
-                to: "main".to_string()
+                to: "main".to_string(),
+                yields: None,
             }),
             "{point:?}: followed under the wall"
         );
@@ -30088,7 +31254,8 @@ fn a_superseded_session_at_a_usage_limit_is_not_followed() {
     assert_eq!(
         idle.account(AccountPoint::TurnEnd),
         Some(AccountAdvice::Move {
-            to: "main".to_string()
+            to: "main".to_string(),
+            yields: None,
         })
     );
 }
@@ -30605,6 +31772,9 @@ fn a_hosted_relaunch_lifts_the_failure_it_caused() {
     for (kind, step, words) in [
         ("relaunch", "relaunched", "restarting"),
         ("relaunch", "adopted", "restarting"),
+        // The loop's carry-on adopting an agent its relaunch's own step never saw register.
+        ("carry-on", "adopted", "restarting"),
+        ("upgrade", "adopted", "upgrading%20to%202.2.0"),
         ("carry-on-after-update", "done:fresh", "restarting"),
         ("upgrade", "done:unconfirmed", "upgrading%20to%202.2.0"),
     ] {
@@ -30638,6 +31808,47 @@ fn a_hosted_relaunch_lifts_the_failure_it_caused() {
         let text = tab.brief();
         assert!(!text.contains("need=failure"), "{step}: {text}");
         assert!(text.contains("acts 1 "), "{step}: {text}");
+    }
+}
+
+/// The loop's resume hook writes each row its resume says under the kind that resume names
+/// ([`resume_rows`]): the late adoption of an upgrade at the loop's idle point
+/// (`relaunch::resume_at_point`'s (`upgrade`, `adopted`) row) lifts the failure and says
+/// "upgrading to <ver>", and the carry-on it ends on adds nothing. NEGATIVE CONTROL: the same rows
+/// said as `carry-on` say `restarting`. MUTANT: a hook that writes every row as `carry-on` fails
+/// the upgrade's case.
+#[test]
+fn the_loops_resume_hook_writes_each_row_under_its_resumes_kind() {
+    for (kind, words) in [
+        ("upgrade", "upgrading%20to%202.2.0"),
+        ("carry-on", "restarting"),
+    ] {
+        let tab = HostedLog::relaunched_claude();
+        assert_eq!(tab.need(), Some("failure"), "PRECONDITION: {kind}");
+        tab.ms.store(800, Ordering::SeqCst);
+        let sid = tab.sid();
+        let report = |step: &str| upgrade_drive::Report {
+            pid: 4242,
+            tab: sid.clone(),
+            session: "c0ffee".to_string(),
+            from: "2.1.0".to_string(),
+            to: "2.2.0(npm)".to_string(),
+            step: step.to_string(),
+        };
+        let step = resume_rows(&sid, &*live_row(tab.store.clone()), |said| {
+            said(kind, &report("adopted"));
+            let carried = report(relaunch::CARRIED_DONE);
+            said("carry-on", &carried);
+            carried
+        });
+        assert_eq!(step, relaunch::CARRIED_DONE, "{kind}: the step it ends on");
+        assert_eq!(
+            tab.acts_and_seen(),
+            [relaunch_act_line(kind), HARNESS_SEEN.to_string()],
+            "{kind}: the adoption's act and seen, the carry-on's nothing"
+        );
+        assert_eq!(tab.need(), None, "{kind}: the adoption lifted it");
+        assert_eq!(tab.labels(), [harness_label_line(words)], "{kind}");
     }
 }
 
@@ -33915,6 +35126,7 @@ fn an_unnamed_conversation_is_read_again_at_a_look_not_at_once() {
             settle_later: AtomicBool::default(),
             told: AtomicU8::new(0),
             repo_probe: Default::default(),
+            group: Arc::default(),
             activations: Arc::default(),
         };
         idle.kept.lock().unwrap().snapshot = Some(Snapshot {
@@ -34131,6 +35343,7 @@ fn idle_of(hooks: Hooks, agent: Program, session: Option<String>) -> WorkerIdle 
         settle_later: AtomicBool::default(),
         told: AtomicU8::new(0),
         repo_probe: Default::default(),
+        group: Arc::default(),
         activations: Arc::default(),
     };
     idle.kept.lock().unwrap().snapshot = Some(Snapshot {
@@ -34149,20 +35362,34 @@ struct GatedRead {
 }
 
 impl GatedRead {
+    /// A read begins, and is held until the test lets it go.
+    fn pass(&self) {
+        self.began.fetch_add(1, Ordering::SeqCst);
+        let open = self.open.lock().unwrap();
+        let (open, _) = self
+            .opened
+            .wait_timeout_while(open, aterm_spec::wait::MUST_HAPPEN, |open| !*open)
+            .unwrap();
+        assert!(*open, "the read was never let go");
+    }
+
     fn act(self: &Arc<Self>, session: &'static str) -> Arc<SnapshotFn> {
         let held = Arc::clone(self);
         Arc::new(move |sid| {
-            held.began.fetch_add(1, Ordering::SeqCst);
-            let open = held.open.lock().unwrap();
-            let (open, _) = held
-                .opened
-                .wait_timeout_while(open, aterm_spec::wait::MUST_HAPPEN, |open| !*open)
-                .unwrap();
-            assert!(*open, "the read was never let go");
+            held.pass();
             Some(Snapshot {
                 session: Some(session.to_string()),
                 ..snap(sid)
             })
+        })
+    }
+
+    /// An upgrade read held like the snapshot's, answering what `says` holds as it is let go.
+    fn due(self: &Arc<Self>, says: &Arc<Mutex<Due>>) -> Arc<DueFn> {
+        let (held, says) = (Arc::clone(self), Arc::clone(says));
+        Arc::new(move |_| {
+            held.pass();
+            *says.lock().unwrap()
         })
     }
 
@@ -34264,6 +35491,320 @@ fn a_slow_relaunch_read_never_holds_the_idle_point() {
         idle.look_at.lock().unwrap().is_none(),
         "a named conversation is not looked at again"
     );
+}
+
+/// An agy worker whose upgrade read is held until the test lets it go, waited for `bound` at a point:
+/// the worker, the read, what it answers, how many upgrade steps ran, and whether a carry-on is owed.
+struct HeldDue {
+    idle: Arc<WorkerIdle>,
+    held: Arc<GatedRead>,
+    says: Arc<Mutex<Due>>,
+    steps: Arc<AtomicUsize>,
+    owes: Arc<AtomicBool>,
+}
+
+impl HeldDue {
+    fn new(bound: Duration) -> Self {
+        const NAMED: &str = "0badf00d-1111-2222-3333-444455556666";
+        let world = Arc::new(World::default());
+        let mut h = hooks(&world, parking_body(&world));
+        let held = Arc::new(GatedRead::default());
+        let says = Arc::new(Mutex::new(Due::Yes));
+        let steps = Arc::new(AtomicUsize::new(0));
+        let owes = Arc::new(AtomicBool::new(false));
+        let (s, o) = (Arc::clone(&steps), Arc::clone(&owes));
+        h.acts.due = held.due(&says);
+        h.acts.due_read = bound;
+        h.acts.step = Arc::new(move |_, _, _| {
+            s.fetch_add(1, Ordering::SeqCst);
+            "wait:failed".to_string()
+        });
+        h.acts.owed = Arc::new(move |_, _| o.load(Ordering::SeqCst));
+        h.acts.resume = Arc::new(|_, _, _| "continued".to_string());
+        let idle = Arc::new(idle_of(h, Program::Agy, Some(NAMED.to_string())));
+        Self {
+            idle,
+            held,
+            says,
+            steps,
+            owes,
+        }
+    }
+
+    fn at(&self) -> Option<String> {
+        self.idle.at_idle_on(IdlePoint::default()).map(|s| s.line)
+    }
+
+    fn out(&self) -> Option<Arc<PointRead>> {
+        with_kept_of(&self.idle.kept, |k| k.due.out.clone())
+    }
+
+    fn landed(&self) -> bool {
+        with_kept_of(&self.idle.kept, |k| k.due.landed.is_some())
+    }
+
+    /// How many reads began, and how many upgrade steps ran.
+    fn counts(&self) -> (usize, usize) {
+        (
+            self.held.began.load(Ordering::SeqCst),
+            self.steps.load(Ordering::SeqCst),
+        )
+    }
+
+    /// A carry-on at a point, a worker's attach on the session's `Kept`, or the upgrade's own step.
+    fn step(&self, step: &str) {
+        match step {
+            "a carry-on" => {
+                self.owes.store(true, Ordering::SeqCst);
+                let carried = Some("carry-on step=continued".to_string());
+                assert_eq!(self.at(), carried, "a point carries the relaunch owed");
+                self.owes.store(false, Ordering::SeqCst);
+            }
+            "a worker's attach" => {
+                let mut quiet = on();
+                quiet.set("upgrade", "false").unwrap();
+                let attaching = WorkerJob {
+                    kept: Arc::clone(&self.idle.kept),
+                    ..left_job(&self.idle.sid, Program::Agy, &quiet)
+                };
+                attach(&attaching, &self.idle.hooks);
+            }
+            _ => self.idle.act(|| ()),
+        }
+    }
+}
+
+const STEPS_THAT_MOVE: [&str; 3] = ["a carry-on", "the upgrade's step", "a worker's attach"];
+
+#[test]
+fn a_slow_upgrade_read_never_holds_the_idle_point() {
+    let unread = Some(format!("upgrade step=wait:{UNREAD_OUT}"));
+    let stepped = Some("upgrade step=wait:failed".to_string());
+
+    let p = Arc::new(HeldDue::new(Duration::ZERO));
+    let (idle, held, says) = (&p.idle, &p.held, &p.says);
+    let first = std::thread::spawn({
+        let p = Arc::clone(&p);
+        move || p.at()
+    });
+    until("the point goes on while its upgrade read is held", || {
+        first.is_finished()
+    });
+    assert_eq!(
+        first.join().unwrap(),
+        unread,
+        "the upgrade is unread while its read is out"
+    );
+    assert!(
+        idle.look_at.lock().unwrap().is_some(),
+        "an unread upgrade is looked at again"
+    );
+    assert!(p.out().is_some());
+    assert_eq!(p.at(), unread);
+    held.let_go();
+    until("the read lands", || p.landed());
+    until("no read is out", || p.out().is_none());
+    assert_eq!(
+        p.counts(),
+        (1, 0),
+        "the second point waited on the read out, and started none"
+    );
+    assert_eq!(p.at(), stepped, "the next point takes the read that landed");
+    assert_eq!(p.counts(), (1, 1), "and reads nothing again");
+
+    for (n, step) in (2..).zip(STEPS_THAT_MOVE) {
+        held.hold();
+        assert_eq!(p.at(), unread);
+        until("its read began", || p.counts().0 == n);
+        let read = p.out().expect("the read is out");
+        p.step(step);
+        held.let_go();
+        assert!(read.wait(aterm_spec::wait::MUST_HAPPEN), "the read ends");
+        assert!(!p.landed(), "a read begun before {step} never lands");
+    }
+    *says.lock().unwrap() = Due::No;
+    held.hold();
+    assert_eq!(p.at(), unread, "the next point reads again");
+    held.let_go();
+    until("the newer read lands", || p.landed());
+    assert_eq!(p.at(), None, "the newer answer decides");
+    assert_eq!(p.counts(), (5, 1));
+
+    let old = Instant::now().checked_sub(DUE_KEPT_FOR + Duration::from_secs(1));
+    with_kept_of(&idle.kept, |k| k.due.landed = old.map(|at| (Due::Yes, at)));
+    held.hold();
+    assert_eq!(p.at(), unread, "an answer kept past its time is read again");
+    held.let_go();
+    until("that read ends", || p.out().is_none());
+    assert_eq!(p.counts(), (6, 1));
+
+    let control = Arc::new(HeldDue::new(aterm_spec::wait::MUST_HAPPEN));
+    let waits = std::thread::spawn({
+        let control = Arc::clone(&control);
+        move || control.at()
+    });
+    until("the read began", || control.counts().0 == 1);
+    assert!(!waits.is_finished(), "the control waits its read out");
+    control.held.let_go();
+    assert_eq!(
+        waits.join().unwrap(),
+        stepped,
+        "the control's point steps on its own read"
+    );
+    assert_eq!(control.counts(), (1, 1));
+}
+
+#[test]
+fn an_upgrade_answer_a_step_outdated_is_neither_taken_nor_waited_on() {
+    let unread = Some(format!("upgrade step=wait:{UNREAD_OUT}"));
+    let stepped = Some("upgrade step=wait:failed".to_string());
+    let p = HeldDue::new(Duration::ZERO);
+    let held = &p.held;
+
+    for step in STEPS_THAT_MOVE {
+        held.hold();
+        assert_eq!(p.at(), unread);
+        held.let_go();
+        until("the read lands", || p.landed());
+        until("the read is over", || p.out().is_none());
+        p.step(step);
+        assert!(!p.landed(), "{step} drops the answer that landed before it");
+    }
+    held.hold();
+    assert_eq!(p.at(), unread, "the point after them reads again");
+    p.idle.act(|| {
+        held.let_go();
+        until("the read lands while the step runs", || p.landed());
+    });
+    assert!(!p.landed(), "the step's end drops what landed while it ran");
+    assert_eq!(p.counts(), (4, 0), "no point took an outdated answer");
+
+    held.hold();
+    assert_eq!(p.at(), unread);
+    let before = p.out().expect("the read is out");
+    p.idle.act(|| ());
+    assert_eq!(p.at(), unread);
+    let after = p
+        .out()
+        .expect("the point after the step started its own read");
+    assert!(
+        !Arc::ptr_eq(&before, &after),
+        "the point after a step waits on no read begun before it"
+    );
+    until("both reads began", || p.counts().0 == 6);
+    held.let_go();
+    assert!(before.wait(aterm_spec::wait::MUST_HAPPEN));
+    until("the read begun after the step lands", || p.landed());
+    assert_eq!(p.at(), stepped, "and decides the next point");
+    assert_eq!(p.counts(), (6, 1));
+
+    let late = UNREAD_LOOK[UNREAD_LOOK.len() - 1] + POINT_READ_BOUND + Duration::from_secs(5);
+    let late = Instant::now()
+        .checked_sub(late)
+        .expect("the machine has been up for a look");
+    with_kept_of(&p.idle.kept, |k| k.due.landed = Some((Due::Yes, late)));
+    held.hold();
+    assert_eq!(
+        p.at(),
+        stepped,
+        "an answer the longest look comes late to is still taken"
+    );
+    held.let_go();
+    assert_eq!(p.counts(), (6, 2));
+
+    let voided = Arc::new(HeldDue::new(aterm_spec::wait::MUST_HAPPEN));
+    let waits = std::thread::spawn({
+        let voided = Arc::clone(&voided);
+        move || voided.at()
+    });
+    until("the read began", || voided.counts().0 == 1);
+    due_moved(&voided.idle.kept);
+    voided.held.let_go();
+    assert_eq!(
+        waits.join().unwrap(),
+        Some(format!("upgrade step=wait:{UNREAD_VOID}")),
+        "a read a step voided while its point waited leaves the upgrade unread"
+    );
+    assert!(
+        voided.idle.look_at.lock().unwrap().is_some(),
+        "and looked at again"
+    );
+    assert_eq!(voided.counts(), (1, 0));
+}
+
+/// An old no-upgrade answer must not consume a newer activation's only look. The held read
+/// captures No before the activation, and the next read sees Yes. Another agent's activation
+/// is the negative control: it leaves this agent's old answer applicable.
+#[test]
+fn a_package_activation_invalidates_an_older_upgrade_answer() {
+    for activation in ["all", "own", "other"] {
+        let world = Arc::new(World::default());
+        let mut h = hooks(&world, parking_body(&world));
+        let held = Arc::new(GatedRead::default());
+        let reads = Arc::new(AtomicUsize::new(0));
+        let steps = Arc::new(AtomicUsize::new(0));
+        let (gate, calls) = (Arc::clone(&held), Arc::clone(&reads));
+        h.acts.due = Arc::new(move |_| {
+            let due = if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Due::No
+            } else {
+                Due::Yes
+            };
+            gate.pass();
+            due
+        });
+        h.acts.due_read = Duration::ZERO;
+        let took = Arc::clone(&steps);
+        h.acts.step = Arc::new(move |_, _, _| {
+            took.fetch_add(1, Ordering::SeqCst);
+            "wait:failed".to_string()
+        });
+        let idle = idle_of(
+            h,
+            Program::Agy,
+            Some("0badf00d-1111-2222-3333-444455556666".to_string()),
+        );
+        let at = || idle.at_idle_on(IdlePoint::default()).map(|s| s.line);
+        let unread = Some(format!("upgrade step=wait:{UNREAD_OUT}"));
+        assert_eq!(at(), unread, "{activation}: the old read is held");
+        until("the old read captured its answer", || {
+            held.began.load(Ordering::SeqCst) == 1
+        });
+        match activation {
+            "all" => idle.activations.note(),
+            "own" => idle.activations.note_of(Program::Agy),
+            _ => idle.activations.note_of(Program::Muse),
+        }
+        held.let_go();
+        until("the old answer landed", || {
+            with_kept_of(&idle.kept, |k| {
+                k.due.out.is_none() && k.due.landed.is_some()
+            })
+        });
+        let mut answer = at();
+        if activation == "other" {
+            assert_eq!(answer, None, "another agent's activation changes nothing");
+            assert_eq!(reads.load(Ordering::SeqCst), 1);
+            assert_eq!(steps.load(Ordering::SeqCst), 0);
+            continue;
+        }
+        assert!(answer.is_some(), "{activation}: old No never ends the look");
+        if answer == unread {
+            until("the new activation's read lands", || {
+                with_kept_of(&idle.kept, |k| {
+                    k.due.out.is_none() && k.due.landed.is_some()
+                })
+            });
+            answer = at();
+        }
+        assert_eq!(
+            answer,
+            Some("upgrade step=wait:failed".to_string()),
+            "{activation}: the activation gets its own answer"
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 2, "{activation}");
+        assert_eq!(steps.load(Ordering::SeqCst), 1, "{activation}");
+    }
 }
 
 #[test]
@@ -35487,6 +37028,7 @@ fn a_full_disk_withholds_continuations_and_space_back_types_the_resume_once() {
         settle_later: AtomicBool::default(),
         told: AtomicU8::new(0),
         repo_probe: Default::default(),
+        group: Arc::default(),
         activations: Arc::default(),
     };
     let full = idle("s-disk-full");
@@ -37086,24 +38628,28 @@ fn the_sweep_counts_the_bytes_of_what_it_swept() {
 
     // A stage a removal could not finish counts the bytes of it that went, never what it was
     // sized at before.
-    let stayed = Unused::Stayed {
-        stayed: 1,
-        freed: 6 << 30,
-    };
-    let swept = [(stage, stayed)];
-    let (freed, went) = disk_swept(&swept, &sized);
-    assert_eq!(freed, 6 << 30);
-    assert!(
-        went[0].ends_with(&format!(
-            "({})",
-            aterm_agent::harness::disk::sweep_reason(stayed)
-        )),
-        "{went:?}"
-    );
-    assert_eq!(
-        disk_sweep_removals(&swept, &sized),
-        [(6 << 30, crate::disk_board::BUILD_CACHES)]
-    );
+    for stayed in [
+        Unused::Stayed {
+            stayed: 1,
+            freed: 6 << 30,
+        },
+        Unused::Revoked { freed: 6 << 30 },
+    ] {
+        let swept = [(stage.clone(), stayed)];
+        let (freed, went) = disk_swept(&swept, &sized);
+        assert_eq!(freed, 6 << 30);
+        assert!(
+            went[0].ends_with(&format!(
+                "({})",
+                aterm_agent::harness::disk::sweep_reason(stayed)
+            )),
+            "{went:?}"
+        );
+        assert_eq!(
+            disk_sweep_removals(&swept, &sized),
+            [(6 << 30, crate::disk_board::BUILD_CACHES)]
+        );
+    }
 }
 
 #[test]
@@ -37284,6 +38830,101 @@ fn the_sweep_journals_a_finished_stage_and_counts_it() {
     );
 }
 
+/// An intent of the no-session sweep that closes with nothing gone is on record as `kept`, never
+/// `removed`: a stage an earlier pass left, its intent journalled, that a process comes to use
+/// before its removal (the fence asked again once the intent is on record) is returned refused as
+/// that stage (`Unused::Refused`, `Refusal::Staged`), journalled `kept` with 0 bytes after its
+/// `removing` row, and is neither a line of what went nor a removal of today's tally; the stage
+/// stays whole. NEGATIVE CONTROL: the same pass with no process coming takes it, journalled
+/// `removed` and counted.
+#[cfg(unix)]
+#[test]
+fn the_sweep_journals_an_intent_closed_with_nothing_gone_as_kept() {
+    use aterm_agent::harness::disk::SweepAction;
+    use atpkg::build_cache::{Refusal, Unused};
+    let tmp = aterm_tempfile::Builder::new()
+        .prefix("aterm-sweep-kept-")
+        .tempdir()
+        .expect("temp dir");
+    let root = tmp.path().join("cache");
+    let stage = root.join("Users/x/gone/.cargo-build.removing");
+    std::fs::create_dir_all(stage.join("debug")).unwrap();
+    std::fs::write(stage.join("debug/x"), vec![7u8; 4096]).unwrap();
+    let board = Shelf::new();
+    let probes = std::cell::Cell::new(0_u32);
+    let comes = std::cell::Cell::new(true);
+    let processes = |_: &[PathBuf], _: &[u32]| {
+        probes.set(probes.get() + 1);
+        let users = (comes.get() && probes.get() > 1)
+            .then(|| aterm_uds::holders::PathUse {
+                pid: 41,
+                how: "cwd",
+                path: PathBuf::from("/c/x"),
+            })
+            .into_iter()
+            .collect();
+        Ok(aterm_uds::holders::PathScan {
+            users,
+            ..aterm_uds::holders::PathScan::default()
+        })
+    };
+    let sweep = |state: &Path| {
+        probes.set(0);
+        disk_sweep_journalled(state, 1_790_000_000, &board, |record| {
+            atpkg::build_cache::reclaim_watched_with_processes(
+                &root,
+                None,
+                std::time::SystemTime::now(),
+                atpkg::build_cache::RECLAIM_GONE_UNDER_PRESSURE,
+                None,
+                record,
+                &processes,
+            )
+        })
+    };
+    let actions = |state: &Path| -> Vec<(Option<SweepAction>, u64)> {
+        std::fs::read_to_string(state.join(aterm_agent::harness::cli::DISK_LEDGER))
+            .expect("the ledger")
+            .lines()
+            .map(|l| {
+                let v: aterm_json::Value = aterm_json::from_str(l).expect("a row");
+                (
+                    v["action"].as_str().and_then(SweepAction::parse),
+                    v["bytes"].as_u64().unwrap_or(u64::MAX),
+                )
+            })
+            .collect()
+    };
+
+    let kept = tmp.path().join("kept");
+    let done = sweep(&kept);
+    let refused = Unused::Refused {
+        by: Refusal::Staged,
+    };
+    assert_eq!(done.swept, vec![(stage.clone(), refused)]);
+    assert!(stage.join("debug/x").is_file(), "kept whole");
+    let journalled = actions(&kept);
+    assert_eq!(journalled.len(), 2, "{journalled:?}");
+    assert_eq!(journalled[0].0, Some(SweepAction::Removing));
+    assert_eq!(journalled[1], (Some(SweepAction::Kept), 0));
+    let (freed, went) = disk_swept(&done.swept, &done.sized);
+    assert_eq!((freed, went.len()), (0, 0));
+    assert!(disk_sweep_removals(&done.swept, &done.sized).is_empty());
+    assert_eq!(disk_kept_lines(&done.swept).len(), 1);
+    assert_eq!(board.board_lock().freed.aterm_bytes, 0);
+
+    comes.set(false);
+    let state = tmp.path().join("state");
+    let done = sweep(&state);
+    assert_eq!(done.swept, vec![(stage.clone(), Unused::Unfinished)]);
+    let journalled = actions(&state);
+    assert_eq!(journalled.len(), 2, "{journalled:?}");
+    assert_eq!(journalled[1].0, Some(SweepAction::Removed));
+    assert!(!stage.exists());
+    assert!(board.board_lock().freed.aterm_bytes >= 4096);
+    assert!(disk_kept_lines(&done.swept).is_empty());
+}
+
 /// The hosted loop presents the harness's in-memory token, so what it types and marks reads
 /// `by=harness`.
 #[cfg(unix)]
@@ -37343,62 +38984,84 @@ fn the_hosted_loop_presents_the_in_memory_token_and_falls_back_beside() {
 }
 
 /// The window's disk resume types through the harness's in-memory token, probed with `version`,
-/// so its carry-on reads `by=harness` ([`live_acts`]' `disk_resume`).
+/// so its carry-on reads `by=harness` ([`live_acts`]' `disk_resume`). A complete authority read
+/// reaches the held hand; unknown or externally owned turn-end authority reaches no write.
 #[cfg(unix)]
 #[test]
 fn the_windows_disk_resume_presents_the_in_memory_token() {
     use std::io::{BufRead, BufReader};
     let harness = crate::control_auth::harness_token().expect("entropy");
-    let dir_guard = crate::test_scratch::short_dir("the disk resume's socket");
-    let dir = dir_guard.path().to_path_buf();
-    let sock = dir.join("a.sock");
-    let names = aterm_types::control_socket::token_names_for_sock("a.sock");
-    std::fs::write(dir.join(&names[0]), "beside\n").unwrap();
-    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
-    let path = sock.to_string_lossy().into_owned();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut seen: Vec<(String, String)> = Vec::new();
-        let Ok((stream, _)) = listener.accept() else {
-            return;
-        };
-        let mut w = stream.try_clone().unwrap();
-        let mut r = BufReader::new(stream);
-        let mut auth = String::new();
-        let _ = r.read_line(&mut auth);
-        let token = auth.trim_end().trim_start_matches("AUTH ").to_string();
-        loop {
-            let mut line = String::new();
-            if r.read_line(&mut line).unwrap_or(0) == 0 {
-                break;
-            }
-            let line = line.trim_end().to_string();
-            let reply: &[u8] = if line.contains(" lease acquire ") {
-                b"ERR busy\n"
-            } else {
-                b"OK\n"
+    for (authority, expected_step, takes_hand) in [
+        (
+            "OK supervisor=- supervisor_contract=- supervisor_scope=- supervisor_revision=41\n",
+            "wait:held",
+            true,
+        ),
+        ("OK\n", "wait:supervisor-input", false),
+        (
+            "OK supervisor=grok-alab@42 supervisor_contract=3 supervisor_scope=turn-end supervisor_revision=41\n",
+            "wait:supervisor-input",
+            false,
+        ),
+    ] {
+        let dir_guard = crate::test_scratch::short_dir("the disk resume's socket");
+        let dir = dir_guard.path().to_path_buf();
+        let sock = dir.join("a.sock");
+        let names = aterm_types::control_socket::token_names_for_sock("a.sock");
+        std::fs::write(dir.join(&names[0]), "beside\n").unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let path = sock.to_string_lossy().into_owned();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut seen: Vec<(String, String)> = Vec::new();
+            let Ok((stream, _)) = listener.accept() else {
+                return;
             };
-            seen.push((token.clone(), line));
-            let _ = w.write_all(reply);
-        }
-        let _ = tx.send(seen);
-    });
-    let acts = live_acts(crate::session_store::new_store(), path);
-    assert_eq!((acts.disk_resume)("s-d", "carry on"), "wait:held");
-    drop(acts);
-    let seen = rx
-        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
-        .expect("the resume's one connection ended");
-    assert_eq!(
-        seen,
-        vec![
+            let mut w = stream.try_clone().unwrap();
+            let mut r = BufReader::new(stream);
+            let mut auth = String::new();
+            let _ = r.read_line(&mut auth);
+            let token = auth.trim_end().trim_start_matches("AUTH ").to_string();
+            loop {
+                let mut line = String::new();
+                if r.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                let line = line.trim_end().to_string();
+                let reply: &[u8] = if line.contains(" lease acquire ") {
+                    b"ERR busy\n"
+                } else if line == "@s-d status" {
+                    authority.as_bytes()
+                } else {
+                    b"OK\n"
+                };
+                seen.push((token.clone(), line));
+                let _ = w.write_all(reply);
+            }
+            let _ = tx.send(seen);
+        });
+        let acts = live_acts(crate::session_store::new_store(), path);
+        assert_eq!(
+            (acts.disk_resume)("s-d", "carry on"),
+            expected_step,
+            "{authority}"
+        );
+        drop(acts);
+        let seen = rx
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("the resume's one connection ended");
+        let mut expected = vec![
             (harness.to_string(), "version".to_string()),
-            (
+            (harness.to_string(), "@s-d status".to_string()),
+        ];
+        if takes_hand {
+            expected.push((
                 harness.to_string(),
-                format!("@s-d {}", upgrade_drive::hand_take_request())
-            ),
-        ]
-    );
+                format!("@s-d {}", upgrade_drive::hand_take_request()),
+            ));
+        }
+        assert_eq!(seen, expected, "{authority}");
+    }
 }
 
 /// The window's sweeps (the lanes' acts, [`live_acts`], and the owner's view,
@@ -38228,7 +39891,8 @@ fn a_muse_code_is_told_its_own_resume_line_behind_its_homes() {
     assert_eq!(
         resume_told(&muse(Some(uuid))),
         Some(format!(
-            "XDG_DATA_HOME=/u/s/.local/share XDG_CONFIG_HOME='/u/s/my config' muse resume {uuid}"
+            "XDG_DATA_HOME=/u/s/.local/share XDG_CONFIG_HOME='/u/s/my config' muse \
+             --contributor-mode off resume {uuid}"
         ))
     );
     assert_eq!(resume_told(&muse(None)), None, "no session proven");
@@ -38314,6 +39978,7 @@ fn a_codex_is_told_no_resume_line_and_claude_codes_is_unchanged() {
             settle_later: AtomicBool::new(false),
             told: AtomicU8::new(0),
             repo_probe: Default::default(),
+            group: Arc::default(),
         };
         idle.kept.lock().unwrap().snapshot = kept;
         idle.resume_command()
@@ -39214,6 +40879,14 @@ fn account_move_claims_target_before_restarting_and_refuses_when_held_elsewhere(
     let step = claims::with_table(table.clone(), || {
         idle.restart(&move_to("work-2", AccountAt::Wall))
     });
+    if cfg!(not(unix)) {
+        // Off Unix no owner-only claim activity can be kept (`claims_activity::Held::take`), so
+        // the claim is unrecorded and the move onto a row this home never held is refused, with
+        // no claim row written: the rest is Unix's.
+        assert_eq!(step.as_deref(), Some("wait:account-changed"));
+        assert!(table.rows.lock().unwrap().is_empty(), "no claim row");
+        return;
+    }
     assert_eq!(step.as_deref(), Some("adopted"));
     let work2 = LeaseKey::new("claude", "work2@example.test").unwrap();
     let row = table
@@ -39266,5 +40939,476 @@ fn account_move_claims_target_before_restarting_and_refuses_when_held_elsewhere(
         moves(&idle.account(usage_wall())),
         Some("pool-a"),
         "settled lease on work-2 steers the next advice to pool-a"
+    );
+}
+
+/// Where the stand-in of [`a_terminating_signal_gives_up_the_windows_claims_then_ends_it_by_it`]
+/// writes its `off`'s marker.
+#[cfg(unix)]
+const WINDOW_OFF_MARKER: &str = "ATERM_TEST_WINDOW_CLAIMS_OFF_MARKER";
+
+/// The stand-in's `off`: a marker that it ran.
+#[cfg(unix)]
+fn window_off_marks() {
+    if let Some(marker) = std::env::var_os(WINDOW_OFF_MARKER) {
+        std::fs::write(marker, b"off").expect("the off marker");
+    }
+}
+
+/// A TERMINATING SIGNAL TO A WINDOW GIVES UP ITS CLAIMS, THEN ENDS IT BY THAT SIGNAL
+/// (docs/DESIGN-fluid-swarm-2026-10-28.md F19): armed as a windowed instance arms it
+/// ([`arm_claims_off_as_the_window_dies`]), a SIGTERM (a shut down or restart with no quit Apple
+/// event, a `launchctl bootout` logout, any on Linux) runs the window's `off` and the process then
+/// dies of that SIGTERM as it did before. A stand-in process of this test is the window, its `off`
+/// a marker.
+///
+/// NEGATIVE CONTROL: drop the stand-in's `arm_claims_off_as_the_window_dies` call (the window
+/// unarmed, as before), and it dies of its SIGTERM with no marker.
+#[cfg(unix)]
+#[test]
+fn a_terminating_signal_gives_up_the_windows_claims_then_ends_it_by_it() {
+    use std::os::unix::process::ExitStatusExt as _;
+    if std::env::var_os(WINDOW_OFF_MARKER).is_some() {
+        arm_claims_off_as_the_window_dies(window_off_marks);
+        let pid = libc::pid_t::try_from(std::process::id()).expect("a pid fits pid_t");
+        // SAFETY: a signal to this stand-in process itself.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+        // A hang detector: the signal ends this process first.
+        std::thread::sleep(aterm_spec::wait::MUST_HAPPEN);
+        panic!("the SIGTERM did not end the window's stand-in");
+    }
+    let scratch = aterm_tempfile::tempdir().expect("scratch");
+    let marker = scratch.path().join("off");
+    let mut stand_in = crate::test_alone::StandIn::this_test();
+    stand_in.command().env(WINDOW_OFF_MARKER, &marker);
+    let ran = stand_in.spawn().selected();
+    let status = ran.status.expect("the stand-in exited");
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGTERM),
+        "the window did not die of its SIGTERM ({status})\n{}",
+        ran.stderr
+    );
+    assert!(
+        marker.exists(),
+        "the window died of its SIGTERM with its claims standing\n{}",
+        ran.stderr
+    );
+}
+
+/// The work records a test worker put, each with the group it was put for ([`work_worker`]).
+type WorkPuts = Arc<Mutex<Vec<(i32, Option<aterm_agent::harness::work_record::WorkRecord>)>>>;
+
+/// A worker over `board` whose work record reads are counted, each a record of branch `feat`
+/// whose `read_ms` is the read's number, and whose puts are kept; its agent's group is 4242.
+/// Where `held` is given, each read waits for a word on it first. A read whose hold on new
+/// starts reads on, as the real reader's does before each git it starts, is unread and counts
+/// none.
+fn work_worker(
+    sid: &str,
+    board: &'static Mutex<crate::program_check_watch::Board>,
+    held: Option<std::sync::mpsc::Receiver<()>>,
+) -> (WorkerIdle, Arc<AtomicUsize>, WorkPuts) {
+    use aterm_agent::harness::work_record::{WorkRead, WorkRecord};
+    let reads = Arc::new(AtomicUsize::new(0));
+    let puts: WorkPuts = Arc::default();
+    let (counted, kept) = (Arc::clone(&reads), Arc::clone(&puts));
+    let held = Mutex::new(held);
+    let mut hooks = hooks(
+        &Arc::new(World::default()),
+        Arc::new(|_: &WorkerJob| BodyEnd::Stopped),
+    );
+    hooks.acts = Acts {
+        program_check: board,
+        work_read: Arc::new(move |_, _, _, starts_held: &dyn Fn() -> bool| {
+            if let Some(held) = held.lock().unwrap().as_ref() {
+                let _ = held.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+            }
+            if starts_held() {
+                return WorkRead::Unread;
+            }
+            let n = counted.fetch_add(1, Ordering::SeqCst) + 1;
+            WorkRead::Read(Box::new(WorkRecord {
+                branch: Some("feat".into()),
+                read_ms: u64::try_from(n).unwrap_or(u64::MAX),
+                ..WorkRecord::default()
+            }))
+        }),
+        work_put: Arc::new(move |_, group, record| kept.lock().unwrap().push((group, record))),
+        ..Acts::inert()
+    };
+    let worker = idle_host(sid, Program::Claude, switched(&on()), hooks);
+    worker.group.store(4242, Ordering::SeqCst);
+    (worker, reads, puts)
+}
+
+/// Wait, as a one-minute hang detector, for `worker`'s work record read to end.
+fn work_read_over(worker: &WorkerIdle) {
+    until("the work record read ended", || {
+        !with_kept_of(&worker.kept, |k| k.work.reading)
+    });
+}
+
+/// A board that macOS's program check, read live, leaves answering.
+fn answering_board() -> &'static Mutex<crate::program_check_watch::Board> {
+    let board: &'static Mutex<crate::program_check_watch::Board> = Box::leak(Box::new(Mutex::new(
+        crate::program_check_watch::Board::new(),
+    )));
+    program_check_reads(board, 0, false);
+    board
+}
+
+/// One reading of `board` at `at_ms`, through the stand-in `program-check full` (`full`) or
+/// `live` sets: a healthy pool, held at its limit while full.
+fn program_check_reads(board: &Mutex<crate::program_check_watch::Board>, at_ms: u64, full: bool) {
+    use aterm_uds::program_check::Look;
+    use aterm_vitals::program_check::{Daemon, Reading};
+    let healthy = Look::Read(Reading {
+        daemon: Daemon {
+            pid: 690,
+            start_s: 1_791_000_000,
+            start_us: 1,
+        },
+        workers: 2,
+        at_limit: false,
+        limit: Some(90),
+    });
+    let _ = crate::program_check_watch::step(
+        &mut board.lock().unwrap(),
+        at_ms,
+        crate::program_check_watch::stood_in(healthy, full),
+    );
+}
+
+/// NO GIT STARTS WHILE THE CHECK IS FULL: a worker with a record, its board then driven full by
+/// `program-check full`'s stand-in, starts no read at a turn break 30 s later (its read hook is
+/// never called, nothing is put, so the record shown keeps its `read_ms` and its age grows), nor
+/// once the board reads stuck; a read made while the board answered and run after it went full
+/// starts no git either. NEGATIVE CONTROL: with the board answering again, as `program-check
+/// live` leaves it, the next turn break reads, and the record put is a new one.
+#[test]
+fn no_git_starts_while_the_check_is_full() {
+    use aterm_vitals::program_check::STUCK_AFTER_MS;
+    const MIN: u64 = 60_000;
+    let board = answering_board();
+    let (worker, reads, puts) = work_worker("s-work-full", board, None);
+    let t0 = Instant::now();
+    worker.work_look(WorkLook::Busy, t0);
+    work_read_over(&worker);
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "the first look's read");
+    program_check_reads(board, MIN, true);
+    assert!(crate::program_check_watch::starts_held(board), "full");
+    let scheduled = || with_kept_of(&worker.kept, |k| k.work.started);
+    worker.work_look(WorkLook::Break, t0 + Duration::from_secs(30));
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "no git while the check is full"
+    );
+    assert_eq!(
+        scheduled(),
+        Some(t0),
+        "no read scheduled while the check is full"
+    );
+    program_check_reads(board, MIN + STUCK_AFTER_MS, true);
+    worker.work_look(WorkLook::Break, t0 + Duration::from_secs(60));
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "no git while the check is stuck"
+    );
+    assert_eq!(scheduled(), Some(t0), "no read scheduled while it is stuck");
+    assert_eq!(
+        puts.lock()
+            .unwrap()
+            .iter()
+            .map(|(_, r)| r.as_ref().map(|r| r.read_ms))
+            .collect::<Vec<_>>(),
+        [Some(1)],
+        "the record shown is the first read's"
+    );
+
+    let late = answering_board();
+    let (racing, raced, _) = work_worker("s-work-late", late, None);
+    let reader = racing.work_reader();
+    program_check_reads(late, MIN, true);
+    assert_eq!(
+        reader(),
+        aterm_agent::harness::work_record::WorkRead::Unread,
+        "a read the check went full under"
+    );
+    assert_eq!(raced.load(Ordering::SeqCst), 0, "it starts no git");
+
+    program_check_reads(board, 2 * MIN + STUCK_AFTER_MS, false);
+    worker.work_look(WorkLook::Break, t0 + Duration::from_secs(90));
+    work_read_over(&worker);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "CONTROL: answering again, the turn break reads"
+    );
+    assert_eq!(
+        puts.lock()
+            .unwrap()
+            .last()
+            .and_then(|(g, r)| r.as_ref().map(|r| (*g, r.read_ms))),
+        Some((4242, 2)),
+        "CONTROL: a new record, for the agent's group"
+    );
+}
+
+/// A RECORD IS READ AT THE FIRST LOOK AND THEN AT MOST EVERY 20 S, over injected instants: a
+/// session's first busy look reads; a second busy look does not, nor a turn break 10 s after the
+/// read; a turn break 20 s after it does; a busy look never reads again; and while a read is
+/// under way no other starts, however late the turn break. NEGATIVE CONTROL: the turn break 20 s
+/// on reads, and so does one a floor after a read held past it.
+#[test]
+fn a_record_is_read_at_the_first_look_and_then_at_most_every_20_s() {
+    let (worker, reads, _) = work_worker("s-work-floor", answering_board(), None);
+    let t0 = Instant::now();
+    let read = |look, at: Duration, want: usize, what: &str| {
+        worker.work_look(look, t0 + at);
+        work_read_over(&worker);
+        assert_eq!(reads.load(Ordering::SeqCst), want, "{what}");
+    };
+    read(WorkLook::Busy, Duration::ZERO, 1, "the first look reads");
+    read(
+        WorkLook::Busy,
+        Duration::from_secs(1),
+        1,
+        "a second busy look",
+    );
+    read(
+        WorkLook::Break,
+        Duration::from_secs(10),
+        1,
+        "a turn break 10 s on",
+    );
+    read(
+        WorkLook::Break,
+        Duration::from_secs(20),
+        2,
+        "CONTROL: a turn break 20 s on",
+    );
+    read(
+        WorkLook::Busy,
+        Duration::from_secs(60),
+        2,
+        "a busy look never again",
+    );
+
+    let (go, held) = std::sync::mpsc::channel();
+    let (slow, slow_reads, _) = work_worker("s-work-held", answering_board(), Some(held));
+    let t1 = Instant::now();
+    slow.work_look(WorkLook::Busy, t1);
+    slow.work_look(WorkLook::Break, t1 + Duration::from_secs(30));
+    assert!(
+        with_kept_of(&slow.kept, |k| k.work.started) == Some(t1),
+        "one read under way at a time"
+    );
+    go.send(()).expect("the held read waits");
+    work_read_over(&slow);
+    assert_eq!(slow_reads.load(Ordering::SeqCst), 1);
+    go.send(()).expect("the next read may go");
+    slow.work_look(WorkLook::Break, t1 + Duration::from_secs(60));
+    work_read_over(&slow);
+    assert_eq!(
+        slow_reads.load(Ordering::SeqCst),
+        2,
+        "CONTROL: a floor after the held read, a turn break reads"
+    );
+}
+
+/// THE RECORD CLEARS AT THE LANDING: the session's timeline drops its record at a landed face and
+/// takes none while that face stands, and its worker starts no read at a turn break after the
+/// landing, however late. NEGATIVE CONTROL: an open face keeps the record, and once the task
+/// opens again the next turn break reads and the record is taken.
+#[test]
+fn the_record_clears_at_the_landing() {
+    use aterm_agent::harness::acts::TaskFace;
+    use aterm_agent::harness::work_record::WorkRecord;
+    let record = || {
+        Some(WorkRecord {
+            branch: Some("feat".into()),
+            ..WorkRecord::default()
+        })
+    };
+    let mut tl = crate::session_timeline::SessionTimeline::default();
+    tl.note_foreground_group(4242);
+    assert!(tl.set_work(4242, record()));
+    tl.set_task_face(Some(TaskFace::Open), 1);
+    assert!(
+        tl.work().is_some(),
+        "CONTROL: an open face keeps the record"
+    );
+    tl.set_task_face(Some(TaskFace::Landed), 2);
+    assert_eq!(tl.work(), None, "the landing clears it");
+    assert!(
+        !tl.set_work(4242, record()),
+        "none is taken while it is landed"
+    );
+    assert_eq!(tl.work(), None);
+
+    let (worker, reads, _) = work_worker("s-work-landed", answering_board(), None);
+    let t0 = Instant::now();
+    worker.work_look(WorkLook::Busy, t0);
+    work_read_over(&worker);
+    worker.task_face(TaskFace::Landed);
+    worker.work_look(WorkLook::Break, t0 + Duration::from_secs(30));
+    worker.work_look(WorkLook::Break, t0 + Duration::from_secs(600));
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "no read after the landing");
+
+    worker.task_face(TaskFace::Open);
+    worker.work_look(WorkLook::Break, t0 + Duration::from_secs(630));
+    work_read_over(&worker);
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "CONTROL: the task open again, a turn break reads"
+    );
+    tl.set_task_face(Some(TaskFace::Open), 3);
+    assert!(
+        tl.set_work(4242, record()) && tl.work().is_some(),
+        "CONTROL: open again, a record is taken"
+    );
+}
+
+/// A LANDING RESTATED AT THE LOOP'S START HOLDS READS BACK TOO: a worker whose loop restates its
+/// task's face as landed ([`IdleHost::task_face_noted`]) starts no read at its first look.
+/// NEGATIVE CONTROL: restated open, the same look reads.
+#[test]
+fn a_landing_restated_at_the_start_holds_reads_back() {
+    use aterm_agent::harness::acts::TaskFace;
+    for (face, want) in [(TaskFace::Landed, 0), (TaskFace::Open, 1)] {
+        let (worker, reads, _) = work_worker("s-work-noted", answering_board(), None);
+        worker.task_face_noted(face, 1);
+        worker.work_look(WorkLook::Busy, Instant::now());
+        work_read_over(&worker);
+        assert_eq!(reads.load(Ordering::SeqCst), want, "restated {face:?}");
+    }
+}
+
+/// A NEW AGENT IN THE TAB READS AT ITS FIRST LOOK: what a session keeps of its reads is its
+/// agent's ([`WorkKept::of`]). After one agent read and its task landed, a worker for another
+/// agent in the same tab (another group, the tab's kept state) reads at its first busy look, and
+/// puts the record for its own group. NEGATIVE CONTROL: the landed agent's own worker starts no
+/// read at a busy look, nor at a turn break past the floor.
+#[test]
+fn a_new_agent_in_the_tab_reads_at_its_first_look() {
+    use aterm_agent::harness::acts::TaskFace;
+    let (first, reads, _) = work_worker("s-work-next", answering_board(), None);
+    let t0 = Instant::now();
+    first.work_look(WorkLook::Busy, t0);
+    work_read_over(&first);
+    first.task_face(TaskFace::Landed);
+    first.work_look(WorkLook::Busy, t0 + Duration::from_secs(1));
+    first.work_look(WorkLook::Break, t0 + Duration::from_secs(60));
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "CONTROL: the landed agent reads no more"
+    );
+
+    let (mut next, next_reads, puts) = work_worker("s-work-next", answering_board(), None);
+    next.kept = Arc::clone(&first.kept);
+    next.group.store(4343, Ordering::SeqCst);
+    next.work_look(WorkLook::Busy, t0 + Duration::from_secs(61));
+    work_read_over(&next);
+    assert_eq!(
+        next_reads.load(Ordering::SeqCst),
+        1,
+        "the new agent's first look reads"
+    );
+    assert_eq!(
+        puts.lock().unwrap().last().map(|(group, _)| *group),
+        Some(4343),
+        "put for the new agent's group"
+    );
+}
+
+/// A CHECK THAT GOES FULL DURING A READ STOPS ITS GIT: a read already under way when the board
+/// is driven full reads the hold it was handed live, as the reader does before each git, so it
+/// starts none (its read counts nothing). NEGATIVE CONTROL: the same read with the board left
+/// answering is made.
+#[test]
+fn a_check_that_goes_full_during_a_read_stops_its_git() {
+    use aterm_agent::harness::work_record::WorkRead;
+    const MIN: u64 = 60_000;
+    for full in [true, false] {
+        let board = answering_board();
+        let (began, begun) = std::sync::mpsc::channel();
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let made = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&made);
+        let (began, wait) = (Mutex::new(began), Mutex::new(wait));
+        let mut hooks = hooks(
+            &Arc::new(World::default()),
+            Arc::new(|_: &WorkerJob| BodyEnd::Stopped),
+        );
+        hooks.acts = Acts {
+            program_check: board,
+            work_read: Arc::new(move |_, _, _, held: &dyn Fn() -> bool| {
+                let _ = began.lock().unwrap().send(());
+                let _ = wait
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+                if held() {
+                    return WorkRead::Unread;
+                }
+                counted.fetch_add(1, Ordering::SeqCst);
+                WorkRead::Read(Box::default())
+            }),
+            ..Acts::inert()
+        };
+        let worker = idle_host("s-work-mid", Program::Claude, switched(&on()), hooks);
+        worker.work_look(WorkLook::Busy, Instant::now());
+        begun
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("the read began");
+        program_check_reads(board, MIN, full);
+        go.send(()).expect("the read waits");
+        work_read_over(&worker);
+        assert_eq!(
+            made.load(Ordering::SeqCst),
+            usize::from(!full),
+            "the board driven full: {full}"
+        );
+    }
+}
+
+#[test]
+fn agy_limit_until_reads_quota_without_a_session_and_parks_only_when_rotation_is_due() {
+    let world = Arc::new(World::default());
+    let mut h = hooks(&world, parking_body(&world));
+    let due = Arc::new(Mutex::new(Due::No));
+    let due_for_act = Arc::clone(&due);
+    h.acts.snapshot = Arc::new(|sid| {
+        Some(Snapshot {
+            session: None,
+            ..snap(sid)
+        })
+    });
+    h.acts.limit_reset = Arc::new(|_| Some(1_900_004_200));
+    h.acts.due = Arc::new(move |_| *due_for_act.lock().unwrap());
+    let idle = idle_of(h, Program::Agy, None);
+    with_kept_of(&idle.kept, |k| k.snapshot = None);
+    idle.park.store(false, Ordering::SeqCst);
+
+    assert_eq!(
+        idle.limit_until(),
+        Some(1_900_004_200),
+        "agy limit_until refreshes its snapshot and does not require a conversation UUID"
+    );
+    assert!(
+        !idle.park.load(Ordering::SeqCst),
+        "when no rotation/upgrade is due (Pick::Keep / Pick::Wait), park stays false"
+    );
+
+    *due.lock().unwrap() = Due::Yes;
+    assert_eq!(idle.limit_until(), Some(1_900_004_200));
+    assert!(
+        idle.park.load(Ordering::SeqCst),
+        "when rotation is due (Pick::Rotate), park is set so host_steps_here rotates immediately"
     );
 }

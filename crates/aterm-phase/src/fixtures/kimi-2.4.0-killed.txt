@@ -1,0 +1,33 @@
+# kimi 2.4.0 · MEASURED 2026-10-29, `aterm ctl text` of a private headless aterm (110x32, aterm 0.146.0) running the real Kimi Code, launched by path with a scratch `HOME` and `KIMI_CODE_HOME` whose `config.toml` names one `openai`-type provider at `http://127.0.0.1:<port>/v1` with a fake key (a local stub of the Chat Completions API, crates/aterm-lab), no login · the `kimi -c` run SIGKILLed by pid: the TUI's last frame stays, the shell's prompt returns under it, and `echo $?` reads 137
+      1  # Lab plan
+      2
+      3  1. Lab step one.
+      4  2. Lab step two.
+      5
+
+ ● lab plan written
+
+ ❯ lab exit plan mode now
+
+ Current plan · Approved: Lab plan A (Recommended)
+   ┌ plan: us-agent-constantine-obsidian.md ────────────────────────────────────────────────────────────────┐
+   │ Lab plan                                                                                               │
+   │                                                                                                        │
+   │ 1. Lab step one.                                                                                       │
+   │ 2. Lab step two.                                                                                       │
+   └────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+ Current plan
+   ExitPlanMode can only be called while plan mode is active. Only the user can turn plan mode on.
+
+ ● lab after the plan
+
+ ❯ lab hit the quota
+
+ ❯ lab hit an auth failure
+
+ ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │ > zsh: killed     sh /private/tmp/at.lab-501/aterm-gk-kimi-c1dea2b9/runs/gkm/kimi.sh                     │
+lab$ echo "kimi exit=$?"
+kimi exit=137
+lab$

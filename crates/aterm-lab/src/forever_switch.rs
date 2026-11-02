@@ -4,22 +4,29 @@
 //! LAND ACTS AT ONCE (v6 §14.10's 10a): what `lab forever` wants of Land's instruction once only
 //! a back-off stood before it.
 //!
-//! * On the measured pass's Land chains ([`at_once`]) land@v1 comes within [`AT_ONCE_MS`] of the
-//!   first point ([`land_at_once`]). Main typed it at +124.3 s: the first short turn's 2-minute
-//!   back-off was waited out before the instruction.
+//! * On the measured pass's Land chains ([`at_once`]) aterm's own share of land@v1, from the first
+//!   point to the Enter it pressed, is within [`AT_ONCE_MS`] ([`land_at_once`]), timed on the
+//!   session's tapes ([`typed_witness`]): everything but how long the program demonstrably held
+//!   the text unshown, which is said beside it as its own number. Main typed it at +124.3 s: the
+//!   first short turn's 2-minute back-off was waited out before the instruction.
 //! * `--mode switch` ([`Chain::SWITCH`]) switches a running Cruise tab's word with `meta set
 //!   autopilot land`, as a chip click, the Autopilot menu or Settings' row does ([`word_step`]):
 //!   - `switch-agent`: at rest in its first short turn's back-off, switched [`SWITCH_AFTER_MS`]
 //!     in: land@v1 within [`LAND_WITHIN_MS`] of the switch and before the back-off's due
 //!     ([`judge_at_rest`]);
-//!   - `switch-seq`: the same under a draft the lab leaves in the composer over the switch:
-//!     nothing typed while it stands, land@v1 within [`LAND_WITHIN_MS`] of its clearing
-//!     ([`judge_draft`]);
+//!   - `switch-seq`: the same under a draft a person leaves in the composer over the switch:
+//!     nothing typed while it stands nor in their grace from its clearing (their last key),
+//!     land@v1 within [`LAND_WITHIN_MS`] of that grace's end, and no new point journaled from
+//!     its typing to that act, the turn above the composer unchanged ([`judge_draft`]);
 //!   - `switch-flip`: Land then Off within [`FLIP_WITHIN_MS`]: nothing typed, past the
 //!     back-off's due ([`judge_flip`]);
-//!   - `switch-held`: held at the same reply under Cruise, switched to Land past its looks in
-//!     front: nothing typed, the hold stands, and its state line still leads with `stopped
-//!     typing:` ([`judge_held`], [`held_line`]);
+//!   - `switch-over-held`: held at the same reply under Cruise, past its looks in front switched
+//!     to Land by `meta set`, no person's (limit 1: nothing typed), back to Cruise, then by the
+//!     person's press of Land on Settings ▸ Harness's SESSIONS row ([`press`], meta
+//!     `autopilot_by=human:settings`), their turn (v6 §14.17 item 3): land@v1 once, opened by the
+//!     why quoting the held reply, `status land_asked=switch` and the state line's
+//!     [`acts::SWITCH_ASKED`] while its answer is out, held again at the same answer and nothing
+//!     typed past it ([`judge_over_held`], [`asked_line`]);
 //!   - `switch-busy`: switched [`BUSY_SWITCH_MS`] into a long busy turn: nothing typed mid-turn,
 //!     land@v1 within [`BUSY_LAND_MS`] of the turn's point ([`judge_busy`]).
 //!
@@ -33,12 +40,13 @@
 
 use std::path::Path;
 
-use aterm_agent::harness::acts::{StopForm, stop_words};
+use aterm_agent::harness::acts::{self, StopForm, stop_words};
 use aterm_agent::supervise::approvals::RULE_POINT;
 use aterm_agent::supervise::policy::turn_end;
+use aterm_agent::supervise::tape::show::Typed;
 use aterm_agent::supervise::tape::{show, store, text};
 
-use super::surfaces::held::{arm_of, is_lift, stall_of};
+use super::surfaces::held::{arm_of, is_stall, stall_of};
 use super::surfaces::{Ctx, compose, observed, page_field};
 use super::{
     AT_DONE_MS, Chain, Harness, Line, Scenario, Seen, Tab, Verdict, act_rule, at, at_composer,
@@ -54,7 +62,8 @@ use crate::util::{now_ms, one_line};
 pub const AT_ONCE_MS: i64 = 10_000;
 
 /// The want [`land_at_once`] composes under ([`with_at_once`]).
-pub const AT_ONCE: &str = "land@v1 at once: within 10 s of the first point (main: +124.3 s)";
+pub const AT_ONCE: &str =
+    "land@v1 at once: aterm's own share of it within 10 s of the first point (main: +124.3 s)";
 
 /// How far into its back-off a tab at rest is switched.
 pub const SWITCH_AFTER_MS: i64 = 10_000;
@@ -62,18 +71,38 @@ pub const SWITCH_AFTER_MS: i64 = 10_000;
 /// How far into its back-off `switch-seq`'s draft is typed.
 pub const DRAFT_AFTER_MS: i64 = 5_000;
 
-/// How long the draft stands before the switch.
+/// How long after the draft is typed the switch comes, once it stands.
 pub const DRAFT_BEFORE_MS: i64 = 5_000;
 
 /// How long the draft stands past the switch before the lab clears it.
 pub const DRAFT_PAST_MS: i64 = 10_000;
 
 /// The words ending the `WAITING` line the loop journals for the person who typed a draft: its
-/// hands-off hold, until their grace from the draft's sighting runs out.
-pub const PERSON_HOLD: &str = "a person is typing";
+/// hands-off hold, until their grace runs out.
+pub const PERSON_HOLD: &str = turn_end::PERSON_TYPING;
+
+/// How long past the person's grace from the clearing the loop's hold may run: the loop reads
+/// their last key at its next look, every few seconds at rest, later under load.
+pub const CLEAR_READ_MS: i64 = 15_000;
+
+/// How much sooner than the lab's clock the loop's hold may end: the lab stamps the clearing once
+/// its last backspace's call returned, after the window stamped that key, and the journal's
+/// `until` is to the second.
+pub const HOLD_SKEW_MS: i64 = 2_000;
+
+/// The person's grace the forever lab's loop holds its hands off for (`[harness] human_grace_s`,
+/// the policy's default: the lab sets none), in ms.
+#[must_use]
+pub fn person_grace_ms() -> i64 {
+    i64::from(aterm_agent::supervise::SupervisorConfig::default().human_grace_s) * 1000
+}
 
 /// `switch-seq`'s draft: plain words with no key a composer reads as a shortcut of its own.
 pub const DRAFT: &str = "a note for later";
+
+/// The verdict's words for a point the loop journaled (`EVENT idle`) between the draft and the
+/// next act: the draft read as the agent's turn ending again.
+pub const DRAFT_REPOINTED: &str = "the draft read as a new point (ATERM-KI-1101-2)";
 
 /// How soon after the switch at rest (or the draft's clearing) land@v1 comes.
 pub const LAND_WITHIN_MS: i64 = 5_000;
@@ -90,7 +119,7 @@ pub const BUSY_SWITCH_MS: i64 = 5_000;
 /// How soon after the busy turn's point land@v1 comes.
 pub const BUSY_LAND_MS: i64 = 3_000;
 
-/// How long past its hold `switch-held` is switched: past both of its looks in front
+/// How long past its hold `switch-over-held` is switched: past both of its looks in front
 /// ([`super::surfaces::held::HELD_LOOKS_MS`]), which read the hold's words under Cruise.
 pub const HELD_SWITCH_MS: i64 = 50_000;
 
@@ -100,6 +129,11 @@ pub const SWITCH_SETTLE_MS: i64 = 3_000;
 
 /// How long a chain that types nothing after its switch is watched past it.
 pub const WATCH_MS: i64 = 60_000;
+
+/// How long `switch-over-held` watches its tab past `meta set`'s switch to Land, no person's,
+/// before switching it back to Cruise: six times [`LAND_WITHIN_MS`], the bound its ask comes in
+/// at the person's switch.
+pub const CTL_WATCH_MS: i64 = 30_000;
 
 /// How long a chain that lands after its switch is watched past it at most: past its back-off's
 /// due, so a land@v1 that waited it out is seen.
@@ -126,6 +160,8 @@ pub struct Switched {
     pub took: bool,
     /// `status phase=` just before it.
     pub phase: String,
+    /// Whether it was the person's press on Settings ▸ Harness ([`press`]), not `meta set`.
+    pub person: bool,
 }
 
 /// `switch-seq`'s draft ([`word_step`]).
@@ -162,7 +198,7 @@ pub const fn switches(chain: Chain) -> bool {
         Chain::SwitchAgent
             | Chain::SwitchSeq
             | Chain::SwitchFlip
-            | Chain::SwitchHeld
+            | Chain::SwitchOverHeld
             | Chain::SwitchBusy
     )
 }
@@ -174,8 +210,16 @@ pub fn at_once(chain: Chain) -> bool {
     Chain::ALL.contains(&chain) && chain.autopilot() == "land"
 }
 
-/// LAND@V1 AT ONCE: the first land@v1 within [`AT_ONCE_MS`] of the first point judged from `t0`
-/// on (`point@v1`), the back-off that stood between them named where one did.
+/// LAND@V1 AT ONCE, BY ATERM'S OWN SHARE: the first land@v1 the session's tapes show the loop
+/// writing ([`Cover::typed`](super::Cover::typed)), judged from the first point judged from `t0`
+/// on (`point@v1`). Aterm's share is the point to the Enter it pressed, less the time the program
+/// demonstrably held the text unshown ([`Typed::aterm_ms`]): the decision, the write, the looks
+/// and settles after the draw and the Enter are all aterm's, and must come within [`AT_ONCE_MS`];
+/// the program's hold is said beside it ([`held_said`]) and judges nothing. A text the program
+/// drew that aterm never sent fails; one it never drew by the watch's end has the write judged.
+/// The back-off that stood before a late act is named. Where no tape shows a land@v1 written (no
+/// tape read, or tapes with no such write), the journal's `CONTINUED` line is the clock, the
+/// program's hold within it, so that fallback can only fail a program's stall, never pass aterm's.
 #[must_use]
 pub fn land_at_once(seen: &Seen, t0: i64) -> Verdict {
     let Some(point) = seen
@@ -185,32 +229,197 @@ pub fn land_at_once(seen: &Seen, t0: i64) -> Verdict {
     else {
         return Verdict::Unobserved(format!("no point judged within {}", at(t0, seen.end_ms)));
     };
-    let Some((tl, _)) = seen.acts(turn_end::RULE_LAND).first().copied() else {
-        return Verdict::Fail(format!(
-            "no land@v1 typed within {}, the first point at +{}",
-            at(t0, seen.end_ms),
+    let line = seen.acts(turn_end::RULE_LAND).first().map(|(t, _)| *t);
+    let wrote = seen.cover.typed.as_deref().and_then(|typed| {
+        typed
+            .iter()
+            .find(|a| a.rule.as_deref() == Some(turn_end::RULE_LAND) && a.sent_ms >= t0)
+    });
+    let after = |t: i64| {
+        let gap = t - point.ts;
+        format!(
+            "{} {} the first point at +{}",
+            at(0, gap.abs()),
+            if gap < 0 { "before" } else { "after" },
             at(t0, point.ts)
-        ));
+        )
     };
-    let gap = tl - point.ts;
-    let said = format!(
-        "land@v1 at +{}, {} {} the first point at +{}",
-        at(t0, *tl),
-        at(0, gap.abs()),
-        if gap < 0 { "before" } else { "after" },
-        at(t0, point.ts)
+    let waited = |until: i64| {
+        seen.journal
+            .iter()
+            .find(|(t, l)| *t >= point.ts - AT_DONE_MS && *t < until && backoff_named(l))
+            .map_or_else(String::new, |(t, l)| {
+                format!(", waiting out +{} {}", at(t0, *t), one_line(l, 110))
+            })
+    };
+    let past = format!(": past {} s", AT_ONCE_MS / 1000);
+    let Some(a) = wrote else {
+        let Some(tl) = line else {
+            return Verdict::Fail(format!(
+                "no land@v1 written within {}, the first point at +{}",
+                at(t0, seen.end_ms),
+                at(t0, point.ts)
+            ));
+        };
+        let said = format!(
+            "land@v1 at +{} ({}: the program's hold of the text is within it), {}",
+            at(t0, tl),
+            if seen.cover.typed.is_some() {
+                "the journal's line, no write of it on the tapes"
+            } else {
+                "the journal's line, no tape read"
+            },
+            after(tl)
+        );
+        if (tl - point.ts).abs() <= AT_ONCE_MS {
+            return Verdict::Pass(said);
+        }
+        return Verdict::Fail(format!("{said}{}{past}", waited(tl)));
+    };
+    let mut said = format!(
+        "aterm wrote land@v1 at +{}{}, {}",
+        at(t0, a.sent_ms),
+        a.decided_ms
+            .map_or_else(String::new, |d| format!(" (decided at +{})", at(t0, d))),
+        after(a.sent_ms)
     );
-    if gap.abs() <= AT_ONCE_MS {
-        return Verdict::Pass(said);
+    if (a.sent_ms - point.ts).abs() > AT_ONCE_MS {
+        said.push_str(&format!("; {}", held_said(a, seen.end_ms, t0)));
+        return Verdict::Fail(format!("{said}{}{past}", waited(a.sent_ms)));
     }
-    let waited = seen
-        .journal
-        .iter()
-        .find(|(t, l)| *t >= point.ts - AT_DONE_MS && t < tl && backoff_named(l))
-        .map_or_else(String::new, |(t, l)| {
-            format!(", waiting out +{} {}", at(t0, *t), one_line(l, 110))
-        });
-    Verdict::Fail(format!("{said}{waited}: past {} s", AT_ONCE_MS / 1000))
+    match (a.aterm_ms(point.ts), a.enter_ms, a.drawn_ms) {
+        (Some(share), Some(enter), _) => {
+            // The point is the journal's line and the rest the tape's stamps, a few ms apart: a
+            // share just under zero is said as 0.0 s.
+            said.push_str(&format!(
+                ", and sent it at +{}: aterm's own share {}; {}",
+                at(t0, enter),
+                at(0, share.max(0)),
+                held_said(a, seen.end_ms, t0)
+            ));
+            if share <= AT_ONCE_MS {
+                Verdict::Pass(said)
+            } else {
+                Verdict::Fail(format!("{said}{}{past}", waited(enter)))
+            }
+        }
+        (_, _, Some(drawn)) => Verdict::Fail(format!(
+            "{said}; the program drew it by +{}, and aterm had not sent it by +{}; {}",
+            at(t0, drawn),
+            at(t0, seen.end_ms),
+            held_said(a, seen.end_ms, t0)
+        )),
+        _ => {
+            said.push_str(&format!("; {}", held_said(a, seen.end_ms, t0)));
+            Verdict::Pass(said)
+        }
+    }
+}
+
+/// THE PROGRAM'S HOLD OF A TEXT ATERM WROTE, as its own number: how long it demonstrably held the
+/// text unshown and the read that first showed it, or the last read that still did not where none
+/// did by the watch's `end`; and the longest `status` read that found the text unread.
+#[must_use]
+pub fn held_said(a: &Typed, end: i64, t0: i64) -> String {
+    let mut out = match (a.drawn_ms, a.held_ms) {
+        (Some(d), Some(h)) => format!(
+            "the program held the text {} (first shown in the read at +{})",
+            at(0, h),
+            at(t0, d)
+        ),
+        _ => match a.unshown_ms {
+            Some(u) => format!(
+                "the program had drawn none of the text by +{} (its last read +{})",
+                at(t0, end),
+                at(t0, u)
+            ),
+            None => format!(
+                "no read after the write showed the text by +{}",
+                at(t0, end)
+            ),
+        },
+    };
+    if let Some(u) = &a.unread {
+        out.push_str(&format!("; status +{} {}", at(t0, u.at_ms), u.said()));
+    }
+    out
+}
+
+/// [`Typed`]s for the run's report, from `t0`: each write, its decision, the program's draw and
+/// hold, and its Enter.
+#[must_use]
+pub fn typed_line(typed: Option<&[Typed]>, t0: i64) -> String {
+    match typed {
+        None => "no tape of the session read".to_string(),
+        Some([]) => "no text written on the tapes".to_string(),
+        Some(t) => t
+            .iter()
+            .map(|a| {
+                let mut s = format!(
+                    "+{} {}",
+                    at(t0, a.sent_ms),
+                    a.rule.as_deref().unwrap_or("?")
+                );
+                if let Some(d) = a.decided_ms {
+                    s.push_str(&format!(" decided +{}", at(t0, d)));
+                }
+                match (a.drawn_ms, a.held_ms, a.unshown_ms) {
+                    (Some(d), Some(h), _) => {
+                        s.push_str(&format!(", drawn +{} (held {})", at(t0, d), at(0, h)))
+                    }
+                    (_, _, Some(u)) => s.push_str(&format!(", undrawn at +{}", at(t0, u))),
+                    _ => s.push_str(", no read after it"),
+                }
+                if let Some(u) = &a.unread {
+                    s.push_str(&format!(", status +{} {}", at(t0, u.at_ms), u.said()));
+                }
+                if let Some(e) = a.enter_ms {
+                    s.push_str(&format!(", Enter +{}", at(t0, e)));
+                }
+                s
+            })
+            .collect::<Vec<_>>()
+            .join("; "),
+    }
+}
+
+/// The texts the tapes of session `sid` show the loop writing ([`show::typed`]), every tape of the
+/// session read as far as it is whole, in the order written; `None` where no tape could be read.
+#[must_use]
+pub(in crate::forever) fn typed_witness(run: &Run, sid: &str) -> Option<Vec<Typed>> {
+    let dir = store::session_dir(&store::store_under(&run.state()), Some(sid));
+    typed_in(&dir)
+}
+
+/// [`typed_witness`] over the tapes in `dir`.
+#[must_use]
+pub fn typed_in(dir: &Path) -> Option<Vec<Typed>> {
+    let mut out = Vec::new();
+    let mut read = false;
+    for tape in tapes_in(dir)? {
+        read = true;
+        out.extend(show::typed(&tape));
+    }
+    out.sort_by_key(|a| a.sent_ms);
+    read.then_some(out)
+}
+
+/// The tapes in `dir`, each read as far as it is whole; `None` where the folder cannot be read.
+fn tapes_in(dir: &Path) -> Option<Vec<show::Tape>> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|x| x != "atape") {
+            continue;
+        }
+        if let Some(tape) = std::fs::read(&path)
+            .ok()
+            .and_then(|raw| show::open(&raw, true).ok())
+        {
+            out.push(tape);
+        }
+    }
+    Some(out)
 }
 
 /// Folds [`land_at_once`] into the verdict `v` of the first scenario of a chain [`at_once`] names;
@@ -220,7 +429,109 @@ pub fn with_at_once(s: Scenario, seen: &Seen, cx: &Ctx<'_>, v: Verdict) -> Verdi
     if !at_once(cx.chain) || cx.chain.scenarios().first() != Some(&s) {
         return v;
     }
-    compose(v, AT_ONCE, land_at_once(seen, cx.t0))
+    let v = compose(v, AT_ONCE, land_at_once(seen, cx.t0));
+    let v = compose(v, LAND_ONCE, land_once(seen, cx.t0));
+    // The note is judged only where the tapes show the write and the look after it; elsewhere
+    // the want is named as skipped, and the chain's word stands on the rest.
+    match held_noted(seen, cx.t0) {
+        Verdict::Unobserved(why) => {
+            let skip = format!("; {HELD_NOTED}: SKIPPED ({why})");
+            match v {
+                Verdict::Pass(w) => Verdict::Pass(w + &skip),
+                Verdict::Fail(w) => Verdict::Fail(w + &skip),
+                Verdict::Unobserved(w) => Verdict::Unobserved(w + &skip),
+            }
+        }
+        judged => compose(v, HELD_NOTED, judged),
+    }
+}
+
+/// The want [`land_once`] composes under ([`with_at_once`]).
+pub const LAND_ONCE: &str = "land@v1 never typed twice in a row";
+
+/// LAND'S INSTRUCTION IS GIVEN ONCE (the at1 review, 2026-11-01): no land@v1 act from `t0` on is
+/// followed by another with no act between, as one drawn late and sent by a later decision was,
+/// typed again at the agent's `Nothing left:` in place of the land check.
+#[must_use]
+pub fn land_once(seen: &Seen, t0: i64) -> Verdict {
+    let acts: Vec<&Line> = seen
+        .all_acts()
+        .into_iter()
+        .filter(|(t, _)| *t >= t0)
+        .collect();
+    let land = |l: &Line| act_rule(&l.1) == Some(turn_end::RULE_LAND);
+    if let Some(w) = acts.windows(2).find(|w| land(w[0]) && land(w[1])) {
+        return Verdict::Fail(format!(
+            "land@v1 typed at +{} and again at +{}, no act between",
+            at(t0, w[0].0),
+            at(t0, w[1].0)
+        ));
+    }
+    let n = acts.iter().filter(|&&l| land(l)).count();
+    Verdict::Pass(format!("land@v1 typed {n} time(s), never twice in a row"))
+}
+
+/// The want [`held_noted`] composes under ([`with_at_once`]).
+pub const HELD_NOTED: &str =
+    "a write its program left unshown past the first look is noted once, under its rule";
+
+/// THE HELD TEXT'S NOTE, ONE PER WRITE (slice at1's item 3): the first land@v1 the tapes show
+/// written from `t0` on gets exactly one `NOTE … rule=land@v1` naming the program as holding the
+/// text where the first `await seq` past it ran out, and none where it saw the screen move,
+/// however long the program then held the text.
+#[must_use]
+pub fn held_noted(seen: &Seen, t0: i64) -> Verdict {
+    let Some(typed) = seen.cover.typed.as_deref() else {
+        return Verdict::Unobserved("no tape of the session read".to_string());
+    };
+    let Some(a) = typed
+        .iter()
+        .find(|a| a.rule.as_deref() == Some(turn_end::RULE_LAND) && a.sent_ms >= t0)
+    else {
+        return Verdict::Unobserved("no land@v1 written on the tapes".to_string());
+    };
+    let Some(moved) = a.reaction else {
+        return Verdict::Unobserved(format!(
+            "no look past land@v1's write at +{} on the tapes",
+            at(t0, a.sent_ms)
+        ));
+    };
+    let until = typed
+        .iter()
+        .find(|b| b.sent_ms > a.sent_ms)
+        .map_or(seen.end_ms, |b| b.sent_ms);
+    let notes = seen
+        .journal
+        .iter()
+        .filter(|(t, l)| {
+            *t >= a.sent_ms
+                && *t <= until
+                && l.starts_with("NOTE ")
+                && l.contains(aterm_agent::supervise::journal::TEXT_HELD)
+                && l.split_whitespace().any(|w| w == "rule=land@v1")
+        })
+        .collect::<Vec<_>>();
+    let want = usize::from(!moved);
+    let said = format!(
+        "the first look past the write at +{} {}; {} note(s){}",
+        at(t0, a.sent_ms),
+        if moved {
+            "saw the screen move"
+        } else {
+            "ran out"
+        },
+        notes.len(),
+        notes.first().map_or_else(String::new, |(t, l)| format!(
+            ", +{} {}",
+            at(t0, *t),
+            one_line(l, 140)
+        ))
+    );
+    if notes.len() == want {
+        Verdict::Pass(said)
+    } else {
+        Verdict::Fail(format!("{said}: want {want}"))
+    }
 }
 
 /// The first short turn's back-off from `t0` on, before any act: what a switch at rest is made in.
@@ -249,6 +560,15 @@ fn acts_between(seen: &Seen, from: i64, until: i64) -> Vec<&Line> {
     seen.all_acts()
         .into_iter()
         .filter(|(t, _)| *t > from && *t < until)
+        .collect()
+}
+
+/// The points journaled (`EVENT <phase> seq=…`) from `from` to before `until`: a draft typed and
+/// cleared in the composer is none, the turn above it unchanged (ATERM-KI-1101-2).
+fn points_between(seen: &Seen, from: i64, until: i64) -> Vec<&Line> {
+    seen.journal
+        .iter()
+        .filter(|(t, l)| *t >= from && *t < until && l.starts_with("EVENT "))
         .collect()
 }
 
@@ -442,12 +762,14 @@ pub fn judge_at_rest(seen: &Seen, t0: i64) -> Verdict {
     verdict(&said, &bad)
 }
 
-/// SWS: the same under a draft that stood over the switch: its wake within [`WAKE_WITHIN_MS`],
-/// nothing typed from the draft's typing to its clearing, and land@v1 within [`LAND_WITHIN_MS`] of
-/// the later of the clearing and the end of the hands-off hold the loop journaled for the person
-/// who typed the draft ([`PERSON_HOLD`]): a draft the loop did not type is a person's typing, so it
-/// keeps its hands off for the person's grace from its sighting. Where that hold ends before the
-/// back-off's due, land@v1 comes before the due too.
+/// SWS: the same under a draft a person typed and cleared over the switch: its wake within
+/// [`WAKE_WITHIN_MS`], nothing typed from the draft's typing to its clearing, nor inside the
+/// person's grace from the clearing as the lab timed it ([`person_grace_ms`] from their last key),
+/// a hands-off hold for them journaled ([`PERSON_HOLD`]) whose last `until` ends no sooner than
+/// that grace and within [`CLEAR_READ_MS`] past it, and land@v1 within [`LAND_WITHIN_MS`] of its
+/// end, past the back-off's due (the clearing comes after the back-off began, the grace as long
+/// as it). The lab times the grace itself, so a run that typed in it fails whatever the loop
+/// journaled.
 #[must_use]
 pub fn judge_draft(seen: &Seen, t0: i64) -> Verdict {
     let Some(d) = seen.cover.draft.as_ref() else {
@@ -503,37 +825,74 @@ pub fn judge_draft(seen: &Seen, t0: i64) -> Verdict {
         ));
     }
     said.push(format!("cleared at +{}", at(t0, cleared)));
+    let held_to = cleared + person_grace_ms();
+    said.push(format!(
+        "the person's grace from it to +{}",
+        at(t0, held_to)
+    ));
+    let inside = acts_between(seen, cleared, held_to - HOLD_SKEW_MS);
+    if !inside.is_empty() {
+        bad.push(format!(
+            "typed inside the person's grace from the clearing (to +{}): {}",
+            at(t0, held_to),
+            named(&inside, t0)
+        ));
+    }
+    let next = acts_between(seen, cleared, i64::MAX)
+        .first()
+        .map_or(seen.end_ms, |(t, _)| *t);
+    let points = points_between(seen, d.typed_ms, next);
+    if !points.is_empty() {
+        bad.push(format!(
+            "{DRAFT_REPOINTED}: {}",
+            points
+                .iter()
+                .map(|(t, l)| format!("+{} {}", at(t0, *t), one_line(l, 60)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
     let hold = seen
         .journal
         .iter()
-        .find(|(t, l)| {
-            *t >= d.typed_ms
-                && *t <= cleared
-                && l.starts_with("WAITING ")
-                && l.ends_with(PERSON_HOLD)
+        .filter(|(t, l)| {
+            *t >= d.typed_ms && *t <= next && l.starts_with("WAITING ") && l.ends_with(PERSON_HOLD)
         })
-        .and_then(|(_, l)| {
+        .filter_map(|(_, l)| {
             crate::workers::iso_ms(l.split_once(" until=")?.1.split_whitespace().next()?)
-        });
-    if let Some(h) = hold {
-        said.push(format!("the hold for the person to +{}", at(t0, h)));
-        let inside = acts_between(seen, cleared, h);
-        if !inside.is_empty() {
+        })
+        .next_back();
+    let until = match hold {
+        None => {
             bad.push(format!(
-                "typed inside the hold for the person (to +{}): {}",
-                at(t0, h),
-                named(&inside, t0)
+                "no hold for the person journaled (`WAITING … {PERSON_HOLD}`) from the draft's \
+                 typing to +{}",
+                at(t0, next)
             ));
+            held_to
         }
-    }
-    let due = backoff_due(wl).filter(|due| hold.is_none_or(|h| h < *due));
+        Some(h) => {
+            said.push(format!("the hold for the person to +{}", at(t0, h)));
+            if h < held_to - HOLD_SKEW_MS {
+                bad.push(format!(
+                    "the hold for the person ends at +{}, inside their grace from the clearing",
+                    at(t0, h)
+                ));
+            } else if h > held_to + CLEAR_READ_MS {
+                bad.push(format!(
+                    "the hold for the person runs to +{}, {} past their grace from the clearing, \
+                     past {} s",
+                    at(t0, h),
+                    at(0, h - held_to),
+                    CLEAR_READ_MS / 1000
+                ));
+            }
+            h.max(held_to)
+        }
+    };
     land_within(
         seen,
-        (
-            hold.map_or(cleared, |h| h.max(cleared)),
-            LAND_WITHIN_MS,
-            due,
-        ),
+        (until, LAND_WITHIN_MS, None),
         t0,
         (&mut said, &mut bad),
     );
@@ -617,142 +976,288 @@ pub fn judge_flip(seen: &Seen, t0: i64) -> Verdict {
     verdict(&said, &bad)
 }
 
-/// SWH: a tab held under Cruise (ruling F's same reply), switched to Land past its looks in front:
-/// its wake journaled, nothing typed after the hold, no lift after the switch, and every `status`
-/// read from [`SWITCH_SETTLE_MS`] past it says `autopilot=land` and the hold's arm (`held=`),
-/// watched [`WATCH_MS`] past it.
+/// The person's switch to Land after the hold at `ts`: the first of the lab's presses from it on.
+fn press_after(seen: &Seen, ts: i64) -> Option<&Switched> {
+    seen.cover.words.iter().find(|w| w.at > ts && w.person)
+}
+
+/// The hold again after Land's one ask at `ta`: the first `kind=stalled` journaled past it.
 #[must_use]
-pub fn judge_held(seen: &Seen, t0: i64) -> Verdict {
+pub fn held_again(seen: &Seen, ta: i64) -> Option<&Line> {
+    seen.journal.iter().find(|(t, l)| *t > ta && is_stall(l))
+}
+
+/// The reply the hold at `ts` stopped at: the last point's words journaled before it.
+fn held_reply(seen: &Seen, ts: i64) -> Option<&str> {
+    seen.journal
+        .iter()
+        .filter(|(t, _)| *t <= ts)
+        .filter_map(|(_, l)| idle_words(l).filter(|w| !w.is_empty() && *w != "-"))
+        .next_back()
+}
+
+/// SWO: a tab held under Cruise (ruling F's same reply), switched to Land past its looks in front
+/// by `meta set` and back to Cruise, then by the person's press, its stand-in giving Land's one ask
+/// the same reply (v6 §14.17 item 3): nothing typed between the hold and the person's press, the
+/// switch no person made included (limit 1); its wake journaled within [`WAKE_WITHIN_MS`]; one
+/// land@v1 within
+/// [`LAND_WITHIN_MS`] of it, opened by the switch's why (`You stopped at: “…”`) quoting the held
+/// reply; `status land_asked=switch` read while its answer was out; held again at that answer
+/// (`kind=stalled`); and nothing typed past it, watched [`WATCH_MS`] past the second hold, every
+/// `status` from [`SWITCH_SETTLE_MS`] past it saying the hold's arm (`held=`) and no ask
+/// (`land_asked=-`).
+#[must_use]
+pub fn judge_over_held(seen: &Seen, t0: i64) -> Verdict {
     let Some((ts, sl)) = stall_of(seen, t0) else {
         return Verdict::Unobserved(format!("no hold within {}", at(t0, seen.end_ms)));
-    };
-    let Some(sw) = seen.cover.words.first() else {
-        return Verdict::Unobserved(format!(
-            "held at +{}, but the switch was never made",
-            at(t0, *ts)
-        ));
     };
     if let Some(v) = untaken(seen, t0) {
         return v;
     }
-    if sw.at <= *ts {
-        return Verdict::Fail(format!(
-            "switched at +{}, before the hold at +{}",
-            at(t0, sw.at),
+    let ctl: Vec<&Switched> = seen
+        .cover
+        .words
+        .iter()
+        .filter(|w| w.at > *ts && !w.person)
+        .collect();
+    let Some(cl) = ctl.iter().find(|w| w.word == "land") else {
+        return Verdict::Unobserved(format!(
+            "held at +{}, but no switch to Land by `meta set` was made",
             at(t0, *ts)
         ));
-    }
+    };
+    let Some(sw) = press_after(seen, cl.at) else {
+        return Verdict::Unobserved(format!(
+            "held at +{}, switched to Land by `meta set` at +{}, but the person's switch was \
+             never made",
+            at(t0, *ts),
+            at(t0, cl.at)
+        ));
+    };
     let arm = arm_of(sl);
     let mut said = vec![
         format!("held at +{} ({})", at(t0, *ts), one_line(sl, 110)),
-        format!("switched to {} at +{}", sw.word, at(t0, sw.at)),
+        format!(
+            "`meta set` {} (no person's)",
+            ctl.iter()
+                .filter(|w| w.at < sw.at)
+                .map(|w| format!("{} at +{}", w.word, at(t0, w.at)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        format!("the person switched to {} at +{}", sw.word, at(t0, sw.at)),
     ];
     let mut bad = Vec::new();
     said.push(wake_within(seen, sw.at, t0, &mut bad));
-    let typed = acts_between(seen, *ts, i64::MAX);
-    if !typed.is_empty() {
-        bad.push(format!("typed after the hold: {}", named(&typed, t0)));
-    }
-    if let Some((tl, ll)) = seen.journal.iter().find(|(t, l)| *t > sw.at && is_lift(l)) {
+    let at_ctl = acts_between(seen, cl.at, sw.at);
+    if !at_ctl.is_empty() {
         bad.push(format!(
-            "the hold lifted at +{}: {}",
-            at(t0, *tl),
-            one_line(ll, 110)
+            "typed at the switch no person made (+{}): {}",
+            at(t0, cl.at),
+            named(&at_ctl, t0)
+        ));
+    }
+    let before = acts_between(seen, *ts, cl.at);
+    if !before.is_empty() {
+        bad.push(format!("typed after the hold: {}", named(&before, t0)));
+    }
+    let after = acts_between(seen, sw.at, i64::MAX);
+    let Some(&ask) = after.first() else {
+        bad.push(format!(
+            "NO ASK: nothing typed after the switch within {}",
+            at(t0, seen.end_ms)
+        ));
+        return verdict(&said, &bad);
+    };
+    let ta = ask.0;
+    let rule = act_rule(&ask.1).unwrap_or("?");
+    said.push(format!(
+        "{rule} at +{}, {} after the switch",
+        at(t0, ta),
+        at(0, ta - sw.at)
+    ));
+    if rule != turn_end::RULE_LAND {
+        bad.push(format!("the act after the switch was {rule}, not land@v1"));
+    }
+    if ta - sw.at > LAND_WITHIN_MS {
+        bad.push(format!("past {} s of the switch", LAND_WITHIN_MS / 1000));
+    }
+    let text = seen.act_text(turn_end::RULE_LAND, ask);
+    if turn_end::is_switch_ask(text) {
+        said.push(format!("opened by the why: \"{}\"", one_line(text, 150)));
+    } else {
+        bad.push(format!(
+            "land@v1 opens with no why: \"{}\"",
+            one_line(text, 150)
+        ));
+    }
+    if let Some(reply) = held_reply(seen, *ts) {
+        // The journal's point keeps the reply's bullet (`⏺ `), which the loop's reply has not.
+        let quote = turn_end::held_quote(reply);
+        let head: String = quote
+            .trim_start_matches(|c: char| !c.is_alphanumeric())
+            .chars()
+            .take(40)
+            .collect();
+        if !text.contains(&head) {
+            bad.push(format!("its why quotes no \"{head}\" (the held reply)"));
+        }
+    }
+    if after.len() > 1 {
+        bad.push(format!(
+            "typed again after the ask: {}",
+            named(&after[1..], t0)
+        ));
+    }
+    let Some((th, hl)) = held_again(seen, ta) else {
+        bad.push(format!(
+            "not held again after the ask within {}",
+            at(t0, seen.end_ms)
+        ));
+        return verdict(&said, &bad);
+    };
+    said.push(format!(
+        "held again at +{} ({})",
+        at(t0, *th),
+        one_line(hl, 110)
+    ));
+    let asking = observed(&seen.status, &seen.status_reads, ta, *th);
+    if asking.is_empty() {
+        bad.push("no `status` read while the ask stood".into());
+    } else if let Some((t, _)) = asking
+        .iter()
+        .find(|(_, s)| word(s, "land_asked").as_deref() == Some("switch"))
+    {
+        said.push(format!("status land_asked=switch at +{}", at(t0, *t)));
+    } else {
+        bad.push(format!(
+            "status never said land_asked=switch in {} read(s) while the ask stood: {}",
+            asking.len(),
+            asking
+                .iter()
+                .map(|(t, s)| format!(
+                    "+{} land_asked={}",
+                    at(t0, *t),
+                    word(s, "land_asked").unwrap_or_else(|| "?".into())
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     }
     let reads = observed(
         &seen.status,
         &seen.status_reads,
-        sw.at + SWITCH_SETTLE_MS,
+        th + SWITCH_SETTLE_MS,
         seen.end_ms + 1,
     );
     let off: Vec<String> = reads
         .iter()
         .filter(|(_, s)| {
-            word(s, "autopilot").as_deref() != Some("land")
-                || word(s, "held").as_deref() != Some(arm.word())
+            word(s, "held").as_deref() != Some(arm.word())
+                || word(s, "land_asked").as_deref() != Some("-")
         })
         .map(|(t, s)| {
             format!(
-                "+{} autopilot={} held={}",
+                "+{} held={} land_asked={}",
                 at(t0, *t),
-                word(s, "autopilot").unwrap_or_else(|| "?".into()),
-                word(s, "held").unwrap_or_else(|| "?".into())
+                word(s, "held").unwrap_or_else(|| "?".into()),
+                word(s, "land_asked").unwrap_or_else(|| "?".into())
             )
         })
         .collect();
     if reads.is_empty() {
-        bad.push("no `status` read after the switch".into());
+        bad.push("no `status` read after the second hold".into());
     } else if off.is_empty() {
         said.push(format!(
-            "{} status read(s) after it: autopilot=land held={}",
+            "{} status read(s) after it: held={} land_asked=-",
             reads.len(),
             arm.word()
         ));
     } else {
-        bad.push(format!("status after the switch: {}", off.join(", ")));
+        bad.push(format!("status after the second hold: {}", off.join(", ")));
     }
-    if bad.is_empty() && seen.end_ms - sw.at < WATCH_MS {
+    if bad.is_empty() && seen.end_ms - th < WATCH_MS {
         return Verdict::Unobserved(format!(
-            "{}: watched {} past the switch, under {} s",
+            "{}: watched {} past the second hold, under {} s",
             said.join("; "),
-            at(0, seen.end_ms - sw.at),
+            at(0, seen.end_ms - th),
             WATCH_MS / 1000
         ));
     }
-    said.push(format!("nothing typed to +{}", at(t0, seen.end_ms)));
+    said.push(format!("nothing more typed to +{}", at(t0, seen.end_ms)));
     said.push(woke_said(seen, sw.at, t0));
     verdict(&said, &bad)
 }
 
-/// SWH's window want: every state line the Harness page drew for the tab from
-/// [`SWITCH_SETTLE_MS`] past the switch on leads with the hold's stop ([`stop_words`]' line).
+/// SWO's window want: a state line the Harness page drew for the tab while Land's one ask stood
+/// leads with its words ([`acts::SWITCH_ASKED`]), and every one it drew from [`SWITCH_SETTLE_MS`]
+/// past the second hold on leads with the hold's stop again ([`stop_words`]' line).
 #[must_use]
-pub fn held_line(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
-    let Some(sw) = seen.cover.words.first() else {
-        return Verdict::Unobserved("the switch was never made".into());
+pub fn asked_line(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
+    let Some((ts, sl)) = stall_of(seen, cx.t0) else {
+        return Verdict::Unobserved("no hold before the switch".into());
+    };
+    let Some(sw) = press_after(seen, *ts) else {
+        return Verdict::Unobserved("the person's switch was never made".into());
     };
     if let Some(v) = untaken(seen, cx.t0) {
         return v;
     }
-    let Some((_, sl)) = stall_of(seen, cx.t0) else {
-        return Verdict::Unobserved("no hold before the switch".into());
+    let Some(ta) = acts_between(seen, sw.at, i64::MAX).first().map(|(t, _)| *t) else {
+        return Verdict::Fail("NO ASK: nothing typed after the switch".into());
     };
-    let lead = stop_words(arm_of(sl), StopForm::Line);
+    let Some((th, _)) = held_again(seen, ta) else {
+        return Verdict::Unobserved("not held again after the ask".into());
+    };
     let w = &seen.window;
-    let rows = observed(
-        &w.page,
-        &w.page_reads,
-        sw.at + SWITCH_SETTLE_MS,
-        seen.end_ms + 1,
-    );
-    let lines: Vec<(i64, &str)> = rows
-        .iter()
-        .filter(|(_, p)| *p != "-")
-        .filter_map(|(t, p)| Some((*t, page_field(p, "state")?)))
-        .collect();
-    if rows.is_empty() {
-        return Verdict::Unobserved("the Harness page was not read after the switch".into());
-    }
-    let Some((t1, l1)) = lines.first() else {
-        return Verdict::Unobserved(format!(
-            "its row drew no state line in the {} read(s) after the switch",
-            rows.len()
-        ));
+    let lines = |from: i64, until: i64| -> Vec<(i64, String)> {
+        observed(&w.page, &w.page_reads, from, until)
+            .into_iter()
+            .filter(|(_, p)| *p != "-")
+            .filter_map(|(t, p)| Some((t, page_field(p, "state")?.to_string())))
+            .collect()
     };
-    match lines.iter().find(|(_, l)| !l.starts_with(&lead)) {
-        Some((t, l)) => Verdict::Fail(format!(
-            "+{} the state line \"{}\" leads with no stop ({lead:?})",
+    let asking = lines(ta, *th);
+    let Some((t1, l1)) = asking
+        .iter()
+        .find(|(_, l)| l.starts_with(acts::SWITCH_ASKED))
+    else {
+        return if asking.is_empty() {
+            Verdict::Unobserved("its row drew no state line while the ask stood".into())
+        } else {
+            Verdict::Fail(format!(
+                "no state line in the {} drawn while the ask stood leads with \"{}\": +{} \"{}\"",
+                asking.len(),
+                acts::SWITCH_ASKED,
+                at(cx.t0, asking[0].0),
+                one_line(&asking[0].1, 200)
+            ))
+        };
+    };
+    // Held again under Land: no switch to make, so the stop names none.
+    let lead = stop_words(arm_of(sl), StopForm::Line, false);
+    let again = lines(th + SWITCH_SETTLE_MS, seen.end_ms + 1);
+    if let Some((t, l)) = again.iter().find(|(_, l)| !l.starts_with(&lead)) {
+        return Verdict::Fail(format!(
+            "+{} after the second hold the state line \"{}\" leads with no stop ({lead:?})",
             at(cx.t0, *t),
             one_line(l, 200)
-        )),
-        None => Verdict::Pass(format!(
-            "{} state line(s) from +{} lead with the stop: \"{}\"",
-            lines.len(),
+        ));
+    }
+    if again.is_empty() {
+        return Verdict::Unobserved(format!(
+            "+{} \"{}\"; no state line drawn after the second hold",
             at(cx.t0, *t1),
             one_line(l1, 160)
-        )),
+        ));
     }
+    Verdict::Pass(format!(
+        "+{} \"{}\"; {} state line(s) after the second hold lead with the stop: \"{}\"",
+        at(cx.t0, *t1),
+        one_line(l1, 160),
+        again.len(),
+        one_line(&again[0].1, 160)
+    ))
 }
 
 /// The turn's point after `t`: its first `EVENT idle` with words.
@@ -820,7 +1325,8 @@ pub fn judge_busy(seen: &Seen, t0: i64) -> Verdict {
 
 /// Whether a switch chain's watch is over: a landing one [`WATCH_MS`]'s third past its landing, or
 /// [`LAND_WATCH_MS`] past its last step; `switch-flip` [`WATCH_MS`] past its flip and past its
-/// back-off's due; `switch-held` [`WATCH_MS`] past its switch.
+/// back-off's due; `switch-over-held` [`WATCH_MS`] past its second hold, or [`LAND_WATCH_MS`]
+/// past its switch where no ask came and held again.
 #[must_use]
 pub fn watched(chain: Chain, seen: &Seen, now: i64) -> bool {
     let landed = seen
@@ -843,7 +1349,16 @@ pub fn watched(chain: Chain, seen: &Seen, now: i64) -> bool {
                 .unwrap_or(i64::MIN);
             since(seen.cover.words.last().map(|w| w.at), WATCH_MS) && now >= due + PAST_DUE_MS
         }
-        Chain::SwitchHeld => since(first, WATCH_MS),
+        Chain::SwitchOverHeld => {
+            let pressed = press_after(seen, i64::MIN).map(|w| w.at);
+            let again = seen
+                .all_acts()
+                .into_iter()
+                .find(|(t, _)| pressed.is_some_and(|p| *t > p))
+                .and_then(|(ta, _)| held_again(seen, *ta))
+                .map(|(t, _)| *t);
+            since(again, WATCH_MS) || since(pressed, LAND_WATCH_MS)
+        }
         _ => false,
     }
 }
@@ -894,12 +1409,43 @@ fn set(door: &Door<'_>, tab: &mut Tab, words: &[&'static str]) {
             reply,
             took,
             phase: phase.clone(),
+            person: false,
         });
     }
 }
 
+/// THE PERSON'S PRESS of `w` on Settings ▸ Harness's SESSIONS row for `tab`
+/// ([`super::surfaces::press_word`], on `page`, the desk's view, where one stands): the window
+/// writes the word as the person's (`autopilot_by=human:settings`), which no `meta set` does. Kept
+/// as [`set`] keeps its writes, with `person` set; one not pressed is kept as not taken, saying
+/// why ([`untaken`]).
+fn press(door: &Door<'_>, tab: &mut Tab, page: Option<&str>, w: &'static str) {
+    let phase = word(&on(door, &tab.sid, &["status"]), "phase").unwrap_or_else(|| "?".into());
+    let t = now_ms();
+    let (took, reply) = match super::surfaces::press_word(door, page, &tab.sid, w) {
+        Ok(said) => (true, said),
+        Err(why) => (false, why),
+    };
+    println!(
+        "  [{}] +{} word    the person's press of {w} on Settings ▸ Harness: {}{} (phase={phase})",
+        tab.chain.name(),
+        at(tab.t0, t),
+        if took { "" } else { "DID NOT TAKE: " },
+        one_line(&reply, 120)
+    );
+    tab.seen.cover.words.push(Switched {
+        at: t,
+        word: w,
+        reply,
+        took,
+        phase,
+        person: true,
+    });
+}
+
 /// THE WORD STEP: each switch chain's writes of its tab's word, the person's switch, at its time
-/// (`switch-seq`'s draft typed and cleared around it): none for any other chain.
+/// (`switch-seq`'s draft typed and cleared around it; `switch-over-held`'s by `meta set` and then
+/// by the person's press on `page`, Settings ▸ Harness's view): none for any other chain.
 ///
 /// # Errors
 /// The run was interrupted.
@@ -908,6 +1454,7 @@ pub(in crate::forever) fn word_step(
     h: Harness,
     tab: &mut Tab,
     now: i64,
+    page: Option<&str>,
 ) -> Result<(), Fail> {
     if !switches(tab.chain) {
         return Ok(());
@@ -922,10 +1469,18 @@ pub(in crate::forever) fn word_step(
         Chain::SwitchFlip if unset && rest.is_some_and(|t| now >= t + SWITCH_AFTER_MS) => {
             set(door, tab, &["land", "off"]);
         }
-        Chain::SwitchHeld
-            if unset && stall_of(s, tab.t0).is_some_and(|(t, _)| now >= t + HELD_SWITCH_MS) =>
-        {
-            set(door, tab, &["land"]);
+        Chain::SwitchOverHeld => {
+            // `meta set`'s Land HELD_SWITCH_MS past the hold, its Cruise CTL_WATCH_MS later, then
+            // the person's press of Land.
+            let held = stall_of(s, tab.t0).map(|(t, _)| *t);
+            match s.cover.words.as_slice() {
+                [] if held.is_some_and(|t| now >= t + HELD_SWITCH_MS) => {
+                    set(door, tab, &["land"]);
+                }
+                [ctl] if now >= ctl.at + CTL_WATCH_MS => set(door, tab, &["cruise"]),
+                [_, back] if now >= back.at + SWITCH_SETTLE_MS => press(door, tab, page, "land"),
+                _ => {}
+            }
         }
         Chain::SwitchBusy
             if unset && now >= tab.t0 + BUSY_SWITCH_MS && point_after(s, tab.t0).is_none() =>
@@ -938,11 +1493,11 @@ pub(in crate::forever) fn word_step(
     Ok(())
 }
 
-/// `switch-seq`'s steps: the draft typed [`DRAFT_AFTER_MS`] into its back-off at rest (through the
-/// control socket; the loop takes a draft it did not type as a person's typing all the same, and
-/// holds its hands off for their grace from its sighting, [`PERSON_HOLD`]), the switch
-/// [`DRAFT_BEFORE_MS`] after it stood, and the draft cleared by backspaces [`DRAFT_PAST_MS`] past
-/// the switch.
+/// `switch-seq`'s steps: the draft typed [`DRAFT_AFTER_MS`] into its back-off at rest, the switch
+/// [`DRAFT_BEFORE_MS`] after it was typed and no sooner than it stood, and the draft cleared by
+/// backspaces [`DRAFT_PAST_MS`] past the switch, each key `as=person`: the loop holds its hands off
+/// for a person's key ([`PERSON_HOLD`]), and a draft no key of theirs stamped holds it only while
+/// it stands.
 fn draft_step(
     door: &Door<'_>,
     h: Harness,
@@ -955,9 +1510,10 @@ fn draft_step(
     match tab.seen.cover.draft.clone() {
         None if rest.is_some_and(|t| now >= t + DRAFT_AFTER_MS) => {
             let typed = now_ms();
-            let r = door.ctl(&[&format!("@{}", tab.sid), "send", DRAFT])?;
-            let stood = r.code == 0
-                && crate::wait_until(std::time::Duration::from_secs(10), || standing(DRAFT));
+            let r = door.ctl(&[&format!("@{}", tab.sid), "send", "as=person", DRAFT])?;
+            // A hang detector, never a budget: Claude Code 2.1.316 under load drew a draft typed
+            // through the socket 15 s late (`kif3-cc`, 2026-11-01), as it reads a fresh tab's.
+            let stood = r.code == 0 && crate::wait_until(super::DRAFT_HANG, || standing(DRAFT));
             println!(
                 "  [{}] +{} draft   \"{DRAFT}\" sent ({}): {}",
                 tab.chain.name(),
@@ -992,10 +1548,10 @@ fn draft_step(
             let who = format!("@{}", tab.sid);
             let before = at_composer(door, &tab.sid, agent);
             for _ in 0..DRAFT.chars().count() {
-                door.ctl(&[&who, "key", "backspace"])?;
+                door.ctl(&[&who, "key", "as=person", "backspace"])?;
             }
             let cleared = now_ms();
-            let emptied = crate::wait_until(std::time::Duration::from_secs(10), || standing(""));
+            let emptied = crate::wait_until(super::DRAFT_HANG, || standing(""));
             println!(
                 "  [{}] +{} draft   cleared by {} backspace(s) (it read {:?} before): {}",
                 tab.chain.name(),
@@ -1073,17 +1629,7 @@ pub(in crate::forever) fn woke_witness(run: &Run, sid: &str) -> Option<Vec<Woke>
 pub fn woke_in(dir: &Path) -> Option<Vec<Woke>> {
     let mut out = Vec::new();
     let mut read = false;
-    for entry in std::fs::read_dir(dir).ok()?.flatten() {
-        let path = entry.path();
-        if path.extension().is_none_or(|x| x != "atape") {
-            continue;
-        }
-        let Some(tape) = std::fs::read(&path)
-            .ok()
-            .and_then(|raw| show::open(&raw, true).ok())
-        else {
-            continue;
-        };
+    for tape in tapes_in(dir)? {
         read = true;
         out.extend(woke_of(&text::render(None, &tape.items)));
     }

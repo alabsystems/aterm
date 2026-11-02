@@ -12,6 +12,7 @@ mod held_guard;
 mod lazy_init;
 mod lex;
 mod lock_order;
+pub mod mirror;
 pub mod scan_set;
 mod scope_census;
 pub mod seal;
@@ -438,9 +439,25 @@ fn waiting_read_on(body: &[String]) -> Option<&str> {
     })
 }
 
+/// `path` as text with `/` between its components on every host: the spelling every
+/// registration, span and pattern of the census uses, where Windows joins with `\`.
+pub(crate) fn slash(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if cfg!(windows) {
+        text.replace('\\', "/")
+    } else {
+        text.into_owned()
+    }
+}
+
+/// `path` relative to `root`, spelled as [`slash`] spells it: the census's name for a file.
+pub(crate) fn rel_path(root: &Path, path: &Path) -> String {
+    slash(path.strip_prefix(root).unwrap_or(path))
+}
+
 /// Returns `true` if `path` is a test-only source file excluded from implementation scans.
 pub fn is_test_file(path: &Path) -> bool {
-    let s = path.to_string_lossy();
+    let s = slash(path);
     s.contains("/tests/")
         || s.ends_with("_tests.rs")
         || path
@@ -837,7 +854,7 @@ struct Marker {
 }
 
 fn marker_sweep_file(p: &Path) -> bool {
-    !is_test_file(p) && !p.to_string_lossy().contains("/aterm-census/")
+    !is_test_file(p) && !slash(p).contains("/aterm-census/")
 }
 
 fn sweep_markers(root: &Path, files: &[PathBuf]) -> Vec<Marker> {
@@ -846,11 +863,7 @@ fn sweep_markers(root: &Path, files: &[PathBuf]) -> Vec<Marker> {
         let Ok(text) = tree::read_to_string(file) else {
             continue;
         };
-        let rel = file
-            .strip_prefix(root)
-            .unwrap_or(file)
-            .to_string_lossy()
-            .into_owned();
+        let rel = crate::rel_path(root, file);
         let lines: Vec<&str> = text.lines().collect();
         for (i, line) in lines.iter().enumerate() {
             let t = line.trim_start();
@@ -898,11 +911,7 @@ fn collect_out_of_closure_markers(root: &Path, scan_dirs: &[String]) -> Vec<Mark
             if !tree::is_dir(&path) {
                 continue;
             }
-            let rel = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
+            let rel = crate::rel_path(root, &path);
             if closure_crate_dirs.contains(rel.as_str()) {
                 continue;
             }
@@ -1048,11 +1057,7 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
         let Ok(text) = tree::read_to_string(&file) else {
             continue;
         };
-        let rel = file
-            .strip_prefix(root)
-            .unwrap_or(&file)
-            .to_string_lossy()
-            .into_owned();
+        let rel = crate::rel_path(root, &file);
         parse_source_fns(&mask_unshipped_items(&text), &rel, &mut fns);
     }
     let mut by_name: std::collections::BTreeMap<String, Vec<usize>> = Default::default();

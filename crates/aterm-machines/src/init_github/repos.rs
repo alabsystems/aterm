@@ -769,14 +769,14 @@ fn remote(text: &str) -> Result<Remote, String> {
 
 fn admit_endpoint(
     sys: &dyn System,
-    user: &User,
+    command: &Cmd,
     owner: &str,
     repo: &Repo,
     url: &str,
 ) -> Result<String, String> {
     let expanded = text(
         sys,
-        &git(sys, user, None).args(["ls-remote", "--get-url", "--", url]),
+        &command.clone().args(["ls-remote", "--get-url", "--", url]),
         "cannot inspect Git's effective GitHub repository URL",
     )?;
     let mut lines = expanded.lines();
@@ -818,13 +818,7 @@ impl<'a> CloneGuard<'a> {
     }
 }
 
-fn network_git(
-    sys: &dyn System,
-    user: &User,
-    endpoint: &str,
-    guard: Option<&CloneGuard<'_>>,
-) -> Cmd {
-    let cmd = git(sys, user, None);
+fn network_git(sys: &dyn System, cmd: Cmd, endpoint: &str, guard: Option<&CloneGuard<'_>>) -> Cmd {
     let Some(account) = guard.and_then(|guard| guard.account) else {
         return cmd;
     };
@@ -845,23 +839,42 @@ fn network_git(
     ])
 }
 
-fn clone_endpoint(
+/// The exact command configuration admitted for the next network operation. A keychain
+/// credential is usable only over HTTPS; a same-repository GitHub SSH rewrite is kept in
+/// the user's configuration but outranked for this request alone.
+fn clone_command(
     sys: &dyn System,
-    user: &User,
+    ordinary: Cmd,
     owner: &str,
     repo: &Repo,
     url: &str,
     guard: Option<&CloneGuard<'_>>,
-) -> Result<String, String> {
-    let endpoint = admit_endpoint(sys, user, owner, repo, url)?;
-    if guard.and_then(|guard| guard.account).is_some()
-        && !endpoint
-            .to_ascii_lowercase()
-            .starts_with("https://github.com/")
-    {
+) -> Result<Cmd, String> {
+    let endpoint = admit_endpoint(sys, &ordinary, owner, repo, url)?;
+    if guard.and_then(|guard| guard.account).is_none() {
+        return Ok(ordinary);
+    }
+    let rewritten = !endpoint.starts_with("https://github.com/");
+    let mut command = network_git(
+        sys,
+        ordinary,
+        if rewritten { url } else { &endpoint },
+        guard,
+    );
+    if rewritten {
+        command = canonical_https(command, url);
+    }
+    // Use the very same -c options for admission and the network operation. In particular,
+    // an equally specific conflicting rewrite must still fail instead of falling back to SSH.
+    let admitted = admit_endpoint(sys, &command, owner, repo, url)?;
+    if !admitted.starts_with("https://github.com/") || (rewritten && admitted != url) {
         return Err("the keychain's GitHub credential this clone pins needs a GitHub HTTPS endpoint (a url.insteadOf rewrite names another); no clone started".into());
     }
-    Ok(endpoint)
+    Ok(command)
+}
+
+fn canonical_https(command: Cmd, url: &str) -> Cmd {
+    command.args(["-c".to_owned(), format!("url.{url}.insteadOf={url}")])
 }
 
 #[cfg(test)]
@@ -1002,6 +1015,9 @@ fn clone_one_with(
     let destination = home.join(&repo.name);
     match sys.stat(&destination) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        // Another clone of it (`sync.clone`, a second `aterm init`) published it since the step
+        // read what was missing: a worktree in place at this repository's origin is done.
+        Ok(_) if verify_existing(sys, user, owner, repo, &destination).is_ok() => return Ok(()),
         _ => {
             return Err(format!(
                 "~/{} appeared before cloning; left untouched",
@@ -1010,11 +1026,11 @@ fn clone_one_with(
         }
     }
     let url = format!("https://github.com/{owner}/{}.git", repo.name);
-    let endpoint = clone_endpoint(sys, user, owner, repo, &url, guard)?;
     current()?;
+    let command = clone_command(sys, git(sys, user, None), owner, repo, &url, guard)?;
     let source = text(
         sys,
-        &network_git(sys, user, &endpoint, guard).args([
+        &command.args([
             "ls-remote",
             "--symref",
             "--",
@@ -1047,8 +1063,10 @@ fn clone_one_with(
     {
         return Err("the empty GitHub repository's default branch changed; run init again".into());
     }
-    let endpoint = clone_endpoint(sys, user, owner, repo, &url, guard)?;
+    // Refuse a changed route before allocating staging; check again after staging is
+    // ready so the eventual network command does not reuse an earlier admission.
     current()?;
+    clone_command(sys, git(sys, user, None), owner, repo, &url, guard)?;
     let mut staging = match staging {
         Some(staging) => staging,
         None => Scratch::new_in(sys, home, "github-clone")
@@ -1065,7 +1083,8 @@ fn clone_one_with(
         .map_err(|_| "cannot mark the private repository staging as this clone's")?;
     let _ = sys.rename(&marking, &staging.path().join(OWNER));
     let clone = staging.path().join("repo");
-    let command = network_git(sys, user, &endpoint, guard)
+    current()?;
+    let command = clone_command(sys, git(sys, user, None), owner, repo, &url, guard)?
         .budget(CLONE_BUDGET)
         .args([
             "clone",
@@ -1101,12 +1120,27 @@ fn clone_one_with(
     }
     verify_new(sys, user, repo, &clone, &source)?;
     current()?;
-    sys.rename_noreplace(&clone, &destination).map_err(|_| {
-        format!(
+    // Publishing is not repeated safely, so it holds the update boundary (init-on-by-default
+    // design §6.7). A wait there for an update's handoff, up to minutes, checks `current` again
+    // before the rename, as every step of a guarded clone does.
+    let _boundary = sys.update_boundary().hold(
+        aterm_types::update_boundary::GuardedItem::ClonePublishRename,
+        &current,
+    )?;
+    if sys.rename_noreplace(&clone, &destination).is_err() {
+        // Another clone of it published first: a worktree in place at this repository's origin
+        // is done, and this one's staging goes. Anything else there is left untouched.
+        if verify_existing(sys, user, owner, repo, &destination).is_ok() {
+            staging.close().map_err(|_| {
+                "the repository is in place, but this clone's private staging could not be removed"
+            })?;
+            return Ok(());
+        }
+        return Err(format!(
             "cannot publish ~/{} without replacing an existing destination; left untouched",
             repo.name
-        )
-    })?;
+        ));
+    }
     staging.close().map_err(
         |_| "repository published, but its private empty staging directory could not be removed",
     )?;
@@ -1286,6 +1320,7 @@ pub(super) mod tests {
     use crate::port::{Fake, GithubResponse, Live, Ran, Stat};
     use std::path::PathBuf;
 
+    mod clone_route_tests;
     mod staging_tests;
 
     const KEYCHAIN: &str = "fixture_keychain_token_only";
@@ -2110,6 +2145,18 @@ pub(super) mod tests {
         empty: bool,
         guard: Option<&CloneGuard<'_>>,
     ) -> (Repo, PathBuf, String) {
+        script_clone_named_route(sys, who, name, sequence, empty, guard, false)
+    }
+
+    pub(in crate::init_github) fn script_clone_named_route(
+        sys: &Fake,
+        who: &User,
+        name: &str,
+        sequence: u64,
+        empty: bool,
+        guard: Option<&CloneGuard<'_>>,
+        rewritten: bool,
+    ) -> (Repo, PathBuf, String) {
         let repo = Repo {
             owner: "alice".into(),
             name: name.into(),
@@ -2120,12 +2167,33 @@ pub(super) mod tests {
         };
         let url = format!("https://github.com/alice/{name}.git");
         let url = url.as_str();
+        let endpoint = if rewritten {
+            format!("git@github.com:alice/{name}.git")
+        } else {
+            url.to_owned()
+        };
         sys.on(
             &git(sys, who, None)
                 .args(["ls-remote", "--get-url", "--", url])
                 .display(),
-            Ran::ok(url),
+            Ran::ok(&endpoint),
         );
+        let route = || {
+            let command = network_git(sys, git(sys, who, None), url, guard);
+            if rewritten {
+                canonical_https(command, url)
+            } else {
+                command
+            }
+        };
+        if guard.and_then(|guard| guard.account).is_some() {
+            sys.on(
+                &route()
+                    .args(["ls-remote", "--get-url", "--", url])
+                    .display(),
+                Ran::ok(url),
+            );
+        }
         let remote = if empty {
             String::new()
         } else {
@@ -2133,7 +2201,7 @@ pub(super) mod tests {
                 "ref: refs/heads/main\tHEAD\n{A}\tHEAD\n{A}\trefs/heads/main\n{B}\trefs/heads/topic\n{B}\trefs/tags/v1\n"
             )
         };
-        let command = network_git(sys, who, url, guard).args([
+        let command = route().args([
             "ls-remote",
             "--symref",
             "--",
@@ -2145,7 +2213,7 @@ pub(super) mod tests {
         sys.on(&command.display(), Ran::ok(&remote));
         let staged =
             Fake::scratch_path(Some(Path::new(&who.home)), "github-clone", sequence).join("repo");
-        let command = network_git(sys, who, url, guard)
+        let command = route()
             .budget(CLONE_BUDGET)
             .args([
                 "clone",
@@ -2228,6 +2296,78 @@ pub(super) mod tests {
             Ran::ok(""),
         );
         (repo, staged, clone_key)
+    }
+
+    /// A clone's publish rename is not repeated safely, so it holds the update boundary while
+    /// it runs (init-on-by-default design §6.7): an update's handoff waits for it, boundedly.
+    /// Before, nothing held the guard, and a handoff could cut the publish in half.
+    #[test]
+    fn a_clones_publish_rename_holds_the_update_boundary() {
+        let (sys, who, _) = fixture();
+        let (repo, _, _) = script_clone(&sys, &who, false);
+        clone_one(&sys, &who, "alice", &repo).unwrap();
+        assert_eq!(
+            sys.guarded_renames(),
+            [Path::new(&who.home).join("new")],
+            "the publish rename ran under the guard"
+        );
+    }
+
+    /// A guarded clone checks `current` before every step, the publish included. The publish's
+    /// guard waits for a pending update handoff (design §6.7), up to minutes, after the last
+    /// check; once the handoff is refused it checks `current` again, and publishes nothing when
+    /// the vault changed meanwhile. Before, the clone was published on the check made before the
+    /// wait.
+    #[test]
+    fn a_clone_publish_that_waited_for_a_handoff_checks_current_again() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for changes in [true, false] {
+            let (sys, who, _) = fixture();
+            let changed = AtomicBool::new(false);
+            let current = || {
+                if changed.load(Ordering::SeqCst) {
+                    Err("injected: the vault changed while the publish waited".to_owned())
+                } else {
+                    Ok(())
+                }
+            };
+            let guard = CloneGuard::pinned("captured-account", &current);
+            let (repo, _staged, _) = script_clone_with(&sys, &who, false, Some(&guard));
+            let latch = sys.boundary.latch_handoff(Duration::from_secs(60));
+            let result = std::thread::scope(|scope| {
+                let worker = scope
+                    .spawn(|| clone_one_guarded(&sys, &who, &repo, "captured-account", &current));
+                let deadline = std::time::Instant::now() + Duration::from_secs(60);
+                while sys.boundary.waiting() == 0 {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the publish never waited"
+                    );
+                    std::thread::yield_now();
+                }
+                changed.store(changes, Ordering::SeqCst);
+                drop(latch);
+                worker.join().unwrap()
+            });
+            let published = sys
+                .calls()
+                .iter()
+                .any(|call| call.starts_with("rename-noreplace "));
+            if changes {
+                assert!(
+                    !published,
+                    "the clone was published after the vault changed during its wait: {result:?}"
+                );
+                assert!(
+                    matches!(&result, Err(why) if why.contains("the vault changed")),
+                    "{result:?}"
+                );
+            } else {
+                // CONTROL: nothing changed while it waited, and it publishes once.
+                assert!(published && result.is_ok(), "{result:?}");
+            }
+            assert_eq!(sys.boundary.any_held(), None);
+        }
     }
 
     #[test]
@@ -2323,7 +2463,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn guarded_clones_refuse_ssh_rewrites_before_network_work() {
+    fn guarded_clones_refuse_an_ssh_rewrite_that_still_wins_the_scoped_override() {
         for endpoint in [
             "git@github.com:alice/new.git",
             "ssh://git@github.com/alice/new.git",
@@ -2344,11 +2484,62 @@ pub(super) mod tests {
                     .display(),
                 Ran::ok(endpoint),
             );
-            let why = clone_one_guarded(&sys, &who, &repo, "alice", &|| Ok(())).unwrap_err();
-            assert!(why.contains("HTTPS"), "{why}");
+            let guard = CloneGuard::pinned("alice", &|| Ok(()));
+            sys.on(
+                &canonical_https(
+                    network_git(&sys, git(&sys, &who, None), url, Some(&guard)),
+                    url,
+                )
+                .args(["ls-remote", "--get-url", "--", url])
+                .display(),
+                Ran::ok(endpoint),
+            );
+            assert!(clone_one_guarded(&sys, &who, &repo, "alice", &|| Ok(())).is_err());
             assert!(sys.calls().iter().all(|call| !call.contains("--symref")
                 && !call.contains(" clone ")
                 && !call.contains("scratch")));
+        }
+    }
+
+    /// Two clones of one repository race (`sync.clone` and a second `aterm init`): the one that
+    /// finds it in place at its origin, before it clones or as it publishes, is done, and its
+    /// staging goes; the racing worktree is never touched.
+    #[test]
+    fn a_clone_that_finds_the_repository_in_place_at_its_origin_is_done() {
+        for at_publish in [false, true] {
+            let (sys, who, _) = fixture();
+            let staged =
+                Fake::scratch_path(Some(Path::new(&who.home)), "github-clone", 0).join("repo");
+            let (repo, _, clone_key) = script_clone(&sys, &who, false);
+            let destination = Path::new(&who.home).join("new");
+            script_existing(&sys, &who, &destination, "new");
+            if at_publish {
+                sys.on_stat(&clone_key, &destination, directory(who.uid));
+                sys.on_write(&clone_key, &destination.join(".git/racer"), b"racing clone");
+            } else {
+                sys.stat_of(destination.to_str().unwrap(), directory(who.uid));
+                sys.file(
+                    destination.join(".git/racer").to_str().unwrap(),
+                    b"racing clone",
+                );
+            }
+            assert_eq!(
+                clone_one(&sys, &who, "alice", &repo),
+                Ok(()),
+                "{at_publish}"
+            );
+            assert_eq!(
+                sys.read_file(&destination.join(".git/racer")).unwrap(),
+                b"racing clone"
+            );
+            assert!(sys.read_file(&destination.join(".git/fixture")).is_err());
+            assert!(sys.stat(&staged).is_err(), "{at_publish}");
+            assert_eq!(
+                sys.calls().iter().any(|call| call.contains(" clone ")),
+                at_publish,
+                "{:?}",
+                sys.calls()
+            );
         }
     }
 

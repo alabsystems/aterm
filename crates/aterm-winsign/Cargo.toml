@@ -26,5 +26,8 @@ path = "src/lib.rs"
 # switch, exactly as `pins::APPLE_TEAM_ID` is for the mac lane.
 aterm-update-core = { workspace = true }
 
+[dev-dependencies]
+aterm-tempfile = { workspace = true }
+
 [lints]
 workspace = true

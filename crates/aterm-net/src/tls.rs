@@ -293,7 +293,7 @@ where
     answered
 }
 
-fn end_without_waiting<C, S>(transport: TlsTransport<C>, clean: bool)
+pub(crate) fn end_without_waiting<C, S>(transport: TlsTransport<C>, clean: bool)
 where
     C: std::ops::DerefMut + std::ops::Deref<Target = rustls::ConnectionCommon<S>>,
     S: rustls::SideData,
@@ -387,14 +387,11 @@ where
     let conn = stream.conn;
     let mut tcp_down = stream.sock;
     let _ = aterm_uds::keep_out_of_children(&tcp_down);
-    let tcp_wr = tcp_down.try_clone()?;
-    let _ = aterm_uds::keep_out_of_children(&tcp_wr);
-    let tcp_up = tcp_down.try_clone()?;
-    let _ = aterm_uds::keep_out_of_children(&tcp_up);
+    let tcp_wr = aterm_uds::kept_out(|| tcp_down.try_clone())?;
+    let tcp_up = aterm_uds::kept_out(|| tcp_down.try_clone())?;
 
     let _ = aterm_uds::keep_out_of_children(&local);
-    let mut local_up = local.try_clone()?;
-    let _ = aterm_uds::keep_out_of_children(&local_up);
+    let mut local_up = aterm_uds::kept_out(|| local.try_clone())?;
     let mut local_down = local;
 
     let shared = Arc::new(RelayShared {

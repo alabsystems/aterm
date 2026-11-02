@@ -679,3 +679,80 @@ fn a_versions_folder_reached_through_a_junction_is_read_where_it_resolves() {
         "the junction stays"
     );
 }
+
+/// A version the harness started and has not seen run is KEPT until it does
+/// ([`crate::harness::first_exec`]), and the remover asks again as it removes.
+#[cfg(unix)]
+#[test]
+fn a_version_the_harness_has_not_seen_run_is_kept() {
+    let tmp = Tmp::new("versions-first-exec");
+    let versions = versions_of(
+        &tmp,
+        &[("2.1.1", b"version one!"), ("2.1.2", b"version two!")],
+    );
+    let launcher = tmp.path().join("claude");
+    std::os::unix::fs::symlink(versions.join("2.1.2"), &launcher).expect("the live link");
+    let holds = tmp
+        .path()
+        .join("state")
+        .join(crate::harness::first_exec::HOLDS);
+    let survey = || {
+        let roots = Roots {
+            versions_dir: Some(versions.clone()),
+            live_link: Some(launcher.clone()),
+            version_hashes: Some(tmp.path().join("state").join(HASH_FILE)),
+            first_exec: Some(holds.clone()),
+            ..Roots::default()
+        };
+        let survey = scan_with(
+            &roots,
+            NOW,
+            Trigger::OnDemand,
+            Config::default(),
+            None,
+            &nobody,
+        );
+        report(&survey, Config::default())
+            .rows_of(Class::ClaudeStaleVersions)
+            .into_iter()
+            .find(|r| r.path == entry(&versions, "2.1.1"))
+            .cloned()
+            .expect("the older one")
+    };
+    let old = entry(&versions, "2.1.1");
+    let hold = crate::harness::first_exec::hold(&holds, &old).expect("the hold");
+    let row = survey();
+    assert!(!row.removable);
+    assert_eq!(
+        row.blocked.as_deref(),
+        Some(crate::harness::first_exec::KEPT)
+    );
+    let mut remove = crate::harness::disk::remover(
+        crate::harness::disk::Judge {
+            now: NOW,
+            threshold_days: crate::harness::disk::DEFAULT_TARGET_STALE_DAYS,
+            device: None,
+            volume: None,
+        },
+        Some(holds.clone()),
+        crate::harness::disk::idle::Sessions::default,
+    );
+    let removable = crate::harness::disk::Row {
+        removable: true,
+        blocked: None,
+        ..row
+    };
+    let refused = remove(&removable).expect_err("a held version stays");
+    assert!(
+        refused
+            .to_string()
+            .contains(crate::harness::first_exec::KEPT),
+        "{refused}"
+    );
+    assert!(old.exists());
+
+    hold.ran();
+    assert!(survey().removable, "once it ran, the hold is gone");
+    remove(&removable).expect("the version goes");
+    assert!(!old.exists());
+}

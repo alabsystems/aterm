@@ -216,9 +216,13 @@ fn every_family_has_one_mode_and_no_prefix_shadows_another() {
             Family::FleetUnreadable,
             Family::HugeDir,
             Family::ServiceMemory,
-            Family::Secrets
+            Family::Secrets,
+            Family::Join
         ]
     );
+    // The asking Macs' entries are the members desk's, filed apart from the need ledger's.
+    assert_eq!(Family::Join.stem(), "members.join");
+    assert_eq!(Family::Join.tag(), tags::PRIVACY);
     assert_eq!(Family::Ai.stem(), "ai");
     assert_eq!(Family::Ai.tag(), tags::HARNESS);
     // Occupancy's two entries (the owner's `prompt`, a hold's spent lines) are raised and

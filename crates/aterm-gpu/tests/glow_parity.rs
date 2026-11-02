@@ -646,11 +646,13 @@ fn cpu_bloom_twin_matches_the_gpu_bloom() {
     );
 }
 
-/// looks10 L1: a frame whose bloom spares its letters (`BloomGate::SparesLetters`) blooms on
-/// the GPU from the lights kept clear of them (`bloom::spared_sources`), as its CPU twin and
-/// the trail replay's judge do: the GPU's frame is the twin's within float rounding, and its
-/// letters' cells take none of the bloom. Negative control: the twin bloomed from the whole
-/// light, as an open gate blooms, misses.
+/// looks10 L1, composed r2 B1: a frame whose bloom spares its letters
+/// (`BloomGate::SparesLetters`) blooms on the GPU from the lights kept clear of them and keeps
+/// off them at its composite by the frame's letter mask (`bloom::spared_sources`,
+/// `bloom::LetterMask`), as its CPU twin and the trail replay's judge do: the GPU's frame is
+/// the twin's within float rounding, and its letters' cells take none of the bloom. Negative
+/// controls: the twin bloomed from the whole light, as an open gate blooms, misses, and so
+/// does the spared light bloomed without the mask.
 #[test]
 fn a_spared_gpu_bloom_matches_its_cpu_twin() {
     let theme = Theme::default();
@@ -699,7 +701,7 @@ fn a_spared_gpu_bloom_matches_its_cpu_twin() {
         cell_h: ch,
     };
     let (mut crown, mut blur) = (Vec::new(), Vec::new());
-    aterm_render::bloom::spared_sources(
+    let mask = aterm_render::bloom::spared_sources(
         &input.cursor_glow_add,
         &input,
         grid,
@@ -708,15 +710,16 @@ fn a_spared_gpu_bloom_matches_its_cpu_twin() {
         &mut blur,
     );
     assert!(
-        !blur.is_empty() && blur.len() > input.cursor_glow_add.len(),
+        !blur.is_empty() && blur.len() > input.cursor_glow_add.len() && mask.is_some(),
         "fixture: the lights cross the letters and reach past their shields"
     );
-    let twin = |glow: &[GlowQuad]| {
+    let twin_kept = |glow: &[GlowQuad], mask: Option<&aterm_render::bloom::LetterMask>| {
         let mut frame = base.clone();
-        aterm_render::bloom::apply(&mut frame, glow, rows, params).unwrap();
+        aterm_render::bloom::apply_kept_off(&mut frame, glow, rows, params, mask).unwrap();
         frame
     };
-    let spared = twin(&blur);
+    let twin = |glow: &[GlowQuad]| twin_kept(glow, None);
+    let spared = twin_kept(&blur, mask.as_ref());
     let worst = max_channel_delta(&spared.pixels, &lit.pixels);
     assert!(
         worst <= 2,
@@ -740,5 +743,10 @@ fn a_spared_gpu_bloom_matches_its_cpu_twin() {
     assert!(
         max_channel_delta(&open.pixels, &lit.pixels) > 2,
         "negative control: the bloom of the whole light misses"
+    );
+    let unmasked = twin(&blur);
+    assert!(
+        max_channel_delta(&unmasked.pixels, &lit.pixels) > 2,
+        "negative control: the spared light bloomed without the mask misses"
     );
 }

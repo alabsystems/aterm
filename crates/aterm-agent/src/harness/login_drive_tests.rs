@@ -1082,4 +1082,12 @@ fn slow_approver_past_output_grace_still_drains_buffered_signed_in_line() {
         Outcome::Exited(Some(0)),
         "CONTROL: exit 0 without a completion phrase stays Exited(Some(0))"
     );
+
+    let script = tmp_ctrl.path().join("env-script");
+    std::fs::write(&script, b"#!/usr/bin/env -u NODE_OPTIONS -C /tmp node\n").expect("write");
+    assert_eq!(env_interpreter(&script).as_deref(), Some("node"));
+    std::fs::write(&script, b"#!/usr/bin/env -- FOO=1 python3\n").expect("write");
+    assert_eq!(env_interpreter(&script).as_deref(), Some("python3"));
+    std::fs::write(&script, b"#!/usr/bin/env ..\n").expect("write");
+    assert_eq!(env_interpreter(&script), None);
 }

@@ -216,6 +216,15 @@ pub fn admit_in(
             "{why}; the VM can never boot here"
         ))),
         Err(Error::Ledger(e)) => Ok(unclaimed(guest, &e.to_string())),
+        Err(e @ Error::Stuck { .. }) => Err(crate::linux::not_run(format!(
+            "its claim for {} {e}; this run {}",
+            guest.vm,
+            if booting {
+                "booted nothing"
+            } else {
+                "ran nothing on it"
+            }
+        ))),
         Err(Error::Stopped { signal, short }) => Err(Fail {
             stopped: signal
                 .inspect(|sig| crate::stop::note(*sig))
@@ -379,6 +388,7 @@ impl Booter {
             since: self.since,
             verb: self.verb.clone(),
             checkout: self.checkout.clone(),
+            stalled: None,
         };
         let offset = i64::try_from(self.since)
             .ok()
@@ -691,6 +701,7 @@ mod tests {
             ppid: 1,
             footprint: 14 << 30,
             written: 0,
+            cpu_ns: 0,
         }])));
 
         let stop = Arc::new(AtomicBool::new(false));

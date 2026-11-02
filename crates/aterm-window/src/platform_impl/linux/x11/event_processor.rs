@@ -226,7 +226,7 @@ impl EventProcessor {
             return;
         }
 
-        // SAFETY: Xlib wrote the member that `event_type` names.
+        // SAFETY (each arm's union read): Xlib wrote the member that `event_type` names.
         match event_type {
             event_type::CLIENT_MESSAGE => {
                 self.client_message(unsafe { &xev.client_message }, &mut callback)

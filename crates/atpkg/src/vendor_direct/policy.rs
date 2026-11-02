@@ -103,7 +103,9 @@ impl Policy {
                 .entry(program.to_string())
                 .or_default()
                 .insert(version);
-        } else if let Ok(build) = spelling.parse::<u64>() {
+        } else if !spelling.starts_with('+')
+            && let Ok(build) = spelling.parse::<u64>()
+        {
             if let Some(version) = Version::from_build_id(build) {
                 self.yanked
                     .entry(program.to_string())

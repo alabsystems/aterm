@@ -366,6 +366,7 @@ impl Observed {
     pub(crate) fn read_carry(&mut self, kv: impl Fn(&str) -> Option<String>) {
         self.integration = kv("obs_int").and_then(|w| carried_word(INTEGRATION_WORDS, &w));
         self.ctx = kv("obs_ctx")
+            .filter(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
             .and_then(|d| d.parse().ok())
             .filter(|d| *d <= 10);
         let flag = |k: &str| {
@@ -379,12 +380,24 @@ impl Observed {
         self.escalated = flag("obs_esc");
         self.progress = kv("obs_prog").and_then(|v| {
             let (w, d) = match v.split_once('.') {
-                Some((w, d)) => (w.to_string(), Some(d.parse::<u8>().ok()?)),
+                Some((w, d)) => (
+                    w.to_string(),
+                    Some(
+                        d.bytes()
+                            .all(|b| b.is_ascii_digit())
+                            .then(|| d.parse::<u8>().ok())
+                            .flatten()?,
+                    ),
+                ),
                 None => (v, None),
             };
             Some((carried_word(PROGRESS_WORDS, &w)?, d))
         });
-        let fp = |k: &str| kv(k).and_then(|h| u64::from_str_radix(&h, 16).ok());
+        let fp = |k: &str| {
+            kv(k)
+                .filter(|h| h.bytes().all(|b| b.is_ascii_hexdigit()))
+                .and_then(|h| u64::from_str_radix(&h, 16).ok())
+        };
         self.cwd = fp("cwd_fp");
         self.title = fp("title_fp");
         self.meta = kv("meta_fp").map_or_else(Vec::new, |v| {
@@ -392,6 +405,9 @@ impl Observed {
                 .filter_map(|pair| {
                     let (f, h) = pair.split_once('.')?;
                     BoundedToken::new(Key::Field, f)?;
+                    if !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+                        return None;
+                    }
                     Some((f.to_string(), u64::from_str_radix(h, 16).ok()?))
                 })
                 .take(META_FIELDS_MAX)
@@ -1200,9 +1216,14 @@ impl SessionLog {
         at: Stamp,
     ) {
         let land_at = change.land_at.map(|ms| ms.div_euclid(1000));
-        let fp = match land_at {
-            None => name_fp(change.value),
-            Some(s) => name_fp(Some(&format!("{}\u{0}{s}", change.value.unwrap_or("")))),
+        let fp = match (land_at, change.why) {
+            (None, None) => name_fp(change.value),
+            (Some(s), None) => name_fp(Some(&format!("{}\u{0}{s}", change.value.unwrap_or("")))),
+            (land_at, Some(why)) => name_fp(Some(&format!(
+                "{}\u{0}{}\u{0}why={why}",
+                change.value.unwrap_or(""),
+                land_at.map_or_else(String::new, |s| s.to_string())
+            ))),
         };
         let known = self.observed.meta.iter().any(|(f, _)| f == change.field);
         let moved = self.observed.meta_moved(change.field, fp);
@@ -1224,6 +1245,10 @@ impl SessionLog {
             let _ = f.set(Key::Value, Val::Text(t));
         }
         let f = with(f, Key::LandAt, land_at.map(Val::I));
+        let f = match change.why {
+            Some(why) => f.clone().word(Key::Why, why).unwrap_or(f),
+            None => f,
+        };
         let f = with(f, Key::Carried, (!moved).then_some(Val::U(1)));
         let _ = self.log.mark(
             Mark::new(Kind::Meta, Src::Meta, Conf::Exact)

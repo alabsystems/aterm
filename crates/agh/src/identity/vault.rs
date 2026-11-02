@@ -1600,7 +1600,7 @@ pub(crate) fn forget_locked(dirs: &Dirs, slot: Slot) -> Result<bool> {
 /// The write's.
 #[cfg(all(unix, any(test, debug_assertions)))]
 pub fn record_for_tests(dirs: &Dirs, rows: &[(Slot, &str, &str)]) -> std::io::Result<()> {
-    if let Some(parent) = dirs.config.parent() {
+    if let Some(parent) = dirs.config.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
     }
     aterm_uds::private_file::create_private_dir(&dirs.config)?;
@@ -1620,7 +1620,7 @@ pub fn record_for_tests(dirs: &Dirs, rows: &[(Slot, &str, &str)]) -> std::io::Re
 /// `record_lock`'s.
 #[cfg(all(unix, any(test, debug_assertions)))]
 pub fn hold_record_lock_for_tests(dirs: &Dirs) -> Result<impl Sized> {
-    if let Some(parent) = dirs.config.parent() {
+    if let Some(parent) = dirs.config.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(|e| Error::could_not_run(e.to_string()))?;
     }
     record_lock(dirs)

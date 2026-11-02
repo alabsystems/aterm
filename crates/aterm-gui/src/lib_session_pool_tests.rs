@@ -45,6 +45,7 @@ fn test_session(id: u64) -> Session {
         frame: Default::default(),
         witness: Default::default(),
         fenced_writes: Default::default(),
+        native_policy: Default::default(),
     });
     Session {
         child_reaped: std::sync::atomic::AtomicBool::new(false),

@@ -28,6 +28,9 @@ pub const CRASHES: &str = "crashes";
 /// The directory of the conversations' databases under the config.
 pub const CONVERSATIONS: &str = "conversations";
 
+/// The settings file under the config (`<config>/settings.json`).
+pub const SETTINGS_JSON: &str = "settings.json";
+
 /// The hidden flag that moves the Gemini directory (absolute; a relative one
 /// is ignored by agy, which logs `.gemini must be an absolute path`).
 const FLAG_GEMINI_DIR: &str = "gemini_dir";
@@ -37,6 +40,9 @@ const FLAG_APP_DATA_DIR: &str = "app_data_dir";
 
 /// The flag that resumes a conversation by id.
 const FLAG_CONVERSATION: &str = "conversation";
+
+/// The flag that overrides `settings.json` for this session alone.
+const FLAG_SETTINGS: &str = "settings";
 
 /// How a flag takes its value (Go's `flag` package, which agy's parser
 /// follows: measured, a switch alone or `=true`/`=false`, a value attached or
@@ -64,9 +70,9 @@ enum Fate {
     OneShot,
 }
 
-/// agy's flags (`agy --help`, 1.4.0, and the two hidden ones the premeasure
-/// found), named without their dashes as Go reads them, each with its fate on
-/// a relaunch.
+/// agy's flags (`agy --help`, 1.4.0 checked against 1.4.10, with the latter's session-only
+/// settings and the two hidden config flags the premeasure found), named without their
+/// dashes as Go reads them, each with its fate on a relaunch.
 const FLAGS: &[(&str, Arity, Fate)] = &[
     ("add-dir", Arity::One, Fate::Drop),
     ("agent", Arity::One, Fate::Drop),
@@ -96,6 +102,9 @@ const FLAGS: &[(&str, Arity, Fate)] = &[
     ("project", Arity::One, Fate::Drop),
     ("remote-control", Arity::None, Fate::Refuse),
     ("sandbox", Arity::None, Fate::Keep),
+    // 1.4.10's session-only JSON/file override: its arity is known, but its config/home
+    // effects have not been measured for a relaunch, so keep refusing that move.
+    (FLAG_SETTINGS, Arity::One, Fate::Refuse),
     ("version", Arity::None, Fate::OneShot),
 ];
 
@@ -134,6 +143,14 @@ fn flag_token(tok: &str) -> Option<(&str, Option<&str>)> {
         Some((name, value)) => (name, Some(value)),
         None => (bare, None),
     })
+}
+
+fn go_bool(value: Option<&str>) -> Option<bool> {
+    match value {
+        None | Some("1" | "t" | "T" | "true" | "TRUE" | "True") => Some(true),
+        Some("0" | "f" | "F" | "false" | "FALSE" | "False") => Some(false),
+        Some(_) => None,
+    }
 }
 
 /// One launch's argv, read: the flags it carries, verbatim and in order.
@@ -175,17 +192,23 @@ fn read(argv: &[String]) -> Result<Read, Stop> {
                 None => Ok(out),
             };
         }
-        let Some((name, attached)) = flag_token(tok) else {
+        if tok == "-" || !tok.starts_with('-') {
             let what = if SUBCOMMANDS.contains(&tok) {
                 tok
             } else {
                 "positional"
             };
             return Err(Stop::Ends(what.to_string()));
+        }
+        let Some((name, attached)) = flag_token(tok) else {
+            return Err(Stop::Unknown(tok.to_string()));
         };
         let Some((arity, fate)) = flag(name) else {
             return Err(Stop::Unknown(name.to_string()));
         };
+        if arity == Arity::None && go_bool(attached).is_none() {
+            return Err(Stop::Unknown(name.to_string()));
+        }
         let mut words = vec![tok.to_string()];
         if arity == Arity::One && attached.is_none() {
             let Some(value) = argv.get(i) else {
@@ -208,22 +231,64 @@ fn read(argv: &[String]) -> Result<Read, Stop> {
 #[must_use]
 pub fn is_tui_argv(argv: &[String]) -> bool {
     match read(argv) {
-        Ok(_) | Err(Stop::Refuse(_)) => true,
+        Ok(_) => true,
         Err(Stop::Ends(_)) => false,
-        Err(Stop::Unknown(_)) => !one_shot_anywhere(argv),
+        Err(Stop::Refuse(_) | Stop::Unknown(_)) => !one_shot_anywhere(argv),
     }
 }
 
-/// A one-shot flag or a subcommand anywhere before `--`, read without the
-/// flag table (an unknown flag may or may not take a value).
+/// A one-shot flag, subcommand, or positional anywhere in `argv`, accounting
+/// for known `Arity::One` flag values and unknown flags that may take a value.
 fn one_shot_anywhere(argv: &[String]) -> bool {
-    argv.iter()
-        .skip(1)
-        .take_while(|t| t.as_str() != "--")
-        .any(|t| match flag_token(t) {
-            Some((name, _)) => flag(name).is_some_and(|(_, fate)| fate == Fate::OneShot),
-            None => SUBCOMMANDS.contains(&t.as_str()),
-        })
+    let mut after_unknown_flag = false;
+    let mut i = 1;
+    while i < argv.len() {
+        let tok = argv[i].as_str();
+        i += 1;
+        if tok == "--" {
+            return argv.get(i).is_some();
+        }
+        match flag_token(tok) {
+            Some((name, attached)) => match flag(name) {
+                Some((_, Fate::OneShot)) => return true,
+                Some((Arity::One, _)) => {
+                    after_unknown_flag = false;
+                    if attached.is_none()
+                        && argv.get(i).is_some_and(|v| {
+                            v != "--"
+                                && !flag_token(v).is_some_and(|(n, _)| {
+                                    flag(n).is_some_and(|(_, f)| f == Fate::OneShot)
+                                })
+                        })
+                    {
+                        i += 1;
+                    }
+                }
+                Some((Arity::None, _)) => {
+                    after_unknown_flag = false;
+                }
+                None => {
+                    after_unknown_flag = attached.is_none();
+                }
+            },
+            None => {
+                if SUBCOMMANDS.contains(&tok) || !after_unknown_flag {
+                    return true;
+                }
+                after_unknown_flag = false;
+            }
+        }
+    }
+    false
+}
+
+/// Whether `tok` is a known value-taking option without an attached value (`--model`, `-i`).
+#[must_use]
+pub(super) fn takes_value(tok: &str) -> bool {
+    let Some((name, None)) = flag_token(tok) else {
+        return false;
+    };
+    matches!(flag(name), Some((Arity::One, _)))
 }
 
 /// The last value of the flag `want` in `argv`, any spelling (`-x=v`,
@@ -235,20 +300,31 @@ fn flag_value<'a>(argv: &'a [String], want: &str) -> Option<&'a str> {
     while i < argv.len() {
         let tok = argv[i].as_str();
         i += 1;
-        if tok == "--" {
+        if matches!(tok, "-" | "--") || !tok.starts_with('-') {
             break;
         }
         let Some((name, attached)) = flag_token(tok) else {
-            continue;
+            break;
         };
         if name != want {
+            if attached.is_none()
+                && matches!(flag(name), Some((Arity::One, _)))
+                && argv.get(i).is_some_and(|v| v != "--")
+            {
+                i += 1;
+            }
             continue;
         }
         found = match attached {
             Some(value) => Some(value),
             None => {
-                let value = argv.get(i).map(String::as_str);
-                i += 1;
+                let value = argv
+                    .get(i)
+                    .filter(|v| v.as_str() != "--")
+                    .map(String::as_str);
+                if value.is_some() {
+                    i += 1;
+                }
                 value
             }
         };
@@ -280,13 +356,20 @@ pub fn with_model(argv: &[String], model: &str) -> Vec<String> {
     while i < rest.len() {
         let tok = rest[i].as_str();
         i += 1;
-        if tok == "--" {
+        if matches!(tok, "-" | "--") || !tok.starts_with('-') {
             out.extend(rest[i - 1..].iter().cloned());
             break;
         }
         match flag_token(tok) {
             Some((FLAG_MODEL, attached)) => {
                 if attached.is_none() {
+                    i += 1;
+                }
+            }
+            Some((name, None)) if matches!(flag(name), Some((Arity::One, _))) => {
+                out.push(tok.to_owned());
+                if let Some(value) = rest.get(i) {
+                    out.push(value.clone());
                     i += 1;
                 }
             }
@@ -304,6 +387,57 @@ pub fn resumed_conversation(argv: &[String]) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Whether `argv` resumes a conversation: `--conversation <id>`, or `--continue` (`-c`),
+/// read through the flag table as Go reads it: values belong to their flags, parsing stops at
+/// `--` or a positional, and the last continuation switch wins. An unknown flag or invalid
+/// boolean proves no resumed launch.
+#[must_use]
+pub fn resumes(argv: &[String]) -> bool {
+    if !is_tui_argv(argv) {
+        return false;
+    }
+    let mut continuing = false;
+    let mut conversation = None;
+    let mut i = 1;
+    while let Some(tok) = argv.get(i) {
+        i += 1;
+        if matches!(tok.as_str(), "-" | "--") || !tok.starts_with('-') {
+            break;
+        }
+        let Some((name, attached)) = flag_token(tok) else {
+            return false;
+        };
+        let Some((arity, _)) = flag(name) else {
+            return false;
+        };
+        match arity {
+            Arity::None => {
+                let Some(value) = go_bool(attached) else {
+                    return false;
+                };
+                if matches!(name, "c" | "continue") {
+                    continuing = value;
+                }
+            }
+            Arity::One => {
+                let value = if let Some(value) = attached {
+                    value
+                } else {
+                    let Some(value) = argv.get(i) else {
+                        return false;
+                    };
+                    i += 1;
+                    value.as_str()
+                };
+                if name == FLAG_CONVERSATION {
+                    conversation = Some(value);
+                }
+            }
+        }
+    }
+    continuing || conversation.is_some_and(|value| !value.is_empty())
+}
+
 /// The flags of `argv` that MOVE agy's config, verbatim and in order (`--gemini_dir`, `--app_data_dir`, each with its value).
 #[must_use]
 pub fn config_flags(argv: &[String]) -> Vec<String> {
@@ -312,24 +446,82 @@ pub fn config_flags(argv: &[String]) -> Vec<String> {
     while i < argv.len() {
         let tok = argv[i].as_str();
         i += 1;
-        if tok == "--" {
+        if matches!(tok, "-" | "--") || !tok.starts_with('-') {
             break;
         }
         let Some((name, attached)) = flag_token(tok) else {
-            continue;
+            break;
         };
         if name != FLAG_GEMINI_DIR && name != FLAG_APP_DATA_DIR {
+            if attached.is_none() && matches!(flag(name), Some((Arity::One, _))) {
+                i += 1;
+            }
             continue;
         }
-        out.push(tok.to_string());
-        if attached.is_none()
-            && let Some(value) = argv.get(i)
-        {
-            out.push(value.clone());
-            i += 1;
+        match attached {
+            Some(_) => out.push(tok.to_string()),
+            None => {
+                if let Some(value) = argv.get(i) {
+                    out.push(tok.to_string());
+                    out.push(value.clone());
+                    i += 1;
+                }
+            }
         }
     }
     out
+}
+
+/// Whether this launch retains the default credential/profile route. Reuse
+/// the pinned native flag grammar, including Go's single-dash and value rules.
+pub fn shared_key_defaults(args: &[String]) -> bool {
+    let mut i = 0;
+    while let Some(tok) = args.get(i) {
+        i += 1;
+        if tok == "--" {
+            return true;
+        }
+        if tok == "-" || !tok.starts_with('-') {
+            return !SUBCOMMANDS.contains(&tok.as_str());
+        }
+        let Some((name, attached)) = flag_token(tok) else {
+            return false;
+        };
+        let Some((arity, fate)) = flag(name) else {
+            return false;
+        };
+        if matches!(
+            name,
+            FLAG_GEMINI_DIR
+                | FLAG_APP_DATA_DIR
+                | FLAG_CONVERSATION
+                | "c"
+                | "continue"
+                | "log-file"
+                | "h"
+                | "help"
+                | "version"
+        ) || fate == Fate::Refuse
+        {
+            return false;
+        }
+        match arity {
+            Arity::None => {
+                if go_bool(attached).is_none() {
+                    return false;
+                }
+            }
+            Arity::One => {
+                if attached.is_none() {
+                    if args.get(i).is_none() {
+                        return false;
+                    }
+                    i += 1;
+                }
+            }
+        }
+    }
+    true
 }
 
 /// THE WORDS A RELAUNCH TYPES AFTER THE PROGRAM: the launch's carried flags verbatim ([`FLAGS`]), then `--conversation=<uuid>`.
@@ -363,15 +555,54 @@ pub fn is_conversation_uuid(s: &str) -> bool {
         && matches!(b[19], b'8' | b'9' | b'a' | b'b')
 }
 
+/// Whether `argv` passes `--settings` (any Go spelling before `--` or a positional), overriding
+/// [`SETTINGS_JSON`] for this session alone.
+#[must_use]
+pub fn has_settings_override(argv: &[String]) -> bool {
+    let mut i = 1;
+    while i < argv.len() {
+        let tok = argv[i].as_str();
+        i += 1;
+        if matches!(tok, "-" | "--") || !tok.starts_with('-') {
+            break;
+        }
+        let Some((name, attached)) = flag_token(tok) else {
+            break;
+        };
+        if name == FLAG_SETTINGS {
+            return true;
+        }
+        if attached.is_none()
+            && matches!(flag(name), Some((Arity::One, _)))
+            && argv.get(i).is_some_and(|v| v != "--")
+        {
+            i += 1;
+        }
+    }
+    false
+}
+
 /// THE CONFIG DIRECTORY A PROCESS WITH THIS ARGV AND HOME USES.
 #[must_use]
 pub fn config_dir(argv: &[String], home: Option<&str>, fallback: &Path) -> Option<PathBuf> {
+    config_dir_or(argv, home, Some(fallback))
+}
+
+/// [`config_dir`] where the host's own home may also be absent: `None` when neither
+/// `--gemini_dir=<abs>`, an absolute `home`, nor an absolute `fallback` names a Gemini root, or
+/// `--app_data_dir` is not a plain relative path.
+#[must_use]
+pub fn config_dir_or(
+    argv: &[String],
+    home: Option<&str>,
+    fallback: Option<&Path>,
+) -> Option<PathBuf> {
     let gemini = match flag_value(argv, FLAG_GEMINI_DIR).filter(|d| Path::new(d).has_root()) {
         Some(abs) => PathBuf::from(abs),
         None => home
             .map(PathBuf::from)
             .filter(|h| h.has_root())
-            .unwrap_or_else(|| fallback.to_path_buf())
+            .or_else(|| fallback.filter(|h| h.has_root()).map(Path::to_path_buf))?
             .join(GEMINI_DIR),
     };
     let app = match flag_value(argv, FLAG_APP_DATA_DIR) {
@@ -586,7 +817,10 @@ pub fn told_line(conversation: &str, env: &[(String, String)], argv: &[String]) 
     };
     let mut said = String::new();
     for (name, value) in env {
-        if value.chars().any(char::is_control) {
+        if value
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+        {
             return None;
         }
         said.push_str(name);
@@ -596,7 +830,10 @@ pub fn told_line(conversation: &str, env: &[(String, String)], argv: &[String]) 
     }
     said.push_str(PROGRAM);
     for flag in config_flags(argv) {
-        if flag.chars().any(char::is_control) {
+        if flag
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+        {
             return None;
         }
         said.push(' ');

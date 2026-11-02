@@ -1,7 +1,28 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# atpkg-publish: spec recovery from its 332 unit tests
+# atpkg-publish: spec recovery from its unit tests
+
+The harness fresh-clone check also refuses tracked entries marked assume-unchanged
+or skip-worktree. `git status` can hide changed build inputs under those hints, so
+`git::is_pristine` checks the NUL-delimited root and active-submodule index flags before status. It leaves the
+caller's index and files unchanged. The existing
+`a_harness_tree_is_a_fresh_clones_whatever_gits_config_hides` control covers both
+flags and their combination, verifies pre-build refusal and retention, and still
+accepts the ordinary clean tree with its ignored top-level target directory.
+`a_pristine_checkout_checks_index_hints_in_active_submodules` checks both hints
+inside an actual nested checkout and retains the hidden source and index flags.
+
+The REST host binds its fetched main-of-record ref to the full lowercase commit
+SHA read independently through its selected API identity. Git URL rewrites may
+transport matching objects; a mirror-only main cannot define that authority.
+Unreadable or malformed API results stop before fetching, and a mismatch or query
+failure after fetching removes only the attempted record ref. These failures are
+could-not-run results without retries. The real-Git and fake-API controls
+`a_main_of_record_is_bound_to_the_authenticated_hosts_commit` and
+`an_unreadable_main_of_record_never_starts_its_git_fetch` distinguish matching
+transport from a mirror-only commit, preserve unrelated refs, and refuse invalid
+API results before the fetch changes an existing record ref.
 
 > Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 27 tests it
 > deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
@@ -46,6 +67,40 @@
 > `tests/channel/index_plan.rs::each_harness_pins_under_its_own_repo_into_the_default_set` replaces the two tests the
 > 2026-10-24 note names. Pinning a harness stays a release-lane act.
 
+> Status 2026-10-31 (§11 D50, the first signed harness packs): when the public-release lookup is
+> unreachable, `pack-upload` permits private dev staging if `ReleaseHost::repo_seen` observes HTTP 404
+> both as this identity and anonymously. A missing repository and a private repository hidden from
+> both readers are indistinguishable; the result does not prove nonexistence. A repository visible to
+> either reader, an unanswered read or a host that cannot ask keeps the could-not-run in that branch.
+> This stages no public release
+> (`tests/artifact/pack.rs::an_upload_stages_when_neither_reader_observes_the_public_repository`,
+> `tests/channel/rest.rs::a_private_repository_hidden_from_both_readers_is_not_seen`).
+
+> Status 2026-10-31 (§11 D46, D49; the review of 2026-10-27, its findings F1 to F3): `pack-refuse-before-effects`
+> holds a harness's `HEAD` (and codex's package source, `check_source`) to the main the staging host serves, not the
+> checkout's `origin/main`, refuses a harness tree that is not a fresh clone's whatever git's config hides, and hands a
+> harness's build the version it signs
+> (`tests/artifact/pack.rs::{a_harness_is_held_to_the_hosts_main_not_its_checkouts_origin,a_harness_tree_is_a_fresh_clones_whatever_gits_config_hides}`).
+
+> Status 2026-10-31 (§11 D51, a hostile review of D44 to D50, then one of D51's first draft): a
+> harness's build number is its commit's `git rev-list --count`, and a count can name several commits
+> main holds: a merged branch's commit repeats one of the first-parent chain's, and a landing that
+> merges main into a branch and pushes moves main's former tip off that chain as a commit of the same
+> count joins it (grok-alab's `53295526`, main's tip, and `6cc031a0`, both count 15). No rule over the
+> count or the chain's shape names one commit over time, so `pack-refuse-before-effects` keeps the
+> ancestor check (the Apple lane packs a signed release's ledger commit, which such a merge can move off
+> the chain), and a harness build is held to one commit by its version, which names the commit
+> (`+g<sha9>`), and by `pack-upload`: an upload refuses to clobber a staged `pkg-<p>-<b>.toml`, or the
+> `pkg-<p>-<b>.toml.atpkg-staged` a cut-short REST replace left in its place, whose `version` differs
+> from the new manifest's or cannot be read, leaving the staged assets as they were, while the same
+> bytes or version converge; the public owner's copy was already immutable. A staging release deleted
+> by hand gives up that guard for its build, a plain program's version names no commit (for it the
+> guard holds one build to one version). The cross-host follow-up adds a create-only exact-version
+> reservation before payload uploads, shared by pack staging, the Linux lane's signed owner uploads,
+> immutable mirror, and managed raw staging uploads. Generic raw public managed-pack replacement is refused; the
+> validated Linux target-extension policy and immutable mirror remain their respective public routes
+> (`tests/artifact/pack.rs::{a_harness_build_is_one_commit_across_a_merge_that_moves_mains_first_parent_chain,a_staged_build_is_never_clobbered_by_another_version}`).
+
 > Status 2026-10-26 (the stale-publisher guard): `plan` refuses, for every program, a `[programs.<p>]`
 > whose repo moves while its pin does not rise above the head's, as `admit_alab_pin` did for the ALab rows
 > alone and as every client now refuses (`atpkg::succession`), and one whose repo moves while a target cell it
@@ -87,36 +142,41 @@ Result: **138 specs**, covering **326 tests**. **6 tests are not spec samples** 
 
 - `TARGETS` = `atpkg::manifest::TARGETS` (the six client triples); `Triple(i)` indexes it. `os(t)`/`arch(t)`
   are as in `triple-os-arch`; `expect(t)` = `(format, cpu)` of `artifact::arch::expect`.
-- `R_c(t)` (written `R(t)` when the channel is clear) = `Channel::for_target(c, t).pin`: `c.pin` overlaid by
-  `c.pin_by_target[t]`. `union(c)` = every `(program, build)` pair of `pin` and of every overlay.
+- `R(t)` = `Channel::for_target(c, t).pin`: `c.pin` overlaid by `c.pin_by_target[t]`. `union(c)` = every
+  `(program, build)` pair of `pin` and of every overlay.
 - **FS model**: a finite map from relative paths to `Dir | File(bytes, mode, (dev,ino)) | Symlink(target)`.
-  "One inode" = equal `(dev,ino)`. `frame(X)` = every path under `X` has identical content before and after.
-- **Host model**: a map `(owner/repo, tag) -> {draft, prerelease, assets: name -> bytes}` with a call trace
-  (create / upload(Replace) / publish-draft / download / probe / fetch) and failure modes
-  (`Unreachable`, `NotFound`, private, one-shot 500).
+  "One inode" = equal `(dev,ino)`.
+- **Host model** (the `ReleaseHost` trait): a map `(owner/repo, tag) -> {draft, prerelease, assets: name
+  -> bytes}` with a call trace (create / upload(Replace) / publish-draft / download / probe / fetch) and
+  failure modes (`Unreachable`, `NotFound`, private, one-shot 500).
 - **Git model**: a commit DAG with refs (`origin/main`, `FETCH_HEAD`); `cnt(x)` = `|ancestors(x)|` (rev-list
   count); the first-parent chain.
-- **Run model** (`artifact::tools::Run`): program, argv, env (ordered pairs), env_remove, clear_env, cwd.
-  `Tools`, `SealProbe`, `Packer`, `Indexer`, `Builder`, `ServiceManager` are trait objects
-  whose implementations are opaque oracles: the specs quantify over every answer.
-- **Client chain**: `verify_dir`/`verify_pkg` = `atpkg::admit_roster` -> `authorize_index` -> (Enforce)
-  freshness. It is cross-crate and assumed sound. `parse_pkg` and the index.toml parser are the client's
-  and serve as the inverse in round-trip specs.
+- **Run model** (`artifact::tools::Run`): program, args, env (ordered pairs), env_remove, clear_env, cwd.
+  `Tools`, `SealProbe`, `Packer`, `Indexer`, `Builder` and `ServiceManager` are trait objects whose
+  implementations are opaque oracles: the specs quantify over every answer.
+- **Client chain**: `quad::verify_dir` runs the client's `atpkg::admit_roster` -> `authorize_index` ->
+  freshness (under `Freshness::Enforce`), and `verify_pkg` the client's package check and `parse_pkg`;
+  the client is cross-crate and assumed sound. `parse_pkg` and the index.toml parser are the inverses in
+  the round-trip specs.
 - **Switch**: `lineage_switch::read` returns `Dormant | Live | Unknown(why)`; `policy(Dormant) = Dormant`,
   every other reading `Require`.
 - "Refused before X" = in the effect trace the `Err` return precedes the first event of kind X (no such
   event occurs).
 - **Error kinds**: `Refused` (exit 1), `Usage` (exit 2), `CannotRun` (exit 3). Quoted strings in statements
-  are substrings of the `Display` output that the spec fixes: they are the user-visible contract, not prose pins.
-- Most specs here are effectful (fs, git, the release host, processes). They are written down now and stay blocked on
-  gap 8 until their pure core is factored out. Where a refactor is the route, the statement names it
-  (e.g. `arch::classify`).
+  are substrings of the `Display` output the spec fixes: the user-visible contract.
+- Most specs are effectful (fs, git, the release host, processes) and blocked on gap 8 until their pure
+  core is factored out; where a refactor is the route, the statement names it (e.g. `arch::classify`,
+  not yet written).
 
 ## 1. Specs (TSV)
 
 Columns: `id`, `kind`, `functions` (paths under `crates/atpkg-publish/src`), `statement`, `subsumes` (every
-test the spec retires; the primary owner is in §2), `difficulty` (Rust features the proof must handle),
-`blocking_gaps` (audit §7 rows besides the universal gap 0).
+test the spec retires; the primary owner is in §2; `-` for none), `difficulty` (Rust features the proof
+must handle), `blocking_gaps`: rows of the gap table in `docs/AUDIT-trust-for-test-migration-2026-10-15.md`
+§7 besides gap 0 (the seal upgrade), which blocks every row. 1 is non-scalar carriers, 2 `&self`/`&mut
+self` views, 3 E6 body widening, 4 callee-ensures composition, 5 quantified clauses, 6 plain-Rust clause
+publication, 7 loops, 8 effects, 9 the proc-macro boundary, 10 model-to-code refinement, 11 generics, 12
+cross-crate citation, 13 threads, async and closures, 14 Clean elaborator coverage.
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
@@ -166,9 +226,10 @@ pack-select	contract	artifact::pack::select	select(meta, exes, t): name(e) = fil
 pack-parse-metadata	contract	artifact::pack::{parse_metadata,built_executables,strings,version_of}	parse_metadata(json, p): Err unless json has a packages array. expose/bundle = the workspace [metadata.atpkg] list if non-empty, else the concatenation of members' lists; build_args = the workspace list; bundle_only = workspace bundle-only or any member's = true; version = the version of the package named p, else of the first package, else "0.0.0"; manifests = every package's manifest_path. built_executables(stream, meta) = the sorted set of `executable` paths over JSON lines with reason = compiler-artifact, target.kind containing "bin" and manifest_path in meta.manifests (non-JSON lines ignored).	tests/artifact/pack.rs::the_declared_bundle_ships_unshimmed_and_build_args_reach_the_build, tests/artifact/pack.rs::a_bundle_only_program_and_a_declared_bin_that_did_not_build_are_refused	JSON Value navigation (Option chains), flat_map over closures, BTreeSet<PathBuf>	1,7,9,13
 pack-check-build-env	contract	artifact::pack::{check_build_env,SCRUBBED_ENV}	check_build_env(env) = Ok iff every key k equals "CARGO_TARGET_" ++ T ++ "_LINKER" with T non-empty over [A-Z0-9_]; otherwise Err(Usage) naming the first other key (so RUSTFLAGS, RUSTC, CARGO_ENCODED_RUSTFLAGS, RUSTC_WRAPPER, CARGO_TARGET_<T>_RUSTFLAGS and CARGO_TARGET__LINKER are refused).	tests/artifact/pack.rs::a_caller_adds_a_cross_linker_only_and_never_outranks_the_seals_compiler	strip_prefix/strip_suffix, byte predicate loop	1,3,7
 pack-build-command	contract	artifact::pack::{build,metadata}	The build Run the pack issues for (bin, t, meta, env, checkout) is: program bin/targo, argv beginning ["--unverified","build","--release","--target", t] and containing meta.build_args contiguously, cwd = checkout, env_remove containing every SCRUBBED_ENV name, and the caller's env pairs set before RUSTC = bin/trustc and RUSTFLAGS = rustflags(t) (so they cannot override either). The metadata Run uses bin/targo with no --unverified flag.	tests/artifact/pack.rs::a_signed_pack_is_one_the_client_verifies_and_extracts_to_its_signed_root, tests/artifact/pack.rs::the_declared_bundle_ships_unshimmed_and_build_args_reach_the_build, tests/artifact/pack.rs::a_caller_adds_a_cross_linker_only_and_never_outranks_the_seals_compiler	builder over a Run struct (Vec<OsString> argv, Vec<(String,OsString)> env)	1,7
-pack-refuse-before-effects	contract	artifact::pack::{pack_with,check_stage_dir,tail,scan}	pack_with(ctx, req, tools) orders its checks before the effects they guard: a program that is not Plain (bundle, unknown), Unsigned with upload, or a bad env is Err(Usage) before any Run; compiler admission precedes the metadata Run; bundle-only metadata is refused before any build Run; for a harness row (programs::Harness) any bundle, a declared expose other than [tool], an absent program-named package or one not at MAJOR.MINOR.0, a checkout with changes or untracked files, a checkout with no origin, an origin not naming <staging owner>/<program>, a HEAD that is not an ancestor of refs/remotes/origin/main, and a build other than cnt(HEAD) are each Err before any build Run, and the build Run carries --locked; a stage dir <out>/<program> that contains the checkout is refused before anything is removed (the checkout survives); a failed build is Err containing "build FAILED" and the stderr tail; the arch gate and the payload scan (a stock /rustc/<sha>/ path inside a binary, reported as "<rel>: N× <path>") run before any .tar.zst or .toml is written under out; with Signing::Unsigned no .sig is left in the stage (a stale one is removed) and sign_all can later sign what was staged.	tests/artifact/pack.rs::a_mislabelled_build_is_refused_by_the_arch_gate_before_any_manifest, tests/artifact/pack.rs::a_bundle_only_program_and_a_declared_bin_that_did_not_build_are_refused, tests/artifact/pack.rs::a_failed_build_is_refused_quoting_its_tail, tests/artifact/pack.rs::a_payload_carrying_a_stock_std_path_is_refused_before_anything_is_tarred, tests/artifact/pack.rs::a_live_switch_refuses_a_receiptless_compiler_before_the_checkout_is_read, tests/artifact/pack.rs::nothing_unsigned_publishes_and_an_unsigned_pack_leaves_no_signature, tests/artifact/pack.rs::an_out_whose_stage_holds_the_checkout_is_refused_and_the_checkout_survives, tests/artifact/pack.rs::a_caller_adds_a_cross_linker_only_and_never_outranks_the_seals_compiler, tests/artifact/pack.rs::a_harness_pack_refuses_every_departure_from_its_rule_before_the_build, tests/artifact/pack.rs::a_harness_pack_is_minted_only_from_its_repos_main	a long effectful orchestration; needs an effect-trace model (Runs, fs writes) and ordering facts	1,4,8
+pack-refuse-before-effects	contract	artifact::pack::{pack_with,check_stage_dir,tail,scan}	pack_with(ctx, req, tools) orders its checks before the effects they guard: a program that is not Plain (bundle, unknown), Unsigned with upload, or a bad env is Err(Usage) before any Run; compiler admission precedes the metadata Run; bundle-only metadata is refused before any build Run; for a harness row (programs::Harness) any bundle, a declared expose other than [tool], an absent program-named package or one not at MAJOR.MINOR.0, a checkout with changes, untracked files or submodule changes whatever status.showUntrackedFiles or a submodule ignore setting says, or with an ignored path other than the top-level target/ (git::is_pristine), a checkout with no origin, an origin not naming <staging owner>/<program>, a HEAD that is not an ancestor of the main the staging host serves (ReleaseHost::fetch_main into refs/atpkg-publish/main-of-record, deleted after; the checkout's refs/remotes/origin/main is never read, and an unreadable host is Err(CannotRun)), and a build other than cnt(HEAD) are each Err before any build Run, and the build Run carries --locked and, for a harness only, ALAB_HARNESS_VERSION = the version it signs, with every pack's build removing an inherited ALAB_HARNESS_VERSION; a stage dir <out>/<program> that contains the checkout is refused before anything is removed (the checkout survives); a failed build is Err containing "build FAILED" and the stderr tail; the arch gate and the payload scan (a stock /rustc/<sha>/ path inside a binary, reported as "<rel>: N× <path>") run before any .tar.zst or .toml is written under out; with Signing::Unsigned no .sig is left in the stage (a stale one is removed) and sign_all can later sign what was staged.	tests/artifact/pack.rs::a_mislabelled_build_is_refused_by_the_arch_gate_before_any_manifest, tests/artifact/pack.rs::a_bundle_only_program_and_a_declared_bin_that_did_not_build_are_refused, tests/artifact/pack.rs::a_failed_build_is_refused_quoting_its_tail, tests/artifact/pack.rs::a_payload_carrying_a_stock_std_path_is_refused_before_anything_is_tarred, tests/artifact/pack.rs::a_live_switch_refuses_a_receiptless_compiler_before_the_checkout_is_read, tests/artifact/pack.rs::nothing_unsigned_publishes_and_an_unsigned_pack_leaves_no_signature, tests/artifact/pack.rs::an_out_whose_stage_holds_the_checkout_is_refused_and_the_checkout_survives, tests/artifact/pack.rs::a_caller_adds_a_cross_linker_only_and_never_outranks_the_seals_compiler, tests/artifact/pack.rs::a_harness_pack_refuses_every_departure_from_its_rule_before_the_build, tests/artifact/pack.rs::a_harness_pack_is_minted_only_from_its_repos_main, tests/artifact/pack.rs::a_harness_is_held_to_the_hosts_main_not_its_checkouts_origin, tests/artifact/pack.rs::a_harness_build_is_one_commit_across_a_merge_that_moves_mains_first_parent_chain, tests/artifact/pack.rs::a_harness_tree_is_a_fresh_clones_whatever_gits_config_hides, tests/artifact/pack.rs::a_harness_pack_ships_its_one_tool_at_its_release_line_and_the_commit_built	a long effectful orchestration; needs an effect-trace model (Runs, fs writes) and ordering facts	1,4,8
 pack-output	contract	artifact::pack::pack_with; artifact::pkgdoc::{fresh,merge}	pack_with(ctx, req, tools) = Ok(o) with Signing::MachineKey implies: every staged binary stage_root/bin/<name> was passed to tools.strip(&dest, false) before scan and tarwrite::write_with; client_verifies(o.manifest, o.signature) = Ok(m) with m's row for req.triple named asset_name(program, build, triple), provenance from the admitted compiler (lineage unproven/seed-mint/lineage as admitted; a seed-mint row records ddc_seed_relation), and extract(o.asset) has tree_root = that row's tree_root with bin/<expose> present; o.build = req.build, o.version = the metadata version (a harness row: the program-named package's MAJOR.MINOR.0 followed by "+g" and git rev-parse --short=9 HEAD), o.exposes = the selection; with merge_from = Some(base) the manifest bytes start with base's bytes and m carries both targets' rows in order.	tests/artifact/pack.rs::a_signed_pack_is_one_the_client_verifies_and_extracts_to_its_signed_root, tests/artifact/pack.rs::a_merge_extends_the_first_targets_manifest_for_the_second, tests/artifact/pack.rs::a_receipt_carrying_compiler_packs_under_a_live_switch_and_says_so, tests/artifact/pack.rs::a_harness_pack_ships_its_one_tool_at_its_release_line_and_the_commit_built, tests/artifact/pack.rs::a_harness_repo_declaring_no_expose_ships_its_rows_tool_and_nothing_else, tests/artifact/pack.rs::a_release_line_is_major_minor_zero_and_a_dev_version_adds_the_short_sha	composition of tarwrite/pkgdoc/sign/quad contracts; effects	1,4,8,12
-pack-upload	contract	artifact::upload::publish; artifact::pack::pack_with (upload)	With upload: the staging owner's repo gets release atpkg-<p>-<b>, prerelease and not draft, holding exactly {asset, pkg-<p>-<b>.toml, .sig}; a rerun converges onto it; if the public owner already serves pkg bytes equal to this manifest nothing is uploaded (uploaded = false); if it serves other bytes the pack is Err("a public pack is immutable") and the staging release is unchanged.	tests/artifact/pack.rs::an_upload_stages_a_prerelease_and_a_public_pack_is_immutable	host model (ReleaseHost trait), byte comparison	1,2,8
+pack-upload	contract	artifact::upload::publish; artifact::pack::pack_with (upload)	With upload: the staging owner's repo gets prerelease atpkg-<p>-<b>, not draft, holding {asset, pkg-<p>-<b>.toml, .sig, atpkg-stage-version.v1}; payloads precede the ready manifest. A rerun converges only after pack-version-admission. Each existing manifest or .atpkg-staged replacement must equal this manifest's bytes or record its version; a differing/unreadable legacy version refuses before reserving, an unanswered download is CannotRun, and post-admission conflict leaves payloads unchanged (the reservation metadata may remain). If public pkg bytes equal this manifest, nothing is uploaded; other public bytes refuse as immutable without touching staging. On an unreachable public-release lookup, private dev staging proceeds only when repo_seen(public) = Ok(false), meaning both identity and anonymous readers return repository 404; this does not prove nonexistence. Every other unanswered public lookup is CannotRun. This arm does not publish publicly.	tests/artifact/pack.rs::an_upload_stages_a_prerelease_and_a_public_pack_is_immutable, tests/artifact/pack.rs::a_staged_build_is_never_clobbered_by_another_version, tests/artifact/pack.rs::a_harness_build_is_one_commit_across_a_merge_that_moves_mains_first_parent_chain, tests/artifact/pack.rs::an_upload_stages_when_neither_reader_observes_the_public_repository, tests/channel/rest.rs::a_repository_is_unseen_only_when_the_identity_and_an_anonymous_reader_both_get_404, tests/channel/rest.rs::a_private_repository_hidden_from_both_readers_is_not_seen	host model (ReleaseHost trait), byte comparison	1,2,8
+pack-version-admission	contract	artifact::upload::reserve_pack_version; artifact::upload::version; channel::mirror; lane::linux	Every cooperating managed pack writer reserves an owner/tag's exact version using the immutable create-only asset atpkg-stage-version.v1: magic `atpkg staged version 1\n`, u32 little-endian UTF-8 byte length, then 1..4096 exact UTF-8 version bytes, with no trailing bytes. A new release starts with reservation metadata alone; ready manifests are not locks. Replace::Never admission always reads the winner, including conflict or lost ACK; missing/unreadable/malformed/different winners authorize no payload upload. Existing manifest and .atpkg-staged copies are checked before and after admission. Local manifests are bounded to 16 MiB and copied for upload. Generic staging and verified Linux byte-prefix target extensions retain their existing replacement policies; mirror payloads remain Never and staging metadata must match the signed version. Marker-only interrupted mirror releases resume; other manifest-less public releases retain their refusal. Managed raw staging requires the matching program/build manifest and the guarded path; raw public managed packs refuse with the supported Linux lane or immutable mirror/index route, while index/unrelated raw protocols are unchanged. Same-version resumability is supported; same-version target-union lost updates and older/out-of-band writers are outside this cross-version guarantee.	tests/artifact/pack_upload_race.rs, tests/channel/mirror.rs::matching_reservation_metadata_is_verified_and_a_marker_only_public_release_resumes, tests/lane/linux.rs::a_keyed_box_signs_uploads_to_both_owners_and_publishes_the_follow_up_index	actual orchestration with deterministic interleaving ReleaseHost and data-only FakeHost fixtures	1,2,8
 upload-preflight	contract	artifact::upload::{preflight,tag,token_preflight}	preflight(asset, sha, others) = Ok iff sha256(asset) = sha (and the others exist), else Err("do not match the signed manifest"); tag(p, b) = "atpkg-" ++ p ++ "-" ++ b; token_preflight(ctx) = Ok iff ctx.tokens.staging exists and is non-empty after trimming, else Err("--upload needs the staging owner's token at ~/.secrets/..."); an --upload pack calls token_preflight before anything is built.	tests/artifact/pack.rs::preflight_refuses_bytes_that_no_longer_match_the_signed_row, tests/artifact/pack.rs::an_upload_without_the_staging_token_is_refused_before_anything_is_built	file hashing and reads (effects), String format	1,8
 pack-lock	invariant	artifact::pack::pack_lock	Mutual exclusion per program: while a guard from pack_lock(ctx, p, w) is alive, every pack_lock(ctx, p, 0) returns Err containing "another publish of p"; pack_lock(ctx, q, 0) for q != p is unaffected; after the guard drops, pack_lock(ctx, p, 0) succeeds.	tests/artifact/pack.rs::the_pack_lock_serializes_publishes_of_one_program	advisory file locks with Drop (OS effect), waits with a Duration	8,13
 pack-parse-args	contract	artifact::pack::parse_args	parse_args(ctx, args, tools): operands program and --checkout C are required; --toolchain, --build N (u64), --triple T (a client target), --merge-from, --out, --trust-repo, --unsigned, --upload map to their fields; triple defaults to host_of(the resolved trustc); out defaults to C/target/atpkg-pack; ctx.trust_repo defaults to home/trust and is set by --trust-repo; a missing program/checkout, an unknown flag, a non-numeric build, a missing value or a non-client triple is Err(Usage).	-	index loop over &[String], &mut Ctx, Tools probe	1,2,7,8
@@ -204,8 +265,8 @@ index-publish-dry-run	contract	channel::index::publish_with	With upload = false:
 index-triple-gate	contract	channel::index::{triple_gate,darwin_targets,read_manifest}	For every pin a delta moves, p: h -> b, let D(m) = the Darwin targets of manifest m. The gate refuses before any public write when D(pkg(p,h)) is not a subset of D(pkg(p,b)) and the dropped target is not allowed: Err("REFUSING — p h->b drops <t>" naming --allow-triple-drop p=<t>); an allowed drop is logged with its reason; pkg(p, b) is read from the public owner when present (else staging); an unreadable pkg(p, h) is Err("cannot read p's head manifest"), never a pass. No .triple-gate scratch survives.	tests/channel/index_publish.rs::a_moved_pin_may_not_silently_drop_a_darwin_target	BTreeSet<String> subset, host downloads and pkg verification (effects)	1,8,12
 newest-roster	contract	channel::index::newest_roster	newest_roster(ctx, candidates, log) returns the master-verified roster pair with the greatest roster_seq among the candidates (the baseline quad's pair and the machine's installed pair); the shipped pair is byte-identical to that candidate, so the published roster generation never falls below the head's.	tests/channel/producer_to_client.rs::the_roster_shipped_is_the_newest_and_never_below_the_heads	fs reads, roster verification, max-by	1,8,12
 ctx-shown-redaction	contract	ctx::Ctx::shown	shown(p) = "~/" ++ rest when p = ctx.home/rest, else p.display(); every path a publish logs goes through shown, so no log line of publish_with contains ctx.home's absolute spelling.	tests/channel/producer_to_client.rs::a_successful_publish_prints_no_absolute_home_path	Path::strip_prefix, String format; the corollary needs every log site (effect trace)	1,8
-mirror-staging-accounting	contract	channel::mirror::{mirror,mirror_in,one,check_staged,bind,release_assets}	mirror(ctx, q, opts) processes each (program, build) in pins::union(q's channel) exactly once, in sorted order. For a unit whose public copy is absent, it downloads the staging release (retrying Unreachable), verifies pkg-<p>-<b>.toml + .sig under q's authority, requires the manifest to bind program = p and build = b (else Err("binds program=.. build=..")), every asset a row names to hash to its signed sha256 (else Err("hash mismatch vs the signed manifest")), and every staging file to be one of {manifest, sig, assets the rows name}, each other name refused literally (Err("unverifiable extra file <name>")); the planned set is exactly [manifest, sig, assets...]. A dry run plans and writes nothing; a build staging does not carry is Err("<owner>/<p>@atpkg-<p>-<b> could not be downloaded").	tests/channel/mirror.rs::an_absent_pack_is_checked_and_planned_with_exactly_its_signed_set, tests/channel/mirror.rs::every_extra_staging_file_is_refused_by_name, tests/channel/mirror.rs::a_staging_pack_whose_bytes_or_bind_disagree_with_its_signature_is_refused, tests/channel/mirror.rs::every_build_any_target_resolves_is_mirrored_once	host model, BTreeSet of names, hashing, pkg verification (cross-crate)	1,8,12
-mirror-public	contract	channel::mirror::one	For each unit: public complete and its manifest self-checks -> skipped with no staging call, no write and no payload fetch; public release present with no manifest -> Err("exists but serves no pkg-<p>-<b>.toml") and no write; public manifest that does not verify -> Err("PKG SELF-CHECK FAILED"); public manifest verifying but != staging's -> Err("DIFFERS from staging"); absent -> one create (prerelease) of exactly the signed set; present with missing assets -> upload exactly the missing ones with Replace::Never (never replacing an existing asset).	tests/channel/mirror.rs::a_publish_creates_the_signed_set_and_confirms_it_then_a_rerun_skips, tests/channel/mirror.rs::a_missing_public_asset_is_uploaded_alone_and_never_replaces, tests/channel/mirror.rs::a_published_pack_is_immutable_and_must_verify, tests/channel/mirror.rs::a_public_release_serving_no_manifest_is_refused_with_its_remedy	host model with call trace, byte comparisons	1,8,12
+mirror-staging-accounting	contract	channel::mirror::{mirror,mirror_in,one,check_staged,bind,release_assets}	mirror(ctx, q, opts) processes each (program, build) in pins::union(q's channel) exactly once, sorted. It verifies the staging manifest/signature under q's authority, program/build binding and each signed release asset hash. Staging holds exactly the signed set plus an optional well-framed reservation matching the signed version; every other name is refused literally. The planned payload set remains [manifest, sig, assets...], excluding independent reservation metadata. A dry run plans and writes nothing, and a missing staging pack is refused.	tests/channel/mirror.rs::an_absent_pack_is_checked_and_planned_with_exactly_its_signed_set, tests/channel/mirror.rs::every_extra_staging_file_is_refused_by_name, tests/channel/mirror.rs::a_staging_pack_whose_bytes_or_bind_disagree_with_its_signature_is_refused, tests/channel/mirror.rs::every_build_any_target_resolves_is_mirrored_once, tests/channel/mirror.rs::matching_reservation_metadata_is_verified_and_a_marker_only_public_release_resumes	host model, BTreeSet of names, hashing, pkg verification (cross-crate)	1,8,12
+mirror-public	contract	channel::mirror::one	Public complete and its manifest self-checks -> skip with no staging call, write or payload fetch. A manifest-less public release refuses without writes except a matching marker-only interrupted reservation, which resumes. Invalid signatures refuse, and a valid public manifest differing from staging refuses. Before creating or repairing a pack, reserve the exact version under pack-version-admission; every payload upload remains Replace::Never, with ready manifest last. Absent packs get a prerelease containing the reservation and signed set; incomplete packs upload only missing signed payloads plus reservation reconciliation.	tests/channel/mirror.rs::a_publish_creates_the_signed_set_and_confirms_it_then_a_rerun_skips, tests/channel/mirror.rs::a_missing_public_asset_is_uploaded_alone_and_never_replaces, tests/channel/mirror.rs::a_published_pack_is_immutable_and_must_verify, tests/channel/mirror.rs::a_public_release_serving_no_manifest_is_refused_with_its_remedy, tests/channel/mirror.rs::matching_reservation_metadata_is_verified_and_a_marker_only_public_release_resumes	host model with call trace, byte comparisons	1,8,12
 mirror-confirm	contract	channel::mirror::one; host::Probe	A probe answer Unknown(_) on the download host decides nothing: the unit is Err("nothing about atpkg-<p>-<b> is known") with no staging read and no write. After a create/upload the asset is probed up to channel::SERVE_PROBES times, ReleaseHost::retry_pause apart (channel::probe_served); still Absent -> Err("after the upload — the public repo is private").	tests/channel/mirror.rs::a_create_the_download_host_never_serves_fails_the_run, tests/channel/mirror.rs::an_unreachable_download_host_decides_nothing	three-valued Probe enum, bounded retry loop	1,7,8
 seed-describe	contract	channel::seed::{field,generated_section,describe}	field(t, k) = the rest of the first line of t that starts with k ++ "=" (None if none). generated_section(s) = the suffix of s (whole lines, newlines kept) starting at the first line that starts with GENERATED_MARKER ("" if none). describe(r) = format("built from the pin {short(pinned_seed_commit)}; double compile against {short(ddc_seed_commit)} ({ddc_seed_lineage} lineage, {rel}: {kind}): both stage2 trees {stage2_tree_sha256_pinned_seed}; latest lineage-disjoint cut {short(lineage_disjoint_anchor)}; re-pin {short(repin_commit)} ({repin_branch}), archives {repin_release_tag}") with short = the first 10 chars, absent fields "", and kind = "diverse" iff rel = "lineage-disjoint", else "not diverse".	tests/channel/seed.rs::the_receipt_is_described_honestly	str lines/strip_prefix/find_map, split_inclusive skip_while, chars().take(10)	1,7,13
 seed-publish-refusals	contract	channel::seed::publish_refusals	publish_refusals(ctx, repo, seal) = [] iff: repo's origin main can be fetched (else ["cannot fetch <repo>'s origin main ..."]); main contains the receipt's repin_commit (else "does not contain this cut's re-pin commit <c>"); main's src/stage0 compiler_git_commit_hash = the receipt's repin_compiler_git_commit_hash (else "but pins X in src/stage0, not this seal's compiler"); generated_section(main's src/stage0) = generated_section(repin_commit's src/stage0) (else "the generated section of src/stage0 on <repo>'s origin main is not the re-pin <short>'s"); main's LEDGER names release (repo, repin_release_tag) (else "names release '<r t>', not this cut's <tag>"); and that release exists on the host (else "the seed archives are not published: release <tag> on <repo> does not exist"). Each failing case yields exactly one refusal.	tests/channel/seed.rs::a_repin_main_carries_with_its_release_publishes, tests/channel/seed.rs::the_archives_must_be_published, tests/channel/seed.rs::main_must_contain_this_cuts_repin, tests/channel/seed.rs::main_must_pin_this_compiler_through_the_repins_archives, tests/channel/seed.rs::the_ledger_must_name_this_cuts_release, tests/channel/seed.rs::no_origin_is_a_refusal_never_a_pass	git subprocesses with a bound (effects), string fields, host lookup	1,8
@@ -233,7 +294,7 @@ lane-preflight	contract	lane::alab::run; lane::linux::run	A non-dry run needs th
 lane-state-floors	contract	lane::state::{LaneState::{of,index_seen,check_index,check_pins,record},names}	LaneState::of(Alab, r) uses r/alab/index-seen and r/alab.lockf; of(Linux, r) uses r/atpkg-index-seen, r/atpkg-pins-seen and r/atpkg.lock. index_seen() = 0 when absent, the number when it parses, Err(Refused) (exit 1) otherwise; check_index(h) = Err("channel head is index h but this lane already processed s") iff h < s. check_pins(ts, pins, head): no record -> Ok; record's first line != stamp(ts) -> warn "... was not recorded for <ts>" and Ok (retired once; the next record re-stamps it), except the Alab lane's unstamped shell-era record, read as stamped for alab::TARGETS; else for each "p b" line: unparsable b -> Err; p not in pins -> warn "ABSENT from index-head"; pins[p] < b -> Err("PIN DOWNGRADE on the channel: p b -> pins[p] in index-head"). record(i, ts, pins) writes i and stamp(ts) ++ sorted "p b" lines atomically. Both lanes run these checks before any pack or index.	tests/lane/state.rs::each_lane_keeps_its_floors_where_its_shell_lane_did, tests/lane/state.rs::a_floor_that_cannot_be_read_is_never_read_as_zero, tests/lane/state.rs::the_pins_floor_refuses_a_fallen_pin_and_warns_of_a_vanished_one, tests/lane/state.rs::the_shell_apple_lanes_unstamped_pins_still_floor_the_apple_pins, tests/lane/alab.rs::a_pin_that_fell_on_the_channel_refuses_everything, tests/lane/alab.rs::an_index_head_below_the_one_processed_refuses_everything, tests/lane/alab.rs::a_pins_record_from_other_targets_is_retired_once_never_believed, tests/lane/linux.rs::an_index_or_pin_downgrade_refuses_the_linux_run	fs reads/atomic writes, line parsing loop, BTreeMap lookups	1,7,8
 lane-state-counters	contract	lane::state::{bump_attempts,clear_attempts,prune,bump_head_failures,clear_head_failures}	bump_attempts(p, b) returns 1 + the stored count (0 when absent) and stores it; clear_attempts resets it to absent; prune(now) removes attempts-* counters whose mtime is older than PRUNE_AFTER_SECS = 30 days before now. bump_head_failures(dry) returns 1 + stored and stores it only when not dry; clear_head_failures resets it to 0.	tests/lane/state.rs::attempts_count_up_clear_on_success_and_age_out, tests/lane/state.rs::a_dry_run_counts_an_unreadable_head_without_writing_it	fs counters, mtime vs clock	8
 lane-lock-stall	contract	lane::state::{try_lock,mark_started,clear_started,stalled_since}; lane::alab::run	try_lock() = Held(g) when no guard is alive, Busy while one is (released on drop). stalled_since(now) = Some(s) iff a started stamp s exists and now - s > STALLED_AFTER_SECS = 12 h. A run that finds the lock Busy exits Ok(covered) without starting work unless the holder has stalled, in which case it is Err("a stalled run") and notifies; a finished run clears its started stamp, so a later lock holder (an install, a dry run) is never read as stalled.	tests/lane/state.rs::a_held_lock_is_busy_and_a_holder_past_twelve_hours_has_stalled, tests/lane/alab.rs::a_run_in_flight_covers_this_one_and_a_stalled_one_is_refused, tests/lane/alab.rs::a_finished_run_leaves_no_start_stamp_for_the_next_lock_holder_to_be_read_as	advisory file lock with Drop (OS), i64 clock arithmetic	8,13
-notify-once	contract	lane::report::{notify_once,utc_day}	utc_day(n) = the UTC calendar date of n as YYYYMMDD (n < 0 read as 0). notify_once(nf, title, dir, now, dry, m), with m' = m with newlines replaced by spaces, truncated to 200 chars: dry -> no effect; else if m' is a line of dir/notified-<utc_day(now)> -> no effect; else every other dir/notified-* file is removed, m' is appended to today's file and nf.notify(title, m') is called once. Hence each message is shown at most once per UTC day, and again the next day.	tests/lane/state.rs::a_notice_is_shown_once_a_utc_day, tests/lane/alab.rs::the_gap_to_trust_main_is_counted_on_the_graph_and_told_once_a_day	fs read/append/remove, RFC3339 formatting, chars().take	1,8
+record-once	contract	lane::report::{record_once,utc_day}	utc_day(n) = the UTC calendar date of n as YYYYMMDD (n < 0 read as 0). record_once(nf, title, dir, now, dry, m), with m' = m with newlines replaced by spaces, truncated to 200 chars: dry -> no effect; else if m' is a line of dir/notified-<utc_day(now)> -> no effect; else every other dir/notified-* file is removed, m' is appended to today's file and nf.record(title, m') is called once. Hence each message is recorded at most once per UTC day, and again the next day.	tests/lane/state.rs::a_notice_is_recorded_once_a_utc_day, tests/lane/alab.rs::the_gap_to_trust_main_is_counted_on_the_graph_and_told_once_a_day	fs read/append/remove, RFC3339 formatting, chars().take	1,8
 report-columns	contract	lane::report::columns	For all rows: let w_i = the max over rows r with i < |r|-1 of chars(r[i]). columns(rows)[k] = concat_{i < |r_k|-1} (r_k[i] ++ spaces(w_i - chars(r_k[i]) + 2)) ++ r_k[last] for each row r_k (an empty row gives ""): every non-last column is padded to its width plus two; the last column is never padded.	-	nested loops over Vec<Vec<String>>, char counts, Vec<usize> widths	1,7
 linux-row-state	contract	lane::linux::row_state	For all booleans: row_state(pub, staged, latched, buildable) = Published if pub, else Staged if staged, else Blocked if latched, else Absent if buildable, else Skipped (a latch outranks buildability).	tests/lane/linux.rs::a_latch_outranks_every_quieter_reading_of_a_row, tests/lane/linux.rs::a_latch_on_one_target_is_blocked_and_never_stops_the_other	if-chain over four bools returning a fieldless enum	1; fragment: `lane::linux::row_state` F1+D2b (VF5 first target, docs/PLAN-tests-to-specs-2026-10-15.md "F1-ready specs").
 linux-decide	contract	lane::linux::{decide,Program::need}	decide(p, holds): unfetchable(w) -> Error(w); Vendor class (atpkg::vendor_direct::is_vendor(p.name), no manifest fetched) -> Vendor; AppleOnly class (a harness row, programs::Harness, no manifest fetched, no clone, no pack) -> AppleOnly; every row Published -> Ok; Bundle -> ManualBundle; Unknown -> Unknown; some Absent row -> Build{held: the Absent/Staged targets t with p.group held at Some(t)}; else some Blocked -> Blocked; else some Staged -> Staged{held: likewise}; else Partial. need(p) = the targets in state Absent.	tests/lane/linux.rs::a_dry_run_sees_every_served_target_and_plans_the_missing_rows, tests/lane/linux.rs::a_latch_on_one_target_is_blocked_and_never_stops_the_other, tests/lane/linux.rs::an_x86_only_builder_plans_x86_and_names_the_target_it_leaves_unserved, tests/lane/linux.rs::an_unfetchable_manifest_is_an_error_row_that_says_why, tests/lane/linux.rs::a_pinned_harness_is_apple_only_and_the_linux_lane_builds_and_fetches_nothing_for_it	BTreeMap<Triple, RowState> filters, closures, Holds callee	1,5,7,13
@@ -244,7 +305,7 @@ lane-run-flags	contract	lane::RunFlags::parse	RunFlags::parse(kind, args): --dry
 linux-staging	contract	lane::linux::run; lane::linux::staged_manifest	For each Build program at build b: the staged manifest is the published manifest's bytes extended (byte prefix) by exactly one row per newly packed target, the legs chained (each later leg merges onto the previous leg's output); a published row is never re-packed or duplicated; each packed target leaves <p>/<p>-<b>-<t>.tar.zst; a pack failure on one target writes BLOCKED-<p>-<b>-<t>.md for that target only, the other targets still stage, and the run ends Err("run finished with BLOCKED/ERROR rows"); READY.md lists every tarball the manifest names, HOLD lines for held programs and SKIPPED targets.	tests/lane/linux.rs::staging_extends_the_published_bytes_with_every_target_in_one_manifest, tests/lane/linux.rs::an_x86_only_builder_stages_x86_and_tells_the_signer_what_went_unserved, tests/lane/linux.rs::one_targets_failure_latches_that_target_and_the_other_still_stages	effectful orchestration, pkgdoc merge composition	1,4,8
 linux-sign-gates	contract	lane::linux::run (sign phase)	A staged manifest S of (p, b) is signed and uploaded only if all of the following hold, checked before the key is used: a machine key is present, signer_for succeeds (else "— nothing signed") and the channel token exists (else nothing signed, READY says why); the published manifest on BOTH owners is a byte prefix of S (else Err("p@b: the published manifest on <owner> is no longer a byte-prefix of the staged merge"), no READY.md, no sig); the staging owner's manifest verifies (else the program is "NOT SIGNABLE this run" and nothing is uploaded for it on either owner, other programs proceed); the new rows (those not in the published base) carry no unproven lineage unless the switch reads Dormant (Unknown -> Err "nothing shows it still is", Live -> Err "origin main now carries a minted re-pin"); and (S, sign(S)) verifies through the client chain (else Err("the signed manifest does not verify through the client's chain") and the sig is removed). On any refusal no upload happens.	tests/lane/linux.rs::a_keyed_box_with_no_channel_token_signs_nothing, tests/lane/linux.rs::a_staged_merge_that_no_longer_extends_the_published_bytes_takes_the_ceremony_with_it, tests/lane/linux.rs::an_unproven_row_is_signed_only_while_the_switch_still_reads_dormant, tests/lane/linux.rs::an_unproven_row_in_the_published_base_is_never_judged_again, tests/lane/linux.rs::a_manifest_that_cannot_be_verified_is_never_signed_over_on_either_owner, tests/lane/linux.rs::a_public_manifest_another_machine_extended_refuses_the_signing, tests/lane/linux.rs::a_key_the_roster_does_not_list_signs_and_uploads_nothing, tests/lane/linux.rs::a_signed_manifest_the_client_would_refuse_is_never_uploaded	effect ordering, byte-prefix checks, crypto callee, injected switch closure	1,4,8,12,13
 linux-sign-publish	contract	lane::linux::run (publish phase)	After the gates, each READY program's identical bytes (manifest, sig, tarballs) are uploaded to the staging and the public owner, then one follow-up index with an empty delta is published (head + 1). A later run that finds the public owner lacking what an earlier run signed uploads it there (logged) before the index; a public copy that is neither the signed bytes nor a byte prefix of them is Err("serves a manifest that is neither the one an earlier run signed nor a byte-prefix of it") and no index is published.	tests/lane/linux.rs::a_keyed_box_signs_uploads_to_both_owners_and_publishes_the_follow_up_index, tests/lane/linux.rs::a_public_upload_an_earlier_run_owed_is_finished_before_the_index, tests/lane/linux.rs::a_public_copy_that_is_not_the_signed_bytes_nor_their_prefix_publishes_no_index	host model, byte comparisons, Indexer trait	1,4,8
-linux-ready-partition	contract	lane::linux::run (READY.md)	READY.md partitions the staged programs into READY (to sign), HOLD (group held) and NOT SIGNABLE, and its ceremony text is a function of (key present, rostered, channel token, signing started, index published): keyless -> "Nothing is signed: this box has no machine key ..." plus `atpkg-publish sign` lines and `atpkg-publish index --upload`; signing started but index not published -> "A run started signing ..." with the ceremony; uploads signed earlier and index unpublished on a keyless box -> "Signed and uploaded by an earlier run: ..." and the index step only (nothing asked to be signed twice); a keyed run that finishes the owed index says "Published atpkg-index-N for the uploads an earlier run signed"; nothing READY on a keyed box -> "Nothing is signed: nothing is READY ..."; a missing channel token -> "Nothing is signed: the channel token at ... is missing or empty"; a fully signed run says "Signed and published by this run ..." and lists no sign step.	tests/lane/linux.rs::a_keyed_run_that_stops_before_the_index_leaves_the_ceremony, tests/lane/linux.rs::a_keyed_box_with_no_channel_token_signs_nothing, tests/lane/linux.rs::a_keyed_box_signs_uploads_to_both_owners_and_publishes_the_follow_up_index	string rendering over Vec<String> partitions, fs write	1,8
+linux-ready-partition	contract	lane::linux::run (READY.md)	READY.md partitions staged programs into READY, HOLD (group held) and NOT SIGNABLE. Keyless, interrupted signing, or earlier signed uploads without an index name the actual state and direct the updated installed Linux lane to resume on a rostered builder, using `atpkg-publish lane run linux --sha256 <installed-snapshot-sha256>` with the install-recorded SHA, machine key and owner tokens. It lists the ready manifests, signatures and new tarballs; the lane verifies signatures and published byte-prefix extension, reserves each owner's exact version, resumes partial uploads and publishes the follow-up index without asking earlier signed uploads to be signed twice. Generic raw public uploads are not a repair route. A keyed completed run says "Signed and published by this run" (or "Published atpkg-index-N for the uploads an earlier run signed") and lists no ceremony; nothing ready or a missing channel token says why nothing is signed.	tests/lane/linux.rs::a_keyed_run_that_stops_before_the_index_leaves_the_ceremony, tests/lane/linux.rs::a_keyed_box_with_no_channel_token_signs_nothing, tests/lane/linux.rs::a_keyed_box_signs_uploads_to_both_owners_and_publishes_the_follow_up_index	string rendering over Vec<String> partitions, fs write	1,8
 self-check	contract	lane::self_check	self_check(exe, sha, dry, state): sha = None -> Ok(None) if dry else Err("started with no --sha256"); sha = Some(h), checked in order: sha256(exe) = ascii_lowercase(h) (else Err("the snapshot was replaced in place")); canonicalize(exe)'s parent is a lane.* directory directly under canonicalize(state) (else Err("is not a snapshot")); that directory's INSTALLED-FROM has a line "sha256 <sha256(exe)>" (else Err("records another sha256")); then Ok(Some(sha256(exe))), so h is compared case-blind.	tests/lane/install.rs::the_snapshot_self_check_pins_a_run_to_the_bytes_its_unit_names	Path component checks, fs read + hashing (effects), ascii lowercase compare	1,8
 units-render	contract	lane::units::{launchd,systemd_service,systemd_timer,render,exec_word,env_word,xml,UnitSpec::argv}	argv(spec) = [binary, lane, run, kind, --sha256, sha, --log, state_dir/<kind log>]. launchd(spec): name systems.alab.aterm-auto-<kind>.plist; ProgramArguments = argv with every string xml()-escaped (& < >); StartInterval 21600; RunAtLoad true; EnvironmentVariables XDG_STATE_HOME = parent(state_dir), XDG_CONFIG_HOME = spec.xdg_config_home, PATH = shim_bin ++ ":" ++ fixed system dirs (no .cargo/bin); stdout/stderr logs under state_dir; no placeholder survives and no /tools/ path. systemd_service(spec): name aterm-auto-<kind>.service; ExecStart = join(" ", [exec_word(w) | w in argv]) with exec_word(w) = a double-quoted w with backslash, '"', '%' -> '%%' and '$' -> '$$' escaped; Environment words env_word(k, v) escape backslash, '"' and '%' (not '$'); Type=oneshot, TimeoutStartSec=4h; PATH starts with shim_bin; XDG_CONFIG_HOME = spec's. systemd_timer: OnCalendar=hourly, WantedBy=timers.target.	tests/lane/install.rs::the_launchd_agent_runs_the_snapshot_with_its_hash, tests/lane/install.rs::the_systemd_units_run_the_snapshot_hourly_with_their_words_escaped	String replace chains, a small XML tree writer (recursion over a Vec of nodes), PathBuf display	1,7
 install-refusals	contract	lane::install::{install_with,dirty_inputs,Machine::check_os,disarm}	install_with(ctx, kind, flags, machine, tx) creates no snapshot (no state/lane link, no lane.* dir) when: machine.os does not run kind ("the alab lane runs on macOS" / "the linux lane runs on Linux"); a lane run holds the lock ("a <kind> lane run is in flight"); there is no machine key (unless keyless), naming --keyless, or no machine record ("no machine record at ~/.aterm/release-ring/machine.toml — the lane signs"); dirty_inputs(repo) != [] and not allow_dirty (naming the files; with allow_dirty INSTALLED-FROM records "(dirty: <files>)"); machine.config_home's aterm.toml names another package store than the installer's ("... names — set XDG_CONFIG_HOME the same way for both"); or the build inputs' content changed between the read before the build and after it ("changed while the snapshot was building", dirty-on-purpose files included); or, unless no_arm, state/lane is a shell-era directory that copy_wait_left finds within FIRST_EXEC_HANG of its exec stamp (a bootout's) or, unstamped, its mtime, which may hold a program in its first exec ("re-run this installer in <n> min", nothing moved or armed). disarm(ctx, kind, machine) refuses a kind the OS does not run, removes the lane's unit files and retired agents (aterm-auto-vendor), keeps the snapshots, calls services.disarm(kind) and then stamps every snapshot the stopped job could have been starting (as after an install's arm, retiring none).	tests/lane/install.rs::install_refuses_the_wrong_os_and_a_box_with_no_machine_identity, tests/lane/install.rs::install_refuses_a_dirty_checkout_unless_told_and_records_it, tests/lane/install.rs::an_edit_that_lands_during_the_build_is_never_snapshotted, tests/lane/install.rs::install_refuses_units_whose_config_home_names_another_store, tests/lane/install.rs::install_refuses_while_a_lane_run_holds_the_lock_and_disarm_removes_the_units, tests/lane/install.rs::a_legacy_shell_alias_survives_unarmed_and_failed_installs_until_the_manager_switches, tests/lane/install.rs::a_snapshot_a_login_started_is_held_from_the_disarm_that_stopped_it	fs, git status, hashing, trait objects (SnapshotBuilder, ServiceManager)	1,2,8
@@ -260,55 +321,10 @@ relocate-vendoring-policy	contract	artifact::relocate::relocate_with, artifact::
 relocate-hard-link-groups	contract	artifact::relocate::relocate_with, artifact::relocate::hard_link_key, artifact::relocate::relink_aliases	For every stage: each hard-link group of native objects is rewritten and re-signed exactly once, under its first name in walk order, with every other name re-linked to the result, so after relocate_with every group is still one inode, report.rewritten = number of distinct objects, the signature names the first name, the rpath rewrite is applied once per distinct directory of the group, and no atpkg-relink scratch file remains.	src/artifact/relocate.rs::a_hard_link_group_is_relocated_once_and_stays_one_file	fs hard links, inode keys (MetadataExt), BTreeMap grouping, trait objects	1,7,8,11
 ```
 
-### Distribution by kind (138)
-
-| kind | count | ids |
-|---|---|---|
-| contract | 127 | triple-os-arch, error-exit-code, cli-dispatch-total, pins-for-targets, quad-verify, quad-head-number, download-retry, arch-header-decode, arch-gate, arch-gate-tree, disk-installed, toolchain-resolve, toolchain-lease, toolchain-admit, switch-policy, lineage-switch-read, lineage-fetch-frame, unproven-gate, closure-refusals, closure-output, closure-source-readonly, bundle-hello-plan, bundle-retired-strip, bundle-prune-links, bundle-prune-foreign-targets, bundle-thin-fat, bundle-one-compiler, bundle-strip-symbols, bundle-gate-runs, bundle-derive-version, bundle-admission, bundle-phase-order, bundle-output, bundle-dirty-and-upload-policy, bundle-parse-args, pack-looks-internal, pack-select, pack-parse-metadata, pack-check-build-env, pack-build-command, pack-refuse-before-effects, pack-output, pack-upload, upload-preflight, pack-parse-args, build-local-plan, build-local-build, build-local-parse-args, pkgdoc-names, pkgdoc-check-provenance, pkgdoc-merge, sign-authority, sign-all, sign-run-args, rest-error-map, rest-resolve-and-write, rest-write-token, rest-token-channel, identity-signer-for, index-plan-carry, index-plan-monotone, index-plan-retire, index-plan-admission, index-plan-yanks, index-plan-floors, parse-yank, index-parse-delta, base-of-head, index-publish-preconditions, index-publish-ordering, index-publish-dry-run, index-triple-gate, newest-roster, ctx-shown-redaction, mirror-staging-accounting, mirror-public, mirror-confirm, seed-describe, seed-publish-refusals, status-describe, scratch-private, group-floor-refusal, group-sibling-build-number, group-preflight, group-step2-recheck, group-stage-plan, hold-algebra, alab-decide, alab-newest-signed-tag, parse-vv, alab-bundle-command, alab-pack-and-index, alab-latch, alab-release-verification, alab-staging-unknown, lane-staging-fetch, main-gap, horizon-warning, lane-dry-run-frame, lane-preflight, lane-state-floors, lane-state-counters, lane-lock-stall, notify-once, report-columns, linux-row-state, linux-decide, linux-buildable-targets, linux-narrow, linux-options, lane-run-flags, linux-staging, linux-sign-gates, linux-sign-publish, linux-ready-partition, self-check, units-render, install-refusals, install-snapshot, resolve-commit, lineage-scan-tree, machine-local-classification, origin-relative-rpath, loader-text-parsers, self-contained-report, relocate-vendoring-policy, relocate-hard-link-groups |
-| table-property | 4 | triple-targets, triple-host-table, programs-table, pack-cpu-floor |
-| round-trip | 4 | tarwrite-roundtrip, pkgdoc-fresh-roundtrip, index-render-roundtrip, lineage-stamp-roundtrip |
-| equivalence | 1 | tarwrite-determinism |
-| invariant | 1 | pack-lock |
-| refinement | 1 | index-publish-cas |
-
-### Gap histogram (specs blocked by each audit §7 gap)
-
-Gap 0 (the installed seal publishes no Lean-discharged row) blocks all 138; it is listed in no row.
-
-| gap | what | specs |
-|---|---|---|
-| 1 | non-scalar carriers and content models | 129 |
-| 2 | certified `&self`/`&mut self` views, two-state | 11 |
-| 3 | E6 body widening | 16 |
-| 4 | callee-ensures to caller composition | 25 |
-| 5 | quantified clauses | 15 |
-| 6 | plain-Rust clause publication | 1 |
-| 7 | loops | 62 |
-| 8 | effects | 84 |
-| 9 | proc-macro boundary | 2 |
-| 10 | model-to-code refinement | 1 |
-| 11 | generics | 2 |
-| 12 | cross-crate theorem citation | 33 |
-| 13 | threads, async, closures | 18 |
-| 14 | Clean elaborator coverage | 2 |
-
-No spec is blocked by gap 0 alone: 129 of 138 need gap 1 (strings, Vecs, enums with payloads) and 86 need gap 8 (effects). The specs with the fewest blockers are the four gap-1-only enum/`Vec` facts and `disk-installed` (scalar `u64`, gaps 3 and 6).
-
-### Proof dependency order
-
-Table facts (`triple-*`, `programs-*`, `pack-cpu-floor`, `pkgdoc-names`) and the scalar `disk-installed` ->
-pure byte/string predicates (`plain`, `valid_private_name`, `safe_name`, hex checks inside
-`pkgdoc-check-provenance`, `closure-refusals`, `build-local-plan`, `pack-check-build-env`, `parse-yank`) ->
-pure decoders and renderers (`arch-header-decode` via a factored `classify`, `rest-error-map`,
-`parse-vv`, `seed-describe`, `report-columns`, `units-render`) -> `pins-for-targets` -> the `index-plan-*`
-family -> `index-render-roundtrip`, `pkgdoc-fresh-roundtrip`, `pkgdoc-merge` (need gap 12 for the client
-parser) -> `arch-gate`, `tarwrite-*` -> the effectful contracts (gap 8): `quad-verify`, `identity-signer-for`,
-`sign-*`, then the orchestrations (`pack-*`, `bundle-*`, `mirror-*`, `index-publish-*`, `group-*`, `alab-*`,
-`linux-*`, `install-*`) -> `index-publish-cas` (refinement, gap 10).
-
 ## 2. Test -> spec map (TSV)
 
-All 335 tests. `primary` is the spec that retires the test; `also` lists the other specs the same test samples. A test marked `NONSPEC` is in §4.
+`primary` is the spec that retires the test; `also` lists the other specs the same test samples. A test
+leaves the suite only when every spec in its row is proved. A test marked `NONSPEC` is in §3.
 
 ```tsv
 file	test	primary	also
@@ -384,6 +400,7 @@ tests/artifact/pack.rs	a_signed_pack_is_one_the_client_verifies_and_extracts_to_
 tests/artifact/pack.rs	an_out_whose_stage_holds_the_checkout_is_refused_and_the_checkout_survives	pack-refuse-before-effects	
 tests/artifact/pack.rs	an_unproven_row_is_not_signed_once_the_mint_lands_mid_pack	unproven-gate	
 tests/artifact/pack.rs	an_upload_stages_a_prerelease_and_a_public_pack_is_immutable	pack-upload	
+tests/artifact/pack.rs	an_upload_stages_when_neither_reader_observes_the_public_repository	pack-upload
 tests/artifact/pack.rs	an_upload_without_the_staging_token_is_refused_before_anything_is_built	upload-preflight	
 tests/artifact/pack.rs	every_target_builds_at_its_distribution_cpu_floor	pack-cpu-floor	
 tests/artifact/pack.rs	nothing_unsigned_publishes_and_an_unsigned_pack_leaves_no_signature	pack-refuse-before-effects	
@@ -502,6 +519,8 @@ tests/channel/rest.rs	a_create_is_a_draft_uploaded_to_then_published_as_a_prerel
 tests/channel/rest.rs	a_create_killed_before_its_publish_leaves_a_draft_no_client_sees	rest-resolve-and-write	
 tests/channel/rest.rs	a_download_shorter_than_its_listing_is_refused_and_leaves_no_file	rest-resolve-and-write	
 tests/channel/rest.rs	a_file_remote_clones_and_fetches_with_no_credential_asked	rest-token-channel	
+tests/channel/rest.rs	a_repository_is_unseen_only_when_the_identity_and_an_anonymous_reader_both_get_404	pack-upload	
+tests/channel/rest.rs	a_private_repository_hidden_from_both_readers_is_not_seen	pack-upload
 tests/channel/rest.rs	a_write_without_a_token_is_refused_before_anything_is_sent	rest-write-token	
 tests/channel/rest.rs	an_upload_replaces_only_when_asked_and_a_draft_is_published_by_tag	rest-resolve-and-write	
 tests/channel/rest.rs	git_hands_its_token_over_whatever_helpers_and_use_http_path_the_users_config_holds	rest-token-channel	
@@ -545,7 +564,7 @@ tests/lane/alab.rs	an_index_head_below_the_one_processed_refuses_everything	lane
 tests/lane/alab.rs	an_unreachable_staging_owner_decides_nothing_and_a_retried_500_never_repacks	alab-staging-unknown	
 tests/lane/alab.rs	the_bundle_landing_on_staging_moves_the_whole_group_together	alab-pack-and-index	
 tests/lane/alab.rs	the_first_run_packs_both_apple_targets_and_holds_the_rustc_group	alab-decide	hold-algebra,alab-pack-and-index
-tests/lane/alab.rs	the_gap_to_trust_main_is_counted_on_the_graph_and_told_once_a_day	main-gap	notify-once
+tests/lane/alab.rs	the_gap_to_trust_main_is_counted_on_the_graph_and_told_once_a_day	main-gap	record-once
 tests/lane/alab.rs	the_hold_follows_the_group_the_channel_enforces	hold-algebra	
 tests/lane/alab.rs	the_bundle_lane_prints_the_bundle_packs_never_runs_them	alab-bundle-command	
 tests/lane/alab.rs	the_newest_signed_release_is_the_newest_published_vxyz_carrying_its_signature	alab-newest-signed-tag	
@@ -605,7 +624,7 @@ tests/lane/state.rs	a_dry_run_counts_an_unreadable_head_without_writing_it	lane-
 tests/lane/state.rs	a_floor_that_cannot_be_read_is_never_read_as_zero	lane-state-floors	
 tests/lane/state.rs	a_group_holds_where_a_member_is_not_ready_and_nowhere_else	hold-algebra	
 tests/lane/state.rs	a_held_lock_is_busy_and_a_holder_past_twelve_hours_has_stalled	lane-lock-stall	
-tests/lane/state.rs	a_notice_is_shown_once_a_utc_day	notify-once	
+tests/lane/state.rs	a_notice_is_recorded_once_a_utc_day	record-once	Journal writes the lane transcript.
 tests/lane/state.rs	attempts_count_up_clear_on_success_and_age_out	lane-state-counters	
 tests/lane/state.rs	each_lane_keeps_its_floors_where_its_shell_lane_did	lane-state-floors	
 tests/lane/state.rs	the_pins_floor_refuses_a_fallen_pin_and_warns_of_a_vanished_one	lane-state-floors	
@@ -633,27 +652,47 @@ src/host/rest.rs	a_name_is_one_segment_and_a_credential_is_scoped_to_an_http_ori
 src/host/rest.rs	gits_token_is_in_its_environment_alone_never_its_argv_or_a_file	rest-token-channel	
 ```
 
-## 3. Coverage
+Some tests have no row, among them all of `tests/artifact/package.rs` and
+`tests/channel/agh_read_contract.rs`, and the codex tests of `tests/channel/index_plan.rs` and
+`tests/channel/status.rs`.
 
-- 339 tests read. 333 map to one of the 140 specs; 6 are not spec samples (§4). No test is unaccounted for (checked against every `#[test]` under `tests/`, `src/artifact/relocate.rs` and `src/host/rest.rs`), except the read contract's (`tests/channel/agh_read_contract.rs`), which samples the hosts behind `rest-*` and agh's own design.
-- The biggest collapses (primary tests): `closure-refusals` (10), `index-publish-cas` (9), `pack-refuse-before-effects` (8), `group-preflight` (8), `linux-sign-gates` (8), `lane-state-floors` (8).
-- 50 tests sample more than one spec; each is deleted only when its primary and every `also` spec are proved.
-- No test is a pure regression of a removed bug with no general property: every regression-named test (a one-shot 500, a lost create race, an orphaned draft, a mid-pack mint) is an instance of a spec above.
+## 3. Tests that are not spec samples
 
-## 4. Tests that are not spec samples
+Each needs a real host tool, so it cannot be a spec; it moves out of the unit suite into a platform
+smoke.
 
-> Status 2026-10-16: deleted the FakeHost test that a created release is a prerelease and an upload never replaces by default.
+| test | why |
+|---|---|
+| `tests/artifact/arch.rs::the_reader_agrees_with_the_host_about_a_real_binary` | Its oracle is the host's real `/bin/sh` and `/bin/ls`; it ends COULD NOT RUN on a host that is no client triple. The decoder's property is `arch-header-decode`. |
+| `tests/artifact/e2e.rs::a_cc_built_sysroot_ships_one_compiler_under_one_signature` | A macOS-only run of cc, codesign, otool and strip. Its logic is `bundle-output` and `bundle-one-compiler` over FakeTools. |
+| `tests/lane/install.rs::the_rendered_agent_lints_with_plutil` | Its oracle is Apple's `plutil` (compiled on macOS only). The provable part is `units-render`. |
+| `tests/lane/install.rs::the_rendered_units_verify_with_systemd_analyze` | Its oracle is `systemd-analyze` (compiled on Linux only). The provable part is `units-render`. |
 
-| test | why | action |
-|---|---|---|
-| `tests/artifact/arch.rs::the_reader_agrees_with_the_host_about_a_real_binary` | Environment conformance: its oracle is the host's real `/bin/sh` and `/bin/ls`. The decoder's property is `arch-header-decode`; that a host binary has the host's format is a fact about the OS, and the test returns early, passing, on a non-client host. | **move-to-bench** |
-| `tests/artifact/e2e.rs::a_cc_built_sysroot_ships_one_compiler_under_one_signature` | macOS-only end-to-end run of cc/codesign/otool/strip. Its logic is `bundle-output` and `bundle-one-compiler` over FakeTools; the real `Tools` implementation is a platform effect (gap 8) that belongs in a platform smoke. | **move-to-bench** |
-| `tests/lane/install.rs::the_rendered_agent_lints_with_plutil` | Its oracle is Apple's `plutil` (macOS only, ignored elsewhere). The provable part is the escaping and shape in `units-render`. | **move-to-bench** |
-| `tests/lane/install.rs::the_rendered_units_verify_with_systemd_analyze` | Its oracle is `systemd-analyze` (Linux only, ignored elsewhere). The provable part is the escaping and shape in `units-render`. | **move-to-bench** |
+## 4. Open findings
 
-By action: move-to-bench 4, delete 2 (both deleted; their rows are gone). A move-to-bench test leaves the unit suite and becomes a platform smoke (it needs a real host tool, so it cannot be a spec).
+- **`index-plan-admission` is wrong for codex.** It says a vendor-direct program is never pinned by
+  `--pin`, but a `programs::alab_package` program (codex) is, through `admit_alab_pin`
+  (`channel/index.rs`). It holds for every other vendor-direct program.
+- **`index-plan-yanks`: a yank of the pinned build is only a warning.** A build yank equal to the
+  program's own pin is accepted with a TOMBSTONES warning, so a signed index can pin a build it also
+  yanks. Whether that should be a refusal is a policy question.
+- `tests/channel/index_plan.rs::the_command_line_refuses_duplicates_and_malformed_values` ends with
+  `let _: Triple = AARCH64_APPLE_DARWIN;`, a type-checker tautology that only silences an unused import.
+- `tests/lane/linux.rs::a_dry_run_sees_every_served_target_and_plans_the_missing_rows` asserts
+  `contains("pack aarch64-unknown-linux-gnu,") || contains("pack aarch64-unknown-linux-gnu")`; the first
+  disjunct implies the second, so the comma check is vacuous. `linux-decide` states what was meant.
+- `tests/lane/state.rs::attempts_count_up_clear_on_success_and_age_out` ages the counter with the real
+  `SystemTime` and samples the 30-day `PRUNE_AFTER_SECS` only at 40 days; `lane-state-counters` states
+  the boundary.
+- `tests/lane/alab.rs::a_horizon_inside_thirty_days_is_told` sets its horizon 17 days after
+  `testkit::NOW`, so the 30-day threshold is never sampled at its boundary; `horizon-warning` states it.
+- `tests/artifact/pack.rs::a_signed_pack_is_one_the_client_verifies_and_extracts_to_its_signed_root`
+  asserts a `strip …bin/ay` line in the FakeTools log, which no spec names. If that strip is a contract,
+  it belongs in `pack-output`.
+- `tests/channel/index_render.rs::the_rendered_index_reads_back_through_the_client_field_for_field`
+  asserts `text == render(&p)`, which a pure function already guarantees.
 
-## 5. Implied specs that look wrong, or tests that check less than they say
+## 5. Proof order
 
 1. **Resolved:** Removed `let _: Triple = AARCH64_APPLE_DARWIN;` tautology in `tests/channel/index_plan.rs::the_command_line_refuses_duplicates_and_malformed_values`.
 2. **Resolved:** Replaced vacuous disjunction in `tests/lane/linux.rs::a_dry_run_sees_every_served_target_and_plans_the_missing_rows` with `ay.contains("pack aarch64-unknown-linux-gnu") && !ay.contains("x86_64-unknown-linux-gnu")`.
@@ -664,40 +703,24 @@ By action: move-to-bench 4, delete 2 (both deleted; their rows are gone). A move
 7. Retired when `tests/channel/rest.rs` replaced the gh host's tests (init-system design S15): `gh-classify` matched substrings of gh's stderr anywhere, so a text quoting "HTTP 404" read NotFound. `rest-error-map` reads the HTTP status curl reports, so that doubt is gone.
 8. **Resolved:** `tests/lane/alab.rs::a_horizon_inside_thirty_days_is_told` now samples both sides of the exact `HORIZON_WARN_DAYS * 86_400` threshold relative to `testkit::NOW`.
 
-One spec-level doubt for the owner's attention, from reading the code:
-
-- `index-plan-yanks`: a build yank equal to the program's own pinned build is accepted with only a TOMBSTONES
-  warning, so a signed index can pin a build it also yanks. The spec records this; whether it should be a
-  refusal is a policy question.
-
-## 6. Proof order (easiest high-value first)
-
-No spec is blocked by gap 0 alone, so the order prefers the fewest and cheapest gaps, then the most tests
-retired.
-
-1. **`disk-installed`** (gaps 3, 6). Scalar `u64` `max` and `div_ceil`: an `omega`-class proof once `div_ceil`
-   is admitted. It retires 1 test outright and is the size lemma `tarwrite-roundtrip` cites.
-2. **`error-exit-code`, `switch-policy`, `linux-row-state`** (gap 1 only). Enum matches,
-   no loops. They are the first users of gap 1's enum-with-payload carrier, and
-   `switch-policy` is the lemma `toolchain-admit`, `unproven-gate` and `linux-sign-gates` all rest on.
-3. **`pack-cpu-floor`, `pkgdoc-names`, `index-plan-floors`, `alab-decide`** (gaps 1, 3). Straight matches over
-   `(os, arch)`, `u64` comparisons and `String` concatenation. `alab-decide` alone retires 6 lane tests'
-   decision halves; `pkgdoc-names` gives the asset-name injectivity every upload spec cites.
-4. **The table facts** `triple-targets`, `triple-os-arch`, `triple-host-table`, `programs-table`
-   (gaps 1, 7, 12). Decidable by evaluating constants; they become free once the cross-crate `TARGETS` can be
-   cited (gap 12).
-5. **Pure parsers and renderers** with one loop (gaps 1, 7, sometimes 3/5/13): `parse-yank`,
-   `rest-error-map`, `parse-vv`, `alab-newest-signed-tag`, `report-columns`,
-   `pack-check-build-env`, `pack-looks-internal`, `pack-select`, `index-parse-delta`, `lane-run-flags`,
-   `build-local-parse-args`, `sign-run-args`, `units-render`, `seed-describe`. Each retires its whole test
-   file's pure half.
-6. **`arch-header-decode`** after factoring `classify(h, pe)` out of the file read (gaps 1, 3, 7). It is
-   byte-slice arithmetic with length guards; with `arch-gate` it retires all of `tests/artifact/arch.rs` but
-   the host-oracle test.
-7. **The `index-plan-*` family and `pins-for-targets`** (gaps 1, 5, 7, 12). `BTreeMap` merges with
-   quantified carry/monotonicity clauses; together they retire `tests/channel/index_plan.rs` and
-   `tests/shared/pins.rs`.
-8. **Round trips** `index-render-roundtrip`, `pkgdoc-fresh-roundtrip`, `pkgdoc-merge` (gaps 1, 12, 14): the
-   client parser is the inverse, so these wait for cross-crate citation.
-9. Everything blocked by **gap 8** (effects), the orchestrations last. `index-publish-cas` (gap 10) refines the
-   committed `AtpkgIndexPublishWalk` model and replaces the existing conformance test.
+1. `disk-installed` (gaps 3, 6): `u64` `max` and `div_ceil`; the size lemma `tarwrite-roundtrip` cites.
+2. `error-exit-code`, `switch-policy`, `linux-row-state` (gap 1): enum matches, no loops. `switch-policy`
+   is the lemma `toolchain-admit`, `unproven-gate` and `linux-sign-gates` rest on.
+3. `pack-cpu-floor`, `pkgdoc-names`, `index-plan-floors`, `alab-decide` (gaps 1, 3): matches over
+   `(os, arch)`, `u64` comparisons, `String` concatenation. `pkgdoc-names` gives the asset-name
+   injectivity every upload spec cites.
+4. The table facts `triple-targets`, `triple-os-arch`, `triple-host-table`, `programs-table` (gaps 1 and
+   12, with 3, 5 or 7): constant evaluation once the cross-crate `TARGETS` can be cited.
+5. Pure parsers and renderers with one loop (gaps 1, 7, sometimes 3, 5 or 13): `parse-yank`,
+   `rest-error-map`, `parse-vv`, `alab-newest-signed-tag`, `report-columns`, `pack-check-build-env`,
+   `pack-looks-internal`, `pack-select`, `index-parse-delta`, `lane-run-flags`, `build-local-parse-args`,
+   `sign-run-args`, `units-render`, `seed-describe`.
+6. `arch-header-decode` after factoring `classify(h, pe)` out of the file read, then `arch-gate`.
+7. `pins-for-targets` and the `index-plan-*` family (`BTreeMap` merges with quantified carry and
+   monotonicity clauses).
+8. The round trips `index-render-roundtrip`, `pkgdoc-fresh-roundtrip`, `pkgdoc-merge` (gap 12, and 14 for
+   the first two): the client parser is the inverse.
+9. The effectful contracts (gap 8): `quad-verify`, `identity-signer-for`, `sign-*`, then the
+   orchestrations (`pack-*`, `bundle-*`, `mirror-*`, `index-publish-*`, `group-*`, `alab-*`, `linux-*`,
+   `install-*`), and last `index-publish-cas` (gap 10), which refines the `AtpkgIndexPublishWalk` model
+   (`crates/aterm-models-atpkg`).

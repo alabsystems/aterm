@@ -697,7 +697,7 @@ impl Command {
             ));
         }
         let routed = if self.tether {
-            crate::tether::route(&self.program, self.arg0.as_deref(), &self.args)?
+            crate::tether::route(&self.program, self.arg0.as_deref(), &self.args)
         } else {
             None
         };
@@ -705,8 +705,10 @@ impl Command {
             Some((exe, args)) => Image::build(exe.as_os_str(), args, &self.env.capture())?,
             None => Image::build(&self.program, &self.args, &self.env.capture())?,
         };
-        if let (Some(arg0), None) = (&self.arg0, &routed) {
-            image.argv[0] = c_string(arg0.as_bytes())?;
+        match (&routed, &self.arg0) {
+            (Some(_), _) => image.argv[0] = c_string(crate::tether::NAME.as_bytes())?,
+            (None, Some(arg0)) => image.argv[0] = c_string(arg0.as_bytes())?,
+            (None, None) => {}
         }
         let cwd = self
             .cwd
@@ -718,6 +720,16 @@ impl Command {
             Some(dir) => std::env::current_dir().ok().map(|here| here.join(dir)),
             None => None,
         };
+        if routed.is_some() {
+            // The tether runs the program only after this spawn returned: one the search cannot
+            // find or may not run fails the spawn here, as its own spawn would, not the tether.
+            super::platform::findable(
+                self.program.as_bytes(),
+                image.search.as_deref(),
+                base.as_deref(),
+                !self.env.saw_path(),
+            )?;
+        }
         let mut handed: Vec<OwnedFd> = Vec::new();
         let mut ours: [Option<OwnedFd>; 3] = [None, None, None];
         let mut sources = [Source::Inherit; 3];
@@ -791,6 +803,7 @@ impl Command {
                 replace,
                 long_entry_ends: !self.env.saw_path(),
                 inherit_all: false,
+                native_image: false,
                 disclaim: self.disclaim,
                 suspended: self.suspended,
             },

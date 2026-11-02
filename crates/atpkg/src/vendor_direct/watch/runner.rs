@@ -117,7 +117,7 @@ impl Settings for LiveSettings {
         let Some(path) = self.path.as_deref() else {
             return self.gate.clone();
         };
-        let stamp = std::fs::metadata(path)
+        let stamp = std::fs::symlink_metadata(path)
             .ok()
             .map(|m| (m.modified().ok(), m.len()));
         if self.seen != Some(stamp) {
@@ -268,10 +268,12 @@ fn detach(exe: &Path, args: &[OsString]) -> io::Result<u32> {
             out.status
         )));
     }
-    String::from_utf8_lossy(&out.stdout)
-        .trim()
-        .parse::<u32>()
-        .map_err(|_| io::Error::other("the detaching shell named no pid"))
+    let raw_pid = String::from_utf8_lossy(&out.stdout);
+    let pid = raw_pid.trim();
+    (!pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| pid.parse::<u32>().ok())
+        .flatten()
+        .ok_or_else(|| io::Error::other("the detaching shell named no pid"))
 }
 
 /// Windows has no zombie to fear and no re-parenting: the pass is an ordinary child, and

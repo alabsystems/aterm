@@ -185,10 +185,8 @@ pub fn apply(cmd: &mut Command, root: &Path) {
         .collect();
     for name in names {
         let text = name.to_string_lossy();
-        let stripped = text.starts_with("ATERM_")
-            || text.starts_with("ATPKG_")
-            || text.starts_with("__ATERM_");
-        if stripped && text != aterm_uds::process::VERIFY_RUN_VAR {
+        let reroute = text.starts_with("ATPKG_") || text.starts_with("__ATERM_");
+        if aterm_uds::process::stripped_from_child(&name) || reroute {
             cmd.env_remove(name);
         }
     }

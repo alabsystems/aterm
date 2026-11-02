@@ -29,6 +29,10 @@ pub struct Spec {
     pub agy: String,
     /// The Muse Code (`muse`) under test (empty: none).
     pub muse: String,
+    /// The Grok Build (`grok`) under test (empty: none).
+    pub grok: String,
+    /// The Kimi Code (`kimi`) under test (empty: none).
+    pub kimi: String,
     /// The lab's socket directory.
     pub sockdir: String,
     /// The owner's home (or a probe's replica of it).
@@ -76,6 +80,8 @@ impl Spec {
             codex: codex.into(),
             agy: String::new(),
             muse: String::new(),
+            grok: String::new(),
+            kimi: String::new(),
             sockdir: sockdir.into(),
             home: p.real_home.clone(),
             caller_home: p.caller_home.clone(),
@@ -207,6 +213,8 @@ pub fn render(spec: &Spec) -> Result<String, String> {
     }
     let agy = &spec.agy;
     let muse = &spec.muse;
+    let grok = &spec.grok;
+    let kimi = &spec.kimi;
     let tg_written = spec.repo_target.clone();
     let tg = physical(Path::new(&tg_written))
         .to_string_lossy()
@@ -235,6 +243,8 @@ pub fn render(spec: &Spec) -> Result<String, String> {
         codex,
         agy,
         muse,
+        grok,
+        kimi,
         &st,
         &spec.aterm,
         &tg_written,
@@ -295,7 +305,14 @@ pub fn render(spec: &Spec) -> Result<String, String> {
         })
         .collect();
     let mut store: Vec<String> = Vec::new();
-    for agent in [claude.as_str(), codex.as_str(), agy.as_str(), muse.as_str()] {
+    for agent in [
+        claude.as_str(),
+        codex.as_str(),
+        agy.as_str(),
+        muse.as_str(),
+        grok.as_str(),
+        kimi.as_str(),
+    ] {
         let Some(h) = homes
             .iter()
             .filter(|h| Path::new(agent).starts_with(h))
@@ -487,6 +504,8 @@ mod tests {
             codex: codex.into(),
             agy: String::new(),
             muse: String::new(),
+            grok: String::new(),
+            kimi: String::new(),
             sockdir: d.sock.clone(),
             home: home.into(),
             caller_home: String::new(),
@@ -632,6 +651,36 @@ mod tests {
             "a build outside the store needs no rule"
         );
         s.muse = format!("{st}/muse/1/bin/m\"se");
+        assert!(render(&s).is_err(), "a path the profile cannot quote");
+        let mut s = spec(&d, "/x", "", "/Users//o");
+        s.grok = format!("{st}/grok/1000001000000000070/bin/grok");
+        let p = render(&s).unwrap();
+        assert!(p.contains(&format!(
+            "(allow file-read* (subpath \"{st}/grok/1000001000000000070\"))"
+        )));
+        assert!(p.contains(&format!(
+            "(allow file-read-metadata (literal \"{st}/grok\"))"
+        )));
+        s.grok = "/private/tmp/gk/home/Library/Application Support/aterm/pkg/store/grok/1/bin/grok"
+            .into();
+        assert!(
+            !render(&s).unwrap().contains("package store"),
+            "a scratch store outside every home needs no rule"
+        );
+        s.grok = format!("{st}/grok/1/bin/g\"ok");
+        assert!(render(&s).is_err(), "a path the profile cannot quote");
+        let mut s = spec(&d, "/x", "", "/Users//o");
+        s.kimi = format!("{st}/kimi/1000002000004000000/bin/kimi");
+        let p = render(&s).unwrap();
+        assert!(p.contains(&format!(
+            "(allow file-read* (subpath \"{st}/kimi/1000002000004000000\"))"
+        )));
+        s.kimi = "/private/tmp/scratch/store/kimi/1/bin/kimi".into();
+        assert!(
+            !render(&s).unwrap().contains("package store"),
+            "a build outside every home needs no rule"
+        );
+        s.kimi = format!("{st}/kimi/1/bin/k\"mi");
         assert!(render(&s).is_err(), "a path the profile cannot quote");
     }
 
@@ -896,8 +945,9 @@ mod tests {
 
     /// The rules a profile makes of the owner's data in `home`, as the
     /// protected list words them (`.ssh`, `.claude.json`, `.gemini`,
-    /// `.codex`, Muse Code's and Antigravity's data, a browser profile), and
-    /// its bans on reading and writing the rest of it.
+    /// `.codex`, Muse Code's, Grok Build's, Kimi Code's and Antigravity's
+    /// data, a browser profile), and its bans on reading and writing the rest
+    /// of it.
     fn home_rules(home: &str) -> Vec<String> {
         let mut rules: Vec<String> = [
             ("subpath", ".ssh"),
@@ -906,6 +956,8 @@ mod tests {
             ("subpath", ".gemini"),
             ("subpath", ".codex"),
             ("subpath", ".local/share/muse"),
+            ("subpath", ".grok"),
+            ("prefix", ".kimi"),
             ("subpath", "Library/Application Support/Muse"),
             ("prefix", "Library/Application Support/Antigravity"),
             ("subpath", "Library/Application Support/Google"),

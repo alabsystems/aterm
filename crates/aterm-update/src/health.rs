@@ -368,6 +368,10 @@ impl Health {
         h.network_since = String::new();
         h.pipeline_since = String::new();
         h.manifest_since = String::new();
+        if h.stage_failures == 0 {
+            h.last_diagnosis_error.clear();
+            h.last_diagnosis_at.clear();
+        }
         Self::relabel_by_standing(&mut h);
         h.write(path);
         h
@@ -471,7 +475,7 @@ impl Health {
         h
     }
 
-    /// Record that an update apply succeeded, clearing `apply` failure, refusal, and pending state.
+    /// Record that an update apply succeeded, clearing `apply` failure, refusal, and trial-proof state.
     pub fn record_apply_success(path: &Path) -> Self {
         let _lock = Self::lock(path);
         let mut h = Self::read(path);
@@ -601,9 +605,9 @@ impl Health {
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
-        if std::fs::write(&tmp, text).is_ok() {
-            let _ = std::fs::rename(&tmp, path);
-        } else {
+        if crate::install::write_private_file(&tmp, text.as_bytes()).is_err()
+            || std::fs::rename(&tmp, path).is_err()
+        {
             let _ = std::fs::remove_file(&tmp);
         }
     }
@@ -755,6 +759,16 @@ mod tests {
             "a check never vouches for the apply lane"
         );
         assert_eq!(h.kind, "stage", "the standing streak owns the headline");
+
+        let p2 = tmp("acquisition-success-no-stage");
+        Health::record_failure(&p2, "manifest", "bad signature");
+        Health::record_apply_failure(&p2, 9, 909, "ActivityRevoked");
+        let h2 = Health::record_acquisition_success(&p2);
+        assert_eq!(h2.manifest_failures, 0);
+        assert_eq!(h2.apply_failures, 1);
+        assert_eq!(h2.kind, "apply");
+        assert!(h2.last_diagnosis_error.is_empty());
+        assert!(h2.last_diagnosis_at.is_empty());
     }
 
     #[test]

@@ -931,18 +931,19 @@ fn default_binary() -> Result<PathBuf, String> {
 
 /// Write `value` to `path` atomically (a temp file in the same directory, then a rename).
 pub(crate) fn write_json_atomic(path: &Path, value: &Value) -> Result<(), String> {
-    let parent = path.parent().unwrap_or(Path::new("."));
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     std::fs::create_dir_all(parent)
         .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
-    let tmp = parent.join(format!(
-        ".{}.{}.tmp",
-        path.file_name()
-            .map(|n| n.to_string_lossy())
-            .unwrap_or_default(),
-        std::process::id()
-    ));
     let mut text = aterm_json::to_string(value).map_err(|e| format!("JSON: {e}"))?;
     text.push('\n');
+    let tmp_dir = aterm_tempfile::Builder::new()
+        .prefix(".json-")
+        .tempdir_in(parent)
+        .map_err(|e| format!("could not stage {}: {e}", path.display()))?;
+    let tmp = tmp_dir.path().join("out.json");
     std::fs::write(&tmp, text).map_err(|e| format!("could not write {}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, path).map_err(|e| format!("could not place {}: {e}", path.display()))?;
     eprintln!("json_result: {}", path.display());
@@ -1823,5 +1824,14 @@ case \"$0\" in *-aterm) echo '{frozen_says}' ;; \
         assert_eq!(j.get("startup_gpu_cell_pipeline_ms"), Some(&Value::Null));
         assert_eq!(j.get(BIRTH), Some(&Value::Null));
         assert_eq!(j.get("startup_prepare_boot_ms"), Some(&Value::Null));
+    }
+
+    #[test]
+    fn write_json_atomic_writes_and_replaces_target() {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nested/out.json");
+        write_json_atomic(&path, &json!({"ok": 1})).expect("write");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(text, "{\"ok\":1}\n");
     }
 }

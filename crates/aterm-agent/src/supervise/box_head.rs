@@ -107,9 +107,9 @@ pub(crate) fn head_row(line: &CtlReply) -> Option<String> {
 fn hit_rows(stdout: &str) -> impl Iterator<Item = u64> + '_ {
     stdout.lines().filter_map(|l| {
         let mut words = l.split(' ');
-        let row = words.next()?.parse().ok()?;
-        words.next()?.parse::<u64>().ok()?;
-        words.next()?.parse::<u64>().ok()?;
+        let row = crate::parse_uint(words.next()?)?;
+        crate::parse_uint::<u64>(words.next()?)?;
+        crate::parse_uint::<u64>(words.next()?)?;
         words.next().is_none().then_some(row)
     })
 }

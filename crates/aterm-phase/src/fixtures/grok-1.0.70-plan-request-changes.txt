@@ -1,0 +1,50 @@
+# grok 1.0.70 · MEASURED 2026-10-29, `aterm ctl text` of a private headless aterm (144x50, aterm 0.146.0) running the real Grok Build, launched by path in the lab's jail with a scratch `HOME` and `GROK_HOME`, the lab's `XAI_API_KEY` and `GROK_XAI_API_BASE_URL`/`GROK_CLI_CHAT_PROXY_BASE_URL=http://127.0.0.1:<port>/v1` (a local stub of xAI's API, crates/aterm-lab) · the plan approval with `s` (request changes) pressed: the plan pane stays, the composer takes the focus (placeholder gone, caret shown) for the changes to ask for, and the key row is `a:approve  │  Tab:plan  │  Esc:back` · cursor=45,6 (visible, blinking_block)
+
+  ╭─ plan.md ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── [↗] ╮
+  │1 Plan                                                                                                                                    │
+  │2                                                                                                                                         │
+  │3 1. Read the failing test.                                                                                                               │
+  │4 2. Fix the reader.                                                                                                                      │
+  │5 3. Run the tests.                                                                                                                       │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │ █
+  │                                                                                                                                          │ █
+  │                                                                                                                                          │ █
+  │                                                                                                                                          │ █
+  │                                                                                                                                          │ █
+  │──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────│ █
+  │                              a approve  |  s request changes  |  c comment  |  y copy plan  |  q quit plan                               │ █
+  ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+    ◆ Waiting on plan approval
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ ❯                                                                                                                                        │
+  ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────── lab-stub · plan approval ─╯
+
+  a:approve  │  Tab:plan  │  Esc:back

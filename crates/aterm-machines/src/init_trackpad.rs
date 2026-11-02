@@ -11,6 +11,11 @@ use aterm_types::macos_setup::Setting;
 
 const KEY: &str = "com.apple.swipescrolldirection";
 
+/// The family of the Natural scrolling item, apart from the trackpad scrolling keys' `trackpad`
+/// (System State's own words for the two rows): `aterm init --only scrolling` sets the one row,
+/// `--only trackpad` the other ([`crate::init::naming`]).
+pub const NATURAL: &str = "scrolling";
+
 /// Turn Natural scrolling off for the resolved local user and current session.
 ///
 /// # Errors
@@ -137,7 +142,7 @@ impl Item for ScrollDirection {
     }
 
     fn family(&self) -> &'static str {
-        "trackpad"
+        NATURAL
     }
 
     fn title(&self) -> String {

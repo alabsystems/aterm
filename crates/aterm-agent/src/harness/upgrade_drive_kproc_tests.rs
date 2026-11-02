@@ -12,7 +12,7 @@ use super::*;
 const HANG: Duration = Duration::from_secs(60);
 
 fn login_shell() -> Child {
-    let child = Command::new("/bin/bash")
+    let child = Command::new(crate::test_program::kept("/bin/bash"))
         .arg0("-kproc-fixture")
         .args([
             "--noprofile",

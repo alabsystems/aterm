@@ -334,6 +334,9 @@ pub(crate) enum SemanticRole {
     List,
     ListBox,
     ListBoxOption,
+    /// A determinate progress indicator: its value is how far along of how much, and its value
+    /// text says it in words ([`AuditedCustomNode::progress`]).
+    ProgressIndicator,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -396,6 +399,8 @@ pub(crate) enum StyleRef {
     Setting,
     Code,
     Chip,
+    /// A note under a row or an item: Caption, in the readable secondary ink.
+    Note,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -407,10 +412,6 @@ pub(crate) struct Control<T> {
     pub(crate) style: StyleRef,
     pub(crate) role: Option<SemanticRole>,
     pub(crate) look_first: bool,
-    /// A text button paints its face centred in its rect, as a navigation chip does, rather
-    /// than at the leading inset: a button that keeps a wider footprint than its face needs
-    /// (System State's Apply, sized for its countdown) shows its words in the middle.
-    pub(crate) centred: bool,
 }
 
 impl<T> Control<T> {
@@ -423,7 +424,6 @@ impl<T> Control<T> {
             style: StyleRef::default(),
             role: None,
             look_first: false,
-            centred: false,
         }
     }
 
@@ -485,14 +485,22 @@ impl GroupSpec {
 
     /// Whether the group paints a backdrop of its own, so all of its rect is drawn, not only its
     /// children.
-    pub(crate) const fn paints_backdrop(&self) -> bool {
-        matches!(
-            self.role,
-            SemanticRole::Application | SemanticRole::Navigation
-        ) || matches!(
-            self.style,
-            StyleRef::Primary | StyleRef::Secondary | StyleRef::Code
-        )
+    pub(crate) fn paints_backdrop(&self) -> bool {
+        self.backdrop() != "none"
+    }
+
+    /// The backdrop the group paints, as its audit line names it (`surface=`): `page` (an
+    /// application's ground), `navigation` (a sidebar), `hero` and `card` (an elevated card, the
+    /// hero tinted with the accent), `code` (a code block), or `none`.
+    pub(crate) const fn backdrop(&self) -> &'static str {
+        match (self.role, self.style) {
+            (SemanticRole::Application, _) => "page",
+            (SemanticRole::Navigation, _) => "navigation",
+            (_, StyleRef::Primary) => "hero",
+            (_, StyleRef::Secondary) => "card",
+            (_, StyleRef::Code) => "code",
+            _ => "none",
+        }
     }
 }
 
@@ -692,23 +700,24 @@ pub(crate) const DISPLAY_FACE_NAME_AUDIT: &str = "settings.text.display-face-nam
 /// About's wordmark, its label "aterm", in the hero's type.
 pub(crate) const WORDMARK_AUDIT: &str = "settings.about.wordmark";
 
-/// System State's brand lockup (`docs/DESIGN-system-state-2026-10-21.md`
-/// §3.1, [`crate::system_state::paint_brand`]): `❯ aterm · ALab▌` in the
-/// terminal's mono face over a dim six-stripe ribbon, and the rainbow kitty
-/// behind the caret. Paint only; its value is the lockup's
-/// [`crate::system_state::BrandSpec`], and its accessible parent names it.
+/// The setup screen's lockup, its progress bar (`docs/DESIGN-init-on-by-default-2026-10-25.md`
+/// §4.5, [`crate::system_state::paint_lockup`]): `❯ aterm · ALab` in the terminal's mono face,
+/// the rainbow ribbon filled to the caret, the track beyond it, and the kitty behind the caret.
+/// A [`SemanticRole::ProgressIndicator`]; its value is the lockup's
+/// [`crate::system_state::LockupSpec`].
 pub(crate) const SYSTEM_STATE_BRAND_AUDIT: &str = "system-state.brand";
 
-/// A System State row's chip (§3.3, [`crate::system_state::paint_chip`]):
-/// ✓, `Will change`, `Needs you`, `Failed` or the quiet `Left as is`,
-/// right-aligned in its rect. Paint only; its value is the chip's word, and
-/// the row's accessible label says it.
-pub(crate) const SYSTEM_STATE_CHIP_AUDIT: &str = "system-state.chip";
+/// A setup screen state's mark (§4.4, [`crate::system_state::paint_mark`]): a ring, a spinner,
+/// dots, a disc with a check or `!`, or an em dash, each its own shape. Paint only, so a screen
+/// reader never hears a frame of the spinner (§4.7); its value is `mark,ground`, and its line's
+/// or row's label says the state in words. The working spinner is a moving node stepping at
+/// 12 Hz ([`NodeMotion`]) where the page may move in place, and its still glyph where it may not.
+pub(crate) const SYSTEM_STATE_MARK_AUDIT: &str = "system-state.mark";
 
-/// System State's run meter (§3.2, [`crate::system_state::paint_meter`]): a
-/// thin capsule while a run is going. Paint only; its value is `done,total`,
-/// and the headline says the same in words.
-pub(crate) const SYSTEM_STATE_METER_AUDIT: &str = "system-state.meter";
+/// A setup screen surface (§4.1, §4.4, [`crate::system_state::paint_surface`]): the list's inset
+/// grouped card, the Needs-you card's wash and rim, or a working line's band. Paint only; its
+/// value is the ground it paints.
+pub(crate) const SYSTEM_STATE_SURFACE_AUDIT: &str = "system-state.surface";
 
 /// The size and face a [`WORDMARK_AUDIT`] node paints `label` in, in a node `width` wide.
 pub(crate) fn wordmark_typography(
@@ -863,6 +872,8 @@ pub(crate) fn slider_geometry(rect: LogicalRect) -> SliderGeometry {
 pub(crate) struct TextFieldSpec {
     pub(crate) label: String,
     pub(crate) placeholder: Option<String>,
+    /// The field holds a secret (a password, a join phrase): its value reaches the semantic tree,
+    /// a control client's dump and a screen reader only as one bullet a character.
     pub(crate) secret: bool,
     pub(crate) visual_value: Option<String>,
     pub(crate) input: Option<crate::native_text_input::TextInputProjection>,
@@ -1392,6 +1403,15 @@ fn text_field_line_band(rect: LogicalRect, inset: f32) -> (f32, f32) {
     let line = native_button_line_height() * 1.8 - 2.0 * (inset - 7.0);
     let height = (rect.height - 2.0 * inset).min(line).max(1.0);
     (rect.y + ((rect.height - height) / 2.0).max(0.0), height)
+}
+
+/// A secret field's value as the semantic tree, a control client's dump and a screen reader
+/// carry it ([`TextFieldSpec::secret`]): one bullet a character, never its words.
+fn masked_semantic_value(value: &SemanticValue) -> SemanticValue {
+    match value {
+        SemanticValue::Text(text) => SemanticValue::Text("•".repeat(text.graphemes().count())),
+        other => other.clone(),
+    }
 }
 
 fn semantic_text(value: &SemanticValue) -> &str {
@@ -2575,6 +2595,73 @@ pub(crate) struct AuditedCustomNode {
     pub(crate) focusable: bool,
     pub(crate) focused: bool,
     pub(crate) focus_visible: bool,
+    /// A [`SemanticRole::ProgressIndicator`]'s `(done, total)`: its value, and the words a screen
+    /// reader hears for it (`11 of 16 done`).
+    pub(crate) progress: Option<(u32, u32)>,
+    /// How the node moves, where it does: its painter draws it at the motion clock's `t_ms`,
+    /// and the host repaints only its pixels when its frame changes ([`NodeMotion`]).
+    pub(crate) motion: Option<NodeMotion>,
+}
+
+/// A custom node that moves (`docs/DESIGN-init-on-by-default-2026-10-25.md` §5.1): its painter
+/// draws it at the motion clock's `t_ms`, on frames of `cadence` counted from `start_ms`, until
+/// `until_ms` (for as long as the node stands where it is `None`: a working spinner turns while
+/// its work runs). The host repaints its pixels alone when its frame changes, with no `view()`
+/// or `compile()`, and wakes for its next frame only while its page is seen in a focused window
+/// and the hands are off the keys (§5.6). A page that may not move (`ViewMotionCx::page`)
+/// declares none, and its painter draws the still glyph.
+///
+/// Both times are on the motion clock a view reads as `ViewCx::animation_phase_ms`, so a page
+/// that starts a motion now declares `start_ms: cx.animation_phase_ms`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct NodeMotion {
+    pub(crate) start_ms: u64,
+    pub(crate) until_ms: Option<u64>,
+    pub(crate) cadence: aterm_messages::motion::Cadence,
+}
+
+impl NodeMotion {
+    /// A motion on `cadence` from `start_ms` with no end.
+    pub(crate) const fn endless(start_ms: u64, cadence: aterm_messages::motion::Cadence) -> Self {
+        Self {
+            start_ms,
+            until_ms: None,
+            cadence,
+        }
+    }
+
+    /// The frame showing at `t_ms`: its last from `until_ms` on.
+    pub(crate) const fn frame_at(self, t_ms: u64) -> u64 {
+        let t = match self.until_ms {
+            Some(until) if t_ms > until => until,
+            _ => t_ms,
+        };
+        self.cadence.frame_at(self.start_ms, t)
+    }
+
+    /// When the frame after the one painted at `painted_ms` shows, `None` once the last has
+    /// (a motion with an end owes no wake after it).
+    pub(crate) const fn next_frame_after(self, painted_ms: u64) -> Option<u64> {
+        let next = self.cadence.next_frame(self.start_ms, painted_ms);
+        match self.until_ms {
+            Some(until) if next > until => {
+                if self.frame_at(until) != self.frame_at(painted_ms) {
+                    Some(until)
+                } else {
+                    None
+                }
+            }
+            _ => Some(next),
+        }
+    }
+}
+
+/// Where one moving node's painter's prims fall in a tray ([`CompiledUi::tray_with_motion`]):
+/// `node` is its index in [`CompiledUi::paint`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MotionSpan {
+    pub(crate) node: usize,
+    pub(crate) prims: std::ops::Range<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2611,6 +2698,10 @@ impl UiContent {
                 let readout = control.spec.display_value.trim();
                 (!readout.is_empty()).then(|| readout.to_string())
             }
+            Self::Custom(AuditedCustomNode {
+                progress: Some((done, total)),
+                ..
+            }) => Some(format!("{done} of {total} done")),
             _ => None,
         }
     }
@@ -2685,7 +2776,12 @@ impl UiContent {
                 control_projection(SemanticRole::Slider, &control.spec.label, control)
             }
             Self::TextField(control) => {
-                control_projection(SemanticRole::TextField, &control.spec.label, control)
+                let mut projection =
+                    control_projection(SemanticRole::TextField, &control.spec.label, control);
+                if control.spec.secret {
+                    projection.value = masked_semantic_value(&projection.value);
+                }
+                projection
             }
             Self::ColorWheel(control) => {
                 control_projection(SemanticRole::Button, &control.spec.label, control)
@@ -2748,7 +2844,13 @@ impl UiContent {
             Self::Custom(spec) => SemanticProjection {
                 role: spec.role,
                 label: spec.label.clone(),
-                value: SemanticValue::None,
+                value: spec.progress.map_or(SemanticValue::None, |(done, total)| {
+                    SemanticValue::Number {
+                        value: f64::from(done),
+                        minimum: 0.0,
+                        maximum: f64::from(total),
+                    }
+                }),
                 state: (spec.action.is_some() || spec.focusable).then(|| ControlState {
                     enabled: spec.action.is_some() || spec.focusable,
                     focused: spec.focused,
@@ -3042,6 +3144,20 @@ impl PaintNode {
         !self.peek && materially_clipped(self.rect, self.clip)
     }
 
+    /// How this node moves, where it does ([`AuditedCustomNode::motion`]).
+    pub(crate) const fn motion(&self) -> Option<NodeMotion> {
+        match &self.content {
+            UiContent::Custom(custom) => custom.motion,
+            _ => None,
+        }
+    }
+
+    /// The pixels a moving node may change: its rect within its clip. Its painter's prims are
+    /// clipped to it ([`CompiledUi::tray_with_chrome`]), so a motion frame repaints this alone.
+    pub(crate) fn motion_rect(&self) -> Option<LogicalRect> {
+        self.rect.intersect(self.clip)
+    }
+
     fn painted_prims(&self) -> Vec<crate::widget::DrawPrim> {
         let theme = aterm_render::Theme::default();
         let roles = crate::settings::Roles::from_theme(theme);
@@ -3159,6 +3275,7 @@ fn ink_marks(
                 w,
                 h,
                 art: image,
+                alpha: _,
             } => {
                 let frame = LogicalRect::new(*x, *y, *w, *h);
                 art = Some((*image, frame));
@@ -3620,6 +3737,9 @@ pub(crate) struct CompiledUi {
     /// ([`Self::tab_past_screen`]), where [`Self::focus_order`] holds only the stops its screen
     /// shows.
     pub(crate) list_stops: Vec<UiKey>,
+    /// The [`Self::paint`] indices of the nodes that move ([`NodeMotion`]), in paint order:
+    /// what the host reads for the next motion frame without a `view()`.
+    pub(crate) motion: Vec<usize>,
 }
 
 /// The picture of a control a list draws in the strip under its room
@@ -4316,8 +4436,20 @@ impl CompiledUi {
             .iter()
             .position(|key| key == &paint.key)
             .map_or_else(|| "-".to_string(), |index| index.to_string());
+        let surface = match &paint.content {
+            UiContent::Group(spec) => spec.backdrop(),
+            // A surface the setup screen paints itself (its list, its Needs-you card, a working
+            // line's wash) is a card to whoever reads the audit.
+            UiContent::Custom(spec) if spec.audit_id == SYSTEM_STATE_SURFACE_AUDIT => "card",
+            _ => "-",
+        };
+        // The band of a scrolling list's edge its words fade out across (top, bottom).
+        let fade = paint.fade.map_or_else(
+            || "-".to_string(),
+            |(top, bottom)| format!("{top:.1},{bottom:.1}"),
+        );
         format!(
-            "paint-node key={:?} kind={} rect={:.1},{:.1},{:.1},{:.1} clip={:.1},{:.1},{:.1},{:.1} visible={} clipped={} role={} label={:?} value={} action={} state={} focus-index={} audit-id={}",
+            "paint-node key={:?} kind={} rect={:.1},{:.1},{:.1},{:.1} clip={:.1},{:.1},{:.1},{:.1} visible={} clipped={} role={} label={:?} value={} action={} state={} focus-index={} audit-id={} surface={surface} fade={fade}",
             paint.key.as_str(),
             ui_content_kind(&paint.content),
             paint.rect.x,
@@ -4386,25 +4518,83 @@ impl CompiledUi {
         theme: aterm_render::Theme,
         base_px: f32,
     ) -> crate::widget::TrayInput {
-        self.tray_with_chrome(theme, theme, base_px)
+        self.tray_with_chrome(theme, theme, base_px, 0)
     }
 
-    /// `Self::tray` with the chrome palette and the terminal theme given apart.
+    /// `Self::tray` with the chrome palette and the terminal theme given apart, its moving
+    /// nodes drawn at `t_ms` on the motion clock ([`NodeMotion`]).
     pub(crate) fn tray_with_chrome(
         &self,
         chrome: impl Into<crate::chrome_band::ChromePalette>,
         terminal_theme: aterm_render::Theme,
         base_px: f32,
+        t_ms: u64,
+    ) -> crate::widget::TrayInput {
+        self.tray_recording(chrome.into(), terminal_theme, base_px, t_ms, None)
+    }
+
+    /// [`Self::tray_with_chrome`], and where each moving node's prims fall in it: what a
+    /// motion frame repaints and splices without a compile ([`Self::paint_motion_node`]).
+    pub(crate) fn tray_with_motion(
+        &self,
+        chrome: impl Into<crate::chrome_band::ChromePalette>,
+        terminal_theme: aterm_render::Theme,
+        base_px: f32,
+        t_ms: u64,
+    ) -> (crate::widget::TrayInput, Vec<MotionSpan>) {
+        let mut spans = Vec::with_capacity(self.motion.len());
+        let tray = self.tray_recording(
+            chrome.into(),
+            terminal_theme,
+            base_px,
+            t_ms,
+            Some(&mut spans),
+        );
+        (tray, spans)
+    }
+
+    /// The prims moving node `index` of [`Self::paint`] draws at `t_ms` in `roles`: what its span
+    /// of a [`Self::tray_with_motion`] tray holds once that node's frame is `t_ms`'s.
+    pub(crate) fn paint_motion_node(
+        &self,
+        index: usize,
+        roles: crate::settings::Roles,
+        terminal_theme: aterm_render::Theme,
+        base_px: f32,
+        t_ms: u64,
+    ) -> Vec<crate::widget::DrawPrim> {
+        let mut prims = Vec::new();
+        if let Some(node) = self.paint.get(index) {
+            paint_node_body(&mut prims, node, roles, terminal_theme, base_px, t_ms);
+        }
+        prims
+    }
+
+    fn tray_recording(
+        &self,
+        chrome: crate::chrome_band::ChromePalette,
+        terminal_theme: aterm_render::Theme,
+        base_px: f32,
+        t_ms: u64,
+        mut spans: Option<&mut Vec<MotionSpan>>,
     ) -> crate::widget::TrayInput {
         let theme = terminal_theme;
         let roles = crate::settings::Roles::from_theme(chrome);
         let mut prims = Vec::with_capacity(self.paint.len() * 5);
-        for node in &self.paint {
+        for (index, node) in self.paint.iter().enumerate() {
+            // A moving node paints within its rect, so the pixels a frame of it changes are
+            // that rect's alone.
+            let clip = if node.motion().is_some() {
+                node.motion_rect()
+                    .unwrap_or(LogicalRect::new(node.rect.x, node.rect.y, 0.0, 0.0))
+            } else {
+                node.clip
+            };
             prims.push(crate::widget::DrawPrim::ClipPush {
-                x: node.clip.x,
-                y: node.clip.y,
-                w: node.clip.width,
-                h: node.clip.height,
+                x: clip.x,
+                y: clip.y,
+                w: clip.width,
+                h: clip.height,
             });
             if let Some((top, bottom)) = node.fade {
                 prims.push(crate::widget::DrawPrim::FadePush {
@@ -4415,12 +4605,14 @@ impl CompiledUi {
                 });
             }
             let from = prims.len();
-            if node.cut_edges.any() {
-                let icons =
-                    painted_icons(|| paint_compiled_node(&mut prims, node, roles, theme, base_px));
-                drop_cut_marks(&mut prims, from, &icons, node.cut_edges);
-            } else {
-                paint_compiled_node(&mut prims, node, roles, theme, base_px);
+            paint_node_body(&mut prims, node, roles, theme, base_px, t_ms);
+            if node.motion().is_some()
+                && let Some(spans) = spans.as_deref_mut()
+            {
+                spans.push(MotionSpan {
+                    node: index,
+                    prims: from..prims.len(),
+                });
             }
             if node.fade.is_some() {
                 prims.push(crate::widget::DrawPrim::FadePop);
@@ -4726,7 +4918,7 @@ fn navigation_is_chip(control: &Control<ButtonSpec>) -> bool {
 }
 
 const fn centres_its_label(control: &Control<ButtonSpec>) -> bool {
-    (control.centred || matches!(control.style, StyleRef::Navigation | StyleRef::Chip))
+    matches!(control.style, StyleRef::Navigation | StyleRef::Chip)
         && control.spec.visual_icon.is_none()
         && control.spec.visual_label.is_some()
 }
@@ -5209,11 +5401,10 @@ fn text_fit_audit(node: &PaintNode) -> Option<TextFitAudit> {
                 let (size, face) = wordmark_typography(&spec.label, node.rect.width);
                 crate::tray_raster::ui_text_width_for(face, &spec.label, size.get())
             } else if spec.audit_id == SYSTEM_STATE_BRAND_AUDIT {
-                crate::system_state::BrandSpec::parse(spec.paint.as_deref()).width()
-            } else if spec.audit_id == SYSTEM_STATE_CHIP_AUDIT {
-                crate::system_state::Chip::parse(spec.paint.as_deref())
-                    .map_or(0.0, crate::system_state::Chip::width)
-            } else if spec.audit_id == SYSTEM_STATE_METER_AUDIT {
+                crate::system_state::LockupSpec::parse(spec.paint.as_deref()).least_width()
+            } else if spec.audit_id == SYSTEM_STATE_MARK_AUDIT
+                || spec.audit_id == SYSTEM_STATE_SURFACE_AUDIT
+            {
                 0.0
             } else {
                 crate::tray_raster::ui_text_width(&spec.label, native_type_px(TypeStep::Body).get())
@@ -5610,6 +5801,7 @@ fn text_typography_for(role: SemanticRole, style: StyleRef) -> (TypeStep, crate:
         _ if style == StyleRef::Code => (TypeStep::Body, TextFace::Mono),
         SemanticRole::Status if style == StyleRef::Primary => (TypeStep::Body, TextFace::Ui),
         SemanticRole::Status => (TypeStep::Caption, TextFace::Ui),
+        _ if style == StyleRef::Note => (TypeStep::Caption, TextFace::Ui),
         _ => (TypeStep::Body, TextFace::Ui),
     }
 }
@@ -5619,7 +5811,40 @@ fn paint_compiled_node(
     node: &PaintNode,
     roles: crate::settings::Roles,
     theme: aterm_render::Theme,
+    base_px: f32,
+) {
+    paint_compiled_node_at(prims, node, roles, theme, base_px, 0);
+}
+
+/// What a tray draws for `node` between its clip's push and pop: its painter's prims at `t_ms`,
+/// less the marks of the edges its list cut.
+fn paint_node_body(
+    prims: &mut Vec<crate::widget::DrawPrim>,
+    node: &PaintNode,
+    roles: crate::settings::Roles,
+    theme: aterm_render::Theme,
+    base_px: f32,
+    t_ms: u64,
+) {
+    let from = prims.len();
+    if node.cut_edges.any() {
+        let icons = painted_icons(|| {
+            paint_compiled_node_at(prims, node, roles, theme, base_px, t_ms);
+        });
+        drop_cut_marks(prims, from, &icons, node.cut_edges);
+    } else {
+        paint_compiled_node_at(prims, node, roles, theme, base_px, t_ms);
+    }
+}
+
+/// [`paint_compiled_node`] with a moving node drawn at `t_ms` on the motion clock.
+fn paint_compiled_node_at(
+    prims: &mut Vec<crate::widget::DrawPrim>,
+    node: &PaintNode,
+    roles: crate::settings::Roles,
+    theme: aterm_render::Theme,
     _base_px: f32,
+    t_ms: u64,
 ) {
     use crate::tray_raster::row_baseline;
     use crate::type_scale::TypeStep;
@@ -5629,13 +5854,20 @@ fn paint_compiled_node(
     match &node.content {
         UiContent::Group(spec) => {
             if spec.role == SemanticRole::Application {
+                // A grouped form's page (`StyleRef::Secondary`, the setup screen's) sinks under
+                // its cards in light mode, as macOS's grouped form style does.
+                let page = if spec.style == StyleRef::Secondary {
+                    roles.grouped().page
+                } else {
+                    roles.surface
+                };
                 prims.push(DrawPrim::Panel {
                     x: rect.x,
                     y: rect.y,
                     w: rect.width,
                     h: rect.height,
                     radius: 0.0,
-                    fill: rgba(roles.surface, 255),
+                    fill: rgba(page, 255),
                 });
                 if spec.style == StyleRef::Hero
                     && !crate::native_appearance::current_preferences().high_contrast
@@ -6117,7 +6349,6 @@ fn paint_compiled_node(
                 paint_control_surface(prims, rect, control.state, roles);
             }
             let on = matches!(control.value, SemanticValue::Bool(true));
-            let enabled = control.state.enabled;
             if FLUENT_SWITCH {
                 paint_fluent_switch(prims, rect, control.state, on, roles);
                 if plain || !switch_word_shown(rect, control) {
@@ -6138,45 +6369,7 @@ fn paint_compiled_node(
                 ));
                 return;
             }
-            let track_w = SWITCH_TRACK_WIDTH.min((rect.width - 8.0).max(0.0));
-            let track_h = 22.0_f32.min((rect.height - 8.0).max(0.0));
-            prims.push(DrawPrim::Capsule {
-                x: rect.right() - track_w - 8.0,
-                y: rect.y + (rect.height - track_h) / 2.0,
-                w: track_w,
-                h: track_h,
-                frac: if on { 1.0 } else { 0.0 },
-                fill: rgba(
-                    if enabled && !control.state.muted {
-                        roles.accent
-                    } else if enabled {
-                        roles.text_tertiary
-                    } else {
-                        mix_rgb(roles.accent, roles.elevated, 0.55)
-                    },
-                    if enabled { 255 } else { 150 },
-                ),
-                track: rgba(roles.control_track, if enabled { 180 } else { 90 }),
-            });
-            prims.push(DrawPrim::Dot {
-                cx: if on {
-                    rect.right() - 8.0 - track_h / 2.0
-                } else {
-                    rect.right() - 8.0 - track_w + track_h / 2.0
-                },
-                cy: rect.y + rect.height / 2.0,
-                r: (track_h / 2.0 - 3.0).max(2.0),
-                color: rgba(
-                    if !enabled {
-                        mix_rgb(roles.text_tertiary, roles.text_secondary, 0.35)
-                    } else if on {
-                        roles.on_accent
-                    } else {
-                        roles.text_secondary
-                    },
-                    if enabled { 255 } else { 170 },
-                ),
-            });
+            paint_mac_switch(prims, rect, control.state, on, &roles);
             let size = native_type_px(TypeStep::Secondary);
             if plain || !switch_word_shown(rect, control) {
                 return;
@@ -6602,15 +6795,21 @@ fn paint_compiled_node(
                 return;
             }
             if spec.audit_id == SYSTEM_STATE_BRAND_AUDIT {
-                crate::system_state::paint_brand(prims, rect, spec.paint.as_deref(), &roles);
+                crate::system_state::paint_lockup(prims, rect, spec.paint.as_deref(), &roles);
                 return;
             }
-            if spec.audit_id == SYSTEM_STATE_CHIP_AUDIT {
-                crate::system_state::paint_chip(prims, rect, spec.paint.as_deref(), &roles);
+            if spec.audit_id == SYSTEM_STATE_MARK_AUDIT {
+                crate::system_state::paint_mark(
+                    prims,
+                    rect,
+                    spec.paint.as_deref(),
+                    spec.motion.map(|motion| motion.frame_at(t_ms)),
+                    &roles,
+                );
                 return;
             }
-            if spec.audit_id == SYSTEM_STATE_METER_AUDIT {
-                crate::system_state::paint_meter(prims, rect, spec.paint.as_deref(), &roles);
+            if spec.audit_id == SYSTEM_STATE_SURFACE_AUDIT {
+                crate::system_state::paint_surface(prims, rect, spec.paint.as_deref(), &roles);
                 return;
             }
             if spec.audit_id == WORDMARK_AUDIT {
@@ -6934,6 +7133,7 @@ fn paint_button_icon_prims(
             r_outer: 8.0,
             thickness: 3.0,
             track: rgba(color, 70),
+            start: 0.0,
             frac: 0.5,
             fill: rgba(color, 240),
         }),
@@ -8548,6 +8748,28 @@ pub(crate) fn disclosure_label_room(width: f32) -> f32 {
     (width - BUTTON_LABEL_INSET - DISCLOSURE_LABEL_END).max(0.0)
 }
 
+/// How much of the text ink a hovered disclosure lays over whatever it sits on. A mark drawn
+/// under one holds its contrast against this wash too (`system_state::marks::mark_ink`).
+pub(crate) const DISCLOSURE_HOVER_WASH: f32 = 0.08;
+
+/// How much of the text ink a pressed disclosure lays over whatever it sits on.
+const DISCLOSURE_PRESSED_WASH: f32 = 0.14;
+
+/// A disclosure's wash, as the alpha of the text ink laid over its ground: pressed or hovered,
+/// never merely open, since the chevron turned down says open (macOS keeps an expanded row
+/// clear). A wash of ink rather than a mix with one surface keeps it as faint on a white card as
+/// on an elevated one.
+fn disclosure_wash_alpha(state: ControlState) -> Option<u8> {
+    let strength = if state.pressed {
+        DISCLOSURE_PRESSED_WASH
+    } else if state.hovered {
+        DISCLOSURE_HOVER_WASH
+    } else {
+        return None;
+    };
+    Some((strength * 255.0).round() as u8)
+}
+
 fn paint_disclosure_button(
     prims: &mut Vec<crate::widget::DrawPrim>,
     rect: LogicalRect,
@@ -8559,23 +8781,14 @@ fn paint_disclosure_button(
 
     let state = control.state;
     let open = state.expanded == Some(true);
-    let wash = if state.pressed {
-        Some(0.14)
-    } else if state.hovered {
-        Some(0.08)
-    } else if open {
-        Some(0.05)
-    } else {
-        None
-    };
-    if let Some(t) = wash {
+    if let Some(alpha) = disclosure_wash_alpha(state) {
         prims.push(DrawPrim::Panel {
             x: rect.x,
             y: rect.y,
             w: rect.width,
             h: rect.height,
             radius: 6.0,
-            fill: rgba(mix_rgb(roles.elevated, roles.text_primary, t), 255),
+            fill: rgba(roles.text_primary, alpha),
         });
     }
     if state.focus_visible {
@@ -8626,20 +8839,39 @@ fn paint_disclosure_button(
         .chevron_row
         .map_or(rect.height, |row| f32::from(row).min(rect.height));
     let (cx, cy) = (rect.right() - 16.0, rect.y + chevron_band / 2.0);
-    let segment = |x1: f32, y1: f32, x2: f32, y2: f32| DrawPrim::Line {
-        x1,
-        y1,
-        x2,
-        y2,
-        width: 1.6,
-        color: ink,
-    };
-    if open {
-        prims.push(segment(cx - 4.5, cy - 2.25, cx, cy + 2.25));
-        prims.push(segment(cx, cy + 2.25, cx + 4.5, cy - 2.25));
-    } else {
-        prims.push(segment(cx - 2.25, cy - 4.5, cx + 2.25, cy));
-        prims.push(segment(cx + 2.25, cy, cx - 2.25, cy + 4.5));
+    paint_disclosure_chevron(prims, (cx, cy), if open { 1.0 } else { 0.0 }, ink);
+}
+
+/// A disclosure chevron centred on `(cx, cy)`, turned `turn` of the way from closed (`0.0`,
+/// pointing right) to open (`1.0`, pointing down): one shape rotated a quarter turn about its
+/// centre, so a motion that eases `turn` swings it as macOS's disclosure swings. Smaller and
+/// heavier than a navigation chevron (`ButtonIcon::Forward`), which leads to another page.
+pub(crate) fn paint_disclosure_chevron(
+    prims: &mut Vec<crate::widget::DrawPrim>,
+    (cx, cy): (f32, f32),
+    turn: f32,
+    ink: crate::widget::Rgba,
+) {
+    /// Half the chevron's depth: its arms reach twice this above and below its point.
+    const HALF_DEPTH: f32 = 2.0;
+    let angle = turn.clamp(0.0, 1.0) * std::f32::consts::FRAC_PI_2;
+    let (sin, cos) = angle.sin_cos();
+    // Clockwise on screen (y down): right → down.
+    let at = |x: f32, y: f32| (cx + x * cos - y * sin, cy + x * sin + y * cos);
+    let (top, point, bottom) = (
+        at(-HALF_DEPTH, -HALF_DEPTH * 2.0),
+        at(HALF_DEPTH, 0.0),
+        at(-HALF_DEPTH, HALF_DEPTH * 2.0),
+    );
+    for ((x1, y1), (x2, y2)) in [(top, point), (point, bottom)] {
+        prims.push(crate::widget::DrawPrim::Line {
+            x1,
+            y1,
+            x2,
+            y2,
+            width: 2.0,
+            color: ink,
+        });
     }
 }
 
@@ -8669,10 +8901,13 @@ fn paint_messages_scroll(
 }
 
 fn scroll_share(value: Option<&str>) -> Option<(f32, f32, f32)> {
-    let mut parts = value
-        .unwrap_or("")
-        .split(',')
-        .map(|part| part.trim().parse::<u32>().unwrap_or(0));
+    let mut parts = value.unwrap_or("").split(',').map(|part| {
+        let s = part.trim();
+        (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| s.parse::<u32>().ok())
+            .flatten()
+            .unwrap_or(0)
+    });
     let (first, shown, total) = (
         parts.next().unwrap_or(0),
         parts.next().unwrap_or(0),
@@ -8861,6 +9096,112 @@ pub(crate) fn switch_least_width() -> f32 {
         SWITCH_TRACK_WIDTH
     };
     (SWITCH_WORD_LEAD + word + SWITCH_WORD_GAP + track).ceil()
+}
+
+/// A switch's knob: white in every state, as AppKit draws it.
+pub(crate) const SWITCH_KNOB: [u8; 3] = [0xFF, 0xFF, 0xFF];
+/// A switch's off track as macOS draws it on a dark ground.
+pub(crate) const SWITCH_OFF_DARK: [u8; 3] = [0x48, 0x48, 0x4A];
+/// A switch's off track as macOS draws it on a light ground.
+pub(crate) const SWITCH_OFF_LIGHT: [u8; 3] = [0xE5, 0xE5, 0xEA];
+
+/// The parts of a switch as macOS draws one: its on track (the accent AppKit paints a control
+/// in, [`crate::settings::Roles::control_accent`]), its off track, its white knob and the knob's
+/// hairline shadow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MacSwitchInks {
+    pub(crate) on: crate::widget::Rgba,
+    pub(crate) off: crate::widget::Rgba,
+    pub(crate) knob: crate::widget::Rgba,
+    pub(crate) shadow: crate::widget::Rgba,
+}
+
+/// [`MacSwitchInks`] for a switch in `state` on `roles`' ground: a disabled one at part
+/// strength, a muted one's on track in the tertiary ink.
+pub(crate) fn mac_switch_inks(
+    state: ControlState,
+    roles: &crate::settings::Roles,
+) -> MacSwitchInks {
+    use crate::widget::rgba;
+    let enabled = state.enabled;
+    let dark = crate::native_appearance::surface_is_dark(roles.surface);
+    let on = if enabled && !state.muted {
+        rgba(roles.control_accent, 255)
+    } else if enabled {
+        rgba(roles.text_tertiary, 255)
+    } else {
+        rgba(mix_rgb(roles.control_accent, roles.elevated, 0.55), 150)
+    };
+    let off = if dark {
+        SWITCH_OFF_DARK
+    } else {
+        SWITCH_OFF_LIGHT
+    };
+    MacSwitchInks {
+        on,
+        off: rgba(off, if enabled { 255 } else { 110 }),
+        knob: rgba(SWITCH_KNOB, if enabled { 255 } else { 170 }),
+        shadow: rgba([0, 0, 0], if dark { 70 } else { 40 }),
+    }
+}
+
+/// A switch as macOS draws one ([`mac_switch_inks`]): the track at the right of `rect`, the knob
+/// at the end `on` names; under High Contrast the track keeps a 3:1 rim, as macOS's Increase
+/// Contrast draws one.
+fn paint_mac_switch(
+    prims: &mut Vec<crate::widget::DrawPrim>,
+    rect: LogicalRect,
+    state: ControlState,
+    on: bool,
+    roles: &crate::settings::Roles,
+) {
+    use crate::widget::{DrawPrim, rgba};
+
+    let inks = mac_switch_inks(state, roles);
+    let track_w = SWITCH_TRACK_WIDTH.min((rect.width - 8.0).max(0.0));
+    let track_h = 22.0_f32.min((rect.height - 8.0).max(0.0));
+    let (x, y) = (
+        rect.right() - track_w - 8.0,
+        rect.y + (rect.height - track_h) / 2.0,
+    );
+    prims.push(DrawPrim::Capsule {
+        x,
+        y,
+        w: track_w,
+        h: track_h,
+        frac: if on { 1.0 } else { 0.0 },
+        fill: inks.on,
+        track: inks.off,
+    });
+    if crate::native_appearance::current_preferences().high_contrast {
+        prims.push(DrawPrim::Stroke {
+            x: x + 0.5,
+            y: y + 0.5,
+            w: (track_w - 1.0).max(0.0),
+            h: (track_h - 1.0).max(0.0),
+            radius: ((track_h - 1.0) / 2.0).max(0.0),
+            width: 1.0,
+            color: rgba(roles.control_edge, if state.enabled { 255 } else { 120 }),
+        });
+    }
+    let cx = if on {
+        x + track_w - track_h / 2.0
+    } else {
+        x + track_h / 2.0
+    };
+    let (cy, r) = (y + track_h / 2.0, (track_h / 2.0 - 2.0).max(2.0));
+    prims.push(DrawPrim::Dot {
+        cx,
+        cy,
+        r: r + 0.5,
+        color: inks.shadow,
+    });
+    prims.push(DrawPrim::Dot {
+        cx,
+        cy,
+        r,
+        color: inks.knob,
+    });
 }
 
 const FLUENT_TRACK: (f32, f32) = (40.0, 20.0);
@@ -9061,7 +9402,8 @@ fn style_text_color(style: StyleRef, roles: &crate::settings::Roles) -> [u8; 3] 
         | StyleRef::Secondary
         | StyleRef::Navigation
         | StyleRef::Setting
-        | StyleRef::Chip => readable_secondary(roles),
+        | StyleRef::Chip
+        | StyleRef::Note => readable_secondary(roles),
         StyleRef::Code => roles.text_primary,
     }
 }
@@ -9120,29 +9462,6 @@ pub(crate) fn joined_as_named(visual: &str, name: &str) -> String {
         out.push_str(line);
     }
     out
-}
-
-/// Whether a button's painted words are heard (WCAG 2.5.3, Label in Name): in its name, or,
-/// for a count in parentheses closing its face (`Apply (30)`, a countdown), the words before the
-/// count in its name and the count in its description, which VoiceOver reads after the name. A
-/// count that changes every second is the control's state, never its name.
-#[cfg(debug_assertions)]
-pub(crate) fn visible_label_heard(visual: &str, name: &str, description: Option<&str>) -> bool {
-    visible_label_in_name(visual, name)
-        || closing_count(visual).is_some_and(|(words, count)| {
-            visible_label_in_name(words, name)
-                && description.is_some_and(|said| {
-                    said.split(|ch: char| !ch.is_ascii_digit())
-                        .any(|number| number == count)
-                })
-        })
-}
-
-/// The words and the count of a face that closes on a count in parentheses (`Apply (30)`).
-#[cfg(debug_assertions)]
-fn closing_count(visual: &str) -> Option<(&str, &str)> {
-    let (words, count) = visual.trim_end().strip_suffix(')')?.rsplit_once(" (")?;
-    (!count.is_empty() && count.chars().all(|ch| ch.is_ascii_digit())).then_some((words, count))
 }
 
 /// Whether the words a control paints are in its name (WCAG 2.5.3, Label in Name).
@@ -9316,11 +9635,7 @@ impl Compiler {
         if let UiContent::Button(control) = &content
             && !paint_only
             && let Some(visual) = control.spec.visual_label.as_deref()
-            && !visible_label_heard(
-                visual,
-                &control.spec.label,
-                control.spec.description.as_deref(),
-            )
+            && !visible_label_in_name(visual, &control.spec.label)
         {
             return Err(CompileError::VisibleLabelNotInName(key));
         }
@@ -9415,6 +9730,9 @@ impl Compiler {
                 }
                 return Ok(());
             }
+        }
+        if matches!(&content, UiContent::Custom(custom) if custom.motion.is_some()) {
+            self.output.motion.push(self.output.paint.len());
         }
         self.output.paint.push(PaintNode {
             key: key.clone(),
@@ -9773,8 +10091,13 @@ pub(crate) mod tests {
                         node,
                         words: (kind == 0).then(|| String::from("words")),
                         rect,
-                        art: (kind == 1)
-                            .then_some((crate::widget::ImageArt::BrandKitty { dark: false }, rect)),
+                        art: (kind == 1).then_some((
+                            crate::widget::ImageArt::Kitty {
+                                pose: crate::widget::ImageArt::BRAND_POSE,
+                                dark: false,
+                            },
+                            rect,
+                        )),
                     })
                     .collect()
             };
@@ -10871,6 +11194,161 @@ pub(crate) mod tests {
                 .map(str::to_string)
         };
         assert_eq!(position(&live_features), position(&inert_features));
+    }
+
+    /// A SWITCH IS DRAWN AS macOS DRAWS ONE (init-on-by-default design §4.4, D1): its on track
+    /// in the accent macOS paints controls in, its off track `#48484A` dark and `#E5E5EA`
+    /// light, its knob white whether on or off. NEGATIVE CONTROL: another system accent moves
+    /// the on track, and the chrome's own accent is not what it wears.
+    #[test]
+    fn a_switch_wears_the_system_accent_and_a_white_knob() {
+        use crate::native_appearance::{SystemAccent, install_control_accent};
+        let light = aterm_types::scheme::builtin_names()
+            .into_iter()
+            .map(|name| {
+                aterm_render::Theme::from(&aterm_types::scheme::builtin(name).expect("a builtin"))
+            })
+            .find(|theme| {
+                !crate::native_appearance::surface_is_dark(
+                    crate::settings::Roles::from_theme(*theme).surface,
+                )
+            })
+            .expect("a light builtin theme");
+        let purple = SystemAccent {
+            on_dark: [0xA5, 0x50, 0xA7],
+            on_light: [0x95, 0x3D, 0x96],
+        };
+        let live = ControlState::default();
+        for (accent, worn) in [
+            (purple, (purple.on_dark, purple.on_light)),
+            (
+                crate::native_appearance::MACOS_SYSTEM_BLUE,
+                ([0x0A, 0x84, 0xFF], [0x00, 0x7A, 0xFF]),
+            ),
+        ] {
+            let _ = install_control_accent(Some(accent));
+            for (theme, on, off) in [
+                (aterm_render::Theme::default(), worn.0, SWITCH_OFF_DARK),
+                (light, worn.1, SWITCH_OFF_LIGHT),
+            ] {
+                let roles = crate::settings::Roles::from_theme(theme);
+                let inks = mac_switch_inks(live, &roles);
+                assert_eq!(inks.on, crate::widget::rgba(on, 255));
+                assert_eq!(inks.off, crate::widget::rgba(off, 255));
+                assert_eq!(inks.knob, [0xFF, 0xFF, 0xFF, 0xFF], "the knob is white");
+                if roles.accent != on {
+                    assert_ne!(inks.on[..3], roles.accent, "not the chrome's accent");
+                }
+                let mut prims = Vec::new();
+                for value in [true, false] {
+                    paint_mac_switch(
+                        &mut prims,
+                        LogicalRect::new(0.0, 0.0, 58.0, 28.0),
+                        live,
+                        value,
+                        &roles,
+                    );
+                }
+                let knobs: Vec<_> = prims
+                    .iter()
+                    .filter_map(|prim| match prim {
+                        crate::widget::DrawPrim::Dot { color, .. } if color[3] == 255 => {
+                            Some(*color)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(knobs, vec![[0xFF; 4]; 2], "on and off, the knob is white");
+            }
+        }
+        let _ = install_control_accent(None);
+    }
+
+    /// A DISCLOSURE CHEVRON TURNS ON ITS CENTRE (D1's LOW item): closed it points right, open it
+    /// points down, and between them it is the same shape turned part of the way, so a motion
+    /// can swing it. NEGATIVE CONTROL: half a turn points neither right nor down.
+    #[test]
+    fn a_disclosure_chevron_points_right_closed_and_down_open() {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "a test's tenths of a point"
+        )]
+        let tip = |turn: f32| {
+            let mut prims = Vec::new();
+            paint_disclosure_chevron(&mut prims, (100.0, 50.0), turn, [0, 0, 0, 255]);
+            assert_eq!(prims.len(), 2, "two arms");
+            match (&prims[0], &prims[1]) {
+                (
+                    crate::widget::DrawPrim::Line { x2, y2, .. },
+                    crate::widget::DrawPrim::Line { x1, y1, .. },
+                ) => {
+                    assert!(
+                        (x2 - x1).abs() < 1e-4 && (y2 - y1).abs() < 1e-4,
+                        "one point"
+                    );
+                    (
+                        ((x2 - 100.0) * 10.0).round() as i32,
+                        ((y2 - 50.0) * 10.0).round() as i32,
+                    )
+                }
+                _ => panic!("a chevron is two lines"),
+            }
+        };
+        assert_eq!(tip(0.0), (20, 0), "closed: its point to the right");
+        assert_eq!(tip(1.0), (0, 20), "open: its point below");
+        let half = tip(0.5);
+        assert!(
+            half != tip(0.0) && half != tip(1.0),
+            "half a turn is between"
+        );
+        assert_eq!(tip(-1.0), tip(0.0), "a turn below closed is closed");
+        assert_eq!(tip(2.0), tip(1.0), "a turn past open is open");
+    }
+
+    /// AN OPEN LINE STAYS CLEAR, AND A HOVERED ONE IS WASHED IN INK OVER ITS OWN GROUND (init-on-
+    /// by-default design §4.4): the chevron turned down says open, so an open disclosure lays no
+    /// band (macOS keeps an expanded row clear); hovered or pressed, it lays the text ink at a
+    /// fixed alpha, never one surface's colour, so it is as faint on a white card as on an
+    /// elevated one. NEGATIVE CONTROL: hovered, the same disclosure does lay its wash.
+    #[test]
+    fn an_open_disclosure_lays_no_band_and_a_hover_lays_ink_over_its_ground() {
+        let roles = crate::settings::Roles::from_theme(aterm_render::Theme::default());
+        let rect = LogicalRect::new(0.0, 0.0, 300.0, 44.0);
+        let washes = |state: ControlState| -> Vec<[u8; 4]> {
+            let mut spec = ButtonSpec::new("Details");
+            spec.visual_label = Some(String::new());
+            let control = Control::new(spec, ActionId::new("line/disclose")).state(state);
+            let mut prims = Vec::new();
+            paint_disclosure_button(&mut prims, rect, &control, &roles);
+            prims
+                .iter()
+                .filter_map(|prim| match prim {
+                    crate::widget::DrawPrim::Panel { fill, .. } => Some(*fill),
+                    _ => None,
+                })
+                .collect()
+        };
+        let open = ControlState {
+            expanded: Some(true),
+            ..ControlState::default()
+        };
+        assert!(washes(open).is_empty(), "an open line lays no band");
+        let hover = washes(ControlState {
+            hovered: true,
+            ..open
+        });
+        let pressed = washes(ControlState {
+            pressed: true,
+            ..open
+        });
+        assert_eq!(hover.len(), 1, "a hovered line lays one wash");
+        assert_eq!(hover[0][..3], roles.text_primary, "of the text ink");
+        assert_eq!(
+            f32::from(hover[0][3]),
+            (DISCLOSURE_HOVER_WASH * 255.0).round(),
+            "at the hover strength marks are held to"
+        );
+        assert!(pressed[0][3] > hover[0][3], "a press is stronger");
     }
 
     fn assert_fit_failures_match_full_audit(compiled: &CompiledUi) -> Vec<String> {
@@ -12363,13 +12841,6 @@ pub(crate) mod tests {
                 "{visual:?} in {name:?}"
             );
         }
-        // A countdown closing the face is heard in the description, at the count painted.
-        let counting = Some("Applies by itself in 30 seconds");
-        assert!(visible_label_heard("Apply (30)", "Apply", counting));
-        assert!(!visible_label_heard("Apply (30)", "Apply", None));
-        assert!(!visible_label_heard("Apply (29)", "Apply", counting));
-        assert!(!visible_label_heard("Apply (30)", "Cancel", counting));
-        assert!(!visible_label_heard("Apply 30", "Apply", counting));
         let compile = |visual: &str, name: &str| {
             UiTree::new(UiNode::new(
                 "button",
@@ -13951,6 +14422,8 @@ pub(crate) mod tests {
                 focusable: true,
                 focused: false,
                 focus_visible: false,
+                progress: None,
+                motion: None,
             }),
         );
         for (tree, refused) in [
@@ -14644,6 +15117,7 @@ pub(crate) mod tests {
             StyleRef::Setting,
             StyleRef::Code,
             StyleRef::Chip,
+            StyleRef::Note,
         ];
         let action = || ActionId::new("test/control");
         let mut controls: Vec<(String, UiContent)> = Vec::new();

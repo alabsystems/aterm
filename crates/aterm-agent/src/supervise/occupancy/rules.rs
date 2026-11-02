@@ -38,7 +38,7 @@ pub fn wait_nudge_after_ms() -> i64 {
 }
 
 fn nudge_after_ms_of(seam: Option<&std::ffi::OsStr>) -> i64 {
-    seam.and_then(|v| v.to_str()?.trim().parse::<i64>().ok())
+    seam.and_then(|v| crate::parse_uint::<i64>(v.to_str()?.trim()))
         .filter(|s| (1..=WAIT_NUDGE_AFTER_MS / 1000).contains(s))
         .map_or(WAIT_NUDGE_AFTER_MS, |s| s * 1000)
 }
@@ -824,7 +824,7 @@ pub fn held_rows_in(body: &str, sid: Option<&str>) -> Vec<HeldRow> {
             if let Some(name) = word.strip_prefix("rule=") {
                 rule = RuleId::of_name(name);
             } else if let Some(n) = word.strip_prefix("ordinal=") {
-                ordinal = n.parse::<usize>().ok();
+                ordinal = crate::parse_uint::<usize>(n);
             } else if let Some(word) = word.strip_prefix("guard=") {
                 guard = Guard::from_word(word);
             }
@@ -899,9 +899,11 @@ pub fn would_rows_in(body: &str, sid: Option<&str>) -> Vec<WouldRow> {
             if let Some(name) = word.strip_prefix("rule=") {
                 rule = RuleId::of_name(name);
             } else if let Some(n) = word.strip_prefix("held_ms=") {
-                held_ms = n.parse::<i64>().ok().filter(|n| *n >= 0);
+                held_ms = crate::parse_uint::<i64>(n).filter(|n| *n >= 0);
             } else if let Some(hex) = word.strip_prefix("episode=") {
-                episode = u64::from_str_radix(hex, 16).ok();
+                episode = (!hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+                    .then(|| u64::from_str_radix(hex, 16).ok())
+                    .flatten();
             }
         }
         if let (Some(rule), Some(held_ms)) = (rule, held_ms) {

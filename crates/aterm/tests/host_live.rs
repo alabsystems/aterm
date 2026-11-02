@@ -91,7 +91,13 @@ fn boot_on(
             let base = std::fs::read_to_string(&cfg).expect("the isolation config");
             assert!(base.contains(launch_isolation::HARNESS_OFF), "{base}");
             let base = base.replace(launch_isolation::HARNESS_OFF, "");
-            std::fs::write(&cfg, format!("{base}[harness]\n{harness}")).expect("write the config");
+            // No test here is of the usage tap, and its `--settings` joins a relaunch's flags only
+            // where this aterm lasts: a target folder with no `CACHEDIR.TAG` would change them.
+            std::fs::write(
+                &cfg,
+                format!("{base}[harness]\nusage_tap = false\n{harness}"),
+            )
+            .expect("write the config");
             write_world(tmp);
             cmd.env("ATERM_LOG", "info")
                 .args(["--lines", &lines.to_string(), "--columns", "200"]);
@@ -1243,8 +1249,14 @@ fn the_host_answers_what_the_policy_proves_safe() {
     assert_eq!(attention(&inst), None, "nothing said");
 }
 
+/// Every rating card gets its `0`, a worker's own background wait under one included; the drafts
+/// card, the transcript-share ask and the web-setup offer get nothing, each drawn over a turn
+/// that ended while a dynamic workflow it started runs on (`Waiting for 1 dynamic workflow to
+/// finish` over a free composer). The host's reader reads that screen busy, the break of the
+/// agent's own background work; the published `agent=` is the turn's rest, `idle`
+/// (`aterm_phase::background_rest`), and nothing is pressed on any of the three.
 #[test]
-fn the_host_dismisses_every_kind_of_rating_card_and_reads_a_busy_worker_busy_under_any_card() {
+fn the_host_dismisses_every_rating_card_and_presses_nothing_on_a_card_over_a_workflow_wait() {
     let inst = boot("z", "");
     let cards = [
         ("k1", "card-long.txt"),
@@ -1276,9 +1288,9 @@ fn the_host_dismisses_every_kind_of_rating_card_and_reads_a_busy_worker_busy_und
                 start_fake_in(inst, sid, log, &[screen]);
                 until(
                     HANG,
-                    &format!("agent=busy under {what}"),
+                    &format!("agent=idle, the turn's rest under its workflow, under {what}"),
                     || status_of(inst, sid),
-                    |s| field(s, "agent") == Some("busy"),
+                    |s| field(s, "agent") == Some("idle"),
                 );
                 ctl_ok(inst, &[&format!("@{sid}"), "key", "z"]);
                 keys_until(inst, log, &["z"], HANG);
@@ -1637,6 +1649,18 @@ fn an_agent_that_exits_unasked_is_relaunched_on_its_conversation() {
         || harness_lines(&inst),
         |l| l.contains("EVENT idle"),
     );
+    // The relaunch snapshot is read off the worker's thread, so an idle point can come before
+    // it lands (a loaded host took 7 s); the crash waits for the snapshot that names the agent.
+    let kept = format!(
+        "the relaunch snapshot kept names pid {} and its conversation",
+        first[0].0
+    );
+    until(
+        HANG,
+        "the relaunch snapshot of the agent kept",
+        || harness_lines(&inst),
+        |l| l.contains(&kept),
+    );
     std::fs::write(inst.tmp.join("die"), "").expect("crash");
     let deadline = Instant::now() + HANG;
     let got = loop {
@@ -1705,6 +1729,410 @@ fn an_agent_that_exits_unasked_is_relaunched_on_its_conversation() {
     );
 }
 
+/// The screen a resume draws over a conversation whose last act was the restart its own tool call
+/// asked for: the cut call comes back as Claude Code 2.1.316 draws it, `draft` in the composer.
+fn restored_screen(draft: &str) -> String {
+    let banner: Vec<String> = body(BOX_TOUCH)
+        .lines()
+        .take(4)
+        .map(str::to_string)
+        .collect();
+    let offer = body(OFFER);
+    let mut composer: Vec<String> = offer.lines().rev().take(4).map(str::to_string).collect();
+    composer.reverse();
+    if let Some(caret) = composer.iter_mut().find(|r| r.starts_with('❯')) {
+        *caret = format!("❯ {draft}");
+    }
+    let mut rows = banner;
+    rows.extend(
+        [
+            "",
+            "⏺ Restarting now.",
+            "",
+            "⏺ Bash(timeout 20 aterm ctl @self restart 2>&1 | head -3)",
+            "  ⎿  Interrupted · What should Claude do instead?",
+            "",
+        ]
+        .map(str::to_string),
+    );
+    rows.extend(composer);
+    rows.join("\n") + "\n"
+}
+
+/// [`write_relaunch_fake`], its resumed process drawing the [`restored_screen`] until a line is
+/// typed into it, and holding `draft` in its composer until the `undraft` file stands.
+fn write_restarting_fake(inst: &Instance, draft: &str) {
+    std::fs::write(inst.tmp.join("sc/idle.txt"), bypass_start()).expect("idle screen");
+    std::fs::write(inst.tmp.join("sc/restored.txt"), restored_screen(draft)).expect("restored");
+    std::fs::write(inst.tmp.join("sc/cleared.txt"), restored_screen("")).expect("cleared");
+    let fake = format!(
+        "#!/bin/sh\n\
+         case \"$1\" in --version) echo '2.1.281 (Claude Code)'; exit 0 ;; esac\n\
+         tmp=${{HOME%/home}}\n\
+         echo \"$$ $*\" >> \"$tmp/launches.log\"\n\
+         stty -icanon -echo min 0 time 2 2>/dev/null\n\
+         sid={CONVERSATION}; prev=; screen=idle\n\
+         for a in \"$@\"; do [ \"$prev\" = --resume ] && {{ sid=$a; screen=restored; }}; prev=$a; done\n\
+         start=$(LC_ALL=C TZ=UTC ps -o lstart= -p $$ | awk '{{$1=$1; print}}')\n\
+         mkdir -p \"$HOME/.claude/sessions\" \"$HOME/.claude/projects/-w\"\n\
+         printf '{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"hi\"}}}}\\n' \
+         >> \"$HOME/.claude/projects/-w/$sid.jsonl\"\n\
+         printf '{{\"pid\":%s,\"sessionId\":\"%s\",\"cwd\":\"%s\",\"version\":\"2.1.281\",\
+         \"status\":\"idle\",\"statusUpdatedAt\":%s000,\"procStart\":\"%s\",\
+         \"kind\":\"interactive\",\"entrypoint\":\"cli\"}}' \
+         $$ \"$sid\" \"$PWD\" \"$(date +%s)\" \"$start\" > \"$HOME/.claude/sessions/$$.json\"\n\
+         draw() {{ printf '\\033[2J\\033[H'; cat \"$tmp/sc/$1.txt\"; \
+         r=$(grep -n '^❯' \"$tmp/sc/$1.txt\" | tail -n 1 | cut -d: -f1); \
+         [ -n \"$r\" ] && printf '\\033[%s;%sH' \"$r\" \"$((3 + $2))\"; }}\n\
+         printf '\\033[?1049h\\033[?1004h'\n\
+         if [ \"$screen\" = restored ]; then draw restored {draft_len}; else draw idle 0; fi\n\
+         cr=$(printf '\\r'); nl=$(printf '\\n.'); nl=${{nl%.}}; esc=$(printf '\\033')\n\
+         while :; do\n\
+         \x20 if [ -e \"$tmp/die\" ]; then rm -f \"$tmp/die\"; kill -KILL $$; fi\n\
+         \x20 if [ \"$screen\" = restored ] && [ -e \"$tmp/undraft\" ]; then rm -f \"$tmp/undraft\"; draw cleared 0; fi\n\
+         \x20 got=$(dd bs=4096 count=1 2>/dev/null; echo .); got=${{got%.}}\n\
+         \x20 [ -n \"$got\" ] && printf '%s' \"$got\" >> \"$tmp/typed-$$.log\"\n\
+         \x20 case \"$got\" in\n\
+         \x20 '') ;;\n\
+         \x20 *\"$cr\"*|*\"$nl\"*) screen=idle; draw idle 0 ;;\n\
+         \x20 \"$esc\"*) ;;\n\
+         \x20 *) printf '\\033[%s;3H\\033[K[Pasted text #1]' \"$r\" ;;\n\
+         \x20 esac\n\
+         done\n",
+        draft_len = draft.chars().count(),
+    );
+    place_fake(&fake_path(&inst.tmp), &fake);
+}
+
+/// The fake started in the tab, under a shell a relaunch can type at: its pid, for the `restart`
+/// the caller asks of it.
+fn start_the_fake(inst: &Instance) -> u32 {
+    let sel = format!("@{}", inst.sid);
+    let tmp = inst.tmp.display();
+    ctl_ok(inst, &[&sel, "send", "/bin/bash --norc --noprofile -i"]);
+    ctl_ok(inst, &[&sel, "key", "enter"]);
+    program_is(inst, "bash", HANG);
+    let line = format!(
+        "cd {tmp}/work && '{}' --model opus",
+        fake_path(&inst.tmp).display()
+    );
+    ctl_ok(inst, &[&sel, "send", &line]);
+    ctl_ok(inst, &[&sel, "key", "enter"]);
+    program_is(inst, "claude", HANG);
+    first_launch(inst)[0].0
+}
+
+/// What process `pid` read, focus reports aside, once `done` says it holds what it should.
+fn read_by(inst: &Instance, pid: u32, what: &str, done: impl Fn(&str) -> bool) -> String {
+    until(
+        HANG,
+        what,
+        || {
+            std::fs::read_to_string(inst.tmp.join(format!("typed-{pid}.log")))
+                .unwrap_or_default()
+                .replace("\x1b[I", "")
+                .replace("\x1b[O", "")
+        },
+        done,
+    )
+}
+
+/// The process relaunched after `old` ended, once launch `nth` (from zero) stands, `old` the one
+/// before it, with no launch past it.
+fn relaunched_as(inst: &Instance, old: u32, nth: usize) -> u32 {
+    let launched = until(
+        HANG,
+        "the relaunch",
+        || format!("{:?}", launches(inst)),
+        |_| launches(inst).len() > nth,
+    );
+    let got = launches(inst);
+    assert_eq!(got.len(), nth + 1, "relaunched once: {launched}");
+    assert_eq!(got[nth - 1].0, old, "{launched}");
+    assert_eq!(
+        got[nth].1,
+        format!("--model opus --resume {CONVERSATION}"),
+        "its flags kept, its conversation resumed"
+    );
+    got[nth].0
+}
+
+fn relaunched_after(inst: &Instance, old: u32) -> u32 {
+    relaunched_as(inst, old, 1)
+}
+
+/// The host can carry a restart of `pid`: its relaunch snapshot kept, and its hand on the session.
+/// The sweep keeps the snapshot and the hosted loop claims the session, in no set order, and
+/// `restart` refuses a session unclaimed as `not-supervised`.
+fn restart_stands_ready(inst: &Instance, pid: u32) {
+    let kept = format!("the relaunch snapshot kept names pid {pid} and its conversation");
+    until(
+        HANG,
+        "the relaunch snapshot of the agent kept",
+        || harness_lines(inst),
+        |l| l.contains(&kept),
+    );
+    until(
+        HANG,
+        "the host's hand on the session",
+        || status(inst),
+        |s| field(s, "supervisor").is_some_and(|v| v.starts_with("aterm-harness")),
+    );
+}
+
+/// A RESTART THROUGH `restart` CONTINUES THE WORK (owner report 2026-11-01), under Cruise and under
+/// Land: the relaunched agent, on the screen its resume draws over the cut tool call, reads one
+/// prompt that says it was restarted and what ended with it, and no person's Esc is read there.
+/// A second relaunch is the only thing that owes a second prompt. NEGATIVE CONTROL on main: the
+/// journal's `EVENT question` and `WAITING … a person stopped the turn with Esc`, nothing read.
+#[test]
+fn a_restart_through_the_verb_is_carried_on_once_under_cruise_and_land() {
+    std::thread::scope(|scope| {
+        let runs: Vec<_> = [
+            ("rc", "autopilot = \"cruise\"\n"),
+            ("rl", "autopilot = \"land\"\n"),
+        ]
+        .into_iter()
+        .map(|(tag, harness)| scope.spawn(move || restart_is_carried_on(tag, harness)))
+        .collect();
+        for run in runs {
+            run.join().expect("a run");
+        }
+    });
+}
+
+fn restart_is_carried_on(tag: &str, harness: &str) {
+    let inst = boot(tag, harness);
+    write_restarting_fake(&inst, "");
+    let sel = format!("@{}", inst.sid);
+    let old = start_the_fake(&inst);
+    restart_stands_ready(&inst, old);
+    let said = ctl_ok(&inst, &[&sel, "restart"]);
+    assert!(
+        said.starts_with(&format!("OK restarting pid {old} cause=asked")),
+        "{tag}: {said}"
+    );
+    let new = relaunched_after(&inst, old);
+    let read = read_by(&inst, new, "the prompt and its Enter", |r| {
+        r.ends_with(['\r', '\n'])
+    });
+    let want = aterm_agent::harness::relaunch::resumed_prompt("2.1.281", "asked");
+    assert_eq!(
+        read.strip_suffix(['\r', '\n']),
+        Some(want.as_str()),
+        "{tag}: the prompt, once\nharness log:\n{}\njournal:\n{}",
+        harness_lines(&inst),
+        journal(&inst)
+    );
+    assert!(
+        want.contains("ended with it") && want.contains("read your handoff"),
+        "{want}"
+    );
+    assert!(
+        !journal(&inst).contains("a person stopped the turn with Esc"),
+        "{tag}: nobody pressed Esc\n{}",
+        journal(&inst)
+    );
+    // The first Enter ended the read above; "once" is read past the step that typed it, whatever
+    // the loop's own act goes on to type.
+    let log = until(
+        HANG,
+        "the carry-on's step",
+        || journal(&inst),
+        |l| l.contains("carry-on step=continued"),
+    );
+    let typed = std::fs::read_to_string(inst.tmp.join(format!("typed-{new}.log")))
+        .expect("what the agent read");
+    assert_eq!(
+        typed.matches(want.as_str()).count(),
+        1,
+        "{tag}: the prompt, once: {typed:?}\njournal:\n{log}"
+    );
+}
+
+/// UNDER LAND THE FIRST THING READ PAST A DRAFT IS THE RESTART'S PROMPT, NOT THE LOOP'S `land@v1`.
+/// This is the end-to-end reading only: it passes with `WorkerIdle::carry_holds` taken out too, the
+/// sweep that carries Claude Code's relaunch reaching the cleared composer first (measured
+/// 2026-11-01), and a lane no sweep carries has no fake here. The hold is held to account by
+/// `the_loops_own_act_waits_on_an_owed_carry_on_that_stands` and
+/// `a_carry_on_owed_holds_the_loops_act_for_a_bounded_wait_a_persons_hold_renews`.
+#[test]
+fn under_land_the_prompt_a_draft_held_comes_before_the_loops_own() {
+    let inst = boot("rdl", "autopilot = \"land\"\n");
+    write_restarting_fake(&inst, "half a thought");
+    let sel = format!("@{}", inst.sid);
+    let old = start_the_fake(&inst);
+    restart_stands_ready(&inst, old);
+    ctl_ok(&inst, &[&sel, "restart"]);
+    let new = relaunched_after(&inst, old);
+    until(
+        HANG,
+        "the carry-on holding at the draft",
+        || journal(&inst),
+        |l| l.contains("carry-on step=wait:draft"),
+    );
+    std::fs::write(inst.tmp.join("undraft"), "").expect("the draft gone");
+    // A look it waits for can be as far as a minute from the one that found the draft, and this
+    // detector runs on from that minute.
+    let read = until(
+        HANG * 2,
+        "the first prompt past the draft",
+        || {
+            std::fs::read_to_string(inst.tmp.join(format!("typed-{new}.log")))
+                .unwrap_or_default()
+                .replace("\x1b[I", "")
+                .replace("\x1b[O", "")
+        },
+        |r| r.contains(['\r', '\n']),
+    );
+    let first = read.split(['\r', '\n']).next().expect("its first line");
+    assert_eq!(
+        first,
+        aterm_agent::harness::relaunch::resumed_prompt("2.1.281", "asked"),
+        "harness log:\n{}\njournal:\n{}",
+        harness_lines(&inst),
+        journal(&inst)
+    );
+}
+
+/// NOTHING IS TYPED OVER UNSENT INPUT OR UNDER OFF, AND THE PROMPT IS WAITED FOR, NOT DROPPED: a draft
+/// in the resumed composer holds it, Off holds it past the draft's end, and turning Autopilot back
+/// on types it, once. CONTROL: `a_restart_through_the_verb_is_carried_on_once_under_cruise_and_land`
+/// types with no draft and Cruise on. On main a draft ended the carry-on in `done:no-continue`.
+#[test]
+fn a_draft_and_off_hold_the_prompt_and_turning_on_types_it_once() {
+    let inst = boot("rd", "autopilot = \"cruise\"\n");
+    write_restarting_fake(&inst, "half a thought");
+    let sel = format!("@{}", inst.sid);
+    let old = start_the_fake(&inst);
+    restart_stands_ready(&inst, old);
+    ctl_ok(&inst, &[&sel, "restart"]);
+    let new = relaunched_after(&inst, old);
+    let log = until(
+        HANG,
+        "the carry-on holding at the draft",
+        || journal(&inst),
+        |l| l.contains("carry-on step=wait:draft"),
+    );
+    let typed = inst.tmp.join(format!("typed-{new}.log"));
+    assert!(!typed.exists(), "typed over the draft\n{log}");
+    ctl_ok(&inst, &[&sel, "meta", "set", "autopilot", "off"]);
+    until(
+        HANG,
+        "the supervisor off the tab",
+        || harness_lines(&inst),
+        |l| l.contains("autopilot is off; its supervisor stops"),
+    );
+    std::fs::write(inst.tmp.join("undraft"), "").expect("the draft gone");
+    until(
+        HANG,
+        "the draft cleared on screen",
+        || ctl_ok(&inst, &[&sel, "text"]),
+        |s| !s.contains("half a thought"),
+    );
+    assert!(!typed.exists(), "typed under Off");
+    ctl_ok(&inst, &[&sel, "meta", "set", "autopilot", "cruise"]);
+    let read = read_by(&inst, new, "the prompt once Autopilot is on", |r| {
+        r.ends_with(['\r', '\n'])
+    });
+    let want = aterm_agent::harness::relaunch::resumed_prompt("2.1.281", "asked");
+    assert_eq!(
+        read.strip_suffix(['\r', '\n']),
+        Some(want.as_str()),
+        "the prompt, once\nharness log:\n{}",
+        harness_lines(&inst)
+    );
+}
+
+/// AT MOST ONE PROMPT PER RELAUNCH, ACROSS A SECOND ONE: the agent dies while its restart's carry-on
+/// waits on a draft, and the relaunch that follows owes the only prompt, the process it replaced
+/// having read nothing. A third relaunch, after that prompt, owes one of its own and no more.
+/// CONTROL for the second half: the process before it read exactly one.
+#[test]
+fn a_second_relaunch_owes_one_prompt_in_place_of_the_first() {
+    let inst = boot("r2", "autopilot = \"cruise\"\n");
+    write_restarting_fake(&inst, "half a thought");
+    let sel = format!("@{}", inst.sid);
+    let first = start_the_fake(&inst);
+    restart_stands_ready(&inst, first);
+    ctl_ok(&inst, &[&sel, "restart"]);
+    let second = relaunched_after(&inst, first);
+    until(
+        HANG,
+        "the carry-on holding at the draft",
+        || journal(&inst),
+        |l| l.contains("carry-on step=wait:draft"),
+    );
+    restart_stands_ready(&inst, second);
+    std::fs::write(inst.tmp.join("die"), "").expect("the crash");
+    let third = relaunched_as(&inst, second, 2);
+    restart_stands_ready(&inst, third);
+    std::fs::write(inst.tmp.join("undraft"), "").expect("the draft gone");
+    let read = read_by(&inst, third, "the one prompt", |r| {
+        r.ends_with(['\r', '\n'])
+    });
+    let log = harness_lines(&inst);
+    let prompt = read.strip_suffix(['\r', '\n']).expect("its Enter");
+    assert!(
+        prompt.starts_with(aterm_agent::harness::upgrade::HARNESS_MARK)
+            && prompt.contains("ended with it")
+            && !prompt.contains(['\r', '\n']),
+        "one prompt: {read:?}\n{log}"
+    );
+    assert!(
+        !inst.tmp.join(format!("typed-{second}.log")).exists(),
+        "the process the crash ended read nothing\n{log}"
+    );
+    restart_stands_ready(&inst, third);
+    // The fourth process draws no draft: it finds this as the third, past its Enter, does not.
+    std::fs::write(inst.tmp.join("undraft"), "").expect("no draft on the next resume");
+    std::fs::write(inst.tmp.join("die"), "").expect("the next crash");
+    let fourth = relaunched_as(&inst, third, 3);
+    let again = read_by(&inst, fourth, "its own prompt", |r| {
+        r.ends_with(['\r', '\n'])
+    });
+    assert_eq!(
+        again
+            .matches(aterm_agent::harness::upgrade::HARNESS_MARK)
+            .count(),
+        1,
+        "{again:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(inst.tmp.join(format!("typed-{third}.log")))
+            .unwrap_or_default()
+            .matches(aterm_agent::harness::upgrade::HARNESS_MARK)
+            .count(),
+        1,
+        "and the process before it stayed at one"
+    );
+}
+
+/// UNDER OFF THE VERB HAS NOTHING TO CARRY: the host holds no snapshot of the agent, so `restart`
+/// refuses, the agent lives on and reads nothing.
+#[test]
+fn under_off_a_restart_is_refused_and_nothing_is_typed() {
+    let inst = boot("ro", "autopilot = \"off\"\n");
+    write_restarting_fake(&inst, "");
+    let sel = format!("@{}", inst.sid);
+    let old = start_the_fake(&inst);
+    let out = headless_boot::ctl(&inst, &[&sel, "restart"]);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        said.contains("ERR restart unavailable: not-the-hosts-agent"),
+        "{said}"
+    );
+    assert_eq!(launches(&inst).len(), 1, "not relaunched: {said}");
+    assert!(
+        !inst.tmp.join(format!("typed-{old}.log")).exists(),
+        "nothing typed under Off"
+    );
+}
+
 /// How long the fake stalls on each digit it reads while its `starved-<version>` file stands.
 #[cfg(target_os = "macos")]
 const STARVED_S: usize = 2;
@@ -1712,6 +2140,35 @@ const STARVED_S: usize = 2;
 /// How long it stalls on each `;` then: past the host's own settle for a typed text's echo, 5 s.
 #[cfg(target_os = "macos")]
 const STARVED_TAIL_S: usize = 6;
+
+/// A copy of `/bin/bash`, signed ad hoc, named `claude` in the instance's scratch: the image the
+/// staged builds ([`stage_upgrade_fake`]) run under, so the session names the program through
+/// atpkg's twin `claude`, as it names a store build that is its own image. Through the twin a
+/// `/bin/sh` or `/bin/bash` script is named by its shell, which runs as the image. It runs once
+/// and writes a line before a build names it, so macOS's first assessment of its exec is done
+/// before the scratch that holds it can go.
+#[cfg(target_os = "macos")]
+fn claude_image(inst: &Instance) -> PathBuf {
+    let path = inst.tmp.join("image/claude");
+    if path.exists() {
+        return path;
+    }
+    std::fs::create_dir_all(path.parent().expect("the image's folder")).expect("mkdir");
+    aterm_uds::deadline::ad_hoc_copy(Path::new("/bin/bash"), &path);
+    let mut proof = aterm_uds::spawnfd::command(&path)
+        .env_clear()
+        .args(["-c", "printf 'claude-image-ran\\n'"])
+        .stdout(aterm_uds::spawnfd::Stdio::piped())
+        .spawn()
+        .expect("run the claude image in place");
+    aterm_uds::deadline::prints(
+        &mut proof,
+        "claude-image-ran",
+        aterm_uds::deadline::ECHO_HANG,
+    );
+    aterm_uds::deadline::kill_within(&mut proof, aterm_uds::deadline::ECHO_HANG);
+    path
+}
 
 #[cfg(target_os = "macos")]
 fn stage_upgrade_fake(inst: &Instance, version: &str, asked: bool) -> PathBuf {
@@ -1742,7 +2199,7 @@ fn stage_upgrade_fake(inst: &Instance, version: &str, asked: bool) -> PathBuf {
         )
     };
     let fake = format!(
-        "#!/bin/sh\n\
+        "#!{image}\n\
          VERSION={version}\n\
          tmp=${{HOME%/home}}\n\
          case \"$1\" in\n\
@@ -1802,6 +2259,7 @@ fn stage_upgrade_fake(inst: &Instance, version: &str, asked: bool) -> PathBuf {
          \x20   else wrap; printf '%s' \"$c\"; word=\"$c\"; col=3; fi ;;\n\
          \x20 esac\n\
          done\n",
+        image = claude_image(inst).display(),
         ready = row("\"$m\""),
         carry = row("'carrying on'"),
         prompt = "printf '{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"%s\"}}\\n' \"$line\" >> \"$T\"",
@@ -1815,8 +2273,24 @@ fn stage_upgrade_fake(inst: &Instance, version: &str, asked: bool) -> PathBuf {
             ":".to_string()
         },
     );
+    // The build is the program and the twin atpkg's own shim for it, as a store lays them: a
+    // version probe runs a shebang file at `agents/claude` only as a producer shim it can pin
+    // (fd3b937ea1), and the build its forward reaches is an image to it, a script under
+    // [`claude_image`], never another `/bin/sh` script it would have to read as a shim.
+    let build = inst.tmp.join(format!("builds/{version}/claude"));
+    place_fake(&build, &fake);
+    let twin = atpkg::platform::twin_executable_to_env(
+        &fake_path(&inst.tmp),
+        &build,
+        &atpkg::shim_env::ShimEnv::NONE,
+        "",
+    )
+    .expect("the twin atpkg lays for the build");
     let staged = fake_path(&inst.tmp).with_file_name(format!("claude.{version}"));
-    place_fake(&staged, &fake);
+    place_fake(
+        &staged,
+        std::str::from_utf8(&twin.body).expect("a UTF-8 shim"),
+    );
     staged
 }
 
@@ -2367,7 +2841,16 @@ fn pressed(report: &aterm_agent::supervise::tape::report::Report) -> Vec<String>
                 .find(|w| !w.starts_with('@'))
                 .is_some_and(|v| v == "key")
         })
-        .filter_map(|words| words.last().cloned())
+        .filter_map(|words| {
+            words
+                .iter()
+                .rev()
+                .find(|word| {
+                    !word.starts_with("harness-duty=")
+                        && !word.starts_with("if-supervisor-revision=")
+                })
+                .cloned()
+        })
         .collect()
 }
 

@@ -155,7 +155,7 @@ fn a_store_validates_uuids_and_formats_bounded_objectives() {
 fn store_db(dir: &std::path::Path, name: &str, schema: &str, rows: &str) -> std::path::PathBuf {
     let db = dir.join(name);
     let made = aterm_uds::deadline::output_until(
-        aterm_uds::spawnfd::command("/usr/bin/sqlite3")
+        aterm_uds::spawnfd::command(crate::test_program::kept("/usr/bin/sqlite3"))
             .arg(&db)
             .arg(format!(
                 "PRAGMA journal_mode=WAL; {schema} {rows} PRAGMA wal_checkpoint(TRUNCATE);"
@@ -244,7 +244,7 @@ fn muse_code_store_names_only_an_active_goal() {
         Some("ship the release | then rest")
     );
     let made = aterm_uds::deadline::output_until(
-        aterm_uds::spawnfd::command("/usr/bin/sqlite3")
+        aterm_uds::spawnfd::command(crate::test_program::kept("/usr/bin/sqlite3"))
             .arg(&muse)
             .arg(format!(
                 "UPDATE goals SET status = 'complete' WHERE session_id = '{a}'; \
@@ -277,7 +277,7 @@ fn muse_code_store_names_only_an_active_goal() {
         Some("keep across empty schema mismatch")
     );
     let broken = aterm_uds::deadline::output_until(
-        aterm_uds::spawnfd::command("/usr/bin/sqlite3")
+        aterm_uds::spawnfd::command(crate::test_program::kept("/usr/bin/sqlite3"))
             .arg(&active_db)
             .arg(
                 "DROP TABLE goals; \

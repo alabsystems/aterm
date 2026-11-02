@@ -1147,11 +1147,16 @@ fn ai_accounts_due(env: &aterm_agent::harness::cli::Env) -> Option<String> {
 /// would refuse), else Claude Code's pool, as it always read
 /// ([`ai_accounts_claude_probe`]), a change where a pool syncing by default has rows of this
 /// machine's in the vault's fleet and no roster here yet ([`ai_accounts_due`]), and each other
-/// CLI's whose roster this machine keeps after it (`other CLIs: codex 1, kimi 1`). A machine
-/// with Claude Code's alone reads as it always did.
+/// CLI's whose roster this machine keeps after it (`other CLIs: codex 1, kimi 1`), then the
+/// vault sheet's rows that conflict for an address this machine's pools skip
+/// (`accounts_sync::sheet_conflicts`: each CLI and its rows, never the address), so `aterm init`
+/// and `aterm doctor` say it on a Mac with no window. A machine with Claude Code's alone reads
+/// as it always did.
 #[cfg(unix)]
 fn ai_accounts_probe(env: &aterm_agent::harness::cli::Env) -> aterm_converge::Probe {
-    use aterm_agent::harness::accounts_sync::{ACCOUNTS_SYNC_OFF, accounts_sync_off};
+    use aterm_agent::harness::accounts_sync::{
+        ACCOUNTS_SYNC_OFF, accounts_sync_off, sheet_conflicts, sheet_conflicts_words,
+    };
     use aterm_converge::Probe;
     if let Some(config) = env.config.as_deref() {
         match aterm_secrets::swarm::enabled_at(config) {
@@ -1173,6 +1178,33 @@ fn ai_accounts_probe(env: &aterm_agent::harness::cli::Env) -> aterm_converge::Pr
             why: ACCOUNTS_SYNC_OFF.to_owned(),
         };
     }
+    let probe = ai_accounts_pools_probe(env);
+    let Some(words) = env
+        .home
+        .as_deref()
+        .zip(env.config.as_deref())
+        .and_then(|(home, config)| sheet_conflicts_words(&sheet_conflicts(home, config)))
+    else {
+        return probe;
+    };
+    match probe {
+        Probe::Ok { now } => Probe::Ok {
+            now: format!("{now}; {words}"),
+        },
+        Probe::NotApplicable { .. } => Probe::Ok { now: words },
+        Probe::Change { from, to } => Probe::Change {
+            from,
+            to: format!("{to}; {words}"),
+        },
+        other => other,
+    }
+}
+
+/// [`ai_accounts_probe`] before the sheet's conflicts: Claude Code's pool, the pools due a sync,
+/// and the other CLIs' kept rosters.
+#[cfg(unix)]
+fn ai_accounts_pools_probe(env: &aterm_agent::harness::cli::Env) -> aterm_converge::Probe {
+    use aterm_converge::Probe;
     let claude = match (ai_accounts_claude_probe(env), ai_accounts_due(env)) {
         (claude, None) => claude,
         (Probe::Ok { now }, Some(due)) => Probe::Change {

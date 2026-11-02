@@ -76,9 +76,6 @@ impl TypingMomentum {
         let Some(at) = self.at else {
             return 0.0;
         };
-        if at == now {
-            return self.value;
-        }
         self.value_after(now.saturating_duration_since(at).as_secs_f32())
     }
 
@@ -87,11 +84,7 @@ impl TypingMomentum {
     pub(crate) fn advance_reading(&mut self, now: Instant) -> (f32, f32) {
         let (decayed, gap) = match self.at {
             Some(at) => {
-                let dt = if at == now {
-                    0.0
-                } else {
-                    now.saturating_duration_since(at).as_secs_f32()
-                };
+                let dt = now.saturating_duration_since(at).as_secs_f32();
                 (self.value_after(dt), dt)
             }
             None => (0.0, TYPING_MOMENTUM_CREDIT_CAP_S),
@@ -141,12 +134,16 @@ impl TypingMomentum {
     #[must_use]
     #[inline]
     pub fn low_crossing(&self, threshold: f32) -> Option<Instant> {
+        if !(threshold.is_finite() && threshold > 0.0) {
+            return None;
+        }
         let at = self.at?;
         if self.value <= threshold {
             return Some(at);
         }
         let elapsed = TYPING_MOMENTUM_TAU * crate::color_math::ln_pos_f32(self.value / threshold);
-        Some(at + std::time::Duration::from_secs_f32(elapsed.max(0.0)))
+        let dur = std::time::Duration::try_from_secs_f32(elapsed.max(0.0)).ok()?;
+        at.checked_add(dur)
     }
 
     /// Deadline when [`Self::value`] reads `<= threshold` (`0.0..=1.0`), including [`SNAP_ZERO`].
@@ -154,12 +151,18 @@ impl TypingMomentum {
     #[inline]
     pub fn reading_low_crossing(&self, threshold: f32) -> Option<Instant> {
         debug_assert!(threshold.is_finite() && (0.0..=1.0).contains(&threshold));
+        if !(threshold.is_finite() && (0.0..=1.0).contains(&threshold)) {
+            return None;
+        }
         let at = self.at?;
-        if self.value_after(0.0) <= threshold {
+        if self.value < SNAP_ZERO || self.value <= threshold {
             return Some(at);
         }
-        let crossing = self.low_crossing(threshold.max(SNAP_ZERO))?;
-        Some(crossing + std::time::Duration::from_millis(1))
+        let elapsed = TYPING_MOMENTUM_TAU
+            * crate::color_math::ln_pos_f32(self.value / threshold.max(SNAP_ZERO));
+        let dur = std::time::Duration::try_from_secs_f32(elapsed.max(0.0)).ok()?;
+        at.checked_add(dur)?
+            .checked_add(std::time::Duration::from_millis(1))
     }
 }
 
@@ -243,6 +246,12 @@ mod tests {
         m.set_value(t0, 0.1);
         assert_eq!(m.low_crossing(0.14), Some(t0));
         assert_eq!(TypingMomentum::default().low_crossing(0.14), None);
+        m.set_value(t0, 0.9);
+        assert_eq!(m.low_crossing(0.0), None);
+        assert_eq!(m.low_crossing(-0.5), None);
+        assert_eq!(m.low_crossing(f32::NAN), None);
+        assert_eq!(m.low_crossing(f32::INFINITY), None);
+        let _ = m.low_crossing(f32::from_bits(1));
     }
 
     #[test]

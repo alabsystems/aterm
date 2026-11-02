@@ -102,6 +102,44 @@ fn the_classifier_claims_for_compiling_verbs_and_nothing_else() {
     }
 }
 
+/// A CALL THAT ONLY RESOLVES WHAT IT WOULD BUILD NEVER CLAIMS: verify's unit-graph probe, the test
+/// compile's own command with `--unit-graph -Z unstable-options` (`aterm_verify::stages::UNIT_GRAPH`),
+/// and a `--build-plan`, build nothing. NEGATIVE CONTROL: the same command without the flag claims
+/// as `targo test`, and so it did with the flag read as any unknown one, by hand.
+#[test]
+fn a_call_that_only_resolves_what_it_would_build_never_claims() {
+    let compile = [
+        "--config",
+        "build.build-dir=/b/.cargo-build",
+        "--unverified",
+        "test",
+        "-p",
+        "aterm-agent",
+        "-p",
+        "aterm-gui",
+        "--no-fail-fast",
+        "--tests",
+        "--no-run",
+        "--message-format=json-render-diagnostics",
+    ];
+    let mut probe = compile.to_vec();
+    probe.extend(["--unit-graph", "-Z", "unstable-options"]);
+    assert_eq!(stage(&probe, Tool::Targo), None);
+    let mut plan = compile.to_vec();
+    plan.extend(["-Z", "unstable-options", "--build-plan"]);
+    assert_eq!(stage(&plan, Tool::Targo), None);
+    assert_eq!(stage(&compile, Tool::Targo).as_deref(), Some("targo test"));
+    assert_eq!(
+        stage(
+            &["--unverified", "test", "-p", "a", "--", "--unit-graph"],
+            Tool::Targo
+        )
+        .as_deref(),
+        Some("targo test"),
+        "a word after `--` is the test binaries'"
+    );
+}
+
 /// A build's selection is the packages it names, sorted and each once, or the workspace, or what
 /// its manifest selects; its variant is what else it shapes, sorted, and what changes neither
 /// (jobs, the target directory, a test filter, `--no-run`) is not read. NEGATIVE CONTROL: a build
@@ -326,8 +364,34 @@ fn a_builds_key_names_its_checkout_and_the_package_it_builds() {
     );
     assert_eq!(
         read(&["--unverified", "test", "-p", "x"], &root.join("crates/m")),
-        (ck, Some(vec!["x".to_owned()]))
+        (ck.clone(), Some(vec!["x".to_owned()]))
     );
+    std::fs::write(
+        root.join("crates/m/Cargo.toml"),
+        "[package] # inline comment\nname = \"commented\" # trailing comment\nversion = \"0.1.0\"\n",
+    )
+    .expect("commented manifest");
+    assert_eq!(
+        read(&["--unverified", "test"], &root.join("crates/m")),
+        (ck.clone(), Some(vec!["commented".to_owned()]))
+    );
+    #[cfg(unix)]
+    {
+        let link = root.join("link-manifest.toml");
+        std::os::unix::fs::symlink(root.join("crates/m/Cargo.toml"), &link).expect("symlink");
+        assert_eq!(
+            read(
+                &[
+                    "--unverified",
+                    "test",
+                    "--manifest-path",
+                    "link-manifest.toml",
+                ],
+                &root
+            ),
+            (ck, None)
+        );
+    }
 }
 
 /// A test build with nothing of its own kept claims what verify's test compile of the same
@@ -410,6 +474,7 @@ fn proc(pid: u32, ppid: u32) -> Proc {
         ppid,
         footprint: 0,
         written: 0,
+        cpu_ns: 0,
     }
 }
 
@@ -447,7 +512,13 @@ fn a_build_under_a_covering_ancestor_claims_nothing() {
     );
     let s = seat(dir.path(), &m, build_pid);
     let ledger = Ledger::at(dir.path().join("ledger"));
-    match admit(&test_build(), dir.path(), &s, &mut |_| {}) {
+    match admit_bounded(
+        &test_build(),
+        dir.path(),
+        &s,
+        &|| panic!("verified coverage must precede any ancestor file probe"),
+        &mut |_| {},
+    ) {
         Admission::Covered(r) => assert_eq!(r.pid, me),
         other => panic!("expected cover, got {other:?}"),
     }
@@ -611,6 +682,45 @@ fn a_failed_build_keeps_a_peak_that_raises_its_claim() {
         "below its claim"
     );
     assert_eq!(records(), before);
+}
+
+/// AN ENDED BUILD'S CLAIM GOES BEFORE ITS PEAK IS KEPT: a book that cannot be written (its folder
+/// is a file) says so while the claim is already gone, and `let_go` leaves the ledger empty before
+/// its `keep` runs. NEGATIVE CONTROL (by hand: the claim let go after the book's write, as
+/// before): the claim is still in the ledger when the failed write is said.
+#[test]
+fn an_ended_builds_claim_goes_before_its_peak_is_kept() {
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let m = machine();
+    let s = seat(dir.path(), &m, std::process::id().wrapping_add(41));
+    let b = test_build();
+    let claimed = || match admit(&b, dir.path(), &s, &mut |_| {}) {
+        Admission::Claimed(h) => h,
+        other => panic!("expected a claim, got {other:?}"),
+    };
+    let ledger = Ledger::at(dir.path().join("ledger"));
+    let file = dir.path().join("a-file");
+    std::fs::write(&file, "").expect("a file");
+    let Held { claim, key, .. } = *claimed();
+    let held = Held {
+        claim,
+        key,
+        own: Some(file.join("targo-memory.json")),
+    };
+    let mut said = Vec::new();
+    assert_eq!(
+        held.end(true, 5 * GIB, &mut |line| {
+            said.push((line.to_owned(), ledger.list().expect("listed").len()));
+        }),
+        None
+    );
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert!(said[0].0.contains("was not kept"), "{said:?}");
+    assert_eq!(said[0].1, 0, "the claim went before the write was tried");
+
+    let ended = claimed().let_go();
+    assert!(ledger.list().expect("listed").is_empty(), "let go");
+    assert_eq!(ended.keep(true, 5 * GIB, &mut |_| {}), Some(5 * GIB));
 }
 
 /// A fresh build that compiled nothing keeps no peak while its key's heavy one is young, so
@@ -1155,7 +1265,85 @@ fn a_core_signals_death_is_an_exit_code_through_the_front() {
         );
     }
     assert!(!ENDS_WITHOUT_CORE.contains(&libc::SIGSEGV));
+    assert!(!ENDS_WITHOUT_CORE.contains(&libc::SIGQUIT));
     assert!(ENDS_WITHOUT_CORE.contains(&libc::SIGKILL));
+}
+
+#[cfg(unix)]
+const NEVER_STANDIN: &str = "ATPKG_BUILD_ADMIT_NEVER_STANDIN";
+
+/// An isolated front whose build never starts. No program is spawned by this front.
+/// A caller sees the arming witness before a queued signal can end this process.
+#[cfg(unix)]
+#[test]
+fn standin_front_has_no_build_for_its_queued_signal() {
+    use std::io::Write as _;
+    let Some(signal) = std::env::var_os(NEVER_STANDIN) else {
+        return;
+    };
+    aterm_uds::secret::no_core_dumps();
+    let mut limit = libc::rlimit {
+        rlim_cur: 1,
+        rlim_max: 1,
+    };
+    // SAFETY: the limit is one initialized, writable rlimit, live for this call.
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_CORE, &raw mut limit) },
+        0
+    );
+    assert_eq!((limit.rlim_cur, limit.rlim_max), (0, 0));
+    let front = front::Front::arm().expect("an armed front");
+    println!("NEVER_FRONT_ARMED core=0");
+    std::io::stdout()
+        .flush()
+        .expect("the caller sees the witness");
+    let signal = match signal.to_str().expect("a signal name") {
+        "none" => None,
+        "QUIT" => Some(libc::SIGQUIT),
+        other => panic!("unknown stand-in signal {other}"),
+    };
+    if let Some(signal) = signal {
+        front::note_for_test(signal);
+    }
+    front.never();
+    front.disarm();
+    println!("NEVER_FRONT_RETURNED");
+}
+
+/// A queued key signal still ends a front whose build never started. Core signals become
+/// shell-style exit codes, never a core-dump death or an unrelated normal return. The ordinary
+/// control precedes the QUIT assertion. Run only the safe315 baseline or newer:
+///315 returns normally for QUIT; older raw-raise production is not this baseline.
+#[cfg(unix)]
+#[test]
+fn a_never_started_front_ends_with_its_queued_signal_without_dumping_core() {
+    use std::os::unix::process::ExitStatusExt as _;
+    for (signal, code) in [("none", 0), ("QUIT", 131)] {
+        let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"));
+        cmd.args([
+            "--exact",
+            "build_admit::tests::standin_front_has_no_build_for_its_queued_signal",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env(NEVER_STANDIN, signal);
+        let out = aterm_uds::deadline::output_within(&mut cmd, aterm_spec::wait::MUST_HAPPEN)
+            .expect("the isolated front's outcome within the hang detector");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stdout.contains("NEVER_FRONT_ARMED core=0"),
+            "{signal}: missing actual arming/core-limit witness: {stdout} {stderr}"
+        );
+        assert!(!out.status.core_dumped(), "{signal}: {:?}", out.status);
+        assert_eq!(out.status.signal(), None, "{signal}: {stdout} {stderr}");
+        assert_eq!(out.status.code(), Some(code), "{signal}: {stdout} {stderr}");
+        assert_eq!(
+            stdout.contains("NEVER_FRONT_RETURNED"),
+            signal == "none",
+            "{signal}: {stdout} {stderr}"
+        );
+    }
 }
 
 /// A stand-in `cargo` in `dir` that writes what it was handed (`ATPKG_ROUTED` and its words)
@@ -1251,14 +1439,26 @@ fn looks_for_its_parents_claim(dir: &Path, ledger: &Path, out: &Path) -> PathBuf
 
 /// THE LOCK ORDER, BOUND TO ITS MODEL (`atpkg_build_admit_model`): a build's claim is held
 /// before its `targo` exists, so the build directory's lock, which only `targo` takes, is only
-/// ever taken under a claim (`LockUnderClaim`), and a claimed builder waiting for the lock can
-/// never be waited on by the lock's holder (`NoWaitCycle`). The model holds both laws and every
-/// run of it ends; the rejected wrapper's order (claim from inside the build) breaks both and
-/// deadlocks with A holding its claim and B the lock. The code, as a call runs it: a stand-in
-/// `targo` that `run_if_claimed_at` ran (classify, admit, then supervise's spawn) finds its
-/// parent's claim held at its start, once; the probe itself finds none for a stand-in run before
-/// any claim. NEGATIVE CONTROL (by hand: `run_if_claimed_at` running the target before it
-/// admits, the wrapper's order): the stand-in finds none first.
+/// ever taken under a claim, or once a holder that kept it died (`LockUnderClaim`); a claimed
+/// builder waiting for the lock can never be waited on by the lock's holder (`NoWaitCycle`); and
+/// an unclaimed build's inner front never waits for a claim whose builder waits for that build's
+/// lock (`NoNestedWaitCycle`); and a front no lock is held over (D: a test's, a `targo run`
+/// program's) never holds its claim beside a claimed builder's (`NoUnrequestedOvercommit`). The
+/// model holds the four laws and every run of it ends. Its mutants: the rejected wrapper's order
+/// (claim from inside the build) breaks the first two and deadlocks with A holding its claim and
+/// B the lock; an exec before the hand-off breaks the first; an inner front that waits breaks the
+/// third and deadlocks with A holding its claim and waiting for C's lock; a holder that lets its
+/// claim go while its build runs (a watch that failed, taken for the build's end) breaks the
+/// first; D admitted at once by cargo's words breaks the fourth. The code, as a call runs it: a stand-in `targo` that `run_if_claimed_at`
+/// ran (classify, admit, then supervise's spawn) finds its parent's claim held at its start,
+/// once; the probe itself finds none for a stand-in run before any claim. The hop's order is
+/// bound through the real binary (`tests/build_hop.rs`: the stand-in the front became finds a
+/// claim held in its own pid while holding no descriptor of it, and its control, an exec before
+/// the hand-off, finds none), and the inner front's and D's by
+/// `an_unproven_nested_lock_never_forces_admission_or_waits_in_a_cycle`, the ordinary-file
+/// regression, and the real Cargo covered-build control in the integration suite.
+/// NEGATIVE CONTROL (by hand: `run_if_claimed_at` running the target before it admits, the
+/// wrapper's order): the stand-in finds none first.
 #[cfg(unix)]
 #[test]
 fn a_builds_claim_is_held_before_its_targo_starts_as_the_model_orders() {
@@ -1267,7 +1467,8 @@ fn a_builds_claim_is_held_before_its_targo_starts_as_the_model_orders() {
     let model = atpkg_build_admit_model();
     let faults = aterm_spec::verify::sweep_faults(std::slice::from_ref(&model));
     assert!(faults.is_empty(), "{faults:?}");
-    let ended = |s: &State| s["a"] == 4 && s["b"] == 4;
+    let ended = |s: &State| s["a"] == 4 && s["b"] == 4 && s["c"] == 4 && s["d"] == 3;
+    assert!(violated_invariants(&model).is_empty());
     assert_eq!(find_deadlock(&model, ended), None, "every run ends");
     let wrapper = with_buggy(&model, 1);
     let broken = violated_invariants(&wrapper);
@@ -1280,6 +1481,34 @@ fn a_builds_claim_is_held_before_its_targo_starts_as_the_model_orders() {
         (stuck["a"], stuck["held"], stuck["b"], stuck["lock"]),
         (2, 1, 1, 2),
         "A holds its claim and waits for the lock B holds while B waits for A's claim"
+    );
+    let early = violated_invariants(&with_buggy(&model, 2));
+    assert!(
+        early.contains("LockUnderClaim") && !early.contains("NoNestedWaitCycle"),
+        "an exec before the hand-off builds unclaimed: {early:?}"
+    );
+    let waits = with_buggy(&model, 3);
+    assert!(
+        violated_invariants(&waits).contains("NoNestedWaitCycle"),
+        "an inner front that waits"
+    );
+    let stuck = find_deadlock(&waits, ended).expect("an inner front that waits deadlocks");
+    assert_eq!(
+        (stuck["a"], stuck["held"], stuck["c"], stuck["lock"]),
+        (2, 1, 2, 3),
+        "A holds its claim and waits for C's lock while C's inner front waits for A's claim"
+    );
+    let let_go = violated_invariants(&with_buggy(&model, 4));
+    assert!(
+        let_go.contains("LockUnderClaim") && !let_go.contains("NoUnrequestedOvercommit"),
+        "a holder that lets its claim go while its build runs leaves the lock unclaimed: \
+         {let_go:?}"
+    );
+    let by_words = violated_invariants(&with_buggy(&model, 5));
+    assert!(
+        by_words.contains("NoUnrequestedOvercommit") && !by_words.contains("NoNestedWaitCycle"),
+        "a front admitted at once by cargo's words alone holds its claim beside another: \
+         {by_words:?}"
     );
 
     let dir = aterm_tempfile::tempdir().expect("scratch");
@@ -1315,4 +1544,259 @@ fn a_builds_claim_is_held_before_its_targo_starts_as_the_model_orders() {
         "none\n"
     );
     drop(late);
+}
+
+/// A Cargo-lock filename is only a possible-cycle hint when a kernel probe says a lock is
+/// held. An unlocked or unknown probe, a non-lock filename and a process outside the lineage
+/// imply nothing. A hint changes neither the configured mode nor the coverage rules.
+#[test]
+fn only_a_held_file_in_the_lineage_is_a_possible_build_lock() {
+    let line = || vec![41_u32, 42, 43];
+    let files = |pid| {
+        if pid == 42 {
+            vec![PathBuf::from("/foreign/.cargo-lock")]
+        } else {
+            Vec::new()
+        }
+    };
+    assert_eq!(possible_build_lock(&line, &files, &|_| false), None);
+    assert_eq!(
+        possible_build_lock(&line, &files, &|_| true),
+        Some("/foreign/.cargo-lock".into())
+    );
+    assert_eq!(possible_build_lock(&|| vec![41], &files, &|_| true), None);
+    assert_eq!(
+        possible_build_lock(&line, &|_| vec!["/w/.cargo-lock.bak".into()], &|_| true),
+        None
+    );
+}
+
+#[test]
+fn an_unproven_nested_lock_never_forces_admission_or_waits_in_a_cycle() {
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let m = machine();
+    let mut s = seat(dir.path(), &m, std::process::id().wrapping_add(41));
+    let ledger = s.ledger.as_ref().unwrap().clone();
+    let unrelated = aterm_capacity::admit_with(
+        &ledger,
+        &m,
+        Need::new("unrelated alone").mem(64 * GIB).alone(),
+        Admit::Now,
+        Pace::default(),
+        &mut |_| {},
+    )
+    .expect("unrelated ALONE claim");
+    let b = test_build();
+    let lock = Path::new("/foreign/.cargo-lock");
+    let mut said = Vec::new();
+    let refused = admit_bounded(
+        &b,
+        dir.path(),
+        &s,
+        &|| Some(lock.to_path_buf()),
+        &mut |line| said.push(line.to_owned()),
+    );
+    assert!(matches!(refused, Admission::Refused(_)), "{refused:?}");
+    assert_eq!(
+        ledger.list().expect("listed").len(),
+        1,
+        "no forced or waiting claim left"
+    );
+    assert!(said.iter().any(|line| line.contains("ownership is unproven") && line.contains("no build started")));
+    s.pid = std::process::id();
+    assert!(
+        matches!(
+            admit_bounded(
+                &b,
+                dir.path(),
+                &s,
+                &|| panic!("an own claim needs no hint probe"),
+                &mut |_| {}
+            ),
+            Admission::Own(_)
+        ),
+        "own claim remains direct"
+    );
+    s.pid = s.pid.wrapping_add(41);
+    s.mode = Admit::Now;
+    let explicit = admit_bounded(
+        &b,
+        dir.path(),
+        &s,
+        &|| panic!("explicit Now needs no hint probe"),
+        &mut |_| {},
+    );
+    assert!(
+        matches!(explicit, Admission::Claimed(_)),
+        "explicit Now is preserved: {explicit:?}"
+    );
+    drop(explicit);
+    drop(unrelated);
+    s.mode = Admit::Wait;
+    let room = admit_bounded(
+        &b,
+        dir.path(),
+        &s,
+        &|| Some(lock.to_path_buf()),
+        &mut |_| {},
+    );
+    assert!(
+        matches!(room, Admission::Claimed(_)),
+        "configured Wait admits normally when it fits: {room:?}"
+    );
+}
+
+/// A WAITING FRONT'S LEDGER SAYS WHAT IT WAITS FOR ([`front_claim`]), read off a real ledger: its
+/// oldest claim that waits, by the memory it claims and the memory claims ahead of it (each held
+/// one; none that claims no memory; no later waiter of its own process); once admitted it holds;
+/// with no claim of its pid, nothing. NEGATIVE CONTROL: the cores-only claim held and the later
+/// waiter of the same process change no count, and the count falls as the claim ahead lets go.
+/// Every claim here is this process's; [`claims_of_other_processes_ahead_of_a_front_are_counted`]
+/// reads other processes' claims.
+#[test]
+fn a_waiting_fronts_ledger_says_what_it_claims_and_how_many_are_ahead() {
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let m = machine();
+    let me = std::process::id();
+    let ledger = Ledger::at(dir.path().join("ledger"));
+    assert_eq!(
+        front_claim(&ledger, me).expect("read"),
+        None,
+        "no ledger yet"
+    );
+    let ahead = hold(
+        dir.path(),
+        &m,
+        Need::new("verify test compile").mem(8 * GIB),
+    );
+    let cores = hold(dir.path(), &m, Need::new("cores only").cores(2));
+    assert_eq!(
+        front_claim(&ledger, me).expect("read"),
+        Some(FrontClaim::Held)
+    );
+    let front = aterm_capacity::Waiter::enter(&ledger, &m, Need::new("targo build").mem(12 * GIB))
+        .expect("entered");
+    let later = aterm_capacity::Waiter::enter(&ledger, &m, Need::new("targo check").mem(4 * GIB))
+        .expect("entered");
+    assert_eq!(
+        front_claim(&ledger, me).expect("read"),
+        Some(FrontClaim::Waiting {
+            mem: 12 * GIB,
+            ahead: vec![me]
+        })
+    );
+    drop(front);
+    drop(ahead);
+    assert_eq!(
+        front_claim(&ledger, me).expect("read"),
+        Some(FrontClaim::Waiting {
+            mem: 4 * GIB,
+            ahead: Vec::new()
+        })
+    );
+    let aterm_capacity::Polled::Admitted(held) = later.poll(&m) else {
+        panic!("4 GiB fits beside a cores-only claim on 20 GiB available");
+    };
+    assert_eq!(
+        front_claim(&ledger, me).expect("read"),
+        Some(FrontClaim::Held)
+    );
+    drop((held, cores));
+    assert_eq!(front_claim(&ledger, me).expect("read"), None);
+    assert_eq!(
+        front_claim(&ledger, me.wrapping_add(1)).expect("read"),
+        None,
+        "another pid's"
+    );
+}
+
+/// A reader finds the front's ledger as the front does: the one its own `ATERM_BUILD_ADMIT_LEDGER`
+/// names in a debug build, else this user's. NEGATIVE CONTROL: an empty value is unset.
+#[test]
+fn a_reader_finds_the_fronts_ledger_by_the_fronts_own_environment() {
+    let scratch = |key: &str| (key == LEDGER_ENV).then(|| "/scratch/ledger".to_owned());
+    assert_eq!(
+        ledger_of_front(&scratch).map(|l| l.dir().to_path_buf()),
+        Some(PathBuf::from("/scratch/ledger"))
+    );
+    let empty = |key: &str| (key == LEDGER_ENV).then(String::new);
+    assert_eq!(ledger_of_front(&empty), Ledger::user());
+    assert_eq!(ledger_of_front(&|_| None), Ledger::user());
+}
+
+/// A claim's record as a ledger lists it: `pid`'s, laid at `start_ms`, asking `mem`, held or
+/// waiting.
+fn record(pid: u32, start_ms: u64, mem: u64, held: bool) -> Record {
+    Record {
+        pid,
+        start_ms,
+        seq: 0,
+        checkout: "/ws".to_owned(),
+        need: Need::new("a build").mem(mem),
+        held: held.then_some(aterm_capacity::Held {
+            admitted_ms: start_ms,
+            cores: 1,
+            alone: false,
+        }),
+        credit: Vec::new(),
+        wrote: None,
+        next_ms: None,
+    }
+}
+
+/// CLAIMS OF OTHER PROCESSES AHEAD OF A FRONT ARE COUNTED ([`front_claim_in`]), oldest first by
+/// pid: a claim another process holds, laid before or after the front's, and one that waits since
+/// earlier; never one that waits since later, nor one of no memory. The front's own oldest waiting
+/// claim is the one read, wherever the list puts it. NEGATIVE CONTROL: the same records with the
+/// earlier waiter laid after the front's claim count it out.
+#[test]
+fn claims_of_other_processes_ahead_of_a_front_are_counted() {
+    const FRONT: u32 = 4100;
+    let records = [
+        record(FRONT, 5_000, 4 * GIB, false),
+        record(4200, 3_000, 8 * GIB, true),
+        record(4300, 9_000, 6 * GIB, true),
+        record(4400, 4_000, 12 * GIB, false),
+        record(4500, 6_000, 2 * GIB, false),
+        record(4600, 2_000, 0, true),
+        record(FRONT, 1_000, 10 * GIB, false),
+    ];
+    assert_eq!(
+        front_claim_in(&records, FRONT),
+        Some(FrontClaim::Waiting {
+            mem: 10 * GIB,
+            ahead: vec![4200, 4300]
+        }),
+        "its oldest waiting claim, laid at 1 s: only the held claims are ahead of it"
+    );
+    let later = [
+        record(FRONT, 5_000, 4 * GIB, false),
+        record(4200, 3_000, 8 * GIB, true),
+        record(4300, 9_000, 6 * GIB, true),
+        record(4400, 4_000, 12 * GIB, false),
+        record(4500, 6_000, 2 * GIB, false),
+        record(4600, 2_000, 0, true),
+    ];
+    assert_eq!(
+        front_claim_in(&later, FRONT),
+        Some(FrontClaim::Waiting {
+            mem: 4 * GIB,
+            ahead: vec![4200, 4400, 4300]
+        }),
+        "laid at 5 s: the held claims and the one waiting since 4 s, never the one since 6 s"
+    );
+    let mut swapped = later.clone();
+    swapped[3].start_ms = 7_000;
+    assert_eq!(
+        front_claim_in(&swapped, FRONT),
+        Some(FrontClaim::Waiting {
+            mem: 4 * GIB,
+            ahead: vec![4200, 4300]
+        })
+    );
+    assert_eq!(
+        front_claim_in(&[record(FRONT, 1_000, GIB, true)], FRONT),
+        Some(FrontClaim::Held)
+    );
+    assert_eq!(front_claim_in(&later, 4700), None);
 }

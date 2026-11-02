@@ -122,7 +122,10 @@ impl IndexCache {
             return;
         }
         let tmp = parent.join(format!(".index-cache.tmp-{}", std::process::id()));
-        if fs::write(&tmp, text.as_bytes()).is_err() {
+        let _ = fs::remove_file(&tmp);
+        let written = crate::platform::create_private_new(&tmp)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, text.as_bytes()));
+        if written.is_err() {
             let _ = fs::remove_file(&tmp);
             return;
         }
@@ -510,6 +513,28 @@ mod tests {
             mode_of(&parent),
             0o700,
             "a $HOME prefix's cache parent is private state and stays 0700"
+        );
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_replaces_tmp_symlink_without_writing_target() {
+        let (_scratch, p) = tmp("tmp-symlink");
+        let parent = p.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&parent).unwrap();
+        let victim = parent.join("victim.txt");
+        fs::write(&victim, b"untouched").unwrap();
+        let tmp_path = parent.join(format!(".index-cache.tmp-{}", std::process::id()));
+        std::os::unix::fs::symlink(&victim, &tmp_path).unwrap();
+
+        let cache = IndexCache::new(p.clone());
+        cache.store("github:o/r", &[cand("v1")]);
+        assert!(cache.load("github:o/r").is_some(), "the cache is written");
+        assert_eq!(
+            fs::read(&victim).unwrap(),
+            b"untouched",
+            "store must unlink .index-cache.tmp-<pid> rather than following a symlink"
         );
         let _ = fs::remove_dir_all(&parent);
     }

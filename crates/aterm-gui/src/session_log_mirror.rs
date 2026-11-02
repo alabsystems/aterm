@@ -103,6 +103,9 @@ impl Tombstone {
         ShortId::new(sid)?;
         let (cursor, head) = rest.rsplit_once(':')?;
         let landed = BusCursor::parse(cursor)?;
+        if !head.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
         let ms_head: u64 = head.parse().ok()?;
         (ms_head > landed.ms).then(|| Tombstone {
             sid: sid.to_string(),

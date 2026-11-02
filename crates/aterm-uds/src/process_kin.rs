@@ -304,7 +304,12 @@ pub fn group_members(pgid: u32) -> Option<GroupMembers> {
         let Ok(entry) = entry else {
             return Some((0, StatRead::Unreadable));
         };
-        let pid = entry.file_name().to_str()?.parse::<i32>().ok()?;
+        let pid = entry
+            .file_name()
+            .to_str()
+            .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))?
+            .parse::<i32>()
+            .ok()?;
         Some((pid, super::stat_row(&entry.path().join("stat"))))
     });
     Some(super::procfs::group_of(
@@ -351,6 +356,15 @@ pub const MARKER_VARS: [&str; 4] = [
 
 /// `ATERM_VERIFY_RUN`.
 pub const VERIFY_RUN_VAR: &str = "ATERM_VERIFY_RUN";
+
+/// Whether a child kept from this process's `ATERM_*` settings has `name` removed: every
+/// `ATERM_*` variable but [`VERIFY_RUN_VAR`]. The verify run's mark is no authority, and with it
+/// the run still reads the child as its own ([`read_process_markers`]).
+#[must_use]
+pub fn stripped_from_child(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy();
+    name.starts_with("ATERM_") && name != VERIFY_RUN_VAR
+}
 
 /// `ATERM_TRUST_CHECK`: the mark every process of one trust-lane check carries.
 pub const TRUST_CHECK_VAR: &str = "ATERM_TRUST_CHECK";
@@ -496,7 +510,8 @@ pub fn process_serial(pid: i32) -> Option<u64> {
     }
     #[cfg(target_os = "linux")]
     {
-        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let stat =
+            super::read_proc_text(std::path::Path::new(&format!("/proc/{pid}/stat"))).ok()?;
         super::procfs::stat_start(&stat, pid).map(|(_, ticks)| ticks)
     }
     #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
@@ -610,6 +625,20 @@ pub struct HeldNow {
     pub count: usize,
     /// The oldest held program's fork age in ms (an upper bound on its wait); 0 when none is.
     pub oldest_ms: u64,
+}
+
+impl HeldNow {
+    /// Whether this reading, taken after `before` (the same reader's earlier one; `None` when that
+    /// one did not read), is a backed-up queue by the jobs engine's rule:
+    /// [`aterm_vitals::jobs::HELD_AT_ONCE`] held at once, or a program held at both readings. A
+    /// count names no row, so a different program held at each counts too: each has stood unrun
+    /// past the 20 s age bound, where a normal exec reads so for under 0.3 ms. A new program
+    /// started now would wait in the same line.
+    #[must_use]
+    pub const fn backed_up(&self, before: Option<Self>) -> bool {
+        self.count >= aterm_vitals::jobs::HELD_AT_ONCE
+            || (self.count > 0 && matches!(before, Some(b) if b.count > 0))
+    }
 }
 
 /// How long a program has waited at macOS's program check, as every surface that counts the wait
@@ -775,13 +804,45 @@ mod tests {
         let _ = std::io::Read::read(&mut std::io::stdin(), &mut [0u8; 1]);
     }
 
+    /// A child kept from this process's `ATERM_*` settings goes without every `ATERM_*` name,
+    /// each marker but the verify run's mark among them, and keeps every other name
+    /// ([`stripped_from_child`]). Negative controls: the rule without its [`VERIFY_RUN_VAR`]
+    /// exemption strips the mark, one that only spares the mark strips `PATH`, and a prefix
+    /// without its `_` strips `ATERMX`.
+    #[test]
+    fn a_child_kept_from_aterm_settings_goes_without_them_but_the_verify_runs_mark() {
+        use std::ffi::OsStr;
+        for marker in MARKER_VARS {
+            assert_eq!(
+                stripped_from_child(OsStr::new(marker)),
+                marker != VERIFY_RUN_VAR,
+                "{marker}"
+            );
+        }
+        for (name, stripped) in [
+            ("ATERM_LOG", true),
+            ("ATERM_", true),
+            ("ATERM_VERIFY_RUNS", true),
+            ("PATH", false),
+            ("HOME", false),
+            ("ATERM", false),
+            ("ATERMX", false),
+            ("XATERM_CHILD", false),
+            ("aterm_child", false),
+        ] {
+            assert_eq!(stripped_from_child(OsStr::new(name)), stripped, "{name}");
+        }
+    }
+
     /// A child's four markers are read off the kernel's copy of its exec environment between two
     /// identity reads, and nothing once it has exited (unreaped or reaped) or for pid 1. Its
-    /// serial reads the same twice, differs from this process's, and is gone once it is reaped.
-    /// The child is this test binary run in place: macOS withholds a platform binary's
-    /// environment. Negative controls: an empty buffer in place of the child's arguments reads no
-    /// markers on macOS; on Linux, reading `environ` without `bracketed` reads the exited child's
-    /// empty file as withheld markers.
+    /// serial reads the same twice and is gone once it is reaped. Apple's unique serial differs
+    /// from this process's; Linux's start tick is no earlier and may equal its parent's tick.
+    /// A platform with no marker reader (any but macOS, Linux and Android) or no serial reader
+    /// (any but Apple's and Linux) reads none. The child is this test binary run in place: macOS
+    /// withholds a platform binary's environment. Negative controls: an empty buffer in place of
+    /// the child's arguments reads no markers on macOS; on Linux, reading `environ` without
+    /// `bracketed` reads the exited child's empty file as withheld markers.
     #[test]
     fn a_spawned_childs_markers_are_read_off_its_exec_environment() {
         use super::super::{ProcessPresence, process_presence};
@@ -820,12 +881,27 @@ mod tests {
         }
         let unreaped = read_process_markers(pid);
         let _ = child.wait();
-        if !cfg!(any(target_os = "macos", target_os = "linux")) {
-            assert_eq!(
-                (read, serial),
-                (None, None),
-                "no marker or serial reader here"
-            );
+        if cfg!(any(target_vendor = "apple", target_os = "linux")) {
+            assert!(serial.is_some() && serial == again, "{serial:?} {again:?}");
+            let parent = process_serial(me).expect("this process's serial");
+            if cfg!(target_vendor = "apple") {
+                assert_ne!(serial, Some(parent));
+            } else {
+                assert!(
+                    serial.is_some_and(|start| start >= parent),
+                    "Linux start ticks may tie across a fork: {serial:?} {parent}"
+                );
+            }
+            assert_eq!(process_serial(pid), None, "a reaped child's serial");
+        } else {
+            assert_eq!(serial, None, "no serial reader here");
+        }
+        if !cfg!(any(
+            target_os = "macos",
+            target_os = "linux",
+            target_os = "android"
+        )) {
+            assert_eq!(read, None, "no marker reader here");
             return;
         }
         assert_eq!(
@@ -839,9 +915,6 @@ mod tests {
             }),
             "the child's markers"
         );
-        assert!(serial.is_some() && serial == again, "{serial:?} {again:?}");
-        assert_ne!(serial, process_serial(me));
-        assert_eq!(process_serial(pid), None, "a reaped child's serial");
         assert_eq!(unreaped, None, "an exited child its parent has not reaped");
         assert_eq!(read_process_markers(pid), None, "a reaped child");
         assert_eq!(read_process_markers(1), None, "launchd's or init's");

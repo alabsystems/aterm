@@ -42,6 +42,11 @@ pub const KERNEL_WAIT_MS: u64 = 10_000;
 pub const NEVER_RETURNS_MS: u64 = 10_000;
 /// How long an orphan must burn a core with no side writes to be a busy-silent orphan finding.
 pub const BUSY_ORPHAN_MS: u64 = 600_000;
+/// How many programs macOS's program check holds at one reading that make a backed-up queue: a
+/// normal exec reads held for under 0.3 ms, so this many at once is a line. The rule's other half
+/// is one held across two readings; a reader that keeps a count, not rows, reads that half as
+/// programs held at both of its readings (`aterm_uds::process::HeldNow::backed_up`).
+pub const HELD_AT_ONCE: usize = 3;
 /// The intervals a job's own μ is the median of (the last ones).
 pub const OWN_RING: usize = 32;
 /// Intervals a job needs before its own median is its μ (and before it teaches its command class).
@@ -292,6 +297,18 @@ pub struct JobProc {
     pub name: String,
     /// Its executable's basename: the name rows print, `name` where `None`.
     pub exe: Option<String>,
+    /// The program a build's front becomes once its memory claim is admitted (`targo`), where
+    /// its arguments say it is one (the host asks `aterm_uds::build_front::front`): rows name it
+    /// by this, before `exe`. `None` for every other process, and where its arguments were not
+    /// read.
+    pub becomes: Option<String>,
+    /// While a front's claim waits in its ledger (the host asks `atpkg::build_admit::front_claim`
+    /// each pass): the pid of each memory claim ahead of it, oldest first, empty where its ledger
+    /// says nothing of them (none laid yet, or unread). While it is a leaf it waits on
+    /// [`WaitName::Memory`], counted as those claims' holders progress. `None` for every other
+    /// process, and for a front whose ledger holds its claim (admitted, handing it to its holder),
+    /// which reads by its own wait.
+    pub claims_ahead: Option<Vec<u32>>,
     /// Its state.
     pub state: ProcState,
     /// A debugger traces it (a debugger's child at a breakpoint is no job-control stop).
@@ -315,9 +332,10 @@ pub struct JobProc {
     /// The descriptor it sleeps reading or writing, read with its descriptors (Linux
     /// `/proc/<pid>/syscall`); `None` elsewhere, where unread, or in no read or write.
     pub blocked_fd: Option<i32>,
-    /// Whether macOS's program check holds it before its first instruction
-    /// (`aterm_sysprobe::jobs::AtStart::Held`).
-    pub program_check: bool,
+    /// What keeps it from its first instruction where its reading judged it unstarted (macOS's
+    /// program check holds it, Rosetta translates it, …: `aterm_sysprobe::jobs::AtStart`);
+    /// `None` for one that started, and where no start was judged.
+    pub start_wait: Option<StartWait>,
     /// Its pid version where read (macOS `p_idversion`, read for each tab's root): a new process
     /// and each exec take a new one, so it moves where the pid, the start and the name stay
     /// (`exec zsh`); `None` elsewhere.
@@ -338,22 +356,33 @@ pub enum StartWait {
     /// Its executable is on a volume not proven local: it has not started, and nothing read
     /// says why.
     NotStarted,
+    /// It reads stopped or traced: a start-suspended spawn or a debugger's launch, unless macOS's
+    /// program check holds a program that reads so, which nothing has measured (the
+    /// leftover-processes design's U3).
+    StoppedUnstarted {
+        /// Its BSD status reads `SSTOP`.
+        stopped: bool,
+        /// It reads `PROC_FLAG_TRACED`.
+        traced: bool,
+    },
 }
 
 impl StartWait {
-    /// The word a `finding` row's `kind=` prints: `program-check`, `translating` or `not-started`.
+    /// The word a `finding` row's `kind=` prints: `program-check`, `translating`, `not-started`
+    /// or `stopped-unstarted`.
     #[must_use]
     pub const fn word(self) -> &'static str {
         match self {
             Self::ProgramCheck => "program-check",
             Self::Translating => "translating",
             Self::NotStarted => "not-started",
+            Self::StoppedUnstarted { .. } => "stopped-unstarted",
         }
     }
 }
 
 /// One process of aterm's user, in a job or not, whose one thread never ran past 20 s: held at
-/// macOS's program check, translating, or not started ([`StartWait`]).
+/// macOS's program check, translating, not started, or stopped or traced ([`StartWait`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HeldProc {
     /// Its pid.
@@ -361,12 +390,21 @@ pub struct HeldProc {
     /// Which program the pid runs: its pid version where read (it moves on exec), else its
     /// start. A wrapper that execs its held tool starts a new held time.
     pub exec: u64,
+    /// Its actual pid version, which changes on exec, proved around the current wait reading.
+    /// Unlike [`Self::exec`], this never substitutes the process's birth or zero for an
+    /// unavailable or inconsistent version.
+    pub exec_version: Option<u64>,
     /// Its executable's basename, else its short name.
     pub name: String,
     /// Whether aterm started it (a tab's member, or aterm's resource coalition): words only.
     pub aterm: bool,
     /// What keeps it from starting.
     pub wait: StartWait,
+    /// The tab of the session a group-mate's environment ties it to while that session lives,
+    /// for one outside every job (the host's W-session read; its own environment is never read).
+    pub tab: Option<u64>,
+    /// When it forked, unix ms; `None` where unread.
+    pub started_ms: Option<u64>,
 }
 
 /// One OSC 133 command block of a tab.
@@ -554,6 +592,10 @@ pub struct JobTab {
     pub calls: Vec<CallHint>,
     /// Tier B namings made on request.
     pub named: Vec<NamedWait>,
+    /// The tab's session was adopted from another aterm process (an update's hand-off): macOS may
+    /// check its new programs whatever aterm's Developer Tools grant says (the leftover-processes
+    /// design's M13).
+    pub adopted: bool,
 }
 
 /// The machine, as the host reads it this tick.
@@ -620,8 +662,12 @@ pub struct JobTick {
     /// The per-user process limit (`kern.maxprocperuid`, `RLIMIT_NPROC`).
     pub process_limit: Option<u64>,
     /// aterm's user's processes that have not started: held at macOS's program check,
-    /// translated by Rosetta, or on a volume not proven local.
+    /// translated by Rosetta, on a volume not proven local, or stopped or traced.
     pub held: Vec<HeldProc>,
+    /// When aterm's Developer Tools grant took effect, unix ms, while the host reads aterm granted:
+    /// from then on macOS checks no new program aterm starts (the leftover-processes design's
+    /// M13). `None` when not granted or not known.
+    pub grant_ms: Option<u64>,
 }
 
 /// One process the host should read in detail.
@@ -809,6 +855,11 @@ impl Verdict {
 pub enum WaitName {
     /// Held at macOS's program check before its first instruction: work in line.
     ProgramCheck,
+    /// An x86_64 program Rosetta is translating before its first instruction: work in line.
+    Translating,
+    /// A build's front waiting for its memory claim in the capacity ledger
+    /// ([`JobProc::claims_ahead`]): work in line behind other claims.
+    Memory,
     /// The person's foreground job reads a password (canonical, no echo).
     TtyPassword,
     /// The shell's own `read` builtin.
@@ -855,6 +906,8 @@ impl WaitName {
     pub const fn word(self) -> &'static str {
         match self {
             Self::ProgramCheck => "program-check",
+            Self::Translating => "translating",
+            Self::Memory => "memory",
             Self::TtyPassword => "tty-password",
             Self::TtyBuiltinRead => "tty-builtin-read",
             Self::TtyRaw => "tty-raw",
@@ -984,6 +1037,8 @@ pub struct JobRow {
     pub tab: u64,
     /// The unit kind.
     pub kind: JobKind,
+    /// For an orphan unit, the kind of the job it outlived (an agent's call, a shell's job).
+    pub orphan_of: Option<JobKind>,
     /// Who waits for it.
     pub consumer: Consumer,
     /// Promoted to background at this timeout, ms.
@@ -1080,12 +1135,31 @@ pub struct ZombieParent {
 pub struct Named {
     /// Its pid.
     pub pid: u32,
+    /// The actual pid version of a held program, when read; `None` for other findings or an
+    /// unavailable version. A later proof must match this version before reusing its held time.
+    pub exec_version: Option<u64>,
     /// Its name.
     pub name: String,
     /// The tab, when it is in one.
     pub tab: Option<u64>,
+    /// The kind of the live job it is a member of, an orphan unit's member the kind of the job
+    /// the unit outlived (an agent's call's leftover reads [`JobKind::AgentCall`], the shell's
+    /// job's [`JobKind::Shell`]); `None` outside every job.
+    pub job: Option<JobKind>,
     /// How long, ms (D-state, busy orphans, and held since the first reading that saw it held).
     pub for_ms: u64,
+}
+
+/// A process whose one thread never ran past 20 s while it reads stopped or traced
+/// ([`StartWait::StoppedUnstarted`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoppedUnstarted {
+    /// The process, since the first reading that saw it so.
+    pub named: Named,
+    /// Its BSD status reads `SSTOP`.
+    pub stopped: bool,
+    /// It reads `PROC_FLAG_TRACED`.
+    pub traced: bool,
 }
 
 /// A stretch of readings in which macOS's program check is backed up
@@ -1121,6 +1195,11 @@ pub struct Findings {
     pub program_check: Vec<Named>,
     /// Of those, the ones aterm started: how many, and the longest held, ms.
     pub program_check_aterm: (u32, u64),
+    /// Of aterm's, how many forked at or after [`JobTick::grant_ms`] where no adopted tab could
+    /// hold them (in a tab no reading named adopted, which stays so after it closes, or in none
+    /// while no reading named a tab adopted). One means the grant did not take; one started
+    /// before it may still wait.
+    pub program_check_after_grant: u32,
     /// The backed-up episode this reading is in.
     pub program_check_episode: Option<HeldEpisode>,
     /// The episode that closed at this reading (set on that one view only).
@@ -1131,6 +1210,11 @@ pub struct Findings {
     /// Own processes with the same signature whose executable is not proven on a local volume,
     /// each since the first reading that saw it so ([`StartWait::NotStarted`]).
     pub not_started: Vec<Named>,
+    /// Own processes with the same signature that read stopped or traced, each since the first
+    /// reading that saw it so, with what this reading read ([`StartWait::StoppedUnstarted`]):
+    /// never counted as held. One that reads stopped is in [`Self::stopped`] too, which lists
+    /// every stopped process whether or not it ran.
+    pub stopped_unstarted: Vec<StoppedUnstarted>,
     /// Inside a backed-up episode, the job members that started but whose CPU did not move since
     /// the reading before while they hold a fresh dylib open: probably waiting for the same
     /// check, a heuristic (§5.1's dylib case). `for_ms` is 0.
@@ -1179,6 +1263,9 @@ pub struct JobsView {
     /// The tabs, ascending, whose every live job waits at the person's own terminal read this
     /// tick and none is watched at the fast cadence (stuck, or on a suspect wait).
     pub parked_tabs: Vec<u64>,
+    /// The pass's clock ([`JobTick::at_ms`]): every figure of the view is as of it, however
+    /// long a snapshot carries the view after it.
+    pub at_ms: u64,
 }
 
 impl JobsView {

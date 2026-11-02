@@ -186,3 +186,35 @@ fn embedded_restore_keeps_its_failed_put_back_beside_the_permissions_stage() {
 fn embedded_restore_keeps_its_at_login_result_beside_the_permissions_stage() {
     embedded_restore(PutBackCase::AtLogin);
 }
+
+/// System State offers Restore previous settings once a pass saved the preferences it changed,
+/// and not before: with nothing saved there is nothing to put back.
+#[test]
+fn restore_is_offered_once_a_pass_saved_the_preferences_it_changed() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    assert!(
+        !snapshot_at(root.path(), Plan::default())
+            .unwrap()
+            .restorable
+    );
+    let mut plan = Plan::from(group_selection(Group::Desktop));
+    plan.selection.set(Setting::Permissions, true);
+    let revision = authorize_at(root.path(), &plan).unwrap().unwrap();
+    let mut stages = WithholdingStages::over(Withholding::widgets());
+    stages.doctor.grant();
+    execute_initial_for_revision(
+        &mut stages,
+        root.path(),
+        revision,
+        &mut None,
+        SetupHooks::NONE,
+    )
+    .unwrap()
+    .expect("the setup ran");
+    assert!(root.path().join("original-preferences.json").is_file());
+    assert!(
+        snapshot_at(root.path(), Plan::default())
+            .unwrap()
+            .restorable
+    );
+}

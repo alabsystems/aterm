@@ -79,6 +79,9 @@ fn tray_present_scissors_and_stays_byte_identical_to_a_full_repaint() {
         dx: (cw * 2) as u32,
         dy: (ch * 2) as u32,
         scrim: None,
+        serial: 0,
+        delta: None,
+        above: &[],
     };
     let (fw, fh) = gpu.frame_size(rows, cols);
     let (fw, fh) = (fw as u32, fh as u32);
@@ -124,6 +127,9 @@ fn dropping_the_tray_leaves_no_stale_card_pixels() {
         dx: cw as u32,
         dy: ch as u32,
         scrim: None,
+        serial: 0,
+        delta: None,
+        above: &[],
     };
     let (fw, fh) = gpu.frame_size(rows, cols);
     let (fw, fh) = (fw as u32, fh as u32);
@@ -184,6 +190,9 @@ fn an_opaque_tray_still_covers_the_comet_halo() {
         dx: 0,
         dy: 0,
         scrim: None,
+        serial: 0,
+        delta: None,
+        above: &[],
     };
     let covered_glow = harvest(&mut gpu, fw, fh, &[(&glowing, Some(quad))]);
     let covered_plain = harvest(&mut gpu, fw, fh, &[(&plain, Some(quad))]);

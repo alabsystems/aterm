@@ -22,7 +22,20 @@ pub enum InflateError {
     OutputTooLarge,
     /// The zlib trailer's Adler-32 did not match the decompressed data.
     BadChecksum,
+    /// The stream's block headers cost more than its reader's work budget
+    /// ([`stream::ZlibReader::with_work_budget`]).
+    TooMuchWork,
 }
+
+/// What a stored or fixed block's header costs against a reader's work budget
+/// ([`stream::ZlibReader::with_work_budget`]): a few bits read, nothing built.
+pub const HEADER_WORK: u64 = 1;
+
+/// What a dynamic block's header costs against a reader's work budget: it
+/// decodes up to 335 code lengths and builds three Huffman tables from them,
+/// measured at about 2 µs against a stored or fixed header's 8 ns. An empty one
+/// is 12 bytes long, so no output pays for it.
+pub const DYNAMIC_HEADER_WORK: u64 = 256;
 
 /// Streaming decompression over `std::io::Read`, for output too large to buffer whole.
 pub mod stream;
@@ -232,10 +245,21 @@ mod oracle {
 
     thread_local! {
         static FORCE_BITWISE: Cell<bool> = const { Cell::new(false) };
+        static TABLES_BUILT: Cell<u64> = const { Cell::new(0) };
     }
 
     pub(super) fn force_bitwise() -> bool {
         FORCE_BITWISE.with(Cell::get)
+    }
+
+    /// Count one [`super::Huffman::new`] on this thread.
+    pub(super) fn note_table_built() {
+        TABLES_BUILT.with(|c| c.set(c.get().saturating_add(1)));
+    }
+
+    /// How many Huffman tables this thread has built.
+    pub(super) fn tables_built() -> u64 {
+        TABLES_BUILT.with(Cell::get)
     }
 
     /// Run `f` with the root table disabled.
@@ -261,6 +285,8 @@ impl Huffman {
     /// Build from per-symbol code lengths (0 = symbol unused).
     fn new(lengths: &[u16]) -> Result<(Self, i32), InflateError> {
         const MAX_SYMBOLS: usize = 288;
+        #[cfg(test)]
+        oracle::note_table_built();
         if lengths.len() > MAX_SYMBOLS {
             return Err(InflateError::BadSymbol);
         }
@@ -389,6 +415,20 @@ fn fixed_dist() -> Huffman {
             symbol: Vec::new(),
             root: Vec::new(),
         })
+}
+
+/// The fixed (`BTYPE=01`) literal/length and distance alphabets, built once
+/// per process with their root tables armed. A fixed block carries no tables
+/// of its own and an empty one is 10 bits long, so building them per block
+/// would cost two table builds per 10 input bits.
+fn fixed_tables() -> &'static (Huffman, Huffman) {
+    static FIXED: std::sync::OnceLock<(Huffman, Huffman)> = std::sync::OnceLock::new();
+    FIXED.get_or_init(|| {
+        let (mut lit, mut dist) = (fixed_lit(), fixed_dist());
+        lit.arm_root();
+        dist.arm_root();
+        (lit, dist)
+    })
 }
 
 fn read_dynamic_tables(br: &mut BitReader) -> Result<(Huffman, Huffman), InflateError> {
@@ -619,15 +659,14 @@ pub fn inflate(input: &[u8], max_output: usize) -> Result<Vec<u8>, InflateError>
 pub fn inflate_prefix(input: &[u8], max_output: usize) -> Result<(Vec<u8>, usize), InflateError> {
     let mut br = BitReader::new(input);
     let mut out: Vec<u8> = Vec::new();
-    let mut fixed: Option<(Huffman, Huffman)> = None;
     loop {
         let bfinal = br.read_bit()?;
         let btype = br.read_bits(2)?;
         match btype {
             0 => inflate_stored(&mut br, &mut out, max_output)?,
             1 => {
-                let (lit, dist) = &mut *fixed.get_or_insert_with(|| (fixed_lit(), fixed_dist()));
-                inflate_block(&mut br, &mut out, max_output, lit, dist)?;
+                let (lit, dist) = fixed_tables();
+                block_loop::<true>(&mut br, &mut out, max_output, lit, dist, 0)?;
             }
             2 => {
                 let (mut lit, mut dist) = read_dynamic_tables(&mut br)?;
@@ -1157,5 +1196,176 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// An LSB-first DEFLATE bit sink for the generated streams below.
+    #[derive(Default)]
+    struct Bits {
+        out: Vec<u8>,
+        acc: u32,
+        held: u32,
+    }
+
+    impl Bits {
+        fn put(&mut self, bits: u32, len: u32) {
+            self.acc |= bits << self.held;
+            self.held += len;
+            while self.held >= 8 {
+                self.out.push(self.acc as u8);
+                self.acc >>= 8;
+                self.held -= 8;
+            }
+        }
+
+        /// A Huffman code word, most significant bit first.
+        fn code(&mut self, word: u32, len: u32) {
+            self.put(reverse_code(word, len), len);
+        }
+
+        /// End the stream with a final stored block holding `tail`.
+        fn finish(mut self, tail: &[u8]) -> Vec<u8> {
+            self.put(0b001, 3); // BFINAL=1, BTYPE=00
+            if self.held > 0 {
+                self.put(0, 8 - self.held);
+            }
+            let len = u16::try_from(tail.len()).expect("a stored block holds 64 KiB");
+            self.out.extend_from_slice(&len.to_le_bytes());
+            self.out.extend_from_slice(&(!len).to_le_bytes());
+            self.out.extend_from_slice(tail);
+            self.out
+        }
+    }
+
+    /// Raw DEFLATE: `blocks` empty fixed-Huffman blocks (10 bits each), then a
+    /// final stored block holding `tail`.
+    fn empty_fixed_blocks(blocks: usize, tail: &[u8]) -> Vec<u8> {
+        let mut bits = Bits::default();
+        for _ in 0..blocks {
+            bits.put(0b010, 3); // BFINAL=0, BTYPE=01
+            bits.put(0, 7); // end of block: fixed code 0000000
+        }
+        bits.finish(tail)
+    }
+
+    /// Raw DEFLATE: `blocks` empty dynamic blocks with the cheapest header to
+    /// write (12 bytes: literal 0 and end-of-block one bit each, no distance
+    /// code), then a final stored block holding `tail`.
+    fn empty_dynamic_blocks(blocks: usize, tail: &[u8]) -> Vec<u8> {
+        // The code-length code: 18 one bit (word 0), 0 and 1 two bits (10, 11).
+        let length_of = |symbol: usize| match symbol {
+            18 => 1,
+            0 | 1 => 2,
+            _ => 0,
+        };
+        let mut bits = Bits::default();
+        for _ in 0..blocks {
+            bits.put(0b100, 3); // BFINAL=0, BTYPE=10
+            bits.put(0, 5); // HLIT: 257 literal/length codes
+            bits.put(0, 5); // HDIST: 1 distance code
+            bits.put(14, 4); // HCLEN: 18 code-length codes
+            for &symbol in CLCL_ORDER.iter().take(18) {
+                bits.put(length_of(symbol), 3);
+            }
+            bits.code(0b11, 2); // literal 0: length 1
+            bits.code(0, 1); // 18: 138 zeros (literals 1..=138)
+            bits.put(138 - 11, 7);
+            bits.code(0, 1); // 18: 117 zeros (literals 139..=255)
+            bits.put(117 - 11, 7);
+            bits.code(0b11, 2); // end of block: length 1
+            bits.code(0b10, 2); // the one distance code: length 0
+            bits.code(1, 1); // end of block
+        }
+        bits.finish(tail)
+    }
+
+    /// `raw` as a zlib stream whose output is `tail`.
+    fn zlib_of(raw: &[u8], tail: &[u8]) -> Vec<u8> {
+        let mut zlib = vec![0x78, 0x01];
+        zlib.extend_from_slice(raw);
+        zlib.extend_from_slice(&adler32(tail).to_be_bytes());
+        zlib
+    }
+
+    #[test]
+    fn fixed_blocks_decode_with_one_pair_of_tables() {
+        use std::io::Read;
+        const BLOCKS: usize = 20_000;
+        const MEMBERS: usize = 1_000;
+        let raw = empty_fixed_blocks(BLOCKS, b"tail");
+        let zlib = zlib_of(&raw, b"tail");
+        // An empty gzip member: a final empty fixed block, CRC-32 0, length 0.
+        let member = [
+            0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3, 0x03, 0x00, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let gzip = member.repeat(MEMBERS);
+
+        let before = oracle::tables_built();
+        assert_eq!(inflate(&raw, 1 << 20).as_deref(), Ok(&b"tail"[..]));
+        let mut out = Vec::new();
+        stream::DeflateReader::new(raw.as_slice())
+            .read_to_end(&mut out)
+            .expect("raw stream");
+        assert_eq!(out, b"tail");
+        out.clear();
+        stream::ZlibReader::new(zlib.as_slice())
+            .read_to_end(&mut out)
+            .expect("zlib stream");
+        assert_eq!(out, b"tail");
+        out.clear();
+        stream::GzipReader::new(gzip.as_slice())
+            .read_to_end(&mut out)
+            .expect("gzip stream");
+        assert!(out.is_empty());
+        let built = oracle::tables_built() - before;
+        assert!(
+            built <= 2,
+            "{BLOCKS} empty fixed blocks, three ways, and {MEMBERS} gzip members built \
+             {built} Huffman tables: a fixed block decodes with the one shared pair"
+        );
+    }
+
+    #[test]
+    fn a_work_budget_refuses_block_headers_past_it_before_building_their_tables() {
+        use std::io::Read;
+        const BLOCKS: u64 = 1_000;
+        let read = |zlib: &[u8], budget: u64| {
+            let mut out = Vec::new();
+            stream::ZlibReader::with_work_budget(zlib, budget)
+                .read_to_end(&mut out)
+                .map(|_| out)
+        };
+        let too_much = |e: std::io::Error| {
+            e.kind() == std::io::ErrorKind::InvalidData
+                && e.get_ref()
+                    .and_then(|e| e.downcast_ref::<InflateError>())
+                    .is_some_and(|e| *e == InflateError::TooMuchWork)
+        };
+        let blocks = usize::try_from(BLOCKS).expect("a usize");
+        let dynamic = zlib_of(&empty_dynamic_blocks(blocks, b"tail"), b"tail");
+        let fixed = zlib_of(&empty_fixed_blocks(blocks, b"tail"), b"tail");
+        assert_eq!(
+            inflate(&empty_dynamic_blocks(blocks, b"tail"), 1 << 20).as_deref(),
+            Ok(&b"tail"[..]),
+            "the generated dynamic blocks are well formed"
+        );
+
+        // Each stream costs its blocks plus the final stored one.
+        let dynamic_cost = BLOCKS * DYNAMIC_HEADER_WORK + HEADER_WORK;
+        let fixed_cost = BLOCKS * HEADER_WORK + HEADER_WORK;
+        assert_eq!(
+            read(&dynamic, dynamic_cost).ok().as_deref(),
+            Some(&b"tail"[..])
+        );
+        assert_eq!(read(&fixed, fixed_cost).ok().as_deref(), Some(&b"tail"[..]));
+        assert!(read(&dynamic, dynamic_cost - 1).is_err_and(too_much));
+        assert!(read(&fixed, fixed_cost - 1).is_err_and(too_much));
+
+        let before = oracle::tables_built();
+        assert!(read(&dynamic, 10 * DYNAMIC_HEADER_WORK).is_err_and(too_much));
+        assert_eq!(
+            oracle::tables_built() - before,
+            30,
+            "ten dynamic headers built three tables each; the eleventh was refused first"
+        );
     }
 }

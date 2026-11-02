@@ -119,6 +119,21 @@ fn a_bad_tail_record_is_refused_not_guessed() {
         decode_tail_payload(&header(KIND_RESIZE, 0, 0, 23), &[0; 23]),
         Err(TailFault::BadLength)
     );
+    for (rows, cols) in [
+        (0u16, 80u16),
+        (24, 0),
+        (MAX_GRID_ROWS + 1, 80),
+        (24, MAX_GRID_COLS + 1),
+    ] {
+        let mut payload = [0u8; RESIZE_PAYLOAD];
+        payload[0..2].copy_from_slice(&rows.to_le_bytes());
+        payload[2..4].copy_from_slice(&cols.to_le_bytes());
+        assert_eq!(
+            decode_tail_payload(&header(KIND_RESIZE, 0, 0, 24), &payload),
+            Err(TailFault::BadLength),
+            "resize {rows}x{cols} must be refused"
+        );
+    }
     assert_eq!(
         decode_tail_payload(&header(KIND_RESIZES_LOST, 0, 0, 5), &[0; 5]),
         Err(TailFault::BadLength)

@@ -397,6 +397,57 @@ fn the_band_and_status_say_unchecked_until_a_witness_judges_and_faithful_only_on
     );
     assert_eq!(ago(3_725), "-1:02:05");
     assert_eq!(clock(-1_000, 0), "23:59:59");
+
+    // Across 2026-11-01 fall-back (PDT UTC-7 -> PST UTC-8 at 09:00Z), a screen from
+    // 2026-10-31 23:30:00 PDT (1_793_514_600_000) shows 23:30:00 rather than 22:30:00.
+    fn la_at(unix: i64) -> Option<i64> {
+        Some(if unix < 1_793_523_600 {
+            -7 * 3_600
+        } else {
+            -8 * 3_600
+        })
+    }
+    let mut dst_view = view_at((12, 20), Faith::Faithful);
+    dst_view.shown_unix_ms = 1_793_514_600_000;
+    let mut app = App::headless_for_test();
+    app.messages_wall = crate::messages_host::WallClock::Zone {
+        unix_ms: 1_793_563_200_000,
+        offset_at: la_at,
+    };
+    assert_eq!(app.rewind_offset_s(dst_view.shown_unix_ms), -7 * 3_600);
+    assert!(
+        band_text(
+            &dst_view,
+            1_793_563_200_000,
+            app.rewind_offset_s(dst_view.shown_unix_ms),
+            1_000,
+            None,
+        )
+        .contains("  23:30:00 ("),
+    );
+    app.pool.set_rewind(0, Some(dst_view));
+    app.note_rewind_withheld(0);
+    assert!(
+        app.messages
+            .live_by_key("session.rewind-read-only.0")
+            .is_some_and(|r| r.msg.title == "Rewind is showing 23:30:00"),
+    );
+
+    let dst_view = app.pool.set_rewind(0, None).expect("session 0 rewind");
+    let mut flat_app = App::headless_for_test();
+    flat_app.messages_wall = crate::messages_host::WallClock::Pinned {
+        unix_ms: 1_793_563_200_000,
+        offset_s: -8 * 3_600,
+    };
+    flat_app.pool.set_rewind(0, Some(dst_view));
+    flat_app.note_rewind_withheld(0);
+    assert!(
+        flat_app
+            .messages
+            .live_by_key("session.rewind-read-only.0")
+            .is_some_and(|r| r.msg.title == "Rewind is showing 22:30:00"),
+        "CONTROL: flat PST shifts the rewound PDT screen back an hour"
+    );
 }
 
 /// Start recording session 0 from its screen now: a keyframe of the live engine seeded on the spine.
@@ -1713,6 +1764,51 @@ fn effects_paused(app: &App) -> bool {
     app.windows[&WID].fx.cursor().momentum.aos_paused()
 }
 
+/// Opening Rewind while a typed key waits for its echo's proof stops the recording for it (a
+/// rewound pane can prove nothing) rather than pausing it mid-step, and taints the glow; with no
+/// key waiting it pauses, as the next test shows.
+#[test]
+fn opening_rewind_while_a_key_waits_for_its_echo_stops_the_recording() {
+    for held in [true, false] {
+        let mut app = crate::aos_repair_tests::momentum_app(false);
+        let t0 = hosted(&mut app);
+        crate::aos_repair_tests::leave_prompt(&app);
+        if held {
+            crate::aos_repair_tests::press(
+                &mut app,
+                crate::aos_repair_tests::glyph('k'),
+                t0 + std::time::Duration::from_millis(400),
+            );
+            assert!(
+                app.windows[&WID].fx.cursor().momentum.aos_holding(),
+                "fixture: held"
+            );
+        }
+        app.rewind_open(0, Target::Latest, None).expect("open");
+        let momentum = &app.windows[&WID].fx.cursor().momentum;
+        if held {
+            assert!(
+                !momentum.aos_attached(),
+                "the held key stopped the recording"
+            );
+            assert!(momentum.aos_tainted(), "and reached the glow unrecorded");
+            assert!(
+                app.aos_ls_now()
+                    .iter()
+                    .any(|l| l.ends_with(" detached why=raw_key")),
+                "{:?}",
+                app.aos_ls_now()
+            );
+            assert_eq!(app.windows[&WID].rewind_paused, None, "nothing to resume");
+        } else {
+            assert!(
+                effects_paused(&app),
+                "negative control: no key waits, it pauses"
+            );
+        }
+    }
+}
+
 /// Opening Rewind pauses the window's hosted effects and the band says so; closing resumes them, and with nothing attached nothing is paused.
 #[test]
 fn opening_rewind_pauses_the_windows_hosted_effects_and_closing_resumes_them() {
@@ -2313,13 +2409,8 @@ fn a_saved_export_is_private_and_leaves_the_chosen_folders_mode_alone() {
 
 /// The frames a person sees, as PNGs for them to read.
 #[test]
-#[ignore = "writes PNGs for a person to read: set ATERM_REWIND_GALLERY to a directory"]
 fn rewind_gallery() {
-    let Some(dir) = std::env::var_os("ATERM_REWIND_GALLERY") else {
-        return;
-    };
-    let dir = std::path::PathBuf::from(dir);
-    std::fs::create_dir_all(&dir).expect("the gallery directory");
+    let (dir, _gallery) = crate::scripted_redraw_fixture::gallery_directory("ATERM_REWIND_GALLERY");
     let mut app = scripted_app();
     start_recording(&app);
     // Spaced so the track spreads the instants over its row.

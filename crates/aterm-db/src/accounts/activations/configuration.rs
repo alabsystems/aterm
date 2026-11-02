@@ -4,6 +4,9 @@
 use super::*;
 use aterm_json::Value;
 
+#[cfg(test)]
+thread_local! {pub(super) static CAPTURES: std::cell::Cell<usize> = const {std::cell::Cell::new(0)};}
+
 /// An owned observation of the bounded, complete proposal closure matched to
 /// a root decision. It is not a permission by itself and does not stay current.
 /// No vault entry values are present: those remain in `Preparation::credential`.
@@ -15,23 +18,43 @@ pub struct Configuration {
 }
 
 impl Configuration {
-    pub(super) fn capture(paths: &Paths, record: &Record) -> Result<Self> {
-        let Action::Prepare(p) = &record.request().action else {
-            return Err(Error::new("account is stopped"));
+    pub(super) fn capture_until(
+        paths: &Paths,
+        record: &Record,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Self> {
+        Self::capture_request_until(paths, record.request(), deadline)
+    }
+
+    pub(super) fn capture_request_until(
+        paths: &Paths,
+        request: &Request,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Self> {
+        #[cfg(test)]
+        CAPTURES.with(|count| count.set(count.get() + 1));
+        let (table, key, configuration, provider, method) = match &request.action {
+            Action::Prepare(p) => (p.table, &p.key, p.configuration, &p.provider, &p.method),
+            Action::Intent(p) => (p.table, &p.key, p.configuration, &p.provider, &p.method),
+            Action::Stop => return Err(Error::new("account is stopped")),
         };
-        let snapshot = super::super::proposals::Proposals::at(paths.clone()).snapshot()?;
-        let plan = super::super::plans::inspect(&snapshot, &p.key)?;
-        let digest = aterm_codec::hex::encode_lower(&p.configuration);
+        let proposals = match deadline {
+            Some(deadline) => super::super::proposals::Proposals::at_until(paths.clone(), deadline),
+            None => super::super::proposals::Proposals::at(paths.clone()),
+        };
+        let snapshot = proposals.snapshot()?;
+        let plan = super::super::plans::inspect(&snapshot, key)?;
+        let digest = aterm_codec::hex::encode_lower(&configuration);
         let row = snapshot
             .cells
-            .get(&("accounts".into(), p.key.clone()))
+            .get(&("accounts".into(), key.clone()))
             .and_then(|c| c.candidates.first())
             .ok_or_else(|| Error::new("account proposal is missing"))?;
         if plan["complete"].as_bool() != Some(true)
-            || snapshot.scope.digest() != p.table
+            || snapshot.scope.digest() != table
             || plan["configuration_digest"].as_str() != Some(digest.as_str())
-            || row.value["provider"].as_str() != Some(p.provider.as_str())
-            || row.value["method"].as_str() != Some(p.method.as_str())
+            || row.value["provider"].as_str() != Some(provider.as_str())
+            || row.value["method"].as_str() != Some(method.as_str())
         {
             return Err(Error::new(
                 "account proposal does not match its preparation decision",
@@ -58,13 +81,13 @@ impl Configuration {
             }
             values.insert(key, cell.candidates[0].value.clone());
         }
-        if !values.contains_key(&("accounts".into(), p.key.clone())) {
+        if !values.contains_key(&("accounts".into(), key.clone())) {
             return Err(Error::new("account plan omitted its selected account"));
         }
         Ok(Self {
             scope: snapshot.scope,
-            key: p.key.clone(),
-            digest: p.configuration,
+            key: key.clone(),
+            digest: configuration,
             values,
         })
     }

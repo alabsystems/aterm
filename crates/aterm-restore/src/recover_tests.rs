@@ -5,6 +5,7 @@ use super::*;
 use crate::records::CHUNK_LINES;
 use crate::store::{RegionStore, VecStore};
 use crate::writer::{JournalWriter, KeyframeInput, WriteError, WriterIdentity};
+use aterm_core::grid::{MAX_GRID_COLS, MAX_GRID_ROWS};
 use aterm_spec::rng::XorShift;
 
 const WRITER: WriterIdentity<'static> = WriterIdentity {
@@ -1738,6 +1739,22 @@ fn an_import_decodes_only_the_chunks_it_takes_within_the_newest_bound() {
     let take = carried_from - newest.first;
     assert_eq!(take, 40);
     assert_eq!(lines_of(&newest, take), live_lines(newest.first, take));
+
+    let inverted = RingExport {
+        fence: aterm_core::grid::HistoryFence {
+            oldest: 20,
+            end: 10,
+            ..export.fence
+        },
+        first: 20,
+        lines: 0,
+        skip: u64::MAX - 2,
+    };
+    let clamped = inverted.newest(5);
+    assert_eq!(clamped.first, 20);
+    assert_eq!(clamped.fence.end, 20);
+    assert_eq!(clamped.lines, 0);
+    assert_eq!(clamped.skip, u64::MAX - 2);
 }
 
 #[test]

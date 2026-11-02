@@ -185,6 +185,10 @@ fn recorded_continuity_tolerates_one_dark_frame_and_refuses_two() {
     let mut dead_start = lit_video();
     dead_start.driven.mature_lead_us = 3_000_000;
     assert_eq!(verdict(&ink, &ledger, &dead_start), ShapeVerdict::Fail);
+    let mut extreme = lit_video();
+    extreme.driven.dark_us = i64::MAX;
+    extreme.driven.nominal_dt_us = i64::MAX;
+    assert_eq!(verdict(&ink, &ledger, &extreme), ShapeVerdict::Pass);
 }
 
 #[test]
@@ -562,6 +566,10 @@ fn a_reach_row_is_red_for_a_body_too_short_or_too_tall() {
         ShapeVerdict::Pass,
         "a row with no reach is not judged on one"
     );
+    assert!(Reach::Tall.holds(usize::MAX, usize::MAX));
+    assert!(!Reach::Underline.holds(usize::MAX, usize::MAX));
+    assert!(Companion::Pet.height_holds(usize::MAX, usize::MAX));
+    assert!(Companion::Cat.height_holds(usize::MAX, usize::MAX));
 }
 
 #[test]

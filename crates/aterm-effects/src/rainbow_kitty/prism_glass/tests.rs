@@ -6,7 +6,7 @@
 use super::scan::{Columns, Ground, LAY_LEG, SLAB_DENSITIES, all_lerps, scan};
 use super::*;
 
-/// The glass pages: the first six shipped.
+/// The glass pages: the first five shipped.
 fn glass_pages() -> impl Iterator<Item = &'static Palette> {
     tables::SHIPPED.iter().filter(|p| p.mode == Mode::Glass)
 }
@@ -170,8 +170,8 @@ fn the_shipped_tables_are_the_generators_output() {
     let modes: Vec<Mode> = solved.iter().map(|p| p.mode).collect();
     assert_eq!(
         modes,
-        [[Mode::Glass; 6].as_slice(), &[Mode::LipForward; 2]].concat(),
-        "six glass pages, then Solarized Light and Catppuccin Latte lip-forward"
+        [[Mode::Glass; 5].as_slice(), &[Mode::LipForward; 3]].concat(),
+        "five glass pages, then Gruvbox Light, Solarized Light and Catppuccin Latte lip-forward"
     );
     let want = render(&solved);
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -251,18 +251,39 @@ fn the_pack_light_pages_are_the_manifests_light_rows() {
     assert_eq!(light, want);
 }
 
-/// §1: the glass anchors on Default Light are the spec's hex, but for the blue anchor, which
-/// the solver lays a hair greener than the spec's `#14acff` (its hue is the spec hex's).
+/// §1 as `docs/design/PRISM-GLASS.md` §15.8 amendment 49 amends it: the glass anchors on
+/// Default Light, solved so the theme fg's glyph as it is seen keeps the bar plus
+/// [`SOLVE_GUARD`], the window's thinnest glyph's ([`colour::THIN_INK_SHARE`]). The yellow,
+/// green and cyan anchors keep the spec's hex (their cusp lies over the floor); the red, orange,
+/// blue, lilac and magenta ones, which sit at the floor, are lighter than the spec's `#ff7a7a`,
+/// `#ff8b00`, `#14acff`, `#bc8cff` and `#fc66f3`, which the bare fg solved. Every anchor keeps
+/// its hex's hue and C ≥ [`HEADROOM_C`], the HEADROOM gate's read ([`headroom`]).
 #[test]
-fn default_lights_glass_anchors_are_the_spec_hex() {
+fn default_lights_glass_anchors_are_solved_against_the_seen_glyph() {
     let (fg, bg) = (0x002B_2D33, 0x00F6_F7F9);
     let got = glass_anchors(fg, bg).map(Option::unwrap);
     let mut want = GLASS_ANCHORS;
-    want[5] = 0x000E_ACFF;
+    want[0] = 0x00FF_8B89;
+    want[1] = 0x00FF_9125;
+    want[5] = 0x0044_B5FF;
+    want[6] = 0x00C3_99FF;
+    want[7] = 0x00FF_79F6;
     assert_eq!(
         got.map(|c| format!("{c:06x}")),
         want.map(|c| format!("{c:06x}"))
     );
+    for (k, (&c, &a)) in got.iter().zip(&GLASS_ANCHORS).enumerate() {
+        assert!(
+            colour::seen(fg, bg, c) >= glass_bar(fg, bg) + SOLVE_GUARD,
+            "anchor {k} #{c:06x} keeps the seen glyph's floor"
+        );
+        assert!(
+            (lch(c).h - lch(a).h).abs() < 1.5,
+            "anchor {k} #{c:06x} keeps #{a:06x}'s hue"
+        );
+    }
+    assert!(got.iter().all(|&c| lch(c).c >= HEADROOM_C));
+    assert!(headroom(fg, bg));
 }
 
 /// §3 `glass-legibility-bar`, the light partner of `bed-legibility-bar`: on every glass page,
@@ -309,7 +330,58 @@ fn the_light_glass_keeps_every_glyph_at_its_bar_at_every_alpha() {
             }
         }
     }
-    assert_eq!(pages, 6);
+    assert_eq!(pages, 5);
+}
+
+/// §3 `glass-legibility-bar`'s low-contrast leg (`docs/design/PRISM-GLASS.md` §15.8 amendment
+/// 55): the bar is [`GLASS_BAR`], or [`PAGE_SHARE`] of the theme fg's own reading on its page
+/// when that is lower, read as every reading the bar bars is, by [`colour::seen`]. The leg binds
+/// on the census's low-contrast pages, and on each of them the fg as it is seen on its own page
+/// keeps the bar, so a glass as light as the page would keep it. Negative control: on each of
+/// them [`PAGE_SHARE`] of the bare contrast, the bar before amendment 55, lies over the fg's own
+/// seen reading, so no glass, which is never lighter than the page, could keep that bar.
+#[test]
+fn the_low_contrast_bar_is_a_share_of_the_fgs_own_seen_reading() {
+    let mut bound = Vec::new();
+    for p in census_pages() {
+        let own = colour::seen(p.fg, p.bg, p.bg);
+        let bar = glass_bar(p.fg, p.bg);
+        assert_eq!(
+            bar.to_bits(),
+            GLASS_BAR.min(PAGE_SHARE * own).to_bits(),
+            "{}",
+            name(p)
+        );
+        if bar < GLASS_BAR {
+            bound.push(name(p));
+            assert!(own >= bar, "{}: {own:.4} under {bar:.4}", name(p));
+            let bare = PAGE_SHARE * contrast(p.fg, p.bg);
+            assert!(
+                own < bare,
+                "negative control: on {} the bare leg {bare:.4} is under the fg's own seen \
+                 reading {own:.4}",
+                name(p)
+            );
+        }
+    }
+    assert_eq!(
+        bound,
+        [
+            "Solarized Light",
+            "Catppuccin Latte",
+            "Dawnfox",
+            "Kanagawa Lotus",
+            "TokyoNight Day",
+            "#e7e7e7",
+            "#e6e7ed",
+            "#eee8b8",
+            "#eff0f6",
+        ],
+        "the leg binds on lip-forward pages alone"
+    );
+    for p in census_pages().filter(|p| bound.contains(&name(p))) {
+        assert_eq!(p.mode, Mode::LipForward, "{}", name(p));
+    }
 }
 
 /// Every table a shipped page draws from, by name.
@@ -509,6 +581,60 @@ fn every_caret_lerp_keeps_its_cut_out() {
     }
 }
 
+/// §1's HEADROOM gate read at the glass a page draws (`docs/design/PRISM-GLASS.md` §15.8
+/// amendment 52): on every census page that takes glass, every anchor of its arc table (which the
+/// lift never moves, so it is the drawn glass at each anchor) keeps C ≥ [`HEADROOM_C`]. The
+/// negative control is the read amendment 49 gave the gate: Gruvbox Light's anchors solved to the
+/// bar alone for a glyph of full ink keep C ≥ [`HEADROOM_C`], so that read admitted the page,
+/// while the anchors it draws (#ffa7a3, #77c6ff and #cfb0ff among them) fall under it, a pastel
+/// glass the gate exists to refuse; read at the drawn anchors, the page is lip-forward.
+#[test]
+fn every_glass_pages_drawn_anchors_keep_headroom_c() {
+    let mut glass = 0;
+    for p in census_pages().filter(|p| p.mode == Mode::Glass) {
+        glass += 1;
+        for (k, &at) in ANCHOR_AT.iter().enumerate() {
+            let c = p.glass_arc[at];
+            assert!(
+                lch(c).c >= HEADROOM_C,
+                "{} anchor {k} #{c:06x}: C {:.4}",
+                name(p),
+                lch(c).c
+            );
+        }
+    }
+    assert!(glass >= 5, "{glass} glass pages");
+    let (fg, bg) = (0x003C_3836, 0x00FB_F1C7);
+    let bar_alone = ANCHOR_AT.map(|at| {
+        glass_point(
+            fg,
+            bg,
+            at as f64 / (ARC_LEN - 1) as f64,
+            (glass_bar(fg, bg), 0.0),
+        )
+        .map(|(l, h)| glass_at(l, h))
+    });
+    assert!(
+        bar_alone
+            .iter()
+            .all(|a| a.is_some_and(|c| lch(c).c >= HEADROOM_C)),
+        "negative control: read at the bar alone, Gruvbox Light keeps its headroom"
+    );
+    let drawn = glass_anchors(fg, bg);
+    assert!(
+        drawn
+            .iter()
+            .any(|a| a.is_none_or(|c| lch(c).c < HEADROOM_C)),
+        "Gruvbox Light's drawn anchors: {:?}",
+        drawn.map(|a| a.map(|c| format!("#{c:06x} C {:.4}", lch(c).c)))
+    );
+    assert!(!headroom(fg, bg));
+    assert_eq!(
+        Palette::shipped(fg, bg).map(|p| p.mode),
+        Some(Mode::LipForward)
+    );
+}
+
 /// §1: a page whose glass anchors lose their chroma at the floor has no headroom and draws no
 /// glass, only its lip; and a page that is not light draws nothing. On every census page that
 /// draws lip-forward, every lip129 and lip511 entry keeps [`LIP_FORWARD_CR`] against the page, or
@@ -516,13 +642,13 @@ fn every_caret_lerp_keeps_its_cut_out() {
 /// colours the LIP-FORWARD AMBER HOLD (at h 58.5) and the CYAN FOLD lay are held to the full bar.
 #[test]
 fn a_theme_without_headroom_draws_no_glass() {
-    let mut lip_forward = 0;
+    let mut lip_forward = Vec::new();
     for p in census_pages() {
         assert_eq!(headroom(p.fg, p.bg), p.mode == Mode::Glass, "{}", name(p));
         if p.mode != Mode::LipForward {
             continue;
         }
-        lip_forward += 1;
+        lip_forward.push(name(p));
         assert!(
             p.glass.iter().chain(&p.glass_arc).all(|&c| c == 0),
             "{}",
@@ -546,8 +672,24 @@ fn a_theme_without_headroom_draws_no_glass() {
         }
     }
     assert_eq!(
-        lip_forward, 10,
-        "two shipped pages, four pack pages and the sweep's four draw lip-forward"
+        lip_forward,
+        [
+            "Gruvbox Light",
+            "Solarized Light",
+            "Catppuccin Latte",
+            "Dawnfox",
+            "Dayfox",
+            "Iceberg Light",
+            "Kanagawa Lotus",
+            "Melange Light",
+            "TokyoNight Day",
+            "#e7e7e7",
+            "#e6e7ed",
+            "#eee8b8",
+            "#eff0f6",
+        ],
+        "three shipped pages, six pack pages and the sweep's four draw lip-forward: read on the \
+         drawn anchors, Gruvbox Light, Dayfox and Iceberg Light lose their headroom"
     );
     let dark = solve(0x00DC_DFE4, 0x0028_2C34);
     assert_eq!(dark.mode, Mode::Paper);

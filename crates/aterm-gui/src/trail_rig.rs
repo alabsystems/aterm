@@ -268,6 +268,26 @@ impl TrailRig {
         Ok(())
     }
 
+    /// The window's backing scale `scale` at `at`, as a window moved to a display of that scale
+    /// takes it: its font laid `scale` times the App's size, so its cells are `scale` times the
+    /// 1x cells, and the renderer re-tuned to it as a redraw re-tunes it
+    /// (`App::apply_window_scale`). The rig's window keeps its padding (none), as a config reload
+    /// keeps a headless window's, so its frame is `scale` times the 1x frame and `pointer` and
+    /// `press` name the same cell at twice the pixels on a scale-2 display. Every config the rig
+    /// admits after keeps the scale, each window's font following its scale. The window keeps
+    /// its pixel size, so lay the grid again after.
+    pub fn scale(&mut self, scale: f64, at: Instant) {
+        self.at(at, |app, wid| {
+            let font_px = font_px_for_scale(app.font_size, scale);
+            let Some(ws) = app.windows.get_mut(&wid) else {
+                return;
+            };
+            ws.scale = scale;
+            ws.metrics.font_px = font_px;
+            app.apply_window_scale(wid);
+        });
+    }
+
     /// The panel's refresh rate, as the window's monitor would report it.
     pub fn panel_hz(&mut self, hz: u32) {
         if let Some(ws) = self.app.windows.get_mut(&self.wid) {

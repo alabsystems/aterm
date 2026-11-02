@@ -51,6 +51,159 @@ impl Paths {
         self.root.join("run")
     }
 
+    /// Create the run directory if missing and set this user's plain directory to `0700`.
+    /// Readable directories are judged and narrowed through a no-follow descriptor. Darwin
+    /// can also repair an owned unreadable directory by no-follow chmod relative to its held
+    /// parent, then reopening and checking the same identity; that pre/post check is not an
+    /// atomic pathname identity claim.
+    ///
+    /// # Errors
+    /// Creation or opening fails, the directory belongs to another user, or its mode cannot
+    /// be set to `0700` and read back. On other Unix hosts, opening an unreadable directory
+    /// may fail; Darwin's parent-anchored no-follow repair can admit an owned `000` directory.
+    pub(crate) fn prepare_run_dir(&self) -> Result<PathBuf, String> {
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+
+        let run = self.run_dir();
+        let why = |operation, e| format!("{}: {operation}: {e}", run.display());
+        std::fs::create_dir_all(&self.root).map_err(|e| why("create state parents", e))?;
+        match std::fs::create_dir(&run) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(why("create run directory", e)),
+        }
+        let opening = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(&run);
+        let dir = match opening {
+            Ok(dir) => dir,
+            #[cfg(target_vendor = "apple")]
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                self.repair_unreadable_run_dir()?
+            }
+            Err(error) => return Err(why("open run directory", error)),
+        };
+        let metadata = dir
+            .metadata()
+            .map_err(|e| why("read opened directory metadata", e))?;
+        if !metadata.is_dir() || metadata.uid() != aterm_uds::peer::our_uid() {
+            return Err(format!(
+                "{}: not this user's plain directory",
+                run.display()
+            ));
+        }
+        dir.set_permissions(std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| why("set opened directory mode", e))?;
+        let narrowed = dir
+            .metadata()
+            .map_err(|e| why("read narrowed directory mode", e))?;
+        if narrowed.mode() & 0o7777 != 0o700 {
+            return Err(format!(
+                "{}: the run directory did not become 0700",
+                run.display()
+            ));
+        }
+        Ok(run)
+    }
+
+    /// Darwin's unreadable-owned repair. The final name is never followed, including at the
+    /// chmod, and its identity is rechecked after reopening; a replacement is refused.
+    #[cfg(target_vendor = "apple")]
+    fn repair_unreadable_run_dir(&self) -> Result<std::fs::File, String> {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+        let run = self.run_dir();
+        let why = |operation, error| format!("{}: {operation}: {error}", run.display());
+        // The root is an ancestor of run, so its existing alias policy is preserved.
+        let parent = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(&self.root)
+            .map_err(|error| why("open run parent", error))?;
+        // SAFETY: libc::stat is plain writable data; zero is valid initial storage.
+        let mut before: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: parent is held, the component is a static NUL-terminated string, and before
+        // is writable. AT_SYMLINK_NOFOLLOW judges the component itself, never a link's target.
+        if unsafe {
+            libc::fstatat(
+                parent.as_raw_fd(),
+                c"run".as_ptr(),
+                &raw mut before,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(why(
+                "judge unreadable run directory",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        if before.st_mode & libc::S_IFMT != libc::S_IFDIR
+            || before.st_uid != aterm_uds::peer::our_uid()
+            || before.st_mode & 0o400 != 0
+        {
+            return Err(format!(
+                "{}: not this user's unreadable directory",
+                run.display()
+            ));
+        }
+        // SAFETY: The held parent and fixed component remain valid. Darwin implements the
+        // final no-follow flag: a replacement link's target cannot be chmodded. Name identity
+        // can still change between calls; the reopened descriptor is checked below.
+        if unsafe {
+            libc::fchmodat(
+                parent.as_raw_fd(),
+                c"run".as_ptr(),
+                0o700,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(why(
+                "repair unreadable run mode without following",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: The component and parent are live; flags require a plain directory and do
+        // not create or truncate anything. A successful descriptor is exclusively owned below.
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                c"run".as_ptr(),
+                libc::O_RDONLY
+                    | libc::O_DIRECTORY
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK
+                    | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(why(
+                "open repaired run directory",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: openat returned this fresh descriptor; File now owns its one close.
+        let dir = unsafe { std::fs::File::from_raw_fd(fd) };
+        let after = dir
+            .metadata()
+            .map_err(|error| why("read repaired directory metadata", error))?;
+        if !after.is_dir()
+            || after.uid() != aterm_uds::peer::our_uid()
+            || after.dev() != before.st_dev as u64
+            || after.ino() != before.st_ino as u64
+            || after.mode() & 0o7777 != 0o700
+        {
+            return Err(format!(
+                "{}: unreadable run directory changed during repair",
+                run.display()
+            ));
+        }
+        Ok(dir)
+    }
+
     /// `run/aterm-linux.sock`.
     #[must_use]
     pub fn socket(&self) -> PathBuf {
@@ -733,5 +886,93 @@ mod tests {
         assert!(DiskLock::try_take(&path).unwrap().is_none(), "held");
         drop(first);
         assert!(DiskLock::try_take(&path).unwrap().is_some(), "let go");
+
+        let link = dir.path().join("linked.img.lock");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(
+            DiskLock::try_take(&link).is_err(),
+            "a symlink lock path must be refused"
+        );
+    }
+
+    #[test]
+    fn the_run_directory_is_owned_and_repaired_to_0700() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("vz")
+            .tempdir_in("/tmp")
+            .expect("a scratch folder short enough for sun_path");
+        let paths = Paths::at(scratch.path().join("state"));
+        let run = paths
+            .prepare_run_dir()
+            .expect("create the private run directory");
+        assert_eq!(std::fs::metadata(&run).unwrap().mode() & 0o7777, 0o700);
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o755)).unwrap();
+        paths.prepare_run_dir().expect("narrow the owned directory");
+        assert_eq!(std::fs::metadata(&run).unwrap().mode() & 0o7777, 0o700);
+        #[cfg(target_vendor = "apple")]
+        {
+            std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o0)).unwrap();
+            assert_eq!(std::fs::metadata(&run).unwrap().mode() & 0o7777, 0);
+            paths
+                .prepare_run_dir()
+                .expect("repair the unreadable owned directory");
+            assert_eq!(std::fs::metadata(&run).unwrap().mode() & 0o7777, 0o700);
+        }
+
+        std::fs::rename(&run, run.with_file_name("kept-directory")).unwrap();
+        std::fs::write(&run, b"owned file, not a run directory").unwrap();
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let before = std::fs::metadata(&run).unwrap().mode();
+        assert!(paths.prepare_run_dir().is_err(), "a plain file is refused");
+        assert_eq!(std::fs::metadata(&run).unwrap().mode(), before);
+        assert_eq!(
+            std::fs::read(&run).unwrap(),
+            b"owned file, not a run directory"
+        );
+    }
+
+    #[test]
+    fn helper_setup_refuses_a_linked_run_directory_without_changing_its_target() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("vz")
+            .tempdir_in("/tmp")
+            .expect("a scratch folder short enough for sun_path");
+        let paths = Paths::at(scratch.path().join("state"));
+        std::fs::create_dir_all(paths.root()).unwrap();
+        paths
+            .checked_socket()
+            .expect("the fixture fits the helper socket path");
+        let run = paths.run_dir();
+        let outside = scratch.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o750)).unwrap();
+        let before = std::fs::metadata(&outside).unwrap().mode();
+        std::os::unix::fs::symlink(&outside, &run).unwrap();
+        let ident = crate::helper::Ident {
+            pid: 4242,
+            uniq: 77,
+            birth_us: BIRTH,
+            helper_sha256: "ab".repeat(32),
+            live_disk: paths.live_disk(),
+        };
+        let attempted = crate::helper::take(&paths, &ident, &Script::of([]));
+        let refused = attempted.is_err();
+        drop(attempted);
+        assert_eq!(std::fs::metadata(&outside).unwrap().mode(), before);
+        assert!(
+            refused,
+            "a linked run directory is refused before helper setup"
+        );
+        assert!(
+            std::fs::symlink_metadata(&run)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
     }
 }

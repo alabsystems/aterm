@@ -79,6 +79,39 @@ pub struct Ctx {
     pub hosts: Hosts,
     /// The roster generation this context's packs sign under, elected once and shared across clones.
     pub(crate) elected: Arc<Mutex<Option<Arc<crate::artifact::sign::Authority>>>>,
+    /// The choice this context's hosts were built with (§16.1). `pub(crate)`, not private,
+    /// because `channel/group.rs` builds `Ctx { trust_repo, ..ctx.clone() }`.
+    pub(crate) host_choice: HostChoice,
+}
+
+/// Which hosts a run builds (§16.1): `gh` is today's, and the default until WP15.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HostChoice {
+    /// `RestHost` for both hosts.
+    #[default]
+    Gh,
+    /// `AghHost` for staging, `RestHost` for the channel: the staging passes of §16.1.
+    AghStaging,
+    /// `AghHost` for both hosts.
+    Agh,
+}
+
+impl HostChoice {
+    /// `gh`, `agh-staging`, `agh`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        // WP12 writes the spellings (plan §16); until then the choice has none.
+        let _ = self;
+        ""
+    }
+
+    /// The choice `text` names.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<HostChoice> {
+        // WP12 writes the parse (plan §16); until then no text names a choice.
+        let _ = text;
+        None
+    }
 }
 
 impl Ctx {
@@ -146,6 +179,58 @@ impl Ctx {
             now_unix,
             hosts,
             elected: Arc::default(),
+            host_choice: HostChoice::Gh,
+        }
+    }
+
+    /// [`Ctx::from_env`] with `hosts` (§16.1). `from_env()` is `from_env_hosts(HostChoice::Gh)`.
+    ///
+    /// # Errors
+    ///
+    /// As `from_env`; under `AghStaging` or `Agh`, a could-not-run naming agh.toml when it is
+    /// missing or invalid (design §10.3's text), after raising the need (§4.6.15).
+    pub fn from_env_hosts(hosts: HostChoice) -> Result<Self> {
+        let _ = hosts;
+        Err(Error::cannot_run(
+            "not yet: Ctx::from_env_hosts lands in WP12",
+        ))
+    }
+
+    /// What `from_env_hosts` builds once it has read the environment and the clock: the
+    /// context of `home`, its XDG directories and `now_unix`, with `hosts`' hosts. Tests call
+    /// it over a scratch home; `from_env_hosts` reads `HOME`, `XDG_CONFIG_HOME`,
+    /// `XDG_STATE_HOME` and the clock as `from_env` does, then calls it.
+    ///
+    /// # Errors
+    ///
+    /// As `from_env_hosts`.
+    pub fn from_home_hosts(
+        home: &Path,
+        xdg_config_home: Option<&Path>,
+        xdg_state_home: Option<&Path>,
+        now_unix: i64,
+        hosts: HostChoice,
+    ) -> Result<Self> {
+        let _ = (home, xdg_config_home, xdg_state_home, now_unix, hosts);
+        Err(Error::cannot_run(
+            "not yet: Ctx::from_home_hosts lands in WP12",
+        ))
+    }
+
+    /// The choice this context's hosts were built with.
+    #[must_use]
+    pub fn host_choice(&self) -> HostChoice {
+        self.host_choice
+    }
+
+    /// Tests: the same context, marked as built for `choice`. The hosts stay the test's own (an
+    /// `AghHost` over agh-fake, a `FakeHost`); only the pre-claim checks read the mark.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn with_host_choice(self, choice: HostChoice) -> Ctx {
+        Ctx {
+            host_choice: choice,
+            ..self
         }
     }
 

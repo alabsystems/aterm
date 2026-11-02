@@ -92,6 +92,7 @@ pub fn spawn_cloexec_default(program: &str, args: &[&str]) -> io::Result<u32> {
     }
     let mut pid: i32 = 0;
     if result.is_ok() {
+        let _spawning = crate::spawn_lock::spawning();
         // SAFETY: `argv` is NUL-terminated and its strings outlive the call;
         // `environ` is the process environment block.
         let rc = unsafe {

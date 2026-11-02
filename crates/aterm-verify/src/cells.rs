@@ -99,6 +99,101 @@ pub fn selected_in(own: &BTreeSet<String>, scope: &crate::scope::Scope) -> Vec<S
         .collect()
 }
 
+/// Whether a cell compiles only part of its graph: under `-p`, and in a run the selection pulled
+/// ([`crate::checks::pulls_cells`]), every cell but the browser's. Whatever names `cells` with no
+/// `-p`, and `--all`, compiles the whole graph: no other check does, `ship release` included. A
+/// browser cell's roots turn its crates' default features off, so a crate named alone there is a
+/// build nothing ships, and it only lints.
+#[must_use]
+pub fn narrows(triple: &str, scope: &crate::scope::Scope, pulled: bool) -> bool {
+    use crate::scope::Scope;
+    !triple.starts_with("wasm32")
+        && match scope {
+            Scope::Workspace => false,
+            Scope::Packages(_) => true,
+            Scope::Changed(_) => pulled,
+        }
+}
+
+/// The roots of a depth-prefixed `targo tree` forest ([`test_tree`]) that reach any of `seeds`, the
+/// seeds' own included: a member's dependents on this cell's triple, dev edges included. The change
+/// cone is closed over this machine's edges, so it cannot hold a dependent only another OS has
+/// (`aterm-gui` on `aterm-x11`, the Windows crates on `aterm-win32`), which only this graph names.
+///
+/// # Errors
+/// A line forge cannot read.
+pub fn dependents_in_forest(
+    text: &str,
+    seeds: &BTreeSet<String>,
+) -> Result<BTreeSet<String>, String> {
+    let mut found = BTreeSet::new();
+    let mut root = None;
+    for raw in text.lines() {
+        let Some(line) = aterm_forge::resolve::parse_line(raw)? else {
+            continue;
+        };
+        if line.depth == 0 {
+            root = Some(line.id.name.clone());
+        }
+        if seeds.contains(&line.id.name)
+            && let Some(root) = &root
+        {
+            found.insert(root.clone());
+        }
+    }
+    Ok(found)
+}
+
+/// The crates a [`narrows`] lint names: of `own`, the `wanted` members this cell compiles for its
+/// own target. `not_owed` (host code) is built for this machine in the cell's graph, so naming it
+/// would compile it for a target it never ships on.
+#[must_use]
+pub fn narrowed_lint(
+    own: &BTreeSet<String>,
+    not_owed: &BTreeSet<String>,
+    members: &BTreeSet<String>,
+    wanted: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    own.iter()
+        .filter(|name| {
+            wanted.contains(*name) && members.contains(*name) && !not_owed.contains(*name)
+        })
+        .cloned()
+        .collect()
+}
+
+/// A `-p` naming no workspace member, which a cell cannot narrow to, so a green would mean
+/// nothing: a typo, a crate's directory where its package has another name, a vendored crate or a
+/// dependency.
+#[must_use]
+pub fn unknown_packages(scope: &crate::scope::Scope, members: &BTreeSet<String>) -> Vec<String> {
+    match scope {
+        crate::scope::Scope::Packages(named) => named
+            .iter()
+            .filter(|spec| {
+                !crate::scope::spec_name(spec).is_some_and(|name| members.contains(name))
+            })
+            .cloned()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// `-p <spec>` for each of `names`, spelled as `scope` names it ([`crate::scope::Scope::spec_of`]).
+#[must_use]
+pub fn package_args<'a>(
+    names: impl IntoIterator<Item = &'a String>,
+    scope: &crate::scope::Scope,
+) -> Vec<String> {
+    names
+        .into_iter()
+        .flat_map(|name| {
+            let spec = scope.spec_of(name).unwrap_or_else(|| name.clone());
+            ["-p".to_string(), spec]
+        })
+        .collect()
+}
+
 /// The cells a run checks: each `--cell` named, else [`foreign_cells`] of `host`.
 ///
 /// # Errors
@@ -213,7 +308,7 @@ pub fn parse_policy(text: &str) -> Result<Vec<Shim>, String> {
 pub enum CellOutcome {
     /// Every obligation held: the row's summary.
     Checked(String),
-    /// A pulled run's cell whose graph holds none of the selected crates ([`selected_in`]):
+    /// A narrowed cell ([`narrows`]) or a pulled one with nothing selected to build for its target:
     /// the selection cannot change what it compiles, so nothing was compiled.
     Unselected,
     /// Nothing was compiled: why, and the install that clears it.
@@ -269,12 +364,24 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
                 .join(", ")
         ));
     }
+    let mut members: Option<Result<Members, String>> = None;
+    if let Ok(known) = members.get_or_insert_with(|| member_names(ctx)) {
+        let unknown = unknown_packages(&ctx.scope, &known.names);
+        if !unknown.is_empty() {
+            r.cannot_run(format!(
+                "cells — -p {} is no workspace member's package name, so no cell can narrow to it \
+                 (a directory can have another name; vendored crates and dependencies are not \
+                 members, and `verify cells` with no -p checks them in the whole graph)",
+                unknown.join(", ")
+            ));
+            return;
+        }
+    }
     let row = aterm_uds::host::tool("rustup");
     let rustup = row.locate_in(&aterm_uds::host::Lookup {
         path: Some(ctx.env.path.clone()),
         ..aterm_uds::host::Lookup::host(row)
     });
-    let mut members: Option<Result<Members, String>> = None;
     for cell in &cells {
         let label = format!("cell {} ({})", cell.name, cell.triple);
         let started = Instant::now();
@@ -295,8 +402,8 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
         let took = format!("{label}: {}s", started.elapsed().as_secs());
         match outcome {
             CellOutcome::Unselected => r.pass(format!(
-                "{label} — none of the selection's crates is in its graph, so the selection \
-                 cannot change what it compiles"
+                "{label} — the selection holds nothing this cell builds for its target, so it \
+                 cannot change what the cell compiles (--all checks the whole graph)"
             )),
             CellOutcome::Checked(summary) => {
                 r.pass(format!("{label} — {summary}"));
@@ -315,11 +422,7 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
             }
         }
     }
-    let subjects = !ctx.cells_pulled
-        || WIN32_ORACLE_SUBJECTS
-            .iter()
-            .any(|p| ctx.scope.includes_crate(p));
-    if runs_win32_oracles(&cells) && subjects {
+    if owes_win32_oracles(&cells, &ctx.scope, ctx.cells_pulled) {
         win32_oracles(ctx, r, rustup.as_ref().err());
     }
     audit_policy(ctx, r, &policy, &cells);
@@ -340,14 +443,27 @@ pub const WIN32_ORACLES: [(&str, &str); 2] = [
 
 /// The packages the [`WIN32_ORACLES`] judge: `crates/aterm-win32`, and the windows-sys facades
 /// (`crates/aterm-windows-sys`, which re-exports it, and `crates/aterm-windows-sys-052`), each
-/// the package `windows-sys`. A pulled run ([`pulled_cells`]) runs the oracles only for a
-/// selection holding one: they judge those crates alone (255 s cold here, 2026-10-26).
-pub const WIN32_ORACLE_SUBJECTS: [&str; 2] = ["aterm-win32", "windows-sys"];
+/// the package `windows-sys`, and `aterm-win32-oracle` itself, which only they run. A pulled or
+/// `-p` run owes the oracles only for a selection holding one: they judge those crates alone
+/// (255 s cold here, 2026-10-26).
+pub const WIN32_ORACLE_SUBJECTS: [&str; 3] = ["aterm-win32", "windows-sys", "aterm-win32-oracle"];
 
 /// Does this run check a Windows cell, which brings the [`WIN32_ORACLES`]?
 #[must_use]
 pub fn runs_win32_oracles(cells: &[Cell]) -> bool {
     cells.iter().any(|c| c.triple.ends_with("-pc-windows-msvc"))
+}
+
+/// Does this run owe the [`WIN32_ORACLES`]? It checks a Windows cell and, if a selection narrowed
+/// it (pulled, or `-p`), that selection holds a crate they judge.
+#[must_use]
+pub fn owes_win32_oracles(cells: &[Cell], scope: &crate::scope::Scope, pulled: bool) -> bool {
+    let narrowed = pulled || matches!(scope, crate::scope::Scope::Packages(_));
+    runs_win32_oracles(cells)
+        && (!narrowed
+            || WIN32_ORACLE_SUBJECTS
+                .iter()
+                .any(|p| scope.includes_crate(p)))
 }
 
 /// `targo --unverified run -q -p aterm-win32-oracle --target-dir <cells lane>/win32-oracle-bin
@@ -560,6 +676,8 @@ pub struct TestGraph {
     pub nodes: BTreeSet<PkgId>,
     pub selected: Vec<String>,
     pub excluded: Vec<String>,
+    /// The forest itself, for a selection's dependents ([`dependents_in_forest`]).
+    pub forest: String,
 }
 
 /// The test-target pass's graph for `cell`: the selection
@@ -597,6 +715,7 @@ fn test_graph(
         nodes: parse_test_forest(&out, &roots)?,
         selected,
         excluded,
+        forest: out,
     })
 }
 
@@ -811,7 +930,8 @@ pub fn resolve_roots(
 const PROVISION_RUSTUP: &str = "targo --unverified verify provision rustup";
 
 /// One cell, end to end: its graph, its shims, its toolchain, the lint of its roots, and (off
-/// wasm32) the all-targets pass over its workspace members.
+/// wasm32) the all-targets pass over its workspace members; of [`narrows`] a selection, the lint and
+/// that pass of the selected members, in a cone run with their dependents in this cell's graph.
 fn check_cell(
     ctx: &Ctx,
     rustup: &Path,
@@ -848,7 +968,8 @@ fn check_cell(
         .filter(|id| in_repo(id))
         .map(|id| id.name.clone())
         .collect();
-    if ctx.cells_pulled && selected_in(&own, &ctx.scope).is_empty() {
+    let selects = ctx.cells_pulled || matches!(ctx.scope, crate::scope::Scope::Packages(_));
+    if selects && selected_in(&own, &ctx.scope).is_empty() {
         return CellOutcome::Unselected;
     }
     let proc_macros: BTreeSet<String> = graph
@@ -875,6 +996,36 @@ fn check_cell(
         }
     };
     let test_nodes = tests.as_ref().map(|t| t.nodes.clone()).unwrap_or_default();
+
+    let mut wanted: BTreeSet<String> = graph_names
+        .iter()
+        .filter(|name| ctx.scope.includes_crate(name))
+        .cloned()
+        .collect();
+    if matches!(ctx.scope, crate::scope::Scope::Changed(_))
+        && let Some(tests) = &tests
+    {
+        match dependents_in_forest(&tests.forest, &wanted) {
+            Ok(dependents) => wanted.extend(dependents),
+            Err(e) => return could_not("NO-TEST-GRAPH", vec![e]),
+        }
+    }
+    // A patched crate's name can stand for two packages (the windows-sys facades), so neither `-p`
+    // nor a read by name could say which was compiled: that selection takes the whole graph.
+    let patched = match patched_crates(&ctx.root) {
+        Ok(p) => p,
+        Err(e) => return could_not("NO-TEST-GRAPH", vec![e]),
+    };
+    let narrow =
+        narrows(&cell.triple, &ctx.scope, ctx.cells_pulled) && wanted.is_disjoint(&patched);
+    let judged: BTreeSet<String> = if narrow {
+        narrowed_lint(&own, &not_owed, &members.names, &wanted)
+    } else {
+        own.difference(&not_owed).cloned().collect()
+    };
+    if narrow && judged.is_empty() {
+        return CellOutcome::Unselected;
+    }
 
     let (mut shim_args, mut shimmed) = (Vec::new(), Vec::new());
     let (mut test_shim_args, mut test_shimmed) = (Vec::new(), Vec::new());
@@ -927,13 +1078,22 @@ fn check_cell(
         shim_args: &shim_args,
     };
 
-    let lint = exec::run(&cargo.lint(cell, &extra), ctx.exec_env());
+    let packages = if narrow {
+        package_args(&judged, &ctx.scope)
+    } else {
+        lint_packages(cell, &extra)
+    };
+    let lint = exec::run(&cargo.lint(&packages), ctx.exec_env());
     let mut red = Red::default();
     let read = match read_cargo_run(&lint, &cell.triple, &graph_names, false, &mut red) {
         Ok(read) => read,
         Err(outcome) => return outcome,
     };
-    for pkg in shimmed.iter().filter(|p| !read.checked.contains(*p)) {
+    // A narrowed build need not reach a shimmed package at all; its whole-graph run judges the row.
+    let inert = shimmed
+        .iter()
+        .filter(|p| !narrow && !read.checked.contains(*p));
+    for pkg in inert {
         red.note(
             format!("SHIM-INERT({pkg})"),
             format!(
@@ -943,7 +1103,7 @@ fn check_cell(
             ),
         );
     }
-    let owed: Vec<&String> = own.difference(&not_owed).collect();
+    let owed: Vec<&String> = judged.iter().collect();
     let unread: Vec<&str> = owed
         .iter()
         .filter(|n| !read.checked.contains(**n))
@@ -962,23 +1122,25 @@ fn check_cell(
         );
     }
     let mut summary = format!(
-        "{}/{} own crates linted on `{}`{}",
+        "{}/{} {} crates linted on `{}`{}",
         owed.len() - unread.len(),
         owed.len(),
+        if narrow { "selected" } else { "own" },
         toolchain.name,
         not_owed_note(&proc_macros, &host_deps)
     );
-    if !extra.is_empty() {
+    // A narrowed run used neither the cell's roots nor, necessarily, its shims: only what it ran.
+    if !narrow && !extra.is_empty() {
         summary.push_str(&format!(
             ", roots {} and {} ({CELLS_KEY})",
             cell.package,
             extra.join(", ")
         ));
     }
-    if !shimmed.is_empty() {
+    if !narrow && !shimmed.is_empty() {
         summary.push_str(&format!(", shimmed (not linked): {}", shimmed.join(", ")));
     }
-    if !test_shimmed.is_empty() {
+    if !narrow && !test_shimmed.is_empty() {
         summary.push_str(&format!(
             ", test targets shimmed (not linked): {}",
             test_shimmed.join(", ")
@@ -990,7 +1152,17 @@ fn check_cell(
             shim_args: &test_shim_args,
             ..cargo
         };
-        let run = exec::run(&test_cargo.all_targets(&tests.excluded), ctx.exec_env());
+        let targets: Vec<&String> = tests
+            .selected
+            .iter()
+            .filter(|name| !narrow || wanted.contains(*name))
+            .collect();
+        let check = if narrow {
+            test_cargo.selected_targets(&package_args(targets.iter().copied(), &ctx.scope))
+        } else {
+            test_cargo.all_targets(&tests.excluded)
+        };
+        let run = exec::run(&check, ctx.exec_env());
         let read = match read_cargo_run(&run, &cell.triple, &graph_names, true, &mut red) {
             Ok(read) => read,
             Err(outcome) => return outcome,
@@ -1000,7 +1172,7 @@ fn check_cell(
         let dependencies = read_cargo_json(&run.output, &cell.triple, &dependency_names, false);
         for pkg in test_shimmed
             .iter()
-            .filter(|p| !dependencies.checked.contains(*p))
+            .filter(|p| !narrow && !dependencies.checked.contains(*p))
         {
             red.note(
                 format!("SHIM-INERT({pkg})"),
@@ -1011,9 +1183,9 @@ fn check_cell(
                 ),
             );
         }
-        let owed: Vec<&String> = tests
-            .selected
+        let owed: Vec<&String> = targets
             .iter()
+            .copied()
             .filter(|n| !proc_macros.contains(*n))
             .collect();
         let missing: Vec<&str> = owed
@@ -1157,7 +1329,9 @@ impl CellCargo<'_> {
         let mut path = OsString::new();
         if let Some(bin) = self.toolchain.cargo.parent() {
             path.push(bin);
-            path.push(":");
+            if !self.ctx.path_env.is_empty() {
+                path.push(if cfg!(windows) { ";" } else { ":" });
+            }
         }
         path.push(&self.ctx.path_env);
         let mut cmd = Cmd::new(&self.toolchain.cargo)
@@ -1190,17 +1364,23 @@ impl CellCargo<'_> {
         cmd
     }
 
-    /// The lint of the cell's root package and its `extra` roots: of clippy,
-    /// only the `clippy.toml` bans (every other clippy lint is the host's), the
-    /// browser cells with their own clock-only config; rustc's own warnings are
-    /// read from the stream ([`is_cell_warning`]).
-    fn lint(&self, cell: &Cell, extra: &[String]) -> Cmd {
-        let mut cmd = self.base("clippy").args(lint_packages(cell, extra));
+    /// The lint of `packages` (`-p` arguments): of clippy, only the `clippy.toml` bans (every other
+    /// clippy lint is the host's), the browser cells with their own clock-only config; rustc's own
+    /// warnings are read from the stream ([`is_cell_warning`]).
+    fn lint(&self, packages: &[String]) -> Cmd {
+        let mut cmd = self.base("clippy").args(packages.iter().cloned());
         cmd = cmd.arg("--").args(lint_flags(self.triple));
         if self.triple.starts_with("wasm32") {
             cmd = cmd.env("CLIPPY_CONF_DIR", self.ctx.root.join(WASM_CLIPPY_CONF));
         }
         cmd
+    }
+
+    /// Every target of `packages` (`-p` arguments), type-checked.
+    fn selected_targets(&self, packages: &[String]) -> Cmd {
+        self.base("check")
+            .arg("--all-targets")
+            .args(packages.iter().cloned())
     }
 
     /// Every target of the workspace less `excluded`, type-checked.
@@ -1391,35 +1571,102 @@ pub fn patched_crates(root: &Path) -> Result<BTreeSet<String>, String> {
         .map_err(|e| format!("could not read {} ({e})", manifest.display()))?;
     let mut out = BTreeSet::new();
     let mut inside = false;
-    for line in text.lines().map(str::trim) {
+    let mut subtable: Option<(String, Option<String>)> = None;
+    for raw in text.lines() {
+        let line = strip_toml_comment(raw).trim();
         if line.starts_with('[') {
-            inside =
-                line.starts_with("[patch.crates-io]") || line.starts_with("[patch.\"crates-io\"]");
+            if let Some((key, renamed)) = subtable.take() {
+                let name = renamed.unwrap_or(key);
+                if !name.is_empty() {
+                    out.insert(name);
+                }
+            }
+            inside = matches!(
+                line,
+                "[patch.crates-io]" | "[patch.\"crates-io\"]" | "[patch.'crates-io']"
+            );
+            subtable = patch_crates_io_subtable(line).map(|k| (k, None));
             continue;
         }
-        if !inside || line.is_empty() || line.starts_with('#') {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((_, ref mut renamed)) = subtable {
+            if let Some((key, rhs)) = line.split_once('=')
+                && key.trim() == "package"
+                && let Some(val) = unquote_toml_string(rhs)
+            {
+                *renamed = Some(val.to_string());
+            }
+            continue;
+        }
+        if !inside {
             continue;
         }
         if let Some((key, spec)) = line.split_once('=') {
-            let name = renamed_package(spec).unwrap_or_else(|| key.trim().trim_matches('"').trim());
+            let name = renamed_package(spec)
+                .unwrap_or_else(|| key.trim().trim_matches(['"', '\'']).trim());
             if !name.is_empty() {
                 out.insert(name.to_string());
             }
         }
     }
+    if let Some((key, renamed)) = subtable {
+        let name = renamed.unwrap_or(key);
+        if !name.is_empty() {
+            out.insert(name);
+        }
+    }
     Ok(out)
+}
+
+fn patch_crates_io_subtable(header: &str) -> Option<String> {
+    let inner = header.strip_prefix('[')?.strip_suffix(']')?.trim();
+    let rest = inner
+        .strip_prefix("patch.crates-io.")
+        .or_else(|| inner.strip_prefix("patch.\"crates-io\"."))
+        .or_else(|| inner.strip_prefix("patch.'crates-io'."))?;
+    let key = rest.trim().trim_matches(['"', '\'']).trim();
+    (!key.is_empty()).then(|| key.to_string())
+}
+
+fn strip_toml_comment(line: &str) -> &str {
+    let mut in_quote: Option<char> = None;
+    let mut escaped = false;
+    for (i, c) in line.char_indices() {
+        match in_quote {
+            Some('"') if escaped => escaped = false,
+            Some('"') if c == '\\' => escaped = true,
+            Some(q) if c == q => in_quote = None,
+            Some(_) => {}
+            None if c == '"' || c == '\'' => in_quote = Some(c),
+            None if c == '#' => return &line[..i],
+            None => {}
+        }
+    }
+    line
+}
+
+fn unquote_toml_string(rhs: &str) -> Option<&str> {
+    let rhs = rhs.trim();
+    let quote = rhs.chars().next().filter(|&c| c == '"' || c == '\'')?;
+    rhs[1..].split(quote).next().filter(|s| !s.is_empty())
 }
 
 /// The `package = "…"` of an inline patch spec, if it has one.
 #[must_use]
 pub fn renamed_package(spec: &str) -> Option<&str> {
+    let spec = strip_toml_comment(spec);
     spec.match_indices("package").find_map(|(at, word)| {
+        let before = spec[..at].trim_end();
+        if !before.is_empty() && !before.ends_with(['{', ',']) {
+            return None;
+        }
         let value = spec[at + word.len()..]
             .trim_start()
             .strip_prefix('=')?
-            .trim_start()
-            .strip_prefix('"')?;
-        value.split('"').next().filter(|p| !p.is_empty())
+            .trim_start();
+        unquote_toml_string(value)
     })
 }
 
@@ -1600,11 +1847,15 @@ fn is_proc_macro(dir: &Path) -> bool {
         return false;
     };
     let mut in_lib = false;
-    for line in text.lines().map(str::trim) {
+    for raw in text.lines() {
+        let line = strip_toml_comment(raw).trim();
         if line.starts_with('[') {
             in_lib = line == "[lib]";
-        } else if in_lib && line.replace(' ', "").starts_with("proc-macro=true") {
-            return true;
+        } else if in_lib {
+            let compact = line.replace([' ', '\t'], "");
+            if compact == "proc-macro=true" || compact == "proc_macro=true" {
+                return true;
+            }
         }
     }
     false
@@ -1703,6 +1954,139 @@ mod tests {
             ["mac-arm", "win", "wasm-cpu", "wasm-gpu"],
             "no cell of its architecture: each OS's first"
         );
+    }
+
+    /// `-p` and a pulled run narrow a cell, never the browser's; a run naming `cells` with no `-p`
+    /// checks the whole graph, in the change cone or not, as no other check does.
+    #[test]
+    fn only_p_and_a_pulled_run_narrow_a_cell() {
+        use crate::scope::Scope;
+        let one = Scope::packages(&["aterm-agent".to_string()]);
+        let cone = Scope::changed("origin/main", vec!["aterm-agent".into()], true);
+        for triple in ["aarch64-unknown-linux-gnu", "aarch64-pc-windows-msvc"] {
+            assert!(narrows(triple, &one, false), "{triple}");
+            assert!(narrows(triple, &one, true), "{triple}");
+            assert!(narrows(triple, &cone, true), "{triple}");
+            assert!(!narrows(triple, &cone, false), "{triple}");
+            assert!(!narrows(triple, &Scope::workspace(), false), "{triple}");
+            assert!(!narrows(triple, &Scope::workspace(), true), "{triple}");
+        }
+        assert!(!narrows("wasm32-unknown-unknown", &one, false));
+        assert!(!narrows("wasm32-unknown-unknown", &cone, true));
+    }
+
+    /// A dependent only this cell's OS has is found in its own forest, dev edges included: the root
+    /// `aterm-gui` reaches `aterm-x11` here though this machine's cone could not say so. NEGATIVE
+    /// CONTROL: a member that does not reach it is left out.
+    #[test]
+    fn a_seeds_dependents_come_from_the_cells_own_forest() {
+        let forest = "0aterm-gui v0.1.0\n1aterm-window v0.1.0\n2aterm-x11 v0.1.0\n\
+                      0aterm-x11 v0.1.0\n0aterm-grid v0.1.0\n1aterm-types v0.1.0\n";
+        assert_eq!(
+            dependents_in_forest(forest, &names(&["aterm-x11"])).expect("the forest"),
+            names(&["aterm-gui", "aterm-x11"])
+        );
+        assert_eq!(
+            dependents_in_forest(forest, &names(&["aterm-window"])).expect("the forest"),
+            names(&["aterm-gui"])
+        );
+        assert!(
+            dependents_in_forest(forest, &names(&["nothing"]))
+                .expect("the forest")
+                .is_empty()
+        );
+    }
+
+    /// A `-p` no member answers to is an error, not a green over nothing, spec spellings included.
+    #[test]
+    fn a_p_naming_no_member_is_reported() {
+        use crate::scope::Scope;
+        let members = names(&["aterm-agent", "libc"]);
+        let packages = |named: &[&str]| {
+            Scope::packages(&named.iter().map(|n| (*n).to_string()).collect::<Vec<_>>())
+        };
+        assert!(unknown_packages(&packages(&["aterm-agent"]), &members).is_empty());
+        assert!(unknown_packages(&packages(&["libc@0.2.0"]), &members).is_empty());
+        assert_eq!(
+            unknown_packages(
+                &packages(&["aterm-agnet", "aterm-agent", "aterm-libc"]),
+                &members
+            ),
+            ["aterm-agnet", "aterm-libc"]
+        );
+        assert!(unknown_packages(&Scope::workspace(), &members).is_empty());
+    }
+
+    /// A narrowed lint names selected members built for the target, never host code the cell's
+    /// graph builds for this machine.
+    #[test]
+    fn a_narrowed_lint_names_no_host_code_and_no_non_member() {
+        let own = names(&["aterm-agent", "aterm-macros", "astream-sys", "aterm-gen"]);
+        let not_owed = names(&["aterm-macros", "aterm-gen"]);
+        let members = names(&["aterm-agent", "aterm-macros", "aterm-gen"]);
+        assert_eq!(
+            narrowed_lint(
+                &own,
+                &not_owed,
+                &members,
+                &names(&[
+                    "aterm-agent",
+                    "aterm-macros",
+                    "astream-sys",
+                    "aterm-gen",
+                    "aterm-objc"
+                ])
+            ),
+            names(&["aterm-agent"])
+        );
+        assert!(
+            narrowed_lint(&own, &not_owed, &members, &names(&["aterm-macros"])).is_empty(),
+            "only host code selected: the cell has nothing to compile"
+        );
+    }
+
+    /// A member whose name the lock shares keeps its path spec, or the `-p` would be ambiguous.
+    #[test]
+    fn package_args_keep_the_selections_own_spec() {
+        use crate::scope::Scope;
+        let spec = "path+file:///repo/crates/x#x@1.0.0".to_string();
+        let cone = Scope::changed("origin/main", vec![spec.clone()], true);
+        assert_eq!(
+            package_args(&names(&["x"]), &cone),
+            ["-p".to_string(), spec]
+        );
+        assert_eq!(
+            package_args(&names(&["x"]), &Scope::workspace()),
+            ["-p", "x"]
+        );
+    }
+
+    /// The oracles judge the Windows facades alone: a narrowed run owes them only for a selection
+    /// holding one, and one naming `cells` with no `-p` always, so an edit to the oracle itself runs them.
+    #[test]
+    fn the_win32_oracles_are_owed_unless_a_selection_rules_them_out() {
+        use crate::scope::Scope;
+        let pick = |cell: &str| {
+            aterm_forge::resolve::select(
+                &aterm_forge::resolve::default_cells(),
+                &[cell.to_string()],
+            )
+            .expect("the cell")
+        };
+        let (win, linux) = (pick("win"), pick("linux-arm"));
+        let packages = |name: &str| Scope::packages(&[name.to_string()]);
+        let cone = Scope::changed("origin/main", vec!["aterm-agent".into()], true);
+        assert!(!owes_win32_oracles(&win, &packages("aterm-agent"), false));
+        assert!(owes_win32_oracles(&win, &packages("aterm-win32"), false));
+        assert!(owes_win32_oracles(
+            &win,
+            &packages("aterm-win32-oracle"),
+            false
+        ));
+        assert!(!owes_win32_oracles(&win, &cone, true));
+        assert!(owes_win32_oracles(&win, &cone, false));
+        assert!(owes_win32_oracles(&win, &Scope::workspace(), false));
+        assert!(!owes_win32_oracles(&linux, &Scope::workspace(), false));
     }
 
     /// A pulled cell is checked for the selected crates its graph holds: the cone's or `-p`'s,
@@ -2439,6 +2823,15 @@ mod tests {
                 target_dir: &target,
                 shim_args: &[],
             };
+            let packages = ["-p".to_string(), "aterm-agent".to_string()];
+            let narrowed = cargo.selected_targets(&packages);
+            assert!(
+                narrowed.args.iter().any(|a| a == "--all-targets")
+                    && narrowed.args.iter().any(|a| a == "aterm-agent")
+                    && !narrowed.args.iter().any(|a| a == "--workspace"),
+                "{:?}",
+                narrowed.args
+            );
             let cmd = cargo.all_targets(&[]);
             let get = |k: &str| {
                 cmd.envs
@@ -2449,7 +2842,13 @@ mod tests {
             assert_eq!(get("CARGO_INCREMENTAL").as_deref(), Some("0"));
             (get("CARGO_TARGET_DIR"), get("CARGO_BUILD_JOBS"))
         };
-        let dir = Some("/repo/target/verify/.ubd/cells.noindex/win".to_string());
+        let dir = Some(
+            ["/repo", "target", "verify", ".ubd", "cells.noindex", "win"]
+                .iter()
+                .collect::<PathBuf>()
+                .to_string_lossy()
+                .into_owned(),
+        );
         assert_eq!(env_of(None), (dir.clone(), Some("4".to_string())));
         assert_eq!(env_of(Some("2")), (dir.clone(), Some("2".to_string())));
         assert_eq!(env_of(Some("16")), (dir, Some("4".to_string())));
@@ -2484,14 +2883,24 @@ mod tests {
             ["oracle", "oracle-052"]
         );
 
+        let root = std::path::absolute("/repo").expect("absolute");
         let ctx = Ctx::new(
-            PathBuf::from("/repo"),
+            root.clone(),
             crate::Scope::workspace(),
             crate::EnvSnapshot::default(),
             PathBuf::from("/tmp"),
         );
         let cmd = win32_oracle_cmd(&ctx, "oracle-052").expect("absolute paths");
         let argv = cmd.argv();
+        let oracle_bin = root
+            .join("target")
+            .join("verify")
+            .join(".ubd")
+            .join("cells.noindex")
+            .join("win32-oracle-bin")
+            .display()
+            .to_string();
+        let root_str = root.display().to_string();
         assert_eq!(
             argv[1..],
             [
@@ -2501,14 +2910,14 @@ mod tests {
                 "-p",
                 "aterm-win32-oracle",
                 "--target-dir",
-                "/repo/target/verify/.ubd/cells.noindex/win32-oracle-bin",
+                oracle_bin.as_str(),
                 "--",
                 "oracle-052",
                 "--root",
-                "/repo",
+                root_str.as_str(),
             ]
         );
-        assert_eq!(cmd.cwd.as_deref(), Some(Path::new("/repo")));
+        assert_eq!(cmd.cwd.as_deref(), Some(root.as_path()));
         assert!(
             !cmd.envs.iter().any(|(k, _)| k == "CARGO_TARGET_DIR"),
             "the oracle's own Windows builds keep their per-checkout directories"
@@ -2546,5 +2955,34 @@ mod tests {
         let wasm = lint_flags("wasm32-unknown-unknown");
         assert!(wasm.contains(&"clippy::disallowed_methods"));
         assert!(!wasm.contains(&"clippy::disallowed_types"));
+    }
+
+    #[test]
+    fn patched_crates_and_renamed_package_handle_subtables_quotes_and_comments() {
+        assert_eq!(
+            renamed_package("{ path = \"crates/package = 'bad'\", package = 'real-pkg' }"),
+            Some("real-pkg")
+        );
+        assert_eq!(
+            renamed_package("{ my_package = \"wrong\" } # package = \"comment\""),
+            None
+        );
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[patch.'crates-io'] # inline table\n\
+             foo = { path = \"crates/foo\" }\n\
+             alias = { path = \"crates/bar\", package = 'bar-real' }\n\
+             [patch.crates-io.sub]\n\
+             path = \"crates/sub\"\n\
+             [patch.\"crates-io\".sub_alias]\n\
+             path = \"crates/sub2\"\n\
+             package = \"sub-real\"\n",
+        )
+        .expect("write");
+        assert_eq!(
+            patched_crates(dir.path()).expect("patched"),
+            names(&["foo", "bar-real", "sub", "sub-real"])
+        );
     }
 }

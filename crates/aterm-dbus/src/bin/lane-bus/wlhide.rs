@@ -29,8 +29,10 @@ fn parse_rules(words: &[String]) -> Result<Vec<Rule>, String> {
             if let Some(i) = w.strip_prefix("hide:").filter(|i| !i.is_empty()) {
                 Ok(Rule::Hide(i.to_string()))
             } else if let Some((i, v)) = w.strip_prefix("cap:").and_then(|r| r.split_once('=')) {
-                v.parse::<u32>()
-                    .ok()
+                v.bytes()
+                    .all(|b| b.is_ascii_digit())
+                    .then(|| v.parse::<u32>().ok())
+                    .flatten()
                     .filter(|v| *v > 0 && !i.is_empty())
                     .map(|v| Rule::Cap(i.to_string(), v))
                     .ok_or_else(|| format!("not a version: {w}"))
@@ -242,6 +244,7 @@ mod tests {
         assert_eq!(parse_rules(&["-".into()]).unwrap(), []);
         assert!(parse_rules(&[]).is_err());
         assert!(parse_rules(&["cap:wl_compositor=0".into()]).is_err());
+        assert!(parse_rules(&["cap:wl_compositor=+5".into()]).is_err());
         assert!(parse_rules(&["show:x".into()]).is_err());
         let mut four = 1u32.to_ne_bytes().to_vec();
         four.extend_from_slice(&(4u32 << 16).to_ne_bytes());

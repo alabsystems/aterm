@@ -101,23 +101,89 @@ fn said_before(said: &str, v: Verdict) -> Verdict {
     }
 }
 
-/// Judges that the orchestrator's turn at `tt` was read, backed off, and acted on at its due.
+/// The first Land instruction needs no back-off. Its two writers stamp independently, so
+/// sequence identity and each record stream's append order join its reply, point and act.
+/// An earlier instruction, ambiguous act or real back-off takes the ordinary path.
+fn first_land_at_point(seen: &Seen, tt: i64, point: &(i64, String), act: &(i64, String)) -> bool {
+    if act_rule(&act.1) != Some(turn_end::RULE_LAND) {
+        return false;
+    }
+    let Some(seq) = word(&point.1, "seq").and_then(|seq| seq.parse::<u64>().ok()) else {
+        return false;
+    };
+    if word(&act.1, "seq").and_then(|seq| seq.parse::<u64>().ok()) != Some(seq) {
+        return false;
+    }
+    let mut acts = seen.journal.iter().enumerate().filter(|(_, (_, line))| {
+        act_rule(line) == Some(turn_end::RULE_LAND)
+            && word(line, "seq").and_then(|seq| seq.parse::<u64>().ok()) == Some(seq)
+    });
+    let Some((act_index, recorded)) = acts.next() else {
+        return false;
+    };
+    if recorded != act || acts.next().is_some() {
+        return false;
+    }
+    let Some(point_index) = seen.journal.iter().position(|entry| entry == point) else {
+        return false;
+    };
+    if point_index >= act_index {
+        return false;
+    }
+    let typed_land = |row: &Row| row.rule == turn_end::RULE_LAND && row.decision == "typed";
+    let mut typed = seen
+        .ledger
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| typed_land(row) && row.box_seq == Some(seq));
+    let Some((typed_index, typed_row)) = typed.next() else {
+        return false;
+    };
+    if typed.next().is_some() {
+        return false;
+    }
+    let prior_land = seen.journal[..act_index]
+        .iter()
+        .any(|(_, line)| act_rule(line) == Some(turn_end::RULE_LAND))
+        || seen.ledger[..typed_index].iter().any(typed_land);
+    let backoff = seen.journal[point_index..act_index]
+        .iter()
+        .any(|(_, line)| backoff_named(line));
+    !prior_land
+        && !backoff
+        && typed_row.ts > tt
+        && seen.ledger[..typed_index].iter().any(|row| {
+            row.ts > tt
+                && row.ts <= typed_row.ts
+                && row.rule == RULE_POINT
+                && row.decision == "waiting"
+                && row.box_seq == Some(seq)
+        })
+}
+
+/// Judges that the orchestrator's turn at `tt` was read and acted on at its judged point,
+/// respecting a back-off where one was decided. The first Land instruction may go immediately.
 fn judged_resumption<'a>(
     seen: &'a Seen,
     tt: i64,
     key: &str,
     t0: i64,
 ) -> Result<(String, &'a (i64, String)), Verdict> {
-    let act = seen.all_acts().into_iter().find(|(t, _)| *t > tt);
-    let before_act = |t: i64| act.is_none_or(|(ta, _)| t < *ta);
-    let point = seen.journal.iter().find(|(t, l)| {
-        *t > tt && before_act(*t) && event_words(l).is_some_and(|(_, w)| w.contains(key))
+    let act_index = seen
+        .journal
+        .iter()
+        .position(|(t, line)| *t > tt && act_rule(line).is_some());
+    let act = act_index.map(|index| &seen.journal[index]);
+    let before_act = &seen.journal[..act_index.unwrap_or(seen.journal.len())];
+    let point_index = before_act.iter().position(|(t, line)| {
+        *t > tt && event_words(line).is_some_and(|(_, words)| words.contains(key))
     });
-    let waited = point.and_then(|(te, el)| {
-        let seq = word(el, "seq");
-        seen.journal
+    let point = point_index.map(|index| &seen.journal[index]);
+    let waited = point_index.and_then(|index| {
+        let seq = word(&seen.journal[index].1, "seq");
+        before_act[index..]
             .iter()
-            .find(|(t, l)| *t >= *te && before_act(*t) && backoff_named(l) && word(l, "seq") == seq)
+            .find(|(_, line)| backoff_named(line) && word(line, "seq") == seq)
     });
     let read = point.map_or_else(
         || format!("its reply never read (no EVENT holding \"{key}\")"),
@@ -150,6 +216,15 @@ fn judged_resumption<'a>(
                     "{read}; {rule} typed at +{}, {} after the turn",
                     at(t0, a.0),
                     at(0, a.0 - tt)
+                ),
+                a,
+            ))
+        }
+        (None, Some(a)) if point.is_some_and(|point| first_land_at_point(seen, tt, point, a)) => {
+            Ok((
+                format!(
+                    "{read}; the first Land instruction typed at +{} at its recorded point, with no back-off owed",
+                    at(t0, a.0)
                 ),
                 a,
             ))
@@ -280,17 +355,26 @@ pub(super) fn judge_answer(seen: &Seen, t0: i64) -> Verdict {
             at(t0, seen.end_ms)
         ));
     };
-    if let Some((tb, lb)) = acts
+    // The answer's defense gets the land check at its yield, and the check's `LANDED` lands
+    // (§14.17 item 5): one check between the answer and the landing, and no other act.
+    let between: Vec<&(i64, String)> = acts
         .iter()
         .copied()
-        .find(|(t, _)| *t > act.0 && *t < done.0)
-    {
+        .filter(|(t, _)| *t > act.0 && *t < done.0)
+        .collect();
+    let checked = between.len() == 1 && act_rule(&between[0].1) == Some(turn_end::RULE_LAND_CHECK);
+    if let Some((tb, lb)) = between.iter().copied().find(|_| !checked) {
         return Verdict::Fail(format!(
-            "{said}; but {} typed at +{} before the landing: it was not the answer's yield",
+            "{said}; but {} typed at +{} before the landing: the answer's yield got {} act(s), not the one land check",
             act_rule(lb).unwrap_or("?"),
-            at(t0, *tb)
+            at(t0, *tb),
+            between.len()
         ));
     }
+    let said = match between.first() {
+        Some((tc, _)) => format!("{said}; the land check at +{}", at(t0, *tc)),
+        None => said,
+    };
     let (mut bad, quiet, window) = landing_quiet(seen, done, false, t0);
     let unread = invented_record(seen, &mut bad);
     let said = format!("{said}; {quiet}");
@@ -305,12 +389,15 @@ pub(super) fn judge_theirs(seen: &Seen, t0: i64) -> Verdict {
     let Some(p) = seen.cover.person_ms else {
         return Verdict::Unobserved("the person's prompt was never typed".into());
     };
+    if let Some(keyed) = &seen.cover.keyed {
+        let delivery = keys_unaccounted(keyed).unwrap_or_else(|| keyed_line(keyed));
+        return Verdict::Unobserved(format!(
+            "{delivery}; hwkey is controller input, so L13's person's takeover was not measured; \
+             draft effects and LEFT/task=theirs do not establish whose hand it was"
+        ));
+    }
     let stamp = seen.cover.person_stamp.as_deref().unwrap_or("?");
-    let path = if seen.cover.keyed.is_some() {
-        "hwkey's keys"
-    } else {
-        "the `as=person` seam"
-    };
+    let path = "the `as=person` seam";
     if stamp.parse::<u64>().is_err() {
         return Verdict::Unobserved(format!(
             "no person's hand reached the session: status human_ms={stamp} after the Enter at +{} \
@@ -318,17 +405,7 @@ pub(super) fn judge_theirs(seen: &Seen, t0: i64) -> Verdict {
             at(t0, p)
         ));
     }
-    if let Some(why) = seen.cover.keyed.as_ref().and_then(keys_unaccounted) {
-        return Verdict::Unobserved(format!(
-            "{why} (the Enter at +{}), so whose hand the prompt was is not known",
-            at(t0, p)
-        ));
-    }
-    let typed = seen
-        .cover
-        .keyed
-        .as_ref()
-        .map_or_else(|| format!("typed through {path}"), keyed_line);
+    let typed = format!("typed through {path}");
     let until = seen.cover.turn_ms.unwrap_or(seen.end_ms);
     let inside = |t: i64| t > p && t < until;
     let left_rule = format!("rule={}", turn_end::RULE_LEFT);
@@ -441,49 +518,60 @@ pub(super) fn judge_theirs(seen: &Seen, t0: i64) -> Verdict {
     }
 }
 
-/// Returns why `hwkey`'s keys do not account for the person's stamp, if they do not.
+/// Returns why native controller delivery was not proved without changing person provenance.
 #[must_use]
 pub fn keys_unaccounted(k: &Keyed) -> Option<String> {
+    if k.posted == 0 {
+        return Some("no native key was posted".to_string());
+    }
+    if k.key_window != k.posted {
+        return Some(format!(
+            "hwkey posted {} key(s), but only {} to the active key window",
+            k.posted, k.key_window
+        ));
+    }
+    if !k.draft_stood || !k.draft_taken {
+        return Some(format!(
+            "native composer effects were not read: draft stood={}, draft taken={}",
+            k.draft_stood, k.draft_taken
+        ));
+    }
     let Some(after) = k.seq_after else {
         return Some(format!(
             "hwkey posted {} key(s), and status human_seq= was not read after the Enter",
             k.posted
         ));
     };
-    let moved = after.checked_sub(k.seq_before);
-    if moved == Some(k.posted) && k.posted > 0 {
+    if after == k.seq_before {
         return None;
     }
-    let what = match moved {
-        Some(n) if n < k.posted => "not every key the real key path took was counted as a person's",
-        Some(n) if n > k.posted => "another hand reached the session beside hwkey's keys",
-        Some(_) => "no key was posted",
-        None => "the person's count went back",
-    };
     Some(format!(
-        "hwkey posted {} key(s), and status human_seq= went {} -> {after}: {what}",
+        "hwkey posted {} controller key(s), but status human_seq= changed {} -> {after}",
         k.posted, k.seq_before
     ))
 }
 
-/// Formats how `hwkey` typed the person's prompt.
+/// Formats native controller posting, independent composer effects and unchanged person count.
 #[must_use]
 pub fn keyed_line(k: &Keyed) -> String {
     format!(
-        "typed through hwkey: {} key(s) posted to the window's event queue ({} to the key window of the active app), status human_seq= {} -> {}",
+        "controller hwkey: {} key(s) posted ({} to the active key window), draft stood={}, draft taken={}, status human_seq= {} -> {}",
         k.posted,
         k.key_window,
+        k.draft_stood,
+        k.draft_taken,
         k.seq_before,
         k.seq_after
             .map_or_else(|| "?".to_string(), |n| n.to_string())
     )
 }
 
-/// Judges L14: P2 live under Land with a work reply before landing.
+/// Judges L14: P2 live under Land with a work reply before landing; the defense's land check
+/// carries the needs ack (L3, `check_after`), and its `LANDED` lands (L5).
 pub(super) fn judge_wrote_land<'a>(
     seen: &'a Seen,
     land: Option<&(i64, String)>,
-    nudge_after: &dyn Fn(i64) -> Option<&'a (i64, String)>,
+    check_after: &dyn Fn(i64) -> Option<&'a (i64, String)>,
     program: &str,
     t0: i64,
 ) -> Verdict {
@@ -535,8 +623,8 @@ pub(super) fn judge_wrote_land<'a>(
         &said,
         &[
             ("L1", judge_land_act(seen, land, done, t0)),
-            ("L3", judge_needs(seen, land, nudge_after, program, t0)),
-            ("L5", judge_landed(seen, land, nudge_after, false, t0)),
+            ("L3", judge_needs(seen, land, check_after, program, t0)),
+            ("L5", judge_landed(seen, land, false, t0)),
         ],
     )
 }
@@ -1092,18 +1180,26 @@ pub(super) fn judge_wall(
             at(t0, reset)
         ));
     }
-    let in_wall = |t: i64| t > t1 + AT_DONE_MS && t < reset;
     let lift = seen
         .cover
         .lifted_ms
         .unwrap_or(reset - WALL_LIFT_EARLY_MS)
         .min(reset);
+    // A land check past the lift answers the program's own continuation's defense, read on a
+    // screen without the wall (§14.17 item 5): no act into the wall.
+    let in_wall = |t: i64, rule: &str| {
+        t > t1 + AT_DONE_MS && t < reset && !(rule == turn_end::RULE_LAND_CHECK && t >= lift)
+    };
     let acts = seen.all_acts();
-    let typed_in: Vec<&(i64, String)> = acts.iter().copied().filter(|(t, _)| in_wall(*t)).collect();
+    let typed_in: Vec<&(i64, String)> = acts
+        .iter()
+        .copied()
+        .filter(|(t, l)| in_wall(*t, act_rule(l).unwrap_or("")))
+        .collect();
     let rows_in: Vec<&Row> = seen
         .ledger
         .iter()
-        .filter(|r| in_wall(r.ts) && r.acted() && r.decision != "escalated")
+        .filter(|r| in_wall(r.ts, &r.rule) && r.acted() && r.decision != "escalated")
         .collect();
     let escalated = seen
         .ledger
@@ -1226,7 +1322,12 @@ pub(super) fn judge_wall(
     let lost_at = reset + wall_grace_ms(program) + WALL_LOST_MS;
     let done = seen.first_after("DONE ", lift);
     let went_on = seen.cover.went_on_ms;
-    let first_act = acts.iter().copied().find(|(t, _)| *t >= reset);
+    // The land check is typed only at a land act's yield with a defense, never at a wall: the
+    // program's own continuation's defense gets it, which is no act on top of that continuation.
+    let first_act = acts
+        .iter()
+        .copied()
+        .find(|(t, l)| *t >= reset && act_rule(l) != Some(turn_end::RULE_LAND_CHECK));
     let resumed = match first_act {
         Some((ta, la)) => {
             if *ta > lost_at {
@@ -1418,10 +1519,11 @@ fn hidden_facts(
             Err("no point was read on a screen without the wall before the reset".to_string()),
         );
     }
+    // The land check answers the agent's own defense, never the remembered wall (§14.17 item 5).
     let Some((ta, la)) = seen
         .all_acts()
         .into_iter()
-        .find(|(t, _)| *t >= reset)
+        .find(|(t, l)| *t >= reset && act_rule(l) != Some(turn_end::RULE_LAND_CHECK))
         .map(|(t, l)| (*t, l.as_str()))
     else {
         return (
@@ -2157,4 +2259,127 @@ pub(super) fn judge_ladder(seen: &Seen, scale: f64, t0: i64) -> Verdict {
         ladder_step_ms(1, scale) / 1000,
         ladder_step_ms(LADDER_STEPS, scale) / 1000
     ))
+}
+
+#[cfg(test)]
+mod first_land_evidence_tests {
+    use super::*;
+
+    /// Equal timestamps do not erase append order or make repeated sequence evidence unique.
+    #[test]
+    fn first_land_requires_unique_acts_and_preceding_evidence_in_each_stream() {
+        let point = (20, "EVENT idle seq=7 Implemented the parser".to_string());
+        let act = (
+            30,
+            "CONTINUED seq=7 rule=land@v1 [aterm harness] Autopilot is Land:".to_string(),
+        );
+        let recorded = || Seen {
+            journal: vec![point.clone(), act.clone()],
+            ledger: vec![
+                Row {
+                    ts: 20,
+                    box_seq: Some(7),
+                    rule: RULE_POINT.into(),
+                    decision: "waiting".into(),
+                    ..Row::default()
+                },
+                Row {
+                    ts: 30,
+                    box_seq: Some(7),
+                    rule: turn_end::RULE_LAND.into(),
+                    decision: "typed".into(),
+                    ..Row::default()
+                },
+            ],
+            ..Seen::default()
+        };
+        assert!(first_land_at_point(&recorded(), 10, &point, &act));
+        for seq in [6, 7] {
+            let mut prior_journal = recorded();
+            prior_journal.journal.insert(
+                0,
+                (
+                    act.0,
+                    format!("CONTINUED seq={seq} rule=land@v1 earlier instruction"),
+                ),
+            );
+            assert!(!first_land_at_point(&prior_journal, 10, &point, &act));
+            let mut prior_ledger = recorded();
+            let mut prior = prior_ledger.ledger[1].clone();
+            prior.box_seq = Some(seq);
+            prior_ledger.ledger.insert(0, prior);
+            assert!(!first_land_at_point(&prior_ledger, 10, &point, &act));
+        }
+        let mut duplicate_journal = recorded();
+        duplicate_journal.journal.push(act.clone());
+        assert!(!first_land_at_point(&duplicate_journal, 10, &point, &act));
+        let mut duplicate_ledger = recorded();
+        duplicate_ledger
+            .ledger
+            .push(duplicate_ledger.ledger[1].clone());
+        assert!(!first_land_at_point(&duplicate_ledger, 10, &point, &act));
+        let mut late = recorded();
+        late.ledger.swap(0, 1);
+        assert!(!first_land_at_point(&late, 10, &point, &act));
+        let mut absent = recorded();
+        absent.journal.remove(0);
+        assert!(!first_land_at_point(&absent, 10, &point, &act));
+        let mut absent = recorded();
+        absent.journal.pop();
+        assert!(!first_land_at_point(&absent, 10, &point, &act));
+    }
+
+    #[test]
+    fn a_prior_instruction_or_a_point_after_the_act_cannot_qualify_first_land() {
+        let point = (20, "EVENT idle seq=7 Implemented the parser".to_string());
+        let act = (
+            30,
+            "CONTINUED seq=7 rule=land@v1 [aterm harness] Autopilot is Land:".to_string(),
+        );
+        let seen = Seen {
+            journal: vec![point.clone(), act.clone()],
+            ledger: vec![
+                Row {
+                    ts: 20,
+                    box_seq: Some(7),
+                    rule: RULE_POINT.into(),
+                    decision: "waiting".into(),
+                    ..Row::default()
+                },
+                Row {
+                    ts: 30,
+                    box_seq: Some(7),
+                    rule: turn_end::RULE_LAND.into(),
+                    decision: "typed".into(),
+                    ..Row::default()
+                },
+            ],
+            ..Seen::default()
+        };
+        assert!(first_land_at_point(&seen, 10, &point, &act));
+        let mut journal_only = seen.clone();
+        journal_only.journal.insert(
+            0,
+            (
+                15,
+                "CONTINUED seq=6 rule=land@v1 [aterm harness] Autopilot is Land:".into(),
+            ),
+        );
+        assert!(!first_land_at_point(&journal_only, 10, &point, &act));
+        let mut ledger_only = seen.clone();
+        ledger_only.ledger.insert(
+            0,
+            Row {
+                ts: 15,
+                box_seq: Some(6),
+                rule: turn_end::RULE_LAND.into(),
+                decision: "typed".into(),
+                ..Row::default()
+            },
+        );
+        assert!(!first_land_at_point(&ledger_only, 10, &point, &act));
+        let mut late_point = seen;
+        late_point.ledger[0].ts = act.0 + 1;
+        assert!(!first_land_at_point(&late_point, 10, &point, &act));
+    }
 }

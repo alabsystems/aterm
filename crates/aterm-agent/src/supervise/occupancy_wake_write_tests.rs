@@ -1039,5 +1039,71 @@ fn a_reconciled_release_is_retold_at_the_successors_first_break() {
     assert_eq!(sends(&told), 0, "CONTROL: {:#?}", told.noted);
 }
 
+/// A break of the agent's own background work whose report names a need.
+fn needs_break_screen() -> Vec<String> {
+    let mut r = rows(&[
+        "⏺ The build runs in the background; the docs are next.",
+        "  NEEDS YOU: the release credential",
+        "",
+        "✻ Crunched for 9m 27s · done 11:07 AM · 1 shell still running",
+        "",
+    ]);
+    r.extend(composer("  ⏵⏵ auto mode on · 1 shell · ← for agents"));
+    r
+}
+
+/// F5: a wake due at the first settled break types its line, the break's one line, and the needs
+/// the break's report names are raised at that break too, the host's step offered there or not:
+/// the wake's `❯` row closes the turn off from every later point. NEGATIVE CONTROL: no wake
+/// declared, the same break raises them and Cruise carries.
+#[test]
+fn a_due_wakes_line_leaves_the_breaks_needs_raised() {
+    let line = job_line(1, T0 + MIN, None);
+    let run = |tag: &str, wake: bool, wants: bool| {
+        let host = if wake {
+            ready_host()
+        } else {
+            Arc::new(DoorHost::default())
+        };
+        host.wants.store(wants, Ordering::SeqCst);
+        Script {
+            policy: SupervisorConfig {
+                autopilot: Autopilot::Cruise,
+                continue_policy: true,
+                ..policy(Occupancy::Prompt)
+            },
+            host,
+            drawn: &|_| needs_break_screen(),
+            ..Script::new(tag, Occupancy::Prompt, &[5 * 60])
+        }
+        .run(&mut utc)
+    };
+    let raised = |ran: &Ran| {
+        ran.requests()
+            .into_iter()
+            .filter(|r| r.starts_with("meta set attention "))
+            .collect::<Vec<_>>()
+    };
+    for wants in [false, true] {
+        let woke = run("wake-needs", true, wants);
+        assert_eq!(sends(&woke), 1, "wants {wants}: {:#?}", woke.writes());
+        assert!(
+            woke.writes()[0].ends_with(&format!(" -- {line}")),
+            "wants {wants}: the wake's line: {:#?}",
+            woke.writes()
+        );
+        let up = raised(&woke);
+        assert_eq!(up.len(), 1, "wants {wants}: {:#?}", woke.requests());
+        assert!(up[0].contains("the release credential"), "{up:#?}");
+        let none = run("wake-needs-none", false, wants);
+        assert_eq!(
+            raised(&none).len(),
+            1,
+            "CONTROL: wants {wants}: {:#?}",
+            none.requests()
+        );
+    }
+}
+
 #[path = "occupancy_left_write_tests.rs"]
 mod left;

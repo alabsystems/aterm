@@ -1098,42 +1098,141 @@ fn read_standby_steward_labels_filters_denied_stewards() {
 }
 
 #[test]
-fn credential_debug_redacts_account_bundle_and_route() {
-    let marker = "synthetic-private-signin-value";
-    let route = SealedRoute {
-        login: marker.into(),
-        webmail_url: Some(marker.into()),
-        imap_url: Some(marker.into()),
-        http_url: Some(marker.into()),
-        password: Some(marker.into()),
-        mailbox_password: Some(marker.into()),
-        totp_secret: Some(marker.into()),
+fn authorize_mail_code_refuses_mismatched_claimed_label_and_prefers_readmitted_row() {
+    let m10_id = deterministic_identity(10);
+    let m22_old_id = deterministic_identity(22);
+    let m22_new_id = deterministic_identity(122);
+    let pool = Pool::from_toml(
+        "[[account]]\nprovider = \"claude\"\nemail = \"m22@example.com\"\nwarm = [\"m22\"]\n",
+        "ai-pool.toml",
+    )
+    .expect("pool");
+    let roster = SwarmRoster {
+        members: vec![
+            make_member("m10", &[], &m10_id, Some("node-m10")),
+            make_member("m22", &[], &m22_old_id, Some("node-m22-old")),
+            make_member("m22", &[], &m22_new_id, Some("node-m22-new")),
+        ],
+        deny_labels: Vec::new(),
+        deny_nodes: vec!["node-m22-old".to_owned()],
     };
-    let bundle = SealedAccountBundle {
-        password: Some(marker.into()),
-        mailbox_password: Some(marker.into()),
-        totp_secret: Some(marker.into()),
-        route: Some(route.clone()),
+    let req = MailCodeRequest {
+        email: "m22@example.com".to_owned(),
+        since: None,
+        senders: Vec::new(),
+        claimed_label: Some("m22".to_owned()),
     };
-    for output in [
-        format!("{route:?}"),
-        format!("{route:#?}"),
-        format!("{bundle:?}"),
-        format!("{bundle:#?}"),
-    ] {
-        assert!(!output.contains(marker));
+    // 1. Bound member `m10` spoofing `claimed_label = Some("m22")` is refused with `Denied`.
+    assert_eq!(
+        authorize_mail_code_requester("node-m10", &req, &roster, Some(&pool), None, 1_760_000_000),
+        Err(MailCodeRefusal::Denied),
+    );
+    // 2. Old denied `node-m22-old` is refused with `Denied`.
+    assert_eq!(
+        authorize_mail_code_requester(
+            "node-m22-old",
+            &req,
+            &roster,
+            Some(&pool),
+            None,
+            1_760_000_000
+        ),
+        Err(MailCodeRefusal::Denied),
+    );
+    // 3. Re-admitted `node-m22-new` succeeds and resolves to `m22_new_id.recipient()`.
+    let auth = authorize_mail_code_requester(
+        "node-m22-new",
+        &req,
+        &roster,
+        Some(&pool),
+        None,
+        1_760_000_000,
+    )
+    .expect("re-admitted m22 row must be authorized");
+    assert_eq!(auth.label, "m22");
+    assert_eq!(auth.recipient, m22_new_id.recipient());
+
+    #[cfg(unix)]
+    {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let secrets = dir.path().join(".secrets");
+        std::fs::create_dir_all(&secrets).expect("secrets dir");
+        let outside = dir.path().join("outside-policy.toml");
+        std::fs::write(&outside, "stewards = [\"injected\"]\n").expect("outside");
+        std::os::unix::fs::symlink(&outside, secrets.join("swarm-policy.toml"))
+            .expect("symlink policy");
+        assert!(read_standby_steward_labels(dir.path()).is_empty());
     }
 }
 
 #[test]
-fn credential_debug_redacts_mail_credential_before_encryption() {
-    let marker = "synthetic-private-mail-code";
-    let credential = SealedMailCredential {
-        kind: "otp".into(),
-        value: marker.into(),
+fn authorize_mail_code_rejects_forged_row_label_from_other_bound_member_and_honors_machine_id() {
+    let m10_id = deterministic_identity(10);
+    let m99_id = deterministic_identity(99);
+    let now = 1_760_000_000_i64;
+    let roster = SwarmRoster {
+        members: vec![
+            make_member("m10", &[], &m10_id, Some("node-m10")),
+            make_member("m99", &[], &m99_id, Some("node-m99")),
+        ],
+        deny_labels: Vec::new(),
+        deny_nodes: vec!["denied-machine-hex".to_owned()],
     };
-    for output in [format!("{credential:?}"), format!("{credential:#?}")] {
-        assert!(!output.contains(marker));
-        assert!(output.contains("SealedMailCredential"));
-    }
+    let key = LeaseKey::new("claude", "claimed@example.com").unwrap();
+    let req = MailCodeRequest {
+        email: "claimed@example.com".to_owned(),
+        since: None,
+        senders: Vec::new(),
+        claimed_label: None,
+    };
+
+    // 1. `node-m99` writes `label = "m10"` in its claim row: `node-m10` cannot ride `node-m99`'s claim.
+    let forged_book = Book::of([Row {
+        machine: "node-m99".to_owned(),
+        label: "m10".to_owned(),
+        counter: 1,
+        until: now + 3_600,
+        claims: vec![Claim {
+            key: key.clone(),
+            kind: Kind::Lease,
+            since: now - 60,
+        }],
+    }]);
+    let claims = (View::default(), forged_book);
+    assert_eq!(
+        authorize_mail_code_requester("node-m10", &req, &roster, None, Some(&claims), now),
+        Err(MailCodeRefusal::UnauthorizedEmail),
+    );
+
+    // 2. Denied `row.machine` with empty `label` is filtered out, and `node-m10` with empty `label`
+    // is authorized by its bound `row.machine == "node-m10"`.
+    let machine_book = Book::of([
+        Row {
+            machine: "denied-machine-hex".to_owned(),
+            label: String::new(),
+            counter: 1,
+            until: now + 3_600,
+            claims: vec![Claim {
+                key: key.clone(),
+                kind: Kind::Lease,
+                since: now - 500,
+            }],
+        },
+        Row {
+            machine: "node-m10".to_owned(),
+            label: String::new(),
+            counter: 1,
+            until: now + 3_600,
+            claims: vec![Claim {
+                key,
+                kind: Kind::Lease,
+                since: now - 60,
+            }],
+        },
+    ]);
+    let claims = (View::default(), machine_book);
+    let auth = authorize_mail_code_requester("node-m10", &req, &roster, None, Some(&claims), now)
+        .expect("node-m10 authorized by its own machine claim even when row.label is empty");
+    assert_eq!(auth.label, "m10");
+    assert_eq!(auth.recipient, m10_id.recipient());
 }

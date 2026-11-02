@@ -428,6 +428,116 @@ fn l10_names() {
     );
 }
 
+/// The dev owner's row, so that a `[[writers]]` repository of `fixture-dev` is dev tier.
+const DEV_OWNER: &str =
+    "[[owners]]\nname = \"fixture-dev\"\ntier = \"dev\"\nread = [\"dev\"]\nwrite = \"dev\"\n";
+
+/// One `[[writers]]` row.
+fn writers(caller: &str, repos: &str) -> String {
+    format!("\n[[writers]]\ncaller = \"{caller}\"\nrepos = {repos}\n")
+}
+
+#[test]
+fn l11_writers() {
+    let granted = format!(
+        "{DEV_OWNER}{}",
+        writers("atpkg-publish", "[\"alabsystems/aterm\"]")
+    );
+    assert_eq!(faults(&granted), Vec::new());
+    assert_one(
+        &writers("Bad_Caller", "[\"alabsystems/aterm\"]"),
+        "L11",
+        &["writers row 1", "Bad_Caller"],
+    );
+    assert_one(
+        &format!(
+            "{}{}",
+            writers("twice", "[\"alabsystems/aterm\"]"),
+            writers("twice", "[\"alabsystems/other\"]")
+        ),
+        "L11",
+        &["twice"],
+    );
+    assert_one(&writers("empty", "[]"), "L11", &["empty", "repos"]);
+    for entry in ["alabsystems", "@channel", "alabsystems/*"] {
+        assert_one(
+            &writers("loose", &format!("[\"{entry}\"]")),
+            "L11",
+            &["loose", entry],
+        );
+    }
+    assert_one(
+        &format!(
+            "{DEV_OWNER}{}",
+            writers("dev-grant", "[\"fixture-dev/app\"]")
+        ),
+        "L11",
+        &["fixture-dev/app", "fixture-dev is dev"],
+    );
+    assert_one(
+        &writers("ext-grant", "[\"fixture-ext/x\"]"),
+        "L11",
+        &["fixture-ext/x", "fixture-ext is external"],
+    );
+
+    let found = faults(&format!(
+        "{DEV_OWNER}\n[profiles.Zed]\ntoken_file = \"{{root}}/z.token\"\ntier = \"dev\"\n{}{}{}{}{}",
+        writers("Bad_Caller", "[\"alabsystems/aterm\"]"),
+        writers("Bad_Caller", "[\"alabsystems/aterm\"]"),
+        writers("empty", "[]"),
+        writers("loose", "[\"@channel\"]"),
+        writers("dev-grant", "[\"fixture-dev/app\"]"),
+    ));
+    assert_eq!(
+        rules(&found),
+        ["L10", "L11", "L11", "L11", "L11", "L11", "L11"],
+        "{found:?}"
+    );
+    let names: [&[&str]; 6] = [
+        &["writers row 1", "Bad_Caller"],
+        &["writers row 2", "Bad_Caller"],
+        &["Bad_Caller"],
+        &["empty"],
+        &["loose", "@channel"],
+        &["dev-grant", "fixture-dev/app", "fixture-dev is dev"],
+    ];
+    for (fault, wanted) in found[1..].iter().zip(names) {
+        for name in wanted {
+            assert!(fault.what.contains(name), "{name} in {:?}", fault.what);
+        }
+    }
+}
+
+/// Unix only: the lane units it reads are launchd's and systemd's, and the paths are unix's.
+#[cfg(unix)]
+#[test]
+fn dirs_resolve_follows_a_lane_s_environment() {
+    let home = Path::new("/lane/home");
+    let cfg = Path::new("/lane/config");
+    let st = Path::new("/lane/state");
+    let dirs = config::Dirs::resolve(home, Some(cfg), Some(st)).expect("absolute roots");
+    assert_eq!(dirs.config, cfg.join("aterm").join("agh"));
+    assert_eq!(dirs.home, home);
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        dirs.state,
+        home.join("Library/Application Support/aterm").join("agh")
+    );
+    #[cfg(target_os = "linux")]
+    assert_eq!(dirs.state, st.join("aterm").join("agh"));
+    assert_eq!(dirs.journal(), dirs.state.join("journal"));
+    assert_eq!(dirs.grants(), dirs.state.join("grants"));
+    assert_eq!(dirs.needs(), dirs.state.join("needs"));
+    let plain = config::Dirs::resolve(home, None, None).expect("the home's defaults");
+    assert_eq!(plain.config, home.join(".config").join("aterm").join("agh"));
+    #[cfg(target_os = "linux")]
+    {
+        let relative = config::Dirs::resolve(home, None, Some(Path::new("rel")))
+            .expect("a relative XDG_STATE_HOME is ignored");
+        assert_eq!(relative.state, home.join(".local/state/aterm").join("agh"));
+    }
+}
+
 #[test]
 fn every_fault_at_once_in_rule_order() {
     let found = faults(
@@ -529,6 +639,34 @@ mod files {
         assert_eq!(faulty.next, "agh policy check");
     }
 
+    #[test]
+    fn the_origin_is_text_from_validate_and_file_from_load() {
+        let root = common::scratch("origin");
+        let dirs = Dirs::under(root.path());
+        let text = format!(
+            "{}{}",
+            common::canonical_config(root.path()),
+            common::WRITERS
+        );
+        let parsed = config::parse(&text).expect("parses");
+        let from_text =
+            config::validate(&parsed, root.path(), &config::file_id).expect("validates");
+        assert_eq!(from_text.origin(), config::ConfigOrigin::Text);
+        common::write_config(&dirs, &text);
+        for loaded in [config::load(&dirs), config::load_for_host(&dirs)] {
+            let validated = loaded.expect("loads").expect("is there");
+            assert_eq!(validated.origin(), config::ConfigOrigin::File);
+            assert_eq!(validated.writers(), from_text.writers());
+        }
+        assert_eq!(
+            from_text.writers(),
+            [(
+                "fixture-caller".to_string(),
+                vec![common::slug("alabsystems/aterm")]
+            )]
+        );
+    }
+
     fn check(root: &std::path::Path, args: &[&str]) -> (u8, String, String) {
         let fake = FakeGithub::start();
         let (mut ctx, captured) = common::ctx(root, &fake, common::env());
@@ -546,7 +684,7 @@ mod files {
         let (exit, stdout, stderr) = check(root.path(), &[]);
         assert_eq!(exit, 0, "{stderr}");
         let expected = format!(
-            "{{\"adopted\":[],\"config\":\"{}\",\"counts\":{{\"owners\":2,\"profiles\":2,\"targets\":1}},\"faults\":[],\"ok\":true,\"present\":true}}\n",
+            "{{\"adopted\":[],\"config\":\"{}\",\"counts\":{{\"owners\":2,\"profiles\":2,\"targets\":1,\"writers\":0}},\"faults\":[],\"legacy_loose\":[],\"ok\":true,\"present\":true,\"writers\":[]}}\n",
             dirs.config_file().display()
         );
         assert_eq!(stdout, expected);

@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! Repository verbs: `repo view` and `repo list`.
+//! Repository verbs: `repo view`, `repo list` and `repo clone`.
 
 use super::args::Invocation;
 use super::verbs::Noun;
@@ -60,4 +60,14 @@ pub(crate) fn repo_list(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
         },
         receipt,
     })
+}
+
+/// `agh repo clone REPO [DIR] [--depth N]`: a clone through the isolated git runner (WP7).
+///
+/// # Errors
+///
+/// could_not_run until WP7.
+pub(crate) fn repo_clone(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
+    let _ = (ctx, inv);
+    Err(crate::error::Error::not_yet("repo clone", "WP7"))
 }

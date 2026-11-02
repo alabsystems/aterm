@@ -77,6 +77,13 @@ fn git(dir: &Path, args: &[&str]) {
     );
 }
 
+/// `path` as git reads a local path: a Windows verbatim path's `\\?\` prefix is one git reads
+/// as a host name, so it goes, naming the same place.
+fn for_git(path: &Path) -> String {
+    let path = path.to_string_lossy();
+    path.strip_prefix(r"\\?\").unwrap_or(&path).to_owned()
+}
+
 /// Write and retain an unpushed commit directly in metadata whose worktree is gone.
 fn retained_module_commit(g: &Gate, module: &Path) -> String {
     let created = GitCli.run(
@@ -135,13 +142,7 @@ fn gate() -> Gate {
     git(&checkout, &["add", "Cargo.toml", ".gitignore"]);
     git(
         &checkout,
-        &[
-            "submodule",
-            "add",
-            "-q",
-            &sub.to_string_lossy(),
-            "vendor/astream",
-        ],
+        &["submodule", "add", "-q", &for_git(&sub), "vendor/astream"],
     );
     git(&checkout, &["commit", "-qm", "main"]);
     git(
@@ -156,7 +157,7 @@ fn gate() -> Gate {
             "add",
             "-q",
             "--detach",
-            &snapshot.to_string_lossy(),
+            &for_git(&snapshot),
             "HEAD",
         ],
     );
@@ -1002,7 +1003,10 @@ fn a_leftover_no_one_entry_keeps_goes_and_one_keeping_an_entry_is_kept() {
         "every other entry of the lock went"
     );
     let kept = remove::named(&g.lock(), 1);
-    assert_eq!(kept.first, [PathBuf::from("holder")]);
+    assert_eq!(
+        kept.first,
+        [(PathBuf::from("holder"), remove::Why::AnotherUser)]
+    );
     assert_eq!(
         of(Kind::Lock),
         Some(Err(kept.words(&g.lock()))),
@@ -1100,7 +1104,10 @@ fn a_snapshot_one_entry_keeps_loses_the_rest_and_is_finished_once_it_goes() {
     };
     let kept = remove::Named {
         count: 1,
-        first: vec![PathBuf::from("target/held/stuck")],
+        first: vec![(
+            PathBuf::from("target/held/stuck"),
+            remove::Why::StillRefusing,
+        )],
     };
     assert_eq!(
         of(&done, &g.snapshot()),

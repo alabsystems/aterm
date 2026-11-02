@@ -10,7 +10,7 @@ use aterm_render::{BeamRows, GlowBlend, RampSink, RibbonVertex, ribbon_beam_into
 pub(super) const DARK_BED_BAR: f32 = 4.8;
 
 /// The bed's opacity over a fresh cell.
-pub(super) const DARK_BED_ALPHA_CAP: f32 = 236.0;
+pub(crate) const DARK_BED_ALPHA_CAP: f32 = 236.0;
 
 /// Luminance budget clamp bounds for the dark bed.
 const DARK_BED_LUMA_MIN: f32 = 0.020;
@@ -3114,7 +3114,7 @@ impl CursorGlow {
         } else {
             &self.comet_runs[..runs_len]
         };
-        let shape = if self.colour_pins.trail && cfg.style.draws_trail_color() {
+        let shape = if self.trail_pinned(cfg) {
             shape.pinned()
         } else {
             shape
@@ -3237,9 +3237,6 @@ impl CursorGlow {
         );
         self.bed_scratch = scratch;
         self.wedge_runs = wedges;
-        if shape.icy && !shape.pinned {
-            self.push_comet_nucleus(geom, caret, runs_len, shape, under.quads());
-        }
     }
 
     /// A test's negative control: no bed's rail lies in its own row's foot

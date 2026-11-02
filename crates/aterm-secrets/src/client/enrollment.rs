@@ -107,7 +107,9 @@ impl Admin {
             .ok_or_else(|| Error::new("Commons enrollment recipient is not admitted"))?
             .name
             .clone();
-        if self.is_denied_in_published_roster(&host, &binding.recipient()) {
+        if self.is_denied_in_published_roster(&host, &binding.recipient())
+            || self.is_binding_node_denied_in_published_roster(binding)
+        {
             return Err(Error::new("Commons enrollment recipient is not admitted"));
         }
         crate::commons::membership::check_candidate(
@@ -149,6 +151,18 @@ impl Admin {
 
     fn is_denied_in_published_roster(&self, host: &str, recipient: &Recipient) -> bool {
         machine_denied_in_doc(&self.published_doc, host, &recipient.to_bech32())
+    }
+
+    fn is_binding_node_denied_in_published_roster(&self, binding: &Binding) -> bool {
+        let Some(roster) = crate::swarm_roster::SwarmRoster::from_document(&self.published_doc)
+            .ok()
+            .flatten()
+        else {
+            return false;
+        };
+        roster.is_node_denied(&aterm_codec::hex::encode_lower(binding.writer()))
+            || roster.is_node_denied(&aterm_codec::hex::encode_lower(binding.incarnation()))
+            || roster.is_node_denied(&aterm_codec::hex::encode_lower(binding.machine()))
     }
 
     /// The current members a roster write keeps, as recorded grants: all but those `leaving`,
@@ -261,6 +275,7 @@ impl Admin {
                 .commons_eligibility
                 .includes(&machine.name, binding.recipient())
                 || self.is_denied_in_published_roster(&machine.name, &binding.recipient())
+                || self.is_binding_node_denied_in_published_roster(binding)
                 || grants.len() == MAX_MEMBERS
             {
                 continue;
@@ -358,16 +373,13 @@ pub(super) fn machine_denied_in_doc(doc: &Document, host: &str, recipient_str: &
         return false;
     };
     let rec_trimmed = recipient_str.trim();
+    if let Some(row) = roster.member_by_recipient(rec_trimmed) {
+        return steward::member_is_denied_in_roster(&roster, row);
+    }
     roster.is_label_denied(host)
         || roster
-            .members
-            .iter()
-            .filter(|m| {
-                m.recipient.trim() == rec_trimmed
-                    || m.label.eq_ignore_ascii_case(host)
-                    || m.aliases.iter().any(|a| a.eq_ignore_ascii_case(host))
-            })
-            .any(|m| steward::member_is_denied_in_roster(&roster, m))
+            .member_by_label_or_alias(host)
+            .is_some_and(|row| steward::member_is_denied_in_roster(&roster, row))
 }
 
 /// Open the exact locally applied admin snapshot without contacting a server,
@@ -377,7 +389,9 @@ pub fn admin_cached(paths: &Paths) -> crate::Result<Admin> {
     admin_cached_with_lock(paths, StateLock::observe(paths)?)
 }
 
-pub(super) fn admin_cached_until(paths: &Paths, deadline: Instant) -> crate::Result<Admin> {
+/// Observe already-applied local root authority within the caller's deadline.
+/// This never fetches a server, changes setup, or materializes a credential.
+pub fn admin_cached_until(paths: &Paths, deadline: Instant) -> crate::Result<Admin> {
     admin_cached_with_lock(paths, StateLock::observe_until(paths, deadline)?)
 }
 

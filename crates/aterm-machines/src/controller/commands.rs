@@ -555,7 +555,7 @@ fn parse_device_info_txt(text: &str) -> (Option<String>, Option<u32>) {
     for line in text.lines() {
         if let Some((_, hex_part)) = line.split_once("bytes:") {
             decoded.push(' ');
-            for tok in hex_part.split_whitespace() {
+            for tok in hex_part.split_whitespace().filter(|t| !t.starts_with('+')) {
                 if tok.len() == 2
                     && let Ok(b) = u8::from_str_radix(tok, 16)
                 {
@@ -630,68 +630,59 @@ fn resolve_ipv4_banner_and_rtt(
 }
 
 fn open_native_monitor_tab_in_aterm() -> Option<String> {
-    #[cfg(unix)]
+    let mut candidates = Vec::new();
+    if let Some(sock) = std::env::var_os("ATERM_SOCKET") {
+        candidates.push(PathBuf::from(sock));
+    }
+    if let Some(dir) = aterm_uds::control_socket_dir()
+        && let Ok(entries) = std::fs::read_dir(&dir)
     {
-        use std::io::{BufRead, BufReader, Write};
-        use std::os::unix::net::UnixStream;
-        let mut candidates = Vec::new();
-        if let Some(sock) = std::env::var_os("ATERM_SOCKET") {
-            candidates.push(PathBuf::from(sock));
+        let mut socks: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("aterm-") && n.ends_with(".sock"))
+            })
+            .collect();
+        socks.sort();
+        socks.reverse();
+        for s in socks {
+            if !candidates.contains(&s) {
+                candidates.push(s);
+            }
         }
-        if let Some(dir) = aterm_uds::control_socket_dir()
-            && let Ok(entries) = std::fs::read_dir(&dir)
+    }
+    open_native_monitor_tab_in_candidates(&candidates)
+}
+
+fn open_native_monitor_tab_in_candidates(candidates: &[PathBuf]) -> Option<String> {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::unix::net::UnixStream;
+    for sock_path in candidates {
+        let Some(token) = crate::sessions::read_sock_token(sock_path) else {
+            continue;
+        };
+        let Ok(mut stream) = UnixStream::connect(sock_path) else {
+            continue;
+        };
+        if !crate::sessions::same_user_peer(&stream) {
+            continue;
+        }
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
+        if stream
+            .write_all(format!("AUTH {token}\nopen app settings /monitor\n").as_bytes())
+            .and_then(|()| stream.flush())
+            .is_err()
         {
-            let mut socks: Vec<PathBuf> = entries
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| {
-                    p.file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|n| n.starts_with("aterm-") && n.ends_with(".sock"))
-                })
-                .collect();
-            socks.sort();
-            socks.reverse();
-            for s in socks {
-                if !candidates.contains(&s) {
-                    candidates.push(s);
-                }
-            }
+            continue;
         }
-        for sock_path in candidates {
-            let stem = sock_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .and_then(|n| n.strip_suffix(".sock"));
-            let Some(stem) = stem else { continue };
-            let token_path = sock_path.with_file_name(format!("{stem}.token"));
-            let Ok(token) = std::fs::read_to_string(&token_path) else {
-                continue;
-            };
-            let token = token.trim();
-            if token.is_empty() {
-                continue;
-            }
-            let Ok(mut stream) = UnixStream::connect(&sock_path) else {
-                continue;
-            };
-            let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
-            let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
-            if writeln!(stream, "AUTH {token}").is_err() {
-                continue;
-            }
-            let mut reader = BufReader::new(stream);
-            let mut line = String::new();
-            if reader.read_line(&mut line).is_err() || !line.starts_with("OK") {
-                continue;
-            }
-            if writeln!(reader.get_mut(), "open app settings /monitor").is_err() {
-                continue;
-            }
-            line.clear();
-            if reader.read_line(&mut line).is_ok() && line.starts_with("OK") {
-                return Some(sock_path.display().to_string());
-            }
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        if reader.by_ref().take(1024).read_line(&mut line).is_ok() && line.starts_with("OK") {
+            return Some(sock_path.display().to_string());
         }
     }
     None
@@ -3643,19 +3634,99 @@ fn replace_signers(env: &Env<'_>, text: &str) -> Result<(), String> {
         .map_err(|e| format!("{}: {e}", current.display()))
 }
 
-/// `aterm machines here plan|apply <baseline.toml>`: run a baseline directly on this Mac.
+/// How `aterm machines here` speaks ([`here`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HereOutput {
+    /// The report: the host's status line and each row that is not in place.
+    Report,
+    /// The report as JSON (`--json`).
+    Json,
+    /// Nothing but the items' own progress lines (`--plain`, `aterm init`'s root half for
+    /// Apple's Command Line Tools): the run applies the tools' own baseline
+    /// ([`crate::init_clt::CommandLineTools::baseline`]), reading no file the person's account
+    /// could write, and ends on 0 when done, else on the code of why it did not finish
+    /// ([`crate::init_clt::Unfinished::code`]), which `aterm init` says in plain words.
+    Plain,
+}
+
+/// `aterm machines here plan|apply <baseline.toml>`: run a baseline directly on this Mac; with
+/// [`HereOutput::Plain`], the Command Line Tools' own baseline (`baseline_path` unread).
 #[must_use]
-pub fn here(sys: &dyn System, mode: Mode, baseline_path: &Path, json: bool) -> ExitCode {
-    if mode == Mode::Apply && sys.euid() != 0 {
-        errln!("aterm machines here apply: needs root: run it with sudo");
-        return ExitCode::from(2);
-    }
-    let text = match sys.read_file(baseline_path) {
-        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
-        Err(e) => {
-            errln!("aterm machines here: {}: {e}", baseline_path.display());
-            return ExitCode::FAILURE;
+pub fn here(
+    sys: &dyn System,
+    mode: Mode,
+    baseline_path: Option<&Path>,
+    output: HereOutput,
+) -> ExitCode {
+    match here_report(sys, mode, baseline_path, output) {
+        Ok(Some((host, report))) => {
+            print_report(
+                &Env {
+                    sys,
+                    paths: Paths {
+                        root: std::path::PathBuf::from("/nonexistent"),
+                    },
+                    json: output == HereOutput::Json,
+                    tty: false,
+                    parallel: None,
+                    agent_sock: None,
+                },
+                &host,
+                &report,
+            );
+            if report.failed() {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
         }
+        Ok(None) => ExitCode::SUCCESS,
+        Err(code) => code,
+    }
+}
+
+/// [`here`]'s run: the host and its report to print, `None` when a plain run finished, or the
+/// exit code it ends on (a plain run's class of why it did not finish).
+fn here_report(
+    sys: &dyn System,
+    mode: Mode,
+    baseline_path: Option<&Path>,
+    output: HereOutput,
+) -> Result<Option<(Host, HostReport)>, ExitCode> {
+    let plain = output == HereOutput::Plain;
+    let other = || ExitCode::from(crate::init_clt::Unfinished::Other.code().unwrap_or(u8::MAX));
+    // A plain run says nothing of its own: the tab says why it did not finish.
+    macro_rules! refuse {
+        ($code:expr, $($why:tt)*) => {{
+            if plain {
+                return Err(other());
+            }
+            errln!($($why)*);
+            return Err($code);
+        }};
+    }
+    if mode == Mode::Apply && sys.euid() != 0 {
+        refuse!(
+            ExitCode::from(2),
+            "aterm machines here apply: needs root: run it with sudo"
+        );
+    }
+    // The root half trusts nothing the person's account can write: a plain run applies the
+    // tools' own baseline, built in.
+    let text = match (plain, baseline_path) {
+        (true, _) => crate::init_clt::CommandLineTools::baseline(),
+        (false, Some(path)) => match sys.read_file(path) {
+            Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+            Err(e) => refuse!(
+                ExitCode::FAILURE,
+                "aterm machines here: {}: {e}",
+                path.display()
+            ),
+        },
+        (false, None) => refuse!(
+            ExitCode::from(2),
+            "aterm machines here: takes plan|apply <baseline.toml>"
+        ),
     };
     let mut facts = crate::facts::gather_without_keyboards(sys);
     let name = facts.local_host_name.clone();
@@ -3669,17 +3740,11 @@ pub fn here(sys: &dyn System, mode: Mode, baseline_path: &Path, json: bool) -> E
         ],
     ) {
         Ok(t) => t,
-        Err(e) => {
-            errln!("aterm machines here: {e}");
-            return ExitCode::FAILURE;
-        }
+        Err(e) => refuse!(ExitCode::FAILURE, "aterm machines here: {e}"),
     };
     let baseline = match crate::baseline::parse(&text) {
         Ok(b) => b,
-        Err(e) => {
-            errln!("aterm machines here: {e}");
-            return ExitCode::FAILURE;
-        }
+        Err(e) => refuse!(ExitCode::FAILURE, "aterm machines here: {e}"),
     };
     if baseline
         .keyboard
@@ -3697,10 +3762,7 @@ pub fn here(sys: &dyn System, mode: Mode, baseline_path: &Path, json: bool) -> E
     for u in &wanted {
         match crate::facts::user(sys, u) {
             Ok(user) => users.push(user),
-            Err(e) => {
-                errln!("aterm machines here: {e}");
-                return ExitCode::FAILURE;
-            }
+            Err(e) => refuse!(ExitCode::FAILURE, "aterm machines here: {e}"),
         }
     }
     let console = facts
@@ -3717,21 +3779,15 @@ pub fn here(sys: &dyn System, mode: Mode, baseline_path: &Path, json: bool) -> E
     };
     let items = match crate::items::expand(&baseline, &ctx) {
         Ok(i) => i,
-        Err(e) => {
-            errln!("aterm machines here: {e}");
-            return ExitCode::FAILURE;
-        }
+        Err(e) => refuse!(ExitCode::FAILURE, "aterm machines here: {e}"),
     };
     let mut journal = match sys.journal() {
         Ok(journal) => journal,
-        Err(why) => {
-            errln!("aterm machines here: {why}");
-            return ExitCode::FAILURE;
-        }
+        Err(why) => refuse!(ExitCode::FAILURE, "aterm machines here: {why}"),
     };
-    let remedy = aterm_converge::Remedy::Command(format!(
-        "sudo aterm machines here apply {}",
-        baseline_path.display()
+    let remedy = aterm_converge::Remedy::Command(baseline_path.map_or_else(
+        || "sudo aterm machines here apply --plain".to_owned(),
+        |path| format!("sudo aterm machines here apply {}", path.display()),
     ));
     let started = sys.now();
     let rows = match crate::engine::run_with(
@@ -3744,11 +3800,31 @@ pub fn here(sys: &dyn System, mode: Mode, baseline_path: &Path, json: bool) -> E
         &mut |_| {},
     ) {
         Ok(rows) => rows,
-        Err(refused) => {
-            errln!("aterm machines here: {refused}");
-            return ExitCode::FAILURE;
-        }
+        Err(refused) => refuse!(ExitCode::FAILURE, "aterm machines here: {refused}"),
     };
+    if plain {
+        // Done once no row is left short of what the baseline asks: a row that stood aside, or
+        // whose probe was blocked, did not finish either.
+        let unfinished = rows
+            .iter()
+            .find(|row| {
+                !matches!(
+                    row.outcome,
+                    Outcome::Ok | Outcome::Changed | Outcome::NotApplicable
+                )
+            })
+            .map(|row| {
+                items
+                    .iter()
+                    .find(|item| item.id() == row.id)
+                    .and_then(|item| item.unfinished())
+                    .unwrap_or(crate::init_clt::Unfinished::Other)
+            });
+        return match unfinished {
+            None => Ok(None),
+            Some(why) => Err(ExitCode::from(why.code().unwrap_or(u8::MAX))),
+        };
+    }
     let report = HostReport {
         schema: crate::SCHEMA,
         mode,
@@ -3769,22 +3845,7 @@ pub fn here(sys: &dyn System, mode: Mode, baseline_path: &Path, json: bool) -> E
         baseline: None,
         users: Vec::new(),
     };
-    let env_sys = Env {
-        sys,
-        paths: Paths {
-            root: std::path::PathBuf::from("/nonexistent"),
-        },
-        json,
-        tty: false,
-        parallel: None,
-        agent_sock: None,
-    };
-    print_report(&env_sys, &host, &report);
-    if report.failed() {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
-    }
+    Ok(Some((host, report)))
 }
 
 fn load(env: &Env<'_>) -> Result<Inventory, ExitCode> {
@@ -6218,6 +6279,103 @@ mod tests {
         );
     }
 
+    /// `here apply --plain`, `aterm init`'s root half for the Command Line Tools, prints no
+    /// report and no line of its own and reads no baseline file (it applies the tools' own): it
+    /// ends on 0 once that baseline is done, else on the code of why it did not finish
+    /// ([`crate::init_clt::Unfinished::code`]), which `aterm init` says in plain words.
+    #[test]
+    fn here_apply_plain_says_nothing_and_exits_with_why_it_did_not_finish() {
+        use crate::init_clt::Unfinished;
+        let baseline = "/b/command-line-tools.toml";
+        let mac = || {
+            let sys = Fake::root();
+            sys.stat_of(
+                "/dev/console",
+                crate::port::Stat {
+                    uid: 0,
+                    gid: 0,
+                    mode: 0o600,
+                    dir: false,
+                    symlink: false,
+                    len: 0,
+                },
+            );
+            sys
+        };
+        let none_selected = || {
+            Ran::exit(
+                2,
+                "xcode-select: error: Unable to get active developer directory.",
+            )
+        };
+        let curl =
+            "/usr/bin/curl --disable --proto =https -sSI --max-time 20 https://swscan.apple.com/";
+        let plain = |sys: &Fake| here_report(sys, Mode::Apply, None, HereOutput::Plain);
+        let class = |why: Unfinished| Some(ExitCode::from(why.code().unwrap()));
+
+        // Installed and selected already: done, and nothing to print.
+        let done = mac();
+        done.stat_of(
+            crate::items::developer::CLT_GIT,
+            crate::port::Stat {
+                uid: 0,
+                gid: 0,
+                mode: 0o755,
+                dir: false,
+                symlink: false,
+                len: 1,
+            },
+        )
+        .on(
+            "/usr/bin/xcode-select -p",
+            Ran::ok("/Library/Developer/CommandLineTools\n"),
+        );
+        assert!(matches!(plain(&done), Ok(None)));
+
+        // Apple's catalog out of reach.
+        let unreached = mac();
+        unreached
+            .on("/usr/bin/xcode-select -p", none_selected())
+            .on(curl, Ran::exit(6, "curl: (6) Could not resolve host"));
+        assert!(plain(&unreached).err() == class(Unfinished::Catalog));
+
+        // Another install holds the placeholder.
+        let busy = mac();
+        busy.on("/usr/bin/xcode-select -p", none_selected())
+            .on(curl, Ran::ok("HTTP/1.1 404 Not Found\r\n\r\n"))
+            .running(&["/usr/sbin/softwareupdate"])
+            .file(crate::items::developer::PLACEHOLDER, b"");
+        assert!(plain(&busy).err() == class(Unfinished::Busy));
+
+        // A baseline file the person's account wrote is never what the root half applies: one
+        // that asks for nothing still installs the tools.
+        let planted = mac();
+        planted
+            .file(baseline, b"schema = 1\n")
+            .on("/usr/bin/xcode-select -p", none_selected())
+            .on(curl, Ran::exit(6, "curl: (6) Could not resolve host"));
+        assert!(plain(&planted).err() == class(Unfinished::Catalog));
+
+        // What the root half cannot even start is said as the other class, never in its words.
+        let mut user = Fake::default();
+        user.euid = 501;
+        user.file(baseline, b"schema = 1\n");
+        assert!(plain(&user).err() == class(Unfinished::Other));
+        assert!(
+            here_report(
+                &user,
+                Mode::Apply,
+                Some(Path::new(baseline)),
+                HereOutput::Report
+            )
+            .err()
+                == Some(ExitCode::from(2)),
+            "a person's own run keeps its usage refusal"
+        );
+        let unread = Fake::root();
+        assert!(plain(&unread).err() == class(Unfinished::Other));
+    }
+
     #[test]
     fn here_journals_each_change_in_the_journal_of_the_system_it_runs_on() {
         let journaled = |sys: &Fake| -> Vec<aterm_json::Value> {
@@ -6251,7 +6409,12 @@ mod tests {
             Ran::ok("lab-07.lab.example\n"),
         );
         assert_eq!(
-            here(&sys, Mode::Apply, Path::new(baseline), true),
+            here(
+                &sys,
+                Mode::Apply,
+                Some(Path::new(baseline)),
+                HereOutput::Json
+            ),
             ExitCode::SUCCESS
         );
         assert_eq!(
@@ -6278,7 +6441,12 @@ mod tests {
             Ran::ok(""),
         );
         assert_eq!(
-            here(&sys, Mode::Apply, Path::new(baseline), true),
+            here(
+                &sys,
+                Mode::Apply,
+                Some(Path::new(baseline)),
+                HereOutput::Json
+            ),
             ExitCode::SUCCESS
         );
         let lines = journaled(&sys);
@@ -6290,6 +6458,45 @@ mod tests {
         assert_eq!(
             line["revert"].as_str(),
             Some("/usr/sbin/scutil --set HostName ''")
+        );
+    }
+
+    #[test]
+    fn monitor_tab_opener_speaks_silent_auth_and_explicit_socket_tokens() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("at-mon-open-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let sym_sock = dir.path().join("aterm-1111.sock");
+        let real_tok = dir.path().join("real.token");
+        std::fs::write(&real_tok, "secret1111\n").unwrap();
+        std::os::unix::fs::symlink(&real_tok, dir.path().join("aterm-1111.token")).unwrap();
+        let _unused = UnixListener::bind(&sym_sock).unwrap();
+
+        let explicit_sock = dir.path().join("custom.sock");
+        std::fs::write(dir.path().join("custom.sock.token"), "cafef00d\n").unwrap();
+        let listener = UnixListener::bind(&explicit_sock).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(conn.try_clone().unwrap());
+            let mut auth = String::new();
+            reader.read_line(&mut auth).unwrap();
+            assert_eq!(auth, "AUTH cafef00d\n");
+            let mut verb = String::new();
+            reader.read_line(&mut verb).unwrap();
+            assert_eq!(verb, "open app settings /monitor\n");
+            conn.write_all(b"OK\n").unwrap();
+        });
+
+        let opened = open_native_monitor_tab_in_candidates(&[sym_sock, explicit_sock.clone()]);
+        server.join().unwrap();
+        assert_eq!(opened.as_deref(), explicit_sock.to_str());
+        assert_eq!(
+            parse_device_info_txt("bytes: 6d 6f 64 65 6c 3d 4d +a 61 63"),
+            (Some("Mac".to_owned()), None)
         );
     }
 }

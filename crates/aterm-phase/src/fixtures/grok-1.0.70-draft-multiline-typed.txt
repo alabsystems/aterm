@@ -1,0 +1,50 @@
+# grok 1.0.70 · MEASURED 2026-10-29, `aterm ctl text` of a private headless aterm (144x50, aterm 0.146.0) running the real Grok Build, launched by path in the lab's jail with a scratch `HOME` and `GROK_HOME`, the lab's `XAI_API_KEY` and `GROK_XAI_API_BASE_URL`/`GROK_CLI_CHAT_PROXY_BASE_URL=http://127.0.0.1:<port>/v1` (a local stub of xAI's API, crates/aterm-lab) · a two-line draft typed with `ctl send` and `ctl key alt+enter` (ESC CR, the key row's `Opt+Enter:newline`) between the lines: two draft rows, the box grown upward by one row · cursor=45,20 (visible, blinking_block: after the second line) · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+  /p/t/at.lab0/proj                                                                                                   11K / 256K │ [Dashboard]
+
+
+     ❯ first pasted line                                                                                                             1:57 PM
+       second pasted line
+       third pasted line
+
+
+     Hi! I am the local lab stub, not a model. (reply 8)                                                                             1:57 PM
+
+     Worked for 0.2s
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ ❯ typed line one                                                                                                                         │
+  │   typed line two                                                                                                                         │
+  ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── lab-stub ─╯
+
+  Enter:send  │  Opt+Enter:newline  │  Shift+Tab:mode  │  Ctrl+x:shortcuts

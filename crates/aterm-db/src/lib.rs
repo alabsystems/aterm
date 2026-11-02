@@ -17,6 +17,8 @@ aterm_secrets::memoized_x25519_in_tests!();
 
 pub mod accounts;
 #[cfg(unix)]
+pub mod admission;
+#[cfg(unix)]
 pub mod catalog;
 #[cfg(unix)]
 pub mod cli;
@@ -28,6 +30,8 @@ pub mod credentials;
 pub mod crypto;
 pub mod database;
 mod documents;
+#[cfg(unix)]
+mod generation;
 #[cfg(unix)]
 pub mod import;
 #[cfg(unix)]
@@ -47,6 +51,65 @@ pub mod runtime;
 pub mod service_state;
 #[cfg(unix)]
 pub mod table;
+
+/// Resolve application storage to an already admitted, fully preserved writer
+/// generation. Call before opening its secrets bootstrap or table directory.
+/// This starts no network work and neither enrolls nor replaces storage.
+///
+/// # Errors
+/// Returns an error if retained selection or custody state is unavailable,
+/// incomplete, changed or no longer authorized.
+#[cfg(unix)]
+pub fn application_paths(
+    paths: &aterm_secrets::client::Paths,
+) -> Result<aterm_secrets::client::Paths> {
+    generation::selected(paths)
+}
+
+/// Resolve existing admitted application custody under one caller-owned
+/// deadline. This changes no enrollment, storage or caller configuration.
+#[cfg(unix)]
+pub fn application_paths_until(
+    paths: &aterm_secrets::client::Paths,
+    deadline: std::time::Instant,
+) -> Result<aterm_secrets::client::Paths> {
+    generation::selected_until(paths, deadline)
+}
+
+/// Observe authenticated predecessor and selected Writer identities under one
+/// deadline. These metadata identities grant no publication or key authority.
+#[cfg(unix)]
+pub fn application_lineage_until(
+    paths: &aterm_secrets::client::Paths,
+    deadline: std::time::Instant,
+) -> Result<Vec<aterm_secrets::commons::binding::Binding>> {
+    generation::lineage_until(paths, deadline)
+}
+
+/// Complete a real writer-successor fixture from two already admitted private
+/// homes beneath one owned temporary directory. No CLI exposes this test seam.
+#[doc(hidden)]
+#[cfg(all(unix, any(test, debug_assertions)))]
+pub fn test_complete_writer_successor(
+    fixture: &std::path::Path,
+    original: &aterm_secrets::client::Paths,
+    successor: &aterm_secrets::client::Paths,
+    config: &std::path::Path,
+    deadline: std::time::Instant,
+) -> Result<aterm_secrets::client::Paths> {
+    generation::test_complete_successor(fixture, original, successor, config, deadline)
+}
+
+/// Authenticate preserved writer-recovery prefixes without importing records.
+/// Development observations expose counts and bounded refusals, never values.
+///
+/// # Errors
+/// Recovery selection, policy, source custody or the admitted candidate cannot
+/// be opened. Individual table refusals remain in the returned observation.
+#[cfg(all(unix, any(test, debug_assertions)))]
+pub fn inspect_writer_recovery(paths: &aterm_secrets::client::Paths) -> Result<aterm_json::Value> {
+    generation::inspect(paths)
+}
 
 /// A refusal that identifies the failed boundary without quoting payloads or keys.
 #[derive(Debug)]

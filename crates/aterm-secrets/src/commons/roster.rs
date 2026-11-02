@@ -313,6 +313,7 @@ fn decode(wire: &[u8]) -> Result<Roster> {
 pub struct Access {
     trust: Trust,
     head: [u8; 32],
+    control_history_head: [u8; 32],
     basis: [u8; 32],
     generation: u64,
     members: Vec<Member>,
@@ -324,6 +325,11 @@ pub struct Access {
 impl Access {
     pub const fn head(&self) -> &[u8; 32] {
         &self.head
+    }
+    /// The control-history commitment used by older application peers. This does
+    /// not replace [`Self::head`]'s binding-sensitive local authorization fence.
+    pub const fn control_history_head(&self) -> &[u8; 32] {
+        &self.control_history_head
     }
     /// Exact data node supplying the roster; a recovery head has no payload.
     pub const fn basis(&self) -> &[u8; 32] {
@@ -416,7 +422,7 @@ impl Access {
         basis: [u8; 32],
     ) -> Result<Option<Historical>> {
         type HistoricalCacheKey = (Trust, [u8; 32], [u8; 32], [u8; 32]);
-        type HistoricalCacheVal = Option<(u64, Vec<Member>, [u8; 32])>;
+        type HistoricalCacheVal = Option<(u64, Vec<Member>, Zeroizing<[u8; 32]>)>;
         static HISTORICAL_CACHE: std::sync::Mutex<
             std::collections::VecDeque<(HistoricalCacheKey, HistoricalCacheVal)>,
         > = std::sync::Mutex::new(std::collections::VecDeque::new());
@@ -482,7 +488,7 @@ impl Access {
             if cache.len() >= 16 {
                 cache.pop_front();
             }
-            cache.push_back((cache_key, Some((generation, members.clone(), *key))));
+            cache.push_back((cache_key, Some((generation, members.clone(), key.clone()))));
         }
         Ok(Some(Historical {
             trust: self.trust,
@@ -716,21 +722,52 @@ impl Historical {
 fn commons_log_state_digest(paths: &crate::client::Paths, heads_digest: [u8; 32]) -> [u8; 32] {
     let mut hash = aterm_digest::Sha256::new();
     hash.update(heads_digest);
-    if let Ok(bytes) = std::fs::read(paths.state_file()) {
-        hash.update(&bytes);
+    if let Ok(Some(bytes)) = crate::fsx::read_private(&paths.state_file(), crate::client::MAX_STATE)
+    {
+        hash.update([1]);
+        hash.update((bytes.len() as u64).to_le_bytes());
+        hash.update(bytes.as_slice());
+    } else {
+        hash.update([0]);
     }
+    if let Ok(Some(bytes)) =
+        crate::fsx::read_public(&paths.dir.join("source.toml"), crate::client::MAX_STATE)
+    {
+        hash.update([1]);
+        hash.update((bytes.len() as u64).to_le_bytes());
+        hash.update(&bytes);
+    } else {
+        hash.update([0]);
+    }
+    let node_dir = paths
+        .home
+        .join(".local")
+        .join("state")
+        .join("aterm")
+        .join("node");
     for extra in [
-        paths.dir.join("applied.vault"),
-        paths.dir.join("source.toml"),
+        paths.dir.join("vault"),
+        paths.dir.join("identity"),
+        paths.dir.join("commons").join("device.age"),
+        node_dir.join("node.key"),
+        node_dir.join("node.id"),
     ] {
         if let Ok(meta) = std::fs::symlink_metadata(&extra) {
+            hash.update([1]);
             hash.update(meta.len().to_le_bytes());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                hash.update(meta.ino().to_le_bytes());
+            }
             if let Ok(dur) = meta.modified().and_then(|t| {
                 t.duration_since(std::time::UNIX_EPOCH)
                     .map_err(std::io::Error::other)
             }) {
                 hash.update(dur.as_nanos().to_le_bytes());
             }
+        } else {
+            hash.update([0]);
         }
     }
     hash.finalize()
@@ -745,7 +782,15 @@ pub(super) fn current_from_loaded_log(
     heads_digest: [u8; 32],
 ) -> Result<Option<Access>> {
     type AccessCacheKey = (Trust, [u8; 32], [u8; 32]);
-    type AccessCacheVal = Option<([u8; 32], [u8; 32], u64, Vec<Member>, usize, [u8; 32])>;
+    type AccessCacheVal = Option<(
+        [u8; 32],
+        [u8; 32],
+        [u8; 32],
+        u64,
+        Vec<Member>,
+        usize,
+        Zeroizing<[u8; 32]>,
+    )>;
     static ACCESS_CACHE: std::sync::Mutex<
         std::collections::VecDeque<(AccessCacheKey, AccessCacheVal)>,
     > = std::sync::Mutex::new(std::collections::VecDeque::new());
@@ -755,21 +800,20 @@ pub(super) fn current_from_loaded_log(
     if let Ok(cache) = ACCESS_CACHE.lock()
         && let Some((_, cached)) = cache.iter().find(|(k, _)| *k == cache_key)
     {
-        return Ok(cached
-            .as_ref()
-            .map(
-                |(head, basis, generation, members, local, key_bytes)| Access {
-                    trust,
-                    head: *head,
-                    basis: *basis,
-                    generation: *generation,
-                    members: members.clone(),
-                    local: *local,
-                    key: SecretBytes::from(key_bytes.as_slice()),
-                    log_paths: Some(paths.clone()),
-                    log_heads_digest: Some(state_digest),
-                },
-            ));
+        return Ok(cached.as_ref().map(
+            |(head, control_history_head, basis, generation, members, local, key_bytes)| Access {
+                trust,
+                head: *head,
+                control_history_head: *control_history_head,
+                basis: *basis,
+                generation: *generation,
+                members: members.clone(),
+                local: *local,
+                key: SecretBytes::from(key_bytes.as_slice()),
+                log_paths: Some(paths.clone()),
+                log_heads_digest: Some(state_digest),
+            },
+        ));
     }
     if crate::client::local_recipient_denied_in_roster(paths) {
         if let Ok(mut cache) = ACCESS_CACHE.lock() {
@@ -809,13 +853,7 @@ pub(super) fn current_from_loaded_log(
                 &crate::membership_log::EpochAudience::Everyone,
                 &m.binding.recipient(),
             )
-            && !m.node_key.is_some_and(|nk| {
-                nk != [0; 32]
-                    && matches!(
-                        membership.node(&nk),
-                        crate::membership_log::NodeStanding::Removed(_)
-                    )
-            })
+            && !membership.member_node_removed(m)
             && !roster
                 .as_ref()
                 .is_some_and(|r| crate::client::member_denied_by_roster(r, m))
@@ -906,6 +944,7 @@ pub(super) fn current_from_loaded_log(
     hash.update(b"ALCO2");
     hash.update(heads_digest);
     hash.update(view.basis);
+    let control_history_head = hash.clone().finalize();
     for m in &members {
         hash.update(m.binding.bytes());
     }
@@ -918,17 +957,19 @@ pub(super) fn current_from_loaded_log(
             cache_key,
             Some((
                 head,
+                control_history_head,
                 view.basis,
                 view.generation,
                 members.clone(),
                 local,
-                *view.key,
+                view.key.clone(),
             )),
         ));
     }
     Ok(Some(Access {
         trust,
         head,
+        control_history_head,
         basis: view.basis,
         generation: view.generation,
         members,
@@ -1069,6 +1110,7 @@ fn validate(
     Ok(Access {
         trust: journal.trust(),
         head: current.head,
+        control_history_head: current.head,
         basis: current.basis,
         generation: roster.generation,
         members,

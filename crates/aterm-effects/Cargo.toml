@@ -122,3 +122,8 @@ harness = false
 name = "rainbow_kitty_v2_frame_cost"
 path = "benches/rainbow_kitty_v2_frame_cost.rs"
 harness = false
+
+[[bench]]
+name = "pet_pose_bake"
+path = "benches/pet_pose_bake.rs"
+harness = false

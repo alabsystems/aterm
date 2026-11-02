@@ -29,8 +29,10 @@ dev-seams = []
 # Exclusively owned notifier carry stages, removed on error/drop.
 aterm-tempfile = { workspace = true }
 # The bus: `cap` for the bound grant every fabric principal attaches with. Its
-# SHA-256 is astream's own astream-digest, so this crate takes no third-party
-# crate from astream. astream's `aead` (the sealed record layer) is not enabled.
+# SHA-256 is astream's own astream-digest. `at-rest` seals `bus.log` and its
+# sidecars under `rest.key` (`crate::at_rest`); it brings astream-aead, whose ring
+# and zeroize are in the graph already. astream's `aead` (the sealed WIRE, its
+# `serve_tcp_sealed` and `connect_sealed`) stays off: `at-rest` compiles none of it.
 # `retention` compiles astream's R4 retention classes: `aterm link broker`
 # (and the world harness's broker) retains its log by
 # `broker_rules::default_rules()` from every open (session log Phase 6 step
@@ -38,7 +40,7 @@ aterm-tempfile = { workspace = true }
 # the log. It is a dependency feature, not a dev row, so the broker the tests
 # run is the broker that ships and a `-p aterm` build shares every unit a
 # `--workspace` test build compiled.
-astream-broker = { path = "../../vendor/astream/crates/astream-broker", features = ["cap", "retention"] }
+astream-broker = { path = "../../vendor/astream/crates/astream-broker", features = ["at-rest", "cap", "retention"] }
 astream-cap = { path = "../../vendor/astream/crates/astream-cap" }
 # astream's address grammar (`subject::validate_filter_str`), the one the broker
 # parses a subscription with: `aterm fabric tail --filter` refuses at the parse,
@@ -99,8 +101,8 @@ aterm-toml = { workspace = true }
 libc = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-# The kernel's process records, read in-process (`fabric::process_table`,
-# `fabric::running_image_inode`). Linux reads `/proc` and keeps `ps`.
+# The mapped image's inode, read in-process (`fabric::running_image_inode`), where
+# Linux follows `/proc/<pid>/exe`.
 aterm-sysprobe = { workspace = true }
 
 [dev-dependencies]

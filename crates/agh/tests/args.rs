@@ -86,9 +86,9 @@ fn rest_skips_content_with_or_without_the_repo_flag() {
 
 #[test]
 fn a_refused_path_exits_one() {
-    let e = refused(&["release", "create", "o/r"]);
+    let e = refused(&["repo", "create", "o/r"]);
     assert_eq!((e.error.kind, e.error.exit()), (Kind::Refused, 1));
-    assert_eq!(e.verb, "release.create");
+    assert_eq!(e.verb, "repo.create");
     let e = refused(&["pr", "list"]);
     assert_eq!(e.verb, "pr");
 }

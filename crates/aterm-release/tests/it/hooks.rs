@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::hook::{
-    Asked, PrePromote, Transforms, cutter_command, pre_promote, running_cutter_command,
+    Asked, PrePromote, Transforms, cutter_command, handed, pre_promote, running_cutter_command,
     source_differs, transforms,
 };
 use crate::transforms::{Inputs, run};
@@ -284,6 +284,8 @@ fn the_commits_own_cutter_inherits_nothing_from_the_alias() {
         "PATH",
         "HOME",
         "TRUST_STAGE2_BIN",
+        "ATERM_RELEASE_CUTTER",
+        "ATERM_RELEASE_CUTTER_SINCE",
     ]
     .map(String::from);
     let cmd = cutter_command(
@@ -302,6 +304,8 @@ fn the_commits_own_cutter_inherits_nothing_from_the_alias() {
     assert_eq!(
         removed,
         [
+            "ATERM_RELEASE_CUTTER",
+            "ATERM_RELEASE_CUTTER_SINCE",
             "CARGO",
             "CARGO_MANIFEST_DIR",
             "CARGO_PKG_NAME",
@@ -711,6 +715,12 @@ fn the_astream_crates_are_derived_at_the_captured_gitlink() {
         link_crate(&export, dep);
     };
     fresh("astream-broker");
+    std::fs::write(sp.join("LICENSE"), "DIRTY LICENSE\n").unwrap();
+    let outside = root.join("outside-astream");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::create_dir_all(export.join("vendor")).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, export.join("vendor/astream")).unwrap();
     run(&Inputs {
         root: sp.clone(),
         export: export.clone(),
@@ -718,15 +728,49 @@ fn the_astream_crates_are_derived_at_the_captured_gitlink() {
     })
     .unwrap();
     assert_eq!(
+        std::fs::read_to_string(export.join("vendor/astream/LICENSE")).unwrap(),
+        "Apache-2.0 fixture\n",
+        "LICENSE is read from the captured commit, not the dirty checkout"
+    );
+    assert!(
+        std::fs::read_dir(&outside).unwrap().next().is_none(),
+        "a pre-existing vendor/astream symlink is removed rather than followed"
+    );
+    assert_eq!(
         std::fs::read_to_string(export.join("vendor/astream/crates/astream-hash/src/lib.rs"))
             .unwrap(),
         "// ONE\n"
     );
     assert!(exported_astream(&export).contains(&"astream-hash".to_string()));
 
+    #[cfg(unix)]
+    {
+        fresh("astream-broker");
+        std::os::unix::fs::symlink(&outside, export.join("vendor")).unwrap();
+        let why = run(&Inputs {
+            root: sp.clone(),
+            export: export.clone(),
+            captured: head.clone(),
+        })
+        .unwrap_err();
+        assert!(why.contains("refusing symbolic link"), "{why}");
+
+        fresh("astream-broker");
+        let outside_lock = root.join("outside.lock");
+        std::fs::write(&outside_lock, "outside\n").unwrap();
+        std::os::unix::fs::symlink(&outside_lock, export.join("Cargo.lock")).unwrap();
+        let why = run(&Inputs {
+            root: sp.clone(),
+            export: export.clone(),
+            captured: head.clone(),
+        })
+        .unwrap_err();
+        assert!(why.contains("not a regular file"), "{why}");
+    }
+
     fresh("astream-gone");
     let why = run(&Inputs {
-        root: sp,
+        root: sp.clone(),
         export: export.clone(),
         captured: head,
     })
@@ -735,6 +779,27 @@ fn the_astream_crates_are_derived_at_the_captured_gitlink() {
         why.contains("vendor/astream/crates/astream-gone, which astream"),
         "{why}"
     );
+
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(
+            "/etc/passwd",
+            astream.join("crates/astream-wire/src/link.rs"),
+        )
+        .unwrap();
+        let bad_rev = git.commit_all(&astream, "symlink in astream");
+        git.ok(&sp.join("vendor/astream"), &["fetch", "-q", "origin"]);
+        git.ok(&sp.join("vendor/astream"), &["checkout", "-q", &bad_rev]);
+        let bad_head = git.commit_all(&sp, "gitlink with symlink");
+        fresh("astream-broker");
+        let why = run(&Inputs {
+            root: sp,
+            export: export.clone(),
+            captured: bad_head,
+        })
+        .unwrap_err();
+        assert!(why.contains("unsupported tree entry mode 120000"), "{why}");
+    }
 }
 
 #[test]
@@ -933,6 +998,7 @@ fn the_transforms_run_as_the_captured_commits_own_code() {
         source: repo.join("crates/aterm-release"),
         target: Some(PathBuf::from("build/shared")),
         delegated: None,
+        handed: None,
         git_env: git.env.clone(),
     };
     let rules = repo.join("crates/aterm-release/src/transforms.rs");
@@ -996,6 +1062,7 @@ fn the_transforms_refuse_rather_than_run_other_rules() {
         source: repo.join("crates/aterm-release"),
         target: None,
         delegated: delegated.map(str::to_string),
+        handed: None,
         git_env: git.env.clone(),
     };
     for (facts, words) in [
@@ -1017,6 +1084,161 @@ fn the_transforms_refuse_rather_than_run_other_rules() {
     let (code, ran, _) = dispatch(&facts(&c1, Some(&"f".repeat(40))));
     assert_eq!(code, 0);
     assert!(matches!(ran, Ran::There { .. }), "{ran:?}");
+}
+
+#[test]
+fn a_handed_cutter_runs_the_transforms_only_as_the_captured_commits_build() {
+    let (_dir, root, git) = scratch();
+    let (repo, [_, c1, c2]) = cutter_history(&root, &git);
+    // The handed cutter's checkout holds its own build, a file c2 does not.
+    std::fs::create_dir_all(repo.join("target/gate")).unwrap();
+    std::fs::write(repo.join("target/gate/aterm-release"), "linked\n").unwrap();
+    let facts = |handed: Option<Result<String, String>>| Transforms {
+        inputs: Inputs {
+            root: repo.clone(),
+            export: root.join("export"),
+            captured: c2.clone(),
+        },
+        source: repo.join("crates/aterm-release"),
+        target: None,
+        delegated: None,
+        handed,
+        git_env: git.env.clone(),
+    };
+    let own = || Ran::There {
+        rules: "// TWO\n".into(),
+        full: c2.clone(),
+        target: repo.join("target/pre-promote.noindex"),
+    };
+
+    let (code, ran, said) = dispatch(&facts(Some(Ok(c2.clone()))));
+    assert_eq!((code, ran), (0, Ran::Here(c2.clone())), "{said}");
+    assert!(
+        said.contains(&format!(
+            "the build of {} itself (nothing built)",
+            &c2[..12]
+        )),
+        "{said}"
+    );
+    // Negative control: judged by its checkout, as a cutter targo built is, it is not c2's.
+    let (code, ran, said) = dispatch(&facts(None));
+    assert_eq!((code, ran), (0, own()), "{said}");
+    assert!(said.contains("holds files"), "{said}");
+
+    let dirty = "its checkout has uncommitted cutter sources (Cargo.lock)".to_string();
+    for (handed, words) in [
+        (
+            Ok(c1.clone()),
+            format!("handed to the engine is the build of {}, not", &c1[..12]),
+        ),
+        (
+            Err(dirty.clone()),
+            format!("is no commit's build ({dirty})"),
+        ),
+    ] {
+        let (code, ran, said) = dispatch(&facts(Some(handed)));
+        assert_eq!((code, ran), (0, own()), "{said}");
+        assert!(said.contains(&words), "{words}: {said}");
+        assert!(!said.contains("nothing built"), "{said}");
+    }
+    assert_eq!(worktrees(&git, &repo), 1);
+}
+
+/// A cutter is handed to the engine only when `ATERM_RELEASE_CUTTER` names its own executable,
+/// spelled through a link or not; one `targo` built that inherited the variable naming another
+/// cutter, or a path that names nothing, keeps its whole-checkout rule, and so does a cutter
+/// that cannot name its own executable. NEGATIVE CONTROL: take any variable that is set, and
+/// another cutter's path hands this one.
+#[test]
+fn a_cutter_is_handed_only_when_the_variable_names_its_own_executable() {
+    let (_dir, root, _git) = scratch();
+    let (exe, other) = (
+        root.join("gate/aterm-release"),
+        root.join("debug/aterm-release"),
+    );
+    for cutter in [&exe, &other] {
+        std::fs::create_dir_all(cutter.parent().unwrap()).unwrap();
+        std::fs::write(cutter, "linked\n").unwrap();
+    }
+    let stamp = "c".repeat(40);
+    let judged = || Ok(stamp.clone());
+    assert_eq!(
+        handed(Some(&exe), Some(&exe), judged),
+        Some(Ok(stamp.clone()))
+    );
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(root.join("gate"), root.join("lane")).unwrap();
+        let through = root.join("lane/aterm-release");
+        assert_eq!(
+            handed(Some(&through), Some(&exe), judged),
+            Some(Ok(stamp.clone())),
+            "this executable through a link to its folder"
+        );
+    }
+    let gone = root.join("gone");
+    for (named, what) in [
+        (Some(other.as_path()), "another cutter's path, inherited"),
+        (Some(gone.as_path()), "a path that names nothing"),
+        (None, "no variable"),
+    ] {
+        assert_eq!(handed(named, Some(&exe), judged), None, "{what}");
+    }
+    assert_eq!(
+        handed(Some(&exe), None, judged),
+        None,
+        "a cutter that cannot name its own executable"
+    );
+}
+
+#[test]
+fn the_transforms_stub_runs_a_handed_cutter_and_builds_one_only_without() {
+    let bash = Path::new("/bin/bash");
+    if !bash.exists() {
+        aterm_spec::host::could_not_run("/bin/bash is not installed");
+    }
+    let (_dir, root, _git) = scratch();
+    let stub = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../publish/transforms.sh");
+    let (bin, said) = (root.join("bin"), root.join("said"));
+    std::fs::create_dir_all(&bin).unwrap();
+    for name in ["aterm-release", "targo"] {
+        let fake = bin.join(name);
+        std::fs::write(
+            &fake,
+            format!("#!/bin/sh\necho \"$0 $*\" >> '{}'\n", said.display()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    let sourced = |handed: Option<&Path>| {
+        let _ = std::fs::remove_file(&said);
+        let mut sh = aterm_uds::spawnfd::command(bash);
+        sh.args(["-c", "set -euo pipefail\n. \"$1\"\n", "transforms"])
+            .arg(&stub)
+            .env("TRUST_STAGE2_BIN", &bin)
+            .env_remove("ATERM_RELEASE_CUTTER")
+            .stdin(aterm_uds::spawnfd::Stdio::null());
+        if let Some(cutter) = handed {
+            sh.env("ATERM_RELEASE_CUTTER", cutter);
+        }
+        assert!(sh.status().unwrap().success(), "{}", stub.display());
+        std::fs::read_to_string(&said).unwrap()
+    };
+    let cutter = bin.join("aterm-release");
+    let built = format!(
+        "{} --unverified ship hook transforms\n",
+        bin.join("targo").display()
+    );
+    assert_eq!(
+        sourced(Some(&cutter)),
+        format!("{} hook transforms\n", cutter.display())
+    );
+    assert_eq!(sourced(None), built);
+    assert_eq!(sourced(Some(Path::new(""))), built);
 }
 
 #[test]
@@ -1052,6 +1274,7 @@ fn export_cutter_attests_dependency_sources_and_workspace_inputs() {
         source: repo.join("crates/aterm-release"),
         target: Some(root.join("shared-target")),
         delegated: None,
+        handed: None,
         git_env: git.env.clone(),
     };
     assert_eq!(dispatch(&facts).1, Ran::Here(captured.clone()));
@@ -1138,6 +1361,7 @@ fn export_cutter_attests_submodule_working_sources() {
         source: repo.join("crates/aterm-release"),
         target: Some(root.join("shared-target")),
         delegated: None,
+        handed: None,
         git_env: git.env.clone(),
     };
     assert_eq!(dispatch(&facts).1, Ran::Here(captured.clone()));

@@ -435,7 +435,10 @@ impl Element {
         else {
             return false;
         };
-        handler.borrow_mut().do_action(request);
+        let Ok(mut handler) = handler.try_borrow_mut() else {
+            return false;
+        };
+        handler.do_action(request);
         true
     }
 }
@@ -503,24 +506,30 @@ impl Adapter {
 
     /// Build nothing until an assistive query has requested the initial tree.
     pub fn update_if_active(&mut self, update: impl FnOnce() -> TreeUpdate) {
-        if self.context.borrow().active {
+        if self.context.try_borrow().is_ok_and(|cx| cx.active) {
             apply(&self.context, update());
         }
     }
 
     pub fn set_scale_factor(&mut self, scale: f64) {
-        self.context.borrow_mut().scale = valid_scale(scale);
+        if let Ok(mut cx) = self.context.try_borrow_mut() {
+            cx.scale = valid_scale(scale);
+        }
         notify(self.host.as_id(), Notification::Layout);
     }
 
     pub fn update_window_focus_state(&mut self, focused: bool) {
-        let changes = self.context.borrow_mut().publication.set_focused(focused);
+        let Ok(mut cx) = self.context.try_borrow_mut() else {
+            return;
+        };
+        let changes = cx.publication.set_focused(focused);
+        drop(cx);
         announce(&self.context, changes);
     }
 
     /// The model's bounds stay in client pixels.
     pub fn window_moved(&mut self) {
-        if self.context.borrow().active {
+        if self.context.try_borrow().is_ok_and(|cx| cx.active) {
             notify(self.host.as_id(), Notification::Layout);
         }
     }
@@ -528,10 +537,15 @@ impl Adapter {
 
 impl Drop for Adapter {
     fn drop(&mut self) {
-        self.context.borrow_mut().closed = true;
-        self.context.borrow_mut().active = false;
-        self.context.borrow_mut().publication = Publication::default();
-        if let Some(view) = self.context.borrow().view.load() {
+        let view = if let Ok(mut cx) = self.context.try_borrow_mut() {
+            cx.closed = true;
+            cx.active = false;
+            cx.publication = Publication::default();
+            cx.view.load()
+        } else {
+            None
+        };
+        if let Some(view) = view {
             // SAFETY: the publisher is main-thread-only and this load retains a still-live NSView;
             // nil removes this publisher's children.
             unsafe {
@@ -553,7 +567,11 @@ fn activate(context: &Shared) {
         cx.active = true;
         cx.activation.clone()
     };
-    if let Some(update) = activation.borrow_mut().request_initial_tree() {
+    let update = activation
+        .try_borrow_mut()
+        .ok()
+        .and_then(|mut a| a.request_initial_tree());
+    if let Some(update) = update {
         apply(context, update);
     }
 }
@@ -563,7 +581,9 @@ fn apply(context: &Shared, update: TreeUpdate) {
         return;
     };
     let changes = {
-        let mut cx = context.borrow_mut();
+        let Ok(mut cx) = context.try_borrow_mut() else {
+            return;
+        };
         let changes = cx.publication.update(update);
         for id in changes.removed.iter().chain(&changes.replaced) {
             cx.elements.remove(id);
@@ -612,7 +632,9 @@ fn notify(element: Id, notification: Notification) {
 
 fn announce_live(context: &Shared, live: Live, value: &str) {
     let application = {
-        let cx = context.borrow();
+        let Ok(cx) = context.try_borrow() else {
+            return;
+        };
         let Some(view) = cx.view.load() else {
             return;
         };
@@ -665,7 +687,9 @@ fn announce_live(context: &Shared, live: Live, value: &str) {
 
 fn announce(context: &Shared, changes: Changes) {
     let (host, updated, focus) = {
-        let cx = context.borrow();
+        let Ok(cx) = context.try_borrow() else {
+            return;
+        };
         let host = (!changes.added.is_empty()
             || !changes.removed.is_empty()
             || !changes.replaced.is_empty())

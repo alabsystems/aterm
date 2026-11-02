@@ -208,7 +208,11 @@ impl InitialHost for Host {
         unreachable!("not in the plan")
     }
 
-    fn accounts(&mut self, _root: &Path, _on_screen: bool) -> Result<Option<Report>, String> {
+    fn accounts(
+        &mut self,
+        _root: &Path,
+        _on_screen: fn() -> bool,
+    ) -> Result<Option<Report>, String> {
         unreachable!("not in the plan")
     }
 
@@ -824,7 +828,7 @@ fn outside_alab_the_repositories_read_as_their_stage_runs_them() {
         for token in [true, false] {
             for (network, heard) in [(&HOME, true), (&OFFICE, false)] {
                 let (sys, ctx) = github(home.path(), token);
-                let seen = repositories_heard(&sys, &ctx, &plan, || {
+                let seen = repositories_heard(&sys, &ctx, &plan, false, || {
                     heard_for(&plan, Some(root.path()), network)
                 })
                 .unwrap();
@@ -849,6 +853,88 @@ fn outside_alab_the_repositories_read_as_their_stage_runs_them() {
                     );
                     assert!(!asked_github(&sys), "{case}");
                 }
+            }
+        }
+    }
+}
+
+/// `[swarm] enabled = false` reads the vault row as the person's choice, whatever this Mac's
+/// membership reads: settled in place at Sharing off, wanting what it reads, with the one note
+/// naming the setting, and never Sync off, whose Turn On Sync would turn on only the vault's sync.
+/// Without the switch, the same Mac in no vault where nothing was heard is a change to make.
+/// NEGATIVE CONTROL: a vault row that reads the membership with the switch off reads that change.
+#[test]
+fn swarm_off_leaves_the_vault_row_settled_not_a_change_to_make() {
+    let unjoined = || {
+        Ok(vault_heard(
+            &VaultRead::Unconfigured,
+            plan().selection,
+            scope::VaultHere::Unasked,
+            None,
+            None,
+        ))
+    };
+    let off = vault_row(true, || panic!("sharing off reads no membership"));
+    assert_eq!(
+        (
+            off.standing,
+            off.now.as_deref(),
+            off.wanted.as_str(),
+            off.note.as_deref()
+        ),
+        (
+            Standing::InPlace,
+            Some(aterm_types::macos_setup::SHARING_OFF),
+            aterm_types::macos_setup::SHARING_OFF,
+            Some(aterm_types::macos_setup::SHARING_OFF_NOTE)
+        ),
+        "{off:?}"
+    );
+    assert!(off.standing.settled() && !off.standing.attention());
+    assert_ne!(
+        off.wanted, SYNC_OFF,
+        "no Turn On Sync for the swarm's switch"
+    );
+    assert_eq!(vault_row(false, unjoined).standing, Standing::Differs);
+}
+
+/// With `[swarm] enabled = false` the Repositories stage runs on this Mac's own GitHub token
+/// ([`vault_not_here`]: the Secrets stage's one row says the switch is off), so the row reads them
+/// so where nothing was heard at the ALab vault's address: in place with a token of the Mac's own,
+/// read from GitHub, and waiting for the vault's token, as the stage does, only with none. With the
+/// switch on, the same Mac waits for the vault's token, asking GitHub nothing.
+/// NEGATIVE CONTROL: a row that ignores the switch waits for a vault that never syncs.
+#[test]
+fn swarm_off_repositories_read_as_their_stage_runs_them() {
+    let plan = with_repositories();
+    let syncing = Some("Waits for the vault to finish syncing this Mac".to_owned());
+    let asked_github = |sys: &aterm_machines::port::Fake| {
+        sys.calls()
+            .iter()
+            .any(|call| call.ends_with(" agh GET /user"))
+    };
+    let home = aterm_tempfile::tempdir().unwrap();
+    for token in [true, false] {
+        for sharing_off in [true, false] {
+            let (sys, ctx) = github(home.path(), token);
+            let seen =
+                repositories_heard(&sys, &ctx, &plan, sharing_off, || scope::VaultHere::Unasked)
+                    .unwrap();
+            let case = format!("token {token}, sharing off {sharing_off}");
+            if sharing_off && token {
+                assert_eq!(
+                    (seen.standing, seen.now.as_deref(), seen.note),
+                    (Standing::InPlace, Some("All 0"), None),
+                    "{case}"
+                );
+                assert!(asked_github(&sys), "{case}");
+            } else {
+                assert_eq!(
+                    (seen.standing, seen.note.clone()),
+                    (Standing::Waiting, syncing.clone()),
+                    "{case}"
+                );
+                assert!(!asked_github(&sys), "{case}");
             }
         }
     }

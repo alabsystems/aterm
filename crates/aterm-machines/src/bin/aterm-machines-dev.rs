@@ -24,6 +24,9 @@ fn main() -> ExitCode {
 
 #[cfg(unix)]
 fn main() -> ExitCode {
+    if let Some(exit) = aterm_machines::port::claude_keychain::entry() {
+        return exit;
+    }
     let argv0 = std::env::args_os().next().unwrap_or_default();
     if Path::new(&argv0)
         .file_name()
@@ -67,7 +70,12 @@ fn seal(words: &[String]) -> ExitCode {
     }
     let sys = Live::new();
     let now = sys.now();
-    let num = |k: &str, d: u64| get.get(k).and_then(|v| v.parse().ok()).unwrap_or(d);
+    let num = |k: &str, d: u64| {
+        get.get(k)
+            .filter(|v| v.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
     let action = match get.get("action").map(String::as_str) {
         Some("plan") => Action::Plan,
         Some("apply") => Action::Apply,

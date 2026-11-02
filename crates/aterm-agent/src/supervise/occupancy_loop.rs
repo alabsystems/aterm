@@ -1016,11 +1016,12 @@ impl<C: Ctl> Session<'_, C> {
         guards.halted = seen.halted;
         guards.draft |= seen.input_unread || self.door_draft(screen) != Some(false);
         guards.taskless |= host.taskless();
-        // The reach read afresh too: the loop's own was read at its last point, before the
-        // background work began. A peek takes no lease; on a Down the ask's lease keeps the probe
-        // measuring, so the break's line goes once it is no longer Down, or once the outage's cap
-        // has passed (a probe wrong about the route holds no break past the cap a point's act is
-        // held to).
+        // The reach read afresh too: the loop's own is its last point's, spent once the agent
+        // moves on from it (a typed act, restart or dialog key there, or a turn read running:
+        // `Session::took`), so a break of a later turn is held on this read alone. A peek takes
+        // no lease; on a Down the ask's lease keeps the probe measuring, so the break's line goes
+        // once neither read is Down, or once the outage's cap has passed (a probe wrong about the
+        // route holds no break past the cap a point's act is held to).
         if self.peeks_down(host) {
             guards.reach_down |= self.outage_holds(host.reach(), now);
         }
@@ -1487,6 +1488,30 @@ impl<C: Ctl> Session<'_, C> {
         })
     }
 
+    /// The first brake ([`Guards::brake`]) at `now`, `untaken` whether an act or line stands
+    /// untaken. A limit episode whose reset and grace have passed, and a wake's settle run out,
+    /// hold nothing, as the host's step at a break reads them (`host_steps_in_background`).
+    pub(super) fn occupancy_brake(
+        &self,
+        now: Instant,
+        cfg: &SupervisorConfig,
+        rows: &[String],
+        untaken: bool,
+    ) -> Option<Guard> {
+        let credits = !cfg.usage_credits
+            && (self.credits_kept.is_some() || self.reader(rows).credits(rows).is_some());
+        let limit = self.limit.is_some() && !self.limit_spent(self.stall_host.as_deref(), None);
+        [
+            (self.stalled.is_some(), Guard::Stall),
+            (limit, Guard::LimitEpisode),
+            (untaken, Guard::ActUntaken),
+            (self.settle_ahead(now).is_some(), Guard::WakeSettle),
+            (credits, Guard::Credits),
+        ]
+        .into_iter()
+        .find_map(|(holds, guard)| holds.then_some(guard))
+    }
+
     /// The guards, from what the loop holds: nothing is read for them.
     pub(super) fn occupancy_guards(
         &self,
@@ -1495,19 +1520,9 @@ impl<C: Ctl> Session<'_, C> {
         rows: &[String],
     ) -> Guards {
         let reader = self.reader(rows);
-        let credits =
-            !cfg.usage_credits && (self.credits_kept.is_some() || reader.credits(rows).is_some());
         let untaken = self.turn_end.act_untaken()
             || (self.turn_end.typed_untaken() && !armed(Fault::OverUntakenHostLine));
-        let brake = [
-            (self.stalled.is_some(), Guard::Stall),
-            (self.limit.is_some(), Guard::LimitEpisode),
-            (untaken, Guard::ActUntaken),
-            (self.wake_settle.is_some(), Guard::WakeSettle),
-            (credits, Guard::Credits),
-        ]
-        .into_iter()
-        .find_map(|(holds, guard)| holds.then_some(guard));
+        let brake = self.occupancy_brake(now, cfg, rows, untaken);
         let person = self.driver || self.typed_within(now, cfg.human_grace_s);
         let (exchange, managed) = self.held_for_others();
         Guards {
@@ -1587,6 +1602,7 @@ impl<C: Ctl> Session<'_, C> {
                 && self.turn_end.landed(),
             held: guards.held_host_fact(),
             theirs: guards.theirs(),
+            ..IdlePoint::default()
         }
     }
 
@@ -1911,8 +1927,9 @@ impl<C: Ctl> Session<'_, C> {
         self.door_task_owed(0, Some(cfg));
     }
 
-    /// A line of the stuck fact's went at `at_ms` (the clock's): it counts toward the session's
-    /// pace as the door's own lines do.
+    /// A line of an `aterm:` fact (a call at no progress, programs held at macOS's program
+    /// check) went at `at_ms` (the clock's): it counts toward the session's pace as the door's
+    /// own lines do.
     pub(super) fn door_lined(&mut self, at_ms: i64) {
         self.hold.door.books.lined(at_ms);
     }

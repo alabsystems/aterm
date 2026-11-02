@@ -156,6 +156,27 @@ const fn token_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')
 }
 
+const fn pem_label_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, ' ' | '-')
+}
+
+fn valid_pem_label(label: &str) -> bool {
+    !label.is_empty() && label.chars().all(pem_label_char)
+}
+
+fn find_pem_end(rest: &str, mut from: usize) -> usize {
+    while let Some(e) = rest[from..].find("-----END ") {
+        let tail = from + e + "-----END ".len();
+        if let Some(t) = rest[tail..].find("-----")
+            && valid_pem_label(&rest[tail..tail + t])
+        {
+            return tail + t + 5;
+        }
+        from = tail;
+    }
+    rest.len()
+}
+
 /// Replaces credential-shaped tokens with `[redacted]`: Anthropic, OpenAI and GitHub keys,
 /// Google OAuth tokens, AWS key ids, JWTs and PEM private-key blocks.
 #[must_use]
@@ -167,20 +188,17 @@ pub fn redact(text: &str) -> (String, usize) {
     while let Some(start) = rest.find("-----BEGIN ") {
         let after = start + "-----BEGIN ".len();
         let head_end = rest[after..].find("-----").map(|e| after + e);
-        let is_key = head_end.is_some_and(|e| rest[start..e].contains("PRIVATE KEY"));
+        let is_key = head_end.is_some_and(|e| {
+            let label = &rest[after..e];
+            valid_pem_label(label) && label.contains("PRIVATE KEY")
+        });
         let Some(head_end) = head_end.filter(|_| is_key) else {
             unpem.push_str(&rest[..after]);
             rest = &rest[after..];
             continue;
         };
         let body = head_end + 5;
-        let end = rest[body..]
-            .find("-----END ")
-            .and_then(|e| {
-                let tail = body + e + "-----END ".len();
-                rest[tail..].find("-----").map(|t| tail + t + 5)
-            })
-            .unwrap_or(rest.len());
+        let end = find_pem_end(rest, body);
         unpem.push_str(&rest[..start]);
         unpem.push_str("[redacted]");
         count += 1;
@@ -302,6 +320,7 @@ pub fn reviewer_env(
             .as_ref()
             .and_then(|a| a.login.clone())
             .unwrap_or_default();
+        env.retain(|(name, _)| name != crate::harness::accounts::LOGIN_ENV);
         env.push((crate::harness::accounts::LOGIN_ENV.to_string(), login));
     } else if default_home
         && !f.hidden_store
@@ -404,6 +423,8 @@ pub fn verdict_of(
 
 /// What one review needs of the machine.
 pub struct Host<'a> {
+    /// Exact config selected by the caller; never inferred from a different HOME.
+    pub config: Option<&'a Path>,
     /// The child processes.
     pub runner: &'a dyn Runner,
     /// One variable of this process's environment.
@@ -416,7 +437,8 @@ pub struct Host<'a> {
     pub now: &'a (dyn Fn() -> i64 + Sync),
 }
 
-fn run_one(h: &Host<'_>, f: &Facts, ask: &Ask<'_>) -> (Answer, Option<Outcome>) {
+fn run_one(h: &Host<'_>, prepared: &PreparedReview, ask: &Ask<'_>) -> (Answer, Option<Outcome>) {
+    let (f, env) = (&prepared.fact, prepared.env.as_slice());
     let (change, asker, words, budget) = (ask.change, ask.asker, ask.words, ask.budget);
     let c = f.connector;
     let mut answer = Answer {
@@ -487,10 +509,7 @@ fn run_one(h: &Host<'_>, f: &Facts, ask: &Ask<'_>) -> (Answer, Option<Outcome>) 
             None
         }
     };
-    let default_home = c
-        .home
-        .var
-        .is_none_or(|v| (h.var)(v).is_none_or(|s| s.is_empty()));
+    let default_home = f.home_var.is_none();
     // The Codex this review runs (`managed.path`) must keep the serving row's login its own too.
     if default_home
         && !f.hidden_store
@@ -561,12 +580,43 @@ fn run_one(h: &Host<'_>, f: &Facts, ask: &Ask<'_>) -> (Answer, Option<Outcome>) 
             }
         }
     }
-    let env = reviewer_env(c, f, h.var, h.vars);
+    let native_env: Vec<_> = env
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    let wrapped = match crate::harness::native_keys::Provider::for_connector(c.id) {
+        Some(provider) => match crate::harness::native_keys::launch(
+            provider,
+            &managed.path,
+            &args,
+            &native_env,
+            h.config,
+        ) {
+            Ok(wrapped) => wrapped,
+            Err(why) => {
+                answer.why = Some(why);
+                return (answer, None);
+            }
+        },
+        None => None,
+    };
+    let (program, args) = wrapped
+        .as_ref()
+        .map_or((managed.path.as_path(), args.as_slice()), |launch| {
+            (launch.program.as_path(), launch.args.as_slice())
+        });
+    if !review_storage_current(prepared) {
+        answer.why = Some(
+            "Codex credential storage changed after preparation; retry the review; nothing was run"
+                .to_owned(),
+        );
+        return (answer, None);
+    }
     let started = Instant::now();
     let ran = h.runner.run(&Job {
-        program: &managed.path,
-        args: &args,
-        env: &env,
+        program,
+        args,
+        env,
         stdin,
         cwd: Some(&cwd),
         budget,
@@ -679,9 +729,303 @@ pub struct Ask<'a> {
     pub level: Level,
 }
 
+struct PreparedReview {
+    fact: Facts,
+    env: Vec<(String, String)>,
+    storage: Option<super::facts::CodexAuthStore>,
+    health_readable: bool,
+    observation: Option<(
+        crate::harness::accounts::Store,
+        crate::harness::accounts_sync::ReviewWitness,
+    )>,
+    refused: Option<String>,
+}
+
+fn review_mode(
+    roster: &Path,
+    override_mode: Option<crate::harness::accounts::Mode>,
+    config: Option<&Path>,
+) -> crate::harness::accounts::Mode {
+    override_mode.unwrap_or_else(|| {
+        let beside = roster.parent().map(|dir| dir.join("aterm.toml"));
+        crate::supervise::config::SupervisorConfig::from_path(config.or(beside.as_deref()))
+            .0
+            .accounts
+    })
+}
+
+fn refresh_review_account(
+    fact: &mut Facts,
+    now: i64,
+    config: Option<&Path>,
+) -> Result<
+    Option<(
+        crate::harness::accounts::Store,
+        crate::harness::accounts_sync::ReviewWitness,
+    )>,
+    String,
+> {
+    use crate::harness::accounts::{Cli, Mode};
+    if fact.home_var.is_some() || fact.hidden_store {
+        return Ok(None);
+    }
+    if let Some(why) = fact.pool.as_ref().and_then(|pool| pool.refused.as_ref()) {
+        return Err(why.clone());
+    }
+    if let Some(why) = fact
+        .accounts
+        .as_ref()
+        .and_then(|account| account.refused.as_ref().or(account.unread.as_ref()))
+    {
+        return Err(why.clone());
+    }
+    let source = if let Some(source) = &fact.review_source {
+        Some((
+            source.store.clone(),
+            Some(source.roster.clone()),
+            review_mode(
+                &source.roster,
+                source.mode_override,
+                config.or(source.config.as_deref()),
+            ),
+            source.program.clone(),
+        ))
+    } else if let Some(pool) = &fact.pool {
+        pool.store.as_ref().map(|store| {
+            (
+                store.clone(),
+                Some(pool.roster.clone()),
+                review_mode(&pool.roster, pool.mode_override, config),
+                pool.program.clone(),
+            )
+        })
+    } else {
+        fact.accounts.as_ref().and_then(|account| {
+            account
+                .store
+                .as_ref()
+                .map(|store| (store.clone(), account.roster.clone(), Mode::Early, None))
+        })
+    };
+    let Some((store, roster, mode, program)) = source else {
+        return Ok(None);
+    };
+    let cli = Cli::parse(fact.connector.id)
+        .ok_or_else(|| "the selected account has no provider".to_owned())?;
+    let crate::harness::accounts_sync::ReviewCapture {
+        witness,
+        pinned,
+        default_row,
+    } = crate::harness::accounts_sync::capture_current_review(
+        &store,
+        cli,
+        roster.as_deref(),
+        mode,
+        program.as_deref(),
+        now,
+    )?;
+    if fact.pool.is_none()
+        && witness.row().is_some()
+        && let Some(source) = &fact.review_source
+    {
+        // Only the prepared clone gets a pool once an actual row is witnessed.
+        // Its environment and health ownership must follow that same observation.
+        fact.pool = Some(crate::ai::facts::CliAccounts {
+            roster: source.roster.clone(),
+            store: Some(source.store.clone()),
+            mode_override: source.mode_override,
+            program: source.program.clone(),
+            ..crate::ai::facts::CliAccounts::default()
+        });
+    }
+    if let Some(pool) = &mut fact.pool {
+        pool.serving_label = witness.row().map(|row| row.label.clone());
+        pool.serving_login = Some(witness.login(cli));
+        pool.launch_refused = None;
+        pool.pinned = pinned;
+        pool.default_row = default_row;
+    }
+    if let Some(account) = &mut fact.accounts {
+        account.label = witness.row().map_or_else(
+            || crate::ai::login::OWN_LABEL.to_owned(),
+            |row| row.label.clone(),
+        );
+        account.listed = witness.row().is_some();
+        account.login = witness.row().and_then(|row| row.dir.clone());
+        account.launch_refused = None;
+    }
+    Ok(Some((store, witness)))
+}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountReviewPreparation",
+        action = "Scope",
+        reason = "Select the original login ownership fixture before preparing a review wave."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountReviewPreparation",
+        action = "Change",
+        reason = "Select the intervening account change fixture before preparing a review wave."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountReviewPreparation",
+        action = "Prepare",
+        project = "aterm_agent::ai::review::tests::review_preparation_transition"
+    )
+)]
+fn prepare_review(h: &Host<'_>, original: &Facts) -> PreparedReview {
+    let mut fact = original.clone();
+    let mut health_readable = false;
+    fact.home_var = fact
+        .connector
+        .home
+        .var
+        .and_then(h.var)
+        .filter(|value| !value.is_empty());
+    if fact.connector.id == connector::CODEX.id && fact.home_var.is_some() {
+        let selected_home = fact.home_var.clone();
+        fact.home = super::facts::home_of(fact.connector, &|_| selected_home.clone(), None);
+    }
+    let storage = if fact.connector.id == connector::CODEX.id
+        && original.home_var.is_some()
+        && fact.home_var.is_none()
+    {
+        Err(
+            "Codex home changed to the default; gather its account context again before reviewing"
+                .to_owned(),
+        )
+    } else if fact.connector.id == connector::CODEX.id {
+        fact.home
+            .as_ref()
+            .map_err(|_| "no resolved home for Codex credential storage".to_owned())
+            .and_then(|home| super::facts::codex_auth_store(home))
+            .map(Some)
+    } else {
+        Ok(None)
+    };
+    let (storage, observation, refused) = match storage {
+        Ok(storage) => {
+            if let Some(storage) = storage {
+                fact.hidden_store = storage.hidden();
+                fact.record_scope = Some(storage.scope());
+                fact.credential_store_error = None;
+                if storage.hidden() {
+                    fact.login_file = None;
+                    fact.limited_until = None;
+                }
+            }
+            fact.record = match h.store.load() {
+                Ok(records) => {
+                    health_readable = true;
+                    records.of_scope(fact.connector.id, fact.record_scope)
+                }
+                Err(_) => super::store::Record::default(),
+            };
+            match refresh_review_account(&mut fact, (h.now)(), h.config) {
+                Ok(observation) => (storage, observation, None),
+                Err(why) => (storage, None, Some(why)),
+            }
+        }
+        Err(why) => (None, None, Some(why)),
+    };
+    let var = |name: &str| {
+        if fact.connector.home.var == Some(name) {
+            fact.home_var.clone()
+        } else {
+            (h.var)(name)
+        }
+    };
+    let env = reviewer_env(fact.connector, &fact, &var, h.vars);
+    PreparedReview {
+        fact,
+        env,
+        storage,
+        health_readable,
+        observation,
+        refused,
+    }
+}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountReviewStorage",
+        action = "Initial",
+        reason = "Select the gather-time credential backend fixture."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountReviewStorage",
+        action = "Select",
+        reason = "Select the preparation-time credential backend fixture."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountReviewStorage",
+        action = "Current",
+        reason = "Select the launch-time or completion-time credential backend fixture."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountReviewStorage",
+        action = "Check",
+        project = "aterm_agent::ai::review::tests::review_storage_transition"
+    )
+)]
+fn review_storage_current(prepared: &PreparedReview) -> bool {
+    prepared.storage.is_none_or(|storage| {
+        prepared.fact.home.as_ref().is_ok_and(|home| {
+            super::facts::codex_auth_store(home).is_ok_and(|current| current == storage)
+        })
+    })
+}
+
+fn run_prepared(
+    h: &Host<'_>,
+    prepared: &PreparedReview,
+    ask: &Ask<'_>,
+) -> (Answer, Option<Outcome>) {
+    if let Some(why) = &prepared.refused {
+        return (
+            Answer {
+                id: prepared.fact.connector.id,
+                product: prepared.fact.connector.product,
+                version: prepared
+                    .fact
+                    .managed
+                    .as_ref()
+                    .and_then(|managed| managed.version.clone()),
+                verdict: Verdict::Failed,
+                secs: 0,
+                text: None,
+                why: Some(format!(
+                    "a launch of it now is refused: {why}; nothing was run"
+                )),
+                fix: None,
+            },
+            None,
+        );
+    }
+    run_one(h, prepared, ask)
+}
+
 /// Runs the review: `ask.count` reviewers from `cands` in order, in parallel, trying the next
 /// in place of one that failed to authenticate, hit its limit or failed (not one that timed
-/// out), and records each outcome on its default login. A candidate whose one-shot mode runs at
+/// out), and records each outcome on the login that served it. A candidate whose one-shot mode runs at
 /// another level than `ask.level` ([`level_skip`]) is skipped, as an unusable one is, and takes
 /// no reviewer's place.
 pub fn run_review(
@@ -717,13 +1061,16 @@ pub fn run_review(
     let mut want = ask.count;
     let mut next = 0;
     while want > 0 && next < queue.len() {
-        let wave: Vec<&Facts> = queue[next..queue.len().min(next + want)].to_vec();
+        let wave: Vec<PreparedReview> = queue[next..queue.len().min(next + want)]
+            .iter()
+            .map(|fact| prepare_review(h, fact))
+            .collect();
         next += wave.len();
         want = 0;
         let results: Vec<(Answer, Option<Outcome>)> = std::thread::scope(|s| {
             let handles: Vec<_> = wave
                 .iter()
-                .map(|f| s.spawn(move || run_one(h, f, ask)))
+                .map(|prepared| s.spawn(move || run_prepared(h, prepared, ask)))
                 .collect();
             handles.into_iter().filter_map(|j| j.join().ok()).collect()
         });
@@ -731,54 +1078,36 @@ pub fn run_review(
             if answer.verdict.falls_through() {
                 want += 1;
             }
-            let fact = facts.iter().find(|f| f.connector.id == answer.id);
-            let default_home = fact
-                .and_then(|f| f.connector.home.var)
-                .is_none_or(|v| (h.var)(v).is_none_or(|s| s.is_empty()));
+            let prepared = wave.iter().find(|p| p.fact.connector.id == answer.id);
             if let Some(o) = outcome
-                && default_home
-                && let Some(fact) = fact
+                && let Some(prepared) = prepared
+                && prepared.fact.home_var.is_none()
+                && review_storage_current(prepared)
             {
+                let fact = &prepared.fact;
                 let at = (h.now)();
-                let isolated_pool_login = !fact.hidden_store
-                    && fact
-                        .pool
-                        .as_ref()
-                        .and_then(|p| p.serving_login.as_ref())
-                        .is_some_and(|(_, v)| v.is_some());
-                if !fact.hidden_store
-                    && let Some(pool) = &fact.pool
-                    && let (Some(pool_store), Some(label)) =
-                        (&pool.store, pool.serving_label.as_deref())
-                {
-                    let mut note = None;
-                    let _ = pool_store.transact_logins(at, &mut note, |state, logins| match o {
-                        Outcome::Worked => {
-                            let events = crate::harness::accounts::note_signed_back(
-                                state, logins, label, at,
-                            );
-                            if events.is_empty() {
-                                crate::harness::accounts::note_served_login(logins, label, at);
-                            }
-                            Ok(events)
-                        }
-                        Outcome::Ended(_) => Ok(crate::harness::accounts::note_login_end(
-                            state, logins, label, at,
-                        )),
-                        Outcome::Limited(until) => Ok(crate::harness::accounts::note_wall(
-                            state,
-                            label,
-                            "five_hour",
-                            until,
-                            at,
-                            at,
-                        )),
-                    });
+                let mut current = true;
+                if let Some((store, witness)) = &prepared.observation {
+                    current = if let (Some(cli), Ok(home)) =
+                        (crate::harness::accounts::Cli::parse(answer.id), &fact.home)
+                    {
+                        crate::harness::accounts_sync::record_current_review(
+                            store, cli, witness, home, o, at,
+                        )
+                        .is_ok()
+                    } else {
+                        false
+                    };
                 }
-                if !isolated_pool_login || matches!(o, Outcome::Worked) {
-                    let _ = h
-                        .store
-                        .note_if_current(answer.id, &fact.record, How::Review, o, at);
+                if current && prepared.health_readable && fact.default_record().is_some() {
+                    let _ = h.store.note_if_current_scope(
+                        answer.id,
+                        fact.record_scope,
+                        &fact.record,
+                        How::Review,
+                        o,
+                        at,
+                    );
                 }
             }
             answers.push(answer);
@@ -939,8 +1268,12 @@ pub fn keep(store: &Store, id: &str, json: &str) -> std::io::Result<PathBuf> {
     aterm_types::fs_restricted::ensure_private_dir(&root)?;
     if let Ok(entries) = std::fs::read_dir(&root) {
         for e in entries.flatten() {
-            let old = e
-                .metadata()
+            if !e.file_name().to_str().is_some_and(valid_id)
+                || !e.file_type().is_ok_and(|ft| ft.is_dir())
+            {
+                continue;
+            }
+            let old = std::fs::symlink_metadata(e.path())
                 .and_then(|m| m.modified())
                 .ok()
                 .and_then(|t| t.elapsed().ok())

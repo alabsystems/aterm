@@ -18,7 +18,7 @@ const LANDED_NOTE: &str = "DONE seq=104 rule=land@v1 the worker said it is done 
                            instruction (autopilot land): nothing more is typed until a person or \
                            an orchestrator types";
 
-fn ended_screen(said: &str, cols: usize) -> Vec<u8> {
+pub(super) fn ended_screen(said: &str, cols: usize) -> Vec<u8> {
     let mut rows: Vec<String> = Vec::new();
     for (n, line) in said.lines().enumerate() {
         rows.push(if n == 0 {

@@ -14,6 +14,8 @@ use std::process::ExitCode;
 mod compact_zone;
 #[cfg(test)]
 mod macho_order;
+#[cfg(unix)]
+mod release_probe;
 
 use aterm_cli::{AliasRoute, alias_route};
 
@@ -21,6 +23,8 @@ use aterm_cli::{AliasRoute, alias_route};
 aterm_durable::plain_durable_flushes_in_tests!();
 #[cfg(all(test, unix))]
 aterm_secrets::memoized_x25519_in_tests!();
+#[cfg(all(test, unix))]
+aterm_db::admission_waits_in_tests!(aterm_spec::wait::MUST_HAPPEN);
 
 macro_rules! println {
     () => {
@@ -42,8 +46,8 @@ fn link_unavailable(verb: &str) -> ExitCode {
 }
 
 /// `aterm machines` where it cannot run: the controller and its agent drive macOS's own tools,
-/// so off macOS (where `aterm-machines` is linked for `aterm init` alone) the verb stays on the
-/// roster and refuses by name.
+/// so off macOS (where `aterm-machines`, linked on Unix, serves other verbs such as `aterm init`)
+/// the verb stays on the roster and refuses by name.
 #[cfg(not(target_os = "macos"))]
 fn machines_unavailable() -> ExitCode {
     eprintln!("aterm machines: not available on this platform (macOS only)");
@@ -66,19 +70,53 @@ fn node_unavailable() -> ExitCode {
     ExitCode::FAILURE
 }
 
+/// The background Commons runtime `aterm node serve` holds, once it started
+/// ([`spawn_node_commons_runtime`]).
+#[cfg(unix)]
+static NODE_COMMONS: std::sync::OnceLock<aterm_db::runtime::Runtime> = std::sync::OnceLock::new();
+
+/// Start `aterm node serve`'s background Commons runtime (C22) while `[swarm] enabled` leaves
+/// sharing on, else once a person turns it on ([`commons_lan::when_sharing_on`]), publishing its
+/// observation to the account claims and its peers to the node job's "network moved" signal.
+#[cfg(unix)]
+fn spawn_node_commons_runtime() {
+    if std::env::var_os("ATERM_STATE_HOME").is_some() || std::env::var_os("CI").is_some() {
+        return;
+    }
+    let Ok(paths) = aterm_secrets::client::Paths::live() else {
+        return;
+    };
+    let Some(config) = aterm_types::dirs::aterm_config_path() else {
+        return;
+    };
+    let home = paths.home.clone();
+    commons_lan::when_sharing_on(&home, commons_lan::SHARING_LOOK, move || {
+        let Some(runtime) = start_node_commons_runtime(paths, config) else {
+            return;
+        };
+        let runtime = NODE_COMMONS.get_or_init(|| runtime);
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            let _ = NODE_OBSERVATION.set(runtime.network_observation());
+            let _ = NODE_PUSHER.set(runtime.pusher());
+        }
+        // A Commons peer heard again after a silence is the node job's "network moved" too.
+        let observation = runtime.network_observation();
+        aterm_gui::hear_commons(move || Some(observation.snapshot().peers));
+    });
+}
+
 /// Background Commons runtime and steward enroller held by `aterm node serve` (C22), yielding
 /// local observation and transport whenever an interactive window runs.
 #[cfg(unix)]
-fn start_node_commons_runtime() -> Option<aterm_db::runtime::Runtime> {
-    if std::env::var_os("ATERM_STATE_HOME").is_some() || std::env::var_os("CI").is_some() {
-        return None;
-    }
-    let paths = aterm_secrets::client::Paths::live().ok()?;
-    let config = aterm_types::dirs::aterm_config_path()?;
+fn start_node_commons_runtime(
+    paths: aterm_secrets::client::Paths,
+    config: std::path::PathBuf,
+) -> Option<aterm_db::runtime::Runtime> {
     let lan = commons_lan::gate(&config, commons_lan::Host::NodeServe);
     match aterm_db::runtime::Runtime::start_background(paths, config, lan, |status| match status {
-        aterm_db::runtime::Status::Refused => aterm_log::warn!(
-            "Commons node background repair refused local configuration or trust state"
+        aterm_db::runtime::Status::Refused(why) => aterm_log::warn!(
+            "Commons node background repair refused local configuration or trust state: {why}"
         ),
         aterm_db::runtime::Status::LanHeld => {
             aterm_log::info!("Commons node background repair: {status:?}");
@@ -119,18 +157,18 @@ fn dispatch_node(forwarded: &[OsString]) -> ExitCode {
             return ExitCode::from(2);
         }
         aterm_gui::install_session_log();
-        let commons = start_node_commons_runtime();
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        if let Some(runtime) = commons.as_ref() {
-            let _ = NODE_OBSERVATION.set(runtime.network_observation());
+        // The job's automatic LAN uses go only while `[swarm] enabled` leaves sharing on.
+        if let Some(home) = aterm_types::dirs::home_dir() {
+            commons_lan::install_sharing(&home);
         }
-        // A Commons peer heard again after a silence is the node job's "network moved" too.
-        if let Some(observation) = commons
-            .as_ref()
-            .map(aterm_db::runtime::Runtime::network_observation)
-        {
-            aterm_gui::hear_commons(move || observation.snapshot().peers);
+        // The job's first LAN uses (its Commons runtime's, its `_alab._tcp` browse and advert,
+        // its listener, heartbeat and facts push) wait while a window's System State Local
+        // Network step is still to come, as its Commons gate does.
+        #[cfg(target_os = "macos")]
+        if let Some(config) = aterm_types::dirs::aterm_config_path() {
+            commons_lan::hold_first_uses_for_the_step(&config, commons_lan::Host::NodeServe);
         }
+        spawn_node_commons_runtime();
         return aterm_gui::run_node_serve();
     }
     let Some(home) = aterm_types::dirs::home_dir() else {
@@ -142,15 +180,13 @@ fn dispatch_node(forwarded: &[OsString]) -> ExitCode {
         return ExitCode::FAILURE;
     };
     let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("aterm"));
-    let isolated =
-        std::env::var_os("ATERM_STATE_HOME").is_some() || std::env::var_os("CI").is_some();
-    let supervisor: &dyn aterm_agent::node_service::ServiceSupervisor = if isolated {
-        &aterm_agent::node_service::FileOnlySupervisor
-    } else {
-        &aterm_agent::node_service::LiveSupervisor
-    };
     match aterm_agent::node_service::run_admin_subcommand(
-        subcmd, rest, &home, &state, &exe, supervisor,
+        subcmd,
+        rest,
+        &home,
+        &state,
+        &exe,
+        aterm_agent::node_service::supervisor_here(),
     ) {
         Ok(out) => {
             let _ = aterm_uds::stdout::write_all(out.as_bytes());
@@ -259,8 +295,16 @@ fn dispatch_link(args: &[String]) -> ExitCode {
 }
 
 pub(crate) fn main() -> ExitCode {
-    // First, while this process has one thread: a window's tethered helper starts as this verb.
+    // First, while this process has one thread: a build's claim holder forks away from its
+    // front's spawn (BUILD-ADMIT), and a window's tethered helper starts as its verb.
+    if let Some(code) = atpkg::build_admit::hold::entry() {
+        return code;
+    }
     if let Some(code) = aterm_uds::tether::entry() {
+        return code;
+    }
+    #[cfg(unix)]
+    if let Some(code) = aterm_machines::port::claude_keychain::entry() {
         return code;
     }
     #[cfg(target_os = "macos")]
@@ -270,6 +314,8 @@ pub(crate) fn main() -> ExitCode {
         return code;
     }
     aterm_types::version::install(BUILD_STAMP);
+    #[cfg(target_os = "macos")]
+    aterm_types::macos_setup::access_record::code_subject_from(local_network_code_subject);
     // Before any vault path runs: the vault refuses every AI CLI's login file as an entry, as the
     // connector rows say where each keeps it (aterm-secrets cannot read them itself).
     #[cfg(unix)]
@@ -281,6 +327,10 @@ pub(crate) fn main() -> ExitCode {
     aterm_secrets::client::on_ask_members(|paths| {
         aterm_agent::members_cli::ask_members(&paths.home).map_err(aterm_secrets::Error::new)
     });
+    // The vault subscriber's first Local Network use is kept for this Mac and app, so a window's
+    // System State step reads macOS's question as already put to aterm.
+    #[cfg(target_os = "macos")]
+    aterm_secrets::client::on_lan_first_use(commons_lan::keep_subscriber_asked_here);
     // Every `aterm pkg` download races this Mac's fleet members unless `[packages] peers` says
     // otherwise, and its doctor counts them; the read runs only when one of those asks for it.
     #[cfg(unix)]
@@ -298,6 +348,16 @@ pub(crate) fn main() -> ExitCode {
     // its join waits on the ALab vault, as `aterm members join --no-wait` does.
     #[cfg(unix)]
     aterm_machines::init_secrets::on_ask_members(aterm_agent::members_cli::ask_members);
+    // `aterm init` with nobody to answer looks for the ALab vault from the console login's
+    // session only once macOS has answered aterm's Local Network question, as System State's
+    // records keep it, so its look raises no question on the screen.
+    #[cfg(target_os = "macos")]
+    aterm_machines::init_secrets::on_lan_answered(|| {
+        matches!(
+            aterm_cli::macos_doctor::local_network_first_use(None),
+            aterm_cli::macos_doctor::LocalNetworkFirstUse::Answered
+        )
+    });
     // The fixed collector runs before GUI initialization or any per-user state is read.
     #[cfg(target_os = "macos")]
     let early_args: Vec<_> = std::env::args_os().skip(1).collect();
@@ -320,7 +380,7 @@ pub(crate) fn main() -> ExitCode {
     #[cfg(unix)]
     aterm_agent::harness::account_catalog::install_reader(shared_accounts::read);
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    account_claims::install(claims_observation);
+    account_claims::install(claims_observation, claims_pusher);
     #[cfg(windows)]
     let _ = aterm_gui::attach_parent_console();
     let mut args_os = std::env::args_os();
@@ -448,6 +508,13 @@ pub(crate) fn main() -> ExitCode {
                     .collect();
                 ExitCode::from(u8::try_from(aterm_gui::run_ship(&args)).unwrap_or(2))
             }
+            #[cfg(unix)]
+            aterm_cli::Verb::Release => release_probe::run(&forwarded),
+            #[cfg(not(unix))]
+            aterm_cli::Verb::Release => {
+                eprintln!("aterm release probe: unavailable on this platform");
+                ExitCode::from(2)
+            }
             aterm_cli::Verb::Update => update_verb(&forwarded),
             #[cfg(unix)]
             aterm_cli::Verb::Db => aterm_db::cli::main_entry(forwarded),
@@ -488,6 +555,8 @@ pub(crate) fn main() -> ExitCode {
                         grants: aterm_cli::macos_doctor::init_grants,
                         walk: &aterm_cli::init_permissions_walk,
                         converge: &converge::Live,
+                        alab: &aterm_cli::macos_doctor::alab_mac,
+                        present: aterm_gui::person_at_this_screen,
                     },
                 )
             }
@@ -505,6 +574,8 @@ pub(crate) fn main() -> ExitCode {
                         grants: aterm_machines::init::no_grants,
                         walk: &|_| None,
                         converge: &converge::Live,
+                        alab: &aterm_machines::init_secrets::alab_member_here,
+                        present: || false,
                     },
                 )
             }
@@ -712,6 +783,10 @@ pub(crate) fn main() -> ExitCode {
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     if session_lane_is_interactive() {
+        // Past its wait for a window's Local Network step, the lane's Commons gate asks macOS
+        // only through the door: a person at this Mac with their hands at rest.
+        #[cfg(target_os = "macos")]
+        commons_lan::install_door(commons_lan::Host::SessionLane);
         spawn_commons_runtime(commons_lan::Host::SessionLane);
         let build = aterm_gui::running_build_number();
         #[cfg(target_os = "linux")]
@@ -853,18 +928,14 @@ fn park_until_spoke_or_silent_for(
     spoke: &std::sync::atomic::AtomicBool,
     silent: std::time::Duration,
 ) -> bool {
-    let now = std::time::Instant::now();
-    let until = now
-        .checked_add(silent)
-        .unwrap_or_else(|| now + std::time::Duration::from_secs(86_400 * 365));
+    let start = std::time::Instant::now();
     loop {
         if spoke.load(std::sync::atomic::Ordering::Acquire) {
             return true;
         }
-        let left = until.saturating_duration_since(std::time::Instant::now());
-        if left.is_zero() {
+        let Some(left) = silent.checked_sub(start.elapsed()).filter(|d| !d.is_zero()) else {
             return false;
-        }
+        };
         std::thread::park_timeout(left);
     }
 }
@@ -987,6 +1058,29 @@ fn spawn_detached_pkg_update(layout: &atpkg::store::Layout) {
     }
 }
 
+/// Bind retained LAN observations to this process's loaded code. A stable
+/// designated identity survives an update; an ad hoc cdhash changes with its build.
+#[cfg(all(target_os = "macos", not(test)))]
+fn local_network_code_subject() -> Option<[u8; 32]> {
+    static SUBJECT: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    if let Some(subject) = SUBJECT.get() {
+        return Some(*subject);
+    }
+    let identity = aterm_keeper::identity::Identity::for_self(
+        aterm_keeper::identity::IdentityPolicy::Designated,
+    )
+    .ok()?;
+    let mut digest = aterm_digest::Sha256::new();
+    digest.update(b"aterm-local-network-observer-v1\0");
+    digest.update(identity.describe().as_bytes());
+    Some(*SUBJECT.get_or_init(|| digest.finalize()))
+}
+
+#[cfg(all(target_os = "macos", test))]
+const fn local_network_code_subject() -> Option<[u8; 32]> {
+    None
+}
+
 fn session_pass_args(layout: &atpkg::store::Layout) -> Vec<std::ffi::OsString> {
     let mut args: Vec<std::ffi::OsString> = vec![
         "pkg".into(),
@@ -1063,8 +1157,8 @@ fn run_window(args: Vec<OsString>, host: WindowHost, handoff: &[OsString]) -> Ex
     let ordinary = ordinary_window(&args);
     // A command line the window's parser answers (`--list-fonts`) or refuses (a word no verb or
     // other front-door route took, which a launch without a terminal brings here) ends in this
-    // check, before the Commons runtime and, on macOS, aCaffiene's autostart, which keeps the
-    // Mac awake for good.
+    // check, before the Commons runtime and, on macOS, aCaffiene's watch, which starts the mug
+    // that keeps the Mac awake unless the person turned it off.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     if ordinary {
         aterm_gui::check_window_args(args.clone());
@@ -1079,6 +1173,11 @@ fn run_window(args: Vec<OsString>, host: WindowHost, handoff: &[OsString]) -> Ex
     let runs_step = first_lan_uses_wait_for_the_step(ordinary, first_run);
     #[cfg(target_os = "linux")]
     let runs_step = false;
+    // A window's automatic LAN uses go only while `[swarm] enabled` leaves sharing on.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if ordinary && let Some(home) = aterm_types::dirs::home_dir() {
+        commons_lan::install_sharing(&home);
+    }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     if ordinary {
         spawn_commons_runtime(commons_lan::Host::Window {
@@ -1087,11 +1186,14 @@ fn run_window(args: Vec<OsString>, host: WindowHost, handoff: &[OsString]) -> Ex
     }
     #[cfg(target_os = "macos")]
     if ordinary {
-        spawn_acaffiene_autostart(acaffiene_launch(std::env::var_os));
+        spawn_acaffiene_watch();
     }
     #[cfg(target_os = "macos")]
     if runs_step && let Some(config) = aterm_types::dirs::aterm_config_path() {
-        commons_lan::hold_first_uses_for_the_step(&config);
+        commons_lan::hold_first_uses_for_the_step(
+            &config,
+            commons_lan::Host::Window { runs_setup: true },
+        );
     }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     let network_source = ordinary.then(network_state_source).flatten();
@@ -1131,21 +1233,6 @@ fn ordinary_window(args: &[OsString]) -> bool {
         }
     }
     true
-}
-
-/// How this window came to start, as aCaffiene's autostart takes it: a running window's
-/// successor when `var` (the environment's reader) finds
-/// [`aterm_update::RELAUNCH_OF_RUNNING_ENV`], which an update and a launch-record renewal set,
-/// else a launch.
-#[cfg(target_os = "macos")]
-fn acaffiene_launch(
-    var: impl Fn(&'static str) -> Option<OsString>,
-) -> aterm_acaffiene::cli::Launch {
-    if var(aterm_update::RELAUNCH_OF_RUNNING_ENV).is_some() {
-        aterm_acaffiene::cli::Launch::Successor
-    } else {
-        aterm_acaffiene::cli::Launch::Fresh
-    }
 }
 
 /// Whether a window's first LAN uses (its Commons runtime's, [`commons_lan::Host::Window`]'s
@@ -1191,20 +1278,49 @@ fn warn_when_logging(line: String) {
     }
 }
 
-/// Start aCaffiene beside an ordinary window once the window has set up its logging
-/// ([`EARLY_LOG_WAIT`]): set to keep the Mac awake for good on a launch, and as saved beside a
-/// running window's successor ([`aterm_acaffiene::cli::Launch`]). Its login-item choice is left
-/// alone.
+/// How often an ordinary window makes sure aCaffiene keeps this Mac awake.
 #[cfg(target_os = "macos")]
-fn spawn_acaffiene_autostart(launch: aterm_acaffiene::cli::Launch) {
+const ACAFFIENE_WATCH: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Keep this Mac awake beside an ordinary window, at launch, once the window has set up its
+/// logging ([`EARLY_LOG_WAIT`]), and every [`ACAFFIENE_WATCH`]
+/// ([`aterm_acaffiene::cli::keep_awake_watch`]): at launch, what the old `aterm caffeine` name
+/// left retired ([`aterm_acaffiene::legacy::tidy`]) and the temporaries cut-short writes left
+/// removed ([`aterm_acaffiene::state::sweep_temps`],
+/// [`aterm_acaffiene::launchd::sweep_plist_temps`]); each pass, the installed app's Enable at
+/// Startup turned on and the mug started, each unless the person turned it off, whose off is
+/// never overwritten. A trouble that lasts is an exceptions entry
+/// ([`aterm_gui::note_keep_awake_failing`]), raised again only when its why changes, and
+/// cleared on each pass with none ([`aterm_acaffiene::cli::EntryWatch`]), so one an earlier
+/// window raised before a relaunch goes too.
+#[cfg(target_os = "macos")]
+fn spawn_acaffiene_watch() {
+    let watch = || {
+        use aterm_acaffiene::cli::{EntryWatch, EntryWord, Kept};
+        // The window installs its logger in main_entry_with_network, after this thread starts;
+        // a line the first pass logs before that would be dropped.
+        let _ = aterm_log::wait_for_logger(EARLY_LOG_WAIT);
+        let mut entry = EntryWatch::default();
+        loop {
+            let (kept, lasting) = aterm_acaffiene::cli::keep_awake_watch();
+            match &kept {
+                Kept::Failed(why) => {
+                    aterm_log::warn!("acaffiene: could not keep this Mac awake: {why}");
+                }
+                kept if !entry.raised() => aterm_log::debug!("acaffiene: {}", kept.line()),
+                _ => {}
+            }
+            match entry.step(&kept, lasting) {
+                Some(EntryWord::Raise(why)) => aterm_gui::note_keep_awake_failing(&why),
+                Some(EntryWord::Clear) => aterm_gui::clear_keep_awake_failing(),
+                None => {}
+            }
+            std::thread::sleep(ACAFFIENE_WATCH);
+        }
+    };
     if let Err(error) = std::thread::Builder::new()
-        .name("aterm-acaffiene-autostart".into())
-        .spawn(move || {
-            // The window installs its logger in main_entry_with_network, after this thread
-            // starts; a line the autostart logs before that would be dropped.
-            let _ = aterm_log::wait_for_logger(EARLY_LOG_WAIT);
-            aterm_acaffiene::cli::autostart(launch);
-        })
+        .name("aterm-acaffiene-watch".into())
+        .spawn(watch)
     {
         warn_when_logging(format!("acaffiene: could not start with aterm: {error}"));
     }
@@ -1221,6 +1337,22 @@ static COMMONS_RUNTIME: std::sync::OnceLock<aterm_db::runtime::Runtime> =
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 static NODE_OBSERVATION: std::sync::OnceLock<aterm_db::network_state::ObservationHandle> =
     std::sync::OnceLock::new();
+
+/// What hands the node job's account claims rows to its peers at once (its background Commons
+/// runtime's push, `aterm_db::runtime::Pusher`).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+static NODE_PUSHER: std::sync::OnceLock<aterm_db::runtime::Pusher> = std::sync::OnceLock::new();
+
+/// This process's Commons runtime's push, where one runs here (a window's or session lane's, else
+/// the node job's): how a quiet or off claims row reaches the peers before the Mac sleeps or
+/// stops.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn claims_pusher() -> Option<aterm_db::runtime::Pusher> {
+    COMMONS_RUNTIME
+        .get()
+        .map(aterm_db::runtime::Runtime::pusher)
+        .or_else(|| NODE_PUSHER.get().cloned())
+}
 
 /// What this process's Commons runtime last observed of the network, where one runs here (a
 /// window's or session lane's, else the node job's), else what the local owner publishes over its
@@ -1246,7 +1378,9 @@ fn claims_observation() -> Option<aterm_types::network_state::NetworkObservation
     aterm_db::network_state::read_live_observation(&aterm_types::dirs::aterm_config_path()?).ok()
 }
 
-/// Start this process's Commons runtime once, for `host` (its LAN gate, [`commons_lan::gate`]).
+/// Start this process's Commons runtime once, for `host` (its LAN gate, [`commons_lan::gate`]),
+/// while `[swarm] enabled` leaves sharing on, else once a person turns it on
+/// ([`commons_lan::when_sharing_on`]).
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn spawn_commons_runtime(host: commons_lan::Host) {
     if std::env::var_os("ATERM_STATE_HOME").is_some()
@@ -1261,6 +1395,20 @@ fn spawn_commons_runtime(host: commons_lan::Host) {
     let Some(config) = aterm_types::dirs::aterm_config_path() else {
         return;
     };
+    let home = paths.home.clone();
+    commons_lan::when_sharing_on(&home, commons_lan::SHARING_LOOK, move || {
+        start_commons_runtime(paths, &config, host);
+    });
+}
+
+/// Start this process's Commons runtime for `host` now, with `paths` and `config`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn start_commons_runtime(
+    paths: aterm_secrets::client::Paths,
+    config: &std::path::Path,
+    host: commons_lan::Host,
+) {
+    let config = config.to_owned();
     let lan = commons_lan::gate(&config, host);
     match aterm_db::runtime::Runtime::start(paths, config, lan, |status| {
         // In a window, the owner thread can report its first status before the window installs
@@ -1268,8 +1416,8 @@ fn spawn_commons_runtime(host: commons_lan::Host) {
         // unsaid. A terminal session has settled its logging before this runtime starts.
         let _ = aterm_log::wait_for_logger(EARLY_LOG_WAIT);
         match status {
-            aterm_db::runtime::Status::Refused => aterm_log::warn!(
-                "Commons automatic control repair refused local configuration or trust state"
+            aterm_db::runtime::Status::Refused(why) => aterm_log::warn!(
+                "Commons automatic control repair refused local configuration or trust state: {why}"
             ),
             aterm_db::runtime::Status::LanHeld => {
                 aterm_log::info!("Commons control repair: {status:?}");
@@ -1294,9 +1442,14 @@ fn network_state_source() -> Option<aterm_gui::NetworkSnapshotSource> {
     }
 
     static SERVICES: OnceLock<Option<aterm_db::service_state::Runtime>> = OnceLock::new();
-    let network = COMMONS_RUNTIME
-        .get()
-        .map(aterm_db::runtime::Runtime::network_observation);
+    // Read at each look, not once: with `[swarm] enabled = false` the runtime starts only once a
+    // person turns sharing on ([`spawn_commons_runtime`]), and the page then shows what it hears.
+    let started = COMMONS_RUNTIME.get().is_some();
+    let network = || {
+        COMMONS_RUNTIME
+            .get()
+            .map(aterm_db::runtime::Runtime::network_observation)
+    };
     let services = SERVICES
         .get_or_init(|| {
             let paths = aterm_secrets::client::Paths::live().ok()?;
@@ -1305,28 +1458,25 @@ fn network_state_source() -> Option<aterm_gui::NetworkSnapshotSource> {
         })
         .as_ref()
         .map(aterm_db::service_state::Runtime::observation);
-    let retained = if network.is_none() {
+    let retained = if started {
+        None
+    } else {
         aterm_types::dirs::aterm_config_path()
             .and_then(|config| aterm_db::network_state::read_history(&config).ok())
-    } else {
-        None
     };
     Some(network_state_source_from(network, services, retained))
 }
 
-/// Compose independent observers, including when only one could start.
+/// Compose independent observers, including when only one could start: `network` reads the
+/// network observer's handle, which may come after the source does.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn network_state_source_from(
-    network: Option<aterm_db::network_state::ObservationHandle>,
+    network: impl Fn() -> Option<aterm_db::network_state::ObservationHandle> + Send + Sync + 'static,
     services: Option<aterm_db::service_state::ObservationHandle>,
     retained: Option<aterm_types::network_state::NetworkObservation>,
 ) -> aterm_gui::NetworkSnapshotSource {
     network_state_source_with_readers(
-        move || {
-            network
-                .as_ref()
-                .and_then(|network| network.try_publication())
-        },
+        move || network().and_then(|network| network.try_publication()),
         move || {
             services
                 .as_ref()
@@ -1391,12 +1541,12 @@ fn network_state_source_with_readers(
         None::<aterm_db::service_state::Publication>,
     ));
     Arc::new(move || {
-        // This callback runs on the UI thread. A worker paused while publishing
-        // must not pause drawing; retained timestamps still expire in the GUI.
+        // Both the UI and the Commons beacon read this callback. A paused reader
+        // must not pause drawing or masquerade as a new startup observation.
         let mut current = match current.try_lock() {
             Ok(current) => current,
             Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => return fallback.clone(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
         };
         if let Some(publication) = network() {
             current.1 = Some(publication);
@@ -1420,7 +1570,7 @@ fn network_state_source_with_readers(
                 services,
             });
         }
-        current.0.clone()
+        Some(current.0.clone())
     })
 }
 
@@ -1442,15 +1592,7 @@ fn wire_window(args: &[OsString]) -> Option<fn() -> bool> {
     #[cfg(target_os = "macos")]
     let first_run = {
         let restoring_window = std::env::var_os(aterm_update::RELAUNCH_OF_RUNNING_ENV).is_some();
-        let setup_args = first_run_window_args(args, restoring_window);
-        // An update successor resumes an admitted run but never shows a review: the person
-        // may be away while the update relaunched this window ([`Review::Withheld`]).
-        let start: fn() -> bool = if restoring_window {
-            apply_successor_first_run
-        } else {
-            apply_first_run_doctor
-        };
-        first_run_window_eligible(setup_args, doctor_startup_env()).then_some(start)
+        first_run_start(args, restoring_window, doctor_startup_env())
     };
     #[cfg(not(target_os = "macos"))]
     let first_run = {
@@ -1475,8 +1617,11 @@ fn wire_window(args: &[OsString]) -> Option<fn() -> bool> {
             stop_initial_setup();
         },
         settle: settle_initial_setup,
+        cut_off: cut_off_initial_setup,
         sync_on: turn_sync_on,
+        tools_installed: command_line_tools_installed,
         fda_granted: verified_full_disk_access_granted,
+        join_phrase: join_alab_with_phrase,
     });
     aterm_gui::register_resource_runner();
     first_run
@@ -1546,26 +1691,29 @@ fn first_run_window_args(args: &[OsString], restoring_window: bool) -> &[OsStrin
     }
 }
 
+/// The first-run setup a new window starts, or none: one start for a launch and an update
+/// successor (`restoring_window`) alike, so a successor admits a pending plan and starts its
+/// background stages at once as any launch does, and only a person stage waits for a person
+/// (init-on-by-default design §6.1, §6.4).
+#[cfg(target_os = "macos")]
+fn first_run_start(
+    args: &[OsString],
+    restoring_window: bool,
+    env: DoctorStartupEnv,
+) -> Option<fn() -> bool> {
+    first_run_window_eligible(first_run_window_args(args, restoring_window), env)
+        .then_some(apply_first_run_doctor as fn() -> bool)
+}
+
+/// A window's first-run setup, a launch's and an update successor's alike.
 #[cfg(target_os = "macos")]
 fn apply_first_run_doctor() -> bool {
-    start_first_run(Review::Offered)
-}
-
-/// An update successor's first-run setup ([`Review::Withheld`]).
-#[cfg(target_os = "macos")]
-fn apply_successor_first_run() -> bool {
-    start_first_run(Review::Withheld)
-}
-
-#[cfg(target_os = "macos")]
-fn start_first_run(review: Review) -> bool {
     match std::thread::Builder::new()
         .name("aterm-workstation-setup".into())
-        .spawn(move || {
-            // A plan aterm chose by itself on an earlier launch widens only through a review of
-            // its own, which the watch offers as soon as the startup is done ([`AlabWatch`]):
-            // nothing is widened unreviewed (System State design §3.5).
-            run_startup_setup_with(None, review);
+        .spawn(|| {
+            // A plan aterm chose by itself on an earlier launch widens through the watch, which
+            // looks as soon as the startup is done ([`AlabWatch`]).
+            run_startup_setup(None);
         }) {
         Ok(_) => true,
         Err(why) => {
@@ -1596,30 +1744,12 @@ struct Widened {
 /// watch widened, so a Stop pressed since its look, or asked for the plan it widened, stops the
 /// run it admitted.
 #[cfg(target_os = "macos")]
-fn run_startup_setup(widened: Option<Widened>) {
-    run_startup_setup_with(widened, Review::Offered);
-}
-
-/// Whether a startup may show its plan on System State for review ([`SetupStartup::may_offer`]).
-#[cfg(target_os = "macos")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Review {
-    /// A launch the person started, or a startup a person's press began: the plan is offered.
-    Offered,
-    /// An update successor's: nobody may be at this Mac while the update relaunched the window,
-    /// so a setup never reviewed waits for the person, who opens System State from a note
-    /// (`aterm_gui::note_setup_unfinished`); a plan already admitted still resumes.
-    Withheld,
-}
-
-/// [`run_startup_setup`] for a startup whose review is `review`.
-#[cfg(target_os = "macos")]
-fn run_startup_setup_with(mut widened: Option<Widened>, review: Review) {
+fn run_startup_setup(mut widened: Option<Widened>) {
     let running = StartupRunning::enter();
     run_repaired_startups(|reserved| {
         let mut password = None;
         let (prepared, mut sent, recovered) =
-            prepare_first_run_doctor(reserved, review, |initial, look, on_begin| {
+            prepare_first_run_doctor(reserved, |initial, on_begin| {
                 let mut answer = aterm_gui::await_initial_setup_answer_while(
                     initial,
                     || {
@@ -1627,7 +1757,6 @@ fn run_startup_setup_with(mut widened: Option<Widened>, review: Review) {
                             aterm_cli::macos_doctor::initial_setup_finished().unwrap_or(false)
                         })
                     },
-                    look,
                     on_begin,
                 );
                 password = answer.password.take();
@@ -1644,11 +1773,7 @@ fn run_startup_setup_with(mut widened: Option<Widened>, review: Review) {
     read_again_if_unread();
 }
 
-/// A cancelled or closed review ends its attempt; other outcomes retain their watch maintenance.
-/// A Cancel, recorded for good, still starts the converge pass's window lane: its `sync.peers`
-/// reads the Cancel and joins nothing, and the rest is the upkeep a vault's subscriber runs
-/// anyway. A review closed unanswered is "not this launch": nothing of setup's runs, the lane
-/// (which would join the vault the review offers) included, and the next launch offers again.
+/// Run what the startup prepared, keeping its watch maintenance.
 #[cfg(target_os = "macos")]
 fn run_prepared_startup_with(
     prepared: PreparedSetup<StartupClaim>,
@@ -1656,12 +1781,6 @@ fn run_prepared_startup_with(
     sent: StartupSent,
     maintain: impl FnMut(WatchMaintenance),
 ) {
-    if matches!(prepared, PreparedSetup::Cancelled) {
-        (setup_io().converge_lane)();
-    }
-    if matches!(prepared, PreparedSetup::Cancelled | PreparedSetup::Closed) {
-        return;
-    }
     with_setup_watch(
         false,
         || run_prepared_setup(prepared, password, sent),
@@ -1858,28 +1977,13 @@ trait AlabWatch {
     fn widens(&mut self) -> Result<bool, String>;
     /// Wait out `gap`, then until a wake since the last look, or until `limit` has passed.
     fn wait(&mut self, gap: std::time::Duration, limit: std::time::Duration);
-    /// Look for the ALab signal and, once it is heard, offer the groups it adds as a review of
-    /// their own (design §3.5): the person's answer. An upgrade this watch holds was answered.
-    fn review(&mut self) -> Result<WidenReview, String>;
-    /// Widen the plan as its review admitted it: the widened plan's revision.
+    /// Look for the ALab signal: heard, so the plan widens now with nothing asked (design §3.5).
+    /// An upgrade this watch holds was heard.
+    fn heard(&mut self) -> Result<bool, String>;
+    /// Widen the plan: the widened plan's revision.
     fn look(&mut self) -> Result<Option<u64>, String>;
     /// Run the widened plan as a launch runs it.
     fn run(&mut self);
-}
-
-/// The answer to a review of the groups this Mac's ALab signal adds to aterm's provisional plan
-/// ([`AlabWatch::review`]).
-#[cfg(any(target_os = "macos", test))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WidenReview {
-    /// No signal heard yet, or no window could show the review: the watch looks again.
-    NotYet,
-    /// The review's plan was applied as it showed it: the watch widens the plan and runs it.
-    Applied,
-    /// The person answered it otherwise (a group choice, which runs as their choice does; a
-    /// Cancel, which keeps the plan in force as theirs; or closing it, not this launch): the
-    /// watch ends, and nothing offers this review again in this launch.
-    Answered,
 }
 
 /// While the plan aterm chose by itself is provisional, look for the ALab vault on each wake
@@ -1887,8 +1991,8 @@ enum WidenReview {
 /// again, this Mac's network changing: [`WakeMarks::ends_alab_wait`]) and on a slow timer, first
 /// as the watch starts: on a first launch the scoping probe is aterm's first request to the LAN,
 /// which macOS holds until the person answers its Local Network question, so it hears nothing.
-/// Once one hears it, System State offers the groups it adds as a review of their own, and the
-/// plan widens and runs in this launch only as that review admits it.
+/// Once one hears it, the plan widens to the groups it adds and runs at once, with nothing asked
+/// (on by default, design §6.1).
 #[cfg(any(target_os = "macos", test))]
 fn widen_on_alab_signal<W: AlabWatch>(watch: &mut W) {
     let mut looks = 0;
@@ -1905,8 +2009,8 @@ fn widen_on_alab_signal<W: AlabWatch>(watch: &mut W) {
                 false
             }
         };
-        // The first look goes at once: a review a person left unanswered on an earlier launch
-        // is offered again as this one starts.
+        // The first look goes at once: a signal heard on an earlier launch widens this one as it
+        // starts.
         if looks > 0 {
             watch.wait(ALAB_LOOK_GAP, alab_look_after(looks - 1));
         }
@@ -1914,10 +2018,9 @@ fn widen_on_alab_signal<W: AlabWatch>(watch: &mut W) {
         if !eligible {
             continue;
         }
-        match watch.review() {
-            Ok(WidenReview::NotYet) => continue,
-            Ok(WidenReview::Answered) => return,
-            Ok(WidenReview::Applied) => {}
+        match watch.heard() {
+            Ok(false) => continue,
+            Ok(true) => {}
             Err(why) => {
                 aterm_log::warn!("setup: looking for the ALab vault did not finish: {why}");
                 continue;
@@ -1936,60 +2039,31 @@ fn widen_on_alab_signal<W: AlabWatch>(watch: &mut W) {
     }
 }
 
-/// A review of the groups the ALab signal adds was answered in this launch other than by
-/// applying it ([`WidenReview::Answered`]): no watch offers it again until the next launch.
-#[cfg(target_os = "macos")]
-static WIDEN_REVIEW_ANSWERED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 /// Whether a watch of aterm's provisional plan has work in this launch
-/// ([`aterm_cli::macos_doctor::provisional_setup_widens`], [`WIDEN_REVIEW_ANSWERED`],
-/// [`widens_here_with`]).
+/// ([`aterm_cli::macos_doctor::provisional_setup_widens`], [`widens_here_with`]).
 #[cfg(target_os = "macos")]
 fn provisional_setup_widens_here() -> Result<bool, String> {
     widens_here_with(
-        WIDEN_REVIEW_ANSWERED.load(std::sync::atomic::Ordering::Acquire),
         aterm_cli::macos_doctor::provisional_setup_widens,
         aterm_cli::macos_doctor::initial_setup_revision,
     )
 }
 
-/// Whether a watch of aterm's provisional plan has work in this launch: no review of the
-/// widen was `answered` in it, the records still widen the plan in force (`widens`), and no
-/// Stop was asked in it for the run in force (`revision`, [`setup_stop_requested`]). A person
-/// who pressed Stop gets no more automatic setup in this launch, so no review offers to widen
-/// the run they stopped, even one the Stop came too late for (it finished, and its records keep
-/// no Stop). The next launch may offer it, as may a later run in this one (Set up now, a
-/// choice), which the Stop did not stop.
+/// Whether a watch of aterm's provisional plan has work in this launch: the records still widen
+/// the plan in force (`widens`), and no Stop was asked in it for the run in force (`revision`,
+/// [`setup_stop_requested`]). A person who pressed Stop gets no more automatic setup in this
+/// launch, so nothing widens the run they stopped, even one the Stop came too late for (it
+/// finished, and its records keep no Stop). The next launch may widen it, as may a later run in
+/// this one (Set up now, a choice), which the Stop did not stop.
 #[cfg(target_os = "macos")]
 fn widens_here_with(
-    answered: bool,
     widens: impl FnOnce() -> Result<bool, String>,
     revision: impl FnOnce() -> Result<u64, String>,
 ) -> Result<bool, String> {
-    if answered || !widens()? {
+    if !widens()? {
         return Ok(false);
     }
     Ok(!setup_stop_requested(revision()?))
-}
-
-/// A person's Cancel of the review of the groups the ALab signal adds: the plan in force becomes
-/// theirs for good ([`aterm_cli::macos_doctor::decline_provisional_setup_widen`]), a write that
-/// fails tried again by itself after the retry wait.
-#[cfg(target_os = "macos")]
-fn decline_widen() {
-    let mut seen = SETUP_WAKES.count();
-    loop {
-        match aterm_cli::macos_doctor::decline_provisional_setup_widen() {
-            Ok(_) => break,
-            Err(why) if setup_is_newer(&why) => break,
-            Err(why) => {
-                aterm_log::warn!("setup: keeping the plan as it is did not finish: {why}");
-                SETUP_WAKES.back_off(&mut seen, SETUP_RETRY_WAIT);
-            }
-        }
-    }
-    aterm_gui::publish_initial_setup_status(initial_setup_status());
 }
 
 #[cfg(target_os = "macos")]
@@ -2001,13 +2075,9 @@ struct LiveAlabWatch {
     upgrade: aterm_cli::macos_doctor::InitialSetupUpgrade,
     /// The plan the last look widens, or widened.
     widened: Widened,
-    /// The page's receipt for the review this watch's upgrade answers: accepted once the
-    /// upgrade is saved, so the page takes the widened plan as the one in force; kept only
-    /// while the upgrade is pending, and refused otherwise ([`look_settling_with`]).
-    receipt: Option<aterm_gui::InitialSetupApplyReceipt>,
-    /// The number the review's Apply took as the latest plan change
-    /// ([`SETUP_APPLY_GENERATION`]): a later choice overtakes it while it waits for another
-    /// setup, as it overtakes a choice waiting. Zero before a review applied.
+    /// The number the widen took as the latest plan change ([`SETUP_APPLY_GENERATION`]) once
+    /// the signal was heard: a later choice overtakes it while it waits for another setup, as it
+    /// overtakes a choice waiting. Zero before the signal was heard.
     generation: u64,
 }
 
@@ -2019,7 +2089,6 @@ impl LiveAlabWatch {
             focus: AlabFocus::new(),
             upgrade: aterm_cli::macos_doctor::InitialSetupUpgrade::default(),
             widened: Widened::default(),
-            receipt: None,
             generation: 0,
         }
     }
@@ -2036,8 +2105,8 @@ impl AlabWatch for LiveAlabWatch {
     }
 
     fn wait(&mut self, gap: std::time::Duration, limit: std::time::Duration) {
-        // A held upgrade whose write failed is a review's Apply still owed: it is tried again
-        // after the retry wait, never after the longer wait between looks for the signal.
+        // A held upgrade whose write failed is a widen still owed: it is tried again after the
+        // retry wait, never after the longer wait between looks for the signal.
         let limit = if self.upgrade.pending() {
             limit.min(SETUP_RETRY_WAIT)
         } else {
@@ -2064,79 +2133,40 @@ impl AlabWatch for LiveAlabWatch {
         SETUP_WAKES.back_off_alab(&mut self.wakes_seen, focus, limit.saturating_sub(gap));
     }
 
-    fn review(&mut self) -> Result<WidenReview, String> {
-        use aterm_gui::WorkstationSetupDecision;
+    fn heard(&mut self) -> Result<bool, String> {
         if self.upgrade.pending() {
-            return Ok(WidenReview::Applied);
+            return Ok(true);
         }
         // Read again at the moment of the look: a Stop pressed while the watch waited holds it.
         if !provisional_setup_widens_here()? {
-            return Ok(WidenReview::NotYet);
+            return Ok(false);
         }
-        let Some((in_force, widened)) = aterm_cli::macos_doctor::provisional_setup_widened()?
-        else {
-            return Ok(WidenReview::NotYet);
-        };
-        // Offered in System State's tab without taking the person's (design §6); withdrawn once
-        // the plan is no longer aterm's to widen (a choice made meanwhile), or a Stop holds it.
-        let mut answer = aterm_gui::await_widen_answer_while(
-            widened.clone(),
-            in_force,
-            || !provisional_setup_widens_here().unwrap_or(true),
-            || {},
-        );
-        let password = answer.password.take();
-        let receipt = answer.receipt.take();
-        let answered = || {
-            WIDEN_REVIEW_ANSWERED.store(true, std::sync::atomic::Ordering::Release);
-            Ok(WidenReview::Answered)
-        };
-        match answer.decision {
-            WorkstationSetupDecision::Begin(plan) if !answer.chosen && plan == widened => {
-                self.receipt = receipt;
-                // The latest plan change from now: a later choice overtakes it.
-                let generation =
-                    SETUP_APPLY_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
-                self.generation = generation;
-                // Shown waiting the moment its write finds another setup holding the records
-                // (design §3.3), never a run going.
-                self.upgrade
-                    .noting_wait(move || queue_setup_press(generation));
-                Ok(WidenReview::Applied)
-            }
-            // A press on the review is the person's choice, which runs as their choices do.
-            WorkstationSetupDecision::Begin(plan) => {
-                if let Some(receipt) = receipt {
-                    restart_initial_setup(plan, answer.vault_typed, password, receipt);
-                }
-                answered()
-            }
-            WorkstationSetupDecision::Cancelled => {
-                WIDEN_REVIEW_ANSWERED.store(true, std::sync::atomic::Ordering::Release);
-                decline_widen();
-                answered()
-            }
-            WorkstationSetupDecision::Closed => answered(),
-            WorkstationSetupDecision::Unavailable => Ok(WidenReview::NotYet),
+        if aterm_cli::macos_doctor::provisional_setup_widened()?.is_none() {
+            return Ok(false);
         }
+        // The latest plan change from now: a later choice overtakes it.
+        let generation =
+            SETUP_APPLY_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+        self.generation = generation;
+        // Nobody chose it: while it waits, the page says it adds the ALab profile.
+        SETUP_QUEUED_WIDEN.store(generation, std::sync::atomic::Ordering::Release);
+        // Shown waiting the moment its write finds another setup holding the records (design
+        // §3.3), never a run going.
+        self.upgrade
+            .noting_wait(move || queue_setup_press(generation));
+        Ok(true)
     }
 
     fn look(&mut self) -> Result<Option<u64>, String> {
         let generation = self.generation;
-        let (looked, receipt) = look_settling_with(
-            &mut self.widened,
-            &mut self.upgrade,
-            self.receipt.take(),
-            |widened| {
-                queue_setup_press(generation);
-                wait_while_queued(|| {
-                    setup_choice_overtaken(generation)
-                        || stop_covers(widened.sent)
-                        || setup_stop_requested(widened.from)
-                })
-            },
-        );
-        self.receipt = receipt;
+        let looked = look_settling_with(&mut self.widened, &mut self.upgrade, |widened| {
+            queue_setup_press(generation);
+            wait_while_queued(|| {
+                setup_choice_overtaken(generation)
+                    || stop_covers(widened.sent)
+                    || setup_stop_requested(widened.from)
+            })
+        });
         if generation != 0 {
             unqueue_setup_press(generation);
         }
@@ -2150,12 +2180,10 @@ impl AlabWatch for LiveAlabWatch {
     }
 }
 
-/// One look of a watch whose widen review applied (`receipt`, the page's for that Apply), which
-/// settles that Apply by every way the look ends but one: accepted once the widened plan is
-/// saved (`Ok(Some)`); kept while the upgrade is still pending, whose next look finishes or
-/// retires it; and otherwise refused, so the page shows the plan in force again, its controls
-/// live and the permission gate released (System State design §3.5). The receipt that comes
-/// back is the one kept.
+/// One look of a watch that heard the ALab signal: the widened plan's revision once it is saved
+/// (`Ok(Some)`); an upgrade still pending (a write that failed part-way) is finished or retired
+/// by its next look; a newer aterm's records end the upgrade whatever it says, and the page
+/// shows the newer aterm's setup (System State design §3.5).
 ///
 /// An upgrade that finds another setup holding the records past its wait
 /// ([`aterm_cli::macos_doctor::SETUP_BUSY`]) waits on, as a choice does (§3.3): `queue` shows it
@@ -2165,12 +2193,8 @@ impl AlabWatch for LiveAlabWatch {
 fn look_settling_with(
     widened: &mut Widened,
     upgrade: &mut impl WatchUpgrade,
-    receipt: Option<aterm_gui::InitialSetupApplyReceipt>,
     mut queue: impl FnMut(&Widened) -> bool,
-) -> (
-    Result<Option<u64>, String>,
-    Option<aterm_gui::InitialSetupApplyReceipt>,
-) {
+) -> Result<Option<u64>, String> {
     let looked = loop {
         let looked = look_setup_upgrade_with(widened, upgrade);
         let held_elsewhere = upgrade.pending()
@@ -2188,17 +2212,12 @@ fn look_settling_with(
         }
         break looked;
     };
-    let receipt = match (&looked, receipt) {
-        (Ok(Some(_)), Some(receipt)) => {
-            receipt.accept();
-            None
-        }
-        (Ok(Some(_)), None) => None,
-        (_, receipt) if upgrade.pending() => receipt,
-        // Dropped: refused.
-        (_, _) => None,
-    };
-    (looked, receipt)
+    // A newer aterm's records are final for this binary, whatever the upgrade says of its
+    // attempt: it ends, and the page shows the newer aterm's setup.
+    if matches!(&looked, Err(why) if setup_is_newer(why)) {
+        upgrade.forget();
+    }
+    looked
 }
 
 /// The actual admission port of one look; the test arm uses the same scratch record writers.
@@ -2283,7 +2302,15 @@ fn look_setup_upgrade_with(
             }
         }
         Err(why) => {
-            // A failed read cannot certify that the attempt published nothing.
+            // A failed read cannot certify that the attempt published nothing. One the upgrade
+            // let go (a write it cannot identify) leaves its Stop debt behind as a startup
+            // admission's does: unconfirmed, it outlives this look's guard until a later
+            // admission retires it ([`retire_unconfirmed_admissions`]).
+            if !upgrade.pending()
+                && let Some(under_way) = widened.under_way.take()
+            {
+                under_way.record_publication(Err(why.clone()));
+            }
             return Err(why);
         }
     }
@@ -2470,16 +2497,10 @@ fn startup_offer_withdrawn(finished: impl FnOnce() -> bool) -> bool {
 #[cfg(target_os = "macos")]
 fn prepare_first_run_doctor(
     reserved: Option<StartupSent>,
-    review: Review,
-    offer: impl FnMut(
-        aterm_types::macos_setup::Plan,
-        StartupLook,
-        StartupHandoff,
-    ) -> aterm_gui::SetupAnswer,
+    offer: impl FnMut(aterm_types::macos_setup::Plan, StartupHandoff) -> aterm_gui::SetupAnswer,
 ) -> (PreparedSetup<StartupClaim>, StartupSent, bool) {
     let mut host = LiveSetupStartup {
         offer,
-        review,
         receipt: None,
         authorization: None,
         last_failure: None,
@@ -2490,7 +2511,6 @@ fn prepare_first_run_doctor(
         sent: reserved.unwrap_or_default(),
         retry_seen: SETUP_WAKES.count(),
         recovered: false,
-        reviewed: None,
     };
     let prepared = match prepare_setup(&mut host) {
         Ok(prepared) => prepared,
@@ -2795,12 +2815,6 @@ trait SetupStartup {
         false
     }
     fn admission(&mut self) -> Result<Option<SetupAdmission>, String>;
-    /// Whether this startup may show a plan nobody admitted yet for review: an update
-    /// successor's may not ([`Review::Withheld`]), and leaves a note instead. Asked before the
-    /// plan is read, so a withheld review reads and probes nothing for it.
-    fn may_offer(&mut self) -> bool {
-        true
-    }
     /// Offer the plan of `admission`, the run this startup resumes, back to System State without
     /// waiting for its answer (design §3.3, §6): the page answers it by itself as it answers the
     /// first launch's offer, and that answer, taken as "go on with this revision" (nothing new
@@ -2815,17 +2829,6 @@ trait SetupStartup {
         &mut self,
         initial: aterm_types::macos_setup::Plan,
     ) -> aterm_gui::WorkstationSetupDecision;
-    /// Record a person's Cancel of the review just answered, for good (design §3.3): every group
-    /// at Leave as is, aterm's own permissions with them, until Set up now applies the plan the
-    /// review showed or a group choice sets up its group. `Ok(false)` when the records changed
-    /// since the review bound (a choice made meanwhile answers for it): nothing is written.
-    fn cancel(&mut self) -> Result<bool, String> {
-        Ok(true)
-    }
-    /// The person closed the review just shown, unanswered: nothing is recorded, nothing offers
-    /// it again in this launch, and System State shows the plan it showed with Set up now; the
-    /// next launch offers it once more (design §3.3).
-    fn closed(&mut self) {}
     fn validate(&mut self, _: &aterm_types::macos_setup::Plan) -> Result<(), String> {
         Ok(())
     }
@@ -2857,8 +2860,6 @@ trait SetupStartup {
 struct LiveSetupStartup<F> {
     /// Shows the plan on System State and waits for the page's answer.
     offer: F,
-    /// Whether this startup may show it ([`Review`]).
-    review: Review,
     receipt: Option<aterm_gui::InitialSetupApplyReceipt>,
     authorization: Option<aterm_cli::macos_doctor::InitialSetupAuthorization>,
     last_failure: Option<String>,
@@ -2876,9 +2877,6 @@ struct LiveSetupStartup<F> {
     retry_seen: u64,
     /// This bound review repaired corrupt records and retired without adopting them.
     recovered: bool,
-    /// The plan the last review showed when it was answered: the one offered, or the plan this
-    /// Mac's ALab signal widened it to while it was up. A Cancel names it.
-    reviewed: Option<aterm_types::macos_setup::Plan>,
 }
 
 /// What the offer of a resumed run's plan reads and waits on ([`run_resume_offer`]): the live
@@ -2960,9 +2958,6 @@ fn run_resume_offer(
                 return ResumeOffer::Admitted;
             }
             WorkstationSetupDecision::Unavailable => reach.back_off(SETUP_RETRY_WAIT),
-            WorkstationSetupDecision::Cancelled | WorkstationSetupDecision::Closed => {
-                return ResumeOffer::LetGo;
-            }
         }
     }
 }
@@ -3034,61 +3029,6 @@ fn offer_resumed_plan(plan: aterm_types::macos_setup::Plan, revision: u64, sent:
     }
 }
 
-/// What a startup's review asks each second while it is up: the plan the ALab signal widens its
-/// draft to, once ([`aterm_gui::await_initial_setup_answer_while`]).
-#[cfg(target_os = "macos")]
-type StartupLook = Box<dyn FnMut() -> Option<aterm_types::macos_setup::Plan>>;
-
-/// The plan a review of `offered` widens to in place once this Mac shows the ALab signal while
-/// it is up (design §3.5): the whole profile, for aterm's own provisional offer that is less.
-#[cfg(target_os = "macos")]
-fn review_widens_to(
-    offered: &aterm_types::macos_setup::Plan,
-    provisional: bool,
-) -> Option<aterm_types::macos_setup::Plan> {
-    let all = aterm_types::macos_setup::Selection::all();
-    (provisional && offered.selection != all).then(|| aterm_types::macos_setup::Plan {
-        selection: all,
-        vault_url: offered.vault_url.clone(),
-    })
-}
-
-/// The review's look for the ALab signal, paced as the watch's ([`widen_on_alab_signal`]): on a
-/// setup wake that is a reason to look ([`WakeMarks::ends_alab_wait`]: the Local Network answer,
-/// the review coming to the front, Check again) and on a timer from [`ALAB_LOOK_FIRST`] doubling,
-/// never twice within [`ALAB_LOOK_GAP`]; `widened` once this Mac shows it
-/// ([`aterm_cli::macos_doctor::alab_mac`], which may probe the network for a few seconds on this
-/// worker). The offer itself looked just before.
-#[cfg(target_os = "macos")]
-fn review_alab_look(widened: aterm_types::macos_setup::Plan) -> StartupLook {
-    let mut seen = SETUP_WAKES.marks();
-    let mut last = std::time::Instant::now();
-    let mut looks = 0;
-    let mut focus = AlabFocus::new();
-    Box::new(move || {
-        let wakes = SETUP_WAKES.marks();
-        let since = last.elapsed();
-        if since < ALAB_LOOK_GAP {
-            return None;
-        }
-        if since < alab_look_after(looks) {
-            if wakes == seen {
-                return None;
-            }
-            if !wakes.ends_alab_wait(seen, focus.counts(lan_heard(), std::time::Instant::now())) {
-                // A wake that is no reason to look (a focus gain [`AlabFocus`] does not count) is
-                // taken as heard, so the next tick does not weigh it again.
-                seen = wakes;
-                return None;
-            }
-        }
-        seen = wakes;
-        last = std::time::Instant::now();
-        looks = looks.saturating_add(1);
-        aterm_cli::macos_doctor::alab_mac().then(|| widened.clone())
-    })
-}
-
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StartupAnswerKind {
@@ -3137,9 +3077,8 @@ impl<F> LiveSetupStartup<F> {
 }
 
 #[cfg(target_os = "macos")]
-impl<
-    F: FnMut(aterm_types::macos_setup::Plan, StartupLook, StartupHandoff) -> aterm_gui::SetupAnswer,
-> SetupStartup for LiveSetupStartup<F>
+impl<F: FnMut(aterm_types::macos_setup::Plan, StartupHandoff) -> aterm_gui::SetupAnswer>
+    SetupStartup for LiveSetupStartup<F>
 {
     type Claim = StartupClaim;
 
@@ -3245,14 +3184,6 @@ impl<
         Ok(plan)
     }
 
-    fn may_offer(&mut self) -> bool {
-        if self.review == Review::Withheld {
-            aterm_gui::note_setup_unfinished();
-            return false;
-        }
-        true
-    }
-
     fn offer_resume(&mut self, admission: &SetupAdmission) {
         offer_resumed_plan(admission.plan.clone(), admission.revision, self.sent.sent);
     }
@@ -3262,55 +3193,16 @@ impl<
         initial: aterm_types::macos_setup::Plan,
     ) -> aterm_gui::WorkstationSetupDecision {
         startup_went_on();
-        // The page shows the review itself: the note an update successor left goes.
+        // An older aterm's note that its update successor left setup unstarted goes.
         aterm_gui::clear_setup_unfinished();
-        let widen_to = self
-            .offered
-            .as_ref()
-            .and_then(|(offered, provisional)| review_widens_to(offered, *provisional));
-        let look = match widen_to.clone() {
-            Some(widened) => review_alab_look(widened),
-            None => Box::new(|| None),
-        };
-        let mut answer = (self.offer)(initial.clone(), look, self.sent.handoff());
+        let mut answer = (self.offer)(initial, self.sent.handoff());
         // A retry's wait starts once the offer is answered: the review's own coming to the
         // front is a setup wake, which must not end the wait before the next offer at once.
         self.retry_seen = SETUP_WAKES.count();
         self.receipt = answer.receipt.take();
         self.chosen = answer.chosen;
         self.vault_typed = answer.vault_typed;
-        self.reviewed = Some(initial);
-        if answer.widened
-            && let Some(widened) = widen_to
-        {
-            // The widened plan is aterm's own provisional offer now, as the next launch on this
-            // ALab Mac offers it: admitted untouched, it is the automatic admission.
-            self.reviewed = Some(widened.clone());
-            self.offered = Some((widened, true));
-        }
         answer.decision
-    }
-
-    fn cancel(&mut self) -> Result<bool, String> {
-        let reviewed = self
-            .reviewed
-            .clone()
-            .ok_or("the startup review showed no plan")?;
-        let authorization = self
-            .authorization
-            .as_mut()
-            .ok_or("the startup review has no bound authorization")?;
-        let observed = authorization.cancel_observed(&reviewed);
-        self.observation = observed.observation;
-        let cancelled = observed.result?;
-        clear_initial_setup_rows();
-        aterm_gui::publish_initial_setup_status(initial_setup_status());
-        Ok(cancelled)
-    }
-
-    fn closed(&mut self) {
-        note_review_closed(self.reviewed.clone());
-        aterm_gui::publish_initial_setup_status(initial_setup_status());
     }
 
     fn validate(&mut self, plan: &aterm_types::macos_setup::Plan) -> Result<(), String> {
@@ -3392,16 +3284,14 @@ mod startup_answer_tests {
     fn answered(
         chosen: bool,
         vault_typed: bool,
-    ) -> LiveSetupStartup<impl FnMut(Plan, StartupLook, StartupHandoff) -> aterm_gui::SetupAnswer>
-    {
+    ) -> LiveSetupStartup<impl FnMut(Plan, StartupHandoff) -> aterm_gui::SetupAnswer> {
         let plan = Plan::default();
         let mut host = LiveSetupStartup {
-            offer: move |plan, _, _| aterm_gui::SetupAnswer {
+            offer: move |plan, _| aterm_gui::SetupAnswer {
                 chosen,
                 vault_typed,
                 ..aterm_gui::WorkstationSetupDecision::Begin(plan).into()
             },
-            review: Review::Offered,
             receipt: None,
             authorization: None,
             last_failure: None,
@@ -3412,7 +3302,6 @@ mod startup_answer_tests {
             sent: StartupSent::default(),
             retry_seen: SETUP_WAKES.count(),
             recovered: false,
-            reviewed: None,
         };
         assert_eq!(
             host.offer(plan.clone()),
@@ -3453,56 +3342,6 @@ mod startup_answer_tests {
             StartupAnswerKind::Join
         );
     }
-
-    /// The review showed the plan this Mac's ALab signal widened its untouched draft to while it
-    /// was up (design §3.5): admitted untouched, it is aterm's own provisional admission, as the
-    /// next launch on this ALab Mac offers it, and a Cancel names it as the plan the review
-    /// showed. Only aterm's own provisional plan widens, and only to the whole profile.
-    #[test]
-    fn a_review_widened_in_place_answers_for_the_widened_plan() {
-        use aterm_types::macos_setup::{Selection, Setting};
-        let mut permissions = Selection::none();
-        permissions.set(Setting::Permissions, true);
-        let narrow = Plan::from(permissions);
-        let widened = review_widens_to(&narrow, true).expect("the provisional plan widens");
-        assert_eq!(widened.selection, Selection::all());
-        assert_eq!(widened.vault_url, narrow.vault_url);
-        assert_eq!(
-            review_widens_to(&narrow, false),
-            None,
-            "a person's plan stays"
-        );
-        assert_eq!(
-            review_widens_to(&widened, true),
-            None,
-            "the whole profile stays"
-        );
-        let answer = widened.clone();
-        let mut host = LiveSetupStartup {
-            offer: move |_, _, _| aterm_gui::SetupAnswer {
-                widened: true,
-                ..aterm_gui::WorkstationSetupDecision::Begin(answer.clone()).into()
-            },
-            review: Review::Offered,
-            receipt: None,
-            authorization: None,
-            last_failure: None,
-            observation: None,
-            offered: Some((narrow.clone(), true)),
-            chosen: false,
-            vault_typed: false,
-            sent: StartupSent::default(),
-            retry_seen: SETUP_WAKES.count(),
-            recovered: false,
-            reviewed: None,
-        };
-        assert_eq!(
-            host.offer(narrow),
-            aterm_gui::WorkstationSetupDecision::Begin(widened.clone())
-        );
-        assert_eq!(host.answer_kind(&widened), StartupAnswerKind::Automatic);
-        assert_eq!(host.reviewed, Some(widened));
-    }
 }
 
 #[cfg(target_os = "macos")]
@@ -3516,15 +3355,8 @@ fn setup_is_newer(_why: &str) -> bool {
 
 #[cfg(any(target_os = "macos", test))]
 enum PreparedSetup<C> {
-    Authorized {
-        claim: C,
-        revision: u64,
-    },
+    Authorized { claim: C, revision: u64 },
     Finished,
-    /// A person's Cancel of the review, recorded for good (design §3.3).
-    Cancelled,
-    /// The person closed the review unanswered: not this launch (design §3.3).
-    Closed,
     Unavailable,
 }
 
@@ -3685,7 +3517,6 @@ fn prepare_setup<H: SetupStartup>(host: &mut H) -> Result<PreparedSetup<H::Claim
         Resume(SetupAdmission),
         Finished,
         Superseded,
-        Withheld,
     }
     loop {
         let claim = match retry_bound_setup_read(host, H::claim)? {
@@ -3717,9 +3548,6 @@ fn prepare_setup<H: SetupStartup>(host: &mut H) -> Result<PreparedSetup<H::Claim
                     BeforeOffer::Resume(admission)
                 });
             }
-            if !host.may_offer() {
-                return Ok(BeforeOffer::Withheld);
-            }
             host.initial().map(BeforeOffer::Initial)
         })();
         if host.stopped() {
@@ -3746,9 +3574,7 @@ fn prepare_setup<H: SetupStartup>(host: &mut H) -> Result<PreparedSetup<H::Claim
                 });
             }
             Ok(BeforeOffer::Finished) => return Ok(PreparedSetup::Finished),
-            Ok(BeforeOffer::Superseded | BeforeOffer::Withheld) => {
-                return Ok(PreparedSetup::Unavailable);
-            }
+            Ok(BeforeOffer::Superseded) => return Ok(PreparedSetup::Unavailable),
             Err(why) => {
                 drop(claim);
                 if matches!(
@@ -3777,19 +3603,6 @@ fn prepare_setup<H: SetupStartup>(host: &mut H) -> Result<PreparedSetup<H::Claim
             WorkstationSetupDecision::Begin(plan) => {
                 host.answered();
                 return Ok(finish_setup_choice(host, claim, plan));
-            }
-            WorkstationSetupDecision::Cancelled => {
-                // A person's Cancel holds until they ask again (design §3.3): it is recorded
-                // before the startup ends, and a write that fails is tried again by itself. The
-                // claim goes first: a choice made meanwhile answers for the Cancel.
-                drop(claim);
-                retry_setup_step(host, H::cancel)?;
-                return Ok(PreparedSetup::Cancelled);
-            }
-            WorkstationSetupDecision::Closed => {
-                drop(claim);
-                host.closed();
-                return Ok(PreparedSetup::Closed);
             }
             WorkstationSetupDecision::Unavailable => {
                 drop(claim);
@@ -3971,8 +3784,6 @@ fn run_prepared_setup(
         // review, a Stop, a newer choice): the window lane is this launch's converge pass beside
         // the subscriber's, each item keeping its own off switch.
         PreparedSetup::Unavailable => (setup_io().converge_lane)(),
-        // The startup ends these before a run ([`run_prepared_startup_with`]).
-        PreparedSetup::Cancelled | PreparedSetup::Closed => {}
     }
 }
 
@@ -4740,7 +4551,7 @@ mod watch_spawn_recovery_tests;
 #[cfg(test)]
 mod alab_watch_tests {
     use super::{
-        ALAB_LOOK_FIRST, ALAB_LOOK_GAP, ALAB_LOOK_LONGEST, AlabWatch, WidenReview, alab_look_after,
+        ALAB_LOOK_FIRST, ALAB_LOOK_GAP, ALAB_LOOK_LONGEST, AlabWatch, alab_look_after,
         widen_on_alab_signal,
     };
     use std::collections::VecDeque;
@@ -4750,8 +4561,8 @@ mod alab_watch_tests {
     #[derive(Default)]
     struct Scripted {
         widens: VecDeque<Option<bool>>,
-        /// The review's answers; once they run out, every review is applied.
-        reviews: VecDeque<WidenReview>,
+        /// Whether each look hears the signal; once they run out, every look hears it.
+        heard: VecDeque<bool>,
         looks: VecDeque<Result<Option<u64>, String>>,
         waits: Vec<(Duration, Duration)>,
         runs: u32,
@@ -4769,8 +4580,8 @@ mod alab_watch_tests {
         fn wait(&mut self, gap: Duration, limit: Duration) {
             self.waits.push((gap, limit));
         }
-        fn review(&mut self) -> Result<WidenReview, String> {
-            Ok(self.reviews.pop_front().unwrap_or(WidenReview::Applied))
+        fn heard(&mut self) -> Result<bool, String> {
+            Ok(self.heard.pop_front().unwrap_or(true))
         }
         fn look(&mut self) -> Result<Option<u64>, String> {
             self.looks.pop_front().expect("a look the script answers")
@@ -4808,30 +4619,28 @@ mod alab_watch_tests {
         assert!(watch.looks.is_empty());
     }
 
-    /// The groups the ALab signal adds are offered as a review of their own, at once as the
-    /// watch starts: the plan widens only once that review is applied. Any other answer (a
-    /// group choice, a Cancel, closing it) ends the watch with nothing widened or run, and a
-    /// review no window could show yet is offered again at the next look.
+    /// The plan widens to the groups the ALab signal adds the moment a look hears it, the first
+    /// look at once as the watch starts, with nothing asked (design §6.1); a look that hears
+    /// nothing yet waits for the next.
     #[test]
-    fn a_watch_widens_only_as_its_review_admits() {
+    fn a_watch_widens_at_once_when_a_look_hears_the_signal() {
         let mut later = Scripted {
             widens: [Some(true)].into(),
-            reviews: [WidenReview::NotYet].into(),
+            heard: [false].into(),
             looks: [Ok(Some(3))].into(),
             ..Scripted::default()
         };
         widen_on_alab_signal(&mut later);
         assert_eq!(later.waits, [(ALAB_LOOK_GAP, ALAB_LOOK_FIRST)]);
         assert_eq!(later.runs, 1);
-        let mut answered = Scripted {
+        let mut first = Scripted {
             widens: [Some(true)].into(),
-            reviews: [WidenReview::Answered].into(),
+            looks: [Ok(Some(3))].into(),
             ..Scripted::default()
         };
-        widen_on_alab_signal(&mut answered);
-        assert!(answered.waits.is_empty(), "the review was offered at once");
-        assert_eq!(answered.runs, 0, "nothing widened or run");
-        assert!(answered.reviews.is_empty());
+        widen_on_alab_signal(&mut first);
+        assert!(first.waits.is_empty(), "the first look went at once");
+        assert_eq!(first.runs, 1, "widened and run with nothing asked");
     }
 
     #[test]
@@ -4941,8 +4750,8 @@ mod alab_watch_tests {
                 self.waits += 1;
             }
 
-            fn review(&mut self) -> Result<WidenReview, String> {
-                Ok(WidenReview::Applied)
+            fn heard(&mut self) -> Result<bool, String> {
+                Ok(true)
             }
 
             fn look(&mut self) -> Result<Option<u64>, String> {
@@ -6265,9 +6074,10 @@ fn startup_holds_claim() -> bool {
 struct SetupActivity {
     /// Raised at every stage start and end.
     epoch: u64,
-    /// The settings whose stage runs now.
+    /// The settings whose stages run now: a set, since lanes run stages at once (the
+    /// Secrets lane beside Workstation, design §6.2).
     settings: Vec<aterm_types::macos_setup::Setting>,
-    /// The rows that stage can change.
+    /// The rows those stages can change.
     subjects: Vec<aterm_types::macos_setup::Subject>,
     /// The epoch of the last stage event that could change each row.
     touched: Vec<(aterm_types::macos_setup::Subject, u64)>,
@@ -6275,6 +6085,8 @@ struct SetupActivity {
 
 #[cfg(target_os = "macos")]
 impl SetupActivity {
+    /// A stage started (`running`) or ended: its settings and rows join the running set, or
+    /// leave it, and the others' stay.
     fn mark(
         &mut self,
         settings: &[aterm_types::macos_setup::Setting],
@@ -6282,16 +6094,21 @@ impl SetupActivity {
         running: bool,
     ) {
         self.epoch += 1;
-        self.settings = if running {
-            settings.to_vec()
+        if running {
+            for setting in settings {
+                if !self.settings.contains(setting) {
+                    self.settings.push(*setting);
+                }
+            }
+            for subject in subjects {
+                if !self.subjects.contains(subject) {
+                    self.subjects.push(*subject);
+                }
+            }
         } else {
-            Vec::new()
-        };
-        self.subjects = if running {
-            subjects.to_vec()
-        } else {
-            Vec::new()
-        };
+            self.settings.retain(|setting| !settings.contains(setting));
+            self.subjects.retain(|subject| !subjects.contains(subject));
+        }
         for subject in subjects {
             match self.touched.iter_mut().find(|(row, _)| row == subject) {
                 Some(touched) => touched.1 = self.epoch,
@@ -6803,6 +6620,13 @@ static SETUP_APPLY_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic:
 #[cfg(target_os = "macos")]
 static SETUP_QUEUED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The choice number of the automatic admission of the groups this Mac's ALab signal adds
+/// (`LiveAlabWatch::review`, answered as offered with nobody's press), or 0: while
+/// [`SETUP_QUEUED`] holds it, what waits is aterm's own, and the page says it waits to add this
+/// Mac's ALab profile (`SetupStatus::queued_widen`), never the person's choice.
+#[cfg(target_os = "macos")]
+static SETUP_QUEUED_WIDEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// [`SETUP_QUEUED`]'s mark for a Restore, which no choice's number reaches.
 #[cfg(target_os = "macos")]
 const RESTORE_QUEUED: u64 = u64::MAX;
@@ -6854,7 +6678,7 @@ fn wait_while_queued(let_go: impl Fn() -> bool) -> bool {
 const SETUP_HOOKS: aterm_cli::macos_doctor::SetupHooks = aterm_cli::macos_doctor::SetupHooks {
     stop: setup_stop_requested,
     stage: setup_stage,
-    on_screen: aterm_types::macos_setup::system_state_front,
+    on_screen: aterm_gui::system_state_on_screen,
     developer_tools: aterm_gui::offer_developer_tools_install,
 };
 
@@ -7036,13 +6860,17 @@ fn wake_setup_network() {
 /// Permissions stage at once (System State design §6). A caller that timed out
 /// behind another dialog also retries once its last guard ends. A window gaining
 /// focus wakes the startup's waits, and a run's park only while an Accounts or
-/// Permissions stage is left.
+/// Permissions stage is left. The moment this process's LAN stops being held for
+/// System State's Local Network step (the step hands it over, a use asks through
+/// the door, the wait for the step runs out) is a fact a Secrets join parked on
+/// the step reads again (`lan_first_use::on_open`).
 #[cfg(target_os = "macos")]
 fn watch_setup_signals() {
     aterm_gui::on_window_focus_gained(wake_setup_on_focus);
     aterm_types::macos_setup::on_system_state_front(wake_setup);
     aterm_types::macos_setup::access_record::on_append(access_step_recorded);
     aterm_types::macos_setup::on_macos_dialog_waiter_ready(wake_setup);
+    aterm_types::macos_setup::lan_first_use::on_open(wake_setup_facts);
 }
 
 /// The window wrote a line to the access record (System State design §6): a step it handed to
@@ -7058,6 +6886,16 @@ fn access_step_recorded(
     // Local Network's step is kept with its time, so it outranks an older answer a look kept.
     aterm_cli::macos_doctor::initial_setup_access_step(access, outcome);
     access_fact_observed(access, outcome);
+}
+
+/// System State's Command Line Tools tab said Apple's Command Line Tools are installed
+/// ([`aterm_gui::InitialSetupHandlers::tools_installed`]): the GitHub repositories row is read
+/// again at once, and a run parked on them wakes to go on (System State design §3.3).
+#[cfg(target_os = "macos")]
+fn command_line_tools_installed() {
+    use aterm_types::macos_setup::{Setting, Subject};
+    request_observation(None, vec![Subject::Setting(Setting::Repositories)], false);
+    wake_setup();
 }
 
 /// The window's own grant is a completed fact even while the setup permission gate is held:
@@ -7139,9 +6977,10 @@ fn end_setup_activity() {
         && (!activity.settings.is_empty() || !activity.subjects.is_empty())
     {
         // An early error missed the normal end hook. Retire readings taken
-        // during that stage just as the hook would, before clearing its rows.
+        // during those stages just as the hook would, before clearing their rows.
+        let settings = std::mem::take(&mut activity.settings);
         let subjects = std::mem::take(&mut activity.subjects);
-        activity.mark(&[], &subjects, false);
+        activity.mark(&settings, &subjects, false);
     }
 }
 
@@ -7593,6 +7432,54 @@ fn turn_sync_on() -> bool {
         .is_ok()
 }
 
+/// System State's Join under the Secrets vault row's phrase field
+/// ([`aterm_gui::InitialSetupHandlers::join_phrase`]): on its own worker (the join finds a member
+/// on this network and runs the phrase with it), ALab lets this Mac in with the phrase a member
+/// showed once its person pressed Allow, as `aterm members join <phrase>` does. The receipt says
+/// whether it did, whether it was refused, or whether it reached no member, which spends no
+/// phrase; why goes to the log, never the page. Then the Secrets and GitHub repositories rows
+/// are read again.
+#[cfg(target_os = "macos")]
+fn join_alab_with_phrase(
+    phrase: aterm_secrets::SecretBytes,
+    receipt: aterm_gui::PhraseJoinReceipt,
+) -> bool {
+    use aterm_agent::members_cli::PhraseTry;
+    use aterm_gui::PhraseOutcome;
+    use aterm_types::macos_setup::{Setting, Subject};
+    std::thread::Builder::new()
+        .name("aterm-vault-phrase".into())
+        .spawn(move || {
+            let tried = aterm_agent::members_cli::join_with_phrase(&phrase);
+            drop(phrase);
+            receipt.finished(match tried {
+                PhraseTry::Joined(said) => {
+                    aterm_log::info!("system state: the phrase let this Mac in: {said:?}");
+                    PhraseOutcome::Joined
+                }
+                PhraseTry::Refused(why) => {
+                    aterm_log::warn!("system state: the phrase let nobody in: {why}");
+                    PhraseOutcome::Refused
+                }
+                PhraseTry::NotReached(why) => {
+                    aterm_log::info!(
+                        "system state: the phrase reached no ALab Mac, so it stays good: {why}"
+                    );
+                    PhraseOutcome::NotReached
+                }
+            });
+            request_observation(
+                None,
+                vec![
+                    Subject::Setting(Setting::Secrets),
+                    Subject::Setting(Setting::Repositories),
+                ],
+                false,
+            );
+        })
+        .is_ok()
+}
+
 /// The admitted revision whose worker is alive in this process, if any.
 #[cfg(all(target_os = "macos", test))]
 fn setup_run() -> Option<u64> {
@@ -7681,7 +7568,7 @@ fn register_admitted_run(
     widened_from: Option<u64>,
 ) -> bool {
     start_stop_worker();
-    // A run admitted: setup is no longer waiting for its review.
+    // A run admitted: an older aterm's note that setup waited for its review goes.
     aterm_gui::clear_setup_unfinished();
     SETUP_WIDENED.store(
         if widened_from.is_some() { revision } else { 0 },
@@ -7841,14 +7728,26 @@ fn settle_setup_stop(limit: std::time::Duration) -> bool {
 }
 
 /// [`aterm_gui::InitialSetupHandlers::settle`]: the app is quitting, or handing off to an
-/// update. A stage running now is cut off by no crash: the next launch resumes it without
-/// counting toward the park two crashes in one stage earn (design §6.5).
+/// update: what a Stop owes the records is saved first.
 #[cfg(target_os = "macos")]
 fn settle_initial_setup() {
     if !settle_setup_stop(STOP_SETTLE_LIMIT) {
         aterm_log::warn!("System State quit before what its Stop owes the records was saved");
     }
-    if let Err(why) = aterm_cli::macos_doctor::note_setup_interrupted() {
+}
+
+/// [`aterm_gui::InitialSetupHandlers::cut_off`]: the app is quitting, or an update's Commit is
+/// about to be written (`going`), so a stage running now is cut off by no crash and the next
+/// launch resumes it without counting toward the park two crashes in one stage earn; or that
+/// Commit did not go, and the note is taken back (design §6.5).
+#[cfg(target_os = "macos")]
+fn cut_off_initial_setup(going: bool) {
+    let noted = if going {
+        aterm_cli::macos_doctor::note_setup_interrupted()
+    } else {
+        aterm_cli::macos_doctor::take_back_setup_interrupted()
+    };
+    if let Err(why) = noted {
         aterm_log::warn!("System State could not note the setup stage a quit cuts off: {why}");
     }
 }
@@ -7968,10 +7867,7 @@ fn add_setup_readings(status: &mut aterm_gui::SetupStatus) {
 
 #[cfg(target_os = "macos")]
 fn initial_setup_status() -> aterm_gui::SetupStatus {
-    // A review closed unanswered in this launch: while nothing is admitted, the page shows the
-    // plan it showed with Set up now, and nothing needs anyone (design §3.3).
-    let closed = closed_review();
-    let snapshot = aterm_cli::macos_doctor::initial_setup_snapshot_offering(closed.as_ref());
+    let snapshot = aterm_cli::macos_doctor::initial_setup_snapshot();
     if matches!(
         snapshot,
         Err(aterm_cli::macos_doctor::InitialSetupSnapshotError::Read(_))
@@ -7984,17 +7880,15 @@ fn initial_setup_status() -> aterm_gui::SetupStatus {
     );
     let busy = INITIAL_SETUP_BUSY.load(std::sync::atomic::Ordering::Acquire);
     let mut status = match INITIAL_SETUP_ROWS.lock() {
-        Ok(last) => setup_status_after_review(snapshot, busy, &last, closed.as_ref()),
-        Err(_) => setup_status_after_review(
-            snapshot,
-            busy,
-            &InitialSetupRows::default(),
-            closed.as_ref(),
-        ),
+        Ok(last) => initial_setup_status_with(snapshot, busy, &last),
+        Err(_) => initial_setup_status_with(snapshot, busy, &InitialSetupRows::default()),
     };
     status.retrying = SETUP_RETRYING.load(std::sync::atomic::Ordering::Acquire) != 0;
     status.widened = SETUP_WIDENED.load(std::sync::atomic::Ordering::Acquire) != 0;
-    status.queued = SETUP_QUEUED.load(std::sync::atomic::Ordering::Acquire) != 0;
+    let queued = SETUP_QUEUED.load(std::sync::atomic::Ordering::Acquire);
+    status.queued = queued != 0;
+    status.queued_widen =
+        queued != 0 && queued == SETUP_QUEUED_WIDEN.load(std::sync::atomic::Ordering::Acquire);
     let startup_retrying = STARTUP_RETRY.lock().is_ok_and(|retry| retry.retrying());
     add_startup_retry(&mut status, startup_retrying);
     add_setup_readings(&mut status);
@@ -8002,49 +7896,8 @@ fn initial_setup_status() -> aterm_gui::SetupStatus {
         &mut status,
         SETUP_VAULT_NOT_JOINED.load(std::sync::atomic::Ordering::Acquire),
     );
-    status
-}
-
-/// The plan this launch's review showed when the person closed it unanswered (design §3.3):
-/// nothing offers it again in this launch, and System State shows it with Set up now until
-/// something is admitted. The next launch, which starts without it, offers the review again.
-#[cfg(target_os = "macos")]
-static CLOSED_REVIEW: std::sync::Mutex<Option<aterm_types::macos_setup::Plan>> =
-    std::sync::Mutex::new(None);
-
-#[cfg(target_os = "macos")]
-fn note_review_closed(reviewed: Option<aterm_types::macos_setup::Plan>) {
-    *CLOSED_REVIEW
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = reviewed;
-}
-
-#[cfg(target_os = "macos")]
-fn closed_review() -> Option<aterm_types::macos_setup::Plan> {
-    CLOSED_REVIEW
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
-}
-
-/// Project the saved setup after a review this launch closed, retaining its plan without
-/// treating permission rows as approved while no setup has been admitted.
-#[cfg(target_os = "macos")]
-fn setup_status_after_review(
-    snapshot: Result<
-        aterm_cli::macos_doctor::InitialSetupSnapshot,
-        aterm_cli::macos_doctor::InitialSetupSnapshotError,
-    >,
-    busy: bool,
-    last: &InitialSetupRows,
-    closed: Option<&aterm_types::macos_setup::Plan>,
-) -> aterm_gui::SetupStatus {
-    let unanswered = closed.is_some()
-        && snapshot.as_ref().is_ok_and(|snapshot| {
-            !snapshot.run_allowed && !snapshot.cancelled && !snapshot.finished
-        });
-    let mut status = initial_setup_status_with(snapshot, busy, last);
-    status.unanswered = unanswered;
+    // Only an ALab Mac signs out of Messages and FaceTime: the page says so on that line.
+    status.alab = aterm_cli::macos_doctor::alab_mac();
     status
 }
 
@@ -8270,6 +8123,7 @@ fn initial_setup_status_with(
     );
     let recovered = snapshot.as_ref().is_ok_and(|snapshot| snapshot.recovered);
     let cancelled = snapshot.as_ref().is_ok_and(|snapshot| snapshot.cancelled);
+    let restorable = snapshot.as_ref().is_ok_and(|snapshot| snapshot.restorable);
     let run = snapshot
         .as_ref()
         .ok()
@@ -8346,6 +8200,7 @@ fn initial_setup_status_with(
         changing,
         recovered,
         cancelled,
+        restorable,
         ..aterm_gui::SetupStatus::default()
     }
 }
@@ -9659,29 +9514,29 @@ mod initial_setup_result_tests {
         initial_setup_snapshot_at(root, Plan::default()).unwrap()
     }
 
-    /// A Stop pressed in this launch for the run in force holds every widen review in it, even
-    /// one the Stop came too late for (it came during the run's last stage, which finished, so
-    /// the records keep no Stop and still widen): a person who pressed Stop gets no more
-    /// automatic setup this launch (design §3.5). A later run, which the Stop did not stop,
-    /// may be widened.
+    /// A Stop pressed in this launch for the run in force holds every widen in it, even one the
+    /// Stop came too late for (it came during the run's last stage, which finished, so the
+    /// records keep no Stop and still widen): a person who pressed Stop gets no more automatic
+    /// setup this launch (design §3.5). A later run, which the Stop did not stop, may be
+    /// widened.
     #[test]
-    fn a_stop_in_this_launch_offers_no_widen_review_of_the_run_it_stopped() {
+    fn a_stop_in_this_launch_widens_nothing_of_the_run_it_stopped() {
         let _globals = globals();
         reset_worker_state();
         assert_eq!(
-            widens_here_with(false, || Ok(true), || Ok(7)),
+            widens_here_with(|| Ok(true), || Ok(7)),
             Ok(true),
             "control: no Stop"
         );
         // What `stop_setup_run(7)` leaves in memory; the durable request it saves is spent.
         *SETUP_STOP.lock().unwrap() = Some(7);
-        let held = widens_here_with(false, || Ok(true), || Ok(7));
-        let later = widens_here_with(false, || Ok(true), || Ok(8));
-        let answered = widens_here_with(true, || panic!("not read"), || panic!("not read"));
+        let held = widens_here_with(|| Ok(true), || Ok(7));
+        let later = widens_here_with(|| Ok(true), || Ok(8));
+        let narrow = widens_here_with(|| Ok(false), || panic!("not read"));
         reset_worker_state();
-        assert_eq!(held, Ok(false), "no review of the run the person stopped");
+        assert_eq!(held, Ok(false), "no widen of the run the person stopped");
         assert_eq!(later, Ok(true), "a later run is not the one stopped");
-        assert_eq!(answered, Ok(false));
+        assert_eq!(narrow, Ok(false), "records that no longer widen");
     }
 
     /// A stand-in for the watch's upgrade: each persist answers as scripted, with whether the
@@ -9742,132 +9597,81 @@ mod initial_setup_result_tests {
     const WIDENED: aterm_cli::macos_doctor::SetupUpgrade =
         aterm_cli::macos_doctor::SetupUpgrade { from: 7, to: 8 };
 
-    /// One look of a watch whose widen review applied, with the page's receipt for that Apply:
-    /// the look's answer and the receipt it kept. The watch keeps `widened` from look to look.
+    /// One look of a watch that heard the ALab signal. The watch keeps `widened` from look to
+    /// look.
     fn look_once(
         widened: &mut Widened,
         upgrade: &mut ScriptedUpgrade,
-        receipt: Option<aterm_gui::InitialSetupApplyReceipt>,
         queue: impl FnMut(&Widened) -> bool,
-    ) -> (
-        Result<Option<u64>, String>,
-        Option<aterm_gui::InitialSetupApplyReceipt>,
-    ) {
-        look_settling_with(widened, upgrade, receipt, queue)
+    ) -> Result<Option<u64>, String> {
+        look_settling_with(widened, upgrade, queue)
     }
 
-    /// Every look of a widen review's Apply settles it but one whose upgrade is still pending:
-    /// accepted once the widened plan is saved, refused when the look ends with nothing
-    /// written (a Stop retired it, the records changed, a write failed for good), so the page
-    /// never shows a run that nothing runs and no later offer is refused for it.
+    /// Every look of a heard widen ends its upgrade but one still pending: saved, the widened
+    /// plan's revision; nothing written (a Stop retired it, the records changed, a write failed
+    /// for good), the upgrade let go so no later look retries it; a write that failed with its
+    /// attempt held, finished by the next look.
     #[test]
-    fn every_look_of_a_widen_apply_accepts_keeps_or_refuses_its_receipt() {
+    fn every_look_of_a_heard_widen_saves_keeps_or_lets_go_its_upgrade() {
         let _globals = globals();
         reset_worker_state();
         let no_wait = |_: &Widened| -> bool { panic!("nothing waits for another setup") };
-        let heard = |answer: &std::sync::mpsc::Receiver<bool>| answer.try_recv().ok();
 
-        let (receipt, answer) = aterm_gui::InitialSetupApplyReceipt::detached(false);
         let mut upgrade = ScriptedUpgrade::new([(Ok(Some(WIDENED)), false)]);
-        let (looked, kept) = look_once(
-            &mut Widened::default(),
-            &mut upgrade,
-            Some(receipt),
-            no_wait,
-        );
-        assert_eq!(
-            (looked, kept.is_none(), heard(&answer)),
-            (Ok(Some(8)), true, Some(true))
-        );
+        let looked = look_once(&mut Widened::default(), &mut upgrade, no_wait);
+        assert_eq!((looked, upgrade.pending), (Ok(Some(8)), false));
 
-        for (why, answer_now) in [
-            ("nothing changed", (Ok(None), false)),
+        for (why, answer_now, looked_now) in [
+            ("nothing changed", Ok(None), Ok(None)),
             (
                 "a write that failed for good",
-                (Err("disk".to_string()), false),
+                Err("disk".to_string()),
+                Err("disk".to_string()),
             ),
         ] {
-            let (receipt, answer) = aterm_gui::InitialSetupApplyReceipt::detached(false);
-            let mut upgrade = ScriptedUpgrade::new([answer_now]);
-            let (_, kept) = look_once(
-                &mut Widened::default(),
-                &mut upgrade,
-                Some(receipt),
-                no_wait,
-            );
-            assert!(kept.is_none(), "{why}");
-            assert_eq!(
-                heard(&answer),
-                Some(false),
-                "{why}: refused, the page shows the plan in force"
-            );
+            let mut upgrade = ScriptedUpgrade::new([(answer_now, false)]);
+            let looked = look_once(&mut Widened::default(), &mut upgrade, no_wait);
+            assert_eq!((looked, upgrade.pending), (looked_now, false), "{why}");
         }
 
         // A write that failed, its attempt held: the next look finishes it.
-        let (receipt, answer) = aterm_gui::InitialSetupApplyReceipt::detached(false);
         let mut upgrade =
             ScriptedUpgrade::new([(Err("disk".to_string()), true), (Ok(Some(WIDENED)), false)]);
         let mut widened = Widened::default();
-        let (looked, kept) = look_once(&mut widened, &mut upgrade, Some(receipt), no_wait);
+        let looked = look_once(&mut widened, &mut upgrade, no_wait);
         assert_eq!(looked, Err("disk".to_string()));
-        assert!(
-            kept.is_some() && heard(&answer).is_none(),
-            "kept while pending"
-        );
-        let (looked, kept) = look_once(&mut widened, &mut upgrade, kept, no_wait);
-        assert_eq!(
-            (looked, kept.is_none(), heard(&answer)),
-            (Ok(Some(8)), true, Some(true))
-        );
+        assert!(upgrade.pending, "kept while pending");
+        let looked = look_once(&mut widened, &mut upgrade, no_wait);
+        assert_eq!((looked, upgrade.pending), (Ok(Some(8)), false));
 
         // This launch's Stop of the run the widen would replace (one spent on a finished run
-        // included): the look retires the upgrade unwritten, and the Apply is refused.
+        // included): the look retires the upgrade unwritten.
         *SETUP_STOP.lock().unwrap() = Some(7);
-        let (receipt, answer) = aterm_gui::InitialSetupApplyReceipt::detached(false);
         let mut upgrade = ScriptedUpgrade::new([(Ok(Some(WIDENED)), false)]);
-        let (looked, kept) = look_once(
-            &mut Widened::default(),
-            &mut upgrade,
-            Some(receipt),
-            no_wait,
-        );
+        let looked = look_once(&mut Widened::default(), &mut upgrade, no_wait);
         reset_worker_state();
         assert_eq!(looked, Ok(None));
         assert_eq!(upgrade.persisted, 0, "nothing reached the records");
-        assert!(kept.is_none());
-        assert_eq!(
-            heard(&answer),
-            Some(false),
-            "refused, never left unanswered"
-        );
     }
 
     /// The upgrade finds another setup holding the records past its wait: it waits on, shown
     /// waiting, as a choice does, and is admitted once that setup lets go; one a Stop or a later
-    /// choice lets go meanwhile is retired unwritten and its Apply refused.
+    /// choice lets go meanwhile is retired unwritten.
     #[test]
-    fn a_widen_apply_another_setup_holds_waits_until_admitted_or_let_go() {
+    fn a_widen_another_setup_holds_waits_until_admitted_or_let_go() {
         let _globals = globals();
         reset_worker_state();
         let busy = || (Err(aterm_cli::macos_doctor::SETUP_BUSY.to_string()), true);
-        let (receipt, answer) = aterm_gui::InitialSetupApplyReceipt::detached(false);
         let mut upgrade = ScriptedUpgrade::new([busy(), busy(), (Ok(Some(WIDENED)), false)]);
         let mut waits = 0;
-        let (looked, kept) =
-            look_once(&mut Widened::default(), &mut upgrade, Some(receipt), |_| {
-                waits += 1;
-                true
-            });
+        let looked = look_once(&mut Widened::default(), &mut upgrade, |_| {
+            waits += 1;
+            true
+        });
         assert_eq!((looked, waits), (Ok(Some(8)), 2));
-        assert!(kept.is_none());
-        assert_eq!(answer.try_recv(), Ok(true));
 
-        let (receipt, answer) = aterm_gui::InitialSetupApplyReceipt::detached(false);
         let mut upgrade = ScriptedUpgrade::new([busy()]);
-        let (looked, kept) =
-            look_once(&mut Widened::default(), &mut upgrade, Some(receipt), |_| {
-                false
-            });
+        let looked = look_once(&mut Widened::default(), &mut upgrade, |_| false);
         reset_worker_state();
         assert_eq!(looked, Ok(None));
         assert_eq!(
@@ -9875,16 +9679,37 @@ mod initial_setup_result_tests {
             (1, false),
             "retired unwritten"
         );
-        assert!(kept.is_none());
-        assert_eq!(answer.try_recv(), Ok(false));
     }
 
-    /// The person cancels the review that offered what a Restore brought forward: the status
-    /// the page reads says so as for any Cancel, its Cancel line beside Set up now, every group
-    /// at Leave as is, aterm's own permissions held; Set up now then applies the plan the review
+    /// A widen whose upgrade meets a newer aterm's records (written by the setup it waited for)
+    /// ends with that one look, even where the upgrade would keep its attempt, so the page shows
+    /// the newer aterm's setup with no run going and no later look retries it
+    /// (`a_held_widen_apply_meeting_a_newer_aterms_records_ends` in aterm-cli is the real
+    /// upgrade's side).
+    #[test]
+    fn a_widen_meeting_a_newer_aterms_records_is_let_go() {
+        let _globals = globals();
+        reset_worker_state();
+        // As the real upgrade's look of those records says it.
+        let newer = (Err(InitialSetupSnapshotError::Newer.to_string()), true);
+        let mut upgrade = ScriptedUpgrade::new([newer]);
+        let looked = look_once(&mut Widened::default(), &mut upgrade, |_| {
+            panic!("nothing waits for another setup")
+        });
+        assert!(looked.is_err_and(|why| setup_is_newer(&why)));
+        assert_eq!(
+            (upgrade.pending, upgrade.forgot),
+            (false, 1),
+            "the attempt ends"
+        );
+    }
+
+    /// An older aterm's Cancel of the review that offered what a Restore brought forward, read
+    /// from its records: the status the page reads says so as for any Cancel, every group at
+    /// Leave as is, aterm's own permissions held; Set up now then applies the plan the review
     /// showed (design §3.3).
     #[test]
-    fn a_cancelled_review_of_a_restore_brought_forward_reads_as_any_cancel() {
+    fn an_older_cancel_of_a_restore_brought_forward_reads_as_any_cancel() {
         use aterm_cli::macos_doctor::InitialSetupAdmissionStopTest;
         let root = aterm_tempfile::tempdir().unwrap();
         let restored = InitialSetupAdmissionStopTest::restored_before_run(root.path()).unwrap();
@@ -9892,9 +9717,9 @@ mod initial_setup_result_tests {
             restored.bring_forward().unwrap().is_some(),
             "brought forward"
         );
-        let mut review = InitialSetupAdmissionStopTest::startup(root.path()).unwrap();
+        let review = InitialSetupAdmissionStopTest::startup(root.path()).unwrap();
         let reviewed = review.plan();
-        assert!(review.cancel().unwrap(), "the Cancel is recorded");
+        review.older_cancel().unwrap();
         let status = initial_setup_status_with(
             Ok(review.snapshot().unwrap()),
             false,
@@ -10559,7 +10384,6 @@ mod initial_setup_result_tests {
     }
 
     fn reset_worker_state() {
-        note_review_closed(None);
         set_setup_run(None);
         *SETUP_STOP.lock().unwrap_or_else(PoisonError::into_inner) = None;
         // The worker, once started, lives on for the next test.
@@ -10870,23 +10694,15 @@ mod initial_setup_result_tests {
 
     /// A launch whose setup runs nothing still starts the converge pass's window lane, since no
     /// run's end starts it later in this process: one unavailable (an update's successor that
-    /// withholds the review), or a Cancel recorded for good. A review closed unanswered ("not
-    /// this launch") starts nothing.
-    /// NEGATIVE CONTROL: an unavailable or cancelled launch that starts no lane fails here.
+    /// withholds its offer, a Stop).
+    /// NEGATIVE CONTROL: an unavailable launch that starts no lane fails here.
     #[test]
     fn a_launch_with_no_run_still_starts_the_converge_lane() {
         let _globals = globals();
         let _io = TestIo::install();
         run_prepared_setup(PreparedSetup::Unavailable, None, StartupSent::default());
         assert_eq!(script().converge_lanes, 1, "unavailable");
-        for (prepared, lanes) in [(PreparedSetup::Cancelled, 1), (PreparedSetup::Closed, 0)] {
-            let _io = TestIo::install();
-            run_prepared_startup_with(prepared, None, StartupSent::default(), |_| {
-                panic!("no watch for a review that ended")
-            });
-            assert_eq!(script().converge_lanes, lanes, "lanes {lanes}");
-            assert!(script().runs.is_empty());
-        }
+        assert!(script().runs.is_empty());
     }
 
     /// The converge pass runs as the Secrets stage ends: not as it starts, and not at another
@@ -11215,8 +11031,6 @@ mod initial_setup_result_tests {
             let outcome = match &prepared {
                 Ok(PreparedSetup::Authorized { .. }) => "authorized",
                 Ok(PreparedSetup::Finished) => "finished",
-                Ok(PreparedSetup::Cancelled) => "cancelled",
-                Ok(PreparedSetup::Closed) => "closed",
                 Ok(PreparedSetup::Unavailable) => "unavailable",
                 Err(_) => "failed",
             };
@@ -13945,6 +13759,15 @@ fn update_summary(
             .staged_version
             .clone()
             .unwrap_or_else(|| format!("build {staged}"));
+        if let Some(refusal) = lane
+            .map(|lane| lane.last_refusal.trim())
+            .filter(|refusal| !refusal.is_empty())
+        {
+            return (
+                format!("aterm {next} is downloaded; installation is waiting"),
+                Some(refusal.to_string()),
+            );
+        }
         let failed = staged_tries(staged, lane);
         return if failed > 0 {
             let tries = if failed == 1 {
@@ -14424,9 +14247,10 @@ mod tests {
             assert_eq!(run_resume_offer(&mut reach, &resumed()), ResumeOffer::LetGo);
             assert_eq!((reach.offers, reach.back_offs), (1, 1), "no second offer");
 
-            // A closed page ends the offer for this launch.
+            // A page that let the offer go (closed, or holding its own admission already)
+            // answers it with no receipt: the offer ends for this launch.
             let mut reach = Script {
-                answers: [WorkstationSetupDecision::Closed.into()].into(),
+                answers: [WorkstationSetupDecision::Begin(resumed()).into()].into(),
                 ..Script::default()
             };
             assert_eq!(run_resume_offer(&mut reach, &resumed()), ResumeOffer::LetGo);
@@ -14436,7 +14260,7 @@ mod tests {
 
     mod setup_startup {
         use super::super::{PreparedSetup, SetupAdmission, SetupStartup, prepare_setup};
-        use aterm_gui::WorkstationSetupDecision::{self, Begin, Cancelled, Closed, Unavailable};
+        use aterm_gui::WorkstationSetupDecision::{self, Begin, Unavailable};
         use aterm_types::macos_setup::{Plan, Selection, Setting};
         use std::cell::{Cell, RefCell};
         use std::collections::VecDeque;
@@ -14483,11 +14307,6 @@ mod tests {
             /// Waits before a retried write of the page's answer, each holding
             /// the claim.
             retry_waits: usize,
-            /// The writes of a person's Cancel, write by write; once they run out, each one is
-            /// recorded.
-            cancels: VecDeque<Result<bool, &'static str>>,
-            cancel_calls: usize,
-            closed_calls: usize,
             /// The admitted runs whose plan the startup offered back as it resumed them.
             resumed: Vec<SetupAdmission>,
         }
@@ -14561,20 +14380,6 @@ mod tests {
                 self.offers.pop_front().expect("unexpected offer")
             }
 
-            fn cancel(&mut self) -> Result<bool, String> {
-                assert_eq!(self.active.get(), 0, "a Cancel's write holds no claim");
-                self.cancel_calls += 1;
-                self.cancels
-                    .pop_front()
-                    .unwrap_or(Ok(true))
-                    .map_err(str::to_owned)
-            }
-
-            fn closed(&mut self) {
-                assert_eq!(self.active.get(), 0, "a closed review holds no claim");
-                self.closed_calls += 1;
-            }
-
             fn authorize(&mut self, plan: &Plan) -> Result<Option<u64>, String> {
                 assert_eq!(self.active.get(), 1, "authorization keeps the setup claim");
                 self.authorized.push(plan.clone());
@@ -14611,81 +14416,30 @@ mod tests {
             }
         }
 
+        /// The person closes the page that showed the offer (Cmd-W): the page lets it go
+        /// unanswered, and the startup, holding nothing while it waits, offers it again; the
+        /// page that shows it next, quietly behind the person's tab, answers it at once, so
+        /// setup goes on with nothing asked (design §6.1).
+        /// NEGATIVE CONTROL: a startup that ends at the first let-go admits nothing here.
         #[test]
-        fn cancelling_a_startup_review_records_it_once_and_releases_its_claim_without_applying() {
+        fn an_offer_its_page_let_go_is_offered_again_and_admitted() {
             let mut host = Host {
-                claims: [Ok(true)].into(),
-                finished: [Ok(false)].into(),
-                offers: [Cancelled].into(),
+                claims: [Ok(true), Ok(true)].into(),
+                finished: [Ok(false), Ok(false), Ok(false)].into(),
+                offers: [Unavailable, Begin(Plan::default())].into(),
                 ..Host::default()
             };
-            assert!(matches!(
-                prepare_setup(&mut host).unwrap(),
-                PreparedSetup::Cancelled
-            ));
+            let result = prepare_setup(&mut host).unwrap();
+            assert!(matches!(result, PreparedSetup::Authorized { .. }));
+            assert_eq!((host.claim_calls, host.offer_calls), (2, 2));
             assert_eq!(
-                (host.bind_calls, host.claim_calls, host.offer_calls),
-                (1, 1, 1)
+                host.held_during_backoff,
+                [0],
+                "no claim held between offers"
             );
-            assert_eq!(host.cancel_calls, 1, "the Cancel is recorded for good");
-            assert_eq!(host.active.get(), 0);
-            assert!(host.authorized.is_empty());
-            assert!(host.held_during_backoff.is_empty());
+            assert_eq!(host.authorized, [Plan::default()]);
             assert!(host.failures.is_empty());
-        }
-
-        /// A Cancel whose write fails is tried again by itself, holding no claim, and never
-        /// offers the review again: the person answered it.
-        #[test]
-        fn a_cancel_whose_write_fails_is_written_again_without_another_offer() {
-            let mut host = Host {
-                claims: [Ok(true)].into(),
-                finished: [Ok(false)].into(),
-                offers: [Cancelled].into(),
-                cancels: [Err("a pass holds the profile lock"), Ok(true)].into(),
-                ..Host::default()
-            };
-            assert!(matches!(
-                prepare_setup(&mut host).unwrap(),
-                PreparedSetup::Cancelled
-            ));
-            assert_eq!(
-                (host.offer_calls, host.cancel_calls),
-                (1, 2),
-                "one offer, its Cancel written twice"
-            );
-            assert_eq!(host.held_during_backoff, [0]);
-            assert_eq!(host.failures, ["a pass holds the profile lock"]);
-            assert!(host.authorized.is_empty());
-        }
-
-        /// The person closes the review that was shown (Cmd-W): that is not this launch. The
-        /// startup ends at once, holding nothing, records nothing, and never offers it again in
-        /// this launch, so it cannot come back over the person's terminal or admit anything.
-        #[test]
-        fn closing_the_review_ends_the_startup_without_another_offer() {
-            let mut host = Host {
-                claims: [Ok(true)].into(),
-                finished: [Ok(false)].into(),
-                offers: [Closed].into(),
-                ..Host::default()
-            };
-            let prepared = prepare_setup(&mut host).unwrap();
-            let closed = matches!(prepared, PreparedSetup::Closed);
-            drop(prepared);
-            assert_eq!(
-                (
-                    closed,
-                    host.offer_calls,
-                    host.closed_calls,
-                    host.held_during_backoff.len()
-                ),
-                (true, 1, 1, 0),
-                "a closed review ends this launch's startup after its one offer"
-            );
-            assert_eq!(host.cancel_calls, 0, "closing records no Cancel");
-            assert!(host.authorized.is_empty());
-            assert_eq!(host.active.get(), 0);
+            drop(result);
         }
 
         #[test]
@@ -15837,6 +15591,63 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_staged_updates_standing_refusal_reaches_the_nonverbose_summary() {
+        let checked =
+            aterm_update_core::pkg_check::rfc3339_to_unix("2026-09-23T12:00:00Z").unwrap();
+        let mut staged = update_status();
+        staged.staged_build = Some(101);
+        staged.staged_version = Some("0.92.0".into());
+        let reason = "the Mac setup offer is still open";
+        let mut lane = aterm_update::ApplyLaneReport {
+            last_refusal: reason.into(),
+            ..Default::default()
+        };
+        let summary = |st: &aterm_update::UpdateStatus,
+                       lane: Option<&aterm_update::ApplyLaneReport>,
+                       automatic| {
+            update_summary(
+                "0.91.0",
+                100,
+                st,
+                lane,
+                checked + 60,
+                automatic,
+                true,
+                &DevCopy::No,
+                "log detail",
+            )
+        };
+        for automatic in [true, false] {
+            assert_eq!(
+                summary(&staged, Some(&lane), automatic).1.as_deref(),
+                Some(reason),
+                "a standing refusal matters with either installation preference"
+            );
+        }
+        lane.last_failure_target_build = 101;
+        lane.failures_for_target = 2;
+        assert_eq!(
+            summary(&staged, Some(&lane), true).1.as_deref(),
+            Some(reason),
+            "the standing cause remains visible after an earlier failed attempt"
+        );
+        lane.last_refusal = " \n\t".into();
+        assert_eq!(
+            summary(&staged, Some(&lane), true).1.as_deref(),
+            Some("log detail"),
+            "an empty refusal does not replace failure diagnostics"
+        );
+        lane.failures_for_target = 0;
+        assert!(summary(&staged, Some(&lane), true).1.is_none());
+        assert!(summary(&staged, None, true).1.is_none());
+        lane.last_refusal = reason.into();
+        staged.staged_build = Some(100);
+        assert!(summary(&staged, Some(&lane), true).1.is_none());
+        staged.staged_build = None;
+        assert!(summary(&staged, Some(&lane), true).1.is_none());
+    }
+
     fn scratch_layout(label: &str) -> atpkg::store::Layout {
         let prefix = std::env::temp_dir().join(format!(
             "aterm-session-lane-{label}-{}-{:?}",
@@ -16224,13 +16035,13 @@ mod tests {
                 move || *timer.lock().unwrap(),
             );
             if prefetch {
-                assert_eq!(read().network.visibility, Visibility::Active);
+                assert_eq!(read().unwrap().network.visibility, Visibility::Active);
             }
             *clock.lock().unwrap() = (at + Duration::from_secs(20), Some(120_000));
-            assert_eq!(read().network.visibility, Visibility::Unavailable);
+            assert_eq!(read().unwrap().network.visibility, Visibility::Unavailable);
             let mut held = publisher.lock().unwrap();
             *clock.lock().unwrap() = (at + Duration::from_secs(21), Some(113_000));
-            let during = read();
+            let during = read().unwrap();
             assert_eq!(during.network.visibility, Visibility::Unavailable);
             assert_eq!(during.network.observed_at_ms, 100_000);
             *held = Some(Publication::new(
@@ -16242,7 +16053,7 @@ mod tests {
                 at + Duration::from_secs(21),
             ));
             drop(held);
-            assert_eq!(read().network.visibility, Visibility::Active);
+            assert_eq!(read().unwrap().network.visibility, Visibility::Active);
         }
     }
 
@@ -16268,19 +16079,19 @@ mod tests {
             None,
             move || (at, Some(2000)),
         );
-        let first = read();
+        let first = read().unwrap();
         assert_eq!(first.network.visibility, Visibility::Unavailable);
         assert_eq!(first.network.history, HistoryState::Unavailable);
         assert_eq!(
             first.services.secrets.availability,
             ServiceAvailability::Cached
         );
-        assert!(Arc::ptr_eq(&first, &read()));
+        assert!(Arc::ptr_eq(&first, &read().unwrap()));
 
         let mut changed = first.services.clone();
         changed.secrets.availability = ServiceAvailability::Unavailable;
         *services.lock().unwrap() = aterm_db::service_state::Publication::new(changed, at);
-        let second = read();
+        let second = read().unwrap();
         assert!(second.revision > first.revision);
         assert_eq!(
             second.services.secrets.availability,
@@ -16313,7 +16124,7 @@ mod tests {
                 None,
                 move || (at, Some(2000)),
             );
-            let first = prefetch.then(|| read());
+            let first = prefetch.then(|| read().unwrap());
             let mut publisher = services.lock().unwrap();
             let mut changed = ServiceStates::default();
             changed.secrets.availability = ServiceAvailability::Unavailable;
@@ -16325,7 +16136,9 @@ mod tests {
             let result = receive.recv_timeout(std::time::Duration::from_secs(60));
             drop(publisher);
             task.join().unwrap();
-            let during = result.expect("a publishing worker must not stall the UI reader");
+            let during = result
+                .expect("a publishing worker must not stall the UI reader")
+                .expect("only the producer is busy, not the composition reader");
             if let Some(first) = first {
                 assert!(Arc::ptr_eq(&first, &during));
                 assert_eq!(during.services.secrets.observed_at_ms, 1000);
@@ -16336,7 +16149,7 @@ mod tests {
                     ServiceAvailability::Unknown
                 );
             }
-            let after = read();
+            let after = read().unwrap();
             assert_eq!(after.services.secrets.observed_at_ms, 2000);
             assert_eq!(
                 after.services.secrets.availability,
@@ -16344,6 +16157,105 @@ mod tests {
             );
             assert!(after.revision > during.revision);
         }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_busy_composition_reader_returns_no_sample_instead_of_startup_state() {
+        use aterm_types::network_state::{
+            HistoryState, NetworkObservation, ServiceAvailability, ServiceStates, Visibility,
+        };
+        use std::{
+            sync::{
+                Arc, Mutex,
+                atomic::{AtomicUsize, Ordering},
+                mpsc,
+            },
+            time::{Duration, Instant},
+        };
+
+        let at = Instant::now();
+        let network = aterm_db::network_state::Publication::new(
+            NetworkObservation {
+                observed_at_ms: 100_000,
+                visibility: Visibility::Active,
+                history: HistoryState::Ready,
+                detail: "authenticated observer".into(),
+                ..Default::default()
+            },
+            at,
+        );
+        let mut services = ServiceStates::default();
+        services.secrets.availability = ServiceAvailability::Cached;
+        services.secrets.observed_at_ms = 100_000;
+        services.secrets.revision = Some("retained revision".into());
+        services.secrets.refresh_failed = true;
+        let services = aterm_db::service_state::Publication::new(services, at);
+        let clock = Arc::new(Mutex::new((at, Some(100_000))));
+        let timer = clock.clone();
+        let (entered, entering) = mpsc::channel();
+        let (resume, resumed) = mpsc::channel();
+        let resumed = Mutex::new(resumed);
+        let reads = AtomicUsize::new(0);
+        let read = super::network_state_source_with_readers(
+            move || {
+                if reads.fetch_add(1, Ordering::Relaxed) == 1 {
+                    entered.send(()).unwrap();
+                    resumed
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(60))
+                        .unwrap();
+                }
+                Some(network.clone())
+            },
+            move || Some(services.clone()),
+            None,
+            move || *timer.lock().unwrap(),
+        );
+        let first = read().unwrap();
+        assert_eq!(first.network.history, HistoryState::Ready);
+        assert_eq!(
+            first.services.secrets.availability,
+            ServiceAvailability::Cached
+        );
+        let background = read.clone();
+        let background = std::thread::spawn(move || background());
+        entering.recv_timeout(Duration::from_secs(60)).unwrap();
+        let foreground = read.clone();
+        let (finished, result) = mpsc::channel();
+        let foreground = std::thread::spawn(move || finished.send(foreground()).unwrap());
+        let busy = result.recv_timeout(Duration::from_secs(60));
+        resume.send(()).unwrap();
+        let resumed = background.join().unwrap().unwrap();
+        foreground.join().unwrap();
+        // The old WouldBlock => startup fallback policy returns Some here, erasing
+        // an already observed history and failed-refresh warning at the consumer.
+        assert!(
+            busy.expect("the composition reader must not block drawing")
+                .is_none()
+        );
+        assert!(Arc::ptr_eq(&first, &resumed));
+        assert!(Arc::ptr_eq(&first, &read().unwrap()));
+
+        // Recovery still uses the producer's original monotonic sample: even a
+        // wall-clock rollback that remains after observed_at cannot extend it.
+        *clock.lock().unwrap() = (at + Duration::from_secs(61), Some(100_001));
+        let expired = read().unwrap();
+        assert_eq!(expired.network.visibility, Visibility::Unavailable);
+        assert_eq!(expired.network.history, HistoryState::Ready);
+        assert_eq!(expired.network.observed_at_ms, 100_000);
+        assert_eq!(
+            expired.services.secrets.availability,
+            ServiceAvailability::Unknown
+        );
+        assert_eq!(expired.services.secrets.observed_at_ms, 100_000);
+        assert_eq!(
+            expired.services.secrets.revision,
+            first.services.secrets.revision
+        );
+        assert!(expired.services.secrets.refresh_failed);
+        assert!(expired.revision > first.revision);
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -16373,17 +16285,17 @@ mod tests {
             move || *timer.lock().unwrap(),
         );
         assert_eq!(
-            read().services.secrets.availability,
+            read().unwrap().services.secrets.availability,
             ServiceAvailability::Cached
         );
         *clock.lock().unwrap() = (at + Duration::from_secs(61), Some(161_001));
         assert_eq!(
-            read().services.secrets.availability,
+            read().unwrap().services.secrets.availability,
             ServiceAvailability::Unknown
         );
         let mut held = publisher.lock().unwrap();
         *clock.lock().unwrap() = (at + Duration::from_secs(62), Some(130_000));
-        let stale = read();
+        let stale = read().unwrap();
         assert_eq!(stale.network.visibility, Visibility::Unavailable);
         assert_eq!(
             stale.services.secrets.availability,
@@ -16393,14 +16305,14 @@ mod tests {
         assert_eq!(stale.services.secrets.revision, states.secrets.revision);
         drop(held);
         assert_eq!(
-            read().services.secrets.availability,
+            read().unwrap().services.secrets.availability,
             ServiceAvailability::Unknown
         );
         held = publisher.lock().unwrap();
         states.secrets.observed_at_ms = 130_000;
         *held = aterm_db::service_state::Publication::new(states, at + Duration::from_secs(62));
         drop(held);
-        let restored = read();
+        let restored = read().unwrap();
         assert_eq!(
             restored.services.secrets.availability,
             ServiceAvailability::Cached
@@ -16425,10 +16337,10 @@ mod tests {
             move || (at + Duration::from_secs(120), Some(110_000)),
         );
         assert_eq!(
-            read().services.accounts.availability,
+            read().unwrap().services.accounts.availability,
             ServiceAvailability::Unknown
         );
-        assert_eq!(read().services.accounts.observed_at_ms, 100_000);
+        assert_eq!(read().unwrap().services.accounts.observed_at_ms, 100_000);
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -16437,8 +16349,8 @@ mod tests {
         use aterm_types::network_state::{ServiceAvailability, Visibility};
 
         let network = aterm_db::network_state::ObservationHandle::default();
-        let read = super::network_state_source_from(Some(network), None, None);
-        let snapshot = read();
+        let read = super::network_state_source_from(move || Some(network.clone()), None, None);
+        let snapshot = read().unwrap();
         assert_eq!(snapshot.network.visibility, Visibility::Checking);
         assert_eq!(
             snapshot.services.accounts.availability,
@@ -16479,14 +16391,16 @@ mod tests {
                 first_seen_ms: 1000,
                 last_seen_ms: 2000,
                 last_checked_ms: Some(2000),
+                last_repair: None,
+                last_authenticated_endpoint: None,
                 reachability: Reachability::Reachable,
                 instances: Some(2),
                 samples: Vec::new(),
             }],
             ..Default::default()
         };
-        let read = super::network_state_source_from(None, None, Some(retained.clone()));
-        let snapshot = read();
+        let read = super::network_state_source_from(|| None, None, Some(retained.clone()));
+        let snapshot = read().unwrap();
         assert_eq!(snapshot.network.visibility, Visibility::Unavailable);
         assert!(snapshot.network.observer.is_none());
         assert_eq!(snapshot.network.history, HistoryState::Ready);
@@ -16498,7 +16412,7 @@ mod tests {
         assert_eq!((peer.first_seen_ms, peer.last_seen_ms), (1000, 2000));
         assert_eq!(peer.reachability, Reachability::Unknown);
         assert_eq!(peer.last_checked_ms, None);
-        assert!(Arc::ptr_eq(&snapshot, &read()));
+        assert!(Arc::ptr_eq(&snapshot, &read().unwrap()));
         assert_eq!(retained.peers[0].reachability, Reachability::Reachable);
     }
 
@@ -16529,23 +16443,6 @@ mod tests {
         ] {
             assert!(!ordinary_window(&args), "{args:?}");
         }
-    }
-
-    /// A running window's successor, an update's or a launch-record renewal's, which can come
-    /// while the person is away, starts aCaffiene as saved; any other window launch, forever.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_running_windows_successor_starts_acaffiene_as_saved() {
-        use aterm_acaffiene::cli::Launch;
-        let only = |set: &'static str| {
-            move |name: &'static str| (name == set).then(|| OsString::from("1"))
-        };
-        assert_eq!(
-            acaffiene_launch(only(aterm_update::RELAUNCH_OF_RUNNING_ENV)),
-            Launch::Successor
-        );
-        assert_eq!(acaffiene_launch(|_| None), Launch::Fresh);
-        assert_eq!(acaffiene_launch(only("ATERM_UPDATED_FROM")), Launch::Fresh);
     }
 
     #[test]

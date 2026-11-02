@@ -25,45 +25,41 @@ Five specs serve as pure or structural lemmas with no primary test (`clampf-cont
 
 ## 0. Notation used in the statements
 
-**Floats.** Every spec here is over IEEE-754 binary32 with round-to-nearest-even. Trust's E6
-bodies refuse floats today, and audit §7 has no float row. This file counts floats under
-**gap 3** (body widening). A Clean `f32` model, not reals, is a prerequisite for every spec
-below. **Recommendation:** add an "IEEE f32 carrier and Clean f32 model" row to audit §7.
-It blocks every spec in this crate.
+Every spec is over IEEE-754 binary32 with round-to-nearest-even, so each needs a Clean `f32` model.
+The rows count that under gap 3; the audit's §7 has no float row yet.
 
-- `lattice(px,py)` = the 16 sample points `(px + (i+0.5)/4, py + (j+0.5)/4)` for
-  `i,j ∈ 0..4`. This is the same lattice as `Tile::fill`.
-- `E(paths,t)` = the ordered edge multiset that `flatten_path(paths[p], p, t, ..)` produces for
-  each `p`. Edges are canonical: `ytop < ybot`, with `xtop` and `dxdy` in `f32` exactly as the code
+- `lattice(px,py)` = the 16 sample points `(px + (i+0.5)/4, py + (j+0.5)/4)` for `i,j ∈ 0..4`, the
+  lattice `Tile::fill_quad` also uses.
+- `E(paths,t)` = the ordered edge multiset that `flatten_path(paths[p], p, t, ..)` produces for each
+  `p`. Edges are canonical: `ytop < ybot`, with `xtop` and `dxdy` in `f32` exactly as the code
   computes them. Horizontal edges are dropped, but their endpoints still enter `BBox`.
 - `X_p(sy)` = the `f32` crossings `xtop + (sy − ytop)·dxdy` of the edges of path `p` with
   `ytop ≤ sy < ybot`, sorted by `total_cmp`.
-- `Spans_p(sy)` = `[X_p[0],X_p[1]), [X_p[2],X_p[3]), …`. An odd trailing crossing is dropped.
-- `Cov(E)(x,sy)` holds iff `∃p ∃span ∈ Spans_p(sy)` with `x ∈ span`. This is even-odd within a
-  path and union across paths.
+- `Spans_p(sy)` = `[X_p[0],X_p[1]), [X_p[2],X_p[3]), …`; an odd trailing crossing is dropped.
+- `Cov(E)(x,sy)` holds iff `∃p ∃span ∈ Spans_p(sy)` with `x ∈ span`: even-odd within a path, union
+  across paths.
 - `c(px,py)` = `#{s ∈ lattice(px,py) : Cov(E)(s)} ∈ 0..=16`.
 - `RefFill(tile,paths,rgb,α,t)`: for every in-tile pixel, if `c > 0` then
   `tile.over(px,py,rgb,α·(c as f32)·(1/16))`, else leave the pixel unchanged. Pixels are
-  independent, so the order does not matter. This is the naive reference rasterizer that the
-  scanline core must refine.
-- `lower(v: u16)` = `f32::from(v) · (1/4096)`. This is exact, because `1/4096` is a power of two and
-  `v < 2^24`. `lowerP` maps `lower` over every `PathSeg` coordinate (`Move`/`Line`/`Cubic`/`Close`
-  map 1:1 to `PathCmd`).
-- `Render(cmds)` = one explicit letter per command: `M x y`, `L x y`, `C x1 y1 x2 y2 x y`, `Z`.
-  Each number is printed with Rust's `f32` `Display` (shortest round-trip, no exponent), and tokens
-  are separated by single spaces. It exists only on the spec side.
-- `PathTok`: the tokenizer exactly as `parse_path` scans. Separators are ASCII whitespace and
-  `,`. A letter token is any ASCII alphabetic byte. A number token is a maximal run of an optional
-  leading sign followed by `[0-9 . e E]`, where a sign may also appear right after `e`/`E`. Its
-  value is `str::parse::<f32>`.
+  independent, so order does not matter. This is the naive reference rasterizer the scanline core
+  must refine.
+- `lower(v: u16)` = `f32::from(v) · (1/4096)` (`fixed_to_unit`), exact because `1/4096` is a power
+  of two and `v < 2^24`. `lowerP` (`PathSeg::to_cmd`) maps `lower` over every coordinate;
+  `Move`/`Line`/`Cubic`/`Close` map 1:1 to `PathCmd`.
+- `Render(cmds)` (spec side only) = one explicit letter per command: `M x y`, `L x y`,
+  `C x1 y1 x2 y2 x y`, `Z`, each number printed with Rust's `f32` `Display` (shortest round-trip,
+  no exponent), tokens separated by single spaces.
+- `PathTok`: the tokenizer exactly as `parse_path` scans. Separators are ASCII whitespace and `,`. A
+  letter token is any ASCII alphabetic byte. A number token is a maximal run of an optional leading
+  sign followed by `[0-9 . e E]`, where a sign may also follow `e`/`E`; its value is
+  `str::parse::<f32>`.
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes`,
-`difficulty (Rust features the proof must handle)`, `blocking gaps (audit §7 numbers)`.
-Gap 0 (an installed seal that publishes Lean-discharged rows) is a prerequisite for every row,
-so it is listed on each one. No spec is blocked by gap 0 alone, because floats (gap 3) block
-all of them.
+Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (primary tests), `difficulty` (the Rust
+features the proof must handle), `blocking gaps` (rows of §7 of
+`docs/AUDIT-trust-for-test-migration-2026-10-15.md`). Gap 0 (an installed seal that publishes
+Lean-discharged rows) blocks every row.
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking gaps
@@ -82,8 +78,8 @@ parse-path-roundtrip	round-trip	vector::parse_path	∀ cmds: Vec<PathCmd> whose 
 
 ## 2. Test → spec map (TSV)
 
-`primary` is the spec that retires the test. `also` lists the other specs the same test samples.
-A test is deleted only when its primary spec and every spec under `also` are proved.
+`primary` is the spec that retires the test; `also` lists the other specs it samples. A test is
+deleted only when its primary spec and every spec under `also` are proved.
 
 ```tsv
 file	test	primary	also
@@ -107,8 +103,9 @@ src/vector.rs	parse_path_roundtrips_the_asset_grammar	parse-path-language	parse-
 
 ## 4. Tests that are not spec samples
 
-None. Every test samples a general property in §1, so there is nothing to delete now and
-nothing to convert into a different kind of check.
+`src/lib.rs::scene_rgb_and_tile_rect_const_helpers` has no row: it checks the `pack_rgb24`/
+`unpack_rgb24`, `blend_rgb24_u8` and `encode_tile_rect_le`/`decode_tile_rect_le` helpers, which no
+spec in §1 states.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
@@ -135,29 +132,23 @@ nothing to convert into a different kind of check.
 
 ## 6. Proof order (easiest high-value first)
 
-No spec is blocked by gap 0 alone, because every spec needs the `f32` model (gap 3, §0).
-The order below therefore starts with the specs whose only extra gaps are the narrowest ones.
+Every spec needs the `f32` model, so the order starts with the narrowest remaining gaps.
 
-1. **`clampf-contract`** (gaps 0, 3, 5, 6). Two comparisons, straight-line, no loops. It is the
-   first proof that exercises the `f32` carrier with a NaN case, which every other spec here needs.
-   It also fixes the doc in §5.4.
-2. **`smoothstep-contract`** (adds gap 4). Straight-line, and it composes `clampf`'s ensures. The
-   endpoint and range clauses are easy. If monotonicity fails under rounding, drop that clause.
-3. **`parse-path-language`** (gaps 0, 1, 3, 5, 7, 13). Self-contained, with no `Tile` and no thread
-   local. It retires `parse_path_roundtrips_the_asset_grammar`. Do this only after the decision in
-   §5.3; if `parse_path` moves next to its one test, skip it.
-4. **`fill-path-noop-guards`** (gaps 0, 1, 2, 3, 5, 7, 13). It retires `degenerate_paths_are_safe`
-   once step 6 is done, and it is the first proof over `&mut Tile` and the scratch `RefCell`.
-5. **`over-run-is-over-fold`** and **`flatten-cubic-contract`**. These are bounded-loop lemmas with
-   no test of their own, but the main refinement cites both. `over-run-is-over-fold` first needs
-   `trust::skip` removed from `Tile::over` (§5.5).
-6. **`fill-path-total-and-bounded`**. Panic-freedom and termination across the whole rasterizer.
-   It completes `degenerate_paths_are_safe` and half of `out_of_range_coords_clamp`.
-7. **`fill-scanline-refines-subsample-model`** (gaps 0–7, 11, 13). This is the bottleneck: steps 8
-   and 9 depend on it.
-8. **`fill-path-fixed-refines-fill-path`**. A thin wrapper once step 7 is done. It retires
+1. **`clampf-contract`**: two comparisons, straight-line; the first proof over an `f32` carrier
+   with a NaN case, which every other spec needs.
+2. **`smoothstep-contract`**: composes `clampf`'s ensures. Drop the monotonicity clause if rounding
+   breaks it.
+3. **`parse-path-language`**: self-contained (no `Tile`, no thread local); retires
+   `parse_path_roundtrips_the_asset_grammar`. Skip it if `parse_path` leaves the `pub` API (§5.3).
+4. **`fill-path-noop-guards`**: the first proof over `&mut Tile` and the scratch `RefCell`.
+5. **`over-run-is-over-fold`** and **`flatten-cubic-contract`**: bounded-loop lemmas the main
+   refinement cites; the first needs §5.5.
+6. **`fill-path-total-and-bounded`**: panic-freedom and termination of the whole rasterizer; with
+   step 4 it retires `degenerate_paths_are_safe`.
+7. **`fill-scanline-refines-subsample-model`**: the bottleneck (§3).
+8. **`fill-path-fixed-refines-fill-path`**: thin once step 7 holds (§5.6); retires
    `fill_path_fixed_matches_float_frame`.
-9. **`fill-path-coverage-geometry`** (adds gap 14 and a real-geometry model). It retires
-   `even_odd_holes_work` and the rest of `out_of_range_coords_clamp`.
-10. **`parse-path-roundtrip`**. Last, because it needs an `f32` `Display`/`FromStr` model and retires
-    no test on its own.
+9. **`fill-path-coverage-geometry`**: adds gap 14 and a real-geometry model; retires
+   `even_odd_holes_work` and, with step 6, `out_of_range_coords_clamp`.
+10. **`parse-path-roundtrip`**: last; it needs an `f32` `Display`/`FromStr` model and retires no
+    test.

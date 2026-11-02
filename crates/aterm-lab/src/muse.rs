@@ -59,14 +59,31 @@ pub fn safe_args(args: &[String]) -> Result<(), String> {
 
 /// Rejects `-e` overrides for environment variables owned by the lab launcher.
 pub fn safe_env(kv: &str) -> Result<(), String> {
-    let key = kv.split_once('=').map_or(kv, |(k, _)| k);
+    let Some((key, _)) = kv.split_once('=') else {
+        return Err(format!("muse: -e '{kv}' is not KEY=VALUE"));
+    };
+    let valid_key = !key.is_empty()
+        && key
+            .bytes()
+            .enumerate()
+            .all(|(i, b)| b == b'_' || b.is_ascii_alphabetic() || (i > 0 && b.is_ascii_digit()));
+    if !valid_key {
+        return Err(format!("muse: -e '{kv}' is not KEY=VALUE"));
+    }
     let up = key.to_ascii_uppercase();
     let owned = up.ends_with("_API_KEY")
         || up.ends_with("_BASE_URL")
         || up.ends_with("_PROXY")
         || matches!(
             up.as_str(),
-            "HOME" | "PATH" | "CODEX_HOME" | "CLAUDE_CONFIG_DIR"
+            "HOME"
+                | "PATH"
+                | "TMPDIR"
+                | "CODEX_HOME"
+                | "CLAUDE_CONFIG_DIR"
+                | "BROWSER"
+                | "LAB_OPEN_LOG"
+                | "LAB_SECURITY_LOG"
         )
         || up.starts_with("XDG_");
     if owned {
@@ -182,7 +199,13 @@ pub fn launch(run: &Run, l: &Launch) -> Result<String, Fail> {
     if door.ctl(&["send", &line])?.code != 0 {
         return Err(Fail::die("could not type the launch line"));
     }
-    door.ctl(&["key", "enter"])?;
+    let entered = door.ctl(&["key", "enter"])?;
+    if entered.code != 0 {
+        return Err(Fail::die(format!(
+            "could not submit the launch line (exit {}): {}{}",
+            entered.code, entered.stdout, entered.stderr
+        )));
+    }
     Ok(format!(
         "launched: {} ({}) in lab '{}', META_API_KEY the lab's fake key, --base-url the stub  (launcher: {})",
         run.muse_bin,
@@ -301,7 +324,15 @@ mod tests {
             "TBH_AUTH_BASE_URL=https://example.com",
             "https_proxy=",
             "HOME=/Users//o",
+            "TMPDIR=/tmp",
+            "BROWSER=/usr/bin/open",
+            "LAB_OPEN_LOG=/dev/null",
+            "LAB_SECURITY_LOG=/dev/null",
             "XDG_CONFIG_HOME=/Users//o/.config",
+            "-u",
+            "/bin/echo",
+            "=x",
+            "1BAD=x",
         ] {
             assert!(parse_launch(&v(&["-e", bad])).is_err(), "{bad}");
         }

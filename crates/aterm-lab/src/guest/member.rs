@@ -141,8 +141,8 @@ pub(crate) fn member(ask: &Ask) -> Result<(), String> {
             aterm_net::fleet::serve_offering_with_ask(
                 &listener,
                 &listening,
-                &|| -> (FleetScope, &'static [FleetOp]) { (FleetScope::Facts, &[]) },
-                &|| Arc::clone(&none),
+                Arc::new(|| -> (FleetScope, &'static [FleetOp]) { (FleetScope::Facts, &[]) }),
+                Arc::new(move || Arc::clone(&none)),
                 Some(handler),
                 &running,
                 // No fleet op is offered, so none is handed over.

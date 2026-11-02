@@ -58,6 +58,8 @@ pub fn account_claim_observation_model() -> Model {
             const Buggy = 0;
             var phase = 0; var fault = 0; var peer = 0; var skew = 0;
             var observed = 0; var accepted = 0; var intent = 0; var own_expired = 0;
+            var prepared = 0;
+            action Prepare when (phase == 0 && prepared == 0) { prepared = 1; }
             action Fault when (phase == 0 && own_expired == 0 && 4 > fault) { fault = fault + 1; }
             action Peer when (phase == 0 && own_expired == 0 && peer == 0) { peer = 1; }
             action Skew when (phase == 0 && own_expired == 0 && 2 > skew) { skew = skew + 1; }
@@ -65,19 +67,20 @@ pub fn account_claim_observation_model() -> Model {
             action Touch when (phase == 0) {
                 phase = 1;
                 observed = if (Buggy == 1 && fault > 0) || (Buggy == 2 && skew > 0) {0} else {peer};
-                accepted = if Buggy == 7 && own_expired == 1 {1} else {if Buggy == 6 {0} else {if peer == 0 && (
+                accepted = if prepared == 1 {if Buggy == 8 {1} else {0}} else {if Buggy == 7 && own_expired == 1 {1} else {if Buggy == 6 {0} else {if peer == 0 && (
                     (fault == 0 && 2 > skew)
                     || (Buggy == 3 && fault == 1 && skew == 0)
                     || (Buggy == 4 && fault == 0 && skew == 2)
-                ) {1} else {0}}};
-                intent = if Buggy == 7 && own_expired == 1 {1} else {if Buggy == 6 {0} else {if Buggy == 5 || (fault == 0 && peer == 0 && 2 > skew) {1} else {0}}};
+                ) {1} else {0}}}};
+                intent = if prepared == 1 {if Buggy == 8 {1} else {0}} else {if Buggy == 7 && own_expired == 1 {1} else {if Buggy == 6 {0} else {if Buggy == 5 || (fault == 0 && peer == 0 && 2 > skew) {1} else {0}}}};
             }
             invariant PeerObserved: phase == 0 || peer == 0 || observed == 1;
             invariant PeerBlocksNewGrant: phase == 0 || peer == 0 || accepted == 0;
             invariant LocalFailureCannotPublish: phase == 0 || fault == 0 || accepted == 0;
             invariant LargeSkewCannotPublish: phase == 0 || 2 > skew || accepted == 0;
             invariant RejectedCandidateNoNewIntent: phase == 0 || accepted == 1 || intent == 0;
-            invariant ReadyProgress: phase == 0 || fault > 0 || peer == 1 || skew == 2 || accepted == 1;
+            invariant ReadyProgress: phase == 0 || prepared == 1 || fault > 0 || peer == 1 || skew == 2 || accepted == 1;
+            invariant PreparedCannotClaim: phase == 0 || prepared == 0 || (accepted == 0 && intent == 0);
         }
     }
 }

@@ -497,10 +497,16 @@ impl Floor {
     /// `(recorded floor, corrupt)`.
     pub(crate) fn read_floor_classified(&self) -> (u64, bool) {
         match crate::metadata_io::read_bounded_regular_utf8(&self.path, MAX_FLOOR_BYTES) {
-            Ok(text) => match text.trim().parse::<u64>() {
-                Ok(value) => (value, false),
-                Err(_) => (0, true),
-            },
+            Ok(text) => {
+                let s = text.trim();
+                match (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                    .then(|| s.parse::<u64>().ok())
+                    .flatten()
+                {
+                    Some(value) => (value, false),
+                    None => (0, true),
+                }
+            }
             Err(_) => (0, std::fs::symlink_metadata(&self.path).is_ok()),
         }
     }
@@ -523,8 +529,10 @@ impl Floor {
             ));
         }
 
+        static FLOOR_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = FLOOR_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp = self.path.with_file_name(format!(
-            "{}.{}.tmp",
+            "{}.{}-{seq}.tmp",
             self.path
                 .file_name()
                 .and_then(|s| s.to_str())
@@ -545,7 +553,7 @@ impl Floor {
         use std::io::Write as _;
 
         {
-            let mut f = crate::platform::open_create_write(tmp, 0o600)?;
+            let mut f = crate::platform::open_create_new_write(tmp, 0o600)?;
             f.write_all(value.to_string().as_bytes())?;
             crate::platform::sync_durable(&f)?;
         }

@@ -292,7 +292,12 @@ pub fn compose_rgba(
     (sx, sy, w, h): (usize, usize, usize, usize),
     blend: bool,
 ) {
-    let height = |len: usize, width: usize| len.checked_div(width.saturating_mul(4)).unwrap_or(0);
+    let height = |len: usize, width: usize| {
+        width
+            .checked_mul(4)
+            .and_then(|stride| len.checked_div(stride))
+            .unwrap_or(0)
+    };
     let (under_h, over_h) = (height(under.len(), under_w), height(over.len(), over_w));
     for row in 0..h {
         let (src_row, dst_row) = (sy.saturating_add(row), dy.saturating_add(row));
@@ -590,6 +595,17 @@ mod tests {
             &[9; 4],
             "the in-bounds part of a large rectangle lands"
         );
+        let after = under.clone();
+        compose_rgba(
+            &mut under,
+            usize::MAX,
+            (0, 0),
+            &[7; 16],
+            usize::MAX,
+            (0, 0, 4, 4),
+            false,
+        );
+        assert_eq!(under, after, "overflowing widths clip cleanly");
     }
 
     #[test]

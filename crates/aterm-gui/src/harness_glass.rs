@@ -5,7 +5,10 @@
 
 use std::time::{Duration, Instant};
 
+use std::sync::Arc;
+
 use aterm_agent::harness::acts::{Act, HeldBy, HoldLeg, LandHeld, TaskFace};
+use aterm_agent::harness::hold_said::HoldSaid;
 
 use crate::App;
 use crate::claude_lights::{ChipGlass, Clock, Weekday};
@@ -329,24 +332,29 @@ pub(crate) struct ShownStop {
     pub(crate) arm: HeldBy,
     /// A proven self-claim's holder, for its own stop; `None` for aterm's.
     pub(crate) by: Option<Claimant>,
+    /// The person's switch to Land would ask once more over aterm's own stop, the chip reading
+    /// Cruise ([`SessionGlass::stop_switch`], [`switch_face`]).
+    pub(crate) switch: bool,
 }
 
 impl ShownStop {
-    /// ITS WORDS IN `form`'s PLACE, NAMING WHO STOPPED WHERE IT WAS NOT ATERM'S OWN HARNESS: [`stop_words`]' own for aterm's, led by the holder's name for a self-claim's (`codex-alab stopped typing: the same reply twice, no work`), so no stop of another agent's reads as aterm's, as [`act_words`] names who did an act. For the surfaces [`App::shown_stop`] feeds: the state line, the hover and the Overview, and a worker's tip (a chip's title and description say only aterm's own, from its glass).
+    /// ITS WORDS IN `form`'s PLACE, NAMING WHO STOPPED WHERE IT WAS NOT ATERM'S OWN HARNESS: [`stop_words`]' own for aterm's, naming the person's switch to Land where it would ask ([`Self::switch`]), led by the holder's name for a self-claim's (`codex-alab stopped typing: the same reply twice, no work`), whose restart is its own loop's and so leaves out a switch to Land, so no stop of another agent's reads as aterm's, as [`act_words`] names who did an act. For the surfaces [`App::shown_stop`] feeds: the state line, the hover and the Overview, and a worker's tip (a chip's title and description say only aterm's own, from its glass).
     #[must_use]
     pub(crate) fn words(self, form: HoldForm) -> String {
-        let words = stop_words(self.arm, form);
         match self.by {
-            Some(by) => format!("{} {words}", by.as_str()),
-            None => words,
+            Some(by) => format!("{} {}", by.as_str(), stop_words(self.arm, form, false)),
+            None => stop_words(self.arm, form, self.switch),
         }
     }
 }
 
-/// LAND'S HOLD AS ITS SURFACES SHOW IT ([`App::shown_hold`]): the hold on the glass, and whose Land it is where that is not aterm's own harness (a proven self-claim's holder, `codex-alab`), as [`ShownStop::by`] names who stopped.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// LAND'S HOLD AS ITS SURFACES SHOW IT ([`App::shown_hold`]): the hold on the glass, its own words where aterm's loop told them ([`App::hold_said`], slice 4b), and whose Land it is where that is not aterm's own harness (a proven self-claim's holder, `codex-alab`), as [`ShownStop::by`] names who stopped.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ShownHold {
     pub(crate) hold: HeldGlass,
+    /// The hold's own words: what the agent said is left and the files git found; `None` for a
+    /// self-claim's hold, which tells only its reader's words.
+    pub(crate) said: Option<Arc<HoldSaid>>,
     /// A proven self-claim's holder, for its own hold; `None` for aterm's.
     pub(crate) by: Option<Claimant>,
 }
@@ -355,13 +363,13 @@ impl ShownHold {
     /// ITS WORDS IN `form`'s PLACE ([`hold_words`]), NAMING WHOSE LAND HOLDS WHERE IT IS NOT ATERM'S OWN HARNESS'S: aterm's in its own words, a self-claim's led by its holder's name (`codex-alab: not landed yet: 2 unpushed commits · 3 nudges`, as [`act_words`] names who did an act), so no hold of another agent's reads as aterm's — unless `after`, the stop said before it on the same line, already named that holder (`codex-alab stopped typing: … · not landed yet: …`, [`ShownStop::words`]), so a line names its holder once. For the surfaces [`App::shown_hold`] feeds that say words: the state line, the hover, the Overview's held line and a worker's tip (a chip's title and description say only aterm's own, from its glass).
     #[must_use]
     pub(crate) fn words(
-        self,
+        &self,
         need: Option<&crate::needs::HarnessAsk>,
         form: HoldForm,
         today: Option<i64>,
         after: Option<ShownStop>,
     ) -> Option<String> {
-        let words = hold_words(&self.hold, need, form, today)?;
+        let words = hold_words(&self.hold, need, form, today, self.said.as_deref())?;
         Some(
             match self
                 .by
@@ -429,8 +437,17 @@ pub(crate) struct SessionGlass {
     hold: Option<HeldGlass>,
     /// ATERM STOPPED TYPING INTO IT (§14.3), by which arm of ruling F's hold, as the session's loop last told its standing exception (`HostNote::ResumeException`'s `held`, [`on_stopped`]): set while the hold stands, whatever its urgency, and cleared as the loop lifts it or ends. What the chip's title and description, the state line, the hover and the Overview, a worker's tip and `status held=` say ([`stop_words`]), each only while the chip carries a mode ([`App::shown_stop`]).
     stopped: Option<HeldBy>,
+    /// WHETHER THE PERSON'S SWITCH TO LAND WOULD ASK ONCE MORE OVER THE STOP (v6 §14.17 item 3), as
+    /// the hold's exception says it (`Exception::lifted_by_switch`, [`on_stopped`]): the stop's
+    /// words name the switch only here, and only under Cruise ([`switch_face`]).
+    stop_switch: bool,
     /// THE LOOP'S OUTAGE WAIT (§14.17.5.2), while one stands ([`on_waiting`]): told by the loop's wait at an outage wall, and cleared by the wait that replaces it, the wait's end or the loop's.
     waiting: Option<WaitGlass>,
+    /// LAND ASKED ONCE MORE AT THE PERSON'S SWITCH OVER A HELD TAB (v6 §14.17 item 3), as the
+    /// loop told it ([`on_switch_asked`]): from Land's one ask until its answer is read, cleared
+    /// by the loop's end. Settings ▸ Harness's state line leads with it under `⤓ land`
+    /// ([`aterm_agent::harness::acts::SWITCH_ASKED`]), and `status land_asked=` prints it.
+    switch_asked: bool,
 }
 
 /// THE KIND OF A TASK'S END (§11.2.3, item 1): under Autopilot Cruise / Autopilot Land only Land's landing, the face moved to `landed`.
@@ -513,6 +530,19 @@ impl SessionGlass {
     #[must_use]
     pub(crate) const fn stopped(&self) -> Option<HeldBy> {
         self.stopped
+    }
+
+    /// Whether the person's switch to Land would ask once more over the stop ([`Self::stop_switch`]).
+    #[must_use]
+    pub(crate) const fn stop_switch(&self) -> bool {
+        self.stopped.is_some() && self.stop_switch
+    }
+
+    /// Whether Land asked once more at the person's switch over a held tab, its answer still out
+    /// ([`on_switch_asked`]).
+    #[must_use]
+    pub(crate) const fn switch_asked(&self) -> bool {
+        self.switch_asked
     }
 
     /// Records a new task end `face` with the next serial, unseen and uncheered.
@@ -672,9 +702,19 @@ impl SessionGlass {
     #[must_use]
     /// Formats the trail for the chip title, newest first, against `now_unix` and `today`.
     pub(crate) fn trail_text(&self, now_unix: i64, today: i64) -> String {
+        self.trail_text_without(now_unix, today, |_| false)
+    }
+
+    /// [`Self::trail_text`] without the acts `said` names: those another part of the title says.
+    pub(crate) fn trail_text_without(
+        &self,
+        now_unix: i64,
+        today: i64,
+        said: impl Fn(Act) -> bool,
+    ) -> String {
         let mut out = String::new();
         for entry in self.trail.iter().flatten() {
-            if now_unix.saturating_sub(entry.unix) > TRAIL_AGE_S {
+            if now_unix.saturating_sub(entry.unix) > TRAIL_AGE_S || said(entry.act) {
                 continue;
             }
             if !out.is_empty() {
@@ -727,11 +767,14 @@ pub(crate) fn wall_today() -> (i64, i64) {
     (unix, at.day())
 }
 
-/// Trail title string for `session` in `glass` ([`SessionGlass::trail_text`]).
+/// Trail title string for `session` in `glass` ([`SessionGlass::trail_text`]); without Land's
+/// own acts (`⤓ landing`, `⤓ nudged`) where `held`, a read hold shown under `⤓ land`, says them
+/// (`landing since 10:30, 2 nudges`; said once, §14.4).
 pub(crate) fn trail_title(
     glass: &std::collections::HashMap<u64, SessionGlass>,
     session: u64,
     stamped: bool,
+    held: bool,
 ) -> (String, Option<i64>) {
     let trail = glass.get(&session).filter(|g| g.trail[0].is_some());
     if trail.is_none() && !stamped {
@@ -739,7 +782,13 @@ pub(crate) fn trail_title(
     }
     let (unix, today) = wall_today();
     (
-        trail.map_or_else(String::new, |g| g.trail_text(unix, today)),
+        trail.map_or_else(String::new, |g| {
+            if held {
+                g.trail_text_without(unix, today, lands_own)
+            } else {
+                g.trail_text(unix, today)
+            }
+        }),
         Some(today),
     )
 }
@@ -753,19 +802,41 @@ pub(crate) fn trail_title(
                   `a11y_tree` cfg (Linux, macOS and Windows)"
     )
 )]
-/// Screen-reader string for the newest act of `session` in `glass` ([`SessionGlass::spoken_last`]).
+/// Screen-reader string for the newest act of `session` in `glass` ([`SessionGlass::spoken_last`]);
+/// none where `held`, a read hold said under `⤓ land`, already says that act (one of Land's own,
+/// [`lands_own`]: `Landing since 22:09, 1 nudge`; said once, §14.4), as the title leaves it out of
+/// `last:` ([`trail_title`]).
 pub(crate) fn spoken_last_now(
     glass: &std::collections::HashMap<u64, SessionGlass>,
     session: u64,
+    held: bool,
 ) -> Option<String> {
-    let g = glass.get(&session).filter(|g| g.trail[0].is_some())?;
+    let g = glass
+        .get(&session)
+        .filter(|g| g.trail[0].is_some_and(|e| !(held && lands_own(e.act))))?;
     let (unix, today) = wall_today();
     g.spoken_last(unix, today)
+}
+
+/// LAND'S OWN ACTS (`⤓ landing`, `⤓ nudged`, `⤓ land check`), which a read hold's `landing since
+/// 10:30, 2 nudges` already says.
+fn lands_own(act: Act) -> bool {
+    matches!(act, Act::Landing | Act::Nudged | Act::LandCheck)
 }
 
 /// Records `act` on `session` into the session's glass and posts its footer.
 pub(crate) fn on_act(app: &mut App, session: u64, act: Act) {
     on_act_at(app, session, act, Arrival::now());
+}
+
+/// [`on_act`] of an act the loop told with whether aterm typed it at the prompt: a turn it
+/// opened that way ends the land check's audit where the act alone does not
+/// ([`crate::harness_ab::AbBook::turn_opened`]).
+pub(crate) fn on_taken(app: &mut App, session: u64, taken: aterm_agent::harness::acts::TakenAct) {
+    on_act(app, session, taken.act);
+    if taken.opens_turn {
+        app.harness_screen.ab.turn_opened(session, taken.act);
+    }
 }
 
 /// [`on_act`] at `at`, lighting only under Cruise or Land when acts are shown.
@@ -786,6 +857,11 @@ pub(crate) fn on_act_by_at(
     by: Option<Claimant>,
     at: Arrival,
 ) {
+    // The land check's turn is the harness's audit, left out of the task's work the end's floor
+    // reads (`AbBook::act_typed`), however it is interrupted; a turn aterm opens past it ends it.
+    app.harness_screen
+        .ab
+        .act_typed(session, act, crate::turn_ledger::now_ms());
     let (_, view, _) = app.session_autopilot(session);
     let light = view.carries() && app.harness_acts_shown();
     let took = app
@@ -856,15 +932,61 @@ pub(crate) fn on_land_held(app: &mut App, session: u64, held: Option<LandHeld>) 
     true
 }
 
-/// Updates the stop of `session` to `stopped` (its standing exception's arm, [`SessionGlass::stopped`]), returning whether it changed: a title someone reads is built again ([`SessionGlass::trail_gen`]).
-pub(crate) fn on_stopped(app: &mut App, session: u64, stopped: Option<HeldBy>) -> bool {
+/// Updates the hold's own words on `session` to `said` ([`App::hold_said`], §14.17 item 1, slice
+/// 4b), returning whether they changed: a title someone reads is built again
+/// ([`SessionGlass::trail_gen`]) though the hold's legs and counts stand equal, so a reworded item
+/// is never shown in its old words.
+pub(crate) fn on_land_said(app: &mut App, session: u64, said: Option<Arc<HoldSaid>>) -> bool {
+    if app.hold_said.get(&session).map(|a| &**a) == said.as_deref() {
+        return false;
+    }
+    match said {
+        Some(said) => {
+            app.hold_said.insert(session, said);
+        }
+        None => {
+            app.hold_said.remove(&session);
+        }
+    }
+    let glass = app.harness_glass.entry(session).or_default();
+    glass.trail_gen = glass.trail_gen.wrapping_add(1);
+    true
+}
+
+/// Updates the stop of `session` to `stopped` (its standing exception's arm, [`SessionGlass::stopped`]) and whether the person's switch to Land would ask over it (`switch`, [`SessionGlass::stop_switch`]), returning whether either changed: a title someone reads is built again ([`SessionGlass::trail_gen`]).
+pub(crate) fn on_stopped(
+    app: &mut App,
+    session: u64,
+    stopped: Option<HeldBy>,
+    switch: bool,
+) -> bool {
+    let switch = switch && stopped.is_some();
     let was = app.harness_glass.get(&session).copied().unwrap_or_default();
-    if was.stopped == stopped {
+    if was.stopped == stopped && was.stop_switch == switch {
         return false;
     }
     let mut now = was;
     now.stopped = stopped;
+    now.stop_switch = switch;
     now.trail_gen = now.trail_gen.wrapping_add(1);
+    if now == SessionGlass::default() {
+        app.harness_glass.remove(&session);
+    } else {
+        app.harness_glass.insert(session, now);
+    }
+    true
+}
+
+/// Updates whether Land asked once more at the person's switch over `session`'s held tab
+/// ([`SessionGlass::switch_asked`]), returning whether it changed: only the state line and
+/// `status` read it, so nothing else is redrawn.
+pub(crate) fn on_switch_asked(app: &mut App, session: u64, asked: bool) -> bool {
+    let was = app.harness_glass.get(&session).copied().unwrap_or_default();
+    if was.switch_asked == asked {
+        return false;
+    }
+    let mut now = was;
+    now.switch_asked = asked;
     if now == SessionGlass::default() {
         app.harness_glass.remove(&session);
     } else {
@@ -952,10 +1074,16 @@ pub(crate) fn hold_words(
     need: Option<&crate::needs::HarnessAsk>,
     form: HoldForm,
     today: Option<i64>,
+    said: Option<&HoldSaid>,
 ) -> Option<String> {
     use aterm_agent::harness::acts::{NOT_LANDED_YET, held_tip, nudge_words};
+    use aterm_agent::harness::hold_said::WAITS_ON_YOU;
     let sep = crate::native_ui::FACT_SEPARATOR;
     let held = hold.held;
+    // SAID ONCE (§14.4): a hold its need alone holds waits only on the person, so no form says
+    // `not landed yet:`, and the hover and a tip, under the need's own line, do not say it again.
+    let alone = hold.need_alone();
+    let head = if alone { WAITS_ON_YOU } else { NOT_LANDED_YET };
     let nudges = nudge_words(held.nudges);
     let since = |between: &str| {
         let head = match hold.since {
@@ -969,20 +1097,25 @@ pub(crate) fn hold_words(
     };
     let legs = || {
         held.legs_held()
-            .map(|leg| leg_words(held, leg, need, form))
+            .map(|leg| leg_words(held, leg, need, form, said))
+            .filter(|words| !words.is_empty())
             .collect::<Vec<_>>()
             .join("; ")
     };
+    let read = |between: &str| match legs() {
+        legs if legs.is_empty() => head.to_owned(),
+        legs => format!("{head}{between}{legs}"),
+    };
     match form {
-        HoldForm::Title if hold.read() => {
-            Some(format!("{NOT_LANDED_YET}: {}{sep}{}", legs(), since(", ")))
-        }
+        HoldForm::Title if hold.read() => Some(format!("{}{sep}{}", read(": "), since(", "))),
         HoldForm::Title => Some(since(", ")),
-        HoldForm::Line if hold.read() => {
-            Some(format!("{NOT_LANDED_YET}: {}{sep}{}", legs(), since(sep)))
-        }
+        HoldForm::Line if hold.read() => Some(format!("{}{sep}{}", read(": "), since(sep))),
         HoldForm::Line => Some(since(sep)),
-        HoldForm::Hover => hold.read().then(|| format!("{NOT_LANDED_YET}, {}", legs())),
+        HoldForm::Hover => hold.read().then(|| read(", ")),
+        HoldForm::Tip if hold.read() && alone => Some(match &nudges {
+            Some(n) => format!("{WAITS_ON_YOU}{sep}{n}"),
+            None => WAITS_ON_YOU.to_owned(),
+        }),
         HoldForm::Tip if hold.read() => Some(held_tip(&legs(), held.nudges)),
         HoldForm::Tip => nudges,
         HoldForm::Spoken => {
@@ -1000,10 +1133,21 @@ pub(crate) fn hold_words(
             if !hold.read() {
                 return Some(since);
             }
+            if alone {
+                let waits = match need {
+                    Some(ask) => format!(
+                        "It {WAITS_ON_YOU}: {}.{}",
+                        speakable(&ask.first),
+                        more_spoken(usize::from(ask.more))
+                    ),
+                    None => format!("It {WAITS_ON_YOU}."),
+                };
+                return Some(format!("{waits} {since}"));
+            }
             let mut out = String::from("Not landed yet.");
             for leg in held.legs_held() {
                 out.push(' ');
-                out.push_str(&spoken_leg(held, leg, need));
+                out.push_str(&spoken_leg(held, leg, need, said));
             }
             out.push(' ');
             out.push_str(&since);
@@ -1012,63 +1156,104 @@ pub(crate) fn hold_words(
     }
 }
 
-/// A STOPPED AUTOPILOT, IN WORDS (§14.3), beside [`hold_words`]: ONE function, in `form`'s place (`aterm_agent::harness::acts::stop_words`, which the lab reads too) — the title's `stopped typing: the same reply twice, no work; types again at your turn or once the agent works`, the state line's with its facts ` · ` apart, the hover's `stopped typing`, a worker's tip without what restarts it, and the description's sentences.
+/// A STOPPED AUTOPILOT, IN WORDS (§14.3), beside [`hold_words`]: ONE function, in `form`'s place (`aterm_agent::harness::acts::stop_words`, which the lab reads too) — the title's `stopped typing: the same reply twice, no work; types again at your turn or once the agent works` (`…, your switch to Land, or …` where `switch`: the person's switch to Land would ask once more, under Cruise), the state line's with its facts ` · ` apart, the hover's `stopped typing`, a worker's tip without what restarts it, and the description's sentences.
 #[must_use]
-pub(crate) fn stop_words(held: HeldBy, form: HoldForm) -> String {
-    use aterm_agent::harness::acts::StopForm;
-    aterm_agent::harness::acts::stop_words(
-        held,
-        match form {
-            HoldForm::Title => StopForm::Title,
-            HoldForm::Line => StopForm::Line,
-            HoldForm::Hover => StopForm::Hover,
-            HoldForm::Tip => StopForm::Tip,
-            HoldForm::Spoken => StopForm::Spoken,
-        },
+pub(crate) fn stop_words(held: HeldBy, form: HoldForm, switch: bool) -> String {
+    aterm_agent::harness::acts::stop_words(held, stop_form(form), switch)
+}
+
+/// WHETHER A CHIP OF `face` CAN SWITCH TO LAND: Cruise's, timed or not. Under Land there is no
+/// switch to make, so no stop's words offer one there (v6 §14.17 item 3).
+#[must_use]
+pub(crate) const fn switch_face(face: crate::claude_lights::ChipFace) -> bool {
+    matches!(
+        face,
+        crate::claude_lights::ChipFace::Cruise | crate::claude_lights::ChipFace::CruiseUntil
     )
 }
 
+fn stop_form(form: HoldForm) -> aterm_agent::harness::acts::StopForm {
+    use aterm_agent::harness::acts::StopForm;
+    match form {
+        HoldForm::Title => StopForm::Title,
+        HoldForm::Line => StopForm::Line,
+        HoldForm::Hover => StopForm::Hover,
+        HoldForm::Tip => StopForm::Tip,
+        HoldForm::Spoken => StopForm::Spoken,
+    }
+}
+
+/// One leg's words in `form`: empty for a need in the hover and a tip, which the need's own line
+/// stands above (said once, §14.4), and for a need alone, whose words lead the hold
+/// ([`hold_words`]' `waits only on you`) in the title and the state line.
 fn leg_words(
     held: LandHeld,
     leg: HoldLeg,
     need: Option<&crate::needs::HarnessAsk>,
     form: HoldForm,
+    said: Option<&HoldSaid>,
 ) -> String {
+    let alone = held.legs == HoldLeg::Needs.bit();
+    let safe = |words: String| {
+        if form == HoldForm::Title {
+            title_safe(&words)
+        } else {
+            words
+        }
+    };
     match leg {
         HoldLeg::Needs => match (form, need) {
-            (HoldForm::Hover | HoldForm::Tip, _) => "needs you".to_owned(),
-            (_, Some(ask)) => {
-                let words = format!("needs you: {}{}", ask.first, ask.more_words());
-                if form == HoldForm::Title {
-                    title_safe(&words)
-                } else {
-                    words
-                }
-            }
+            (HoldForm::Hover | HoldForm::Tip, _) => String::new(),
+            (_, Some(ask)) if alone => safe(format!("{}{}", ask.first, ask.more_words())),
+            (_, None) if alone => String::new(),
+            (_, Some(ask)) => safe(format!("needs you: {}{}", ask.first, ask.more_words())),
             (_, None) => "a need named earlier in its reply".to_owned(),
         },
-        HoldLeg::Repo => repo_words(held),
-        HoldLeg::Open => open_leg(held.open_words()),
+        HoldLeg::Repo => safe(repo_words(held, said, Files::Shown)),
+        HoldLeg::Open => safe(open_leg(held.open_words(), said, form)),
         HoldLeg::Unread | HoldLeg::Defense | HoldLeg::Cut => {
             leg.fixed_words().unwrap_or_default().to_owned()
         }
     }
 }
 
-fn spoken_leg(held: LandHeld, leg: HoldLeg, need: Option<&crate::needs::HarnessAsk>) -> String {
+/// ` And 2 more.`, or nothing for none: what a screen reader hears past the first need.
+fn more_spoken(more: usize) -> String {
+    match more {
+        0 => String::new(),
+        n => format!(" And {n} more."),
+    }
+}
+
+fn spoken_leg(
+    held: LandHeld,
+    leg: HoldLeg,
+    need: Option<&crate::needs::HarnessAsk>,
+    said: Option<&HoldSaid>,
+) -> String {
     match leg {
         HoldLeg::Needs => match need {
-            Some(ask) => {
-                let more = match ask.more {
-                    0 => String::new(),
-                    n => format!(" And {n} more."),
-                };
-                format!("Needs you: {}.{more}", speakable(&ask.first))
-            }
+            Some(ask) => format!(
+                "Needs you: {}.{}",
+                speakable(&ask.first),
+                more_spoken(usize::from(ask.more))
+            ),
             None => "A need named earlier in its reply.".to_owned(),
         },
-        HoldLeg::Repo => format!("{}.", repo_words(held)),
+        HoldLeg::Repo => format!("{}.", repo_words(held, said, Files::Spoken)),
         HoldLeg::Unread => "A repository that could not be read.".to_owned(),
+        HoldLeg::Open if said.is_some_and(|s| !s.open.is_empty()) => {
+            let said = said.unwrap_or_else(|| unreachable!("guarded"));
+            let first = said.open.first().map(|q| speakable(q)).unwrap_or_default();
+            // A sentence that closes itself is not closed again: `speakable` keeps `.` and `:` of
+            // the marks that close one, and drops `?`, `!` and a cut's `…`.
+            let close = if first.ends_with(['.', ':']) { "" } else { "." };
+            format!(
+                "{}: {first}{close}{}",
+                capital(aterm_agent::harness::hold_said::OPEN_IN_REPORT),
+                more_spoken(said.past_first())
+            )
+        }
         HoldLeg::Open => {
             let words: Vec<String> = held
                 .open_words()
@@ -1076,9 +1261,13 @@ fn spoken_leg(held: LandHeld, leg: HoldLeg, need: Option<&crate::needs::HarnessA
                 .filter(|w| !w.is_empty())
                 .collect();
             if words.is_empty() {
-                "Open work in its report.".to_owned()
+                format!("{}.", capital(aterm_agent::harness::acts::OPEN_LISTED))
             } else {
-                format!("Open work in its report: {}.", words.join(", "))
+                format!(
+                    "{}: {}.",
+                    capital(aterm_agent::harness::hold_said::OPEN_IN_REPORT),
+                    words.join(", ")
+                )
             }
         }
         HoldLeg::Defense => "No Nothing left defense yet.".to_owned(),
@@ -1086,30 +1275,134 @@ fn spoken_leg(held: LandHeld, leg: HoldLeg, need: Option<&crate::needs::HarnessA
     }
 }
 
-fn open_leg<'a>(words: impl Iterator<Item = &'a str>) -> String {
-    let words: Vec<&str> = words.collect();
-    if words.is_empty() {
-        "open work in its report".to_owned()
-    } else {
-        format!("open work in its report: {}", words.join(", "))
+/// `words` with its first letter a capital, as a sentence a screen reader hears begins.
+fn capital(words: &str) -> String {
+    let mut cs = words.chars();
+    match cs.next() {
+        Some(first) => format!("{}{}", first.to_uppercase(), cs.as_str()),
+        None => String::new(),
     }
 }
 
-fn repo_words(held: LandHeld) -> String {
+/// THE OPEN LEG IN THE AGENT'S OWN WORDS (§14.17 item 1, slice 4b): its list quoted, every item
+/// in the state line (`open in its report: “The docs PR is still open.”; “Bump the version.”`),
+/// the first alone, cut, in the title, the hover and a tip (`… “The docs PR is still…” (+1
+/// more)`). Where no list was told (a self-claim's hold), the reader's words, else
+/// [`aterm_agent::harness::acts::OPEN_LISTED`].
+fn open_leg<'a>(
+    words: impl Iterator<Item = &'a str>,
+    said: Option<&HoldSaid>,
+    form: HoldForm,
+) -> String {
+    use aterm_agent::harness::hold_said::{
+        OPEN_IN_REPORT, SHORT_CHARS, cut_chars, more_words, quoted,
+    };
+    if let Some(said) = said.filter(|s| !s.open.is_empty()) {
+        return match form {
+            HoldForm::Line | HoldForm::Spoken => format!(
+                "{OPEN_IN_REPORT}: {}{}",
+                said.open
+                    .iter()
+                    .map(|q| quoted(q))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+                more_words(usize::from(said.more))
+            ),
+            HoldForm::Title | HoldForm::Hover | HoldForm::Tip => format!(
+                "{OPEN_IN_REPORT}: {}{}",
+                quoted(&cut_chars(&said.open[0], SHORT_CHARS)),
+                more_words(said.past_first())
+            ),
+        };
+    }
+    let words: Vec<&str> = words.collect();
+    if words.is_empty() {
+        aterm_agent::harness::acts::OPEN_LISTED.to_owned()
+    } else {
+        format!("{OPEN_IN_REPORT}: {}", words.join(", "))
+    }
+}
+
+/// How the repository leg names the files git found ([`repo_words`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Files {
+    /// As the glass shows them: `: wip-notes.txt, README.md, …`
+    /// (`aterm_agent::harness::hold_said::files_words`).
+    Shown,
+    /// As a screen reader says them: each file's own name, whole (`: hold_said.rs and more`).
+    Spoken,
+}
+
+/// The files git found as a screen reader says them: each path's file name whole, its `-`, `_`
+/// and `.` kept (a screen reader reads them), its folders left out, then `and more` where git
+/// found more than it named.
+fn spoken_files(named: &[String], found: usize) -> String {
+    let names: Vec<String> = named
+        .iter()
+        .map(|path| {
+            let name = path
+                .trim_end_matches(['/', '\\'])
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or_default();
+            name.chars()
+                .filter(|c| c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | ' '))
+                .collect::<String>()
+                .trim()
+                .to_owned()
+        })
+        .filter(|name| !name.is_empty())
+        .collect();
+    if names.is_empty() {
+        return String::new();
+    }
+    let more = if found > named.len() { " and more" } else { "" };
+    format!(": {}{more}", names.join(", "))
+}
+
+/// The repository leg's counts, the files git found after the changed and untracked ones
+/// (`1 untracked file: wip-notes.txt`, slice 4b) where its words were told, named as `files`
+/// says.
+fn repo_words(held: LandHeld, said: Option<&HoldSaid>, files_said: Files) -> String {
     let count = |n: u16, one: &str, many: &str| match n {
         0 => None,
         1 => Some(format!("1 {one}")),
         n => Some(format!("{n} {many}")),
     };
-    let parts: Vec<String> = [
+    let files: Vec<String> = [
         count(held.changed, "changed file", "changed files"),
         count(held.untracked, "untracked file", "untracked files"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let named = said.map_or(&[][..], |s| s.paths.as_slice());
+    let files = (!files.is_empty()).then(|| {
+        let found = usize::from(held.changed) + usize::from(held.untracked);
+        let names = match files_said {
+            Files::Shown => aterm_agent::harness::hold_said::files_words(named, found),
+            Files::Spoken => spoken_files(named, found),
+        };
+        format!("{}{names}", files.join(", "))
+    });
+    let parts: Vec<String> = [
+        files,
         count(held.stashes, "stash", "stashes"),
         count(held.unpushed, "unpushed commit", "unpushed commits"),
+        count(
+            held.sub_unpushed,
+            "submodule commit on no remote",
+            "submodule commits on no remote",
+        ),
         count(
             held.unlanded,
             "commit not on the remote main",
             "commits not on the remote main",
+        ),
+        count(
+            held.parked,
+            "commit parked on another branch",
+            "commits parked on other branches",
         ),
     ]
     .into_iter()
@@ -1135,7 +1428,7 @@ pub(crate) fn need_title(ask: &crate::needs::HarnessAsk) -> String {
 pub(crate) fn need_spoken(ask: &crate::needs::HarnessAsk) -> String {
     format!(
         "{} Carrying on.",
-        spoken_leg(LandHeld::default(), HoldLeg::Needs, Some(ask))
+        spoken_leg(LandHeld::default(), HoldLeg::Needs, Some(ask), None)
     )
 }
 
@@ -1145,6 +1438,8 @@ fn title_safe(words: &str) -> String {
         .replace(" \u{2014} ", ", ")
 }
 
+/// `words` as a screen reader says them: `&`, `%` and `#` in words, dashes, `/`, `\\` and `_` a
+/// space (so the words they join never run together), other marks dropped.
 fn speakable(words: &str) -> String {
     let mut out = String::with_capacity(words.len());
     for c in words.chars() {
@@ -1156,7 +1451,7 @@ fn speakable(words: &str) -> String {
                 out.truncate(out.trim_end().len());
                 out.push(',');
             }
-            '-' | '\u{2010}'..='\u{2014}' => out.push(' '),
+            '-' | '\u{2010}'..='\u{2014}' | '/' | '\\' | '_' => out.push(' '),
             c if c.is_alphanumeric() || matches!(c, '.' | ':' | ',') => out.push(c),
             c if c.is_whitespace() => out.push(' '),
             _ => {}
@@ -1182,6 +1477,7 @@ impl App {
             let now = crate::metrics::now_us();
             meta.self_land(now).map(|hold| ShownHold {
                 hold,
+                said: None,
                 by: meta.live_supervisor(now).map(claimant),
             })
         });
@@ -1194,7 +1490,11 @@ impl App {
             &crate::autopilot::ClaimClock::default(),
         );
         let hold = if supervised {
-            own.map(|hold| ShownHold { hold, by: None })
+            own.map(|hold| ShownHold {
+                hold,
+                said: self.hold_said.get(&session).cloned(),
+                by: None,
+            })
         } else {
             told
         }?;
@@ -1206,10 +1506,9 @@ impl App {
     /// THE STOP OF SESSION `session` AS ITS SURFACES SAY IT (§14.3, §14.3.2), told by whoever drives it ([`crate::autopilot::carried`]'s rule) — while aterm holds its claim, the arm on its glass ([`SessionGlass::stopped`]); under a proven self-claim, the arm that claim told of its own typing (`meta set harness_held`, [`crate::session_timeline::SessionMeta::self_held`]) while the claim stands, named for its holder — and either only while its chip carries a mode (`∞`, `∞ ⤓18:00`, `⤓ land`: [`crate::claude_lights::ChipFace::of`] over its view and glass), never on an Off, landed or quiet chip, so `status held=` and the worker row's tip say a stop exactly where the hover, the Overview and the state line, which read the face, do: a codex-alab tells its own landing and a person's own exchange (`landed@v1`, `left-to-person@v1`) onto the same face, and its stop gives way to them as aterm's does. Nobody's with neither claim.
     #[must_use]
     pub(crate) fn shown_stop(&self, session: u64) -> Option<ShownStop> {
-        let own = self
-            .harness_glass
-            .get(&session)
-            .and_then(SessionGlass::stopped);
+        let own_glass = self.harness_glass.get(&session);
+        let own = own_glass.and_then(SessionGlass::stopped);
+        let own_switch = own_glass.is_some_and(SessionGlass::stop_switch);
         let told = {
             let meta = self
                 .pool
@@ -1222,6 +1521,7 @@ impl App {
             meta.self_held(now).map(|arm| ShownStop {
                 arm,
                 by: meta.live_supervisor(now).map(claimant),
+                switch: false,
             })
         };
         if own.is_none() && told.is_none() {
@@ -1232,21 +1532,44 @@ impl App {
             self.session_agent(session),
             &crate::autopilot::ClaimClock::default(),
         );
+        let glass = self.chip_glass(session);
+        let face = crate::claude_lights::ChipFace::of(view, &glass);
         let stop = if supervised {
-            own.map(|arm| ShownStop { arm, by: None })
+            own.map(|arm| ShownStop {
+                arm,
+                by: None,
+                switch: own_switch && switch_face(face),
+            })
         } else {
             told
         }?;
-        let glass = self.chip_glass(session);
-        crate::claude_lights::ChipFace::of(view, &glass)
-            .carries()
-            .then_some(stop)
+        face.carries().then_some(stop)
     }
 
     /// THE OUTAGE WAIT OF SESSION `session` (§14.17.5.2): the wait on its glass ([`SessionGlass::waiting`]), whatever its chip's face: only a running loop tells one, and the wait's end or the loop's takes it down.
     #[must_use]
     pub(crate) fn shown_wait(&self, session: u64) -> Option<WaitGlass> {
         self.harness_glass.get(&session)?.waiting
+    }
+
+    /// Whether Land asked once more at the person's switch over `session`'s held tab and its
+    /// answer is still out (v6 §14.17 item 3), only while its chip reads `⤓ land`: no other face
+    /// carries Land's ask.
+    pub(crate) fn shown_switch_asked(&self, session: u64) -> bool {
+        if !self
+            .harness_glass
+            .get(&session)
+            .is_some_and(SessionGlass::switch_asked)
+        {
+            return false;
+        }
+        let (_, view, _, _) = self.session_autopilot_for(
+            session,
+            self.session_agent(session),
+            &crate::autopilot::ClaimClock::default(),
+        );
+        crate::claude_lights::ChipFace::of(view, &self.chip_glass(session))
+            == crate::claude_lights::ChipFace::Land
     }
 
     /// Whether the act ticker's label is shown at all: `[claude_footer] acts` on (the default) and serious mode off (`SeriousEffect::HarnessTicker`).
@@ -1312,6 +1635,7 @@ impl App {
     /// Removes harness glass state for retired session `id`.
     pub(crate) fn forget_harness_glass(&mut self, id: u64) {
         self.harness_glass.remove(&id);
+        self.hold_said.remove(&id);
     }
 }
 

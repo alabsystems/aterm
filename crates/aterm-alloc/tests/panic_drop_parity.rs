@@ -152,6 +152,22 @@ fn small_vec_clear_case<const N: usize>() {
     assert_each_dropped_exactly_once(&format!("SmallVec<_, {N}>::clear"));
 }
 
+fn small_vec_truncate_case<const N: usize>() {
+    let _ = drain_log();
+    let mut v = small::<N>(3);
+    let caught = catch_unwind(AssertUnwindSafe(|| v.truncate(1)));
+    assert!(caught.is_err(), "the panicking destructor must unwind");
+    assert_eq!(ids(&v), vec![0], "the retained prefix survives the unwind");
+    drop(v);
+    assert_each_dropped_exactly_once(&format!("SmallVec<_, {N}>::truncate"));
+}
+
+#[test]
+fn small_vec_truncate_drops_each_element_once_when_a_destructor_panics() {
+    small_vec_truncate_case::<8>();
+    small_vec_truncate_case::<2>();
+}
+
 fn small_vec_drop_case<const N: usize>() {
     let _ = drain_log();
     let v = small::<N>(2);

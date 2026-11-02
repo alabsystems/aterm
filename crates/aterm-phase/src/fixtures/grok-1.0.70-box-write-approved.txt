@@ -1,0 +1,50 @@
+# grok 1.0.70 · MEASURED 2026-10-29, `aterm ctl text` of a private headless aterm (144x50, aterm 0.146.0) running the real Grok Build, launched by path in the lab's jail with a scratch `HOME` and `GROK_HOME`, the lab's `XAI_API_KEY` and `GROK_XAI_API_BASE_URL`/`GROK_CLI_CHAT_PROXY_BASE_URL=http://127.0.0.1:<port>/v1` (a local stub of xAI's API, crates/aterm-lab) · the edit prompt answered with Enter on the focused row (`3 (●) Yes`): the file written, `◆ Creating notes.txt +1/-0`, `Tool call done.`, `Worked for 6.8s`, the composer back with the side request's suggestion · cursor=45,6 (visible, blinking_block) · in this run the stub answered every side request, the prompt predictor's among them, `Lab stub session`, so that is the suggestion · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+  /p/t/at.lab0/proj                                                                                                   12K / 256K │ [Dashboard]
+
+
+     ❯ toolstart write the notes                                                                                                     1:59 PM
+
+
+     ◆ Creating notes.txt +1/-0
+
+     Tool call done.                                                                                                                 1:59 PM
+
+     Worked for 6.8s
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ ❯ Lab stub session                                                                                                                       │
+  ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── lab-stub ─╯
+
+  Tab/→:accept suggestion  │  Shift+Tab:mode  │  Ctrl+x:shortcuts

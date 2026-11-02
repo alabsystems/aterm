@@ -22,8 +22,79 @@ fn preflight_cache(repo: &Path) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-/// The variable `publish/pre-promote` reads for the running release's own cutter: set on `pub publish`, whose engine passes it through to the hook.
+/// The variable `publish/pre-promote` reads for the running release's own cutter: set on `pub
+/// publish`, whose engine passes it through to the hook. `publish/transforms.sh` reads it too: a
+/// `pub stage` gets it only from [`hand_transforms_cutter`].
 pub const RELEASE_CUTTER_ENV: &str = "ATERM_RELEASE_CUTTER";
+
+/// The moment the cutter [`RELEASE_CUTTER_ENV`] names was judged from, with the pid and start of
+/// the process that hands it on, set and removed with it ([`hand_this_cutter`]), so the handed
+/// cutter judges itself from that moment too while that process is its live ancestor
+/// ([`crate::cutter::handed_since`]). [`Real::scrubbed`] removes both from every child it builds:
+/// a child has them only from [`hand_this_cutter`].
+pub const RELEASE_CUTTER_SINCE_ENV: &str = "ATERM_RELEASE_CUTTER_SINCE";
+
+/// The cutter a `pub stage` of `commit` hands its `publish/transforms.sh`: `exe`, when this
+/// process is `commit`'s own build (`built`, [`crate::cutter::running`]: built from that commit's
+/// clean, tracked cutter sources, lockfile, manifests, cargo config and toolchain pin, and the
+/// links inside its checkout they are read through, none of them changed after the moment its
+/// start judgment dated them from ([`crate::cutter::Since`]) or read by way of a place outside the
+/// checkout, and none of those build inputs removed since), so the stage runs `commit`'s rules
+/// with no build; else why not.
+pub(crate) fn transforms_cutter(
+    built: Result<&str, &crate::cutter::NotOwn>,
+    exe: std::io::Result<PathBuf>,
+    commit: &str,
+) -> Result<PathBuf, String> {
+    match built {
+        Ok(built) if built == commit => {
+            exe.map_err(|e| format!("this cutter cannot name its own executable ({e})"))
+        }
+        Ok(built) => Err(format!(
+            "this cutter is the build of {}, not {}",
+            short(built),
+            short(commit)
+        )),
+        Err(not) => Err(format!("this cutter is no commit's build: {}", not.why)),
+    }
+}
+
+/// Hand `stage`, a `pub stage` of `commit`, this cutter for its transforms
+/// ([`transforms_cutter`], [`hand_this_cutter`]), and otherwise no cutter at all, whatever this
+/// process inherited; the line that says which.
+fn hand_transforms_cutter(stage: &mut Command, commit: &str) -> String {
+    match transforms_cutter(crate::cutter::running(), std::env::current_exe(), commit) {
+        Ok(exe) => {
+            hand_this_cutter(stage, &exe, crate::cutter::reference());
+            format!(
+                "== transforms: by this cutter ({}), the build of {} itself",
+                exe.display(),
+                short(commit)
+            )
+        }
+        Err(why) => {
+            stage.env_remove(RELEASE_CUTTER_ENV);
+            stage.env_remove(RELEASE_CUTTER_SINCE_ENV);
+            format!(
+                "== transforms: {why}; {}'s publish/transforms.sh builds its own",
+                short(commit)
+            )
+        }
+    }
+}
+
+/// Hand `cmd` this running cutter, whose executable is `exe`: [`RELEASE_CUTTER_ENV`] names it,
+/// and [`RELEASE_CUTTER_SINCE_ENV`] carries `since`, the moment its start judgment dated its
+/// inputs from ([`crate::cutter::reference`]), handed on by this process
+/// ([`crate::cutter::hand_value`]), or is removed when there is none or this process's start is
+/// unread.
+fn hand_this_cutter(cmd: &mut Command, exe: &Path, since: Option<std::time::SystemTime>) {
+    cmd.env(RELEASE_CUTTER_ENV, exe);
+    match since.and_then(crate::cutter::hand_value) {
+        Some(since) => cmd.env(RELEASE_CUTTER_SINCE_ENV, since),
+        None => cmd.env_remove(RELEASE_CUTTER_SINCE_ENV),
+    };
+}
 
 fn detach(cmd: &mut Command) {
     crate::credential_wait::ask_no_one(cmd);
@@ -105,13 +176,11 @@ pub struct Real {
     scratch_logs: bool,
     verbose: bool,
     origin_tags: String,
-    /// The local UTC offset, in seconds, read once (`date +%z`).
-    offset: i64,
     /// The step the run is at ([`Backend::entered`]): what a child is noted under.
     step: Step,
     /// This process's arguments (after the program) with every path flag's value
-    /// anchored ([`crate::release::ReleaseOptions::anchored_args`]): what the re-exec
-    /// as R's own cutter passes on, from the clone's root.
+    /// anchored ([`crate::release::ReleaseOptions::anchored_args`]): what the re-run
+    /// as R's own cutter ([`Real::reexec_command`]) passes on, from the clone's root.
     argv: Vec<std::ffi::OsString>,
 }
 
@@ -195,7 +264,6 @@ impl Real {
             scratch_logs: dry,
             verbose,
             origin_tags: String::new(),
-            offset,
             step: Step::Checks,
             argv: std::env::args_os().skip(1).collect(),
         })
@@ -208,6 +276,19 @@ impl Real {
     fn git_out(&self, args: &[&str]) -> Option<String> {
         let out = self.git().git(args).ok()?;
         out.success().then(|| out.stdout_utf8().trim().to_string())
+    }
+
+    /// Admit complete Git output as unquoted NUL-delimited relative paths. GitCli keeps
+    /// its existing process/watch semantics; its child capture is not made bounded here.
+    fn git_paths(&self, args: &[&str]) -> Result<Vec<String>, String> {
+        let out = self
+            .git()
+            .git(args)
+            .map_err(|why| format!("could not enumerate Git paths: {why}"))?;
+        if !out.success() {
+            return Err(format!("Git path enumeration exited {}", out.status));
+        }
+        nested_locks::paths(&out.stdout)
     }
 
     fn remote_git(&self, args: &[&str]) -> std::io::Result<std::process::Output> {
@@ -296,6 +377,7 @@ impl Real {
         let mut cmd = command(program);
         scrub(&mut cmd);
         cmd.env("PUBLICATION_ENGINE", &self.engine);
+        cmd.env("PATH", publication_path());
         cmd
     }
 
@@ -308,10 +390,57 @@ impl Real {
         cmd
     }
 
-    fn cut_command(&self, args: &[String], prover: &Prover) -> Command {
-        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("aterm-release"));
-        let mut cmd = self.child(exe, Some(prover));
+    /// This cutter again with `args` (the build and cut steps): [`Real::cut_command_of`] this
+    /// process's executable.
+    fn cut_command(&self, args: &[String], prover: &Prover) -> Result<Command, String> {
+        self.cut_command_of(std::env::current_exe(), args, prover)
+    }
+
+    /// The cutter at `exe`, this process's executable, with `args`: a [`Real::child`] with
+    /// `prover`'s bin, handed itself ([`hand_this_cutter`]) so its own start judgment dates its
+    /// inputs from the moment this one's did, not from its link: it is a child of this process,
+    /// not of a `targo`, and the cut gate in it reads that judgment. When this process cannot
+    /// name its executable, why, and no command: an `aterm-release` found on `PATH` is no cutter
+    /// this process knows to be itself.
+    fn cut_command_of(
+        &self,
+        exe: std::io::Result<PathBuf>,
+        args: &[String],
+        prover: &Prover,
+    ) -> Result<Command, String> {
+        let exe = exe.map_err(|e| format!("this cutter cannot name its own executable ({e})"))?;
+        let mut cmd = self.child(&exe, Some(prover));
         cmd.args(args);
+        hand_this_cutter(&mut cmd, &exe, crate::cutter::reference());
+        Ok(cmd)
+    }
+
+    /// The release again as R's own cutter, `targo --unverified ship <its arguments>` in the
+    /// clone with `prover`'s `targo`: [`Real::scrubbed`], and without the `TRUST_TARGO_*`
+    /// variables this process inherited (`inherited` names them), so it is a `targo` of its own,
+    /// not one nested in the `targo` that ran this cutter. A nested one would exec into the
+    /// cutter it built, a process whose parent is this one, not the program `$CARGO` names, so
+    /// that cutter would have no Launch moment and be judged from its link; a `targo` of its own
+    /// starts the cutter as its own child, and the cutter is judged from that `targo`'s start
+    /// ([`crate::cutter::Since::Launch`]), a fork after the bump and checkout this run wrote. It
+    /// is started as this process's child, in its process group, and waited on, and takes the
+    /// run claim over ([`RunClaim::hand`]).
+    ///
+    /// [`RunClaim::hand`]: crate::release::RunClaim::hand
+    fn reexec_command(
+        &self,
+        prover: &Prover,
+        inherited: impl IntoIterator<Item = std::ffi::OsString>,
+    ) -> Command {
+        let mut cmd = self.scrubbed(prover.bin.join("targo"));
+        for name in inherited {
+            if name.to_str().is_some_and(|n| n.starts_with("TRUST_TARGO_")) {
+                cmd.env_remove(name);
+            }
+        }
+        cmd.args(["--unverified", "ship"])
+            .args(&self.argv)
+            .current_dir(&self.repo);
         cmd
     }
 
@@ -320,7 +449,7 @@ impl Real {
         cmd.args(["publish", "aterm", "--skip-site", "--repo-path"])
             .arg(&self.repo);
         if let Ok(exe) = std::env::current_exe() {
-            cmd.env(RELEASE_CUTTER_ENV, exe);
+            hand_this_cutter(&mut cmd, &exe, crate::cutter::reference());
         }
         cmd
     }
@@ -772,7 +901,7 @@ impl Real {
         }
         let toolchain = self.metadata_toolchain();
         let pubbin = engine.join("bin/pub");
-        let mut stage = self.dry_run_command(&engine, r, &root, &reads);
+        let (mut stage, handed) = self.dry_run_command(&engine, r, &root, &reads);
         let (code, text) = match self.output_forwarded(&mut stage) {
             Ok(o) => (
                 o.status.code().unwrap_or(-1),
@@ -784,7 +913,7 @@ impl Real {
             ),
             Err(e) => (-1, format!("cannot run {}: {e}", pubbin.display())),
         };
-        let _ = std::fs::write(&log, &text);
+        let _ = std::fs::write(&log, format!("{handed}\n{text}"));
         let mut run = EngineRun::read(code, &text);
         let out = root.join("publish/.out");
         let export = out.join("export");
@@ -804,14 +933,18 @@ impl Real {
         )
     }
 
-    /// The engine's dry run of `r` over the clone at `root`, `pub stage aterm --dry-run --no-check --commit R --repo-path <root>` from the scratch `engine`: [`Real::scrubbed`], with this rustup's directory first on PATH and `reads` ([`public_reads`]) in its environment.
+    /// The engine's dry run of `r` over the clone at `root`, `pub stage aterm --dry-run
+    /// --no-check --commit R --repo-path <root>` from the scratch `engine`: [`Real::scrubbed`],
+    /// with this rustup's directory first on PATH and `reads` ([`public_reads`]) in its
+    /// environment, handed this cutter for its transforms only as `r`'s own build
+    /// ([`hand_transforms_cutter`], whose line it returns beside it).
     fn dry_run_command(
         &self,
         engine: &Path,
         r: &str,
         root: &Path,
         reads: &[(String, std::ffi::OsString)],
-    ) -> Command {
+    ) -> (Command, String) {
         let mut stage = self.scrubbed(engine.join("bin/pub"));
         stage
             .env("PUBLICATION_ENGINE", engine)
@@ -833,7 +966,8 @@ impl Real {
                 "--repo-path",
             ])
             .arg(root);
-        stage
+        let handed = hand_transforms_cutter(&mut stage, r);
+        (stage, handed)
     }
 
     fn dry_clone(&self, base: &Path, root: &Path, r: &str) -> Result<(), String> {
@@ -1120,12 +1254,28 @@ impl Real {
     fn stage_run(&self, c: &Candidate, prover: &Prover) -> Result<Ran, Refusal> {
         self.compat_check(c)?;
         self.engine_sync()?;
-        let mut cmd = self.child(self.engine.join("bin/pub"), Some(prover));
-        cmd.args(["stage", "aterm", "--commit", &c.commit, "--repo-path"])
-            .arg(&self.repo);
+        let (mut cmd, handed) = self.stage_command(&c.commit, prover);
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.step_log(self.step))
+        {
+            let _ = writeln!(file, "{handed}");
+        }
         let ran = self.logged(self.step, &mut cmd);
         self.engine_sync()?;
         Ok(ran)
+    }
+
+    /// The stage step's `pub stage aterm --commit <commit> --repo-path <repo>`, a [`Real::child`]
+    /// with `prover`'s bin, handed this cutter for its transforms only as `commit`'s own build
+    /// ([`hand_transforms_cutter`], whose line it returns beside it).
+    fn stage_command(&self, commit: &str, prover: &Prover) -> (Command, String) {
+        let mut cmd = self.child(self.engine.join("bin/pub"), Some(prover));
+        cmd.args(["stage", "aterm", "--commit", commit, "--repo-path"])
+            .arg(&self.repo);
+        let handed = hand_transforms_cutter(&mut cmd, commit);
+        (cmd, handed)
     }
 
     fn compat_check(&self, c: &Candidate) -> Result<(), Refusal> {
@@ -1222,7 +1372,14 @@ impl Real {
         reserved: &Reservation,
         prover: &Prover,
     ) -> Result<Artifact, Refusal> {
-        let mut cmd = self.cut_command(&["build".to_string()], prover);
+        let mut cmd = self
+            .cut_command(&["build".to_string()], prover)
+            .map_err(|why| {
+                Refusal::new(
+                    format!("the build was not started: {why}"),
+                    format!("run {RELEASE_COMMAND} again from the clone (nothing was claimed)"),
+                )
+            })?;
         let ran = self.logged(Step::Build, &mut cmd);
         if ran.code != 0 {
             return Err(Refusal::new(
@@ -1606,9 +1763,20 @@ pub(crate) fn launcher_env(name: &str) -> bool {
 }
 
 fn scrub(cmd: &mut Command) {
-    for (name, _) in std::env::vars_os() {
+    scrub_names(cmd, std::env::vars_os().map(|(name, _)| name));
+}
+
+/// Remove from `cmd` each of `inherited` (the names of this process's environment) that a step
+/// runs without: what [`clears`] and [`launcher_env`] name, and the cutter this process may have
+/// been handed ([`RELEASE_CUTTER_ENV`], [`RELEASE_CUTTER_SINCE_ENV`]), which a child has only
+/// from [`hand_this_cutter`].
+fn scrub_names(cmd: &mut Command, inherited: impl IntoIterator<Item = std::ffi::OsString>) {
+    for name in inherited {
         if let Some(name) = name.to_str()
-            && (clears(name) || launcher_env(name))
+            && (clears(name)
+                || launcher_env(name)
+                || name == RELEASE_CUTTER_ENV
+                || name == RELEASE_CUTTER_SINCE_ENV)
         {
             cmd.env_remove(name);
         }
@@ -1730,6 +1898,7 @@ impl Scratch {
                 .file_name()
                 .to_str()
                 .and_then(|n| n.split('-').next())
+                .filter(|p| p.bytes().all(|b| b.is_ascii_digit()))
                 .and_then(|p| p.parse::<u32>().ok());
             if pid.is_some_and(|pid| pid != me && started_of(pid).is_none()) {
                 let _ = std::fs::remove_dir_all(entry.path());
@@ -1892,8 +2061,17 @@ fn public_header_key(key: &str) -> Result<Option<&str>, Refusal> {
         return Err(ambiguous());
     }
     if let Some((name, port)) = host.rsplit_once(':')
-        && name.eq_ignore_ascii_case("github.com")
+        && name
+            .strip_suffix('.')
+            .unwrap_or(name)
+            .eq_ignore_ascii_case("github.com")
         && (port.is_empty() || port.starts_with('0') || !port.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return Err(ambiguous());
+    }
+    if host
+        .strip_suffix('.')
+        .is_some_and(|name| name.eq_ignore_ascii_case("github.com"))
     {
         return Err(ambiguous());
     }
@@ -1977,12 +2155,30 @@ fn public_reads(
     Ok(env)
 }
 
-/// `dir`, then this process's PATH without it.
-fn path_with(dir: &Path) -> std::ffi::OsString {
+/// The publication engine sees installed managed programs, rustup and the pinned scanner even
+/// when the launching shell has not adopted the package prefix or developer tooling PATH.
+fn publication_path() -> std::ffi::OsString {
     let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut path = prepend_path(&atpkg::abrew::prefix::Prefix::resolve().bin(), &path);
+    for name in ["rustup", "gitleaks"] {
+        if let Some(tool) = aterm_uds::host::tool(name).find()
+            && let Some(dir) = tool.parent()
+        {
+            path = prepend_path(dir, &path);
+        }
+    }
+    path
+}
+
+fn prepend_path(dir: &Path, path: &std::ffi::OsStr) -> std::ffi::OsString {
     let dirs =
-        std::iter::once(dir.to_path_buf()).chain(std::env::split_paths(&path).filter(|d| d != dir));
-    std::env::join_paths(dirs).unwrap_or(path)
+        std::iter::once(dir.to_path_buf()).chain(std::env::split_paths(path).filter(|d| d != dir));
+    std::env::join_paths(dirs).unwrap_or_else(|_| path.to_owned())
+}
+
+/// `dir`, then the publication PATH without it.
+fn path_with(dir: &Path) -> std::ffi::OsString {
+    prepend_path(dir, &publication_path())
 }
 
 fn keep_reports(out: &Path, to: &Path) {
@@ -2560,19 +2756,25 @@ pub fn appcast_problems(text: &str, slug: &str, tag: &str, version: &str) -> Vec
     }
 }
 
+fn hms_local(epoch: u64, offset_at: impl FnOnce(i64) -> Option<i64>) -> String {
+    let unix = i64::try_from(epoch).unwrap_or(i64::MAX);
+    let offset = offset_at(unix).unwrap_or(0);
+    let local = unix.saturating_add(offset).rem_euclid(86_400);
+    format!(
+        "{:02}:{:02}:{:02}",
+        local / 3600,
+        local % 3600 / 60,
+        local % 60
+    )
+}
+
 impl Backend for Real {
     fn now(&mut self) -> u64 {
         now()
     }
 
     fn hms(&mut self, epoch: u64) -> String {
-        let local = (epoch as i64 + self.offset).rem_euclid(86_400);
-        format!(
-            "{:02}:{:02}:{:02}",
-            local / 3600,
-            local % 3600 / 60,
-            local % 60
-        )
+        hms_local(epoch, aterm_uds::zone::local_offset_at)
     }
 
     fn sleep(&mut self, secs: u64) {
@@ -2608,6 +2810,10 @@ impl Backend for Real {
     fn me(&mut self) -> (u32, String) {
         let pid = std::process::id();
         (pid, self.started_of(pid).unwrap_or_default())
+    }
+
+    fn ancestors(&mut self) -> Vec<u32> {
+        crate::cutter::ancestors()
     }
 
     fn started_of(&mut self, pid: u32) -> Option<String> {
@@ -3056,30 +3262,49 @@ impl Backend for Real {
                     ));
                 }
             }
-            let moved: Vec<String> = [
-                &["diff", "--name-only", "HEAD"][..],
-                &["ls-files", "--others", "--exclude-standard"][..],
+            // A nested workspace (a recorder run read-only in the Linux lane)
+            // locks aterm's path crates at the workspace's version too: each
+            // moves with the root, or its `--locked` run fails until relocked.
+            let nested = self.git_paths(&["ls-files", "-z", "--", "*/Cargo.lock"]);
+            let followed = match bump_nested_locks(&self.repo, nested, from, to) {
+                Ok(followed) => followed,
+                Err(why) => {
+                    undo(self);
+                    return Err(Refusal::new(why, "read the commit step's log"));
+                }
+            };
+            let inspected = [
+                &["diff", "--name-only", "-z", "HEAD"][..],
+                &["ls-files", "--others", "--exclude-standard", "-z"][..],
             ]
             .iter()
-            .flat_map(|args| {
-                self.git_out(args)
-                    .unwrap_or_default()
-                    .lines()
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .filter(|p| p != "Cargo.toml" && p != "Cargo.lock")
-            .collect();
-            let stray = self
-                .git_out(&["diff", "-U0"])
-                .unwrap_or_default()
-                .lines()
-                .any(|l| {
-                    (l.starts_with('+') || l.starts_with('-'))
-                        && !l.starts_with("+++")
-                        && !l.starts_with("---")
-                        && !l.contains("version")
-                });
+            .map(|args| self.git_paths(args))
+            .collect::<Result<Vec<_>, _>>();
+            let inspected = match inspected {
+                Ok(inspected) => inspected,
+                Err(why) => {
+                    undo(self);
+                    return Err(Refusal::new(why, "read the commit step's log"));
+                }
+            };
+            let moved: Vec<String> = inspected
+                .into_iter()
+                .flatten()
+                .filter(|p| p != "Cargo.toml" && p != "Cargo.lock" && !followed.contains(p))
+                .collect();
+            let Some(diff) = self.git_out(&["diff", "-U0"]) else {
+                undo(self);
+                return Err(Refusal::new(
+                    "could not inspect the bump's diff; the bump is undone",
+                    "read the commit step's log",
+                ));
+            };
+            let stray = diff.lines().any(|l| {
+                (l.starts_with('+') || l.starts_with('-'))
+                    && !l.starts_with("+++")
+                    && !l.starts_with("---")
+                    && !l.contains("version")
+            });
             if !moved.is_empty() || stray {
                 undo(self);
                 return Err(Refusal::new(
@@ -3092,6 +3317,7 @@ impl Backend for Real {
             let mut commit = command(aterm_uds::os_path!("git"));
             commit
                 .args(["commit", "-q", "-m", &msg, "--", "Cargo.toml", "Cargo.lock"])
+                .args(&followed)
                 .current_dir(&self.repo);
             if self.logged(Step::Commit, &mut commit).code != 0 {
                 return Err(Refusal::new(
@@ -3138,27 +3364,27 @@ impl Backend for Real {
         crate::gates::own_cutter(&self.git(), commit)
     }
 
-    fn reexec(&mut self, prover: &Prover) -> Refusal {
-        let mut cmd = self.scrubbed(prover.bin.join("targo"));
-        cmd.args(["--unverified", "ship"])
-            .args(&self.argv)
-            .current_dir(&self.repo);
-        #[cfg(unix)]
-        {
-            let e = cmd.exec();
+    /// [`Real::reexec_command`], never started once this process caught a signal, waited on
+    /// with each signal this process catches meanwhile passed on to it, a `SIGINT` as a
+    /// `SIGTERM` ([`interrupt::wait_passing_on`]): one sent to this pid alone (a second run's
+    /// refusal names it until the re-run takes the claim over) reaches the re-run's `targo` too,
+    /// which passes it on to the cutter it started.
+    fn reexec(&mut self, prover: &Prover) -> Result<i32, Refusal> {
+        let cannot = |why: String| {
             Refusal::new(
-                format!("cannot re-run as R's own cutter ({e})"),
+                format!("cannot re-run as R's own cutter ({why})"),
                 format!("run {RELEASE_COMMAND} again from the clone"),
             )
+        };
+        if interrupt::caught().is_some() {
+            return Err(cannot("not started: the release was interrupted".into()));
         }
-        #[cfg(not(unix))]
-        {
-            let _ = cmd;
-            Refusal::new(
-                "a release runs on macOS",
-                format!("run {RELEASE_COMMAND} from a provisioned Mac"),
-            )
-        }
+        let inherited = std::env::vars_os().map(|(name, _)| name);
+        let mut cmd = self.reexec_command(prover, inherited);
+        let status = cmd
+            .spawn()
+            .and_then(|mut child| interrupt::wait_passing_on(&mut child, &interrupt::counts));
+        crate::hook::exit_code(status, &prover.bin.join("targo")).map_err(cannot)
     }
 
     fn facts(&mut self, c: &Candidate, prover: &Prover, artifact: Option<&Artifact>) -> Facts {
@@ -3218,6 +3444,7 @@ impl Backend for Real {
                     .lines()
                     .nth(1)
                     .and_then(|l| l.split_whitespace().nth(3))
+                    .filter(|f| f.bytes().all(|b| b.is_ascii_digit()))
                     .and_then(|f| f.parse::<u64>().ok())
             })
             .map(|kib| kib / (1024 * 1024));
@@ -3231,7 +3458,7 @@ impl Backend for Real {
         if dry && let Err(not) = crate::gates::own_cutter(&git, &c.commit) {
             self.say(&format!(
                 "        note: R's pre-claim gates asked of this cutter, not yet R's own (a real \
-                 run re-execs as R's): {}",
+                 run re-runs as R's): {}",
                 not.why
             ));
         }
@@ -3266,9 +3493,7 @@ impl Backend for Real {
                 crate::gates::LockedMetadataError::Lockfile(_) => refusal,
             });
         }
-        let path = std::env::var_os("PATH").unwrap_or_default();
-        let gitleaks = std::env::split_paths(&path).any(|d| d.join("gitleaks").is_file());
-        if !gitleaks {
+        if aterm_uds::host::tool("gitleaks").locate().is_err() {
             blocks.push(Refusal::new(
                 "gitleaks is not installed — every stage dies at the guard",
                 aterm_uds::host::tool("gitleaks").remedy(),
@@ -3528,8 +3753,13 @@ impl Backend for Real {
     }
 
     fn cut(&mut self, args: &[String], prover: &Prover) -> Ran {
-        let mut cmd = self.cut_command(args, prover);
-        self.logged(Step::Cut, &mut cmd)
+        match self.cut_command(args, prover) {
+            Ok(mut cmd) => self.logged(Step::Cut, &mut cmd),
+            Err(why) => Ran {
+                code: -1,
+                detail: vec![format!("not started: {why}")],
+            },
+        }
     }
 
     fn after_cut(&mut self, version: &str) -> Result<AfterCut, Refusal> {
@@ -3565,7 +3795,7 @@ impl Backend for Real {
         if site_tag != tag {
             match read(self, &site_tag) {
                 Ok(rel) => {
-                    let v = site_tag.trim_start_matches('v');
+                    let v = site_tag.strip_prefix('v').unwrap_or(&site_tag);
                     problems.extend(
                         release_shape(&rel, v).into_iter().map(|p| {
                             format!("{site_tag} (the release alab.systems would link): {p}")
@@ -3855,6 +4085,48 @@ fn checked(repo: &Path, opts: &CheckOptions) -> Result<Precheck, String> {
         }
     }
     Ok(found)
+}
+
+#[path = "release_steps_nested_locks.rs"]
+mod nested_locks;
+
+/// Move admitted nested locks through pinned Unix directory handles, staging every update
+/// before publication. Unknown evidence refuses; renames are not a multi-file transaction.
+fn bump_nested_locks(
+    repo: &Path,
+    listing: Result<Vec<String>, String>,
+    from: &str,
+    to: &str,
+) -> Result<Vec<String>, String> {
+    nested_locks::bump(repo, listing, from, to)
+}
+
+/// `lock` (a nested workspace's Cargo.lock) with every path package at the
+/// workspace's version `from` moved to `to`, as `targo update` there rewrites
+/// it after a bump; `None` when no line moves. A registry package carries a
+/// `source` line and keeps its version, whatever it is.
+fn lock_follows_bump(lock: &str, from: &str, to: &str) -> Option<String> {
+    let old = format!("version = \"{from}\"");
+    let mut lines: Vec<String> = lock.split_inclusive('\n').map(str::to_string).collect();
+    let mut moved = false;
+    let mut version_line: Option<usize> = None;
+    let mut sourced = false;
+    for i in 0..=lines.len() {
+        let line = lines.get(i).map_or("", |l| l.trim_end());
+        if i == lines.len() || line.starts_with('[') {
+            if let (Some(at), false) = (version_line.take(), sourced) {
+                let ending = &lines[at][lines[at].trim_end().len()..];
+                lines[at] = format!("version = \"{to}\"{ending}");
+                moved = true;
+            }
+            sourced = false;
+        } else if line == old {
+            version_line = Some(i);
+        } else if line.starts_with("source = ") {
+            sourced = true;
+        }
+    }
+    moved.then(|| lines.concat())
 }
 
 /// `ship check`'s name for the engine's dry run.
@@ -4492,11 +4764,25 @@ mod tests {
         let dir = aterm_tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let real = Real::new(&root, Some(&root), true, false).unwrap();
-        let stage = real.dry_run_command(
+        let (stage, handed) = real.dry_run_command(
             &root.join("engine"),
             "c0ffee",
             &root.join("clone"),
             &reads(Some("1")).unwrap(),
+        );
+        // This test process was never judged at its start, so it is no commit's build: the dry
+        // run it builds is handed no cutter, not even one this process inherited.
+        for name in [RELEASE_CUTTER_ENV, RELEASE_CUTTER_SINCE_ENV] {
+            assert!(
+                stage
+                    .get_envs()
+                    .any(|(k, v)| k == std::ffi::OsStr::new(name) && v.is_none()),
+                "{name}: {handed}"
+            );
+        }
+        assert!(
+            handed.ends_with("c0ffee's publish/transforms.sh builds its own"),
+            "{handed}"
         );
         let mut sent: Vec<(String, std::ffi::OsString)> = stage
             .get_envs()
@@ -4964,6 +5250,44 @@ mod tests {
         assert!(staging_moved_from(&twice, &s).is_some());
     }
 
+    /// The build and cut steps run this very executable or nothing: a cutter that cannot name
+    /// its own executable builds no command for an `aterm-release` found on `PATH`, which would
+    /// be handed nothing of this one; one that can runs that path, handed itself. NEGATIVE
+    /// CONTROL: fall back to `aterm-release` on `PATH` (as before), and a command comes back.
+    #[test]
+    fn a_cutter_that_cannot_name_itself_starts_no_step() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let real = Real::new(
+            dir.path(),
+            Some(Path::new("/other/publication")),
+            true,
+            false,
+        )
+        .expect("a backend");
+        let prover = Prover {
+            bin: PathBuf::from("/store/trust/9192/bin"),
+            commit: "321aaeda7".into(),
+            source: "the store".into(),
+        };
+        let args = ["cut".to_string()];
+        let gone = real.cut_command_of(Err(std::io::Error::other("gone")), &args, &prover);
+        assert_eq!(
+            gone.err().as_deref(),
+            Some("this cutter cannot name its own executable (gone)")
+        );
+        let exe = PathBuf::from("/t/gate/aterm-release");
+        let cmd = real
+            .cut_command_of(Ok(exe.clone()), &args, &prover)
+            .unwrap();
+        assert_eq!(cmd.get_program(), exe.as_os_str());
+        assert_eq!(cmd.get_args().collect::<Vec<_>>(), ["cut"]);
+        assert!(cmd.get_envs().any(|kv| kv
+            == (
+                std::ffi::OsStr::new(RELEASE_CUTTER_ENV),
+                Some(exe.as_os_str())
+            )));
+    }
+
     #[test]
     fn the_engine_the_release_judges_is_the_one_every_child_reads() {
         let dir = aterm_tempfile::tempdir().unwrap();
@@ -4983,9 +5307,23 @@ mod tests {
             std::ffi::OsStr::new("PUBLICATION_ENGINE"),
             Some(std::ffi::OsStr::new("/other/publication")),
         );
-        let cut = real.cut_command(&["cut".into(), "--mac-only".into()], &prover);
+        let cut = real
+            .cut_command(&["cut".into(), "--mac-only".into()], &prover)
+            .unwrap();
         let envs: Vec<_> = cut.get_envs().collect();
         assert!(envs.contains(&engine), "{envs:?}");
+        let exe = std::env::current_exe().unwrap();
+        // The cut step's cutter is this executable, handed itself, so its cut gate judges it
+        // from this process's moment; never judged at its start, this test process has none.
+        for handed in [
+            (RELEASE_CUTTER_ENV, Some(exe.as_os_str())),
+            (RELEASE_CUTTER_SINCE_ENV, None),
+        ] {
+            assert!(
+                envs.contains(&(std::ffi::OsStr::new(handed.0), handed.1)),
+                "{handed:?}: {envs:?}"
+            );
+        }
         assert!(
             envs.contains(&(
                 std::ffi::OsStr::new("TRUST_STAGE2_BIN"),
@@ -5006,7 +5344,6 @@ mod tests {
         );
         let envs: Vec<_> = publish.get_envs().collect();
         assert!(envs.contains(&engine), "{envs:?}");
-        let exe = std::env::current_exe().unwrap();
         assert!(
             envs.contains(&(
                 std::ffi::OsStr::new(RELEASE_CUTTER_ENV),
@@ -5014,8 +5351,470 @@ mod tests {
             )),
             "{envs:?}"
         );
+        // Never judged at its start, this test process has no moment to hand on with itself.
+        assert!(
+            envs.contains(&(std::ffi::OsStr::new(RELEASE_CUTTER_SINCE_ENV), None)),
+            "{envs:?}"
+        );
         let edit = real.scrubbed("/other/publication/bin/pub-bump-edit");
         assert!(edit.get_envs().any(|kv| kv == engine));
+    }
+
+    /// The stage step's `pub stage` is a child with the prover's bin, handed this cutter only as
+    /// the commit's own build: this test process, never judged at its start, hands none, and
+    /// removes any it inherited. NEGATIVE CONTROL: build the command without
+    /// [`hand_transforms_cutter`], and neither variable is removed.
+    #[test]
+    fn the_stage_step_is_handed_this_cutter_only_as_the_commits_own_build() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let real = Real::new(
+            dir.path(),
+            Some(Path::new("/other/publication")),
+            true,
+            false,
+        )
+        .expect("a backend");
+        let prover = Prover {
+            bin: PathBuf::from("/store/trust/9192/bin"),
+            commit: "321aaeda7".into(),
+            source: "the store".into(),
+        };
+        let commit = "c".repeat(40);
+        let (stage, handed) = real.stage_command(&commit, &prover);
+        assert_eq!(
+            stage.get_program(),
+            std::ffi::OsStr::new("/other/publication/bin/pub")
+        );
+        let args: Vec<_> = stage.get_args().collect();
+        let repo = dir.path().as_os_str();
+        assert_eq!(
+            args,
+            ["stage", "aterm", "--commit", commit.as_str(), "--repo-path"]
+                .map(std::ffi::OsStr::new)
+                .into_iter()
+                .chain([repo])
+                .collect::<Vec<_>>()
+        );
+        let envs: Vec<_> = stage.get_envs().collect();
+        for kv in [
+            ("PUBLICATION_ENGINE", Some("/other/publication")),
+            ("TRUST_STAGE2_BIN", Some("/store/trust/9192/bin")),
+            (RELEASE_CUTTER_ENV, None),
+            (RELEASE_CUTTER_SINCE_ENV, None),
+        ] {
+            let want = (std::ffi::OsStr::new(kv.0), kv.1.map(std::ffi::OsStr::new));
+            assert!(envs.contains(&want), "{kv:?}: {envs:?}");
+        }
+        assert!(
+            handed.contains("no commit's build")
+                && handed.ends_with("ccccccccc's publish/transforms.sh builds its own"),
+            "{handed}"
+        );
+    }
+
+    /// The re-run as R's own cutter is `targo --unverified ship <the release's arguments>` in the
+    /// clone, started as this process's child in its process group and waited on, its exit code
+    /// the re-run's, and it inherits no `TRUST_TARGO_*` variable, so it is a `targo` of its own
+    /// rather than one nested in the `targo` that ran this cutter. NEGATIVE CONTROLS: keep the
+    /// inherited `TRUST_TARGO_*` variables, and the nested endpoint reaches the re-run; `exec`
+    /// the command (as before), and this test's own process is replaced by the stand-in.
+    #[cfg(unix)]
+    #[test]
+    fn the_rerun_is_a_targo_of_its_own_that_this_run_waits_on() {
+        use std::ffi::{OsStr, OsString};
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut real = Real::new(&root, Some(&root), false, false).unwrap();
+        real.argv = ["release", "--commit", "origin/main"]
+            .map(OsString::from)
+            .to_vec();
+        let bin = root.join("store/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let said = root.join("said");
+        let targo = bin.join("targo");
+        std::fs::write(
+            &targo,
+            format!(
+                "#!/bin/sh\n{{ echo \"$PPID\"; ps -o pgid= -p $$; pwd -P; printf '%s\\n' \"$@\"; \
+                 }} > '{}'\nexit 7\n",
+                said.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&targo, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let prover = Prover {
+            bin: bin.clone(),
+            commit: "321aaeda7".into(),
+            source: "the store".into(),
+        };
+        let inherited = [
+            "TRUST_TARGO_NESTED_UNVERIFIED_ENDPOINT",
+            "TRUST_STAGE2_BIN",
+            "HOME",
+        ];
+        let cmd = real.reexec_command(&prover, inherited.map(OsString::from));
+        let envs: Vec<_> = cmd.get_envs().collect();
+        assert!(
+            envs.contains(&(OsStr::new("TRUST_TARGO_NESTED_UNVERIFIED_ENDPOINT"), None)),
+            "{envs:?}"
+        );
+        for kept in ["TRUST_STAGE2_BIN", "HOME"] {
+            assert!(
+                !envs.iter().any(|(k, _)| *k == OsStr::new(kept)),
+                "{kept}: {envs:?}"
+            );
+        }
+
+        assert_eq!(real.reexec(&prover), Ok(7), "the re-run's exit code");
+        let said = std::fs::read_to_string(&said).unwrap();
+        let said: Vec<&str> = said.lines().map(str::trim).collect();
+        assert_eq!(
+            said[0],
+            std::process::id().to_string(),
+            "a child of this process"
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            said[1],
+            aterm_sysprobe::kproc::record(std::process::id())
+                .unwrap()
+                .pgid
+                .to_string(),
+            "in this process's group"
+        );
+        assert_eq!(said[2], root.display().to_string(), "in the clone");
+        assert_eq!(
+            said[3..],
+            ["--unverified", "ship", "release", "--commit", "origin/main"]
+        );
+    }
+
+    /// This test binary run again as a release waiting on the re-run as R's own cutter: its
+    /// handler installed as the release's is (from the default dispositions, whatever the test
+    /// inherited), it prints what [`Real::reexec`] answered with `<root>/bin/targo` and exits.
+    /// With `interrupted`, it first sends itself a `SIGTERM` and waits until its handler caught
+    /// it (a one-minute hang detector), as a release that caught one before its re-run.
+    #[cfg(unix)]
+    fn reexec_probe(root: &Path, interrupted: bool) -> ! {
+        unsafe extern "C" {
+            fn signal(sig: i32, handler: usize) -> usize;
+        }
+        for sig in [interrupt::SIGHUP, interrupt::SIGINT, interrupt::SIGTERM] {
+            // SAFETY: SIG_DFL (0) for a signal no handler of this process holds yet.
+            unsafe {
+                signal(sig, 0);
+            }
+        }
+        interrupt::install();
+        if interrupted {
+            interrupt::send(std::process::id().cast_signed(), interrupt::SIGTERM);
+            let bound = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while interrupt::caught().is_none() {
+                if std::time::Instant::now() > bound {
+                    println!("never caught its own SIGTERM");
+                    std::process::exit(1);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        let mut real = Real::new(root, Some(root), true, false).unwrap();
+        let prover = Prover {
+            bin: root.join("bin"),
+            commit: "321aaeda7".into(),
+            source: "the store".into(),
+        };
+        println!("reexec: {:?}", real.reexec(&prover));
+        std::process::exit(0);
+    }
+
+    /// A stand-in `targo` under `root` for [`reexec_probe`], and the run of `test` (this test,
+    /// named as `--exact` takes it) as that probe, with `probe` naming `root`, in a process group
+    /// of its own, which the stand-in joins ([`Real::reexec`]). Started, the stand-in writes its
+    /// pid to `<root>/armed`, records each `SIGINT`, `SIGHUP` and `SIGTERM` it gets as a line of
+    /// `<root>/record` and ends 3 on its second `SIGTERM`; it ends 9 once its parent (the probe)
+    /// is reaped or this test is gone, or after about five minutes, so a probe left behind takes
+    /// it along, and a test killed outright (its group signalled, which the probe's own group
+    /// misses) leaves neither: the stand-in ends, so the probe's wait returns and it exits.
+    #[cfg(unix)]
+    fn reexec_stand_in(root: &Path, test: &str, probe: &str) -> aterm_uds::spawnfd::Child {
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let targo = bin.join("targo");
+        std::fs::write(
+            &targo,
+            format!(
+                "#!/bin/sh\nrec='{root}/record'\ntrap 'echo INT >> \"$rec\"' INT\n\
+                 trap 'echo HUP >> \"$rec\"' HUP\n\
+                 t=0\ntrap 'echo TERM >> \"$rec\"; t=$((t + 1)); [ $t -lt 2 ] || exit 3' TERM\n\
+                 echo $$ > '{root}/armed.new' && mv '{root}/armed.new' '{root}/armed'\ni=0\n\
+                 while kill -0 $PPID 2>/dev/null && kill -0 {test_pid} 2>/dev/null \
+                 && [ $i -lt 3000 ]; do\n\
+                 sleep 0.1; i=$((i + 1)); done\nexit 9\n",
+                root = root.display(),
+                test_pid = std::process::id()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&targo, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        command(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(probe, root)
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    }
+
+    /// Fail a test of [`reexec_stand_in`] with `what` and the probe's output. A probe this test
+    /// has not reaped has its process group, the stand-in in it, sent `SIGKILL`: that group's id
+    /// is the probe's pid, which no other process can take until this test reaps the probe, so
+    /// the kill reaches no other group. The stand-in's watch of its parent would not do there:
+    /// `kill -0` answers 0 for an unreaped process (macOS 27.0, measured), and `wait_with_output`
+    /// reads the output the stand-in holds open to its end before it reaps the probe. A probe
+    /// already reaped is not signalled: the stand-in's watch fails once that pid is free, and it
+    /// ends at its next look, 0.1 s on.
+    #[cfg(unix)]
+    fn reexec_failed(mut probe: aterm_uds::spawnfd::Child, what: &str) -> ! {
+        if probe.try_wait().unwrap().is_none() {
+            interrupt::send(-i32::try_from(probe.id()).unwrap(), interrupt::SIGKILL);
+        }
+        let out = probe.wait_with_output().unwrap();
+        panic!(
+            "{what}: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    }
+
+    /// A release that caught a signal before its re-run as R's own cutter starts none: the
+    /// stand-in `targo` never runs, and [`Real::reexec`] says why. NEGATIVE CONTROL: drop the
+    /// check, and the re-run starts and is passed the `SIGTERM` this run caught, so reexec
+    /// answers Ok with its exit code.
+    #[cfg(unix)]
+    #[test]
+    fn a_rerun_never_starts_once_this_run_caught_a_signal() {
+        use std::time::{Duration, Instant};
+        const PROBE: &str = "ATERM_RELEASE_REEXEC_INTERRUPTED_PROBE";
+        if let Some(root) = std::env::var_os(PROBE) {
+            reexec_probe(Path::new(&root), true);
+        }
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let root = scratch.path().canonicalize().unwrap();
+        let mut probe = reexec_stand_in(
+            &root,
+            "release_steps::tests::a_rerun_never_starts_once_this_run_caught_a_signal",
+            PROBE,
+        );
+        let bound = Instant::now() + Duration::from_secs(60);
+        while probe.try_wait().unwrap().is_none() {
+            if Instant::now() > bound {
+                reexec_failed(probe, "the probe did not end");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let out = probe.wait_with_output().unwrap();
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            said.contains(
+                "reexec: Err(Refusal { why: \"cannot re-run as R's own cutter (not started: \
+                 the release was interrupted)\""
+            ),
+            "{said}"
+        );
+        assert!(
+            !root.join("armed").exists() && !root.join("record").exists(),
+            "the stand-in never ran"
+        );
+    }
+
+    /// Each signal sent to this run alone while it waits on the re-run as R's own cutter reaches
+    /// the re-run's `targo` once, a `SIGINT` as a `SIGTERM` (which that `targo` passes on to its
+    /// cutter, as it does not a `SIGINT`), and the run ends with that `targo`'s exit code. The
+    /// test sends each only after the stand-in recorded the one before, so the record keeps the
+    /// order they were sent in (within one look, the wait passes `SIGHUP`s, then `SIGINT`s, then
+    /// `SIGTERM`s). Each wait for the stand-in has a one-minute hang detector of its own, and a
+    /// failure kills the probe's process group, the stand-in in it ([`reexec_failed`]). NEGATIVE
+    /// CONTROLS: wait on the re-run without passing signals on (`child.wait()`, as before), and
+    /// the stand-in never gets the `SIGINT`; pass a `SIGINT` on as itself, and the stand-in
+    /// records `INT`.
+    #[cfg(unix)]
+    #[test]
+    fn a_signal_sent_to_this_run_alone_reaches_the_reruns_targo() {
+        use std::time::{Duration, Instant};
+        const PROBE: &str = "ATERM_RELEASE_REEXEC_SIGNAL_PROBE";
+        if let Some(root) = std::env::var_os(PROBE) {
+            reexec_probe(Path::new(&root), false);
+        }
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let root = scratch.path().canonicalize().unwrap();
+        let record = root.join("record");
+        let armed = root.join("armed");
+        let mut probe = reexec_stand_in(
+            &root,
+            "release_steps::tests::a_signal_sent_to_this_run_alone_reaches_the_reruns_targo",
+            PROBE,
+        );
+        let pid = i32::try_from(probe.id()).unwrap();
+        // A one-minute hang detector for what must happen, the probe still running.
+        let came = |probe: &mut aterm_uds::spawnfd::Child, done: &dyn Fn() -> bool| {
+            let bound = Instant::now() + Duration::from_secs(60);
+            while !done() {
+                if Instant::now() > bound || probe.try_wait().unwrap().is_some() {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            true
+        };
+        let fail = |probe, what: &str| reexec_failed(probe, what);
+        if !came(&mut probe, &|| armed.exists()) {
+            fail(probe, "the re-run's targo never armed");
+        }
+        let read = || std::fs::read_to_string(&record).unwrap_or_default();
+        for (sig, name, recorded) in [
+            (interrupt::SIGINT, "INT", "TERM\n"),
+            (interrupt::SIGHUP, "HUP", "TERM\nHUP\n"),
+        ] {
+            let before = read().len();
+            interrupt::send(pid, sig);
+            if !came(&mut probe, &|| read().len() > before) {
+                fail(
+                    probe,
+                    &format!("the re-run's targo never got the SIG{name} sent to this run"),
+                );
+            }
+            let got = read();
+            if got != recorded {
+                fail(
+                    probe,
+                    &format!(
+                        "the SIG{name} reached the re-run's targo as {got:?}, not {recorded:?}"
+                    ),
+                );
+            }
+        }
+        interrupt::send(pid, interrupt::SIGTERM);
+        let bound = Instant::now() + Duration::from_secs(60);
+        while probe.try_wait().unwrap().is_none() {
+            if Instant::now() > bound {
+                fail(probe, "the run did not end with its re-run");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let out = probe.wait_with_output().unwrap();
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            said.contains("reexec: Ok(3)"),
+            "the re-run's exit code: {said}"
+        );
+        assert_eq!(read(), "TERM\nHUP\nTERM\n", "each once, in the order sent");
+    }
+
+    /// A handed cutter carries the moment it was judged from, with this process as the one that
+    /// handed it, as the cutter it hands reads it, or none: an inherited one is removed.
+    /// NEGATIVE CONTROL: leave the variable alone when there is no moment, and an inherited one
+    /// reaches the handed cutter.
+    #[test]
+    fn a_handed_cutter_carries_the_moment_it_was_judged_from() {
+        let exe = Path::new("/t/gate/aterm-release");
+        let at = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::new(1_793_520_000, 7);
+        let since = |cmd: &Command| {
+            cmd.get_envs()
+                .find(|(k, _)| *k == std::ffi::OsStr::new(RELEASE_CUTTER_SINCE_ENV))
+                .map(|(_, v)| v.map(std::ffi::OsStr::to_os_string))
+        };
+        let mut cmd = command("/other/publication/bin/pub");
+        hand_this_cutter(&mut cmd, exe, Some(at));
+        let value = crate::cutter::hand_value(at);
+        #[cfg(target_os = "macos")]
+        assert!(
+            value.as_deref().is_some_and(
+                |v| v.starts_with(&format!("1793520000000000007 {} ", std::process::id()))
+            ),
+            "the moment and this process's pid, in nanoseconds: {value:?}"
+        );
+        assert_eq!(
+            since(&cmd),
+            Some(value.map(Into::into)),
+            "handed by this process"
+        );
+        assert!(cmd.get_envs().any(|kv| kv
+            == (
+                std::ffi::OsStr::new(RELEASE_CUTTER_ENV),
+                Some(exe.as_os_str())
+            )));
+        let mut cmd = command("/other/publication/bin/pub");
+        hand_this_cutter(&mut cmd, exe, None);
+        assert_eq!(since(&cmd), Some(None), "none, and none inherited");
+    }
+
+    /// A step runs without the cutter this process may have been handed: a child has
+    /// [`RELEASE_CUTTER_ENV`] and [`RELEASE_CUTTER_SINCE_ENV`] only from [`hand_this_cutter`],
+    /// never inherited, and keeps what the scrub does not name. NEGATIVE CONTROL: scrub only
+    /// what [`clears`] and [`launcher_env`] name, and both reach the child.
+    #[test]
+    fn a_step_inherits_no_handed_cutter() {
+        let mut cmd = command("/usr/bin/true");
+        let inherited = [
+            RELEASE_CUTTER_ENV,
+            RELEASE_CUTTER_SINCE_ENV,
+            "HOME",
+            "RUSTFLAGS",
+        ];
+        scrub_names(&mut cmd, inherited.map(std::ffi::OsString::from));
+        let removed: Vec<_> = cmd
+            .get_envs()
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k.to_os_string())
+            .collect();
+        assert_eq!(
+            removed,
+            [RELEASE_CUTTER_ENV, RELEASE_CUTTER_SINCE_ENV, "RUSTFLAGS"]
+        );
+        hand_this_cutter(&mut cmd, Path::new("/t/gate/aterm-release"), None);
+        assert!(cmd.get_envs().any(|kv| kv
+            == (
+                std::ffi::OsStr::new(RELEASE_CUTTER_ENV),
+                Some(std::ffi::OsStr::new("/t/gate/aterm-release"))
+            )));
+    }
+
+    #[test]
+    fn a_stage_is_handed_this_cutter_for_its_transforms_only_as_the_commits_own_build() {
+        let (commit, other) = ("c".repeat(40), "d".repeat(40));
+        let exe = || Ok(PathBuf::from("/t/gate/aterm-release"));
+        assert_eq!(
+            transforms_cutter(Ok(commit.as_str()), exe(), &commit),
+            Ok(PathBuf::from("/t/gate/aterm-release"))
+        );
+        let dirty = crate::cutter::NotOwn {
+            why: "its checkout /w has uncommitted cutter sources (Cargo.lock)".into(),
+            fix: String::new(),
+        };
+        for (built, words) in [
+            (Ok(other.as_str()), "the build of ddddddddd, not ccccccccc"),
+            (
+                Err(&dirty),
+                "no commit's build: its checkout /w has uncommitted",
+            ),
+        ] {
+            let why = transforms_cutter(built, exe(), &commit).unwrap_err();
+            assert!(why.contains(words), "{words}: {why}");
+        }
+        let unnamed = transforms_cutter(
+            Ok(commit.as_str()),
+            Err(std::io::Error::other("gone")),
+            &commit,
+        );
+        assert!(
+            unnamed
+                .unwrap_err()
+                .contains("cannot name its own executable (gone)")
+        );
     }
 
     #[test]
@@ -5119,6 +5918,15 @@ mod tests {
         assert_eq!(local_stamp(0, 0), "19700101T000000");
         assert_eq!(local_stamp(1_792_627_200, 7200), "20261022T020000");
         assert_eq!(local_stamp(1_792_627_200, -27_000), "20261021T163000");
+        let (pdt, pst, fall_back) = (-7 * 3600, -8 * 3600, 1_793_523_600);
+        let zone = |t: i64| Some(if t < fall_back { pdt } else { pst });
+        assert_eq!(hms_local(1_793_518_200, zone), "00:30:00");
+        assert_eq!(hms_local(1_793_527_200, zone), "02:00:00");
+        assert_eq!(
+            hms_local(1_793_527_200, |_| Some(pdt)),
+            "03:00:00",
+            "NEGATIVE CONTROL: start-of-run offset shifts post-change step times by an hour"
+        );
         assert!(clears("RUSTFLAGS") && clears("CARGO_TARGET_DIR") && !clears("PATH"));
         for name in [
             "CARGO",
@@ -5129,5 +5937,151 @@ mod tests {
             assert!(launcher_env(name), "{name}");
         }
         assert!(!launcher_env("CARGO_HOME") && !launcher_env("HOME"));
+    }
+
+    #[cfg(unix)]
+    mod nested_lock_files {
+        use super::*;
+
+        const NESTED_LOCK_BEFORE: &str = "version = 4\n\n[[package]]\nname = \"aterm-local\"\nversion = \"0.147.0\"\n\n[[package]]\nname = \"registry\"\nversion = \"0.147.0\"\nsource = \"registry+https://example.invalid/index\"\n";
+        const NESTED_LOCK_AFTER: &str = "version = 4\n\n[[package]]\nname = \"aterm-local\"\nversion = \"0.148.0\"\n\n[[package]]\nname = \"registry\"\nversion = \"0.147.0\"\nsource = \"registry+https://example.invalid/index\"\n";
+
+        fn ordinary_nested_bump(repo: &Path) {
+            let parent = repo.join("ordinary");
+            std::fs::create_dir_all(&parent).unwrap();
+            std::fs::write(parent.join("Cargo.lock"), NESTED_LOCK_BEFORE).unwrap();
+            assert_eq!(
+                bump_nested_locks(
+                    repo,
+                    Ok(vec!["ordinary/Cargo.lock".into()]),
+                    "0.147.0",
+                    "0.148.0"
+                )
+                .unwrap(),
+                ["ordinary/Cargo.lock"]
+            );
+            assert_eq!(
+                std::fs::read_to_string(parent.join("Cargo.lock")).unwrap(),
+                NESTED_LOCK_AFTER,
+                "the local package moves and the registry version stays"
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn nested_lock_bumps_refuse_aliases_without_touching_their_payloads() {
+            use std::os::unix::fs::MetadataExt as _;
+
+            let mut outcomes = Vec::new();
+            for kind in ["symlink", "hardlink"] {
+                let scratch = aterm_tempfile::tempdir().unwrap();
+                let home = scratch.path().canonicalize().unwrap();
+                let repo = home.join("repo");
+                ordinary_nested_bump(&repo);
+                std::fs::create_dir(repo.join("nested")).unwrap();
+                let payload = home.join("outside-repo.lock");
+                let alias = repo.join("nested/Cargo.lock");
+                std::fs::write(&payload, NESTED_LOCK_BEFORE).unwrap();
+                if kind == "symlink" {
+                    std::os::unix::fs::symlink(&payload, &alias).unwrap();
+                } else {
+                    std::fs::hard_link(&payload, &alias).unwrap();
+                }
+                let identity = |path: &Path| {
+                    let meta = std::fs::symlink_metadata(path).unwrap();
+                    (meta.dev(), meta.ino(), meta.nlink())
+                };
+                let before = identity(&alias);
+                let result = bump_nested_locks(
+                    &repo,
+                    Ok(vec!["nested/Cargo.lock".into()]),
+                    "0.147.0",
+                    "0.148.0",
+                );
+                outcomes.push((
+                    kind,
+                    result.is_err(),
+                    identity(&alias) == before,
+                    std::fs::read_to_string(&payload).unwrap() == NESTED_LOCK_BEFORE,
+                ));
+            }
+            assert!(
+                outcomes
+                    .iter()
+                    .all(|(_, refused, kept, untouched)| *refused && *kept && *untouched),
+                "each alias must be refused and retain its external payload: {outcomes:?}"
+            );
+        }
+
+        #[test]
+        fn nested_lock_refusals_preserve_every_target_before_publication() {
+            let mut outcomes = Vec::new();
+            for kind in ["invalid-utf8", "missing", "directory", "listing-refused"] {
+                let scratch = aterm_tempfile::tempdir().unwrap();
+                let repo = scratch.path().canonicalize().unwrap();
+                ordinary_nested_bump(&repo);
+                std::fs::create_dir(repo.join("good")).unwrap();
+                std::fs::write(repo.join("good/Cargo.lock"), NESTED_LOCK_BEFORE).unwrap();
+                std::fs::create_dir(repo.join("unknown")).unwrap();
+                match kind {
+                    "invalid-utf8" => {
+                        std::fs::write(repo.join("unknown/Cargo.lock"), [0xff]).unwrap()
+                    }
+                    "directory" => std::fs::create_dir(repo.join("unknown/Cargo.lock")).unwrap(),
+                    "missing" | "listing-refused" => {}
+                    _ => unreachable!(),
+                }
+                let listing = if kind == "listing-refused" {
+                    Err("inert git enumeration refusal".to_owned())
+                } else {
+                    Ok(vec!["good/Cargo.lock".into(), "unknown/Cargo.lock".into()])
+                };
+                let result = bump_nested_locks(&repo, listing, "0.147.0", "0.148.0");
+                outcomes.push((
+                    kind,
+                    result.is_err(),
+                    std::fs::read_to_string(repo.join("good/Cargo.lock")).unwrap()
+                        == NESTED_LOCK_BEFORE,
+                ));
+            }
+            assert!(
+                outcomes
+                    .iter()
+                    .all(|(_, refused, unchanged)| *refused && *unchanged),
+                "unknown evidence must stop the batch before any target changes: {outcomes:?}"
+            );
+        }
+    }
+
+    /// The bump moves a nested lock's path crates with the root's and leaves a
+    /// registry crate that happens to share the old version where it was.
+    #[test]
+    fn a_nested_lock_follows_the_bump_in_its_path_crates_only() {
+        let lock = "version = 4\n\n[[package]]\nname = \"aterm-font\"\nversion = \"0.147.0\"\n\
+                    dependencies = [\n \"aterm-hash\",\n]\n\n[[package]]\nname = \"lookalike\"\n\
+                    version = \"0.147.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+                    checksum = \"00\"\n\n[[package]]\nname = \"astream-wire\"\nversion = \"0.2.0\"\n\n\
+                    [[package]]\nname = \"aterm-hash\"\nversion = \"0.147.0\"\n";
+        let moved = lock_follows_bump(lock, "0.147.0", "0.148.0").expect("two path crates move");
+        assert_eq!(
+            moved,
+            lock.replacen(
+                "name = \"aterm-font\"\nversion = \"0.147.0\"",
+                "name = \"aterm-font\"\nversion = \"0.148.0\"",
+                1
+            )
+            .replacen(
+                "name = \"aterm-hash\"\nversion = \"0.147.0\"",
+                "name = \"aterm-hash\"\nversion = \"0.148.0\"",
+                1
+            )
+        );
+        assert!(moved.contains("name = \"lookalike\"\nversion = \"0.147.0\""));
+        assert_eq!(lock_follows_bump(lock, "0.107.0", "0.148.0"), None);
+        let crlf = "[[package]]\r\nname = \"aterm-uds\"\r\nversion = \"0.147.0\"\r\n";
+        assert_eq!(
+            lock_follows_bump(crlf, "0.147.0", "0.148.0").as_deref(),
+            Some("[[package]]\r\nname = \"aterm-uds\"\r\nversion = \"0.148.0\"\r\n")
+        );
     }
 }

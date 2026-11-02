@@ -321,4 +321,15 @@ fn a_survey_reply_reads_as_a_member() {
         why("claude", &chosen),
         "claude account main 7d 12% 5h 3%, 1 busy session; the best of 1 that can take it"
     );
+    let plus = vec![
+        "instance pid=9 host=m7.local version=0.146.0 sessions=0 level=facts \
+         at_ms=+1 accounts=1 accounts_unread=- drive=1"
+            .to_owned(),
+        "account pool=claude id=main condition=usable enrolled=1 pct5=+3 pct7=+12 week_reset=- \
+         walled_until=- last_used=-"
+            .to_owned(),
+    ];
+    let m = &members_of(&[peer(Ok(plus))])[0];
+    assert_eq!(m.at_ms, None);
+    assert_eq!(m.accounts, Some(vec![row("claude", "main", None, None)]));
 }

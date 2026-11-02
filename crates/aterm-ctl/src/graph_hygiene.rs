@@ -99,12 +99,7 @@ pub(crate) fn writer_gone(pid: u32, written: Option<SystemTime>) -> bool {
 
 /// A graph entry's body and when it was last written, from one open.
 pub(crate) fn read_entry(path: &Path) -> std::io::Result<(String, Option<SystemTime>)> {
-    use std::io::Read;
-    let mut file = std::fs::File::open(path)?;
-    let mut body = String::new();
-    file.read_to_string(&mut body)?;
-    let written = file.metadata().and_then(|m| m.modified()).ok();
-    Ok((body, written))
+    crate::read_bounded_regular_utf8(path, crate::MAX_GRAPH_ENTRY_BYTES)
 }
 
 /// Remove the graph entry at `entry`.
@@ -112,6 +107,9 @@ pub(crate) fn prune_dead_entry(entry: &Path, seen: &str) -> bool {
     let (Some(dir), Some(name)) = (entry.parent(), entry.file_name()) else {
         return false;
     };
+    if !std::fs::symlink_metadata(entry).is_ok_and(|m| m.file_type().is_file()) {
+        return false;
+    }
     let mut aside_name = std::ffi::OsString::from(".prune-");
     aside_name.push(name);
     aside_name.push(format!("-{}", std::process::id()));
@@ -119,7 +117,8 @@ pub(crate) fn prune_dead_entry(entry: &Path, seen: &str) -> bool {
     if std::fs::rename(entry, &aside).is_err() {
         return false;
     }
-    let unchanged = std::fs::read_to_string(&aside).is_ok_and(|now| now == seen);
+    let unchanged = crate::read_bounded_regular_utf8(&aside, crate::MAX_GRAPH_ENTRY_BYTES)
+        .is_ok_and(|(now, _)| now == seen);
     if !unchanged {
         // Rewritten under us: restore it, unless a newer entry already holds
         // the name (then that one is the live answer and ours is older).
@@ -183,6 +182,18 @@ mod tests {
             0,
             "removed, and no aside file"
         );
+
+        let target = s.path().join("target");
+        let symlink = s.path().join("s-link");
+        std::fs::write(&target, dead).unwrap();
+        std::os::unix::fs::symlink(&target, &symlink).unwrap();
+        assert!(read_entry(&symlink).is_err(), "symlinks are refused");
+        assert!(
+            !prune_dead_entry(&symlink, dead),
+            "symlinks are never pruned or followed"
+        );
+        std::fs::remove_file(&symlink).unwrap();
+        std::fs::remove_file(&target).unwrap();
     }
 
     /// [`is_entry_writer`]'s edges: before the write, inside the slack, a microsecond past it,

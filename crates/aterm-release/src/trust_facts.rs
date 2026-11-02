@@ -13,7 +13,7 @@ use aterm_digest::Sha256;
 use crate::ledger::{Error, GitRunner, Result, git_ok, rev_parse};
 use crate::release::shell_word;
 
-pub const FACTS_MAGIC: &str = "aterm-trust facts 9";
+pub const FACTS_MAGIC: &str = "aterm-trust facts 10";
 
 pub const FACTS_END: &str = "end";
 
@@ -74,6 +74,21 @@ pub const CHECK_CANCELLED: &str = "proof validation cancelled by the caller";
 /// lane to decide it then.
 const WALL_CLOCKS: &str = "the prover's clocks count wall time, and only `[trust] backstop` in the workspace root manifest sets them, for every run in the checkout, so the lane can neither count CPU time nor scale them by the share its threads get; while its threads wait for a core, behind the host's work or the prover's own other threads, only a prover whose clocks count CPU time, or that takes a backstop for one run, decides it (asked of the Trust toolchain in docs/DESIGN-adaptive-build-2026-10-24.md)";
 
+/// How far apart two runs of one tree under one prover can prove, in hundredths of the count:
+/// the prover is not reproducible. Measured at loads that starved neither run: aterm-link 841
+/// and 853 (12, 1.4%), aterm-messages 1066 and 1070 (4), aterm-gpu 811 and 812 (1); none of
+/// the obligations that moved was one a backstop stopped (`docs/DESIGN-adaptive-build-2026-10-24.md`,
+/// TRUST-JUDGE).
+pub const SPREAD_PER_CENT: u64 = 2;
+
+/// The most a run may fall short of a floor of `f` its own prover recorded by that prover's
+/// run-to-run spread alone: [`SPREAD_PER_CENT`] of `f`, rounded down, so a floor under 50 has
+/// none and a small crate's one lost proof stays a regression.
+#[must_use]
+pub const fn spread(f: u64) -> u64 {
+    f.saturating_mul(SPREAD_PER_CENT) / 100
+}
+
 /// Raw verification metrics parsed from a single crate's `targo trust check` log.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Measured {
@@ -101,6 +116,12 @@ pub struct Measured {
     pub pace: Option<Pace>,
     /// What a backstop stopped, from the check's obligation record; `None` when it left none.
     pub backstops: Option<Vec<Backstop>>,
+    /// What served trustd's socket after the trustd this run's keeper held went away while the
+    /// check ran (the lane's `.trustd-lost` mark); empty when it stayed.
+    pub trustd_lost: String,
+    /// targo-trust's own `COULD NOT RUN:` (its first such line, from those words on); empty when
+    /// it said none.
+    pub could_not_run: String,
 }
 
 /// How a check ran: its CPU and wall time, the host's mean one-minute load while it ran, the
@@ -157,20 +178,20 @@ impl Pace {
                 load,
                 cores,
                 Some(Threads {
-                    ran_ms: ran.parse().ok()?,
-                    runnable_ms: runnable.parse().ok()?,
+                    ran_ms: parse_uint(ran)?,
+                    runnable_ms: parse_uint(runnable)?,
                 }),
             ),
             _ => return None,
         };
         Some(Pace {
-            cpu_ms: cpu.parse().ok()?,
-            wall_ms: wall.parse().ok()?,
+            cpu_ms: parse_uint(cpu)?,
+            wall_ms: parse_uint(wall)?,
             load: match load {
                 "-" => None,
-                l => Some(l.parse().ok()?),
+                l => Some(parse_uint(l)?),
             },
-            cores: cores.parse().ok()?,
+            cores: parse_uint(cores)?,
             threads,
         })
     }
@@ -406,10 +427,18 @@ fn backticked(s: &str) -> Option<(&str, &str)> {
     (e > 0).then(|| (&s[..e], &s[e + 1..]))
 }
 
+fn parse_uint<T: std::str::FromStr>(s: &str) -> Option<T> {
+    (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| s.parse().ok())
+        .flatten()
+}
+
 fn octal_mode(s: &str) -> Option<u32> {
     let r = s.strip_prefix("0o")?;
     let n = r.bytes().take_while(|b| (b'0'..=b'7').contains(b)).count();
-    u32::from_str_radix(&r[..n], 8).ok()
+    (n > 0)
+        .then(|| u32::from_str_radix(&r[..n], 8).ok())
+        .flatten()
 }
 
 fn foreign_owner(rest: &str) -> Option<Refused> {
@@ -555,6 +584,12 @@ pub const TRUSTD_REFUSED: &str =
     "could not establish the selected same-sysroot trustd memory authority";
 
 pub const TRUSTD_DIRTY: &str = "crash epoch is not CLEAN";
+
+/// How targo-trust says a run is no measurement, then why (`COULD NOT RUN: verification did not
+/// run to a measurement: …`, `targo trust: COULD NOT RUN: …`): its exit 3, which it documents as
+/// "no verdict either way". Its `Result: COULD NOT RUN (outcome …)` line, which comes with
+/// counts, is not this.
+pub const TARGO_COULD_NOT_RUN: &str = "COULD NOT RUN: ";
 
 fn find_all(hay: &str, needle: &str) -> Vec<usize> {
     let mut out = Vec::new();
@@ -722,7 +757,7 @@ fn stop_count(causes: &str, cause: &str) -> u64 {
         .next()
         .unwrap_or("")
         .split_whitespace()
-        .find_map(|w| w.strip_prefix(cause)?.strip_prefix('=')?.parse().ok())
+        .find_map(|w| parse_uint(w.strip_prefix(cause)?.strip_prefix('=')?))
         .unwrap_or(0)
 }
 
@@ -804,6 +839,11 @@ impl Measured {
             if line.contains("verification did not run") || line.contains("transport:missing-json")
             {
                 m.transport = true;
+            }
+            if m.could_not_run.is_empty()
+                && let Some(at) = line.find(TARGO_COULD_NOT_RUN)
+            {
+                m.could_not_run = line[at..].to_string();
             }
             launch_refused |= line.contains(TRUSTD_REFUSED);
             dirty |= line.contains(TRUSTD_DIRTY);
@@ -912,10 +952,7 @@ impl Measured {
                 signal_said(name)
             ));
         }
-        if let Some(n) = rc
-            .trim()
-            .parse::<u32>()
-            .ok()
+        if let Some(n) = parse_uint::<u32>(rc.trim())
             .filter(|c| (129..=192).contains(c))
             .map(|c| c - 128)
         {
@@ -961,6 +998,8 @@ impl Measured {
             self.backstops
                 .as_ref()
                 .map_or_else(|| "-".into(), |b| b.len().to_string()),
+            one_line(&self.trustd_lost),
+            one_line(&self.could_not_run),
             one_line(&self.summary),
         ]
         .join("\t")
@@ -987,6 +1026,8 @@ impl Measured {
             rss,
             pace,
             backstops,
+            trustd_lost,
+            could_not_run,
             summary,
         ] = f
         else {
@@ -998,7 +1039,7 @@ impl Measured {
         };
         let backstops: Option<usize> = match *backstops {
             "-" => None,
-            n => Some(n.parse().ok()?),
+            n => Some(parse_uint(n)?),
         };
         if !matches!(*launch, "" | "dirty" | "owned" | "unready" | "other") {
             return None;
@@ -1016,13 +1057,13 @@ impl Measured {
                 "1" => true,
                 _ => return None,
             },
-            refused: refused.parse().ok()?,
-            lapsed: lapsed.parse().ok()?,
-            cancelled: cancelled.parse().ok()?,
-            budget_rows: budget_rows.parse().ok()?,
+            refused: parse_uint(refused)?,
+            lapsed: parse_uint(lapsed)?,
+            cancelled: parse_uint(cancelled)?,
+            budget_rows: parse_uint(budget_rows)?,
             skipped: match *skipped {
                 "-" => None,
-                n => Some(n.parse().ok()?),
+                n => Some(parse_uint(n)?),
             },
             ceiling: (*ceiling).to_string(),
             peak: (*peak).to_string(),
@@ -1034,9 +1075,11 @@ impl Measured {
             ended: (*ended).to_string(),
             summary: (*summary).to_string(),
             path_refused: Vec::new(),
-            rss: rss.parse().ok()?,
+            rss: parse_uint(rss)?,
             pace,
             backstops: backstops.map(Vec::with_capacity),
+            trustd_lost: (*trustd_lost).to_string(),
+            could_not_run: (*could_not_run).to_string(),
         };
         Some((m, backstops))
     }
@@ -1058,7 +1101,7 @@ fn one(x: f64) -> String {
 
 fn gib_of(figure: &str) -> Option<f64> {
     let (v, unit) = figure.split_once(' ')?;
-    let v: f64 = v.parse().ok()?;
+    let v: f64 = gib(v)?;
     let f = match unit.as_bytes().first() {
         Some(b'K') => 1.0 / 1_048_576.0,
         Some(b'M') => 1.0 / 1024.0,
@@ -1099,7 +1142,7 @@ fn ram_for(x: f64) -> u64 {
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn ram_above(x: f64) -> u64 {
-    (8.0 * x + 1e-9).trunc() as u64 + 1
+    ((8.0 * x + 1e-9).trunc() as u64).saturating_add(1)
 }
 
 /// The `-Z` flag through which `targo trust` gives a verifier its memory ceiling: a prover
@@ -1599,7 +1642,7 @@ pub fn peak_seen(host: &Host, maxrss: u64, when: &str) -> Option<Seen> {
 /// able to make available to admit it. `None` for any other [`Seen`].
 #[allow(clippy::cast_precision_loss)]
 pub(crate) fn peak_refusal(host: &Host, name: &str, seen: &Seen) -> Option<Refusal> {
-    let peak: u64 = seen.peak.parse().ok().filter(|_| seen.outcome == PEAK)?;
+    let peak: u64 = parse_uint(&seen.peak).filter(|_| seen.outcome == PEAK)?;
     let claim = aterm_capacity::peak_claim(peak);
     let gb = |b: u64| b as f64 / 1e9;
     let on = match seen.when.get(..10) {
@@ -1607,7 +1650,7 @@ pub(crate) fn peak_refusal(host: &Host, name: &str, seen: &Seen) -> Option<Refus
         _ => String::new(),
     };
     let ram = format!("{:.1} GB ({} GiB) of RAM", gb(host.mem), host.ram_gib());
-    let reach = seen.ceil.parse::<u64>().ok().filter(|r| *r < host.mem);
+    let reach = parse_uint::<u64>(&seen.ceil).filter(|r| *r < host.mem);
     let why = if peak > host.mem {
         format!(
             "its last check peaked at {:.2} GB{on}, above this host's {ram}",
@@ -2039,7 +2082,7 @@ impl Facts {
                 "grants" => f.grants = v.to_string(),
                 "trustd-seen" => f.trustd_seen = v.to_string(),
                 "only" => f.only = v.to_string(),
-                "host-mem" => f.host.mem = v.parse().ok()?,
+                "host-mem" => f.host.mem = parse_uint(v)?,
                 "host-mem-os" => {
                     f.host.memtotal = match v {
                         "MemTotal" => true,
@@ -2166,7 +2209,7 @@ pub fn floor_run(backstops: Option<&str>, name: &str) -> Option<FloorRun> {
         .filter_map(|l| l.strip_prefix(name)?.strip_prefix('\t'))
     {
         match rest.strip_prefix(RUN_ROW) {
-            Some(n) => cancelled = Some(n.parse().ok()?),
+            Some(n) => cancelled = Some(parse_uint(n)?),
             None => stops.extend(Backstop::from_fields(rest)),
         }
     }
@@ -2522,6 +2565,12 @@ pub fn judge(
     let (mut total_proved, mut total_all, mut capbound_n) = (0u64, 0u64, 0usize);
     let mut unfinished_n = 0usize;
     let (mut by_trustd, mut by_clock) = (Vec::<String>::new(), Vec::<String>::new());
+    // Undecided within the prover's spread ([`spread`]), and those whose check trustd went
+    // away under ([`Measured::trustd_lost`]).
+    let (mut by_spread, mut by_lost) = (Vec::<String>::new(), Vec::<String>::new());
+    // Undecided: those targo-trust itself could not run to a measurement
+    // ([`Measured::could_not_run`]).
+    let mut by_targo = Vec::<String>::new();
     // What a run of the crates in `by_clock` needs to be decided ([`Pace::unstarved`]).
     let mut clock_need: Option<String> = None;
     let (mut trustd_dirty, mut trustd_block) = (false, None::<(String, String)>);
@@ -2556,7 +2605,7 @@ pub fn judge(
             refused_paths.entry(r).or_default().push(name);
         }
         if !m.wall_budget.is_empty() {
-            let secs = m.wall_budget.parse::<u64>().ok();
+            let secs = parse_uint::<u64>(&m.wall_budget);
             let s = format!("OVER-BUDGET({}s)", m.wall_budget);
             failed.push(format!("{name} {s}"));
             rows.push([name.into(), s, dash(), dash()]);
@@ -2619,6 +2668,43 @@ pub fn judge(
             ));
             continue;
         }
+        // trustd went away while the check ran, and the check measured nothing: its transport
+        // ended with trustd (trustc dies of SIGPIPE writing to it), which says nothing of the code.
+        if !m.trustd_lost.is_empty() && (m.transport || !m.ended.is_empty() || m.summary.is_empty())
+        {
+            rows.push([name.into(), "NOT-VERIFIED(trustd)".into(), dash(), dash()]);
+            by_lost.push(name.to_string());
+            skipped_what.push_str(&format!(" {name} (trustd went away)"));
+            let how = if m.ended.is_empty() {
+                format!("it exited {} with nothing measured", m.rc)
+            } else {
+                format!("it exited {}: {}", m.rc, m.ended)
+            };
+            notes.push(format!(
+                "NOT VERIFIED: {name}: trustd went away while its check ran, and {how} — the check lost its prover, which says nothing of the code; the socket then held: {}",
+                m.trustd_lost
+            ));
+            continue;
+        }
+        // targo-trust's own COULD NOT RUN with nothing measured: its exit 3, which it documents as
+        // a run that is no measurement and failed for that alone (a solver refused admission, a
+        // row with no stable key, a clock, its backstop ending the compiler), no verdict either
+        // way. A refused path stays the lane's FAIL, with its remedy.
+        if m.rc.trim() == "3"
+            && !m.could_not_run.is_empty()
+            && m.summary.is_empty()
+            && m.path_refused.is_empty()
+        {
+            rows.push([name.into(), "NOT-VERIFIED(targo)".into(), dash(), dash()]);
+            by_targo.push(name.to_string());
+            skipped_what.push_str(&format!(" {name} (targo-trust could not run it)"));
+            notes.push(format!(
+                "NOT VERIFIED: {name}: targo-trust exited 3 with nothing measured, in its own words {} — no verdict either way, which says nothing of the code; re-run it ({})",
+                m.could_not_run,
+                measure_again(facts, &[name])
+            ));
+            continue;
+        }
         if m.transport {
             let s = format!("NOT-VERIFIED(rc={})", m.rc);
             failed.push(format!("{name} {s}"));
@@ -2665,9 +2751,9 @@ pub fn judge(
         let floor: Option<u64> = match &row {
             None => None,
             Some(r) if r.proved.is_empty() => None,
-            Some(r) => match r.proved.parse() {
-                Ok(n) => Some(n),
-                Err(_) => {
+            Some(r) => match parse_uint(&r.proved) {
+                Some(n) => Some(n),
+                None => {
                     failed.push(format!("{name} FLOOR-UNPARSED"));
                     rows.push([
                         name.into(),
@@ -2807,8 +2893,12 @@ pub fn judge(
                 _ => None,
             },
         ));
-        if let Some(f) = floor.filter(|f| proved < *f && proved.saturating_add(clock) >= *f)
-            && let Some(pace) = starved
+        // What the prover's own run-to-run spread can take from a floor it recorded itself (a
+        // floor another prover recorded compares provers, not runs).
+        let allowance = floor.filter(|_| own_floor).map_or(0, spread);
+        if let Some(f) = floor.filter(|f| {
+            proved < *f && clock > 0 && proved.saturating_add(clock).saturating_add(allowance) >= *f
+        }) && let Some(pace) = starved
         {
             rows.push([
                 name.into(),
@@ -2819,11 +2909,47 @@ pub fn judge(
             by_clock.push(name.to_string());
             clock_need.get_or_insert_with(|| pace.unstarved());
             skipped_what.push_str(&format!(" {name} (starved)"));
+            let rest = if proved.saturating_add(clock) < f {
+                format!(
+                    ", and the {} it leaves is within the {allowance} runs of one tree under this prover differ by",
+                    f - proved - clock
+                )
+            } else {
+                String::new()
+            };
             notes.push(format!(
-                "BUDGET LAPSED: {name}: {proved} proved, floor {f}; in a starved run ({}), {} — undecided; a run with {} decides it ({}); {WALL_CLOCKS}",
+                "BUDGET LAPSED: {name}: {proved} proved, floor {f}; in a starved run ({}), {}{rest} — undecided; a run with {} decides it ({}); {WALL_CLOCKS}",
                 pace.said(),
                 credit.said(),
                 pace.unstarved(),
+                measure_again(facts, &[name])
+            ));
+            continue;
+        }
+        // A run that names no obligation it lost and falls short of its own prover's floor by
+        // no more than that prover's spread cannot tell the spread from a lost proof: undecided,
+        // never a regression. It names one when a backstop stopped what its floor's run did not,
+        // or the lane cancelled more proof checks than there; where that run was not kept, no
+        // stop can be called new, so it names none.
+        if let Some(f) = floor.filter(|f| proved < *f && proved.saturating_add(allowance) >= *f)
+            && (credit.n == 0 || credit.floor_run.is_none())
+        {
+            let short = f - proved;
+            rows.push([
+                name.into(),
+                format!("NOT-VERIFIED(spread,<{f},{short})"),
+                dash(),
+                dash(),
+            ]);
+            by_spread.push(name.to_string());
+            skipped_what.push_str(&format!(" {name} (within the prover's spread)"));
+            let names = if credit.floor_run.is_some() {
+                "no backstop stop its floor's run did not have, no proof check cancelled beyond that run's count"
+            } else {
+                "what its floor's run stopped was not kept, so no stop can be called new"
+            };
+            notes.push(format!(
+                "WITHIN SPREAD: {name}: {proved} proved, floor {f}, {short} short: no more than the {allowance} ({SPREAD_PER_CENT}% of the floor) that runs of one tree under this prover differ by, and the run names no obligation it lost ({names}) — undecided; a run that meets the floor decides it ({})",
                 measure_again(facts, &[name])
             ));
             continue;
@@ -2853,6 +2979,13 @@ pub fn judge(
                 bad = true;
                 if credit.stops.saturating_add(credit.recurring) > 0 || clock > 0 {
                     notes.push(lost_note(name, proved, f, &credit, m.pace));
+                }
+                // Under a floor of 50 the allowance rounds down to 0: no spread to be beyond.
+                if own_floor && allowance > 0 && f - proved > allowance {
+                    notes.push(format!(
+                        "BEYOND SPREAD: {name}: {proved} proved against its floor of {f}, {} short: more than the {allowance} ({SPREAD_PER_CENT}% of the floor) that runs of one tree under this prover differ by",
+                        f - proved
+                    ));
                 }
                 if !own_floor {
                     notes.push(format!(
@@ -2932,8 +3065,8 @@ pub fn judge(
             Some(_) => {}
         }
         if !floor_why.is_empty() && !floor_total.is_empty() && floor_driver == driver_row {
-            match floor_total.parse::<u64>() {
-                Ok(t) if all > t => {
+            match parse_uint::<u64>(floor_total) {
+                Some(t) if all > t => {
                     if status == "open" || status == "CLEAN" {
                         status = format!("TOTAL-ABOVE-ROW(>{t})");
                     }
@@ -2952,8 +3085,8 @@ pub fn judge(
                         "HAND-LOWERED: {name}: its row sets {set}total {t}; this run measures {all} obligations{todo}"
                     ));
                 }
-                Ok(_) => {}
-                Err(_) => {
+                Some(_) => {}
+                None => {
                     status = "FLOOR-UNPARSED".into();
                     bad = true;
                     notes.push(format!(
@@ -3093,7 +3226,14 @@ pub fn judge(
         ));
     }
 
-    let unverified: Vec<String> = by_trustd.iter().chain(&by_clock).cloned().collect();
+    let unverified: Vec<String> = by_trustd
+        .iter()
+        .chain(&by_lost)
+        .chain(&by_targo)
+        .chain(&by_clock)
+        .chain(&by_spread)
+        .cloned()
+        .collect();
     let me = aterm_uds::peer::our_uid();
     let refused_notes: Vec<String> = refused_paths
         .iter()
@@ -3150,6 +3290,18 @@ pub fn judge(
                 "TRUSTD: held by this run's keeper, {n} grants — trustd went away under a live grant and came back ({sock})\n"
             )),
         }
+        let lost: Vec<&str> = facts
+            .crates
+            .iter()
+            .filter(|c| matches!(&c.decision, Decision::Gate(m) if !m.trustd_lost.is_empty()))
+            .map(|c| c.name.as_str())
+            .collect();
+        if !lost.is_empty() {
+            out.push_str(&format!(
+                "TRUSTD: went away under this run's keeper while these ran: {}\n",
+                lost.join(" ")
+            ));
+        }
     }
     for n in refused_notes.iter().chain(&mem_notes).chain(&notes) {
         out.push_str(n);
@@ -3205,10 +3357,28 @@ pub fn judge(
                     by_trustd.join(" ")
                 ));
             }
+            if !by_lost.is_empty() {
+                out.push_str(&format!(
+                    "     - trustd went away while they ran, so nothing was decided about: {} (in NEITHER total)\n",
+                    by_lost.join(" ")
+                ));
+            }
+            if !by_targo.is_empty() {
+                out.push_str(&format!(
+                    "     - targo-trust could not run them to a measurement (its exit 3), so nothing was decided about: {} (in NEITHER total)\n",
+                    by_targo.join(" ")
+                ));
+            }
             if !by_clock.is_empty() {
                 out.push_str(&format!(
                     "     - in a starved run, what the machine can be credited with (its BUDGET LAPSED note says what) could cover the shortfall, so nothing was decided about: {} (in NEITHER total)\n",
                     by_clock.join(" ")
+                ));
+            }
+            if !by_spread.is_empty() {
+                out.push_str(&format!(
+                    "     - within the prover's run-to-run spread of their floors, with no obligation named lost (each WITHIN SPREAD note), so nothing was decided about: {} (in NEITHER total)\n",
+                    by_spread.join(" ")
                 ));
             }
             out.push_str("         Re-run the whole tree, with every exclusion lifted, before quoting a whole-tree number.\n");
@@ -3231,12 +3401,38 @@ pub fn judge(
                 by_trustd.join(" ")
             ));
         }
+        if !by_lost.is_empty() {
+            said.push(format!(
+                "trustd went away while they ran, so nothing was decided about: {}; re-run them, and if targo then refuses for a DIRTY crash epoch, its log carries the recovery command (never signal a trustd)",
+                by_lost.join(" ")
+            ));
+        }
+        if !by_targo.is_empty() {
+            said.push(format!(
+                "targo-trust could not run them to a measurement (its exit 3, each NOT VERIFIED note in its words), so nothing was decided about: {}; re-run them ({})",
+                by_targo.join(" "),
+                measure_again(
+                    facts,
+                    &by_targo.iter().map(String::as_str).collect::<Vec<_>>()
+                )
+            ));
+        }
         if !by_clock.is_empty() {
             said.push(format!(
                 "in a starved run, what the machine can be credited with (each BUDGET LAPSED note says what) could cover the shortfall, so nothing was decided about: {}; a run with {} decides them ({}); while their threads wait for a core, behind the host's work or the prover's own other threads, only a prover whose clocks count CPU time does (each BUDGET LAPSED note says why)",
                 by_clock.join(" "),
                 clock_need.as_deref().unwrap_or_default(),
                 measure_again(facts, &by_clock.iter().map(String::as_str).collect::<Vec<_>>())
+            ));
+        }
+        if !by_spread.is_empty() {
+            said.push(format!(
+                "within the prover's run-to-run spread of their floors ({SPREAD_PER_CENT}%), with no obligation named lost, so nothing was decided about: {}; a run that meets its floor decides them ({})",
+                by_spread.join(" "),
+                measure_again(
+                    facts,
+                    &by_spread.iter().map(String::as_str).collect::<Vec<_>>()
+                )
             ));
         }
         (
@@ -3371,10 +3567,10 @@ pub fn floors_lowered(
     let (was_rows, now) = (rows(measured), rows(judged));
     let mut out = Vec::new();
     for r in &now {
-        if r.proved.parse::<u64>().is_err() {
+        if parse_uint::<u64>(r.proved).is_none() {
             out.push(format!("{}: floor `{}` is not a count", r.name, r.proved));
         }
-        if r.total.parse::<u64>().is_err() {
+        if parse_uint::<u64>(r.total).is_none() {
             out.push(format!("{}: total `{}` is not a count", r.name, r.total));
         }
         if gated(r.name) && !was_rows.iter().any(|w| w.name == r.name) && driver != Some(r.prover) {
@@ -3386,7 +3582,7 @@ pub fn floors_lowered(
         }
     }
     for was in &was_rows {
-        let Ok(was_n) = was.proved.parse::<u64>() else {
+        let Some(was_n) = parse_uint::<u64>(was.proved) else {
             continue;
         };
         let Some(is) = now.iter().find(|r| r.name == was.name) else {
@@ -3398,7 +3594,7 @@ pub fn floors_lowered(
             }
             continue;
         };
-        let Ok(is_n) = is.proved.parse::<u64>() else {
+        let Some(is_n) = parse_uint::<u64>(is.proved) else {
             continue;
         };
         if is.prover != was.prover {
@@ -3429,8 +3625,8 @@ pub fn floors_lowered(
             ));
             continue;
         }
-        let gone = match (was.total.parse::<u64>(), is.total.parse::<u64>()) {
-            (Ok(w), Ok(i)) => Some(w.saturating_sub(i)),
+        let gone = match (parse_uint::<u64>(was.total), parse_uint::<u64>(is.total)) {
+            (Some(w), Some(i)) => Some(w.saturating_sub(i)),
             _ => None,
         };
         if gone.is_none_or(|g| was_n - is_n > g) {
@@ -3572,9 +3768,9 @@ impl Plan {
                 "host-obs" => p.host_obs = (!v.is_empty()).then(|| v.into()),
                 "try-refused" => p.try_refused = v == "1",
                 "remeasure" => p.remeasure = v == "1",
-                "host-mem" => p.facts.host.mem = v.parse().map_err(|_| bad())?,
+                "host-mem" => p.facts.host.mem = parse_uint(v).ok_or_else(bad)?,
                 "host-mem-os" => p.facts.host.memtotal = v == "MemTotal",
-                "host-reach" => p.facts.host.reach = v.parse().map_err(|_| bad())?,
+                "host-reach" => p.facts.host.reach = parse_uint(v).ok_or_else(bad)?,
                 "driver-ceiling" => p.facts.host.uncapped = ceiling_word(v).ok_or_else(bad)?,
                 // The host's one-minute load as the run began and as it ended: provenance only.
                 "load-start" | "load-end" => {}
@@ -3728,8 +3924,8 @@ impl Plan {
         Ok((lines, refused))
     }
 
-    /// Reads each gated crate's log and its `.rc`, `.trustd`, `.budget`, `.pace` and obligation
-    /// record ([`crate::trust_oblig::RECORD_SUFFIX`]) beside it into `self.crates`.
+    /// Reads each gated crate's log and its `.rc`, `.trustd`, `.trustd-lost`, `.budget`, `.pace`
+    /// and obligation record ([`crate::trust_oblig::RECORD_SUFFIX`]) beside it into `self.crates`.
     pub fn measure(&mut self) {
         let read = |p: PathBuf| {
             fs::read_to_string(p)
@@ -3771,6 +3967,8 @@ impl Plan {
                     };
                 }
                 m.pace = Pace::parse(&read(self.logdir.join(format!("{spec}.log.pace"))));
+                m.trustd_lost =
+                    one_line(&read(self.logdir.join(format!("{spec}.log.trustd-lost"))));
                 m.backstops = fs::read_to_string(
                     self.logdir
                         .join(format!("{spec}.log{}", crate::trust_oblig::RECORD_SUFFIX)),
@@ -4120,48 +4318,49 @@ pub fn backstops_beside(ratchet: &Path) -> PathBuf {
     ratchet.with_file_name(BACKSTOPS.rsplit('/').next().unwrap_or(BACKSTOPS))
 }
 
-/// Writes the floor files a judge rewrote (each `Some` text to its path): every one beside
-/// itself first, then each moved into place, so a write that fails (a full disk) leaves them all
-/// as they were, and a new floor never stands beside the old floor's stops for want of room.
+/// Writes the floor files a judge rewrote (each `Some` text to its path): stage every write in
+/// a fresh private directory beside its target before moving any into place. A staging write
+/// that fails leaves every target as it was, and cleanup touches only the directories this
+/// pass acquired. Files are renamed individually; a later rename failure does not undo one
+/// already placed.
 ///
 /// # Errors
-/// Names the file it could not write or move; what it staged is removed.
+/// Names the file it could not stage, write or move; guards attempt to remove remaining owned
+/// scratch.
 fn write_floor_files(files: &[(&Path, Option<&str>)]) -> std::result::Result<(), String> {
-    let files: Vec<(&Path, &str, PathBuf)> = files
-        .iter()
-        .filter_map(|&(path, text)| {
-            let staged = path.with_extension(format!("tsv.{}", std::process::id()));
-            Some((path, text?, staged))
-        })
-        .collect();
-    let done = files
-        .iter()
-        .try_for_each(|(path, text, staged)| {
-            fs::write(staged, text).map_err(|e| {
-                format!(
-                    "could not write {} (for {}): {e}",
-                    staged.display(),
-                    path.display()
-                )
-            })
-        })
-        .and_then(|()| {
-            files.iter().try_for_each(|(path, _, staged)| {
-                fs::rename(staged, path).map_err(|e| {
-                    format!(
-                        "could not move {} onto {}: {e}",
-                        staged.display(),
-                        path.display()
-                    )
-                })
-            })
-        });
-    if done.is_err() {
-        for (_, _, staged) in &files {
-            let _ = fs::remove_file(staged);
-        }
+    let mut staged = Vec::new();
+    for &(path, text) in files {
+        let Some(text) = text else {
+            continue;
+        };
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix(".trust-floor-")
+            .tempdir_in(parent)
+            .map_err(|e| format!("could not stage {}: {e}", path.display()))?;
+        let file = scratch.path().join("data");
+        fs::write(&file, text).map_err(|e| {
+            format!(
+                "could not write {} (for {}): {e}",
+                file.display(),
+                path.display()
+            )
+        })?;
+        staged.push((path, scratch, file));
     }
-    done
+    for (path, _scratch, file) in staged {
+        fs::rename(&file, path).map_err(|e| {
+            format!(
+                "could not move {} onto {}: {e}",
+                file.display(),
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 /// Measures completed logs, judges facts against the ratchet, and files the resulting record.
@@ -4229,7 +4428,8 @@ pub fn conclude(
     if !verdict.memory_rows.is_empty() {
         let written = fs::read_to_string(&plan.memory)
             .map(|t| memory_rewritten(&t, &verdict.memory_rows))
-            .and_then(|t| fs::write(&plan.memory, t));
+            .map_err(|e| e.to_string())
+            .and_then(|t| write_floor_files(&[(&plan.memory, Some(&t))]));
         if written.is_err() {
             for (name, _) in &verdict.memory_rows {
                 said.push(format!(
@@ -4364,7 +4564,7 @@ pub fn file_record(store: &Path, facts: &Facts) -> std::result::Result<PathBuf, 
 /// Extracts the `commit-hash` reported by `<bin>/trustc -vV`, or `"unknown"`.
 #[must_use]
 pub fn trustc_commit(bin: &Path) -> String {
-    std::process::Command::new(bin.join("trustc"))
+    aterm_uds::spawnfd::command(bin.join("trustc"))
         .arg("-vV")
         .output()
         .ok()
@@ -4756,12 +4956,10 @@ pub fn run_cmd(repo: &Path, cmd: TrustCmd) -> i32 {
                 let mem = repo.join(MEMORY);
                 let written = fs::read_to_string(&mem)
                     .map(|t| memory_rewritten(&t, &verdict.memory_rows))
-                    .and_then(|t| fs::write(&mem, t));
+                    .map_err(|e| format!("could not write {}: {e}", mem.display()))
+                    .and_then(|t| write_floor_files(&[(&mem, Some(&t))]));
                 if let Err(e) = written {
-                    eprintln!(
-                        "aterm-release trust judge: could not write {}: {e}",
-                        mem.display()
-                    );
+                    eprintln!("aterm-release trust judge: {e}");
                     return 2;
                 }
                 println!("MEMORY RECORD: {MEMORY} kept current from the stored facts");
@@ -5136,6 +5334,147 @@ mod tests {
             None,
             "a version-5 record, which could not tell, is never read"
         );
+    }
+
+    /// TP-4: trustd ending under a check (the lane's keeper saw its grant end) leaves trustc to
+    /// die of SIGPIPE writing to it with nothing measured, which says nothing of the code: COULD
+    /// NOT RUN naming what then served the socket, and no floor moves. NEGATIVE CONTROL: the
+    /// same check with no trustd lost is the code's (`NOT-VERIFIED(rc=101)`, or
+    /// `NOT-VERIFIED(incomplete)`), and one that finished before trustd went is scored.
+    #[test]
+    fn a_check_whose_trustd_went_away_is_could_not_run_and_never_the_codes() {
+        const GONE: &str = "nothing serves /tmp/t.sock (its socket file is stale)";
+        const PIPE: &str = "cargo: trustc ended by signal 13 (SIGPIPE)";
+        let check = |rc: &str, lost: &str, transport: bool, ended: &str, summary: &str| {
+            Decision::Gate(Measured {
+                rc: rc.into(),
+                transport,
+                ended: ended.into(),
+                summary: summary.into(),
+                trustd_lost: lost.into(),
+                ..Measured::default()
+            })
+        };
+        let ratchet = format!("alpha\t3\t3\t{DRV}\nbeta\t3\t3\t{DRV}\n");
+        let judged = |d: Decision| {
+            let f = facts(vec![
+                ("alpha", d),
+                ("beta", gate("Summary: 3 proved (3 total)")),
+            ]);
+            assert_eq!(Facts::parse(&f.to_record()), Some(f.clone()));
+            judge(&f, Some(&ratchet), None, "R", "M", Update::RAISE)
+        };
+        for d in [
+            check("101", GONE, true, "", ""),
+            check("101", GONE, false, PIPE, ""),
+            check("101", GONE, false, "", ""),
+        ] {
+            let v = judged(d);
+            assert_eq!((v.word, v.exit), ("COULD-NOT-RUN", 2), "{}", v.report);
+            assert!(v.failed.is_empty(), "{:?}", v.failed);
+            assert_eq!(v.unverified, ["alpha"]);
+            assert_eq!(row_of(&v, "alpha"), "NOT-VERIFIED(trustd)");
+            let said = note(&v, "NOT VERIFIED: alpha: trustd went away");
+            assert!(said.contains(GONE) && said.contains("exited 101"), "{said}");
+            assert!(
+                v.tail.contains("trustd went away while they ran"),
+                "{}",
+                v.tail
+            );
+            assert!(
+                v.ratchet
+                    .as_deref()
+                    .is_none_or(|r| r.contains("alpha\t3\t3\t")),
+                "no floor moves: {:?}",
+                v.ratchet
+            );
+        }
+
+        let v = judged(check("101", "", true, "", ""));
+        assert_eq!(v.failed, ["alpha NOT-VERIFIED(rc=101)"]);
+        let v = judged(check("101", "", false, PIPE, ""));
+        assert_eq!(v.failed, ["alpha NOT-VERIFIED(incomplete)"]);
+        let v = judged(check("0", GONE, false, "", "Summary: 3 proved (3 total)"));
+        assert_eq!(
+            (v.word, v.exit, v.total.as_str()),
+            ("PASS", 0, "6/6"),
+            "{}",
+            v.report
+        );
+        assert!(
+            v.report
+                .contains("TRUSTD: went away under this run's keeper while these ran: alpha")
+        );
+    }
+
+    /// TP-4: targo-trust's own `COULD NOT RUN` with nothing measured, its exit 3 (a run that is
+    /// no measurement and failed for that alone, "no verdict either way"), is undecided, in its
+    /// words, and no floor moves. NEGATIVE CONTROL: the same log at targo's exit 2 (a setup
+    /// error), and a refused path at exit 3, stay the lane's FAIL; one with counts is judged by
+    /// them.
+    #[test]
+    fn targo_trusts_own_could_not_run_is_undecided_and_never_the_codes() {
+        const DEFECT: &str = "  [UNKNOWN] [transport:missing-json] missing structured Trust JSON transport (targo-trust)\n\
+                              COULD NOT RUN: verification did not run to a measurement: targo-trust found 1 transport defect(s) and reports each as a row of its own, which has no stable key, so the unit's verdicts cannot be compared, so this run has no counts\n\
+                              Stop causes: unclassified=1 — COULD NOT RUN: resource admission refused the solver, or a row carried no stable key, so this run is not a measurement\n";
+        const NO_COMPILER: &str = "targo trust: COULD NOT RUN: interrupted by SIGTERM. The run started no compiler, so it has no verdict\n";
+        let ratchet = format!("alpha\t3\t3\t{DRV}\nbeta\t3\t3\t{DRV}\n");
+        let judged = |log: &str, rc: &str| {
+            let m = Measured::of_log(log.as_bytes(), rc);
+            // A run with a refused path is never filed, so its record keeps none.
+            let filed = m.path_refused.is_empty();
+            let f = facts(vec![
+                ("alpha", Decision::Gate(m)),
+                ("beta", gate("Summary: 3 proved (3 total)")),
+            ]);
+            if filed {
+                assert_eq!(Facts::parse(&f.to_record()), Some(f.clone()));
+            }
+            judge(&f, Some(&ratchet), None, "R", "M", Update::RAISE)
+        };
+        for (log, said) in [
+            (
+                DEFECT,
+                "COULD NOT RUN: verification did not run to a measurement: targo-trust found 1",
+            ),
+            (NO_COMPILER, "COULD NOT RUN: interrupted by SIGTERM."),
+        ] {
+            let v = judged(log, "3");
+            assert_eq!((v.word, v.exit), ("COULD-NOT-RUN", 2), "{}", v.report);
+            assert!(v.failed.is_empty(), "{:?}", v.failed);
+            assert_eq!(v.unverified, ["alpha"]);
+            assert_eq!(row_of(&v, "alpha"), "NOT-VERIFIED(targo)");
+            let note = note(&v, "NOT VERIFIED: alpha: targo-trust exited 3");
+            assert!(note.contains(said), "{note}");
+            assert!(
+                v.tail
+                    .contains("targo-trust could not run them to a measurement"),
+                "{}",
+                v.tail
+            );
+            assert!(
+                v.ratchet
+                    .as_deref()
+                    .is_none_or(|r| r.contains("alpha\t3\t3\t")),
+                "no floor moves: {:?}",
+                v.ratchet
+            );
+        }
+
+        // NEGATIVE CONTROL: targo's exit 2 is its setup error, and a refused path keeps its
+        // remedy: the lane's FAIL, as before.
+        assert_eq!(judged(DEFECT, "2").failed, ["alpha NOT-VERIFIED(rc=2)"]);
+        let v = judged(REFUSED_LOG, "3");
+        assert_eq!(v.failed, ["alpha NOT-VERIFIED(rc=3)"]);
+        assert!(!v.report.contains("NOT-VERIFIED(targo)"), "{}", v.report);
+        // With counts, they decide.
+        let v = judged(
+            "Summary: 3 proved (3 total)\n\
+             Coverage: 9/9 eligible function bodies verified (complete)\n\
+             Stop causes: unclassified=1 — COULD NOT RUN: resource admission refused the solver\n",
+            "3",
+        );
+        assert_eq!((v.word, v.exit), ("PASS", 0), "{}", v.report);
     }
 
     #[test]
@@ -6197,7 +6536,12 @@ mod tests {
             "{}",
             v.report
         );
-        assert_eq!(judged(&run(310, 72), None).failed, regression);
+        // What is credited and the 7 the prover's spread takes from 383 must cover the 73.
+        assert_eq!(
+            row_of(&judged(&run(310, 66), None), "aterm-codec"),
+            "NOT-VERIFIED(clock,<383,66)"
+        );
+        assert_eq!(judged(&run(310, 65), None).failed, regression);
         assert_eq!(judged(&run(310, 0), None).failed, regression);
         let v = judged(&run(383, 91), None);
         assert_ne!(v.word, "COULD-NOT-RUN", "{}", v.report);
@@ -6410,8 +6754,10 @@ mod tests {
         );
         let v = judged(QUIET, None, Update::NONE);
         assert_eq!(
-            v.word, "FAIL",
-            "not starved, so not the clock's: {}",
+            row_of(&v, "aterm-gpu"),
+            "NOT-VERIFIED(spread,<813,1)",
+            "not starved, so not the clock's; 1 short, and with no record of the floor's run no \
+             stop is called new, so the prover's spread: {}",
             v.report
         );
 
@@ -6428,10 +6774,160 @@ mod tests {
         assert!(v.tail.contains(&STARVED.unstarved()), "{}", v.tail);
         assert_eq!((v.ratchet, v.backstops), (None, None), "no floor is raised");
 
-        // A stop every run has earns nothing, starved or not.
-        let v = judged(STARVED, Some(&kept_run("aterm-gpu", &all, 0)), Update::NONE);
-        assert_eq!(v.failed, ["aterm-gpu RATCHET-REGRESSION(<813) 812/4685"]);
+        // A stop every run has earns nothing, starved or not: beyond the prover's spread the
+        // drop is the code's.
+        let beyond = format!("aterm-gpu\t830\t4685\t{DRV}\n");
+        let f = measured_check("aterm-gpu", GPU, Some(STARVED), true);
+        let all_kept = kept_run("aterm-gpu", &all, 0);
+        let v = judge(&f, Some(&beyond), Some(&all_kept), "R", "M", Update::NONE);
+        assert_eq!(v.failed, ["aterm-gpu RATCHET-REGRESSION(<830) 812/4685"]);
         assert!(note(&v, "LOST: ").contains(&STARVED.said()), "{}", v.report);
+    }
+
+    /// TF-2: the prover is not reproducible (aterm-link 841 and 853 on one tree), so a run that
+    /// falls short of its own prover's floor by no more than [`spread`] and names no obligation
+    /// it lost is undecided, never `RATCHET-REGRESSION`, and sets no floor; beyond the spread,
+    /// or under another prover's floor, it is the code's. NEGATIVE CONTROL: the same run 1 short
+    /// with one obligation planted lost (a stop its floor's run did not have) is
+    /// `RATCHET-REGRESSION`, its `LOST` note naming it.
+    #[test]
+    fn a_shortfall_within_the_provers_spread_is_undecided_and_a_named_loss_is_not() {
+        let rec = crate::trust_oblig::Record::parse(GPU.2).unwrap();
+        let all = gated(&measured_check("aterm-gpu", GPU, None, true))
+            .backstops
+            .clone()
+            .unwrap();
+        let alike = |o: &crate::trust_oblig::Obligation| {
+            rec.rows.iter().filter(|r| r.key() == o.key()).count()
+        };
+        let lost = rec
+            .rows
+            .iter()
+            .find(|o| o.backstopped() && o.status == "timeout" && alike(o) == 1)
+            .unwrap();
+        let mut had = all.clone();
+        had.remove(had.iter().position(|b| b.key == lost.key()).unwrap());
+        let (every, planted) = (
+            kept_run("aterm-gpu", &all, 0),
+            kept_run("aterm-gpu", &had, 0),
+        );
+        let judged = |floor: u64, driver: &str, pace: Pace, run: &str, update: Update<'_>| {
+            let f = measured_check("aterm-gpu", GPU, Some(pace), true);
+            let row = format!("aterm-gpu\t{floor}\t4685\t{driver}\n");
+            judge(&f, Some(&row), Some(run), "R", "M", update)
+        };
+        assert_eq!(
+            (
+                spread(813),
+                spread(828),
+                spread(829),
+                spread(49),
+                spread(50)
+            ),
+            (16, 16, 16, 0, 1)
+        );
+
+        // 812 against 813 and against 828, 16 short: the spread, so undecided.
+        for floor in [813, 828] {
+            let v = judged(floor, DRV, QUIET, &every, Update::RAISE);
+            assert_eq!(
+                row_of(&v, "aterm-gpu"),
+                format!("NOT-VERIFIED(spread,<{floor},{})", floor - 812)
+            );
+            assert_eq!((v.word, v.exit), ("COULD-NOT-RUN", 2), "{}", v.report);
+            assert!(v.failed.is_empty(), "{:?}", v.failed);
+            assert_eq!(v.unverified, ["aterm-gpu"]);
+            let within = note(&v, "WITHIN SPREAD: ");
+            assert!(within.contains("the 16 (2% of the floor)"), "{within}");
+            assert!(
+                v.tail.contains("within the prover's run-to-run spread"),
+                "{}",
+                v.tail
+            );
+            assert_eq!(
+                (v.ratchet, v.backstops),
+                (None, None),
+                "no floor is written"
+            );
+        }
+
+        // 17 short of 829: beyond it, the code's.
+        let v = judged(829, DRV, QUIET, &every, Update::NONE);
+        assert_eq!(v.failed, ["aterm-gpu RATCHET-REGRESSION(<829) 812/4685"]);
+        assert!(
+            note(&v, "BEYOND SPREAD: ").contains("17 short"),
+            "{}",
+            v.report
+        );
+
+        // A floor under 50 has no spread: one proof short of its own prover's 4 is the code's,
+        // and no BEYOND SPREAD note claims a spread of 0 was measured.
+        let v = judge(
+            &facts(vec![("alpha", gate("Summary: 3 proved (3 total)"))]),
+            Some(&format!("alpha\t4\t3\t{DRV}\n")),
+            None,
+            "R",
+            "M",
+            Update::NONE,
+        );
+        assert_eq!(v.failed, ["alpha RATCHET-REGRESSION(<4) 3/3"]);
+        assert!(!v.report.contains("SPREAD"), "{}", v.report);
+
+        // A floor whose run was not kept (84 of the 142 floors, aterm-link's, aterm-messages' and
+        // aterm-render's among them): no stop can be called new, so the 89 name no loss, and the
+        // spread decides as for a run that named none.
+        let v = judge(
+            &measured_check("aterm-gpu", GPU, Some(QUIET), true),
+            Some(&format!("aterm-gpu\t813\t4685\t{DRV}\n")),
+            None,
+            "R",
+            "M",
+            Update::NONE,
+        );
+        assert_eq!(row_of(&v, "aterm-gpu"), "NOT-VERIFIED(spread,<813,1)");
+        assert!(
+            note(&v, "WITHIN SPREAD: ").contains("was not kept"),
+            "{}",
+            v.report
+        );
+        let v = judge(
+            &measured_check("aterm-gpu", GPU, Some(QUIET), true),
+            Some(&format!("aterm-gpu\t829\t4685\t{DRV}\n")),
+            None,
+            "R",
+            "M",
+            Update::NONE,
+        );
+        assert_eq!(v.failed, ["aterm-gpu RATCHET-REGRESSION(<829) 812/4685"]);
+
+        // Another prover's floor compares provers, not runs: no spread.
+        let v = judged(
+            813,
+            "targo 1.99.0-dev (321aaeda7 2026-10-12)",
+            QUIET,
+            &every,
+            Update::NONE,
+        );
+        assert_eq!(v.failed, ["aterm-gpu RATCHET-REGRESSION(<813) 812/4685"]);
+        assert!(!v.report.contains("WITHIN SPREAD"), "{}", v.report);
+
+        // A starved run: what it is credited with and the spread together leave it undecided,
+        // and beyond both it is the code's.
+        let v = judged(829, DRV, STARVED, &planted, Update::NONE);
+        assert_eq!(row_of(&v, "aterm-gpu"), "NOT-VERIFIED(clock,<829,1)");
+        assert!(
+            note(&v, "BUDGET LAPSED: ").contains("the 16 it leaves is within the 16"),
+            "{}",
+            v.report
+        );
+        let v = judged(830, DRV, STARVED, &planted, Update::NONE);
+        assert_eq!(v.failed, ["aterm-gpu RATCHET-REGRESSION(<830) 812/4685"]);
+
+        // NEGATIVE CONTROL: 1 short, one obligation planted lost, not starved.
+        let v = judged(813, DRV, QUIET, &planted, Update::RAISE);
+        assert_eq!(v.failed, ["aterm-gpu RATCHET-REGRESSION(<813) 812/4685"]);
+        assert!(note(&v, "LOST: ").contains(&lost.said()), "{}", v.report);
+        assert!(!v.report.contains("WITHIN SPREAD"), "{}", v.report);
     }
 
     /// A starved run sets or raises a floor only when the machine can be credited with nothing
@@ -6563,10 +7059,13 @@ mod tests {
                 Update::NONE,
             )
         };
-        let v = judged(&f, 1730 + 44, &wall);
-        assert_eq!(row_of(&v, "aterm-render"), "NOT-VERIFIED(clock,<1774,44)");
-        let v = judged(&f, 1730 + 45, &wall);
-        assert_eq!(row_of(&v, "aterm-render"), "RATCHET-REGRESSION(<1775)");
+        // What is credited, and the prover's spread of the floor, cover the shortfall.
+        let edge = |covered: u64| (covered..).find(|f| covered + spread(*f) < *f).unwrap();
+        assert_eq!(edge(1730 + 44), 1811, "1774 and the 36 of 1810");
+        let v = judged(&f, 1810, &wall);
+        assert_eq!(row_of(&v, "aterm-render"), "NOT-VERIFIED(clock,<1810,44)");
+        let v = judged(&f, 1811, &wall);
+        assert_eq!(row_of(&v, "aterm-render"), "RATCHET-REGRESSION(<1811)");
         let v = judged(&f, 1730 + 44, &stops);
         assert_eq!(
             row_of(&v, "aterm-render"),
@@ -6575,10 +7074,11 @@ mod tests {
         );
 
         let bare = measured_check("aterm-render", RENDER, Some(STARVED), false);
-        let v = judged(&bare, 1730 + 747 + 715 - 6, &wall);
-        assert_eq!(row_of(&v, "aterm-render"), "NOT-VERIFIED(clock,<3186,1456)");
-        let v = judged(&bare, 1730 + 747 + 715 - 5, &wall);
-        assert_eq!(row_of(&v, "aterm-render"), "RATCHET-REGRESSION(<3187)");
+        assert_eq!(edge(1730 + 747 + 715 - 6), 3252, "3186 and the 65 of 3251");
+        let v = judged(&bare, 3251, &wall);
+        assert_eq!(row_of(&v, "aterm-render"), "NOT-VERIFIED(clock,<3251,1456)");
+        let v = judged(&bare, 3252, &wall);
+        assert_eq!(row_of(&v, "aterm-render"), "RATCHET-REGRESSION(<3252)");
         let quiet = measured_check("aterm-render", RENDER, Some(QUIET), false);
         let v = judge(
             &quiet,
@@ -6656,6 +7156,7 @@ mod tests {
             "-",
             "1 2 3",
             "1 2 x 4",
+            "1 2 +3 4",
             "1 2 3 4 5",
             "1 2 3 4 5 x",
             "1 2 3 4 5 6 7",
@@ -6773,21 +7274,25 @@ mod tests {
         assert_eq!(Facts::parse(&f.to_record()), Some(f));
     }
 
-    /// A floor and the stops of the run that set it are written together: a write that fails
-    /// leaves both files as they were.
+    /// No target is published until every staged write succeeds; a missing parent is a real
+    /// staging failure, independent of how the writer names its scratch.
     #[test]
     fn the_floor_files_are_written_together_or_not_at_all() {
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-trust-floor-files-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        let (floors, stops) = (dir.join("floors.tsv"), dir.join("backstops.tsv"));
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let (floors, stops) = (
+            dir.path().join("floors.tsv"),
+            dir.path().join("backstops.tsv"),
+        );
         fs::write(&floors, "old floors\n").unwrap();
         fs::write(&stops, "old stops\n").unwrap();
-        let blocked = dir.join("blocked.tsv");
-        fs::create_dir_all(blocked.with_extension(format!("tsv.{}", std::process::id()))).unwrap();
+        let names = || {
+            fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<BTreeSet<_>>()
+        };
+        let before = names();
+        let blocked = dir.path().join("missing-parent/blocked.tsv");
         let err = write_floor_files(&[
             (&floors, Some("new floors\n")),
             (&blocked, Some("x\n")),
@@ -6797,17 +7302,101 @@ mod tests {
         assert!(err.contains("blocked.tsv"), "{err}");
         assert_eq!(fs::read_to_string(&floors).unwrap(), "old floors\n");
         assert_eq!(fs::read_to_string(&stops).unwrap(), "old stops\n");
+        assert_eq!(names(), before, "a failed pass leaves no scratch");
         write_floor_files(&[(&floors, Some("new floors\n")), (&stops, None)]).unwrap();
         assert_eq!(fs::read_to_string(&floors).unwrap(), "new floors\n");
         assert_eq!(fs::read_to_string(&stops).unwrap(), "old stops\n");
-        let left: Vec<_> = fs::read_dir(&dir)
+        assert_eq!(names(), before, "a successful pass leaves no scratch");
+    }
+
+    /// An existing temporary-looking name is somebody else's file or directory. A successful
+    /// update keeps its identity and bytes, even when it is linked to another payload.
+    #[cfg(unix)]
+    #[test]
+    fn floor_updates_preserve_occupied_legacy_scratch() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let ordinary = aterm_tempfile::tempdir().unwrap();
+        let floor = ordinary.path().join("memory.tsv");
+        write_floor_files(&[(&floor, Some("ordinary update\n"))]).unwrap();
+        assert_eq!(fs::read_to_string(&floor).unwrap(), "ordinary update\n");
+
+        let mut outcomes = Vec::new();
+        for kind in ["regular", "hardlink", "symlink", "directory"] {
+            let dir = aterm_tempfile::tempdir().unwrap();
+            let floor = dir.path().join("memory.tsv");
+            let occupied = floor.with_extension(format!("tsv.{}", std::process::id()));
+            let payload = dir.path().join("unrelated-payload");
+            fs::write(&floor, "old memory\n").unwrap();
+            fs::write(&payload, "keep this payload\n").unwrap();
+            match kind {
+                "regular" => fs::write(&occupied, "keep this name\n").unwrap(),
+                "hardlink" => fs::hard_link(&payload, &occupied).unwrap(),
+                "symlink" => std::os::unix::fs::symlink(&payload, &occupied).unwrap(),
+                "directory" => fs::create_dir(&occupied).unwrap(),
+                _ => unreachable!(),
+            }
+            let identity = |path: &Path| {
+                fs::symlink_metadata(path)
+                    .ok()
+                    .map(|meta| (meta.dev(), meta.ino(), meta.mode(), meta.len()))
+            };
+            let before = identity(&occupied);
+            let bytes = fs::read(&occupied).ok();
+            let link = fs::read_link(&occupied).ok();
+            let updated = write_floor_files(&[(&floor, Some("new memory\n"))]);
+            outcomes.push((
+                kind,
+                updated.is_ok(),
+                identity(&occupied) == before
+                    && fs::read(&occupied).ok() == bytes
+                    && fs::read_link(&occupied).ok() == link,
+                fs::read_to_string(&payload).unwrap() == "keep this payload\n",
+                fs::read_to_string(&floor).unwrap() == "new memory\n",
+            ));
+        }
+        assert!(
+            outcomes.iter().all(|(_, wrote, kept, payload, target)| {
+                *wrote && *kept && *payload && *target
+            }),
+            "occupied names must survive each successful update: {outcomes:?}"
+        );
+    }
+
+    /// A failed first stage never acquired a later scratch name; cleanup cannot unlink it.
+    #[test]
+    fn floor_staging_failure_preserves_an_unvisited_occupied_name() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let ordinary = dir.path().join("ordinary.tsv");
+        write_floor_files(&[(&ordinary, Some("ordinary update\n"))]).unwrap();
+        assert_eq!(fs::read_to_string(&ordinary).unwrap(), "ordinary update\n");
+        let missing = dir.path().join("missing-parent/floors.tsv");
+        let later = dir.path().join("backstops.tsv");
+        let occupied = later.with_extension(format!("tsv.{}", std::process::id()));
+        fs::write(&later, "old stops\n").unwrap();
+        fs::write(&occupied, "keep this unvisited name\n").unwrap();
+        let before: BTreeSet<_> = fs::read_dir(dir.path())
             .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.contains(".tsv.") && !n.starts_with("blocked"))
+            .map(|entry| entry.unwrap().file_name())
             .collect();
-        assert!(left.is_empty(), "nothing staged is left: {left:?}");
-        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            write_floor_files(&[
+                (&missing, Some("new floors\n")),
+                (&later, Some("new stops\n"))
+            ])
+            .is_err()
+        );
+        assert_eq!(fs::read_to_string(&later).unwrap(), "old stops\n");
+        assert_eq!(
+            fs::read_to_string(&occupied).ok().as_deref(),
+            Some("keep this unvisited name\n"),
+            "cleanup must preserve a name it never acquired"
+        );
+        let after: BTreeSet<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(after, before, "failed staging changes no other name");
     }
 
     #[test]

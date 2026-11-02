@@ -2036,7 +2036,7 @@ fn mktemp_dir(subst: &str) -> Option<String> {
             if t.contains(['$', '`', '~', '*', '?', '[']) || !t.ends_with("XXX") {
                 return None;
             }
-            match t.rsplit_once('/').filter(|_| t.starts_with('/')) {
+            match t.rsplit_once('/') {
                 Some((dir, _)) => {
                     abs_components(dir)?;
                     Some(format!("{dir}/{MKTEMP_NAME}"))

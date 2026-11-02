@@ -212,21 +212,7 @@ pub fn read_owner_command(home: &Path) -> Option<String> {
 /// Whether `argv` (`argv[0]` first) carries aterm's tap.
 #[must_use]
 pub fn carried_by(argv: &[String]) -> bool {
-    let mut it = argv.iter().skip(1);
-    while let Some(tok) = it.next() {
-        if tok == "--" {
-            return false;
-        }
-        let value = match tok.strip_prefix("--settings") {
-            Some("") => it.next().map(String::as_str),
-            Some(rest) => rest.strip_prefix('='),
-            None => None,
-        };
-        if value.is_some_and(is_ours) {
-            return true;
-        }
-    }
-    false
+    super::upgrade::carries_tap(argv)
 }
 
 /// This aterm's canonical `current_exe`.
@@ -409,7 +395,7 @@ impl Reading {
         let pid = vars
             .pid
             .as_deref()
-            .and_then(|p| p.parse::<u32>().ok())
+            .and_then(crate::parse_uint::<u32>)
             .filter(|p| *p > 0)?;
         let doc = aterm_json::from_str::<Value>(text)
             .ok()
@@ -518,21 +504,29 @@ impl Reading {
                     pct: u32::try_from(w.get("pct")?.as_u64()?)
                         .ok()
                         .filter(|p| *p <= 100)?,
-                    resets_at: w.get("resets_at")?.as_i64()?,
-                    pct_x10: w
-                        .get("pct_x10")
-                        .and_then(Value::as_u64)
-                        .and_then(|p| u32::try_from(p).ok())
-                        .filter(|p| *p <= 1000),
+                    resets_at: w.get("resets_at")?.as_i64().filter(|t| *t > 0)?,
+                    pct_x10: match w.get("pct_x10") {
+                        None | Some(Value::Null) => None,
+                        Some(v) => Some(u32::try_from(v.as_u64()?).ok().filter(|p| *p <= 1000)?),
+                    },
                 })),
             }
         };
         let cache = doc.get("cache")?;
         Some(Reading {
             at: doc.get("at")?.as_i64()?,
-            sid: doc.get("sid")?.as_str()?.to_owned(),
-            pid: u32::try_from(doc.get("pid")?.as_u64()?).ok()?,
-            session: opt_str("session")?,
+            sid: doc
+                .get("sid")?
+                .as_str()
+                .filter(|s| is_tab_id(s))?
+                .to_owned(),
+            pid: u32::try_from(doc.get("pid")?.as_u64()?)
+                .ok()
+                .filter(|p| *p > 0)?,
+            session: match doc.get("session")? {
+                Value::Null => None,
+                v => Some(word_of(Some(v), 64).filter(|s| super::upgrade::is_session_id(s))?),
+            },
             login: opt_str("login")?,
             home: opt_str("home")?,
             api_ms: doc.get("api_ms")?.as_u64()?,
@@ -540,17 +534,18 @@ impl Reading {
             seven_day: window("seven_day")?,
             warm: cache.get("warm").and_then(Value::as_bool),
             cache_expires_at: cache.get("expires_at").and_then(Value::as_i64),
-            version: opt_str("version")?,
-            model: doc
-                .get("model")
-                .and_then(Value::as_str)
-                .filter(|m| super::upgrade::is_model_id(m))
-                .map(str::to_owned),
-            ctx_left: doc
-                .get("ctx_left")
-                .and_then(Value::as_u64)
-                .and_then(|p| u8::try_from(p).ok())
-                .filter(|p| *p <= 100),
+            version: match doc.get("version")? {
+                Value::Null => None,
+                v => Some(word_of(Some(v), 32)?),
+            },
+            model: match doc.get("model") {
+                None | Some(Value::Null) => None,
+                Some(v) => Some(word_of(Some(v), 64).filter(|m| super::upgrade::is_model_id(m))?),
+            },
+            ctx_left: match doc.get("ctx_left") {
+                None | Some(Value::Null) => None,
+                Some(v) => Some(u8::try_from(v.as_u64()?).ok().filter(|p| *p <= 100)?),
+            },
             dur_us: doc.get("dur_us").and_then(Value::as_u64).unwrap_or(0),
         })
     }
@@ -829,7 +824,11 @@ pub fn chain_command(cmd: &str, payload: &[u8]) -> io::Result<aterm_uds::spawnfd
     let _ = std::fs::remove_file(&path);
     file.write_all(payload)?;
     file.seek(SeekFrom::Start(0))?;
-    let mut command = aterm_uds::spawnfd::command("/bin/sh");
+    #[cfg(test)]
+    let shell = crate::test_program::kept("/bin/sh");
+    #[cfg(not(test))]
+    let shell = "/bin/sh";
+    let mut command = aterm_uds::spawnfd::command(shell);
     command.arg("-c").arg(cmd).env(CARRIED_ENV, "1").stdin(file);
     Ok(command)
 }
@@ -857,7 +856,7 @@ pub fn sweep(dir: &Path, now: i64, alive: &dyn Fn(u32) -> bool) {
         else {
             continue;
         };
-        let Some(pid) = pid.parse::<u32>().ok().filter(|_| is_tab_id(sid)) else {
+        let Some(pid) = crate::parse_uint::<u32>(pid).filter(|_| is_tab_id(sid)) else {
             continue;
         };
         let Some(at) = file_mtime(&path) else {

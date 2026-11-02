@@ -95,10 +95,10 @@ fn alice_with(profile: Option<&str>) -> (Fake, User) {
         len: 0,
     };
     sys.stat_of(&alice.home, dir());
-    sys.stat_of("/Users/alice/aterm", dir());
+    sys.stat_of("/Users//alice/aterm", dir());
     sys.write_user_file(
         &alice,
-        Path::new("/Users/alice/aterm/Cargo.toml"),
+        Path::new("/Users//alice/aterm/Cargo.toml"),
         crate::checkout::tests::manifest(Path::new("/srv/origin.git")).as_bytes(),
         0o644,
     )
@@ -118,7 +118,7 @@ fn record_of(sys: &Fake, alice: &User, want: Option<bool>) -> Vec<ItemReport> {
         &Inputs {
             want,
             asked: false,
-            cwd: Some(Path::new("/Users/alice/aterm/crates/aterm/src")),
+            cwd: Some(Path::new("/Users//alice/aterm/crates/aterm/src")),
             targo: None,
         },
     )
@@ -153,7 +153,7 @@ fn develop_records_the_workspace_it_runs_in_and_no_develop_gives_the_file_back()
     let writes = || {
         sys.calls()
             .iter()
-            .filter(|call| call.contains("$ write /Users/alice/.config"))
+            .filter(|call| call.contains("$ write /Users//alice/.config"))
             .count()
     };
     let before = writes();
@@ -203,20 +203,20 @@ fn the_develop_layer_follows_the_record_and_never_guesses() {
         ]
     );
     let (sys, alice) = alice_with(None);
-    let refused = compose_for(&sys, &alice, Some(Path::new("/Users/alice")), Some(true))
+    let refused = compose_for(&sys, &alice, Some(Path::new("/Users//alice")), Some(true))
         .err()
         .unwrap();
     assert!(refused.contains("no aterm checkout to record"), "{refused}");
     assert!(
         sys.calls()
             .iter()
-            .all(|call| !call.contains("$ write /Users/alice/.config"))
+            .all(|call| !call.contains("$ write /Users//alice/.config"))
     );
 }
 
 /// Scripts the local git reads [`checkout::kept_here`] performs on `~/aterm`.
 pub(crate) fn script_local(sys: &Fake, alice: &User, url: &str, branch: bool, status: &str) {
-    let path = Path::new("/Users/alice/aterm");
+    let path = Path::new("/Users//alice/aterm");
     for (args, ran) in [
         (
             vec!["rev-parse", "--is-inside-work-tree"],
@@ -266,14 +266,14 @@ pub(crate) const ORIGIN: &str = "/srv/origin.git";
 
 /// `targo --unverified --locked verify provision`, run as alice in `~/aterm` with the
 /// toolset's `bin` first on `PATH`.
-const CHECK: &str = "cd /Users/alice/aterm && alice$ \
-                     PATH=/Users/alice/.atpkg/bin:/usr/bin:/bin:/usr/sbin:/sbin \
-                     /Users/alice/.atpkg/bin/targo --unverified --locked verify provision --check";
+const CHECK: &str = "cd /Users//alice/aterm && alice$ \
+                     PATH=/Users//alice/.atpkg/bin:/usr/bin:/bin:/usr/sbin:/sbin \
+                     /Users//alice/.atpkg/bin/targo --unverified --locked verify provision --check";
 
 fn tools(targo: Option<Targo>) -> WorkspaceTools {
     WorkspaceTools {
         user: user("alice", 501),
-        path: PathBuf::from("/Users/alice/aterm"),
+        path: PathBuf::from("/Users//alice/aterm"),
         spelled: "~/aterm".into(),
         targo,
         reader: Reader::Init,
@@ -281,7 +281,7 @@ fn tools(targo: Option<Targo>) -> WorkspaceTools {
 }
 
 fn found_targo() -> Targo {
-    Arc::new(|| Ok(PathBuf::from("/Users/alice/.atpkg/bin/targo")))
+    Arc::new(|| Ok(PathBuf::from("/Users//alice/.atpkg/bin/targo")))
 }
 
 /// [`WorkspaceTools`] runs the checkout's own `targo --unverified --locked verify provision` with the toolset's `bin` first on `PATH`.
@@ -325,13 +325,13 @@ fn workspace_tools_run_the_checkouts_own_verify_provision_from_inside_it() {
         .filter(|call| call.contains("targo"))
         .collect();
     assert_eq!(ran, [CHECK, provide, CHECK]);
-    let cmd = tools(Some(found_targo())).command(Path::new("/Users/alice/.atpkg/bin/targo"), true);
-    assert_eq!(cmd.cwd.as_deref(), Some(Path::new("/Users/alice/aterm")));
+    let cmd = tools(Some(found_targo())).command(Path::new("/Users//alice/.atpkg/bin/targo"), true);
+    assert_eq!(cmd.cwd.as_deref(), Some(Path::new("/Users//alice/aterm")));
     assert_eq!(
         cmd.env,
         [(
             "PATH".to_owned(),
-            "/Users/alice/.atpkg/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_owned()
+            "/Users//alice/.atpkg/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_owned()
         )]
     );
 
@@ -417,7 +417,7 @@ fn workspace_tools_run_no_code_from_a_tree_init_leaves_as_it_is_and_never_rewrit
         CHECK,
         Ran::exit(
             101,
-            "error: cannot update the lock file /Users/alice/aterm/Cargo.lock because \
+            "error: cannot update the lock file /Users//alice/aterm/Cargo.lock because \
              --locked was passed to prevent this\n",
         ),
     );
@@ -803,7 +803,7 @@ fn a_submodule_head_git_cannot_read_is_never_updated() {
         (1, "cannot run git rev-parse in vendor/astream"),
     ] {
         let (sys, alice) = alice_with(None);
-        let path = Path::new("/Users/alice/aterm");
+        let path = Path::new("/Users//alice/aterm");
         let git = checkout::git(&sys, &alice, Some(&path.join(SUBMODULE)));
         let status = ["status", "--porcelain=v1", "-z", "--untracked-files=normal"];
         sys.on(&git.clone().args(status).display(), Ran::ok(""));
@@ -1096,7 +1096,7 @@ fn no_develop_names_its_own_remedy() {
             &Inputs {
                 want,
                 asked: false,
-                cwd: Some(Path::new("/Users/alice/aterm")),
+                cwd: Some(Path::new("/Users//alice/aterm")),
                 targo: None,
             },
         )
@@ -1149,9 +1149,9 @@ fn only_names_develop_items_by_id_family_and_layer() {
 
 /// `targo --unverified --locked --offline verify provision --check`: doctor's read of the
 /// tools, run as alice in `~/aterm` with the toolset's `bin` first on `PATH`.
-const DOCTOR_CHECK: &str = "cd /Users/alice/aterm && alice$ \
-                            PATH=/Users/alice/.atpkg/bin:/usr/bin:/bin:/usr/sbin:/sbin \
-                            /Users/alice/.atpkg/bin/targo --unverified --locked --offline verify \
+const DOCTOR_CHECK: &str = "cd /Users//alice/aterm && alice$ \
+                            PATH=/Users//alice/.atpkg/bin:/usr/bin:/bin:/usr/sbin:/sbin \
+                            /Users//alice/.atpkg/bin/targo --unverified --locked --offline verify \
                             provision --check";
 
 /// The runs among `calls` that reach past this Mac, or run a checkout's code other than
@@ -1193,7 +1193,7 @@ fn reaches(calls: &[String]) -> Vec<String> {
 /// last fetched (`main`, at `tip`), and a submodule at the commit the tree records with
 /// `submodule.recurse` true.
 fn script_fetched(sys: &Fake, alice: &User, tip: &str) {
-    let path = Path::new("/Users/alice/aterm");
+    let path = Path::new("/Users//alice/aterm");
     for (args, ran) in [
         (
             vec!["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
@@ -1818,7 +1818,7 @@ fn doctor_reads_an_offline_refusal_of_the_checkout_s_lock_as_blocked() {
 /// keeps [`LONG_BUDGET`], and its read of a run that gave no answer is unusable, as before.
 #[test]
 fn doctor_stops_waiting_for_a_checkout_s_tools_after_its_budget() {
-    let targo = Path::new("/Users/alice/.atpkg/bin/targo");
+    let targo = Path::new("/Users//alice/.atpkg/bin/targo");
     assert_eq!(
         doctor_tools(Some(found_targo()))
             .command(targo, true)

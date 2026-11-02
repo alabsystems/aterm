@@ -19,6 +19,8 @@ const PLUTIL: &str = aterm_uds::os_path!("plutil");
 const OSASCRIPT: &str = aterm_uds::os_path!("osascript");
 const OPEN: &str = aterm_uds::os_path!("open");
 
+type AccountItem = (Setting, Box<dyn Item>);
+
 #[derive(Clone, Copy)]
 enum Service {
     Messages,
@@ -91,6 +93,24 @@ const AUTOMATION_OFF: &str = "macOS Automation permission to control System Even
                               switch it on in System Settings \u{25b8} Privacy & Security \
                               \u{25b8} Automation, then run `aterm init --sign-out`";
 
+/// Why a sign-out waits when nobody is at this Mac as its clicks are to start: the words end as
+/// the Accounts stage's do while it is parked for want of a person, which System State reads to
+/// look for their return ([`aterm_types::macos_setup::StageRow::WAITS_FOR_A_PERSON`]).
+pub(crate) fn away() -> String {
+    format!(
+        "nobody is at this Mac now; signing out {}",
+        aterm_types::macos_setup::StageRow::WAITS_FOR_A_PERSON
+    )
+}
+
+/// Whether `row` is a sign-out that found nobody at this Mac right before its clicks
+/// ([`System::person_present`]): it clicked nothing, and waits for a person.
+#[must_use]
+pub fn found_nobody(row: &crate::model::ItemReport) -> bool {
+    signs_out(&row.id)
+        && matches!(&row.stood_aside, Some(aterm_converge::StoodAside::Waiting(why)) if *why == away())
+}
+
 /// The one Apple event that asks macOS's Automation question for System Events before any app
 /// opens. It has to reach System Events: AppleScript answers an application's `name`, `id`,
 /// `version` and `running` itself, sending nothing, so asking for one of those asks macOS
@@ -124,12 +144,34 @@ pub fn items(ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
     selected_items(ctx, Selection::all())
 }
 
+/// What every sign-out's id holds between its service and its user ([`signs_out`]).
+const SIGNED_OUT: &str = ".signed-out@";
+
+/// Whether the item `id` is one of the Messages and FaceTime sign-outs.
+#[must_use]
+pub fn signs_out(id: &str) -> bool {
+    id.starts_with("init.") && id.contains(SIGNED_OUT)
+}
+
 /// Build only the selected account operations.
 ///
 /// # Errors
 /// A selected user has no absolute home directory.
 pub fn selected_items(ctx: &Ctx, selected: Selection) -> Result<Vec<Box<dyn Item>>, String> {
-    let mut items: Vec<Box<dyn Item>> = Vec::new();
+    Ok(selected_tagged_items(ctx, selected)?
+        .into_iter()
+        .map(|(_, item)| item)
+        .collect())
+}
+
+/// [`selected_items`], each sign-out with the setting whose System State row it reports to,
+/// tagged as it is built. One call builds every sign-out of a pass: they share its one
+/// Accessibility request.
+///
+/// # Errors
+/// A selected user has no absolute home directory.
+pub fn selected_tagged_items(ctx: &Ctx, selected: Selection) -> Result<Vec<AccountItem>, String> {
+    let mut items: Vec<AccountItem> = Vec::new();
     let consent = std::sync::Arc::new(Consent::default());
     for user in &ctx.users {
         if !Path::new(&user.home).is_absolute() {
@@ -142,13 +184,16 @@ pub fn selected_items(ctx: &Ctx, selected: Selection) -> Result<Vec<Box<dyn Item
             if !selected.contains(setting) {
                 continue;
             }
-            items.push(Box::new(SignOut {
-                service,
-                user: user.clone(),
-                blocked: Mutex::new(None),
-                reading: crate::init_observe::LastReading::default(),
-                consent: std::sync::Arc::clone(&consent),
-            }));
+            items.push((
+                setting,
+                Box::new(SignOut {
+                    service,
+                    user: user.clone(),
+                    blocked: Mutex::new(None),
+                    reading: crate::init_observe::LastReading::default(),
+                    consent: std::sync::Arc::clone(&consent),
+                }),
+            ));
         }
     }
     Ok(items)
@@ -156,7 +201,7 @@ pub fn selected_items(ctx: &Ctx, selected: Selection) -> Result<Vec<Box<dyn Item
 
 impl Item for SignOut {
     fn id(&self) -> String {
-        format!("init.{}.signed-out@{}", self.service.id(), self.user.name)
+        format!("init.{}{SIGNED_OUT}{}", self.service.id(), self.user.name)
     }
 
     fn family(&self) -> &'static str {
@@ -219,9 +264,26 @@ impl Item for SignOut {
             signout_cmd(&self.user, self.service, &labels),
             Some(deadline),
         )?;
-        let ran = sys
-            .run_complete_stdout(&command)
-            .map_err(|_| format!("{} sign-out could not run", self.service.name()))?;
+        // A person stage (init-on-by-default design §6.4): presence is read fresh right before
+        // this sign-out's clicks, each sign-out its own, since the stage's own reading came
+        // before the other sign-out's minute of clicks. The clicks are not repeated safely, so
+        // they hold the update boundary (§6.7); a wait there for an update's handoff, up to
+        // minutes, reads presence again before they start.
+        if !sys.person_present() {
+            self.stand(Some(aterm_converge::StoodAside::Waiting(away())));
+            return Ok(());
+        }
+        let ran = {
+            let Ok(_boundary) = sys.update_boundary().hold(
+                aterm_types::update_boundary::GuardedItem::SignOutSequence,
+                || sys.person_present().then_some(()).ok_or(()),
+            ) else {
+                self.stand(Some(aterm_converge::StoodAside::Waiting(away())));
+                return Ok(());
+            };
+            sys.run_complete_stdout(&command)
+        }
+        .map_err(|_| format!("{} sign-out could not run", self.service.name()))?;
         match ran.out().trim() {
             "permission-blocked" if ran.success() => {
                 self.stand(Some(aterm_converge::StoodAside::Permission(
@@ -435,7 +497,7 @@ impl SignOut {
     /// Whether the account deregistered within `patience`, read every [`POLL`] in this process;
     /// a stop ends the wait.
     fn deregistered(&self, sys: &dyn System, patience: Duration) -> Result<bool, String> {
-        let deadline = Instant::now() + patience;
+        let deadline = crate::port::deadline_after(patience);
         for tick in 0..=ticks(patience) {
             // Each reading keeps its own budget; the wait ends at its deadline or its last
             // poll, whichever comes first, never in the middle of a reading.
@@ -1065,6 +1127,160 @@ mod tests {
             .as_user(&item.user);
         sys.refuse_complete_stdout(&gzip.display(), "record exceeded limit");
         assert!(matches!(item.probe(&sys, &ctx), Probe::Unusable { .. }));
+    }
+
+    /// The sign-out clicks are not repeated safely, so they hold the update boundary while
+    /// they run (init-on-by-default design §6.7): an update's handoff waits for them, boundedly.
+    /// Before, nothing held the guard, and a handoff could cut the clicks in half.
+    #[test]
+    fn the_sign_out_clicks_hold_the_update_boundary() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (sys, ctx, item) = fixture();
+        sys.trusts(&[true]);
+        clicks(&sys, &item, "sign-out-requested");
+        signed_in_for(&sys, &item, 1);
+        let labels = Labels {
+            panes: vec!["iMessage".into()],
+            sign_out: vec!["Sign Out".into()],
+        };
+        let clicking = signout_cmd(&item.user, item.service, &labels).display();
+        let held = std::sync::Arc::new(AtomicBool::new(false));
+        let seen = std::sync::Arc::clone(&held);
+        sys.simulate(move |sys, cmd| {
+            if cmd.display() == clicking {
+                seen.store(
+                    sys.boundary
+                        .is_held(aterm_types::update_boundary::GuardedItem::SignOutSequence),
+                    Ordering::SeqCst,
+                );
+            }
+            None
+        });
+        item.apply(&sys, &ctx).expect("signed out");
+        assert!(
+            held.load(Ordering::SeqCst),
+            "the clicks ran under the guard: {:?}",
+            sys.calls()
+        );
+    }
+
+    /// The clicks of a sign-out ready to click (Accessibility on, Automation answered, the
+    /// labels read), as [`signout_cmd`] runs them.
+    fn clicking(item: &SignOut) -> String {
+        let labels = Labels {
+            panes: vec!["iMessage".into()],
+            sign_out: vec!["Sign Out".into()],
+        };
+        signout_cmd(&item.user, item.service, &labels).display()
+    }
+
+    /// Run `item`'s apply on a worker while an update's handoff is pending on this thread, and
+    /// once the clicks wait for it, call `meanwhile` (minutes passing) and refuse the handoff.
+    fn apply_behind_a_handoff(
+        sys: &Fake,
+        ctx: &Ctx,
+        item: &SignOut,
+        meanwhile: impl FnOnce(),
+    ) -> Result<(), String> {
+        let latch = sys.boundary.latch_handoff(Duration::from_secs(60));
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| item.apply(sys, ctx));
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while sys.boundary.waiting() == 0 {
+                assert!(Instant::now() < deadline, "the sign-out never waited");
+                std::thread::yield_now();
+            }
+            assert_eq!(
+                count(sys, &clicking(item)),
+                0,
+                "nothing clicks while the handoff is pending"
+            );
+            meanwhile();
+            drop(latch);
+            worker.join().unwrap()
+        })
+    }
+
+    /// A sign-out is a person stage (init-on-by-default design §6.4): its clicks wait for a
+    /// pending update handoff (§6.7), up to minutes, and once that handoff is refused it reads
+    /// presence again before it clicks. The person walked away meanwhile: nothing is clicked,
+    /// and the sign-out stands aside, calmly, in the words the page looks for the person's
+    /// return by. Before, it clicked at once on the presence its stage read before the wait.
+    #[test]
+    fn a_sign_out_that_waited_for_a_handoff_reads_presence_again_before_it_clicks() {
+        use std::sync::atomic::Ordering;
+        let (sys, ctx, item) = fixture();
+        sys.trusts(&[true]);
+        clicks(&sys, &item, "sign-out-requested");
+        signed_in_for(&sys, &item, 1);
+        apply_behind_a_handoff(&sys, &ctx, &item, || {
+            sys.away.store(true, Ordering::SeqCst);
+        })
+        .expect("standing aside is no failure");
+        assert_eq!(
+            count(&sys, &clicking(&item)),
+            0,
+            "the sign-out clicked with nobody at this Mac after waiting for the handoff: {:?}",
+            sys.calls()
+        );
+        let Some(aterm_converge::StoodAside::Waiting(why)) = item.stood_aside() else {
+            panic!("{:?}", item.stood_aside());
+        };
+        assert!(
+            why.ends_with(aterm_types::macos_setup::StageRow::WAITS_FOR_A_PERSON),
+            "{why}"
+        );
+        assert_eq!(sys.boundary.any_held(), None, "it took no guard");
+        // CONTROL: the person stays, and the clicks go once the handoff is refused.
+        let (sys, ctx, item) = fixture();
+        sys.trusts(&[true]);
+        clicks(&sys, &item, "sign-out-requested");
+        signed_in_for(&sys, &item, 1);
+        apply_behind_a_handoff(&sys, &ctx, &item, || {}).expect("signed out");
+        assert_eq!(count(&sys, &clicking(&item)), 1, "{:?}", sys.calls());
+        assert_eq!(item.stood_aside(), None);
+    }
+
+    /// Each sign-out reads presence itself, right before its own clicks, Messages and FaceTime
+    /// alike: the person who was there for Messages' minute of clicks and walked away before
+    /// FaceTime's gets no FaceTime clicks. Before, the Accounts stage read presence once for
+    /// both.
+    #[test]
+    fn each_sign_out_reads_presence_right_before_its_own_clicks() {
+        use std::sync::atomic::Ordering;
+        let (sys, ctx, messages) = fixture();
+        let facetime = SignOut {
+            service: Service::FaceTime,
+            user: messages.user.clone(),
+            blocked: Mutex::new(None),
+            reading: crate::init_observe::LastReading::default(),
+            consent: std::sync::Arc::clone(&messages.consent),
+        };
+        sys.trusts(&[true]);
+        clicks(&sys, &messages, "sign-out-requested");
+        clicks(&sys, &facetime, "sign-out-requested");
+        signed_in_for(&sys, &messages, 1);
+        messages.apply(&sys, &ctx).expect("Messages signed out");
+        assert_eq!(count(&sys, &clicking(&messages)), 1, "{:?}", sys.calls());
+        // The person walks away during Messages' clicks.
+        sys.away.store(true, Ordering::SeqCst);
+        facetime
+            .apply(&sys, &ctx)
+            .expect("standing aside is no failure");
+        assert_eq!(
+            count(&sys, &clicking(&facetime)),
+            0,
+            "FaceTime clicked with nobody at this Mac: {:?}",
+            sys.calls()
+        );
+        assert!(
+            matches!(
+                facetime.stood_aside(),
+                Some(aterm_converge::StoodAside::Waiting(why)) if why == away()
+            ),
+            "{:?}",
+            facetime.stood_aside()
+        );
     }
 
     /// Away from a terminal (System State, which asks for Accessibility itself) a sign-out

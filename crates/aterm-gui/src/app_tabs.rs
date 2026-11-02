@@ -926,7 +926,7 @@ impl App {
         self.open_system_state_tab_in_window(wid)
     }
 
-    /// The System State tab for a review that must not take the person's tab (design §6): one
+    /// The System State tab for an offer that must not take the person's tab (design §6): one
     /// that is open stays where it is, and one opened now goes behind the tab the frontmost
     /// window shows, or the first window's when none is in front. Whether a System State tab is
     /// open.
@@ -1033,7 +1033,10 @@ impl App {
         &mut self,
         wid: WindowId,
     ) -> Result<(crate::tab_model::TabId, crate::tab_model::ViewId), NativeTabInstallError> {
-        let state = crate::native_app::AppViewState::SystemState(Box::default());
+        let open = self.system_state_host.fixture_line();
+        let state = crate::native_app::AppViewState::SystemState(Box::new(
+            crate::system_state::SystemStateViewState::with_line_open(open),
+        ));
         let presentation = crate::tab_model::TabPresentation {
             title: "System State".into(),
             icon: Some(crate::tab_model::TabIconKind::Settings),
@@ -1483,7 +1486,44 @@ impl App {
             ws.tab_set
                 .tabs()
                 .iter()
-                .map(|tab| crate::tab_bar::TabStripMetadata::from_presentation(&tab.presentation))
+                .map(|tab| {
+                    let mut metadata =
+                        crate::tab_bar::TabStripMetadata::from_presentation(&tab.presentation);
+                    if metadata.icon.is_none()
+                        && self
+                            .view_store
+                            .get(tab.focus)
+                            .copied()
+                            .and_then(crate::tab_model::View::terminal_session)
+                            .is_some_and(|session| {
+                                self.pool.get(session).is_some_and(|slot| {
+                                    use aterm_phase::Program;
+                                    match slot
+                                        .ctx
+                                        .timeline
+                                        .lock()
+                                        .unwrap_or_else(|p| p.into_inner())
+                                        .agent()
+                                        .reader
+                                    {
+                                        Some(Program::Codex) => true,
+                                        Some(
+                                            Program::Claude
+                                            | Program::Agy
+                                            | Program::Muse
+                                            | Program::Grok
+                                            | Program::Kimi
+                                            | Program::Generic,
+                                        )
+                                        | None => false,
+                                    }
+                                })
+                            })
+                    {
+                        metadata.icon = Some(crate::tab_model::TabIconKind::Codex);
+                    }
+                    metadata
+                })
                 .collect()
         });
         self.stamp_presence_chips(wid, &mut metadata);
@@ -2134,7 +2174,7 @@ impl App {
             layouts,
             crate::tab_model::TabSet::new(stable_tab),
         );
-        self.windows.insert(wid_b, Box::new(ws_b));
+        self.insert_unattached_window(wid_b, ws_b);
         self.frontmost_window = Some(wid_b);
         self.sync_window(wid_a);
         self.sync_active_session();
@@ -2330,7 +2370,7 @@ impl App {
             vec![layout],
             crate::tab_model::TabSet::new(tab),
         );
-        self.windows.insert(wid_b, Box::new(ws_b));
+        self.insert_unattached_window(wid_b, ws_b);
         self.install_window_config_assets(wid_b);
         self.frontmost_window = Some(wid_b);
         self.sync_active_session();
@@ -2662,8 +2702,9 @@ impl App {
         let landed = self.chip_face_landed(h.local_id);
         let hold = self.shown_hold(h.local_id);
         let stop = self.shown_stop(h.local_id);
-        let held_tip =
-            hold.and_then(|hold| hold.words(None, crate::harness_glass::HoldForm::Tip, None, stop));
+        let held_tip = hold
+            .as_ref()
+            .and_then(|hold| hold.words(None, crate::harness_glass::HoldForm::Tip, None, stop));
         let stop_tip = stop.map(|stop| stop.words(crate::harness_glass::HoldForm::Tip));
         let landing_tip = match (stop_tip, held_tip) {
             (Some(stop), Some(held)) => {
@@ -2671,9 +2712,14 @@ impl App {
             }
             (stop, held) => stop.or(held),
         };
-        let need_alone = hold.is_some_and(|hold| hold.hold.need_alone());
-        let (verdict, agent, program, task, told) = {
+        let need_alone = hold.as_ref().is_some_and(|hold| hold.hold.need_alone());
+        let (verdict, agent, program, task, told, receipt) = {
             let tl = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+            // What aterm checked at the landing (§14.9, slice 9c), beside a landed face only.
+            let receipt = tl
+                .task_face()
+                .filter(|(face, _)| *face == aterm_agent::harness::acts::TaskFace::Landed)
+                .and_then(|_| tl.land_receipt().cloned());
             (
                 tl.need().clone(),
                 tl.agent().word,
@@ -2693,6 +2739,7 @@ impl App {
                     seen: false,
                 }),
                 glass_end.and_then(|end| tl.task_face_at(end.face.task_face())),
+                receipt,
             )
         };
         let task = task.map(|mut t| {
@@ -2723,6 +2770,7 @@ impl App {
             landed,
             landing: hold.is_some(),
             landing_tip,
+            receipt,
             need_alone,
             place: None,
         }
@@ -3159,8 +3207,6 @@ impl App {
             .into_iter()
             .map(|entry| (entry.id.raw(), entry.title))
             .collect();
-        glance.alerts = self.config.desktop_alerts_or_default();
-        glance.voice = crate::notify::own_voice();
         glance.system_state = self.system_state_menu_line();
         glance
     }
@@ -3219,26 +3265,7 @@ impl App {
             self.status_fingerprint = Some(fp);
             crate::sibling_scan::request_scan(proxy.clone());
             self.start_fleet_glance();
-            #[cfg(target_os = "macos")]
-            self.prime_notices();
         }
-    }
-
-    /// The first window's launch asks macOS, where it was never asked, to let aterm post
-    /// quietly (no dialog, Notification Center only, and aterm posts nothing on it), so turning
-    /// Notify Me on later is the only dialog; then the status item learns whose voice notices
-    /// have.
-    #[cfg(target_os = "macos")]
-    pub(crate) fn prime_notices(&self) {
-        let proxy = self.proxy.clone();
-        let center = self.notice_center;
-        center.prime(Box::new(move || {
-            if let Some(proxy) = proxy {
-                crate::notify::learn_voice(center, move || {
-                    let _ = proxy.send_event(crate::Wake::NoticeVoice);
-                });
-            }
-        }));
     }
 
     /// The drawn glance a click's `pick` was painted from — the one the menu's last open was painted from ([`Self::note_status_painted`]), else one of the last two handed over — or `None`.
@@ -3265,16 +3292,6 @@ impl App {
         if let Some(glance) = painted {
             self.status_painted = Some(glance);
         }
-    }
-
-    #[cfg(target_os = "macos")]
-    fn learn_notice_voice(&self) {
-        let Some(proxy) = self.proxy.clone() else {
-            return;
-        };
-        crate::notify::learn_voice(self.notice_center, move || {
-            let _ = proxy.send_event(crate::Wake::NoticeVoice);
-        });
     }
 
     /// The owner went to session `session` from the menu bar or a notice.
@@ -3371,40 +3388,6 @@ impl App {
         }
     }
 
-    #[cfg(target_os = "macos")]
-    fn toggle_desktop_alerts(&mut self) {
-        let desired = !self.config.desktop_alerts_or_default();
-        self.config.desktop_alerts = Some(desired);
-        self.apply_desktop_alerts(desired);
-        if desired {
-            let proxy = self.proxy.clone();
-            let center = self.notice_center;
-            center.ask(Box::new(move || {
-                if let Some(proxy) = proxy {
-                    crate::notify::learn_voice(center, move || {
-                        let _ = proxy.send_event(crate::Wake::NoticeVoice);
-                    });
-                }
-            }));
-        }
-        let (reply, answer) = std::sync::mpsc::channel();
-        self.queue_control_settings_field(
-            crate::prefs::EDIT_DESKTOP_ALERTS.to_string(),
-            Some(desired.to_string()),
-            reply,
-        );
-        let _ = std::thread::Builder::new()
-            .name("aterm-status-notify-save".to_string())
-            .spawn(move || {
-                if let Ok(Err(why)) = answer.recv_timeout(std::time::Duration::from_secs(60)) {
-                    aterm_log::warn!(
-                        "status item: desktop_alerts = {desired} was not saved: {why}"
-                    );
-                }
-            });
-        self.mark_status_dirty();
-    }
-
     /// Read Result: a finished worker's result as a Markdown document tab on the front window, raised ([`Self::raise_window`]), which marks its done seen, and the captured supervised agent's task end with it ([`Self::see_session_end`]).
     #[cfg(any(target_os = "macos", test))]
     pub(crate) fn read_status_result(&mut self, result: &crate::status_item::ResultRef) {
@@ -3454,7 +3437,7 @@ impl App {
     #[cfg(target_os = "macos")]
     pub(crate) fn on_status_menu_opening(&mut self, painted: Option<crate::status_item::Glance>) {
         self.note_status_painted(painted);
-        self.learn_notice_voice();
+        self.notice_center.adopt_clicks();
         if let Some(proxy) = self.proxy.clone() {
             crate::sibling_scan::request_scan(proxy);
         }
@@ -3536,7 +3519,6 @@ impl App {
                     crate::app_take_over::CliVerb::ReadThisMac,
                 ));
             }
-            StatusAction::ToggleNotify => self.toggle_desktop_alerts(),
             StatusAction::HandBackAll => self.hand_back_all(),
             StatusAction::DismissExceptions => {
                 let _ = self.dismiss_exceptions();
@@ -6514,6 +6496,9 @@ impl App {
             drop(freed);
         }
         drop(held);
+        // The exit edge pulls one reading, so the leftover pass keeps the closed tab's horizon
+        // from the reading at its close (leftover §5.3).
+        self.vitals.note_tab_closed();
         self.forget_harness_glass(id);
         self.autopilot_timers.forget(id);
         self.claude_facts.remove(&id);
@@ -6566,6 +6551,16 @@ mod system_state_runtime_tests {
         use crate::native_ui::{SemanticValue, UiKey};
         assert!(app.open_system_state_tab_in_window(wid));
         let (_, view) = app.active_native_view(wid).unwrap();
+        // A new view opens no line by itself: the person opens the Secrets line to see them.
+        app.dispatch_native_view_event(
+            wid,
+            view,
+            crate::native_app::AppEvent::Action(crate::native_app::ActionInvocation {
+                id: crate::native_ui::ActionId::new("system-state/line/secrets/disclose"),
+                value: None,
+            }),
+        )
+        .unwrap();
         assert!(app.commit_glassless_native_frame(wid));
         let ui = &app.windows[&wid].leaf_render_cache[&view]
             .native
@@ -6628,7 +6623,7 @@ mod system_state_runtime_tests {
     }
 
     #[test]
-    fn system_state_second_window_close_preserves_review_until_its_final_view_closes() {
+    fn system_state_second_window_close_keeps_the_offer_until_its_final_view_lets_it_go() {
         use crate::native_app::CloseScope;
         use crate::workstation_setup::{Request, WorkstationSetupDecision};
         use aterm_types::macos_setup::Plan;
@@ -6659,8 +6654,8 @@ mod system_state_runtime_tests {
             assert!(receive.try_recv().is_err());
             assert_review(&mut app, first_window);
             assert!(app.structural_invariants_ok());
-            // Closing never cancels setup (design §3.3): the review is closed
-            // for this launch either way, and the next launch offers it again.
+            // Closing never answers (init-on-by-default design §6.1): the offer is let go
+            // either way, as one no window showed, so the worker makes it again.
             if window_close {
                 assert!(
                     app.prepare_window_native_shutdown(first_window, CloseScope::Window)
@@ -6672,7 +6667,7 @@ mod system_state_runtime_tests {
             }
             assert_eq!(
                 receive.try_recv().unwrap().decision,
-                WorkstationSetupDecision::Closed
+                WorkstationSetupDecision::Unavailable
             );
             assert!(!request.pending());
             assert!(app.native_runtime.app(instance).is_none());
@@ -9895,6 +9890,33 @@ mod status_glance_tests {
         app.publish_need(session);
     }
 
+    #[test]
+    fn a_codex_terminal_keeps_its_program_icon_while_busy() {
+        let app = App::headless_for_test();
+        let ctx = app.pool.get(0).expect("session 0").ctx.clone();
+        for program in [Some(aterm_phase::Program::Codex), None] {
+            {
+                let mut timeline = ctx.timeline.lock().unwrap();
+                timeline.note_foreground_group(4242);
+                timeline.set_program(4242, Some("codex".into()));
+                timeline.publish_agent(
+                    "unknown",
+                    None,
+                    None,
+                    program,
+                    crate::session_timeline::AgentStamp {
+                        generation: crate::control::ScreenGen { epoch: 1, seq: 1 },
+                        fp: 1,
+                    },
+                );
+            }
+            assert_eq!(
+                app.tab_strip_metadata(WindowId(0))[0].icon,
+                program.map(|_| crate::tab_model::TabIconKind::Codex)
+            );
+        }
+    }
+
     /// A CODEX TAB AT REST RESTS ON THE GLANCE, AND ONE AT A BOX NEEDS YOU: where its reader
     /// names no state (`agent=unknown`), the glance buckets the tab by the survey's word for the
     /// program's own shown report (`program_state::survey_word`), so an `idle`, `done` or
@@ -10055,23 +10077,6 @@ mod status_glance_tests {
     }
 
     #[test]
-    fn typed_meta_drives_the_headless_glance() {
-        let mut app = App::headless_for_test();
-        let g = app.status_glance();
-        assert!(g.needs.is_empty());
-        assert_eq!(g.button_title(), "\u{276f}");
-        set_meta(&mut app, 0, "role", "operator");
-        assert!(app.status_glance().needs.is_empty(), "a role is a label");
-        set_meta(&mut app, 0, "attention", "wedged on CI");
-        let g = app.status_glance();
-        assert_eq!(g.local_need_sessions(), vec![0]);
-        assert_eq!(g.button_title(), "\u{276f}1");
-        assert_eq!(g.needs[0].label, "operator", "the role labels the tab");
-        let line = app.status_item_chrome_line();
-        assert!(line.contains(" needs=1 stuck=0 "), "{line}");
-    }
-
-    #[test]
     fn chrome_reads_the_status_menu_as_its_builder_composes_it() {
         let mut app = App::headless_for_test();
         let needs = |app: &App| {
@@ -10089,7 +10094,7 @@ mod status_glance_tests {
         let now = aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(0));
         let lines = app.status_item_chrome_lines_at(now);
         assert!(
-            lines[0].starts_with("statusitem title=\u{276f}1 "),
+            lines[0].starts_with("statusitem title=\u{276f} "),
             "{lines:#?}"
         );
         assert_eq!(
@@ -10100,12 +10105,6 @@ mod status_glance_tests {
             )[..],
         );
         assert!(needs(&app), "{lines:#?}");
-        assert!(
-            lines.iter().any(|line| line.starts_with(
-                "statusmenu \"Notify Me When I\u{2019}m Needed\" enabled=yes checked=no "
-            )),
-            "{lines:#?}"
-        );
         assert_eq!(
             (
                 app.status_gen,
@@ -10254,35 +10253,6 @@ mod status_glance_tests {
                 "the next open's paint replaces it"
             );
         }
-    }
-
-    #[test]
-    fn a_done_stands_until_its_tab_is_looked_at() {
-        let mut app = App::headless_for_test();
-        app.push_stub_tab(WindowId(0), crate::stub_session(1));
-        let ctx = app.pool.get(1).expect("pooled").ctx.clone();
-        let mark = |app: &mut App, state| {
-            let mark = crate::task_record::TaskMark::new(state);
-            crate::task_record::mark_session_task(&ctx, 1, &mark).expect("marked");
-            app.on_task_changed(1);
-        };
-        mark(&mut app, crate::task_record::TaskState::Working);
-        mark(&mut app, crate::task_record::TaskState::Done);
-        app.note_done_seen_looking();
-        assert_eq!(app.status_glance().done.len(), 1, "nobody looked");
-        assert_eq!(app.status_glance().button_title(), "\u{276f}\u{2022}");
-        let ws = app.windows.get_mut(&WindowId(0)).expect("window 0");
-        ws.band_on_screen_for_test = true;
-        app.note_done_seen_looking();
-        assert!(app.status_glance().done.is_empty(), "looked at");
-        app.windows
-            .get_mut(&WindowId(0))
-            .expect("window 0")
-            .occluded = true;
-        mark(&mut app, crate::task_record::TaskState::Working);
-        mark(&mut app, crate::task_record::TaskState::Done);
-        app.note_done_seen_looking();
-        assert_eq!(app.status_glance().done.len(), 1, "a later done is new");
     }
 
     #[cfg(unix)]
@@ -10754,28 +10724,6 @@ mod status_glance_tests {
         app.go_to_session(clicked.expect("the notice named session 0"));
         assert_eq!(state(&app), (0, Some(0)), "its tab, and its pane");
         assert_eq!(take_raised_windows(), vec![wid], "its window raised");
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn only_turning_notify_me_on_asks_macos() {
-        use crate::notice_center::{take_asks, take_primes};
-        use crate::status_item::StatusAction;
-        let mut app = App::headless_for_test();
-        assert!(!app.config.desktop_alerts_or_default(), "off by default");
-        let _ = take_asks();
-        app.prime_notices();
-        assert_eq!(
-            (take_primes(), take_asks()),
-            (1, 0),
-            "the launch asks quietly, never the dialog"
-        );
-        app.dispatch_status_action(StatusAction::ToggleNotify);
-        assert!(app.config.desktop_alerts_or_default(), "on");
-        assert_eq!(take_asks(), 1, "turning it on asks");
-        app.dispatch_status_action(StatusAction::ToggleNotify);
-        assert!(!app.config.desktop_alerts_or_default(), "off");
-        assert_eq!(take_asks(), 0, "turning it off asks nothing");
     }
 
     #[test]

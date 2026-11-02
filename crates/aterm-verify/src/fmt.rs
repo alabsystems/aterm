@@ -469,11 +469,7 @@ impl Editions {
             .ancestors()
             .find_map(|d| {
                 let text = std::fs::read_to_string(self.root.join(d).join("Cargo.toml")).ok()?;
-                let line = text
-                    .lines()
-                    .map(str::trim)
-                    .find(|l| l.starts_with("edition"))?;
-                if line.contains("workspace") {
+                if toml_workspace_edition(&text) {
                     Some(self.workspace.clone())
                 } else {
                     toml_edition(&text)
@@ -524,8 +520,38 @@ pub fn toml_edition(text: &str) -> Option<String> {
         .filter(|l| !l.starts_with('#'))
         .find_map(|l| {
             let rest = l.strip_prefix("edition")?.trim_start();
-            let quoted = rest.strip_prefix('=')?.trim();
-            Some(quoted.split(['"', '\'']).nth(1)?.to_string())
+            let quoted = rest.strip_prefix('=')?.trim_start();
+            let quote = quoted.chars().next().filter(|&c| c == '"' || c == '\'')?;
+            Some(quoted[1..].split(quote).next()?.to_string())
+        })
+}
+
+fn toml_workspace_edition(text: &str) -> bool {
+    text.lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim())
+        .filter(|l| !l.is_empty())
+        .any(|l| {
+            let Some(rest) = l.strip_prefix("edition").map(str::trim_start) else {
+                return false;
+            };
+            if let Some(after_dot) = rest.strip_prefix('.') {
+                return after_dot
+                    .trim_start()
+                    .strip_prefix("workspace")
+                    .and_then(|r| r.trim_start().strip_prefix('='))
+                    .is_some_and(|v| v.trim() == "true");
+            }
+            if let Some(after_eq) = rest.strip_prefix('=')
+                && let Some(inner) = after_eq.trim_start().strip_prefix('{')
+            {
+                return inner.split([',', '}']).any(|part| {
+                    part.trim()
+                        .strip_prefix("workspace")
+                        .and_then(|r| r.trim_start().strip_prefix('='))
+                        .is_some_and(|v| v.trim() == "true")
+                });
+            }
+            false
         })
 }
 
@@ -884,6 +910,15 @@ mod tests {
             Some("2021")
         );
         assert_eq!(toml_edition("edition.workspace = true\n"), None);
+        assert_eq!(toml_edition("edition = { workspace = true }\n"), None);
+        assert_eq!(toml_edition("edition-guide = \"1.0\"\n"), None);
         assert_eq!(toml_edition("[package]\nname = \"a\"\n"), None);
+        assert!(toml_workspace_edition(
+            "edition.workspace = true # comment\n"
+        ));
+        assert!(toml_workspace_edition("edition = { workspace = true }\n"));
+        assert!(!toml_workspace_edition(
+            "edition = \"2021\" # inherited from workspace\n"
+        ));
     }
 }

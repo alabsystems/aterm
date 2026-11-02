@@ -1231,6 +1231,44 @@ fn a_failed_model_call_is_an_api_wall() {
             "{msg}"
         );
     }
+    // Its own tries spent (1.4.13, the lab stub's dropped host): the same wall, after its count.
+    let spent = edited(
+        &rows,
+        "◆ model failed",
+        "◆ model failed after 10 attempts: transport error [body-truncated]: response body ended \
+         before completion (meta stream)",
+    );
+    assert_eq!(
+        wall(&spent).map(|w| w.kind),
+        Some(WallKind::ApiError {
+            code: None,
+            retryable: true,
+            cause: ApiCause::Unreachable,
+        }),
+        "a transport error is the network's"
+    );
+    let spent_500 = edited(
+        &rows,
+        "◆ model failed",
+        "◆ model failed after 3 attempts: API error 500: it broke",
+    );
+    assert_eq!(wall(&spent_500).map(|w| w.kind), Some(api(Some(500), true)));
+    let uncounted = edited(
+        &rows,
+        "◆ model failed",
+        "◆ model failed after many attempts: transport error",
+    );
+    assert_eq!(wall(&uncounted), None, "the control: no count, no wall");
+    let unnamed_tries = edited(
+        &rows,
+        "◆ model failed",
+        "◆ model failed after 3 tries: transport error",
+    );
+    assert_eq!(
+        wall(&unnamed_tries),
+        None,
+        "the control: only the attempts' own word follows the count"
+    );
     let quoted = edited(
         &rows,
         "◆ model failed",
@@ -1312,6 +1350,54 @@ fn the_usage_wall_is_limited_until_its_reset() {
         wall(&quoted),
         None,
         "the control: the wall's words past a reply's head"
+    );
+}
+
+#[test]
+fn the_usage_wall_with_rows_under_its_reset_is_limited_until_its_clock() {
+    assert_eq!(
+        wall(&screen(USAGE_WALL)).and_then(|w| w.reset),
+        Some("1:06 PM".to_string())
+    );
+    let rows = screen(USAGE_WALL_TURN_STOPPED);
+    let reset_at = |with: &str| -> Vec<String> {
+        rows.iter()
+            .map(|r| r.replace("reset at 4:08", with))
+            .collect()
+    };
+    let mut unclocked = reset_at("reset at noon");
+    let am = unclocked
+        .iter()
+        .position(|r| r == "  AM")
+        .expect("the wrapped reset row");
+    unclocked.remove(am);
+    assert_eq!(
+        wall(&unclocked).and_then(|w| w.reset).as_deref(),
+        Some(
+            "noon This turn stopped because your usage limit was reached. Check /usage for details. Send a message to continue when usage is available"
+        ),
+        "a reset with no clock keeps its words",
+    );
+    let r = muse(USAGE_WALL_TURN_STOPPED);
+    let w = r.wall.clone().expect("the actual wall");
+    assert!(
+        w.message
+            .ends_with("Send a message to continue when usage is available.")
+    );
+    assert_eq!(
+        (w.kind, w.reset.as_deref()),
+        (WallKind::UsageSession, Some("4:08 AM"))
+    );
+    assert_eq!(
+        r.phase,
+        Phase::Limited {
+            message: w.message,
+            reset: Some("4:08 AM".to_string())
+        }
+    );
+    assert_eq!(
+        wall(&reset_at("reset at Oct 30 at 4:08")).and_then(|w| w.reset),
+        Some("Oct 30 at 4:08 AM".to_string())
     );
 }
 
@@ -3693,9 +3779,15 @@ fn muse_codes_title_says_whether_its_run_is_active() {
     assert_eq!(MuseReader.title_runs("⠙ proj"), Some(true));
     assert_eq!(MuseReader.title_runs("proj"), Some(false));
     for p in Program::ALL {
-        if p != Program::Muse {
-            assert_eq!(p.reader().title_runs("⠙ proj"), None, "{}", p.name());
-        }
+        let reading = match p {
+            Program::Muse => continue,
+            // Claude Code reads its own title, in which Muse Code's spinner is no run.
+            Program::Claude => Some(false),
+            Program::Codex | Program::Grok | Program::Kimi | Program::Agy | Program::Generic => {
+                None
+            }
+        };
+        assert_eq!(p.reader().title_runs("⠙ proj"), reading, "{}", p.name());
     }
 }
 
@@ -3798,4 +3890,40 @@ fn a_turn_runs_tools_by_its_tool_rows_under_its_message() {
     ] {
         assert!(!turn_ran_tools(&alone(words)), "the control: {words:?}");
     }
+}
+
+#[test]
+fn the_banner_over_one_message_is_the_opening_exchange() {
+    let one = screen(END_OF_TURN);
+    assert!(opening(&one), "{one:#?}");
+    let at = one
+        .iter()
+        .position(|r| r == "❯ hello there")
+        .expect("the message");
+    let mut two = one.clone();
+    two.splice(
+        at..at,
+        ["❯ fix the parser", "", "◆ Fixed.", ""].map(str::to_string),
+    );
+    assert!(!opening(&two), "a second message: {two:#?}");
+    let mut scrolled = one.clone();
+    scrolled.drain(..at);
+    assert!(
+        !opening(&scrolled),
+        "the banner scrolled off: {scrolled:#?}"
+    );
+    assert!(!opening(&screen(IDLE)), "no message yet");
+    let mut relaunched = screen(IDLE_RELAUNCHED);
+    let top = relaunched
+        .iter()
+        .position(|r| r.starts_with("── Voice input"))
+        .expect("the composer");
+    relaunched.splice(
+        top..top,
+        ["❯ fix the parser", "", "◆ Fixed.", ""].map(str::to_string),
+    );
+    assert!(
+        opening(&relaunched),
+        "an earlier session above the banner: {relaunched:#?}"
+    );
 }

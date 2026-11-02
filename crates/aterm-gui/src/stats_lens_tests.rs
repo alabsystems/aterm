@@ -19,6 +19,7 @@ use aterm_vitals::model::{Hog, ProcScope, ScopeFig, TopProc, Writer};
 const LOC: Locale = Locale {
     platform: Platform::MacOs,
     utc_offset_s: -8 * 3600,
+    utc_offset_at: None,
 };
 
 struct Rng(u64);
@@ -475,6 +476,30 @@ fn a_chart_says_an_unread_span_once() {
     let said = trace_said("Used", "GiB", &trace, (0, 60_000), &LOC);
     assert!(said.ends_with(" Not read from 16:01 to 16:03."), "{said}");
     assert!(!said.contains(", not read"), "{said}");
+
+    fn dst_offset(unix_s: i64) -> Option<i64> {
+        Some(if unix_s < 1_793_523_600 {
+            -7 * 3600
+        } else {
+            -8 * 3600
+        })
+    }
+    let dst_loc = Locale {
+        platform: Platform::MacOs,
+        utc_offset_s: -8 * 3600,
+        utc_offset_at: Some(dst_offset),
+    };
+    let dst_said = trace_said(
+        "Used",
+        "GiB",
+        &trace,
+        (1_793_518_200_000, 3_600_000),
+        &dst_loc,
+    );
+    assert!(
+        dst_said.ends_with(" Not read from 01:30 to 02:30."),
+        "{dst_said}"
+    );
 }
 
 #[test]
@@ -1512,13 +1537,8 @@ fn the_lens_hangs_under_the_deck_and_over_the_sill() {
 }
 
 #[test]
-#[ignore = "writes PNGs for a person to read: set ATERM_LENS_GALLERY to a directory"]
 fn lens_gallery() {
-    let Some(dir) = std::env::var_os("ATERM_LENS_GALLERY") else {
-        return;
-    };
-    let dir = std::path::PathBuf::from(dir);
-    std::fs::create_dir_all(&dir).expect("the gallery directory");
+    let (dir, _gallery) = crate::scripted_redraw_fixture::gallery_directory("ATERM_LENS_GALLERY");
     crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
     let calm = lens_scene(Scene::Calm);
     let trouble = lens_scene(Scene::Trouble);

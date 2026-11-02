@@ -24,15 +24,22 @@ pub fn within<T>(
     gap: Duration,
     mut probe: impl FnMut() -> Option<T>,
 ) -> Option<T> {
-    let deadline = Instant::now() + budget;
+    let deadline = Instant::now().checked_add(budget);
     loop {
         if let Some(value) = probe() {
             return Some(value);
         }
-        if Instant::now() >= deadline {
-            return None;
-        }
-        if gap.is_zero() {
+        let now = Instant::now();
+        if let Some(deadline) = deadline {
+            if now >= deadline {
+                return None;
+            }
+            if gap.is_zero() {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(gap.min(deadline.saturating_duration_since(now)));
+            }
+        } else if gap.is_zero() {
             std::thread::yield_now();
         } else {
             std::thread::sleep(gap);
@@ -52,17 +59,33 @@ pub fn until_within<T>(budget: Duration, what: &str, probe: impl FnMut() -> Opti
     }
 }
 
+/// Waits within [`MUST_HAPPEN`] for `stream`'s peer to close both halves
+/// ([`aterm_uds::hangup::peer_closed`]) once a test dropped the peer's end. The socket closes
+/// with the last descriptor of that end, and a child spawned while the end could still be
+/// copied holds one until its `exec` or its exit lets go: one created and marked apart rather
+/// than through [`aterm_uds::kept_out`], or forked off Apple, where no mark keeps a descriptor
+/// out of a child before its `exec`.
+///
+/// # Panics
+/// Panics if the peer has not closed within [`MUST_HAPPEN`].
+#[track_caller]
+pub fn until_peer_closed(stream: &aterm_uds::CtlStream) {
+    until_within(MUST_HAPPEN, "the peer's last close", || {
+        aterm_uds::hangup::peer_closed(stream).then_some(())
+    });
+}
+
 /// Retries `spawn` while the kernel returns `ETXTBSY`, up to [`MUST_HAPPEN`].
 ///
 /// # Errors
 /// Returns the last error produced by `spawn`.
 pub fn past_text_busy<T>(mut spawn: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
-    let deadline = Instant::now() + MUST_HAPPEN;
+    let deadline = Instant::now().checked_add(MUST_HAPPEN);
     loop {
         match spawn() {
             Err(e)
                 if e.kind() == std::io::ErrorKind::ExecutableFileBusy
-                    && Instant::now() < deadline =>
+                    && deadline.is_none_or(|d| Instant::now() < d) =>
             {
                 std::thread::sleep(Duration::from_millis(5));
             }
@@ -227,5 +250,37 @@ mod tests {
             quiet.push(line);
         });
         assert_eq!(quiet, Vec::<String>::new());
+        // `Duration::MAX` budget does not overflow `Instant::now() + budget`, and a gap larger
+        // than `budget` is clamped to the remaining deadline.
+        assert_eq!(within(Duration::MAX, Duration::ZERO, || Some(7)), Some(7));
+        let began = Instant::now();
+        assert_eq!(
+            within(
+                Duration::from_millis(10),
+                Duration::from_secs(30),
+                || None::<()>
+            ),
+            None
+        );
+        assert!(began.elapsed() < MUST_HAPPEN);
+    }
+
+    /// A peer whose end another descriptor still holds reads open, and the wait returns once
+    /// that last copy lets go, 300 ms on: an assertion at once fails there.
+    #[test]
+    fn the_peers_close_is_waited_for_until_its_last_copy_lets_go() {
+        let (near, far) = aterm_uds::kept_out(aterm_uds::CtlStream::pair).unwrap();
+        let copy = aterm_uds::kept_out(|| far.try_clone()).unwrap();
+        drop(far);
+        assert!(
+            !aterm_uds::hangup::peer_closed(&near),
+            "the copy holds the peer open"
+        );
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(copy);
+        });
+        until_peer_closed(&near);
+        holder.join().unwrap();
     }
 }

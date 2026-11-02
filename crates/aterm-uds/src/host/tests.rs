@@ -236,7 +236,7 @@ fn the_refusal_names_its_provider() {
             .contains("`targo --unverified verify provision --record` builds the pinned 0.2.108"),
         "{bindgen}"
     );
-    let vim = tool("vim").refusal();
+    let vim = tool("vim").refusal_on(mac);
     assert!(
         vim.contains("operating system, and no command adds it"),
         "{vim}"
@@ -328,8 +328,9 @@ fn every_workspace_row_names_the_run_that_provides_it() {
 
 #[test]
 fn a_host_the_tree_pins_nothing_for_is_told_so() {
-    for name in ["fish", "bash-5.3", "pwsh", "wasm-opt", "limactl"] {
+    for name in ["fish", "pwsh", "wasm-opt", "limactl"] {
         let row = tool(name);
+        assert!(!row.in_guest, "{name}");
         let linux = row.refusal_on("linux-x86_64");
         assert!(
             linux.contains("aterm provides none for linux-x86_64:")
@@ -345,6 +346,30 @@ fn a_host_the_tree_pins_nothing_for_is_told_so() {
     }
     let bindgen = tool("wasm-bindgen").refusal_on("linux-aarch64");
     assert!(bindgen.contains("builds the pinned 0.2.108"), "{bindgen}");
+}
+
+#[test]
+fn a_linux_host_is_sent_to_the_guest_that_builds_the_pin() {
+    let row = tool("bash-5.3");
+    assert!(row.in_guest);
+    for linux in ["linux-aarch64", "linux-x86_64"] {
+        assert_eq!(
+            row.refusal_on(linux),
+            "no bash-5.3 here: the Linux guest builds the pinned 5.3.20 as \
+             /usr/local/bin/bash-5.3: `targo --unverified verify linux` runs this there (or \
+             ATERM_TEST_BASH_5_3=<path> names one)"
+        );
+    }
+    assert!(
+        row.refusal_on("macos-aarch64")
+            .contains("`targo --unverified verify provision` builds the pinned 5.3.20"),
+        "a Mac still builds its own"
+    );
+    assert!(
+        row.refusal_on("windows-x86_64")
+            .contains("aterm provides none for windows-x86_64:"),
+        "only Linux has the guest"
+    );
 }
 
 #[test]
@@ -489,12 +514,21 @@ fn a_rustup_the_row_cannot_find_is_absent_naming_verify_provision_once() {
         absent.why,
         format!(
             "no rustup (looked in $ATERM_TEST_RUSTUP, the stamped 1.29.2 at {} and $PATH)",
-            tooling.join("rustup-1.29.2/bin/rustup").display()
+            // The pin's folder, then its `exe` as the row spells it.
+            tooling.join("rustup-1.29.2").join("bin/rustup").display()
         )
     );
+    // The fix is this host's remedy: the pin covers macOS and Linux, and a
+    // Windows host is told the tree pins none for it.
+    assert_eq!(absent.fix, row.remedy());
     assert_eq!(
-        absent.fix,
+        row.remedy_on("macos-aarch64"),
         "`targo --unverified verify provision` fetches the pinned 1.29.2 into this user's cache"
+    );
+    assert_eq!(
+        row.remedy_on("windows-aarch64"),
+        "aterm provides none for windows-aarch64: `targo --unverified verify provision` pins it \
+         for macos-aarch64 and macos-x86_64 and linux-x86_64 and linux-aarch64 only"
     );
     let said = absent.to_string();
     assert_eq!(said.matches("verify provision").count(), 1, "{said}");
@@ -624,8 +658,17 @@ fn a_missing_tool_ends_could_not_run_naming_its_provider() {
     assert_eq!(nowhere.find_in(&Lookup::default()), None);
     assert!(
         nowhere
-            .refusal()
+            .refusal_on("macos-aarch64")
             .starts_with("no vim here: it comes with the operating system"),
+        "{}",
+        nowhere.refusal_on("macos-aarch64")
+    );
+    assert!(
+        nowhere.refusal().starts_with(if cfg!(windows) {
+            "no vim here: Windows ships none"
+        } else {
+            "no vim here: it comes with the operating system"
+        }),
         "{}",
         nowhere.refusal()
     );
@@ -651,6 +694,41 @@ fn a_missing_tool_ends_could_not_run_naming_its_provider() {
         Some(true),
         "need_in ends a missing tool COULD NOT RUN"
     );
+}
+
+/// Windows ships none of the Unix OS rows: a missing one is refused as Windows' absence,
+/// naming the usual third-party copies its row looks for, and a row Windows ships is
+/// Windows' own.
+#[test]
+fn a_unix_os_row_on_windows_is_not_the_operating_systems() {
+    let on = "windows-aarch64";
+    assert_eq!(
+        tool("zsh").refusal_on(on),
+        "no zsh here: Windows ships none, and aterm looks for one at \
+         C:\\Program Files\\Git\\usr\\bin\\zsh.exe or C:\\msys64\\usr\\bin\\zsh.exe \
+         (or ATERM_TEST_ZSH=<path> names one)"
+    );
+    assert_eq!(
+        tool("bash").remedy_on(on),
+        "Windows ships none, and aterm looks for one at C:\\Program Files\\Git\\bin\\bash.exe"
+    );
+    assert_eq!(
+        tool("codesign").remedy_on(on),
+        "Windows ships none, and aterm provides none"
+    );
+    assert_eq!(
+        tool("cmd").remedy_on(on),
+        "it comes with Windows, and no command adds it"
+    );
+    assert_eq!(
+        tool("cmd").remedy_on("macos-aarch64"),
+        "only Windows ships it, and this host is macos-aarch64"
+    );
+    assert_eq!(
+        tool("zsh").remedy_on("macos-x86_64"),
+        "it comes with the operating system, and no command adds it"
+    );
+    assert_eq!(tool("cmd").provided_by(), "Windows");
 }
 
 #[test]

@@ -13,8 +13,83 @@ use crate::supervise::tape::testing::MemoryTape;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::mpsc;
 
+/// How [`observe_table`]'s table runs a row of every write path the harness has (H6 rule 5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    /// The host confirms agents and says observe: an unconfirmed agent.
+    Observe,
+    /// The host confirms agents and says on: a confirmed agent (the dev-seam stand-in's act,
+    /// read through the identity predicate).
+    On,
+    /// The host confirms nothing: today's name-only admission, the table's negative control.
+    NameOnly,
+}
+
+thread_local! {
+    /// The mode the row on this thread runs in, and every request its mocks heard (an ask of
+    /// the host's act heard as [`TABLE_ASKED`]): unset outside the table.
+    static TABLE: std::cell::RefCell<Option<(Mode, Vec<String>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The session a row's loop names when its scenario names none: the act is a session's.
+const TABLE_SID: &str = "@s-table";
+
+/// How the table hears the loop ask the host for the session's act.
+const TABLE_ASKED: &str = "(agent-act)";
+
+/// The act the identity predicate gives the table's agent in `mode`
+/// ([`crate::harness::agent_image::proof_among`] for Claude Code): the lab's stand-in, a file the
+/// stand-in seam names by identity, under [`Mode::On`]; under [`Mode::Observe`] a file of the
+/// same bytes no seam names, run as `claude`.
+fn table_image_act(mode: Mode) -> Act {
+    use crate::harness::agent_image::{FileId, Image, Places, proof_among};
+    thread_local! {
+        static IMAGES: std::cell::OnceCell<(aterm_tempfile::TempDir, PathBuf, PathBuf)> =
+            const { std::cell::OnceCell::new() };
+    }
+    IMAGES.with(|images| {
+        let (_, standin, named) = images.get_or_init(|| {
+            let dir = aterm_tempfile::tempdir().expect("scratch");
+            let standin = dir.path().join("lab/claude");
+            let named = dir.path().join("bin/claude");
+            for path in [&standin, &named] {
+                std::fs::create_dir_all(path.parent().expect("a parent")).expect("dir");
+                std::fs::write(path, "#!/bin/sh\nexec sleep 30\n").expect("the image");
+            }
+            (dir, standin, named)
+        });
+        let standins: Vec<FileId> = FileId::of(standin).into_iter().collect();
+        let exe = if mode == Mode::On { standin } else { named };
+        let proof = proof_among(
+            aterm_phase::Program::Claude,
+            &Image::at(exe),
+            &Places::default(),
+            &standins,
+        );
+        Act::of(proof)
+    })
+}
+
+fn table_mode() -> Option<Mode> {
+    TABLE.with_borrow(|t| t.as_ref().map(|(mode, _)| *mode))
+}
+
+fn table_heard(args: &[&str]) {
+    TABLE.with_borrow_mut(|t| {
+        if let Some((_, heard)) = t {
+            heard.push(args.join(" "));
+        }
+    });
+}
+
 fn session<C: Ctl>(ctl: &mut C, sid: Option<String>) -> Session<'_, C> {
+    let mode = table_mode();
+    let sid = sid.or_else(|| mode.map(|_| TABLE_SID.to_string()));
     let mut s = Session::new(ctl, sid);
+    if let Some(mode) = mode {
+        s.set_confirms_agent(mode != Mode::NameOnly);
+    }
     s.set_timings(crate::harness::Timings::FAST);
     s.set_box_settle(Duration::ZERO);
     s.set_box_call_step(Duration::ZERO);
@@ -249,6 +324,8 @@ struct Mock {
     person_at_send: usize,
     person_at_status: Option<usize>,
     person_after_send: usize,
+    /// The first `cell` read once the attention is raised is lost.
+    cell_lost_once_told: bool,
     person_skipped: Vec<usize>,
     cell_attrs: &'static str,
     /// The attributes a `cell` read answers while the script's screen `i` is the one last
@@ -260,6 +337,20 @@ struct Mock {
     history_cells: BTreeMap<(usize, usize), String>,
     human_ms_reads: VecDeque<Option<u64>>,
     status_human_from: BTreeMap<usize, u64>,
+    /// The person's one key, at the `text` read of this many reads served before it: from then
+    /// on `status` and every read time it on the run's clock (`human_ms`), as the window does.
+    keyed_at_read: Option<usize>,
+    /// When, on the run's clock, that key came ([`Self::keyed_at_read`]).
+    keyed_at: Option<Instant>,
+    /// The window's `human_typed_ms`, the age of the person's last typing, as `status` and every
+    /// read report it beside `human_ms` (`None`: a window that reports none).
+    typed_ms: Option<u64>,
+    /// The window reports the person's key ([`Self::keyed_at`]) as their typing too, in place of
+    /// [`Self::typed_ms`]: its `human_typed_ms` counts the Mac's sleep since
+    /// ([`Self::slept_since_key`]), as the window's does.
+    typed_at_key: bool,
+    /// The sleep [`Self::sleeps_at`] slept since the person's key.
+    slept_since_key: Duration,
     agent_pushes: bool,
     questions: Option<&'static str>,
     questions_after_badge: Option<Option<&'static str>>,
@@ -267,6 +358,15 @@ struct Mock {
     autopilot: Option<&'static str>,
     autopilot_at: Vec<(usize, Option<&'static str>)>,
     autopilot_on: BTreeMap<usize, Option<&'static str>>,
+    /// [`Self::autopilot_on`] once: the word moved at the first read of that screen only, so a
+    /// later move (`autopilot_at`) stands past the screen's reads again.
+    autopilot_once: BTreeMap<usize, Option<&'static str>>,
+    /// Who set the word, as `meta`'s `autopilot_by=` says it (`human:chip`, `ctl`, …): only the
+    /// person's own switch to Land over a held tab asks (v6 §14.17 item 3).
+    autopilot_by: Option<&'static str>,
+    /// [`Self::autopilot_by`] moved at the `meta` read of each count, as [`Self::autopilot_at`]
+    /// moves the word: who set each word in turn.
+    autopilot_by_at: Vec<(usize, Option<&'static str>)>,
     /// `meta` writes in time, each that long after the first wait that carried `autopilot=`
     /// ([`Self::word_latch`]).
     meta_writes: VecDeque<(Duration, MetaWrite)>,
@@ -277,6 +377,11 @@ struct Mock {
     word_deaf: bool,
     /// Whether the screens past the one shown at rest wait for [`MetaWrite::Moves`].
     moves_held: bool,
+    /// How long each script screen stands once first served, on the run's clock: until then a
+    /// read serves it again and an `await seq` sits out its timeout, and the next screen is drawn
+    /// with no wake of its own, so the read the loop makes as its due falls is the first to see it
+    /// ([`Self::standing`]).
+    stands: BTreeMap<usize, Duration>,
     /// Whether the host's waits take `autopilot=<word>`; an older host's refuse it (`ERR usage`).
     takes_word: bool,
     /// When each `turn` was asked.
@@ -309,6 +414,12 @@ struct Mock {
     unread_after_write: Option<Duration>,
     /// When the last `key` or `send` was made, on the run's clock ([`Self::unread_after_write`]).
     last_write_at: Option<Instant>,
+    /// [`Self::unread_after_write`] timed from the first `send` alone: a worker that holds the
+    /// first write it is sent and reads every later one at once.
+    unread_first_send_only: bool,
+    /// `status`'s input by the time since the last `key` or `send`: the first entry whose span that
+    /// time has not passed, in place of [`Self::input`] (a worker read stalled, then pending).
+    input_by_write: Vec<(Duration, &'static str)>,
     /// How many reads after the first `send` move on as scripted before the screen stands
     /// ([`Self::unmoved_after_send`]): a frame drawn after the write that does not show it.
     unmoved_from_read: usize,
@@ -358,6 +469,7 @@ struct Mock {
     task_requests: Vec<String>,
     task_reopens_at: Option<usize>,
     task_busy: usize,
+    task_mark_replies: VecDeque<CtlReply>,
     task_lost: usize,
     hang_up_at: Option<&'static str>,
     hung_up: bool,
@@ -1061,6 +1173,7 @@ impl Mock {
             person_at_send: 0,
             person_at_status: None,
             person_after_send: 0,
+            cell_lost_once_told: false,
             person_skipped: Vec::new(),
             cell_attrs: "dim",
             cell_attrs_on: BTreeMap::new(),
@@ -1070,6 +1183,11 @@ impl Mock {
             history_cells: BTreeMap::new(),
             human_ms_reads: VecDeque::new(),
             status_human_from: BTreeMap::new(),
+            keyed_at_read: None,
+            keyed_at: None,
+            typed_ms: None,
+            typed_at_key: false,
+            slept_since_key: Duration::ZERO,
             agent_pushes: false,
             questions: None,
             questions_after_badge: None,
@@ -1077,10 +1195,14 @@ impl Mock {
             autopilot: None,
             autopilot_at: Vec::new(),
             autopilot_on: BTreeMap::new(),
+            autopilot_once: BTreeMap::new(),
+            autopilot_by: None,
+            autopilot_by_at: Vec::new(),
             meta_writes: VecDeque::new(),
             rest_from: None,
             word_deaf: false,
             moves_held: false,
+            stands: BTreeMap::new(),
             takes_word: false,
             turn_times: Vec::new(),
             metas: 0,
@@ -1095,6 +1217,8 @@ impl Mock {
             unmoved_after_send: None,
             unmoved_after_key: None,
             unread_after_write: None,
+            unread_first_send_only: false,
+            input_by_write: Vec::new(),
             last_write_at: None,
             unmoved_wakes: 0,
             unmoved_from_read: 0,
@@ -1128,6 +1252,7 @@ impl Mock {
             task_requests: Vec::new(),
             task_reopens_at: None,
             task_busy: 0,
+            task_mark_replies: VecDeque::new(),
             task_lost: 0,
             hang_up_at: None,
             hung_up: false,
@@ -1154,6 +1279,11 @@ impl Mock {
             Some((rev, fields)) => format!("OK task rev={rev} {fields} agent=idle attention=-"),
             None => "OK task -".to_string(),
         };
+        if matches!(words, ["task", "mark", ..])
+            && let Some(reply) = self.task_mark_replies.pop_front()
+        {
+            return reply;
+        }
         match words {
             ["task"] if self.task_lost > 0 => {
                 self.task_lost -= 1;
@@ -1235,12 +1365,15 @@ impl Mock {
         let autopilot = self
             .autopilot
             .map_or_else(String::new, |w| format!(" autopilot={w}"));
+        let autopilot_by = self
+            .autopilot_by
+            .map_or_else(String::new, |by| format!(" autopilot_by={by}"));
         let supervisor = self.supervisor_owner.as_deref().unwrap_or("-");
         format!(
             "OK title=- user_title=- description=- icon=- role=- attention={attention} \
              cwd={cwd} state=alive attention_owner={owner} attention_owners={owners} \
              attention_kinds={kinds} supervisor={supervisor}{questions} agent_cwd={agent_cwd} \
-             trusted_cwd={trusted_cwd}{autopilot}\n"
+             trusted_cwd={trusted_cwd}{autopilot}{autopilot_by}\n"
         )
     }
     fn status_line(&mut self) -> String {
@@ -1263,12 +1396,30 @@ impl Mock {
                 self.input = input;
             }
         }
-        if let Some((unread, written)) = self.unread_after_write.zip(self.last_write_at) {
-            self.input = if run_since(self.waits.as_deref(), written) < unread {
+        // The write unread for this long: `status` times its wait from the write, as the window's
+        // `input_wait_ms` does.
+        let mut waited = None;
+        let written = if self.unread_first_send_only {
+            self.first_send_at
+        } else {
+            self.last_write_at
+        };
+        if let Some((unread, written)) = self.unread_after_write.zip(written) {
+            let since = run_since(self.waits.as_deref(), written);
+            self.input = if since < unread {
+                waited = Some(since);
                 INPUT_KEY_UNREAD
             } else {
                 INPUT_CLEAR
             };
+        }
+        if let Some(written) = self.last_write_at
+            && let Some(&(_, input)) = self
+                .input_by_write
+                .iter()
+                .find(|(span, _)| run_since(self.waits.as_deref(), written) < *span)
+        {
+            self.input = input;
         }
         if ["input=pending", "input=typeahead"]
             .iter()
@@ -1276,10 +1427,13 @@ impl Mock {
         {
             self.input_unread_at = Some(run_now(self.waits.as_deref()));
         }
-        let input = if self.input.is_empty() {
-            String::new()
-        } else {
-            format!(" {}", self.input)
+        let input = match waited {
+            Some(since) => format!(
+                " input=pending input_bytes=1 input_wait_ms={} fg_rss_mb=-",
+                since.as_millis()
+            ),
+            None if self.input.is_empty() => String::new(),
+            None => format!(" {}", self.input),
         };
         let after_read = self
             .status_human_from
@@ -1294,13 +1448,20 @@ impl Mock {
             .map(|at| {
                 u64::try_from(run_since(self.waits.as_deref(), at).as_millis()).unwrap_or(u64::MAX)
             });
+        let timed = self
+            .keyed_at
+            .map(|at| u64::try_from(run_since(self.waits.as_deref(), at).as_millis()).unwrap_or(0));
         let mut human = keyed
+            .or(timed)
             .or(after_read)
             .map_or_else(
                 || self.human_ms_reads.pop_front().unwrap_or(self.human_ms),
                 Some,
             )
             .map_or_else(String::new, |ms| format!(" human_ms={ms}"));
+        if let Some(ms) = self.typed_ms.or_else(|| self.typed_at_key_ms()) {
+            human.push_str(&format!(" human_typed_ms={ms}"));
+        }
         if self.agent_pushes {
             human.push_str(" agent_rev=1");
         }
@@ -1341,6 +1502,13 @@ impl Mock {
              seq={}{generation} hand={hand}{human}{title}\n",
             self.status_sid, self.hold, self.fabric, self.program, self.seq
         )
+    }
+    /// The age of the person's key as a window that counts the Mac's sleep reports their typing
+    /// ([`Self::typed_at_key`]).
+    fn typed_at_key_ms(&self) -> Option<u64> {
+        let at = self.keyed_at.filter(|_| self.typed_at_key)?;
+        let ago = run_since(self.waits.as_deref(), at).saturating_add(self.slept_since_key);
+        Some(u64::try_from(ago.as_millis()).unwrap_or(u64::MAX))
     }
     fn measured_cell(&self, tail: &[&str]) -> Option<String> {
         let [row, col] = tail else { return None };
@@ -1515,9 +1683,23 @@ impl Mock {
         };
         format!("OK idle {seq}\n")
     }
+    /// Whether the screen last served still stands ([`Self::stands`]).
+    fn standing(&self) -> bool {
+        let Some(i) = self.served.checked_sub(1) else {
+            return false;
+        };
+        let Some(&hold) = self.stands.get(&i) else {
+            return false;
+        };
+        self.read_times
+            .iter()
+            .find(|(k, _)| *k == i)
+            .is_some_and(|(_, first)| run_since(self.waits.as_deref(), *first) < hold)
+    }
     fn held(&self) -> bool {
         self.moves_held && self.rest_from.is_some()
             || self.unmoved_for().is_some()
+            || self.standing()
             || self
                 .turn_releases
                 .is_some_and(|i| self.served == i + 1 && !self.turned)
@@ -1559,6 +1741,9 @@ impl Mock {
             && let Some(clock) = &self.waits
         {
             clock.slept(secs);
+            if self.keyed_at.is_some() {
+                self.slept_since_key += Duration::from_secs(secs.unsigned_abs());
+            }
         }
         if survey_open(&self.screens[i]) {
             let now = run_now(self.waits.as_deref());
@@ -1633,16 +1818,25 @@ impl Mock {
             (None, 1) => self.human[0],
             (None, _) => self.human.remove(0),
         };
+        if self.keyed_at_read == Some(self.reads.len()) {
+            self.keyed_at = Some(run_now(self.waits.as_deref()));
+        }
+        let timed = self
+            .keyed_at
+            .map(|at| run_since(self.waits.as_deref(), at).as_millis().to_string());
         self.reads.push((i, stamp));
         self.read_times.push((i, run_now(self.waits.as_deref())));
         if let Some((_, &n)) = self.human_seq_from.range(..=self.reads.len()).next_back() {
             self.human_seq = Some(n);
         }
-        let mut human = if stamp.is_empty() {
-            String::new()
-        } else {
-            format!(",\"human_ms\":{stamp}")
+        let mut human = match (timed, stamp) {
+            (Some(ms), _) => format!(",\"human_ms\":{ms}"),
+            (None, "") => String::new(),
+            (None, stamp) => format!(",\"human_ms\":{stamp}"),
         };
+        if let Some(ms) = self.typed_ms.or_else(|| self.typed_at_key_ms()) {
+            human.push_str(&format!(",\"human_typed_ms\":{ms}"));
+        }
         let count = self.human_seq_on.get(&i).copied().unwrap_or(self.human_seq);
         if let Some(n) = count {
             human.push_str(&format!(",\"human_seq\":{n}"));
@@ -2481,6 +2675,9 @@ impl Mock {
                 if let Some(word) = self.autopilot_on.get(&before) {
                     self.autopilot = *word;
                 }
+                if let Some(word) = self.autopilot_once.remove(&before) {
+                    self.autopilot = word;
+                }
                 self.panel_seen();
                 self.reset_seen();
                 self.after_gone.push(after_gone);
@@ -2987,6 +3184,11 @@ impl Mock {
                         self.autopilot = word;
                     }
                 }
+                for &(n, by) in &self.autopilot_by_at {
+                    if self.metas == n {
+                        self.autopilot_by = by;
+                    }
+                }
                 Ok(ok(&self.meta_line()))
             }
             "status" => {
@@ -3013,6 +3215,10 @@ impl Mock {
             "search" if self.scrollback.is_some() => Ok(self.scrollback_search(tail)),
             "line" if self.scrollback.is_some() => Ok(self.scrollback_line(tail)),
             "cell" if self.cell_unreadable => Ok(err("no such verb: cell")),
+            "cell" if self.cell_lost_once_told && self.attention.is_some() => {
+                self.cell_lost_once_told = false;
+                Ok(err("evicted"))
+            }
             "cell" if self.measured_cell(tail).is_some() => Ok(ok(&format!(
                 "{}\n",
                 self.measured_cell(tail).unwrap_or_default()
@@ -3098,6 +3304,7 @@ impl Mock {
 
 impl Ctl for Mock {
     fn call(&mut self, args: &[&str]) -> Result<CtlReply, String> {
+        table_heard(args);
         assert!(
             self.hang_at.is_none_or(|at| Instant::now() < at),
             "timed out after {:?} waiting for a run on the run's clock to end",
@@ -3116,6 +3323,16 @@ impl Ctl for Mock {
     fn call_at_host_of(&mut self, sid: &str, args: &[&str]) -> Result<CtlReply, String> {
         self.aimed.push(sid.to_string());
         self.call(args)
+    }
+
+    /// The table's act ([`Mode`]), read through the identity predicate ([`table_image_act`]);
+    /// every other test's mock is a confirmed agent's host.
+    fn agent_act(&mut self, _: &str) -> Act {
+        table_heard(&[TABLE_ASKED]);
+        match table_mode() {
+            Some(mode @ (Mode::Observe | Mode::On)) => table_image_act(mode),
+            Some(Mode::NameOnly) | None => Act::On,
+        }
     }
 }
 
@@ -3842,6 +4059,8 @@ fn a_span_the_grid_no_longer_has_is_read_again() {
             "status",
             "await gone esc.to.interrupt rows 33 49 timeout 20000",
             "text --json tail=40",
+            // Its end has no done row, so its title is read: it set none.
+            "title",
         ]
     );
 }
@@ -4146,7 +4365,8 @@ fn a_muse_end_under_its_running_title_is_held_until_the_title_rests() {
             "{pinned:?}"
         );
         assert_eq!(unread, 0, "{pinned:?}: {requests:#?}");
-        assert_eq!(reads(&requests), 4, "{pinned:?}: {requests:#?}");
+        // Four titles, and the rest read again after the settle that follows it.
+        assert_eq!(reads(&requests), 5, "{pinned:?}: {requests:#?}");
         let first = requests
             .iter()
             .position(|r| r == "title" || r == "status")
@@ -4165,8 +4385,9 @@ fn a_muse_end_under_its_running_title_is_held_until_the_title_rests() {
         assert_eq!((t.phase, &t.screen.rows), (Phase::Idle, &end), "{titles:?}");
         assert_eq!(reads(&requests), 1, "{titles:?}: {requests:#?}");
     }
+    // Claude Code's done row is its turn's end drawn: no title is read for it.
     let claude = idle_screen();
-    let (t, requests, _) = run(&claude, &[Some("⠙ proj")]);
+    let (t, requests, _) = run(&claude, &[Some("◐ proj")]);
     assert_eq!(t.phase, Phase::Idle);
     assert_eq!(reads(&requests), 0, "{requests:#?}");
     let (t, requests, took) = run(&end, &[Some("⠙ proj")]);
@@ -4213,6 +4434,17 @@ impl Review for Noted {
 }
 
 fn title_run(screens: Vec<Vec<String>>, titles: &[&str], refused: bool) -> TitleRun {
+    title_run_over(screens, titles, refused, None)
+}
+
+/// [`title_run`], the transcript having told the end of the carried wait on the screen read at
+/// `transcript_over` ([`Session::transcript_wait_over`]).
+fn title_run_over(
+    screens: Vec<Vec<String>>,
+    titles: &[&str],
+    refused: bool,
+    transcript_over: Option<u64>,
+) -> TitleRun {
     let mut m = Mock::new(screens);
     m.gone_on_next = true;
     m.stall_sleep = Some(Duration::from_secs(60));
@@ -4222,6 +4454,7 @@ fn title_run(screens: Vec<Vec<String>>, titles: &[&str], refused: bool) -> Title
     m.run_on(&clock);
     let mut s = session(&mut m, None);
     s.set_fx(Fx::over(ClockSource::Scripted(Arc::clone(&clock))));
+    s.transcript_over_seq = transcript_over;
     let started = s.fx.mono();
     let mut noted = Noted::default();
     let turn = s
@@ -4270,15 +4503,16 @@ fn a_title_hold_is_counted_from_the_review_it_holds() {
     let statuses = r.requests.iter().filter(|q| *q == "status").count();
     assert_eq!(
         (r.unread, title_reads(&r.requests), statuses),
-        (0, 3, 1),
-        "the busy wait's `status` (the session log's head) read the first title: {:#?}",
+        (0, 4, 1),
+        "the busy wait's `status` (the session log's head) read the first title, and the rest is \
+         read again after its settle: {:#?}",
         r.requests
     );
     assert!(r.noted.is_empty(), "{:#?}", r.noted);
     let r = title_run(vec![end.clone()], &turning, false);
     assert_eq!(
         (r.turn.phase, r.unread, title_reads(&r.requests)),
-        (Phase::Idle, 0, 4)
+        (Phase::Idle, 0, 5)
     );
 }
 
@@ -4299,7 +4533,7 @@ fn a_title_hold_holds_a_question_and_notes_its_hang() {
     );
     assert_eq!(
         (r.unread, title_reads(&r.requests)),
-        (0, 3),
+        (0, 4),
         "{:#?}",
         r.requests
     );
@@ -4320,6 +4554,163 @@ fn a_title_hold_holds_a_question_and_notes_its_hang() {
     assert!(r.noted.is_empty(), "{:#?}", r.noted);
 }
 
+fn needs_said(rows: &[String]) -> usize {
+    aterm_phase::Program::Claude
+        .reader()
+        .said_tail(rows)
+        .map_or(0, |t| t.matches("NEEDS YOU:").count())
+}
+
+/// ATERM-KI-1027-3. Under a status line (aterm's usage tap is one) Claude Code draws its reply
+/// with no busy sign on the screen: no `esc to interrupt`, and no spinner row once the reply's
+/// first line is drawn. A read mid-reply was taken for the turn's end, and Land rested on a
+/// reply cut before its NEEDS YOU lines. The frames are 2.1.311's (lab `mr`, MEASURED): mid-reply
+/// twice under the running title (`◑`, `◐`), then the last line still held back under the title
+/// already at rest (it rests 23 ms before the frame that draws that line), then the finished
+/// reply under its done row. The turn ends on the finished reply, all four NEEDS YOU lines in
+/// what it said.
+#[test]
+fn a_claude_reply_drawn_under_a_status_line_ends_once_its_title_has_rested() {
+    use aterm_phase::prompt::fixtures::{
+        STATUSLINE_LAST_LINE_HELD_2_1_311, STATUSLINE_MIDREPLY_2_1_311,
+        STATUSLINE_REPLY_DONE_2_1_311, screen,
+    };
+    let mid = screen(STATUSLINE_MIDREPLY_2_1_311);
+    let held = screen(STATUSLINE_LAST_LINE_HELD_2_1_311);
+    let done = screen(STATUSLINE_REPLY_DONE_2_1_311);
+    let reader = aterm_phase::Program::Claude.reader();
+    for rows in [&mid, &held, &done] {
+        assert!(reader.phase_authoritative(rows, &reader.phase(rows)));
+        assert!(reader.wall(rows).is_none());
+    }
+    let r = title_run(
+        vec![mid.clone(), mid, held.clone(), done.clone()],
+        &[
+            "◑ Claude Code",
+            "◐ Claude Code",
+            "✳ Claude Code",
+            "✳ Claude Code",
+        ],
+        false,
+    );
+    assert_eq!(
+        (r.turn.phase.clone(), &r.turn.screen.rows, r.turn.timed_out),
+        (Phase::Idle, &done, false),
+        "{:#?}",
+        r.requests
+    );
+    assert_eq!(needs_said(&r.turn.screen.rows), 4);
+    assert_eq!(
+        (r.unread, title_reads(&r.requests)),
+        (1, 3),
+        "the done row's read needs no title: {:#?}",
+        r.requests
+    );
+    assert!(r.took < TITLE_HOLD, "{:?}", r.took);
+    assert!(r.noted.is_empty(), "{:#?}", r.noted);
+    // The same reply read first just after a busy read, its title already at rest: the turn
+    // ran in this wait, so the end waits one settle for the frame that draws the last line.
+    let r = title_run(
+        vec![busy_screen(), held.clone(), done.clone()],
+        &["✳ Claude Code"],
+        false,
+    );
+    assert_eq!(
+        (r.turn.phase.clone(), &r.turn.screen.rows, r.turn.timed_out),
+        (Phase::Idle, &done, false),
+        "{:#?}",
+        r.requests
+    );
+    assert_eq!(title_reads(&r.requests), 1, "{:#?}", r.requests);
+    // The controls, never held as busy: the finished reply ends at its first read, its done row
+    // drawn, whatever the title says; a reply that ends with no done row (`showTurnDuration`
+    // off) ends under its resting title, at once where the wait saw no run.
+    let r = title_run(vec![done.clone()], &["◑ Claude Code"], false);
+    assert_eq!(
+        (r.turn.phase.clone(), &r.turn.screen.rows, r.turn.timed_out),
+        (Phase::Idle, &done, false),
+        "{:#?}",
+        r.requests
+    );
+    assert_eq!(title_reads(&r.requests), 0, "{:#?}", r.requests);
+    assert!(r.took < Duration::from_secs(5), "{:?}", r.took);
+    let r = title_run(vec![held.clone()], &["✳ Claude Code"], false);
+    assert_eq!(
+        (r.turn.phase.clone(), &r.turn.screen.rows, r.turn.timed_out),
+        (Phase::Idle, &held, false),
+        "{:#?}",
+        r.requests
+    );
+    assert_eq!(title_reads(&r.requests), 1, "{:#?}", r.requests);
+    assert!(r.took < Duration::from_secs(5), "{:?}", r.took);
+    assert!(r.noted.is_empty(), "{:#?}", r.noted);
+    // A Claude Code that set no title (`CLAUDE_CODE_DISABLE_TERMINAL_TITLE`) says nothing by it:
+    // its end after a busy read decides as read, with no settle after the title.
+    let r = title_run(vec![busy_screen(), held.clone()], &[""], false);
+    assert_eq!(
+        (r.turn.phase.clone(), &r.turn.screen.rows, r.turn.timed_out),
+        (Phase::Idle, &held, false),
+        "{:#?}",
+        r.requests
+    );
+    assert_eq!(
+        (
+            title_reads(&r.requests),
+            r.requests.last().map(String::as_str)
+        ),
+        (1, Some("title")),
+        "{:#?}",
+        r.requests
+    );
+}
+
+/// A wall, and a carried wait the transcript says ended, decide as read: Claude Code's title
+/// also runs while its background agents or workflows do, its turn over, so holding either
+/// under that title would wait out [`TITLE_HOLD`] and note a hang that is none.
+#[test]
+fn a_wall_or_a_transcript_told_end_is_not_held_by_a_running_title() {
+    use aterm_phase::prompt::fixtures::{END_529, screen};
+    let reader = aterm_phase::Program::Claude.reader();
+    // Its done row left out: with it, the end is drawn and decides before any wall is asked.
+    let walled: Vec<String> = screen(END_529)
+        .into_iter()
+        .filter(|r| !r.starts_with("✻ "))
+        .collect();
+    assert_eq!(reader.phase(&walled), Phase::Idle);
+    assert!(reader.wall(&walled).is_some());
+    assert!(!reader.end_drawn(&walled));
+    let r = title_run(vec![walled.clone()], &["◑ Claude Code"], false);
+    assert_eq!(
+        (r.turn.phase.clone(), &r.turn.screen.rows, r.turn.timed_out),
+        (Phase::Idle, &walled, false)
+    );
+    assert_eq!(title_reads(&r.requests), 0, "{:#?}", r.requests);
+    assert!(r.took < Duration::from_secs(5), "{:?}", r.took);
+    assert!(r.noted.is_empty(), "{:#?}", r.noted);
+    let mut carried = rows(&[
+        "✻ Waiting for 1 dynamic workflow to finish",
+        "",
+        "⏺ Monitor event: \"lander\"",
+        "",
+        "⏺ Still in its crates-tests lane. I restarted the watch.",
+        "",
+    ]);
+    carried.extend(composer(
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents",
+    ));
+    assert!(aterm_phase::phase::carried_wait_alone(&carried));
+    assert!(!reader.end_drawn(&carried));
+    let r = title_run_over(vec![carried.clone()], &["◑ Claude Code"], false, Some(101));
+    assert_eq!(
+        (r.turn.phase.clone(), r.turn.screen.seq, r.turn.timed_out),
+        (Phase::Idle, 101, false),
+        "{:#?}",
+        r.requests
+    );
+    assert_eq!(title_reads(&r.requests), 0, "{:#?}", r.requests);
+    assert!(r.took < Duration::from_secs(5), "{:?}", r.took);
+}
+
 struct MarkFake {
     sent: Vec<String>,
     reply: CtlReply,
@@ -4334,7 +4725,7 @@ impl Ctl for MarkFake {
 
 #[test]
 fn a_refused_act_mark_latches_the_rest_off() {
-    let first = "@s-1 mark - act word=approve rule=read-only.classify-v10";
+    let first = "@s-1 mark - act word=approve rule=read-only.classify-v11";
     for (err, latched) in [
         ("ERR unknown verb 'mark' (help lists them)", true),
         ("ERR usage: mark <node|-> <kind> [word=<w>] …", true),
@@ -4351,7 +4742,7 @@ fn a_refused_act_mark_latches_the_rest_off() {
         };
         let mut s = Session::new(&mut fake, Some("@s-1".to_string()));
         s.act_marks
-            .queue("act word=approve rule=read-only.classify-v10".to_string());
+            .queue("act word=approve rule=read-only.classify-v11".to_string());
         s.act_marks.queue("act word=escalate".to_string());
         s.send_act_marks();
         s.act_marks.queue("act word=deny rule=write.v1".to_string());
@@ -4403,7 +4794,7 @@ fn supervise_auto_approves_reads_guarded_and_hands_over_writes() {
             "@s-9 key if-human=7 if-gen=1.101 if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1",
             "@s-9 await seq 101 timeout 20000",
             "@s-9 text --json tail=40",
-            "@s-9 mark - act word=approve rule=read-only.classify-v10",
+            "@s-9 mark - act word=approve rule=read-only.classify-v11",
             "@s-9 await idle 500 timeout 1500",
             "@s-9 text --json tail=40",
             "@s-9 status",
@@ -4554,7 +4945,7 @@ fn the_same_box_is_never_pressed_twice_on_an_unchanged_screen() {
             "key if-human=7 if-gen=1.101 if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1",
             "await seq 101 timeout 20000",
             "text --json tail=40",
-            "mark - act word=approve rule=read-only.classify-v10",
+            "mark - act word=approve rule=read-only.classify-v11",
         ],
         "{:?}",
         m.requests
@@ -4611,6 +5002,8 @@ fn an_await_timeout_is_a_step_not_an_error() {
 fn reply_readers_match_the_wire() {
     assert_eq!(ok("OK seq=31\n").seq(), Some(31));
     assert_eq!(ok("OK skipped seq=7\n").seq(), Some(7));
+    assert_eq!(ok("OK other_seq=99\n").seq(), None);
+    assert_eq!(ok("OK seq=7abc\n").seq(), None);
     assert!(ok("OK skipped seq=7\n").skipped());
     assert!(!ok("OK seq=7\n").skipped());
     assert_eq!(ok("OK\n").seq(), None);
@@ -4990,6 +5383,48 @@ fn render_prompt_prints_the_notes_after_the_description_and_before_classify() {
     assert!(!out.contains("\nnote "), "{out}");
 }
 
+/// `aterm drive phase` on a turn over under the agent's own background work: the reader's busy
+/// and its reason, then the phase the turn rests at (the captured 2.1.310 workflow wait); a live
+/// turn over the same work prints no rest.
+#[test]
+fn drive_phase_prints_the_rest_of_a_turn_over_under_its_own_background_work() {
+    let turn_for = |rows: Vec<String>| Turn {
+        phase: worker_phase(&rows),
+        screen: Screen {
+            rows,
+            ..Screen::default()
+        },
+        timed_out: false,
+    };
+    let rows = aterm_phase::prompt::fixtures::screen(
+        aterm_phase::prompt::fixtures::WAITING_WORKFLOWS_2_1_310,
+    );
+    let turn = turn_for(rows.clone());
+    assert_eq!(turn.phase, Phase::Busy);
+    let out = render_phase(&turn, by_screen(&turn), &[]);
+    assert_eq!(
+        out,
+        "busy\nreason status row: waiting for a dynamic workflow\nrest idle\n"
+    );
+    let wait = rows
+        .iter()
+        .position(|r| r.starts_with("✻ Waiting for 3 dynamic workflows"))
+        .expect("the waiting row");
+    let (head, panel) = rows[wait].split_once('│').expect("the panel's rule");
+    let mut live = rows.clone();
+    live[wait] = format!(
+        "{:<w$}│{panel}",
+        "✢ Running… (12s · esc to interrupt)",
+        w = head.chars().count()
+    );
+    let turn = turn_for(live);
+    let out = render_phase(&turn, by_screen(&turn), &[]);
+    assert!(
+        out.starts_with("busy\nreason ") && !out.contains("\nrest "),
+        "{out}"
+    );
+}
+
 #[test]
 fn a_boxs_classify_word_is_the_read_only_rules_verdict_on_its_readings() {
     use crate::supervise::classify::classify_command;
@@ -5334,6 +5769,63 @@ fn a_point_is_new_when_its_transcript_moved_whatever_the_loop_saw() {
     );
 }
 
+/// A wall that names no zone, read past the minute a read of the offset stands, reads the offset
+/// again and the zone at its reset. Both are on the tape, at the calls that made them, so a strict
+/// replay asks them where the recording did.
+/// NEGATIVE CONTROL: a first read that stands for the session's life fails "the offset read again".
+#[test]
+fn a_wall_read_past_the_offsets_minute_replays_from_its_tape() {
+    let wall = |reset: &str| -> Vec<String> {
+        limited_screen()
+            .into_iter()
+            .map(|r| r.replace("7:30pm (America/Los_Angeles)", reset))
+            .collect()
+    };
+    let mut m = Mock::new(vec![
+        wall("3am"),
+        busy_screen(),
+        wall("4am"),
+        busy_screen(),
+        wall("5am"),
+    ]);
+    m.idle_skips_busy = true;
+    m.vanish_after = Some(0);
+    let opts = SuperviseOpts {
+        max: Duration::from_secs(30),
+        policy: powerless(),
+        ..SuperviseOpts::default()
+    };
+    let run = record_watch(&mut m, &opts, |s| {
+        s.set_local_lookup(|_| Some(PDT));
+        s.test_clock().set_tick_ms(30_000);
+    });
+    crate::supervise::tape::testing::assert_replays(&run.tape, &run.header, &run.sent, &run.lines);
+    let read = crate::supervise::tape::recover::recover(&run.tape.sink.bytes());
+    let crossed = |at: &str| {
+        read.items
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i.record(),
+                    Some(astream_effects::EffectRecord::Exchange { door, .. }) if door == at
+                )
+            })
+            .count()
+    };
+    let doors = crate::supervise::tape::doors::PROBE_TZ_OFFSET;
+    assert!(
+        crossed(doors) >= 2,
+        "the offset read again: {}",
+        crossed(doors)
+    );
+    let at = crate::supervise::tape::doors::PROBE_LOCAL_OFFSET;
+    assert!(
+        crossed(at) >= 1,
+        "the zone read at the reset: {}",
+        crossed(at)
+    );
+}
+
 #[test]
 fn a_new_point_that_looks_like_the_last_one_is_still_reported() {
     let retried = framed(&[
@@ -5465,7 +5957,7 @@ fn nothing_happens_after_the_budget() {
     assert_eq!(m.requests.len(), 9, "nothing read after: {:?}", m.requests);
     assert_eq!(
         m.requests.last().map(String::as_str),
-        Some("mark - act word=approve rule=read-only.classify-v10")
+        Some("mark - act word=approve rule=read-only.classify-v11")
     );
 }
 
@@ -7114,6 +7606,7 @@ fn watch_rides_out_a_lost_connection_to_the_next_event() {
             "text --json tail=40",
             "await idle 500 timeout 1500",
             "text --json tail=40",
+            "title",
             "modes",
             "offscreen tail=1",
             "meta",
@@ -7344,10 +7837,11 @@ fn an_outage_that_keeps_coming_back_is_one_window() {
 #[test]
 fn a_later_outage_is_a_new_one_with_its_own_window() {
     let mut m = Mock::new(vec![question_screen()]);
-    m.by_index.insert(6, closed());
-    m.by_index.insert(14, timeout());
-    m.delay.insert(14, Duration::from_millis(400));
-    m.by_index.insert(17, closed());
+    // Each read of the question reads its `title` too (requests 2 and 11).
+    m.by_index.insert(7, closed());
+    m.by_index.insert(16, timeout());
+    m.delay.insert(16, Duration::from_millis(400));
+    m.by_index.insert(19, closed());
     m.vanish_after = Some(0);
     let (lines, code) = watch_quick(&mut m, Duration::from_millis(300));
     assert_eq!(lines.len(), 8, "{lines:?}; requests={:#?}", m.requests);
@@ -7381,8 +7875,9 @@ fn a_later_outage_is_a_new_one_with_its_own_window() {
 
 #[test]
 fn no_such_session_is_final_outside_an_outage_and_not_yet_inside_one() {
+    // Request 7 is `await seq 101`: the read's `title` is request 2.
     let mut m = Mock::new(vec![question_screen()]);
-    m.by_index.insert(6, err("no such session"));
+    m.by_index.insert(7, err("no such session"));
     let (lines, code) = watch_quick(&mut m, Duration::from_secs(5));
     assert_eq!(
         lines,
@@ -7392,12 +7887,12 @@ fn no_such_session_is_final_outside_an_outage_and_not_yet_inside_one() {
         ]
     );
     assert_eq!(code, 1);
-    assert_eq!(m.requests.len(), 8, "no retry: {:?}", m.requests);
+    assert_eq!(m.requests.len(), 9, "no retry: {:?}", m.requests);
 
     let mut m = Mock::new(vec![question_screen()]);
-    m.by_index.insert(6, closed());
-    m.by_index.insert(7, err("no such session"));
+    m.by_index.insert(7, closed());
     m.by_index.insert(8, err("no such session"));
+    m.by_index.insert(9, err("no such session"));
     m.vanish_after = Some(0);
     let (lines, code) = watch_quick(&mut m, Duration::from_secs(5));
     assert_eq!(lines.len(), 5, "{lines:?}");
@@ -7416,8 +7911,8 @@ fn no_such_session_is_final_outside_an_outage_and_not_yet_inside_one() {
     assert_eq!(code, 1);
 
     let mut m = Mock::new(vec![question_screen()]);
-    m.by_index.insert(6, closed());
-    m.down = Some((7, err("no such session")));
+    m.by_index.insert(7, closed());
+    m.down = Some((8, err("no such session")));
     let (lines, code) = watch_quick(&mut m, Duration::from_millis(60));
     assert_eq!(
         lines,
@@ -7432,7 +7927,7 @@ fn no_such_session_is_final_outside_an_outage_and_not_yet_inside_one() {
     assert_eq!(code, 1);
 
     let mut m = Mock::new(vec![question_screen()]);
-    m.by_index.insert(6, closed());
+    m.by_index.insert(7, closed());
     let (lines, code) = watch_quick(&mut m, Duration::ZERO);
     assert_eq!(
         lines,
@@ -7443,7 +7938,7 @@ fn no_such_session_is_final_outside_an_outage_and_not_yet_inside_one() {
     );
     assert_eq!(code, 1);
     assert_eq!(
-        m.requests[8..],
+        m.requests[9..],
         ["meta", "meta unset attention owner=supervisor"],
         "{:?}",
         m.requests
@@ -7454,8 +7949,9 @@ fn no_such_session_is_final_outside_an_outage_and_not_yet_inside_one() {
 fn a_connection_turned_away_is_ridden_out() {
     let text = "auth";
     let mut m = Mock::new(vec![question_screen()]);
-    m.by_index.insert(5, err(text));
+    // Requests 6 and 7 are the attention's set and `await seq 101`: the read's `title` is 2.
     m.by_index.insert(6, err(text));
+    m.by_index.insert(7, err(text));
     m.vanish_after = Some(0);
     let (lines, code) = watch_quick(&mut m, Duration::from_secs(5));
     assert_eq!(lines.len(), 5, "{text}: {lines:?}");
@@ -7536,10 +8032,11 @@ fn a_budget_spent_in_an_outage_is_the_timeout() {
     assert!(out.starts_with("TIMEOUT\nbusy\n"), "{out}");
     // The busy wait's first request, the `status` that reads the session log's head, meets
     // the outage, and the loop rides it out as it rides out its `await gone`.
+    let log = String::from_utf8(log).expect("utf-8");
     assert!(
-        String::from_utf8(log)
-            .expect("utf-8")
-            .starts_with("RECONNECT status failed: "),
+        log.starts_with("RECONNECT status failed: "),
+        "{log}\nrequests: {:?}",
+        m.requests
     );
 
     let mut m = Mock::new(vec![busy_screen()]);
@@ -9432,6 +9929,131 @@ fn an_auto_continue_notice_closes_at_the_first_busy_read_and_nothing_is_typed() 
     let _ = std::fs::remove_dir_all(&jdir);
 }
 
+/// A turn that ended with the agent's own shell still running: a break of its background work.
+fn shell_break() -> Vec<String> {
+    let mut r = rows(&[
+        "⏺ The server is up; I am watching its log.",
+        "",
+        "✻ Crunched for 2m 7s · 1 shell still running",
+        "",
+    ]);
+    r.extend(composer("  ⏵⏵ auto mode on · 1 shell · ← for agents"));
+    r
+}
+
+/// A NAMED RESET'S EPISODE CLOSES AT THE FIRST LIVE READ PAST IT (2026-10-29): the agent's own turn
+/// read live once the reset and its grace have passed is the agent working past the limit, and a
+/// turn of it may end at a break of its background work, where no point comes to close the
+/// episode. NEGATIVE CONTROLS: inside the grace the episode stands, and so it does at a break of
+/// the agent's own background work, which is no work past the limit.
+#[test]
+fn a_named_reset_episode_closes_at_the_first_live_read_past_it() {
+    let grace = i64::try_from(crate::harness::upgrade_drive::LIMIT_GRACE_S).expect("the grace");
+    let run = |tag: &str, screen: Vec<String>, ago_s: i64| {
+        let (jdir, path) = journal_file(tag);
+        let mut m = Mock::new(vec![screen]);
+        m.vanish_after = Some(2);
+        let opts = SuperviseOpts {
+            journal: Some(path.clone()),
+            ..auto(30)
+        };
+        let _ = watch_lines_with(&mut m, &opts, |s| {
+            s.seeds_learned_state("a limit episode open before the loop's first read");
+            s.limit = Some(Episode {
+                seq: 101,
+                resumes_itself: false,
+                reset_unix: Some(TEST_NOW - ago_s),
+                reset_text: "3pm".to_string(),
+                extended: false,
+                raised: false,
+                worked: false,
+                message: String::new(),
+            });
+        });
+        let (records, _) = journal_records(&path);
+        let _ = std::fs::remove_dir_all(&jdir);
+        records
+            .into_iter()
+            .filter(|r| r.kind == "cleared")
+            .map(|r| r.line)
+            .collect::<Vec<_>>()
+    };
+    let live = run("spent-live", busy_screen(), grace + 60);
+    assert!(
+        live.len() == 1 && live[0].ends_with("the worker works again past the limit's reset"),
+        "{live:#?}"
+    );
+    let within = run("spent-within", busy_screen(), grace - 60);
+    assert!(within.is_empty(), "{within:#?}");
+    let at_break = run("spent-break", shell_break(), grace + 60);
+    assert!(at_break.is_empty(), "{at_break:#?}");
+}
+
+/// A LIMIT EPISODE THE AGENT WORKED PAST CLOSES AT ITS BREAK (2026-10-29): the agent's own turn,
+/// read live after the wall and inside the reset's grace (the policy's resume taken), that ends at
+/// a settled break of its background work closes the episode there, as a point it ended at would.
+/// Before, the episode stood until the grace ran out, an hour past the reset, and held every line
+/// at such breaks meanwhile. NEGATIVE CONTROLS: a break no live read came before leaves the
+/// episode standing, and so does a live turn that met the wall again: the break after it reads as
+/// that wall.
+#[test]
+fn a_limit_episode_the_agent_worked_past_closes_at_its_break() {
+    let run = |tag: &str, screens: Vec<Vec<String>>| {
+        let (jdir, path) = journal_file(tag);
+        let mut m = Mock::new(screens);
+        m.vanish_after = Some(2);
+        let opts = SuperviseOpts {
+            journal: Some(path.clone()),
+            ..auto(30)
+        };
+        let _ = watch_lines_with(&mut m, &opts, |s| {
+            s.seeds_learned_state("a limit episode open before the loop's first read");
+            s.setup.background_settle = Duration::ZERO;
+            s.limit = Some(Episode {
+                seq: 101,
+                resumes_itself: false,
+                reset_unix: Some(TEST_NOW - 300),
+                reset_text: "3pm".to_string(),
+                extended: false,
+                raised: false,
+                worked: false,
+                message: String::new(),
+            });
+        });
+        let (records, _) = journal_records(&path);
+        let _ = std::fs::remove_dir_all(&jdir);
+        records.into_iter().map(|r| r.line).collect::<Vec<_>>()
+    };
+    let cleared = |lines: &[String]| -> Vec<String> {
+        lines
+            .iter()
+            .filter(|l| l.starts_with("CLEARED "))
+            .cloned()
+            .collect()
+    };
+    let worked = cleared(&run("worked-break", vec![busy_screen(), shell_break()]));
+    assert!(
+        worked.len() == 1
+            && worked[0]
+                .ends_with("the worker worked past the limit to a break of its background work"),
+        "{worked:#?}"
+    );
+    let unworked = cleared(&run("unworked-break", vec![shell_break()]));
+    assert!(unworked.is_empty(), "{unworked:#?}");
+    // The break after the wall again reads as that wall (the loop's wall memory).
+    let walled = run(
+        "walled-break",
+        vec![busy_screen(), limited_screen(), shell_break()],
+    );
+    assert!(
+        cleared(&walled).is_empty()
+            && walled
+                .iter()
+                .any(|l| l.starts_with("EVENT limited seq=103")),
+        "{walled:#?}"
+    );
+}
+
 #[test]
 fn a_continuing_shortly_notice_is_a_reset_a_minute_off() {
     let mut m = Mock::new(vec![busy_screen(), auto_waiting(SHORTLY_TEXT)]);
@@ -9602,7 +10224,7 @@ mod engine {
         use super::*;
         include!("run_box_key_tests.rs");
     }
-    mod box_hold {
+    pub(super) mod box_hold {
         use super::*;
         include!("run_box_hold_tests.rs");
     }
@@ -9615,6 +10237,9 @@ mod box_head_loop {
 
 #[path = "turn_end_loop_tests.rs"]
 mod turn_end;
+
+#[path = "run_point_key_tests.rs"]
+mod point_key;
 
 mod needs_loop {
     use super::*;
@@ -9634,11 +10259,20 @@ mod autopilot_loop {
 mod task_face_loop {
     use super::*;
     include!("task_face_loop_tests.rs");
+    mod receipt {
+        use super::*;
+        include!("receipt_loop_tests.rs");
+    }
 }
 
 mod hold_loop {
     use super::*;
     include!("hold_loop_tests.rs");
+}
+
+mod go_ahead_loop {
+    use super::*;
+    include!("go_ahead_loop_tests.rs");
 }
 
 mod wall_confirm_loop {
@@ -9679,4 +10313,9 @@ mod counterfactual_loop {
 mod corpus_loop {
     use super::*;
     include!("corpus_loop_tests.rs");
+}
+
+mod observe_table {
+    use super::*;
+    include!("observe_table_tests.rs");
 }

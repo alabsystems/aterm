@@ -1315,6 +1315,18 @@ pub(crate) fn linear_composites() -> u64 {
 }
 
 #[cfg(test)]
+thread_local! {
+    static STROKE_VISITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The pixels this thread's rounded strokes have weighed by their distance field so far
+/// (test-only): a stroke's cost is the difference across it.
+#[cfg(test)]
+fn stroke_visits() -> u64 {
+    STROKE_VISITS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
 fn lock_fonts() -> std::sync::MutexGuard<'static, ChromeFonts> {
     thread_local! {
         static FONTS: &'static Mutex<ChromeFonts> =
@@ -3242,16 +3254,19 @@ fn linear_to_srgb_u8_direct(l: f32) -> u8 {
     (encoded * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
-fn linear_to_srgb_u8(l: f32) -> u8 {
-    const BUCKETS: usize = 8_192;
-    struct Quantizer {
-        thresholds: [f32; 255],
-        coarse: [u8; BUCKETS + 1],
-    }
+/// [`linear_to_srgb_u8`]'s tables: the least linear value that encodes past each byte, and a
+/// coarse first guess per bucket of the unit interval.
+struct SrgbQuantizer {
+    thresholds: [f32; 255],
+    coarse: [u8; QUANTIZER_BUCKETS + 1],
+}
 
-    let l = l.clamp(0.0, 1.0);
-    static QUANTIZER: OnceLock<Quantizer> = OnceLock::new();
-    let quantizer = QUANTIZER.get_or_init(|| {
+const QUANTIZER_BUCKETS: usize = 8_192;
+
+fn srgb_quantizer() -> &'static SrgbQuantizer {
+    const BUCKETS: usize = QUANTIZER_BUCKETS;
+    static QUANTIZER: OnceLock<SrgbQuantizer> = OnceLock::new();
+    QUANTIZER.get_or_init(|| {
         let thresholds = std::array::from_fn(|n| {
             let mut low = 0.0_f32.to_bits();
             let mut high = 1.0_f32.to_bits();
@@ -3269,8 +3284,14 @@ fn linear_to_srgb_u8(l: f32) -> u8 {
             let linear = bucket as f32 / BUCKETS as f32;
             thresholds.partition_point(|&threshold| linear >= threshold) as u8
         });
-        Quantizer { thresholds, coarse }
-    });
+        SrgbQuantizer { thresholds, coarse }
+    })
+}
+
+fn linear_to_srgb_u8(l: f32) -> u8 {
+    const BUCKETS: usize = QUANTIZER_BUCKETS;
+    let l = l.clamp(0.0, 1.0);
+    let quantizer = srgb_quantizer();
     let bucket = ((l * BUCKETS as f32).floor() as usize).min(BUCKETS);
     let mut encoded = usize::from(quantizer.coarse[bucket]);
     while encoded < quantizer.thresholds.len() && l >= quantizer.thresholds[encoded] {
@@ -4049,6 +4070,18 @@ fn specimen_frame(spec: &TerminalSpecimenSpec, scale: f32) -> Option<Rc<aterm_re
 }
 
 fn render_specimen_frame(spec: &TerminalSpecimenSpec, scale: f32) -> Option<aterm_render::Frame> {
+    render_specimen_frame_observed(spec, scale, |_, _, _| {})
+}
+
+fn render_specimen_frame_observed(
+    spec: &TerminalSpecimenSpec,
+    scale: f32,
+    observe: impl FnOnce(
+        &aterm_render::RenderInput,
+        &mut Renderer,
+        Option<&crate::settings_preview::CursorScene>,
+    ),
+) -> Option<aterm_render::Frame> {
     type HeldFork = (u64, std::rc::Weak<Renderer>, Renderer);
     thread_local! {
         static SPECIMEN_RENDERERS: std::cell::RefCell<Vec<HeldFork>> =
@@ -4118,23 +4151,40 @@ fn render_specimen_frame(spec: &TerminalSpecimenSpec, scale: f32) -> Option<ater
         let input = walled.as_ref().unwrap_or(&*spec.input);
         Some(match spec.motion.as_deref() {
             Some(scene) => {
-                let ink = renderer.glyph_ink();
-                let input = scene.decorate_inked(input, renderer.cell_size(), Some(&ink));
-                let mut frame = renderer.try_render_input(&input).ok()?;
-                let place = renderer.fx_frame(frame.width, frame.height, input.rows);
-                let (cell_w, cell_h) = renderer.cell_size();
-                let grid = aterm_render::bloom::LetterGrid {
-                    pad: place.pad,
-                    grid_top: place.grid_top,
-                    cell_w,
-                    cell_h,
-                };
-                scene.post_process(&mut frame, &input, grid).ok()?;
+                let input = scene.decorate_with_renderer(input, renderer);
+                let frame = render_decorated_specimen_input(renderer, &input, Some(scene))?;
+                observe(&input, renderer, Some(scene));
                 frame
             }
-            None => renderer.try_render_input(input).ok()?,
+            None => {
+                let frame = render_decorated_specimen_input(renderer, input, None)?;
+                observe(input, renderer, None);
+                frame
+            }
         })
     })
+}
+
+/// Rasterize already-decorated input, including the scene's actual post passes, without
+/// advancing or replaying the scene.
+fn render_decorated_specimen_input(
+    renderer: &mut Renderer,
+    input: &aterm_render::RenderInput,
+    scene: Option<&crate::settings_preview::CursorScene>,
+) -> Option<aterm_render::Frame> {
+    let mut frame = renderer.try_render_input(input).ok()?;
+    if let Some(scene) = scene {
+        let place = renderer.fx_frame(frame.width, frame.height, input.rows);
+        let (cell_w, cell_h) = renderer.cell_size();
+        let grid = aterm_render::bloom::LetterGrid {
+            pad: place.pad,
+            grid_top: place.grid_top,
+            cell_w,
+            cell_h,
+        };
+        scene.post_process(&mut frame, input, grid).ok()?;
+    }
+    Some(frame)
 }
 
 /// `spec`'s card with `input` (a cursor scene's decorated cells, its lights cleared) in place
@@ -4153,6 +4203,41 @@ pub(crate) fn render_bare_scene_card(
         },
         scale,
     )
+}
+
+/// The rendered card and exact input/geometry its live renderer observed, plus the
+/// body-only counterfactual when the scene requested that observation.
+#[cfg(test)]
+pub(crate) struct ObservedSpecimen {
+    pub(crate) frame: aterm_render::Frame,
+    pub(crate) input: aterm_render::RenderInput,
+    pub(crate) cell: (usize, usize),
+    pub(crate) without_body: Option<aterm_render::Frame>,
+}
+
+#[cfg(test)]
+pub(crate) fn render_specimen_observed_for_test(
+    spec: &TerminalSpecimenSpec,
+    scale: f32,
+) -> Option<ObservedSpecimen> {
+    let mut observed = None;
+    let frame = render_specimen_frame_observed(spec, scale, |input, renderer, scene| {
+        let without_body = scene.and_then(|scene| {
+            let input = crate::settings_preview::scene_card_without_body_for_test(
+                input,
+                scene.fingerprint,
+            )?;
+            render_decorated_specimen_input(renderer, &input, Some(scene))
+        });
+        observed = Some((input.clone(), renderer.cell_size(), without_body));
+    })?;
+    let (input, cell, without_body) = observed?;
+    Some(ObservedSpecimen {
+        frame,
+        input,
+        cell,
+        without_body,
+    })
 }
 
 /// What `spec`'s card face lays of each glyph at `scale` ([`Renderer::glyph_ink`]), as the
@@ -4380,21 +4465,27 @@ impl Canvas {
     }
 
     /// A [`DrawPrim::Image`] in the `w`×`h` device rect at `(x, y)`: `art`
-    /// baked at exactly that many device pixels ([`baked_image`]) and
-    /// composited pixel by pixel at its own alpha, through the clip stack.
-    fn image(&mut self, x: f32, y: f32, w: f32, h: f32, art: crate::widget::ImageArt) {
+    /// baked at exactly that many device pixels ([`crate::widget::ImageArt::baked`]) and
+    /// composited pixel by pixel at its own alpha scaled by `alpha`, through the clip stack.
+    fn image(
+        &mut self,
+        (x, y, w, h): (f32, f32, f32, f32),
+        art: crate::widget::ImageArt,
+        alpha: u8,
+    ) {
         let (width, height) = (w.round().max(0.0) as u32, h.round().max(0.0) as u32);
-        if width == 0 || height == 0 {
+        if width == 0 || height == 0 || alpha == 0 {
             return;
         }
-        let pixels = baked_image(art, width, height);
+        let coverage = f32::from(alpha) / 255.0;
+        let pixels = art.baked(width, height);
         let (x0, y0) = (x.round() as i32, y.round() as i32);
         for (row, line) in pixels.chunks_exact(width as usize * 4).enumerate() {
             for (col, pixel) in line.as_chunks::<4>().0.iter().enumerate() {
                 if pixel[3] == 0 {
                     continue;
                 }
-                self.blend(x0 + col as i32, y0 + row as i32, *pixel, 1.0);
+                self.blend(x0 + col as i32, y0 + row as i32, *pixel, coverage);
             }
         }
     }
@@ -4539,7 +4630,22 @@ impl Canvas {
         }
     }
 
-    fn arc(&mut self, cx: f32, cy: f32, r_mid: f32, thickness: f32, frac: f32, c: [u8; 4]) {
+    /// A ring band of `thickness` about `r_mid` around `(cx, cy)`, filled for `frac` of the
+    /// turn clockwise from `start` turns past 12 o'clock, in `c`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one call per ring band; a struct would only rename the parameters"
+    )]
+    fn arc(
+        &mut self,
+        cx: f32,
+        cy: f32,
+        r_mid: f32,
+        thickness: f32,
+        start: f32,
+        frac: f32,
+        c: [u8; 4],
+    ) {
         let frac = frac.clamp(0.0, 1.0);
         // A clear ink (a `Ring`'s clear track) blends nothing.
         if frac <= 0.0 || c[3] == 0 {
@@ -4570,7 +4676,7 @@ impl Canvas {
                 }
                 let mut cov_a = 1.0;
                 if frac < 1.0 {
-                    let a = dx.atan2(-dy).rem_euclid(TAU) / TAU;
+                    let a = (dx.atan2(-dy).rem_euclid(TAU) / TAU - start).rem_euclid(1.0);
                     let d_frac = if a <= frac {
                         -(a.min(frac - a)) // inside (negative)
                     } else {
@@ -4808,28 +4914,45 @@ impl Canvas {
             (x + w + sw + 1.0).ceil() as i32,
             (y + h + sw + 1.0).ceil() as i32,
         );
-        // The box `m` inside the rect's edges is ink-free: there both of the distance's axes are
-        // within the straight sides (`m ≥ r`), so `sd_round_box ≤ -m` and `|sd| - hw ≥ 2`, which
-        // `cov` makes 0. Its pixels are skipped, so a stroke costs its rim, not its whole box.
-        let m = r.max(hw + 1.0) + 1.0;
-        let hole_x = (
-            (cx - hx + m - 0.5).ceil() as i32,
-            (cx + hx - m - 0.5).floor() as i32 + 1,
-        );
-        let hole_y = (
-            (cy - hy + m - 0.5).ceil() as i32,
-            (cy + hy - m - 0.5).floor() as i32 + 1,
-        );
+        // The rect inset by `t` is ink-free: there `sd_round_box ≤ -t`, so `|sd| - hw ≥ 2`, which
+        // `cov` makes 0. Each row skips its span of that inset ([`inset_half_width`]), so a
+        // stroke costs its line and its corners, not a band as deep as its radius.
+        let t = hw + 2.0;
+        let mut memo = RimMemo::default();
         for py in y0..y1 {
-            let gap = if hole_x.0 < hole_x.1 && (hole_y.0..hole_y.1).contains(&py) {
-                hole_x.0.clamp(x0, x1)..hole_x.1.clamp(x0, x1)
+            let pyc = py as f32 + 0.5;
+            let gap = inset_half_width(pyc - cy, (hx, hy, r), t)
+                .map_or(x1..x1, |half| columns_within(cx, half, x0, x1));
+            // A row the inset misses, past the straight sides' ends (`qy > 0`), is the same
+            // distance from the edge (`qy - r`) at every column between those sides: they take
+            // one coverage as one span. The column at each end of it is weighed alone.
+            let qy = (pyc - cy).abs() - (hy - r);
+            let flat = if gap.is_empty() && qy > 0.0 {
+                let run = columns_within(cx, hx - r, x0, x1);
+                if run.end - run.start > 2 {
+                    run.start + 1..run.end - 1
+                } else {
+                    x1..x1
+                }
             } else {
                 x1..x1
             };
-            for px in (x0..gap.start).chain(gap.end..x1) {
-                let d =
-                    sd_round_box(px as f32 + 0.5, py as f32 + 0.5, cx, cy, hx, hy, r).abs() - hw;
+            let skip = if gap.is_empty() { flat.clone() } else { gap };
+            for px in (x0..skip.start).chain(skip.end..x1) {
+                #[cfg(test)]
+                STROKE_VISITS.with(|n| n.set(n.get() + 1));
+                let d = sd_round_box(px as f32 + 0.5, pyc, cx, cy, hx, hy, r).abs() - hw;
                 self.blend(px, py, c, cov(d));
+            }
+            if !flat.is_empty() {
+                self.blend_span(
+                    flat.start,
+                    flat.end,
+                    py,
+                    c,
+                    cov((qy - r).abs() - hw),
+                    &mut memo,
+                );
             }
         }
     }
@@ -4992,6 +5115,31 @@ fn rim_on_grid(
     let (oy, oh) = device_snapped(y - sw / 2.0, h + sw);
     let sw = sw.round().max(1.0);
     (ox + sw / 2.0, oy + sw / 2.0, ow - sw, oh - sw, sw)
+}
+
+/// How far either side of its centre the rounded box of half-extents `hx`×`hy` and corner `r`,
+/// inset by `t`, reaches on the row `dy` from its centre, or `None` where the row misses it. The
+/// inset of a rounded box is exactly the box `t` smaller with corners of `r - t`, square once `t`
+/// passes `r`: its distance field is the outer one plus `t`.
+fn inset_half_width(dy: f32, (hx, hy, r): (f32, f32, f32), t: f32) -> Option<f32> {
+    let (ix, iy, ir) = (hx - t, hy - t, (r - t).max(0.0));
+    let dy = dy.abs();
+    if ix <= 0.0 || dy > iy {
+        return None;
+    }
+    let qy = dy - (iy - ir);
+    Some(if qy <= 0.0 {
+        ix
+    } else {
+        ix - ir + (ir * ir - qy * qy).max(0.0).sqrt()
+    })
+}
+
+/// The columns of `x0..x1` whose pixel centres lie within `half` of `cx`, or the empty `x1..x1`.
+fn columns_within(cx: f32, half: f32, x0: i32, x1: i32) -> std::ops::Range<i32> {
+    let start = ((cx - half - 0.5).ceil() as i32).clamp(x0, x1);
+    let end = ((cx + half - 0.5).floor() as i32 + 1).clamp(x0, x1);
+    if start < end { start..end } else { x1..x1 }
 }
 
 /// Whether [`Canvas::stroke_rect`] draws a stroke rounded (by its distance field).
@@ -5268,6 +5416,10 @@ thread_local! {
 
 type DeviceRect = (i32, i32, i32, i32);
 
+/// The prims as GPU tray prims, and the composite law the GPU reads (`tray_gpu_prims.rs`).
+#[path = "tray_gpu_prims.rs"]
+pub(crate) mod gpu_prims;
+
 fn device_clip_rect(x: f32, y: f32, w: f32, h: f32) -> DeviceRect {
     (
         x.floor() as i32,
@@ -5380,39 +5532,6 @@ fn tile_around(tile: DeviceRect, covered: DeviceRect) -> impl Iterator<Item = De
     ]
     .into_iter()
     .filter(|rect| rect.0 < rect.2 && rect.1 < rect.3)
-}
-
-/// How many baked [`DrawPrim::Image`] bitmaps a raster thread keeps: a page
-/// shows one or two, at one size per display scale and theme.
-const BAKED_IMAGES_KEPT: usize = 4;
-
-/// A baked bitmap's key: the art and its device width and height.
-type BakedImageKey = (crate::widget::ImageArt, u32, u32);
-
-thread_local! {
-    static BAKED_IMAGES: std::cell::RefCell<Vec<(BakedImageKey, Rc<[u8]>)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// `art` baked at `width`×`height` device pixels: baked once per size and
-/// kept, so a page that repaints draws the same pixels without a re-bake.
-fn baked_image(art: crate::widget::ImageArt, width: u32, height: u32) -> Rc<[u8]> {
-    BAKED_IMAGES.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        let key = (art, width, height);
-        if let Some(at) = cache.iter().position(|(baked, _)| *baked == key) {
-            let entry = cache.remove(at);
-            let pixels = Rc::clone(&entry.1);
-            cache.push(entry);
-            return pixels;
-        }
-        let pixels: Rc<[u8]> = art.bake(width, height).into();
-        if cache.len() >= BAKED_IMAGES_KEPT {
-            cache.remove(0);
-        }
-        cache.push((key, Rc::clone(&pixels)));
-        pixels
-    })
 }
 
 /// The device pixels the first opaque [`DrawPrim::Panel`] after `prims[at]`, in the unbroken run
@@ -5541,13 +5660,14 @@ fn replay_tray(
                 r_outer,
                 thickness,
                 track,
+                start,
                 frac,
                 fill,
             } => {
                 let r_mid = (r_outer - thickness / 2.0) * s;
                 let th = thickness * s;
-                cv.arc(cx * s, cy * s, r_mid, th, 1.0, *track);
-                cv.arc(cx * s, cy * s, r_mid, th, *frac, *fill);
+                cv.arc(cx * s, cy * s, r_mid, th, 0.0, 1.0, *track);
+                cv.arc(cx * s, cy * s, r_mid, th, *start, *frac, *fill);
             }
             DrawPrim::Capsule {
                 x,
@@ -5656,7 +5776,14 @@ fn replay_tray(
                 icon,
                 color,
             } => cv.band_icon(x * s, y * s, size * s, *icon, *color),
-            DrawPrim::Image { x, y, w, h, art } => cv.image(x * s, y * s, w * s, h * s, *art),
+            DrawPrim::Image {
+                x,
+                y,
+                w,
+                h,
+                art,
+                alpha,
+            } => cv.image((x * s, y * s, w * s, h * s), *art, *alpha),
             DrawPrim::ClipPush { .. }
             | DrawPrim::ClipPop
             | DrawPrim::FadePush { .. }
@@ -6419,6 +6546,7 @@ mod tests {
                 r_outer: 26.0,
                 thickness: 7.0,
                 track,
+                start: 0.0,
                 frac: 0.3 + i as f32 * 0.2,
                 fill: good,
             });
@@ -9070,6 +9198,10 @@ mod tests {
             (4.0, 8.0, 59.0, 17.0, 0.75, 3.0),
             (3.3, 4.1, 50.0, 30.0, 14.0, 1.0),
             (0.5, 0.5, 63.0, 47.0, 28.0, 2.0),
+            (2.0, 3.0, 61.0, 42.0, 2.5, 1.5),
+            (3.0, 3.0, 8.0, 30.0, 3.0, 2.5),
+            (1.75, 2.25, 60.0, 44.0, 19.2, 3.0),
+            (5.0, 6.0, 52.0, 21.0, 10.0, 4.0),
         ];
         let paints = [
             ([0, 0, 0, 0], [18, 28, 42, 255]),
@@ -9111,6 +9243,30 @@ mod tests {
         }
     }
 
+    /// A rounded stroke weighs its upright sides' line and its corners, not a band as deep as its
+    /// radius, nor its top and bottom pixel by pixel: the rim of a 2x card (corners of 28 pixels,
+    /// a 2-pixel line) and a selection ring weigh at most their height times their line and
+    /// margins, plus four squares a little bigger than their corners.
+    #[test]
+    fn a_rounded_stroke_visits_its_line_and_corners_not_a_band_its_radius_deep() {
+        for (w, h, r, width) in [
+            (400.0_f32, 300.0_f32, 28.0_f32, 2.0_f32),
+            (1520.0, 980.0, 28.0, 2.0),
+            (1500.0, 34.0, 10.2, 3.0),
+        ] {
+            let mut canvas = Canvas::new(w as u32 + 20, h as u32 + 20, [0, 0, 0, 0]);
+            let before = stroke_visits();
+            canvas.stroke_rect(10.0, 10.0, w, h, r, width, [92, 176, 255, 255]);
+            let visits = stroke_visits() - before;
+            let corner = r + 2.0 * width + 4.0;
+            let budget = 2.0 * h * (2.0 * width + 6.0) + 4.0 * corner * corner;
+            assert!(
+                visits as f32 <= budget,
+                "a {w}x{h} stroke, corners {r}, line {width}: {visits} pixels weighed, past {budget}"
+            );
+        }
+    }
+
     /// A ring inks exactly what the distance field over its whole box inks, though it visits only
     /// its band: whole and partial, with a hole and without, at fractional centres, clipped or
     /// not; and a clear ink inks nothing.
@@ -9141,7 +9297,7 @@ mod tests {
                         band.push_clip(x, y, w, h);
                         every.push_clip(x, y, w, h);
                     }
-                    band.arc(cx, cy, r_mid, th, frac, color);
+                    band.arc(cx, cy, r_mid, th, 0.0, frac, color);
 
                     let r_out = r_mid + th / 2.0;
                     let (x0, y0, x1, y1) = every.clipped_bounds(
@@ -9171,7 +9327,15 @@ mod tests {
                         "ring ({cx},{cy}) r={r_mid} th={th} frac={frac} colour={color:?} clip={clip:?}"
                     );
                     let mut clear = Canvas::new(66, 52, backdrop);
-                    clear.arc(cx, cy, r_mid, th, frac, [color[0], color[1], color[2], 0]);
+                    clear.arc(
+                        cx,
+                        cy,
+                        r_mid,
+                        th,
+                        0.0,
+                        frac,
+                        [color[0], color[1], color[2], 0],
+                    );
                     assert!(
                         clear.px == Canvas::new(66, 52, backdrop).px,
                         "a clear ring inks"
@@ -9193,6 +9357,7 @@ mod tests {
             r_outer,
             thickness,
             track: [90, 90, 90, 255],
+            start: 0.0,
             frac: 1.0,
             fill: ink,
         };

@@ -11,11 +11,20 @@ const SUBSAMPLES: u32 = 8;
 /// The icon at `px` × `px` pixels: one coverage byte per pixel (0 clear, 255 ink).
 #[must_use]
 pub fn coverage(lit: bool, px: u32) -> Vec<u8> {
-    let n = px as usize;
-    let mut out = vec![0u8; n * n];
+    let Some((n, total)) = usize::try_from(px)
+        .ok()
+        .and_then(|n| n.checked_mul(n).map(|total| (n, total)))
+    else {
+        return Vec::new();
+    };
     if n == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    if out.try_reserve_exact(total).is_err() {
         return out;
     }
+    out.resize(total, 0);
     let step = SIZE_POINTS / f64::from(px);
     let sub = f64::from(SUBSAMPLES);
     let samples = SUBSAMPLES * SUBSAMPLES;
@@ -40,8 +49,20 @@ pub fn coverage(lit: bool, px: u32) -> Vec<u8> {
 /// [`coverage`] as an 8-bit RGBA template PNG (black with coverage as alpha).
 #[must_use]
 pub fn png(lit: bool, px: u32) -> Vec<u8> {
+    if px == 0 {
+        return Vec::new();
+    }
     let alpha = coverage(lit, px);
-    let mut rgba = Vec::with_capacity(alpha.len() * 4);
+    if alpha.is_empty() {
+        return Vec::new();
+    }
+    let Some(cap) = alpha.len().checked_mul(4) else {
+        return Vec::new();
+    };
+    let mut rgba = Vec::new();
+    if rgba.try_reserve_exact(cap).is_err() {
+        return Vec::new();
+    }
     for a in alpha {
         rgba.extend_from_slice(&[0, 0, 0, a]);
     }
@@ -248,6 +269,9 @@ mod tests {
             }
         }
         assert!(coverage(true, 0).is_empty());
+        assert!(coverage(true, u32::MAX).is_empty());
+        assert!(png(true, 0).is_empty());
+        assert!(png(true, u32::MAX).is_empty());
     }
 
     #[test]

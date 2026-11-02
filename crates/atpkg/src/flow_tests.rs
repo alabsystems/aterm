@@ -3037,7 +3037,9 @@ fn a_member_stage_failure_aborts_the_group_and_a_retry_heals_it() {
 
 /// `fake` with each row signing its archive's true size, as published rows do, so a group
 /// pass stages each download as it arrives; with `wrong_sha`, that program's row signs bytes
-/// its archive does not hold.
+/// its archive does not hold. Unix only, as staging a download as it arrives is
+/// ([`crate::flow::arriving::streams`]).
+#[cfg(unix)]
 fn true_sized(mut fake: Fake, wrong_sha: Option<&str>) -> Fake {
     for ((program, build), (body, sig)) in &mut fake.pkg {
         let asset = format!("{program}-{build}.tar.zst");
@@ -3058,12 +3060,15 @@ fn true_sized(mut fake: Fake, wrong_sha: Option<&str>) -> Fake {
 
 /// A fetcher that writes each archive into `<dest>.part`, as curl does, and finishes the
 /// download only once the pass has laid that archive's tree into a staging scratch beside its
-/// builds: a pass that stages only a completed download never gets past it.
+/// builds: a pass that stages only a completed download never gets past it. Unix only, as
+/// staging a download as it arrives is ([`crate::flow::arriving::streams`]).
+#[cfg(unix)]
 struct HeldUntilLaid {
     inner: Fake,
     layout: Layout,
 }
 
+#[cfg(unix)]
 impl HeldUntilLaid {
     /// Whether a staging scratch of `program` holds its laid binary.
     fn laid(&self, program: &str) -> bool {
@@ -3080,6 +3085,7 @@ impl HeldUntilLaid {
     }
 }
 
+#[cfg(unix)]
 impl Fetcher for HeldUntilLaid {
     fn index_candidates(&self) -> Result<Vec<Candidate>, String> {
         self.inner.index_candidates()
@@ -3112,7 +3118,9 @@ impl Fetcher for HeldUntilLaid {
 }
 
 /// STAGED AS IT ARRIVES: each member's tree is laid while its download is still running, and
-/// the group lands exactly as one staged from completed downloads does.
+/// the group lands exactly as one staged from completed downloads does. Unix only, as staging
+/// a download as it arrives is ([`crate::flow::arriving::streams`]).
+#[cfg(unix)]
 #[test]
 fn a_group_pass_lays_each_tree_while_its_download_runs_and_lands_it() {
     let dir = scratch("as-it-arrives");
@@ -3150,7 +3158,8 @@ fn a_group_pass_lays_each_tree_while_its_download_runs_and_lands_it() {
 
 /// The control of the row above: the same pass, the tree laid as the bytes arrive, but one
 /// row signs other bytes. The streamed stage is thrown away and the group aborts before any
-/// flip, exactly as a download that missed its digest always did.
+/// flip, exactly as a download that missed its digest always did. Unix only, as the row above.
+#[cfg(unix)]
 #[test]
 fn a_tree_laid_from_bytes_that_miss_their_signed_digest_aborts_the_group() {
     let dir = scratch("as-it-arrives-mismatch");

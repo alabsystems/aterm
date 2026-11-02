@@ -38,9 +38,10 @@ fn dump(frames: &[String]) -> String {
 
 /// The comparison of two dumps' texts.
 fn report(head: &str, base: &str) -> Report {
-    compare(
+    compare_declared(
         &parse_dump(head).expect("the head's dump parses"),
         &parse_dump(base).expect("the base's dump parses"),
+        &|_| false,
     )
 }
 
@@ -54,7 +55,8 @@ fn equal_dumps_report_nothing_and_exit_0() {
     let r = report(&d, &d);
     assert_eq!(
         r.totals(),
-        "scripts=1 frames=3 differing_compared=0 arm_frames=0 state_differing=0 dark_arms=0"
+        "scripts=1 frames=3 differing_compared=0 arm_frames=0 state_differing=0 dark_arms=0 \
+         unexpected_arms=0"
     );
     assert!(r.firsts.is_empty() && r.arms.is_empty(), "{r:?}");
     assert_eq!(verdict(&r, None), (0, None));
@@ -174,7 +176,11 @@ fn a_light_arm_on_a_dark_ground_fails() {
           head=light=3 arms=glass:glow_under base=light=0 arms="
         ]
     );
-    assert!(r.totals().ends_with(" dark_arms=1"), "{}", r.totals());
+    assert!(
+        r.totals().ends_with(" dark_arms=1 unexpected_arms=0"),
+        "{}",
+        r.totals()
+    );
     // A dark script's frames with no arm pass; a script merely named for the dark does not
     // count as one.
     let r = report(&dark(&frame(&[])), &dark(&frame(&[])));
@@ -184,6 +190,59 @@ fn a_light_arm_on_a_dark_ground_fails() {
     assert_eq!((r.arm_frames, r.dark_arms), (1, 0), "{r:?}");
     assert!(dark_script("crates/x/trail-diff/dark/split.trail"));
     assert!(!dark_script("dark.trail") && !dark_script("glass/flip-dark-to-light.trail"));
+}
+
+/// A script that declares `# expect: no-arms` (a light page whose light is sheer) fails on any
+/// frame where an arm drew, in either build, lit or not, whatever its streams say; the same arm
+/// in a script that declares nothing is listed and passes (the negative control). The
+/// declaration is a line of its own.
+#[test]
+fn an_arm_in_a_script_that_expects_none_fails() {
+    let lit = frame(&[("light=0 arms=-", "light=3 arms=glass:glow_under")]);
+    let plain = dump(&[frame(&[])]);
+    let declared = |name: &str| name == "light/typing.trail";
+    for (head, base) in [
+        (dump(std::slice::from_ref(&lit)), plain.clone()),
+        (plain.clone(), dump(std::slice::from_ref(&lit))),
+    ] {
+        let (h, b) = (
+            parse_dump(&head).expect("the head's dump parses"),
+            parse_dump(&base).expect("the base's dump parses"),
+        );
+        let r = compare_declared(&h, &b, &declared);
+        assert_eq!(
+            (
+                r.arm_frames,
+                r.differing_compared,
+                r.dark_arms,
+                r.unexpected_arms
+            ),
+            (1, 0, 0, 1),
+            "{r:?}"
+        );
+        assert!(r.differs(), "{r:?}");
+        assert!(
+            r.firsts[0].contains("arms in a script that expects none"),
+            "{r:?}"
+        );
+        assert!(r.totals().ends_with(" unexpected_arms=1"), "{}", r.totals());
+        assert_eq!(verdict(&r, None).0, 1);
+        let r = compare_declared(&h, &b, &|_| false);
+        assert_eq!((r.arm_frames, r.unexpected_arms), (1, 0), "{r:?}");
+        assert!(!r.differs(), "the negative control: {r:?}");
+    }
+    let r = compare_declared(
+        &parse_dump(&plain).expect("the dump parses"),
+        &parse_dump(&plain).expect("the dump parses"),
+        &declared,
+    );
+    assert!(!r.differs(), "no arm drew: {r:?}");
+    assert!(declares_no_arms(
+        "# Copyright\n# expect: no-arms\n\ngrid 8 40\n"
+    ));
+    assert!(declares_no_arms("# expect: no-arms  \n"));
+    assert!(!declares_no_arms("# it would expect: no-arms\n"));
+    assert!(!declares_no_arms("grid 8 40\n"));
 }
 
 #[test]
@@ -344,12 +403,14 @@ fn each_script_prints_its_first_difference_and_its_arm_frames_as_ranges() {
     );
     assert_eq!(
         r.totals(),
-        "scripts=2 frames=7 differing_compared=2 arm_frames=4 state_differing=1 dark_arms=0"
+        "scripts=2 frames=7 differing_compared=2 arm_frames=4 state_differing=1 dark_arms=0 \
+         unexpected_arms=0"
     );
     let printed = r.render();
     assert!(
         printed.ends_with(
-            "scripts=2 frames=7 differing_compared=2 arm_frames=4 state_differing=1 dark_arms=0\n"
+            "scripts=2 frames=7 differing_compared=2 arm_frames=4 state_differing=1 dark_arms=0 \
+             unexpected_arms=0\n"
         ),
         "{printed}"
     );

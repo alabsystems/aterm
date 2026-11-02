@@ -575,13 +575,37 @@ pub(crate) fn classify(
         }
     };
     let mut subject = None;
+    // A turn that ended while the agent's own background work runs on is a turn end: published
+    // as the phase it rests at, so the session log closes the turn there and `agent=` says the
+    // composer takes the next message. The reader's phase stays busy for the supervisor's breaks.
+    // The rest stands only as the reader's own reading of that phase would: authoritative, and
+    // an idle one only where the cursor is in the composer (an agents panel holding it, or no
+    // cursor read, keeps the busy the reader read).
+    let read = match r.phase {
+        aterm_phase::Phase::Busy => reader
+            .background_rest(rows)
+            .filter(|rest| {
+                let rested = aterm_phase::Reading {
+                    phase: rest.clone(),
+                    ..r.clone()
+                };
+                reader.phase_authoritative(rows, rest)
+                    && match cursor {
+                        Cursor::At(row) => reader.cursor_vouches(rows, &rested, row),
+                        #[cfg(test)]
+                        Cursor::Unknown => true,
+                    }
+            })
+            .unwrap_or(aterm_phase::Phase::Busy),
+        p => p,
+    };
     let phase = if !r.phase_authoritative {
         AgentPhase::Unknown
     } else if let Some(w) = r.wall {
         subject = api_cause_words(w.kind).map(str::to_string);
         wall(w.kind, w.reset)
     } else {
-        match r.phase {
+        match read {
             aterm_phase::Phase::Busy => AgentPhase::Busy,
             aterm_phase::Phase::Prompt => {
                 subject = r
@@ -973,8 +997,10 @@ mod tests {
         );
     }
 
+    /// `classify` publishes aterm-phase's verdict, its busy at a turn over under the agent's own
+    /// background work as the phase that turn rests at ([`aterm_phase::background_rest`]).
     #[test]
-    fn classify_is_aterm_phases_verdict() {
+    fn classify_is_aterm_phases_verdict_or_its_background_rest() {
         let rows = |body: &[&str]| body.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let mut done_at_composer = rows(&["\u{23fa} Done.", ""]);
         done_at_composer.extend(aterm_phase::prompt::fixtures::composer("  ? for shortcuts"));
@@ -988,6 +1014,9 @@ mod tests {
                 "\u{00b7} Cogitating\u{2026} (12s)",
             ]),
             rows(&[]),
+            aterm_phase::prompt::fixtures::screen(
+                aterm_phase::prompt::fixtures::WAITING_WORKFLOWS_2_1_310,
+            ),
         ];
         let mut words = Vec::new();
         for screen in &screens {
@@ -999,7 +1028,10 @@ mod tests {
                 Instant::now(),
             );
             let want = if verdict.phase_authoritative {
-                verdict.phase.name()
+                aterm_phase::background_rest(screen)
+                    .filter(|_| verdict.phase == aterm_phase::Phase::Busy)
+                    .unwrap_or(verdict.phase)
+                    .name()
             } else {
                 "unknown"
             };
@@ -1009,8 +1041,8 @@ mod tests {
         }
         assert_eq!(
             words,
-            ["question", "unknown", "idle", "busy", "unknown"],
-            "both halves of the mapping are exercised"
+            ["question", "unknown", "idle", "busy", "unknown", "idle"],
+            "both halves of the mapping and the rest are exercised"
         );
         let (limited, _, _) = classify(
             &aterm_phase::ClaudeReader,
@@ -1027,6 +1059,182 @@ mod tests {
                 "{reset:?}"
             );
         }
+    }
+
+    /// A Claude Code turn that ended while its own background work runs on is published at the
+    /// phase it rests at, never `busy` for as long as the work runs (the cruise stall of
+    /// 2026-10-24..27: a tab read `agent=busy` for 19 h over three dynamic workflows it started,
+    /// its log's turn open for 70 h); a live turn over the same work stays `busy`.
+    #[test]
+    fn a_turn_over_under_its_own_background_work_publishes_its_rest() {
+        use aterm_phase::prompt::fixtures::{
+            IDLE_SHELLS_2_1_271, WAITING_WORKFLOWS_2_1_310, screen,
+        };
+        let word = |rows: &[String], cursor: Option<usize>| {
+            agent_verdict(Some("claude"), false, None, rows, Cursor::At(cursor), t0()).word()
+        };
+        let caret_of = |rows: &[String]| rows.iter().rposition(|r| r.starts_with('❯'));
+        let workflows = screen(WAITING_WORKFLOWS_2_1_310);
+        let caret = caret_of(&workflows);
+        assert!(caret.is_some(), "the composer's row");
+        assert_eq!(
+            aterm_phase::read(Some("claude"), &workflows, None).phase,
+            aterm_phase::Phase::Busy,
+            "the reader's phase stays busy for the supervisor's break"
+        );
+        assert_eq!(word(&workflows, caret), "idle", "captured 2.1.310 screen");
+        let shells = screen(IDLE_SHELLS_2_1_271);
+        let at_caret = caret_of(&shells);
+        assert_eq!(word(&shells, at_caret), "idle", "two shells left running");
+        let done = "✻ Cogitated for 3m 12s · done 9:29 PM · 2 shells still running";
+        let at = shells.iter().position(|r| r == done).expect("the done row");
+        let mut asked = shells.clone();
+        asked[at - 2] = asked[at - 2].replace("when they notify.", "when they notify?");
+        assert_eq!(word(&asked, at_caret), "question", "its turn ended asking");
+        assert_eq!(
+            word(&asked, None),
+            "question",
+            "a question stands wherever the cursor is, as the reader's own does"
+        );
+        // NEGATIVE CONTROLS: a live turn over the same background work is busy.
+        let mut live = shells.clone();
+        live[at] = "✶ Pondering… (2m 5s · esc to interrupt)".to_string();
+        assert_eq!(word(&live, at_caret), "busy", "a live turn over two shells");
+        let (head, panel) = workflows
+            .iter()
+            .find_map(|r| {
+                r.starts_with("✻ Waiting for 3 dynamic workflows")
+                    .then(|| r.split_once('│'))
+                    .flatten()
+            })
+            .expect("the waiting row and its panel");
+        let mut working = workflows.clone();
+        let wait = working
+            .iter()
+            .position(|r| r.starts_with("✻ Waiting for 3"))
+            .expect("the waiting row");
+        working[wait] = format!(
+            "{:<w$}│{panel}",
+            "· Wibbling… (4m 36s · ↓ 16.4k tokens)",
+            w = head.chars().count()
+        );
+        assert_eq!(
+            word(&working, caret),
+            "busy",
+            "a live turn over three workflows"
+        );
+    }
+
+    /// The rest's idle stands only as the reader's own idle would: with the cursor in the
+    /// composer. An agents panel holding the cursor (a key typed there goes to the panel: `x`
+    /// stops the agent) or no cursor read keeps the busy the reader read, never `idle` and never a
+    /// wall the turn has not ended on.
+    #[test]
+    fn a_rest_is_published_only_where_the_reader_would_vouch_for_it() {
+        use aterm_phase::prompt::fixtures::{
+            AGENTS_PANEL_AGENT_SELECTED_2_1_304, IDLE_SHELLS_2_1_271, WAITING_WORKFLOWS_2_1_310,
+            WRAPUP_WAITING_2_1_283, screen,
+        };
+        let word = |rows: &[String], cursor: Option<usize>| {
+            agent_verdict(Some("claude"), false, None, rows, Cursor::At(cursor), t0()).word()
+        };
+        let panel = screen(AGENTS_PANEL_AGENT_SELECTED_2_1_304);
+        assert_eq!(
+            aterm_phase::read(Some("claude"), &panel, None).phase,
+            aterm_phase::Phase::Busy
+        );
+        assert_eq!(
+            aterm_phase::background_rest(&panel),
+            Some(aterm_phase::Phase::Idle),
+            "its turn is over under a background agent"
+        );
+        let selected = panel
+            .iter()
+            .position(|r| r.starts_with("❯ ◯ general-purpose"))
+            .expect("the selected agent row");
+        let composer = panel
+            .iter()
+            .position(|r| r.trim_end() == "❯")
+            .expect("the composer's caret row");
+        assert!(composer < selected);
+        assert_eq!(
+            word(&panel, Some(selected)),
+            "busy",
+            "the panel holds the cursor"
+        );
+        assert_eq!(word(&panel, None), "busy", "no cursor read");
+        assert_eq!(
+            word(&panel, Some(composer)),
+            "idle",
+            "CONTROL: the composer holds it"
+        );
+        for text in [WAITING_WORKFLOWS_2_1_310, IDLE_SHELLS_2_1_271] {
+            let rows = screen(text);
+            assert_eq!(word(&rows, None), "busy", "no cursor read");
+        }
+        // A limit's notice drawn while the turn wraps up is no wall yet, and no rest.
+        let wrapup = screen(WRAPUP_WAITING_2_1_283);
+        let caret = wrapup.iter().rposition(|r| r.starts_with('❯'));
+        assert_eq!(word(&wrapup, caret), "busy");
+    }
+
+    /// A `/goal` runs on through its wait, its mark run into the update hint's row as Claude Code
+    /// 2.1.283 draws it (`✔ Update installed · Restart to update◎ /goal active (1d)`): the
+    /// measured wrap-up screen with its limit notice gone, the cursor in the composer, publishes
+    /// `busy`, never the rest's `idle`. CONTROL: with its goal mark gone too, `idle`.
+    #[test]
+    fn a_goal_run_into_the_update_hint_publishes_no_rest() {
+        use aterm_phase::prompt::fixtures::{WRAPUP_WAITING_2_1_283, screen};
+        let word = |rows: &[String]| {
+            let caret = rows.iter().rposition(|r| r.starts_with('❯'));
+            agent_verdict(Some("claude"), false, None, rows, Cursor::At(caret), t0()).word()
+        };
+        let unnoticed: Vec<String> = screen(WRAPUP_WAITING_2_1_283)
+            .into_iter()
+            .filter(|r| !r.contains("Usage limit reached"))
+            .collect();
+        assert_eq!(word(&unnoticed), "busy", "its goal runs on");
+        let hint = "✔ Update installed · Restart to update";
+        let goalless: Vec<String> = unnoticed
+            .iter()
+            .map(|r| match r.split_once(hint) {
+                Some((lead, _)) => format!("{lead}{hint}"),
+                None => r.clone(),
+            })
+            .collect();
+        assert_ne!(goalless, unnoticed, "the goal mark is cut");
+        assert_eq!(
+            word(&goalless),
+            "idle",
+            "CONTROL: the goal mark is what keeps it busy"
+        );
+    }
+
+    /// The live Claude Code 2.1.316 session this fix was measured on (2026-10-31, aterm 0.147.0
+    /// publishing `agent=busy` for 30 minutes over its rest): with the cursor where it was
+    /// captured, row 47 column 2, its turn over under two background agents and three dynamic
+    /// workflows publishes `idle`, and the live turn it ran 17 minutes earlier, with the cursor
+    /// on its empty composer, publishes `busy`.
+    #[test]
+    fn the_live_2_1_316_sessions_rest_publishes_idle_and_its_live_turn_busy() {
+        use aterm_phase::prompt::fixtures::{
+            INFERRING_OVER_BACKGROUND_2_1_316, WAITING_AGENTS_WORKFLOWS_2_1_316, screen,
+        };
+        let word = |rows: &[String], cursor: Option<usize>| {
+            agent_verdict(Some("claude"), false, None, rows, Cursor::At(cursor), t0()).word()
+        };
+        let rest = screen(WAITING_AGENTS_WORKFLOWS_2_1_316);
+        assert_eq!(
+            aterm_phase::read(Some("claude"), &rest, Some(2)).phase,
+            aterm_phase::Phase::Busy,
+            "the reader's phase stays busy for the supervisor's break"
+        );
+        assert_eq!(word(&rest, Some(47)), "idle", "the captured cursor");
+        assert_eq!(word(&rest, None), "busy", "no cursor read");
+        let live = screen(INFERRING_OVER_BACKGROUND_2_1_316);
+        let caret = live.iter().rposition(|r| r.starts_with('❯'));
+        assert!(caret.is_some(), "the composer's row");
+        assert_eq!(word(&live, caret), "busy", "a live turn");
     }
 
     #[test]

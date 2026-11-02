@@ -94,13 +94,13 @@ private JSON module.
 Registry and blocks
 - `AF` = `AGENT_FILES` in registry order `[claude, codex, agy, opencode, muse]`. `names(AF)` = their `name`s.
   `addendum(n)` = the `addendum` of the `AF` row named `n`, or `None` when no row has that name.
-- `B(x)` = `block_with(x)`. `Blk(a)` = `block_for(a)` = `B(a.addendum)`.
+- `Blk(a)` = `block_for(a)` = `block_with(a.addendum)`.
 - `Lines(c)` = `c.split_inclusive('\n')`. `tr(l)` = `l.trim_end_matches(['\n','\r']).trim()`.
   `isBegin(l)` := `tr(l).starts_with(MARK_PREFIX)`. `isEnd(l)` := `tr(l) == MARK_END`.
 - `nl*(s)` = `s.trim_end_matches('\n')`. `canon(c)` = `""` if `c.trim()` is empty, else `nl*(c) + "\n"`.
 - `WFB(b)`, a well-formed block: `find_block(b) == Ok(Some((0, b.len())))`, `b` ends in `'\n'`, and `b`
   has exactly one `isBegin` line (its first). Every `Blk(a)` is `WFB`.
-- `shq(w)` = `"'" + w.replace('\'', "'\\''") + "'"` (the old hook writer's single-quoting).
+- `shq(w)` = `"'" + w.replace('\'', "'\\''") + "'"` (shell single-quoting).
 
 Paths and filesystem
 - `roots` = `Roots { xdg, codex }`: the non-empty `$XDG_CONFIG_HOME` and the absolute `$CODEX_HOME`
@@ -123,14 +123,17 @@ JSON
 Outcomes
 - `Fold(...)` = `fold_outcome`. `word(o)` = `outcome_word(o)`.
 
-The vendor's top-level effort key is written in this file as `b"ultra\x63ode"`, never joined,
-because the export baseline bans the joined word in every exported file (§5.7).
+This file writes the vendor's top-level effort key as `b"ultra\x63ode"`, never joined, because the
+export baseline bans the joined word in every exported file; any proof or clause text that states
+`top-effort-key-spelling` spells it the same way.
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes (primary tests; secondary in §2)`,
-`blocking_gaps (audit §7)`, `difficulty (Rust features the proof must handle)`. Test names are in
-src/lib.rs unless prefixed `settings_json::`.
+Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (primary tests; secondary in §2),
+`blocking_gaps` (rows of the gap table in `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7),
+`difficulty` (Rust features the proof must handle). Test names are in src/lib.rs unless prefixed
+`settings_json::`. Gap 0 (the installed seal publishes no Lean-discharged row) is on every row, and
+no row is blocked by gap 0 alone.
 
 ```tsv
 id	kind	functions	statement	subsumes	blocking_gaps	difficulty
@@ -186,8 +189,7 @@ taught-surface-and-retired-names	table-property	taught_ctl_verbs, PRIMER_BODY, C
 ## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
-A test is deleted only when its primary and every `also` spec are proved. The two tests of §4
-were deleted, so no row is `(none)` now.
+A test goes only when its primary and every `also` spec are proved.
 
 ```tsv
 file	test	primary	also
@@ -268,12 +270,27 @@ src/lib.rs	every_log_word_the_log_verbs_help_names_is_the_logs	taught-surface-an
   it goes last. `relocated_config_drives_detection_install_and_remove_in_one_root` sampled six
   before the audit cut its status half; it now samples `auto-prime-pass` and `cli-remove`.
 
-## 4. Tests that are not spec samples
+## 4. Tests missing from §2
 
-None left: the two tests this section marked **delete** are deleted. No census guard replaced the
-banned-word list of the no-hook test.
+All are in src/lib.rs.
 
-No test is a pure regression of a removed bug with no general property.
+- The shared-context-file and link tests sample behaviour no row states (§5.13):
+  `agents_that_share_one_context_file_get_one_generic_block`,
+  `a_row_by_row_aterm_leaves_a_shared_files_generic_block`,
+  `a_file_not_made_yet_is_one_file_through_a_linked_folder`,
+  `a_link_made_before_its_file_is_that_file_from_the_first_pass`,
+  `an_install_through_a_folder_link_made_before_its_folder_makes_one_file`,
+  `a_named_install_shares_the_file_a_folder_link_waits_for`,
+  `status_reads_a_link_another_reader_makes_live_as_the_file_not_made_yet`,
+  `a_link_spelled_in_another_case_is_its_file_where_case_is_ignored`.
+- `auto_prime_replaces_completion_rules_in_v24_and_supervise_v3` samples `upsert-block`,
+  `install-skill-file`, `auto-prime-pass` and `auto-prime-idempotent`.
+- The checks of the bundled text sample no row: `the_primer_and_the_skills_teach_served_verbs` (every
+  verb `taught_ctl_verbs` finds is served by `aterm_types::control_verbs` or is in
+  `aterm_ctl::CLIENT_HELP_VERBS`), `a_taught_command_is_read_to_its_verb_across_a_line_break`
+  (`taught_ctl_verbs` itself), `every_log_word_a_skill_names_is_the_logs` and
+  `every_log_word_the_log_verbs_help_names_is_the_logs` (aterm-slog's vocabulary), and
+  `nothing_aterm_installs_names_the_retired_token`.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
@@ -302,9 +319,8 @@ No test is a pure regression of a removed bug with no general property.
 
 ## 6. Proof order (easiest high-value first)
 
-No spec is blocked by gap 0 alone; every one also needs gap 1 (`&str`/`String`/enum carriers) or
-gap 8 (effects). The order below takes the closest to gap-0-only first, then the pure string core
-that most later specs compose.
+Every row also needs gap 1 (`&str`/`String`/enum carriers) or gap 8 (effects). The order takes the
+pure string core first, since most later specs compose it.
 
 1. **`top-effort-key-spelling`** (gaps 0, 1). A byte-slice equality over a `concat!` constant,
    decidable by evaluation. It is the smallest probe of gap 1 on this crate and retires its test outright.

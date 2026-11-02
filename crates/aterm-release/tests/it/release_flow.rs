@@ -18,6 +18,8 @@ const OLD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const TIP: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const BUMP: &str = "cccccccccccccccccccccccccccccccccccccccc";
 const NEXT: &str = "dddddddddddddddddddddddddddddddddddddddd";
+/// The re-run as R's own cutter: its pid and start, as the claim it takes over names them.
+const RERUN: (u32, &str) = (4343, "Thu Oct  9 02:01:00 2026");
 const BUMP2: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 
 struct World {
@@ -28,6 +30,14 @@ struct World {
     pid: u32,
     started: String,
     alive: BTreeMap<u32, String>,
+    /// This process's ancestors, its parent's pid first.
+    ancestors: Vec<u32>,
+    /// How the re-run as R's own cutter ends: its exit code, or why it could not start.
+    reexec: Result<i32, Refusal>,
+    /// The re-run took the run claim over (it names [`RERUN`], alive) before it ended.
+    reexec_takes_claim: bool,
+    /// The re-run's end removed the claim it took over.
+    rerun_removes_claim: bool,
     times: String,
     history: Vec<String>,
     versions: BTreeMap<String, String>,
@@ -121,6 +131,8 @@ struct World {
     staged_by: Option<String>,
     /// Whether the run claim was still on disk when the PREPARED line was said.
     running_at_prepared: Option<bool>,
+    /// The run claim's text (empty when there was none) when an INTERRUPTED line was said.
+    claim_at_interrupted: Option<String>,
     /// The stage leaves a step child's note behind, its process gone.
     child_note_at_stage: bool,
     /// Origin does not answer `git ls-remote`.
@@ -145,6 +157,10 @@ impl World {
             pid: 4242,
             started: "Thu Oct  9 02:00:00 2026".into(),
             alive: BTreeMap::new(),
+            ancestors: Vec::new(),
+            reexec: Err(Refusal::new("the fake's re-run could not start", "nothing")),
+            reexec_takes_claim: false,
+            rerun_removes_claim: false,
             times: String::new(),
             history: vec![OLD.into(), TIP.into()],
             versions,
@@ -201,6 +217,7 @@ impl World {
             engine: "e7e7e7e7e7".into(),
             staged_by: None,
             running_at_prepared: None,
+            claim_at_interrupted: None,
             child_note_at_stage: false,
             ls_remote_down: false,
             peer_staged: false,
@@ -305,6 +322,10 @@ impl Backend for World {
         if line.starts_with("PREPARED") {
             self.running_at_prepared = Some(World::release_dir(self).join(RUNNING_FILE).exists());
         }
+        if line.starts_with("INTERRUPTED") {
+            let claim = World::release_dir(self).join(RUNNING_FILE);
+            self.claim_at_interrupted = Some(std::fs::read_to_string(claim).unwrap_or_default());
+        }
         self.out.push(line.to_string());
     }
     fn interrupted(&mut self) -> Option<i32> {
@@ -327,6 +348,9 @@ impl Backend for World {
             return Some(self.started.clone());
         }
         self.alive.get(&pid).cloned()
+    }
+    fn ancestors(&mut self) -> Vec<u32> {
+        self.ancestors.clone()
     }
     fn release_dir(&mut self) -> PathBuf {
         World::release_dir(self)
@@ -456,9 +480,26 @@ impl Backend for World {
             })
         }
     }
-    fn reexec(&mut self, _prover: &Prover) -> Refusal {
+    fn reexec(&mut self, _prover: &Prover) -> Result<i32, Refusal> {
         self.calls.push("reexec".into());
-        Refusal::new("exec failed in the fake", "nothing")
+        let path = World::release_dir(self).join(RUNNING_FILE);
+        let claim = std::fs::read_to_string(&path);
+        if claim.is_ok_and(|text| text.lines().any(|l| l == "handed")) {
+            self.calls.push("reexec with the claim handed".into());
+        }
+        self.interrupt_at("reexec");
+        if self.reexec_takes_claim {
+            self.alive.insert(RERUN.0, RERUN.1.into());
+            std::fs::write(
+                &path,
+                format!("pid {}\nstarted {}\nlogs /l\n", RERUN.0, RERUN.1),
+            )
+            .unwrap();
+        }
+        if self.rerun_removes_claim {
+            std::fs::remove_file(&path).unwrap();
+        }
+        self.reexec.clone()
     }
     fn facts(&mut self, c: &Candidate, _prover: &Prover, artifact: Option<&Artifact>) -> Facts {
         let down = self.judge_down;
@@ -1315,6 +1356,13 @@ fn a_second_run_in_the_same_clone_is_refused_naming_the_first() {
     );
 }
 
+/// A cutter that is not R's own hands its run claim to the re-run it starts, waits for it and
+/// ends with its exit code; the re-run, a descendant of it, takes the claim over, keeps the
+/// candidate, and refuses rather than re-run again. A claim handed by a live process that is
+/// not this one's ancestor, or one a live ancestor did not hand, refuses as another run's.
+/// NEGATIVE CONTROLS: take a claim over whatever its holder (the old pid test), and the re-run's
+/// own process is never its holder, so it refuses at 1/11; take it over from any live
+/// ancestor, handed or not, and the unhanded claim is adopted.
 #[test]
 fn a_cutter_that_is_not_rs_own_reexecs_once_and_keeps_the_candidate() {
     let mut w = World::new();
@@ -1324,23 +1372,78 @@ fn a_cutter_that_is_not_rs_own_reexecs_once_and_keeps_the_candidate() {
         commit: Some("origin/main".into()),
         ..mac()
     };
+    let claim = w.release_dir().join(RUNNING_FILE);
     let (code, last) = w.run(tip.clone());
     assert_eq!(w.count("reexec"), 1, "{:?}", w.calls);
-    assert_eq!(code, 1, "the fake's exec fails: {last}");
-    let adopt = |w: &World| {
+    assert_eq!(w.count("reexec with the claim handed"), 1, "{:?}", w.calls);
+    assert!(
+        code == 1 && last.starts_with("REFUSED at 3/11 commit"),
+        "a re-run that could not start: {last}"
+    );
+    assert!(
+        !claim.exists(),
+        "the claim no re-run took is this run's to remove"
+    );
+
+    w.reexec = Ok(5);
+    w.calls.clear();
+    let (code, last) = w.run(tip.clone());
+    assert_eq!(
+        (code, last.as_str()),
+        (5, ""),
+        "the re-run's exit, its own final line"
+    );
+    assert_eq!(w.count("reexec with the claim handed"), 1, "{:?}", w.calls);
+    assert!(!claim.exists());
+
+    // The re-run: its parent (or grandparent) holds the claim and handed it on.
+    let earlier = (999, "Thu Oct  9 01:59:00 2026");
+    let handed = |w: &mut World, handed: bool| {
+        w.alive.insert(earlier.0, earlier.1.into());
+        let mark = if handed { "handed\n" } else { "" };
         std::fs::write(
             w.release_dir().join(RUNNING_FILE),
-            format!("pid {}\nstarted {}\nlogs /l\n", w.pid, w.started),
+            format!("pid {}\nstarted {}\nlogs /l\n{mark}", earlier.0, earlier.1),
         )
         .unwrap();
     };
-    adopt(&w);
+    w.ancestors = vec![998, earlier.0, 1];
+    handed(&mut w, true);
     w.calls.clear();
     let (code, last) = w.run(tip.clone());
     assert_eq!((code, w.count("reexec")), (1, 0), "no loop: {last}");
     assert!(last.starts_with("REFUSED at 3/11 commit"), "{last}");
+    assert!(
+        !claim.exists(),
+        "the claim it took over is its own to remove"
+    );
 
-    adopt(&w);
+    for (ancestors, mark, what) in [
+        (
+            vec![998, 1],
+            true,
+            "handed by a live process that is no ancestor",
+        ),
+        (
+            vec![998, earlier.0, 1],
+            false,
+            "a live ancestor's, not handed",
+        ),
+    ] {
+        w.ancestors = ancestors;
+        handed(&mut w, mark);
+        w.calls.clear();
+        let (code, last) = w.run(tip.clone());
+        assert!(
+            code == 1 && last.starts_with("REFUSED at 1/11 checks") && last.contains("pid 999"),
+            "{what}: {last}"
+        );
+        assert!(w.calls.is_empty(), "{what}: {:?}", w.calls);
+        assert!(claim.exists(), "{what}: another run's claim is kept");
+    }
+
+    w.ancestors = vec![998, earlier.0, 1];
+    handed(&mut w, true);
     w.history.push(NEXT.into());
     w.versions.insert(NEXT.into(), "0.6.0".into());
     w.own_cutter = true;
@@ -1353,6 +1456,107 @@ fn a_cutter_that_is_not_rs_own_reexecs_once_and_keeps_the_candidate() {
         )),
         "{last}"
     );
+}
+
+/// A signal this run catches while it waits on the re-run as R's own cutter stops the release
+/// at 3/11 when the claim still names this run as the re-run ends (no re-run took it over).
+/// When the claim is the re-run's then, or gone with the re-run's end, the release was the
+/// re-run's to stop and to say: this run ends with its exit code, no final line of its own, and
+/// the re-run's claim left in place. The fake fires the signal as the re-run starts, before it
+/// rewrites the claim. NEGATIVE CONTROLS: drop the interrupt check after the re-run, and the
+/// first case ends with the re-run's code and no line; make `RunClaim`'s drop remove the claim
+/// whatever it names, and the re-run's claim is gone.
+#[test]
+fn a_signal_during_the_rerun_is_this_runs_until_the_rerun_takes_the_claim() {
+    let mut w = World::new();
+    w.versions.insert(TIP.into(), "0.6.0".into());
+    w.own_cutter = false;
+    w.reexec = Ok(5);
+    w.signal_at = Some("reexec");
+    let tip = ReleaseOptions {
+        commit: Some("origin/main".into()),
+        ..mac()
+    };
+    let claim = w.release_dir().join(RUNNING_FILE);
+    let (code, last) = w.run(tip.clone());
+    assert_eq!(w.count("reexec with the claim handed"), 1, "{:?}", w.calls);
+    assert!(
+        code == 130 && last.starts_with("INTERRUPTED at 3/11 commit (by SIGTERM)"),
+        "the claim still this run's as the re-run ends: {code} {last}"
+    );
+    assert!(
+        !claim.exists(),
+        "the claim no re-run took is this run's to remove"
+    );
+
+    w.signal = None;
+    w.reexec_takes_claim = true;
+    w.calls.clear();
+    let (code, last) = w.run(tip.clone());
+    assert_eq!(w.count("reexec with the claim handed"), 1, "{:?}", w.calls);
+    assert_eq!(
+        (code, last.as_str()),
+        (5, ""),
+        "the claim the re-run's as it ends: the re-run answers for the signal"
+    );
+    let holder = std::fs::read_to_string(&claim).unwrap_or_default();
+    assert!(
+        holder.starts_with(&format!("pid {}\n", RERUN.0)),
+        "the claim the re-run took is the re-run's: {holder:?}"
+    );
+
+    // The re-run took the claim, said its own INTERRUPTED line, and its end removed the claim
+    // (the claim the last case's re-run left, its end not modelled, goes first).
+    std::fs::remove_file(&claim).unwrap();
+    w.signal = None;
+    w.reexec = Ok(130);
+    w.rerun_removes_claim = true;
+    w.calls.clear();
+    let (code, last) = w.run(tip);
+    assert_eq!(
+        (code, last.as_str()),
+        (130, ""),
+        "one final line: the re-run's"
+    );
+    assert!(!claim.exists());
+}
+
+/// A re-run as R's own cutter takes over the claim the run that started it handed it before it
+/// can say a final line: one that caught a signal before its checks says INTERRUPTED at 1/11 with
+/// the claim naming it, and its end removes the claim, so the run that started it, finding the
+/// claim no longer its own when the re-run ends, says nothing more
+/// (a_signal_during_the_rerun_is_this_runs_until_the_rerun_takes_the_claim). NEGATIVE CONTROL:
+/// take the claim at the checks, after begin(Checks)'s interrupt check (as before), and the
+/// re-run says its line while the claim still names the run that handed it, which would say
+/// INTERRUPTED at 3/11 as well.
+#[test]
+fn a_rerun_takes_the_handed_claim_before_it_can_say_a_final_line() {
+    let mut w = World::new();
+    let earlier = (999, "Thu Oct  9 01:59:00 2026");
+    w.alive.insert(earlier.0, earlier.1.into());
+    w.ancestors = vec![998, earlier.0, 1];
+    let claim = w.release_dir().join(RUNNING_FILE);
+    std::fs::create_dir_all(w.release_dir()).unwrap();
+    std::fs::write(
+        &claim,
+        format!(
+            "pid {}\nstarted {}\nlogs /l\nhanded\n",
+            earlier.0, earlier.1
+        ),
+    )
+    .unwrap();
+    w.signal = Some(2);
+    let (code, last) = w.run(mac());
+    assert!(
+        code == 130 && last.starts_with("INTERRUPTED at 1/11 checks (by SIGINT)"),
+        "{code} {last}"
+    );
+    let said_with = w.claim_at_interrupted.clone().unwrap_or_default();
+    assert!(
+        said_with.starts_with(&format!("pid {}\n", w.pid)),
+        "the re-run's line was said with the claim its own: {said_with:?}"
+    );
+    assert!(!claim.exists(), "and its end removed the claim");
 }
 
 #[test]

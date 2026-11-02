@@ -243,6 +243,11 @@ pub fn validate(collection: &str, value: &Value) -> Result<()> {
         if !o.get("name").and_then(Value::as_str).is_some_and(name) {
             return Err(Error::new("mailbox needs a stable display name"));
         }
+        if let Some(provider) = o.get("provider")
+            && !provider.as_str().is_some_and(name)
+        {
+            return Err(Error::new("mailbox provider must be an identifier"));
+        }
         if let Some(auth) = o.get("auth") {
             validate_auth(auth)?;
         }
@@ -250,17 +255,24 @@ pub fn validate(collection: &str, value: &Value) -> Result<()> {
             validate_secret_ref(reference)?;
         }
     }
-    if collection == "phones"
-        && let Some(number) = o.get("number")
-    {
-        let n = number
-            .as_str()
-            .ok_or_else(|| Error::new("phone must be an international number"))?;
-        if !n.starts_with('+')
-            || !(8..=16).contains(&n.len())
-            || !n[1..].bytes().all(|b| b.is_ascii_digit())
+    if collection == "phones" {
+        if let Some(number) = o.get("number") {
+            let n = number
+                .as_str()
+                .ok_or_else(|| Error::new("phone must be an international number"))?;
+            if !n.starts_with('+')
+                || !(8..=16).contains(&n.len())
+                || !n[1..].bytes().all(|b| b.is_ascii_digit())
+            {
+                return Err(Error::new("phone needs international +country-code form"));
+            }
+        }
+        if let Some(label) = o.get("label")
+            && !label.as_str().is_some_and(|s| {
+                !s.is_empty() && s.len() <= 128 && !s.chars().any(char::is_control)
+            })
         {
-            return Err(Error::new("phone needs international +country-code form"));
+            return Err(Error::new("invalid phone label"));
         }
     }
     if let Some(details) = o.get("details") {

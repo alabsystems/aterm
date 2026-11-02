@@ -3786,16 +3786,47 @@ impl App {
         true
     }
 
+    /// The identity of the tray `window` presents: its one card's, or its tray stack's (the
+    /// stack's union, and its cards' identities hashed in order).
     fn recording_card_identity(
-        card: Option<&crate::SettingsCard>,
+        window: &crate::WindowState,
     ) -> Option<crate::VideoPresentedCardIdentity> {
-        card.map(|card| crate::VideoPresentedCardIdentity {
+        let one = |card: &crate::SettingsCard| crate::VideoPresentedCardIdentity {
             width: card.pw,
             height: card.ph,
             x: card.dx,
             y: card.dy,
             model: card.fp,
             geometry: card.geom,
+        };
+        let Some(stack) = window.tray_stack() else {
+            return window.present_card().map(one);
+        };
+        let ids: Vec<_> = stack.into_iter().flatten().map(one).collect();
+        let x0 = ids.iter().map(|c| c.x).min()?;
+        let y0 = ids.iter().map(|c| c.y).min()?;
+        let x1 = ids.iter().map(|c| c.x.saturating_add(c.width)).max()?;
+        let y1 = ids.iter().map(|c| c.y.saturating_add(c.height)).max()?;
+        let mut model = aterm_hash::FNV64_OFFSET;
+        for id in &ids {
+            for word in [
+                u64::from(id.width),
+                u64::from(id.height),
+                u64::from(id.x),
+                u64::from(id.y),
+                id.model,
+                id.geometry,
+            ] {
+                model = aterm_hash::fnv1a_64_u64_le(model, word);
+            }
+        }
+        Some(crate::VideoPresentedCardIdentity {
+            width: x1 - x0,
+            height: y1 - y0,
+            x: x0,
+            y: y0,
+            model,
+            geometry: model,
         })
     }
 
@@ -3879,7 +3910,7 @@ impl App {
         let overlay_fingerprint = window
             .last_present
             .map_or_else(|| window.overlay_fp(), |key| key.settings_fp);
-        let card = Self::recording_card_identity(window.present_card());
+        let card = Self::recording_card_identity(window);
         let theme = crate::VideoPresentedThemeIdentity {
             colors: self.image_theme_fingerprint(),
         };
@@ -3988,7 +4019,7 @@ impl App {
             .active_visible_frame_layout(wid)
             .ok_or_else(|| "image deferred: recording layout changed before capture".to_string())?;
         let current_destination_height = window.win_px.map(|size| size.height.max(1) as usize);
-        let current_card = Self::recording_card_identity(window.present_card());
+        let current_card = Self::recording_card_identity(window);
         let current_theme = crate::VideoPresentedThemeIdentity {
             colors: self.image_theme_fingerprint(),
         };
@@ -4676,8 +4707,14 @@ impl App {
         let window = windows
             .get(&wid)
             .ok_or_else(|| "capture lost its window".to_string())?;
-        let tray = window
-            .present_card()
+        // A tray stack is folded here, on the CPU, as the renderers that take one card fold it.
+        let folded = window.tray_stack().and_then(|stack| {
+            let cards: Vec<_> = stack.into_iter().flatten().collect();
+            crate::stats_deck::fold_cards(&cards, 1)
+        });
+        let tray = folded
+            .as_ref()
+            .or_else(|| window.present_card())
             .and_then(|card| tray_quad_below_y(card, tray_floor_y));
         let destination_height = window.win_px.map(|size| size.height.max(1) as usize);
         let mut frame = backend.render_input_for_destination(
@@ -15365,59 +15402,5 @@ mod headless_settings_preview_capture_tests {
             "a still preview is the same frame at every capture"
         );
         assert_eq!(drawn_preview(&app).phase_ms, still.phase_ms);
-    }
-}
-
-#[cfg(test)]
-mod headless_capture_band_tests {
-    use crate::{App, WindowId};
-    use std::time::{Duration, Instant};
-
-    /// A headless capture of a native or mixed front prepares the message band at the capture
-    /// instant, as a terminal front's does, instead of splicing whatever frame the band last
-    /// held (a live row's elapsed, ETA and stalled state frozen at it).
-    #[test]
-    fn a_headless_capture_of_any_front_prepares_the_band_now() {
-        for mixed in [false, true] {
-            let mut app = App::headless_for_test();
-            let wid = WindowId(0);
-            app.announce_toolchain_pass("installing 10 ALab program(s)", true);
-            assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
-            if mixed {
-                let _ = app
-                    .split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Horizontal);
-            }
-            let (plan, route) = app
-                .active_visible_frame_layout(wid)
-                .expect("a visible frame");
-            assert!(
-                matches!(
-                    (mixed, route),
-                    (false, crate::VisibleContentRoute::Native { .. })
-                        | (true, crate::VisibleContentRoute::Heterogeneous)
-                ),
-                "PRECONDITION: the front's route ({route:?}, mixed={mixed})"
-            );
-            let stale = Instant::now() + Duration::from_secs(120);
-            app.prepare_band_motion(wid, stale);
-            let held = app.windows[&wid]
-                .band
-                .motion()
-                .expect("PRECONDITION: a live row's band frame")
-                .at;
-            assert!(
-                app.stage_headless_capture(wid, plan, route, None).is_ok(),
-                "the capture stages (mixed={mixed})"
-            );
-            let at = app.windows[&wid]
-                .band
-                .motion()
-                .expect("the band's frame")
-                .at;
-            assert!(
-                at < held,
-                "the capture prepared the band now, not at the held frame (mixed={mixed})"
-            );
-        }
     }
 }

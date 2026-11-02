@@ -216,6 +216,7 @@ fn represented_sync(
         &FleetRoster {
             source: "fixture".into(),
             accounts: incoming.clone(),
+            ..FleetRoster::default()
         }
         .to_toml(),
     );

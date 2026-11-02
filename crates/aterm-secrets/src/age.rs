@@ -7,9 +7,7 @@
 
 use crate::{SecretBytes, b64, bech32, x25519};
 use ring::{aead, hkdf, hmac};
-use zeroize::Zeroize;
-#[cfg(unix)]
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Why an age operation failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +72,32 @@ const PAYLOAD_NONCE: usize = 16;
 /// The file key.
 const FILE_KEY: usize = 16;
 
+/// Parsing still validates every spelling and retains the supplied secret in
+/// its own identity. Only the deterministic public derivation is shared; the
+/// bounded cache keeps a digest and public point, never a private key or grant.
+fn parsed_public(secret: &[u8; 32]) -> [u8; 32] {
+    type Entry = (Zeroizing<[u8; 32]>, [u8; 32]);
+    static PUBLIC: std::sync::Mutex<std::collections::VecDeque<Entry>> =
+        std::sync::Mutex::new(std::collections::VecDeque::new());
+    let mut hash = aterm_digest::Sha256::new();
+    hash.update(b"aterm/age/identity-public/1\0");
+    hash.update(secret);
+    let digest = Zeroizing::new(hash.finalize());
+    if let Ok(cache) = PUBLIC.lock()
+        && let Some((_, public)) = cache.iter().find(|(key, _)| **key == *digest)
+    {
+        return *public;
+    }
+    let public = x25519::x25519_base(secret);
+    if let Ok(mut cache) = PUBLIC.lock() {
+        if cache.len() >= 16 {
+            cache.pop_front();
+        }
+        cache.push_back((digest, public));
+    }
+    public
+}
+
 /// An age X25519 identity: a machine key.
 pub struct Identity {
     secret: [u8; 32],
@@ -111,7 +135,7 @@ impl Identity {
                     public: [0u8; 32],
                 };
                 identity.secret.copy_from_slice(&decoded.data);
-                identity.public = x25519::x25519_base(&identity.secret);
+                identity.public = parsed_public(&identity.secret);
                 Ok(identity)
             } else {
                 Err(AgeError::Key)
@@ -951,6 +975,35 @@ mod tests {
         let shown = format!("{id:?}");
         assert!(!shown.contains(&text[16..]), "Debug shows no secret");
         assert_eq!(shown, format!("Identity({spelled})"));
+    }
+
+    #[test]
+    fn interleaved_parsed_identities_still_open_only_their_own_ciphertext() {
+        let identities: Vec<_> = (1..=24).map(identity).collect();
+        for id in &identities {
+            Identity::parse(id.to_bech32().as_str().unwrap()).unwrap();
+        }
+        for (index, original) in identities.iter().enumerate() {
+            let text = original.to_bech32();
+            let parsed = Identity::parse(text.as_str().unwrap()).unwrap();
+            assert_eq!(parsed.recipient(), original.recipient());
+            assert_eq!(parsed.secret_bytes(), original.secret_bytes());
+            let ciphertext = encrypt(&[parsed.recipient()], b"scratch parsed identity").unwrap();
+            assert_eq!(
+                decrypt(std::slice::from_ref(original), &ciphertext)
+                    .unwrap()
+                    .as_slice(),
+                b"scratch parsed identity"
+            );
+            assert!(
+                decrypt(
+                    std::slice::from_ref(&identities[(index + 1) % identities.len()]),
+                    &ciphertext,
+                )
+                .is_err()
+            );
+            assert!(Identity::parse(&text.as_str().unwrap().to_ascii_lowercase()).is_err());
+        }
     }
 
     /// age.md's example identity (32 bytes of 0x42), spelled at run time so no key-shaped

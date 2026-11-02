@@ -10,10 +10,10 @@ use super::step::{self, Cx, Evidence, Fault, Progress, Track};
 use super::wait::{self, JobFacts, Scene};
 use super::{
     BUSY_ORPHAN_MS, Block, Class, ClassTable, Consumer, Demand, EXITED_KEEP_MS, Findings, GateWord,
-    HeldEpisode, HeldProc, Holder, InputGate, JobCounters, JobKind, JobProc, JobRow, JobTab,
-    JobTick, JobsView, KERNEL_WAIT_MS, MemberMap, Named, NamedRow, NamedWait, ProcState, Standing,
-    StartWait, Stop, SweepProc, TermWord, TierB, TtyMode, Verdict, WaitName, Want, ZOMBIE_AGE_MS,
-    ZombieParent, Zombies, command_class,
+    HELD_AT_ONCE, HeldEpisode, HeldProc, Holder, InputGate, JobCounters, JobKind, JobProc, JobRow,
+    JobTab, JobTick, JobsView, KERNEL_WAIT_MS, MemberMap, Named, NamedRow, NamedWait, ProcState,
+    Standing, StartWait, Stop, StoppedUnstarted, SweepProc, TermWord, TierB, TtyMode, Verdict,
+    WaitName, Want, ZOMBIE_AGE_MS, ZombieParent, Zombies, command_class,
 };
 
 #[cfg(test)]
@@ -104,6 +104,8 @@ struct Job {
     key: Key,
     id: String,
     kind: JobKind,
+    /// An orphan unit's: the kind of the job it outlived ([`Self::named_kind`]).
+    outlived: Option<JobKind>,
     consumer: Consumer,
     promoted_ms: Option<u64>,
     task: Option<String>,
@@ -600,7 +602,7 @@ fn write_end_of(w: &super::FdKind, handle: u64, peer: u64) -> bool {
 
 /// `n` over `dt_ms`, a minute.
 fn per_min(n: u64, dt_ms: u64) -> u64 {
-    n.saturating_mul(60_000) / dt_ms.max(1)
+    u64::try_from(u128::from(n) * 60_000 / u128::from(dt_ms.max(1))).unwrap_or(u64::MAX)
 }
 
 /// A unit found this tick.
@@ -658,8 +660,9 @@ pub struct Jobs {
     zombie_parents: HashMap<u32, u64>,
     d_since: HashMap<u32, u64>,
     /// The first reading that saw each `(pid, exec)` not started, by what keeps it
-    /// ([`StartWait`]), kept for the keys the last reading held.
-    held_since: HashMap<(u32, u64, StartWait), u64>,
+    /// ([`StartWait`]), kept for the keys the last reading held. An unavailable exec version's
+    /// fallback never lends its duration to a later actual version.
+    held_since: HashMap<(u32, HeldExec, StartWait), u64>,
     /// The backed-up episode, while one is open.
     held_episode: Option<Backlog>,
     /// The episode the last reading closed.
@@ -674,6 +677,9 @@ pub struct Jobs {
     roots: HashMap<u64, RootSeen>,
     /// Each tab's processes in its shell's own group.
     born: HashMap<u64, Born>,
+    /// Every tab a reading named adopted ([`JobTab::adopted`]), kept after it closes: what its
+    /// programs left running is still its own, in the unit it outlived or in none.
+    adopted: BTreeSet<u64>,
     #[cfg(any(test, debug_assertions))]
     fault: Option<Fault>,
 }
@@ -1004,6 +1010,8 @@ impl Jobs {
         self.note_zombies(at, &tick.sweep);
         self.note_d_state(at, &tick.sweep, &facts);
         self.note_held(at, &tick.held);
+        self.adopted
+            .extend(tick.tabs.iter().filter(|t| t.adopted).map(|t| t.key));
         let flat_on_dylib = self.flat_on_a_fresh_dylib(&facts);
 
         let alive = |pid: u32, start: Option<u64>| -> bool {
@@ -1868,7 +1876,7 @@ impl Jobs {
                     .map(|(p, m)| (*p, m.clone()))
                     .collect();
                 if !survivors.is_empty() && job.kind != JobKind::Orphan {
-                    orphans.push(Job::orphan(job.key.tab, survivors, at));
+                    orphans.push(Job::orphan(job.key.tab, job.kind, survivors, at));
                 }
             }
 
@@ -2490,6 +2498,7 @@ impl Jobs {
                 id: job.id.clone(),
                 tab: job.key.tab,
                 kind: job.kind,
+                orphan_of: job.outlived,
                 consumer: job.consumer,
                 promoted_ms: job.promoted_ms,
                 task: job.task.clone(),
@@ -2579,6 +2588,7 @@ impl Jobs {
             demand,
             lanes_off,
             parked_tabs,
+            at_ms: at,
         }
     }
 
@@ -2623,16 +2633,18 @@ impl Jobs {
     /// Folds this reading's unstarted programs into their first sightings, and those macOS's
     /// program check holds ([`StartWait::ProgramCheck`]) into the backed-up episode. A reading is
     /// backed up when a key held now was held at the reading before (its first sighting is kept)
-    /// or three are held at once (a normal exec reads held for under 0.3 ms); the episode opens at
-    /// the first backed-up reading and closes at the second reading in a row with nothing held. A
-    /// `Translating` or `NotStarted` row is no part of it: its wait is not the check's.
+    /// or [`HELD_AT_ONCE`] are held at once (a normal exec reads held for under 0.3 ms); the
+    /// episode opens at the first backed-up reading and closes at the second reading in a row with
+    /// nothing held. A `Translating`, `NotStarted` or `StoppedUnstarted` row is no part of it:
+    /// its wait is not the check's.
     fn note_held(&mut self, at: u64, held: &[HeldProc]) {
-        let all: BTreeSet<(u32, u64, StartWait)> = held.iter().map(held_key).collect();
-        let keys: BTreeSet<&(u32, u64, StartWait)> = all
+        let all: BTreeSet<(u32, HeldExec, StartWait)> = held.iter().map(held_key).collect();
+        let keys: BTreeSet<&(u32, HeldExec, StartWait)> = all
             .iter()
             .filter(|k| k.2 == StartWait::ProgramCheck)
             .collect();
-        let backed_up = keys.len() >= 3 || keys.iter().any(|k| self.held_since.contains_key(k));
+        let backed_up =
+            keys.len() >= HELD_AT_ONCE || keys.iter().any(|k| self.held_since.contains_key(k));
         self.held_since.retain(|k, _| all.contains(k));
         for k in &all {
             self.held_since.entry(*k).or_insert(at);
@@ -2673,8 +2685,9 @@ impl Jobs {
     }
 
     /// The live job members flat on a fresh dylib at this reading, read before it updates them:
-    /// started (not held), holding a dylib a build just wrote open, with the CPU their member
-    /// record kept from the reading before at the same start. [`Self::findings`] names them only
+    /// started (no start wait: not held, translated or otherwise unstarted), holding a dylib a
+    /// build just wrote open, with the CPU their member record kept from the reading before at
+    /// the same start. [`Self::findings`] names them only
     /// inside a backed-up episode.
     fn flat_on_a_fresh_dylib(&self, facts: &HashMap<u32, &JobProc>) -> BTreeMap<u32, String> {
         let mut flat = BTreeMap::new();
@@ -2697,7 +2710,7 @@ impl Jobs {
                     (m.counters, f.counters),
                     (Some(a), Some(b)) if a.cpu_ns == b.cpu_ns
                 );
-                if fresh && same && still && !f.program_check {
+                if fresh && same && still && f.start_wait.is_none() {
                     flat.insert(*pid, shown_name(f));
                 }
             }
@@ -2712,12 +2725,17 @@ impl Jobs {
         flat_on_dylib: &BTreeMap<u32, String>,
     ) -> Findings {
         let at = tick.at_ms;
-        let tab_of: HashMap<u32, u64> = self
+        let job_of: HashMap<u32, (u64, JobKind)> = self
             .jobs
             .iter()
             .filter(|j| j.exited_ms.is_none())
-            .flat_map(|j| j.members.keys().map(move |p| (*p, j.key.tab)))
+            .flat_map(|j| {
+                let kind = j.named_kind();
+                j.members.keys().map(move |p| (*p, (j.key.tab, kind)))
+            })
             .collect();
+        let tab_of = |pid: &u32| job_of.get(pid).map(|(tab, _)| *tab);
+        let kind_of = |pid: &u32| job_of.get(pid).map(|(_, kind)| *kind);
         let name = |pid: u32| sweep.get(&pid).map(|s| s.name.clone()).unwrap_or_default();
         let mut f = Findings {
             process_limit: tick.process_limit,
@@ -2727,8 +2745,10 @@ impl Jobs {
             if p.state == ProcState::Stopped {
                 f.stopped.push(Named {
                     pid: p.pid,
+                    exec_version: None,
                     name: p.name.clone(),
-                    tab: tab_of.get(&p.pid).copied(),
+                    tab: tab_of(&p.pid),
+                    job: kind_of(&p.pid),
                     for_ms: 0,
                 });
             }
@@ -2749,7 +2769,7 @@ impl Jobs {
                 name: name(ppid),
                 count,
                 per_min_deci: per_min_deci(count, at.saturating_sub(since)),
-                tab: tab_of.get(&ppid).copied(),
+                tab: tab_of(&ppid),
             });
         }
         for (pid, since) in &self.d_since {
@@ -2760,8 +2780,10 @@ impl Jobs {
             if own && for_ms >= KERNEL_WAIT_MS {
                 f.d_state.push(Named {
                     pid: *pid,
+                    exec_version: None,
                     name: name(*pid),
-                    tab: tab_of.get(pid).copied(),
+                    tab: tab_of(pid),
+                    job: kind_of(pid),
                     for_ms,
                 });
             }
@@ -2777,18 +2799,34 @@ impl Jobs {
                 if for_ms >= BUSY_ORPHAN_MS {
                     f.busy_orphans.push(Named {
                         pid: j.key.leader,
+                        exec_version: None,
                         name: j
                             .members
                             .get(&j.key.leader)
                             .map(|m| m.name.clone())
                             .unwrap_or_default(),
                         tab: Some(j.key.tab),
+                        job: Some(j.named_kind()),
                         for_ms,
                     });
                 }
             }
         }
-        let mut seen: BTreeSet<(u32, u64, StartWait)> = BTreeSet::new();
+        // Only a program forked at or after the grant took, where no adopted tab could hold it,
+        // shows the grant did not take.
+        let after_grant = |h: &HeldProc, tab: Option<u64>| {
+            let fresh = match tab {
+                Some(tab) => !self.adopted.contains(&tab),
+                None => self.adopted.is_empty(),
+            };
+            h.aterm
+                && fresh
+                && tick
+                    .grant_ms
+                    .zip(h.started_ms)
+                    .is_some_and(|(grant, started)| started >= grant)
+        };
+        let mut seen: BTreeSet<(u32, HeldExec, StartWait)> = BTreeSet::new();
         for h in &tick.held {
             let Some(since) = self.held_since.get(&held_key(h)) else {
                 continue;
@@ -2799,8 +2837,10 @@ impl Jobs {
             let for_ms = at.saturating_sub(*since);
             let named = Named {
                 pid: h.pid,
+                exec_version: h.exec_version,
                 name: h.name.clone(),
-                tab: tab_of.get(&h.pid).copied(),
+                tab: tab_of(&h.pid).or(h.tab),
+                job: kind_of(&h.pid),
                 for_ms,
             };
             match h.wait {
@@ -2809,15 +2849,26 @@ impl Jobs {
                         f.program_check_aterm.0 += 1;
                         f.program_check_aterm.1 = f.program_check_aterm.1.max(for_ms);
                     }
+                    if after_grant(h, named.tab) {
+                        f.program_check_after_grant += 1;
+                    }
                     f.program_check.push(named);
                 }
                 StartWait::Translating => f.translating.push(named),
                 StartWait::NotStarted => f.not_started.push(named),
+                StartWait::StoppedUnstarted { stopped, traced } => {
+                    f.stopped_unstarted.push(StoppedUnstarted {
+                        named,
+                        stopped,
+                        traced,
+                    });
+                }
             }
         }
         for list in [&mut f.program_check, &mut f.translating, &mut f.not_started] {
             list.sort_by_key(|n| n.pid);
         }
+        f.stopped_unstarted.sort_by_key(|s| s.named.pid);
         f.program_check_episode = self.held_episode.map(Backlog::view);
         f.program_check_drained = self.held_drained;
         if self.held_episode.is_some() {
@@ -2825,8 +2876,10 @@ impl Jobs {
                 .iter()
                 .map(|(pid, name)| Named {
                     pid: *pid,
+                    exec_version: None,
                     name: name.clone(),
-                    tab: tab_of.get(pid).copied(),
+                    tab: tab_of(pid),
+                    job: kind_of(pid),
                     for_ms: 0,
                 })
                 .collect();
@@ -2841,6 +2894,7 @@ impl Job {
             key: u.key.clone(),
             id: u.id.clone(),
             kind: u.kind,
+            outlived: None,
             consumer: u.consumer,
             promoted_ms: u.promoted_ms,
             task: u.task.clone(),
@@ -2877,7 +2931,16 @@ impl Job {
         }
     }
 
-    fn orphan(tab: u64, members: MemberMap, at: u64) -> Self {
+    /// The kind the findings name its members by: an orphan unit's, the job it outlived (whose
+    /// leftover it is); every other job's, its own.
+    fn named_kind(&self) -> JobKind {
+        match (self.kind, self.outlived) {
+            (JobKind::Orphan, Some(outlived)) => outlived,
+            (kind, _) => kind,
+        }
+    }
+
+    fn orphan(tab: u64, outlived: JobKind, members: MemberMap, at: u64) -> Self {
         let (leader, m) = members
             .iter()
             .next()
@@ -2892,6 +2955,7 @@ impl Job {
             },
             id: format!("o{leader}"),
             kind: JobKind::Orphan,
+            outlived: Some(outlived),
             consumer: Consumer::Nobody,
             promoted_ms: None,
             task: None,
@@ -2929,10 +2993,31 @@ impl Job {
     }
 }
 
+/// An actual exec version is distinct from the birth or zero used when it was unavailable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum HeldExec {
+    Version(u64),
+    Fallback(u64),
+}
+
 /// The key a held time is kept by: the pid, the program it runs (an exec starts a new one) and
-/// what keeps it.
-const fn held_key(h: &HeldProc) -> (u32, u64, StartWait) {
-    (h.pid, h.exec, h.wait)
+/// the kind of what keeps it. A stopped-unstarted row's stopped and traced bits are left out (each
+/// key carries both as `false`): a debugger that attaches to a start-suspended spawn has not let
+/// it run, so its time goes on. Reading an actual version after a fallback starts a proved
+/// duration afresh.
+const fn held_key(h: &HeldProc) -> (u32, HeldExec, StartWait) {
+    let exec = match h.exec_version {
+        Some(version) => HeldExec::Version(version),
+        None => HeldExec::Fallback(h.exec),
+    };
+    let wait = match h.wait {
+        StartWait::StoppedUnstarted { .. } => StartWait::StoppedUnstarted {
+            stopped: false,
+            traced: false,
+        },
+        wait => wait,
+    };
+    (h.pid, exec, wait)
 }
 
 fn delta(now: Option<u64>, then: Option<u64>) -> u64 {
@@ -3880,11 +3965,13 @@ fn now_name(
         .find_map(name_of)
 }
 
-/// A process's name as rows show it: its executable's basename where the
-/// reader gave one (`proc_pidpath`, `/proc/<pid>/exe`), else its short name.
+/// A process's name as rows show it: the build a front becomes ([`JobProc::becomes`]), else its
+/// executable's basename where the reader gave one (`proc_pidpath`, `/proc/<pid>/exe`), else its
+/// short name.
 fn shown_name(f: &JobProc) -> String {
-    f.exe
+    f.becomes
         .as_deref()
+        .or(f.exe.as_deref())
         .filter(|e| !e.is_empty())
         .map_or_else(|| f.name.clone(), str::to_owned)
 }
@@ -3982,4 +4069,16 @@ fn parked_tabs(rows: &[JobRow], at_person: &BTreeSet<(u64, &str)>) -> Vec<u64> {
         }
     }
     parked.difference(&not).copied().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::per_min;
+
+    #[test]
+    fn per_min_avoids_premature_saturation_on_large_counts() {
+        let n = u64::MAX / 60_000 + 100;
+        assert_eq!(per_min(n, 60_000), n);
+        assert_eq!(per_min(u64::MAX, 1), u64::MAX);
+    }
 }

@@ -8,14 +8,22 @@
 use crate::{Error, Result, crypto::name};
 use aterm_json::Value;
 
+pub mod billing;
+#[cfg(unix)]
+pub mod broker;
+
 #[cfg(unix)]
 pub mod activations;
 #[cfg(unix)]
 pub mod claims;
 #[cfg(unix)]
+pub mod native_requests;
+#[cfg(unix)]
 mod plans;
 #[cfg(unix)]
 pub mod proposals;
+#[cfg(unix)]
+pub mod recovery;
 #[cfg(unix)]
 mod references;
 
@@ -39,6 +47,7 @@ pub fn validate(value: &Value) -> Result<()> {
         "auth",
         "details",
         "source",
+        "billing",
     ];
     if object.keys().any(|key| !fields.contains(&key.as_str())) {
         return Err(Error::new(
@@ -85,6 +94,9 @@ pub fn validate(value: &Value) -> Result<()> {
     }
     if let Some(reference) = value.get("secret_ref").filter(|v| !v.is_null()) {
         crate::contacts::validate_secret_ref(reference)?;
+    }
+    if let Some(reference) = value.get("billing").filter(|v| !v.is_null()) {
+        billing::Reference::parse(reference)?;
     }
     if let Some(machines) = value.get("machines") {
         let machines = machines.as_array().ok_or_else(|| {

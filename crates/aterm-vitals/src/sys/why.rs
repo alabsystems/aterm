@@ -21,6 +21,10 @@ use crate::words;
 /// Maximum byte length of a `sys why` text reply (including its header) when `top=` is unset.
 pub const REPLY_MAX: usize = 2048;
 
+/// The `who` rows a reply keeps before the CPU-hardware block gives way to one line pointing
+/// at `sys cores`, which prints it whole.
+const WHO_BEFORE_HARDWARE: usize = 3;
+
 fn resolve(q: &SysQuery, snap: Option<&Snapshot>) -> Bare {
     match (q.subject, snap) {
         (Some(subject), _) => Bare::Subject(subject),
@@ -744,7 +748,7 @@ pub fn why_text(
     ctx: &Ctx<'_>,
     s: &Snapshot,
     lines: &mut Vec<Line>,
-    hw_notes: &[Line],
+    hw_notes: &mut Vec<Line>,
     events: &[Line],
 ) {
     let subject = match resolve(q, Some(s)) {
@@ -796,11 +800,21 @@ pub fn why_text(
                 .chain(&head)
                 .chain(&body)
                 .chain(&tail)
-                .chain(hw_notes)
+                .chain(hw_notes.iter())
                 .chain(events)
                 .map(|l| l.text.len() + 1)
                 .sum::<usize>();
-        if q.top_set || sent <= REPLY_MAX || !rows.cut_one() {
+        let over = !q.top_set && sent > REPLY_MAX;
+        if over && rows.shown.len() <= WHO_BEFORE_HARDWARE && hw_notes.len() > 1 {
+            hw_notes.clear();
+            hw_notes.push(Line {
+                key: "cpu_hardware".into(),
+                text: "CPU hardware: cut to fit; `sys cores` prints it".into(),
+                value: false,
+            });
+            continue;
+        }
+        if !over || !rows.cut_one() {
             lines.extend(head);
             lines.extend(body);
             lines.extend(tail);

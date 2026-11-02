@@ -99,7 +99,7 @@ impl LaneState {
     /// # Errors
     /// A could-not-run when the lock file cannot be opened.
     pub fn try_lock(&self) -> Result<Lock> {
-        if let Some(parent) = self.lock.parent() {
+        if let Some(parent) = self.lock.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)
                 .map_err(|e| Error::io(format!("mkdir {}", parent.display()), &e))?;
         }
@@ -112,7 +112,7 @@ impl LaneState {
 
     /// Stamp the start of the run that holds the lock.
     pub fn mark_started(&self, now_unix: i64) {
-        let _ = std::fs::write(&self.started, format!("{now_unix}\n"));
+        let _ = super::report::write_atomic(&self.started, &format!("{now_unix}\n"));
     }
 
     /// The run that held the lock ended.
@@ -194,13 +194,16 @@ impl LaneState {
                     self.pins_seen.display()
                 )));
             };
-            let seen: Build = build.parse().map_err(|_| {
-                Error::refused(format!(
-                    "{} carries an unreadable line `{line}` — a floor that cannot be read is \
-                     never skipped; fix or remove it deliberately",
-                    self.pins_seen.display()
-                ))
-            })?;
+            let seen: Build = (!build.is_empty() && build.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| build.parse().ok())
+                .flatten()
+                .ok_or_else(|| {
+                    Error::refused(format!(
+                        "{} carries an unreadable line `{line}` — a floor that cannot be read is \
+                         never skipped; fix or remove it deliberately",
+                        self.pins_seen.display()
+                    ))
+                })?;
             match pins.get(program) {
                 None => tx.warn(format!(
                     "program {program} was pinned when this lane last ran and is ABSENT from \
@@ -246,7 +249,7 @@ impl LaneState {
             .unwrap_or(0)
             .saturating_add(1);
         if !dry_run {
-            let _ = std::fs::write(&self.head_failures, format!("{n}\n"));
+            let _ = super::report::write_atomic(&self.head_failures, &format!("{n}\n"));
         }
         n
     }
@@ -277,7 +280,7 @@ impl LaneState {
             .flatten()
             .unwrap_or(0)
             .saturating_add(1);
-        let _ = std::fs::write(&f, format!("{n}\n"));
+        let _ = super::report::write_atomic(&f, &format!("{n}\n"));
         u32::try_from(n).unwrap_or(u32::MAX)
     }
 
@@ -293,7 +296,9 @@ impl LaneState {
         };
         for e in entries.flatten() {
             let name = e.file_name();
-            if !name.to_string_lossy().starts_with("attempts-") {
+            if !name.to_string_lossy().starts_with("attempts-")
+                || !e.file_type().is_ok_and(|ft| ft.is_file())
+            {
                 continue;
             }
             let age = e
@@ -333,13 +338,20 @@ fn file_name(path: &Path) -> String {
 
 fn read_number(path: &Path) -> Result<Option<u64>> {
     match std::fs::read_to_string(path) {
-        Ok(text) => text.trim().parse().map(Some).map_err(|_| {
-            Error::refused(format!(
-                "{} holds `{}`, not a number — a floor that cannot be read is never read as 0",
-                path.display(),
-                text.trim()
-            ))
-        }),
+        Ok(text) => {
+            let trimmed = text.trim();
+            (!trimmed.is_empty() && trimmed.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| trimmed.parse().ok())
+                .flatten()
+                .map(Some)
+                .ok_or_else(|| {
+                    Error::refused(format!(
+                        "{} holds `{trimmed}`, not a number — a floor that cannot be read is \
+                         never read as 0",
+                        path.display()
+                    ))
+                })
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(Error::io(format!("read {}", path.display()), &e)),
     }

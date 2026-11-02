@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use atpkg_publish::artifact::upload;
 use atpkg_publish::channel::mirror::{self, MirrorOptions, MirrorReport};
 use atpkg_publish::error::Result;
 use atpkg_publish::host::fake::{FakeHost, FakeRelease};
@@ -163,7 +164,12 @@ fn a_publish_creates_the_signed_set_and_confirms_it_then_a_rerun_skips() {
     assert!(rel.prerelease);
     assert_eq!(
         rel.assets.keys().map(String::as_str).collect::<Vec<_>>(),
-        [TARBALL, "pkg-ay-8256.toml", "pkg-ay-8256.toml.sig"]
+        [
+            upload::VERSION_RESERVATION,
+            TARBALL,
+            "pkg-ay-8256.toml",
+            "pkg-ay-8256.toml.sig"
+        ]
     );
     assert_eq!(
         rig.host.notes_of(&public(), "atpkg-ay-8256").as_deref(),
@@ -217,7 +223,86 @@ fn a_missing_public_asset_is_uploaded_alone_and_never_replaces() {
         .filter(|c| c.starts_with("upload"))
         .cloned()
         .collect();
-    assert_eq!(uploads, ["upload alabsystems/ay atpkg-ay-8256 Never"]);
+    assert_eq!(
+        uploads, ["upload alabsystems/ay atpkg-ay-8256 Never"; 2],
+        "reservation reconciliation and the missing payload both remain create-only"
+    );
+}
+
+#[test]
+fn matching_reservation_metadata_is_verified_and_a_marker_only_public_release_resumes() {
+    let (rig, q) = setup("mirror-reservation", index());
+    let tag = "atpkg-ay-8256";
+    let staged = rig.host.release_of(&staging(), tag).unwrap();
+    let dir = rig.path("reserved-staging");
+    std::fs::create_dir_all(&dir).unwrap();
+    let files: Vec<_> = staged
+        .assets
+        .iter()
+        .map(|(name, bytes)| {
+            let path = dir.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            path
+        })
+        .collect();
+    upload::publish(
+        &rig.ctx,
+        "ay",
+        tag,
+        &dir.join("pkg-ay-8256.toml"),
+        &files,
+        "fixture",
+    )
+    .unwrap();
+    let staged = rig.host.release_of(&staging(), tag).unwrap();
+    let marker = staged.assets[upload::VERSION_RESERVATION].clone();
+    let (report, _) = ok(&rig, &q, false);
+    assert_eq!(report.created, [tag]);
+    let mut interrupted = rig.host.release_of(&public(), tag).unwrap();
+    interrupted
+        .assets
+        .retain(|name, _| name == upload::VERSION_RESERVATION);
+    interrupted.draft = true;
+    rig.host.put(&public(), tag, interrupted);
+    let (report, _) = ok(&rig, &q, false);
+    assert_eq!(report.created, [tag]);
+    let restored = rig.host.release_of(&public(), tag).unwrap();
+    assert!(!restored.draft);
+    assert_eq!(restored.assets[upload::VERSION_RESERVATION], marker);
+    assert_eq!(restored.assets[TARBALL], staged.assets[TARBALL]);
+
+    // A marker is metadata only when its exact version agrees with the verified
+    // signed manifest; malformed metadata must not relax the no-extras rule.
+    let before = rig.host.calls().len();
+    rig.host.put_asset(
+        &staging(),
+        tag,
+        upload::VERSION_RESERVATION,
+        b"unknown".to_vec(),
+    );
+    let mut incomplete = restored.clone();
+    incomplete.assets.remove(TARBALL);
+    rig.host.put(&public(), tag, incomplete.clone());
+    assert!(err(&rig, &q, false).contains("reservation is malformed or differs"));
+    assert_eq!(rig.host.release_of(&public(), tag), Some(incomplete));
+    assert!(
+        !rig.host.calls()[before..]
+            .iter()
+            .any(|call| call.starts_with("upload") || call.starts_with("create"))
+    );
+
+    // Restore the valid staged record, then make the owner-side record disagree.
+    rig.host.put(&staging(), tag, staged);
+    let mut conflicting = restored;
+    conflicting.assets.remove(TARBALL);
+    let mut other_version = marker;
+    *other_version.last_mut().unwrap() = b'x';
+    conflicting
+        .assets
+        .insert(upload::VERSION_RESERVATION.to_owned(), other_version);
+    rig.host.put(&public(), tag, conflicting.clone());
+    assert!(err(&rig, &q, false).contains("one build number names one version"));
+    assert_eq!(rig.host.release_of(&public(), tag), Some(conflicting));
 }
 
 #[test]

@@ -1319,8 +1319,12 @@ fn stop(l: &Layout, ssh: Option<&Ssh>) -> Result<(), String> {
         let _ = qmp(l, &["{\"execute\":\"system_powerdown\"}".to_string()]);
     }
     let t0 = Instant::now();
+    // A QEMU that ends at once is seen to end at once; a guest that takes its time is looked
+    // at every 2 s.
+    let mut step = Duration::from_millis(25);
     while process.still_here(l, Daemon::Qemu)? && t0.elapsed() < STOP_WITHIN {
-        std::thread::sleep(Duration::from_secs(2));
+        std::thread::sleep(step);
+        step = step.saturating_mul(2).min(Duration::from_secs(2));
     }
     let mut forced = None;
     if process.still_here(l, Daemon::Qemu)? {
@@ -1716,6 +1720,22 @@ fn stage_display_driver(l: &Layout, ssh: &Ssh) -> Result<(), String> {
     Ok(())
 }
 
+/// This Mac's `web2` to the guest's [`guest::WEB2`], whose digest the plan's `web2` step checks.
+fn stage_web2(ssh: &Ssh) -> Result<(), String> {
+    let (dir, _) = guest::WEB2
+        .rsplit_once('\\')
+        .unwrap_or_else(|| unreachable!("{} names a folder", guest::WEB2));
+    let made = ssh.run(&format!("if not exist {dir} mkdir {dir}"));
+    if !made.ok() {
+        return Err(format!("mkdir {dir}: {}", made.tail(3)));
+    }
+    let put = ssh.put(
+        Path::new(crate::linux_guest::WEB2),
+        &guest::WEB2.replace('\\', "/"),
+    );
+    if put.ok() { Ok(()) } else { Err(put.tail(3)) }
+}
+
 fn provision(l: &Layout, ssh: &Ssh) -> Result<Option<f64>, Fail> {
     let steps = guest::provision_steps();
     let want = guest::fingerprint(&steps);
@@ -1727,6 +1747,9 @@ fn provision(l: &Layout, ssh: &Ssh) -> Result<Option<f64>, Fail> {
     let t0 = Instant::now();
     stage_display_driver(l, ssh)
         .map_err(|e| not_run(format!("virtio-win's display driver did not copy: {e}")))?;
+    if steps.iter().any(|s| s.label == "web2") {
+        stage_web2(ssh).map_err(|e| not_run(format!("web2 did not copy: {e}")))?;
+    }
     let runner = ssh.runner();
     for s in &steps {
         println!("windows:   {} …", s.label);

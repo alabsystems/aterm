@@ -26,7 +26,10 @@ pub struct Bounded;
 
 impl Run for Bounded {
     fn run(&self, cmd: &mut Command, wait: Duration) -> Result<Output, RunError> {
-        aterm_uds::deadline::output_until(cmd, Instant::now() + wait)
+        let until = Instant::now()
+            .checked_add(wait)
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400));
+        aterm_uds::deadline::output_until(cmd, until)
     }
 }
 

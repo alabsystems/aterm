@@ -1,44 +1,16 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-control: spec recovery from its 77 unit tests
+# aterm-control: spec recovery from its unit tests
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 30 tests it
-> deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
-> were taken before.
+Each §1 row is a property of the compiled Rust for a Trust/Clean proof to establish; the proof
+retires the tests the row subsumes. §2 maps each test to its specs. A test neither table names has
+no spec here. The claims come from reading the code.
 
-> Status 2026-10-16: this is the crate's migration worklist. Each of the 32 specs below is proved
-> through Trust/Clean about the compiled Rust function, then the tests it subsumes are deleted. The 4
-> checks in §4 that sampled no spec are deleted; no spec-sample test has been deleted yet. Added since
-> the recovery: `visible-text-collapse` and the 5 tests §2 maps from `src/wire.rs`'s three
-> `visible-text-collapse` rows to `src/selection.rs`'s two `blocktext-format` rows, and the 4
-> tests the asciicast codec, the replay engine and its fork brought (`write_then_parse_round_trips`,
-> `every_replay_sets_archive_posture_and_policy`, `forked_variants_equal_full_folds`,
-> `offline_drift_sees_the_handoff`).
-> `selector-parse` left this crate with `host::Selector::parse`: the wire's selector grammar is
-> aterm-types' (`control_request`, spec `cr-request-grammar`, digits-only, which settles §5.1), and the
-> roster check (R1) reads ids through it. 31 specs remain. `SessionHost::write_input`,
-> `placements` and `HostCapabilities::input_sink` left the trait (no production caller; the
-> control-server carve is not scheduled): clause (W) and `a_host_without_a_sink_never_answers_ok`
-> went with them, and the unserved-sid arm of the write check is `check_unserved_sid`, on
-> `with_terminal_mut`.
-
-Source: `crates/aterm-control` (read only). I read every `#[test]` (src/cast_drift.rs 25,
-src/conformance.rs 35, src/selection.rs 14, src/host.rs 2, src/wire.rs 1 = 77) and the code each one
-reaches. Nothing was compiled or run. The claims below come from reading the code.
-
-Result: **32 specs**, covering **82 tests**. **4 tests are not spec samples** (§4). Three specs are
-mostly about code in other crates and should be re-homed there, with this crate citing the theorem
-(gap 12): `json-escape-wire` (aterm-codec; the functions here are re-exports),
+JSON escape and percent encoding are aterm-codec's; block parsing (OSC 133/633/7), selection, grid
+cells and resize are aterm-core's. A row citing them needs gap 12, and three rows belong in those
+crates' `SPECS.md`: `json-escape-wire` (aterm-codec; the functions here are re-exports),
 `word-cells-are-drawn-cells` and `paint-equals-copy` (aterm-core).
-
-Blocking gaps are the row numbers of the gap table in
-`AUDIT-trust-for-test-migration-2026-10-15.md` (historical internal audit) §7.
-Gap 0 (the installed seal publishes no Clean-discharged row) is the prerequisite for every row, so it is
-listed on every spec. Seal `150efe4a`, built locally, closes it for local use; admitting it to the
-machine's `trust` channel is owner-gated. No spec here is blocked by gap 0 alone: the narrowest rows
-also need gap 2 and 3 (`drift-settle-cut`) or gap 1 (everything else), because the crate's surface is
-`&str` in and `String` out.
 
 ## 0. Notation used in the statements
 
@@ -55,20 +27,16 @@ also need gap 2 and 3 (`drift-settle-cut`) or gap 1 (everything else), because t
     `resolve(Local(e.sid)) = resolve(Id(e.id)) = Some(e.sid)`. `resolve(sel) = None` for every `sel`
     that names no row.
   - **(S)** `Served(c)` ⇔ `with_terminal_mut(c,_) ≠ None` ⇔ `with_terminal_as_it_stands(c,_) ≠ None`, for
-    every `c`.
-    `request_redraw(c)` and `subscribe(c)` never touch `s`'s state when `c ≠ s`.
-  - **(K)** retention: an effect of `with_terminal_mut(s,f)` is seen by every later `with_terminal(s,_)`,
-    `with_terminal_as_it_stands(s,_)` or `with_terminal_mut(s,_)`, because there is one engine per sid.
-    `with_terminal` may first wait for a whole frame of the program's (`aterm-gui`'s host does, bounded),
-    and `blocktext`, `selection`, `copy` and `select` say ` frame=open` for one still unfinished under
-    its hold; `with_terminal_as_it_stands` never does, and is what `blocks`, `blocks --json` and `wait`
-    read through.
+    every `c`. `request_redraw(c)` and `subscribe(c)` never touch `s`'s state when `c ≠ s`.
+  - **(K)** retention: one engine per sid, so an effect of `with_terminal_mut(s,f)` is seen by every
+    later accessor of `s`. `with_terminal` may first wait, bounded, for the program's frame to finish
+    (aterm-gui's host does), and `blocktext`, `selection`, `copy` and `select` say ` frame=open` for one
+    still unfinished; `with_terminal_as_it_stands`, which `blocks`, `blocks --json` and `wait` read
+    through, never waits.
   - **(C)** `capabilities()` is constant during a call.
 - `Pred_X(H,s)`: the exact decidable predicate each `check_X` evaluates (spec `conf-check-predicates`).
-- Long-term route: lift `HostContract` onto the trait as per-impl obligations, prove it for the production
-  hosts (aterm-gui's `GuiHost`, any daemon host), then delete the suite's meta-tests. `MemoryHost` is
-  `#[cfg(test)]`-only. The suite sits behind feature `conformance` and has dev-only callers (aterm-gui
-  tests, the `aterm-redraw-conformance` dev bin).
+- The suite (`conformance`) is `#[cfg(any(test, debug_assertions))]`; its reference host `MemoryHost` is
+  `#[cfg(test)]`. aterm-gui's tests and its `aterm-redraw-conformance` dev bin run it against the GUI host.
 
 ### Verbs
 
@@ -112,26 +80,30 @@ also need gap 2 and 3 (`drift-settle-cut`) or gap 1 (everything else), because t
   posture `p` and resize law `l` (`Terminal::set_resize_law`, one of `h.resize_laws`), entered alt iff `a`,
   then fed `ev` in order. Output means `process`. Resize means: drop the resize undo first iff `¬u`, then
   resize under policy `p`.
-- **Engine resize law** (aterm-core, external; citing it is gap 12): on the alt screen with a non-blank row
-  below the cursor, a one-row shrink then grow with any output between them demotes the top row, shifts
-  every row up one and appends a blank row. With nothing output between them, the undo hands the row
-  back. On the primary screen with the cursor on row 0 it rotates rows through history. The scenario
-  tests sample this law composed with the audit specs below.
+- **Engine resize law** (aterm-core; citing it is gap 12): on the alt screen with a non-blank row below
+  the cursor, a one-row shrink then grow with output between them demotes the top row, shifts every row
+  up one and appends a blank row; with no output between them, the undo hands the row back. On the
+  primary screen with the cursor on row 0 it rotates rows through history. The scenario tests sample
+  this law composed with the audit specs.
 
-Cross-crate: JSON escape and percent encoding live in aterm-codec. Block parsing (OSC 133/633/7),
-selection, grid cells and resize live in aterm-core. Specs that cite those functions need gap 12, or need
-to be re-homed in that crate's `SPECS.md`.
+### Gaps
+
+`blocking_gaps` numbers are rows of the gap table in `docs/AUDIT-trust-for-test-migration-2026-10-15.md`
+§7: 0 a seal that publishes Clean-discharged rows (every row), 1 non-scalar carriers (`&str`, `String`,
+`Vec`), 2 certified `&self`/`&mut self` views, 3 E6 body widening, 4 callee-ensures composition, 5
+quantified clauses, 6 plain-Rust clause publication, 7 loops, 8 effects, 10 model→code refinement, 11
+generics, 12 cross-crate citation, 13 threads and closures.
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes (primary tests; secondary in §2)`,
-`difficulty (Rust features the proof must handle)`, `blocking_gaps (audit §7)`.
+Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (primary tests; others in §2),
+`difficulty` (Rust features the proof must handle), `blocking_gaps` (§0).
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
 json-escape-wire	round-trip (home: aterm-codec)	wire::json_escape (= aterm_codec::json::escape), wire::json_escape_into (= aterm_codec::json::escape_into), wire::json_str_field, wire::json_ok	∀ buf:String, s:&str. (a) json_escape_into(buf,s) leaves buf' = buf ++ json_escape(s). (b) json_escape(s) contains no char c with TtyActive(c), and no '"' or '\\' except as part of an escape. Every such char is emitted as a two-character escape (\" \\ and the codec's C0-whitespace table: \n \r \t \b \f) or as \u followed by 4 lowercase hex digits. Every other char, non-ASCII included, is emitted verbatim. (c) JSON-decode("\"" ++ json_escape(s) ++ "\"") = s. (d) json_str_field(k,v) = "\"" ++ json_escape(k) ++ "\":\"" ++ json_escape(v) ++ "\"", and json_ok(x) = "OK 1\n" ++ x ++ "\n". Corollary: "{" ++ json_str_field(k,s) ++ "}" is a valid JSON object whose member k decodes to s.	wire::json_member_keeps_arbitrary_keys_and_values_in_one_member	MEDIUM: &str/String char iteration loop, push_str, format!, a char-class table, a cross-crate re-export. The decode half (c) needs a JSON-decoder model; cast-json-reader's round-trip clause is the same law from the reader side.	0,1,5,6,7,12
 visible-text-collapse	contract	wire::{visible_char, VisibleTrim, push_visible, is_blank_row, trimmed_len, visible_row, visible_row_into}, Terminal::push_line_text	∀ out, s, trim. visible_char(c) = ' ' iff c ∈ U+0000..=U+001F ∪ U+007F..=U+009F (= c.is_control()), else c. push_visible(out, s, trim) sets out' = out ++ T_trim(map visible_char s), where T_None(x) = x, T_Spaces(x) = x without its trailing U+0020 run, and T_Whitespace(x) = trim_end(x) (Unicode White_Space); the prefix out is never changed, so a trim never crosses into it. is_blank_row(r) ⇔ ∀ c ∈ r. visible_char(c) is White_Space ⇔ push_visible("", r, Whitespace) = "". trimmed_len(rows) = 1 + the largest index i with ¬is_blank_row(rows_i), or 0 if none; hence trimmed_len(rows) = trimmed_len([push_visible("", r, Whitespace) | r ∈ rows]). ∀ t, r, out. visible_row_into(t, r, out) sets out' = out ++ push_visible("", get_line_text(t, r, None) or "", Whitespace) when r < rows, and leaves out unchanged otherwise (Terminal::push_line_text appends exactly get_line_text(r, None) and answers r < rows); visible_row(t, r) = visible_row_into(t, r, "").	wire::visible_char_blanks_exactly_the_control_characters, wire::push_visible_collapses_then_trims_each_rule, wire::trimmed_len_is_last_nonblank_plus_one, wire::visible_row_into_appends_the_rows_text_reads	MEDIUM: &mut String append with a tail-only truncate, a char map with a rare rebuild, three trim rules, an iterator fold; the engine row walk is aterm-core's	0,1,2,3,7,12
-wait-args	contract	wire::{clamp_wait_ms, resolve_wait_timeout_ms, wait_ms}, selection::cmd_wait (argument arm)	clamp_wait_ms(ms) = min(ms, WAIT_MAX_MS); resolve_wait_timeout_ms(None) = WAIT_DEFAULT_MS and resolve_wait_timeout_ms(Some(ms)) = clamp_wait_ms(ms). ∀ tok. wait_ms(tok) = tok.parse::<u64>().ok().map(clamp_wait_ms) when tok is non-empty ASCII digits, and None otherwise. It does no trimming: wait_ms(" 5") = None, wait_ms("+5") = None. ∀ H, s, rest, with r = rest.trim(): r = "" ⇒ timeout = WAIT_DEFAULT_MS. r ≠ "" ∧ wait_ms(r) = None ⇒ cmd_wait returns exactly "ERR usage: wait [<ms>]\n" before any host call. Otherwise timeout = wait_ms(r). So "2s", "1.5", "-1", "+5", "0x10", "5 6" and "timeout=5" are usage errors, and "99999999999" waits WAIT_MAX_MS.	wire::wait_timeouts_default_and_clamp, conformance::a_wait_ms_that_is_not_a_number_is_the_usage_line	EASY: &str trim, ASCII-digit check and parse::<u64>, Option::map, u64::min, an early return before generic trait calls	0,1,3,6; fragment: `wire::clamp_wait_ms` F1 (VF5 first target, docs/PLAN-tests-to-specs-2026-10-15.md "F1-ready specs").
+wait-args	contract	wire::{clamp_wait_ms, resolve_wait_timeout_ms, wait_ms}, selection::cmd_wait (argument arm)	clamp_wait_ms(ms) = min(ms, WAIT_MAX_MS); resolve_wait_timeout_ms(None) = WAIT_DEFAULT_MS and resolve_wait_timeout_ms(Some(ms)) = clamp_wait_ms(ms). ∀ tok. wait_ms(tok) = tok.parse::<u64>().ok().map(clamp_wait_ms) when tok is non-empty ASCII digits, and None otherwise. It does no trimming: wait_ms(" 5") = None, wait_ms("+5") = None. ∀ H, s, rest, with r = rest.trim(): r = "" ⇒ timeout = WAIT_DEFAULT_MS. r ≠ "" ∧ wait_ms(r) = None ⇒ cmd_wait returns exactly "ERR usage: wait [<ms>]\n" before any host call. Otherwise timeout = wait_ms(r). So "2s", "1.5", "-1", "+5", "0x10", "5 6" and "timeout=5" are usage errors, and "99999999999" waits WAIT_MAX_MS.	wire::wait_timeouts_default_and_clamp, conformance::a_wait_ms_that_is_not_a_number_is_the_usage_line	EASY: &str trim, ASCII-digit check and parse::<u64>, Option::map, u64::min, an early return before generic trait calls	0,1,3,6; fragment: `wire::clamp_wait_ms` F1 (VF5 first target, docs/PLAN-tests-to-specs-2026-10-15.md "F1-ready specs"). Proved via mirror: Clean R208 row `aterm_clamp_wait_ms` (the F1 mirror of the PM-1-free rows, over a verbatim copy at aterm 5285726838; graded proved in Clean's rows.out.tsv); not yet credited: Trust's compiler mints no calculus row until it pins a VF5 base (E4.7).
 selector-wire-projection	contract	host::Selector::{local_sid, stable_id}, <aterm_types::control_request::Selector as From<host::Selector>>::from	Selector::Local(n) has local_sid() = Some(n), stable_id() = None, and converts to WireSelector::Local(n). Selector::Id(s) has local_sid() = None, stable_id() = Some(s), and converts to WireSelector::Sid(sid) when Sid::parse(s) = Some(sid), else WireSelector::Invalid(s).	host::selector_reads_as_the_wire_grammar	EASY: enum match and Sid::parse delegation	0,1,3,12
 park-slice-loop	contract	park::{park, park_guarded, Lane::ignoring_hangup}	park floors until at now + MIN_PARK and loops over left = until.saturating_duration_since(now): left = 0 ⇒ Woke::Due; else slice = (lane.slice)(left) and woke = wait(slice). woke ⇒ Woke::Rang (neither lane.hung_up nor moved is called); else slice ≥ left ⇒ Woke::Due (neither is called, so an unserved lane with slice = id runs one wait); else (lane.hung_up)() ⇒ Woke::HungUp (moved not called); else moved() ⇒ Woke::Rang; else repeats. park_guarded runs the same loop over Condvar::wait_timeout (recovering poison) and returns the MutexGuard on every exit. Lane::ignoring_hangup keeps slice and sets hung_up to const false.	park::a_bare_slice_asks_only_after_the_caller_and_the_flag, park::an_unserved_park_is_one_wait, park::a_guarded_park_hands_its_guard_back	MEDIUM: loop over Instant/Duration, FnMut/fn callbacks, Condvar/MutexGuard	0,1,3,4,7,8,11,13
 verbs-fail-closed-on-unserved-sid	contract	selection::{cmd_blocks, cmd_blocks_json, cmd_blocktext, cmd_wait, cmd_select, cmd_selection, cmd_copy}	∀ H, s with with_terminal(s,_) = None, with_terminal_mut(s,_) = None and with_terminal_as_it_stands(s,_) = None. cmd_blocks(H,s,r) = cmd_blocks_json(H,s,r) = NO_SESSION for every r. cmd_blocktext(H,s,r) = NO_SESSION when r.trim() is non-empty ASCII digits that parse as u64, and its USAGE otherwise. cmd_wait(H,s,r) = NO_SESSION for every valid tail (wait-args), and subscribe is never called. cmd_selection(H,s) = NO_SESSION. cmd_copy(H,s) = NO_SESSION if caps.clipboard, else "ERR unsupported\n". cmd_select(H,s,r) = NO_SESSION for every r that parses to a form, and such a call never calls request_redraw. No verb calls clipboard_set, and no verb answers from another sid's state. Usage and capability refusals are checked before the sid.	conformance::an_unresolved_sid_is_refused	MEDIUM: generic trait methods with impl FnOnce closures returning Option, let-else, String allocation	0,1,2,4,11
@@ -212,7 +184,7 @@ The aterm-codec and aterm-core facts come first, from their own crates: `json-es
 
 ## 2. Test → spec map (TSV)
 
-`primary` is the spec that retires the test. `also` lists the other specs the same test samples.
+`primary` is the spec that retires the test; `also` lists the other specs it samples.
 
 ```tsv
 file	test	primary	also
@@ -292,25 +264,12 @@ src/cast_drift.rs	offline_drift_sees_the_handoff	drift-render	asciicast-structur
 
 ## 3. Coverage
 
-- 77 tests read. 73 map to one of the 31 specs. 4 are not spec samples (§4).
-- The biggest collapses: `drift-verdict-and-attribution` (10 primary, plus 4 shared),
-  `conf-check-predicates` (10 primary), `word-cells-are-drawn-cells` (7), `conf-sound` (6),
-  `select-line-logical` and `conf-nonintrusive` (4 each).
-- Four specs have no primary test: `select-word-contract`, `paint-equals-copy`, `cast-until` and
-  `drift-render`. Each is sampled only as a side check of other tests; it states a
-  contract the code keeps and those tests lean on. `drift-render` is the widest of them: 11 tests read
-  the wire form it fixes.
-- `json-escape-wire`, `word-cells-are-drawn-cells` and `paint-equals-copy` move to aterm-codec's and
-  aterm-core's catalogues. Their 8 primary tests are deleted once those crates prove them, and this crate
-  then cites the theorems (gap 12).
+No test is primary for `select-word-contract`, `paint-equals-copy` or `cast-until`: other tests sample
+them as side checks. The four `conf-*` rows subsume no test.
 
 ## 4. Tests that are not spec samples
 
-> Status 2026-10-16: the 4 tests this section listed are deleted (77 → 73 tests in the crate), and their
-> §2 rows are gone. One checked the field values `#[derive(Default)]` gives `SessionPlacement`, which the
-> derive already guarantees; three asserted only `MemoryHost`'s own `#[cfg(test)]` methods, while the
-> property they named is a clause of `HostContract` that each production host owes. Every test left
-> samples a spec.
+None: every test §2 lists samples a spec.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
@@ -341,24 +300,28 @@ src/cast_drift.rs	offline_drift_sees_the_handoff	drift-render	asciicast-structur
 
 ## 6. Proof order (easiest high-value first)
 
-No spec here is blocked by gap 0 alone. The order below takes the narrowest rows first, because each forces
-a small, reusable Trust widening that the larger specs then build on.
+No row is blocked by gap 0 alone. The narrowest go first, each forcing a small Trust widening the
+larger rows reuse:
 
-1. **`drift-settle-cut`** (gaps 0, 2, 3). A `&mut self` update of one enum field guarded by a `matches!`
-   over two others: no loop, no string, no call. It is the smallest certified `&mut self` view in the
-   crate and retires `a_racy_cut_is_answered_by_the_replays` (whose seed half also needs
-   `drift-anchor-and-seed`).
-2. **`wait-args`** (gaps 0, 1, 3, 6). One `str::parse::<u64>` plus a `min`, on a Clean model of
-   `u64::from_str` over `&str`. Fixing §5.2 first (ASCII digits only) shrinks that model to a digit fold.
-   It retires one test and is a premise of `wait-completion` and `conf-check-predicates`.
-3. **`drift-args-parse`** (gaps 0, 1, 3, 6, 7). A token loop over the same parse model; it retires one test.
-4. **`cast-until`** (gaps 0, 1, 7). A `Vec::retain` with an `f64` comparison: the first `Vec` content
-   model in the crate, needed later by `asciicast-structure`.
-5. **`drift-undo-law`** (gaps 0, 1, 2, 3, 5). A case split over two calls to the seeded audit, stated
-   with the audit's result as an opaque record. It retires two tests.
-6. **`select-word-contract`** and **`drift-run-grouping`** (gaps 0, 1, 2 plus 12 or 7). Small bodies; the
-   first is the bridge every gesture test crosses, the second retires one test and is the base of the
-   drift candidate specs.
+1. **`drift-settle-cut`** (gaps 0, 2, 3): a `&mut self` update of one field under a `matches!`, with
+   no loop, string or call; the smallest certified `&mut self` view in the crate.
+2. **`wait-args`** (gaps 0, 1, 3, 6): one `str::parse::<u64>` and a `min` over a Clean model of
+   `u64::from_str`, a digit fold once §5.1 is fixed. A premise of `wait-completion` and
+   `conf-check-predicates`.
+3. **`drift-args-parse`** (gaps 0, 1, 3, 6, 7): a token loop over the same parse model.
+4. **`cast-until`** (gaps 0, 1, 7): a `Vec::retain` with an `f64` comparison, the first `Vec` content
+   model, which `asciicast-structure` needs.
+5. **`drift-undo-law`** (gaps 0, 1, 2, 3, 5): a case split over two calls to the seeded audit, its
+   result an opaque record.
+6. **`select-word-contract`** and **`drift-run-grouping`**: the bridge every gesture test crosses, and
+   the base of the drift candidate rows.
 
-The large collapses come after: `conf-check-predicates` (10 tests) once gaps 4, 5, 7 and 11 land, and
-`drift-verdict-and-attribution` (10 tests) once `drift-replay-fidelity` can be cited.
+Then by dependency: the aterm-codec and aterm-core facts in their crates (`json-escape-wire`,
+`word-cells-are-drawn-cells`, `paint-equals-copy`, the engine resize law); the parsers
+(`cast-json-reader` → `asciicast-structure`); `visible-text-collapse`, which `blocktext-format` and
+`drift-replay-fidelity` cite; the verbs (`verbs-fail-closed-on-unserved-sid`, then
+`blocks-line-format`, `blocks-json-format`, `blocktext-format`, `wait-completion`,
+`word-span-window-refines-line` → `select-line-logical`, `select-grammar`,
+`selection-and-copy-render`); the checker (`conf-check-predicates`, then `conf-sound`,
+`conf-retention-complete`, `conf-nonintrusive`); the drift audit (`drift-replay-fidelity`, then
+`drift-anchor-and-seed`, `drift-candidates`, `drift-verdict-and-attribution`, `drift-render`).

@@ -40,6 +40,7 @@ mod any_host;
 mod remote;
 pub use remote::{DriveLink, DriveRefused, DriveStream, FleetDriveFn, Left, lifts_there};
 mod survey;
+mod verb_first;
 pub use survey::{
     DEFAULT_BUDGET, EXCERPT_CHARS, EXCERPT_WIDE_CHARS, EXCERPTS_CUT, FLEET_WITHIN, FleetAsk,
     FleetRead, FleetRefused, FleetSurveyFn, LEFT_OUT_LEAD, NO_ROUTE_NOTE, PeerFault, PeerSurvey,
@@ -228,6 +229,13 @@ CROSS-TERMINAL DRIVING:
     @$ATERM_PARENT_SESSION_ID — your own session, whichever tab is in front —
     and fails outside an aterm session. No selector, or @., targets the
     instance's active tab, which changes with every tab switch.
+    A read the server answers at once (text, screen, status, search, log,
+    inbox, result, …; not a wait such as await or ready, nor subscribe, a
+    write or a meta verb) also takes its selector right after the verb, or
+    the bare sid as `ls` prints it, its other words kept: aterm-ctl status
+    s-ab12… is aterm-ctl @s-ab12… status. After `search` only an @ that
+    names a session is one (its other words are the pattern), and `read` is
+    `text` beside a selector on either side (read @s-ab12…, @s-ab12… read).
 
 PUSH FRAMES (subscribe):
     After the `OK subscribe <n>` ack (on stderr) the connection is push-only
@@ -305,9 +313,11 @@ CLIENT VERBS (answered by aterm-ctl itself; not in the protocol table):
                   window=<id|none|-> active=<0|1|-> wfocus=<0|1|-> detail=<pct|->
                   path=<frozen|live> program=<name|-> agent=<word|->
                   agent_detail=<pct|-> agent_rev=<n> agent_since_ms=<ms> agent_gen=<e.s|->
-                  agent_fp=<hex16|-> program_state=<word[:kind]|-> human_ms=<ms|->
+                  agent_fp=<hex16|-> wait=<memory|-> wait_gib=<GiB|-> wait_ahead=<n|->
+                  program_state=<word[:kind]|-> human_ms=<ms|->
                   role=<pct|-> attention=<pct|-> user_title=<pct|->
                   supervisor=<holder|-> supervisor_proven=<0|1>
+                  supervisor_version=<pct|-> supervisor_vendor=<pct|->
                   autopilot=<off|cruise|land|->
                   path_evidence=<measured:<ms>|unconfirmed:<ms>|carried|->
                   copy=<managed|foreign|-> upgrade=<-|<state>/<to>/<why>/<age>>
@@ -835,8 +845,12 @@ fn self_instance_sock_in(dir: &Path, self_sid: Option<&str>) -> Option<String> {
     graph_entry_sock_in(dir, aterm_types::control_request::Sid::parse(self_sid?)?)
 }
 
+pub(crate) const MAX_GRAPH_ENTRY_BYTES: u64 = 16 * 1024;
+
 fn graph_entry_sock_in(dir: &Path, sid: aterm_types::control_request::Sid<'_>) -> Option<String> {
-    let body = std::fs::read_to_string(dir.join("graph").join(sid.as_str())).ok()?;
+    let (body, _) =
+        read_bounded_regular_utf8(&dir.join("graph").join(sid.as_str()), MAX_GRAPH_ENTRY_BYTES)
+            .ok()?;
     control_socket::graph_entry_sock(&body)
 }
 
@@ -871,8 +885,7 @@ pub fn connect_then_read_token(sock: &str) -> io::Result<(CtlStream, io::Result<
 
 fn connect_then_read<T>(sock: &str, read: impl FnOnce(&str) -> T) -> io::Result<(CtlStream, T)> {
     let pinned = pin_alias(sock);
-    let stream = CtlStream::connect(&pinned)?;
-    aterm_uds::keep_out_of_children(&stream)?;
+    let stream = aterm_uds::kept_out(|| CtlStream::connect(&pinned))?;
     Ok((stream, read(&pinned)))
 }
 
@@ -1542,9 +1555,15 @@ pub const PROBE_WITHIN_SEAM: &str = "ATERM_DEBUG_CTL_PROBE_WITHIN_MS";
 /// The milliseconds the dev seam `seam` names, or `or` where it names none.
 fn seamed_within(seam: &str, or: std::time::Duration) -> std::time::Duration {
     aterm_types::dev_seam!(seam)
-        .and_then(|ms| ms.to_str()?.trim().parse::<u64>().ok())
+        .and_then(|ms| parse_uint::<u64>(ms.to_str()?.trim()))
         .filter(|&ms| ms > 0)
         .map_or(or, std::time::Duration::from_millis)
+}
+
+pub(crate) fn parse_uint<T: std::str::FromStr>(s: &str) -> Option<T> {
+    (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| s.parse().ok())
+        .flatten()
 }
 
 #[derive(Clone, Copy)]
@@ -1742,6 +1761,37 @@ enum Probe {
 
 fn probe_lines(path: &str, verb: &str, pid: u32) -> Probe {
     probe_lines_with_deadline(path, verb, pid, probe_within())
+}
+
+/// `verb` asked on `stream`, a connection to an instance's control socket, as this crate's
+/// probes ask it: `token` presented first (`AUTH`, which answers nothing), every write and
+/// read done within `within`, and the reply read as `OK <n>` and its `n` lines.
+///
+/// # Errors
+/// No reply so framed within `within`: the token refused (`ERR auth`), a busy instance, another
+/// `ERR` reply, a status line not so framed, a hang-up mid-reply, or no answer in time; the
+/// error's text says which.
+pub fn exchange_lines(
+    stream: &CtlStream,
+    token: &str,
+    verb: &str,
+    within: std::time::Duration,
+) -> io::Result<Vec<String>> {
+    match probe_exchange(
+        stream,
+        Some(token),
+        None,
+        verb,
+        ProbeDeadline::after(within),
+    ) {
+        Probe::Answered(lines) => Ok(lines),
+        Probe::Timeout => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("no answer within {}", deadline_words(within)),
+        )),
+        Probe::Other(e) => Err(e),
+        refused => Err(io::Error::other(probe_cause(0, &refused))),
+    }
 }
 
 fn probe_read_bounded_line<R: BufRead>(
@@ -1942,6 +1992,10 @@ fn other_elevation_note() -> Option<String> {
 }
 
 fn inspect_fleet() -> (DirOutcome, Vec<Target>) {
+    inspect_fleet_with(Inventory::Display)
+}
+
+fn inspect_fleet_with(mode: Inventory) -> (DirOutcome, Vec<Target>) {
     let Some(dir) = socket_dir() else {
         return (DirOutcome::Unresolvable, Vec::new());
     };
@@ -1953,7 +2007,14 @@ fn inspect_fleet() -> (DirOutcome, Vec<Target>) {
         }
         Err(err) => return (DirOutcome::Unreadable { path: dir, err }, Vec::new()),
     };
-    let instances = enumerate_instances(&dir, entries);
+    let inventory = match mode {
+        Inventory::Display => Ok(enumerate_instances(&dir, entries)),
+        Inventory::Complete => enumerate_instances_with(&dir, entries, mode),
+    };
+    let instances = match inventory {
+        Ok(instances) => instances,
+        Err(err) => return (DirOutcome::Unreadable { path: dir, err }, Vec::new()),
+    };
     let outcome = if instances.is_empty() {
         DirOutcome::Empty(dir)
     } else {
@@ -1990,7 +2051,33 @@ impl Target {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Inventory {
+    /// A display listing skips unreadable entries so the others remain visible.
+    Display,
+    /// A removal census must retain unknown facts instead of skipping an error.
+    Complete,
+}
+
+impl Inventory {
+    fn read<T>(self, result: io::Result<T>) -> io::Result<Option<T>> {
+        match result {
+            Ok(value) => Ok(Some(value)),
+            Err(_) if self == Self::Display => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+}
+
 fn enumerate_instances(dir: &Path, entries: std::fs::ReadDir) -> Vec<Target> {
+    enumerate_instances_with(dir, entries, Inventory::Display).unwrap_or_default()
+}
+
+fn enumerate_instances_with(
+    dir: &Path,
+    entries: impl IntoIterator<Item = io::Result<std::fs::DirEntry>>,
+    mode: Inventory,
+) -> io::Result<Vec<Target>> {
     let mut out: Vec<Target> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     let remember = |seen: &mut HashSet<String>, sock: &str| -> bool {
@@ -2001,17 +2088,42 @@ fn enumerate_instances(dir: &Path, entries: std::fs::ReadDir) -> Vec<Target> {
         );
         seen.insert(key)
     };
-    for (pid, sock) in instance_socks_in(dir, entries) {
+    for entry in entries {
+        let Some((pid, sock)) = mode.read(entry)?.and_then(|e| instance_sock_in(dir, &e)) else {
+            continue;
+        };
         if remember(&mut seen, &sock) {
             out.push(Target::named(pid, sock));
         }
     }
-    if let Ok(entries) = std::fs::read_dir(dir.join("graph")) {
-        for e in entries.flatten() {
-            let Ok((body, written)) = graph_hygiene::read_entry(&e.path()) else {
+    let graph = dir.join("graph");
+    if mode == Inventory::Complete {
+        match std::fs::symlink_metadata(&graph) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                out.sort_unstable();
+                return Ok(out);
+            }
+            Err(error) => return Err(error),
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => return Err(io::Error::other("session graph is not a real directory")),
+        }
+    }
+    let entries = match std::fs::read_dir(graph) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound && mode == Inventory::Display => None,
+        other => mode.read(other)?,
+    };
+    if let Some(entries) = entries {
+        for entry in entries {
+            let Some(e) = mode.read(entry)? else {
+                continue;
+            };
+            let Some((body, written)) = mode.read(graph_hygiene::read_entry(&e.path()))? else {
                 continue;
             };
             let Some(sock) = control_socket::graph_entry_sock(&body) else {
+                if mode == Inventory::Complete {
+                    return Err(io::Error::other("session graph record has no socket"));
+                }
                 continue;
             };
             let pid = control_socket::graph_entry_pid(&body).unwrap_or(0);
@@ -2028,19 +2140,21 @@ fn enumerate_instances(dir: &Path, entries: std::fs::ReadDir) -> Vec<Target> {
         }
     }
     out.sort_unstable();
-    out
+    Ok(out)
 }
 
 fn instance_socks_in(dir: &Path, entries: std::fs::ReadDir) -> Vec<(u32, String)> {
     entries
         .flatten()
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().into_owned();
-            let pid = control_socket::instance_pid(&name)?;
-            name.ends_with(".sock")
-                .then(|| (pid, dir.join(&name).to_string_lossy().into_owned()))
-        })
+        .filter_map(|e| instance_sock_in(dir, &e))
         .collect()
+}
+
+fn instance_sock_in(dir: &Path, entry: &std::fs::DirEntry) -> Option<(u32, String)> {
+    let name = entry.file_name().to_string_lossy().into_owned();
+    let pid = control_socket::instance_pid(&name)?;
+    name.ends_with(".sock")
+        .then(|| (pid, dir.join(&name).to_string_lossy().into_owned()))
 }
 
 fn foreign_note(verb: &str, probes: &[(u32, String, Probe)]) -> Option<String> {
@@ -2083,24 +2197,28 @@ fn foreign_note_text(foreign: &[(u32, &str, &ForeignFacts)]) -> Option<String> {
         "NOTE: {n} private {noun} only whoever started {it} can drive ({})",
         rows.join(", ")
     );
-    if let Some(kill) = orphan_kill(foreign.iter().map(|(pid, _, facts)| (*pid, *facts))) {
-        note.push_str(&format!("; {kill}"));
+    if let Some(pointer) = orphan_pointer(foreign.iter().map(|(_, _, facts)| *facts)) {
+        note.push_str(&format!("; {pointer}"));
     }
     Some(note)
 }
 
-fn orphan_kill<'a>(foreign: impl Iterator<Item = (u32, &'a ForeignFacts)>) -> Option<String> {
-    let orphans: Vec<String> = foreign
-        .filter(|(_, facts)| facts.orphaned())
-        .map(|(pid, _)| pid.to_string())
-        .collect();
-    if orphans.is_empty() {
+/// For instances whose launcher exited and launchd adopted, where they are listed with their
+/// proof: `aterm ctl sys left scope=aterm`, whose `end=` token, where the proof offers one, is
+/// what `aterm ctl end` takes. No pid is printed to type: a pid names whatever holds it by then.
+fn orphan_pointer<'a>(foreign: impl Iterator<Item = &'a ForeignFacts>) -> Option<String> {
+    let orphans = foreign.filter(|facts| facts.orphaned()).count();
+    if orphans == 0 {
         return None;
     }
-    let it = if orphans.len() == 1 { "it" } else { "them" };
+    let (it, its) = if orphans == 1 {
+        ("it", "its")
+    } else {
+        ("them", "each one's")
+    };
     Some(format!(
-        "`kill {}` ends {it} once nothing in {it} is yours to keep",
-        orphans.join(" ")
+        "`aterm ctl sys left scope=aterm` lists {it} with {its} proof, and `aterm ctl end \
+         <token>` ends one it offers a token for"
     ))
 }
 
@@ -2532,7 +2650,11 @@ pub fn fleet_sessions() -> Result<Vec<FleetSession>, FleetListError> {
 
 /// Every aterm instance that has published a control socket on this machine, as `(pid, socket path)`.
 pub fn local_instances() -> Result<Vec<(u32, String)>, FleetListError> {
-    let (dir, targets) = inspect_fleet();
+    local_instances_with(Inventory::Display)
+}
+
+fn local_instances_with(mode: Inventory) -> Result<Vec<(u32, String)>, FleetListError> {
+    let (dir, targets) = inspect_fleet_with(mode);
     match dir {
         DirOutcome::Found { .. } | DirOutcome::Empty(_) | DirOutcome::Scoped { .. } => {
             Ok(targets.into_iter().map(Target::listed).collect())
@@ -2542,6 +2664,36 @@ pub fn local_instances() -> Result<Vec<(u32, String)>, FleetListError> {
             Err(FleetListError { reason, code })
         }
     }
+}
+
+/// The local instance inventory for callers whose idle-removal census must not skip an
+/// unreadable directory entry or malformed graph record. This remains a filesystem snapshot;
+/// callers must authenticate every resulting instance and refresh it at removal admission.
+/// # Errors
+/// The inventory, an entry, or a bounded regular graph record could not be read completely.
+pub fn local_instances_complete() -> Result<Vec<(u32, String)>, FleetListError> {
+    local_instances_with(Inventory::Complete)
+}
+
+/// Whether `pid` is an aterm instance proven the writer of a graph entry naming it in `dir`'s
+/// `graph` folder (W-writer, `docs/DESIGN-leftover-processes-2026-10-16.md` §4.1): born no later
+/// than the entry was written, its birth read the same before and after, its image aterm's
+/// ([`graph_hygiene::is_entry_writer`], as `ls`'s foreign note judges one). Reads the entries,
+/// the process's birth, parent and image; connects to no socket.
+#[must_use]
+pub fn graph_writer(dir: &Path, pid: u32) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir.join("graph")) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        graph_hygiene::read_entry(&e.path()).is_ok_and(|(body, written)| {
+            control_socket::graph_entry_pid(&body) == Some(pid)
+                && matches!(
+                    ForeignFacts::read(pid, written),
+                    ForeignFacts::Writer { .. }
+                )
+        })
+    })
 }
 
 /// Whether `aterm ctl --pid <pid>` reaches the instance on `sock`.
@@ -2616,8 +2768,8 @@ fn window_rows_from_sessions(pid: u32, sessions: &[String]) -> Vec<String> {
         let token = |key: &str| tail.iter().find_map(|f| f.strip_prefix(key));
         match token("window=") {
             Some("none") => detached += 1,
-            Some(id) => match id.parse::<u64>() {
-                Ok(id) => {
+            Some(id) => match parse_uint::<u64>(id) {
+                Some(id) => {
                     let fold = windows.entry(id).or_insert(Fold {
                         focused: false,
                         sessions: 0,
@@ -2629,7 +2781,7 @@ fn window_rows_from_sessions(pid: u32, sessions: &[String]) -> Vec<String> {
                         fold.active.push((*sid).to_string());
                     }
                 }
-                Err(_) => unknown += 1,
+                None => unknown += 1,
             },
             None => unknown += 1,
         }
@@ -2945,15 +3097,15 @@ fn dominant_hint(probes: &[(u32, String, Probe)], scoped: Option<usize>) -> Opti
         }
         Cause::Foreign => {
             let drive = "only whoever started a `foreign` instance can drive it";
-            let foreign = probes.iter().filter_map(|(pid, _, p)| match p {
-                Probe::Foreign { facts, .. } => Some((*pid, facts)),
+            let foreign = probes.iter().filter_map(|(_, _, p)| match p {
+                Probe::Foreign { facts, .. } => Some(facts),
                 _ => None,
             });
-            if foreign.clone().all(|(_, facts)| facts.writer_gone()) {
+            if foreign.clone().all(ForeignFacts::writer_gone) {
                 return None;
             }
-            match orphan_kill(foreign) {
-                Some(kill) => format!("{drive}; {kill}"),
+            match orphan_pointer(foreign) {
+                Some(pointer) => format!("{drive}; {pointer}"),
                 None => drive.to_string(),
             }
         }
@@ -3101,7 +3253,43 @@ pub fn read_control_token_file(path: &Path) -> io::Result<String> {
             "token file contains an embedded line terminator",
         ));
     }
+    if token.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "token file contains whitespace or control characters",
+        ));
+    }
     Ok(token.to_string())
+}
+
+/// Read a bounded regular UTF-8 file without following a final symlink or blocking on a FIFO,
+/// returning its contents and last-modified timestamp from the open descriptor.
+pub(crate) fn read_bounded_regular_utf8(
+    path: &Path,
+    max_bytes: u64,
+) -> io::Result<(String, Option<std::time::SystemTime>)> {
+    let file = open_regular_token_file(path)?;
+    let meta = file.metadata()?;
+    if meta.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "regular file exceeds its size bound",
+        ));
+    }
+    let written = meta.modified().ok();
+    let cap = usize::try_from(max_bytes.min(64 * 1024)).unwrap_or(64 * 1024);
+    let mut bytes = Vec::with_capacity(cap);
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "regular file exceeds its size bound",
+        ));
+    }
+    let text = String::from_utf8(bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file is not UTF-8"))?;
+    Ok((text, written))
 }
 
 fn read_token_at(path: &str) -> Result<String, (PathBuf, io::Error)> {
@@ -3549,6 +3737,12 @@ fn utf8_args(argv: Vec<std::ffi::OsString>) -> io::Result<Vec<String>> {
 }
 
 fn parse_pid(v: &str) -> io::Result<u32> {
+    if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--pid requires a numeric PID",
+        ));
+    }
     match v.parse::<u32>() {
         Ok(0) => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -3645,6 +3839,12 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
         }
     }
 
+    // A read's session named after its verb (`text @s-…`, `status s-…`, `read` for `text`)
+    // moves in front of it first, so every reader below, `--help` and `--host` included, sees
+    // the protocol's one form.
+    if let Some(rewritten) = verb_first::rewrite(&request_parts) {
+        request_parts = rewritten;
+    }
     let mut help_asked = HelpAsked::ByVerb;
     if let Some(rewritten) = help_request_rewrite(&request_parts) {
         help_asked = HelpAsked::ByFlag;
@@ -3656,15 +3856,6 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
             );
         }
         request_parts = rewritten;
-    }
-    if let [verb, target] = request_parts.as_slice()
-        && verb == "status"
-        && (target.starts_with('@') || target.starts_with("s-"))
-    {
-        request_parts = vec![
-            format!("@{}", target.trim_start_matches('@')),
-            "status".to_string(),
-        ];
     }
 
     if let Some(host) = host.as_deref() {
@@ -3777,6 +3968,8 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
         );
     }
 
+    validate_request_parts(&request_parts)?;
+
     let (selector, rest) = split_selector(&request_parts);
     let verb_tok = rest.first().map(String::as_str);
     let verb_args = rest.get(1..).unwrap_or(&[]);
@@ -3816,8 +4009,6 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
         let head = format!("{head} len={}", payload.len());
         return targets.run(|t| worker_exchange(&t.path, t.origin, &head, &payload, deadline));
     }
-
-    validate_request_parts(&request_parts)?;
 
     {
         let (selector, rest) = split_selector(&request_parts);
@@ -3972,6 +4163,12 @@ fn self_selector_error() -> io::Error {
 }
 
 fn parse_timeout(v: &str) -> io::Result<Option<std::time::Duration>> {
+    if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--timeout requires a non-negative integer number of SECONDS (0 = no deadline)",
+        ));
+    }
     let secs: u64 = v.parse().map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -4141,30 +4338,36 @@ fn request_line(parts: &[String]) -> io::Result<String> {
 fn spawn_wire_line(parts: &[String]) -> io::Result<String> {
     let parts = parts
         .iter()
-        .map(|part| spawn_wire_cwd(part))
+        .map(|part| spawn_wire_value(part))
         .collect::<io::Result<Vec<_>>>()?;
     Ok(parts.join(" "))
 }
 
-fn spawn_wire_cwd(part: &str) -> io::Result<std::borrow::Cow<'_, str>> {
+/// Quotes a spawn `key=value` whose value holds a space (`cwd=/My Project`, `theme=Rose Pine`),
+/// since the shell stripped the quotes a person typed and the server splits on spaces outside
+/// them.
+fn spawn_wire_value(part: &str) -> io::Result<std::borrow::Cow<'_, str>> {
     use std::borrow::Cow;
-    let Some(dir) = part.strip_prefix("cwd=") else {
+    let Some((key, value)) = part
+        .split_once('=')
+        .filter(|(key, _)| !key.contains(char::is_whitespace))
+    else {
         return Ok(Cow::Borrowed(part));
     };
-    let wrapped = dir
+    let wrapped = value
         .strip_prefix('"')
-        .and_then(|d| d.strip_suffix('"'))
+        .and_then(|v| v.strip_suffix('"'))
         .is_some_and(|inner| !inner.contains('"'));
-    if !dir.contains(char::is_whitespace) || wrapped {
+    if !value.contains(char::is_whitespace) || wrapped {
         return Ok(Cow::Borrowed(part));
     }
-    if dir.contains('"') {
+    if value.contains('"') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("spawn: cwd={dir} holds a space and a quote, which no request line can carry"),
+            format!("spawn: {part} holds a space and a quote, which no request line can carry"),
         ));
     }
-    Ok(Cow::Owned(format!("cwd=\"{dir}\"")))
+    Ok(Cow::Owned(format!("{key}=\"{value}\"")))
 }
 
 fn worker_cwd_arg(dir: &Path) -> Result<String, &'static str> {
@@ -4515,7 +4718,7 @@ fn help_request_rewrite(parts: &[String]) -> Option<Vec<String>> {
 }
 
 fn stream_count(tail: &str) -> Option<usize> {
-    let count: usize = tail.split_whitespace().next()?.parse().ok()?;
+    let count: usize = parse_uint(tail.split_whitespace().next()?)?;
     (count <= MAX_STREAM_LINES).then_some(count)
 }
 
@@ -4527,7 +4730,7 @@ pub fn search_incomplete_note(tail: &str) -> Option<String> {
     const DEPTH: &str = SEARCH_DEPTH_NOTE;
     const LIMIT: &str = "results stop at 100000 matches";
     let mut words = tail.split_whitespace();
-    let count = words.next().and_then(|n| n.parse::<usize>().ok());
+    let count = words.next().and_then(parse_uint::<usize>);
     if words.next() != Some("incomplete") {
         return None;
     }
@@ -4579,7 +4782,7 @@ fn bytes_payload(verb: &str, request: &str) -> bool {
 }
 
 fn byte_count(tail: &str) -> Option<usize> {
-    let n: usize = tail.split_whitespace().next()?.parse().ok()?;
+    let n: usize = parse_uint(tail.split_whitespace().next()?)?;
     (n <= MAX_BODY_BYTES).then_some(n)
 }
 
@@ -5577,6 +5780,7 @@ fn exchange_on(
             || verb == "log"
             || verb == "brief"
             || verb == "sys"
+            || verb == "end"
             || (verb == "history" && tail.split_whitespace().nth(1).is_some())
         {
             stderr_line(status_line)?;

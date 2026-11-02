@@ -90,6 +90,9 @@ pub struct Window {
     pub opening_failed: Option<String>,
     /// Its row one level into its manager's submenu ([`worker_of`]): `-` where none names it.
     pub worker: Vec<(i64, String)>,
+    /// Its Done for you row's tip ([`done_tip_of`], slice 9c: what aterm checked at its
+    /// landing): `-` where no such row names it or the row has none.
+    pub done_tip: Vec<(i64, String)>,
     /// A same-reply chain's looks in front past its hold ([`held::look_step`]): each its
     /// `autopilot` line, title and all (`-` where its label was not in the strip).
     pub held: Vec<(i64, String)>,
@@ -114,6 +117,7 @@ impl Window {
             },
         );
         let worker = worker_of(&g.sub, &label);
+        let done_tip = done_tip_of(&g.menu, &label);
         let tab = g.strip.iter().find(|s| s.label == label);
         let strip = tab.map_or_else(|| "-".to_string(), StripTab::words);
         let hover = tab
@@ -137,6 +141,7 @@ impl Window {
             ("page", &mut self.page, page),
             ("title", &mut self.title, title),
             ("worker", &mut self.worker, worker),
+            ("done_tip", &mut self.done_tip, done_tip),
         ] {
             if (what == "hover" && !hover_read) || (what == "page" && !g.page_read) {
                 continue;
@@ -337,6 +342,8 @@ pub struct MenuRow {
     pub label: String,
     pub at: String,
     pub indent: u8,
+    /// Its hover (`tip="…"`), where it has one.
+    pub tip: Option<String>,
 }
 
 /// Extracts and unescapes a `key="…"` value from `line`.
@@ -371,9 +378,10 @@ fn unquote(s: &str) -> (String, &str) {
                     if let Some(body) = body
                         && let Some(end) = body.find('}')
                     {
-                        if let Some(ch) = u32::from_str_radix(&body[..end], 16)
-                            .ok()
-                            .and_then(char::from_u32)
+                        let hex = &body[..end];
+                        if hex.bytes().all(|b| b.is_ascii_hexdigit())
+                            && let Some(ch) =
+                                u32::from_str_radix(hex, 16).ok().and_then(char::from_u32)
                         {
                             out.push(ch);
                         }
@@ -529,9 +537,20 @@ pub fn menu_rows(chrome: &str) -> Vec<MenuRow> {
             indent: word(tail, "indent")
                 .and_then(|n| n.parse().ok())
                 .unwrap_or(0),
+            tip: quoted(tail, "tip"),
         });
     }
     out
+}
+
+/// The tip of the Done for you row naming the tab labelled `tab` (slice 9c), `-` where no such
+/// row or no tip.
+#[must_use]
+pub fn done_tip_of(menu: &[MenuRow], tab: &str) -> String {
+    menu.iter()
+        .find(|r| r.section == "done" && r.indent == 0 && row_names(&r.label, tab))
+        .and_then(|r| r.tip.clone())
+        .unwrap_or_else(|| "-".into())
 }
 
 /// Whether menu row `row` names the tab labelled `tab`.
@@ -913,7 +932,7 @@ fn settled(list: &[(i64, String)], until: i64) -> Option<&(i64, String)> {
 }
 
 /// The states of a [`Window::strip`] entry.
-fn states(strip: &str) -> Vec<&str> {
+pub(crate) fn states(strip: &str) -> Vec<&str> {
     strip
         .split_whitespace()
         .find_map(|w| w.strip_prefix("states="))
@@ -923,7 +942,7 @@ fn states(strip: &str) -> Vec<&str> {
 }
 
 /// The menu rows of a [`Window::menu`] entry in `section`.
-fn rows_in<'a>(menu: &'a str, section: &str) -> Vec<&'a str> {
+pub(crate) fn rows_in<'a>(menu: &'a str, section: &str) -> Vec<&'a str> {
     menu.lines()
         .filter_map(|l| l.strip_prefix(section)?.strip_prefix('|'))
         .collect()
@@ -1013,8 +1032,10 @@ pub fn holds_at_end(c: Chain) -> bool {
 /// The chains whose chip's title is read and judged ([`title_words`]): the measured pass's and
 /// the coverage chains (`--mode cover`), each brought in front once before its first prompt
 /// ([`opening_sweep`]); the worker once it is spawned.
-pub const TITLED: [Chain; 25] = [
+pub const TITLED: [Chain; 27] = [
     Chain::LandA,
+    Chain::LandN,
+    Chain::LandO,
     Chain::LandB,
     Chain::LandC,
     Chain::LandD,
@@ -1076,22 +1097,24 @@ pub const WANTS: &[Want] = &[
         judge: chip_faces,
     },
     Want {
-        under: Under::FirstOf(&[Chain::SwitchHeld]),
-        name: "switched to Land, its state line still leads with the stop",
-        judge: super::switch::held_line,
+        under: Under::FirstOf(&[Chain::SwitchOverHeld]),
+        name: "switched to Land over its hold, its state line says Land asked once more, then the stop again",
+        judge: super::switch::asked_line,
     },
     Want {
         under: Under::FirstOf(&TITLED),
         name: "the chip's title says its mode's sentence from MODE_WORDS (a read hold's words in its place under Land)",
         judge: title_words,
     },
+    // Not under the chains that end past the work floor: L16's and L17's, and land-listed's,
+    // whose landing follows its work on the quoted list (a turn past the floor, with a tool).
     Want {
-        under: Under::First(&[Chain::LandA, Chain::LandJ, Chain::LandK]),
+        under: Under::First(&[Chain::LandA, Chain::LandJ, Chain::LandK, Chain::LandListed]),
         name: "never an end (status end=-)",
         judge: never_ended,
     },
     Want {
-        under: Under::First(&[Chain::LandA, Chain::LandJ, Chain::LandK]),
+        under: Under::First(&[Chain::LandA, Chain::LandJ, Chain::LandK, Chain::LandListed]),
         name: "never a Done for you row or a •, never a need row where none is scripted",
         judge: never_a_row,
     },
@@ -1107,8 +1130,13 @@ pub const WANTS: &[Want] = &[
     },
     Want {
         under: Under::Scenario(Scenario::L2),
-        name: "land_held=open; the hover and state line name the words its nudge named, unquoted",
+        name: "land_held=open; the hover and state line quote the list its nudge quoted, the chip's description says it",
         judge: |s, c| hold::legs(s, c, hold::L2),
+    },
+    Want {
+        under: Under::Scenario(Scenario::LR),
+        name: "the hover and state line quote the list, then its rewording, never the old words again",
+        judge: hold::reworded,
     },
     Want {
         under: Under::Scenario(Scenario::L3),
@@ -1117,22 +1145,22 @@ pub const WANTS: &[Want] = &[
     },
     Want {
         under: Under::Scenario(Scenario::L3),
-        name: "land_held=needs; the hover and state line say not landed yet, needs you",
+        name: "land_held=needs; the hover and state line say waits only on you, the need once",
         judge: |s, c| hold::legs(s, c, hold::L3),
     },
     Want {
         under: Under::Scenario(Scenario::L4),
-        name: "land_held=repo; the hover and state line say 1 untracked file, no other count",
+        name: "land_held=repo; the hover and state line say 1 untracked file: wip-notes.txt, no other count",
         judge: |s, c| hold::legs(s, c, hold::L4),
     },
     Want {
         under: Under::Scenario(Scenario::L6),
-        name: "land_held=needs (the tall reply read whole); the hover and state line say the need",
+        name: "land_held=needs (the tall reply read whole); the hover and state line say waits only on you, the need once",
         judge: |s, c| hold::legs(s, c, hold::L6),
     },
     Want {
         under: Under::Scenario(Scenario::L8),
-        name: "land_held=repo; the hover and state line say 1 changed file, no other count",
+        name: "land_held=repo; the hover and state line say 1 changed file: README.md, no other count",
         judge: |s, c| hold::legs(s, c, hold::L8),
     },
     Want {
@@ -1194,6 +1222,11 @@ pub const WANTS: &[Want] = &[
         under: Under::Scenario(Scenario::L7),
         name: "the page's Landed row: Landed: N today · M in 7 days, N every landing, M at least N",
         judge: l7_did,
+    },
+    Want {
+        under: Under::Scenario(Scenario::L7),
+        name: "the page's Forced continues row: N today · M in 7 days, N every done check, its line under it",
+        judge: l7_forced,
     },
     Want {
         under: Under::Scenario(Scenario::P5),
@@ -1314,6 +1347,46 @@ pub const WANTS: &[Want] = &[
         under: Under::Scenario(Scenario::O2),
         name: super::outage::STATE_LINE_WANT,
         judge: super::outage::state_line,
+    },
+    Want {
+        under: Under::Scenario(Scenario::Sys(super::sysmsg::Form::Overload)),
+        name: super::sysmsg::STATE_LINE_WANT,
+        judge: super::sysmsg::state_line,
+    },
+    Want {
+        under: Under::Scenario(Scenario::Sys(super::sysmsg::Form::Outage)),
+        name: super::sysmsg::STATE_LINE_WANT,
+        judge: super::sysmsg::state_line,
+    },
+    Want {
+        under: Under::Scenario(Scenario::Sys(super::sysmsg::Form::Rate)),
+        name: super::sysmsg::STATE_LINE_WANT,
+        judge: super::sysmsg::state_line,
+    },
+    Want {
+        under: Under::Scenario(Scenario::Sys(super::sysmsg::Form::Drop)),
+        name: super::sysmsg::STATE_LINE_WANT,
+        judge: super::sysmsg::state_line,
+    },
+    Want {
+        under: Under::Scenario(Scenario::SysLand(super::sysmsg::Form::Overload)),
+        name: super::sysmsg::STATE_LINE_WANT,
+        judge: super::sysmsg::state_line,
+    },
+    Want {
+        under: Under::Scenario(Scenario::SysLand(super::sysmsg::Form::Outage)),
+        name: super::sysmsg::STATE_LINE_WANT,
+        judge: super::sysmsg::state_line,
+    },
+    Want {
+        under: Under::Scenario(Scenario::SysLand(super::sysmsg::Form::Rate)),
+        name: super::sysmsg::STATE_LINE_WANT,
+        judge: super::sysmsg::state_line,
+    },
+    Want {
+        under: Under::Scenario(Scenario::SysLand(super::sysmsg::Form::Drop)),
+        name: super::sysmsg::STATE_LINE_WANT,
+        judge: super::sysmsg::state_line,
     },
 ];
 
@@ -1665,7 +1738,11 @@ fn l3_row(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     }
 }
 
-/// L5: `face=landed` after the landing, and the page's state for it `landed <time>`.
+/// L5: `face=landed` after the landing, and the page's state for it `landed <time>`, after the
+/// need that stands beside the landing, since a `LANDED` retracts no need (the post-landing
+/// review, 2026-11-01): `needs you: …; waits on you · landed <time> · …`, for nothing
+/// carries on after a landing (the second review, 2026-11-01), the page's words read off the
+/// entry's own tail ([`aterm_agent::harness::hold_said::NeedTail`]).
 fn l5_landed(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     let Some((d, _)) = seen.first_after("DONE ", cx.t0) else {
         return Verdict::Unobserved("no landing (L5's records)".into());
@@ -1674,9 +1751,10 @@ fn l5_landed(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     let face = chips_in(seen, *d, i64::MAX)
         .into_iter()
         .find(|(_, c, _)| c.face == "landed");
-    let page = standing(&w.page, *d, i64::MAX)
-        .into_iter()
-        .find(|(_, p)| page_field(p, "state").is_some_and(|s| s.starts_with("landed ")));
+    let page = standing(&w.page, *d, i64::MAX).into_iter().find(|(_, p)| {
+        page_field(p, "state")
+            .is_some_and(|s| s.split(" \u{b7} ").any(|part| part.starts_with("landed ")))
+    });
     let mut bad = Vec::new();
     if face.is_none() {
         bad.push(format!(
@@ -1685,6 +1763,27 @@ fn l5_landed(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
                 .iter()
                 .map(|(_, c, _)| c.face.clone())
                 .collect::<Vec<_>>()
+        ));
+    }
+    let waits = format!(
+        "; {}",
+        aterm_agent::harness::hold_said::NeedTail::WaitsOnYou.words()
+    );
+    let need_beside = standing(&w.page, *d, i64::MAX)
+        .into_iter()
+        .filter_map(|(t, p)| {
+            let state = page_field(p, "state")?;
+            let mut parts = state.split(" \u{b7} ");
+            let need = parts.clone().find(|part| part.starts_with("needs you:"))?;
+            parts
+                .any(|part| part.starts_with("landed "))
+                .then_some((*t, need))
+        })
+        .next_back();
+    if let Some((t, need)) = need_beside.filter(|(_, need)| !need.ends_with(&waits)) {
+        bad.push(format!(
+            "+{} the need beside the landing reads \"{need}\", not \"…{waits}\"",
+            at(cx.t0, t)
         ));
     }
     let mut unread = Vec::new();
@@ -1841,14 +1940,15 @@ fn l7_here(seen: &Seen, _cx: &Ctx<'_>) -> Verdict {
 pub enum TitleSays {
     /// `autopilot: <mode> — <its sentence>`, whole.
     Sentence,
-    /// Under Land, a READ hold's words in the sentence's place (`not landed yet: …`, §12.4.12).
+    /// Under Land, a READ hold's words in the sentence's place (`not landed yet: …`, §12.4.12;
+    /// `waits only on you: …` for a hold its need alone holds, slice 4b).
     Held,
     /// Under Land or Cruise, the stop in the sentence's place (§14.3: `stopped typing: …`, 3a's
     /// [`stop_words`](aterm_agent::harness::acts::stop_words) for the arm it names).
     Stopped(aterm_agent::harness::acts::HeldBy),
     /// A face past Land's own (`land, landed`, `land, quiet`): no mode sentence to say. It holds
-    /// the `face=` that says it (`landed`, `theirs`). A landed title says
-    /// [`LANDED_WORDS`](aterm_agent::supervise::mode_words::LANDED_WORDS) whole (§14.9, 9a).
+    /// the `face=` that says it (`landed`, `theirs`). A landed title says what aterm checked in
+    /// brief and [`LANDED_REST`](aterm_agent::supervise::mode_words::LANDED_REST) (§14.9, 9c).
     Past(&'static str),
     /// Anything else, and why.
     Wrong(String),
@@ -1856,25 +1956,39 @@ pub enum TitleSays {
 
 /// What title `t` says of chain mode `mode` (`cruise`, `land`, `off`): its phrase, ` — `, and the
 /// mode's sentence from [`MODE_WORDS`](aterm_agent::supervise::mode_words::MODE_WORDS) whole, then
-/// the title's end or its next part (` · `). A landed title says
-/// [`LANDED_WORDS`](aterm_agent::supervise::mode_words::LANDED_WORDS) so, never "remote main"
-/// (§14.9, 9a).
+/// the title's end or its next part (` · `). A landed title says what aterm checked, in brief,
+/// led by one of `mode_words`' leads ([`CHECKED_LEAD`], [`NO_REPO_CHECKED`], [`GONE_LEAD`], or
+/// [`NO_RECORD`] where it holds no receipt), then
+/// [`LANDED_REST`](aterm_agent::supervise::mode_words::LANDED_REST), never "remote main" (§14.9,
+/// 9c); which receipt's words it must say is `forever_checked::title_checked`'s want.
+///
+/// [`CHECKED_LEAD`]: aterm_agent::supervise::mode_words::CHECKED_LEAD
+/// [`NO_REPO_CHECKED`]: aterm_agent::supervise::mode_words::NO_REPO_CHECKED
+/// [`GONE_LEAD`]: aterm_agent::supervise::mode_words::GONE_LEAD
+/// [`NO_RECORD`]: aterm_agent::supervise::mode_words::NO_RECORD
 #[must_use]
 pub fn title_says(t: &str, mode: &str) -> TitleSays {
     use aterm_agent::supervise::Autopilot;
-    use aterm_agent::supervise::mode_words::{LANDED_WORDS, mode_words};
+    use aterm_agent::supervise::mode_words::{
+        CHECKED_LEAD, GONE_LEAD, LANDED_REST, NO_RECORD, NO_REPO_CHECKED, mode_words,
+    };
     let Some(m) = Autopilot::ALL.into_iter().find(|m| m.word() == mode) else {
         return TitleSays::Wrong(format!("no mode {mode:?}"));
     };
     let sentence = mode_words(m).chip;
     if m == Autopilot::Land && t.starts_with("autopilot: land, landed") {
-        let landed = t
-            .split_once(" \u{2014} ")
-            .and_then(|(_, rest)| rest.strip_prefix(LANDED_WORDS))
-            .is_some_and(|after| after.is_empty() || after.starts_with(" \u{b7} "));
+        let landed = t.split_once(" \u{2014} ").is_some_and(|(_, rest)| {
+            rest.split_once(&format!("; {LANDED_REST}"))
+                .is_some_and(|(checked, after)| {
+                    [CHECKED_LEAD, NO_REPO_CHECKED, GONE_LEAD, NO_RECORD]
+                        .iter()
+                        .any(|lead| checked.starts_with(lead))
+                        && (after.is_empty() || after.starts_with(" \u{b7} "))
+                })
+        });
         if !landed || t.contains("remote main") {
             return TitleSays::Wrong(format!(
-                "a landed title whose sentence is not {LANDED_WORDS:?}"
+                "a landed title that does not say what aterm checked, then {LANDED_REST:?}"
             ));
         }
         return TitleSays::Past("landed");
@@ -1892,17 +2006,26 @@ pub fn title_says(t: &str, mode: &str) -> TitleSays {
     {
         return TitleSays::Sentence;
     }
-    if m == Autopilot::Land && rest.starts_with("not landed yet: ") && !rest.contains(sentence) {
+    let held = [
+        aterm_agent::harness::acts::NOT_LANDED_YET,
+        aterm_agent::harness::hold_said::WAITS_ON_YOU,
+    ]
+    .iter()
+    .any(|head| rest.starts_with(head));
+    if m == Autopilot::Land && held && !rest.contains(sentence) {
         return TitleSays::Held;
     }
     if matches!(m, Autopilot::Land | Autopilot::Cruise)
         && let Some(arm) = aterm_agent::harness::acts::HeldBy::ALL
             .into_iter()
             .find(|arm| {
-                rest.starts_with(&aterm_agent::harness::acts::stop_words(
-                    *arm,
-                    aterm_agent::harness::acts::StopForm::Title,
-                ))
+                [true, false].into_iter().any(|switch| {
+                    rest.starts_with(&aterm_agent::harness::acts::stop_words(
+                        *arm,
+                        aterm_agent::harness::acts::StopForm::Title,
+                        switch,
+                    ))
+                })
             })
         && !rest.contains(sentence)
     {
@@ -2070,6 +2193,48 @@ fn none_names_landed(label: &str) -> bool {
         .is_some_and(|names| names.split(" \u{b7} ").any(|n| n == DID_NONE_LANDED))
 }
 
+/// The page's keys of WHAT THE HARNESS DID's nodes, and of its rows among them.
+const DID: &str = "harness/did/";
+const DID_ROWS: &str = "harness/did/row/";
+
+/// What WHAT THE HARNESS DID's Forced continues row's label starts with (6c): its name, read from
+/// its one source ([`FORCED_CONTINUES`](aterm_agent::harness::stats::FORCED_CONTINUES)), then `: `.
+fn forced_head() -> String {
+    format!("{}: ", aterm_agent::harness::stats::FORCED_CONTINUES)
+}
+
+/// WHAT THE HARNESS DID's Forced continues row (6c) in Harness page `rows`, found by its name from
+/// the one source, with the label of the page's node right after it where that node is on the
+/// same screen and is no row of the card: the line the page draws under the row, whatever it says.
+#[must_use]
+pub fn did_forced_of(rows: &[(String, String)]) -> Option<(String, Option<String>)> {
+    let head = forced_head();
+    let at = rows
+        .iter()
+        .position(|(k, l)| k.starts_with(DID_ROWS) && l.starts_with(&head))?;
+    let line = rows
+        .get(at + 1)
+        .filter(|(k, _)| k.starts_with(DID) && !k.starts_with(DID_ROWS))
+        .map(|(_, l)| l.clone());
+    Some((rows[at].1.clone(), line))
+}
+
+/// How many of `journal`'s acts are the done checks WHAT THE HARNESS DID's Forced continues row
+/// counts ([`FORCED_CONTINUE_RULES`](aterm_agent::harness::stats::FORCED_CONTINUE_RULES)), each
+/// at a time `today` keeps.
+#[must_use]
+pub fn forced_continues_of(journal: &[(i64, String)], today: impl Fn(i64) -> bool) -> usize {
+    journal
+        .iter()
+        .filter(|(t, l)| {
+            today(*t)
+                && super::act_rule(l).is_some_and(|r| {
+                    aterm_agent::harness::stats::FORCED_CONTINUE_RULES.contains(&r)
+                })
+        })
+        .count()
+}
+
 /// The page's HARNESS UPDATES card, which stands below WHAT THE HARNESS DID and its settings.
 const UPDATES: &str = "harness/updates";
 
@@ -2161,8 +2326,11 @@ pub fn list_middle(controls: &str) -> Option<(i64, i64)> {
 /// chains' window, in front, and turns the wheel down its list from the top, as a person scrolls,
 /// until the row is on the screen ([`did_step`]). It then closes that tab and brings back the tab
 /// that was in front. The caller has turned the person's look off, so no tab it brings in front is
-/// looked at. Returns the row (if read) and the step's words.
-fn read_did(door: &Door<'_>, desk: &Desk) -> Result<(Option<String>, String), Fail> {
+/// looked at. On the way it reads the Forced continues row and the node under it
+/// ([`did_forced_of`]), which stand above the Landed row (6c), keeping a read with its line over
+/// one whose line was not on that screen. Returns the Landed row (if read), the Forced continues
+/// read (if its row passed a screen) and the step's words.
+fn read_did(door: &Door<'_>, desk: &Desk) -> Result<DidRead, Fail> {
     let back = strip_tabs(&door.out(&["chrome"]))
         .into_iter()
         .find(|t| t.selected)
@@ -2177,6 +2345,7 @@ fn read_did(door: &Door<'_>, desk: &Desk) -> Result<(Option<String>, String), Fa
     let Some(view) = view.filter(|_| shown) else {
         return Ok((
             None,
+            None,
             format!(
                 "Settings opened in the chains' window ({}), but no Settings tab in its front \
                  within {} s",
@@ -2187,8 +2356,14 @@ fn read_did(door: &Door<'_>, desk: &Desk) -> Result<(Option<String>, String), Fa
     };
     let middle = list_middle(&door.out(&["inspect", "app/v1", "view", &view, "controls"]));
     let (mut found, mut wheels, mut said) = (None, 0, "row further down");
+    let mut forced: Option<(String, Option<String>)> = None;
     for _ in 0..=DID_WHEELS {
         let rows = page_rows(&door.out(&["inspect", "app/v1", "view", &view, "text"]));
+        if forced.as_ref().is_none_or(|(_, line)| line.is_none())
+            && let Some(read) = did_forced_of(&rows)
+        {
+            forced = Some(read);
+        }
         match did_step(&rows) {
             DidStep::Read(row) => {
                 found = Some(row);
@@ -2229,13 +2404,24 @@ fn read_did(door: &Door<'_>, desk: &Desk) -> Result<(Option<String>, String), Fa
     );
     let words = format!(
         "Settings opened in the chains' window ({}, view {view}), wheeled {wheels} step(s) down: \
-         {}; closed ({}), {again}",
+         {}; {}; closed ({}), {again}",
         one_line(&opened, 40),
         found.as_deref().unwrap_or(said),
+        forced.as_ref().map_or_else(
+            || format!(
+                "no {} row passed",
+                aterm_agent::harness::stats::FORCED_CONTINUES
+            ),
+            |(row, line)| format!("{row}, under it {}", line.as_deref().unwrap_or("-"))
+        ),
         one_line(&closed, 40),
     );
-    Ok((found, words))
+    Ok((found, forced, words))
 }
+
+/// [`read_did`]'s read: the Landed row (or the None row in its place), the Forced continues row
+/// with the node under it, and the step's words.
+type DidRead = (Option<String>, Option<(String, Option<String>)>, String);
 
 /// L7 on the page's WHAT THE HARNESS DID (4c), at rest: `Landed: N today · M in 7 days`, N the
 /// run's landings this local day (as the today line counts them), M at least N; a week with none
@@ -2273,6 +2459,62 @@ fn l7_did(seen: &Seen, _cx: &Ctx<'_>) -> Verdict {
         Some((t, w)) if w < t => vec![format!("{w} in 7 days, fewer than {t} today")],
         Some(_) => Vec::new(),
     };
+    told(said, &bad, &[])
+}
+
+/// L7 on the page's WHAT THE HARNESS DID (6c), at rest: the Forced continues row, found by its
+/// name from the one source, reads `N today · M in 7 days`, N the run's done checks this local day
+/// (its journals' acts of `FORCED_CONTINUE_RULES`), M at least N, and the page's node right under
+/// it is its line, word for word from the one source
+/// ([`FORCED_CONTINUES_LINE`](aterm_agent::harness::stats::FORCED_CONTINUES_LINE)). A run with no
+/// done check today passes on an earlier day's row (`0 today`), and with no row read is a named
+/// UNOBSERVED (§14.0 limit 7: no want passes on `-`).
+fn l7_forced(seen: &Seen, _cx: &Ctx<'_>) -> Verdict {
+    use aterm_agent::harness::stats::{FORCED_CONTINUES, FORCED_CONTINUES_LINE};
+    let Some(rest) = seen.window.rest.as_deref() else {
+        return Verdict::Unobserved(UNREST.into());
+    };
+    let Some(forced) = word(rest, "forced").and_then(|v| v.parse::<usize>().ok()) else {
+        return Verdict::Unobserved(format!("the rest read lacks its counts: {rest}"));
+    };
+    if quoted(rest, "did").is_none_or(|d| d == "-") {
+        return Verdict::Unobserved(
+            "WHAT THE HARNESS DID's Landed row was never on the page's screen".into(),
+        );
+    }
+    let Some(row) = quoted(rest, "forced_row").filter(|r| r != "-") else {
+        if forced == 0 {
+            return Verdict::Unobserved(format!(
+                "no done check in the run today, and no {FORCED_CONTINUES} row to read"
+            ));
+        }
+        let said = format!("no {FORCED_CONTINUES} row; {forced} done check(s) in the run today");
+        let bad = [format!(
+            "{forced} done check(s) today, and no row named {FORCED_CONTINUES}"
+        )];
+        return told(said, &bad, &[]);
+    };
+    let line = quoted(rest, "forced_line").filter(|l| l != "-");
+    let counts = row.strip_prefix(&forced_head()).and_then(|r| {
+        let (t, w) = r.split_once(" \u{b7} ")?;
+        let t = t.strip_suffix(" today")?.parse::<usize>().ok()?;
+        let w = w.strip_suffix(" in 7 days")?.parse::<usize>().ok()?;
+        Some((t, w))
+    });
+    let said = format!(
+        "the row \"{row}\" and under it {}; {forced} done check(s) in the run today",
+        line.as_deref()
+            .map_or_else(|| "nothing".to_string(), |l| format!("\"{l}\""))
+    );
+    let mut bad = match counts {
+        None => vec!["not `N today · M in 7 days`".to_string()],
+        Some((t, _)) if t != forced => vec![format!("{t} today, not {forced}")],
+        Some((t, w)) if w < t => vec![format!("{w} in 7 days, fewer than {t} today")],
+        Some(_) => Vec::new(),
+    };
+    if line.as_deref() != Some(FORCED_CONTINUES_LINE) {
+        bad.push(format!("its line is not \"{FORCED_CONTINUES_LINE}\""));
+    }
     told(said, &bad, &[])
 }
 
@@ -2822,20 +3064,23 @@ fn wakes_of(v: &str, variant: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// Judges the end-of-run idle window and resting surfaces across `desk` and `tabs`.
+/// The idle window's counts judged, from its `metrics` (`m`) and `metrics percentiles` (`p`)
+/// between its opening and its close ([`idle_metrics_between`], [`idle_percentiles_between`]):
+/// nothing rendered, no timer wake and no deadline armed or fired but `presence`'s, or, where a
+/// program wrote (`Output` wakes), the status sweep's and the output-wake watch's for those
+/// writes. Each count that breaks the rest, said; none where the window rested. END's judge
+/// ([`judge_end`]) and `codex-alab-proof`'s window pass read the same counts by it.
 #[must_use]
-pub fn judge_end(desk: &Desk, tabs: &[(Chain, &Window)], program: &str) -> Verdict {
-    let Some(idle) = &desk.idle else {
-        return Verdict::Unobserved("END's idle window was never had".into());
-    };
-    if let Some(e) = &idle.metrics_failed {
-        return Verdict::Fail(format!(
-            "END's idle window of {} s: a `metrics` call failed, so none of its counts is judged: {e}",
-            idle.ms / 1000
-        ));
-    }
-    let m = &idle.metrics;
-    let p = &idle.percentiles;
+pub(crate) fn idle_counts(m: &str, p: &str) -> Vec<String> {
+    idle_counts_beside(m, p, &[])
+}
+
+/// [`idle_counts`] where the owners `also` may arm a deadline in the window but never fire one: a
+/// deadline past the window, such as the next turn of Settings ▸ Harness's words while the page
+/// is open (`autopilot_timer`, its day words turning at midnight). A fire of theirs in the window,
+/// or a timer wake, still breaks it.
+#[must_use]
+pub(crate) fn idle_counts_beside(m: &str, p: &str, also: &[&str]) -> Vec<String> {
     let timer = metric(m, "timer_wakes");
     let n_render = metric(p, "n_render");
     let arms = metric(m, "deadline_arms_by_owner");
@@ -2846,11 +3091,12 @@ pub fn judge_end(desk: &Desk, tabs: &[(Chain, &Window)], program: &str) -> Verdi
     let heal_fires = count_of(&fires, WAKE_HEAL);
     let heals = metric(m, "wake_heals");
     let watched = output > 0 && (heal_arms > 0 || heal_fires > 0);
-    let allowed: &[&str] = if output == 0 {
+    let base: &[&str] = if output == 0 {
         &[PRESENCE]
     } else {
         &[PRESENCE, SWEEP, WAKE_HEAL]
     };
+    let allowed: Vec<&str> = base.iter().chain(also).copied().collect();
     let mut bad = Vec::new();
     if watched {
         if heals != "0" {
@@ -2899,6 +3145,35 @@ pub fn judge_end(desk: &Desk, tabs: &[(Chain, &Window)], program: &str) -> Verdi
     if !armed.is_empty() {
         bad.push(format!("armed beside {allowed:?}: {armed:?} ({arms})"));
     }
+    bad
+}
+
+/// Judges the end-of-run idle window and resting surfaces across `desk` and `tabs`.
+#[must_use]
+pub fn judge_end(desk: &Desk, tabs: &[(Chain, &Window)], program: &str) -> Verdict {
+    let Some(idle) = &desk.idle else {
+        return Verdict::Unobserved("END's idle window was never had".into());
+    };
+    if let Some(e) = &idle.metrics_failed {
+        return Verdict::Fail(format!(
+            "END's idle window of {} s: a `metrics` call failed, so none of its counts is judged: {e}",
+            idle.ms / 1000
+        ));
+    }
+    let m = &idle.metrics;
+    let p = &idle.percentiles;
+    let timer = metric(m, "timer_wakes");
+    let n_render = metric(p, "n_render");
+    let arms = metric(m, "deadline_arms_by_owner");
+    let fires = metric(m, "deadline_fires_by_owner");
+    let wakes = metric(m, "wakes_by_variant");
+    let output = wakes_of(&wakes, "Output");
+    let heal_arms = count_of(&arms, WAKE_HEAL);
+    let heal_fires = count_of(&fires, WAKE_HEAL);
+    let heals = metric(m, "wake_heals");
+    let watched = output > 0 && (heal_arms > 0 || heal_fires > 0);
+    let sweep_fires = count_of(&fires, SWEEP);
+    let mut bad = idle_counts(m, p);
     let mut unread = Vec::new();
     if idle.ends.is_empty() {
         unread.push("no end stood unseen in it".to_string());
@@ -3090,7 +3365,7 @@ pub fn glance(door: &Door<'_>, desk: &Desk) -> Result<Glance, String> {
 }
 
 /// The windows' ids in `inspect app/v1 tabs`.
-fn windows_of(tabs: &str) -> (Vec<String>, Option<(String, String)>) {
+pub(crate) fn windows_of(tabs: &str) -> (Vec<String>, Option<(String, String)>) {
     let mut windows = Vec::new();
     let mut page = None;
     let mut current = String::new();
@@ -3127,25 +3402,123 @@ fn new_window(
     made.filter(|_| shown)
 }
 
+/// Session `sid`'s local id, the column before its sid on its `ls` line (`<local> <sid> <parent>
+/// …`, after the client's instance column: `0 3 s-… s-… alive …`), which the window's own keys
+/// carry (`harness/session/<local>/…`). The sid is the line's first `s-` token, so a child's line
+/// naming `sid` as its parent is not its.
+#[must_use]
+pub fn local_of(ls: &str, sid: &str) -> Option<String> {
+    ls.lines().find_map(|l| {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        let at = f.iter().position(|t| t.starts_with("s-"))?;
+        let local = f[..at].last()?;
+        (f[at] == sid && local.bytes().all(|b| b.is_ascii_digit())).then(|| (*local).to_string())
+    })
+}
+
+/// A Settings view in `inspect app/v1 tabs`, the first listed.
+#[must_use]
+pub fn settings_view(tabs: &str) -> Option<String> {
+    tabs.lines().map(str::trim_start).find_map(|t| {
+        (t.starts_with("leaf ")
+            && t.contains(" kind=app")
+            && word(t, "app").as_deref() == Some("settings"))
+        .then(|| word(t, "view"))
+        .flatten()
+    })
+}
+
+/// THE PERSON'S PRESS of Autopilot `w` for session `sid` on Settings ▸ Harness's SESSIONS row
+/// (`act app/v1 view <view> harness/session/<local>/autopilot/<w>`, its local id read off `ls`,
+/// [`local_of`]), on `page` where one stands (the desk's), else on a Settings tab it opens for
+/// the press and closes after it. The window writes the word as the person's
+/// (`autopilot_by=human:settings`), which no `meta set` does (v6 §14.17 item 3).
+///
+/// # Errors
+/// Why it was not pressed: no local id, no Settings view, or the window's refusal.
+pub fn press_word(
+    door: &Door<'_>,
+    page: Option<&str>,
+    sid: &str,
+    w: &str,
+) -> Result<String, String> {
+    let local =
+        local_of(&door.out(&["ls"]), sid).ok_or_else(|| format!("no `ls` line for {sid}"))?;
+    let action = format!("harness/session/{local}/autopilot/{w}");
+    let (view, opened) = match page {
+        Some(view) => (view.to_string(), false),
+        None => {
+            let said = door.out(&["open", "app", "settings", "/harness"]);
+            let mut view = None;
+            let shown = wait_until(STEP_WAIT, || {
+                view = settings_view(&door.out(&["inspect", "app/v1", "tabs"]));
+                view.is_some()
+            });
+            let view = view.filter(|_| shown).ok_or_else(|| {
+                format!(
+                    "no Settings view within {} s of `open app settings /harness` ({})",
+                    STEP_WAIT.as_secs(),
+                    one_line(&said, 80)
+                )
+            })?;
+            (view, true)
+        }
+    };
+    let r = door.ctl(&["act", "app/v1", "view", &view, &action, &action]);
+    if opened {
+        let _ = door.out(&["open", "prefs", "close"]);
+    }
+    match r {
+        Ok(r) if r.code == 0 && r.stdout.trim_start().starts_with("OK") => {
+            Ok(format!("{action}: {}", r.stdout.trim()))
+        }
+        Ok(r) => Err(format!(
+            "{action}: exit {}: {}",
+            r.code,
+            [r.stdout.trim(), r.stderr.trim()].join(" ").trim()
+        )),
+        Err(e) => Err(format!("{action}: {e}")),
+    }
+}
+
 /// Opens the Settings window (on `/harness`) and the chains window before spawning chain tabs.
 ///
 /// # Errors
 ///
 /// Returns an error if a control verb fails or a window does not appear in time.
 pub fn lay_windows(door: &Door<'_>) -> Result<Desk, String> {
+    lay_windows_by(&|args| door.ctl(args).map(|r| (r.code, r.stdout, r.stderr)))
+}
+
+/// What [`lay_windows_by`]'s `ctl` answers: the verb's exit code, stdout and stderr, or why it
+/// could not run.
+pub(crate) type CtlReply = Result<(i32, String, String), String>;
+
+/// [`lay_windows`] through any instance's `aterm ctl` (`ctl`: its exit code, stdout and stderr):
+/// the forever lab's door, or `codex-alab-proof`'s rig. The window it opens last is in front, so
+/// the tabs spawned next go there.
+///
+/// # Errors
+///
+/// Returns an error if a control verb fails or a window does not appear in time.
+pub(crate) fn lay_windows_by(ctl: &dyn Fn(&[&str]) -> CtlReply) -> Result<Desk, String> {
     let step = |args: &[&str]| -> Result<String, String> {
-        let r = door.ctl(args)?;
-        if r.code != 0 || !r.stdout.starts_with("OK") {
+        let (code, stdout, stderr) = ctl(args)?;
+        if code != 0 || !stdout.starts_with("OK") {
             return Err(format!(
                 "`{}`: {}{}",
                 args.join(" "),
-                r.stdout.trim(),
-                r.stderr.trim()
+                stdout.trim(),
+                stderr.trim()
             ));
         }
-        Ok(r.stdout)
+        Ok(stdout)
     };
-    let tabs = || door.out(&["inspect", "app/v1", "tabs"]);
+    let tabs = || {
+        ctl(&["inspect", "app/v1", "tabs"])
+            .map(|(_, stdout, _)| stdout)
+            .unwrap_or_default()
+    };
     let (open, _) = windows_of(&tabs());
     step(&["invoke", "NewWindow"])?;
     new_window(&open, STEP_WAIT, tabs).ok_or_else(|| {
@@ -3813,19 +4186,26 @@ pub(super) fn end_steps(
         (today_of(&rows), every)
     };
     let _ = door.out(&["person", "look", "off"]);
-    let did = if desk.page_view.is_empty() {
-        None
+    let forced_today: usize = tabs
+        .iter()
+        .map(|t| forced_continues_of(&t.seen.journal, |at| local_day(at) == day))
+        .sum();
+    let (did, forced) = if desk.page_view.is_empty() {
+        (None, None)
     } else {
-        let (did, words) = read_did(door, desk)?;
+        let (did, forced, words) = read_did(door, desk)?;
         say(desk, format!("the page's WHAT THE HARNESS DID: {words}"));
-        did
+        (did, forced)
     };
+    let (forced_row, forced_line) = forced.map_or((None, None), |(row, line)| (Some(row), line));
     let rest = format!(
-        "here={} landed_tabs={landed_tabs} landing_tabs={landing_tabs} held_landing={held_landing} held_needs={held_needs} held_unread={held_unread} landings={landings} today={} every={} did={} status_failed={}",
+        "here={} landed_tabs={landed_tabs} landing_tabs={landing_tabs} held_landing={held_landing} held_needs={held_needs} held_unread={held_unread} landings={landings} today={} every={} did={} forced={forced_today} forced_row={} forced_line={} status_failed={}",
         q(&here),
         q(today.as_deref().unwrap_or("-")),
         q(every.as_deref().unwrap_or("-")),
         q(did.as_deref().unwrap_or("-")),
+        q(forced_row.as_deref().unwrap_or("-")),
+        q(forced_line.as_deref().unwrap_or("-")),
         q(&if unread_status.is_empty() {
             "-".to_string()
         } else {

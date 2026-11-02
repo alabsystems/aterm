@@ -238,6 +238,7 @@ fn parse_session_row(line: &str) -> Option<(Option<SiblingNeed>, bool)> {
         NeedWord::Frozen | NeedWord::Stopped if !agent => None,
         _ => field("agent_ms"),
     }
+    .filter(|ms| !ms.is_empty() && ms.bytes().all(|b| b.is_ascii_digit()))
     .and_then(|ms| ms.parse::<u64>().ok());
     Some((
         Some(SiblingNeed {
@@ -286,7 +287,12 @@ fn summarize_peer_within(pid: u32, sock: &str, budget: Duration) -> Option<Sibli
     (&stream).flush().ok()?;
     let mut reader = BufReader::new(&stream);
     let header = read_bounded_line(&stream, &mut reader, deadline)?;
-    let count: usize = header.trim_end().strip_prefix("OK ")?.parse().ok()?;
+    let count: usize = header
+        .trim_end()
+        .strip_prefix("OK ")
+        .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))?
+        .parse()
+        .ok()?;
     if count > MAX_SESSIONS_PER_PEER + 1 + MAX_FACTS_LINES {
         // Refuse, never clamp: reading fewer lines than the peer sent would
         // leave the leftovers desyncing every later reply on this stream.

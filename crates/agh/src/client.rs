@@ -5,21 +5,21 @@
 
 use std::collections::BTreeMap;
 use std::io::Read;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use crate::classify;
 use crate::config::Dirs;
-use crate::error::{Error, HttpRef, IdentityRef, Kind, Result, Sub, Tried};
-use crate::fx::{Fx, Mode};
+use crate::error::{Error, HttpRef, IdentityRef, Kind, Replay, Result, SideEffect, Sub, Tried};
+use crate::fx::{Fx, Mode, canon};
 use crate::git::{GitOut, GitRun, HelperCommand};
 use crate::github::{How, repo_root};
-use crate::identity::{self, Credential, EnvSource, LoadError, ProcessEnv, TokenKind};
-use crate::journal::{IntentDraft, IntentStore, Journal};
+use crate::identity::{self, Credential, EnvSource, LoadError, ProcessEnv, Source, TokenKind};
+use crate::journal::{IntentDraft, IntentStore, Journal, Settled};
 use crate::notify::{NoNotifier, Notifier};
 use crate::policy::{
-    Access, AnonymousWhy, Decision, Permit, Presence, Refusal, RefusalCode, RouteRequest,
-    RouteTarget, Router,
+    Access, AnonymousWhy, Decision, Permit, PermitTarget, Presence, Refusal, RefusalCode,
+    RouteRequest, RouteTarget, Router,
 };
 use crate::rate::{RateBook, RateSnapshot, book_key, resource_for};
 use crate::redact::Redactor;
@@ -121,6 +121,11 @@ pub struct Call {
     pub answer_any: bool,
     /// The write's body (`CallBody::Empty` from `Call::get` and `Call::head`).
     pub(crate) body: CallBody,
+    /// Whether the rate book may refuse it before it is sent (`How::rate_book`; default
+    /// true). The reads that guard a write set it false (design §7.4).
+    pub(crate) rate_book: bool,
+    /// The most its retry sleeps may take (`How::sleep_budget`; default `None`: no cap).
+    pub(crate) sleep_budget: Option<Duration>,
 }
 
 impl Call {
@@ -144,6 +149,8 @@ impl Call {
             retry: None,
             answer_any: false,
             body: CallBody::Empty,
+            rate_book: true,
+            sleep_budget: None,
         }
     }
 
@@ -168,8 +175,26 @@ impl Call {
             method,
             idempotency,
             body,
+            probe_404: false,
+            follow_moved: false,
             ..Call::get(path, route)
         }
+    }
+
+    /// The same call consulting the rate book before it is sent, or not (`How::rate_book`).
+    #[inline]
+    #[must_use]
+    pub(crate) const fn rate_book(mut self, on: bool) -> Call {
+        self.rate_book = on;
+        self
+    }
+
+    /// The same call with a cap on its retry sleeps (`How::sleep_budget`).
+    #[inline]
+    #[must_use]
+    pub(crate) const fn sleep_budget(mut self, budget: Option<Duration>) -> Call {
+        self.sleep_budget = budget;
+        self
     }
 
     /// The same call on `origin`.
@@ -377,6 +402,38 @@ impl Meter {
     }
 }
 
+/// The login bindings of a client's inline profiles (design §6.1).
+#[derive(Default)]
+struct Bindings {
+    /// Each inline profile a binding began for: `false` while its `GET /user` runs, `true`
+    /// once its login matched.
+    profiles: BTreeMap<String, bool>,
+    /// The sends waiting now for another send's binding to end: a test's reading only.
+    #[cfg(any(test, debug_assertions))]
+    waiting: usize,
+}
+
+/// Ends a binding that did not bind (an error, a mismatch, or a panic in its read): its
+/// entry is removed and every waiting send wakes, to bind again itself.
+struct Binder<'a> {
+    gh: &'a Github,
+    profile: &'a str,
+    bound: bool,
+}
+
+impl Drop for Binder<'_> {
+    fn drop(&mut self) {
+        let mut held = self.gh.bindings();
+        if self.bound {
+            held.profiles.insert(self.profile.to_string(), true);
+        } else {
+            held.profiles.remove(self.profile);
+        }
+        drop(held);
+        self.gh.inner.bind_done.notify_all();
+    }
+}
+
 struct Inner {
     router: Router,
     transport: Arc<dyn Transport>,
@@ -394,6 +451,12 @@ struct Inner {
     /// Each repository's numeric id, by `Slug::key`: the only memo (design §14).
     ids: Mutex<BTreeMap<String, u64>>,
     meter: Mutex<Meter>,
+    /// The inline profiles whose login a `GET /user` bound (design §6.1), or is binding now.
+    bound: Mutex<Bindings>,
+    /// Wakes the sends that wait on another send's binding.
+    bind_done: Condvar,
+    /// `fx.mono()` when this client's last write attempt began: the pacing clock (design §7.4).
+    last_write: Mutex<Option<Duration>>,
     /// The directories `GithubBuilder::journal` set: the write journals, grants and needs.
     dirs: Option<Dirs>,
     /// Where `How::notify` posts go.
@@ -574,6 +637,9 @@ impl GithubBuilder {
                 credentials: Mutex::new(BTreeMap::new()),
                 ids: Mutex::new(BTreeMap::new()),
                 meter: Mutex::new(Meter::default()),
+                bound: Mutex::new(Bindings::default()),
+                bind_done: Condvar::new(),
+                last_write: Mutex::new(None),
                 dirs: self.dirs,
                 notifier: self.notifier,
                 git_helper: self.git_helper,
@@ -819,6 +885,9 @@ impl Github {
                 credentials: Mutex::new(BTreeMap::new()),
                 ids: Mutex::new(BTreeMap::new()),
                 meter: Mutex::new(Meter::default()),
+                bound: Mutex::new(Bindings::default()),
+                bind_done: Condvar::new(),
+                last_write: Mutex::new(None),
                 dirs: inner.dirs.clone(),
                 notifier: inner.notifier.clone(),
                 git_helper: inner.git_helper.clone(),
@@ -838,8 +907,8 @@ impl Github {
     ///
     /// As `Router::permit`; under a replay, the route door's `Replay` errors.
     pub fn permit(&self, req: &RouteRequest) -> Result<Permit> {
-        let _ = req;
-        Err(Error::not_yet("the client's write permit", "WP3"))
+        let decision = self.inner.fx.route(req, &mut || self.decide(req))?;
+        self.inner.router.permit_decided(req, decision)
     }
 
     /// Run a write `call` under `permit`: the write pipeline (design §7.4, §10.1).
@@ -848,8 +917,7 @@ impl Github {
     ///
     /// The pipeline's errors, each saying what the write may have done (`side_effect`).
     pub(crate) fn call_write(&self, call: &Call, permit: &Permit, how: &How) -> Result<Answered> {
-        let _ = (call, permit, how);
-        Err(Error::not_yet("the write pipeline", "WP3"))
+        self.call_write_guarded(call, permit, how, &mut |_| Ok(None))
     }
 
     /// [`Github::call_write`] whose `guard` runs before every attempt: `Ok(Some(answered))`
@@ -866,8 +934,54 @@ impl Github {
         how: &How,
         guard: &mut dyn FnMut(u32) -> Result<Option<Answered>>,
     ) -> Result<Answered> {
-        let _ = (call, permit, how, guard);
-        Err(Error::not_yet("the write pipeline", "WP3"))
+        let on_repo = |error: Error| with_call_repo(call, error);
+        if call.method.is_read() {
+            return Err(on_repo(Error::usage(format!(
+                "a write method sends a write; {} is a read",
+                call.method.as_str()
+            ))));
+        }
+        write_target(call, permit).map_err(on_repo)?;
+        let decided = self.decided_for(permit).map_err(on_repo)?;
+        self.bind_login(permit.profile())
+            .map_err(|error| on_repo(before_the_write(error)))?;
+        let policy = how.retry.or(call.retry).unwrap_or(self.inner.retry);
+        let budget = how.sleep_budget.or(call.sleep_budget);
+        let consult_book = how.rate_book && call.rate_book;
+        let mut slept = Duration::ZERO;
+        let mut secondary_retried = false;
+        let mut attempt = 1u32;
+        loop {
+            if let Some(answered) = guard(attempt)? {
+                return Ok(answered);
+            }
+            self.pace()?;
+            let failure = match self.write_attempt(call, permit, &decided, consult_book) {
+                Ok(mut answered) => {
+                    answered.requests = attempt;
+                    return Ok(answered);
+                }
+                Err(failure) => failure,
+            };
+            let Some(pause) = should_retry(
+                &policy,
+                call.idempotency,
+                attempt,
+                &failure,
+                secondary_retried,
+            ) else {
+                return Err(failure);
+            };
+            if budget.is_some_and(|budget| slept.saturating_add(pause) > budget) {
+                return Err(failure);
+            }
+            if failure.sub == Sub::Secondary {
+                secondary_retried = true;
+            }
+            self.inner.fx.sleep(pause)?;
+            slept = slept.saturating_add(pause);
+            attempt = attempt.saturating_add(1);
+        }
     }
 
     /// The journal's draft for a one-shot `call` under `permit`: `IntentDraft::new` with the
@@ -887,14 +1001,30 @@ impl Github {
         permit: &Permit,
         key: &str,
     ) -> Result<IntentDraft> {
-        let _ = (op, slug, call, permit, key);
-        Err(Error::not_yet("the intent draft", "WP3"))
+        let decided = self.decided_for(permit)?;
+        let fingerprint = if self.taped() {
+            TAPED.to_string()
+        } else {
+            match &decided.cred {
+                Some(cred) => cred.fingerprint().to_string(),
+                None => return Err(not_loaded(permit.profile())),
+            }
+        };
+        let prepared = self.prepare_write(call, &decided);
+        let mut file = None;
+        let (body, digest) = write_body(call, &mut file, true)?;
+        let request = prepared.write_request(permit, body, digest.as_deref());
+        let canonical = canon::request_credentialed(&request, &self.inner.endpoints)?;
+        Ok(IntentDraft::new(op, slug, permit, &fingerprint, key)
+            .with_request(canon::request_digest(&canonical)))
     }
 
-    /// One one-shot write (design §10.2): `intents.latest(draft.op, &draft.key)`, whose id
-    /// becomes the draft's `after`, then `intents.begin(draft)`, `call_write` once, then
-    /// `intents.settle` with `write::settle_table` of the result and `created(&answered)`, an
-    /// `Unknown`'s why passed through `self.redactor().apply` first, so a learned secret of
+    /// One one-shot write (design §10.2): first the call's target against the permit's
+    /// (`write_target`) and the login binding, so neither failure leaves an intent; then
+    /// `intents.latest(draft.op, &draft.key)`, whose id becomes the draft's `after`, then
+    /// `intents.begin(draft)`, `call_write` once, then `intents.settle` with
+    /// `write::settle_table` of the result and `created(&answered)`, an `Unknown`'s why and a
+    /// `Created`'s url passed through `self.redactor().apply` first, so a learned secret of
     /// no known shape never reaches the journal. `NeverSent` answers `Outcome::NeverSent`,
     /// `Created` answers `Outcome::Done`, `Refused` answers `Outcome::Refused`, and `Unknown`
     /// answers `Outcome::Unknown` with the intent. For an `Ok` with no object id there is no
@@ -905,13 +1035,14 @@ impl Github {
     ///
     /// # Errors
     ///
+    /// `write_target`'s Usage and the login binding's error, with no intent begun.
     /// `begin`'s refusal, and nothing is sent. A `settle` that fails after GitHub answered is
     /// could_not_run, `Sub::Local`, `side_effect` applied for a 2xx and unknown otherwise, why
     /// `GitHub answered {status}, and the journal could not record it: {e}; intent {id} stays
     /// open`, next `agh intent show {repo} {id}`. The open intent then stops a second POST of
-    /// the same op and key at `begin` (`IntentStore::begin`), until a person retracts it. A
-    /// `RefCreate` is the one exception: its second POST is GitHub's 422 `Reference already
-    /// exists`, which `Refs::create` resolves by reading the ref.
+    /// the same op and key at `begin` (`IntentStore::begin`), until `agh intent retract`
+    /// closes it. A `RefCreate` is the one exception: its second POST is GitHub's 422
+    /// `Reference already exists`, which `Refs::create` resolves by reading the ref.
     pub(crate) fn one_shot(
         &self,
         call: &Call,
@@ -920,8 +1051,63 @@ impl Github {
         intents: &dyn IntentStore,
         created: &dyn Fn(&Answered) -> Option<(u64, String)>,
     ) -> Result<Outcome<Answered>> {
-        let _ = (call, permit, draft, intents, created);
-        Err(Error::not_yet("the one-shot write", "WP3"))
+        // The target and the login binding come before the journal: a call its permit does
+        // not cover, or a binding that fails, leaves no intent in it.
+        let on_repo = |error: Error| with_call_repo(call, error);
+        write_target(call, permit).map_err(on_repo)?;
+        self.bind_login(permit.profile())
+            .map_err(|error| on_repo(before_the_write(error)))?;
+        let after = intents
+            .latest(draft.op, &draft.key)?
+            .map(|view| view.intent.id);
+        let id = intents.begin(&draft.clone().with_after(after))?;
+        let result = self.call_write(call, permit, &How::write());
+        let made = result.as_ref().ok().and_then(created);
+        let settled = match crate::write::settle_table(&result, made) {
+            Settled::Unknown { why } => Settled::Unknown {
+                why: self.redactor().apply(&why),
+            },
+            Settled::Created { id, url } => Settled::Created {
+                id,
+                url: self.redactor().apply(&url),
+            },
+            settled => settled,
+        };
+        if let Err(e) = intents.settle(&id, &settled) {
+            let (status, side_effect) = match &result {
+                Ok(answered) => (answered.status.to_string(), SideEffect::Applied),
+                Err(error) => (
+                    error
+                        .http
+                        .as_ref()
+                        .map_or_else(|| "nothing".to_string(), |http| http.status.to_string()),
+                    SideEffect::Unknown,
+                ),
+            };
+            let why = format!(
+                "GitHub answered {status}, and the journal could not record it: {}; intent {id} stays open",
+                e.why
+            );
+            return Err(Error::could_not_run(self.redactor().apply(&why))
+                .with_sub(Sub::Local)
+                .with_side_effect(side_effect)
+                .with_next(format!("agh intent show {} {id}", draft.slug))
+                .with_repo(draft.slug.to_string()));
+        }
+        Ok(match (settled, result) {
+            (Settled::Created { .. }, Ok(answered)) => Outcome::Done(answered),
+            (Settled::Unknown { why }, Ok(_)) => Outcome::Unknown {
+                intent: id,
+                error: Error::new(Kind::OutcomeUnknown, why)
+                    .with_side_effect(SideEffect::Applied)
+                    .with_repo(draft.slug.to_string()),
+            },
+            (Settled::NeverSent, Err(error)) => Outcome::NeverSent(error),
+            (Settled::Refused { .. }, Err(error)) => Outcome::Refused(error),
+            (_, Err(error)) => Outcome::Unknown { intent: id, error },
+            // `settle_table` answers an `Ok` with `Created` or `Unknown` alone.
+            (_, Ok(answered)) => Outcome::Done(answered),
+        })
     }
 
     /// The isolated git runner (design §6.9).
@@ -1148,7 +1334,16 @@ struct Decided {
     identity: IdentityRef,
     cred: Option<Arc<Credential>>,
     covers_all_repos: bool,
+    /// A replay's Send: the tape decided it, no credential was loaded, and the identity's
+    /// fingerprint is `taped`.
+    taped: bool,
 }
+
+/// The fingerprint a taped run names in place of a credential's (plan §4.6.19).
+const TAPED: &str = "taped";
+
+/// The pause between two write attempts of one client (design §7.4).
+const PACE: Duration = Duration::from_secs(1);
 
 struct Prepared {
     method: Method,
@@ -1157,6 +1352,8 @@ struct Prepared {
     auth: Option<AuthHeader>,
     /// Who the request is sent as: the decided identity when the door gave it a credential.
     as_: IdentityRef,
+    /// The profile the decision sends it as (`Decision::Send`), credential or not.
+    as_profile: Option<String>,
     /// The call's limit.
     limit: u64,
     reading: Reading,
@@ -1175,7 +1372,22 @@ impl Prepared {
             deadlines: self.deadlines,
             permit: None,
             body_digest: None,
-            as_profile: None,
+            as_profile: self.as_profile.as_deref(),
+        }
+    }
+
+    /// The write's request: `request()` carrying `permit`, `body` and the body's digest.
+    fn write_request<'a>(
+        &'a self,
+        permit: &'a Permit,
+        body: WireBody<'a>,
+        body_digest: Option<&'a str>,
+    ) -> WireRequest<'a> {
+        WireRequest {
+            body,
+            permit: Some(permit),
+            body_digest,
+            ..self.request()
         }
     }
 
@@ -1233,18 +1445,183 @@ pub(crate) fn retarget(call: &mut Call, old: &Slug, new: &Slug) {
     }
 }
 
-/// Build the refusal error for write methods in M1.
+/// The refusal of a write method where only a read is taken (`Github::call`, `Raw::get`).
 pub(crate) fn method_refusal(method: Method, repo: Option<&Slug>) -> Error {
     Refusal {
         code: RefusalCode::MethodNotRead,
         why: format!(
-            "{} is a write, and agh M1 sends only GET and HEAD",
+            "{} is a write, and Github::call sends only GET and HEAD",
             method.as_str()
         ),
-        next: "writes arrive in M2: use gh for now".to_string(),
+        next: "a write takes a permit: Router::permit, then a write method of the resource"
+            .to_string(),
         tried: Vec::new(),
     }
     .into_error(repo)
+}
+
+/// What a route target is called in a refusal.
+fn route_target_text(target: &RouteTarget) -> String {
+    match target {
+        RouteTarget::Repo(slug) => slug.to_string(),
+        RouteTarget::Owner(owner) => format!("owner {owner}"),
+        RouteTarget::Unscoped => "an unscoped path".to_string(),
+        RouteTarget::Identity => "/user".to_string(),
+    }
+}
+
+/// Step 2 of the write pipeline: the call's target is the permit's (the same slug, or both
+/// Identity), and its origin one the target may be written on (a repository's: the api or
+/// the uploads origin; the identity's: the api origin). Usage otherwise, before anything is
+/// loaded or sent.
+pub(crate) fn write_target(call: &Call, permit: &Permit) -> Result<()> {
+    let (same, origin_ok) = match (&call.route.target, permit.target()) {
+        (RouteTarget::Repo(a), PermitTarget::Repo(b)) => (
+            a.key() == b.key(),
+            matches!(call.origin, OriginRole::Api | OriginRole::Uploads),
+        ),
+        (RouteTarget::Identity, PermitTarget::Identity) => (true, call.origin == OriginRole::Api),
+        _ => (false, true),
+    };
+    let permitted = match permit.target() {
+        PermitTarget::Repo(slug) => slug.to_string(),
+        PermitTarget::Identity => "/user".to_string(),
+    };
+    if !same {
+        return Err(Error::usage(format!(
+            "the call is for {}, the permit for {permitted}",
+            route_target_text(&call.route.target)
+        )));
+    }
+    if !origin_ok {
+        return Err(Error::usage(format!(
+            "a write to {permitted} goes to the API origin{}, not the {} origin",
+            if matches!(permit.target(), PermitTarget::Repo(_)) {
+                " or the uploads origin"
+            } else {
+                ""
+            },
+            origin_word(call.origin)
+        )));
+    }
+    Ok(())
+}
+
+/// `error` naming the call's repository, when it names none yet.
+fn with_call_repo(call: &Call, error: Error) -> Error {
+    match repo_of(&call.route) {
+        Some(slug) if error.repo.is_none() => error.with_repo(slug.to_string()),
+        _ => error,
+    }
+}
+
+/// A login binding's error as the write's: the write itself was never sent, so the error
+/// carries no HTTP exchange and no side effect (the binding's `GET /user` status moves into
+/// its why), and `write::settle_table` settles it `NeverSent` rather than reading the read's
+/// 5xx as an unknown write or its 4xx as a refused one.
+fn before_the_write(mut error: Error) -> Error {
+    if let Some(http) = error.http.take() {
+        error.why = format!(
+            "the login binding's GET /user answered {}, and the write was not sent: {}",
+            http.status, error.why
+        );
+    }
+    error.side_effect = SideEffect::None;
+    error
+}
+
+/// `api`, `uploads`, `web`, `CDN`.
+const fn origin_word(role: OriginRole) -> &'static str {
+    match role {
+        OriginRole::Api => "API",
+        OriginRole::Uploads => "uploads",
+        OriginRole::Web => "web",
+        OriginRole::AssetCdn => "CDN",
+    }
+}
+
+/// Unauthenticated: the profile's credential did not load.
+fn not_loaded(profile: &str) -> Error {
+    Error::new(
+        Kind::Unauthenticated,
+        format!("the credential of {profile} did not load"),
+    )
+}
+
+/// CouldNotRun `Sub::Local` about the upload file at `path`.
+fn file_error(path: &std::path::Path, what: &str) -> Error {
+    Error::could_not_run(format!("{} {what}", path.display())).with_sub(Sub::Local)
+}
+
+/// The file at `path`, opened again for this attempt, when it still holds `len` bytes: a
+/// file that changed is could_not_run before any byte leaves.
+fn open_unchanged(path: &std::path::Path, len: u64) -> Result<std::fs::File> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| file_error(path, &format!("could not be opened: {e}")))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| file_error(path, &format!("could not be read: {e}")))?;
+    if !meta.is_file() || meta.len() != len {
+        return Err(file_error(path, "changed since it was hashed"));
+    }
+    Ok(file)
+}
+
+/// `sha256:{hex}` of `file`'s bytes, which must be `len` of them; the file is left at its start.
+fn file_digest(file: &mut std::fs::File, path: &std::path::Path, len: u64) -> Result<String> {
+    use std::io::{Seek, SeekFrom};
+    let mut hasher = aterm_digest::Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut read = 0u64;
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                hasher.update(&buf[..n]);
+                read = read.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(file_error(path, &format!("could not be read: {e}"))),
+        }
+    }
+    if read != len {
+        return Err(file_error(path, "changed since it was hashed"));
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| file_error(path, &format!("could not be read: {e}")))?;
+    Ok(format!(
+        "sha256:{}",
+        aterm_codec::hex::encode_lower(&hasher.finalize())
+    ))
+}
+
+/// The call's body as the wire takes it, and a file body's digest when `digest` asks for it
+/// (a tape names a file body by its digest). A file is opened into `file`, which the body
+/// borrows.
+fn write_body<'a>(
+    call: &'a Call,
+    file: &'a mut Option<std::fs::File>,
+    digest: bool,
+) -> Result<(WireBody<'a>, Option<String>)> {
+    match &call.body {
+        CallBody::Empty => Ok((WireBody::Empty, None)),
+        CallBody::Json(bytes) => Ok((WireBody::Bytes(bytes), None)),
+        CallBody::File { path, len, .. } => {
+            let opened = file.insert(open_unchanged(path, *len)?);
+            let sha = if digest {
+                Some(file_digest(opened, path, *len)?)
+            } else {
+                None
+            };
+            Ok((
+                WireBody::Reader {
+                    len: *len,
+                    reader: opened,
+                },
+                sha,
+            ))
+        }
+    }
 }
 
 fn method_gate(call: &Call) -> Result<()> {
@@ -1288,41 +1665,312 @@ impl Github {
         }
     }
 
+    /// Read step 1: the decision the route door gives (live, `decide`'s own; under a
+    /// credentialed replay, the tape's), then the credential it sends. The first send as an
+    /// inline profile binds its login first.
     fn route(&self, route: &RouteRequest) -> Result<Decided> {
-        match self.decide(route) {
+        let (decided, profile) = self.route_unbound(route)?;
+        if let Some(profile) = profile {
+            self.bind_login(&profile)?;
+        }
+        Ok(decided)
+    }
+
+    /// `route` with no login binding: the decision and the profile it sends as, if any. The
+    /// binding's own `GET /user` routes here, so it never waits on itself.
+    fn route_unbound(&self, route: &RouteRequest) -> Result<(Decided, Option<String>)> {
+        match self.inner.fx.route(route, &mut || self.decide(route))? {
             Decision::Send { profile, .. } => {
-                let cred = self.credential(&profile).ok_or_else(|| {
-                    Error::new(
-                        Kind::Unauthenticated,
-                        format!("the credential of {profile} did not load"),
-                    )
-                })?;
-                let covers_all_repos = self
-                    .inner
-                    .router
-                    .profile(&profile)
-                    .is_some_and(|p| p.covers_all_repos);
-                Ok(Decided {
-                    identity: IdentityRef::Profile {
-                        name: profile,
-                        fingerprint: cred.fingerprint().to_string(),
-                    },
-                    cred: Some(cred),
-                    covers_all_repos,
-                })
+                let decided = self.decided_as(&profile)?;
+                Ok((decided, Some(profile)))
             }
             Decision::Anonymous { why } => {
                 if why != AnonymousWhy::Asked {
                     self.lock_meter().fell_to_anonymous = true;
                 }
-                Ok(Decided {
-                    identity: IdentityRef::Anonymous,
-                    cred: None,
-                    covers_all_repos: false,
-                })
+                Ok((
+                    Decided {
+                        identity: IdentityRef::Anonymous,
+                        cred: None,
+                        covers_all_repos: false,
+                        taped: false,
+                    },
+                    None,
+                ))
             }
             Decision::Refuse(refusal) => Err(refusal.into_error(repo_of(route))),
         }
+    }
+
+    /// Whether this run replays a tape: then no credential is loaded or sent.
+    fn replays(&self) -> bool {
+        matches!(self.inner.fx.mode(), Mode::Replaying | Mode::Rerecording)
+    }
+
+    /// Whether this run is under any tape.
+    fn taped(&self) -> bool {
+        matches!(
+            self.inner.fx.mode(),
+            Mode::Recording | Mode::Replaying | Mode::Rerecording
+        )
+    }
+
+    /// What a Send as `profile` speaks with: its loaded credential, or, under a replay, no
+    /// credential and the fingerprint `taped`.
+    fn decided_as(&self, profile: &str) -> Result<Decided> {
+        let covers_all_repos = self
+            .inner
+            .router
+            .profile(profile)
+            .is_some_and(|p| p.covers_all_repos);
+        if self.replays() {
+            return Ok(Decided {
+                identity: IdentityRef::Profile {
+                    name: profile.to_string(),
+                    fingerprint: TAPED.to_string(),
+                },
+                cred: None,
+                covers_all_repos,
+                taped: true,
+            });
+        }
+        let cred = self
+            .credential(profile)
+            .ok_or_else(|| not_loaded(profile))?;
+        Ok(Decided {
+            identity: IdentityRef::Profile {
+                name: profile.to_string(),
+                fingerprint: cred.fingerprint().to_string(),
+            },
+            cred: Some(cred),
+            covers_all_repos,
+            taped: false,
+        })
+    }
+
+    /// What a write under `permit` speaks with: `decided_as` the permit's profile, its
+    /// credential loaded (once per process) first.
+    fn decided_for(&self, permit: &Permit) -> Result<Decided> {
+        if !self.replays() {
+            let _ = self.presence(permit.profile());
+        }
+        self.decided_as(permit.profile())
+    }
+
+    /// Login binding (design §6.1): before the first send as an inline profile in this
+    /// client, one `GET /user` as that profile, whose `login` must be the profile's
+    /// (ASCII case-insensitive). Unauthenticated `Sub::LoginMismatch` otherwise, and nothing
+    /// else is sent. A profile of a file or the environment needs no binding.
+    ///
+    /// A send that finds another send of this client binding the same profile waits for that
+    /// binding to end, so nothing else goes out as the profile while its login is unchecked.
+    /// A binding that did not bind wakes its waiters, and each binds again itself.
+    fn bind_login(&self, profile: &str) -> Result<()> {
+        let Some(row) = self.inner.router.profile(profile) else {
+            return Ok(());
+        };
+        if !matches!(row.source, Source::Inline(_)) {
+            return Ok(());
+        }
+        let mut held = self.bindings();
+        loop {
+            match held.profiles.get(profile) {
+                Some(true) => return Ok(()),
+                Some(false) => {
+                    #[cfg(any(test, debug_assertions))]
+                    {
+                        held.waiting = held.waiting.saturating_add(1);
+                    }
+                    held = self
+                        .inner
+                        .bind_done
+                        .wait(held)
+                        .unwrap_or_else(PoisonError::into_inner);
+                    #[cfg(any(test, debug_assertions))]
+                    {
+                        held.waiting = held.waiting.saturating_sub(1);
+                    }
+                }
+                None => break,
+            }
+        }
+        held.profiles.insert(profile.to_string(), false);
+        drop(held);
+        let mut binder = Binder {
+            gh: self,
+            profile,
+            bound: false,
+        };
+        let expected = row.login.clone().unwrap_or_default();
+        let route = RouteRequest::read(RouteTarget::Identity).with_as(Some(profile.to_string()));
+        let call = Call::get("/user", route)
+            .probe_404(false)
+            .follow_moved(false);
+        // Routed past the binding: this read is the binding's own send as the profile.
+        let got = self
+            .route_unbound(&call.route)
+            .and_then(|(decided, _)| self.run(&call, &decided, Reading::Whole))
+            .and_then(Got::into_answered)
+            .and_then(|answered| {
+                let user: crate::model::UserObject = crate::model::from_json(&answered.json()?)?;
+                Ok(user.login)
+            })?;
+        if got.eq_ignore_ascii_case(&expected) {
+            binder.bound = true;
+            return Ok(());
+        }
+        Err(Error::new(
+            Kind::Unauthenticated,
+            format!("the token of {profile} is {got}'s, and {profile} names {expected}"),
+        )
+        .with_sub(Sub::LoginMismatch { expected, got }))
+    }
+
+    /// The login bindings, held.
+    fn bindings(&self) -> MutexGuard<'_, Bindings> {
+        self.inner
+            .bound
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Pacing (design §7.4): a write attempt begins at least 1 s of `fx.mono()` after this
+    /// client's last one began, sleeping through `fx.sleep` for the rest. No lock spans
+    /// processes.
+    fn pace(&self) -> Result<()> {
+        let fx = &self.inner.fx;
+        let mut last = self
+            .inner
+            .last_write
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(began) = *last {
+            let elapsed = fx.mono()?.saturating_sub(began);
+            if elapsed < PACE {
+                fx.sleep(PACE.saturating_sub(elapsed))?;
+            }
+        }
+        *last = Some(fx.mono()?);
+        Ok(())
+    }
+
+    /// `prepare` for a write: its body's `Content-Type` added.
+    fn prepare_write(&self, call: &Call, decided: &Decided) -> Prepared {
+        let mut prepared = self.prepare(call, decided, Reading::Whole);
+        let content_type = match &call.body {
+            CallBody::Empty => None,
+            CallBody::Json(_) => Some("application/json"),
+            CallBody::File { content_type, .. } => Some(content_type.as_str()),
+        };
+        if let Some(content_type) = content_type {
+            prepared
+                .headers
+                .push(("Content-Type".to_string(), content_type.to_string()));
+        }
+        prepared
+    }
+
+    /// One write attempt: the rate book's pre-refusal (unless `consult_book` is off), the
+    /// body opened again, one exchange through `Fx::gh`, and the answer classified. Every
+    /// error says what the write may have done: `side_effect` none when nothing was sent or
+    /// GitHub answered a 4xx, unknown for a 5xx, a redirect, or a request that may have
+    /// left with no answer read.
+    fn write_attempt(
+        &self,
+        call: &Call,
+        permit: &Permit,
+        decided: &Decided,
+        consult_book: bool,
+    ) -> Result<Answered> {
+        let prepared = self.prepare_write(call, decided);
+        let key = book_key(&decided.identity);
+        let booked = call.origin == OriginRole::Api && self.inner.rate_book.enabled();
+        if booked && consult_book {
+            let now = self.inner.fx.wall_secs()?;
+            let resource = resource_for(&call.path);
+            if let Some(refused) = self.inner.rate_book.refuse_before_send(&key, resource, now) {
+                return Err(self.finish_error(refused, call, &prepared.as_, None));
+            }
+        }
+        let mut file = None;
+        let (body, digest) = write_body(call, &mut file, self.taped())?;
+        let request = prepared.write_request(permit, body, digest.as_deref());
+        {
+            let mut meter = self.lock_meter();
+            meter.requests = meter.requests.saturating_add(1);
+            meter.as_ = Some(prepared.as_.clone());
+        }
+        let exchanged = self
+            .inner
+            .fx
+            .gh(&*self.inner.transport, &self.inner.endpoints, request);
+        let answer = match exchanged {
+            Ok(answer) => answer,
+            Err(door) => {
+                // A recording sent the write before the tape refused its answer. A latch an
+                // earlier exchange set never reaches here: `pace` reads `fx.mono()` just
+                // before this attempt, and a recording's clock returns the latched error, so
+                // the run ends there, sent nothing, at side_effect none.
+                let after = self.inner.fx.mode() == Mode::Recording
+                    && door.sub == Sub::Replay(Replay::BodyNotTaped);
+                let door = if after {
+                    door.with_side_effect(SideEffect::Unknown)
+                } else {
+                    door
+                };
+                return Err(self.finish_error(door, call, &prepared.as_, None));
+            }
+        };
+        let mut response = match answer {
+            Ok(response) => response,
+            Err(wire) => {
+                let mut error = classify::wire(&wire, call.method, call.idempotency);
+                if wire.phase != crate::wire::Phase::NotSent {
+                    error = error.with_side_effect(SideEffect::Unknown);
+                }
+                return Err(self.finish_error(error, call, &prepared.as_, None));
+            }
+        };
+        let rate = RateSnapshot::from_headers(&response.headers);
+        if let Some(snapshot) = &rate {
+            self.lock_meter().rate = Some(snapshot.clone());
+            if booked {
+                self.inner.rate_book.record(&key, snapshot);
+            }
+        }
+        let status = response.status;
+        if (200..300).contains(&status) {
+            return match prepared.held(&mut response) {
+                Ok(whole) => {
+                    Got::of(response, whole, &prepared.as_, 1, rate, call.limit).into_answered()
+                }
+                Err(wire) => {
+                    let error = classify::wire(&wire, call.method, call.idempotency)
+                        .with_side_effect(SideEffect::Unknown);
+                    let exchange = Exchange {
+                        status,
+                        headers: &response.headers,
+                        rate,
+                    };
+                    Err(self.finish_error(error, call, &prepared.as_, Some(exchange)))
+                }
+            };
+        }
+        let (headers, head) = head_of(response);
+        let side_effect = if (400..500).contains(&status) {
+            SideEffect::None
+        } else {
+            SideEffect::Unknown
+        };
+        let error = classify::answer(status, &headers, &head, call.method, call.idempotency)
+            .unwrap_or_else(|| Error::protocol(format!("GitHub answered {status}")))
+            .with_side_effect(side_effect);
+        let exchange = Exchange {
+            status,
+            headers: &headers,
+            rate,
+        };
+        Err(self.finish_error(error, call, &prepared.as_, Some(exchange)))
     }
 
     fn lock_meter(&self) -> std::sync::MutexGuard<'_, Meter> {
@@ -1356,10 +2004,17 @@ impl Github {
             Some(backstop) => call.deadlines.with_backstop(backstop),
             None => call.deadlines,
         };
-        let as_ = if auth.is_some() {
+        // A replay loads no credential, so it names the identity wherever a live run's
+        // credential would have gone: the api and uploads origins.
+        let credential_origin = origin == endpoints.api() || origin == endpoints.uploads();
+        let as_ = if auth.is_some() || (decided.taped && credential_origin) {
             decided.identity.clone()
         } else {
             IdentityRef::Anonymous
+        };
+        let as_profile = match &decided.identity {
+            IdentityRef::Profile { name, .. } => Some(name.clone()),
+            IdentityRef::Anonymous => None,
         };
         Prepared {
             method: call.method,
@@ -1367,6 +2022,7 @@ impl Github {
             headers,
             auth,
             as_,
+            as_profile,
             limit: call.limit,
             reading,
             deadlines,
@@ -1433,7 +2089,7 @@ impl Github {
         let key = book_key(&decided.identity);
         let booked = call.origin == OriginRole::Api && self.inner.rate_book.enabled();
         let free = path_only(&call.path) == "/rate_limit";
-        if booked && !free {
+        if booked && !free && call.rate_book {
             let now = self.inner.fx.wall_secs()?;
             let resource = resource_for(&call.path);
             if let Some(refused) = self.inner.rate_book.refuse_before_send(&key, resource, now) {
@@ -1444,6 +2100,7 @@ impl Github {
         let mut requests = 0u32;
         let mut attempt = 1u32;
         let mut secondary_retried = false;
+        let mut slept = Duration::ZERO;
         loop {
             requests = requests.saturating_add(1);
             *sent = requests;
@@ -1532,10 +2189,17 @@ impl Github {
             ) else {
                 return Err(failure);
             };
+            if call
+                .sleep_budget
+                .is_some_and(|budget| slept.saturating_add(pause) > budget)
+            {
+                return Err(failure);
+            }
             if failure.sub == Sub::Secondary {
                 secondary_retried = true;
             }
             self.inner.fx.sleep(pause)?;
+            slept = slept.saturating_add(pause);
             attempt = attempt.saturating_add(1);
         }
     }
@@ -1839,3 +2503,7 @@ impl Github {
         }
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "client_write_tests.rs"]
+mod write_tests;

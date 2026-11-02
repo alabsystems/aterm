@@ -249,8 +249,8 @@ impl PermissionGate {
         };
     }
 
-    /// Whether the plan the status names (Permissions admitted, nothing held) is the window's own
-    /// admission: what [`Self::admitted`] reads with no row press, as a fact that spends nothing.
+    /// Whether the selected plan is this window's own admission. An automatic admission
+    /// remains a valid setup decision without granting a permission-prompt capability.
     pub(super) fn own_admission_stands(&self) -> bool {
         self.allowed()
             && self
@@ -259,9 +259,13 @@ impl PermissionGate {
                 .is_some_and(|(policy, (_, revision))| revision == policy.revision)
     }
 
-    /// The standing yes, while the plan the status names (Permissions admitted, nothing held) is
-    /// the window's own admission; or, for `person_press` (a person's press on a row's own
-    /// button), while that plan stands at all. The one door that makes an [`AdmittedAccess`].
+    /// Whether this revision has an explicit person's permission choice.
+    pub(super) fn person_admission_stands(&self) -> bool {
+        self.own_admission_stands() && self.own.is_some_and(|(by, _)| by == AdmittedBy::Person)
+    }
+
+    /// The explicit permission choice, or a person's press on that permission's own
+    /// button while its plan stands. Automatic admission never creates this capability.
     pub(super) fn admitted(&self, person_press: bool) -> Option<AdmittedAccess> {
         let stopped_press = person_press
             && ::std::matches!(self.hold, PermissionHold::Stopped { person: true })
@@ -278,6 +282,11 @@ impl PermissionGate {
             });
         }
         let (by, revision) = self.own?;
+        // An automatic setup decision cannot authorize an OS permission prompt.
+        // Keep that capability tied to an explicit person's choice.
+        if by != AdmittedBy::Person {
+            return None;
+        }
         (revision == policy.revision).then_some(AdmittedAccess {
             revision,
             by,

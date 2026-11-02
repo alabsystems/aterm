@@ -8,7 +8,11 @@ use aterm_secrets::{
     client::{self, Membership, Paths},
     commons,
 };
-use aterm_types::network_state::{ServiceAvailability, ServiceState, ServiceStates};
+use aterm_types::network_state::{
+    ServiceAvailability, ServiceState, ServiceStates, VaultHttp204Response,
+    VaultNetworkMaterialization, VaultNetworkRefresh, VaultNetworkRefreshOutcome,
+    VaultNetworkSource,
+};
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex},
@@ -138,6 +142,17 @@ fn control_busy(now_ms: u64) -> ServiceState {
 }
 
 fn secrets(paths: &Paths, now_ms: u64) -> ServiceState {
+    secrets_reading_refresh(paths, now_ms, client::observe_network_refresh)
+}
+
+fn secrets_reading_refresh(
+    paths: &Paths,
+    now_ms: u64,
+    refresh: impl FnOnce(
+        &Paths,
+        &client::Config,
+    ) -> aterm_secrets::Result<Option<client::VaultNetworkRefresh>>,
+) -> ServiceState {
     let status = match client::status(paths) {
         Ok(status) => status,
         Err(_) => {
@@ -147,16 +162,68 @@ fn secrets(paths: &Paths, now_ms: u64) -> ServiceState {
     let Some(config) = &status.config else {
         return secret_metadata(&status.membership, false, status.names.len(), now_ms);
     };
-    match client::observe_materialization(paths, config, || client::status(paths)) {
-        Ok(client::MaterializationObservation::Ready(held)) => secret_metadata(
-            &held.inputs.membership,
-            true,
-            held.inputs.names.len(),
-            now_ms,
-        ),
+    let mut result = match client::observe_materialization(paths, config, || client::status(paths))
+    {
+        Ok(client::MaterializationObservation::Ready(held)) => {
+            let mut result = secret_metadata(
+                &held.inputs.membership,
+                true,
+                held.inputs.names.len(),
+                now_ms,
+            );
+            result.network_materialization =
+                held.snapshot.network_materialization().map(|receipt| {
+                    VaultNetworkMaterialization {
+                        source: match receipt.source() {
+                            client::VaultNetworkSource::ConfiguredUrl => {
+                                VaultNetworkSource::ConfiguredUrl
+                            }
+                            client::VaultNetworkSource::PeerUrl => VaultNetworkSource::PeerUrl,
+                        },
+                        sequence: receipt.sequence(),
+                        sampled_at_ms: receipt.sampled_at_ms(),
+                    }
+                });
+            result
+        }
         Ok(client::MaterializationObservation::Blocked(reason)) => secret_blocker(reason, now_ms),
         Err(_) => failed_observation(now_ms, "Local vault cache could not be verified"),
+    };
+    result.http204_response = client::observe_http204_response(paths, config)
+        .ok()
+        .flatten()
+        .map(|response| VaultHttp204Response {
+            source: match response.source() {
+                client::VaultNetworkSource::ConfiguredUrl => VaultNetworkSource::ConfiguredUrl,
+                client::VaultNetworkSource::PeerUrl => VaultNetworkSource::PeerUrl,
+            },
+            responded_at_ms: response.responded_at_ms(),
+        });
+    match refresh(paths, config) {
+        Ok(refresh) => {
+            result.network_refresh = refresh.map(|refresh| VaultNetworkRefresh {
+                completed_at_ms: refresh.completed_at_ms(),
+                outcome: match refresh.outcome() {
+                    client::VaultNetworkRefreshOutcome::Succeeded => {
+                        VaultNetworkRefreshOutcome::Succeeded
+                    }
+                    client::VaultNetworkRefreshOutcome::Failed => {
+                        VaultNetworkRefreshOutcome::Failed
+                    }
+                },
+            });
+            result.refresh_failed |= result
+                .network_refresh
+                .is_some_and(|refresh| refresh.outcome == VaultNetworkRefreshOutcome::Failed);
+        }
+        Err(_) => {
+            result.refresh_failed = true;
+            result
+                .detail
+                .push_str("; network-refresh history could not be read");
+        }
     }
+    result
 }
 
 fn secret_blocker(reason: client::MaterializationBlocker, now_ms: u64) -> ServiceState {
@@ -225,13 +292,13 @@ fn secret_metadata(
             now_ms,
             "Local unsigned source; shared vault access is unverified",
         ),
-        Membership::In { seq, heard } => {
+        Membership::In { seq, .. } => {
             let mut result = if ready && entries > 0 {
                 state(
                     ServiceAvailability::Cached,
                     now_ms,
                     &format!(
-                        "{entries} authorized manifest entries; file delivery, login readiness and remote currency are not established by this read"
+                        "{entries} manifest entries; local materialization checks passed; provider sign-in and remote currency are not established by this read"
                     ),
                 )
             } else if ready {
@@ -248,9 +315,6 @@ fn secret_metadata(
                 )
             };
             result.revision = Some(format!("vault {seq}"));
-            result.last_success_ms = heard
-                .checked_mul(1000)
-                .filter(|at| *at > 0 && *at <= now_ms);
             result
         }
     }
@@ -273,6 +337,11 @@ fn accounts_until(
     now_ms: u64,
     deadline: std::time::Instant,
 ) -> ServiceState {
+    let selected = match crate::generation::selected(paths) {
+        Ok(paths) => paths,
+        Err(_) => return failed_observation(now_ms, "Commons writer recovery is pending"),
+    };
+    let paths = &selected;
     match commons::observe(paths) {
         Ok(commons::Observation::Unavailable(reason)) => {
             let availability = if matches!(reason, commons::Unavailable::Busy) {
@@ -522,10 +591,28 @@ mod tests {
             revision: Some("public revision".into()),
             detail: "retained metadata".into(),
             refresh_failed: true,
+            network_materialization: None,
+            http204_response: None,
+            network_refresh: None,
         };
         ServiceStates {
             accounts: service.clone(),
-            secrets: service,
+            secrets: ServiceState {
+                network_refresh: Some(VaultNetworkRefresh {
+                    completed_at_ms: wall.saturating_sub(3),
+                    outcome: VaultNetworkRefreshOutcome::Failed,
+                }),
+                network_materialization: Some(VaultNetworkMaterialization {
+                    source: VaultNetworkSource::PeerUrl,
+                    sequence: 66,
+                    sampled_at_ms: wall.saturating_sub(1),
+                }),
+                http204_response: Some(VaultHttp204Response {
+                    source: VaultNetworkSource::ConfiguredUrl,
+                    responded_at_ms: wall.saturating_sub(2),
+                }),
+                ..service
+            },
         }
     }
 
@@ -554,6 +641,20 @@ mod tests {
                 assert_eq!(service.revision, states.accounts.revision);
                 assert!(service.refresh_failed);
             }
+            assert_eq!(
+                expired.secrets.network_materialization,
+                states.secrets.network_materialization
+            );
+            assert_eq!(expired.accounts.network_materialization, None);
+            assert_eq!(
+                expired.secrets.http204_response,
+                states.secrets.http204_response
+            );
+            assert_eq!(expired.accounts.http204_response, None);
+            assert_eq!(
+                expired.secrets.network_refresh,
+                states.secrets.network_refresh
+            );
         }
         assert_eq!(
             publication
@@ -677,6 +778,8 @@ mod tests {
             assert_eq!(observation.availability, availability);
             assert_eq!(observation.observed_at_ms, 2000);
             assert_eq!(observation.last_success_ms, None);
+            assert_eq!(observation.network_materialization, None);
+            assert_eq!(observation.http204_response, None);
             assert_eq!(observation.revision, None);
             assert!(!observation.refresh_failed);
         }
@@ -850,7 +953,8 @@ mod tests {
         assert_eq!(missing.availability, ServiceAvailability::Unknown);
         let cached = secret_metadata(&membership, true, 11, 15_000);
         assert_eq!(cached.availability, ServiceAvailability::Cached);
-        assert_eq!(cached.last_success_ms, Some(12_000));
+        assert_eq!(cached.last_success_ms, None);
+        assert_eq!(cached.network_materialization, None);
         assert!(!cached.refresh_failed);
         assert_eq!(
             secret_metadata(&membership, true, 0, 15_000).availability,
@@ -860,6 +964,351 @@ mod tests {
             secret_metadata(&membership, true, 11, 10_000).last_success_ms,
             None
         );
+        let heartbeat = secret_metadata(
+            &Membership::In {
+                seq: 66,
+                heard: u64::MAX,
+            },
+            true,
+            11,
+            15_000,
+        );
+        assert_eq!(heartbeat.last_success_ms, None);
+        assert_eq!(heartbeat.network_materialization, None);
+    }
+
+    struct VaultFixture {
+        root: aterm_tempfile::TempDir,
+        server: Option<aterm_secrets::server::Running>,
+        listener: std::net::TcpListener,
+        paths: Paths,
+        url: String,
+    }
+
+    impl VaultFixture {
+        fn new() -> Self {
+            use aterm_secrets::{fsx, server};
+            let root = aterm_tempfile::tempdir().unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let held_listener = listener.try_clone().unwrap();
+            let running = server::start(
+                listener,
+                &server::Options {
+                    listen: address,
+                    store: root.path().join("store"),
+                    advertise: None,
+                    pins: Vec::new(),
+                    hold: Duration::from_millis(20),
+                    keep_awake: false,
+                },
+            )
+            .unwrap();
+            let fixture = Self {
+                paths: Paths::for_home(&root.path().join("member")),
+                url: format!("http://{address}/v1/adapter"),
+                root,
+                server: Some(running),
+                listener: held_listener,
+            };
+            let import = fixture.root.path().join("entries.secrets");
+            fsx::ensure_private_dir(&import).unwrap();
+            fsx::write_atomic(&import.join("token"), b"inert-vault-adapter-value\n", 0o600)
+                .unwrap();
+            client::create(&fixture.paths, &fixture.url, Some(&import), Some("adapter")).unwrap();
+            fixture
+        }
+    }
+
+    impl Drop for VaultFixture {
+        fn drop(&mut self) {
+            if let Some(server) = self.server.take() {
+                server.stop();
+            }
+        }
+    }
+
+    #[test]
+    fn failed_network_refresh_keeps_cache_and_receipts_and_recovery_clears_only_failure() {
+        use aterm_secrets::server;
+        use std::io::{Read as _, Write as _};
+        use std::os::fd::AsFd as _;
+
+        let mut fixture = VaultFixture::new();
+        let paths = &fixture.paths;
+        client::sync_reader_until(paths, Instant::now() + Duration::from_secs(60)).unwrap();
+        let before = secrets(paths, 100_000);
+        let signed_receipt = before.network_materialization.unwrap();
+        assert_eq!(before.availability, ServiceAvailability::Cached);
+        assert_eq!(
+            before.network_refresh.unwrap().outcome,
+            VaultNetworkRefreshOutcome::Succeeded
+        );
+        fixture.server.take().unwrap().stop();
+        // Keep the exact listening socket throughout failure and recovery: the source,
+        // configuration and identity stay unchanged, and no port rebind race is involved.
+        let listener = fixture.listener.try_clone().unwrap();
+        let failed = std::thread::spawn(move || {
+            // The stopped server left this shared descriptor nonblocking. It has no
+            // other acceptor now; wait for the request before its single accept.
+            aterm_uds::ready::until(
+                listener.as_fd(),
+                aterm_uds::ready::Interest::Read,
+                Instant::now() + Duration::from_secs(60),
+            )
+            .unwrap();
+            let (mut stream, _) = aterm_uds::kept_out(|| listener.accept()).unwrap();
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(60)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(60)))
+                .unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                head.push(byte[0]);
+                assert!(head.len() < 16 * 1024);
+            }
+            let body = b"private-error-body-inert";
+            write!(stream, "HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+            stream.write_all(body).unwrap();
+        });
+        assert!(client::sync_within(paths, Duration::from_secs(60)).is_err());
+        failed.join().unwrap();
+        let observed = secrets(paths, 110_000);
+        assert_eq!(observed.availability, ServiceAvailability::Cached);
+        assert!(observed.refresh_failed);
+        let refresh = observed.network_refresh.unwrap();
+        assert_eq!(refresh.outcome, VaultNetworkRefreshOutcome::Failed);
+        assert!(refresh.completed_at_ms > 0);
+        assert_eq!(observed.network_materialization, Some(signed_receipt));
+        assert_eq!(observed.http204_response, before.http204_response);
+        assert_eq!(observed.last_success_ms, None);
+        let state_path = paths.dir.join("state.toml");
+        let state = std::fs::read(&state_path).unwrap();
+        let repeated = secrets(paths, 120_000);
+        assert_eq!(repeated.network_refresh, Some(refresh));
+        assert_eq!(
+            std::fs::read(&state_path).unwrap(),
+            state,
+            "observation is read-only"
+        );
+        assert!(!format!("{observed:?}").contains("private-error-body-inert"));
+        assert!(
+            !String::from_utf8(state)
+                .unwrap()
+                .contains("private-error-body-inert")
+        );
+
+        // Materialization has completed before this reader runs. A writer can win
+        // precisely the later history-read race without making the usable cache vanish.
+        let retained_bytes = std::fs::read(&state_path).unwrap();
+        for discard_busy in [false, true] {
+            let raced = secrets_reading_refresh(paths, 120_001, |paths, config| {
+                let _writer = aterm_uds::private_file::PrivateLock::take(
+                    &paths.dir,
+                    ".lock",
+                    Duration::from_secs(60),
+                    "fixture vault writer is busy",
+                )
+                .unwrap();
+                let actual = client::observe_network_refresh(paths, config);
+                assert!(
+                    actual.is_err(),
+                    "the actual history read meets a held OS lock"
+                );
+                if discard_busy {
+                    // Executable former policy: collapse that actual busy read into absence.
+                    actual.or(Ok(None))
+                } else {
+                    actual
+                }
+            });
+            assert_eq!(raced.availability, ServiceAvailability::Cached);
+            assert_eq!(raced.network_materialization, Some(signed_receipt));
+            assert_eq!(raced.network_refresh, None);
+            assert_eq!(raced.refresh_failed, !discard_busy);
+            assert_eq!(
+                raced
+                    .detail
+                    .contains("network-refresh history could not be read"),
+                !discard_busy
+            );
+            assert_eq!(std::fs::read(&state_path).unwrap(), retained_bytes);
+        }
+        let readable = secrets(paths, 120_002);
+        assert_eq!(readable.availability, ServiceAvailability::Cached);
+        assert!(readable.refresh_failed);
+        assert_eq!(readable.network_refresh, Some(refresh));
+        assert_eq!(std::fs::read(&state_path).unwrap(), retained_bytes);
+
+        let address = fixture.listener.local_addr().unwrap();
+        fixture.server = Some(
+            server::start(
+                fixture.listener.try_clone().unwrap(),
+                &server::Options {
+                    listen: address,
+                    store: fixture.root.path().join("store"),
+                    advertise: None,
+                    pins: Vec::new(),
+                    hold: Duration::from_millis(20),
+                    keep_awake: false,
+                },
+            )
+            .unwrap(),
+        );
+        // An actual 204 completes this pass without minting a signed-body receipt.
+        client::sync_within(paths, Duration::from_secs(60)).unwrap();
+        let recovered = secrets(paths, 130_000);
+        assert_eq!(recovered.availability, ServiceAvailability::Cached);
+        assert!(!recovered.refresh_failed);
+        assert_eq!(
+            recovered.network_refresh.unwrap().outcome,
+            VaultNetworkRefreshOutcome::Succeeded
+        );
+        assert_eq!(recovered.network_materialization, Some(signed_receipt));
+        assert_eq!(recovered.last_success_ms, None);
+        assert!(recovered.http204_response.is_some());
+        assert_eq!(before.network_materialization, Some(signed_receipt));
+    }
+
+    #[test]
+    fn a_guarded_vault_receipt_keeps_its_original_time_and_excludes_changed_local_inputs() {
+        use aterm_secrets::{age::Identity, fsx};
+        let fixture = VaultFixture::new();
+        let root = &fixture.root;
+        let paths = fixture.paths.clone();
+        let url = fixture.url.clone();
+        client::sync_reader_until(&paths, Instant::now() + Duration::from_secs(60)).unwrap();
+        let first = secrets(&paths, aterm_time::unix_millis().unwrap());
+        assert_eq!(first.availability, ServiceAvailability::Cached);
+        assert_eq!(first.last_success_ms, None);
+        let receipt = first.network_materialization.unwrap();
+        assert_eq!(receipt.source, VaultNetworkSource::ConfiguredUrl);
+        assert!(receipt.sampled_at_ms > 0);
+        assert_eq!(first.revision, Some(format!("vault {}", receipt.sequence)));
+        let later = secrets(&paths, first.observed_at_ms + 20_000);
+        assert_eq!(later.network_materialization, Some(receipt));
+        assert_eq!(later.last_success_ms, None);
+        let recipient = client::read_machine_identity(&paths)
+            .unwrap()
+            .unwrap()
+            .recipient()
+            .to_bech32();
+        let shown = format!("{later:?}");
+        for private in [
+            url.as_str(),
+            paths.home.to_str().unwrap(),
+            recipient.as_str(),
+            "inert-vault-adapter-value",
+        ] {
+            assert!(!shown.contains(private));
+        }
+
+        let source_path = paths.dir.join("source.toml");
+        let source = std::fs::read_to_string(&source_path).unwrap();
+        fsx::write_atomic(
+            &source_path,
+            source.replace(&url, &format!("{url}-changed")).as_bytes(),
+            0o600,
+        )
+        .unwrap();
+        assert_eq!(
+            secrets(&paths, first.observed_at_ms).network_materialization,
+            None
+        );
+        fsx::write_atomic(&source_path, source.as_bytes(), 0o600).unwrap();
+        assert_eq!(
+            secrets(&paths, first.observed_at_ms).network_materialization,
+            Some(receipt)
+        );
+        let mut changed: aterm_toml::Table = aterm_toml::from_str(&source).unwrap();
+        changed.insert(
+            "host".into(),
+            aterm_toml::Value::String("other-host".into()),
+        );
+        fsx::write_atomic(
+            &source_path,
+            aterm_toml::to_string(&changed).unwrap().as_bytes(),
+            0o600,
+        )
+        .unwrap();
+        let changed_host = secrets(&paths, first.observed_at_ms);
+        assert_eq!(changed_host.availability, ServiceAvailability::Cached);
+        assert_eq!(changed_host.network_materialization, None);
+        fsx::write_atomic(&source_path, source.as_bytes(), 0o600).unwrap();
+        assert_eq!(
+            secrets(&paths, first.observed_at_ms).network_materialization,
+            Some(receipt)
+        );
+
+        let identity_path = paths.dir.join("identity");
+        let identity = std::fs::read(&identity_path).unwrap();
+        let replacement = Identity::from_secret_bytes([117; 32]).to_bech32();
+        fsx::write_atomic(&identity_path, replacement.as_slice(), 0o600).unwrap();
+        assert_eq!(
+            secrets(&paths, first.observed_at_ms).network_materialization,
+            None
+        );
+        fsx::write_atomic(&identity_path, &identity, 0o600).unwrap();
+        assert_eq!(
+            secrets(&paths, first.observed_at_ms).network_materialization,
+            Some(receipt)
+        );
+
+        let state_path = paths.dir.join("state.toml");
+        let state = std::fs::read_to_string(&state_path).unwrap();
+        for (key, value) in [
+            (
+                "seq",
+                aterm_toml::Value::Integer(i64::try_from(receipt.sequence + 1).unwrap()),
+            ),
+            ("digest", aterm_toml::Value::String("00".repeat(32))),
+            ("records_digest", aterm_toml::Value::String("00".repeat(32))),
+        ] {
+            let mut changed: aterm_toml::Table = aterm_toml::from_str(&state).unwrap();
+            changed.insert(key.into(), value);
+            fsx::write_atomic(
+                &state_path,
+                aterm_toml::to_string(&changed).unwrap().as_bytes(),
+                0o600,
+            )
+            .unwrap();
+            let changed_version = secrets(&paths, first.observed_at_ms);
+            assert_eq!(changed_version.network_materialization, None, "{key}");
+            if key == "records_digest" {
+                assert_eq!(changed_version.availability, ServiceAvailability::Cached);
+            }
+            fsx::write_atomic(&state_path, state.as_bytes(), 0o600).unwrap();
+            assert_eq!(
+                secrets(&paths, first.observed_at_ms).network_materialization,
+                Some(receipt)
+            );
+        }
+
+        let local_source = root.path().join("local.vault");
+        let cached = std::fs::read(paths.dir.join("vault")).unwrap();
+        fsx::write_atomic(&local_source, &cached, 0o600).unwrap();
+        let mut configured: aterm_toml::Table = aterm_toml::from_str(&source).unwrap();
+        configured.remove("url");
+        configured.insert(
+            "path".into(),
+            aterm_toml::Value::String(local_source.to_str().unwrap().into()),
+        );
+        fsx::write_atomic(
+            &source_path,
+            aterm_toml::to_string(&configured).unwrap().as_bytes(),
+            0o600,
+        )
+        .unwrap();
+        client::sync_reader_until(&paths, Instant::now() + Duration::from_secs(60)).unwrap();
+        let local = secrets(&paths, first.observed_at_ms + 30_000);
+        assert_eq!(local.availability, ServiceAvailability::Cached);
+        assert_eq!(local.network_materialization, None);
+        assert_eq!(local.last_success_ms, None);
     }
 
     #[test]
@@ -876,6 +1325,105 @@ mod tests {
                 ServiceAvailability::Cached | ServiceAvailability::Current
             ));
             assert_eq!(result.last_success_ms, None);
+        }
+    }
+
+    #[test]
+    fn an_actual_204_stays_historical_when_local_materialization_is_unavailable() {
+        use aterm_secrets::{age::Identity, fsx, materialize};
+
+        let fixture = VaultFixture::new();
+        let paths = &fixture.paths;
+        let now_ms = aterm_time::unix_millis().unwrap();
+        let before = secrets(paths, now_ms);
+        assert_eq!(before.availability, ServiceAvailability::Cached);
+        assert_eq!(before.network_materialization, None);
+        assert_eq!(before.http204_response, None);
+        client::sync_within(paths, Duration::from_secs(60)).unwrap();
+        let first = secrets(paths, now_ms + 1);
+        let response = first
+            .http204_response
+            .expect("actual server's 204 retained");
+        assert_eq!(response.source, VaultNetworkSource::ConfiguredUrl);
+        assert!(response.responded_at_ms > 0);
+        assert_eq!(first.availability, ServiceAvailability::Cached);
+        assert_eq!(first.network_materialization, None);
+        assert_eq!(first.last_success_ms, None);
+        assert_eq!(
+            secrets(paths, now_ms + 20_000).http204_response,
+            Some(response)
+        );
+
+        let state_path = paths.dir.join("state.toml");
+        let state = std::fs::read_to_string(&state_path).unwrap();
+        for membership in ["pending", "revoked"] {
+            let mut changed: aterm_toml::Table = aterm_toml::from_str(&state).unwrap();
+            changed.insert(
+                "membership".into(),
+                aterm_toml::Value::String(membership.into()),
+            );
+            fsx::write_atomic(
+                &state_path,
+                aterm_toml::to_string(&changed).unwrap().as_bytes(),
+                0o600,
+            )
+            .unwrap();
+            let unavailable = secrets(paths, now_ms + 20_000);
+            assert_eq!(unavailable.availability, ServiceAvailability::Unavailable);
+            assert_eq!(unavailable.http204_response, Some(response));
+            assert_eq!(unavailable.network_materialization, None);
+            assert_eq!(unavailable.last_success_ms, None);
+        }
+        fsx::write_atomic(&state_path, state.as_bytes(), 0o600).unwrap();
+        let token_path = materialize::target_path(&paths.home, "token").unwrap();
+        let token = std::fs::read(&token_path).unwrap();
+        fsx::write_atomic(&token_path, b"locally-changed", 0o600).unwrap();
+        let incomplete = secrets(paths, now_ms + 20_000);
+        assert_eq!(incomplete.availability, ServiceAvailability::Unknown);
+        assert_eq!(incomplete.http204_response, Some(response));
+        assert_eq!(incomplete.network_materialization, None);
+        assert_eq!(incomplete.last_success_ms, None);
+        fsx::write_atomic(&token_path, &token, 0o600).unwrap();
+
+        let source_path = paths.dir.join("source.toml");
+        let source = std::fs::read_to_string(&source_path).unwrap();
+        let mut changed: aterm_toml::Table = aterm_toml::from_str(&source).unwrap();
+        changed.insert(
+            "host".into(),
+            aterm_toml::Value::String("other-host".into()),
+        );
+        fsx::write_atomic(
+            &source_path,
+            aterm_toml::to_string(&changed).unwrap().as_bytes(),
+            0o600,
+        )
+        .unwrap();
+        let changed_host = secrets(paths, now_ms + 20_000);
+        assert_eq!(changed_host.availability, ServiceAvailability::Cached);
+        assert_eq!(changed_host.http204_response, None);
+        fsx::write_atomic(&source_path, source.as_bytes(), 0o600).unwrap();
+        let identity_path = paths.dir.join("identity");
+        let identity = std::fs::read(&identity_path).unwrap();
+        let replacement = Identity::from_secret_bytes([117; 32]).to_bech32();
+        fsx::write_atomic(&identity_path, replacement.as_slice(), 0o600).unwrap();
+        assert_eq!(secrets(paths, now_ms + 20_000).http204_response, None);
+        fsx::write_atomic(&identity_path, &identity, 0o600).unwrap();
+        let restored = secrets(paths, now_ms + 20_000);
+        assert_eq!(restored.http204_response, Some(response));
+        assert_eq!(restored.availability, ServiceAvailability::Cached);
+        let recipient = client::read_machine_identity(paths)
+            .unwrap()
+            .unwrap()
+            .recipient()
+            .to_bech32();
+        let shown = format!("{restored:?}");
+        for private in [
+            fixture.url.as_str(),
+            paths.home.to_str().unwrap(),
+            recipient.as_str(),
+            "inert-vault-adapter-value",
+        ] {
+            assert!(!shown.contains(private));
         }
     }
 
@@ -953,6 +1501,8 @@ mod tests {
         let observation = accounts(paths, &config, 2000);
         assert_eq!(observation.availability, ServiceAvailability::Cached);
         assert_eq!(observation.last_success_ms, Some(2000));
+        assert_eq!(observation.network_materialization, None);
+        assert_eq!(observation.http204_response, None);
         assert!(!observation.detail.contains("private"));
         assert_eq!(proposals.snapshot().unwrap().operations.len(), before);
     }

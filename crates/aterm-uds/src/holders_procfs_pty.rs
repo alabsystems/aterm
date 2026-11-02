@@ -1,0 +1,69 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! Linux's pseudo-terminal masters, answering [`crate::holders::pty_master_held`] from the
+//! terminal alone. Closing a master hangs up its terminal (`pty_close` calls `tty_vhangup` on
+//! the terminal end, `drivers/tty/pty.c`), and the hangup takes the terminal from every process
+//! of its session (`tty_signal_session_leader` clears each one's `signal->tty`), as the session
+//! leader's exit does (`disassociate_ctty`); a terminal whose master closed cannot be taken
+//! again (a new open fails, `pty_open`'s `TTY_OTHER_CLOSED`, and the hangup left every open
+//! descriptor of it `hung_up_tty_fops`). So a live process whose `tty_nr` still
+//! names a devpts terminal has that terminal's master open somewhere, whoever holds it: another
+//! user's process (`sudo` with `use_pty`, `su` from another user's terminal), one in another pid
+//! namespace (`docker exec -t`), or none at all while a socket carries the master in flight. No
+//! scan of this uid's descriptor tables sees all of those, so none is read.
+
+/// The major number of every devpts terminal (`UNIX98_PTY_SLAVE_MAJOR`); its minor, up to 20
+/// bits, is the terminal's index.
+const PTS_MAJOR: u32 = 136;
+
+/// Whether `tty_nr` (`/proc/<pid>/stat`'s encoding, the kernel's 32-bit `new_encode_dev`)
+/// numbers a devpts terminal. A number past 32 bits is no `tty_nr`, so a 64-bit `dev_t` passed
+/// unmasked is none.
+fn is_devpts(tty_nr: u64) -> bool {
+    u32::try_from(tty_nr).is_ok_and(|tty_nr| (tty_nr >> 8) & 0xfff == PTS_MAJOR)
+}
+
+/// Whether a live process holds the master of the terminal `tty_nr` numbers, a live process's
+/// controlling terminal: `Some(true)` for a devpts terminal (this module's head says why), never
+/// `Some(false)`, and `None` for a terminal of another driver (a virtual console, a serial line).
+pub(in crate::holders) fn pty_master_held_of(tty_nr: u64) -> Option<bool> {
+    is_devpts(tty_nr).then_some(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pty_master_held_of;
+
+    /// `/dev/pts/3` as `tty_nr` numbers it.
+    const PTS_3: u64 = (136 << 8) | 3;
+
+    /// A live process's devpts terminal reads held whoever holds its master, a holder no scan of
+    /// this uid's tables would find included, since the kernel takes a terminal from its session
+    /// once its master closes; a terminal of another driver, or a number no `tty_nr` is, reads
+    /// unknown. NEGATIVE CONTROL: the scan this replaced read `Some(false)` for `/dev/pts/3`
+    /// once no table of this uid held a `ptmx` printing index 3, which is what it read with the
+    /// master held by root's `sudo`, another user's terminal or a container's shim.
+    #[test]
+    fn a_live_processs_pty_reads_held_whoever_holds_its_master() {
+        assert_eq!(pty_master_held_of(PTS_3), Some(true), "/dev/pts/3");
+        assert_eq!(
+            pty_master_held_of(34817),
+            Some(true),
+            "/dev/pts/1, as a stat line reads it"
+        );
+        assert_eq!(
+            pty_master_held_of(0x0120_8834),
+            Some(true),
+            "/dev/pts/4660, its minor split across the encoding"
+        );
+        assert_eq!(pty_master_held_of((4 << 8) | 1), None, "/dev/tty1");
+        assert_eq!(pty_master_held_of((4 << 8) | 64), None, "/dev/ttyS0");
+        assert_eq!(pty_master_held_of(0), None, "no terminal");
+        assert_eq!(
+            pty_master_held_of((0x1000 << 32) | PTS_3),
+            None,
+            "a 64-bit dev_t whose major's low 12 bits are 136"
+        );
+    }
+}

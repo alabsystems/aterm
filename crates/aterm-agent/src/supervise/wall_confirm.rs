@@ -588,6 +588,25 @@ fn shows(said: &str, text: &str) -> bool {
             .eq(want.iter().copied())
 }
 
+/// WHETHER A SCREEN'S OUTAGE WALL OF `kind` STANDS OVER A TURN THE API NEVER ANSWERED (v6
+/// §14.17.5, slice 12a's G1): an overload, a server error or a lost connection
+/// ([`super::super::policy::turn_end::outage_named`]; a reply cut off is an answer begun) over a
+/// transcript that ends on the prompt or a tool's result, no reply and no notice after it. The
+/// program drew the error and wrote none; the model said nothing, so the turn end is no one's but
+/// the outage's ([`Session::judge_wall`]).
+#[must_use]
+pub(crate) fn unanswered(kind: WallKind, end: &TranscriptEnd) -> bool {
+    let cut = matches!(
+        kind,
+        WallKind::ApiError {
+            cause: ApiCause::CutOff,
+            ..
+        }
+    );
+    !cut && super::super::policy::turn_end::outage_named(kind).is_some()
+        && matches!(end.last, Entry::Input | Entry::ToolResult)
+}
+
 /// Returns whether `end` confirms a screen-detected wall of kind `screen`.
 #[must_use]
 pub(crate) fn confirms(screen: WallKind, end: &TranscriptEnd) -> bool {
@@ -840,6 +859,15 @@ impl<C: Ctl> Session<'_, C> {
         apply_verdict(reading, screen, refused, found, named);
     }
 
+    /// Whether the wall check at point `seq` refused the screen's wall (no transcript confirmed
+    /// it): the point reads no wall, yet its words may still be the outage's, so its turn
+    /// witnesses nothing (v6 §14.17.5.4, `Session::answered_at`).
+    pub(super) fn wall_refused_at(&self, seq: u64) -> bool {
+        self.wall_verdict
+            .as_ref()
+            .is_some_and(|v| v.seq == seq && v.refused.is_some())
+    }
+
     pub(super) fn wall_as_decided(&self, reading: &mut aterm_phase::Reading, screen: &Screen) {
         if let Some(v) = self.wall_verdict.as_ref().filter(|v| v.seq == screen.seq) {
             apply_verdict(
@@ -944,6 +972,16 @@ impl<C: Ctl> Session<'_, C> {
                 }
                 if untold {
                     return unsaid(self);
+                }
+                // NO MODEL REPLY SINCE THE PROMPT (v6 §14.17.5, slice 12a's G1): the transcript
+                // ends on the prompt or a tool's result, so the API never answered and the
+                // screen's error is the program's, not the model's prose (a spoof's transcript
+                // ends on its reply): the outage's wait, never a plain point Cruise or Land types
+                // into. Nothing in the transcript confirms the wall, so the screen alone must:
+                // words read under a tool's call are that tool's output, never the outage's.
+                if unanswered(w.kind, &end) && !older && !self.under_call_on_screen(w, screen) {
+                    self.wall_conversation = Some((screen.seq, conversation_of(&tail)));
+                    return Ok(None);
                 }
                 if older {
                     "the transcript's notice was written before the turn it would answer"

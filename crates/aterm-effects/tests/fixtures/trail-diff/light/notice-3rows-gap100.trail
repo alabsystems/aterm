@@ -5,6 +5,7 @@
 # paper arm: a 3-row job notice 100 ms after the last key.
 
 foreach-scheme light {
+  scale 2
   grid 24 80
   style rainbow kitty
   hz 60

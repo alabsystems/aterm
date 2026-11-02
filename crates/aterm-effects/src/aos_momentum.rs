@@ -52,6 +52,10 @@ pub mod fidelity;
 #[cfg(test)]
 mod fidelity_tests;
 #[cfg(test)]
+mod hold_conformance_tests;
+#[cfg(test)]
+mod hold_tests;
+#[cfg(test)]
 mod host_tests;
 pub mod lane;
 #[cfg(test)]
@@ -302,6 +306,8 @@ pub struct ConfigRecord {
     pub theme_fg: u32,
     pub theme_bg: u32,
     pub block: bool,
+    /// Written as the ink byte's [`INK_BAR`] bit.
+    pub bar: bool,
     pub glyph_span: Option<(i32, i32)>,
     pub light_vivid: bool,
     pub chosen_hue: bool,
@@ -314,35 +320,40 @@ const INK_VIVID: u8 = 1;
 const INK_CHOSEN_HUE: u8 = 2;
 /// [`ConfigRecord::ink_byte`]'s bit for `chosen_base`.
 const INK_CHOSEN_BASE: u8 = 4;
+/// [`ConfigRecord::ink_byte`]'s bit for `bar` (where the halo sits, not its ink, but the one
+/// byte a recording made before writes `0` in, so it reads the same).
+const INK_BAR: u8 = 8;
 
 impl ConfigRecord {
-    /// The one byte a Tick input writes for the glow's ink: `light_vivid`, `chosen_hue` and
-    /// `chosen_base` as bits 0, 1 and 2. A glow that reads no chosen colour writes `0` or `1`,
-    /// the byte `light_vivid` was written as alone, so every recording made before reads the
-    /// same and its digests and pins stand.
+    /// The one byte a Tick input writes for the glow's ink and seat: `light_vivid`,
+    /// `chosen_hue`, `chosen_base` and `bar` as bits 0, 1, 2 and 3. A glow that reads no chosen
+    /// colour round a block writes `0` or `1`, the byte `light_vivid` was written as alone, so
+    /// every recording made before reads the same and its digests and pins stand.
     #[inline]
     #[must_use]
     pub const fn ink_byte(&self) -> u8 {
         (if self.light_vivid { INK_VIVID } else { 0 })
             | (if self.chosen_hue { INK_CHOSEN_HUE } else { 0 })
             | (if self.chosen_base { INK_CHOSEN_BASE } else { 0 })
+            | (if self.bar { INK_BAR } else { 0 })
     }
 
-    /// The ink byte's three bits, `(light_vivid, chosen_hue, chosen_base)`; a byte with any
-    /// other bit set is `BadTag` for `field`.
+    /// The ink byte's four bits, `(light_vivid, chosen_hue, chosen_base, bar)`; a byte with
+    /// any other bit set is `BadTag` for `field`.
     #[inline]
     fn read_ink_byte(
         d: &mut Dec<'_>,
         field: &'static str,
-    ) -> Result<(bool, bool, bool), WireFault> {
+    ) -> Result<(bool, bool, bool, bool), WireFault> {
         let tag = d.u8(field)?;
-        if tag & !(INK_VIVID | INK_CHOSEN_HUE | INK_CHOSEN_BASE) != 0 {
+        if tag & !(INK_VIVID | INK_CHOSEN_HUE | INK_CHOSEN_BASE | INK_BAR) != 0 {
             return Err(WireFault::BadTag { field, tag });
         }
         Ok((
             tag & INK_VIVID != 0,
             tag & INK_CHOSEN_HUE != 0,
             tag & INK_CHOSEN_BASE != 0,
+            tag & INK_BAR != 0,
         ))
     }
 }
@@ -370,6 +381,7 @@ impl ConfigRecord {
             theme_fg: c.theme_fg,
             theme_bg: c.theme_bg,
             block: c.block,
+            bar: c.bar,
             glyph_span: c.glyph_span,
             light_vivid: c.light_vivid,
             chosen_hue: c.chosen_hue,
@@ -393,6 +405,7 @@ impl ConfigRecord {
             theme_fg: self.theme_fg,
             theme_bg: self.theme_bg,
             block: self.block,
+            bar: self.bar,
             glyph_span: self.glyph_span,
             light_vivid: self.light_vivid,
             chosen_hue: self.chosen_hue,
@@ -825,6 +838,7 @@ impl Schema for MomentumSchema {
                     theme_fg: d.u32("cfg.theme_fg")?,
                     theme_bg: d.u32("cfg.theme_bg")?,
                     block: d.bool("cfg.block")?,
+                    bar: false,
                     glyph_span: d.opt("cfg.glyph_span", |d| {
                         Ok((d.i32("cfg.glyph_span")?, d.i32("cfg.glyph_span")?))
                     })?,
@@ -832,7 +846,7 @@ impl Schema for MomentumSchema {
                     chosen_hue: false,
                     chosen_base: false,
                 };
-                (cfg.light_vivid, cfg.chosen_hue, cfg.chosen_base) =
+                (cfg.light_vivid, cfg.chosen_hue, cfg.chosen_base, cfg.bar) =
                     ConfigRecord::read_ink_byte(d, "cfg.ink")?;
                 Ok(MomentumEvent::Tick { cur, at, geom, cfg })
             }
@@ -1161,7 +1175,7 @@ impl Sched {
         match self {
             Sched::Prebuilt(code) => code.is_active(s),
             #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
-            Sched::Plan(plan) => plan.is_active(&PlanView::of(&s.glow)),
+            Sched::Plan(plan) => plan.is_glow_active(&s.glow),
         }
     }
 
@@ -1172,7 +1186,7 @@ impl Sched {
         match self {
             Sched::Prebuilt(code) => code.settling(s),
             #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
-            Sched::Plan(plan) => plan.settling(&PlanView::of(&s.glow)),
+            Sched::Plan(plan) => plan.is_glow_settling(&s.glow),
         }
     }
 
@@ -1721,8 +1735,8 @@ impl Held {
 
 /// Whether the glow is at rest.
 #[inline]
-fn at_rest(s: &MomentumState, epoch: Instant) -> bool {
-    s.glow.snapshot(epoch) == MomentumGlow::default().snapshot(epoch)
+const fn at_rest(s: &MomentumState) -> bool {
+    s.glow.is_at_rest()
 }
 
 /// What one tick presents: its cursor cell, geometry and config.
@@ -1757,6 +1771,9 @@ struct Hosted {
     /// The plan-only presentation guard.
     #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
     guard: Guard,
+    /// While a typed key waits for its program's echo ([`MomentumHost::aos_hold`]): the instant
+    /// the host wakes by. No input reaches the boundary meanwhile.
+    awaiting_echo: Option<Instant>,
 }
 
 #[inline]
@@ -1773,6 +1790,27 @@ fn refill(v: &mut Vec<GlowQuad>, from: &[GlowQuad]) {
         v.clear();
     }
     v.extend_from_slice(from);
+}
+
+/// What a tick that delivers nothing draws: `held`'s frame and quads where it is still shown at
+/// (`cur`, `geom`, `cfg`), else nothing.
+#[inline]
+fn held_frame(
+    held: Option<&Held>,
+    cur: Option<(u16, u16)>,
+    geom: &Geom,
+    cfg: &MomentumGlowConfig,
+    out: &mut Vec<GlowQuad>,
+    under: &mut Vec<GlowQuad>,
+) -> MomentumGlowFrame {
+    match held {
+        Some(held) if held.shows(cur, geom, cfg) => {
+            out.extend_from_slice(&held.out);
+            under.extend_from_slice(&held.under);
+            held.frame
+        }
+        _ => MomentumGlowFrame::default(),
+    }
 }
 
 /// The hosted horizon in signed nanoseconds.
@@ -1800,6 +1838,32 @@ enum HostMode {
 /// Why the host stopped recording by itself: live time passed the hosted horizon.
 pub const PAST_HORIZON: &str = "past the hosted horizon";
 
+/// Why a key stopped the recording: a program reads it raw (or the tty's mode is unreadable),
+/// no prompt of aterm's own integrated shell is open for it, and its own echo was not proven in
+/// place, so it may be a password. The host stops for it by itself when a key or a reset arrives
+/// while a key is held.
+pub const RAW_KEY: &str = "raw key";
+
+#[cfg(test)]
+thread_local! {
+    /// Whether a test lets a held glow's ticks reach the boundary, the host binding's mutant.
+    pub(crate) static HELD_TICK_DELIVERS: core::cell::Cell<bool> =
+        const { core::cell::Cell::new(false) };
+}
+
+/// Whether a held glow's tick is delivered: never, but under a test's mutant.
+#[inline]
+fn held_tick_delivers() -> bool {
+    #[cfg(test)]
+    {
+        HELD_TICK_DELIVERS.with(core::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
 /// The momentum glow as the host holds it.
 pub struct MomentumHost {
     mode: HostMode,
@@ -1807,6 +1871,9 @@ pub struct MomentumHost {
     left: Vec<Segment>,
     /// Why the host last stopped recording by itself, until [`Self::aos_take_detached`] takes it.
     detached: Option<&'static str>,
+    /// Whether the live glow took a key no recording logged since it last started from rest:
+    /// the next new recording starts it from rest, so its checkpoint holds no such key's instant.
+    tainted: bool,
 }
 
 impl Default for MomentumHost {
@@ -1816,6 +1883,7 @@ impl Default for MomentumHost {
             mode: HostMode::Direct(MomentumGlow::default()),
             left: Vec::new(),
             detached: None,
+            tainted: false,
         }
     }
 }
@@ -2065,10 +2133,10 @@ impl Hosted {
             match self.boundary.last_queued() {
                 Some(MomentumEvent::Reset) => true,
                 Some(_) => false,
-                None => at_rest(self.state(), self.epoch()),
+                None => at_rest(self.state()),
             }
         } else {
-            at_rest(self.state(), self.epoch())
+            at_rest(self.state())
         }
     }
 
@@ -2119,10 +2187,22 @@ impl MomentumHost {
         self.left.drain(..over);
     }
 
-    /// One printable key (`MomentumGlow::on_key`).
+    /// One printable key (`MomentumGlow::on_key`). A key while a key is held stops the recording
+    /// first ([`RAW_KEY`]): only [`Self::aos_release`] logs a held run.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AosKeyHold",
+            action = "Key",
+            project = "aterm_effects::aos_momentum::hold_conformance_tests::Real::project"
+        )
+    )]
     #[inline]
     pub fn on_key(&mut self, now: Instant, tau_s: f32) {
         self.expire_past_horizon(now);
+        if self.aos_holding() {
+            self.detach_by_itself(RAW_KEY);
+        }
         match &mut self.mode {
             HostMode::Direct(g) => g.on_key(now, tau_s),
             HostMode::Hosted(h) => {
@@ -2136,9 +2216,13 @@ impl MomentumHost {
         }
     }
 
-    /// Back to rest (`MomentumGlow::reset`).
+    /// Back to rest (`MomentumGlow::reset`). A reset while a key is held stops the recording first
+    /// ([`RAW_KEY`]).
     #[inline]
     pub fn reset(&mut self) {
+        if self.aos_holding() {
+            self.detach_by_itself(RAW_KEY);
+        }
         match &mut self.mode {
             HostMode::Direct(g) => g.reset(),
             HostMode::Hosted(h) => {
@@ -2161,7 +2245,16 @@ impl MomentumHost {
         self.detached.take()
     }
 
-    /// One frame (`MomentumGlow::tick`).
+    /// One frame (`MomentumGlow::tick`). While a key is held nothing is delivered: the frame is the
+    /// last delivered tick's where it is still shown, as while paused.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AosKeyHold",
+            action = "Tick",
+            project = "aterm_effects::aos_momentum::hold_conformance_tests::Real::project"
+        )
+    )]
     #[inline]
     pub fn tick(
         &mut self,
@@ -2175,6 +2268,9 @@ impl MomentumHost {
         self.expire_past_horizon(now);
         match &mut self.mode {
             HostMode::Direct(g) => g.tick(cur, now, geom, cfg, out, under),
+            HostMode::Hosted(h) if h.awaiting_echo.is_some() && !held_tick_delivers() => {
+                held_frame(h.held.as_ref(), cur, &geom, cfg, out, under)
+            }
             HostMode::Hosted(h) => {
                 let (at, moved) = h.logical(now);
                 let ev = MomentumEvent::Tick {
@@ -2186,36 +2282,35 @@ impl MomentumHost {
                 match h.deliver(&ev, moved, out, under) {
                     Some(Applied::Frame(frame)) => frame,
                     Some(_) => MomentumGlowFrame::default(),
-                    None => match &h.held {
-                        Some(held) if held.shows(cur, &geom, cfg) => {
-                            out.extend_from_slice(&held.out);
-                            under.extend_from_slice(&held.under);
-                            held.frame
-                        }
-                        _ => MomentumGlowFrame::default(),
-                    },
+                    None => held_frame(h.held.as_ref(), cur, &geom, cfg, out, under),
                 }
             }
         }
     }
 
-    /// Frame cadence (`MomentumGlow::is_active`, or a plan's under its presentation guard); `false` while paused.
+    /// Frame cadence (`MomentumGlow::is_active`, or a plan's under its presentation guard); `false` while paused or while a key is held.
     #[inline]
     #[must_use]
     pub fn is_active(&self) -> bool {
         match &self.mode {
             HostMode::Direct(g) => g.is_active(),
-            HostMode::Hosted(h) => !h.boundary.is_paused() && h.is_active(),
+            HostMode::Hosted(h) => {
+                !h.boundary.is_paused() && h.awaiting_echo.is_none() && h.is_active()
+            }
         }
     }
 
-    /// Hot with no frame-to-frame change (`MomentumGlow::settling`); `false` while paused.
+    /// Hot with no frame-to-frame change (`MomentumGlow::settling`); `false` while paused, and
+    /// `true` while a key is held, so the lane wakes by the hold's deadline
+    /// ([`Self::next_change_deadline`]).
     #[inline]
     #[must_use]
     pub fn settling(&self) -> bool {
         match &self.mode {
             HostMode::Direct(g) => g.settling(),
-            HostMode::Hosted(h) => !h.boundary.is_paused() && h.settling(),
+            HostMode::Hosted(h) => {
+                !h.boundary.is_paused() && (h.awaiting_echo.is_some() || h.settling())
+            }
         }
     }
 
@@ -2239,7 +2334,9 @@ impl MomentumHost {
         }
     }
 
-    /// The wake the live code names (`MomentumGlow::next_change_deadline`).
+    /// The wake the live code names (`MomentumGlow::next_change_deadline`); while a key is held,
+    /// the hold's deadline but never sooner than a frame from `now`, asked of no code and recorded
+    /// nowhere.
     #[inline]
     pub fn next_change_deadline(
         &mut self,
@@ -2249,8 +2346,93 @@ impl MomentumHost {
         self.expire_past_horizon(now);
         match &mut self.mode {
             HostMode::Direct(g) => g.next_change_deadline(now, frame_interval),
-            HostMode::Hosted(h) => h.next_change_deadline(now, frame_interval),
+            HostMode::Hosted(h) => match h.awaiting_echo {
+                Some(deadline) => Some(match now.checked_add(frame_interval) {
+                    Some(frame) => deadline.max(frame),
+                    None => deadline,
+                }),
+                None => h.next_change_deadline(now, frame_interval),
+            },
         }
+    }
+
+    /// Holds the recording while a typed key waits for its program's echo: until
+    /// [`Self::aos_release`] or a detach no input reaches the boundary (a tick draws the last
+    /// frame, [`Self::next_change_deadline`] names `deadline`), and a key or a reset stops the
+    /// recording ([`RAW_KEY`]). Unattached or paused it does nothing.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AosKeyHold",
+            action = "Hold",
+            project = "aterm_effects::aos_momentum::hold_conformance_tests::Real::project"
+        )
+    )]
+    #[inline]
+    pub fn aos_hold(&mut self, deadline: Instant) {
+        if let HostMode::Hosted(h) = &mut self.mode
+            && !h.boundary.is_paused()
+        {
+            h.awaiting_echo = Some(deadline);
+        }
+    }
+
+    /// Ends a hold: the `keys` oldest held keys, their echo proven, are logged as `Key` inputs at
+    /// `now`, then the hold opens again until `rest` if keys still wait. With no hold open the keys
+    /// reach only the glow, a recording stopped first ([`RAW_KEY`]).
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AosKeyHold",
+            action = "Release",
+            project = "aterm_effects::aos_momentum::hold_conformance_tests::Real::project"
+        )
+    )]
+    #[inline]
+    pub fn aos_release(&mut self, now: Instant, keys: u32, tau_s: f32, rest: Option<Instant>) {
+        self.expire_past_horizon(now);
+        if let HostMode::Hosted(h) = &mut self.mode
+            && h.awaiting_echo.take().is_some()
+        {
+            let (at, moved) = h.logical(now);
+            let ev = MomentumEvent::Key {
+                at,
+                tau_bits: tau_s.to_bits(),
+            };
+            for _ in 0..keys {
+                let _ = h.deliver(&ev, moved, &mut Vec::new(), &mut Vec::new());
+            }
+            h.awaiting_echo = rest;
+            return;
+        }
+        if self.aos_attached() {
+            self.detach_by_itself(RAW_KEY);
+        }
+        self.tainted = true;
+        for _ in 0..keys {
+            self.on_key(now, tau_s);
+        }
+    }
+
+    /// Whether a typed key holds the recording ([`Self::aos_hold`]).
+    #[inline]
+    #[must_use]
+    pub const fn aos_holding(&self) -> bool {
+        matches!(&self.mode, HostMode::Hosted(h) if h.awaiting_echo.is_some())
+    }
+
+    /// Notes that the live glow takes a key the recording may not hold: the next new recording
+    /// starts it from rest.
+    #[inline]
+    pub const fn taint(&mut self) {
+        self.tainted = true;
+    }
+
+    /// Whether the live glow took a key no recording logged since it last started from rest.
+    #[inline]
+    #[must_use]
+    pub const fn aos_tainted(&self) -> bool {
+        self.tainted
     }
 
     /// Starts hosting.
@@ -2307,6 +2489,14 @@ impl MomentumHost {
         );
     }
 
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AosKeyHold",
+            action = "Attach",
+            project = "aterm_effects::aos_momentum::hold_conformance_tests::Real::project"
+        )
+    )]
     #[inline]
     fn attach_sched(
         &mut self,
@@ -2321,6 +2511,8 @@ impl MomentumHost {
             && h.epoch() == epoch
             && h.sched() == sched
             && h.build == build
+            && h.awaiting_echo.is_none()
+            && !self.tainted
         {
             let first = h.cursor();
             if h.boundary.attach(log_epoch, max_events).is_ok() {
@@ -2329,7 +2521,10 @@ impl MomentumHost {
             }
             return;
         }
-        let glow = self.take_glow();
+        let mut glow = self.take_glow();
+        if core::mem::take(&mut self.tainted) {
+            glow = MomentumGlow::default();
+        }
         let prebuilt = PrebuiltMomentum::of(sched, build);
         let identity = momentum_identity(&prebuilt);
         let mut boundary = Boundary::new(
@@ -2363,23 +2558,35 @@ impl MomentumHost {
             scratch: Enc::new(),
             #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
             guard: Guard::default(),
+            awaiting_echo: None,
         }));
     }
 
-    /// The glow out of the host, any recording dropped with its undrained retired segments kept for the watcher.
+    /// The glow out of the host, any recording dropped with its undrained retired segments kept for the watcher; a hold dropped taints the glow, whose held keys the caller hands it unrecorded.
     #[inline]
     fn take_glow(&mut self) -> MomentumGlow {
         self.keep_retired();
         match core::mem::replace(&mut self.mode, HostMode::Direct(MomentumGlow::default())) {
             HostMode::Direct(g) => g,
             HostMode::Hosted(mut h) => {
+                if h.awaiting_echo.is_some() {
+                    self.tainted = true;
+                }
                 h.boundary.detach();
                 h.boundary.pair().state.glow
             }
         }
     }
 
-    /// Stops hosting; the glow draws on from its live state.
+    /// Stops hosting; the glow draws on from its live state. A hold it drops taints the glow.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AosKeyHold",
+            action = "Detach",
+            project = "aterm_effects::aos_momentum::hold_conformance_tests::Real::project"
+        )
+    )]
     #[inline]
     pub fn aos_detach(&mut self) {
         let glow = self.take_glow();
@@ -2388,8 +2595,9 @@ impl MomentumHost {
 
     /// Pauses at this step boundary.
     /// # Errors
-    /// [`PublishRefusal::NotAttached`] or [`PublishRefusal::AlreadyPaused`]; nothing is recorded
-    /// then.
+    /// [`PublishRefusal::NotAttached`], [`PublishRefusal::AlreadyPaused`], or
+    /// [`PublishRefusal::MidStep`] while a key is held (a step the host has not taken); nothing is
+    /// recorded then.
     #[inline]
     pub fn aos_pause(
         &mut self,
@@ -2401,6 +2609,9 @@ impl MomentumHost {
         };
         if h.boundary.is_paused() {
             return Err(PublishRefusal::AlreadyPaused);
+        }
+        if h.awaiting_echo.is_some() {
+            return Err(PublishRefusal::MidStep);
         }
         let _ = h.next_change_deadline(now, frame_interval);
         h.queued_at = None;
@@ -2548,11 +2759,13 @@ impl MomentumHost {
     pub fn aos_status(&self) -> MomentumAosStatus {
         let h = match &self.mode {
             HostMode::Direct(g) => {
+                let is_active = g.is_active();
+                let settling = g.settling();
                 return MomentumAosStatus {
                     code: MomentumCode::Shipped.name(),
-                    hot: g.is_active() || g.settling(),
-                    is_active: g.is_active(),
-                    settling: g.settling(),
+                    hot: is_active || settling,
+                    is_active,
+                    settling,
                     ..MomentumAosStatus::default()
                 };
             }

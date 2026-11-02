@@ -15,17 +15,53 @@ use aterm_db::accounts::activations::Activations;
 use aterm_secrets::client::{self, Config, Paths};
 use std::{collections::BTreeMap, ffi::OsString, path::PathBuf, process::ExitCode};
 
+#[path = "shared_native.rs"]
+mod native;
+#[path = "shared_login_provider.rs"]
+mod providers;
+#[path = "shared_login_recovery.rs"]
+mod recovery;
+
 const USAGE: &str = "aterm harness accounts shared-renew <local-label> --account <digest> --decision <digest> --request <nonce> [--config <aterm.toml>]\nRenews one existing local Claude OAuth row using an exact current root grant.\n";
 
 pub(super) fn install_automatic() {
     aterm_agent::harness::accounts_sync::shared_renewal::install_authority(automatic_authority);
+    aterm_agent::harness::accounts_sync::shared_renewal::install_checkpoint_authority(
+        checkpoint_authority,
+    );
+    aterm_agent::harness::accounts_sync::shared_renewal::install_discovery(automatic_candidates);
+    recovery::install();
+    native::install();
 }
 
-fn automatic_authority(
+fn automatic_candidates(
+    home: &std::path::Path,
+) -> Result<Vec<aterm_agent::harness::accounts_sync::shared_renewal::Candidate>, String> {
+    let paths = Paths::for_home(home);
+    let Some(expected) = client::config(&paths).map_err(|why| why.to_string())? else {
+        return Ok(Vec::new());
+    };
+    let db = Activations::at(paths.clone());
+    let mut candidates = Vec::new();
+    for (account, decision) in db.local_preparations().map_err(|why| why.to_string())? {
+        let approved = Approved {
+            paths: paths.clone(),
+            expected: expected.clone(),
+            account,
+            decision,
+        };
+        if let Ok(candidate) = providers::candidate(std::sync::Arc::new(approved)) {
+            candidates.push(candidate);
+        }
+    }
+    Ok(candidates)
+}
+
+fn current_authority(
     home: &std::path::Path,
     source: accounts::shared::Source,
     row: &accounts::Row,
-) -> Result<aterm_agent::harness::accounts_sync::shared_renewal::CheckedAuthority, String> {
+) -> Result<std::sync::Arc<Approved>, String> {
     let paths = Paths::for_home(home);
     let expected = client::config(&paths)
         .map_err(|e| e.to_string())?
@@ -46,6 +82,30 @@ fn automatic_authority(
         return Err("shared renewal belongs to a different retained network".into());
     }
     Ok(std::sync::Arc::new(approved))
+}
+
+fn automatic_authority(
+    home: &std::path::Path,
+    source: accounts::shared::Source,
+    row: &accounts::Row,
+) -> Result<aterm_agent::harness::accounts_sync::shared_renewal::CheckedAuthority, String> {
+    let approved = current_authority(home, source, row)?;
+    if !providers::ordinary_renewal(&approved.prepared()?) {
+        return Err("shared account requires its prepared-provider login path".into());
+    }
+    Ok(approved)
+}
+
+fn checkpoint_authority(
+    home: &std::path::Path,
+    source: accounts::shared::Source,
+    row: &accounts::Row,
+) -> Result<aterm_agent::harness::accounts_sync::shared_renewal::CheckedAuthority, String> {
+    let approved = current_authority(home, source, row)?;
+    if !providers::claude_checkpoint(&approved.prepared()?) {
+        return Err("shared checkpoint is not a supported Claude preparation".into());
+    }
+    Ok(approved)
 }
 
 struct Approved {
@@ -79,129 +139,6 @@ fn has_unsupported_requirements(value: &aterm_json::Value, supported: &[&str]) -
         })
 }
 
-impl Approved {
-    fn read(&self, row: &accounts::Row) -> Result<Grant, String> {
-        if client::config(&self.paths)
-            .map_err(|e| e.to_string())?
-            .as_ref()
-            != Some(&self.expected)
-        {
-            return Err("configured vault changed during shared renewal".into());
-        }
-        let prepared = Activations::at(self.paths.clone())
-            .prepare(self.account, &self.expected)
-            .map_err(|e| e.to_string())?;
-        let record = prepared.decision();
-        if record.id() != self.decision {
-            return Err("shared renewal decision is no longer current".into());
-        }
-        let configuration = prepared.configuration();
-        let value = configuration.account();
-        if has_unsupported_requirements(
-            value,
-            &["local-class", "browser-profile", "provider-account-id"],
-        ) {
-            return Err("shared renewal contains an unsupported required detail".into());
-        }
-        if value["provider"].as_str() != Some("anthropic")
-            || value["method"].as_str() != Some("oauth")
-            || prepared.credential().is_some()
-        {
-            return Err("shared renewal currently supports local Claude OAuth without copying a shared credential".into());
-        }
-        let email = value["email"]
-            .as_str()
-            .filter(|s| accounts::email_refusal(s).is_none())
-            .ok_or_else(|| "shared renewal requires a direct approved email".to_owned())?;
-        let identity = match value
-            .get("details")
-            .and_then(|d| d.get("provider-identity"))
-        {
-            None => email,
-            Some(detail) => {
-                if detail["kind"].as_str() != Some("email-ref") {
-                    return Err("provider-identity must be an email-ref".into());
-                }
-                let key = detail["value"]
-                    .as_str()
-                    .ok_or_else(|| "invalid approved identity reference".to_owned())?;
-                let key = key.strip_prefix("email-addresses:").unwrap_or(key);
-                let absent =
-                    || "approved provider identity is absent from its checked closure".to_owned();
-                let contact = configuration
-                    .get("email-addresses", key)
-                    .ok_or_else(absent)?;
-                let address = contact["address"]
-                    .as_str()
-                    .filter(|s| accounts::email_refusal(s).is_none())
-                    .ok_or_else(absent)?;
-                if has_unsupported_requirements(contact, &[]) {
-                    return Err(
-                        "shared renewal cannot enforce a required provider identity detail".into(),
-                    );
-                }
-                address
-            }
-        };
-        if !row
-            .email
-            .as_deref()
-            .is_some_and(|e| accounts::email_matches(e, email))
-            || !row
-                .expected_identity_email()
-                .is_some_and(|e| accounts::email_matches(e, identity))
-        {
-            return Err(
-                "local row does not match the approved sign-in and provider identity".into(),
-            );
-        }
-        let browser = requirement(value, "browser-profile")?;
-        if browser.is_some_and(|browser| browser.trim().is_empty()) {
-            return Err("invalid required browser profile".into());
-        }
-        if requirement(value, "local-class")?.is_some_and(|class| class != row.class.as_str())
-            || browser.is_some_and(|browser| Some(browser) != row.browser.as_deref())
-        {
-            return Err("local account policy differs from the approved configuration".into());
-        }
-        if value.get("realm").is_some_and(|v| !v.is_null())
-            || value
-                .get("auth")
-                .is_some_and(|routes| routes.as_array().is_none_or(|routes| !routes.is_empty()))
-        {
-            return Err(
-                "shared renewal does not support custom realms or additional authentication routes"
-                    .into(),
-            );
-        }
-        let principal = match requirement(value, "provider-account-id")? {
-            None => None,
-            Some(value) => Some(
-                aterm_agent::harness::profile::principal_id(value)
-                    .ok_or_else(|| "invalid approved provider account id".to_owned())?,
-            ),
-        };
-        let trust = record.trust();
-        let mut hash = aterm_digest::Sha256::new();
-        hash.update(b"aterm/shared-login-network/1\0");
-        hash.update(trust.network);
-        hash.update(trust.authority);
-        hash.update(trust.genesis);
-        Ok(Grant {
-            source: accounts::shared::Source {
-                network: hash.finalize(),
-                account: self.account,
-            },
-            decision: record.id(),
-            generation: record.request().generation,
-            configuration: prepared.configuration().digest(),
-            identity: identity.into(),
-            expected_principal: principal,
-            required_browser_profile: browser.map(str::to_owned),
-        })
-    }
-}
-
 impl Authority for Approved {
     fn prepare(&self, row: &accounts::Row) -> Result<Grant, String> {
         self.read(row)
@@ -211,6 +148,29 @@ impl Authority for Approved {
             return Err("shared renewal approval changed".into());
         }
         Ok(())
+    }
+    fn request_recovery(
+        &self,
+        grant: &Grant,
+        row: &accounts::Row,
+        intent: &accounts::shared::Intent,
+    ) -> Result<(), String> {
+        self.current(grant, row)?;
+        if !matches!(
+            &self.prepared()?.decision().request().action,
+            aterm_secrets::commons::accounts::Action::Prepare(terms) if terms.intent.is_some()
+        ) {
+            return Ok(());
+        }
+        if intent.source != grant.source
+            || intent.decision != grant.decision
+            || intent.configuration != grant.configuration
+        {
+            return Err("shared recovery request differs from the retained preparation".into());
+        }
+        aterm_db::accounts::recovery::Recovery::at(self.paths.clone())
+            .request(self.account, self.decision, intent.request)
+            .map_err(|why| why.to_string())
     }
 }
 
@@ -272,6 +232,9 @@ fn parse(args: &[OsString]) -> Result<Command, String> {
 }
 
 pub(super) fn try_run(args: &[OsString]) -> Option<ExitCode> {
+    if let Some(result) = native::try_run(args) {
+        return Some(result);
+    }
     if args.first().is_none_or(|a| a != "accounts")
         || args.get(1).is_none_or(|a| a != "shared-renew")
     {
@@ -296,6 +259,9 @@ pub(super) fn try_run(args: &[OsString]) -> Option<ExitCode> {
             account: command.account,
             decision: command.decision,
         };
+        if !providers::ordinary_renewal(&authority.prepared()?) {
+            return Err("shared account requires its prepared-provider login path".into());
+        }
         Ok(cli::shared_renewal::run(
             &env,
             &cli::LiveAccounts,
@@ -545,6 +511,177 @@ mod tests {
     }
 
     #[test]
+    fn prepared_inputs_recover_without_enabling_ordinary_shared_renewal() {
+        use aterm_secrets::text::Audience;
+        let (_home, mut approved, row) = fixture();
+        let admin = client::admin_open(&approved.paths).unwrap();
+        let mut doc = admin.doc.clone();
+        doc.set_entry(&Audience::Everyone, "mailbox-input", &aterm_json::to_vec(&json!({
+            "schema":1,"kind":"mailbox","target":"alias@example.test",
+            "transport":"https","endpoint":"https://mail.example.test/inbox","bearer_token":"synthetic-token"
+        })).unwrap()).unwrap();
+        client::admin_publish(&approved.paths, &admin, &doc).unwrap();
+        approved.expected = client::config(&approved.paths).unwrap().unwrap();
+        let proposals = Proposals::at(approved.paths.clone());
+        let mut account = proposals.snapshot().unwrap().cells[&("accounts".into(), "one".into())]
+            .candidates[0]
+            .value
+            .clone();
+        account.as_object_mut().unwrap().insert(
+            "secret_ref".into(),
+            json!({"vault":approved.expected.name,"entry":"mailbox-input"}),
+        );
+        account
+            .as_object_mut()
+            .unwrap()
+            .get_mut("details")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert(
+                "login-input-format".into(),
+                json!({"kind":"requirement","value":"mailbox-v1"}),
+            );
+        proposals
+            .write(
+                [12; 16],
+                vec![Change {
+                    collection: "accounts".into(),
+                    key: "one".into(),
+                    value: Some(account),
+                }],
+            )
+            .unwrap();
+        let admin = client::admin_open(&approved.paths).unwrap();
+        let db = Activations::at(approved.paths.clone());
+        let actor = Bootstrap::required(&approved.paths)
+            .unwrap()
+            .request()
+            .unwrap()
+            .binding()
+            .actor();
+        let request = db
+            .configuration(
+                &admin,
+                approved.account,
+                "one",
+                actor,
+                vec![approved.decision],
+            )
+            .unwrap();
+        approved.decision = db.issue(&admin, [13; 16], request).unwrap().0.id();
+        let grant = approved.prepare(&row).unwrap();
+        assert!(approved.prepared().unwrap().credential().is_some());
+        let candidates = automatic_candidates(&approved.paths.home).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert!(!candidates[0].ordinary_renewal);
+        assert!(automatic_authority(&approved.paths.home, grant.source, &row).is_err());
+        let recovery = checkpoint_authority(&approved.paths.home, grant.source, &row).unwrap();
+        assert_eq!(recovery.prepare(&row).unwrap(), grant);
+        recovery.current(&grant, &row).unwrap();
+        let stop = db
+            .stop_request(approved.account, vec![approved.decision])
+            .unwrap();
+        db.issue(&admin, [14; 16], stop).unwrap();
+        assert!(recovery.current(&grant, &row).is_err());
+        assert!(checkpoint_authority(&approved.paths.home, grant.source, &row).is_err());
+    }
+
+    /// This test binary asks aterm-db for the hang detector (`admission_waits_in_tests!` in
+    /// main.rs), so an open whose caller names no deadline (`Proposals::at`) waits out a
+    /// holder of the Commons custody lock that keeps it past a product open's 2 s: every
+    /// holder a test races is its own and releases it, so a pass a loaded machine slows is
+    /// waited for, not refused as "application pass deadline expired". Without the ask the
+    /// write refuses while the lock is still held.
+    #[test]
+    fn an_open_naming_no_deadline_waits_out_a_holder_past_the_product_wait() {
+        use std::time::{Duration, Instant};
+        let (_home, approved, _) = fixture();
+        let (lock, _) =
+            aterm_uds::private_file::open_private(&approved.paths.dir, "commons.lock").unwrap();
+        aterm_uds::private_file::lock_exclusive_until(
+            &lock,
+            Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+            "the test holds Commons custody",
+        )
+        .unwrap();
+        let (began, writing) = std::sync::mpsc::channel();
+        let paths = approved.paths.clone();
+        let write = std::thread::spawn(move || {
+            began.send(Instant::now()).unwrap();
+            Proposals::at(paths).write(
+                [5; 16],
+                vec![Change {
+                    collection: "accounts".into(),
+                    key: "held".into(),
+                    value: Some(json!({
+                        "provider":"anthropic", "method":"oauth",
+                        "email":"held@example.test"
+                    })),
+                }],
+            )
+        });
+        let began = writing.recv().unwrap();
+        // Held past the product's whole 2 s wait, with a second to spare.
+        std::thread::sleep(
+            (began + Duration::from_secs(3)).saturating_duration_since(Instant::now()),
+        );
+        lock.unlock().unwrap();
+        drop(lock);
+        write.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn first_adoption_discovers_only_current_root_decisions_without_a_local_roster() {
+        let (_home, approved, _) = fixture();
+        let env = environment(&approved.paths.home);
+        assert!(!env.accounts_roster().unwrap().exists());
+        let candidates = automatic_candidates(&approved.paths.home).unwrap();
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+        let grant = candidate.authority.prepare(&candidate.row).unwrap();
+        assert_eq!(grant.source.account, approved.account);
+        assert_eq!(grant.decision, approved.decision);
+        assert_eq!(candidate.cli, accounts::Cli::Claude);
+        assert_ne!(
+            candidate.row.label, "one",
+            "proposal keys are not local labels"
+        );
+        Proposals::at(approved.paths.clone())
+            .write(
+                [8; 16],
+                vec![Change {
+                    collection: "accounts".into(),
+                    key: "proposal-only".into(),
+                    value: Some(json!({
+                        "provider":"anthropic", "method":"oauth",
+                        "email":"unapproved@example.test"
+                    })),
+                }],
+            )
+            .unwrap();
+        assert_eq!(automatic_candidates(&approved.paths.home).unwrap().len(), 1);
+        let db = Activations::at(approved.paths.clone());
+        let admin = client::admin_open(&approved.paths).unwrap();
+        let stop = db
+            .stop_request(approved.account, vec![approved.decision])
+            .unwrap();
+        db.issue(&admin, [9; 16], stop).unwrap();
+        assert!(
+            automatic_candidates(&approved.paths.home)
+                .unwrap()
+                .is_empty()
+        );
+
+        let (_home, unsupported, _) = fixture_with_extra(None, true, None);
+        assert!(
+            automatic_candidates(&unsupported.paths.home)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn automatic_upkeep_resolves_only_the_pinned_network_and_current_root_head() {
         let (_home, approved, row) = fixture();
         let grant = approved.prepare(&row).unwrap();
@@ -561,6 +698,89 @@ mod tests {
         db.issue(&admin, [3; 16], stop).unwrap();
         assert!(automatic.current(&grant, &row).is_err());
         assert!(automatic_authority(&approved.paths.home, grant.source, &row).is_err());
+    }
+
+    #[test]
+    fn dependency_setup_rechecks_root_and_local_switches_before_the_provider() {
+        use aterm_agent::harness::cli::shared_provider::{Context, Execution, Provider};
+        use std::cell::Cell;
+
+        struct Host<'a> {
+            approved: &'a Approved,
+            config: &'a std::path::Path,
+            off: Option<&'a str>,
+            checked: Cell<bool>,
+            launched: Cell<usize>,
+        }
+        impl cli::AccountsHost for Host<'_> {
+            fn automatic_sign_in(&self) -> bool {
+                true
+            }
+            fn native_credential_setup(&self) -> bool {
+                self.checked.set(true);
+                if let Some(off) = self.off {
+                    std::fs::write(self.config, off).unwrap();
+                } else {
+                    let db = Activations::at(self.approved.paths.clone());
+                    let admin = client::admin_open(&self.approved.paths).unwrap();
+                    let stop = db
+                        .stop_request(self.approved.account, vec![self.approved.decision])
+                        .unwrap();
+                    db.issue(&admin, [97; 16], stop).unwrap();
+                }
+                false
+            }
+            fn stdin_is_terminal(&self) -> bool {
+                false
+            }
+            fn auth_status(
+                &self,
+                _: &str,
+            ) -> Result<aterm_agent::harness::align::Captured, String> {
+                panic!("no authentication read")
+            }
+            fn unaskable(&self) -> Option<String> {
+                None
+            }
+            fn login(&self, _: Option<&str>) -> Result<i32, String> {
+                panic!("no ordinary login")
+            }
+            fn now(&self) -> i64 {
+                1_700_000_000
+            }
+            fn renew_flow(&self, _: &str, _: &str, _: &cli::RenewBrowser) -> Result<i32, String> {
+                self.launched.set(self.launched.get() + 1);
+                Err("unexpected provider launch".into())
+            }
+        }
+        for off in [
+            None,
+            Some("[harness]\naccounts = \"off\"\n"),
+            Some("[harness]\nlogins = \"off\"\n"),
+            Some("[harness]\nenabled = false\n"),
+        ] {
+            let (home, approved, row) = fixture();
+            let env = environment(home.path());
+            let store = env.accounts_store();
+            let host = Host {
+                approved: &approved,
+                config: env.config.as_deref().unwrap(),
+                off,
+                checked: Cell::new(false),
+                launched: Cell::new(0),
+            };
+            let context = Context {
+                env: &env,
+                store: &store,
+                host: &host,
+            };
+            assert!(matches!(
+                approved.execute_attempt(&context, &row, home.path(), &cli::RenewBrowser::Default),
+                Execution::NotStarted(_)
+            ));
+            assert!(host.checked.get());
+            assert_eq!(host.launched.get(), 0);
+        }
     }
 
     #[test]
@@ -988,7 +1208,15 @@ mod tests {
                     usize::from(!stop),
                     "a fresh nonce must not replay the root grant"
                 );
-                assert_eq!(authority.checked.get(), checked_before_retry);
+                if stop {
+                    assert_eq!(authority.checked.get(), checked_before_retry);
+                } else {
+                    assert!(
+                        authority.checked.get() > checked_before_retry,
+                        "advisory recovery must recheck the current root authority"
+                    );
+                    assert_eq!(authority.current_passed.get(), authority.checked.get());
+                }
                 assert_eq!(authority.prepared.get(), 1 + usize::from(!stop));
                 let retried = store.load_logins(env.now).unwrap().0;
                 assert_eq!(retried.shared.latest(grant.source), attempt.as_ref());

@@ -97,7 +97,9 @@ fn linux_exe_link_name(pid: u32) -> Option<String> {
 /// truncated to 15 bytes unless the process renamed itself.
 #[cfg(target_os = "linux")]
 fn linux_comm_name(pid: u32) -> Option<String> {
-    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    let comm =
+        aterm_uds::process::read_proc_text(std::path::Path::new(&format!("/proc/{pid}/comm")))
+            .ok()?;
     let comm = comm.trim();
     (!comm.is_empty()).then(|| comm.to_string())
 }

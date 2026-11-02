@@ -39,6 +39,9 @@ struct DoorHost {
     reread: Mutex<Option<OccupancyReading>>,
     /// The hung calls the host's facts reading names (`IdleHost::facts`); `None`, no reading.
     facts: Mutex<Option<Vec<crate::supervise::BackgroundCall>>>,
+    /// The held programs the host's facts reading names (`FactsReading::held`); `None`, the part
+    /// unread. With either set the host answers a reading.
+    held: Mutex<Option<Vec<crate::supervise::HeldCall>>>,
     /// The wall (unix ms) of the read the run is at, when the facts reading is taken.
     facts_at: Mutex<i64>,
     calls: Mutex<Vec<String>>,
@@ -80,6 +83,8 @@ struct DoorHost {
     /// What the host measured of the API's reach ([`IdleHost::reach_peek`] and
     /// [`IdleHost::reach`] alike).
     reach: Mutex<crate::supervise::policy::turn_end::Reach>,
+    /// The needs the loop last told the host stand ([`IdleHost::needs_standing`]), whole.
+    standing: Mutex<Vec<String>>,
 }
 
 impl DoorHost {
@@ -133,6 +138,9 @@ impl IdleHost for DoorHost {
     fn lasting_hold(&self, hold: Option<crate::supervise::Lasting>) {
         self.lasting.lock().expect("lasting").push(hold);
     }
+    fn needs_standing(&self, needs: &[String], _entry: &str) {
+        *self.standing.lock().expect("standing") = needs.to_vec();
+    }
     fn taskless(&self) -> bool {
         self.taskless.load(Ordering::SeqCst)
     }
@@ -164,10 +172,16 @@ impl IdleHost for DoorHost {
     }
     fn facts(&self) -> Option<crate::supervise::FactsReading> {
         self.called("facts".to_string());
-        let calls = self.facts.lock().expect("facts").clone()?;
+        let calls = self.facts.lock().expect("facts").clone();
+        let held = self.held.lock().expect("held").clone();
+        if calls.is_none() && held.is_none() {
+            return None;
+        }
+        let as_of_ms = *self.facts_at.lock().expect("facts_at");
         Some(crate::supervise::FactsReading {
-            as_of_ms: *self.facts_at.lock().expect("facts_at"),
-            no_progress: calls,
+            as_of_ms,
+            no_progress: calls.unwrap_or_default(),
+            held: held.map(|programs| crate::supervise::HeldReading { as_of_ms, programs }),
         })
     }
     fn occupancy_said(&self, said: &OccupancySaid) {
@@ -293,7 +307,8 @@ impl Ctl for Logged<'_> {
                 .position(|a| *a == "--")
                 .map(|i| words[i + 1..].join(" "))
         {
-            let at = self.m.served;
+            // A read past the script's last screen (a history read's) serves its last.
+            let at = self.m.served.min(self.m.screens.len());
             let mut drawn = self.m.last_served().to_vec();
             let caret = drawn
                 .iter()
@@ -304,6 +319,10 @@ impl Ctl for Logged<'_> {
             self.m.screen_cols.insert(at, 12);
         }
         Ok(r)
+    }
+
+    fn agent_act(&mut self, sid: &str) -> Act {
+        self.m.agent_act(sid)
     }
 }
 
@@ -472,6 +491,10 @@ enum Step {
     Again,
     /// Read under Off: a live turn is still taken, the break's steps skipped.
     Off,
+    /// The break's steps run on it and a call among them is lost ([`Fail::Lost`]), which the loop
+    /// rides out: it comes back to the read after it afresh, so a test steps that one
+    /// [`Self::Again`].
+    Lost,
 }
 
 /// The loop's end where its session went (`session_gone`).
@@ -575,13 +598,22 @@ impl<'a> Script<'a> {
                 before(&mut s, i);
                 let screen = s.screen().expect("the break's read");
                 s.clock_marks = Some((s.fx.mono(), at_ms));
-                match (self.steps)(i) {
+                let step = (self.steps)(i);
+                match step {
                     Step::Off => continue,
                     Step::Again => since = None,
-                    Step::Stepped => {}
+                    Step::Stepped | Step::Lost => {}
                 }
-                s.host_steps_in_background(&screen, &mut since, Some(&self.policy), &mut heard)
-                    .expect("the break's step");
+                let stepped =
+                    s.host_steps_in_background(&screen, &mut since, Some(&self.policy), &mut heard);
+                if step == Step::Lost {
+                    assert!(
+                        matches!(stepped, Err(Fail::Lost(_))),
+                        "a call lost: {stepped:?}"
+                    );
+                } else {
+                    stepped.expect("the break's step");
+                }
             }
             if self.gone {
                 let opts = SuperviseOpts {
@@ -4065,6 +4097,7 @@ fn a_fact_at_a_background_break_keeps_an_idle_points_guards() {
             done_under_land: false,
             held: Some(Guard::Exchange),
             theirs: Some(Guard::Exchange),
+            ..IdlePoint::default()
         }],
     );
 }
@@ -4159,6 +4192,7 @@ fn a_fact_at_a_background_break_reads_the_persons_grace_there() {
             done_under_land: false,
             held: Some(Guard::Person),
             theirs: None,
+            ..IdlePoint::default()
         }),
         "the person's grace, read at the break"
     );
@@ -4240,4 +4274,4 @@ fn a_fact_at_a_background_break_keeps_the_act_awaited_before_it() {
 mod wake_write;
 
 #[path = "cruise_carry_loop_tests.rs"]
-mod cruise_carry_loop;
+pub(crate) mod cruise_carry_loop;

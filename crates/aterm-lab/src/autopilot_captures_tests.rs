@@ -11,19 +11,15 @@ use std::cell::Cell;
 
 use super::*;
 
-/// The recorded run's manifest.
+/// The recorded run's manifest. Its codex-alab rows are a later run's, on codex-alab
+/// 0.1.0-dev.14249 (2026-10-31, `--harness codex-alab --look both` at 1x and 2x), every planned
+/// scene a png; their hold skips carry this tree's reason ([`HOLDS_UNSHOT`]). Its Claude Code,
+/// agy and Muse Code rows are slice 4b's (2026-11-01, Claude Code 2.1.316, agy 1.4.12 and Muse
+/// Code 1.4.14, each look at 1x and 2x), every planned scene a png: Claude Code's 1x Night, 2x
+/// Day and 2x Night on 4b's build before main's scoped input, whose same-land never settled
+/// (design §14.17.4.1); agy's and Muse Code's `switch-asked` rows are skips with this tree's
+/// reason ([`SWITCH_ON_CLAUDE`]).
 const RECORDED: &str = include_str!("fixtures/autopilot-captures-manifest.tsv");
-
-/// The recorded run's planned captures that have no png, each with its row's why: codex-alab's
-/// Land, landed and need legs. The managed codex-alab package that run had (store build
-/// 2026102001, 0.164.0-dev.12479+g07a25d86a) typed Cruise's acts on a Land tab and raised no need,
-/// so those legs never reached their scenes; `codex-alab-proof` fails the same legs with it, on
-/// main's lab and aterm as on this tree's.
-const UNCAPTURED_HERE: [(&str, &str); 3] = [
-    ("codex-alab", "land"),
-    ("codex-alab", "landed"),
-    ("codex-alab", "need"),
-];
 
 const SCALES: [u8; 2] = [1, 2];
 
@@ -77,9 +73,16 @@ fn shown() -> Vec<Row> {
         };
         let line = match who.chipless() {
             None => r#"window=0 program=claude face=cruise drawn="∞" title="autopilot: cruise""#,
-            Some(_) => "window=0 program=codex face=- drawn=- why=no-footer",
+            Some(_) => "window=0 program=codex face=cruise drawn=- why=not-drawn",
         };
-        let caption = format!("{}; {}", scene.what(), chip_words(line));
+        let mut caption = format!("{}; {}", scene.what(), chip_words(line));
+        if who.chipless().is_some() {
+            caption.push_str(&pad_words(
+                line,
+                Some("codex-alab 0.1.0-dev.14249 \u{2500}\u{2500} \u{221e} \u{2500}[Cruise]\u{2500}[Land]\u{2500}[Off]"),
+                true,
+            ));
+        }
         if who.chipless().is_none() {
             let png = png_name(who, scene, look, scale, Kind::Title);
             rows.push(Row::new(who, scene, look, scale, &png, caption.clone()));
@@ -103,14 +106,12 @@ fn gaps_of(rows: &[Row]) -> Vec<Gap> {
 #[test]
 fn the_recorded_manifest_has_a_row_for_every_harness_scene_look_and_scale() {
     let rows = recorded();
-    for g in gaps_of(&rows) {
-        let named = matches!(&g.lack, Lack::NotCaptured(why) if !why.trim().is_empty());
-        assert!(named, "the recorded manifest lacks {g}");
-        assert!(
-            UNCAPTURED_HERE.contains(&(g.who.name(), g.scene.name())),
-            "the recorded manifest has no png for {g}"
-        );
-    }
+    let gaps: Vec<String> = gaps_of(&rows).iter().map(ToString::to_string).collect();
+    assert!(gaps.is_empty(), "the recorded manifest lacks {gaps:?}");
+    assert!(
+        !gaps_of(&without(&rows, Who::CodexAlab, Scene::Landed)).is_empty(),
+        "CONTROL: codex-alab's landed rows taken out"
+    );
     assert_eq!(
         manifest_text(&rows),
         RECORDED,
@@ -326,10 +327,18 @@ fn codex_alab_holds_pass_as_skips_naming_their_reason() {
     let holds: Vec<Scene> = Who::CodexAlab
         .scenes()
         .iter()
-        .filter(|(_, p)| *p == Plan::Skip(A3_WAITS))
+        .filter(|(_, p)| *p == Plan::Skip(HOLDS_UNSHOT))
         .map(|(s, _)| *s)
         .collect();
-    assert_eq!(holds, [Scene::LandOpen, Scene::LandRepo, Scene::SameLand]);
+    assert_eq!(
+        holds,
+        [
+            Scene::LandOpen,
+            Scene::LandRepo,
+            Scene::SameLand,
+            Scene::SwitchAsked
+        ]
+    );
     for rows in [planned(), recorded()] {
         for &scene in &holds {
             let skips: Vec<&Row> = rows
@@ -340,7 +349,7 @@ fn codex_alab_holds_pass_as_skips_naming_their_reason() {
             for r in skips {
                 assert_eq!(
                     (r.png.as_str(), r.caption.clone()),
-                    ("-", format!("{SKIPPED}{A3_WAITS}")),
+                    ("-", format!("{SKIPPED}{HOLDS_UNSHOT}")),
                     "{}",
                     r.line()
                 );
@@ -665,9 +674,39 @@ fn a_hovered_titles_cells_are_counted_to_its_end() {
     let mut facts = drawn(&rest, lead, short);
     ink(&mut facts, 140 * CELL..150 * CELL, 2..8);
     assert_eq!(c.title_cells(&facts, &rest, lead), text_width(short) + 1);
+    // A title drawn past another chip the rule keeps after this one (Claude Code's mode,
+    // `⏵⏵ auto`), which the hover left as it was, is counted from its own first cell; one that
+    // starts further along the rule than any chip is none of it.
+    let pill = text_width("⏵⏵ auto") + 2;
+    assert_eq!(
+        c.title_cells(&drawn(&rest, lead + pill, whole), &rest, lead),
+        text_width(whole) + 1
+    );
+    let far = lead + TITLE_LEAD_SKIP + TITLE_GAP + 2;
+    assert_eq!(c.title_cells(&drawn(&rest, far, short), &rest, lead), 0);
     // Nothing drawn, and a frame of another size, measure none.
     assert_eq!(c.title_cells(&rest, &rest, lead), 0);
     assert_eq!(c.title_cells(&rule(80), &rest, lead), 0);
+    // Beside Claude Code's footer the block's other chip (`─ auto`) stands between the landed
+    // chip and its title, unchanged by the hover: the title is counted from where it begins, and
+    // a lean fit beside it is still cut short (slice 9c's review round: the measure read 0 of
+    // every title there). NEGATIVE CONTROL (run by hand): counting from the chip's own end again
+    // reads 0 here.
+    let landed_lead = text_width("\u{2713} landed") + 2;
+    let beside = drawn(&rest, landed_lead, "\u{2500} auto");
+    let at = landed_lead + text_width("\u{2500} auto") + 1;
+    let titled = |text: &str| c.title_cells(&drawn(&beside, at, text), &beside, landed_lead);
+    assert_eq!(titled(whole), text_width(whole) + 1);
+    assert!(
+        !said(titled(whole)).contains(FINDING),
+        "{}",
+        said(titled(whole))
+    );
+    assert!(
+        said(titled(short)).starts_with(FINDING),
+        "{}",
+        said(titled(short))
+    );
 }
 
 #[test]
@@ -724,4 +763,134 @@ fn a_held_rows_state_line_is_shown_only_on_the_lists_screen() {
         Some("stopped typing: the same reply twice, no work"),
         "turned onto the list's screen"
     );
+}
+
+/// A CODEX-ALAB CAPTION QUOTES ITS PAD, AND A CHIP OVER THE PROGRAM'S OWN LINE IS A FINDING: the
+/// pad codex-alab drew is quoted beside a chip that stood down (no finding). A chip drawn on
+/// either a blank pad or the program's own line is a finding, which [`faults`] reports.
+#[test]
+fn a_codex_alab_caption_finds_a_chip_over_its_own_pad() {
+    let own = "codex-alab 0.1.0-dev.13916 \u{b7} based on OpenAI Codex 0.165.0 \u{2500}[Cruise]";
+    let down = "window=0 program=codex face=land drawn=- why=not-drawn";
+    let drawn = "window=0 program=codex face=land drawn=\"\u{2913} land\"";
+    let said = pad_words(down, Some(own), false);
+    assert!(
+        said.contains(&format!("{own:?}")) && !said.contains(FINDING),
+        "{said}"
+    );
+    assert!(said.contains("names no mode"), "13916's line: {said}");
+    assert!(
+        pad_words(drawn, Some(""), true).contains(FINDING),
+        "a chip on a blank pad"
+    );
+    assert!(
+        !pad_words(down, None, true).contains(FINDING),
+        "no prompt row"
+    );
+    let covered = pad_words(drawn, Some(own), true);
+    assert!(covered.contains(FINDING), "CONTROL: {covered}");
+    let row = Row::new(
+        Who::CodexAlab,
+        Scene::Land,
+        Look::Night,
+        1,
+        &png_name(Who::CodexAlab, Scene::Land, Look::Night, 1, Kind::Rest),
+        format!("{}; {}{covered}", Scene::Land.what(), chip_words(drawn)),
+    );
+    assert!(
+        faults(&[row])
+            .iter()
+            .any(|f| matches!(&f.fault, Fault::Finding(_))),
+        "the finding is a fault"
+    );
+}
+
+/// A BUILD THAT NAMES ITS MODE ON ITS LINE MUST NAME THE FACE: 14249's line under Land says
+/// `⤓ land`, so a landed shot beside it still saying land is a [`FINDING`]; 13916's line, which
+/// lights a button only, is said to name no mode and is no fault for a build before
+/// [`codex_alab_proof::SAYS_ITS_MODE`]. CONTROL: the same line under a build that should say it.
+#[test]
+fn a_codex_alab_caption_wants_its_own_line_to_name_the_face() {
+    let land = "codex-alab 0.1.0-dev.14249 \u{b7} based on OpenAI Codex 0.166.0 \u{2500}\u{2500} \
+                \u{2913} land \u{2500}[Cruise]\u{2500}[Land]\u{2500}[Off]";
+    let landed = land.replace("\u{2913} land", "\u{2713} landed");
+    let down = |face: &str| format!("window=0 program=codex face={face} drawn=- why=not-drawn");
+    assert!(!pad_words(&down("land"), Some(land), true).contains(FINDING));
+    assert!(!pad_words(&down("landed"), Some(&landed), true).contains(FINDING));
+    let stale = pad_words(&down("landed"), Some(land), true);
+    assert!(
+        stale.contains(FINDING) && stale.contains("names no landed"),
+        "{stale}"
+    );
+    let old = "codex-alab 0.1.0-dev.13916 \u{2500}[Cruise]\u{2500}[Land]\u{2500}[Off]";
+    assert!(!pad_words(&down("landed"), Some(old), false).contains(FINDING));
+    assert!(
+        pad_words(&down("landed"), Some(old), true).contains(FINDING),
+        "CONTROL: 13916's line under a build that should name the face"
+    );
+}
+
+/// Native ownership needs no host chip, including on a blank pad. Historical captures
+/// continue to require their recorded evidence of the old host standing down.
+#[test]
+fn a_codex_alab_shot_with_no_host_footer_accepts_a_blank_pad() {
+    let shot = |scene: Scene, why: &str, pad: Option<&str>| {
+        let line = format!("window=0 program=codex face=land drawn=- why={why}");
+        Row::new(
+            Who::CodexAlab,
+            scene,
+            Look::Day,
+            1,
+            &png_name(Who::CodexAlab, scene, Look::Day, 1, Kind::Rest),
+            format!(
+                "{}; {}{}",
+                scene.what(),
+                chip_words(&line),
+                pad_words(&line, pad, true)
+            ),
+        )
+    };
+    let no_chip = |r: Row| {
+        faults(&[r])
+            .iter()
+            .any(|f| matches!(f.fault, Fault::NoChip(_)))
+    };
+    let own = "\u{2913} land \u{2500}[Cruise]\u{2500}[Land]\u{2500}[Off]";
+    assert!(!no_chip(shot(Scene::Land, "no-footer", Some(""))));
+    assert!(!no_chip(shot(Scene::Land, "no-footer", None)));
+    assert!(!no_chip(shot(Scene::Land, "not-drawn", Some(own))));
+    assert!(!no_chip(shot(Scene::Off, "switch-only", Some(""))));
+    assert!(
+        no_chip(shot(Scene::Land, "not-drawn", Some(""))),
+        "CONTROL: a blank pad"
+    );
+    assert!(
+        no_chip(shot(Scene::Land, "not-drawn", None)),
+        "CONTROL: no prompt row"
+    );
+    assert!(
+        no_chip(shot(Scene::Land, "switch-only", Some(""))),
+        "CONTROL: a carried scene with the switch alone"
+    );
+}
+
+/// A CAPTURE RUN LEAVES ANOTHER'S LAB UP (slice 9c's review round): a lab of the run's own name
+/// whose aterm still runs is another capture run's (another aterm under `LAB_ATERM`), and the
+/// run refuses rather than take it down; one whose aterm is gone was left by a run that died,
+/// and is taken down. NEGATIVE CONTROL (run by hand): `still_up` answering `None` whatever the
+/// pid, as the run did before, fails it.
+#[test]
+fn a_capture_run_leaves_another_runs_lab_up() {
+    let run = crate::run::Run {
+        tag: "apcap-claude-day-1x".into(),
+        instance_pid: 4242,
+        aterm: "/x/bin-9c-base/aterm".into(),
+        ..crate::run::Run::default()
+    };
+    let why = still_up(&run, |pid| pid == 4242).expect("its aterm runs");
+    assert!(
+        why.contains("apcap-claude-day-1x") && why.contains("4242"),
+        "{why}"
+    );
+    assert_eq!(still_up(&run, |_| false), None, "a lab whose run died");
 }

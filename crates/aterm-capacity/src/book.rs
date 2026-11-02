@@ -26,7 +26,7 @@
 
 use std::fmt;
 use std::io::{self, Write as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use aterm_json::{Map, Value};
 
@@ -36,6 +36,10 @@ pub const KEPT: usize = 8;
 /// The records a file keeps: past this, the one whose newest peak is oldest goes, so change
 /// cones that never come back do not grow it without end.
 pub const ROWS_KEPT: usize = 512;
+
+/// The encoded book's read and publication bound. A row-count limit alone does not bound
+/// the bytes of its public key strings.
+const BOOK_MAX_BYTES: u64 = 16 << 20;
 
 /// The records' schema: 2 keys each record by its checkout and variant as well ([`Key`]); a file
 /// of schema 1, keyed by the work and selection alone, is read as none, and the next keep writes
@@ -55,6 +59,15 @@ pub const VERIFY_RECORD: &str = "verify/stage-memory.json";
 
 /// Plain `targo` builds' records, beside verify's ([`VERIFY_RECORD`]).
 pub const TARGO_RECORD: &str = "verify/targo-memory.json";
+
+/// The lock beside the record at `path` (`stage-memory.json.lock`), which a writer holds from its
+/// read of the record to its write of it ([`Records::update`]).
+#[must_use]
+pub fn lock_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".lock");
+    PathBuf::from(name)
+}
 
 /// WHAT A RECORD IS KEPT FOR: a kind of work, the checkout it ran in, its crate selection,
 /// sorted, where the work reads one, and what else of the run changes its work.
@@ -109,6 +122,19 @@ impl Key {
                 .collect::<Vec<_>>()
                 .join(" "),
         }
+    }
+
+    /// The key as one line of JSON, as the file holds it ([`Self::from_json`] reads it back): what
+    /// a build's claim holder is handed on its command line (BUILD-ADMIT).
+    #[must_use]
+    pub fn to_json(&self) -> String {
+        aterm_json::to_string(&self.encode()).unwrap_or_else(|_| "{}".to_owned())
+    }
+
+    /// The key [`Self::to_json`] wrote; `None` for any other text.
+    #[must_use]
+    pub fn from_json(text: &str) -> Option<Key> {
+        Key::decode(&aterm_json::from_str::<Value>(text).ok()?)
     }
 
     /// The key as the file holds it: `crates` and `variant` left out when unset.
@@ -344,40 +370,92 @@ impl Records {
         decoded().unwrap_or_default()
     }
 
-    /// The records kept in `path`; none where it is absent or unreadable.
+    /// The records kept in `path`; none where it is absent or unreadable, including a file
+    /// past 16 MiB. This soft lookup may fall back to cold estimates; [`Self::update`] instead
+    /// preserves a read-refused existing file and reports the refusal.
     #[must_use]
     pub fn load(path: &Path) -> Records {
-        std::fs::read_to_string(path)
-            .map(|t| Records::decode(&t))
-            .unwrap_or_default()
+        Self::read(path).unwrap_or_default()
+    }
+
+    /// An absent book starts empty. Existing decode/schema compatibility stays with
+    /// [`Self::decode`], but an I/O, type, text or size refusal is not an empty book to a writer.
+    fn read(path: &Path) -> io::Result<Records> {
+        match crate::read_regular_text(path, BOOK_MAX_BYTES) {
+            Ok(text) => Ok(Self::decode(&text)),
+            Err(why) if why.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(why) => Err(why),
+        }
     }
 
     /// Write the records to `path`: staged in a private folder beside it, then renamed over it,
     /// so a reader finds the old file or the new one whole. Two writers at once can lose one of
-    /// their peaks; neither leaves a torn file.
+    /// their peaks, unless each reads and writes under the record's lock ([`Self::update`]);
+    /// neither leaves a torn file.
     ///
     /// # Errors
-    /// Its directory could not be made, or the write failed: the records kept before stand.
+    /// The encoded book exceeds the read bound, its directory could not be made, or the
+    /// write failed: the records kept before stand.
     pub fn save(&self, path: &Path) -> io::Result<()> {
+        let encoded = self.encode();
+        if u64::try_from(encoded.len()).unwrap_or(u64::MAX) > BOOK_MAX_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                "memory book exceeds its read bound; previous records retained",
+            ));
+        }
         let dir = path.parent().unwrap_or_else(|| Path::new("."));
-        std::fs::create_dir_all(dir)?;
+        crate::ledger::ensure_dir(dir)?;
         let stage = aterm_tempfile::Builder::new()
             .prefix(".stage-memory-")
             .tempdir_in(dir)?;
         let staged = stage.path().join("data");
-        std::fs::File::create(&staged)?.write_all(self.encode().as_bytes())?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        options.open(&staged)?.write_all(encoded.as_bytes())?;
         std::fs::rename(&staged, path)
     }
 
-    /// Keep `bytes`, measured at `at_ms`, under `key` in the file at `path`: read, pushed
-    /// ([`Self::push`]) and written back whole ([`Self::save`]).
+    /// Read the records at `path`, let `change` add to them, and write them back whole
+    /// ([`Self::save`]) when it says to, holding the record's lock ([`lock_path`]) from the read to
+    /// the write: two writers at once, in this process or another (a verify run's stages, another
+    /// checkout's run, a plain build), each read what the other wrote, and neither loses a peak or
+    /// a row. Whether it wrote. An absent book starts empty; a refused existing read never
+    /// invokes `change` or replaces that file.
     ///
     /// # Errors
-    /// As [`Self::save`].
+    /// The existing book could not be read, the lock could not be made or taken, or as
+    /// [`Self::save`].
+    pub fn update(path: &Path, change: impl FnOnce(&mut Records) -> bool) -> io::Result<bool> {
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        crate::ledger::ensure_dir(dir)?;
+        let lock = crate::ledger::open_rendezvous(&lock_path(path))?;
+        let _held = aterm_toolchain::record_lock::RecordLock::lock(lock, 0)?;
+        let mut records = Records::read(path)?;
+        if !change(&mut records) {
+            return Ok(false);
+        }
+        records.save(path).map(|()| true)
+    }
+
+    /// Keep `bytes`, measured at `at_ms`, under `key` in the file at `path`: read, pushed
+    /// ([`Self::push`]) and written back whole, under the record's lock ([`Self::update`]).
+    ///
+    /// # Errors
+    /// As [`Self::update`].
     pub fn keep(path: &Path, key: Key, bytes: u64, at_ms: u64) -> io::Result<()> {
-        let mut records = Records::load(path);
-        records.push(key, bytes, at_ms);
-        records.save(path)
+        Records::update(path, |records| {
+            records.push(key, bytes, at_ms);
+            true
+        })
+        .map(|_| ())
     }
 
     /// Whether a plain build's run of `bytes` at `at_ms` is LIGHT beside what `key`'s own record
@@ -403,14 +481,15 @@ impl Records {
     /// which then stands in its record unchanged. Whether it was kept.
     ///
     /// # Errors
-    /// As [`Self::save`].
+    /// As [`Self::update`].
     pub fn keep_unless_light(path: &Path, key: Key, bytes: u64, at_ms: u64) -> io::Result<bool> {
-        let mut records = Records::load(path);
-        if records.light(&key, bytes, at_ms) {
-            return Ok(false);
-        }
-        records.push(key, bytes, at_ms);
-        records.save(path).map(|()| true)
+        Records::update(path, |records| {
+            if records.light(&key, bytes, at_ms) {
+                return false;
+            }
+            records.push(key, bytes, at_ms);
+            true
+        })
     }
 }
 

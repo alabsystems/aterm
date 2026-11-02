@@ -221,6 +221,64 @@ impl Backoff {
     }
 }
 
+/// The most distinct errors one [`Outage`] says; past them its failures say nothing more
+/// until it attaches.
+pub(crate) const OUTAGE_SAID_MAX: usize = 8;
+
+/// A LONG-LIVED FOLLOWER'S BROKER OUTAGE, SAID ONCE (fix unit E5, E2E-15): what a reader that
+/// redials on its [`Backoff`] says on stderr, held per reader thread. The first failure of an
+/// outage says the error and that it retries, every [`RECONNECT_MAX`] at most, until it
+/// attaches; a failure with an error this outage already said (the same kind and OS error),
+/// however the errors alternate, says nothing, and each other error one more line, up to
+/// [`OUTAGE_SAID_MAX`] of them; the attach after a failure says how many tries failed and
+/// over how long.
+#[derive(Debug, Default)]
+pub(crate) struct Outage {
+    /// When the outage's first failure was, while one is under way.
+    since: Option<Instant>,
+    /// The failures since then.
+    tries: u64,
+    /// The errors this outage's lines said, each its kind and OS error, oldest first.
+    said: Vec<(io::ErrorKind, Option<i32>)>,
+}
+
+impl Outage {
+    /// A dial or a subscription failed at `now` with `e`: the line to say (after the reader's
+    /// own `<who> `), or `None` when it would repeat the last.
+    pub(crate) fn failed(&mut self, now: Instant, e: &io::Error) -> Option<String> {
+        self.tries = self.tries.saturating_add(1);
+        let first = self.since.is_none();
+        if first {
+            self.since = Some(now);
+        }
+        let what = (e.kind(), e.raw_os_error());
+        if self.said.contains(&what) || self.said.len() >= OUTAGE_SAID_MAX {
+            return None;
+        }
+        self.said.push(what);
+        Some(if first {
+            format!(
+                "could not subscribe: {e}; it retries, every {} s at most, until it attaches, \
+                 and says when it does",
+                RECONNECT_MAX.as_secs()
+            )
+        } else {
+            format!("could not subscribe: {e} (still retrying)")
+        })
+    }
+
+    /// The subscription is live again at `now`: the line saying so after an outage, which ends.
+    pub(crate) fn attached(&mut self, now: Instant) -> Option<String> {
+        let since = self.since.take()?;
+        let tries = std::mem::take(&mut self.tries);
+        self.said.clear();
+        Some(format!(
+            "subscribed again after {tries} failed tries over {} s",
+            now.saturating_duration_since(since).as_secs()
+        ))
+    }
+}
+
 /// `b` jittered into `[b/2, b]` by `r`: integer-only, and never longer than
 /// `b`.
 fn jittered(b: Duration, r: u64) -> Duration {
@@ -651,6 +709,66 @@ mod tests {
             stdout.lines().any(|line| line == "bare-name=read"),
             "the child ran no check: {stdout}"
         );
+    }
+
+    /// A FOLLOWER SAYS AN OUTAGE ONCE (fix unit E5, E2E-15): twenty failures with one error
+    /// say one line, naming the error and the retry ceiling read from [`RECONNECT_MAX`]; the
+    /// attach says one line naming the twenty; the next failure starts a new outage, one line;
+    /// a different error in an outage says one more; twenty failures alternating between two
+    /// errors (a broker in a crash loop: the dial refused, then the subscription reset) say two;
+    /// past [`OUTAGE_SAID_MAX`] distinct errors nothing more. NEGATIVE CONTROLS (scratch): an
+    /// [`Outage::failed`] that answers every failure says twenty; one that remembers only the
+    /// last error said says twenty for the alternating outage.
+    #[test]
+    fn a_follower_says_an_outage_once_and_its_end_once() {
+        let t0 = Instant::now();
+        let gone = || io::Error::from(io::ErrorKind::NotFound);
+        let refused = io::Error::from(io::ErrorKind::ConnectionRefused);
+        let mut o = Outage::default();
+        let said: Vec<String> = (0..20u64)
+            .filter_map(|i| o.failed(t0 + Duration::from_millis(250 * i), &gone()))
+            .collect();
+        assert_eq!(said.len(), 1, "{said:#?}");
+        assert!(said[0].contains(&gone().to_string()), "{}", said[0]);
+        let ceiling = format!("every {} s at most", RECONNECT_MAX.as_secs());
+        assert!(said[0].contains(&ceiling), "{}", said[0]);
+        let back = o
+            .attached(t0 + Duration::from_secs(9))
+            .expect("the attach after an outage says so");
+        assert!(back.contains("after 20 failed tries over 9 s"), "{back}");
+        assert_eq!(o.attached(t0 + Duration::from_secs(10)), None, "said once");
+        let again = o.failed(t0 + Duration::from_secs(11), &gone());
+        assert!(again.is_some_and(|l| l.contains(&ceiling)), "a new outage");
+        let mut o = Outage::default();
+        let two: Vec<String> = [gone(), refused]
+            .iter()
+            .filter_map(|e| o.failed(t0, e))
+            .collect();
+        assert_eq!(two.len(), 2, "{two:#?}");
+        assert!(two[1].contains("still retrying"), "{}", two[1]);
+        let reset = || io::Error::from(io::ErrorKind::ConnectionReset);
+        let refused = || io::Error::from(io::ErrorKind::ConnectionRefused);
+        let mut o = Outage::default();
+        let alternating: Vec<String> = (0..20u64)
+            .filter_map(|i| {
+                let e = if i % 2 == 0 { refused() } else { reset() };
+                o.failed(t0 + Duration::from_millis(250 * i), &e)
+            })
+            .collect();
+        assert_eq!(alternating.len(), 2, "{alternating:#?}");
+        assert!(alternating[0].contains(&ceiling), "{}", alternating[0]);
+        assert!(
+            alternating[1].contains(&reset().to_string()),
+            "{}",
+            alternating[1]
+        );
+        let back = o.attached(t0 + Duration::from_secs(5)).expect("attached");
+        assert!(back.contains("after 20 failed tries"), "{back}");
+        let mut o = Outage::default();
+        let many: Vec<String> = (0..2 * OUTAGE_SAID_MAX as i32)
+            .filter_map(|n| o.failed(t0, &io::Error::from_raw_os_error(1000 + n)))
+            .collect();
+        assert_eq!(many.len(), OUTAGE_SAID_MAX, "{many:#?}");
     }
 
     /// Equal jitter: every draw lies in `[b/2, b]`, both ends reachable.

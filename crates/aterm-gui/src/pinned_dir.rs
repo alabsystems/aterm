@@ -3133,7 +3133,7 @@ mod shared_backend_contract_tests {
 }
 
 #[cfg(all(test, windows))]
-mod windows_tests {
+pub(crate) mod windows_tests {
     use super::{
         PinnedDir, imp::rename_payload, imp::test_is_direct_child, imp::test_link_count,
         windows_component_is_safe,
@@ -3401,7 +3401,7 @@ mod windows_tests {
     /// A directory junction at `link`: unlike `symlink_dir` it needs no
     /// privilege or Developer Mode, so the tests that use it run on every
     /// host.
-    fn junction(link: &std::path::Path, target: &std::path::Path) {
+    pub(crate) fn junction(link: &std::path::Path, target: &std::path::Path) {
         let plain = |path: &std::path::Path| {
             let text = path.to_str().expect("test paths are UTF-8");
             text.strip_prefix(r"\\?\").unwrap_or(text).to_owned()

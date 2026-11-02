@@ -69,7 +69,7 @@ const ARM: &str = "D3D11";
 /// architecture; COULD NOT RUN when there is no device to draw on.
 fn native_adapter() -> String {
     #[cfg(target_os = "macos")]
-    let name = crate::metal::ffi::Device::preferred()
+    let name = crate::metal::ffi::Device::preferred_listed()
         .map(|d| d.name())
         .unwrap_or_else(|| aterm_spec::host::could_not_run("no Metal device"));
     #[cfg(target_os = "linux")]
@@ -83,7 +83,7 @@ fn native_adapter() -> String {
 
 /// A renderer armed with this build's arm.
 fn record_renderer() -> GpuRenderer {
-    let ctx = GpuContext::new()
+    let ctx = GpuContext::new_headless()
         .unwrap_or_else(|e| aterm_spec::host::could_not_run(format!("no GPU context: {e}")));
     let cpu = Renderer::from_system_with_family(None, 18.0, Theme::default())
         .unwrap_or_else(|| aterm_spec::host::could_not_run("no system monospace font"));
@@ -355,6 +355,9 @@ fn draw_frames() -> Drawing {
             dx: 5,
             dy: 3,
             scrim: None,
+            serial: 0,
+            delta: None,
+            above: &[],
         };
         let f = gpu
             .try_render_input(&mut win, &heat, Some(tray))
@@ -390,6 +393,9 @@ fn draw_frames() -> Drawing {
         dx: 3,
         dy: 2,
         scrim: None,
+        serial: 0,
+        delta: None,
+        above: &[],
     };
     let overlay = DropOverlay {
         accent: 0x0040_a0ff,

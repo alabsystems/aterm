@@ -826,9 +826,10 @@ pub fn default_row_staging(label: &str, why: &AuthPathUnread) -> String {
     )
 }
 
-/// The binary `program` execs: the one an atpkg launcher script names
-/// ([`super::upgrade_catalog::twin_binary`]), else `program` itself; `None` for a bare word, a
-/// relative path, and a script that names no binary so.
+/// The binary `program` execs: the one an atpkg launcher script names (a `sh` twin, or on
+/// Windows a `.cmd` one, whose lines start with `@`; [`super::upgrade_catalog::twin_binary`]),
+/// else `program` itself; `None` for a bare word, a relative path, and a script that names no
+/// binary so.
 fn exec_target(program: &Path) -> Option<PathBuf> {
     use std::io::Read as _;
     if !program.is_absolute() {
@@ -839,7 +840,7 @@ fn exec_target(program: &Path) -> Option<PathBuf> {
     };
     let mut head = Vec::new();
     file.take(LAUNCHER_MAX + 1).read_to_end(&mut head).ok()?;
-    if head.starts_with(b"#!") {
+    if head.starts_with(b"#!") || head.starts_with(b"@") {
         if head.len() as u64 > LAUNCHER_MAX {
             return None;
         }
@@ -939,6 +940,20 @@ pub fn lay_package(root: &Path, reads_auth_path: bool) -> PathBuf {
     .concat();
     std::fs::write(&exe, bytes).expect("package binary");
     exe
+}
+
+/// atpkg's launcher for `exe` as this platform's twin spells it, for a test: a `sh` twin's
+/// `exec '<exe>' "$@"`, or on Windows a `.cmd` twin's `@"<exe>" %* & @exit /b` after its frame.
+#[cfg(test)]
+pub(crate) fn twin_text(exe: &Path) -> String {
+    if cfg!(windows) {
+        format!(
+            "@goto :main\r\n:main\r\n@\"{}\" %* & @exit /b\r\n",
+            exe.display()
+        )
+    } else {
+        format!("#!/bin/sh\n# atpkg shim\nexec '{}' \"$@\"\n", exe.display())
+    }
 }
 
 /// THE ENVIRONMENT A CODEX RELAUNCH LINE MUST CARRY.

@@ -307,11 +307,15 @@ pub fn pass_lock_for(home: &Path) -> PathBuf {
 
 /// Cross-instance non-blocking flock guard for a disk-watch pass.
 #[derive(Debug)]
-pub struct PassLock(std::fs::File);
+pub struct PassLock {
+    file: std::fs::File,
+    #[cfg(target_os = "macos")]
+    path: PathBuf,
+}
 
 impl Drop for PassLock {
     fn drop(&mut self) {
-        let _ = self.0.unlock();
+        let _ = self.file.unlock();
     }
 }
 
@@ -335,7 +339,7 @@ pub fn take_pass(path: &Path) -> std::io::Result<Option<PassLock>> {
     {
         use std::os::unix::fs::OpenOptionsExt as _;
         opts.mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
     }
     #[cfg(windows)]
     {
@@ -343,6 +347,16 @@ pub fn take_pass(path: &Path) -> std::io::Result<Option<PassLock>> {
         opts.custom_flags(super::win::FILE_FLAG_OPEN_REPARSE_POINT);
     }
     let file: std::fs::File = opts.open(path)?;
+    #[cfg(unix)]
+    {
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "pass lock is not a regular file",
+            ));
+        }
+        aterm_uds::keep_out_of_children(&file)?;
+    }
     #[cfg(windows)]
     {
         let meta = file.metadata()?;
@@ -359,9 +373,65 @@ pub fn take_pass(path: &Path) -> std::io::Result<Option<PassLock>> {
     )]
     let taken = file.try_lock();
     match taken {
-        Ok(()) => Ok(Some(PassLock(file))),
+        Ok(()) => Ok(Some(PassLock {
+            file,
+            #[cfg(target_os = "macos")]
+            path: path.to_path_buf(),
+        })),
         Err(std::fs::TryLockError::WouldBlock) => Ok(None),
         Err(std::fs::TryLockError::Error(e)) => Err(e),
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl PassLock {
+    /// Validate that this genuine held guard still names the exact requested pass file.
+    /// The descriptor is private and cannot be cloned or unlocked by a caller.
+    /// # Errors
+    /// The requested path differs, no longer names this private owner-readable/writable inode,
+    /// or cannot currently be opened read-write under the ordinary pass-lock rules.
+    pub fn validate_for(&self, path: &Path) -> std::io::Result<(u64, u64)> {
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+        if path != self.path {
+            return Err(std::io::Error::other(
+                "disk pass guard belongs to another path",
+            ));
+        }
+        let parent = path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("disk pass guard has no parent"))?;
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| std::io::Error::other("disk pass guard has no private file name"))?;
+        // Reuse the owner/mode/ACL/link checks without creating or narrowing any file.
+        let (_, checked) =
+            aterm_uds::private_file::open_private(parent, name).map_err(std::io::Error::other)?;
+        let writable = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(path)?
+            .metadata()?;
+        let held = self.file.metadata()?;
+        let named = std::fs::symlink_metadata(path)?;
+        if !held.is_file()
+            || !named.is_file()
+            || (held.dev(), held.ino()) != (named.dev(), named.ino())
+            || (held.dev(), held.ino()) != (checked.dev(), checked.ino())
+            || (held.dev(), held.ino()) != (writable.dev(), writable.ino())
+            || [held.mode(), named.mode(), checked.mode(), writable.mode()]
+                .iter()
+                .any(|mode| *mode & 0o600 != 0o600 || *mode != checked.mode())
+            || [held.uid(), named.uid(), writable.uid()]
+                .iter()
+                .any(|uid| *uid != checked.uid())
+        {
+            return Err(std::io::Error::other(
+                "disk pass guard identity, owner or read-write mode changed",
+            ));
+        }
+        Ok((held.dev(), held.ino()))
     }
 }
 

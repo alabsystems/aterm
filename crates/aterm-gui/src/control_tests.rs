@@ -5,6 +5,208 @@ const EVENTUALLY: std::time::Duration = std::time::Duration::from_secs(60);
 
 const LIVE_FOREIGN_PID: u32 = if cfg!(windows) { 4 } else { 1 };
 
+#[test]
+fn recognized_scoped_connections_cannot_use_owner_or_person_input_adapters() {
+    let h = crate::session_store::test_handle_on(7620, -1);
+    crate::session_timeline::scoped_input_tests::install(
+        &h.ctx,
+        71,
+        &[aterm_agent::harness::contract::Scope::Upgrade],
+    );
+    struct Restore(Option<u64>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SERVING_CONNECTION.with(|conn| conn.set(self.0));
+        }
+    }
+    let _restore = Restore(SERVING_CONNECTION.with(|conn| conn.replace(Some(71))));
+    let _principal = ServingPrincipal::enter(Principal::Instance);
+    for verb in ["send", "key"] {
+        let (options, _) = control_input::take_leading_options(input_of(verb), "as=person enter");
+        assert!(options.as_person);
+        assert!(
+            supervisor_input_fence(
+                &h.ctx,
+                -1,
+                options.supervisor_request(),
+                options.if_supervisor.as_deref()
+            )
+            .is_err()
+        );
+    }
+    assert!(
+        scoped_untyped_input_refusal(&h.ctx, crate::metrics::now_us()).is_some(),
+        "also used by binary and app PTY adapters"
+    );
+    for body in ["Paste", "unread=ok Paste"] {
+        assert!(
+            scoped_app_input_refusal(&h.ctx, input_of("invoke"), "invoke", body).is_some(),
+            "recognized scoped peer cannot use invoke {body}"
+        );
+    }
+    assert!(
+        scoped_app_input_refusal(&h.ctx, input_of("invoke"), "invoke", "SystemState").is_none()
+    );
+    SERVING_CONNECTION.with(|conn| conn.set(Some(999)));
+    assert!(
+        supervisor_input_fence(&h.ctx, -1, None, None)
+            .unwrap()
+            .is_none(),
+        "independent instance operator keeps its existing authority"
+    );
+    let _harness = ServingPrincipal::enter(Principal::Harness);
+    assert!(
+        supervisor_input_fence(&h.ctx, -1, None, None).is_err(),
+        "private harness must use its explicit retained duty"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn released_or_expired_scoped_connections_cannot_reach_untyped_person_frame_or_app_writers() {
+    use aterm_agent::harness::contract::Scope as Duty;
+    for expires in [false, true] {
+        let store = session_store::new_store();
+        let (front, reader) = pipe_session(7624 + u64::from(expires));
+        store.write().unwrap().register(front.clone());
+        let active = active_for_handle(&front);
+        crate::session_timeline::scoped_input_tests::install(&front.ctx, 71, &[Duty::Upgrade]);
+        let now = crate::metrics::now_us();
+        if expires {
+            front
+                .ctx
+                .meta
+                .lock()
+                .unwrap()
+                .supervisor
+                .as_mut()
+                .unwrap()
+                .expires_us = Some(now);
+        } else {
+            assert!(crate::session_timeline::release_supervisor_held_by(
+                &front.ctx,
+                "grok-alab@4242",
+                now,
+                aterm_slog::Actor::Ctl
+            ));
+        }
+        struct Restore(Option<u64>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                SERVING_CONNECTION.with(|conn| conn.set(self.0));
+            }
+        }
+        let _restore = Restore(SERVING_CONNECTION.with(|conn| conn.replace(Some(71))));
+        let _principal = ServingPrincipal::enter(Principal::Instance);
+        for relabeled in [false, true] {
+            if relabeled {
+                if expires {
+                    assert!(crate::session_timeline::lapse_supervisor(&front.ctx, now));
+                }
+                assert!(
+                    crate::session_timeline::claim_supervisor_as(
+                        &front.ctx,
+                        "ordinary-owner",
+                        Some(71),
+                        None,
+                        None,
+                        now,
+                        aterm_slog::Actor::Ctl
+                    )
+                    .is_ok()
+                );
+            }
+            for (verb, body) in [
+                ("send", "X"),
+                ("send", "as=person X"),
+                ("key", "as=person x"),
+                ("feed", "58"),
+                ("paste", "X"),
+                ("turn", "X"),
+            ] {
+                let (options, _) = control_input::take_leading_options(input_of(verb), body);
+                assert!(
+                    supervisor_input_fence(
+                        &front.ctx,
+                        -1,
+                        options.supervisor_request(),
+                        options.if_supervisor.as_deref()
+                    )
+                    .is_err(),
+                    "{verb} {body}, expired={expires}, relabeled={relabeled}"
+                );
+            }
+            for (verb, body) in [
+                ("invoke", "Paste"),
+                ("invoke", "unread=ok Paste"),
+                ("hwkey", "x"),
+            ] {
+                assert!(scoped_app_input_refusal(&front.ctx, input_of(verb), verb, body).is_some());
+            }
+            for verb in ["feed-bin", "paste-bin"] {
+                let mut payload = std::io::Cursor::new(b"Xafter\n".to_vec());
+                let mut out = Vec::new();
+                let mut dispatch = |_, _| -> Result<InputOutcome, String> {
+                    panic!("ended scoped claimant reached actual frame dispatch")
+                };
+                assert!(feed_bin_routed(
+                    &format!("@{} {verb} 1", front.local_id),
+                    &mut payload,
+                    FeedBinRoute {
+                        active: &active,
+                        store: &store,
+                        scope: Scope::Owner
+                    },
+                    &mut dispatch,
+                    &mut out
+                ));
+                assert_eq!(
+                    String::from_utf8_lossy(&out),
+                    crate::session_timeline::SCOPED_INPUT_DENIED
+                );
+                assert_eq!(
+                    read_request_line(&mut payload).as_deref(),
+                    Some("after"),
+                    "refusal preserves frame synchronization"
+                );
+                assert!(drain_pipe(&reader).is_empty());
+            }
+        }
+        SERVING_CONNECTION.with(|conn| conn.set(Some(999)));
+        assert!(
+            supervisor_input_fence(&front.ctx, -1, None, None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            scoped_app_input_refusal(&front.ctx, input_of("invoke"), "invoke", "unread=ok Paste")
+                .is_none()
+        );
+        let mut dispatched = 0;
+        let mut dispatch = |_, _| {
+            dispatched += 1;
+            Ok(InputOutcome::Ok)
+        };
+        let mut out = Vec::new();
+        assert!(feed_bin_routed(
+            &format!("@{} feed-bin 1", front.local_id),
+            &mut std::io::Cursor::new(b"O".to_vec()),
+            FeedBinRoute {
+                active: &active,
+                store: &store,
+                scope: Scope::Owner
+            },
+            &mut dispatch,
+            &mut out
+        ));
+        assert_eq!(String::from_utf8_lossy(&out), "OK 1 bytes\n");
+        assert_eq!(
+            dispatched, 1,
+            "independent operator keeps its existing frame authority"
+        );
+    }
+}
+
 fn live_foreign_entry() -> String {
     format!("sock /nonexistent/aterm.sock\nnonce ab\npid {LIVE_FOREIGN_PID}\n")
 }
@@ -1913,16 +2115,14 @@ fn acknowledge_then_exit(
     await_ack(outbox, server)
 }
 
-/// Assert the peer really detached.
+/// Assert the peer really detached: the client end's last descriptor closed, which a copy a
+/// child spawned meanwhile holds back until it lets go.
 #[track_caller]
 fn assert_peer_detached(server: &CtlStream) {
     #[cfg(not(unix))]
     let _ = server;
     #[cfg(unix)]
-    assert!(
-        aterm_uds::hangup::peer_closed(server),
-        "the client end's last descriptor closed: the peer detached"
-    );
+    aterm_spec::wait::until_peer_closed(server);
     #[cfg(target_os = "macos")]
     assert_eq!(
         server
@@ -2295,16 +2495,20 @@ use std::os::unix::io::FromRawFd;
 fn owner_only_verbs_refuse_an_edge_and_a_named_session() {
     let edge = Scope::Edge(aterm_session::EdgeToken::generate());
     let denied = |refusal: Option<String>| refusal.is_some_and(|r| r.starts_with("ERR denied"));
-    assert!(denied(owner_only_refusal(
-        "sessions",
-        Some(&Selector::Local(7)),
-        Scope::Owner
-    )));
-    assert!(denied(owner_only_refusal("sessions", None, edge)));
-    assert_eq!(
-        owner_only_refusal("sessions", Some(&Selector::SelfTok), Scope::Owner),
-        None
-    );
+    for verb in ["sessions", "native-focus"] {
+        let form = aterm_types::control_verbs::spec_for(verb, "").unwrap();
+        assert!(matches!(route(verb, Some(form)), Ok((Route::Owner, _))));
+        assert!(denied(owner_only_refusal(
+            verb,
+            Some(&Selector::Local(7)),
+            Scope::Owner
+        )));
+        assert!(denied(owner_only_refusal(verb, None, edge)));
+        assert_eq!(
+            owner_only_refusal(verb, Some(&Selector::SelfTok), Scope::Owner),
+            None
+        );
+    }
 }
 
 #[test]
@@ -4533,6 +4737,49 @@ fn sessionless_front_key_is_owner_bare_only_and_terminal_routing_is_unchanged() 
     );
 }
 
+/// A bare `end` with no terminal in front is an owner's, served with no session: an owner-class
+/// connection may end any row the view offers, so it needs none; an edge has no session to end
+/// its own rows from, and is denied. A terminal in front and an explicit target keep the
+/// session's path. NEGATIVE CONTROL: leave `end` out of the verbs served without a session, and
+/// an owner's bare `end` falls to `ERR no active terminal`.
+#[test]
+fn sessionless_front_end_is_owner_bare_only_and_terminal_routing_is_unchanged() {
+    let caller = sessionless_front_end("end", None, false, NativeControlPrincipal::Owner)
+        .expect("a bare end with no terminal in front is served without a session")
+        .expect("an owner may end any row");
+    assert!(caller.owner, "{caller:?}");
+    assert_eq!((caller.key, caller.sid), (0, ""));
+    assert!(
+        sessionless_front_end(
+            "end",
+            Some(&Selector::SelfTok),
+            false,
+            NativeControlPrincipal::Owner
+        )
+        .is_some_and(|c| c.is_ok()),
+        "@self with no terminal in front is the bare form",
+    );
+    assert!(
+        sessionless_front_end("end", None, true, NativeControlPrincipal::Owner).is_none(),
+        "a terminal front keeps the session's path",
+    );
+    assert!(
+        sessionless_front_end(
+            "end",
+            Some(&Selector::Local(7)),
+            false,
+            NativeControlPrincipal::Owner,
+        )
+        .is_none(),
+        "an explicit selector remains an exact terminal-session target",
+    );
+    assert!(matches!(
+        sessionless_front_end("end", None, false, NativeControlPrincipal::Edge),
+        Some(Err("ERR denied\n"))
+    ));
+    assert!(sessionless_front_end("signal", None, false, NativeControlPrincipal::Owner).is_none());
+}
+
 #[test]
 fn both_forms_of_resize_survive_a_native_front() {
     let route = sessionless_front_window_resize(
@@ -4707,58 +4954,20 @@ fn app_route_denies_an_edge_before_it_looks() {
     );
 }
 
-/// The session an `@<sid>` resolves to is the one `open autopilot-menu at=…` opens the program's
-/// menu for: the line's selector, through [`app_route`], to [`open_route`]. NEGATIVE CONTROLS:
-/// the same words with no selector, or `@.` (this connection's own), are unaimed and answer the
-/// aimed form's usage; the bare form routes as before, aimed or not.
+/// The retired program-coordinate popup is refused with or without a session selector.
 #[test]
-fn open_routes_the_menu_a_program_asks_for_to_the_session_it_aims_at() {
+fn legacy_program_menu_coordinates_are_refused() {
     use crate::control::control_media::OpenRoute;
-    let handle = crate::session_store::test_handle(7);
-    let hosted: Target = (
-        handle.term.clone(),
-        handle.master,
-        handle.local_id,
-        handle.ctx.clone(),
-    );
-    let routed = |line: &str| {
-        let Head { selector, rest, .. } = control_request::head(line);
-        let aim = app_route(NativeControlPrincipal::Owner, selector.as_ref(), |_| {
-            Resolution::Hosted(hosted.clone())
-        })
-        .expect("the Owner's line routes");
-        open_route(&aim, rest)
-    };
-    assert_eq!(
-        routed("@7 open autopilot-menu at=20,40 by=keys"),
-        OpenRoute::ProgramMenu(crate::autopilot_menu::ProgramMenu {
-            session: 7,
-            cell: (20, 40),
-            keyboard: true,
-        })
-    );
-    for unaimed in [
+    for line in [
+        "@7 open autopilot-menu at=20,40 by=keys",
         "open autopilot-menu at=20,40 by=keys",
         "@. open autopilot-menu at=20,40 by=keys",
     ] {
-        assert!(
-            matches!(
-                routed(unaimed),
-                OpenRoute::Refused(refusal)
-                    if refusal.starts_with("ERR usage: @<sid> open autopilot-menu at=")
-            ),
-            "{unaimed:?}"
-        );
-    }
-    for bare in ["@7 open autopilot-menu", "open autopilot-menu"] {
-        assert_eq!(
-            routed(bare),
-            OpenRoute::Aux {
-                target: crate::app_introspect::AuxTarget::AutopilotMenu,
-                close: false,
-            },
-            "{bare:?}"
-        );
+        let Head { rest, .. } = control_request::head(line);
+        assert!(matches!(
+            control_media::open_route(rest),
+            OpenRoute::Refused(_)
+        ));
     }
 }
 
@@ -5650,6 +5859,28 @@ fn escalation(verb: &str, rest: &str) -> Option<Need> {
 }
 
 #[test]
+fn retained_gui_network_inspection_requires_owner_authority() {
+    let (_app, ctx, tokens) = closed_session_fixture(&[Op::ReadScreen]);
+    let reader = Scope::Edge(tokens[0]);
+    for rest in ["app/v1 network", " app/v1   network "] {
+        assert_eq!(escalation("inspect", rest), Some(Need::OwnerOnly));
+        assert!(line_authorized(Scope::Owner, "inspect", rest, &ctx));
+        assert!(!line_authorized(reader, "inspect", rest, &ctx));
+        assert!(!line_authorized(
+            Scope::Fleet {
+                content: true,
+                drive: true
+            },
+            "inspect",
+            rest,
+            &ctx,
+        ));
+    }
+    assert!(line_authorized(reader, "inspect", "app/v1 tabs", &ctx));
+    assert_eq!(escalation("inspect", "app/v1 tabs"), None);
+}
+
+#[test]
 fn the_verb_only_projection_agrees_with_the_dispatch_gate() {
     use aterm_types::control_verbs::VERBS;
     for row in VERBS {
@@ -5776,6 +6007,10 @@ fn escalated_op_fences_argument_dependent_seams() {
         ("brief", "budget=100 r1", None),
         ("brief", "", None),
         ("brief", "budget=x all", owner),
+        ("sys", "left", None),
+        ("sys", "left scope=pane --json", None),
+        ("sys", "left scope=aterm", owner),
+        ("sys", "left scope=aterm top=3 --json", owner),
         ("family", "", None),
         ("family", "  ", None),
         ("family", "s-other", owner),
@@ -6759,6 +6994,7 @@ fn registered_session(local_id: u64, master: i32, seed: &[u8]) -> SessionHandle 
         frame: Default::default(),
         witness: Default::default(),
         fenced_writes: Default::default(),
+        native_policy: Default::default(),
     });
     SessionHandle {
         sid,
@@ -17215,11 +17451,13 @@ fn the_supervisor_key_is_owner_only_shown_in_the_roster_and_released_with_its_co
             owner.ends_with(" copy=- upgrade=- land_at=- task=- pause=- task_state=- task_rev=0"),
             "{line}"
         );
-        head.strip_suffix(" supervisor_proven=0 autopilot=-")
-            .unwrap_or_else(|| {
-                panic!("an unproven claim's supervisor_proven=0, then autopilot=: {line}")
-            })
-            .to_string()
+        head.strip_suffix(
+            " supervisor_proven=0 supervisor_version=- supervisor_vendor=- autopilot=-",
+        )
+        .unwrap_or_else(|| {
+            panic!("an unproven claim's supervisor_proven=0, then autopilot=: {line}")
+        })
+        .to_string()
     };
     assert!(row().ends_with(" supervisor=-"), "{}", row());
 
@@ -18909,8 +19147,9 @@ fn a_turn_that_wrote_nothing_leaves_its_id_for_the_retry() {
 #[test]
 fn a_turn_write_refused_whole_carries_the_line_send_answers() {
     let h = crate::session_store::test_handle(0);
+    let fence = crate::session_timeline::SupervisorInputDelivery::Legacy("sup-a".to_string());
     assert_eq!(
-        turn_write(&h.ctx, Some("sup-a"), || panic!("the fence refuses first")),
+        turn_write(&h.ctx, Some(&fence), || panic!("the fence refuses first")),
         Err(Some("ERR busy supervisor=-\n".to_string()))
     );
     assert_eq!(
@@ -20249,13 +20488,30 @@ fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
     const CWD: &str = if cfg!(windows) { "C:/tmp" } else { "/tmp" };
     let hosts = |sid: &SessionId| [W, MINE].contains(&sid.as_str());
     let spawned = |sid: &SessionId| sid.as_str() == W;
-    let gate = |line: &str| drive_gate(line, &hosts, &spawned);
+    let gate = |line: &str| drive_gate(line, &hosts, &spawned, &|_| false);
     let wrote = |line: &str| match gate(line) {
         Ok(DriveLine::Act { write, .. }) => write.map(|act| act.verb),
         other => panic!("{line:?} was not admitted: {other:?}"),
     };
     assert_eq!(gate("survey"), Ok(DriveLine::Fleet));
     assert_eq!(gate("version"), Ok(DriveLine::Fleet));
+    assert_eq!(
+        wrote("accounts-renew start=0123456789abcdef0123456789abcdef"),
+        Some("accounts-renew")
+    );
+    assert_eq!(
+        wrote("accounts-renew poll=0123456789abcdef0123456789abcdef"),
+        None
+    );
+    for refused in [
+        "accounts-renew",
+        "accounts-renew start=x",
+        "accounts-renew run=0123456789abcdef0123456789abcdef",
+        "accounts-renew start=0123456789abcdef0123456789abcdef command=sh",
+        "@s-00000000000000aa accounts-renew start=0123456789abcdef0123456789abcdef",
+    ] {
+        assert!(gate(refused).is_err(), "{refused}");
+    }
     for read in [
         format!("@{W} status"),
         format!("@{W} text"),
@@ -20352,6 +20608,7 @@ fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
         "spawn agent=claude".to_owned(),
         "spawn len=5".to_owned(),
         "spawn agent=codex-old len=5".to_owned(),
+        "spawn agent=bogus len=5".to_owned(),
         "spawn agent=generic len=5".to_owned(),
         "spawn agent=gemini".to_owned(),
         "spawn agent=agy identity=x len=5".to_owned(),
@@ -20361,6 +20618,9 @@ fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
         "spawn agent=claude window=1 len=5".to_owned(),
         "spawn agent=claude split=v len=5".to_owned(),
         "spawn agent=claude theme=x len=5".to_owned(),
+        format!("spawn agent=claude cwd={CWD} command=echo len=5"),
+        format!("spawn cwd={CWD} len=5"),
+        "spawn agent=claude len=5 -".to_owned(),
         format!("spawn connected=controlled place=tab of={W}"),
         format!("@{W} spawn agent=claude len=5"),
         format!("hold {W} on origin=local"),
@@ -20374,44 +20634,27 @@ fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
     ] {
         let refused = gate(&line);
         assert!(
-            refused.as_ref().is_err_and(|why| {
-                !why.contains("this Mac") && !why.contains("this aterm") && !why.contains(" here")
-            }),
-            "{line:?}: the driving Mac reads the refusal too: {refused:?}"
+            refused.is_err(),
+            "{line:?}: a forbidden drive command was admitted: {refused:?}"
         );
     }
     for word in ["gemini", "Gemini", "gemini-cli"] {
         let line = format!("spawn agent={word} model=m-1 cwd={CWD} len=5");
-        assert_eq!(
-            gate(&line).err(),
-            Some(format!(
-                "spawn agent={word}: Gemini CLI is no longer supported: agy replaces it \
-                 (agent=agy)"
-            )),
-            "{line}: the retired Gemini CLI is refused by name"
+        assert!(
+            gate(&line).is_err(),
+            "{line}: a retired worker was admitted"
         );
     }
-    assert_eq!(
-        gate(&format!("hold @{W} on")).err().as_deref(),
-        Some(
-            "a drive's hold names a session the driven Mac hosts by its bare sid, with no @: \
-             hold s-… on|off [reason=<pct>]"
-        ),
-        "the form a hold takes"
-    );
     for line in [
+        format!("hold @{W} on"),
         format!("@{W} hold on"),
         format!("@{W} hold {W} on"),
         "@s-00000000000000cc hold on".to_owned(),
         format!("@1 hold {W} off"),
     ] {
-        assert_eq!(
-            gate(&line).err().as_deref(),
-            Some(
-                "a drive's hold names its session as its argument, never a selector: hold s-… \
-                 on|off [reason=<pct>]"
-            ),
-            "{line}: the form a hold takes"
+        assert!(
+            gate(&line).is_err(),
+            "{line}: a malformed hold was admitted"
         );
     }
     for line in [
@@ -20426,29 +20669,16 @@ fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
             "{line}: a worker it hosts no more, as on one Mac"
         );
     }
-    let unhosted = gate("@s-00000000000000cc status").err();
-    assert!(
-        unhosted.as_deref().is_some_and(|why| !why.contains('@')),
-        "{unhosted:?}"
-    );
+    for line in ["@s-00000000000000cc status", "hold s-00000000000000cc off"] {
+        assert!(
+            gate(line).is_err(),
+            "{line}: an unknown session was admitted"
+        );
+    }
     assert_eq!(
-        gate("hold s-00000000000000cc off").err(),
-        unhosted,
-        "a bare sid it does not host: no session, as for every verb"
-    );
-    let usage = gate("spawn agent=bogus len=5").err().unwrap_or_default();
-    assert!(
-        usage.starts_with("a drive spawns only a worker: spawn agent=<claude|codex|agy|muse")
-            && !usage.contains("len=")
-            && usage.contains("|grok") == aterm_phase::Program::Grok.supervisable(),
-        "{usage}"
-    );
-    let long = format!("{:?}", gate(&format!("@{W} turn timeout=22001 hi")));
-    assert!(
-        long.contains("give it a shorter timeout=, or say settle=submitted")
-            && long.contains("`await task @<sid>:<task_rev>`")
-            && long.contains("any other session with `@<sid> status` (or `text`)"),
-        "{long}"
+        wrote("spawn agent=grok len=5"),
+        Some("spawn"),
+        "recognized worker grammar leaves supervision admission to the launch path"
     );
 }
 
@@ -20592,6 +20822,7 @@ fn only_a_drive_scope_on_a_drivers_thread_passes_the_drive_gate() {
 fn a_drives_record_names_what_moved() {
     let sid = SessionId::new("s-0000000000d71e00");
     let hold = |on, held| DriveAct {
+        shell: false,
         verb: "hold",
         sid: Some(sid.clone()),
         hold: Some(HoldAsk { on, held }),
@@ -20631,6 +20862,7 @@ fn a_drives_record_names_what_moved() {
         );
     }
     let act = |verb| DriveAct {
+        shell: false,
         verb,
         sid: Some(sid.clone()),
         hold: None,
@@ -20653,6 +20885,7 @@ fn a_drives_record_names_what_moved() {
     let worker = SessionId::new("s-0000000000d71e01");
     let _driving = crate::fabric::DrivingAs::enter(driver.clone());
     let spawn = DriveAct {
+        shell: false,
         verb: "spawn",
         sid: None,
         hold: None,
@@ -20665,6 +20898,7 @@ fn a_drives_record_names_what_moved() {
     note_drive_act(&spawn, &reply, &store);
     assert_eq!(drive_spawned_by(&worker), Some(driver.node.clone()));
     let close = DriveAct {
+        shell: false,
         verb: "close",
         sid: Some(worker.clone()),
         hold: None,
@@ -20695,6 +20929,171 @@ fn a_drives_typing_is_credited_to_its_host_over_the_fleet() {
 }
 
 #[test]
+fn plain_fleet_shell_grammar_cannot_carry_commands_tasks_or_extra_placement() {
+    let no = |_: &SessionId| false;
+    let gate = |line: &str| drive_gate(line, &no, &no, &no);
+    let Ok(DriveLine::Act {
+        line,
+        write: Some(act),
+    }) = gate("spawn cwd=/private/tmp")
+    else {
+        panic!("the explicit plain shell is admitted");
+    };
+    assert_eq!(line, "spawn cwd=/private/tmp raise=false");
+    assert!(act.shell);
+    assert_eq!(act.verb, "spawn");
+    for line in [
+        "spawn",
+        "spawn cwd=relative",
+        "spawn cwd=/tmp len=2",
+        "spawn cwd=/tmp -",
+        "spawn cwd=/tmp command=sh",
+        "spawn cwd=/tmp from=s-x",
+        "spawn cwd=/tmp model=x",
+        "spawn cwd=/tmp cwd=/",
+        "spawn cwd=/tmp raise=false raise=false",
+        "spawn cwd=/tmp raise=true",
+        "spawn cwd=/tmp split=v",
+        "spawn cwd=/tmp window=0",
+        "spawn cwd=/tmp connected=controlled",
+        "spawn cwd=/tmp\nversion",
+    ] {
+        assert!(gate(line).is_err(), "{line}");
+    }
+}
+
+#[test]
+fn owned_shell_history_and_waits_are_bounded_and_not_granted_to_workers() {
+    let sid = SessionId::new("s-a8227f");
+    let hosts = |s: &SessionId| s == &sid;
+    for rest in [
+        "blocks",
+        "blocks 4 --json",
+        "blocktext 4 trim",
+        "await idle 100 timeout=22000",
+        "await idle 0 timeout=0",
+        "await idle 22000 timeout=22000",
+        "await block timeout=0",
+    ] {
+        let line = format!("@{sid} {rest}");
+        assert!(drive_gate(&line, &hosts, &hosts, &hosts).is_ok(), "{line}");
+        assert!(
+            drive_gate(&line, &hosts, &hosts, &|_| false).is_err(),
+            "worker: {line}"
+        );
+    }
+    for rest in [
+        "blocks 1 extra",
+        "blocktext 4 extra",
+        "await block",
+        "await block timeout=22001",
+        "await idle 22001 timeout=22000",
+        "await idle 18446744073709551615 timeout=22000",
+        "await idle 100 timeout=1 timeout=2",
+        "await log open=run timeout=1",
+        "await match secret timeout=1",
+    ] {
+        let line = format!("@{sid} {rest}");
+        assert!(drive_gate(&line, &hosts, &hosts, &hosts).is_err(), "{line}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn owned_shell_reads_and_close_recheck_driver_and_human_adoption() {
+    let store = crate::session_store::new_store();
+    let (handle, _output) = pipe_session(8228);
+    let sid = handle.sid.clone();
+    let ctx = Arc::clone(&handle.ctx);
+    store.write().unwrap().register(handle);
+    let driver = crate::fabric::Driver {
+        node: "8228".repeat(8),
+        host: "owner".to_owned(),
+    };
+    let _driving = crate::fabric::DrivingAs::enter(driver.clone());
+    assert!(record_driven_shell(&store, sid.as_str(), &driver.node));
+    let read = DriveAct {
+        verb: "shell-read",
+        sid: Some(sid.clone()),
+        hold: None,
+        shell: false,
+    };
+    assert!(drive_owns_shell(&store, &sid, &driver.node));
+    assert!(!drive_owns_shell(&store, &sid, "foreign"));
+    assert_eq!(
+        drive_close_admission(&store, 8228, &driver.node),
+        Some(true)
+    );
+    assert_eq!(drive_close_admission(&store, 8228, "foreign"), None);
+    store
+        .write()
+        .unwrap()
+        .set_state(8228, crate::session_store::SessionState::Exited);
+    assert!(
+        drive_read_still_owned(&read, &store),
+        "completed shell output remains readable"
+    );
+    assert_eq!(
+        drive_close_admission(&store, 8228, &driver.node),
+        Some(true)
+    );
+    store
+        .write()
+        .unwrap()
+        .set_state(8228, crate::session_store::SessionState::Alive);
+    assert!(drive_read_still_owned(&read, &store));
+    ctx.human_input.note(1, crate::human_input::Gesture::Typed);
+    assert!(!drive_owns_shell(&store, &sid, &driver.node));
+    assert!(
+        !drive_read_still_owned(&read, &store),
+        "an already-admitted wait cannot return after human input"
+    );
+    assert_eq!(
+        drive_close_admission(&store, 8228, &driver.node),
+        None,
+        "the UI close recheck refuses adoption"
+    );
+    let close = DriveAct {
+        verb: "close",
+        sid: Some(sid),
+        hold: None,
+        shell: false,
+    };
+    note_drive_act(&close, "OK closed\n", &store);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_persons_takeover_ends_plain_shell_ownership_even_after_handback() {
+    let mut app = crate::App::headless_for_test();
+    let local = app.next_session_id;
+    let session = crate::stub_session(local);
+    let sid = session.ctx.self_id.clone();
+    app.push_stub_tab(crate::WindowId(0), session);
+    let driver = crate::fabric::Driver {
+        node: "8229".repeat(8),
+        host: "owner".to_owned(),
+    };
+    let _driving = crate::fabric::DrivingAs::enter(driver.clone());
+    assert!(record_driven_shell(&app.store, sid.as_str(), &driver.node));
+    assert_eq!(
+        drive_close_admission(&app.store, local, &driver.node),
+        Some(true)
+    );
+    app.take_over_session(local).expect("person takes it");
+    app.hand_back_session(local).expect("person hands it back");
+    assert_eq!(drive_close_admission(&app.store, local, &driver.node), None);
+    assert!(
+        app.close_control_session(local, Some(&driver.node))
+            .is_err()
+    );
+    assert!(
+        app.store.read().unwrap().by_sid(&sid).is_some(),
+        "the final close path leaves the adopted session intact"
+    );
+}
+
+#[test]
 fn sys_escalates_its_owner_only_forms_by_its_own_parser() {
     for scoped in [
         "",
@@ -20715,6 +21114,9 @@ fn sys_escalates_its_owner_only_forms_by_its_own_parser() {
         "why global.mem --json",
         "why top=3 fresh=0",
         "why since=7f3a.12",
+        "left",
+        "left scope=pane",
+        "left scope=tab --json",
     ] {
         assert_eq!(argument_escalation("sys", scoped), None, "{scoped}");
     }
@@ -20732,6 +21134,9 @@ fn sys_escalates_its_owner_only_forms_by_its_own_parser() {
         "why scope=tab",
         "why instances=all",
         "why cpu mem",
+        "left scope=aterm",
+        "left scope=window",
+        "left scope=global",
     ] {
         assert_eq!(
             argument_escalation("sys", owner),

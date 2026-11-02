@@ -79,7 +79,9 @@ fn running_as_root() -> bool {
 }
 
 fn plan(layout: &Layout, landed: &BTreeSet<String>) -> Vec<(&'static VendorSpec, u64)> {
-    let removed = layout.removed_programs();
+    let Ok(removed) = layout.removed_programs() else {
+        return Vec::new();
+    };
     let active = crate::active_builds(layout);
     landed
         .iter()
@@ -151,7 +153,7 @@ impl Request {
         if !prefix.is_absolute() {
             return None;
         }
-        let build = build.to_str()?.parse().ok()?;
+        let build = crate::store::parse_build_name(build.to_str()?)?;
         Some(Self {
             spec,
             prefix,
@@ -342,6 +344,9 @@ enum Ended {
     Killed,
     /// It could not be started.
     SpawnFailed,
+    /// Not run: its build could not be held for first exec, or no wrapper could
+    /// faithfully pin that target ([`crate::store::hold_first_exec`]).
+    Unheld,
     /// Not run: the user opted out of the traffic it makes ([`Warm::opt_out`]).
     OptedOut,
     /// Not run: the program has never run on this account ([`Warm::state`]).
@@ -359,6 +364,7 @@ impl Ended {
             Self::Signal(n) => format!("signal={n}"),
             Self::Killed => String::from("killed"),
             Self::SpawnFailed => String::from("spawn-failed"),
+            Self::Unheld => String::from("unheld"),
             Self::OptedOut => String::from("opted-out"),
             Self::NeverRun => String::from("never-run"),
             Self::SetupUnread => String::from("setup-unread"),
@@ -393,6 +399,23 @@ fn warm(
     hold: Duration,
     deadline: Duration,
 ) -> Option<Ended> {
+    warm_with_launch(request, inherited, login, home, |command| {
+        match aterm_uds::spawnfd::spawn_past_text_busy(|| command.spawn()) {
+            Ok(child) => drive(child, hold, deadline),
+            Err(_) => Ended::SpawnFailed,
+        }
+    })
+}
+
+type WarmCommand = aterm_uds::spawnfd::Command;
+
+fn warm_with_launch(
+    request: &Request,
+    inherited: &[(OsString, OsString)],
+    login: impl FnOnce() -> Option<Vec<(OsString, OsString)>>,
+    home: Option<&Path>,
+    launch: impl FnOnce(&mut WarmCommand) -> Ended,
+) -> Option<Ended> {
     let layout = Layout {
         prefix: request.prefix.clone(),
     };
@@ -410,22 +433,35 @@ fn warm(
         return Some(ended);
     };
     let started = std::time::Instant::now();
+    let exe = layout
+        .build_dir(program, request.build)
+        .join("bin")
+        .join(tool.exe_file());
     let ended = if let Some(declined) = declined(warm, &setup, home) {
         declined
-    } else {
+    } else if let Ok(first_exec) = crate::store::hold_first_exec(&exe) {
         let keys = inherited.iter().map(|(key, _)| key.clone());
-        let mut command = warm_command(&layout, &tool, warm, keys, home);
-        for (name, value) in setup.iter().filter(|pair| !inherited.contains(pair)) {
-            if !name.to_str().is_some_and(|name| stripped(warm, name))
-                && !warm.env.iter().any(|(child, _)| name == *child)
-            {
-                command.env(name, value);
+        let ended = if let Some(mut command) = warm_command(&layout, &tool, &exe, warm, keys, home)
+        {
+            for (name, value) in setup.iter().filter(|pair| !inherited.contains(pair)) {
+                if !name.to_str().is_some_and(|name| stripped(warm, name))
+                    && !warm.env.iter().any(|(child, _)| name == *child)
+                {
+                    command.env(name, value);
+                }
             }
+            launch(&mut command)
+        } else {
+            Ended::Unheld
+        };
+        // killed at the deadline or by a signal, it may still be in macOS's check of its
+        // first exec, and the build stays held
+        if matches!(ended, Ended::Exit(_) | Ended::SpawnFailed | Ended::Unheld) {
+            first_exec.ran();
         }
-        match aterm_uds::spawnfd::spawn_past_text_busy(|| command.spawn()) {
-            Ok(child) => drive(child, hold, deadline),
-            Err(_) => Ended::SpawnFailed,
-        }
+        ended
+    } else {
+        Ended::Unheld
     };
     let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     log(&layout, program, request.build, &ended.words(), ms);
@@ -439,14 +475,13 @@ fn stripped(warm: &Warm, name: &str) -> bool {
 fn warm_command(
     layout: &Layout,
     tool: &ToolName,
+    exe: &Path,
     warm: &Warm,
     inherited: impl IntoIterator<Item = OsString>,
     home: Option<&Path>,
-) -> aterm_uds::spawnfd::StdCommand {
-    use aterm_uds::spawnfd::InheritNothing as _;
-    let args: Vec<String> = warm.argv.iter().map(|a| (*a).to_string()).collect();
-    let mut command = crate::landing::shim_command(layout, tool, &args);
-    command.inherit_nothing();
+) -> Option<WarmCommand> {
+    let mut command = pinned_command(layout, tool, exe)?;
+    command.args(warm.argv);
     for key in inherited {
         if key.to_str().is_some_and(|name| stripped(warm, name)) {
             command.env_remove(key);
@@ -457,18 +492,40 @@ fn warm_command(
     }
     command
         .current_dir(home.unwrap_or(layout.prefix.as_path()))
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stdin(aterm_uds::spawnfd::Stdio::piped())
+        .stdout(aterm_uds::spawnfd::Stdio::null())
+        .stderr(aterm_uds::spawnfd::Stdio::null());
     #[cfg(unix)]
     {
-        use std::os::unix::process::CommandExt as _;
         command.process_group(0);
     }
-    command
+    Some(command)
 }
 
-fn drive(mut child: std::process::Child, hold: Duration, deadline: Duration) -> Ended {
+/// Render the held build's ordinary wrapper as shell input, never reopen the
+/// mutable active shim. Its name remains shell $0; each warm argument stays one
+/// argument. Only the catalog's Unix warms have this wrapper representation.
+#[cfg(unix)]
+fn pinned_command(layout: &Layout, tool: &ToolName, exe: &Path) -> Option<WarmCommand> {
+    // The existing renderer represents paths as UTF-8 shell text. Refuse a path
+    // it cannot preserve instead of silently substituting bytes or an active shim.
+    exe.to_str()?;
+    let env = crate::shim_env::of_store_binary(exe);
+    let route = crate::compat::route_for_shim(&layout.shim(tool), exe);
+    let body = crate::platform::sh_shim_content_routed(exe, &env, route.as_deref());
+    let mut command = aterm_uds::spawnfd::command("/bin/sh");
+    command.arg("-c").arg(body).arg(layout.shim(tool));
+    Some(command)
+}
+
+/// No Unix wrapper can be pinned here. Automatic warming is already Unix-only;
+/// a directly requested warm must refuse rather than reopen a mutable .cmd shim.
+#[cfg(not(unix))]
+fn pinned_command(_layout: &Layout, _tool: &ToolName, _exe: &Path) -> Option<WarmCommand> {
+    None
+}
+
+fn drive(mut child: aterm_uds::spawnfd::Child, hold: Duration, deadline: Duration) -> Ended {
     let started = std::time::Instant::now();
     let mut stdin = child.stdin.take();
     loop {
@@ -505,7 +562,7 @@ fn exit_of(status: std::process::ExitStatus) -> Ended {
     Ended::Exit(-1)
 }
 
-fn kill_group(child: &mut std::process::Child) {
+fn kill_group(child: &mut aterm_uds::spawnfd::Child) {
     crate::platform::kill_process_group(child.id());
     let _ = child.kill();
 }
@@ -747,6 +804,8 @@ mod tests {
             &["claude", prefix, "7", "extra"],
             &["claude", "relative/pkg", "7"],
             &["claude", prefix, "seven"],
+            &["claude", prefix, "+7"],
+            &["claude", prefix, "07"],
             &["ay", prefix, "7"],
             &["", prefix, "7"],
         ] {
@@ -770,7 +829,132 @@ mod tests {
     }
 
     #[test]
-    fn the_command_runs_the_bin_shim_with_the_table_argv_and_no_ai_variables() {
+    #[cfg(unix)]
+    fn setup_retargeting_cannot_change_the_build_a_warm_holds_and_launches() {
+        let scratch = scratch("pinned ' build");
+        let layout = &scratch.layout;
+        let _bound =
+            crate::packages_log::test_bind::bind(layout.prefix.join("logs"), layout.prefix.clone());
+        let home = layout.prefix.join("home");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        let spec = crate::vendor_direct::spec("claude").unwrap();
+        let tool = ToolName::new("claude").unwrap();
+        let first = 2_001_298;
+        let second = 2_001_299;
+        install(layout, "claude", first, "inert first build\n");
+        let first_build = layout.build_dir("claude", first);
+        let first_exe = first_build.join("bin").join(tool.exe_file());
+        let first_env = crate::shim_env::ShimEnv::admit(&[
+            "DISABLE_AUTOUPDATER=1".into(),
+            "WARM_BUILD=first '$ value".into(),
+        ])
+        .unwrap();
+        crate::shim_env::write_sidecar(&first_build, &first_env).unwrap();
+        let request = Request {
+            spec,
+            prefix: layout.prefix.clone(),
+            build: first,
+        };
+        let inherited = vec![
+            (OsString::from("HOME"), home.as_os_str().to_owned()),
+            (OsString::from("ANTHROPIC_API_KEY"), OsString::from("inert")),
+        ];
+        let setup = || {
+            Some(vec![
+                (OsString::from("PATH"), OsString::from("owned login path")),
+                (
+                    OsString::from("CLAUDE_CONFIG_DIR"),
+                    home.join(".claude").into_os_string(),
+                ),
+                (OsString::from("AI_AGENT"), OsString::from("not inherited")),
+            ])
+        };
+        let captured = std::cell::Cell::new(false);
+        let ended = warm_with_launch(&request, &inherited, setup, Some(&home), |command| {
+            captured.set(true);
+            assert!(crate::store::held_unproven(&first_build));
+            assert_eq!(command.get_current_dir(), Some(home.as_path()));
+            let args: Vec<_> = command.get_args().collect();
+            let wanted: Vec<_> = spec
+                .warm
+                .unwrap()
+                .argv
+                .iter()
+                .map(|arg| std::ffi::OsStr::new(*arg))
+                .collect();
+            assert!(args.ends_with(&wanted));
+            assert!(command.get_envs().any(|(key, value)| key == "PATH"
+                && value == Some(std::ffi::OsStr::new("owned login path"))));
+            assert!(
+                command
+                    .get_envs()
+                    .any(|(key, value)| key == "ANTHROPIC_API_KEY" && value.is_none())
+            );
+            assert!(!command.get_envs().any(|(key, _)| key == "AI_AGENT"));
+            Ended::SpawnFailed
+        });
+        assert!(
+            captured.get(),
+            "ordinary setup reached the actual launch seam"
+        );
+        assert_eq!(ended, Some(Ended::SpawnFailed));
+        assert!(!crate::store::held_unproven(&first_build));
+
+        let login_ran = std::cell::Cell::new(false);
+        let ended = warm_with_launch(
+            &request,
+            &inherited,
+            || {
+                login_ran.set(true);
+                assert_eq!(crate::active_builds(layout).get("claude"), Some(&first));
+                install(layout, "claude", second, "inert second build\n");
+                let second_env =
+                    crate::shim_env::ShimEnv::admit(&["WARM_BUILD=second".into()]).unwrap();
+                crate::shim_env::write_sidecar(&layout.build_dir("claude", second), &second_env)
+                    .unwrap();
+                assert_eq!(crate::active_builds(layout).get("claude"), Some(&second));
+                setup()
+            },
+            Some(&home),
+            |command| {
+                assert!(
+                    login_ran.get(),
+                    "the activation changed after the initial check"
+                );
+                assert!(crate::store::held_unproven(&first_build));
+                assert!(!crate::store::held_unproven(
+                    &layout.build_dir("claude", second)
+                ));
+                assert_eq!(command.get_program(), std::ffi::OsStr::new("/bin/sh"));
+                let expected_body =
+                    crate::platform::sh_shim_content_routed(&first_exe, &first_env, None);
+                let mut expected = os(&["-c", &expected_body]);
+                expected.push(layout.shim(&tool).into_os_string());
+                expected.extend(
+                    spec.warm
+                        .unwrap()
+                        .argv
+                        .iter()
+                        .map(|arg| OsString::from(*arg)),
+                );
+                assert_eq!(
+                    command
+                        .get_args()
+                        .map(std::ffi::OsStr::to_os_string)
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+                assert!(!expected_body.contains("WARM_BUILD='second'"));
+                Ended::SpawnFailed
+            },
+        );
+        assert_eq!(ended, Some(Ended::SpawnFailed));
+        assert!(!crate::store::held_unproven(&first_build));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_command_pins_the_wrapper_with_the_table_argv_and_no_ai_variables() {
         let layout = Layout {
             prefix: PathBuf::from(abs_prefix()),
         };
@@ -794,7 +978,7 @@ mod tests {
         ]
         .map(OsString::from);
         let home = Path::new("/Users//someone");
-        let envs = |command: &std::process::Command| -> Vec<(String, Option<String>)> {
+        let envs = |command: &WarmCommand| -> Vec<(String, Option<String>)> {
             command
                 .get_envs()
                 .map(|(k, v)| {
@@ -816,10 +1000,22 @@ mod tests {
             "CLAUDE_CODE_SESSION_ID",
             "CLAUDE_CODE_SIMPLE",
         ];
-        let command = warm_command(&layout, &tool, &claude, inherited.clone(), Some(home));
-        assert_eq!(command.get_program(), layout.shim(&tool).as_os_str());
+        let exe = layout
+            .build_dir("claude", 7)
+            .join("bin")
+            .join(tool.exe_file());
+        let command =
+            warm_command(&layout, &tool, &exe, &claude, inherited.clone(), Some(home)).unwrap();
+        assert_eq!(command.get_program(), "/bin/sh");
         let args: Vec<&std::ffi::OsStr> = command.get_args().collect();
-        assert_eq!(args, claude.argv);
+        assert_eq!(args[0], "-c");
+        assert_eq!(
+            args[1],
+            crate::platform::sh_shim_content_routed(&exe, &crate::shim_env::ShimEnv::NONE, None)
+                .as_str()
+        );
+        assert_eq!(args[2], layout.shim(&tool).as_os_str());
+        assert_eq!(args[3..], *claude.argv);
         assert_eq!(command.get_current_dir(), Some(home));
         let mut expected = removed(&session);
         expected.extend(removed(&["CODEX_HOME"]));
@@ -835,7 +1031,11 @@ mod tests {
         );
         let codex = crate::vendor_direct::spec("codex").unwrap().warm.unwrap();
         let tool = ToolName::new("codex").unwrap();
-        let command = warm_command(&layout, &tool, &codex, inherited, Some(home));
+        let exe = layout
+            .build_dir("codex", 8)
+            .join("bin")
+            .join(tool.exe_file());
+        let command = warm_command(&layout, &tool, &exe, &codex, inherited, Some(home)).unwrap();
         let mut expected = removed(&session);
         expected.extend(removed(&[
             "ANTHROPIC_BASE_URL",
@@ -845,8 +1045,44 @@ mod tests {
         ]));
         expected.sort();
         assert_eq!(envs(&command), expected, "CODEX_HOME is inherited");
-        let command = warm_command(&layout, &tool, &codex, [], None);
+        let command = warm_command(&layout, &tool, &exe, &codex, [], None).unwrap();
         assert_eq!(command.get_current_dir(), Some(layout.prefix.as_path()));
+        let odd = Warm {
+            argv: &["", "a b", "'\"$word", "--", "line\nbreak"],
+            ..codex
+        };
+        let command = warm_command(&layout, &tool, &exe, &odd, [], None).unwrap();
+        assert_eq!(command.get_args().skip(3).collect::<Vec<_>>(), odd.argv);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_unrepresentable_target_never_falls_back_to_the_active_shim() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let layout = Layout {
+            prefix: PathBuf::from("/opt/pkg"),
+        };
+        let tool = ToolName::new("claude").unwrap();
+        let warm = crate::vendor_direct::spec("claude").unwrap().warm.unwrap();
+        let exe = PathBuf::from(OsString::from_vec(
+            b"/opt/p\xffkg/store/claude/7/bin/claude".to_vec(),
+        ));
+        assert!(warm_command(&layout, &tool, &exe, &warm, [], None).is_none());
+    }
+
+    #[test]
+    #[cfg(not(unix))]
+    fn an_unsupported_wrapper_never_falls_back_to_the_active_shim() {
+        let layout = Layout {
+            prefix: PathBuf::from(abs_prefix()),
+        };
+        let tool = ToolName::new("claude").unwrap();
+        let warm = crate::vendor_direct::spec("claude").unwrap().warm.unwrap();
+        let exe = layout
+            .build_dir("claude", 7)
+            .join("bin")
+            .join(tool.exe_file());
+        assert!(warm_command(&layout, &tool, &exe, &warm, [], None).is_none());
     }
 
     #[test]
@@ -909,8 +1145,14 @@ mod tests {
         let tool = ToolName::new("claude").unwrap();
         let spec = crate::vendor_direct::spec("claude").unwrap();
         let spawn = || {
+            let exe = layout
+                .build_dir("claude", crate::active_builds(layout)["claude"])
+                .join("bin")
+                .join(tool.exe_file());
             aterm_spec::wait::past_text_busy(|| {
-                warm_command(layout, &tool, &spec.warm.unwrap(), [], None).spawn()
+                warm_command(layout, &tool, &exe, &spec.warm.unwrap(), [], None)
+                    .unwrap()
+                    .spawn()
             })
             .unwrap()
         };
@@ -1015,7 +1257,13 @@ mv '{m}/fd.tmp' '{m}/fd'
         );
         assert!(control.wait().unwrap().success());
         let mut child = aterm_spec::wait::past_text_busy(|| {
-            warm_command(layout, &tool, &spec.warm.unwrap(), [], None).spawn()
+            let exe = layout
+                .build_dir("claude", 2_001_282)
+                .join("bin")
+                .join(tool.exe_file());
+            warm_command(layout, &tool, &exe, &spec.warm.unwrap(), [], None)
+                .unwrap()
+                .spawn()
         })
         .unwrap();
         assert_eq!(seen(), "absent");
@@ -1086,15 +1334,18 @@ mv '{m}/fd.tmp' '{m}/fd'
             run(2_001_281, &no_env, &layout.prefix, Duration::from_secs(1)),
             Some(Ended::NeverRun)
         );
-        let shim = layout.shim(&ToolName::new("claude").unwrap());
+        let exe = layout
+            .build_dir("claude", 2_001_281)
+            .join("bin")
+            .join(ToolName::new("claude").unwrap().exe_file());
         {
             use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o644)).unwrap();
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o644)).unwrap();
         }
         assert_eq!(crate::active_builds(layout).get("claude"), Some(&2_001_281));
         assert_eq!(
             run(2_001_281, &no_env, &home, Duration::from_secs(1)),
-            Some(Ended::SpawnFailed)
+            Some(Ended::Exit(126))
         );
         let outcomes: Vec<(String, String, String)> = crate::packages_log::read_tail(&logs, 100)
             .iter()
@@ -1112,12 +1363,102 @@ mv '{m}/fd.tmp' '{m}/fd'
         assert_eq!(
             outcomes,
             [
-                row("2001281", "spawn-failed"),
+                row("2001281", "exit=126"),
                 row("2001281", "never-run"),
                 row("2001281", "opted-out"),
                 row("2001281", "killed"),
                 row("2001280", "exit=3"),
             ]
+        );
+    }
+
+    /// The warmed build is held from before its program starts: a program that exits on its
+    /// own releases it, one killed at the deadline leaves it held for every process, and a
+    /// later run that never starts takes nothing from that hold.
+    #[cfg(unix)]
+    #[test]
+    fn a_warm_holds_its_build_until_the_program_ended_on_its_own() {
+        let scratch = scratch("hold");
+        let layout = &scratch.layout;
+        let _bound =
+            crate::packages_log::test_bind::bind(layout.prefix.join("logs"), layout.prefix.clone());
+        let home = layout.prefix.join("home");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        let spec = crate::vendor_direct::spec("claude").unwrap();
+        let run = |build, deadline| {
+            let request = Request {
+                spec,
+                prefix: layout.prefix.clone(),
+                build,
+            };
+            warm(
+                &request,
+                &[],
+                || Some(Vec::new()),
+                Some(&home),
+                Duration::ZERO,
+                deadline,
+            )
+        };
+        let mark = |build| {
+            crate::store::sidecar_path(
+                &layout.build_dir("claude", build),
+                crate::store::FIRST_EXEC_MARKS_SUFFIX,
+            )
+            .unwrap()
+        };
+        install(
+            layout,
+            "claude",
+            2_001_290,
+            &format!(
+                "#!/bin/sh\ntest -d '{}' && exit 4\nexit 5\n",
+                mark(2_001_290).display()
+            ),
+        );
+        assert_eq!(
+            run(2_001_290, Duration::from_secs(120)),
+            Some(Ended::Exit(4)),
+            "the hold is on disk while the program runs"
+        );
+        assert!(!mark(2_001_290).exists(), "an exit of its own releases it");
+        assert!(!crate::store::held_unproven(
+            &layout.build_dir("claude", 2_001_290)
+        ));
+
+        install(
+            layout,
+            "claude",
+            2_001_291,
+            "#!/bin/sh\ntrap '' TERM\nwhile :; do sleep 1; done\n",
+        );
+        assert_eq!(
+            run(2_001_291, Duration::from_millis(300)),
+            Some(Ended::Killed)
+        );
+        assert!(
+            mark(2_001_291).is_dir(),
+            "a killed program leaves its build held"
+        );
+        assert!(crate::store::held_unproven(
+            &layout.build_dir("claude", 2_001_291)
+        ));
+
+        let exe = layout
+            .build_dir("claude", 2_001_291)
+            .join("bin")
+            .join(ToolName::new("claude").unwrap().exe_file());
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        assert_eq!(
+            run(2_001_291, Duration::from_secs(1)),
+            Some(Ended::Exit(126))
+        );
+        assert!(
+            mark(2_001_291).is_dir(),
+            "a run that never started leaves the earlier hold standing"
         );
     }
 }

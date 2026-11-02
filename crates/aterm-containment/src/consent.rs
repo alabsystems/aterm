@@ -329,7 +329,9 @@ pub fn open_probe_line(outcome: ProbeOutcome) -> String {
 pub fn parse_open_probe_line(out: &str) -> Option<ProbeOutcome> {
     match out.trim_end_matches('\n').split_once(' ') {
         None if out.trim_end_matches('\n') == "ok" => Some(ProbeOutcome::Ok),
-        Some(("errno", errno)) => errno.parse().ok().map(ProbeOutcome::Errno),
+        Some(("errno", errno)) if !errno.starts_with('+') => {
+            errno.parse().ok().map(ProbeOutcome::Errno)
+        }
         _ => None,
     }
 }
@@ -2116,7 +2118,7 @@ impl ResetSubject {
 #[must_use]
 pub fn tccutil_reset_command(subject: &ResetSubject, folder: Folder) -> Vec<String> {
     vec![
-        String::from("/usr/bin/tccutil"),
+        String::from(TCCUTIL_PATH),
         String::from("reset"),
         String::from(folder.tcc_service()),
         String::from(subject.as_str()),
@@ -2124,7 +2126,6 @@ pub fn tccutil_reset_command(subject: &ResetSubject, folder: Folder) -> Vec<Stri
 }
 
 /// The `tccutil` binary, absolute.
-#[cfg(any(unix, test))]
 pub const TCCUTIL_PATH: &str = aterm_uds::os_path!("tccutil");
 
 /// Whether [`TCCUTIL_PATH`] can be run at all.
@@ -2453,6 +2454,50 @@ pub const CS_GET_TASK_ALLOW: u32 = 0x0000_0004;
 
 /// `CS_RUNTIME` — the hardened runtime, what `codesign` prints as `0x10000(runtime)` (same header).
 pub const CS_RUNTIME: u32 = 0x0001_0000;
+
+/// The longest team identifier [`team_requirement`] quotes, in bytes (Apple's are ten).
+pub const TEAM_MAX: usize = 32;
+
+/// The code requirement a signature meets when its leaf certificate, under Apple's anchor, names
+/// `team`: `anchor apple generic and certificate leaf[subject.OU] = "<team>"`. `None` for a team
+/// that is not one to [`TEAM_MAX`] ASCII capitals and digits: no requirement quotes anything else.
+#[must_use]
+pub fn team_requirement(team: &str) -> Option<String> {
+    let shaped = !team.is_empty()
+        && team.len() <= TEAM_MAX
+        && team
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit());
+    shaped.then(|| format!("anchor apple generic and certificate leaf[subject.OU] = \"{team}\""))
+}
+
+/// Whether the code process `pid` runs meets [`team_requirement`] for `team` now, as
+/// `codesign --verify -R` checks running code: the kernel holds the process valid, and its
+/// signature's certificate chain runs from a leaf naming `team` to Apple's anchor. An ad hoc or
+/// linker signature has no certificate and meets none. `false` off macOS, for pid 0, for a team
+/// no requirement quotes, and when `codesign` cannot say within its ceiling.
+#[must_use]
+pub fn process_meets_team(pid: u32, team: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let Some(requirement) = team_requirement(team).filter(|_| pid > 0) else {
+            return false;
+        };
+        let requirement = format!("-R={requirement}");
+        let pid = pid.to_string();
+        run_bounded(
+            "/usr/bin/codesign",
+            &["--verify".as_ref(), requirement.as_ref(), pid.as_ref()],
+            CODESIGN_CEILING,
+        )
+        .is_some_and(|(met, _, _)| met)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (pid, team);
+        false
+    }
+}
 
 /// What `DevToolsSecurity -status` says about the rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -6808,8 +6853,15 @@ mod tests {
             .unwrap();
         std::fs::create_dir_all(at("folder.app/Contents/Info.plist")).unwrap();
         lay("upper.app", "X");
+        // Unix reads through a file to ENOTDIR, a hole; Windows reads through one to
+        // ERROR_PATH_NOT_FOUND, the answer for a bundle with no `Info.plist`.
+        let through_a_file = if cfg!(windows) {
+            Candidate::NotOurs
+        } else {
+            Candidate::Hole
+        };
         for (name, want) in [
-            ("flat.app", Candidate::Hole),
+            ("flat.app", through_a_file),
             ("huge.app", Candidate::Hole),
             ("folder.app", Candidate::NotOurs),
             ("upper.app", Candidate::NotOurs),
@@ -8400,6 +8452,59 @@ mod tests {
         }
         assert_eq!(CS_RUNTIME, 0x1_0000);
         assert_eq!(CS_OPS_STATUS, 0);
+    }
+
+    /// A team is quoted into a requirement only in Apple's shape, so a requirement names nothing
+    /// but a leaf certificate's team. NEGATIVE CONTROL (run): with the shape check gone, the
+    /// quoting row is a requirement.
+    #[test]
+    fn a_team_requirement_quotes_only_a_team_in_apples_shape() {
+        assert_eq!(
+            team_requirement("QZPTEAM001").as_deref(),
+            Some("anchor apple generic and certificate leaf[subject.OU] = \"QZPTEAM001\"")
+        );
+        let longest = "A".repeat(TEAM_MAX);
+        assert!(team_requirement(&longest).is_some());
+        let too_long = "A".repeat(TEAM_MAX + 1);
+        for bad in [
+            "",
+            "qzpteam001",
+            "QZP\"TEAM",
+            "QZP TEAM",
+            "QZPTEAM\u{0}",
+            too_long.as_str(),
+        ] {
+            assert_eq!(team_requirement(bad), None, "{bad:?}");
+        }
+        assert!(!process_meets_team(0, "QZPTEAM001"));
+        assert!(!process_meets_team(std::process::id(), "QZP\"TEAM"));
+    }
+
+    /// An ad hoc signature carries no certificate, so a running copy of `sleep` signed ad hoc
+    /// meets no team's requirement, Claude Code's included, though the kernel holds it valid.
+    /// NEGATIVE CONTROL (run): `process_meets_team` answering whether `codesign` ran says it
+    /// meets them.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_running_ad_hoc_copy_meets_no_teams_requirement() {
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let copy = dir.path().join("sleep");
+        std::fs::copy("/bin/sleep", &copy).expect("a copy of sleep");
+        let signed = aterm_uds::spawnfd::command("/usr/bin/codesign")
+            .args(["--force", "--sign", "-"])
+            .arg(&copy)
+            .output()
+            .expect("codesign runs");
+        assert!(signed.status.success(), "{signed:?}");
+        let mut child = aterm_uds::spawnfd::command(&copy)
+            .arg("30")
+            .spawn()
+            .expect("the copy runs");
+        let pid = child.id();
+        let met = ["QZPTEAM001", "Q6L2SF6YDW"].map(|team| process_meets_team(pid, team));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(met, [false, false]);
     }
 
     #[test]
@@ -10331,5 +10436,10 @@ mod tests {
         ] {
             assert_eq!(tccutil_presence_at(&path), want, "{}", path.display());
         }
+        assert_eq!(
+            parse_open_probe_line("errno 1\n"),
+            Some(ProbeOutcome::Errno(1))
+        );
+        assert_eq!(parse_open_probe_line("errno +1\n"), None);
     }
 }

@@ -1255,6 +1255,7 @@ fn random_tick(r: &mut Rng, at: i128) -> Ev {
             (end / 3, end)
         }),
         block: r.below(3) != 0,
+        bar: false,
         ..config(dark, hue)
     };
     let cur = match r.below(10) {

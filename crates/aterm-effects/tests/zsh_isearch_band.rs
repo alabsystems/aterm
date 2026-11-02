@@ -7,7 +7,8 @@
 use aterm_core::render::GlowQuad;
 use aterm_core::terminal::{ContentScrollDelta, ContentScrollState, Terminal};
 use aterm_effects::cursor_glow::{
-    AdmissionRecord, CursorGlow, Geom, GlowConfig, InsertWidth, ProbeTrust,
+    AdmissionRecord, BoundaryOrigin, CaretBoundary, CursorGlow, Geom, GlowConfig, InsertWidth,
+    ProbeTrust, ProgramRowRefusal,
 };
 use aterm_effects::rainbow_kitty::TypedClass;
 use aterm_effects::rainbow_kitty::witness::WITNESS_ROWS;
@@ -1722,7 +1723,12 @@ fn a_composer_inserting_again_settles_its_parked_row() {
     for settled in [false, true] {
         let mut h = Host::new(24, 100, APP);
         let row = plain_prompt(&mut h);
-        h.glow.clear_typed(h.now);
+        let boundary = CaretBoundary {
+            seq: 1,
+            origin: BoundaryOrigin::InputFence,
+            at: h.now,
+        };
+        h.glow.clear_typed_from(h.now, boundary.origin);
         h.feed(b"\x1b[1B\rstatus\x1b[A\x1b[4G");
         h.hint(b"a");
         h.feed(b"a");
@@ -1731,6 +1737,45 @@ fn a_composer_inserting_again_settles_its_parked_row() {
             "unowned parked row is ambiguous"
         );
         assert!(h.glow.caret_row_parked());
+        let parked_refusal = Some(ProgramRowRefusal::VisibleLanding {
+            landing_foreign: false,
+            parked_redisplay: true,
+        });
+        assert_eq!(
+            h.glow.admission_log().last().unwrap().program_row_refusal,
+            parked_refusal
+        );
+        let record = *h.glow.admission_log().last().unwrap();
+        assert_eq!(record.parked_boundary, Some(boundary));
+        let immutable = |now| {
+            record
+                .line(now)
+                .split_ascii_whitespace()
+                .filter(|field| !field.starts_with("age_ms="))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(immutable(h.now), immutable(h.now + Duration::from_secs(60)));
+        let mut future = record;
+        future.parked_boundary.as_mut().unwrap().at = record.at + Duration::from_millis(1);
+        assert!(
+            future
+                .line(h.now)
+                .split_ascii_whitespace()
+                .any(|field| field == "boundary_to_verdict_ms=-")
+        );
+        let mut missing = record;
+        missing.parked_boundary = None;
+        let line = missing.line(h.now);
+        let fields: BTreeMap<_, _> = line
+            .split_ascii_whitespace()
+            .filter_map(|field| field.split_once('='))
+            .collect();
+        assert_eq!(fields.get("boundary_origin"), Some(&"unknown"));
+        assert_eq!(fields.get("boundary_seq"), Some(&"-"));
+        assert_eq!(fields.get("boundary_to_verdict_ms"), Some(&"-"));
+        h.glow.clear_typed_keeping_hand(h.now);
+        h.glow.supersede_typed_press();
         if settled {
             h.glow.note_composer_inserting();
             assert!(!h.glow.caret_row_parked());
@@ -1742,6 +1787,15 @@ fn a_composer_inserting_again_settles_its_parked_row() {
             settled,
             "settled={settled}: {}",
             h.report("key after the word")
+        );
+        assert_eq!(
+            h.glow.admission_log().last().unwrap().program_row_refusal,
+            if settled { None } else { parked_refusal },
+            "settling the row admits the key without a refusal detail"
+        );
+        assert_eq!(
+            h.glow.admission_log().last().unwrap().parked_boundary,
+            if settled { None } else { Some(boundary) }
         );
     }
 }

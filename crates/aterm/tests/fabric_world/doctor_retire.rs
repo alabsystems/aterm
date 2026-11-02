@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `fabric doctor --retire-ghosts` with the bridge up: the retirement goes through it.
+//! `aterm fabric` from outside a world with the bridge up: `fabric doctor --retire-ghosts`
+//! retires through the bridge, and the report names the instance's own bridge.
 #![allow(
     clippy::disallowed_types,
     reason = "test code: a stand-in child may inherit descriptors"
@@ -17,13 +18,12 @@ fn state_of(body: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// `<bin> fabric doctor <args>` in `w`'s scratch home, with `fabric_cmd` as its fabric command
-/// and each read of the world's instance bounded by [`harness::FABRIC_IO_WAIT`].
-fn doctor_command(w: &World, bin: &str, fabric_cmd: &str, args: &[&str]) -> std::process::Command {
-    let mut doctor = std::process::Command::new(bin);
-    doctor
+/// `<bin> fabric <args>` in `w`'s scratch home, with `fabric_cmd` as its fabric command and each
+/// read of the world's instance bounded by [`harness::FABRIC_IO_WAIT`].
+fn fabric_command(w: &World, bin: &str, fabric_cmd: &str, args: &[&str]) -> std::process::Command {
+    let mut fabric = std::process::Command::new(bin);
+    fabric
         .arg("fabric")
-        .arg("doctor")
         .args(args)
         .env("HOME", w.tmp.join("home"))
         .env("XDG_RUNTIME_DIR", w.tmp.join("run"))
@@ -33,19 +33,52 @@ fn doctor_command(w: &World, bin: &str, fabric_cmd: &str, args: &[&str]) -> std:
             harness::FABRIC_IO_WAIT.1.as_millis().to_string(),
         )
         .stdin(std::process::Stdio::null());
-    doctor
+    fabric
 }
 
-fn doctor(w: &World, args: &[&str]) -> String {
+/// `aterm fabric <args>` from outside the world, with the world's own fabric command.
+fn fabric(w: &World, args: &[&str]) -> std::process::Output {
     let cmd = std::fs::read_to_string(w.tmp.join("fabric.cmd")).expect("the fabric command");
     let cmd = cmd.trim();
     let bin = cmd.split_whitespace().next().expect("the bridge binary");
-    let out = harness::output_within(&mut doctor_command(w, bin, cmd, args), "the doctor");
+    harness::output_within(&mut fabric_command(w, bin, cmd, args), "aterm fabric")
+}
+
+fn doctor(w: &World, args: &[&str]) -> String {
+    let out = fabric(w, &[&["doctor"], args].concat());
     format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     )
+}
+
+/// The report's bridge list names the instance's own bridge child, read from outside: the child
+/// the census proves aterm by its executable, whose words serve the fleet.
+#[test]
+fn the_bridge_list_names_the_instance_s_own_bridge() {
+    let w = World::boot("bridgelist", &[]);
+    w.wait_ready();
+    let bridge = u64::try_from(w.bridge_pid()).expect("a bridge pid");
+    let gui = u64::from(w.gui.as_ref().expect("the instance").id());
+    let out = fabric(&w, &["--json"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    let report: aterm_json::Value =
+        aterm_json::from_str(&text).unwrap_or_else(|e| panic!("not JSON ({e}): {text}"));
+    let bridges = report["bridges"]
+        .as_array()
+        .unwrap_or_else(|| panic!("`bridges` is an array: {text}"));
+    let ours = bridges
+        .iter()
+        .find(|b| b["pid"].as_u64() == Some(gui))
+        .unwrap_or_else(|| panic!("the instance {gui} is listed: {text}"));
+    let pids: Vec<u64> = ours["bridge_pids"]
+        .as_array()
+        .unwrap_or_else(|| panic!("`bridge_pids` is an array: {text}"))
+        .iter()
+        .filter_map(aterm_json::Value::as_u64)
+        .collect();
+    assert_eq!(pids, [bridge], "{text}");
 }
 
 /// Retiring a ghost with a live bridge publishes one exited record through the bridge.
@@ -217,7 +250,12 @@ fn a_ghost_nodes_rows_are_retired_as_that_node_beside_a_live_bridge() {
         ghost_cap.display(),
         ghost_state.display()
     );
-    let mut doctor = doctor_command(&w, &bin, &ghost_cmd, &["--retire-ghosts", "--yes"]);
+    let mut doctor = fabric_command(
+        &w,
+        &bin,
+        &ghost_cmd,
+        &["doctor", "--retire-ghosts", "--yes"],
+    );
     let out = harness::output_within(&mut doctor, "the doctor");
     let text = format!(
         "{}{}",

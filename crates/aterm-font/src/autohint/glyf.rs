@@ -17,6 +17,7 @@ use super::DrawError;
 use super::deltas;
 use super::fixed::{F2Dot14, F26Dot6, Fixed, Point};
 use super::tuple::{Gvar, ReadError};
+use crate::work::VariationWork;
 
 /// Composite recursion limit (skrifa's `GLYF_COMPOSITE_RECURSION_LIMIT`).
 const GLYF_COMPOSITE_RECURSION_LIMIT: usize = 32;
@@ -753,6 +754,8 @@ pub(crate) struct UnscaledScaler<'a> {
     component_delta_count: usize,
     /// The four phantom points.
     phantom: [Point<F26Dot6>; PHANTOM_POINT_COUNT],
+    /// What the glyph's `gvar` deltas may still cost, over all its components.
+    work: VariationWork,
 }
 
 impl<'a> UnscaledScaler<'a> {
@@ -772,6 +775,7 @@ impl<'a> UnscaledScaler<'a> {
             contour_count: 0,
             component_delta_count: 0,
             phantom: Default::default(),
+            work: VariationWork::default(),
         })
     }
 
@@ -850,12 +854,16 @@ impl<'a> UnscaledScaler<'a> {
     fn load_empty(&mut self, glyph_id: u16) -> Result<(), DrawError> {
         let mut unscaled = self.phantom.map(|point| point.map(|x| x.to_bits()));
         if let (Some(gvar), false) = (self.outlines.gvar.as_ref(), self.coords.is_empty()) {
-            if let Ok(Some(deltas)) =
-                gvar.phantom_point_deltas(&self.outlines.glyf, self.coords, glyph_id)
-            {
+            if let Ok(Some(deltas)) = gvar.phantom_point_deltas(
+                &self.outlines.glyf,
+                self.coords,
+                glyph_id,
+                &mut self.work,
+            ) {
                 unscaled[0] += deltas[0].map(Fixed::to_i32);
                 unscaled[1] += deltas[1].map(Fixed::to_i32);
             }
+            within(&self.work)?;
         }
         for (phantom, unscaled) in self.phantom.iter_mut().zip(&unscaled) {
             *phantom = unscaled.map(F26Dot6::from_i32);
@@ -922,10 +930,17 @@ impl<'a> UnscaledScaler<'a> {
             let iup_buffer = iup_buffer
                 .get_mut(..point_count + PHANTOM_POINT_COUNT)
                 .ok_or(InsufficientMemory)?;
-            if deltas::simple_glyph(gvar, glyph_id, self.coords, glyph, iup_buffer, deltas).is_ok()
-            {
-                have_deltas = true;
-            }
+            let varied = deltas::simple_glyph(
+                gvar,
+                glyph_id,
+                self.coords,
+                glyph,
+                iup_buffer,
+                deltas,
+                &mut self.work,
+            );
+            have_deltas = varied.is_ok();
+            within(&self.work)?;
         }
         if have_deltas {
             for (unscaled, delta) in unscaled.iter_mut().zip(deltas.iter()) {
@@ -961,7 +976,15 @@ impl<'a> UnscaledScaler<'a> {
                 .composite_deltas
                 .get_mut(delta_base..delta_base + count)
                 .ok_or(InsufficientMemory)?;
-            if deltas::composite_glyph(gvar, glyph_id, self.coords, &mut deltas[..]).is_ok() {
+            let varied = deltas::composite_glyph(
+                gvar,
+                glyph_id,
+                self.coords,
+                &mut deltas[..],
+                &mut self.work,
+            );
+            within(&self.work)?;
+            if varied.is_ok() {
                 for (phantom, delta) in self
                     .phantom
                     .iter_mut()
@@ -1071,6 +1094,15 @@ impl<'a> UnscaledScaler<'a> {
         }
         Ok(())
     }
+}
+
+/// A glyph whose deltas ran past `work`'s budget is refused, not drawn
+/// unvaried: the unhinted loader refuses it too.
+fn within(work: &VariationWork) -> Result<(), DrawError> {
+    if work.exhausted() {
+        return Err(DrawError::VariationLimitExceeded);
+    }
+    Ok(())
 }
 
 impl From<ReadError> for DrawError {

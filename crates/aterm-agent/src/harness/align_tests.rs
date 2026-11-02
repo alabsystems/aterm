@@ -25,8 +25,10 @@ fn temp_dir(tag: &str) -> aterm_tempfile::TempDir {
 fn shell(line: &str) -> Command {
     #[cfg(unix)]
     {
-        let mut cmd = aterm_uds::spawnfd::command("/bin/sh");
-        cmd.arg("-c").arg(line);
+        let mut cmd = aterm_uds::spawnfd::command(crate::test_program::kept("/bin/sh"));
+        cmd.arg("-c")
+            .arg(line)
+            .env("ATERM_TEST_SLEEP", crate::test_program::kept("/bin/sleep"));
         cmd
     }
     #[cfg(windows)]
@@ -43,7 +45,7 @@ fn a_child_that_never_returns_is_killed_at_the_deadline() {
     let cmd = if cfg!(windows) {
         shell("for /L %i in (0,0,1) do @rem")
     } else {
-        shell("sleep 120")
+        shell("\"$ATERM_TEST_SLEEP\" 120")
     };
     let started = std::time::Instant::now();
     let got = capture_bounded(cmd, Duration::from_millis(250), 1024);
@@ -90,10 +92,15 @@ const HANG_S: u64 = 300;
 fn capture_a_hanging_group(tag: &str, script: &str, path: &str) -> (libc::pid_t, Duration) {
     let tmp = temp_dir(tag);
     let pgid_file = tmp.path().join("pgid");
-    let mut cmd = Command::new("/bin/sh");
+    let mut cmd = Command::new(crate::test_program::kept("/bin/sh"));
     cmd.arg("-c")
         .arg(script)
         .env("PGIDF", &pgid_file)
+        .env(
+            "ATERM_TEST_PS",
+            crate::test_program::kept(aterm_uds::os_path!("ps")),
+        )
+        .env("ATERM_TEST_SLEEP", crate::test_program::kept("/bin/sleep"))
         .env("HANG_S", HANG_S.to_string());
     let observed = Arc::new(CaptureLifecycleObservation::default());
     let report = pgid_file.clone();
@@ -155,7 +162,7 @@ fn group_emptied(pgid: libc::pid_t) -> bool {
 fn a_child_that_closes_stdout_then_hangs_cannot_survive_the_deadline() {
     let (pgid, took) = capture_a_hanging_group(
         "closed-stdout-hang",
-        "exec 1>&-; echo \"$$ $(ps -o pgid= -p $$)\" > \"$PGIDF\"; sleep \"$HANG_S\"",
+        "exec 1>&-; echo \"$$ $(\"$ATERM_TEST_PS\" -o pgid= -p $$)\" > \"$PGIDF\"; \"$ATERM_TEST_SLEEP\" \"$HANG_S\"",
         "closed its output",
     );
     assert!(
@@ -170,7 +177,7 @@ fn a_child_that_closes_stdout_then_hangs_cannot_survive_the_deadline() {
 fn a_descendant_holding_stdout_is_killed_with_its_process_group() {
     let (pgid, took) = capture_a_hanging_group(
         "descendant-stdout-hang",
-        "g=$(ps -o pgid= -p $$); (echo \"$$ $g\" > \"$PGIDF\"; sleep \"$HANG_S\") & exit 0",
+        "g=$(\"$ATERM_TEST_PS\" -o pgid= -p $$); (echo \"$$ $g\" > \"$PGIDF\"; \"$ATERM_TEST_SLEEP\" \"$HANG_S\") & exit 0",
         "ran past its",
     );
     assert!(
@@ -188,7 +195,7 @@ fn a_descendant_holding_stdout_is_killed_with_its_process_group() {
 fn a_group_still_forking_at_the_deadline_is_killed_whole() {
     let (pgid, _) = capture_a_hanging_group(
         "forking-group",
-        "echo \"$$ $(ps -o pgid= -p $$)\" > \"$PGIDF\"; while :; do sleep \"$HANG_S\" & kill $!; done",
+        "echo \"$$ $(\"$ATERM_TEST_PS\" -o pgid= -p $$)\" > \"$PGIDF\"; while :; do \"$ATERM_TEST_SLEEP\" \"$HANG_S\" & kill -KILL $!; done",
         "ran past its",
     );
     assert!(

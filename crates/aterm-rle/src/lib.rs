@@ -10,6 +10,7 @@
 
 //! Run-Length Encoding (RLE) for cell attributes.
 
+use aterm_alloc::SmallVec;
 use std::fmt;
 use std::ops::Index;
 
@@ -295,7 +296,7 @@ impl<T: Default> Default for Run<T> {
 #[derive(Debug, Clone)]
 pub struct Rle<T> {
     /// The runs in order.
-    runs: Vec<Run<T>>,
+    runs: SmallVec<Run<T>, 2>,
     /// Total length (sum of all run lengths).
     total_length: u32,
 }
@@ -313,22 +314,18 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
     #[inline]
     pub const fn new() -> Self {
         Self {
-            runs: Vec::new(),
+            runs: SmallVec::new(),
             total_length: 0,
         }
     }
 
     /// Create an RLE sequence with a single value repeated `length` times.
     #[must_use]
-    #[allow(
-        clippy::vec_init_then_push,
-        reason = "vec! expands alloc unsafe into the Trust-verified span; with_capacity+push keeps it out"
-    )]
     pub fn with_value(value: T, length: u32) -> Self {
         if length == 0 {
             return Self::new();
         }
-        let mut runs = Vec::with_capacity(1);
+        let mut runs = SmallVec::new();
         runs.push(Run { value, length });
         Self {
             runs,
@@ -384,6 +381,18 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
     #[inline]
     pub fn runs(&self) -> &[Run<T>] {
         &self.runs
+    }
+
+    /// Heap storage owned by the run sequence, excluding this struct's inline runs.
+    #[must_use]
+    pub const fn heap_bytes(&self) -> usize {
+        if self.runs.is_inline() {
+            0
+        } else {
+            self.runs
+                .capacity()
+                .saturating_mul(std::mem::size_of::<Run<T>>())
+        }
     }
 
     /// Clear the sequence.

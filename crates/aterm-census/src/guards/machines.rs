@@ -37,8 +37,8 @@ pub(super) const MACHINES_ROOT_DOOR: Rule = Rule {
           atpkg's Rosetta 2 install, the whole argv \
           [\"/usr/sbin/softwareupdate\", \"--install-rosetta\", \"--agree-to-license\"] in \
           crates/atpkg/src/platform/unix.rs, which installs as the user with no administrator. \
-          The GUI installer probe may only compare softwareupdate's executable identity \
-          in a closed boolean helper, without binding or executing the path",
+          The GUI installer probe may only compare softwareupdate's and installer's executable \
+          identities in a closed boolean helper, without binding or executing either path",
     scope: &[MACHINES_CRATE],
     check: machines_root_door,
 };
@@ -80,11 +80,8 @@ fn machines_root_door(tree: &Tree<'_>, out: &mut Vec<Finding>) {
 
 fn is_installer_identity(file: &SourceFile, line: &Line<'_>, tool: &str) -> bool {
     if file.rel != INSTALLER_PROBE
-        || tool != ROSETTA_INSTALL.1
+        || !matches!(tool, "/usr/sbin/softwareupdate" | "/usr/sbin/installer")
         || line.text.matches(tool).count() != 1
-        || ROOT_TOOLS
-            .iter()
-            .any(|other| *other != tool && line.text.contains(other))
     {
         return false;
     }
@@ -107,12 +104,29 @@ fn is_installer_identity(file: &SourceFile, line: &Line<'_>, tool: &str) -> bool
         let Some(close) = brace_close(&lexed.code, open) else {
             return false;
         };
+        let signature = squeeze(&lexed.text[at..open]);
+        let body = squeeze(&lexed.text[open + 1..close]);
+        let softwareupdate = "path==::std::path::Path::new(\"/usr/sbin/softwareupdate\")";
+        let installer = "path==::std::path::Path::new(\"/usr/sbin/installer\")";
+        let closed = match signature.as_str() {
+            "fnis_softwareupdate(path:&::std::path::Path)->bool" => body == softwareupdate,
+            "fnis_install_process(path:&::std::path::Path)->bool" => {
+                body == format!("{softwareupdate}||{installer}")
+                    || body == format!("{installer}||{softwareupdate}")
+            }
+            _ => false,
+        };
         at <= literal_at
             && literal_at < close
-            && squeeze(&lexed.text[at..open])
-                == "fnis_softwareupdate(path:&::std::path::Path)->bool"
-            && squeeze(&lexed.text[open + 1..close])
-                == format!("path==::std::path::Path::new(\"{tool}\")")
+            && closed
+            // The rule checks one root-tool finding per line. Every root-tool spelling on
+            // that line must belong to this helper, including when both comparisons share it.
+            && ROOT_TOOLS.iter().all(|other| {
+                line.text.match_indices(*other).all(|(offset, _)| {
+                    let here = line_at + offset;
+                    open < here && here < close
+                })
+            })
     })
 }
 
@@ -348,11 +362,65 @@ mod tests {
     }
 
     #[test]
+    fn the_installer_probe_compares_both_apple_installers_without_exposing_either() {
+        let identity = concat!(
+            "fn is_install_process(path: &::std::path::Path) -> bool {\n",
+            "path == ::std::path::Path::new(\"/usr/sbin/softwareupdate\")\n",
+            "|| path == ::std::path::Path::new(\"/usr/sbin/installer\")\n",
+            "}\n",
+        );
+        let compact = identity.replace('\n', " ");
+        let reversed = concat!(
+            "fn is_install_process(path: &::std::path::Path) -> bool {\n",
+            "path == ::std::path::Path::new(\"/usr/sbin/installer\")\n",
+            "|| path == ::std::path::Path::new(\"/usr/sbin/softwareupdate\")\n",
+            "}\n",
+        );
+        for allowed in [identity, compact.as_str(), reversed] {
+            assert!(
+                run(&MACHINES_ROOT_DOOR, &[(INSTALLER_PROBE, allowed)]).is_empty(),
+                "only closed boolean comparisons: {allowed}"
+            );
+        }
+        let binding = "fn is_install_process(path: &::std::path::Path) -> bool { let tool = ::std::path::Path::new(\"/usr/sbin/installer\"); path == tool }";
+        let execution = "fn is_install_process(path: &::std::path::Path) -> bool { spawnfd::command(\"/usr/sbin/installer\"); true }";
+        let returned = "fn is_install_process(path: &::std::path::Path) -> &::std::path::Path { ::std::path::Path::new(\"/usr/sbin/installer\") }";
+        for refused in [
+            binding.to_owned(),
+            execution.to_owned(),
+            returned.to_owned(),
+            identity.replace("path ==", "path !="),
+            identity.replace("||", "&&"),
+            identity.replace("/usr/sbin/installer", "/usr/bin/pmset"),
+            identity.replacen('{', "{ extra();", 1),
+            identity.replace("\n}", " || true\n}"),
+            format!("{compact} const TOOL: &str = \"/usr/sbin/softwareupdate\";"),
+            format!("{compact} const TOOL: &str = \"/usr/sbin/installer\";"),
+        ] {
+            assert!(
+                !run(&MACHINES_ROOT_DOOR, &[(INSTALLER_PROBE, &refused)]).is_empty(),
+                "neither path can escape its closed identity: {refused}"
+            );
+        }
+        assert!(
+            !run(
+                &MACHINES_ROOT_DOOR,
+                &[("crates/aterm-gui/src/other.rs", identity)]
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
     fn admitted_tool_spellings_never_hide_agent_access_on_the_same_line() {
         for (rel, admitted) in [
             (
                 INSTALLER_PROBE,
                 "fn is_softwareupdate(path: &::std::path::Path) -> bool { path == ::std::path::Path::new(\"/usr/sbin/softwareupdate\") }",
+            ),
+            (
+                INSTALLER_PROBE,
+                "fn is_install_process(path: &::std::path::Path) -> bool { path == ::std::path::Path::new(\"/usr/sbin/softwareupdate\") || path == ::std::path::Path::new(\"/usr/sbin/installer\") }",
             ),
             (
                 ROSETTA_INSTALL.0,

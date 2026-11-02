@@ -17,12 +17,10 @@ use crate::recover::read_header;
 use crate::store::{RegionStore, StoreError};
 
 /// The region offset of ring position `pos` in a ring of `cap` bytes at `hist_off`.
-///
-/// # Panics
-/// If the offset does not fit a `usize` (it is inside a region, which does).
 #[must_use]
 pub fn ring_offset(hist_off: usize, cap: u64, pos: u64) -> usize {
-    hist_off + usize::try_from(pos % cap).expect("an offset inside the region")
+    let rem = pos.checked_rem(cap).unwrap_or(0);
+    hist_off.saturating_add(usize::try_from(rem).unwrap_or(usize::MAX))
 }
 
 /// Flip the byte at ring position `pos`: a payload byte's flip fails its frame's CRC and leaves
@@ -36,6 +34,12 @@ pub fn flip<S: RegionStore + ?Sized>(
     cap: u64,
     pos: u64,
 ) -> Result<(), StoreError> {
+    if cap == 0 {
+        return Err(StoreError::OutOfBounds {
+            at: hist_off,
+            len: 1,
+        });
+    }
     let at = ring_offset(hist_off, cap, pos);
     let mut b = [0u8; 1];
     store.read(at, &mut b)?;
@@ -49,9 +53,6 @@ pub fn flip<S: RegionStore + ?Sized>(
 ///
 /// # Errors
 /// The store's refusal of the write.
-///
-/// # Panics
-/// If a claimed length does not fit a frame's `u32` (it is capped below that).
 pub fn lookalikes<S: RegionStore + ?Sized>(
     store: &S,
     hist_off: usize,
@@ -64,9 +65,9 @@ pub fn lookalikes<S: RegionStore + ?Sized>(
     let end = until.min(seg_end);
     let mut bytes = Vec::new();
     let mut p = from;
-    while p + header < end {
+    while p.saturating_add(header) < end {
         let len = (seg_end - p - header).min(MAX_PAYLOAD_LEN as u64);
-        let len = u32::try_from(len).expect("under the frame cap");
+        let len = u32::try_from(len).unwrap_or(u32::MAX);
         let mut h = [0u8; HEADER_SIZE];
         h[0] = MAGIC[0];
         h[1] = MAGIC[1];
@@ -77,6 +78,12 @@ pub fn lookalikes<S: RegionStore + ?Sized>(
     }
     if bytes.is_empty() {
         return Ok(());
+    }
+    if cap == 0 {
+        return Err(StoreError::OutOfBounds {
+            at: hist_off,
+            len: bytes.len(),
+        });
     }
     store.write(ring_offset(hist_off, cap, from), &bytes)
 }
@@ -318,5 +325,34 @@ mod tests {
             view.read(0, &mut after).expect("region");
             assert_eq!(after, original, "cap={cap}");
         }
+    }
+
+    #[test]
+    fn plant_primitives_handle_zero_capacity_and_max_positions() {
+        let store = VecStore::new(64);
+        assert_eq!(ring_offset(16, 0, u64::MAX), 16);
+        assert_eq!(ring_offset(usize::MAX, 8, 5), usize::MAX);
+        assert_eq!(
+            flip(&store, 16, 0, 0),
+            Err(StoreError::OutOfBounds { at: 16, len: 1 })
+        );
+        assert_eq!(
+            lookalikes(&store, 16, 64, u64::MAX, u64::MAX, u64::MAX),
+            Ok(())
+        );
+        assert_eq!(
+            lookalikes(
+                &store,
+                16,
+                0,
+                0,
+                HEADER_SIZE as u64 + 1,
+                HEADER_SIZE as u64 + 1
+            ),
+            Err(StoreError::OutOfBounds {
+                at: 16,
+                len: HEADER_SIZE
+            })
+        );
     }
 }

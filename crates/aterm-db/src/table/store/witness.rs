@@ -14,6 +14,9 @@ pub(super) struct Witness {
 }
 impl Witness {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != 40 {
+            return Err(Error::new("invalid table custody witness"));
+        }
         let count = u64::from_le_bytes(bytes[..8].try_into().unwrap());
         let hash = bytes[8..].try_into().unwrap();
         if count > super::JOURNAL_RECORDS as u64 || (count == 0 && hash != [0; 32]) {

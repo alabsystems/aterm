@@ -226,7 +226,11 @@ pub(crate) mod markers {
     pub(crate) fn parse(name: &str) -> Option<MarkerName> {
         let body = name.strip_prefix(PREFIX)?.strip_suffix(".log")?;
         let mut parts = body.splitn(3, '-');
-        let pid = parts.next()?.parse::<u32>().ok()?;
+        let pid = parts.next()?;
+        if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let pid = pid.parse::<u32>().ok()?;
         let nanos = parts.next()?;
         if nanos.is_empty() || !nanos.bytes().all(|b| b.is_ascii_digit()) {
             return None;
@@ -244,7 +248,11 @@ pub(crate) mod markers {
     /// The pid of a legacy `crash-signal-<pid>-<nanos>.log`.
     fn legacy_pid(name: &str) -> Option<u32> {
         let body = name.strip_prefix(LEGACY_PREFIX)?.strip_suffix(".log")?;
-        body.split('-').next()?.parse().ok()
+        let pid = body.split('-').next()?;
+        pid.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| pid.parse().ok())
+            .flatten()
     }
 
     /// What trying a marker's owner lock says about its owner.

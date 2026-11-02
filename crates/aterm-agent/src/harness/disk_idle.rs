@@ -578,6 +578,15 @@ pub fn resolve_local(path: &Path, table: &Table) -> Option<PathBuf> {
     resolve_local_reading(path, table, false).ok().flatten()
 }
 
+/// `path` resolved as [`resolve_local`] resolves it, where a component that is not there ends
+/// the walk with the place it names and the rest of `path` beneath it as written (a folder that
+/// is gone resolves to where it was); `None` on a remote or automounted volume or an unknown
+/// reading.
+#[must_use]
+pub fn resolve_dangling(path: &Path, table: &Table) -> Option<PathBuf> {
+    resolve_local_reading(path, table, true).ok().flatten()
+}
+
 /// A local resolution, a positively remote/automounted path (`Ok(None)`),
 /// or an unknown reading. `dangling`: a component that is not there ends the walk with the
 /// place it names, the rest of the path beneath it as written (nothing past it exists to

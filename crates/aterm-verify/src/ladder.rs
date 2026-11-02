@@ -185,6 +185,28 @@ impl Report {
         }
     }
 
+    /// A driven child's rows: its output verbatim, then its row. A child with
+    /// no status of its own to read (its spawn failed, or the run's end ended
+    /// it while it waited or ran, or a stuck holder of what it waited for did)
+    /// is COULD NOT RUN under `name` with the run's own reason, never a guess
+    /// at a signal; any other is what `read` makes of its exit code and output.
+    pub fn record_driven(
+        &mut self,
+        run: &Run,
+        name: &str,
+        read: impl FnOnce(Option<i32>, &str) -> (Outcome, String),
+    ) {
+        self.raw(run.output.as_str());
+        if run.spawn_error.is_some() && self.child_could_not_run(run, name) {
+            return;
+        }
+        let (outcome, label) = read(run.code, &run.output);
+        if self.child_could_not_run(run, &label) {
+            return;
+        }
+        self.record_child(run, outcome, label);
+    }
+
     /// The environment's failure, if this child had one, recorded as a COULD
     /// NOT RUN row under `label`: `true` when it was.
     pub fn child_could_not_run(&mut self, run: &Run, label: &str) -> bool {

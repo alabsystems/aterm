@@ -788,6 +788,8 @@ struct Controls {
     no_escalation: bool,
     /// NC7: the horizon's full flush issued as a barrier, the product told it was full.
     horizon_as_barrier: bool,
+    /// The at-rest key every open takes (`None`: plaintext), for the keyed arm.
+    key: Option<[u8; 32]>,
 }
 
 /// What clients were shown under one identity: the records, in offset order.
@@ -848,7 +850,7 @@ fn open_as(
         Storage::Sim(sim.clone()),
         &opts(tier, boot, c),
         repair,
-        None,
+        c.key,
         AntiRollbackMode::Off,
         || Ok(prepared.map_or(Prepared::Nothing, |why| Prepared::Unclean(why.to_string()))),
     )?;
@@ -1459,8 +1461,20 @@ fn start(w: &Workload, c: &Controls) -> (Sim, Vec<Generation>) {
             })
             .collect();
         for r in &recs {
-            dev.logical
-                .extend_from_slice(&r.encode().expect("a prefix record encodes"));
+            // Keyed, the older build sealed it too (the v1 AAD the simulated log reads: its
+            // offset, little-endian).
+            let framed = match c.key {
+                #[cfg(feature = "at-rest")]
+                Some(key) => {
+                    let payload = r.encode_payload().expect("a prefix record encodes");
+                    let sealed = astream_aead::seal(&key, &r.seq.0.to_le_bytes(), &payload);
+                    astream_wire::Frame::new(sealed)
+                        .encode()
+                        .expect("it frames")
+                }
+                _ => r.encode().expect("a prefix record encodes"),
+            };
+            dev.logical.extend_from_slice(&framed);
         }
         let identity = LogIdentity {
             id: [0x77; 16],
@@ -2155,7 +2169,28 @@ fn the_exhaustive_sets_meet_every_pair_at_every_adjacent_place() {
 /// the seeded random sample, each recovered and checked, a sample crashed twice.
 #[test]
 fn the_power_loss_law_holds_on_the_real_writer_and_open() {
-    let c = Controls::default();
+    default_sweep(&Controls::default());
+}
+
+/// THE SAME LAW ON A LOG SEALED AT REST (`at-rest`): every open takes a key, so every
+/// record's payload is sealed on the device (40 bytes longer, which moves every frame
+/// boundary against the blocks) and recovery authenticates each one it keeps; the sweep's
+/// properties and its not-vacuous checks hold as on a plaintext log. The simulated device
+/// keeps no `<log>.seal`, so its records are sealed under the v1 index-only AAD
+/// (`resolve_at_rest_key` on simulated storage); the v2 binding's AAD differs only in its
+/// prefix and seal id, which changes no frame's size or place.
+#[cfg(feature = "at-rest")]
+#[test]
+fn the_power_loss_law_holds_on_a_log_sealed_at_rest() {
+    default_sweep(&Controls {
+        key: Some([0x5a; 32]),
+        ..Controls::default()
+    });
+}
+
+/// [`the_power_loss_law_holds_on_the_real_writer_and_open`]'s sweep under `c`.
+fn default_sweep(c: &Controls) {
+    let c = *c;
     let workloads = exhaustive(&TIERS, &[16, 32, 64], 3, 2);
     let report = sweep(&workloads, 64, 16, &c, 0x5EED);
     eprintln!("exhaustive sweep: {report}");
@@ -2190,6 +2225,22 @@ fn rot_below_the_floor_or_behind_a_later_batch_is_refused_never_cut() {
     for tier in TIERS {
         let report = rot(tier, &Controls::default());
         assert!(report.clean(), "{tier:?} rot:\n{report}");
+    }
+}
+
+/// The rot arm on a log sealed at rest: every byte of a clean keyed log flipped, each held
+/// to the properties the plaintext arm is (P2, P4, P8); a record recovery keeps is also
+/// authenticated.
+#[cfg(feature = "at-rest")]
+#[test]
+fn rot_in_a_log_sealed_at_rest_is_refused_never_cut() {
+    let c = Controls {
+        key: Some([0x5a; 32]),
+        ..Controls::default()
+    };
+    for tier in TIERS {
+        let report = rot(tier, &c);
+        assert!(report.clean(), "{tier:?} rot, sealed:\n{report}");
     }
 }
 

@@ -12,7 +12,7 @@ use aterm_json::{Value, json};
 use super::args::Invocation;
 use super::verbs::Noun;
 use super::{Answer, Completeness, Ctx, Outcome, Receipt};
-use crate::error::{Kind, Result};
+use crate::error::{Error, Kind, Result};
 use crate::identity::vault::{Adoption, Found};
 use crate::identity::{self, EnvSource, Profile, Source, tilde};
 use crate::policy::{Access, Presence, RouteRequest, RouteTarget};
@@ -232,13 +232,16 @@ pub(super) fn vault_rows(
         .collect()
 }
 
-/// `agh whoami [--for REPO [--op read|writer-read|write]] [--verify]`.
+/// `agh whoami [--for REPO [--op read|writer-read|write]] [--verify] [--git URL]`.
 ///
 /// # Errors
 ///
 /// Usage for the flags' combinations; the client's refusal of an invalid agh.toml; with
-/// `--verify`, any error of `GET /user` but a 401.
+/// `--verify`, any error of `GET /user` but a 401; with `--git`, could_not_run until WP7.
 pub(crate) fn whoami(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
+    if inv.flag("--git").is_some() {
+        return Err(Error::not_yet("whoami --git", "WP7"));
+    }
     let usage = |why: &str| inv.usage(why);
     let target = inv.flag("--for");
     if inv.has("--op") && target.is_none() {

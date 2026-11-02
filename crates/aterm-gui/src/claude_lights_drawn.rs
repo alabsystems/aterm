@@ -23,8 +23,7 @@ pub(crate) enum Drawn {
     /// The program has no composer line to draw a chip in ([`crate::claude_footer::chip_line`]).
     NoFooter,
     /// The last frame drew only the pane's harness switch: over a footer
-    /// [`crate::claude_footer::bare_while_off`] leaves bare, or on a top line whose chip stands
-    /// down ([`crate::claude_footer::chip_stands_down`]).
+    /// [`crate::claude_footer::bare_while_off`] leaves bare.
     SwitchOnly,
 }
 
@@ -135,8 +134,7 @@ impl WindowLights {
             } else if self.border_toggles.iter().any(|b| {
                 b.session == session
                     && !covered(b.term_row)
-                    && (crate::claude_footer::bare_while_off(Some(b.program), Some(b.face))
-                        || b.chip_down)
+                    && crate::claude_footer::bare_while_off(Some(b.program), Some(b.face))
             }) {
                 Drawn::SwitchOnly
             } else {
@@ -272,8 +270,14 @@ impl App {
                             });
                         let (label, description) = self.autopilot_spoken(session, built.0, &glass);
                         let title = CHROME_TITLE.then(|| {
-                            super::title_parts(&self.harness_glass, &self.pool, session, &built)
-                                .whole
+                            super::title_parts(
+                                &self.harness_glass,
+                                &self.hold_said,
+                                &self.pool,
+                                session,
+                                &built,
+                            )
+                            .whole
                         });
                         (label, description, title)
                     });

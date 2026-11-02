@@ -11,6 +11,8 @@ description = "Embedded encrypted replicated application database over astream"
 [dependencies]
 aterm-db-core.workspace = true
 aterm-secrets.workspace = true
+aterm-http.workspace = true
+serde.workspace = true
 aterm-spec-anchor.workspace = true
 aterm-journal.workspace = true
 aterm-durable.workspace = true
@@ -21,13 +23,15 @@ aterm-net.workspace = true
 aterm-uds.workspace = true
 aterm-time.workspace = true
 aterm-types.workspace = true
+aterm-tempfile.workspace = true
 aterm-toml.workspace = true
 ring.workspace = true
-zeroize = { version = "1", default-features = false }
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
 astream-broker = { path = "../../vendor/astream/crates/astream-broker" }
 astream-wire = { path = "../../vendor/astream/crates/astream-wire" }
 [dev-dependencies]
-aterm-tempfile.workspace = true
+# The process CPU time a repair round's cost is measured by (tests).
+aterm-sysprobe.workspace = true
 aterm-spec.workspace = true
 aterm-models-db.workspace = true
 

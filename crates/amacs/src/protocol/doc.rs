@@ -159,8 +159,15 @@ impl DocRequest {
                 Ok(format!("ls uri={uri}"))
             }
             Self::Read { doc, lines } => {
-                if let DocRef::Uri(uri) = doc {
-                    file_uri_token(uri)?;
+                match doc {
+                    DocRef::Id(0) => return Err(DocError::BadField("doc", "0".to_string())),
+                    DocRef::Id(_) => {}
+                    DocRef::Uri(uri) => {
+                        file_uri_token(uri)?;
+                    }
+                }
+                if lines.first == 0 || lines.last.is_some_and(|last| last < lines.first) {
+                    return Err(DocError::BadLines(lines.to_string()));
                 }
                 let mut args = format!("read {doc}");
                 if *lines != LineRange::ALL {
@@ -387,6 +394,16 @@ impl DocRow {
     /// The row, without its newline.
     pub fn format(&self) -> Result<String, DocError> {
         file_uri_token(&self.uri)?;
+        if let Some(at) = self.cursor
+            && (at.at.line == 0 || at.at.col == 0)
+        {
+            return Err(DocError::BadField("cursor", at.to_string()));
+        }
+        if let Some(sel) = self.sel
+            && (sel.from.line == 0 || sel.from.col == 0 || sel.to.line == 0 || sel.to.col == 0)
+        {
+            return Err(DocError::BadField("sel", sel.to_string()));
+        }
         Ok(format!(
             "doc={} uri={} seq={} dirty={} disk={} views={} ticket={} cursor={} sel={}",
             self.doc,
@@ -421,6 +438,9 @@ impl DocRow {
             return Err(DocError::UnknownOption(extra.to_string()));
         }
         let [doc, uri, seq, dirty, disk, views, tickets, cursor, sel] = values;
+        if !uri.starts_with("file://") {
+            return Err(DocError::BadField("uri", uri.to_string()));
+        }
         Ok(Self {
             doc: number(doc, "doc")?,
             uri: uri.to_string(),
@@ -653,6 +673,54 @@ mod tests {
             ..DocRow::parse(&line).unwrap()
         };
         assert_eq!(spaced.format(), Err(DocError::Whitespace("uri")));
+        assert_eq!(
+            DocRow::parse(
+                "doc=3 uri=/tmp/x seq=1 dirty=0 disk=same views=1 ticket=- cursor=- sel=-"
+            ),
+            Err(DocError::BadField("uri", "/tmp/x".to_string()))
+        );
+        assert_eq!(
+            DocRow {
+                cursor: Some(ViewPoint {
+                    view: 1,
+                    at: Point { line: 0, col: 1 },
+                }),
+                ..DocRow::parse(&line).unwrap()
+            }
+            .format(),
+            Err(DocError::BadField("cursor", "1:0:1".to_string()))
+        );
+        assert_eq!(
+            DocRow {
+                sel: Some(ViewSpan {
+                    view: 1,
+                    from: Point { line: 1, col: 1 },
+                    to: Point { line: 1, col: 0 },
+                }),
+                ..DocRow::parse(&line).unwrap()
+            }
+            .format(),
+            Err(DocError::BadField("sel", "1:1:1-1:0".to_string()))
+        );
+        assert_eq!(
+            DocRequest::Read {
+                doc: DocRef::Id(0),
+                lines: LineRange::ALL,
+            }
+            .format(),
+            Err(DocError::BadField("doc", "0".to_string()))
+        );
+        assert_eq!(
+            DocRequest::Read {
+                doc: DocRef::Id(1),
+                lines: LineRange {
+                    first: 5,
+                    last: Some(2),
+                },
+            }
+            .format(),
+            Err(DocError::BadLines("5-2".to_string()))
+        );
     }
 
     #[test]

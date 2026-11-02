@@ -471,7 +471,8 @@ fn managed_alab_twin() -> Option<PathBuf> {
 
 /// The atpkg twin `twin`, where the build it execs is ALab's ([`codex_alab::alab_bytes`]).
 pub(crate) fn alab_twin(twin: PathBuf) -> Option<PathBuf> {
-    let exe = super::upgrade_catalog::twin_binary(&std::fs::read_to_string(&twin).ok()?)?;
+    let raw = super::accounts::read_bounded(&twin, 256 * 1024).ok()??;
+    let exe = super::upgrade_catalog::twin_binary(&raw)?;
     codex_alab::alab_bytes(&exe).then_some(twin)
 }
 
@@ -712,7 +713,10 @@ impl Witnesses {
     #[must_use]
     pub fn handled(&self, pid: u32, start: &str) -> bool {
         let want = Self::line(pid, start);
-        std::fs::read_to_string(&self.path).is_ok_and(|text| text.lines().any(|l| l == want))
+        super::accounts::read_bounded(&self.path, 4 * 1024 * 1024)
+            .ok()
+            .flatten()
+            .is_some_and(|text| text.lines().any(|l| l == want))
     }
 
     /// Append witness `(pid, start)` to the ledger file.
@@ -722,21 +726,26 @@ impl Witnesses {
     pub fn record(&self, pid: u32, start: &str) -> std::io::Result<()> {
         use std::io::Write as _;
         if let Some(dir) = self.path.parent() {
-            std::fs::create_dir_all(dir)?;
             #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
-            }
+            aterm_uds::private_file::ensure_private_dir(dir)?;
+            #[cfg(not(unix))]
+            std::fs::create_dir_all(dir)?;
         }
         let mut open = std::fs::OpenOptions::new();
         open.create(true).append(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
-            open.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+            open.mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         }
         let mut file = open.open(&self.path)?;
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "witness ledger is not a regular file",
+            ));
+        }
         writeln!(file, "{}", Self::line(pid, start))
     }
 }

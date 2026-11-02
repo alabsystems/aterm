@@ -1281,6 +1281,81 @@ fn a_process_outside_the_default_home_reads_none_of_the_stores_week() {
     let _ = std::fs::remove_dir_all(root());
 }
 
+/// THE OUTLOOK'S GLANCE SPEAKS ONLY UNDER THE LABEL THE GATE PASSED: the default home's row,
+/// `personal`, beside a second row; with no address on the row the account gate refuses the
+/// profile, and though the footer still names the account the store judges the login to
+/// (`personal`), the pane shows none of the outlook's figures, as its weekly shows none of the
+/// store's. Control: the row's address named, the gate passes and the glance shows. Negative
+/// control: a glance taken under the footer's account label shows on the refused pane.
+#[test]
+fn a_pane_whose_gate_refused_shows_no_glance() {
+    fresh("footer-glance-gate");
+    profile(None);
+    save_as("personal", Some(NOW - 60), false);
+    fn two(email: Option<&str>) -> Option<accounts::Roster> {
+        Some(accounts::Roster {
+            rows: vec![
+                accounts::Row {
+                    label: "personal".into(),
+                    class: accounts::Class::Dedicated,
+                    dir: None,
+                    email: email.map(str::to_owned),
+                    ..accounts::Row::default()
+                },
+                accounts::Row {
+                    label: "alt1".into(),
+                    class: accounts::Class::Dedicated,
+                    dir: Some("/logins/alt1".into()),
+                    email: Some("alt1@example.test".into()),
+                    ..accounts::Row::default()
+                },
+            ],
+        })
+    }
+    fn named() -> Option<accounts::Roster> {
+        two(Some("tap@example.test"))
+    }
+    fn unnamed() -> Option<accounts::Roster> {
+        two(None)
+    }
+    crate::accounts_outlook::TEST_STATE_DIR.with(|d| *d.borrow_mut() = Some(store()));
+    let facts = |roster: fn() -> Option<accounts::Roster>| {
+        let timeline = tab();
+        let _ = reread(
+            &timeline,
+            &mut unread(&records()),
+            Asks {
+                roster,
+                ..asks(untapped, stored)
+            },
+        );
+        let held = timeline.lock().unwrap();
+        held.claude_footer().cloned().expect("a Claude Code footer")
+    };
+    let passed = facts(named);
+    assert_eq!(
+        passed
+            .subscription
+            .as_ref()
+            .and_then(|s| s.label.as_deref()),
+        Some("personal"),
+        "CONTROL: the gate passed"
+    );
+    assert!(passed.glance.is_some(), "CONTROL: the glance shows");
+    let refused = facts(unnamed);
+    assert_eq!(
+        (
+            refused.account.as_deref(),
+            refused.subscription.as_ref().and_then(|s| s.label.clone())
+        ),
+        (Some("personal"), None),
+        "the gate refused, the footer still names the account"
+    );
+    assert_eq!(refused.glance, None);
+    crate::accounts_outlook::TEST_STATE_DIR.with(|d| *d.borrow_mut() = None);
+    let _ = std::fs::remove_dir_all(root());
+}
+
 /// A 7D WALL IN THE TRANSCRIPT BEATS THE FOOTER'S OWN AGED FIGURE: at the weekly limit, a tap
 /// reading twenty minutes old says `weekly 0% left`, never the week it read before the wall;
 /// a current reading still says its own.

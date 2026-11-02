@@ -288,9 +288,22 @@ pub(crate) fn context_transition(
                     assert_ne!(before, after);
                     before.labels.get_mut("work").unwrap().renewal_generation = 0;
                     after.labels.get_mut("work").unwrap().renewal_generation = 0;
+                    before
+                        .labels
+                        .get_mut("work")
+                        .unwrap()
+                        .last_success_generation = 0;
+                    after
+                        .labels
+                        .get_mut("work")
+                        .unwrap()
+                        .last_success_generation = 0;
                     before.generation_clock = 0;
                     after.generation_clock = 0;
-                    assert_eq!(before, after, "the generation alone invalidates this cache");
+                    assert_eq!(
+                        before, after,
+                        "only publication generation metadata changed"
+                    );
                 }
                 _ => {}
             }

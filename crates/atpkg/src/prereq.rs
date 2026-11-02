@@ -408,7 +408,8 @@ fn build_probe(cc: &Path, resolved: PathBuf, path_var: Option<&OsStr>, host: &Cc
             driver: cc.to_path_buf(),
         },
         Some(out) if out.status.success() => {
-            let wrote = std::fs::metadata(&program).is_ok_and(|m| m.is_file() && m.len() > 0);
+            let wrote =
+                std::fs::symlink_metadata(&program).is_ok_and(|m| m.is_file() && m.len() > 0);
             if wrote {
                 CcVerdict::Ready { driver: resolved }
             } else {

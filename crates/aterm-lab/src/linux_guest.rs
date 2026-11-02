@@ -5,6 +5,8 @@
 
 use std::fmt::Write as _;
 
+use aterm_uds::host::bash::File;
+
 /// A configuration namespace reserved by one `Up` with guest `mktemp -d`.
 #[derive(Debug)]
 pub struct Config {
@@ -189,7 +191,7 @@ pub const DEV_LIBRARIES: &[&str] = &[
 /// Mesa's software drivers, installed for both architectures: llvmpipe (GL) and lavapipe (Vulkan), the lane's GPU.
 pub const MESA: &[&str] = &["libgl1-mesa-dri", "libegl-mesa0", "mesa-vulkan-drivers"];
 
-/// The guest's own tools: the build, the display servers, the second X client of the clipboard round trip, the baseline's input and probe tools (xdotool's XTEST keys and pointer, xset and xrdb, xdpyinfo, wayland-info, wl-clipboard's second Wayland client, ibus as the XIM server, GNOME Shell, whose IBus bridge is the one input method that reaches Mutter's text-input-v3, and pipewire, without which Mutter has no screencast, the space RemoteDesktop places a finger in), the session bus and the accessibility bus, Orca with speech-dispatcher (whose dummy output module answers speech with no audio device) and x11-utils' xev (the window an Orca row has Mutter frame before aterm-gui starts, [`crate::linux_a11y::FRAMES_PRIMER`]) and xdg-desktop-portal with its GTK backend (the Settings portal aterm's motion read asks), the GPU probes, fonts (a stock Ubuntu desktop's: Noto CJK and Noto Color Emoji are the CJK and colour faces aterm-render's script and emoji tests need, and without them those answer COULD NOT RUN), the x86_64 cross toolchain with its libc, zsh and fish, the shells aterm integrates beside bash, whose integration tests run each one and cannot run without it (apt's fish, 3.7 on noble, is the fish floor lane, docs/DESIGN-init-system-2026-10-20.md §6.2: the guest never takes the pinned 4.9.3 `verify provision` builds on macOS; pwsh, the fourth, is [`PWSH`], Microsoft's release archive held to its sha256), the two build tools [`BASH_3_2_INSTALL`] needs (autotools-dev's `config.guess` and `config.sub`, which know aarch64, and bison), unzip, which `verify provision` unpacks the browser lane's pinned browsers with, sway (headless wlroots: the one lane compositor that grants server-side decorations and offers cursor-shape-v1 and a virtual pointer, for `linux edges`), grim (its screenshot, for the shadow margin's pixels), GStreamer's pipewire source and PNG encoder (a frame of Mutter's screencast, the pixels a Mutter CPU row is held to), ibus-libpinyin (a CJK engine with a preedit, for XIM), xtrace (a proxy display that logs an X11 client's requests, for the baseline's `x11.wire.*` lines, [`crate::linux_xwire`]), and python3 and openssl, the install_sh tests' floor for install.sh's embedded verifier (Python 3.11+, OpenSSL 3: docs/DESIGN-init-system-2026-10-20.md §6.1 row 14).
+/// The guest's own tools: the build, the display servers, the second X client of the clipboard round trip, the baseline's input and probe tools (xdotool's XTEST keys and pointer, xset and xrdb, xdpyinfo, wayland-info, wl-clipboard's second Wayland client, ibus as the XIM server, GNOME Shell, whose IBus bridge is the one input method that reaches Mutter's text-input-v3, and pipewire, without which Mutter has no screencast, the space RemoteDesktop places a finger in), the session bus and the accessibility bus, Orca with speech-dispatcher (whose dummy output module answers speech with no audio device) and x11-utils' xev (the window an Orca row has Mutter frame before aterm-gui starts, [`crate::linux_a11y::FRAMES_PRIMER`]) and xdg-desktop-portal with its GTK backend (the Settings portal aterm's motion read asks), the GPU probes, fonts (a stock Ubuntu desktop's: Noto CJK and Noto Color Emoji are the CJK and colour faces aterm-render's script and emoji tests need, and without them those answer COULD NOT RUN), the x86_64 cross toolchain with its libc, zsh and fish, the shells aterm integrates beside bash, whose integration tests run each one and cannot run without it (apt's fish, 3.7 on noble, is the fish floor lane, docs/DESIGN-init-system-2026-10-20.md §6.2: the guest never takes the pinned 4.9.3 `verify provision` builds on macOS; pwsh, the fourth, is [`PWSH`], Microsoft's release archive held to its sha256), the build tools [`BASH_INSTALL`] needs beyond build-essential (patch, which applies GNU's official patches, autotools-dev's `config.guess` and `config.sub`, which know aarch64 where 3.2's own do not, and bison, which 3.2's 2006 build files need), unzip, which `verify provision` unpacks the browser lane's pinned browsers with, sway (headless wlroots: the one lane compositor that grants server-side decorations and offers cursor-shape-v1 and a virtual pointer, for `linux edges`), grim (its screenshot, for the shadow margin's pixels), GStreamer's pipewire source and PNG encoder (a frame of Mutter's screencast, the pixels a Mutter CPU row is held to), ibus-libpinyin (a CJK engine with a preedit, for XIM), xtrace (a proxy display that logs an X11 client's requests, for the baseline's `x11.wire.*` lines, [`crate::linux_xwire`]), and python3 and openssl, the install_sh tests' floor for install.sh's embedded verifier (Python 3.11+, OpenSSL 3: docs/DESIGN-init-system-2026-10-20.md §6.1 row 14).
 pub const TOOLS: &[&str] = &[
     "build-essential",
     "pkg-config",
@@ -231,6 +233,7 @@ pub const TOOLS: &[&str] = &[
     "libc6-dev-amd64-cross",
     "zsh",
     "fish",
+    "patch",
     "autotools-dev",
     "bison",
     "sway",
@@ -346,29 +349,96 @@ fi
 ln -sfn "$dir/pwsh" /usr/local/bin/pwsh
 "#;
 
-/// GNU bash 3.2.57, the bash macOS ships as /bin/bash, for the one test that needs that bash on Linux: the spare hold's SIGWINCH negative control (`a_spare_hold_survives_sigwinch_and_only_go_releases_it`), whose cut hold a signal releases only where the hold's FIFO open fails when interrupted. bash 5 (the guest's 5.2) restarts it, so without this bash the control is COULD NOT RUN and the shell suite's row fails.
-pub const BASH_3_2: (&str, &str) = (
-    "3.2.57",
-    "3fa9daf85ebf35068f090ce51283ddeeb3c75eb5bc70b1a4a7cb05868bfe06a4",
-);
+/// A GNU bash the guest builds from GNU's release archive and its official patches ([`BASH_INSTALL`]), beside the distro's own (noble's 5.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Bash {
+    /// The version it builds, what `bash --version` answers: the release and its patch level (5.3 and 20 patches, 5.3.20).
+    pub version: &'static str,
+    /// GNU's release archive.
+    pub source: File,
+    /// Each official patch, in order.
+    pub patches: &'static [File],
+    /// Its name in `/usr/local/bin`.
+    pub link: &'static str,
+}
 
-/// Build [`BASH_3_2`] (`$1` its version, `$2` the archive's sha256) into `/opt/aterm-lane/bash-<version>` and link it as `/usr/local/bin/bash-3.2`, run as the guest's user (root only to install).
-pub const BASH_3_2_INSTALL: &str = r#"set -eu
-dir=/opt/aterm-lane/bash-$1
+impl Bash {
+    /// Where the guest's tests find it.
+    #[must_use]
+    pub fn path(&self) -> String {
+        format!("/usr/local/bin/{}", self.link)
+    }
+
+    /// The provisioning step that builds it: [`BASH_INSTALL`] run as the guest's user.
+    fn step(&self, label: &'static str) -> Step {
+        let mut argv = strings(&["sh", "-s", "--", self.version, self.link]);
+        argv.extend(
+            std::iter::once(&self.source)
+                .chain(self.patches)
+                .map(|file| format!("{}={}", file.sha256, file.url)),
+        );
+        Step {
+            label,
+            argv,
+            stdin: Some(BASH_INSTALL.to_string()),
+        }
+    }
+}
+
+/// GNU bash 3.2.57, the bash macOS ships as /bin/bash, for the one test that needs that bash on Linux: the spare hold's SIGWINCH negative control (`a_spare_hold_survives_sigwinch_and_only_go_releases_it`), whose cut hold a signal releases only where the hold's FIFO open fails when interrupted. bash 5 (the guest's 5.2) restarts it, so without this bash the control is COULD NOT RUN and the shell suite's row fails. GNU's 3.2.57 archive carries its patches.
+pub const BASH_3_2: Bash = Bash {
+    version: "3.2.57",
+    source: File {
+        url: "https://ftp.gnu.org/gnu/bash/bash-3.2.57.tar.gz",
+        sha256: "3fa9daf85ebf35068f090ce51283ddeeb3c75eb5bc70b1a4a7cb05868bfe06a4",
+        bytes: 2_542_620,
+    },
+    patches: &[],
+    link: "bash-3.2",
+};
+
+/// GNU bash 5.3 with its official patches, the `bash-5.3` tool row's pin, built from the one table of its files that `verify provision`'s Mac build reads too ([`aterm_uds::host::bash`]): the bash integration's 5.3 paths (the `${ ...; }` history read, PS0's file-free hook) run on no older bash, so without it the guest's shell suite never runs them. The Linux proof names it to that suite ([`crate::linux_proof::SHELLS`]), and the row's Linux refusal names this build.
+pub const BASH_5_3: Bash = Bash {
+    version: aterm_uds::host::pinned_version("bash-5.3"),
+    source: aterm_uds::host::bash::SOURCE,
+    patches: aterm_uds::host::bash::PATCHES,
+    link: "bash-5.3",
+};
+
+/// Build a [`Bash`] into `/opt/aterm-lane/bash-<version>` and link it as `/usr/local/bin/<link>` (`$1` the version, `$2` the link, then each file as `<sha256>=<url>`, the archive first and then each patch in order), run as the guest's user (root only to install). Each download is held to its sha256 and each patch applied in order, as `verify provision` applies them on a Mac; the archive's own times stay, so what a patch changes comes out newer than what was generated from it (a `parse.y` than its `y.tab.c`, which `make` remakes with bison), and a patch that changes both lays the generated file second (bash53-016 `configure.ac`, then `configure`), so `make` never asks for autoconf. Configured as the Mac's 5.3 is (bash's own malloc off, no translations), with the archive's own `config.guess` and `config.sub` where they name the guest (5.3's, as the Mac build keeps them), else the guest's (3.2's predate aarch64); the build must answer `bash --version` with the version it was built as before it is installed.
+pub const BASH_INSTALL: &str = r#"set -eu
+version=$1 link=$2
+shift 2
+dir=/opt/aterm-lane/bash-$version
 if [ ! -x "$dir/bin/bash" ]; then
   tmp=$(mktemp -d)
   trap 'rm -rf "$tmp"' EXIT
-  curl -fsSL -o "$tmp/bash.tar.gz" "https://ftp.gnu.org/gnu/bash/bash-$1.tar.gz"
-  echo "$2  $tmp/bash.tar.gz" | sha256sum -c --quiet
-  tar -xzf "$tmp/bash.tar.gz" -C "$tmp"
-  cd "$tmp/bash-$1"
-  cp /usr/share/misc/config.guess /usr/share/misc/config.sub support/
-  ./configure --prefix="$dir" --without-bash-malloc >"$tmp/build.log" 2>&1 &&
-    make >>"$tmp/build.log" 2>&1 || { tail -40 "$tmp/build.log"; exit 1; }
+  n=0
+  for each in "$@"; do
+    n=$((n + 1))
+    curl -fsSL -o "$tmp/$n" "${each#*=}"
+    echo "${each%%=*}  $tmp/$n" | sha256sum -c --quiet
+  done
+  mkdir "$tmp/src"
+  tar -xzf "$tmp/1" -C "$tmp/src" --strip-components=1
+  cd "$tmp/src"
+  i=1
+  while [ "$i" -lt "$n" ]; do
+    i=$((i + 1))
+    patch -p0 -s -f -i "$tmp/$i"
+  done
+  sh support/config.guess >/dev/null 2>&1 ||
+    cp /usr/share/misc/config.guess /usr/share/misc/config.sub support/
+  ./configure --prefix="$dir" --without-bash-malloc --disable-nls >"$tmp/build.log" 2>&1 &&
+    make bash >>"$tmp/build.log" 2>&1 || { tail -40 "$tmp/build.log"; exit 1; }
+  case $(./bash --version | head -n 1) in
+    "GNU bash, version $version("*) ;;
+    *) echo "bash $version built as $(./bash --version | head -n 1)" >&2; exit 1 ;;
+  esac
   sudo install -D -m 0755 bash "$dir/bin/.bash.new"
   sudo mv "$dir/bin/.bash.new" "$dir/bin/bash"
 fi
-sudo ln -sfn "$dir/bin/bash" /usr/local/bin/bash-3.2
+sudo ln -sfn "$dir/bin/bash" "/usr/local/bin/$link"
 "#;
 
 /// Webster's Second International (`web2`), the public-domain word list aterm-lexicon's dictionary gates walk: their allowlists are curated against it, so another list decides nothing and they answer COULD NOT RUN without it (`crates/aterm-lexicon/tests/lexicon_suite.rs`). macOS ships it here and Ubuntu packages no web2 (its `wamerican` is another list), so the guest gets this Mac's copy at the same path.
@@ -491,11 +561,8 @@ pub fn provision_plan_for(web2: Option<String>, x86_64: bool) -> Vec<Step> {
             &["sudo", "sh", "-s", "--", PWSH.0, PWSH.1],
             Some(PWSH_INSTALL),
         ),
-        step(
-            "bash 3.2",
-            &["sh", "-s", "--", BASH_3_2.0, BASH_3_2.1],
-            Some(BASH_3_2_INSTALL),
-        ),
+        BASH_3_2.step("bash 3.2"),
+        BASH_5_3.step("bash 5.3"),
     ]);
     if let Some(words) = web2 {
         steps.push(step(
@@ -1508,6 +1575,30 @@ mod tests {
                 .iter()
                 .all(|s| s.label != "web2" && !s.argv.iter().any(|a| a == WEB2))
         );
+    }
+
+    /// One recipe builds both bashes, each linked where its tool row looks first: the 5.3 is the
+    /// `bash-5.3` row's pin, whose Linux refusal names this build, each file of the one table
+    /// its Mac build reads too passed with its sha256, the archive first.
+    #[test]
+    fn the_guest_builds_the_pinned_bash_5_3_with_the_3_2_recipe() {
+        let five = aterm_uds::host::tool("bash-5.3");
+        assert!(five.in_guest);
+        let plan = provision_plan(None);
+        for (label, bash, row) in [
+            ("bash 3.2", BASH_3_2, aterm_uds::host::tool("bash-3.2")),
+            ("bash 5.3", BASH_5_3, five),
+        ] {
+            assert_eq!(row.at.first(), Some(&bash.path().as_str()), "{label}");
+            let step = plan.iter().find(|s| s.label == label).expect(label);
+            assert_eq!(step.stdin.as_deref(), Some(BASH_INSTALL), "{label}");
+            assert_eq!(step.argv[3..5], [bash.version, bash.link], "{label}");
+            let files: Vec<String> = std::iter::once(&bash.source)
+                .chain(bash.patches)
+                .map(|file| format!("{}={}", file.sha256, file.url))
+                .collect();
+            assert_eq!(step.argv[5..], files, "{label}");
+        }
     }
 
     #[test]

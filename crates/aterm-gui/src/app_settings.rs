@@ -299,7 +299,8 @@ impl App {
                     crate::native_app::AppViewState::Settings(state) => {
                         state.replace_drawn_faces(drawn.clone())
                     }
-                    crate::native_app::AppViewState::About(_)
+                    crate::native_app::AppViewState::Mail(_)
+                    | crate::native_app::AppViewState::About(_)
                     | crate::native_app::AppViewState::Markdown(_)
                     | crate::native_app::AppViewState::SystemState(_)
                     | crate::native_app::AppViewState::Editor(_)
@@ -342,7 +343,8 @@ impl App {
                     crate::native_app::AppViewState::Settings(state) => {
                         state.replace_font_refusals(refusals.to_vec(), announce)
                     }
-                    crate::native_app::AppViewState::About(_)
+                    crate::native_app::AppViewState::Mail(_)
+                    | crate::native_app::AppViewState::About(_)
                     | crate::native_app::AppViewState::Markdown(_)
                     | crate::native_app::AppViewState::SystemState(_)
                     | crate::native_app::AppViewState::Editor(_)
@@ -384,7 +386,8 @@ impl App {
                     crate::native_app::AppViewState::Settings(state) => {
                         state.replace_font_families(std::sync::Arc::clone(families))
                     }
-                    crate::native_app::AppViewState::About(_)
+                    crate::native_app::AppViewState::Mail(_)
+                    | crate::native_app::AppViewState::About(_)
                     | crate::native_app::AppViewState::Markdown(_)
                     | crate::native_app::AppViewState::SystemState(_)
                     | crate::native_app::AppViewState::Editor(_)
@@ -570,7 +573,8 @@ impl App {
                         let armed = state.arm_consent_gestures(gestures);
                         state.replace_macos_access(access.clone()) || armed
                     }
-                    crate::native_app::AppViewState::About(_)
+                    crate::native_app::AppViewState::Mail(_)
+                    | crate::native_app::AppViewState::About(_)
                     | crate::native_app::AppViewState::Markdown(_)
                     | crate::native_app::AppViewState::SystemState(_)
                     | crate::native_app::AppViewState::Editor(_)
@@ -939,6 +943,13 @@ impl App {
             .map(|(_, _, _, state)| &state.legacy)
     }
 
+    /// Whether window `wid` holds a Settings tab ([`Self::visit_settings_tabs_in_window`]).
+    pub(crate) fn window_holds_settings(&self, wid: crate::WindowId) -> bool {
+        let mut holds = false;
+        self.visit_settings_tabs_in_window(wid, |_, _, _, _| holds = true);
+        holds
+    }
+
     /// Select the process-singleton Settings app in the frontmost window.
     pub(crate) fn open_settings_tab(
         &mut self,
@@ -1065,6 +1076,8 @@ impl App {
             ws.last_present = None;
         }
         self.resync_active_or_window(wid);
+        // A window holding Settings is never smaller than Settings' least.
+        self.hold_least_window_size(wid);
         self.sync_settings_consent_posture();
         self.sync_settings_session_runtime();
         if route == crate::native_settings::SettingsRoute::SoftwareUpdate {
@@ -1913,7 +1926,7 @@ impl App {
         req: aterm_a11y::model::ActionRequest,
     ) {
         use crate::overlay::OverlayKind;
-        self.clear_move_license(wid);
+        self.clear_move_license_from(wid, crate::cursor_glow::BoundaryOrigin::Accessibility);
         let kind = self
             .windows
             .get(&wid)
@@ -4459,504 +4472,5 @@ mod tests {
             0
         );
         assert!(glow.is_empty() && trail.is_empty());
-    }
-}
-
-/// The production wiring for chrome-message live regions: the `App` methods that read
-/// the live window and decide what a screen reader is told (which band is on the
-/// glass, how the frame cut it), on a real `App`.
-#[cfg(all(test, a11y_tree))]
-mod a11y_message_wiring_tests {
-    use std::time::Instant;
-
-    use crate::a11y_tree::{ChromeMessage, GridMessage};
-    use crate::{App, WindowId};
-
-    fn message(app: &App, wid: WindowId, kind: ChromeMessage) -> GridMessage {
-        app.grid_a11y_messages(wid)
-            .into_iter()
-            .find(|m| m.message == kind)
-            .unwrap_or_else(|| panic!("{kind:?} is not published"))
-    }
-
-    #[test]
-    fn a_band_row_is_announced_at_the_row_it_reserves_and_only_while_it_holds_it() {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        app.prepare_terminal_capture_grid(wid).unwrap();
-        let downloading = |done: u64| aterm_update::Progress::Downloading {
-            version: "0.64.0".to_string(),
-            bytes_done: done * 1024 * 1024,
-            bytes_total: 480 * 1024 * 1024,
-        };
-        app.note_update_check_asked(true);
-        app.note_update_progress(&downloading(120));
-        assert_eq!(
-            app.message_band_rows, 0,
-            "inside its grace the row is not on the glass (design §10.4.3)"
-        );
-        assert!(app.grid_a11y_messages(wid).is_empty(), "…nor in the tree");
-        app.settle_messages(Instant::now() + aterm_messages::PROGRESS_GRACE * 2);
-        assert_eq!(app.message_band_rows, 1, "the update lane reserved its row");
-
-        let band = message(&app, wid, ChromeMessage::BandRow0);
-        assert_eq!(band.bar_row, Some(0), "the only row is the top row");
-        assert_eq!(band.progress, Some(0.25));
-        assert!(!band.busy, "a download has a fraction");
-        assert!(band.activates, "a press opens Software Update");
-        let figures = band.detail.clone().expect("the byte counter is described");
-        assert!(
-            figures.contains("126 MB"),
-            "the stats ride the description: {figures:?}"
-        );
-        assert!(
-            !band.text.contains("126 MB"),
-            "the volatile figures must not ride the announced sentence: {:?}",
-            band.text
-        );
-        assert_eq!(
-            band.capsules.len(),
-            1,
-            "a downloading row carries only the implicit Details capsule"
-        );
-
-        app.note_update_progress(&downloading(400));
-        let later = message(&app, wid, ChromeMessage::BandRow0);
-        assert_eq!(later.text, band.text, "no announcement for a byte count");
-        assert_ne!(later.detail, band.detail);
-
-        app.message_band_rows = 0;
-        assert!(
-            app.grid_a11y_messages(wid).is_empty(),
-            "a row with no committed slot is not on the glass"
-        );
-    }
-
-    #[test]
-    fn a_decision_row_is_an_alert() {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        app.prepare_terminal_capture_grid(wid).unwrap();
-        app.post_message(crate::message_reporters::file_access_question(
-            &crate::consent_card::NeedWords::sample(),
-        ));
-        let ask = message(&app, wid, ChromeMessage::BandRow0);
-        assert_eq!(ask.text, crate::consent_card::FDA_TITLE);
-        assert!(ask.alarm, "a question is an alert");
-        assert!(ask.progress.is_none() && !ask.busy);
-        let mut app = App::headless_for_test();
-        app.prepare_terminal_capture_grid(wid).unwrap();
-        app.announce_toolchain_pass("installing 10 ALab program(s)", true);
-        let work = message(&app, wid, ChromeMessage::BandRow0);
-        assert!(!work.alarm, "work in flight is not an alert");
-        assert!(work.busy);
-    }
-
-    #[test]
-    fn activating_a_band_row_performs_its_body_press_and_a_capsule_child_its_intent() {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        app.prepare_terminal_capture_grid(wid).unwrap();
-        let id = app.post_message(
-            aterm_messages::Message::new(
-                aterm_messages::tags::TOOLCHAIN,
-                aterm_messages::Severity::Info,
-                "Installing ALab toolchain",
-            )
-            .line("trust — extracting")
-            .action(aterm_messages::Intent::OpenSettings {
-                route: "/packages".into(),
-            })
-            .hold(aterm_messages::Hold::Live {
-                stale_after: aterm_messages::STALE_TAILED,
-            }),
-        );
-        let row = message(&app, wid, ChromeMessage::BandRow0);
-        assert!(row.activates, "a band row activates");
-        assert_eq!(
-            row.capsules.len(),
-            2,
-            "the authored capsule, then the row's link"
-        );
-        assert_eq!(
-            row.capsules[1].index,
-            crate::a11y_tree::CAPSULE_DETAILS,
-            "the link takes the Details slot"
-        );
-        let settings = |app: &App| {
-            let (_, view) = app.active_native_view(wid)?;
-            match app.native_runtime.view_state(view)? {
-                crate::native_app::AppViewState::Settings(state) => {
-                    Some((state.route, state.messages_selected))
-                }
-                _ => None,
-            }
-        };
-        assert_eq!(settings(&app), None);
-        app.activate_a11y_message(wid, ChromeMessage::BandRow0, row.context);
-        assert_eq!(
-            app.messages.live(id).unwrap().acted.map(|(k, _)| k),
-            None,
-            "the body is no capsule: nothing is recorded as one"
-        );
-        assert!(app.messages.live(id).unwrap().seen, "…but the row is seen");
-        assert_eq!(
-            settings(&app),
-            Some((
-                crate::native_settings::SettingsRoute::Messages,
-                Some(id.raw())
-            )),
-            "Settings \u{25b8} Messages at this entry, in this window"
-        );
-        app.activate_a11y_message(
-            wid,
-            ChromeMessage::BandCapsule { row: 0, index: 0 },
-            row.context,
-        );
-        assert_eq!(
-            app.messages.live(id).unwrap().acted.map(|(k, _)| k),
-            Some(aterm_messages::ActionIndex(0)),
-            "the engine recorded the press"
-        );
-        assert_eq!(
-            settings(&app).map(|(route, _)| route),
-            Some(crate::native_settings::SettingsRoute::Packages),
-            "Settings \u{25b8} Packages, in this window"
-        );
-        app.activate_a11y_message(
-            wid,
-            ChromeMessage::BandCapsule {
-                row: 0,
-                index: crate::a11y_tree::CAPSULE_DETAILS,
-            },
-            row.context,
-        );
-        assert_eq!(
-            settings(&app).map(|(route, _)| route),
-            Some(crate::native_settings::SettingsRoute::Messages)
-        );
-        assert!(app.resolve_message(id, aterm_messages::Outcome::Ok));
-        assert!(
-            app.grid_a11y_messages(wid)
-                .iter()
-                .all(|m| m.message != ChromeMessage::BandRow0),
-            "a resolved row is not published"
-        );
-        app.activate_a11y_message(wid, ChromeMessage::BandRow0, row.context);
-        app.activate_a11y_message(
-            wid,
-            ChromeMessage::BandCapsule { row: 0, index: 0 },
-            row.context,
-        );
-        assert!(app.messages.live(id).is_none());
-
-        let mut app = App::headless_for_test();
-        app.prepare_terminal_capture_grid(wid).unwrap();
-        let posting = |title: &str| {
-            aterm_messages::Message::new(
-                aterm_messages::tags::TOOLCHAIN,
-                aterm_messages::Severity::Info,
-                title,
-            )
-            .key("a11y-delayed")
-            .action(aterm_messages::Intent::OpenSettings {
-                route: "/packages".into(),
-            })
-            .hold(aterm_messages::Hold::Live {
-                stale_after: aterm_messages::STALE_TAILED,
-            })
-        };
-        let first = app.post_message(posting("First task"));
-        let queued = |app: &mut App| {
-            app.prepare_terminal_capture_grid(wid).unwrap();
-            let tree = app.grid_a11y_tree(wid, None).expect("published grid");
-            let (target, node) = tree
-                .nodes
-                .iter()
-                .find(|(_, node)| {
-                    node.role() == aterm_a11y::model::Role::Button
-                        && node.label() == Some("Packages")
-                })
-                .expect("published authored capsule");
-            aterm_a11y::model::ActionRequest {
-                context: node.action_context(),
-                action: aterm_a11y::model::Action::Click,
-                target_tree: aterm_a11y::model::TreeId::ROOT,
-                target_node: *target,
-                data: None,
-            }
-        };
-        let stale_owner = queued(&mut app);
-        let second = app.post_message(posting("Second task"));
-        assert_ne!(first, second);
-        assert!(app.messages.live(first).is_none());
-        app.on_accessibility_action(wid, stale_owner);
-        assert_eq!(
-            settings(&app),
-            None,
-            "old slot must not activate the new message"
-        );
-        assert!(app.messages.live(second).unwrap().acted.is_none());
-        let stale_action = queued(&mut app);
-        assert!(app.messages.restate(
-            second,
-            aterm_messages::Restatement {
-                actions: Some(vec![aterm_messages::Intent::OpenSettings {
-                    route: "/appearance".into()
-                }]),
-                ..aterm_messages::Restatement::default()
-            },
-            Instant::now()
-        ));
-        app.on_accessibility_action(wid, stale_action.clone());
-        assert_eq!(
-            settings(&app),
-            None,
-            "same id with changed actions is still stale"
-        );
-        assert!(app.messages.live(second).unwrap().acted.is_none());
-        assert!(app.messages.restate(
-            second,
-            aterm_messages::Restatement {
-                actions: Some(vec![aterm_messages::Intent::OpenSettings {
-                    route: "/packages".into()
-                }]),
-                ..aterm_messages::Restatement::default()
-            },
-            Instant::now()
-        ));
-        app.on_accessibility_action(wid, stale_action);
-        assert_eq!(
-            settings(&app),
-            None,
-            "restoring the old action does not revive its queued version"
-        );
-        let current = queued(&mut app);
-        for context in [
-            None,
-            Some(aterm_a11y::model::ActionContext::new(
-                second.raw(),
-                current.context.unwrap().generation(),
-            )),
-            Some(aterm_a11y::model::ActionContext::tab(second.raw())),
-        ] {
-            let mut wrong = current.clone();
-            wrong.context = context;
-            app.on_accessibility_action(wid, wrong);
-            assert_eq!(settings(&app), None, "unbound or wrong-domain action");
-        }
-        app.on_accessibility_action(wid, current);
-        assert_eq!(
-            settings(&app).map(|(route, _)| route),
-            Some(crate::native_settings::SettingsRoute::Packages)
-        );
-        assert_eq!(
-            app.messages
-                .live(second)
-                .unwrap()
-                .acted
-                .map(|(index, _)| index),
-            Some(aterm_messages::ActionIndex(0))
-        );
-    }
-
-    #[test]
-    fn a11y_activate_on_a_row_opens_details() {
-        let settings = |app: &App, wid: WindowId| {
-            let (_, view) = app.active_native_view(wid)?;
-            match app.native_runtime.view_state(view)? {
-                crate::native_app::AppViewState::Settings(state) => {
-                    Some((state.route, state.messages_selected))
-                }
-                _ => None,
-            }
-        };
-        let row_of = |app: &App, wid: WindowId, id: aterm_messages::MessageId| {
-            let cols = usize::from(app.windows[&wid].cols);
-            app.band_presentation(cols)
-                .rows
-                .iter()
-                .position(|r| matches!(r.kind, aterm_messages::RowKind::Message(m) if m == id))
-        };
-        let slots = [
-            ChromeMessage::BandRow0,
-            ChromeMessage::BandRow1,
-            ChromeMessage::BandRow2,
-        ];
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        app.prepare_terminal_capture_grid(wid).unwrap();
-        let meter = app.post_message(
-            aterm_messages::Message::new(
-                aterm_messages::tags::TOOLCHAIN,
-                aterm_messages::Severity::Info,
-                "Installing ALab toolchain",
-            )
-            .line("trust — extracting")
-            .action(aterm_messages::Intent::OpenSettings {
-                route: "/packages".into(),
-            })
-            .hold(aterm_messages::Hold::Live {
-                stale_after: aterm_messages::STALE_TAILED,
-            }),
-        );
-        let warning = app.post_message(
-            aterm_messages::Message::new(
-                aterm_messages::tags::CONFIG,
-                aterm_messages::Severity::Warn,
-                "aterm.toml: unknown key `foo`",
-            )
-            .line("at line 12"),
-        );
-        assert_eq!(app.message_band_rows, 2);
-        let row = row_of(&app, wid, warning).expect("the warning is on the band");
-        let node = message(&app, wid, slots[row]);
-        assert!(node.activates, "a band row activates");
-        assert_eq!(
-            node.capsules.iter().map(|c| c.index).collect::<Vec<_>>(),
-            [crate::a11y_tree::CAPSULE_DETAILS],
-            "a capsule-less row publishes its link alone"
-        );
-        assert_eq!(settings(&app, wid), None);
-        app.activate_a11y_message(wid, slots[row], node.context);
-        assert_eq!(
-            settings(&app, wid),
-            Some((
-                crate::native_settings::SettingsRoute::Messages,
-                Some(warning.raw())
-            )),
-            "Settings \u{25b8} Messages at this entry, in this window"
-        );
-        assert!(
-            app.messages.live(warning).is_none(),
-            "read, so a held row folds"
-        );
-        assert!(
-            app.messages
-                .live(meter)
-                .is_some_and(|l| !l.seen && l.acted.is_none()),
-            "the row beside it is untouched"
-        );
-        assert!(
-            row_of(&app, wid, warning).is_none(),
-            "the folded row is off the glass"
-        );
-        assert_eq!(
-            app.message_band_rows, 1,
-            "Settings came to the front: the folded row's band row went with it, so \
-             Settings is laid out without it (no quiet is kept for a view that left)"
-        );
-        assert!(
-            app.grid_a11y_messages(wid)
-                .iter()
-                .all(|m| m.message != ChromeMessage::BandRow1),
-            "the second slot is no longer published"
-        );
-        app.activate_a11y_message(wid, ChromeMessage::BandRow1, node.context);
-        assert_eq!(
-            settings(&app, wid),
-            Some((
-                crate::native_settings::SettingsRoute::Messages,
-                Some(warning.raw())
-            ))
-        );
-        assert!(app.messages.live(meter).is_some_and(|l| !l.seen));
-
-        let mut app = App::headless_for_test();
-        app.prepare_terminal_capture_grid(wid).unwrap();
-        let ids: Vec<_> = (0..5)
-            .map(|i| {
-                app.post_message(
-                    aterm_messages::Message::new(
-                        aterm_messages::tags::CONFIG,
-                        aterm_messages::Severity::Warn,
-                        format!("config warning {i}"),
-                    )
-                    .line("why"),
-                )
-            })
-            .collect();
-        assert_eq!(app.message_band_rows, aterm_messages::MAX_ROWS);
-        let link = message(&app, wid, ChromeMessage::BandOverflow);
-        assert!(link.activates, "the overflow row is a link");
-        assert!(
-            link.capsules.is_empty(),
-            "the node is the one link: its painted chip is no second control"
-        );
-        app.activate_a11y_message(wid, ChromeMessage::BandOverflow, link.context);
-        assert_eq!(
-            settings(&app, wid),
-            Some((crate::native_settings::SettingsRoute::Messages, None)),
-            "the page, top of the log, nothing expanded"
-        );
-        for id in &ids {
-            assert!(
-                app.messages.live(*id).is_some_and(|l| !l.seen),
-                "a link to the log reads no row"
-            );
-        }
-        assert_eq!(app.message_band_rows, aterm_messages::MAX_ROWS);
-
-        let mut app = App::headless_for_test();
-        app.prepare_terminal_capture_grid(wid).unwrap();
-        app.post_message(
-            aterm_messages::Message::new(
-                aterm_messages::tags::CONFIG,
-                aterm_messages::Severity::Warn,
-                "one warning",
-            )
-            .line("why"),
-        );
-        assert!(
-            app.grid_a11y_messages(wid)
-                .iter()
-                .all(|m| m.message != ChromeMessage::BandOverflow),
-            "one row: no overflow link is published"
-        );
-        app.activate_a11y_message(wid, ChromeMessage::BandOverflow, link.context);
-        assert_eq!(settings(&app, wid), None, "nothing opened");
-    }
-
-    #[test]
-    fn a_countdown_never_reannounces_a_row() {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        app.prepare_terminal_capture_grid(wid).unwrap();
-        let total: u64 = 200_000_000;
-        let words = |done: u64| {
-            crate::update_words::progress(
-                &aterm_update::Progress::Downloading {
-                    version: "0.91.0".to_string(),
-                    bytes_done: done,
-                    bytes_total: total,
-                },
-                None,
-                "",
-            )
-        };
-        let now = Instant::now();
-        let base = now - std::time::Duration::from_secs(10);
-        let id = app
-            .messages
-            .post(words(0), crate::messages_host::wall_stamp_now(), base)
-            .id;
-        for k in 1..=20u64 {
-            let t = base + std::time::Duration::from_millis(k * 500);
-            app.messages.restate(
-                id,
-                crate::messages_host::restatement_of(&words(k * 2_500_000)),
-                t,
-            );
-        }
-        app.settle_messages(now);
-        assert_eq!(app.message_band_rows, 1);
-        let first = message(&app, wid, ChromeMessage::BandRow0);
-        app.messages.restate(
-            id,
-            crate::messages_host::restatement_of(&words(60_000_000)),
-            now,
-        );
-        let later = message(&app, wid, ChromeMessage::BandRow0);
-        assert_eq!(later.text, first.text, "the countdown is never announced");
     }
 }

@@ -415,9 +415,15 @@ fn launch_serving(
     use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixStream;
 
-    let (near_verb, far_verb) = UnixStream::pair()?;
-    let (near_push, far_push) = UnixStream::pair()?;
-    let near = [near_verb.try_clone()?, near_push.try_clone()?];
+    // Every end is kept out of children from its creation (`aterm_uds::kept_out`): the near ends
+    // live as long as the bridge, and the far ones reach the bridge's child alone (the spawn
+    // hands a kept-out lane to its own child, `aterm_uds::spawnfd::spawn_with_two_fds`).
+    let (near_verb, far_verb) = aterm_uds::kept_out(UnixStream::pair)?;
+    let (near_push, far_push) = aterm_uds::kept_out(UnixStream::pair)?;
+    let near = [
+        aterm_uds::kept_out(|| near_verb.try_clone())?,
+        aterm_uds::kept_out(|| near_push.try_clone())?,
+    ];
     let mut cmd = LaneCommand::new(&argv[0]);
     cmd.args(&argv[1..])
         .env_exactly(filter_child_env(std::env::vars_os()))

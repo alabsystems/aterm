@@ -108,6 +108,11 @@ fn the_tap_value_is_exact_and_only_it_is_ours() {
     };
     assert!(carried_by(&argv(&["--settings", &value])));
     assert!(carried_by(&argv(&[&format!("--settings={value}")])));
+    assert!(!carried_by(&argv(&[
+        "--append-system-prompt",
+        "--settings",
+        &value
+    ])));
     assert!(!carried_by(&argv(&["--", "--settings", &value])));
     assert!(!carried_by(&argv(&["--settings", r#"{"model":"x"}"#])));
     assert!(!carried_by(&argv(&[])));
@@ -1546,6 +1551,44 @@ fn a_lines_refusal_names_its_argv_or_its_own_settings() {
 /// `rate_limits`), with example names.
 const PAYLOAD_2_1_310: &str = include_str!("testdata/tap/claude-2.1.310-statusline.json");
 
+/// A Claude Code 2.1.316 status-line payload for a login whose replies carry the week and no
+/// five-hour window, with example names: that build puts `rate_limits.five_hour` in only while the
+/// last reply's headers carried both `anthropic-ratelimit-unified-5h-utilization` and `-reset`
+/// (its own statusLine docs: "present only while the API reports it"), and `rate_limits` itself
+/// once any window is there. The week's figures are a real session's of 2026-10-31.
+const PAYLOAD_2_1_316_WEEK_ONLY: &str =
+    include_str!("testdata/tap/claude-2.1.316-statusline-week-only.json");
+
+/// THE TAP READS 2.1.316'S WEEK-ONLY PAYLOAD AS IT IS: the week (1%, its reset) and no five-hour
+/// window, never a guessed one; the row says `5h –`, and the reading has figures, which is what
+/// tells `harness usage` the vendor reports no five-hour window rather than that nothing was read.
+#[test]
+fn a_week_only_payload_reads_the_week_and_no_five_hour_window() {
+    let dir = scratch("week-only");
+    let (code, line) = tap(
+        PAYLOAD_2_1_316_WEEK_ONLY.as_bytes(),
+        &vars(),
+        Some(dir.path()),
+    );
+    assert_eq!(code, std::process::ExitCode::SUCCESS);
+    assert_eq!(line, "5h \u{2013} \u{b7} 7d 1%\n");
+    let (reading, _) = Reading::read(dir.path(), SID, 68537, 0).expect("the reading");
+    assert_eq!(reading.five_hour, None);
+    assert_eq!(
+        reading.seven_day,
+        Some(Window {
+            pct: 1,
+            resets_at: 1_794_078_000,
+            pct_x10: Some(10),
+        })
+    );
+    assert!(reading.has_figures());
+    assert_eq!(reading.version.as_deref(), Some("2.1.316"));
+    assert_eq!(reading.model.as_deref(), Some("claude-opus-5-5"));
+    assert_eq!(reading.api_ms, 219_320_877);
+    assert_eq!(reading.ctx_left, Some(88));
+}
+
 /// THE CARRYING TAP WRITES THE READING AND HANDS ON THE PAYLOAD BYTE FOR BYTE (R-12): on Claude
 /// Code 2.1.310's payload it records the week the footer reads (12.3% used, its reset) as the
 /// plain tap does, prints nothing of its own, and returns exactly what Claude Code wrote for the
@@ -1640,17 +1683,23 @@ fn the_owners_command_reads_the_payload_and_keeps_its_row_and_status() {
             })
             .unwrap_or_default()
     };
-    let echoed = chain_command("cat", PAYLOAD_2_1_310.as_bytes())
+    let echoed = chain_command("\"$ATERM_TEST_CAT\"", PAYLOAD_2_1_310.as_bytes())
         .expect("a command")
+        .env("ATERM_TEST_CAT", crate::test_program::kept("/bin/cat"))
         .output()
         .expect("it ran");
     assert!(echoed.status.success());
     assert_eq!(echoed.stdout, PAYLOAD_2_1_310.as_bytes());
     let big = "x".repeat(200 * 1024);
-    let counted = chain_command("wc -c | tr -d ' '", big.as_bytes())
-        .expect("a command")
-        .output()
-        .expect("it ran");
+    let counted = chain_command(
+        "\"$ATERM_TEST_WC\" -c | \"$ATERM_TEST_TR\" -d ' '",
+        big.as_bytes(),
+    )
+    .expect("a command")
+    .env("ATERM_TEST_WC", crate::test_program::kept("/usr/bin/wc"))
+    .env("ATERM_TEST_TR", crate::test_program::kept("/usr/bin/tr"))
+    .output()
+    .expect("it ran");
     assert_eq!(String::from_utf8_lossy(&counted.stdout).trim(), "204800");
     let own = chain_command("printf 'mine\\n'; exit 3", b"{}")
         .expect("a command")

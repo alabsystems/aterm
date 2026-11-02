@@ -130,7 +130,9 @@ impl Probe {
         loop {
             let now = self.read();
             if delta(before, &now, "realtime") - delta(before, &now, "uptime_raw") > STEP_NS / 2 {
-                return now;
+                // Take one complete reading line now that the offset file is loaded, so a step
+                // picked up partway through `readings()` never leaves earlier clocks unshifted.
+                return self.read();
             }
             assert!(
                 Instant::now() < end,
@@ -183,6 +185,14 @@ fn step(name: &str, continuous: bool) -> (HashMap<&'static str, i128>, i128, Str
         p.record().contains("offset_ns=0 "),
         "the record at load: {:?}",
         p.record()
+    );
+    set_offset(&dir, &format!("86400{}junk", " ".repeat(60)));
+    std::thread::sleep(Duration::from_millis(25));
+    let still_zero = p.read();
+    assert!(
+        (delta(&before, &still_zero, "realtime") - delta(&before, &still_zero, "uptime_raw")).abs()
+            <= SLACK_NS,
+        "an oversize offset file with trailing junk past byte 64 must be refused"
     );
     set_offset(&dir, "86400");
     let after = p.read_stepped(&before);

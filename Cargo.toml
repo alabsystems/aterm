@@ -27,7 +27,7 @@ default-members = [
     "crates/aterm-hash", "crates/aterm-http", "crates/aterm-journal", "crates/aterm-jpeg", "crates/aterm-json",
     "crates/aterm-keeper", "crates/aterm-lexicon", "crates/aterm-libc",
     "crates/aterm-link", "crates/aterm-log", "crates/aterm-machines", "crates/aterm-lz4",
-    "crates/aterm-macro-support", "crates/aterm-messages", "crates/aterm-net", "crates/aterm-objc",
+    "crates/aterm-macro-support", "crates/aterm-mail", "crates/aterm-mail-bigint", "crates/aterm-messages", "crates/aterm-net", "crates/aterm-objc",
     "crates/aterm-models-agh", "crates/aterm-models-aos", "crates/aterm-models-atpkg", "crates/aterm-models-core", "crates/aterm-models-effects",
     "crates/aterm-models-db", "crates/aterm-models-gui", "crates/aterm-models-harness", "crates/aterm-models-misc",
     "crates/aterm-models-native", "crates/aterm-models-release", "crates/aterm-models-render",
@@ -79,7 +79,7 @@ bundle = []
 update_channel = "alabsystems/aterm"
 
 [workspace.package]
-version = "0.147.0"
+version = "0.148.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -87,6 +87,8 @@ authors = ["Andrew Yates"]
 description = "aterm — a fast, hardened terminal engine"
 
 [workspace.dependencies]
+aterm-mail = { path = "crates/aterm-mail" }
+aterm-mail-bigint = { path = "crates/aterm-mail-bigint" }
 # First-party serde (`crates/aterm-serde` + `crates/aterm-serde-derive`) exposed
 # under the `serde` dependency name. Declared as a workspace dependency rather
 # than `[patch.crates-io]`, with `derive` off by default so crates that only
@@ -97,7 +99,7 @@ serde = { package = "aterm-serde", path = "crates/aterm-serde" }
 # Resolves to crates/aterm-libc through [patch.crates-io] below.
 libc = "0.2"
 # TLS for aterm-http and aterm-net (the fleet); `ring` backend, no aws-lc C build.
-rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 # Shared version floor for every direct `ring` edge; default features off so each
 # member enables only what it needs (`alloc` in atpkg for RSA, `default` in
 # signing tools and tests).

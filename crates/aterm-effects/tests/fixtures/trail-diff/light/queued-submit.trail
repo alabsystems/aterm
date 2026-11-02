@@ -5,6 +5,7 @@
 # paper arm: a queued submit (main's melt).
 
 foreach-scheme light {
+  scale 2
   grid 24 100
   style rainbow kitty
   hz 60

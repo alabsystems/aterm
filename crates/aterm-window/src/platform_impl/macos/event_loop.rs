@@ -404,8 +404,7 @@ impl<T> AppKitEventLoop<T> {
                         },
                         Some(duration) => {
                             self.delegate.set_stop_before_wait(false);
-                            let timeout = Instant::now() + duration;
-                            self.delegate.set_wait_timeout(Some(timeout));
+                            self.delegate.set_wait_timeout(Instant::now().checked_add(duration));
                             self.delegate.set_stop_after_wait(true);
                         },
                         None => {

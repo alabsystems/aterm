@@ -22,32 +22,47 @@ pub struct User {
     pub home: String,
 }
 
+fn parse_u32(s: &str) -> Option<u32> {
+    (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| s.parse().ok())
+        .flatten()
+}
+
 /// Every well-formed account in `passwd`'s text (`name:x:uid:gid:gecos:home:shell`).
 fn accounts(passwd: &str) -> impl Iterator<Item = User> + '_ {
     passwd.lines().filter_map(|line| {
         let f: Vec<&str> = line.split(':').collect();
-        if f.len() < 7 || f[0].is_empty() || f[0].starts_with('#') {
+        if f.len() != 7 || f[0].is_empty() || f[0].starts_with('#') {
             return None;
         }
         Some(User {
             name: f[0].to_string(),
-            uid: f[2].parse().ok()?,
-            gid: f[3].parse().ok()?,
+            uid: parse_u32(f[2])?,
+            gid: parse_u32(f[3])?,
             home: f[5].to_string(),
         })
     })
 }
 
-/// The lane user: the one account whose home is `/home/<name>.guest`.
+/// The lane user: the one non-root account whose home is `/home/<name>.guest`.
 ///
 /// # Errors
-/// None is, or more than one is: which.
+/// None is, or more than one is, or its uid is 0: which.
 pub fn lane_user(passwd: &str) -> Result<User, String> {
     let mut found: Vec<User> = accounts(passwd)
-        .filter(|u| u.home == format!("/home/{}.guest", u.name))
+        .filter(|u| !u.name.contains('/') && u.home == format!("/home/{}.guest", u.name))
         .collect();
     match found.len() {
-        1 => Ok(found.remove(0)),
+        1 => {
+            let user = found.remove(0);
+            if user.uid == 0 {
+                return Err(format!(
+                    "lane user '{}' in /etc/passwd has uid 0 (root)",
+                    user.name
+                ));
+            }
+            Ok(user)
+        }
         0 => Err("no lane user: no account in /etc/passwd has home /home/<name>.guest".into()),
         _ => Err(format!(
             "more than one lane user in /etc/passwd: {}",
@@ -67,10 +82,10 @@ pub fn groups(group: &str, user: &User) -> Vec<u32> {
     let mut out = vec![user.gid];
     for line in group.lines() {
         let f: Vec<&str> = line.split(':').collect();
-        if f.len() < 4 || f[0].is_empty() || f[0].starts_with('#') {
+        if f.len() != 4 || f[0].is_empty() || f[0].starts_with('#') {
             continue;
         }
-        let Ok(gid) = f[2].parse::<u32>() else {
+        let Some(gid) = parse_u32(f[2]) else {
             continue;
         };
         if f[3].split(',').any(|m| m.trim() == user.name) && !out.contains(&gid) {
@@ -105,6 +120,9 @@ ubuntu:x:1000:1000:Ubuntu:/home/ubuntu:/bin/bash
 dana:x:501:1001:Dana:/home/dana.guest:/bin/bash
 dana2:x:502:1002::/home/dana.guest:/bin/bash
 broken:x:notanumber:1::/home/broken.guest:/bin/sh
+plus_uid:x:+503:1003::/home/plus_uid.guest:/bin/sh
+plus_gid:x:503:+1003::/home/plus_gid.guest:/bin/sh
+extra:x:504:1004:gecos:/home/extra.guest:/bin/sh:trailing
 short:x:3
 ";
 
@@ -115,6 +133,8 @@ sudo:x:27:ubuntu, dana
 dana:x:1001:
 users:x:100:dana2
 video:x:44:dana,dana
+plus:x:+45:dana
+extra:x:46:dana:trailing
 garbage
 bad:x:nan:dana
 ";
@@ -139,9 +159,12 @@ bad:x:nan:dana
         let commented = format!(
             "#commented:x:700:700::/home/#commented.guest:/bin/sh\n\
              :x:701:701::/home/.guest:/bin/sh\n\
+             a/b:x:702:702::/home/a/b.guest:/bin/sh\n\
              {PASSWD}"
         );
         assert_eq!(lane_user(&commented).unwrap().name, "dana");
+        let root_lane = lane_user("dana:x:0:1001:Dana:/home/dana.guest:/bin/bash\n").unwrap_err();
+        assert!(root_lane.contains("uid 0"), "{root_lane}");
     }
 
     #[test]

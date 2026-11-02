@@ -1422,6 +1422,23 @@ fn no_index_reports_not_measured() {
         ),
         DrivenWindow::NOT_MEASURED
     );
+    let mut extreme_stamps = BTreeMap::new();
+    extreme_stamps.insert("a.png".to_string(), i64::MIN);
+    extreme_stamps.insert("b.png".to_string(), i64::MAX);
+    let extreme_idx = RecordingIndex {
+        stamps: extreme_stamps,
+        covered_from: Some(i64::MIN),
+        ticks: vec![0],
+    };
+    let extreme = driven_window_darkness(
+        Some(&extreme_idx),
+        Some((0, i64::MAX)),
+        &["a.png".into(), "b.png".into()],
+        &[false, false],
+        &[false, false],
+    );
+    assert_eq!(extreme.frames, 2);
+    assert_eq!(extreme.dark_us, i64::MAX);
 }
 
 #[test]
@@ -1548,6 +1565,23 @@ fn a_take_with_mismatched_rows_or_sizes_is_refused() {
     let empty_report = scan_frames(&names, empty_frames.into_iter().map(Ok), &ctx)
         .expect("empty frames scan without panicking");
     assert_eq!((empty_report.frames, empty_report.total_ink), (2, 0));
+    let non_empty_sat: SatMap = [(0_usize, 120.0)].into_iter().collect();
+    let non_empty_pts: BTreeSet<usize> = [0_usize].into_iter().collect();
+    assert!(ink_objects(0, 4, &non_empty_sat).is_empty());
+    assert_eq!(
+        band_ink_partition(0, 4, &non_empty_sat, 14, &[]),
+        (0, HueSet::default(), 0)
+    );
+    assert_eq!(object_row_hue_separation(0, 4, &non_empty_sat), 0.0);
+    assert_eq!(banded_row_span(0, &non_empty_sat), 0.0);
+    assert_eq!(
+        thin_ribbon_component(0, 4, &non_empty_pts, CELL),
+        Shape::NONE
+    );
+    assert_eq!(
+        attached_ribbon_run(0, 4, &non_empty_pts, &non_empty_pts, CELL),
+        RibbonRun::NONE
+    );
     let malformed_ctx = TakeContext {
         statuses: Some(vec![
             StatusRow::new("trail spawns=0 pet_active=false cat_active=false ribbon_hue_bands=0"),

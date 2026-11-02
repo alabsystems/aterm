@@ -73,6 +73,8 @@ pub(crate) enum Driver {
     WorkerOfElsewhere(String),
     /// aterm's harness drives it under this Autopilot wording.
     Aterm(String),
+    /// Codex-alab drives itself inside its own process.
+    CodexAlab(String),
 }
 
 impl Driver {
@@ -83,6 +85,7 @@ impl Driver {
             Self::WorkerOf(manager) => format!("worker of {manager}"),
             Self::WorkerOfElsewhere(sid) => format!("worker of {sid} (not here)"),
             Self::Aterm(autopilot) => format!("driven by aterm ({autopilot})"),
+            Self::CodexAlab(autopilot) => format!("codex-alab autopilot ({autopilot})"),
         }
     }
 
@@ -92,6 +95,7 @@ impl Driver {
             Self::You => "person",
             Self::WorkerOf(_) | Self::WorkerOfElsewhere(_) => "worker",
             Self::Aterm(_) => "aterm",
+            Self::CodexAlab(_) => "codex-alab",
         }
     }
 }
@@ -1021,9 +1025,9 @@ fn overview_row_rect_in(
     let (card_x, card_y, card_w, _) = layout.card;
     Some((
         card_x + g.cw,
-        card_y + (1 + slot) as f32 * g.ch + 1.0,
+        card_y + (1 + slot) as f32 * g.ch + g.px_per_pt,
         (card_w - g.cw * 2.0).max(0.0),
-        (g.ch - 2.0).max(0.0),
+        (g.ch - 2.0 * g.px_per_pt).max(0.0),
     ))
 }
 
@@ -1035,6 +1039,17 @@ pub(crate) fn overview_row_rect(
     slot: usize,
 ) -> Option<(f32, f32, f32, f32)> {
     overview_row_rect_in(&overview_layout(state, g), g, slot)
+}
+
+/// The item a body line selects, if it is one.
+const fn line_item(line: &OverviewLine) -> Option<usize> {
+    match line {
+        OverviewLine::Chip { item, .. }
+        | OverviewLine::Held { item, .. }
+        | OverviewLine::Fabric { item, .. }
+        | OverviewLine::Manages { item, .. } => Some(*item),
+        _ => None,
+    }
 }
 
 /// Item index under a card-local point `(px, py)`.
@@ -1049,18 +1064,25 @@ pub(crate) fn overview_item_hit(
     for slot in 0..layout.body_rows {
         let (rx, ry, rw, rh) = overview_row_rect_in(&layout, g, slot)?;
         if x >= rx && x < rx + rw && y >= ry && y < ry + rh {
-            return match lines.get(state.scroll + slot) {
-                Some(
-                    OverviewLine::Chip { item, .. }
-                    | OverviewLine::Held { item, .. }
-                    | OverviewLine::Fabric { item, .. }
-                    | OverviewLine::Manages { item, .. },
-                ) => Some(*item),
-                _ => None,
-            };
+            return lines.get(state.scroll + slot).and_then(line_item);
         }
     }
     None
+}
+
+/// The card-local centre of item `item`'s painted row while the card shows it, a point
+/// [`overview_item_hit`] reads back as that item.
+pub(crate) fn overview_item_centre(
+    state: &OverviewState,
+    g: &SettingsGeom,
+    item: usize,
+) -> Option<(f32, f32)> {
+    let lines = state.lines();
+    let layout = overview_layout(state, g);
+    (0..layout.body_rows)
+        .find(|slot| lines.get(state.scroll + slot).and_then(line_item) == Some(item))
+        .and_then(|slot| overview_row_rect_in(&layout, g, slot))
+        .map(|(x, y, w, h)| (x + w * 0.5, y + h * 0.5))
 }
 
 fn fit_body(s: &str, room: f32, px: f32) -> String {
@@ -1094,7 +1116,7 @@ pub(crate) fn overview_tray(
     let (cw, ch, px) = (g.cw, g.ch, g.font_px);
     let layout = overview_layout(state, g);
     let (card_x, card_y, _, _) = layout.card;
-    let mut prims = overlay_card_frame(layout.card, ch, &r, false);
+    let mut prims = overlay_card_frame(layout.card, g, &r, false);
     let text_at = row_text_writer(px, ch);
     text_at(
         &mut prims,
@@ -1155,7 +1177,7 @@ pub(crate) fn overview_tray(
                 w,
                 h,
                 radius: ch * 0.3,
-                width: 1.5,
+                width: 1.5 * g.px_per_pt,
                 color: rgba(ring, 0xCC),
             });
         }
@@ -1225,7 +1247,7 @@ pub(crate) fn closing_scene() -> OverviewState {
     let land = OverviewChip {
         typed: Some(("aterm".to_string(), "just now".to_string())),
         held: Some(
-            "not landed yet: needs you; open work in its report: local, unchecked box, a part, \
+            "not landed yet: needs you; open in its report: local, unchecked box, a part, \
              still open"
                 .to_string(),
         ),
@@ -1521,7 +1543,7 @@ mod tests {
     #[test]
     fn a_held_chip_says_why_on_a_line_of_its_own_cut_with_an_ellipsis() {
         let held = "not landed yet: needs you; 3 changed files, 1 untracked file, 1 stash, 4 \
-                    commits not on the remote main; open work in its report: follow-up, not \
+                    commits not on the remote main; open in its report: follow-up, not \
                     pushed, local, a part; no \u{201c}Nothing left:\u{201d} defense yet; a reply \
                     too tall to read whole \u{b7} 3 nudges";
         let mut landing = chip("h", 4);
@@ -1680,6 +1702,34 @@ mod tests {
             cols: 60,
             ..geom_at(k)
         }
+    }
+
+    /// At 2 device pixels per point the Overview is the 1x card at twice the pixels: its corner
+    /// radius cap, shadow offset, border, row insets and hover ring are points. The cell
+    /// (12 x 25) is tall enough that the 14-point radius cap binds (§14.16).
+    #[test]
+    fn the_overview_wears_its_corners_shadow_and_ring_in_points() {
+        let at = |k: f32| SettingsGeom {
+            cw: 12.0 * k,
+            ch: 25.0 * k,
+            font_px: 18.0 * k,
+            cols: 144,
+            panel_rows: 40,
+            px_per_pt: k,
+        };
+        let s = closing_scene();
+        let one = overview_tray(&s, &at(1.0), Theme::default()).prims;
+        let two = overview_tray(&s, &at(2.0), Theme::default()).prims;
+        let DrawPrim::Stroke { radius, .. } = one[2] else {
+            panic!("the card's border: {:?}", one[2]);
+        };
+        assert_eq!(radius, 14.0, "the 1x radius is at its cap");
+        assert!(
+            one.iter()
+                .any(|p| matches!(p, DrawPrim::Stroke { width, .. } if *width == 1.5)),
+            "the scene rings its selected row"
+        );
+        crate::palette::assert_drawn_at_scale(&one, &two, 2.0, &[], "overview");
     }
 
     #[test]

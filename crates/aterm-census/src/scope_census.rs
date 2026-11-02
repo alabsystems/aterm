@@ -414,19 +414,12 @@ fn line_of(source: &str, at: usize) -> usize {
 fn sweep_files(root: &Path) -> Vec<std::path::PathBuf> {
     let mut files = Vec::new();
     let _ = collect_rs_files(&root.join("crates"), &mut files);
-    files.retain(|p| !is_test_file(p) && !p.to_string_lossy().contains(SELF_EXCLUDED_DIR));
+    files.retain(|p| !is_test_file(p) && !crate::slash(p).contains(SELF_EXCLUDED_DIR));
     files.sort();
     files
 }
 
 const UNSHIPPED_GATES: &[&str] = &["#[cfg(test)]"];
-
-fn rel(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
-}
 
 /// The scope-cardinality census over the live registry.
 #[must_use]
@@ -473,7 +466,7 @@ fn run_scope_census_over(root: &Path, claims: &[ScopeClaim]) -> CensusOutcome {
     let _ = writeln!(
         log,
         "    scope: verbatim declaration pinning + a closure sweep over non-test \
-         crates/**/*.rs (precision limits: docs/temporal-safety-gate.md)."
+         crates/**/*.rs; a lexical walk, not a proof."
     );
     let summary = format!(
         "{} scope claim(s) re-derived from the tree ({} pinned chain link(s), {} accounted \
@@ -626,7 +619,7 @@ fn check_closure(root: &Path, claims: &[ScopeClaim], v: &mut Vec<String>) {
         let Ok(raw) = crate::tree::read_to_string(&path) else {
             continue;
         };
-        let file = rel(root, &path);
+        let file = crate::rel_path(root, &path);
         let masked = mask_comments(&mask_gated_items(&raw, UNSHIPPED_GATES));
         let structs = all_struct_bodies(&masked);
         for claim in claims {

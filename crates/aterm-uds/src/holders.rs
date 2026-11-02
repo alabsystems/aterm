@@ -63,6 +63,44 @@ pub fn pty_master_rdev(_slave: u64) -> Option<u64> {
     None
 }
 
+/// Whether a live process of this uid holds the master of the PTY whose terminal is `slave`, a
+/// live process's controlling terminal as it numbers it (macOS's `e_tdev`): by the master's own
+/// number ([`pty_master_rdev`]), read off this uid's descriptor tables ([`master_held_by`]).
+/// `None` when the listing or a descriptor table did not read.
+#[cfg(target_vendor = "apple")]
+#[must_use]
+pub fn pty_master_held(slave: u64) -> Option<bool> {
+    master_held_by(&scan_rdev_holders(pty_master_rdev(slave)?, &[]).ok()?)
+}
+
+/// What a scan for a PTY's master says of it: held once a table holds it, and free only once
+/// every table read and none did.
+#[cfg(any(target_vendor = "apple", test))]
+fn master_held_by(scan: &HolderScan) -> Option<bool> {
+    if scan.holders.is_empty() {
+        (scan.unreadable.is_empty() && scan.sealed.is_empty()).then_some(false)
+    } else {
+        Some(true)
+    }
+}
+
+/// See the macOS twin: `slave` as `/proc/<pid>/stat`'s `tty_nr` numbers it. Every devpts
+/// terminal a live process still has reads held and none reads free, since the kernel takes a
+/// terminal from its session once its master closes (`holders_procfs_pty.rs`); a terminal that
+/// is no PTY's reads `None`.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn pty_master_held(slave: u64) -> Option<bool> {
+    procfs::pty::pty_master_held_of(slave)
+}
+
+/// See the macOS twin: no reader here.
+#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+#[must_use]
+pub fn pty_master_held(_slave: u64) -> Option<bool> {
+    None
+}
+
 /// Scan live same-UID processes except `skip` for each device in `rdevs`.
 /// # Errors
 /// Returns an error if the process listing fails.
@@ -101,7 +139,7 @@ pub fn scan_file_holders(path: &std::path::Path, skip: &[u32]) -> io::Result<Hol
     use std::os::unix::fs::MetadataExt as _;
     let me = std::fs::metadata("/proc/self")?.uid();
     let (path, skip) = (path.to_path_buf(), skip.to_vec());
-    procfs::within(procfs::SCAN_DEADLINE, move || {
+    within(SCAN_DEADLINE, TABLES, HUNG, move || {
         procfs::scan_file_holders_in(std::path::Path::new(procfs::PROC), me, &path, &skip)
     })
 }
@@ -129,16 +167,34 @@ pub fn scan_file_holders(_path: &std::path::Path, _skip: &[u32]) -> io::Result<H
 /// later holder waited on it by `poll` or a `kevent` (a pre-fork server's worker), which is named
 /// instead; one that only blocks in `accept` is not. The record keeps a pid number: once the
 /// process it names has exited while another holds the listener, the scan names nobody, and,
-/// after that number is reused, the unrelated live process of this user that has it. A bound path
-/// names `path` as [`SocketPath::names`] says. Each scan finds a listener of its own in the
-/// same table read, bound for the check, so a table this build misreads is refused, never read as
-/// no holder.
+/// after that number is reused, the unrelated live process of this user that has it. A listener
+/// holds `path` when it was bound there ([`SocketPath::names`]), or at its private sibling
+/// `<path>.<pid>.<n>` ([`SocketPath::is_sibling`]) with its record's pid the one the kernel names
+/// for the listener a connection to `path` reaches (`serving_pid`): an astream broker binds
+/// there, links `path` to its socket and removes the name (`Broker::bind_unix`), and the record
+/// keeps the name it was bound at and no file a path can be matched with. That connection is made
+/// only for a live row of this user's bound at a sibling, and the listener it reaches sees a peer
+/// that closes at once. One that does not answer within [`SCAN_DEADLINE`], is refused
+/// (`ECONNREFUSED`) while a probe finds a socket bound to the file (`refused_by`: a listener
+/// whose accept queue is full is refused as a gone one is, and the probe tells them apart), fails
+/// other than as no listener's, or reaches a listener whose pid no row of the table read binds
+/// at `path` or a sibling (one bound after the read), leaves the answer unknown, the scan's
+/// error, never a scan naming no holder. Each scan finds a listener of its own in the same table
+/// read, bound for the check, so a table this build misreads is refused, never read as no holder.
 ///
 /// # Errors
-/// The process listing or the table read failing, or the check's listener not binding or not
-/// found in the table as this build reads it (`Unsupported`).
+/// The process listing or the table read failing, the check's listener not binding or not found
+/// in the table as this build reads it (`Unsupported`), or the connection to `path` not answering
+/// within 10 s (`TimedOut`), refused while a socket may be bound there (`ConnectionRefused`),
+/// failing other than as no listener's (`serving_pid`), or reaching a listener the table read
+/// does not hold (`listener_holders`); unreadable endpoint metadata or a symlink at its leaf
+/// leaves ownership unknown.
 #[cfg(target_vendor = "apple")]
 pub fn scan_listener_holders(path: &std::path::Path, skip: &[u32]) -> io::Result<HolderScan> {
+    use std::os::unix::fs::MetadataExt as _;
+    listener_target_inode(
+        std::fs::symlink_metadata(path).map(|m| (m.ino(), m.file_type().is_symlink())),
+    )?;
     let check = TableCheck::bind()?;
     let table = unix_stream_table()?;
     // SAFETY: `geteuid` is a side-effect-free getter.
@@ -152,23 +208,247 @@ pub fn scan_listener_holders(path: &std::path::Path, skip: &[u32]) -> io::Result
         aterm_sysprobe::jobs::darwin::unix_listeners(&table).as_deref(),
         own,
         &SocketPath::of(path),
+        || serving_pid(path, SCAN_DEADLINE),
         &uid_pids()?,
         skip,
     )
 }
 
+/// How long a scan waits for an answer before its answer is unknown (`TimedOut`, never a scan
+/// naming no holder): Linux's whole scan, which a hung mount its `/proc` links reach stalls,
+/// macOS's one connection (`serving_pid`) with its probe, and [`bound_at`]'s probe, whose
+/// `socket(2)` a spawn holding the spawn lock delays. Each is waited for on a thread of its own
+/// ([`within`]). A hang detector, never a budget: none takes long unless something is stuck.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+const SCAN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What Linux's scans wait for ([`within`]).
+#[cfg(target_os = "linux")]
+const TABLES: &str = "the descriptor tables";
+
+/// What stalls them.
+#[cfg(target_os = "linux")]
+const HUNG: &str = "a hung mount";
+
+/// `read`'s answer if it gives one within `deadline`, read on a thread of its own; else
+/// `TimedOut`, saying that `what` did not answer and what may stall it (`why`). A read that does
+/// not answer keeps its thread (no read can be cancelled), and its answer is dropped when it comes.
+///
+/// # Errors
+///
+/// `read`'s error, `TimedOut`, or the thread not starting.
+#[cfg(any(target_vendor = "apple", target_os = "linux", all(test, unix)))]
+fn within<T: Send + 'static>(
+    deadline: std::time::Duration,
+    what: &str,
+    why: &str,
+    read: impl FnOnce() -> io::Result<T> + Send + 'static,
+) -> io::Result<T> {
+    let (answer, answered) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("aterm-holder-scan".to_string())
+        .spawn(move || {
+            let _ = answer.send(read());
+        })?;
+    match answered.recv_timeout(deadline) {
+        Ok(read) => read,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "{what} did not answer within {} s ({why})",
+                deadline.as_secs()
+            ),
+        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::other(format!(
+            "{what} gave no answer: its thread ended"
+        ))),
+    }
+}
+
+/// The pid the kernel names for the listener a connection to `path` reaches: the connection's
+/// `LOCAL_PEERPID`, which xnu copies from that listener's `last_pid` as `connect(2)` queues it
+/// (`sonewconn`), the `so_last_pid` a table row names its listener by. `Ok(None)` when the
+/// connect is refused as no listener's ([`no_listener`]), or refused (`ECONNREFUSED`) with
+/// nothing bound to the file at `path` ([`refused_by`]). A macOS `connect(2)` to a path is
+/// queued or refused at once, and so is the probe a refusal is followed by ([`probe_bound`]),
+/// so the one wait is each one's `socket(2)`, which a spawn holding this process's spawn lock
+/// delays ([`crate::kept_out`]): the connection and its probe are made on a thread of their own
+/// ([`within`]) and waited for at most `hang`, the hang detector [`SCAN_DEADLINE`]. One that
+/// answers later keeps its thread until then and is closed unread.
+///
+/// # Errors
+/// `TimedOut` when the connection does not answer within `hang`; `ConnectionRefused` when the
+/// connect is refused (`ECONNREFUSED`) while a socket may be bound to the file ([`refused_by`]):
+/// a live listener whose accept queue is full (a wedged broker), say; and any other failure to
+/// connect or to read the pid but [`no_listener`]'s: whether a listener serves `path` is then
+/// unknown.
+#[cfg(target_vendor = "apple")]
+fn serving_pid(path: &std::path::Path, hang: std::time::Duration) -> io::Result<Option<u32>> {
+    let deadline = std::time::Instant::now() + hang;
+    let path = path.to_path_buf();
+    let why = "a spawn holding the spawn lock";
+    within(
+        hang,
+        "the connection to the listener",
+        why,
+        move || match crate::connect::until(&path, deadline) {
+            Ok(stream) => crate::fdpass::peer_pid(&stream).map(Some),
+            Err(e) if no_listener(&e) => Ok(None),
+            Err(e) if e.raw_os_error() == Some(libc::ECONNREFUSED) => {
+                refused_by(&path, &e, probe_bound(&path))
+            }
+            Err(e) => Err(e),
+        },
+    )
+}
+
+/// Whether `connect(2)` refused a path with `e` as one no stream listener takes: nothing there
+/// (`ENOENT`, `ENOTDIR`), no socket (`ENOTSOCK`), a datagram socket (`EPROTOTYPE`). Not
+/// `ECONNREFUSED`, which xnu answers for a live listener whose accept queue is full as for a
+/// socket file whose listener is gone ([`refused_by`] tells them apart).
+#[cfg(target_vendor = "apple")]
+fn no_listener(e: &io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::ENOENT | libc::ENOTDIR | libc::ENOTSOCK | libc::EPROTOTYPE)
+    )
+}
+
+/// What a stream connection to `path` that was refused (`refused`, `ECONNREFUSED`) says of the
+/// listener there, by what a probe found bound to its file (`bound`, [`probe_bound`]): none when
+/// nothing is, as a socket file whose listener is gone has nothing bound to it. Else which
+/// listener serves `path` is unknown: a stream socket is bound there (a listener whose accept
+/// queue is full, or one not listening yet), a datagram socket took the probe (the file changed
+/// between the two connects), or the probe failed.
+///
+/// # Errors
+/// `ConnectionRefused`, saying which, unless nothing is bound to the file.
+#[cfg(target_vendor = "apple")]
+fn refused_by(
+    path: &std::path::Path,
+    refused: &io::Error,
+    bound: io::Result<Bound>,
+) -> io::Result<Option<u32>> {
+    let why = match bound {
+        Ok(Bound::Nothing) => return Ok(None),
+        Ok(Bound::Stream) => {
+            "a stream socket is bound to it: its accept queue is full, or it is not listening yet"
+                .to_string()
+        }
+        Ok(Bound::Datagram) => {
+            "a datagram socket took a probe of it: the file changed since".to_string()
+        }
+        Err(e) => format!("a probe of what is bound to it failed ({e})"),
+    };
+    Err(io::Error::new(
+        io::ErrorKind::ConnectionRefused,
+        format!("{} refused a connection ({refused}): {why}", path.display()),
+    ))
+}
+
+/// What is bound to the file at a path, as a datagram connect to that path finds it
+/// ([`bound_at`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Bound {
+    /// No socket: nothing is at the path (`ENOENT`, `ENOTDIR`), or the file there is one no
+    /// socket is bound to (`ECONNREFUSED`: a socket file whose socket closed, or on Linux a file
+    /// that is no socket; `ENOTSOCK` on macOS for one).
+    Nothing,
+    /// A stream socket, which refuses a datagram connect by its type (`EPROTOTYPE`): a
+    /// listener, whatever its accept queue holds, or a socket bound and not listening yet.
+    Stream,
+    /// A datagram socket, which took the connect.
+    Datagram,
+}
+
+/// What is bound to the file at `path` ([`Bound`]), by a datagram connect that no stream socket
+/// queues or wakes for: a stream socket refuses it by its type before any connection is made,
+/// so a listener whose accept queue is full, which refuses a stream connection as a socket file
+/// whose listener is gone does, is told from that file. A link at `path` is followed, as a
+/// connection's would be. astream's broker tells a stale socket file from a live one by the
+/// same probe before it replaces one (`claim_socket_path`). The probe waits on a spawn holding
+/// the spawn lock ([`probe_bound`]), so it is made on a thread of its own ([`within`]) and
+/// waited for at most [`SCAN_DEADLINE`], a hang detector.
+///
+/// # Errors
+/// The probe not answering within 10 s (`TimedOut`), its socket not made, or its connect
+/// failing other than by an answer [`Bound`] names (a folder on the path refusing it, a path
+/// too long for `sun_path`): what is bound there is then unknown. `Unsupported` off macOS and
+/// Linux.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+pub fn bound_at(path: &std::path::Path) -> io::Result<Bound> {
+    let path = path.to_path_buf();
+    within(
+        SCAN_DEADLINE,
+        "the probe of the socket file",
+        "a spawn holding the spawn lock",
+        move || probe_bound(&path),
+    )
+}
+
+/// See the macOS and Linux twin.
+///
+/// # Errors
+/// Always `Unsupported`.
+#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+pub fn bound_at(_path: &std::path::Path) -> io::Result<Bound> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "the socket file probe is made on macOS and Linux",
+    ))
+}
+
+/// [`bound_at`]'s probe, unbounded: a nonblocking datagram socket, kept out of children from its
+/// creation ([`crate::kept_out`], whose `socket(2)` waits on a spawn holding the spawn lock),
+/// connected to `path` and closed.
+///
+/// # Errors
+/// As [`bound_at`]'s, but for the hang detector.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+fn probe_bound(path: &std::path::Path) -> io::Result<Bound> {
+    let probe = crate::kept_out(std::os::unix::net::UnixDatagram::unbound)?;
+    probe.set_nonblocking(true)?;
+    bound_by(probe.connect(path))
+}
+
+/// What a datagram connect's answer (`connected`) says is bound to the file it named
+/// ([`Bound`]).
+///
+/// # Errors
+/// `connected`'s error when it is none of the answers [`Bound`] names.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+fn bound_by(connected: io::Result<()>) -> io::Result<Bound> {
+    match connected {
+        Ok(()) => Ok(Bound::Datagram),
+        Err(e) => match e.raw_os_error() {
+            Some(libc::ENOENT | libc::ENOTDIR | libc::ENOTSOCK | libc::ECONNREFUSED) => {
+                Ok(Bound::Nothing)
+            }
+            Some(libc::EPROTOTYPE) => Ok(Bound::Stream),
+            _ => Err(e),
+        },
+    }
+}
+
 /// The holders one table read's listeners `rows` name ([`scan_listener_holders`]): the pid of
-/// each listener `own`'s user made, bound at a path `target` names, once, when it is `live` and
-/// not in `skip`. `scanned` counts `live` but `skip`.
+/// each listener `own`'s user made, once, when it is `live` and not in `skip`, bound at `target`,
+/// or at its private sibling with that pid the one `serving` names for the listener a connection
+/// to `target` reaches. The pid a sibling's name holds is its binder's own words and is not
+/// compared. `serving` is asked at most once, and only for such a row bound at a sibling.
+/// `scanned` counts `live` but `skip`.
 ///
 /// # Errors
 /// `Unsupported` when `rows` is no table read (`None`), or a read without `own`, the check's
-/// listener: a table this build misreads.
+/// listener: a table this build misreads. `serving`'s error, when it is asked: whether that
+/// sibling holds `target` is unknown. An error too when `serving` names a pid not in `skip` that
+/// no row binds at `target` or a sibling: the listener the connection reached is not in the
+/// table read (one bound after it, by a broker started in its predecessor's place, say).
 #[cfg(target_vendor = "apple")]
 fn listener_holders(
     rows: Option<&[aterm_sysprobe::jobs::darwin::UnixListenerRow<'_>]>,
     own: aterm_sysprobe::jobs::darwin::UnixListenerRow<'_>,
     target: &SocketPath,
+    mut serving: impl FnMut() -> io::Result<Option<u32>>,
     live: &[u32],
     skip: &[u32],
 ) -> io::Result<HolderScan> {
@@ -182,38 +462,225 @@ fn listener_holders(
         scanned: live.iter().filter(|pid| !skip.contains(pid)).count(),
         ..HolderScan::default()
     };
+    let mut served = None;
     for row in rows {
-        let holds = row.uid == own.uid && target.names(row.path);
-        if holds && live.contains(&row.pid) && !skip.contains(&row.pid) && !scan.holds(row.pid) {
-            scan.holders.push(row.pid);
+        if row.uid != own.uid
+            || !live.contains(&row.pid)
+            || skip.contains(&row.pid)
+            || scan.holds(row.pid)
+        {
+            continue;
         }
+        if target.names(row.path) {
+            scan.holders.push(row.pid);
+        } else if target.is_sibling(row.path) {
+            let serving = match served {
+                Some(pid) => pid,
+                None => *served.insert(serving()?),
+            };
+            if serving == Some(row.pid) {
+                scan.holders.push(row.pid);
+            }
+        }
+    }
+    if let Some(Some(pid)) = served
+        && !skip.contains(&pid)
+        && !rows
+            .iter()
+            .any(|row| row.pid == pid && (target.names(row.path) || target.is_sibling(row.path)))
+    {
+        return Err(io::Error::other(format!(
+            "the listener a connection to the path reaches is pid {pid}'s, which no row of the \
+             table read binds there (one bound after the read, say)"
+        )));
     }
     Ok(scan)
 }
 
 /// Scan live same-UID processes except `skip` for a listening `AF_UNIX` socket bound at `path`,
-/// by each socket's own kernel record, never by a process's arguments: `/proc/net/unix`'s
-/// listening rows ([`aterm_sysprobe::jobs::linux::listening_unix`]) matched with each
-/// process's `/proc/<pid>/fd` links (`holders_procfs.rs`). A bound path names `path` as
-/// [`SocketPath::names`] says. A table only root reads is in [`HolderScan::sealed`].
+/// by each socket's own kernel record, never by a process's arguments: the listening sockets the
+/// kernel's socket dump names ([`aterm_sysprobe::linux::unix_diag_listeners`], each record
+/// and name length-delimited) matched with each process's `/proc/<pid>/fd` links
+/// (`holders_procfs.rs`). A listener holds `path` as `diag_listener_holds` says: bound there,
+/// or bound at its private sibling and linked to `path` (an astream broker's,
+/// `Broker::bind_unix`), by the inode its record names. A table only root reads is in
+/// [`HolderScan::sealed`].
 ///
 /// # Errors
-/// `/proc/net/unix` or the process listing cannot be read, or the reads take longer than 10 s
-/// (`TimedOut`).
+/// The dump or the process listing cannot be read: the kernel has no unix socket dump
+/// (`CONFIG_UNIX_DIAG`), a sandbox refuses a netlink socket, or the reads take longer than 10 s
+/// (`TimedOut`). No holder is then named: `/proc/net/unix`, whose rows a socket name holding a
+/// newline forges, is never read instead. Unreadable endpoint metadata or a symlink at its leaf
+/// also leaves ownership unknown.
 #[cfg(target_os = "linux")]
 pub fn scan_listener_holders(path: &std::path::Path, skip: &[u32]) -> io::Result<HolderScan> {
+    use std::os::unix::fs::MetadataExt as _;
     // SAFETY: `geteuid` is a side-effect-free getter.
     let me = unsafe { libc::geteuid() };
     let (path, skip) = (path.to_path_buf(), skip.to_vec());
-    procfs::within(procfs::SCAN_DEADLINE, move || {
+    within(SCAN_DEADLINE, TABLES, HUNG, move || {
+        let listeners = diag::unix_listeners(SCAN_DEADLINE)?;
         let target = SocketPath::of(&path);
+        let placed = listener_target_inode(
+            std::fs::symlink_metadata(&path).map(|m| (m.ino(), m.file_type().is_symlink())),
+        )?;
         procfs::scan_listener_holders_in(
             std::path::Path::new(procfs::PROC),
             me,
-            |bound| target.names(bound),
+            &listeners,
+            |listener| diag_listener_holds(&target, placed, listener),
             &skip,
         )
     })
+}
+
+/// A missing target has no bound inode. Any other failed metadata read leaves its
+/// listener unknown, so callers cannot treat an unreadable private sibling as absent.
+/// A leaf symlink is unknown too: SocketPath resolves folders, not the endpoint itself.
+#[cfg(any(target_vendor = "apple", target_os = "linux", all(test, unix)))]
+fn listener_target_inode(read: io::Result<(u64, bool)>) -> io::Result<Option<u64>> {
+    match read {
+        Ok((_, true)) => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "listener ownership through a socket-leaf symlink is unknown",
+        )),
+        Ok((inode, false)) => Ok(Some(inode)),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether a listener the socket dump names holds `target` (Linux's [`scan_listener_holders`]):
+/// it was bound there ([`SocketPath::names`]), or at its private sibling with the file its bind
+/// made the one at `target`, whose inode number `lstat(2)` read as `placed`. A sibling is bound in
+/// `target`'s folder and `link(2)` never crosses a filesystem or a btrfs subvolume, so a socket
+/// linked into place keeps its inode number, compared by the low 32 bits the record keeps. No
+/// device is compared: btrfs gives `lstat(2)` each subvolume's own device and the dump its
+/// superblock's. Nor is the pid in the sibling's name: a binder in another pid namespace writes
+/// its own.
+#[cfg(any(target_os = "linux", test))]
+fn diag_listener_holds(
+    target: &SocketPath,
+    placed: Option<u64>,
+    listener: &aterm_sysprobe::linux::UnixDiagListener,
+) -> bool {
+    target.names(&listener.path)
+        || target.is_sibling(&listener.path)
+            && listener
+                .file
+                .zip(placed)
+                .is_some_and(|(bound, ino)| bound.is_inode(ino))
+}
+
+/// This uid's processes that hold a listening `AF_UNIX` socket at any path, this one aside, read
+/// as [`scan_listener_holders`] reads one path: by each socket's own kernel record, never by a
+/// process's arguments, with the check's own listener found in the same table read, so a table
+/// this build misreads is refused, never read as no listener. On Apple the kernel's table names
+/// each holder, so [`HolderScan::holders`] alone is filled; a process whose descriptors could not
+/// be matched (Linux) is in [`HolderScan::unreadable`] or [`HolderScan::sealed`], neither a holder
+/// nor clear.
+///
+/// # Errors
+/// As [`scan_listener_holders`]'s.
+#[cfg(target_vendor = "apple")]
+pub fn scan_unix_listeners() -> io::Result<HolderScan> {
+    let check = TableCheck::bind()?;
+    let table = unix_stream_table()?;
+    // SAFETY: `geteuid` is a side-effect-free getter.
+    let me = unsafe { ffi::geteuid() };
+    let own = aterm_sysprobe::jobs::darwin::UnixListenerRow {
+        pid: std::process::id(),
+        uid: me,
+        path: check.path.as_os_str().as_encoded_bytes(),
+    };
+    let rows = aterm_sysprobe::jobs::darwin::unix_listeners(&table)
+        .filter(|rows| rows.contains(&own))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the unix-domain stream table is not laid out as this build reads it",
+            )
+        })?;
+    let live = uid_pids()?;
+    let mut holders: Vec<u32> = rows
+        .iter()
+        .filter(|row| row.uid == me && row.pid != own.pid && live.contains(&row.pid))
+        .map(|row| row.pid)
+        .collect();
+    holders.sort_unstable();
+    holders.dedup();
+    Ok(HolderScan {
+        holders,
+        scanned: live.len(),
+        ..HolderScan::default()
+    })
+}
+
+/// See the Apple twin: the listening sockets the kernel's socket dump names, at any bound path,
+/// matched with each process's `/proc/<pid>/fd` links.
+///
+/// # Errors
+/// As [`scan_listener_holders`]'s.
+#[cfg(target_os = "linux")]
+pub fn scan_unix_listeners() -> io::Result<HolderScan> {
+    // SAFETY: `geteuid` is a side-effect-free getter.
+    let me = unsafe { libc::geteuid() };
+    let mine = std::process::id();
+    within(SCAN_DEADLINE, TABLES, HUNG, move || {
+        let listeners = diag::unix_listeners(SCAN_DEADLINE)?;
+        procfs::scan_listener_holders_in(
+            std::path::Path::new(procfs::PROC),
+            me,
+            &listeners,
+            |_| true,
+            &[mine],
+        )
+    })
+}
+
+/// See the Apple twin.
+///
+/// # Errors
+/// Always `Unsupported`.
+#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+pub fn scan_unix_listeners() -> io::Result<HolderScan> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "the listener scan reads libproc (macOS) or /proc (Linux)",
+    ))
+}
+
+/// Whether a sandbox profile holds `pid` (macOS's `sandbox_check` with no filter: a lab jail's
+/// processes are); `None` when the check fails. Off macOS nothing is held, and `Some(false)`.
+#[cfg(target_vendor = "apple")]
+#[cfg_attr(trust_verify, trust::skip)]
+#[must_use]
+pub fn sandboxed(pid: u32) -> Option<bool> {
+    unsafe extern "C" {
+        fn sandbox_check(pid: i32, operation: *const std::ffi::c_char, kind: i32, ...) -> i32;
+    }
+    let pid = i32::try_from(pid).ok().filter(|p| *p > 0)?;
+    // SAFETY: `sandbox_check` reads only its arguments; the operation is a null pointer under
+    // `SANDBOX_FILTER_NONE` (0), which takes no further argument.
+    match unsafe { sandbox_check(pid, std::ptr::null(), 0) } {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    }
+}
+
+/// See the Apple twin.
+#[cfg(not(target_vendor = "apple"))]
+#[must_use]
+pub fn sandboxed(_pid: u32) -> Option<bool> {
+    Some(false)
 }
 
 /// Scan live same-UID processes except `skip` for a listening `AF_UNIX` socket bound at `path`.
@@ -261,6 +728,23 @@ impl SocketPath {
     #[must_use]
     pub fn names(&self, bound: &[u8]) -> bool {
         bound == self.bytes || self.canonical.as_deref() == Some(bound)
+    }
+
+    /// Whether `bound` is this path's private sibling `<path>.<pid>.<n>`, `path` as
+    /// [`Self::names`] takes it and each number one or more decimal digits: the name an astream
+    /// broker binds its listener at before it links this path to that socket and removes the name
+    /// (`Broker::bind_unix`). Only the shape is read: the pid is its binder's own words, which no
+    /// rule compares.
+    #[must_use]
+    pub fn is_sibling(&self, bound: &[u8]) -> bool {
+        fn before_number(name: &[u8]) -> Option<&[u8]> {
+            let dot = name.iter().rposition(|byte| *byte == b'.')?;
+            let digits = &name[dot + 1..];
+            (!digits.is_empty() && digits.iter().all(u8::is_ascii_digit)).then_some(&name[..dot])
+        }
+        before_number(bound)
+            .and_then(before_number)
+            .is_some_and(|path| self.names(path))
     }
 }
 
@@ -501,7 +985,7 @@ pub fn fd_is_terminal(pid: u32, fd: i32) -> Option<bool> {
     match std::fs::read_link(format!("/proc/{pid}/fd/{fd}")) {
         Ok(link) => link_terminal(link.to_str()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => closed_answer(
-            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            crate::process::read_proc_text(std::path::Path::new(&format!("/proc/{pid}/stat")))
                 .ok()
                 .as_deref(),
         ),
@@ -1094,16 +1578,35 @@ pub fn uid_pids() -> io::Result<Vec<u32>> {
     pids_of_uid(unsafe { libc::geteuid() })
 }
 
-/// List every live process PID whose effective uid is `uid`: the pids whose `/proc/<pid>`
-/// directory `uid` owns. The kernel keeps that directory the effective uid's, dumpable or not,
-/// and gives root only a non-dumpable process's files inside it, so root's listing holds no
-/// other uid's non-dumpable process.
+/// List every live process PID whose effective uid is `uid`: the pids [`listed_pids`] lists
+/// whose [`euid_of`] is `uid`. The kernel gives root only a non-dumpable process's files inside
+/// its directory, so root's listing holds no other uid's non-dumpable process.
 ///
 /// # Errors
-/// Returns an error if `/proc` cannot be read.
+/// Returns an error if `/proc` cannot be read whole.
 #[cfg(target_os = "linux")]
 pub fn pids_of_uid(uid: u32) -> io::Result<Vec<u32>> {
     procfs::uid_pids_in(std::path::Path::new(procfs::PROC), uid)
+}
+
+/// Every pid `/proc` lists, of every user `/proc` shows: a listing with an entry that does not
+/// read is refused, never cut.
+///
+/// # Errors
+/// `/proc` cannot be listed, or one of its entries does not read.
+#[cfg(target_os = "linux")]
+pub fn listed_pids() -> io::Result<Vec<u32>> {
+    procfs::listed_pids_in(std::path::Path::new(procfs::PROC))
+}
+
+/// The effective uid `pid` runs as: the owner of its `/proc/<pid>`, which the kernel keeps the
+/// effective uid's, dumpable or not.
+///
+/// # Errors
+/// `NotFound` once `pid` is gone; the `stat`'s error otherwise.
+#[cfg(target_os = "linux")]
+pub fn euid_of(pid: u32) -> io::Result<u32> {
+    procfs::euid_in(std::path::Path::new(procfs::PROC), pid)
 }
 
 /// List every live process PID owned by this user SID.
@@ -1357,6 +1860,9 @@ pub fn pshm_sizes_of(_pid: u32) -> io::Result<Vec<u64>> {
     ))
 }
 
+#[cfg(target_os = "linux")]
+#[path = "holders_diag.rs"]
+mod diag;
 #[cfg(all(any(test, debug_assertions), target_vendor = "apple"))]
 #[path = "holders_jail.rs"]
 mod jail;
@@ -1619,13 +2125,237 @@ mod listing_tests {
         (master, terminal)
     }
 
+    /// Set in the copy of this test binary that runs one test alone (`runs_alone`).
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    const ALONE_ENV: &str = "ATERM_UDS_TEST_PTY_ALONE";
+
+    /// How long the copy that runs one test alone may run: a hang detector past the copy's own,
+    /// never a budget. A test that runs alone waits in turn on at most three things that must
+    /// happen, each under its one-minute hang detector (Linux's terminal test: its pty, its
+    /// session leader's line, the leader's loss of the terminal), and a fourth minute covers the
+    /// copy's start and its end, so a copy whose own wait hangs fails by its own message.
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    const ALONE_HANG: std::time::Duration =
+        std::time::Duration::from_secs(4 * crate::deadline::ECHO_HANG.as_secs());
+
+    /// Whether this is the copy of this test binary that runs the test `name` names alone; when
+    /// it is not, that copy is run (`--exact`, one thread) and must say it passed. A pty test
+    /// runs there: a fork another test takes while a master is open holds a copy of it until
+    /// that child execs or exits (one that never execs, or one held in `execve` while macOS
+    /// checks a fresh binary), so a master the test closed would stay open. The wait on the
+    /// copy is its hang detector (`ALONE_HANG`, `alone_within`).
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    fn runs_alone(name: &str) -> bool {
+        alone_within(name, ALONE_HANG)
+    }
+
+    /// `runs_alone`, its wait on the copy ended at `hang` ([`crate::deadline::ends_within`]): a
+    /// copy macOS's program check still holds then ends the test COULD NOT RUN, and any other
+    /// fails it.
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    #[track_caller]
+    fn alone_within(name: &str, hang: std::time::Duration) -> bool {
+        if std::env::var_os(ALONE_ENV).is_some() {
+            return true;
+        }
+        let out = crate::deadline::ends_within(
+            crate::spawnfd::command(std::env::current_exe().expect("this test binary"))
+                .args(["--exact", name, "--test-threads=1"])
+                .env(ALONE_ENV, "1"),
+            hang,
+        );
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && said.contains("test result: ok. 1 passed"),
+            "the copy: {said}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        false
+    }
+
+    /// A copy run alone that never ends fails its test at the wait's hang detector, killed and
+    /// reaped by then, and never hangs it. The copy parks until the binary that waits on it is
+    /// gone, or past the outer wait's own detector, so the 1 s detector runs out by
+    /// construction; the outer wait is the one-minute hang detector. NEGATIVE CONTROL: a copy
+    /// that ends and passes is `a_ptys_master_is_held_while_it_is_open`'s (macOS) and
+    /// `a_terminal_leaves_its_session_once_its_master_closes`'s (Linux).
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    #[test]
+    fn a_copy_run_alone_that_never_ends_fails_at_the_hang_detector() {
+        const NAME: &str =
+            "holders::listing_tests::a_copy_run_alone_that_never_ends_fails_at_the_hang_detector";
+        if std::env::var_os(ALONE_ENV).is_some() {
+            let waiter = std::os::unix::process::parent_id();
+            let parked = std::time::Instant::now();
+            while std::os::unix::process::parent_id() == waiter
+                && parked.elapsed() < 2 * crate::deadline::ECHO_HANG
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            return;
+        }
+        let (tx, ended) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let waited =
+                std::panic::catch_unwind(|| alone_within(NAME, std::time::Duration::from_secs(1)));
+            let _ = tx.send(waited.map_err(|why| why.downcast_ref::<String>().cloned()));
+        });
+        let waited = ended
+            .recv_timeout(crate::deadline::ECHO_HANG)
+            .expect("the wait on a copy that never ends ended within the one-minute hang detector");
+        let why = waited
+            .expect_err("a copy that never ends fails its test")
+            .expect("the wait fails with its words");
+        assert!(
+            why.contains("did not finish in time: not within its 1s hang detector"),
+            "{why}"
+        );
+        let copy = why
+            .split_once("(pid ")
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .and_then(|(pid, _)| pid.parse().ok())
+            .unwrap_or_else(|| panic!("the words name the copy: {why}"));
+        assert!(
+            !crate::process::pid_alive(copy),
+            "the copy (pid {copy}) was killed and reaped by the time its test failed"
+        );
+    }
+
+    /// A pty's master is held while it is open and not once it closes, read from its
+    /// terminal's number, which is what a controlling terminal is numbered by (`e_tdev`, the
+    /// terminal's `st_rdev`). It runs alone (`runs_alone`). After the close it reads free, or
+    /// unknown while any table of this uid does not read, so there it is held only to not
+    /// reading held; which scan reads free is `master_held_by_reads_free_only_once_every_table_read`'s
+    /// to say. NEGATIVE CONTROL: another pty's master stays open throughout, so a reader that
+    /// took any master for this one's still reads it held.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn a_ptys_master_is_held_while_it_is_open() {
+        use std::os::unix::fs::MetadataExt as _;
+        if !runs_alone("holders::listing_tests::a_ptys_master_is_held_while_it_is_open") {
+            return;
+        }
+        let (_other_master, _other) = a_terminal();
+        let (master, terminal) = a_terminal();
+        let number = terminal.metadata().expect("fstat the terminal").rdev() & 0xffff_ffff;
+        assert_eq!(
+            super::pty_master_held(number),
+            Some(true),
+            "its master is open"
+        );
+        drop(master);
+        assert_ne!(
+            super::pty_master_held(number),
+            Some(true),
+            "its master closed"
+        );
+    }
+
+    /// A scan for a master reads it held once a table holds it, free only once every table read
+    /// and none did, and unknown while a table did not read or only root reads one. NEGATIVE
+    /// CONTROL: a fold that read no holder as unknown passes the live test above, and fails here.
+    #[test]
+    fn master_held_by_reads_free_only_once_every_table_read() {
+        let scan = |holders: &[u32], unreadable: &[u32], sealed: &[u32]| super::HolderScan {
+            holders: holders.to_vec(),
+            unreadable: unreadable.to_vec(),
+            sealed: sealed.to_vec(),
+            scanned: 4,
+        };
+        assert_eq!(super::master_held_by(&scan(&[], &[], &[])), Some(false));
+        assert_eq!(super::master_held_by(&scan(&[7], &[8], &[9])), Some(true));
+        assert_eq!(super::master_held_by(&scan(&[], &[8], &[])), None);
+        assert_eq!(super::master_held_by(&scan(&[], &[], &[9])), None);
+    }
+
+    /// A terminal leaves its session once its master closes, so Linux reads every devpts
+    /// terminal a live process still has held (`pty_master_held`): a session leader that ignores
+    /// `SIGHUP` takes the pty's terminal end as its controlling terminal by opening it, its
+    /// `tty_nr` names that terminal, and once the master closes the leader still runs with
+    /// none. It runs alone (`runs_alone`). NEGATIVE CONTROL: while the master is open the
+    /// leader's terminal reads as its own, so a lineage that never read a terminal fails it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_terminal_leaves_its_session_once_its_master_closes() {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::MetadataExt as _;
+        /// The leader, ended and reaped however the test ends.
+        struct Ended(crate::spawnfd::Child);
+        impl Drop for Ended {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        if !runs_alone(
+            "holders::listing_tests::a_terminal_leaves_its_session_once_its_master_closes",
+        ) {
+            return;
+        }
+        let (master, terminal) = a_terminal();
+        let number = terminal.metadata().expect("fstat the terminal").rdev() & 0xffff_ffff;
+        let name = std::fs::read_link(format!("/proc/self/fd/{}", terminal.as_raw_fd()))
+            .expect("the terminal end's name");
+        let mut leader = crate::spawnfd::command("/bin/sh");
+        leader
+            .args([
+                "-c",
+                "trap '' HUP; exec 3<>\"$0\"; echo ran; exec /bin/sleep 60",
+            ])
+            .arg(&name)
+            .setsid(true)
+            .stdin(crate::spawnfd::Stdio::null())
+            .stdout(crate::spawnfd::Stdio::piped());
+        let mut leader = Ended(leader.spawn().expect("spawn the session leader"));
+        crate::deadline::prints(&mut leader.0, "ran", crate::deadline::ECHO_HANG);
+        let pid = i32::try_from(leader.0.id()).expect("a pid");
+        let tty = crate::process::read_lineage(pid)
+            .expect("the leader's lineage")
+            .tty;
+        assert_eq!(tty.map(u64::from), Some(number), "{name:?} is its terminal");
+        assert_eq!(
+            super::pty_master_held(number),
+            Some(true),
+            "its master is open"
+        );
+        drop(master);
+        let deadline = std::time::Instant::now() + crate::deadline::ECHO_HANG;
+        loop {
+            let lineage = crate::process::read_lineage(pid).expect("the leader still runs");
+            if lineage.tty.is_none() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the leader kept {name:?} a minute after its master closed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Set in the children [`a_child_s_standard_input_is_a_terminal_only_on_a_pty`] spawns
+    /// of this test binary.
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    const STDIN_CHILD_ENV: &str = "ATERM_UDS_TEST_STDIN_CHILD";
+
     /// A child's standard input is a terminal when it is a pty's terminal end, and none when it
     /// is `/dev/null` or a pipe; a descriptor the child does not hold is none. Each child shows
-    /// it runs by a line before it is read.
+    /// it runs by a line before it is read. The children are this test binary staged by
+    /// [`STDIN_CHILD_ENV`], never a shell: a shell started with a terminal for its input names
+    /// that terminal (`ttyname`) while it starts, which scans `/dev` and hangs on one wedged
+    /// node — the read under test is the parent's, and no child behavior past holding its
+    /// descriptors is.
     #[cfg(any(target_vendor = "apple", target_os = "linux"))]
     #[test]
     fn a_child_s_standard_input_is_a_terminal_only_on_a_pty() {
         use crate::spawnfd::{Child, Stdio, command};
+        const NAME: &str =
+            "holders::listing_tests::a_child_s_standard_input_is_a_terminal_only_on_a_pty";
+        if std::env::var_os(STDIN_CHILD_ENV).is_some() {
+            println!("ran");
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            return;
+        }
         /// The children, each ended and reaped however the test ends.
         struct Ended(Vec<Child>);
         impl Drop for Ended {
@@ -1636,15 +2366,26 @@ mod listing_tests {
                 }
             }
         }
+        let exe = std::env::current_exe().expect("the test binary");
         let (_master, terminal) = a_terminal();
         let mut children = Ended(Vec::new());
         for stdin in [Stdio::from(terminal), Stdio::null(), Stdio::piped()] {
-            let child = command("/bin/sh")
-                .args(["-c", "echo ran; exec /bin/sleep 60"])
+            // `--quiet` keeps the child's `ran` on its own line for [`crate::deadline::prints`]:
+            // the harness's progress fragment has no newline for it to land on otherwise.
+            let child = command(&exe)
+                .args([
+                    "--exact",
+                    NAME,
+                    "--nocapture",
+                    "--quiet",
+                    "--test-threads=1",
+                ])
+                .env(STDIN_CHILD_ENV, "1")
                 .stdin(stdin)
                 .stdout(Stdio::piped())
+                .stderr(Stdio::null())
                 .spawn()
-                .expect("spawn the shell");
+                .expect("spawn the child");
             children.0.push(child);
             let child = children.0.last_mut().expect("the child just kept");
             crate::deadline::prints(child, "ran", crate::deadline::ECHO_HANG);
@@ -1825,6 +2566,328 @@ mod listing_tests {
         );
         assert!(scan(&b).holds(me), "the other listener still");
         drop((l2, l3));
+    }
+
+    /// A private sibling is `<path>.<pid>.<n>` exactly, `path` as `names` takes it and each
+    /// number one or more digits. The pid is not read, so a leading zero or a number past `u32`
+    /// still has the shape; a path's own words take no sibling.
+    #[test]
+    fn a_private_sibling_is_its_paths_name_and_two_numbers() {
+        let target = super::SocketPath::of(std::path::Path::new("/nowhere-folder/bus.sock"));
+        let shown = |name: &[u8]| String::from_utf8_lossy(name).into_owned();
+        for sibling in [
+            &b"/nowhere-folder/bus.sock.812.0"[..],
+            b"/nowhere-folder/bus.sock.812.37",
+            b"/nowhere-folder/bus.sock.0812.0",
+            b"/nowhere-folder/bus.sock.0.0",
+            b"/nowhere-folder/bus.sock.99999999999.0",
+        ] {
+            assert!(target.is_sibling(sibling), "{}", shown(sibling));
+        }
+        for other in [
+            &b"/nowhere-folder/bus.sock"[..],
+            b"/nowhere-folder/bus.sock.812",
+            b"/nowhere-folder/bus.sock.812.",
+            b"/nowhere-folder/bus.sock..0",
+            b"/nowhere-folder/bus.sock.x.0",
+            b"/nowhere-folder/bus.sock.812.0.1",
+            b"/nowhere-folder/bus.sockx.812.0",
+            b"/nowhere-folder/bus.sock.wake",
+            b"/elsewhere/bus.sock.812.0",
+        ] {
+            assert!(!target.is_sibling(other), "{}", shown(other));
+        }
+        assert!(!target.names(b"/nowhere-folder/bus.sock.812.0"));
+    }
+
+    /// A listener this process binds at `<path>.<pid>.<n>`, links to `path` and whose private name
+    /// it removes, as an astream broker binds (`Broker::bind_unix`), holds `path`, whatever pid
+    /// the name holds. A sibling never linked into place holds no path, left at its name or that
+    /// name removed: with nothing at the path, beside a datagram socket there, or beside a socket
+    /// file whose listener is gone, which macOS's connection is refused at as a full accept
+    /// queue's would be and its probe finds nothing bound to. NEGATIVE CONTROLS, on macOS's rule:
+    /// match by `names` alone, and the broker's path has no holder; take any sibling whose name
+    /// is gone, and one with nothing at its path holds it; take one whose name is gone with a
+    /// socket at the path, and one beside a datagram socket holds it; read every refusal as
+    /// unknown whatever the probe finds, and the scan beside the stale file fails.
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    #[test]
+    fn a_listener_linked_into_place_from_its_private_name_holds_its_path() {
+        use std::os::unix::net::{UnixDatagram, UnixListener};
+        let me = std::process::id();
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("held-")
+            .tempdir_in("/tmp")
+            .expect("a scratch folder short enough for sun_path");
+        let at = |name: &str| dir.path().join(name);
+        let scan =
+            |name: &str| super::scan_listener_holders(&at(name), &[]).expect("the listener scan");
+        let private = |path: &str| at(&format!("{path}.{me}.0"));
+        let sibling =
+            |path: &str| UnixListener::bind(private(path)).expect("bind the private name");
+        let unnamed =
+            |path: &str| std::fs::remove_file(private(path)).expect("remove the private name");
+        let linked = |path: &str, name: &str| {
+            let listener = UnixListener::bind(at(name)).expect("bind the private name");
+            std::fs::hard_link(at(name), at(path)).expect("link into place");
+            std::fs::remove_file(at(name)).expect("remove the private name");
+            listener
+        };
+        let held = |path: &str, what: &str| {
+            let found = scan(path);
+            assert!(found.holds(me), "{what}: {found:?}");
+        };
+        let free = |path: &str, what: &str| {
+            let found = scan(path);
+            assert!(!found.holds(me), "{what}: {found:?}");
+        };
+
+        let broker = linked("b.sock", &format!("b.sock.{me}.0"));
+        held("b.sock", "a broker's listener holds its path");
+        let foreign = linked("e.sock", "e.sock.1.0");
+        held(
+            "e.sock",
+            "a sibling that names another pid, linked into place",
+        );
+
+        let left = sibling("c.sock");
+        free("c.sock", "a sibling left at its name, nothing at the path");
+        let gone = sibling("x.sock");
+        unnamed("x.sock");
+        free("x.sock", "a sibling's name removed, nothing at the path");
+        let datagram = UnixDatagram::bind(at("d.sock")).expect("a datagram socket at d");
+        let beside = sibling("d.sock");
+        free("d.sock", "a sibling left beside a datagram socket");
+        unnamed("d.sock");
+        free(
+            "d.sock",
+            "a sibling's name removed beside a datagram socket",
+        );
+        drop(UnixListener::bind(at("f.sock")).expect("a listener closed, its file left"));
+        let stale = sibling("f.sock");
+        unnamed("f.sock");
+        free(
+            "f.sock",
+            "a sibling's name removed beside a socket file whose listener is gone",
+        );
+        drop((broker, foreign, left, gone, datagram, beside, stale));
+    }
+
+    /// A listener the socket dump names holds a path when bound there, or bound at its private
+    /// sibling, whatever pid that names, with its file's inode the one at the path by the low 32
+    /// bits the record keeps. A sibling whose file is not the one at the path, with nothing
+    /// there, or with no file in its record holds nothing, nor does another name of that file.
+    /// NEGATIVE CONTROL: match by `names` alone, and the sibling linked into place holds nothing.
+    #[test]
+    fn a_dump_record_holds_its_path_by_its_name_or_its_siblings_inode() {
+        use aterm_sysprobe::linux::{BoundFile, UnixDiagListener};
+        let target = super::SocketPath::of(std::path::Path::new("/nowhere-folder/bus.sock"));
+        let record = |path: &[u8], file| UnixDiagListener {
+            inode: 41001,
+            path: path.to_vec(),
+            file,
+        };
+        let file = Some(BoundFile { ino: 0x1234 });
+        let sibling = record(b"/nowhere-folder/bus.sock.812.0", file);
+        let holds = |listener: &UnixDiagListener, placed| {
+            super::diag_listener_holds(&target, placed, listener)
+        };
+        assert!(
+            holds(&record(b"/nowhere-folder/bus.sock", None), None),
+            "bound at the path"
+        );
+        assert!(holds(&sibling, Some(0x1234)), "a sibling linked into place");
+        assert!(
+            holds(
+                &record(b"/nowhere-folder/bus.sock.1.0", file),
+                Some(0x7_0000_1234)
+            ),
+            "by the inode's low 32 bits, whatever pid the name holds"
+        );
+        for (listener, placed, what) in [
+            (&sibling, Some(0x1235), "another file at the path"),
+            (&sibling, None, "nothing at the path"),
+            (
+                &record(b"/nowhere-folder/bus.sock.812.0", None),
+                Some(0x1234),
+                "a record with no file",
+            ),
+            (
+                &record(b"/nowhere-folder/other.sock", file),
+                Some(0x1234),
+                "another name of that file",
+            ),
+        ] {
+            assert!(!holds(listener, placed), "{what}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_target_metadata_keeps_a_private_listener_unknown() {
+        use aterm_sysprobe::linux::{BoundFile, UnixDiagListener};
+        let target = super::SocketPath::of(std::path::Path::new("/nowhere-folder/bus.sock"));
+        let listener = UnixDiagListener {
+            inode: 41001,
+            path: b"/nowhere-folder/bus.sock.812.0".to_vec(),
+            file: Some(BoundFile { ino: 0x1234 }),
+        };
+        let holds = |metadata| -> std::io::Result<bool> {
+            let placed = super::listener_target_inode(metadata)?;
+            Ok(super::diag_listener_holds(&target, placed, &listener))
+        };
+        assert!(
+            holds(Ok((0x1234, false))).unwrap(),
+            "the linked listener is held"
+        );
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::NotADirectory,
+        ] {
+            assert!(!holds(Err(std::io::Error::from(kind))).unwrap());
+        }
+        for errno in [libc::EIO, libc::EACCES, libc::ELOOP] {
+            let error = holds(Err(std::io::Error::from_raw_os_error(errno)))
+                .expect_err("unreadable does not establish that no listener holds the target");
+            assert_eq!(error.raw_os_error(), Some(errno));
+        }
+        // The former `.ok().map(...)` loses EIO and incorrectly reports a known absence.
+        let erased = Err::<u64, _>(std::io::Error::from_raw_os_error(libc::EIO)).ok();
+        assert!(!super::diag_listener_holds(&target, erased, &listener));
+    }
+
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    #[test]
+    fn a_socket_leaf_alias_is_unknown_and_cannot_report_an_absent_private_listener() {
+        use std::os::unix::net::UnixListener;
+        let dir = aterm_tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+        let real = dir.path().join("b.sock");
+        let private = dir.path().join(format!("b.sock.{}.0", std::process::id()));
+        let listener = UnixListener::bind(&private).unwrap();
+        std::fs::hard_link(&private, &real).unwrap();
+        std::fs::remove_file(&private).unwrap();
+        assert!(
+            super::scan_listener_holders(&real, &[])
+                .unwrap()
+                .holds(std::process::id())
+        );
+        let alias = dir.path().join("alias.sock");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let target = super::SocketPath::of(&alias);
+        assert!(
+            !target.is_sibling(private.as_os_str().as_encoded_bytes()),
+            "the folder-only matcher cannot prove this differently named leaf alias"
+        );
+        let error = super::scan_listener_holders(&alias, &[])
+            .expect_err("an aliased live listener is unknown, never a successful empty scan");
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        drop(listener);
+    }
+
+    /// A datagram probe finds nothing bound where there is no file, a folder on the path is
+    /// missing or no folder, the file is no socket, or the socket file's listener closed; a
+    /// stream socket where a listener is, its accept queue full or not, and through a link to
+    /// it; a datagram socket where one is. The probe queues nothing at the listener it finds,
+    /// and a path too long for `sun_path` is no answer. NEGATIVE CONTROL: read `EPROTOTYPE` as
+    /// nothing bound, as `ECONNREFUSED` is, and the live listener reads as nothing bound.
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    #[test]
+    fn a_probe_tells_a_live_listener_from_a_stale_socket_file() {
+        use super::Bound;
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::net::{UnixDatagram, UnixListener};
+        let dir = aterm_tempfile::Builder::new()
+            .tempdir_in("/tmp")
+            .expect("a scratch folder short enough for sun_path");
+        let at = |name: &str| dir.path().join(name);
+        let bound = |name: &str| super::bound_at(&at(name)).expect("the probe answers");
+        std::fs::write(at("plain"), b"").expect("a plain file");
+        drop(UnixListener::bind(at("stale.sock")).expect("a listener closed, its file left"));
+        for (name, what) in [
+            ("none.sock", "no file"),
+            ("missing/x.sock", "a missing folder"),
+            ("plain/x.sock", "a file where a folder is"),
+            ("plain", "a file that is no socket"),
+            ("stale.sock", "a socket file whose listener closed"),
+        ] {
+            assert_eq!(bound(name), Bound::Nothing, "{what}");
+        }
+        let live = UnixListener::bind(at("live.sock")).expect("a listener");
+        assert_eq!(bound("live.sock"), Bound::Stream, "a live listener");
+        live.set_nonblocking(true).expect("a nonblocking listener");
+        let queued = live.accept().map(drop).map_err(|e| e.kind());
+        assert_eq!(
+            queued,
+            Err(std::io::ErrorKind::WouldBlock),
+            "the probe queued nothing"
+        );
+        std::os::unix::fs::symlink(at("live.sock"), at("alias.sock")).expect("a link to it");
+        assert_eq!(bound("alias.sock"), Bound::Stream, "through a link");
+        let full = UnixListener::bind(at("full.sock")).expect("a listener");
+        // SAFETY: the descriptor is `full`'s listening socket, open while `full` lives.
+        let listened = unsafe { libc::listen(full.as_raw_fd(), 1) };
+        assert_eq!(listened, 0, "{}", std::io::Error::last_os_error());
+        let hang = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut held = Vec::new();
+        while let Ok(stream) = crate::connect::until(&at("full.sock"), hang) {
+            held.push(stream);
+            assert!(held.len() < 64, "the accept queue never filled");
+        }
+        assert_eq!(bound("full.sock"), Bound::Stream, "a full accept queue");
+        let datagram = UnixDatagram::bind(at("d.sock")).expect("a datagram socket");
+        assert_eq!(bound("d.sock"), Bound::Datagram, "a datagram socket");
+        let long = at(&"l".repeat(120));
+        assert!(super::bound_at(&long).is_err(), "a path past sun_path");
+        drop((live, full, held, datagram));
+    }
+
+    /// A socket bound at a name holding a newline and a whole `/proc/net/unix` row, which names
+    /// another path and this process's own listener's inode, names no listener at that other
+    /// path: the kernel's socket dump carries each name by its length. The row's path holds `/`s,
+    /// so the name runs through folders, which are made before the bind. NEGATIVE CONTROL: read the
+    /// listeners off `/proc/net/unix`'s text instead, and the forged row makes this process the
+    /// holder of a path nothing is bound at.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_socket_name_holding_a_forged_row_names_no_other_listener() {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::net::UnixListener;
+        let me = std::process::id();
+        let dir = aterm_tempfile::Builder::new()
+            .tempdir_in("/tmp")
+            .expect("a scratch folder short enough for sun_path");
+        let base = dir
+            .path()
+            .canonicalize()
+            .expect("the scratch folder's own spelling");
+        let (a, v) = (base.join("a.sock"), base.join("v.sock"));
+        let real = UnixListener::bind(&a).expect("bind a");
+        let link = std::fs::read_link(format!("/proc/self/fd/{}", real.as_raw_fd()))
+            .expect("the listener's descriptor link");
+        let aterm_sysprobe::jobs::linux::FdLink::Socket(inode) =
+            aterm_sysprobe::jobs::linux::parse_fd_link(&link.to_string_lossy())
+        else {
+            panic!("the listener's link names no socket: {link:?}");
+        };
+        let forged = base.join(format!(
+            "x\n0: 0 0 10000 1 1 {inode} {}",
+            v.to_str().expect("a UTF-8 scratch path")
+        ));
+        assert!(
+            forged.as_os_str().len() < 108,
+            "the forged name fits sun_path: {forged:?}"
+        );
+        std::fs::create_dir_all(forged.parent().expect("the forged name's folder"))
+            .expect("the folders the forged row's path runs through");
+        let decoy = UnixListener::bind(&forged).expect("bind the forged name");
+        let scan = |path: &std::path::Path| {
+            super::scan_listener_holders(path, &[]).expect("the listener scan")
+        };
+        let at_v = scan(&v);
+        assert!(!at_v.holds(me), "nothing is bound at {v:?}: {at_v:?}");
+        assert!(scan(&a).holds(me), "the real listener");
+        assert!(scan(&forged).holds(me), "the forged name is one name");
+        drop((real, decoy));
     }
 }
 
@@ -2522,9 +3585,19 @@ mod tests {
         assert_eq!(mine(), 0, "closed");
     }
 
-    /// One table read's rows name the holders: a live listener of this user's at the target,
-    /// once; not another user's, a dead binder's, a skipped one's or one bound elsewhere. A read
-    /// that is no table, or one without the check's own listener, is refused.
+    /// One table read's rows name the holders: a live listener of this user's at the target, once,
+    /// or at its private sibling with its pid the one the kernel names for the listener the path
+    /// reaches, whatever pid the sibling's name holds; not another user's, a dead binder's, a
+    /// skipped one's, one bound elsewhere, or another pid's sibling (one whose name was removed
+    /// beside the broker's, or any when nothing listening is reached). The kernel is asked once,
+    /// and not at all with no such sibling row. A read that is no table, or one without the
+    /// check's own listener, is refused, and so is one whose connection did not answer, or
+    /// reached a listener whose pid no row binds at the path or a sibling, live or not (a broker
+    /// started after the read): whether a sibling holds the path is then unknown. A reached pid
+    /// that such a row names, or that is skipped, leaves the rules above to answer. NEGATIVE
+    /// CONTROLS: take any sibling, and 47 and 48 join; read a connection that did not answer as
+    /// nothing listening, and the scan names 41; drop the check of the reached pid, and a broker
+    /// the read does not hold leaves a scan naming 41 and 44 alone.
     #[test]
     fn a_table_read_names_its_live_binders_once_it_holds_its_own_listener() {
         use aterm_sysprobe::jobs::darwin::UnixListenerRow as Row;
@@ -2540,20 +3613,159 @@ mod tests {
             row(43, 501, bus),
             row(44, 501, bus),
             row(45, 501, b"/nowhere-folder/other.sock"),
+            row(46, 501, b"/nowhere-folder/bus.sock.46.0"),
+            row(47, 501, b"/nowhere-folder/bus.sock.47.0"),
+            row(48, 501, b"/nowhere-folder/bus.sock.46.1"),
+            row(49, 501, b"/nowhere-folder/other.sock.49.0"),
+            row(50, 0, b"/nowhere-folder/bus.sock.50.0"),
         ];
-        let live = [7, 41, 42, 44, 45, 46];
-        let scan = super::listener_holders(Some(&rows), own, &target, &live, &[44])
-            .expect("a read holding its own listener");
-        assert_eq!(scan.holders, [41], "{scan:?}");
-        assert_eq!(scan.scanned, 5, "the live processes but the skipped one");
+        let live = [7, 41, 42, 44, 45, 46, 47, 48, 49, 50];
+        let asked = std::cell::Cell::new(0);
+        let read = |rows: &[Row<'_>], served: Option<u32>| {
+            let serving = || {
+                asked.set(asked.get() + 1);
+                Ok(served)
+            };
+            super::listener_holders(Some(rows), own, &target, serving, &live, &[44])
+                .expect("a read holding its own listener")
+        };
+        let scan = read(&rows, Some(46));
+        assert_eq!(scan.holders, [41, 46], "the broker's sibling: {scan:?}");
+        assert_eq!(asked.get(), 1, "the kernel is asked once");
+        assert_eq!(scan.scanned, 9, "the live processes but the skipped one");
         assert!(
             scan.unreadable.is_empty() && scan.sealed.is_empty(),
             "{scan:?}"
         );
+        assert_eq!(
+            read(&rows, None).holders,
+            [41],
+            "no sibling when nothing listening is reached"
+        );
+        assert_eq!(
+            read(&rows, Some(48)).holders,
+            [41, 48],
+            "the pid in a sibling's name is not compared"
+        );
+        asked.set(0);
+        assert_eq!(read(&rows[..7], Some(46)).holders, [41]);
+        assert_eq!(asked.get(), 0, "no sibling row, no question");
         for refused in [None, Some(&rows[1..])] {
-            let e = super::listener_holders(refused, own, &target, &live, &[])
+            let e = super::listener_holders(refused, own, &target, || Ok(None), &live, &[])
                 .expect_err("a misread table");
             assert_eq!(e.kind(), std::io::ErrorKind::Unsupported, "{e}");
+        }
+        let unanswered = || Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        let e = super::listener_holders(Some(&rows), own, &target, unanswered, &live, &[44])
+            .expect_err("a connection that did not answer");
+        assert_eq!(e.kind(), std::io::ErrorKind::TimedOut, "{e}");
+        let no_sibling =
+            super::listener_holders(Some(&rows[..7]), own, &target, unanswered, &live, &[44])
+                .expect("no sibling row, no question");
+        assert_eq!(no_sibling.holders, [41], "{no_sibling:?}");
+        for (served, why) in [
+            (99, "a pid with no row, live since the listing or not"),
+            (45, "a pid whose one row binds elsewhere"),
+            (49, "a pid whose one row binds another path's sibling"),
+        ] {
+            for live in [&live[..], &[7, 41, 45, 46, 99]] {
+                let e = super::listener_holders(
+                    Some(&rows),
+                    own,
+                    &target,
+                    || Ok(Some(served)),
+                    live,
+                    &[],
+                )
+                .expect_err(why);
+                assert_eq!(e.kind(), std::io::ErrorKind::Other, "{why}: {e}");
+            }
+        }
+        for served in [42, 43, 50] {
+            let scan =
+                super::listener_holders(Some(&rows), own, &target, || Ok(Some(served)), &live, &[])
+                    .expect("a pid a row binds at the path or a sibling");
+            assert_eq!(scan.holders, [41, 44], "{served}: {scan:?}");
+        }
+        let skipped =
+            super::listener_holders(Some(&rows), own, &target, || Ok(Some(99)), &live, &[99])
+                .expect("a skipped pid");
+        assert_eq!(skipped.holders, [41, 44], "{skipped:?}");
+    }
+
+    /// A connection whose `socket(2)` waits on the spawn lock past its hang detector answers
+    /// `TimedOut`, unknown, though a listener is there to take it; with the lock free the same
+    /// connection names that listener's binder. The lock is held until the first answer comes, so
+    /// only the detector can end its wait. NEGATIVE CONTROL: read the detector's expiry as no
+    /// listener (`Ok(None)`), and the held connection answers that nobody listens.
+    #[test]
+    fn a_connection_past_its_hang_detector_is_unknown() {
+        use std::os::unix::net::{UnixListener, UnixStream};
+        let dir = aterm_tempfile::Builder::new()
+            .tempdir_in("/tmp")
+            .expect("a scratch folder short enough for sun_path");
+        let path = dir.path().join("l.sock");
+        let listener = UnixListener::bind(&path).expect("bind");
+        let (held_tx, held) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let creation = std::thread::spawn(move || {
+            crate::kept_out(|| {
+                held_tx.send(()).expect("the test waits for the hold");
+                let _ = released.recv_timeout(HANG);
+                UnixStream::pair()
+            })
+        });
+        held.recv_timeout(HANG)
+            .expect("the creation holds the spawn lock");
+        let late = super::serving_pid(&path, Duration::from_millis(50));
+        release
+            .send(())
+            .expect("the creation waits for its release");
+        drop(
+            creation
+                .join()
+                .expect("the creation")
+                .expect("a kept-out pair"),
+        );
+        assert_eq!(
+            late.map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::TimedOut),
+            "a connection held past its hang detector"
+        );
+        assert_eq!(
+            super::serving_pid(&path, HANG).expect("a connection with the lock free"),
+            Some(std::process::id())
+        );
+        drop(listener);
+    }
+
+    /// A refused connection is no listener's only where the probe finds nothing bound to the
+    /// file; a stream socket there, a datagram socket that took the probe, or a probe that failed
+    /// leave it unknown (`ConnectionRefused`). NEGATIVE CONTROL: read every refusal as unknown
+    /// whatever the probe found, and the stale file's refusal is unknown.
+    #[test]
+    fn a_refusal_is_no_listeners_only_where_nothing_is_bound() {
+        use super::Bound;
+        let path = std::path::Path::new("/nowhere-folder/bus.sock");
+        let refused = std::io::Error::from_raw_os_error(libc::ECONNREFUSED);
+        assert_eq!(
+            super::refused_by(path, &refused, Ok(Bound::Nothing)).map_err(|e| e.to_string()),
+            Ok(None)
+        );
+        for (bound, what) in [
+            (Ok(Bound::Stream), "a stream socket bound there"),
+            (Ok(Bound::Datagram), "a datagram socket that took the probe"),
+            (
+                Err(std::io::Error::from_raw_os_error(libc::EACCES)),
+                "a probe that failed",
+            ),
+        ] {
+            let e = super::refused_by(path, &refused, bound).expect_err(what);
+            assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionRefused,
+                "{what}: {e}"
+            );
         }
     }
 

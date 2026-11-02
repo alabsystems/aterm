@@ -117,7 +117,9 @@ fn conn_real_main(argv: Vec<std::ffi::OsString>) -> io::Result<ExitCode> {
     if rest.first().map(String::as_str) == Some("help") {
         return print_usage();
     }
-    let self_sid = env::var(super::SELF_SID_ENV).ok().filter(|s| !s.is_empty());
+    let self_sid = env::var(super::SELF_SID_ENV)
+        .ok()
+        .filter(|s| aterm_types::control_verbs::selector_body_names_something(s));
     let (path, origin) = super::resolve_target(sock, pid, self_sid.clone())?;
     let wire = ConnWire { path, origin };
     match rest.first().map(String::as_str) {
@@ -257,10 +259,18 @@ fn classify_selector(tok: &str) -> io::Result<SelTok<'_>> {
         "." => Err(usage(
             "@. (the active tab) retargets on every tab switch — name the session: @self, @<sid>, or @<local-id>",
         )),
-        b if b.starts_with("s-") && b.len() > 2 => Ok(SelTok::Sid(b)),
-        b => match b.parse::<u64>() {
-            Ok(n) => Ok(SelTok::Local(n)),
-            Err(_) => Err(usage(&format!(
+        b if b.starts_with("s-")
+            && b.len() > 2
+            && aterm_types::control_verbs::selector_body_names_something(b) =>
+        {
+            Ok(SelTok::Sid(b))
+        }
+        b => match (!b.is_empty() && b.bytes().all(|c| c.is_ascii_digit()))
+            .then(|| b.parse::<u64>().ok())
+            .flatten()
+        {
+            Some(n) => Ok(SelTok::Local(n)),
+            None => Err(usage(&format!(
                 "'{tok}' is not a selector; use @self, @<sid>, or @<local-id>"
             ))),
         },
@@ -274,6 +284,7 @@ fn resolve_selector_with(
 ) -> io::Result<String> {
     match classify_selector(tok)? {
         SelTok::SelfSid => self_sid
+            .filter(|s| aterm_types::control_verbs::selector_body_names_something(s))
             .map(str::to_string)
             .ok_or_else(super::self_selector_error),
         SelTok::Sid(sid) => Ok(sid.to_string()),
@@ -433,7 +444,7 @@ fn parse_sessions_lines(lines: &[String]) -> Vec<SessionRow> {
         else {
             continue;
         };
-        let Ok(local) = local.parse::<u64>() else {
+        let Some(local) = super::parse_uint::<u64>(local) else {
             continue;
         };
         let title = match toks.next() {
@@ -766,7 +777,7 @@ fn cmd_rm(wire: &ConnWire, self_sid: Option<&str>, args: &[String]) -> io::Resul
         .tail()
         .split_whitespace()
         .next()
-        .and_then(|n| n.parse::<usize>().ok())
+        .and_then(super::parse_uint::<usize>)
         .unwrap_or(0);
     super::print_stdout_line(&rm_outcome(&src, &dst, spec.kind.as_deref(), revoked))?;
     Ok(ExitCode::SUCCESS)
@@ -878,7 +889,10 @@ mod tests {
         assert_eq!(classify_selector("@env").unwrap(), SelTok::SelfSid);
         assert_eq!(classify_selector("@s-ab12").unwrap(), SelTok::Sid("s-ab12"));
         assert_eq!(classify_selector("@7").unwrap(), SelTok::Local(7));
+        assert!(classify_selector("@+7").is_err());
         assert!(classify_selector("@sideways").is_err());
+        assert!(classify_selector("@s-ab 12").is_err());
+        assert!(classify_selector("@s-ab\n12").is_err());
     }
 
     #[test]
@@ -891,6 +905,12 @@ mod tests {
             e.to_string().contains("ATERM_PARENT_SESSION_ID"),
             "must name the env var: {e}"
         );
+        for bad_env in ["", " ", "s-me extra", "s-me\n"] {
+            assert!(
+                resolve_selector_with("@self", Some(bad_env), &mut no_lookup).is_err(),
+                "{bad_env:?} must be refused"
+            );
+        }
         let ok = resolve_selector_with("@self", Some("s-me"), &mut no_lookup).unwrap();
         assert_eq!(ok, "s-me");
         let ok = resolve_selector_with("@s-peer", None, &mut no_lookup).unwrap();
@@ -971,6 +991,7 @@ mod tests {
             "0 s-aa11 - running cargo%20build meta=0",
             "1 s-bb22 s-aa11 exited operator meta=1",
             "2 s-cc33 - running meta=0",
+            "+3 s-dd44 - running plus meta=0",
             "garbage line",
         ]));
         assert_eq!(

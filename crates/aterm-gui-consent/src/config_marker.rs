@@ -65,12 +65,17 @@ pub fn write_marker(
     if flush == Flush::Durable
         && let Some(dir) = path.parent()
     {
+        use std::os::unix::fs::OpenOptionsExt as _;
         let dir = if dir.as_os_str().is_empty() {
             Path::new(".")
         } else {
             dir
         };
-        if let Ok(dir) = std::fs::File::open(dir) {
+        if let Ok(dir) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY)
+            .open(dir)
+        {
             let _ = crate::durable::sync_all(&dir);
         }
     }

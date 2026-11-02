@@ -18,6 +18,24 @@ pub fn to_vec<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Encode one quoted JSON string, reserving its worst-case size before copying
+/// any text. The buffer never grows while it holds text; callers handling
+/// private data can scrub the returned allocation without abandoned growth
+/// buffers. This does not scrub the caller's input.
+/// # Errors
+/// The string's worst-case escaped length exceeds the addressable capacity.
+pub fn quoted_string(text: &str) -> Result<Vec<u8>> {
+    let capacity = text
+        .len()
+        .checked_mul(6)
+        .and_then(|n| n.checked_add(2))
+        .filter(|n| *n <= isize::MAX as usize)
+        .ok_or_else(|| Error::message("quoted string exceeds capacity"))?;
+    let mut out = Vec::with_capacity(capacity);
+    write_json_string(&mut out, text);
+    Ok(out)
+}
+
 /// Serializes `value` as a compact JSON string.
 ///
 /// # Errors
@@ -727,5 +745,24 @@ impl ser::Serializer for KeySerializer<'_> {
         _len: usize,
     ) -> Result<Self::SerializeStructVariant> {
         Err(key_type_error())
+    }
+}
+
+#[cfg(test)]
+mod quoted_tests {
+    #[test]
+    fn preallocated_quoting_matches_general_serialization_at_escape_bounds() {
+        let controls: String = (0..32).map(char::from).collect();
+        for text in [
+            String::new(),
+            controls,
+            "\"\\\nλ🔒".repeat(400),
+            "x".repeat(65536),
+        ] {
+            let quoted = super::quoted_string(&text).unwrap();
+            assert_eq!(quoted, super::to_vec(&text).unwrap());
+            assert!(quoted.capacity() >= text.len() * 6 + 2);
+            assert_eq!(crate::from_slice::<String>(&quoted).unwrap(), text);
+        }
     }
 }

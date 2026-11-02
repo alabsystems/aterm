@@ -393,12 +393,13 @@ pub fn named_by_status_alone(text: &str) -> bool {
 /// dropped`, the reason Claude Code 2.1.310 gives a transient error, an overload or a server
 /// error. Read alone, with no error row above it to read it through to, that echo is a generic
 /// API error ([`ApiCause::Server`]), never an unreachable route: its reason covers an overload
-/// and a server error too, so it is waited out blind and no measured Up of the route clears it;
-/// only the error row it reads through to (`Can't reach the API server … (ENOTFOUND)`, the
-/// owner's outage) names an unreachable route. The guard is on the opening, never a bare
-/// `contains`: a message read through to its error row (`API Error: 529 Overloaded … — Goal
-/// still active · the API was unavailable …`, as aterm-agent keeps and re-reads it) opens with
-/// that row and is read by it.
+/// and a server error too, so it is waited out blind and a measured Up of the route alone never
+/// clears it (aterm-agent holds a code-less server error as the connection's outage only where it
+/// measured the route down at the wall); only the error row it reads through to (`Can't reach
+/// the API server … (ENOTFOUND)`, the owner's outage) names an unreachable route. The guard is on
+/// the opening, never a bare `contains`: a message read through to its error row (`API Error: 529
+/// Overloaded … — Goal still active · the API was unavailable …`, as aterm-agent keeps and
+/// re-reads it) opens with that row and is read by it.
 fn goal_echo_of_an_unavailable_api(lower: &str) -> bool {
     let opens = [
         crate::anchor!("wall.goal_still"),
@@ -538,7 +539,11 @@ fn refused_status(code: u16) -> bool {
 fn status_in_parens(rest: &str) -> Option<u16> {
     rest.match_indices('(').find_map(|(at, _)| {
         let inner = rest.get(at + 1..at + 5)?;
-        let code = inner.strip_suffix(')')?.parse::<u16>().ok()?;
+        let digits = inner.strip_suffix(')')?;
+        if !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let code = digits.parse::<u16>().ok()?;
         (400..600).contains(&code).then_some(code)
     })
 }

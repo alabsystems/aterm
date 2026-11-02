@@ -128,7 +128,7 @@ pub fn system_awake_since() -> u64 {
             .and_then(|stat| {
                 stat.lines()
                     .find_map(|l| l.strip_prefix("btime "))
-                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .and_then(|s| crate::parse_uint::<u64>(s.trim()))
             })
             .unwrap_or(0)
     }
@@ -2050,7 +2050,7 @@ fn home_exports(line: &str) -> Vec<(&'static str, String)> {
     .filter_map(|name| {
         exports
             .iter()
-            .find(|(n, _)| *n == name)
+            .rfind(|(n, _)| *n == name)
             .map(|(_, value)| (name, (*value).to_string()))
     })
     .collect()
@@ -2062,22 +2062,23 @@ fn launch_of(line: &str) -> Option<Vec<String>> {
     if exe.rsplit('/').next() != Some("claude") {
         return None;
     }
+    let at = rest
+        .iter()
+        .rposition(|word| matches!(word.as_str(), "--resume" | "-r"))?;
     let mut launch = vec![exe.clone()];
-    for word in rest {
-        if matches!(word.as_str(), "--resume" | "-r") {
-            return Some(launch);
-        }
+    for word in &rest[..at] {
         if word.contains('\\') {
             return None;
         }
         launch.push(word.clone());
     }
-    None
+    Some(launch)
 }
 
 fn export_of(word: &str) -> Option<(&str, &str)> {
     word.split_once('=').filter(|(name, _)| {
         !name.is_empty()
+            && !name.as_bytes()[0].is_ascii_digit()
             && name
                 .bytes()
                 .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
@@ -2102,7 +2103,7 @@ fn resume_login(line: &str) -> Option<String> {
     last[..program_at(&last)]
         .iter()
         .filter_map(|word| export_of(word))
-        .find(|(name, _)| *name == crate::harness::accounts::LOGIN_ENV)
+        .rfind(|(name, _)| *name == crate::harness::accounts::LOGIN_ENV)
         .map(|(_, value)| value.to_string())
 }
 
@@ -2408,6 +2409,7 @@ impl Row {
         let bases = [
             self.behind_since,
             self.minted_at,
+            self.progress_at,
             self.noticed_at,
             self.wait_since,
             self.own_work_at,
@@ -2425,16 +2427,28 @@ impl Row {
             QUEUED_MAX_S,
             LIMIT_MAX_S,
             LIMIT_GRACE_S,
+            LIMIT_GRACE_S + QUIET_MOVE_S,
             LONGEST_LIMIT_S + LIMIT_GRACE_S,
             STALE_S + 1,
             HUNG_EXIT_AFTER_S + 1,
             RELAUNCH_STUCK_S,
             RELAUNCH_INTERRUPT_S,
         ];
+        let defer_until = match self.request {
+            Request::DeferUntil(t) => Some(t),
+            _ => None,
+        };
+        let unwatched_at = self
+            .watch_owed()
+            .then(|| unwatched_turns_at(self.watch_at, self.looked_at, self.awake_since))
+            .flatten();
         let mut candidates: Vec<u64> = bases
             .iter()
             .filter(|base| **base != 0)
             .flat_map(|base| spans.iter().map(move |span| base.saturating_add(*span)))
+            .chain(defer_until)
+            .chain(self.limit_told_at())
+            .chain(unwatched_at)
             .filter(|at| *at > now)
             .collect();
         candidates.sort_unstable();
@@ -3941,7 +3955,7 @@ pub const REFUSED_STOPPED: &str = "stopped:";
 #[must_use]
 pub fn refused_stopped(e: &str) -> Option<(u64, &str)> {
     let (at, sentence) = e.strip_prefix(REFUSED_STOPPED)?.split_once(':')?;
-    Some((at.parse().ok()?, sentence))
+    Some((crate::parse_uint(at)?, sentence))
 }
 
 /// What a person at a shell is told for [`ask`]'s refusal.
@@ -4429,7 +4443,7 @@ fn read_back(opts: &Opts) -> BTreeMap<String, u64> {
     text.lines()
         .filter_map(|line| {
             let (session, exited) = line.split_once(' ')?;
-            let exited = exited.parse::<u64>().ok().filter(|at| *at != 0)?;
+            let exited = crate::parse_uint::<u64>(exited).filter(|at| *at != 0)?;
             (!session.is_empty() && !session.contains(char::is_whitespace))
                 .then(|| (session.to_string(), exited))
         })
@@ -4904,7 +4918,7 @@ fn next_change(rows: &[Row], now: u64) -> Option<u64> {
                 (waiting && r.request == Request::Now)
                     .then(|| r.request_at.saturating_add(NOW_QUIETS_S)),
                 match r.request {
-                    Request::DeferUntil(t) if waiting => Some(t),
+                    Request::DeferUntil(t) if owed => Some(t),
                     _ => None,
                 },
                 r.restarting(now).then(|| r.confirm_by.saturating_add(1)),

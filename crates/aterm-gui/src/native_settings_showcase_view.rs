@@ -20,7 +20,7 @@ const CHOOSER_NARROW_BELOW: f32 = 240.0;
 const COLUMN_GAP: f32 = 16.0;
 const SHORT_ROWS: f32 = 4.0;
 const DEMO_LEAST_WIDTH: f32 = 288.0;
-const PANEL_INSET: f32 = 8.0;
+pub(in crate::native_settings) const PANEL_INSET: f32 = 8.0;
 const DEMO_STRIP_GAP: f32 = 8.0;
 fn check_width() -> f32 {
     16.0_f32.max(text_width("\u{2713}", SemanticRole::Text, StyleRef::Accent).ceil())
@@ -258,6 +258,8 @@ thread_local! {
     /// The faces chrome text measures in as this render first asked, while [`BlocksShared`] is
     /// open ([`measured_in`]).
     static FACES: Cell<Option<Option<u64>>> = const { Cell::new(None) };
+    /// Each lead's items by their nodes, weighed whole once asked, while [`BlocksShared`] is open.
+    static LEADS: RefCell<Option<Vec<SharedLead>>> = const { RefCell::new(None) };
 }
 
 /// The faces chrome text measures in ([`crate::tray_raster::chrome_measure_epoch`]), weighed once
@@ -305,6 +307,15 @@ pub(in crate::native_settings) fn forget_strip_names() {
 
 /// A list's items built this render and what they were built of.
 type SharedItems = (ItemsAt, std::rc::Rc<[ListItem]>);
+
+/// A lead told by [`led_by`], and its items or, once [`Scrolls::at`] asked, how tall they stand.
+type SharedLead = (u64, LeadWhole);
+
+/// A lead's items, or how tall they stand whole once weighed.
+enum LeadWhole {
+    Items(Vec<ListItem>),
+    Tall(f32),
+}
 
 /// What a list's items are built of: the chooser's or the sheet's rows, and how they are held.
 #[derive(PartialEq)]
@@ -360,7 +371,7 @@ pub(in crate::native_settings) struct ListRoom {
     /// The nodes and heights it is led by ([`led_by`]).
     led: u64,
     /// Whether its list scrolls at every width it builds rows at: its room shorter than its lead.
-    scrolls: bool,
+    scrolls: Scrolls,
     /// Whether its list captions its sections.
     captions: bool,
     /// Whether its lead lists the demo's strip.
@@ -408,7 +419,7 @@ impl ListRoom {
         other: Self,
         state: &SettingsViewState,
     ) -> bool {
-        self.stops_as_at(other, [true, true], state)
+        self.stops_as_at(other, || true, state)
     }
 
     /// [`Self::stops_as`] for a list laid in `laid`, only its narrower rows told where it scrolls.
@@ -417,7 +428,7 @@ impl ListRoom {
         laid: Self,
         state: &SettingsViewState,
     ) -> bool {
-        self.stops_as_at(laid, [!self.scrolls, true], state)
+        self.stops_as_at(laid, || !self.scrolls.at(self.room), state)
     }
 
     /// Whether a list laid in `other` is as wide and pinned alike: one a reuse here is told for.
@@ -426,15 +437,21 @@ impl ListRoom {
         self.panel.0 == other.panel.0 && self.held == other.held
     }
 
-    /// [`Self::stops_as`], its rows told alike at the widths `sides` names: wide, then narrower.
-    fn stops_as_at(self, other: Self, sides: [bool; 2], state: &SettingsViewState) -> bool {
+    /// [`Self::stops_as`], its rows told alike a gutter narrower, and wide where `wide` says.
+    fn stops_as_at(
+        self,
+        other: Self,
+        wide: impl FnOnce() -> bool,
+        state: &SettingsViewState,
+    ) -> bool {
         let footer = !self.held.1;
         self.panel.0 == other.panel.0
             && self.captions == other.captions
             && self.held == other.held
             && self.led == other.led
             && (self.framed == other.framed
-                || (0..2).all(|side| !sides[side] || rows_alike(state, self.panel.0, side, footer)))
+                || ((!wide() || rows_alike(state, self.panel.0, 0, footer))
+                    && rows_alike(state, self.panel.0, 1, footer)))
     }
 }
 
@@ -469,12 +486,73 @@ fn rows_alike(state: &SettingsViewState, panel_width: f32, side: usize, footer: 
 /// What [`ListRoom::stops_as`] tells a list's lead by: each node's key and height.
 fn led_by(lead: &[(UiNode, f32)]) -> u64 {
     use std::hash::{Hash as _, Hasher as _};
-    let mut hasher = std::hash::DefaultHasher::new();
+    let mut hasher = aterm_hash::FxHasher::default();
     for (node, height) in lead {
         node.key.as_str().hash(&mut hasher);
         height.to_bits().hash(&mut hasher);
     }
     hasher.finish()
+}
+
+/// What [`ListRoom::stops_as`] tells a lead by: the lead `led` tells, with `node` put in at `at`.
+fn led_with(led: u64, at: usize, (node, height): &(UiNode, f32)) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = aterm_hash::FxHasher::default();
+    led.hash(&mut hasher);
+    at.hash(&mut hasher);
+    node.key.as_str().hash(&mut hasher);
+    height.to_bits().hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Whether a list scrolls at every width, or the lead [`led_by`] tells whose height says so.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Scrolls {
+    Told(bool),
+    Led(u64),
+}
+
+impl Scrolls {
+    /// A list led by `items`, told as `led`: its lead kept unweighed where [`BlocksShared`] is open.
+    fn of(led: u64, items: Vec<ListItem>, room: f32) -> Self {
+        if items.is_empty() {
+            return Self::Told(false);
+        }
+        LEADS.with(|leads| match leads.borrow_mut().as_mut() {
+            Some(leads) => {
+                if !leads.iter().any(|(seen, _)| *seen == led) {
+                    leads.push((led, LeadWhole::Items(items)));
+                }
+                Self::Led(led)
+            }
+            None => Self::Told(lead_whole(&items) > room + 0.01),
+        })
+    }
+
+    /// Whether a list `room` tall scrolls; its lead's items gone, no, so its wide rows are told too.
+    fn at(self, room: f32) -> bool {
+        let led = match self {
+            Self::Told(scrolls) => return scrolls,
+            Self::Led(led) => led,
+        };
+        LEADS
+            .with(|leads| {
+                let mut leads = leads.borrow_mut();
+                let (_, whole) = leads.as_mut()?.iter_mut().find(|(seen, _)| *seen == led)?;
+                let tall = match whole {
+                    LeadWhole::Tall(tall) => *tall,
+                    LeadWhole::Items(items) => lead_whole(items),
+                };
+                *whole = LeadWhole::Tall(tall);
+                Some(tall > room + 0.01)
+            })
+            .unwrap_or(false)
+    }
+}
+
+/// How tall `items` stand whole at any width.
+fn lead_whole(items: &[ListItem]) -> f32 {
+    scroll::leading_span(items, 0.0, f32::INFINITY, usize::MAX)
 }
 
 /// How [`themes_page`] lays its list out at the chrome and bars `state` holds: its sizes, measured,
@@ -564,10 +642,58 @@ struct PanelLaid {
     height: f32,
     demo: f32,
     led: bool,
+    /// Whether the toolbar alone leads it, the demo leading it only under the toolbar's row.
+    lent: bool,
 }
 
 impl PanelLaid {
+    /// Laid out in `room` under a listed toolbar `toolbar` tall, never taller than `room` (Clip).
     fn at(
+        state: &SettingsViewState,
+        page_width: f32,
+        (room, toolbar): (f32, f32),
+        frame: Option<&SettingsPreviewSpec>,
+    ) -> Self {
+        let laid = Self::shaped(state, page_width, room, frame);
+        if state.page_chrome.get().toolbar_lent
+            && laid.lends_under(state, page_width, (room, toolbar), frame)
+        {
+            return Self::lent_in(page_width, room);
+        }
+        laid
+    }
+
+    /// Whether the demo leads this list in `room` only under a listed toolbar `toolbar` tall.
+    fn lends_under(
+        self,
+        state: &SettingsViewState,
+        page_width: f32,
+        (room, toolbar): (f32, f32),
+        frame: Option<&SettingsPreviewSpec>,
+    ) -> bool {
+        #[cfg(test)]
+        let lends = !TOOLBAR_LENT_REFUSED.with(Cell::get);
+        #[cfg(not(test))]
+        let lends = true;
+        lends
+            && toolbar > 0.0
+            && !self.led
+            && Self::shaped(state, page_width, (room - toolbar).max(0.0), frame).led
+    }
+
+    /// The list a lent toolbar leads in `room`, alone over the demo.
+    const fn lent_in(page_width: f32, room: f32) -> Self {
+        Self {
+            shape: Shape::Stacked,
+            width: page_width,
+            height: room,
+            demo: 0.0,
+            led: true,
+            lent: true,
+        }
+    }
+
+    fn shaped(
         state: &SettingsViewState,
         page_width: f32,
         room: f32,
@@ -598,6 +724,7 @@ impl PanelLaid {
                 height: whole_rows_height(state, room, pins),
                 demo: 0.0,
                 led: false,
+                lent: false,
             };
         }
         let strip = strip_tall(state, page_width);
@@ -654,6 +781,7 @@ impl PanelLaid {
             height,
             demo,
             led,
+            lent: false,
         }
     }
 }
@@ -729,6 +857,7 @@ fn page_room(
         .position(|(node, _)| super::is_compact_toolbar(node))
         .map(|at| head.remove(at));
     state.toolbar_head_taken.set(false);
+    state.toolbar_head_lent.set(false);
     let mut name = head.pop();
     // Pinned, the name leaves the chooser its filter and its tallest row under it
     // ([`chooser_floor`]): at 1× text in a 178x152 window a name pinned over a 58pt list left a
@@ -773,9 +902,9 @@ fn page_room(
     )
 }
 
-/// How the page lays its list's panel out at `state`'s chrome and bars, as its shape alone tells.
+/// The list's panel at `state`'s chrome and bars: the panel, its room, toolbar height and width.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(in crate::native_settings) struct PanelAt(PanelLaid, f32);
+pub(in crate::native_settings) struct PanelAt(PanelLaid, f32, (f32, f32));
 
 impl PanelAt {
     /// Its list's body `body` where given, else as laid out.
@@ -786,21 +915,56 @@ impl PanelAt {
         body: Option<f32>,
     ) -> Self {
         // Measured, the page leaves whether its list took the toolbar as the page last built it.
-        let taken = state.toolbar_head_taken.get();
-        let (_, page_width, room, demo, _) = page_room(state, width, cx, body);
-        state.toolbar_head_taken.set(taken);
+        let taken = (
+            state.toolbar_head_taken.get(),
+            state.toolbar_head_lent.get(),
+        );
+        let (_, page_width, room, demo, (_, toolbar)) = page_room(state, width, cx, body);
+        state.toolbar_head_taken.set(taken.0);
+        state.toolbar_head_lent.set(taken.1);
+        let toolbar = toolbar.map_or(0.0, |(_, height)| height);
         let laid = PanelLaid::at(
             state,
             page_width,
-            room,
+            (room, toolbar),
             demo.as_ref().as_ref().map(|(_, frame)| frame),
         );
-        Self(laid, room)
+        Self(laid, room, (toolbar, page_width))
+    }
+
+    /// This rung's panel as lent: the rung's heading, room and list, but its list where it lends.
+    pub(in crate::native_settings) fn lent(
+        self,
+        state: &SettingsViewState,
+        cx: &ViewCx<'_>,
+    ) -> Self {
+        let (toolbar, page_width) = self.2;
+        let demo = demo_shared(
+            state,
+            cx.animation_phase_ms,
+            cx.motion,
+            cx.terminal_font_px,
+            cx.terminal_scale,
+            cx.semantic_font.as_ref(),
+        );
+        let frame = demo.as_ref().as_ref().map(|(_, frame)| frame);
+        if self
+            .0
+            .lends_under(state, page_width, (self.1, toolbar), frame)
+        {
+            return Self(PanelLaid::lent_in(page_width, self.1), self.1, self.2);
+        }
+        self
     }
 
     /// How wide its panel lays out.
     pub(in crate::native_settings) const fn width(self) -> f32 {
         self.0.width
+    }
+
+    /// Whether the toolbar alone leads its list, lent to a list the demo leads under its row.
+    pub(in crate::native_settings) const fn lends(self) -> bool {
+        self.0.lent
     }
 
     /// The most room a list under its heading has; a chooser's frame gives way for its tallest row.
@@ -922,7 +1086,8 @@ pub(crate) fn themes_page(
     let gap = settings_page_gap(state, width, cx.viewport);
     let (mut out, page_width, room, demo, (name, toolbar)) = page_room(state, width, cx, None);
     let (spec, frame) = Option::clone(&demo).unzip();
-    let laid = PanelLaid::at(state, page_width, room, frame.as_ref());
+    let over = toolbar.as_ref().map_or(0.0, |(_, height)| *height);
+    let laid = PanelLaid::at(state, page_width, (room, over), frame.as_ref());
     let shape = laid.shape;
     match shape {
         Shape::Beside { .. } | Shape::Short { .. } => {
@@ -999,6 +1164,7 @@ pub(crate) fn themes_page(
                         .map_or(0.0, |(_, height)| height + DEMO_STRIP_GAP);
                     let sizing = LeadSizing::new(frame, first, over, list_room);
                     state.toolbar_head_taken.set(toolbar.is_some());
+                    state.toolbar_head_lent.set(toolbar.is_some() && laid.lent);
                     let lead = toolbar
                         .into_iter()
                         .chain([
@@ -1117,14 +1283,14 @@ fn beside_fits(
     let demo = frame.map_or(0.0, |frame| frame.demo_height(1));
     let panel_width = panel_width(chooser, page_width);
     let strip = strip_tall(state, (page_width - panel_width - COLUMN_GAP).max(0.0));
-    let panel = if state.showcase.sheet_open {
-        sheet_floor(state, panel_width)
-    } else {
+    // The chooser's floor (rows kept across renders); the sheet's only where demo and strip fit.
+    let floor = (!state.showcase.sheet_open).then(|| {
         let inner = (panel_width - 2.0 * PANEL_INSET).max(0.0);
         let rows = chooser_rows_tallest(state, inner, chooser_is_narrow(panel_width));
         chooser_floor(state, rows)
-    };
-    room + 0.5 >= demo + DEMO_STRIP_GAP + strip && room + 0.5 >= panel
+    });
+    room + 0.5 >= demo + DEMO_STRIP_GAP + strip
+        && room + 0.5 >= floor.unwrap_or_else(|| sheet_floor(state, panel_width))
 }
 
 fn chooser_least(state: &SettingsViewState, rows: f32) -> f32 {
@@ -2622,7 +2788,9 @@ fn chooser_panel(
     let lead_tallest = |room: f32| scroll::tallest_span(&lead_items, 0.0, room);
     let pins = fit.pins(state, height, lead_tallest);
     let room = fit.room(state, height, pins);
-    let lead: Vec<(UiNode, f32)> = match name.filter(|_| !pins.head) {
+    // The list is led by the name too, its lead's items by the lead without it.
+    let items_led = led_by(&lead);
+    let (lead, led): (Vec<(UiNode, f32)>, u64) = match name.filter(|_| !pins.head) {
         // Under the toolbar where it leads the list.
         Some(title) => {
             let mut lead = lead;
@@ -2630,21 +2798,20 @@ fn chooser_panel(
                 lead.first()
                     .is_some_and(|(node, _)| super::is_compact_toolbar(node)),
             );
-            lead.insert(
-                at,
-                super::page_name_node(title, (inner - THUMB_GUTTER).max(0.0)),
-            );
-            lead
+            let named = super::page_name_node(title, (inner - THUMB_GUTTER).max(0.0));
+            let led = led_with(items_led, at, &named);
+            lead.insert(at, named);
+            (lead, led)
         }
-        None => lead,
+        None => (lead, items_led),
     };
     let laid = ListRoom {
         panel: (panel_width, height),
         framed: inset > 0.0,
         held: (pins.head, pins.footer, lead.len()),
-        led: led_by(&lead),
-        // Its lead heads its list at every width.
-        scrolls: scroll::leading_span(&lead_items, 0.0, f32::INFINITY, usize::MAX) > room + 0.01,
+        led,
+        // Its lead heads its list at every width, weighed only where a reuse asks.
+        scrolls: Scrolls::of(items_led, lead_items, room),
         captions: room + 0.5 >= captions_from,
         strip: lead.iter().any(|(node, _)| node.key.as_str() == STRIP_KEY),
         room,
@@ -2914,7 +3081,7 @@ fn sheet_panel(
         framed: true,
         held: (pin_title, false, lead.len()),
         led: led_by(&lead),
-        scrolls: false,
+        scrolls: Scrolls::Told(false),
         captions: false,
         strip: false,
         room,
@@ -3176,6 +3343,8 @@ fn rule_node(key: &str) -> UiNode {
             focusable: false,
             focused: false,
             focus_visible: false,
+            progress: None,
+            motion: None,
         }),
     )
     .layout(
@@ -3867,6 +4036,7 @@ impl<'a> BlocksShared<'a> {
         ITEMS.with(|items| items.replace(Some(Vec::new())));
         FOOTERS.with(|footers| footers.replace(Some(Vec::new())));
         FACES.with(|faces| faces.set(Some(None)));
+        LEADS.with(|leads| leads.replace(Some(Vec::new())));
         state.showcase_blocks.replace(Some(Vec::new()));
         state.showcase_sheet.replace(Some(Vec::new()));
         state.showcase_sheet_rows.replace(Some(Vec::new()));
@@ -3884,6 +4054,7 @@ impl Drop for BlocksShared<'_> {
         ITEMS.with(|items| items.replace(None));
         FOOTERS.with(|footers| footers.replace(None));
         FACES.with(|faces| faces.set(None));
+        LEADS.with(|leads| leads.replace(None));
         let built = self.0.showcase_blocks.replace(None).unwrap_or_default();
         let mut kept = self.0.showcase.blocks_kept.borrow_mut();
         let mut latest: Vec<SharedBlocks> = built
@@ -4444,6 +4615,8 @@ fn row_node(
                     focusable: false,
                     focused: false,
                     focus_visible: false,
+                    progress: None,
+                    motion: None,
                 }),
             )
             .layout(Layout::default().width(Length::Fill).height(Length::Fill)),

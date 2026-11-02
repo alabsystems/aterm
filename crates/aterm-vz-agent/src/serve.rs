@@ -170,10 +170,23 @@ pub fn serve<L: Listener>(listener: &L, system: &Arc<dyn System>) -> io::Result<
             }
             Err(e) => return Err(e),
         };
+        let report = conn.try_clone().ok();
         let system = Arc::clone(system);
-        thread::Builder::new()
+        if let Err(e) = thread::Builder::new()
             .name("vz-agent command".into())
-            .spawn(move || connection(conn, system.as_ref()))?;
+            .spawn(move || connection(conn, system.as_ref()))
+        {
+            eprintln!("aterm-vz-agent: a command thread could not start: {e}");
+            if let Some(mut report) = report {
+                let _ = wire::write_frame(
+                    &mut report,
+                    &Frame::Exit(Exit::NotStarted(format!(
+                        "a command thread could not start: {e}"
+                    ))),
+                );
+                report.shutdown();
+            }
+        }
     }
 }
 
@@ -245,6 +258,20 @@ fn start(exec: &Exec, identity: Identity) -> Result<Started, String> {
     };
     if exec.cwd.is_empty() {
         return Err("no cwd".into());
+    }
+    for (k, v) in &exec.env {
+        if k.is_empty() || k.contains(&b'=') || k.contains(&0) {
+            return Err(format!(
+                "invalid environment variable name `{}`",
+                String::from_utf8_lossy(k)
+            ));
+        }
+        if v.contains(&0) {
+            return Err(format!(
+                "environment variable `{}` holds a NUL byte",
+                String::from_utf8_lossy(k)
+            ));
+        }
     }
     let mut cmd = command(OsStr::from_bytes(program));
     cmd.args(args.iter().map(|a| OsStr::from_bytes(a)))

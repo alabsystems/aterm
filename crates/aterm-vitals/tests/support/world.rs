@@ -29,6 +29,10 @@ pub struct Proc {
     pub name: String,
     /// Its executable's file name, where the reader gives one.
     pub exe: Option<String>,
+    /// The build a front becomes, where the host read its arguments as one.
+    pub becomes: Option<String>,
+    /// While its claim waits, the pids of the claims ahead of it, as the host read its ledger.
+    pub claims_ahead: Option<Vec<u32>>,
     pub state: ProcState,
     /// Its controlling terminal is the tab's.
     pub tty: bool,
@@ -72,6 +76,9 @@ pub struct Proc {
     pub forked: bool,
     /// Started under aterm though no tab's tree holds it (its resource coalition).
     pub aterm: bool,
+    /// The tab a session-mate's environment ties it to while it is held outside every job (the
+    /// host's leftover reader reads that tie; its own environment is never read).
+    pub tie: Option<u64>,
 }
 
 impl Proc {
@@ -84,6 +91,8 @@ impl Proc {
             sid: 0,
             name: name.to_owned(),
             exe: None,
+            becomes: None,
+            claims_ahead: None,
             state: ProcState::Sleeping,
             tty: false,
             uid: UID,
@@ -119,6 +128,7 @@ impl Proc {
             exec: 1,
             forked: false,
             aterm: false,
+            tie: None,
         }
     }
 }
@@ -167,6 +177,9 @@ pub struct World {
     /// The reader reads pid versions (macOS): with none (Linux), only a command's text tells
     /// the engine its shell ran `exec`.
     pub versions: bool,
+    /// When aterm's Developer Tools grant took effect, on the world's clock (each held row's
+    /// start is its `born`).
+    pub grant_ms: Option<u64>,
 }
 
 impl Default for World {
@@ -195,6 +208,7 @@ impl World {
             vars: HashMap::new(),
             looked: HashMap::new(),
             versions: true,
+            grant_ms: None,
         };
         let mut aterm = Proc::new(100, 1, "aterm");
         aterm.sid = 100;
@@ -519,6 +533,7 @@ impl World {
             lanes: self.lanes,
             process_limit: self.limit,
             held: self.held(),
+            grant_ms: self.grant_ms,
         };
         let view = self.jobs.absorb(&tick);
         for t in &mut self.tabs {
@@ -580,6 +595,8 @@ impl World {
             uid: Some(p.uid),
             name: p.name.clone(),
             exe: p.exe.clone().filter(|_| !zombie),
+            becomes: p.becomes.clone().filter(|_| !zombie),
+            claims_ahead: p.claims_ahead.clone().filter(|_| !zombie),
             state: if p.d_state {
                 ProcState::Uninterruptible
             } else {
@@ -607,9 +624,7 @@ impl World {
             wchan: p.wchan.clone(),
             fds: (want_fds && !zombie && !p.refused).then_some(fds),
             blocked_fd: p.blocked_fd.filter(|_| want_fds && !zombie && !p.refused),
-            program_check: p.held
-                && p.wait == aterm_vitals::jobs::StartWait::ProgramCheck
-                && !zombie,
+            start_wait: (p.held && !zombie).then_some(p.wait),
             version: (self.versions && !zombie).then_some(p.exec),
         }
     }
@@ -623,9 +638,12 @@ impl World {
             .map(|p| aterm_vitals::jobs::HeldProc {
                 pid: p.pid,
                 exec: p.exec,
+                exec_version: self.versions.then_some(p.exec),
                 name: p.exe.clone().unwrap_or_else(|| p.name.clone()),
                 aterm: p.aterm || self.descends_from(p.pid, 100),
                 wait: p.wait,
+                tab: p.tie,
+                started_ms: p.born,
             })
             .collect()
     }

@@ -346,17 +346,22 @@ mod proc_syscall {
         if first == "running" {
             return None;
         }
-        Some(match first.parse::<i64>() {
-            Ok(n) if n == flock_nr => Asleep::Flock {
+        let digits = first.strip_prefix('-').unwrap_or(first);
+        let parsed = (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| first.parse::<i64>().ok())
+            .flatten();
+        Some(match parsed {
+            Some(n) if n == flock_nr => Asleep::Flock {
                 fd: words
                     .next()
                     .and_then(|a| a.strip_prefix("0x"))
+                    .filter(|a| !a.is_empty() && a.bytes().all(|b| b.is_ascii_hexdigit()))
                     .and_then(|a| u64::from_str_radix(a, 16).ok())
                     .map_or(-1, low_c_int),
             },
-            Ok(-1) => Asleep::Elsewhere("no call".to_string()),
-            Ok(n) => Asleep::Elsewhere(format!("syscall {n}")),
-            Err(_) => Asleep::Elsewhere(first.to_string()),
+            Some(-1) => Asleep::Elsewhere("no call".to_string()),
+            Some(n) => Asleep::Elsewhere(format!("syscall {n}")),
+            None => Asleep::Elsewhere(first.to_string()),
         })
     }
 }
@@ -395,7 +400,12 @@ mod imp {
     pub(super) fn threads() -> io::Result<Vec<Thread>> {
         let mut found = Vec::new();
         for entry in std::fs::read_dir("/proc/self/task")? {
-            if let Some(tid) = entry?.file_name().to_str().and_then(|s| s.parse().ok()) {
+            if let Some(tid) = entry?
+                .file_name()
+                .to_str()
+                .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|s| s.parse().ok())
+            {
                 found.push(Thread { tid });
             }
         }
@@ -550,6 +560,16 @@ mod tests {
                 ),
                 Some(Asleep::Flock { fd: -2 }),
                 "sign-extended 64-bit negative descriptor preserved"
+            );
+            assert_eq!(
+                parse_with(&format!("{flock_nr} 0x+1a 0x2\n"), flock_nr),
+                Some(Asleep::Flock { fd: -1 }),
+                "signed hex argument is rejected"
+            );
+            assert_eq!(
+                parse_with(&format!("+{flock_nr} 0x1a 0x2\n"), flock_nr),
+                Some(Asleep::Elsewhere(format!("+{flock_nr}"))),
+                "plus-prefixed syscall number is not flock"
             );
             assert_eq!(
                 parse_with(&format!("{other} 0x1a 0x2\n"), flock_nr),

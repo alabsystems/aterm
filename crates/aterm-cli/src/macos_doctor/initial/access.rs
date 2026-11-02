@@ -70,15 +70,43 @@ pub(super) fn notify_local_network_waiters() {
     cvar.notify_all();
 }
 
-/// The record, in aterm's doctor state, of the last answer a LAN look heard: a later launch reads
-/// Local Network from it, since a joined ALab Mac's launch looks for nothing and a Mac with no
-/// ALab vault on its LAN hears no answer to a look.
-const KEPT: &str = "local-network.json";
+/// The loaded-code subject whose process heard the answer. Test hosts supply an
+/// inert identity; only the composing executable installs a native reader.
+fn code_subject() -> Option<[u8; 32]> {
+    #[cfg(test)]
+    {
+        fn inert() -> Option<[u8; 32]> {
+            Some([0x54; 32])
+        }
+        access_record::code_subject_from(inert);
+        inert()
+    }
+    #[cfg(not(test))]
+    access_record::code_subject()
+}
 
-const KEPT_LOCK: &str = "local-network.lock";
+/// Each signing identity retains its own answer and sequence. Unbound legacy
+/// records remain untouched and never stand for a newly signed application.
+fn kept_names(subject: [u8; 32]) -> (String, String) {
+    let key = aterm_codec::hex::encode_lower(&subject);
+    (
+        format!("local-network-{key}.json"),
+        format!("local-network-{key}.lock"),
+    )
+}
+
+#[cfg(test)]
+fn test_kept_path(root: &Path) -> std::path::PathBuf {
+    root.join(kept_names(code_subject().unwrap()).0)
+}
+
+#[cfg(test)]
+fn test_kept_lock() -> String {
+    kept_names(code_subject().unwrap()).1
+}
 
 /// Note what a look at the LAN heard, now: for this process, and kept for later launches. Each
-/// answer takes the next number of one sequence that this process and the record share
+/// answer takes the next number of this code identity's sequence shared by process and record
 /// ([`keep_answer`]), so the answer heard last always wins, whatever the Mac's clock said when
 /// either was heard: an old refusal never outlasts a later step or look. A record that cannot be
 /// written leaves later launches what they read before; this process still reads its own answer.
@@ -164,10 +192,10 @@ pub(super) fn heard_here() -> Option<LanAnswer> {
         .map(|(answer, _)| answer)
 }
 
-/// Note `answer`, heard at `at` (Unix seconds, kept for an older aterm, which orders answers by
-/// it), in `heard` and in the record in `root`, under the record's lock: numbered after the
-/// answer the record keeps and the last one `heard` holds, so every later answer, in any process,
-/// outranks it. Its number is noted in `heard` even when the record cannot be written.
+/// Note `answer`, heard at `at` (Unix seconds), in `heard` and this identity's
+/// record under its lock. Number it after the kept answer and the last one
+/// `heard` holds, so later answers from the same identity outrank it regardless
+/// of clock changes. Memory keeps its number even when persistence fails.
 fn keep_answer(
     root: &Path,
     heard: &Mutex<Option<(LanAnswer, u64)>>,
@@ -184,25 +212,48 @@ fn keep_answer_with(
     at: u64,
     after_read: impl FnOnce(),
 ) -> Result<u64, String> {
-    let lock = HeldLock::take_named(root, KEPT_LOCK);
-    let kept = kept_answer(root).map_or(0, |(_, sequence)| sequence);
+    keep_answer_for_subject(root, code_subject(), heard, answer, at, after_read)
+}
+
+fn keep_answer_for_subject(
+    root: &Path,
+    subject: Option<[u8; 32]>,
+    heard: &Mutex<Option<(LanAnswer, u64)>>,
+    answer: LanAnswer,
+    at: u64,
+    after_read: impl FnOnce(),
+) -> Result<u64, String> {
+    let Some(subject) = subject else {
+        hear_answer(heard, answer, 0);
+        return Err("Local Network observation has no loaded-code identity".into());
+    };
+    let (file, lock_file) = kept_names(subject);
+    let lock = HeldLock::take_named(root, &lock_file);
+    let kept = kept_answer_for_subject(root, Some(subject)).map_or(0, |(_, sequence)| sequence);
     let sequence = hear_answer(heard, answer, kept);
     let _lock = lock?;
     after_read();
     super::write_json(
-        &root.join(KEPT),
-        &json!({"profile":super::PROFILE,"answer":answer.word(),"at":at,"sequence":sequence}),
+        &root.join(file),
+        &json!({"profile":super::PROFILE,"subject":aterm_codec::hex::encode_lower(&subject),
+            "answer":answer.word(),"at":at,"sequence":sequence}),
     )?;
     Ok(sequence)
 }
 
-/// The answer kept in `root`, and its number in the order of answers (an older aterm's record,
-/// which keeps only the time it was heard, reads as the first); `None` when there is none, or the
-/// record cannot be read (a reading that says nothing, never a guess).
+/// This identity's answer and sequence; an unreadable, unbound or different
+/// identity's record says nothing about this application's Local Network access.
 fn kept_answer(root: &Path) -> Option<(LanAnswer, u64)> {
-    let bytes = std::fs::read(root.join(KEPT)).ok()?;
+    kept_answer_for_subject(root, code_subject())
+}
+
+fn kept_answer_for_subject(root: &Path, subject: Option<[u8; 32]>) -> Option<(LanAnswer, u64)> {
+    let subject = subject?;
+    let bytes = std::fs::read(root.join(kept_names(subject).0)).ok()?;
     let value: Value = aterm_json::from_slice(&bytes).ok()?;
-    if value["profile"].as_str() != Some(super::PROFILE) {
+    if value["profile"].as_str() != Some(super::PROFILE)
+        || value["subject"].as_str() != Some(aterm_codec::hex::encode_lower(&subject).as_str())
+    {
         return None;
     }
     let sequence = match value.get("sequence") {
@@ -269,6 +320,7 @@ pub(super) fn wait_for_local_network_grant(
 
 #[cfg(test)]
 pub(super) fn record_step_isolated_at(root: &Path, revision: u64, outcome: AccessOutcome) {
+    let _subject = code_subject();
     let _ = access_record::append(root, revision, Access::LocalNetwork, outcome);
     if let Some(answer) = step_answer(outcome) {
         if answer == LanAnswer::Reached {
@@ -1032,6 +1084,49 @@ mod tests {
         assert_eq!(opted_out(published, &records, [false; 5])[1], Some(switch));
     }
 
+    /// A Local Network step a switch holds (`[swarm] enabled = false` or a `[privacy]` switch
+    /// off, which the window publishes as an always-true opt-out) settles the row for the
+    /// Permissions stage on every reading, so the stage never waits on a step that never runs, and
+    /// the page reads it calmly, never as a change to make or a person's step.
+    /// NEGATIVE CONTROL: with no opt-out, an untold row waits for the window's step.
+    #[test]
+    fn a_local_network_step_a_switch_holds_settles_the_permissions_stage() {
+        let why = "Setup asks for no Local Network while sharing is off.";
+        let slot = Access::ALL
+            .iter()
+            .position(|access| *access == Access::LocalNetwork)
+            .unwrap();
+        let stage = |g: &Grants| {
+            stage_rows(g, &[])
+                .into_iter()
+                .find(|row| row.name == "Local Network")
+                .unwrap()
+        };
+        for lan in [Lan::Untold, Lan::Asked, Lan::On, Lan::Off] {
+            let mut g = Grants { lan, ..grants() };
+            let mut published = [None; 5];
+            published[slot] = Some(OptOut::Always(why));
+            g.opted_out = opted_out(
+                published,
+                &[],
+                Access::ALL.map(|access| g.reads_off(access)),
+            );
+            g.refused_lan();
+            let row = observation(Access::LocalNetwork, &g, managed());
+            assert!(
+                row.standing.settled() && !row.standing.attention(),
+                "{lan:?}: {row:?}"
+            );
+            let row = stage(&g);
+            assert_eq!(row.status, "ok", "{lan:?}: {row:?}");
+        }
+        let unheld = Grants {
+            lan: Lan::Untold,
+            ..grants()
+        };
+        assert_eq!(stage(&unheld).status, WAITING);
+    }
+
     /// The window publishes a debugger opt-out at every launch, before any probe (§4), so it is
     /// said only of an Off reading; an On or unread debugger keeps its own row.
     #[test]
@@ -1156,6 +1251,75 @@ mod tests {
     }
 
     #[test]
+    fn cached_lan_answer_does_not_cross_code_subjects() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let release_subject = [0x11; 32];
+        let dev_subject = [0x22; 32];
+        let signed_release = Some(release_subject);
+        let signed_dev = Some(dev_subject);
+        let sequence = keep_answer_for_subject(
+            root.path(),
+            signed_release,
+            &Mutex::new(None),
+            LanAnswer::Reached,
+            10,
+            || {},
+        )
+        .unwrap();
+        assert_eq!(
+            kept_answer_for_subject(root.path(), signed_release),
+            Some((LanAnswer::Reached, sequence))
+        );
+        assert_eq!(kept_answer_for_subject(root.path(), signed_dev), None);
+        assert_eq!(kept_answer_for_subject(root.path(), None), None);
+        let release_record =
+            std::fs::read(root.path().join(kept_names(release_subject).0)).unwrap();
+        std::fs::write(root.path().join(kept_names(dev_subject).0), &release_record).unwrap();
+        assert_eq!(
+            kept_answer_for_subject(root.path(), signed_dev),
+            None,
+            "renaming another identity's record does not rebind it"
+        );
+        keep_answer_for_subject(
+            root.path(),
+            signed_dev,
+            &Mutex::new(None),
+            LanAnswer::Refused,
+            11,
+            || {},
+        )
+        .unwrap();
+        assert_eq!(
+            kept_answer_for_subject(root.path(), signed_release),
+            Some((LanAnswer::Reached, sequence))
+        );
+        assert_eq!(
+            kept_answer_for_subject(root.path(), signed_dev),
+            Some((LanAnswer::Refused, 1))
+        );
+    }
+
+    #[test]
+    fn unbound_or_unknown_code_does_not_reuse_persistent_lan_permission() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let legacy = root.path().join("local-network.json");
+        let bytes = b"{\"profile\":\"macos-workstation-v1\",\"answer\":\"reached\",\"at\":1,\"sequence\":99}";
+        std::fs::write(&legacy, bytes).unwrap();
+        assert_eq!(kept_answer_for_subject(root.path(), Some([0x11; 32])), None);
+        assert_eq!(kept_answer_for_subject(root.path(), None), None);
+        let heard = Mutex::new(None);
+        assert!(
+            keep_answer_for_subject(root.path(), None, &heard, LanAnswer::Reached, 2, || {})
+                .is_err()
+        );
+        assert_eq!(
+            latest([*heard.lock().unwrap(), None]),
+            Some(LanAnswer::Reached)
+        );
+        assert_eq!(std::fs::read(legacy).unwrap(), bytes);
+    }
+
+    #[test]
     fn a_kept_answer_is_read_back_and_every_later_one_replaces_it() {
         let root = aterm_tempfile::tempdir().unwrap();
         assert_eq!(kept_answer(root.path()), None, "nothing kept yet");
@@ -1165,17 +1329,18 @@ mod tests {
         let second = kept_by_another(root.path(), LanAnswer::Refused, 50);
         assert!(second > first);
         assert_eq!(kept_answer(root.path()), Some((LanAnswer::Refused, second)));
-        // An older aterm's record keeps only its time: it reads as the first answer, and the
-        // next one this aterm hears outranks it.
+        // An observation without a sequence reads as the first answer, while
+        // its signing-identity binding remains required.
         super::super::write_json(
-            &root.path().join(KEPT),
-            &json!({"profile":super::super::PROFILE,"answer":"reached","at":u64::MAX}),
+            &test_kept_path(root.path()),
+            &json!({"profile":super::super::PROFILE,"answer":"reached","at":u64::MAX,
+                "subject":aterm_codec::hex::encode_lower(&code_subject().unwrap())}),
         )
         .unwrap();
         assert_eq!(kept_answer(root.path()), Some((LanAnswer::Reached, 0)));
         let after = kept_by_another(root.path(), LanAnswer::Refused, 1);
         assert_eq!(kept_answer(root.path()), Some((LanAnswer::Refused, after)));
-        std::fs::write(root.path().join(KEPT), b"{").unwrap();
+        std::fs::write(test_kept_path(root.path()), b"{").unwrap();
         assert_eq!(
             kept_answer(root.path()),
             None,
@@ -1249,7 +1414,7 @@ mod tests {
             begin
                 .recv_timeout(Duration::from_secs(60))
                 .expect("the older writer read the kept answer");
-            let lock = HeldLock::try_take_named(&path, KEPT_LOCK).unwrap();
+            let lock = HeldLock::try_take_named(&path, &test_kept_lock()).unwrap();
             if lock.is_some() {
                 // No writer lock excludes this newer publication from the gap.
                 drop(lock);
@@ -1315,8 +1480,8 @@ mod tests {
         let earlier = kept_by_another(root.path(), LanAnswer::Reached, 1);
         let heard = Mutex::new(None);
         // A destination directory makes the actual atomic replacement fail.
-        std::fs::remove_file(root.path().join(KEPT)).unwrap();
-        std::fs::create_dir(root.path().join(KEPT)).unwrap();
+        std::fs::remove_file(test_kept_path(root.path())).unwrap();
+        std::fs::create_dir(test_kept_path(root.path())).unwrap();
         assert!(keep_answer(root.path(), &heard, LanAnswer::Refused, 2).is_err());
         assert_eq!(kept_answer(root.path()), None);
         assert_lan_refused(latest([*heard.lock().unwrap(), kept_answer(root.path())]));
@@ -1330,10 +1495,11 @@ mod tests {
         );
         // The record readable again with what it kept before: this process's later answer
         // still outranks it.
-        std::fs::remove_dir(root.path().join(KEPT)).unwrap();
+        std::fs::remove_dir(test_kept_path(root.path())).unwrap();
         super::super::write_json(
-            &root.path().join(KEPT),
-            &json!({"profile":super::super::PROFILE,"answer":"refused","at":1,"sequence":earlier}),
+            &test_kept_path(root.path()),
+            &json!({"profile":super::super::PROFILE,"answer":"refused","at":1,"sequence":earlier,
+                "subject":aterm_codec::hex::encode_lower(&code_subject().unwrap())}),
         )
         .unwrap();
         assert_eq!(

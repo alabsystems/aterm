@@ -18,7 +18,6 @@ use crate::supervise::facts::SeedOutcome;
 
 const MINUTE_MS: i64 = 60_000;
 const HOUR_MS: i64 = 60 * MINUTE_MS;
-const DAY_MS: i64 = 24 * HOUR_MS;
 
 /// The most wakes a session's book holds, in any state.
 pub const MAX_WAKES: usize = 16;
@@ -111,7 +110,7 @@ impl WakeUsage {
             WakeUsage::Pattern => "the pattern does not compile",
             WakeUsage::Escape => "a percent escape is %XX of UTF-8",
             WakeUsage::Volume => {
-                "need= takes machine terms; free, disk= and vol= arrive in a later slice"
+                "wake takes no free, disk= or vol= term; `await sys` waits on those"
             }
             WakeUsage::NeedSys => "need= takes machine terms alone",
             WakeUsage::UnlessSource => "unless= takes file:, gone: and pid:<n> exited alone",
@@ -990,14 +989,6 @@ impl WakeBook {
     /// THE DECLARATION `req`, by `by` for `agent`, at `now_ms` in a zone `local_offset_s` from UTC.
     /// # Errors
     /// [`DeclareRefusal`].
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "WakeBook",
-            action = "DeclareOwn",
-            project = "conformance_wakes::project"
-        )
-    )]
     pub fn declare(
         &mut self,
         req: WakeReq,
@@ -1006,6 +997,30 @@ impl WakeBook {
         now_ms: i64,
         local_offset_s: i64,
     ) -> Result<u16, DeclareRefusal> {
+        self.declare_local(req, by, agent, now_ms, &|_| Some(local_offset_s))
+    }
+
+    /// [`Self::declare`], reading the local zone at each candidate instant (`local_at`, unix
+    /// seconds to UTC offset seconds) so an `at:HH:MM` wake declared across a daylight change fires
+    /// on the wall clock of its target day.
+    /// # Errors
+    /// [`DeclareRefusal`].
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "WakeBook",
+            action = "DeclareOwn",
+            project = "conformance_wakes::project"
+        )
+    )]
+    pub fn declare_local(
+        &mut self,
+        req: WakeReq,
+        by: Declarer,
+        agent: AgentId,
+        now_ms: i64,
+        local_at: &dyn Fn(i64) -> Option<i64>,
+    ) -> Result<u16, DeclareRefusal> {
         let due_by_ms = now_ms.saturating_add(req.by_ms);
         let await_only = req.await_only();
         let mut when = Vec::with_capacity(req.when.len());
@@ -1013,11 +1028,19 @@ impl WakeBook {
             let at_ms = match atom {
                 Atom::Time(TimeAtom::In { ms }) => Some(now_ms.saturating_add(ms)),
                 Atom::Time(TimeAtom::At { hh, mm }) => {
-                    let local = now_ms
-                        .saturating_add(local_offset_s.saturating_mul(1_000))
-                        .rem_euclid(DAY_MS);
-                    let target = i64::from(hh) * HOUR_MS + i64::from(mm) * MINUTE_MS;
-                    Some(now_ms.saturating_add((target - local).rem_euclid(DAY_MS)))
+                    let now_s = now_ms.div_euclid(1_000);
+                    let now_offset = local_at(now_s).unwrap_or(0);
+                    let today = now_s.saturating_add(now_offset).div_euclid(86_400);
+                    let clock_s = i64::from(hh) * 3_600 + i64::from(mm) * 60;
+                    let place = |day: i64| -> Option<i64> {
+                        let local = day.checked_mul(86_400)?.checked_add(clock_s)?;
+                        let approx = local.checked_sub(now_offset)?;
+                        let offset = local_at(approx).unwrap_or(now_offset);
+                        local.checked_sub(offset)?.checked_mul(1_000)
+                    };
+                    place(today)
+                        .filter(|at| *at >= now_ms)
+                        .or_else(|| place(today.saturating_add(1)))
                 }
                 Atom::Source(_) | Atom::Sys(_) => None,
             };

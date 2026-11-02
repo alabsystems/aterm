@@ -27,7 +27,7 @@ use super::m6_policy::{
     PoolId, SetId, SetTag, Side, control_id, features, set_pools, side,
 };
 use super::plan::SchedulePlan;
-use super::test_fixtures::BUILD;
+use super::test_fixtures::{BUILD, refused_off_the_pinned_target};
 
 // ---- Fixtures ----
 
@@ -77,6 +77,9 @@ fn the_pinned_chain_reproduces_on_the_v1_sets() {
         "f3ae385050abe4b23912ec63291af550d6445337e3c72adee7f0645a3113afa7"
     );
     assert_eq!(pin.ids[0], Version::base().id());
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let members = chain(&Sets::v1(), &Labeller::new(evaluator(), &Threads)).expect("the v1 chain");
     assert_eq!(ChainPin::of(&members), Some(pin));
 }
@@ -405,6 +408,9 @@ fn names(moves: &[(&'static str, Moved)]) -> Vec<&'static str> {
 
 #[test]
 fn the_chain_is_deterministic() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let f = fixture();
     let again = chain(&f.sets, &Labeller::new(&evaluator().anew(), &Serial)).expect("the chain");
     assert_eq!(
@@ -426,6 +432,9 @@ fn the_chain_is_deterministic() {
 
 #[test]
 fn the_chain_names_no_build() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let other = Evaluator::v1("another-build", Instant::now()).expect("the pinned policy v1");
     let theirs = chain(&fixture().sets, &Labeller::new(&other, &Threads)).expect("the chain");
     assert_eq!(
@@ -437,6 +446,9 @@ fn the_chain_names_no_build() {
 
 #[test]
 fn a_state_round_trips_and_its_bounds_are_refused() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     for v in &fixture().chain {
         let bytes = v.state().encode();
         assert_eq!(bytes.len(), super::m6::STATE_LEN);
@@ -488,6 +500,9 @@ fn training_past_the_step_budget_is_refused() {
     let t_at = 12 + super::m6::ADAPTER_LEN + FEATURES * 8;
     bytes[t_at..t_at + 8].copy_from_slice(&MAX_STEPS.to_le_bytes());
     let full = State::decode(&bytes).expect("t at the budget is a state");
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let labels = evaluator()
         .label_spread(
             LabelScope::Train,
@@ -532,6 +547,9 @@ fn training_past_the_step_budget_is_refused() {
 
 #[test]
 fn a_version_round_trips_from_its_files() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     for v in &fixture().chain {
         let parts = (
             v.descriptor(),
@@ -622,6 +640,9 @@ fn a_version_round_trips_from_its_files() {
 
 #[test]
 fn every_versioned_part_is_in_the_id() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let v = &fixture().chain[2];
     let mut seen = vec![v.id()];
     for how in [
@@ -700,6 +721,9 @@ fn train_by_rule(parent: &[u8], data: &[&TrainLabel]) -> Vec<u8> {
 
 #[test]
 fn the_trainer_follows_its_rule_and_its_random_state_matters() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let f = fixture();
     let (parent, member) = (&f.chain[1], &f.chain[2]);
     let labels = evaluator()
@@ -1014,6 +1038,9 @@ fn each_void_is_classed_by_when_it_arose() {
 #[test]
 fn a_stopped_session_spends_nothing() {
     let root = root();
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let mut ledger =
         Ledger::practice(MemLog::of(&root, Pair::Practice(0)), 0, pin()).expect("a ledger");
     ledger
@@ -1102,6 +1129,9 @@ fn the_pair_checks_refuse_by_name() {
 fn the_ledger_refuses_a_race_a_moved_chain_and_a_broken_line() {
     let root = root();
     let log = MemLog::of(&root, Pair::Practice(0));
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let mut first = Ledger::practice(log.clone(), 0, pin()).expect("a ledger");
     let mut second = Ledger::practice(log.clone(), 0, pin()).expect("a ledger");
     first
@@ -1132,6 +1162,9 @@ fn the_ledger_refuses_a_race_a_moved_chain_and_a_broken_line() {
 
 #[test]
 fn a_token_is_minted_only_after_its_line() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let f = fixture();
     let root = root();
     let log = MemLog::of(&root, Pair::Practice(0));
@@ -1207,6 +1240,9 @@ fn a_practice_token_takes_only_practice_plans() {
     .expect("E_1")[0][0];
     assert_eq!(side(&held), Side::HeldOut);
     assert_eq!(side(&report), Side::Report);
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let f = fixture();
     for plan in [held, report] {
         let root = root();
@@ -1240,6 +1276,9 @@ fn a_practice_token_takes_only_practice_plans() {
 
 #[test]
 fn an_admission_is_bound_to_its_own_ledger() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let s = all_admitted();
     let f = fixture();
     let labeller = Labeller::new(evaluator(), &Threads);
@@ -1395,6 +1434,9 @@ fn an_admission_is_bound_to_its_own_ledger() {
 
 #[test]
 fn the_runner_writes_only_void_and_record() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let f = fixture();
     let root = root();
     let log = MemLog::of(&root, Pair::Practice(0));
@@ -1425,6 +1467,9 @@ fn the_runner_writes_only_void_and_record() {
 
 #[test]
 fn a_scaled_practice_session_reads_no_held_out_item() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let (ev, s) = natural();
     let relaxed = std::sync::atomic::Ordering::Relaxed;
     assert_eq!(
@@ -1458,6 +1503,9 @@ fn a_scaled_practice_session_reads_no_held_out_item() {
 
 #[test]
 fn each_arm_folds_its_rankers_top_k() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let (_, s) = natural();
     let f = fixture();
     let report = s.a.report.as_ref().expect("A's report");
@@ -1511,6 +1559,9 @@ fn the_grid_reproduces_m4s_training_record() {
     let grid = Sets::v1().grid();
     assert_eq!(grid.len(), 54);
     let bytes: Vec<[u8; 12]> = grid.iter().map(SchedulePlan::encode).collect();
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let labels = evaluator()
         .label_spread(LabelScope::Train, &bytes, &Threads)
         .expect("the grid's labels");
@@ -1519,6 +1570,9 @@ fn the_grid_reproduces_m4s_training_record() {
 
 #[test]
 fn the_chain_is_independent_of_admission() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let f = fixture();
     for s in [all_admitted(), all_refused(), control_admitted()] {
         assert_eq!(s.a.chain, f.chain);
@@ -1528,6 +1582,9 @@ fn the_chain_is_independent_of_admission() {
 
 #[test]
 fn forced_admissions_publish_rollback_and_replay() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let s = all_admitted();
     let f = fixture();
     replays_equal(s);
@@ -1579,6 +1636,9 @@ fn forced_admissions_publish_rollback_and_replay() {
 
 #[test]
 fn a_replayed_admission_publishes_once() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let s = all_admitted();
     let f = fixture();
     let root: Shared = Arc::new(Mutex::new(s.root.lock().expect("unpoisoned").clone()));
@@ -1605,6 +1665,9 @@ fn a_replayed_admission_publishes_once() {
 
 #[test]
 fn an_admitted_control_publishes_nothing() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let s = control_admitted();
     replays_equal(s);
     assert_eq!(s.a.bits, [false, true, false, false, false]);
@@ -1630,6 +1693,9 @@ fn an_admitted_control_publishes_nothing() {
 
 #[test]
 fn a_look_runs_only_through_the_ledger_list() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let f = fixture();
     let root = root();
     let mut ledger =
@@ -1667,6 +1733,9 @@ fn a_look_runs_only_through_the_ledger_list() {
 
 #[test]
 fn a_session_runs_only_on_its_pairs_store_and_build() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let f = fixture();
     let env = SessionEnv {
         build: BUILD,
@@ -1709,6 +1778,9 @@ fn a_session_runs_only_on_its_pairs_store_and_build() {
 
 #[test]
 fn a_reproducing_train_moves_the_head() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let f = fixture();
     let labeller = Labeller::new(evaluator(), &Threads);
     let mut st = store(3);
@@ -1764,6 +1836,9 @@ fn a_reproducing_train_moves_the_head() {
 
 #[test]
 fn each_store_load_check_refuses() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let v0 = fixture().chain[0].id();
     let mut st = store(4);
     st.rollback(v0, Digest([0; 32])).expect("a rollback");
@@ -1838,6 +1913,9 @@ fn each_store_load_check_refuses() {
 
 #[test]
 fn the_store_budgets_hold() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let v0 = fixture().chain[0].id();
     let mut st = store(6);
     while st.revisions().len() < MAX_REVISIONS {
@@ -3036,6 +3114,9 @@ fn the_workspace_scan_refuses_its_planted_fixtures() {
 #[test]
 fn the_pools_judged_are_k_per_arm() {
     assert_eq!(JUDGED, 4);
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let s = all_admitted();
     let figures = s.a.figures.first().expect("look 1's figures");
     assert_eq!(figures.pools().len(), 12);

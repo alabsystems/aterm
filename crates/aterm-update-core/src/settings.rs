@@ -71,16 +71,31 @@ fn update_parse_notice(text: &str, e: &aterm_toml::Error) -> String {
     format!("{what} — automatic updates stay on: {e}")
 }
 
+fn read_config_file(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let file = opts.open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > MAX_CONFIG_BYTES {
+        return None;
+    }
+    let mut text = String::new();
+    file.take(MAX_CONFIG_BYTES.saturating_add(1))
+        .read_to_string(&mut text)
+        .ok()?;
+    (text.len() as u64 <= MAX_CONFIG_BYTES).then_some(text)
+}
+
 /// Read [`parse_update_enabled`] from `path` (`true` if absent, non-regular, oversized, or non-UTF-8).
 #[must_use]
 pub fn update_enabled_at(path: &Path) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return true;
-    };
-    if !meta.is_file() || meta.len() > MAX_CONFIG_BYTES {
-        return true;
-    }
-    std::fs::read_to_string(path).map_or(true, |text| parse_update_enabled(&text))
+    read_config_file(path).is_none_or(|text| parse_update_enabled(&text))
 }
 
 /// `[update] auto_apply` alone.
@@ -110,15 +125,9 @@ pub fn parse_update_auto_apply(text: &str) -> bool {
 /// Read [`parse_update_auto_apply`] from the user config (`true` if absent, oversized, or unreadable).
 #[must_use]
 pub fn update_auto_apply() -> bool {
-    let Some(path) = config_path() else {
-        return true;
-    };
-    match std::fs::metadata(&path) {
-        Ok(meta) if meta.is_file() && meta.len() <= MAX_CONFIG_BYTES => {
-            std::fs::read_to_string(&path).map_or(true, |text| parse_update_auto_apply(&text))
-        }
-        _ => true,
-    }
+    config_path()
+        .and_then(|path| read_config_file(&path))
+        .is_none_or(|text| parse_update_auto_apply(&text))
 }
 
 /// Cached `[update] enabled` setting for this process.

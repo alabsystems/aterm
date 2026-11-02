@@ -1,7 +1,7 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-once-cell: spec recovery from its 23 unit tests
+# aterm-once-cell: spec recovery from unit tests
 
 > Status: migration worklist. Each of the 8 specs below is proved through Trust/Clean, and then the
 > tests it subsumes are deleted. All eight §4 non-spec checks are deleted: the racy-cell negative
@@ -15,12 +15,9 @@ a spec**: the 8 §4 checks that sampled no spec are deleted.
 
 ## 0. Notation used in the statements
 
-- `Abs(c) : Option<T>` is the abstract state of a cell.
-  - For `sync::OnceCell` it is `c.inner.get()` (a `std::sync::OnceLock`).
-  - For `unsync::OnceCell` it is `c.0.get()` (a `core::cell::OnceCell`).
-  - For `race::OnceBox<T>` it is the inner `Option<Box<T>>` read through `Box` deref.
-
-  Every statement is up to that deref.
+- `Abs(c) : Option<T>` is a cell's abstract state: `c.inner.get()` (a `std::sync::OnceLock`) for
+  `sync::OnceCell`, `c.0.get()` (a `core::cell::OnceCell`) for `unsync::OnceCell`, and the inner
+  cell's `Option<Box<T>>` for `race::OnceBox<T>`. Statements hold up to the `Box` deref.
 - `CellModel(T)` is the sequential state machine over `Option<T>`:
   - `new()` and `default()` give `None`. `with_value(v)` and `From(v)` give `Some v`.
   - `get()` returns `Abs` and leaves it unchanged. `get_mut()` returns it as `&mut`.
@@ -29,23 +26,22 @@ a spec**: the 8 §4 checks that sampled no spec are deleted.
   - `get_or_init(f)`: from `Some u`, `f` is not called and the result is `&u`. From `None`, `f` is called exactly once, and the state becomes `Some(f())`, which is returned.
   - `get_or_try_init(f)`: from `Some u`, `f` is not called and the result is `Ok(&u)`. From `None`, `f` is called once. `Ok v` gives the state `Some v` and returns `Ok(&v)`. `Err e` leaves the state `None` and returns `Err e`.
   - `take()` returns the old `Abs` and leaves `None`. `into_inner()` returns `Abs`.
-- `Calls(f)` counts how many times the user closure `f` was invoked. It is a ghost counter.
+- `Calls(f)` is a ghost counter of the invocations of the user closure `f`.
 - `LazyModel` has the state `(Abs(cell), init : Option<F>)`, with the invariant `Abs(cell) = None ⇒ init = Some _`:
   - `new(f)` gives `(None, Some f)` and does not call `f`.
   - `get` returns `Abs(cell)`.
   - `force`, `Deref`, `force_mut` and `DerefMut`, from `None`: take `init`, call it once, store the result and return a reference to it. From `Some v`, they call nothing and return `&v`.
   - `into_value` returns `Ok(v)` when `Abs = Some v`, and `Err(init)` otherwise.
-- `Hist` is any linearizable concurrent history of calls, from any number of threads, on one
-  `sync::OnceCell`, or on a `sync::Lazy` or `race::OnceBox` built on it. The concurrent specs
-  are stated over every such interleaving.
-- Gap numbers refer to the table in
-  `AUDIT-trust-for-test-migration-2026-10-15.md` (historical internal audit) §7.
-  Gap 0 (a seal that publishes Clean rows) is a prerequisite for every row, so it is listed on each.
+- `Hist` is any linearizable history of calls, from any number of threads, on one
+  `sync::OnceCell` or on a `sync::Lazy` or `race::OnceBox` built on it.
+- `blocking_gaps` numbers are rows of the gap table in
+  `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7. Gap 0 (a seal that publishes Clean
+  rows) blocks every row.
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes (primary tests; secondary in §2)`,
-`difficulty (Rust features the proof must handle)`, `blocking gaps (audit §7)`.
+`subsumes` lists the primary tests (secondary ones are in §2); `difficulty` names the Rust
+features the proof must handle.
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
@@ -59,45 +55,9 @@ unsync-reentrant-init-panics	contract	unsync::OnceCell::{get_or_try_init,get_or_
 cell-debug-eq-clone-shapes	contract	sync::OnceCell::{fmt,eq,clone,clone_from}, unsync::OnceCell::{fmt,eq,clone,clone_from}, sync::Lazy::fmt, unsync::Lazy::fmt, race::OnceBox::{fmt,clone}	∀ cell c: format!("{c:?}") is "OnceCell(Uninit)" when Abs(c) = None, and otherwise the debug_tuple("OnceCell").field(v) rendering of Some v. Lazy's Debug is debug_struct("Lazy") with the fields cell (that cell's Debug) and init (".."), and it never calls init. OnceBox's Debug is "OnceBox({p:?})", where p is null iff Abs = None and is the box's address otherwise. a == b ⇔ Abs(a) == Abs(b). Abs(c.clone()) = Abs(c).cloned(). After d.clone_from(&s), Abs(d) = Abs(s).cloned().	behaviour::debug_and_eq_match_the_upstream_shapes	EASY-MEDIUM, with no closures and no threads: core::fmt Formatter, debug_tuple and debug_struct (String output); the Debug, PartialEq and Clone impls; Debug formatting of a raw pointer; generics bounded on T: Debug, PartialEq or Clone	0,1,3,4,11,12
 ```
 
-### Distribution by kind (8)
-
-| kind | count | ids |
-|---|---|---|
-| refinement | 4 | sync-oncecell-refines-cellmodel, unsync-oncecell-refines-cellmodel, oncebox-refines-cellmodel, lazy-refines-lazymodel |
-| contract | 3 | sync-panic-leaves-cell-empty-and-unpoisoned, unsync-reentrant-init-panics, cell-debug-eq-clone-shapes |
-| invariant (concurrent) | 1 | sync-init-exactly-once-concurrent |
-
-### Blocking-gap histogram (specs blocked by each gap)
-
-| gap | specs | what it is here |
-|---|---|---|
-| 0 | 8 | a seal that publishes Clean rows (prerequisite for all) |
-| 1 | 5 | `Option`/`Result`/`Box`/`String` carriers in clauses |
-| 2 | 6 | certified `&self`/`&mut self` views and the two-state `Abs` before and after a call |
-| 3 | 1 | calls and matches in reflected bodies (the `fmt` impls) |
-| 4 | 5 | composing callee `ensures` (`OnceLock`, `core::cell::OnceCell`, the cell under `Lazy`/`OnceBox`) |
-| 5 | 2 | quantified clauses ("every sequence of operations") |
-| 8 | 5 | `Mutex`, poisoning, unwinding and panic edges |
-| 10 | 1 | binding a `ty_model!` of the gate protocol to the code |
-| 11 | 7 | generic `T`/`F`/`E`: every function in this crate is generic |
-| 12 | 4 | citing contracts from `core`/`std` |
-| 13 | 7 | closures (`FnOnce` higher-order specs) and threads |
-
-No spec is blocked by gap 0 alone. Every operation in the crate is generic and takes or stores a
-closure, so gaps 11 and 13 cover almost everything here.
-
-### Proof dependency order
-
-`unsync-oncecell-refines-cellmodel` and `sync-oncecell-refines-cellmodel` (the sequential
-CellModel) → `oncebox-refines-cellmodel` and `lazy-refines-lazymodel` (by composition) →
-`cell-debug-eq-clone-shapes` (uses Abs from the refinements) → `unsync-reentrant-init-panics` and
-`sync-panic-leaves-cell-empty-and-unpoisoned` (panic edges) → `sync-init-exactly-once-concurrent`
-(the concurrent model).
-
 ## 2. Test → spec map (TSV)
 
-`primary` is the spec that retires the test. `also` lists the other specs the same test samples. The
-tests deleted since have no row.
+`primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 
 ```tsv
 file	test	primary	also
@@ -118,7 +78,7 @@ tests/behaviour.rs	a_panicking_initialiser_leaves_the_cell_usable	sync-panic-lea
 tests/behaviour.rs	sync_once_cell_gate_conformance_and_ungated_negative_control	sync-init-exactly-once-concurrent	sync-oncecell-refines-cellmodel
 ```
 
-## 3. Coverage
+## 3. Tests that are not spec samples
 
 - The first reading covered 23 tests: 15 mapped to one of the 8 specs, and 8 were not spec samples
   (§4). Two spec samples and all 8 non-spec checks have since been deleted, and
@@ -131,14 +91,16 @@ tests/behaviour.rs	sync_once_cell_gate_conformance_and_ungated_negative_control	
 - `sync-oncecell-refines-cellmodel` is the base the other specs rest on. `oncebox-refines-cellmodel`
   and the `sync::Lazy` half of `lazy-refines-lazymodel` are compositions over it.
 
-## 4. Tests that are not spec samples
+## 4. Open findings
 
 None left. `the_unwind_safety_surface_matches_upstream` was deleted after its `rus`/`us`
 assertions moved into a module-level `const _` item, so rustc itself is the proof.
 
 Counts by action: delete 0.
 
-## 5. Implied specs that look wrong, or disagree with the code
+Every function is generic (gap 11) and almost every one takes a closure (gap 13), so Trust's work
+on those two gaps comes first. A monomorphic instance (`T = u32`, a concrete closure) is a
+stepping stone but retires no test.
 
 1. **`Lazy` panic poisoning documented and sampled (resolved 2026-10-27).** Both `sync::Lazy` and
    `unsync::Lazy` document that a panicking initializer poisons the `Lazy`, and

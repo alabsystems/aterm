@@ -5,6 +5,8 @@
 
 use std::collections::HashMap;
 
+use aterm_agent::harness::acts::Act;
+
 use crate::autopilot::AutopilotView;
 use crate::harness_glass::Stamp;
 use crate::harness_screen::{duration_words, local_midnight_ms, share_words};
@@ -91,13 +93,14 @@ impl AbArm {
 /// Published agent phase counted by the A/B book.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum AbPhase {
-    /// `busy`: turn or background work running.
+    /// `busy`: a turn running (a turn over under the agent's own background work publishes its
+    /// rest, `idle` or `question`, [`aterm_phase::background_rest`]).
     Busy,
     /// `prompt`: permission box standing.
     AtBox,
     /// `question`: agent waiting on a user question.
     Asked,
-    /// `idle`: agent sitting at its prompt.
+    /// `idle`: agent sitting at its prompt, its own background work running on or not.
     AtPrompt,
 }
 
@@ -525,6 +528,26 @@ pub(crate) struct AbTask {
     /// first task, a seamless update's successor, a cold restore): every
     /// busy piece the book saw counts.
     from_ms: u64,
+    /// THE LAND CHECK'S TURN IS ATERM'S AUDIT, NOT THE TASK'S WORK (v6 §14.17.13, departure
+    /// 16), however it is interrupted (the post-landing review, 2026-11-01): from where the book
+    /// leaves the task's work out, then the instant `land-check@v1`'s act reached it
+    /// ([`AbBook::act_typed`]). A busy piece begun at or after the first charges nothing; one
+    /// begun before it charges up to it. A box, a question, a dropped phase read or the box's own
+    /// approval inside the check's turn ends nothing ([`Self::audit_ran`]).
+    audit: Option<(u64, u64)>,
+    /// Whether the book read the agent busy in a run begun at or after the check's act reached it:
+    /// that run is the check's own, so the prompt it comes back to ends the audit. A run open when
+    /// the act arrived may be the check's (its fact reaches the book after the agent took the
+    /// turn) or the turn before it read late, so it is left out and ends nothing: the cost is a
+    /// missing cheer, never a false one.
+    audit_ran: bool,
+    /// Whether the last turn aterm opened was the land check: a wall's resume inside it goes on
+    /// with the check's turn, and is the audit again.
+    in_check: bool,
+    /// The busy run in progress while it is the task's work ([`AbClock::is_task_work`]): when it
+    /// began, and the milliseconds of it charged to the task so far, which the check's act takes
+    /// back when it arrives with the run open.
+    run: Option<(u64, u64)>,
 }
 
 impl AbTask {
@@ -534,6 +557,10 @@ impl AbTask {
             land_from: None,
             worked_ms: 0,
             from_ms: 0,
+            audit: None,
+            audit_ran: false,
+            in_check: false,
+            run: None,
         }
     }
 
@@ -554,6 +581,57 @@ impl AbTask {
     fn worked(&mut self, from: u64, to: u64) {
         let ms = to.saturating_sub(from.max(self.from_ms));
         self.worked_ms = self.worked_ms.saturating_add(ms);
+        if let Some((_, charged)) = &mut self.run {
+            *charged = charged.saturating_add(ms);
+        }
+    }
+
+    /// A busy piece `from`..`to` of the task's ([`Self::worked`]), the land check's turn left
+    /// out ([`Self::audit`]).
+    fn worked_past_audit(&mut self, from: u64, to: u64) {
+        match self.audit {
+            Some((audit, arrived)) => {
+                if self.run.is_some_and(|(start, _)| start >= arrived) {
+                    self.audit_ran = true;
+                }
+                if from < audit {
+                    self.worked(from, to.min(audit));
+                }
+            }
+            None => self.worked(from, to),
+        }
+    }
+
+    /// The part of an open busy piece since `from`, read at `now`, the task counts.
+    fn open_work(&self, from: u64, now: u64) -> u64 {
+        let to = match self.audit {
+            Some((audit, _)) if from >= audit => return 0,
+            Some((audit, _)) => now.min(audit),
+            None => now,
+        };
+        to.saturating_sub(from.max(self.from_ms))
+    }
+
+    /// The check's turn opens where its act reached the book at `at_ms`: a busy run open then is
+    /// taken back from the task's work and left out from its start ([`Self::audit_ran`]).
+    fn audit_at(&mut self, at_ms: u64) {
+        let from = match &mut self.run {
+            Some((start, charged)) => {
+                self.worked_ms = self.worked_ms.saturating_sub(*charged);
+                *charged = 0;
+                (*start).min(at_ms)
+            }
+            None => at_ms,
+        };
+        self.audit = Some((from, at_ms));
+        self.audit_ran = false;
+    }
+
+    /// The audit is over: aterm opened another turn, or a task opened.
+    const fn audit_over(&mut self) {
+        self.audit = None;
+        self.audit_ran = false;
+        self.in_check = false;
     }
 }
 
@@ -594,7 +672,7 @@ impl AbBook {
                         self.tasks
                             .entry(*session)
                             .or_insert_with(AbTask::new)
-                            .worked(open.since_ms, at);
+                            .worked_past_audit(open.since_ms, at);
                     }
                     open.since_ms = at;
                 }
@@ -626,7 +704,7 @@ impl AbBook {
                 self.tasks
                     .entry(session)
                     .or_insert_with(AbTask::new)
-                    .worked(open.since_ms, at_ms);
+                    .worked_past_audit(open.since_ms, at_ms);
             }
             let goes_on = phase == Some(open.phase);
             if let Some(calendar) = self.calendar.as_mut() {
@@ -647,18 +725,35 @@ impl AbBook {
                 hold = open.hold;
             }
         }
-        if let Some(phase) = phase {
-            let hold = hold.or_else(|| phase.held().map(|_| (at_ms, arm)));
-            self.clocks.insert(
-                session,
-                AbClock {
-                    phase,
-                    cause,
-                    arm,
-                    since_ms: at_ms,
-                    hold,
-                },
-            );
+        let next = phase.map(|phase| AbClock {
+            phase,
+            cause,
+            arm,
+            since_ms: at_ms,
+            hold: hold.or_else(|| phase.held().map(|_| (at_ms, arm))),
+        });
+        // The busy run the task's work is in, and the check's turn's end: the prompt a run of the
+        // check's own comes back to ([`AbTask::audit_ran`]). A box, a question or a dropped read
+        // ends neither the check's turn nor, where the agent goes busy again, its audit.
+        let was_work = open.is_some_and(|open| open.is_task_work());
+        let is_work = next.is_some_and(|next| next.is_task_work());
+        if let Some(task) = self.tasks.get_mut(&session) {
+            task.run = match (was_work, is_work) {
+                (true, true) => task.run,
+                (false, true) => Some((at_ms, 0)),
+                (_, false) => None,
+            };
+            if phase == Some(AbPhase::AtPrompt) && task.audit_ran {
+                task.audit = None;
+                task.audit_ran = false;
+            }
+        } else if is_work {
+            let mut task = AbTask::new();
+            task.run = Some((at_ms, 0));
+            self.tasks.insert(session, task);
+        }
+        if let Some(next) = next {
+            self.clocks.insert(session, next);
         }
     }
 
@@ -688,10 +783,43 @@ impl AbBook {
             .clocks
             .get(&session)
             .filter(|open| open.is_task_work())
-            .map_or(0, |open| {
-                now_ms.saturating_sub(open.since_ms.max(task.from_ms))
-            });
+            .map_or(0, |open| task.open_work(open.since_ms, now_ms));
         task.worked_ms.saturating_add(open)
+    }
+
+    /// AN ACT ATERM TYPED into `session`, its fact reaching the book at `at_ms`: the land check
+    /// opens its audit ([`AbTask::audit`]); a turn aterm opens past it ends that; a wall's resume
+    /// inside the check's turn goes on with it; a box's or a question's answer is inside a turn
+    /// and moves nothing.
+    pub(crate) fn act_typed(&mut self, session: u64, act: Act, at_ms: u64) {
+        let task = self.tasks.entry(session).or_insert_with(AbTask::new);
+        match act {
+            Act::LandCheck => {
+                task.audit_at(at_ms);
+                task.in_check = true;
+            }
+            Act::Resumed => {
+                if task.in_check && task.audit.is_none() {
+                    task.audit_at(at_ms);
+                }
+            }
+            Act::Continued | Act::Landing | Act::Nudged => task.audit_over(),
+            Act::Approved | Act::Declined | Act::Answered => {}
+        }
+    }
+
+    /// A TURN ATERM OPENED AT THE PROMPT WITH `act` ([`aterm_agent::harness::acts::TakenAct`]),
+    /// past what [`Self::act_typed`] read of the act: a prose answer (`go-ahead@v1` at the check's
+    /// answer, a prose question's, `land-answer@v1` typed) ends the land check's audit as a nudge
+    /// does, where a dialog's keys answer inside the check's turn and end nothing (the second
+    /// review of the post-landing fixes, 2026-11-01). Every other act's place is
+    /// [`Self::act_typed`]'s.
+    pub(crate) fn turn_opened(&mut self, session: u64, act: Act) {
+        if act == Act::Answered
+            && let Some(task) = self.tasks.get_mut(&session)
+        {
+            task.audit_over();
+        }
     }
 
     /// Resets `session`'s task work counter when its task reopens at `at_ms`.
@@ -699,6 +827,10 @@ impl AbBook {
         let task = self.tasks.entry(session).or_insert_with(AbTask::new);
         task.worked_ms = 0;
         task.from_ms = at_ms;
+        task.audit_over();
+        if let Some((_, charged)) = &mut task.run {
+            *charged = 0;
+        }
         if task.lands == Some(true) {
             task.land_from = Some(at_ms);
         }

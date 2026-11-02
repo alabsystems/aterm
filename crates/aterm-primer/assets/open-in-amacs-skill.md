@@ -2,7 +2,7 @@
 name: open-in-amacs
 description: Open a file for the person to fill in, check or change in amacs, aterm's editor (an Editor tab beside this one, the caret on the line that needs them), wait for them or not, and read back what they wrote, instead of printing its path. Use for "fill in", "edit this file", "open it for me", "let me edit", "let me check it", a CSV or TSV, a config (TOML, YAML, JSON, .env), a draft or template the person completes, or a command that needs an $EDITOR (git commit).
 ---
-<!-- aterm skill v2 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
+<!-- aterm skill v3 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
 
 # Open a file for the person in amacs
 
@@ -45,7 +45,7 @@ amacs --no-wait +3:12 config.toml notes.md   # +LINE[:COL] is for the next FILE 
   person does and has no timeout, so run it as a background command.
 - After `--no-wait`, `aterm ctl @self await edit uri=file:///abs/accounts.csv
   timeout=600000` answers `OK edit done result=<finished|closed|aborted> saved=<0|1> seq=<n>`
-  when they are done, or `OK timeout` (exit 124) at its timeout (600 s at most, 30 s without
+  when they are done, or `OK timeout` (exit 124) once its `timeout=` passes (an hour without
   one): run it again. `saved=1`: the file holds their last text; `saved=0`: it does not
   (nothing saved, or typing left unsaved when they closed it), so read the file for what they
   did save.
@@ -70,7 +70,7 @@ amacs --no-wait +3:12 config.toml notes.md   # +LINE[:COL] is for the next FILE 
   (`dirty=1`: typing not saved yet; `cursor=`: where their caret is). A bare `doc ls` lists
   every document an Editor tab shows, each with its exact `uri=`. Name a file as a `file://`
   URI, its path absolute and percent-encoded (`%20` for a space): a bare path answers
-  `ERR bad doc=`.
+  `ERR bad uri=` (`ERR bad doc=` to `doc read`).
 - `aterm ctl @self doc read file:///abs/accounts.csv [lines=A-B]` prints that buffer, unsaved
   typing included, as `<n>:<h6>|<text>` lines ending `-- lines=<total> seq=<s>` (256 KiB a
   read; `next=` says where the next read starts). A document no Editor tab shows answers

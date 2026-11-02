@@ -544,6 +544,7 @@ fn verdict(w: &World, (advice, at_wall): &(Advice, bool), now: i64) -> Verdict {
             ahead,
             rotates,
             takes_canary,
+            yields: None,
         } => Verdict::Move {
             to: w.account(Some(to.as_str())),
             rotates: *rotates,
@@ -754,8 +755,9 @@ fn turn_end(worked: Option<Duration>) -> TurnEndReading {
         said_cut: false,
         opens_cut: false,
         turn_said: None,
+        said_lines: None,
+        turn_lines: None,
         opened_by: None,
-        opened_words: None,
         message_drawn: false,
         submits: None,
         inputs_before: None,
@@ -782,12 +784,15 @@ fn turn_end(worked: Option<Duration>) -> TurnEndReading {
         notice_elsewhere: false,
         reset_clock: None,
         person: None,
+        key: None,
         reach: Default::default(),
+        witness: None,
         program: aterm_phase::Program::Claude,
         seat: Default::default(),
         account: None,
         autopilot: aterm_agent::supervise::Autopilot::Cruise,
         login_label: None,
+        autopilot_by_person: false,
         login_superseded: false,
         login_notice: None,
         login_screen: None,
@@ -1398,6 +1403,7 @@ fn around_an_ask(
             let named = TurnEndReading {
                 account: Some(AccountAdvice::Move {
                     to: (*other).to_string(),
+                    yields: None,
                 }),
                 ..reading.clone()
             };
@@ -3035,12 +3041,14 @@ fn a_real_history_from_an_empty_state_stays_in_step_with_the_model() {
         ahead,
         rotates: true,
         takes_canary: false,
+        yields: None,
     };
     let follow = |to: &str, ahead: bool| Advice::Move {
         to: to.to_string(),
         ahead,
         rotates: false,
         takes_canary: false,
+        yields: None,
     };
 
     h.step("WallD1");
@@ -3089,7 +3097,8 @@ fn a_real_history_from_an_empty_state_stays_in_step_with_the_model() {
         mapped(&h.w, &h.real, &Advice::Probe, place, h.now, clock),
         Some(AccountAdvice::Probe {
             otherwise: Some(Box::new(AccountAdvice::Move {
-                to: "main".to_string()
+                to: "main".to_string(),
+                yields: None,
             })),
         })
     );
@@ -3147,7 +3156,8 @@ fn six_rotations_in_an_hour_are_the_bound_and_the_seventh_wall_is_waited_out() {
                 to: to.to_string(),
                 ahead: false,
                 rotates: true,
-                takes_canary: false
+                takes_canary: false,
+                yields: None,
             },
             "round {round}"
         );
@@ -3208,6 +3218,7 @@ fn a_canary_that_never_answers_is_replaced_by_the_next_session_after_its_hold() 
         ahead: false,
         rotates: false,
         takes_canary: true,
+        yields: None,
     };
     h.step("WallD1");
     h.step("Move1");
@@ -3287,6 +3298,7 @@ fn a_strike_goes_back_to_an_account_that_never_served_as_unproven() {
         ahead: false,
         rotates: false,
         takes_canary,
+        yields: None,
     };
     for served in [false, true] {
         let mut h = InStep::begin(HOUR);
@@ -3312,7 +3324,8 @@ fn a_strike_goes_back_to_an_account_that_never_served_as_unproven() {
                 to: "pool-a".to_string(),
                 ahead: false,
                 rotates: true,
-                takes_canary: false
+                takes_canary: false,
+                yields: None,
             }
         );
         h.step("Move2");
@@ -3609,7 +3622,8 @@ fn the_sessions_own_bounds_part_from_the_model_only_toward_todays_rule() {
     assert_eq!(
         same.reading.account,
         Some(AccountAdvice::Move {
-            to: "pool-a".to_string()
+            to: "pool-a".to_string(),
+            yields: None,
         })
     );
     assert_eq!(c.said(&same), Asked::Today);
@@ -3646,7 +3660,8 @@ fn the_sessions_own_bounds_part_from_the_model_only_toward_todays_rule() {
     assert_eq!(
         fifth.reading.account,
         Some(AccountAdvice::Move {
-            to: "main".to_string()
+            to: "main".to_string(),
+            yields: None,
         })
     );
     assert_eq!(c.said(&fifth), Asked::Today);

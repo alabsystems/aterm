@@ -433,7 +433,8 @@ impl GlDevice {
         let cur = self.enter()?;
         let gl = cur.gl();
         // SAFETY: the context is current; the region is inside the texture and `bytes` covers it
-        // at the stated row length (checked above).
+        // at the stated row length (checked above). The unpack state that makes GL read at that
+        // row length is set for this call and restored.
         unsafe {
             (gl.bind_texture)(ffi::GL_TEXTURE_2D, tex.name);
             (gl.pixel_storei)(ffi::GL_UNPACK_ALIGNMENT, 1);

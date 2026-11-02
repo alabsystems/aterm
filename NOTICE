@@ -288,5 +288,19 @@ and exceptions of Donald E. Knuth's hyphen.tex), embedded unmodified. Its own
 notice, kept in the file, permits copying and distribution with or without
 modification provided the copyright notice and that notice are preserved.
 
+The mail client contains adapted client-authentication code and test vectors from
+Proton AG's proton-srp and proton-rpgp (proton-crypto-rs commit
+c468e282625206eda9b48d539949e6183b1da32a), under the MIT license. Only the client
+protocol and relevant public test fixtures are retained. See
+crates/aterm-mail/src/crypto/LICENSE-Proton-MIT and SOURCE.md.
+
+The mail client's owned password-hashing and encryption implementations include
+adapted source from RustCrypto blowfish 0.9.1 and aes 0.8.4 (MIT OR Apache-2.0),
+and bcrypt 0.17.1 (MIT). The AES fixsliced implementation derives from Alexandre
+Adomnicai's original work. Their notices and licenses are retained under
+crates/aterm-mail/src/crypto/. The fixed-width arithmetic in
+crates/aterm-mail-bigint derives from RustCrypto crypto-bigint 0.5.5 (MIT OR
+Apache-2.0); its license texts and provenance remain beside its source.
+
 The public source snapshot contains no executable binary, no updater payload
 and no managed ALab tool package; PUBLICATION.md describes its boundary.

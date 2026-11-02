@@ -637,10 +637,14 @@ pub fn thin_fat(tools: &dyn Tools, root: &Path, triple: Triple) -> Result<Vec<St
             )));
         }
         let tmp = path.with_extension("atpkg-thin");
-        tools
-            .thin(&path, lipo_arch, &tmp)
-            .map_err(|e| Error::refused(format!("lipo -thin {}: {e}", rel.display())))?;
-        let thin = std::fs::read(&tmp).map_err(|e| Error::io("read the thinned slice", &e))?;
+        tools.thin(&path, lipo_arch, &tmp).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            Error::refused(format!("lipo -thin {}: {e}", rel.display()))
+        })?;
+        let thin = std::fs::read(&tmp).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            Error::io("read the thinned slice", &e)
+        })?;
         let _ = std::fs::remove_file(&tmp);
         std::fs::write(&path, thin)
             .map_err(|e| Error::io(format!("write {}", rel.display()), &e))?;
@@ -1353,10 +1357,12 @@ pub fn parse_args(ctx: &mut Ctx, args: &[String]) -> Result<BundleRequest> {
             "--sysroot" => sysroot = Some(PathBuf::from(value()?)),
             "--src-repo" => src_repo = Some(PathBuf::from(value()?)),
             "--build" => {
+                let v = value()?;
                 req_build = Some(
-                    value()?
-                        .parse()
-                        .map_err(|_| Error::usage("--build takes a decimal build number"))?,
+                    (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                        .then(|| v.parse().ok())
+                        .flatten()
+                        .ok_or_else(|| Error::usage("--build takes a decimal build number"))?,
                 );
             }
             "--version" => version = Some(value()?),
@@ -1402,4 +1408,33 @@ pub fn parse_args(ctx: &mut Ctx, args: &[String]) -> Result<BundleRequest> {
         signing,
         upload,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::host::Hosts;
+    use crate::host::fake::FakeHost;
+
+    #[test]
+    fn parse_args_rejects_plus_prefixed_build() {
+        let hosts = Hosts {
+            staging: Arc::new(FakeHost::default()),
+            channel: Arc::new(FakeHost::default()),
+        };
+        let mut ctx = Ctx::new(Path::new("/tmp/home"), None, None, 1_792_022_400, hosts);
+        let args = [
+            "trust",
+            "--sysroot",
+            "/tmp/sysroot",
+            "--build",
+            "+2026103001",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect::<Vec<_>>();
+        assert!(parse_args(&mut ctx, &args).is_err());
+    }
 }

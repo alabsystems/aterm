@@ -382,6 +382,7 @@ fn every_successful_route_replaces_capture_visuals_instead_of_inheriting_them() 
             invert: true,
             overlay: Some(stale),
         },
+        None,
         &plan,
     );
     let terminal_serial = app.windows[&id].capture_present_serial;
@@ -396,6 +397,7 @@ fn every_successful_route_replaces_capture_visuals_instead_of_inheriting_them() 
         SuccessfulPresentRoute::Heterogeneous,
         crate::VisibleContentRoute::Heterogeneous,
         HostVisualState::default(),
+        None,
         &plan,
     );
     let state = &app.windows[&id];
@@ -451,6 +453,7 @@ fn both_effect_drawing_routes_feed_the_pool_park_latch() {
                 route,
                 visible_route,
                 HostVisualState::default(),
+                None,
                 &plan,
             );
             let state = &app.windows[&id];

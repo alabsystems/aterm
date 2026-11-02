@@ -1,114 +1,60 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-codec: spec recovery from its 67 unit tests
+# aterm-codec: spec recovery from its unit tests
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 19 tests it
-> deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
-> were taken before.
-
-> Audit amendment: The 2026-10-16 code audit corrected the error docs in §5.2/4 and removed render's unused last parameter/dead arm (§5.3); SafeStream::finish retains end-of-input handling. The dated inventory below records the earlier snapshot.
-
-> Status 2026-10-20: `src/crc32.rs` no longer holds a table. `Crc32` wraps astream-wire's
-> `hash::crc32_ieee_update` (compile-time slicing-by-8), and its state is the finished CRC,
-> starting at `0`. `crc32-reference` and `crc32-fold` now state the wrapper against the bitwise CRC
-> by citing a refinement `ensures` on `crc32_ieee_update` that astream-wire DOES NOT HAVE: the
-> function is a plain `pub const fn`. What Trust proves in astream-wire's `hash.rs` is the Level-0
-> obligations (every table index in bounds, the arithmetic; astream's
-> `evidence/verify/trust-wire.md`) and `crc_table_index_in_bounds`, which the fold never calls;
-> astream pins the CRC's value with tests (`wire.hash.crc32-table-equiv`). That contract, and the
-> slice-by-8 table-step lemma it rests on, land in astream first (astream's `docs/ROADMAP.md`,
-> "Functional contracts aterm cites", astream e45b103), so both rows wait on it as well as on the gaps they list.
-> The new test `the_state_is_the_finished_crc_and_the_register_seed_is_wrong` samples
-> `crc32-fold`.
-
-> Status 2026-10-15: this is the crate's migration worklist. Each spec below is proved through
-> Trust/Clean about the compiled Rust function, and then the tests it subsumes are deleted. No test
-> here samples nothing, so nothing is deleted ahead of a proof (§4).
->
-> **Re-measured 2026-10-16 on Trust seal `150efe4a`: `tty-active-class` and `hex-digit-tables` are
-> still blocked; no test is deleted.** Each fn was given a `trust_contract_fn!` contract citing a Clean
-> theorem over `trust_import_aterm_codec__<fn>`, run under `TRUST_E6_DEBUG=1`, then reverted. No
-> import is minted for any of the five fns, so every theorem fails with
-> `Clean island declaration rejected: AutoBoundHeadOverApplied { name: "trust_import_aterm_codec__<fn>", … }`.
-> A scratch probe crate separated the causes:
-> - `tty::is_active`: the FACET gate refuses the `char as u32` cast (`_2=cast`: "validated
->   closed-fragment firewall declined Pure/Total/Deterministic/NoPanic"). Without the cast a `char`
->   compare is admitted, but the citation is refused: "this clause is outside the exact statement
->   fragment: missing supported type for clause variable `c`". `char` is not a clause carrier (gap 1),
->   and the cast is gap 3.
-> - `tty::needs_escape`: "call to `aterm_codec::tty::is_active`, which is not itself structurally
->   certified". It waits on `is_active`.
-> - `hex::digit_lower` / `digit_upper`: `admissible=true` but `recognize=None`. The shape gate does
->   not read a 16-arm literal `switch`, and a `u8 → u8` table of the same shape is refused the same
->   way (gap 3). The `char` result is also no clause carrier (gap 1).
-> - `hex::nibble`: "local _0 has type Adt { name: "core::option::Option", … } outside the v1 scalar
->   fragment" (gap 1). Its `c - b'0'` arms keep checked `Assert`s, which the NoPanic facet refuses
->   even though the range guard makes them safe (gap 3). The new seal does admit and mint a `u8` range
->   `match` that returns `bool`.
-> - Contract predicates that use `as` casts, a `char` literal compare or a Clean-def call
->   (`result == nibble_spec(c)`) are reported "unsupported contract predicate expression".
-
-Source: `crates/aterm-codec` (read only). I read every `#[test]`: `src/base64.rs` 7, `src/crc32.rs` 4,
-`src/fields.rs` 5, `src/hex.rs` 2, `src/inflate.rs` 21, `src/json.rs` 3, `src/pct.rs` 3, `src/tty.rs` 5,
-`tests/base64.rs` 9 and `tests/inflate_stream.rs` 8, which makes 67. `tests/codec_suite.rs` has no
-tests: it only declares `mod base64; mod inflate_stream;`. Its doc comment contains the text
-`#[test]`, which is why a line count gives 68. I also read the code each test reaches, including the
-digit writers in `src/lib.rs` and `src/inflate/stream.rs` (which has no tests of its own). Nothing was
-compiled or run. The claims below come from reading the code.
-
-Result: **37 specs**, covering **all 67 tests**. **0 tests are non-spec samples** (§4).
+Specs recovered from the tests in `crates/aterm-codec` (`src/`, `tests/`). Each §1 row is a property
+of the compiled functions it names; a Trust/Clean proof of it retires the tests it subsumes. §2 maps
+each test to its spec.
 
 ## 0. Notation used in the statements
 
 - `MAX` = `crate::MAX_INPUT_LEN` = 64 MiB.
 - `B64(x)`: the RFC 4648 §4 padded standard-alphabet encoding, as a Lean model
-  `List UInt8 → List UInt8`. Each 3-byte group becomes four 6-bit symbols, MSB first. A 1-byte tail
-  gives `XX==` and a 2-byte tail gives `XXX=`. `|B64(x)| = 4·⌈|x|/3⌉`.
+  `List UInt8 → List UInt8`: each 3-byte group becomes four 6-bit symbols, MSB first; a 1-byte tail
+  gives `XX==` and a 2-byte tail `XXX=`. `|B64(x)| = 4·⌈|x|/3⌉`.
 - `Sym(c)`: the index of `c` in `STANDARD_ALPHABET`, or none (the `STANDARD_DECODE` table).
-- `Bits6(t)`: the concatenation of the 6-bit values of `t`, MSB first. `Pack(t)` is the first
-  `⌊6|t|/8⌋` bytes of `Bits6(t)`, with the leftover low bits discarded.
-- `Lossy(b)`: the Unicode §3.9 / WHATWG maximal-subpart decomposition of a byte string `b`. It is a
-  list of items, each `Char c`, `Bad(bytes)` for a maximal ill-formed subpart (std's
-  `error_len = Some(n)`), or `Cut(bytes)` for a trailing incomplete well-formed prefix
-  (`error_len = None`). It agrees with `std::str::from_utf8`'s `valid_up_to`/`error_len`, and
-  `String::from_utf8_lossy(b)` is its rendering with one U+FFFD per `Bad`/`Cut`.
-- `bitsLSB(x)`: the bit list of `x`, each byte LSB first (DEFLATE order).
-- `RFC1951(x)`: a Clean model of raw DEFLATE decoding over `bitsLSB(x)`, in puff.c semantics, with the
-  same error lattice as `InflateError` (`Truncated`, `BadBlockType`, `BadStoredLength`, `BadSymbol`,
-  `BadDistance`). It returns `Ok(out, nbits)`, where `nbits` counts the bits up to the end of the final
-  block. It includes RFC 1951's completeness rules: the code-length code and the lit/len code are
-  complete, and the distance code is complete, empty, or a single length-1 code.
-  `used(nbits) = ⌈nbits/8⌉`.
-- `Canon(lengths)`: the RFC 1951 §3.2.2 canonical code. Symbol `s` gets code word `Canon(lengths)[s]`
+- `Pack(t)`: the first `⌊6|t|/8⌋` bytes of the 6-bit values of `t` concatenated MSB first, the
+  leftover low bits discarded.
+- `Lossy(b)`: the Unicode §3.9 / WHATWG maximal-subpart decomposition of bytes `b`, a list of
+  `Char c`, `Bad(bytes)` (a maximal ill-formed subpart, std's `error_len = Some(n)`) and `Cut(bytes)`
+  (a trailing incomplete prefix, `error_len = None`). `String::from_utf8_lossy(b)` renders it with one
+  U+FFFD per `Bad`/`Cut`.
+- `bitsLSB(x)`: the bits of `x`, each byte LSB first (DEFLATE order).
+- `RFC1951(x)`: a Clean model of raw DEFLATE decoding over `bitsLSB(x)` in puff.c semantics, with
+  `InflateError`'s errors (`Truncated`, `BadBlockType`, `BadStoredLength`, `BadSymbol`, `BadDistance`)
+  and RFC 1951's completeness rules (the code-length and lit/len codes complete; the distance code
+  complete, empty, or a single length-1 code). It returns `Ok(out, nbits)`, `nbits` the bits through
+  the final block; `used(nbits) = ⌈nbits/8⌉`. The model is not written yet.
+- `Canon(lengths)`: the RFC 1951 §3.2.2 canonical code; symbol `s` gets code word `Canon(lengths)[s]`
   of length `lengths[s]`, MSB first. `Kraft(lengths) = Σ_{l≠0} 2^-l`.
-- `CRC(d)`: CRC-32/ISO-HDLC, defined bitwise with no table: reflected polynomial `0xEDB88320`, init
-  `0xFFFFFFFF`, final xor `0xFFFFFFFF`.
+- `CRC(d)`: CRC-32/ISO-HDLC, defined bitwise: reflected polynomial `0xEDB88320`, init `0xFFFFFFFF`,
+  final xor `0xFFFFFFFF`.
 - `ADLER(d)`: RFC 1950 §8.2. `A = 1 + Σ dᵢ mod 65521`, `B = Σ_k A_k mod 65521`, `ADLER = B<<16 | A`.
 - `ZOK(x, o, n)`: `x[0..2]` is a valid zlib header (CM = 8, `(CMF·256+FLG) % 31 = 0`, FDICT clear),
   `RFC1951(x[2..]) = Ok(o, nb)`, `n = 2 + used(nb) + 4 ≤ |x|`, and `BE32(x[n-4..n]) = ADLER(o)`.
-- `GzMember(m, p)`: `m = H ++ D ++ LE32(CRC(p)) ++ LE32(|p| mod 2^32)`. `H` is an RFC 1952 header that
-  `parse_gzip_header` accepts with length `|H|`, and `D` is raw DEFLATE with `RFC1951(D) = Ok(p, nb)`
-  and `used(nb) = |D|`.
-- `ReadAll(R, src, drip, chunk)`: wrap a source that yields at most `drip` bytes of `src` per read,
-  then call `read` with a buffer of `chunk` bytes until it returns 0 or an error. The result is the
-  concatenation, or the first error.
-- `E(c)`: the `tty::push_escape` spelling of one char (spec `tty-push-escape`). `hex2(b)` is
-  `format!("{b:02x}")`.
-- `JsonRef(s)`: the per-char map `'"'` → `\"`, `'\\'` → `\\`, `\n \r \t \b \f` by name,
-  `is_active(c)` → `\u` plus 4 lowercase hex digits, and every other char unchanged. This is the
-  `#[cfg(test)]` `reference` fn in `src/json.rs`, lifted to a spec-only model.
-- Gap numbers refer to the table in
-  the historical development audit `docs/AUDIT-trust-for-test-migration-2026-10-15.md`
-  §7. **Gap 0 (a seal that publishes Clean rows) blocks every spec and is not repeated in the
-  column.** No spec is blocked by gap 0 alone. The two closest (`tty-active-class`,
-  `hex-digit-tables`) also need gap 3.
+- `GzMember(m, p)`: `m = H ++ D ++ LE32(CRC(p)) ++ LE32(|p| mod 2^32)`, `H` an RFC 1952 header
+  `parse_gzip_header` accepts with length `|H|`, `D` raw DEFLATE with `RFC1951(D) = Ok(p, nb)` and
+  `used(nb) = |D|`.
+- `ReadAll(R, src, drip, chunk)`: over a source yielding at most `drip` bytes of `src` per read, call
+  `read` with a `chunk`-byte buffer until it returns 0 or an error; the result is the concatenation,
+  or the first error.
+- `E(c)`: `tty::push_escape`'s spelling of one char (`tty-push-escape`). `hex2(b)` = `format!("{b:02x}")`.
+- `JsonRef(s)`: the per-char map `'"'` → `\"`, `'\\'` → `\\`, `\n \r \t \b \f` by name, `is_active(c)`
+  → `\u` plus 4 lowercase hex digits, every other char unchanged: the `#[cfg(test)]` `reference` fn in
+  `src/json.rs` as a spec-only model.
+- **Gaps** (`blocking_gaps`) are the gap numbers of `docs/AUDIT-trust-for-test-migration-2026-10-15.md`
+  §7: 1 non-scalar carriers (`char`, slices, `String`, `Option`, structs), 2 `&self`/`&mut self` views,
+  3 E6 body widening (casts, calls, loops, matches), 4 callee-ensures composition, 5 quantified
+  clauses, 7 loops, 8 effects (`as_mut_vec`, `Read` sources), 10 model→code refinement, 11 generics
+  (`R: Read`, the const-generic `block_loop`), 12 cross-crate theorem citation, 13 closures. Gap 0 (a
+  seal that publishes Clean rows) precedes every row and is left out.
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (primary tests; secondary ones are in §2),
-`difficulty` (the Rust features the proof must handle), `blocking_gaps` (audit §7 numbers, gap 0
-implied).
+Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (primary tests; others in §2; `-` or
+"none primary" when no test is primary), `difficulty` (the Rust features the proof must handle),
+`blocking_gaps`.
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
@@ -126,7 +72,7 @@ pct-encode	contract	pct::{encode,encode_into}	∀ s: &str, out: encode_into(out,
 pct-decode-total	contract	pct::decode	∀ s: &str: decode(s) = String::from_utf8_lossy(D(s.bytes())). D scans left to right: at i, if bytes[i] = '%' ∧ i+2 < len ∧ bytes[i+1], bytes[i+2] are ASCII hex digits (either case), emit 16·hi + lo and skip 3; otherwise emit bytes[i] and skip 1. Never panics. Corollaries: a string with no well-formed %XX is returned unchanged, and a stray '%' does not consume the escape that follows it.	src/pct.rs::decode_is_total	while loop over byte indices with an i+2 bound, char::to_digit(16) on a byte-as-char, Vec push, from_utf8_lossy (needs the Lossy model)	1,5,7
 pct-roundtrip	round-trip	pct::{encode,decode}	∀ s: &str: decode(encode(s)) = s. By pct-encode every '%' in encode(s) starts a well-formed uppercase escape and D inverts each token; the bytes are then s's own valid UTF-8, so from_utf8_lossy is the identity.	(none primary; sampled by src/pct.rs::encode_is_the_wires_spelling_and_decode_inverts_it)	composition of the two contracts, String/UTF-8 validity facts	1,4,5,7
 pct-word-line	round-trip	pct::{encode_word,join_words,split_words,decode}	∀ argv of non-empty words w1..wn: split_words(join_words(argv)) = argv. encode_word(w) escapes exactly '%', every char::is_whitespace char and every char::is_control char as uppercase %XX of each UTF-8 byte and keeps every other char, so it holds no whitespace and every '%' in it starts a well-formed escape that decode inverts; join_words joins the encoded words with one ' '. Corollary: a word with no '%', whitespace or control char is its own encoding, so join_words(argv) = argv.join(" ") for an argv of such words.	src/pct.rs::an_argv_line_keeps_every_word_whole	chars loop, encode_utf8, split_whitespace, composition with pct-decode-total	1,3,7
-json-escape-reference	equivalence	json::{escape,escape_into,push_u,utf8_len}	∀ s: &str, out: escape_into(out, s) leaves out' = out ++ JsonRef(s), and escape(s) = JsonRef(s). The fast path copies plain runs and decodes only lead bytes C2/D8/E2; it is correct because every is_active char ≥ 0x80 has one of those leads (C2 for U+0080–009F, D8 for U+061C, E2 for U+200E–2069). push_u's two-byte lowercase hex equals {:04x} because every active char is ≤ 0xFFFF.	src/json.rs::escape_spells_rfc_8259_and_the_active_class, src/json.rs::the_fast_path_is_the_reference	while-let over bytes.get(at) with a char-boundary invariant (start ≤ at, both on boundaries), s.get(a..b) str slicing, chars().next(), c.len_utf8(), &mut String	1,2,5,7; fragment: `json::utf8_len` F1 (VF5 first target, docs/PLAN-tests-to-specs-2026-10-15.md "F1-ready specs").
+json-escape-reference	equivalence	json::{escape,escape_into,push_u,utf8_len}	∀ s: &str, out: escape_into(out, s) leaves out' = out ++ JsonRef(s), and escape(s) = JsonRef(s). The fast path copies plain runs and decodes only lead bytes C2/D8/E2; it is correct because every is_active char ≥ 0x80 has one of those leads (C2 for U+0080–009F, D8 for U+061C, E2 for U+200E–2069). push_u's two-byte lowercase hex equals {:04x} because every active char is ≤ 0xFFFF.	src/json.rs::escape_spells_rfc_8259_and_the_active_class, src/json.rs::the_fast_path_is_the_reference	while-let over bytes.get(at) with a char-boundary invariant (start ≤ at, both on boundaries), s.get(a..b) str slicing, chars().next(), c.len_utf8(), &mut String	1,2,5,7; fragment: `json::utf8_len` F1 (VF5 first target, docs/PLAN-tests-to-specs-2026-10-15.md "F1-ready specs"; proved via mirror: Clean R212 row `json_utf8_len` (row 5, `VF5AtermRows.row_json_utf8_len`); not yet credited: counts once Trust mints calculus rows and the owner's E4.7 ruling grades them).
 json-escape-inert-and-invertible	round-trip	json::escape	∀ s: escape(s) contains no char c with tty::is_active(c), and reading escape(s) as an RFC 8259 string body (a spec-only JSON string decoder) gives back s. A corollary of json-escape-reference: JsonRef emits only non-active chars plus ASCII escapes, and each escape token decodes to its source char.	src/json.rs::the_output_holds_no_active_byte_and_decodes_back	String/char model; needs a Lean JSON-string-body decoder as the reference	1,4,5
 fields-sink-spellings	contract	fields::{TextSink,JsonSink,FlagWords::word,Decimal::write}, fields::FieldSink::{opt_count,opt_decimal,count_pairs}	∀ field sequences F of (key, kind, value): a TextSink::new(h, w) driven by F then finish() = h ++ concat_F (' ' ++ key ++ '=' ++ T(kind, value)), and a JsonSink::new() driven by F then finish() = '{' ++ join_F(',', '"' ++ JsonRef(key) ++ '":' ++ J(kind, value)) ++ '}'. T / J per kind: count n → decimal digits / the same; decimal(v, p) → format!("{v:.p$}") / the same, null when v is not finite; flag b → w's word for b / true|false; label v → pct::encode(v) / '"' ++ JsonRef(v) ++ '"'; absent(t) → t / null; pairs(P, e) → e when P = [], else join(',', K(k) ++ ':' ++ TC(c)) / '{' ++ join(',', '"' ++ JsonRef(k) ++ '":' ++ JC(c)) ++ '}', where K(k) = pct::encode(k) with each ',' written %2C and each ':' %3A, TC(Rec R) = join('/', TC over R's values) and JC(Rec R) is R as an object. opt_count/opt_decimal(Some v) = the plain kind, (None) = absent; count_pairs = pairs of Count cells. Corollary: every text value of a label or a pair key is ASCII-graphic, so one token, and no K(k) holds ',' or ':', so a non-empty text ledger splits on ',' then on the first ':' back into the pairs written, pct::decode recovering each k.	src/fields.rs::each_kind_spells_its_documented_bytes, src/fields.rs::fields_keep_their_call_order, src/fields.rs::the_text_flag_words_are_the_records_choice, src/fields.rs::labels_and_pair_keys_are_escaped_per_syntax, src/fields.rs::a_non_finite_decimal_is_null_in_json	&mut dyn trait dispatch, String push, fmt::Write of u64 and f64 (core float formatting needs a model), recursion over Cell::Rec, mem::take on a bool	1,2,5,7
 tty-active-class	table-property	tty::{is_active,needs_escape}	∀ c: char: is_active(c) ⇔ (c as u32) ∈ [0,0x1F] ∪ [0x7F,0x9F] ∪ {0x061C, 0x200E, 0x200F} ∪ [0x2028,0x202E] ∪ [0x2066,0x2069]. needs_escape(c) ⇔ is_active(c) ∧ c ∉ {'\n','\t'}.	src/tty.rs::the_active_class_is_controls_bidi_and_the_separators	const fn, char as u32 cast, boolean range comparisons, one call (needs_escape → is_active). Straight-line scalar	1,3
@@ -140,12 +86,13 @@ huffman-new-kraft	contract	inflate::Huffman::new	∀ lengths: &[u16]: |lengths| 
 huffman-walk-canonical	contract	inflate::{Huffman::decode_bitwise,fixed_lit,fixed_dist}	∀ h = Huffman::new(lengths) (Ok), ∀ reader states br: decode_bitwise(br) = Ok(s) ⇔ the next lengths[s] stream bits, read MSB first, equal Canon(lengths)[s], and it then consumes exactly lengths[s] bits. No code word prefixing the remaining bits within 15 bits ⇒ Err(BadSymbol); bits running out first ⇒ Err(Truncated). fixed_lit/fixed_dist are Huffman::new of the RFC 1951 §3.2.6 lengths (8/9/7/8 and 30×5), so new never fails there.	(none primary; sampled by the two src/inflate.rs root_table_* tests)	&mut BitReader, i32 canonical-walk loop over count.iter().skip(1), Vec get, Result ?	1,2,5,7
 root-table-agrees-with-walk	equivalence	inflate::{build_root_table,reverse_code,Huffman::{arm_root,decode},block_loop,inflate_block}	∀ h from Huffman::new with left ≥ 0, armed or not, ∀ br: decode(br) = decode_bitwise(br). On Ok both leave br in the same state; on Err both return the same error value, and the reader post-state may differ (unobservable: every caller aborts or restores a checkpoint). Table: build_root_table puts packed (len, sym) in exactly the slots whose low len bits equal reverse(Canon[sym], len) for len ≤ ROOT_BITS, and every other slot is 0; for a complete code with max length ≤ 9 (fixed_lit) no slot is 0. Lifted: inflate/zlib_decompress return the same Result for every input whether or not any block arms its tables, which makes the cfg(test) oracle::without_root_table switch removable.	src/inflate.rs::root_table_resolves_every_fixed_literal_code, src/inflate.rs::root_table_falls_back_for_codes_longer_than_root_bits, src/inflate.rs::table_and_bitwise_decoders_agree_on_corpus_prefixes_and_mutations	Vec<u16> of 512 with stride-filling while-let get_mut, nested enumerate loops, peek_bits/consume_bits on &mut BitReader, const generic bool TABLE in block_loop	1,2,5,7,11
 bitreader-is-bitstream	refinement	inflate::BitReader::{new,refill,read_bit,read_bits,peek_bits,consume_bits,align_to_byte,read_aligned_byte,read_aligned_u16}	Abstraction pos(br) = 8·byte_pos − bits_in_buffer, with Inv: bits_in_buffer ≤ 64, byte_pos ≤ |data|, and bit_buffer's low bits_in_buffer bits = bitsLSB(data)[pos .. pos+bits_in_buffer] with the higher bits zero. Under Inv: read_bits(n ≤ 32) = Ok(v) ⇔ pos+n ≤ 8|data|, and then v = Σ_{i<n} bitsLSB(data)[pos+i] << i and pos' = pos+n; otherwise Err(Truncated). read_bit is n = 1. peek_bits(w) returns (the low min(w, available) bits, avail) without moving pos. consume_bits(k ≤ avail) advances pos by k. align_to_byte rounds pos up to a multiple of 8. read_aligned_byte/u16 read whole little-endian bytes at an aligned pos. Every op preserves Inv.	-	&mut self struct with a u64 accumulator, wrapping_shl/shr under bounds, refill while-loop, saturating ops; an abstraction function over a borrowed slice	1,2,5,7
-inflate-refines-rfc1951	refinement	inflate::{inflate,inflate_prefix,inflate_stored,inflate_block,block_loop,read_dynamic_tables}	∀ x, max_output = usize::MAX: RFC1951(x) = Ok(o, nb) ⇒ inflate_prefix(x, MAX) = Ok((o, used(nb))); RFC1951(x) = Err(e) ⇒ inflate_prefix(x, MAX) = Err(e); inflate = inflate_prefix(..).0. Composes bitreader-is-bitstream, huffman-walk-canonical and root-table-agrees-with-walk. Back-references copy out[cur−d+i] byte by byte, and the extend_from_within fast path equals that when d ≥ length. The python-zlib known-answer vectors (empty, fixed literals, stored, fixed backrefs, dynamic, raw) are instances.	src/inflate.rs::reference_vectors_decode, src/inflate.rs::every_strict_prefix_of_a_raw_stream_is_truncated	Vec<u8> push/extend_from_within/reserve, nested loops (block loop, repeat loops), Option<(Huffman,Huffman)> get_or_insert_with closure, &mut Huffman, match on btype; a Lean RFC 1951 model as the reference	1,2,4,5,7,10,13
+inflate-refines-rfc1951	refinement	inflate::{inflate,inflate_prefix,inflate_stored,inflate_block,block_loop,read_dynamic_tables}	∀ x, max_output = usize::MAX: RFC1951(x) = Ok(o, nb) ⇒ inflate_prefix(x, MAX) = Ok((o, used(nb))); RFC1951(x) = Err(e) ⇒ inflate_prefix(x, MAX) = Err(e); inflate = inflate_prefix(..).0. Composes bitreader-is-bitstream, huffman-walk-canonical and root-table-agrees-with-walk. Back-references copy out[cur−d+i] byte by byte, and the extend_from_within fast path equals that when d ≥ length. The python-zlib known-answer vectors (empty, fixed literals, stored, fixed backrefs, dynamic, raw) are instances.	src/inflate.rs::reference_vectors_decode, src/inflate.rs::every_strict_prefix_of_a_raw_stream_is_truncated	Vec<u8> push/extend_from_within/reserve, nested loops (block loop, repeat loops), the process-wide fixed pair (fixed_tables, a OnceLock), &mut Huffman, match on btype; a Lean RFC 1951 model as the reference	1,2,4,5,7,10,13
+inflate-header-work	contract	inflate::{fixed_tables,inflate_prefix,HEADER_WORK,DYNAMIC_HEADER_WORK}, inflate::stream::{Inflater::pump,ZlibReader::with_work_budget}	(a) A fixed block builds no table: every BTYPE=01 block, one-shot or streamed, decodes with the one pair fixed_tables builds once per process. (b) Let W(x) be the cost of the block headers of x's DEFLATE data in order, HEADER_WORK per stored or fixed one and DYNAMIC_HEADER_WORK per dynamic one, up to the first that fails or the final one. ∀ x, b, drip ≥ 1, chunk ≥ 1: W(x) ≤ b ⇒ ReadAll(ZlibReader::with_work_budget(x, b), x, drip, chunk) = ReadAll(ZlibReader::new(x), x, drip, chunk); W(x) > b ⇒ the read ends in InvalidData(TooMuchWork) at the first header whose cost exceeds what is left, before that header's tables are built, so at most ⌊b/DYNAMIC_HEADER_WORK⌋ dynamic headers build tables. A header the input cuts short is charged once, when it is read whole. ZlibReader::new is with_work_budget(x, u64::MAX).	src/inflate.rs::a_work_budget_refuses_block_headers_past_it_before_building_their_tables, src/inflate.rs::fixed_blocks_decode_with_one_pair_of_tables	a u64 budget threaded through the pump's &mut destructure, checked_sub before a call that may return Truncated and be retried, OnceLock, io::Error source downcast; the table-build count is the test-only oracle counter	1,2,4,5,7,8,11
 inflate-dynamic-table-completeness	contract	inflate::read_dynamic_tables	∀ br: read_dynamic_tables(br) = Ok((lit, dist)) ⇒ hlit ≤ 286 ∧ hdist ≤ 30, the code-length code is complete (left = 0), the lit/len code is complete (Kraft = 1), the dist code is complete, empty, or a single length-1 code, the repeat codes 16/17/18 never write past hlit+hdist, and 16 never comes first. Any violation ⇒ Err(BadSymbol) (or Truncated if the bits run out first). Corollary: a stream whose lit/len code is incomplete is refused even when its Adler-32 matches.	src/inflate.rs::incomplete_dynamic_huffman_rejected	[u16;19] and Vec<u16> length arrays, while loop with inner repeat for-loops, split_at, calls to Huffman::new	1,2,4,7
 inflate-output-cap	contract	inflate::{inflate,inflate_prefix,zlib_decompress,zlib_decompress_prefix}	∀ x, m: inflate(x, m) = Ok(o) ⇒ |o| ≤ m. inflate(x, m) = Ok(o) ⇔ inflate(x, usize::MAX) = Ok(o) ∧ |o| ≤ m, so the cap only turns an over-long decode into an error and never changes accepted output. inflate(x, m) = Err(OutputTooLarge) ⇒ ¬(inflate(x, MAX) = Ok(o) ∧ |o| ≤ m). The same three facts hold for zlib_decompress and zlib_decompress_prefix.	src/inflate.rs::output_cap_rejects_bomb	invariant out.len() ≤ max_output across loops; saturating_add guards; Vec length reasoning	1,4,5,7
 inflate-prefix-locality	contract	inflate::inflate_prefix	∀ a, m with inflate_prefix(a, m) = Ok((o, u)): u ≤ |a|, and ∀ a' with a'[..u] = a[..u]: inflate_prefix(a', m) = Ok((o, u)). The decoder reads no bit beyond the final block: refill's look-ahead is undone in the `used` computation, and a partly consumed last byte counts.	(none primary; sampled by src/inflate.rs::prefix_form_tolerates_bytes_after_the_stream)	reasoning that BitReader observations depend only on data[..⌈pos/8⌉] (look-ahead bytes never decide a result: peek's len ≤ avail check), loops	1,5,7
 zlib-framing	contract	inflate::{zlib_decompress,zlib_decompress_prefix,check_zlib_header}	∀ x (cap as in inflate-output-cap; shown with m = MAX): zlib_decompress_prefix(x) = Ok((o, n)) ⇔ ZOK(x, o, n). zlib_decompress(x) = Ok(o) ⇔ ZOK(x, o, |x|), so the checksum must sit exactly where the stream ends; hence zlib_decompress(x) = Ok(o) ⇔ zlib_decompress_prefix(x) = Ok((o, |x|)). With inflate-prefix-locality, ZOK(s, o, |s|) ⇒ ∀ p: zlib_decompress_prefix(s ++ p) = Ok((o, |s|)), and for p ≠ [] zlib_decompress(s ++ p) = Err. Errors: |x| < 6 ⇒ Truncated; a bad CM, FCHECK or FDICT ⇒ BadZlibHeader; an Adler-32 mismatch ⇒ BadChecksum; in the whole-buffer form a stream that ends before the last 4 bytes ⇒ BadChecksum; in the prefix form a trailer that runs past the end ⇒ Truncated.	src/inflate.rs::prefix_form_tolerates_bytes_after_the_stream, src/inflate.rs::whole_buffer_form_reads_the_checksum_where_the_stream_ends, src/inflate.rs::prefix_form_still_checks_the_adler_and_the_length, src/inflate.rs::bad_zlib_header_rejected	slice indexing after length guards, u16 header arithmetic mod 31, from_be_bytes, composition with the inflate_prefix and adler32 contracts	1,4,5
-stream-deflate-refines-oneshot	equivalence	inflate::stream::{DeflateReader::{new,read,advance,refill},Inflater::{pump,compact},decode_one,take_pending}	∀ body, drip ≥ 1, chunk ≥ 1: ReadAll(DeflateReader, body, drip, chunk) = Ok(o) ⇔ inflate(body, usize::MAX) = Ok(o). An Err from inflate maps through io_err (Truncated → UnexpectedEof, else InvalidData(e)). Bytes after the final block are never consumed. Lemmas: (1) each pump unit either completes or returns NeedInput with the Inflater unchanged; (2) compact preserves the observable state (≥ WINDOW bytes of history kept, distance ≤ 32768 checked against `produced`); (3) every byte reaches the caller exactly once and in order through take_pending.	tests/inflate_stream.rs::every_read_and_refill_granularity_matches_the_one_shot	generic R: Read (trait, io::Result, Interrupted retry loop), enum Phase with Box<Huffman> fields matched by &mut, closures returning Result, Vec drain/extend, u64 counters, a bisimulation between two drivers	1,2,4,5,7,8,11,13
+stream-deflate-refines-oneshot	equivalence	inflate::stream::{DeflateReader::{new,read,advance,refill},Inflater::{pump,compact},decode_one,take_pending}	∀ body, drip ≥ 1, chunk ≥ 1: ReadAll(DeflateReader, body, drip, chunk) = Ok(o) ⇔ inflate(body, usize::MAX) = Ok(o). An Err from inflate maps through io_err (Truncated → UnexpectedEof, else InvalidData(e)). Bytes after the final block are never consumed. Lemmas: (1) each pump unit either completes or returns NeedInput with the Inflater unchanged; (2) compact preserves the observable state (≥ WINDOW bytes of history kept, distance ≤ 32768 checked against `produced`); (3) every byte reaches the caller exactly once and in order through take_pending.	tests/inflate_stream.rs::every_read_and_refill_granularity_matches_the_one_shot	generic R: Read (trait, io::Result, Interrupted retry loop), enum Phase holding Tables::{Fixed, Dynamic { Box<Huffman> × 2 }} matched by &mut, closures returning Result, Vec drain/extend, u64 counters, a bisimulation between two drivers	1,2,4,5,7,8,11,13
 stream-zlib-refines-prefix	equivalence	inflate::stream::{ZlibReader::read,DeflateReader::fill_to}, inflate::{check_zlib_header,Adler32}	∀ x, drip ≥ 1, chunk ≥ 1: ReadAll(ZlibReader, x, drip, chunk) = Ok(o) ⇔ ∃ n: zlib_decompress_prefix(x, usize::MAX) = Ok((o, n)). Bytes after x[..n] are never read, so ReadAll on x ++ p equals ReadAll on x. read returns Ok(0) only after the Adler-32 matched. A truncated x or a spoiled header, body or trailer gives Err.	tests/inflate_stream.rs::zlib_streams_like_the_one_shot_prefix_form	state enum ZlibState, generic R: Read, running Adler32 over output pieces (the adler32-reference fold), cursor surgery (cursor.pos = 2)	1,2,4,5,7,8,11
 gzip-header-parse	contract	inflate::stream::parse_gzip_header	∀ buf: parse_gzip_header(buf) = Ok(Some(n)) ⇔ buf[0..2] = 1F 8B ∧ buf[2] = 8 ∧ FLG & 0xE0 = 0 and buf[..n] is the RFC 1952 header: 10 fixed bytes, then (FEXTRA ? 2+XLEN bytes), (FNAME ? NUL-terminated), (FCOMMENT ? NUL-terminated), (FHCRC ? 2 bytes equal to CRC(buf[..n−2]) & 0xFFFF), with n ≤ MAX_GZIP_HEADER. Ok(None) ⇔ buf is a proper prefix of such a header that could still complete within the limit. Err otherwise (bad magic or method, a reserved bit, an FHCRC mismatch, too long). Monotone: Ok(Some(n)) on buf ⇒ Ok(Some(n)) on buf ++ more.	tests/inflate_stream.rs::optional_header_fields_are_skipped_and_reserved_bits_refused, tests/inflate_stream.rs::a_wrong_header_checksum_is_refused	slice get chains, iter().position, loop over a [bool;2], saturating usize, a Crc32::of call, io::Error construction	1,4,5,7,8
 gzip-reader-refines-members	equivalence	inflate::stream::GzipReader::{new,read,begin_body,end_body,verify_trailer,read_source,read_source_into_frame}	∀ x, drip ≥ 1, chunk ≥ 1: ReadAll(GzipReader, x, drip, chunk) = Ok(o) ⇔ ∃ k ≥ 1, members m1..mk, payloads p1..pk with x = m1 ++ … ++ mk, ∀ i GzMember(mi, pi), and o = p1 ++ … ++ pk. Otherwise Err (empty x, truncated x, a trailing non-member, a CRC or ISIZE mismatch, a bad header, bad DEFLATE). Corollaries: every proper prefix of a one-member stream is refused; a one-bit flip of a valid member is refused or yields the same payload (CRC-32 detects every single-bit error).	tests/inflate_stream.rs::concatenated_members_are_one_stream, tests/inflate_stream.rs::truncated_and_corrupted_gzip_is_refused, tests/inflate_stream.rs::a_wrong_trailer_is_refused	generic R: Read, GzState machine, mem::take buffer hand-off between frame and inflater, split_off/drain, Crc32 fold over delivered pieces, u64 member length mod 2^32	1,2,4,5,7,8,11
@@ -153,11 +100,11 @@ cell-style-parse	contract	cell::{parse_style,Attribute::{word,parse},attributes_
 xml-escape	contract	xml::{escape,escape_into}	∀ text, out: escape_into(out, text) leaves out' = out ++ concat_{c ∈ text.chars()} X(c), where X('&') = "&amp;", X('<') = "&lt;", X('>') = "&gt;", X('"') = "&quot;", X('\'') = "&apos;", and X(c) = [c] otherwise; escape(text) = escape_into("", text).	src/xml.rs::escaping_covers_the_five_entities	&mut String push_str/push, text.chars() loop, 6-arm char match	1,2,5,7
 ```
 
-### Distribution by kind (39)
+### Distribution by kind (40)
 
 | kind | count | ids |
 |---|---|---|
-| contract | 19 | b64-encode-padded, b64-strict-canonical, b64-lenient-decode, hex-validate, hex-decode, pct-encode, pct-decode-total, fields-sink-spellings, tty-push-escape, tty-safe, huffman-new-kraft, huffman-walk-canonical, inflate-dynamic-table-completeness, inflate-output-cap, inflate-prefix-locality, zlib-framing, gzip-header-parse, cell-style-parse, xml-escape |
+| contract | 20 | b64-encode-padded, b64-strict-canonical, b64-lenient-decode, hex-validate, hex-decode, pct-encode, pct-decode-total, fields-sink-spellings, tty-push-escape, tty-safe, huffman-new-kraft, huffman-walk-canonical, inflate-header-work, inflate-dynamic-table-completeness, inflate-output-cap, inflate-prefix-locality, zlib-framing, gzip-header-parse, cell-style-parse, xml-escape |
 | equivalence | 10 | fmt-digit-writers, hex-encode, json-escape-reference, tty-stream-split-invariance, crc32-reference, adler32-reference, root-table-agrees-with-walk, stream-deflate-refines-oneshot, stream-zlib-refines-prefix, gzip-reader-refines-members |
 | round-trip | 4 | b64-roundtrip, pct-roundtrip, pct-word-line, json-escape-inert-and-invertible |
 | refinement | 2 | bitreader-is-bitstream, inflate-refines-rfc1951 |
@@ -169,16 +116,16 @@ xml-escape	contract	xml::{escape,escape_into}	∀ text, out: escape_into(out, te
 
 | gap | specs | note |
 |---|---|---|
-| 0 | 39 | every spec (seal) |
-| 1 | 39 | every spec |
-| 2 | 22 | |
+| 0 | 40 | every spec (seal) |
+| 1 | 40 | every spec |
+| 2 | 23 | |
 | 3 | 10 | with 0 and 1, the only gaps on the two scalar specs |
-| 4 | 13 | |
-| 5 | 31 | |
-| 7 | 33 | |
-| 8 | 6 | `as_mut_vec`, `Read` sources |
+| 4 | 14 | |
+| 5 | 32 | |
+| 7 | 34 | |
+| 8 | 7 | `as_mut_vec`, `Read` sources |
 | 10 | 1 | `inflate-refines-rfc1951` |
-| 11 | 5 | generic `R: Read`, const-generic `block_loop` |
+| 11 | 6 | generic `R: Read`, const-generic `block_loop` |
 | 12 | 2 | `crc32-reference`, `crc32-fold`: citing astream-wire's contract |
 | 13 | 2 | closures (`get_or_insert_with`, pump closures) |
 
@@ -216,6 +163,8 @@ src/inflate.rs	table_and_bitwise_decoders_agree_on_corpus_prefixes_and_mutations
 src/inflate.rs	fuzz_never_panics_and_respects_cap	codec-no-panic	inflate-output-cap
 src/inflate.rs	reference_vectors_decode	inflate-refines-rfc1951	zlib-framing
 src/inflate.rs	every_strict_prefix_of_a_raw_stream_is_truncated	inflate-refines-rfc1951	bitreader-is-bitstream
+src/inflate.rs	fixed_blocks_decode_with_one_pair_of_tables	inflate-header-work	stream-deflate-refines-oneshot, gzip-reader-refines-members
+src/inflate.rs	a_work_budget_refuses_block_headers_past_it_before_building_their_tables	inflate-header-work	stream-zlib-refines-prefix
 src/json.rs	escape_spells_rfc_8259_and_the_active_class	json-escape-reference	tty-active-class
 src/json.rs	the_fast_path_is_the_reference	json-escape-reference	
 src/json.rs	the_output_holds_no_active_byte_and_decodes_back	json-escape-inert-and-invertible	
@@ -247,32 +196,21 @@ tests/inflate_stream.rs	zlib_streams_like_the_one_shot_prefix_form	stream-zlib-r
 
 ## 3. Coverage
 
-- 67 tests read; all 67 map to one of the 37 specs as primary. None is a non-spec sample (§4).
-- The biggest collapses: `inflate-refines-rfc1951` (6 primary), `b64-encode-padded` (5),
-  `b64-lenient-decode` (5), `zlib-framing` (5), `gzip-reader-refines-members` (3), `root-table-agrees-with-walk` (3),
-  `b64-roundtrip` (3), `codec-no-panic` (3).
-- Five specs have no primary test. They are lemmas the others are built on: `hex-digit-tables`,
-  `hex-validate`, `pct-roundtrip`, `huffman-walk-canonical` and `inflate-prefix-locality`. Each is
-  sampled as a secondary in §2, and proving it is what makes the primary spec cheap.
-- `inflate-refines-rfc1951` needs a Clean RFC 1951 model, which does not exist yet. With it, the
-  inflate specs `inflate-output-cap`, `zlib-framing` and the three stream refinements become
-  compositions.
+`hex-digit-tables`, `hex-validate`, `pct-roundtrip`, `huffman-walk-canonical` and
+`inflate-prefix-locality` are lemmas under other specs. They, `b64-lenient-decode` and
+`adler32-reference` are sampled only under `also` in §2; `fmt-digit-writers`, `bitreader-is-bitstream`
+and `inflate-refines-rfc1951` by no test.
 
 ## 4. Tests that are not spec samples
 
-None. Every test samples a general property. Counts by action: **delete 0, become a spec 0, keep 0**.
-
-The migration still deletes test-only **scaffolding** together with the tests that use it, once the
-spec that replaces it is Certified:
-
-| scaffolding | where | deleted with |
-|---|---|---|
-| `oracle::without_root_table` switch | `crates/aterm-codec/src/inflate.rs` (the `#[cfg(test)]` hook in the block decoder) | `root-table-agrees-with-walk` |
-| the `reference` escape fn | `crates/aterm-codec/src/json.rs` `#[cfg(test)]` | `json-escape-reference` (it becomes the spec-only `JsonRef` model) |
+None. Three pieces of `#[cfg(test)]` scaffolding go once their spec is proved: the
+`oracle::without_root_table` switch in `src/inflate.rs` with `root-table-agrees-with-walk`, its
+`oracle::{note_table_built, tables_built}` counter with `inflate-header-work`, and the `reference`
+escape fn in `src/json.rs` with `json-escape-reference` (it becomes the `JsonRef` model).
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
-1. **Test count reconciled (resolved).** The header and §3 record 67 `#[test]` fns (`tests/codec_suite.rs`
+1. **Test count reconciled (resolved).** The crate has 57 `#[test]` fns (`tests/codec_suite.rs`
    only declares `mod base64; mod inflate_stream;`).
 2. **`Huffman::decode` doc narrowed and error post-state noted (resolved).** `Huffman::decode`'s doc is
    now `"Decode one symbol."`, and `root-table-agrees-with-walk` explicitly allows the `BitReader`
@@ -284,35 +222,24 @@ spec that replaces it is Certified:
 
 ## 6. Proof order (easiest high-value first)
 
-No spec is blocked by gap 0 alone. The cheapest are the two blocked by gap 0 plus gap 3, which are
-scalar `const fn`s. They are the natural first E6 widening increments (casts, `&`, literal/range
-`match`, one call).
-
-1. **`tty-active-class`** (gaps 1, 3; re-measured 2026-10-16, see the status note). `is_active` is a straight-line `char as u32` range test, and
-   `needs_escape` adds one call. It retires one test and is the class every `tty`/`json` spec cites.
-2. **`hex-digit-tables`** (gaps 1, 3; re-measured 2026-10-16, see the status note). `digit_lower`/`digit_upper` are a 16-arm literal `match` on
-   `n & 0xF`, and `nibble` is a 256-case range `match`. These are decidable by evaluation. This spec is
-   the lemma under `hex-encode`, `hex-validate` and `hex-decode`.
-3. **Pure-arithmetic cores as Clean theorems first**, bound to code later: the Adler-32 NMAX non-wrap
-   bound, a closed Lean fact that needs no carrier. It becomes `adler32-reference` once gaps 1/2/7
-   land. (The CRC table-step lemma left with the table, 2026-10-20. Nothing proves it yet: it is
-   the lemma under the refinement contract astream-wire has to land on `crc32_ieee_update`.)
-4. **The first carrier-and-loop specs** (gaps 1, 2, 5, 7), in this order: `hex-validate`,
-   `hex-encode`, `pct-encode`, `hex-decode`. Each is one byte loop that appends to a `String`.
-   They are the smallest instances of the gap-1/gap-7 work and retire 3 tests between them.
-   `crc32-fold` and `crc32-reference` left this list on 2026-10-20: their loop is astream-wire's
-   now, so they wait on its refinement contract (astream first) and on gap 12 to cite it, and then
-   retire 3 tests.
-5. **base64**: `b64-encode-padded` (also gap 8 for `as_mut_vec`), `b64-lenient-decode`,
-   `b64-strict-canonical`, then `b64-roundtrip` as a gap-4 composition, and `fmt-digit-writers`. Together
-   they retire 16 tests.
-6. **Text escaping** (this needs the `Lossy` model): `tty-push-escape`, `pct-decode-total`,
-   `pct-roundtrip`, `json-escape-reference`, `json-escape-inert-and-invertible`, `tty-safe`, and
+1. `tty-active-class` (gaps 1, 3): `is_active` is a straight-line `char as u32` range test and
+   `needs_escape` adds one call. It needs `char` as a clause carrier (gap 1) and the cast (gap 3);
+   every `tty`/`json` spec cites the class.
+2. `hex-digit-tables` (1, 3): a 16-arm literal `match` on `n & 0xF` and the range `match` of `nibble`,
+   decidable by evaluation; the lemma under `hex-encode`, `hex-validate` and `hex-decode`.
+3. The Adler-32 `NMAX` non-wrap bound as a closed Clean theorem, bound to `adler32-reference` once gaps
+   1, 2 and 7 land.
+4. One byte loop appending to a `String` each: `hex-validate`, `hex-encode`, `pct-encode`, `hex-decode`.
+5. base64: `b64-encode-padded` (gap 8 for `as_mut_vec`), `b64-lenient-decode`, `b64-strict-canonical`,
+   then `b64-roundtrip` (gap 4) and `fmt-digit-writers`.
+6. Text escaping, on the `Lossy` model: `tty-push-escape`, `pct-decode-total`, `pct-roundtrip`,
+   `json-escape-reference`, `json-escape-inert-and-invertible`, `tty-safe`,
    `tty-stream-split-invariance`.
-7. **DEFLATE core**: `bitreader-is-bitstream` → `huffman-new-kraft` → `huffman-walk-canonical` →
-   `root-table-agrees-with-walk` (gap 11) → `inflate-dynamic-table-completeness` → the RFC 1951 Clean
-   model and `inflate-refines-rfc1951` (gaps 10, 13) → `inflate-output-cap`, `inflate-prefix-locality`
-   → `zlib-framing`. `codec-no-panic` comes free once the strict lane discharges panic-freedom.
-8. **Streams last** (gaps 8, 11, 13: `R: Read`, closures): `gzip-header-parse`,
-   `stream-deflate-refines-oneshot`, `stream-zlib-refines-prefix`, `gzip-reader-refines-members`.
-   Factor each reader's pure step out of the `Read` shell first (plan step 4).
+7. DEFLATE: `bitreader-is-bitstream` → `huffman-new-kraft` → `huffman-walk-canonical` →
+   `root-table-agrees-with-walk` → `inflate-dynamic-table-completeness` → the `RFC1951` model and
+   `inflate-refines-rfc1951` → `inflate-output-cap`, `inflate-prefix-locality` → `zlib-framing`.
+   `inflate-header-work` follows the streams (8).
+   `codec-no-panic` follows from the strict lane's panic-freedom obligations.
+8. Streams last (gaps 8, 11, 13): `gzip-header-parse`, `stream-deflate-refines-oneshot`,
+   `stream-zlib-refines-prefix`, `gzip-reader-refines-members`, each reader's pure step factored out of
+   its `Read` shell first.

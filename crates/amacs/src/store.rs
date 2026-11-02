@@ -34,6 +34,34 @@ pub struct DocumentSnapshot {
     pub text: Arc<str>,
 }
 
+/// A read-only directory projection. Entry ranges refer to the displayed text;
+/// navigation uses the exact URI, never a displayed (possibly escaped) filename.
+#[derive(Clone, Debug)]
+pub struct DirectoryListing {
+    pub text: String,
+    pub parent: Option<String>,
+    pub entries: Vec<(Range<usize>, String)>,
+}
+
+impl DirectoryListing {
+    /// The exact navigation target on the line containing `point`.
+    pub fn target_at(&self, point: usize) -> Option<&str> {
+        self.entries
+            .iter()
+            .find(|(range, _)| range.contains(&point))
+            .map(|(_, uri)| uri.as_str())
+    }
+
+    /// Keep point on a surviving entry after refresh, otherwise use the first entry.
+    pub fn point_for(&self, target: Option<&str>) -> usize {
+        self.entries
+            .iter()
+            .find(|(_, uri)| Some(uri.as_str()) == target)
+            .or_else(|| self.entries.first())
+            .map_or(0, |(range, _)| range.start)
+    }
+}
+
 /// One half-open UTF-8 byte edit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TextEdit {
@@ -72,6 +100,7 @@ pub struct EditDelta {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DocumentError {
     UnknownDocument,
+    ReadOnly,
     UnknownView,
     Closing,
     InvalidRange,
@@ -97,6 +126,7 @@ pub enum DocumentCloseReadiness {
 
 #[derive(Clone, Debug)]
 struct Document {
+    directory: Option<DirectoryListing>,
     id: DocumentId,
     canonical_uri: String,
     surface: Surface,
@@ -188,6 +218,7 @@ impl DocumentStore {
         let head = surface.seq();
         let text_rope = crate::text::TextRope::from(projection.as_ref());
         let document = Document {
+            directory: None,
             id,
             canonical_uri: canonical_uri.clone(),
             surface,
@@ -210,6 +241,54 @@ impl DocumentStore {
 
     pub fn canonical_uri(&self, id: DocumentId) -> Option<&str> {
         self.documents.get(&id).map(|d| d.canonical_uri.as_str())
+    }
+
+    pub fn directory(&self, id: DocumentId) -> Option<&DirectoryListing> {
+        self.documents.get(&id)?.directory.as_ref()
+    }
+
+    /// Replace a generated listing without making it a user edit or a dirty buffer.
+    pub fn set_directory(
+        &mut self,
+        id: DocumentId,
+        listing: DirectoryListing,
+    ) -> Result<(), DocumentError> {
+        let document = self
+            .documents
+            .get_mut(&id)
+            .ok_or(DocumentError::UnknownDocument)?;
+        if !matches!(
+            document.phase,
+            DocumentPhase::Active | DocumentPhase::Suspended
+        ) {
+            return Err(DocumentError::Closing);
+        }
+        if document.projection.as_ref() == listing.text {
+            document.directory = Some(listing);
+            document.checkpoint_seq = document.head();
+            return Ok(());
+        }
+        let previous = document.directory.take();
+        let base = document.head();
+        let result = self.replace_text(id, base, &listing.text);
+        let document = self
+            .documents
+            .get_mut(&id)
+            .ok_or(DocumentError::UnknownDocument)?;
+        match result {
+            DocumentTxnOutcome::Committed { .. } => {
+                document.checkpoint_seq = document.head();
+                document.directory = Some(listing);
+                Ok(())
+            }
+            DocumentTxnOutcome::Rejected(error) => {
+                document.directory = previous;
+                Err(error)
+            }
+            DocumentTxnOutcome::Conflict { .. } => {
+                unreachable!("exclusive store borrow preserves sequence")
+            }
+        }
     }
 
     /// Roll back a failed host initialization before any view attaches.
@@ -286,7 +365,8 @@ impl DocumentStore {
         Ok(())
     }
 
-    #[cfg(any(test, debug_assertions))]
+    /// The number of attached views, including in release builds where hosts use it
+    /// to discard work whose last view has closed.
     pub fn view_count(&self, id: DocumentId) -> Option<usize> {
         self.documents.get(&id).map(|d| d.views.len())
     }
@@ -321,6 +401,9 @@ impl DocumentStore {
         let Some(document) = self.documents.get_mut(&id) else {
             return DocumentTxnOutcome::Rejected(DocumentError::UnknownDocument);
         };
+        if document.directory.is_some() {
+            return DocumentTxnOutcome::Rejected(DocumentError::ReadOnly);
+        }
         if !matches!(
             document.phase,
             DocumentPhase::Active | DocumentPhase::Suspended
@@ -543,11 +626,8 @@ impl DocumentStore {
         id: DocumentId,
         closing: &[DocumentViewId],
     ) -> Result<(), DocumentError> {
-        match self.prepare_close(id, closing)? {
-            DocumentCloseReadiness::Ready { .. } => {}
-            DocumentCloseReadiness::Pending { .. } | DocumentCloseReadiness::Blocked { .. } => {
-                return Err(DocumentError::CloseNotReady);
-            }
+        if !self.close_ready(id, closing)? {
+            return Err(DocumentError::CloseNotReady);
         }
         let document = self
             .documents
@@ -586,16 +666,22 @@ impl DocumentStore {
         &mut self,
         closing: &[(DocumentId, Vec<DocumentViewId>)],
     ) -> Result<(), DocumentError> {
+        let mut grouped = BTreeMap::<DocumentId, Vec<DocumentViewId>>::new();
         for (document, views) in closing {
-            match self.prepare_close(*document, views)? {
-                DocumentCloseReadiness::Ready { .. } => {}
-                DocumentCloseReadiness::Pending { .. } | DocumentCloseReadiness::Blocked { .. } => {
-                    return Err(DocumentError::CloseNotReady);
+            let entry = grouped.entry(*document).or_default();
+            for &view in views {
+                if !entry.contains(&view) {
+                    entry.push(view);
                 }
             }
         }
+        for (document, views) in &grouped {
+            if !self.close_ready(*document, views)? {
+                return Err(DocumentError::CloseNotReady);
+            }
+        }
 
-        for (document, views) in closing {
+        for (document, views) in &grouped {
             let state = self
                 .documents
                 .get_mut(document)
@@ -637,26 +723,32 @@ fn test_authority() -> aterm_cap::Authority {
 }
 
 /// Rebase one byte position through committed edits.
-pub fn rebase_position(mut position: usize, deltas: &[EditDelta]) -> usize {
+pub fn rebase_position(position: usize, deltas: &[EditDelta]) -> usize {
     let original = position;
-    let mut growth = 0isize;
+    let shift = |base: usize, inserted: usize, removed: usize| {
+        if inserted >= removed {
+            base.saturating_add(inserted - removed)
+        } else {
+            base.saturating_sub(removed - inserted)
+        }
+    };
+    let mut removed = 0usize;
+    let mut inserted = 0usize;
     for delta in deltas {
         if original < delta.old.start {
             break;
         }
         if original <= delta.old.end {
-            return delta
-                .old
-                .start
-                .saturating_add_signed(growth)
-                .saturating_add(delta.inserted_len);
+            return shift(
+                delta.old.start,
+                inserted.saturating_add(delta.inserted_len),
+                removed,
+            );
         }
-        let removed = delta.old.end.saturating_sub(delta.old.start);
-        growth =
-            growth.saturating_add((delta.inserted_len as isize).saturating_sub(removed as isize));
+        removed = removed.saturating_add(delta.old.end.saturating_sub(delta.old.start));
+        inserted = inserted.saturating_add(delta.inserted_len);
     }
-    position = original.saturating_add_signed(growth);
-    position
+    shift(original, inserted, removed)
 }
 
 #[cfg(test)]
@@ -1082,6 +1174,35 @@ mod tests {
         store.commit_detach_batch(&batch).unwrap();
         assert_eq!(store.view_count(first), Some(0));
         assert_eq!(store.view_count(second), Some(0));
+
+        let shared = store.open("mem://batch/shared".into(), "three".into());
+        let shared_a = DocumentViewId(33);
+        let shared_b = DocumentViewId(34);
+        store.attach_view(shared, shared_a).unwrap();
+        store.attach_view(shared, shared_b).unwrap();
+        let shared_seq = match store.transact(
+            shared,
+            store.snapshot(shared).unwrap().seq,
+            vec![TextEdit {
+                range: 5..5,
+                insert: "!".into(),
+            }],
+        ) {
+            DocumentTxnOutcome::Committed { seq, .. } => seq,
+            other => panic!("shared edit failed: {other:?}"),
+        };
+        let split_batch = vec![(shared, vec![shared_a]), (shared, vec![shared_b])];
+        assert_eq!(
+            store.commit_detach_batch(&split_batch),
+            Err(DocumentError::CloseNotReady)
+        );
+        assert_eq!(store.phase(shared), Some(DocumentPhase::Active));
+        assert_eq!(store.view_count(shared), Some(2));
+        store.checkpoint_ack(shared, shared_seq).unwrap();
+        store
+            .commit_detach_batch(&[(shared, vec![shared_a, shared_a]), (shared, vec![shared_b])])
+            .unwrap();
+        assert_eq!(store.view_count(shared), Some(0));
     }
 
     #[test]
@@ -1185,5 +1306,11 @@ mod tests {
             rebase_position(6, &coordinates_stay_in_the_pre_transaction_snapshot),
             16
         );
+        let huge = (isize::MAX as usize) + 5;
+        let past_isize = vec![EditDelta {
+            old: 0..2,
+            inserted_len: huge,
+        }];
+        assert_eq!(rebase_position(3, &past_isize), huge + 1);
     }
 }

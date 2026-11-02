@@ -34,7 +34,7 @@ pub const BOOT: Duration = Duration::from_secs(60);
 
 /// The scratch world an instance runs in.
 pub struct World {
-    /// The `/tmp/at.*` directory holding everything below.
+    /// The private directory holding everything below.
     pub dir: PathBuf,
     pub home: PathBuf,
     pub cfg: PathBuf,
@@ -46,19 +46,23 @@ pub struct World {
 
 impl World {
     /// Lay out a fresh world whose `aterm.toml` is `config` with the audible bell off.
+    /// Its short `/tmp` root ends in `.noindex` and uses the shared root's quiet routing.
     /// # Errors
-    /// A directory or file could not be made.
+    /// A directory or file could not be made or resolved, or its socket paths are too long.
     pub fn new(config: &str) -> Result<World, String> {
-        let dir = crate::sys::make_temp_dir("/tmp/at.XXXXXX")
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("at")
+            .suffix(".noindex")
+            .tempdir_in("/tmp")
             .map_err(|e| format!("cannot make a scratch directory under /tmp: {e}"))?;
-        let dir = PathBuf::from(dir);
-        let dir = std::fs::canonicalize(&dir).map_err(|e| {
-            let _ = std::fs::remove_dir(&dir);
+        let dir = std::fs::canonicalize(scratch.path()).map_err(|e| {
             format!(
                 "cannot resolve the newly owned scratch directory {}: {e}",
-                dir.display()
+                scratch.path().display()
             )
         })?;
+        check_world_socket_paths(&dir)?;
+        let _ = scratch.keep();
         Self::lay_out(dir, config, false)
     }
 
@@ -105,16 +109,7 @@ impl World {
         .map_err(|error| error.to_string())?;
         let name = dir.file_name().ok_or("lab world needs a directory name")?;
         let dir = parent.join(name);
-        for suffix in [
-            "run/aterm/aterm-4294967295.sock",
-            "cfg/aterm/network-state/observer.sock",
-            "cfg/aterm/network-state/waiting.sock",
-        ] {
-            std::os::unix::net::SocketAddr::from_pathname(dir.join(suffix)).map_err(|_| {
-                "lab world socket paths are too long; choose a short directory under /tmp/.ubd"
-                    .to_string()
-            })?;
-        }
+        check_world_socket_paths(&dir)?;
         std::fs::DirBuilder::new()
             .mode(0o700)
             .create(&dir)
@@ -215,6 +210,21 @@ impl World {
     }
 }
 
+/// Check the longest socket paths before a fresh world can launch anything.
+fn check_world_socket_paths(dir: &Path) -> Result<(), String> {
+    for suffix in [
+        "run/aterm/aterm-4294967295.sock",
+        "cfg/aterm/network-state/observer.sock",
+        "cfg/aterm/network-state/waiting.sock",
+    ] {
+        std::os::unix::net::SocketAddr::from_pathname(dir.join(suffix)).map_err(|_| {
+            "lab world socket paths are too long; choose a short directory under /tmp/.ubd"
+                .to_string()
+        })?;
+    }
+    Ok(())
+}
+
 /// A test's parent folder for [`World::create_at`], under `/tmp` so the world's socket paths fit
 /// `sun_path`: the targo shim runs tests with `TMPDIR` at `$TMPDIR/.ubd/`, a `/var/folders` path
 /// that leaves them too long.
@@ -255,16 +265,31 @@ mod prepared_world_tests {
 }
 
 /// The development seams every lab world sets ([`World::env`], the lab runs' `lab_vars`, the
-/// fleet's `world_env`): the hosted loop records its harness tape ([`crate::tape::seam`]), and the
+/// fleet's `world_env`): the hosted loop records its harness tape ([`crate::tape::seam`]), the
 /// instance hears no system memory pressure (`ATERM_DEBUG_SYSTEM_PRESSURE=none`), so only the
-/// `pressure` verb sets its level and a loaded host sheds nothing mid-run. `--env` and
+/// `pressure` verb sets its level and a loaded host sheds nothing mid-run, and the lab's own
+/// program is the one lab stand-in agent the harness may drive ([`standins_seam`]). `--env` and
 /// `LAB_INSTANCE_ENV` refuse them (`lab_sets`).
 #[must_use]
-pub(crate) fn seams() -> [(String, String); 2] {
+pub(crate) fn seams() -> [(String, String); 3] {
     [
         crate::tape::seam(),
         ("ATERM_DEBUG_SYSTEM_PRESSURE".into(), "none".into()),
+        standins_seam(),
     ]
+}
+
+/// The lab's stand-in agents, by the program they all run (`aterm-lab`: the presence and seamless
+/// stand-ins, a swarm's shim interpreter): a debug build's harness types into an agent only when
+/// the kernel confirms its image, and this seam names the lab's own as one it may
+/// ([`aterm_agent::harness::agent_image::STANDINS_SEAM`]). A program merely named `claude` stays
+/// observed.
+#[must_use]
+pub(crate) fn standins_seam() -> (String, String) {
+    (
+        aterm_agent::harness::agent_image::STANDINS_SEAM.into(),
+        crate::paths::paths().exe.to_string_lossy().into_owned(),
+    )
 }
 
 /// Roots for a newly owned HOME, on its volume even when `rehome` moved it.
@@ -479,7 +504,7 @@ fn terminal_selector(roster: &str) -> Option<String> {
         .map(|(_, sid)| format!("@{sid}"))
 }
 
-fn terminal_request(mut ctl: impl FnMut(&[&str]) -> Reply, args: &[&str]) -> Reply {
+pub(crate) fn terminal_request(mut ctl: impl FnMut(&[&str]) -> Reply, args: &[&str]) -> Reply {
     let roster = ctl(&["sessions"]);
     if roster.code != 0 {
         return roster;
@@ -505,13 +530,14 @@ impl Instance {
         Self::start_on_socket(world, l, &world.sock)
     }
 
-    /// Start a window through the ordinary executable entry point, using its
-    /// default socket beneath this world's private runtime directory. The caller
+    /// Start an app-band window as its own responsible process through the ordinary
+    /// executable entry point, using its default socket beneath this world's private
+    /// runtime directory. The caller
     /// supplies an environment without `ATERM_STATE_HOME` or `CI`, and confines
     /// any automatic network lanes the measurement enables.
     /// # Errors
     /// A headless launch, mismatched private roots, a suppressed runtime,
-    /// or any failure named by [`Self::start`].
+    /// or any failure named by [`Self::start_in`].
     pub fn start_ordinary(world: &World, l: Launch) -> Result<Instance, String> {
         if l.headless
             || l.env
@@ -533,7 +559,7 @@ impl Instance {
         }
         // Empty means the ordinary per-instance socket, rather than an explicit
         // socket that would suppress Commons startup in the executable.
-        let mut instance = Self::start_on_socket(world, l, Path::new(""))?;
+        let mut instance = Self::start_in_on_socket(world, l, Band::App, Path::new(""))?;
         instance.sock = world
             .run
             .join("aterm")
@@ -585,13 +611,22 @@ impl Instance {
     /// # Errors
     /// As [`Instance::start`]; a sandboxed `l` in the app band; the job could not start.
     pub fn start_in(world: &World, l: Launch, band: Band) -> Result<Instance, String> {
+        Self::start_in_on_socket(world, l, band, &world.sock)
+    }
+
+    fn start_in_on_socket(
+        world: &World,
+        l: Launch,
+        band: Band,
+        socket: &Path,
+    ) -> Result<Instance, String> {
         if Via::of(&l, band)? == Via::Child {
-            return Instance::start(world, l);
+            return Self::start_on_socket(world, l, socket);
         }
         let quiet = windowed_quiet(&l)?;
         let log = world.dir.join("aterm.log");
         std::fs::File::create(&log).map_err(|e| format!("cannot create {}: {e}", log.display()))?;
-        let line = line(&l, Via::Job, &paths().exe, &world.sock);
+        let line = line(&l, Via::Job, &paths().exe, socket);
         let job = Job::start(&world.dir, &line, &l.env, &l.cwd, &log)?;
         Ok(Instance {
             pid: job.pid,
@@ -612,7 +647,7 @@ impl Instance {
     /// # Errors
     /// Interrupted, the instance exited first, or it never answered (its log tail says why).
     pub fn await_socket(&mut self, limit: Duration) -> Result<(), Fail> {
-        let end = Instant::now() + limit;
+        let end = stop::deadline_after(limit);
         loop {
             let ordinary = self
                 .sock
@@ -840,15 +875,17 @@ pub fn take_flag(args: &mut Vec<String>, flag: &str) -> bool {
 /// # Errors
 /// Not a positive number.
 pub fn count(flag: &str, v: &str) -> Result<u32, Fail> {
-    v.parse::<u32>()
-        .ok()
+    v.bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| v.parse::<u32>().ok())
+        .flatten()
         .filter(|n| *n > 0)
         .ok_or_else(|| Fail::usage(format!("{flag} takes a positive count, not '{v}'")))
 }
 
 /// The aterm to drive: the `--aterm` value given, else the lab's own pick.
 /// # Errors
-/// Why there is none to drive.
+/// Why there is none to drive: the one given is not executable, or the lab found none.
 pub fn resolve_aterm(given: Option<String>) -> Result<PathBuf, String> {
     if let Some(a) = given {
         let a = from_caller(&a);
@@ -1227,7 +1264,7 @@ fn reveal_pending(rows: &str) -> bool {
 /// The band settled: no live row still in its reveal's grace, read through `messages live`.
 /// # Errors
 /// A row still pending after a minute, or the run interrupted.
-fn await_band(inst: &Instance) -> Result<(), Fail> {
+pub(crate) fn await_band(inst: &Instance) -> Result<(), Fail> {
     let start = Instant::now();
     loop {
         let rows = inst.ctl(&["messages", "live"]);
@@ -1690,6 +1727,12 @@ mod world_tests {
     fn a_released_world_goes_when_it_drops() {
         let mut kept = World::new(CONFIG_OFF).expect("fresh private world");
         let dir = kept.dir.clone();
+        assert_eq!(dir.extension().and_then(|s| s.to_str()), Some("noindex"));
+        let observer = dir.join("cfg/aterm/network-state/observer.sock");
+        std::fs::create_dir(observer.parent().unwrap()).expect("network state");
+        let listener = std::os::unix::net::UnixListener::bind(&observer)
+            .expect("the longest world socket path fits after canonicalization");
+        drop(listener);
         kept.keep();
         drop(kept);
         assert!(dir.is_dir(), "kept");

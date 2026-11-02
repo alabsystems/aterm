@@ -5,13 +5,13 @@
 //! (`mode=off|forever|until`, `ends=<secs>`, `span=<secs>`, `deadline=<secs>`, `boot=<uuid>`).
 //!
 //! A timed mode ends at `ends` on the boot clock ([`Clocks::since_boot`]), so only a file of this
-//! boot is read against it. `deadline` is that end on the wall clock as the save read it, for a
-//! person reading the file (every build that reads it reads `ends`); the mug saves it again once
-//! the date changes ([`refresh`]). A file with no `ends` (one written by hand) is read against
-//! the wall clock now, never as more than its span away, until the mug that takes it saves it
-//! back ([`take_saving`]). Missing or unparseable state, a mode saved in an earlier boot, and an
-//! expired span restore to [`Mode::Forever`]; only an explicit off of this boot restores to
-//! [`Mode::Off`].
+//! boot is read against it. `deadline` is that end on the wall clock as the save read it, which a
+//! file of an earlier boot (or one with no `ends`, written by hand) is read against; the mug saves
+//! it again once the date changes ([`refresh`]). A file read on the wall clock is read against it
+//! now, never as more than its span away, until the mug that takes it saves it back
+//! ([`take_saving`]). Missing or unparseable state restores to [`Mode::Forever`]; any other mode
+//! is the one saved, in any boot: an off (a person's: a click, Quit, `aterm acaffiene off` or
+//! `quit`, or the end of a span they picked) lasts until it is turned on again.
 
 use std::io;
 use std::path::Path;
@@ -76,7 +76,7 @@ pub fn encode(saved: &Saved, now: Clocks) -> String {
 /// wall-clock deadline read at `now`, never as more than its span away.
 #[must_use]
 pub fn decode(text: &str, now: Clocks) -> Option<Saved> {
-    parse(text, now).map(|(saved, _)| saved)
+    parse(text, now, |_| true).map(|(saved, _)| saved)
 }
 
 /// The keys of a state file's text, each as the last line naming it says.
@@ -98,7 +98,11 @@ fn fields(text: &str) -> Option<Fields<'_>> {
             continue;
         }
         let (key, value) = line.split_once('=')?;
-        let number = || value.parse::<u64>().ok();
+        let number = || {
+            (!value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| value.parse::<u64>().ok())
+                .flatten()
+        };
         match key {
             "mode" => mode = Some(value),
             "ends" => ends = Some(number()?),
@@ -117,8 +121,14 @@ fn fields(text: &str) -> Option<Fields<'_>> {
     })
 }
 
-/// [`decode`], and whether the text keeps a timed mode on the wall clock alone (no `ends`).
-fn parse(text: &str, now: Clocks) -> Option<(Saved, bool)> {
+/// [`decode`], reading `ends` only where `ends_counts` says the file's boot clock is the one
+/// `now` reads (an `ends` of another boot counts on a clock that started again), and whether the
+/// text keeps a timed mode on the wall clock alone.
+fn parse(
+    text: &str,
+    now: Clocks,
+    ends_counts: impl FnOnce(Option<u128>) -> bool,
+) -> Option<(Saved, bool)> {
     let Fields {
         mode,
         ends,
@@ -126,6 +136,7 @@ fn parse(text: &str, now: Clocks) -> Option<(Saved, bool)> {
         span,
         boot,
     } = fields(text)?;
+    let ends = ends.filter(|_| ends_counts(boot));
     let mode = match mode {
         "off" => Mode::Off,
         "forever" => Mode::Forever,
@@ -174,27 +185,21 @@ fn drifted(text: &str, mode: Mode, boot: Option<u128>, now: Clocks) -> bool {
     })
 }
 
-/// Restores `saved` at `now` if its boot matches `boot_now`; missing, unreadable and earlier-boot
-/// state is forever, and an expired span returns to forever ([`Mode::kept`]). Only an explicit off
-/// of this boot is off.
+/// Restores `saved` at `now`: missing or unreadable state is forever, and any other mode is the
+/// one saved, settled at `now`, in this boot or an earlier one: an off lasts, and a span that has
+/// ended is off.
 #[inline]
 #[must_use]
-pub const fn restore(saved: Option<Saved>, boot_now: Option<u128>, now: Clocks) -> Mode {
-    match (saved, boot_now) {
-        (
-            Some(Saved {
-                mode,
-                boot: Some(then),
-            }),
-            Some(now_boot),
-        ) if now_boot == then => mode.kept(now),
-        _ => Mode::Forever,
+pub const fn restore(saved: Option<Saved>, now: Clocks) -> Mode {
+    match saved {
+        Some(Saved { mode, .. }) => mode.settled(now),
+        None => Mode::Forever,
     }
 }
 
 /// Whether the mode saved in `path` is on at `now`, as written ([`read`]): not as a restore
-/// answers it ([`load`]), which is forever for a save with no boot to match. A mug or a verb that
-/// has just saved off asks this to tell a writer's on that came after its save.
+/// answers it ([`load`]), which is forever for a file that is missing or cannot be read. A mug or
+/// a verb that has just saved off asks this to tell a writer's on that came after its save.
 #[must_use]
 pub fn saved_on(path: &Path, now: Clocks) -> bool {
     read(path, now).is_some_and(|saved| saved.mode.is_on(now))
@@ -272,8 +277,17 @@ pub(crate) fn hold_dir(
     wait: Duration,
     mut pause: impl FnMut(),
 ) -> io::Result<Option<Held>> {
-    let file = std::fs::File::open(dir)?;
-    let until = Instant::now() + wait;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_DIRECTORY);
+    }
+    let file = options.open(dir)?;
+    #[cfg(unix)]
+    aterm_uds::keep_out_of_children(&file)?;
+    let until = Instant::now().checked_add(wait);
     loop {
         #[expect(
             clippy::disallowed_methods,
@@ -282,7 +296,9 @@ pub(crate) fn hold_dir(
         let taken = file.try_lock();
         match taken {
             Ok(()) => return Ok(Some(Held(file))),
-            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < until => pause(),
+            Err(std::fs::TryLockError::WouldBlock) if until.is_none_or(|u| Instant::now() < u) => {
+                pause();
+            }
             Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
             Err(std::fs::TryLockError::Error(e)) => return Err(e),
         }
@@ -348,7 +364,8 @@ fn write_unless(
 }
 
 /// Remove the temporaries that no write will rename beside the mode and the update bridge's pid
-/// file, under this name and the old one ([`crate::legacy`]), with
+/// file, under this name and the old one ([`crate::legacy`]), and beside the mug's trouble record
+/// ([`crate::trouble`]), with
 /// [`aterm_uds::atomic_file::sweep_temps_beside`] past
 /// [`aterm_uds::atomic_file::ABANDONED_AFTER`]; the job plists' are
 /// [`crate::launchd::sweep_plist_temps`]'s. A process that ends while a thread of its own is
@@ -362,6 +379,7 @@ pub fn sweep_temps(paths: &crate::paths::Paths) -> Vec<(std::path::PathBuf, io::
     [
         paths.state_file(),
         paths.bridge_file(),
+        paths.trouble_file(),
         crate::legacy::state_file(paths),
         crate::legacy::bridge_file(paths),
     ]
@@ -434,9 +452,9 @@ pub fn load(path: &Path, now: Clocks) -> Mode {
 }
 
 /// [`load`], and the text the mode was restored from when the file is one to save back because
-/// every read of it restores it anew: a timed mode on the wall clock alone (no `ends`), or a mode
-/// of this boot the restore changed (a deadline gone, or more than its span and [`DRIFT_SECS`]
-/// away). A deadline past its span by no more than [`DRIFT_SECS`] (a writer's fresh span read at
+/// every read of it restores it anew: a timed mode on the wall clock alone (no `ends`, or an
+/// `ends` of an earlier boot), or a mode of this boot the restore changed (a deadline gone, or
+/// more than its span and [`DRIFT_SECS`] away). A deadline past its span by no more than [`DRIFT_SECS`] (a writer's fresh span read at
 /// clocks a moment behind its own) is brought in only in the mode answered, and the file is left
 /// as written: that writer posts its notification after its save, and the take it brings reads
 /// the span as written.
@@ -445,9 +463,9 @@ pub fn take(path: &Path, now: Clocks) -> (Mode, Option<String>) {
     let Some(text) = read_text(path) else {
         return (Mode::Forever, None);
     };
-    let parsed = parse(&text, now);
     let boot = crate::instance::boot_id();
-    let mode = restore(parsed.map(|(saved, _)| saved), boot, now);
+    let parsed = parse(&text, now, |saved| boot.is_some() && saved == boot);
+    let mode = restore(parsed.map(|(saved, _)| saved), now);
     let resave = parsed.is_some_and(|(saved, wall_only)| {
         wall_only
             || (boot.is_some()
@@ -502,8 +520,8 @@ fn take_saving_with(path: &Path, now: Clocks, mut landing: impl FnMut(&Path)) ->
 
 /// Saves `mode` again, encoded at `now`, when the file at `path` holds it as a timed mode saved
 /// before a change of the date ([`drifted`]), unless a writer changes it first ([`save_over`]):
-/// whether it was saved. This keeps `deadline` true for a person reading the file. The file is
-/// read only for a timed mode.
+/// whether it was saved. This keeps `deadline` true for a read after a restart, which reads the
+/// end on the wall clock alone. The file is read only for a timed mode.
 ///
 /// # Errors
 ///
@@ -549,16 +567,18 @@ mod tests {
         let dir = aterm_tempfile::tempdir().expect("tempdir");
         let file = dir.path().join("acaffiene.state");
         assert!(!saved_on(&file, NOW), "no file");
+        assert_eq!(
+            load(&file, NOW),
+            Mode::Forever,
+            "no file, which a restore reads as forever"
+        );
         let at = |mode, boot| {
             std::fs::write(&file, encode(&Saved { mode, boot }, NOW)).expect("write");
             saved_on(&file, NOW)
         };
         assert!(!at(Mode::Off, Some(BOOT)));
-        assert!(
-            !at(Mode::Off, None),
-            "an off with no boot, which a restore reads as forever"
-        );
-        assert_eq!(load(&file, NOW), Mode::Forever, "as a restore reads it");
+        assert!(!at(Mode::Off, None), "an off with no boot");
+        assert_eq!(load(&file, NOW), Mode::Off, "as a restore reads it too");
         assert!(at(Mode::Forever, None));
         assert!(at(Mode::Forever, Some(BOOT)));
         let span = |deadline| Mode::Until {
@@ -628,15 +648,11 @@ mod tests {
             assert_eq!(parse_boot(bad), None, "{bad:?}");
         }
         assert_eq!(decode("mode=forever\nboot=1789990000\n", NOW), None);
-        let zero = format!("mode=forever\nboot={}\n", boot_text(0));
+        let zero = format!("mode=off\nboot={}\n", boot_text(0));
         assert_eq!(decode(&zero, NOW), None);
-        assert_eq!(restore(decode(&zero, NOW), Some(0), NOW), Mode::Forever);
-        let this = format!("mode=forever\nboot={}\n", boot_text(BOOT));
-        assert_eq!(
-            restore(decode(&this, NOW), Some(BOOT), NOW),
-            Mode::Forever,
-            "CONTROL"
-        );
+        assert_eq!(restore(decode(&zero, NOW), NOW), Mode::Forever);
+        let this = format!("mode=off\nboot={}\n", boot_text(BOOT));
+        assert_eq!(restore(decode(&this, NOW), NOW), Mode::Off, "CONTROL");
     }
 
     #[test]
@@ -663,49 +679,86 @@ mod tests {
         );
     }
 
+    /// Missing or unreadable state is forever; a saved mode is restored as saved, settled: an off
+    /// lasts, through a restart too, and a span that has ended is off, not forever.
     #[test]
-    fn a_restart_missing_state_or_a_passed_deadline_returns_to_forever() {
-        let forever = Saved {
-            mode: Mode::Forever,
-            boot: Some(BOOT),
-        };
-        assert_eq!(restore(Some(forever), Some(BOOT), NOW), Mode::Forever);
-        assert_eq!(restore(Some(forever), Some(BOOT ^ 1), NOW), Mode::Forever);
-        assert_eq!(restore(Some(forever), None, NOW), Mode::Forever);
-        assert_eq!(
-            restore(
-                Some(Saved {
-                    boot: None,
-                    ..forever
-                }),
-                Some(BOOT),
-                NOW
-            ),
-            Mode::Forever
-        );
-        assert_eq!(restore(None, Some(BOOT), NOW), Mode::Forever);
-        let timed = Saved {
-            mode: Mode::Until {
+    fn missing_state_is_forever_an_off_lasts_and_an_ended_span_is_off() {
+        assert_eq!(restore(None, NOW), Mode::Forever);
+        for boot in [Some(BOOT), Some(BOOT ^ 1), None] {
+            let saved = |mode| Some(Saved { mode, boot });
+            assert_eq!(
+                restore(saved(Mode::Forever), NOW),
+                Mode::Forever,
+                "{boot:?}"
+            );
+            assert_eq!(restore(saved(Mode::Off), NOW), Mode::Off, "{boot:?}");
+            let timed = Mode::Until {
                 deadline: NOW.since_boot + 10,
                 span: HOUR,
-            },
-            boot: Some(BOOT),
-        };
-        assert_eq!(restore(Some(timed), Some(BOOT), NOW), timed.mode);
-        assert_eq!(restore(Some(timed), Some(BOOT), NOW + 10), Mode::Forever);
-        let nothing = Saved {
-            mode: Mode::Until {
+            };
+            assert_eq!(restore(saved(timed), NOW), timed, "{boot:?}");
+            assert_eq!(restore(saved(timed), NOW + 10), Mode::Off, "{boot:?}");
+            let nothing = Mode::Until {
                 deadline: NOW.since_boot + HOUR,
                 span: 0,
-            },
-            boot: Some(BOOT),
+            };
+            assert_eq!(
+                restore(saved(nothing), NOW),
+                Mode::Off,
+                "a hand-edited span of nothing ends as it starts: {boot:?}"
+            );
+        }
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("acaffiene.state");
+        let earlier = |mode: &str| format!("mode={mode}\nboot={}\n", boot_text(BOOT ^ 1));
+        std::fs::write(&path, earlier("off")).expect("an earlier boot's off");
+        assert_eq!(load(&path, NOW), Mode::Off, "an off outlasts a restart");
+        std::fs::write(&path, earlier("forever")).expect("an earlier boot's on");
+        assert_eq!(load(&path, NOW), Mode::Forever);
+    }
+
+    /// An `ends` counts on the boot clock of the file's own boot: a span saved in an earlier boot
+    /// (or where the boot cannot be read) is read on the wall clock, never as more than its span
+    /// away, so a restart neither ends it early nor keeps it past its end.
+    #[test]
+    fn a_span_from_an_earlier_boot_is_read_on_the_wall_clock() {
+        let text = |ends: u64, deadline: u64, boot: u128| {
+            format!(
+                "mode=until\nends={ends}\nspan={HOUR}\ndeadline={deadline}\nboot={}\n",
+                boot_text(boot)
+            )
         };
-        assert_eq!(restore(Some(nothing), Some(BOOT), NOW), Mode::Forever);
-        let off = Saved {
-            mode: Mode::Off,
-            boot: Some(BOOT),
+        let read = |text: &str, this: Option<u128>| {
+            parse(text, NOW, |saved| this.is_some() && saved == this)
+                .map(|(saved, wall_only)| (restore(Some(saved), NOW), wall_only))
         };
-        assert_eq!(restore(Some(off), Some(BOOT), NOW), Mode::Off);
+        let half_an_hour_on_its_clock = text(NOW.since_boot + 1800, NOW.wall + 600, BOOT);
+        assert_eq!(
+            read(&half_an_hour_on_its_clock, Some(BOOT)),
+            Some((
+                Mode::Until {
+                    deadline: NOW.since_boot + 1800,
+                    span: HOUR
+                },
+                false
+            )),
+            "CONTROL: this boot's `ends`"
+        );
+        for this in [Some(BOOT ^ 1), None] {
+            assert_eq!(
+                read(&half_an_hour_on_its_clock, this),
+                Some((
+                    Mode::Until {
+                        deadline: NOW.since_boot + 600,
+                        span: HOUR
+                    },
+                    true
+                )),
+                "{this:?}"
+            );
+            let gone = text(NOW.since_boot + 1800, NOW.wall - 1, BOOT);
+            assert_eq!(read(&gone, this), Some((Mode::Off, true)), "{this:?}");
+        }
     }
 
     /// A saved span keeps its time through the wall clock set back or forward a day, and the file
@@ -723,7 +776,7 @@ mod tests {
                 since_boot: NOW.since_boot + 600,
                 wall,
             };
-            let mode = restore(decode(&text, later), Some(BOOT), later);
+            let mode = restore(decode(&text, later), later);
             assert_eq!(mode.remaining(later), Some(HOUR - 600), "{wall}");
         }
     }
@@ -739,7 +792,7 @@ mod tests {
             )
         };
         let read = |text: &str| decode(text, NOW).map(|saved| saved.mode);
-        let left = |text: &str| restore(decode(text, NOW), Some(BOOT), NOW).remaining(NOW);
+        let left = |text: &str| restore(decode(text, NOW), NOW).remaining(NOW);
         let ten_minutes_in = earlier(NOW.wall + HOUR - 600);
         assert_eq!(left(&ten_minutes_in), Some(HOUR - 600));
         let set_back = earlier(NOW.wall + DAY + HOUR - 600);
@@ -750,7 +803,7 @@ mod tests {
         );
         assert_eq!(left(&set_back), Some(HOUR));
         assert_eq!(left(&earlier(NOW.wall - 1)), None, "a deadline gone");
-        let mode = restore(decode(&ten_minutes_in, NOW), Some(BOOT), NOW);
+        let mode = restore(decode(&ten_minutes_in, NOW), NOW);
         let back = Clocks {
             since_boot: NOW.since_boot + 60,
             wall: NOW.wall - DAY + 60,
@@ -767,7 +820,8 @@ mod tests {
     }
 
     /// A file with no `ends` is one to save back, whatever its boot: re-read after the date is set
-    /// back it would read a full span, while the mode saved reads the time it had.
+    /// back it would read a full span, while the mode saved reads the time it had. So is one whose
+    /// `ends` counts on an earlier boot's clock; this boot's `ends` is read as it is.
     #[test]
     fn a_file_with_no_ends_is_one_to_save_back() {
         let earlier = |deadline: u64| {
@@ -777,8 +831,9 @@ mod tests {
                 boot_text(BOOT)
             )
         };
-        let wall_only = |text: &str, at: Clocks| parse(text, at).map(|(_, wall_only)| wall_only);
-        let left = |text: &str, at: Clocks| restore(decode(text, at), Some(BOOT), at).remaining(at);
+        let wall_only =
+            |text: &str, at: Clocks| parse(text, at, |_| true).map(|(_, wall_only)| wall_only);
+        let left = |text: &str, at: Clocks| restore(decode(text, at), at).remaining(at);
         let back = Clocks {
             since_boot: NOW.since_boot + 600,
             wall: NOW.wall - DAY + 600,
@@ -790,7 +845,7 @@ mod tests {
             assert_eq!(left(&text, back), Some(8 * HOUR), "{deadline}: read anew");
             let saved = encode(
                 &Saved {
-                    mode: restore(decode(&text, NOW), Some(BOOT), NOW),
+                    mode: restore(decode(&text, NOW), NOW),
                     boot: Some(BOOT),
                 },
                 NOW,
@@ -810,21 +865,26 @@ mod tests {
         assert_eq!(take(&path, NOW), (Mode::Forever, None), "no file");
         std::fs::write(&path, earlier(NOW.wall + HOUR)).expect("a file with no ends");
         assert_eq!(take(&path, NOW).1, Some(earlier(NOW.wall + HOUR)));
-        write(
-            &path,
-            &Saved {
-                mode: Mode::chosen(crate::model::Choice::Hours8, NOW),
-                boot: Some(BOOT),
-            },
-            NOW,
-        )
-        .expect("write");
-        assert_eq!(take(&path, NOW).1, None);
+        let this = crate::instance::boot_id();
+        let other = this.map_or(BOOT, |this| this ^ 1);
+        for (boot, resaved) in [(this, this.is_none()), (Some(other), true)] {
+            write(
+                &path,
+                &Saved {
+                    mode: Mode::chosen(crate::model::Choice::Hours8, NOW),
+                    boot,
+                },
+                NOW,
+            )
+            .expect("write");
+            assert_eq!(take(&path, NOW).1.is_some(), resaved, "{boot:?}");
+        }
     }
 
     /// A file of this boot whose restore changes its mode is saved back once: a deadline a day
-    /// away comes in to its hour, and one gone returns to forever. One past its span by no more than
-    /// [`DRIFT_SECS`] is brought in but left as it is.
+    /// away comes in to its hour, and one gone is off. One past its span by no more than
+    /// [`DRIFT_SECS`] is brought in but left as it is. An earlier boot's span is read on the wall
+    /// clock, its hour, and saved back on this boot's.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_restore_that_changes_this_boots_mode_is_saved_back() {
@@ -841,11 +901,11 @@ mod tests {
         let hour = Mode::chosen(crate::model::Choice::Hours1, NOW);
         for (ends, boot, want, resaved) in [
             (NOW.since_boot + DAY, this, hour, true),
-            (NOW.since_boot - 1, this, Mode::Forever, true),
+            (NOW.since_boot - 1, this, Mode::Off, true),
             (NOW.since_boot + HOUR, this, hour, false),
             (NOW.since_boot + HOUR + DRIFT_SECS, this, hour, false),
             (NOW.since_boot + HOUR + DRIFT_SECS + 1, this, hour, true),
-            (NOW.since_boot + DAY, this ^ 1, Mode::Forever, false),
+            (NOW.since_boot + DAY, this ^ 1, hour, true),
         ] {
             let text = file(ends, boot);
             std::fs::write(&path, &text).expect("state file");
@@ -999,6 +1059,22 @@ mod tests {
         assert!(held.is_some(), "taken once its holder let go");
         assert_eq!(pauses, 1);
         assert!(hold(dir.path(), Duration::ZERO).is_none(), "and held");
+        let mut max_elsewhere = held;
+        let taken_max = hold_with(dir.path(), Duration::MAX, || {
+            max_elsewhere = None;
+        });
+        assert!(
+            taken_max.is_some(),
+            "Duration::MAX wait never overflows Instant"
+        );
+        let file = dir.path().join("not-a-dir");
+        std::fs::write(&file, b"file").expect("file");
+        assert!(hold_dir(&file, Duration::ZERO, || {}).is_err());
+        let link = dir.path().join("dir-link");
+        let real = dir.path().join("real-dir");
+        std::fs::create_dir(&real).expect("real-dir");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        assert!(hold_dir(&link, Duration::ZERO, || {}).is_err());
     }
 
     /// A refresh reads the file only for a timed mode: off, and on with no end, keep no end on
@@ -1221,6 +1297,7 @@ mod tests {
         let written = [
             "acaffiene.state",
             "acaffiene.bridge",
+            "acaffiene.trouble",
             "caffeine.state",
             "caffeine.bridge",
         ];

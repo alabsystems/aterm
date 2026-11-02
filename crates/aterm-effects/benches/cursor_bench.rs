@@ -84,25 +84,37 @@ fn benchmark_with(style: GlowStyle, label: &str, fixture: GlowFixture, min_total
         let fingerprint = glow.tick(Some(cursor), now, &config, geometry, &mut quads);
         samples.push(start.elapsed());
         assert_ne!(fingerprint, 0, "saturated {label} fixture must emit");
-        let under_quads = glow.under_quads().len();
-        max_over_quads = max_over_quads.max(quads.len());
+        // Native ramps retain the lit rows their equivalent quads would draw.
+        let under_quads = glow.under_ramps().laid(glow.under_quads().len());
+        let over_quads = glow.out_ramps().laid(quads.len());
+        max_over_quads = max_over_quads.max(over_quads);
         max_under_quads = max_under_quads.max(under_quads);
-        max_total_quads = max_total_quads.max(quads.len() + under_quads);
+        max_total_quads = max_total_quads.max(over_quads + under_quads);
     }
     samples.sort();
     let median = samples[ITERATIONS / 2];
     let p90 = samples[ITERATIONS * 9 / 10];
+    println!(
+        "{label}: final native geometry {} under quads + {} over quads; \
+         {} under ramps / {} over ramps; normalized geometry {} under + {} over",
+        glow.under_quads().len(),
+        quads.len(),
+        glow.under_ramps().items.len(),
+        glow.out_ramps().items.len(),
+        glow.under_ramps().laid(glow.under_quads().len()),
+        glow.out_ramps().laid(quads.len()),
+    );
     const P90_REFERENCE_US: u64 = 500;
     let scale = budget_scale();
     let p90_bound_us = scaled_budget_us(P90_REFERENCE_US, scale);
     println!(
         "{label}: median {median:?} (p90 {p90:?}), \
-         max quads {max_total_quads} ({max_under_quads} under + {max_over_quads} over); \
+         max normalized quads {max_total_quads} ({max_under_quads} under + {max_over_quads} over); \
          p90 bound {p90_bound_us} us (reference {P90_REFERENCE_US} × {BUDGET_SCALE_VAR} {scale})"
     );
     assert!(
         max_total_quads > min_total_quads,
-        "fixture must exercise substantial geometry ({max_total_quads} quads, floor \
+        "fixture must exercise substantial geometry ({max_total_quads} normalized quads, floor \
          {min_total_quads})"
     );
     assert!(
@@ -161,10 +173,11 @@ fn bench_cursor_rainbow_hot_ribbon_worstcase() {
         let start = Instant::now();
         step(&mut glow, &mut quads, &mut now);
         samples.push(start.elapsed());
-        let under_quads = glow.under_quads().len();
-        max_over_quads = max_over_quads.max(quads.len());
+        let under_quads = glow.under_ramps().laid(glow.under_quads().len());
+        let over_quads = glow.out_ramps().laid(quads.len());
+        max_over_quads = max_over_quads.max(over_quads);
         max_under_quads = max_under_quads.max(under_quads);
-        max_total_quads = max_total_quads.max(quads.len() + under_quads);
+        max_total_quads = max_total_quads.max(over_quads + under_quads);
     }
     samples.sort();
     let median = samples[ITERATIONS / 2];
@@ -176,7 +189,7 @@ fn bench_cursor_rainbow_hot_ribbon_worstcase() {
     let p90_bound_us = scaled_budget_us(P90_REFERENCE_US, scale);
     println!(
         "bench_cursor_rainbow_hot_ribbon_worstcase: median {median:?} (p90 {p90:?}), \
-         max quads {max_total_quads} ({max_under_quads} under + {max_over_quads} over); \
+         max normalized quads {max_total_quads} ({max_under_quads} under + {max_over_quads} over); \
          median bound {median_bound_us} us / p90 bound {p90_bound_us} us \
          (reference {MEDIAN_REFERENCE_US}/{P90_REFERENCE_US} × {BUDGET_SCALE_VAR} {scale})"
     );

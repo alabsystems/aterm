@@ -232,7 +232,7 @@ impl TrickFlash {
     #[inline]
     pub(crate) const fn found_in_a_pane(&self) -> bool {
         matches!(
-            self.slot,
+            &self.slot,
             Some(Slot {
                 pane: Some(_),
                 located: Some(_),
@@ -340,7 +340,7 @@ impl TrickFlash {
         let Some(slot) = self.slot.as_mut() else {
             return;
         };
-        match slot.located {
+        match &slot.located {
             None => self.slot = None,
             Some(loc) => {
                 if slot.revoked_at.is_none() {
@@ -356,10 +356,10 @@ impl TrickFlash {
         let Some(slot) = self.slot.as_ref() else {
             return TrickFlashPhase::Idle;
         };
-        match slot.located {
+        match &slot.located {
             None if millis_since(now, slot.at) > GIVE_UP_MS => TrickFlashPhase::Idle,
             None => TrickFlashPhase::Pending,
-            Some(loc) if millis_since(now, loc.since) >= window_ms(&loc, slot.revoked_at) => {
+            Some(loc) if millis_since(now, loc.since) >= window_ms(loc, slot.revoked_at) => {
                 TrickFlashPhase::Idle
             }
             Some(_) if slot.revoked_at.is_some() => TrickFlashPhase::Revoked,
@@ -462,7 +462,7 @@ impl TrickFlash {
         ink: &mut Vec<InkCell>,
         fp: &mut u64,
     ) -> Option<Instant> {
-        let slot = self.slot?;
+        let slot = self.slot.as_ref()?;
         if !pane_matches(slot.pane, scope) {
             return None;
         }
@@ -470,9 +470,9 @@ impl TrickFlash {
             self.slot = None;
             return None;
         }
-        let loc = slot.located?;
+        let loc = slot.located.as_ref()?;
         let t = millis_since(now, loc.since);
-        let window = window_ms(&loc, slot.revoked_at);
+        let window = window_ms(loc, slot.revoked_at);
         if t >= window {
             self.slot = None;
             return None;
@@ -493,19 +493,23 @@ impl TrickFlash {
         } else {
             (0.0, 0.0)
         };
+        let loc_row = loc.row;
+        let loc_sat = loc.sat;
+        let loc_val = loc.val;
+        let loc_since = loc.since;
         let mut search_from = 0usize;
         let mut i = 0;
         while i < n {
             let target = if has_tint {
                 let hue = base_hue + i as f32 * span_per_step;
-                hsv2rgb(hue, loc.sat, loc.val)
+                hsv2rgb(hue, loc_sat, loc_val)
             } else {
                 0
             };
             let col = loc.cols[i];
             let fg_i = loc.fg[i];
             i += 1;
-            let cell = if !matches!(ink.last(), Some(c) if (c.row, c.col) >= (loc.row, col)) {
+            let cell = if !matches!(ink.last(), Some(c) if (c.row, c.col) >= (loc_row, col)) {
                 let color = if full_tint {
                     u32_to_rgb3(target)
                 } else if has_tint {
@@ -514,7 +518,7 @@ impl TrickFlash {
                     fg_i
                 };
                 let cell = InkCell {
-                    row: loc.row,
+                    row: loc_row,
                     col,
                     color,
                 };
@@ -522,7 +526,7 @@ impl TrickFlash {
                 search_from = ink.len();
                 cell
             } else {
-                let key = (loc.row, col);
+                let key = (loc_row, col);
                 let lookup = match ink.get(search_from) {
                     Some(c) if (c.row, c.col) == key => Ok(0),
                     Some(c) if (c.row, c.col) > key => Err(0),
@@ -551,7 +555,7 @@ impl TrickFlash {
                             fg_i
                         };
                         let cell = InkCell {
-                            row: loc.row,
+                            row: loc_row,
                             col,
                             color,
                         };
@@ -563,7 +567,7 @@ impl TrickFlash {
             *fp = fold_ink(*fp, cell);
         }
         *fp = fnv_mix_u64(*fp, t);
-        Some(loc.since + Duration::from_millis(window))
+        Some(loc_since + Duration::from_millis(window))
     }
 
     #[inline]
@@ -1129,9 +1133,13 @@ const fn capture(loc: &mut Located, n: usize, cells: &[RenderCell]) -> bool {
         return true;
     }
     loc.bg = first.bg;
-    let bg = rgb3_to_u32(first.bg);
     let table = crate::color_math::relative_luminance_table();
-    let lum_bg = crate::color_math::relative_luminance_with(table, bg);
+    let lum_bg = crate::color_math::relative_luminance_rgb(
+        table,
+        first.bg[0] as usize,
+        first.bg[1] as usize,
+        first.bg[2] as usize,
+    );
     (loc.sat, loc.val) = resolve_sat_val_from_lum(lum_bg);
     loc.strength = legible_strength_with(table, rgb3_to_u32(first.fg), lum_bg, loc.sat, loc.val);
     loc.strength > 0.0

@@ -1200,3 +1200,254 @@ warm = ["m2", "m1"]
     assert_eq!(updated_lease.until, 0);
     assert!(repair_half_done_revokes(&mut doc).unwrap().is_none());
 }
+
+#[test]
+fn repair_and_cascade_protect_surviving_canonical_label_from_suffixed_stale_claim() {
+    let r1 = Identity::generate().unwrap().recipient().to_bech32();
+    let r2 = Identity::generate().unwrap();
+    let r2_str = r2.recipient().to_bech32();
+    let mut doc = Document::new_vault("m1", &r1);
+    // m2 is not in [machines] (stale), and has a clash-suffixed `claimed_label = Some("m1-3fa2")`
+    // whose canonical `leading_m_label` is `"m1"` (held by active `m1`).
+    let roster = crate::swarm_roster::SwarmRoster {
+        members: vec![
+            crate::swarm_roster::SwarmMember {
+                label: "m1".to_owned(),
+                vault_name: "m1".to_owned(),
+                recipient: r1.clone(),
+                node_id: None,
+                node_key: None,
+                hint: None,
+                admitted_ms: 1000,
+                aliases: Vec::new(),
+                claimed_label: None,
+                claimed_at_ms: None,
+            },
+            crate::swarm_roster::SwarmMember {
+                label: "m2".to_owned(),
+                vault_name: "m2".to_owned(),
+                recipient: r2_str.clone(),
+                node_id: None,
+                node_key: None,
+                hint: None,
+                admitted_ms: 1000,
+                aliases: Vec::new(),
+                claimed_label: Some("m1-3fa2".to_owned()),
+                claimed_at_ms: Some(1000),
+            },
+        ],
+        deny_labels: Vec::new(),
+        deny_nodes: Vec::new(),
+    };
+    doc.set_entry(
+        &Audience::Everyone,
+        crate::swarm_roster::ROSTER_ENTRY,
+        roster.to_toml().as_bytes(),
+    )
+    .unwrap();
+
+    // 1. `cascade_member_removal` on `--stolen` for `r2` must deny `m2` without folding
+    //    `m1-3fa2` into `deny_labels` as `"m1"` and denying surviving `m1`.
+    let mut entries = std::collections::BTreeMap::new();
+    entries.insert(
+        crate::swarm_roster::ROSTER_ENTRY.to_owned(),
+        Entry {
+            name: crate::swarm_roster::ROSTER_ENTRY.to_owned(),
+            value: SecretBytes::from(roster.to_toml()),
+            audience: Audience::Everyone,
+            if_absent: false,
+            anchor: None,
+        },
+    );
+    super::cascade_member_removal(
+        &mut entries,
+        &r2.recipient(),
+        &std::collections::BTreeSet::from(["m2".to_owned()]),
+        &std::collections::BTreeSet::new(),
+        true,
+    )
+    .unwrap();
+    let cascaded = crate::swarm_roster::SwarmRoster::from_toml(
+        std::str::from_utf8(entries[crate::swarm_roster::ROSTER_ENTRY].value.as_slice()).unwrap(),
+    )
+    .unwrap();
+    assert!(cascaded.is_label_denied("m2"));
+    assert!(
+        !cascaded.is_label_denied("m1"),
+        "surviving m1 must not be collateral-denied by m2's suffixed claim: {:?}",
+        cascaded.deny_labels
+    );
+
+    // 2. `repair_half_done_revokes` must also retire stale `m2` without denying surviving `m1`.
+    repair_half_done_revokes(&mut doc)
+        .unwrap()
+        .expect("should retire stale m2");
+    let repaired = crate::swarm_roster::SwarmRoster::from_document(&doc)
+        .unwrap()
+        .unwrap();
+    assert!(repaired.is_label_denied("m2"));
+    assert!(
+        !repaired.is_label_denied("m1"),
+        "surviving m1 must not be collateral-denied by repair_half_done_revokes: {:?}",
+        repaired.deny_labels
+    );
+
+    // 3. When a stale row (`m2`) shares `node_id` / `node_key` with surviving `m1` (e.g. after `m1`
+    //    rotated its age recipient), `repair_half_done_revokes` must retire `m2` without pushing
+    //    `m1`'s active `node_id` / `node_key` into `deny_nodes`.
+    let shared_node = "00000000000000000000000000000001";
+    let shared_nk = "11".repeat(32);
+    let shared_roster = crate::swarm_roster::SwarmRoster {
+        members: vec![
+            crate::swarm_roster::SwarmMember {
+                label: "m1".to_owned(),
+                vault_name: "m1".to_owned(),
+                recipient: r1,
+                node_id: Some(shared_node.to_owned()),
+                node_key: Some(shared_nk.clone()),
+                hint: None,
+                admitted_ms: 2000,
+                aliases: Vec::new(),
+                claimed_label: None,
+                claimed_at_ms: None,
+            },
+            crate::swarm_roster::SwarmMember {
+                label: "m2".to_owned(),
+                vault_name: "m2".to_owned(),
+                recipient: r2_str,
+                node_id: Some(shared_node.to_owned()),
+                node_key: Some(shared_nk.clone()),
+                hint: None,
+                admitted_ms: 1000,
+                aliases: Vec::new(),
+                claimed_label: None,
+                claimed_at_ms: None,
+            },
+        ],
+        deny_labels: Vec::new(),
+        deny_nodes: Vec::new(),
+    };
+    doc.set_entry(
+        &Audience::Everyone,
+        crate::swarm_roster::ROSTER_ENTRY,
+        shared_roster.to_toml().as_bytes(),
+    )
+    .unwrap();
+    repair_half_done_revokes(&mut doc)
+        .unwrap()
+        .expect("should retire stale m2");
+    let repaired_shared = crate::swarm_roster::SwarmRoster::from_document(&doc)
+        .unwrap()
+        .unwrap();
+    assert!(!repaired_shared.is_node_denied(shared_node));
+    assert!(!repaired_shared.is_node_denied(&shared_nk));
+    assert!(
+        !repaired_shared.is_member_denied(repaired_shared.member_by_label_or_alias("m1").unwrap())
+    );
+
+    // 4. Even when surviving `m1` is in `doc.machines()` only (not yet seeded into `roster.members`),
+    //    `repair_half_done_revokes` retiring stale `m2` (which carries `claimed_label = Some("m1")` or
+    //    `Some("m1-3fa2")`) must NOT collateral-deny `m1`.
+    let unseeded_m1_roster = crate::swarm_roster::SwarmRoster {
+        members: vec![crate::swarm_roster::SwarmMember {
+            label: "m2".to_owned(),
+            vault_name: "m2".to_owned(),
+            recipient: Identity::generate().unwrap().recipient().to_bech32(),
+            node_id: None,
+            node_key: None,
+            hint: None,
+            admitted_ms: 1000,
+            aliases: Vec::new(),
+            claimed_label: Some("m1".to_owned()),
+            claimed_at_ms: Some(1000),
+        }],
+        deny_labels: Vec::new(),
+        deny_nodes: Vec::new(),
+    };
+    doc.set_entry(
+        &Audience::Everyone,
+        crate::swarm_roster::ROSTER_ENTRY,
+        unseeded_m1_roster.to_toml().as_bytes(),
+    )
+    .unwrap();
+    repair_half_done_revokes(&mut doc)
+        .unwrap()
+        .expect("should retire stale m2");
+    let repaired_unseeded = crate::swarm_roster::SwarmRoster::from_document(&doc)
+        .unwrap()
+        .unwrap();
+    assert!(repaired_unseeded.is_label_denied("m2"));
+    assert!(
+        !repaired_unseeded.is_label_denied("m1"),
+        "surviving m1 in doc.machines() must not be collateral-denied by stale m2's claimed_label: {:?}",
+        repaired_unseeded.deny_labels
+    );
+}
+
+/// A plain removal (no `--stolen`) rotates the fleet code too, so the removed Mac's copy of it
+/// lets it into neither the fleet nor the vault by the fleet's key (`client::readmit`), while it
+/// still denies nothing on the roster (an "Allow again" restores it).
+///
+/// NEGATIVE CONTROL: the rotation gated on `stolen` again (`if stolen && let Some(entry) = …`):
+/// the code is unchanged and `assert!(cascade.fleet_code_rotated)` fails.
+#[test]
+fn a_plain_removal_rotates_the_fleet_code_and_denies_nothing() {
+    let removed = crate::age::Identity::generate().unwrap().recipient();
+    let code = encode_fleet_join_code(&[7; FLEET_SECRET_LEN], Some("10.0.0.2:7878"));
+    let roster = crate::swarm_roster::SwarmRoster {
+        members: vec![crate::swarm_roster::SwarmMember {
+            label: "m9".to_owned(),
+            vault_name: "m9".to_owned(),
+            recipient: removed.to_bech32(),
+            node_id: Some("00000000000000000000000000000009".to_owned()),
+            node_key: Some("09".repeat(32)),
+            hint: None,
+            admitted_ms: 1000,
+            aliases: Vec::new(),
+            claimed_label: None,
+            claimed_at_ms: None,
+        }],
+        deny_labels: Vec::new(),
+        deny_nodes: Vec::new(),
+    };
+    let entry = |name: &str, value: String| {
+        (
+            name.to_owned(),
+            Entry {
+                name: name.to_owned(),
+                value: SecretBytes::from(value),
+                audience: Audience::Everyone,
+                if_absent: false,
+                anchor: None,
+            },
+        )
+    };
+    let mut entries = std::collections::BTreeMap::from([
+        entry(fleet::FLEET_CODE_ENTRY, code.clone()),
+        entry(crate::swarm_roster::ROSTER_ENTRY, roster.to_toml()),
+    ]);
+    let cascade = super::cascade_member_removal(
+        &mut entries,
+        &removed,
+        &std::collections::BTreeSet::from(["m9".to_owned()]),
+        &std::collections::BTreeSet::from(["09".repeat(32)]),
+        false,
+    )
+    .unwrap();
+    let rotated = std::str::from_utf8(entries[fleet::FLEET_CODE_ENTRY].value.as_slice())
+        .unwrap()
+        .to_owned();
+    assert!(cascade.fleet_code_rotated);
+    assert_ne!(rotated, code, "the removed Mac's copy of the code is stale");
+    assert!(
+        rotated.ends_with("@10.0.0.2:7878"),
+        "the rotated code keeps its place: {}",
+        rotated.len()
+    );
+    let after = crate::swarm_roster::SwarmRoster::from_toml(
+        std::str::from_utf8(entries[crate::swarm_roster::ROSTER_ENTRY].value.as_slice()).unwrap(),
+    )
+    .unwrap();
+    assert!(after.deny_labels.is_empty() && after.deny_nodes.is_empty());
+    assert!(after.members.is_empty(), "its roster row goes");
+}

@@ -22,6 +22,37 @@
 # pinned 4.9.3 that `targo --unverified verify provision` builds. (`return`
 # outside a function needs 3.4; `string escape --style=url` needs 3.1.)
 
+# A fish started inside a tab while aterm installs Apple's Command Line Tools
+# (`fish -l -c ...`, an agent's own shell) reads this file from aterm's
+# `vendor_conf.d` after its login `/etc/paths` put `/usr/bin` back in front of
+# the shim, and returns below before the integration loads: the shim goes back
+# to just ahead of the first `/usr/bin` (else `/bin`) here, never ahead of an
+# earlier entry, as the tab's own shell does further on. Only while its
+# `.wanted` mark is there: without it nothing installs them.
+if test -n "$ATERM_CLT_SHIM"; and test -d "$ATERM_CLT_SHIM"; and test -f (string replace -r '/+$' '' -- "$ATERM_CLT_SHIM").wanted
+    if not status is-interactive; or test -n "$ATERM_SHELL_INTEGRATION_INSTALLED"
+        set -l __aterm_rest
+        for __aterm_d in $PATH
+            test "$__aterm_d" != "$ATERM_CLT_SHIM"; and set -a __aterm_rest "$__aterm_d"
+        end
+        set -l __aterm_sys /usr/bin
+        contains -- /usr/bin $__aterm_rest; or set __aterm_sys /bin
+        if contains -- $__aterm_sys $__aterm_rest
+            set -l __aterm_new
+            set -l __aterm_placed 0
+            for __aterm_d in $__aterm_rest
+                if test $__aterm_placed = 0; and test "$__aterm_d" = "$__aterm_sys"
+                    set -a __aterm_new "$ATERM_CLT_SHIM"
+                    set __aterm_placed 1
+                end
+                set -a __aterm_new "$__aterm_d"
+            end
+            test "$__aterm_new" = "$PATH"; or set -gx PATH $__aterm_new
+        end
+        set -e __aterm_d
+    end
+end
+
 # Only run in interactive shells. Use `return` (not `exit`, which kills the
 # fish process when loaded via XDG_DATA_DIRS conf.d).
 if not status is-interactive
@@ -253,6 +284,93 @@ function __aterm_path_front --argument-names dir
     end
     set -gx PATH "$dir" $rest
 end
+# While aterm installs Apple's Command Line Tools, `$ATERM_CLT_SHIM` names the
+# directory whose `git`, `cc` and kin say the tools are on their way instead of
+# raising Apple's install dialog, and its `.wanted` mark is there. A login fish
+# puts `/etc/paths` (`/usr/bin`) back in front of it, so it moves to just ahead
+# of the first `/usr/bin` (else `/bin`): never ahead of a person's own earlier
+# entry. Without the mark nothing installs them: the shim is put back nowhere.
+function __aterm_clt_shim_place
+    set -l dir "$ATERM_CLT_SHIM"
+    __aterm_clt_bash_env "$dir"
+    if test -z "$dir"; or not test -d "$dir"; or not test -f (string replace -r '/+$' '' -- "$dir").wanted
+        return 0
+    end
+    set -l rest
+    for d in $PATH
+        if test "$d" != "$dir"
+            set -a rest "$d"
+        end
+    end
+    set -l sys /usr/bin
+    if not contains -- /usr/bin $rest
+        set sys /bin
+        contains -- /bin $rest; or return 0
+    end
+    set -l new
+    set -l placed 0
+    for d in $rest
+        if test $placed = 0; and test "$d" = "$sys"
+            set -a new "$dir"
+            set placed 1
+        end
+        set -a new "$d"
+    end
+    if test "$new" != "$PATH"
+        set -gx PATH $new
+    end
+end
+# A bash started inside the tab (`bash -lc`, an agent's own shell) runs its
+# login profile and loads no integration, so while the shim at `$argv[1]` is
+# wanted `BASH_ENV` names aterm's `bash/clt_env`, which that bash reads after
+# its profile to put the shim back; the person's own `BASH_ENV` waits in
+# `ATERM_CLT_BASH_ENV_BEFORE` and runs first. Its exact owner is recorded in
+# `ATERM_CLT_BASH_ENV_HOOK`, so another script set preserves the predecessor;
+# an older hook's `ATERM_CLT_BASH_ENV` stays its context. Once the shim is not wanted, the
+# person's own comes back (`__aterm_clt_env_on` has each prompt look).
+if not set -q __aterm_clt_env_on
+    set -g __aterm_clt_env_on 0
+end
+function __aterm_clt_bash_env
+    set -l dir "$argv[1]"
+    set -l si "$ATERM_SHELL_INTEGRATION_DIR"
+    set -l hook "$si/bash/clt_env"
+    set -l before "$BASH_ENV"
+    if set -q ATERM_CLT_BASH_ENV_HOOK; and test "$BASH_ENV" = "$ATERM_CLT_BASH_ENV_HOOK"
+        set before "$ATERM_CLT_BASH_ENV_BEFORE"
+    end
+    # Keep an old hook from sourcing itself when this parent restores it.
+    if test -n "$before"; and test "$ATERM_CLT_BASH_ENV" = "$before"
+        set -eg ATERM_CLT_BASH_ENV
+    end
+    if test -n "$dir"; and test -n "$si"; and test -f (string replace -r '/+$' '' -- "$dir").wanted; and test -f "$hook"
+        if not set -q BASH_ENV; or test "$BASH_ENV" != "$hook"
+            if not set -q ATERM_CLT_BASH_ENV_HOOK; or test "$BASH_ENV" != "$ATERM_CLT_BASH_ENV_HOOK"
+                if set -q BASH_ENV
+                    set -gx ATERM_CLT_BASH_ENV_BEFORE "$BASH_ENV"
+                else
+                    set -eg ATERM_CLT_BASH_ENV_BEFORE
+                end
+            end
+            set -gx BASH_ENV "$hook"
+        end
+        set -gx ATERM_CLT_BASH_ENV_HOOK "$hook"
+        set -g __aterm_clt_env_on 1
+        return 0
+    end
+    if set -q ATERM_CLT_BASH_ENV_HOOK
+        if set -q BASH_ENV; and test "$BASH_ENV" = "$ATERM_CLT_BASH_ENV_HOOK"
+            if set -q ATERM_CLT_BASH_ENV_BEFORE
+                set -gx BASH_ENV "$ATERM_CLT_BASH_ENV_BEFORE"
+            else
+                set -eg BASH_ENV
+            end
+        end
+        set -eg ATERM_CLT_BASH_ENV_BEFORE
+        set -eg ATERM_CLT_BASH_ENV_HOOK
+    end
+    set -g __aterm_clt_env_on 0
+end
 # Track expected leading directories in `$__aterm_managed_want` and whether each
 # existed when last fronted so the per-prompt hot path only stats when a
 # directory was absent.
@@ -280,6 +398,7 @@ function __aterm_reroute_path_front
         set -g __aterm_managed_want "$ATERM_REROUTE_DIR" $__aterm_managed_want
         set -g __aterm_managed_reroute_on 1
     end
+    __aterm_clt_shim_place
 end
 __aterm_reroute_path_front
 # Export `EDITOR=$ATERM_DEFAULT_EDITOR` (aterm's own editor, amacs) only when
@@ -351,6 +470,12 @@ end
 function __aterm_managed_path_live
     if test "$__aterm_managed_live" != 1
         return 0
+    end
+    # Give the person's own `BASH_ENV` back once nothing wants the shim.
+    if test "$__aterm_clt_env_on" = 1
+        if test -z "$ATERM_CLT_SHIM"; or not test -f (string replace -r '/+$' '' -- "$ATERM_CLT_SHIM").wanted
+            __aterm_clt_bash_env ""
+        end
     end
     __aterm_atpkg_hook_read
     if test "$__aterm_atpkg_hook_now" != "$__aterm_atpkg_hook_seen"
@@ -837,18 +962,33 @@ function __aterm_prompt_handlers_ahead
 end
 
 # Warm spare hold at the first prompt event: emit the `spare` start mark, wait
-# for `go` on `$__aterm_spare_fifo`, then merge history and re-run prior
-# `fish_prompt` handlers upon release.
+# for `go` on fd 10, the end the host handed the shell (`$__aterm_spare_fifo`
+# is only the mark), then merge history and re-run prior `fish_prompt` handlers
+# upon release. A spare with no end at fd 10 has no hold: it signs `cold` and
+# goes on as the cold shell it is. Once the host is gone each read is
+# end-of-file and the shell ends; the retries are for a read a signal fails. A
+# builtin given `<&10` reads fish's own stdin instead, so the read opens
+# /dev/fd/10. In an event handler `exit` ends only the handler and fish goes on
+# to its prompt, so the shell ends by `exec`. fish cannot close a descriptor, so
+# the tab keeps fd 10: a read end whose writers close at its first prompt.
 function __aterm_spare_hold
+    if not test -p /dev/fd/10
+        set -e __aterm_spare_fifo
+        __aterm_start_mark cold
+        return 0
+    end
     set -l ahead (__aterm_prompt_handlers_ahead)
     __aterm_start_mark spare (count $ahead)
     set -l n 0
     while true
-        if read -l go <"$__aterm_spare_fifo" 2>/dev/null
+        if read -l go </dev/fd/10 2>/dev/null
             test "$go" = go; and break
         else
             set n (math $n + 1)
-            if test $n -ge 50; or not test -p "$__aterm_spare_fifo"
+            if test $n -ge 50
+                # An `exit` here ends only the event handler, and fish draws its prompt: the hold
+                # ends the shell by replacing it, and the `exit` serves where that fails.
+                exec /bin/sh -c 'exit 0'
                 exit 0
             end
         end

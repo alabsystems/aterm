@@ -35,6 +35,7 @@ impl OperationId {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum AppKind {
+    Mail,
     About,
     Settings,
     SystemState,
@@ -46,6 +47,7 @@ pub(crate) enum AppKind {
 impl AppKind {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
+            Self::Mail => "mail",
             Self::About => "about",
             Self::Settings => "settings",
             Self::SystemState => "system-state",
@@ -58,6 +60,7 @@ impl AppKind {
     /// Human-facing name, spelled as the apps' own tooltips spell it (`"Markdown · {uri}"`), so a tab's install-time tooltip never changes case on first refresh.
     pub(crate) const fn display_name(self) -> &'static str {
         match self {
+            Self::Mail => "Mail",
             Self::About => "About aterm",
             Self::Settings => "Settings",
             Self::SystemState => "System State",
@@ -70,6 +73,7 @@ impl AppKind {
     /// The tab icon this app kind wears.
     pub(crate) const fn icon(self) -> AppIcon {
         match self {
+            Self::Mail => AppIcon::Mail,
             Self::About => AppIcon::About,
             Self::Settings => AppIcon::Settings,
             Self::SystemState => AppIcon::Settings,
@@ -157,6 +161,7 @@ impl CommonViewState {
 }
 
 pub(crate) enum AppViewState {
+    Mail(Box<crate::native_mail::MailViewState>),
     About(Box<crate::native_about::AboutViewState>),
     Settings(Box<crate::native_settings::SettingsViewState>),
     SystemState(Box<crate::system_state::SystemStateViewState>),
@@ -168,6 +173,7 @@ pub(crate) enum AppViewState {
 impl AppViewState {
     pub(crate) const fn kind(&self) -> AppKind {
         match self {
+            Self::Mail(_) => AppKind::Mail,
             Self::About(_) => AppKind::About,
             Self::Settings(_) => AppKind::Settings,
             Self::SystemState(_) => AppKind::SystemState,
@@ -179,6 +185,7 @@ impl AppViewState {
 
     pub(crate) fn common(&self) -> &CommonViewState {
         match self {
+            Self::Mail(view) => &view.common,
             Self::About(view) => &view.common,
             Self::Settings(view) => &view.common,
             Self::SystemState(view) => &view.common,
@@ -197,6 +204,7 @@ impl AppViewState {
 
     pub(crate) fn common_mut(&mut self) -> &mut CommonViewState {
         match self {
+            Self::Mail(view) => &mut view.common,
             Self::About(view) => &mut view.common,
             Self::Settings(view) => &mut view.common,
             Self::SystemState(view) => &mut view.common,
@@ -494,6 +502,7 @@ pub(crate) struct RecoveryApp {
 }
 
 pub(crate) enum NativeApp {
+    Mail(Box<crate::native_mail::MailApp>),
     About(Box<crate::native_about::AboutApp>),
     /// Boxed: the one Settings controller carries every page's projection and dwarfs the document apps, which are the many instances (as its view state is boxed in [`AppViewState::Settings`]).
     Settings(Box<crate::native_settings::SettingsApp>),
@@ -531,6 +540,7 @@ pub(crate) struct AppVTable {
 impl NativeApp {
     pub(crate) const fn vtable(&self) -> &'static AppVTable {
         match self {
+            Self::Mail(_) => &mail_vtable::VTABLE,
             Self::About(_) => &about_vtable::VTABLE,
             Self::Settings(_) => &settings_vtable::VTABLE,
             Self::SystemState(_) => &system_state_vtable::VTABLE,
@@ -546,7 +556,7 @@ impl NativeApp {
 
     pub(crate) const fn document_id(&self) -> Option<DocumentId> {
         match self {
-            Self::About(_) | Self::Settings(_) | Self::SystemState(_) => None,
+            Self::Mail(_) | Self::About(_) | Self::Settings(_) | Self::SystemState(_) => None,
             Self::Markdown(app) => Some(app.document),
             Self::Editor(app) => Some(app.document),
             Self::Recovery(_) => None,
@@ -708,6 +718,7 @@ macro_rules! define_app_vtable {
 }
 
 define_app_vtable!(about_vtable, About, About, AppKind::About, "about");
+define_app_vtable!(mail_vtable, Mail, Mail, AppKind::Mail, "mail");
 define_app_vtable!(
     settings_vtable,
     Settings,
@@ -2213,6 +2224,8 @@ pub(crate) enum UpdateRequest {
 pub(crate) enum HarnessRequest {
     /// Read the harness's ledgers again, off the event loop, and republish (the page's Refresh, and the route's arrival).
     Refresh,
+    /// Refresh the Lab page's local account observation off the event loop.
+    LabRefresh,
     /// Write session `session`'s own Autopilot word (a press on its row's Cruise, Land or Off).
     Autopilot {
         session: u64,
@@ -2457,6 +2470,32 @@ pub(crate) struct ViewMotionCx {
     pub(crate) display_edr: bool,
     /// Automatic selected-tab colour when `active_tab_color` is unset ([`crate::App::automatic_tab_color`]).
     pub(crate) automatic_tab_color: [u8; 3],
+    /// The person's `motion` setting, as [`Self::page`] reads it.
+    pub(crate) mode: crate::motion::MotionMode,
+    /// The overload latch as the person's settings admit it (`App::load_shed_active`), where
+    /// [`Self::performance_reduced`] is the raw latch.
+    pub(crate) shed: bool,
+    /// Low Power Mode, or a serious thermal state (`App::low_power`).
+    pub(crate) low_power: bool,
+    /// Whether this view's window is focused (or recorded): what a page's motion follows,
+    /// where [`Self::focused`] is this leaf's own focus too.
+    pub(crate) window_focused: bool,
+}
+
+impl ViewMotionCx {
+    /// How a native page may move (`docs/DESIGN-init-on-by-default-2026-10-25.md` §5.5–5.6):
+    /// [`crate::motion::MotionPolicy::resolve_page`] over these facts, the one home for the
+    /// person's `motion` setting, Reduce Motion, Serious Mode, the shed, Low Power and focus.
+    pub(crate) const fn page(self) -> crate::motion::PageMotion {
+        crate::motion::MotionPolicy::resolve_page(
+            self.mode,
+            self.system_reduced,
+            self.window_focused,
+            self.serious,
+            self.shed,
+            self.low_power,
+        )
+    }
 }
 
 impl Default for ViewMotionCx {
@@ -2475,6 +2514,10 @@ impl Default for ViewMotionCx {
                 crate::tab_bar::StripFloor::Ground,
                 None,
             ),
+            mode: crate::motion::MotionMode::Auto,
+            shed: false,
+            low_power: false,
+            window_focused: true,
         }
     }
 }
@@ -2733,6 +2776,30 @@ impl Default for NativeRuntime {
 }
 
 impl NativeRuntime {
+    pub(crate) fn poll_mail(&mut self) -> bool {
+        let mut changed = false;
+        let mut connected = false;
+        for app in self.instances.values_mut() {
+            if let NativeApp::Mail(mail) = app {
+                let had = mail.connected();
+                changed |= mail.poll();
+                connected |= !had && mail.connected();
+            }
+        }
+        if changed {
+            for state in self.views.values_mut() {
+                if let AppViewState::Mail(view) = state {
+                    view.common.presentation_revision =
+                        view.common.presentation_revision.wrapping_add(1);
+                    if connected {
+                        view.setup = false;
+                    }
+                    state.touch();
+                }
+            }
+        }
+        changed
+    }
     pub(crate) fn new() -> Self {
         Self::default()
     }
@@ -2781,6 +2848,7 @@ impl NativeRuntime {
                 editor.config_watch_status.clone_from(&watch_status);
             }
             AppViewState::About(_)
+            | AppViewState::Mail(_)
             | AppViewState::SystemState(_)
             | AppViewState::Markdown(_)
             | AppViewState::Editor(_)
@@ -2856,6 +2924,12 @@ impl NativeRuntime {
         })
     }
 
+    /// A kitty pose the setup screen's lockup waits on was baked (`Wake::KittyBaked`): each
+    /// System State view renders again, and draws it.
+    pub(crate) fn kitty_baked(&mut self) {
+        self.touch_system_state_views();
+    }
+
     fn touch_system_state_views(&mut self) {
         for state in self.views.values_mut() {
             if matches!(state, AppViewState::SystemState(_)) {
@@ -2876,29 +2950,42 @@ impl NativeRuntime {
         }) else {
             return false;
         };
+        // A view whose focus is on a card button: that button may leave the card.
+        let focused = self.views.values().any(|view| {
+            matches!(view, AppViewState::SystemState(view) if view.common.last_focus.is_some())
+        });
+        let before = if focused {
+            state.card_buttons()
+        } else {
+            Vec::new()
+        };
         let changed = update(state);
         if changed {
+            if !before.is_empty() {
+                // Focus on a card item that left the card moves to the card's first button (its
+                // default action), else to nothing: never a control that is gone.
+                let after = state.card_buttons();
+                for view in self.views.values_mut() {
+                    let AppViewState::SystemState(view) = view else {
+                        continue;
+                    };
+                    let gone = view.common.last_focus.as_ref().is_some_and(|key| {
+                        before.iter().any(|was| was == key.as_str())
+                            && !after.iter().any(|now| now == key.as_str())
+                    });
+                    if gone {
+                        view.common.last_focus = after.first().map(|key| UiKey::new(key.clone()));
+                    }
+                }
+            }
             self.touch_system_state_views();
         }
         changed
     }
 
-    /// One page tick ([`crate::system_state::SystemStateApp::tick`]): a person is `present` at
-    /// this Mac, the page is `shown` (the active view of some window), and its village walks
-    /// when a view in `seen` (every view someone can see, one in an unfocused split pane
-    /// included) drew it walking at its last render. A view nobody sees never decides it,
-    /// whatever size it last rendered at.
-    pub(crate) fn tick_system_state(
-        &mut self,
-        present: bool,
-        shown: bool,
-        seen: &[ViewId],
-    ) -> bool {
-        let walks = seen.iter().any(|view| {
-            matches!(self.views.get(view), Some(AppViewState::SystemState(state))
-                if state.village_walks())
-        });
-        self.update_system_state(|state| state.tick(present, shown, walks))
+    /// One page tick ([`crate::system_state::SystemStateApp::tick`]).
+    pub(crate) fn tick_system_state(&mut self) -> bool {
+        self.update_system_state(crate::system_state::SystemStateApp::tick)
     }
 
     pub(crate) fn offer_system_state(
@@ -2940,6 +3027,19 @@ impl NativeRuntime {
 
     pub(crate) fn accept_system_state_apply(&mut self, plan: aterm_types::macos_setup::Plan) {
         if self.update_system_state(|state| state.apply_accepted(plan)) {
+            self.retire_system_state_review();
+        }
+    }
+
+    /// What the phrase try `sent` of System State's Secrets vault row came to
+    /// ([`crate::system_state::SystemStateApp::phrase_finished`]): the open page hears it, and
+    /// only a page whose field sent that try changes.
+    pub(crate) fn system_state_phrase_finished(
+        &mut self,
+        sent: crate::system_state::PhraseTry,
+        outcome: Option<crate::system_state_host::PhraseOutcome>,
+    ) {
+        if self.update_system_state(|state| state.phrase_finished(sent, outcome)) {
             self.retire_system_state_review();
         }
     }
@@ -3012,6 +3112,7 @@ impl NativeRuntime {
         let Some(settings) = self.instances.values_mut().find_map(|app| match app {
             NativeApp::Settings(settings) => Some(settings),
             NativeApp::About(_)
+            | NativeApp::Mail(_)
             | NativeApp::SystemState(_)
             | NativeApp::Markdown(_)
             | NativeApp::Editor(_)
@@ -3043,6 +3144,7 @@ impl NativeRuntime {
         let Some(settings) = self.instances.values_mut().find_map(|app| match app {
             NativeApp::Settings(settings) => Some(settings),
             NativeApp::About(_)
+            | NativeApp::Mail(_)
             | NativeApp::SystemState(_)
             | NativeApp::Markdown(_)
             | NativeApp::Editor(_)
@@ -3064,6 +3166,7 @@ impl NativeRuntime {
         let Some(settings) = self.instances.values_mut().find_map(|app| match app {
             NativeApp::Settings(settings) => Some(settings),
             NativeApp::About(_)
+            | NativeApp::Mail(_)
             | NativeApp::SystemState(_)
             | NativeApp::Markdown(_)
             | NativeApp::Editor(_)
@@ -3085,6 +3188,7 @@ impl NativeRuntime {
         let Some(settings) = self.instances.values_mut().find_map(|app| match app {
             NativeApp::Settings(settings) => Some(settings),
             NativeApp::About(_)
+            | NativeApp::Mail(_)
             | NativeApp::SystemState(_)
             | NativeApp::Markdown(_)
             | NativeApp::Editor(_)
@@ -3093,6 +3197,33 @@ impl NativeRuntime {
             return false;
         };
         settings.replace_harness(harness, revision);
+        self.touch_settings_views();
+        true
+    }
+
+    /// Names retained at the latest session lifecycle publication; no session lock is taken.
+    pub(crate) fn settings_lab_session_names(
+        &self,
+    ) -> Option<Vec<crate::harness_screen::HarnessSession>> {
+        self.instances.values().find_map(|app| match app {
+            NativeApp::Settings(settings) => Some(settings.lab_session_names()),
+            _ => None,
+        })
+    }
+
+    /// Replace Lab observations without rebuilding unrelated session/ledger projections.
+    pub(crate) fn replace_settings_lab(
+        &mut self,
+        lab: crate::lab_screen::LabState,
+        revision: u64,
+    ) -> bool {
+        let Some(settings) = self.instances.values_mut().find_map(|app| match app {
+            NativeApp::Settings(settings) => Some(settings),
+            _ => None,
+        }) else {
+            return false;
+        };
+        settings.replace_lab(lab, revision);
         self.touch_settings_views();
         true
     }
@@ -3226,6 +3357,7 @@ impl NativeRuntime {
                     &mut editor.config_watch_status
                 }
                 AppViewState::About(_)
+                | AppViewState::Mail(_)
                 | AppViewState::SystemState(_)
                 | AppViewState::Markdown(_)
                 | AppViewState::Editor(_)
@@ -3248,6 +3380,7 @@ impl NativeRuntime {
                         editor.common.presentation_revision.saturating_add(1);
                 }
                 AppViewState::About(_)
+                | AppViewState::Mail(_)
                 | AppViewState::SystemState(_)
                 | AppViewState::Markdown(_)
                 | AppViewState::Recovery(_) => {}
@@ -3347,6 +3480,7 @@ impl NativeRuntime {
         match self.instances.get(&instance)? {
             NativeApp::Editor(editor) if editor.config_editor => editor.config_analysis.as_ref(),
             NativeApp::Settings(_)
+            | NativeApp::Mail(_)
             | NativeApp::About(_)
             | NativeApp::SystemState(_)
             | NativeApp::Markdown(_)
@@ -3368,6 +3502,7 @@ impl NativeRuntime {
         match self.instances.get(&instance)? {
             NativeApp::Editor(editor) => editor.config_assist(snapshot, caret),
             NativeApp::Settings(_)
+            | NativeApp::Mail(_)
             | NativeApp::About(_)
             | NativeApp::SystemState(_)
             | NativeApp::Markdown(_)
@@ -3508,6 +3643,7 @@ impl NativeRuntime {
                     editor.canonical_uri.clone(),
                 )),
                 NativeApp::About(_)
+                | NativeApp::Mail(_)
                 | NativeApp::Settings(_)
                 | NativeApp::SystemState(_)
                 | NativeApp::Recovery(_) => None,
@@ -3528,6 +3664,7 @@ impl NativeRuntime {
                     Some((*instance, app.base_title.clone(), app.canonical_uri.clone()))
                 }
                 NativeApp::About(_)
+                | NativeApp::Mail(_)
                 | NativeApp::Settings(_)
                 | NativeApp::SystemState(_)
                 | NativeApp::Recovery(_) => None,
@@ -3607,6 +3744,17 @@ impl NativeRuntime {
         view: ViewId,
         field: Option<&UiKey>,
     ) -> bool {
+        if let (Some(NativeApp::Mail(app)), Some(AppViewState::Mail(state))) =
+            (self.instances.get_mut(&instance), self.views.get_mut(&view))
+        {
+            let changed = app.cancel_preedit(state, field);
+            if changed {
+                state.common.presentation_revision =
+                    state.common.presentation_revision.wrapping_add(1);
+                state.common.content_epoch = state.common.content_epoch.wrapping_add(1);
+            }
+            return changed;
+        }
         if matches!(self.views.get(&view), Some(AppViewState::SystemState(_))) {
             if !matches!(
                 self.instances.get(&instance),
@@ -8288,7 +8436,11 @@ mod markdown_reader_tests {
             let state = match kind {
                 AppKind::Markdown => AppViewState::Markdown(MarkdownViewState::default()),
                 AppKind::Editor => AppViewState::Editor(Box::default()),
-                AppKind::About | AppKind::Settings | AppKind::SystemState | AppKind::Recovery => {
+                AppKind::Mail
+                | AppKind::About
+                | AppKind::Settings
+                | AppKind::SystemState
+                | AppKind::Recovery => {
                     unreachable!()
                 }
             };

@@ -440,21 +440,6 @@ pub fn train(parent: &State, data: &[&TrainLabel]) -> Result<State, LearnRefusal
     Ok(s)
 }
 
-/// `C(n, k)`, exactly.
-#[inline]
-const fn choose(n: u32, k: u32) -> u128 {
-    let min_k = if k < n { k } else { n };
-    let rem = n - min_k;
-    let k = if k < rem { k } else { rem };
-    let mut c = 1_u128;
-    let mut i = 0;
-    while i < k {
-        c = c * ((n - i) as u128) / ((i + 1) as u128);
-        i += 1;
-    }
-    c
-}
-
 /// The one-sided sign test at level `1 / level` (design §13.4): `n ≥ 1` and
 /// `level · Σ_{k=w}^{n} C(n, k) ≤ 2ⁿ`, exactly in `u128`, for `n` up to [`POOLS`].
 #[inline]
@@ -463,11 +448,14 @@ pub const fn sign_test(level: u128, wins: u32, n: u32) -> bool {
     if n == 0 || wins > n || n as usize > POOLS {
         return false;
     }
-    let mut tail = 0_u128;
-    let mut k = wins;
-    while k <= n {
-        tail += choose(n, k);
-        k += 1;
+    let rem = n - wins;
+    let mut c = 1_u128;
+    let mut tail = 1_u128;
+    let mut i = 0;
+    while i < rem {
+        c = c * ((n - i) as u128) / ((i + 1) as u128);
+        tail += c;
+        i += 1;
     }
     level * tail <= 1_u128 << n
 }
@@ -4277,12 +4265,12 @@ impl<S: DurableStore> Store<S> {
 /// The pair a `store.txt` names.
 #[inline]
 fn parse_pair(name: &str) -> Option<Pair> {
-    if let Some(i) = name.strip_prefix("pair-") {
+    if let Some(i) = name.strip_prefix("pair-").filter(|s| !s.starts_with('+')) {
         return i.parse().ok().map(Pair::Real);
     }
-    name.strip_prefix("practice-")?
-        .parse()
-        .ok()
+    let i = name.strip_prefix("practice-")?;
+    (!i.starts_with('+'))
+        .then(|| i.parse().ok())?
         .map(Pair::Practice)
 }
 

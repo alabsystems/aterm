@@ -474,3 +474,435 @@ fn a_gpos_refused_through_a_nested_lookup_applies_none_of_it() {
         "past the budget, through a nested lookup: GPOS is refused from the first shape"
     );
 }
+
+/// A `GSUB` whose `calt` runs lookup 0 (glyph 0 to 1), then `lookups` chain-context lookups
+/// sharing one format-3 subtable that takes any glyph followed by `lookahead` more and applies
+/// nothing, so each walks up to `lookahead` glyphs ahead of every glyph of a run, then a last
+/// lookup (glyph 1 to 2).
+fn chained_gsub(lookups: usize, lookahead: usize) -> Vec<u8> {
+    let be16 = |v: usize| u16::try_from(v).unwrap().to_be_bytes();
+    let count = lookups + 2;
+    let mut g = vec![0, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+    let script_list = g.len();
+    g.extend([0, 1, b'D', b'F', b'L', b'T', 0, 8, 0, 4, 0, 0]);
+    g.extend([0, 0, 0xFF, 0xFF, 0, 1, 0, 0]);
+    let feature_list = g.len();
+    g.extend([0, 1, b'c', b'a', b'l', b't', 0, 8, 0, 0]);
+    g.extend(be16(count));
+    (0..count).for_each(|i| g.extend(be16(i)));
+    let lookup_list = g.len();
+    // The lookup tables follow their offsets, then the two single substitutions, then the
+    // shared chain context.
+    let tables = 2 + 2 * count;
+    let singles = tables + 8 * count;
+    let chain = singles + 24;
+    g.extend(be16(count));
+    (0..count).for_each(|i| g.extend(be16(tables + 8 * i)));
+    for i in 0..count {
+        let (kind, subtable) = match i {
+            0 => (1, singles),
+            i if i == count - 1 => (1, singles + 12),
+            _ => (6, chain),
+        };
+        g.extend(be16(kind));
+        g.extend([0, 0, 0, 1]);
+        g.extend(be16(subtable - (tables + 8 * i)));
+    }
+    for glyph in [0, 1] {
+        g.extend([0, 1, 0, 6, 0, 1, 0, 1, 0, 1, 0, glyph]);
+    }
+    let coverage = 12 + 2 * lookahead;
+    g.extend([0, 3, 0, 0, 0, 1]);
+    g.extend(be16(coverage));
+    g.extend(be16(lookahead));
+    (0..lookahead).for_each(|_| g.extend(be16(coverage)));
+    g.extend([0, 0]);
+    g.extend([0, 2, 0, 1, 0, 0, 0xFF, 0xFF, 0, 0]);
+    g[4..6].copy_from_slice(&be16(script_list));
+    g[6..8].copy_from_slice(&be16(feature_list));
+    g[8..10].copy_from_slice(&be16(lookup_list));
+    g
+}
+
+#[test]
+fn contextual_lookups_stop_applying_once_the_layout_budget_is_spent() {
+    use aterm_font::shape::{ShapeFace, UnicodeBuffer, shape};
+    const RUN: usize = 256;
+    let shaped = |lookups: usize| {
+        let bytes = crate::never_panic::sfnt(3, &[(b"GSUB", &chained_gsub(lookups, 128))]);
+        let face = ShapeFace::new(Face::parse(&bytes, 0).expect("the synthetic face parses"));
+        let mut buffer = UnicodeBuffer::new();
+        buffer.push_str(&"x".repeat(RUN));
+        let _ = aterm_font::take_spent();
+        let glyphs: Vec<u32> = shape(&face, &[], buffer)
+            .glyph_infos()
+            .iter()
+            .map(|info| info.glyph_id)
+            .collect();
+        (glyphs, aterm_font::take_spent().layout_ops)
+    };
+    let (glyphs, _) = shaped(2);
+    assert_eq!(glyphs, [2; RUN], "within the budget every lookup runs");
+    // 4,000 lookups walking 128 glyphs ahead at half the run's glyphs would spend about 70M
+    // units, against 16k a character (4.2M here).
+    let (glyphs, spent) = shaped(4_000);
+    let budget = RUN as u64 * 16 * 1024;
+    assert!(
+        (budget..2 * budget).contains(&spent),
+        "spent {spent} of {budget}"
+    );
+    assert_eq!(
+        glyphs, [1; RUN],
+        "past the budget no lookup applies, and the first lookup's substitution stays"
+    );
+}
+
+/// A `GSUB` whose `calt` grows each glyph 0 into 64 glyph 1s, then runs one chain-context
+/// lookup that takes any glyph followed by `lookahead` more and applies nothing.
+fn expanded_single_chain(lookahead: usize) -> Vec<u8> {
+    let be16 = |v: usize| u16::try_from(v).unwrap().to_be_bytes();
+    let mut g = vec![0, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+    let script_list = g.len();
+    g.extend([0, 1, b'D', b'F', b'L', b'T', 0, 8, 0, 4, 0, 0]);
+    g.extend([0, 0, 0xFF, 0xFF, 0, 1, 0, 0]);
+    let feature_list = g.len();
+    g.extend([0, 1, b'c', b'a', b'l', b't', 0, 8, 0, 0, 0, 2, 0, 0, 0, 1]);
+    let lookup_list = g.len();
+    // Two lookup tables at 6 and 14, then the multiple substitution, then the chain context.
+    let multiple = 22;
+    let chain = multiple + 16 + 2 * 64;
+    g.extend([0, 2, 0, 6, 0, 14]);
+    g.extend([0, 2, 0, 0, 0, 1]);
+    g.extend(be16(multiple - 6));
+    g.extend([0, 6, 0, 0, 0, 1]);
+    g.extend(be16(chain - 14));
+    g.extend([0, 1, 0, 8, 0, 1, 0, 14, 0, 1, 0, 1, 0, 0]);
+    g.extend(be16(64));
+    (0..64).for_each(|_| g.extend([0, 1]));
+    let coverage = 12 + 2 * lookahead;
+    g.extend([0, 3, 0, 0, 0, 1]);
+    g.extend(be16(coverage));
+    g.extend(be16(lookahead));
+    (0..lookahead).for_each(|_| g.extend(be16(coverage)));
+    g.extend([0, 0]);
+    g.extend([0, 2, 0, 1, 0, 0, 0xFF, 0xFF, 0, 0]);
+    g[4..6].copy_from_slice(&be16(script_list));
+    g[6..8].copy_from_slice(&be16(feature_list));
+    g[8..10].copy_from_slice(&be16(lookup_list));
+    g
+}
+
+#[test]
+fn one_lookup_over_a_run_a_substitution_grew_is_refused_partway() {
+    use aterm_font::shape::{ShapeFace, UnicodeBuffer, shape};
+    const RUN: usize = 64;
+    let bytes = crate::never_panic::sfnt(3, &[(b"GSUB", &expanded_single_chain(2_048))]);
+    let face = ShapeFace::new(Face::parse(&bytes, 0).expect("the synthetic face parses"));
+    let mut buffer = UnicodeBuffer::new();
+    buffer.push_str(&"x".repeat(RUN));
+    let _ = aterm_font::take_spent();
+    let glyphs = shape(&face, &[], buffer).glyph_infos().len();
+    let spent = aterm_font::take_spent().layout_ops;
+    assert_eq!(
+        glyphs,
+        RUN * 64,
+        "the multiple substitution applies in full"
+    );
+    // Walking 2,048 glyphs ahead at the first half of 4,096 would spend about 4.2M units; only
+    // refusing within the one lookup keeps it near the budget.
+    let budget = RUN as u64 * 16 * 1024;
+    assert!(
+        (budget..2 * budget).contains(&spent),
+        "spent {spent} of {budget}"
+    );
+}
+
+/// The synthetic face's glyphs: bases `B` and `x`, a mark `m`, ligatures `L` and `Z` of `B`s
+/// and of `Z0`s, and `OUT`, which the last lookup of each `GSUB` makes.
+const B: usize = 1;
+const M: usize = 2;
+const X: usize = 3;
+const L: usize = 4;
+const Z0: usize = 5;
+const Z: usize = 6;
+const OUT: usize = 7;
+const IGNORE_MARKS: usize = 8;
+
+fn be16(v: usize) -> [u8; 2] {
+    u16::try_from(v).unwrap().to_be_bytes()
+}
+
+/// `from` to `to` (SingleSubstFormat1).
+fn single(from: usize, to: usize) -> Vec<u8> {
+    [
+        &[0, 1, 0, 6][..],
+        &be16(to.wrapping_sub(from) & 0xFFFF),
+        &[0, 1, 0, 1],
+        &be16(from),
+    ]
+    .concat()
+}
+
+/// `from` to the glyphs `to` (MultipleSubstFormat1).
+fn multiple(from: usize, to: &[usize]) -> Vec<u8> {
+    let mut t = vec![0, 1, 0, 8, 0, 1, 0, 14, 0, 1, 0, 1];
+    t.extend(be16(from));
+    t.extend(be16(to.len()));
+    to.iter().for_each(|&glyph| t.extend(be16(glyph)));
+    t
+}
+
+/// `first` and then `rest` to `glyph` (LigatureSubstFormat1).
+fn ligature(first: usize, rest: &[usize], glyph: usize) -> Vec<u8> {
+    let mut t = vec![0, 1, 0, 8, 0, 1, 0, 14, 0, 1, 0, 1];
+    t.extend(be16(first));
+    t.extend([0, 1, 0, 4]);
+    t.extend(be16(glyph));
+    t.extend(be16(rest.len() + 1));
+    rest.iter().for_each(|&glyph| t.extend(be16(glyph)));
+    t
+}
+
+/// `input` copies of `glyph`, running each `(sequence index, lookup)` record (ContextFormat3).
+fn context(input: usize, glyph: usize, records: &[(usize, usize)]) -> Vec<u8> {
+    let coverage = 6 + 2 * input + 4 * records.len();
+    let mut t = vec![0, 3];
+    t.extend(be16(input));
+    t.extend(be16(records.len()));
+    (0..input).for_each(|_| t.extend(be16(coverage)));
+    records
+        .iter()
+        .for_each(|&(index, lookup)| t.extend([be16(index), be16(lookup)].concat()));
+    t.extend([0, 1, 0, 1]);
+    t.extend(be16(glyph));
+    t
+}
+
+/// `glyph` followed by `ahead`, running each `(sequence index, lookup)` record
+/// (ChainContextFormat3).
+fn chain(glyph: usize, ahead: usize, records: &[(usize, usize)]) -> Vec<u8> {
+    let coverage = 14 + 4 * records.len();
+    let mut t = vec![0, 3, 0, 0, 0, 1];
+    t.extend(be16(coverage));
+    t.extend([0, 1]);
+    t.extend(be16(coverage + 6));
+    t.extend(be16(records.len()));
+    records
+        .iter()
+        .for_each(|&(index, lookup)| t.extend([be16(index), be16(lookup)].concat()));
+    t.extend([0, 1, 0, 1]);
+    t.extend(be16(glyph));
+    t.extend([0, 1, 0, 1]);
+    t.extend(be16(ahead));
+    t
+}
+
+type Lookup = (usize, usize, Vec<u8>);
+
+/// A `GSUB` whose `calt` runs the `first` lookups (each a type, flags and subtable), then
+/// `copies` lookups sharing one rule, then a last lookup that turns `last` into `OUT`. The
+/// `nested` lookups follow the copies, outside `calt`; `rule` makes the rule's subtable given
+/// the first one's index.
+fn repeated_rule_gsub(
+    first: &[Lookup],
+    copies: usize,
+    rule: (usize, usize, &dyn Fn(usize) -> Vec<u8>),
+    nested: &[Lookup],
+    last: usize,
+) -> Vec<u8> {
+    let (kind, flags, rule) = rule;
+    let mut subtables = vec![rule(first.len() + copies), single(last, OUT)];
+    let mut lookups = Vec::new();
+    let mut own = |(kind, flags, subtable): &Lookup| {
+        subtables.push(subtable.clone());
+        (*kind, *flags, subtables.len() - 1)
+    };
+    lookups.extend(first.iter().map(&mut own));
+    lookups.extend(std::iter::repeat_n((kind, flags, 0), copies));
+    lookups.extend(nested.iter().map(&mut own));
+    lookups.push((1, 0, 1));
+    let in_calt = (0..first.len() + copies).chain([lookups.len() - 1]);
+
+    let mut g = vec![0, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+    let script_list = g.len();
+    g.extend([0, 1, b'D', b'F', b'L', b'T', 0, 8, 0, 4, 0, 0]);
+    g.extend([0, 0, 0xFF, 0xFF, 0, 1, 0, 0]);
+    let feature_list = g.len();
+    g.extend([0, 1, b'c', b'a', b'l', b't', 0, 8, 0, 0]);
+    g.extend(be16(first.len() + copies + 1));
+    in_calt.for_each(|i| g.extend(be16(i)));
+    let lookup_list = g.len();
+    // The lookup tables follow their offsets, then the subtables.
+    let tables = 2 + 2 * lookups.len();
+    let mut at = tables + 8 * lookups.len();
+    let offsets: Vec<usize> = subtables
+        .iter()
+        .map(|subtable| {
+            at += subtable.len();
+            at - subtable.len()
+        })
+        .collect();
+    g.extend(be16(lookups.len()));
+    (0..lookups.len()).for_each(|i| g.extend(be16(tables + 8 * i)));
+    for (i, &(kind, flags, subtable)) in lookups.iter().enumerate() {
+        g.extend([be16(kind), be16(flags), be16(1)].concat());
+        g.extend(be16(offsets[subtable] - (tables + 8 * i)));
+    }
+    subtables.iter().for_each(|subtable| g.extend(subtable));
+    g[4..6].copy_from_slice(&be16(script_list));
+    g[6..8].copy_from_slice(&be16(feature_list));
+    g[8..10].copy_from_slice(&be16(lookup_list));
+    g
+}
+
+fn shaped_spending(gsub: &[u8], text: &str) -> (Vec<u32>, aterm_font::Spent) {
+    use aterm_font::shape::{ShapeFace, UnicodeBuffer, shape};
+    let cmap = crate::gpos_shaping::cmap_format4(&[
+        (u16::from(b'B'), B as u16),
+        (u16::from(b'm'), M as u16),
+        (u16::from(b'x'), X as u16),
+    ]);
+    let mut gdef = vec![0, 1, 0, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 7];
+    // Glyph classes from `B`: base, mark, base, ligature, base, ligature, base.
+    [1, 3, 1, 2, 1, 2, 1]
+        .iter()
+        .for_each(|&class| gdef.extend(be16(class)));
+    let bytes = crate::never_panic::sfnt(8, &[(b"cmap", &cmap), (b"GDEF", &gdef), (b"GSUB", gsub)]);
+    let face = ShapeFace::new(Face::parse(&bytes, 0).expect("the synthetic face parses"));
+    let mut buffer = UnicodeBuffer::new();
+    buffer.push_str(text);
+    let _ = aterm_font::take_spent();
+    let glyphs = shape(&face, &[], buffer)
+        .glyph_infos()
+        .iter()
+        .map(|info| info.glyph_id)
+        .collect();
+    (glyphs, aterm_font::take_spent())
+}
+
+/// Shapes `text` with `gsub(2)`, then `gsub(2_000)` (the rule's copies), checking that every
+/// glyph `walked` counts is charged, that two copies run within the budget and walk the run,
+/// and that 2,000 stop within twice the budget, before the last lookup.
+fn charges_what_it_walks(
+    gsub: impl Fn(usize) -> Vec<u8>,
+    text: &str,
+    last: usize,
+    walked: impl Fn(&aterm_font::Spent) -> u64,
+) {
+    let run = text.chars().count() as u64;
+    let budget = run * 16 * 1024;
+    let last_glyph = |glyphs: &[u32]| {
+        let at = glyphs
+            .iter()
+            .rposition(|&g| [last, OUT].contains(&(g as usize)));
+        glyphs[at.expect("the last lookup's glyph is there")] as usize
+    };
+    let (glyphs, spent) = shaped_spending(&gsub(2), text);
+    assert_eq!(
+        last_glyph(&glyphs),
+        OUT,
+        "within the budget every lookup runs"
+    );
+    assert!(
+        walked(&spent) > 32 * run,
+        "the rules walk the run: {spent:?}"
+    );
+    assert!(
+        walked(&spent) <= spent.layout_ops,
+        "every glyph walked is charged: {spent:?}"
+    );
+    let (glyphs, spent) = shaped_spending(&gsub(2_000), text);
+    assert!(
+        walked(&spent) <= spent.layout_ops,
+        "every glyph walked is charged: {spent:?}"
+    );
+    assert!(
+        (budget..2 * budget).contains(&spent.layout_ops),
+        "spent {spent:?} of {budget}"
+    );
+    assert_eq!(
+        last_glyph(&glyphs),
+        last,
+        "past the budget the last lookup does not apply"
+    );
+}
+
+#[test]
+fn a_rule_moving_between_its_positions_spends_the_layout_budget() {
+    // Records alternating between two `B`s that the match paired across 254 marks, so each
+    // moves those marks to the output or back. Unmetered, 2,000 copies move 33M glyphs.
+    let alternating = |nested| {
+        context(
+            2,
+            B,
+            &(0..64).map(|k| (1 - k % 2, nested)).collect::<Vec<_>>(),
+        )
+    };
+    charges_what_it_walks(
+        |copies| {
+            let nothing = (1, 0, single(0, 0));
+            repeated_rule_gsub(&[], copies, (5, IGNORE_MARKS, &alternating), &[nothing], B)
+        },
+        &("B".to_owned() + &"m".repeat(254) + "B"),
+        B,
+        |spent| spent.glyphs_moved,
+    );
+    // Records all at a `B` that a multiple substitution grows into `B m`: each rewinds past the
+    // input read so far, which shifts the rest of the input forward.
+    let regrowing = |nested| context(1, B, &[(0, nested); 64]);
+    charges_what_it_walks(
+        |copies| {
+            let grow = (2, 0, multiple(B, &[B, M]));
+            repeated_rule_gsub(&[], copies, (5, 0, &regrowing), &[grow], X)
+        },
+        &("B".to_owned() + &"x".repeat(255)),
+        X,
+        |spent| spent.glyphs_moved,
+    );
+}
+
+#[test]
+fn walks_over_a_ligatures_marks_spend_the_layout_budget() {
+    // `B`, 253 marks and `B` ligate into `L` with the marks after it, then `x`.
+    let text = "B".to_owned() + &"m".repeat(253) + "Bx";
+    let first = [(4, IGNORE_MARKS, ligature(B, &[B], L))];
+    // Records cycling `L` to 16 `Z0`s and `L`, those to `Z` (a ligature of 16 components,
+    // which its 4 bits store as 0), and `Z` and `L` back to `L`, which renumbers every mark
+    // after `L` and leaves their numbers as they were.
+    let cycling = |nested| {
+        let records: Vec<_> = (0..192).map(|k| (0, nested + k % 3)).collect();
+        context(1, L, &records)
+    };
+    charges_what_it_walks(
+        |copies| {
+            let nested = [
+                (2, 0, multiple(L, &[[Z0; 16].as_slice(), &[L]].concat())),
+                (4, 0, ligature(Z0, &[Z0; 15], Z)),
+                (4, 0, ligature(Z, &[L], L)),
+            ];
+            repeated_rule_gsub(&first, copies, (5, 0, &cycling), &nested, X)
+        },
+        &text,
+        X,
+        |spent| spent.marks_walked,
+    );
+    // Records at the last mark, before `x`, trying to ligate it with `x` past the marks: the
+    // mark belongs to `L` and `x` does not, so the match walks back over every mark to `L` to
+    // see whether it may be skipped (it may not).
+    let at_the_last_mark = |nested| chain(M, X, &[(0, nested); 64]);
+    charges_what_it_walks(
+        |copies| {
+            let past_the_marks = (4, IGNORE_MARKS, ligature(M, &[X], L));
+            repeated_rule_gsub(
+                &first,
+                copies,
+                (6, 0, &at_the_last_mark),
+                &[past_the_marks],
+                X,
+            )
+        },
+        &text,
+        X,
+        |spent| spent.marks_walked,
+    );
+}

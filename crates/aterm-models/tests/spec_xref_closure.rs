@@ -58,6 +58,9 @@ fn collected_digests(refs: &[&xref::RefinementAnchor], waivers: &[&xref::Waiver]
 fn spec_xref_closure() {
     let _domains = aterm_models::link_all();
     std::hint::black_box(
+        aterm_agent::harness::accounts_sync::account_shared_recovery_environment as fn(),
+    );
+    std::hint::black_box(
         aterm_agent::harness::accounts_sync::account_provider_realm_environment as fn(),
     );
     std::hint::black_box(
@@ -67,6 +70,14 @@ fn spec_xref_closure() {
     std::hint::black_box(aterm_db::replica::db_repair_policy_environment as fn());
     #[cfg(unix)]
     std::hint::black_box(aterm_db::accounts::claims::db_claim_ring_environment as fn());
+    #[cfg(unix)]
+    std::hint::black_box((
+        aterm_db::import::commons::Imports::compare as *const (),
+        aterm_db::import::commons::Imports::apply as *const (),
+        aterm_db::accounts::proposals::Proposals::plan as *const (),
+        aterm_db::accounts::proposals::Proposals::create_if_absent as *const (),
+        aterm_db::accounts::proposals::Proposals::replace_if_current as *const (),
+    ));
     std::hint::black_box(aterm_secrets::need::credential_request_environment as fn());
     std::hint::black_box(
         aterm_agent::harness::codex_app_login::codex_refresh_publication_environment as fn(),
@@ -297,6 +308,25 @@ fn spec_xref_closure() {
     eprintln!("spec_xref_closure: {} registered model(s)", modules.len());
 
     let report = xref::check_closure(&modules);
+    #[cfg(unix)]
+    for machine in [
+        "DbImportComparison",
+        "DbImportAtomic",
+        "DbAccountPlan",
+        "DbProposalConditional",
+        "AccountSharedRecovery",
+        "AccountSharedProgress",
+        "AccountSharedAdoptionProgress",
+        "AccountSharedAdoptionRecovery",
+    ] {
+        assert!(
+            report
+                .coverage
+                .iter()
+                .any(|coverage| coverage.machine == machine && coverage.active),
+            "{machine} must participate in source-to-model closure"
+        );
+    }
 
     eprintln!("spec_xref_closure: per-machine coverage ledger:");
     for c in &report.coverage {

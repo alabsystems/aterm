@@ -441,6 +441,7 @@ impl Grid {
     /// Make an inline-image ref a cell's only image.
     #[inline]
     pub fn set_cell_image(&mut self, row: u16, col: u16, image: crate::ImageRef) {
+        crate::history_reads::note();
         self.storage.cell_extra_mut(row, col);
         let coord = CellCoord::new(row, col);
         self.storage.extras_mut().set_image(coord, image);
@@ -449,6 +450,7 @@ impl Grid {
     /// Stack an inline-image ref onto a cell's images in draw order.
     #[inline]
     pub fn stack_cell_image(&mut self, row: u16, col: u16, image: crate::ImageRef) {
+        crate::history_reads::note();
         self.storage.cell_extra_mut(row, col);
         let coord = CellCoord::new(row, col);
         self.storage.extras_mut().stack_image(coord, image);

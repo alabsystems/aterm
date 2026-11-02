@@ -29,13 +29,19 @@ pub(crate) fn cmd_scroll(
         "down" => ScrollIntent::Down,
         "prev-prompt" => ScrollIntent::PrevPrompt,
         "next-prompt" => ScrollIntent::NextPrompt,
-        n => match n.parse::<i32>() {
-            Ok(d) => ScrollIntent::By(d),
-            Err(_) => {
-                return "ERR usage: scroll <up|down|top|bottom|prev-prompt|next-prompt|N>\n"
-                    .to_string();
+        n => {
+            let s = n.strip_prefix('-').unwrap_or(n);
+            match (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| n.parse::<i32>().ok())
+                .flatten()
+            {
+                Some(d) => ScrollIntent::By(d),
+                None => {
+                    return "ERR usage: scroll <up|down|top|bottom|prev-prompt|next-prompt|N>\n"
+                        .to_string();
+                }
             }
-        },
+        }
     };
     match post_input_reply(proxy, vec![InputEvent::ScrollView(intent)]) {
         Ok(_) => {}
@@ -329,7 +335,8 @@ pub(crate) fn control_fence(
 /// The usage line every malformed `key` body answers (the plain, guarded and both cross-session arms).
 pub(crate) const KEY_USAGE: &str = "ERR usage: key [id=<epoch>:<producer>:<seq>] [if=<re>] \
                                     [if-gen=<epoch>.<seq>] [if-fp=<hex16>] [if-human=<n>] \
-                                    [if-supervisor=<holder>] [unread=ok] \
+                                    [if-supervisor=<holder>] [if-supervisor-revision=<n>] \
+                                    [harness-duty=<scope>] [unread=ok] \
                                     [act=approve|deny|answer] [<mod>+]<name|char> \
                                     [mods=<list>] [type=press|repeat|release] [base=<c>] — \
                                     names include enter tab esc space backspace delete insert \
@@ -353,6 +360,10 @@ pub(crate) struct LeadingInputOptions {
     pub unread_ok: bool,
     /// The `if-supervisor=<holder>` fence (the self-claim contract, §2).
     pub if_supervisor: Option<String>,
+    /// A typed supervisor input's exact authority revision, read from `status`.
+    pub supervisor_revision: Option<u64>,
+    /// The duty this coordinated input performs, never inferred from a key's text.
+    pub harness_duty: Option<aterm_agent::harness::contract::Scope>,
     /// `cause=@<off>|<seq>`: the mail or record this input acted on, which the turn it opens names.
     pub cause: Option<crate::session_log::CauseRef>,
     /// `act=approve|deny|answer`: what this input means for the approval box or question it dismisses.
@@ -398,6 +409,51 @@ pub(crate) const ACT_USAGE: &str =
 const IF_SUPERVISOR_USAGE: &str =
     "ERR usage: if-supervisor=<holder> needs the holder the claim was made under\n";
 
+const SUPERVISOR_INPUT_USAGE: &str = "ERR usage: typed supervisor input takes if-supervisor=<holder> if-supervisor-revision=<n> harness-duty=<scope> together, once\n";
+
+impl LeadingInputOptions {
+    /// The complete typed request; malformed or incomplete groups are already a usage refusal.
+    pub(crate) fn supervisor_request(
+        &self,
+    ) -> Option<crate::session_timeline::SupervisorInputRequest> {
+        Some(crate::session_timeline::SupervisorInputRequest {
+            holder: self.if_supervisor.clone()?,
+            revision: self.supervisor_revision?,
+            duty: self.harness_duty?,
+        })
+    }
+}
+
+fn take_supervisor_option(opts: &mut LeadingInputOptions, head: &str) -> bool {
+    if let Some(value) = head.strip_prefix("if-supervisor=") {
+        take_if_supervisor(opts, value);
+    } else if let Some(value) = head.strip_prefix("if-supervisor-revision=") {
+        let revision = (!value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| value.parse::<u64>().ok())
+            .flatten();
+        match revision {
+            Some(revision) if opts.supervisor_revision.replace(revision).is_none() => {}
+            _ => opts.refusal = Some(SUPERVISOR_INPUT_USAGE.to_string()),
+        }
+    } else if let Some(value) = head.strip_prefix("harness-duty=") {
+        match aterm_agent::harness::contract::Scope::from_word(value) {
+            Some(duty) if opts.harness_duty.replace(duty).is_none() => {}
+            _ => opts.refusal = Some(SUPERVISOR_INPUT_USAGE.to_string()),
+        }
+    } else {
+        return false;
+    }
+    true
+}
+
+fn finish_supervisor_options(opts: &mut LeadingInputOptions) {
+    if (opts.supervisor_revision.is_some() || opts.harness_duty.is_some())
+        && opts.supervisor_request().is_none()
+    {
+        opts.refusal = Some(SUPERVISOR_INPUT_USAGE.to_string());
+    }
+}
+
 fn take_if_supervisor(opts: &mut LeadingInputOptions, value: &str) {
     if !crate::session_timeline::valid_owner_token(value) || value == "-" {
         opts.refusal = Some(IF_SUPERVISOR_USAGE.to_string());
@@ -414,11 +470,24 @@ pub(crate) fn take_leading_options(class: Input, rest: &str) -> (LeadingInputOpt
     let caused = class.contains(Input::CAUSE);
     let mut opts = LeadingInputOptions::default();
     if !keyed && !guarded {
-        // `paste`'s body is raw: only a leading `if-supervisor=<holder>` and
-        // the one space after it are taken off, and nothing else.
-        if supervised && let Some(after) = rest.strip_prefix("if-supervisor=") {
-            let (value, body) = after.split_once(' ').unwrap_or((after, ""));
-            take_if_supervisor(&mut opts, value);
+        // `paste` keeps its raw body, including extra spaces after the one separating each
+        // leading authority option. `--` ends those options before a literal option-like body.
+        if supervised {
+            let mut body = rest;
+            loop {
+                let (head, tail) = body.split_once(' ').unwrap_or((body, ""));
+                if head == "--"
+                    && (opts.supervisor_revision.is_some() || opts.harness_duty.is_some())
+                {
+                    body = tail;
+                    break;
+                }
+                if !take_supervisor_option(&mut opts, head) {
+                    break;
+                }
+                body = tail;
+            }
+            finish_supervisor_options(&mut opts);
             return (opts, body);
         }
         return (opts, rest);
@@ -496,12 +565,15 @@ pub(crate) fn take_leading_options(class: Input, rest: &str) -> (LeadingInputOpt
             continue;
         }
         if guarded && let Some(value) = head.strip_prefix("if-human=") {
-            match value.parse::<u64>() {
-                Ok(n) if opts.if_human.replace(n).is_some() => {
+            match (!value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| value.parse::<u64>().ok())
+                .flatten()
+            {
+                Some(n) if opts.if_human.replace(n).is_some() => {
                     opts.refusal = Some("ERR usage: if-human= given twice\n".to_string());
                 }
-                Ok(_) => {}
-                Err(_) => {
+                Some(_) => {}
+                None => {
                     opts.refusal = Some(
                         "ERR usage: if-human=<n> needs the person count a read returned \
                          (status human_seq=)\n"
@@ -513,8 +585,7 @@ pub(crate) fn take_leading_options(class: Input, rest: &str) -> (LeadingInputOpt
             consumed = true;
             continue;
         }
-        if supervised && let Some(value) = head.strip_prefix("if-supervisor=") {
-            take_if_supervisor(&mut opts, value);
+        if supervised && take_supervisor_option(&mut opts, head) {
             cur = tail;
             consumed = true;
             continue;
@@ -563,6 +634,7 @@ pub(crate) fn take_leading_options(class: Input, rest: &str) -> (LeadingInputOpt
         }
         break;
     }
+    finish_supervisor_options(&mut opts);
     if opts.as_person
         && (opts.idem.is_some()
             || opts.guard.is_some()
@@ -570,6 +642,8 @@ pub(crate) fn take_leading_options(class: Input, rest: &str) -> (LeadingInputOpt
             || opts.if_fp.is_some()
             || opts.if_human.is_some()
             || opts.if_supervisor.is_some()
+            || opts.supervisor_revision.is_some()
+            || opts.harness_duty.is_some()
             || opts.act.is_some()
             || opts.cause.is_some())
     {
@@ -770,7 +844,22 @@ pub(crate) fn input_if_fenced_observed(
         echo_write.finish_delivery(Delivery::Full, None, &ctx.sink);
         return GuardedInput::Pressed(Delivery::Full);
     }
-    let (outcome, accepted_order) = ctx.sink.try_write_frame_whole_with_receipt(&bytes);
+    if completion
+        .as_ref()
+        .is_some_and(|completion| !completion.start_supervised_inline())
+    {
+        return GuardedInput::Pressed(Delivery::BusyZero);
+    }
+    let supervised = completion
+        .as_ref()
+        .is_some_and(|completion| completion.is_supervised());
+    let (outcome, accepted_order, prefix_receipt) = if supervised {
+        let (outcome, receipt) = ctx.sink.try_write_frame_whole_with_prefix(&bytes);
+        (outcome, receipt.order(), Some(receipt))
+    } else {
+        let (outcome, order) = ctx.sink.try_write_frame_whole_with_receipt(&bytes);
+        (outcome, order, None)
+    };
     if matches!(
         outcome,
         aterm_session::sink::ImmediateWrite::Full
@@ -785,7 +874,7 @@ pub(crate) fn input_if_fenced_observed(
         }
     }
     drop(foreground);
-    let delivery = match outcome {
+    let mut delivery = match outcome {
         aterm_session::sink::ImmediateWrite::Full
         | aterm_session::sink::ImmediateWrite::Queued { .. } => Delivery::Full,
         aterm_session::sink::ImmediateWrite::BusyZero => Delivery::BusyZero,
@@ -793,8 +882,22 @@ pub(crate) fn input_if_fenced_observed(
             Delivery::PartialInDoubt { accepted }
         }
     };
-    echo_write.finish_delivery(delivery, accepted_order, &ctx.sink);
     drop(terminal);
+    if let Some(receipt) = prefix_receipt
+        && receipt.order().is_some()
+        && !receipt
+            .kernel_prefix()
+            .is_some_and(|prefix| ctx.sink.wait_prefix_to_kernel(prefix))
+    {
+        delivery = match outcome {
+            aterm_session::sink::ImmediateWrite::Queued { accepted }
+            | aterm_session::sink::ImmediateWrite::PartialInDoubt { accepted } => {
+                Delivery::PartialInDoubt { accepted }
+            }
+            _ => Delivery::Failed,
+        };
+    }
+    echo_write.finish_delivery(delivery, accepted_order, &ctx.sink);
     if let Some(completion) = completion {
         completion.finish(crate::input::EgressReceipt::from_reported_delivery(
             delivery,
@@ -995,13 +1098,14 @@ pub(crate) fn feed_bytes(rest: &str) -> Result<Vec<u8>, &'static str> {
     aterm_codec::hex::decode_vec(hex.as_bytes()).ok_or("ERR bad hex\n")
 }
 
-/// `signal <name> [pid=<n>] [quiet=<s>]` -> deliver a job-control signal to the PTY's foreground process group (`tcgetpgrp` on the master, then `killpg`), or with `pid=` (which must be that group's id) to its leader alone (`kill`), whatever the line discipline would generate.
+/// `signal <name> [pid=<n>] [quiet=<s>]` -> deliver a job-control signal to the PTY's foreground process group (`tcgetpgrp` on the master, then `killpg`), or with `pid=` (which must be that group's id) to its leader alone (`kill`), whatever the line discipline would generate. A signal that ends a program (`term`, `kill`, `int`, `quit`, `hup`; never `cont` or `tstp`) is `asker`'s ask: past every refusal and just before the signal it writes `act word=signal by=<asker>` and the ask ([`crate::session_log::EndAsker::ask`]), taken back when the signal is not delivered.
 #[cfg(unix)]
 pub(crate) fn cmd_signal(
     master: i32,
     rest: &str,
     sink: &SinkWriter,
     human_ms: Option<u64>,
+    asker: Option<crate::session_log::EndAsker<'_>>,
 ) -> String {
     let (sig, pid, quiet) = match parse_signal(rest) {
         Ok(v) => v,
@@ -1026,12 +1130,16 @@ pub(crate) fn cmd_signal(
     }
     let discarded = crate::input_stall::discard_before_signal(master, sink, sig);
     let tail = discarded.map_or_else(String::new, |n| format!(" discarded={n}"));
+    let asker = ask_signal_end(asker, sig, pgrp);
     let rc = match pid {
         // SAFETY: `kill` on a pid this terminal's own foreground group is led by, re-read just above.
         Some(pid) => unsafe { libc::kill(pid, sig) },
         // SAFETY: `killpg` on the terminal's own foreground group, read from the master just above; it takes no pointers.
         None => unsafe { libc::killpg(pgrp, sig) },
     };
+    if let Some(asker) = asker {
+        let _ = asker.delivered(pgrp, rc);
+    }
     let reply = match (pid, rc) {
         (Some(pid), 0) => format!("OK signalled pid {pid}{tail}\n"),
         (Some(_), _) => format!("ERR kill failed{tail}\n"),
@@ -1042,19 +1150,59 @@ pub(crate) fn cmd_signal(
     reply
 }
 
-/// The `signal` verb as the control dispatch runs it ([`super::serve_session_verb`]'s arm).
-pub(crate) fn signal_verb(master: i32, rest: &str, ctx: &SessionCtx) -> String {
+/// Whether signal `sig`'s default action ends the process: `term`, `kill`, `int`, `quit` and
+/// `hup` do; `cont` resumes a job and `tstp` stops one, so neither asks for an end.
+#[cfg(unix)]
+const fn ends_a_program(sig: i32) -> bool {
+    matches!(
+        sig,
+        libc::SIGTERM | libc::SIGKILL | libc::SIGINT | libc::SIGQUIT | libc::SIGHUP
+    )
+}
+
+/// THE ASK A SIGNAL MAKES: a signal `sig` to group `pgrp` that ends a program
+/// ([`ends_a_program`]) writes `asker`'s act mark and its ask ([`crate::session_log::EndAsker::ask`])
+/// and hands the asker back, so a signal that fails takes it back; any other asks nothing.
+#[cfg(unix)]
+pub(crate) fn ask_signal_end(
+    asker: Option<crate::session_log::EndAsker<'_>>,
+    sig: i32,
+    pgrp: i32,
+) -> Option<crate::session_log::EndAsker<'_>> {
+    let asker = asker.filter(|_| ends_a_program(sig))?;
+    asker.ask(pgrp, crate::session_log::AskWord::Signal);
+    Some(asker)
+}
+
+/// The `signal` verb as the control dispatch runs it ([`super::serve_session_verb`]'s arm), on
+/// `by`'s ask.
+pub(crate) fn signal_verb(
+    master: i32,
+    rest: &str,
+    ctx: &SessionCtx,
+    by: aterm_slog::Actor,
+) -> String {
     cmd_signal(
         master,
         rest,
         &ctx.sink,
         ctx.human_input.ms_since(crate::metrics::now_us()),
+        Some(crate::session_log::EndAsker {
+            timeline: &ctx.timeline,
+            by,
+        }),
     )
 }
 
-/// The `restart` verb as the control dispatch runs it ([`super::serve_session_verb`]'s arm).
-pub(crate) fn restart_verb(master: i32, rest: &str, ctx: &std::sync::Arc<SessionCtx>) -> String {
-    crate::restart_act::restart(master, rest, ctx)
+/// The `restart` verb as the control dispatch runs it ([`super::serve_session_verb`]'s arm), on
+/// `by`'s ask.
+pub(crate) fn restart_verb(
+    master: i32,
+    rest: &str,
+    ctx: &std::sync::Arc<SessionCtx>,
+    by: aterm_slog::Actor,
+) -> String {
+    crate::restart_act::restart(master, rest, ctx, by)
 }
 
 /// Pure parser for `signal <name> [pid=<n>] [quiet=<s>]` -> (signal number, exact pid, quiet seconds).
@@ -1076,14 +1224,21 @@ pub(crate) fn parse_signal(rest: &str) -> Result<(i32, Option<i32>, Option<u32>)
     let mut quiet = None;
     for w in words {
         if let Some(s) = w.strip_prefix("quiet=") {
-            match s.parse::<u32>() {
-                Ok(s) if quiet.is_none() => quiet = Some(s),
+            match (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| s.parse::<u32>().ok())
+                .flatten()
+            {
+                Some(s) if quiet.is_none() => quiet = Some(s),
                 _ => return Err(format!("ERR bad signal argument: {w}\n")),
             }
             continue;
         }
-        match w.strip_prefix("pid=").map(str::parse::<i32>) {
-            Some(Ok(n)) if n > 1 && pid.is_none() => pid = Some(n),
+        match w
+            .strip_prefix("pid=")
+            .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|s| s.parse::<i32>().ok())
+        {
+            Some(n) if n > 1 && pid.is_none() => pid = Some(n),
             _ => return Err(format!("ERR bad signal argument: {w}\n")),
         }
     }
@@ -1097,8 +1252,9 @@ pub(crate) fn cmd_signal(
     rest: &str,
     sink: &SinkWriter,
     human_ms: Option<u64>,
+    asker: Option<crate::session_log::EndAsker<'_>>,
 ) -> String {
-    let _ = (master, rest, sink, human_ms);
+    let _ = (master, rest, sink, human_ms, asker.map(|a| a.by));
     "ERR signal unsupported on this platform\n".to_string()
 }
 
@@ -1134,7 +1290,11 @@ pub(crate) fn parse_mouse(rest: &str) -> Result<InputEvent, String> {
                 };
             }
         } else if let Some(c) = tok.strip_prefix("count=") {
-            click_count = c.parse::<u8>().unwrap_or(1).clamp(1, 3);
+            click_count = (!c.is_empty() && c.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| c.parse::<u8>().ok())
+                .flatten()
+                .unwrap_or(1)
+                .clamp(1, 3);
         } else if let Some(s) = tok.strip_prefix("side=") {
             side = if s == "right" {
                 SelectionSide::Right
@@ -1144,7 +1304,12 @@ pub(crate) fn parse_mouse(rest: &str) -> Result<InputEvent, String> {
         } else if let Some(b) = tok.strip_prefix("block=") {
             block = matches!(b, "1" | "true" | "yes" | "block");
         } else if let Some(l) = tok.strip_prefix("lines=") {
-            wheel_lines = l.parse::<i32>().unwrap_or(1).clamp(1, MAX_WHEEL_LINES);
+            let s = l.strip_prefix('-').unwrap_or(l);
+            wheel_lines = (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| l.parse::<i32>().ok())
+                .flatten()
+                .unwrap_or(1)
+                .clamp(1, MAX_WHEEL_LINES);
         } else if action.is_empty() {
             action = tok;
         } else {
@@ -1162,8 +1327,13 @@ pub(crate) fn parse_mouse(rest: &str) -> Result<InputEvent, String> {
         }
     };
     let parse_rc = |r: &str, c: &str| -> Result<(u16, u16), String> {
-        match (r.parse::<u16>(), c.parse::<u16>()) {
-            (Ok(r), Ok(c)) => Ok((r, c)),
+        let uint = |s: &str| {
+            (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| s.parse::<u16>().ok())
+                .flatten()
+        };
+        match (uint(r), uint(c)) {
+            (Some(r), Some(c)) => Ok((r, c)),
             _ => Err("ERR bad args\n".to_string()),
         }
     };
@@ -1318,6 +1488,7 @@ pub(crate) fn parse_tab(rest: &str) -> Option<TabAction> {
             return match it.next() {
                 None => Some(TabAction::Close(None)),
                 Some(n) => {
+                    (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then_some(())?;
                     let i = n.parse::<usize>().ok()?;
                     it.next().is_none().then_some(TabAction::Close(Some(i)))
                 }
@@ -1325,7 +1496,12 @@ pub(crate) fn parse_tab(rest: &str) -> Option<TabAction> {
         }
         Some("move") => {
             let (from, to) = (it.next()?, it.next()?);
-            if it.next().is_some() {
+            if it.next().is_some()
+                || from.is_empty()
+                || to.is_empty()
+                || !from.bytes().all(|b| b.is_ascii_digit())
+                || !to.bytes().all(|b| b.is_ascii_digit())
+            {
                 return None;
             }
             let from = from.parse::<usize>().ok()?;
@@ -1334,7 +1510,9 @@ pub(crate) fn parse_tab(rest: &str) -> Option<TabAction> {
         }
         _ => {}
     }
-    rest.parse::<usize>().ok().map(TabAction::Select)
+    (!rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| rest.parse::<usize>().ok().map(TabAction::Select))
+        .flatten()
 }
 
 /// The refusal `tab <N>` / `tab close <N>` / `tab move <from> <to>` answer for an index no tab holds.
@@ -1548,12 +1726,20 @@ pub(crate) fn parse_pointer(rest: &str) -> Result<crate::app_mouse::PointerActio
             };
             if cs.is_none() {
                 use crate::app_mouse::NativePointerTarget;
+                if let Some(item) = rs.strip_prefix("item=") {
+                    return item
+                        .parse::<usize>()
+                        .map(PointerAction::MoveItem)
+                        .map_err(|_| POINTER_MOVE_USAGE.to_string());
+                }
                 if let Some(key) = rs.strip_prefix("key=").filter(|key| !key.is_empty()) {
                     return Ok(PointerAction::MoveNative(NativePointerTarget::Key(
                         key.to_string(),
                     )));
                 }
                 if let Some((x, y)) = rs.strip_prefix("xy=").and_then(|xy| xy.split_once(','))
+                    && !x.starts_with('+')
+                    && !y.starts_with('+')
                     && let (Ok(x), Ok(y)) = (x.parse::<f32>(), y.parse::<f32>())
                     && x.is_finite()
                     && y.is_finite()
@@ -1567,6 +1753,14 @@ pub(crate) fn parse_pointer(rest: &str) -> Result<crate::app_mouse::PointerActio
             };
             if it.next().is_some() {
                 return Err(POINTER_MOVE_USAGE.to_string());
+            }
+            let rs_digits = rs.strip_prefix('-').unwrap_or(rs);
+            if rs_digits.is_empty()
+                || !rs_digits.bytes().all(|b| b.is_ascii_digit())
+                || cs.is_empty()
+                || !cs.bytes().all(|b| b.is_ascii_digit())
+            {
+                return Err("ERR bad args\n".to_string());
             }
             let (Ok(row), Ok(col)) = (rs.parse::<i32>(), cs.parse::<u16>()) else {
                 return Err("ERR bad args\n".to_string());
@@ -1597,7 +1791,7 @@ pub(crate) fn parse_pointer(rest: &str) -> Result<crate::app_mouse::PointerActio
             _ => Err(POINTER_MODS_USAGE.to_string()),
         },
         Some(_) => Err(
-            "ERR usage: pointer [move <r> <c>|move key=<ui-key>|move xy=<x>,<y>|click|wheel dy=<n>|leave|status|mods <list>]\n"
+            "ERR usage: pointer [move <r> <c>|move key=<ui-key>|move xy=<x>,<y>|move item=<n>|click|wheel dy=<n>|leave|status|mods <list>]\n"
                 .to_string(),
         ),
     }
@@ -1613,9 +1807,9 @@ fn parse_pointer_wheel<'a>(
     use crate::app_mouse::{NativePointerTarget, PointerAction, WheelUnit};
     let usage = || POINTER_WHEEL_USAGE.to_string();
     let delta = |value: &str| {
-        value
-            .parse::<f64>()
-            .ok()
+        (!value.starts_with('+'))
+            .then(|| value.parse::<f64>().ok())
+            .flatten()
             .filter(|n| n.is_finite())
             .ok_or_else(usage)
             .and_then(|n| {
@@ -1644,6 +1838,9 @@ fn parse_pointer_wheel<'a>(
                 .is_none(),
             "xy" => {
                 let (x, y) = value.split_once(',').ok_or_else(usage)?;
+                if x.starts_with('+') || y.starts_with('+') {
+                    return Err(usage());
+                }
                 let (Ok(x), Ok(y)) = (x.parse::<f32>(), y.parse::<f32>()) else {
                     return Err(usage());
                 };
@@ -1671,7 +1868,7 @@ fn parse_pointer_wheel<'a>(
 }
 
 const POINTER_MOVE_USAGE: &str =
-    "ERR usage: pointer move <r> <c> | move key=<ui-key> | move xy=<x>,<y>\n";
+    "ERR usage: pointer move <r> <c> | move key=<ui-key> | move xy=<x>,<y> | move item=<n>\n";
 
 /// `pointer [move <r> <c>|click|wheel dy=<n>|leave|status|mods <list>]` -> drive the front window's pointer and report its position or acknowledge dispatch when readback is unavailable.
 pub(crate) fn cmd_pointer(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
@@ -1720,6 +1917,13 @@ pub(crate) fn parse_resize(rest: &str) -> Result<(u16, u16), String> {
     let (Some(rs), Some(cs)) = (it.next(), it.next()) else {
         return Err("ERR usage: resize <r> <c>\n".to_string());
     };
+    if rs.is_empty()
+        || cs.is_empty()
+        || !rs.bytes().all(|b| b.is_ascii_digit())
+        || !cs.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err("ERR bad args\n".to_string());
+    }
     let (Ok(r), Ok(c)) = (rs.parse::<u16>(), cs.parse::<u16>()) else {
         return Err("ERR bad args\n".to_string());
     };
@@ -1764,6 +1968,13 @@ pub(crate) fn parse_resize_px(rest: &str) -> Option<Result<InputEvent, String>> 
     let (Some(ws), Some(hs)) = (it.next(), it.next()) else {
         return Some(Err("ERR usage: resize px <w> <h>\n".to_string()));
     };
+    if ws.is_empty()
+        || hs.is_empty()
+        || !ws.bytes().all(|b| b.is_ascii_digit())
+        || !hs.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Some(Err("ERR bad args\n".to_string()));
+    }
     let (Ok(width), Ok(height)) = (ws.parse::<u32>(), hs.parse::<u32>()) else {
         return Some(Err("ERR bad args\n".to_string()));
     };
@@ -2063,13 +2274,13 @@ mod tests {
     fn signal_cont_is_a_known_signal() {
         for name in ["cont", "sigcont"] {
             assert_eq!(
-                cmd_signal(-1, name, &SinkWriter::new(-1), None),
+                cmd_signal(-1, name, &SinkWriter::new(-1), None, None),
                 "ERR no foreground process group\n",
                 "{name}"
             );
         }
         assert_eq!(
-            cmd_signal(-1, "continue", &SinkWriter::new(-1), None),
+            cmd_signal(-1, "continue", &SinkWriter::new(-1), None, None),
             "ERR unknown signal: continue\n"
         );
     }
@@ -2253,11 +2464,17 @@ mod tests {
         let pgrp = unsafe { libc::tcgetpgrp(master) };
         assert!(pgrp > 0, "a foreground job");
         let reply = match remedy {
-            Remedy::Verb => Some(cmd_signal(master, "term", &sink, None)),
+            Remedy::Verb => Some(cmd_signal(master, "term", &sink, None, None)),
             Remedy::VerbPid => {
                 let unread = sink.input_backlog().expect("measured").unread();
                 assert_eq!(
-                    cmd_signal(master, &format!("term pid={pgrp} quiet=0"), &sink, None),
+                    cmd_signal(
+                        master,
+                        &format!("term pid={pgrp} quiet=0"),
+                        &sink,
+                        None,
+                        None
+                    ),
                     format!("ERR busy input-unread bytes={unread}\n")
                 );
                 assert_eq!(
@@ -2266,6 +2483,7 @@ mod tests {
                         &format!("term pid={pgrp} quiet=120"),
                         &sink,
                         Some(5_000),
+                        None,
                     ),
                     "ERR busy person human_ms=5000\n"
                 );
@@ -2275,6 +2493,7 @@ mod tests {
                         &format!("term pid={pgrp} quiet=1"),
                         &sink,
                         Some(5_000),
+                        None,
                     ),
                     format!("ERR busy input-unread bytes={unread}\n"),
                     "a person past the grace is no hold; the unread input still is"
@@ -2284,7 +2503,13 @@ mod tests {
                     unread,
                     "nothing dropped"
                 );
-                Some(cmd_signal(master, &format!("term pid={pgrp}"), &sink, None))
+                Some(cmd_signal(
+                    master,
+                    &format!("term pid={pgrp}"),
+                    &sink,
+                    None,
+                    None,
+                ))
             }
             Remedy::BareKillpg => {
                 // SAFETY: `pgrp` is this test's own job.
@@ -2369,6 +2594,56 @@ mod tests {
             let (o, tail) = take_leading_options(input_of(verb), "unread=ok x");
             assert!(!o.unread_ok, "{verb}");
             assert_eq!(tail, "unread=ok x", "{verb}");
+        }
+    }
+
+    #[test]
+    fn typed_supervisor_input_options_are_complete_exact_and_preserve_paste_bytes() {
+        use aterm_agent::harness::contract::Scope;
+        for verb in ["send", "key", "paste", "turn"] {
+            let (options, body) = take_leading_options(
+                input_of(verb),
+                "harness-duty=approvals if-supervisor-revision=42 if-supervisor=h@1 enter",
+            );
+            assert_eq!(body, "enter", "{verb}");
+            assert_eq!(options.refusal, None, "{verb}");
+            let request = options.supervisor_request().unwrap();
+            assert_eq!(
+                (request.holder.as_str(), request.revision, request.duty),
+                ("h@1", 42, Scope::Approvals)
+            );
+            for malformed in [
+                "harness-duty=approvals enter",
+                "if-supervisor-revision=42 enter",
+                "if-supervisor=h@1 harness-duty=approvals enter",
+                "if-supervisor=h@1 if-supervisor-revision=42 enter",
+                "if-supervisor=h@1 if-supervisor-revision=+42 harness-duty=approvals enter",
+                "if-supervisor=h@1 if-supervisor-revision=18446744073709551616 harness-duty=approvals enter",
+                "if-supervisor=h@1 if-supervisor-revision=42 harness-duty=unknown enter",
+                "if-supervisor=h@1 if-supervisor-revision=42 if-supervisor-revision=42 harness-duty=approvals enter",
+                "if-supervisor=h@1 if-supervisor-revision=42 harness-duty=approvals harness-duty=approvals enter",
+            ] {
+                assert!(
+                    take_leading_options(input_of(verb), malformed)
+                        .0
+                        .refusal
+                        .is_some(),
+                    "{verb}: {malformed}"
+                );
+            }
+        }
+        let (options, body) = take_leading_options(
+            input_of("paste"),
+            "if-supervisor=h@1 if-supervisor-revision=42 harness-duty=approvals --  literal if-supervisor=x\n tail",
+        );
+        assert_eq!(options.refusal, None);
+        assert_eq!(body, " literal if-supervisor=x\n tail");
+        assert_eq!(
+            take_leading_options(input_of("paste"), "-- untouched").1,
+            "-- untouched"
+        );
+        for verb in ["send", "key"] {
+            assert!(take_leading_options(input_of(verb), "as=person if-supervisor=h@1 if-supervisor-revision=42 harness-duty=approvals enter").0.refusal.is_some());
         }
     }
 
@@ -2695,7 +2970,10 @@ mod tests {
                 crate::app_mouse::NativePointerTarget::Point(120.5, 64.0)
             ))
         );
+        assert_eq!(parse_pointer("move item=4"), Ok(PointerAction::MoveItem(4)));
         for junk in [
+            "move item=",
+            "move item=-1",
             "move key=",
             "move xy=1",
             "move xy=a,b",

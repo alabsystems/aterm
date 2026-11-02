@@ -16,7 +16,7 @@ use crate::wall::{Placement, Wall, WallKind};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 6, "0.6");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 7, "0.7");
 
 /// The usage limit is spent: Kimi Code's own quota patterns (lowercase).
 const QUOTA: [&str; 3] = [
@@ -77,14 +77,43 @@ fn caret_text(row: &str) -> Option<&str> {
     Some(crate::text::trim(draft.strip_suffix('│').unwrap_or(draft)))
 }
 
-/// The share of context a footer row says is used (`context: 0%`, the row's only words).
+/// The share of context a footer row says is used: `context: 0%`, or the measured 2.4.1 form
+/// with numeric counters, `context: 15% (13.7k/97.7k)`. Other trailing words are not a footer.
 #[must_use]
 pub fn context_row(row: &str) -> Option<u8> {
-    crate::text::trim(row)
-        .strip_prefix(crate::anchor!("kimi.footer.context"))?
-        .strip_suffix('%')?
-        .parse()
-        .ok()
+    let rest = crate::text::trim(row).strip_prefix(crate::anchor!("kimi.footer.context"))?;
+    let (percent, tail) = rest.split_once('%')?;
+    if percent.is_empty() || !percent.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if !tail.is_empty() {
+        let counts = tail.strip_prefix(" (")?.strip_suffix(')')?;
+        let (used, total) = counts.split_once('/')?;
+        if !context_count(used) || !context_count(total) {
+            return None;
+        }
+    }
+    percent.parse().ok()
+}
+
+/// A decimal token count, optionally in compact thousands or millions.
+fn context_count(count: &str) -> bool {
+    let digits = count
+        .strip_suffix('k')
+        .or_else(|| count.strip_suffix('M'))
+        .unwrap_or(count);
+    let mut parts = digits.split('.');
+    let whole = parts.next().unwrap_or_default();
+    if whole.is_empty() || !whole.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    match (parts.next(), parts.next()) {
+        (None, None) => true,
+        (Some(fraction), None) => {
+            !fraction.is_empty() && fraction.bytes().all(|b| b.is_ascii_digit())
+        }
+        _ => false,
+    }
 }
 
 /// The composer as `(caret row, lines)`, the caret row's draft first ([`composer_rows`]).
@@ -112,13 +141,39 @@ pub fn is_kimi_screen(rows: &[String]) -> bool {
         })
 }
 
+/// Whether `row` continues the `Error: …` block opened at `indent` columns in a composer frame
+/// `box_cols` wide: either an indented continuation paragraph (`   If this persists, …`), or a
+/// word that wrapped back to Kimi Code's one-column margin because `prev` had no room for it.
+fn continues_error(prev: &str, row: &str, indent: usize, box_cols: usize) -> bool {
+    let lead = crate::phase::leading_spaces(row);
+    if lead >= indent {
+        return true;
+    }
+    if lead == 0 {
+        return false;
+    }
+    let trimmed = crate::text::trim_start(row);
+    if trimmed.starts_with(['❯', '●', '✗', '✦', '▶', '╭', '┌', '│', '╰', '└', '─'])
+    {
+        return false;
+    }
+    let Some(first_word) = trimmed.split_whitespace().next() else {
+        return false;
+    };
+    let prev_cols = crate::text::trim_end(prev).chars().count();
+    let word_cols = first_word.chars().count();
+    box_cols > 0 && prev_cols + 1 + word_cols >= box_cols
+}
+
 /// The wall the last turn ended on: the `Error: …` row standing last above the composer, its
-/// indented continuation rows joined, read as Kimi Code reads it — a spent quota
+/// indented continuation rows joined (along with words Kimi Code wrapped back to column 1 at the
+/// composer's right edge), read as Kimi Code reads it — a spent quota
 /// ([`WallKind::UsageSession`]: it names no window), a spent balance ([`WallKind::Spend`]), or a
 /// login gone ([`WallKind::Auth`]). A concurrency throttle is none, and so is any other error.
 #[must_use]
 pub fn wall(rows: &[String]) -> Option<Wall> {
     let (top, _, _) = composer_rows(rows)?;
+    let box_cols = crate::text::trim_end(&rows[top]).chars().count();
     let last = rows[..top].iter().rposition(|r| !crate::text::blank(r))?;
     let opener = crate::anchor!("kimi.error");
     let at = (0..=last)
@@ -126,7 +181,7 @@ pub fn wall(rows: &[String]) -> Option<Wall> {
         .take_while(|&i| !crate::text::blank(&rows[i]))
         .find(|&i| crate::text::trim_start(&rows[i]).starts_with(opener))?;
     let indent = crate::phase::leading_spaces(&rows[at]);
-    if (at + 1..=last).any(|i| crate::phase::leading_spaces(&rows[i]) < indent) {
+    if (at + 1..=last).any(|i| !continues_error(&rows[i - 1], &rows[i], indent, box_cols)) {
         return None;
     }
     let message = rows[at..=last]
@@ -165,6 +220,18 @@ mod tests;
 /// in dependent crates; not part of the documented API.
 #[doc(hidden)]
 pub mod fixtures {
+    /// Kimi Code 2.4.1's local API-stub reply and context counters (MEASURED).
+    pub const STUB_REPLY: &str = include_str!("fixtures/kimi-2.4.1-local-stub-reply.txt");
+    /// Kimi Code 2.4.0 after ten 429 quota failures: `Error: [provider.rate_limit] 429 …`
+    /// soft-wrapped to column 1 over the `/export-debug-zip` advice (MEASURED).
+    pub const LIMIT_429_FINAL_240: &str = include_str!("fixtures/kimi-2.4.0-limit-429-final.txt");
+    /// Kimi Code 2.4.0 retrying a 429 quota failure (`Retrying (6/10) · …`): not yet a wall
+    /// (MEASURED).
+    pub const LIMIT_429_RETRYING_240: &str =
+        include_str!("fixtures/kimi-2.4.0-limit-429-retrying.txt");
+    /// Kimi Code 2.4.0 after a custom provider's 401 (`[provider.auth_error]`) under an earlier
+    /// quota wall: neither a managed login wall nor the earlier quota wall (MEASURED).
+    pub const AUTH_401_240: &str = include_str!("fixtures/kimi-2.4.0-auth-401.txt");
     /// Kimi Code 2.3.1 signed out at its idle composer, after the folder was trusted (MEASURED).
     pub const IDLE: &str = include_str!("fixtures/kimi-2.3.1-idle.txt");
     /// The same with `hello` typed and unsent (MEASURED).

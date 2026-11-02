@@ -12,8 +12,8 @@ fn snapshot() -> Snapshot {
         pid: 4242,
         start: "Mon Oct 26 01:02:03 2026".into(),
         shell: 4241,
-        program: "/synthetic/claude".into(),
-        argv: vec!["/synthetic/claude".into()],
+        program: at!("/synthetic/claude").into(),
+        argv: vec![at!("/synthetic/claude").into()],
         session: Some("00000000-0000-0000-0000-000000000001".into()),
         cwd: "/synthetic".into(),
         version: None,
@@ -40,7 +40,7 @@ fn read_case(case: i64) -> (bool, bool) {
         ..first
     };
     let mut args = atpkg::caller_shell::ProcArgs {
-        exec_path: "/synthetic/claude".into(),
+        exec_path: at!("/synthetic/claude").into(),
         argv: snap.argv.clone(),
         env: vec!["HOME=/synthetic".into()],
     };
@@ -60,11 +60,11 @@ fn read_case(case: i64) -> (bool, bool) {
         11 => args
             .env
             .push(format!("{}=synthetic", accounts::CREDENTIAL_KEYS[0])),
-        17 => args.exec_path = "/another/claude".into(),
+        17 => args.exec_path = at!("/another/claude").into(),
         18 => args.argv.push("--settings=changed.json".into()),
         19 => {
-            args.exec_path = "/usr/bin/node".into();
-            args.argv.insert(0, "/usr/bin/node".into());
+            args.exec_path = at!("/usr/bin/node").into();
+            args.argv.insert(0, at!("/usr/bin/node").into());
         }
         _ => {}
     }
@@ -74,7 +74,7 @@ fn read_case(case: i64) -> (bool, bool) {
         Some(PathBuf::from(&args.exec_path))
     };
     if case == 20 {
-        args.exec_path = "/alias/claude".into();
+        args.exec_path = at!("/alias/claude").into();
     }
     let original = args.env.clone();
     let mut reads = 0;
@@ -153,6 +153,9 @@ fn transcript_environment_keeps_the_snapshots_process_and_login() {
     }
 }
 
+/// Where `aterm_uds` reads a process's lineage (macOS, Linux); elsewhere no identity reads, so
+/// no live snapshot is admitted.
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
 #[test]
 fn transcript_environment_reads_the_live_kernel_identity() {
     let mut snap = snapshot();
@@ -181,14 +184,14 @@ fn transcript_environment_reads_the_live_kernel_identity() {
 #[test]
 fn codex_snapshot_login_env_verifies_codex_home_and_self_claimed_auth_path() {
     let mut snap = snapshot();
-    snap.program = "/synthetic/codex".into();
-    snap.argv = vec!["/synthetic/codex".into()];
+    snap.program = at!("/synthetic/codex").into();
+    snap.argv = vec![at!("/synthetic/codex").into()];
     snap.stored_login = false;
     snap.run = AgentRun::Codex(crate::harness::relaunch::CodexRun {
         home: "/synthetic/.codex".into(),
         home_env: Some("/synthetic/.codex".into()),
         self_claimed: Some(crate::harness::self_claimed::Resume {
-            argv: vec!["/synthetic/codex".into()],
+            argv: vec![at!("/synthetic/codex").into()],
             session: "01900000-0000-7000-8000-000000000001".into(),
             codex_home: Some("/synthetic/.codex".into()),
             codex_auth_path: Some("/synthetic/logins/work/auth.json".into()),
@@ -207,12 +210,12 @@ fn codex_snapshot_login_env_verifies_codex_home_and_self_claimed_auth_path() {
             || Some(snap.start.clone()),
             || {
                 Some(atpkg::caller_shell::ProcArgs {
-                    exec_path: "/synthetic/codex".into(),
+                    exec_path: at!("/synthetic/codex").into(),
                     argv: snap.argv.clone(),
                     env,
                 })
             },
-            || Some(PathBuf::from("/synthetic/codex")),
+            || Some(PathBuf::from(at!("/synthetic/codex"))),
         )
     };
     let matching = vec![

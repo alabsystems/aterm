@@ -378,39 +378,34 @@ fn a_file_of_many_names_stands_in_by_the_name_it_was_execd_by() {
     );
 }
 
-/// The real read of a hard-linked image ([`read_names`]): a copy of `sleep`, signed ad hoc, run
+/// The real read of a hard-linked image ([`read_names`]): a copy of `cat`, signed ad hoc, run
 /// by its second link, reads as a file of several names whose exec name is that link, so it
-/// stands in by it. NEGATIVE CONTROL (scratch): `image_file` answering no links fails the first
-/// assertion.
+/// stands in by it. Its names are read, and its folder goes, only once it echoed a line
+/// ([`aterm_uds::deadline::cat_echoes`]): a name the kernel shows at `_dyld_start` is no proof
+/// macOS finished assessing the copy's first exec. NEGATIVE CONTROL (scratch): `image_file`
+/// answering no links fails the first assertion.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn a_hard_linked_image_reads_as_linked_and_shows_the_link_it_ran_by() {
-    let dir = aterm_tempfile::tempdir().expect("a scratch dir");
-    let first = dir.path().join("qzlinka");
-    let second = dir.path().join("qzlinkb");
-    std::fs::copy("/bin/sleep", &first).expect("copy sleep");
-    let mut sign = aterm_uds::spawnfd::command("/usr/bin/codesign");
-    sign.args(["--force", "--sign", "-"]).arg(&first);
-    let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
-    let signed = aterm_uds::deadline::output_until(&mut sign, deadline).expect("codesign");
-    assert!(signed.status.success(), "codesign: {signed:?}");
+    use aterm_uds::spawnfd::Stdio;
+    let mut kept = aterm_uds::deadline::KeptUntilRan::new(
+        aterm_tempfile::tempdir().expect("a scratch dir").keep(),
+    );
+    let first = kept.path().join("qzlinka");
+    let second = kept.path().join("qzlinkb");
+    aterm_uds::deadline::ad_hoc_copy(Path::new("/bin/cat"), &first);
     std::fs::hard_link(&first, &second).expect("a second link");
     let _ = std::fs::metadata(&first).expect("the first link, looked up last");
     let mut child = aterm_uds::spawnfd::command(&second)
-        .arg("60")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
         .spawn()
         .expect("spawn the second link");
-    let pid = i32::try_from(child.id()).expect("a pid");
-    let names = aterm_spec::wait::until_within(
-        aterm_spec::wait::MUST_HAPPEN,
-        "the child to run its image",
-        || {
-            let names = read_names(pid, &mut |_| false);
-            (names.exec.as_deref() == Some("qzlinkb")).then_some(names)
-        },
-    );
-    let _ = child.kill();
-    let _ = child.wait();
+    let fed = aterm_uds::deadline::cat_echoes(&mut child);
+    kept.ran();
+    let names = read_names(i32::try_from(child.id()).expect("a pid"), &mut |_| false);
+    drop(fed);
+    aterm_uds::deadline::kill_within(&mut child, aterm_spec::wait::MUST_HAPPEN);
     assert!(names.linked, "a file of two names: {names:?}");
     assert_eq!(names.shown(), Some("qzlinkb"), "{names:?}");
     assert_eq!(names.file, file_id(&first), "one file under both names");

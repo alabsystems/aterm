@@ -149,7 +149,11 @@ pub fn main(args: &[std::ffi::OsString]) -> ExitCode {
             (Some("--listen"), Some(v)) => listen = Some(std::path::PathBuf::from(v)),
             (Some("--watch"), Some(v)) => watch = Some(std::path::PathBuf::from(v)),
             (Some("--key"), Some(v)) => key = Some(std::path::PathBuf::from(v)),
-            (Some("--tick-ms"), Some(v)) => match v.to_str().and_then(|v| v.parse().ok()) {
+            (Some("--tick-ms"), Some(v)) => match v
+                .to_str()
+                .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|v| v.parse().ok())
+            {
                 Some(ms) => tick = Duration::from_millis(ms),
                 None => {
                     eprintln!("{USAGE}");
@@ -168,5 +172,29 @@ pub fn main(args: &[std::ffi::OsString]) -> ExitCode {
             eprintln!("{USAGE}");
             ExitCode::from(2)
         }
+    }
+}
+
+#[cfg(all(test, not(target_os = "linux")))]
+mod tests {
+    use std::ffi::OsString;
+    use std::process::ExitCode;
+
+    #[test]
+    fn tick_ms_rejects_non_canonical_unsigned_values() {
+        let args: Vec<OsString> = [
+            "--listen",
+            "/tmp/l.sock",
+            "--watch",
+            "/tmp/w.sock",
+            "--key",
+            "/tmp/k.img",
+            "--tick-ms",
+            "+20",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        assert_eq!(super::main(&args), ExitCode::from(2));
     }
 }

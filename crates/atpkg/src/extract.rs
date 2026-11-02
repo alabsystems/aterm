@@ -1478,11 +1478,22 @@ pub(crate) fn stage_file(
     mode: u32,
     max_total_bytes: u64,
 ) -> Result<WrittenFile, ExtractError> {
+    let file =
+        crate::platform::open_create_write(dest, mode).map_err(|e| io_at(e, "open", dest))?;
+    stage_open_file(reader, file, dest, mode, max_total_bytes)
+}
+
+/// The same bounded writer for a caller's descriptor-relative, exclusively created file.
+pub(crate) fn stage_open_file(
+    reader: impl Read,
+    file: std::fs::File,
+    dest: &Path,
+    mode: u32,
+    max_total_bytes: u64,
+) -> Result<WrittenFile, ExtractError> {
     let budget = Rc::new(Cell::new(TAR_ENTRY_STRUCTURAL_BUDGET));
     let mut buf = vec![0u8; 64 * 1024];
     let mut remaining = max_total_bytes;
-    let file =
-        crate::platform::open_create_write(dest, mode).map_err(|e| io_at(e, "open", dest))?;
     write_capped(
         reader,
         Sink { file, dest, mode },

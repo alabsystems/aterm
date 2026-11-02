@@ -639,6 +639,7 @@ pub(crate) fn spotlight_after_start_up() -> Arc<WhyFacts> {
 const MAC: Locale = Locale {
     platform: Platform::MacOs,
     utc_offset_s: 0,
+    utc_offset_at: None,
 };
 
 pub(crate) fn light_inks() -> VitalsInks {
@@ -2459,13 +2460,8 @@ fn hit_map() {
 }
 
 #[test]
-#[ignore = "writes PNGs for a person to read: set ATERM_DECK_GALLERY to a directory"]
 fn deck_gallery() {
-    let Some(dir) = std::env::var_os("ATERM_DECK_GALLERY") else {
-        return;
-    };
-    let dir = std::path::PathBuf::from(dir);
-    std::fs::create_dir_all(&dir).expect("the gallery directory");
+    let (dir, _gallery) = crate::scripted_redraw_fixture::gallery_directory("ATERM_DECK_GALLERY");
     crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
     let scenes = [
         ("calm", Scene::Calm),
@@ -3009,4 +3005,4 @@ fn column_faults(
 }
 
 #[path = "stats_deck_owner_scenes.rs"]
-mod owner_scenes;
+pub(crate) mod owner_scenes;

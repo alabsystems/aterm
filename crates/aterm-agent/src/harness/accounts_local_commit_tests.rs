@@ -10,7 +10,7 @@ fn renew(store: &Store) -> Result<Vec<Event>, String> {
         if logins
             .get("main")
             .and_then(|binding| binding.dir.as_deref())
-            == Some("/retained/new")
+            == Some(at!("/retained/new"))
         {
             return Ok(Vec::new());
         }
@@ -19,7 +19,7 @@ fn renew(store: &Store) -> Result<Vec<Event>, String> {
             logins,
             "main",
             None,
-            "/retained/new",
+            at!("/retained/new"),
             None,
             NOW,
         ))
@@ -498,7 +498,7 @@ fn no_op_and_login_only_first_publication_preserve_absence() {
             logins.labels.insert(
                 "main".into(),
                 Binding {
-                    dir: Some("/retained/login".into()),
+                    dir: Some(at!("/retained/login").into()),
                     ..Binding::default()
                 },
             );

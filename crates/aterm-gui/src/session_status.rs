@@ -61,6 +61,11 @@ struct AgentWatch {
     frame: Option<(i32, aterm_phase::Program)>,
     reading: Option<crate::presence::AgentReading>,
     reading_seq: u64,
+    /// The leader in front is a build's front waiting for memory
+    /// ([`crate::session_timeline::SessionTimeline::build_wait`]): its figures are read again
+    /// every [`PROGRAM_RECHECK`] whether or not its screen moves, since the front writes a line
+    /// only about once a minute while the claims ahead of it come and go.
+    build_waiting: bool,
 }
 
 /// Published agent status tuple: `(word, detail, prompt_subject, program_name)`.
@@ -2478,6 +2483,10 @@ pub(crate) fn status_facts(status: &Status) -> crate::session_log::observed::Sta
     }
 }
 
+/// How often the event loop's tick looks for native operations whose processes are gone
+/// ([`crate::App::reconcile_native_extinctions`]).
+pub(crate) const NATIVE_SWEEP: Duration = Duration::from_secs(1);
+
 /// Per-session status classifier table enforcing observation intervals and scheduling wakes.
 #[derive(Debug)]
 pub(crate) struct StatusObserver {
@@ -2487,6 +2496,8 @@ pub(crate) struct StatusObserver {
     sessions: std::collections::HashMap<u64, SessionSlot>,
     next_due_any: Option<Instant>,
     swept_pool_epoch: u64,
+    /// The last native sweep's time and whether it left an operation open.
+    native_swept: Option<(Instant, bool)>,
     unclassified: Vec<u64>,
     agents: std::collections::HashMap<u64, AgentWatch>,
     agent_seq: u64,
@@ -2576,6 +2587,7 @@ impl StatusObserver {
             sessions: std::collections::HashMap::new(),
             next_due_any: None,
             swept_pool_epoch: 0,
+            native_swept: None,
             unclassified: Vec::new(),
             agents: std::collections::HashMap::new(),
             agent_seq: 0,
@@ -2679,14 +2691,15 @@ impl StatusObserver {
 
     /// Schedules an off-thread Codex rollout log tap read for `session` when due: the target a
     /// live proven claim names, or, with none, the read-only copy of a released claim's process
-    /// while it leads the foreground group `pgid` ([`crate::self_claim::tap_target`]).
+    /// while it leads the foreground group `pgid` ([`crate::self_claim::tap_target`]). `at` is the
+    /// sweep's instant and the session's last output ([`crate::codex_rollout_tap::due`]).
     pub(crate) fn request_rollout_if_due(
         &mut self,
         session: u64,
         ctx: &std::sync::Arc<crate::SessionCtx>,
         program: Option<&str>,
         pgid: i32,
-        now: Instant,
+        at: (Instant, Option<Instant>),
         wake: &crate::claude_footer::LogWake,
     ) {
         use crate::codex_rollout_tap::{due, follow_ask};
@@ -2694,7 +2707,7 @@ impl StatusObserver {
             .then(|| crate::self_claim::tap_target(ctx, pgid))
             .flatten();
         follow_ask(
-            due(&mut self.rollout_asked, session, target, now),
+            due(&mut self.rollout_asked, session, target, at),
             session,
             ctx,
             wake,
@@ -2754,6 +2767,24 @@ impl StatusObserver {
     /// Returns whether `session` has an initialized classifier slot.
     pub(crate) fn knows(&self, session: u64) -> bool {
         self.sessions.contains_key(&session)
+    }
+
+    /// Whether [`NATIVE_SWEEP`] has passed since the last native sweep, or none has run.
+    pub(crate) fn native_sweep_due(&self, now: Instant) -> bool {
+        self.native_swept
+            .is_none_or(|(at, _)| now.saturating_duration_since(at) >= NATIVE_SWEEP)
+    }
+
+    /// Records a native sweep at `now`, and whether it left an operation open.
+    pub(crate) fn note_native_sweep(&mut self, now: Instant, open: bool) {
+        self.native_swept = Some((now, open));
+    }
+
+    /// When the next native sweep is due, only while the last one left an operation open.
+    pub(crate) fn native_sweep_next(&self) -> Option<Instant> {
+        self.native_swept
+            .filter(|(_, open)| *open)
+            .map(|(at, _)| at + NATIVE_SWEEP)
     }
 
     /// Returns the session-pool epoch last observed by [`Self::note_swept`].
@@ -2853,7 +2884,11 @@ impl StatusObserver {
                     .deferred_name_recheck_at
                     .filter(|_| w.pgid > 0)
                     .map(|at| at.max(slot.next_due));
-                [followup, unresolved, confirmation]
+                let build_wait = w
+                    .resolved_at
+                    .filter(|_| w.build_waiting && w.pgid > 0)
+                    .map(|at| (at + PROGRAM_RECHECK).max(slot.next_due));
+                [followup, unresolved, confirmation, build_wait]
                     .into_iter()
                     .flatten()
                     .min()
@@ -3193,8 +3228,18 @@ impl StatusObserver {
                         && w.pgid > 0
                         && age >= unresolved_program_recheck(w.resolve_attempts))
                         || (w.seq_seen != Some(generation) && age >= PROGRAM_RECHECK)
+                        || (w.build_waiting && w.pgid > 0 && age >= PROGRAM_RECHECK)
                 })
         })
+    }
+
+    /// Note whether `session`'s leader in front is a build's front waiting for memory
+    /// ([`AgentWatch::build_waiting`]), which [`Self::program_due`] and [`Self::next_wake`] read
+    /// again on a timer, still screen or not.
+    pub(crate) fn note_build_wait(&mut self, session: u64, waiting: bool) {
+        if let Some(w) = self.agents.get_mut(&session) {
+            w.build_waiting = waiting;
+        }
     }
 
     fn note_program_request(&mut self, session: u64, pgid: i32, now: Instant) {
@@ -3406,6 +3451,24 @@ impl crate::App {
         }
     }
 
+    /// Native custody's backstop, on the event loop's tick and never on an output wake, which walks
+    /// no session: at most once per [`NATIVE_SWEEP`], every session's operations whose processes are
+    /// gone are closed (a channel's close reconciles its own at once). It is independent of the
+    /// optional status UI. Extinction observation never waits for an input writer or releases an
+    /// unproved actor/continuation. Returns when to look again, only while an operation stays open,
+    /// so a quiet window with none takes no wake for it.
+    pub(crate) fn reconcile_native_extinctions(&mut self, now: Instant) -> Option<Instant> {
+        if self.session_status.native_sweep_due(now) {
+            let mut open = false;
+            for session in self.pool.iter() {
+                crate::native_act::reconcile_extinct(&session.ctx);
+                open |= crate::native_act::maybe_unsettled(&session.ctx);
+            }
+            self.session_status.note_native_sweep(now, open);
+        }
+        self.session_status.native_sweep_next()
+    }
+
     /// Sweeps all due sessions under `try_lock`, returning the IDs whose published status or chrome changed.
     pub(crate) fn observe_session_statuses(&mut self, now: std::time::Instant) -> Vec<u64> {
         if !self.config.tab_status_or_default() {
@@ -3580,7 +3643,7 @@ impl crate::App {
                 timeline.slog_mut().observe_status(facts, at);
                 timeline.record(STATUS_CHANGE);
             }
-            let (previous_group, wake, program_honoured, codex_front) = {
+            let (previous_group, wake, program_honoured, codex_front, build_waiting) = {
                 let mut timeline = session
                     .ctx
                     .timeline
@@ -3608,16 +3671,24 @@ impl crate::App {
                     timeline.agent().program.as_deref(),
                     Some(aterm_core::terminal::program_state::ProgramApp::Codex),
                 );
-                (previous, timeline.slog_wake(), honoured, codex_front)
+                (
+                    previous,
+                    timeline.slog_wake(),
+                    honoured,
+                    codex_front,
+                    timeline.build_wait().is_some(),
+                )
             };
             self.session_status.slog_wakes.note(id, wake);
+            self.session_status.note_build_wait(id, build_waiting);
             let group_changed = previous_group.is_some();
             if group_changed
-                && crate::session_timeline::release_proven_if_gone(
+                && crate::session_timeline::publish_release_proven_if_gone(
                     &session.ctx,
                     pgid,
                     crate::metrics::now_us(),
                 )
+                .published()
             {
                 claims_cleared.push(id);
             }
@@ -3661,6 +3732,18 @@ impl crate::App {
                 if program_state_moved {
                     timeline.note_program_state(shown, program_report.began);
                 }
+            }
+            if program_state_moved
+                && session
+                    .ctx
+                    .timeline
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .program_speaks()
+            {
+                let arm = self.harness_ab_arm(id);
+                let glass = self.harness_ab_glass(id);
+                self.harness_screen.note_phase(id, &session.ctx, arm, glass);
             }
             if program_state_moved {
                 if shown.is_some_and(|state| {
@@ -3729,7 +3812,7 @@ impl crate::App {
                     program.as_deref()
                 },
                 pgid,
-                now,
+                (now, last_output),
                 &footer_wake,
             );
             let heal = integration_degraded.then(|| {
@@ -4281,17 +4364,20 @@ impl crate::App {
         );
         let appearance = format!("{appearance} {}", self.session_theme_fields(session));
         let conpty = conpty_status_field(cfg!(windows), aterm_pty::conpty_host(pooled.master));
-        let (supervisor, word, land_at, claimed_here, proven) = {
+        let (supervisor, authority, word, land_at, claimed_here, proven) = {
             let meta = pooled.ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
             let now = crate::metrics::now_us();
             let live = meta.live_supervisor(now);
             let proven = meta.supervisor_proven(now);
+            let (version, vendor) = crate::harness_claim::wire_versions(meta.live_scoped(now));
             (
                 format!(
-                    "{} supervisor_proven={}",
+                    "{} supervisor_proven={} supervisor_version={version} \
+                     supervisor_vendor={vendor}",
                     live.map_or_else(|| "-".to_string(), aterm_control::wire::pct_encode),
                     u8::from(meta.claim_proven(now)),
                 ),
+                meta.supervisor_authority(now).wire_fields(),
                 meta.autopilot_word(),
                 meta.land_at,
                 live == Some(crate::autopilot::own_holder()),
@@ -4324,7 +4410,7 @@ impl crate::App {
             task_record,
             (supervised_agent, group),
             last_act,
-            face,
+            (face, receipt),
             pause,
             slog,
             goal,
@@ -4335,13 +4421,19 @@ impl crate::App {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             let slog = timeline.slog();
+            let (watch, watch_why) = pooled.ctx.ran.watch_words();
             let slog = format!(
-                "{} {}",
+                "{} {} {} exec_watch={watch} exec_watch_why={watch_why}",
                 slog.status_fields(slog.now().wall_ms),
-                slog.rollout_fields()
+                slog.rollout_fields(),
+                self.session_log_journal.status().words()
             );
             (
-                timeline.agent().wire_fields(),
+                format!(
+                    "{}{}",
+                    timeline.agent().wire_fields(),
+                    crate::session_status::program::BuildWait::fields(timeline.build_wait())
+                ),
                 timeline.resize_status_fields(resize_probe, crate::turn_ledger::now_ms()),
                 crate::task_record::status_tokens(timeline.task()),
                 (
@@ -4349,7 +4441,10 @@ impl crate::App {
                     timeline.agent().program_pgid,
                 ),
                 timeline.last_act().unwrap_or("-").to_string(),
-                timeline.task_face().map(|(face, _)| face),
+                (
+                    timeline.task_face().map(|(face, _)| face),
+                    timeline.land_receipt().cloned(),
+                ),
                 timeline.pause(),
                 slog,
                 goal_field(timeline.goal()),
@@ -4357,6 +4452,8 @@ impl crate::App {
         };
         let supervised_agent =
             crate::harness_host::admitted_as(&pooled.ctx, supervised_agent, group);
+        let supervisor_act =
+            crate::agent_act::status_word(pooled.ctx.self_id.as_str(), supervised_agent, group);
         let autopilot =
             crate::autopilot::wire_field(self.harness_posture(), word, supervised_agent);
         let program_state = self.session_status.program_state_fields(session);
@@ -4366,9 +4463,15 @@ impl crate::App {
         let pause = crate::autopilot::pause_field(pause, claimed_here, supervised_agent);
         let land = land_fields(self.shown_hold(session).map(|shown| shown.hold.held));
         let land = format!(
-            "{land}{}{}",
+            "{land}{}{}{}{}",
             stop_field(self.shown_stop(session).map(|stop| stop.arm)),
-            wait_field(self.shown_wait(session).filter(|_| claimed_here))
+            wait_field(self.shown_wait(session).filter(|_| claimed_here)),
+            switch_field(claimed_here && self.shown_switch_asked(session)),
+            landed_fields(
+                receipt
+                    .as_deref()
+                    .filter(|_| face == Some(aterm_agent::harness::acts::TaskFace::Landed))
+            )
         );
         #[cfg(any(test, debug_assertions))]
         let end = self.end_status_fields(
@@ -4378,7 +4481,9 @@ impl crate::App {
         );
         #[cfg(not(any(test, debug_assertions)))]
         let end = "";
-        let human_ms = pooled.ctx.human_input.wire(crate::metrics::now_us());
+        let now_us = crate::metrics::now_us();
+        let human_ms = pooled.ctx.human_input.wire(now_us);
+        let human_typed_ms = pooled.ctx.human_input.typed_wire(now_us);
         let consent = self.session_consent(session, reported_cwd.as_deref());
         let opt = |value: Option<&str>| {
             value.map_or_else(|| "-".to_string(), aterm_control::wire::pct_encode)
@@ -4447,8 +4552,8 @@ impl crate::App {
                  revision=0 enabled={enabled} hold={hold} hold_advisory={hold_advisory} \
                  fabric={fabric} {fabric_tail} fleet={fleet} units={units} setup={setup} \
                  {presence} needs={needs} hold_by={hold_by} {typed} path={path} {agent} {program_state} last_act={last_act} {appearance}{conpty} integration={integration} \
-                 {input} supervisor={supervisor} autopilot={autopilot} human_ms={human_ms} \
-                 human_seq={human_seq} {launch} {owner} \
+                 {input} {authority} supervisor={supervisor} supervisor_act={supervisor_act} autopilot={autopilot} human_ms={human_ms} \
+                 human_typed_ms={human_typed_ms} human_seq={human_seq} {launch} {owner} \
                  history_lost={history_lost} {journal} integration_rev={integration_rev} {born} {resize} \
                  land_at={land_at} task={task} pause={pause}{land}{end} goal={goal} {task_record} {slog} editing={editing} editor={editor} {bells} gen={generation} seq={seq} hash={hash}",
                 opt(subject.as_deref()),
@@ -4481,8 +4586,8 @@ impl crate::App {
              conflict={} revision={} enabled={enabled} hold={hold} hold_advisory={hold_advisory} \
              fabric={fabric} {fabric_tail} fleet={fleet} units={units} setup={setup} \
              {presence} needs={needs} hold_by={hold_by} {typed} path={path} {agent} {program_state} last_act={last_act} {appearance}{conpty} integration={integration} \
-             {input} supervisor={supervisor} autopilot={autopilot} human_ms={human_ms} \
-             human_seq={human_seq} {launch} {owner} \
+             {input} {authority} supervisor={supervisor} supervisor_act={supervisor_act} autopilot={autopilot} human_ms={human_ms} \
+             human_typed_ms={human_typed_ms} human_seq={human_seq} {launch} {owner} \
              history_lost={history_lost} {journal} integration_rev={integration_rev} {born} {resize} \
              land_at={land_at} task={task} pause={pause}{land}{end} goal={goal} {task_record} {slog} editing={editing} editor={editor} {bells} gen={generation} seq={seq} hash={hash}",
             opt(subject.as_deref()),
@@ -4549,6 +4654,34 @@ pub(crate) fn land_fields(held: Option<aterm_agent::harness::acts::LandHeld>) ->
     )
 }
 
+/// Formats the `landed_head`, `landed_on`, `landed_leg` and `landed_repo` fields for `status`
+/// output (`docs/DESIGN-harness-autopilot-2026-10-15.md` §14.9, slice 9c): what aterm checked at
+/// the landing that stands, beside a landed face only (`SessionTimeline::land_receipt`): `HEAD`'s
+/// 12 digits, the remote main it is on, the receipt's leg (`on-main`, `pushed`, `no-remote`,
+/// `no-repo`, `gone`) and the repository (or the folder that is gone), percent-encoded; `-` for
+/// each it does not name, and for all four where nothing was checked (no landing, a landing with
+/// no receipt: codex-alab's own). A reader that finds no `landed_head=` (a build before it) reads
+/// it as unknown, never as `-`.
+pub(crate) fn landed_fields(receipt: Option<&aterm_agent::harness::acts::LandReceipt>) -> String {
+    let named = |s: &str| {
+        if s.is_empty() {
+            "-".to_string()
+        } else {
+            aterm_control::wire::pct_encode(s)
+        }
+    };
+    match receipt {
+        None => " landed_head=- landed_on=- landed_leg=- landed_repo=-".to_string(),
+        Some(r) => format!(
+            " landed_head={} landed_on={} landed_leg={} landed_repo={}",
+            named(&r.head),
+            named(&r.main_ref),
+            r.leg.word(),
+            named(&r.repo)
+        ),
+    }
+}
+
 /// Formats the `held` field for `status` output (§14.3): the arm that stopped the typing
 /// (`same-reply`, `no-work`) of whoever drives the session ([`crate::App::shown_stop`]: aterm
 /// while it claims it, a codex-alab under its own proven claim, §14.3.2), `-` where it types on
@@ -4567,6 +4700,14 @@ pub(crate) fn stop_field(stopped: Option<aterm_agent::harness::acts::HeldBy>) ->
 /// `waiting=` (a build before it) reads it as unknown, never as `-`.
 pub(crate) fn wait_field(wait: Option<crate::harness_glass::WaitGlass>) -> String {
     format!(" waiting={}", wait.map_or("-", |wait| wait.wall.word()))
+}
+
+/// Formats the `land_asked` field for `status` output (v6 §14.17 item 3): `switch` while Land's
+/// one ask after the person's switch over a held tab stands, its answer unread
+/// ([`crate::App::shown_switch_asked`]), `-` otherwise. A reader that finds no `land_asked=` (a
+/// build before it) reads it as unknown, never as `-`.
+pub(crate) fn switch_field(asked: bool) -> String {
+    format!(" land_asked={}", if asked { "switch" } else { "-" })
 }
 
 /// Formats the development-build `end_glass` fields for `status` output.

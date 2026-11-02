@@ -80,12 +80,12 @@ impl LogHead {
         };
         let open = |key: &str| field(key).is_some_and(|v| !v.is_empty() && v != "-");
         let base = match field("log_base") {
-            Some(v) => Some(v.parse().ok()?),
+            Some(v) => Some(crate::parse_uint(v)?),
             None => None,
         };
         Some(LogHead {
-            seq: field("log_seq")?.parse().ok()?,
-            ep: field("log_ep")?.parse().ok()?,
+            seq: crate::parse_uint(field("log_seq")?)?,
+            ep: crate::parse_uint(field("log_ep")?)?,
             base,
             turn_open: open("turn"),
             need_open: open("need"),

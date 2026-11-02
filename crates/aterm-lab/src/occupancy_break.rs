@@ -239,8 +239,9 @@ pub fn judge(r: &Recording<'_>) -> Vec<String> {
             if intent_at > at {
                 fail.push("the intent row follows the typed row".to_string());
             }
-            episode =
-                word(&row.reason, "episode").filter(|key| u64::from_str_radix(key, 16).is_ok());
+            episode = word(&row.reason, "episode").filter(|key| {
+                key.bytes().all(|b| b.is_ascii_hexdigit()) && u64::from_str_radix(key, 16).is_ok()
+            });
             if episode.is_none() {
                 fail.push("the typed row has no valid episode".to_string());
             } else if word(&intent.reason, "episode") != episode {

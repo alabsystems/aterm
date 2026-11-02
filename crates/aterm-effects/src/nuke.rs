@@ -242,20 +242,25 @@ const fn fade_after_skirt(t_ms: u64) -> f32 {
 
 #[inline]
 const fn cap_geom(t_ms: u64) -> (f32, f32, f32, f32) {
-    let (q, bloom) = if t_ms >= CAP_BLOOM_END_MS {
-        (1.0, 1.0)
+    if t_ms >= CAP_BLOOM_END_MS {
+        let tail = ((t_ms - CAP_BLOOM_END_MS) as f32 * INV_TAIL_SPAN_MS).clamp(0.0, 1.0);
+        let spread = 1.0 + 0.55 * tail;
+        let sx = 1.20 * spread;
+        let sy = 1.12 * (1.0 + 0.15 * (spread - 1.0));
+        let dy_cells = -1.50 - 0.70 * tail;
+        (1.0, sx, sy, dy_cells)
     } else {
         let q = ((t_ms - CAP_BLOOM_START_MS) as f32 * INV_CAP_BLOOM_SPAN_MS).clamp(0.0, 1.0);
         let omq = 1.0 - q;
         let (sin_q, _) = crate::supernova::sin_cos_f32(core::f32::consts::PI * q);
-        (q, (1.0 - omq * omq * omq) + 0.06 * sin_q)
-    };
-    let tail = (t_ms.saturating_sub(CAP_BLOOM_END_MS) as f32 * INV_TAIL_SPAN_MS).clamp(0.0, 1.0);
-    let spread = 1.0 + 0.55 * tail;
-    let sx = (0.45 + 0.75 * bloom) * spread;
-    let sy = (0.50 + 0.62 * bloom) * (1.0 + 0.15 * (spread - 1.0));
-    let dy_cells = -(0.90 + 0.60 * q) - 0.70 * tail;
-    (q, sx, sy, dy_cells)
+        let bloom = (1.0 - omq * omq * omq) + 0.06 * sin_q;
+        (
+            q,
+            0.45 + 0.75 * bloom,
+            0.50 + 0.62 * bloom,
+            -(0.90 + 0.60 * q),
+        )
+    }
 }
 
 /// Resolve `part`'s draw state at `t_ms`, or `None` outside its active window.

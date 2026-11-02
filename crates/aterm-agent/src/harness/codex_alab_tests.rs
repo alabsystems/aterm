@@ -608,17 +608,19 @@ fn only_a_codex_alab_that_holds_the_auth_path_mark_may_run_a_row_of_its_own() {
         std::fs::write(&path, body).expect("launcher");
         path
     };
-    let to = |exe: &Path| format!("#!/bin/sh\n# atpkg shim\nexec '{}' \"$@\"\n", exe.display());
     assert_eq!(auth_path_unread(&reads), None);
-    assert_eq!(auth_path_unread(&launcher("twin-new", &to(&reads))), None);
+    assert_eq!(
+        auth_path_unread(&launcher("twin-new", &twin_text(&reads))),
+        None
+    );
     assert_eq!(auth_path_unread(&before), Some(Older(before.clone())));
     assert_eq!(
-        auth_path_unread(&launcher("twin-old", &to(&before))),
+        auth_path_unread(&launcher("twin-old", &twin_text(&before))),
         Some(Older(before.clone()))
     );
     assert_eq!(auth_path_unread(&vendor), Some(Vendor(vendor.clone())));
     assert_eq!(
-        auth_path_unread(&launcher("twin-vendor", &to(&vendor))),
+        auth_path_unread(&launcher("twin-vendor", &twin_text(&vendor))),
         Some(Vendor(vendor.clone()))
     );
     for word in ["codex", "bin/codex"] {

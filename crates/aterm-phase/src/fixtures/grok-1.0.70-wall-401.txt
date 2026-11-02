@@ -1,0 +1,50 @@
+# grok 1.0.70 · MEASURED 2026-10-29, `aterm ctl text` of a private headless aterm (144x50, aterm 0.146.0) running the real Grok Build, launched by path in the lab's jail with a scratch `HOME` and `GROK_HOME`, the lab's `XAI_API_KEY` and `GROK_XAI_API_BASE_URL`/`GROK_CLI_CHAT_PROXY_BASE_URL=http://127.0.0.1:<port>/v1` (a local stub of xAI's API, crates/aterm-lab) · the turn answered 401 `{"code": "The request does not have valid authentication credentials for the operation", "error": "Incorrect API key provided: xa***ey. …"}` (the stub's `401` mode in the xAI dialect): no retry (one request); under the prompt row, on the heavy left bar and wrapped over two rows, `Authentication required: your session has expired or your credentials were rejected. Run /login to re-authenticate, then resend your message.`; the composer idle; no sign-in started · cursor=45,6 (visible, blinking_block) · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+  /p/t/at.lab0/proj                                                                                                   14K / 256K │ [Dashboard]
+
+
+     ❯ with a bad key                                                                                                                2:06 PM
+
+
+  ┃  Authentication required: your session has expired or your credentials were rejected. Run /login to re-authenticate, then resend your
+  ┃  message.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ ❯                                                                                                                                        │
+  ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── lab-stub ─╯
+
+  Shift+Tab:mode  │  Ctrl+x:shortcuts

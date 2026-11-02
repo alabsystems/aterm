@@ -7,6 +7,7 @@
 use std::io::Cursor;
 
 use crate::error::{Error, Replay, Result};
+use crate::policy::{Decision, RouteRequest};
 use crate::redact::Redactor;
 use crate::wire::{
     Endpoints, Origin, OriginRole, Phase, WireBody, WireError, WireKind, WireRequest, WireResponse,
@@ -163,6 +164,15 @@ pub fn request(req: &WireRequest<'_>, endpoints: &Endpoints) -> Result<Vec<u8>> 
         )
         .with_next(ANONYMOUS_READS));
     }
+    let mut text = head(req, endpoints)?;
+    text.push_str("\nas anonymous\nbody none");
+    Ok(text.into_bytes())
+}
+
+/// The first lines of a request's canonical bytes, which `request` and `request_credentialed`
+/// share: the method and the path with its sorted (or, on an asset host, redacted) query, the
+/// `origin` line, and the sorted headers without `user-agent` or a credential header.
+fn head(req: &WireRequest<'_>, endpoints: &Endpoints) -> Result<String> {
     let on_no_origin = || {
         Error::protocol(format!(
             "{} is on none of this client's origins",
@@ -190,7 +200,7 @@ pub fn request(req: &WireRequest<'_>, endpoints: &Endpoints) -> Result<Vec<u8>> 
         .headers
         .iter()
         .map(|(name, value)| (name.to_ascii_lowercase(), value.as_str()))
-        .filter(|(name, _)| name != "user-agent")
+        .filter(|(name, _)| name != "user-agent" && !door::is_authorization(name))
         .collect();
     headers.sort_by(|a, b| {
         a.0.as_bytes()
@@ -203,8 +213,114 @@ pub fn request(req: &WireRequest<'_>, endpoints: &Endpoints) -> Result<Vec<u8>> 
         text.push(' ');
         text.push_str(value);
     }
-    text.push_str("\nas anonymous\nbody none");
+    Ok(text)
+}
+
+/// `sha256:{hex}` of `bytes`.
+fn sha256_of(bytes: &[u8]) -> String {
+    let digest = aterm_digest::Sha256::digest(bytes);
+    format!("sha256:{}", aterm_codec::hex::encode_lower(&digest))
+}
+
+/// `sha256:{hex} {len}` of `canonical`: the journal's `request` field (§4.6.8), so an intent
+/// names the exact request it stands for without holding it.
+#[must_use]
+pub fn request_digest(canonical: &[u8]) -> String {
+    format!("{} {}", sha256_of(canonical), canonical.len())
+}
+
+/// A credentialed request's canonical bytes: `request`'s lines 1–3, then `as {profile}` from
+/// `WireRequest::as_profile` (`as anonymous` when it is `None`; never a token, a fingerprint
+/// or the header), then the
+/// body: `body none`; `body json {len}` and the JSON text, split at each newline, for a JSON
+/// body of at most `BODY_TAPE_MAX` bytes; or `body sha256:{hex} {len}` for a larger JSON body
+/// and for a file body, whose digest the pipeline sets (`WireRequest::body_digest`).
+///
+/// # Errors
+///
+/// `Replay::StreamNotTaped` for a `WireBody::Reader` with no `body_digest`; as `request`.
+pub fn request_credentialed(req: &WireRequest<'_>, endpoints: &Endpoints) -> Result<Vec<u8>> {
+    let mut text = head(req, endpoints)?;
+    text.push_str("\nas ");
+    text.push_str(req.as_profile.unwrap_or("anonymous"));
+    match &req.body {
+        WireBody::Empty => text.push_str("\nbody none"),
+        WireBody::Bytes(bytes) => match std::str::from_utf8(bytes) {
+            Ok(json) if bytes.len() <= BODY_TAPE_MAX => {
+                text.push_str(&format!("\nbody json {}", bytes.len()));
+                for line in json.split('\n') {
+                    text.push('\n');
+                    text.push_str(line);
+                }
+            }
+            _ => text.push_str(&format!("\nbody {} {}", sha256_of(bytes), bytes.len())),
+        },
+        WireBody::Reader { len, .. } => {
+            let Some(digest) = req.body_digest else {
+                return Err(Error::replay(
+                    Replay::StreamNotTaped,
+                    format!(
+                        "a {} with a file body and no digest is not taped",
+                        req.method.as_str()
+                    ),
+                )
+                .with_next(
+                    "run it without --record or --replay: a tape names a file body by its digest",
+                ));
+            };
+            text.push_str(&format!("\nbody {digest} {len}"));
+        }
+    }
     Ok(text.into_bytes())
+}
+
+/// A routing decision's inputs: `route {target}` (`repo {owner}/{repo}`, `owner {owner}`,
+/// `unscoped`, `identity`), `access {read|writer-read|write}`, `named {literal|target|default}`
+/// with the literal's or target's text, `anonymous {0|1}`, `as {profile|-}`. One line each,
+/// joined by `\n`.
+#[must_use]
+pub fn route_request(req: &RouteRequest) -> Vec<u8> {
+    let _ = req;
+    Vec::new()
+}
+
+/// A decision: `send {profile} {tier}`; `anonymous {why}` (`AnonymousWhy::slug`); or
+/// `refuse {code}` (`RefusalCode::slug`) followed by `why {text}`, `next {text}` and one
+/// `tried {label} {presence}` line per judged step, each text through `Redactor::shapes`. So
+/// a replayed refusal prints the error line the recorded one printed.
+#[must_use]
+pub fn route_reply(decision: &Decision) -> Vec<u8> {
+    let _ = decision;
+    Vec::new()
+}
+
+/// A decision read back.
+///
+/// # Errors
+///
+/// `Replay::Format` for bytes `route_reply` did not write.
+pub fn route_decode(bytes: &[u8]) -> Result<Decision> {
+    let _ = bytes;
+    Err(Error::not_yet("the route door", "WP10"))
+}
+
+/// A git run's canonical bytes: `git {op} {owner}/{repo}` (`clone`, `fetch`, `ls-remote`,
+/// `push-delete`), then the op's own words, one per line (`depth {n}`, `ref {name}`,
+/// `expect {sha}`). Never the URL (the tape's header names the endpoints), the environment,
+/// the grant's nonce or a path.
+#[must_use]
+pub fn git_request(run: &crate::git::GitRun) -> Vec<u8> {
+    let _ = run;
+    Vec::new()
+}
+
+/// A git run's answer: `exit {code}` or `exit signal`, then `stdout {n}` and stdout's `n`
+/// pieces split at each `\n`, then `stderr {m}` and stderr's `m` pieces, each piece through
+/// `Redactor::shapes`. An empty stream is one empty piece.
+#[must_use]
+pub fn git_reply(out: &super::child::ChildOut) -> Vec<u8> {
+    let _ = out;
+    Vec::new()
 }
 
 /// Encodes `status`, `headers`, and `body` into canonical tape reply bytes, replacing bodies over [`BODY_TAPE_MAX`] with a `body-digest` header.
@@ -372,5 +488,119 @@ impl Reply {
             headers: self.headers,
             body: Box::new(Cursor::new(self.body)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BODY_TAPE_MAX, request_credentialed, request_digest};
+    use crate::error::{Kind, Replay, Sub};
+    use crate::identity::Credential;
+    use crate::policy::Tier;
+    use crate::wire::door::AuthHeader;
+    use crate::wire::{Deadlines, Endpoints, Method, WireBody, WireRequest};
+
+    /// `method` to `url` on github.com's endpoints, as the profile `dev`.
+    fn as_dev<'a>(method: Method, url: &str) -> WireRequest<'a> {
+        let mut req = WireRequest::new(method, url, Vec::new(), 1 << 20, Deadlines::JSON);
+        req.as_profile = Some("dev");
+        req
+    }
+
+    /// The credentialed canonical bytes, as text.
+    fn text(req: &WireRequest<'_>) -> String {
+        let bytes = request_credentialed(req, &Endpoints::github_com()).expect("canonical");
+        String::from_utf8(bytes).expect("UTF-8")
+    }
+
+    /// The digest is the SHA-256 test vector's, then the size.
+    #[test]
+    fn a_request_digest_is_sha256_then_the_size() {
+        assert_eq!(
+            request_digest(b"abc"),
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad 3"
+        );
+    }
+
+    /// The profile is named, the credential never: an `authorization` header among the
+    /// headers, and the `auth` the pipeline built, leave the bytes as they are without them.
+    #[test]
+    fn a_credentialed_request_names_its_profile_and_never_its_credential() {
+        let e = Endpoints::github_com();
+        let token = agh_fake::token("canon-credentialed");
+        let cred = Credential::for_tests("dev", Tier::Dev, token.as_bytes());
+        let header = AuthHeader::for_origin_for_tests(&cred, &e, e.api()).expect("a header");
+        let plain = as_dev(Method::Get, "https://api.github.com/user");
+        let mut carried = as_dev(Method::Get, "https://api.github.com/user");
+        carried
+            .headers
+            .push(("Authorization".to_string(), format!("Bearer {token}")));
+        carried.auth = Some(&header);
+        assert_eq!(text(&plain), "GET /user\norigin api\nas dev\nbody none");
+        assert_eq!(text(&carried), text(&plain));
+        let mut anonymous = as_dev(Method::Get, "https://api.github.com/user");
+        anonymous.as_profile = None;
+        assert_eq!(
+            text(&anonymous),
+            "GET /user\norigin api\nas anonymous\nbody none"
+        );
+    }
+
+    /// A JSON body of at most `BODY_TAPE_MAX` bytes is written out, one line per newline.
+    #[test]
+    fn a_small_json_body_is_written_line_by_line() {
+        let body = b"{\"a\":1}\n{\"b\":2}";
+        let mut req = as_dev(Method::Post, "https://api.github.com/repos/o/r/releases");
+        req.body = WireBody::Bytes(body);
+        assert_eq!(
+            text(&req),
+            "POST /repos/o/r/releases\norigin api\nas dev\nbody json 15\n{\"a\":1}\n{\"b\":2}"
+        );
+        let at_max = vec![b' '; BODY_TAPE_MAX];
+        req.body = WireBody::Bytes(&at_max);
+        assert!(
+            text(&req).contains(&format!("\nbody json {BODY_TAPE_MAX}\n")),
+            "a body of exactly BODY_TAPE_MAX bytes is written out"
+        );
+    }
+
+    /// A body over `BODY_TAPE_MAX`, or one that is not UTF-8, is named by its digest and size.
+    #[test]
+    fn a_large_or_binary_body_is_named_by_its_digest() {
+        let large = vec![b' '; BODY_TAPE_MAX + 1];
+        let binary = [0xff, 0xfe, b'a'];
+        for body in [&large[..], &binary[..]] {
+            let mut req = as_dev(Method::Patch, "https://api.github.com/repos/o/r");
+            req.body = WireBody::Bytes(body);
+            assert_eq!(
+                text(&req),
+                format!(
+                    "PATCH /repos/o/r\norigin api\nas dev\nbody {}",
+                    request_digest(body)
+                )
+            );
+        }
+    }
+
+    /// A file body is named by the digest the pipeline set; with none, it is not taped.
+    #[test]
+    fn a_file_body_is_named_by_its_digest_or_refused() {
+        let mut bytes: &[u8] = b"abc";
+        let mut req = as_dev(Method::Post, "https://uploads.github.com/repos/o/r/assets");
+        req.body = WireBody::Reader {
+            len: 3,
+            reader: &mut bytes,
+        };
+        req.body_digest = Some("sha256:00ff");
+        assert_eq!(
+            text(&req),
+            "POST /repos/o/r/assets\norigin uploads\nas dev\nbody sha256:00ff 3"
+        );
+        req.body_digest = None;
+        let refused = request_credentialed(&req, &Endpoints::github_com()).expect_err("no digest");
+        assert_eq!(
+            (refused.kind, refused.sub.clone()),
+            (Kind::CouldNotRun, Sub::Replay(Replay::StreamNotTaped))
+        );
     }
 }

@@ -92,26 +92,35 @@ impl Retired {
     /// The inverse of [`Retired::encode`]; unknown ⇒ `None`.
     #[must_use]
     pub fn decode(s: &str) -> Option<Self> {
-        let (kind, payload) = s.split_once(':').unwrap_or((s, ""));
-        match (kind, payload) {
-            ("folded", "") => Some(Self::Folded),
-            ("stale", "") => Some(Self::Stale),
-            ("unseen", "") => Some(Self::Unseen),
-            ("superseded", id) => Some(Self::Superseded {
-                by: MessageId::from_raw(id.parse().ok()?)?,
-            }),
-            ("resolved", "ok") => Some(Self::Resolved(Outcome::Ok)),
-            ("resolved", "warn") => Some(Self::Resolved(Outcome::Warn)),
-            ("dismissed", "") => Some(Self::Dismissed),
-            ("answered", label) => Some(Self::Answered {
-                label: label.to_string(),
-            }),
-            ("evicted", "") => Some(Self::Evicted),
-            ("carried", "") => Some(Self::Carried),
-            ("withdrawn", "") => Some(Self::Withdrawn),
-            ("recorded", "") => Some(Self::Recorded),
-            ("quit", "") => Some(Self::Quit),
-            _ => None,
+        match s.split_once(':') {
+            None => match s {
+                "folded" => Some(Self::Folded),
+                "stale" => Some(Self::Stale),
+                "unseen" => Some(Self::Unseen),
+                "dismissed" => Some(Self::Dismissed),
+                "evicted" => Some(Self::Evicted),
+                "carried" => Some(Self::Carried),
+                "withdrawn" => Some(Self::Withdrawn),
+                "recorded" => Some(Self::Recorded),
+                "quit" => Some(Self::Quit),
+                _ => None,
+            },
+            Some((kind, payload)) => match (kind, payload) {
+                ("superseded", id) => {
+                    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+                        return None;
+                    }
+                    Some(Self::Superseded {
+                        by: MessageId::from_raw(id.parse().ok()?)?,
+                    })
+                }
+                ("resolved", "ok") => Some(Self::Resolved(Outcome::Ok)),
+                ("resolved", "warn") => Some(Self::Resolved(Outcome::Warn)),
+                ("answered", label) => Some(Self::Answered {
+                    label: label.to_string(),
+                }),
+                _ => None,
+            },
         }
     }
 }
@@ -517,7 +526,7 @@ impl Fields {
     fn get(&self, key: &str) -> Option<&str> {
         self.pairs
             .iter()
-            .find(|(k, _)| k == key)
+            .rfind(|(k, _)| k == key)
             .map(|(_, v)| v.as_str())
     }
 
@@ -532,9 +541,11 @@ impl Fields {
     }
 
     fn num<T: std::str::FromStr>(&self, key: &'static str) -> Result<T, CodecError> {
-        self.need(key)?
-            .parse()
-            .map_err(|_| CodecError::BadField(key))
+        let s = self.need(key)?;
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(CodecError::BadField(key));
+        }
+        s.parse().map_err(|_| CodecError::BadField(key))
     }
 
     fn id(&self) -> Result<MessageId, CodecError> {
@@ -1474,6 +1485,8 @@ pub(crate) mod tests {
         ] {
             assert_eq!(Retired::decode(&how.encode()), Some(how));
         }
+        assert_eq!(Retired::decode("answered"), None);
+        assert_eq!(Retired::decode("folded:"), None);
         let mut us_inside = posted(5);
         us_inside.detail = vec!["b\u{1f}c".into()];
         match LogLine::decode(&LogLine::Posted(us_inside).encode()).unwrap() {
@@ -2214,5 +2227,16 @@ pub(crate) mod tests {
             LogLine::Posted(rec) => assert_eq!(rec.detail, Vec::<String>::new()),
             other => panic!("{other:?}"),
         }
+        assert_eq!(Retired::decode("superseded:+5"), None);
+        assert_eq!(
+            LogLine::decode("m1\tkind=dropped\tn=+2\tend="),
+            Err(CodecError::BadField("n"))
+        );
+        assert_eq!(
+            LogLine::decode("m1\tkind=dropped\tn=1\tn=3\tend="),
+            Ok(LogLine::Dropped { count: 3 })
+        );
+        assert_eq!(crate::Intent::decode("apply-update:+7"), None);
+        assert_eq!(crate::Hold::decode("for:+10"), None);
     }
 }

@@ -72,6 +72,21 @@ pub fn binary_identity_json(
 ) -> Result<String, String> {
     aterm_json::to_string(identity).map_err(|error| error.to_string())
 }
+
+pub(crate) fn parse_uint<T: std::str::FromStr>(s: &str) -> Option<T> {
+    (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| s.parse().ok())
+        .flatten()
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) fn instant_after(
+    base: std::time::Instant,
+    d: std::time::Duration,
+) -> std::time::Instant {
+    base.checked_add(d)
+        .unwrap_or_else(|| base + std::time::Duration::from_secs(u64::from(u32::MAX)))
+}
 #[cfg(all(test, target_os = "macos"))]
 mod checker_supervision_tests;
 /// How each run of the installed app ended.
@@ -121,7 +136,7 @@ fn read_ledger_text_checked(path: &std::path::Path) -> std::io::Result<Option<St
 
     let file = match std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(path)
     {
         Ok(file) => file,
@@ -2579,7 +2594,7 @@ fn note_checker_lock_holder(path: &std::path::Path) {
 /// The pid the last process to take `checker.lock` wrote into it ([`note_checker_lock_holder`]).
 #[cfg(target_os = "macos")]
 fn checker_lock_holder(path: &std::path::Path) -> Option<u32> {
-    let pid: u32 = read_ledger_text(path)?.trim().parse().ok()?;
+    let pid: u32 = parse_uint(read_ledger_text(path)?.trim())?;
     let raw = i32::try_from(pid).ok().filter(|raw| *raw > 0)?;
     // SAFETY: signal 0 delivers nothing; it only asks whether `raw` exists.
     let exists = unsafe { libc::kill(raw, 0) } == 0
@@ -2804,16 +2819,6 @@ fn checker_gate(path: &std::path::Path, wait: std::time::Duration) -> CheckerGat
         Err(error) if error.kind() == std::io::ErrorKind::TimedOut => CheckerGate::Deferred,
         Err(_) => CheckerGate::Unavailable,
     }
-}
-
-/// The text of a caught panic's payload, for its log line.
-#[cfg(target_os = "macos")]
-fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
-    payload
-        .downcast_ref::<&str>()
-        .map(|s| (*s).to_string())
-        .or_else(|| payload.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "a non-text panic payload".to_string())
 }
 
 /// The check loop, under `generation` of `watch`.
@@ -3134,10 +3139,10 @@ fn run_checker(
                             );
                         }
                         let until = skip_timer_target(window_expiry, cadence::entropy_byte());
-                        schedule.hold_until(
-                            std::time::Instant::now()
-                                + std::time::Duration::from_secs(until.saturating_sub(now_unix)),
-                        );
+                        schedule.hold_until(crate::instant_after(
+                            std::time::Instant::now(),
+                            std::time::Duration::from_secs(until.saturating_sub(now_unix)),
+                        ));
                         if !stamp(CheckerPhase::Waiting) {
                             return Cycle::Superseded(last.get());
                         }
@@ -3221,8 +3226,11 @@ fn run_checker(
                                 })
                                 .map(|(_, expiry)| {
                                     let until = skip_timer_target(expiry, cadence::entropy_byte());
-                                    now + std::time::Duration::from_secs(
-                                        until.saturating_sub(now_unix),
+                                    crate::instant_after(
+                                        now,
+                                        std::time::Duration::from_secs(
+                                            until.saturating_sub(now_unix),
+                                        ),
                                     )
                                 });
                             schedule.deferred(window_end, now, cadence::entropy_byte());
@@ -3307,10 +3315,13 @@ fn run_checker(
             Ok(Cycle::Next) => {}
             Ok(Cycle::Superseded(phase)) => return CheckerExit::Superseded { phase },
             Err(payload) => {
+                // A panic's message can quote what the cycle held (a release's or a config's
+                // text): aterm.log names it by its kind and length, and the panic hook keeps
+                // the message on stderr and in the crash report (DESIGN-session-log §3.6).
                 warn(&format!(
                     "an update check cycle panicked ({}); the checker carries on after a \
                      backed-off wait",
-                    panic_text(payload.as_ref())
+                    aterm_log::words::Panic::of(payload.as_ref())
                 ));
                 schedule.failed();
                 if !stamp(CheckerPhase::Waiting) {
@@ -5117,6 +5128,10 @@ mod commit_match_tests {
         file.set_len(super::MAX_LEDGER_BYTES + 1).unwrap();
         assert!(super::read_ledger_text(&oversized).is_none());
         assert!(super::read_ledger_text(&dir).is_none());
+        let link = dir.join("link.toml");
+        std::os::unix::fs::symlink(&valid, &link).unwrap();
+        assert!(super::read_ledger_text(&link).is_none());
+        assert!(super::read_ledger_text_checked(&link).is_err());
         let _ = std::fs::remove_dir_all(dir);
     }
 

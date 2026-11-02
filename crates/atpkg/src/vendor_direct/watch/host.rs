@@ -204,7 +204,10 @@ fn write_pid(file: &mut File) -> std::io::Result<()> {
 fn read_pid(file: &mut File) -> Option<u32> {
     let mut text = String::new();
     file.take(MAX_SEAT_BYTES).read_to_string(&mut text).ok()?;
-    text.trim().parse().ok()
+    let s = text.trim();
+    (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| s.parse().ok())
+        .flatten()
 }
 
 /// Which host watches this store's vendor heads right now ([`watcher`]).
@@ -220,7 +223,10 @@ pub enum Watcher {
     Unknown(String),
 }
 
-/// Who watches `layout`'s vendor heads, read off the rendezvous without taking the watch.
+/// Who watches `layout`'s vendor heads, read off the rendezvous's locks without taking the watch.
+///
+/// The hosts file is read first, then the seat. On macOS a read holds no lock; elsewhere it takes
+/// each lock for an instant, which can turn away a host that admits in that instant.
 #[must_use]
 pub fn watcher(layout: &Layout) -> Watcher {
     let hosts = match probe(&layout.prefix.join(HOSTS_FILE)) {
@@ -231,17 +237,19 @@ pub fn watcher(layout: &Layout) -> Watcher {
         return Watcher::Window;
     }
     let seat_path = layout.prefix.join(SEAT_FILE);
+    // Only a session takes the seat, and only exclusive, so any hold of it is a seated session.
     match probe(&seat_path) {
-        Ok(Probe::Exclusive) => Watcher::Session(
+        Ok(Probe::Free) if hosts == Probe::Exclusive => Watcher::Session(None),
+        Ok(Probe::Free) => Watcher::Nobody,
+        Ok(Probe::Shared | Probe::Exclusive) => Watcher::Session(
             open_private(&seat_path, false).and_then(|mut file| read_pid(&mut file)),
         ),
-        Ok(_) if hosts == Probe::Exclusive => Watcher::Session(None),
-        Ok(_) => Watcher::Nobody,
         Err(why) => Watcher::Unknown(why),
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+/// How a rendezvous file's lock is held, as one read of it found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Probe {
     Free,
     Shared,
@@ -249,35 +257,384 @@ enum Probe {
 }
 
 fn probe(path: &Path) -> Result<Probe, String> {
-    let open = || open_private(path, false);
     if std::fs::symlink_metadata(path).is_err() {
         return Ok(Probe::Free);
     }
-    let Some(file) = open() else {
-        return Err(format!("{} could not be opened", path.display()));
-    };
-    match Flock::try_lock(file) {
-        Ok(_free) => return Ok(Probe::Free),
-        Err(std::fs::TryLockError::WouldBlock) => {}
-        Err(std::fs::TryLockError::Error(e)) => {
-            return Err(format!("{} could not be locked ({e})", path.display()));
-        }
+    #[cfg(target_os = "macos")]
+    {
+        look(path)
     }
-    let Some(file) = open() else {
-        return Err(format!("{} could not be opened", path.display()));
+    #[cfg(not(target_os = "macos"))]
+    {
+        sample(path)
+    }
+}
+
+fn unopened(path: &Path) -> String {
+    format!("{} could not be opened", path.display())
+}
+
+/// macOS keeps `flock` locks on the list `fcntl` reads, so `F_GETLK` names the kind of the lock
+/// that would refuse a writer. That is one read at one instant, holding nothing: a holder that lets
+/// go and takes again cannot split it, and no host admitting meanwhile is turned away.
+#[cfg(target_os = "macos")]
+fn look(path: &Path) -> Result<Probe, String> {
+    use std::os::fd::AsRawFd as _;
+    let Some(file) = open_private(path, false) else {
+        return Err(unopened(path));
     };
-    match Flock::try_lock_shared(file) {
-        Ok(_shared) => Ok(Probe::Shared),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(Probe::Exclusive),
-        Err(std::fs::TryLockError::Error(e)) => {
-            Err(format!("{} could not be locked ({e})", path.display()))
+    #[cfg(test)]
+    probing(path, Step::Reads);
+    let mut lock = libc::flock {
+        l_start: 0,
+        l_len: 0,
+        l_pid: 0,
+        l_type: libc::F_WRLCK,
+        l_whence: libc::SEEK_SET as libc::c_short,
+    };
+    // SAFETY: `file` stays open for the call, and `lock` is a live `flock` that `F_GETLK` reads
+    // the asked range from and writes the blocking lock, if any, into.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &raw mut lock) } == -1 {
+        let e = std::io::Error::last_os_error();
+        return Err(format!("{} could not be read ({e})", path.display()));
+    }
+    match lock.l_type {
+        libc::F_UNLCK => Ok(Probe::Free),
+        libc::F_RDLCK => Ok(Probe::Shared),
+        libc::F_WRLCK => Ok(Probe::Exclusive),
+        kind => Err(format!(
+            "{} has a lock of unknown kind {kind}",
+            path.display()
+        )),
+    }
+}
+
+/// Elsewhere no read names a `flock` holder's kind, so it is sampled by taking the lock for an
+/// instant, each take on a fresh open. A refused exclusive take shows somebody holds the file, and a
+/// refused shared take that it is held exclusive. A shared take that succeeds shows no exclusive
+/// holder at that moment and nothing about a shared one, so a last exclusive take tells a round
+/// that has ended (Free) from a window's hold (Shared). The takes are separate instants: a session
+/// that lets its round go before the shared take and takes the next before the last reads as a
+/// window, and a host admitting while a take holds the file is turned away and asks again later.
+#[cfg(any(test, not(target_os = "macos")))]
+fn sample(path: &Path) -> Result<Probe, String> {
+    let takes = |shared: bool| {
+        let Some(file) = open_private(path, false) else {
+            return Err(unopened(path));
+        };
+        #[cfg(test)]
+        probing(path, Step::Reads);
+        let taken = if shared {
+            Flock::try_lock_shared(file)
+        } else {
+            Flock::try_lock(file)
+        };
+        match taken {
+            Ok(_held) => {
+                #[cfg(test)]
+                probing(path, Step::Holds);
+                Ok(true)
+            }
+            Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+            Err(std::fs::TryLockError::Error(e)) => {
+                Err(format!("{} could not be locked ({e})", path.display()))
+            }
         }
+    };
+    if takes(false)? {
+        return Ok(Probe::Free);
+    }
+    if !takes(true)? {
+        return Ok(Probe::Exclusive);
+    }
+    Ok(if takes(false)? {
+        Probe::Free
+    } else {
+        Probe::Shared
+    })
+}
+
+/// A point in a read of one rendezvous file where a test acts ([`probing`]).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    /// The read is about to look at the file's lock.
+    Reads,
+    /// The read holds the lock it took.
+    Holds,
+}
+
+/// What a test runs at each [`Step`] of a read, given the file read.
+#[cfg(test)]
+type ProbingHook = Box<dyn FnMut(&Path, Step)>;
+
+#[cfg(test)]
+thread_local! {
+    static PROBING: std::cell::RefCell<Option<ProbingHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs this thread's probing hook, if a test set one, at `step` of a read of `path`.
+#[cfg(test)]
+fn probing(path: &Path, step: Step) {
+    if let Some(mut hook) = PROBING.with_borrow_mut(Option::take) {
+        hook(path, step);
+        PROBING.with_borrow_mut(|slot| *slot = Some(hook));
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use super::*;
+
+    /// Each point a read reached, by file name.
+    type Seen = Vec<(&'static str, Step)>;
+
+    /// `read()` with `act` run at each point of its rendezvous reads; what it returned and the
+    /// points, in order.
+    fn probed<T>(
+        mut act: impl FnMut(&'static str, Step) + 'static,
+        read: impl FnOnce() -> T,
+    ) -> (T, Seen) {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let log = Rc::clone(&seen);
+        PROBING.with_borrow_mut(|slot| {
+            *slot = Some(Box::new(move |path: &Path, step| {
+                let file = [HOSTS_FILE, SEAT_FILE]
+                    .into_iter()
+                    .find(|name| path.ends_with(name))
+                    .unwrap_or_else(|| panic!("a read of {}", path.display()));
+                log.borrow_mut().push((file, step));
+                act(file, step);
+            }));
+        });
+        let out = read();
+        PROBING.with_borrow_mut(|slot| *slot = None);
+        let seen = seen.borrow().clone();
+        (out, seen)
+    }
+
+    /// A probing hook that runs `act` before the `n`th read.
+    fn before_read(
+        n: usize,
+        mut act: impl FnMut() + 'static,
+    ) -> impl FnMut(&'static str, Step) + 'static {
+        let mut reads = 0;
+        move |_, step| {
+            if step == Step::Reads {
+                reads += 1;
+                if reads == n {
+                    act();
+                }
+            }
+        }
+    }
+
+    /// A session that holds the seat between rounds.
+    fn sitting(l: &Layout) -> HostClaim {
+        let mut session = HostClaim::new(Host::Session, l);
+        assert_eq!(session.admit().0, Admit::Yes);
+        session.end_round();
+        session
+    }
+
+    /// A seated session lets its round go or takes the next before each of the report's reads, as
+    /// a runner step's back-to-back looks can: the report names the session, in either phase.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_round_that_comes_and_goes_mid_report_reads_as_the_session() {
+        let l = layout("round-churn");
+        let session = Rc::new(RefCell::new(sitting(&l)));
+        for in_round in [false, true] {
+            if in_round {
+                assert_eq!(session.borrow_mut().admit().0, Admit::Yes);
+            }
+            let churn = Rc::clone(&session);
+            let (verdict, seen) = probed(
+                move |_, step| {
+                    if step == Step::Reads {
+                        let mut claim = churn.borrow_mut();
+                        if claim.seated_session() {
+                            claim.end_round();
+                        } else {
+                            assert_eq!(claim.admit().0, Admit::Yes, "nothing else holds it");
+                        }
+                    }
+                },
+                || watcher(&l),
+            );
+            assert_eq!(
+                verdict,
+                Watcher::Session(Some(std::process::id())),
+                "starting in a round: {in_round}"
+            );
+            assert_eq!(
+                seen,
+                [(HOSTS_FILE, Step::Reads), (SEAT_FILE, Step::Reads)],
+                "one read of each file, holding nothing"
+            );
+        }
+        drop(session);
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// The seat changes hands before each of the report's reads (its sitter exits, or a new one
+    /// sits): the report names a seated session iff one sat when the seat was read.
+    #[test]
+    fn a_seat_that_changes_hands_mid_report_reads_as_it_was_read() {
+        let l = layout("seat-churn");
+        let sitter = Rc::new(RefCell::new(Some(sitting(&l))));
+        for (seated, expect) in [
+            (true, Watcher::Session(Some(std::process::id()))),
+            (false, Watcher::Nobody),
+        ] {
+            if !seated {
+                drop(sitter.borrow_mut().take());
+            }
+            let (churn, at) = (Rc::clone(&sitter), (*l).clone());
+            let (verdict, _) = probed(
+                move |_, step| {
+                    if step == Step::Reads {
+                        let mut seat = churn.borrow_mut();
+                        let next = if seat.is_some() {
+                            None
+                        } else {
+                            Some(sitting(&at))
+                        };
+                        drop(std::mem::replace(&mut *seat, next));
+                    }
+                },
+                || watcher(&l),
+            );
+            assert_eq!(verdict, expect, "seated at the start: {seated}");
+        }
+        drop(sitter);
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// A session and a window that admit at every point of a report are not turned away by it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn hosts_that_admit_mid_report_are_not_turned_away() {
+        let l = layout("admit-mid-report");
+        let session = Rc::new(RefCell::new(sitting(&l)));
+        let refused = Rc::new(RefCell::new(Vec::new()));
+        let (admits, log, at) = (Rc::clone(&session), Rc::clone(&refused), (*l).clone());
+        let (verdict, _) = probed(
+            move |file, step| {
+                let mut claim = admits.borrow_mut();
+                let session = claim.admit().0;
+                claim.end_round();
+                let window = HostClaim::new(Host::Window, &at).admit().0;
+                if session != Admit::Yes || window != Admit::Yes {
+                    log.borrow_mut().push((file, step, session, window));
+                }
+            },
+            || watcher(&l),
+        );
+        assert!(
+            refused.borrow().is_empty(),
+            "(file, step, session, window) where the report turned a host away: {:?}",
+            refused.borrow()
+        );
+        assert_eq!(verdict, Watcher::Session(Some(std::process::id())));
+        drop(session);
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// A window opens before the hosts read or between it and the seat's (in a session's round,
+    /// which ends to let it in, or between rounds), or one closes at either point: the report
+    /// names whoever held the hosts file when it was read.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_window_that_comes_or_goes_mid_report_reads_as_the_hosts_file_was_read() {
+        let l = layout("window-churn");
+        let session = Rc::new(RefCell::new(sitting(&l)));
+        let seated = Watcher::Session(Some(std::process::id()));
+        let window = Rc::new(RefCell::new(None::<HostClaim>));
+        for (in_round, n, expect) in [
+            (false, 1, Watcher::Window),
+            (false, 2, seated.clone()),
+            (true, 1, Watcher::Window),
+            (true, 2, seated.clone()),
+        ] {
+            if in_round {
+                assert_eq!(session.borrow_mut().admit().0, Admit::Yes);
+            }
+            let (claim, opens, at) = (Rc::clone(&session), Rc::clone(&window), (*l).clone());
+            let opening = before_read(n, move || {
+                claim.borrow_mut().end_round();
+                let mut opened = HostClaim::new(Host::Window, &at);
+                assert_eq!(opened.admit(), (Admit::Yes, None));
+                *opens.borrow_mut() = Some(opened);
+            });
+            assert_eq!(
+                probed(opening, || watcher(&l)).0,
+                expect,
+                "in a round: {in_round}, opened before read {n}"
+            );
+            drop(window.borrow_mut().take());
+        }
+        for (n, expect) in [(1, seated.clone()), (2, Watcher::Window)] {
+            let mut open = HostClaim::new(Host::Window, &l);
+            assert_eq!(open.admit(), (Admit::Yes, None));
+            *window.borrow_mut() = Some(open);
+            let closes = Rc::clone(&window);
+            let closing = before_read(n, move || drop(closes.borrow_mut().take()));
+            assert_eq!(
+                probed(closing, || watcher(&l)).0,
+                expect,
+                "closed before read {n}"
+            );
+            drop(window.borrow_mut().take());
+        }
+        drop(session);
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// The sample other systems read by: a hold that stays reads as its kind, and one let go
+    /// before the last take reads Free.
+    #[test]
+    fn a_sampled_hold_reads_as_its_kind_or_free_once_let_go() {
+        let l = layout("sample");
+        let hosts = l.prefix.join(HOSTS_FILE);
+        let session = Rc::new(RefCell::new(HostClaim::new(Host::Session, &l)));
+        assert_eq!(session.borrow_mut().admit().0, Admit::Yes);
+        assert_eq!(sample(&hosts), Ok(Probe::Exclusive), "a round held");
+        let claim = Rc::clone(&session);
+        let (read, seen) = probed(
+            before_read(2, move || claim.borrow_mut().end_round()),
+            || sample(&hosts),
+        );
+        assert_eq!(
+            read,
+            Ok(Probe::Free),
+            "a round let go after the refused exclusive take"
+        );
+        let (reads, holds) = ((HOSTS_FILE, Step::Reads), (HOSTS_FILE, Step::Holds));
+        assert_eq!(seen, [reads, reads, holds, reads, holds]);
+
+        let mut open = HostClaim::new(Host::Window, &l);
+        assert_eq!(open.admit(), (Admit::Yes, None));
+        assert_eq!(sample(&hosts), Ok(Probe::Shared), "a window's hold");
+        let window = Rc::new(RefCell::new(Some(open)));
+        let closes = Rc::clone(&window);
+        let (read, _) = probed(
+            before_read(3, move || drop(closes.borrow_mut().take())),
+            || sample(&hosts),
+        );
+        assert_eq!(
+            read,
+            Ok(Probe::Free),
+            "a window closed after the shared take"
+        );
+        drop(window);
+        drop(session);
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
 
     fn layout(label: &str) -> crate::testdir::ScratchLayout {
         crate::testdir::layout(&format!("atpkg-hosts-{label}-"))

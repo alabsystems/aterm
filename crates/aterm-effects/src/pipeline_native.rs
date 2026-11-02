@@ -1193,6 +1193,8 @@ impl EffectsPipeline {
         let frame_light = self.frame_light(f.now);
         self.pane_lights.0 = Some(f.now);
         self.pane_lights.1.clear();
+        let ink_from = self.ink_scratch.len();
+        let mut ink_panes = 0usize;
         for (index, pane) in panes.into_iter().enumerate() {
             let place = pane.place;
             let px_origin = (
@@ -1285,6 +1287,7 @@ impl EffectsPipeline {
             if !self.pane_ink.is_empty() {
                 translate_ink_into_pane(&mut self.pane_ink, place);
                 self.ink_scratch.extend_from_slice(&self.pane_ink);
+                ink_panes += 1;
             }
             if !self.pane_free.is_empty() {
                 translate_free_into_pane(&mut self.pane_free, place);
@@ -1295,7 +1298,10 @@ impl EffectsPipeline {
                 self.nova_scratch.extend_from_slice(&self.pane_nova);
             }
         }
-        if self.ink_scratch.len() > 1 && !self.ink_scratch.is_sorted_by_key(|c| (c.row, c.col)) {
+        if (ink_from > 0 || ink_panes > 1)
+            && self.ink_scratch.len() > 1
+            && !self.ink_scratch.is_sorted_by_key(|c| (c.row, c.col))
+        {
             self.ink_scratch.sort_unstable_by_key(|c| (c.row, c.col));
         }
         self.note_word_icons(from);
@@ -1552,7 +1558,6 @@ impl EffectsPipeline {
         input.nova_add.clone_from(&self.nova_scratch);
         self.yield_glass(input);
         self.shade_word_icons(input);
-        self.veil_pet_letters(input);
     }
 
     /// The yield (§15.2 1.9): on a frame whose cursor step laid the light glass, its glass in
@@ -1591,22 +1596,6 @@ impl EffectsPipeline {
         }
         let sprites: &[FreeSprite] = if worded { &self.free_scratch } else { &[] };
         let _ = self.cursor.glow.yield_glass(input, sprites, at);
-    }
-
-    /// The page veil under the letters the pet lies beneath, by the body its
-    /// tick drew this frame, into the published under stream
-    /// ([`crate::cursor_glow::CursorGlow::veil_pet_letters`]): every host
-    /// calls it after its pet's tick and the trail's publish.
-    #[inline]
-    pub fn veil_pet_letters(&mut self, input: &mut RenderInput) {
-        #[cfg(test)]
-        if self.pet_veil_stale {
-            return;
-        }
-        let _ = self.cursor.glow.veil_pet_letters(
-            (&mut input.glow_under, &mut input.glow_under_ramps),
-            &self.free_scratch,
-        );
     }
 
     /// The pet's level rules and senses before its tick ([`CompanionOwner::prepare`]), reading the

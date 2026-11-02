@@ -133,7 +133,11 @@ fn kind(word: &str) -> bool {
 }
 
 fn id(word: &str) -> Option<u64> {
-    word.strip_prefix('f')?.parse().ok().filter(|n| *n > 0)
+    let digits = word.strip_prefix('f')?;
+    (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| digits.parse().ok())
+        .flatten()
+        .filter(|n| *n > 0)
 }
 
 fn valid_node(node: &str) -> bool {
@@ -501,10 +505,13 @@ pub fn view(ctx: &dyn FabricSession, rest: &str, combined: bool) -> Result<View,
             meta = true;
         } else if let Some(value) = word
             .strip_prefix("since=f")
+            .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
             .and_then(|v| v.parse::<u64>().ok())
         {
             since = value;
-        } else if let Ok(value) = word.parse::<usize>() {
+        } else if word.bytes().all(|b| b.is_ascii_digit())
+            && let Ok(value) = word.parse::<usize>()
+        {
             limit = value.min(ROWS);
         } else if combined && word.starts_with("since=") {
         } else {
@@ -1117,6 +1124,19 @@ mod tests {
             crate::cmd_await_inbox(&receiver, &["since=f1"], 0),
             "OK timeout\n"
         );
+        for bad in [
+            &["since=f1", "fleet_since=f1"][..],
+            &["fleet_since=f1", "since=f1"][..],
+            &["since=f1", "since=1"][..],
+            &["since=1", "since=f1"][..],
+            &["re=8", "fleet_since=f1"][..],
+            &["since=0", "topic=lab", "fleet_since=f1"][..],
+        ] {
+            assert!(
+                crate::cmd_await_inbox(&receiver, bad, 0).starts_with("ERR usage"),
+                "{bad:?}"
+            );
+        }
         assert_eq!(
             crate::deliver_row(
                 &receiver,
@@ -1286,6 +1306,39 @@ mod tests {
         assert!(
             page.contains("msg f2 ") && page.contains("msg f17 "),
             "{page}"
+        );
+    }
+
+    #[test]
+    fn inbox_verb_and_direct_mail_parsers_reject_signed_numbers_and_stuck_fleet_prefixes() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let receiver = session(&scratch.path().join("private/inbox.toml"));
+        assert_eq!(
+            as_node("a", || post(&receiver, "key=k kind=ask -- question")),
+            "OK f1\n"
+        );
+        assert_eq!(
+            as_node("a", || crate::cmd_inbox_verb(&receiver, "seen")),
+            "ERR usage: inbox seen f<id>\n"
+        );
+        assert!(
+            as_node("a", || crate::cmd_inbox_verb(&receiver, "fleet--peek")).starts_with("ERR ")
+        );
+        assert!(as_node("a", || crate::cmd_inbox_verb(&receiver, "fleet1")).starts_with("ERR "));
+        assert!(as_node("a", || inbox(&receiver, "since=f+1", false)).starts_with("ERR "));
+        assert!(as_node("a", || inbox(&receiver, "+1", false)).starts_with("ERR "));
+        assert_eq!(
+            post(&receiver, "re=f+1 key=r kind=answer -- answer"),
+            "ERR fleet-mail: invalid direct-mail option\n"
+        );
+        let _ = crate::cmd_inbox(&receiver, "");
+        assert_eq!(
+            crate::cmd_inbox_verb(&receiver, "seen   f+1 forget"),
+            "ERR usage: inbox seen f<id> forget\n"
+        );
+        assert_eq!(
+            crate::cmd_inbox_verb(&receiver, "seen   f1 forget"),
+            "OK forgot=f1\n"
         );
     }
 }

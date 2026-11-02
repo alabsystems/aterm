@@ -327,7 +327,11 @@ fn api_credits(
     flag: Option<RawApiFlag>,
     statuses: &OrgStatuses,
 ) -> Option<Offer> {
-    let eligible = statuses.0.iter().any(|(key, number)| key == org && *number);
+    let eligible = statuses
+        .0
+        .iter()
+        .rfind(|(key, _)| key == org)
+        .is_some_and(|(_, number)| *number);
     if !eligible {
         return None;
     }
@@ -426,7 +430,9 @@ pub fn vendor_host(host: &str) -> bool {
         && host
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
-        && host.split('.').all(|label| !label.is_empty());
+        && host
+            .split('.')
+            .all(|label| !label.is_empty() && !label.starts_with('-') && !label.ends_with('-'));
     plain
         && VENDOR_HOSTS.iter().any(|vendor| {
             host == *vendor
@@ -434,6 +440,28 @@ pub fn vendor_host(host: &str) -> bool {
                     .strip_suffix(vendor)
                     .is_some_and(|sub| sub.len() > 1 && sub.ends_with('.'))
         })
+}
+
+fn decode_percent_ascii_lower(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (
+                aterm_codec::hex::nibble(bytes[i + 1]),
+                aterm_codec::hex::nibble(bytes[i + 2]),
+            )
+        {
+            out.push(char::from((hi << 4) | lo).to_ascii_lowercase());
+            i += 3;
+        } else {
+            out.push(char::from(bytes[i]).to_ascii_lowercase());
+            i += 1;
+        }
+    }
+    out
 }
 
 /// Why the page at `url` is none a claim worker may act on, `Ok` where it is one: an `https://`
@@ -454,7 +482,7 @@ pub fn claim_page(url: &str) -> Result<(), String> {
     let Some(rest) = url.strip_prefix("https://") else {
         return Err("its page is not an https:// page".to_owned());
     };
-    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let end = rest.find(['/', '\\', '?', '#']).unwrap_or(rest.len());
     let (authority, after) = rest.split_at(end);
     if authority.contains('@') {
         return Err("its page's link names a user before the host".to_owned());
@@ -465,8 +493,12 @@ pub fn claim_page(url: &str) -> Result<(), String> {
     if !vendor_host(authority) {
         return Err(format!("{authority} is not the vendor's host"));
     }
-    let after = after.to_ascii_lowercase();
-    if let Some(word) = MONEY_WORDS.iter().find(|w| after.contains(*w)) {
+    let lower = after.to_ascii_lowercase();
+    let decoded = decode_percent_ascii_lower(after);
+    if let Some(word) = MONEY_WORDS
+        .iter()
+        .find(|w| lower.contains(*w) || decoded.contains(*w))
+    {
         return Err(format!(
             "its page's link names `{word}`: a billing, plan, usage or payment page"
         ));
@@ -608,13 +640,22 @@ impl<'de> Deserialize<'de> for OrgStatuses {
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<OrgStatuses, A::Error> {
                 let mut out = Vec::new();
                 while let Some(key) = map.next_key::<String>()? {
-                    if out.len() >= STATUS_ENTRIES_MAX || key.is_empty() || key.len() > ID_MAX {
+                    if key.is_empty() || key.len() > ID_MAX {
+                        map.next_value::<IgnoredAny>()?;
+                        continue;
+                    }
+                    let existing = out.iter().position(|(k, _)| k == &key);
+                    if existing.is_none() && out.len() >= STATUS_ENTRIES_MAX {
                         map.next_value::<IgnoredAny>()?;
                         continue;
                     }
                     let Obj(status) = map.next_value::<Obj<RawApiStatus>>()?;
                     let number = status.is_some_and(|s| s.since.num().is_some_and(f64::is_finite));
-                    out.push((key, number));
+                    if let Some(idx) = existing {
+                        out[idx].1 = number;
+                    } else {
+                        out.push((key, number));
+                    }
                 }
                 Ok(OrgStatuses(out))
             }

@@ -232,6 +232,10 @@ pub(super) enum Reading {
 type ReadHook = Box<dyn FnMut(Reading)>;
 thread_local! {
     static READ_HOOK: std::cell::RefCell<Option<ReadHook>> = const { std::cell::RefCell::new(None) };
+    static HASHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+pub(super) fn hashing() {
+    HASHES.with(|count| count.set(count.get() + 1));
 }
 pub(super) fn read_step(step: Reading) {
     let hook = READ_HOOK.with(|hook| hook.borrow_mut().take());
@@ -286,6 +290,105 @@ fn a_reader_needs_no_lock_while_a_writer_holds_the_journal() {
         read_committed(dir.path(), "test", b"foreign", limits(), None).is_err(),
         "a reader holds the anchor to the caller's pin"
     );
+}
+
+#[test]
+fn unchanged_fresh_prefix_needs_no_repeated_digest_computation() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let mut owner = open(dir.path());
+    owner
+        .append("app/1", b"private journal value".to_vec())
+        .unwrap();
+    let (_, prefix) = rebuilt(dir.path());
+    let before = HASHES.with(std::cell::Cell::get);
+    for _ in 0..2 {
+        assert!(matches!(
+            read(dir.path(), Some(&prefix)).unwrap(),
+            Committed::Unchanged
+        ));
+    }
+    assert_eq!(
+        HASHES.with(std::cell::Cell::get),
+        before,
+        "equal fresh bytes need no new digest"
+    );
+}
+
+#[test]
+fn retained_bytes_do_not_hide_a_changed_checkpoint_or_enter_debug_output() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let mut owner = open(dir.path());
+    owner
+        .append("app/1", b"private journal value".to_vec())
+        .unwrap();
+    let (_, prefix) = rebuilt(dir.path());
+    let physical = std::fs::read(dir.path().join("test.astream")).unwrap();
+    assert!(!format!("{prefix:?}").contains(&format!("{physical:?}")));
+    let checkpoint = std::fs::read(dir.path().join("test.checkpoint")).unwrap();
+    let mut changed = checkpoint.clone();
+    changed[8] ^= 1;
+    private_file::write_private(dir.path(), "test.checkpoint", &changed).unwrap();
+    assert!(read(dir.path(), Some(&prefix)).is_err());
+    private_file::write_private(dir.path(), "test.checkpoint", &checkpoint).unwrap();
+    assert!(matches!(
+        read(dir.path(), Some(&prefix)).unwrap(),
+        Committed::Unchanged
+    ));
+}
+
+#[test]
+fn retained_prefix_requires_current_private_files_and_anchor() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let mut owner = open(dir.path());
+    owner.append("app/1", b"value".to_vec()).unwrap();
+    let (_, prefix) = rebuilt(dir.path());
+    for name in ["test.anchor", "test.checkpoint", "test.astream"] {
+        let path = dir.path().join(name);
+        let private = std::fs::metadata(&path).unwrap().permissions();
+        let mut exposed = private.clone();
+        exposed.set_mode(private.mode() | 0o040);
+        std::fs::set_permissions(&path, exposed).unwrap();
+        let refused = read(dir.path(), Some(&prefix)).is_err();
+        std::fs::set_permissions(&path, private).unwrap();
+        assert!(refused, "a retained prefix cannot admit a nonprivate file");
+        assert!(matches!(
+            read(dir.path(), Some(&prefix)).unwrap(),
+            Committed::Unchanged
+        ));
+    }
+    private_file::write_private(dir.path(), "test.anchor", b"foreign").unwrap();
+    assert!(read(dir.path(), Some(&prefix)).is_err());
+    private_file::write_private(dir.path(), "test.anchor", b"pinned").unwrap();
+    assert!(matches!(
+        read(dir.path(), Some(&prefix)).unwrap(),
+        Committed::Unchanged
+    ));
+}
+
+#[test]
+fn large_prefixes_still_verify_without_retaining_physical_bytes() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let capacity = Limits {
+        records: 1,
+        bytes: PREFIX_BYTES + 4096,
+        record_bytes: PREFIX_BYTES,
+    };
+    let mut owner = Log::open(dir.path(), "test", b"pinned", false, capacity).unwrap();
+    owner.finish_open().unwrap();
+    owner.append("app/1", vec![7; PREFIX_BYTES]).unwrap();
+    let Committed::Rebuilt { prefix, .. } =
+        read_committed(dir.path(), "test", b"pinned", capacity, None).unwrap()
+    else {
+        panic!("initial observation must provide the complete prefix");
+    };
+    let before = HASHES.with(std::cell::Cell::get);
+    assert!(matches!(
+        read_committed(dir.path(), "test", b"pinned", capacity, Some(&prefix)).unwrap(),
+        Committed::Unchanged
+    ));
+    assert_eq!(HASHES.with(std::cell::Cell::get), before + 1);
 }
 
 #[test]
@@ -656,6 +759,18 @@ fn a_reader_refuses_an_unanchored_or_over_capacity_journal() {
     assert!(read_committed(dir.path(), "test", b"pinned", small_record, Some(&known)).is_err());
     assert!(Log::open(dir.path(), "test", b"pinned", true, small_record).is_err());
 
+    let oversized = aterm_tempfile::tempdir().unwrap();
+    let over_log = open(oversized.path());
+    drop(over_log);
+    let max_bytes = (limits().bytes + limits().record_bytes) as u64;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(oversized.path().join("test.astream"))
+        .unwrap()
+        .set_len(max_bytes + 1)
+        .unwrap();
+    assert!(Log::open(oversized.path(), "test", b"pinned", true, limits()).is_err());
+
     let mut reopened = Log::open(dir.path(), "test", b"pinned", true, limits()).unwrap();
     reopened.finish_open().unwrap();
     assert!(reopened.append("", b"x".to_vec()).is_err());
@@ -665,6 +780,35 @@ fn a_reader_refuses_an_unanchored_or_over_capacity_journal() {
         "invalid subjects refuse pre-mutation without poisoning"
     );
     reopened.append("app/1", b"ok".to_vec()).unwrap();
+    drop(reopened);
+
+    for bad_subject in ["", "/a/will", "/a/commit", "/a/bind", "/a/retire"] {
+        let crafted = aterm_tempfile::tempdir().unwrap();
+        let log = open(crafted.path());
+        drop(log);
+        let frame = BrokerRecord {
+            seq: Offset(0),
+            producer_id: 1,
+            producer_seq: 1,
+            subject: bad_subject.into(),
+            body: b"x".to_vec(),
+            commit: None,
+        }
+        .encode()
+        .unwrap();
+        private_file::write_private(crafted.path(), "test.astream", &frame).unwrap();
+        let mut ckpt = (frame.len() as u64).to_le_bytes().to_vec();
+        ckpt.extend_from_slice(&aterm_digest::Sha256::digest(&frame));
+        private_file::write_private(crafted.path(), "test.checkpoint", &ckpt).unwrap();
+        assert!(
+            read(crafted.path(), None).is_err(),
+            "read_committed must refuse subject {bad_subject:?}"
+        );
+        assert!(
+            Log::open(crafted.path(), "test", b"pinned", true, limits()).is_err(),
+            "Log::open must refuse subject {bad_subject:?}"
+        );
+    }
 }
 
 thread_local! {

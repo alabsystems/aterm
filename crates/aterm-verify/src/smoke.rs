@@ -114,9 +114,10 @@ impl SmokeChild {
     /// has exited `SIGKILL` the group until it holds nothing but the unreaped leader (a child
     /// forked as one signal went out takes the next), until [`GROUP_GONE`] passes, or until the
     /// group's custody is lost and no signal may go to its id. `sweep`
-    /// reads the group before the leader is reaped, and names what is still there. True only when
-    /// the leader exited 0 or died of a signal sent here.
-    pub fn retire(mut self, sweep: impl FnOnce(u32)) -> bool {
+    /// reads the group before the leader is reaped, and names what is still there; `reaped` is
+    /// told the group once the leader is reaped. True only when the leader exited 0 or died of a
+    /// signal sent here.
+    pub fn retire(mut self, sweep: impl FnOnce(u32), reaped: impl FnOnce(u32)) -> bool {
         use std::os::unix::process::ExitStatusExt as _;
         let pgid = self.child.id();
         let term_sent = self.live.term().is_ok();
@@ -135,7 +136,10 @@ impl SmokeChild {
             let _ = self.live.kill();
             std::thread::sleep(Duration::from_millis(10));
         }
-        match self.live.reap_stage_sweeping(&mut self.child, true, sweep) {
+        match self
+            .live
+            .reap_stage_sweeping(&mut self.child, true, sweep, reaped)
+        {
             Ok(Some(st)) => match (st.code(), st.signal()) {
                 (Some(0), _) => true,
                 (_, Some(15)) => term_sent,
@@ -207,14 +211,17 @@ pub fn activate_macos_gui_pid(pid: u32) -> bool {
     if !Path::new(SWIFT).exists() {
         return false;
     }
-    let script = std::env::temp_dir().join(format!(
-        "aterm-verify-activate-{}-{pid}.swift",
-        std::process::id()
-    ));
+    let Ok(dir) = aterm_tempfile::Builder::new()
+        .prefix("aterm-verify-activate-")
+        .tempdir()
+    else {
+        return false;
+    };
+    let script = dir.path().join("activate.swift");
     if std::fs::write(&script, ACTIVATE_SWIFT).is_err() {
         return false;
     }
-    let ok = Command::new(SWIFT)
+    Command::new(SWIFT)
         .arg(&script)
         .arg(pid.to_string())
         .arg(ACTIVATE_DEADLINE_SECS.to_string())
@@ -223,9 +230,7 @@ pub fn activate_macos_gui_pid(pid: u32) -> bool {
         .stderr(Stdio::null())
         .status()
         .map(|s| s.success())
-        .unwrap_or(false);
-    let _ = std::fs::remove_file(&script);
-    ok
+        .unwrap_or(false)
 }
 
 /// How long the activation program waits for WindowServer to report this pid as
@@ -354,7 +359,10 @@ mod tests {
         let (child, ready) = smoke_child("echo up; exec sleep 30");
         assert_eq!(ready, "up\n");
         let pid = i32::try_from(child.id()).expect("pid");
-        assert!(child.retire(|_| {}), "a TERM we sent is a clean retirement");
+        assert!(
+            child.retire(|_| {}, |_| {}),
+            "a TERM we sent is a clean retirement"
+        );
         assert_eq!(
             aterm_uds::process::process_presence(pid),
             aterm_uds::process::ProcessPresence::Absent,
@@ -368,7 +376,7 @@ mod tests {
         assert_eq!(ready, "ignoring\n", "the child set its trap");
         let start = std::time::Instant::now();
         assert!(
-            child.retire(|_| {}),
+            child.retire(|_| {}, |_| {}),
             "KILL after the budget is still a retirement we caused"
         );
         assert!(
@@ -380,7 +388,13 @@ mod tests {
 
     /// The subject's `atpkg machine` read, started as the smoke's window went, outlived it in the
     /// window's group. Here the helper ignores `SIGTERM` and sleeps on, so it is still there,
-    /// held, when the instance dies: only the teardown can end it.
+    /// held, when the instance dies: only the teardown can end it. The kernel's answer about the
+    /// whole group ([`crate::exec::group::empty`]) reads it not empty while its leader is
+    /// unreaped, and, on Apple, whose teardown waits until the group lists nothing but the leader,
+    /// empty once the leader is reaped (on Linux, whose listing skips a zombie, the helper may
+    /// still be one then, so that answer is only read); on every host it reads empty once the
+    /// helper is gone too. NEGATIVE CONTROL: answer `Some(false)` for `ESRCH` in
+    /// [`crate::exec::group::empty`], and the emptied group reads not empty.
     #[test]
     fn retiring_the_instance_ends_the_helper_it_left_in_its_group() {
         let (child, line) = smoke_child(
@@ -388,17 +402,31 @@ mod tests {
         );
         let helper: i32 = line.trim().parse().expect("the helper's pid");
         let leader = i32::try_from(child.id()).expect("pid");
-        let mut swept = None;
+        let (mut swept, mut reaped) = (None, None);
         assert!(
-            child.retire(|pgid| swept = aterm_uds::process::group_members(pgid)),
+            child.retire(
+                |pgid| {
+                    swept = Some((
+                        aterm_uds::process::group_members(pgid),
+                        crate::exec::group::empty(pgid),
+                    ));
+                },
+                |pgid| reaped = Some(crate::exec::group::empty(pgid)),
+            ),
             "a TERM we sent is a clean retirement"
         );
+        let (listed, unreaped) = swept.expect("the sweep ran");
+        assert_eq!(unreaped, Some(false), "the unreaped leader keeps its group");
+        let reaped = reaped.expect("the reap was told");
         if cfg!(target_vendor = "apple") {
             assert_eq!(
-                swept.map(|m| m.pids),
+                listed.map(|m| m.pids),
                 Some(vec![leader]),
                 "the sweep finds the unreaped leader alone in its group"
             );
+            assert_eq!(reaped, Some(true), "reaped, the group holds no one");
+        } else {
+            assert!(reaped.is_some(), "the kernel answers about the group");
         }
         assert!(
             matches!(
@@ -407,6 +435,21 @@ mod tests {
                     | aterm_uds::process::ProcessPresence::Exited
             ),
             "the helper (pid {helper}) outlived the smoke's instance"
+        );
+        // Its new parent reaps the ended helper; then no process holds the group's id.
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the ended helper's reap",
+            || {
+                (aterm_uds::process::process_presence(helper)
+                    == aterm_uds::process::ProcessPresence::Absent)
+                    .then_some(())
+            },
+        );
+        assert_eq!(
+            crate::exec::group::empty(u32::try_from(leader).expect("a pid")),
+            Some(true),
+            "with its leader reaped and its helper gone, the group holds no one"
         );
     }
 }

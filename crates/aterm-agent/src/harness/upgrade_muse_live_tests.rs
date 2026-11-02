@@ -35,6 +35,27 @@ fn run(id: &str, event: &str, at_us: u64) -> String {
     )
 }
 
+/// What was said to a session is what its runs started on since the second asked: an older run is
+/// left out, an inbox drain's empty prompt is no one's word, and a torn line says nothing.
+#[test]
+fn prompts_since_reads_what_was_said_since() {
+    let started = |prompt: &str| format!(r#"{{"kind":"started","prompt":"{prompt}"}}"#);
+    let log = [
+        run("r1", &started("before the restart"), START_US - 1),
+        run("r2", &started("hi"), START_US),
+        run("r3", &started(""), START_US + 1),
+        run("r4", r#"{"kind":"completed"}"#, START_US + 2),
+        run("r5", &started("[aterm harness] Relaunched"), START_US + 3),
+        r#"{"schema_version":1,"recorded_at":1792284625000009,"payload":{"kind":"run","event":{"kind":"started","prompt":"to"#.to_string(),
+    ]
+    .join("\n");
+    assert_eq!(
+        prompts_since(&log, START_US),
+        ["hi".to_string(), "[aterm harness] Relaunched".to_string()]
+    );
+    assert_eq!(prompts_since(&log, START_US + 100), Vec::<String>::new());
+}
+
 fn task(id: &str, event: &str, at_us: u64) -> String {
     rec(
         "runtime.session",

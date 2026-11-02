@@ -1433,3 +1433,31 @@ fn occupancy_fact_keys_are_appended_wire_and_an_older_reader_skips_them() {
         assert_eq!(read.f.get(key), None, "{key:?} skipped: {older}");
     }
 }
+
+#[test]
+fn line_and_bus_decoders_reject_plus_prefixed_numbers() {
+    assert_eq!(
+        decode("+1 open t1 turn"),
+        Err(DecodeError::Seq),
+        "plus-prefixed seq is rejected"
+    );
+    let r = decode("1 mark - task rev=+3 code=+2 t=+9").expect("decodes header");
+    assert_eq!(r.t, 0, "plus-prefixed timestamp falls back to 0");
+    assert_eq!(
+        r.f.get(Key::Rev),
+        None,
+        "plus-prefixed unsigned field is skipped"
+    );
+    assert_eq!(
+        r.f.get(Key::Code),
+        None,
+        "plus-prefixed signed field is skipped"
+    );
+
+    assert_eq!(
+        decode_bus("v=2 t=7 ep=3 seq=+9 ms=4 op=open node=t1 k=turn"),
+        Err(DecodeError::Seq)
+    );
+    let b = decode_bus("v=2 t=+7 ep=+3 seq=9 ms=+4 op=open node=t1 k=turn").expect("decodes");
+    assert_eq!((b.rec.t, b.ep, b.ms), (0, 0, None));
+}

@@ -545,10 +545,17 @@ impl MarkReq {
                     req.word = Some(w);
                 }
                 "text" if takes_text => req.text = Some(mark_text(v)?),
-                "ttl" if takes_ttl => match v.parse::<u64>() {
-                    Ok(s) if (1..=LABEL_TTL_MAX_S).contains(&s) => req.ttl = Some(s),
-                    _ => return Err("ERR mark: ttl is 1..=3600\n".to_string()),
-                },
+                "ttl" if takes_ttl => {
+                    match v
+                        .bytes()
+                        .all(|b| b.is_ascii_digit())
+                        .then(|| v.parse::<u64>().ok())
+                        .flatten()
+                    {
+                        Some(s) if (1..=LABEL_TTL_MAX_S).contains(&s) => req.ttl = Some(s),
+                        _ => return Err("ERR mark: ttl is 1..=3600\n".to_string()),
+                    }
+                }
                 "rule" if takes_rule => {
                     req.rule = Some(
                         ShortId::new(v)
@@ -866,15 +873,16 @@ impl LogAwait {
     pub(crate) fn parse(args: &[&str]) -> Result<LogAwait, &'static str> {
         let mut what: Option<LogWaits> = None;
         let (mut since, mut ep, mut base) = (None, None, None);
+        let digits = |v: &str| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit());
         for tok in args {
             match tok.split_once('=') {
-                Some(("since", v)) if since.is_none() => {
+                Some(("since", v)) if since.is_none() && digits(v) => {
                     since = Some(v.parse::<u64>().map_err(|_| AWAIT_LOG_USAGE)?);
                 }
-                Some(("ep", v)) if ep.is_none() => {
+                Some(("ep", v)) if ep.is_none() && digits(v) => {
                     ep = Some(v.parse::<u32>().map_err(|_| AWAIT_LOG_USAGE)?);
                 }
-                Some(("base", v)) if base.is_none() => {
+                Some(("base", v)) if base.is_none() && digits(v) => {
                     base = Some(v.parse::<u32>().map_err(|_| AWAIT_LOG_USAGE)?);
                 }
                 Some(("since" | "ep" | "base", _)) => return Err(AWAIT_LOG_USAGE),

@@ -15,6 +15,27 @@
 
 #[cfg(test)]
 aterm_durable::plain_durable_flushes_in_tests!();
+
+#[cfg(test)]
+mod test_program;
+
+/// A test's POSIX absolute path literal as this host reads it absolute, as a `&'static str`
+/// (`harness::host_path::abs` makes the same `String`): itself on Unix, on drive `C:` on Windows;
+/// with a text before and after it, that text with the path inside.
+#[cfg(test)]
+macro_rules! at {
+    ($posix:literal) => {
+        at!("", $posix, "")
+    };
+    ($before:literal, $posix:literal, $after:literal) => {
+        if cfg!(windows) {
+            concat!($before, "C:", $posix, $after)
+        } else {
+            concat!($before, $posix, $after)
+        }
+    };
+}
+
 #[cfg(all(test, unix))]
 aterm_secrets::memoized_x25519_in_tests!();
 
@@ -35,12 +56,16 @@ pub mod fleet_cli;
 /// Fleet admission as this Mac's membership log says it (F17).
 #[cfg(unix)]
 pub mod fleet_log;
-/// `aterm fleet init|join|peers|allow|leave`: this machine's membership in a fleet.
+/// `aterm fleet init|join|peers|allow|publish|sync|census|leave`: this machine's membership in a
+/// fleet.
 #[cfg(unix)]
 mod fleet_member;
 /// `aterm members`: Macs joining ALab and the members that let them in.
 #[cfg(unix)]
 pub mod members_cli;
+/// `vault-join`: a Mac whose vault key changed proves itself to a member over the fleet.
+#[cfg(unix)]
+pub mod vault_join;
 /// `aterm ctl survey --fleet | --host`: the fleet's peers; `aterm ctl --host <h> …`: another Mac
 /// driven over it.
 #[cfg(unix)]
@@ -188,6 +213,71 @@ pub(crate) fn reply_count(header: &str) -> std::io::Result<Option<usize>> {
     }
 }
 
+#[inline]
+pub(crate) fn parse_uint<T: std::str::FromStr>(s: &str) -> Option<T> {
+    (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| s.parse().ok())
+        .flatten()
+}
+
+#[inline]
+pub(crate) fn parse_int<T: std::str::FromStr>(s: &str) -> Option<T> {
+    let digits = s.strip_prefix('-').unwrap_or(s);
+    (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| s.parse().ok())
+        .flatten()
+}
+
+/// How long one exchange on a persistent control connection may wait for the server to get to
+/// it: a hang guard, never a latency budget. On a loaded machine an idle step took up to 57 s
+/// (`docs/measured/idle-look-under-load-2026-10-23.md`), a whole-step observation. The guard
+/// bounds the wait for an unanswered exchange.
+pub const DEFAULT_REPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The wait the request `words` asks of the server, by the first `timeout=<ms>` (or
+/// `timeout <ms>`) it names: a typed text's words come after it.
+pub(crate) fn named_timeout(words: &[&str]) -> Option<std::time::Duration> {
+    let ms = words.iter().enumerate().find_map(|(i, w)| {
+        if *w == "timeout" {
+            words.get(i + 1).and_then(|n| parse_uint::<u64>(n))
+        } else {
+            w.strip_prefix("timeout=").and_then(parse_uint::<u64>)
+        }
+    });
+    ms.map(std::time::Duration::from_millis)
+}
+
+/// How long the request `line` may wait for its reply on a connection bounded by `bound`
+/// ([`RelayClient::bounded`]): the bound, and on top the wait the request names.
+fn exchange_wait(line: &str, bound: std::time::Duration) -> std::time::Duration {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    bound.saturating_add(named_timeout(&words).unwrap_or_default())
+}
+
+/// Whether `e` ended an exchange whose reply did not come within its wait
+/// ([`RelayClient::bounded`]): the request may have reached the server, which may still act on it,
+/// so its outcome is unknown, never the server's refusal.
+#[must_use]
+pub fn unanswered(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
+}
+
+/// Arms a transport's read and write timeouts for one exchange ([`RelayClient::bounded`]).
+type Arm<S> = fn(&S, std::time::Duration) -> std::io::Result<()>;
+
+fn monotonic_now<S>(_: &S) -> std::time::Instant {
+    std::time::Instant::now()
+}
+
+#[derive(Clone, Copy)]
+struct ExchangeBudget {
+    started: std::time::Instant,
+    wait: std::time::Duration,
+}
+
 /// One persistent, authenticated control connection, the in-process twin of [`CtlClient`].
 pub struct RelayClient<S: Read + Write> {
     io: S,
@@ -197,12 +287,43 @@ pub struct RelayClient<S: Read + Write> {
     buf: Vec<u8>,
     /// The `OK` replies to `help <verb>` this connection has had ([`Self::help_counted`]).
     help: Vec<(String, (String, String))>,
+    /// Each exchange's bound and how it arms the transport ([`RelayClient::bounded`]).
+    bound: Option<(Arm<S>, std::time::Duration)>,
+    /// Hangs the transport up once a reply is left unread, so the server reads its caller gone
+    /// ([`RelayClient::bounded`]).
+    hang_up: fn(&S),
+    /// The monotonic clock, injected with a controlled transport in deadline tests.
+    clock: fn(&S) -> std::time::Instant,
+    /// One budget for writes, flush, header and the entire counted or framed reply.
+    exchange: Option<ExchangeBudget>,
+    /// Whether the last exchange received any bytes, even before a malformed/partial reply.
+    reply_started: bool,
+    /// A reply was left unread: what is left of it would answer the next request, so every
+    /// later one is refused unsent ([`Self::reply_unread`]).
+    unread: bool,
 }
 
 /// The verbs a read-only connection may send ([`RelayClient::reads_only`]).
 pub const READ_VERBS: &[&str] = &[
-    "text", "screen", "line", "cell", "cursor", "modes", "blocks", "history", "status", "timeline",
-    "metrics", "await", "who", "sessions", "help", "meta", "ls", "doc",
+    "text",
+    "screen",
+    "line",
+    "cell",
+    "cursor",
+    "modes",
+    "blocks",
+    "history",
+    "status",
+    "timeline",
+    "metrics",
+    "await",
+    "who",
+    "sessions",
+    "help",
+    "meta",
+    "ls",
+    "doc",
+    "native-act",
 ];
 
 /// Whether the control request `line` is one [`READ_VERBS`] names, in its read form.
@@ -210,6 +331,7 @@ fn is_read_request(line: &str) -> bool {
     let mut words = line.split_whitespace().skip_while(|w| w.starts_with('@'));
     match words.next() {
         Some("meta") => words.next().is_none(),
+        Some("native-act") => words.next() == Some("info") && words.next().is_none(),
         Some("metrics") => {
             let mut command = words.filter(|w| !matches!(*w, "json" | "--json"));
             matches!(command.next(), None | Some("percentiles")) && command.next().is_none()
@@ -231,6 +353,12 @@ impl<S: Read + Write> RelayClient<S> {
             reads_only: false,
             buf: Vec::new(),
             help: Vec::new(),
+            bound: None,
+            hang_up: |_| {},
+            clock: monotonic_now::<S>,
+            exchange: None,
+            reply_started: false,
+            unread: false,
         }
     }
 
@@ -311,7 +439,7 @@ impl<S: Read + Write> RelayClient<S> {
             // a long, fragmented reply must not repeatedly scan its whole prefix.
             scanned = self.buf.len();
             let mut tmp = [0u8; 8192];
-            let n = self.io.read(&mut tmp)?;
+            let n = self.read_some(&mut tmp)?;
             if n == 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
@@ -322,7 +450,9 @@ impl<S: Read + Write> RelayClient<S> {
         }
     }
 
-    fn write_line(&mut self, line: &str) -> std::io::Result<()> {
+    /// Whether `line` may go out as one request ([`Self::may_send`], on one line). A refusal
+    /// writes nothing.
+    fn sendable(&self, line: &str) -> std::io::Result<()> {
         self.may_send(line)?;
         if line.contains(['\n', '\r']) {
             return Err(std::io::Error::new(
@@ -330,9 +460,151 @@ impl<S: Read + Write> RelayClient<S> {
                 "control request must not contain an embedded line terminator",
             ));
         }
-        self.io.write_all(line.as_bytes())?;
-        self.io.write_all(b"\n")?;
-        self.io.flush()
+        Ok(())
+    }
+
+    fn write_line(&mut self, line: &str) -> std::io::Result<()> {
+        self.sendable(line)?;
+        self.write_all(line.as_bytes())?;
+        self.write_all(b"\n")?;
+        self.flush()
+    }
+
+    fn remaining(&self) -> std::io::Result<Option<std::time::Duration>> {
+        let Some(budget) = self.exchange else {
+            return Ok(None);
+        };
+        let elapsed = (self.clock)(&self.io).saturating_duration_since(budget.started);
+        let left = budget.wait.saturating_sub(elapsed);
+        if left.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "control exchange exceeded its reply budget",
+            ));
+        }
+        Ok(Some(left))
+    }
+
+    fn before_io(&self) -> std::io::Result<()> {
+        if let Some(left) = self.remaining()?
+            && let Some((arm, _)) = self.bound
+        {
+            arm(&self.io, left)?;
+        }
+        Ok(())
+    }
+
+    fn read_some(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        self.before_io()?;
+        let got = self.io.read(bytes);
+        self.reply_started |= got.as_ref().is_ok_and(|n| *n > 0);
+        self.remaining()?;
+        got
+    }
+
+    fn write_all(&mut self, mut bytes: &[u8]) -> std::io::Result<()> {
+        while !bytes.is_empty() {
+            self.before_io()?;
+            let got = self.io.write(bytes);
+            self.remaining()?;
+            match got {
+                Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+                Ok(n) => bytes = &bytes[n..],
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.before_io()?;
+        let got = self.io.flush();
+        self.remaining()?;
+        got
+    }
+
+    /// Readies the connection for the request `line`: refused, unsent (`NotConnected`), once an
+    /// earlier reply was left unread ([`Self::settled`]), else armed with its wait
+    /// ([`Self::bounded`]).
+    fn ready_for(&mut self, line: &str) -> std::io::Result<()> {
+        if self.unread {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "an earlier reply on this control connection was left unread, and what is left \
+                 of it would answer this request: not sent",
+            ));
+        }
+        self.reply_started = !self.buf.is_empty();
+        if let Some((arm, bound)) = self.bound {
+            let wait = exchange_wait(line, bound).max(std::time::Duration::from_millis(1));
+            let started = (self.clock)(&self.io);
+            arm(&self.io, wait)?;
+            self.exchange = Some(ExchangeBudget { started, wait });
+        }
+        Ok(())
+    }
+
+    /// `got`; an error leaves the connection refusing every later request, since what is left of
+    /// the reply would answer it, and a [`Self::bounded`] one is hung up.
+    fn settled<T>(&mut self, got: std::io::Result<T>) -> std::io::Result<T> {
+        let got = got.and_then(|value| self.remaining().map(|_| value));
+        // Streaming reads are not part of the completed request's total budget. Restore the
+        // full per-I/O interval the connection had when it began, not a nearly spent remainder.
+        let restore = match (self.exchange.take(), self.bound) {
+            (Some(budget), Some((arm, _))) => arm(&self.io, budget.wait),
+            _ => Ok(()),
+        };
+        let got = got.and_then(|value| restore.map(|()| value));
+        if got.is_err() && !std::mem::replace(&mut self.unread, true) {
+            (self.hang_up)(&self.io);
+        }
+        got
+    }
+
+    /// Whether a reply on this connection was left unread (a [`Self::bounded`] exchange past its
+    /// wait, or a reply cut short): every later request is refused unsent, so a caller reads what
+    /// it asks after as the socket's silence, never the server's answer.
+    pub(crate) const fn reply_unread(&self) -> bool {
+        self.unread
+    }
+
+    pub(crate) fn closed_before_reply(&self) -> bool {
+        !self.reply_started
+    }
+
+    /// Observe one reply byte after the caller proves closure or empty EOF. Whether
+    /// no reply byte preceded closure; any observed or buffered byte refuses recovery.
+    fn closed_peer_without_reply(&mut self) -> bool {
+        if !self.closed_before_reply() || !self.buf.is_empty() {
+            return false;
+        }
+        match self.read_some(&mut [0u8; 1]) {
+            Ok(0) => true,
+            Ok(_) => false,
+            Err(e) => {
+                matches!(
+                    e.kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                ) || (e.kind() == std::io::ErrorKind::NotConnected && e.raw_os_error().is_some())
+            }
+        }
+    }
+
+    fn request_with<T>(
+        &mut self,
+        line: &str,
+        read: impl FnOnce(&mut Self, String) -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
+        self.sendable(line)?;
+        self.ready_for(line)?;
+        let got = self
+            .write_line(line)
+            .and_then(|()| self.read_reply())
+            .and_then(|header| read(self, header));
+        self.settled(got)
     }
 
     /// The underlying transport.
@@ -342,22 +614,36 @@ impl<S: Read + Write> RelayClient<S> {
 
     /// Send one control line and read one reply line (`OK …` or `ERR …`), returned verbatim.
     /// # Errors
-    /// I/O errors writing the request or reading the reply, or an embedded line terminator.
+    /// I/O errors writing the request or reading the reply (a reply past its wait on a
+    /// [`Self::bounded`] connection), an embedded line terminator, or a connection an earlier
+    /// reply was left unread on.
     pub fn request_line(&mut self, line: &str) -> std::io::Result<String> {
-        self.write_line(line)?;
-        self.read_reply()
+        self.request_with(line, |_, header| Ok(header))
     }
 
     /// Send one control line and read a counted reply.
     /// # Errors
-    /// I/O errors, or a count/body past the client's own reply bounds.
+    /// As [`Self::request_line`], or a count/body past the client's own reply bounds.
     pub fn request_counted(&mut self, line: &str) -> std::io::Result<(String, String)> {
-        let header = self.request_line(line)?;
-        let count = reply_count(&header)?;
-        let Some(count) = count else {
-            return Ok((header, String::new()));
-        };
-        Ok((header, self.read_body_lines(count, MAX_REPLY_BYTES)?))
+        self.request_counted_with_limit(line, MAX_REPLY_BYTES)
+    }
+
+    /// Send one control line and read a counted reply with a smaller aggregate bound.
+    /// The client's ordinary line and aggregate bounds still apply.
+    /// # Errors
+    /// As [`Self::request_counted`], or the body exceeds `max_bytes` including newlines.
+    pub fn request_counted_with_limit(
+        &mut self,
+        line: &str,
+        max_bytes: usize,
+    ) -> std::io::Result<(String, String)> {
+        self.request_with(line, |client, header| {
+            let body = match reply_count(&header)? {
+                Some(count) => client.read_body_lines(count, max_bytes.min(MAX_REPLY_BYTES))?,
+                None => String::new(),
+            };
+            Ok((header, body))
+        })
     }
 
     fn read_body_lines(&mut self, count: usize, max_bytes: usize) -> std::io::Result<String> {
@@ -384,12 +670,18 @@ impl<S: Read + Write> RelayClient<S> {
 
     /// Send one control line and read a byte-framed reply.
     /// # Errors
-    /// I/O errors, a body past the line bound, or a stream that ends inside the body.
+    /// As [`Self::request_line`], a body past the line bound, or a stream that ends inside the
+    /// body.
     pub fn request_bytes(&mut self, line: &str) -> std::io::Result<(String, Vec<u8>)> {
-        let header = self.request_line(line)?;
-        let count = reply_count(&header)?;
+        self.request_with(line, |client, header| {
+            let body = client.read_body_bytes(reply_count(&header)?)?;
+            Ok((header, body))
+        })
+    }
+
+    fn read_body_bytes(&mut self, count: Option<usize>) -> std::io::Result<Vec<u8>> {
         let Some(count) = count else {
-            return Ok((header, Vec::new()));
+            return Ok(Vec::new());
         };
         if count > MAX_LINE_BYTES {
             return Err(std::io::Error::new(
@@ -399,7 +691,7 @@ impl<S: Read + Write> RelayClient<S> {
         }
         while self.buf.len() < count {
             let mut tmp = [0u8; 8192];
-            let n = self.io.read(&mut tmp)?;
+            let n = self.read_some(&mut tmp)?;
             if n == 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
@@ -408,13 +700,12 @@ impl<S: Read + Write> RelayClient<S> {
             }
             self.buf.extend_from_slice(&tmp[..n]);
         }
-        let body: Vec<u8> = self.buf.drain(..count).collect();
-        Ok((header, body))
+        Ok(self.buf.drain(..count).collect())
     }
 
     /// Send one length-framed request.
     /// # Errors
-    /// I/O errors, and a `head` carrying a line terminator.
+    /// As [`Self::request_line`], and a `head` carrying a line terminator.
     pub fn request_frame(&mut self, head: &str, payload: &[u8]) -> std::io::Result<String> {
         // A framed request is a write (`feed-bin`, `paste-bin`): never read-only's.
         if self.reads_only {
@@ -429,14 +720,18 @@ impl<S: Read + Write> RelayClient<S> {
                 "control request must not contain an embedded line terminator",
             ));
         }
+        self.ready_for(head)?;
         let mut frame = format!("{head} {}\n", payload.len()).into_bytes();
         frame.extend_from_slice(payload);
-        self.io.write_all(&frame)?;
-        self.io.flush()?;
-        self.read_reply()
+        let got = self
+            .write_all(&frame)
+            .and_then(|()| self.flush())
+            .and_then(|()| self.read_reply());
+        self.settled(got)
     }
 
     /// Read one line a server pushed on a connection that is already parked on a stream.
+    /// Stream reads retain their transport's per-I/O timeout, outside request total budgets.
     /// # Errors
     /// I/O errors, and `UnexpectedEof` when the stream ends.
     pub fn next_pushed(&mut self) -> std::io::Result<String> {
@@ -449,8 +744,7 @@ impl RelayClient<aterm_uds::CtlStream> {
     /// # Errors
     /// I/O errors connecting to `sock_path` or writing the auth line.
     pub fn connect_local(sock_path: &str, token: &str) -> std::io::Result<Self> {
-        let stream = aterm_uds::CtlStream::connect(sock_path)?;
-        aterm_uds::keep_out_of_children(&stream)?;
+        let stream = aterm_uds::kept_out(|| aterm_uds::CtlStream::connect(sock_path))?;
         Self::authenticated(stream, token)
     }
 
@@ -468,6 +762,62 @@ impl RelayClient<aterm_uds::CtlStream> {
         client.write_line(&format!("AUTH {token}"))?;
         Ok(client)
     }
+
+    /// Bound each validated request's writes, flush, header and entire reply body by one
+    /// monotonic budget: `bound` plus its named server wait ([`named_timeout`]). Remaining
+    /// time is armed before each blocking I/O and checked again afterward. A late reply is
+    /// an error ([`unanswered`]): the socket is hung up, so a request the server has yet to act
+    /// on is its departed caller's, and every later request is refused unsent
+    /// ([`Self::reply_unread`]). A zero budget uses one millisecond.
+    /// Connection setup is separate; [`Self::next_pushed`] retains stream timeout semantics.
+    #[must_use]
+    pub fn bounded(mut self, bound: std::time::Duration) -> Self {
+        self.bound_by(bound);
+        self
+    }
+
+    /// [`Self::bounded`] from the next request on.
+    pub fn bound_by(&mut self, bound: std::time::Duration) {
+        self.bound = Some((arm_ctl, bound));
+        self.hang_up = |stream| {
+            aterm_uds::hangup::hang_up(stream);
+        };
+    }
+}
+
+/// Arm one blocking operation with the exchange's remaining time. Socket timer granularity
+/// can round it up; the monotonic clock is checked again before accepting the result.
+fn arm_ctl(stream: &aterm_uds::CtlStream, wait: std::time::Duration) -> std::io::Result<()> {
+    let wait = wait.max(std::time::Duration::from_millis(1));
+    let armed = stream
+        .set_read_timeout(Some(wait))
+        .and_then(|()| stream.set_write_timeout(Some(wait)));
+    #[cfg(target_os = "macos")]
+    {
+        accept_closed_arm(stream, armed)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        armed
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn accept_closed_arm(
+    stream: &aterm_uds::CtlStream,
+    armed: std::io::Result<()>,
+) -> std::io::Result<()> {
+    match armed {
+        // Darwin can reject timeout updates after full peer closure. That peer cannot
+        // block another operation; let actual I/O expose EOF, queued bytes or its error.
+        Err(e)
+            if matches!(e.raw_os_error(), Some(libc::EINVAL) | Some(libc::ENOTCONN))
+                && aterm_uds::hangup::peer_closed(stream) =>
+        {
+            Ok(())
+        }
+        got => got,
+    }
 }
 
 /// The help for the `aterm drive` tool.
@@ -477,7 +827,10 @@ aterm drive — the window harness's readers, run by hand.
 MENTAL MODEL
     An aterm window supervises every Claude Code, agy and Muse Code session by
     default (`status supervisor=aterm-harness@<pid>`), under `[harness]`
-    in `aterm.toml` (`aterm help harness`). `aterm drive` runs that supervisor's
+    in `aterm.toml` (`aterm help harness`). It types only into an agent the kernel
+    confirms by its running image (`status supervisor_act=on`); a program merely
+    named like one (a link, a copy, `exec -a claude`, an npm `node … cli.js`
+    install) is observed (`supervisor_act=observe`). `aterm drive` runs that supervisor's
     readers and tape tools from a terminal. Vendor `codex` reports through
     `status program_state=` and has no reader here; `codex-alab` supervises itself.
     Driving a session is `aterm ctl` (`aterm ctl help`): `aterm ctl @self spawn
@@ -663,6 +1016,246 @@ EXAMPLES
 
 #[cfg(test)]
 mod tests {
+    struct FragmentTransport {
+        base: std::time::Instant,
+        now: std::cell::Cell<std::time::Instant>,
+        timeout: std::cell::Cell<std::time::Duration>,
+        step: std::time::Duration,
+        write_step: std::time::Duration,
+        flush_step: std::time::Duration,
+        write_chunk: usize,
+        round_up: bool,
+        fragments: std::collections::VecDeque<Vec<u8>>,
+        sent: Vec<u8>,
+    }
+
+    impl FragmentTransport {
+        fn new(fragments: &[&[u8]], step: std::time::Duration) -> Self {
+            let base = std::time::Instant::now();
+            Self {
+                base,
+                now: std::cell::Cell::new(base),
+                timeout: std::cell::Cell::new(std::time::Duration::MAX),
+                step,
+                write_step: std::time::Duration::ZERO,
+                flush_step: std::time::Duration::ZERO,
+                write_chunk: usize::MAX,
+                round_up: false,
+                fragments: fragments.iter().map(|bytes| bytes.to_vec()).collect(),
+                sent: Vec::new(),
+            }
+        }
+
+        fn advance(&self, step: std::time::Duration) -> std::io::Result<()> {
+            let allowed = self.timeout.get();
+            let spent = if self.round_up {
+                step
+            } else {
+                step.min(allowed)
+            };
+            self.now.set(self.now.get().checked_add(spent).unwrap());
+            if step > allowed && !self.round_up {
+                return Err(std::io::ErrorKind::TimedOut.into());
+            }
+            Ok(())
+        }
+    }
+
+    impl std::io::Read for FragmentTransport {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.fragments.is_empty() {
+                return Ok(0);
+            }
+            self.advance(self.step)?;
+            let part = self.fragments.front_mut().unwrap();
+            let count = part.len().min(buf.len());
+            buf[..count].copy_from_slice(&part[..count]);
+            part.drain(..count);
+            if part.is_empty() {
+                self.fragments.pop_front();
+            }
+            Ok(count)
+        }
+    }
+
+    impl std::io::Write for FragmentTransport {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.advance(self.write_step)?;
+            let count = bytes.len().min(self.write_chunk);
+            self.sent.extend_from_slice(&bytes[..count]);
+            Ok(count)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.advance(self.flush_step)
+        }
+    }
+
+    fn arm_fragments(io: &FragmentTransport, wait: std::time::Duration) -> std::io::Result<()> {
+        io.timeout.set(wait);
+        Ok(())
+    }
+
+    fn fragment_clock(io: &FragmentTransport) -> std::time::Instant {
+        io.now.get()
+    }
+
+    /// The injected clock advances only when a fragment's simulated blocking read completes.
+    /// Four 3ms fragments each satisfy a 10ms per-I/O timeout, but exceed one exchange budget.
+    #[test]
+    fn a_fragmented_counted_reply_keeps_one_exchange_budget() {
+        let wait = std::time::Duration::from_millis(10);
+        let io = FragmentTransport::new(
+            &[b"OK 1\n", b"r", b"o", b"w\n"],
+            std::time::Duration::from_millis(3),
+        );
+        let mut client = RelayClient::new(io);
+        client.bound = Some((arm_fragments, wait));
+        client.clock = fragment_clock;
+        let got = client.request_counted("text");
+        let elapsed = (client.clock)(&client.io).duration_since(client.io.base);
+        assert!(
+            matches!(got.as_ref(), Err(e) if e.kind() == std::io::ErrorKind::TimedOut),
+            "reply {got:?}, controlled elapsed {elapsed:?}, exchange budget {wait:?}"
+        );
+        assert!(
+            client.request_line("status").is_err(),
+            "a partial body must poison the connection"
+        );
+        assert_eq!(client.io.sent, b"text\n");
+    }
+
+    fn bounded_fragments(
+        io: FragmentTransport,
+        wait: std::time::Duration,
+    ) -> RelayClient<FragmentTransport> {
+        let mut client = RelayClient::new(io);
+        client.bound = Some((arm_fragments, wait));
+        client.clock = fragment_clock;
+        client
+    }
+
+    #[test]
+    fn fragment_control_per_io_timeouts_accept_a_late_counted_body() {
+        let ms = std::time::Duration::from_millis;
+        let io = FragmentTransport::new(&[b"OK 1\n", b"r", b"o", b"w\n"], ms(3));
+        // Actual old behavior: the transport is armed once, with no total client budget.
+        arm_fragments(&io, ms(10)).unwrap();
+        let mut legacy = RelayClient::new(io);
+        assert_eq!(
+            legacy.request_counted("text").unwrap(),
+            ("OK 1".into(), "row\n".into())
+        );
+        assert_eq!(legacy.io.now.get().duration_since(legacy.io.base), ms(12));
+    }
+
+    #[test]
+    fn fragment_deadline_checks_late_operations_and_byte_bodies() {
+        let ms = std::time::Duration::from_millis;
+        for round_up in [false, true] {
+            let mut io = FragmentTransport::new(&[b"OK 4\n", b"a", b"b", b"cd"], ms(3));
+            io.round_up = round_up;
+            let mut client = bounded_fragments(io, ms(10));
+            assert_eq!(
+                client.request_bytes("image --bytes").unwrap_err().kind(),
+                std::io::ErrorKind::TimedOut
+            );
+            assert!(client.request_frame("feed-bin", b"later").is_err());
+            assert_eq!(client.io.sent, b"image --bytes\n");
+        }
+        let io = FragmentTransport::new(&[b"OK 2\n", b"\0", b"\xff", b"OK next\n"], ms(2));
+        let mut client = bounded_fragments(io, ms(10));
+        assert_eq!(
+            client.request_bytes("image --bytes").unwrap(),
+            ("OK 2".into(), vec![0, 255])
+        );
+        assert_eq!(client.request_line("status").unwrap(), "OK next");
+    }
+
+    #[test]
+    fn fragment_deadline_includes_partial_writes_and_flush() {
+        let ms = std::time::Duration::from_millis;
+        for frame in [false, true] {
+            let mut io = FragmentTransport::new(&[b"OK done\n"], ms(3));
+            io.write_chunk = 2;
+            io.write_step = ms(2);
+            io.flush_step = ms(2);
+            let mut client = bounded_fragments(io, ms(10));
+            let got = if frame {
+                client.request_frame("feed-bin", b"x")
+            } else {
+                client.request_line("status")
+            };
+            assert_eq!(got.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+            assert!(!client.io.sent.is_empty());
+            let sent = client.io.sent.clone();
+            assert!(client.request_line("later").is_err());
+            assert_eq!(client.io.sent, sent);
+        }
+        let mut io = FragmentTransport::new(&[b"OK done\n"], ms(3));
+        io.write_chunk = 4;
+        io.write_step = ms(1);
+        io.flush_step = ms(1);
+        let mut client = bounded_fragments(io, ms(10));
+        assert_eq!(client.request_frame("feed-bin", b"x").unwrap(), "OK done");
+        assert_eq!(client.io.sent, b"feed-bin 1\nx");
+    }
+
+    #[test]
+    fn fragment_deadlines_preserve_named_waits_and_reset_between_requests() {
+        let ms = std::time::Duration::from_millis;
+        let io = FragmentTransport::new(&[b"OK 1\n", b"r", b"o", b"w\n", b"OK next\n"], ms(3));
+        let mut client = bounded_fragments(io, ms(10));
+        assert_eq!(
+            client.request_counted("await idle timeout=10").unwrap(),
+            ("OK 1".into(), "row\n".into())
+        );
+        assert_eq!(client.io.now.get().duration_since(client.io.base), ms(12));
+        assert_eq!(client.request_line("status").unwrap(), "OK next");
+    }
+
+    #[test]
+    fn fragment_stream_reads_keep_transport_timeout_semantics() {
+        let ms = std::time::Duration::from_millis;
+        let io = FragmentTransport::new(
+            &[b"OK\n", b"stream", b" progress", b" remains", b"\n"],
+            ms(3),
+        );
+        let mut client = bounded_fragments(io, ms(10));
+        assert_eq!(client.request_line("subscribe").unwrap(), "OK");
+        assert_eq!(client.next_pushed().unwrap(), "stream progress remains");
+        assert_eq!(client.io.now.get().duration_since(client.io.base), ms(15));
+
+        let io = FragmentTransport::new(&[b"OK\n", b"stream\n"], ms(3));
+        let mut client = bounded_fragments(io, ms(10));
+        assert_eq!(client.request_line("subscribe").unwrap(), "OK");
+        client.transport().timeout.set(ms(1));
+        assert_eq!(
+            client.next_pushed().unwrap_err().kind(),
+            std::io::ErrorKind::TimedOut
+        );
+    }
+
+    #[test]
+    fn malformed_or_cut_bodies_poison_but_never_count_as_auth_close() {
+        for bytes in [
+            &b"OK 2\none\n"[..],
+            &b"OK 1\n\xff\n"[..],
+            &b"OK 99999999999999999999999999\n"[..],
+        ] {
+            let mut client = RelayClient::new(RecordingTransport::new(bytes));
+            assert!(client.request_counted("version").is_err());
+            assert!(client.reply_unread());
+            assert!(!client.closed_before_reply());
+            assert!(client.request_line("later").is_err());
+            assert_eq!(client.io.sent, b"version\n");
+        }
+        let mut client = RelayClient::new(RecordingTransport::new(b""));
+        assert_eq!(
+            client.request_line("version").unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+        assert!(client.closed_before_reply());
+    }
     use super::*;
 
     struct RecordingTransport {
@@ -699,6 +1292,266 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    /// A request whose reply was left unread leaves the connection refusing every later one,
+    /// unsent, so the late reply answers none of them; a refusal that wrote nothing leaves it
+    /// as it was.
+    #[test]
+    fn a_reply_left_unread_answers_no_later_request() {
+        let mut client = RelayClient::new(RecordingTransport::new(b"OK late\nOK next\n"));
+        client.io.error_at = Some(0);
+        assert!(!client.reply_unread());
+        let cut = client
+            .request_line("status")
+            .expect_err("the reply did not come");
+        assert!(unanswered(&cut), "{cut:?}");
+        assert!(client.reply_unread());
+        let refused = client.request_counted("who").expect_err("never sent");
+        assert_eq!(refused.kind(), std::io::ErrorKind::NotConnected);
+        assert!(
+            !unanswered(&refused),
+            "a request never sent is no unanswered one"
+        );
+        assert!(client.request_bytes("image --bytes").is_err());
+        assert!(client.request_frame("feed-bin", b"x").is_err());
+        assert_eq!(
+            client.io.sent, b"status\n",
+            "nothing after the unread reply"
+        );
+
+        let mut client = RelayClient::new(RecordingTransport::new(b"OK 2\nrow\n")).reads_only();
+        let cut = client
+            .request_counted("text")
+            .expect_err("a body cut short");
+        assert_eq!(cut.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(
+            client.request_line("status").is_err(),
+            "nothing after a cut body"
+        );
+
+        let mut client =
+            RelayClient::new(RecordingTransport::new(b"OK 1\nrow\nOK next\n")).reads_only();
+        let line = client.request_line("status\nwho").expect_err("two lines");
+        assert_eq!(line.kind(), std::io::ErrorKind::InvalidInput);
+        let send = client
+            .request_line("@s-1 send x")
+            .expect_err("a read-only send");
+        assert_eq!(send.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            client
+                .request_counted("text")
+                .expect("a refusal left it whole"),
+            ("OK 1".to_string(), "row\n".to_string())
+        );
+        assert_eq!(client.request_line("status").expect("the next"), "OK next");
+        assert!(!client.reply_unread());
+    }
+
+    #[test]
+    fn a_callers_reply_bound_counts_every_line_and_ends_an_oversize_connection() {
+        let mut fits = RelayClient::new(RecordingTransport::new(b"OK 2\nab\ncd\n"));
+        assert_eq!(
+            fits.request_counted_with_limit("text", 6).unwrap().1,
+            "ab\ncd\n"
+        );
+        let mut too_long = RelayClient::new(RecordingTransport::new(b"OK 2\nab\ncd\nOK next\n"));
+        assert_eq!(
+            too_long
+                .request_counted_with_limit("text", 5)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert!(too_long.request_line("status").is_err());
+        assert_eq!(too_long.io.sent, b"text\n");
+    }
+
+    std::thread_local! {
+        static ARMED: std::cell::RefCell<Vec<std::time::Duration>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    #[test]
+    fn unknown_closed_peer_reads_never_certify_an_empty_auth_reply() {
+        struct FailedRead(std::io::ErrorKind);
+        impl Read for FailedRead {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(self.0.into())
+            }
+        }
+        impl Write for FailedRead {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for kind in [
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::WouldBlock,
+            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::NotConnected,
+        ] {
+            let mut client = RelayClient::new(FailedRead(kind));
+            assert!(!client.closed_peer_without_reply(), "{kind:?} is not EOF");
+        }
+        for kind in [
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::ConnectionReset,
+        ] {
+            let mut client = RelayClient::new(FailedRead(kind));
+            assert!(client.closed_peer_without_reply(), "pre-reply {kind:?}");
+        }
+        let mut empty = RelayClient::new(RecordingTransport::new(b""));
+        assert!(empty.closed_peer_without_reply());
+        for bytes in [b"partial".as_slice(), b"OK\n", b"\xff"] {
+            let mut client = RelayClient::new(RecordingTransport::new(bytes));
+            assert!(
+                !client.closed_peer_without_reply(),
+                "queued bytes {bytes:?}"
+            );
+        }
+        let mut buffered = RelayClient::new(RecordingTransport::new(b""));
+        buffered.buf.push(b'x');
+        assert!(!buffered.closed_peer_without_reply());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_os_disconnect_certifies_no_reply_only_before_any_byte_was_observed() {
+        struct Disconnected;
+        impl Read for Disconnected {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from_raw_os_error(libc::ENOTCONN))
+            }
+        }
+        impl Write for Disconnected {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut client = RelayClient::new(Disconnected);
+        assert!(client.closed_peer_without_reply());
+        client.reply_started = true;
+        assert!(!client.closed_peer_without_reply());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn closed_peer_timeout_errors_preserve_the_queued_reply() {
+        for errno in [libc::EINVAL, libc::ENOTCONN] {
+            let (mut near, mut far) = aterm_uds::kept_out(aterm_uds::CtlStream::pair).unwrap();
+            near.set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
+                .unwrap();
+            assert!(
+                accept_closed_arm(&near, Err(std::io::Error::from_raw_os_error(errno))).is_err()
+            );
+            far.write_all(b"OK partial").unwrap();
+            far.shutdown(std::net::Shutdown::Both).unwrap();
+            drop(far);
+            aterm_spec::wait::until_peer_closed(&near);
+            assert!(
+                accept_closed_arm(&near, Err(std::io::Error::from_raw_os_error(libc::EPERM)))
+                    .is_err()
+            );
+            accept_closed_arm(&near, Err(std::io::Error::from_raw_os_error(errno))).unwrap();
+            let mut reply = Vec::new();
+            near.read_to_end(&mut reply).unwrap();
+            assert_eq!(
+                reply, b"OK partial",
+                "timeout handling must not discard bytes"
+            );
+        }
+    }
+
+    fn armed(_: &RecordingTransport, wait: std::time::Duration) -> std::io::Result<()> {
+        ARMED.with(|a| a.borrow_mut().push(wait));
+        Ok(())
+    }
+
+    /// A bounded connection arms each exchange with the bound and, on top, the wait the request
+    /// names: the first `timeout=` (or `timeout <ms>`) it carries, a typed text's words after it
+    /// being text.
+    #[test]
+    fn a_bounded_exchange_waits_the_bound_and_its_own_timeout() {
+        let bound = std::time::Duration::from_millis(100);
+        let mut client = RelayClient::new(RecordingTransport::new(&b"OK\n".repeat(4)));
+        client.bound = Some((armed, bound));
+        ARMED.with(|arms| arms.borrow_mut().clear());
+        let ms = std::time::Duration::from_millis;
+        for (line, wait) in [
+            ("@s-1 status", bound),
+            ("@s-1 await agent idle timeout=15000", bound + ms(15_000)),
+            (
+                "@s-1 turn yield=0.2 idle=1 timeout=10000 the timeout=1 of it",
+                bound + ms(10_000),
+            ),
+            ("await seq 4 timeout 300", bound + ms(300)),
+        ] {
+            assert_eq!(exchange_wait(line, bound), wait);
+            ARMED.with(|arms| arms.borrow_mut().clear());
+            assert_eq!(client.request_line(line).expect(line), "OK");
+            ARMED.with(|arms| {
+                let arms = arms.borrow();
+                assert_eq!(arms.first(), Some(&wait));
+                assert_eq!(arms.last(), Some(&wait));
+                assert!(arms.iter().all(|armed| !armed.is_zero() && *armed <= wait));
+            });
+        }
+        assert_eq!(
+            exchange_wait("await seq timeout=1", std::time::Duration::MAX),
+            std::time::Duration::MAX,
+            "a wait past the clock's range saturates"
+        );
+    }
+
+    /// A bounded connection whose peer never answers ends the exchange at its bound and hangs
+    /// up, the client still held, so the peer reads its caller gone; one whose peer answers
+    /// reads the answer.
+    #[cfg(unix)]
+    #[test]
+    fn a_bounded_exchange_ends_at_its_bound() {
+        use std::io::BufRead as _;
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut client = RelayClient::new(ours).bounded(std::time::Duration::from_millis(50));
+            let cut = client.request_line("status");
+            let _ = tx.send((cut.map_err(|e| unanswered(&e)), client));
+        });
+        let (cut, client) = rx
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("the exchange within the hang detector");
+        assert_eq!(cut, Err(true), "unanswered");
+        assert!(client.reply_unread());
+        theirs
+            .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
+            .expect("the peer's hang detector");
+        let mut peer = std::io::BufReader::new(&theirs);
+        let mut asked = String::new();
+        peer.read_line(&mut asked).expect("the request");
+        assert_eq!(asked, "status\n");
+        asked.clear();
+        assert_eq!(
+            peer.read_line(&mut asked).map_err(|e| e.kind()),
+            Ok(0),
+            "the caller hung up while its client lives"
+        );
+        drop(client);
+
+        let (ours, mut theirs) = std::os::unix::net::UnixStream::pair().expect("pair");
+        theirs.write_all(b"OK answered\n").expect("the answer");
+        let mut client = RelayClient::new(ours).bounded(DEFAULT_REPLY_WAIT);
+        assert_eq!(
+            client.request_line("status").expect("answered"),
+            "OK answered"
+        );
     }
 
     #[test]

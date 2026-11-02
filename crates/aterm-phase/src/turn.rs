@@ -30,6 +30,23 @@ pub fn fresh(rows: &[String]) -> bool {
     }
 }
 
+/// Returns whether `rows` show a launch's opening exchange whole: its launch card, then one user
+/// `❯` message (a `/clear` aside) with no reply drawn above it.
+#[must_use]
+pub fn opening(rows: &[String]) -> bool {
+    let Some(frame) = composer_frame(rows) else {
+        return false;
+    };
+    let banner = const { crate::anchor!("launch.banner") };
+    let Some(card) = rows[..frame.top].iter().rposition(|r| r.contains(banner)) else {
+        return false;
+    };
+    let mut said = rows[card + 1..frame.top]
+        .iter()
+        .filter(|r| r.starts_with(SAID) && crate::text::trim_end(r) != "❯ /clear");
+    said.next().is_some_and(|r| r.starts_with('❯')) && !said.any(|r| r.starts_with('❯'))
+}
+
 /// Returns whether a user `❯` message or `⏺` reply is visible on `rows`.
 #[must_use]
 pub fn message_drawn(rows: &[String]) -> bool {
@@ -478,7 +495,11 @@ pub fn continuation_suggestion(rows: &[String], cursor_col: usize) -> Option<Str
     composer_text(rows).filter(|t| !t.is_empty())
 }
 
-/// Returns whether Claude Code's `◎ /goal active` indicator is present in the live zone.
+/// Claude Code's `/goal` indicator.
+const GOAL_MARK: &str = "◎ /goal active";
+
+/// Returns whether Claude Code's `◎ /goal active` indicator is present in the live zone: against
+/// the right edge on a hint row over the composer or a footer row under it ([`goal_mark`]).
 #[must_use]
 pub fn goal_active(rows: &[String]) -> bool {
     let Some(frame) = composer_frame(rows) else {
@@ -486,12 +507,29 @@ pub fn goal_active(rows: &[String]) -> bool {
     };
     let width = crate::text::trim_end(&rows[frame.bottom]).chars().count();
     let from = status_block(rows, frame.top).from;
+    let at_edge = |r: &str| crate::text::trim_end(r).chars().count() + 3 >= width;
     rows[from..frame.top]
         .iter()
-        .chain(&rows[frame.bottom + 1..])
-        .any(|r| {
-            crate::text::trim_start(r).starts_with("◎ /goal active")
-                && is_against_right_edge(r, width)
+        .any(|r| goal_mark(r) && is_against_right_edge(r, width))
+        || rows[frame.bottom + 1..]
+            .iter()
+            .any(|r| goal_mark(r) && at_edge(r))
+}
+
+/// `row` carries the goal mark: opening it, or as its rightmost item, bare or with its age
+/// (`(1d)`), where Claude Code runs it into the row's other items (2.1.283's update hint,
+/// `✔ Update installed · Restart to update◎ /goal active (1d)`; 2.1.311's footer,
+/// `⏵⏵ auto mode on (shift+tab to cycle)` … `◎ /goal active (36s)`).
+fn goal_mark(row: &str) -> bool {
+    let t = crate::text::trim_end(row);
+    crate::text::trim_start(t).starts_with(GOAL_MARK)
+        || t.rfind(GOAL_MARK).is_some_and(|at| {
+            let rest = &t[at + GOAL_MARK.len()..];
+            rest.is_empty()
+                || rest
+                    .strip_prefix(" (")
+                    .and_then(|age| age.strip_suffix(')'))
+                    .is_some_and(|age| !age.is_empty() && !age.contains(['(', ')']))
         })
 }
 
@@ -514,17 +552,30 @@ pub fn said_whole(rows: &[String]) -> bool {
     said_message(rows).is_some_and(|(head, _)| rows[head].starts_with(['⏺', '●']))
 }
 
+/// [`said_tail`], each line Ink wrapped across rows read as one ([`crate::wrap::said_lines`]).
+#[must_use]
+pub fn said_lines(rows: &[String], apart: crate::reader::Apart) -> Option<String> {
+    said_message_rows(rows).map(|(_, said)| crate::wrap::said_lines(rows, &said, 0, apart))
+}
+
 /// Extracts earlier `⏺` messages from the same turn above [`said_tail`].
 #[must_use]
 pub fn turn_said_before(rows: &[String]) -> Option<String> {
-    let (_, said) = turn_before(rows)?;
+    let (_, said) = turn_before(rows, crate::wrap::said_rows)?;
+    (!said.is_empty()).then(|| said.join("\n\n"))
+}
+
+/// [`turn_said_before`], its lines read as [`said_lines`] reads them.
+#[must_use]
+pub fn turn_lines_before(rows: &[String], apart: crate::reader::Apart) -> Option<String> {
+    let (_, said) = turn_before(rows, |said| crate::wrap::said_lines(rows, said, 0, apart))?;
     (!said.is_empty()).then(|| said.join("\n\n"))
 }
 
 /// Returns whether the entire last turn (from the user's `❯` prompt through [`said_tail`]) fits on `rows`.
 #[must_use]
 pub fn turn_whole(rows: &[String]) -> bool {
-    turn_before(rows).is_some_and(|(opened, _)| opened)
+    turn_before(rows, crate::wrap::said_rows).is_some_and(|(opened, _)| opened)
 }
 
 /// Returns whether the last turn on `rows` ran a tool: a call's row (`⏺ Bash(…)`, [`bare_call`]), a collapsed tool group's ([`tool_group`]) or a background task's end ([`task_notice`]) under the `❯` prompt that opened it.
@@ -1270,8 +1321,11 @@ pub fn turn_history_stop(row: &str) -> bool {
     !row.is_empty() && !row.starts_with(char::is_whitespace) && !row.starts_with(['⏺', '●'])
 }
 
-fn turn_before(rows: &[String]) -> Option<(bool, Vec<String>)> {
-    let (head, _) = said_message(rows)?;
+fn turn_before(
+    rows: &[String],
+    read: impl Fn(&[(usize, &str)]) -> String,
+) -> Option<(bool, Vec<String>)> {
+    let (head, _) = said_message_rows(rows)?;
     if !rows[head].starts_with(['⏺', '●']) {
         return None;
     }
@@ -1292,8 +1346,8 @@ fn turn_before(rows: &[String]) -> Option<(bool, Vec<String>)> {
                 .rev()
                 .find(|&k| !crate::text::trim(&rows[k]).is_empty())
                 .unwrap_or(i);
-            if let Some((_, words)) = message_at(rows, last).filter(|(h, _)| *h == i) {
-                said.push(words);
+            if let Some((_, words)) = message_rows(rows, last).filter(|(h, _)| *h == i) {
+                said.push(read(&words));
             }
         }
         below = i;
@@ -1303,17 +1357,21 @@ fn turn_before(rows: &[String]) -> Option<(bool, Vec<String>)> {
 }
 
 fn said_message(rows: &[String]) -> Option<(usize, String)> {
-    let (head, said) = message_at(rows, last_said_index(rows)?)?;
-    let (head, said) = if is_idle_notice(&said) {
+    said_message_rows(rows).map(|(head, said)| (head, crate::wrap::said_rows(&said)))
+}
+
+fn said_message_rows(rows: &[String]) -> Option<(usize, Vec<(usize, &str)>)> {
+    let (head, said) = message_rows(rows, last_said_index(rows)?)?;
+    let (head, said) = if is_idle_notice(&crate::wrap::said_rows(&said)) {
         let above = before_idle_compaction(rows, head);
         let last = (0..above)
             .rev()
             .find(|&i| crate::phase::is_said(&rows[i], None))?;
-        message_at(rows, last)?
+        message_rows(rows, last)?
     } else {
         (head, said)
     };
-    (!is_hook_verdict(&said)).then_some((head, said))
+    (!is_hook_verdict(&crate::wrap::said_rows(&said))).then_some((head, said))
 }
 
 fn is_hook_verdict(said: &str) -> bool {
@@ -1360,6 +1418,11 @@ pub fn answered_prompt(rows: &[String]) -> Option<String> {
 }
 
 fn message_at(rows: &[String], last: usize) -> Option<(usize, String)> {
+    message_rows(rows, last).map(|(head, said)| (head, crate::wrap::said_rows(&said)))
+}
+
+/// The rows of the `⏺` message that row `last` ends, each with its text there.
+fn message_rows(rows: &[String], last: usize) -> Option<(usize, Vec<(usize, &str)>)> {
     let head = (0..=last).rev().find(|&i| {
         let r = &rows[i];
         !crate::text::trim(r).is_empty() && leading_spaces(r) == 0
@@ -1371,7 +1434,7 @@ fn message_at(rows: &[String], last: usize) -> Option<(usize, String)> {
     if !headless && (!rows[head].starts_with(['⏺', '●']) || is_tool_call(&rows[head])) {
         return None;
     }
-    let mut out: Vec<&str> = Vec::new();
+    let mut out: Vec<(usize, &str)> = Vec::new();
     let mut in_gutter = false;
     for (i, r) in rows.iter().enumerate().take(last + 1).skip(head) {
         let t = crate::text::trim(r);
@@ -1392,9 +1455,9 @@ fn message_at(rows: &[String], last: usize) -> Option<(usize, String)> {
         } else {
             t
         };
-        out.push(t);
+        out.push((i, t));
     }
-    (!out.is_empty()).then(|| (head, out.join("\n")))
+    (!out.is_empty()).then_some((head, out))
 }
 
 fn is_idle_notice(said: &str) -> bool {
@@ -1465,12 +1528,18 @@ pub fn interrupted(rows: &[String]) -> bool {
     {
         return true;
     }
+    rows[block..end].iter().any(|r| interrupt_notice(r))
+}
+
+/// Whether `row` is Claude Code's notice that a person stopped the turn with Esc, under the call
+/// or the reply it cut short (`⎿  Interrupted · What should Claude do instead?`, the anchor
+/// `turn.interrupted`): its question is the vendor's to the person, never the agent asking.
+#[must_use]
+pub fn interrupt_notice(row: &str) -> bool {
     let text = const { crate::anchor!("turn.interrupted") };
-    rows[block..end].iter().any(|r| {
-        crate::text::trim_start(r)
-            .strip_prefix('⎿')
-            .is_some_and(|rest| crate::text::trim_start(rest).starts_with(text))
-    })
+    crate::text::trim_start(row)
+        .strip_prefix('⎿')
+        .is_some_and(|rest| crate::text::trim_start(rest).starts_with(text))
 }
 
 #[cfg(test)]
@@ -2089,6 +2158,73 @@ mod tests {
         assert!(goal_active(&armed));
     }
 
+    /// Claude Code right-aligns its goal mark as its row's rightmost item, alone or run into the
+    /// row's other items, as measured: 2.1.283's update hint
+    /// (`✔ Update installed · Restart to update◎ /goal active (1d)`) and 2.1.311's footer
+    /// (`⏵⏵ auto mode on (shift+tab to cycle)` … `◎ /goal active (36s)`). The mark with an item to
+    /// its right, or on a row short of the right edge, is no indicator.
+    #[test]
+    fn a_goal_mark_run_into_its_rows_other_items_is_read_as_their_rightmost() {
+        use crate::prompt::fixtures::{
+            WALL_GOAL_API_UNAVAILABLE_ECONNREFUSED_2_1_311, WRAPUP_WAITING_2_1_283,
+        };
+        for text in [
+            WRAPUP_WAITING_2_1_283,
+            include_str!("fixtures/claude-2.1.283-wall-session-goal-checkin-shell-measured.txt"),
+            include_str!("fixtures/claude-2.1.283-wall-weekly-goal-paused-shell-measured.txt"),
+            WALL_GOAL_API_UNAVAILABLE_ECONNREFUSED_2_1_311,
+        ] {
+            let r = screen(text);
+            assert!(goal_active(&r), "{:?}", r.first());
+        }
+        let hint = "✔ Update installed · Restart to update";
+        let edge = |item: &str| format!("{}{item}", " ".repeat(120 - item.chars().count()));
+        let spread = |left: &str, right: &str| {
+            let gap = 120 - left.chars().count() - right.chars().count();
+            format!("{left}{}{right}", " ".repeat(gap))
+        };
+        let hinted = |row: &str| {
+            framed(
+                &["⏺ Done.", "", "✻ Worked for 3s · done 9:01 AM", row],
+                "  ? for shortcuts",
+            )
+        };
+        let footed = |row: &str| framed(&["⏺ Done.", "", "✻ Worked for 3s · done 9:01 AM"], row);
+        let run_in = edge(&format!("{hint}◎ /goal active (1d)"));
+        assert!(goal_active(&hinted(&run_in)), "run into the update hint");
+        assert!(
+            goal_active(&hinted(&edge("◎ /goal active"))),
+            "its age not drawn"
+        );
+        let mode = "  ⏵⏵ auto mode on (shift+tab to cycle)";
+        assert!(
+            goal_active(&footed(&spread(mode, "◎ /goal active (36s)"))),
+            "the footer's rightmost item"
+        );
+        // CONTROLS: the update hint alone, the mark with an item to its right, and the mark on a
+        // row short of the right edge.
+        assert!(!goal_active(&hinted(&edge(hint))), "the update hint alone");
+        let followed = edge(&format!("{hint}◎ /goal active (1d) · 2 shells"));
+        assert!(!goal_active(&hinted(&followed)), "an item to its right");
+        let short = format!("      {hint}◎ /goal active (1d)");
+        assert!(!goal_active(&hinted(&short)), "short of the right edge");
+        assert!(
+            !goal_active(&footed(&spread(
+                &format!("{mode} · ◎ /goal active (36s)"),
+                "/rc active"
+            ))),
+            "the footer's item with another to its right"
+        );
+        assert!(
+            !goal_active(&footed(&format!("{mode} · ◎ /goal active (36s)"))),
+            "the footer's item short of the right edge"
+        );
+        assert!(
+            !goal_active(&footed(&spread(mode, "◎ /goal active (36s) (2)"))),
+            "two parentheses"
+        );
+    }
+
     #[test]
     fn said_tail_is_the_last_message_without_its_gutter() {
         assert_eq!(
@@ -2540,6 +2676,45 @@ mod tests {
         let mut usage = cleared.clone();
         usage[clear] = "❯ /usage".to_string();
         assert!(!fresh(&usage), "{usage:#?}");
+    }
+
+    #[test]
+    fn the_launch_card_over_one_message_is_the_opening_exchange() {
+        let one = measured("claude-2.1.286-survey-race-0hello-measured.txt");
+        assert!(opening(&one), "{one:#?}");
+        let hi = one.iter().position(|r| r == "❯ hi").expect("the message");
+        let mut two = one.clone();
+        two.splice(
+            hi..hi,
+            ["❯ fix the parser", "", "⏺ Fixed.", ""].map(str::to_string),
+        );
+        assert!(!opening(&two), "a second message: {two:#?}");
+        let mut scrolled = one.clone();
+        scrolled.drain(..hi);
+        assert!(!opening(&scrolled), "the card scrolled off: {scrolled:#?}");
+        let compacted = measured("claude-2.1.286-compact-succeeded.txt");
+        assert!(
+            !opening(&compacted),
+            "a reply over the one message: {compacted:#?}"
+        );
+        let mut kept = compacted.clone();
+        let compact = kept
+            .iter()
+            .position(|r| r.trim_end() == "❯ /compact")
+            .expect("/compact");
+        kept.drain(compact..compact + 2);
+        assert!(!opening(&kept), "a reply and no message: {kept:#?}");
+        assert!(!opening(&measured("claude-2.1.283-launch-repl-ready.txt")));
+        let mut cleared = measured("claude-2.1.300-cleared-at-armed-limit.txt");
+        let clear = cleared
+            .iter()
+            .position(|r| r == "❯ /clear")
+            .expect("/clear");
+        cleared.splice(
+            clear + 1..clear + 1,
+            ["", "❯ fix the parser"].map(str::to_string),
+        );
+        assert!(opening(&cleared), "a /clear aside: {cleared:#?}");
     }
 
     fn measured(name: &str) -> Vec<String> {

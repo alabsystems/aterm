@@ -506,8 +506,10 @@ impl Tally {
                 .ok_or_else(|| format!("a tally line with no `{key}=` in its place: {line:?}"))
         };
         let dec = |key: &str, v: &str| -> Result<u64, String> {
-            v.parse::<u64>()
-                .map_err(|_| format!("a tally line whose `{key}` is not a number: {line:?}"))
+            (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| v.parse::<u64>().ok())
+                .flatten()
+                .ok_or_else(|| format!("a tally line whose `{key}` is not a number: {line:?}"))
         };
         let pid = u32::try_from(dec("pid", next("pid")?)?)
             .map_err(|_| format!("a tally line whose pid is not a pid: {line:?}"))?;
@@ -523,6 +525,9 @@ impl Tally {
                 return Err(format!(
                     "a tally line whose `{key}` is not {width} hex digits: {line:?}"
                 ));
+            }
+            if !v.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(format!("a tally line whose `{key}` is not hex: {line:?}"));
             }
             u64::from_str_radix(v, 16)
                 .map_err(|_| format!("a tally line whose `{key}` is not hex: {line:?}"))

@@ -1032,9 +1032,12 @@ mod unix {
             } else if name.starts_with(&legacy_prefix)
                 && name.ends_with(".log")
                 && meta.len() > 0
-                && name[legacy_prefix.len()..name.len() - 4]
-                    .parse::<u128>()
-                    .is_ok_and(|nanos| nanos <= id.nanos)
+                && {
+                    let s = &name[legacy_prefix.len()..name.len() - 4];
+                    !s.is_empty()
+                        && s.bytes().all(|b| b.is_ascii_digit())
+                        && s.parse::<u128>().is_ok_and(|nanos| nanos <= id.nanos)
+                }
             {
                 class = class.max(Some(DeathClass::Signal));
             }
@@ -1305,6 +1308,7 @@ mod unix {
                     claimer
                         .split('-')
                         .next()
+                        .filter(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
                         .and_then(|pid| pid.parse::<u32>().ok())
                         .is_some_and(|pid| !aterm_uds::process::pid_alive(pid))
                 } else if rest.ends_with(".lock.pending") {

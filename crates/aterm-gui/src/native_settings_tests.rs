@@ -4290,6 +4290,7 @@ fn every_devtools_facts() -> Vec<DevToolsFacts> {
 
 #[test]
 fn the_devtools_card_draws_what_it_measures() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     fn walk(node: &UiNode, out: &mut Vec<String>) {
         out.push(node.key.as_str().to_string());
         for child in &node.children {
@@ -4303,8 +4304,8 @@ fn the_devtools_card_draws_what_it_measures() {
         text_width: 640.0,
         line_budget: 400,
     };
-    let (mut state_whole, mut state_floor) = (0_usize, 0_usize);
-    for facts in every_devtools_facts() {
+    let (state_whole, state_floor) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    on_workers(&every_devtools_facts(), "the devtools card", |&facts| {
         let access = devtools_access(facts, SpikeEvidence::UNMEASURED);
         let copy = devtools_card_copy(&access);
         {
@@ -4382,9 +4383,9 @@ fn the_devtools_card_draws_what_it_measures() {
                 "{context}"
             );
             if state_line == copy.state {
-                state_whole += 1;
+                state_whole.fetch_add(1, Ordering::Relaxed);
             } else {
-                state_floor += 1;
+                state_floor.fetch_add(1, Ordering::Relaxed);
             }
             assert!(
                 short_keys
@@ -4478,7 +4479,8 @@ fn the_devtools_card_draws_what_it_measures() {
                 "{facts:?} lead={lead:?}"
             );
         }
-    }
+    });
+    let (state_whole, state_floor) = (state_whole.into_inner(), state_floor.into_inner());
     assert!(
         state_whole > 0 && state_floor > 0,
         "both forms drawn: {state_whole} whole, {state_floor} in the floor's words"
@@ -7752,7 +7754,7 @@ fn a_cursor_styles_check_gives_up_its_tail_where_it_costs_a_too_tall_name_a_line
     });
 }
 
-/// FONT SIZE'S STATE LINE BREAKS ALIKE FOR AUTOMATIC AND CHANGED ([`rest_breaking_alike`]): in
+/// FONT SIZE'S STATE LINE BREAKS ALIKE FOR AUTOMATIC AND CHANGED ([`resting_state_held`]): in
 /// a column narrower than "Automatic" but wide enough for "Changed" (the Linux lane's Noto Sans
 /// with 2x text in a 164pt window), the line under the name says "Default" at rest and "Changed"
 /// once a size is written, each on the one line it keeps. Before, the at-rest "Auto-" / "matic"
@@ -7773,9 +7775,8 @@ fn font_sizes_state_line_breaks_alike_for_automatic_and_changed() {
         below: Vec::new(),
         worst_below: Vec::new(),
         state_below: Some(StateBelow {
-            said: vec![said.to_string()],
+            written: (said != AUTOMATIC_WORD).then(|| vec![said.to_string()]),
             worst: vec![AUTOMATIC_WORD.to_string()],
-            rest: vec![AUTOMATIC_WORD.to_string()],
             facts: Vec::new(),
             worst_facts: Vec::new(),
         }),
@@ -8527,7 +8528,7 @@ fn a_saved_trail_alias_selects_its_row_in_the_picker() {
         .expect("listed");
     assert_eq!(
         cycle_choice(
-            trail_style_row_value(prefs::EDIT_CURSOR_TRAIL_STYLE, "nyan rainbow"),
+            choice_row_value(prefs::EDIT_CURSOR_TRAIL_STYLE, "nyan rainbow"),
             prefs::CURSOR_TRAIL_STYLES,
             true,
         )
@@ -9055,6 +9056,103 @@ fn pickers_list_the_default_once_and_name_what_they_do_not_offer() {
     assert_eq!(
         labels(&picker),
         ["Automatic (default)", "Always animate", "Reduce motion"]
+    );
+}
+
+/// A WRITTEN `none` OR `off` SHOWS AS REDUCE MOTION (composed r0's judges, D1): the engine reads
+/// `motion = "none"` and `"off"` (and `"reduce"`) as Reduced (`MotionMode::parse`), but the
+/// Motion row's domain is auto, full and reduced, so the row showed "None (current)" beside a
+/// Reduce motion it did not select and the config check raised a bad-value error. Each spelling
+/// selects the Reduce motion row, is labelled Reduce motion, adds no "(current)" row, and is no
+/// error. Negative control: an unknown spelling (`sometimes`, which the engine reads as Auto)
+/// still shows as itself, "(current)", and is still an error, so the law is the documented
+/// spellings and not every value.
+#[test]
+fn a_written_none_or_off_shows_as_reduce_motion() {
+    let labels = |picker: &ChoicePicker| {
+        picker
+            .options
+            .iter()
+            .map(|option| option.label.clone())
+            .collect::<Vec<_>>()
+    };
+    let picker = |written: &str| {
+        ChoicePicker::new(
+            prefs::EDIT_MOTION,
+            prefs::MOTION_MODES.iter().map(|mode| (*mode).to_string()),
+            written,
+            true,
+            true,
+            &effective_default_for_field(prefs::EDIT_MOTION),
+        )
+    };
+    let error = |written: &str| {
+        crate::native_config_language::analyze(&format!("motion = \"{written}\"\n")).has_errors()
+    };
+    for written in ["none", "off", "NONE", " Off ", "reduce"] {
+        let picker = picker(written);
+        assert_eq!(
+            labels(&picker),
+            ["Automatic (default)", "Always animate", "Reduce motion"],
+            "motion = {written:?} adds no row of its own"
+        );
+        assert_eq!(
+            picker.options[picker.selected].label, "Reduce motion",
+            "motion = {written:?} selects the row the engine plays"
+        );
+        assert_eq!(
+            setting_choice_label(prefs::EDIT_MOTION, written),
+            "Reduce motion",
+            "motion = {written:?}"
+        );
+        assert!(!error(written), "motion = {written:?} is no config error");
+    }
+    let unknown = picker("sometimes");
+    assert_eq!(
+        unknown.options[unknown.selected].label, "Sometimes (current)",
+        "negative control: an unknown spelling is shown as itself"
+    );
+    assert!(
+        error("sometimes"),
+        "negative control: an unknown spelling is an error"
+    );
+}
+
+/// A WRITTEN "NONE" OR "OFF" SHOWS THE SAME MOTION SEGMENTS AS "REDUCED" (composed r1's access
+/// judge; O5(c)): the engine plays all three as Reduce motion, but only "reduced" (and "reduce")
+/// matched a segment, so "none" and "off" fell back to a dropdown on the Motion row. Each written
+/// spelling now shows the Automatic / Animate / Reduce segments with Reduce selected. Negative
+/// control (the display alias left out): the written "none" as itself matches no segment.
+#[test]
+fn a_written_none_or_off_shows_the_motion_segments() {
+    let field = |seed: &str| EditField {
+        label: "Motion",
+        key: prefs::EDIT_MOTION,
+        kind: crate::prefs::edit_kind(prefs::EDIT_MOTION),
+        seed: Some(seed.to_string()),
+        placeholder: String::new(),
+    };
+    let segments = |seed: &str| {
+        let f = field(seed);
+        segmented_choices(&f, SettingsState::display_value(&f)).map(|(options, selected)| {
+            (
+                options.iter().map(|o| o.value.clone()).collect::<Vec<_>>(),
+                options[selected].value.clone(),
+            )
+        })
+    };
+    let reduced = segments("reduced").expect("fixture: \"reduced\" shows the segments");
+    assert_eq!(reduced.1, "reduced");
+    for written in ["reduce", "none", "off", "NONE", " Off "] {
+        assert_eq!(
+            segments(written).as_ref(),
+            Some(&reduced),
+            "motion = {written:?} shows the segments \"reduced\" shows"
+        );
+    }
+    assert!(
+        segmented_choices(&field("none"), "none").is_none(),
+        "negative control: \"none\" read as itself matches no segment"
     );
 }
 
@@ -20439,11 +20537,7 @@ fn a_search_takes_loose_hits_only_where_nothing_starts_a_word() {
     for key in [KEYWORD_KITTIES_KEY, prefs::EDIT_CURSOR_TRAIL_STYLE] {
         assert!(finds(key, cat), "cat finds {key}");
     }
-    for key in [
-        prefs::EDIT_ALLOW_NOTIFICATIONS,
-        prefs::EDIT_DESKTOP_ALERTS,
-        prefs::EDIT_BELL_SOUND,
-    ] {
+    for key in [prefs::EDIT_ALLOW_NOTIFICATIONS, prefs::EDIT_BELL_SOUND] {
         assert!(!finds(key, cat), "cat inside a word of {key}");
     }
     let mut scratch = String::new();
@@ -26205,7 +26299,6 @@ fn an_unknown_trail_style_leaves_the_tuning_rows_live() {
     for (key, motion) in [
         (prefs::EDIT_CURSOR_TRAIL_INTENSITY, motion),
         (prefs::EDIT_HDR_GLOW, edr),
-        (prefs::EDIT_CURSOR_TRAIL_MS, motion),
     ] {
         let effect = projected_effect(
             &format!("cursor_trail = true\ncursor_trail_style = \"{typo}\"\n"),
@@ -26216,6 +26309,29 @@ fn an_unknown_trail_style_leaves_the_tuning_rows_live() {
         );
         assert!(effect.has_live_effect, "{key}: {effect:?}");
     }
+    // Trail duration (access r3, composed O12(a)): the fallback's ribbon follows the typing,
+    // and its row says so rather than offering a knob that changes nothing it can see; a style
+    // whose lights read the duration keeps the row live.
+    let duration = |style: &str| {
+        let key = prefs::EDIT_CURSOR_TRAIL_MS;
+        projected_effect(
+            &format!("cursor_trail = true\ncursor_trail_style = \"{style}\"\n"),
+            &[(key, sample(prefs::edit_kind(key)))],
+            key,
+            availability,
+            motion,
+        )
+    };
+    let ribbon = duration(typo);
+    assert!(
+        !ribbon.has_live_effect && effect_note_contains(&ribbon, "follows your typing speed"),
+        "{ribbon:?}"
+    );
+    let comet = duration("comet");
+    assert!(
+        comet.has_live_effect,
+        "control: Comet reads Trail duration: {comet:?}"
+    );
 
     let key = prefs::EDIT_TRAIL_SOUNDS;
     let project = |style: &str| {
@@ -27899,53 +28015,6 @@ fn a_security_permissions_sequence_name_still_finds_its_row() {
 }
 
 #[test]
-fn the_security_page_carries_the_desktop_alerts_switch() {
-    let key = prefs::EDIT_DESKTOP_ALERTS;
-    let on: Config = aterm_toml::from_str("desktop_alerts = true").unwrap();
-    let seed = |cfg: &Config| {
-        prefs::editable_fields(cfg)
-            .into_iter()
-            .find(|field| field.key == key)
-            .and_then(|field| field.seed)
-    };
-    assert_eq!(seed(&Config::default()).as_deref(), Some("false"));
-    assert_eq!(seed(&on).as_deref(), Some("true"), "an ON config seeds ON");
-    if !crate::notify::delivery_available() {
-        assert!(native_advanced_effect(key).is_none());
-        return;
-    }
-    assert!(matches!(
-        native_advanced_effect(key),
-        Some(AdvancedEffectPath::DesktopNotifier)
-    ));
-    let (mut runtime, instance, view) = setup();
-    go_to_route(&mut runtime, instance, view, SettingsRoute::Security);
-    let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(1_200.0, 900.0));
-    let control = compiled
-        .semantic(&UiKey::new(format!("settings/control/{key}")))
-        .expect("the Security page draws the desktop-alerts switch");
-    assert_eq!(control.value, SemanticValue::Bool(false), "default OFF");
-    let (mut runtime, instance, view) = setup();
-    runtime
-        .dispatch(
-            instance,
-            view,
-            AppEvent::Action(ActionInvocation {
-                id: ActionId::new("settings/search"),
-                value: Some(SemanticInput::Text("alerts".to_string())),
-            }),
-        )
-        .unwrap();
-    let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(1_200.0, 900.0));
-    assert!(
-        compiled
-            .semantic(&UiKey::new(format!("settings/control/{key}")))
-            .is_some(),
-        "a search for \"alerts\" draws it"
-    );
-}
-
-#[test]
 fn row_notes_are_native_semantic_and_fit_responsive_layouts() {
     at_each_text_scale(
         &[1.0, 2.0],
@@ -28480,15 +28549,20 @@ fn about_byline_sweep(scale: f32, coarse: f32, resolution: f32) {
             let _ = std::io::stderr().write_all(line.as_bytes());
         }
 
+        // Which rung a 150pt host's 90pt column fits is the UI face's: none in Helvetica Neue,
+        // the author's short form in Segoe UI. It paints the longest that fits, or no byline at
+        // all (the sweep's omissions hold that arm on every face).
         let hero = byline_at(150.0, 558.0).expect("a 150pt host still paints the About hero");
-        assert!(
-            width_of(author_short) > hero.column,
-            "no rung fits the 150pt host's {}pt column",
-            hero.column
-        );
-        assert!(
-            hero.painted.is_none(),
-            "a column no rung fits paints no byline at all"
+        let want = [author, author_short]
+            .into_iter()
+            .find(|rung| width_of(rung) <= hero.column);
+        assert_eq!(
+            hero.painted.as_ref().map(|(text, ..)| text.as_str()),
+            want,
+            "a 150pt host's {}pt column paints the longest rung it fits ({author_short:?} needs \
+             {}pt), and no byline where none fits",
+            hero.column,
+            width_of(author_short)
         );
         let provenance = crate::about::provenance_text();
         for fact in [
@@ -28830,6 +28904,7 @@ fn sample_messages() -> MessagesState {
         log_folder: Some("/Users//w/Library/Logs/aterm".to_string()),
         saved: true,
         utc_offset_s: 0,
+        entry_offsets: Vec::new(),
     }
 }
 
@@ -29151,6 +29226,70 @@ fn the_log_is_sectioned_by_the_readers_local_day() {
     let compiled = compile_settings_view(&runtime, instance, view, &cx);
     assert!(message_days(&compiled).is_empty());
     assert_eq!(when(&compiled, 40).as_deref(), Some("1 min ago"));
+
+    // End-to-end across 2026-11-01 fall-back (PDT UTC-7 -> PST UTC-8 at 09:00Z):
+    // 2026-10-31 23:30 PDT (1_793_514_600_000) renders as Yesterday 11:30 PM, while
+    // 2026-11-01 00:30 PDT (1_793_518_200_000) renders under Today ("12 h ago" at 12:00 PST).
+    fn la_at(unix: i64) -> Option<i64> {
+        Some(if unix < 1_793_523_600 {
+            -7 * 3_600
+        } else {
+            -8 * 3_600
+        })
+    }
+    let mut app = crate::App::headless_for_test();
+    app.messages_wall = crate::messages_host::WallClock::Zone {
+        unix_ms: 1_793_563_200_000,
+        offset_at: la_at,
+    };
+    let oct_id = app
+        .post_message_at(
+            aterm_messages::Message::new(
+                aterm_messages::tags::CONFIG,
+                aterm_messages::Severity::Warn,
+                "late october",
+            )
+            .line("pdt row")
+            .hold(aterm_messages::Hold::LogOnly),
+            aterm_messages::WallStamp {
+                unix_ms: 1_793_514_600_000,
+            },
+        )
+        .raw();
+    let nov_id = app
+        .post_message_at(
+            aterm_messages::Message::new(
+                aterm_messages::tags::CONFIG,
+                aterm_messages::Severity::Info,
+                "early november",
+            )
+            .line("after midnight pdt")
+            .hold(aterm_messages::Hold::LogOnly),
+            aterm_messages::WallStamp {
+                unix_ms: 1_793_518_200_000,
+            },
+        )
+        .raw();
+    let (mut runtime, instance, view) = setup_with_messages();
+    assert!(runtime.replace_settings_messages(app.messages_state(), 9));
+    let compiled = compile_settings_view(&runtime, instance, view, &cx);
+    assert_eq!(message_days(&compiled), ["Today", "Yesterday"]);
+    assert_eq!(when(&compiled, nov_id).as_deref(), Some("12 h ago"));
+    assert_eq!(when(&compiled, oct_id).as_deref(), Some("11:30 PM"));
+
+    app.messages_wall = crate::messages_host::WallClock::Pinned {
+        unix_ms: 1_793_563_200_000,
+        offset_s: -8 * 3_600,
+    };
+    assert!(runtime.replace_settings_messages(app.messages_state(), 10));
+    let flat = compile_settings_view(&runtime, instance, view, &cx);
+    assert_eq!(
+        message_days(&flat),
+        ["Yesterday"],
+        "CONTROL: flat PST drops Today and groups 00:30 PDT under Yesterday"
+    );
+    assert_eq!(when(&flat, nov_id).as_deref(), Some("11:30 PM"));
+    assert_eq!(when(&flat, oct_id).as_deref(), Some("10:30 PM"));
 }
 
 #[test]
@@ -31480,11 +31619,12 @@ fn a_count_lines_note_never_moves_its_buttons() {
     let mut placements = std::collections::BTreeSet::new();
     for w in (120..=900).step_by(10) {
         let w = w as f32;
-        let (bare, bare_h) = messages_count_line(Some("1,234 of 5,678".into()), None, w, true);
+        let (bare, bare_h) =
+            messages_count_line(Some("1,234 of 5,678".into()), None, w, true, None);
         placements.insert(shape(&bare).len());
         for note in notes {
             let (with, with_h) =
-                messages_count_line(Some("1,234 of 5,678".into()), Some(note), w, true);
+                messages_count_line(Some("1,234 of 5,678".into()), Some(note), w, true, None);
             assert_eq!(with_h, bare_h, "{w} pt, {note:?}: the height moved");
             assert_eq!(
                 shape(&with),
@@ -33108,8 +33248,8 @@ fn a_short_host_scrolls_the_preview_never_drops_it() {
         (SettingsRoute::Appearance, 584.0, 230.0, false),
         (SettingsRoute::Appearance, 664.0, 230.0, false),
         (SettingsRoute::Appearance, 584.0, 270.0, true),
-        (SettingsRoute::TextFonts, 584.0, 260.0, false),
-        (SettingsRoute::TextFonts, 664.0, 260.0, false),
+        (SettingsRoute::TextFonts, 584.0, 240.0, false),
+        (SettingsRoute::TextFonts, 664.0, 240.0, false),
         (SettingsRoute::CursorMotion, 584.0, 220.0, false),
         (SettingsRoute::Appearance, 584.0, 292.0, true),
         (SettingsRoute::TextFonts, 664.0, 298.0, true),
@@ -34639,7 +34779,7 @@ fn the_about_hero_names_its_author_and_the_card_lists_what_it_cannot() {
     for (width, height, short) in [
         (738.0, 420.0, false),
         (584.0, 350.0, false),
-        (584.0, 260.0, true),
+        (584.0, 240.0, true),
     ] {
         let at = format!("{width}x{height}");
         top_of_page(&mut runtime, view);
@@ -40398,6 +40538,7 @@ fn session_controls_save_reset_and_disclose_observed_runtime() {
             journal: Status {
                 phase: Some(phase),
                 attention,
+                off: None,
             },
             keeper: crate::keeper_link::Status {
                 phase: crate::keeper_link::RegistrationPhase::Live,
@@ -40884,10 +41025,10 @@ fn the_system_pages_measure_against_the_layout() {
         "584x292: the full hero, its buttons in it, whole in the list: {hero:?} {copy:?} {list:?}"
     );
     assert!(
-        hero_at(584.0, 260.0)
+        hero_at(584.0, 240.0)
             .semantic(&UiKey::new("about/compact-identity"))
             .is_some(),
-        "584x260: the short hero where the full one does not fit"
+        "584x240: the short hero where the full one does not fit"
     );
     at_each_text_scale(&[1.0, 1.5, 2.0], "About hero words", |scale| {
         for (width, height) in [

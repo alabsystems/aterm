@@ -1330,10 +1330,12 @@ pub fn boot_run(
 ) -> atpkg::admit_disk::Run {
     atpkg::admit_disk::Run {
         what: format!("lab {lane} boot"),
+        scope: String::new(),
         dirs: vec![dir],
         record,
         cold,
         on: base.to_path_buf(),
+        stuck_ends: None,
     }
 }
 

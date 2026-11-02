@@ -286,14 +286,15 @@ impl Light {
         self.0 & (Self::ON | arm) == Self::ON | arm
     }
 
-    /// This light on its page (§15.2 1.7, `host::PageFacts`): a latched light over a page that is
-    /// not `clear` (a translucent window, or a wallpaper or an image under the text) is sheer, and
-    /// a sheer light draws no glass, so the frame draws main's paper arm there. [`Self::OFF`]
-    /// stays [`Self::OFF`] on every page.
+    /// This light on its page (§15.2 1.7, `host::PageFacts`): a latched light over a page the
+    /// glass does not draw on (`PageFacts::glass` false: a translucent window, a wallpaper or an
+    /// image under the text, or a face whose thinnest glyph lays no pixel near the full ink,
+    /// §15.8 amendment 53) is sheer, and a sheer light draws no glass, so the frame draws main's
+    /// paper arm there. [`Self::OFF`] stays [`Self::OFF`] on every page.
     #[inline]
     #[must_use]
-    pub const fn on_page(self, clear: bool) -> Self {
-        if self.on() && !clear {
+    pub const fn on_page(self, glass: bool) -> Self {
+        if self.on() && !glass {
             Self(self.0 | Self::SHEER)
         } else {
             self
@@ -307,7 +308,8 @@ impl Light {
         self.0 & Self::SHEER != 0
     }
 
-    /// The glass body draws (Phase 1): its level is live and the page is clear ([`Self::sheer`]).
+    /// The glass body draws (Phase 1): its level is live and the page takes glass
+    /// ([`Self::sheer`]).
     #[inline]
     #[must_use]
     pub const fn glass(self) -> bool {
@@ -337,6 +339,19 @@ impl Light {
 }
 
 impl GlowConfig {
+    /// Where a light the caret seats sits in `(row, col)`: [`Self::head_dx`] of the cell across
+    /// (a bar's insertion point, a block's centre) at the cell's middle height. Every light laid
+    /// on the caret, or on the path it took (the comet's samples, the landing ring, the bolt's
+    /// ends, a particle's birth), reads it, as Classic's streak and the comet's caret bridge
+    /// always did; a light laid on a letter keeps the letter's cell centre. On a block it is
+    /// [`Geom::cell_center`] exactly.
+    #[inline]
+    #[must_use]
+    pub(crate) fn caret_center(&self, geom: &Geom, row: u16, col: u16) -> (f32, f32) {
+        let (x, y) = geom.cell_center(row, col);
+        (x + (self.head_dx - 0.5) * geom.cw as f32, y)
+    }
+
     /// A config with every field set, for a test that needs one whole: it changes the fields it
     /// is about by struct update, so a field a later phase adds gets its value here and no test
     /// literal has to name every field (the trail-diff closure's tests among them, §15.0.6).
@@ -420,6 +435,10 @@ pub enum TrailKnob {
     Accent,
     /// `cursor_fire_shimmer`: the GPU heat shimmer, which distorts the fire field only Fire emits.
     FireShimmer,
+    /// `cursor_trail_ms` (Trail duration): how long a typed light lives
+    /// ([`super::typed_life_scale`]). The Rainbow Kitty's ribbon follows the typing instead: it
+    /// stays while the phrase is typed and swooshes away once it rests, whatever the duration.
+    Duration,
 }
 
 /// Context flags that determine whether a [`TrailKnob`] affects a frame.
@@ -493,6 +512,7 @@ impl GlowStyle {
                 RainbowKitty | Fire | Laser | Beam | Water => false,
             },
             TrailKnob::FireShimmer => matches!(self, Fire),
+            TrailKnob::Duration => !matches!(self, RainbowKitty),
         }
     }
 

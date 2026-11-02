@@ -8,6 +8,41 @@ use std::path::{Path, PathBuf};
 
 use super::*;
 
+#[test]
+fn occupied_legacy_temps_never_prevent_generated_file_updates_or_touch_their_targets() {
+    let ordinary = crate::testdir::dir("selfsetup-temp-positive-");
+    let name = std::ffi::OsStr::new("page.1");
+    write_644(&ordinary, name, b"first").unwrap();
+    write_644(&ordinary, name, b"second").unwrap();
+    assert_eq!(std::fs::read(ordinary.join(name)).unwrap(), b"second");
+    let mut outcomes = Vec::new();
+    for alias in [false, true] {
+        let dir = crate::testdir::dir("selfsetup-occupied-temp-");
+        let target = dir.join("unrelated");
+        std::fs::write(&target, b"do not touch").unwrap();
+        std::fs::write(dir.join(name), b"previous generated file").unwrap();
+        let tmp = dir.join(format!(".page.1.tmp.{}", std::process::id()));
+        if alias {
+            symlink(&target, &tmp).unwrap();
+        } else {
+            std::fs::write(&tmp, b"previous writer's temporary").unwrap();
+        }
+        let updated = write_644(&dir, name, b"current generated file").is_ok();
+        let fresh = std::fs::read(dir.join(name)).unwrap() == b"current generated file";
+        outcomes.push((alias, updated && fresh));
+        assert_eq!(std::fs::read(&target).unwrap(), b"do not touch");
+        if alias {
+            assert_eq!(std::fs::read_link(&tmp).unwrap(), target);
+        } else {
+            assert_eq!(std::fs::read(&tmp).unwrap(), b"previous writer's temporary");
+        }
+    }
+    assert!(
+        outcomes.iter().all(|(_, fresh)| *fresh),
+        "regular and alias cases both attempted: {outcomes:?}"
+    );
+}
+
 struct Account {
     dir: crate::testdir::Dir,
     places: Places,
@@ -545,7 +580,7 @@ fn a_zdotdir_zshrc_takes_the_path_block_and_the_sweep_finds_it() {
     assert!(a.sweep(None, false).0);
     std::fs::remove_file(a.home().join(".zshrc")).expect("rm ~/.zshrc");
 
-    a.places = places_from(a.home(), |name| {
+    a.places = places_from(a.home(), None, |name| {
         (name == "ZDOTDIR").then(|| zdot.clone().into_os_string())
     });
     a.places.install_dir = Some(a.home().join("Applications"));
@@ -572,6 +607,50 @@ fn a_zdotdir_zshrc_takes_the_path_block_and_the_sweep_finds_it() {
     );
 }
 
+/// While zsh's folder is unknown (round 13: a zshenv that could not be run), shell-setup edits
+/// no `.zshrc`, its plan and its run say why, and the sweep still finds a block a pass left in
+/// `~/.zshrc`. The control is the same account with zsh's folder known (`$HOME`).
+#[test]
+fn an_unknown_zsh_folder_gets_no_path_block_and_says_why() {
+    let mut a = Account::new("zunknown");
+    let env = zsh("/usr/bin:/bin");
+    let exe = Path::new("/nonexistent/aterm");
+    let coming = Setup {
+        path: true,
+        toolset_coming: true,
+        ..Setup::default()
+    };
+    a.places.zdotdir = crate::zdotdir::ZshDir::Unknown("zsh hung".to_owned());
+    let why = "PATH: no edit — which folder zsh reads .zshrc from is unknown (zsh hung)";
+    let (ok, out, err) = a.setup(&env, exe, &coming);
+    assert!(!ok, "{out}{err}");
+    assert!(err.contains(why), "{err}");
+    assert!(!a.home().join(".zshrc").exists());
+    let (_, plan, _) = a.setup(
+        &env,
+        exe,
+        &Setup {
+            dry_run: true,
+            ..coming.clone()
+        },
+    );
+    assert!(plan.contains(why), "{plan}");
+
+    a.places.zdotdir = crate::zdotdir::ZshDir::Home;
+    let (ok, out, err) = a.setup(&env, exe, &coming);
+    assert!(ok, "{out}{err}");
+    a.places.zdotdir = crate::zdotdir::ZshDir::Unknown("zsh hung".to_owned());
+    let (ok, out, err) = a.sweep(None, false);
+    assert!(ok, "{out}{err}");
+    assert!(
+        out.contains(&format!(
+            "removed PATH block: {}",
+            a.home().join(".zshrc").display()
+        )),
+        "{out}"
+    );
+}
+
 /// `ZDOTDIR` names zsh's folder only as an absolute path; empty or relative, `~` is it.
 #[test]
 fn only_an_absolute_zdotdir_moves_the_zshrc() {
@@ -582,13 +661,17 @@ fn only_an_absolute_zdotdir_moves_the_zshrc() {
         (Some("dots"), "/h"),
         (Some("/h/.config/zsh"), "/h/.config/zsh"),
     ] {
-        let places = places_from(home, |name| {
+        let places = places_from(home, None, |name| {
             (name == "ZDOTDIR")
                 .then_some(value)
                 .flatten()
                 .map(OsString::from)
         });
-        assert_eq!(places.zdotdir, Path::new(want), "{value:?}");
+        assert_eq!(
+            places.zdotdir.dir(home).as_deref(),
+            Some(Path::new(want)),
+            "{value:?}"
+        );
     }
 }
 
@@ -721,7 +804,7 @@ fn the_completions_note_reads_the_zshrc_zsh_reads() {
     write(&home_rc, &loader);
     assert_eq!(note(&a), None, "no ZDOTDIR: ~/.zshrc's loader counts");
 
-    a.places = places_from(a.home(), |name| {
+    a.places = places_from(a.home(), None, |name| {
         (name == "ZDOTDIR").then(|| zdot.clone().into_os_string())
     });
     a.places.install_dir = Some(a.home().join("Applications"));
@@ -1182,6 +1265,10 @@ fn an_uninstall_quits_the_acaffiene_mug_and_removes_its_files() {
     write(&support.join("acaffiene.state"), "mode=off\n");
     write(&support.join("acaffiene.lock"), "");
     write(&support.join("acaffiene.bridge"), "4242\n");
+    write(
+        &support.join("acaffiene.trouble"),
+        "since=1\nwhy=a full disk\n",
+    );
     write(&support.join("acaffiene/l.plist"), "<plist/>");
     write(
         &support.join("acaffiene-code.noindex/l/1-2/aterm.app/Contents/Info.plist"),
@@ -1231,6 +1318,7 @@ fn an_uninstall_quits_the_acaffiene_mug_and_removes_its_files() {
         "acaffiene",
         "acaffiene.state",
         "acaffiene.bridge",
+        "acaffiene.trouble",
     ] {
         assert!(!present(&support.join(name)), "{name}: {out}");
     }
@@ -1416,6 +1504,7 @@ fn an_uninstall_removes_saves_cut_short_and_nothing_a_writer_may_rename() {
     write(&saving, "");
     date(&saving);
     let bridged = support.join(".acaffiene.bridge.tmp.4294967295.0123abcd");
+    let troubled = support.join(".acaffiene.trouble.tmp.4294967295.0123abcd");
     let old = [
         support.join(".caffeine.state.tmp.4294967295.0123abcd"),
         support.join(".caffeine.bridge.tmp.4294967295.0123abcd"),
@@ -1435,7 +1524,12 @@ fn an_uninstall_removes_saves_cut_short_and_nothing_a_writer_may_rename() {
             std::process::id()
         )),
     ];
-    for temp in old.iter().chain([&bridged]).chain(&items).chain(&others) {
+    for temp in old
+        .iter()
+        .chain([&bridged, &troubled])
+        .chain(&items)
+        .chain(&others)
+    {
         write(temp, "");
         date(temp);
     }
@@ -1446,6 +1540,7 @@ fn an_uninstall_removes_saves_cut_short_and_nothing_a_writer_may_rename() {
     for (temp, what) in [
         (&cut_short, "aCaffiene save"),
         (&bridged, "aCaffiene save"),
+        (&troubled, "aCaffiene save"),
         (&old[0], "old Caffeine save"),
         (&old[1], "old Caffeine save"),
         (&items[0], "aCaffiene login item"),
@@ -1459,7 +1554,7 @@ fn an_uninstall_removes_saves_cut_short_and_nothing_a_writer_may_rename() {
     }
     let (ok, out, err) = a.sweep(None, false);
     assert!(ok, "{out}{err}");
-    for temp in [&cut_short, &bridged, &old[0], &old[1]]
+    for temp in [&cut_short, &bridged, &troubled, &old[0], &old[1]]
         .into_iter()
         .chain(&items)
     {

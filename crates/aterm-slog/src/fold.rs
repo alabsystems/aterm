@@ -515,7 +515,7 @@ pub enum ClauseRow {
     Step,
     /// The open turn.
     Turn,
-    /// The open command, or the agent at rest.
+    /// The open command or the program it runs, or the agent at rest.
     Run,
 }
 
@@ -1583,7 +1583,7 @@ pub fn clause_of_proven(st: &SessionState, now_wall: u64) -> Option<Clause> {
 pub fn need_words(word: &str, detail: Option<&str>) -> Option<(Words, Tone)> {
     match word {
         w if w.starts_with("approval:") => Some((
-            Words::fit("approval", w.trim_start_matches("approval:")),
+            Words::fit("approval", w.strip_prefix("approval:").unwrap_or(w)),
             Tone::Attention,
         )),
         "question" => Some((Words::fit("question", ""), Tone::Attention)),
@@ -1594,7 +1594,7 @@ pub fn need_words(word: &str, detail: Option<&str>) -> Option<(Words, Tone)> {
                 Some((Words::fit("limit", detail.unwrap_or("")), Tone::Attention))
             } else {
                 Some((
-                    Words::fit("wall", w.trim_start_matches("wall:")),
+                    Words::fit("wall", w.strip_prefix("wall:").unwrap_or(w)),
                     Tone::Attention,
                 ))
             }
@@ -1685,7 +1685,9 @@ fn clause_with(
         ));
     }
     if let Some(run) = st.run() {
-        if run.kind == Kind::Cmd {
+        // The run slot is the DEEPEST open run, so while a command's program runs it is the
+        // `prog` run the status sweep opened beneath the `cmd` (fix J1-2): both name what runs.
+        if matches!(run.kind, Kind::Cmd | Kind::Prog) {
             let detail = run
                 .f
                 .str(Key::Detail)

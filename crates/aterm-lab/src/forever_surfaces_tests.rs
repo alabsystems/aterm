@@ -345,6 +345,34 @@ window id=1 focused=true tabs=2 active=3
     assert_eq!(window_of(ls, "s-b"), None);
 }
 
+/// The person's press finds its session's local id on its `ls` line and a Settings view in the
+/// tabs; another sid's line, or a tab of no Settings, gives none.
+#[test]
+fn the_persons_press_reads_the_local_id_and_a_settings_view() {
+    // The client's `ls`, its instance column first; s-bb's child names it as its parent.
+    let ls = "0 3 s-aa - alive alpha meta=1 window=0 active=1\n0 7 s-bb s-aa alive %2Fp meta=0 \
+              window=2\n0 9 s-cc s-bb alive child meta=1 window=2";
+    assert_eq!(local_of(ls, "s-bb").as_deref(), Some("7"));
+    assert_eq!(local_of(ls, "s-aa").as_deref(), Some("3"));
+    assert_eq!(local_of(ls, "s-b"), None);
+    assert_eq!(local_of("OK 2", "s-aa"), None);
+    // The session table's own line, with no instance column.
+    assert_eq!(
+        local_of("4 s-dd - alive x meta=0", "s-dd").as_deref(),
+        Some("4")
+    );
+    let tabs = "window id=1 focused=true tabs=2 active=3
+  tab id=2 index=0 kind=terminal title=\"/p\" state=clean active=false
+    leaf path=/ view=2 rect_px=0.0,0.0,1008.0,700.0 focused=true kind=terminal session=1
+  tab id=3 index=1 kind=app title=\"Settings\" state=clean active=true
+    leaf path=/ view=5 rect_px=0.0,0.0,1008.0,700.0 focused=true kind=app app=settings title=\"Settings\"";
+    assert_eq!(settings_view(tabs).as_deref(), Some("5"));
+    assert_eq!(
+        settings_view(&tabs.replace("app=settings", "app=about")),
+        None
+    );
+}
+
 /// `invoke NewWindow` answers before its window is made (the window's first
 /// shell spawns off the event loop): the window is waited for, read after
 /// read, and the one `before` lacks is named.
@@ -424,6 +452,7 @@ fn tab_with(journal: &[(i64, &str)]) -> Tab {
         t0: 0,
         ask_tried: false,
         over: false,
+        gate_opened: false,
     }
 }
 
@@ -715,7 +744,7 @@ fn every_chip_title_says_its_modes_sentence_from_mode_words() {
     let stopped = |mode: &str, arm: HeldBy| {
         format!(
             "autopilot: {mode} \u{2014} {} \u{b7} not landed yet: 1 untracked file \u{b7} click: x",
-            stop_words(arm, StopForm::Title)
+            stop_words(arm, StopForm::Title, mode == "cruise")
         )
     };
     for arm in HeldBy::ALL {
@@ -739,19 +768,38 @@ fn every_chip_title_says_its_modes_sentence_from_mode_words() {
         mode_words(Autopilot::Land).chip
     );
     assert_eq!(title_says(&unread, "land"), TitleSays::Sentence);
-    let landed = format!(
-        "autopilot: land, landed 14:05 \u{2014} {} \u{b7} click: off",
-        aterm_agent::supervise::mode_words::LANDED_WORDS
-    );
+    let receipt = aterm_agent::harness::acts::LandReceipt {
+        head: "3f9a1c2e4b7d".into(),
+        main_ref: "origin/main".into(),
+        repo: "/w/proj".into(),
+        branch: "main".into(),
+        leg: aterm_agent::harness::acts::ReceiptLeg::OnMain,
+        check: false,
+        said: "Nothing left: pushed.".into(),
+        at_ms: 0,
+    };
+    let landed_title =
+        |words: String| format!("autopilot: land, landed 14:05 \u{2014} {words} \u{b7} click: off");
+    let landed = landed_title(aterm_agent::supervise::mode_words::landed_brief(Some(
+        &receipt,
+    )));
     assert_eq!(title_says(&landed, "land"), TitleSays::Past("landed"));
+    let whole = landed_title(aterm_agent::supervise::mode_words::landed_words(Some(
+        &receipt,
+    )));
+    assert_eq!(title_says(&whole, "land"), TitleSays::Past("landed"));
+    let unchecked = landed_title(aterm_agent::supervise::mode_words::landed_brief(None));
+    assert_eq!(title_says(&unchecked, "land"), TitleSays::Past("landed"));
     for wrong in [
         "autopilot: land, landed 14:05 \u{2014} all of the work is on the remote main branch",
         "autopilot: land, landed 14:05",
-        &landed[..landed.len() - 20],
+        "autopilot: land, landed 14:05 \u{2014} it said nothing is left, and no repository check \
+         found work left to land; the harness types nothing more until someone else's turn",
+        &landed[..landed.len() - 30],
     ] {
         assert!(
             matches!(title_says(wrong, "land"), TitleSays::Wrong(_)),
-            "a landed title that does not say LANDED_WORDS whole: {wrong}"
+            "a landed title that does not say what aterm checked: {wrong}"
         );
     }
 
@@ -999,6 +1047,123 @@ fn the_landed_row_counts_every_landing() {
         Some("Landed: 5 today · 5 in 7 days"),
         "the Landed row first"
     );
+}
+
+/// L7's Forced continues row (6c, WHAT THE HARNESS DID): found by its name from the one source,
+/// today the run's done checks (no fewer and no more), the week at least that, and its line right
+/// under it word for word; a run with no done check today passes on an earlier day's row, and with
+/// no row read is UNOBSERVED, never a PASS on `-` (§14.0 limit 7). CONTROL: main's page at
+/// `71db001398`, whose row is `past “done”` with no line under it, fails where the run typed one.
+#[test]
+fn the_forced_continues_row_counts_every_done_check() {
+    use aterm_agent::harness::stats::{FORCED_CONTINUES, FORCED_CONTINUES_LINE};
+    let rest = |forced: usize, row: &str, line: &str| {
+        format!(
+            "here=\"x\" landed_tabs=1 landing_tabs=1 landings=1 today=\"x\" every=\"x\" did=\"Landed: 1 today \u{b7} 1 in 7 days\" forced={forced} forced_row=\"{row}\" forced_line=\"{line}\""
+        )
+    };
+    let judge = |r: Option<String>| {
+        let s = Seen {
+            window: Window {
+                read: true,
+                rest: r,
+                ..Window::default()
+            },
+            ..Seen::default()
+        };
+        l7_forced(&s, &title_cx(Chain::LandE, "claude"))
+    };
+    let row = |t: usize, w: usize| format!("{FORCED_CONTINUES}: {t} today \u{b7} {w} in 7 days");
+    for (forced, r, line) in [
+        (2, row(2, 2), FORCED_CONTINUES_LINE),
+        (2, row(2, 5), FORCED_CONTINUES_LINE),
+        (0, row(0, 3), FORCED_CONTINUES_LINE),
+    ] {
+        assert!(
+            matches!(judge(Some(rest(forced, &r, line))), Verdict::Pass(_)),
+            "{forced} {r} {line}"
+        );
+    }
+    let main = "past \u{201c}done\u{201d}: 2 today \u{b7} 2 in 7 days";
+    for (forced, r, line) in [
+        (2, "-".to_string(), "-"),
+        (2, row(1, 2), FORCED_CONTINUES_LINE),
+        (2, row(3, 3), FORCED_CONTINUES_LINE),
+        (2, row(2, 1), FORCED_CONTINUES_LINE),
+        (2, row(2, 2), "-"),
+        (2, row(2, 2), "Landed: 1 today \u{b7} 1 in 7 days"),
+        (
+            2,
+            format!("{FORCED_CONTINUES}: two today"),
+            FORCED_CONTINUES_LINE,
+        ),
+    ] {
+        assert!(
+            matches!(judge(Some(rest(forced, &r, line))), Verdict::Fail(_)),
+            "{forced} {r} {line}"
+        );
+    }
+    assert!(matches!(judge(None), Verdict::Unobserved(_)));
+    assert!(
+        matches!(judge(Some(rest(0, "-", "-"))), Verdict::Unobserved(_)),
+        "no done check and no row read is no PASS"
+    );
+    let unread = rest(2, &row(2, 2), FORCED_CONTINUES_LINE)
+        .replace("did=\"Landed: 1 today \u{b7} 1 in 7 days\"", "did=\"-\"");
+    assert!(matches!(judge(Some(unread)), Verdict::Unobserved(_)));
+    let page = |lines: &[(&str, &str)]| {
+        page_rows(
+            &lines
+                .iter()
+                .map(|(key, label)| format!("text key=\"{key}\" role=Group label=\"{label}\""))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    };
+    let kept = "Kept going: 5 today \u{b7} 5 in 7 days";
+    let landed = "Landed: 1 today \u{b7} 1 in 7 days";
+    let ours = row(2, 2);
+    assert_eq!(
+        did_forced_of(&page(&[
+            ("harness/did/row/kept-going", kept),
+            ("harness/did/row/forced-continues", &ours),
+            ("harness/did/line/forced-continues", FORCED_CONTINUES_LINE),
+            ("harness/did/row/landed", landed),
+        ])),
+        Some((ours.clone(), Some(FORCED_CONTINUES_LINE.to_string())))
+    );
+    assert_eq!(
+        did_forced_of(&page(&[
+            ("harness/did/row/forced-continues", &ours),
+            ("harness/did/row/landed", landed),
+        ])),
+        Some((ours.clone(), None)),
+        "a row under it is no line"
+    );
+    assert_eq!(
+        did_forced_of(&page(&[
+            ("harness/did/row/kept-going", kept),
+            ("harness/did/row/past--done", main),
+            ("harness/did/row/landed", landed),
+        ])),
+        None,
+        "main's page"
+    );
+    let journal: Vec<(i64, String)> = [
+        (10, "CONTINUED seq=1 rule=continue@v1 kept going"),
+        (20, "CONTINUED seq=2 rule=continue-done-check@v1 defend it"),
+        (
+            30,
+            "TYPED seq=3 rule=continue-open-items@v1 an older build's",
+        ),
+        (40, "CONTINUED seq=4 rule=continue-done-check@v1 defend it"),
+        (50, "DONE seq=5 rule=continue-done-check@v1 not an act"),
+    ]
+    .into_iter()
+    .map(|(t, l)| (t, l.to_string()))
+    .collect();
+    assert_eq!(forced_continues_of(&journal, |_| true), 3);
+    assert_eq!(forced_continues_of(&journal, |t| t < 35), 2);
 }
 
 /// L7 widened (§14.6): This Mac's `landing` is every Land tab that holds at rest, less those
@@ -1375,7 +1540,7 @@ fn a_past_or_held_title_is_judged_against_its_own_chips_face() {
     );
     let landed: &str = &format!(
         "autopilot: land, landed 06:12 \u{2014} {}",
-        aterm_agent::supervise::mode_words::LANDED_WORDS
+        aterm_agent::supervise::mode_words::landed_brief(None)
     );
     let quiet = "autopilot: land, quiet \u{2014} a person's own exchange";
     let held = "autopilot: land \u{2014} not landed yet: no \u{201c}Nothing left:\u{201d} defense yet \u{b7} landing since 14:02";

@@ -4,6 +4,11 @@
 // Derived from winit 0.30.13 src/platform_impl/windows/mod.rs,
 // modified by Andrew Yates for the aterm project in 2026 (see the repository NOTICE).
 
+// Modified by Andrew Yates for the aterm project in 2026; see the repository NOTICE.
+// Bridge public handle ids to windows-sys 0.61 using typed conversion helpers; drop the
+// unused physicalkey_to_scancode export; take `SmolStr` from `crate::keyboard`; add the
+// `recorded` key-message replay (tests and debug builds).
+
 use crate::keyboard::SmolStr;
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::WINDOW_LONG_PTR_INDEX;

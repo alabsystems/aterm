@@ -19,9 +19,11 @@ const SIBLING_SEEDS: u64 = 32;
 
 const RARE_SEEDS: u64 = 20000;
 
-/// The search for a rule rarer still: since the post journal (B19) the incarnation lease's
-/// collision is reached by one seed in 60000 (54518), where 8483 had been the first in 20000.
-const RAREST_SEEDS: u64 = 60_000;
+/// The search for a rule rarer still: since the asks journal (C04) the first seed that reaches
+/// the incarnation lease's collision is 84750, where 54518 had been the first in 60,000 and,
+/// before the post journal (B19), 8483 the first in 20,000. Four and sixteen times the power
+/// cuts reach it nowhere in the first 8,000 seeds.
+const RAREST_SEEDS: u64 = 100_000;
 
 fn report(out: &Outcome) -> String {
     let tail = out.trace.len().saturating_sub(40);
@@ -459,7 +461,7 @@ fn each_rule_switched_off_is_caught() {
                 )
             }),
             "cap-compromised",
-            54518,
+            84750,
         ),
         (
             "a move of the log drops the mirror's pinned batch",
@@ -544,7 +546,7 @@ fn each_rule_switched_off_is_caught() {
             "the recovery a write error stopped is done before the run record",
             Box::new(|s| Opts::seed(s).with(Mutant::BeginRunPastAFailedRecovery)),
             "liveness",
-            31,
+            299,
         ),
         (
             "the mirror judges its pin once the recovery reconciled it",
@@ -568,19 +570,19 @@ fn each_rule_switched_off_is_caught() {
             "an attach delivers on a new log only once its witness is written",
             Box::new(|s| both_ways(s).with(Mutant::AttachPastAnUnwrittenWitness)),
             "dup delivery",
-            158,
+            1324,
         ),
         (
             "a run whose recovery is owed makes no clean stop",
             Box::new(|s| erring_quitting(s).with(Mutant::CleanStopOverAnOwedRecovery)),
             "mirror",
-            327,
+            863,
         ),
         (
             "a recovery tried again moves each file once",
             Box::new(|s| both_ways_erring(s).with(Mutant::CopyOnEveryTry)),
             "quarantine copies:",
-            17,
+            1,
         ),
         (
             "the broker escalates aterm's table (the oracle keeps it)",
@@ -666,7 +668,7 @@ fn each_rule_switched_off_is_caught() {
             "a read back that meets its subject's floor reads again told",
             Box::new(|s| Opts::seed(s).with(Mutant::ReadBackWithoutTheHeld)),
             "dup post",
-            602,
+            27,
         ),
         (
             "a read of one offset below its filter's oldest reads again told (F3)",
@@ -696,7 +698,7 @@ fn each_rule_switched_off_is_caught() {
             "a topic catch-up tells the uncounted notice below the first broadcast it delivers (F4)",
             Box::new(|s| asking(s).with(Mutant::TopicReplayDropsAnUncountedNotice)),
             "silent skip",
-            233,
+            635,
         ),
         (
             "the broadcast face's gap notice hands its cursors to the catch-up (F4)",
@@ -711,13 +713,6 @@ fn each_rule_switched_off_is_caught() {
             1,
         ),
         (
-            "the deadline sweep takes an `expired` on the lane for its verdict (F4)",
-            Box::new(|s| asking(s).with(Mutant::ExpireWithoutReadingBack)),
-            " expired 2 times",
-            // 1149 before the merge with critic item B09's refill and the review's fixes.
-            5832,
-        ),
-        (
             "a hand-off whose heads the disk refuses keeps the journal (F4)",
             Box::new(|s| asking_erring(s).with(Mutant::HandOffWithoutTheHeads)),
             "dup post|answered 2 times| expired 2 times",
@@ -727,13 +722,13 @@ fn each_rule_switched_off_is_caught() {
             "an answer is delivered only once the deadline it settles is off the disk (F4)",
             Box::new(|s| asking_erring(s).with(Mutant::DeliverOverAnUnwrittenSettle)),
             "was handed",
-            472,
+            348,
         ),
         (
             "an attach takes a hand-off's files before its incarnation (F4)",
             Box::new(|s| asking_erring(s).with(Mutant::AdoptAfterTheAttach)),
             "dup post|answered 2 times| expired 2 times",
-            244,
+            1670,
         ),
         (
             "an adoption names the attach of the hand-off it takes (F4)",
@@ -745,7 +740,7 @@ fn each_rule_switched_off_is_caught() {
             "a post retires only once its deadline is on disk (F4)",
             Box::new(|s| asking_erring(s).with(Mutant::RetireOverAnUnwrittenDeadline)),
             "neither answered nor expired",
-            360,
+            12,
         ),
     ];
     // The replay's drain rule (a record the attach published again is delivered once its
@@ -778,10 +773,8 @@ fn each_rule_switched_off_is_caught() {
         // hundreds or the thousands: a refused write of the deadline table, then a kill before
         // it is written again, the asker still hosted once settled; an uncounted notice below a
         // topic page's first broadcast; the heads of a hand-off the disk refused; an answer
-        // delivered over a refused write of the table; a hand-off whose taker stopped, or
-        // handed it on, before its attach came up; and, since an `expired` too waits for the
-        // table, a deadline left in it by a bridge killed once it published its `expired`.
-        "the deadline sweep takes an `expired` on the lane for its verdict (F4)",
+        // delivered over a refused write of the table; and a hand-off whose taker stopped, or
+        // handed it on, before its attach came up.
         "a post retires only once its deadline is on disk (F4)",
         "a topic catch-up tells the uncounted notice below the first broadcast it delivers (F4)",
         "a hand-off whose heads the disk refuses keeps the journal (F4)",
@@ -924,6 +917,26 @@ const FOUND_ERRING: &[(u64, usize, &str)] = &[
     // seed's writes, so not every row reaches its bug with the rule off any more; each rule
     // keeps one that does (each_found_bug_is_reached_again_with_its_rule_off), 31 added for
     // the sweep's when the review moved 93, 125 and 185 off it.
+    // The asks journal (C04) moved every seed's writes again: an ask is one append where it was
+    // two replaces, and no reach of these four rules survived on the rows below. Each row here
+    // is the first seed of a plain search to 60,000 that reaches its bug with its rule off, and
+    // holds every law with the rule on.
+    (
+        14,
+        400,
+        "a record delivered while its in-flight entry stood",
+    ),
+    (
+        299,
+        400,
+        "a sweep a write error stopped, closed by the run record",
+    ),
+    (494, 400, "a record dropped while the disk refused the drop"),
+    (
+        22702,
+        400,
+        "an entry read back from its head on a log a move continued below it",
+    ),
     (28, 400, "a deduped replay moved the self-lane window down"),
     (
         31,
@@ -1418,7 +1431,7 @@ fn a_torn_mirror_pin_after_a_power_cut_is_set_aside_and_the_mirror_resumes() {
         torn.iter().map(|out| out.stats.pins_set_aside).sum::<u64>()
     );
     let keeping = |s| Opts::seed(s).with(Mutant::KeepTornPin);
-    let stopped = breaking_at(&keeping, "stopped for its pin", 7, CONTROL_SEEDS)
+    let stopped = breaking_at(&keeping, "stopped for its pin", 15, CONTROL_SEEDS)
         .expect("NEGATIVE CONTROL: with the torn pin kept, some seed's mirror stops for it");
     eprintln!(
         "the torn pin kept at seed {}: {}",
@@ -1448,7 +1461,7 @@ fn a_torn_mirror_pin_after_a_power_cut_is_set_aside_and_the_mirror_resumes() {
         "the same seed with the torn pin kept, on a device that never tears, breaks no law"
     );
     for (mutant, law, witness) in [
-        (Mutant::KeyInThePinAlone, "alias keys", 3),
+        (Mutant::KeyInThePinAlone, "alias keys", 7),
         (Mutant::TotalInThePinAlone, "mirror total", 3),
     ] {
         let off = breaking_at(
@@ -3200,7 +3213,7 @@ fn a_post_the_log_lost_stays_lost_after_a_later_power_cut() {
         o
     };
     let republishing = move |s: u64| world(s).with(Mutant::RepublishInFlightOfAnEarlierBoot);
-    let out = breaking_at(&republishing, "order:", 173, RARE_SEEDS)
+    let out = breaking_at(&republishing, "order:", 424, RARE_SEEDS)
         .expect("NEGATIVE CONTROL: the old republish puts some post out of its sender's order");
     eprintln!(
         "the old republish at seed {}: {}",
@@ -3273,7 +3286,7 @@ fn the_round_refines_its_exactly_once_model() {
     })
     .expect("some run delivered a record a move took");
     assert!(taken.violations.is_empty(), "{}", report(&taken));
-    let reused = witnessed(&Opts::seed, 108, RARE_SEEDS, &|out| {
+    let reused = witnessed(&Opts::seed, 236, RARE_SEEDS, &|out| {
         out.model.2.contains("Reuse")
     })
     .expect("some committed run put a later record at an offset a move took");

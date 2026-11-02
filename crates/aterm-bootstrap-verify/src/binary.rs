@@ -17,6 +17,7 @@ use crate::{Refusal, Verdict, require};
 /// # Errors
 /// The first of those it is not.
 pub fn verify_binary(path: &OsStr, arch: &str, digest: &str, size: u64) -> Verdict<()> {
+    use std::os::unix::fs::MetadataExt as _;
     let named = PyPath::new(path).to_path();
     let meta = std::fs::symlink_metadata(&named).map_err(|e| os_error(&e, &named))?;
     require(
@@ -25,6 +26,14 @@ pub fn verify_binary(path: &OsStr, arch: &str, digest: &str, size: u64) -> Verdi
     )?;
     // Opened by the spelling it was given, as the embedded verifier opened it.
     let mut file = open_file(std::path::Path::new(path))?;
+    let opened = file.metadata().map_err(|e| bare_os_error(&e))?;
+    require(
+        opened.file_type().is_file()
+            && opened.len() == size
+            && opened.dev() == meta.dev()
+            && opened.ino() == meta.ino(),
+        "Linux artifact size/type mismatch",
+    )?;
     let mut header = Vec::with_capacity(64);
     (&mut file)
         .take(64)
@@ -56,13 +65,17 @@ pub fn verify_binary(path: &OsStr, arch: &str, digest: &str, size: u64) -> Verdi
         .map_err(|e| bare_os_error(&e))?;
     let mut hasher = aterm_digest::Sha256::new();
     let mut buffer = vec![0u8; 1 << 16];
+    let mut read_total: u64 = 0;
     loop {
         let n = file.read(&mut buffer).map_err(|e| bare_os_error(&e))?;
         if n == 0 {
             break;
         }
+        read_total = read_total.saturating_add(n as u64);
+        require(read_total <= size, "Linux artifact size/type mismatch")?;
         hasher.update(&buffer[..n]);
     }
+    require(read_total == size, "Linux artifact size/type mismatch")?;
     require(
         aterm_codec::hex::encode_lower(&hasher.finalize()) == digest,
         "Linux artifact SHA-256 mismatch",

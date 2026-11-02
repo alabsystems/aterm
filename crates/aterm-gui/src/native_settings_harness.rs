@@ -49,11 +49,15 @@ pub(super) fn timer_action(local_id: u64, choice: TimerChoice) -> String {
 pub(super) fn parse_timer_action(action: &str) -> Option<(u64, TimerChoice)> {
     let rest = action.strip_prefix(crate::harness_screen::SESSION_ACTION_PREFIX)?;
     let (id, what) = rest.split_once('/')?;
+    (!id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())).then_some(())?;
     let choice = match what {
         "land-at" => TimerChoice::At,
         "land-cancel" => TimerChoice::Cancel,
         _ => {
-            let minutes: u32 = what.strip_prefix("land-in/")?.parse().ok()?;
+            let minutes_str = what.strip_prefix("land-in/")?;
+            (!minutes_str.is_empty() && minutes_str.bytes().all(|b| b.is_ascii_digit()))
+                .then_some(())?;
+            let minutes: u32 = minutes_str.parse().ok()?;
             crate::autopilot_menu::LAND_IN_MINUTES
                 .contains(&minutes)
                 .then_some(TimerChoice::In(minutes))?
@@ -72,11 +76,11 @@ pub(super) fn timer_toggle(local_id: u64) -> String {
 
 /// [`timer_toggle`] read back.
 fn parse_timer_toggle(action: &str) -> Option<u64> {
-    action
+    let id = action
         .strip_prefix(crate::harness_screen::SESSION_ACTION_PREFIX)?
-        .strip_suffix("/timer")?
-        .parse()
-        .ok()
+        .strip_suffix("/timer")?;
+    (!id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())).then_some(())?;
+    id.parse().ok()
 }
 
 /// A SESSIONS row's `Show`: `harness/session/<id>/show`.
@@ -98,11 +102,11 @@ pub(super) fn every_timer_toggle() -> String {
 
 /// [`show_action`] read back.
 fn parse_show_action(action: &str) -> Option<u64> {
-    action
+    let id = action
         .strip_prefix(crate::harness_screen::SESSION_ACTION_PREFIX)?
-        .strip_suffix("/show")?
-        .parse()
-        .ok()
+        .strip_suffix("/show")?;
+    (!id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())).then_some(())?;
+    id.parse().ok()
 }
 
 pub(super) use crate::harness_screen::HARNESS_LAND;
@@ -229,6 +233,12 @@ impl SettingsApp {
             // (whose session may be one SESSIONS does not list: its agent has
             // exited or it is a plain shell tab).
             if self.harness.sessions.iter().any(|s| s.local_id == session)
+                || self
+                    .harness
+                    .lab
+                    .sessions
+                    .iter()
+                    .any(|s| s.local_id == session)
                 || self
                     .harness
                     .decided_open
@@ -486,11 +496,15 @@ fn harness_cards(
         room,
         card_width,
     ));
-    cards.extend(facts(
+    let mut did = facts(
         "harness/did",
         ("WHAT THE HARNESS DID", "WHAT IT DID"),
         &harness.did_rows,
-    ));
+    );
+    if let Some(card) = did.first_mut() {
+        with_row_lines(card, "harness/did", &harness.did_rows, inner);
+    }
+    cards.extend(did);
     let config = config_facts(harness, state.harness_config_open);
     let px = 13.0 * crate::native_appearance::text_scale();
     let key_width = config
@@ -524,6 +538,97 @@ fn harness_cards(
     cards
 }
 
+/// Under each row of fact card `card` (keyed `key`, of `rows`) that has one
+/// ([`crate::harness_screen::did_row_line`]: Forced continues, §14.17 item 2), its one line: what
+/// the row counts, in quiet type under the row, as a setting's note stands under its row
+/// (`with_row_detail`). Its words stand in the value's column where they take no more lines there
+/// than across the card, as a fact stands beside its name ([`FactColumns`]), and across the card
+/// otherwise. The line is heard as text of its own after its row; its painted lines are
+/// paint-only. The card grows by the line's height and no other row changes.
+fn with_row_lines(
+    (card, height): &mut (UiNode, f32),
+    key: &str,
+    rows: &[(String, String)],
+    inner: f32,
+) {
+    let columns = FactColumns::measure(rows, inner, fact_label_width(rows, inner));
+    let quiet = (SemanticRole::Text, StyleRef::Quiet);
+    let line_height = row_detail_line_height();
+    for (label, _) in rows {
+        let Some(line) = crate::harness_screen::did_row_line(label) else {
+            continue;
+        };
+        let fragment = key_fragment(label);
+        let row_key = format!("{key}/row/{fragment}");
+        let Some(at) = card
+            .children
+            .iter()
+            .position(|child| child.key.as_str() == row_key)
+        else {
+            continue;
+        };
+        let across = wrapped_words_lines(line, quiet, inner.max(0.0));
+        let beside = (!columns.stacked)
+            .then(|| wrapped_words_lines(line, quiet, columns.value))
+            .filter(|lines| lines.len() <= across.len());
+        let (lead, lines) = match beside {
+            Some(lines) => (columns.label + ABOUT_METADATA_ROW_GAP, lines),
+            None => (0.0, across),
+        };
+        let block = lines.len().max(1) as f32 * line_height;
+        let line_key = format!("{key}/line/{fragment}");
+        let words = UiNode::new(
+            line_key.clone(),
+            UiContent::Group(GroupSpec {
+                label: Some(line.to_string()),
+                role: SemanticRole::Text,
+                style: StyleRef::Plain,
+            }),
+        )
+        .layout(
+            Layout::column()
+                .width(Length::Fill)
+                .height(Length::Fixed(block))
+                .padding(Insets {
+                    left: lead,
+                    ..Insets::default()
+                }),
+        )
+        .children(
+            lines
+                .into_iter()
+                .enumerate()
+                .map(|(index, text)| {
+                    UiNode::new(
+                        format!("{line_key}/line-{index}"),
+                        UiContent::Text(TextSpec {
+                            text,
+                            role: quiet.0,
+                            style: quiet.1,
+                        }),
+                    )
+                    .layout(Layout::default().height(Length::Fixed(line_height)))
+                    .paint_only()
+                })
+                .collect(),
+        );
+        let row = card.children.remove(at);
+        let row_height = fixed_height(&row);
+        card.children.insert(
+            at,
+            UiNode::new(
+                format!("{key}/with-line/{fragment}"),
+                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+            )
+            .layout(Layout::column().height(Length::Fixed(row_height + block)))
+            .paint_only()
+            .children(vec![row, words]),
+        );
+        *height += block;
+    }
+    card.layout = card.layout.height(Length::Fixed(*height));
+}
+
 /// Running harness provenance and installed CLI facts are distinct.
 fn harness_update_rows(
     harness: &HarnessProjection,
@@ -554,6 +659,7 @@ fn harness_update_rows(
             )
         })
         .collect();
+    rows.extend(harness.ai.harness_packages.iter().cloned());
     rows.extend([
         ("aterm updates".to_string(), update.headline.clone()),
         ("CLI observations".to_string(), harness.ai.health.clone()),
@@ -561,7 +667,7 @@ fn harness_update_rows(
         ("Codex CLI".to_string(), cli("codex")),
         (
             "Delivery".to_string(),
-            "Each alab harness updates with aterm. Published CLI builds arrive through Packages. Sessions resume on a replacement when it is safe.".to_string(),
+            "Built-in CLI harnesses update with aterm. Bundled codex-alab owns its controls and reports its own build; it has no separate aterm harness version. Agent packages and CLI builds arrive through Packages. Sessions resume when it is safe.".to_string(),
         ),
         (
             "This session".to_string(),

@@ -248,6 +248,9 @@ pub struct Proc {
     pub footprint: u64,
     /// Bytes it has written to disk since it started: 0 where unread (Linux).
     pub written: u64,
+    /// The CPU time it and the children it reaped have used, nanoseconds
+    /// (`ProcessReading::cpu_ns` with `child_cpu_ns`): 0 where unread.
+    pub cpu_ns: u64,
 }
 
 /// A process tree's use: what a claimant already takes, so its claims' reservations count only the rest.
@@ -286,6 +289,25 @@ impl Procs {
             at = up;
         }
         out
+    }
+
+    /// What `pid` and every process descended from it have done ([`aterm_toolchain::stall`]),
+    /// a claimant's included, with the trees of `credited` (the processes a claim of `pid`'s is
+    /// credited with, [`crate::Record::credit`]: its VM's, outside its tree); `None` where the
+    /// sweep does not hold `pid`.
+    #[must_use]
+    pub fn work(&self, pid: u32, credited: &[u32]) -> Option<aterm_toolchain::stall::Work> {
+        let procs: Vec<aterm_toolchain::stall::Proc> = self
+            .procs
+            .iter()
+            .map(|p| aterm_toolchain::stall::Proc {
+                pid: p.pid,
+                ppid: p.ppid,
+                cpu_ns: p.cpu_ns,
+                written: p.written,
+            })
+            .collect();
+        aterm_toolchain::stall::work_with(pid, credited, &procs)
     }
 
     /// The use of `pid` and every process descended from it.
@@ -441,6 +463,7 @@ impl Machine for Live {
                 ppid: r.ppid,
                 footprint: 0,
                 written: 0,
+                cpu_ns: 0,
             });
             if r.ppid <= 1 || r.ppid == at {
                 break;
@@ -471,6 +494,10 @@ impl Proc {
             ppid: p.ppid,
             footprint: p.resident.map_or(footprint, |r| r.min(footprint)),
             written: p.disk_written.unwrap_or(0),
+            cpu_ns: p
+                .cpu_ns
+                .unwrap_or(0)
+                .saturating_add(p.child_cpu_ns.unwrap_or(0)),
         }
     }
 }

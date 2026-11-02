@@ -116,15 +116,25 @@ fn kv<'a>(line: &'a str, key: &str) -> Option<&'a str> {
         .map(|(_, v)| v)
 }
 
+fn is_digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
 fn num<T: std::str::FromStr>(line: &str, key: &str) -> Option<T> {
-    kv(line, key).and_then(|v| v.parse().ok())
+    kv(line, key)
+        .filter(|v| match v.strip_prefix('-') {
+            Some(rest) => !rest.starts_with('0') && is_digits(rest),
+            None => is_digits(v),
+        })
+        .and_then(|v| v.parse().ok())
 }
 
 /// `-` or a number.
 fn opt_num(line: &str, key: &str) -> Option<Option<u64>> {
     match kv(line, key)? {
         "-" => Some(None),
-        v => v.parse().ok().map(Some),
+        v if is_digits(v) => v.parse().ok().map(Some),
+        _ => None,
     }
 }
 
@@ -296,11 +306,15 @@ impl SessionLog {
                             "-" => None,
                             v => {
                                 let (base, cursor) = v.split_once(',')?;
+                                if !is_digits(base) {
+                                    return None;
+                                }
                                 Some(CSnap {
                                     base: base.parse().ok()?,
                                     cursor: match cursor {
                                         "-" => None,
-                                        c => Some(c.parse().ok()?),
+                                        c if is_digits(c) => Some(c.parse().ok()?),
+                                        _ => return None,
                                     },
                                 })
                             }
@@ -382,6 +396,8 @@ impl SessionLog {
                     let mut typed = Typed::default();
                     if let Some(v) = kv(line, "input")
                         && let Some((seq, w)) = v.split_once(',')
+                        && is_digits(seq)
+                        && is_digits(w)
                         && let (Ok(seq), Ok(w)) = (seq.parse::<u64>(), w.parse::<u64>())
                         && fresh(w)
                     {
@@ -392,6 +408,9 @@ impl SessionLog {
                     if let Some(v) = kv(line, "ctl") {
                         let parts: Vec<&str> = v.split(',').collect();
                         if let [seq, by, ledger, w] = parts[..]
+                            && is_digits(seq)
+                            && is_digits(ledger)
+                            && is_digits(w)
                             && let (Ok(seq), Ok(ledger), Ok(w)) =
                                 (seq.parse::<u64>(), ledger.parse::<u64>(), w.parse::<u64>())
                             && fresh(w)
@@ -460,10 +479,14 @@ fn read_cmd(line: &str, log: &Log, at: Stamp) -> Option<CmdRun> {
 
 /// A carried `fg` line, when it reads and names a run `log` holds open.
 fn read_fg(line: &str, log: &Log) -> Option<FgRun> {
+    let fp = kv(line, "name_fp")?;
+    if !fp.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
     let f = FgRun {
         pgid: num(line, "pgid")?,
         node: Node::parse(kv(line, "node")?)?,
-        name_fp: u64::from_str_radix(kv(line, "name_fp")?, 16).ok()?,
+        name_fp: u64::from_str_radix(fp, 16).ok()?,
     };
     (log.is_open(f.node) && f.node.lvl == Lvl::Run).then_some(f)
 }

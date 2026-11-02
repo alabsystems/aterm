@@ -221,18 +221,25 @@ impl Layout {
         self.prefix.join("removed")
     }
 
-    /// The programs this machine removed on purpose.
-    #[must_use]
-    pub fn removed_programs(&self) -> std::collections::BTreeSet<String> {
-        std::fs::read_to_string(self.removed())
-            .map(|text| {
-                text.lines()
-                    .map(str::trim)
-                    .filter(|line| !line.is_empty() && !line.starts_with('#'))
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default()
+    /// The programs this machine removed on purpose. Missing is an empty set; refused evidence
+    /// is an error, never permission to reinstall or overwrite it. IO is bounded per record
+    /// and by the admitted file's initial length; the returned set grows with distinct names.
+    /// # Errors
+    /// The file is not an admitted regular UTF-8 file, changes during the read, or contains a
+    /// record longer than the producer's 4096-byte line limit.
+    pub fn removed_programs(&self) -> std::io::Result<std::collections::BTreeSet<String>> {
+        let mut names = std::collections::BTreeSet::new();
+        match crate::metadata_io::read_regular_lines(&self.removed(), REMOVAL_LINE_BYTES, |line| {
+            let name = line.trim();
+            if !name.is_empty() && !name.starts_with('#') {
+                names.insert(name.to_string());
+            }
+            Ok(true)
+        }) {
+            Ok(()) => Ok(names),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
+            Err(error) => Err(error),
+        }
     }
 
     /// `declined`: the durable "this machine does not want the bundled toolset" marker.
@@ -394,6 +401,9 @@ const READY_CONTENTS_BIN: &str = "bin:";
 
 const READY_OK_LINE: &str = "ok";
 
+/// The removal writer and streaming reader share this record bound, including its newline.
+pub(crate) const REMOVAL_LINE_BYTES: usize = 4096;
+
 fn running_platform() -> String {
     format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS)
 }
@@ -525,15 +535,50 @@ pub fn build_is_complete(build_dir: &Path) -> bool {
 }
 
 /// Whether `build_dir` records the other slice of the universal binary.
-pub(crate) fn build_marks_another_slice(build_dir: &Path) -> bool {
+/// # Errors
+/// Its present marker cannot be admitted or its leading complete/platform evidence cannot
+/// be read as bounded UTF-8. A caller deciding deletion must preserve this unknown case.
+pub(crate) fn build_marks_another_slice(build_dir: &Path) -> std::io::Result<bool> {
     let Some(marker) = ready_marker_path(build_dir) else {
-        return false;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "build has no marker name",
+        ));
     };
-    let Ok(text) = std::fs::read_to_string(&marker) else {
-        return false;
-    };
-    first_line_is_ok(&text)
-        && recorded_platform(&text).is_some_and(|p| p != running_platform().as_str())
+    let mut first = true;
+    let mut another = false;
+    // The producer writes ok, then platform, before its arbitrarily large bin inventory.
+    // Legacy markers may lack platform; unknown/overlong evidence is kept out of GC.
+    match crate::metadata_io::read_regular_lines(&marker, 4096, |line| {
+        if first {
+            first = false;
+            if line.trim() != READY_OK_LINE {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "ready marker has no complete header",
+                ));
+            }
+            return Ok(true);
+        }
+        if let Some(platform) = line
+            .trim()
+            .strip_prefix(READY_PLATFORM_KEY)
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+        {
+            another = platform != running_platform();
+            return Ok(false);
+        }
+        Ok(true)
+    }) {
+        Ok(()) if first => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "ready marker is empty",
+        )),
+        Ok(()) => Ok(another),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 /// Atomically and durably mark `build_dir` complete.
@@ -543,22 +588,47 @@ pub fn mark_build_ready(build_dir: &Path) -> std::io::Result<()> {
     })?;
     let parent = dest.parent().unwrap_or(build_dir);
     let tmp = parent.join(format!(".ready.tmp-{}", std::process::id()));
+    let body = ready_body(build_dir);
+    let written = (|| -> std::io::Result<()> {
+        use std::io::Write as _;
+        let mut f = crate::platform::open_create_write(&tmp, 0o644)?;
+        f.write_all(body.as_bytes())?;
+        sync_contents_or_accept_refusal(&f)
+    })();
+    if let Err(err) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
+    if let Err(err) = std::fs::rename(&tmp, &dest) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn ready_body(build_dir: &Path) -> String {
+    ready_body_with_inventory(bin_inventory(build_dir).as_deref())
+}
+
+pub(crate) fn ready_body_with_inventory(inventory: Option<&str>) -> String {
     let mut body = format!(
         "{READY_OK_LINE}\n{READY_PLATFORM_KEY}{}\n",
         running_platform()
     );
-    if let Some(contents) = bin_inventory(build_dir) {
+    if let Some(contents) = inventory {
         body.push_str(READY_CONTENTS_KEY);
-        body.push_str(&contents);
+        body.push_str(contents);
         body.push('\n');
     }
-    {
-        use std::io::Write as _;
-        let mut f = crate::platform::open_create_write(&tmp, 0o644)?;
-        f.write_all(body.as_bytes())?;
-        sync_contents_or_accept_refusal(&f)?;
-    }
-    std::fs::rename(&tmp, &dest)
+    body
+}
+
+/// Local selection needs positively readable, canonical readiness, never GC's keep-on-error.
+#[cfg(all(unix, test))]
+pub(crate) fn local_build_ready(build_dir: &Path) -> std::io::Result<bool> {
+    let marker = ready_marker_path(build_dir).ok_or(std::io::ErrorKind::InvalidInput)?;
+    let text = crate::metadata_io::read_bounded_regular_utf8(&marker, 4096)?;
+    Ok(bin_inventory(build_dir).is_some() && text == ready_body(build_dir))
 }
 
 /// Remove the completeness marker, making `build_dir` read as not installed.
@@ -595,7 +665,7 @@ pub(crate) fn unmark_program_builds(prog_store: &Path) -> std::io::Result<()> {
         }
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if name.parse::<u64>().is_err() {
+        if parse_build_name(name).is_none() {
             continue;
         }
         clear_build_ready(&entry.path())?;
@@ -634,7 +704,7 @@ pub fn write_declared_modes(
     if crate::platform::HAS_POSIX_MODES {
         return Ok(());
     }
-    if let Some(parent) = build_dir.parent() {
+    if let Some(parent) = build_dir.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
     }
     let mut body: Vec<u8> = Vec::with_capacity(modes.len().saturating_mul(48).saturating_add(32));
@@ -954,9 +1024,17 @@ fn parse_stage_refusal(text: &str) -> Option<StageRefusal> {
         } else if let Some(v) = line.strip_prefix("why=") {
             why = Some(v.to_string());
         } else if let Some(v) = line.strip_prefix("at=") {
-            at = v.trim().parse::<i64>().ok();
+            let s = v.trim();
+            let digits = s.strip_prefix('-').unwrap_or(s);
+            at = (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| s.parse::<i64>().ok())
+                .flatten();
         } else if let Some(v) = line.strip_prefix("attempts=") {
-            attempts = v.trim().parse::<u32>().ok().filter(|n| *n >= 1);
+            let s = v.trim();
+            attempts = (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| s.parse::<u32>().ok())
+                .flatten()
+                .filter(|n| *n >= 1);
         } else if let Some(v) = line.strip_prefix("signer=") {
             signer = v.trim() == "1";
         } else if let Some(v) = line.strip_prefix("hold=") {
@@ -997,9 +1075,56 @@ pub(crate) const VENDOR_SIDECAR_SUFFIX: &str = ".vendor";
 /// (`store/<program>/<build>.exposes`, [`write_exposes`]).
 pub(crate) const EXPOSES_SUFFIX: &str = ".exposes";
 
-const EXPOSES_HEADER: &str = "exposes v1";
+pub(crate) const EXPOSES_HEADER: &str = "exposes v1";
 
 const MAX_EXPOSES_BYTES: usize = 64 * 1024;
+
+/// The suffix of a build's record of the version its signed manifest names
+/// (`store/<program>/<build>.version`, [`write_version`]): display only, as the manifest's
+/// `version` is, so a surface can say which release a build is without the manifest.
+pub(crate) const VERSION_SUFFIX: &str = ".version";
+
+pub(crate) const VERSION_HEADER: &str = "version v1";
+
+/// The longest version a record keeps.
+const MAX_VERSION_LEN: usize = 128;
+
+/// Whether `version` is one a record keeps: 1 to [`MAX_VERSION_LEN`] bytes of visible ASCII
+/// (no space or control byte), so it prints on one line as one word.
+fn version_word(version: &str) -> bool {
+    !version.is_empty()
+        && version.len() <= MAX_VERSION_LEN
+        && version.bytes().all(|b| b.is_ascii_graphic())
+}
+
+/// Record `version`, the signed manifest's display version, beside `build_dir`
+/// ([`write_sidecar_durably`]). A version that is empty or not one word ([`version_word`]) is not
+/// recorded.
+pub(crate) fn write_version(build_dir: &Path, version: &str) -> std::io::Result<()> {
+    if !version_word(version) {
+        return Ok(());
+    }
+    write_sidecar_durably(
+        build_dir,
+        VERSION_SUFFIX,
+        format!("{VERSION_HEADER}\n{version}\n").as_bytes(),
+    )
+}
+
+/// The version `build_dir`'s signed manifest named ([`write_version`]), or `None` for a build
+/// staged before that record existed, one whose manifest named none, or a record that does not
+/// parse.
+#[must_use]
+pub fn recorded_version(build_dir: &Path) -> Option<String> {
+    let path = sidecar_path(build_dir, VERSION_SUFFIX)?;
+    let text = crate::metadata_io::read_bounded_regular_utf8(&path, 2 * MAX_VERSION_LEN).ok()?;
+    let mut lines = text.lines();
+    if lines.next()? != VERSION_HEADER {
+        return None;
+    }
+    let version = lines.next()?;
+    (version_word(version) && lines.next().is_none()).then(|| version.to_string())
+}
 
 /// The sidecars a stage writes beside its build — through
 /// [`crate::install::StageHooks::sidecars`], or a kept unit ([`crate::peers::keep`]) — which gc
@@ -1009,7 +1134,10 @@ pub(crate) const STAGE_SIDECAR_SUFFIXES: &[&str] = &[
     crate::shim_env::SIDECAR_SUFFIX,
     DECLARED_MODES_SUFFIX,
     EXPOSES_SUFFIX,
+    VERSION_SUFFIX,
     crate::peers::UNIT_SUFFIX,
+    #[cfg(unix)]
+    crate::local_harness::SUFFIX,
 ];
 
 /// Record `tools`, the admitted names of the build's signed `exposes`, beside `build_dir`
@@ -1272,6 +1400,7 @@ pub(crate) fn relink_aside(build_dir: &Path) -> bool {
 /// `build_dir` is not a real directory, its aside's name is taken, or the rename or the link
 /// failed (a failed link puts the directory back).
 pub(crate) fn lay_aside(build_dir: &Path) -> std::io::Result<()> {
+    let _first_exec = first_exec_removal(build_dir)?;
     let aside = aterm_toolchain::layout::aside_of(build_dir).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "build dir has no name")
     })?;
@@ -1302,6 +1431,19 @@ pub(crate) fn lay_aside(build_dir: &Path) -> std::io::Result<()> {
 
 /// Recover the one crash window a swap cannot make atomic.
 pub(crate) fn recover_interrupted_swap(build_dir: &Path) -> bool {
+    let Some(program) = build_dir.parent() else {
+        return false;
+    };
+    let Ok(first_exec) = first_exec::program_gate(program) else {
+        return false;
+    };
+    recover_interrupted_swap_under_gate(build_dir, &first_exec)
+}
+
+fn recover_interrupted_swap_under_gate(build_dir: &Path, first_exec: &FirstExecRemoval) -> bool {
+    if first_exec.check(build_dir).is_err() {
+        return false;
+    }
     relink_aside(build_dir);
     // `symlink_metadata`, not `exists()`: a dangling symlink at the build path is still
     // something there, and the window means nothing is, unless it is the build's own link
@@ -1324,12 +1466,21 @@ pub(crate) fn recover_interrupted_swap(build_dir: &Path) -> bool {
     if superseded.next().is_some() {
         return false;
     }
+    if first_exec.check(&old).is_err() || first_exec.check(&back_to).is_err() {
+        return false;
+    }
     std::fs::rename(&old, back_to).is_ok()
 }
 
-/// Delete stage-scratch siblings of `build_dir` ([`recover_interrupted_swap`]).
+/// Delete stage-scratch siblings after recovery, under the stable program gate.
 pub(crate) fn sweep_stage_scratch(build_dir: &Path) {
-    let recovered = recover_interrupted_swap(build_dir);
+    let Some(program) = build_dir.parent() else {
+        return;
+    };
+    let Ok(first_exec) = first_exec::program_gate(program) else {
+        return;
+    };
+    let recovered = recover_interrupted_swap_under_gate(build_dir, &first_exec);
     let parked_only_copy = !recovered && tree_absent(build_dir);
     for (kind, path) in scratch_siblings(build_dir) {
         // Spare only a directory (what a swap parks); a file or symlink at that name is
@@ -1342,10 +1493,12 @@ pub(crate) fn sweep_stage_scratch(build_dir: &Path) {
         }
         match std::fs::symlink_metadata(&path) {
             Ok(m) if m.is_dir() => {
-                let _ = remove_tree(&path);
+                let _ = remove_tree_under_gate(&path, &first_exec);
             }
             Ok(_) => {
-                let _ = std::fs::remove_file(&path);
+                if first_exec.check(&path).is_ok() {
+                    let _ = std::fs::remove_file(&path);
+                }
             }
             Err(_) => {}
         }
@@ -1443,6 +1596,22 @@ pub(crate) fn unseal_bin(tree: &Path) {
 /// `<build>.noindex` tree first and then the `<build>` link, so a crash between the two
 /// leaves a link to nothing, which the next sweep removes.
 pub(crate) fn remove_tree(dir: &Path) -> std::io::Result<()> {
+    remove_tree_after_admission(dir, || {})
+}
+
+fn remove_tree_after_admission(dir: &Path, admitted: impl FnOnce()) -> std::io::Result<()> {
+    let first_exec = first_exec_removal(dir)?;
+    admitted();
+    remove_tree_under_gate(dir, &first_exec)
+}
+
+/// Remove under an already-held program gate. Swap, discard and scratch sweep must not
+/// reacquire that nonblocking lock; every other generic caller enters through `remove_tree`.
+pub(crate) fn remove_tree_under_gate(
+    dir: &Path,
+    first_exec: &FirstExecRemoval,
+) -> std::io::Result<()> {
+    first_exec.check(dir)?;
     if aterm_toolchain::layout::is_linked_aside(dir)
         && let Some(aside) = aterm_toolchain::layout::aside_of(dir)
     {
@@ -1456,91 +1625,31 @@ pub(crate) fn remove_tree(dir: &Path) -> std::io::Result<()> {
     std::fs::remove_dir_all(dir)
 }
 
-/// `<build>.unproven`: the awake-clock reading at which a resolve check's child in that build
-/// ended with no exit of its own ([`hold_unproven`]), so no atpkg process removes or replaces
-/// the build within [`aterm_uds::deadline::FIRST_EXEC_HANG`] of it.
+/// Legacy scalar marks remain readable beside independent first-start marks.
 pub(crate) const UNPROVEN_SUFFIX: &str = ".unproven";
 
-/// Executables a resolve check started that never exited on their own, each with when that was
-/// seen: this process's hold where the [`UNPROVEN_SUFFIX`] mark could not be written.
-static UNPROVEN: std::sync::Mutex<Vec<(PathBuf, std::time::Instant)>> =
-    std::sync::Mutex::new(Vec::new());
+#[path = "store_first_exec.rs"]
+mod first_exec;
+#[cfg(all(test, unix))]
+pub(crate) use first_exec::MARKS_SUFFIX as FIRST_EXEC_MARKS_SUFFIX;
+pub use first_exec::{FirstExec, hold_first_exec};
+pub(crate) use first_exec::{
+    Removal as FirstExecRemoval, first_exec_program_removal, first_exec_removal, held_build_in,
+    held_unproven,
+};
+#[cfg(all(test, unix))]
+use first_exec::{held_unproven_at, hold_first_exec_at};
 
-/// Hold in place ([`held_unproven`]) the build that ships `exe` (`<build>/bin/<tool>`, as
-/// [`crate::flow::bundle_resolve_check`] names it): macOS may still be assessing its first exec,
-/// and syspolicyd crashes when the file goes mid-assessment.
-pub(crate) fn hold_unproven(exe: &Path) {
-    UNPROVEN
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push((exe.to_path_buf(), std::time::Instant::now()));
-    if let Some(build) = exe.parent().and_then(Path::parent) {
-        let stamp = aterm_uds::process::awake_ms()
-            .map(|ms| ms.to_string())
-            .unwrap_or_default();
-        let _ = write_sidecar_durably(build, UNPROVEN_SUFFIX, stamp.as_bytes());
-    }
-}
-
-/// Whether `tree` holds an executable [`hold_unproven`] took less than
-/// [`aterm_uds::deadline::FIRST_EXEC_HANG`] ago, in this process or (by its [`UNPROVEN_SUFFIX`]
-/// mark) in any.
-pub(crate) fn held_unproven(tree: &Path) -> bool {
-    let here = UNPROVEN
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .iter()
-        .any(|(exe, at)| {
-            exe.starts_with(tree) && at.elapsed() < aterm_uds::deadline::FIRST_EXEC_HANG
-        });
-    here || sidecar_path(tree, UNPROVEN_SUFFIX).is_some_and(|mark| unproven_mark_holds(&mark))
-}
-
-/// Whether the [`UNPROVEN_SUFFIX`] mark at `mark` is younger than
-/// [`aterm_uds::deadline::FIRST_EXEC_HANG`] of awake time, aged as
-/// [`aterm_uds::deadline::copy_wait_left`] ages an exec stamp: an awake clock below the stamp
-/// means a restart, which ended the assessment; with no reading, the mark's modification time
-/// counts. A mark that is there but cannot be read holds.
-fn unproven_mark_holds(mark: &Path) -> bool {
-    let text = match std::fs::read_to_string(mark) {
-        Ok(text) => text,
-        Err(e) => return e.kind() != std::io::ErrorKind::NotFound,
-    };
-    let age = match (
-        text.trim().parse::<u64>().ok(),
-        aterm_uds::process::awake_ms(),
-    ) {
-        (Some(at), Some(now)) => match now.checked_sub(at) {
-            Some(ms) => std::time::Duration::from_millis(ms),
-            None => return false,
-        },
-        _ => std::fs::symlink_metadata(mark)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|at| at.elapsed().ok())
-            .unwrap_or_default(),
-    };
-    age < aterm_uds::deadline::FIRST_EXEC_HANG
-}
-
-/// A build of the program store `prog_store` that [`held_unproven`] keeps in place, if any.
-pub(crate) fn held_build_in(prog_store: &Path) -> Option<PathBuf> {
-    std::fs::read_dir(prog_store)
-        .ok()?
-        .flatten()
-        .map(|entry| entry.path())
-        .find(|path| {
-            path.file_name()
-                .and_then(|n| n.to_str())
-                .and_then(parse_build_name)
-                .is_some()
-                && held_unproven(path)
-        })
-}
+#[cfg(all(test, unix))]
+#[path = "store_first_exec_tests.rs"]
+mod first_exec_tests;
 
 /// Discard a build after its marker's removal is flushed. A failed removal or flush
 /// retains the tree; a held build ([`held_unproven`]) stays unmarked until a later sweep.
 pub(crate) fn discard_build(build_dir: &Path) {
+    let Ok(first_exec) = first_exec_removal(build_dir) else {
+        return;
+    };
     if clear_build_ready(build_dir).is_err() {
         return;
     }
@@ -1553,7 +1662,7 @@ pub(crate) fn discard_build(build_dir: &Path) {
         return;
     }
     crate::compat::discard_root_of(build_dir);
-    let _ = remove_tree(build_dir);
+    let _ = remove_tree_under_gate(build_dir, &first_exec);
     if let Some(mark) = sidecar_path(build_dir, UNPROVEN_SUFFIX) {
         let _ = std::fs::remove_file(mark);
     }
@@ -1573,6 +1682,9 @@ pub(crate) fn discard_build(build_dir: &Path) {
         let _ = std::fs::remove_file(unit);
     }
     if let Some(record) = sidecar_path(build_dir, EXPOSES_SUFFIX) {
+        let _ = std::fs::remove_file(record);
+    }
+    if let Some(record) = sidecar_path(build_dir, VERSION_SUFFIX) {
         let _ = std::fs::remove_file(record);
     }
 }
@@ -1966,6 +2078,55 @@ mod tests {
 
     fn temp_home(label: &str) -> crate::testdir::Dir {
         crate::testdir::dir(&format!("atpkg-store-{label}-"))
+    }
+
+    /// THE VERSION RECORD READS BACK WHAT WAS WRITTEN AND NOTHING ELSE: a one-word version
+    /// round-trips (the positive control); an empty or multi-word version writes no record; a
+    /// record with a foreign header, a second line or a space in its word reads as none; a
+    /// rewrite replaces the word.
+    #[test]
+    fn a_version_record_round_trips_one_word_and_refuses_the_rest() {
+        let h = temp_home("version-record");
+        let build = h.join("store").join("grok-alab").join("17");
+        std::fs::create_dir_all(&build).unwrap();
+        assert_eq!(recorded_version(&build), None, "no record yet");
+        write_version(&build, "0.3.0").unwrap();
+        assert_eq!(recorded_version(&build).as_deref(), Some("0.3.0"));
+        let record = sidecar_path(&build, VERSION_SUFFIX).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&record).unwrap(),
+            "version v1\n0.3.0\n"
+        );
+        write_version(&build, "0.4.0+g1a2b3c4").unwrap();
+        assert_eq!(recorded_version(&build).as_deref(), Some("0.4.0+g1a2b3c4"));
+        for refused in ["", "0.4 beta", "0.4\n0.5", &"9".repeat(MAX_VERSION_LEN + 1)] {
+            write_version(&build, refused).unwrap();
+            assert_eq!(
+                recorded_version(&build).as_deref(),
+                Some("0.4.0+g1a2b3c4"),
+                "{refused:?} is not recorded"
+            );
+        }
+        let other = h.join("store").join("grok-alab").join("18");
+        std::fs::create_dir_all(&other).unwrap();
+        write_version(&other, "").unwrap();
+        assert!(!sidecar_path(&other, VERSION_SUFFIX).unwrap().exists());
+        for body in [
+            "exposes v1\n0.3.0\n",
+            "version v1\n0.3.0\nextra\n",
+            "version v1\n0.3 0\n",
+            "version v1\n",
+            "",
+        ] {
+            std::fs::write(&record, body).unwrap();
+            assert_eq!(recorded_version(&build), None, "{body:?}");
+        }
+        std::fs::write(&record, "version v1\n1.2.3").unwrap();
+        assert_eq!(
+            recorded_version(&build).as_deref(),
+            Some("1.2.3"),
+            "a record with no final newline still reads (control)"
+        );
     }
 
     #[test]
@@ -2929,6 +3090,56 @@ mod tests {
         assert!(!contents_still_stand(&build, "bin:ay,ny"));
         assert!(contents_still_stand(&build, "tree-root:deadbeef"));
         assert!(contents_still_stand(&build, "bin"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A first-exec hold is on disk before it returns and goes once its program showed it
+    /// ran, unless another hold of the build stands: another process's mark, or another of
+    /// this process's starts still running.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_first_exec_hold_goes_when_it_ran_and_leaves_every_other_hold() {
+        let home = temp_home("firstexec");
+        let build = |n: &str| {
+            let build = home.join("store").join("ay").join(n);
+            std::fs::create_dir_all(build.join("bin")).unwrap();
+            (
+                build.join("bin").join("ay"),
+                build.join("bin").join("ny"),
+                build,
+            )
+        };
+        let mark = |build: &Path| sidecar_path(build, UNPROVEN_SUFFIX).unwrap();
+        let starts = |build: &Path| sidecar_path(build, FIRST_EXEC_MARKS_SUFFIX).unwrap();
+
+        let (ay, _, alone) = build("1");
+        let hold = hold_first_exec(&ay).unwrap();
+        assert!(starts(&alone).is_dir() && held_unproven(&alone));
+        hold.ran();
+        assert!(!starts(&alone).exists() && !held_unproven(&alone));
+
+        let (ay, _, theirs) = build("2");
+        let now = aterm_uds::process::awake_ms().expect("the awake clock");
+        write_sidecar_durably(&theirs, UNPROVEN_SUFFIX, now.to_string().as_bytes()).unwrap();
+        hold_first_exec(&ay).unwrap().ran();
+        assert!(
+            mark(&theirs).is_file() && held_unproven(&theirs),
+            "another process's hold stands"
+        );
+
+        let (ay, ny, both) = build("3");
+        let first = hold_first_exec(&ay).unwrap();
+        let second = hold_first_exec(&ny).unwrap();
+        first.ran();
+        assert!(
+            starts(&both).is_dir() && held_unproven(&both),
+            "a start still running holds the build"
+        );
+        second.ran();
+        assert!(
+            !held_unproven(&ay) && !held_unproven(&ny),
+            "neither start holds anything of this process now"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 

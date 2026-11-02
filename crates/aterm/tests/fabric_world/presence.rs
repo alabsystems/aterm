@@ -439,12 +439,7 @@ fn a_sessions_presence_row_relays_the_servers_agent_verdict_and_never_text() {
 fn write_marked_program(dir: &Path, name: &str) -> String {
     let path = dir.join(format!("{name}.sh"));
     std::fs::write(&path, "#!/bin/sh\nread _x\n").expect("write the marked program");
-    marked_line(
-        dir,
-        name,
-        &harness::own_image(dir, name, "/bin/bash"),
-        &path,
-    )
+    marked_line(dir, name, &harness::own_image(dir, name), &path)
 }
 
 /// **A `meta` CHANGE AFTER THE FIRST READ REACHES THE BUS BY THE PUSH, AND

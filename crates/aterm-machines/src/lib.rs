@@ -15,6 +15,7 @@ pub mod agent;
 pub mod askpass;
 pub mod baseline;
 pub(crate) mod checkout;
+pub use checkout::github_writer_origin;
 pub mod cli;
 pub mod console;
 pub mod controller;
@@ -44,6 +45,7 @@ pub mod model;
 pub mod plist;
 pub mod port;
 pub mod protocol;
+pub mod release_probe;
 pub mod sessions;
 pub mod sync;
 
@@ -60,3 +62,16 @@ pub const SUDOERS_FILE: &str = "/etc/sudoers.d/aterm-machines";
 
 /// The schema of every document this crate writes or reads: envelope, baseline, report.
 pub const SCHEMA: u32 = 1;
+
+pub(crate) fn parse_uint<T: std::str::FromStr>(s: &str) -> Option<T> {
+    (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| s.parse().ok())
+        .flatten()
+}
+
+pub(crate) fn parse_int<T: std::str::FromStr>(s: &str) -> Option<T> {
+    let digits = s.strip_prefix('-').unwrap_or(s);
+    (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| s.parse().ok())
+        .flatten()
+}

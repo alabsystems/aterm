@@ -89,9 +89,14 @@ pub fn act_class(door: &str, request: &[u8]) -> ActClass {
     if door == doors::TELLER {
         return ActClass::Housekeeping;
     }
-    if door == doors::CTL {
-        let Ok(words) = codec::ctl_args(request) else {
-            return ActClass::Read;
+    if door == doors::CTL || door == doors::CTL_DUTY {
+        let Ok(words) = ctl::argv(door, request) else {
+            // A malformed typed envelope must never be discarded as a harmless look.
+            return if door == doors::CTL_DUTY {
+                ActClass::Act
+            } else {
+                ActClass::Read
+            };
         };
         let words: Vec<&str> = words
             .iter()
@@ -133,11 +138,13 @@ fn wait_of(request: &[u8]) -> (Option<String>, Option<u64>) {
         .filter(|w| !w.starts_with('@'))
         .collect();
     let kind = words.get(1).cloned();
-    let timeout = words
-        .iter()
-        .position(|w| w == "timeout")
-        .and_then(|at| words.get(at + 1))
-        .and_then(|ms| ms.parse().ok());
+    let timeout = words.iter().enumerate().find_map(|(i, w)| {
+        if w == "timeout" {
+            words.get(i + 1).and_then(|ms| crate::parse_uint(ms))
+        } else {
+            w.strip_prefix("timeout=").and_then(crate::parse_uint)
+        }
+    });
     (kind, timeout)
 }
 
@@ -155,7 +162,7 @@ fn wait_key(request: &[u8]) -> Vec<String> {
     while let Some(w) = it.next() {
         if w == "timeout" {
             it.next();
-        } else if !w.starts_with(WORD_TOKEN) {
+        } else if !w.starts_with(WORD_TOKEN) && !w.starts_with("timeout=") {
             key.push(w);
         }
     }
@@ -195,6 +202,28 @@ fn housekeeping_kind(request: &[u8]) -> Vec<String> {
     words.into_iter().take(verb).collect()
 }
 
+/// Whether `request` reads the program's window title (`title`).
+fn is_title_read(request: &[u8]) -> bool {
+    codec::ctl_args(request).is_ok_and(|words| {
+        words
+            .iter()
+            .map(String::as_str)
+            .filter(|w| !w.starts_with('@'))
+            .eq(["title"])
+    })
+}
+
+/// What a `title` read on a tape that holds none is answered with: the refusal of a host
+/// without the verb, which the loop reads as no title at all. The build that recorded the tape
+/// asked no title, so the loop decides as that build did.
+fn untitled() -> Vec<u8> {
+    codec::ctl_reply(&Ok(crate::supervise::CtlReply {
+        code: 1,
+        stdout: String::new(),
+        stderr: "aterm-ctl: ERR unknown verb 'title' (help lists them)\n".to_string(),
+    }))
+}
+
 /// A control lane's success, saying nothing: what housekeeping no record of
 /// its kind answered is answered with.
 fn lane_success() -> Vec<u8> {
@@ -226,7 +255,7 @@ pub struct ActsAccount {
     pub virtual_clock: usize,
     /// Sleeps with no identical sleep under the cursor: virtual time.
     pub slept: usize,
-    /// Housekeeping its identical request in the loop's segment did not answer (never compared): served from a segment before the loop's own, by the latest of its kind before the cursor, or as its door's success.
+    /// Housekeeping its identical request in the loop's segment did not answer (never compared): served from a segment before the loop's own, by the latest of its kind before the cursor, or as its door's success. And `title` reads on a tape that holds none, answered as no title ([`untitled`]): the tape's build read no title.
     pub housekept: usize,
     /// Outputs (a line, a row, a mark, a notification) with no record of their door under the cursor, and writes whose outcome no record of their door gave.
     pub unmatched_outputs: usize,
@@ -287,6 +316,8 @@ pub(crate) struct ActsCursor {
     slept_mono: u64,
     slept_wall: u64,
     mono_floor: u64,
+    /// Each record consumed, served again as a wait or a sleep, or stood for by a virtual sleep ([`Self::sleep`]): any other behind the cursor was dropped.
+    had: Vec<bool>,
     /// Flags read true, and each flag's false reads since the last record.
     latched: BTreeSet<String>,
     flag_reads: BTreeMap<String, u64>,
@@ -311,6 +342,8 @@ pub(crate) struct ActsCursor {
     /// The round trips and file reads a candidate may ask (every one but an
     /// output's): where the tape is spent ([`ActsCursor::spent`]).
     askable: Vec<usize>,
+    /// The tape holds a `title` read: its build read the program's title.
+    titled: bool,
 }
 
 /// The first of the ascending `list` in `lo..hi`.
@@ -347,6 +380,7 @@ impl ActsCursor {
         let mut housekeeping: BTreeMap<(String, Vec<String>), Vec<usize>> = BTreeMap::new();
         let mut wait_keys: BTreeMap<(String, Vec<String>), Vec<usize>> = BTreeMap::new();
         let mut askable = Vec::new();
+        let mut titled = false;
         for (at, r) in records.iter().enumerate() {
             match r {
                 EffectRecord::Raised { door, .. } => {
@@ -358,6 +392,7 @@ impl ActsCursor {
                         .or_default()
                         .push(at);
                     by_door.entry(door.clone()).or_default().push(at);
+                    titled |= door == doors::CTL && is_title_read(request);
                     let class = act_class(door, request);
                     match class {
                         ActClass::Wait if door == doors::CTL => {
@@ -399,6 +434,7 @@ impl ActsCursor {
             acts: acts.len(),
             ..ActsAccount::default()
         };
+        let had = vec![false; records.len()];
         Self {
             records,
             stamps,
@@ -412,6 +448,7 @@ impl ActsCursor {
             slept_mono: 0,
             slept_wall: 0,
             mono_floor: 0,
+            had,
             latched: BTreeSet::new(),
             flag_reads: BTreeMap::new(),
             idle: 0,
@@ -423,6 +460,7 @@ impl ActsCursor {
             wait_keys,
             housekeeping,
             askable,
+            titled,
         }
     }
 
@@ -475,6 +513,9 @@ impl ActsCursor {
             self.strayed = true;
         }
         self.pos = at + 1;
+        if let Some(had) = self.had.get_mut(at) {
+            *had = true;
+        }
         self.account.consumed += 1;
         self.idle = 0;
         self.flag_reads.clear();
@@ -514,6 +555,21 @@ impl ActsCursor {
         self.slept_wall = self.slept_wall.saturating_add(ns);
     }
 
+    /// What a wait or sleep served again from record `at` passes, `full` at most: of a stamped record the cursor dropped, only the rest of its recorded run past `base + slept`; else `full`.
+    fn owed(&mut self, at: usize, full: u64) -> u64 {
+        let dropped = self
+            .had
+            .get_mut(at)
+            .is_some_and(|had| !std::mem::replace(had, true));
+        match self.stamps.get(at).copied().flatten() {
+            Some(end) if dropped => full.min(
+                end.mono_ns
+                    .saturating_sub(self.base_mono.saturating_add(self.slept_mono)),
+            ),
+            _ => full,
+        }
+    }
+
     /// Whether record `at` is a round trip at `door` asking `request`.
     fn holds(&self, at: usize, door: &str, request: &[u8]) -> bool {
         matches!(&self.records[at], EffectRecord::Exchange { door: d, request: r, .. }
@@ -541,6 +597,13 @@ impl ActsCursor {
     /// The latest of `list` in `from..` the cursor.
     fn behind(&self, list: Option<&Vec<usize>>, from: usize) -> Option<usize> {
         last_in(list, from, self.pos)
+    }
+
+    /// The first of `list` in the segment ahead of the cursor not yet had: the had lead there, since only [`Self::sleep`] marks one ahead, the first unhad.
+    fn unhad_ahead(&self, list: Option<&Vec<usize>>) -> Option<usize> {
+        let rest = list?.get(list?.partition_point(|&p| p < self.pos)..)?;
+        let i = rest.partition_point(|&p| self.had.get(p).copied().unwrap_or(false));
+        rest.get(i).copied().filter(|&p| p < self.seg_end())
     }
 
     /// The segment's closing act, when the tape holds the wait `list` names
@@ -615,6 +678,25 @@ impl ActsCursor {
                     self.account.keyed += 1;
                     return Ok(self.again(at));
                 }
+                if door == doors::PROBE_LOCAL_OFFSET {
+                    // An instant the tape holds no answer for, whichever build recorded it, reads
+                    // unknown: a clock then uses the offset as of now, a wake's line says none.
+                    self.account.housekept += 1;
+                    self.idle += 1;
+                    return Ok(Served {
+                        reply: Vec::new(),
+                        at: None,
+                    });
+                }
+                if door == doors::CTL && !self.titled && is_title_read(request) {
+                    // No stray: the build that recorded the tape asked nothing here.
+                    self.account.housekept += 1;
+                    self.idle += 1;
+                    return Ok(Served {
+                        reply: untitled(),
+                        at: None,
+                    });
+                }
                 Err(Refusal::Stale {
                     class: ActClass::Read,
                 })
@@ -627,7 +709,8 @@ impl ActsCursor {
                 }
                 if let Some(at) = self.behind(same, self.seg_start) {
                     self.account.repeated += 1;
-                    self.pass(timeout.unwrap_or(0).saturating_mul(1_000_000));
+                    let owed = self.owed(at, timeout.unwrap_or(0).saturating_mul(1_000_000));
+                    self.pass(owed);
                     return Ok(self.again(at));
                 }
                 let kin = (door == doors::CTL)
@@ -696,16 +779,31 @@ impl ActsCursor {
     }
 
     /// A SLEEP whose request is its length in nanoseconds: the identical
-    /// sleep under the cursor, else virtual time.
+    /// sleep under the cursor, else virtual time, less what the same sleep
+    /// the cursor dropped in this segment already put in the base ([`Self::owed`]);
+    /// with none, it stands for the first identical sleep ahead in the segment
+    /// not yet had, so a drop of that one later owes it back in full.
     fn sleep(&mut self, request: &[u8]) -> Served {
         if self.pos < self.records.len() && self.holds(self.pos, doors::SLEEP, request) {
             let at = self.pos;
             return self.take(at);
         }
-        let ns = std::str::from_utf8(request)
+        let full = std::str::from_utf8(request)
             .ok()
-            .and_then(|t| t.parse::<u64>().ok())
+            .and_then(crate::parse_uint::<u64>)
             .unwrap_or(0);
+        let ns = match self.behind(self.asked(doors::SLEEP, request), self.seg_start) {
+            Some(at) if self.had.get(at) == Some(&false) => self.owed(at, full),
+            _ => {
+                if let Some(had) = self
+                    .unhad_ahead(self.asked(doors::SLEEP, request))
+                    .and_then(|at| self.had.get_mut(at))
+                {
+                    *had = true;
+                }
+                full
+            }
+        };
         self.account.slept += 1;
         self.unconsumed();
         self.pass(ns);

@@ -86,6 +86,28 @@ pub(crate) fn github_origin(url: &str, owner: &str, name: &str) -> bool {
     github_path(url).is_some_and(|path| path.eq_ignore_ascii_case(&format!("{owner}/{name}")))
 }
 
+/// Whether an ordinary Git push URL retains the exact GitHub repository. A public login
+/// inserted by configured `pushInsteadOf` is accepted only when it is the independently
+/// authenticated writer; passwords, token userinfo, another host and another path refuse.
+#[must_use]
+pub fn github_writer_origin(url: &str, owner: &str, name: &str, writer: &str) -> bool {
+    if github_origin(url, owner, name) {
+        return true;
+    }
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let Some((user, host_path)) = rest.split_once('@') else {
+        return false;
+    };
+    !writer.is_empty()
+        && writer
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        && user.eq_ignore_ascii_case(writer)
+        && github_origin(&format!("https://{host_path}"), owner, name)
+}
+
 /// The `<owner>/<name>` a github.com URL names, without `.git`.
 fn github_path(url: &str) -> Option<&str> {
     let path = url
@@ -506,9 +528,8 @@ fn oid(value: &str) -> bool {
 }
 
 fn count(sys: &dyn System, user: &User, path: &Path, args: &[&str]) -> Result<u64, String> {
-    read_ok(sys, user, path, args)?
-        .parse()
-        .map_err(|_| "git rev-list --count answered no number".to_owned())
+    crate::parse_uint(&read_ok(sys, user, path, args)?)
+        .ok_or_else(|| "git rev-list --count answered no number".to_owned())
 }
 
 /// Whether `ancestor` is an ancestor of `of` (`git merge-base --is-ancestor`).

@@ -302,8 +302,11 @@ impl CursorRainbow {
     #[cfg(any(test, debug_assertions))]
     #[inline]
     #[must_use]
-    pub fn settle_light(&self) -> Option<crate::cursor_glow::Light> {
-        self.settle_probe.map(|probe| probe.cfg.light)
+    pub const fn settle_light(&self) -> Option<crate::cursor_glow::Light> {
+        match &self.settle_probe {
+            Some(probe) => Some(probe.cfg.light),
+            None => None,
+        }
     }
 
     /// Fresh dormant rainbow-cursor animation state.
@@ -788,14 +791,13 @@ impl CursorRainbow {
             let mut layer = 0;
             while layer < HALO_LAYERS {
                 let t = layer as f32 * INV_HALO_SPAN;
-                let gx = (t * radius_x) as i32 + 1;
-                let gy = (t * radius_y) as i32 + 1;
                 let falloff = (1.0 - t) * (1.0 - t);
                 let cov = (HALO_BASE_COV * falloff * halo_energy).min(OVER_INK_COV_CAP) as u8;
                 if cov == 0 {
-                    layer += 1;
-                    continue;
+                    break;
                 }
+                let gx = (t * radius_x) as i32 + 1;
+                let gy = (t * radius_y) as i32 + 1;
                 let ring_arc = if layer == 0 {
                     rainbow
                 } else {

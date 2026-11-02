@@ -549,26 +549,15 @@ pub fn tail(path: &Path, n: usize) -> String {
     lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
-/// Each of `pids`' resident set in KiB (`ps -o pid=,rss=`), one call.
+/// Each of `pids`' resident set in KiB, as `ps -o rss=` reads it (the task's resident size,
+/// [`crate::sys::resident_size`]), read in this process with no program run, so a sampler that
+/// calls it every few milliseconds starts nothing on the machine it measures; a pid that does
+/// not read is left out.
 #[must_use]
 pub fn rss_kib(pids: &[i32]) -> std::collections::BTreeMap<i32, u64> {
-    let list: Vec<String> = pids.iter().map(i32::to_string).collect();
-    let out = aterm_uds::spawnfd::command("/bin/ps")
-        .args(["-o", "pid=,rss=", "-p", &list.join(",")])
-        .stdin(Stdio::null())
-        .output();
-    let mut map = std::collections::BTreeMap::new();
-    if let Ok(out) = out {
-        for line in String::from_utf8_lossy(&out.stdout).lines() {
-            let mut w = line.split_whitespace();
-            if let (Some(Ok(pid)), Some(Ok(rss))) =
-                (w.next().map(str::parse), w.next().map(str::parse))
-            {
-                map.insert(pid, rss);
-            }
-        }
-    }
-    map
+    pids.iter()
+        .filter_map(|&pid| crate::sys::resident_size(pid).map(|b| (pid, b / 1024)))
+        .collect()
 }
 
 /// Returns each PID's physical footprint in KiB ([`crate::sys::phys_footprint`]).

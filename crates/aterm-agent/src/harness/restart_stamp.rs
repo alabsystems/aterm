@@ -90,8 +90,14 @@ impl Stamp {
     pub fn from_json(text: &str) -> Option<Self> {
         let v: aterm_json::Value = aterm_json::from_str(text).ok()?;
         Some(Self {
-            pid: u32::try_from(v.get("pid")?.as_u64()?).ok()?,
-            start: v.get("start")?.as_str()?.to_string(),
+            pid: u32::try_from(v.get("pid")?.as_u64()?)
+                .ok()
+                .filter(|&pid| pid > 0)?,
+            start: v
+                .get("start")?
+                .as_str()
+                .filter(|s| !s.is_empty())?
+                .to_string(),
             cause: Cause::parse(v.get("cause")?.as_str()?)?,
             at: v.get("at")?.as_u64()?,
         })
@@ -186,6 +192,7 @@ pub fn prune(state: &Path, name: &str, now: u64) -> bool {
     let Some(tab) = name
         .strip_prefix(FILE_PREFIX)
         .and_then(|rest| rest.strip_suffix(".json"))
+        .filter(|tab| path(state, tab).is_some())
     else {
         return false;
     };

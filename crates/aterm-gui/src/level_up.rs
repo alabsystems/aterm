@@ -97,7 +97,7 @@ impl LevelUp {
     /// The same rim at a re-park of its attempt: its cap counts again from `now`,
     /// as a rim [`Self::charging_continued`] started there would (already charged,
     /// so nothing dips), keeping its build and motion.
-    #[cfg(any(unix, test))]
+    #[cfg(unix)]
     pub(crate) fn re_anchor(&mut self, now: Instant) {
         let continued = Self::charging_continued(self.build, now, self.motion);
         self.spawned = self.spawned.max(continued.spawned);

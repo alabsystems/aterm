@@ -14,8 +14,6 @@ mod customize;
 #[path = "native_settings_showcase_view.rs"]
 mod view;
 
-#[cfg(test)]
-pub(super) use view::SHEET_TITLE;
 #[cfg(all(test, target_os = "macos"))]
 pub(super) use view::forget_strip_names;
 pub(super) use view::{
@@ -24,6 +22,8 @@ pub(super) use view::{
     demo_font_candidate, demo_spec, footer_reach, laid_last, led_first_screen_least, list_laid,
     list_room, listed_least, row_filtered_out, row_under_caption, rows_apart, themes_page,
 };
+#[cfg(test)]
+pub(super) use view::{PANEL_INSET, SHEET_TITLE};
 #[cfg(test)]
 pub(super) use view::{list_blocks, list_heights, row_height as chooser_row_height, section_items};
 
@@ -1254,11 +1254,11 @@ pub(super) fn palette_reset(
 
 /// Spoken label for a `palette_overrides.<index>` key (`"Palette colour 4, blue"`).
 pub(super) fn palette_slot_name(key: &str) -> Option<String> {
-    let index = key
+    let index_str = key
         .strip_prefix(prefs::EDIT_PALETTE_OVERRIDES)?
-        .strip_prefix('.')?
-        .parse::<usize>()
-        .ok()?;
+        .strip_prefix('.')?;
+    (!index_str.is_empty() && index_str.bytes().all(|b| b.is_ascii_digit())).then_some(())?;
+    let index = index_str.parse::<usize>().ok()?;
     let name = SLOT_NAMES.get(index)?;
     Some(format!("Palette color {index}, {name}"))
 }
@@ -1419,9 +1419,10 @@ pub(super) fn carried_override_keys(
                 .iter()
                 .filter_map(|key| key.strip_prefix(prefix))
                 .all(|slot| {
-                    slot.trim_end_matches(']')
-                        .parse::<usize>()
-                        .is_ok_and(|index| index < 16)
+                    let s = slot.trim_end_matches(']');
+                    !s.is_empty()
+                        && s.bytes().all(|b| b.is_ascii_digit())
+                        && s.parse::<usize>().is_ok_and(|index| index < 16)
                 })
     };
     let clear_list = fully_carried("palette[");
@@ -1475,6 +1476,7 @@ pub(super) fn override_count(resolved: &crate::resolved_colors::ResolvedColors) 
                 key.strip_prefix(prefs::EDIT_PALETTE_OVERRIDES)
                     .and_then(|rest| rest.strip_prefix('.'))
             })
+            .filter(|index| !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()))
             .and_then(|index| index.parse::<usize>().ok());
         slots.extend(slot);
     }
@@ -1677,6 +1679,7 @@ impl SettingsApp {
             view.feedback = Some(feedback.to_string());
         } else if let Some(index) = action
             .strip_prefix(PALETTE_PREFIX)
+            .filter(|index| !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()))
             .and_then(|index| index.parse::<usize>().ok())
             .filter(|index| *index < 16)
         {

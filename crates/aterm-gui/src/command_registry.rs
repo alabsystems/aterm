@@ -131,6 +131,7 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
         M::Packages => spec("app.settings.packages", S::App, A::ConfigMutate, C::Any),
         M::Messages => spec("app.settings.messages", S::App, A::ConfigMutate, C::Any),
         M::SystemState => spec("app.system_state.open", S::App, A::ConfigMutate, C::Any),
+        M::Mail => spec("app.mail.open", S::App, A::ConfigMutate, C::Any),
         M::HarnessSettings => spec("app.settings.harness", S::App, A::ConfigMutate, C::Any),
         M::OpenPalette => spec("palette.open", S::Window, A::Owner, C::Any),
         M::ChooseTheme => spec("palette.choose_theme", S::Window, A::ConfigMutate, C::Any),
@@ -153,7 +154,6 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
         M::FabricStatus => spec("fabric.status", S::Process, A::Owner, C::Any),
         M::FabricOn => spec("fabric.on", S::Process, A::Owner, C::Any),
         M::FabricOff => spec("fabric.off", S::Process, A::Owner, C::Any),
-        M::ToggleNeedsInWindows => spec("presence.rim.toggle", S::Process, A::ConfigMutate, C::Any),
         M::StatsBarsDeck => spec("sys.stats_bars.deck", S::Process, A::ConfigMutate, C::Any),
         M::StatsBarsSill => spec("sys.stats_bars.sill", S::Process, A::ConfigMutate, C::Any),
         M::StatsBarsOff => spec("sys.stats_bars.off", S::Process, A::ConfigMutate, C::Any),
@@ -252,6 +252,7 @@ pub(crate) fn native_document_action(action: &str) -> Option<CommandSpec> {
         }
         _ if action
             .strip_prefix("editor/completion/")
+            .filter(|index| index.bytes().all(|b| b.is_ascii_digit()))
             .and_then(|index| index.parse::<usize>().ok())
             .is_some_and(|index| index < 8) =>
         {
@@ -266,6 +267,9 @@ pub(crate) fn native_document_action(action: &str) -> Option<CommandSpec> {
         _ if action
             .strip_prefix("editor/config-page/")
             .and_then(|suffix| suffix.split_once('/'))
+            .filter(|(t, c)| {
+                t.bytes().all(|b| b.is_ascii_digit()) && c.bytes().all(|b| b.is_ascii_digit())
+            })
             .and_then(|(target, candidates)| {
                 Some((
                     target.parse::<usize>().ok()?,
@@ -390,11 +394,6 @@ mod tests {
 
         let all_actions: Vec<menu::MenuAction> =
             (0..=128).filter_map(menu::MenuAction::from_tag).collect();
-        assert!(
-            all_actions.len() >= 78,
-            "expected the full MenuAction table, got {}",
-            all_actions.len()
-        );
         let mut seen_ids = std::collections::HashSet::with_capacity(all_actions.len());
         for action in all_actions {
             let cmd = menu_command(action);

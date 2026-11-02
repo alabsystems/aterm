@@ -224,7 +224,7 @@ mod imp {
         }
 
         pub(super) fn wait(&self, timeout: Option<Duration>) -> io::Result<Vec<WatchId>> {
-            let deadline = timeout.map(|t| Instant::now() + t);
+            let deadline = timeout.and_then(|t| Instant::now().checked_add(t));
             // SAFETY: kevent initializes the slots it reports before they are read.
             let mut events: [libc::kevent; BATCH] = unsafe { std::mem::zeroed() };
             let got = loop {
@@ -416,7 +416,7 @@ mod imp {
         }
 
         pub(super) fn wait(&self, timeout: Option<Duration>) -> io::Result<Vec<WatchId>> {
-            let deadline = timeout.map(|t| Instant::now() + t);
+            let deadline = timeout.and_then(|t| Instant::now().checked_add(t));
             let mut fds = [
                 libc::pollfd {
                     fd: self.inotify.as_raw_fd(),
@@ -494,10 +494,14 @@ mod imp {
                     }
                     if mask & IN_IGNORED != 0 {
                         // The kernel took the watch off (its object went):
-                        // its ids stay known, so their removal is quiet, and
-                        // are gone, though a later watch may get this
+                        // its ids are removed from `of_id` so an overflow does
+                        // not emit them again, and stay in `gone` until
+                        // removed, though a later watch may get this
                         // descriptor's number.
                         if let Some(of_wd) = wds.ids.remove(&wd) {
+                            for id in &of_wd {
+                                wds.of_id.remove(id);
+                            }
                             wds.gone.extend(of_wd);
                         }
                     }
@@ -711,6 +715,8 @@ mod tests {
             .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
             .expect("the woken wait returns");
         assert!(woke.is_empty());
+        watcher.wake().unwrap();
+        assert!(watcher.wait(Some(Duration::MAX)).unwrap().is_empty());
     }
 
     #[test]

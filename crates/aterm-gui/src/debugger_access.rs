@@ -81,15 +81,21 @@ impl ChangeMarker {
 
     /// Strict: exactly the shape [`Self::encode`] writes, or nothing.
     pub(crate) fn parse(text: &str) -> Option<Self> {
+        let uint = |s: &str| {
+            s.bytes()
+                .all(|b| b.is_ascii_digit())
+                .then(|| s.parse::<u64>().ok())
+                .flatten()
+        };
         let mut words = text.split_whitespace();
         let change = DebuggerChange::from_token(words.next()?)?;
-        let pid = words.next()?.parse::<u32>().ok()?;
+        let pid = u32::try_from(uint(words.next()?)?).ok()?;
         let (seconds, microseconds) = words.next()?.split_once('.')?;
         let birth = ProcessBirth {
-            seconds: seconds.parse().ok()?,
-            microseconds: microseconds.parse().ok()?,
+            seconds: uint(seconds)?,
+            microseconds: uint(microseconds)?,
         };
-        let since = words.next()?.parse().ok()?;
+        let since = uint(words.next()?)?;
         if words.next().is_some() || pid == 0 {
             return None;
         }
@@ -157,7 +163,11 @@ impl ObservedMarker {
             "disabled" => DebuggerMode::Disabled,
             _ => return None,
         };
-        let since = words.next()?.parse().ok()?;
+        let since = words
+            .next()
+            .filter(|s| s.bytes().all(|b| b.is_ascii_digit()))?
+            .parse()
+            .ok()?;
         let origin = Origin::from_token(words.next()?)?;
         if words.next().is_some() {
             return None;
@@ -2029,6 +2039,10 @@ pub(crate) struct DebuggerStepFacts {
     pub(crate) dialog_up: bool,
     /// System Settings asks something of the person ([`StepMoment::settings_asks`]).
     pub(crate) settings_asks: bool,
+    /// A key was typed into aterm, or an aterm window took the keyboard back, within
+    /// `devtools_helper::QUIET_FOR` (`App::debugger_step_keys_typed`): the steps' key rest has
+    /// not come, so a key the person is typing could land in macOS's password field.
+    pub(crate) keys_typed: bool,
     /// The owner declined a Security gesture recently (`OwnerQuiet`).
     pub(crate) owner_quiet: bool,
 }
@@ -2130,6 +2144,7 @@ pub(crate) enum StepWait {
     DialogUp,
     SettingsAsks,
     NotFrontmost,
+    KeysTyped,
     OwnerQuiet,
     ProbeStale,
     ProbeUnread,
@@ -2154,6 +2169,7 @@ impl StepWait {
             Self::DialogUp => "dialog_up",
             Self::SettingsAsks => "settings_asks",
             Self::NotFrontmost => "not_frontmost",
+            Self::KeysTyped => "keys_typed",
             Self::OwnerQuiet => "owner_quiet",
             Self::ProbeStale => "probe_stale",
             Self::ProbeUnread => "probe_unread",
@@ -2171,6 +2187,7 @@ impl StepWait {
             | Self::Announced
             | Self::Recording
             | Self::NotFrontmost
+            | Self::KeysTyped
             | Self::DialogUp
             | Self::SettingsAsks => crate::devtools_helper::PANEL_TICK,
             _ => crate::devtools_helper::RECHECK_EVERY,
@@ -2291,6 +2308,7 @@ pub(crate) fn admit_debugger_step(facts: &DebuggerStepFacts) -> StepVerdict {
         (facts.dialog_up, StepWait::DialogUp),
         (facts.settings_asks, StepWait::SettingsAsks),
         (!facts.frontmost, StepWait::NotFrontmost),
+        (facts.keys_typed, StepWait::KeysTyped),
         (facts.owner_quiet, StepWait::OwnerQuiet),
         (!facts.probe_fresh, StepWait::ProbeStale),
     ];
@@ -4591,6 +4609,7 @@ mod tests {
             local_network_pending: false,
             dialog_up: false,
             settings_asks: false,
+            keys_typed: false,
             owner_quiet: false,
         }
     }
@@ -4767,6 +4786,11 @@ mod tests {
                 Wait(StepWait::NotFrontmost),
             ),
             (
+                "keys typed within the key rest",
+                |f| f.keys_typed = true,
+                Wait(StepWait::KeysTyped),
+            ),
+            (
                 "owner quiet",
                 |f| f.owner_quiet = true,
                 Wait(StepWait::OwnerQuiet),
@@ -4817,6 +4841,7 @@ mod tests {
             Wait(StepWait::DialogUp),
             Wait(StepWait::SettingsAsks),
             Wait(StepWait::NotFrontmost),
+            Wait(StepWait::KeysTyped),
             Wait(StepWait::OwnerQuiet),
             Wait(StepWait::ProbeStale),
             Settle(StepSettle::Underway),

@@ -154,8 +154,11 @@ pub fn skim(tape: &Tape) -> String {
                         door,
                         request,
                         reply,
-                    } => match (codec::ctl_args(request), reply_of(reply)) {
-                        (Ok(words), Ok(r)) if door == doors::CTL || door == doors::TELLER => {
+                    } => match (
+                        super::ctl::reported_args(door, request),
+                        super::ctl::control_reply(door, reply),
+                    ) {
+                        (Ok(words), Ok(Some(r))) if super::ctl::is_control_door(door) => {
                             format!(
                                 "{} {} → {}",
                                 shown(door),
@@ -259,14 +262,18 @@ pub fn decisions(tape: &Tape) -> Vec<Decision> {
                 door,
                 request,
                 reply,
-            }) if door == doors::CTL => {
-                let words = codec::ctl_args(request).ok()?;
-                let refs: Vec<&str> = words.iter().map(String::as_str).collect();
-                super::ctl::is_act(&refs).then(|| {
-                    let reply = reply_of(reply)
-                        .map_or_else(|e| format!("unreadable: {e}"), |r| reply_brief(&r));
-                    (words, reply)
-                })
+            }) if door == doors::CTL || door == doors::CTL_DUTY => {
+                let argv = super::ctl::argv(door, request).ok()?;
+                let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+                if !super::ctl::is_act(&refs) {
+                    return None;
+                }
+                let words = super::ctl::reported_args(door, request).ok()?;
+                let reply = super::ctl::control_reply(door, reply).map_or_else(
+                    |e| format!("unreadable: {e}"),
+                    |r| r.map_or_else(|| "adapter unavailable".to_string(), |r| reply_brief(&r)),
+                );
+                Some((words, reply))
             }
             _ => None,
         });
@@ -354,6 +361,258 @@ pub fn render_decisions(decisions: &[Decision]) -> String {
             d.reply.as_deref().unwrap_or("-"),
             shown(d.journal.as_deref().unwrap_or("-")),
         ));
+    }
+    out
+}
+
+/// One text a turn-end decision wrote into the session, timed off the tape ([`typed`]): aterm's
+/// act, apart from how long its program took to show it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Typed {
+    /// The rule that decided it (`land@v1`, …).
+    pub rule: Option<String>,
+    /// The judged screen's sequence.
+    pub seq: u64,
+    /// The last wall clock (unix ms) the loop read before its decision: when it decided.
+    pub decided_ms: Option<i64>,
+    /// When the write went in (unix ms, the `send` or `turn` exchange's stamp): aterm's act.
+    pub sent_ms: i64,
+    /// The first screen read after the write that shows the text, more often than the read
+    /// before the write did: the program's draw, as aterm first saw it. `None`: no read showed it.
+    pub drawn_ms: Option<i64>,
+    /// How long the program demonstrably held the text, where a read showed it drawn: the write
+    /// to the last read that did not show it, and the time aterm then spent in `await seq` waits
+    /// (which wake at any move of the screen) until the read that did. Never the time aterm spent
+    /// on anything else, so a late look by aterm stays aterm's ([`Self::aterm_ms`]).
+    pub held_ms: Option<i64>,
+    /// The last read after the write that did not show it (unix ms), where no read did.
+    pub unshown_ms: Option<i64>,
+    /// The `status` read between the write and that draw that found the input unread longest.
+    pub unread: Option<Unread>,
+    /// Whether the first `await seq` past the write saw the screen move (`true`) or ran out
+    /// (`false`), where one followed it: the loop journals its held-text `NOTE` on the second.
+    pub reaction: Option<bool>,
+    /// When the write's Enter went in: the first `key … enter` the host took after it, under a
+    /// decision of the same rule (the write's own, or a later one sending the line it left), before
+    /// the next write.
+    pub enter_ms: Option<i64>,
+}
+
+impl Typed {
+    /// ATERM'S OWN SHARE OF THE ACT from `point` (unix ms) to the Enter: all of it but the
+    /// program's demonstrable hold ([`Self::held_ms`]). `None` where no Enter was taken.
+    #[must_use]
+    pub fn aterm_ms(&self, point: i64) -> Option<i64> {
+        self.enter_ms
+            .map(|enter| enter - point - self.held_ms.unwrap_or(0))
+    }
+}
+
+/// A `status` read that found the session's input unread ([`Typed::unread`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Unread {
+    /// When it was read (unix ms).
+    pub at_ms: i64,
+    /// `input=`: `pending` or `typeahead`.
+    pub word: String,
+    /// `input_bytes=`: the bytes the program had not read.
+    pub bytes: Option<u64>,
+    /// `input_wait_ms=`: how long the oldest of them had waited.
+    pub wait_ms: Option<u64>,
+}
+
+impl Unread {
+    /// `input=<w> input_bytes=<n> input_wait_ms=<ms>`, as `status` says it.
+    #[must_use]
+    pub fn said(&self) -> String {
+        let n = |v: Option<u64>| v.map_or_else(|| "-".to_string(), |v| v.to_string());
+        format!(
+            "input={} input_bytes={} input_wait_ms={}",
+            self.word,
+            n(self.bytes),
+            n(self.wait_ms)
+        )
+    }
+
+    /// The unread input a `status` reply names, if any.
+    #[must_use]
+    pub fn of_status(stdout: &str, at_ms: i64) -> Option<Self> {
+        let field = |key: &str| {
+            stdout
+                .split_whitespace()
+                .find_map(|w| w.strip_prefix(key)?.strip_prefix('='))
+        };
+        let word = field("input").filter(|w| matches!(*w, "pending" | "typeahead"))?;
+        let num = |key: &str| field(key).and_then(|v| v.parse().ok());
+        Some(Self {
+            at_ms,
+            word: word.to_string(),
+            bytes: num("input_bytes"),
+            wait_ms: num("input_wait_ms"),
+        })
+    }
+}
+
+/// How many squashed characters of a written text a read must show to show it ([`typed`]).
+const DRAWN_HEAD: usize = 48;
+
+/// What [`typed`] follows of the last write while it is the one the exchanges after it belong to.
+struct Following {
+    /// The text's head, squashed ([`DRAWN_HEAD`]).
+    head: String,
+    /// How often the read before the write showed that head.
+    before: usize,
+    /// When the last read since the write that did not show it came (the write's own stamp first).
+    unshown_ms: i64,
+    /// The time spent in `await seq` waits since that read.
+    watched_ms: i64,
+}
+
+/// How often `rows` show `head` (squashed), the rows run together as a wrapped line reads.
+fn shows(rows: &[String], head: &str) -> usize {
+    if head.is_empty() {
+        return 0;
+    }
+    crate::supervise::policy::approval::squashed(&rows.concat())
+        .matches(head)
+        .count()
+}
+
+/// THE TEXTS THE LOOP WROTE, TIMED: each turn-end decision followed by a `send` (or `turn`) the
+/// host took, with the decision's clock, the write's stamp, the program's draw as the screen reads
+/// after it show it, how long the program held it, the longest unread-input read between, and
+/// the Enter. Every wall time is the tape's own: an exchange's stamp (taken as its reply came),
+/// else the last clock read before it; an exchange began at the item before it.
+#[must_use]
+pub fn typed(tape: &Tape) -> Vec<Typed> {
+    let mut out: Vec<Typed> = Vec::new();
+    let mut clock: Option<i64> = None;
+    // The turn-end decision whose write is still to come: its rule, its seq and its clock.
+    let mut open: Option<(Option<String>, u64, Option<i64>)> = None;
+    // The rule of the last decision of any kind (`None` where it was no turn end's).
+    let mut deciding: Option<String> = None;
+    // The last write, while the reads after it are its.
+    let mut follow: Option<Following> = None;
+    let mut last_rows: Vec<String> = Vec::new();
+    for item in &tape.items {
+        let began = clock;
+        if let Item::Effect { stamp: Some(s), .. } = item {
+            clock = Some(s.wall_ms);
+        }
+        match item.record() {
+            Some(EffectRecord::Clock(ns)) => clock = i64::try_from(ns / 1_000_000).ok(),
+            Some(EffectRecord::Emit { door, bytes }) if door.starts_with("decide.") => {
+                let mark = (door == doors::DECIDE_TURN_END)
+                    .then(|| std::str::from_utf8(bytes).ok().and_then(DecideMark::decode))
+                    .flatten();
+                deciding = mark.as_ref().and_then(|m| m.rule.clone());
+                open = mark.map(|mark| (mark.rule, mark.seq, clock));
+            }
+            Some(EffectRecord::Exchange {
+                door,
+                request,
+                reply,
+            }) if door == doors::CTL || door == doors::CTL_DUTY => {
+                let Ok(argv) = super::ctl::argv(door, request) else {
+                    continue;
+                };
+                let words: Vec<&str> = argv
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|w| !w.starts_with('@'))
+                    .collect();
+                let Ok(Some(Ok(r))) = super::ctl::control_reply(door, reply) else {
+                    continue;
+                };
+                let at = clock.unwrap_or(0);
+                let took = r.ok() && r.stdout.trim_start().starts_with("OK") && !r.skipped();
+                if matches!(words.first(), Some(&("send" | "turn"))) {
+                    // A write the host turned away wrote nothing: the decision is spent, and the
+                    // last write's reads go on.
+                    let decision = open.take();
+                    if !took {
+                        continue;
+                    }
+                    follow = None;
+                    if let Some((rule, seq, decided)) = decision {
+                        let text = words
+                            .iter()
+                            .position(|w| *w == "--")
+                            .map(|i| words[i + 1..].join(" "))
+                            .unwrap_or_default();
+                        let head: String = crate::supervise::policy::approval::squashed(&text)
+                            .chars()
+                            .take(DRAWN_HEAD)
+                            .collect();
+                        follow = Some(Following {
+                            before: shows(&last_rows, &head),
+                            head,
+                            unshown_ms: at,
+                            watched_ms: 0,
+                        });
+                        out.push(Typed {
+                            rule,
+                            seq,
+                            decided_ms: decided,
+                            sent_ms: at,
+                            ..Typed::default()
+                        });
+                    }
+                    continue;
+                }
+                if words.first() == Some(&"text")
+                    && let Some(rows) = crate::supervise::screen::parse_text_json(&r.stdout)
+                        .ok()
+                        .map(|s| s.rows)
+                {
+                    if let (Some(f), Some(last)) = (follow.as_mut(), out.last_mut())
+                        && last.drawn_ms.is_none()
+                    {
+                        if shows(&rows, &f.head) > f.before {
+                            last.drawn_ms = Some(at);
+                            last.held_ms = Some(f.unshown_ms - last.sent_ms + f.watched_ms);
+                            last.unshown_ms = None;
+                        } else {
+                            f.unshown_ms = at;
+                            f.watched_ms = 0;
+                            last.unshown_ms = Some(at);
+                        }
+                    }
+                    last_rows = rows;
+                    continue;
+                }
+                let (Some(f), Some(last)) = (follow.as_mut(), out.last_mut()) else {
+                    continue;
+                };
+                match words.as_slice() {
+                    ["await", "seq", ..] => {
+                        if last.reaction.is_none() {
+                            last.reaction = Some(r.stdout.trim_start().starts_with("OK seq"));
+                        }
+                        if last.drawn_ms.is_none() {
+                            f.watched_ms += at - began.unwrap_or(at);
+                        }
+                    }
+                    ["status", ..] if last.drawn_ms.is_none() => {
+                        if let Some(u) = Unread::of_status(&r.stdout, at)
+                            && last
+                                .unread
+                                .as_ref()
+                                .is_none_or(|was| u.wait_ms >= was.wait_ms)
+                        {
+                            last.unread = Some(u);
+                        }
+                    }
+                    ["key", .., "enter"]
+                        if took && last.enter_ms.is_none() && deciding == last.rule =>
+                    {
+                        last.enter_ms = Some(at);
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
     }
     out
 }

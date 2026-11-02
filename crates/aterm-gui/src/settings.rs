@@ -60,7 +60,7 @@ fn enum_alias(key: &str, token: &str) -> Option<&'static str> {
         (prefs::EDIT_PREDICTIVE_ECHO, "auto" | "on" | "true") => "adaptive",
         (prefs::EDIT_PREDICTIVE_ECHO, "force") => "always",
         (prefs::EDIT_TEXT_BLENDING, "linear_corrected") => "linear-corrected",
-        (prefs::EDIT_MOTION, "reduce") => "reduced",
+        (prefs::EDIT_MOTION, "reduce" | "none" | "off") => "reduced",
         (prefs::EDIT_WINDOW_COLORSPACE, "displayp3" | "p3") => "display-p3",
         (prefs::EDIT_BACKGROUND_MATERIAL, "underwindow" | "under_window") => "under-window",
         (prefs::EDIT_BACKGROUND_MATERIAL, "") => "none",
@@ -338,13 +338,23 @@ pub(crate) fn parse_rainbow_kitty_village_spec(spec: &str) -> (u64, bool, usize,
     let mut states = Vec::new();
     for part in spec.split(';') {
         if let Some(val) = part.strip_prefix("phase=") {
-            phase_ms = val.parse::<u64>().unwrap_or(0);
+            if val.bytes().all(|b| b.is_ascii_digit()) {
+                phase_ms = val.parse::<u64>().unwrap_or(0);
+            }
         } else if let Some(val) = part.strip_prefix("busy=") {
             busy = val == "1";
         } else if let Some(val) = part.strip_prefix("done=") {
-            done = val.parse::<usize>().ok();
+            done = val
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+                .then(|| val.parse::<usize>().ok())
+                .flatten();
         } else if let Some(val) = part.strip_prefix("total=") {
-            total = val.parse::<usize>().ok();
+            total = val
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+                .then(|| val.parse::<usize>().ok())
+                .flatten();
         } else if let Some(val) = part.strip_prefix("states=") {
             states.extend(val.chars());
         }
@@ -1055,6 +1065,8 @@ mod tests {
                 "linear-corrected",
             ),
             (crate::prefs::EDIT_MOTION, "reduce", "reduced"),
+            (crate::prefs::EDIT_MOTION, "none", "reduced"),
+            (crate::prefs::EDIT_MOTION, "off", "reduced"),
             (
                 crate::prefs::EDIT_WINDOW_COLORSPACE,
                 "displayp3",
@@ -1205,5 +1217,79 @@ mod tests {
         for phase in [1, 500, 86_399_999, 86_400_000, 604_800_000, u64::MAX] {
             assert_eq!(arch(phase), baseline, "phase_ms={phase}");
         }
+    }
+
+    #[test]
+    fn rainbow_kitty_village_builds_and_synergies_stay_stable_when_state_is_stable_while_kitties_roam()
+     {
+        let sky = [0x18, 0x16, 0x22];
+        let rim = [0x38, 0x34, 0x4C];
+        let arch_for = |states: &str, phase_ms: u64| -> Vec<crate::widget::DrawPrim> {
+            let spec = format!(
+                "phase={phase_ms};busy=0;done={};total={};states={states}",
+                states.chars().filter(|&c| c == 'G').count(),
+                states.len()
+            );
+            let (p, b, done, total, parsed) =
+                crate::settings::parse_rainbow_kitty_village_spec(&spec);
+            let mut prims = Vec::new();
+            crate::settings::paint_rainbow_kitty_village_architecture(
+                &mut prims, 0.0, 0.0, 640.0, 48.0, sky, rim, p, b, done, total, &parsed,
+            );
+            prims
+        };
+        let kitties_for = |phase_ms: u64| -> Vec<crate::widget::DrawPrim> {
+            let mut prims = Vec::new();
+            crate::settings::paint_rainbow_kitty_village_kitties(
+                &mut prims, 0.0, 640.0, 40.0, phase_ms, false,
+            );
+            prims
+        };
+
+        // The village fills in as stations converge D → G, with neighbour synergies.
+        let pending = arch_for("DDDDDDDDDDDD", 0);
+        let one_done = arch_for("GDDDDDDDDDDD", 0);
+        let pair_synergy = arch_for("GGDDDDDDDDDD", 0);
+        let district_synergy = arch_for("GGGDDDDDDDDD", 0);
+        let all_verified = arch_for("GGGGGGGGGGGG", 0);
+        assert!(
+            pending.len() < one_done.len()
+                && one_done.len() < pair_synergy.len()
+                && pair_synergy.len() < district_synergy.len()
+                && district_synergy.len() < all_verified.len(),
+            "{} < {} < {} < {} < {}",
+            pending.len(),
+            one_done.len(),
+            pair_synergy.len(),
+            district_synergy.len(),
+            all_verified.len(),
+        );
+
+        // With no station working, the buildings never move with the phase.
+        for stable_states in [
+            "GGGGGGGGGGGG",
+            "GDG_GGGGGGGG",
+            "DDDDDDDDDDDD",
+            "GGGGGGGGGGGGGGGGGG",
+        ] {
+            let base = format!("{:?}", arch_for(stable_states, 0));
+            for phase in [120, 480, 1440, 5200] {
+                assert_eq!(
+                    base,
+                    format!("{:?}", arch_for(stable_states, phase)),
+                    "{stable_states} at phase={phase}"
+                );
+            }
+        }
+
+        // The kitties roam all the same.
+        assert_ne!(
+            format!("{:?}", kitties_for(0)),
+            format!("{:?}", kitties_for(360))
+        );
+        assert_ne!(
+            format!("{:?}", kitties_for(360)),
+            format!("{:?}", kitties_for(1200))
+        );
     }
 }

@@ -187,7 +187,11 @@ pub(crate) fn serve_await_edit(
         Ok(posted) => posted,
         Err(error) => return format!("ERR {error}\n"),
     };
-    let waited = park_for_answer(&answer, Instant::now() + timeout, hung_up, park);
+    let now = Instant::now();
+    let deadline = now
+        .checked_add(timeout)
+        .unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 3600));
+    let waited = park_for_answer(&answer, deadline, hung_up, park);
     post.tell(Wake::EditAwaitWithdraw { waiter });
     match waited {
         Waited::Answer(line) => line,

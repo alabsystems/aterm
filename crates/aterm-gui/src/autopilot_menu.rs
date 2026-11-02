@@ -35,43 +35,18 @@ pub(crate) enum MenuAct {
     Fact(Fact, FactAct),
 }
 
-/// Owner of the open card (Autopilot chip, a program's own cell, or composer-rule fact).
+/// Owner of the open card (Autopilot chip or composer-rule fact).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MenuOwner {
     Autopilot,
-    /// The Autopilot menu a program asked for at a cell of its own screen
-    /// (`@<sid> open autopilot-menu at=`), with what it opened over.
-    Program(ProgramAnchor),
     Fact(Fact),
 }
 
-/// What a program's Autopilot menu opened over, all of which it stands on: the frame cells of
-/// the session's pane, the session's foreground group, and which of its screens (main or
-/// alternate) shows. A program that exits or is replaced changes the group or the screen.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ProgramAnchor {
-    pane: MenuRect,
-    pgid: i32,
-    alternate: bool,
-}
-
-/// The Autopilot menu a program asks for at a cell of its own screen
-/// (`@<sid> open autopilot-menu at=<row>,<col> [by=pointer|keys]`), as the wire reads it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ProgramMenu {
-    /// The session the request is aimed at.
-    pub(crate) session: u64,
-    /// The 0-based `(row, col)` of the session's own screen.
-    pub(crate) cell: (usize, usize),
-    /// `by=keys`: the first choice lit, as a keyboard open lights it.
-    pub(crate) keyboard: bool,
-}
-
 impl MenuOwner {
-    /// Whether the card is the Autopilot menu, the chip's or a program's.
+    /// Whether the card is the Autopilot chip's menu.
     #[must_use]
     pub(crate) const fn is_autopilot(self) -> bool {
-        matches!(self, Self::Autopilot | Self::Program(_))
+        matches!(self, Self::Autopilot)
     }
 }
 
@@ -96,10 +71,11 @@ pub(crate) enum MenuRow {
     Header(String),
     Name(String),
     /// A line of words the card states (`◆  Opus 5.5`), and those words as
-    /// a screen reader is told them, part of the card's name.
+    /// a screen reader is told them, part of the card's name, in `tone`'s ink.
     Note {
         text: String,
         spoken: String,
+        tone: NoteTone,
     },
     /// Provenance note (`set 14:05 …`), with `floor` width preserved across rebuilds.
     SetBy {
@@ -109,7 +85,11 @@ pub(crate) enum MenuRow {
     Rule,
     /// Blank placeholder preserving row positions after a choice disappears.
     Gap(usize),
-    Plot(Box<[PlotCell]>),
+    /// A drawn row (a chart, a bar, a strip) with the caption a screen reader is told for it.
+    Plot {
+        cells: Box<[PlotCell]>,
+        spoken: String,
+    },
     Item {
         glyph: &'static str,
         label: String,
@@ -126,7 +106,11 @@ impl MenuRow {
     pub(crate) fn note(text: impl Into<String>) -> Self {
         let text = text.into();
         let spoken = spoken_words(&text);
-        Self::Note { text, spoken }
+        Self::Note {
+            text,
+            spoken,
+            tone: NoteTone::Label,
+        }
     }
 
     /// A note of `text` a screen reader is told as `spoken`.
@@ -134,6 +118,16 @@ impl MenuRow {
     pub(crate) fn note_spoken(text: impl Into<String>, spoken: impl Into<String>) -> Self {
         Self::Note {
             text: text.into(),
+            spoken: spoken.into(),
+            tone: NoteTone::Label,
+        }
+    }
+
+    /// A drawn row of `cells` a screen reader is told as `spoken`.
+    #[must_use]
+    pub(crate) fn plot(cells: impl Into<Box<[PlotCell]>>, spoken: impl Into<String>) -> Self {
+        Self::Plot {
+            cells: cells.into(),
             spoken: spoken.into(),
         }
     }
@@ -149,7 +143,7 @@ impl MenuRow {
             Self::Header(text) | Self::Note { text, .. } | Self::SetBy { text, .. } => text.clone(),
             Self::Name(name) => quoted(name),
             Self::Rule | Self::Gap(_) => String::new(),
-            Self::Plot(cells) => cells.iter().map(|cell| cell.ch).collect(),
+            Self::Plot { cells, .. } => cells.iter().map(|cell| cell.ch).collect(),
             Self::Item { glyph, label, .. } => {
                 let pad = GLYPH_CELLS.saturating_sub(display_cells(glyph));
                 format!("{glyph}{}{label}", " ".repeat(pad))
@@ -198,6 +192,27 @@ pub(crate) enum PlotInk {
     In,
     Out,
     Axis,
+    /// A bar's used and projected cells (`━ ╍ ┽`) and a carrier's run: the accent floored to
+    /// 4.5:1 on the card.
+    Meter,
+    /// A bar's room left (`─ ┄`): the rule's ink floored to 3:1 on the card.
+    Track,
+    /// A stop (`╳`): the warn ink floored to 4.5:1 on the card.
+    Warn,
+    /// A label's text or a figure: the card's value ink.
+    Value,
+}
+
+/// The ink a [`MenuRow::Note`]'s words take.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) enum NoteTone {
+    /// The card's label ink, as every note before the outlook.
+    #[default]
+    Label,
+    /// The value ink (the outlook's verdict).
+    Value,
+    /// The warn ink floored to 4.5:1 on the card (a projected stop, its `⧗` leading).
+    Warn,
 }
 
 fn quoted(name: &str) -> String {
@@ -424,7 +439,7 @@ fn same_choice(a: &MenuRow, b: &MenuRow) -> bool {
 fn row_width(row: &MenuRow) -> usize {
     match row {
         MenuRow::Gap(cells) => *cells,
-        MenuRow::Plot(cells) => cells.len(),
+        MenuRow::Plot { cells, .. } => cells.len(),
         MenuRow::Item { .. } => display_cells(&row.text()) + CHECK_CELLS,
         MenuRow::SetBy { floor, .. } => display_cells(&row.text()).max(*floor),
         _ => display_cells(&row.text()),
@@ -440,7 +455,7 @@ fn content_width(rows: &[MenuRow]) -> usize {
 }
 
 fn max_content(rows: &[MenuRow]) -> usize {
-    if rows.iter().any(|row| matches!(row, MenuRow::Plot(_))) {
+    if rows.iter().any(|row| matches!(row, MenuRow::Plot { .. })) {
         TRAFFIC_MAX_CONTENT
     } else {
         MAX_CONTENT
@@ -484,7 +499,7 @@ fn same_place(shown: &MenuRow, fresh: &MenuRow) -> bool {
         (MenuRow::Header(_), MenuRow::Header(_))
         | (MenuRow::Name(_), MenuRow::Name(_))
         | (MenuRow::Note { .. }, MenuRow::Note { .. })
-        | (MenuRow::Plot(_), MenuRow::Plot(_))
+        | (MenuRow::Plot { .. }, MenuRow::Plot { .. })
         | (MenuRow::SetBy { .. }, MenuRow::SetBy { .. })
         | (MenuRow::Rule, MenuRow::Rule) => true,
         (MenuRow::Item { act: a, .. }, MenuRow::Item { act: b, .. }) => a == b,
@@ -660,7 +675,7 @@ pub(crate) fn paint(
             out.push(edge('\u{251C}', '\u{2500}', '\u{2524}'));
             continue;
         }
-        if let MenuRow::Plot(plot) = row {
+        if let MenuRow::Plot { cells: plot, .. } = row {
             out.push(paint_plot(w, (text_start, text_end), plot, &c));
             continue;
         }
@@ -668,6 +683,17 @@ pub(crate) fn paint(
         let bg = if selected { c.sel_bg } else { c.card_bg };
         let (fg, bold) = match row {
             MenuRow::Header(_) | MenuRow::Name(_) => (c.band.value, true),
+            MenuRow::Note {
+                tone: NoteTone::Value,
+                ..
+            } => (c.band.value, false),
+            MenuRow::Note {
+                tone: NoteTone::Warn,
+                ..
+            } => (
+                crate::claude_footer::legible_on(c.band.warn, c.card_bg),
+                false,
+            ),
             MenuRow::Note { .. } | MenuRow::SetBy { .. } | MenuRow::Item { enabled: false, .. } => {
                 (c.disabled, false)
             }
@@ -721,8 +747,11 @@ fn paint_plot(
     {
         let fg = match p.ink {
             PlotInk::In => c.band.accent,
-            PlotInk::Out => c.band.value,
+            PlotInk::Out | PlotInk::Value => c.band.value,
             PlotInk::Axis => c.band.label,
+            PlotInk::Meter => crate::claude_footer::legible_on(c.band.accent, c.card_bg),
+            PlotInk::Track => crate::claude_footer::visible_on(c.rule, c.card_bg),
+            PlotInk::Warn => crate::claude_footer::legible_on(c.band.warn, c.card_bg),
         };
         let bg = if p.busy { busy_bg } else { c.card_bg };
         *slot = cell(p.ch, fg, bg, false, false);
@@ -847,7 +876,7 @@ impl AutopilotMenu {
     #[must_use]
     pub(crate) fn controls_lines(&self, sid: &str) -> Vec<String> {
         let (target, fact) = match self.owner {
-            MenuOwner::Autopilot | MenuOwner::Program(_) => ("autopilot-menu", String::new()),
+            MenuOwner::Autopilot => ("autopilot-menu", String::new()),
             MenuOwner::Fact(fact) => ("fact-menu", format!(" fact={}", fact.key())),
         };
         let mut out = vec![format!(
@@ -880,7 +909,7 @@ impl AutopilotMenu {
                 MenuRow::Name(_) => {
                     out.push(format!("{target} label index={i} text={:?}", row.text()));
                 }
-                MenuRow::Plot(_) => {
+                MenuRow::Plot { .. } => {
                     out.push(format!("{target} plot index={i} text={:?}", row.text()));
                 }
             }
@@ -918,11 +947,11 @@ impl std::hash::Hash for MenuRow {
         match self {
             Self::Header(t) => (0u8, t).hash(h),
             Self::Name(t) => (5u8, t).hash(h),
-            Self::Note { text, .. } => (1u8, text).hash(h),
+            Self::Note { text, tone, .. } => (1u8, text, tone).hash(h),
             Self::Rule => 2u8.hash(h),
             Self::Gap(cells) => (4u8, cells).hash(h),
             Self::SetBy { text, floor } => (6u8, text, floor).hash(h),
-            Self::Plot(cells) => (7u8, cells).hash(h),
+            Self::Plot { cells, spoken } => (7u8, cells, spoken).hash(h),
             Self::Item {
                 label,
                 act,
@@ -1131,6 +1160,12 @@ impl App {
         let Some(menu) = self.autopilot_menu.take() else {
             return false;
         };
+        if matches!(
+            menu.owner,
+            MenuOwner::Fact(crate::claude_lights::Fact::Account)
+        ) {
+            crate::accounts_outlook::card_open(None);
+        }
         self.account_menu_read.close();
         self.request_menu_frame(menu.wid);
         true
@@ -1222,85 +1257,6 @@ impl App {
         Ok(())
     }
 
-    /// Open `request.session`'s Autopilot menu at `request.cell`, a 0-based cell of its own
-    /// screen, for the program drawing there (`@<sid> open autopilot-menu at=<row>,<col>`),
-    /// which shows no Autopilot chip of aterm's: only where the session is the front window's
-    /// focused one, as every reader and key of the card is the front window's, and on its live
-    /// screen, the cell clamped into its pane. The card stands while the session keeps what it
-    /// opened over ([`ProgramAnchor`]); it types nothing into the session, and its rows are the
-    /// chip's.
-    pub(crate) fn open_program_autopilot_menu(
-        &mut self,
-        request: ProgramMenu,
-    ) -> Result<(), String> {
-        let ProgramMenu {
-            session,
-            cell: (row, col),
-            keyboard,
-        } = request;
-        let wid = self
-            .frontmost_window
-            .filter(|&wid| self.focused_session_id(wid) == Some(session))
-            .ok_or_else(|| "the session is not focused in the front window".to_string())?;
-        if !self.shows_live_screen(session) {
-            return Err("the session's pane is scrolled back or rewound".to_string());
-        }
-        let stands_on = self
-            .program_anchor(wid, session)
-            .ok_or_else(|| "the session's pane shows no cells".to_string())?;
-        let pane = stands_on.pane;
-        let anchor = (
-            pane.row + row.min(pane.h - 1),
-            pane.col + col.min(pane.w - 1),
-        );
-        self.open_autopilot_menu_as(
-            MenuOwner::Program(stands_on),
-            wid,
-            session,
-            anchor,
-            keyboard,
-        );
-        Ok(())
-    }
-
-    /// What a program's menu over `session` in `wid` stands on now ([`ProgramAnchor`]), or
-    /// `None` where no pane of `wid` shows frame cells of it.
-    fn program_anchor(&self, wid: WindowId, session: u64) -> Option<ProgramAnchor> {
-        self.visible_session_rect(wid, session)?;
-        let (rows, cols) = self.autopilot_menu_pane(wid, session);
-        if rows.is_empty() || cols.is_empty() {
-            return None;
-        }
-        let entry = self.pool.get(session)?;
-        let pgid = entry
-            .ctx
-            .timeline
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .agent()
-            .program_pgid;
-        Some(ProgramAnchor {
-            pane: MenuRect {
-                row: rows.start,
-                col: cols.start,
-                w: cols.len(),
-                h: rows.len(),
-            },
-            pgid,
-            alternate: crate::term_lock(&entry.term).is_alternate_screen(),
-        })
-    }
-
-    /// Whether `session`'s pane shows its live screen, the one a program's cells name: neither
-    /// scrolled back nor under a Rewind view.
-    fn shows_live_screen(&self, session: u64) -> bool {
-        !self.pool.is_rewound(session)
-            && self
-                .pool
-                .get(session)
-                .is_some_and(|entry| crate::term_lock(&entry.term).grid().display_offset() == 0)
-    }
-
     /// Paint the open menu into `wid`'s frame scratch, or close it if its anchor or focus moved.
     pub(crate) fn splice_autopilot_menu(&mut self, wid: WindowId) {
         let rect = self.paint_autopilot_menu(wid);
@@ -1323,14 +1279,6 @@ impl App {
         let (session, anchor, focus, owner) = (menu.session, menu.anchor, menu.focus, menu.owner);
         let anchored = match owner {
             MenuOwner::Autopilot => self.shows_autopilot_chip(wid, session, anchor),
-            // aterm cannot tell where a program redraws its line after a re-grid, a moved pane,
-            // a scroll back or a Rewind view, nor whether the program that asked still draws
-            // there once the foreground group or the screen changed, so the card closes then,
-            // as at a focus change.
-            MenuOwner::Program(stands_on) => {
-                self.shows_live_screen(session)
-                    && self.program_anchor(wid, session) == Some(stands_on)
-            }
             MenuOwner::Fact(fact) => self.shows_fact_on_row(wid, session, fact, anchor.0),
         };
         if self.focused_session_id(wid) != focus || !anchored {
@@ -1670,7 +1618,9 @@ impl App {
         let mut set_by: Vec<&str> = Vec::new();
         for (i, row) in menu.rows.iter().enumerate().take(shown_rows(rect)) {
             match row {
-                MenuRow::Note { spoken, .. } => notes.push(spoken.as_str()),
+                MenuRow::Note { spoken, .. } | MenuRow::Plot { spoken, .. } => {
+                    notes.push(spoken.as_str());
+                }
                 MenuRow::SetBy { text, .. } => set_by.push(text.as_str()),
                 MenuRow::Item {
                     spoken,
@@ -1689,11 +1639,7 @@ impl App {
                         row: top + 1 + i,
                     });
                 }
-                MenuRow::Header(_)
-                | MenuRow::Name(_)
-                | MenuRow::Rule
-                | MenuRow::Gap(_)
-                | MenuRow::Plot(_) => {}
+                MenuRow::Header(_) | MenuRow::Name(_) | MenuRow::Rule | MenuRow::Gap(_) => {}
             }
         }
         let mut label = menu.spoken.clone();

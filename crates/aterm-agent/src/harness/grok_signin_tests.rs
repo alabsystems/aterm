@@ -21,6 +21,9 @@ const GROK_LINES: &str = include_str!("fixtures/signin/grok-1.0.70-device-auth-n
 /// The stand-in's arm file in its test's root: the mode it runs in.
 const ARM: &str = "stand-in.arm";
 
+/// Only the plain positive control overrides the sandbox's literal denied opener target.
+const CONTROL_OPENER: &str = "ATERM_TEST_GROK_CONTROL_OPENER";
+
 /// The test's root, from the staging home the gate hands the stand-in
 /// (`<root>/state/.signin-grok-…`).
 fn stand_in_root() -> Option<PathBuf> {
@@ -55,7 +58,8 @@ fn grok_signin_stand_in() {
         eprintln!("the stand-in was run as {argv:?}");
         std::process::exit(3);
     }
-    let opened = aterm_uds::spawnfd::command("/usr/bin/open")
+    let opener = std::env::var_os(CONTROL_OPENER).unwrap_or_else(|| "/usr/bin/open".into());
+    let opened = aterm_uds::spawnfd::command(opener)
         .arg("-h")
         .stdin(aterm_uds::spawnfd::Stdio::null())
         .stdout(aterm_uds::spawnfd::Stdio::null())
@@ -647,6 +651,7 @@ fn under_the_gate_the_vendors_browser_open_is_stopped_and_its_page_and_code_are_
         .args(["login", "--device-auth"])
         .env("GROK_HOME", &staging)
         .env("GROK_AUTH_PATH", staging.join("auth.json"))
+        .env(CONTROL_OPENER, crate::test_program::kept("/usr/bin/open"))
         .stdin(aterm_uds::spawnfd::Stdio::null())
         .output()
         .expect("plain stand-in");
@@ -1093,7 +1098,7 @@ fn running_reads_the_leaders_record_and_never_takes_the_lock() {
     assert!(!running(&state), "the leader's record went with it");
     let me = std::process::id();
     let born = birth_word(me);
-    let gone = aterm_uds::spawnfd::command("/usr/bin/true")
+    let gone = aterm_uds::spawnfd::command(crate::test_program::kept("/usr/bin/true"))
         .spawn()
         .and_then(|mut c| {
             let pid = c.id();
@@ -1278,11 +1283,12 @@ fn the_default_home_s_row_is_its_rosters_row_else_the_active_one() {
     let roster = |text: &str| {
         super::super::accounts::Roster::parse_for(Cli::Grok, text).expect("a grok roster")
     };
-    let both = roster(
-        "[[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = \"/l/work\"\n\
-         email = \"work@example.com\"\n\n[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\
-         email = \"main@example.com\"\n",
-    );
+    let both = roster(at!(
+        "[[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = \"",
+        "/l/work",
+        "\"\nemail = \"work@example.com\"\n\n[[account]]\nlabel = \"main\"\n\
+         class = \"dedicated\"\nemail = \"main@example.com\"\n"
+    ));
     assert_eq!(
         pick_row(&both, Some("work")),
         (
@@ -1292,7 +1298,11 @@ fn the_default_home_s_row_is_its_rosters_row_else_the_active_one() {
         ),
         "the default home's own row wins over the active one"
     );
-    let dirs = roster("[[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = \"/l/work\"\n");
+    let dirs = roster(at!(
+        "[[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = \"",
+        "/l/work",
+        "\"\n"
+    ));
     assert_eq!(
         pick_row(&dirs, Some("work")),
         ("work".to_owned(), RowFrom::Active, None)
@@ -2417,4 +2427,31 @@ fn a_mailbox_with_no_password_yet_is_named_not_called_missing() {
     ladder.mailbox_unready = None;
     assert!(ladder.words().contains("mailbox(none configured)"));
     assert_eq!(ladder.setup(), Setup::Mailbox("main".to_owned()));
+
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let secret = dir.path().join("secret.txt");
+        std::fs::write(&secret, "private-key-material").expect("write secret");
+        let staged_link = dir.path().join("staged-link.json");
+        std::os::unix::fs::symlink(&secret, &staged_link).expect("symlink");
+        let target = dir.path().join("out/login.json");
+        assert!(
+            place(&staged_link, &target).is_err(),
+            "place must refuse symlinked staged login"
+        );
+        assert!(!target.exists());
+
+        let fifo_state = dir.path().join("fifo-state");
+        std::fs::create_dir_all(&fifo_state).expect("fifo state dir");
+        for name in [RECORD_FILE, RUNNING_FILE] {
+            let p = fifo_state.join(name);
+            let c_path = CString::new(p.as_os_str().as_bytes()).expect("cstr");
+            assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        }
+        assert_eq!(read_record(&fifo_state), Record::default());
+        assert!(!running(&fifo_state));
+    }
 }

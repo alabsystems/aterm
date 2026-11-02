@@ -81,6 +81,20 @@ impl TextInputState {
         &self.value
     }
 
+    /// Empty the field and wipe what it held from memory: its text, every frame of its edit
+    /// history and any composition, for a field that took a secret (System State's phrase), so no
+    /// undo brings it back.
+    pub(crate) fn wipe(&mut self) {
+        let mut held = std::mem::replace(self, Self::new(String::new()));
+        let mut texts = vec![std::mem::take(&mut held.value)];
+        texts.extend(held.undo.drain(..).map(|frame| frame.value));
+        texts.extend(held.redo.drain(..).map(|frame| frame.value));
+        texts.extend(held.preedit.take().map(|preedit| preedit.text));
+        for text in texts {
+            drop(aterm_secrets::SecretBytes::from(text));
+        }
+    }
+
     pub(crate) const fn selection(&self) -> &TextSelection {
         &self.selection
     }
@@ -423,6 +437,22 @@ fn next_grapheme(text: &str, position: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A wiped field keeps no text, no composition and no history: no undo brings a secret back.
+    #[test]
+    fn a_wiped_field_keeps_no_text_or_history() {
+        let mut input = TextInputState::new(String::new());
+        input.insert("river stone");
+        input.insert(" lamp");
+        assert!(input.undo());
+        input.set_preedit("ex".into(), None);
+        input.wipe();
+        assert_eq!(input.value(), "");
+        assert_eq!(input.preedit(), None);
+        assert!(!input.undo(), "no history to undo into");
+        assert!(!input.redo(), "no history to redo into");
+        assert_eq!(input, TextInputState::new(String::new()));
+    }
 
     #[test]
     fn selection_replace_and_local_undo_redo_are_atomic() {

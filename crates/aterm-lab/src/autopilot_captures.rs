@@ -6,7 +6,8 @@
 //! harness and look, launched in that look, so each program starts on the ground it is shot on: on
 //! the three aterm supervises (Claude Code, agy, Muse Code) it drives the forever lab's
 //! own chains against its stub ([`crate::forever`]: cruise-n's two needs, land-b's open hold,
-//! land-c's repository hold, land-a's landing, Off); on codex-alab, which supervises itself, it
+//! land-c's repository hold, land-e's landing, Off, same-land's stop, and on Claude Code
+//! switch-over-held's ask at the switch to Land); on codex-alab, which supervises itself, it
 //! drives `codex-alab-proof`'s legs against its fake model ([`crate::codex_alab_proof`]: Cruise,
 //! Land, landed, Off, a need). A scene this tree cannot show is a named skip ([`Plan::Skip`]).
 //! After each scene settles it takes an `image` at rest, points at the chip for its hovered title,
@@ -62,6 +63,7 @@ impl Who {
     #[must_use]
     pub const fn scenes(self) -> &'static [(Scene, Plan)] {
         match self {
+            Who::Agent(Harness::Claude) => &SUPERVISED_CLAUDE,
             Who::Agent(_) => &SUPERVISED,
             Who::CodexAlab => &CODEX_ALAB,
         }
@@ -76,7 +78,7 @@ impl Who {
     pub const fn chipless(self) -> Option<&'static str> {
         match self {
             Who::Agent(_) => None,
-            Who::CodexAlab => Some(PAD_CHIP_UNREAD),
+            Who::CodexAlab => Some(OWN_LINE),
         }
     }
 
@@ -88,28 +90,35 @@ impl Who {
     }
 }
 
-/// Why codex-alab takes no hovered title: its chip is on its composer's slab pad (8b), and this
-/// verb looks for a chip on the `─` rules alone (`rule_rows`, `CHIP_COLS`); the recording
-/// predates the chip.
-pub const PAD_CHIP_UNREAD: &str = "codex-alab's chip is on its slab pad (8b), on no rule this \
-     verb reads; the recording predates it (chrome's why=no-footer)";
+/// Codex owns its composer, including when its native interface leaves the pad blank.
+/// Each caption quotes that pad; aterm reports `why=no-footer` and draws no chip or title.
+pub const OWN_LINE: &str =
+    "codex-alab owns its controls; aterm draws no footer (chrome's why=no-footer)";
 
 /// A scene the captures show.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scene {
     /// Cruise, its report naming two needs (cruise-n, N1).
     CruiseNeeds,
-    /// Land held by open work its report names (land-b, L2).
+    /// Land held by open work its report names (land-b, L2), quoted (4b): its rest and hovered
+    /// title, and beside them the Overview and Settings ▸ Harness ([`Shots::held_extras`]).
     LandOpen,
-    /// Land held by work in its repository, an untracked file (land-c, L4).
+    /// Land held by work in its repository, an untracked file (land-c, L4), named (4b): as
+    /// [`Self::LandOpen`].
     LandRepo,
-    /// Land landed.
+    /// Land landed (land-e, L7: a task over `aterm ctl`, so the landing's Done for you row and its
+    /// tip stand): its rest and hovered title, and beside them the Overview and Settings ▸
+    /// Harness, whose state line says what aterm checked (slice 9c, [`Shots::held_extras`]).
     Landed,
     /// Autopilot Off.
     Off,
     /// Land held by the same reply, the stop said (`same-land`, 3a): its rest and hovered title,
     /// and beside them the Overview and Settings ▸ Harness ([`Shots::held_extras`]).
     SameLand,
+    /// Cruise held by the same reply, switched to Land: Land's one ask standing (`switch-over-held`,
+    /// v6 §14.17 item 3), its rest and hovered title, and beside them the Overview and Settings ▸
+    /// Harness, whose state line says it ([`Shots::held_extras`]).
+    SwitchAsked,
     /// codex-alab under Cruise, at rest after a turn.
     Cruise,
     /// codex-alab landing: Land's instruction typed.
@@ -119,13 +128,14 @@ pub enum Scene {
 }
 
 impl Scene {
-    const ALL: [Scene; 9] = [
+    const ALL: [Scene; 10] = [
         Scene::CruiseNeeds,
         Scene::LandOpen,
         Scene::LandRepo,
         Scene::Landed,
         Scene::Off,
         Scene::SameLand,
+        Scene::SwitchAsked,
         Scene::Cruise,
         Scene::Land,
         Scene::Need,
@@ -141,6 +151,7 @@ impl Scene {
             Scene::Landed => "landed",
             Scene::Off => "off",
             Scene::SameLand => "same-land",
+            Scene::SwitchAsked => "switch-asked",
             Scene::Cruise => "cruise",
             Scene::Land => "land",
             Scene::Need => "need",
@@ -161,6 +172,9 @@ impl Scene {
             Scene::Landed => "Land landed",
             Scene::Off => "Autopilot Off: its reply read, nothing typed",
             Scene::SameLand => "Land held by the same reply, the stop said",
+            Scene::SwitchAsked => {
+                "Cruise held by the same reply, switched to Land: Land asked once more"
+            }
             Scene::Cruise => "Cruise at rest after a turn",
             Scene::Land => "Land landing: Land's instruction typed (land@v1)",
             Scene::Need => "its report naming a NEEDS YOU need",
@@ -168,7 +182,7 @@ impl Scene {
     }
 
     fn rank(self) -> usize {
-        [&SUPERVISED[..], &CODEX_ALAB[..]]
+        [&SUPERVISED_CLAUDE[..], &CODEX_ALAB[..]]
             .iter()
             .find_map(|s| s.iter().position(|(sc, _)| *sc == self))
             .unwrap_or(usize::MAX)
@@ -186,29 +200,51 @@ pub enum Plan {
     Skip(&'static str),
 }
 
-/// Why codex-alab's holds are skips: it rebuilds no Land hold from its own acts until A3.
-pub const A3_WAITS: &str = "UNOBSERVED until A3 (§14.14, codex-alab's Land hold rebuilt from \
-    its own acts, deferred to the round after 8b): codex-alab keeps nudging and holds no landing, \
-    so there is no hold to show";
+/// Why codex-alab's holds are skips: the scenes are the forever lab's chains on aterm's own loop,
+/// and codex-alab's hold is its own.
+pub const HOLDS_UNSHOT: &str = "UNOBSERVED here: these scenes are the forever lab's chains on \
+    aterm's own loop; codex-alab's Land hold is its own, told from its build 13942 on (A3's \
+    half, §14.14, read by codex-alab-proof --window-only), and its shots are the round after 8b's";
 
-const SUPERVISED: [(Scene, Plan); 6] = [
+/// Why Land's ask at the switch is shot on Claude Code alone: it is said by the window, the state
+/// line's words beside the row, and drawn the same for every harness aterm supervises.
+pub const SWITCH_ON_CLAUDE: &str = "UNSHOT here: Land's ask at the switch is said by the window \
+    (Settings ▸ Harness's state line), drawn the same for every harness aterm supervises, and \
+    shot on Claude Code; forever's switch-over-held judges it on this harness";
+
+const SUPERVISED: [(Scene, Plan); 7] = [
+    (Scene::CruiseNeeds, Plan::Chain(Chain::CruiseN)),
+    (Scene::LandOpen, Plan::Chain(Chain::LandB)),
+    (Scene::LandRepo, Plan::Chain(Chain::LandC)),
+    // land-e, not land-a: its task over `aterm ctl` leaves a Done for you row, whose tip says what
+    // aterm checked (slice 9c); land-a's quick landing leaves none (no task, no end).
+    (Scene::Landed, Plan::Chain(Chain::LandE)),
+    (Scene::Off, Plan::Chain(Chain::Off)),
+    (Scene::SameLand, Plan::Chain(Chain::SameLand)),
+    (Scene::SwitchAsked, Plan::Skip(SWITCH_ON_CLAUDE)),
+];
+
+/// Claude Code's scenes: [`SUPERVISED`]'s, and Land's ask at the switch shot.
+const SUPERVISED_CLAUDE: [(Scene, Plan); 7] = [
     (Scene::CruiseNeeds, Plan::Chain(Chain::CruiseN)),
     (Scene::LandOpen, Plan::Chain(Chain::LandB)),
     (Scene::LandRepo, Plan::Chain(Chain::LandC)),
     (Scene::Landed, Plan::Chain(Chain::LandA)),
     (Scene::Off, Plan::Chain(Chain::Off)),
     (Scene::SameLand, Plan::Chain(Chain::SameLand)),
+    (Scene::SwitchAsked, Plan::Chain(Chain::SwitchOverHeld)),
 ];
 
-const CODEX_ALAB: [(Scene, Plan); 8] = [
+const CODEX_ALAB: [(Scene, Plan); 9] = [
     (Scene::Cruise, Plan::Leg("continue")),
     (Scene::Land, Plan::Leg("land")),
     (Scene::Landed, Plan::Leg("reland")),
     (Scene::Off, Plan::Leg("off")),
     (Scene::Need, Plan::Leg("needs")),
-    (Scene::LandOpen, Plan::Skip(A3_WAITS)),
-    (Scene::LandRepo, Plan::Skip(A3_WAITS)),
-    (Scene::SameLand, Plan::Skip(A3_WAITS)),
+    (Scene::LandOpen, Plan::Skip(HOLDS_UNSHOT)),
+    (Scene::LandRepo, Plan::Skip(HOLDS_UNSHOT)),
+    (Scene::SameLand, Plan::Skip(HOLDS_UNSHOT)),
+    (Scene::SwitchAsked, Plan::Skip(HOLDS_UNSHOT)),
 ];
 
 /// A look: the theme the instance, and so every program in it, is launched in.
@@ -614,12 +650,27 @@ pub fn faults(rows: &[Row]) -> Vec<Flaw> {
                     .unwrap_or("no title row");
                 flaw(Fault::NoTitle(why.to_string()));
             }
-        } else if who.chipless().is_none() {
+        } else if who.chipless().is_none() || !beside_its_own_line(&r.caption, scene) {
             let why = caption_word(&r.caption, "why").unwrap_or_else(|| NO_LINE.to_string());
             flaw(Fault::NoChip(why));
         }
     }
     flaws
+}
+
+/// Accept native ownership, including a blank pad. Older capture manifests retain their
+/// measured `not-drawn` and Off `switch-only` evidence.
+fn beside_its_own_line(caption: &str, scene: Scene) -> bool {
+    let pad = caption
+        .split_once(PAD_SAID)
+        .map(|(_, rest)| rest.trim_start());
+    let own = pad.is_some_and(|p| p.starts_with('"') && !p.starts_with("\"\""));
+    match caption_word(caption, "why").as_deref() {
+        Some("no-footer") => true,
+        Some("not-drawn") => own,
+        Some("switch-only") => scene == Scene::Off,
+        _ => false,
+    }
 }
 
 /// The rows of a scene its plan skips.
@@ -645,6 +696,8 @@ struct Asked {
     baseline: Option<String>,
     /// The typing take alone, on this process's aterm (the baseline's arm).
     typing_only: bool,
+    /// The typing pair's program: codex-alab (`--typing codex-alab`), else agy.
+    typing_codex: bool,
     /// The sheets alone, drawn again from the folder's manifest.
     sheets_only: bool,
 }
@@ -656,23 +709,29 @@ const LINES: u16 = 40;
 
 const HELP: &str = "usage: targo --unverified lab autopilot-captures --harness all|claude|agy|muse|codex-alab
        [--scale 1|2] [--look day|night|both] [--out DIR] [--columns N] [--lines N] [--baseline ATERM]
-   or: targo --unverified lab autopilot-captures --baseline ATERM [--out DIR]
+       [--typing agy|codex-alab]
+   or: targo --unverified lab autopilot-captures --baseline ATERM [--typing agy|codex-alab] [--out DIR]
    or: targo --unverified lab autopilot-captures --sheets [--out DIR]
 
 Autopilot's scenes on every harness, side by side (design §14.2's 2b), on one private headless
 instance per harness and look, launched in that look (its aterm.toml's theme), so every program
 starts on the ground it is shot on. Claude Code, agy and Muse Code run the forever lab's
 chains against its stub: cruise-needs (cruise-n's two needs), land-open (land-b's open hold),
-land-repo (land-c's repository hold), landed (land-a's landing), off, and same-land (the
-same-reply hold, the stop said: beside its shots the Overview, Settings ▸ Harness and the
-Messages rows it raised). codex-alab runs codex-alab-proof's legs against its fake model: cruise,
-land, landed, off and need; its holds are named skips until A3. codex-alab needs the package
+land-repo (land-c's repository hold), landed (land-e's landing, its Done for you row standing),
+off, and same-land (the same-reply hold, the stop said); beside same-land's, land-open's and
+land-repo's shots the Overview, Settings ▸ Harness turned to its row (the state line) and the
+Messages rows it raised; Claude Code also switch-asked (switch-over-held's hold under Cruise,
+switched to Land by the person's press on Settings ▸ Harness, shot while Land's one ask stands,
+its shots beside it as same-land's), which agy and Muse Code name a skip. codex-alab runs
+codex-alab-proof's legs against its fake model: cruise, land, landed, off and need; its holds are
+named skips. codex-alab needs the package
 codex-alab-proof would pick.
 
 After each scene settles it takes an image at rest (<harness>-<scene>-<look>-<scale>x-rest.png),
 then points at the chip and takes its hovered title (…-title.png, the rule's band beside it as
 …-title-band.png) where a chip is drawn, each png with a .txt of the pointer, `status`, `chrome`
-and the screen's text. A title the rule drew shorter than chrome's whole title is a FINDING.
+and the screen's text; codex-alab's rest shots also cut its pad row at full scale
+(…-rest-pad-band.png). A title the rule drew shorter than chrome's whole title is a FINDING.
 manifest.tsv (harness, scene, look, scale, png, caption or the skip's reason) merges each run's
 rows under a lock, so one folder holds 1x and 2x, Day and Night, from runs side by side. --scale is
 the instance's (default 1); --columns and --lines its grid (400 x 40, so the rule's slot holds a
@@ -681,11 +740,15 @@ whole title). --out defaults to $LAB_STATE/autopilot-captures.
 --baseline ATERM also takes one paired agy typing take after the captures, or alone without
 --harness (200 keys, then 200 backspaces, under one `video`, harness `continue = false`): on ATERM
 first, then on this lab's aterm, back to back, the same lab binary, agy, stub, keys and pace
-(typing-agy.txt). Take it on a quiet machine.
+(typing-agy.txt). --typing codex-alab takes it on codex-alab instead, in codex-alab-proof's `off`
+leg under Autopilot Off at rest, each take then idle 20 s, four takes in the order baseline, this
+tree, this tree, baseline, so neither arm always runs second; each line names its slot
+(typing-codex-alab.txt). Take it on a quiet machine.
 
 Each harness also gets <harness>-<scale>x-sheet.png (its frames at rest, a scene a row, Day then
-Night) and <harness>-<scale>x-titles.png (its hovered titles' bands, stacked), drawn from the
-folder's manifest; --sheets draws them again and runs nothing.
+Night), <harness>-<scale>x-titles.png (its hovered titles' bands, stacked) and, for codex-alab,
+<harness>-<scale>x-pads.png (its pad bands, stacked at full scale), drawn from the folder's
+manifest; --sheets draws them again and runs nothing.
 
 Exit: 0 every row there, no fault and the typing take taken where asked; 1 a gap, a fault or a
 take not taken; 2 usage; 3 a harness could not run.
@@ -702,6 +765,7 @@ fn parse_args(args: &[String]) -> Result<Option<Asked>, Fail> {
         lines: LINES,
         baseline: None,
         typing_only: false,
+        typing_codex: false,
         sheets_only: false,
     };
     let mut it = args.iter();
@@ -755,6 +819,17 @@ fn parse_args(args: &[String]) -> Result<Option<Asked>, Fail> {
             }
             "--baseline" => a.baseline = Some(crate::paths::from_caller(&value("an aterm")?)),
             "--typing-only" => a.typing_only = true,
+            "--typing" => {
+                a.typing_codex = match value("agy or codex-alab")?.as_str() {
+                    "agy" => false,
+                    "codex-alab" => true,
+                    other => {
+                        return Err(usage(&format!(
+                            "--typing takes agy or codex-alab, not '{other}'"
+                        )));
+                    }
+                }
+            }
             "--sheets" => a.sheets_only = true,
             "-h" | "--help" => return Ok(None),
             other => return Err(usage(&format!("unknown option '{other}'"))),
@@ -806,7 +881,12 @@ pub fn cmd_autopilot_captures(args: &[String]) -> Res {
     }
     if a.whos.is_empty() {
         let base = a.baseline.as_deref().unwrap_or_default();
-        return Ok(if typing_pair(&a, base, &out)? { 0 } else { 1 });
+        let taken = if a.typing_codex {
+            codex_typing_pair(base, &out)?
+        } else {
+            typing_pair(&a, base, &out)?
+        };
+        return Ok(if taken { 0 } else { 1 });
     }
     println!(
         "autopilot-captures: {} at {}x in {}, each launched in its look -> {}",
@@ -863,6 +943,7 @@ pub fn cmd_autopilot_captures(args: &[String]) -> Res {
     rows.sort_by_key(Row::order);
     let drawn = merge_manifest(&out, &a, &rows)?;
     let typed = match &a.baseline {
+        Some(base) if a.typing_codex => codex_typing_pair(base, &out)?,
         Some(base) => typing_pair(&a, base, &out)?,
         None => {
             println!(
@@ -1043,9 +1124,7 @@ fn agent_scenes(
     rows: &mut Vec<Row>,
 ) -> Result<(), Fail> {
     let tag = format!("apcap-{}-{}-{}x", h.name(), look.name(), a.scale);
-    if crate::run::is_run(&tag) {
-        let _ = crate::lab::down(&tag, false);
-    }
+    clear_lab(&tag)?;
     let mut u = crate::lab::UpOpts::from_env();
     u.trust = true;
     u.lifeline = true;
@@ -1069,6 +1148,38 @@ fn agent_scenes(
     let shot = agent_lab(&tag, (who, h, look), a, out, rows);
     let _ = crate::lab::down(&tag, false);
     shot
+}
+
+/// Lab `tag` cleared for a capture run to bring up: a lab of that name a run that died left is
+/// taken down; one whose aterm still runs is another capture run's (another aterm under
+/// `LAB_ATERM`, the same harness, look and scale, or the same typing arm), and taking it down
+/// would end that run's scenes without a word, so this run refuses instead ([`still_up`]).
+fn clear_lab(tag: &str) -> Result<(), Fail> {
+    if crate::run::is_run(tag) {
+        if let Some(why) = crate::run::Run::read(tag)
+            .ok()
+            .and_then(|run| still_up(&run, crate::sys::alive))
+        {
+            return Err(Fail::exit(3, why));
+        }
+        let _ = crate::lab::down(tag, false);
+    }
+    Ok(())
+}
+
+/// Why a capture run may not take lab `run` down before its own: its aterm still runs (`alive`
+/// of its pid), so it is another capture run's, of another aterm under `LAB_ATERM` with the same
+/// harness, look and scale, whose scenes a `down` would end without a word. `None` for a lab a
+/// run that died left behind, which is taken down.
+fn still_up(run: &crate::run::Run, alive: impl Fn(i32) -> bool) -> Option<String> {
+    alive(run.instance_pid).then(|| {
+        format!(
+            "a lab named {} is up, its aterm (pid {}, {}) still running: another \
+             autopilot-captures run of this harness, look and scale; it was left alone (wait for \
+             it, or `aterm-lab down {}`)",
+            run.tag, run.instance_pid, run.aterm, run.tag
+        )
+    })
 }
 
 fn agent_lab(
@@ -1191,8 +1302,15 @@ fn agent_lab(
             }
             if tab.done {
                 rows.extend(shots.scene(&door, tab.scene, &tab.sid, chain.name())?);
-                if tab.scene == Scene::SameLand {
-                    shots.held_extras(&door, &tab.sid, chain.name())?;
+                if matches!(
+                    tab.scene,
+                    Scene::SameLand
+                        | Scene::SwitchAsked
+                        | Scene::Landed
+                        | Scene::LandOpen
+                        | Scene::LandRepo
+                ) {
+                    shots.held_extras(&door, tab.scene, &tab.sid, chain.name())?;
                 }
             }
         }
@@ -1213,6 +1331,15 @@ fn agent_settled(door: &Door<'_>, scene: Scene, sid: &str, chain: Chain) -> bool
         Scene::LandRepo => idle && held(HoldLeg::Repo),
         // Stopped: the same-reply hold standing (3a's `status held=`).
         Scene::SameLand => idle && w("held") == HeldBy::SameReply.word(),
+        // Held under Cruise, the person's switch to Land is made here, their press on Settings ▸
+        // Harness's row (no `meta set`, which is no person's and asks nothing); shot while Land's
+        // one ask stands (`status land_asked=switch`), its answer slow.
+        Scene::SwitchAsked => {
+            if idle && w("autopilot") == "cruise" && w("held") == HeldBy::SameReply.word() {
+                let _ = forever::surfaces::press_word(door, None, sid, "land");
+            }
+            w("land_asked") == "switch"
+        }
         Scene::Landed => w("task") == "landed",
         Scene::Off => {
             idle && w("autopilot") == chain.autopilot()
@@ -1253,6 +1380,8 @@ fn seen_words(status: &str, acts: &[String]) -> String {
         "needs_n",
         "needs",
         "land_held",
+        "held",
+        "land_asked",
     ]
     .iter()
     .filter_map(|k| forever::word(status, k).map(|v| format!("{k}={v}")))
@@ -1374,7 +1503,11 @@ fn codex_settled(rig: &Proof, scene: Scene, sid: &str) -> bool {
                 && screen().contains(model::STEP_ONE)
         }
         Scene::Need => codex_alab_proof::needs_raised(&rig.on(sid, &["meta"]).first()),
-        Scene::CruiseNeeds | Scene::LandOpen | Scene::LandRepo | Scene::SameLand => false,
+        Scene::CruiseNeeds
+        | Scene::LandOpen
+        | Scene::LandRepo
+        | Scene::SameLand
+        | Scene::SwitchAsked => false,
     }
 }
 
@@ -1489,6 +1622,22 @@ impl Frame {
         }
     }
 
+    /// The box `(x0, y0)..(x1, y1)` of it, clipped to it.
+    fn crop(&self, (x0, y0): (usize, usize), (x1, y1): (usize, usize)) -> Frame {
+        let (x0, y0) = (x0.min(self.w), y0.min(self.h));
+        let (w, h) = (
+            x1.min(self.w).saturating_sub(x0),
+            y1.min(self.h).saturating_sub(y0),
+        );
+        let mut out = Frame::blank(w, h, [0, 0, 0, 255]);
+        for row in 0..h {
+            let from = ((y0 + row) * self.w + x0) * 4;
+            out.rgba[row * w * 4..(row + 1) * w * 4]
+                .copy_from_slice(&self.rgba[from..from + w * 4]);
+        }
+        out
+    }
+
     /// Rows `y0..y1` of it, as a PNG.
     fn band_png(&self, y0: usize, y1: usize) -> Option<Vec<u8>> {
         let (y0, y1) = (y0.min(self.h), y1.min(self.h));
@@ -1517,14 +1666,18 @@ const SHEET_CELL: usize = 860;
 /// The gap between a sheet's cells, and its colour.
 const SHEET_GAP: (usize, [u8; 4]) = (8, [128, 128, 128, 255]);
 
+/// A codex-alab rest shot's pad band ([`Shots::pad_band`]), after its png's stem.
+const PAD_BAND: &str = "-pad-band.png";
+
 /// `who`'s sheets in `out` from `rows` at `scale`, their names: its frames at rest as one grid
 /// (`<harness>-<scale>x-sheet.png`, a scene a row, a look a column, each frame shrunk to at most
-/// [`SHEET_CELL`] wide) and its hovered titles' bands stacked in the same order
-/// (`<harness>-<scale>x-titles.png`).
+/// [`SHEET_CELL`] wide), its hovered titles' bands stacked in the same order
+/// (`<harness>-<scale>x-titles.png`), and codex-alab's pad bands stacked at full scale, Day then
+/// Night a scene (`<harness>-<scale>x-pads.png`).
 fn sheets(out: &Path, who: Who, scale: u8, rows: &[Row]) -> Vec<String> {
     // Each of the harness's frames at `scale` of `kind`, read from the png its row names, or for
-    // `band` its title's band: its scene, look and frame.
-    let mine = |kind: Kind, band: bool| -> Vec<(Scene, Look, Frame)> {
+    // `band` the band of that name beside it: its scene, look and frame.
+    let mine = |kind: Kind, band: Option<&str>| -> Vec<(Scene, Look, Frame)> {
         rows.iter()
             .filter(|r| r.kind() == Some(kind))
             .filter_map(|r| {
@@ -1532,18 +1685,17 @@ fn sheets(out: &Path, who: Who, scale: u8, rows: &[Row]) -> Vec<String> {
                 if w != who || s != scale {
                     return None;
                 }
-                let png = if band {
-                    file_name(w, scene, look, s, kind, "-band.png")
-                } else {
-                    r.png.clone()
-                };
+                let png = band.map_or_else(
+                    || r.png.clone(),
+                    |tail| file_name(w, scene, look, s, kind, tail),
+                );
                 Some((scene, look, Frame::read(&out.join(png))?))
             })
             .collect()
     };
     let (gap, grey) = SHEET_GAP;
     let mut made = Vec::new();
-    let rests = mine(Kind::Rest, false);
+    let rests = mine(Kind::Rest, None);
     let scenes: Vec<Scene> = rests.iter().fold(Vec::new(), |mut v, (s, _, _)| {
         if !v.contains(s) {
             v.push(*s);
@@ -1573,7 +1725,7 @@ fn sheets(out: &Path, who: Who, scale: u8, rows: &[Row]) -> Vec<String> {
             made.push(name);
         }
     }
-    let bands = mine(Kind::Title, true);
+    let bands = mine(Kind::Title, Some("-band.png"));
     if let Some((_, _, first)) = bands.first() {
         let f = usize::from(scale).max(1);
         let w = first.w / f;
@@ -1586,6 +1738,25 @@ fn sheets(out: &Path, who: Who, scale: u8, rows: &[Row]) -> Vec<String> {
             y += small.h + gap;
         }
         let name = format!("{}-{scale}x-titles.png", who.name());
+        if let Some(png) = stack.band_png(0, stack.h) {
+            let _ = crate::sys::put(&out.join(&name), 0o644, &crate::sys::PutSrc::Bytes(&png));
+            made.push(name);
+        }
+    }
+    let mut pads = mine(Kind::Rest, Some(PAD_BAND));
+    pads.sort_by_key(|(scene, look, _)| {
+        (scenes.iter().position(|s| s == scene), *look == Look::Night)
+    });
+    if !pads.is_empty() {
+        let w = pads.iter().map(|(_, _, b)| b.w).max().unwrap_or(0) + 2 * gap;
+        let h: usize = pads.iter().map(|(_, _, b)| b.h + gap).sum::<usize>() + gap;
+        let mut stack = Frame::blank(w, h, grey);
+        let mut y = gap;
+        for (_, _, band) in &pads {
+            stack.paste(band, (gap, y));
+            y += band.h + gap;
+        }
+        let name = format!("{}-{scale}x-pads.png", who.name());
         if let Some(png) = stack.band_png(0, stack.h) {
             let _ = crate::sys::put(&out.join(&name), 0o644, &crate::sys::PutSrc::Bytes(&png));
             made.push(name);
@@ -1625,6 +1796,11 @@ struct ChipAt {
 /// blanks and an em dash drawn where the rule's line was (` — `).
 const TITLE_GAP: usize = 3;
 
+/// How many cells past the chip's a hovered title may begin: the rule keeps another chip
+/// between them where one is drawn (the permission chip, Claude Code's mode, as `⏵⏵ auto`), and
+/// the hover leaves it as it was.
+const TITLE_LEAD_SKIP: usize = 24;
+
 /// How many cells short of chrome's whole title a drawn title may measure and still be whole:
 /// the chip's first cell found one off, and the blank the rule draws after the title. A leaner
 /// form gives up a whole part, ` · ` and its words, more than this.
@@ -1648,13 +1824,15 @@ impl ChipAt {
         changed / ((x1 - x0) * (y1 - y0)).max(1.0)
     }
 
-    /// How many cells the hovered title takes in the rule: from `lead` cells past the chip's
-    /// (where the rule draws a title, past the chip's cells and two blanks) to the last cell that
-    /// differs between `hovered` and `rest` before more than [`TITLE_GAP`] cells in a row that do
-    /// not. 0 where none differs.
+    /// How many cells the hovered title takes in the rule: from its first cell that differs
+    /// between `hovered` and `rest`, no nearer than `lead` cells past the chip's (where the rule
+    /// draws a title, past the chip's cells and two blanks) and no further than
+    /// [`TITLE_LEAD_SKIP`] past that, to the last that differs before more than [`TITLE_GAP`]
+    /// cells in a row that do not. 0 where none differs.
     fn title_cells(&self, hovered: &Frame, rest: &Frame, lead: usize) -> usize {
         let (y0, y1) = (pixel(self.y - self.ch / 2.0), pixel(self.y + self.ch / 2.0));
         let left = |i: usize| pixel(self.x + (cells_f(i) - 0.5) * self.cw);
+        let mut first: Option<usize> = None;
         let mut last: Option<usize> = None;
         let mut i = lead.saturating_sub(1);
         while left(i) < hovered.w {
@@ -1663,13 +1841,16 @@ impl ChipAt {
                 .unwrap_or(0)
                 > 0;
             if changed {
+                first.get_or_insert(i);
                 last = Some(i);
-            } else if i > last.unwrap_or(lead) + TITLE_GAP {
+            } else if i > last.unwrap_or(lead + TITLE_LEAD_SKIP) + TITLE_GAP {
                 break;
             }
             i += 1;
         }
-        last.map_or(0, |l| (l + 1).saturating_sub(lead))
+        first
+            .zip(last)
+            .map_or(0, |(f, l)| (l + 1).saturating_sub(f.max(lead)))
     }
 }
 
@@ -1766,6 +1947,9 @@ impl Shots<'_> {
                 hovered: None,
             },
         );
+        if who == Who::CodexAlab {
+            self.pad_band(lab, sid, scene, &rest);
+        }
         let Some(drawn) = drawn_of(&chip_line) else {
             return Ok(vec![row(Some(Kind::Rest), caption)]);
         };
@@ -1823,31 +2007,46 @@ impl Shots<'_> {
         Ok(rows)
     }
 
-    /// THE STOP BESIDE ITS TAB (3a): with same-land's tab in front, the Overview
-    /// (`…-overview.png`) and Settings ▸ Harness turned to same-land's row (`…-page.png`), each
-    /// opened on the front window, shot with `image` once it shows the session ([`HELD_HANG`] the
-    /// hang detector of each wait) and closed again, and `…-held.txt` with what they, the tab's
-    /// hover and `ctl messages tag=harness` read: the stop's words on every surface a person reads
-    /// it on. A surface that never showed the session is NOT CAPTURED by name; a sidecar that cannot
-    /// be written fails the run.
-    fn held_extras(&self, lab: &dyn Lab, sid: &str, label: &str) -> Result<(), Fail> {
+    /// THE STOP BESIDE ITS TAB (3a), THE HOLD'S QUOTE (4b), LAND'S ASK AT THE SWITCH OVER IT
+    /// (10b), AND WHAT ATERM CHECKED AT A LANDING (9c): with `scene`'s tab in front (same-land's,
+    /// land-open's, land-repo's, switch-over-held's, or land-e's landed), the Overview
+    /// (`…-overview.png`) and Settings ▸ Harness turned to its row (`…-page.png`), each opened on
+    /// the front window, shot with `image` once it shows the session ([`HELD_HANG`] the hang
+    /// detector of each wait) and closed again, and `…-held.txt` with what they, the tab's hover,
+    /// its `status`'s `landed_*` fields, its `statusmenu` rows and `ctl messages tag=harness`
+    /// read: the stop's words, the hold's quote, the ask, or what aterm checked, on every surface a
+    /// person reads them on. A surface that never showed the session is NOT CAPTURED by name; a
+    /// sidecar that cannot be written fails the run.
+    fn held_extras(&self, lab: &dyn Lab, scene: Scene, sid: &str, label: &str) -> Result<(), Fail> {
         let (who, look, scale) = (self.who, self.look, self.a.scale);
         let name = |tail: &str| {
             format!(
                 "{}-{}-{}-{scale}x{tail}",
                 who.name(),
-                Scene::SameLand.name(),
+                scene.name(),
                 look.name()
             )
         };
         let mut said = vec![format!(
             "# {}: {} on {}, {}; sid={sid}; at {}",
             name("-held.txt"),
-            Scene::SameLand.what(),
+            scene.what(),
             self.head,
             look.theme(),
             crate::util::now_ms()
         )];
+        let status = on(lab, sid, &["status"]);
+        said.push(format!(
+            "## status (slice 9c)\n{}",
+            forever::checked::FIELDS
+                .iter()
+                .map(|k| format!(
+                    "{k}={}",
+                    forever::word(&status, k).unwrap_or_else(|| "?".into())
+                ))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ));
         let chrome = lab.said(&["chrome"]);
         let strip = forever::surfaces::strip_tabs(&chrome);
         let hover = strip
@@ -1859,6 +2058,14 @@ impl Shots<'_> {
         said.push(format!(
             "## what a screen reader is handed (`chrome`'s `a11y` lines)\n{}",
             forever::surfaces::ax_of(&chrome, sid)
+        ));
+        said.push(format!(
+            "## the menu bar's rows naming it, with their tips\n{}",
+            chrome
+                .lines()
+                .filter(|l| l.starts_with("statusmenu ") && l.contains(label))
+                .collect::<Vec<_>>()
+                .join("\n")
         ));
         let overview = name("-overview.png");
         let opened = lab.said(&["open", "overview"]);
@@ -1877,6 +2084,7 @@ impl Shots<'_> {
             ))
         };
         said.push(self.extra_said(
+            scene,
             "overview",
             &opened,
             &kept,
@@ -1887,7 +2095,13 @@ impl Shots<'_> {
         let page = name("-page.png");
         let opened = lab.said(&["open", "app", "settings", "/harness"]);
         let kept = turn_to_row(lab, label).and_then(|_| self.shoot_front(lab, &page));
-        said.push(self.extra_said("prefs", &opened, &kept, &lab.said(&["controls", "prefs"])));
+        said.push(self.extra_said(
+            scene,
+            "prefs",
+            &opened,
+            &kept,
+            &lab.said(&["controls", "prefs"]),
+        ));
         let _ = lab.said(&["pointer", "leave"]);
         let _ = lab.said(&["open", "prefs", "close"]);
         let _ = raise(lab, label);
@@ -1908,6 +2122,7 @@ impl Shots<'_> {
     /// the png kept (or why none was) and what `controls <target>` read.
     fn extra_said(
         &self,
+        scene: Scene,
         target: &str,
         opened: &str,
         kept: &Result<String, String>,
@@ -1917,8 +2132,9 @@ impl Shots<'_> {
             .as_ref()
             .map_or_else(|why| format!("{NOT_CAPTURED}{why}"), Clone::clone);
         println!(
-            "  {} same-land ({}): {target} {kept}",
+            "  {} {} ({}): {target} {kept}",
             self.who.name(),
+            scene.name(),
             self.look.name()
         );
         format!(
@@ -2020,6 +2236,60 @@ impl Shots<'_> {
         Ok(None)
     }
 
+    /// codex-alab's pad row cut from its frame at rest at full scale, two cells either side of
+    /// what the program drew there (`…-rest-pad-band.png`): the line its own Autopilot words stand
+    /// on, which the sheet shrinks past reading (`<harness>-<scale>x-pads.png` stacks them).
+    /// Nothing where the screen shows no prompt row or the pointer names no cell.
+    fn pad_band(&self, lab: &dyn Lab, sid: &str, scene: Scene, rest: &Frame) {
+        let text = on(lab, sid, &["text"]);
+        let rows: Vec<&str> = text.lines().collect();
+        let Some(row) = rows
+            .iter()
+            .rposition(|r| r.starts_with('\u{203a}'))
+            .and_then(|prompt| prompt.checked_sub(1))
+        else {
+            return;
+        };
+        let line = rows[row].trim_end();
+        let first = line.chars().take_while(|c| *c == ' ').count();
+        let width = text_width(line).max(first + 1);
+        let at = |row: usize, col: usize| {
+            px_of(&lab.said(&["pointer", "move", &row.to_string(), &col.to_string()]))
+        };
+        let cells = (at(row, 1), at(row + 1, 0), at(row, 0));
+        let _ = lab.said(&["pointer", "leave"]);
+        let (Some((x1, _)), Some((_, y1)), Some((x0, y0))) = cells else {
+            return;
+        };
+        let (cw, ch) = (x1 - x0, y1 - y0);
+        if cw <= 0.0 || ch <= 0.0 {
+            return;
+        }
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a frame's width in pixels, exact in an f64"
+        )]
+        let k = (rest.w as f64 / (f64::from(self.a.cols) * cw))
+            .round()
+            .max(1.0);
+        let x = |col: f64| pixel((x0 + col * cw) * k);
+        let band = rest.crop(
+            (x(cells_f(first) - 2.5), pixel((y0 - ch) * k)),
+            (x(cells_f(width) + 1.5), pixel((y0 + ch) * k)),
+        );
+        if let Some(png) = band.band_png(0, band.h) {
+            let p = self.out.join(file_name(
+                self.who,
+                scene,
+                self.look,
+                self.a.scale,
+                Kind::Rest,
+                PAD_BAND,
+            ));
+            let _ = crate::sys::put(&p, 0o644, &crate::sys::PutSrc::Bytes(&png));
+        }
+    }
+
     /// The `.txt` beside a png: what it shows, the pointer, `status`, `chrome` and the screen.
     fn sidecar(&self, lab: &dyn Lab, sid: &str, scene: Scene, kind: Kind, pointer: &str) {
         let (who, look, scale) = (self.who, self.look, self.a.scale);
@@ -2062,6 +2332,12 @@ impl Shots<'_> {
             chip_words(shot.chip_line),
             self.look.theme()
         );
+        if self.who == Who::CodexAlab {
+            let pad = codex_alab_proof::pad_of(&on(lab, sid, &["text"]));
+            let says_mode = codex_alab_proof::dev_build(self.head)
+                .is_some_and(|b| b >= codex_alab_proof::SAYS_ITS_MODE);
+            c.push_str(&pad_words(shot.chip_line, pad.as_deref(), says_mode));
+        }
         if let Some(h) = shot.hovered {
             c.push_str("; ");
             c.push_str(&title_verdict(h, shot.chip_line));
@@ -2115,6 +2391,41 @@ fn chip_words(chip_line: &str) -> String {
             forever::word(chip_line, "why").unwrap_or_default()
         )
     }
+}
+
+/// How a caption quotes codex-alab's pad ([`pad_words`]).
+const PAD_SAID: &str = "; its pad: ";
+
+/// What a codex-alab caption says of its composer pad (`pad`, as the program drew it:
+/// [`codex_alab_proof::pad_of`]) beside the chip's `chrome` line: the pad quoted, and a
+/// [`FINDING`] where aterm drew any Codex chip. Where the chip stood down beside that line, a build that
+/// names its mode there (`says_mode`, [`codex_alab_proof::SAYS_ITS_MODE`]) must name the face
+/// ([`forever::surfaces::face_cells`]), else a [`FINDING`]; an older build's line is said to name
+/// no mode.
+fn pad_words(chip_line: &str, pad: Option<&str>, says_mode: bool) -> String {
+    let mut w = format!(
+        "{PAD_SAID}{}",
+        pad.map_or_else(|| "no prompt row".to_string(), |p| format!("{p:?}"))
+    );
+    let own = pad.filter(|p| !p.is_empty());
+    if drawn_of(chip_line).is_some() {
+        w.push_str(&format!(
+            "; {FINDING}aterm drew a chip on codex-alab's native composer"
+        ));
+    } else if let Some(p) = own {
+        let face = forever::word(chip_line, "face").unwrap_or_else(|| "-".into());
+        match forever::surfaces::face_cells(&face) {
+            Some(cells) if says_mode && !p.contains(cells) => w.push_str(&format!(
+                "; {FINDING}codex-alab's own line names no {face} ({cells:?} not on it)"
+            )),
+            Some(_) if !says_mode => w.push_str(&format!(
+                "; its line names no mode (a build before {} lights the mode's button only)",
+                codex_alab_proof::SAYS_ITS_MODE
+            )),
+            _ => {}
+        }
+    }
+    w
 }
 
 /// The value of `key=` among a caption's words, the `;` or `)` its piece ends with left off.
@@ -2328,9 +2639,7 @@ fn typing_take(a: &Asked) -> Result<String, Fail> {
     } else {
         "apcap-typing"
     };
-    if crate::run::is_run(tag) {
-        let _ = crate::lab::down(tag, false);
-    }
+    clear_lab(tag)?;
     let mut u = crate::lab::UpOpts::from_env();
     u.trust = true;
     u.lifeline = true;
@@ -2381,36 +2690,10 @@ fn typing_in(tag: &str) -> Result<String, Fail> {
         ));
     }
     stop::sleep(Duration::from_secs(3))?;
-    let burst_over = AtomicBool::new(false);
-    let (pct, video) = std::thread::scope(|s| {
-        // One recording for the whole burst: it holds the window focused, as a person's typing
-        // does. `video` answers when it ends: at `video stop` after the burst, or at once when
-        // it is refused.
-        let recording = s.spawn(|| {
-            let said = door.ctl(&["video", "60", "keys"]).map_or_else(
-                |e| format!("ERR {e}"),
-                |r| format!("{}{}", r.stdout, r.stderr),
-            );
-            (said, burst_over.load(Ordering::Relaxed))
-        });
-        let typed = type_burst(&door, &sid);
-        let pct = door.out(&["metrics", "percentiles"]);
-        burst_over.store(true, Ordering::Relaxed);
-        let _ = door.ctl(&["video", "stop"]);
-        let video = recording
-            .join()
-            .unwrap_or_else(|_| ("ERR the recording's thread panicked".to_string(), false));
-        typed.map(|()| (pct, video))
-    })?;
-    let said = recording_held(&video.0, video.1).map_err(Fail::die)?;
-    let picked: Vec<String> = TAKE_KEYS
-        .iter()
-        .filter_map(|k| forever::word(&pct, k).map(|v| format!("{k}={v}")))
-        .collect();
+    let (picked, said) = burst_taken(&door, &sid)?;
     Ok(format!(
-        "{TAKEN}{ver} aterm {}: {}; video: {said}",
-        run.aterm,
-        picked.join(" ")
+        "{TAKEN}{ver} aterm {}: {picked}; video: {said}",
+        run.aterm
     ))
 }
 
@@ -2434,23 +2717,175 @@ fn recording_held(said: &str, outlasted: bool) -> Result<String, String> {
 }
 
 /// The burst: 200 keys, then 200 backspaces, 50 ms apart, after the metrics are reset.
-fn type_burst(door: &Door<'_>, sid: &str) -> Result<(), Fail> {
+fn type_burst(lab: &dyn Lab, sid: &str) -> Result<(), Fail> {
     stop::sleep(Duration::from_secs(2))?;
-    let _ = door.ctl(&["metrics", "reset"]);
+    let _ = lab.said(&["metrics", "reset"]);
     let keys = "the quick brown fox jumps over the lazy dog ";
     for c in keys.chars().cycle().take(200) {
         if c == ' ' {
-            let _ = forever::on(door, sid, &["key", "space"]);
+            let _ = on(lab, sid, &["key", "space"]);
         } else {
-            let _ = forever::on(door, sid, &["send", &c.to_string()]);
+            let _ = on(lab, sid, &["send", &c.to_string()]);
         }
         stop::sleep(Duration::from_millis(50))?;
     }
     for _ in 0..200 {
-        let _ = forever::on(door, sid, &["key", "backspace"]);
+        let _ = on(lab, sid, &["key", "backspace"]);
         stop::sleep(Duration::from_millis(50))?;
     }
     Ok(())
+}
+
+/// The burst ([`type_burst`]) under one `video 60 keys` that must outlast it, then `metrics
+/// percentiles`: the take's [`TAKE_KEYS`] words and what the recording said, or why it is not
+/// taken ([`recording_held`]).
+fn burst_taken(lab: &(dyn Lab + Sync), sid: &str) -> Result<(String, String), Fail> {
+    let burst_over = AtomicBool::new(false);
+    let (pct, video) = std::thread::scope(|s| {
+        // One recording for the whole burst: it holds the window focused, as a person's typing
+        // does. `video` answers when it ends: at `video stop` after the burst, or at once when
+        // it is refused.
+        let recording = s.spawn(|| {
+            let said = lab.said(&["video", "60", "keys"]);
+            (said, burst_over.load(Ordering::Relaxed))
+        });
+        let typed = type_burst(lab, sid);
+        let pct = lab.said(&["metrics", "percentiles"]);
+        burst_over.store(true, Ordering::Relaxed);
+        let _ = lab.said(&["video", "stop"]);
+        let video = recording
+            .join()
+            .unwrap_or_else(|_| ("ERR the recording's thread panicked".to_string(), false));
+        typed.map(|()| (pct, video))
+    })?;
+    let said = recording_held(&video.0, video.1).map_err(Fail::die)?;
+    let picked: Vec<String> = TAKE_KEYS
+        .iter()
+        .filter_map(|k| forever::word(&pct, k).map(|v| format!("{k}={v}")))
+        .collect();
+    Ok((picked.join(" "), said))
+}
+
+/// The idle window's words after a take: `metrics reset`, 2 s to settle, the opening counts,
+/// [`forever::surfaces::IDLE_MS`] with no read, the closing counts; what moved in it
+/// (`timer_wakes`, `deadline_arms_by_owner`, `wakes_by_variant`, `n_render`) and, where the
+/// window did not rest, why ([`forever::surfaces::idle_counts`]).
+fn idle_taken(lab: &dyn Lab) -> Result<String, Fail> {
+    let _ = lab.said(&["metrics", "reset"]);
+    stop::sleep(Duration::from_secs(2))?;
+    let (m0, p0) = (
+        lab.said(&["metrics"]),
+        lab.said(&["metrics", "percentiles"]),
+    );
+    stop::sleep(Duration::from_millis(
+        u64::try_from(forever::surfaces::IDLE_MS).unwrap_or(20_000),
+    ))?;
+    let (m1, p1) = (
+        lab.said(&["metrics"]),
+        lab.said(&["metrics", "percentiles"]),
+    );
+    let m = forever::surfaces::idle_metrics_between(&m0, &m1);
+    let p = forever::surfaces::idle_percentiles_between(&p0, &p1);
+    let mut said: Vec<String> = ["timer_wakes", "deadline_arms_by_owner", "wakes_by_variant"]
+        .iter()
+        .map(|k| format!("{k}={}", forever::word(&m, k).unwrap_or_else(|| "-".into())))
+        .collect();
+    said.push(format!(
+        "n_render={}",
+        forever::word(&p, "n_render").unwrap_or_else(|| "-".into())
+    ));
+    let bad = forever::surfaces::idle_counts(&m, &p);
+    Ok(format!(
+        "idle {} s: {}; {}",
+        forever::surfaces::IDLE_MS / 1000,
+        said.join(" "),
+        if bad.is_empty() {
+            "at rest".to_string()
+        } else {
+            format!("NOT at rest: {}", bad.join("; "))
+        }
+    ))
+}
+
+/// A taken codex-alab arm's line starts so.
+const CODEX_TAKEN: &str = "typing codex-alab ";
+
+/// How the codex-alab typing pair is taken, its file's first line.
+const CODEX_TYPING_SAYS: &str = "the codex-alab typing take: 200 keys (one `send` or `key \
+    space` each, 50 ms apart) then 200 backspaces into the composer of codex-alab-proof's `off` \
+    leg (Autopilot Off, its claim given back and its reply standing, so nothing is typed into \
+    it), under one `video 60 keys` that must outlast the burst, then an idle window of 20 s; each \
+    arm a rig of its own, 144x50 at 1x in Aterm Night, the baseline's aterm first, then this \
+    lab's, back to back, the same lab binary, package, fake model, keys and pace, only the aterm \
+    differing; headless, so frames are n_render with render_p*";
+
+/// One codex-alab typing take on `aterm` (else this lab's): its `typing codex-alab …` line.
+fn codex_typing_take(aterm: Option<&str>) -> Result<String, Fail> {
+    let args = ["--columns", "144", "--lines", "50", "--scale", "1"]
+        .map(str::to_string)
+        .to_vec();
+    let mut rig = Proof::captures_rig(aterm.map(str::to_string), args, Look::Night.theme())?;
+    let took = codex_typing_in(&mut rig);
+    rig.finish();
+    took
+}
+
+fn codex_typing_in(rig: &mut Proof) -> Result<String, Fail> {
+    let sid = rig.open_scene("off")?;
+    let claimed = crate::wait_until(CODEX_LIMIT, || rig.proven_pid(&sid).is_some());
+    if !claimed {
+        return Err(Fail::die("the off leg's codex-alab never held its claim"));
+    }
+    let off = on(rig, &sid, &["meta", "set", "autopilot", "off"]);
+    let rested = crate::wait_until(CODEX_LIMIT, || codex_settled(rig, Scene::Off, &sid));
+    if !rested {
+        return Err(Fail::die(format!(
+            "the off leg did not rest under Off within {} s ({})",
+            CODEX_LIMIT.as_secs(),
+            off.trim()
+        )));
+    }
+    stop::sleep(Duration::from_secs(3))?;
+    let (picked, video) = burst_taken(rig, &sid)?;
+    let idle = idle_taken(rig)?;
+    Ok(format!(
+        "{CODEX_TAKEN}{} aterm {}: {picked}; {idle}; video: {video}",
+        rig.package_version(),
+        rig.aterm_path().display()
+    ))
+}
+
+/// The order of the codex-alab typing takes: the baseline (`true`) and this lab's aterm twice
+/// each, ABBA, so each arm runs once in each place of a pair and neither always runs second, on a
+/// machine whose load moves between takes.
+const CODEX_TYPING_ORDER: [bool; 4] = [true, false, false, true];
+
+/// The codex-alab typing takes ([`CODEX_TYPING_ORDER`]), back to back, in this process; each line,
+/// its slot and arm named, to `<out>/typing-codex-alab.txt`. Whether every take was taken.
+fn codex_typing_pair(base: &str, out: &Path) -> Result<bool, Fail> {
+    let mut lines = Vec::new();
+    let n = CODEX_TYPING_ORDER.len();
+    for (i, baseline) in CODEX_TYPING_ORDER.into_iter().enumerate() {
+        let (arm, aterm) = if baseline {
+            ("baseline", Some(base))
+        } else {
+            ("this tree", None)
+        };
+        let slot = format!("[slot {}/{n}, {arm}] ", i + 1);
+        lines.push(match codex_typing_take(aterm) {
+            Ok(line) => line.replacen(CODEX_TAKEN, &format!("{CODEX_TAKEN}{slot}"), 1),
+            Err(f) if f.stopped.is_some() => return Err(f),
+            Err(f) => format!("{NOT_TAKEN} {slot}{}", f.msg.unwrap_or_default()),
+        });
+    }
+    let text = format!("# {CODEX_TYPING_SAYS}\n{}\n", lines.join("\n"));
+    for l in &lines {
+        println!("autopilot-captures: {l}");
+    }
+    let p = out.join("typing-codex-alab.txt");
+    crate::sys::put(&p, 0o644, &crate::sys::PutSrc::Bytes(text.as_bytes()))
+        .map_err(|e| Fail::die(format!("autopilot-captures: {}: {e}", p.display())))?;
+    Ok(lines.iter().all(|l| l.starts_with(CODEX_TAKEN)))
 }
 
 #[cfg(test)]

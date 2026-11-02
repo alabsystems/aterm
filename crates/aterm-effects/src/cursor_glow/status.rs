@@ -33,6 +33,122 @@ pub struct AdmissionSource {
     pub session: u64,
 }
 
+/// Fixed host entry point that created doubt about a caret row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoundaryOrigin {
+    /// No host origin was supplied.
+    Unknown,
+    /// The core's geometry classifier boundary.
+    Reflow,
+    /// An explicitly synthetic motion hint.
+    Synthetic,
+    /// A window consumed an owed control-socket licence fence.
+    ControlFence,
+    /// The native key handler's classified press fence.
+    PhysicalPress,
+    /// The convergence seam's classified input fence.
+    InputFence,
+    /// The recipient's non-typing key-class fallback.
+    InputClass,
+    /// A composition update that took the generic fence.
+    ImePreedit,
+    /// A composition commit that took the generic fence.
+    ImeCommit,
+    /// A menu or OS status action.
+    Menu,
+    /// A tab command or rename surface.
+    TabSurface,
+    /// A palette's find command.
+    Palette,
+    /// An OS accessibility action request.
+    Accessibility,
+    /// An explicit scroll-view command.
+    Scroll,
+}
+
+impl BoundaryOrigin {
+    /// A fixed diagnostic token, never terminal text or a key's value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Reflow => "reflow",
+            Self::Synthetic => "synthetic",
+            Self::ControlFence => "control-fence",
+            Self::PhysicalPress => "physical-press",
+            Self::InputFence => "input-fence",
+            Self::InputClass => "input-class",
+            Self::ImePreedit => "ime-preedit",
+            Self::ImeCommit => "ime-commit",
+            Self::Menu => "menu",
+            Self::TabSurface => "tab-surface",
+            Self::Palette => "palette",
+            Self::Accessibility => "accessibility",
+            Self::Scroll => "scroll",
+        }
+    }
+}
+
+/// The boundary that created one surviving caret-row doubt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CaretBoundary {
+    pub seq: u64,
+    pub origin: BoundaryOrigin,
+    pub at: Instant,
+}
+
+/// Already-evaluated guards at a `program-row` refusal, before its cleanup.
+/// The variants name the seam site, not a later reading of the engine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProgramRowRefusal {
+    /// A hidden or parked caret's print anchor belongs to a contested row.
+    AnchorContested { tainted: bool, spoken_for: bool },
+    /// A parked caret's anchor has a foreign glyph or a hand still at the caret.
+    ParkedAnchor {
+        foreign_glyph: bool,
+        hand_at_caret: bool,
+    },
+    /// A visible move lands on a foreign glyph or a parked redisplay row.
+    VisibleLanding {
+        landing_foreign: bool,
+        parked_redisplay: bool,
+    },
+}
+
+impl std::fmt::Display for ProgramRowRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::AnchorContested {
+                tainted,
+                spoken_for,
+            } => write!(
+                f,
+                "program_row=anchor-contested tainted={} spoken_for={}",
+                u8::from(tainted),
+                u8::from(spoken_for),
+            ),
+            Self::ParkedAnchor {
+                foreign_glyph,
+                hand_at_caret,
+            } => write!(
+                f,
+                "program_row=parked-anchor foreign_glyph={} hand_at_caret={}",
+                u8::from(foreign_glyph),
+                u8::from(hand_at_caret),
+            ),
+            Self::VisibleLanding {
+                landing_foreign,
+                parked_redisplay,
+            } => write!(
+                f,
+                "program_row=visible-landing landing_foreign={} parked_redisplay={}",
+                u8::from(landing_foreign),
+                u8::from(parked_redisplay),
+            ),
+        }
+    }
+}
+
 /// One entry of the admission diagnosis ring ([`CursorGlow::admission_log`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AdmissionRecord {
@@ -51,6 +167,10 @@ pub struct AdmissionRecord {
     pub licence: &'static str,
     /// The owner bound when the verdict was appended, unknown for unbound hosts.
     pub source: Option<AdmissionSource>,
+    /// Guard values captured at a `program-row` refusal; absent on other verdicts.
+    pub program_row_refusal: Option<ProgramRowRefusal>,
+    /// Original boundary of the parked row this refusal read, not a later host reading.
+    pub parked_boundary: Option<CaretBoundary>,
 }
 
 impl AdmissionRecord {
@@ -74,7 +194,7 @@ impl AdmissionRecord {
     #[must_use]
     pub fn line(&self, now: Instant) -> String {
         format!(
-            "admission seq={} phase={} reason={} age_ms={:.0} origin={},{} target={},{} alt={} licence={} source={} source_view={} source_session={}",
+            "admission seq={} phase={} reason={} age_ms={:.0} origin={},{} target={},{} alt={} licence={} source={} source_view={} source_session={} {} {}",
             self.seq,
             self.phase.as_str(),
             self.reason,
@@ -97,6 +217,42 @@ impl AdmissionRecord {
             std::fmt::from_fn(|f| match self.source {
                 Some(s) => write!(f, "{}", s.session),
                 None => f.write_str("-"),
+            }),
+            std::fmt::from_fn(|f| match self.program_row_refusal {
+                Some(refusal) => write!(f, "{refusal}"),
+                None if self.reason == CursorGlow::DECLINE_PROGRAM_ROW => {
+                    f.write_str("program_row=unknown")
+                }
+                None => f.write_str("program_row=none"),
+            }),
+            std::fmt::from_fn(|f| match self.parked_boundary {
+                Some(boundary) => {
+                    write!(
+                        f,
+                        "boundary_origin={} boundary_seq={} boundary_to_verdict_ms=",
+                        boundary.origin.as_str(),
+                        boundary.seq
+                    )?;
+                    match self.at.checked_duration_since(boundary.at) {
+                        Some(age) => write!(f, "{}", age.as_millis()),
+                        None => f.write_str("-"),
+                    }
+                }
+                None => {
+                    let applicable = matches!(
+                        self.program_row_refusal,
+                        Some(ProgramRowRefusal::VisibleLanding {
+                            parked_redisplay: true,
+                            ..
+                        })
+                    ) || (self.program_row_refusal.is_none()
+                        && self.reason == CursorGlow::DECLINE_PROGRAM_ROW);
+                    write!(
+                        f,
+                        "boundary_origin={} boundary_seq=- boundary_to_verdict_ms=-",
+                        if applicable { "unknown" } else { "none" }
+                    )
+                }
             }),
         )
     }
@@ -693,6 +849,8 @@ impl CursorGlow {
             alternate_screen: self.ctx_alt,
             licence,
             source: self.admission_source,
+            program_row_refusal: None,
+            parked_boundary: None,
         });
     }
 
@@ -705,6 +863,39 @@ impl CursorGlow {
         target: (u16, u16),
         reason: &'static str,
     ) {
+        self.log_decline_with_detail(at, origin, target, reason, None, None);
+    }
+
+    /// Record a `program-row` refusal with its already-evaluated guard values.
+    #[inline]
+    pub(super) const fn log_program_row_refusal(
+        &mut self,
+        at: Instant,
+        origin: (u16, u16),
+        target: (u16, u16),
+        refusal: ProgramRowRefusal,
+        parked_boundary: Option<CaretBoundary>,
+    ) {
+        self.log_decline_with_detail(
+            at,
+            origin,
+            target,
+            Self::DECLINE_PROGRAM_ROW,
+            Some(refusal),
+            parked_boundary,
+        );
+    }
+
+    #[inline]
+    const fn log_decline_with_detail(
+        &mut self,
+        at: Instant,
+        origin: (u16, u16),
+        target: (u16, u16),
+        reason: &'static str,
+        program_row_refusal: Option<ProgramRowRefusal>,
+        parked_boundary: Option<CaretBoundary>,
+    ) {
         self.admission_log.push(AdmissionRecord {
             seq: 0,
             phase: AdmissionPhase::Declined,
@@ -715,6 +906,8 @@ impl CursorGlow {
             alternate_screen: self.ctx_alt,
             licence: AdmissionRecord::LICENCE_NONE,
             source: self.admission_source,
+            program_row_refusal,
+            parked_boundary,
         });
     }
 
@@ -961,6 +1154,21 @@ impl CursorGlow {
         let mut all = Vec::new();
         self.out_ramps.expand_into(out, &mut all);
         all
+    }
+
+    /// [`Self::out_laid`] into `dst` (cleared first), for a host's read of the light it lays.
+    #[inline]
+    pub(crate) fn out_laid_into(&self, out: &[GlowQuad], dst: &mut Vec<GlowQuad>) {
+        dst.clear();
+        self.out_ramps.expand_into(out, dst);
+    }
+
+    /// The last tick's under stream, every lit row of its ramps the quad it stands for, in draw
+    /// order, into `dst` (cleared first), for a host's read of the light it lays.
+    #[inline]
+    pub(crate) fn under_laid_into(&self, dst: &mut Vec<GlowQuad>) {
+        dst.clear();
+        self.under_ramps.expand_into(&self.under_out, dst);
     }
 
     /// This frame's per-pixel fire patches.
@@ -1239,6 +1447,10 @@ pub(crate) struct FrameText {
     /// Row-major, alongside [`Self::pairs`]: the cell's glyph as the face's
     /// [`aterm_render::GlyphInk`] indexes it ([`aterm_render::GlyphInk::index`]).
     pub(super) glyph: Vec<u8>,
+    /// Row-major, alongside [`Self::pairs`]: whether the cell's ink is its glyph's raster alone
+    /// as the face's table seats it ([`aterm_render::GlyphInk::raster`]): a narrow glyph with no
+    /// combining mark, no slant, no decoration line, no emoji presentation and no script shift.
+    pub(super) plain: Vec<bool>,
     pub(super) cols: usize,
     /// The window column of `pairs`' first column (a split pane's offset).
     pub(super) col0: i32,
@@ -1264,6 +1476,7 @@ impl FrameText {
         pairs: Vec::new(),
         short: Vec::new(),
         glyph: Vec::new(),
+        plain: Vec::new(),
         cols: 0,
         col0: 0,
         pane: None,
@@ -1307,6 +1520,19 @@ impl FrameText {
         } else {
             aterm_render::GlyphInk::OTHER
         }
+    }
+
+    /// Whether cell `(row, col)`'s ink is its glyph's table raster alone ([`Self::plain`]);
+    /// `false` for a cell the frame did not read.
+    #[inline]
+    pub(crate) const fn plain(&self, row: i32, col: i32) -> bool {
+        let (i, col) = (row - self.lo, col - self.col0);
+        if i < 0 || i as usize >= self.rows.len() || col < 0 || col as usize >= self.cols {
+            return false;
+        }
+        let idx = i as usize * self.cols + col as usize;
+        let plain = self.plain.as_slice();
+        idx < plain.len() && plain[idx]
     }
 
     /// Whether cell `(row, col)`'s glyph keeps under the x-height

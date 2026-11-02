@@ -342,9 +342,57 @@ impl NightGround {
     }
 }
 
+/// What a night ground holds its lights to ([`night_ground_holding`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GroundRule {
+    /// No light reads green over its ground where it does not on the
+    /// reference dark page: Fire's and Sparkle's warm lights.
+    OffGreen,
+    /// The page's own neutral, closing as gently as lets every coloured
+    /// light's core (its light at [`NIGHT_GROUND_CORE`] of full or more) read
+    /// in its own hue over it, as it does on the reference dark page: a colour
+    /// the user chose (Classic's one-colour face, the pin ruling). Added to
+    /// Solarized Dark's teal `#002b36`, the pink pin `#d03a8c` drew its jump
+    /// core lilac (hue 290) and an Enter's streak blue (219), the pin at 327
+    /// (composed r1's beauty judge). Its faint skirt keeps the page's own
+    /// hue, as a glow fading into the page does. Only the neutral ink is
+    /// tried: a ground solved toward the light's own hue (composed r2's
+    /// [`GroundRule::OwnHue`]) laid a maroon `#3e171f` disc round the caret on
+    /// the teal page, a stain rather than a glow (composed r2's judges).
+    NeutralCore,
+    /// A test's negative control (composed r2's rule): every coloured light
+    /// reads in its own hue over its ground wherever it lights the page in a
+    /// colour, the ink solved off neutral for it.
+    #[cfg(any(test, debug_assertions))]
+    OwnHue,
+}
+
+/// The light, of 255, from which a light is its core
+/// ([`GroundRule::NeutralCore`]): its brightest three quarters.
+const NIGHT_GROUND_CORE: f32 = 64.0;
+
+/// How far from a light's own hue its reading over its ground may lie
+/// ([`GroundRule::OwnHue`]), degrees.
+const NIGHT_GROUND_HUE_GAP: f32 = 25.0;
+/// How far a reading must lie from the page, in its farthest channel, and
+/// how much chroma it must wear, for its hue to count
+/// ([`GroundRule::OwnHue`]): a light fainter than this, or one at grey, wears
+/// no colour the eye names.
+const NIGHT_GROUND_HUE_SEEN: f32 = 12.0;
+const NIGHT_GROUND_HUE_CHROMA: f32 = 24.0;
+
 /// The night ground of the tinted dark page `page` under the lights of
 /// `family` (a style's palette), solved on the page, or none when no ground
-/// keeps them off green (a green light is the user's own).
+/// keeps them off green (a green light is the user's own):
+/// [`night_ground_holding`] under [`GroundRule::OffGreen`].
+#[inline]
+pub(crate) const fn night_ground(page: u32, family: &[u32]) -> Option<NightGround> {
+    night_ground_holding(page, family, GroundRule::OffGreen)
+}
+
+/// The night ground of the tinted dark page `page` under the lights of
+/// `family` (a style's palette), solved on the page under `rule`, or none
+/// when no ground holds them to it.
 ///
 /// Its ink keeps the page's OKLab lightness, so the ground lies on the page
 /// as part of the light's glow, never as a dark hole. Of the inks round the
@@ -361,7 +409,11 @@ impl NightGround {
 /// neutral closes over tens of levels. The close is then quickened by
 /// [`NIGHT_GROUND_MARGIN`].
 #[inline]
-pub(crate) const fn night_ground(page: u32, family: &[u32]) -> Option<NightGround> {
+pub(crate) const fn night_ground_holding(
+    page: u32,
+    family: &[u32],
+    rule: GroundRule,
+) -> Option<NightGround> {
     #[inline]
     const fn ch(c: u32, sh: u32) -> f32 {
         ((c >> sh) & 0xff) as f32
@@ -379,8 +431,59 @@ pub(crate) const fn night_ground(page: u32, family: &[u32]) -> Option<NightGroun
         let (h, s, v) = crate::color_math::rgb2hsv(px(c[0]) << 16 | px(c[1]) << 8 | px(c[2]));
         s >= 0.2 && v >= 0.12 && h >= 66.0 && h < 180.0
     }
+    /// Whether `c` over `page` lights it in a colour off `want`'s hue
+    /// ([`GroundRule::OwnHue`]).
     #[inline]
-    const fn passes(p: [f32; 3], r: [f32; 3], lights: &[[f32; 3]], ng: NightGround) -> bool {
+    const fn off_hue(c: [f32; 3], page: [f32; 3], want: f32) -> bool {
+        #[inline]
+        const fn px(v: f32) -> u32 {
+            v.round().clamp(0.0, 255.0) as u32
+        }
+        let (r, g, b) = (px(c[0]), px(c[1]), px(c[2]));
+        let (rf, gf, bf) = (r as f32, g as f32, b as f32);
+        let chroma = rf.max(gf).max(bf) - rf.min(gf).min(bf);
+        let seen = (rf - page[0])
+            .abs()
+            .max((gf - page[1]).abs())
+            .max((bf - page[2]).abs());
+        if seen < NIGHT_GROUND_HUE_SEEN || chroma < NIGHT_GROUND_HUE_CHROMA {
+            return false;
+        }
+        let (h, _, _) = crate::color_math::rgb2hsv(r << 16 | g << 8 | b);
+        let d = (h - want).abs();
+        d.min(360.0 - d) > NIGHT_GROUND_HUE_GAP
+    }
+    #[inline]
+    const fn reads_off(
+        rule: GroundRule,
+        (p, r): ([f32; 3], [f32; 3]),
+        (base, c): ([f32; 3], &[f32; 4]),
+        s: f32,
+    ) -> bool {
+        let lit = [base[0] + s * c[0], base[1] + s * c[1], base[2] + s * c[2]];
+        let reference = [r[0] + s * c[0], r[1] + s * c[1], r[2] + s * c[2]];
+        match rule {
+            GroundRule::OffGreen => green(lit) && !green(reference),
+            // A light of no hue (white) has none to keep.
+            GroundRule::NeutralCore => {
+                s >= NIGHT_GROUND_CORE
+                    && c[3] >= 0.0
+                    && off_hue(lit, p, c[3])
+                    && !off_hue(reference, r, c[3])
+            }
+            #[cfg(any(test, debug_assertions))]
+            GroundRule::OwnHue => {
+                c[3] >= 0.0 && off_hue(lit, p, c[3]) && !off_hue(reference, r, c[3])
+            }
+        }
+    }
+    #[inline]
+    const fn passes(
+        rule: GroundRule,
+        (p, r): ([f32; 3], [f32; 3]),
+        lights: &[[f32; 4]],
+        ng: NightGround,
+    ) -> bool {
         let q = rgb(ng.ink);
         let inv_tau = 1.0 / ng.tau.max(0.1);
         // From six closes up the ground is whole to a quarter of a percent.
@@ -398,9 +501,7 @@ pub(crate) const fn night_ground(page: u32, family: &[u32]) -> Option<NightGroun
             while li < lights.len() {
                 let c = &lights[li];
                 li += 1;
-                if green([base0 + s * c[0], base1 + s * c[1], base2 + s * c[2]])
-                    && !green([r[0] + s * c[0], r[1] + s * c[1], r[2] + s * c[2]])
-                {
+                if reads_off(rule, (p, r), ([base0, base1, base2], c), s) {
                     return false;
                 }
             }
@@ -410,17 +511,20 @@ pub(crate) const fn night_ground(page: u32, family: &[u32]) -> Option<NightGroun
     let page = page & 0x00FF_FFFF;
     let (p, r) = (rgb(page), rgb(REF_DARK_PAGE));
     let lightness = crate::color_math::oklab(page)[0];
-    // Each light at a strength of one in its brightest channel.
-    let mut lights_buf = [[0.0f32; 3]; 16];
+    // Each light at a strength of one in its brightest channel, and its
+    // hue (negative where it has none the eye names).
+    let mut lights_buf = [[0.0f32; 4]; 16];
     let mut lights_len = 0usize;
     let mut fi = 0;
     while fi < family.len() {
         let c = rgb(family[fi]);
+        let (h, sat, _) = crate::color_math::rgb2hsv(family[fi] & 0x00FF_FFFF);
         fi += 1;
         let top = c[0].max(c[1]).max(c[2]);
         if top > 0.0 && lights_len < lights_buf.len() {
             let inv_top = 1.0 / top;
-            lights_buf[lights_len] = [c[0] * inv_top, c[1] * inv_top, c[2] * inv_top];
+            let hue = if sat >= 0.2 { h } else { -1.0 };
+            lights_buf[lights_len] = [c[0] * inv_top, c[1] * inv_top, c[2] * inv_top, hue];
             lights_len += 1;
         }
     }
@@ -430,24 +534,31 @@ pub(crate) const fn night_ground(page: u32, family: &[u32]) -> Option<NightGroun
     // (distance from the page, ground)
     let mut best: Option<(f32, NightGround)> = None;
     let mut gentlest: Option<NightGround> = None;
-    let mut ai = -4i8;
-    while ai <= 6 {
-        let mut bi = -4i8;
-        while bi <= 4 {
+    // The neutral core's ground is the page's neutral alone.
+    let neutral = matches!(rule, GroundRule::NeutralCore);
+    let (a_lo, a_hi, b_lo, b_hi) = if neutral {
+        (0, 0, 0, 0)
+    } else {
+        (-4i8, 6i8, -4i8, 4i8)
+    };
+    let mut ai = a_lo;
+    while ai <= a_hi {
+        let mut bi = b_lo;
+        while bi <= b_hi {
             let (a, b) = (ai as f32 * 0.01, bi as f32 * 0.01);
             bi += 1;
             let ink = crate::color_math::oklab_to_rgb([lightness, a, b]) & 0x00FF_FFFF;
             let (mut lo, mut hi) = (floor, TOP);
-            if !passes(p, r, lights, NightGround { ink, tau: lo }) {
+            if !passes(rule, (p, r), lights, NightGround { ink, tau: lo }) {
                 continue;
             }
-            if passes(p, r, lights, NightGround { ink, tau: hi }) {
+            if passes(rule, (p, r), lights, NightGround { ink, tau: hi }) {
                 lo = hi;
             } else {
                 let mut step = 0;
                 while step < 7 {
                     let mid = 0.5 * (lo + hi);
-                    if passes(p, r, lights, NightGround { ink, tau: mid }) {
+                    if passes(rule, (p, r), lights, NightGround { ink, tau: mid }) {
                         lo = mid;
                     } else {
                         hi = mid;
@@ -914,6 +1025,10 @@ pub(crate) fn reink_quads(quads: &mut [GlowQuad], cap: u8, ink_at: impl Fn(&Glow
 pub(crate) struct LightGround {
     pub(crate) fg: u32,
     pub(crate) bg: u32,
+    /// The trail on this ground wears a colour the user chose ([`Self::chosen`]): every ink
+    /// keeps its colour's hue and saturation and no more than its chroma
+    /// ([`light_chosen_ink`]).
+    pub(crate) chosen: bool,
     /// Test-only: answer the bare vivid ink ([`light_ink_bold`]), never solved against the text (`CursorGlow::light_ground`'s negative control).
     #[cfg(test)]
     pub(crate) unsolved: bool,
@@ -924,11 +1039,49 @@ impl LightGround {
     #[inline]
     #[must_use]
     pub(crate) const fn of(cfg: &GlowConfig) -> Self {
+        Self::on(cfg.theme_fg, cfg.theme_bg)
+    }
+
+    /// The ground of the theme's text `fg` and paper `bg`.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn on(fg: u32, bg: u32) -> Self {
         Self {
-            fg: cfg.theme_fg,
-            bg: cfg.theme_bg,
+            fg,
+            bg,
+            chosen: false,
             #[cfg(test)]
             unsolved: false,
+        }
+    }
+
+    /// THE CHOSEN COLOUR'S INK ON A LIGHT GROUND: this ground under a trail that wears a colour
+    /// the user chose (a pinned trail colour), every part of it the pin's or drawn from it (its
+    /// tail, its dust, its crackle, each the pin toward white or black). Every ink the ground
+    /// solves ([`Self::body_ink`], [`Self::leading_ink`]; [`Self::vivid_body_ink`] lays any
+    /// colour as itself) starts from the colour scaled to the bold weight
+    /// ([`light_chosen_ink`]) instead of its hue's vivid ink, and is walked toward white only as
+    /// far as the text over it asks: the deepening adds no chroma the colour lacks, as
+    /// Sparkle's paper pin already kept ([`light_chosen_ink`]).
+    #[inline]
+    #[must_use]
+    pub(crate) const fn chosen(self) -> Self {
+        Self {
+            chosen: true,
+            ..self
+        }
+    }
+
+    /// The vivid ink of `rgb` a leading or under-ink mark lays ([`InkRole::Leading`],
+    /// [`light_ink_bold`]); on a chosen colour's ground, the colour as itself
+    /// ([`light_chosen_ink`]).
+    #[inline]
+    #[must_use]
+    pub(crate) const fn leading_ink(self, rgb: u32) -> u32 {
+        if self.chosen {
+            light_chosen_ink(rgb)
+        } else {
+            InkRole::Leading.ink(rgb)
         }
     }
 
@@ -939,6 +1092,14 @@ impl LightGround {
         #[cfg(test)]
         if self.unsolved {
             return light_ink_bold(rgb & 0x00FF_FFFF);
+        }
+        if self.chosen {
+            return ink_over_floor_from(
+                light_chosen_ink(rgb),
+                self.bg,
+                LIGHT_BODY_ALPHA_CAP as u8,
+                light_body_floor(self.fg),
+            );
         }
         light_body_ink(rgb, self.fg, self.bg, LIGHT_BODY_ALPHA_CAP as u8)
     }

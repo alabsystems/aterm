@@ -31,6 +31,21 @@ fn the_script_set_carries_each_body_beside_its_loader() {
         !script_set_matches(dir.path()),
         "a changed body is a different set"
     );
+    #[cfg(unix)]
+    {
+        ensure_scripts(dir.path()).unwrap();
+        assert!(script_set_matches(dir.path()));
+        let planted = aterm_tempfile::tempdir().unwrap();
+        let target = planted.path().join("zsh");
+        std::fs::copy(dir.path().join("aterm_shell_integration.zsh"), &target).unwrap();
+        std::fs::remove_file(dir.path().join("aterm_shell_integration.zsh")).unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("aterm_shell_integration.zsh"))
+            .unwrap();
+        assert!(
+            !script_set_matches(dir.path()),
+            "a symlinked script never counts as an installed set"
+        );
+    }
 }
 
 #[cfg(unix)]

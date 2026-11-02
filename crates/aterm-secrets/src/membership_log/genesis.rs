@@ -216,26 +216,34 @@ pub fn alab_founders(
             )));
         }
     }
-    let taken: BTreeSet<&str> = labels.values().map(String::as_str).collect();
+    let mut taken: BTreeSet<String> = labels.values().cloned().collect();
     let mut next = next_free.max(1);
     let mut founders = Vec::with_capacity(machines.len());
+    let mut assigned_labels: BTreeSet<String> = BTreeSet::new();
     for machine in machines {
         let label = match labels.get(&machine.recipient) {
-            Some(label) if super::is_label(label) => label.clone(),
-            Some(label) => {
+            Some(label) if super::is_label(label) && !assigned_labels.contains(label.as_str()) => {
+                label.clone()
+            }
+            Some(label) if !super::is_label(label) => {
                 return Err(Error::new(format!(
                     "{}'s label {label} is not m<N> with one to five digits",
                     machine.name
                 )));
             }
-            None => loop {
+            _ => loop {
+                if next > 99_999 {
+                    return Err(Error::new("no free m<N> label up to m99999"));
+                }
                 let label = format!("m{next}");
                 next += 1;
-                if !taken.contains(label.as_str()) {
+                if !taken.contains(label.as_str()) && !assigned_labels.contains(label.as_str()) {
+                    taken.insert(label.clone());
                     break label;
                 }
             },
         };
+        assigned_labels.insert(label.clone());
         founders.push(Founder {
             recipient: machine.recipient,
             binding: bound.get(&machine.recipient).map(|b| (*b).clone()),

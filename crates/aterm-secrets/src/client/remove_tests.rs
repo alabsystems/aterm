@@ -1181,3 +1181,737 @@ fn stolen_member_removal_denies_node_keys_and_expires_steward_lease() {
     .expect("parse lease");
     assert_eq!(after_lease.until, 0, "removed steward's lease must expire");
 }
+
+#[test]
+fn removing_one_split_clashed_mac_does_not_deny_surviving_mac_or_mark_restored_mac_left_out() {
+    let seat = |tag: u8| Seat {
+        identity: Identity::from_secret_bytes([tag; 32]),
+        tag,
+    };
+    let (a, b, clash1, clash2) = (seat(1), seat(2), seat(40), seat(41));
+    let mut log_a = Log::new(
+        Record::found(&[99; 32], vec![a.entrant("m1"), b.entrant("m2")], 1).expect("genesis"),
+    )
+    .expect("log");
+    let mut log_b = log_a.clone();
+
+    // Concurrent split admissions both claiming `m40`.
+    let admit1 = a.sign(
+        &mut log_a,
+        Body::Admit {
+            entrant: clash1.entrant("m40"),
+            evidence: crate::membership_log::Evidence::Phrase,
+        },
+    );
+    let admit2 = b.sign(
+        &mut log_b,
+        Body::Admit {
+            entrant: clash2.entrant("m40"),
+            evidence: crate::membership_log::Evidence::Phrase,
+        },
+    );
+    let admit2_id = *admit2.id();
+    let mut log = log_a;
+    log.insert(admit2).expect("merge admit2");
+    let mem_before = log.membership();
+    let label1 = mem_before
+        .get(&clash1.actor())
+        .expect("clash1 in")
+        .label
+        .clone();
+    let label2 = mem_before
+        .get(&clash2.actor())
+        .expect("clash2 in")
+        .label
+        .clone();
+    assert!(
+        label1.starts_with("m40-") && label2.starts_with("m40-"),
+        "both split claims are suffixed: {label1}, {label2}"
+    );
+
+    // Remove clash2; clash1 remains active.
+    a.sign(
+        &mut log,
+        Body::Remove {
+            member: clash2.actor(),
+            cutoff: admit2_id,
+        },
+    );
+    let mem_after = log.membership();
+    assert!(
+        !mem_after.removed_labels().contains("m40"),
+        "surviving split holder keeps bare m40 out of removed_labels: {:?}",
+        mem_after.removed_labels()
+    );
+    let mut roster = crate::swarm_roster::SwarmRoster::default();
+    super::roster::overlay_log_membership(&log, &mut roster);
+    assert!(
+        !roster.is_label_denied("m40") && !roster.is_label_denied(&label1),
+        "surviving split holder must not be label-denied: {:?}",
+        roster.deny_labels
+    );
+    let clash1_member = mem_after.get(&clash1.actor()).expect("clash1 still active");
+    assert!(
+        !log_entries::member_denied_by_roster(&roster, clash1_member),
+        "surviving split holder must not be denied by roster"
+    );
+
+    // Also verify `audience_left_out_recipient` when a removed Mac is restored concurrently
+    // with an epoch that causally follows its pre-removal wrap.
+    let (ep1_draft, ep1_key) = log
+        .draft_epoch(&a.actor(), 10, EpochAudience::Everyone, 1)
+        .expect("ep1");
+    let ep1 = ep1_draft.sign(&[a.tag; 32], [a.tag; 16]).expect("sign ep1");
+    let ep1_id = *ep1.id();
+    log.insert(ep1).expect("insert ep1");
+    for rec in [
+        a.identity.recipient(),
+        b.identity.recipient(),
+        clash1.identity.recipient(),
+    ] {
+        let w = log
+            .draft_wrap(&a.actor(), 11, ep1_id, &ep1_key, rec)
+            .expect("wrap")
+            .sign(&[a.tag; 32], [a.tag; 16])
+            .expect("sign wrap");
+        log.insert(w).expect("insert wrap");
+    }
+    // Remove clash1 and rotate to ep2 without clash1.
+    a.sign(
+        &mut log,
+        Body::Remove {
+            member: clash1.actor(),
+            cutoff: *admit1.id(),
+        },
+    );
+    let (ep2_draft, ep2_key) = log
+        .draft_epoch(&a.actor(), 12, EpochAudience::Everyone, 2)
+        .expect("ep2");
+    let ep2 = ep2_draft.sign(&[a.tag; 32], [a.tag; 16]).expect("sign ep2");
+    let ep2_id = *ep2.id();
+    log.insert(ep2).expect("insert ep2");
+    for rec in [a.identity.recipient(), b.identity.recipient()] {
+        let w = log
+            .draft_wrap(&a.actor(), 13, ep2_id, &ep2_key, rec)
+            .expect("wrap2")
+            .sign(&[a.tag; 32], [a.tag; 16])
+            .expect("sign wrap2");
+        log.insert(w).expect("insert wrap2");
+    }
+    assert!(
+        log.audience_left_out_recipient(&EpochAudience::Everyone, &clash1.identity.recipient()),
+        "CONTROL: before restore, clash1 is left out of ep2"
+    );
+
+    // Now b restores clash1 under a second device key (same recipient) on top of ep2,
+    // before wrapping ep2 to clash1.
+    let clash1_v2 = Seat {
+        identity: Identity::from_secret_bytes([40; 32]),
+        tag: 140,
+    };
+    let admit_v2 = b.sign(
+        &mut log,
+        Body::Admit {
+            entrant: clash1_v2.entrant("m42"),
+            evidence: crate::membership_log::Evidence::Phrase,
+        },
+    );
+    assert!(
+        !log.audience_left_out_recipient(&EpochAudience::Everyone, &clash1.identity.recipient()),
+        "restored Mac whose Admit follows ep2 must not be marked left out by pre-removal wrap"
+    );
+
+    // If clash1_v2 is also removed, `removal_target` still reports `is removed already` even
+    // though clash1's recipient now has two removed seats.
+    a.sign(
+        &mut log,
+        Body::Remove {
+            member: clash1_v2.actor(),
+            cutoff: *admit_v2.id(),
+        },
+    );
+    let err = removal_target(&log, &join_code(&clash1.identity.recipient()), &a.actor())
+        .expect_err("both incarnations removed");
+    assert!(
+        err.to_string().contains("is removed already"),
+        "expected removed already, got: {err}"
+    );
+}
+
+#[test]
+fn a_removed_mac_asking_again_with_fresh_secrets_key_and_same_node_key_is_restored() {
+    use crate::members::desk::{Asking, Desk, Handing, Local};
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"v1".as_slice())]);
+    let m7 = &macs.m7;
+    let node_key = [0x44; 32];
+    let (m40, request40, allowed40) = asker(macs.root.path(), m7, "m40", "m40");
+    let handout = hand_over(
+        m7,
+        &Handing {
+            request: &request40,
+            node: node_key,
+            name: "m40",
+            allowed: &allowed40,
+            reads_log: true,
+            restore: false,
+        },
+    )
+    .expect("m7 admits m40 with node_key");
+    assert!(handout.logged);
+    let bundle40 = crate::members::Bundle::decode(handout.bundle.as_slice()).unwrap();
+    write_from_log_bundle(&m40, &bundle40).unwrap();
+    let actor40_old = request40.binding().actor();
+    let label = log_of(m7)
+        .membership()
+        .get(&actor40_old)
+        .unwrap()
+        .label
+        .clone();
+    remove_member(m7, &label, false).expect("m7 removes m40");
+
+    // m40 wipes its ~/.secrets (fresh machine + device keys) while keeping its fleet node_key.
+    let (m40_fresh, request_fresh, allowed_fresh) = asker(macs.root.path(), m7, "m40-fresh", "m40");
+    assert_ne!(
+        request_fresh.binding().recipient(),
+        request40.binding().recipient()
+    );
+    assert_ne!(
+        request_fresh.binding().writer(),
+        request40.binding().writer()
+    );
+
+    let mut desk = Desk::new(Local::of(m7).unwrap().expect("m7 is a member"));
+    let now = Instant::now();
+    let device_fresh = Device::open(&m40_fresh).unwrap().unwrap();
+    let key = *desk.local().key();
+    let signature = crate::members::joiner::ask_signature(
+        &device_fresh,
+        &key,
+        &node_key,
+        "m40",
+        "Mac15,3",
+        request_fresh.bytes(),
+    )
+    .unwrap();
+    desk.hear(
+        &Asking {
+            wire: request_fresh.bytes(),
+            node: node_key,
+            name: "m40",
+            model: "Mac15,3",
+            signature: &signature,
+        },
+        "192.0.2.44".parse().unwrap(),
+        now,
+    )
+    .expect("heard fresh request with old node_key");
+
+    let rows = desk.rows(now);
+    let row = rows.iter().find(|r| r.name == "m40").unwrap().clone();
+    let note = row
+        .removed
+        .clone()
+        .expect("m40 asking with fresh secrets key and same node_key shows as removed");
+    assert_eq!(note.label, label);
+    assert!(!note.quorum);
+
+    let err = desk
+        .allow(row.id, now)
+        .expect_err("plain Allow must refuse removed node_key");
+    assert!(err.to_string().contains("Allow again"), "{err}");
+    desk.allow_again(row.id, now)
+        .expect("Allow again gives a phrase for removed node_key");
+
+    let restored_handout = hand_over(
+        m7,
+        &Handing {
+            request: &request_fresh,
+            node: node_key,
+            name: "m40",
+            allowed: &allowed_fresh,
+            reads_log: true,
+            restore: true,
+        },
+    )
+    .expect("m7 restores m40 under fresh secrets identity and same node_key");
+    assert!(restored_handout.logged);
+
+    let after_log = log_of(m7);
+    let membership = after_log.membership();
+    let actor_fresh = request_fresh.binding().actor();
+    let back = membership.get(&actor_fresh).expect("fresh seat is in");
+    assert_eq!(
+        back.label, label,
+        "restored under its old bare label without clash suffix"
+    );
+    assert_eq!(
+        membership.node(&node_key),
+        crate::membership_log::NodeStanding::Member(actor_fresh)
+    );
+    assert!(
+        removed_notes(m7)
+            .unwrap()
+            .of_with_node(
+                &request_fresh.binding().recipient(),
+                request_fresh.binding().writer(),
+                &node_key,
+            )
+            .is_none(),
+        "restored node_key is no longer in removed_notes"
+    );
+    let listed = member_list(m7).unwrap().unwrap();
+    assert_eq!(
+        listed.iter().filter(|m| m.label == label).count(),
+        1,
+        "member_list shows restored Mac once as active and not in gone: {listed:?}"
+    );
+    assert!(
+        listed
+            .iter()
+            .find(|m| m.label == label)
+            .unwrap()
+            .removed
+            .is_none()
+    );
+    let (restored_labels, restored_nodes) = roster::restored_by_log(&after_log);
+    assert!(restored_labels.contains(&label));
+    assert!(restored_nodes.contains(&aterm_codec::hex::encode_lower(&node_key)));
+
+    macs.server.stop();
+}
+
+#[test]
+fn a_secondary_admit_squatting_active_node_key_or_denied_label_does_not_hide_removal_or_lift_deny()
+{
+    let seat = |tag: u8| Seat {
+        identity: Identity::from_secret_bytes([tag; 32]),
+        tag,
+    };
+    let (a, b, y) = (seat(1), seat(2), seat(41));
+    let mut log = Log::new(
+        Record::found(&[99; 32], vec![a.entrant("m1"), b.entrant("m2")], 1).expect("genesis"),
+    )
+    .expect("log");
+
+    // A admits Y as `m41` with node_key `[41; 32]`.
+    let admit1 = a.sign(
+        &mut log,
+        Body::Admit {
+            entrant: y.entrant("m41"),
+            evidence: crate::membership_log::Evidence::Phrase,
+        },
+    );
+    let admit1_id = *admit1.id();
+
+    // B signs a redundant secondary Admit for Y carrying A's active node_key `[1; 32]` and a
+    // denied label `m99`, grinding `authored_ms` so its SHA-256 RecordId sorts below `admit1_id`.
+    let mut forged_entrant = y.entrant("m99");
+    forged_entrant.node_key = [a.tag; 32];
+    let mut admit2 = None;
+    for ts in 10..10_000 {
+        let candidate = log
+            .draft(
+                &b.actor(),
+                ts,
+                Body::Admit {
+                    entrant: forged_entrant.clone(),
+                    evidence: crate::membership_log::Evidence::Manual,
+                },
+            )
+            .sign(&[b.tag; 32], [b.tag; 16])
+            .expect("sign candidate");
+        if *candidate.id() < admit1_id {
+            admit2 = Some(candidate);
+            break;
+        }
+    }
+    let admit2 = admit2.expect("found smaller RecordId");
+    let admit2_id = *admit2.id();
+    log.insert(admit2).expect("insert admit2");
+
+    // A removes Y at `admit2_id`.
+    a.sign(
+        &mut log,
+        Body::Remove {
+            member: y.actor(),
+            cutoff: admit2_id,
+        },
+    );
+
+    // 1. A's node_key `[1; 32]` remains `Member(a.actor())`, and Y's node_key `[41; 32]` is `Removed`.
+    let membership = log.membership();
+    assert_eq!(
+        membership.node(&[a.tag; 32]),
+        crate::membership_log::NodeStanding::Member(a.actor())
+    );
+    assert_eq!(
+        membership.node(&[y.tag; 32]),
+        crate::membership_log::NodeStanding::Removed(y.actor())
+    );
+
+    // 2. `notes_of(&log)` still reports Y as removed under its earliest causal seat `m41`
+    // (not hidden by A's active node_key `[1; 32]`, and not relabeled `m99`).
+    let notes = notes_of(&log);
+    let note = notes
+        .of_with_node(
+            &y.identity.recipient(),
+            y.request().binding().writer(),
+            &[y.tag; 32],
+        )
+        .expect("Y must still appear in RemovedNotes");
+    assert_eq!(note.label, "m41");
+
+    // 3. If Y is later restored under a new device key (`y_v2`), `restored_by_log` lifts `m41`
+    // and `[41; 32]`, NOT `m99` from the redundant secondary Admit.
+    let y_v2 = Seat {
+        identity: Identity::from_secret_bytes([41; 32]),
+        tag: 141,
+    };
+    let mut restored_entrant = y_v2.entrant("m41");
+    restored_entrant.node_key = [y.tag; 32];
+    a.sign(
+        &mut log,
+        Body::Admit {
+            entrant: restored_entrant,
+            evidence: crate::membership_log::Evidence::Phrase,
+        },
+    );
+    let (restored_labels, restored_nodes) = roster::restored_by_log(&log);
+    assert!(restored_labels.contains("m41"));
+    assert!(
+        !restored_labels.contains("m99"),
+        "secondary Admit's label must not be lifted by restore: {restored_labels:?}"
+    );
+    assert!(restored_nodes.contains(&aterm_codec::hex::encode_lower(&[y.tag; 32])));
+}
+
+#[test]
+fn notes_of_and_kept_out_prefer_quorum_removal_and_newest_removed_seat_over_incarnation_sort() {
+    let seat = |tag: u8| Seat {
+        identity: Identity::from_secret_bytes([tag; 32]),
+        tag,
+    };
+    let (a, b, c) = (seat(1), seat(2), seat(3));
+    let mut log = Log::new(
+        Record::found(
+            &[99; 32],
+            vec![a.entrant("m1"), b.entrant("m2"), c.entrant("m3")],
+            1,
+        )
+        .expect("genesis"),
+    )
+    .expect("log");
+
+    // 1. Quorum removal vs single-member removal across two incarnations sharing recipient/writer:
+    // Seat 1 has incarnation `[0x01; 16]` (sorts FIRST in BTreeMap) and is removed by quorum (A + B).
+    // Seat 2 has incarnation `[0xFF; 16]` (sorts SECOND in BTreeMap) and is removed by A alone.
+    let target_id = Identity::from_secret_bytes([50; 32]);
+    let target_seed = [50u8; 32];
+    let req_quorum = crate::commons::binding::Request::create(
+        [2; 16],
+        [3; 32],
+        [50; 16],
+        [0x01; 16],
+        &target_id,
+        &target_seed,
+    )
+    .expect("req_quorum");
+    let req_single = crate::commons::binding::Request::create(
+        [2; 16],
+        [3; 32],
+        [50; 16],
+        [0xFF; 16],
+        &target_id,
+        &target_seed,
+    )
+    .expect("req_single");
+    assert!(
+        req_quorum.binding().actor() < req_single.binding().actor(),
+        "CONTROL: quorum seat sorts before single-member seat in BTreeMap"
+    );
+
+    let mut log_branch = log.clone();
+    let admit_quorum = a.sign(
+        &mut log,
+        Body::Admit {
+            entrant: crate::membership_log::Entrant {
+                request: req_quorum.clone(),
+                node_key: [0x50; 32],
+                name: "m50".to_owned(),
+                label: "m50".to_owned(),
+            },
+            evidence: crate::membership_log::Evidence::Phrase,
+        },
+    );
+    let admit_single = c.sign(
+        &mut log_branch,
+        Body::Admit {
+            entrant: crate::membership_log::Entrant {
+                request: req_single.clone(),
+                node_key: [0x50; 32],
+                name: "m50".to_owned(),
+                label: "m50".to_owned(),
+            },
+            evidence: crate::membership_log::Evidence::Phrase,
+        },
+    );
+    let rem_single = c.sign(
+        &mut log_branch,
+        Body::Remove {
+            member: req_single.binding().actor(),
+            cutoff: *admit_single.id(),
+        },
+    );
+    // Quorum of A and B removes `req_quorum`.
+    a.sign(
+        &mut log,
+        Body::Remove {
+            member: req_quorum.binding().actor(),
+            cutoff: *admit_quorum.id(),
+        },
+    );
+    b.sign(
+        &mut log,
+        Body::Remove {
+            member: req_quorum.binding().actor(),
+            cutoff: *admit_quorum.id(),
+        },
+    );
+    log.insert(admit_single).expect("merge admit_single");
+    log.insert(rem_single).expect("merge rem_single");
+
+    let notes = notes_of(&log);
+    let note = notes
+        .of_with_node(
+            &target_id.recipient(),
+            req_quorum.binding().writer(),
+            &[0x50; 32],
+        )
+        .expect("note present");
+    assert!(
+        note.quorum,
+        "quorum removal must not be overwritten by higher-MemberId single removal: {note:?}"
+    );
+    // Even if the Mac asks again with a brand-new writer key (same recipient), `kept_out_with_node`
+    // must still refuse `restore = true` because a quorum removed it.
+    let req_new_writer = crate::commons::binding::Request::create(
+        [2; 16],
+        [3; 32],
+        [51; 16],
+        [0x02; 16],
+        &target_id,
+        &[51u8; 32],
+    )
+    .expect("req_new_writer");
+    let why = super::admit::kept_out_with_node(&log, req_new_writer.binding(), [0; 32], true)
+        .expect("quorum-removed recipient must stay kept out on restore");
+    assert!(why.contains("quorum"), "{why}");
+
+    // 2. Two plain removals in causal order where the first seat has incarnation `[0xFF; 16]`
+    // (`m40`) and the restored second seat has incarnation `[0x01; 16]` (`m45`): `notes_of`
+    // must report the newer seat's label `m45`, not `m40`.
+    let plain_id = Identity::from_secret_bytes([60; 32]);
+    let req_first = crate::commons::binding::Request::create(
+        [2; 16],
+        [3; 32],
+        [60; 16],
+        [0xFF; 16],
+        &plain_id,
+        &[60u8; 32],
+    )
+    .expect("req_first");
+    let req_second = crate::commons::binding::Request::create(
+        [2; 16],
+        [3; 32],
+        [60; 16],
+        [0x01; 16],
+        &plain_id,
+        &[60u8; 32],
+    )
+    .expect("req_second");
+    assert!(
+        req_second.binding().actor() < req_first.binding().actor(),
+        "CONTROL: newer seat sorts before older seat in BTreeMap"
+    );
+    let admit1 = a.sign(
+        &mut log,
+        Body::Admit {
+            entrant: crate::membership_log::Entrant {
+                request: req_first.clone(),
+                node_key: [0x60; 32],
+                name: "m40".to_owned(),
+                label: "m40".to_owned(),
+            },
+            evidence: crate::membership_log::Evidence::Phrase,
+        },
+    );
+    a.sign(
+        &mut log,
+        Body::Remove {
+            member: req_first.binding().actor(),
+            cutoff: *admit1.id(),
+        },
+    );
+    let admit2 = a.sign(
+        &mut log,
+        Body::Admit {
+            entrant: crate::membership_log::Entrant {
+                request: req_second.clone(),
+                node_key: [0x60; 32],
+                name: "m45".to_owned(),
+                label: "m45".to_owned(),
+            },
+            evidence: crate::membership_log::Evidence::Phrase,
+        },
+    );
+    a.sign(
+        &mut log,
+        Body::Remove {
+            member: req_second.binding().actor(),
+            cutoff: *admit2.id(),
+        },
+    );
+    let notes2 = notes_of(&log);
+    let note2 = notes2
+        .of_with_node(
+            &plain_id.recipient(),
+            req_second.binding().writer(),
+            &[0x60; 32],
+        )
+        .expect("note2 present");
+    assert_eq!(
+        note2.label, "m45",
+        "notes_of must return the causally newer seat's label, got: {note2:?}"
+    );
+}
+
+#[test]
+fn removed_labels_overlay_and_local_label_resolution_enforce_node_and_recipient_removal() {
+    let seat = |tag: u8| Seat {
+        identity: Identity::from_secret_bytes([tag; 32]),
+        tag,
+    };
+    let (a, b, x, y) = (seat(1), seat(2), seat(40), seat(41));
+    let mut log = Log::new(
+        Record::found(&[99; 32], vec![a.entrant("m1"), b.entrant("m2")], 1).expect("genesis"),
+    )
+    .expect("log");
+
+    // X (`m40`) and Y (`m41`) are two incarnations of the same device (sharing writer seed
+    // `[40; 32]` and physical node_key `[0x40; 32]`); X is removed while Y is not explicitly
+    // named in a Remove record.
+    let mut ent_x = x.entrant("m40");
+    ent_x.node_key = [0x40; 32];
+    let admit_x = a.sign(
+        &mut log,
+        Body::Admit {
+            entrant: ent_x,
+            evidence: crate::membership_log::Evidence::Phrase,
+        },
+    );
+    let req_y = crate::commons::binding::Request::create(
+        [2; 16],
+        [3; 32],
+        [41; 16],
+        [0x41; 16],
+        &y.identity,
+        &[40u8; 32],
+    )
+    .expect("req_y");
+    let ent_y = crate::membership_log::Entrant {
+        request: req_y,
+        node_key: [0x40; 32],
+        name: "m41".to_owned(),
+        label: "m41".to_owned(),
+    };
+    a.sign(
+        &mut log,
+        Body::Admit {
+            entrant: ent_y,
+            evidence: crate::membership_log::Evidence::Phrase,
+        },
+    );
+    a.sign(
+        &mut log,
+        Body::Remove {
+            member: x.actor(),
+            cutoff: *admit_x.id(),
+        },
+    );
+
+    // 1. Because `[0x40; 32]` is `NodeStanding::Removed`, Y's seat (`m41`) is also out and its
+    // bare label `m41` must appear in `membership().removed_labels()`.
+    let membership = log.membership();
+    assert!(membership.removed_labels().contains("m40"));
+    assert!(
+        membership.removed_labels().contains("m41"),
+        "seat out by shared removed node_key must contribute its label to removed_labels: {:?}",
+        membership.removed_labels()
+    );
+
+    // 2. `overlay_log_membership` removes a `SwarmMember` row whose `node_key` is `[0x40; 32]`
+    // even if that row has a rotated recipient (`z`) that never appeared in `log`.
+    let z_rec = Identity::from_secret_bytes([42; 32])
+        .recipient()
+        .to_bech32();
+    let node40_hex = aterm_codec::hex::encode_lower(&[0x40; 32]);
+    let mut sw_roster = crate::swarm_roster::SwarmRoster {
+        deny_labels: Vec::new(),
+        deny_nodes: Vec::new(),
+        members: vec![
+            crate::swarm_roster::SwarmMember {
+                recipient: a.identity.recipient().to_bech32(),
+                vault_name: "m1".to_owned(),
+                label: "m1".to_owned(),
+                aliases: Vec::new(),
+                hint: None,
+                admitted_ms: 0,
+                claimed_label: None,
+                claimed_at_ms: None,
+                node_id: None,
+                node_key: Some(aterm_codec::hex::encode_lower(&[a.tag; 32])),
+            },
+            crate::swarm_roster::SwarmMember {
+                recipient: z_rec,
+                vault_name: "m42".to_owned(),
+                label: "m42".to_owned(),
+                aliases: Vec::new(),
+                hint: None,
+                admitted_ms: 0,
+                claimed_label: None,
+                claimed_at_ms: None,
+                node_id: None,
+                node_key: Some(node40_hex.clone()),
+            },
+        ],
+    };
+    roster::overlay_log_membership(&log, &mut sw_roster);
+    assert!(
+        !sw_roster.members.iter().any(|m| m.label == "m42"),
+        "row with log-removed node_key must be evicted from members: {:?}",
+        sw_roster.members
+    );
+    assert!(sw_roster.is_label_denied("m42"));
+    assert!(sw_roster.is_node_denied(&node40_hex));
+
+    // 3. `resolve_local_swarm_label` returns `Ok(None)` when the local Mac is removed in the log
+    // or denied in the roster, even if `source.toml` (`host = "m7"`) and `state.toml` (`name = "m7"`)
+    // still name `"m7"`.
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"v1".as_slice())]);
+    let (m22, m7) = (&macs.m22, &macs.m7);
+    assert_eq!(
+        crate::client::resolve_local_swarm_label(m7, &[]).expect("resolve before removal"),
+        Some("m7".to_owned()),
+        "CONTROL: m7 resolves its swarm label before removal"
+    );
+    remove_member(m22, "m7", false).expect("m22 removes m7");
+    post_records_to_servers(m22).expect("m22 posts");
+    sync(m7, None).expect("m7 syncs removal");
+    assert_eq!(
+        crate::client::resolve_local_swarm_label(m7, &["m7".to_owned()])
+            .expect("resolve after removal"),
+        None,
+        "log-removed Mac must not resolve a swarm label from state.toml, source.toml, or hostnames"
+    );
+    macs.server.stop();
+}

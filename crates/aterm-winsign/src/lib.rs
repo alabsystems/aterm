@@ -152,6 +152,9 @@ pub trait Host {
     fn is_windows(&self) -> bool;
 }
 
+/// Maximum bytes [`RealHost::read_to_string`] reads from a host file.
+const MAX_HOST_READ_BYTES: u64 = 1024 * 1024;
+
 /// The real machine.
 pub struct RealHost;
 
@@ -172,10 +175,65 @@ impl Host for RealHost {
             .unwrap_or_default()
     }
     fn read_to_string(&self, path: &Path) -> Result<String, String> {
-        std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))
+        use std::io::Read;
+        let pre =
+            std::fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        if !pre.file_type().is_file() {
+            return Err(format!("{}: not a regular file", path.display()));
+        }
+        let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let meta = file
+            .metadata()
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        if !meta.is_file() {
+            return Err(format!("{}: not a regular file", path.display()));
+        }
+        if meta.len() > MAX_HOST_READ_BYTES {
+            return Err(format!(
+                "{}: exceeds {MAX_HOST_READ_BYTES}-byte limit",
+                path.display()
+            ));
+        }
+        let mut out = String::new();
+        let read = file
+            .take(MAX_HOST_READ_BYTES + 1)
+            .read_to_string(&mut out)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        if read as u64 > MAX_HOST_READ_BYTES {
+            return Err(format!(
+                "{}: exceeds {MAX_HOST_READ_BYTES}-byte limit",
+                path.display()
+            ));
+        }
+        Ok(out)
     }
     fn write(&self, path: &Path, text: &str) -> Result<(), String> {
-        std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))
+        use std::io::Write;
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_file() => {
+                std::fs::remove_file(path).map_err(|e| format!("{}: {e}", path.display()))?;
+            }
+            Ok(_) => {
+                return Err(format!(
+                    "{}: refusing to overwrite non-regular file",
+                    path.display()
+                ));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        }
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts
+            .open(path)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        file.write_all(text.as_bytes())
+            .map_err(|e| format!("{}: {e}", path.display()))
     }
     fn remove_file(&self, path: &Path) {
         let _ = std::fs::remove_file(path);
@@ -188,7 +246,8 @@ impl Host for RealHost {
     }
     fn home(&self) -> Option<PathBuf> {
         std::env::var_os("USERPROFILE")
-            .or_else(|| std::env::var_os("HOME"))
+            .filter(|v| !v.is_empty())
+            .or_else(|| std::env::var_os("HOME").filter(|v| !v.is_empty()))
             .map(PathBuf::from)
     }
     fn sdk_arch(&self) -> &'static str {
@@ -394,9 +453,13 @@ pub fn versions_newest_first<'a>(names: impl IntoIterator<Item = &'a str>) -> Ve
         .filter_map(|n| {
             let parts: Vec<u64> = n
                 .split('.')
-                .map(str::parse)
-                .collect::<Result<_, _>>()
-                .ok()?;
+                .map(|p| {
+                    p.bytes()
+                        .all(|b| b.is_ascii_digit())
+                        .then(|| p.parse().ok())
+                        .flatten()
+                })
+                .collect::<Option<_>>()?;
             Some((parts, n))
         })
         .collect();
@@ -508,7 +571,7 @@ pub fn find_dlib(host: &dyn Host, configured: Option<&Path>) -> Result<PathBuf, 
     }
     Err(format!(
         "Azure.CodeSigning.Dlib.dll not found (looked for {}). Install the Microsoft.ArtifactSigning.Client \
-         NuGet package (apps/aterm-win/SIGNING.md, step 4) or set ATERM_WINSIGN_DLIB to the dll.",
+         NuGet package (apps/aterm-win/SIGNING.md, Lane A step 7) or set ATERM_WINSIGN_DLIB to the dll.",
         looked.join(", ")
     ))
 }
@@ -575,7 +638,7 @@ pub fn find_dotnet_runtime(host: &dyn Host) -> Result<DotnetRuntime, String> {
     Err(format!(
         ".NET {DOTNET_MIN_MAJOR}+ runtime not found (looked for {}). The Trusted Signing plug-in is a .NET \
          component; install the runtime without admin with Microsoft's dotnet-install.ps1 \
-         (apps/aterm-win/SIGNING.md, step 4), or set DOTNET_ROOT.",
+         (apps/aterm-win/SIGNING.md, Lane A step 7), or set DOTNET_ROOT.",
         looked.join(", ")
     ))
 }
@@ -1705,7 +1768,7 @@ Successfully verified: aterm.exe
     #[test]
     fn versions_sort_numerically() {
         assert_eq!(
-            versions_newest_first(["1.0.9", "1.0.10", "x", "1.0.52"]),
+            versions_newest_first(["1.0.9", "1.0.10", "x", "1.+0.99", "1.0.52"]),
             ["1.0.52", "1.0.10", "1.0.9"]
         );
     }
@@ -1979,5 +2042,19 @@ Successfully verified: aterm.exe
             find_signtool(&h, None).expect("signtool found on Windows PATH"),
             Path::new(r"C:\Windows Kits\bin\signtool.exe")
         );
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let regular = dir.path().join("meta.json");
+        RealHost.write(&regular, "{}").expect("write regular file");
+        assert_eq!(RealHost.read_to_string(&regular).expect("read"), "{}");
+        #[cfg(unix)]
+        {
+            let target = dir.path().join("victim.txt");
+            std::fs::write(&target, "keep").expect("seed victim");
+            let link = dir.path().join("link.json");
+            std::os::unix::fs::symlink(&target, &link).expect("symlink");
+            assert!(RealHost.write(&link, "clobber").is_err());
+            assert!(RealHost.read_to_string(&link).is_err());
+            assert_eq!(std::fs::read_to_string(&target).expect("intact"), "keep");
+        }
     }
 }

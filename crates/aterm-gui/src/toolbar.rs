@@ -2348,65 +2348,14 @@ mod macos {
                                 appkit::send_v(ring, sel!(stroke));
                             }
                             TabStatusKind::Attention => {
-                                let level = metadata.attention;
-                                if level == crate::tab_bar::ChipLevel::Done {
-                                    appkit::send_v(ns_color(sel!(secondaryLabelColor)), sel!(set));
-                                    appkit::send_v(circle(x, y, 1.5 * scale), sel!(fill));
-                                    continue;
-                                }
-                                if level == crate::tab_bar::ChipLevel::Note {
-                                    appkit::send_v(ink, sel!(set));
-                                    let half = f64::from(crate::tab_bar::NOTE_DASH_HALF) * scale;
-                                    let dash = bezier_path();
-                                    appkit::send_v_f64(dash, sel!(setLineWidth:), 1.25 * scale);
-                                    appkit::send_v_usize(
-                                        dash,
-                                        sel!(setLineCapStyle:),
-                                        consts::NS_LINE_CAP_STYLE_ROUND,
-                                    );
-                                    appkit::send_v_point(
-                                        dash,
-                                        sel!(moveToPoint:),
-                                        point(x - half, y),
-                                    );
-                                    appkit::send_v_point(
-                                        dash,
-                                        sel!(lineToPoint:),
-                                        point(x + half, y),
-                                    );
-                                    appkit::send_v(dash, sel!(stroke));
-                                    continue;
-                                }
-                                if level == crate::tab_bar::ChipLevel::Yours {
-                                    appkit::send_v(ink, sel!(set));
-                                    let side = 4.4 * scale;
-                                    let square = rounded_rect(
-                                        rect(x - side * 0.5, y - side * 0.5, side, side),
-                                        0.8 * scale,
-                                    );
-                                    appkit::send_v_f64(square, sel!(setLineWidth:), 1.15 * scale);
-                                    appkit::send_v(square, sel!(stroke));
-                                    continue;
-                                }
-                                let hue = if matches!(level, crate::tab_bar::ChipLevel::Stop(_)) {
-                                    sel!(systemRedColor)
-                                } else {
-                                    sel!(systemOrangeColor)
-                                };
-                                appkit::send_v(ns_color(hue), sel!(set));
-                                let radius = 2.5 * scale;
-                                let diamond = polygon(&[
-                                    point(x, y + radius),
-                                    point(x + radius, y),
-                                    point(x, y - radius),
-                                    point(x - radius, y),
-                                ]);
-                                if matches!(level, crate::tab_bar::ChipLevel::Stop(_)) {
-                                    appkit::send_v(diamond, sel!(fill));
-                                } else {
-                                    appkit::send_v_f64(diamond, sel!(setLineWidth:), 1.15 * scale);
-                                    appkit::send_v(diamond, sel!(stroke));
-                                }
+                                appkit::send_v(ink, sel!(set));
+                                let side = 4.4 * scale;
+                                let square = rounded_rect(
+                                    rect(x - side * 0.5, y - side * 0.5, side, side),
+                                    0.8 * scale,
+                                );
+                                appkit::send_v_f64(square, sel!(setLineWidth:), 1.15 * scale);
+                                appkit::send_v(square, sel!(stroke));
                             }
                             TabStatusKind::Connection => {
                                 if let Some(role) = metadata.conn {
@@ -4351,6 +4300,8 @@ mod macos {
                 (TabView::class(), sel!(tabMenuAction:), "v@:@".into()),
                 (TabView::class(), sel!(tabMenuSessionAction:), "v@:@".into()),
                 (TabView::class(), sel!(tabMenuConnection:), "v@:@".into()),
+                (TabView::class(), sel!(tabMenuUpgrade:), "v@:@".into()),
+                (TabView::class(), sel!(tabMenuRewind:), "v@:@".into()),
                 (TabView::class(), sel!(dealloc), "v@:".into()),
                 (
                     ToolbarDelegate::class(),

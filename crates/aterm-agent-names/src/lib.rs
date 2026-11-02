@@ -41,7 +41,7 @@ impl Agent {
 pub fn agent_of(program: &str) -> Option<Agent> {
     let word = program_word(program);
     let is = |name: &str| word.eq_ignore_ascii_case(name);
-    if is("claude") || is("claude-code") {
+    if is("claude") || is("claude-code") || is("claude-alab") || is("claude-code-alab") {
         Some(Agent::Claude)
     } else if is("codex") || is("codex-old") {
         Some(Agent::Codex)
@@ -104,6 +104,12 @@ mod tests {
             ("CODEX", Some(Agent::Codex)),
             ("/usr/local/bin/Claude --resume", Some(Agent::Claude)),
             ("-Claude-Code", Some(Agent::Claude)),
+            ("claude-alab", Some(Agent::Claude)),
+            ("-CLAUDE-CODE-ALAB --resume", Some(Agent::Claude)),
+            (
+                "/opt/pkg/store/claude-code-alab/14275/bin/claude-alab --resume x",
+                Some(Agent::Claude),
+            ),
             ("Agy", Some(Agent::Agy)),
             ("MUSE x", Some(Agent::Muse)),
             (
@@ -134,6 +140,9 @@ mod tests {
             ("grok-", None),
             ("kimi-alab", None),
             ("claude-codes", None),
+            ("claude-alabs", None),
+            ("claude-code-alabs", None),
+            ("xclaude-alab", None),
             ("node", None),
             ("", None),
         ] {

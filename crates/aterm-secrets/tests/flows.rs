@@ -38,26 +38,30 @@ struct Lab {
     url: String,
     hold: Duration,
     gap: Duration,
+    /// The server stands in for one on the home ALab LAN, where members answered
+    /// (`server::start_at_home`).
+    home: bool,
 }
 
 fn start(
     listener: std::net::TcpListener,
     store: PathBuf,
-    hold: Duration,
-    gap: Duration,
+    (hold, gap): (Duration, Duration),
+    home: bool,
 ) -> Running {
-    server::start_with_join_change_gap(
-        listener,
-        &Options {
-            listen: "127.0.0.1:0".parse().expect("addr"),
-            store,
-            advertise: None,
-            pins: Vec::new(),
-            hold,
-            keep_awake: false,
-        },
-        gap,
-    )
+    let options = Options {
+        listen: "127.0.0.1:0".parse().expect("addr"),
+        store,
+        advertise: None,
+        pins: Vec::new(),
+        hold,
+        keep_awake: false,
+    };
+    if home {
+        server::start_at_home(listener, &options, gap)
+    } else {
+        server::start_with_join_change_gap(listener, &options, gap)
+    }
     .expect("server starts")
 }
 
@@ -74,11 +78,20 @@ impl Lab {
         Lab::tuned(vault, Duration::from_secs(50), Duration::ZERO)
     }
 
+    /// A lab whose server is on the home ALab LAN, its join queue changeable at once.
+    fn at_home(vault: &str) -> Lab {
+        Lab::placed(vault, (Duration::from_secs(50), Duration::ZERO), true)
+    }
+
     fn tuned(vault: &str, hold: Duration, gap: Duration) -> Lab {
+        Lab::placed(vault, (hold, gap), false)
+    }
+
+    fn placed(vault: &str, (hold, gap): (Duration, Duration), home: bool) -> Lab {
         let root = aterm_tempfile::tempdir().expect("tempdir");
         let socket = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let copy = socket.try_clone().expect("a copy of the socket");
-        let server = start(copy, root.path().join("store"), hold, gap);
+        let server = start(copy, root.path().join("store"), (hold, gap), home);
         let url = format!("http://{}/v1/{vault}", server.addr);
         Lab {
             root,
@@ -87,6 +100,7 @@ impl Lab {
             url,
             hold,
             gap,
+            home,
         }
     }
 
@@ -95,7 +109,7 @@ impl Lab {
         let store = self.root.path().join("store");
         std::fs::remove_dir_all(&store).expect("store removed");
         let copy = self.socket.try_clone().expect("a copy of the socket");
-        self.server = Some(start(copy, store, self.hold, self.gap));
+        self.server = Some(start(copy, store, (self.hold, self.gap), self.home));
     }
 
     /// Stop the server: no admin's approver, and no vault, can be reached.
@@ -109,8 +123,8 @@ impl Lab {
         self.server = Some(start(
             copy,
             self.root.path().join("store"),
-            self.hold,
-            self.gap,
+            (self.hold, self.gap),
+            self.home,
         ));
     }
 
@@ -881,7 +895,7 @@ fn approved(admin: &Paths) -> Vec<String> {
     approved
 }
 
-/// A personal open vault (`open = yes`) lets no machine in by itself: not one that asks with no
+/// A personal open vault (its open note) lets no machine in by itself: not one that asks with no
 /// password, nor one that proves an old one. Only a request carrying a member's Allow is
 /// admitted, recorded as a person's decision, and once the vault lets that machine go, its
 /// Allow, still queued, cannot bring it back (docs/DESIGN-fluid-swarm-2026-10-28.md F10).
@@ -963,15 +977,38 @@ fn a_personal_vault_request_with_no_allow_is_never_admitted() {
     ));
 }
 
-/// A first-time LAN join needs no member's Allow, password or interaction under the
-/// default ALab policy. It gains the same authenticated secrets and Commons writer
-/// enrollment as an explicitly admitted member, and a later revoke still keeps it out.
+/// A first-time join on the home ALab LAN (its server observed it where members answered)
+/// needs no member's Allow, password or interaction under the default ALab policy. It gains the
+/// same authenticated secrets and Commons writer enrollment as an explicitly admitted member,
+/// and a later revoke still keeps it out. The same join at a server with no member evidence (a
+/// phone hotspot, a café) is never let in by the policy.
+///
+/// NEGATIVE CONTROL: with the lab's server started plainly (`Lab::changing`, no home), the
+/// request lists no `home=` and `test_auto_approve_alab_lan` approves nobody, so the
+/// `["m2"]` assertion fails (the second half of this test is that control, kept).
 #[test]
 fn the_default_alab_lan_policy_admits_a_new_machine_and_converges_commons() {
     use aterm_secrets::commons::binding::Pending;
     use aterm_secrets::commons::roster::Role;
 
-    let lab = Lab::changing("alab");
+    {
+        let away = Lab::changing("alab");
+        let admin = away.home("m1");
+        let created = client::create(&admin, &away.url, None, Some("m1")).unwrap();
+        let machine = away.home("m2");
+        let pinned = format!("{}#{}", away.url, created.signer);
+        join_unattended(&machine, &pinned, "m2").unwrap();
+        let requests = client::requests(&admin, None).unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].home.is_none(), "no member evidence: no home");
+        assert!(
+            client::test_auto_approve_alab_lan(&admin)
+                .unwrap()
+                .approved
+                .is_empty()
+        );
+    }
+    let lab = Lab::at_home("alab");
     let admin = lab.home("m1");
     let token = synthetic("gh");
     write_private(&admin.home.join(".secrets/gh_access_token"), &token);
@@ -990,7 +1027,9 @@ fn the_default_alab_lan_policy_admits_a_new_machine_and_converges_commons() {
     ));
     let requests = client::requests(&admin, None).unwrap();
     assert_eq!(requests.len(), 1);
-    assert!(requests[0].lan && requests[0].allowed.is_none() && requests[0].proof.is_none());
+    assert!(
+        requests[0].home.is_some() && requests[0].allowed.is_none() && requests[0].proof.is_none()
+    );
     // The fixture's key is not the compiled ALab key, even though its vault is named alab.
     assert!(client::auto_approve(&admin).unwrap().approved.is_empty());
     let done = client::test_auto_approve_alab_lan(&admin).unwrap();
@@ -1183,6 +1222,7 @@ fn an_allowed_signed_by_a_key_no_roster_member_binds_is_refused() {
             code: client::join_code(&recipient),
             time: None,
             lan: false,
+            home: None,
             allowed: Some(allowed.to_text()),
             proof: None,
         }

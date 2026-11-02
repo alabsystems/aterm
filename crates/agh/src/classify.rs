@@ -15,7 +15,7 @@ fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
 
 #[inline]
 fn number(headers: &[(String, String)], name: &str) -> Option<u64> {
-    header(headers, name).and_then(|v| v.parse::<u64>().ok())
+    header(headers, name).and_then(crate::path::digits)
 }
 
 #[inline]

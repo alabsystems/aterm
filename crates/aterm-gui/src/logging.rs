@@ -615,7 +615,9 @@ fn consumed_report_pid(name: &str) -> Option<u32> {
         .strip_prefix("marker-")
         .or_else(|| body.strip_prefix("signal-"))
         .unwrap_or(body);
-    body.split('-').next()?.parse().ok()
+    let pid = body.split('-').next()?;
+    (!pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit())).then_some(())?;
+    pid.parse().ok()
 }
 
 fn no_log_dir_reason(state_home: Option<&std::ffi::OsStr>, dir: Option<PathBuf>) -> String {
@@ -836,8 +838,15 @@ pub(crate) fn open_append_0600(path: &Path) -> std::io::Result<File> {
         .create(true)
         .append(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    if !f.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     Ok(f)
 }
 
@@ -875,10 +884,18 @@ fn create_0600(path: &Path) -> std::io::Result<File> {
     let f = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
-        .truncate(true)
+        .truncate(false)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    if !f.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    f.set_len(0)?;
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     Ok(f)
 }
 
@@ -1016,7 +1033,10 @@ impl FileLogger {
     }
 
     fn flush_within(&self, within: Duration) -> bool {
-        let deadline = Instant::now() + within;
+        let now = Instant::now();
+        let deadline = now
+            .checked_add(within)
+            .unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 3600));
         loop {
             let mut file = match self.file.try_lock() {
                 Ok(file) => file,
@@ -1174,6 +1194,19 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         assert_eq!(read(&path), "first\nsecond\n");
+
+        let outside = dir.0.path().join("outside.txt");
+        std::fs::write(&outside, b"keep\n").unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = dir.0.path().join("linked.log");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        assert!(open_append_0600(&link).is_err());
+        assert!(create_0600(&link).is_err());
+        assert_eq!(read(&outside), "keep\n");
+        assert_eq!(
+            std::fs::metadata(&outside).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
     }
 
     #[test]

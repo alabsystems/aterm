@@ -7,7 +7,7 @@ use super::super::policy::approval::RULE_RM_BREAKER_WARN;
 use super::super::policy::approval::{
     AnswerTarget, ApprovalCtx, Choice, DeclineStep, QuestionPriority, RULE_AUTO_MODE_SETUP,
     RULE_AUTOCOMPACT_OFFER, RULE_LIMIT_RESET, RULE_LIMIT_WAIT, RULE_TRUST_ANY, RULE_TRUST_DIALOG,
-    decide, proof_would_lift, unvoiced_tools,
+    decide, proof_would_lift, reads_from_stand, unvoiced_tools,
 };
 use super::super::policy::box_call;
 use super::super::policy::box_facts::{BoxFacts, QuestionFacts};
@@ -350,6 +350,8 @@ fn meta_names(stdout: &str, key: &str) -> bool {
 pub(super) struct AutopilotWord {
     kept: bool,
     word: Option<Autopilot>,
+    /// Whether a person set the stored word: `meta`'s `autopilot_by=human:…` (v6 §14.17 item 3).
+    by_person: bool,
     /// The stored word a wait at rest last woke on (`OK autopilot <word>`), until a read.
     reported: Option<Option<Autopilot>>,
     fresh: bool,
@@ -368,6 +370,7 @@ impl AutopilotWord {
         self.word = meta_word(meta, "autopilot")
             .as_deref()
             .and_then(Autopilot::parse);
+        self.by_person = meta_word(meta, "autopilot_by").is_some_and(|by| by.starts_with("human:"));
         self.reported = None;
         self.fresh = true;
         self.read = true;
@@ -402,6 +405,11 @@ impl AutopilotWord {
     /// The session's own word as the last reply read named it ([`Self::word`]).
     pub(super) const fn word(&self) -> Option<Autopilot> {
         self.word
+    }
+
+    /// Whether a person set the session's word where the last reply read it ([`Self::by_person`]).
+    pub(super) const fn by_person(&self) -> bool {
+        self.by_person
     }
 
     /// Whether the host ever answered a bare `meta`, read or refused.
@@ -490,7 +498,8 @@ fn leave_wait(now: Instant, deny: Option<Instant>) -> Duration {
 
 const TICK_SLACK: Duration = Duration::from_secs(3);
 
-/// Recheck interval for a box whose auto-deny countdown has not yet been seen ticking.
+/// Recheck interval for a box whose auto-deny countdown has not yet been seen ticking, or whose
+/// person count is owed a verdict ([`Episode::owed`]).
 pub(super) const TICK_LOOK: Duration = Duration::from_secs(1);
 
 /// Auto-deny countdown read from a box, trusted only once seen ticking in step with the loop's clock.
@@ -561,27 +570,118 @@ pub(super) enum DenyClock {
     At { deny: Instant },
 }
 
+/// How long Claude Code's auto-deny countdown runs from the box's first frame: two minutes,
+/// measured on 2.1.301's rm safety check (`docs/measured/real-claude-lab-2026-10-15.md`, "The
+/// auto-deny countdown under a hold").
+pub(super) const AUTO_DENY_WINDOW: Duration = Duration::from_secs(120);
+
+/// When the box an episode reads was drawn, as far as its countdown tells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Drawn {
+    /// It draws no countdown, or the episode read one showing more time left than
+    /// [`AUTO_DENY_WINDOW`] and [`TICK_SLACK`] allow, which that window cannot place: at any time
+    /// before its first read.
+    Untold,
+    /// Its countdown row is drawn and its time is not read (`about 2 minutes`, a row cut
+    /// mid-redraw): a later frame's countdown may place it.
+    Unread,
+    /// Its countdown has not been seen ticking yet, so it is not believed yet.
+    Unseen,
+    /// No earlier than this: its ticking countdown's deny less [`AUTO_DENY_WINDOW`] and the
+    /// [`TICK_SLACK`] a countdown's clock is believed to.
+    From(Instant),
+}
+
+/// A rise in the person count a box's first read found, owed a verdict ([`Episode::owed`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Owed {
+    /// The count that read found.
+    count: u64,
+    /// How long before that read's snapshot the person's last gesture was (`human_ms`).
+    ms: u64,
+    /// The latest instant that gesture can have been made: `ms` before the next read was asked
+    /// for, which was after the server took the snapshot. `None` until that next read.
+    last: Option<Instant>,
+}
+
 /// Contiguous box episode tracking whether a person or another driver touched the session while a box was up.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Episode {
     baseline: Option<u64>,
     by: Option<&'static str>,
+    /// The box the episode's last read showed ([`box_identity`]).
+    shown: String,
+    /// The person count a box's first read found above `baseline`: a gesture between the read
+    /// before the box and its first read, told apart from the box once its countdown places the
+    /// box's first frame.
+    owed: Option<Owed>,
+    /// A countdown the episode read showed more time left than [`AUTO_DENY_WINDOW`] and
+    /// [`TICK_SLACK`] allow: that window places none of its boxes ([`Drawn::Untold`]).
+    outlasted: bool,
 }
 
 const BY_DRIVER: &str = "another driver's hand was on the session while it was up";
+
+const BY_OWED: &str = "a person's gesture was counted between the read before it and its first \
+                       read, which its countdown, once seen ticking, places before or after it";
+
+const BY_COUNTED: &str = "a person's gesture was counted on the session since it appeared";
 
 impl Episode {
     fn touch(&mut self, by: &'static str) {
         self.by.get_or_insert(by);
     }
 
-    fn read(&mut self, screen: &Screen) {
+    /// Who touched the box: a person count owed a verdict ([`Self::owed`]) is a touch until its
+    /// countdown says it came before the box.
+    const fn by(&self) -> Option<&'static str> {
+        match (self.by, self.owed) {
+            (Some(by), _) => Some(by),
+            (None, Some(_)) => Some(BY_OWED),
+            (None, None) => None,
+        }
+    }
+
+    /// Reads `screen`, asked for at `asked` (`first`: the read that first found the box it shows).
+    /// A rise in the person count is a touch unless the box's first read found it and the person's
+    /// last gesture by then is older than the box's first frame ([`Drawn::From`]): that gesture
+    /// answered something else, and the count it left is the episode's baseline.
+    fn read(&mut self, screen: &Screen, asked: Instant, first: bool, drawn: Drawn) {
         let by = match (self.baseline, screen.human_seq, screen.human) {
             (None, _, _) | (_, None, _) | (_, _, HumanInput::Unknown) => {
                 "whether a person touched it since it appeared cannot be told"
             }
-            (Some(then), Some(now), _) if now > then => {
-                "a person's gesture was counted on the session since it appeared"
+            (Some(then), Some(now), human) if now > then => {
+                if first {
+                    self.owed = match human {
+                        HumanInput::Ago(ms) => Some(Owed {
+                            count: now,
+                            ms,
+                            last: None,
+                        }),
+                        HumanInput::Never | HumanInput::NeverFor(_) | HumanInput::Unknown => None,
+                    };
+                } else if let Some(o) = self.owed.as_mut().filter(|o| o.last.is_none()) {
+                    o.last = asked.checked_sub(Duration::from_millis(o.ms));
+                }
+                match (self.owed.take().filter(|o| o.count == now), drawn) {
+                    (Some(o), Drawn::Unseen | Drawn::Unread) => {
+                        self.owed = Some(o);
+                        return;
+                    }
+                    (Some(o), Drawn::From(from)) => match o.last {
+                        None => {
+                            self.owed = Some(o);
+                            return;
+                        }
+                        Some(last) if last < from => {
+                            self.baseline = Some(now);
+                            return;
+                        }
+                        Some(_) => BY_COUNTED,
+                    },
+                    _ => BY_COUNTED,
+                }
             }
             (Some(then), Some(now), _) if now < then => {
                 "the session's person count started over since it appeared, so whether a \
@@ -643,7 +743,7 @@ impl LaunchStatus {
         let field = |f: &str| super::escalate::status_field(stdout, f);
         Self {
             person_seq: (field("launch") == Some("person"))
-                .then(|| field("launch_seq").and_then(|n| n.parse().ok()))
+                .then(|| field("launch_seq").and_then(crate::parse_uint))
                 .flatten(),
             input: field("input").map(str::to_string),
             program: field("program").map(str::to_string),
@@ -704,6 +804,8 @@ fn told_by_role(act: &Act, p: &aterm_phase::PromptV2, what: &str) -> Option<(Str
 struct Reads {
     git: bool,
     bash: bool,
+    /// The Bash box reads a path from where its command stands ([`reads_from_stand`]).
+    stand: bool,
     asks: bool,
 }
 
@@ -759,6 +861,7 @@ impl<C: Ctl> Session<'_, C> {
         }
         if !r.ok() {
             self.person = None;
+            self.key = None;
             self.launch_status = LaunchStatus::default();
             self.status_sid = None;
             self.halted = false;
@@ -769,8 +872,15 @@ impl<C: Ctl> Session<'_, C> {
         self.halted = field("hold").as_deref() == Some("1");
         self.status_sid = field("sid").filter(|s| s != "-");
         self.person = field("human_ms")
-            .and_then(|ms| ms.parse::<u64>().ok())
+            .and_then(|ms| crate::parse_uint::<u64>(&ms))
             .and_then(|ms| self.fx.mono().checked_sub(Duration::from_millis(ms)));
+        // The person's typing alone, never a scroll or a click; a window that reports no typing
+        // stamp of its own says it by `human_ms`.
+        self.key = match field("human_typed_ms") {
+            None => self.person,
+            Some(ms) => crate::parse_uint::<u64>(&ms)
+                .and_then(|ms| self.fx.mono().checked_sub(Duration::from_millis(ms))),
+        };
         self.note_hand(&r.stdout);
         let program = field("program");
         let named_agent = program
@@ -785,17 +895,28 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// Another driver's hand on `status` holds the loop as a person's key does and touches the box
-    /// episode.
+    /// episode. One no window host holds is the person's key for the go-ahead too
+    /// ([`crate::harness::relaunch::outside_hand`]), kept past the reads after it lifts
+    /// (`Session::hand_key`, 2026-10-30 review 9); another `aterm harness` process's own lease
+    /// (`aterm harness upgrade`'s) holds the loop and leaves that key as the window measured it.
     pub(super) fn note_hand(&mut self, status: &str) {
         self.driver = crate::harness::relaunch::driver_hand(status);
         if self.driver {
             self.person = Some(self.fx.mono());
             self.episode_driven();
         }
+        if crate::harness::relaunch::outside_hand(status) {
+            self.hand_key = Some(self.fx.mono());
+        }
     }
 
     fn box_facts(&mut self, fresh_cwd: bool, reads: Reads) -> Result<BoxFacts, Fail> {
-        let Reads { git, bash, asks } = reads;
+        let Reads {
+            git,
+            bash,
+            stand,
+            asks,
+        } = reads;
         if fresh_cwd {
             let r = self.call(&["meta"])?;
             if self.unserved(&r) {
@@ -826,7 +947,11 @@ impl<C: Ctl> Session<'_, C> {
                 WorkerSource::Session => self.worker_env(),
                 WorkerSource::Fixed(worker) => worker,
             };
-            if git && let (Ok(w), Some(cwd)) = (&worker, cwd.as_deref()) {
+            // A Bash box's secrets check reads a relative path where the Bash tool stands, as a
+            // git read is judged there; the session's worker re-reads the cwd for it.
+            if (git || stand && session)
+                && let (Ok(w), Some(cwd)) = (&worker, cwd.as_deref())
+            {
                 facts.shell_cwds = probe.shell_cwds(w, cwd);
             }
             if bash && session {
@@ -1007,6 +1132,11 @@ impl<C: Ctl> Session<'_, C> {
                 reason: format!("another supervisor ({holder}) answers this session"),
             });
         }
+        if self.observing() {
+            return Ok(Decision::Escalate {
+                reason: super::observe::OBSERVE_REASON.to_string(),
+            });
+        }
         self.program = self.foreground_program()?;
         let mut reading = aterm_phase::read(
             self.program.as_deref(),
@@ -1057,7 +1187,16 @@ impl<C: Ctl> Session<'_, C> {
         let fresh_cwd = reading.prompt.as_ref().is_some_and(needs_cwd)
             || asks
             || bash && matches!(self.setup.approval_env.worker, WorkerSource::Session);
-        let mut facts = self.box_facts(fresh_cwd, Reads { git, bash, asks })?;
+        let stand = bash && reading.prompt.as_ref().is_some_and(reads_from_stand);
+        let mut facts = self.box_facts(
+            fresh_cwd,
+            Reads {
+                git,
+                bash,
+                stand,
+                asks,
+            },
+        )?;
         facts.screen_cols = screen
             .cols
             .unwrap_or_else(|| super::super::policy::question::widest_row(&screen.rows));
@@ -1406,6 +1545,17 @@ impl<C: Ctl> Session<'_, C> {
             reason,
             box_seq,
         };
+        if matches!(
+            outcome,
+            approvals::Outcome::Typed | approvals::Outcome::Waiting
+        ) {
+            approvals::fold_tap_said(
+                &mut self.tap_said,
+                outcome == approvals::Outcome::Typed,
+                rule_id,
+                reason,
+            );
+        }
         let named_track = self.turn_end.has_limit_track();
         let scoped_wait = outcome == approvals::Outcome::Waiting
             && matches!(
@@ -1428,9 +1578,16 @@ impl<C: Ctl> Session<'_, C> {
         } else {
             None
         };
-        let program = (scoped_wait && rule_id == approvals::RULE_WALL_WAIT)
-            .then(|| self.limit_met_under())
-            .flatten();
+        let program = match rule_id {
+            approvals::RULE_WALL_WAIT if scoped_wait => self.limit_met_under(),
+            approvals::RULE_POINT if scoped_wait => self
+                .turn_end
+                .short_program()
+                .filter(|p| *p != aterm_phase::Program::Generic),
+            _ => None,
+        };
+        let conversation = conversation
+            .or_else(|| program.map(|_| super::super::policy::turn_end::Conversation::Hostless));
         let at_ms = self.fx.stamp_ms();
         let row = match conversation {
             Some(c) => self.ledger.write_scoped_counted(
@@ -1461,7 +1618,7 @@ impl<C: Ctl> Session<'_, C> {
         if let Some(host) = &self.stall_host
             && let Some(act) = crate::harness::acts::sort(rule_id, outcome, command).act
         {
-            host.act_taken(act);
+            host.act_taken(crate::harness::acts::TakenAct::of(act, outcome));
         }
         if policy_act {
             self.tell_hold();
@@ -1598,9 +1755,13 @@ impl<C: Ctl> Session<'_, C> {
         let who = if self.driver {
             "another driver's hand is on the session"
         } else {
-            "a person is typing"
+            super::super::policy::turn_end::PERSON_TYPING
         };
         let (until, why) = match (clock, self.touched()) {
+            (_, Some(by)) if self.touch_owed() => (
+                grace_ends.min(self.fx.mono() + TICK_LOOK),
+                format!("; {by}"),
+            ),
             (DenyClock::None, _) => (grace_ends, String::new()),
             (DenyClock::Unseen, Some(by)) => (grace_ends, format!("; {by}: held as ever")),
             (DenyClock::At { deny, .. }, Some(by)) => (
@@ -1642,7 +1803,7 @@ impl<C: Ctl> Session<'_, C> {
             .setup
             .person_hold_wait
             .map_or(until, |wait| until.min(self.fx.mono() + wait));
-        self.set_due(until, "a person is typing");
+        self.set_due(until, super::super::policy::turn_end::PERSON_TYPING);
         self.held = true;
         Ok(true)
     }
@@ -1690,26 +1851,61 @@ impl<C: Ctl> Session<'_, C> {
         self.countdown = Some(read.after(self.countdown.as_ref()));
     }
 
-    /// Keeps the box episode `screen` reads, its baseline `before` (the prior read's person count);
-    /// a read with no box ends it.
-    pub(super) fn keep_episode(&mut self, screen: &Screen, before: Option<Option<u64>>) {
+    /// Keeps the box episode `screen` (asked for at `asked`) reads, its baseline `before` (the
+    /// prior read's person count); a read with no box ends it. A box drawn in another's place
+    /// while nobody has touched the episode, and no count is owed a verdict, is read as the box's
+    /// first read, so its countdown places a gesture made between the read before it and its
+    /// first frame as it places the first box's; a count owed a verdict at a box drawn over
+    /// before its countdown placed it is a touch.
+    pub(super) fn keep_episode(
+        &mut self,
+        screen: &Screen,
+        before: Option<Option<u64>>,
+        asked: Instant,
+    ) {
+        let v2 = aterm_phase::parse_prompt_v2(&screen.rows);
+        let shown = v2.as_ref().map(|v2| identity_of(v2, &screen.rows));
         #[cfg(test)]
         {
-            let shown = box_identity(&screen.rows);
             if self.episode_per_box && self.last_box.is_some() && shown != self.last_box {
                 self.episode = None;
             }
-            self.last_box = shown;
+            self.last_box.clone_from(&shown);
         }
-        if aterm_phase::parse_prompt_v2(&screen.rows).is_none() {
+        let (Some(v2), Some(identity)) = (v2, shown) else {
             self.episode = None;
             return;
-        }
+        };
+        let countdown = self.countdown_of_box(&identity);
+        let outlasts = countdown.is_some_and(|c| c.left > AUTO_DENY_WINDOW + TICK_SLACK);
+        let deny = countdown.map(Countdown::deny);
+        let first = self
+            .episode
+            .as_ref()
+            .is_none_or(|e| e.by.is_none() && e.owed.is_none() && e.shown != identity);
         let episode = self.episode.get_or_insert_with(|| Episode {
             baseline: before.flatten(),
             by: None,
+            shown: String::new(),
+            owed: None,
+            outlasted: false,
         });
-        episode.read(screen);
+        if episode.shown != identity && episode.owed.take().is_some() {
+            // The box the count was owed at was drawn over before its countdown placed it.
+            episode.touch(BY_COUNTED);
+        }
+        episode.shown = identity;
+        episode.outlasted |= outlasts;
+        let drawn = match deny {
+            _ if episode.outlasted => Drawn::Untold,
+            None if v2.auto_deny.is_some() => Drawn::Unread,
+            None => Drawn::Untold,
+            Some(None) => Drawn::Unseen,
+            Some(Some(deny)) => deny
+                .checked_sub(AUTO_DENY_WINDOW + TICK_SLACK)
+                .map_or(Drawn::Untold, Drawn::From),
+        };
+        episode.read(screen, asked, first, drawn);
     }
 
     pub(super) fn episode_driven(&mut self) {
@@ -1723,14 +1919,22 @@ impl<C: Ctl> Session<'_, C> {
         if self.touch_off {
             return None;
         }
-        self.episode.as_ref().and_then(|e| e.by)
+        self.episode.as_ref().and_then(Episode::by)
+    }
+
+    /// Whether the box's episode holds a person count its countdown has yet to place
+    /// ([`Episode::owed`]).
+    fn touch_owed(&self) -> bool {
+        self.episode
+            .as_ref()
+            .is_some_and(|e| e.by.is_none() && e.owed.is_some())
     }
 
     /// The one person count every key of an answer names: an untouched episode's baseline, else
     /// `seen`'s.
     pub(super) const fn person_fence(&self, seen: &Screen) -> Option<u64> {
         match &self.episode {
-            Some(e) if e.by.is_none() => e.baseline,
+            Some(e) if e.by().is_none() => e.baseline,
             _ => seen.human_seq,
         }
     }
@@ -1919,7 +2123,18 @@ impl<C: Ctl> Session<'_, C> {
             self.question_done(seq, review)?;
         }
         self.autopilot.begin();
+        let unanswered = self.fx.policy_probe().unanswered();
         let decision = self.decide_box(&turn.screen, opts, allow)?;
+        self.box_left_out = (matches!(decision, Decision::Escalate { .. })
+            && self.fx.policy_probe().unanswered() != unanswered)
+            .then(|| self.review_key(&turn));
+        if self.box_left_out.is_some() {
+            // The look's end, which decides the box again, is no door's: no replay can make it.
+            self.fx
+                .note(super::super::tape::core::NOTE_UNREPLAYABLE, || {
+                    format!("seq={seq}: a box escalated for a look at the disk that did not answer")
+                });
+        }
         #[cfg(test)]
         if PANIC_AT_DECIDE.with(std::cell::Cell::get) {
             panic!("a planted panic in the policy, at the decision on seq={seq}");
@@ -2003,6 +2218,18 @@ impl<C: Ctl> Session<'_, C> {
         deadline: Instant,
         review: &mut dyn Review,
     ) -> Result<Step, Fail> {
+        let scope = duty::prompt_scope(p.kind);
+        if self.setup.builtin_duties
+            && scope.is_none()
+            && !matches!(decision, Decision::Escalate { .. })
+        {
+            self.box_reason = Some((
+                self.review_key(&turn),
+                "no explicit semantic duty for this dialog".to_string(),
+            ));
+            return Ok(Step::Review(turn));
+        }
+        let _duty = scope.map(|scope| self.duty_guard(scope));
         let seq = turn.screen.seq;
         let (rule_id, act, subject, unproven) = match decision {
             Decision::Escalate { reason } => {
@@ -2984,8 +3211,8 @@ mod act_tests {
         fn owns_turn_end(&self) -> bool {
             false
         }
-        fn act_taken(&self, act: Act) {
-            self.acts.lock().unwrap().push(act);
+        fn act_taken(&self, act: crate::harness::acts::TakenAct) {
+            self.acts.lock().unwrap().push(act.act);
         }
         fn task_face(&self, face: TaskFace) {
             let _ = face;
@@ -3009,7 +3236,7 @@ mod act_tests {
         ),
         ("decline@v1", Outcome::Declined, "rm -rf /"),
         (RULE_LOGIN, Outcome::Typed, "/login"),
-        ("read-only@classify-v10", Outcome::Skipped, "ls"),
+        ("read-only@classify-v11", Outcome::Skipped, "ls"),
         ("-", Outcome::Escalated, ""),
         ("wall-wait@v1", Outcome::Waiting, ""),
     ];

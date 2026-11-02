@@ -344,20 +344,63 @@ pub(crate) fn runs_a_posix_runtime(program: &Path, is_file: impl Fn(&Path) -> bo
 
 /// Copy `source` to `<cache>/<package>/OpenConsole.exe` unless an identical copy is already there, then prune the copies other packages left ([`prune_other_packages`]), so the cache holds one host however many Windows Terminal updates pass (each left about 1 MB behind before).
 pub(crate) fn copy_out(source: &Path, cache: &Path, package: &str) -> io::Result<PathBuf> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let dir = cache.join(package);
+    if let Ok(meta) = std::fs::symlink_metadata(&dir)
+        && !meta.is_dir()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to copy OpenConsole.exe through a non-directory cache entry",
+        ));
+    }
     let dest = dir.join("OpenConsole.exe");
     let want = std::fs::read(source)?;
-    if !std::fs::read(&dest).is_ok_and(|have| have == want) {
+    let up_to_date = std::fs::symlink_metadata(&dest).is_ok_and(|m| m.file_type().is_file())
+        && std::fs::read(&dest).is_ok_and(|have| have == want);
+    if !up_to_date {
         std::fs::create_dir_all(&dir)?;
-        let partial = dir.join(format!("OpenConsole.exe.{}.partial", std::process::id()));
-        {
-            let mut file = std::fs::OpenOptions::new()
+        if !std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "refusing to copy OpenConsole.exe through a non-directory cache entry",
+            ));
+        }
+        let pid = std::process::id();
+        let mut opened = None;
+        for attempt in 0..64u32 {
+            let name = if attempt == 0 {
+                format!("OpenConsole.exe.{pid}.partial")
+            } else {
+                let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                format!("OpenConsole.exe.{pid}.{seq}.partial")
+            };
+            let candidate = dir.join(name);
+            match std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .open(&partial)?;
-            file.write_all(&want)?;
+                .open(&candidate)
+            {
+                Ok(file) => {
+                    opened = Some((candidate, file));
+                    break;
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && attempt < 63 => {}
+                Err(e) => return Err(e),
+            }
         }
-        std::fs::rename(&partial, &dest)?;
+        let (partial, mut file) = opened.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "could not allocate a unique OpenConsole.exe partial file",
+            )
+        })?;
+        let wrote = file.write_all(&want);
+        drop(file);
+        if let Err(e) = wrote.and_then(|()| std::fs::rename(&partial, &dest)) {
+            let _ = std::fs::remove_file(&partial);
+            return Err(e);
+        }
     }
     prune_other_packages(cache, package);
     Ok(dest)
@@ -848,8 +891,14 @@ mod tests {
             "an identical copy is not rewritten"
         );
         std::fs::write(&source, b"MZ two").unwrap();
-        copy_out(&source, &cache, pkg).expect("changed source");
+        let pid_partial = cache
+            .join(pkg)
+            .join(format!("OpenConsole.exe.{}.partial", std::process::id()));
+        std::fs::write(&pid_partial, b"in-flight").unwrap();
+        copy_out(&source, &cache, pkg).expect("changed source tolerates existing pid partial");
         assert_eq!(std::fs::read(&dest).unwrap(), b"MZ two");
+        assert_eq!(std::fs::read(&pid_partial).unwrap(), b"in-flight");
+        std::fs::remove_file(&pid_partial).unwrap();
         let leftovers: Vec<_> = std::fs::read_dir(cache.join(pkg))
             .unwrap()
             .flatten()
@@ -871,8 +920,23 @@ mod tests {
         std::os::unix::fs::symlink(&outside, cache.join("linked")).unwrap();
         let source = root.join("source.exe");
         std::fs::write(&source, b"MZ one").unwrap();
+        assert!(copy_out(&source, &cache, "linked").is_err());
+        assert_eq!(
+            std::fs::read(outside.join("OpenConsole.exe")).unwrap(),
+            b"MZ elsewhere"
+        );
         copy_out(&source, &cache, "current").expect("copy");
         assert!(outside.join("OpenConsole.exe").exists());
+        let current_exe = cache.join("current").join("OpenConsole.exe");
+        std::fs::remove_file(&current_exe).unwrap();
+        std::os::unix::fs::symlink(&source, &current_exe).unwrap();
+        copy_out(&source, &cache, "current").expect("replaces symlinked dest with real file");
+        assert!(
+            std::fs::symlink_metadata(&current_exe)
+                .unwrap()
+                .file_type()
+                .is_file()
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

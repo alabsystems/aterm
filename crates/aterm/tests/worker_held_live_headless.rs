@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+use aterm_agent::supervise::policy::land_check;
+
 use crate::{child_output, headless_boot, launch_isolation};
 
 use headless_boot::{Instance, boot_session, client_command, ctl, ctl_ok, field};
@@ -23,16 +25,18 @@ const STANDIN: &str = "#!/bin/sh\n\
     exec /bin/bash -c 'exec -a claude /bin/sh \"$HOME/fake.sh\" \"$HOME/screens\"'\n";
 
 /// Fake raw-mode Claude worker: transitions `ready` -> `landed` (on LAND Enter,
-/// word-wrapping the submitted prompt under `❯ ` so `answered_prompt` matches) ->
-/// `box` (on follow-up Enter: Claude Code's working frame, the prompt in the
-/// transcript over an empty composer, which `turn` reads as taken; the box once the
-/// test leaves the `held` cue ([`held_cue`]), drawn by a poll that ends with the fake,
-/// so the input loop never blocks) -> `back` (on Esc).
+/// word-wrapping the submitted prompt under `❯ ` so `answered_prompt` matches; the
+/// defense) -> `checked` (on the land check's Enter, a prompt opening with its head:
+/// the check, wrapped the same way, answered `LANDED`, which lands the task) -> `box`
+/// (on follow-up Enter: Claude Code's working frame, the prompt in the transcript over
+/// an empty composer, which `turn` reads as taken; the box once the test leaves the
+/// `held` cue ([`held_cue`]), drawn by a poll that ends with the fake, so the input
+/// loop never blocks) -> `back` (on Esc).
 const FAKE: &str = r#"#!/bin/sh
 dir="$1"
 stty raw -echo
 cr=$(printf '\r'); esc=$(printf '\033'); sc=$(printf '\0337'); rc=$(printf '\0338')
-rule=$(cat "$dir/rule")
+rule=$(cat "$dir/rule"); check=$(cat "$dir/check.head")
 screen() {
   printf '\033[H\033[2J'; cat "$1"; printf '%s\r\n' "$rule"
   if [ -z "$2" ]; then printf '\342\235\257 %s' "$sc"
@@ -41,23 +45,27 @@ screen() {
   printf '\r\n%s\r\n  ? for shortcuts%s' "$rule" "$rc"
 }
 draw() { printf '\033[H\033[2J'; cat "$dir/$1.scr"; }
+reply() {
+  { cat "$dir/$1.top"
+    printf '%s\n' "$buf" | fold -s -w 96 | awk 'NR>1{printf "  %s\r\n",$0;next}{printf "\342\235\257 %s\r\n",$0}'
+    printf '\r\n'; cat "$dir/$2.top"; } > "$dir/$3.top"
+  at=$3; buf=""; screen "$dir/$3.top" ""
+}
 enter() {
-  if [ "$at" = ready ]; then
-    { cat "$dir/ready.top"
-      printf '%s\n' "$buf" | fold -s -w 96 | awk 'NR>1{printf "  %s\r\n",$0;next}{printf "\342\235\257 %s\r\n",$0}'
-      printf '\r\n'; cat "$dir/defense.top"; } > "$dir/landed.top"
-    at=landed; buf=""; screen "$dir/landed.top" ""
-  else
-    at=box; buf=""; draw working
-    ( while [ ! -e "$dir/held" ] && kill -0 $$ 2>/dev/null; do sleep 0.1; done
-      [ -e "$dir/held" ] && draw box ) &
-  fi
+  case "$at:$buf" in
+    ready:*) reply ready defense landed ;;
+    landed:"$check"*) reply landed landed-word checked ;;
+    *)
+      at=box; buf=""; draw working
+      ( while [ ! -e "$dir/held" ] && kill -0 $$ 2>/dev/null; do sleep 0.1; done
+        [ -e "$dir/held" ] && draw box ) & ;;
+  esac
 }
 feed() {
   rest="$1"
   while [ -n "$rest" ]; do
     case "$at" in
-      ready|landed)
+      ready|landed|checked)
         case "$rest" in
           *"$cr"*) buf="$buf${rest%%"$cr"*}"; rest="${rest#*"$cr"}"; enter ;;
           *) buf="$buf$rest"; rest=""; screen "$dir/$at.top" "$buf" ;;
@@ -137,6 +145,12 @@ fn write_worker(home: &Path) {
     let top = |rows: &[&str]| rows.iter().map(|r| format!("{r}\r\n")).collect::<String>();
     std::fs::write(dir.join("ready.top"), top(&TASK_TURN)).expect("ready");
     std::fs::write(dir.join("defense.top"), top(&DEFENSE)).expect("the defense");
+    // The land check Land types after the defense opens with its head; the word alone answers
+    // it and lands the task.
+    std::fs::write(dir.join("check.head"), land_check::LAND_CHECK_HEAD).expect("the check's head");
+    let word = format!("⏺ {}", land_check::LANDED);
+    std::fs::write(dir.join("landed-word.top"), top(&[word.as_str(), ""]))
+        .expect("the check's answer");
     std::fs::write(dir.join("rule"), "─".repeat(COLUMNS)).expect("the rule");
     let asked = format!("❯ {FOLLOW_UP}");
     let mut held: Vec<String> = TASK_TURN.iter().map(|r| (*r).to_string()).collect();
@@ -191,6 +205,8 @@ fn boot(tag: &str, held_ms: &str) -> Instance {
             .expect("write the config");
             let bin = tmp.join("bin");
             headless_boot::standin(&bin.join("claude"), STANDIN);
+            // The worker the stand-in runs as `claude` is the agent the harness lands.
+            headless_boot::agent_standin(&home(tmp).join("fake.sh"));
             write_worker(&home(tmp));
             std::fs::create_dir_all(tmp.join("work")).expect("the worker's folder");
             cmd.env("SHELL", "/bin/zsh")

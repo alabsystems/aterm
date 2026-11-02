@@ -409,7 +409,11 @@ fn cell_of(ctl: &Ctl, row: &PaintRow) -> Result<(Cell, Option<TypedRow>), CouldN
             "ctl dims did not place the grid on the frame ({dims})"
         )));
     };
-    let bottom = pad_top + head + (tab_rows + PLANE_ROW + 1) * cell.h;
+    let bottom = tab_rows
+        .checked_add(PLANE_ROW + 1)
+        .and_then(|rows| rows.checked_mul(cell.h))
+        .and_then(|grid_y| pad_top.checked_add(head)?.checked_add(grid_y))
+        .ok_or_else(|| CouldNotRun::Refused(format!("ctl dims overflowed ({dims})")))?;
     Ok((
         cell,
         Some(TypedRow {

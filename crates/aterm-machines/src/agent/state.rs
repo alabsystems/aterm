@@ -129,7 +129,7 @@ impl Holder {
         let mut start = None;
         for word in text.split_whitespace() {
             if let Some(p) = word.strip_prefix("pid=") {
-                pid = p.parse().ok();
+                pid = crate::parse_uint(p);
             } else if let Some(r) = word.strip_prefix("run=") {
                 run = Some(r.to_owned());
             } else if let Some(s) = word.strip_prefix("start=") {

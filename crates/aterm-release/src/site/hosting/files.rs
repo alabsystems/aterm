@@ -184,7 +184,7 @@ pub fn list(
             if kind.is_file() {
                 let bytes = match overlay.get(&rel) {
                     Some(bytes) => bytes.clone(),
-                    None => std::fs::read(entry.path())
+                    None => crate::durable::read_regular_bytes(&entry.path(), 64 * 1024 * 1024)
                         .map_err(|e| format!("cannot read {}: {e}", entry.path().display()))?,
                 };
                 if super::key::holds_a_private_key(&bytes) {
@@ -206,8 +206,16 @@ pub fn list(
         }
     }
     for (rel, bytes) in overlay {
-        if !ignored(rel) {
-            found.entry(rel.clone()).or_insert_with(|| bytes.clone());
+        if !ignored(rel) && !found.contains_key(rel) {
+            if super::key::holds_a_private_key(bytes) {
+                return Err(format!(
+                    "{} is a private key (a JSON key with a private_key, such as the \
+                     deployer's service-account key): the site would serve it to anyone — \
+                     move it out of public/ or name it in firebase.json's hosting.ignore",
+                    public.join(rel).display()
+                ));
+            }
+            found.insert(rel.clone(), bytes.clone());
         }
     }
     Ok(found)
@@ -391,6 +399,15 @@ mod tests {
         )
         .unwrap();
         assert!(!ignored.contains_key("assets/deployer.txt"));
+
+        std::fs::remove_file(public.join("assets/deployer.txt")).unwrap();
+        let mut overlay = BTreeMap::new();
+        overlay.insert("assets/new-key.json".to_string(), key.into_bytes());
+        let why_overlay = list(&public, &[], &overlay).unwrap_err();
+        assert!(
+            why_overlay.contains("new-key.json") && why_overlay.contains("private key"),
+            "{why_overlay}"
+        );
     }
 
     /// A file is named by the SHA-256 of its gzip member, and the member is the same bytes

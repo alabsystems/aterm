@@ -5,6 +5,7 @@
 # paper arm: the owner's sentence typed at 10 keys/s into a Claude Code composer.
 
 foreach-scheme light {
+  scale 2
   grid 24 100
   style rainbow kitty
   hz 60

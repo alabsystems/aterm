@@ -160,6 +160,7 @@ impl<C: Ctl> Session<'_, C> {
         opts: &SuperviseOpts,
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
+        let _duty = self.duty_guard(Scope::Walls);
         let Some(row) = aterm_phase::api_retry_row(&screen.rows) else {
             return Ok(());
         };

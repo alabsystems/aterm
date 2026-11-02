@@ -19,7 +19,7 @@ pub(crate) use crate::presence::ChipLevel;
 /// The connection-mark role, re-exported beside the icon kind so both renderers consume one
 /// vocabulary defined on the tab model.
 pub(crate) use crate::tab_model::TabConnRole;
-/// The four first-party non-terminal tab application identities.
+/// The closed tab application and recognized program icons.
 pub(crate) use crate::tab_model::TabIconKind;
 
 /// Non-title presentation metadata consumed by both tab-strip renderers.
@@ -119,14 +119,14 @@ impl TabStripMetadata {
 
     #[must_use]
     pub(crate) const fn has_status(self) -> bool {
-        self.dirty || self.busy || !matches!(self.attention, ChipLevel::Off) || self.conn.is_some()
+        self.dirty || self.busy || matches!(self.attention, ChipLevel::Yours) || self.conn.is_some()
     }
 
     #[must_use]
     pub(crate) const fn status_count(self) -> usize {
         self.dirty as usize
             + self.busy as usize
-            + !matches!(self.attention, ChipLevel::Off) as usize
+            + matches!(self.attention, ChipLevel::Yours) as usize
             + self.conn.is_some() as usize
     }
 }
@@ -154,7 +154,7 @@ impl TabStripMetadata {
         match kind {
             TabStatusKind::Dirty => self.dirty,
             TabStatusKind::Busy => self.busy,
-            TabStatusKind::Attention => !matches!(self.attention, ChipLevel::Off),
+            TabStatusKind::Attention => matches!(self.attention, ChipLevel::Yours),
             TabStatusKind::Connection => self.conn.is_some(),
         }
     }
@@ -358,6 +358,29 @@ const ABOUT_ICON: &[TabIconPrimitive] = &[
     },
 ];
 
+const CODEX_ICON: &[TabIconPrimitive] = &[
+    TabIconPrimitive::RoundedRect {
+        rect: [1.5, 2.0, 13.0, 12.0],
+        radius: 2.0,
+        width: 1.2,
+    },
+    TabIconPrimitive::Line {
+        from: [4.0, 5.0],
+        to: [7.0, 8.0],
+        width: 1.5,
+    },
+    TabIconPrimitive::Line {
+        from: [7.0, 8.0],
+        to: [4.0, 11.0],
+        width: 1.5,
+    },
+    TabIconPrimitive::Line {
+        from: [8.5, 11.0],
+        to: [12.0, 11.0],
+        width: 1.5,
+    },
+];
+
 const RECOVERY_ICON: &[TabIconPrimitive] = &[
     TabIconPrimitive::RoundedRect {
         rect: [2.0, 1.5, 12.0, 13.0],
@@ -378,6 +401,24 @@ const RECOVERY_ICON: &[TabIconPrimitive] = &[
 #[must_use]
 pub(crate) const fn tab_icon_primitives(kind: TabIconKind) -> &'static [TabIconPrimitive] {
     match kind {
+        TabIconKind::Mail => &[
+            TabIconPrimitive::RoundedRect {
+                rect: [1.5, 3.0, 13.0, 10.0],
+                radius: 1.5,
+                width: 1.25,
+            },
+            TabIconPrimitive::Line {
+                from: [2.0, 4.0],
+                to: [8.0, 8.0],
+                width: 1.25,
+            },
+            TabIconPrimitive::Line {
+                from: [8.0, 8.0],
+                to: [14.0, 4.0],
+                width: 1.25,
+            },
+        ],
+        TabIconKind::Codex => CODEX_ICON,
         TabIconKind::About => ABOUT_ICON,
         TabIconKind::Settings => SETTINGS_ICON,
         TabIconKind::Markdown => MARKDOWN_ICON,
@@ -2425,41 +2466,14 @@ fn paint_strip_impl(
     (images, rename_caret)
 }
 
-/// Half the length of the [`ChipLevel::Note`] dash in the 16-unit design box.
-pub(crate) const NOTE_DASH_HALF: f32 = 2.0;
-
 /// Resolve the ink colour for a chip's status marks.
 fn status_mark_ink(
     item: TabStripMetadata,
     colors: &StripColors,
-    palette: ChromePalette,
+    _palette: ChromePalette,
     ink: [u8; 3],
 ) -> [u8; 3] {
-    let need = |stuck: bool| {
-        let inks = aterm_messages::presence::inks(
-            crate::chrome_band::presence_tones(palette),
-            colors.band_bg,
-        );
-        if stuck { inks.stop } else { inks.wait }
-    };
-    match item.attention {
-        ChipLevel::Stop(_) => need(true),
-        ChipLevel::Wait => need(false),
-        _ if item.dirty => colors.accent,
-        _ => ink,
-    }
-}
-
-/// [`status_mark_ink`] on the default theme's strip, for the host's tests.
-#[cfg(test)]
-pub(crate) fn status_mark_ink_for_test(item: TabStripMetadata, ink: [u8; 3]) -> [u8; 3] {
-    let theme = Theme::default();
-    status_mark_ink(
-        item,
-        &strip_colors_with_active(theme, None),
-        theme.into(),
-        ink,
-    )
+    if item.dirty { colors.accent } else { ink }
 }
 
 /// Paint the window's needs pill into the strip row `row`.
@@ -2577,68 +2591,11 @@ fn status_primitives(metadata: TabStripMetadata) -> Vec<TabIconPrimitive> {
                 width: 1.25 * s,
             }),
             TabStatusKind::Attention => {
-                let w = 1.15 * s;
-                let r = 2.5 * s;
-                match metadata.attention {
-                    ChipLevel::Off => continue,
-                    ChipLevel::Done => {
-                        primitives.push(TabIconPrimitive::Dot {
-                            center: [x, 8.0],
-                            radius: 1.5 * s,
-                        });
-                        continue;
-                    }
-                    ChipLevel::Note => {
-                        primitives.push(TabIconPrimitive::Line {
-                            from: [x - NOTE_DASH_HALF * s, 8.0],
-                            to: [x + NOTE_DASH_HALF * s, 8.0],
-                            width: 1.25 * s,
-                        });
-                        continue;
-                    }
-                    ChipLevel::Yours => {
-                        primitives.push(TabIconPrimitive::RoundedRect {
-                            rect: [x - 2.2 * s, 8.0 - 2.2 * s, 4.4 * s, 4.4 * s],
-                            radius: 0.8 * s,
-                            width: 1.15 * s,
-                        });
-                        continue;
-                    }
-                    ChipLevel::Stop(_) => {
-                        primitives.extend([
-                            TabIconPrimitive::Triangle {
-                                points: [[x, 8.0 - r], [x + r, 8.0], [x - r, 8.0]],
-                            },
-                            TabIconPrimitive::Triangle {
-                                points: [[x - r, 8.0], [x + r, 8.0], [x, 8.0 + r]],
-                            },
-                        ]);
-                        continue;
-                    }
-                    ChipLevel::Wait => {}
-                }
-                primitives.extend([
-                    TabIconPrimitive::Line {
-                        from: [x, 8.0 - r],
-                        to: [x + r, 8.0],
-                        width: w,
-                    },
-                    TabIconPrimitive::Line {
-                        from: [x + r, 8.0],
-                        to: [x, 8.0 + r],
-                        width: w,
-                    },
-                    TabIconPrimitive::Line {
-                        from: [x, 8.0 + r],
-                        to: [x - r, 8.0],
-                        width: w,
-                    },
-                    TabIconPrimitive::Line {
-                        from: [x - r, 8.0],
-                        to: [x, 8.0 - r],
-                        width: w,
-                    },
-                ]);
+                primitives.push(TabIconPrimitive::RoundedRect {
+                    rect: [x - 2.2 * s, 8.0 - 2.2 * s, 4.4 * s, 4.4 * s],
+                    radius: 0.8 * s,
+                    width: 1.15 * s,
+                });
             }
             TabStatusKind::Connection => {
                 let Some(role) = metadata.conn else {
@@ -8473,6 +8430,7 @@ mod tests {
     #[test]
     fn memoized_strip_glyphs_match_a_fresh_raster_for_every_key() {
         let kinds = [
+            TabIconKind::Codex,
             TabIconKind::About,
             TabIconKind::Settings,
             TabIconKind::Markdown,
@@ -8701,48 +8659,27 @@ mod tests {
     }
 
     #[test]
-    fn every_attention_mark_is_tellable_apart() {
-        let with = |attention| TabStripMetadata {
-            icon: None,
-            dirty: false,
-            busy: false,
-            attention,
-            conn: None,
-            closable: true,
-            team: TabTeam::NONE,
-            load: 0,
-        };
-        let levels = [
+    fn automatic_attention_never_draws_a_tab_mark() {
+        for attention in [
             ChipLevel::Note,
             ChipLevel::Done,
-            ChipLevel::Yours,
             ChipLevel::Wait,
             ChipLevel::Stop(crate::presence::StopCause::Wall),
-        ];
-        let note = status_primitives(with(ChipLevel::Note));
-        assert!(
-            matches!(note[..], [TabIconPrimitive::Line { .. }]),
-            "the note is one dash"
-        );
-        let done = status_primitives(with(ChipLevel::Done));
-        assert!(
-            matches!(done[..], [TabIconPrimitive::Dot { .. }]),
-            "the done mark is one dot"
-        );
-        let rasters: Vec<Vec<u8>> = levels
-            .iter()
-            .map(|level| rasterize_icon(&status_primitives(with(*level)), [213, 219, 255]))
-            .collect();
-        for (i, a) in rasters.iter().enumerate() {
-            assert!(
-                a.as_chunks::<4>().0.iter().any(|p| p[3] != 0),
-                "{:?} draws",
-                levels[i]
-            );
-            for (j, b) in rasters.iter().enumerate().skip(i + 1) {
-                assert_ne!(a, b, "{:?} and {:?} look alike", levels[i], levels[j]);
-            }
+        ] {
+            let metadata = TabStripMetadata {
+                attention,
+                ..PLAIN_TAB
+            };
+            assert!(!metadata.has_status());
+            assert_eq!(metadata.status_count(), 0);
+            assert!(status_primitives(metadata).is_empty());
         }
+        let held = TabStripMetadata {
+            attention: ChipLevel::Yours,
+            ..PLAIN_TAB
+        };
+        assert_eq!(held.status_count(), 1);
+        assert!(!status_primitives(held).is_empty());
     }
 
     #[test]
@@ -11739,41 +11676,40 @@ mod team_title_tests {
     }
 }
 
-/// A tab's need mark wears the border's tone on the in-grid strip.
+/// Diagnostics do not change a tab's ink.
 #[cfg(test)]
 mod status_mark_ink_tests {
     use super::*;
 
     #[test]
-    fn a_needs_mark_wears_the_borders_tone() {
+    fn recorded_issues_never_change_tab_ink() {
         let theme = Theme::default();
         let colors = strip_colors_with_active(theme, None);
-        let inks = aterm_messages::presence::inks(
-            crate::chrome_band::presence_tones(theme),
-            colors.band_bg,
-        );
         let ink = [1, 2, 3];
-        let of = |attention, dirty| {
-            status_mark_ink(
-                TabStripMetadata {
-                    attention,
-                    dirty,
-                    ..PLAIN_TAB
-                },
-                &colors,
-                theme.into(),
-                ink,
-            )
-        };
-        let stuck = of(ChipLevel::Stop(crate::presence::StopCause::Wall), true);
-        let decide = of(ChipLevel::Wait, false);
-        assert_eq!(stuck, inks.stop);
-        assert_eq!(decide, inks.wait);
-        assert_eq!(of(ChipLevel::Done, true), colors.accent);
-        assert_eq!(of(ChipLevel::Off, false), ink);
-        let note = of(ChipLevel::Note, false);
-        assert_eq!(note, ink);
-        assert!(note != inks.stop && note != inks.wait && note != inks.yours);
-        assert!(stuck != decide && stuck != colors.accent && decide != colors.accent);
+        for attention in [
+            ChipLevel::Off,
+            ChipLevel::Note,
+            ChipLevel::Done,
+            ChipLevel::Wait,
+            ChipLevel::Stop(crate::presence::StopCause::Wall),
+        ] {
+            let metadata = TabStripMetadata {
+                attention,
+                ..PLAIN_TAB
+            };
+            assert_eq!(status_mark_ink(metadata, &colors, theme.into(), ink), ink);
+            assert_eq!(
+                status_mark_ink(
+                    TabStripMetadata {
+                        dirty: true,
+                        ..metadata
+                    },
+                    &colors,
+                    theme.into(),
+                    ink
+                ),
+                colors.accent
+            );
+        }
     }
 }

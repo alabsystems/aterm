@@ -1,0 +1,11 @@
+# grok 1.0.70 · MEASURED 2026-10-29, `aterm ctl text` of a private headless aterm (144x50, aterm 0.146.0) running the real Grok Build, launched by path in the lab's jail with a scratch `HOME` and `GROK_HOME`, the lab's `XAI_API_KEY` and `GROK_XAI_API_BASE_URL`/`GROK_CLI_CHAT_PROXY_BASE_URL=http://127.0.0.1:<port>/v1` (a local stub of xAI's API, crates/aterm-lab) · Ctrl-Q pressed twice on the idle composer: Grok Build left the alternate screen and printed, on the shell's screen, the session's title (`Lab stub session`), the last exchange (`> …` and the reply), and `Resume this session with:` / `  grok --resume <session id>`; the launcher's `sh` then exited `0` (`echo "grok-exit=$?"` at the lab shell's prompt) · cursor at the shell prompt
+
+Lab stub session
+> echo "grok-exit=$?"
+  Hi! I am the local lab stub, not a model. (reply 38)
+
+Resume this session with:
+  grok --resume 01a1896f-28b4-7993-afb5-9d92e19dd098
+lab$ echo "grok-exit=$?"
+grok-exit=0
+lab$

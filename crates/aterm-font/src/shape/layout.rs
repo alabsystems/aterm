@@ -32,6 +32,9 @@ pub(crate) fn substitute(plan: &ShapePlan, face: &ShapeFace, buffer: &mut Buffer
     for (stage_index, stage) in plan.map.stages(super::map::GSUB).iter().enumerate() {
         if face.gsub().is_some() {
             for lookup_map in plan.map.stage_lookups(super::map::GSUB, stage_index) {
+                if ctx.budget.spent() {
+                    break;
+                }
                 let Some(lookup) = face.gsub_lookup(lookup_map.index) else {
                     continue;
                 };
@@ -59,6 +62,9 @@ pub(crate) fn position(plan: &ShapePlan, face: &ShapeFace, buffer: &mut Buffer) 
     for (stage_index, stage) in plan.map.stages(super::map::GPOS).iter().enumerate() {
         if face.gpos().is_some() {
             for lookup_map in plan.map.stage_lookups(super::map::GPOS, stage_index) {
+                if ctx.budget.spent() {
+                    break;
+                }
                 let Some(lookup) = face.gpos_lookup(lookup_map.index) else {
                     continue;
                 };
@@ -85,7 +91,7 @@ fn apply_position(ctx: &mut ApplyContext, lookup: &super::face::PosLookup) {
     }
     ctx.lookup_props = lookup.props;
     ctx.buffer.idx = 0;
-    while ctx.buffer.idx < ctx.buffer.len && ctx.buffer.successful {
+    while ctx.buffer.idx < ctx.buffer.len && ctx.buffer.successful && ctx.budget.charge() {
         let cur = *ctx.buffer.cur(0);
         if (cur.mask & ctx.lookup_mask()) != 0
             && ctx.check_glyph_property(&cur, ctx.lookup_props)
@@ -114,7 +120,8 @@ fn apply_string(ctx: &mut ApplyContext, lookup: &super::face::SubstLookup) {
     if !lookup.reverse {
         ctx.buffer.clear_output();
         ctx.buffer.idx = 0;
-        while ctx.buffer.idx < ctx.buffer.len && ctx.buffer.successful {
+        // Out of budget, the rest of the run goes to the output untouched (`sync`).
+        while ctx.buffer.idx < ctx.buffer.len && ctx.buffer.successful && ctx.budget.charge() {
             let cur = *ctx.buffer.cur(0);
             if (cur.mask & ctx.lookup_mask()) != 0
                 && ctx.check_glyph_property(&cur, ctx.lookup_props)
@@ -131,7 +138,7 @@ fn apply_string(ctx: &mut ApplyContext, lookup: &super::face::SubstLookup) {
             return;
         }
         ctx.buffer.idx = ctx.buffer.len - 1;
-        loop {
+        while ctx.budget.charge() {
             let cur = *ctx.buffer.cur(0);
             if (cur.mask & ctx.lookup_mask()) != 0
                 && ctx.check_glyph_property(&cur, ctx.lookup_props)

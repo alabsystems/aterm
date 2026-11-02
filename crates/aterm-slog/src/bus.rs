@@ -326,7 +326,7 @@ impl BusSpace {
         self.holes_from(1)
     }
 
-    /// Whether the view holds its space's first bus-class record (or a cover of it).
+    /// Whether the view holds its space's first mirrored record, `ms` 1 (or a cover of it).
     #[must_use]
     pub fn holds_start(&self) -> bool {
         self.held_ms().any(|ms| ms == 1) || self.covers.iter().any(|(lo, ..)| *lo == 1)

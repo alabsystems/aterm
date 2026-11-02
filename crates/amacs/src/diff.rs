@@ -202,7 +202,7 @@ fn piece_hunks<'a>(old: &[&'a str], new: &[&'a str]) -> Option<Vec<(Range<usize>
         return Some(vec![(0..n, 0..m)]);
     }
 
-    let limit = (n + m).min(MAX_EDITS);
+    let limit = n.saturating_add(m).min(MAX_EDITS);
     let offset = limit + 1;
     // `v[k + offset]`: the furthest old piece reached on diagonal `k = x - y`.
     let mut v = vec![0usize; 2 * offset + 1];

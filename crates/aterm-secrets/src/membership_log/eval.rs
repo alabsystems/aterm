@@ -231,6 +231,15 @@ impl Membership {
             .copied()
             .unwrap_or(NodeStanding::Unknown)
     }
+    /// Whether `member`'s bound `node_key` or `binding.writer()` has been removed and not
+    /// superseded in [`Self::nodes`].
+    #[must_use]
+    pub fn member_node_removed(&self, member: &Member) -> bool {
+        member
+            .node_key
+            .is_some_and(|nk| nk != [0; 32] && matches!(self.node(&nk), NodeStanding::Removed(_)))
+            || matches!(self.node(member.binding.writer()), NodeStanding::Removed(_))
+    }
     /// Every node key whose standing is not [`NodeStanding::Unknown`], by key.
     pub const fn nodes(&self) -> &BTreeMap<[u8; 32], NodeStanding> {
         &self.nodes
@@ -285,6 +294,7 @@ pub(super) fn authorization_passes(records: &[Record]) -> usize {
 
 /// Which held records count for non-membership payloads (`Epoch`, `Wrap`, `Put`, `Delete`), and
 /// strict causal precedence among them.
+#[derive(Debug)]
 pub(super) struct Effective {
     counts: Vec<bool>,
     past: Vec<Bits>,
@@ -317,6 +327,12 @@ pub(super) fn historical_seat_entry(records: &[Record], binding: &Binding) -> Op
 /// taken out for good by an effective quorum `Remove`.
 pub(super) fn has_historical_seat(records: &[Record], binding: &Binding) -> bool {
     historical_seat_entry(records, binding).is_some()
+}
+
+/// Whether `actor` holds a founding or non-void, authorized, non-cut-off admitted seat in
+/// `records` (including actors later retired by an ordinary or quorum `Remove`).
+pub(super) fn has_known_actor(records: &[Record], actor: &MemberId) -> bool {
+    Graph::new(records).has_known_actor(actor)
 }
 
 /// The cutoff of F16's quorum `Remove` of `actor` ([`super::Log::undo_cutoff`]).
@@ -372,7 +388,7 @@ pub(super) fn historical_bindings_for_epoch(
 }
 
 /// A set of record indexes.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Bits(Vec<u64>);
 
 impl Bits {
@@ -617,7 +633,7 @@ impl<'a> Graph<'a> {
         let all = |_: usize| true;
         let standing = self.standing(&all, &effects.void, &effects.out, &authorized);
         let plain = self.authorized(&vec![false; self.records.len()], memo, &mut scratch);
-        let labels = self.labels(&plain, &authorized);
+        let labels = self.labels(&plain, &authorized, &standing, &effects.out, &effects.void);
         let mut quorums: Vec<Quorum> = accepted
             .iter()
             .map(|&q| {
@@ -633,9 +649,23 @@ impl<'a> Graph<'a> {
 
         let mut members = BTreeMap::new();
         for (member, &entry) in &standing.members {
-            let Some((seat, admitted_by)) = self.entrant(entry, member) else {
+            let Some((mut seat, admitted_by)) = self.entrant(entry, member) else {
                 continue;
             };
+            if entry != 0 {
+                seat.node_key = seat.node_key.filter(|key| {
+                    self.admit_node_key_binds(
+                        entry,
+                        *member,
+                        seat.binding.recipient(),
+                        key,
+                        &effects.out,
+                        &authorized,
+                        &effects.void,
+                        &standing,
+                    )
+                });
+            }
             let name = self
                 .latest(standing.names.get(member))
                 .and_then(|i| match self.records[i].body() {
@@ -690,14 +720,27 @@ impl<'a> Graph<'a> {
             .filter(|&i| effects.void[i])
             .map(|i| *self.records[i].id())
             .collect();
-        let active_recipients: BTreeSet<Recipient> =
-            members.values().map(|m| m.binding.recipient()).collect();
-        let active_labels: BTreeSet<&str> = members.values().map(|m| m.label.as_str()).collect();
         let mut seat_recipients: BTreeMap<MemberId, Recipient> = BTreeMap::new();
+        let mut seat_nodes: BTreeMap<MemberId, BTreeSet<[u8; 32]>> = BTreeMap::new();
         for seat in self.bound_seats(&effects.out, &authorized, &effects.void, &standing) {
             seat_recipients
                 .entry(seat.member())
                 .or_insert_with(|| seat.binding.recipient());
+            if let Some(nk) = seat.node_key.filter(|k| *k != [0; 32]) {
+                seat_nodes.entry(seat.member()).or_default().insert(nk);
+            }
+        }
+        for (i, record) in self.records.iter().enumerate().skip(1) {
+            if authorized[i]
+                && !effects.void[i]
+                && let Body::Node { node_key, .. } = record.body()
+                && *node_key != [0; 32]
+            {
+                seat_nodes
+                    .entry(*record.actor())
+                    .or_default()
+                    .insert(*node_key);
+            }
         }
         let mut superseded_by: BTreeMap<MemberId, MemberId> = BTreeMap::new();
         for (&removed_actor, removal) in &removed {
@@ -712,7 +755,12 @@ impl<'a> Graph<'a> {
             }
             if let Some((&active_actor, _)) = members.iter().find(|&(active_actor, m)| {
                 (active_actor[..32] == removed_actor[..32]
-                    || seat_recipients.get(&removed_actor) == Some(&m.binding.recipient()))
+                    || seat_recipients.get(&removed_actor) == Some(&m.binding.recipient())
+                    || m.node_key.is_some_and(|nk| {
+                        seat_nodes
+                            .get(&removed_actor)
+                            .is_some_and(|nks| nks.contains(&nk))
+                    }))
                     && standing
                         .members
                         .get(active_actor)
@@ -721,34 +769,84 @@ impl<'a> Graph<'a> {
                 superseded_by.insert(removed_actor, active_actor);
             }
         }
+        let unproved = self.unproved(&members, &removed, &effects, &authorized, &standing);
+        let bound_seats: Vec<(usize, Seat<'a>)> = self
+            .bound_seats_with_entry(&effects.out, &authorized, &effects.void, &standing)
+            .collect();
         let mut removed_recipients = BTreeSet::new();
-        let mut removed_labels = BTreeSet::new();
         let mut claimed_labels: BTreeSet<String> =
             self.listed().iter().map(|f| f.label.clone()).collect();
-        for seat in self.bound_seats(&effects.out, &authorized, &effects.void, &standing) {
+        for &(seat_entry, seat) in &bound_seats {
             let member = seat.member();
             if members.contains_key(&member) || removed.contains_key(&member) {
                 claimed_labels.insert(seat.label.to_owned());
             }
             if removed.contains_key(&member) && !superseded_by.contains_key(&member) {
                 let recipient = seat.binding.recipient();
-                if !active_recipients.contains(&recipient) {
+                let has_newer_recipient_seat =
+                    members.iter().any(|(active_actor, m)| {
+                        m.binding.recipient() == recipient
+                            && standing
+                                .members
+                                .get(active_actor)
+                                .is_some_and(|&active_entry| active_entry > seat_entry)
+                    }) || unproved.iter().any(|f| f.recipient == recipient);
+                if !has_newer_recipient_seat {
                     removed_recipients.insert(recipient);
-                }
-                if !active_labels.contains(seat.label) {
-                    removed_labels.insert(seat.label.to_owned());
                 }
             }
         }
-        let unproved = self.unproved(&members, &removed, &effects, &authorized, &standing);
         let nodes = self.nodes(
             &members,
-            &removed,
-            &superseded_by,
+            (&removed, &superseded_by, &removed_recipients),
             &effects.out,
             (&authorized, &effects.void),
             &standing,
         );
+        let member_is_out = |m: &Member| {
+            removed_recipients.contains(&m.binding.recipient())
+                || m.node_key.is_some_and(|nk| {
+                    nk != [0; 32] && matches!(nodes.get(&nk), Some(NodeStanding::Removed(_)))
+                })
+                || matches!(
+                    nodes.get(m.binding.writer()),
+                    Some(NodeStanding::Removed(_))
+                )
+        };
+        let mut removed_labels = BTreeSet::new();
+        for &(seat_entry, seat) in &bound_seats {
+            let member = seat.member();
+            let seat_out = (removed.contains_key(&member) && !superseded_by.contains_key(&member))
+                || members.get(&member).is_some_and(member_is_out);
+            if seat_out {
+                let recipient = seat.binding.recipient();
+                let seat_was_bare = labels
+                    .get(&member)
+                    .is_none_or(|evaluated| evaluated == seat.label);
+                let has_active_label_holder = members.iter().any(|(active_actor, m)| {
+                    !member_is_out(m)
+                        && (m.label == seat.label
+                            || m.label
+                                .split_once('-')
+                                .is_some_and(|(bare, _)| bare == seat.label))
+                        && (m.binding.recipient() != recipient
+                            || standing
+                                .members
+                                .get(active_actor)
+                                .is_some_and(|&active_entry| active_entry > seat_entry))
+                }) || unproved.iter().any(|f| {
+                    f.label == seat.label
+                        && !removed_recipients.contains(&f.recipient)
+                        && !f.node_key.is_some_and(|nk| {
+                            nk != [0; 32]
+                                && matches!(nodes.get(&nk), Some(NodeStanding::Removed(_)))
+                        })
+                });
+                if seat_was_bare && !has_active_label_holder {
+                    removed_labels.insert(seat.label.to_owned());
+                }
+            }
+        }
         Membership {
             members,
             removed,
@@ -783,8 +881,9 @@ impl<'a> Graph<'a> {
     }
 
     /// Whether an `Admit` at `i` for `target` binds `target`'s recipient and entry node key: it
-    /// counts (`!void`, `authorized`, not cut off, and not self-signed), and when both its signer
-    /// and `target` are now out, another member also removed `target` after `i`.
+    /// counts (`!void`, `authorized`, not cut off, and not self-signed), is not a redundant
+    /// re-admission of an already-active seat in its causal past, and when both its signer and
+    /// `target` are now out, another member also removed `target` after `i`.
     fn admit_binds(
         &self,
         i: usize,
@@ -801,13 +900,138 @@ impl<'a> Graph<'a> {
         {
             return false;
         }
+        let has_remove_between = |from: Option<usize>| {
+            standing.removes.get(&target).is_some_and(|rs| {
+                rs.iter()
+                    .any(|&r| from.is_none_or(|j| !self.before(r, j)) && self.before(r, i))
+            })
+        };
+        if self.founders().any(|seat| seat.member() == target) && !has_remove_between(None) {
+            return false;
+        }
+        if standing.admits.get(&target).is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|&j| j != i && self.before(j, i) && !has_remove_between(Some(j)))
+        }) {
+            return false;
+        }
         if self.is_removed_in(&target, out, standing)
             && self.is_removed_in(self.signer(i), out, standing)
         {
+            if let Body::Admit { entrant, evidence } = self.records[i].body() {
+                let rec = entrant.request.binding().recipient();
+                let squats_listed = self.listed().iter().any(|f| {
+                    f.recipient == rec
+                        && (f.binding.is_some() || *evidence != super::Evidence::Listed)
+                });
+                let squats_active = standing.members.iter().any(|(&m, &entry)| {
+                    m != target
+                        && m[..32] != target[..32]
+                        && self
+                            .entrant(entry, &m)
+                            .is_some_and(|(s, _)| s.binding.recipient() == rec)
+                });
+                if squats_listed || squats_active {
+                    return false;
+                }
+            }
             return standing.removes.get(&target).is_some_and(|rs| {
                 rs.iter()
                     .any(|&r| self.signer(r) != self.signer(i) && self.before(i, r))
             });
+        }
+        true
+    }
+
+    /// Whether a binding `Admit` at `i` for `target` (with recipient `target_rec`) binds `key` as
+    /// its entry node key: `false` when `key` is already bound to another Mac (by founder entry,
+    /// `Node` proof, or earlier `Admit`) that `i` does not supersede after a non-quorum removal.
+    #[allow(clippy::too_many_arguments)]
+    fn admit_node_key_binds(
+        &self,
+        i: usize,
+        target: MemberId,
+        target_rec: Recipient,
+        key: &[u8; 32],
+        out: &BTreeSet<MemberId>,
+        authorized: &[bool],
+        void: &[bool],
+        standing: &Standing,
+    ) -> bool {
+        if *key == [0; 32] {
+            return false;
+        }
+        let same_mac = |other: MemberId, other_rec: Option<Recipient>| {
+            other == target || other[..32] == target[..32] || other_rec == Some(target_rec)
+        };
+        let active_mac = |other: MemberId, other_rec: Option<Recipient>| {
+            standing.members.iter().any(|(&m, &entry)| {
+                m == other
+                    || m[..32] == other[..32]
+                    || other_rec.is_some_and(|rec| {
+                        self.entrant(entry, &m)
+                            .is_some_and(|(s, _)| s.binding.recipient() == rec)
+                    })
+            })
+        };
+        let removable_before_i = |other: MemberId, other_rec: Option<Recipient>| {
+            !out.contains(&other)
+                && !active_mac(other, other_rec)
+                && standing
+                    .removes
+                    .get(&other)
+                    .is_some_and(|rs| !rs.is_empty() && rs.iter().all(|&r| self.before(r, i)))
+        };
+        for f in self.listed() {
+            if f.node_key != Some(*key) || f.recipient == target_rec {
+                continue;
+            }
+            match f.member() {
+                Some(other) if same_mac(other, Some(f.recipient)) => continue,
+                Some(other) if removable_before_i(other, Some(f.recipient)) => continue,
+                _ => return false,
+            }
+        }
+        for (j, record) in self.records.iter().enumerate().skip(1) {
+            if !authorized[j] || void[j] {
+                continue;
+            }
+            match record.body() {
+                Body::Node { node_key, .. } if node_key == key => {
+                    let other = *self.signer(j);
+                    if !same_mac(other, None)
+                        && !self.before(i, j)
+                        && !removable_before_i(other, None)
+                    {
+                        return false;
+                    }
+                }
+                Body::Admit { entrant: e_j, .. }
+                    if j != i
+                        && &e_j.node_key == key
+                        && self.admit_binds(j, e_j.member(), out, authorized, void, standing) =>
+                {
+                    let other = e_j.member();
+                    let other_rec = e_j.request.binding().recipient();
+                    let j_precedes_i = self.before(j, i)
+                        || (!self.before(i, j)
+                            && (
+                                self.is_removed_in(self.signer(j), out, standing),
+                                self.records[j].id(),
+                            ) < (
+                                self.is_removed_in(self.signer(i), out, standing),
+                                self.records[i].id(),
+                            ));
+                    if !same_mac(other, Some(other_rec))
+                        && j_precedes_i
+                        && !removable_before_i(other, Some(other_rec))
+                    {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
         }
         true
     }
@@ -817,8 +1041,11 @@ impl<'a> Graph<'a> {
     fn nodes(
         &self,
         members: &BTreeMap<MemberId, Member>,
-        removed: &BTreeMap<MemberId, Removal>,
-        superseded_by: &BTreeMap<MemberId, MemberId>,
+        (removed, superseded_by, removed_recipients): (
+            &BTreeMap<MemberId, Removal>,
+            &BTreeMap<MemberId, MemberId>,
+            &BTreeSet<Recipient>,
+        ),
         out: &BTreeSet<MemberId>,
         (authorized, void): (&[bool], &[bool]),
         standing: &Standing,
@@ -846,6 +1073,16 @@ impl<'a> Graph<'a> {
                             authorized,
                             void,
                             standing,
+                        )
+                        && self.admit_node_key_binds(
+                            i,
+                            entrant.member(),
+                            entrant.request.binding().recipient(),
+                            &entrant.node_key,
+                            out,
+                            authorized,
+                            void,
+                            standing,
                         ) =>
                 {
                     (entrant.node_key, entrant.member())
@@ -865,10 +1102,12 @@ impl<'a> Graph<'a> {
         bound
             .into_iter()
             .filter_map(|(key, macs)| {
-                let standing = if let Some(out) = macs
-                    .iter()
-                    .find(|m| removed.contains_key(*m) && !superseded_by.contains_key(*m))
-                {
+                let standing = if let Some(out) = macs.iter().find(|m| {
+                    (removed.contains_key(*m) && !superseded_by.contains_key(*m))
+                        || members.get(*m).is_some_and(|mem| {
+                            removed_recipients.contains(&mem.binding.recipient())
+                        })
+                }) {
                     NodeStanding::Removed(*out)
                 } else {
                     match current.get(&key).map(Vec::as_slice) {
@@ -895,14 +1134,43 @@ impl<'a> Graph<'a> {
         void: &[bool],
         standing: &Standing,
     ) -> impl Iterator<Item = Seat<'a>> {
+        self.bound_seats_with_entry(out, authorized, void, standing)
+            .map(|(_, seat)| seat)
+    }
+
+    /// Every seat the genesis (`0`) or a binding `Admit` ([`Self::admit_binds`]) binds, with its
+    /// record index.
+    fn bound_seats_with_entry(
+        &self,
+        out: &BTreeSet<MemberId>,
+        authorized: &[bool],
+        void: &[bool],
+        standing: &Standing,
+    ) -> impl Iterator<Item = (usize, Seat<'a>)> {
+        let founders = self.founders().map(|seat| (0usize, seat));
         let entrants = (1..self.records.len()).filter_map(move |i| {
             let Body::Admit { entrant, .. } = self.records[i].body() else {
                 return None;
             };
             self.admit_binds(i, entrant.member(), out, authorized, void, standing)
-                .then(|| Seat::entrant(entrant))
+                .then(|| {
+                    let mut seat = Seat::entrant(entrant);
+                    seat.node_key = seat.node_key.filter(|key| {
+                        self.admit_node_key_binds(
+                            i,
+                            entrant.member(),
+                            entrant.request.binding().recipient(),
+                            key,
+                            out,
+                            authorized,
+                            void,
+                            standing,
+                        )
+                    });
+                    (i, seat)
+                })
         });
-        self.founders().chain(entrants)
+        founders.chain(entrants)
     }
 
     /// The founders listed with no binding whose recipient no member and no Mac taken out holds:
@@ -1475,12 +1743,32 @@ impl<'a> Graph<'a> {
         if effects.out.contains(&actor) {
             return None;
         }
-        if self.founders().any(|seat| seat.binding == binding) {
-            return Some(*self.records[0].id());
-        }
         let authorized = self.authorized(&effects.void, &mut memo, &mut scratch);
         let all = |_: usize| true;
         let standing = self.standing(&all, &effects.void, &effects.out, &authorized);
+        if let Some(&entry) = standing.members.get(&actor) {
+            let binds = if entry == 0 {
+                self.founders().any(|seat| seat.binding == binding)
+            } else {
+                self.admit_binds(
+                    entry,
+                    actor,
+                    &effects.out,
+                    &authorized,
+                    &effects.void,
+                    &standing,
+                ) && matches!(
+                    self.records[entry].body(),
+                    Body::Admit { entrant, .. } if entrant.request.binding() == binding
+                )
+            };
+            if binds {
+                return Some(*self.records[entry].id());
+            }
+        }
+        if self.founders().any(|seat| seat.binding == binding) {
+            return Some(*self.records[0].id());
+        }
         standing.admits.get(&actor).and_then(|entries| {
             let matching: Vec<usize> = entries
                 .iter()
@@ -1510,6 +1798,21 @@ impl<'a> Graph<'a> {
                 .min_by_key(|&i| self.records[i].id())
                 .map(|i| *self.records[i].id())
         })
+    }
+
+    fn has_known_actor(self, actor: &MemberId) -> bool {
+        if self.founders().any(|seat| seat.member() == *actor) {
+            return true;
+        }
+        let mut scratch = AuthScratch::new(self.records.len());
+        let candidates = self.candidates();
+        let mut memo = Memo::new();
+        let accepted = self.accepted(&candidates, &mut memo, &mut scratch);
+        let effects = self.effects(&candidates, &accepted);
+        let authorized = self.authorized(&effects.void, &mut memo, &mut scratch);
+        let all = |_: usize| true;
+        let standing = self.standing(&all, &effects.void, &effects.out, &authorized);
+        standing.admits.contains_key(actor)
     }
 
     fn historical_bindings_for_epoch(self, epoch_index: usize) -> Option<Vec<Binding>> {
@@ -1783,18 +2086,57 @@ impl<'a> Graph<'a> {
     ///
     /// An `Admit` claims when it is authorized in its own past (`plain`, which no later record
     /// changes) or under the quorums that take effect (`settled`).
-    fn labels(&self, plain: &[bool], settled: &[bool]) -> BTreeMap<MemberId, String> {
+    fn labels(
+        &self,
+        plain: &[bool],
+        settled: &[bool],
+        standing: &Standing,
+        out: &BTreeSet<MemberId>,
+        void: &[bool],
+    ) -> BTreeMap<MemberId, String> {
         // Every claim: the record that makes it, the Mac, and what the record says of it.
         let mut claims: Vec<(usize, MemberId, Seat<'a>)> = self
             .founders()
             .map(|seat| (0, seat.member(), seat))
             .collect();
+        let mut node_claims: BTreeMap<MemberId, BTreeSet<[u8; 32]>> = BTreeMap::new();
+        for (_, member, seat) in &claims {
+            if let Some(nk) = seat.node_key.filter(|k| *k != [0; 32]) {
+                node_claims.entry(*member).or_default().insert(nk);
+            }
+        }
         for (i, record) in self.records.iter().enumerate().skip(1) {
-            if let Body::Admit { entrant, .. } = record.body()
-                && self.signer(i) != &entrant.member()
-                && (plain[i] || settled[i])
-            {
-                claims.push((i, entrant.member(), Seat::entrant(entrant)));
+            if !(plain[i] || settled[i]) {
+                continue;
+            }
+            match record.body() {
+                Body::Admit { entrant, .. } if self.signer(i) != &entrant.member() => {
+                    let seat = Seat::entrant(entrant);
+                    if let Some(nk) = seat.node_key.filter(|k| {
+                        *k != [0; 32]
+                            && self.admit_binds(i, entrant.member(), out, settled, void, standing)
+                            && self.admit_node_key_binds(
+                                i,
+                                entrant.member(),
+                                entrant.request.binding().recipient(),
+                                k,
+                                out,
+                                settled,
+                                void,
+                                standing,
+                            )
+                    }) {
+                        node_claims.entry(entrant.member()).or_default().insert(nk);
+                    }
+                    claims.push((i, entrant.member(), seat));
+                }
+                Body::Node { node_key, .. } if *node_key != [0; 32] => {
+                    node_claims
+                        .entry(*record.actor())
+                        .or_default()
+                        .insert(*node_key);
+                }
+                _ => {}
             }
         }
         // A Mac's first claims: those no other claim of it precedes.
@@ -1827,10 +2169,21 @@ impl<'a> Graph<'a> {
                 let clash = own_labels.len() > 1
                     || claimants.get(base.label).is_some_and(|c| {
                         c.iter().any(|(j, other, other_rec)| {
+                            let restored_by_node = !standing.members.contains_key(other)
+                                && standing.removes.get(other).is_some_and(|rs| {
+                                    !rs.is_empty() && rs.iter().all(|&r| self.before(r, *at))
+                                })
+                                && node_claims.get(&member).is_some_and(|mine_nks| {
+                                    node_claims
+                                        .get(other)
+                                        .is_some_and(|other_nks| !mine_nks.is_disjoint(other_nks))
+                                });
                             *other != member
                                 && !self.before(*at, *j)
                                 && !(self.before(*j, *at)
-                                    && (other[..32] == member[..32] || *other_rec == base_rec))
+                                    && (other[..32] == member[..32]
+                                        || *other_rec == base_rec
+                                        || restored_by_node))
                         })
                     });
                 let label = if clash {

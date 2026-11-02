@@ -1,0 +1,6 @@
+# grok 1.0.70 · MEASURED 2026-10-29, `aterm ctl text` of a private headless aterm (144x50, aterm 0.146.0) running the real Grok Build, launched by path in the lab's jail with a scratch `HOME` and `GROK_HOME`, the lab's `XAI_API_KEY` and `GROK_XAI_API_BASE_URL`/`GROK_CLI_CHAT_PROXY_BASE_URL=http://127.0.0.1:<port>/v1` (a local stub of xAI's API, crates/aterm-lab) · `grok --resume <an id no session has>`: no TUI; on the shell's screen `Session "<id>" not found locally, restoring conversation from remote...` then `Error: Failed to authenticate for session restore: error sending request for url (https://auth.x.ai/.well-known/openid-configuration)` (the stub saw `GET /v1/login-config`, the black hole three `CONNECT auth.x.ai:443`), exit status `1`; no browser · cursor at the shell prompt
+Session "00000000-0000-4000-8000-000000000000" not found locally, restoring conversation from remote...
+Error: Failed to authenticate for session restore: error sending request for url (https://auth.x.ai/.well-known/openid-configuration)
+lab$ echo "grok-exit=$?"
+grok-exit=1
+lab$

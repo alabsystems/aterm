@@ -1,0 +1,25 @@
+# kimi 2.4.1 · MEASURED 2026-10-30, `aterm ctl text` of a private headless aterm (144x50, aterm 0.148.0) running the real Kimi Code, launched by path with a scratch `HOME` and `KIMI_CODE_HOME` whose `config.toml` names one `openai`-type provider at `http://127.0.0.1:<port>/v1` with a fake key (a local stub of the Chat Completions API, crates/aterm-lab), no login · Actual Kimi2.4.1 fake-key localstub reply; harness disabled, scratch trust only
+
+ ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │                                                                                                                                            │
+ │  ▐█▛█▛█▌  Welcome to Kimi Code!                                                                                                            │
+ │  ▐█████▌  Send /help for help information.                                                                                                 │
+ │                                                                                                                                            │
+ │  Directory: /private/tmp/at.YCny/proj                                                                                                      │
+ │  Session:   session_1962cf63-c438-4681-b21e-98e551e2dd5a                                                                                   │
+ │  Model:     lab-model                                                                                                                      │
+ │  Version:   2.4.1                                                                                                                          │
+ │                                                                                                                                            │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+   No session yet — one will be created on your first message.
+
+ ❯ Say hi from the private lab stub.
+
+ ● Hi! I am the local lab stub, not a model. (reply 1)
+
+ ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │ >                                                                                                                                          │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ lab-model  …/tmp/at.YCny/proj                                                                                             /model: switch model
+                                                                                                                     context: 15% (13.7k/97.7k)

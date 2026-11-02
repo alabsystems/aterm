@@ -924,6 +924,23 @@ fn every_reporter_message() -> Vec<Message> {
             0,
         ));
     }
+    {
+        let view = left_fixture();
+        for tab in &view.closed {
+            all.push(super::left_record(tab, &view));
+        }
+        for killed in [false, true] {
+            all.push(super::end_record(
+                &view.rows[0],
+                &view,
+                super::EndOutcome { killed, gone: true },
+                LEFT_NOW,
+            ));
+        }
+        all.push(super::auto_end_record(
+            "verify ended aterm link broker (pid 4242) of its stage group: proof group,tree; gone",
+        ));
+    }
     all.extend(integration_lost_fixtures());
     all.push(integration_rekey_waits("in tab 2", "s-0123456789abcdef"));
     for place in ["in tab 2", "in window 12, tab 10", "in its tab"] {
@@ -935,7 +952,6 @@ fn every_reporter_message() -> Vec<Message> {
             },
             &Exception {
                 held: None,
-                title: None,
                 kind: ExceptionKind::Login,
                 when: Urgency::Now,
                 why: "Its login is gone, and the roster has no other account to move it to."
@@ -953,7 +969,7 @@ fn every_reporter_message() -> Vec<Message> {
                     place: place.to_string(),
                     nav: None,
                 },
-                &Exception::repeats_land(held, None),
+                &Exception::repeats(held),
             ));
         }
         for text in aterm_agent::supervise::policy::notice::ALL {
@@ -974,18 +990,6 @@ fn every_reporter_message() -> Vec<Message> {
     }
     all.push(a11y_publisher_dead("Server GUID mismatch", true));
     all.push(a11y_publisher_dead("Server GUID mismatch", false));
-    all.push(presence_not_saved(
-        "presence.rim",
-        "Show Needs in Windows",
-        "the write was refused",
-        false,
-    ));
-    all.push(presence_not_saved(
-        "presence.rim",
-        "Show Needs in Windows",
-        "the write could not be verified",
-        true,
-    ));
     all.push(theme_not_saved(
         "Gruvbox Dark",
         "aterm.toml changed first; its current value was kept",
@@ -4006,4 +4010,122 @@ fn a_config_rows_narrow_band_says_what_is_wrong() {
             row.title.1
         );
     }
+}
+
+/// Now, unix ms, for the leftover records' words.
+const LEFT_NOW: u64 = 1_792_200_000_000;
+
+/// A leftover view: tab 2 (key 5) closed two hours ago and left `ugrep` twice and `tail`, which
+/// `end` takes, and a `trustd`, daemon-shaped, which it only names; tab 4 (key 6) closed and left
+/// nothing.
+fn left_fixture() -> aterm_vitals::left::LeftView {
+    use aterm_vitals::left::{ClosedTab, LeftRow, LeftView, Proof, Source, State, Tier, Why};
+    let row = |pid: u32, exe: &str| LeftRow {
+        pid,
+        state: State::Left,
+        peer: None,
+        check_ms: None,
+        started_ms: Some(9_000_000),
+        cpu_ms: Some(10),
+        exe_judged: Some(format!("/opt/bin/{exe}")),
+        tier: Tier::Offer,
+        why: Why::OwnerGone,
+        proof: vec![Proof::Env, Proof::Time, Proof::Coalition],
+        listen: false,
+        from: Source::Closed(5),
+        teller: None,
+        token: Some(format!("{pid}@1792098840004410:331")),
+        foreground: false,
+    };
+    let tab = |key: u64, label: &str, left: usize| ClosedTab {
+        key,
+        sid: format!("s-{key}"),
+        label: label.into(),
+        number: None,
+        shell_uniqueid: 1_000,
+        horizon: 2_000,
+        closed_ms: LEFT_NOW - 7_200_000,
+        agent_since: None,
+        left,
+    };
+    let daemon = LeftRow {
+        tier: Tier::Name,
+        why: Why::Daemon,
+        token: None,
+        ..row(2609, "trustd")
+    };
+    LeftView {
+        rows: vec![
+            row(2606, "ugrep"),
+            row(2607, "ugrep"),
+            row(2608, "tail"),
+            daemon,
+        ],
+        closed: vec![tab(5, "Tab 2", 3), tab(6, "Tab 4", 0)],
+        ..LeftView::default()
+    }
+}
+
+/// A CLOSE IS TOLD ONCE: the first view that holds a closed tab with processes left makes one
+/// `proc.left` record naming them by executable; a close that left nothing makes none, and a
+/// later view makes none for the same close, whatever its count did in between. NEGATIVE
+/// CONTROLS: post on every close, and the close that left nothing is told; forget a close once
+/// its count reads none, and a count that fell to none and rose again is told twice.
+#[test]
+fn a_close_that_left_processes_posts_one_record_and_one_that_left_none_posts_none() {
+    use aterm_messages::need::Need;
+    let after = left_fixture();
+    let mut told = std::collections::BTreeSet::new();
+    let first = super::newly_left(&mut told, &after);
+    assert_eq!(first.iter().map(|t| t.key).collect::<Vec<_>>(), [5]);
+    let record = super::left_record(first[0], &after);
+    assert_eq!(record.key.as_deref(), Some("proc.left"));
+    assert_eq!(record.tag, aterm_messages::tags::SYSTEM);
+    assert_eq!(*record.need(), Need::Record);
+    assert!(
+        super::newly_left(&mut told, &after).is_empty(),
+        "a view adopted again tells nothing"
+    );
+    let mut none_left = after.clone();
+    none_left.closed[0].left = 0;
+    assert!(super::newly_left(&mut told, &none_left).is_empty());
+    assert!(
+        super::newly_left(&mut told, &after).is_empty(),
+        "a count that fell to none and rose again is the same close"
+    );
+    let mut gone = after.clone();
+    gone.closed.remove(0);
+    assert!(super::newly_left(&mut told, &gone).is_empty());
+    assert!(
+        told.is_empty(),
+        "told keeps only the closes the view holds: {told:?}"
+    );
+}
+
+/// The record of a close names by executable the processes `end` takes: a daemon the tab left
+/// (a `trustd`), which the view lists with no token, is neither counted nor named. NEGATIVE
+/// CONTROL: name every row of the tab, and the daemon is named.
+#[test]
+fn a_close_record_names_only_the_processes_end_takes() {
+    let after = left_fixture();
+    let record = super::left_record(&after.closed[0], &after);
+    assert_eq!(
+        record.title,
+        "Tab 2 closed and left 3 processes: ugrep ×2, tail"
+    );
+}
+
+/// What a verify run ended unasked arrives as `appnotice proc <text>` and is a record under the
+/// `proc.` stem, never on any glass. NEGATIVE CONTROL: key it under `harness.`, and the stem is
+/// wrong.
+#[test]
+fn appnotice_proc_records_under_the_proc_stem() {
+    use aterm_messages::need::Need;
+    let text =
+        "verify ended aterm link broker (pid 4242) of its stage group: proof group,tree; gone";
+    let record = super::auto_end_record(text);
+    assert_eq!(record.key.as_deref(), Some("proc.auto-end"));
+    assert_eq!(record.tag, aterm_messages::tags::SYSTEM);
+    assert_eq!(*record.need(), Need::Record);
+    assert_eq!(record.title, text);
 }

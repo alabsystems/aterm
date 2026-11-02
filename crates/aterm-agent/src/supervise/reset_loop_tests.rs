@@ -1486,6 +1486,8 @@ fn a_deadline_is_placed_in_the_wall_notices_zone_where_the_loop_holds_one() {
         reset_text: "Oct 9 at 5am (UTC)".to_string(),
         extended: false,
         raised: false,
+        worked: false,
+        message: String::new(),
     });
     assert_eq!(s.reset_place("Oct 5 at 3pm"), Some(local - 7 * 3600));
 }

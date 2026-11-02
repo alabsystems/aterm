@@ -321,7 +321,9 @@ fn parse_csi_body(major_tok: &str, rest: &str) -> Result<SequenceSelector, Selec
 }
 
 fn parse_dcs_body(major_tok: &str, rest: &str) -> Result<SequenceSelector, SelectorParseError> {
-    let suffix = if rest.is_empty() {
+    let suffix = if rest.is_empty() && (major_tok.is_empty() || major_tok == "*") {
+        None
+    } else if rest.is_empty() {
         Some(major_tok.to_owned())
     } else {
         Some(format!("{major_tok}{rest}"))
@@ -376,6 +378,9 @@ fn compile_param(raw: &str) -> SelectorParam {
 
 #[inline]
 fn parse_major(tok: &str) -> Result<u32, SelectorParseError> {
+    if !tok.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(SelectorParseError::BadMajor(tok.to_owned()));
+    }
     tok.parse::<u32>()
         .map_err(|_| SelectorParseError::BadMajor(tok.to_owned()))
 }
@@ -452,12 +457,22 @@ mod tests {
             ("DCS 2000p", sel(Dcs, None, Some("2000p"), &[])),
             ("DCS 2000 p", sel(Dcs, None, Some("2000p"), &[])),
             ("DCS  2000  p", sel(Dcs, None, Some("2000p"), &[])),
+            ("DCS *", sel(Dcs, None, None, &[])),
+            ("DCS", sel(Dcs, None, None, &[])),
         ] {
             assert_eq!(SequenceSelector::parse(spelling), Ok(want), "{spelling:?}");
         }
         assert!(matches!(
             SequenceSelector::parse("XYZ 1"),
             Err(SelectorParseError::UnknownFunction(_))
+        ));
+        assert!(matches!(
+            SequenceSelector::parse("OSC +4"),
+            Err(SelectorParseError::BadMajor(_))
+        ));
+        assert!(matches!(
+            SequenceSelector::parse("CSI +20 t"),
+            Err(SelectorParseError::BadMajor(_))
         ));
         assert_eq!(SequenceSelector::parse(""), Err(SelectorParseError::Empty));
     }
@@ -490,6 +505,8 @@ mod tests {
             ("CSI ? h", csi(25, 'h'), false),
             ("DCS 2000p", DispatchedSequence::dcs("2000p"), true),
             ("DCS 2000p", DispatchedSequence::dcs("1000p"), false),
+            ("DCS *", DispatchedSequence::dcs("2000p"), true),
+            ("DCS *", DispatchedSequence::dcs("1000p"), true),
             ("OSC 4;*;?", osc(4, &["3"]), false),
             ("OSC 4;*", osc(4, &["3", "anything"]), true),
         ] {

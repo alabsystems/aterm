@@ -1,9 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Persistent session log journal writer ([`gate`], [`Lane::new`], [`aterm_slog::Notify`],
-//! [`COALESCE`], [`BATCH_RECORDS`], [`TRANSIENT_TO_BACKOFF`], [`FREE_FLOOR`], [`QUIT_BUDGET`],
-//! [`quit_budget`]).
+//! Persistent session log journal writer ([`admit`], [`Lane::new`], [`Status::words`],
+//! [`aterm_slog::Notify`], [`COALESCE`], [`BATCH_RECORDS`], [`TRANSIENT_TO_BACKOFF`],
+//! [`FREE_FLOOR`], [`QUIT_BUDGET`], [`quit_budget`]).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
@@ -93,9 +93,15 @@ pub(crate) fn quit_budget() -> Duration {
 /// The quit budget a [`QUIT_BUDGET_SEAM`] value names: its whole milliseconds above zero, and
 /// [`QUIT_BUDGET`] for no value or any other.
 pub(crate) fn quit_budget_of(seam: Option<&std::ffi::OsStr>) -> Duration {
-    seam.and_then(|v| v.to_str()?.trim().parse::<u64>().ok())
-        .filter(|&ms| ms > 0)
-        .map_or(QUIT_BUDGET, Duration::from_millis)
+    seam.and_then(|v| {
+        let s = v.to_str()?.trim();
+        s.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| s.parse::<u64>().ok())
+            .flatten()
+    })
+    .filter(|&ms| ms > 0)
+    .map_or(QUIT_BUDGET, Duration::from_millis)
 }
 
 /// Why a requested journal cannot run on the launch's configuration and desk.
@@ -138,15 +144,139 @@ pub(crate) const fn eligibility(
     }
 }
 
-/// Read once at launch.
-pub(crate) fn gate(config: &crate::app_config::Config, desk: crate::desk::Desk) -> bool {
+/// Why the launch's configuration and desk keep no journal ([`eligibility`]); read once at launch.
+pub(crate) fn inactive(
+    config: &crate::app_config::Config,
+    desk: crate::desk::Desk,
+) -> Option<Inactive> {
     eligibility(
         config.session_log_journal(),
         config.restore_session_or_default(),
         desk,
         cfg!(unix),
     )
-    .is_none()
+}
+
+/// THIS LAUNCH'S JOURNAL FOLDER, or why it keeps none ([`Lane::new`], `status
+/// log_journal_why=`, fix unit E5): [`inactive`] on the launch's configuration and desk, then
+/// `logs`, the logs folder, asked only of an eligible launch.
+pub(crate) fn admit(
+    config: &crate::app_config::Config,
+    desk: crate::desk::Desk,
+    logs: impl FnOnce() -> Option<PathBuf>,
+) -> Result<PathBuf, Off> {
+    match inactive(config, desk) {
+        Some(why) => Err(Off::Inactive(why)),
+        None => logs().ok_or(Off::NoFolder),
+    }
+}
+
+/// Why this launch's lane keeps no journal (`status log_journal_why=`, fix unit E5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Off {
+    /// The launch is not eligible ([`eligibility`]).
+    Inactive(Inactive),
+    /// No logs folder resolves (`aterm_types::dirs::logs_dir`).
+    NoFolder,
+}
+
+/// Declares a closed word list `status` prints from one variant list: the enum, each
+/// variant's word and (in a test build) `ALL`, so the help that names the list is held to
+/// what aterm writes (fix unit E5; the `gone_reasons!`/`rollout_words!` pattern).
+macro_rules! status_words {
+    ($(#[$doc:meta])* $name:ident { $($(#[$vdoc:meta])* $variant:ident => $word:literal,)* }) => {
+        $(#[$doc])*
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub(crate) enum $name {
+            $($(#[$vdoc])* $variant,)*
+        }
+
+        impl $name {
+            /// Every word, from the same list as the enum's.
+            #[cfg(all(test, unix))]
+            pub(crate) const ALL: &[$name] = &[$($name::$variant,)*];
+
+            /// The word `status` prints.
+            pub(crate) const fn word(self) -> &'static str {
+                match self {
+                    $($name::$variant => $word,)*
+                }
+            }
+        }
+    };
+}
+
+status_words! {
+    /// `status log_journal=`: what this launch's session log journal does ([`Status::words`]).
+    LogJournal {
+        /// The writer runs.
+        On => "on",
+        /// An update's candidate waits for its Commit before it writes.
+        Armed => "armed",
+        /// Paused: the disk is full or failing, and the writer retries.
+        Paused => "paused",
+        /// Stopped for this run.
+        Stopped => "stopped",
+        /// Handed to the update's successor.
+        Handed => "handed",
+        /// This launch keeps no journal.
+        Off => "off",
+    }
+}
+
+status_words! {
+    /// `status log_journal_why=`: why the journal is off, paused or stopped ([`Status::words`]).
+    JournalWhy {
+        /// Nothing to say: it runs, waits for its Commit, or was handed on.
+        Nothing => "-",
+        /// `[session_log] journal = false`.
+        Disabled => "disabled",
+        /// `restore_session = false`.
+        NoRestore => "no-restore",
+        /// The instance keeps no desktop, as a plain headless one does.
+        NoDesk => "no-desk",
+        /// A platform other than macOS and Linux.
+        Unsupported => "unsupported",
+        /// No logs folder resolves.
+        NoFolder => "no-folder",
+        /// The disk is full.
+        Full => "full",
+        /// The disk failed a write.
+        Io => "io",
+        /// The folder or a file was refused.
+        Denied => "denied",
+        /// The folder's filesystem has no file locks.
+        NoLock => "no-lock",
+        /// The writer panicked.
+        Panic => "panic",
+        /// The writer thread could not start.
+        Spawn => "spawn",
+    }
+}
+
+impl JournalWhy {
+    /// The word for why a lane keeps no journal.
+    const fn of_off(off: Off) -> JournalWhy {
+        match off {
+            Off::Inactive(Inactive::Disabled) => JournalWhy::Disabled,
+            Off::Inactive(Inactive::RestoreOff) => JournalWhy::NoRestore,
+            Off::Inactive(Inactive::NoDesk) => JournalWhy::NoDesk,
+            Off::Inactive(Inactive::Unsupported) => JournalWhy::Unsupported,
+            Off::NoFolder => JournalWhy::NoFolder,
+        }
+    }
+
+    /// The word for why a running journal paused or stopped.
+    const fn of_cause(cause: Cause) -> JournalWhy {
+        match cause {
+            Cause::Full => JournalWhy::Full,
+            Cause::Io => JournalWhy::Io,
+            Cause::Denied => JournalWhy::Denied,
+            Cause::Unsupported => JournalWhy::NoLock,
+            Cause::Panic => JournalWhy::Panic,
+            Cause::Spawn => JournalWhy::Spawn,
+        }
+    }
 }
 
 /// The writer's wake: a dirty flag and the writer's thread.
@@ -397,12 +527,53 @@ pub(crate) fn journals_to_fence() -> bool {
 pub(crate) struct Status {
     pub(crate) phase: Option<Phase>,
     pub(crate) attention: Attention,
+    /// Why a lane with no writer keeps no journal, when the launch said ([`admit`]).
+    pub(crate) off: Option<Off>,
+}
+
+impl Status {
+    /// `status`'s two words for this launch's journal (fix unit E5): `log_journal=` from the
+    /// phase, `log_journal_why=` from the launch's [`Off`] or the writer's [`Cause`]. A word the
+    /// writer has said wins over a phase it has not published yet: a stop or a pause is never
+    /// shown as running.
+    pub(crate) const fn word_pair(self) -> (LogJournal, JournalWhy) {
+        let why = match self.attention {
+            Attention::None => JournalWhy::Nothing,
+            Attention::Paused(cause) | Attention::Stopped(cause) => JournalWhy::of_cause(cause),
+        };
+        match (self.phase, self.attention) {
+            (None, _) => (
+                LogJournal::Off,
+                match self.off {
+                    Some(off) => JournalWhy::of_off(off),
+                    None => JournalWhy::Nothing,
+                },
+            ),
+            (Some(Phase::Handed), _) => (LogJournal::Handed, JournalWhy::Nothing),
+            (Some(Phase::Stopped), _) | (_, Attention::Stopped(_)) => (LogJournal::Stopped, why),
+            (Some(Phase::Backoff), _) | (_, Attention::Paused(_)) => (LogJournal::Paused, why),
+            (Some(Phase::Armed), Attention::None) => (LogJournal::Armed, JournalWhy::Nothing),
+            (Some(Phase::Running), Attention::None) => (LogJournal::On, JournalWhy::Nothing),
+        }
+    }
+
+    /// `log_journal=<word> log_journal_why=<word>` ([`Self::word_pair`]).
+    pub(crate) fn words(self) -> String {
+        let (journal, why) = self.word_pair();
+        format!(
+            "log_journal={} log_journal_why={}",
+            journal.word(),
+            why.word()
+        )
+    }
 }
 
 /// The App's handle on its journal lane (`App::session_log_journal`).
 pub(crate) struct Lane {
     shared: Option<Arc<Shared>>,
     logs: Option<PathBuf>,
+    /// Why this lane keeps no journal, when the launch said ([`admit`]).
+    off: Option<Off>,
     armed: bool,
     started: bool,
 }
@@ -413,15 +584,24 @@ impl Lane {
         Lane {
             shared: None,
             logs: None,
+            off: None,
             armed: false,
             started: false,
         }
     }
 
-    /// This launch's lane: inert unless `logs` names the logs directory (the [`gate`] passed).
-    pub(crate) fn new(logs: Option<PathBuf>, armed: bool) -> Lane {
-        let Some(logs) = logs else {
-            return Lane::inert();
+    /// This launch's lane: inert, remembering why, unless `logs` names the logs directory
+    /// ([`admit`] passed). A second lane in one process stays inert with no reason to give:
+    /// only a test builds one.
+    pub(crate) fn new(logs: Result<PathBuf, Off>, armed: bool) -> Lane {
+        let logs = match logs {
+            Ok(logs) => logs,
+            Err(off) => {
+                return Lane {
+                    off: Some(off),
+                    ..Lane::inert()
+                };
+            }
         };
         let shared = Shared::new();
         if LANE.set(Arc::clone(&shared)).is_err() {
@@ -432,6 +612,7 @@ impl Lane {
         Lane {
             shared: Some(shared),
             logs: Some(logs),
+            off: None,
             armed,
             started: false,
         }
@@ -483,6 +664,7 @@ impl Lane {
             attention: self
                 .attention()
                 .map_or(Attention::None, |(_, attention)| attention),
+            off: self.off,
         }
     }
 

@@ -2304,10 +2304,15 @@ fn agy_usage_card_weekly_parses_gemini_and_third_party_rows() {
     let gemini = usage_card_weekly(&rows).expect("gemini weekly");
     assert_eq!(gemini.text, "weekly 78% left");
     assert_eq!(gemini.reset.as_deref(), Some("2026-10-29 09:31 PDT"));
-    let claude =
-        usage_card_weekly_for_model(&rows, Some("Claude Opus 4.6")).expect("claude weekly");
-    assert_eq!(claude.text, "weekly 100% left");
-    assert_eq!(claude.reset.as_deref(), Some("2026-10-31 00:51 PDT"));
+    for model in ["Claude Opus 4.6", "Opus 5.5", "Sonnet 5.5"] {
+        let claude = usage_card_weekly_for_model(&rows, Some(model)).expect("claude weekly");
+        assert_eq!(claude.text, "weekly 100% left", "{model}");
+        assert_eq!(
+            claude.reset.as_deref(),
+            Some("2026-10-31 00:51 PDT"),
+            "{model}"
+        );
+    }
 }
 
 #[test]
@@ -2358,4 +2363,266 @@ fn a_turn_runs_tools_by_its_tool_rows_under_its_message() {
         "○ Thought for 4.9s (The target file is empty; therefore, the correct approach is to overwrite it. `write_to_file` a...)"
     )));
     assert!(turn_ran_tools(&alone("● Explored 1 file (x.txt)")));
+}
+
+#[test]
+fn the_logo_over_one_message_is_the_opening_exchange() {
+    let one = screen(END_OF_TURN);
+    assert!(opening(&one), "{one:#?}");
+    let rule = one
+        .iter()
+        .position(|r| r.starts_with("> Write"))
+        .expect("the message")
+        - 1;
+    let mut two = one.clone();
+    let earlier = [one[rule].as_str(), "> fix the parser", "", "  Fixed.", ""];
+    two.splice(rule..rule, earlier.map(str::to_string));
+    assert!(!opening(&two), "a second message: {two:#?}");
+    let mut scrolled = one.clone();
+    scrolled.drain(..rule);
+    assert!(!opening(&scrolled), "the logo scrolled off: {scrolled:#?}");
+    assert!(!opening(&screen(IDLE)), "no message yet");
+}
+
+/// agy 1.4.12 reports a signed-in account's subscription quota at once, in the backend's gRPC
+/// words (`RESOURCE_EXHAUSTED (code 429): Individual quota reached. … Resets in 4h29m33s.`). It is
+/// a usage wall that lifts at the reset it names, so the harness waits it out and types again.
+/// Read as no wall, two Cruise prompts at it were the same reply twice and held the session for
+/// two days past the reset (m15, 2026-10-29).
+///
+/// NEGATIVE CONTROL: drop the `INDIVIDUAL_QUOTA` arm in `failure_kind`: the screen reads as a
+/// generic 429 (`ApiError`) rather than a subscription quota; its reset and Limited phase remain.
+#[test]
+fn a_subscription_quota_is_a_usage_wall_that_names_its_reset() {
+    let r = agy(lab::ERROR_429_INDIVIDUAL);
+    let w = r.wall.clone().expect("the wall");
+    assert_eq!(
+        (w.kind, w.reset.as_deref(), w.placement),
+        (WallKind::UsageSession, Some("in 16173s"), Placement::Banner)
+    );
+    assert!(
+        w.message.contains("Individual quota reached"),
+        "{}",
+        w.message
+    );
+    assert!(
+        matches!(&r.phase, Phase::Limited { reset, .. } if reset.as_deref() == Some("in 16173s")),
+        "{:?}",
+        r.phase
+    );
+    assert!(r.phase_authoritative);
+
+    // Another gRPC-form status is an API error by its code, not a quota.
+    let rows: Vec<String> = screen(lab::ERROR_429_INDIVIDUAL)
+        .iter()
+        .map(|row| {
+            row.replace(
+                "RESOURCE_EXHAUSTED (code 429): Individual quota reached",
+                "UNAVAILABLE (code 503): Busy",
+            )
+            .replace(" Resets in 4h29m33s.", "")
+        })
+        .collect();
+    assert_eq!(
+        wall(&rows).map(|w| (w.kind, w.reset)),
+        Some((
+            WallKind::ApiError {
+                code: Some(503),
+                retryable: true,
+                cause: ApiCause::Server,
+            },
+            None
+        ))
+    );
+
+    for (message, reset) in [
+        ("Resets in 2d4h29m33s.", Some("in 188973s")),
+        ("Resets in 2d 4h 29m 33s.", Some("in 188973s")),
+        ("Resets in 3d.", Some("in 259200s")),
+        ("Resets in 4h29m33s.", Some("in 16173s")),
+        ("Resets in 4h2 9m33s.", Some("in 16173s")),
+        ("Resets in 23h54m15s.", Some("in 86055s")),
+        ("Resets in 124h19m39s.", Some("in 447579s")),
+        ("resets in 41s", Some("in 41s")),
+        ("Resets in 2h.", Some("in 7200s")),
+        ("Resets in 2h see docs", Some("in 7200s")),
+        ("Resets in 2hh", None),
+        ("Resets in soon", None),
+        ("Resets in 4x", None),
+        ("no reset named", None),
+    ] {
+        assert_eq!(resets_in(message).as_deref(), reset, "{message}");
+    }
+
+    // Measured agy 1.4.12 bare wall (`⚠ Individual quota reached. …`) with a background task
+    // running and `/model` switched onto `Claude Opus 5.5 · high`: phase stays `Limited` (never
+    // `Busy` or `Idle`), a notice card over the composer does not hide `Error ID:`, and
+    // `launch_card` reads the live footer's model with or without an effort badge.
+    let measured_rows = screen(lab::WALL_INDIVIDUAL_QUOTA);
+    let measured = agy(lab::WALL_INDIVIDUAL_QUOTA);
+    assert_eq!(
+        measured
+            .wall
+            .as_ref()
+            .map(|w| (w.kind, w.reset.as_deref(), w.placement)),
+        Some((
+            WallKind::UsageSession,
+            Some("in 447579s"),
+            Placement::Banner
+        ))
+    );
+    assert!(
+        matches!(
+            &measured.phase,
+            Phase::Limited { reset, .. } if reset.as_deref() == Some("in 447579s")
+        ),
+        "{:?}",
+        measured.phase
+    );
+    let card = launch_card(&measured_rows).expect("launch card");
+    assert_eq!(
+        (card.model.as_str(), card.effort.as_deref()),
+        ("Claude Opus 5.5", Some("high"))
+    );
+    let no_effort: Vec<String> = measured_rows
+        .iter()
+        .map(|row| row.replace("Claude Opus 5.5 · high", "Claude Sonnet 5.5"))
+        .collect();
+    let card_no_effort = launch_card(&no_effort).expect("launch card without effort");
+    assert_eq!(
+        (
+            card_no_effort.model.as_str(),
+            card_no_effort.effort.as_deref()
+        ),
+        ("Claude Sonnet 5.5", None)
+    );
+    let mut with_notice = measured_rows.clone();
+    let top_rule = with_notice
+        .iter()
+        .rposition(|r| r.starts_with('>') && r.len() <= 2)
+        .expect("composer caret")
+        - 1;
+    with_notice.insert(top_rule, " ┃ Switched model in this session".to_owned());
+    assert_eq!(
+        wall(&with_notice).map(|w| (w.kind, w.reset)),
+        Some((WallKind::UsageSession, Some("in 447579s".to_owned())))
+    );
+}
+
+/// A model call that failed in words no arm knows (`generating and executing: …`) is still a
+/// server's error, waited out and tried again, never a reply the agent gave: so a new failure's
+/// wording never holds a supervised session as the same reply twice. A failure before any call
+/// (`failed to construct executor`, agy's own settings) stays an ended turn
+/// ([`a_failed_turn_is_an_ended_turn_with_no_wall`]).
+///
+/// NEGATIVE CONTROL: drop the `GENERATING` fallback in `failed_turn`: the screen reads as no
+/// wall.
+#[test]
+fn an_error_block_in_unknown_words_is_a_retried_server_error() {
+    let rows: Vec<String> = screen(lab::ERROR_429_INDIVIDUAL)
+        .iter()
+        .map(|row| {
+            row.replace(
+                "RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to",
+                "UNKNOWN_REASON: the planner stopped for a reason this reader has never seen, worded to",
+            )
+            .replace(" Resets in 4h29m33s.", "")
+        })
+        .collect();
+    assert_eq!(
+        wall(&rows).map(|w| w.kind),
+        Some(WallKind::ApiError {
+            code: None,
+            retryable: true,
+            cause: ApiCause::Server,
+        })
+    );
+}
+
+#[test]
+fn transcript_end_stays_above_composer_menus_panels_and_notice_cards() {
+    let reader = Program::Agy.reader();
+
+    let end = screen(END_OF_TURN);
+    let end_idx = reader.transcript_end(&end);
+    let (top, _) = composer_rules(&end).expect("end-of-turn composer");
+    assert!(end_idx <= top, "never enters composer: {end_idx} vs {top}");
+    assert_eq!(
+        end[end_idx - 1].trim(),
+        "and ocean floor depth further amplify or dampen these global rhythms.",
+        "ends right past the last reply row"
+    );
+
+    // Drafts, slash menus, exit-confirm footers, and active-items panels below the same
+    // transcript leave `transcript_end` and the transcript slice identical.
+    let mut drafted = end.clone();
+    let caret = composer(&drafted).expect("composer caret");
+    drafted[caret] = "> a note for later".to_owned();
+
+    let slash = screen(SLASH_MENU);
+    let mut slash_over_end = end[..top].to_vec();
+    let (slash_top, _) = composer_rules(&slash).expect("slash menu composer");
+    slash_over_end.extend_from_slice(&slash[slash_top..]);
+
+    let exit_confirm = screen(EXIT_CONFIRM);
+    let mut exit_over_end = end[..top].to_vec();
+    let (exit_top, _) = composer_rules(&exit_confirm).expect("exit-confirm composer");
+    exit_over_end.extend_from_slice(&exit_confirm[exit_top..]);
+
+    let bg = screen(lab::BG_TASK);
+    let mut bg_over_end = end[..top].to_vec();
+    let (bg_top, _) = composer_rules(&bg).expect("bg-task composer");
+    bg_over_end.extend_from_slice(&bg[bg_top..]);
+
+    for (label, variant) in [
+        ("draft", &drafted),
+        ("slash-menu", &slash_over_end),
+        ("exit-confirm", &exit_over_end),
+        ("bg-panel", &bg_over_end),
+    ] {
+        let idx = reader.transcript_end(variant);
+        assert_eq!(
+            &variant[..idx],
+            &end[..end_idx],
+            "{label} must keep the exact transcript slice above the composer"
+        );
+    }
+
+    // Dismissable `┃` notice cards above the composer are excluded so dismissing them with Esc
+    // leaves the transcript slice unchanged.
+    let fresh_notice = screen(IDLE_FRESH_NOTICE);
+    let fresh_idle = screen(IDLE);
+    assert_eq!(
+        &fresh_notice[..reader.transcript_end(&fresh_notice)],
+        &fresh_idle[..reader.transcript_end(&fresh_idle)],
+    );
+
+    // Busy frames stop at the spinner row (excluding `└ Tip:` rows below it).
+    for (label, raw) in [("busy", BUSY), ("busy-tip", BUSY_TIP)] {
+        let rows = screen(raw);
+        let idx = reader.transcript_end(&rows);
+        assert!(
+            rows[idx].contains("Generating..."),
+            "{label}: expected spinner row at {idx}, got {:?}",
+            rows.get(idx)
+        );
+    }
+
+    // Feedback survey hiding the composer stops above the survey's question row.
+    let survey_rows = screen(lab::SURVEY);
+    let survey_idx = reader.transcript_end(&survey_rows);
+    assert!(
+        survey_rows[survey_idx - 1].starts_with("Error ID:"),
+        "survey transcript ends at Error ID row, got {:?}",
+        survey_rows.get(survey_idx - 1)
+    );
+
+    // Measured subscription-quota wall stops right past the `Error ID:` row under `⚠ Individual
+    // quota reached...`, above the composer, active-items panel, and footer.
+    let quota_rows = screen(lab::WALL_INDIVIDUAL_QUOTA);
+    let quota_idx = reader.transcript_end(&quota_rows);
+    let (quota_top, _) = composer_rules(&quota_rows).expect("quota wall composer");
+    assert!(quota_idx <= quota_top);
+    assert!(quota_rows[quota_idx - 2].contains("Resets in 124h19m39s."));
+    assert!(quota_rows[quota_idx - 1].starts_with("Error ID:"));
 }

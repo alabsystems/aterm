@@ -31,14 +31,14 @@ pub struct ApplyBudget(Option<Instant>);
 impl ApplyBudget {
     /// Start a budget of `limit`, replacing any budget already in force.
     pub fn start(limit: Duration) -> Self {
-        Self(APPLY_DEADLINE.with(|d| d.replace(Some(Instant::now() + limit))))
+        Self(APPLY_DEADLINE.with(|d| d.replace(Some(crate::instant_after(Instant::now(), limit)))))
     }
 
     /// Push the deadline out by `elapsed`.
     pub fn extend(elapsed: Duration) {
         APPLY_DEADLINE.with(|d| {
             if let Some(deadline) = d.get() {
-                d.set(Some(deadline + elapsed));
+                d.set(Some(crate::instant_after(deadline, elapsed)));
             }
         });
     }
@@ -104,10 +104,10 @@ pub(crate) fn status_bounded_with_stderr_observed(
 ) -> Result<(std::process::ExitStatus, String), HelperFailure> {
     use aterm_uds::spawnfd::Stdio;
     use std::io::Read;
-    let deadline = Instant::now() + limit;
+    let deadline = crate::instant_after(Instant::now(), limit);
     let cleanup_reserve = Duration::from_millis(250).min(limit / 4);
-    let work_deadline = deadline - cleanup_reserve;
-    let cleanup_deadline = || deadline.min(Instant::now() + cleanup_reserve);
+    let work_deadline = deadline.checked_sub(cleanup_reserve).unwrap_or(deadline);
+    let cleanup_deadline = || deadline.min(crate::instant_after(Instant::now(), cleanup_reserve));
     let mut child = cmd
         .stdin(Stdio::null())
         .stderr(Stdio::piped())
@@ -363,7 +363,7 @@ pub(crate) fn output_within(
 ) -> Result<std::process::Output, String> {
     output_until(cmd, what, || {
         (
-            Instant::now() + limit,
+            crate::instant_after(Instant::now(), limit),
             mark_passing(format!(
                 "{what} did not finish within {}s; treating as a failure",
                 limit.as_secs()
@@ -732,8 +732,8 @@ fn build_number_from(out: std::process::Output) -> Result<u64, String> {
     }
     let text = String::from_utf8_lossy(&out.stdout);
     let text = text.trim();
-    text.parse::<u64>()
-        .map_err(|_| format!("CFBundleVersion {text:?} is not an integer"))
+    crate::parse_uint::<u64>(text)
+        .ok_or_else(|| format!("CFBundleVersion {text:?} is not an integer"))
 }
 
 /// Read `CFBundleShortVersionString` from a bundle's sealed `Contents/Info.plist`.

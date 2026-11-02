@@ -90,6 +90,9 @@ pub(crate) fn parse_key(value: &str, live: LaunchNonce) -> Result<Key, String> {
     let Some(epoch) = LaunchNonce::from_hex(epoch) else {
         return Err(USAGE.to_string());
     };
+    if !producer.bytes().all(|b| b.is_ascii_digit()) || !seq.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(USAGE.to_string());
+    }
     let (Ok(producer), Ok(seq)) = (producer.parse::<u64>(), seq.parse::<u64>()) else {
         return Err(USAGE.to_string());
     };

@@ -1,10 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Automatic credential bootstrap from an existing ALab member on the LAN.
-//! The default flow needs no Allow action or typed phrase. The existing signed-device
-//! and encrypted bundle exchange carries the shared files into `~/.secrets`.
-//! Explicit phrase admission remains available for compatibility with older installations.
+//! Admission by Allow and a phrase (`docs/DESIGN-fluid-swarm-2026-10-28.md` §3.3, F10): a new
+//! Mac asks every member it finds; a person presses Allow on any one, which shows a short
+//! phrase there; the person types it into the new Mac, which runs CPace over it with that member
+//! ([`crate::pake`]). The member then proves the new Mac holds its keys, signs an
+//! [`Allowed`], and hands it a [`Bundle`] of its `[everyone]` files under the run's key. An
+//! admin's approver admits only a request that carries an `Allowed` its Commons roster binds.
+//!
+//! [`desk`] is the member's side, [`joiner`] the new Mac's; the exchange runs on the fleet
+//! port's `ask` ALPN, the one path a caller without the fleet secret reaches.
 
 pub mod allowed;
 pub mod bundle;
@@ -45,9 +50,9 @@ where
         wire::write_line(joiner, &line)?;
         let parsed = wire::Line::parse(&line);
         if let Ok(size) = parsed.get("bundle") {
-            let size: u64 = size
-                .parse()
-                .ok()
+            let size: u64 = Some(size)
+                .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|s| s.parse().ok())
                 .filter(|size| *size <= (bundle::MAX_BUNDLE + 64) as u64)
                 .ok_or_else(|| crate::Error::new("the member's bundle size is out of bounds"))?;
             let copied = std::io::copy(&mut std::io::Read::take(&mut *member, size), joiner)?;

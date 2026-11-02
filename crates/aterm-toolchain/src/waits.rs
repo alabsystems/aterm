@@ -11,13 +11,14 @@
 //! record saying what it waits for and who holds that; the kernel lets the lock go when the
 //! waiter dies, however it dies, so a mark whose lock can be taken is no wait ([`waiting`]). A
 //! wait needs no ceiling: its liveness is its once-a-minute line naming the holder, and a dead
-//! holder lets its lock go.
+//! holder lets its lock go. A live holder whose processes make no progress ([`crate::stall`]) is
+//! what can keep it for ever, so the record says when every holder the wait is behind has made
+//! none for the waiter's bound ([`Stuck`]), and the tool over it may end the wait on that.
 
-use std::fs::File;
 use std::io::{self, Read as _, Seek as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::record_lock::RecordLock;
 
@@ -98,7 +99,7 @@ impl Mark {
             path: taking,
             since: now_secs(),
         };
-        mark.write(text)?;
+        mark.write(text, None)?;
         let named = dir.join(format!("{stem}{MARK}"));
         std::fs::rename(&mark.path, &named)?;
         mark.path = named;
@@ -108,11 +109,17 @@ impl Mark {
     /// Say what it waits for now, its holder named afresh. A record that cannot be written keeps
     /// what it said before.
     pub fn say(&mut self, text: &str) {
-        let _ = self.write(text);
+        self.say_stuck(text, None);
     }
 
-    fn write(&mut self, text: &str) -> io::Result<()> {
-        let line = record(std::process::id(), self.since, text);
+    /// [`Self::say`], and whether every holder it waits behind has made no progress for the
+    /// waiter's bound ([`Stuck`]).
+    pub fn say_stuck(&mut self, text: &str, stuck: Option<&Stuck>) {
+        let _ = self.write(text, stuck);
+    }
+
+    fn write(&mut self, text: &str, stuck: Option<&Stuck>) -> io::Result<()> {
+        let line = record(std::process::id(), self.since, text, stuck);
         self.lock.seek(io::SeekFrom::Start(0))?;
         self.lock.write_all(line.as_bytes())?;
         self.lock
@@ -135,6 +142,19 @@ pub struct Waiting {
     pub since: u64,
     /// What it waits for and who holds that, as it last said.
     pub text: String,
+    /// Whether every holder it waits behind had made no progress for its waiter's bound, as it
+    /// last said.
+    pub stuck: Option<Stuck>,
+}
+
+/// The holders a wait is behind, every one of which has made no progress ([`crate::stall`]) for
+/// at least its waiter's bound, as the waiter last read them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Stuck {
+    /// Their pids.
+    pub holders: Vec<u32>,
+    /// How long the one that made progress last has made none.
+    pub span: Duration,
 }
 
 /// The waits marked in `dir` now: every mark whose waiter still holds it, oldest first. A
@@ -146,7 +166,10 @@ pub fn waiting(dir: &Path) -> Vec<Waiting> {
     };
     let mut found: Vec<Waiting> = entries
         .flatten()
-        .filter(|e| e.file_name().to_str().is_some_and(|n| n.ends_with(MARK)))
+        .filter(|e| {
+            e.file_name().to_str().is_some_and(|n| n.ends_with(MARK))
+                && e.file_type().is_ok_and(|t| t.is_file())
+        })
         .filter_map(|e| live(&e.path()))
         .collect();
     found.sort_by_key(|w| (w.since, w.pid));
@@ -155,7 +178,17 @@ pub fn waiting(dir: &Path) -> Vec<Waiting> {
 
 /// The wait `path` marks, while its waiter holds it.
 fn live(path: &Path) -> Option<Waiting> {
-    let mut file = File::open(path).ok()?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = options.open(path).ok()?;
+    if !file.metadata().is_ok_and(|m| m.is_file()) {
+        return None;
+    }
     let mut head = Vec::new();
     (&mut file).take(RECORD).read_to_end(&mut head).ok()?;
     match RecordLock::try_lock(file, RECORD) {
@@ -165,10 +198,15 @@ fn live(path: &Path) -> Option<Waiting> {
 }
 
 /// A record: pid, since and text on one tab-separated line, cut short of [`RECORD`] on a
-/// character boundary.
-fn record(pid: u32, since: u64, text: &str) -> String {
+/// character boundary; then, for a wait whose holders are [`Stuck`], a line `stuck`, the seconds
+/// and the holders' pids, which a reader that knows only the first line leaves alone.
+fn record(pid: u32, since: u64, text: &str, stuck: Option<&Stuck>) -> String {
+    let tail = stuck.map_or_else(String::new, |s| {
+        let pids: Vec<String> = s.holders.iter().map(u32::to_string).collect();
+        format!("stuck\t{}\t{}\n", s.span.as_secs(), pids.join(","))
+    });
     let mut line = format!("{pid}\t{since}\t{}", text.replace(['\t', '\n', '\r'], " "));
-    let limit = usize::try_from(RECORD).map_or(0, |r| r.saturating_sub(1));
+    let limit = usize::try_from(RECORD).map_or(0, |r| r.saturating_sub(1 + tail.len()));
     if line.len() > limit {
         let mut end = limit;
         while !line.is_char_boundary(end) {
@@ -177,15 +215,34 @@ fn record(pid: u32, since: u64, text: &str) -> String {
         line.truncate(end);
     }
     line.push('\n');
+    line.push_str(&tail);
     line
 }
 
 fn parse(text: &str) -> Option<Waiting> {
-    let mut fields = text.lines().next()?.splitn(3, '\t');
+    let uint = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let mut lines = text.lines();
+    let mut fields = lines.next()?.splitn(3, '\t');
     Some(Waiting {
-        pid: fields.next()?.parse().ok().filter(|&p| p != 0)?,
-        since: fields.next()?.parse().ok()?,
+        pid: fields
+            .next()
+            .filter(|s| uint(s))?
+            .parse()
+            .ok()
+            .filter(|&p| p != 0)?,
+        since: fields.next().filter(|s| uint(s))?.parse().ok()?,
         text: fields.next().unwrap_or_default().to_string(),
+        stuck: lines.find_map(|l| {
+            let mut f = l.strip_prefix("stuck\t")?.splitn(2, '\t');
+            let span = Duration::from_secs(f.next().filter(|s| uint(s))?.parse().ok()?);
+            let holders = f
+                .next()?
+                .split(',')
+                .map(|h| h.parse().ok().filter(|_| uint(h)))
+                .collect::<Option<Vec<u32>>>()
+                .filter(|h| !h.is_empty())?;
+            Some(Stuck { holders, span })
+        }),
     })
 }
 
@@ -224,6 +281,25 @@ mod tests {
             waiting(dir.path())[0].text,
             "still waiting for pid 7 (lab linux exec)"
         );
+        assert_eq!(waiting(dir.path())[0].stuck, None);
+        let stuck = Stuck {
+            holders: vec![7],
+            span: Duration::from_secs(900),
+        };
+        mark.say_stuck(
+            "waiting for pid 7, which has made no progress",
+            Some(&stuck),
+        );
+        let seen = waiting(dir.path());
+        assert_eq!(
+            (seen[0].text.as_str(), seen[0].stuck.as_ref()),
+            (
+                "waiting for pid 7, which has made no progress",
+                Some(&stuck)
+            )
+        );
+        mark.say("waiting for pid 7, which works again");
+        assert_eq!(waiting(dir.path())[0].stuck, None, "a record said anew");
         let path = mark.path.clone();
         drop(mark);
         assert!(waiting(dir.path()).is_empty());
@@ -231,21 +307,52 @@ mod tests {
 
         std::fs::write(
             dir.path().join("1-0.wait"),
-            record(1, 0, "a waiter that died"),
+            record(1, 0, "a waiter that died", None),
         )
         .expect("a dead waiter's mark");
         assert!(
             waiting(dir.path()).is_empty(),
             "a mark nobody holds is no wait"
         );
+        #[cfg(unix)]
+        {
+            use std::ffi::CString;
+            use std::os::unix::ffi::OsStrExt as _;
+            let fifo = dir.path().join("fifo-0.wait");
+            let c_fifo = CString::new(fifo.as_os_str().as_bytes()).expect("cstr");
+            // SAFETY: `c_fifo` is a live NUL-terminated path in our scratch directory; `mkfifo` retains no pointer.
+            assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0, "mkfifo");
+            assert_eq!(live(&fifo), None);
+            let held = Mark::at(dir.path(), "real waiter").expect("held");
+            let link = dir.path().join("link-0.wait");
+            std::os::unix::fs::symlink(&held.path, &link).expect("symlink");
+            assert_eq!(live(&link), None);
+            assert_eq!(waiting(dir.path()).len(), 1);
+            drop(held);
+        }
     }
 
     #[test]
     fn a_long_text_is_cut_on_a_character_boundary() {
-        let line = record(9, 1, &"é".repeat(4096));
-        assert!(line.len() <= RECORD as usize, "{}", line.len());
-        assert!(parse(&line).is_some_and(|w| w.pid == 9 && w.text.starts_with('é')));
+        let stuck = Stuck {
+            holders: vec![7, 8],
+            span: Duration::from_secs(960),
+        };
+        for s in [None, Some(&stuck)] {
+            let line = record(9, 1, &"é".repeat(4096), s);
+            assert!(line.len() <= RECORD as usize, "{}", line.len());
+            let back = parse(&line).expect("a record");
+            assert!(back.pid == 9 && back.text.starts_with('é'), "{back:?}");
+            assert_eq!(back.stuck.as_ref(), s);
+        }
         assert!(parse("0\t1\tz").is_none(), "pid 0 is no waiter");
+        assert!(parse("+9\t1\tz").is_none());
+        assert!(parse("9\t+1\tz").is_none());
+        assert!(parse("9\t1\tz\nstuck\t960\t7,8").is_some_and(|w| w.stuck.is_some()));
+        assert!(parse("9\t1\tz\nstuck\t+960\t7").is_some_and(|w| w.stuck.is_none()));
+        assert!(parse("9\t1\tz\nstuck\t960\t7,+8").is_some_and(|w| w.stuck.is_none()));
+        assert!(crate::named_lock::Holder::parse("+9\t1\tv\tc").is_none());
+        assert!(crate::named_lock::Holder::parse("9\t+1\tv\tc").is_none());
     }
 
     #[test]

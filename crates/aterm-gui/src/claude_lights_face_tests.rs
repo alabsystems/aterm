@@ -77,7 +77,7 @@ fn rows() -> Vec<Row> {
     use ChipTone::{Accent, Amber, Dim, Off};
     use aterm_agent::supervise::Autopilot;
     let timed = crate::autopilot::TIMED_CRUISE_CHIP;
-    let landed = aterm_agent::supervise::mode_words::LANDED_WORDS;
+    let landed = aterm_agent::supervise::mode_words::landed_brief(None);
     let (cruise, land, off) = (
         mode_words(Autopilot::Cruise).chip,
         mode_words(Autopilot::Land).chip,
@@ -302,34 +302,247 @@ fn lights(view: AutopilotView, glass: ChipGlass) -> WindowLights {
     w
 }
 
-/// A LANDING'S FIXED WORDS CLAIM NO REMOTE (`docs/DESIGN-harness-autopilot-2026-10-15.md` §14.9,
-/// slice 9a): the hovered `✓ landed` title and the `Autopilot landed` record's line say
-/// [`aterm_agent::supervise::mode_words::LANDED_WORDS`], true on every leg a landing stands on,
-/// and never "remote main", which no check reads for a repository with no remote, a folder that
-/// is no repository or one the probe may not read, nor a checker: the record says the same words
-/// for codex-alab's own landing, which aterm did not check. NEGATIVE CONTROLS (mutants, run by
-/// hand): main's sentence, "all of the work is on the remote main branch; …", and §14.9's first
-/// draft, "aterm's check found nothing left to land; …", each fail it.
+/// A LANDING'S WORDS SAY WHAT ATERM CHECKED (`docs/DESIGN-harness-autopilot-2026-10-15.md`
+/// §14.9, slice 9c): on every leg, the chip's screen-reader description and the `Autopilot landed`
+/// record's first line say the receipt's [`aterm_agent::supervise::mode_words::checked_words`]
+/// whole, the hovered `✓ landed` title its brief (`checked_brief`: on main the head, the ref and
+/// the folder) without the agent's words, the record's second line what the agent said, a quote
+/// as long as a receipt keeps cut before its closing mark; "remote main" on none of them (git
+/// names `origin/main`). With no receipt (codex-alab's own landing, one a loop before the
+/// receipt noted) each says aterm has no record of checking it, and names no head. Where the
+/// receipt says the land check was answered (§14.17 item 5, slice 13a), the description and the
+/// record's second line say so before what the agent said. The chip at rest stays `✓ landed`.
+/// NEGATIVE CONTROLS (mutants, run by hand): 9a's fixed sentence on the title, the record leaving
+/// out its receipt, the record's quote left whole, and the agent's words read without the
+/// receipt's `check` each fail it.
 #[test]
-fn the_landed_words_claim_no_remote() {
-    use aterm_agent::supervise::mode_words::LANDED_WORDS;
-    let (whole, _) = autopilot_title(
-        AutopilotView::Land,
-        &told(TaskFace::Landed),
-        "",
-        Some(TODAY),
-        TitleWords::default(),
-    );
-    let record = crate::harness_task::task_record("s-1", "in tab 3", "in tab 3", TaskFace::Landed)
-        .expect("a landing's record");
-    for (surface, text) in [
-        ("title", whole.as_str()),
-        ("record", record.detail[0].as_str()),
-    ] {
-        assert!(text.contains(LANDED_WORDS), "{surface}: {text}");
-        assert!(!text.contains("remote main"), "{surface}: {text}");
-        assert!(!text.contains("aterm"), "{surface} names a checker: {text}");
+fn the_landed_words_say_what_aterm_checked() {
+    use aterm_agent::harness::acts::{LandReceipt, ReceiptLeg};
+    use aterm_agent::supervise::mode_words::{
+        ANSWERED_CHECK, NO_RECORD, checked_brief, checked_words, landed_brief, landed_words,
+    };
+    let said = "Nothing left: pushed to origin/main.";
+    let receipt = |leg: ReceiptLeg| {
+        let named = !matches!(leg, ReceiptLeg::NoRepo | ReceiptLeg::Gone);
+        let on = leg == ReceiptLeg::OnMain;
+        LandReceipt {
+            head: if named { "3f9a1c2e4b7d" } else { "" }.to_owned(),
+            main_ref: if on { "origin/main" } else { "" }.to_owned(),
+            repo: if leg == ReceiptLeg::NoRepo {
+                ""
+            } else {
+                "/Users//me/src/proj"
+            }
+            .to_owned(),
+            branch: if on { "main" } else { "" }.to_owned(),
+            leg,
+            check: false,
+            said: said.to_owned(),
+            at_ms: 0,
+        }
+    };
+    let surfaces = |r: Option<&LandReceipt>| {
+        let words = TitleWords {
+            receipt: r,
+            ..TitleWords::default()
+        };
+        let glass = told(TaskFace::Landed);
+        let (whole, short) = autopilot_title(AutopilotView::Land, &glass, "", Some(TODAY), words);
+        let face = ChipFace::of(AutopilotView::Land, &glass);
+        let spoken =
+            autopilot_description(face, &glass, words, Some(TODAY), None).unwrap_or_default();
+        let record =
+            crate::harness_task::task_record("s-1", "in tab 3", "in tab 3", TaskFace::Landed, r)
+                .expect("a landing's record");
+        (whole, short, spoken, record.detail)
+    };
+    for leg in ReceiptLeg::ALL {
+        let r = receipt(leg);
+        let checked = checked_words(Some(&r));
+        let (whole, short, spoken, detail) = surfaces(Some(&r));
+        assert!(
+            whole.contains(&landed_brief(Some(&r))) && whole.contains(&checked_brief(Some(&r))),
+            "{leg:?} title: {whole}"
+        );
+        assert!(
+            spoken.contains(&landed_words(Some(&r))) && spoken.contains(&checked),
+            "{leg:?} description: {spoken}"
+        );
+        assert_eq!(detail[0], format!("Tab 3: {checked}"), "{leg:?}");
+        assert_eq!(
+            detail.get(1).map(String::as_str),
+            Some(format!("It said \u{201c}{said}\u{201d}").as_str()),
+            "{leg:?}"
+        );
+        assert!(!short.contains(&checked), "{leg:?} at rest: {short}");
+        assert!(
+            !whole.contains(said),
+            "{leg:?} title quotes the agent: {whole}"
+        );
+        for text in [&whole, &spoken, &detail[0]] {
+            assert!(!text.contains("remote main"), "{leg:?}: {text}");
+        }
     }
+    // The land check answered (§14.17 item 5, slice 13a): the description and the record's second
+    // line say so before what the agent said; the title's brief, which quotes no agent, is the
+    // unchecked one's.
+    let unchecked = receipt(ReceiptLeg::OnMain);
+    let checked = LandReceipt {
+        check: true,
+        ..unchecked.clone()
+    };
+    let (whole, _, spoken, detail) = surfaces(Some(&checked));
+    assert!(spoken.contains(ANSWERED_CHECK), "{spoken}");
+    let second = detail
+        .get(1)
+        .map(|line| line.to_lowercase())
+        .unwrap_or_default();
+    assert!(
+        second.starts_with(ANSWERED_CHECK)
+            && second.ends_with(&format!("\u{201c}{}\u{201d}", said.to_lowercase())),
+        "{detail:?}"
+    );
+    assert_eq!(whole, surfaces(Some(&unchecked)).0);
+    let (_, _, spoken, detail) = surfaces(Some(&unchecked));
+    assert!(
+        !spoken.contains(ANSWERED_CHECK)
+            && !detail.join(" ").to_lowercase().contains(ANSWERED_CHECK)
+    );
+    let (whole, _, spoken, detail) = surfaces(None);
+    for text in [&whole, &spoken, &detail[0]] {
+        assert!(text.contains(NO_RECORD), "{text}");
+        assert!(!text.contains("3f9a1c2e4b7d"), "{text}");
+    }
+    assert_eq!(detail.len(), 1, "{detail:?}");
+    // A quote as long as a receipt keeps: the record's line is cut to its cap before the quote's
+    // closing mark, never past it.
+    let long = LandReceipt {
+        said: format!(
+            "Nothing left: {}",
+            "x".repeat(aterm_agent::harness::land_receipt::SAID_BYTES)
+        ),
+        ..receipt(ReceiptLeg::OnMain)
+    };
+    let record = crate::harness_task::task_record(
+        "s-1",
+        "in tab 3",
+        "in tab 3",
+        TaskFace::Landed,
+        Some(&long),
+    )
+    .expect("a landing's record");
+    let line = &record.detail[1];
+    assert!(
+        line.chars().count() <= aterm_messages::DETAIL_LINE_CAP
+            && line.starts_with("It said \u{201c}Nothing left: x")
+            && line.ends_with("x\u{2026}\u{201d}")
+            && line.matches('\u{2026}').count() == 1,
+        "{line}"
+    );
+}
+
+/// THE HOVERED LANDED TITLE KEEPS WHAT ATERM CHECKED BESIDE THE AGENT'S FOOTER (§14.9, slice 9c;
+/// its review round): with the agent's words as long as a receipt keeps them (`SAID_BYTES`), the
+/// `✓ landed` chip's title, fitted into the rule beside Claude Code's footer at 300 and 400
+/// columns, still draws `aterm checked <head> on origin/main in <folder>`, and it shows from no
+/// wider a window than 9a's fixed sentence did beside the same footer: the title says what aterm
+/// checked in brief and leaves the agent's words to the state line, the tips, the record and the
+/// description. NEGATIVE CONTROL (run by hand): a brief that quotes the agent (the build before
+/// the review round) draws `autopilot: land, landed 17:42 · click: off · right-click: more` at
+/// both widths and fails it.
+#[test]
+fn the_hovered_landed_title_keeps_what_aterm_checked_beside_the_footer() {
+    use aterm_agent::harness::acts::{LandReceipt, ReceiptLeg};
+    use aterm_agent::harness::footer::{self, FooterFacts, LightsWidth, TitleFit};
+    use aterm_agent::supervise::mode_words::{checked_brief, landed_brief};
+    let facts = FooterFacts {
+        model: Some("Opus 5.5".into()),
+        effort: Some("xhigh".into()),
+        path: Some("~/aterm".into()),
+        branch: Some("main".into()),
+        ..FooterFacts::default()
+    };
+    let receipt = LandReceipt {
+        head: "3f9a1c2e4b7d".into(),
+        main_ref: "origin/main".into(),
+        repo: "/Users//me/src/proj-api".into(),
+        branch: "main".into(),
+        leg: ReceiptLeg::OnMain,
+        check: false,
+        said: format!(
+            "Nothing left: {}",
+            "x".repeat(aterm_agent::harness::land_receipt::SAID_BYTES - 14)
+        ),
+        at_ms: 0,
+    };
+    let glass = told(TaskFace::Landed);
+    let words = TitleWords {
+        receipt: Some(&receipt),
+        ..TitleWords::default()
+    };
+    let (whole, short) = autopilot_title(
+        AutopilotView::Land,
+        &glass,
+        "\u{2913} landing 17:42",
+        Some(TODAY),
+        words,
+    );
+    // 9a's title: the same parts around its fixed sentence.
+    let nine_a = whole.replace(
+        &landed_brief(Some(&receipt)),
+        "it said nothing is left, and no repository check found work left to land; the harness \
+         types nothing more until someone else's turn",
+    );
+    assert_ne!(nine_a, whole);
+    let now = Instant::now();
+    let fitted = |whole: &str| {
+        let w = lights(AutopilotView::Land, glass);
+        let mut block = Block::default();
+        assert!(w.fit_into(
+            7,
+            blank(),
+            now,
+            ACCENT,
+            None,
+            Some(Chip::Autopilot),
+            400,
+            (Some((whole, short.as_str())), None, None),
+            &mut block,
+        ));
+        let widths = LightsWidth {
+            chips: block.holds,
+            title: block.title.len(),
+            lean: block.lean.each_ref().map(Vec::len),
+            short: block.short_title.len(),
+            reason: block.reason,
+        };
+        (block, widths)
+    };
+    let drawn_at = |(block, widths): &(Block, LightsWidth), cols: usize| {
+        let fit = footer::fit_rule(&facts, footer::rule_room(&(0..cols)), Some(*widths));
+        match fit.title {
+            TitleFit::Full => text(&block.title),
+            TitleFit::Lean(n) => text(&block.lean[usize::from(n)]),
+            TitleFit::Short => text(&block.short_title),
+            TitleFit::None => String::new(),
+        }
+    };
+    let brief = checked_brief(Some(&receipt));
+    let ours = fitted(&whole);
+    for cols in [300, 400] {
+        let drawn = drawn_at(&ours, cols);
+        assert!(drawn.contains(&brief), "{cols} columns drew {drawn:?}");
+        assert!(drawn.contains("aterm checked 3f9a1c2e4b7d"), "{drawn:?}");
+    }
+    let main = fitted(&nine_a);
+    let explained_from = |fitted: &(Block, LightsWidth), says: &str| {
+        (40..=600).find(|&cols| drawn_at(fitted, cols).contains(says))
+    };
+    let from = explained_from(&ours, &brief).expect("the brief is drawn at some width");
+    let main_from = explained_from(&main, "no repository check found")
+        .expect("9a's sentence is drawn at some width");
+    eprintln!("what aterm checked shows from {from} columns; 9a's sentence from {main_from}");
+    assert!(from <= main_from, "{from} > 9a's {main_from}");
 }
 
 #[test]
@@ -1333,11 +1546,13 @@ fn every_face_says_a_hold_and_a_need_where_its_harness_explains() {
     let need_part = " \u{b7} needs you: sign 0.48.0, the release credential, on this Mac (+1 more); \
                      carrying on";
     let need_said = "Needs you: sign 0.48.0 the release credential on this Mac. And 1 more.";
-    let legs = "2 unpushed commits; open work in its report: follow-up, not pushed";
+    let legs = "2 unpushed commits; open in its report: follow-up, not pushed";
     let since = "landing since 14:02, 3 nudges";
+    // No chip glyph (✓, ⤓) in a description; a landed one's what-aterm-checked sentence keeps
+    // its own `;` and `'` (§14.9, 9c).
     let glyph_free = |text: &str| {
         text.chars()
-            .all(|c| c.is_alphanumeric() || matches!(c, ' ' | '.' | ':' | ','))
+            .all(|c| c.is_alphanumeric() || matches!(c, ' ' | '.' | ':' | ',' | ';' | '\''))
     };
     for row in rows() {
         let face = row.face;
@@ -1361,6 +1576,9 @@ fn every_face_says_a_hold_and_a_need_where_its_harness_explains() {
                 stopped: None,
                 hold,
                 need: said_need,
+                switch: false,
+                receipt: None,
+                said: None,
             };
             let (whole, short) = autopilot_title(row.view, &row.glass, "", Some(TODAY), words);
             let read_hold = land && hold.is_some_and(|h| h.read());
@@ -1422,9 +1640,17 @@ fn every_face_says_a_hold_and_a_need_where_its_harness_explains() {
             }
             let description = autopilot_description(face, &row.glass, words, Some(TODAY), None);
             let mut sentences = Vec::new();
+            if face == ChipFace::Landed {
+                // What aterm checked leads a landed chip's description (§14.9, 9c): these rows
+                // carry no receipt, so it checked nothing.
+                sentences.push(format!(
+                    "{}.",
+                    aterm_agent::supervise::mode_words::landed_words(None)
+                ));
+            }
             match hold.filter(|_| land) {
                 Some(h) if h.read() => sentences.push(format!(
-                    "Not landed yet. {} 2 unpushed commits. Open work in its report: follow up, \
+                    "Not landed yet. {} 2 unpushed commits. Open in its report: follow up, \
                      not pushed. Landing since 14:02, 3 nudges.",
                     if said_need.is_some() {
                         need_said
@@ -1458,6 +1684,7 @@ fn a_need_in_the_title_keeps_its_cut_marks() {
         more: 1,
         others: Vec::new(),
         program: aterm_phase::Program::Claude,
+        tail: crate::needs::NeedTail::CarryingOn,
     };
     let written = crate::needs::HarnessAsk {
         first: "sign 0.48.0, last: the release credential, on this Mac, click: approve".to_string(),
@@ -1482,6 +1709,9 @@ fn a_need_in_the_title_keeps_its_cut_marks() {
                     stopped: None,
                     hold: None,
                     need: Some(need),
+                    switch: false,
+                    receipt: None,
+                    said: None,
                 },
             )
             .0
@@ -1525,6 +1755,9 @@ fn a_held_landing_keeps_the_titles_four_lean_forms() {
         stopped: None,
         hold: Some(&hold),
         need: Some(&need),
+        switch: false,
+        receipt: None,
+        said: None,
     };
     let (whole, short) = autopilot_title(
         AutopilotView::Land,

@@ -6,7 +6,7 @@
 use std::sync::{Mutex, PoisonError};
 
 use aterm_agent::harness::self_claimed::{self, Copy};
-use aterm_agent::harness::{codex_alab, restart_stamp};
+use aterm_agent::harness::{agent_image, restart_stamp};
 
 /// The holder prefix a self-claim is made under: `codex-alab@<pid>`.
 pub(crate) const SELF_CLAIM_PREFIX: &str = "codex-alab@";
@@ -60,7 +60,13 @@ pub(crate) fn runs_alab_build(pid: u32) -> bool {
     i32::try_from(pid)
         .ok()
         .and_then(aterm_uds::sudo::exe_path)
-        .is_some_and(|exe| codex_alab::alab_bytes(&exe))
+        .is_some_and(|exe| {
+            agent_image::in_vendor_layout(
+                aterm_phase::Program::Codex,
+                &agent_image::Image::at(&exe),
+                &agent_image::Places::default(),
+            )
+        })
 }
 
 /// Prove `holder`'s claim on `facts` and capture its kernel start.
@@ -1163,7 +1169,7 @@ mod tests {
                     &mut asked,
                     7594,
                     tap_target_by(ctx, 4242, alive_as_proven),
-                    at
+                    (at, None)
                 ),
                 Ask::Read(watched.clone()),
                 "the sweep keeps asking, never stops"
@@ -1185,7 +1191,12 @@ mod tests {
             "the kernel knows no process 4242 started then"
         );
         assert_eq!(
-            due(&mut asked, 7594, tap_target(ctx, 4242), t0 + RECHECK * 2),
+            due(
+                &mut asked,
+                7594,
+                tap_target(ctx, 4242),
+                (t0 + RECHECK * 2, None)
+            ),
             Ask::Stop
         );
 

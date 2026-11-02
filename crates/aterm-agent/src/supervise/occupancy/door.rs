@@ -571,10 +571,14 @@ pub fn left_rows_in(body: &str, sid: Option<&str>) -> Vec<(EpisodeKey, Left)> {
             continue;
         }
         let word = |key: &str| reason.split(' ').find_map(|w| w.strip_prefix(key));
-        let Some(id) = word("episode=").and_then(|hex| u64::from_str_radix(hex, 16).ok()) else {
+        let Some(id) = word("episode=").and_then(|hex| {
+            (!hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+                .then(|| u64::from_str_radix(hex, 16).ok())
+                .flatten()
+        }) else {
             continue;
         };
-        let held_ms = word("held_ms=").and_then(|n| n.parse::<i64>().ok());
+        let held_ms = word("held_ms=").and_then(crate::parse_int::<i64>);
         let row = match kind {
             FactKind::Hold => {
                 let (Some(rule), Some(held_ms)) =
@@ -594,7 +598,7 @@ pub fn left_rows_in(body: &str, sid: Option<&str>) -> Vec<(EpisodeKey, Left)> {
                     .into_iter()
                     .find(|d| word("door=") == Some(d.word()));
                 let (Some(ord), Some(held_ms), Some(door)) = (
-                    word("ord=").and_then(|n| n.parse::<u16>().ok()),
+                    word("ord=").and_then(crate::parse_uint::<u16>),
                     held_ms,
                     door,
                 ) else {
@@ -602,7 +606,7 @@ pub fn left_rows_in(body: &str, sid: Option<&str>) -> Vec<(EpisodeKey, Left)> {
                 };
                 LeftRow::Wake { ord, held_ms, door }
             }
-            FactKind::NoProgress => {
+            FactKind::NoProgress | FactKind::ProgramCheck => {
                 let door = [FactDoor::Break, FactDoor::TurnEnd]
                     .into_iter()
                     .find(|d| word("door=") == Some(d.word()));
@@ -616,7 +620,7 @@ pub fn left_rows_in(body: &str, sid: Option<&str>) -> Vec<(EpisodeKey, Left)> {
             row,
             text: text("command").unwrap_or_default().to_string(),
             at_ms,
-            submits: word("submits=").and_then(|n| n.parse::<u64>().ok()),
+            submits: word("submits=").and_then(crate::parse_uint::<u64>),
             ran: false,
             seeded: true,
             counted: false,
@@ -799,7 +803,11 @@ pub fn seed_rows_in(body: &str, sid: Option<&str>) -> Vec<(EpisodeKey, i64, Seed
             },
             _ => continue,
         };
-        if let Some(id) = word("episode=").and_then(|hex| u64::from_str_radix(hex, 16).ok()) {
+        if let Some(id) = word("episode=").and_then(|hex| {
+            (!hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+                .then(|| u64::from_str_radix(hex, 16).ok())
+                .flatten()
+        }) {
             rows.push((EpisodeKey { kind, id }, at_ms, outcome));
         }
     }
@@ -807,37 +815,31 @@ pub fn seed_rows_in(body: &str, sid: Option<&str>) -> Vec<(EpisodeKey, i64, Seed
 }
 
 /// When (unix ms, oldest first) each line an earlier loop typed at a break went, from ledger
-/// `body`, with its kind: session `sid`'s `fact-no-progress@v1` and `fact-wake@v1` rows `typed`
-/// at `door=break` (a rider's `door=turn-end` or `door=point` row is no line of its own) and its
-/// `fact-hold@v1` rows `typed`. A successor paces the stuck line by them, as
-/// [`super::rules::would_rows_in`] seeds the door's own books.
+/// `body`, with its kind: session `sid`'s rows of every fact but the hold (a call at no progress,
+/// programs held at macOS's program check, a wake) `typed` at `door=break` (a rider's
+/// `door=turn-end` or `door=point` row is no line of its own) and its `fact-hold@v1` rows
+/// `typed`. A successor paces the stuck line by them, as [`super::rules::would_rows_in`] seeds
+/// the door's own books.
 #[must_use]
 pub fn break_lines_in(body: &str, sid: Option<&str>) -> Vec<(i64, FactKind)> {
-    let (stuck, hold, wake) = (
-        FactKind::NoProgress.rule(),
-        FactKind::Hold.rule(),
-        FactKind::Wake.rule(),
-    );
     let want = sid.map(|s| s.trim_start_matches('@'));
     body.lines()
         .filter(|line| {
-            (line.contains(stuck) || line.contains(hold) || line.contains(wake))
+            FactKind::ALL.iter().any(|k| line.contains(k.rule()))
                 && want.is_none_or(|sid| line.contains(sid))
         })
         .filter_map(|line| aterm_json::from_str::<aterm_json::Value>(line).ok())
         .filter_map(|v| {
             let text = |k: &str| v.get(k).and_then(aterm_json::Value::as_str);
-            let at_break = || {
-                text("reason").is_some_and(|r| {
-                    r.split(' ')
-                        .any(|w| w.strip_prefix("door=") == Some(FactDoor::Break.word()))
-                })
-            };
-            let kind = match text("rule_id") {
-                Some(rule) if rule == hold => Some(FactKind::Hold),
-                Some(rule) if rule == stuck => at_break().then_some(FactKind::NoProgress),
-                Some(rule) if rule == wake => at_break().then_some(FactKind::Wake),
-                _ => None,
+            let kind = match text("rule_id").and_then(FactKind::of_rule) {
+                Some(FactKind::Hold) => Some(FactKind::Hold),
+                Some(kind) => text("reason")
+                    .is_some_and(|r| {
+                        r.split(' ')
+                            .any(|w| w.strip_prefix("door=") == Some(FactDoor::Break.word()))
+                    })
+                    .then_some(kind),
+                None => None,
             };
             if text("sid") != want || text("decision") != Some("typed") {
                 return None;

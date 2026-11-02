@@ -12,20 +12,24 @@
 //! (`docs/DESIGN-system-state-2026-10-21.md` §6). The walk is no person's press on the row's
 //! `Turn On…`, so it never takes that door.
 //!
-//! * It starts by itself once, on a cold first launch ([`starts`]): no page aterm brought up
-//!   before, System State in front of an active app, the person present ([`START_PRESENT_WITHIN`],
-//!   read as the steps read it: [`App::person_present_within`]) and not typing
-//!   ([`START_KEYS_QUIET`]), System Settings asking nothing (`App::system_settings_may_ask`), and
-//!   System State's Local Network step run and its alert's hold over
-//!   ([`App::local_network_step_to_come`]), so System Settings does not come up beside that
-//!   alert; or that step still to come once it alone has held a ready walk for
-//!   [`LOCAL_NETWORK_WAIT`] of unbroken looks and its own moment has not come
-//!   ([`App::waited_out_local_network`]), after which the walk goes first and the step, and every
-//!   step after it, the debugger's among them, asks once it is over: the one exception to the
-//!   Local Network step going first. While it may still start and only the person's absence
+//! * It starts by itself once, on a cold first launch or in an update's successor
+//!   ([`starts`], [`WalkLane::note_successor`]): no page aterm brought up before, System State in
+//!   front of an active app, the person present ([`START_PRESENT_WITHIN`], read as the steps read
+//!   it: [`App::person_present_within`]) and not typing ([`START_KEYS_QUIET`]), System Settings
+//!   asking nothing (`App::system_settings_may_ask`), and System State's Local Network step run
+//!   and its alert's hold over ([`App::local_network_step_to_come`]): macOS's answer heard by the
+//!   LAN re-probe, or the person at the Mac for
+//!   [`crate::system_state_access::LOCAL_NETWORK_ALERT_HOLD`] counted from their first touch
+//!   after the ask, their time away not counted ([`App::look_at_local_network_alert`]), so
+//!   System Settings does not come up beside that
+//!   alert, even one asked while nobody was there; or that step still to come once it alone has
+//!   held a ready walk for [`LOCAL_NETWORK_WAIT`] of unbroken looks and its own moment has not
+//!   come ([`App::waited_out_local_network`]), after which the walk goes first and the step, and
+//!   every step after it, the debugger's among them, asks once it is over: the one exception to
+//!   the Local Network step going first. While it may still start and only the person's absence
 //!   holds it, System State's later steps wait with it ([`App::walk_waits_for_the_person`]), so
-//!   none takes its first page; the Local Network step does not. An update's successor never
-//!   starts one. `aterm ctl permissions walk now` (at most once a minute, [`VERB_AGAIN_AFTER`])
+//!   none takes its first page; the Local Network step does not.
+//!   `aterm ctl permissions walk now` (at most once a minute, [`VERB_AGAIN_AFTER`])
 //!   and the Permissions row's press start one; the verb sent while one is under way joins it
 //!   ([`WalkLane::join`]), its pages before the debugger's, and takes back a page the walk passed
 //!   only as often as it may start one. A verb's ask its control lane gave up before the main
@@ -48,8 +52,13 @@
 //!   ([`WalkLane::pressed`]).
 //! * A grant already held is skipped without opening its page ([`Walk::advance`]), and the
 //!   panel's "Step 1 of N" counts only the pages that come up ([`Walk::position`]); while a page
-//!   is up the window reads its grant every [`GRANT_POLL`]. Accessibility reading on asks macOS's
-//!   Automation question too, and a walk that asked it opens no page while it is out
+//!   is up and the person is at the Mac the window reads its grant every [`GRANT_POLL`]. A
+//!   page's ten minutes count only the person's time: behind a lock, or while nobody touches the
+//!   Mac, they stop, and nothing is read (`App::count_walk_page_time`), so the page is there when
+//!   they come back. A page that lapses after ten minutes of theirs ends the walk giving way:
+//!   the pages after it start again at the next quiet moment, the page that lapsed does not
+//!   ([`WalkLane::lapse`]), so no page comes back again and again. Accessibility reading on asks
+//!   macOS's Automation question too, and a walk that asked it opens no page while it is out
 //!   ([`WalkReach::automation_out`]), so its next page never comes up beside that question.
 //!   Full Disk Access reading on brings macOS's Quit & Reopen sheet over System Settings: the
 //!   page's done words wait, naming the next page, until that sheet is gone and no quit is asked
@@ -89,8 +98,9 @@ pub(crate) const START_KEYS_QUIET: Duration = Duration::from_secs(2);
 /// only a wait on such a part, which would otherwise hold the walk for good; presence and System
 /// Settings asking the two read alike (`App::person_present_within`,
 /// `App::system_settings_asks`), so neither ends it: the walk's presence, held through an
-/// unbroken wait (`StartFacts::present`), spans at most two minutes from the last touch, inside
-/// the steps' five (`devtools_helper::PRESENT_WITHIN`).
+/// unbroken wait (`StartFacts::present`), keeps the wait counting, and the look at which it runs
+/// out reads the person again: the walk starts only with a touch within [`START_PRESENT_WITHIN`]
+/// of that look.
 pub(crate) const LOCAL_NETWORK_WAIT: Duration = Duration::from_secs(60);
 
 /// How often the window reads the grant the walk's page asks for while the panel is up, until
@@ -210,9 +220,11 @@ impl Subject {
     reason = "the start's independent readings, each a yes or no"
 )]
 pub(crate) struct StartFacts {
-    /// The owner started this process (not an update's successor). Whether aterm brought up the
-    /// Full Disk Access or Developer Tools page for this bundle on this Mac before (either page's
-    /// opening of this TCC identity) is read only once these facts say start (`App::fresh_mac`).
+    /// The process may start the first walk by itself (`App::walk_may_start_by_itself`): the
+    /// owner started it, or it is an update's successor ([`WalkLane::note_successor`]). Whether
+    /// aterm brought up the Full Disk Access or Developer Tools page for this bundle on this Mac
+    /// before (either page's opening of this TCC identity) is read only once these facts say
+    /// start (`App::fresh_mac`).
     pub(crate) cold: bool,
     /// System State is the visible view of a focused window of the active app.
     pub(crate) presented: bool,
@@ -221,9 +233,11 @@ pub(crate) struct StartFacts {
     /// or, where macOS cannot give one, a key, click or scroll in an aterm window then), or the
     /// walk's wait for the Local Network step counts an unbroken run of looks the person was
     /// present at the start of (`App::local_network_wait_counting`). One touch so lets that wait
-    /// run out where the idle time cannot be read and pointer motion is not seen, and the walk
-    /// starts at most [`START_PRESENT_WITHIN`] plus [`LOCAL_NETWORK_WAIT`] after the last touch,
-    /// within the steps' own presence (`devtools_helper::PRESENT_WITHIN`).
+    /// run out where the idle time cannot be read and pointer motion is not seen; but the look at
+    /// which it runs out, the one that would open System Settings, reads the person again
+    /// (`App::look_for_walk_start`), so the walk starts only with a touch within
+    /// [`START_PRESENT_WITHIN`] of the look that starts it, as the first walk's person stage asks
+    /// (`docs/DESIGN-init-on-by-default-2026-10-25.md` §6.4).
     pub(crate) present: bool,
     /// A key was typed within [`START_KEYS_QUIET`].
     pub(crate) typing: bool,
@@ -332,7 +346,11 @@ fn read_reopen(text: &str) -> Option<Reopen> {
         return None;
     }
     let mut words = first.split(' ');
-    let at = words.next()?.parse::<u64>().ok()?;
+    let at = words
+        .next()
+        .filter(|w| w.bytes().all(|b| b.is_ascii_digit()))?
+        .parse::<u64>()
+        .ok()?;
     let mut seen = [false; 4];
     let subjects: Vec<Subject> = words
         .filter_map(Subject::parse)
@@ -453,6 +471,10 @@ pub(crate) struct Walk {
     step: Step,
     /// When the current page became due.
     due_at: Instant,
+    /// How long the current page has been held off with the person at the Mac
+    /// ([`Self::count_held_off`]), and the last look that counted it, with whether it read the
+    /// person present.
+    held_off: (Duration, Option<(Instant, bool)>),
     /// The pages before the current one that came up (or were on their way): the panel's count
     /// leaves out a page skipped, its grant held, declined or handed.
     shown: usize,
@@ -473,6 +495,7 @@ impl Walk {
             at: 0,
             step: Step::Due,
             due_at: now,
+            held_off: (Duration::ZERO, None),
             shown: 0,
         })
     }
@@ -534,9 +557,21 @@ impl Walk {
         self.at_named() || now.saturating_duration_since(self.due_at) >= UNREAD_WAIT
     }
 
-    /// How long the current page has been due.
-    pub(crate) fn due_for(&self, now: Instant) -> Duration {
-        now.saturating_duration_since(self.due_at)
+    /// Count the time the current page has been held off (it could not open) at a look at
+    /// `now`, `present` whether the look reads the person at the Mac: the time since the last
+    /// look counts only with the person present at both, as the walk's page counts its own ten
+    /// minutes (`devtools_helper::Lane::count_walk_page_time`), and the Mac asleep counts nothing
+    /// on this clock. The total.
+    pub(crate) fn count_held_off(&mut self, now: Instant, present: bool) -> Duration {
+        let (counted, last) = &mut self.held_off;
+        if let Some((at, was)) = *last
+            && was
+            && present
+        {
+            *counted = counted.saturating_add(now.saturating_duration_since(at));
+        }
+        *last = Some((now, present));
+        *counted
     }
 
     /// The subject whose page the walk is at.
@@ -584,6 +619,7 @@ impl Walk {
         self.at = self.at.saturating_add(1).min(self.subjects.len());
         self.step = Step::Due;
         self.due_at = now;
+        self.held_off = (Duration::ZERO, None);
         self.current()
     }
 
@@ -790,6 +826,8 @@ pub(crate) struct WalkLane {
     /// first of an unbroken run of looks at which only that step held a start; spent by any walk
     /// that starts ([`Self::start`]).
     local_network_wait: Option<LocalNetworkWait>,
+    /// This process is an update's successor ([`Self::note_successor`]).
+    successor: bool,
 }
 
 /// The walk's wait for System State's Local Network step ([`App::waited_out_local_network`]).
@@ -844,7 +882,18 @@ impl WalkLane {
             ax_declined: None,
             reopened: Reopened::Unread,
             local_network_wait: None,
+            successor: false,
         }
+    }
+
+    /// This process is an update's successor (a launch into a staged update, a seamless
+    /// hand-over, a relaunch of the running aterm), not one the owner started: it starts this
+    /// Mac's first walk by itself as a cold launch does ([`StartFacts::cold`]), on a Mac that
+    /// never had one ([`App::fresh_mac`]), and walks on from the pages a Quit & Reopen left when
+    /// it opened into the update ([`App::take_walk_reopen`]). Its settle and the Full Disk
+    /// Access page's Later stay a successor's (`devtools_helper::Lane::note_cold_start`).
+    pub(crate) const fn note_successor(&mut self) {
+        self.successor = true;
     }
 
     pub(crate) const fn reach(&self) -> WalkReach {
@@ -979,6 +1028,25 @@ impl WalkLane {
         self.gave_way = true;
         self.end(why);
     }
+
+    /// The walk's page lapsed: its ten minutes of the person's time at the Mac
+    /// (`devtools_helper::Panel::count_time`) passed with no answer. The walk gives way as to a
+    /// press ([`Self::give_way`]), freeing the pages after it for the walk that starts by itself
+    /// at the next quiet moment, but the page that lapsed stays walked: an unanswered page never
+    /// comes back by itself, so no walk opens it again and again.
+    pub(crate) fn lapse(&mut self) {
+        let Some(walk) = self.walk.as_ref() else {
+            return;
+        };
+        let lapsed = walk.current();
+        for subject in walk.ahead() {
+            if Some(*subject) != lapsed {
+                self.walked[subject.index()] = false;
+            }
+        }
+        self.gave_way = true;
+        self.end("its page lapsed");
+    }
 }
 
 /// What the window's walk answered a start (`aterm ctl permissions walk now`, a row's press).
@@ -1059,12 +1127,16 @@ enum Opened {
 }
 
 impl App {
-    /// The walk's turn before the hand-overs: on a cold first launch with the person at System
-    /// State, start one by itself ([`starts`]); then [`Self::drive_permission_walk`].
+    /// The walk's turn before the hand-overs: the person's time with System State's Local Network
+    /// alert counted first ([`App::look_at_local_network_alert`]), so its hold reads as of this
+    /// turn; on a cold first launch with the person at System State, start one by itself
+    /// ([`starts`]); then [`Self::drive_permission_walk`].
     pub(crate) fn tick_permission_walk(&mut self, now: Instant) {
+        self.look_at_local_network_alert(now);
         if !cfg!(target_os = "macos") || !self.devtools_helper.windowed() {
             return;
         }
+        self.count_walk_page_time(now);
         if !self.permission_walk.active() {
             self.look_for_walk_start(now);
         }
@@ -1102,11 +1174,10 @@ impl App {
     /// markers: those still missing and not held back by the owner's Not now, in the walk's order.
     fn look_for_walk_start(&mut self, now: Instant) {
         self.take_walk_reopen();
-        let cold = self.devtools_helper.cold_start();
-        let Some(revision) = self
-            .access_revision()
-            .filter(|_| cold && self.access_steps_allowed())
-        else {
+        let cold = self.walk_may_start_by_itself();
+        let Some(revision) = self.access_revision().filter(|_| {
+            cold && self.access_steps_allowed() && self.person_permission_admission_stands()
+        }) else {
             self.restart_local_network_wait();
             return;
         };
@@ -1146,6 +1217,12 @@ impl App {
             Some(true) => true,
             None => false,
         };
+        // The look at which the wait runs out opens System Settings: the presence the wait carried
+        // from its first look does not, only a touch within the last minute read now. The wait
+        // stays run out, so the walk starts at the next look that reads the person back.
+        if ran_out && !self.person_present_within(START_PRESENT_WITHIN, now) {
+            return;
+        }
         let reopened = matches!(self.permission_walk.reopened, Reopened::Waits(_));
         let walk = if let Reopened::Waits(left) = &self.permission_walk.reopened {
             let left = left.clone();
@@ -1290,9 +1367,10 @@ impl App {
     /// other rules hold ([`Self::look_for_walk_start`]). Switching Full Disk Access on brings that
     /// question, and its Quit & Reopen ends the walk with its next pages still to show
     /// (`docs/measured/first-launch-permission-walk-0.145.0-2026-10-28.md`, finding 1); the
-    /// aterm it opens is a cold start whose pages came up before ([`Self::fresh_mac`]), so
-    /// without them it would start none. A walk that started in this process before the look (a
-    /// person's press, the control verb) ends the wait.
+    /// aterm it opens, a cold start or, when an update was staged, the update's successor
+    /// ([`WalkLane::note_successor`]), is one whose pages came up before ([`Self::fresh_mac`]),
+    /// so without them it would start none. A walk that started in this process before the look
+    /// (a person's press, the control verb) ends the wait.
     fn take_walk_reopen(&mut self) {
         if self.permission_walk.reopened != Reopened::Unread {
             return;
@@ -1377,8 +1455,16 @@ impl App {
         }
     }
 
+    /// Whether this process may start the first walk by itself ([`StartFacts::cold`]): the owner
+    /// started it (`devtools_helper::Lane::cold_start`), or it is an update's successor
+    /// ([`WalkLane::note_successor`]). Every windowed process is one or the other; a test's lane
+    /// that notes neither starts none by itself.
+    fn walk_may_start_by_itself(&self) -> bool {
+        self.devtools_helper.cold_start() || self.permission_walk.successor
+    }
+
     /// Whether a walk may still start by itself in this process and only the person's absence
-    /// holds it: a windowed macOS instance the owner started ([`StartFacts::cold`]), no walk run
+    /// holds it: a windowed macOS instance that may start one ([`StartFacts::cold`]), no walk run
     /// in it, no look that found an opening holding the start ([`Self::fresh_mac`]: none that
     /// latched, none held under the key the access marks carry now), and no touch of the
     /// keyboard or pointer within [`START_PRESENT_WITHIN`], read as the walk's start reads it
@@ -1394,7 +1480,7 @@ impl App {
     pub(crate) fn walk_waits_for_the_person(&self, now: Instant) -> bool {
         cfg!(target_os = "macos")
             && self.devtools_helper.windowed()
-            && self.devtools_helper.cold_start()
+            && self.walk_may_start_by_itself()
             && !self.permission_walk.any_walked()
             && !self.permission_walk.page_seen
             && !self.person_present_within(START_PRESENT_WITHIN, now)
@@ -1537,10 +1623,18 @@ impl App {
     /// verb, and only the owner's own press goes past a Not now. The walk reads that hold again
     /// before each page, and opens its first only under the one-gesture rule
     /// ([`Self::open_walk_page`]). A walk under way takes the verb's subjects and answers with
-    /// the pages it has still to show.
+    /// the pages it has still to show. A walk it starts or joins brings System State in front,
+    /// whose card says each page.
     pub(crate) fn ask_permission_walk(&mut self, named: &[Subject], now: Instant) -> Started {
         let held_back = Subject::ORDER.map(|subject| self.declined_for_the_verb(subject));
-        self.start_walk_without(named, held_back, true, "a control client", now)
+        let started = self.start_walk_without(named, held_back, true, "a control client", now);
+        // The walk's pages are the setup screen's Needs-you card's
+        // (`docs/DESIGN-init-on-by-default-2026-10-25.md` §4.8): System State comes in front
+        // to say each one, where the person sees it beside System Settings.
+        if matches!(started, Started::Walking { .. }) {
+            self.open_system_state_tab();
+        }
+        started
     }
 
     /// A control lane's ask, as this turn takes it: [`Self::ask_permission_walk`], its answer
@@ -1687,6 +1781,19 @@ impl App {
             .then(|| walk.position(|subject| self.walk_reads_held(subject)))
     }
 
+    /// The walk's page now and its place in the walk, for the setup screen's Needs-you card
+    /// (`docs/DESIGN-init-on-by-default-2026-10-25.md` §4.8): one page of one says no step.
+    pub(crate) fn system_state_walk_page(&self) -> Option<crate::system_state::WalkPage> {
+        let walk = self.permission_walk.walk()?;
+        let subject = walk.current()?;
+        let (at, of) = walk.position(|subject| self.walk_reads_held(subject));
+        (of > 1).then_some(crate::system_state::WalkPage {
+            access: subject.access(),
+            at,
+            of,
+        })
+    }
+
     /// Whether `subject`'s grant reads held by the readings already in, as [`Self::walk_held`]
     /// judges it but starting no reading: the walk's count of the pages it will show
     /// ([`Walk::position`]), read at every turn while a page is up.
@@ -1801,10 +1908,12 @@ impl App {
     /// A walk page closed `why`: done or switched on goes on to the next page, and so does a
     /// Not now on a page the walk added; a Not now on a page asked for by name (a row's press,
     /// the control verb) goes on only to another page asked for by name, and otherwise ends the
-    /// walk there, as do the close box (on done words that wait for macOS's question too), the
-    /// page's ten minutes, System Settings quitting, another panel and a give-way to a press
-    /// elsewhere (whose walk already stepped aside, `WalkLane::give_way`). A Not now or the close
-    /// box on the Accessibility page, the walk's alone, is noted as its decline
+    /// walk there, as do the close box (on done words that wait for macOS's question too), System
+    /// Settings quitting, another panel and a give-way to a press elsewhere (whose walk already
+    /// stepped aside, `WalkLane::give_way`). The page's ten minutes of the person's time
+    /// (`devtools_helper::Panel::count_time`) end it giving way, the pages after it free for the
+    /// walk that starts by itself, the page that lapsed not (`WalkLane::lapse`). A Not now or the
+    /// close box on the Accessibility page, the walk's alone, is noted as its decline
     /// (`WalkLane::note_ax_declined`), as the lane notes the other pages'.
     fn walk_page_closed(&mut self, page: Page, why: Closed, now: Instant) {
         if page == Page::Accessibility && why.declines() {
@@ -1831,7 +1940,7 @@ impl App {
                 }
             }
             Closed::CloseBox | Closed::Waiting => self.permission_walk.end("the close box"),
-            Closed::Lapsed => self.permission_walk.end("its page lapsed"),
+            Closed::Lapsed => self.permission_walk.lapse(),
             Closed::SettingsGone => self.permission_walk.end("System Settings quit"),
             Closed::Replaced => self.permission_walk.end("another panel replaced its page"),
             Closed::GaveWay => self
@@ -1873,17 +1982,36 @@ impl App {
         self.take_walk_close(now);
     }
 
+    /// The walk's look at the time of its page that is up: the page's ten minutes count only
+    /// while the person is at the Mac with its screen in use, and its grant and list are read only
+    /// then (`devtools_helper::Lane::count_walk_page_time`), so a page left up behind a lock, or
+    /// while nobody touches the Mac, is there when they come back and spends nothing meanwhile.
+    /// The person is away once the screen is locked, asleep or another user's
+    /// (`App::screen_away`), or nobody has touched the Mac for [`START_PRESENT_WITHIN`]
+    /// ([`Self::person_present_within`]). The page behind another app does not stop its time: a
+    /// person who moved on to other work leaves it, and it lapses ten minutes into theirs.
+    fn count_walk_page_time(&mut self, now: Instant) {
+        let present = !self.permission_walk.active() || !self.walk_person_away(now);
+        self.devtools_helper.count_walk_page_time(now, present);
+    }
+
+    /// Whether the person is away from the walk's page ([`Self::count_walk_page_time`]).
+    fn walk_person_away(&self, now: Instant) -> bool {
+        (self.screen_away)() || !self.person_present_within(START_PRESENT_WITHIN, now)
+    }
+
     /// While a walk page is up, read its grant every [`GRANT_POLL`] until the page shows its done
     /// words: a fresh Full Disk Access probe (its answer turns the page in
     /// `App::tick_fda_hand_over`) and `AXIsProcessTrusted`. Full Disk Access's done words may
     /// wait minutes for macOS's sheet ([`Self::turn_after_fda`]), and the grant they show is in,
     /// so no probe (a child aterm each) runs under them. The Developer Tools page reads its own
-    /// list at that pace.
+    /// list at that pace. Nothing is read while the person is away
+    /// ([`Self::count_walk_page_time`]): no switch flips then.
     fn read_walk_grant(&mut self, now: Instant) {
         let Some(walk) = self.permission_walk.walk() else {
             return;
         };
-        if walk.step() != Step::Up {
+        if walk.step() != Step::Up || self.devtools_helper.walk_page_rests() {
             return;
         }
         let done = |page: Page| {
@@ -1952,12 +2080,13 @@ impl App {
                 }
                 Opened::Wait => {
                     // A page held off as long as a panel stays up ends the walk, so a dialog
-                    // slot that never frees keeps no walk looking for it.
-                    if self
-                        .permission_walk
-                        .walk()
-                        .is_some_and(|walk| walk.due_for(now) >= crate::devtools_helper::PANEL_FOR)
-                    {
+                    // slot that never frees keeps no walk looking for it. Only the person's time
+                    // at the Mac counts, as the page's own does: a walk held off while they are
+                    // away is there when they come back.
+                    let present = !self.walk_person_away(now);
+                    if self.permission_walk.walk_mut().is_some_and(|walk| {
+                        walk.count_held_off(now, present) >= crate::devtools_helper::PANEL_FOR
+                    }) {
                         self.permission_walk
                             .end("its page could not open for ten minutes");
                     }
@@ -2105,8 +2234,15 @@ impl App {
     /// walk yields to) is tried again and a page that is up reads its grant. A page that comes
     /// due as another ends opens in the same turn ([`Self::drive_permission_walk`]), so nothing
     /// waits on this deadline to open at once, and a page that cannot open never spins the park.
+    /// While the person is away from a page that is up ([`Self::count_walk_page_time`]) the walk
+    /// looks every [`crate::devtools_helper::PANEL_TICK`] instead, for their return.
     pub(crate) fn next_permission_walk_deadline(&self, now: Instant) -> Option<Instant> {
-        self.permission_walk.walk().map(|_| now + GRANT_POLL)
+        let every = if self.devtools_helper.walk_page_rests() {
+            crate::devtools_helper::PANEL_TICK
+        } else {
+            GRANT_POLL
+        };
+        self.permission_walk.walk().map(|_| now + every)
     }
 }
 
@@ -2263,7 +2399,7 @@ mod tests {
                 cold: false,
                 ..facts()
             }),
-            "an update's successor, or a Mac whose pages came up before, never"
+            "a process that may not start one by itself never"
         );
         assert!(!starts(StartFacts {
             presented: false,

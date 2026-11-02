@@ -37,6 +37,7 @@ const fn order(noun: Noun) -> Option<&'static str> {
         Noun::Repo => Some("full_name asc, case-insensitive"),
         Noun::Identity => Some("profile asc, then the ambient variables"),
         Noun::Rate => Some("profile asc, then anonymous; resource asc"),
+        Noun::Intent => Some("repo asc, then step asc"),
         Noun::Release
         | Noun::User
         | Noun::Policy
@@ -46,7 +47,9 @@ const fn order(noun: Noun) -> Option<&'static str> {
         | Noun::Download
         | Noun::Wait
         | Noun::Permission
-        | Noun::Meta => None,
+        | Noun::Meta
+        | Noun::Write
+        | Noun::Credential => None,
     }
 }
 
@@ -72,6 +75,9 @@ const fn class_slug(class: Class) -> &'static str {
         Class::Local => "local",
         Class::Provision => "provision",
         Class::ByMethod => "by-method",
+        Class::Write => "write",
+        Class::Destructive => "destructive",
+        Class::Git => "git",
     }
 }
 

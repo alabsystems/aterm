@@ -5,11 +5,11 @@
 use std::fs;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aterm_digest::Sha256;
+use aterm_uds::spawnfd::command;
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
@@ -58,7 +58,12 @@ pub const LABEL_MAX: usize = VALUE_COL - 3;
 fn width() -> usize {
     std::env::var("COLUMNS")
         .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
+        .and_then(|v| {
+            let v = v.trim();
+            (!v.starts_with('+'))
+                .then(|| v.parse::<usize>().ok())
+                .flatten()
+        })
         .unwrap_or(100)
         .clamp(60, 120)
 }
@@ -254,7 +259,8 @@ pub fn repo_slug(cargo_toml: &str) -> Option<String> {
                 .strip_prefix("https://github.com/")
                 .or_else(|| url.strip_prefix("http://github.com/"))
                 .or_else(|| url.strip_prefix("git@github.com:"))?;
-            let slug = tail.trim_end_matches('/').trim_end_matches(".git");
+            let tail = tail.trim_end_matches('/');
+            let slug = tail.strip_suffix(".git").unwrap_or(tail);
             if slug.split('/').count() == 2 {
                 return Some(slug.to_string());
             }
@@ -309,7 +315,8 @@ pub fn github_slug_from_remote_url(url: &str) -> Result<String> {
                 "origin URL {url:?} is not an unambiguous GitHub repository URL"
             ))
         })?;
-    let slug = tail.trim_end_matches('/').trim_end_matches(".git");
+    let tail = tail.trim_end_matches('/');
+    let slug = tail.strip_suffix(".git").unwrap_or(tail);
     let mut parts = slug.split('/');
     let (Some(owner), Some(repo), None) = (parts.next(), parts.next(), parts.next()) else {
         return Err(Error::new(format!(
@@ -561,7 +568,8 @@ static FENCE_SELF_VERSION: std::sync::Mutex<Option<String>> = std::sync::Mutex::
 /// Record what this invocation publishes.
 pub fn set_publisher_fence_version(version: &str) {
     if let Ok(mut slot) = FENCE_SELF_VERSION.lock() {
-        *slot = Some(version.trim().trim_start_matches('v').to_string());
+        let v = version.trim();
+        *slot = Some(v.strip_prefix('v').unwrap_or(v).to_string());
     }
 }
 
@@ -643,15 +651,18 @@ impl FenceIdentity {
             if value.is_empty() {
                 continue;
             }
+            let uint = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
             match key.trim() {
-                "format" => identity.format = value.parse().ok(),
-                "pid" => identity.pid = value.parse().ok(),
-                "pgid" => identity.pgid = value.parse().ok(),
+                "format" if uint(value) => identity.format = value.parse().ok(),
+                "pid" if uint(value) => identity.pid = value.parse().ok(),
+                "pgid" if uint(value) => identity.pgid = value.parse().ok(),
                 "host" => identity.host = Some(value.to_string()),
                 "boot" => identity.boot = Some(value.to_string()),
                 "exe" => identity.exe = Some(value.to_string()),
-                "version" => identity.version = Some(value.trim_start_matches('v').to_string()),
-                "started" => identity.started_unix = value.parse().ok(),
+                "version" => {
+                    identity.version = Some(value.strip_prefix('v').unwrap_or(value).to_string());
+                }
+                "started" if uint(value) => identity.started_unix = value.parse().ok(),
                 _ => {}
             }
         }
@@ -728,106 +739,44 @@ pub trait PublisherProbe {
 pub struct LocalProbe;
 
 impl LocalProbe {
-    fn uname_n() -> Option<String> {
-        let out = Command::new("uname").arg("-n").output().ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let host = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        (!host.is_empty()).then_some(host)
-    }
-
-    fn pgrp_from_stat(stat: &str) -> Option<u32> {
-        let (_, after) = stat.rsplit_once(')')?;
-        after.split_whitespace().nth(2)?.parse().ok()
-    }
-
+    /// This process's group: `getpgrp`, which cannot fail.
+    #[cfg(unix)]
     fn own_pgid() -> Option<u32> {
-        if let Ok(stat) = fs::read_to_string("/proc/self/stat") {
-            return Self::pgrp_from_stat(&stat);
+        unsafe extern "C" {
+            fn getpgrp() -> i32;
         }
-        let out = Command::new("ps")
-            .args(["-o", "pgid=", "-p", &std::process::id().to_string()])
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+        // SAFETY: `getpgrp` takes nothing, touches no memory of ours and always succeeds.
+        u32::try_from(unsafe { getpgrp() }).ok()
     }
 
+    /// See the unix twin: no group is read here.
+    #[cfg(not(unix))]
+    fn own_pgid() -> Option<u32> {
+        None
+    }
+
+    /// The members of `pgid` in a listing of every process read in this process
+    /// ([`crate::interrupt::listing`]), each named by the kernel's short name for it. No program
+    /// runs and no process's arguments are read: a `ps` that reads every process's hung by the
+    /// thousand in a program-check wedge (`docs/DESIGN-leftover-processes-2026-10-16.md` M29).
     fn members_of(pgid: u32) -> GroupState {
-        let me = std::process::id();
-        if Path::new("/proc/self/stat").exists() {
-            let entries = match fs::read_dir("/proc") {
-                Ok(entries) => entries,
-                Err(error) => return GroupState::Unknown(format!("could not read /proc: {error}")),
-            };
-            let mut members = Vec::new();
-            let mut saw_self = false;
-            for entry in entries.flatten() {
-                let Some(pid) = entry
-                    .file_name()
-                    .to_str()
-                    .and_then(|s| s.parse::<u32>().ok())
-                else {
-                    continue;
-                };
-                let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
-                    continue;
-                };
-                saw_self |= pid == me;
-                if Self::pgrp_from_stat(&stat) == Some(pgid) {
-                    let comm = fs::read_to_string(entry.path().join("comm"))
-                        .map(|c| c.trim().to_string())
-                        .unwrap_or_default();
-                    members.push((pid, comm));
-                }
-            }
-            if !saw_self {
-                return GroupState::Unknown("/proc did not list this process".to_string());
-            }
-            return if members.is_empty() {
-                GroupState::Empty
-            } else {
-                GroupState::Members(members)
-            };
-        }
-        let out = match Command::new("ps")
-            .args(["-A", "-o", "pid=,pgid=,comm="])
-            .output()
-        {
-            Ok(out) => out,
-            Err(error) => return GroupState::Unknown(format!("could not run ps: {error}")),
+        let Some(procs) = crate::interrupt::listing() else {
+            return GroupState::Unknown("the process table could not be read".to_string());
         };
-        if !out.status.success() {
-            return GroupState::Unknown(format!(
-                "ps -A exited {}: {}",
-                out.status
-                    .code()
-                    .map_or_else(|| "by signal".to_string(), |code| code.to_string()),
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
+        Self::group_of(procs, pgid, std::process::id())
+    }
+
+    /// [`Self::members_of`] over `procs`, a listing that must show `me`.
+    fn group_of(procs: Vec<crate::interrupt::Proc>, pgid: u32, me: u32) -> GroupState {
+        let own = |pid: i32| u32::try_from(pid).ok();
+        if !procs.iter().any(|p| own(p.pid) == Some(me)) {
+            return GroupState::Unknown("the process table did not list this process".to_string());
         }
-        let text = String::from_utf8_lossy(&out.stdout);
-        let mut members = Vec::new();
-        let mut saw_self = false;
-        for line in text.lines() {
-            let mut fields = line.split_whitespace();
-            let (Some(pid), Some(group)) = (fields.next(), fields.next()) else {
-                continue;
-            };
-            let Ok(pid) = pid.parse::<u32>() else {
-                continue;
-            };
-            saw_self |= pid == me;
-            if group.parse::<u32>().ok() == Some(pgid) {
-                members.push((pid, fields.collect::<Vec<_>>().join(" ")));
-            }
-        }
-        if !saw_self {
-            return GroupState::Unknown("ps -A did not list this process".to_string());
-        }
+        let members: Vec<(u32, String)> = procs
+            .into_iter()
+            .filter(|p| u32::try_from(p.pgid).ok() == Some(pgid))
+            .filter_map(|p| Some((own(p.pid)?, p.name)))
+            .collect();
         if members.is_empty() {
             GroupState::Empty
         } else {
@@ -847,7 +796,8 @@ impl PublisherProbe for LocalProbe {
 
     fn host(&self) -> Option<String> {
         static HOST: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-        HOST.get_or_init(LocalProbe::uname_n).clone()
+        HOST.get_or_init(aterm_uds::process::kernel_host_name)
+            .clone()
     }
 
     fn boot(&self) -> Option<[u8; 16]> {
@@ -878,43 +828,58 @@ impl PublisherProbe for LocalProbe {
                 .ok()
                 .map(|path| path.display().to_string())
                 .or_else(|| {
-                    fs::read_to_string(dir.join("comm"))
+                    aterm_uds::process::read_proc_text(&dir.join("comm"))
                         .ok()
                         .map(|name| name.trim().to_string())
                 });
             return PidState::Running { exe };
         }
-        match Command::new("ps")
-            .args(["-p", &pid.to_string(), "-o", "comm="])
-            .output()
+        // macOS's process table, read in this process: a zombie reads as `ps` prints it, and a
+        // live process as `ps -o comm=` names it, its first argument word
+        // (`kproc::ps_comm`), the path it was started by, as `current_exe` records the
+        // publisher's, a symlink's own name included. Its words are read only once its one
+        // thread has run (`thread_ran`, M29 of `docs/DESIGN-leftover-processes-2026-10-16.md`);
+        // before that it is named by the image it runs (`proc_pidpath`, or the kernel's short
+        // name where that does not read).
+        #[cfg(target_os = "macos")]
         {
-            Err(error) => PidState::Unknown(format!("could not run ps: {error}")),
-            Ok(out) if out.status.success() => {
-                let exe = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if exe.is_empty() {
-                    PidState::NotRunning
-                } else {
+            match aterm_sysprobe::kproc::record_read(pid) {
+                Ok(None) => PidState::NotRunning,
+                Err(error) => PidState::Unknown(format!(
+                    "the kernel's record of pid {pid} did not read: {error}"
+                )),
+                Ok(Some(r)) if r.zombie => PidState::Running {
+                    exe: Some(aterm_sysprobe::kproc::DEFUNCT.to_string()),
+                },
+                Ok(Some(r)) => {
+                    let ran = i32::try_from(pid)
+                        .ok()
+                        .and_then(aterm_uds::process::thread_ran);
+                    let exe = if ran == Some(true) {
+                        aterm_sysprobe::kproc::ps_comm(&r, aterm_sysprobe::kproc::Locale::Utf8)
+                    } else {
+                        aterm_sysprobe::process_path(pid)
+                            .map_or(r.comm, |path| path.display().to_string())
+                    };
                     PidState::Running { exe: Some(exe) }
                 }
             }
-            Ok(out) => {
-                let complaint = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                match (out.status.code(), complaint.is_empty()) {
-                    (Some(1), true) => PidState::NotRunning,
-                    (code, _) => PidState::Unknown(format!(
-                        "ps -p {pid} exited {}: {complaint}",
-                        code.map_or_else(|| "by signal".to_string(), |code| code.to_string())
-                    )),
-                }
-            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            PidState::Unknown(format!(
+                "pid {pid}: this platform's process table is not read"
+            ))
         }
     }
 }
 
 fn executables_agree(recorded: &str, observed: &str) -> bool {
     let base = |path: &str| {
-        path.trim()
-            .trim_end_matches(" (deleted)")
+        let trimmed = path.trim();
+        trimmed
+            .strip_suffix(" (deleted)")
+            .unwrap_or(trimmed)
             .rsplit('/')
             .next()
             .unwrap_or(path)
@@ -1865,7 +1830,7 @@ impl JournalHeader {
 }
 
 fn read_journal_text(path: &Path) -> Result<Option<String>> {
-    match fs::read_to_string(path) {
+    match crate::durable::read_regular_text(path, 4 * 1024 * 1024) {
         Ok(text) => Ok(Some(text)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(Error::new(format!("read {}: {e}", path.display()))),
@@ -1972,18 +1937,24 @@ impl Journal {
             .write(true)
             .open(&tmp)
             .map_err(|e| Error::new(format!("create {}: {e}", tmp.display())))?;
-        file.write_all(text.as_bytes())
-            .map_err(|e| Error::new(format!("write {}: {e}", tmp.display())))?;
-        crate::durable::sync_all(&file)
-            .map_err(|e| Error::new(format!("fsync {}: {e}", tmp.display())))?;
-        drop(file);
-        fs::rename(&tmp, path).map_err(|e| {
-            Error::new(format!(
-                "rename {} -> {}: {e}",
-                tmp.display(),
-                path.display()
-            ))
-        })?;
+        let commit_tmp = (|| -> Result<()> {
+            file.write_all(text.as_bytes())
+                .map_err(|e| Error::new(format!("write {}: {e}", tmp.display())))?;
+            crate::durable::sync_all(&file)
+                .map_err(|e| Error::new(format!("fsync {}: {e}", tmp.display())))?;
+            drop(file);
+            fs::rename(&tmp, path).map_err(|e| {
+                Error::new(format!(
+                    "rename {} -> {}: {e}",
+                    tmp.display(),
+                    path.display()
+                ))
+            })
+        })();
+        if let Err(err) = commit_tmp {
+            let _ = fs::remove_file(&tmp);
+            return Err(err);
+        }
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -2068,7 +2039,23 @@ impl Journal {
                 Error::new("signed release journal has no persisted update public key")
             })?;
             canonical_update_pubkey(pubkey)?;
-        } else if self.signature_pubkey.is_some() || self.manifest_signed {
+            if let Some(verify_pubkey) = self.verify_pubkey.as_deref() {
+                canonical_update_pubkey(verify_pubkey)?;
+            }
+            if self
+                .signature_machine_id
+                .as_deref()
+                .is_some_and(|id| id.trim().is_empty())
+            {
+                return Err(Error::new(
+                    "signed release journal carries an empty signature_machine_id",
+                ));
+            }
+        } else if self.signature_pubkey.is_some()
+            || self.verify_pubkey.is_some()
+            || self.signature_machine_id.is_some()
+            || self.manifest_signed
+        {
             return Err(Error::new(
                 "release journal carries signature bytes/key while signature_required is false",
             ));
@@ -3011,12 +2998,15 @@ pub fn parse_release_object_identity_rows(rows: &str) -> Result<Vec<ReleaseObjec
                     index + 1
                 )));
             };
-            let id = id.parse::<u64>().map_err(|_| {
-                Error::new(format!(
-                    "GitHub release identity row {} has non-numeric ID",
-                    index + 1
-                ))
-            })?;
+            let id = (!id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| id.parse::<u64>().ok())
+                .flatten()
+                .ok_or_else(|| {
+                    Error::new(format!(
+                        "GitHub release identity row {} has non-numeric ID",
+                        index + 1
+                    ))
+                })?;
             if id == 0 || tag.is_empty() || target.is_empty() {
                 return Err(Error::new(format!(
                     "GitHub release identity row {} has an empty/zero identity field",
@@ -3839,10 +3829,15 @@ pub fn parse_release_asset_identity_rows(
             if observed_name != name {
                 return None;
             }
+            let uint = |s: &str| {
+                (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                    .then(|| s.parse::<u64>().ok())
+                    .flatten()
+            };
             Some(
-                id.parse::<u64>()
-                    .and_then(|id| size.parse::<u64>().map(|size| (id, size)))
-                    .map_err(|_| Error::new("GitHub release asset has non-numeric id/size")),
+                uint(id)
+                    .zip(uint(size))
+                    .ok_or_else(|| Error::new("GitHub release asset has non-numeric id/size")),
             )
         })
         .collect::<Result<Vec<_>>>()?;
@@ -3909,14 +3904,16 @@ pub fn release_asset_inventory_for_release_id(
                 index + 1
             )));
         };
+        let uint = |s: &str, msg: &str| {
+            (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| s.parse::<u64>().ok())
+                .flatten()
+                .ok_or_else(|| Error::new(msg))
+        };
         inventory.push(ReleaseAssetInventoryEntry {
             name: name.to_string(),
-            id: id
-                .parse()
-                .map_err(|_| Error::new("release inventory asset ID is non-numeric"))?,
-            size: size
-                .parse()
-                .map_err(|_| Error::new("release inventory asset size is non-numeric"))?,
+            id: uint(id, "release inventory asset ID is non-numeric")?,
+            size: uint(size, "release inventory asset size is non-numeric")?,
         });
     }
     inventory.sort();
@@ -4374,11 +4371,8 @@ pub fn stage_roster_assets(dist: &Path, document: Option<&machines::RosterDocume
         return Ok(());
     };
     let roster = dist.join(roster::ROSTER_ASSET);
-    let signature = dist.join(roster::ROSTER_SIG_ASSET);
-    fs::write(&roster, &document.bytes)
+    crate::provision::publish_proven_pair(&roster, &document.bytes, &document.signature)
         .map_err(|e| Error::new(format!("stage {}: {e}", roster.display())))?;
-    fs::write(&signature, &document.signature)
-        .map_err(|e| Error::new(format!("stage {}: {e}", signature.display())))?;
     step(
         "roster",
         &format!(
@@ -7526,6 +7520,7 @@ fn prove_publication_on_disk(ctx: &CutCtx) -> Result<Manifest> {
             )));
         }
     }
+    prove_roster_on_disk(ctx, &manifest)?;
     Ok(manifest)
 }
 
@@ -7538,7 +7533,7 @@ fn step_selfcheck(ctx: &mut CutCtx) -> Result<()> {
     let staging = ctx.dist.join(bundle::staging_dir_name(ctx.build));
     let _ = fs::remove_file(staging.join(aterm_uds::deadline::RAN));
     aterm_uds::deadline::stamp_exec(&staging);
-    let diag = Command::new(app.join("Contents/MacOS/aterm"))
+    let diag = command(app.join("Contents/MacOS/aterm"))
         .arg("--diagnose")
         .current_dir(&ctx.repo)
         .output()
@@ -7574,7 +7569,7 @@ fn step_selfcheck(ctx: &mut CutCtx) -> Result<()> {
         ("aterm-gui", "aterm-gui"),
         ("aterm-ctl", "aterm-ctl"),
     ] {
-        let output = Command::new(app.join("Contents/MacOS").join(basename))
+        let output = command(app.join("Contents/MacOS").join(basename))
             .arg("--version")
             .current_dir(&ctx.repo)
             .output()
@@ -7871,7 +7866,28 @@ fn step_publish(ctx: &mut CutCtx) -> Result<()> {
 }
 
 fn prove_roster_on_disk(ctx: &CutCtx, manifest: &Manifest) -> Result<()> {
+    prove_roster_on_disk_at(
+        ctx,
+        manifest,
+        aterm_update_core::pins::PAPER_MASTER_PUBKEYS,
+        roster_now_unix(),
+    )
+}
+
+fn prove_roster_on_disk_at(
+    ctx: &CutCtx,
+    manifest: &Manifest,
+    master_pubkeys: &[&str],
+    now_unix: i64,
+) -> Result<()> {
     if !ctx.attaches_roster() {
+        if manifest.machine_id.is_some() || manifest.roster_seq.is_some() {
+            return Err(Error::new(
+                "this cut attaches no machine roster, but its appcast carries machine_id or \
+                 roster_seq attribution; refusing to publish an attributed appcast without its \
+                 roster pair",
+            ));
+        }
         return Ok(());
     }
     let machine_id = manifest.machine_id.as_deref().ok_or_else(|| {
@@ -7888,10 +7904,12 @@ fn prove_roster_on_disk(ctx: &CutCtx, manifest: &Manifest) -> Result<()> {
         fs::read(ctx.dist.join(name))
             .map_err(|e| Error::new(format!("read dist/{name} before publishing it: {e}")))
     };
+    let roster_bytes = read(roster::ROSTER_ASSET)?;
+    let roster_sig = read(roster::ROSTER_SIG_ASSET)?;
     machines::verify_published_roster(
-        aterm_update_core::pins::PAPER_MASTER_PUBKEYS,
-        read(roster::ROSTER_ASSET)?,
-        &read(roster::ROSTER_SIG_ASSET)?,
+        master_pubkeys,
+        roster_bytes.clone(),
+        &roster_sig,
         machine_id,
         manifest.roster_seq,
     )
@@ -7904,6 +7922,42 @@ fn prove_roster_on_disk(ctx: &CutCtx, manifest: &Manifest) -> Result<()> {
             ctx.version
         ))
     })?;
+    let verified =
+        roster::verify_roster(master_pubkeys, roster_bytes, &roster_sig).map_err(|e| {
+            Error::new(format!(
+                "dist/{} failed master verification ({e:?})",
+                roster::ROSTER_ASSET
+            ))
+        })?;
+    let parsed = roster::Roster::parse(&verified)
+        .map_err(|e| Error::new(format!("dist/{} is unusable ({e:?})", roster::ROSTER_ASSET)))?;
+    parsed.admit(0, now_unix).map_err(|e| {
+        Error::new(format!(
+            "dist/{} is not a fresh roster at publish time ({e:?}); refusing to publish a \
+             lapsed roster onto the channel head",
+            roster::ROSTER_ASSET
+        ))
+    })?;
+    let machine = parsed.machine(machine_id, now_unix).map_err(|e| {
+        Error::new(format!(
+            "dist/{} does not admit machine {machine_id:?} at publish time ({e:?}) — a \
+             revocation or expiry rewrote it after this cut was built; refusing to publish an \
+             appcast beside a roster that rejects its signer",
+            roster::ROSTER_ASSET
+        ))
+    })?;
+    if let Some(expected_pubkey) = ctx.verification_pubkey() {
+        let roster_pubkey = canonical_update_pubkey(&machine.pubkey)?;
+        let expected_pubkey = canonical_update_pubkey(expected_pubkey)?;
+        if roster_pubkey != expected_pubkey {
+            return Err(Error::new(format!(
+                "dist/{} binds machine {machine_id:?} to public key {roster_pubkey:?}, but \
+                 this cut's appcast was signed under {expected_pubkey:?}; refusing to publish \
+                 a roster whose machine key disagrees with the appcast signature",
+                roster::ROSTER_ASSET
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -8193,7 +8247,7 @@ pub fn anon_probe_refusal(stderr: &str) -> Option<u16> {
 fn anon_probe(args: &[&str]) -> Result<std::process::Output> {
     let mut last = None;
     for attempt in 1..=ANON_PROBE_ATTEMPTS {
-        let out = Command::new("curl")
+        let out = command("curl")
             .args(args)
             .env_remove("GH_TOKEN")
             .env_remove("GITHUB_TOKEN")
@@ -9453,6 +9507,119 @@ sha256 = \"aa\"\ndmg = \"aterm-0.20.0.dmg\"\n";
         );
     }
 
+    #[test]
+    fn prove_roster_on_disk_enforces_liveness_non_revocation_pubkey_binding_and_unrostered_cleanliness()
+     {
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+
+        let dir =
+            std::env::temp_dir().join(format!("aterm-prove-roster-on-disk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let master_kp = Ed25519KeyPair::from_seed_unchecked(&[0x51; 32]).unwrap();
+        let master_pk = aterm_codec::base64::encode(master_kp.public_key().as_ref()).unwrap();
+        let m3_kp = Ed25519KeyPair::from_seed_unchecked(&[0x52; 32]).unwrap();
+        let m3_pk = aterm_codec::base64::encode(m3_kp.public_key().as_ref()).unwrap();
+        let other_kp = Ed25519KeyPair::from_seed_unchecked(&[0x53; 32]).unwrap();
+        let other_pk = aterm_codec::base64::encode(other_kp.public_key().as_ref()).unwrap();
+
+        let write_roster = |revoked: &[&str], pubkey: &str| {
+            let doc = roster::Roster {
+                schema: 1,
+                roster_seq: 6,
+                valid_until: "2027-02-01T00:00:00Z".into(),
+                machines: vec![roster::Machine {
+                    id: "m3".into(),
+                    pubkey: pubkey.to_string(),
+                    added_at: "2026-08-04T00:00:00Z".into(),
+                    not_after: None,
+                }],
+                revoked: revoked.iter().map(|id| (*id).to_string()).collect(),
+            };
+            let bytes = doc.to_toml().unwrap().into_bytes();
+            let sig = master_kp.sign(&bytes).as_ref().to_vec();
+            std::fs::write(dir.join(roster::ROSTER_ASSET), &bytes).unwrap();
+            std::fs::write(dir.join(roster::ROSTER_SIG_ASSET), &sig).unwrap();
+        };
+
+        let base_manifest = || {
+            manifest_out::build(&manifest_out::ManifestInputs {
+                version: "0.5.0",
+                build_number: 500,
+                commit: &"a".repeat(40),
+                dmg_name: "aterm-0.5.0.dmg",
+                dmg_sha256: &"ab".repeat(32),
+                zip_name: "aterm-0.5.0-mac.zip",
+                zip_sha256: &"cd".repeat(32),
+                repo_slug: "owner/repo",
+                min_os: "11.0",
+                team_id: "",
+                pub_date: "2026-08-11T00:00:00Z",
+                min_build: None,
+                changelog: "### Added\n- a thing\n",
+            })
+        };
+
+        let mut attributed = base_manifest();
+        machines::attribute(
+            &mut attributed,
+            &roster::Attribution {
+                machine_id: "m3".to_string(),
+                pubkey_b64: m3_pk.clone(),
+                roster_seq: 5,
+            },
+        );
+
+        let mut rostered_ctx = ctx(Some("m3"));
+        rostered_ctx.dist = dir.clone();
+        rostered_ctx.signature_pubkey = Some(m3_pk.clone());
+        let now_ok = 1_790_000_000;
+        let masters = [master_pk.as_str()];
+
+        write_roster(&[], &m3_pk);
+        prove_roster_on_disk_at(&rostered_ctx, &attributed, &masters, now_ok)
+            .expect("valid staged roster matching verification pubkey passes");
+
+        write_roster(&["m3"], &m3_pk);
+        let revoked_err = prove_roster_on_disk_at(&rostered_ctx, &attributed, &masters, now_ok)
+            .expect_err("staged roster revoking the cut's machine must be refused");
+        assert!(
+            revoked_err.0.contains("does not admit machine"),
+            "{}",
+            revoked_err.0
+        );
+
+        write_roster(&[], &other_pk);
+        let key_err = prove_roster_on_disk_at(&rostered_ctx, &attributed, &masters, now_ok)
+            .expect_err("staged roster binding machine to a different pubkey must be refused");
+        assert!(key_err.0.contains("binds machine"), "{}", key_err.0);
+
+        write_roster(&[], &m3_pk);
+        let lapsed_err =
+            prove_roster_on_disk_at(&rostered_ctx, &attributed, &masters, 1_900_000_000)
+                .expect_err("lapsed staged roster must be refused");
+        assert!(
+            lapsed_err.0.contains("not a fresh roster"),
+            "{}",
+            lapsed_err.0
+        );
+
+        let unrostered_ctx = ctx(None);
+        prove_roster_on_disk_at(&unrostered_ctx, &base_manifest(), &masters, now_ok)
+            .expect("unattributed manifest on unrostered cut passes");
+        let unrostered_err =
+            prove_roster_on_disk_at(&unrostered_ctx, &attributed, &masters, now_ok)
+                .expect_err("attributed manifest on unrostered cut must be refused");
+        assert!(
+            unrostered_err.0.contains("attaches no machine roster"),
+            "{}",
+            unrostered_err.0
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     const ROSTER_SEQ2: &[&str] = &[
         "c2NoZW1hID0gMQpyb3N0ZXJfc2VxID0gMgp2YWxpZF91bnRpbCA9ICI5OTk5LTEyLTMxVDAwOjAwOjAwWiIKcmV2",
         "b2tlZCA9IFtdCgpbW21hY2hpbmVdXQppZCA9ICJpbmN1bWJlbnQtaGVhZCIKcHVia2V5ID0gImN3NWdJR1lRelg2",
@@ -9998,5 +10165,102 @@ mod artifact_proof_tests {
             .expect_err("a flipped zip byte must be refused")
             .to_string();
         assert!(error.contains("zip sha256"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod local_probe_tests {
+    use super::{GroupState, LocalProbe};
+    use crate::interrupt::Proc;
+
+    fn proc(pid: i32, pgid: i32, name: &str) -> Proc {
+        Proc {
+            pid,
+            parent: 1,
+            pgid,
+            name: name.to_string(),
+        }
+    }
+
+    /// A group is read from a listing that shows this process: its members by pid and name,
+    /// empty when none is in it, and unknown when the listing lacks this process.
+    #[test]
+    fn a_group_reads_from_a_listing_that_shows_this_process() {
+        let procs = || {
+            vec![
+                proc(40, 40, "zsh"),
+                proc(41, 77, "aterm-release"),
+                proc(42, 77, "curl"),
+                proc(43, 78, "git"),
+            ]
+        };
+        assert_eq!(
+            LocalProbe::group_of(procs(), 77, 40),
+            GroupState::Members(vec![
+                (41, "aterm-release".to_string()),
+                (42, "curl".to_string())
+            ])
+        );
+        assert_eq!(LocalProbe::group_of(procs(), 79, 40), GroupState::Empty);
+        assert!(matches!(
+            LocalProbe::group_of(procs(), 77, 99),
+            GroupState::Unknown(why) if why.contains("did not list this process")
+        ));
+    }
+
+    /// A live process started through a symlink of another name reads by the path it was
+    /// started by, as `current_exe` records a publisher's, not by the image the link resolves
+    /// to, so a live publisher run through such a link is never read as its pid reused.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_process_started_through_a_symlink_reads_by_the_path_it_was_started_by() {
+        use super::{PidState, PublisherProbe as _};
+        let dir = aterm_tempfile::tempdir().expect("scratch dir");
+        let link = dir.path().join("cut");
+        std::os::unix::fs::symlink("/bin/sleep", &link).expect("link sleep as cut");
+        let mut child = aterm_uds::spawnfd::command(&link)
+            .arg("600")
+            .spawn()
+            .expect("run sleep through the link");
+        let pid = i32::try_from(child.id()).expect("pid");
+        let bound = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while aterm_uds::process::thread_ran(pid) != Some(true) {
+            if std::time::Instant::now() > bound {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the linked sleep never ran");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let state = LocalProbe.pid_state(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(
+            state,
+            PidState::Running {
+                exe: Some(link.display().to_string())
+            }
+        );
+    }
+
+    /// This machine's process table lists this process in its own group, and a reaped child's
+    /// group is empty.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn the_live_table_shows_this_process_in_its_own_group() {
+        let me = std::process::id();
+        let own = LocalProbe::own_pgid().expect("this process has a group");
+        let GroupState::Members(members) = LocalProbe::members_of(own) else {
+            panic!("this process's own group reads with it in it");
+        };
+        assert!(members.iter().any(|(pid, _)| *pid == me), "{members:?}");
+        let mut child = aterm_uds::spawnfd::command("/bin/sh")
+            .args(["-c", "exit 0"])
+            .process_group(0)
+            .spawn()
+            .expect("spawn a child in its own group");
+        let group = child.id();
+        child.wait().expect("reap it");
+        assert_eq!(LocalProbe::members_of(group), GroupState::Empty);
     }
 }

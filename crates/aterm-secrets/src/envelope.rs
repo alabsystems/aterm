@@ -6,6 +6,10 @@
 use crate::{Error, b64};
 use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 
+mod digest_cache;
+
+pub(crate) use digest_cache::digest as digest_bytes;
+
 /// The first line.
 pub const MAGIC: &str = "alab-vault/1";
 /// The largest envelope accepted.
@@ -701,7 +705,7 @@ impl Envelope {
 
     /// SHA-256 of [`Envelope::raw`].
     pub fn digest(&self) -> [u8; 32] {
-        aterm_digest::Sha256::digest(&self.raw)
+        digest_bytes(&self.raw)
     }
 
     /// Check the signature over the signed bytes with `signer`.

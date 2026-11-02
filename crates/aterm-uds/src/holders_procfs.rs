@@ -1,29 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Linux's descriptor tables (`<proc>/<pid>/fd`), answering [`super::scan_file_holders`],
-//! [`super::scan_listener_holders`] (with `<proc>/net/unix`) and [`super::open_files`] from
-//! `/proc` in production or a scratch tree in tests.
+//! Linux's process listing and descriptor tables (`<proc>/<pid>/fd`), answering
+//! [`super::listed_pids`], [`super::euid_of`], [`super::scan_file_holders`],
+//! [`super::scan_listener_holders`] and [`super::open_files`] from `/proc` in production or a
+//! scratch tree in tests.
 //!
 //! Two kinds of same-uid process have root-owned tables (`task_dump_owner` in `fs/proc/base.c`):
 //! zombies holding nothing ([`Table::Exited`]), and non-dumpable live processes such as
 //! `ssh-agent` ([`Table::Sealed`]); any other refusal is [`Table::Unreadable`], which a scan
-//! counts outside it once the process runs as another user (`read_of`).
+//! counts clear once the process has exited and outside it once the process runs as another
+//! user (`read_of`).
 
+use std::ffi::OsString;
 use std::io;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+
+use aterm_sysprobe::linux::UnixDiagListener;
 
 use super::HolderScan;
 
 /// The kernel's procfs.
 #[cfg(target_os = "linux")]
 pub(super) const PROC: &str = "/proc";
-
-/// How long a scan may take before a hung mount makes its answer unknown.
-#[cfg(target_os = "linux")]
-pub(super) const SCAN_DEADLINE: Duration = Duration::from_secs(10);
 
 /// What `<proc>/<pid>` says of the process's descriptor table.
 #[derive(Debug)]
@@ -55,10 +55,22 @@ enum ProcessState {
 /// dead task, its thread count in `status`; `None` when either required read is unknown. Both
 /// are read lossily ([`crate::process::read_proc_text`]): their command name is raw bytes.
 fn process_state(dir: &Path) -> Option<ProcessState> {
-    let stat = match crate::process::read_proc_text(&dir.join("stat")) {
-        Ok(stat) => stat,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Some(ProcessState::Reaped),
-        Err(_) => return None,
+    let read = |name: &str| crate::process::read_proc_text(&dir.join(name));
+    state_of(read("stat"), || read("status").ok())
+}
+
+/// [`process_state`]'s judgment of its `stat` read and, for a zombie or dead task only, its
+/// `status`. A process gone by the `stat` read is reaped by the rule every `/proc` reader here
+/// judges a gone one by ([`crate::process::stat_read`]: `ENOENT` or `ESRCH`).
+fn state_of(
+    stat: io::Result<String>,
+    status: impl FnOnce() -> Option<String>,
+) -> Option<ProcessState> {
+    use crate::process::procfs::StatRead;
+    let stat = match crate::process::stat_read(stat) {
+        StatRead::Text(stat) => stat,
+        StatRead::Gone => return Some(ProcessState::Reaped),
+        StatRead::Unreadable => return None,
     };
     let state = stat.rsplit_once(')')?.1.trim_start().chars().next()?;
     match state {
@@ -66,14 +78,14 @@ fn process_state(dir: &Path) -> Option<ProcessState> {
         'R' | 'S' | 'D' | 'T' | 't' | 'W' | 'K' | 'P' | 'I' => return Some(ProcessState::Live),
         _ => return None,
     }
-    let threads = crate::process::read_proc_text(&dir.join("status"))
-        .ok()
-        .and_then(|status| {
-            status
-                .lines()
-                .find_map(|l| l.strip_prefix("Threads:"))
-                .and_then(|n| n.trim().parse::<u32>().ok())
-        });
+    let threads = status().and_then(|status| {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix("Threads:"))
+            .map(str::trim)
+            .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|n| n.parse::<u32>().ok())
+    });
     match threads {
         Some(1) => Some(ProcessState::Zombie),
         Some(n) if n > 1 => Some(ProcessState::LeaderOnly),
@@ -104,21 +116,61 @@ pub(super) fn table(proc: &Path, pid: u32) -> Table {
     }
 }
 
-/// Every pid under `proc` that runs as effective uid `me`: its directory's owner. The kernel
-/// keeps `/proc/<pid>` the effective uid's when the process is non-dumpable and gives root only
-/// the entries inside (`task_dump_owner` spares a `0555` directory, as
-/// `docs/measured/linux-lane-2026-10-23.md` records).
+/// The pids a `/proc` listing's entry names: each positive number in decimal digits alone, any
+/// other name (`self`, `+101`) skipped. An entry that does not read fails the listing, since a
+/// listing cut short proves no absence.
 ///
 /// # Errors
 ///
-/// `proc` could not be listed.
+/// The first entry that did not read.
+pub(super) fn pids_listed(
+    entries: impl IntoIterator<Item = io::Result<OsString>>,
+) -> io::Result<Vec<u32>> {
+    let mut pids = Vec::new();
+    for entry in entries {
+        if let Some(pid) = entry?
+            .to_str()
+            .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|n| n.parse::<u32>().ok())
+            && pid > 0
+        {
+            pids.push(pid);
+        }
+    }
+    Ok(pids)
+}
+
+/// Every pid under `proc` ([`pids_listed`]).
+///
+/// # Errors
+///
+/// `proc` could not be listed, or one of its entries did not read.
+pub(super) fn listed_pids_in(proc: &Path) -> io::Result<Vec<u32>> {
+    pids_listed(std::fs::read_dir(proc)?.map(|e| e.map(|e| e.file_name())))
+}
+
+/// The effective uid `pid` runs as: its directory's owner. The kernel keeps `/proc/<pid>` the
+/// effective uid's when the process is non-dumpable and gives root only the entries inside
+/// (`task_dump_owner` spares a `0555` directory, as `docs/measured/linux-lane-2026-10-23.md`
+/// records).
+///
+/// # Errors
+///
+/// `NotFound` once `pid` is gone; the `stat`'s error otherwise.
+pub(super) fn euid_in(proc: &Path, pid: u32) -> io::Result<u32> {
+    std::fs::metadata(proc.join(pid.to_string())).map(|m| m.uid())
+}
+
+/// Every pid under `proc` that runs as effective uid `me` ([`euid_in`]): a pid gone between the
+/// listing and its `stat` is not `me`'s.
+///
+/// # Errors
+///
+/// `proc` could not be listed whole ([`listed_pids_in`]).
 pub(super) fn uid_pids_in(proc: &Path, me: u32) -> io::Result<Vec<u32>> {
-    Ok(std::fs::read_dir(proc)?
-        .flatten()
-        .filter_map(|entry| {
-            let pid = entry.file_name().to_str()?.parse::<u32>().ok()?;
-            (std::fs::metadata(entry.path()).ok()?.uid() == me).then_some(pid)
-        })
+    Ok(listed_pids_in(proc)?
+        .into_iter()
+        .filter(|pid| euid_in(proc, *pid).ok() == Some(me))
         .collect())
 }
 
@@ -134,21 +186,32 @@ enum Read {
     Unreadable,
 }
 
-/// Whether `<proc>/<pid>` names another effective user than `me` now: its directory's owner,
-/// which the kernel keeps the process's effective uid ([`uid_pids_in`]). `false` once the
-/// directory is gone.
+/// Whether `<proc>/<pid>` names another effective user than `me` now ([`euid_in`]). `false`
+/// once the directory is gone.
 pub(super) fn runs_as_another_user_in(proc: &Path, pid: u32, me: u32) -> bool {
-    std::fs::metadata(proc.join(pid.to_string())).is_ok_and(|m| m.uid() != me)
+    euid_in(proc, pid).is_ok_and(|uid| uid != me)
 }
 
-/// What `read` makes of `pid`'s table, an unknown answer read [`Read::Left`] once `pid` runs as
-/// another effective user than `me` ([`runs_as_another_user_in`]). A scan lists only `me`'s
-/// processes, so a process that execs a set-user-ID program (`sudo`, `su`, `passwd`) between
-/// the listing and its read is outside it, as it would be listed a moment later: the exec makes
-/// its directory and its table root's (`task_dump_owner`, the process now non-dumpable), so its
-/// table is refused and would otherwise leave the whole scan unknown.
+/// What `read` makes of `pid`'s table, an unknown answer read [`Read::Clear`] once `pid` has
+/// exited since (reaped, or a zombie whose every thread has: [`table`]'s [`Table::Exited`]),
+/// and [`Read::Left`] once it runs as another effective user than `me`
+/// ([`runs_as_another_user_in`]). A process that exits while its listed table is read holds
+/// nothing, yet the kernel makes its `fd` directory root's once it has no memory map
+/// (`task_dump_owner`), so each entry read after that fails `EACCES`, not `ENOENT`. A scan lists
+/// only `me`'s processes, so a process that execs a set-user-ID program (`sudo`, `su`,
+/// `passwd`) between the listing and its read is outside it, as it would be listed a moment
+/// later: the exec makes its directory and its table root's (`task_dump_owner`, the process now
+/// non-dumpable), so its table is refused and would otherwise leave the whole scan unknown.
 fn read_of(proc: &Path, pid: u32, me: u32, read: impl FnOnce(Table) -> Read) -> Read {
     match read(table(proc, pid)) {
+        Read::Unreadable
+            if matches!(
+                process_state(&proc.join(pid.to_string())),
+                Some(ProcessState::Reaped | ProcessState::Zombie)
+            ) =>
+        {
+            Read::Clear
+        }
         Read::Unreadable if runs_as_another_user_in(proc, pid, me) => Read::Left,
         read => read,
     }
@@ -259,24 +322,24 @@ fn holds_socket(table: Table, inodes: &[u64]) -> Read {
     }
 }
 
-/// [`super::scan_listener_holders`] over `proc`: the listening sockets `<proc>/net/unix`
-/// lists at a path `names` accepts, and each process `me` owns but `skip` read for a
-/// descriptor on one of them. With no such listener no table is read.
+/// [`super::scan_listener_holders`] over `proc`: the `listeners` (from the kernel's socket dump)
+/// `serves` accepts, and each process `me` owns but `skip` read for a descriptor on one of them.
+/// With no such listener no table is read.
 ///
 /// # Errors
 ///
-/// `<proc>/net/unix` or `proc` cannot be read.
+/// `proc` cannot be listed whole.
 pub(super) fn scan_listener_holders_in(
     proc: &Path,
     me: u32,
-    names: impl Fn(&[u8]) -> bool,
+    listeners: &[UnixDiagListener],
+    serves: impl Fn(&UnixDiagListener) -> bool,
     skip: &[u32],
 ) -> io::Result<HolderScan> {
-    let net_unix = std::fs::read(proc.join("net/unix"))?;
-    let inodes: Vec<u64> = aterm_sysprobe::jobs::linux::listening_unix(&net_unix)
-        .into_iter()
-        .filter(|(_, bound)| names(bound))
-        .map(|(inode, _)| inode)
+    let inodes: Vec<u64> = listeners
+        .iter()
+        .filter(|listener| serves(listener))
+        .map(|listener| listener.inode)
         .collect();
     let mut scan = HolderScan::default();
     for pid in uid_pids_in(proc, me)? {
@@ -324,7 +387,12 @@ pub(super) fn open_files_in(proc: &Path, pid: u32) -> io::Result<Vec<PathBuf>> {
     let mut named: Vec<(u32, PathBuf)> = Vec::new();
     for entry in fds {
         let entry = entry?;
-        let Some(fd) = entry.file_name().to_str().and_then(|n| n.parse().ok()) else {
+        let Some(fd) = entry
+            .file_name()
+            .to_str()
+            .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|n| n.parse().ok())
+        else {
             continue;
         };
         match std::fs::read_link(entry.path()) {
@@ -338,36 +406,8 @@ pub(super) fn open_files_in(proc: &Path, pid: u32) -> io::Result<Vec<PathBuf>> {
     Ok(named.into_iter().map(|(_, path)| path).collect())
 }
 
-/// `read`'s answer if it gives one within `deadline`, read on a thread of its own; else
-/// `TimedOut`. A read that does not answer keeps its thread (no read can be cancelled).
-///
-/// # Errors
-///
-/// `read`'s error, `TimedOut`, or the thread not starting.
-pub(super) fn within<T: Send + 'static>(
-    deadline: Duration,
-    read: impl FnOnce() -> io::Result<T> + Send + 'static,
-) -> io::Result<T> {
-    let (answer, answered) = std::sync::mpsc::sync_channel(1);
-    std::thread::Builder::new()
-        .name("aterm-holder-scan".to_string())
-        .spawn(move || {
-            let _ = answer.send(read());
-        })?;
-    match answered.recv_timeout(deadline) {
-        Ok(read) => read,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!(
-                "the descriptor tables did not answer within {} s (a hung mount)",
-                deadline.as_secs()
-            ),
-        )),
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            Err(io::Error::other("the descriptor scan ended with no answer"))
-        }
-    }
-}
+#[path = "holders_procfs_pty.rs"]
+pub(super) mod pty;
 
 #[cfg(test)]
 mod tests {
@@ -376,9 +416,10 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        Read, Table, holds, open_files_in, read_of, runs_as_another_user_in, scan_file_holders_in,
-        table, uid_pids_in, within,
+        Read, Table, euid_in, holds, open_files_in, pids_listed, read_of, runs_as_another_user_in,
+        scan_file_holders_in, table, uid_pids_in,
     };
+    use crate::holders::within;
 
     /// A directory only root may list, which a sealed or zombie table's `fd` stands in for
     /// (the kernel makes those root's): macOS's `/var/root`, Linux's `/root`.
@@ -495,6 +536,7 @@ mod tests {
         std::fs::remove_file(proc.join("114/status")).unwrap();
         process(&proc, 115, '?', 1, None, &sealed);
         std::fs::create_dir(proc.join("self")).unwrap();
+        std::fs::create_dir(proc.join("+101")).unwrap();
 
         let mut scan = scan_file_holders_in(&proc, me(), &lock, &[109]).expect("scan");
         std::fs::set_permissions(proc.join("106/fd"), std::fs::Permissions::from_mode(0o700))
@@ -525,6 +567,9 @@ mod tests {
     /// set-user-ID exec since the listing, which makes `/proc/<pid>` that user's) reads `Left`,
     /// outside the scan. Negative control: the same refusal scanned as its directory's owner
     /// stays unknown. A table read or sealed keeps its answer, and a process gone runs as no one.
+    /// A listed table whose entry refuses a read once its process exited holds nothing; while
+    /// the process runs, the same refusal stays unknown. NEGATIVE CONTROL: judge the refusal by
+    /// the user alone, and the exited processes' tables read unknown.
     #[test]
     fn a_table_refused_once_its_process_runs_as_another_user_is_outside_the_scan() {
         use std::os::unix::fs::MetadataExt as _;
@@ -541,6 +586,14 @@ mod tests {
             .unwrap();
         process(&proc, 402, 'S', 1, Some(&[(3, &held_s)]), &sealed);
         process(&proc, 403, 'S', 1, None, &sealed);
+        // Listed while it ran, its entry refused since (no symbolic link reads `EINVAL`, as the
+        // kernel's refusal of an exited process's entry reads `EACCES`): a lone zombie and a
+        // process reaped hold nothing, a zombie leader whose other threads run stays unknown.
+        for (pid, state, threads) in [(404, 'Z', 1), (405, 'S', 1), (406, 'Z', 3), (407, 'Z', 1)] {
+            process(&proc, pid, state, threads, Some(&[]), &sealed);
+            std::fs::create_dir(proc.join(pid.to_string()).join("fd/3")).unwrap();
+        }
+        std::fs::remove_file(proc.join("407/stat")).unwrap();
         let (me, other) = (me(), me().wrapping_add(1));
         let read = |pid, scan_as| read_of(&proc, pid, scan_as, |table| holds(table, key));
         let reads = [
@@ -549,11 +602,17 @@ mod tests {
             read(402, other),
             read(403, other),
         ];
+        let exited = [read(404, me), read(405, me), read(406, me), read(407, me)];
         std::fs::set_permissions(proc.join("401/fd"), std::fs::Permissions::from_mode(0o700))
             .unwrap();
         assert_eq!(
             reads,
             [Read::Unreadable, Read::Left, Read::Holds, Read::Sealed]
+        );
+        assert_eq!(
+            exited,
+            [Read::Clear, Read::Unreadable, Read::Unreadable, Read::Clear],
+            "a lone zombie, a live process, a zombie leader whose threads run, a reaped process"
         );
         assert!(!runs_as_another_user_in(&proc, 401, me));
         assert!(runs_as_another_user_in(&proc, 401, other));
@@ -593,25 +652,57 @@ mod tests {
         );
     }
 
-    /// A listener is held by the process whose table names its socket; a stream accepted at its
-    /// path, another listener and a zombie hold nothing, and a sealed table is sealed. A path no
-    /// listener is bound at reads no table. `net/unix` is read as bytes, so a path that is no
-    /// UTF-8 is a row like any other, and a missing `net/unix` is an error.
+    /// A `stat` read that answers `ESRCH`, a process reaped between the open and the read, is a
+    /// reaped process, as a `stat` gone by its open (`ENOENT`) is, and no `status` is read for
+    /// either; any other failed read is unknown. NEGATIVE CONTROL: judge only `ENOENT` gone, and
+    /// the `ESRCH` read is unknown, so a scan counts that process unreadable.
+    #[test]
+    fn a_stat_read_that_finds_the_process_reaped_is_reaped() {
+        use super::{ProcessState, state_of};
+        let unasked = || -> Option<String> { panic!("a reaped process's status was read") };
+        for gone in [
+            std::io::Error::from(std::io::ErrorKind::NotFound),
+            std::io::Error::from_raw_os_error(libc::ESRCH),
+        ] {
+            let why = gone.to_string();
+            assert_eq!(
+                state_of(Err(gone), unasked),
+                Some(ProcessState::Reaped),
+                "{why}"
+            );
+        }
+        assert_eq!(
+            state_of(
+                Err(std::io::Error::from_raw_os_error(libc::EACCES)),
+                unasked
+            ),
+            None,
+            "a refused read"
+        );
+    }
+
+    /// A listener is held by the process whose table names its socket: a stream accepted at the
+    /// listener's path (no listener row) and another listener hold nothing, a zombie holds
+    /// nothing, and a sealed table is sealed. Another socket's name that is no UTF-8 is a row
+    /// like any other, and a path no listener is bound at reads no table. NEGATIVE CONTROL: keep
+    /// every listener whatever its path, and the process holding another listener joins.
     #[test]
     fn a_listener_is_held_by_the_process_whose_table_names_its_socket() {
+        use aterm_sysprobe::linux::UnixDiagListener;
         let sealed = roots_own();
         let tmp = aterm_tempfile::tempdir().unwrap();
         let proc = tmp.path().join("proc");
-        std::fs::create_dir_all(proc.join("net")).unwrap();
-        std::fs::write(
-            proc.join("net/unix"),
-            b"Num       RefCount Protocol Flags    Type St Inode Path\n\
-             0000000000000000: 00000002 00000000 00010000 0001 01 41001 /run/b.sock\n\
-             0000000000000000: 00000003 00000000 00000000 0001 03 41002 /run/b.sock\n\
-             0000000000000000: 00000002 00000000 00010000 0001 01 41004 /run/\xff.sock\n\
-             0000000000000000: 00000002 00000000 00010000 0001 01 41003 /run/other.sock\n",
-        )
-        .unwrap();
+        let listeners: Vec<UnixDiagListener> = [
+            (41001, &b"/run/b.sock"[..]),
+            (41004, b"/run/\xff.sock"),
+            (41003, b"/run/other.sock"),
+        ]
+        .map(|(inode, path)| UnixDiagListener {
+            inode,
+            path: path.to_vec(),
+            file: None,
+        })
+        .to_vec();
         process(
             &proc,
             301,
@@ -624,20 +715,40 @@ mod tests {
         process(&proc, 303, 'S', 1, Some(&[(4, "socket:[41003]")]), &sealed);
         process(&proc, 304, 'Z', 1, None, &sealed);
         process(&proc, 305, 'S', 1, None, &sealed);
-        let at = |path: &'static [u8]| move |bound: &[u8]| bound == path;
-        let scan = super::scan_listener_holders_in(&proc, me(), at(b"/run/b.sock"), &[]).unwrap();
+        let at = |path: &'static [u8]| move |bound: &UnixDiagListener| bound.path == path;
+        let scan =
+            super::scan_listener_holders_in(&proc, me(), &listeners, at(b"/run/b.sock"), &[])
+                .unwrap();
         assert_eq!(scan.holders, [301], "{scan:?}");
         assert_eq!(scan.sealed, [305], "{scan:?}");
         assert!(scan.unreadable.is_empty(), "{scan:?}");
         assert_eq!(scan.scanned, 5);
-        let none = super::scan_listener_holders_in(&proc, me(), at(b"/run/c.sock"), &[]).unwrap();
+        let none =
+            super::scan_listener_holders_in(&proc, me(), &listeners, at(b"/run/c.sock"), &[])
+                .unwrap();
         assert!(
             none.holders.is_empty() && none.sealed.is_empty(),
             "{none:?}"
         );
         assert_eq!(none.scanned, 5);
-        std::fs::remove_file(proc.join("net/unix")).unwrap();
-        assert!(super::scan_listener_holders_in(&proc, me(), at(b"/run/b.sock"), &[]).is_err());
+    }
+
+    /// A listing is the positive numbers its entries name in digits alone, any other name (a
+    /// sign included) skipped, and an entry that does not read refuses the whole listing.
+    /// NEGATIVE CONTROL: skip such an entry, and the listing cut short reads as whole.
+    #[test]
+    fn a_listing_with_an_entry_that_does_not_read_is_refused() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(
+            pids_listed(["10", "self", "20", "-1", "0", "+30"].map(|s| Ok(s.into()))).unwrap(),
+            [10, 20]
+        );
+        let cut = pids_listed([
+            Ok("10".into()),
+            Err(Error::from(ErrorKind::PermissionDenied)),
+            Ok("20".into()),
+        ]);
+        assert!(cut.is_err(), "{cut:?}");
     }
 
     /// Open files are the paths a table's links name in descriptor order without `stat`;
@@ -667,6 +778,7 @@ mod tests {
         let want: Vec<PathBuf> = ["/dev/null", "/w/a (deleted)", "/w/b"]
             .map(PathBuf::from)
             .into();
+        symlink("/w/ignored", proc.join("201/fd/+4")).unwrap();
         assert_eq!(open_files_in(&proc, 201).expect("read"), want);
         let kind = |pid| open_files_in(&proc, pid).map_err(|e| e.kind());
         assert_eq!(kind(202), Err(std::io::ErrorKind::NotFound), "a zombie");
@@ -697,6 +809,7 @@ mod tests {
         let proc = tmp.path().join("proc");
         process(&proc, 301, 'S', 1, Some(&[]), tmp.path());
         std::fs::create_dir(proc.join("self")).unwrap();
+        std::fs::create_dir(proc.join("+101")).unwrap();
         let other = me().wrapping_add(1);
         let status = proc.join("301/status");
         let text = std::fs::read_to_string(&status).unwrap();
@@ -710,6 +823,12 @@ mod tests {
             uid_pids_in(&proc, other).unwrap().is_empty(),
             "a status names no owner"
         );
+        assert_eq!(euid_in(&proc, 301).unwrap(), me());
+        assert_eq!(
+            euid_in(&proc, 999).map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::NotFound),
+            "a pid gone"
+        );
     }
 
     /// A read held past the deadline returns `TimedOut`, and one that finishes returns its
@@ -717,7 +836,7 @@ mod tests {
     #[test]
     fn a_scan_that_does_not_answer_in_time_is_unknown() {
         let (go, wait) = std::sync::mpsc::channel::<()>();
-        let held = within(Duration::from_millis(50), move || {
+        let held = within(Duration::from_millis(50), "a read", "held", move || {
             let _ = wait.recv();
             Ok(7)
         });
@@ -726,11 +845,14 @@ mod tests {
             Err(std::io::ErrorKind::TimedOut)
         );
         drop(go);
-        let answered = within(Duration::from_secs(60), || Ok(7));
+        let answered = within(Duration::from_secs(60), "a read", "held", || Ok(7));
         assert_eq!(answered.expect("answered"), 7);
-        let failed = within(Duration::from_secs(60), || -> std::io::Result<u8> {
-            Err(std::io::Error::other("its own"))
-        });
+        let failed = within(
+            Duration::from_secs(60),
+            "a read",
+            "held",
+            || -> std::io::Result<u8> { Err(std::io::Error::other("its own")) },
+        );
         assert_eq!(failed.expect_err("its error").to_string(), "its own");
     }
 }

@@ -289,13 +289,13 @@ pub(super) fn resumed_witness(run: &Run, tab: &Tab) -> Option<usize> {
 /// One act the loop typed: when, under which rule, and its text (the ledger's, else the journal
 /// line's).
 #[derive(Clone, Copy, Debug)]
-struct Act<'a> {
-    at: i64,
-    rule: &'a str,
-    text: &'a str,
+pub(super) struct Act<'a> {
+    pub(super) at: i64,
+    pub(super) rule: &'a str,
+    pub(super) text: &'a str,
 }
 
-fn acts_after(seen: &Seen, t: i64) -> Vec<Act<'_>> {
+pub(super) fn acts_after(seen: &Seen, t: i64) -> Vec<Act<'_>> {
     seen.all_acts()
         .into_iter()
         .filter(|(at, _)| *at > t)
@@ -312,7 +312,7 @@ fn acts_after(seen: &Seen, t: i64) -> Vec<Act<'_>> {
 
 /// The first wait on an outage journaled after `from` and before `to`: when, and the due it names
 /// ([`wait_due`]).
-fn wait_after(seen: &Seen, from: i64, to: i64) -> Option<(i64, Option<i64>)> {
+pub(super) fn wait_after(seen: &Seen, from: i64, to: i64) -> Option<(i64, Option<i64>)> {
     seen.journal
         .iter()
         .find(|(t, l)| *t > from && *t < to && is_wait(l))
@@ -333,7 +333,7 @@ fn wall_of(seen: &Seen, (prev, waited): (i64, i64), due: Option<i64>, rung: i64)
 }
 
 /// When the first point after `from` and by `to` was read (its `EVENT` journal line).
-fn first_read(seen: &Seen, from: i64, to: i64) -> Option<i64> {
+pub(super) fn first_read(seen: &Seen, from: i64, to: i64) -> Option<i64> {
     seen.journal
         .iter()
         .find(|(t, l)| *t > from && *t <= to && l.starts_with("EVENT "))
@@ -397,7 +397,7 @@ fn wrong_words(text: &str, owed: bool) -> Result<(), String> {
 
 /// How late past its rung a try may come: half the rung, so a try a rung late is never its own,
 /// and a minute at the most.
-fn late_ms(rung: i64) -> i64 {
+pub(super) fn late_ms(rung: i64) -> i64 {
     (rung / 2).min(PERSISTENCE_GRACE_MS)
 }
 
@@ -478,7 +478,12 @@ fn past_wall(seen: &Seen, prev: i64, t: i64, rung: i64) -> String {
 
 /// What may not happen while the outage stood (`met` to `stood_to`), or at all: an escalation in
 /// it, a need, a hold in it, a landing in it under Land or any under Cruise.
-fn stood_faults(seen: &Seen, (met, stood_to): (i64, i64), land: bool, t0: i64) -> Vec<String> {
+pub(super) fn stood_faults(
+    seen: &Seen,
+    (met, stood_to): (i64, i64),
+    land: bool,
+    t0: i64,
+) -> Vec<String> {
     let mut bad = Vec::new();
     if let Some(r) = seen
         .ledger
@@ -766,7 +771,8 @@ pub fn judge(chain: Chain, seen: &Seen, scale: f64, t0: i64) -> Verdict {
 }
 
 /// O1 past its resume `r`, `later` the acts after it but a cut's answer: landed on the resume's
-/// answer ([`landing_quiet`]) with nothing typed between.
+/// answer ([`landing_quiet`]) with nothing typed between but the land check its clean defense gets
+/// at once (§14.17 item 5), whose `LANDED` lands it.
 fn judge_landed(
     seen: &Seen,
     r: &Act<'_>,
@@ -788,7 +794,9 @@ fn judge_landed(
             at(t0, seen.end_ms)
         ));
     };
-    if let Some(a) = later.iter().find(|a| a.at < done.0) {
+    let before: Vec<&Act<'_>> = later.iter().filter(|a| a.at < done.0).collect();
+    let checked = matches!(before[..], [a] if a.rule == turn_end::RULE_LAND_CHECK);
+    if let Some(a) = before.first().filter(|_| !checked) {
         return Verdict::Fail(format!(
             "{said}; NOT LANDED ON THE RESUME'S ANSWER: {} typed at +{} before the landing at +{}",
             a.rule,
@@ -804,7 +812,14 @@ fn judge_landed(
         ));
     }
     let (bad, quiet, window) = landing_quiet(seen, done, false, t0);
-    let said = format!("{said}; landed on its answer: {quiet}");
+    let said = if let Some(c) = before.first() {
+        format!(
+            "{said}; its defense's land check at +{}, landed on its answer: {quiet}",
+            at(t0, c.at)
+        )
+    } else {
+        format!("{said}; landed on its answer: {quiet}")
+    };
     match unread {
         Some(why) if bad.is_empty() => Verdict::Unobserved(format!("{said}: {why}")),
         _ => landed_verdict(bad, said, seen, done.0, window),

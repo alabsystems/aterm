@@ -537,7 +537,8 @@ fn block_count(reply: &str) -> Option<usize> {
     reply
         .lines()
         .next()?
-        .strip_prefix("OK ")?
+        .strip_prefix("OK ")
+        .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))?
         .parse::<usize>()
         .ok()
 }

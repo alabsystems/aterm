@@ -120,7 +120,7 @@ pub const fn cursor_cat_color_key(
             if rem_cells > 0 {
                 let fallback_band = match fallback_band_opt {
                     Some(b) => b,
-                    None => CatColorKey::background_band_with(table, fallback_bg),
+                    None => CatColorKey::background_band_rgb(table, fallback_bg_rgb),
                 };
                 if fallback_band < min_background_band {
                     min_background_band = fallback_band;
@@ -146,10 +146,7 @@ pub const fn cursor_cat_color_key(
                 || background_rgb[1] != last_bg_rgb[1]
                 || background_rgb[2] != last_bg_rgb[2]
             {
-                let band = CatColorKey::background_band_with(
-                    table,
-                    crate::word_decorations::rgb3_to_u32(background_rgb),
-                );
+                let band = CatColorKey::background_band_rgb(table, background_rgb);
                 last_bg_rgb = background_rgb;
                 if band < min_background_band {
                     min_background_band = band;
@@ -184,7 +181,7 @@ pub const fn cursor_cat_color_key(
                 let fallback_band = match fallback_band_opt {
                     Some(b) => b,
                     None => {
-                        let b = CatColorKey::background_band_with(table, fallback_bg);
+                        let b = CatColorKey::background_band_rgb(table, fallback_bg_rgb);
                         fallback_band_opt = Some(b);
                         b
                     }
@@ -1285,7 +1282,7 @@ impl CompanionOwner {
     #[inline]
     pub fn offer_glass(&mut self, glass: impl IntoIterator<Item = PetGlass>) {
         let any_own = self.clear_own_glass_offers();
-        let want_resight = self.resight_frame.map(|f| f.glass);
+        let want_resight = self.resight_frame.as_ref().map(|f| f.glass);
         if want_resight.is_none() && !any_own {
             return;
         }
@@ -1406,7 +1403,7 @@ impl CompanionOwner {
         if any_own {
             let mut si = 0;
             while si < self.own_glass.len() {
-                if let Some(own) = self.own_glass[si]
+                if let Some(own) = &self.own_glass[si]
                     && !self.pet.has_ghost_on_glass(own.key)
                 {
                     self.own_glass[si] = None;

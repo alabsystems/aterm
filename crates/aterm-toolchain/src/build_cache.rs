@@ -82,10 +82,19 @@ pub fn shim_root(home: &Path, path: &std::ffi::OsStr) -> PathBuf {
         .find(|shim| shim.is_file())
         .and_then(|shim| {
             use std::io::Read as _;
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.custom_flags(libc::O_NONBLOCK);
+            }
+            let file = options.open(shim).ok()?;
+            if !file.metadata().is_ok_and(|m| m.is_file()) {
+                return None;
+            }
             let mut head = Vec::new();
-            std::fs::File::open(shim)
-                .and_then(|f| f.take(64 << 10).read_to_end(&mut head))
-                .ok()?;
+            file.take(64 << 10).read_to_end(&mut head).ok()?;
             root_named_by_shim(home, std::str::from_utf8(&head).ok()?)
         })
         .unwrap_or_else(|| cache_root(home))
@@ -140,8 +149,58 @@ pub struct Machine<'a> {
     pub writable: &'a dyn Fn(&Path) -> Option<bool>,
 }
 
-/// Environment variable carrying the build directory to `targo trust` ([`BuildDir::TrustEnv`]).
+/// Environment variable carrying automatic placement across external subcommand dispatch
+/// ([`loses_config`]), which may drop the outer driver's global `--config` words, and to
+/// `targo trust`.
 pub const BUILD_DIR_ENV: &str = "CARGO_BUILD_BUILD_DIR";
+
+/// Whether `args` run an external frontend, which loses the outer driver's global `--config`
+/// words, so that placement must also travel in [`BUILD_DIR_ENV`]. Anything else keeps them,
+/// aliases included (cargo expands one in-process), and must not get the variable: cargo hands it
+/// on to the build scripts it runs, and a nested cargo on the same workspace would inherit the
+/// outer build's directory and wait forever on the lock the outer build holds. A frontend has no
+/// such choice, so a build script that builds its own workspace under one still waits, and an
+/// alias to a frontend places the outer call alone.
+#[must_use]
+pub fn loses_config(args: &[String], tool: Tool) -> bool {
+    if tool == Tool::Tippy {
+        return true;
+    }
+    let mut it = args.iter().map(String::as_str);
+    while let Some(a) = it.next() {
+        match a {
+            "--" => return false,
+            "--config" | "--manifest-path" | "--target-dir" | "-C" | "-Z" | "--color"
+            | "--explain" => {
+                it.next();
+            }
+            _ if a.starts_with(['-', '+']) => {}
+            verb => return matches!(verb, "clippy" | "tippy"),
+        }
+    }
+    false
+}
+
+/// The directory in a literal config value produced by this placement policy. Use only for
+/// an automatically selected value, not to reinterpret the caller's configuration.
+#[must_use]
+pub fn directory_from_config(value: &str) -> Option<&str> {
+    value.strip_prefix("build.build-dir='")?.strip_suffix('\'')
+}
+
+/// The directory in the leading config words [`with_build_dir`] inserted, including past
+/// Cargo's optional `+toolchain`. The caller must have selected automatic placement first.
+#[must_use]
+pub fn directory_from_placed_args(args: &[String]) -> Option<&str> {
+    let at = usize::from(args.first().is_some_and(|arg| arg.starts_with('+')));
+    let [flag, value, ..] = args.get(at..)? else {
+        return None;
+    };
+    if flag != "--config" {
+        return None;
+    }
+    directory_from_config(value)
+}
 
 /// What `cargo run` hands the process it runs about ITSELF (`targo --unverified verify` and `lab`
 /// are `run -q -p …`), which build scripts track (ring's tracks `CARGO_MANIFEST_DIR` and
@@ -554,7 +613,12 @@ fn config_scan(dir: &Path, alias: Option<&str>, m: &Machine<'_>) -> Named {
                     named.build |= line.contains("build-dir");
                     named.target |= line.contains("target-dir");
                     if x.starts_with('[') {
-                        in_alias = x.starts_with("[alias]");
+                        let head = x.split('#').next().unwrap_or(x).trim_end();
+                        in_alias = !head.starts_with("[[")
+                            && head
+                                .strip_prefix('[')
+                                .and_then(|h| h.strip_suffix(']'))
+                                .is_some_and(|h| h.trim() == "alias");
                     } else if let Some(verb) = alias {
                         named.alias_builds |= alias_builds(x, verb, in_alias);
                     }
@@ -649,18 +713,72 @@ pub fn target_build_dir(target: &Path, m: &Machine<'_>) -> Option<String> {
     reason = "Machine::read's shape: a file that cannot be read is a choice, whatever the error"
 )]
 pub fn read_config(path: &Path) -> Result<Option<String>, ()> {
-    match std::fs::metadata(path) {
-        Ok(meta) if meta.is_file() => std::fs::read(path)
-            .map(|b| Some(String::from_utf8_lossy(&b).into_owned()))
-            .map_err(|_| ()),
-        Ok(_) => Ok(None),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(_) => Err(()),
+    use std::io::Read as _;
+    const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
     }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        #[cfg(unix)]
+        Err(e) if e.raw_os_error() == Some(libc::ENXIO) => return Ok(None),
+        Err(_) => return Err(()),
+    };
+    match file.metadata() {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => return Ok(None),
+        Err(_) => return Err(()),
+    }
+    let mut buf = Vec::new();
+    file.take(MAX_CONFIG_BYTES.saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(|_| ())?;
+    if (buf.len() as u64) > MAX_CONFIG_BYTES {
+        return Err(());
+    }
+    Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_an_external_frontend_loses_the_config_words() {
+        let words = |line: &str| {
+            line.split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        for line in [
+            "tippy",
+            "clippy -p demo",
+            "--unverified tippy",
+            "+trust --config build.jobs=1 clippy",
+            "--color always tippy",
+        ] {
+            assert!(loses_config(&words(line), Tool::Cargo), "{line}");
+        }
+        for line in [
+            "",
+            "--unverified",
+            "--unverified build",
+            "--config build.jobs=1 test -q",
+            "+trust --target-dir tippy check",
+            "-- tippy",
+            "fix",
+            "clean",
+            "--unverified verify",
+            "an-alias",
+        ] {
+            assert!(!loses_config(&words(line), Tool::Cargo), "{line}");
+        }
+        assert!(loses_config(&words("-p demo"), Tool::Tippy));
+    }
+
     use super::*;
     use std::collections::BTreeMap;
 
@@ -866,5 +984,31 @@ mod tests {
             )
             .is_some()
         );
+
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("atc-read-config-")
+            .tempdir()
+            .expect("scratch dir");
+        let cfg = dir.path().join("config.toml");
+        std::fs::write(&cfg, "target-dir = 'x'\n").unwrap();
+        assert_eq!(read_config(&cfg), Ok(Some("target-dir = 'x'\n".to_owned())));
+        std::fs::write(&cfg, vec![b'x'; 1024 * 1024 + 1]).unwrap();
+        assert_eq!(
+            read_config(&cfg),
+            Err(()),
+            "oversized config must fail closed"
+        );
+        #[cfg(unix)]
+        {
+            let fifo = dir.path().join("fifo.toml");
+            let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+            // SAFETY: `c_fifo` is a valid NUL-terminated path in our scratch directory.
+            assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+            assert_eq!(
+                read_config(&fifo),
+                Ok(None),
+                "a FIFO config must not hang or count as a regular file"
+            );
+        }
     }
 }

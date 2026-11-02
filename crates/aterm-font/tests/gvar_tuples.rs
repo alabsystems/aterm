@@ -76,6 +76,14 @@ fn variations(tuples: usize, x: &[i8], y: &[i8]) -> Vec<u8> {
 /// A one-axis (`wght` 100..=400..=900) glyf+gvar face of `glyphs`, each a
 /// `(glyf record, variation data)` pair.
 pub(crate) fn face_bytes(glyphs: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+    face_bytes_with(glyphs, &[])
+}
+
+/// [`face_bytes`] with the `extra` tables too.
+pub(crate) fn face_bytes_with(
+    glyphs: &[(Vec<u8>, Vec<u8>)],
+    extra: &[(&[u8; 4], &[u8])],
+) -> Vec<u8> {
     let mut fvar = Vec::new();
     for v in [1u16, 0, 16, 2, 1, 20, 0, 8] {
         fvar.extend(v.to_be_bytes());
@@ -119,15 +127,14 @@ pub(crate) fn face_bytes(glyphs: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
     gvar.extend(u32::try_from(data.len()).expect("small").to_be_bytes());
     gvar.extend(data);
 
-    sfnt(
-        count,
-        &[
-            (b"fvar", &fvar),
-            (b"glyf", &glyf),
-            (b"gvar", &gvar),
-            (b"loca", &loca),
-        ],
-    )
+    let mut tables: Vec<(&[u8; 4], &[u8])> = vec![
+        (b"fvar", &fvar),
+        (b"glyf", &glyf),
+        (b"gvar", &gvar),
+        (b"loca", &loca),
+    ];
+    tables.extend_from_slice(extra);
+    sfnt(count, &tables)
 }
 
 fn rect(x_min: i16, y_min: i16, x_max: i16, y_max: i16) -> Option<Rect> {

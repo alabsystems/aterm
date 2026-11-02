@@ -13,8 +13,10 @@ use serde::Deserialize;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
+mod credentials;
 mod native;
 mod repos;
+pub use credentials::{sync_vault_git_credentials, vault_git_credentials};
 pub use native::InitialRepositoryInputs;
 
 /// Whether the git every clone runs ([`crate::items::github::installed_git`]: the Command Line
@@ -146,6 +148,69 @@ pub fn items(
         }),
         repos::item(user, &config, recorded),
     ])
+}
+
+/// What `sync.clone` reads of the GitHub step an `aterm init` owes ([`crate::init::owed_clone`]):
+/// whether the token it reads is on this Mac, and the step's mark.
+pub(crate) struct TokenRead {
+    /// The token is here: the vault's ([`TOKEN_FILE`]), or the `token_file` init.toml's
+    /// `[github]` names.
+    pub(crate) landed: bool,
+    /// Why a token file that is there cannot be used (not a regular file of the user's, a
+    /// link, readable by others, or too long): what is wrong with it, in plain words.
+    pub(crate) unusable: Option<String>,
+    /// A digest of init.toml, the token and whether git is installed, which moves when any of
+    /// them changes: a clone only a person could finish waits until it does. The token itself is
+    /// not kept.
+    pub(crate) mark: String,
+}
+
+/// [`TokenRead`] for this Mac's one user; `None` where `[github]` turns the step off.
+///
+/// # Errors
+/// The run does not name exactly one user, or init.toml cannot be admitted.
+pub(crate) fn token_read(sys: &dyn System, ctx: &Ctx) -> Result<Option<TokenRead>, String> {
+    let [user] = ctx.users.as_slice() else {
+        return Err("aterm init GitHub requires exactly one local user".into());
+    };
+    let config = Path::new(&user.home).join(".config/aterm/init.toml");
+    let config = sys
+        .read_owned_file(&config, user.uid, INPUT_MAX, false)
+        .unwrap_or_default();
+    let table = profile(sys, user)?.and_then(|profile| profile.github);
+    let path = match asked(table, user)? {
+        Asked::Off => return Ok(None),
+        Asked::Default => Path::new(&user.home).join(TOKEN_FILE),
+        Asked::Scoped(config) | Asked::Profile(config) => config.token_file,
+    };
+    let read = sys.read_owned_file(&path, user.uid, INPUT_MAX, true);
+    let unusable = match &read {
+        Err(why) if why.kind() != io::ErrorKind::NotFound => Some(format!(
+            "the GitHub token at {} is on this Mac but cannot be used ({why}): it must be a \
+             regular file of yours, not a link, that only you can read, of at most {} KiB",
+            path.display(),
+            INPUT_MAX / 1024
+        )),
+        _ => None,
+    };
+    let token = read.ok().map(zeroize::Zeroizing::new);
+    // Whether git is there is part of the mark: a step that stopped without it runs again once
+    // the Command Line Tools bring it.
+    let git = [u8::from(crate::items::github::installed_git(sys).is_some())];
+    let mut digest = aterm_digest::Sha256::new();
+    for part in [
+        config.as_slice(),
+        token.as_ref().map_or(&[][..], |token| token.as_slice()),
+        &git[..],
+    ] {
+        digest.update((part.len() as u64).to_le_bytes());
+        digest.update(part);
+    }
+    Ok(Some(TokenRead {
+        landed: token.is_some(),
+        unusable,
+        mark: aterm_codec::hex::encode_lower(&digest.finalize()),
+    }))
 }
 
 fn profile(sys: &dyn System, user: &User) -> Result<Option<Config>, String> {

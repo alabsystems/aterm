@@ -20,8 +20,9 @@ fn interned_test_shell(
     .as_deref()
 }
 
-/// The pinned bash 5.3 (the `bash-5.3` row, which `verify provision` builds on a Mac), when
-/// this host has one that answers `BASH_VERSINFO` 5.3 or later; else why not.
+/// The pinned bash 5.3 (the `bash-5.3` row, which `verify provision` builds on a Mac and the
+/// Linux guest builds as `/usr/local/bin/bash-5.3`), when this host has one that answers
+/// `BASH_VERSINFO` 5.3 or later; else why not.
 #[cfg(unix)]
 fn bash_5_3() -> Result<&'static str, &'static str> {
     static BASH: std::sync::OnceLock<Result<String, String>> = std::sync::OnceLock::new();
@@ -137,6 +138,11 @@ fn shell_command(shell: &str) -> ShellCommand {
         "ATERM_PROMPT_SEP_COLOR",
         "ATERM_SHELL_NONCE",
         "ATERM_REROUTE_DIR",
+        "ATERM_CLT_SHIM",
+        "BASH_ENV",
+        "ATERM_CLT_BASH_ENV",
+        "ATERM_CLT_BASH_ENV_BEFORE",
+        "ATERM_CLT_BASH_ENV_HOOK",
         "__ATERM_REROUTE_PASSTHROUGH",
         "ATPKG_AGENTS",
         "ATERM_CHILD",
@@ -247,7 +253,9 @@ impl ShellLanes {
     /// Every bash the bash tests run on: the OS's (`$ATERM_TEST_BASH`, else the `bash` row:
     /// macOS's 3.2, a Linux host's own), then the pinned 5.3 ([`bash_5_3`]), for the
     /// `${ ...; }` reads and PS0 hook 3.2 lacks. A missing 5.3 is noted where the tree pins one
-    /// for this host. A bash test gets its bash here and nowhere else, so each runs on both.
+    /// for this host, and anywhere `$ATERM_TEST_BASH_5_3` names one that is no 5.3 (the Linux
+    /// proof names the guest's). A bash test gets its bash here and nowhere else, so each runs
+    /// on both.
     fn bashes(&mut self) -> Vec<&'static str> {
         static OS: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
         let os = interned_test_shell(&OS, "bash").unwrap_or("bash");
@@ -256,11 +264,10 @@ impl ShellLanes {
             Ok(pinned) if pinned != os => bashes.push(pinned),
             Ok(_) => {}
             Err(why) => {
+                let row = aterm_spec::host::tool("bash-5.3");
                 let host = aterm_uds::host::host_platform();
-                let pinned_here = aterm_spec::host::tool("bash-5.3")
-                    .pin
-                    .is_some_and(|pin| pin.pinned_for(&host));
-                if pinned_here {
+                let pinned_here = row.pin.is_some_and(|pin| pin.pinned_for(&host));
+                if pinned_here || std::env::var_os(row.var()).is_some() {
                     self.missing(why.to_owned());
                 }
             }
@@ -2439,6 +2446,55 @@ const ATPKG_HOOK_FIXTURE_REROUTE: &str = "/opt/aterm-si fixture/pkg/reroute";
 #[cfg(unix)]
 const REROUTE_DIR_MARKER: &str = ".atpkg-reroute-dir";
 
+/// Holds [`spare_fifo::HOLD_FD`] for this test process's life from before `main`, when no test has
+/// opened anything: a close-on-exec placeholder (`/dev/null`) at that number, so nothing this
+/// process opens later lands there, std's exec-status pipe included, and a spare shell's spawn
+/// can put its hold's end there in the child ([`LiveShell::spawn_on_pty_holding`]). A descriptor
+/// at that number before `main` was inherited and is owned by nothing here, so it is replaced.
+#[cfg(unix)]
+#[used]
+#[cfg_attr(
+    target_vendor = "apple",
+    unsafe(link_section = "__DATA,__mod_init_func,mod_init_funcs")
+)]
+#[cfg_attr(
+    any(target_os = "linux", target_os = "android"),
+    unsafe(link_section = ".init_array")
+)]
+static HOLD_FD_KEPT_FROM_LOAD: extern "C" fn() = keep_hold_fd;
+
+/// Whether [`HOLD_FD_KEPT_FROM_LOAD`] holds its number.
+#[cfg(unix)]
+static HOLD_FD_KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn keep_hold_fd() {
+    let at = spare_fifo::HOLD_FD;
+    // SAFETY: before `main`, on the one thread there is: `open`, `dup2`, `fcntl` and `close`
+    // over integers and a static C string; `dup2` replaces only an inherited descriptor nothing
+    // in this process owns, and the placeholder is never closed.
+    let kept = unsafe {
+        let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
+        if null < 0 {
+            false
+        } else if null == at {
+            true
+        } else {
+            let placed =
+                libc::dup2(null, at) == at && libc::fcntl(at, libc::F_SETFD, libc::FD_CLOEXEC) == 0;
+            libc::close(null);
+            placed
+        }
+    };
+    HOLD_FD_KEPT.store(kept, std::sync::atomic::Ordering::Release);
+}
+
+/// Whether this process holds [`spare_fifo::HOLD_FD`] ([`HOLD_FD_KEPT_FROM_LOAD`]).
+#[cfg(unix)]
+fn hold_fd_kept() -> bool {
+    HOLD_FD_KEPT.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// One live, interactive shell, driven over pipes or a pty.
 #[cfg(unix)]
 struct LiveShell {
@@ -2461,7 +2517,7 @@ struct ShellJob {
     pid_file: PathBuf,
     root: std::sync::Arc<std::sync::Mutex<Option<aterm_tempfile::TempDir>>>,
     script: Option<OwnedShellPid>,
-    /// The same open FIFO the fixture holds, never a reopened pathname.
+    /// A copy of the hold's host end the fixture holds, never a reopened pathname.
     release: std::fs::File,
 }
 
@@ -2637,7 +2693,18 @@ impl LiveShell {
     /// writes to and reads the master; its stderr reaches the master with its stdout, so
     /// [`Self::stderr`] reads a pipe nothing holds.
     fn spawn_on_pty(label: &str, cmd: &mut Command) -> Self {
-        use std::os::fd::{FromRawFd as _, OwnedFd};
+        Self::spawn_on_pty_holding(label, cmd, None)
+    }
+
+    /// [`Self::spawn_on_pty`], the shell also given `hold` at [`spare_fifo::HOLD_FD`], as a
+    /// spare's host gives it the shell's end of its hold. The end is put in place in the child
+    /// after the strip ([`Self::defaults`]): a `dup2` onto the number, which this process holds
+    /// for its life ([`HOLD_FD_KEPT_FROM_LOAD`]), so the `dup2` replaces only the child's copy of
+    /// that placeholder, never std's exec-status pipe, and a failed exec is still told.
+    /// (`PassDescriptor::pass_at` would need the number free in this process at each spawn,
+    /// which tests running side by side cannot promise.)
+    fn spawn_on_pty_holding(label: &str, cmd: &mut Command, hold: Option<&std::fs::File>) -> Self {
+        use std::os::fd::{AsFd as _, FromRawFd as _, OwnedFd};
         use std::os::unix::process::CommandExt as _;
         let (master, slave) = aterm_pty::open_pty_pair()
             .unwrap_or_else(|error| panic!("{label}: open a pty: {error}"));
@@ -2651,6 +2718,28 @@ impl LiveShell {
             )
         };
         Self::defaults(cmd);
+        if let Some(hold) = hold {
+            assert!(
+                hold_fd_kept(),
+                "{label}: this process does not hold fd {} for spare shells' holds",
+                spare_fifo::HOLD_FD
+            );
+            let pass = aterm_uds::spawnfd::PassAt::new(hold.as_fd(), spare_fifo::HOLD_FD)
+                .unwrap_or_else(|error| panic!("{label}: the hold's end: {error}"));
+            // SAFETY: between fork and exec, after the strip `defaults` added: `PassAt::apply`
+            // alone (`dup2` over two integers) and an `errno` read, no allocation, no lock. `hold`
+            // stays open until the spawn returns (the caller holds it), and the number it lands on
+            // holds only this process's placeholder ([`HOLD_FD_KEPT_FROM_LOAD`]).
+            unsafe {
+                cmd.pre_exec(move || {
+                    if pass.apply() {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::last_os_error())
+                    }
+                });
+            }
+        }
         cmd.stdin(end(&slave))
             .stdout(end(&slave))
             .stderr(end(&slave));
@@ -3309,11 +3398,25 @@ print -rn -- \"[hook=${+builtins[zstat]} ran=${ATERM_TEST_HOOK_RAN:-0}]\"\n";
 /// An interactive fish inside a session.
 #[cfg(unix)]
 fn spawn_live_fish(fish: &str, fx: &LiveFixture, extra: &[(&str, &str)]) -> LiveShell {
+    spawn_live_fish_with(fish, fx, "", extra)
+}
+
+/// [`spawn_live_fish`], its `config.fish` starting with `rc_prelude`.
+#[cfg(unix)]
+fn spawn_live_fish_with(
+    fish: &str,
+    fx: &LiveFixture,
+    rc_prelude: &str,
+    extra: &[(&str, &str)],
+) -> LiveShell {
     let config = fx.home.join("config").join("fish");
     std::fs::create_dir_all(&config).expect("config.fish dir");
     std::fs::write(
         config.join("config.fish"),
-        format!("set -gx PATH \"{}\" $PATH\n", fx.foreign.display()),
+        format!(
+            "{rc_prelude}set -gx PATH \"{}\" $PATH\n",
+            fx.foreign.display()
+        ),
     )
     .expect("config.fish");
     let InjectionEnv { env_add, .. } = prepare_into(ShellType::Fish, &fx.base)

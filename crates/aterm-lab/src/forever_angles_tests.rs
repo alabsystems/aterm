@@ -4,6 +4,7 @@
 //! Tests for `cruise-angles` (v6 §14.5's 5a): its script and its judge, over records shaped as
 //! the loop journals them.
 
+use aterm_agent::supervise::policy::go_ahead::{NEVER_A_NEED, unless_held};
 use aterm_agent::supervise::policy::needs::{defense_line, needs_you};
 use aterm_agent::supervise::policy::turn_end::{
     DONE_CHECK_FIXED_BEFORE, MIN_WORK, done_check_act, done_check_words, open_work, says_done,
@@ -85,8 +86,9 @@ fn text(rule: &J) -> &str {
     rule.get("text").and_then(J::as_str).unwrap_or_default()
 }
 
-/// Each angle's check, bare or with the rules' and the repository's suffixes, gets that angle's
-/// reply, paced long; the first prompt, and any check that asks no angle, the first prompt's.
+/// Each angle's check, bare, with the rules' and the repository's suffixes or as the person's
+/// hour cuts it, gets that angle's reply, paced long; the first prompt, and any check that asks no
+/// angle, the first prompt's.
 /// NEGATIVE CONTROL: v1's one fixed check gets the first prompt's reply, whichever claim it is.
 #[test]
 fn each_angles_check_gets_its_own_reply_and_any_other_the_first_prompts() {
@@ -95,6 +97,7 @@ fn each_angles_check_gets_its_own_reply_and_any_other_the_first_prompts() {
         for check in [
             done_check_words(n),
             done_check_act(n, Some("never push to main"), true),
+            unless_held(&done_check_words(n), true).into_owned(),
         ] {
             let before: Vec<String> = (0..n).map(done_check_words).collect();
             let mut acts: Vec<&str> = before.iter().map(String::as_str).collect();
@@ -149,6 +152,7 @@ fn records(typed: &[String], end: i64) -> Seen {
         ));
         seen.ledger.push(Row {
             ts: T0 + t,
+            box_seq: None,
             rule: RULE_DONE_CHECK.into(),
             decision: "typed".into(),
             command: check.clone(),
@@ -350,5 +354,29 @@ fn another_sessions_work_stands_as_laid_and_each_piece_gone_is_named() {
             assert_eq!(left.len(), 1, "{gone}: {left:?}");
             assert!(left[0].contains(gone), "{gone}: {left:?}");
         }
+    }
+}
+
+/// A check typed within the person's hour, without the go-ahead's sentence
+/// (`go_ahead::unless_held`), asks its angle as the whole check does, with the standing rules
+/// after it too. NEGATIVE CONTROL: another angle's check, cut or whole, does not.
+#[test]
+fn a_check_the_persons_hour_cut_still_asks_its_angle() {
+    for n in 0..DONE_ANGLES.len() {
+        let whole = done_check_words(n);
+        let cut = unless_held(&whole, true);
+        assert!(
+            whole.contains(NEVER_A_NEED) && !cut.contains(NEVER_A_NEED),
+            "{whole}"
+        );
+        assert!(asks(&whole, n) && asks(&cut, n), "{n}");
+        let ruled = format!("{cut} (standing rules: never push to main)");
+        assert!(asks(&ruled, n), "{ruled}");
+        let other = (n + 1) % DONE_ANGLES.len();
+        assert!(
+            !asks(&unless_held(&done_check_words(other), true), n),
+            "{n}"
+        );
+        assert!(!asks(&done_check_words(other), n), "{n}");
     }
 }

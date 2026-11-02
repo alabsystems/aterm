@@ -520,6 +520,7 @@ fn fx_window_in(
                 ("editor", None, Some(uri)) => NativeTabRestore::Editor { uri: uri.clone() },
                 ("system-state", None, None) => NativeTabRestore::SystemState,
                 ("about", None, None) => NativeTabRestore::About,
+                ("mail", None, None) => NativeTabRestore::Mail,
                 other => panic!("a native tab this generator does not spell: {other:?}"),
             };
             if descriptor.joins_mirror(&native_tabs) {
@@ -1141,7 +1142,7 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
     let ceiling = park.carry_ceiling();
     let mut masters = Vec::new();
     let mut slaves = Vec::new();
-    for _ in &desk.sessions {
+    for session in &desk.sessions {
         let (mut master, mut slave) = (0i32, 0i32);
         // SAFETY: valid out-params; openpty fills them on success.
         let rc = unsafe {
@@ -1153,7 +1154,16 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
                 std::ptr::null_mut(),
             )
         };
-        assert_eq!(rc, 0, "openpty");
+        if rc != 0 {
+            let error = std::io::Error::last_os_error();
+            panic!(
+                "openpty: {error}; desk={} session={} completed={}/{}",
+                desk.name,
+                session.record.local_id,
+                masters.len(),
+                desk.sessions.len()
+            );
+        }
         masters.push(master);
         slaves.push(slave);
     }
@@ -4385,6 +4395,17 @@ fn fx_variants_desk() -> FxDesk {
         } if native.restore_tag == "about"
     ));
     tabs.push(about);
+    app.stage_mail_tab(crate::WindowId(0))
+        .expect("the native Mail tab opens");
+    let mail = app.capture_handoff_layout().windows[0]
+        .restored_tabs
+        .pop()
+        .expect("the opened Mail tab is captured");
+    assert!(matches!(
+        &mail.root,
+        RestoredSplitTree::Leaf { view: RestoredView::Native(native) } if native.restore_tag == "mail"
+    ));
+    tabs.push(mail);
     FxDesk {
         name: "variants",
         nonce_seed: 0x0100_0019,

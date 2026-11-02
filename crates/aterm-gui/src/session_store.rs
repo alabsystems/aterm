@@ -196,6 +196,9 @@ pub(crate) fn journal_key_row((pid, id): (u32, u64)) -> String {
 /// Parses a `<pid>:<id>` crash-journal key, rejecting PID `0`.
 pub(crate) fn parse_journal_key(row: &str) -> Option<(u32, u64)> {
     let (pid, id) = row.split_once(':')?;
+    if !pid.bytes().all(|b| b.is_ascii_digit()) || !id.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
     Some((
         pid.parse::<u32>().ok().filter(|pid| *pid != 0)?,
         id.parse::<u64>().ok()?,
@@ -214,13 +217,22 @@ pub(crate) fn render_debt_keys(debt: Option<RenderDebt>) -> (Option<String>, u64
 
 /// Reconstructs a [`RenderDebt`] from its manifest `(row_debt, cut_cols)` fields.
 pub(crate) fn parse_render_debt(row: Option<&str>, cut: u64) -> Option<RenderDebt> {
+    let parse_signed = |s: &str| -> Option<i32> {
+        let s = s.trim();
+        let valid = match s.strip_prefix('-') {
+            Some(rest) => {
+                !rest.is_empty()
+                    && !rest.starts_with('0')
+                    && rest.bytes().all(|b| b.is_ascii_digit())
+            }
+            None => !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()),
+        };
+        valid.then(|| s.parse::<i32>().ok()).flatten()
+    };
     let (shift, pushed) = match row {
         Some(row) => {
             let (shift, pushed) = row.split_once(',')?;
-            (
-                shift.trim().parse::<i32>().ok()?,
-                pushed.trim().parse::<i32>().ok()?,
-            )
+            (parse_signed(shift)?, parse_signed(pushed)?)
         }
         None => (0, 0),
     };
@@ -1199,6 +1211,7 @@ pub(crate) fn new_store() -> Store {
 impl SessionStore {
     /// Registers or replaces a [`SessionHandle`], updating both indices and appending to the roster journal.
     pub(crate) fn register(&mut self, handle: SessionHandle) {
+        handle.ctx.native_policy.registered();
         let first = !self.by_id.contains_key(&handle.sid);
         if first {
             let mut tl = handle
@@ -1934,6 +1947,7 @@ fn handle_ran(
         frame: Default::default(),
         witness: Default::default(),
         fenced_writes: Default::default(),
+        native_policy: Default::default(),
     });
     SessionHandle {
         sid,

@@ -138,10 +138,15 @@ pub fn linear_levels() -> &'static [f64; 256] {
 /// WCAG relative luminance of `0x00RRGGBB`.
 #[must_use]
 pub fn luminance(c: u32) -> f64 {
+    luminance_rgb([(c >> 16) as u8, (c >> 8) as u8, c as u8])
+}
+
+/// [`luminance`] of the channels `[r, g, b]`.
+#[inline]
+#[must_use]
+pub fn luminance_rgb([r, g, b]: [u8; 3]) -> f64 {
     let lin = linear_levels();
-    0.2126 * lin[((c >> 16) & 0xff) as usize]
-        + 0.7152 * lin[((c >> 8) & 0xff) as usize]
-        + 0.0722 * lin[(c & 0xff) as usize]
+    0.2126 * lin[usize::from(r)] + 0.7152 * lin[usize::from(g)] + 0.0722 * lin[usize::from(b)]
 }
 
 /// The WCAG contrast of two luminances.
@@ -155,4 +160,95 @@ pub fn contrast_y(a: f64, b: f64) -> f64 {
 #[must_use]
 pub fn contrast(a: u32, b: u32) -> f64 {
     contrast_y(luminance(a), luminance(b))
+}
+
+/// The judge's solid ink: a glyph's pixels that read at least this share of its extreme's ratio
+/// against its clean ground, so a frame equal to its twin reads close to what the clean glyph
+/// reads (the antialiased rim reads less on any page, and on paper a pixel nine tenths of the way
+/// to the ink in luminance is still only 6:1). The one source of the trail judge's metric:
+/// `aterm-lab trail-contrast` and `trail-census` read their glyphs by it, aterm-render's
+/// `glass_letters_read` reads the glass's letters by it, the letter guard keeps a light's letters
+/// by it, and the glass is solved to it ([`seen_y`]).
+pub const SOLID_SHARE: f64 = 0.85;
+
+/// The widest ring of untouched ground a solid ink pixel's local ground is read from, px
+/// (Chebyshev, 1 then this far out): the trail judge's ring ([`SOLID_SHARE`]'s readers').
+pub const RING_REACH: i64 = 2;
+
+/// A cell whose extreme reads under this ratio against its ground holds no glyph: the trail
+/// judge's blank ([`SOLID_SHARE`]'s readers').
+pub const BLANK_BELOW: f64 = 1.5;
+
+/// How far toward its page, as a share of linear light, the darkest pixel of the thinnest glyph
+/// the window's face lays may lie: the glass is solved for a face that lays it no further, and
+/// draws only where the window's face does (`host::PageFacts::glass`, read off the face's raster
+/// by `aterm_render::GlyphInk::thin_share`, `docs/design/PRISM-GLASS.md` §15.8 amendment 53), so
+/// every letter's solid ink keeps its bar. The judge reads a glyph's solid ink against its own
+/// extreme, so a glyph none of whose pixels reaches the full ink reads under the bar a full ink
+/// keeps. The solve's share was measured by aterm-render's `glass_letters_read` from the frame
+/// (§15.8 amendment 49): SF Mono, macOS's primary, at 24 px (a 12 pt window at scale 2) leaves
+/// its `"` and `%` 0.0044 to 0.0069 short of the full ink by page as the census reads them. The
+/// raster's own share, which the page reads, is 0 there (every printable glyph lays a pixel at
+/// full coverage), at most 0.0036 at 21, 23 and 25 px, 0 from 27 to 48 px, 0.0046 to 0.0074 by
+/// page at 22 px, and over the share at 26 px (0.0090 to 0.0141: its `_` lays no row at the full
+/// ink, 5.09 by the census on a 5.25 bar), at 20 px (0.0108 to 0.0169) and at every size under
+/// (0.063 and more); the bundled JetBrains Mono's is 0 at 24 px and over 0.14 at 12 and 14 px.
+/// A share that covers 26 px's `_` leaves Default Light's glass mud (`light-mud-census`), so the
+/// glass is solved for the faces that keep this share and draws on no other.
+pub const THIN_INK_SHARE: f64 = 0.007;
+
+/// How far the dimmest solid ink of a glyph, its ink of luminance `ink_y` on a page of luminance
+/// `page_y`, lies from the ink toward its ground, as a share of linear light, when its darkest
+/// pixel lies `edge` of the way (`0`: a glyph that lays its full ink): the renderer lays a
+/// glyph's edge as the ink and its ground mixed in linear light, so a pixel that far toward the
+/// page reads [`SOLID_SHARE`] of the darkest pixel's ratio there, the least the judge counts as
+/// solid. `0` when the ink is not the darker.
+#[inline]
+#[must_use]
+pub fn rim_share(ink_y: f64, page_y: f64, edge: f64) -> f64 {
+    if page_y <= ink_y {
+        return 0.0;
+    }
+    ((ink_y + 0.05) * (1.0 / SOLID_SHARE - 1.0) / (page_y - ink_y) + edge / SOLID_SHARE)
+        .clamp(0.0, 1.0)
+}
+
+/// What a glyph whose darkest pixel lies `edge` of the way to the page reads over a ground of
+/// luminance `ground_y`, its ink of luminance `ink_y` set on a page of luminance `page_y`, as the
+/// judge reads it (`aterm-lab trail-census`'s glyph minimum): its dimmest solid ink,
+/// [`rim_share`] of the way to the ground, against the ground.
+#[inline]
+#[must_use]
+pub fn seen_edge_y(ink_y: f64, page_y: f64, ground_y: f64, edge: f64) -> f64 {
+    let rim = ink_y + rim_share(ink_y, page_y, edge) * (ground_y - ink_y);
+    contrast_y(rim, ground_y)
+}
+
+/// What the window's thinnest glyph reads over a ground of luminance `ground_y`, its ink of
+/// luminance `ink_y` set on a page of luminance `page_y`: [`seen_edge_y`] at
+/// [`THIN_INK_SHARE`], the glyph as it is seen. Every bar the glass keeps is read here.
+#[inline]
+#[must_use]
+pub fn seen_y(ink_y: f64, page_y: f64, ground_y: f64) -> f64 {
+    seen_edge_y(ink_y, page_y, ground_y, THIN_INK_SHARE)
+}
+
+/// [`seen_y`] of three colours: the ink `ink` set on `page`, over `ground`.
+#[must_use]
+pub fn seen(ink: u32, page: u32, ground: u32) -> f64 {
+    seen_y(luminance(ink), luminance(page), luminance(ground))
+}
+
+/// The ground luminance at which [`seen_y`] reaches `thr` for an ink of luminance `ink_y` on a
+/// page of luminance `page_y`: a lighter ground reads more, a darker one less (`seen_y` rises
+/// with the ground over the ink). `INFINITY` when no ground reaches it.
+#[inline]
+#[must_use]
+pub fn seen_floor_y(ink_y: f64, page_y: f64, thr: f64) -> f64 {
+    let s = rim_share(ink_y, page_y, THIN_INK_SHARE);
+    let room = 1.0 - thr * s;
+    if room <= 0.0 {
+        return f64::INFINITY;
+    }
+    (thr * (ink_y * (1.0 - s) + 0.05) - 0.05) / room
 }

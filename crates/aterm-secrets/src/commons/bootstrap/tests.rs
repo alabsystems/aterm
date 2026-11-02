@@ -15,6 +15,139 @@ fn fixture() -> (aterm_tempfile::TempDir, Paths) {
     (home, paths)
 }
 
+#[test]
+fn local_denial_observation_finishes_while_bootstrap_holds_device_custody() {
+    use crate::{swarm_roster::SwarmRoster, text::Audience};
+    let home = aterm_tempfile::tempdir().unwrap();
+    let paths = Paths::for_home(home.path());
+    client::create(
+        &paths,
+        home.path().join("team.vault").to_str().unwrap(),
+        None,
+        Some("m1"),
+    )
+    .unwrap();
+    let admin = client::admin_open(&paths).unwrap();
+    let mut doc = admin.doc.clone();
+    let roster = SwarmRoster {
+        members: Vec::new(),
+        deny_labels: Vec::new(),
+        deny_nodes: vec![aterm_codec::hex::encode_lower(&[99; 32])],
+    };
+    doc.set_entry(
+        &Audience::Everyone,
+        crate::swarm_roster::ROSTER_ENTRY,
+        roster.to_toml().as_bytes(),
+    )
+    .unwrap();
+    client::admin_publish(&paths, &admin, &doc).unwrap();
+    let device = Device::open_existing(&paths).unwrap();
+    let request = device.request(NETWORK, [2; 32]).unwrap();
+    let encrypted_before = fsx::read_private(&paths.dir.join("commons/device.age"), MAX_DEVICE)
+        .unwrap()
+        .unwrap();
+    let claim_before = fsx::read_private(&paths.dir.join("commons/device.claim"), CLAIM_LEN)
+        .unwrap()
+        .unwrap();
+    let held = CustodyLock::acquire_commons_custody(&paths, "commons-device.lock", true).unwrap();
+    std::thread::scope(|scope| {
+        let (send, receive) = std::sync::mpsc::channel();
+        let paths = &paths;
+        let worker = scope.spawn(move || {
+            send.send(client::local_recipient_denied_in_roster(paths))
+                .unwrap();
+        });
+        let observed = receive.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+        drop(held);
+        worker.join().unwrap();
+        assert!(!observed.unwrap());
+    });
+    for denied in [
+        request.binding().writer().as_slice(),
+        request.binding().incarnation().as_slice(),
+        request.binding().machine().as_slice(),
+    ] {
+        let mut roster = roster.clone();
+        roster.deny_nodes = vec![aterm_codec::hex::encode_lower(denied)];
+        assert!(
+            Device::denied_in_roster(
+                &paths,
+                client::read_identity(&paths).unwrap().unwrap(),
+                &roster,
+            )
+            .unwrap()
+        );
+    }
+    assert_eq!(
+        fsx::read_private(&paths.dir.join("commons/device.age"), MAX_DEVICE)
+            .unwrap()
+            .unwrap()
+            .as_slice(),
+        encrypted_before.as_slice()
+    );
+    assert_eq!(
+        fsx::read_private(&paths.dir.join("commons/device.claim"), CLAIM_LEN)
+            .unwrap()
+            .unwrap()
+            .as_slice(),
+        claim_before.as_slice()
+    );
+    let identity = || client::read_identity(&paths).unwrap().unwrap();
+    let encrypted_path = paths.dir.join("commons/device.age");
+    let mut corrupt = encrypted_before.as_slice().to_vec();
+    *corrupt.last_mut().unwrap() ^= 1;
+    fsx::write_atomic(&encrypted_path, &corrupt, 0o600).unwrap();
+    assert!(Device::denied_in_roster(&paths, identity(), &roster).is_err());
+    fsx::write_atomic(&encrypted_path, encrypted_before.as_slice(), 0o600).unwrap();
+    let claim_path = paths.dir.join("commons/device.claim");
+    let mut corrupt = claim_before.as_slice().to_vec();
+    *corrupt.last_mut().unwrap() ^= 1;
+    fsx::write_atomic(&claim_path, &corrupt, 0o600).unwrap();
+    assert!(Device::denied_in_roster(&paths, identity(), &roster).is_err());
+    fsx::write_atomic(&claim_path, claim_before.as_slice(), 0o600).unwrap();
+    assert!(
+        Device::denied_in_roster(&paths, Identity::from_secret_bytes([99; 32]), &roster,).is_err()
+    );
+    assert!(!Device::denied_in_roster(&paths, identity(), &roster).unwrap());
+}
+
+#[test]
+fn existing_binding_observation_never_takes_or_repairs_device_custody() {
+    let (_home, paths) = fixture();
+    let device = Device::open(&paths).unwrap().unwrap();
+    let expected = device.request([1; 16], [2; 32]).unwrap().binding().clone();
+    let _held = aterm_uds::private_file::PrivateLock::take(
+        &paths.dir,
+        "commons-device.lock",
+        std::time::Duration::from_secs(60),
+        "fixture custody",
+    )
+    .unwrap();
+    assert_eq!(
+        Device::existing_binding_for_observation(&paths).unwrap(),
+        expected
+    );
+    let claim = paths.dir.join("commons/device.claim");
+    std::fs::remove_file(&claim).unwrap();
+    assert_eq!(
+        Device::existing_binding_for_observation(&paths).unwrap(),
+        expected,
+        "authenticated device bytes still identify a denial without repairing custody"
+    );
+    assert!(!claim.exists(), "a query must not recreate a claim");
+    let matching = device.claim();
+    assert_eq!(
+        Device::existing_binding_before_claim(&paths, || {
+            fsx::write_new(&claim, &matching, 0o600).unwrap();
+        })
+        .unwrap(),
+        expected,
+        "matching claim publication does not change the observed binding"
+    );
+    fsx::write_atomic(&claim, b"invalid claim", 0o600).unwrap();
+    assert!(Device::existing_binding_for_observation(&paths).is_err());
+}
+
 fn switch_source(paths: &Paths, target: &Path) {
     let path = paths.dir.join("source.toml");
     let text = fsx::read_private(&path, 4 << 20).unwrap().unwrap();
@@ -1020,11 +1153,11 @@ fn control_state_is_a_claim_a_pin_or_history_and_never_a_device_key_alone() {
 }
 
 thread_local! {
-    /// Run each time this thread's custody take finds the lock held.
+    /// Run when this thread's local custody or vault admission finds a lock held.
     static HELD: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
         const { std::cell::RefCell::new(None) };
 }
-pub(super) fn custody_held() {
+pub(in crate::commons) fn admission_held() {
     HELD.with(|held| {
         if let Some(held) = held.borrow_mut().as_mut() {
             held();
@@ -1109,6 +1242,119 @@ fn settled_bounded_bootstrap_reads_beside_a_writer_but_pair_admission_requires_t
             .unwrap();
     assert!(writer.is_writer());
     assert_eq!(writer.directory(), observed.journal_dir());
+}
+
+#[test]
+fn established_observation_neither_initializes_nor_repairs_custody() {
+    use std::time::{Duration, Instant};
+    for missing in [
+        "commons/device.age",
+        "commons/device.claim",
+        "commons/default.pin",
+        "commons.claim",
+    ] {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let paths = Paths::for_home(home.path());
+        client::create(
+            &paths,
+            home.path().join("team.vault").to_str().unwrap(),
+            None,
+            Some("m1"),
+        )
+        .unwrap();
+        let (bootstrap, journal) = Bootstrap::required_with_journal_until(
+            &paths,
+            Instant::now() + Duration::from_secs(60),
+        )
+        .unwrap();
+        drop(journal);
+        let (observed, read) = Bootstrap::established_with_journal_until(
+            &paths,
+            Instant::now() + Duration::from_secs(60),
+        )
+        .unwrap();
+        assert!(!read.is_writer());
+        assert_eq!(observed.trust(), bootstrap.trust());
+        assert!(observed.access_in(&read).unwrap().is_some());
+        drop(read);
+        let path = paths.dir.join(missing);
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            Bootstrap::established_with_journal_until(
+                &paths,
+                Instant::now() + Duration::from_secs(60)
+            )
+            .is_err(),
+            "{missing}"
+        );
+        assert!(!path.exists(), "an observation must not recreate {missing}");
+    }
+}
+
+#[test]
+fn established_observation_does_not_narrow_foreign_directory_permissions() {
+    use std::time::{Duration, Instant};
+    let home = aterm_tempfile::tempdir().unwrap();
+    let paths = Paths::for_home(home.path());
+    client::create(
+        &paths,
+        home.path().join("team.vault").to_str().unwrap(),
+        None,
+        Some("m1"),
+    )
+    .unwrap();
+    let commons = paths.dir.join("commons");
+    std::fs::set_permissions(&commons, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        Bootstrap::established_with_journal_until(&paths, Instant::now() + Duration::from_secs(60))
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::metadata(&commons).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+}
+
+#[test]
+fn established_custody_acquisition_never_recreates_a_lock_lost_after_precheck() {
+    use std::time::{Duration, Instant};
+    let home = aterm_tempfile::tempdir().unwrap();
+    let paths = Paths::for_home(home.path());
+    client::create(
+        &paths,
+        home.path().join("team.vault").to_str().unwrap(),
+        None,
+        Some("m1"),
+    )
+    .unwrap();
+    established_files(&paths).unwrap();
+    let held = CustodyLock::observe_until_with(
+        &paths,
+        "commons.lock",
+        Some(Instant::now() + Duration::from_secs(60)),
+        || {},
+    )
+    .unwrap();
+    let busy = CustodyLock::observe_until_with(&paths, "commons.lock", Some(Instant::now()), || {})
+        .err()
+        .unwrap();
+    assert_eq!(busy.kind(), crate::ErrorKind::CustodyBusy);
+    drop(held);
+    std::fs::remove_file(paths.dir.join("commons.lock")).unwrap();
+    assert!(
+        CustodyLock::observe_until_with(&paths, "commons.lock", Some(Instant::now()), || {})
+            .is_err()
+    );
+    assert!(!paths.dir.join("commons.lock").exists());
+    std::fs::set_permissions(&paths.dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        CustodyLock::observe_until_with(&paths, "commons-device.lock", Some(Instant::now()), || {})
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::metadata(&paths.dir).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
 }
 
 #[test]
@@ -1218,75 +1464,100 @@ fn an_established_journal_missing_a_published_witness_takes_the_writer_to_ingest
 
 #[test]
 fn bounded_bootstrap_retries_transient_vault_lock_after_releasing_custody() {
-    use std::{
-        cell::Cell,
-        rc::Rc,
-        sync::Arc,
-        time::{Duration, Instant},
-    };
+    use std::{cell::Cell, rc::Rc, time::Instant};
 
-    let home = aterm_tempfile::tempdir().unwrap();
-    let paths = Paths::for_home(home.path());
-    client::create(
-        &paths,
-        home.path().join("team.vault").to_str().unwrap(),
-        None,
-        Some("m1"),
-    )
-    .unwrap();
-    let initial = Bootstrap::cached(&paths).unwrap().unwrap();
-    {
-        let _held_journal = Journal::open_existing(initial.journal_dir(), initial.trust()).unwrap();
-        assert!(
-            super::writer_here(&paths),
-            "writer_here must read settled custody beside a concurrent journal writer"
-        );
-    }
-    let (file, _) = aterm_uds::private_file::open_private(&paths.dir, "commons.lock").unwrap();
-    aterm_uds::keep_out_of_children(&file).unwrap();
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the test holder is a CustodyLock guard which unlocks before close"
-    )]
-    file.try_lock().unwrap();
-    let mut commons_owner = Some(CustodyLock(file));
-    let vault_file = std::fs::File::open(paths.dir.join(".lock")).unwrap();
-    aterm_uds::keep_out_of_children(&vault_file).unwrap();
-    let vault_file = Arc::new(vault_file);
-    let vf = Arc::clone(&vault_file);
-    let vf_release = Arc::clone(&vault_file);
-    let (tx, rx) = std::sync::mpsc::channel();
-    let waited = Rc::new(Cell::new(0usize));
-    let observed = Rc::clone(&waited);
-    let reopened = std::thread::scope(|scope| {
-        scope.spawn(move || {
-            if rx.recv().is_ok() {
-                std::thread::sleep(Duration::from_millis(15));
-                let _ = vf_release.unlock();
+    for established in [false, true] {
+        for change_source in [false, true] {
+            let home = aterm_tempfile::tempdir().unwrap();
+            let paths = Paths::for_home(home.path());
+            client::create(
+                &paths,
+                home.path().join("team.vault").to_str().unwrap(),
+                None,
+                Some("m1"),
+            )
+            .unwrap();
+            let initial = Bootstrap::cached(&paths).unwrap().unwrap();
+            {
+                let _held_journal =
+                    Journal::open_existing(initial.journal_dir(), initial.trust()).unwrap();
+                assert!(
+                    super::writer_here(&paths),
+                    "writer_here must read settled custody beside a concurrent journal writer"
+                );
             }
-        });
-        aterm_uds::private_file::with_lock_wait_observer(
-            move |_| {
+            let (file, _) =
+                aterm_uds::private_file::open_private(&paths.dir, "commons.lock").unwrap();
+            aterm_uds::keep_out_of_children(&file).unwrap();
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the test holder is a CustodyLock guard which unlocks before close"
+            )]
+            file.try_lock().unwrap();
+            let mut commons_owner = Some(CustodyLock(file));
+            let vault_file = std::fs::File::open(paths.dir.join(".lock")).unwrap();
+            aterm_uds::keep_out_of_children(&vault_file).unwrap();
+            let vault = Rc::new(CustodyLock(vault_file));
+            let vf = Rc::clone(&vault);
+            let waited = Rc::new(Cell::new(0usize));
+            let observed = Rc::clone(&waited);
+            let changed_paths = paths.clone();
+            let target = home.path().join("other.vault");
+            let on_hold = move || {
                 let step = observed.get() + 1;
                 observed.set(step);
+                let vault_file: &std::fs::File = &vf.0;
                 if step == 1 {
-                    // Simulate a vault sync grabbing state.lock right as commons.lock releases.
+                    // The first source observation has completed. A vault writer wins
+                    // immediately before the reader obtains Commons custody.
                     #[expect(
                         clippy::disallowed_methods,
-                        reason = "released by the scoped helper thread after the retry starts"
+                        reason = "the test holder is a CustodyLock guard which unlocks before close"
                     )]
-                    vf.try_lock().unwrap();
+                    vault_file.try_lock().unwrap();
                     drop(commons_owner.take());
-                    let _ = tx.send(());
+                } else {
+                    assert_eq!(step, 2, "one custody race then one vault wait");
+                    let (file, _) =
+                        aterm_uds::private_file::open_private(&changed_paths.dir, "commons.lock")
+                            .unwrap();
+                    aterm_uds::keep_out_of_children(&file).unwrap();
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "the test holder is a CustodyLock guard which unlocks before close"
+                    )]
+                    file.try_lock()
+                        .expect("a vault wait must release Commons custody");
+                    let _released = CustodyLock(file);
+                    vault_file.unlock().unwrap();
+                    if change_source {
+                        switch_source(&changed_paths, &target);
+                    }
                 }
-            },
-            || {
-                Bootstrap::cached_until(&paths, Instant::now() + aterm_spec::wait::MUST_HAPPEN)
-                    .unwrap()
-                    .unwrap()
-            },
-        )
-    });
-    assert_eq!(reopened.trust(), initial.trust());
-    assert_eq!(waited.get(), 1);
+            };
+            HELD.with(|held| *held.borrow_mut() = Some(Box::new(on_hold)));
+            let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+            let reopened = if established {
+                Bootstrap::established_with_journal_until(&paths, deadline)
+                    .map(|(bootstrap, _)| Some(bootstrap))
+            } else {
+                Bootstrap::cached_until(&paths, deadline)
+            };
+            HELD.with(|held| held.borrow_mut().take());
+            assert_eq!(
+                waited.get(),
+                2,
+                "established={established}, result={:?}",
+                reopened.as_ref().err()
+            );
+            if change_source {
+                assert!(
+                    !matches!(reopened, Ok(Some(_))),
+                    "a changed source grants no observation"
+                );
+            } else {
+                assert_eq!(reopened.unwrap().unwrap().trust(), initial.trust());
+            }
+        }
+    }
 }

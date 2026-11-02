@@ -15,7 +15,7 @@ fn signed_p(prop: &str) -> String {
     format!("\x1b]633;P;{prop};id={SPARE_NONCE}\x07")
 }
 
-/// One spare's world: a home, this build's scripts, and a control dir whose `rekey/<sid>` names the shell's re-key file and whose `spare/<sid>` is its FIFO (made by [`Self::fifo`], or never, for a cold shell).
+/// One spare's world: a home, this build's scripts, and a control dir whose `rekey/<sid>` names the shell's re-key file and whose `spare/<sid>` is its mark, the FIFO (made with the hold's two ends by [`Self::hold`], alone by [`Self::make_fifo`], or never, for a cold shell).
 #[cfg(unix)]
 struct SpareRig {
     root: std::sync::Arc<std::sync::Mutex<Option<aterm_tempfile::TempDir>>>,
@@ -23,6 +23,8 @@ struct SpareRig {
     dir: PathBuf,
     rekey: PathBuf,
     fifo: PathBuf,
+    /// The shell's end of the hold [`Self::hold`] opened: the next spawn hands it to the shell at [`spare_fifo::HOLD_FD`], as a spare's host does, and the test keeps no copy.
+    shell_end: std::sync::Mutex<Option<std::fs::File>>,
 }
 
 #[cfg(unix)]
@@ -42,6 +44,7 @@ impl SpareRig {
             home,
             dir,
             root: std::sync::Arc::new(std::sync::Mutex::new(Some(root))),
+            shell_end: std::sync::Mutex::new(None),
         }
     }
 
@@ -53,13 +56,15 @@ impl SpareRig {
         self.home.join(marker).exists()
     }
 
-    fn fifo(&self) -> std::fs::File {
+    /// Make the spare's mark and open the hold's two ends as its host does ([`spare_fifo::hold_ends`]): the host's end is returned for the test to write, and the shell's waits for the next spawn.
+    fn hold(&self) -> std::fs::File {
         self.make_fifo();
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&self.fifo)
-            .expect("hold the FIFO")
+        let ends = spare_fifo::hold_ends(&self.fifo).expect("the hold's ends");
+        *self
+            .shell_end
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ends.shell);
+        ends.host
     }
 
     fn make_fifo(&self) {
@@ -72,35 +77,12 @@ impl SpareRig {
         assert!(made.success(), "mkfifo {}", self.fifo.display());
     }
 
-    fn writer_met_by(&self, sh: &LiveShell) -> std::fs::File {
-        let path = self.fifo.clone();
-        let (met, meeting) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = met.send(std::fs::OpenOptions::new().write(true).open(path));
-        });
-        match meeting.recv_timeout(LiveShell::TIMEOUT) {
-            Ok(writer) => writer.expect("open the FIFO to write"),
-            Err(_) => {
-                use std::os::unix::fs::OpenOptionsExt as _;
-                let _ = std::fs::OpenOptions::new()
-                    .read(true)
-                    .custom_flags(libc::O_NONBLOCK)
-                    .open(&self.fifo);
-                panic!(
-                    "{}: the hold never opened its FIFO\n{}",
-                    sh.label,
-                    sh.transcript()
-                );
-            }
-        }
-    }
-
     fn spawn(&self, shell: ShellType, program: &str) -> LiveShell {
         self.spawn_from(shell, program, &self.dir)
     }
 
     fn spawn_with_job(&self, shell: ShellType, program: &str, host: &std::fs::File) -> LiveShell {
-        let release = host.try_clone().expect("duplicate the rig's own FIFO");
+        let release = host.try_clone().expect("a copy of the hold's host end");
         let mut sh = self.spawn(shell, program);
         sh.job = Some(ShellJob {
             pid_file: self.home.join("job"),
@@ -192,7 +174,14 @@ impl SpareRig {
             ShellType::Fish => "fish",
             _ => "bash",
         };
-        LiveShell::spawn_on_pty(label, &mut cmd).holding(hermetic.into_home())
+        let hold = self
+            .shell_end
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let sh = LiveShell::spawn_on_pty_holding(label, &mut cmd, hold.as_ref());
+        drop(hold);
+        sh.holding(hermetic.into_home())
     }
 
     fn fish_rc(&self, name: &str, body: &str) {
@@ -255,19 +244,6 @@ fn spare_zsh() -> &'static str {
     live_pty_zsh()
 }
 
-/// `${BASH_VERSINFO[0]}` of `bash`: the spare hold's SIGWINCH negative control holds only where a signal fails the hold's FIFO open (bash 3.2).
-#[cfg(unix)]
-fn bash_major_version(bash: &str) -> u32 {
-    let out = shell_command(bash)
-        .args(["-c", "echo ${BASH_VERSINFO[0]}"])
-        .output()
-        .unwrap_or_else(|e| panic!("{bash} -c: {e}"));
-    let text = String::from_utf8_lossy(&out.stdout);
-    text.trim()
-        .parse()
-        .unwrap_or_else(|_| panic!("{bash}: BASH_VERSINFO[0] read {text:?}"))
-}
-
 /// The shells under test with the startup file whose run each reports: zsh, then every bash ([`ShellLanes::bashes`]).
 #[cfg(unix)]
 fn spare_shells(shells: &mut ShellLanes) -> Vec<(ShellType, &'static str, &'static str)> {
@@ -303,7 +279,7 @@ fn a_spare_runs_no_startup_file_until_asked_and_signs_one_start_record() {
 
         let rig = SpareRig::new();
         rig.rc(rc, &rc_body);
-        let mut host = rig.fifo();
+        let mut host = rig.hold();
         let mut sh = rig.spawn(shell, program);
         let parked = sh.wait_for_after(&signed_p("AtermSpare=parked"), 0);
         assert!(!rig.ran("rc.ran"), "{program}: parked, no startup file ran");
@@ -320,7 +296,7 @@ fn a_spare_runs_no_startup_file_until_asked_and_signs_one_start_record() {
 
         let rig = SpareRig::new();
         rig.rc(rc, &rc_body);
-        let mut host = rig.fifo();
+        let mut host = rig.hold();
         let mut sh = rig.spawn(shell, program);
         let parked = sh.wait_for_after(&signed_p("AtermSpare=parked"), 0);
         tell(&mut host, "run");
@@ -364,7 +340,7 @@ fn a_parked_shell_told_a_folder_reads_as_a_cold_shell_started_there() {
         let reading = |release: Option<&str>, env: &[(&str, &Path)]| -> String {
             let rig = SpareRig::new();
             rig.rc(rc, ": rc ran\n");
-            let mut host = release.map(|_| rig.fifo());
+            let mut host = release.map(|_| rig.hold());
             let start = if release.is_some() {
                 &elsewhere
             } else {
@@ -434,7 +410,7 @@ fn a_warm_zsh_first_prompt_reads_as_a_cold_one() {
         let rig = SpareRig::new();
         rig.rc(".zshrc", &rc);
         std::fs::write(rig.home.join("f"), "before").unwrap();
-        let mut host = rig.fifo();
+        let mut host = rig.hold();
         let mut sh = rig.spawn(ShellType::Zsh, zsh);
         let parked = sh.wait_for_after(&signed_p("AtermSpare=parked"), 0);
         tell(&mut host, "run");
@@ -475,7 +451,7 @@ fn a_warm_zsh_first_prompt_reads_as_a_cold_one() {
             ".zshrc",
             "sched +600 :\nsleep 600 &\necho $! >$HOME/job\nPERIOD=600\nperiodic() { :; }\n",
         );
-        let mut host = rig.fifo();
+        let mut host = rig.hold();
         let mut sh = rig.spawn_with_job(ShellType::Zsh, zsh, &host);
         let parked = sh.wait_for_after(&signed_p("AtermSpare=parked"), 0);
         tell(&mut host, "run");
@@ -519,7 +495,7 @@ fn assert_job_cleanup(sh: LiveShell, unwinding: bool) {
 #[cfg(unix)]
 fn zsh_history_reading(rig: &SpareRig, warm: bool, append_during_hold: &str) -> String {
     let zsh = spare_zsh();
-    let mut host = warm.then(|| rig.fifo());
+    let mut host = warm.then(|| rig.hold());
     let mut sh = rig.spawn(ShellType::Zsh, zsh);
     if let Some(host) = host.as_mut() {
         let parked = sh.wait_for_after(&signed_p("AtermSpare=parked"), 0);
@@ -655,7 +631,7 @@ fn a_warm_zsh_reads_its_history_again_only_when_the_file_moved() {
         );
         let hist = rig.home.join("hist");
         std::fs::write(&hist, "echo AAAA\n").expect("seed history");
-        let mut host = rig.fifo();
+        let mut host = rig.hold();
         let mut sh = rig.spawn(ShellType::Zsh, zsh);
         let parked = sh.wait_for_after(&signed_p("AtermSpare=parked"), 0);
         tell(&mut host, "run");
@@ -703,7 +679,7 @@ fn bash_history_reading(
     warm: bool,
     append_during_hold: &str,
 ) -> String {
-    let mut host = warm.then(|| rig.fifo());
+    let mut host = warm.then(|| rig.hold());
     let mut sh = rig.spawn(ShellType::Bash, bash);
     if let Some(host) = host.as_mut() {
         let parked = sh.wait_for_after(&signed_p("AtermSpare=parked"), 0);
@@ -821,7 +797,7 @@ fn a_warm_bash_holds_and_leaves_the_history_a_cold_one_does() {
     }
 }
 
-/// S5: both holds ride out a resize. Ten SIGWINCHes (what each TIOCSWINSZ on the master sends the foreground group) at the parked hold and at the warm hold release neither; `go` releases each. Negative control: bash's warm hold with its loop cut and no writer held is released by the signals, as the design's probe found (bash 3.2's `read < fifo` fails when a signal interrupts the open, and the shell runs on; bash 5 restarts the open).
+/// S5: both holds ride out a resize. Ten SIGWINCHes (what each TIOCSWINSZ on the master sends the foreground group) at the parked hold and at the warm hold release neither; `go` releases each. A hold reads its descriptor, and no signal fails such a read on the shells this rig runs: bash 3.2's warm hold with its loop cut and a writer held was not released by 15 s of SIGWINCH, one every 20 ms (a read of the FIFO's path failed when a signal interrupted its open). No control here can show the loop's retries, then: they are for a read a signal fails on a shell this rig does not run.
 #[cfg(unix)]
 #[test]
 fn a_spare_hold_survives_sigwinch_and_only_go_releases_it() {
@@ -836,7 +812,7 @@ fn a_spare_hold_survives_sigwinch_and_only_go_releases_it() {
             },
             ": > \"$HOME/rc.ran\"\n",
         );
-        let mut host = rig.fifo();
+        let mut host = rig.hold();
         let mut sh = rig.spawn(shell, program);
         let parked = sh.wait_for_after(&signed_p("AtermSpare=parked"), 0);
         let pid = sh.shell_pid();
@@ -865,61 +841,12 @@ fn a_spare_hold_survives_sigwinch_and_only_go_releases_it() {
         sh.wait_for_after("HELD42", a);
         sh.finish();
     }
-
-    let bash_3_2 = aterm_spec::host::tool("bash-3.2");
-    let bash = aterm_spec::host::test_shell(bash_3_2.name)
-        .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_else(|| aterm_spec::host::could_not_run(bash_3_2.refusal()));
-    let major = bash_major_version(&bash);
-    if major >= 5 {
-        aterm_spec::host::could_not_run(format!(
-            "{bash} is bash {major}, which restarts the interrupted open, so the negative \
-             control has no cut hold to show; {}",
-            bash_3_2.refusal()
-        ));
-    }
-    let root = aterm_tempfile::tempdir().expect("tempdir");
-    let cut = folder_with_edits(
-        root.path(),
-        "00000000000000ab",
-        &[(
-            "bash",
-            scripts::BASH,
-            &[(
-                "        else\n            __aterm_n=$((__aterm_n + 1))\n            { [[ $__aterm_n -lt 50 ]] && [[ -p $__aterm_spare_fifo ]]; } || exit 0\n        fi\n    done 2>/dev/null\n",
-                "        fi\n        break\n    done 2>/dev/null\n",
-            )],
-        )],
-    );
-    let rig = SpareRig::new();
-    rig.rc(".bashrc", "PS1='P> '\n");
-    rig.make_fifo();
-    let mut sh = rig.spawn_from(ShellType::Bash, &bash, &cut);
-    let parked = sh.wait_for_after(&signed_p("AtermSpare=parked"), 0);
-    let mut host = rig.writer_met_by(&sh);
-    tell(&mut host, "run");
-    drop(host);
-    let spare = sh.wait_for_after(&signed_p("AtermStart=spare"), parked);
-    let pid = sh.shell_pid();
-    let mut released = false;
-    let started = std::time::Instant::now();
-    while !released {
-        signal("WINCH", pid);
-        released = sh.output()[spare..].contains("\x1b]133;A");
-        assert!(
-            started.elapsed() < LiveShell::TIMEOUT,
-            "the cut hold was never released by SIGWINCH\n{}",
-            sh.transcript()
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    sh.kill_now();
 }
 
-/// S6: a spare discarded at either hold writes no history (its HISTFILE is byte for byte what it was, a line another tab appended during the hold included), for shells that would write at a hang-up: a zsh with no append option rewrites its file from its list, and a bash whose rc saved a line appends it. A shell whose FIFO is gone ends itself.
+/// S6: a spare discarded at either hold writes no history (its HISTFILE is byte for byte what it was, a line another tab appended during the hold included), for shells that would write at a hang-up: a zsh with no append option rewrites its file from its list, and a bash whose rc saved a line appends it. A shell whose host closes its end of the hold ends itself with no prompt drawn: at the parked hold, and at the warm hold though its startup files left a job (zsh's `CHECK_JOBS` refuses a plain `exit` then and draws its prompt). The job, a `cat` of the tty, ends once its shell is gone and the tty with it.
 #[cfg(unix)]
 #[test]
-fn a_discarded_spare_writes_no_history_and_ends_without_its_fifo() {
+fn a_discarded_spare_writes_no_history_and_a_shell_whose_host_closes_its_end_ends_itself() {
     let mut shells = ShellLanes::default();
     for (shell, program, _) in spare_shells(&mut shells) {
         let (rc_name, rc) = match shell {
@@ -936,7 +863,7 @@ fn a_discarded_spare_writes_no_history_and_ends_without_its_fifo() {
             let rig = SpareRig::new();
             rig.rc(rc_name, rc);
             std::fs::write(rig.home.join("hist"), "echo kept\n").unwrap();
-            let mut host = rig.fifo();
+            let mut host = rig.hold();
             let mut sh = rig.spawn(shell, program);
             let parked = sh.wait_for_after(&signed_p("AtermSpare=parked"), 0);
             if at_warm {
@@ -961,15 +888,552 @@ fn a_discarded_spare_writes_no_history_and_ends_without_its_fifo() {
                 if at_warm { "warm" } else { "parked" }
             );
         }
+        for at_warm in [false, true] {
+            let rig = SpareRig::new();
+            if at_warm {
+                rig.rc(
+                    rc_name,
+                    &format!("{rc}cat </dev/tty &\necho $! > \"$HOME/job\"\n"),
+                );
+            } else {
+                rig.rc(rc_name, rc);
+            }
+            let mut host = rig.hold();
+            let mut sh = rig.spawn(shell, program);
+            let parked = sh.wait_for_after(&signed_p("AtermSpare=parked"), 0);
+            let job = at_warm.then(|| {
+                tell(&mut host, "run");
+                sh.wait_for_after(&signed_p("AtermStart=spare"), parked);
+                let pid: i32 = std::fs::read_to_string(rig.home.join("job"))
+                    .expect("the rc's job")
+                    .trim()
+                    .parse()
+                    .expect("a pid");
+                (
+                    pid,
+                    aterm_uds::process::read_identity(pid)
+                        .expect("the job's identity")
+                        .birth,
+                )
+            });
+            drop(host);
+            sh.wait_exit();
+            assert!(
+                !all_it_wrote(&sh).contains("\x1b]133;A"),
+                "{program}: a shell whose host closed its end ended at its {} hold\n{}",
+                if at_warm { "warm" } else { "parked" },
+                sh.transcript()
+            );
+            if let Some((pid, birth)) = job {
+                aterm_spec::wait::until_within(
+                    aterm_spec::wait::MUST_HAPPEN,
+                    "the job ends once its shell is gone",
+                    || {
+                        aterm_uds::process::read_identity(pid)
+                            .is_none_or(|now| now.birth != birth)
+                            .then_some(())
+                    },
+                );
+            }
+        }
+    }
+}
+
+/// The spare holds as main ran them at `daaf70dd42`, each reading the FIFO's path: the parked hold the wrappers open with, then each shell's warm hold. A hold whose host died before its open waits in that open for ever.
+#[cfg(unix)]
+const PATH_READ_PARKED_HOLD: &str = include_str!("fixtures/spare-hold-daaf70dd42.sh");
+#[cfg(unix)]
+const PATH_READ_WARM_HOLDS: [(&str, &str); 3] = [
+    ("zsh", include_str!("fixtures/spare-hold-daaf70dd42.zsh")),
+    ("bash", include_str!("fixtures/spare-hold-daaf70dd42.bash")),
+    ("fish", include_str!("fixtures/spare-hold-daaf70dd42.fish")),
+];
+
+/// `script`'s warm hold, `__aterm_spare_hold`, from its first line through the line that closes it (`ext` names the shell).
+#[cfg(unix)]
+fn warm_hold_of<'s>(script: &'s str, ext: &str) -> &'s str {
+    let (head, tail) = if ext == "fish" {
+        ("\nfunction __aterm_spare_hold\n", "\nend\n")
+    } else {
+        ("\n__aterm_spare_hold() {\n", "\n}\n")
+    };
+    let from = script.find(head).expect("the warm hold") + 1;
+    let to = from + script[from..].find(tail).expect("the warm hold's end") + tail.len();
+    &script[from..to]
+}
+
+/// This build's script set with the holds that read the FIFO's path ([`PATH_READ_PARKED_HOLD`], [`PATH_READ_WARM_HOLDS`]) in place of its own: in each script, and in the three wrappers the parked hold opens.
+#[cfg(unix)]
+fn folder_with_path_read_holds(root: &Path) -> PathBuf {
+    let parked: &[(&str, &str)] = &[(spare_parked_hold!(), PATH_READ_PARKED_HOLD)];
+    let warm = |ext: &str, script: &'static str| -> [(&'static str, &'static str); 1] {
+        let old = PATH_READ_WARM_HOLDS
+            .iter()
+            .find(|(of, _)| *of == ext)
+            .expect("a warm hold of this shell's")
+            .1;
+        [(warm_hold_of(script, ext), old)]
+    };
+    let (zsh, bash, fish) = (
+        warm("zsh", scripts::ZSH),
+        warm("bash", scripts::BASH),
+        warm("fish", scripts::FISH),
+    );
+    folder_with_edits(
+        root,
+        "daaf70dd42000000",
+        &[
+            ("zsh", scripts::ZSH, &zsh),
+            ("bash", scripts::BASH, &bash),
+            ("fish", scripts::FISH, &fish),
+            ("zdotdir/.zshenv", ZSH_WRAPPER, parked),
+            ("bash/rcfile", BASH_WRAPPER, parked),
+            ("bash/bashrc", BASH_LOADER, parked),
+        ],
+    )
+}
+
+/// A FIFO at `path`, for a test's gate.
+#[cfg(unix)]
+fn gate_at(path: &Path) {
+    use std::os::unix::ffi::OsStrExt as _;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("a path");
+    // SAFETY: `c` is a NUL-terminated path that lives across the call.
+    assert_eq!(
+        unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+        0,
+        "mkfifo {}",
+        path.display()
+    );
+}
+
+/// Open the gate FIFO at `gate` and write it a line, which the rc waiting to read it takes and goes on. The gate is opened read-write, which never waits for a reader, and its own reader keeps the line in the FIFO, so it waits there for the rc's read whenever that comes: a signal can tear down the rc's open or read as this one writes, and the rc then opens the gate again. The caller holds the returned end until the shell is gone, so that open finds a writer still there.
+#[cfg(unix)]
+#[must_use]
+fn open_gate(gate: &Path) -> std::fs::File {
+    use std::io::Write as _;
+    let mut end = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(gate)
+        .expect("open the gate");
+    end.write_all(b"open\n").expect("write the gate");
+    end
+}
+
+/// The line a test writes its gate waits for a reader that opens after it: a reader the gate never met, and one that opened and went away before the write, as an rc's open a signal tore down does.
+#[cfg(unix)]
+#[test]
+fn a_gates_line_waits_for_the_reader_that_opens_after_it() {
+    use std::io::BufRead as _;
+    let dir = aterm_tempfile::tempdir().expect("tempdir");
+    for torn_down in [false, true] {
+        let gate = dir.path().join(format!("gate-{torn_down}"));
+        gate_at(&gate);
+        if torn_down {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            drop(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&gate)
+                    .expect("a reader that goes away"),
+            );
+        }
+        let held = open_gate(&gate);
+        let mut line = String::new();
+        std::io::BufReader::new(std::fs::File::open(&gate).expect("the rc's open"))
+            .read_line(&mut line)
+            .expect("the rc's read");
+        assert_eq!(
+            line, "open\n",
+            "torn down {torn_down}: the rc reads the gate's line"
+        );
+        drop(held);
+    }
+}
+
+/// A spare's host as these tests run one: `/bin/sleep`'s stand-in holding `host`, the hold's host end, on its stdin. The test lets its own copy go (`host` is moved in), so the stand-in is the end's only holder, and killing it closes that end as a SIGKILLed aterm's death does.
+#[cfg(unix)]
+fn host_stand_in(host: std::fs::File) -> aterm_uds::spawnfd::Child {
+    aterm_uds::spawnfd::command(aterm_uds::deadline::stand_in(Path::new("/bin/sleep")))
+        .arg("600")
+        .stdin(aterm_uds::spawnfd::Stdio::from(host))
+        .stdout(aterm_uds::spawnfd::Stdio::null())
+        .stderr(aterm_uds::spawnfd::Stdio::null())
+        .spawn()
+        .expect("the host's stand-in")
+}
+
+/// SIGKILL the host's stand-in by its own handle, and reap it.
+#[cfg(unix)]
+fn kill_host(host: &mut aterm_uds::spawnfd::Child) {
+    host.kill().expect("SIGKILL the host's stand-in");
+    host.wait().expect("reap the host's stand-in");
+}
+
+/// The startup file each shell runs in [`a_spare_whose_host_is_sigkilled_exits`]: deaf to SIGHUP (the hangup a closed master sends), it marks that it ran, then, when `gated`, waits until it reads a line from its gate. It opens the gate again after a failed read: fish's own SIGHUP handler interrupts the gate's open, which fish 3 does not retry.
+#[cfg(unix)]
+fn hup_deaf_rc(rig: &SpareRig, shell: ShellType, gated: bool) {
+    match shell {
+        ShellType::Fish => rig.fish_rc(
+            "config.fish",
+            &format!(
+                "trap \"\" HUP\ntouch $HOME/rc.ran\n{}",
+                if gated {
+                    "while not read -l gate_line <$HOME/gate; end\n"
+                } else {
+                    ""
+                }
+            ),
+        ),
+        _ => rig.rc(
+            if shell == ShellType::Zsh {
+                ".zshrc"
+            } else {
+                ".bashrc"
+            },
+            &format!(
+                "trap '' HUP\n: > \"$HOME/rc.ran\"\n{}PS1='P> '\n",
+                if gated {
+                    "until IFS= read -r gate_line < \"$HOME/gate\"; do :; done\n"
+                } else {
+                    ""
+                }
+            ),
+        ),
+    }
+}
+
+/// Wait until the rc marked that it ran, within the hang detector.
+#[cfg(unix)]
+fn rc_started(rig: &SpareRig, sh: &mut LiveShell) {
+    let started = std::time::Instant::now();
+    while !rig.ran("rc.ran") {
+        if let Ok(Some(status)) = sh.child.try_wait() {
+            panic!(
+                "{}: exited ({status}) before its rc ran\n{}",
+                sh.label,
+                sh.transcript()
+            );
+        }
+        assert!(
+            started.elapsed() < LiveShell::TIMEOUT,
+            "{}: its rc never ran\n{}",
+            sh.label,
+            sh.transcript()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Everything an exited shell wrote: what its pty's master yields until the read that says no process holds the slave, within the hang detector.
+#[cfg(unix)]
+fn all_it_wrote(sh: &LiveShell) -> String {
+    let started = std::time::Instant::now();
+    while !sh.stdout.ended.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(
+            started.elapsed() < LiveShell::TIMEOUT,
+            "{}: its pty never read to the end\n{}",
+            sh.label,
+            sh.transcript()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    sh.output()
+}
+
+/// When a spare's host is SIGKILLed.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostKilled {
+    /// Before the shell starts, nothing told: zsh and bash meet it at the parked hold, before any startup file; fish, which has no parked hold, at its first prompt.
+    BeforeTheFirstHold,
+    /// While the startup files run after `run`, the shell then hung up as a closed master hangs it up (the rc ignores it).
+    DuringTheRcFiles,
+    /// While the startup files run, the master held as the keeper holds an adopted shell's, so no hangup comes.
+    DuringAWarmingAdoption,
+}
+
+/// One spare whose host is SIGKILLed at `moment`: it exits, within the hang detector, with no prompt drawn.
+#[cfg(unix)]
+fn a_spare_whose_host_was_killed(shell: ShellType, program: &str, moment: HostKilled) {
+    let rig = SpareRig::new();
+    let gated = moment != HostKilled::BeforeTheFirstHold;
+    let gate = rig.home.join("gate");
+    if gated {
+        gate_at(&gate);
+    }
+    hup_deaf_rc(&rig, shell, gated);
+    let mut host = rig.hold();
+    if gated && shell != ShellType::Fish {
+        tell(&mut host, "run");
+    }
+    let mut stand_in = host_stand_in(host);
+    if !gated {
+        kill_host(&mut stand_in);
+    }
+    let mut sh = rig.spawn(shell, program);
+    if gated {
+        rc_started(&rig, &mut sh);
+        kill_host(&mut stand_in);
+        if moment == HostKilled::DuringTheRcFiles {
+            signal("HUP", sh.shell_pid());
+        }
+    }
+    let gate = gated.then(|| open_gate(&gate));
+    sh.wait_exit_status(&format!(
+        "{moment:?}: the spare outlived its SIGKILLed host"
+    ));
+    drop(gate);
+    let out = all_it_wrote(&sh);
+    let at_parked = shell != ShellType::Fish && !gated;
+    assert!(
+        !out.contains("\x1b]133;A")
+            && if at_parked {
+                !rig.ran("rc.ran") && out.contains(&signed_p("AtermSpare=parked"))
+            } else {
+                rig.ran("rc.ran") && out.contains(&signed_p("AtermStart=spare"))
+            },
+        "{program} {moment:?}: it exits at its {} hold with no prompt drawn{}\n{}",
+        if at_parked { "parked" } else { "warm" },
+        if at_parked {
+            ", no startup file run"
+        } else {
+            ", its startup files run"
+        },
+        sh.transcript()
+    );
+}
+
+/// The negative control, at a Warming adoption: a spare whose holds read the FIFO's path ([`folder_with_path_read_holds`]), its host the FIFO held read-write and no end handed over, as before. 5 s after its host's SIGKILL it is still there, its identity unchanged and nothing written past its spare record: blocked in its hold's open. It is then ended by that identity ([`aterm_uds::process::end_proven`]) and reaped.
+#[cfg(unix)]
+fn a_path_read_hold_outlives_its_killed_host(shell: ShellType, program: &str, folder: &Path) {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let rig = SpareRig::new();
+    let gate = rig.home.join("gate");
+    gate_at(&gate);
+    hup_deaf_rc(&rig, shell, true);
+    rig.make_fifo();
+    let mut host = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(&rig.fifo)
+        .expect("the FIFO read-write, as the host held it");
+    if shell != ShellType::Fish {
+        tell(&mut host, "run");
+    }
+    let mut stand_in = host_stand_in(host);
+    let mut sh = rig.spawn_from(shell, program, folder);
+    let pid = i32::try_from(sh.shell_pid()).expect("a pid");
+    let identity = aterm_uds::process::read_identity(pid).expect("the shell's identity");
+    rc_started(&rig, &mut sh);
+    kill_host(&mut stand_in);
+    let _gate = open_gate(&gate);
+    let spare = sh.wait_for_after(&signed_p("AtermStart=spare"), 0);
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    let alive = matches!(sh.child.try_wait(), Ok(None));
+    let same = aterm_uds::process::read_identity(pid) == Some(identity);
+    let past = sh.output()[spare..].to_owned();
+    assert!(
+        alive && same && past.is_empty(),
+        "{program}: a path-read hold still waits 5 s after its host's SIGKILL (alive {alive}, \
+         same identity {same}, written past its spare record {past:?})\n{}",
+        sh.transcript()
+    );
+    let ended = aterm_uds::process::end_proven(
+        identity,
+        std::time::Duration::from_millis(500),
+        &mut aterm_uds::process::EndControlLive,
+        |_| true,
+    )
+    .unwrap_or_else(|refused| panic!("{program}: end the path-read hold: {refused:?}"));
+    assert!(ended.termed, "{program}: ended by its identity: {ended:?}");
+    sh.wait_exit_status("the path-read hold outlived its end");
+}
+
+/// A spare whose host is SIGKILLed exits by itself: before its first hold, during its startup files (hung up, which the rc ignores), and during a Warming adoption (the master held, so no hangup), for zsh, every bash ([`ShellLanes::bashes`]) and fish. Each hold reads the end its host handed it, which reads end-of-file once the host is gone. Negative control, per shell at the Warming adoption: the holds that read the FIFO's path are still blocked 5 s on ([`a_path_read_hold_outlives_its_killed_host`]). The shells run side by side, so their 5 s overlap.
+#[cfg(unix)]
+#[test]
+fn a_spare_whose_host_is_sigkilled_exits() {
+    let mut shells = ShellLanes::default();
+    let mut lanes = vec![(ShellType::Zsh, spare_zsh())];
+    lanes.extend(
+        shells
+            .bashes()
+            .into_iter()
+            .map(|bash| (ShellType::Bash, bash)),
+    );
+    lanes.extend(shells.fish().map(|fish| (ShellType::Fish, fish)));
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let folder = folder_with_path_read_holds(root.path());
+    std::thread::scope(|scope| {
+        for &(shell, program) in &lanes {
+            let folder = &folder;
+            scope.spawn(move || {
+                for moment in [
+                    HostKilled::BeforeTheFirstHold,
+                    HostKilled::DuringTheRcFiles,
+                    HostKilled::DuringAWarmingAdoption,
+                ] {
+                    a_spare_whose_host_was_killed(shell, program, moment);
+                }
+                a_path_read_hold_outlives_its_killed_host(shell, program, folder);
+            });
+        }
+    });
+}
+
+/// zsh and bash close the hold's descriptor at their release, so nothing the shell starts from then on holds the end: a command run after a parked `go`, a parked `go <folder>` or a warm `go` finds no fd 10, and neither does a startup file run after a parked release. A warm spare's startup files run before its release, and the same probe finds fd 10 there, which shows the probe sees the end while it is open. fish cannot close a descriptor, so a fish tab keeps fd 10, a read end whose writers close at its first prompt; it is not asserted. Negative control: a release's close cut, fd 10 shows.
+#[cfg(unix)]
+#[test]
+fn a_spare_closes_its_hold_descriptor_at_release() {
+    const PROBE: &str = "/bin/test -e /dev/fd/10; echo \"FD=$?|E$((40+2))\"";
+    const RC: &str = "/bin/test -e /dev/fd/10; echo \"$?\" > \"$HOME/rc-fd\"\nPS1='P> '\n";
+    let scratch = aterm_tempfile::tempdir().expect("tempdir");
+    let there = std::fs::canonicalize(scratch.path()).expect("canonical scratch");
+    let mut shells = ShellLanes::default();
+    for (shell, program, rc) in spare_shells(&mut shells) {
+        for release in ["go", "go <folder>", "warm go"] {
+            let rig = SpareRig::new();
+            rig.rc(rc, RC);
+            let mut host = rig.hold();
+            let mut sh = rig.spawn(shell, program);
+            let parked = sh.wait_for_after(&signed_p("AtermSpare=parked"), 0);
+            let from = match release {
+                "go" => {
+                    tell(&mut host, "go");
+                    parked
+                }
+                "go <folder>" => {
+                    tell(&mut host, &format!("go {}", there.display()));
+                    parked
+                }
+                _ => {
+                    tell(&mut host, "run");
+                    let spare = sh.wait_for_after(&signed_p("AtermStart=spare"), parked);
+                    tell(&mut host, "go");
+                    spare
+                }
+            };
+            let a = sh.wait_for_after("\x1b]133;A", from);
+            let prompt = sh.wait_for_after("\x1b]133;B", a);
+            sh.send(PROBE);
+            let end = sh.wait_for_after("|E42", prompt);
+            assert_eq!(
+                sh.value_before("FD=", end),
+                "1|E42",
+                "{program}, {release}: a command run after the release finds no fd 10\n{}",
+                sh.transcript()
+            );
+            let (rc_fd, ran) = if release == "warm go" {
+                ("0\n", "before the release finds fd 10")
+            } else {
+                ("1\n", "after the release finds no fd 10")
+            };
+            assert_eq!(
+                std::fs::read_to_string(rig.home.join("rc-fd")).expect("the rc's reading"),
+                rc_fd,
+                "{program}, {release}: a startup file run {ran}"
+            );
+            sh.finish();
+        }
+    }
+}
+
+/// A spare with no end of its hold at fd 10 signs no hold, so no host takes it for one waiting there. zsh and bash, the mark made and no end handed: the parked hold exits before it says it is parked and before any startup file. zsh and bash whose startup files close fd 10 after `run`: the warm hold has nothing to read, so the shell signs `cold`, never `spare`, draws its first prompt and runs what is typed, as a tab that adopted it while it warmed needs. fish cannot close a descriptor, and with none handed fish puts one of its own at the first number from 10 up, so its hold always reads the end its host handed it; it is not run here.
+#[cfg(unix)]
+#[test]
+fn a_spare_without_its_hold_descriptor_signs_no_hold() {
+    let mut shells = ShellLanes::default();
+    for (shell, program, rc) in spare_shells(&mut shells) {
         let rig = SpareRig::new();
-        rig.rc(rc_name, rc);
+        rig.rc(rc, ": > \"$HOME/rc.ran\"\n");
         rig.make_fifo();
         let mut sh = rig.spawn(shell, program);
-        sh.wait_for_after(&signed_p("AtermSpare=parked"), 0);
-        let host = rig.writer_met_by(&sh);
-        std::fs::remove_file(&rig.fifo).unwrap();
-        drop(host);
-        sh.wait_exit();
+        sh.wait_exit_status("the parked hold with no end at fd 10 did not exit");
+        let out = all_it_wrote(&sh);
+        assert!(
+            !out.contains("AtermSpare=") && !out.contains("\x1b]133;A") && !rig.ran("rc.ran"),
+            "{program}: with no end at fd 10 the parked hold exits unsigned, no startup file run\n{}",
+            sh.transcript()
+        );
+
+        let rig = SpareRig::new();
+        let close = if shell == ShellType::Zsh {
+            "n=10\nexec {n}<&-\n"
+        } else {
+            "exec 10<&-\n"
+        };
+        rig.rc(rc, &format!("{close}PS1='P> '\n"));
+        let mut host = rig.hold();
+        let mut sh = rig.spawn(shell, program);
+        let parked = sh.wait_for_after(&signed_p("AtermSpare=parked"), 0);
+        tell(&mut host, "run");
+        let cold = sh.wait_for_after(&signed_p("AtermStart=cold"), parked);
+        let prompt = sh.wait_for_after("\x1b]133;A", cold);
+        sh.send("echo COLD$((40+2))");
+        sh.wait_for_after("COLD42", prompt);
+        assert!(
+            !sh.output().contains("AtermStart=spare"),
+            "{program}: a warm spare whose startup files closed fd 10 signs no warm hold\n{}",
+            sh.transcript()
+        );
+        sh.finish();
+    }
+}
+
+/// Release the FIFO of `sh`, a `program` waiting at its `at` hold, as a sweep leaves it: unlink it, write `end` through the hold's host end, then close that end. Nothing after `held` signs a start or draws a prompt: the line releases no hold, and the shell exits at the end-of-file after it.
+#[cfg(unix)]
+fn exits_on_end_at_its_hold(
+    rig: &SpareRig,
+    mut host: std::fs::File,
+    mut sh: LiveShell,
+    held: usize,
+    program: &str,
+    at: &str,
+) {
+    std::fs::remove_file(&rig.fifo).expect("unlink the FIFO");
+    tell(&mut host, "end");
+    drop(host);
+    sh.wait_exit();
+    let after = stdout_between(&sh, held, usize::MAX);
+    assert!(
+        !after.contains("AtermStart=") && !after.contains("\x1b]133;A"),
+        "{program}: `end` released the {at} hold\n{}",
+        sh.transcript()
+    );
+}
+
+/// S9: a spare whose FIFO is released while it waits at either hold reads `end` and exits, as a
+/// sweep leaves it: the line releases neither the parked hold nor the warm one, and the end-of-file
+/// after it ends the shell. zsh and every bash.
+#[cfg(unix)]
+#[test]
+fn a_spare_told_end_once_its_fifo_is_gone_exits_from_either_hold() {
+    let mut shells = ShellLanes::default();
+    for (shell, program, _) in spare_shells(&mut shells) {
+        for at_warm in [false, true] {
+            let rig = SpareRig::new();
+            rig.rc(
+                if shell == ShellType::Zsh {
+                    ".zshrc"
+                } else {
+                    ".bashrc"
+                },
+                "PS1='P> '\n",
+            );
+            let mut host = rig.hold();
+            let mut sh = rig.spawn(shell, program);
+            let mut held = sh.wait_for_after(&signed_p("AtermSpare=parked"), 0);
+            if at_warm {
+                tell(&mut host, "run");
+                held = sh.wait_for_after(&signed_p("AtermStart=spare"), held);
+            }
+            let at = if at_warm { "warm" } else { "parked" };
+            exits_on_end_at_its_hold(&rig, host, sh, held, program, at);
+        }
     }
 }
 
@@ -995,7 +1459,7 @@ fn a_warm_spare_carries_seconds_on_from_its_rc_run() {
         };
         let rig = SpareRig::new();
         rig.rc(rc_name, rc);
-        let mut host = rig.fifo();
+        let mut host = rig.hold();
         let mut sh = rig.spawn(shell, program);
         let parked = sh.wait_for_after(&signed_p("AtermSpare=parked"), 0);
         tell(&mut host, "run");
@@ -1098,7 +1562,7 @@ fn a_warm_fish_runs_its_startup_files_at_once_and_holds_its_first_prompt() {
 
     let rig = SpareRig::new();
     rig.fish_rc("config.fish", rc_body);
-    let mut host = rig.fifo();
+    let mut host = rig.hold();
     let mut sh = rig.spawn(ShellType::Fish, fish);
     let spare = sh.wait_for_after(&signed_p("AtermStart=spare"), 0);
     assert!(rig.ran("rc.ran"), "fish: a spare's config ran at once");
@@ -1120,6 +1584,20 @@ fn a_warm_fish_runs_its_startup_files_at_once_and_holds_its_first_prompt() {
     sh.finish();
 }
 
+/// S9, fish: a warm fish whose FIFO is released while it holds reads `end` and exits, as zsh and
+/// bash do ([`exits_on_end_at_its_hold`]). An `exit` in a prompt event ends only the handler, so
+/// what ends this fish is the hold's `exec`.
+#[cfg(unix)]
+#[test]
+fn a_warm_fish_told_end_once_its_fifo_is_gone_exits_from_its_hold() {
+    let fish = spare_fish();
+    let rig = SpareRig::new();
+    let host = rig.hold();
+    let mut sh = rig.spawn(ShellType::Fish, fish);
+    let held = sh.wait_for_after(&signed_p("AtermStart=spare"), 0);
+    exits_on_end_at_its_hold(&rig, host, sh, held, fish, "warm");
+}
+
 /// One fish's first prompt as the test reads it: the `$status` its prompt function was handed, the start record's flags, and what a prompt-event handler defined ahead of aterm's (a conf.d snippet sourced first) read when it last ran. Warm: held, `state` rewritten, then released.
 #[cfg(unix)]
 fn fish_first_prompt(fish: &str, warm: bool) -> (String, String, String) {
@@ -1133,7 +1611,7 @@ fn fish_first_prompt(fish: &str, warm: bool) -> (String, String, String) {
         "function __ahead --on-event fish_prompt; cat $HOME/state >$HOME/seen; end\n",
     );
     rig.rc("state", if warm { "before\n" } else { "after\n" });
-    let mut host = warm.then(|| rig.fifo());
+    let mut host = warm.then(|| rig.hold());
     let mut sh = rig.spawn(ShellType::Fish, fish);
     let start = sh.wait_for_after(
         &signed_p(&format!(
@@ -1182,7 +1660,7 @@ fn a_warm_fish_first_prompt_reads_as_a_cold_one() {
     for unwinding in [false, true] {
         let rig = SpareRig::new();
         rig.fish_rc("config.fish", "sleep 600 &\necho $last_pid >$HOME/job\n");
-        let host = rig.fifo();
+        let host = rig.hold();
         let mut sh = rig.spawn_with_job(ShellType::Fish, fish, &host);
         sh.wait_for_after(&signed_p("AtermStart=spare"), 0);
         assert!(
@@ -1366,7 +1844,7 @@ fn fish_history_reading(
         )
         .expect("append");
     };
-    let mut host = warm.then(|| rig.fifo());
+    let mut host = warm.then(|| rig.hold());
     if appended && !warm {
         append(1_700_000_003);
     }

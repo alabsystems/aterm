@@ -93,7 +93,10 @@ pub(crate) fn parse_stamp(stamp: &str) -> Option<(u64, [u8; 32], u64)> {
     let (pairs, _) = digest.as_bytes().as_chunks::<2>();
     for (byte, pair) in sha.iter_mut().zip(pairs) {
         let pair = std::str::from_utf8(pair).ok()?;
-        if pair.bytes().any(|b| b.is_ascii_uppercase()) {
+        if !pair
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
             return None;
         }
         *byte = u8::from_str_radix(pair, 16).ok()?;
@@ -622,7 +625,7 @@ impl HistoryExporter {
 
     #[cfg(test)]
     pub(crate) fn await_caught_up(&mut self, wait: Duration) -> bool {
-        self.drain_while(std::time::Instant::now() + wait, |export| !export.caught_up);
+        self.drain_while(deadline_after(wait), |export| !export.caught_up);
         self.caught_up || self.done
     }
 
@@ -633,7 +636,7 @@ impl HistoryExporter {
 
     #[cfg(test)]
     pub(crate) fn await_passed(&mut self, wait: Duration) -> bool {
-        self.drain_while(std::time::Instant::now() + wait, |export| !export.passed);
+        self.drain_while(deadline_after(wait), |export| !export.passed);
         self.passed || self.done
     }
 
@@ -641,7 +644,7 @@ impl HistoryExporter {
     pub(crate) fn halt(&mut self, wait: Duration) -> bool {
         self.cancel.store(true, Ordering::Release);
         self.worker.unpark();
-        self.drain_until(std::time::Instant::now() + wait);
+        self.drain_until(deadline_after(wait));
         self.done
     }
 
@@ -673,7 +676,7 @@ impl HistoryExporter {
 
     #[cfg(test)]
     pub(crate) fn pause(&mut self, wait: Duration) -> bool {
-        let deadline = std::time::Instant::now() + wait;
+        let deadline = deadline_after(wait);
         self.ask_pause(wait);
         self.drain_while(deadline, |export| export.paused != export.pause_generation);
         self.done || self.paused == self.pause_generation
@@ -690,13 +693,13 @@ impl HistoryExporter {
 
     #[cfg(any(target_os = "macos", test))]
     pub(crate) fn finish(self, wait: Duration) -> ExportResults {
-        self.finish_by(std::time::Instant::now() + wait)
+        self.finish_by(deadline_after(wait))
     }
 
     fn finish_deferred(mut self, wait: Duration, held_wait: Duration) -> ExportResults {
-        let deadline = std::time::Instant::now() + wait;
+        let deadline = deadline_after(wait);
         self.drain_while(deadline, |export| !export.caught_up);
-        let held_deadline = deadline.min(std::time::Instant::now() + held_wait);
+        let held_deadline = deadline.min(deadline_after(held_wait));
         self.finish_by(held_deadline)
     }
 
@@ -710,6 +713,12 @@ impl HistoryExporter {
         results.unfinished = !handed_over;
         results
     }
+}
+
+fn deadline_after(wait: Duration) -> std::time::Instant {
+    let now = std::time::Instant::now();
+    now.checked_add(wait)
+        .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365))
 }
 
 impl Drop for HistoryExporter {

@@ -5,6 +5,7 @@
 # paper arm: a translucent page (background_opacity 0.8).
 
 foreach-scheme light {
+  scale 2
   grid 24 100
   style rainbow kitty
   hz 60

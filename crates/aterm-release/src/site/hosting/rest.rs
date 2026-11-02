@@ -417,7 +417,9 @@ impl Client {
         let split = stdout.iter().rposition(|b| *b == b'\n');
         let status = split
             .and_then(|at| std::str::from_utf8(&stdout[at + 1..]).ok())
-            .and_then(|code| code.trim().parse::<u16>().ok())
+            .map(str::trim)
+            .filter(|code| !code.is_empty() && code.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|code| code.parse::<u16>().ok())
             .filter(|code| (100..600).contains(code))
             .ok_or_else(|| {
                 Unanswered::Lost(format!("curl said no HTTP status for {}", origin(url)))

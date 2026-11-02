@@ -501,10 +501,16 @@ impl Connection {
         loop {
             limit.timeout()?;
             if let Some(end) = self.rbuf.windows(2).position(|w| w == b"\r\n") {
+                if end > auth::MAX_LINE {
+                    self.broken = true;
+                    return Err(Error::Auth("server handshake line too long".into()));
+                }
                 let line = self.rbuf.drain(..end.saturating_add(2)).take(end).collect();
                 return Ok(line);
             }
-            if self.rbuf.len() > auth::MAX_LINE {
+            let max_buffered =
+                auth::MAX_LINE.saturating_add(usize::from(self.rbuf.last() == Some(&b'\r')));
+            if self.rbuf.len() > max_buffered {
                 self.broken = true;
                 return Err(Error::Auth("server handshake line too long".into()));
             }

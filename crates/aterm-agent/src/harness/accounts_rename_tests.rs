@@ -16,7 +16,7 @@ pub(crate) fn seed_reference(state: &mut State, logins: &mut Logins, label: &str
             logins.labels.insert(
                 label.into(),
                 Binding {
-                    dir: (kind == 2).then(|| "/private/retained-login".into()),
+                    dir: (kind == 2).then(|| at!("/private/retained-login").into()),
                     renewed_at: Some(NOW - 1),
                     renewal_generation: 11,
                     subscription: Some("max".into()),

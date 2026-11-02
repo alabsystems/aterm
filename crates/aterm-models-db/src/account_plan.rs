@@ -44,6 +44,7 @@ pub fn account_plan_model() -> Model {
                 scenario = 13; complete = 1; proposal = 1; configuration = if Buggy == 14 {0} else {1};
             }
             action Cycle when (scenario == 0) {scenario = 14; complete = if Buggy == 15 {1} else {0};}
+            action Causal when (scenario == 0) {scenario = 15; complete = if Buggy == 16 {1} else {0};}
             invariant LocalReview: scenario == 0 || scenario > 8 || complete == 1;
             invariant NoEffects: effects == 0;
             invariant LabelInert: 2 > scenario || scenario > 2 || configuration == 0;

@@ -463,7 +463,7 @@ fn varied(t: i64) -> f64 {
 }
 
 /// The owner's ask, "I want to see a shifting to the left animation" (2026-10-24), read outward
-/// from now since the now-left design (§3.4), where he looks: the default window, Folded at about
+/// from now since the now-left design (§3.4), where they look: the default window, Folded at about
 /// 600 pt and focused. Each reading a second on slides the strip's fine band right by the time it
 /// opened, a whole 1 s box (3 device px at 1x, 6 at 2x; the owner's blocks of 2026-10-26), as
 /// every Folded width's band moves at least two pixels, in whole-pixel moves under half a box,
@@ -1184,6 +1184,8 @@ fn a_live_frame_patches_only_what_moved_to_the_whole_rasters_bytes() {
             fp: 1,
             geom: 1,
             raster_fingerprint_once: std::sync::OnceLock::new(),
+            serial: 0,
+            delta: None,
             scrim: None,
         };
         let (want, _, _) = whole(&after);
@@ -1323,6 +1325,8 @@ fn a_needle_frame_patches_only_the_dial_to_the_whole_rasters_bytes() {
             fp: 1,
             geom: 1,
             raster_fingerprint_once: std::sync::OnceLock::new(),
+            serial: 0,
+            delta: None,
             scrim: None,
         };
         assert!(
@@ -1349,13 +1353,14 @@ fn a_needle_frame_patches_only_the_dial_to_the_whole_rasters_bytes() {
 /// header and the whole raster), and with the lens open the fold of the patched card and the
 /// lens's (`App::fold_stats_deck`). At 700, 1100 and 2238 device px wide at 2×, both forms, the
 /// owner's busy scene and the worst case. It times; it asserts nothing about time. Run it
-/// optimized and alone:
-/// `targo --unverified test -p aterm-gui --profile opt-test --lib -- --ignored deck_frame_cost
-/// --nocapture --test-threads 1` (`ATERM_DECK_COST=<file>` also writes the table as TSV).
+/// optimized and alone for measurements, with `ATERM_DECK_COST=<file>`:
+/// `targo --unverified test -p aterm-gui --profile opt-test --lib -- deck_frame_cost
+/// --nocapture --test-threads 1`. Ordinary tests exercise four live frames per case;
+/// the explicit measurement writes a TSV using 400 samples per case.
 #[test]
-#[ignore = "measures CPU for the designs' budget rows: run it optimized and alone"]
 fn deck_frame_cost() {
-    const RUNS: usize = 400;
+    let output = std::env::var_os("ATERM_DECK_COST");
+    let runs = if output.is_some() { 400 } else { 4 };
     crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
     let pct = |v: &mut Vec<f64>, q: f64| {
         v.sort_by(f64::total_cmp);
@@ -1390,6 +1395,8 @@ fn deck_frame_cost() {
                     fp: 1,
                     geom: 1,
                     raster_fingerprint_once: std::sync::OnceLock::new(),
+                    serial: 0,
+                    delta: None,
                     scrim: None,
                 };
                 let px_per_deg = out.needle_px_per_deg;
@@ -1444,6 +1451,8 @@ fn deck_frame_cost() {
                         fp: 2,
                         geom: 2,
                         raster_fingerprint_once: std::sync::OnceLock::new(),
+                        serial: 0,
+                        delta: None,
                         scrim: None,
                     }
                 });
@@ -1466,8 +1475,8 @@ fn deck_frame_cost() {
                     input.live = was;
                     let (prims, _, _) = deck_paint_kept(&g, &input, &mut still);
                     card.rgba = whole(&prims).0;
-                    let (mut times, mut share) = (Vec::with_capacity(RUNS), 0.0);
-                    for i in 1..=RUNS {
+                    let (mut times, mut share) = (Vec::with_capacity(runs), 0.0);
+                    for i in 1..=runs {
                         let now = live(i);
                         input.live = now;
                         let t = std::time::Instant::now();
@@ -1492,7 +1501,7 @@ fn deck_frame_cost() {
                         g.w,
                         pct(&mut times, 0.5),
                         pct(&mut times, 0.95),
-                        share / RUNS as f64
+                        share / runs as f64
                     )
                 };
                 let mut rows = Vec::new();
@@ -1524,9 +1533,9 @@ fn deck_frame_cost() {
                     tsv.push_str(&row);
                 }
                 // A new reading: its words and header read again and the card rastered whole.
-                let mut times = Vec::with_capacity(RUNS / 4);
+                let mut times = Vec::with_capacity(runs / 4);
                 input.live = DeckLive::STILL;
-                for _ in 0..RUNS / 4 {
+                for _ in 0..runs / 4 {
                     let t = std::time::Instant::now();
                     let mut fresh = DeckStill::default();
                     let (prims, _, _) = deck_paint_kept(&g, &input, &mut fresh);
@@ -1544,7 +1553,7 @@ fn deck_frame_cost() {
             }
         }
     }
-    if let Some(path) = std::env::var_os("ATERM_DECK_COST") {
+    if let Some(path) = output {
         std::fs::write(path, tsv).expect("the cost table writes");
     }
 }
@@ -1597,6 +1606,8 @@ fn a_beat_patch_blends_only_the_glyphs_over_its_rects() {
             fp: 1,
             geom: 1,
             raster_fingerprint_once: std::sync::OnceLock::new(),
+            serial: 0,
+            delta: None,
             scrim: None,
         };
         let blits = crate::tray_raster::glyph_blits();
@@ -1702,13 +1713,8 @@ fn a_live_frame_keeps_the_prim_budget() {
 /// Folded strip halfway through its slide), beating, and stalled, in both forms and grounds, at
 /// 2× and 1×.
 #[test]
-#[ignore = "writes PNGs for a person to read: set ATERM_DECK_GALLERY to a directory"]
 fn deck_live_gallery() {
-    let Some(dir) = std::env::var_os("ATERM_DECK_GALLERY") else {
-        return;
-    };
-    let dir = std::path::PathBuf::from(dir);
-    std::fs::create_dir_all(&dir).expect("the gallery directory");
+    let (dir, _gallery) = crate::scripted_redraw_fixture::gallery_directory("ATERM_DECK_GALLERY");
     crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
     let mut snap = scene(Scene::Calm);
     snap.at_unix_ms = OPEN;
@@ -2119,6 +2125,8 @@ fn the_live_now_box_steps_through_the_heat_ramp_with_no_halo_and_patches_byte_fo
                 fp: 1,
                 geom: 1,
                 raster_fingerprint_once: std::sync::OnceLock::new(),
+                serial: 0,
+                delta: None,
                 scrim: None,
             };
             assert!(patch_live(
@@ -2215,6 +2223,8 @@ fn a_blend_patches_the_bars_under_the_percent_to_the_whole_rasters_bytes() {
             fp: 1,
             geom: 1,
             raster_fingerprint_once: std::sync::OnceLock::new(),
+            serial: 0,
+            delta: None,
             scrim: None,
         };
         assert!(

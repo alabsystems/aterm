@@ -252,3 +252,96 @@ fn the_decoration_latch_is_sized_for_the_lane_a_park_stretches_it_to() {
         "and it still expires: a decoration that stopped moving stops paying"
     );
 }
+
+/// SPECS `deck-frame-interval`: the deck's clock frames the needle at one period of the window's
+/// clock, floored at the effect tick's floor, and at two while a deck frame of the run waited
+/// [`super::EFFECT_LANE_ACQUIRE_PARK_NS`] or more for a drawable or the Mac is in Low Power
+/// Mode. The cursor trail's lane keeps its own interval (`effect-present-interval`).
+#[test]
+fn the_deck_frame_runs_at_one_period_until_its_frames_park() {
+    use crate::stats_clock::deck_frame_interval;
+    let hz = |millihertz: u64| Duration::from_nanos(1_000_000_000_000 / millihertz);
+    for (name, period) in [
+        ("120 Hz", hz(120_000)),
+        ("60 Hz", hz(60_000)),
+        ("144 Hz", hz(144_000)),
+        ("30 Hz", hz(30_000)),
+    ] {
+        assert_eq!(deck_frame_interval(period, false, false), period, "{name}");
+        assert_eq!(
+            deck_frame_interval(period, true, false),
+            period * 2,
+            "{name}: parked"
+        );
+        assert_eq!(
+            deck_frame_interval(period, false, true),
+            period * 2,
+            "{name}: Low Power Mode"
+        );
+        assert_eq!(
+            deck_frame_interval(period, true, true),
+            period * 2,
+            "{name}"
+        );
+    }
+    assert_eq!(
+        deck_frame_interval(Duration::from_micros(100), false, false),
+        MIN_EFFECT_TICK_INTERVAL,
+        "a \"10 kHz\" period is floored"
+    );
+    let hz60 = hz(60_000);
+    assert_ne!(
+        deck_frame_interval(hz60, false, false),
+        super::effect_present_interval_with(Some(hz60), super::EFFECT_PRESENT_PANEL_PERIODS),
+        "CONTROL: the deck does not take the trail lane's two periods"
+    );
+}
+
+/// SPECS `deck-frame-interval`: the deck runs at its clock's rate only where that clock is a
+/// display link a GPU present follows, or the headless synthetic panel that stands in for one;
+/// a window on the loop's timer (a Mac before 14, Linux, Windows) or presented by the CPU keeps
+/// the effect lane's interval, today's cadence (design §3.7).
+#[test]
+fn only_a_linked_gpu_window_or_a_headless_one_frames_the_deck_at_its_clock() {
+    use crate::stats_clock::deck_clock_at_panel_rate;
+    for (windowed, link, cpu, want, name) in [
+        (false, None, false, true, "headless, not yet asked"),
+        (
+            false,
+            Some(false),
+            false,
+            true,
+            "headless, the synthetic panel",
+        ),
+        (false, Some(true), false, true, "a test's inert link"),
+        (
+            true,
+            Some(true),
+            false,
+            true,
+            "macOS 14, a display link, Metal",
+        ),
+        (
+            true,
+            Some(true),
+            true,
+            false,
+            "a display link, the CPU presents",
+        ),
+        (
+            true,
+            Some(false),
+            false,
+            false,
+            "a Mac before 14, Linux or Windows",
+        ),
+        (true, Some(false), true, false, "no link, the CPU presents"),
+        (true, None, false, false, "a window not yet asked"),
+    ] {
+        assert_eq!(
+            deck_clock_at_panel_rate(windowed, link, cpu),
+            want,
+            "{name}"
+        );
+    }
+}

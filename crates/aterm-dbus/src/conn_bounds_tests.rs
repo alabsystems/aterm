@@ -242,4 +242,28 @@ fn a_joins_handshake_ends_by_the_callers_bound_not_the_default() {
         auth::first(effective_uid()),
         "the bound ended the handshake, with the join's AUTH sent and unanswered"
     );
+
+    // A single-read handshake line past `auth::MAX_LINE` is refused even when `\r\n` arrives in
+    // the same chunk, while an exact `auth::MAX_LINE` line split across `\r` and `\n` succeeds.
+    let (ours, mut bus) = CtlStream::pair().unwrap();
+    let mut over = vec![b'A'; auth::MAX_LINE + 1];
+    over.extend_from_slice(b"\r\n");
+    bus.write_all(&over).unwrap();
+    let mut conn = connected(ours);
+    let err = conn.read_line(Instant::now().checked_add(HANG));
+    assert!(matches!(err, Err(Error::Auth(_))), "{err:?}");
+    assert!(conn.broken);
+
+    let (ours, mut bus) = CtlStream::pair().unwrap();
+    let mut conn = connected(ours);
+    let mut first_half = vec![b'B'; auth::MAX_LINE];
+    first_half.push(b'\r');
+    bus.write_all(&first_half).unwrap();
+    let writer = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(10));
+        bus.write_all(b"\n")
+    });
+    let line = conn.read_line(Instant::now().checked_add(HANG)).unwrap();
+    writer.join().unwrap().unwrap();
+    assert_eq!(line.len(), auth::MAX_LINE);
 }

@@ -171,6 +171,10 @@ pub struct Config {
     pub reduced_motion: bool,
     /// The frame's light ([`GlowConfig::light`]).
     pub light: Light,
+    /// Where the caret's insertion point sits in its cell across ([`GlowConfig::head_dx`]): a
+    /// bar's 0.08, a block's 0.5. The band the ribbon lays under the caret ends there
+    /// (`Ribbon::plan_run`'s attach): across the whole cell a block covers, just past a bar.
+    pub head_dx: f32,
 }
 
 impl Config {
@@ -188,6 +192,7 @@ impl Config {
             theme_bg: cfg.theme_bg,
             reduced_motion,
             light: cfg.light,
+            head_dx: cfg.head_dx,
         }
     }
 }
@@ -473,9 +478,9 @@ impl Cadence {
     pub(crate) fn tail(&mut self, step_s: f32) {
         const TAIL_FLOOR_S: f32 = TAIL_FLOOR.as_secs_f32();
         let at = if step_s.is_finite() && step_s > TAIL_FLOOR_S {
-            self.now + Duration::from_secs_f32(step_s)
+            crate::effect_util::saturating_add_secs_f32(self.now, step_s)
         } else {
-            self.now + TAIL_FLOOR
+            crate::effect_util::saturating_add_duration(self.now, TAIL_FLOOR)
         };
         self.edge(at);
     }
@@ -491,7 +496,8 @@ impl Cadence {
     #[inline]
     #[must_use]
     pub(crate) fn at_tail_floor(&self) -> bool {
-        matches!(self.best, Some(b) if b <= self.now + TAIL_FLOOR)
+        let floor = crate::effect_util::saturating_add_duration(self.now, TAIL_FLOOR);
+        matches!(self.best, Some(b) if b <= floor)
     }
 
     /// The fold: the next frame when brisk, else the earliest offer.
@@ -499,7 +505,10 @@ impl Cadence {
     #[must_use]
     pub(crate) fn take(self) -> Option<Instant> {
         if self.brisk {
-            Some(self.now + FRAME_CADENCE)
+            Some(crate::effect_util::saturating_add_duration(
+                self.now,
+                FRAME_CADENCE,
+            ))
         } else {
             self.best
         }
@@ -3300,6 +3309,7 @@ mod tests {
             theme_bg: 0x0016_161C,
             reduced_motion: false,
             light: Light::OFF,
+            head_dx: 0.5,
         }
     }
 
@@ -7900,5 +7910,9 @@ mod tests {
         assert!(sc_eng.take_hand_lift().is_none());
         assert_eq!(sc_eng.withheld_n, 0);
         assert!(sc_eng.flush_clock.is_none());
+
+        let mut fold = Cadence::at(t_end);
+        fold.tail(f32::MAX);
+        assert!(fold.take().is_some());
     }
 }

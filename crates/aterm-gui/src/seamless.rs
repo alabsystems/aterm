@@ -814,6 +814,13 @@ pub(crate) enum PersonStamp {
     Keyed(u64),
     /// No person ever did in the milliseconds the outgoing process (and those before it) served it (`human_input::HumanInputStamp::unkeyed_ms`).
     Unkeyed(u64),
+    /// The carried typing age, including a legacy gesture kept as a possible key
+    /// (`human_input::HumanInputStamp::typed_ms_since`): `t<id> <age>`, whose nonnumeric id
+    /// older readers ignore.
+    Typed(u64),
+    /// This writer knows the session has no typing stamp: `t<id> -`, distinguished from an
+    /// older writer that recorded gestures alone. Older readers ignore its nonnumeric id.
+    Untyped,
 }
 
 /// Write the person-stamps sidecar at `path`.
@@ -824,6 +831,8 @@ pub(crate) fn write_person_stamps(path: &std::path::Path, stamps: &[(u64, Person
         .map(|(local_id, stamp)| match stamp {
             PersonStamp::Keyed(age_ms) => format!("{local_id} {age_ms}\n"),
             PersonStamp::Unkeyed(age_ms) => format!("{local_id} -{age_ms}\n"),
+            PersonStamp::Typed(age_ms) => format!("t{local_id} {age_ms}\n"),
+            PersonStamp::Untyped => format!("t{local_id} -\n"),
         })
         .collect();
     write_private_new(path, body.as_bytes()).is_some()
@@ -842,12 +851,25 @@ pub(crate) fn take_person_stamps(
     };
     body.lines()
         .filter_map(|line| {
-            let (local_id, age) = line.split_once(' ')?;
-            let stamp = match age.strip_prefix('-') {
-                Some(unkeyed) => PersonStamp::Unkeyed(unkeyed.parse().ok()?),
-                None => PersonStamp::Keyed(age.parse().ok()?),
+            let uint = |s: &str| {
+                (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                    .then(|| s.parse().ok())
+                    .flatten()
             };
-            Some((local_id.parse().ok()?, stamp))
+            let (local_id, age) = line.split_once(' ')?;
+            if let Some(typed) = local_id.strip_prefix('t') {
+                let stamp = if age == "-" {
+                    PersonStamp::Untyped
+                } else {
+                    PersonStamp::Typed(uint(age)?)
+                };
+                return Some((uint(typed)?, stamp));
+            }
+            let stamp = match age.strip_prefix('-') {
+                Some(unkeyed) => PersonStamp::Unkeyed(uint(unkeyed)?),
+                None => PersonStamp::Keyed(uint(age)?),
+            };
+            Some((uint(local_id)?, stamp))
         })
         .collect()
 }
@@ -2678,6 +2700,9 @@ fn validated_identities(
 fn parse_fd_entry(entry: &str) -> Option<SessionIdentity> {
     let (local_id, rest) = entry.split_once('=')?;
     let (fd, pid) = rest.split_once(':')?;
+    let is_digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let is_int = |s: &str| is_digits(s.strip_prefix('-').unwrap_or(s));
+    (is_digits(local_id) && is_int(fd) && is_digits(pid)).then_some(())?;
     Some((local_id.parse().ok()?, fd.parse().ok()?, pid.parse().ok()?))
 }
 
@@ -2685,6 +2710,8 @@ fn parse_fd_entry(entry: &str) -> Option<SessionIdentity> {
 fn parse_named_fd(entry: &str) -> Option<i32> {
     let (_, rest) = entry.split_once('=')?;
     let (fd, _) = rest.split_once(':')?;
+    let s = fd.strip_prefix('-').unwrap_or(fd);
+    (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())).then_some(())?;
     fd.parse().ok()
 }
 
@@ -3744,6 +3771,11 @@ impl ProcessBirth {
 
     fn from_wire(raw: &str) -> Option<Self> {
         let (seconds, microseconds) = raw.trim().split_once('.')?;
+        let is_int = |s: &str| {
+            let s = s.strip_prefix('-').unwrap_or(s);
+            !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+        };
+        (is_int(seconds) && is_int(microseconds)).then_some(())?;
         Some(Self {
             seconds: seconds.parse().ok()?,
             microseconds: microseconds.parse().ok()?,
@@ -4081,7 +4113,12 @@ pub(crate) fn prearm_incoming_fds_from(env: &mut HandoffEnv) -> PrearmedIncoming
         .and_then(|value| ProcessBirth::from_wire(&value));
     let parent = env
         .string(ENV_PARENT_PID)
-        .and_then(|value| value.trim().parse::<libc::pid_t>().ok())
+        .and_then(|value| {
+            let s = value.trim();
+            (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| s.parse::<libc::pid_t>().ok())
+                .flatten()
+        })
         .and_then(|pid| attest_handoff_parent(pid, published_birth));
     env.remove(ENV_PARENT_PID);
     env.remove(ENV_PARENT_BIRTH);
@@ -4148,7 +4185,11 @@ pub(crate) fn prearm_incoming_fds_from(env: &mut HandoffEnv) -> PrearmedIncoming
     for key in [ENV_READY_FD, ENV_COMMIT_FD] {
         let present = env.present(key);
         if let Some(value) = env.string(key) {
-            if let Ok(fd) = value.trim().parse::<i32>() {
+            let trimmed = value.trim();
+            if !trimmed.is_empty()
+                && trimmed.bytes().all(|b| b.is_ascii_digit())
+                && let Ok(fd) = trimmed.parse::<i32>()
+            {
                 if fd >= 3 && unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0 {
                     named_fds.push(fd);
                     if aterm_pty::set_cloexec(fd, true).is_err() {
@@ -4286,6 +4327,7 @@ pub(crate) fn encode_target_identity(build: u64, commit: &str) -> String {
 #[must_use]
 pub(crate) fn parse_target_identity(raw: &str) -> Option<HandoffTarget> {
     let (build, commit) = raw.trim().split_once(' ')?;
+    (!build.is_empty() && build.bytes().all(|b| b.is_ascii_digit())).then_some(())?;
     build
         .parse::<u64>()
         .ok()
@@ -4306,7 +4348,9 @@ pub(crate) fn target_identity_names_this_build(env: &HandoffEnv) -> bool {
     let own = crate::build_info::build_number()
         .parse::<u64>()
         .unwrap_or(0);
-    build.parse::<u64>().ok() == Some(own)
+    !build.is_empty()
+        && build.bytes().all(|b| b.is_ascii_digit())
+        && build.parse::<u64>().ok() == Some(own)
 }
 
 /// [`take_target_identity_from`] over the process environment: the env-shaped entry point the handoff suites drive (`handoff_env::through_process_env`).
@@ -4864,7 +4908,9 @@ pub(crate) fn take_ready_fd_from(
     adopted_fds: &[i32],
 ) -> Option<ReadySignal> {
     let raw = env.take(ENV_READY_FD).and_then(|v| v.into_string().ok());
-    let fd: i32 = raw?.trim().parse().ok()?;
+    let s = raw?.trim().to_string();
+    (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())).then_some(())?;
+    let fd: i32 = s.parse().ok()?;
     if fd < 3 {
         return None;
     }
@@ -4911,7 +4957,9 @@ pub(crate) fn take_commit_fd_from(
     if !parent.still_alive() {
         return None;
     }
-    let fd: i32 = raw?.trim().parse().ok()?;
+    let s = raw?.trim().to_string();
+    (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())).then_some(())?;
+    let fd: i32 = s.parse().ok()?;
     if fd < 3 || unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
         return None;
     }

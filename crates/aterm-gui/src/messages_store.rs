@@ -419,7 +419,10 @@ impl Writer {
 
     /// Wait no longer than `within` for every line appended so far to land.
     pub(crate) fn flush_within(&self, within: std::time::Duration) -> bool {
-        let deadline = std::time::Instant::now() + within;
+        let now = std::time::Instant::now();
+        let deadline = now
+            .checked_add(within)
+            .unwrap_or_else(|| now + std::time::Duration::from_secs(365 * 24 * 3600));
         let Some(tx) = &self.tx else {
             let mut queued = self.overflow.lock().unwrap_or_else(PoisonError::into_inner);
             self.hand_over(&mut queued);

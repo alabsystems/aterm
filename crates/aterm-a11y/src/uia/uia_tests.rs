@@ -2,21 +2,29 @@
 // Copyright 2026 Andrew Yates
 
 //! Windows-only controls exercise the actual COM objects and method dispatch,
-//! through their vtables as UI Automation calls them. They do not create an
-//! HWND, inspect the desktop or claim Narrator acceptance.
+//! through their vtables as UI Automation calls them. One creates a hidden HWND
+//! of its own and hooks WinEvents in-process; none inspects the desktop or
+//! claims Narrator acceptance.
 
 #![cfg(test)]
 
 use std::ptr;
 
-use aterm_win32::Win32::Foundation::{E_NOINTERFACE, E_POINTER, SysFreeString};
+use aterm_win32::Win32::Foundation::{
+    E_NOINTERFACE, E_POINTER, LPARAM, LRESULT, SysFreeString, WPARAM,
+};
 use aterm_win32::Win32::System::Variant::{VARIANT, VariantClear};
 use aterm_win32::Win32::UI::Accessibility::{
-    SupportedTextSelection_None, SupportedTextSelection_Single, TextPatternRangeEndpoint_End,
-    TextPatternRangeEndpoint_Start, TextUnit, TextUnit_Character, TextUnit_Word,
-    UIA_IsReadOnlyAttributeId,
+    HWINEVENTHOOK, SetWinEventHook, SupportedTextSelection_None, SupportedTextSelection_Single,
+    TextPatternRangeEndpoint_End, TextPatternRangeEndpoint_Start, TextUnit, TextUnit_Character,
+    TextUnit_Word, UIA_IsReadOnlyAttributeId, UnhookWinEvent,
 };
-use aterm_win32::com::{IID_IAgileObject, IID_IInspectable, IID_IMarshal};
+use aterm_win32::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EVENT_MAX, EVENT_MIN, MSG,
+    PM_REMOVE, PeekMessageW, RegisterClassExW, SendMessageW, WINEVENT_OUTOFCONTEXT, WM_GETOBJECT,
+    WM_NCDESTROY, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+};
+use aterm_win32::com::{Apartment, IID_IAgileObject, IID_IInspectable, IID_IMarshal};
 use aterm_win32::uia::{
     IID_IRawElementProviderSimple, IID_ITextProvider, IInvokeProvider_Vtbl,
     IRawElementProviderFragment_Vtbl, IRawElementProviderSimple_Vtbl, ISelectionItemProvider_Vtbl,
@@ -675,4 +683,128 @@ fn nullable_native_results_write_null_or_an_owned_interface_and_reject_null_slot
             E_POINTER
         );
     }
+}
+
+/// A window procedure that serves UIA as aterm-gui's subclass does: the
+/// root-object request, and retirement once the handle is destroyed.
+unsafe extern "system" fn host(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let id = hwnd.addr().cast_signed();
+    if msg == WM_GETOBJECT
+        && let Some(result) = handle_wm_getobject(id, wparam, lparam)
+    {
+        return result;
+    }
+    // SAFETY: this window's own message, passed on unchanged.
+    let result = unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+    if msg == WM_NCDESTROY {
+        window_destroyed(id);
+    }
+    result
+}
+
+unsafe extern "system" fn ignore_win_event(
+    _: HWINEVENTHOOK,
+    _: u32,
+    _: HWND,
+    _: i32,
+    _: i32,
+    _: u32,
+    _: u32,
+) {
+}
+
+/// Deliver what this thread's queue holds, the hook's WinEvents among it.
+fn pump() {
+    let mut msg = MSG::default();
+    // SAFETY: `msg` is writable; every message is this thread's own.
+    while unsafe { PeekMessageW(&mut msg, ptr::null_mut(), 0, 0, PM_REMOVE) } != 0 {
+        // SAFETY: as above.
+        unsafe { DispatchMessageW(&msg) };
+    }
+}
+
+#[test]
+fn a_destroyed_window_lets_uia_release_the_providers_that_raised_its_events() {
+    let _apartment = Apartment::enter().unwrap();
+    // An MSAA client: while a WinEvent hook listens, UI Automation keeps each
+    // provider that raises an event in its raised-event map.
+    // SAFETY: an out-of-context hook on this thread, unhooked below.
+    let hook = unsafe {
+        SetWinEventHook(
+            EVENT_MIN,
+            EVENT_MAX,
+            ptr::null_mut(),
+            Some(ignore_win_event),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT,
+        )
+    };
+    assert!(!hook.is_null(), "SetWinEventHook");
+    let class = "aterm-a11y-uia-destroy\0"
+        .encode_utf16()
+        .collect::<Vec<_>>();
+    let window_class = WNDCLASSEXW {
+        cbSize: u32::try_from(std::mem::size_of::<WNDCLASSEXW>()).unwrap(),
+        lpfnWndProc: Some(host),
+        lpszClassName: class.as_ptr(),
+        ..Default::default()
+    };
+    // SAFETY: the class names `host` and a NUL-terminated name that outlives
+    // the window.
+    assert_ne!(unsafe { RegisterClassExW(&window_class) }, 0);
+    // SAFETY: the class registered above; a hidden top-level window.
+    let window = unsafe {
+        CreateWindowExW(
+            0,
+            class.as_ptr(),
+            class.as_ptr(),
+            WS_OVERLAPPEDWINDOW,
+            0,
+            0,
+            320,
+            200,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null(),
+        )
+    };
+    assert!(!window.is_null(), "CreateWindowExW");
+    let actions = Actions(Arc::new(Mutex::new(Vec::new())));
+    // SAFETY: the window stays live until DestroyWindow below, which retires
+    // the adapter at WM_NCDESTROY.
+    let mut adapter =
+        unsafe { Adapter::new(window.addr().cast_signed(), Activation, actions) }.unwrap();
+    let shared = adapter.shared.clone();
+    // SAFETY: the request UI Automation sends, to this thread's own window.
+    unsafe { SendMessageW(window, WM_GETOBJECT, 0, UiaRootObjectId as LPARAM) };
+    // Before any event: the registry's entry and the root provider.
+    let quiet = Arc::weak_count(&shared);
+    adapter.update_window_focus_state(true);
+    for round in 0..8 {
+        adapter.update_if_active(|| {
+            let mut next = update(true);
+            next.nodes[2].1.set_label(format!("Run {round}"));
+            next.focus = model::NodeId(if round % 2 == 0 { 3 } else { 1 });
+            next
+        });
+        pump();
+    }
+    let raised = Arc::weak_count(&shared);
+    assert!(
+        raised > quiet,
+        "premise: UI Automation holds the providers that raised events ({quiet} -> {raised})"
+    );
+    // SAFETY: this thread's own window.
+    assert_ne!(unsafe { DestroyWindow(window) }, 0);
+    pump();
+    assert_eq!(
+        Arc::weak_count(&shared),
+        1,
+        "only the root provider aterm holds is left once the window is gone"
+    );
+    drop(adapter);
+    // SAFETY: the hook set above.
+    unsafe { UnhookWinEvent(hook) };
 }

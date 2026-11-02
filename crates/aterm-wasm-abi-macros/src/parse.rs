@@ -149,7 +149,7 @@ pub fn opts(args: &[Tt]) -> Result<Opts, Error> {
             [t] if t.is_ident("constructor") => out.constructor = true,
             [k, eq, v] if k.is_ident("js_name") && eq.is_punct('=') => {
                 out.js_name = Some(match v {
-                    Tt::Ident(i) => i.clone(),
+                    Tt::Ident(i) => i.strip_prefix("r#").unwrap_or(i).to_string(),
                     Tt::Lit(l) => str_value(l)
                         .ok_or_else(|| Error::new("`js_name` takes a name or a string"))?,
                     _ => return Err(Error::new("`js_name` takes a name or a string")),
@@ -401,7 +401,9 @@ pub fn split_commas(tts: &[Tt]) -> Vec<&[Tt]> {
     for (i, t) in tts.iter().enumerate() {
         match t {
             Tt::Punct('<', _) => depth += 1,
-            Tt::Punct('>', _) if !(i > 0 && tts[i - 1] == Tt::Punct('-', true)) => depth -= 1,
+            Tt::Punct('>', _) if !(i > 0 && tts[i - 1] == Tt::Punct('-', true)) && depth > 0 => {
+                depth -= 1;
+            }
             Tt::Punct(',', _) if depth == 0 => {
                 out.push(&tts[start..i]);
                 start = i + 1;
@@ -577,6 +579,11 @@ mod tests {
                 .as_deref(),
             Some("atermSmokePanic")
         );
+        assert_eq!(
+            opts(&lex("js_name = r#type")).unwrap().js_name.as_deref(),
+            Some("type")
+        );
+        assert_eq!(split_commas(&lex("a > b, c")).len(), 2);
         assert_eq!(
             opts(&lex("constructor, js_name = \"make\"")).unwrap(),
             Opts {

@@ -468,6 +468,47 @@ impl Store {
         )
     }
 
+    /// Read an observed usage scope while holding its account writer, without publishing
+    /// account state. Recovery completes before the reader can encounter a pending receipt.
+    /// # Errors
+    /// The store or target differs, the writer cannot be acquired, recovery or reading
+    /// fails, or the caller's inspection rejects the snapshot.
+    pub(in crate::harness) fn inspect_usage_within<T>(
+        &self,
+        ladder: &[std::time::Duration],
+        captured: &UsageRoster,
+        now: i64,
+        inspect: impl FnOnce(&AccountRecords) -> Result<T, String>,
+    ) -> Result<T, String> {
+        if self.dir != captured.store.dir || self.cli != captured.store.cli {
+            return Err("usage observation belongs to another account store".into());
+        }
+        let held = self
+            .acquire_within(ladder)
+            .map_err(|why| why.to_string())?
+            .ok_or_else(|| LOCK_HELD.to_owned())?;
+        let target = usage_target(captured.path.as_deref())?;
+        if target != captured.target {
+            return Err("usage roster target changed; nothing recorded".into());
+        }
+        let recovery_target = captured
+            .path
+            .as_deref()
+            .map(super::super::cli::roster_target)
+            .transpose()?
+            .map(|(path, _)| path);
+        self.recover_sync_at(&held, recovery_target.as_deref(), &mut |_| Ok(()))?;
+        let records = self
+            .read_account_records(captured.path.as_deref(), now)
+            .map_err(|why| match why {
+                super::RosterReadError::Roster(why) | super::RosterReadError::Records(why) => why,
+            })?;
+        if usage_target(captured.path.as_deref())? != target {
+            return Err("usage roster target changed during read; nothing recorded".into());
+        }
+        inspect(&records)
+    }
+
     /// Usage also works without configured rows. An absent file is a retained absence
     /// in the receipt, so a later configuration cannot silently admit old observations.
     pub(super) fn transact_usage_within(
@@ -786,6 +827,7 @@ impl Store {
         let before = (state.clone(), logins.clone());
         let events = edit(&mut state, &mut logins)?;
         advance_renewal_generations(&before.1, &mut logins, &events)?;
+        advance_sign_in_receipts(&before.1, &mut logins, &state, &events)?;
         let old_state = read(&self.state_file(), MAX_STATE_BYTES)?;
         let old_logins = read(&self.logins_file(), MAX_LOGINS_BYTES)?;
         let new_state = if state != before.0 || (!events.is_empty() && old_state.is_none()) {

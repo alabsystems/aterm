@@ -36,7 +36,7 @@ fn failed_follow_up(doctor: &mut Withholding, root: &Path) {
 fn spent_follow_ups(root: &Path) -> (Withholding, u64) {
     let (mut doctor, revision) = admitted_withheld_widgets(root);
     failed_follow_up(&mut doctor, root);
-    doctor.wait(RETRY_AFTER);
+    doctor.wait(SECOND_TRY_AFTER);
     failed_follow_up(&mut doctor, root);
     let owed = load_withheld(root).unwrap();
     assert_eq!(owed.failed.len(), 1);
@@ -95,12 +95,13 @@ fn withheld_revision_a_confirmed_new_run_reopens_the_follow_up_budget() {
     );
 
     initial::request_stop_at(root.path(), revision).unwrap();
-    initial::save_explicit_workstation_plan(root.path()).unwrap();
-    let next = initial::revision_at(root.path()).unwrap();
-    assert!(
-        next > revision,
-        "a real explicit admission replaced the stopped run"
-    );
+    let next = InitialSetupAdmissionStopTest::restart(root.path())
+        .unwrap()
+        .set_up_now()
+        .unwrap()
+        .expect("Set up now after the Stop admits a run");
+    assert_eq!(initial::revision_at(root.path()).unwrap(), next);
+    assert!(next > revision, "Set up now replaced the stopped run");
     assert!(
         initial::initial_setup_snapshot_at(root.path(), Default::default())
             .unwrap()

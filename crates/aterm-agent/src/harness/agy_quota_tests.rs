@@ -45,6 +45,26 @@ fn the_hud_names_each_pool_and_the_spent_one() {
     );
 }
 
+/// A LIMIT agy GAVE NO FRACTION FOR SAYS SO, NEVER A BARE `?`; one it gave keeps its figure.
+#[test]
+fn a_limit_with_no_fraction_says_why() {
+    let bare = SPENT_GEMINI.replace(
+        r#""window":"5h","remaining_fraction":0.9179044961929321,"#,
+        r#""window":"5h","#,
+    );
+    assert_ne!(bare, SPENT_GEMINI, "the fixture names the bucket");
+    let line = hud_line(&parse(&bare).unwrap(), NOW);
+    assert!(
+        line.ends_with("5h \u{2013} (no figure given) (refills in 4h54m)"),
+        "{line}"
+    );
+    assert!(!line.contains('?'), "{line}");
+    assert!(
+        line.contains("week 96% left"),
+        "a fraction it gave is kept: {line}"
+    );
+}
+
 #[test]
 fn the_json_keeps_every_bucket() {
     let v = to_json(&parse(SPENT_GEMINI).unwrap(), NOW);
@@ -130,6 +150,8 @@ fn every_model_finds_its_pool_by_family() {
         ("gemini-3.8-flash-low", "Gemini Models"),
         ("Gemini 4 Argon (High)", "Gemini Models"),
         ("claude-opus-5-5-medium", "Claude and GPT models"),
+        ("Opus 5.5", "Claude and GPT models"),
+        ("Sonnet 5.5", "Claude and GPT models"),
         ("Claude Sonnet 5.5 (Low)", "Claude and GPT models"),
         ("gpt-oss-120b-medium", "Claude and GPT models"),
         ("GPT-OSS 120B (Medium)", "Claude and GPT models"),
@@ -284,5 +306,118 @@ fn harness_agy_sets_rotation_and_the_supervisor_takes_the_keys_quietly() {
         Rotation::from_aterm_toml("[harness.agy]\nrotate = \"yes\"\nlow = 1.5e3\norder = []\n");
     assert_eq!(r, Rotation::default());
     assert_eq!(notes.len(), 3, "{notes:?}");
+    let (r, notes) = Rotation::from_aterm_toml(
+        "[harness.agy]\norder = [\"gemini-4-argon-high\", \"--resume\"]\n",
+    );
+    assert_eq!(r, Rotation::default());
+    assert_eq!(notes.len(), 1, "{notes:?}");
     assert_eq!(Rotation::from_aterm_toml("").0, Rotation::default());
+}
+
+#[test]
+fn group_holds_matches_family_tokens_without_substring_or_boilerplate_false_positives() {
+    let q = parse(SPENT_GEMINI).unwrap();
+    for bad in [
+        "mini-1", "in-1", "models-1", "within-1", "this-1", "group-1", "and-1", "oss-120b",
+    ] {
+        assert_eq!(q.group_of(bad), None, "{bad}");
+    }
+    assert!(
+        parse_model(r#"{"status":"SUCCESS","command":{"name":"model","data":{"id":"--resume"}}}"#)
+            .is_err()
+    );
+}
+
+#[test]
+fn pick_at_wall_and_full_opus_google_cycle_drain_entire_quota() {
+    let r = Rotation::default();
+
+    // 1. Default Opus drops to Low (0.08) while Gemini is Open (0.90): rotates to Gemini.
+    let q = pools((0.90, false), (0.80, 0.08));
+    assert_eq!(
+        pick(&q, "claude-opus-5-5-medium", false, &r),
+        Pick::Rotate {
+            from: "claude-opus-5-5-medium".to_owned(),
+            from_standing: Standing::Low,
+            to: "gemini-4-argon-high".to_owned(),
+            to_standing: Standing::Open,
+        }
+    );
+
+    // 2. Named Opus at a quota wall on screen even at Low (0.08) rotates to Open Gemini.
+    assert_eq!(
+        pick_at_wall(&q, "claude-opus-5-5-medium", &r),
+        Pick::Rotate {
+            from: "claude-opus-5-5-medium".to_owned(),
+            from_standing: Standing::Low,
+            to: "gemini-4-argon-high".to_owned(),
+            to_standing: Standing::Open,
+        }
+    );
+
+    // 3. Once rotated to `--model gemini-4-argon-high` (named = true), Gemini drains to Spent (0.0),
+    //    then rotates BACK to Opus to drain the remaining 8% Low quota!
+    let q = pools((0.0, true), (0.80, 0.08));
+    assert_eq!(
+        pick(&q, "gemini-4-argon-high", true, &r),
+        Pick::Rotate {
+            from: "gemini-4-argon-high".to_owned(),
+            from_standing: Standing::Spent,
+            to: "claude-opus-5-5-medium".to_owned(),
+            to_standing: Standing::Low,
+        }
+    );
+
+    // 4. Opus (`named = true`) keeps running at Low (0.08) until it reaches 0% (Spent),
+    //    then both pools are Spent and `pick` / `pick_at_wall` waits for the earliest refill.
+    assert_eq!(
+        pick(&q, "claude-opus-5-5-medium", true, &r),
+        Pick::Keep {
+            model: "claude-opus-5-5-medium".to_owned(),
+            standing: Standing::Low,
+        }
+    );
+    let q = pools((0.0, true), (0.80, 0.0));
+    assert_eq!(
+        pick_at_wall(&q, "claude-opus-5-5-medium", &r),
+        Pick::Wait {
+            model: "claude-opus-5-5-medium".to_owned(),
+            until: aterm_types::rfc3339::parse_utc_fractional("2026-10-24T05:49:13Z"),
+        }
+    );
+
+    // 5. When Gemini refills to 100% (1.0) while sitting at a wall on Spent Opus, rotates to Gemini.
+    let q = pools((1.0, false), (0.80, 0.0));
+    assert_eq!(
+        pick_at_wall(&q, "claude-opus-5-5-medium", &r),
+        Pick::Rotate {
+            from: "claude-opus-5-5-medium".to_owned(),
+            from_standing: Standing::Spent,
+            to: "gemini-4-argon-high".to_owned(),
+            to_standing: Standing::Open,
+        }
+    );
+
+    // 6. When Opus's 5h bucket refills to 100% (1.0) while its weekly bucket has prior usage
+    //    (0.75, Open) and sitting at a wall on Opus, keeps Opus so the supervisor resumes it in
+    //    place even if Gemini is Open.
+    let q = pools((0.80, false), (0.75, 1.0));
+    assert_eq!(
+        pick_at_wall(&q, "claude-opus-5-5-medium", &r),
+        Pick::Keep {
+            model: "claude-opus-5-5-medium".to_owned(),
+            standing: Standing::Open,
+        }
+    );
+
+    // 7. When Opus's 5h bucket refills to 100% (1.0) while its weekly bucket is Low (0.05) and
+    //    Gemini is Spent, keeps Opus rather than waiting for Gemini's weekly reset.
+    let q = pools((0.0, true), (0.05, 1.0));
+    assert_eq!(
+        pick_at_wall(&q, "claude-opus-5-5-medium", &r),
+        Pick::Keep {
+            model: "claude-opus-5-5-medium".to_owned(),
+            standing: Standing::Low,
+        }
+    );
 }

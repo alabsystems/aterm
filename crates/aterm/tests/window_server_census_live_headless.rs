@@ -121,15 +121,52 @@ fn client_reply(inst: &Instance, args: &[&str]) -> (String, String) {
     )
 }
 
-/// Local wall-clock `YYYY-MM-DD HH:MM:SS`, the shape `log show --start` reads.
+/// Local wall-clock `YYYY-MM-DD HH:MM:SS`, the shape `log show --start` reads, at which a census
+/// that begins now starts reading the log.
 fn log_timestamp() -> Option<String> {
-    let out = Command::new("/bin/date")
-        .arg("+%Y-%m-%d %H:%M:%S")
-        .output()
-        .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    log_start_at(i64::try_from(now).ok()?, None)
+}
+
+/// [`log_timestamp`] at `now` (seconds since the epoch) in the zone `tz`, the machine's by default:
+/// `now`, or three hours before it within two hours of a change of the UTC offset. `log show`
+/// reads nothing from a window that starts inside the hour a change back repeats, by `--start`
+/// (with an offset on the date or none) or `--last` alike (macOS 27.0, measured 2026-11-01), and
+/// that would blind this census. The wider window reads more of tccd's lines, and the census judges
+/// only its own pids.
+fn log_start_at(now: i64, tz: Option<&str>) -> Option<String> {
+    const HOUR: i64 = 3600;
+    let date = |at: i64, format: &str| -> Option<String> {
+        let mut date = Command::new("/bin/date");
+        date.args(["-r", &at.to_string(), format]);
+        if let Some(tz) = tz {
+            date.env("TZ", tz);
+        }
+        let out = date.output().ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    let near_a_change = date(now - 2 * HOUR, "+%z")? != date(now + 2 * HOUR, "+%z")?;
+    let from = if near_a_change { now - 3 * HOUR } else { now };
+    date(from, "+%Y-%m-%d %H:%M:%S")
+}
+
+#[test]
+fn a_census_never_starts_reading_inside_a_repeated_hour() {
+    const LOS_ANGELES: Option<&str> = Some("America/Los_Angeles");
+    for (now, start) in [
+        // 01:26 PDT, then 01:26 PST: the hour that repeats on 2026-11-01.
+        (1_793_521_560, "2026-10-31 22:26:00"),
+        (1_793_525_160, "2026-10-31 23:26:00"),
+        // An ordinary day starts where it is.
+        (1_784_116_800, "2026-07-15 05:00:00"),
+    ] {
+        assert_eq!(log_start_at(now, LOS_ANGELES).as_deref(), Some(start));
+    }
 }
 
 /// The unified log since `start` under `predicate`, or `Err` when it could not

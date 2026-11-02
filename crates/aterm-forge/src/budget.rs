@@ -96,8 +96,11 @@ pub fn parse(text: &str) -> Result<Vec<Row>, String> {
             ));
         }
         let ceiling: u64 = ceiling
-            .parse()
-            .map_err(|_| bad(n, raw, &format!("`{ceiling}` is not a whole number")))?;
+            .bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| ceiling.parse().ok())
+            .flatten()
+            .ok_or_else(|| bad(n, raw, &format!("`{ceiling}` is not a whole number")))?;
         let regress_reason = match f.get(3) {
             None => None,
             Some(r) if r.trim().is_empty() => {
@@ -788,11 +791,15 @@ fn write_rows(root: &Path, rows: &[Row]) -> Result<(), String> {
 
 fn write_body(root: &Path, body: &str) -> Result<(), String> {
     let path = root.join(BUDGET_PATH);
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)
-            .map_err(|e| format!("cannot create {} ({e})", dir.display()))?;
-    }
-    std::fs::write(&path, body).map_err(|e| format!("cannot write {} ({e})", path.display()))
+    let dir = path.parent().unwrap_or(root);
+    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {} ({e})", dir.display()))?;
+    let scratch = aterm_tempfile::Builder::new()
+        .prefix(".forge-budget-")
+        .tempdir_in(dir)
+        .map_err(|e| format!("cannot write {} ({e})", path.display()))?;
+    let tmp = scratch.path().join("forge-budget.tsv");
+    std::fs::write(&tmp, body).map_err(|e| format!("cannot write {} ({e})", path.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("cannot write {} ({e})", path.display()))
 }
 
 fn table(rows: &[[String; 5]]) -> String {
@@ -1038,5 +1045,22 @@ mod tests {
                 p.problems
             );
         }
+    }
+
+    #[test]
+    fn write_body_replaces_budget_without_leaving_staging_dirs() {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write_body(root, "first\n").expect("first write");
+        write_body(root, "second\n").expect("second write");
+        assert_eq!(
+            std::fs::read_to_string(root.join(BUDGET_PATH)).expect("read"),
+            "second\n"
+        );
+        let entries: Vec<_> = std::fs::read_dir(root.join("tools"))
+            .expect("tools dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries, vec!["forge-budget.tsv".to_string()]);
     }
 }

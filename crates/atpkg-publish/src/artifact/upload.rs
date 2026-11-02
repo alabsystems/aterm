@@ -6,7 +6,12 @@ use std::path::{Path, PathBuf};
 
 use crate::ctx::Ctx;
 use crate::error::{Error, Result};
-use crate::host::{HostError, Replace};
+use crate::host::rest::STAGED;
+use crate::host::{HostError, Release, ReleaseHost, Replace, Slug};
+
+#[path = "upload_version.rs"]
+mod version;
+pub use version::VERSION_RESERVATION;
 
 /// Check that the staging owner's token file exists and is non-empty before building.
 /// # Errors
@@ -61,6 +66,31 @@ pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
             )));
         }
     }
+    if let Some((program, build)) = managed_pack(tag) {
+        if owner == "public" {
+            return Err(Error::refused(
+                "raw public upload cannot replace a managed pack; use `atpkg-publish mirror <quad-dir>` or `atpkg-publish index --upload` for an immutable pack. For a signed Linux target extension, resume the installed Linux lane on its rostered machine: `atpkg-publish lane run linux --sha256 <installed-snapshot-sha256>`; it verifies the signed byte-prefix extension before guarded owner uploads",
+            ));
+        }
+        let expected = super::pkgdoc::manifest_name(program, build);
+        let manifests: Vec<_> = files
+            .iter()
+            .filter(|file| {
+                file.file_name().and_then(|name| name.to_str()) == Some(expected.as_str())
+            })
+            .collect();
+        let [manifest] = manifests.as_slice() else {
+            return Err(Error::refused(format!(
+                "managed {tag} upload needs exactly one supplied {expected}"
+            )));
+        };
+        version::check_managed_manifest(manifest, program, build)?;
+        match publish(ctx, repo, tag, manifest, &files, "managed pack upload")? {
+            Uploaded::Staged => println!("staged managed pack {slug} {tag}"),
+            Uploaded::AlreadyPublic => println!("{tag} already has this immutable public manifest"),
+        }
+        return Ok(());
+    }
     match host.upload(&slug, tag, &files, Replace::Clobber) {
         Ok(()) => {
             println!("uploaded {} asset(s) to {slug} {tag}", files.len());
@@ -73,6 +103,17 @@ pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
             "upload to {slug} {tag} failed: {e}"
         ))),
     }
+}
+
+/// Pack tags use the program and canonical build number. The channel index has
+/// its own immutable quad protocol and is not a program pack.
+fn managed_pack(tag: &str) -> Option<(&str, u64)> {
+    let (program, number) = tag.strip_prefix("atpkg-")?.rsplit_once('-')?;
+    if program.is_empty() || program == "index" {
+        return None;
+    }
+    let build = number.parse::<u64>().ok()?;
+    (number == build.to_string()).then_some((program, build))
 }
 
 /// Release tag for one program build (`atpkg-<program>-<build>`).
@@ -117,10 +158,12 @@ pub enum Uploaded {
     AlreadyPublic,
 }
 
-/// Upload `files` to the staging release of `repo`'s `tag` after checking public immutability.
+/// Upload `files` to the staging release of `repo`'s `tag` after checking public immutability,
+/// never overwriting a staged manifest of another version (D51).
 /// # Errors
-/// Returns a refusal if the public release differs (or its manifest cannot be fetched) or upload
-/// fails, or cannot-run if unreachable.
+/// Returns a refusal if the public release differs (or its manifest cannot be fetched), the
+/// staged manifest records another version or none readable, or upload fails; cannot-run if
+/// unreachable or the staged manifest cannot be downloaded.
 pub fn publish(
     ctx: &Ctx,
     repo: &str,
@@ -151,10 +194,8 @@ pub fn publish(
                              fetched ({e}) — refusing to touch {staging}"
                         ))
                     })?;
-                let theirs = std::fs::read(tmp.path().join(&name))
-                    .map_err(|e| Error::io(format!("read the public {name}"), &e))?;
-                let ours = std::fs::read(manifest)
-                    .map_err(|e| Error::io(format!("read {}", manifest.display()), &e))?;
+                let theirs = version::read_manifest(&tmp.path().join(&name))?;
+                let ours = version::read_manifest(manifest)?;
                 if theirs == ours {
                     return Ok(Uploaded::AlreadyPublic);
                 }
@@ -165,6 +206,13 @@ pub fn publish(
                 )));
             }
             Err(HostError::NotFound) => {}
+            // This identity cannot list the public owner's releases. Two repository 404s
+            // establish only that neither this identity nor an anonymous reader sees it:
+            // a missing repository and a private one hidden from both look the same.
+            // Either permits this private dev staging (§11 D50), not a public publication;
+            // any other answer keeps the could-not-run.
+            Err(HostError::Unreachable(_))
+                if matches!(ctx.hosts.channel.repo_seen(&public), Ok(false)) => {}
             Err(e) => {
                 return Err(Error::cannot_run(format!(
                     "could not ask {public} whether {tag} is public ({e}) — nothing was \
@@ -173,28 +221,167 @@ pub fn publish(
             }
         }
     }
-    let host = &ctx.hosts.staging;
-    let title = format!("atpkg {tag}");
-    let converge = || {
-        host.upload(&staging, tag, files, Replace::Clobber)
-            .map_err(|e| Error::refused(format!("upload to {staging} {tag} failed: {e}")))
-    };
-    match host.release(&staging, tag) {
-        Ok(_) => converge()?,
-        Err(HostError::NotFound) => match host.create(&staging, tag, &title, notes, files) {
-            Ok(()) => {}
-            Err(HostError::Refused(_)) => converge()?,
-            Err(e) => {
-                return Err(Error::refused(format!(
-                    "creating {tag} on {staging} failed: {e}"
-                )));
-            }
-        },
-        Err(e) => {
-            return Err(Error::cannot_run(format!(
-                "could not read {staging} {tag}: {e}"
-            )));
-        }
-    }
+    publish_pack_to(
+        ctx.hosts.staging.as_ref(),
+        &staging,
+        tag,
+        manifest,
+        files,
+        notes,
+    )?;
     Ok(Uploaded::Staged)
+}
+
+/// Apply cross-host exact-version admission for one pack owner. The caller retains
+/// its owner policy: generic staging checks public immutability, while the Linux
+/// lane first verifies its signed byte-prefix target extension through the roster.
+pub(crate) fn publish_pack_to(
+    host: &dyn ReleaseHost,
+    owner: &Slug,
+    tag: &str,
+    manifest: &Path,
+    files: &[PathBuf],
+    notes: &str,
+) -> Result<()> {
+    let reserved = reserve_pack_version(host, owner, tag, manifest, files, notes)?;
+    host.upload(owner, tag, reserved.files(), Replace::Clobber)
+        .map_err(|error| Error::refused(format!("upload to {owner} {tag} failed: {error}")))?;
+    if reserved.release.draft {
+        host.publish_draft(owner, tag)
+            .map_err(|error| Error::refused(format!("publish {owner} {tag}: {error}")))?;
+    }
+    Ok(())
+}
+
+/// The admitted manifest copy and its lifetime, with payloads before ready metadata.
+pub(crate) struct ReservedPack {
+    prepared: version::Prepared,
+    pub(crate) release: Release,
+}
+
+impl ReservedPack {
+    pub(crate) fn files(&self) -> &[PathBuf] {
+        &self.prepared.files
+    }
+}
+
+/// Reserve one exact version without choosing the owner's payload replacement policy.
+/// The mirror keeps `Never`; the validated Linux extension keeps `Clobber`.
+pub(crate) fn reserve_pack_version(
+    host: &dyn ReleaseHost,
+    owner: &Slug,
+    tag: &str,
+    manifest: &Path,
+    files: &[PathBuf],
+    notes: &str,
+) -> Result<ReservedPack> {
+    let prepared = version::Prepared::new(manifest, files)?;
+    if let Some((program, build)) = managed_pack(tag) {
+        version::check_managed_manifest(&prepared.manifest, program, build)?;
+    }
+    let title = format!("atpkg {tag}");
+    let unread = |e: HostError| Error::cannot_run(format!("could not read {owner} {tag}: {e}"));
+    let before = match host.release(owner, tag) {
+        Ok(release) => release,
+        Err(HostError::NotFound) => {
+            // Only independent reservation metadata precedes the archives. A racing
+            // create or a lost response is reconciled by reading the actual release.
+            let made = host.create(
+                owner,
+                tag,
+                &title,
+                notes,
+                std::slice::from_ref(&prepared.reservation),
+            );
+            host.release(owner, tag).map_err(|error| Error::cannot_run(format!(
+                "could not reconcile creating {owner} {tag} ({error}; create: {made:?}) — no payload uploaded"
+            )))?
+        }
+        Err(e) => return Err(unread(e)),
+    };
+    check_staged(host, owner, tag, &before, &prepared.manifest)?;
+    prepared.acquire(host, owner, tag)?;
+    let current = host.release(owner, tag).map_err(unread)?;
+    check_staged(host, owner, tag, &current, &prepared.manifest)?;
+    Ok(ReservedPack {
+        prepared,
+        release: current,
+    })
+}
+
+/// Validate known reservation metadata against an already verified manifest version.
+pub(crate) fn check_version_reservation(path: &Path, version: &str) -> Result<()> {
+    version::check_reservation(path, version)
+}
+
+/// The `version` a pkg manifest's bytes record: a TOML document's top-level string `version`.
+fn manifest_version(bytes: &[u8]) -> Option<String> {
+    let doc: aterm_toml::Value = std::str::from_utf8(bytes).ok()?.parse().ok()?;
+    doc.get("version")?.as_str().map(str::to_string)
+}
+
+/// Before an upload clobbers the staging release `release` of `tag`, every manifest it already
+/// stages under `manifest`'s name must be `manifest`'s bytes or record its `version` (a
+/// rebuild, or a manifest merged with a second target): one build number names one version
+/// (D51). A replace the REST host cut short between deleting the old manifest and renaming its
+/// replacement leaves the replacement under that name plus [`STAGED`] alone, and that copy is
+/// then what the release stages, so it is read too. A release with neither holds nothing to
+/// keep.
+/// # Errors
+/// A refusal when a staged manifest records another version or none readable; a could-not-run
+/// when one cannot be downloaded.
+fn check_staged(
+    host: &dyn ReleaseHost,
+    staging: &Slug,
+    tag: &str,
+    release: &Release,
+    manifest: &Path,
+) -> Result<()> {
+    let name = manifest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let present: Vec<String> = [name.clone(), format!("{name}{STAGED}")]
+        .into_iter()
+        .filter(|n| release.assets.contains(n))
+        .collect();
+    if present.is_empty() {
+        return Ok(());
+    }
+    let ours = version::read_manifest(manifest)?;
+    let tmp = aterm_tempfile::Builder::new()
+        .prefix("atpkg-publish-staged-")
+        .tempdir()
+        .map_err(|e| Error::io("create a scratch dir", &e))?;
+    for staged in &present {
+        host.download(staging, tag, &[staged.as_str()], tmp.path())
+            .map_err(|e| {
+                Error::cannot_run(format!(
+                    "could not read the {staged} {staging} {tag} already stages ({e}) — no \
+                     payload was uploaded"
+                ))
+            })?;
+        let theirs = version::read_manifest(&tmp.path().join(staged))?;
+        if theirs == ours {
+            continue;
+        }
+        let version = manifest_version(&ours).ok_or_else(|| {
+            Error::refused(format!(
+                "{} records no version — not a manifest to stage",
+                manifest.display()
+            ))
+        })?;
+        let at = match manifest_version(&theirs) {
+            Some(v) if v == version => continue,
+            Some(v) => format!("at version `{v}`"),
+            None => "recording no readable version".to_string(),
+        };
+        return Err(Error::refused(format!(
+            "{tag} on {staging} already stages {staged} {at}, and this upload is version \
+             `{version}` — one build number names one version, so the staged pack is not \
+             overwritten (D51). If the staged one is wrong, delete that staging release by hand; \
+             otherwise pack under another build number"
+        )));
+    }
+    Ok(())
 }

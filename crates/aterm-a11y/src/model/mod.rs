@@ -3,7 +3,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Derived from accesskit 0.24.1 (MIT OR Apache-2.0, used under Apache-2.0)
-// src/lib.rs, modified by the aterm project in 2026.
+// src/lib.rs, and cut by the aterm project in 2026 to what aterm-gui builds
+// and its publishers read: the roles and properties aterm sets (plus a
+// link's URL and a value's step, which the AT-SPI publisher serves), stored
+// as plain fields; one tree per window (a tree id names only the root tree);
+// no serialization.
 //
 // Derived from Chromium's accessibility abstraction.
 // Copyright 2018 The Chromium Authors. All rights reserved.

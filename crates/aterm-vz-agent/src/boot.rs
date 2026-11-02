@@ -36,6 +36,17 @@ WantedBy=multi-user.target
 /// # Errors
 /// The unit could not be read, or the new text written and renamed over it.
 pub fn refresh_unit(path: &Path, carried: &str) -> io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unit path is a symbolic link",
+            ));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    }
     let on_disk = match std::fs::read(path) {
         Ok(text) => text,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
@@ -48,8 +59,16 @@ pub fn refresh_unit(path: &Path, carried: &str) -> io::Result<bool> {
         .file_name()
         .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
     let partial = path.with_file_name(format!(".{}.partial", name.to_string_lossy()));
+    let _ = std::fs::remove_file(&partial);
     {
-        let mut f = std::fs::File::create(&partial)?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o644);
+        }
+        let mut f = opts.open(&partial)?;
         f.write_all(carried.as_bytes())?;
         // A power loss may leave the old unit or the new one, never a torn one: the text
         // is on disk before the rename names it.
@@ -131,5 +150,21 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(left, ["aterm-vz-agent.service"], "no partial is left");
+
+        #[cfg(unix)]
+        {
+            let decoy = dir.path().join("decoy");
+            std::fs::write(&decoy, "untouched").unwrap();
+            std::os::unix::fs::symlink(&decoy, dir.path().join(".aterm-vz-agent.service.partial"))
+                .unwrap();
+            std::fs::write(&unit, "[Service]\nExecStart=/stale\n").unwrap();
+            assert!(refresh_unit(&unit, UNIT).unwrap());
+            assert_eq!(std::fs::read_to_string(&decoy).unwrap(), "untouched");
+
+            let unit_link = dir.path().join("linked.service");
+            std::os::unix::fs::symlink(&decoy, &unit_link).unwrap();
+            assert!(refresh_unit(&unit_link, UNIT).is_err());
+            assert_eq!(std::fs::read_to_string(&decoy).unwrap(), "untouched");
+        }
     }
 }

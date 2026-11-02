@@ -226,6 +226,7 @@ pub(super) fn candidate_server_urls(
 }
 
 fn decode_verified_head(
+    paths: &Paths,
     url_label: String,
     bytes: Vec<u8>,
     config: &Config,
@@ -244,6 +245,11 @@ fn decode_verified_head(
     if envelope::signer_public(&opened.seed)? != envelope.signer {
         return Err(Error::new(
             "the admin locker's key does not match the envelope's signer",
+        ));
+    }
+    if super::admin_removed_in_log(paths, config, &envelope, identity, &opened.doc) {
+        return Err(Error::new(
+            "this Mac is not an active admin in the served vault head",
         ));
     }
     Ok(ObservedHead {
@@ -284,8 +290,14 @@ pub fn read_server_heads(paths: &Paths, extra_urls: &[String]) -> crate::Result<
     {
         if let Ok(Fetched::Body(bytes)) =
             transport::fetch(&config.source, None, SERVER_HEAD_DEADLINE)
-            && let Ok(head) =
-                decode_verified_head(path.display().to_string(), bytes, &config, &pin, &identity)
+            && let Ok(head) = decode_verified_head(
+                paths,
+                path.display().to_string(),
+                bytes,
+                &config,
+                &pin,
+                &identity,
+            )
         {
             out.push(head);
         }
@@ -293,9 +305,12 @@ pub fn read_server_heads(paths: &Paths, extra_urls: &[String]) -> crate::Result<
     }
 
     for url in candidate_server_urls(paths, &config, extra_urls) {
-        if let Ok(Fetched::Body(bytes)) =
-            transport::fetch_within(&url, None, servers_within(SERVER_HEAD_DEADLINE))
-            && let Ok(head) = decode_verified_head(url, bytes, &config, &pin, &identity)
+        if let Ok(Fetched::Body(bytes)) = transport::fetch_within_as(
+            &url,
+            None,
+            servers_within(SERVER_HEAD_DEADLINE),
+            Some(&identity.recipient().to_bech32()),
+        ) && let Ok(head) = decode_verified_head(paths, url, bytes, &config, &pin, &identity)
         {
             out.push(head);
         }
@@ -354,6 +369,14 @@ pub(super) fn reconcile_merged_metadata(
     doc: &mut Document,
     heads: &[ObservedHead],
 ) -> crate::Result<()> {
+    reconcile_merged_metadata_with_log(doc, heads, None)
+}
+
+pub(super) fn reconcile_merged_metadata_with_log(
+    doc: &mut Document,
+    heads: &[ObservedHead],
+    log: Option<&crate::membership_log::Log>,
+) -> crate::Result<()> {
     if heads.is_empty() {
         return Ok(());
     }
@@ -384,67 +407,213 @@ pub(super) fn reconcile_merged_metadata(
     keep_policy(doc, order.iter().map(|&idx| &heads[idx].doc))?;
 
     // Merge `aterm-swarm-roster`: grow-only union of `deny_labels` + `deny_nodes`, prune
-    // revoked members, and deterministically assign labels for unioned admissions.
+    // revoked members (cascading their labels and node keys onto the deny-lists), and
+    // deterministically assign labels for unioned admissions.
     let mut any_roster = false;
     let mut merged_roster = SwarmRoster::default();
+    let mut by_seat: Vec<crate::swarm_roster::SwarmMember> = Vec::new();
     let cur_doc = doc.clone();
     for branch_doc in std::iter::once(&cur_doc).chain(order.iter().map(|&idx| &heads[idx].doc)) {
         if let Some(r) = SwarmRoster::from_document(branch_doc)? {
-            if !any_roster {
-                merged_roster = r;
-                any_roster = true;
-            } else {
-                merged_roster.deny_labels.extend(r.deny_labels);
-                merged_roster.deny_nodes.extend(r.deny_nodes);
-                for member in r.members {
-                    if !revoked_recipients.contains(&member.recipient)
-                        && !merged_roster.deny_labels.contains(&member.label)
-                        && member
-                            .node_id
-                            .as_ref()
-                            .is_none_or(|n| !merged_roster.deny_nodes.contains(n))
-                        && member
-                            .node_key
-                            .as_ref()
-                            .is_none_or(|n| !merged_roster.deny_nodes.contains(n))
-                    {
-                        if let Some(existing) = merged_roster
-                            .members
-                            .iter_mut()
-                            .find(|m| m.recipient == member.recipient)
-                        {
-                            if existing.node_key.is_none() {
-                                existing.node_key = member.node_key;
-                            }
-                            if existing.node_id.is_none() {
-                                existing.node_id = member.node_id;
-                            }
-                        } else {
-                            merged_roster.members.push(member);
+            any_roster = true;
+            merged_roster.deny_labels.extend(r.deny_labels);
+            merged_roster.deny_nodes.extend(r.deny_nodes);
+            for member in r.members {
+                if let Some(existing) = by_seat
+                    .iter_mut()
+                    .find(|m| m.recipient == member.recipient && m.label == member.label)
+                {
+                    if existing.node_key.is_none() {
+                        existing.node_key = member.node_key;
+                    }
+                    if existing.node_id.is_none() {
+                        existing.node_id = member.node_id;
+                    }
+                    if existing.hint.is_none() {
+                        existing.hint = member.hint;
+                    }
+                    if existing.claimed_label.is_none() {
+                        existing.claimed_label = member.claimed_label;
+                    }
+                    for alias in member.aliases {
+                        if !existing.aliases.contains(&alias) {
+                            existing.aliases.push(alias);
                         }
                     }
+                } else {
+                    by_seat.push(member);
                 }
             }
         }
     }
     if any_roster {
+        if let Some(log) = log {
+            merged_roster.members = by_seat.clone();
+            let _ = super::roster::lift_restored_from_roster(log, &mut merged_roster);
+            merged_roster.members.clear();
+        }
         merged_roster.canonicalize();
-        let candidates = std::mem::take(&mut merged_roster.members);
-        merged_roster.members = candidates
-            .into_iter()
-            .filter(|m| {
-                !revoked_recipients.contains(&m.recipient)
-                    && !merged_roster.is_label_denied(&m.label)
-                    && !m.aliases.iter().any(|a| merged_roster.is_label_denied(a))
-                    && !merged_roster.is_label_denied(&m.vault_name)
-                    && m.node_id
-                        .as_deref()
-                        .is_none_or(|n| !merged_roster.is_node_denied(n))
-                    && m.node_key
-                        .as_deref()
-                        .is_none_or(|n| !merged_roster.is_node_denied(n))
-            })
+        let mut log_active_labels = BTreeSet::new();
+        let mut log_active_nodes = BTreeSet::new();
+        if let Some(l) = log {
+            let mem = l.membership();
+            for (actor, m) in mem.members() {
+                let rec = m.binding.recipient();
+                if !l.recipient_is_removed(&rec)
+                    && !l.audience_left_out(&crate::membership_log::EpochAudience::Everyone, actor)
+                    && !l.audience_left_out_recipient(
+                        &crate::membership_log::EpochAudience::Everyone,
+                        &rec,
+                    )
+                    && !super::log_entries::recipient_denied_by_roster_or_log(
+                        Some(&merged_roster),
+                        l,
+                        &rec,
+                    )
+                {
+                    if let Some((_, c)) = crate::swarm_roster::leading_m_label(&m.label)
+                        .or_else(|| crate::swarm_roster::leading_m_label(&m.name))
+                    {
+                        log_active_labels.insert(c);
+                    }
+                    if let Some(nk) = m.node_key.filter(|k| *k != [0; 32]) {
+                        log_active_nodes.insert(aterm_codec::hex::encode_lower(&nk));
+                    }
+                }
+            }
+            for f in mem.unproved() {
+                if !l.recipient_is_removed(&f.recipient)
+                    && !l.audience_left_out_recipient(
+                        &crate::membership_log::EpochAudience::Everyone,
+                        &f.recipient,
+                    )
+                    && !super::log_entries::recipient_denied_by_roster_or_log(
+                        Some(&merged_roster),
+                        l,
+                        &f.recipient,
+                    )
+                {
+                    if let Some((_, c)) = crate::swarm_roster::leading_m_label(&f.label)
+                        .or_else(|| crate::swarm_roster::leading_m_label(&f.name))
+                    {
+                        log_active_labels.insert(c);
+                    }
+                    if let Some(nk) = f.node_key.filter(|k| *k != [0; 32]) {
+                        log_active_nodes.insert(aterm_codec::hex::encode_lower(&nk));
+                    }
+                }
+            }
+        }
+        let mut denied_roster_recipients = BTreeSet::new();
+        let mut stale_labels: Vec<String> = Vec::new();
+        let mut stale_nodes: Vec<String> = Vec::new();
+        for m in by_seat {
+            let removed_in_log = log.is_some_and(|l| {
+                Recipient::parse(&m.recipient).is_ok_and(|rec| {
+                    l.recipient_is_removed(&rec)
+                        || l.audience_left_out_recipient(
+                            &crate::membership_log::EpochAudience::Everyone,
+                            &rec,
+                        )
+                        || super::log_entries::recipient_denied_by_roster_or_log(
+                            Some(&merged_roster),
+                            l,
+                            &rec,
+                        )
+                })
+            });
+            let row_denied = revoked_recipients.contains(&m.recipient)
+                || removed_in_log
+                || merged_roster.is_label_denied(&m.label)
+                || m.aliases.iter().any(|a| merged_roster.is_label_denied(a))
+                || m.claimed_label
+                    .as_deref()
+                    .filter(|c| crate::membership_log::is_label(c))
+                    .is_some_and(|c| merged_roster.is_label_denied(c))
+                || m.node_id
+                    .as_deref()
+                    .is_some_and(|n| merged_roster.is_node_denied(n))
+                || m.node_key
+                    .as_deref()
+                    .is_some_and(|n| merged_roster.is_node_denied(n));
+            if row_denied {
+                denied_roster_recipients.insert(m.recipient);
+                if let Some(nid) = m.node_id {
+                    stale_nodes.push(nid);
+                }
+                if let Some(nk) = m.node_key {
+                    stale_nodes.push(nk);
+                }
+                stale_labels.push(m.label);
+                stale_labels.extend(m.aliases);
+                if let Some(claimed) = m
+                    .claimed_label
+                    .filter(|c| crate::membership_log::is_label(c))
+                {
+                    stale_labels.push(claimed);
+                }
+            } else if let Some(existing) = merged_roster
+                .members
+                .iter_mut()
+                .find(|e| e.recipient == m.recipient)
+            {
+                if existing.node_key.is_none() {
+                    existing.node_key = m.node_key;
+                }
+                if existing.node_id.is_none() {
+                    existing.node_id = m.node_id;
+                }
+                if existing.hint.is_none() {
+                    existing.hint = m.hint;
+                }
+                for alias in m.aliases {
+                    if !existing.aliases.contains(&alias) {
+                        existing.aliases.push(alias);
+                    }
+                }
+            } else {
+                merged_roster.members.push(m);
+            }
+        }
+        let surviving_nodes: BTreeSet<String> = merged_roster
+            .members
+            .iter()
+            .flat_map(|m| m.node_id.iter().chain(m.node_key.iter()))
+            .map(|n| n.trim().to_ascii_lowercase())
             .collect();
+        for node in stale_nodes {
+            let lower = node.trim().to_ascii_lowercase();
+            if !surviving_nodes.contains(&lower) && !log_active_nodes.contains(&lower) {
+                merged_roster.deny_nodes.push(node);
+            }
+        }
+        let rostered_recipients: BTreeSet<String> = merged_roster
+            .members
+            .iter()
+            .map(|m| m.recipient.clone())
+            .collect();
+        let mut surviving_labels: BTreeSet<String> = merged_roster
+            .members
+            .iter()
+            .flat_map(|m| std::iter::once(m.label.clone()).chain(m.aliases.iter().cloned()))
+            .map(|lbl| crate::swarm_roster::leading_m_label(&lbl).map_or(lbl, |(_, c)| c))
+            .collect();
+        for machine in doc.machines() {
+            if !revoked_recipients.contains(&machine.recipient)
+                && !denied_roster_recipients.contains(&machine.recipient)
+                && !rostered_recipients.contains(&machine.recipient)
+                && let Some((_, c)) = crate::swarm_roster::leading_m_label(&machine.name)
+            {
+                surviving_labels.insert(c);
+            }
+        }
+        for lbl in stale_labels {
+            let canon = crate::swarm_roster::leading_m_label(&lbl).map_or(lbl, |(_, c)| c);
+            if !surviving_labels.contains(&canon) && !log_active_labels.contains(&canon) {
+                merged_roster.deny_labels.push(canon);
+            }
+        }
+        merged_roster.canonicalize();
         // Ensure deterministic unique labels across merged branches (`§3.4 rule 5`: recompute
         // conflicting labels rather than allowing two approvers to hand out one label).
         let policy = SwarmPolicy::from_document(doc)?.unwrap_or_default();
@@ -494,7 +663,23 @@ pub(super) fn reconcile_merged_metadata(
         }
         merged_roster.members = deduped_members;
         for (recipient, vault_name) in &newly_admitted {
+            let removed_in_log = log.is_some_and(|l| {
+                Recipient::parse(recipient).is_ok_and(|rec| {
+                    l.recipient_is_removed(&rec)
+                        || l.audience_left_out_recipient(
+                            &crate::membership_log::EpochAudience::Everyone,
+                            &rec,
+                        )
+                        || super::log_entries::recipient_denied_by_roster_or_log(
+                            Some(&merged_roster),
+                            l,
+                            &rec,
+                        )
+                })
+            });
             if merged_roster.member_by_recipient(recipient).is_none()
+                && !denied_roster_recipients.contains(recipient)
+                && !removed_in_log
                 && !merged_roster.is_label_denied(vault_name)
             {
                 assign_newcomer(
@@ -552,7 +737,7 @@ pub(super) fn reconcile_merged_metadata(
 
     // Complete any half-done revoke cascade (e.g. account-pool warm slots or steward lease of a
     // Mac revoked on one branch while reallocated or renewed on another).
-    let _ = retirement::repair_half_done_revokes(doc)?;
+    let _ = retirement::repair_half_done_revokes_with_log(doc, log)?;
     Ok(())
 }
 
@@ -792,19 +977,34 @@ pub(super) fn publish_to_servers_for_admin(
     urls: &[String],
     bytes: &[u8],
 ) -> crate::Result<Vec<(String, crate::Result<()>)>> {
+    publish_to_servers_for_admin_until(paths, expected, urls, bytes, None)
+}
+
+pub(super) fn publish_to_servers_for_admin_until(
+    paths: &Paths,
+    expected: &Config,
+    urls: &[String],
+    bytes: &[u8],
+    deadline: Option<std::time::Instant>,
+) -> crate::Result<Vec<(String, crate::Result<()>)>> {
     // Publishes from this Mac PUT one at a time, so every server hears two of them in the order
     // they began (`publish_lock`). The state lock, which every secrets command on this Mac takes,
     // covers only the check that the configuration is still the one `bytes` were sealed for and
     // goes before any PUT: held across them, a server that takes a PUT and never answers held
     // every such command for the PUT's exchange deadline.
-    let _publishing = super::publish_lock(paths)?;
-    drop(super::configured_admin(paths, expected)?);
+    let _publishing = match deadline {
+        Some(deadline) => {
+            super::StateLock::take_at_until(paths, &paths.publish_lock_file(), deadline)?
+        }
+        None => super::publish_lock(paths)?,
+    };
+    drop(super::configured_admin_until(paths, expected, deadline)?);
     // Every PUT runs at once. Each one has its own exchange deadline, and the list holds up to
     // `discover::MAX_CANDIDATES` browsed servers that nothing has verified. Run one after
     // another, a server that accepts and never answers would hold the publish for one deadline
     // per server. Run at once, it holds it for one deadline, as the single PUT to
     // `config.source` did before F6.
-    let put = |url: &String| transport::publish(&Source::Url(url.clone()), bytes);
+    let put = |url: &String| transport::publish_until(&Source::Url(url.clone()), bytes, deadline);
     let results = std::thread::scope(|scope| {
         let handles: Vec<_> = urls
             .iter()
@@ -882,7 +1082,13 @@ pub fn verify_approved_in_served_head(
         .config
         .signer
         .ok_or_else(|| Error::new("vault has no pinned signer for read-back"))?;
-    let served_bytes = match transport::fetch(&admin.config.source, None, READ_BACK_DEADLINE)? {
+    let identity = machine_identity(paths)?;
+    let served_bytes = match transport::fetch_as(
+        &admin.config.source,
+        None,
+        READ_BACK_DEADLINE,
+        Some(&identity.recipient().to_bech32()),
+    )? {
         Fetched::Body(bytes) => bytes,
         Fetched::Missing | Fetched::NoNewer(_) => {
             return Err(Error::new(
@@ -903,13 +1109,18 @@ pub fn verify_approved_in_served_head(
             served_env.seq
         )));
     }
-    let identity = machine_identity(paths)?;
     let locker = served_env
         .admin_locker()
         .ok_or_else(|| Error::new("read-back envelope has no admin locker"))?;
     let plain = age::decrypt(std::slice::from_ref(&identity), locker.armored.as_bytes())
         .map_err(|e| Error::new(format!("read-back admin locker: {e}")))?;
     let opened = parse_admin(&plain)?;
+    opened.admissions.validate(&opened.doc, served_env.seq)?;
+    if envelope::signer_public(&opened.seed)? != served_env.signer {
+        return Err(Error::new(
+            "read-back admin locker's key does not match the envelope's signer",
+        ));
+    }
     let machines = opened.doc.machines();
     let revoked: BTreeSet<String> = opened.doc.code_only().into_iter().collect();
     for recipient in approved_recipients {

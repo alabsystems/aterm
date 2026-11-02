@@ -246,10 +246,11 @@ impl TerminalHandler<'_> {
                 .get(1)
                 .and_then(|p| std::str::from_utf8(p).ok())
                 .and_then(|param_str| {
-                    param_str.split(':').find_map(|kv| {
-                        kv.strip_prefix("id=")
-                            .filter(|v| !v.is_empty() && v.len() <= 256)
-                    })
+                    param_str
+                        .split(':')
+                        .rev()
+                        .find_map(|kv| kv.strip_prefix("id="))
+                        .filter(|v| !v.is_empty() && v.len() <= 256)
                 });
             self.transient.current_hyperlink = Some(std::sync::Arc::from(uri));
             self.transient.current_hyperlink_id = id.map(std::sync::Arc::from);
@@ -741,6 +742,14 @@ mod tests {
             );
             assert_eq!(term.hyperlink_at_visible(0, 1), None, "{refused:.40}");
         }
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b]8;id=first:id=second;https://a.example/\x07");
+        assert_eq!(
+            term.transient.current_hyperlink_id.as_deref(),
+            Some("second")
+        );
+        term.process(b"\x1b]8;id=first:id=;https://a.example/\x07");
+        assert_eq!(term.transient.current_hyperlink_id, None);
     }
 
     #[test]

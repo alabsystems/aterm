@@ -42,6 +42,7 @@ pub(crate) fn spawn_shell(
         sandbox_wrap,
         aterm_sandbox::Limits::shell_default(),
         None,
+        None,
     )
     .map(|s| s.master)
 }
@@ -111,7 +112,8 @@ fn pts_name(master: libc::c_int) -> io::Result<CString> {
         return Err(io::Error::last_os_error());
     }
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-    // SAFETY: `buf` is a live owned buffer of `buf.len()` bytes that `ptsname_r` NUL-terminates.
+    // SAFETY: `buf` is a live owned buffer and we pass its exact length; `ptsname_r` either
+    // NUL-terminates within that length or fails (ERANGE).
     let rc = unsafe { libc::ptsname_r(master, buf.as_mut_ptr(), buf.len()) };
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     if rc != 0 {
@@ -911,6 +913,17 @@ fn fill_kits(kits: &std::sync::Mutex<KitPool>, depth: usize) -> io::Result<usize
     Ok(opened)
 }
 
+/// A descriptor [`spawn_shell_with_pid_cell_px`] hands its child at a fixed number: the same
+/// open file as `fd`, at `at` (above 2), open across the exec. The child holds it beside its
+/// stdio and nothing else, a descriptor kept out of children ([`aterm_uds::kept_out`]) included.
+#[derive(Debug, Clone, Copy)]
+pub struct PassedFd<'fd> {
+    /// The parent's descriptor, open until the spawn returns.
+    pub fd: std::os::fd::BorrowedFd<'fd>,
+    /// The number the child holds it at.
+    pub at: libc::c_int,
+}
+
 /// Spawns a shell in a fresh `rows`×`cols` PTY, returning [`SpawnedShell`].
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_shell_with_pid(
@@ -941,10 +954,13 @@ pub fn spawn_shell_with_pid(
         sandbox_wrap,
         limits,
         None,
+        None,
     )
 }
 
-/// [`spawn_shell_with_pid`], filling the winsize pixel fields from the host's cell metrics.
+/// [`spawn_shell_with_pid`], filling the winsize pixel fields from the host's cell metrics, and
+/// handing the child `pass` ([`PassedFd`]) when there is one. A pass the child cannot put in
+/// place fails the spawn closed: the child exits before its exec and the call is an `Err`.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -974,6 +990,14 @@ pub fn spawn_shell_with_pid(
     aterm_spec_anchor::refines(
         machine = "fork_exec",
         action = "CloseMaster",
+        project = "aterm_pty::child_spawn::project_pc"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "fork_exec",
+        action = "PassFd",
         project = "aterm_pty::child_spawn::project_pc"
     )
 )]
@@ -1014,9 +1038,14 @@ pub fn spawn_shell_with_pid_cell_px(
     sandbox_wrap: Option<&str>,
     limits: aterm_sandbox::Limits,
     cell_px: Option<(u16, u16)>,
+    pass: Option<PassedFd<'_>>,
 ) -> io::Result<SpawnedShell> {
     aterm_cap::require(cap, aterm_cap::Tier::Trusted)
         .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e.to_string()))?;
+    let handed = pass.map(|p| std::os::fd::AsRawFd::as_raw_fd(&p.fd));
+    let pass = pass
+        .map(|p| aterm_uds::spawnfd::PassAt::new(p.fd, p.at))
+        .transpose()?;
 
     let (shell, origin) = crate::select_shell_with_origin(shell_override.map(std::ffi::OsStr::new));
     let shell_from = origin.suffix();
@@ -1088,7 +1117,12 @@ pub fn spawn_shell_with_pid_cell_px(
     argv.push(ptr::null());
 
     let chdir_c: Option<CString> = match cwd {
-        Some(dir) => CString::new(dir.as_bytes()).ok(),
+        Some(dir) => Some(CString::new(dir.as_bytes()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the working directory contains a NUL",
+            )
+        })?),
         None => default_start_folder().and_then(|h| CString::new(h.as_bytes()).ok()),
     };
 
@@ -1113,8 +1147,16 @@ pub fn spawn_shell_with_pid_cell_px(
     };
     let (master, slave, status_rd, status_wr) = kit.into_raw();
     let inherit_strip = aterm_uds::spawnfd::InheritStrip::prepare();
+    // A passed descriptor kept out of children (`aterm_uds::kept_out`) is unmarked for this fork
+    // alone, so the child has the copy it puts at its number.
+    let spawning = aterm_uds::spawn_lock::handing(handed.as_slice());
     // SAFETY: `fork` takes no arguments and returns child pid, 0, or -1.
     let pid = unsafe { libc::fork() };
+    if pid != 0 {
+        // The parent's hold ends with the copy. The child's is never released (no lock call is
+        // safe there): it execs or `_exit`s.
+        drop(spawning);
+    }
     if pid < 0 {
         let err = io::Error::last_os_error();
         // SAFETY: fork failed, so no child exists; closing the four owned descriptors.
@@ -1132,6 +1174,7 @@ pub fn spawn_shell_with_pid_cell_px(
             libc::close(status_rd);
         }
         // SAFETY: `slave` is the child's inherited pty fd; `login_tty`/`dup2`/`close` are a-s-safe.
+        // Nothing here allocates, takes a lock, or reads the environment.
         unsafe {
             if libc::login_tty(slave) == -1 {
                 libc::dup2(slave, libc::STDIN_FILENO);
@@ -1142,7 +1185,8 @@ pub fn spawn_shell_with_pid_cell_px(
                 }
             }
         }
-        // SAFETY: `sa` and `empty` are zeroed/initialized locals; signal calls are a-s-safe.
+        // SAFETY: `sa` and `empty` are zeroed/initialized locals; signal calls are a-s-safe; no
+        // allocation, no locks.
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
             sa.sa_sigaction = libc::SIG_DFL;
@@ -1180,9 +1224,13 @@ pub fn spawn_shell_with_pid_cell_px(
             }
         }
         if let Some(dir) = &chdir_c {
-            // SAFETY: `dir` is a valid NUL-terminated path; `chdir` is async-signal-safe.
+            // SAFETY: the path is a live C string; chdir, write and _exit are async-signal-safe.
             unsafe {
-                libc::chdir(dir.as_ptr());
+                if libc::chdir(dir.as_ptr()) != 0 {
+                    let b: u8 = b'C';
+                    libc::write(status_wr, std::ptr::addr_of!(b).cast::<libc::c_void>(), 1);
+                    libc::_exit(126);
+                }
             }
         }
         // SAFETY: `master` is this child's inherited master fd; `close` is async-signal-safe.
@@ -1191,6 +1239,19 @@ pub fn spawn_shell_with_pid_cell_px(
                 libc::close(master);
             }
         }
+        let status_wr = match pass {
+            None => status_wr,
+            // SAFETY: the forked child before its exec, after the strip and the master's close; `status_wr` is its exec-status write end.
+            Some(pass) => match unsafe { place_passed(pass, status_wr) } {
+                Ok(status_wr) => status_wr,
+                // SAFETY: `write` and `_exit` are async-signal-safe; `b` is a 1-byte stack local.
+                Err(status_wr) => unsafe {
+                    let b: u8 = b'P';
+                    libc::write(status_wr, std::ptr::addr_of!(b).cast::<libc::c_void>(), 1);
+                    libc::_exit(126);
+                },
+            },
+        };
         #[cfg(test)]
         pre_exec_stall::in_child();
         // SAFETY: `exec_target` is a live C string, and `argv` and `envp` null-terminated arrays
@@ -1214,10 +1275,24 @@ pub fn spawn_shell_with_pid_cell_px(
     retire_spent(status_rd);
     let failure: Option<(io::ErrorKind, String)> = match status {
         ExecStatus::Execed => None,
+        ExecStatus::FailedBeforeExec(b'C') => Some((
+            io::ErrorKind::Other,
+            "the child's working directory could not be entered; no program was executed"
+                .to_owned(),
+        )),
         ExecStatus::FailedBeforeExec(b'S') => Some((
             io::ErrorKind::PermissionDenied,
             "sandbox confinement failed in child (fail-closed: shell not exec'd, _exit(126))"
                 .to_owned(),
+        )),
+        ExecStatus::FailedBeforeExec(b'P') => Some((
+            io::ErrorKind::Other,
+            format!(
+                "the child could not hold its passed descriptor at {} (fail-closed: `{}` not \
+                 exec'd, _exit(126))",
+                pass.map_or(-1, aterm_uds::spawnfd::PassAt::at),
+                exec_target.to_string_lossy()
+            ),
         )),
         ExecStatus::FailedBeforeExec(_) => Some((
             io::ErrorKind::Other,
@@ -1258,6 +1333,36 @@ pub fn spawn_shell_with_pid_cell_px(
         return Err(io::Error::new(kind, what));
     }
     Ok(SpawnedShell { master, pid })
+}
+
+/// In the forked child, after the master's close: put `pass` at its number. The exec-status
+/// write end moves off that number first when it sits there (to the lowest free number from 3,
+/// still close-on-exec), because the pass's `dup2` would close it: the parent would read that
+/// end-of-file as the exec, and a failed exec would be told as a start. Answers the write end's
+/// number, or `Err` with it when the pass could not be put in place.
+///
+/// # Safety
+/// Only in the forked child before its exec, after the descriptor strip, with `status_wr` its
+/// exec-status write end and nothing else it still needs at `pass.at()`.
+unsafe fn place_passed(
+    pass: aterm_uds::spawnfd::PassAt,
+    status_wr: libc::c_int,
+) -> Result<libc::c_int, libc::c_int> {
+    let mut status_wr = status_wr;
+    if status_wr == pass.at() {
+        // SAFETY: `F_DUPFD_CLOEXEC` takes integers and touches no memory.
+        let moved = unsafe { libc::fcntl(status_wr, libc::F_DUPFD_CLOEXEC, 3) };
+        if moved < 0 {
+            return Err(status_wr);
+        }
+        status_wr = moved;
+    }
+    // SAFETY: the caller's contract: the forked child after the strip, and `at` holds nothing it needs (the status end has left it).
+    if unsafe { pass.apply() } {
+        Ok(status_wr)
+    } else {
+        Err(status_wr)
+    }
 }
 
 /// Hang up a spawned shell: `SIGHUP` to its process group (`pid` is the session leader and pgid).
@@ -1309,13 +1414,19 @@ fn process_birth_platform(pid: i32) -> Option<u64> {
 
 #[cfg(target_os = "linux")]
 fn process_birth_platform(pid: i32) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let stat =
+        aterm_uds::process::read_proc_text(std::path::Path::new(&format!("/proc/{pid}/stat")))
+            .ok()?;
     let rest = &stat[stat.rfind(')')? + 1..];
     let mut fields = rest.split_ascii_whitespace();
     if fields.next()? == "Z" {
         return None;
     }
-    fields.nth(18)?.parse().ok()
+    fields
+        .nth(18)
+        .filter(|s| s.bytes().all(|b| b.is_ascii_digit()))?
+        .parse()
+        .ok()
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -1327,17 +1438,22 @@ fn is_unreaped_child(pid: i32) -> bool {
     let Ok(id) = libc::id_t::try_from(pid) else {
         return false;
     };
-    let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
-    // SAFETY: `info` is a valid `siginfo_t` out-param and `WNOWAIT` leaves child state intact.
-    let rc = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            id,
-            info.as_mut_ptr(),
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-        )
-    };
-    rc == 0
+    loop {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        // SAFETY: `info` is a valid `siginfo_t` out-param and `WNOWAIT` leaves child state intact.
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                id,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return rc == 0;
+    }
 }
 
 /// Records the [`ShellIdentity`] of a shell this process just spawned.
@@ -1406,8 +1522,15 @@ pub fn collect_exit_status(pid: i32) -> Option<crate::ChildExit> {
         return None;
     }
     let mut status: libc::c_int = 0;
-    // SAFETY: `WNOHANG` `waitpid` with a valid out-param.
-    if unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } != pid {
+    let waited = loop {
+        // SAFETY: `WNOHANG` `waitpid` with a valid out-param.
+        let rc = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if rc < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        break rc;
+    };
+    if waited != pid {
         return None;
     }
     if libc::WIFEXITED(status) {
@@ -1835,6 +1958,30 @@ pub fn poll_writable(fd: i32, timeout_ms: i32) -> io::Result<bool> {
     }
 }
 
+/// Whether the PTY master `master` holds output the slave wrote and nobody has read yet, asked
+/// now (a `poll` for `POLLIN` that does not wait); an error or a hangup answers yes, so a caller
+/// that acts only on a quiet master never acts on one it could not read. A `false` answer means
+/// every byte the slave wrote before the call was read already: the macOS master's queue is
+/// written within the slave's own `write`, and Linux's `n_tty` poll first flushes the pty's
+/// pending buffer work (the work queue that moves a slave's write to the master) before it
+/// answers no.
+#[must_use]
+pub fn has_unread(master: i32) -> bool {
+    let mut p = libc::pollfd {
+        fd: master,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: `p` is a valid pollfd for the duration of the call; nfds == 1.
+        let r = unsafe { libc::poll(&mut p, 1, 0) };
+        if r < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return r != 0;
+    }
+}
+
 /// Duplicates `fd` with `F_DUPFD_CLOEXEC` into an owned [`std::os::fd::OwnedFd`].
 #[inline]
 pub fn dup_fd(fd: i32) -> io::Result<std::os::fd::OwnedFd> {
@@ -2149,7 +2296,8 @@ pub enum ReadOutcome {
     Eof,
     /// The wake pipe fired because the owning session closed.
     Wake,
-    /// The wakeless poll timed out with no master activity.
+    /// The poll timed out with no activity: the wakeless poll's own timeout, or the caller's
+    /// ([`read_or_poke`]'s `within_ms`).
     Idle,
     /// The shell's exit watch (`exit_rd`) fired.
     Exited,
@@ -2171,6 +2319,86 @@ const fn exit_fired(entry: &libc::pollfd) -> bool {
 
 const WAKELESS_POLL_TIMEOUT_MS: libc::c_int = 250;
 
+struct ReadFds {
+    master: i32,
+    wake: i32,
+    exit: i32,
+    process: i32,
+    poke: i32,
+}
+
+trait ReadWait {
+    fn now(&mut self) -> std::time::Instant;
+    fn poll(&mut self, fds: &mut [libc::pollfd], timeout: i32) -> io::Result<usize>;
+    fn read(&mut self, master: i32, buf: &mut [u8]) -> io::Result<usize>;
+}
+
+struct SystemReadWait;
+
+impl ReadWait for SystemReadWait {
+    fn now(&mut self) -> std::time::Instant {
+        std::time::Instant::now()
+    }
+
+    fn poll(&mut self, fds: &mut [libc::pollfd], timeout: i32) -> io::Result<usize> {
+        let count = libc::nfds_t::try_from(fds.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "poll descriptor count"))?;
+        // SAFETY: the initialized descriptor slice remains writable for its exact count.
+        let result = unsafe { libc::poll(fds.as_mut_ptr(), count, timeout) };
+        if result < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(result as usize)
+        }
+    }
+
+    fn read(&mut self, master: i32, buf: &mut [u8]) -> io::Result<usize> {
+        let result = read(master, buf);
+        if result < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(result as usize)
+        }
+    }
+}
+
+/// One original wait bound. Even a zero bound permits its initial nonblocking ready read;
+/// every later retry consumes elapsed monotonic time instead of restarting that bound.
+struct ReadDeadline {
+    until: Option<std::time::Instant>,
+    first: bool,
+}
+
+impl ReadDeadline {
+    fn new(timeout: i32, wait: &mut impl ReadWait) -> Option<Self> {
+        let until = if timeout < 0 {
+            None
+        } else {
+            Some(
+                wait.now()
+                    .checked_add(std::time::Duration::from_millis(timeout as u64))?,
+            )
+        };
+        Some(Self { until, first: true })
+    }
+
+    fn next(&mut self, wait: &mut impl ReadWait) -> Option<i32> {
+        let Some(until) = self.until else {
+            return Some(-1);
+        };
+        let now = wait.now();
+        if !self.first && now >= until {
+            return None;
+        }
+        self.first = false;
+        let millis = until
+            .saturating_duration_since(now)
+            .as_nanos()
+            .div_ceil(1_000_000);
+        Some(i32::try_from(millis).unwrap_or(i32::MAX))
+    }
+}
+
 /// Block until the master is readable (or EOF), `wake_rd` fires, or `exit_rd` fires.
 pub fn read_or_wake(
     master: i32,
@@ -2179,11 +2407,14 @@ pub fn read_or_wake(
     exit_rd: i32,
     proc_rd: i32,
 ) -> ReadOutcome {
-    read_or_poke(master, buf, wake_rd, exit_rd, proc_rd, -1)
+    read_or_poke(master, buf, wake_rd, exit_rd, proc_rd, -1, -1)
 }
 
 /// [`read_or_wake`] that also answers [`ReadOutcome::Poke`] when `poke_rd` (`-1` for none) fires,
-/// before it reads the master.
+/// before it reads the master, and [`ReadOutcome::Idle`] when its original `within_ms` wait
+/// expires, including time spent in interrupted polls or reads and ignored watch readiness.
+/// A zero bound still reads immediately ready data once; any negative bound is unbounded.
+/// A wakeless poll keeps its own 250 ms cap, the shorter finite bound counting.
 pub fn read_or_poke(
     master: i32,
     buf: &mut [u8],
@@ -2191,7 +2422,47 @@ pub fn read_or_poke(
     exit_rd: i32,
     proc_rd: i32,
     poke_rd: i32,
+    within_ms: libc::c_int,
 ) -> ReadOutcome {
+    read_or_poke_with(
+        ReadFds {
+            master,
+            wake: wake_rd,
+            exit: exit_rd,
+            process: proc_rd,
+            poke: poke_rd,
+        },
+        buf,
+        within_ms,
+        &mut SystemReadWait,
+    )
+}
+
+fn read_or_poke_with(
+    fds: ReadFds,
+    buf: &mut [u8],
+    within_ms: i32,
+    wait: &mut impl ReadWait,
+) -> ReadOutcome {
+    let ReadFds {
+        master,
+        wake: wake_rd,
+        exit: exit_rd,
+        process: proc_rd,
+        poke: poke_rd,
+    } = fds;
+    let timeout = if wake_rd < 0 {
+        if within_ms < 0 {
+            WAKELESS_POLL_TIMEOUT_MS
+        } else {
+            within_ms.min(WAKELESS_POLL_TIMEOUT_MS)
+        }
+    } else {
+        within_ms
+    };
+    let Some(mut deadline) = ReadDeadline::new(timeout, wait) else {
+        return ReadOutcome::Idle;
+    };
     let exit_watch = libc::pollfd {
         fd: exit_rd,
         events: libc::POLLIN,
@@ -2218,16 +2489,19 @@ pub fn read_or_poke(
             proc_watch,
             poke_watch,
         ];
-        // SAFETY: `fds` is a valid 4-element `pollfd` array live for the `poll` call.
-        let r = unsafe { libc::poll(fds.as_mut_ptr(), 4, WAKELESS_POLL_TIMEOUT_MS) };
-        if r < 0 {
-            let e = io::Error::last_os_error();
-            return if e.kind() == io::ErrorKind::Interrupted {
-                ReadOutcome::Idle
-            } else {
-                ReadOutcome::Eof
-            };
-        }
+        let Some(timeout) = deadline.next(wait) else {
+            return ReadOutcome::Idle;
+        };
+        let r = match wait.poll(&mut fds, timeout) {
+            Ok(ready) => ready,
+            Err(error) => {
+                return if error.kind() == io::ErrorKind::Interrupted {
+                    ReadOutcome::Idle
+                } else {
+                    ReadOutcome::Eof
+                };
+            }
+        };
         if r == 0 {
             return ReadOutcome::Idle;
         }
@@ -2242,19 +2516,18 @@ pub fn read_or_poke(
         }
         let ready = libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
         if fds[0].revents & ready != 0 {
-            let n = read(master, buf);
-            if n > 0 {
-                return ReadOutcome::Data(n as usize);
+            match wait.read(master, buf) {
+                Ok(n) if n > 0 => return ReadOutcome::Data(n),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    return ReadOutcome::Idle;
+                }
+                _ => return ReadOutcome::Eof,
             }
-            if n < 0
-                && matches!(
-                    io::Error::last_os_error().kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                )
-            {
-                return ReadOutcome::Idle;
-            }
-            return ReadOutcome::Eof;
         }
         return ReadOutcome::Idle;
     }
@@ -2274,14 +2547,16 @@ pub fn read_or_poke(
         poke_watch,
     ];
     loop {
-        // SAFETY: `fds` is a valid 5-element `pollfd` array live for the `poll` call.
-        let r = unsafe { libc::poll(fds.as_mut_ptr(), 5, -1) };
-        if r < 0 {
-            let e = io::Error::last_os_error();
-            if e.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return ReadOutcome::Eof;
+        let Some(timeout) = deadline.next(wait) else {
+            return ReadOutcome::Idle;
+        };
+        let r = match wait.poll(&mut fds, timeout) {
+            Ok(ready) => ready,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return ReadOutcome::Eof,
+        };
+        if r == 0 {
+            return ReadOutcome::Idle;
         }
         if fds[1].revents != 0 {
             return ReadOutcome::Wake;
@@ -2303,19 +2578,18 @@ pub fn read_or_poke(
         }
         let ready = libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
         if fds[0].revents & ready != 0 {
-            let n = read(master, buf);
-            if n > 0 {
-                return ReadOutcome::Data(n as usize);
+            match wait.read(master, buf) {
+                Ok(n) if n > 0 => return ReadOutcome::Data(n),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    continue;
+                }
+                _ => return ReadOutcome::Eof,
             }
-            if n < 0
-                && matches!(
-                    io::Error::last_os_error().kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                )
-            {
-                continue;
-            }
-            return ReadOutcome::Eof;
         }
     }
 }
@@ -2450,7 +2724,14 @@ fn idle_poll_us() -> u32 {
     static IDLE_POLL_US: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *IDLE_POLL_US.get_or_init(|| {
         aterm_types::dev_seam!("ATERM_PTY_IDLE_POLL_US")
-            .and_then(|v| v.to_string_lossy().trim().parse().ok())
+            .and_then(|v| {
+                let s = v.to_string_lossy();
+                let s = s.trim();
+                s.bytes()
+                    .all(|b| b.is_ascii_digit())
+                    .then(|| s.parse().ok())
+                    .flatten()
+            })
             .unwrap_or(IDLE_POLL_DEFAULT_US)
             .min(IDLE_POLL_CLAMP_US)
     })
@@ -2863,6 +3144,10 @@ fn winsize_pixels(rows: u16, cols: u16, cell_px: Option<(u16, u16)>) -> (u16, u1
 #[cfg(test)]
 #[path = "unix_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "unix_read_deadline_tests.rs"]
+mod read_deadline_tests;
 
 #[cfg(test)]
 #[path = "unix_shell_identity_tests.rs"]

@@ -189,6 +189,9 @@ impl Item for Aside<'_> {
     fn apply(&self) -> Result<(), String> {
         Ok(())
     }
+    fn activation(&self) -> Option<std::sync::Arc<dyn crate::Activation + '_>> {
+        self.inner.activation()
+    }
     fn explain(&self, probe: &Probe) -> Explain {
         self.inner.explain(probe)
     }
@@ -298,6 +301,13 @@ impl Item for HeldBack<'_> {
     }
     fn apply(&self) -> Result<(), String> {
         Err(self.why.clone())
+    }
+    fn activation(&self) -> Option<std::sync::Arc<dyn crate::Activation + '_>> {
+        if self.waits {
+            self.inner.activation()
+        } else {
+            None
+        }
     }
     fn explain(&self, probe: &Probe) -> Explain {
         self.inner.explain(probe)
@@ -972,5 +982,69 @@ mod tests {
             assert!(applied.iter().all(|n| n.load(Ordering::SeqCst) == 0));
             assert!(journal.lines.is_empty(), "{:?}", journal.lines);
         }
+
+        struct DummyAct;
+        impl crate::Activation for DummyAct {
+            fn id(&self) -> String {
+                "act.dummy".into()
+            }
+            fn pending(&self) -> Result<Option<(String, String)>, String> {
+                Ok(None)
+            }
+            fn activate(&self) -> Result<Vec<(String, String)>, String> {
+                Ok(Vec::new())
+            }
+        }
+        struct WithAct(Placed, Arc<DummyAct>);
+        impl Item for WithAct {
+            fn id(&self) -> String {
+                self.0.id()
+            }
+            fn family(&self) -> &'static str {
+                self.0.family()
+            }
+            fn layer(&self) -> Layer {
+                self.0.layer()
+            }
+            fn class(&self) -> Class {
+                self.0.class()
+            }
+            fn title(&self) -> String {
+                self.0.title()
+            }
+            fn probe(&self) -> Probe {
+                self.0.probe()
+            }
+            fn apply(&self) -> Result<(), String> {
+                self.0.apply()
+            }
+            fn explain(&self, probe: &Probe) -> Explain {
+                self.0.explain(probe)
+            }
+            fn activation(&self) -> Option<Arc<dyn crate::Activation + '_>> {
+                Some(Arc::clone(&self.1) as Arc<dyn crate::Activation>)
+            }
+        }
+        let act = Arc::new(DummyAct);
+        let mk = || -> Vec<Box<dyn Item>> {
+            vec![Box::new(WithAct(
+                Placed::new("base.act", Class::Relay, Requires::Account),
+                Arc::clone(&act),
+            ))]
+        };
+        let aside = standing_aside(mk(), &StoodAside::Lock("lock".into()));
+        assert_eq!(
+            aside[0].activation().map(|a| a.id()),
+            Some("act.dummy".into())
+        );
+        let hb = held_back(mk(), "why");
+        assert_eq!(hb[0].activation().map(|a| a.id()), Some("act.dummy".into()));
+        let lai = left_as_is(mk(), "why");
+        assert_eq!(
+            lai[0].activation().map(|a| a.id()),
+            Some("act.dummy".into())
+        );
+        let lta = left_to_another(mk(), "why");
+        assert!(lta[0].activation().is_none());
     }
 }

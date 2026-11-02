@@ -14,9 +14,15 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 mod children;
 
+#[cfg(unix)]
+mod input_unix;
+#[cfg(windows)]
+mod input_windows;
+
 mod complete;
 pub use complete::{
     CompleteOutputError, output_until_complete_stdout, output_until_complete_stdout_from,
+    output_until_complete_stdout_from_observed, output_until_complete_stdout_observed,
 };
 
 /// Maximum duration macOS may hold the first exec of a new binary in `syspolicyd`.
@@ -52,7 +58,12 @@ pub fn try_stamp_exec(home: &std::path::Path) -> std::io::Result<()> {
 pub fn exec_stamp(home: &std::path::Path) -> Option<u64> {
     std::fs::read_to_string(home.join(EXEC_STAMP))
         .ok()
-        .and_then(|text| text.trim().parse::<u64>().ok())
+        .and_then(|text| {
+            let s = text.trim();
+            (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| s.parse::<u64>().ok())
+                .flatten()
+        })
 }
 
 /// Whether the binary copy directory `home` is safe to remove at `now`.
@@ -88,13 +99,15 @@ fn copy_wait_left_at(
 
 #[cfg(any(test, debug_assertions))]
 mod silent;
+#[cfg(all(unix, test))]
+pub(crate) use silent::std_ends_within;
 #[cfg(any(test, debug_assertions))]
 pub use silent::{
     CODESIGN_HANG, ECHO_HANG, KeptUntilRan, ad_hoc_copy, held_words, require_disk_image_service,
     require_trust_service, sign_ad_hoc, stand_in, trust_service_silent,
 };
 #[cfg(all(unix, any(test, debug_assertions)))]
-pub use silent::{cat_echoes, prints};
+pub use silent::{cat_echoes, ends_within, prints};
 
 #[cfg(all(unix, any(test, debug_assertions)))]
 mod stopped;
@@ -265,7 +278,9 @@ impl<T> Pending<T> {
             let (lock, answered) = &*self.slot;
             let slot = lock.lock().unwrap_or_else(PoisonError::into_inner);
             let (mut slot, _) = answered
-                .wait_timeout_while(slot, within, |slot| matches!(slot, Slot::Pending))
+                .wait_timeout_while(slot, within.min(MAX_WITHIN), |slot| {
+                    matches!(slot, Slot::Pending)
+                })
                 .unwrap_or_else(PoisonError::into_inner);
             match std::mem::replace(&mut *slot, Slot::Abandoned) {
                 Slot::Done(Ok(value)) => Some(Ok(value)),
@@ -321,6 +336,11 @@ impl std::error::Error for RunError {}
 
 const POLL_MIN: Duration = Duration::from_millis(1);
 const POLL_MAX: Duration = Duration::from_millis(25);
+const MAX_WITHIN: Duration = Duration::from_secs(10 * 365 * 24 * 3600);
+
+pub(crate) fn saturating_after(now: Instant, within: Duration) -> Instant {
+    now.checked_add(within).unwrap_or_else(|| now + MAX_WITHIN)
+}
 
 const DRAIN_GRACE: Duration = Duration::from_millis(250);
 
@@ -341,7 +361,7 @@ struct Grace {
 
 impl Grace {
     /// A grace that ends at `by`, for a child whose group is not known.
-    #[cfg(test)]
+    #[cfg(any(test, all(unix, debug_assertions)))]
     fn at(by: Instant) -> Self {
         Self {
             by,
@@ -392,6 +412,41 @@ fn pipe_end<T>(_stream: &T) -> Option<PipeEnd> {
 /// Maximum tail bytes retained per output stream by [`output_until`].
 pub const OUTPUT_KEEP: usize = 1024 * 1024;
 
+/// Runs `cmd` with owned secret input, requiring complete stdout and stderr, each at most
+/// `max_output` bytes. The absolute deadline covers input, child execution and both drains.
+/// Direct exit or refusal closes input and requests termination of the owned process scope
+/// (Unix process group, Windows Job), followed by bounded cleanup that can outlive the deadline.
+/// A direct exit's status survives descendant cleanup. Input is scrubbed when sent or stopped.
+/// A process the kernel will not let exit can outlive the termination request.
+///
+/// # Errors
+/// Spawn, input, output or wait errors; `InvalidData` if either output exceeds its bound;
+/// `TimedOut` if execution or complete EOF outlives the deadline. An early stdin `BrokenPipe`
+/// preserves the direct child's result. Unsupported owned-process operations are refused.
+pub fn output_with_input_until(
+    cmd: &mut Command,
+    input: crate::secret::Secret,
+    deadline: Instant,
+    max_output: usize,
+) -> io::Result<Output> {
+    #[cfg(unix)]
+    {
+        input_unix::output_with_input_until(cmd, input, deadline, max_output)
+    }
+    #[cfg(windows)]
+    {
+        input_windows::output_with_input_until(cmd, input, deadline, max_output)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (cmd, input, deadline, max_output);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "bounded child input requires Unix or Windows",
+        ))
+    }
+}
+
 /// Runs `cmd` with closed stdin, draining stdout/stderr and killing its process group at
 /// `deadline`.
 ///
@@ -406,7 +461,7 @@ pub fn output_until(cmd: &mut Command, deadline: Instant) -> Result<Output, RunE
 /// # Errors
 /// Returns the same errors as [`output_until`].
 pub fn output_within(cmd: &mut Command, within: Duration) -> Result<Output, RunError> {
-    output_until(cmd, Instant::now() + within)
+    output_until(cmd, saturating_after(Instant::now(), within))
 }
 
 /// [`output_until`] with `stdin` attached as the child's standard input.
@@ -418,9 +473,12 @@ pub fn output_until_from(
     stdin: Stdio,
     deadline: Instant,
 ) -> Result<Output, RunError> {
-    output_by(cmd, stdin, &mut || {
-        deadline.saturating_duration_since(deadline_now())
-    })
+    output_by(
+        cmd,
+        stdin,
+        &mut || deadline.saturating_duration_since(deadline_now()),
+        &mut end,
+    )
 }
 
 #[cfg(test)]
@@ -431,7 +489,7 @@ thread_local! {
 }
 
 /// Installs or clears the clock [`deadline_now`] reads on this thread.
-#[cfg(all(test, unix))]
+#[cfg(test)]
 fn set_deadline_clock_for_test(clock: Option<Box<dyn Fn() -> Instant>>) {
     DEADLINE_CLOCK_FOR_TEST.with(|slot| *slot.borrow_mut() = clock);
 }
@@ -461,26 +519,48 @@ pub fn output_while_progressing(
 ) -> Result<Output, RunError> {
     let tick = PROGRESS_TICK.min(window / 4).max(Duration::from_millis(1));
     let mut last: Option<(u64, Instant)> = None;
-    output_by(cmd, Stdio::null(), &mut || {
-        let reading = progress();
-        let now = Instant::now();
-        let since = match last {
-            Some((seen, since)) if seen == reading => since,
-            _ => {
-                last = Some((reading, now));
-                now
-            }
-        };
-        let quiet = now.saturating_duration_since(since);
-        window.saturating_sub(quiet).min(tick)
-    })
+    output_by(
+        cmd,
+        Stdio::null(),
+        &mut || {
+            let reading = progress();
+            let now = Instant::now();
+            let since = match last {
+                Some((seen, since)) if seen == reading => since,
+                _ => {
+                    last = Some((reading, now));
+                    now
+                }
+            };
+            let quiet = now.saturating_duration_since(since);
+            window.saturating_sub(quiet).min(tick)
+        },
+        &mut end,
+    )
 }
 
+/// `cmd` run with `stdin` in a process group of its own (on Unix), its output drained, until it
+/// ends or `left()` reads zero; then `overrun` ends it (for `output_until` and
+/// `output_while_progressing`, [`end`]: it and its group killed, and it reaped).
 fn output_by(
     cmd: &mut Command,
     stdin: Stdio,
     left: &mut dyn FnMut() -> Duration,
+    overrun: &mut dyn FnMut(&mut Child),
 ) -> Result<Output, RunError> {
+    let (child, pipes, group) = started(cmd, stdin)?;
+    drained_by(child, pipes, group, left, overrun)?.map_err(|_| RunError::TimedOut)
+}
+
+/// A child's stdout and stderr, taken for a drained wait ([`drained_by`]).
+type Pipes = (
+    Option<std::process::ChildStdout>,
+    Option<std::process::ChildStderr>,
+);
+
+/// `cmd` started with `stdin` in a process group of its own (on Unix), with its stdout and
+/// stderr piped and taken for a drained wait, and the group it leads.
+fn started(cmd: &mut Command, stdin: Stdio) -> Result<(Child, Pipes, Option<u32>), RunError> {
     #[cfg(unix)]
     cmd.process_group(0);
     let mut child = cmd
@@ -489,50 +569,137 @@ fn output_by(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(RunError::Spawn)?;
-    let stdout = child.stdout.take().map(|s| {
+    let pipes = (child.stdout.take(), child.stderr.take());
+    let group = Some(child.id());
+    Ok((child, pipes, group))
+}
+
+/// A started child a drained wait ([`drained_by`]) reads: this crate's, or, for a test that
+/// launches its own, `std`'s.
+trait Waited {
+    /// Its process id.
+    fn pid(&self) -> u32;
+    /// Its exit status once it has exited, reaping it.
+    fn poll_exit(&mut self) -> io::Result<Option<std::process::ExitStatus>>;
+    /// Kill it (and the group it leads, when it leads one) and reap it, however long that takes.
+    fn end(&mut self);
+    /// Let it go, reaped or handed to [`crate::reaper`] (`spawnfd`'s handle does so on its drop).
+    fn release(self);
+}
+
+impl Waited for Child {
+    fn pid(&self) -> u32 {
+        self.id()
+    }
+
+    fn poll_exit(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        self.try_wait()
+    }
+
+    fn end(&mut self) {
+        end(self);
+    }
+
+    fn release(self) {}
+}
+
+#[cfg(all(unix, test))]
+impl Waited for std::process::Child {
+    fn pid(&self) -> u32 {
+        self.id()
+    }
+
+    fn poll_exit(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        self.try_wait()
+    }
+
+    /// The child alone: it is in a group `std` chose, often the test binary's own.
+    fn end(&mut self) {
+        let _ = self.kill();
+        let _ = self.wait();
+    }
+
+    fn release(mut self) {
+        if matches!(self.try_wait(), Ok(None)) {
+            crate::reaper::hand_off(move || !matches!(self.try_wait(), Ok(None)));
+        }
+    }
+}
+
+/// What a drained wait leaves of a run past its time once `overrun` has ended it: its drains,
+/// which hold what it wrote by its end ([`Late::wrote`]).
+#[cfg_attr(not(all(unix, any(test, debug_assertions))), allow(dead_code))]
+struct Late {
+    stdout: Option<Drain>,
+    stderr: Option<Drain>,
+}
+
+impl Late {
+    /// What the run wrote, read until its pipes close or [`DRAIN_GRACE`] has passed.
+    #[cfg(all(unix, any(test, debug_assertions)))]
+    fn wrote(self) -> (Vec<u8>, Vec<u8>) {
+        let grace = Grace::at(saturating_after(Instant::now(), DRAIN_GRACE));
+        let collect = |drain: Option<Drain>| drain.map(|d| d.collect(&grace)).unwrap_or_default();
+        (collect(self.stdout), collect(self.stderr))
+    }
+}
+
+/// `child`, started with `pipes` (its stdout and stderr), waited on with its output drained until
+/// it ends or `left()` reads zero; `group` is its process group when it leads one. Past its time
+/// `overrun` ends it while it still runs, and the answer is [`Late`]; on a failure it is
+/// [`Waited::end`]ed.
+fn drained_by<C: Waited>(
+    mut child: C,
+    pipes: Pipes,
+    group: Option<u32>,
+    left: &mut dyn FnMut() -> Duration,
+    overrun: &mut dyn FnMut(&mut C),
+) -> Result<Result<Output, Late>, RunError> {
+    let stdout = pipes.0.map(|s| {
         let pipe = pipe_end(&s);
         drain(s, pipe, "stdout")
     });
-    let stderr = child.stderr.take().map(|s| {
+    let stderr = pipes.1.map(|s| {
         let pipe = pipe_end(&s);
         drain(s, pipe, "stderr")
     });
     let (stdout, stderr) = match (stdout.transpose(), stderr.transpose()) {
         (Ok(stdout), Ok(stderr)) => (stdout, stderr),
         (Err(e), _) | (_, Err(e)) => {
-            end(&mut child);
+            child.end();
             return Err(RunError::Spawn(e));
         }
     };
-    let mut exit = ExitWait::new(&child);
+    let mut exit = ExitWait::on_pid(child.pid());
     let status = loop {
-        match child.try_wait() {
+        match child.poll_exit() {
             Ok(Some(status)) => break status,
             Ok(None) => {
                 let remaining = left();
                 if remaining.is_zero() {
-                    end(&mut child);
-                    return Err(RunError::TimedOut);
+                    overrun(&mut child);
+                    child.release();
+                    return Ok(Err(Late { stdout, stderr }));
                 }
                 exit.wait(remaining);
             }
             Err(e) => {
-                end(&mut child);
+                child.end();
                 return Err(RunError::Wait(e));
             }
         }
     };
     let grace = Grace {
-        by: Instant::now() + DRAIN_GRACE,
-        until: Instant::now() + left(),
-        group: Some(child.id()),
+        by: saturating_after(Instant::now(), DRAIN_GRACE),
+        until: saturating_after(Instant::now(), left()),
+        group,
     };
     let collect = |drain: Option<Drain>| drain.map(|d| d.collect(&grace)).unwrap_or_default();
-    Ok(Output {
+    Ok(Ok(Output {
         status,
         stdout: collect(stdout),
         stderr: collect(stderr),
-    })
+    }))
 }
 
 /// Kernel-backed wait handle for a single child process's exit.
@@ -629,20 +796,20 @@ fn end(child: &mut Child) {
 /// `SIGKILL` `child` and reap it within `hang`, waiting on its exit as the kernel reports it. One still there at `hang` is left to its handle's drop, which hands it to the reaper: whether a program macOS's program check holds takes its signal is unmeasured.
 pub fn kill_within(child: &mut Child, hang: Duration) {
     let _ = child.kill();
-    reap_within(child, None, Instant::now() + hang);
+    reap_within(child, None, saturating_after(Instant::now(), hang));
 }
 
-fn reap_within(child: &mut Child, exit: Option<&mut ExitWait>, by: Instant) {
+fn reap_within<C: Waited>(child: &mut C, exit: Option<&mut ExitWait>, by: Instant) {
     let mut fallback;
     let exit = match exit {
         Some(exit) => exit,
         None => {
-            fallback = ExitWait::new(child);
+            fallback = ExitWait::on_pid(child.pid());
             &mut fallback
         }
     };
     loop {
-        match child.try_wait() {
+        match child.poll_exit() {
             Ok(Some(_)) | Err(_) => return,
             Ok(None) => {
                 let left = by.saturating_duration_since(Instant::now());
@@ -714,7 +881,7 @@ impl Held {
         };
         if let Err(error) = child.resume() {
             children::kill_group(&mut child);
-            reap_within(&mut child, None, Instant::now() + reap);
+            reap_within(&mut child, None, saturating_after(Instant::now(), reap));
             return Err(RunError::Spawn(error));
         }
         children::output_of_until(child, deadline, reap)
@@ -797,8 +964,8 @@ mod tests {
     #[test]
     fn a_copy_ages_on_the_awake_clock_from_its_exec() {
         use super::{
-            EXEC_STAMP, FIRST_EXEC_HANG, RAN, copy_wait_left_at, exec_stamp, stamp_exec,
-            try_stamp_exec,
+            EXEC_STAMP, FIRST_EXEC_HANG, RAN, copy_wait_left_at, exec_stamp, saturating_after,
+            stamp_exec, try_stamp_exec,
         };
         let copy_may_go_at =
             |home: &std::path::Path, now, awake| copy_wait_left_at(home, now, awake).is_none();
@@ -826,6 +993,8 @@ mod tests {
         );
         assert!(!copy_may_go_at(&home, now, None));
         assert!(copy_may_go_at(&home, later, None));
+        std::fs::write(home.join(EXEC_STAMP), "+1000\n").expect("signed stamp");
+        assert_eq!(exec_stamp(&home), None, "signed stamp holds no reading");
         std::fs::write(home.join(EXEC_STAMP), "").expect("blank stamp");
         assert_eq!(exec_stamp(&home), None, "a blank stamp holds no reading");
         assert!(!copy_may_go_at(&home, now, Some(1000 + hang)));
@@ -845,6 +1014,8 @@ mod tests {
         let first = crate::process::awake_ms();
         let second = crate::process::awake_ms();
         assert!(first <= second, "{first:?} then {second:?}");
+        let now = Instant::now();
+        assert!(saturating_after(now, Duration::MAX) > now);
     }
 
     const DEADLINE: Duration = Duration::from_millis(200);
@@ -1185,9 +1356,12 @@ mod tests {
     /// The pid a shell's `echo` wrote to `file`, once its whole line is there.
     #[cfg(unix)]
     fn pid_in(file: &std::path::Path) -> Option<u32> {
-        std::fs::read_to_string(file)
-            .ok()
-            .and_then(|text| text.strip_suffix('\n')?.parse::<u32>().ok())
+        std::fs::read_to_string(file).ok().and_then(|text| {
+            text.strip_suffix('\n')
+                .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))?
+                .parse::<u32>()
+                .ok()
+        })
     }
 
     /// Waits (under the hang detector) until a shell has written its pid to `file`.

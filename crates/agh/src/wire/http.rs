@@ -11,9 +11,10 @@ use aterm_http::{Body, Client, ProxyMode, SendError, Trust};
 use aterm_uds::secret::Secret;
 
 use crate::identity::EnvSource;
+use crate::policy::PermitTarget;
 use crate::wire::{
     Deadlines, Method, Origin, Phase, WireBody, WireError, WireKind, WireRequest, WireResponse,
-    wire_kind_of,
+    path_only, wire_kind_of,
 };
 
 /// Sends through aterm-http with the platform trust store and the environment's proxy.
@@ -73,12 +74,68 @@ const fn refused(detail: String) -> WireError {
     }
 }
 
-fn guard(req: &WireRequest<'_>) -> Option<WireError> {
-    if !req.method.is_read() {
+/// What a permit's target is called in a refusal: `{owner}/{repo}`, or `/user`.
+fn target_text(target: &PermitTarget) -> String {
+    match target {
+        PermitTarget::Repo(slug) => slug.to_string(),
+        PermitTarget::Identity => "/user".to_string(),
+    }
+}
+
+/// Checks 2–4 of a write's guard (plan §4.6.4): a permit, whose target covers the URL's path on
+/// a credential origin, and whose profile is the credential's. A read never reaches it.
+///
+/// The transport holds no endpoints, so a URL's origin is judged by the credential the
+/// pipeline built for it: `AuthHeader::for_origin` builds one only for the api and uploads
+/// origins, and a write's URL must be that credential's own origin. The pipeline holds the
+/// Identity target to the api origin before it builds the request (`client::write_target`).
+fn write_guard(req: &WireRequest<'_>) -> Option<WireError> {
+    let method = req.method.as_str();
+    let Some(permit) = req.permit else {
         return Some(refused(format!(
-            "agh M1 sends only GET and HEAD; {} is refused",
-            req.method.as_str()
+            "{method} needs a write permit; nothing was sent"
         )));
+    };
+    let parsed = Origin::parse(&req.url);
+    let path = parsed
+        .as_ref()
+        .map_or(req.url.as_str(), |(_, path)| path_only(path));
+    let on_credential_origin = match (&parsed, req.auth) {
+        (Some((origin, _)), Some(auth)) => origin == auth.origin(),
+        // No credential: check 4 refuses it, naming `none`.
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+    if !on_credential_origin || !permit.covers(path) {
+        let shown = match (&parsed, on_credential_origin) {
+            (Some((origin, _)), false) => format!("{}{path}", origin.base()),
+            _ => path.to_string(),
+        };
+        return Some(refused(format!(
+            "the permit covers {}, not {shown}",
+            target_text(permit.target())
+        )));
+    }
+    // No credential is refused by name, never by the sentinel: a profile may be named `none`.
+    match req.auth {
+        None => Some(refused(format!(
+            "the permit is {}'s, the credential none's",
+            permit.profile()
+        ))),
+        Some(auth) if auth.profile() != permit.profile() => Some(refused(format!(
+            "the permit is {}'s, the credential {}'s",
+            permit.profile(),
+            auth.profile()
+        ))),
+        Some(_) => None,
+    }
+}
+
+fn guard(req: &WireRequest<'_>) -> Option<WireError> {
+    if !req.method.is_read()
+        && let Some(refusal) = write_guard(req)
+    {
+        return Some(refusal);
     }
     let auth = req.auth?;
     let target = Origin::parse(&req.url).map(|(origin, _)| origin);
@@ -163,9 +220,11 @@ impl crate::wire::Transport for HttpTransport {
             body,
             limit,
             deadlines,
-            permit: _permit,
-            body_digest: _body_digest,
-            as_profile: _as_profile,
+            // The guard above judged the permit; nothing past it reads the permit, the
+            // body's digest (a tape's) or the profile it speaks as (the credential's own).
+            permit: _,
+            body_digest: _,
+            as_profile: _,
         } = req;
         let mut builder = self.client.request(http_method(method), &url);
         for (name, value) in &headers {
@@ -207,6 +266,10 @@ impl crate::wire::Transport for HttpTransport {
 }
 
 impl super::sealed::Sealed for HttpTransport {}
+
+#[cfg(test)]
+#[path = "permit_tests.rs"]
+mod permit_tests;
 
 #[cfg(test)]
 mod tests {

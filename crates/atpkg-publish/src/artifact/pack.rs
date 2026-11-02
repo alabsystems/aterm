@@ -15,6 +15,7 @@ use super::{arch, package, sign, tarwrite, toolchain, upload};
 use crate::api::{Build, PackOutcome, PackRequest, Packer, Signing};
 use crate::ctx::Ctx;
 use crate::error::{Error, Result};
+use crate::host::ReleaseHost;
 use crate::identity::MachineKey;
 use crate::programs::{self, Harness, Shape};
 use crate::triple::{Os, Triple};
@@ -74,8 +75,15 @@ pub fn rustflags(triple: Triple) -> String {
     cpu_floor(triple).map_or_else(String::new, |cpu| format!("-C target-cpu={cpu}"))
 }
 
-/// Inherited variables a pack's build removes: each outranks, wraps or reroutes the `RUSTC` / `RUSTFLAGS` the pack sets (`CARGO_ENCODED_RUSTFLAGS` beats `RUSTFLAGS`, a wrapper runs whatever it likes, `RUSTUP_TOOLCHAIN` reroutes a proxy).
+/// The variable a harness pack's build reads its own version from (D46): the pack sets it to the
+/// version it signs (`MAJOR.MINOR.0+g<sha9>`, [`dev_version`]), so the binary's `--version` and
+/// its claim say what the manifest says. Every pack's build has an inherited value removed
+/// first ([`SCRUBBED_ENV`]).
+pub const HARNESS_VERSION_ENV: &str = "ALAB_HARNESS_VERSION";
+
+/// Inherited variables a pack's build removes: each outranks, wraps or reroutes the `RUSTC` / `RUSTFLAGS` the pack sets (`CARGO_ENCODED_RUSTFLAGS` beats `RUSTFLAGS`, a wrapper runs whatever it likes, `RUSTUP_TOOLCHAIN` reroutes a proxy), or is a version only the pack may give ([`HARNESS_VERSION_ENV`]).
 pub const SCRUBBED_ENV: &[&str] = &[
+    HARNESS_VERSION_ENV,
     "CARGO_ENCODED_RUSTFLAGS",
     "CARGO_BUILD_RUSTFLAGS",
     "CARGO_BUILD_RUSTC",
@@ -281,12 +289,98 @@ pub fn dev_version(own: &str, sha: &str) -> Result<String> {
     Ok(format!("{own}+g{sha}"))
 }
 
-/// A harness pack's checked metadata and version, from `checkout` at `build`: refused unless
-/// the checkout is clean, its `HEAD` is on `origin/main` of `<owner>/<repo>` (the staging
-/// owner's repo, as codex's package source is: [`package::check_on_main`]), and `build` is its
-/// `HEAD` commit count, so the `+g<sha>` and the build number both name a commit of the
-/// repo's main.
+/// The clean main commit a harness build names, shared by local and packed builds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HarnessIdentity {
+    /// Full lowercase source commit, never a version-prefix guess.
+    pub source: String,
+    /// The source commit's complete-history commit count.
+    pub build_number: Build,
+    /// The harness's own release line with its source build stamp.
+    pub version: String,
+}
+
+impl HarnessIdentity {
+    /// Recheck the exact source after a build, without substituting a newer main.
+    /// # Errors
+    /// Git fails, the checkout or its commit count changed, or any build input is uncommitted.
+    pub fn recheck(&self, checkout: &Path) -> Result<()> {
+        if crate::git::head(checkout)? != self.source
+            || crate::git::rev_count(checkout, "HEAD")? != self.build_number
+            || crate::git::is_pristine(checkout)?.is_some()
+        {
+            return Err(Error::refused(
+                "the harness source changed during the build; refusing its artifact",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// A harness build's checked metadata and identity, from `checkout` at `build`: refused unless
+/// the checkout is pristine ([`crate::git::is_pristine`]), its `HEAD` is on `main` of
+/// `<owner>/<repo>` (the staging owner's repo) as `host` serves it, as codex's package source
+/// is ([`package::check_on_main`]), and `build` is its `HEAD` commit count, so the `+g<sha>`
+/// and the build number both name a commit of the repo's main. A count alone can name several
+/// commits main holds (a merged branch's commit, or a former tip a later merge moved off the
+/// first-parent chain, repeats one): what holds a build number to one commit is this version,
+/// which names it, and [`super::upload::publish`], which never stages a second version under a
+/// build staging or the public owner already holds (D51).
+/// # Errors
+/// Invalid harness metadata, an unclean tree, a missing or foreign main, incomplete history,
+/// an invalid full source SHA, a requested build count mismatch, or a concurrent source change.
+pub fn harness_identity(
+    host: &dyn ReleaseHost,
+    program: &str,
+    h: Harness,
+    meta: Metadata,
+    checkout: &Path,
+    build: Option<Build>,
+    source: (&str, &str),
+) -> Result<(Metadata, HarnessIdentity)> {
+    let meta = held_to_harness(program, h, meta)?;
+    let own = meta.own_version.clone().unwrap_or_default();
+    if let Some(stray) = crate::git::is_pristine(checkout)? {
+        return Err(Error::refused(format!(
+            "{program}: the checkout {} has changes or untracked files ({stray}) — a harness \
+             version is minted from a clean tree or not at all (pack from a fresh clone)",
+            checkout.display()
+        )));
+    }
+    let (owner, repo) = source;
+    let head = crate::git::head(checkout)?;
+    if head.len() != 40 || !head.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err(Error::refused(
+            "a harness needs its full lowercase source SHA",
+        ));
+    }
+    package::check_on_main(
+        host,
+        checkout,
+        owner,
+        repo,
+        &format!("{program}'s HEAD"),
+        &head,
+    )?;
+    let count = crate::git::rev_count(checkout, "HEAD")?;
+    if let Some(build) = build.filter(|build| *build != count) {
+        return Err(Error::refused(format!(
+            "{program}: build {build} is not the checkout's HEAD (it counts {count} commits) — \
+             a harness's build number and its +g<sha> name one commit"
+        )));
+    }
+    let sha = crate::git::run(checkout, &["rev-parse", "--short=9", "HEAD"])?;
+    let identity = HarnessIdentity {
+        source: head,
+        build_number: count,
+        version: dev_version(&own, &sha)?,
+    };
+    identity.recheck(checkout)?;
+    Ok((meta, identity))
+}
+
 fn mint_harness(
+    host: &dyn ReleaseHost,
     program: &str,
     h: Harness,
     meta: Metadata,
@@ -294,27 +388,8 @@ fn mint_harness(
     build: Build,
     source: (&str, &str),
 ) -> Result<(Metadata, String)> {
-    let meta = held_to_harness(program, h, meta)?;
-    let own = meta.own_version.clone().unwrap_or_default();
-    if !crate::git::is_clean(checkout)? {
-        return Err(Error::refused(format!(
-            "{program}: the checkout {} has changes or untracked files — a harness version \
-             is minted from a clean tree or not at all",
-            checkout.display()
-        )));
-    }
-    let (owner, repo) = source;
-    let head = crate::git::head(checkout)?;
-    package::check_on_main(checkout, owner, repo, &format!("{program}'s HEAD"), &head)?;
-    let count = crate::git::rev_count(checkout, "HEAD")?;
-    if count != build {
-        return Err(Error::refused(format!(
-            "{program}: build {build} is not the checkout's HEAD (it counts {count} commits) — \
-             a harness's build number and its +g<sha> name one commit"
-        )));
-    }
-    let sha = crate::git::run(checkout, &["rev-parse", "--short=9", "HEAD"])?;
-    Ok((meta, dev_version(&own, &sha)?))
+    let (meta, identity) = harness_identity(host, program, h, meta, checkout, Some(build), source)?;
+    Ok((meta, identity.version))
 }
 
 /// The workspace members' freshly built bin executables, from a `--message-format=json` stream: sorted, each once.
@@ -509,13 +584,15 @@ fn metadata(
     parse_metadata(&ran.stdout, program)
 }
 
-/// The build, with the lane flag, the target, the CPU floor and the seal's own compiler.
+/// The build, with the lane flag, the target, the CPU floor and the seal's own compiler, and a
+/// harness's minted version as [`HARNESS_VERSION_ENV`] (`harness_version`).
 fn build(
     tools: &dyn Tools,
     tc: &toolchain::Toolchain,
     request: &PackRequest,
     meta: &Metadata,
     stage_dir: &Path,
+    harness_version: Option<&str>,
 ) -> Result<Vec<PathBuf>> {
     let mut args: Vec<OsString> = vec![
         "--unverified".into(),
@@ -538,6 +615,9 @@ fn build(
     run.env.push(("RUSTC".into(), tc.trustc().into()));
     run.env
         .push(("RUSTFLAGS".into(), rustflags(request.triple).into()));
+    if let Some(v) = harness_version {
+        run.env.push((HARNESS_VERSION_ENV.into(), v.into()));
+    }
     let ran = tools
         .run(&run)
         .map_err(|e| Error::cannot_run(format!("the build: {e}")))?;
@@ -566,7 +646,10 @@ fn build(
 pub fn check_stage_dir(ctx: &Ctx, stage_dir: &Path, checkout: &Path) -> Result<()> {
     let checkout = std::fs::canonicalize(checkout)
         .map_err(|e| Error::io(format!("resolve {}", ctx.shown(checkout)), &e))?;
-    let parent = stage_dir.parent().unwrap_or(stage_dir);
+    let parent = stage_dir
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)
         .map_err(|e| Error::io(format!("mkdir {}", ctx.shown(parent)), &e))?;
     let parent = std::fs::canonicalize(parent)
@@ -681,8 +764,7 @@ pub fn write_manifest(
         }
         None => None,
     };
-    std::fs::write(pkg, doc.bytes())
-        .map_err(|e| Error::io(format!("write {}", pkg.display()), &e))?;
+    crate::lane::report::write_atomic_bytes(pkg, doc.bytes())?;
     let Some(sig) = sig else {
         eprintln!(
             "atpkg-publish: wrote {} UNSIGNED — no client accepts it until a rostered \
@@ -714,8 +796,7 @@ pub fn write_bottle_manifest(
         }
         None => None,
     };
-    std::fs::write(pkg, doc.bytes())
-        .map_err(|e| Error::io(format!("write {}", pkg.display()), &e))?;
+    crate::lane::report::write_atomic_bytes(pkg, doc.bytes())?;
     let Some(sig) = sig else {
         eprintln!(
             "atpkg-publish: wrote {} UNSIGNED — no client accepts it until a rostered \
@@ -797,6 +878,7 @@ pub fn pack_with(ctx: &Ctx, request: &PackRequest, tools: &dyn Tools) -> Result<
     }
     let (meta, version) = match def.harness() {
         Some(h) => mint_harness(
+            ctx.hosts.staging.as_ref(),
             program,
             h,
             meta,
@@ -810,7 +892,8 @@ pub fn pack_with(ctx: &Ctx, request: &PackRequest, tools: &dyn Tools) -> Result<
         }
     };
     pkgdoc::check_exposes(program, &meta.expose)?;
-    let exes = build(tools, &tc, request, &meta, &stage_dir)?;
+    let harness_version = def.harness().map(|_| version.as_str());
+    let exes = build(tools, &tc, request, &meta, &stage_dir, harness_version)?;
     let gated = arch::gate(request.triple, &exes)?;
     eprintln!(
         "atpkg-publish: arch gate OK — {gated} binary(ies) are {} as claimed ({})",
@@ -947,10 +1030,12 @@ pub fn parse_args(ctx: &mut Ctx, args: &[String], tools: &dyn Tools) -> Result<P
             "--checkout" => checkout = Some(PathBuf::from(value()?)),
             "--triple" => triple = Some(Triple::parse(&value()?)?),
             "--build" => {
+                let v = value()?;
                 build = Some(
-                    value()?
-                        .parse::<Build>()
-                        .map_err(|_| Error::usage("--build takes a decimal build number"))?,
+                    (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                        .then(|| v.parse::<Build>().ok())
+                        .flatten()
+                        .ok_or_else(|| Error::usage("--build takes a decimal build number"))?,
                 );
             }
             "--merge-from" => merge_from = Some(PathBuf::from(value()?)),

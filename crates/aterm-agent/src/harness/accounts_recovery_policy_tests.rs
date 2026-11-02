@@ -5,6 +5,43 @@ use super::*;
 
 const NOW: i64 = 1_790_000_000;
 
+pub(super) fn hold_retry(
+    guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
+    store: &accounts::Store,
+    cli: Cli,
+    key: &str,
+    label: &str,
+) {
+    let clock = Instant::now();
+    let mut state = guard.lock().unwrap();
+    state.last_attempt.insert(key.into(), clock);
+    state.parked.insert(key.into(), clock);
+    state.bot_checked.insert(key.into(), clock);
+    state.ladder.failed(key, "fixture", clock);
+    state
+        .activity_owners
+        .insert(key.into(), LoginOwner::new(store, cli, label, NOW));
+    state
+        .ladder_owners
+        .insert(key.into(), LoginOwner::new(store, cli, label, NOW));
+}
+
+fn retry_is_held(state: &AutoRenewGuard, key: &str) -> bool {
+    let held = [
+        state.last_attempt.contains_key(key),
+        state.parked.contains_key(key),
+        state.bot_checked.contains_key(key),
+        state.ladder.has_backoff(key),
+        state.activity_owners.contains_key(key),
+        state.ladder_owners.contains_key(key),
+    ];
+    assert!(
+        held.iter().all(|value| *value == held[0]),
+        "partial cleanup: {held:?}"
+    );
+    held[0]
+}
+
 pub(crate) fn recovery_transition(
     state: &aterm_spec::interp::State,
     action: &str,
@@ -278,8 +315,16 @@ pub(crate) fn recovery_transition(
             let proof_path = staging.join(accounts::RENEWAL_CHECKPOINT_FILE);
             let proof_before = fs::read(&proof_path).unwrap();
             let guard = std::sync::Arc::new(std::sync::Mutex::new(AutoRenewGuard::default()));
-            let recovered =
-                recover_interrupted_staging_renewals_for(cli, &store, &path, &guard, NOW);
+            hold_retry(&guard, &store, cli, "local", "account");
+            hold_retry(&guard, &store, cli, "foreign", "another-account");
+            let recovered = recover_interrupted_staging_renewals_for(
+                cli,
+                &store,
+                &path,
+                &guard,
+                NOW,
+                shared_renewal::CheckpointAuthority::Unavailable,
+            );
             if recovered {
                 assert_eq!(
                     store
@@ -304,6 +349,9 @@ pub(crate) fn recovery_transition(
             assert_eq!(fs::read(&proof_path).unwrap(), proof_before);
             next.insert("phase", 2);
             next.insert("recovered", i64::from(recovered));
+            let held = guard.lock().unwrap();
+            next.insert("local_hold", i64::from(retry_is_held(&held, "local")));
+            next.insert("foreign_hold", i64::from(retry_is_held(&held, "foreign")));
         }
         _ => unreachable!(),
     }
@@ -313,7 +361,7 @@ pub(crate) fn recovery_transition(
 #[test]
 fn checkpoint_recovery_conforms_to_current_policy_for_every_provider() {
     let model = aterm_models_harness::account_recovery_policy_model();
-    assert_eq!(model.mutant_dials(), (1..=33).collect::<Vec<_>>());
+    assert_eq!(model.mutant_dials(), (1..=36).collect::<Vec<_>>());
     assert_eq!(aterm_spec::interp::prove_and_catch(&model), 372);
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
@@ -331,11 +379,20 @@ fn checkpoint_recovery_conforms_to_current_policy_for_every_provider() {
     changed.insert("case", 2);
     changed.insert("phase", 1);
     let mut forged = recovery_transition(&changed, "Recover");
+    let mut cleared_retry = forged.clone();
+    cleared_retry.insert("local_hold", 0);
+    assert!(!model.check_invariant("RecoveryReleasesOwnRetry", &cleared_retry));
     forged.insert("recovered", 1);
     assert!(!model.check_invariant("AdmissibleRecoveryOnly", &forged));
     let mut current = model.init_state();
     current.insert("phase", 1);
     let mut refused = recovery_transition(&current, "Recover");
+    let mut stale_retry = refused.clone();
+    stale_retry.insert("local_hold", 1);
+    assert!(!model.check_invariant("RecoveryReleasesOwnRetry", &stale_retry));
+    let mut foreign_retry = refused.clone();
+    foreign_retry.insert("foreign_hold", 0);
+    assert!(!model.check_invariant("ForeignRetryPreserved", &foreign_retry));
     refused.insert("recovered", 0);
     assert!(!model.check_invariant("AdmissibleRecoverySucceeds", &refused));
     let mut rolled_back = model.init_state();

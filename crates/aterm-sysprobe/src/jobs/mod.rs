@@ -439,12 +439,14 @@ fn queued_on(fd: i32) -> Option<u32> {
 }
 
 /// The node of the pseudo-terminal `dev`: macOS's `/dev/ttysNNN` (major 16, the minor its
-/// number).
+/// number), named from the device number alone. The node is never `stat`ed to check the
+/// name: the kernel record that handed over `dev` already vouches for the device, the open
+/// in [`term_word`] is the check that can fail, and a wedged device node blocks a `stat`
+/// of it without bound (the same wedge that hangs a fresh shell's `ttyname`); `None` for a
+/// device of any other major, whose node no arithmetic names.
 #[cfg(target_os = "macos")]
 fn term_node(_pid: u32, dev: u32) -> Option<PathBuf> {
-    use std::os::unix::fs::MetadataExt;
-    let path = PathBuf::from(format!("/dev/ttys{:03}", dev & 0x00ff_ffff));
-    (u32::try_from(std::fs::metadata(&path).ok()?.rdev()).ok() == Some(dev)).then_some(path)
+    (dev >> 24 & 0xff == 16).then(|| PathBuf::from(format!("/dev/ttys{:03}", dev & 0x00ff_ffff)))
 }
 
 /// `pid`'s descriptor of the terminal `dev`: `/dev/pts/N` names a terminal of aterm's own
@@ -549,10 +551,17 @@ pub const PROGRAM_CHECK_AGE_MS: u64 = 20_000;
 /// Where a process stands at its start (`docs/DESIGN-leftover-processes-2026-10-16.md` §4.2), judged by [`judge_start`] from its [`StartFacts`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AtStart {
-    /// It runs: its thread set its handle, or it is younger than [`PROGRAM_CHECK_AGE_MS`], stopped or traced.
+    /// It runs: its thread set its handle, or it is younger than [`PROGRAM_CHECK_AGE_MS`].
     Started,
     /// Held at macOS's program check: one thread that never ran, past [`PROGRAM_CHECK_AGE_MS`], neither stopped nor traced, native, its executable on a local volume.
     Held,
+    /// One thread that never ran, past [`PROGRAM_CHECK_AGE_MS`], that reads stopped or traced: a start-suspended spawn, a debugger's launch, or a program the check holds that reads either way, which nothing has measured (the leftover-processes design's U3). Never counted as held; `sys jobs` names it with what it read.
+    StoppedUnstarted {
+        /// Its BSD status reads `SSTOP`.
+        stopped: bool,
+        /// It reads `PROC_FLAG_TRACED`.
+        traced: bool,
+    },
     /// The same signature in an x86_64 process on an arm64 Mac: Rosetta translates it, and the Developer Tools grant does not reach that.
     Translating,
     /// The same signature on an executable whose volume is not proven local: it has not started, and nothing read says why.
@@ -576,16 +585,21 @@ pub struct StartFacts {
     pub age_ms: Option<u64>,
 }
 
-/// Where a process with `f` stands at its start: [`AtStart::Started`] unless it shows the held
-/// signature (its one thread never ran, past [`PROGRAM_CHECK_AGE_MS`], neither stopped nor
-/// traced); then [`AtStart::Translating`] for an x86_64 process on an arm64 Mac, else
+/// Where a process with `f` stands at its start: [`AtStart::Started`] unless its one thread never
+/// ran, past [`PROGRAM_CHECK_AGE_MS`]; then [`AtStart::StoppedUnstarted`] when it reads stopped or
+/// traced, else [`AtStart::Translating`] for an x86_64 process on an arm64 Mac, else
 /// [`AtStart::Unstarted`] unless its executable's volume reads local, else [`AtStart::Held`].
 #[must_use]
 pub fn judge_start(f: &StartFacts) -> AtStart {
-    if !(f.lone_zero && !f.stopped && !f.traced && f.age_ms >= Some(PROGRAM_CHECK_AGE_MS)) {
+    if !(f.lone_zero && f.age_ms >= Some(PROGRAM_CHECK_AGE_MS)) {
         return AtStart::Started;
     }
-    if f.translated {
+    if f.stopped || f.traced {
+        AtStart::StoppedUnstarted {
+            stopped: f.stopped,
+            traced: f.traced,
+        }
+    } else if f.translated {
         AtStart::Translating
     } else if f.local != Some(true) {
         AtStart::Unstarted
@@ -786,8 +800,9 @@ impl JobsReader {
         self.read_all_at(reqs, now_us())
     }
 
-    /// [`Self::read_all`], each start's age taken at `now` (µs since the epoch, [`now_us`]).
-    fn read_all_at(&mut self, reqs: &[ReadReq], now: u64) -> Vec<ProcFacts> {
+    /// [`Self::read_all`], each start's age taken at `now` (µs since the epoch, [`now_us`]): a
+    /// caller that reads other starts beside it takes their ages at the same clock.
+    pub fn read_all_at(&mut self, reqs: &[ReadReq], now: u64) -> Vec<ProcFacts> {
         let lanes = if reqs.iter().any(|r| r.fds) {
             Some(self.lanes())
         } else {
@@ -798,7 +813,7 @@ impl JobsReader {
         let mut execd = HashMap::new();
         let live_windows = cfg!(windows) && self.root == Path::new("/proc");
         let boot_ms = (!cfg!(target_os = "macos") && !live_windows)
-            .then(|| std::fs::read_to_string(self.root.join("uptime")).ok())
+            .then(|| crate::read_bounded(&self.root.join("uptime")))
             .flatten()
             .and_then(|t| crate::linux::parse_uptime_ns(&t))
             .map(|ns| ns / 1_000_000);
@@ -948,7 +963,7 @@ impl JobsReader {
             if !tail_allowed(&path, table) {
                 continue;
             }
-            *lf_tail = tail_has_lf(&path, prev, *size);
+            *lf_tail = tail_has_lf_ino(&path, prev, *size, *ino);
         }
     }
 
@@ -1029,10 +1044,14 @@ pub fn tail_allowed(path: &Path, table: &crate::volumes::Table) -> bool {
 /// Whether the bytes of `path` between `from` and `to` hold a line feed: at most the last [`TAIL_CAP`] of them, read with one `pread` on a descriptor opened read-only, non-blocking and without following a final symlink.
 #[must_use]
 pub fn tail_has_lf(path: &Path, from: u64, to: u64) -> Option<bool> {
+    tail_has_lf_ino(path, from, to, 0)
+}
+
+fn tail_has_lf_ino(path: &Path, from: u64, to: u64, want_ino: u64) -> Option<bool> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{FileExt as _, OpenOptionsExt as _};
-        if to <= from {
+        use std::os::unix::fs::{FileExt as _, MetadataExt as _, OpenOptionsExt as _};
+        if to <= from || !intermediate_dirs_real(path) {
             return None;
         }
         let len = usize::try_from(to - from)
@@ -1044,14 +1063,58 @@ pub fn tail_has_lf(path: &Path, from: u64, to: u64) -> Option<bool> {
             .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
             .open(path)
             .ok()?;
+        let meta = file.metadata().ok()?;
+        if !meta.is_file() || (want_ino != 0 && meta.ino() != want_ino) {
+            return None;
+        }
         let mut buf = vec![0u8; len];
         let n = file.read_at(&mut buf, at).ok()?;
         Some(buf[..n].contains(&b'\n'))
     }
     #[cfg(not(unix))]
     {
-        let _ = (path, from, to);
+        let _ = (path, from, to, want_ino);
         None
+    }
+}
+
+#[cfg(unix)]
+fn intermediate_dirs_real(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+    if !path.is_absolute()
+        || path
+            .as_os_str()
+            .as_bytes()
+            .split(|&b| b == b'/')
+            .any(|seg| matches!(seg, b"." | b".."))
+    {
+        return false;
+    }
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => return false,
+    };
+    if let Some(root) = path
+        .to_str()
+        .and_then(|s| TAIL_ROOTS.iter().copied().find(|r| s.starts_with(r)))
+    {
+        let base = Path::new(root);
+        let Ok(rel) = parent.strip_prefix(base) else {
+            return false;
+        };
+        let mut cur = base.to_path_buf();
+        for comp in rel.components() {
+            if !matches!(comp, std::path::Component::Normal(_)) {
+                return false;
+            }
+            cur.push(comp);
+            if !std::fs::symlink_metadata(&cur).is_ok_and(|m| m.file_type().is_dir()) {
+                return false;
+            }
+        }
+        true
+    } else {
+        std::fs::symlink_metadata(parent).is_ok_and(|m| m.file_type().is_dir())
     }
 }
 

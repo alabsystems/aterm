@@ -96,7 +96,7 @@ pub(crate) const EMPTY_COMPOSER: &str = r"if=^❯\s*$";
 /// The composer's row holding `/login` (Claude Code draws a no-break space after `❯`).
 const LOGIN_COMPOSER: &str = r"if=^❯\x{A0}/login\s*$";
 /// A row of Claude Code's `/login` method picker, which the lab waits for and never presses.
-const PICKER_ROW: &str = "Claude account with subscription";
+pub(crate) const PICKER_ROW: &str = "Claude account with subscription";
 
 // ---------------------------------------------------------------------------------------------
 // The evidence, read from text.
@@ -858,7 +858,7 @@ impl Watcher {
         let handle = std::thread::spawn(move || {
             let mut said = std::collections::BTreeSet::new();
             while !s.load(Ordering::SeqCst) {
-                let rows = ps_rows();
+                let rows = crate::procs::commands();
                 let table: Vec<(i32, i32)> = rows.iter().map(|(p, pp, _)| (*p, *pp)).collect();
                 let family = crate::procs::descendants_in(&table, instance);
                 let mut look = k.lock().unwrap_or_else(PoisonError::into_inner);
@@ -912,30 +912,6 @@ impl Drop for Watcher {
     fn drop(&mut self) {
         self.halt();
     }
-}
-
-/// `ps -axww -o pid=,ppid=,command=`: every process, its parent and its whole command line.
-pub(crate) fn ps_rows() -> Vec<(i32, i32, String)> {
-    let Ok(out) = aterm_uds::spawnfd::command("/bin/ps")
-        .args(["-axww", "-o", "pid=,ppid=,command="])
-        .output()
-    else {
-        return Vec::new();
-    };
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| {
-            let l = l.trim_start();
-            let (pid, rest) = l.split_once(char::is_whitespace)?;
-            let rest = rest.trim_start();
-            let (ppid, command) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
-            Some((
-                pid.parse().ok()?,
-                ppid.parse().ok()?,
-                command.trim().to_string(),
-            ))
-        })
-        .collect()
 }
 
 // ---------------------------------------------------------------------------------------------

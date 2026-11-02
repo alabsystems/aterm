@@ -982,12 +982,14 @@ fn staged_signals() {
         let block = sigset_of(&[SIGUSR1, SIGTERM]);
         assert_eq!(pthread_sigmask(SIG_BLOCK, &block, std::ptr::null_mut()), 0);
     }
-    let ours_mask = probed_mask(&mask_probe!(command).output().expect("probe"));
-    let theirs_mask = probed_mask(
-        &mask_probe!(std::process::Command::new)
-            .output()
-            .expect("probe"),
-    );
+    let ours_mask = probed_mask(&crate::deadline::ends_within(
+        &mut mask_probe!(command),
+        crate::deadline::ECHO_HANG,
+    ));
+    let theirs_mask = probed_mask(&crate::deadline::std_ends_within(
+        &mut mask_probe!(std::process::Command::new),
+        crate::deadline::ECHO_HANG,
+    ));
     let mut ours = command("/bin/sleep")
         .arg("60")
         .spawn()
@@ -1429,12 +1431,13 @@ fn a_disclaimed_child_is_its_own_responsible_process() {
         println!("STAGED disclaim ok");
         return;
     }
-    let out = command(std::env::current_exe().expect("the test binary"))
-        .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
-        .env(STAGE_ENV, STAGE)
-        .disclaim_responsibility(true)
-        .output()
-        .expect("start this test binary disclaimed");
+    let out = crate::deadline::ends_within(
+        command(std::env::current_exe().expect("the test binary"))
+            .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+            .env(STAGE_ENV, STAGE)
+            .disclaim_responsibility(true),
+        crate::deadline::ECHO_HANG,
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success() && stdout.contains("STAGED disclaim ok"),

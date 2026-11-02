@@ -15,6 +15,8 @@
 aterm_durable::plain_durable_flushes_in_tests!();
 
 pub mod age;
+pub mod alab_join;
+pub mod api_key;
 pub mod b64;
 pub mod bech32;
 pub mod commons;
@@ -62,6 +64,8 @@ pub mod discover;
 pub mod fsx;
 #[cfg(unix)]
 pub mod heard;
+#[cfg(unix)]
+pub mod home_lan;
 pub mod keychain_tools;
 #[cfg(unix)]
 pub mod materialize;
@@ -108,10 +112,12 @@ pub const ALAB_SIGNER: &str = "gnUs9ywlj9oLJNA7jDsP6xGO34YTr7xR8ra22GXUoQ4=";
 pub const ALAB_RETIRED: &[&str] = &[];
 
 /// ALab's genesis, by its digest in hex: what `aterm secrets genesis` printed when m22 signed
-/// Genesis v2 (`docs/DESIGN-fluid-swarm-2026-10-28.md` F12). A build checks ALab's genesis by
-/// this digest alone, never by a signer ([`membership_log::Log::alab`]). `None` until F12b
-/// compiles it in; the check is dormant until then.
-pub const ALAB_GENESIS: Option<&str> = None;
+/// Genesis v2 with the released 0.146.0 on 2026-10-29, listing the vault's 40 machines
+/// (`docs/DESIGN-fluid-swarm-2026-10-28.md` F12, F12b). A build checks ALab's genesis by this
+/// digest alone, never by a signer ([`membership_log::Log::alab`]): any other genesis for ALab is
+/// refused, one signed with the vault's own key included.
+pub const ALAB_GENESIS: Option<&str> =
+    Some("a8ed22e8eb1ec410d8efc1e736d93dfe100191514584dc7fad8260b429d3a8ac");
 
 /// Reserved `[everyone]` vault entry carrying swarm labels, aliases, hints, and deny-lists.
 pub const SWARM_ROSTER_ENTRY: &str = swarm_roster::ROSTER_ENTRY;

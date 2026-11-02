@@ -15,10 +15,10 @@ use super::{
 use crate::spawnfd::{Child, Command, Stdio};
 
 #[repr(C)]
-struct PollFd {
-    fd: RawFd,
-    events: i16,
-    revents: i16,
+pub(super) struct PollFd {
+    pub(super) fd: RawFd,
+    pub(super) events: i16,
+    pub(super) revents: i16,
 }
 
 const POLLIN: i16 = 0x1;
@@ -58,7 +58,7 @@ fn group_left(group: u32) -> bool {
 }
 
 #[cfg_attr(trust_verify, trust::skip)]
-fn poll(fds: &mut [PollFd], timeout: Duration) -> io::Result<bool> {
+pub(super) fn poll(fds: &mut [PollFd], timeout: Duration) -> io::Result<bool> {
     #[cfg(target_os = "linux")]
     type Nfds = core::ffi::c_ulong;
     #[cfg(not(target_os = "linux"))]
@@ -66,7 +66,7 @@ fn poll(fds: &mut [PollFd], timeout: Duration) -> io::Result<bool> {
     unsafe extern "C" {
         fn poll(fds: *mut PollFd, nfds: Nfds, timeout: i32) -> i32;
     }
-    let until = Instant::now() + timeout;
+    let until = super::saturating_after(Instant::now(), timeout);
     loop {
         let left = until.saturating_duration_since(Instant::now());
         let ms = i32::try_from(left.as_nanos().div_ceil(1_000_000)).unwrap_or(i32::MAX);
@@ -291,10 +291,13 @@ fn run_until(
     loop {
         let now = deadline_now();
         for run in runs.iter_mut().filter(|run| run.running()) {
-            run.observe(now, now + reap);
+            run.observe(now, super::saturating_after(now, reap));
         }
         for run in &mut runs {
-            if run.exited_at.is_some_and(|at| now >= at + DRAIN_GRACE) {
+            if run
+                .exited_at
+                .is_some_and(|at| now >= super::saturating_after(at, DRAIN_GRACE))
+            {
                 run.close_held_streams();
             }
         }
@@ -302,7 +305,7 @@ fn run_until(
             break;
         }
         if now >= deadline {
-            let reap_by = Instant::now() + reap;
+            let reap_by = super::saturating_after(Instant::now(), reap);
             for run in runs.iter_mut().filter(|run| run.running()) {
                 if let Ok(child) = run.child.as_mut() {
                     kill_group(child);

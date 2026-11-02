@@ -39,6 +39,10 @@ use aterm_secrets::{
 use std::collections::{BTreeMap, BTreeSet};
 
 pub mod cli;
+mod delivery;
+pub(crate) mod handoff;
+mod source;
+mod value;
 
 /// A record body's canonical bytes are at most this long (§5).
 pub const MAX_RECORD: usize = 4096;
@@ -224,7 +228,16 @@ fn hex_field<const N: usize>(value: &Value) -> Option<[u8; N]> {
 /// Check a record's closed schema: the fields its kind allows, each well formed.
 fn check(record: &Record) -> Result<()> {
     let allowed: &[&str] = match record.kind.as_str() {
-        "request" => &["nonce", "want", "purpose", "refused", "supersedes", "entry"],
+        "request" => &[
+            "nonce",
+            "want",
+            "purpose",
+            "refused",
+            "supersedes",
+            "entry",
+            "origin",
+            "origin_att",
+        ],
         "offer" => &[],
         "sweep" => &["covers"],
         "still" => &["at"],
@@ -269,6 +282,14 @@ fn check(record: &Record) -> Result<()> {
                 .ok_or_else(|| Error::new("unknown purpose"))?;
             optional(body, "refused", Value::as_u64)?;
             optional(body, "supersedes", hex_field::<16>)?;
+            if body.contains_key("origin") || body.contains_key("origin_att") {
+                body.get("origin")
+                    .and_then(hex_field::<48>)
+                    .ok_or_else(|| Error::new("a delegated request names its original Writer"))?;
+                body.get("origin_att")
+                    .and_then(hex_field::<64>)
+                    .ok_or_else(|| Error::new("a delegated request has its origin's signature"))?;
+            }
         }
         "sweep" => {
             let covers = body
@@ -390,6 +411,11 @@ pub struct Context {
     pub network: [u8; 16],
     /// Every current member's actor.
     pub members: BTreeSet<Actor>,
+    /// Exact credential table identity, including its complete Commons trust.
+    /// A projection without this context cannot answer delegated requests.
+    pub scope: Option<Digest>,
+    /// Current Writers whose bound vault recipients can authorize delivery.
+    pub writers: BTreeMap<Actor, aterm_secrets::commons::binding::Binding>,
     /// Unix ms now.
     pub now_ms: u64,
 }
@@ -409,6 +435,9 @@ pub struct Thread {
     pub supersedes: Option<[u8; 16]>,
     /// The requester: the request record's signer.
     pub requester: Actor,
+    /// Original current Writer authorizing delivery to its own bound recipient.
+    /// Absent on an ordinary request delivered to the requester itself.
+    pub origin: Option<Actor>,
     /// The request's operation digest.
     pub operation: Digest,
     /// The requester's sequence number for it.
@@ -515,6 +544,13 @@ impl Book {
                 inert(entry.id, "a request id is its first requester's own");
                 continue;
             }
+            let Ok(origin) = delivery::origin(&entry.record, entry.actor, context) else {
+                inert(
+                    entry.id,
+                    "request has no current authorization for its original recipient",
+                );
+                continue;
+            };
             threads.insert(
                 id,
                 Thread {
@@ -524,6 +560,7 @@ impl Book {
                     refused: body.get("refused").and_then(Value::as_u64),
                     supersedes: body.get("supersedes").and_then(hex_field::<16>),
                     requester: entry.actor,
+                    origin,
                     operation: entry.id,
                     sequence: entry.sequence,
                     arrived_ms: entry.received_ms,
@@ -753,6 +790,12 @@ fn context(facts: &need::Facts, session: &Session<'_>, scope: Scope, now_ms: u64
             .iter()
             .map(aterm_secrets::commons::binding::Binding::actor)
             .collect(),
+        scope: Some(scope.digest()),
+        writers: session
+            .writers()
+            .into_iter()
+            .map(|binding| (binding.actor(), binding))
+            .collect(),
         now_ms,
     }
 }
@@ -776,7 +819,8 @@ pub struct Observation {
     pub at_ms: u64,
     /// All retained operations, including those this build cannot interpret.
     pub retained_operations: usize,
-    /// Operations eligible for this build's request projection, before protocol checks.
+    /// Eligible decoded operations, including structural merges, before
+    /// credential protocol checks.
     pub interpreted_operations: usize,
     /// Requests and checked answers retained here; not a read of other replicas.
     pub book: Book,
@@ -788,17 +832,20 @@ pub struct Observation {
 /// # Errors
 /// Local vault facts, membership, the catalog or the initialized table cannot be read.
 pub fn observe(paths: &Paths) -> Result<Observation> {
+    let logical = crate::generation::observed_logical_paths(paths)?;
+    let paths = &logical;
     let at_ms = now_ms();
     let facts = facts(paths, at_ms)?;
     crate::documents::application::observe_store(paths, descriptor, |session, store, scope| {
         let context = context(&facts, session, scope, at_ms);
         let log = Log::read_with(session, store, scope, decode)?;
+        let snapshot = log.snapshot();
         Ok(Observation {
             observer: session.actor(),
             members: context.members.clone(),
             at_ms,
-            retained_operations: log.snapshot().retained,
-            interpreted_operations: log.eligible().len(),
+            retained_operations: snapshot.retained,
+            interpreted_operations: snapshot.operations.iter().filter(|op| op.eligible).count(),
             book: Book::read(&log, &context),
         })
     })
@@ -811,7 +858,7 @@ fn commit(session: &Session<'_>, store: &mut Store, log: &Log, record: &Record) 
             .receipt(session, &id)?
             .ok_or_else(|| Error::new("credential record receipt is unavailable"));
     }
-    store.commit_catalog(session, &encode(&command)?)
+    crate::documents::application::append(session, store, &encode(&command)?)
 }
 
 fn request_record(me: &Actor, need: &Need) -> Record {
@@ -923,15 +970,22 @@ pub fn pass(paths: &Paths) -> Result<Pass> {
 /// # Errors
 /// As [`pass`].
 pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
+    let logical = crate::generation::logical_paths(paths)?;
+    let paths = &logical;
+    let origin = delivery::Origin::open(paths)?;
     let needs = need::list(paths).map_err(crate::table::failure)?;
     let facts = facts(paths, now_ms)?;
     let mut moves = Vec::new();
-    let mut report = with_store(paths, |session, store, scope| {
+    let (mut report, network, book) = with_store(paths, |session, store, scope| {
         let context = context(&facts, session, scope, now_ms);
         let log = Log::read_with(session, store, scope, decode)?;
         let writer = session.writer().is_ok() && log.writable(session.actor()).is_ok();
         let book = Book::read(&log, &context);
         let me = session.actor();
+        let request = |record| match &origin {
+            Some(origin) => origin.bind(session, scope, record),
+            None => Ok(record),
+        };
         let mut report = Pass {
             writer,
             ..Pass::default()
@@ -972,13 +1026,15 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
             let room = open < need::MAX_OPEN;
             match (need.state, thread) {
                 (State::Local, None) if writer && allowed && room => {
-                    let receipt = commit(session, store, &log, &request_record(&me, need))?;
+                    let receipt =
+                        commit(session, store, &log, &request(request_record(&me, need))?)?;
                     moves.push((need.id, Absorb::Flushed(receipt.id.to_vec())));
                     report.posted += 1;
                     open += 1;
                 }
                 (State::AwaitingPerson, None) if writer && allowed && room && !need.posted => {
-                    let receipt = commit(session, store, &log, &request_record(&me, need))?;
+                    let receipt =
+                        commit(session, store, &log, &request(request_record(&me, need))?)?;
                     moves.push((need.id, Absorb::Posted(receipt.id.to_vec())));
                     report.posted += 1;
                     open += 1;
@@ -1000,7 +1056,7 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
                         ),
                     )?;
                     let (nonce, successor) = successor_record(&me, need)?;
-                    let receipt = commit(session, store, &log, &successor)?;
+                    let receipt = commit(session, store, &log, &request(successor)?)?;
                     moves.push((
                         need.id,
                         Absorb::Reissued {
@@ -1083,6 +1139,7 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
             let mut covers = Vec::new();
             for thread in book.threads.values() {
                 let unanswered = thread.requester != me
+                    && context.members.contains(&thread.requester)
                     && !thread.ended()
                     && thread.published.is_none()
                     && !thread.swept.contains(&me)
@@ -1090,7 +1147,7 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
                 if !unanswered || !context.policy.allows(&thread.want) {
                     continue;
                 }
-                if holds(paths, &thread.want) {
+                if source::held(paths, scope.trust().network, thread, now_ms) {
                     commit(
                         session,
                         store,
@@ -1112,9 +1169,9 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
                 commit(session, store, &log, &Record::new("sweep", &pass_id, body))?;
             }
         }
-        report.threads = book.threads.into_values().collect();
-        report.inert = book.inert;
-        Ok(report)
+        report.threads = book.threads.values().cloned().collect();
+        report.inert = book.inert.clone();
+        Ok((report, scope.trust().network, book))
     })?;
     report.decided = need::absorb(paths, &moves)
         .map_err(crate::table::failure)?
@@ -1125,7 +1182,131 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
                 .any(|(id, step)| *id == need.id && matches!(step, Absorb::Decided(_)))
         })
         .count();
+    source::cleanup(paths, network, &book, now_ms)?;
     Ok(report)
+}
+
+/// What an explicit `need give` retained or published. These are request counts, never
+/// credentials printed or records containing a value.
+#[derive(Debug, Default)]
+pub struct Given {
+    /// Open requests whose value is retained locally and offered.
+    pub retained: usize,
+    /// Open requests answered by an immediate vault publication.
+    pub published: usize,
+}
+
+/// Answer current requests selected by want or request id. Authorization is resolved before
+/// `read` opens the person's input. A member keeps a private value and posts an Offer; an
+/// admin publishes it immediately. A value never comes from a command-line argument.
+///
+/// # Errors
+/// No permitted request matches, input/validation fails, or retention/publication fails.
+pub fn give_from(
+    paths: &Paths,
+    selector: &str,
+    read: impl FnOnce() -> Result<aterm_secrets::SecretBytes>,
+) -> Result<Given> {
+    let logical = crate::generation::logical_paths(paths)?;
+    let paths = &logical;
+    let config = if Paths::live().ok().as_ref() == Some(paths) {
+        aterm_types::dirs::aterm_config_path()
+            .ok_or_else(|| Error::new("Commons configuration path is unavailable"))?
+    } else {
+        paths
+            .dir
+            .parent()
+            .ok_or_else(|| Error::new("Commons configuration path is unavailable"))?
+            .join("aterm.toml")
+    };
+    let bootstrap = Bootstrap::required(paths).map_err(crate::table::failure)?;
+    let table = descriptor(&bootstrap)?.scope;
+    let check_sharing = || {
+        let policy = crate::catalog::policy::Policy::read(&config)?;
+        let current = Bootstrap::required(paths).map_err(crate::table::failure)?;
+        if !policy.enabled
+            || policy.excluded.contains(&table.digest())
+            || current.trust() != table.trust()
+        {
+            return Err(Error::new(
+                "credential give is disabled by current Commons sharing policy",
+            ));
+        }
+        Ok(())
+    };
+    check_sharing()?;
+    let now = now_ms();
+    let facts = facts(paths, now)?;
+    let selected_want = Want::parse(selector).ok();
+    let selected_id = ids(selector).ok();
+    let admin = client::admin_cached(paths).is_ok();
+    if selected_want.is_none() && selected_id.is_none() {
+        return Err(Error::new("give names a posted want or a request id"));
+    }
+    let (network, threads) = with_store(paths, |session, store, scope| {
+        session.writer()?;
+        let log = Log::read_with(session, store, scope, decode)?;
+        log.writable(session.actor())?;
+        let context = context(&facts, session, scope, now);
+        let book = Book::read(&log, &context);
+        let threads: Vec<_> = book
+            .threads
+            .values()
+            .filter(|thread| {
+                !thread.ended()
+                    && thread.published.is_none()
+                    && context.members.contains(&thread.requester)
+                    && context.policy.allows(&thread.want)
+                    && (admin || thread.requester != session.actor())
+                    && (selected_want.as_ref() == Some(&thread.want)
+                        || selected_id == Some(thread.id))
+            })
+            .cloned()
+            .collect();
+        if threads.is_empty() {
+            return Err(Error::new(
+                "give matches no permitted open request retained here",
+            ));
+        }
+        Ok((scope.trust().network, threads))
+    })?;
+    let values = source::single(&threads[0].want, read()?)?;
+    value::validate(&threads[0].want, &values)?;
+    let mut result = Given::default();
+    for thread in &threads {
+        check_sharing()?;
+        if admin {
+            handoff::publish_given(paths, thread, &values)?;
+            result.published += 1;
+        } else {
+            source::keep(paths, network, thread, &values)?;
+            let refreshed = self::facts(paths, now_ms())?;
+            with_store(paths, |session, store, scope| {
+                session.writer()?;
+                if thread.requester == session.actor()
+                    || delivery::destination(session, thread).is_err()
+                {
+                    return Err(Error::new(
+                        "give for this Mac's own request requires the vault custodian",
+                    ));
+                }
+                if !refreshed.policy.allows(&thread.want) {
+                    return Err(Error::new("credential policy changed before the Offer"));
+                }
+                let log = Log::read_with(session, store, scope, decode)?;
+                log.writable(session.actor())?;
+                commit(
+                    session,
+                    store,
+                    &log,
+                    &Record::new("offer", &thread.id, Map::new()),
+                )?;
+                Ok(())
+            })?;
+            result.retained += 1;
+        }
+    }
+    Ok(result)
 }
 
 /// What a custodian's pass decided (§9.3).
@@ -1147,6 +1328,7 @@ enum Plan {
         recipient: aterm_secrets::age::Recipient,
         want: Want,
         offered: bool,
+        offer_window_ended: bool,
         decided: bool,
         asked: bool,
     },
@@ -1171,6 +1353,8 @@ pub fn custodian_pass(paths: &Paths) -> Result<Option<Custodian>> {
 /// # Errors
 /// As [`custodian_pass`].
 pub fn custodian_pass_at(paths: &Paths, now_ms: u64) -> Result<Option<Custodian>> {
+    let logical = crate::generation::logical_paths(paths)?;
+    let paths = &logical;
     let Ok(mut admin) = client::admin_cached(paths) else {
         return Ok(None);
     };
@@ -1204,7 +1388,7 @@ pub fn custodian_pass_at(paths: &Paths, now_ms: u64) -> Result<Option<Custodian>
                 ));
                 continue;
             }
-            let Ok(binding) = session.peer(thread.requester) else {
+            let Ok(binding) = delivery::destination(session, thread) else {
                 report
                     .waiting
                     .push((thread.id, "the requester is not a current member".into()));
@@ -1216,6 +1400,7 @@ pub fn custodian_pass_at(paths: &Paths, now_ms: u64) -> Result<Option<Custodian>
                 recipient: binding.recipient(),
                 want: thread.want.clone(),
                 offered: !thread.offers.is_empty(),
+                offer_window_ended: thread.window_ended(now_ms),
                 decided,
                 asked: thread.needs_person,
             });
@@ -1236,6 +1421,7 @@ pub fn custodian_pass_at(paths: &Paths, now_ms: u64) -> Result<Option<Custodian>
                 recipient,
                 want,
                 offered,
+                offer_window_ended,
                 decided,
                 asked,
             } => {
@@ -1264,9 +1450,9 @@ pub fn custodian_pass_at(paths: &Paths, now_ms: u64) -> Result<Option<Custodian>
                         id,
                         "the vault holds 62 host sections already: an admin merges two".into(),
                     )),
-                    Copied::NotHeld if offered => report.waiting.push((
+                    Copied::NotHeld if offered && !offer_window_ended => report.waiting.push((
                         id,
-                        "a holder offered it: the handoff from a holder is the next step's".into(),
+                        "a holder offered it: the custodian's runtime takes the copy on its next authenticated LAN round".into(),
                     )),
                     Copied::NotHeld if asked => report.waiting.push((
                         id,
@@ -1277,7 +1463,7 @@ pub fn custodian_pass_at(paths: &Paths, now_ms: u64) -> Result<Option<Custodian>
                         .push((id, "waits on the members' sweeps or the want window".into())),
                     Copied::NotHeld if want.person_sourced() => {
                         let mut body = Map::new();
-                        body.insert("template".into(), Value::from("vault-lacks"));
+                        body.insert("template".into(), Value::from(if offered { "holder-away" } else { "vault-lacks" }));
                         records.push(Record::new("needs-person", &id, body));
                         report.asked.push(id);
                     }
@@ -1337,3 +1523,6 @@ pub fn custodian_pass_at(paths: &Paths, now_ms: u64) -> Result<Option<Custodian>
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod frontier_tests;

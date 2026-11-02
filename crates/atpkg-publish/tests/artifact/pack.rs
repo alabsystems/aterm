@@ -17,8 +17,9 @@ use atpkg_publish::artifact::pack::{self, ExposeMode, Metadata};
 use atpkg_publish::artifact::{pkgdoc, sign, upload};
 use atpkg_publish::ctx::Ctx;
 use atpkg_publish::error::Error;
-use atpkg_publish::host::Slug;
 use atpkg_publish::host::fake::{FakeHost, FakeRelease};
+use atpkg_publish::host::rest::STAGED;
+use atpkg_publish::host::{ReleaseHost as _, Slug};
 use atpkg_publish::testkit::Keys;
 use atpkg_publish::triple::{
     AARCH64_APPLE_DARWIN, Triple, X86_64_APPLE_DARWIN, X86_64_UNKNOWN_LINUX_GNU,
@@ -29,6 +30,9 @@ use super::fixture::{
     bare_origin, checkout as fixture_checkout, client_verifies, elf, macho, push_from_elsewhere,
     put, put_exe, ran, scratch, seed_mint, toolchain as fixture_toolchain, trust_repo,
 };
+
+#[path = "pack_upload_race.rs"]
+mod upload_race;
 
 /// A machine with a rostered key, a channel head, a dormant trust checkout at `$HOME/trust`,
 /// a fixture Trust toolchain and an `ay` checkout.
@@ -559,6 +563,7 @@ fn an_upload_stages_a_prerelease_and_a_public_pack_is_immutable() {
     assert_eq!(
         names,
         [
+            upload::VERSION_RESERVATION,
             "ay-9-x86_64-unknown-linux-gnu.tar.zst",
             "pkg-ay-9.toml",
             "pkg-ay-9.toml.sig"
@@ -588,6 +593,214 @@ fn an_upload_stages_a_prerelease_and_a_public_pack_is_immutable() {
         "{err}"
     );
     assert_eq!(w.host.release_of(&staging, "atpkg-ay-9"), before);
+}
+
+/// Private dev staging can proceed when neither the identity nor an anonymous reader sees
+/// the public repository (§11 D50). Two 404s cover both missing and private-hidden repos;
+/// an anonymously visible public repo or an unanswered read keeps the could-not-run.
+#[test]
+fn an_upload_stages_when_neither_reader_observes_the_public_repository() {
+    let w = world("pack-upload-no-public-repo");
+    let t = tools(&w, "aarch64-apple-darwin", declared(&w), linux_ay());
+    let mut req = w.request(X86_64_UNKNOWN_LINUX_GNU);
+    req.upload = true;
+    let staging = Slug::new("alabsystems", "ay");
+    let public = Slug::new("alabsystems", "ay");
+
+    // Control first: this identity cannot read the public repository, but an anonymous
+    // repository read sees it. Nothing may be staged.
+    w.host.put(
+        &public,
+        "atpkg-ay-1",
+        FakeRelease {
+            prerelease: true,
+            ..FakeRelease::default()
+        },
+    );
+    w.host.set_not_visible(&public, true);
+    assert_eq!(w.host.repo_seen(&public), Ok(true));
+    let err = pack::pack_with(&w.ctx, &req, &t).expect_err("an anonymously visible repository");
+    assert!(
+        err.to_string()
+            .contains("could not ask alabsystems/ay whether atpkg-ay-9 is public"),
+        "{err}"
+    );
+    assert!(w.host.release_of(&staging, "atpkg-ay-9").is_none());
+
+    // A repository read that does not answer keeps the could-not-run too.
+    let w = world("pack-upload-public-repo-unanswered");
+    let t = tools(&w, "aarch64-apple-darwin", declared(&w), linux_ay());
+    let mut req = w.request(X86_64_UNKNOWN_LINUX_GNU);
+    req.upload = true;
+    w.host.set_not_visible(&public, true);
+    w.host.set_repo_unanswered(&public, true);
+    let err = pack::pack_with(&w.ctx, &req, &t).expect_err("an unanswered repository read");
+    assert!(
+        err.to_string().contains("could not ask alabsystems/ay"),
+        "{err}"
+    );
+    assert!(w.host.release_of(&staging, "atpkg-ay-9").is_none());
+
+    // Missing and existing private-hidden repositories are indistinguishable to both
+    // readers. Either permits private dev staging without touching that repository.
+    for private_hidden in [false, true] {
+        let w = world("pack-upload-unseen-public-repo-stages");
+        let t = tools(&w, "aarch64-apple-darwin", declared(&w), linux_ay());
+        let mut req = w.request(X86_64_UNKNOWN_LINUX_GNU);
+        req.upload = true;
+        if private_hidden {
+            w.host.put(&public, "atpkg-ay-1", FakeRelease::default());
+            w.host.set_private(&public, true);
+        }
+        w.host.set_not_visible(&public, true);
+        let before = w.host.release_of(&public, "atpkg-ay-1");
+        assert_eq!(w.host.repo_seen(&public), Ok(false));
+        let out = pack::pack_with(&w.ctx, &req, &t).expect("private dev staging");
+        assert!(out.uploaded);
+        let rel = w.host.release_of(&staging, "atpkg-ay-9").expect("staged");
+        assert!(rel.prerelease && !rel.draft);
+        assert_eq!(w.host.release_of(&public, "atpkg-ay-1"), before);
+        assert!(w.host.release_of(&public, "atpkg-ay-9").is_none());
+        assert!(
+            w.host
+                .calls()
+                .iter()
+                .any(|c| c == "repo_seen alabsystems/ay"),
+            "the upload asked whether either reader observes the public repository"
+        );
+    }
+}
+
+/// A STAGED BUILD IS NEVER CLOBBERED BY ANOTHER VERSION (D51). The staging release
+/// `atpkg-ay-9` holds a manifest of one version: an upload of the same build at another version
+/// is refused and every staged asset stays as it was, as is one over a staged manifest that
+/// records no readable version, and one over a replace the REST host cut short, which left
+/// build 9's manifest only under `pkg-ay-9.toml.atpkg-staged`. The same bytes, other bytes at
+/// the same version (a rebuild, a merged second target, the cut-short replace finished) and a
+/// staging release with no manifest yet all converge. Through `pack_with`, `ay` 0.3.0 packed
+/// as build 9 is refused over build 9's staged 0.2.0.
+#[test]
+fn a_staged_build_is_never_clobbered_by_another_version() {
+    let w = world("upload-staged-version");
+    let staging = Slug::new("alabsystems", "ay");
+    let tag = "atpkg-ay-9";
+    let tarball = "ay-9-aarch64-apple-darwin.tar.zst";
+    let lay = |dir: &str, version: &str, note: &str| {
+        let dir = w.root.join("up").join(dir);
+        let pkg = dir.join("pkg-ay-9.toml");
+        put(
+            &pkg,
+            format!(
+                "# {note}\nschema = 1\nprogram = \"ay\"\nversion = \"{version}\"\n\
+                 build_number = 9\n"
+            )
+            .as_bytes(),
+        );
+        put(&dir.join(tarball), note.as_bytes());
+        (pkg.clone(), vec![dir.join(tarball), pkg])
+    };
+    let publish = |(pkg, files): &(PathBuf, Vec<PathBuf>)| {
+        upload::publish(&w.ctx, "ay", tag, pkg, files, "notes")
+    };
+    let staged = || w.host.asset(&staging, tag, "pkg-ay-9.toml");
+    let bytes = |(pkg, _): &(PathBuf, Vec<PathBuf>)| std::fs::read(pkg).expect("manifest");
+
+    let first = lay("first", "0.1.0+gaaaaaaaaa", "the first pack");
+    assert_eq!(publish(&first).expect("created"), upload::Uploaded::Staged);
+    assert_eq!(
+        publish(&first).expect("the same bytes converge"),
+        upload::Uploaded::Staged
+    );
+    let rebuilt = lay("rebuilt", "0.1.0+gaaaaaaaaa", "the same commit rebuilt");
+    assert_ne!(bytes(&first), bytes(&rebuilt));
+    publish(&rebuilt).expect("other bytes at the same version converge");
+    assert_eq!(staged(), Some(bytes(&rebuilt)));
+
+    let refused = |upload: &(PathBuf, Vec<PathBuf>), says: &str| {
+        let before = w.host.release_of(&staging, tag);
+        let err = publish(upload).expect_err(says);
+        assert!(matches!(err, Error::Refused(_)), "{says}: {err:?}");
+        assert!(err.to_string().contains(says), "{says}: {err}");
+        assert!(
+            err.to_string()
+                .contains("one build number names one version"),
+            "{err}"
+        );
+        assert_eq!(
+            w.host.release_of(&staging, tag),
+            before,
+            "{says}: nothing staged moved"
+        );
+    };
+    let other = lay("other", "0.1.0+gbbbbbbbbb", "another commit at build 9");
+    refused(
+        &other,
+        "atpkg-ay-9 on alabsystems/ay already stages pkg-ay-9.toml at version \
+         `0.1.0+gaaaaaaaaa`, and this upload is version `0.1.0+gbbbbbbbbb`",
+    );
+    w.host
+        .put_asset(&staging, tag, "pkg-ay-9.toml", b"not a manifest".to_vec());
+    refused(
+        &rebuilt,
+        "already stages pkg-ay-9.toml recording no readable version",
+    );
+
+    let half = format!("pkg-ay-9.toml{STAGED}");
+    w.host.put(
+        &staging,
+        tag,
+        FakeRelease {
+            prerelease: true,
+            assets: [
+                (tarball.to_string(), b"the first pack".to_vec()),
+                (half.clone(), bytes(&first)),
+            ]
+            .into(),
+            ..FakeRelease::default()
+        },
+    );
+    refused(
+        &other,
+        &format!(
+            "already stages {half} at version `0.1.0+gaaaaaaaaa`, and this upload is version \
+             `0.1.0+gbbbbbbbbb`"
+        ),
+    );
+    publish(&rebuilt).expect("the same version finishes the cut-short replace");
+    assert_eq!(staged(), Some(bytes(&rebuilt)));
+
+    w.host.put(
+        &staging,
+        tag,
+        FakeRelease {
+            prerelease: true,
+            assets: [(tarball.to_string(), b"a partial upload".to_vec())].into(),
+            ..FakeRelease::default()
+        },
+    );
+    publish(&other).expect("no manifest staged yet: it converges");
+    assert_eq!(staged(), Some(bytes(&other)));
+    w.host.fail_once(&staging, tag, "pkg-ay-9.toml");
+    let before = w.host.release_of(&staging, tag);
+    let err = publish(&first).expect_err("an unread staged manifest is no pass");
+    assert!(matches!(err, Error::CannotRun(_)), "{err:?}");
+    assert_eq!(w.host.release_of(&staging, tag), before);
+
+    let w = world("pack-upload-staged-version");
+    let mut req = w.request(X86_64_UNKNOWN_LINUX_GNU);
+    req.upload = true;
+    let t = tools(&w, "aarch64-apple-darwin", declared(&w), linux_ay());
+    pack::pack_with(&w.ctx, &req, &t).expect("0.2.0 staged as build 9");
+    let before = w.host.release_of(&staging, tag);
+    let meta = declared(&w).replace("\"0.2.0\"", "\"0.3.0\"");
+    let t = tools(&w, "aarch64-apple-darwin", meta, linux_ay());
+    let err = pack::pack_with(&w.ctx, &req, &t).expect_err("0.3.0 over build 9's 0.2.0");
+    assert!(
+        err.to_string()
+            .contains("at version `0.2.0`, and this upload is version `0.3.0`"),
+        "{err}"
+    );
+    assert_eq!(w.host.release_of(&staging, tag), before);
 }
 
 #[test]
@@ -705,6 +918,7 @@ fn a_caller_adds_a_cross_linker_only_and_never_outranks_the_seals_compiler() {
         "RUSTC_WRAPPER",
         "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS",
         "CARGO_TARGET__LINKER",
+        pack::HARNESS_VERSION_ENV,
     ] {
         let mut req = w.request(X86_64_UNKNOWN_LINUX_GNU);
         req.env = vec![(key.into(), "-C target-cpu=native".into())];
@@ -736,12 +950,17 @@ fn a_caller_adds_a_cross_linker_only_and_never_outranks_the_seals_compiler() {
         "RUSTC_WRAPPER",
         "RUSTC_WORKSPACE_WRAPPER",
         "RUSTUP_TOOLCHAIN",
+        pack::HARNESS_VERSION_ENV,
     ] {
         assert!(
             build.env_remove.iter().any(|k| k == scrubbed),
             "{scrubbed} is removed from the inherited environment"
         );
     }
+    assert!(
+        build.env_of(pack::HARNESS_VERSION_ENV).is_none(),
+        "only a harness's build is handed a version"
+    );
 }
 
 #[test]
@@ -809,12 +1028,13 @@ fn harness_tree(w: &World, dir: &str) -> PathBuf {
 }
 
 /// Give `checkout` the origin `w.root/remotes/<owner>/<repo>.git`, a bare it pushes its
-/// `HEAD` to as `branch` and then fetches.
+/// `HEAD` to as `branch` and then fetches, and which the host serves as `<owner>/<repo>`.
 fn harness_origin(w: &World, checkout: &Path, owner: &str, repo: &str, branch: &str) {
     let bare = w.root.join(format!("remotes/{owner}/{repo}.git"));
     if !bare.exists() {
         bare_origin(&bare);
     }
+    w.host.add_clone_source(&Slug::new(owner, repo), &bare);
     let git = |args: &[&str]| super::fixture::git(checkout, args);
     if git(&["remote"]).is_empty() {
         git(&["remote", "add", "origin", &bare.to_string_lossy()]);
@@ -924,6 +1144,22 @@ fn a_harness_pack_ships_its_one_tool_at_its_release_line_and_the_commit_built() 
         t.runs_of("build")[0].argv().iter().any(|a| a == "--locked"),
         "a harness builds the lock it committed: {:?}",
         t.runs_of("build")[0].argv()
+    );
+    let run = &t.runs_of("build")[0];
+    assert_eq!(
+        run.env
+            .iter()
+            .filter(|(k, _)| k == pack::HARNESS_VERSION_ENV)
+            .map(|(_, v)| v.to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+        [format!("0.1.0+g{sha}")],
+        "the build is handed the version the manifest signs (D46)"
+    );
+    assert!(
+        run.env_remove
+            .iter()
+            .any(|k| k == pack::HARNESS_VERSION_ENV),
+        "an inherited value is removed first"
     );
 }
 
@@ -1063,9 +1299,17 @@ fn a_harness_pack_is_minted_only_from_its_repos_main() {
     put(&ahead.join("README"), b"a commit main does not hold\n");
     super::fixture::git(&ahead, &["add", "-A"]);
     super::fixture::git(&ahead, &["commit", "-q", "-m", "local"]);
-    refuses(&ahead, 2, "is not on alabsystems/muse-alab origin/main");
+    refuses(
+        &ahead,
+        2,
+        "is not on alabsystems/muse-alab main as the host serves it",
+    );
     harness_origin(&w, &ahead, "alabsystems", "muse-alab", "feature");
-    refuses(&ahead, 2, "is not on alabsystems/muse-alab origin/main");
+    refuses(
+        &ahead,
+        2,
+        "is not on alabsystems/muse-alab main as the host serves it",
+    );
 
     harness_origin(&w, &ahead, "alabsystems", "muse-alab", "main");
     let t = harness_tools(&ahead, meta(&ahead), arm_bins(&["muse-alab"]));
@@ -1074,6 +1318,326 @@ fn a_harness_pack_is_minted_only_from_its_repos_main() {
     let out = pack::pack_with(&w.ctx, &req, &t).expect("main holds HEAD: it packs");
     let sha = super::fixture::git(&ahead, &["rev-parse", "--short=9", "HEAD"]);
     assert_eq!((out.build, out.version), (2, format!("0.1.0+g{sha}")));
+}
+
+/// THE MAIN A HARNESS IS HELD TO IS THE HOST'S, NOT THE CHECKOUT'S (D25): a clone whose
+/// origin is a local mirror at a path ending `alabsystems/muse-alab`, whose main holds a
+/// commit the host's main never got, has that commit on its own `origin/main` and is still
+/// refused, before anything is built, with the host's main named; the checkout keeps its own
+/// remote-tracking refs and no record ref. An unreachable host is a could-not-run, never a
+/// pass. The same commit packs once the host's main holds it.
+#[test]
+fn a_harness_is_held_to_the_hosts_main_not_its_checkouts_origin() {
+    let w = world("pack-harness-record");
+    let meta = |co: &Path| harness_metadata_json(co, "muse-alab", "0.1.0", &["muse-alab"], &[]);
+    let attempt = |co: &Path, build: u64| {
+        let t = harness_tools(co, meta(co), arm_bins(&["muse-alab"]));
+        let mut req = harness_request(&w, "muse-alab", co);
+        req.build = Some(build);
+        let out = pack::pack_with(&w.ctx, &req, &t);
+        (out, t)
+    };
+    let record = harness_checkout(&w, "muse-alab");
+    let recorded = super::fixture::git(&record, &["rev-parse", "HEAD"]);
+
+    let mirror = w.root.join("mirror/alabsystems/muse-alab.git");
+    bare_origin(&mirror);
+    let co = w.root.join("from-mirror");
+    super::fixture::git(
+        &w.root,
+        &[
+            "clone",
+            "-q",
+            &w.root
+                .join("remotes/alabsystems/muse-alab.git")
+                .to_string_lossy(),
+            "from-mirror",
+        ],
+    );
+    let git = |args: &[&str]| super::fixture::git(&co, args);
+    git(&["remote", "set-url", "origin", &mirror.to_string_lossy()]);
+    put(&co.join("README"), b"a commit only the mirror holds\n");
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "mirror only"]);
+    git(&["push", "-q", "origin", "HEAD:refs/heads/main"]);
+    git(&["fetch", "-q", "origin"]);
+    let head = git(&["rev-parse", "HEAD"]);
+    assert_eq!(
+        git(&["rev-parse", "refs/remotes/origin/main"]),
+        head,
+        "the checkout's own origin/main holds HEAD, so a check against it would pass"
+    );
+
+    let (err, t) = attempt(&co, 2);
+    let err = err.expect_err("the host's main does not hold HEAD");
+    let says = format!("is not on alabsystems/muse-alab main as the host serves it ({recorded})");
+    assert!(err.to_string().contains(&says), "{err}");
+    assert!(t.runs_of("build").is_empty(), "refused before the build");
+    assert!(w.written(".toml").is_empty() && w.written(".tar.zst").is_empty());
+    assert_eq!(git(&["rev-parse", "refs/remotes/origin/main"]), head);
+    assert!(
+        git(&["for-each-ref", "refs/atpkg-publish/"]).is_empty(),
+        "no record ref is left behind"
+    );
+    assert!(
+        w.host
+            .calls()
+            .iter()
+            .any(|c| c == "fetch-main alabsystems/muse-alab")
+    );
+
+    w.host
+        .set_not_visible(&Slug::new("alabsystems", "muse-alab"), true);
+    let err = attempt(&co, 2)
+        .0
+        .expect_err("an unreachable host is no pass");
+    assert!(matches!(err, Error::CannotRun(_)), "{err:?}");
+    assert!(
+        err.to_string()
+            .contains("could not read alabsystems/muse-alab's main"),
+        "{err}"
+    );
+    w.host
+        .set_not_visible(&Slug::new("alabsystems", "muse-alab"), false);
+
+    git(&[
+        "push",
+        "-q",
+        &w.root
+            .join("remotes/alabsystems/muse-alab.git")
+            .to_string_lossy(),
+        "HEAD:refs/heads/main",
+    ]);
+    let out = attempt(&co, 2)
+        .0
+        .expect("the host's main holds HEAD: it packs");
+    let sha = git(&["rev-parse", "--short=9", "HEAD"]);
+    assert_eq!((out.build, out.version), (2, format!("0.1.0+g{sha}")));
+}
+
+/// A HARNESS BUILD NAMES ONE COMMIT ACROSS A MERGE THAT MOVES MAIN'S FIRST-PARENT CHAIN (D51).
+/// Main's tip `tip` (count 2) is packed and staged as build 2. A branch cut before it then
+/// lands the usual way, by merging main into the branch and pushing the merge: its own
+/// commit `landed` counts 2 as well, and the merge's first parent is `landed`, so `tip` leaves
+/// main's first-parent chain as `landed` joins it (grok-alab's `53295526` and `6cc031a0`, both
+/// count 15, did exactly this). Both are on main, so no rule over the count or the chain's
+/// shape tells them apart over time: packing `landed` as build 2 is refused at the upload,
+/// because build 2 already stages `tip`'s version, and staging is unchanged. `tip`, off the
+/// chain now, still re-packs and converges (the Apple lane packs a signed release's ledger
+/// commit, which a later merge moves off the chain the same way), and the merge packs as
+/// build 4.
+#[test]
+fn a_harness_build_is_one_commit_across_a_merge_that_moves_mains_first_parent_chain() {
+    let w = world("pack-harness-timeline");
+    let co = harness_checkout(&w, "muse-alab");
+    let git = |args: &[&str]| super::fixture::git(&co, args);
+    let root = git(&["rev-parse", "HEAD"]);
+    put(&co.join("TIP"), b"main's tip when build 2 is packed\n");
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "tip"]);
+    let tip = git(&["rev-parse", "HEAD"]);
+    harness_origin(&w, &co, "alabsystems", "muse-alab", "main");
+
+    let staging = Slug::new("alabsystems", "muse-alab");
+    let tag = "atpkg-muse-alab-2";
+    let attempt = |at: &str, build: u64| {
+        git(&["checkout", "-q", "--detach", at]);
+        let meta = harness_metadata_json(&co, "muse-alab", "0.1.0", &["muse-alab"], &[]);
+        let t = harness_tools(&co, meta, arm_bins(&["muse-alab"]));
+        let mut req = harness_request(&w, "muse-alab", &co);
+        req.build = Some(build);
+        req.upload = true;
+        pack::pack_with(&w.ctx, &req, &t)
+    };
+    let version = |c: &str| format!("0.1.0+g{}", git(&["rev-parse", "--short=9", c]));
+    let out = attempt(&tip, 2).expect("main's tip packs and stages as build 2");
+    assert_eq!((out.build, &out.version), (2, &version(&tip)));
+    let staged = w.host.release_of(&staging, tag).expect("build 2 is staged");
+
+    git(&["checkout", "-q", "-b", "branch", &root]);
+    put(&co.join("LANDED"), b"a branch cut before the tip\n");
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "landed"]);
+    let landed = git(&["rev-parse", "HEAD"]);
+    git(&[
+        "merge",
+        "-q",
+        "--no-ff",
+        "--no-edit",
+        "-m",
+        "merge main into the branch",
+        &tip,
+    ]);
+    let merge = git(&["rev-parse", "HEAD"]);
+    harness_origin(&w, &co, "alabsystems", "muse-alab", "main");
+    let count = |c: &str| git(&["rev-list", "--count", c]);
+    assert_eq!(
+        [count(&tip), count(&landed), count(&merge)],
+        ["2", "2", "4"],
+        "the landed commit repeats the packed tip's count"
+    );
+    assert_eq!(
+        git(&["rev-list", "--first-parent", "refs/remotes/origin/main"]),
+        [merge.as_str(), landed.as_str(), root.as_str()].join("\n"),
+        "the merge moved the packed tip off main's first-parent chain"
+    );
+    git(&[
+        "merge-base",
+        "--is-ancestor",
+        &tip,
+        "refs/remotes/origin/main",
+    ]);
+
+    let err = attempt(&landed, 2).expect_err("build 2 already stages the tip's version");
+    assert!(matches!(err, Error::Refused(_)), "{err:?}");
+    let says = format!(
+        "already stages pkg-muse-alab-2.toml at version `{}`, and this upload is version `{}`",
+        version(&tip),
+        version(&landed)
+    );
+    assert!(err.to_string().contains(&says), "{err}");
+    assert_eq!(
+        w.host.release_of(&staging, tag),
+        Some(staged),
+        "build 2's staged release is unchanged"
+    );
+
+    let out = attempt(&tip, 2).expect("the former tip, off the chain now, re-packs");
+    assert_eq!((out.build, &out.version), (2, &version(&tip)));
+    assert_eq!(
+        w.host.asset(&staging, tag, "pkg-muse-alab-2.toml"),
+        Some(std::fs::read(&out.manifest).expect("manifest")),
+        "the same version converges"
+    );
+    let out = attempt(&merge, 4).expect("the merge packs as build 4");
+    assert_eq!((out.build, &out.version), (4, &version(&merge)));
+    assert!(
+        w.host
+            .asset(&staging, "atpkg-muse-alab-4", "pkg-muse-alab-4.toml")
+            .is_some()
+    );
+}
+
+/// A HARNESS TREE IS A FRESH CLONE'S, WHATEVER GIT'S CONFIG HIDES (D25): an untracked
+/// `.cargo/config.toml` (whose `[env]` the build would read) is refused when
+/// `status.showUntrackedFiles=no` hides it from a plain `git status`, and again when an
+/// exclude rule ignores it. A tracked build input hidden by either index hint is refused
+/// without clearing the hint; an ignored top-level `target/` is not a stray. Each refusal
+/// comes before the build.
+#[test]
+fn a_harness_tree_is_a_fresh_clones_whatever_gits_config_hides() {
+    let w = world("pack-harness-pristine");
+    let co = harness_checkout(&w, "muse-alab");
+    let meta = harness_metadata_json(&co, "muse-alab", "0.1.0", &["muse-alab"], &[]);
+    let attempt = || {
+        let t = harness_tools(&co, meta.clone(), arm_bins(&["muse-alab"]));
+        let out = pack::pack_with(&w.ctx, &harness_request(&w, "muse-alab", &co), &t);
+        (out, t)
+    };
+    let git = |args: &[&str]| super::fixture::git(&co, args);
+    put(
+        &co.join(".cargo/config.toml"),
+        b"[env]\nALAB_HARNESS_VERSION = \"9.9.0\"\n",
+    );
+
+    git(&["config", "status.showUntrackedFiles", "no"]);
+    assert!(
+        git(&["status", "--porcelain"]).is_empty(),
+        "a plain status hides it"
+    );
+    let (err, t) = attempt();
+    let err = err.expect_err("a hidden untracked file");
+    assert!(err.to_string().contains("?? .cargo/config.toml"), "{err}");
+    assert!(t.runs_of("build").is_empty(), "refused before the build");
+
+    git(&["config", "--unset", "status.showUntrackedFiles"]);
+    put(&co.join(".git/info/exclude"), b".cargo/\n");
+    assert!(
+        git(&["status", "--porcelain"]).is_empty(),
+        "an exclude rule hides it"
+    );
+    let (err, t) = attempt();
+    let err = err.expect_err("an ignored build input");
+    assert!(err.to_string().contains("!! .cargo/"), "{err}");
+    assert!(t.runs_of("build").is_empty(), "refused before the build");
+
+    std::fs::remove_dir_all(co.join(".cargo")).expect("rm .cargo");
+    let manifest = std::fs::read(co.join("Cargo.toml")).expect("tracked manifest");
+    for flags in [
+        &["--assume-unchanged"][..],
+        &["--skip-worktree"][..],
+        &["--assume-unchanged", "--skip-worktree"][..],
+    ] {
+        for flag in flags {
+            git(&["update-index", flag, "--", "Cargo.toml"]);
+        }
+        put(&co.join("Cargo.toml"), b"changed tracked build input\n");
+        assert!(git(&["status", "--porcelain"]).is_empty(), "{flags:?}");
+        let hinted = git(&["ls-files", "-v", "--", "Cargo.toml"]);
+        let (err, t) = attempt();
+        let err = err.expect_err("an index hint hides a changed tracked build input");
+        assert!(
+            err.to_string().contains("index hint hides tracked input")
+                && err.to_string().contains("Cargo.toml"),
+            "{err}"
+        );
+        assert!(t.runs_of("build").is_empty(), "refused before the build");
+        assert_eq!(git(&["ls-files", "-v", "--", "Cargo.toml"]), hinted);
+        assert_eq!(
+            std::fs::read(co.join("Cargo.toml")).expect("retained input"),
+            b"changed tracked build input\n"
+        );
+        put(&co.join("Cargo.toml"), &manifest);
+        git(&["update-index", "--no-assume-unchanged", "--", "Cargo.toml"]);
+        git(&["update-index", "--no-skip-worktree", "--", "Cargo.toml"]);
+    }
+    put(&co.join("target/release/muse-alab"), b"an earlier build\n");
+    let out = attempt().0.expect("only target/ is ignored: it packs");
+    assert_eq!(out.build, 1);
+}
+
+#[test]
+fn a_pristine_checkout_checks_index_hints_in_active_submodules() {
+    let tmp = scratch("pack-harness-submodule-hints");
+    let source = tmp.path().join("dependency");
+    let co = tmp.path().join("checkout");
+    fixture_checkout(&source, &[("source.rs", b"original dependency\n")]);
+    fixture_checkout(&co, &[("Cargo.toml", b"[workspace]\n")]);
+    let git = |args: &[&str]| super::fixture::git(&co, args);
+    git(&[
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "--",
+        source.to_str().expect("fixture path"),
+        "nested",
+    ]);
+    git(&["commit", "-qm", "Add dependency"]);
+    assert_eq!(atpkg_publish::git::is_pristine(&co).unwrap(), None);
+    let nested = co.join("nested");
+    let child_git = |args: &[&str]| super::fixture::git(&nested, args);
+    for (set, clear) in [
+        ("--assume-unchanged", "--no-assume-unchanged"),
+        ("--skip-worktree", "--no-skip-worktree"),
+    ] {
+        child_git(&["update-index", set, "--", "source.rs"]);
+        put(&nested.join("source.rs"), b"changed dependency\n");
+        assert!(git(&["status", "--porcelain"]).is_empty());
+        let hinted = child_git(&["ls-files", "-v", "--", "source.rs"]);
+        let blocked = atpkg_publish::git::is_pristine(&co)
+            .unwrap()
+            .expect("a hidden dependency change must prevent publication");
+        assert!(blocked.contains("nested/source.rs"), "{blocked}");
+        assert_eq!(child_git(&["ls-files", "-v", "--", "source.rs"]), hinted);
+        assert_eq!(
+            std::fs::read(nested.join("source.rs")).unwrap(),
+            b"changed dependency\n"
+        );
+        put(&nested.join("source.rs"), b"original dependency\n");
+        child_git(&["update-index", clear, "--", "source.rs"]);
+    }
+    assert_eq!(atpkg_publish::git::is_pristine(&co).unwrap(), None);
 }
 
 #[test]

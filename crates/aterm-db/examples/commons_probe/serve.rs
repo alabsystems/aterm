@@ -2,7 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! Proof observations from the real automatic Runtime, never a parallel manual
-//! endpoint. The explicitly selected live modes pause and restore live config.
+//! endpoint. Guarded live modes pause and restore live config; recovery keeps
+//! the persistent policy authoritative and uses separate observer storage.
 //! Receiver preflight precedes the ownership handoff. To attribute delivery to
 //! this owner, write a fresh marker after its runtime-owner-active event and
 //! verify that exact operation in the post-stop received rows.
@@ -11,7 +12,7 @@ use super::probe::{LocalProbe, Result, prepare_existing, received_existing_at};
 use aterm_codec::hex::encode_lower;
 use aterm_db::{
     replica::InventorySummary,
-    runtime::{LanGate, RepairRound, Runtime, Status},
+    runtime::{RepairRound, Runtime, Status},
 };
 use aterm_digest::Sha256;
 use aterm_json::{Value, json};
@@ -25,11 +26,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-const MAX_ROUNDS: usize = 512;
+const MAX_ROUNDS: usize = 4096;
 const MAX_STATUSES: usize = 64;
 
 struct ReceiverStart {
     tables_root_present: bool,
+    recovery_root_present: bool,
     retained_tables: BTreeSet<[u8; 32]>,
 }
 
@@ -37,22 +39,27 @@ impl ReceiverStart {
     /// Directory names alone need no current membership. A vault-approved,
     /// pending device can reach Runtime's ordinary enrollment path afterward.
     fn observe(paths: &Paths) -> Result<Self> {
-        let root = paths.dir.join("commons/tables");
-        let entries = match std::fs::read_dir(&root) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(Self {
-                    tables_root_present: false,
-                    retained_tables: BTreeSet::new(),
-                });
-            }
-            Err(error) => return Err(error.into()),
-        };
-        if aterm_secrets::fsx::kind(&root)? != aterm_secrets::fsx::Kind::Dir {
-            return Err(io::Error::other("receiver table root is not a directory").into());
+        let primary = Self::retained_at(&paths.dir.join("commons/tables"))?;
+        let recovery = Self::retained_at(&paths.dir.join("commons/recovery/tables"))?;
+        let tables_root_present = primary.is_some();
+        let recovery_root_present = recovery.is_some();
+        let mut retained_tables = primary.unwrap_or_default();
+        retained_tables.extend(recovery.unwrap_or_default());
+        Ok(Self {
+            tables_root_present,
+            recovery_root_present,
+            retained_tables,
+        })
+    }
+
+    fn retained_at(root: &Path) -> Result<Option<BTreeSet<[u8; 32]>>> {
+        match aterm_secrets::fsx::kind(root)? {
+            aterm_secrets::fsx::Kind::Missing => return Ok(None),
+            aterm_secrets::fsx::Kind::Dir => {}
+            _ => return Err(io::Error::other("receiver table root is not a directory").into()),
         }
         let mut retained_tables = BTreeSet::new();
-        for (count, entry) in entries.enumerate() {
+        for (count, entry) in std::fs::read_dir(root)?.enumerate() {
             if count >= 65 {
                 return Err(io::Error::other("receiver retained storage exceeds its bound").into());
             }
@@ -64,15 +71,13 @@ impl ReceiverStart {
                 retained_tables.insert(id);
             }
         }
-        Ok(Self {
-            tables_root_present: true,
-            retained_tables,
-        })
+        Ok(Some(retained_tables))
     }
 
     fn value(&self) -> Value {
         json!({
             "tables_root_present":self.tables_root_present,
+            "recovery_root_present":self.recovery_root_present,
             "retained_table_ids":self.retained_tables.iter().map(|id|encode_lower(id)).collect::<Vec<_>>(),
             "session_required":false,"receiver_seed_written":false,
         })
@@ -82,6 +87,14 @@ impl ReceiverStart {
 enum Objective {
     Baseline(LocalProbe),
     Receive(ReceiverStart),
+}
+
+struct OwnerConfig<'a> {
+    policy_path: &'a Path,
+    policy: &'a [u8],
+    /// A separate observer lets the live policy remain authoritative during
+    /// persistent recovery. A copied policy must never allocate a generation.
+    observer: Option<&'a Path>,
 }
 
 impl Objective {
@@ -103,8 +116,8 @@ struct Observed {
 }
 
 fn seconds_valid(seconds: u64) -> Result<()> {
-    if !(1..=180).contains(&seconds) {
-        return Err(io::Error::other("serve seconds must be between 1 and 180").into());
+    if !(1..=3600).contains(&seconds) {
+        return Err(io::Error::other("serve seconds must be between 1 and 3600").into());
     }
     Ok(())
 }
@@ -125,8 +138,11 @@ pub(super) fn run(run: &str, seconds: u64, config: &Path) -> Result<Value> {
     owner(
         run,
         seconds,
-        config,
-        &policy,
+        OwnerConfig {
+            policy_path: config,
+            policy: &policy,
+            observer: None,
+        },
         paths,
         Objective::Baseline(baseline),
         || false,
@@ -166,6 +182,44 @@ pub(super) fn receive_live(run: &str, seconds: u64) -> Result<Value> {
     )
 }
 
+pub(super) fn recover_live(run: &str, seconds: u64) -> Result<Value> {
+    seconds_valid(seconds)?;
+    let live = aterm_types::dirs::aterm_config_path()
+        .ok_or_else(|| io::Error::other("Commons configuration path is unavailable"))?;
+    let (policy, mode) = super::live_guard::read_config(&live)?;
+    if !aterm_db::runtime::enabled(&live)? {
+        return Err(io::Error::other("live Commons policy is disabled").into());
+    }
+    let paths = Paths::live()?;
+    let before = ReceiverStart::observe(&paths)?;
+    let scratch = aterm_tempfile::Builder::new()
+        .prefix("cpr-")
+        .tempdir_in("/tmp")?;
+    let observer = scratch.path().join("observer.toml");
+    let mut value = owner(
+        run,
+        seconds,
+        OwnerConfig {
+            policy_path: &live,
+            policy: &policy,
+            observer: Some(&observer),
+        },
+        paths,
+        Objective::Receive(before),
+        || false,
+    )?;
+    let unchanged = super::live_guard::read_config(&live)? == (policy, mode);
+    let fields = value.as_object_mut().expect("owner report is an object");
+    fields.insert("mode".into(), json!("recover-live"));
+    fields.insert(
+        "observer_config".into(),
+        json!(observer.display().to_string()),
+    );
+    fields.insert("config_mutated".into(), json!(false));
+    fields.insert("config_unchanged".into(), json!(unchanged));
+    Ok(value)
+}
+
 fn guarded_owner(
     run: &str,
     seconds: u64,
@@ -180,8 +234,11 @@ fn guarded_owner(
         owner(
             run,
             seconds,
-            guard.private_config(),
-            &policy,
+            OwnerConfig {
+                policy_path: guard.private_config(),
+                policy: &policy,
+                observer: None,
+            },
             paths,
             objective,
             || guard.stop_requested(),
@@ -226,8 +283,12 @@ fn classification(round: &RepairRound, baseline: Option<&LocalProbe>) -> &'stati
         "control-not-observed"
     } else if round.membership_error.is_some() {
         "membership-failed"
-    } else if round.application_error.is_some() {
+    } else if round.application_error.is_some() || round.application_interrupted.is_some() {
         "application-failed"
+    } else if round.application_deferral.is_some() {
+        "application-inventory-unavailable"
+    } else if round.application_batch_deferral.is_some() {
+        "application-batch-deferred"
     } else if baseline.is_some_and(|baseline| {
         round
             .application
@@ -274,6 +335,34 @@ pub(super) fn source_evidence(
     })
 }
 
+pub(super) fn deferral_value(why: Option<&aterm_db::replica::InventoryDeferral>) -> Value {
+    why.map_or(Value::Null, |why| {
+        json!({
+            "inventory":why.inventory,"local_error":why.local_error,
+            "retaining_primary_conflicts":why.retaining_primary_conflicts,
+            "peer_unavailable":why.peer_unavailable,
+        })
+    })
+}
+
+pub(super) fn batch_deferral_value(why: Option<&aterm_db::replica::BatchDeferral>) -> Value {
+    why.map_or(
+        Value::Null,
+        |why| json!({"batch":why.batch,"stage":why.stage,"reason":why.reason}),
+    )
+}
+
+pub(super) fn application_value(report: Option<aterm_db::replica::Report>) -> Value {
+    report.map_or(Value::Null, |report| json!({
+        "recovery_reader":report.recovery,
+        "table":report.table.map(|id|encode_lower(&id)),
+        "local_known":inventory(report.local_known),"local_offered":inventory(report.local_offered),
+        "peer_known":inventory(report.peer_known),"sent":report.sent,"received":report.received,
+        "deferred":report.deferred,"keys_sent":report.keys_sent,"keys_received":report.keys_received,
+        "conflicts_sent":report.conflicts_sent,"conflicts_received":report.conflicts_received,
+    }))
+}
+
 fn round_value(round: &RepairRound, baseline: Option<&LocalProbe>) -> Value {
     let control = match &round.control {
         Ok(report) => {
@@ -281,18 +370,17 @@ fn round_value(round: &RepairRound, baseline: Option<&LocalProbe>) -> Value {
         }
         Err(error) => json!({"error":error}),
     };
-    let application = round.application.map_or(Value::Null, |report| json!({
-        "table":report.table.map(|id|encode_lower(&id)),
-        "local_known":inventory(report.local_known),"local_offered":inventory(report.local_offered),
-        "peer_known":inventory(report.peer_known),"sent":report.sent,"received":report.received,
-        "deferred":report.deferred,"keys_sent":report.keys_sent,"keys_received":report.keys_received,
-        "conflicts_sent":report.conflicts_sent,"conflicts_received":report.conflicts_received,
-    }));
+    let application = application_value(round.application);
     let membership = round.membership.map_or(Value::Null, |report| {
         json!({
             "sent":report.sent,"received":report.received,"deferred":report.deferred,
         })
     });
+    let handoff = match &round.handoff {
+        None => Value::Null,
+        Some(Ok(published)) => json!({"published":published}),
+        Some(Err(error)) => json!({"error":error}),
+    };
     json!({
         "target":round.target.map(|address|address.to_string()),
         "actor":round.actor.map(|actor|encode_lower(&actor)),
@@ -302,18 +390,23 @@ fn round_value(round: &RepairRound, baseline: Option<&LocalProbe>) -> Value {
         "classification":classification(round,baseline),"control":control,
         "membership":membership,"membership_error":round.membership_error,
         "application":application,"application_error":round.application_error,
+        "application_interrupted":application_value(round.application_interrupted),
+        "application_deferral":deferral_value(round.application_deferral.as_ref()),
+        "application_batch_deferral":batch_deferral_value(round.application_batch_deferral.as_ref()),
+        "credential_handoff":handoff,
     })
 }
 
 fn owner(
     run: &str,
     seconds: u64,
-    config: &Path,
-    policy: &[u8],
+    configuration: OwnerConfig<'_>,
     paths: Paths,
     objective: Objective,
     stop_requested: impl Fn() -> bool,
 ) -> Result<Value> {
+    let config = configuration.policy_path;
+    let policy = configuration.policy;
     if stop_requested() {
         return Err(io::Error::other("serve stopped before automatic owner startup").into());
     }
@@ -322,10 +415,9 @@ fn owner(
     let rounds = observed.clone();
     let started = Instant::now();
     // The probe drives the LAN on purpose, so its runtime's first LAN use waits for nothing.
-    let runtime = Runtime::start_with_reports(
+    let runtime = start_runtime(
         paths.clone(),
-        config.to_owned(),
-        LanGate::open(),
+        &configuration,
         move |status: Status| {
             let mut observed = statuses.lock().unwrap_or_else(|error| error.into_inner());
             let at_ms = aterm_time::unix_millis().unwrap_or(0);
@@ -437,6 +529,7 @@ fn owner(
                             && round.actor.is_some()
                             && round.control.is_ok()
                             && round.application_error.is_none()
+                            && round.application_interrupted.is_none()
                             && round.membership_error.is_none()
                             && round.application.is_some_and(|report| {
                                 report.table == Some(probe.table) && report.received > 0
@@ -470,6 +563,36 @@ fn owner(
     Ok(value)
 }
 
+fn start_runtime(
+    paths: Paths,
+    configuration: &OwnerConfig<'_>,
+    observe: impl Fn(Status) + Send + 'static,
+    reports: impl Fn(RepairRound) + Send + 'static,
+) -> Result<Runtime> {
+    #[cfg(any(test, debug_assertions))]
+    {
+        Ok(Runtime::start_diagnostic(
+            paths,
+            configuration.policy_path.to_owned(),
+            aterm_db::runtime::Diagnostic {
+                observer_config: configuration
+                    .observer
+                    .unwrap_or(configuration.policy_path)
+                    .to_owned(),
+                recover_writer: configuration.observer.is_some(),
+            },
+            aterm_db::runtime::LanGate::open(),
+            observe,
+            reports,
+        )?)
+    }
+    #[cfg(not(any(test, debug_assertions)))]
+    {
+        let _ = (paths, configuration.observer, observe, reports);
+        Err(io::Error::other("automatic owner probes require a debug build").into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,6 +603,7 @@ mod tests {
         let paths = Paths::for_home(&root.path().join("pending"));
         let before = ReceiverStart::observe(&paths).unwrap();
         assert!(!before.tables_root_present);
+        assert!(!before.recovery_root_present);
         assert!(before.retained_tables.is_empty());
         assert!(!paths.home.exists());
 
@@ -492,5 +616,38 @@ mod tests {
         assert!(std::fs::read_dir(&retained).unwrap().next().is_none());
         assert!(!paths.dir.join("commons/control").exists());
         assert!(!paths.dir.join("commons/table-claims").exists());
+
+        let recovery_only = Paths::for_home(&root.path().join("recovery-only"));
+        let recovery_table = [43; 32];
+        let retained = recovery_only
+            .dir
+            .join("commons/recovery/tables")
+            .join(encode_lower(&recovery_table));
+        std::fs::create_dir_all(&retained).unwrap();
+        let before = ReceiverStart::observe(&recovery_only).unwrap();
+        assert!(!before.tables_root_present);
+        assert!(before.recovery_root_present);
+        assert!(
+            before.retained_tables.contains(&recovery_table),
+            "a retained recovery table cannot be called absent before startup"
+        );
+        let primary = recovery_only
+            .dir
+            .join("commons/tables")
+            .join(encode_lower(&table));
+        std::fs::create_dir_all(&primary).unwrap();
+        let before = ReceiverStart::observe(&recovery_only).unwrap();
+        assert!(before.tables_root_present && before.recovery_root_present);
+        assert_eq!(
+            before.retained_tables,
+            BTreeSet::from([table, recovery_table])
+        );
+        assert!(!recovery_only.dir.join("commons/control").exists());
+        assert!(
+            !recovery_only
+                .dir
+                .join("commons/recovery/table-claims")
+                .exists()
+        );
     }
 }

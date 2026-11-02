@@ -1,7 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Native development build from a checkout's atpkg declaration (`atpkg-publish build-local`).
+//! Native development builds from atpkg declarations (`atpkg-publish build-local`).
+//! Registered harness rows carry their checked main identity and exact build stamp.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -12,6 +13,10 @@ use super::{arch, toolchain};
 use crate::ctx::Ctx;
 use crate::error::{Error, Result};
 use crate::triple::Triple;
+
+#[cfg(unix)]
+#[path = "build_local_harness.rs"]
+mod harness;
 
 /// Which lane builds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,6 +84,8 @@ pub struct Plan {
     pub command: Run,
     /// The checkout's commit.
     pub source: String,
+    /// A registered harness's clean main identity; ordinary local builds retain their own lane.
+    pub harness: Option<pack::HarnessIdentity>,
     /// The compiler's commit.
     pub compiler: String,
     /// The compiler's `-vV`, verbatim.
@@ -95,17 +102,61 @@ pub struct Plan {
     pub out: PathBuf,
 }
 
+/// The producer's immutable local harness namespace, without opening or authorizing it.
+/// A manager may ask the installer to validate a completed prior artifact here. A collision
+/// that lacks a valid complete receipt must be preserved, never rebuilt over or removed.
+/// # Errors
+/// A plan that does not identify a registered harness.
+#[cfg(unix)]
+pub fn harness_artifact_path(req: &Request, plan: &Plan) -> Result<PathBuf> {
+    if plan.harness.is_none() {
+        return Err(Error::refused(
+            "the local manager requires a registered harness plan",
+        ));
+    }
+    Ok(harness::destination(req, plan))
+}
+
 fn safe_name(s: &str) -> bool {
     let mut b = s.bytes();
     b.next().is_some_and(|c| c.is_ascii_alphanumeric())
         && b.all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-'))
 }
 
+/// A harness receipt and its immutable output path name one full compiler commit.
+fn harness_compiler(text: &str) -> Result<&str> {
+    let mut fields = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("commit-hash:"));
+    let commit = fields.next().and_then(|field| field.strip_prefix(' '));
+    match commit {
+        Some(commit)
+            if fields.next().is_none()
+                && commit.len() == 40
+                && commit
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) =>
+        {
+            Ok(commit)
+        }
+        _ => Err(Error::refused(
+            "a harness compiler's -vV must name exactly one full lowercase 40-hex commit-hash",
+        )),
+    }
+}
+
 /// Decide the build.
 ///
 /// # Errors
 ///
-/// Usage error for a bad program name or checkout; refusal for an invalid toolchain or dirty tree.
+/// A usage error for a bad program name or checkout. A refusal for a toolchain
+/// `toolchain::resolve` refuses, a mutable bootstrap stage, a toolchain missing one of its four
+/// drivers, a compiler whose `-vV` fails or names no commit or no host that parses (a harness
+/// requires exactly one full lowercase 40-hex compiler commit), a checkout
+/// git fails on or that has tracked source changes, a `targo metadata` that fails or prints JSON
+/// `pack::parse_metadata` refuses, a bundle-only program or a missing expose declaration. A
+/// could-not-run when the toolchain directory does not resolve, git cannot be spawned, or
+/// `targo metadata` cannot run.
 pub fn plan(ctx: &Ctx, req: &Request, tools: &dyn Tools) -> Result<Plan> {
     let program = &req.program;
     if !program
@@ -151,13 +202,19 @@ pub fn plan(ctx: &Ctx, req: &Request, tools: &dyn Tools) -> Result<Plan> {
             .lines()
             .find_map(|l| l.strip_prefix(k).map(|v| v.trim().to_string()))
     };
-    let compiler = field("commit-hash: ")
-        .ok_or_else(|| Error::refused("the compiler's -vV names no commit-hash"))?;
+    let harness_row =
+        crate::programs::get(program).and_then(|def| def.harness().map(|row| (def, row)));
+    let compiler = if harness_row.is_some() {
+        harness_compiler(&compiler_text)?.to_string()
+    } else {
+        field("commit-hash: ")
+            .ok_or_else(|| Error::refused("the compiler's -vV names no commit-hash"))?
+    };
     let triple = Triple::parse(
         &field("host: ").ok_or_else(|| Error::refused("the compiler's -vV names no host"))?,
     )
     .map_err(|e| Error::refused(e.to_string()))?;
-    let source = crate::git::head(&checkout)?;
+    let mut source = crate::git::head(&checkout)?;
     if !crate::git::run(
         &checkout,
         &["status", "--porcelain", "--untracked-files=no"],
@@ -186,7 +243,23 @@ pub fn plan(ctx: &Ctx, req: &Request, tools: &dyn Tools) -> Result<Plan> {
             String::from_utf8_lossy(&ran.stderr).trim()
         )));
     }
-    let metadata = pack::parse_metadata(&ran.stdout, program)?;
+    let mut metadata = pack::parse_metadata(&ran.stdout, program)?;
+    let harness = if let Some((def, row)) = harness_row {
+        let (held, identity) = pack::harness_identity(
+            ctx.hosts.staging.as_ref(),
+            program,
+            row,
+            metadata,
+            &checkout,
+            None,
+            (&ctx.accounts.staging, def.repo),
+        )?;
+        metadata = held;
+        source = identity.source.clone();
+        Some(identity)
+    } else {
+        None
+    };
     if metadata.bundle_only {
         return Err(Error::refused(format!(
             "{program} needs `atpkg-publish pack-bundle` and a complete sysroot"
@@ -221,7 +294,13 @@ pub fn plan(ctx: &Ctx, req: &Request, tools: &dyn Tools) -> Result<Plan> {
         ]
         .map(OsString::from),
     );
-    args.extend(metadata.build_args.iter().map(OsString::from));
+    args.extend(
+        metadata
+            .build_args
+            .iter()
+            .filter(|arg| harness.is_none() || arg.as_str() != "--locked")
+            .map(OsString::from),
+    );
     for b in &bins {
         args.extend([OsString::from("--bin"), OsString::from(b)]);
     }
@@ -241,9 +320,26 @@ pub fn plan(ctx: &Ctx, req: &Request, tools: &dyn Tools) -> Result<Plan> {
             out.join("targets.noindex").join(program).into(),
         ),
     ];
+    if let Some(identity) = &harness {
+        command.env_remove = pack::SCRUBBED_ENV.iter().map(|key| (*key).into()).collect();
+        command.env.push((
+            pack::HARNESS_VERSION_ENV.into(),
+            identity.version.clone().into(),
+        ));
+        command.env.push((
+            "CARGO_TARGET_DIR".into(),
+            out.join(".ubd")
+                .join("targets.noindex")
+                .join(program)
+                .join(&source)
+                .join(&compiler)
+                .into(),
+        ));
+    }
     Ok(Plan {
         command,
         source,
+        harness,
         compiler,
         compiler_text,
         sysroot,
@@ -305,7 +401,17 @@ fn executable_of(stream: &[u8], bin: &str) -> Option<PathBuf> {
 /// # Errors
 ///
 /// Build failure, source change during the build, existing artifact, or failed bin check.
+/// A harness also refuses outputs outside the producer's home, unsafe existing ancestry,
+/// or an unavailable Unix private-filesystem check.
 pub fn build(ctx: &Ctx, req: &Request, plan: &Plan, tools: &dyn Tools) -> Result<Built> {
+    if plan.harness.is_some() {
+        #[cfg(unix)]
+        return harness::build(ctx, req, plan, tools);
+        #[cfg(not(unix))]
+        return Err(Error::refused(
+            "local harness production needs Unix private-filesystem admission",
+        ));
+    }
     let program = &req.program;
     let _lease = toolchain::lease(
         ctx,
@@ -426,7 +532,7 @@ pub fn build(ctx: &Ctx, req: &Request, plan: &Plan, tools: &dyn Tools) -> Result
         format!("{record}\n"),
     )?;
     write(&run_dir.join("root/SHA256SUMS"), sums)?;
-    if let Some(parent) = dest.parent() {
+    if let Some(parent) = dest.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)
             .map_err(|e| Error::io(format!("mkdir {}", parent.display()), &e))?;
     }
@@ -510,9 +616,10 @@ pub fn parse_args(args: &[String]) -> Result<Request> {
                 };
             }
             "--jobs" => {
-                req.jobs = value()?
-                    .parse()
-                    .ok()
+                let v = value()?;
+                req.jobs = (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                    .then(|| v.parse().ok())
+                    .flatten()
                     .filter(|n| *n > 0)
                     .ok_or_else(|| Error::usage("--jobs takes a positive number"))?;
             }
@@ -548,6 +655,12 @@ pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
         plan.command.program.display(),
         plan.command.argv().join(" ")
     );
+    if let Some(identity) = &plan.harness {
+        println!(
+            "  harness build={} version={} origin=local-build",
+            identity.build_number, identity.version
+        );
+    }
     if req.plan {
         return Ok(());
     }
@@ -564,4 +677,18 @@ pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
         println!("  {}", built.link.join(" "));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_args_rejects_plus_prefixed_jobs() {
+        let args = ["aterm", "/tmp/aterm", "--jobs", "+4"]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>();
+        assert!(parse_args(&args).is_err());
+    }
 }

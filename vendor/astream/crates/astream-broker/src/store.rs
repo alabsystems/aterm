@@ -1073,12 +1073,61 @@ const SEAL_FILE_CAP: u64 = 256;
 #[cfg(feature = "at-rest")]
 const REC_BOUND_PREFIX: &[u8; 16] = b"astream-rec-v2\0\0";
 
+/// The offline seal of a plaintext log (`at-rest`, unix) and the switch it ends with, which
+/// every open finishes or undoes first (every build): `offline_seal.rs`.
+#[path = "offline_seal.rs"]
+mod offline_seal;
+#[cfg(all(feature = "at-rest", unix))]
+pub use offline_seal::SealedLog;
+
 /// The per-log cryptographic at-rest binding sidecar path (`<log>.seal`).
 #[cfg_attr(not(feature = "at-rest"), allow(dead_code))]
 pub(crate) fn seal_path(path: &Path) -> PathBuf {
     let mut p = path.to_path_buf();
     p.as_mut_os_string().push(".seal");
     p
+}
+
+/// A KEYLESS OPEN OF A LOG SEALED AT REST refuses here, in every build, before anything
+/// reads its retention sidecars (`.compact`, `.base`, `.state`, `.held`): `<log>.seal`
+/// beside a log the open did not create says its records, `.state` and `.held` are sealed.
+/// Read without the key, a sealed frame is its nonce first, and a `.held` whose first nonce
+/// byte is the rules kind and whose next eight read as a cut above the base (about one in
+/// 256) is taken for rules a compaction never landed. A log sealed with no `.seal` (a v1 log,
+/// unbound, or one whose `.seal` is gone) is not seen here and reaches that read: the log's scan
+/// refuses it after, and the cut the read found waits until nothing refuses the open
+/// (`HeldStore::make_owed_cut`), so it is never made. A keyless open that creates the log has
+/// nothing sealed to refuse: [`clear_stale_seal`].
+fn refuse_keyless_sealed(path: &Path) -> io::Result<()> {
+    let seal = seal_path(path);
+    match std::fs::symlink_metadata(&seal) {
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{}: the log is sealed at rest (`{}` binds it to its key) and this open has no \
+                 at-rest key: open it with its key (`BrokerLog::open_encrypted_bound`, or \
+                 `BrokerLog::open_encrypted_repair` to repair it). Refused before its retention \
+                 sidecars were read, so they are as they were",
+                path.display(),
+                seal.display()
+            ),
+        )),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// A keyless open that CREATED the log clears a `.seal` a deleted predecessor left, as the
+/// open clears that log's other sidecars, so the plaintext log it creates is not taken for
+/// a sealed one at its next open ([`refuse_keyless_sealed`]). Beside an anti-rollback
+/// watermark the `.seal` stays: a verified open reads the pair to refuse the deleted log
+/// (`preserve_seal_for_deleted_log_verify`), and a keyless open has no say in that.
+fn clear_stale_seal(path: &Path) {
+    let mut hw = path.to_path_buf();
+    hw.as_mut_os_string().push(".hw");
+    if !hw.exists() {
+        let _ = remove_file_path(&seal_path(path));
+    }
 }
 
 /// AAD binding the head-watermark sidecar to its purpose (domain separation from the
@@ -4430,9 +4479,16 @@ impl BrokerLog {
     }
 
     /// THE open, every constructor's: lock the file, run the embedder's `prepare`,
-    /// recover, settle the identity, and record it around the flush.
+    /// settle an offline seal's switch, recover, settle the identity, and record it around
+    /// the flush.
     ///
-    /// 1. Lock the file and run `prepare` (before anything is read).
+    /// 1. Lock the file and run `prepare` (before anything is read). Then settle an offline
+    ///    seal's switch a crash interrupted (`offline_seal.rs`): finish it (the sealed log,
+    ///    locked before it takes the name, is the file from then on), refuse it (its marker
+    ///    does not read, or the log changed after it), or undo its staging. An open with no
+    ///    at-rest key then refuses a log its `.seal` says is sealed, before reading its
+    ///    retention sidecars ([`refuse_keyless_sealed`]), or, having created the log, clears
+    ///    the `.seal` a deleted one left ([`clear_stale_seal`]).
     /// 2. Read the identity sidecar: the durable floor, the last run's tier, boot and
     ///    state, and so this open's UNCLEAN verdict.
     /// 3. Scan and classify ([`recover::classify`]): keep, cut, or refuse.
@@ -4496,7 +4552,7 @@ impl BrokerLog {
         // The escalation table is checked here, before the file is created or anything
         // is prepared: a rule that does not parse is a caller's mistake, refused by name.
         let rules = opts.escalation.compile()?;
-        let (mut file, dir, created) = match storage {
+        let (file, dir, created) = match storage {
             Storage::Os(path) => {
                 let (file, created) = open_log_file(path, sync_parent_dir, || {})?;
                 (
@@ -4513,6 +4569,24 @@ impl BrokerLog {
         };
         let path = dir.log_path().to_path_buf();
         let prepared = prepare()?;
+        // An offline seal's switch a crash interrupted is finished, refused or undone here,
+        // under the lock and before a byte of the log is read (`offline_seal.rs`), after the
+        // embedder's prepare (which, refusing, leaves everything as it found it). When it
+        // moved the sealed log over the name, `file` holds the file it replaced, and the
+        // settle hands back the sealed one, locked before it took the name: that one is the
+        // log from here, and only then is the replaced one let go.
+        let settled = if dir.is_os() {
+            offline_seal::settle(&path)?
+        } else {
+            None
+        };
+        let (mut file, created) = match settled {
+            Some(sealed) => {
+                drop(file);
+                (Backing::from_file(sealed), false)
+            }
+            None => (file, created),
+        };
         // A log that ever took a replicated record is a replica FOREVER, across every
         // constructor: the marker beside it is read before a single record is decoded.
         // A log WE just created carries none of that history, so a marker left beside
@@ -4546,6 +4620,13 @@ impl BrokerLog {
             std::hint::black_box(k);
         }
         let at_rest_key = at_rest_res?;
+        if at_rest_key.is_none() && dir.is_os() {
+            if created {
+                clear_stale_seal(&path);
+            } else {
+                refuse_keyless_sealed(&path)?;
+            }
+        }
         let at_rest_ref = match &at_rest_key {
             Some(k) => Some(k.as_ref()),
             None => None,
@@ -4697,8 +4778,12 @@ impl BrokerLog {
         let head_watermark =
             Self::open_watermark(anti_rollback, &path, at_rest_ref, &existing, base.0, next.0)?;
         drop(existing);
-        // The retention stamps read back cut to the head recovered, once nothing refuses the
-        // open: a crash lost the records past it a tick had stamped (`held.rs`, `S`).
+        // The cut the held store's read found, and the retention stamps read back cut to the
+        // head recovered, once nothing refuses the open: read without its key a sealed store can
+        // read as owing a cut (`held.rs`), and a crash lost the records past the head a tick had
+        // stamped (`held.rs`, `S`).
+        #[cfg(feature = "retention")]
+        hold.make_owed_cut(&path)?;
         #[cfg(feature = "retention")]
         hold.opened_at(&path, at_rest_ref, base.0, next.0)?;
         #[cfg_attr(not(feature = "retention"), allow(unused_mut))]

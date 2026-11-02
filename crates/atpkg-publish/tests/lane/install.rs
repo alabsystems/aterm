@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use atpkg_publish::ctx::HostChoice;
 use atpkg_publish::error::Result;
 use atpkg_publish::lane::install::{
     self, Built, InstallFlags, Lint, Machine, Retirement, ServiceManager, SnapshotBuilder,
@@ -263,6 +264,7 @@ fn spec(kind: LaneKind, root: &Path) -> UnitSpec {
         state_dir: root.join("state root/aterm-auto"),
         xdg_config_home: root.join("home/.config"),
         shim_bin: root.join("home/Library/Application Support/aterm/pkg/bin"),
+        host: HostChoice::Gh,
     }
 }
 

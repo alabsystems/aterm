@@ -1,0 +1,50 @@
+# grok 1.0.70 · MEASURED 2026-10-29, `aterm ctl text` of a private headless aterm (144x50, aterm 0.146.0) running the real Grok Build, launched by path in the lab's jail with a scratch `HOME` and `GROK_HOME`, the lab's `XAI_API_KEY` and `GROK_XAI_API_BASE_URL`/`GROK_CLI_CHAT_PROXY_BASE_URL=http://127.0.0.1:<port>/v1` (a local stub of xAI's API, crates/aterm-lab) · Ctrl-C pressed once on a fresh Grok Build's empty composer (the welcome card up): it stays up, and the key row becomes `Ctrl+c:press again to quit` (a second Ctrl-C within the window quits, as Ctrl-Q does) · cursor=45,6 (visible, blinking_block) · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+  /p/t/at.lab0/proj
+
+
+
+
+
+
+
+
+
+
+            ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+            │                                                                                                                      │
+            │  ⠀⠀⠀⠀⠀⠀⣀⣀⡀⠀⠀⠀⢀⠄   Grok Build  1.0.70                                                                                 │
+            │  ⠀⠀⠀⣠⣾⠿⠛⠛⠛⠛⢀⡴⠁⠀   Thanks for trying Grok Build, give feedback with /feedback!                                        │
+            │  ⠀⠀⣼⡟⠁⠀⠀⠀⢀⡴⠻⣿⡀⠀                                                                                                      │
+            │  ⠀⠀⣿⡇⠀⠀⠀⠔⠁⠀⠀⣿⡇⠀   Resume session                                                                             ctrl+r  │
+            │  ⠀⠀⢹⣷⠀⠀⠀⠀⠀⢀⣴⡿⠀⠀   New worktree                                                                               ctrl+w  │
+            │  ⠀⢀⠞⠁⠠⢶⣶⣶⣶⠿⠋⠀⠀⠀   Changelog                                                                                          │
+            │  ⠐⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀   Quit                                                                                       ctrl+q  │
+            │                                                                                                                      │
+            ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ ❯                                                                                                                                        │
+  ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── lab-stub ─╯
+
+  Ctrl+c:press again to quit

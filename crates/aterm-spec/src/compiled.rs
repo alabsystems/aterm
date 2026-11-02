@@ -570,7 +570,7 @@ impl Compiled {
             depth: Cell::new(0),
         };
         let whole = scope.whole(e, &mut Vec::new());
-        CompiledExpr(whole, scope.depth.get())
+        CompiledExpr(whole, scope.depth.get(), self.width())
     }
 
     #[inline]
@@ -591,6 +591,13 @@ impl Compiled {
     #[cfg_attr(trust_verify, trust::skip)]
     #[inline]
     pub(crate) fn state(&self, s: &[i64]) -> BTreeMap<&'static str, i64> {
+        assert_eq!(
+            s.len(),
+            self.width(),
+            "state slice length {} != model width {}",
+            s.len(),
+            self.width()
+        );
         self.names.iter().copied().zip(s.iter().copied()).collect()
     }
 
@@ -599,6 +606,13 @@ impl Compiled {
     #[cfg_attr(trust_verify, trust::skip)]
     #[inline]
     pub(crate) fn holds(&self, i: usize, s: &[i64]) -> bool {
+        assert_eq!(
+            s.len(),
+            self.width(),
+            "state slice length {} != model width {}",
+            s.len(),
+            self.width()
+        );
         with_slots(self.slots, |locals| self.invariants[i].check(s, locals))
     }
 
@@ -623,6 +637,13 @@ impl Compiled {
     // Skip: the cartesian product's Vec bookkeeping, as in `successors_in`.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(crate) fn successors_into(&self, a: usize, s: &[i64], rows: &mut Vec<i64>) -> usize {
+        assert_eq!(
+            s.len(),
+            self.width(),
+            "state slice length {} != model width {}",
+            s.len(),
+            self.width()
+        );
         with_slots(self.slots, |locals| {
             self.successors_with(a, s, rows, locals)
         })
@@ -694,7 +715,7 @@ const fn write_slot(rows: &mut [i64], width: usize, slot: usize, v: i64) {
 }
 
 /// A boolean expression resolved against one [`Compiled`] model.
-pub(crate) struct CompiledExpr(Whole, usize);
+pub(crate) struct CompiledExpr(Whole, usize, usize);
 
 impl CompiledExpr {
     /// The expression's value at `s` (`Expr::eval` over `eval_env(s)`).
@@ -702,6 +723,13 @@ impl CompiledExpr {
     #[cfg_attr(trust_verify, trust::skip)]
     #[inline]
     pub(crate) fn eval(&self, s: &[i64]) -> Value {
+        assert_eq!(
+            s.len(),
+            self.2,
+            "state slice length {} != model width {}",
+            s.len(),
+            self.2
+        );
         with_slots(self.1, |locals| self.0.eval(s, locals))
     }
 }

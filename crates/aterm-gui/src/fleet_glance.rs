@@ -245,10 +245,14 @@ fn host_part(dial: &str) -> &str {
     if dial.parse::<std::net::IpAddr>().is_ok() {
         return dial;
     }
-    match dial.rsplit_once(':') {
+    let host = match dial.rsplit_once(':') {
         Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
         _ => dial,
-    }
+    };
+    host.strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .filter(|h| h.parse::<std::net::Ipv6Addr>().is_ok())
+        .unwrap_or(host)
 }
 
 /// How a row names the peer the book knows as `dial`: its host's first label (`mac-17` for `mac-17.local`), an address whole.
@@ -364,12 +368,15 @@ fn mac_of(
         unproven,
         sessions: rows.len(),
         instances_unread: field(instance, "instances")
+            .filter(|n| n.bytes().all(|b| b.is_ascii_digit()))
             .and_then(|n| n.parse::<usize>().ok())
             .unwrap_or(1)
             .saturating_sub(1),
         ..FleetMac::default()
     };
-    let claimed = field(instance, "sessions").and_then(|n| n.parse::<usize>().ok());
+    let claimed = field(instance, "sessions")
+        .filter(|n| n.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|n| n.parse::<usize>().ok());
     mac.left_out = claimed.map_or(0, |n| n.saturating_sub(sent.len()));
     for row in &rows {
         let agent = field(row, "program_kind") == Some("agent");
@@ -433,6 +440,7 @@ fn mac_of(
                 .map(crate::presence::short_sid),
             age_ms: age_key
                 .and_then(|key| field(row, key))
+                .filter(|ms| ms.bytes().all(|b| b.is_ascii_digit()))
                 .and_then(|ms| ms.parse().ok()),
             what: claim
                 .map(str::to_string)
@@ -772,12 +780,49 @@ impl FleetRunner for ChildRunner {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kick {
     /// The status menu is opening: read if the last read is stale.
+    #[cfg_attr(
+        all(not(target_os = "macos"), not(test)),
+        expect(dead_code, reason = "the menu-bar status item is macOS's")
+    )]
     MenuOpening,
     /// Read the Fleet Now: read whatever the last read's age.
+    #[cfg_attr(
+        all(not(target_os = "macos"), not(test)),
+        expect(dead_code, reason = "the menu-bar status item is macOS's")
+    )]
     Now,
     /// This Mac's network moved: the read's backoff ends ([`Quiet::moved`]), and a Mac that reads
     /// on its own reads now.
     Moved,
+}
+
+/// The kicks the reader holds at one look ([`reader_loop`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Asked {
+    /// A [`Kick::Now`].
+    now: bool,
+    /// A [`Kick::MenuOpening`].
+    menu: bool,
+    /// A [`Kick::Moved`].
+    moved: bool,
+}
+
+impl Asked {
+    /// `first`, if any, and every kick queued behind it in `rx`.
+    fn with_queued(first: Option<Kick>, rx: &Receiver<Kick>) -> Self {
+        let mut asked = Self::default();
+        for kick in first
+            .into_iter()
+            .chain(std::iter::from_fn(|| rx.try_recv().ok()))
+        {
+            match kick {
+                Kick::Now => asked.now = true,
+                Kick::MenuOpening => asked.menu = true,
+                Kick::Moved => asked.moved = true,
+            }
+        }
+        asked
+    }
 }
 
 /// The reader thread's inputs besides its runner.
@@ -797,6 +842,13 @@ pub(crate) struct ReaderSeams {
     /// This process's "network moved" signal, each move a [`Kick::Moved`]; none in a test that
     /// kicks by hand.
     pub(crate) moved: Option<crate::network_moved::Watch>,
+    /// Whether this process may use the local network now
+    /// ([`aterm_types::macos_setup::lan_first_use::may_use`]): a read dials the fleet's Macs, so
+    /// none goes by itself (the tick, a menu, a move) while System State's Local Network step,
+    /// which asks macOS first, is still to come. A person's Read the Fleet Now still reads. It is
+    /// asked only for a read the tick would make ([`should_poll`]), right before it: past the
+    /// step's wait it is the door that takes the dialog slot for macOS's question.
+    pub(crate) lan: Box<dyn Fn() -> bool + Send>,
 }
 
 /// The fleet glance's handle: the slot and the kick channel.
@@ -867,7 +919,8 @@ pub(crate) fn spawn(runner: Box<dyn FleetRunner>, mut seams: ReaderSeams) -> Opt
 
 /// The reader: look, read when [`should_poll`] (or a [`Kick::Now`]) says,
 /// at the wait [`Quiet`] keeps (a [`Kick::Moved`] starts it again and reads
-/// as if no read was made), write the slot ([`carry`]ing a silent Mac's last
+/// as if no read was made, and one that comes while a read runs does so once
+/// that read is over), write the slot ([`carry`]ing a silent Mac's last
 /// rows), tell the App, then wait for a kick, the tick, or the next instant
 /// the read or one Mac's rows in it starts or stops counting
 /// ([`FleetSnapshot::next_freshness_change`]), whichever is first.
@@ -878,7 +931,7 @@ fn reader_loop(
     rx: &Receiver<Kick>,
 ) {
     let lock = || slot.lock().unwrap_or_else(|p| p.into_inner());
-    let mut kick: Option<Kick> = None;
+    let mut asked = Asked::default();
     let mut first = true;
     let mut freshness_at: Option<u64> = None;
     let mut told_ms: u64 = 0;
@@ -886,22 +939,20 @@ fn reader_loop(
     loop {
         let book = (seams.book)();
         let now = (seams.now_ms)();
-        let moved = kick == Some(Kick::Moved);
-        if moved {
+        if asked.moved {
             quiet.moved();
         }
-        let tried = lock().tried_ms.filter(|_| !moved);
+        let tried = lock().tried_ms.filter(|_| !asked.moved);
         let watch = seams.watch.load(std::sync::atomic::Ordering::Acquire);
+        // The LAN door is asked last, only for a read this tick makes: past the wait for System
+        // State's Local Network step it takes the dialog slot for macOS's question, so a tick
+        // that reads nothing must not go through it.
         let read = book.in_fleet
-            && (kick == Some(Kick::Now)
-                || should_poll(
-                    &book,
-                    watch,
-                    tried,
-                    now,
-                    kick == Some(Kick::MenuOpening),
-                    quiet.every(),
-                ));
+            && (asked.now
+                || (should_poll(&book, watch, tried, now, asked.menu, quiet.every())
+                    && (seams.lan)()));
+        // A move of the network that came while a read ran: that read went out on the old one.
+        let mut moved_since = false;
         let book_moved = {
             let mut slot = lock();
             let moved = slot.book != book;
@@ -920,12 +971,17 @@ fn reader_loop(
         }
         if read {
             let answer = runner.run();
+            // The kicks that came while it ran are answered by it, but a move of the network,
+            // which asks for a read on the new one; one sent once its result is in the slot asks
+            // for another.
+            moved_since = Asked::with_queued(None, rx).moved;
             let now = (seams.now_ms)();
             let parsed = answer.and_then(|(json, stderr)| {
                 let no_route = stderr.contains(aterm_ctl::NO_ROUTE_NOTE);
                 parse(&json, no_route, seams.own_node.as_deref(), now)
             });
-            if quiet.after(&parsed) {
+            // Whom a read on the old network reached says nothing of the new one.
+            if !moved_since && quiet.after(&parsed) {
                 aterm_log::info!("{}", quiet_line(quiet));
             }
             {
@@ -946,7 +1002,6 @@ fn reader_loop(
                 }
             }
             lock().book = (seams.book)();
-            while rx.try_recv().is_ok() {}
             if !(seams.post)() {
                 return;
             }
@@ -960,10 +1015,17 @@ fn reader_loop(
         let wait = freshness_at.map_or(seams.tick, |at| {
             Duration::from_millis(at.saturating_sub(now)).min(seams.tick)
         });
-        kick = match rx.recv_timeout(wait) {
-            Ok(kick) => Some(kick),
-            Err(RecvTimeoutError::Timeout) => None,
-            Err(RecvTimeoutError::Disconnected) => return,
+        asked = if moved_since {
+            Asked {
+                moved: true,
+                ..Asked::default()
+            }
+        } else {
+            match rx.recv_timeout(wait) {
+                Ok(kick) => Asked::with_queued(Some(kick), rx),
+                Err(RecvTimeoutError::Timeout) => Asked::default(),
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
         };
     }
 }
@@ -1028,6 +1090,9 @@ pub(crate) fn parse_told(rows: &[String]) -> std::collections::HashMap<u64, Need
     rows.iter()
         .filter_map(|row| {
             let (key, word) = row.split_once('=')?;
+            if !key.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return None;
+            }
             let key = u64::from_str_radix(key, 16)
                 .ok()
                 .filter(|k| is_herald_key(*k))?;
@@ -1091,6 +1156,7 @@ impl crate::App {
             post: Box::new(move || proxy.send_event(crate::Wake::FleetRead).is_ok()),
             tick: POLL_EVERY,
             moved: Some(crate::network_moved::watch()),
+            lan: Box::new(aterm_types::macos_setup::lan_first_use::may_use),
         };
         self.start_fleet_glance_with(Box::new(ChildRunner::fleet()), seams);
     }

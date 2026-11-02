@@ -433,16 +433,27 @@ impl EditorBufferView {
 }
 
 pub(super) fn previous_boundary(text: &str, position: usize) -> usize {
-    let position = position.min(text.len());
-    text[..position]
+    let position = clamp_to_char_boundary(text, position);
+    if position == 0 {
+        return 0;
+    }
+    let start = line_start(text, position);
+    if position == start {
+        return if start >= 2 && text.as_bytes().get(start - 2..start) == Some(b"\r\n") {
+            start - 2
+        } else {
+            start - 1
+        };
+    }
+    text[start..position]
         .grapheme_indices()
-        .map(|(at, _)| at)
+        .map(|(at, _)| start.saturating_add(at))
         .last()
-        .unwrap_or(0)
+        .unwrap_or(start)
 }
 
 pub(super) fn next_boundary(text: &str, position: usize) -> usize {
-    let position = position.min(text.len());
+    let position = clamp_to_char_boundary(text, position);
     if position == text.len() {
         return position;
     }
@@ -1146,5 +1157,17 @@ mod tests {
             .execute(&mut store, &mut view, EditorCommand::MoveBackward)
             .unwrap();
         assert_eq!(view.primary_selection().head, 0);
+    }
+
+    #[test]
+    fn line_and_grapheme_boundaries_clamp_mid_char_offsets_and_keep_crlf_whole() {
+        let text = "α\r\nβ\ne\u{301}";
+        assert_eq!(line_start(text, 1), 0);
+        assert_eq!(line_end(text, 1), 3);
+        assert_eq!(previous_boundary(text, 1), 0);
+        assert_eq!(next_boundary(text, 1), "α".len());
+        assert_eq!(previous_boundary(text, "α\r\n".len()), "α".len());
+        assert_eq!(previous_boundary(text, "α\r\nβ\n".len()), "α\r\nβ".len());
+        assert_eq!(previous_boundary(text, text.len()), "α\r\nβ\n".len());
     }
 }

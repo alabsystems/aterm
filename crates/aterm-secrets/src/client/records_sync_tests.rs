@@ -228,6 +228,44 @@ fn member_pinned(root: &Path, host: &RecordsHost, key: &[u8; 32]) -> Paths {
     member
 }
 
+#[test]
+fn unused_peer_selection_does_not_advance_after_a_record_long_poll() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let primary = RecordsHost::start(Box::new(|_| (Vec::new(), false)), 400);
+    let peer_reads = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&peer_reads);
+    let peer = RecordsHost::start(
+        Box::new(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            (Vec::new(), false)
+        }),
+        400,
+    );
+    let member = member_of(root.path(), &primary);
+    let selections = AtomicUsize::new(0);
+    let found = |_: &Config| {
+        selections.fetch_add(1, Ordering::SeqCst);
+        vec![crate::discover::DiscoveredVault {
+            url: peer.url("team"),
+            txt: None,
+        }]
+    };
+    let found = PeerDiscovery::supplied(&found);
+    sync_records_inner(&member, Some(Duration::ZERO), &[], Some(&found))
+        .expect("the primary answered its long poll");
+    let after_poll = selections.load(Ordering::SeqCst);
+    let reads_after_poll = peer_reads.load(Ordering::SeqCst);
+    sync_records_inner(&member, None, &[], Some(&found)).expect("a non-waiting pass asks peers");
+    let after_probe = selections.load(Ordering::SeqCst);
+    let reads_after_probe = peer_reads.load(Ordering::SeqCst);
+    peer.end();
+    primary.end();
+    assert_eq!(after_poll, 0, "an unused batch must not advance discovery");
+    assert_eq!(reads_after_poll, 0);
+    assert_eq!(after_probe, 1);
+    assert_eq!(reads_after_probe, 1);
+}
+
 /// What [`lacking`] sets up: a records host whose store lacks the member's newest record and
 /// says so, the member, and the founder's log and keys to mint more records with.
 struct Lacking {
@@ -287,6 +325,38 @@ fn lacking(root: &Path, post_status: u16) -> Lacking {
     held.push(lacking.mint(6));
     save_records(&lacking.member, &encode_records(&held)).expect("the member's store");
     lacking
+}
+
+#[test]
+fn bounded_member_records_pull_retains_verified_records_without_reposting() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let mut fixture = lacking(root.path(), 400);
+    let late = fixture.mint(8);
+    let wire = encode_records(fixture.log.records());
+    let host = RecordsHost::start(Box::new(move |_| (wire.clone(), true)), 400);
+    let config = configured(&fixture.member).unwrap();
+    let mut moved = config.clone();
+    moved.source = Source::Url(host.url("team"));
+    save_config(&fixture.member, &moved).unwrap();
+    let found = |_: &Config| Vec::new();
+    let found = PeerDiscovery::supplied(&found);
+    sync_records_until(
+        &fixture.member,
+        None,
+        &[],
+        Some(&found),
+        Some(Instant::now() + HANG_DETECTOR),
+    )
+    .expect("bounded record pull");
+    assert!(
+        load_records(&fixture.member)
+            .unwrap()
+            .complete_bytes(late.id())
+            .is_some()
+    );
+    assert_eq!(host.posts(), 0, "a bounded reader does not repost");
+    host.end();
+    fixture.host.end();
 }
 
 /// A server that cannot take a member's frontier (a record its build refuses, a store at its

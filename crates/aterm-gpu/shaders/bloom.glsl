@@ -17,6 +17,17 @@ layout(std140) uniform aterm_b2 {
     float bu_chroma_radius; // the coloured part's, the shorter of the two
     float bu_extent_x;      // the share of the half texture's storage in use: 1 unless roomy
     float bu_extent_y;
+    float bu_pad0;
+    vec2 bu_screen;         // the frame, px: a fragment lies at `uv * screen`
+    // The frame's letter mask (aterm_render::bloom::LetterMask): the cells the bloom keeps off.
+    vec2 bu_origin;         // the grid's top-left, px
+    vec2 bu_cell;           // a cell, px
+    vec2 bu_grow;           // kept off entirely this far past a kept cell's box, px
+    vec2 bu_feather;        // easing back to whole over this far past that, px
+    float bu_mask_on;       // 0: the bloom is laid whole
+    float bu_pad2;
+    uvec4 bu_window;        // the cells the bits cover: first column, first row, columns, rows
+    uvec4 bu_bits[256];     // one bit a cell, row-major: bit i & 31 of word i >> 5
 };
 uniform highp sampler2D aterm_t0;
 
@@ -52,6 +63,51 @@ vec3 half_rgb(vec2 uv) {
     return texture(aterm_t0, held * vec2(bu_extent_x, bu_extent_y)).rgb;
 }
 
+// Whether cell (c, r) is kept off (`LetterMask::kept`).
+bool kept_cell(int c, int r) {
+    int lc = c - int(bu_window.x);
+    int lr = r - int(bu_window.y);
+    if (lc < 0 || lr < 0 || lc >= int(bu_window.z) || lr >= int(bu_window.w)) {
+        return false;
+    }
+    uint i = uint(lr) * bu_window.z + uint(lc);
+    uint word = bu_bits[int(i >> 7u)][int((i >> 5u) & 3u)];
+    return ((word >> (i & 31u)) & 1u) != 0u;
+}
+
+// The share of the bloom laid at frame point p (`LetterMask::weight`, its twin): 0 within a
+// kept cell's box grown by `grow`, rising to 1 over `feather` past it.
+float letter_mask(vec2 p) {
+    if (bu_mask_on == 0.0) {
+        return 1.0;
+    }
+    int c = int(floor((p.x - bu_origin.x) / bu_cell.x));
+    int r = int(floor((p.y - bu_origin.y) / bu_cell.y));
+    float m = 1.0;
+    for (int dr = -2; dr <= 2; dr = dr + 1) {
+        for (int dc = -1; dc <= 1; dc = dc + 1) {
+            int cc = c + dc;
+            int rr = r + dr;
+            if (!kept_cell(cc, rr)) {
+                continue;
+            }
+            float bx0 = bu_origin.x + float(cc) * bu_cell.x - bu_grow.x;
+            float by0 = bu_origin.y + float(rr) * bu_cell.y - bu_grow.y;
+            float bx1 = bx0 + bu_cell.x + 2.0 * bu_grow.x;
+            float by1 = by0 + bu_cell.y + 2.0 * bu_grow.y;
+            float dx = max(max(bx0 - p.x, p.x - bx1), 0.0) / bu_feather.x;
+            float dy = max(max(by0 - p.y, p.y - by1), 0.0) / bu_feather.y;
+            float e2 = dx * dx + dy * dy;
+            if (e2 >= 1.0) {
+                continue;
+            }
+            float e = sqrt(e2);
+            m = min(m, e * e * (3.0 - 2.0 * e));
+        }
+    }
+    return m;
+}
+
 // One 25-tap kernel, two radii: the white part spreads at `radius`, the chroma
 // at the shorter `chroma_radius`, summed back into one halo.
 void fs_bloom() {
@@ -71,6 +127,7 @@ void fs_bloom() {
         }
     }
     vec3 sum = vec3(white) + chroma;
-    o_frag = vec4(sum / vec3(wsum) * bu_strength, 1.0);
+    float kept = letter_mask(v_uv * bu_screen);
+    o_frag = vec4(sum / vec3(wsum) * bu_strength * kept, 1.0);
 }
 #endif

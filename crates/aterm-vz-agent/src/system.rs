@@ -126,7 +126,11 @@ pub fn parse_jobs(text: &str) -> Vec<RawJob> {
     text.lines()
         .filter_map(|line| {
             let mut f = line.split_whitespace();
-            let id = f.next()?.parse().ok()?;
+            let id = f.next()?;
+            if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let id = id.parse().ok()?;
             let unit = f.next()?.to_string();
             let kind = f.next()?.to_string();
             let state = f.next()?.to_string();
@@ -155,13 +159,19 @@ pub fn parse_failed(text: &str) -> Vec<String> {
 #[must_use]
 pub fn parse_uptime_ms(text: &str) -> Option<u64> {
     let secs = text.split_whitespace().next()?;
-    let (whole, frac) = secs.split_once('.').unwrap_or((secs, ""));
+    let (whole, frac) = match secs.split_once('.') {
+        Some((whole, frac)) if !frac.is_empty() && frac.bytes().all(|b| b.is_ascii_digit()) => {
+            (whole, frac)
+        }
+        Some(_) => return None,
+        None => (secs, ""),
+    };
+    if whole.is_empty() || !whole.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
     let whole: u64 = whole.parse().ok()?;
     let mut ms = 0;
     for (i, digit) in frac.bytes().take(3).enumerate() {
-        if !digit.is_ascii_digit() {
-            return None;
-        }
         ms += u64::from(digit - b'0') * [100, 10, 1][i];
     }
     whole.checked_mul(1000)?.checked_add(ms)
@@ -187,6 +197,7 @@ mod tests {
  98 cloud-final.service                  start waiting
 No jobs running.
 x not.a job line
++117 systemd-networkd-wait-online.service start running
 ";
         assert_eq!(
             parse_jobs(text),
@@ -225,6 +236,10 @@ x not.a job line
         assert_eq!(parse_uptime_ms("12345.6 1.0"), Some(12_345_600));
         assert_eq!(parse_uptime_ms("7 0"), Some(7000));
         assert_eq!(parse_uptime_ms("0.0049 0"), Some(4));
+        assert_eq!(parse_uptime_ms("+7 0"), None);
+        assert_eq!(parse_uptime_ms("1. 0"), None);
+        assert_eq!(parse_uptime_ms(".5 0"), None);
+        assert_eq!(parse_uptime_ms("1.234xyz 0"), None);
         assert_eq!(parse_uptime_ms("x"), None);
         assert_eq!(parse_uptime_ms(""), None);
     }

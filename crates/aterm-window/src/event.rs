@@ -9,7 +9,7 @@
 //! [`EventLoop::run_app`]: crate::event_loop::EventLoop::run_app
 use std::path::PathBuf;
 use std::sync::{Mutex, Weak};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::keyboard::SmolStr;
 
@@ -168,6 +168,11 @@ pub enum WindowEvent {
 
     /// The window should be redrawn (invalidated by the OS or requested via [`Window::request_redraw`]).
     RedrawRequested,
+
+    /// LOCAL PATCH (aterm): a vsync of the window's frame clock, sent while the window asks for
+    /// one ([`Window::set_frame_clock`]): `target` is when a frame drawn now reaches the display,
+    /// `period` the display's refresh period at the rate the clock runs.
+    FrameTick { target: Instant, period: Duration },
 }
 
 /// Identifier of an input device.

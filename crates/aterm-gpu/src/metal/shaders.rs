@@ -24,6 +24,9 @@ pub(crate) const TRAY: &str = include_str!("../../shaders/tray.metal");
 pub(crate) const BLOOM: &str = include_str!("../../shaders/bloom.metal");
 /// EMBERFORGE heat-haze displacement shader.
 pub(crate) const SHIMMER: &str = include_str!("../../shaders/shimmer.metal");
+/// GPU tray prims shader (`crate::tray_prims`), compiled with fast math off
+/// ([`super::ffi::CompileOptions::aterm_precise`]).
+pub(crate) const TRAY_PRIMS: &str = include_str!("../../shaders/tray_prims.metal");
 
 /// The line [`source_for`] puts before [`CELL`] for a device with framebuffer fetch: it compiles `cell.metal`'s fetch twins and probe (`#if ATERM_FETCH`).
 pub(crate) const FETCH_DEFINE: &str = "#define ATERM_FETCH 1\n";
@@ -46,6 +49,7 @@ pub(crate) const fn source(library: ShaderLibrary) -> &'static str {
         ShaderLibrary::Tray => TRAY,
         ShaderLibrary::Bloom => BLOOM,
         ShaderLibrary::Shimmer => SHIMMER,
+        ShaderLibrary::TrayPrims => TRAY_PRIMS,
     }
 }
 

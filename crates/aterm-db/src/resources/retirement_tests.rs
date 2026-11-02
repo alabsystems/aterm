@@ -269,18 +269,25 @@ pub(crate) fn retirement_transition(
 fn retirement_appends_conform_and_catalog_negative_control_is_detected() {
     let model = aterm_models_db::resource_retirement_model();
     assert!(aterm_spec::interp::prove_and_catch(&model) > 1);
-    for state in aterm_spec::interp::reachable_states(&model) {
-        for action in &model.actions {
-            if model.action_enabled(action.name, &state) {
-                let next = retirement_transition(&state, action.name);
-                assert!(
-                    model.successors(action.name, &state).contains(&next),
-                    "{}: {state:?} -> {next:?}",
-                    action.name
-                );
-            }
-        }
-    }
+    let steps: Vec<_> = aterm_spec::interp::reachable_states(&model)
+        .iter()
+        .flat_map(|state| {
+            model
+                .actions
+                .iter()
+                .filter(|action| model.action_enabled(action.name, state))
+                .map(|action| (state.clone(), action.name))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    // Each step builds its own Lab in its own temporary home, on the lane's places.
+    aterm_spec::fs_lane::each(&steps, |(state, action)| {
+        let next = retirement_transition(state, action);
+        assert!(
+            model.successors(action, state).contains(&next),
+            "{action}: {state:?} -> {next:?}"
+        );
+    });
     let seeded = retirement_transition(&model.init_state(), "LegacyPeer");
     let mut blocked = retirement_transition(&seeded, "Reserve");
     blocked.insert("accepted", 0);

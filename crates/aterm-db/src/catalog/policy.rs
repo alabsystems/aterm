@@ -18,9 +18,17 @@ impl Default for Policy {
     }
 }
 impl Policy {
+    /// The policy `aterm.toml` at `path` gives, read as the window reads its settings: a symlink
+    /// (a dotfiles checkout, home-manager) is followed to a file this user or root owns and
+    /// others cannot write ([`aterm_secrets::fsx::read_aterm_config`]), as `[swarm] enabled` is
+    /// read ([`aterm_secrets::swarm::enabled_at`]).
     pub fn read(path: &Path) -> Result<Self> {
-        let bytes = aterm_secrets::fsx::read_owned(path, 1024 * 1024)
-            .map_err(|_| Error::new("Commons configuration is not an owned safe file"))?;
+        let bytes = aterm_secrets::fsx::read_aterm_config(path, 1024 * 1024).map_err(|why| {
+            Error(format!(
+                "Commons configuration is not a file of this user's or root's that others cannot \
+                 write: {why}"
+            ))
+        })?;
         let Some(bytes) = bytes else {
             return Ok(Self::default());
         };
@@ -72,5 +80,24 @@ impl Policy {
             enabled: swarm && enabled,
             excluded,
         })
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::Policy;
+
+    /// A symlinked `aterm.toml` (a dotfiles checkout, home-manager) gives Commons its policy as
+    /// the window reads the file, so sharing that reads on in the window starts Commons here too.
+    #[test]
+    fn a_symlinked_aterm_toml_gives_commons_its_policy() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let target = scratch.path().join("dotfiles.toml");
+        std::fs::write(&target, "[commons]\nenabled = false\n").unwrap();
+        let link = scratch.path().join("aterm.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(!Policy::read(&link).expect("the link is followed").enabled);
+        std::fs::write(&target, "[swarm]\nenabled = true\n").unwrap();
+        assert!(Policy::read(&link).expect("the link is followed").enabled);
     }
 }

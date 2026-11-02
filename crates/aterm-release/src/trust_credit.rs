@@ -142,9 +142,10 @@ pub fn parse_epochs(text: &str) -> Result<Vec<Epoch>, String> {
         let [id, old, mapped, floor, why] = f[..] else {
             return Err(format!("{EPOCHS}:{n}: {} fields, not 5", f.len()));
         };
-        let id: u32 = id
-            .parse()
-            .map_err(|_| format!("{EPOCHS}:{n}: epoch {id:?} is not a number"))?;
+        let id: u32 = (!id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| id.parse().ok())
+            .flatten()
+            .ok_or_else(|| format!("{EPOCHS}:{n}: epoch {id:?} is not a number"))?;
         let want = out.last().map_or(1, |e| e.id + 1);
         if id != want {
             return Err(format!(
@@ -168,9 +169,10 @@ pub fn parse_epochs(text: &str) -> Result<Vec<Epoch>, String> {
                 ENCODINGS.join(", ")
             ));
         }
-        let calculus_floor: u64 = floor
-            .parse()
-            .map_err(|_| format!("{EPOCHS}:{n}: floor {floor:?} is not a count"))?;
+        let calculus_floor: u64 = (!floor.is_empty() && floor.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| floor.parse().ok())
+            .flatten()
+            .ok_or_else(|| format!("{EPOCHS}:{n}: floor {floor:?} is not a count"))?;
         if let Some(prev) = out.last()
             && calculus_floor < prev.calculus_floor
         {
@@ -377,15 +379,18 @@ fn check_grade(status: &str, e: &str, d: &str, p: &[String]) -> Result<bool, Str
 }
 
 /// Whether a grade is Trust's calculus authority's (`CalculusRowProved`, VF5): encoding
-/// [`CALCULUS`], discharge [`CALCULUS_DISCHARGE`], and every one of [`CALCULUS_PREMISES`]
-/// stated. Only such a proved row is "proved (calculus)".
+/// [`CALCULUS`], discharge [`CALCULUS_DISCHARGE`], and [`CALCULUS_PREMISES`] stated in
+/// declaration order with no extra or repeated premises. Only such a proved row is
+/// "proved (calculus)".
 #[must_use]
 pub fn is_calculus_row(encoding: &str, discharge: &str, premises: &[String]) -> bool {
     encoding == CALCULUS
         && discharge == CALCULUS_DISCHARGE
-        && CALCULUS_PREMISES
+        && premises.len() == CALCULUS_PREMISES.len()
+        && premises
             .iter()
-            .all(|want| premises.iter().any(|p| p == want))
+            .zip(CALCULUS_PREMISES)
+            .all(|(p, want)| p == want)
 }
 
 /// What a run's records say, against the current epoch.
@@ -754,6 +759,41 @@ mod tests {
             CALCULUS_DISCHARGE,
             &CALCULUS_PREMISES.map(String::from)
         ));
+        assert!(!is_calculus_row(
+            CALCULUS,
+            CALCULUS_DISCHARGE,
+            &[
+                "parameter-view".to_string(),
+                "semr-translation".to_string(),
+                "target-kappa".to_string(),
+                "closed-world-entry".to_string(),
+            ]
+        ));
+        assert!(!is_calculus_row(
+            CALCULUS,
+            CALCULUS_DISCHARGE,
+            &[
+                "closed-world-entry".to_string(),
+                "semr-translation".to_string(),
+                "target-kappa".to_string(),
+            ]
+        ));
+        let extra_premise = graded_with(
+            "proved",
+            CALCULUS,
+            CALCULUS_DISCHARGE,
+            &[
+                "parameter-view",
+                "semr-translation",
+                "target-kappa",
+                "closed-world-entry",
+            ],
+        );
+        assert!(
+            tally(&record(&[&extra_premise]))
+                .unwrap_err()
+                .contains("calculus authority")
+        );
     }
 
     /// Review finding 4: a line Trust neither writes nor reads back is refused, not counted.
@@ -929,6 +969,8 @@ mod tests {
                 .contains("first epoch")
         );
         assert!(parse_epochs("# only a comment\n").is_err());
+        assert!(parse_epochs("+1\tproved\tunvalidated-encoder\t0\twhy\n").is_err());
+        assert!(parse_epochs("1\tproved\tunvalidated-encoder\t+0\twhy\n").is_err());
     }
 
     #[test]

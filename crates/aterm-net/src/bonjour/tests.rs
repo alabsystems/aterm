@@ -50,6 +50,10 @@ impl Api for Fake {
         }
     }
 
+    unsafe fn ready(&self, _reference: Reference, _within: Duration) -> io::Result<bool> {
+        Ok(!self.replies.borrow().is_empty())
+    }
+
     unsafe fn process(&self, reference: Reference) -> i32 {
         let Some((flags, interface, error, name)) = self.replies.borrow_mut().pop_front() else {
             return -65537;
@@ -179,4 +183,45 @@ fn transport_failure_and_callback_panic_both_close_the_reference() {
     assert!(panic.is_err());
     assert_eq!(api.closed.get(), 1);
     assert!(api.callback.get().is_none());
+}
+
+/// A browse kept while sharing is on reads each reply as it comes, asks before each read and
+/// after each quiet `look` whether to go on, and ends, its connection closed, once the answer is
+/// no, though nothing more arrives: a person's off switch ends it within a look.
+#[test]
+fn a_browse_while_going_ends_once_going_says_no_with_nothing_heard() {
+    let api = Fake::new([(ADD, 4, 0, Some(c"Desk A")), (ADD, 4, 0, Some(c"Desk B"))]);
+    let asks = Cell::new(0);
+    let mut heard = Vec::new();
+    browse_while_with(
+        &api,
+        c"_alab._tcp",
+        c"local.",
+        (Duration::from_millis(1), || {
+            asks.set(asks.get() + 1);
+            asks.get() < 6
+        }),
+        |event| {
+            heard.push(event.name.to_owned());
+            ControlFlow::Continue(())
+        },
+    )
+    .expect("ended by its going");
+    assert_eq!(heard, [c"Desk A".to_owned(), c"Desk B".to_owned()]);
+    assert_eq!(
+        asks.get(),
+        6,
+        "asked before each read, then each quiet look"
+    );
+    assert_eq!(api.closed.get(), 1, "its connection closed");
+    let api = Fake::new([(ADD, 4, 0, Some(c"Desk A"))]);
+    browse_while_with(
+        &api,
+        c"_alab._tcp",
+        c"local.",
+        (Duration::from_millis(1), || false),
+        |_| panic!("an off switch reads nothing"),
+    )
+    .expect("off from the start");
+    assert_eq!(api.closed.get(), 1);
 }

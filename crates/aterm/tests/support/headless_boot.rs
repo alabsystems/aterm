@@ -43,9 +43,10 @@ impl Drop for Instance {
     }
 }
 
-/// Remove a scratch world whose instances (and keeper) are dead, first releasing the warm spares
-/// they left waiting on their FIFOs as the next launch in the world would: no launch comes to a
-/// removed world, and a spare its hangup did not end waits in its FIFO's open for ever.
+/// Remove a scratch world whose instances (and keeper) are dead, first releasing the spare FIFOs
+/// they left as the next launch in the world would, since no launch comes to a removed world: a
+/// spare of this build ends at its hold's end-of-file once its instance is gone, but one whose
+/// hold opens its FIFO's path (an older build's) waits in that open for ever.
 pub fn remove_world(root: &Path) {
     aterm_shell_integration::spare_fifo::sweep_dead(
         &root
@@ -245,8 +246,11 @@ fn boot_under(
     let lifeline = launch_isolation::lifeline(&mut cmd, &tmp);
     let mut signal = arm_ready(&mut cmd, &tmp);
     CONFIGURED.set(Some(Vec::new()));
+    AGENTS.set(Some(Vec::new()));
     configure(&tmp, &mut cmd);
     let standins = CONFIGURED.take().unwrap_or_default();
+    let agents = AGENTS.take().unwrap_or_default();
+    name_standins(&mut cmd, standins.iter().chain(&agents));
     let path = launch_path(&cmd);
     if let Some(path) = &path
         && let Err(e) = launch_isolation::pin_login_path(&tmp, path)
@@ -288,6 +292,38 @@ fn boot_under(
 std::thread_local! {
     static CONFIGURED: std::cell::RefCell<Option<Vec<PathBuf>>> =
         const { std::cell::RefCell::new(None) };
+    static AGENTS: std::cell::RefCell<Option<Vec<PathBuf>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Name `paths` to the instance as the lab stand-ins its harness may type into
+/// ([`aterm_agent::harness::agent_image::STANDINS_SEAM`]): the debug build drives an agent only
+/// when the kernel confirms its image, and a stand-in is confirmed by its identity alone.
+fn name_standins<'a>(cmd: &mut Command, paths: impl Iterator<Item = &'a PathBuf>) {
+    let paths: Vec<&PathBuf> = paths.collect();
+    if paths.is_empty() {
+        return;
+    }
+    let list = std::env::join_paths(paths).expect("stand-in paths hold no separator");
+    cmd.env(aterm_agent::harness::agent_image::STANDINS_SEAM, list);
+}
+
+/// From a [`boot_with`] `configure`: `path` (absolute; laid then or later) is a stand-in agent the
+/// instance's harness may type into, though no [`standin`] lays it: a script a stand-in runs
+/// under an agent's name (`exec -a claude /bin/sh <path>`) is confirmed by its identity.
+/// # Panics
+/// Outside a `configure`, where no boot would hear it.
+pub fn agent_standin(path: &Path) {
+    assert!(
+        path.is_absolute(),
+        "a stand-in is named by an absolute path"
+    );
+    AGENTS.with_borrow_mut(|agents| {
+        agents
+            .as_mut()
+            .expect("named from a boot's configure")
+            .push(path.to_owned());
+    });
 }
 
 /// The opening words of the refusal [`boot_with`] ends a test with when the instance's login shell

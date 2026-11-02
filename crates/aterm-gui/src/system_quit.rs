@@ -98,6 +98,15 @@ pub(crate) fn asked() -> bool {
         || EVENT_LOOP_FAILED.load(Ordering::SeqCst)
 }
 
+/// Whether the system asked this process to quit (a logout, a restart or a shutdown) by a quit
+/// nobody cancelled: not System Settings' Quit & Reopen, whose quit reason is a logout's too
+/// ([`asker_of`]), nor a failed event loop. What gives up this Mac's account claims at the end of
+/// the run (`crate::harness_host::claims_off_as_the_system_quits`).
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn by_the_system() -> bool {
+    SYSTEM_QUIT.load(Ordering::SeqCst) != 0
+}
+
 /// Whether aterm opens again once this process is gone: System Settings' Quit & Reopen asked for
 /// a quit nobody cancelled, and no logout, restart, shutdown or failed event loop is under it.
 #[cfg(any(target_os = "macos", test))]
@@ -264,6 +273,48 @@ mod tests {
         assert!(!reopens(), "a gone window system's quit reopens");
         clear_for_test();
         assert!(!reopens() && !asked());
+    }
+
+    /// Only the system's quit nobody cancelled gives up this Mac's account claims at the end of the
+    /// run: a person's quit, System Settings' Quit & Reopen (its logout reason notwithstanding),
+    /// a failed event loop and a cancelled logout do not.
+    ///
+    /// NEGATIVE CONTROL: make `by_the_system` answer `asked()`, and the Quit & Reopen and the
+    /// failed event loop read as the system's.
+    #[test]
+    fn only_the_systems_quit_nobody_cancelled_is_by_the_system() {
+        use crate::menu::{NativeTerminateDecision, admit_native_terminate};
+        let _serial = crate::menu::terminate_test_serial();
+        let NativeTerminateDecision::Dispatch(person) = admit_native_terminate(Asker::Person)
+        else {
+            panic!("a first request dispatches");
+        };
+        assert!(!by_the_system(), "a person's quit");
+        assert!(crate::menu::cancel_current_native_termination());
+
+        let NativeTerminateDecision::Dispatch(reopen) = admit_native_terminate(Asker::Reopen)
+        else {
+            panic!("the arbiter is free again");
+        };
+        assert!(
+            asked() && !by_the_system(),
+            "System Settings' Quit & Reopen"
+        );
+        assert!(crate::menu::cancel_current_native_termination());
+
+        let NativeTerminateDecision::Dispatch(logout) = admit_native_terminate(Asker::System)
+        else {
+            panic!("the arbiter is free again");
+        };
+        assert_ne!(logout, reopen);
+        assert_ne!(logout, person);
+        assert!(by_the_system(), "the logout");
+        assert!(crate::menu::cancel_current_native_termination());
+        assert!(!by_the_system(), "the cancelled logout");
+
+        note_event_loop_failed();
+        assert!(asked() && !by_the_system(), "a failed event loop");
+        clear_for_test();
     }
 
     #[test]

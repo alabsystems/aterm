@@ -1128,6 +1128,7 @@ mod tests {
                     Restart {
                         chosen: true,
                         joins: false,
+                        automatic: false,
                     },
                     AdmittedVault::None,
                     save_progress,

@@ -1,0 +1,31 @@
+# kimi 2.4.0 · MEASURED 2026-10-29, `aterm ctl text` of a private headless aterm (110x32, aterm 0.146.0) running the real Kimi Code, launched by path with a scratch `HOME` and `KIMI_CODE_HOME` whose `config.toml` names one `openai`-type provider at `http://127.0.0.1:<port>/v1` with a fake key (a local stub of the Chat Completions API, crates/aterm-lab), no login · a third line added with Ctrl-J, then Enter: the three lines go as one message (the stub's last_user is all three) and the stub's immediate reply ends the turn
+
+ ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │                                                                                                          │
+ │  ▐█▛█▛█▌  Welcome to Kimi Code!                                                                          │
+ │  ▐█████▌  Send /help for help information.                                                               │
+ │                                                                                                          │
+ │  Directory: /private/tmp/at.H2aa/proj                                                                    │
+ │  Session:   session_d240495d-90d8-422b-bc70-82ea4e4c480f                                                 │
+ │  Model:     lab-model                                                                                    │
+ │  Version:   2.4.0                                                                                        │
+ │                                                                                                          │
+ ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+   No session yet — one will be created on your first message.
+
+ ❯ lab draft one
+
+ ● lab held reply, sent after 30 s
+
+ ❯ lab line one
+   lab line two
+   lab line three
+
+ ● Hi! I am the local lab stub, not a model. (reply 2)
+
+ ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │ >                                                                                                        │
+ ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ lab-model  …/tmp/at.H2aa/proj
+                                                                                   context: 22% (20.7k/97.7k)

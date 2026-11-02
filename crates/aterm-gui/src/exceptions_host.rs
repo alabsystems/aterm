@@ -846,7 +846,13 @@ impl App {
                 // Later exceptions, so the glass reads the arm here, and loses it as the loop
                 // lifts the hold (`standing: None`) or ends (`end_notes`).
                 if let Some(session) = self.local_session_of(&aterm_session::SessionId::new(&sid)) {
-                    self.show_stopped(session, standing.as_ref().and_then(|e| e.held));
+                    self.show_stopped(
+                        session,
+                        standing.as_ref().and_then(|e| e.held),
+                        standing.as_ref().is_some_and(
+                            aterm_agent::supervise::policy::exception::Exception::lifted_by_switch,
+                        ),
+                    );
                 }
                 match standing
                     .as_ref()
@@ -1051,6 +1057,12 @@ impl App {
                             }
                         }
                     }
+                }
+            }
+            HostNote::SheetConflicts(conflicts) => {
+                match message_reporters::accounts_sheet_conflict_entry(&conflicts) {
+                    Some(entry) => self.except(&entry),
+                    None => self.except_clear(message_reporters::ACCOUNTS_SHEET_CONFLICT_KEY),
                 }
             }
             HostNote::Inform { sid, text } => {
@@ -2155,7 +2167,7 @@ mod tests {
         );
         assert_eq!(
             app.status_item_chrome_line(),
-            "statusitem title=\u{276f}\u{2022} needs=0 stuck=0 exceptions=1 done=0 fleet=off",
+            "statusitem title=\u{276f} needs=0 stuck=0 exceptions=1 done=0 fleet=off",
             "the menu-bar cue an agent can read"
         );
     }

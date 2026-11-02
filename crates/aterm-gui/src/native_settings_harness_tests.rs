@@ -43,6 +43,7 @@ pub(super) fn fixture() -> HarnessState {
         sessions: vec![HarnessSession {
             stopped: None,
             waiting: None,
+            switch_asked: false,
             local_id: 7,
             sid: "s-7".to_string(),
             title: "fix the build".to_string(),
@@ -57,6 +58,7 @@ pub(super) fn fixture() -> HarnessState {
             set_by: None,
             need: None,
             hold: None,
+            receipt: None,
         }],
         stats: HarnessStatsSlot {
             report: Some(std::sync::Arc::new(HarnessStatsReport::new(
@@ -74,6 +76,7 @@ pub(super) fn fixture() -> HarnessState {
         config: config_rows(&policy),
         land_at_offer: None,
         ai: crate::ai_screen::AiState::default(),
+        lab: crate::lab_screen::LabState::default(),
         tabs: crate::harness_screen::TabControlState::default(),
         decided_open: Vec::new(),
         today: 0,
@@ -313,6 +316,12 @@ fn the_harness_route_renders_its_cards_and_controls() {
             "a product name alone cannot imply an installed or observed CLI"
         );
     }
+    assert!(
+        node(&pages, "harness/updates/row/harness-packages")
+            .label
+            .contains("not looked at"),
+        "no harness package is implied before a look reads the store"
+    );
     for (key, route) in [
         ("software", SettingsRoute::SoftwareUpdate),
         ("packages", SettingsRoute::Packages),
@@ -514,6 +523,29 @@ fn the_harness_route_renders_its_cards_and_controls() {
         ],
         store_note: None,
         held: None,
+        harness_packages: vec![
+            atpkg::harness::Installed {
+                harness: "grok-alab".to_string(),
+                program: "grok-alab".to_string(),
+                build: Some(17),
+                version: Some("0.3.0".to_string()),
+                linked: None,
+            },
+            atpkg::harness::Installed {
+                harness: "codex-alab".to_string(),
+                program: "codex".to_string(),
+                build: Some(2_026_101_601),
+                version: Some("0.164.0+codex.0.130.0".to_string()),
+                linked: None,
+            },
+            atpkg::harness::Installed {
+                harness: "kimi-alab".to_string(),
+                program: "kimi-alab".to_string(),
+                build: None,
+                version: None,
+                linked: Some(std::path::PathBuf::from("/src/kimi-alab")),
+            },
+        ],
     });
     assert!(runtime.replace_settings_harness(observed.clone(), 2));
     let pages = every_page(&mut runtime, instance, view, &view_cx());
@@ -521,6 +553,27 @@ fn the_harness_route_renders_its_cards_and_controls() {
         node(&pages, "harness/updates/row/claude-cli")
             .label
             .contains(version)
+    );
+    // Each installed harness package by name, with the version its record names (§5).
+    for (key, words) in [
+        ("grok-alab-package", "v0.3.0 \u{b7} build 17"),
+        (
+            "codex-alab-package",
+            "v0.164.0+codex.0.130.0 \u{b7} codex build 2026101601",
+        ),
+        (
+            "kimi-alab-package",
+            "version unrecorded \u{b7} dev link /src/kimi-alab",
+        ),
+    ] {
+        let row = node(&pages, &format!("harness/updates/row/{key}"));
+        assert!(row.label.contains(words), "{key}: {:?}", row.label);
+    }
+    assert!(
+        pages.iter().all(|page| page
+            .semantic(&UiKey::new("harness/updates/row/harness-packages"))
+            .is_none()),
+        "no stand-in row once packages are read"
     );
     assert!(
         node(&pages, "harness/updates/row/codex-cli")
@@ -932,7 +985,7 @@ fn a_sessions_buttons_follow_its_agents_own_switch() {
     assert!(requests.is_empty(), "{requests:?}");
     assert_eq!(
         feedback.as_deref(),
-        Some("Watch codex-alab sessions is Off, so Autopilot has nothing to steer there.")
+        Some("Enable codex-alab Autopilot is Off, so Autopilot has nothing to steer there.")
     );
 }
 
@@ -1003,7 +1056,7 @@ fn a_sessions_timer_follows_its_agents_own_switch() {
     assert!(requests.is_empty(), "{requests:?}");
     assert_eq!(
         feedback.as_deref(),
-        Some("Watch codex-alab sessions is Off, so Autopilot has nothing to steer there.")
+        Some("Enable codex-alab Autopilot is Off, so Autopilot has nothing to steer there.")
     );
 }
 
@@ -1037,7 +1090,7 @@ fn an_agent_switched_off_is_on_the_effective_table() {
     assert!(
         node(&pages, "harness/status/row/supervision")
             .label
-            .contains("limited by Watch codex-alab sessions set to Off"),
+            .contains("limited by Enable codex-alab Autopilot set to Off"),
         "{}",
         node(&pages, "harness/status/row/supervision").label
     );
@@ -3991,7 +4044,11 @@ fn the_page_draws_its_landings_and_the_done_claims_checked() {
     }
     let landed = node(&pages, "harness/did/row/landed").label.clone();
     assert!(says(&landed, "2 today \u{b7} 9 in 7 days"), "{landed}");
-    let checked = node(&pages, "harness/did/row/past--done").label.clone();
+    let forced = format!(
+        "harness/did/row/{}",
+        key_fragment(crate::harness_screen::DONE_CHECKED_OF_KEPT_GOING)
+    );
+    let checked = node(&pages, &forced).label.clone();
     assert!(says(&checked, "1 today \u{b7} 12 in 7 days"), "{checked}");
     node(&pages, "harness/did/row/no-safe-rule");
     node(&pages, "harness/did/row/land-prompts");
@@ -4001,7 +4058,7 @@ fn the_page_draws_its_landings_and_the_done_claims_checked() {
     assert!(day.starts_with("today: 1 landed \u{b7} "), "{day}");
     let (mut runtime, instance, view) = harness_route(fixture());
     let pages = every_page(&mut runtime, instance, view, &view_cx());
-    for key in ["harness/did/row/landed", "harness/did/row/past--done"] {
+    for key in ["harness/did/row/landed", forced.as_str()] {
         assert!(
             pages
                 .iter()
@@ -4011,7 +4068,7 @@ fn the_page_draws_its_landings_and_the_done_claims_checked() {
     }
 }
 
-/// WHAT THE HARNESS DID'S PLAIN COUNTS ON THE COMPILED PAGE (§14.6): `past “done”`, `no safe
+/// WHAT THE HARNESS DID'S PLAIN COUNTS ON THE COMPILED PAGE (§14.6): `Forced continues`, `no safe
 /// rule`, `Waited for you`, `Needs, carried on` and `None in 7 days` are each a fact of their own
 /// key (the compile refuses two of one key), and no fact of v5's words is drawn: `of them`, `of
 /// those`, `Needed you`, `Needs told`, `Waited on you`, or a count's `0 today · 0 in 7 days`.
@@ -4062,6 +4119,148 @@ fn the_page_draws_its_plain_counts() {
     ] {
         assert!(rows.iter().any(|(l, _)| l == label), "{label}: {rows:?}");
     }
+}
+
+/// FORCED CONTINUES SAYS WHAT IT COUNTS (§14.17 item 2, slice 6c): the Kept going row's part that
+/// counts the done claims the harness answered with Cruise's done check is labelled with the
+/// owner's name, and one line under it says what it counts, both read from their one source
+/// (`aterm_agent::harness::stats`). The line is heard as text of its own right after its row,
+/// painted in quiet type between its row and the next one, in the value's column of the default
+/// window; no other row has a line, and a week with no done check draws neither. The manual names
+/// the row by the same name.
+#[test]
+fn forced_continues_says_what_it_counts() {
+    use aterm_agent::harness::stats::{FORCED_CONTINUES, FORCED_CONTINUES_LINE};
+    let fragment = key_fragment(FORCED_CONTINUES);
+    let row_key = format!("harness/did/row/{fragment}");
+    let line_key = format!("harness/did/line/{fragment}");
+    let lines_of = |pages: &[crate::native_ui::CompiledUi]| -> Vec<String> {
+        pages
+            .iter()
+            .flat_map(|page| {
+                let heard = page.semantics.iter().map(|node| node.key.as_str());
+                let painted = page.paint.iter().map(|node| node.key.as_str());
+                heard.chain(painted).map(str::to_string).collect::<Vec<_>>()
+            })
+            .filter(|key| key.starts_with("harness/did/line/"))
+            .collect()
+    };
+    let (mut runtime, instance, view) = harness_route(fixture_landings());
+    let pages = every_page(&mut runtime, instance, view, &view_cx());
+    let stray: Vec<String> = lines_of(&pages)
+        .into_iter()
+        .filter(|key| *key != line_key && !key.starts_with(&format!("{line_key}/line-")))
+        .collect();
+    assert!(stray.is_empty(), "a line under another row: {stray:?}");
+    let page = pages
+        .iter()
+        .find(|page| page.semantic(&UiKey::new(row_key.as_str())).is_some())
+        .unwrap_or_else(|| panic!("{row_key} is on no page"));
+    let row = page
+        .semantic(&UiKey::new(row_key.as_str()))
+        .expect("its row");
+    assert_eq!(
+        row.label,
+        format!("{FORCED_CONTINUES}: 1 today \u{b7} 12 in 7 days")
+    );
+    let heard: Vec<&str> = page
+        .semantics
+        .iter()
+        .map(|node| node.key.as_str())
+        .collect();
+    let at = heard
+        .iter()
+        .position(|key| *key == row_key)
+        .expect("the row is heard");
+    assert_eq!(
+        heard.get(at + 1).copied(),
+        Some(line_key.as_str()),
+        "the line is heard right after its row: {heard:?}"
+    );
+    let line = page
+        .semantic(&UiKey::new(line_key.as_str()))
+        .expect("its line");
+    assert_eq!(line.label, FORCED_CONTINUES_LINE);
+    assert_eq!(line.role, SemanticRole::Text);
+    let painted: Vec<&crate::native_ui::PaintNode> = page
+        .paint
+        .iter()
+        .filter(|node| node.key.as_str().starts_with(&format!("{line_key}/line-")))
+        .collect();
+    let words: Vec<&str> = painted
+        .iter()
+        .map(|node| match &node.content {
+            UiContent::Text(text) => {
+                assert_eq!(text.style, StyleRef::Quiet, "{}", node.key.as_str());
+                text.text.as_str()
+            }
+            other => panic!("{}: {other:?}", node.key.as_str()),
+        })
+        .collect();
+    assert_eq!(words.join(" "), FORCED_CONTINUES_LINE, "{words:?}");
+    let rect_of = |key: &str| {
+        page.paint
+            .iter()
+            .find(|node| node.key.as_str() == key)
+            .map(|node| node.rect)
+            .unwrap_or_else(|| panic!("{key} is not painted"))
+    };
+    let row_rect = rect_of(&row_key);
+    let value_x = rect_of(&format!("harness/did/value/{fragment}")).x;
+    assert!(
+        value_x > row_rect.x + 1.0,
+        "the default window sets the row's value beside its name: {value_x} in {row_rect:?}"
+    );
+    let next = page
+        .semantics
+        .iter()
+        .skip(at + 2)
+        .find(|node| node.key.as_str().starts_with("harness/did/row/"))
+        .map(|node| rect_of(node.key.as_str()))
+        .expect("a row after it");
+    for node in &painted {
+        let r = node.rect;
+        assert!(
+            r.y >= row_rect.bottom() - 0.01 && r.bottom() <= next.y + 0.01,
+            "{} at {r:?}: between {row_rect:?} and {next:?}",
+            node.key.as_str()
+        );
+        assert!(
+            r.x >= row_rect.x - 0.01 && r.right() <= row_rect.right() + 0.01,
+            "{} at {r:?}: inside {row_rect:?}",
+            node.key.as_str()
+        );
+        assert!(
+            (r.x - value_x).abs() < 0.5,
+            "{} at {r:?}: in the value's column, at {value_x}",
+            node.key.as_str()
+        );
+    }
+    let (mut runtime, instance, view) = harness_route(fixture());
+    let pages = every_page(&mut runtime, instance, view, &view_cx());
+    assert_eq!(
+        lines_of(&pages),
+        Vec::<String>::new(),
+        "no line with no done check"
+    );
+    for key in [&row_key, &line_key] {
+        assert!(
+            pages
+                .iter()
+                .all(|page| page.semantic(&UiKey::new(key.as_str())).is_none()
+                    && page
+                        .paint
+                        .iter()
+                        .all(|node| !node.key.as_str().starts_with(key.as_str()))),
+            "{key} with no done check"
+        );
+    }
+    const MANUAL: &str = include_str!("../../aterm-cli/src/manual.rs");
+    let manual = MANUAL.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        manual.contains(&format!("`{FORCED_CONTINUES}`")),
+        "the manual names the row"
+    );
 }
 
 #[test]

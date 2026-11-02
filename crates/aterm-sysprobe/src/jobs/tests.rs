@@ -398,7 +398,9 @@ fn an_arch_answer_gives_its_cpu_type() {
 }
 
 /// M1's row reads held and M2's normal exec, caught at its first instruction, does not; each
-/// other guard of [`judge_start`] moves M1's row off held.
+/// other guard of [`judge_start`] moves M1's row off held. A stop or a tracer on M1's row is its
+/// own verdict, carrying what it read, while a young or a started process that reads either way
+/// runs.
 #[test]
 fn the_program_check_judge_holds_only_an_old_lone_unstarted_thread() {
     let m1 = StartFacts {
@@ -441,11 +443,67 @@ fn the_program_check_judge_holds_only_an_old_lone_unstarted_thread() {
                 stopped: true,
                 ..m1
             },
-            AtStart::Started,
+            AtStart::StoppedUnstarted {
+                stopped: true,
+                traced: false,
+            },
         ),
         (
             "traced",
             StartFacts { traced: true, ..m1 },
+            AtStart::StoppedUnstarted {
+                stopped: false,
+                traced: true,
+            },
+        ),
+        (
+            "stopped and traced, x86_64 on a remote volume",
+            StartFacts {
+                stopped: true,
+                traced: true,
+                translated: true,
+                local: Some(false),
+                ..m1
+            },
+            AtStart::StoppedUnstarted {
+                stopped: true,
+                traced: true,
+            },
+        ),
+        (
+            "a start-suspended child at 19.999 s",
+            StartFacts {
+                stopped: true,
+                age_ms: Some(19_999),
+                ..m1
+            },
+            AtStart::Started,
+        ),
+        (
+            "stopped after it ran",
+            StartFacts {
+                lone_zero: false,
+                stopped: true,
+                ..m1
+            },
+            AtStart::Started,
+        ),
+        (
+            "traced after it ran",
+            StartFacts {
+                lone_zero: false,
+                traced: true,
+                ..m1
+            },
+            AtStart::Started,
+        ),
+        (
+            "traced, its age unread",
+            StartFacts {
+                traced: true,
+                age_ms: None,
+                ..m1
+            },
             AtStart::Started,
         ),
         (
@@ -519,13 +577,17 @@ fn a_stat_line_gives_every_field_past_any_command_name() {
         Some(0x8000_8800),
         "pts 524288 (major 136)"
     );
-    for tty in ["x", "4294967296", "-2147483649"] {
+    for tty in ["x", "+34817", "4294967296", "-2147483649"] {
         assert_eq!(
             linux::parse_stat(&STAT.replacen(" 34817 ", &format!(" {tty} "), 1)),
             None,
             "terminal {tty}"
         );
     }
+    assert_eq!(
+        linux::parse_stat(&STAT.replacen(" 20 10 ", " +20 10 ", 1)),
+        None
+    );
     assert_eq!(linux::parse_stat("9 (d) R 1"), None);
     assert_eq!(linux::parse_stat("garbage"), None);
 }
@@ -623,35 +685,6 @@ const NET_TCP: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr
    0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000   501        0 1111 1 0\n\
    1: 0100007F:C3A1 0A0200C0:1F90 01 00000000:00000000 00:00000000 00000000   501        0 2222 1 0\n\
    2: 0100007F:C3A2 0A0200C0:1F90 02 00000000:0000000";
-
-/// A `/proc/net/unix` as Linux 6.8 prints one: a listener, a stream it accepted at the same path,
-/// an abstract listener, an unbound socket, a listener whose path has a space, a listener whose
-/// path is no UTF-8, and a torn row.
-const NET_UNIX: &[u8] = b"\
-Num       RefCount Protocol Flags    Type St Inode Path\n\
-0000000000000000: 00000002 00000000 00010000 0001 01 41001 /run/user/1000/b.sock\n\
-0000000000000000: 00000003 00000000 00000000 0001 03 41002 /run/user/1000/b.sock\n\
-0000000000000000: 00000002 00000000 00010000 0001 01 41003 @/tmp/.X11-unix/X0\n\
-0000000000000000: 00000002 00000000 00000000 0002 01  4104\n\
-0000000000000000: 00000002 00000000 00010000 0001 01 41005 /tmp/a b.sock\n\
-0000000000000000: 00000002 00000000 00010000 0001 01 41007 /tmp/\xff.sock\n\
-0000000000000000: 00000002 00000000 00010000 0001 01 41006 /tmp/torn";
-
-#[test]
-fn listening_rows_of_proc_net_unix() {
-    assert_eq!(
-        linux::listening_unix(NET_UNIX),
-        [
-            (41001, &b"/run/user/1000/b.sock"[..]),
-            (41005, b"/tmp/a b.sock"),
-            (41007, b"/tmp/\xff.sock"),
-        ],
-        "listeners bound at a path, a stream accepted at that path left out"
-    );
-    assert!(linux::listening_unix(b"").is_empty());
-    let header = NET_UNIX.split(|b| *b == b'\n').next().unwrap();
-    assert!(linux::listening_unix(header).is_empty());
-}
 
 #[test]
 fn a_tcp_table_gives_state_peer_and_queue_and_skips_a_torn_row() {
@@ -902,6 +935,8 @@ fn only_a_local_temporary_file_is_opened_for_its_tail() {
     assert!(!tail_allowed(Path::new("/private/tmp/nfs/out.log"), &t));
     assert!(!tail_allowed(Path::new("/tmp/auto/out.log"), &t));
     assert!(!tail_allowed(Path::new("/private/tmp/../Users//me/x"), &t));
+    assert!(!tail_allowed(Path::new("/private/tmp/./x"), &t));
+    assert!(!tail_allowed(Path::new("/private/tmp/."), &t));
     assert!(!tail_allowed(Path::new("relative/tmp/x"), &t));
     assert!(!tail_allowed(Path::new("/private/tmp/x"), &table(&[])));
     let cut = Table {
@@ -935,16 +970,50 @@ fn a_cut_mount_table_proves_no_volume_local() {
 #[cfg(unix)]
 #[test]
 fn the_tail_check_reads_only_the_appended_bytes() {
+    use std::os::unix::fs::MetadataExt as _;
     let dir = aterm_tempfile::tempdir().expect("scratch dir");
     let p = dir.path().join("out");
     std::fs::write(&p, b"line one\nspin\rspin\r").unwrap();
+    let ino = std::fs::metadata(&p).unwrap().ino();
     assert_eq!(tail_has_lf(&p, 0, 9), Some(true));
     assert_eq!(tail_has_lf(&p, 9, 19), Some(false));
     assert_eq!(tail_has_lf(&p, 9, 9), None);
     assert_eq!(tail_has_lf(&dir.path().join("missing"), 0, 4), None);
+    assert_eq!(
+        tail_has_lf(dir.path(), 0, 4),
+        None,
+        "a directory is not a regular file"
+    );
+    assert_eq!(tail_has_lf_ino(&p, 0, 9, ino), Some(true));
+    assert_eq!(
+        tail_has_lf_ino(&p, 0, 9, ino.wrapping_add(1)),
+        None,
+        "an unlinked and replaced path with a different inode is refused"
+    );
     let l = dir.path().join("link");
     std::os::unix::fs::symlink(&p, &l).unwrap();
     assert_eq!(tail_has_lf(&l, 0, 9), None);
+    let real_sub = dir.path().join("real");
+    std::fs::create_dir(&real_sub).unwrap();
+    let sub_out = real_sub.join("out");
+    std::fs::write(&sub_out, b"line one\n").unwrap();
+    let sym_sub = dir.path().join("sym");
+    std::os::unix::fs::symlink(&real_sub, &sym_sub).unwrap();
+    assert_eq!(
+        tail_has_lf(&sym_sub.join("out"), 0, 9),
+        None,
+        "an intermediate directory symlink is refused before open"
+    );
+    assert_eq!(
+        tail_has_lf(&dir.path().join(".").join("out"), 0, 9),
+        None,
+        "a dot segment in the path is refused before open"
+    );
+    assert_eq!(
+        tail_has_lf(&real_sub.join("..").join("out"), 0, 9),
+        None,
+        "a parent segment in the path is refused before open"
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -1463,10 +1532,11 @@ fn a_stopped_childs_counters_and_threads_read_its_cpu_time_as_wait4_counts_it() 
 }
 
 /// A start-suspended spawn reads one thread whose handle is `0`, stopped and untraced, so its
-/// stop, not its age (read 21 s ahead), keeps it from reading held. The job probe reads the same
-/// facts, and a reader handed a mount table places the executable by that table. A child runs
-/// translated exactly when this process does (the universal `/bin/sleep` follows its parent's
-/// architecture under Rosetta 2), and a translated one reads as translating, not held.
+/// stop, not its age (read 21 s ahead), keeps it from reading held: it is stopped-unstarted. The
+/// job probe reads the same facts, and a reader handed a mount table places the executable by that
+/// table. A child runs translated exactly when this process does (the universal `/bin/sleep`
+/// follows its parent's architecture under Rosetta 2), and a translated one, unstopped, reads as
+/// translating, not held.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_start_suspended_child_reads_one_unstarted_thread_and_is_not_held() {
@@ -1488,9 +1558,13 @@ fn a_start_suspended_child_reads_one_unstarted_thread_and_is_not_held() {
         "/bin is on the system volume: {facts:?}"
     );
     assert!(facts.age_ms >= Some(PROGRAM_CHECK_AGE_MS), "{facts:?}");
+    let stopped = AtStart::StoppedUnstarted {
+        stopped: true,
+        traced: false,
+    };
     assert_eq!(
         judge_start(&facts),
-        AtStart::Started,
+        stopped,
         "a start-suspended child is not held: {facts:?}"
     );
     assert_eq!(
@@ -1523,7 +1597,7 @@ fn a_start_suspended_child_reads_one_unstarted_thread_and_is_not_held() {
         Some(facts),
         "the job probe reads the same start"
     );
-    assert_eq!(f.program_check(), Some(AtStart::Started), "{f:?}");
+    assert_eq!(f.program_check(), Some(stopped), "{f:?}");
     let now = JobsReader::new()
         .read(ReadReq { pid, fds: false })
         .expect("the job probe reads it");
@@ -1817,6 +1891,23 @@ fn a_ptys_word_is_read_through_its_device_node() {
         term_word(me, dev).map(|w| w.queued),
         Some(3),
         "the keys the editor has not read"
+    );
+}
+
+/// A pseudo-terminal's node is named from its device number alone: no `stat` reads a
+/// node a wedge could block, and a device of another major has no such node.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_ptys_node_is_named_from_its_number_alone() {
+    let ptmx = |minor: u32| (16 << 24) | minor;
+    assert_eq!(term_node(0, ptmx(0)), Some(PathBuf::from("/dev/ttys000")));
+    assert_eq!(term_node(0, ptmx(31)), Some(PathBuf::from("/dev/ttys031")));
+    assert_eq!(term_node(0, ptmx(511)), Some(PathBuf::from("/dev/ttys511")));
+    assert_eq!(term_node(0, 0), None, "no terminal");
+    assert_eq!(
+        term_node(0, (3 << 24) | 2),
+        None,
+        "/dev/null's device is no pseudo-terminal"
     );
 }
 

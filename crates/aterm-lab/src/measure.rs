@@ -4,10 +4,25 @@
 //! THE STEPS `lab codex-measure` AND `lab claude-measure` SHARE, so a program's build is measured
 //! one way whichever program it is: the step testdata read only as HEAD holds it
 //! ([`committed_in`]), one reducer's fixed point ([`fixed_point`], [`reduce_leg`]), one judge of
-//! the keys and record kinds against every committed reduction of the program ([`judge`]), the
-//! create-new writes a refusal removes ([`landed`], [`Written`]), the aterm build and the standing
-//! tests. A [`Family`] says what differs: the program, which files are its reductions, a row's
-//! record kind and build, the keys its fold reads, and the standing tests.
+//! the keys and record kinds against every committed reduction of the program ([`judge`], then
+//! [`exercised`] once run 2 passed), the create-new writes a refusal removes ([`landed`],
+//! [`Written`]), the aterm build and the standing tests. A [`Family`] says what differs: the
+//! program, which files are its reductions, a row's record kind and build, the keys its fold
+//! reads, the row kinds it does not act on, and the standing tests.
+//!
+//! THE JUDGE'S RULE (ruling 2026-10-28, fix J2-4), for a key or record kind no measured build
+//! showed: on a row kind the fold does not act on ([`Family::inert`]) it is NOTED, since such a row
+//! changes nothing the fold makes (aterm-agent's law test
+//! `an_inert_row_changes_nothing_the_fold_makes`); a key the fold reads ([`Family::read`]) on a row
+//! it acts on is REFUSED (NEW-KEY), a format change the fold must be taught; any other key, and a
+//! new record kind of a row the fold acts on, is ADMITTED only once run 2, expecting the build
+//! exact, wrote rows carrying it and passed every check, and the verdict names the run and the
+//! check; else it is REFUSED (NEW-KEY) as one no run exercised. A key is held by the row kinds a
+//! measured build showed it on, not by its name: one shown only on rows the fold does not act on
+//! is new the first time a build writes it on a row the fold acts on, and GONE holds a build only
+//! to what the previous build showed on rows the fold acts on ([`drift`]). The privacy oracle runs
+//! before the judge on each reduction it reads, run 2's included (`claude_measure::text_kept`,
+//! `codex_measure::text_kept`).
 //!
 //! Ruling T8: a build is read exact only once it is measured, and it is measured when its
 //! reductions are committed in aterm-agent's step testdata, since `build.rs` lists the builds
@@ -15,7 +30,7 @@
 //! until a build has passed every step before the write, and removes what it wrote on any later
 //! refusal.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
@@ -53,10 +68,15 @@ pub(crate) struct Family {
     /// What the program writes, as a refusal names it (`rollout`, `transcript`).
     pub source: &'static str,
     /// The keys and closed words the program's step fold reads, as the anchors name them (the
-    /// fold reads each through `anchor!`): GONE holds a build to them. Each family's tests hold
-    /// the table to the fold itself: a key whose removal from a committed reduction changes what
-    /// the fold makes of it must be here (`keys_the_fold_reads`).
+    /// fold reads each through `anchor!`): GONE holds a build to them, and NEW-KEY refuses a new
+    /// one. Each family's tests hold the table to the fold itself: a key whose removal from a
+    /// committed reduction changes what the fold makes of it must be here
+    /// (`keys_the_fold_reads`), and aterm-agent's step tests hold `TRANSCRIPT_KEYS` to the keys
+    /// the fold's projections keep (`the_fold_reads_what_the_transcript_keys_name`).
     pub read: &'static [Anchor],
+    /// Whether the fold acts on no row of the record kind `kind` (`<type>/<…>`): a new key or
+    /// record kind there is only noted.
+    pub inert: fn(&str) -> bool,
     /// Whether the file `name` in the step testdata is one of its reductions, as aterm-agent's
     /// `build.rs` reads one.
     pub holds: fn(&str) -> bool,
@@ -93,7 +113,8 @@ pub(crate) enum Class {
     FixedPoint,
     /// The reduction keeps text of what it reduced (the privacy oracle, ruling T7).
     Text,
-    /// A key or record kind no measured build showed.
+    /// A key the fold reads that no measured build showed, on a row it acts on; or a new key or
+    /// record kind of a row it acts on that no run exercised.
     NewKey,
     /// A key the fold reads that the previous build's same leg showed.
     Gone,
@@ -306,12 +327,13 @@ pub(crate) fn reduce_leg(
 }
 
 /// What a source or reduction shows: every JSON object key at every depth but the names the
-/// reducer gives keys (`k<n>`, which hold nothing of the program's), and every row's record kind
-/// ([`Family::kind`]).
+/// reducer gives keys (`k<n>`, which hold nothing of the program's), every row's record kind
+/// ([`Family::kind`]), and the record kinds of the rows that carry each key.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Shows {
     pub keys: BTreeSet<String>,
     pub kinds: BTreeSet<String>,
+    pub on: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl Shows {
@@ -324,16 +346,41 @@ impl Shows {
         Ok(s)
     }
 
+    /// Whether a row of a record kind the fold acts on ([`Family::inert`]) carries `key`.
+    #[must_use]
+    pub(crate) fn acted_on(&self, f: &Family, key: &str) -> bool {
+        self.on
+            .get(key)
+            .is_some_and(|kinds| kinds.iter().any(|kind| !(f.inert)(kind)))
+    }
+
     /// Add what `text` shows.
     /// # Errors
     /// A row is no JSON value.
     pub(crate) fn add(&mut self, f: &Family, text: &str) -> Result<(), String> {
         for (n, row) in rows(text).enumerate() {
             let v: Value = aterm_json::from_str(row).map_err(|e| format!("row {}: {e}", n + 1))?;
-            keys_of(&v, &mut self.keys);
-            self.kinds.insert((f.kind)(&v));
+            let kind = (f.kind)(&v);
+            let mut keys = BTreeSet::new();
+            keys_of(&v, &mut keys);
+            for k in &keys {
+                self.on.entry(k.clone()).or_default().insert(kind.clone());
+            }
+            self.keys.extend(keys);
+            self.kinds.insert(kind);
         }
         Ok(())
+    }
+}
+
+/// Whether the JSON row `v` carries the key `key` at any depth (never a reducer's `k<n>`).
+fn carries(v: &Value, key: &str) -> bool {
+    match v {
+        Value::Object(m) => m
+            .iter()
+            .any(|(k, v)| (k == key && !reduce::is_key_name(k)) || carries(v, key)),
+        Value::Array(a) => a.iter().any(|v| carries(v, key)),
+        _ => false,
     }
 }
 
@@ -433,39 +480,87 @@ pub(crate) fn word(v: Option<&Value>) -> String {
     v.and_then(Value::as_str).unwrap_or("-").to_string()
 }
 
-/// The steps `program`'s fold makes of `text`, each by its shape (`call <tool>`, `wall <kind>`,
-/// else its kind), the bind left out.
+/// A step by its shape (`call <tool>`, `wall <kind>`, else its kind), a bind none.
+fn shape_of(ev: &StepEvent) -> Option<String> {
+    match ev {
+        StepEvent::Bind { .. } => None,
+        StepEvent::Prompt { .. } => Some("prompt".to_string()),
+        StepEvent::Interrupt => Some("interrupt".to_string()),
+        StepEvent::ToolUse { tool, .. } => Some(format!("call {}", tool.as_str())),
+        StepEvent::ToolResult { .. } => Some("result".to_string()),
+        StepEvent::TurnEnd { .. } => Some("end".to_string()),
+        StepEvent::EndWall { kind } => Some(format!("wall {kind:?}")),
+        StepEvent::Compact => Some("compact".to_string()),
+        StepEvent::Model { .. } => Some("model".to_string()),
+        StepEvent::Off { .. } => Some("off".to_string()),
+    }
+}
+
+/// The steps `program`'s fold makes of `text`, each by its shape ([`shape_of`]), the bind left
+/// out.
 #[must_use]
 pub(crate) fn step_shapes(program: Program, text: &str) -> Vec<String> {
     reduce::readings(text, program)
         .steps
         .iter()
-        .filter_map(|s| match &s.ev {
-            StepEvent::Bind { .. } => None,
-            StepEvent::Prompt { .. } => Some("prompt".to_string()),
-            StepEvent::Interrupt => Some("interrupt".to_string()),
-            StepEvent::ToolUse { tool, .. } => Some(format!("call {}", tool.as_str())),
-            StepEvent::ToolResult { .. } => Some("result".to_string()),
-            StepEvent::TurnEnd { .. } => Some("end".to_string()),
-            StepEvent::EndWall { kind } => Some(format!("wall {kind:?}")),
-            StepEvent::Compact => Some("compact".to_string()),
-            StepEvent::Model { .. } => Some("model".to_string()),
-            StepEvent::Off { .. } => Some("off".to_string()),
-        })
+        .filter_map(|s| shape_of(&s.ev))
         .collect()
 }
 
-/// What step 5 found in one leg: what refuses (`new`: NEW-KEY, `gone`: GONE) and what the note
-/// lists.
+/// The steps `program`'s fold makes of row `row` (0-based among its rows) of `text`, as a verdict
+/// says them (`result`, `call Bash, result`), or `no step`.
+#[must_use]
+pub(crate) fn row_steps(program: Program, text: &str, row: usize) -> String {
+    let made: Vec<String> = reduce::readings(text, program)
+        .steps
+        .iter()
+        .filter(|s| s.row == row)
+        .filter_map(|s| shape_of(&s.ev))
+        .collect();
+    if made.is_empty() {
+        "no step".to_string()
+    } else {
+        made.join(", ")
+    }
+}
+
+/// A new key, or a new record kind (`key` none), on rows of the record kind `kind` the fold acts
+/// on and does not read the key of: admitted only once run 2 exercised it ([`exercised`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Pending {
+    pub leg: String,
+    pub kind: String,
+    pub key: Option<String>,
+}
+
+impl Pending {
+    /// How a verdict names it: `<leg>: key "<key>" on <kind>`, or `<leg>: record <kind>`.
+    #[must_use]
+    pub(crate) fn said(&self) -> String {
+        match &self.key {
+            Some(k) => format!("{}: key {k:?} on {}", self.leg, self.kind),
+            None => format!("{}: record {}", self.leg, self.kind),
+        }
+    }
+}
+
+/// What step 5 found in one leg: what refuses (`new`: NEW-KEY, `gone`: GONE), what run 2 must
+/// exercise (`pending`), and what the note lists.
 #[derive(Debug, Default)]
 pub(crate) struct Drift {
     pub new: Vec<String>,
+    pub pending: Vec<Pending>,
     pub gone: Vec<String>,
     pub noted: Vec<String>,
 }
 
 /// STEP 5 for one leg's reduction `text`: against `union` (what every committed reduction of a
 /// measured build shows), and against `prev`, the previous build's same leg (its build and text).
+/// A key is new to the fold when no measured build showed it on a row kind the fold acts on,
+/// whatever rows it showed it on that the fold does not act on: a key first noted on an inert row
+/// is still held to rules (b) and (c) the first time a build writes it where the fold acts. GONE
+/// holds a build to the keys the fold reads that the previous build showed on rows it acts on,
+/// and only to those rows.
 /// # Errors
 /// A row is no JSON value.
 pub(crate) fn drift(
@@ -476,32 +571,70 @@ pub(crate) fn drift(
     prev: Option<(&str, &str)>,
 ) -> Result<Drift, String> {
     let now = Shows::of(f, text).map_err(|e| format!("{leg}: {e}"))?;
+    let read = |k: &str| f.read.iter().any(|a| a.text == k);
     let mut d = Drift::default();
-    d.new.extend(
-        now.keys
-            .difference(&union.keys)
-            .map(|k| format!("{leg}: key {k:?}")),
-    );
-    d.new.extend(
-        now.kinds
-            .difference(&union.kinds)
-            .map(|k| format!("{leg}: record {k}")),
-    );
+    for (k, kinds) in &now.on {
+        let (inert, acted): (Vec<&String>, Vec<&String>) =
+            kinds.iter().partition(|kind| (f.inert)(kind));
+        if !acted.is_empty() && !union.acted_on(f, k) {
+            let before = if union.keys.contains(k) {
+                ", shown before only on rows the fold does not act on"
+            } else {
+                ""
+            };
+            if read(k) {
+                d.new.push(format!(
+                    "{leg}: key {k:?} on {}, a key the fold reads{before}",
+                    join(&acted)
+                ));
+            } else {
+                d.pending.extend(acted.iter().map(|kind| Pending {
+                    leg: leg.to_string(),
+                    kind: (*kind).clone(),
+                    key: Some(k.clone()),
+                }));
+            }
+        }
+        if !inert.is_empty() && !union.keys.contains(k) {
+            d.noted.push(format!(
+                "{leg}: key {k:?} on {}, rows the fold does not act on",
+                join(&inert)
+            ));
+        }
+    }
+    for kind in now.kinds.difference(&union.kinds) {
+        if (f.inert)(kind) {
+            d.noted.push(format!(
+                "{leg}: record {kind}, a row the fold does not act on"
+            ));
+        } else {
+            d.pending.push(Pending {
+                leg: leg.to_string(),
+                kind: kind.clone(),
+                key: None,
+            });
+        }
+    }
     let Some((build, before)) = prev else {
         return Ok(d);
     };
+    let (was_acted, now_acted) = (
+        acted_rows(f, before).map_err(|e| format!("{leg} of {build}: {e}"))?,
+        acted_rows(f, text).map_err(|e| format!("{leg}: {e}"))?,
+    );
+    let mut lost = BTreeSet::new();
     for a in f.read {
         let quoted = format!("\"{}\"", a.text);
-        if before.contains(&quoted) && !text.contains(&quoted) {
+        if was_acted.contains(&quoted) && !now_acted.contains(&quoted) {
+            lost.insert(a.text);
             d.gone.push(format!("{leg}: {} ({build} showed it)", a.id));
         }
     }
     let was = Shows::of(f, before).map_err(|e| format!("{leg} of {build}: {e}"))?;
-    let read = |k: &str| f.read.iter().any(|a| a.text == k);
     d.noted.extend(
         was.keys
             .difference(&now.keys)
-            .filter(|k| !read(k))
+            .filter(|k| !lost.contains(k.as_str()))
             .map(|k| format!("{leg}: key {k:?} gone since {build}")),
     );
     d.noted.extend(
@@ -518,6 +651,22 @@ pub(crate) fn drift(
         ));
     }
     Ok(d)
+}
+
+/// The rows of `text` of a record kind the fold acts on ([`Family::inert`]), one a line: what
+/// GONE reads a key the fold reads in, since a row of any other kind changes nothing it makes.
+/// # Errors
+/// A row is no JSON value.
+fn acted_rows(f: &Family, text: &str) -> Result<String, String> {
+    let mut out = String::new();
+    for (n, row) in rows(text).enumerate() {
+        let v: Value = aterm_json::from_str(row).map_err(|e| format!("row {}: {e}", n + 1))?;
+        if !(f.inert)(&(f.kind)(&v)) {
+            out.push_str(row);
+            out.push('\n');
+        }
+    }
+    Ok(out)
 }
 
 /// A build's release numbers and dev count (`<release>[-dev.<count>][+g<sha>]`), to order builds
@@ -552,7 +701,17 @@ pub(crate) fn previous(f: &Family, build: &str, committed: &[Reduction]) -> Opti
         .map(|b| (*b).to_string())
 }
 
-/// What step 5 decided: the builds it read, the previous one, and what the note lists.
+/// The names of `kinds`, joined.
+fn join(kinds: &[&String]) -> String {
+    kinds
+        .iter()
+        .map(|k| k.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// What step 5 decided: the builds it read, the previous one, what the note lists, and what run 2
+/// must exercise.
 #[derive(Debug)]
 pub(crate) struct Judged {
     pub builds: usize,
@@ -560,12 +719,15 @@ pub(crate) struct Judged {
     pub keys: usize,
     pub kinds: usize,
     pub noted: Vec<String>,
+    pub pending: Vec<Pending>,
 }
 
 /// STEP 5 over every leg of `build`'s reductions (`legs`: leg and text) against the committed
-/// reductions of `f`'s measured builds.
+/// reductions of `f`'s measured builds, by the judge's rule (the module's head): what is new on a
+/// row the fold does not act on is noted, what it reads refuses, and the rest waits on run 2
+/// ([`Judged::pending`], [`exercised`]).
 /// # Errors
-/// NEW-KEY (every new key and kind named, and anything gone), else GONE; or a row is no JSON
+/// NEW-KEY (every new key the fold reads named, and anything gone), else GONE; or a row is no JSON
 /// value (FIXED-POINT: the reduction is no file the reader reads).
 pub(crate) fn judge(
     f: &Family,
@@ -585,7 +747,8 @@ pub(crate) fn judge(
     }
     let builds: BTreeSet<&str> = measured.iter().filter_map(|r| r.build.as_deref()).collect();
     let prev = previous(f, build, committed);
-    let (mut new, mut gone, mut noted) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut new, mut gone, mut noted, mut pending) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut shown = Shows::default();
     for (leg, text) in legs {
         let before = prev.as_deref().and_then(|p| {
@@ -601,6 +764,7 @@ pub(crate) fn judge(
         new.extend(d.new);
         gone.extend(d.gone);
         noted.extend(d.noted);
+        pending.extend(d.pending);
     }
     if !new.is_empty() {
         let also = if gone.is_empty() {
@@ -611,7 +775,7 @@ pub(crate) fn judge(
         return Err(Refusal::new(
             Class::NewKey,
             format!(
-                "{build} shows what no measured build showed ({} builds read): {}{also}",
+                "{build} shows a key the fold reads that no measured build showed ({} builds read): {}{also}",
                 builds.len(),
                 new.join(", ")
             ),
@@ -633,7 +797,73 @@ pub(crate) fn judge(
         keys: shown.keys.len(),
         kinds: shown.kinds.len(),
         noted,
+        pending,
     })
+}
+
+/// THE JUDGE'S RULE (b), once `run` (run 2, expecting the build exact) passed every check: each of
+/// `pending` admitted by the first row of its record kind in `run`'s reduction of its leg (`legs`:
+/// leg and reduction, each held to the privacy oracle as run 1's was) that carries its key, or for
+/// a new record kind is of it. What admitted each, by `check_of` (the leg, the reduction and the
+/// row, 0-based among its rows: the run's check that read the step the fold made of that row):
+/// one line per key, naming the run and the check.
+/// # Errors
+/// NEW-KEY: no row of `run`'s carries one (each named, with its row kind, as one no run
+/// exercised); FIXED-POINT: a row is no JSON value.
+pub(crate) fn exercised(
+    f: &Family,
+    build: &str,
+    pending: &[Pending],
+    run: &str,
+    legs: &[(&str, String)],
+    check_of: &dyn Fn(&str, &str, usize) -> String,
+) -> Result<Vec<String>, Refusal> {
+    let (mut admitted, mut missed) = (Vec::new(), Vec::new());
+    for p in pending {
+        let Some((_, text)) = legs.iter().find(|(leg, _)| *leg == p.leg) else {
+            missed.push(format!("{} ({run} wrote no {} leg)", p.said(), p.leg));
+            continue;
+        };
+        let mut at = None;
+        for (n, row) in rows(text).enumerate() {
+            let v: Value = aterm_json::from_str(row).map_err(|e| {
+                Refusal::new(Class::FixedPoint, format!("{}: row {}: {e}", p.leg, n + 1))
+            })?;
+            if (f.kind)(&v) == p.kind && p.key.as_deref().is_none_or(|k| carries(&v, k)) {
+                at = Some(n);
+                break;
+            }
+        }
+        match at {
+            Some(n) => admitted.push(format!(
+                "{}: {run}, row {} ({})",
+                p.said(),
+                n + 1,
+                check_of(&p.leg, text, n)
+            )),
+            None => missed.push(format!(
+                "{} (no run exercised it: {run} wrote no {} row {})",
+                p.said(),
+                p.kind,
+                if p.key.is_some() {
+                    "carrying it"
+                } else {
+                    "at all"
+                }
+            )),
+        }
+    }
+    if missed.is_empty() {
+        Ok(admitted)
+    } else {
+        Err(Refusal::new(
+            Class::NewKey,
+            format!(
+                "{build} shows on rows the fold acts on what no measured build showed and no run exercised: {}",
+                missed.join(", ")
+            ),
+        ))
+    }
 }
 
 /// Every file a [`Written`] made and still holds (neither undone nor kept), for

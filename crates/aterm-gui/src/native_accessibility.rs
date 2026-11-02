@@ -1286,6 +1286,7 @@ const fn lower_role(role: SemanticRole) -> Role {
         SemanticRole::List => Role::List,
         SemanticRole::ListBox => Role::ListBox,
         SemanticRole::ListBoxOption => Role::ListBoxOption,
+        SemanticRole::ProgressIndicator => Role::ProgressIndicator,
     }
 }
 
@@ -1384,6 +1385,7 @@ const fn lower_actions(node: &mut Node, semantic: &SemanticNode, focusable: bool
         | SemanticRole::Switch
         | SemanticRole::Navigation
         | SemanticRole::ListBoxOption
+        | SemanticRole::ProgressIndicator
         | SemanticRole::Status => {}
     }
 }

@@ -65,10 +65,22 @@ mod tests {
         let temp = aterm_tempfile::tempdir().unwrap();
         let path = temp.path().join("owned");
         std::fs::write(&path, b"private fixture").unwrap();
+        // A scratch file can inherit a group we do not belong to; the kernel then clears
+        // SGID on chmod. Keep this owned fixture in our effective group before setting it.
+        // SAFETY: getegid reads this process's effective group and has no preconditions.
+        let gid = unsafe { libc::getegid() };
+        std::os::unix::fs::chown(&path, None, Some(gid)).unwrap();
+        assert_eq!(path.metadata().unwrap().gid(), gid);
         let uid = path.metadata().unwrap().uid();
         let live = Live::new();
-        let mode =
-            |mode| std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        let mode = |mode| {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(
+                path.metadata().unwrap().mode() & 0o7777,
+                mode,
+                "the fixture must retain the requested permission bits before admission"
+            );
+        };
         mode(0o600);
         assert_eq!(
             live.read_owned_file(&path, uid, 15, true).unwrap(),
@@ -148,6 +160,10 @@ mod tests {
             },
             Stat {
                 mode: 0o4600,
+                ..safe
+            },
+            Stat {
+                mode: 0o2600,
                 ..safe
             },
             Stat { dir: true, ..safe },

@@ -388,9 +388,10 @@ fn content(root: &Path) -> Result<u64> {
     let mut sum = 0u64;
     for rel in files {
         let p = root.join(rel);
-        sum += std::fs::metadata(&p)
+        let len = std::fs::metadata(&p)
             .map_err(|e| Error::io(format!("stat {}", p.display()), &e))?
             .len();
+        sum = sum.saturating_add(len);
     }
     Ok(sum)
 }
@@ -406,7 +407,7 @@ struct Counting<W> {
 impl<W: Write> Write for Counting<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let k = self.inner.write(buf)?;
-        self.n += k as u64;
+        self.n = self.n.saturating_add(k as u64);
         self.hash.update(&buf[..k]);
         Ok(k)
     }
@@ -453,7 +454,7 @@ fn decodes_back(asset: &Path, n: u64, sum: u64) -> io::Result<()> {
             break;
         }
         hash.update(&buf[..k]);
-        got += k as u64;
+        got = got.saturating_add(k as u64);
     }
     if (got, hash.digest()) != (n, sum) {
         return Err(io::Error::other(format!(
@@ -490,7 +491,7 @@ fn stream_len(members: &[Member]) -> io::Result<u64> {
     struct Len(u64);
     impl Write for Len {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0 += buf.len() as u64;
+            self.0 = self.0.saturating_add(buf.len() as u64);
             Ok(buf.len())
         }
         fn flush(&mut self) -> io::Result<()> {
@@ -499,7 +500,7 @@ fn stream_len(members: &[Member]) -> io::Result<u64> {
     }
     let mut len = Len(0);
     layout(&mut len, members, &mut |len, _, size| {
-        len.0 += size;
+        len.0 = len.0.saturating_add(size);
         Ok(())
     })?;
     Ok(len.0)

@@ -37,8 +37,8 @@ pub fn read_frame(stream: &CtlStream) -> io::Result<Option<Incoming>> {
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         };
-        if r.bytes == 0 && r.fds.is_empty() {
-            return if got == 0 {
+        if r.bytes == 0 {
+            return if got == 0 && r.fds.is_empty() {
                 Ok(None)
             } else {
                 Err(io::ErrorKind::UnexpectedEof.into())
@@ -84,7 +84,14 @@ pub fn write_frame(
         return Err(wire(WireError::FdFlag(frame.kind())));
     }
     let sent = match fd {
-        Some(fd) => fdpass::send_with_fds(stream, &bytes, &[fd])?,
+        Some(fd) => loop {
+            match fdpass::send_with_fds(stream, &bytes, &[fd]) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(n) => break n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        },
         None => 0,
     };
     let mut s = stream;
@@ -142,5 +149,15 @@ mod tests {
         fdpass::send_with_fds(&a, &bytes, &[a.as_fd()]).expect("send");
         let err = read_frame(&b).expect_err("refused");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn truncated_header_returns_unexpected_eof() {
+        let (a, b) = CtlStream::pair().expect("pair");
+        let bytes = Frame::Bye.encode().expect("encode");
+        fdpass::send_with_fds(&a, &bytes[..3], &[]).expect("partial header");
+        drop(a);
+        let err = read_frame(&b).expect_err("truncated header must fail");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 }

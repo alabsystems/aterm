@@ -1,55 +1,37 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-log: spec recovery from its 23 unit tests
+# aterm-log: spec recovery from unit tests
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 11 tests it
-> deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
-> were taken before.
-
-> Status 2026-10-16: this is the crate's migration worklist. The 10 specs below are each proved
-> through Trust/Clean, and then the tests each one subsumes are deleted. The 2 tests in §4 sample no
-> spec and can be deleted now.
->
-> **Proved: `should-rotate-threshold`** (2026-10-16). `should_rotate` carries
-> `ensures result == (len > 4194304) by should_rotate_is_threshold`, a Clean theorem over
-> `trust_import_aterm_log__should_rotate`. On Trust seal `150efe4a` the row is Certified
-> (`clean-kernel-citation`, kernel-rechecked), and mutating the body to `>=` fails the theorem.
-> `test_should_rotate_threshold` is deleted. The machine's installed seal (321aaeda7) withholds
-> Clean rows at publication, so the row counts toward the floor only once a newer seal is installed.
-
-Source: `crates/aterm-log/src/lib.rs` (read only). I read every `#[test]` (`mod tests` 18,
-`mod env_tests` 5 = 23) and the code each one reaches. Nothing was compiled or run. The claims below
-come from reading the code.
-
-Result: **10 specs**, covering **21 tests**. **2 tests are not spec samples** (§4). One spec,
-`log-gate`, has no test today. It replaces a test of `#[cfg(test)]`-only code.
+Each row states a property of `crates/aterm-log/src/lib.rs`, recovered from its tests (`mod tests`,
+`mod env_tests`). A test is deleted once Trust/Clean proves the spec that subsumes it.
+`should-rotate-threshold` is proved: `should_rotate` carries
+`ensures result == (len > 4194304) by should_rotate_is_threshold`, a Clean theorem in the same file.
 
 ## 0. Notation used in the statements
 
 - `NAMES` = `[Off→"off", Error→"error", Warn→"warn", Info→"info", Debug→"debug", Trace→"trace"]`.
-- `lf(l)` = the `LevelFilter` variant with the same name as `Level` `l`, so `lf(l) as usize = l as usize`.
+- `lf(l)` = the `LevelFilter` variant named like `Level` `l`, so `lf(l) as usize = l as usize`.
 - `ctl(c)` = `char::is_control(c)`, the Unicode Cc category: U+0000..U+001F, U+007F, U+0080..U+009F.
 - `repl(c)` = `if ctl(c) then U+FFFD else c`. `M(msg)` = the string `msg.chars().map(repl)`.
 - `Prefix_cap(s)` = the longest char-boundary prefix of `s` whose UTF-8 length is ≤ `cap`.
-- `San(msg, cap)` = `Prefix_cap(M(msg)) ++ (if Prefix_cap(M(msg)) ≠ M(msg) then "…" else "")`. This is
-  the value the loop in `sanitize_capped` builds. It pushes `repl(c)` until the next push would exceed
-  `cap`, then pushes `'…'` and stops.
-- `Gate(l, f)` := `(l as usize) ≤ (f as usize)`. This is the check in `__log` against `MAX_LEVEL`.
+- `San(msg, cap)` = `Prefix_cap(M(msg)) ++ (if Prefix_cap(M(msg)) ≠ M(msg) then "…" else "")`: the
+  loop in `sanitize_capped` pushes `repl(c)` until the next push would exceed `cap`, then pushes
+  `'…'` and stops.
+- `Gate(l, f)` := `(l as usize) ≤ (f as usize)`, the check in `__log` against `MAX_LEVEL`.
 - `Env`: the process environment as a partial map `E : OsString ⇀ OsString`, read through
   `std::env::var_os`. `E[k:=v]` updates `k`; `E\k` removes `k`.
-- **Linearizable** means that calls into `aterm_log::env` from different threads take effect atomically
-  in some total order, because every one of them holds `ENV_LOCK`. It says nothing about `getenv` calls
-  made outside the module.
-- `blocking_gaps` are the numbers in the gap table of
-  the historical development audit `docs/AUDIT-trust-for-test-migration-2026-10-15.md`
-  §7. Gap 0 (a seal that publishes Clean rows) is a prerequisite for every spec. It is listed only
-  where it is the *only* blocker.
+- **Linearizable**: calls into `aterm_log::env` from different threads take effect atomically in
+  some total order, because each holds `ENV_LOCK`. It says nothing about `getenv` calls outside the
+  module.
+- `blocking_gaps`: gap numbers from §7 of `docs/AUDIT-trust-for-test-migration-2026-10-15.md`. Gap
+  0 (a seal that publishes Clean rows) is a prerequisite for every spec and is listed only where it
+  is the only blocker.
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes (primary tests; secondary in §2)`,
-`difficulty (Rust features the proof must handle)`, `blocking_gaps`.
+Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (primary tests; the others are in §2),
+`difficulty` (the Rust features the proof must handle), `blocking_gaps`.
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
@@ -57,7 +39,7 @@ level-severity-order	table-property	Level (derived PartialOrd/Ord), LevelFilter 
 level-display-names	table-property	<Level as Display>::fmt, LevelFilter::parse	∀ l ∈ Level: l.to_string() = ascii_uppercase(NAMES[lf(l)]), i.e. "ERROR","WARN","INFO","DEBUG","TRACE". fmt writes exactly that string with one write_str and returns that call's result. Round trip: ∀ l: LevelFilter::parse(&l.to_string()) = Some(lf(l)).	test_level_display	MEDIUM: &mut fmt::Formatter, a Display trait impl, &str literals, String from to_string; the round trip composes with parse	1, 2, 3, 4
 level-filter-parse	contract	LevelFilter::parse	∀ s: &str, ∀ f ∈ LevelFilter: parse(s) = Some(f) ⇔ s.trim().eq_ignore_ascii_case(NAMES[f]); parse(s) = None ⇔ no f satisfies that. The names are pairwise distinct ignoring ASCII case, so the result is well defined. trim strips Unicode White_Space at both ends (§5.4); the match is ASCII-case-insensitive only.	parse_level_filter_takes_names_in_any_case_and_refuses_junk	MEDIUM: &str, str::trim (a char loop over Unicode whitespace), eq_ignore_ascii_case (a byte loop), an if-chain, Option<enum>	1, 3, 5, 7
 should-rotate-threshold	contract	should_rotate	∀ len: u64: should_rotate(len) ⇔ len > MAX_LOG_BYTES = 4·1024·1024 = 4194304.	(none; its test went when the spec was proved)	TRIVIAL: one u64 comparison against a const; a straight-line admissible body	0
-record-cap-by-level	contract	record_cap	∀ l ∈ Level: record_cap(l) = if l ≤ Level::Warn then MAX_ALERT_RECORD_BYTES (1024) else MAX_RECORD_BYTES (512). Hence record_cap(l) ≤ MAX_ALERT_RECORD_BYTES, which is sanitize_capped's precondition.	record_cap_matches_alert_and_standard_thresholds	EASY: an enum match with or-patterns, usize consts	1, 3; fragment: `record_cap` F1+D2b (VF5 first target, docs/PLAN-tests-to-specs-2026-10-15.md "F1-ready specs").
+record-cap-by-level	contract	record_cap	∀ l ∈ Level: record_cap(l) = if l ≤ Level::Warn then MAX_ALERT_RECORD_BYTES (1024) else MAX_RECORD_BYTES (512). Hence record_cap(l) ≤ MAX_ALERT_RECORD_BYTES, which is sanitize_capped's precondition.	record_cap_matches_alert_and_standard_thresholds	EASY: an enum match with or-patterns, usize consts	1, 3; fragment: `record_cap` F1+D2b (VF5 first target, docs/PLAN-tests-to-specs-2026-10-15.md "F1-ready specs", row 45). Proved via mirror: Clean R213 row `log_record_cap` (`RowProvedB3` over a verbatim copy; `l ≤ Warn` read as `(l as usize) ≤ 2`, with a false-clause control); not yet credited: Trust's compiler mints no calculus row until it pins a VF5 base (E4.7).
 sanitize-record	contract	sanitize_capped, sanitize_record, sanitize_record_for	∀ msg: &str, ∀ cap ≤ MAX_ALERT_RECORD_BYTES, let r = sanitize_capped(msg, cap). (a) Value: r.as_ref() = San(msg, cap). (b) Borrowing: r is Cow::Borrowed ⇔ (∀ c ∈ msg.chars(): ¬ctl(c)) ∧ msg.len() ≤ cap, and then r = Borrowed(msg), the same pointer. (c) Consequences of (a), stated for the proof: r has no control chars; r.len() ≤ cap + 3; if r ends with an added '…' then M(msg).len() > cap and r.len() > cap − 3; every char of r except an added final '…' is repl of the char at the same index of msg, so no code point is split; for Owned, out never outgrows its reservation: len ≤ OUT_CAPACITY = 1028 and capacity is unchanged. Wrappers: sanitize_record(m) = sanitize_capped(m, MAX_RECORD_BYTES); sanitize_record_for(l, m) = sanitize_capped(m, record_cap(l)).	test_warn_and_error_keep_the_longer_cap, test_sanitize_record_replaces_control_characters, test_sanitize_record_cap_respects_char_boundaries, test_sanitize_record_control_char_at_boundary_stays_within_reservation	MEDIUM-HARD: &str and Cow<'_, str> carriers; a chars() loop with break and the invariant out = Prefix of M over the chars consumed so far ∧ out.len() ≤ cap; String::with_capacity/push/len; char::is_control/len_utf8; saturating_add; usize::min; a call to record_cap (composition); a quantifier over chars	1, 3, 4, 5, 7
 record-accessors	contract	Record::{level,target,args,file,line,metadata}, Metadata::level	∀ r = Record{level,target,args,file,line}: r.level() = level, r.target() = target (the same &'a str), r.file() = file, r.line() = line, r.args() points to r.args, and r.metadata().level() = level.	(shared: tests/log_gate.rs::log_gate_and_record_accessors_hold_across_filters_and_logger_decisions)	EASY once views are certified: &self views on a struct with &'a str, Option<&str>, Option<u32> and fmt::Arguments fields; field projection	1, 2
 log-gate	contract	set_max_level, set_logger, settle_logger, wait_for_logger, takes_records, __log	After set_max_level(f), with no intervening set_max_level: MAX_LEVEL holds f as usize, and __log(l, t, a, fi, li) calls logger.log(&Record{l,t,a,fi,li}) exactly once ⇔ Gate(l, f) ∧ a logger L was installed by set_logger ∧ L.enabled(&Metadata{level: l}). Otherwise it calls neither log nor anything else, except that enabled is called when Gate holds and a logger is installed. wait_for_logger(within) returns true as soon as LOGGER.get().is_some() ∧ MAX_LEVEL > Off (woken by set_logger and set_max_level), and returns false without waiting further once settle_logger() has run while ¬takes_records() or once within elapses.	tests/log_gate.rs::log_gate_and_record_accessors_hold_across_filters_and_logger_decisions, a_waiter_wakes_once_a_logger_takes_records	HARD: AtomicUsize/AtomicBool, OnceLock, Mutex+Condvar wakeups, a dyn Log trait-object call; __log and wait_for_logger carry trust::skip today	2, 8, 13
@@ -68,7 +50,7 @@ log-words	contract	words::{Len,word,WordOrLen,Panic,Panic::of,Panic::of_text,Pan
 
 ## 2. Test → spec map (TSV)
 
-`primary` is the spec that retires the test. `also` lists the other specs the same test samples.
+`primary` is the spec that retires the test; `also` lists the other specs it samples.
 
 ```tsv
 file	test	primary	also
@@ -104,11 +86,8 @@ The first 5 rows are `mod tests`; the last 4 are `mod env_tests`.
 
 ## 4. Tests that are not spec samples
 
-> Status 2026-10-15: both tests this section listed (`test_max_level_round_trips` and
-> `test_set_logger_error_display`) are deleted, with the `#[cfg(test)]`-only `max_level()` and
-> `LEVEL_TEST_LOCK` they alone used. The first read the level back through `max_level()` (the property
-> that matters, that `set_max_level` drives `__log`'s gate, is `log-gate`); the second pinned the prose
-> of a constant error message. Every test left samples a spec.
+None. No test samples `log-gate`. `env::read` is `#[cfg(test)]`-only; the env specs are stated
+against `std::env::var_os`, and the helper goes with the last env test.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
@@ -132,22 +111,16 @@ The first 5 rows are `mod tests`; the last 4 are `mod env_tests`.
 5. **Env tests retargeted onto `std::env::var_os` (resolved 2026-10-28).** Deleted `#[cfg(test)]`
    `env::read` and retargeted all four `env_tests` onto `std::env::var_os`.
 
-## 6. Proof order (easiest high-value first)
+## 6. Proof order
 
-1. **`should-rotate-threshold`**. It is the only spec blocked by gap 0 alone: one `u64` comparison
-   against a const, a straight-line admissible body. It is the smoke test that a newer seal publishes a
-   Certified row for this crate, and it retires 1 test.
-2. **`record-cap-by-level`** and **`level-severity-order`** (gaps 1, 3). Both are finite enum tables
-   decidable by evaluation once E6 admits enum matches and `as usize` casts. They retire 2 tests, and
-   `record-cap-by-level` is the lemma `sanitize-record` needs for `sanitize_record_for`.
-3. **`sanitize-record`** (gaps 1, 3, 4, 5, 7). This is the highest-value spec: it retires 7 tests and
-   guards every log record against control-char injection and unbounded size. It needs `&str`/`Cow`
-   carriers, a `chars()` loop with an invariant, and composition with `record_cap`.
-4. **`level-filter-parse`**, then **`level-display-names`** (it composes with parse for the round trip),
-   then **`record-accessors`** (gap 2, certified `&self` views). Together they retire 6 tests.
-5. **Effects last**: `env-mutators`, `env-scoped-restore` and `log-gate` wait on gaps 8, 11 and 13
-   (platform lane, generics, closures and threads). Their pure cores are small. A spec over an abstract
-   `Env` map could be stated now, but proving the real bodies needs the platform lane.
-
-Gap histogram (gap → specs blocked by it): 0 → 1 explicitly (all 10 implicitly), 1 → 8, 2 → 3,
-3 → 5, 4 → 2, 5 → 2, 7 → 2, 8 → 3, 11 → 2, 13 → 3.
+1. **`record-cap-by-level`** and **`level-severity-order`** (gaps 1, 3): finite enum tables,
+   decidable by evaluation. `record-cap-by-level` is the lemma `sanitize-record` needs for
+   `sanitize_record_for`.
+2. **`sanitize-record`** (gaps 1, 3, 4, 5, 7): the highest-value spec, guarding every log record
+   against control-char injection and unbounded size. It needs `&str`/`Cow` carriers, a `chars()`
+   loop invariant, and composition with `record_cap`.
+3. **`level-filter-parse`**, then **`level-display-names`** (it composes with parse for the round
+   trip), then **`record-accessors`** (gap 2).
+4. **Effects last**: `env-mutators`, `env-scoped-restore` and `log-gate` wait on gaps 8, 11 and 13.
+   A spec over an abstract `Env` map can be stated now; proving the real bodies needs the platform
+   lane.

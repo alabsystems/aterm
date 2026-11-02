@@ -106,6 +106,162 @@ fn authenticated_reads_are_local_redacted_and_bound_to_one_entry() {
 }
 
 #[test]
+fn authenticated_entry_versions_retain_absence_and_reject_rollback_forks() {
+    let f = Fixture::new();
+    let config = config(&f.paths).unwrap().unwrap();
+    let first = observe_verified_entry(&f.paths, &config, "token")
+        .unwrap()
+        .unwrap();
+    f.publish(|doc| {
+        doc.unset_entry(&Audience::Everyone, "token").unwrap();
+    });
+    let absent = observe_verified_entry(&f.paths, &config, "token")
+        .unwrap()
+        .unwrap();
+    assert!(absent.entry.is_none());
+    assert!(absent.version.not_before(&first.version));
+    assert!(!first.version.not_before(&absent.version));
+    let mut fork = absent.version.clone();
+    fork.envelope[0] ^= 1;
+    assert!(!fork.not_before(&absent.version));
+    assert!(!absent.version.not_before(&fork));
+    f.publish(|doc| {
+        doc.set_entry(&Audience::Everyone, "token", b"inert-authentic-token")
+            .unwrap();
+    });
+    let restored = observe_verified_entry(&f.paths, &config, "token")
+        .unwrap()
+        .unwrap();
+    assert!(restored.version.not_before(&absent.version));
+    assert!(
+        restored
+            .entry
+            .unwrap()
+            .snapshot()
+            .continues(first.entry.unwrap().snapshot())
+    );
+    let other = observe_verified_entry(&f.paths, &config, "other")
+        .unwrap()
+        .unwrap();
+    assert!(!other.version.not_before(&restored.version));
+    std::fs::write(
+        materialize::target_path(&f.paths.home, "token").unwrap(),
+        b"forged",
+    )
+    .unwrap();
+    let forged = observe_verified_entry(&f.paths, &config, "token")
+        .unwrap()
+        .unwrap();
+    assert!(forged.entry.is_none());
+    assert!(forged.version.not_before(&restored.version));
+}
+
+#[test]
+fn entry_versions_require_retained_log_facts_even_with_an_unchanged_envelope() {
+    let f = Fixture::new();
+    let mut first = f.read_token().unwrap().snapshot().version();
+    first.log_ids = Some(std::sync::Arc::new([[1; 32]].into_iter().collect()));
+    let mut extended = first.clone();
+    extended.log_ids = Some(std::sync::Arc::new(
+        [[1; 32], [2; 32]].into_iter().collect(),
+    ));
+    assert!(extended.not_before(&first));
+    assert!(!first.not_before(&extended));
+    let mut replaced = extended.clone();
+    replaced.log_ids = Some(std::sync::Arc::new(
+        [[2; 32], [3; 32], [4; 32]].into_iter().collect(),
+    ));
+    assert!(!replaced.not_before(&first));
+    replaced.log_ids = None;
+    assert!(!replaced.not_before(&first));
+}
+
+pub(crate) fn version_transition(
+    before: &aterm_spec::interp::State,
+    action: &str,
+) -> aterm_spec::interp::State {
+    version_transition_with(before, action, false)
+}
+
+fn version_transition_with(
+    before: &aterm_spec::interp::State,
+    action: &str,
+    bypass: bool,
+) -> aterm_spec::interp::State {
+    let f = Fixture::new();
+    let mut floor = f.read_token().unwrap().snapshot().version();
+    floor.seq = 1;
+    floor.envelope = [1; 32];
+    floor.log_ids = Some(std::sync::Arc::new([[1; 32]].into_iter().collect()));
+    let mut candidate = floor.clone();
+    let scenario = match action {
+        "Same" => 1,
+        "Advance" => {
+            candidate.seq = 2;
+            2
+        }
+        "Rollback" => {
+            candidate.seq = 0;
+            3
+        }
+        "Fork" => {
+            candidate.envelope = [2; 32];
+            4
+        }
+        "LogExtend" => {
+            candidate.log_ids = Some(std::sync::Arc::new(
+                [[1; 32], [2; 32]].into_iter().collect(),
+            ));
+            5
+        }
+        "LogDrop" => {
+            candidate.log_ids = None;
+            6
+        }
+        "LogSwap" => {
+            candidate.log_ids = Some(std::sync::Arc::new(
+                [[2; 32], [3; 32]].into_iter().collect(),
+            ));
+            7
+        }
+        "Context" => {
+            candidate.name = "other".into();
+            8
+        }
+        _ => unreachable!(),
+    };
+    let accepted = if bypass {
+        candidate.seq >= floor.seq
+    } else {
+        candidate.not_before(&floor)
+    };
+    let mut after = before.clone();
+    after.insert("scenario", scenario);
+    after.insert("accepted", i64::from(accepted));
+    after
+}
+
+#[test]
+fn entry_version_conforms_and_catches_sequence_only_comparisons() {
+    let model = aterm_models_db::entry_version_model();
+    assert!(aterm_spec::interp::prove_and_catch(&model) > 1);
+    let initial = model.init_state();
+    aterm_spec::check::each_on(aterm_spec::fs_lane::PLACES, &model.actions, |action| {
+        let next = version_transition(&initial, action.name);
+        assert!(
+            model.successors(action.name, &initial).contains(&next),
+            "{}: {next:?}",
+            action.name
+        );
+        next
+    });
+    assert!(!model.check_invariant(
+        "Retained",
+        &version_transition_with(&initial, "LogDrop", true)
+    ));
+}
+
+#[test]
 fn reserved_entries_are_authenticated_without_becoming_secret_files() {
     let f = Fixture::new();
     f.publish(|doc| {
@@ -672,6 +828,318 @@ fn local_if_absent_files_are_not_promoted_to_authenticated_entries() {
             .as_slice(),
         b"filled-inert-value"
     );
+}
+
+fn adopted_signing_fixture(anchored: bool) -> Fixture {
+    let f = Fixture::new();
+    let key = materialize::target_path(&f.paths.home, "~/.aterm/apple/devid-existing.key").unwrap();
+    fsx::ensure_private_dir(key.parent().unwrap()).unwrap();
+    fsx::write_atomic(&key, b"inert-existing-key", 0o600).unwrap();
+    f.publish(|doc| {
+        let anchor = "~/.aterm/apple/devid-existing.cer";
+        if anchored {
+            doc.set_entry_with(
+                &Audience::Everyone,
+                anchor,
+                b"inert-certificate",
+                true,
+                None,
+            )
+            .unwrap();
+        }
+        doc.set_entry_with(
+            &Audience::Everyone,
+            "~/.aterm/apple/devid-existing.key",
+            b"inert-existing-key",
+            anchored,
+            anchored.then_some(anchor),
+        )
+        .unwrap();
+    });
+    f
+}
+
+#[test]
+fn signing_reader_accepts_identical_adopted_bytes_without_claiming_ownership() {
+    let f = adopted_signing_fixture(false);
+    let name = "~/.aterm/apple/devid-existing.key";
+    let expected = config(&f.paths).unwrap().unwrap();
+    let key = materialize::target_path(&f.paths.home, name).unwrap();
+    let state = load_state(&f.paths).unwrap();
+    assert!(!state.manifest.files.contains_key(name));
+    assert!(state.own.as_ref().unwrap().contains(name));
+    let before = (
+        std::fs::read(f.paths.state_file()).unwrap(),
+        std::fs::read(&key).unwrap(),
+    );
+    assert!(
+        read_verified_entry(&f.paths, &expected, name)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        read_signing_material(&f.paths, &expected, name)
+            .unwrap()
+            .unwrap()
+            .as_slice(),
+        b"inert-existing-key"
+    );
+    assert_eq!(
+        before,
+        (
+            std::fs::read(f.paths.state_file()).unwrap(),
+            std::fs::read(&key).unwrap()
+        )
+    );
+    for other in [
+        "token",
+        "~/.aterm/apple/devid-nested/other.key",
+        "~/.aterm/apple/devid-existing.txt",
+    ] {
+        assert!(read_signing_material(&f.paths, &expected, other).is_err());
+    }
+}
+
+fn adopted_publication_fixture(name: &str) -> Fixture {
+    let f = Fixture::new();
+    let path = materialize::target_path(&f.paths.home, name).unwrap();
+    fsx::write_atomic(&path, b"inert-publication-token", 0o600).unwrap();
+    f.publish(|doc| {
+        doc.set_entry(&Audience::Everyone, name, b"inert-publication-token")
+            .unwrap();
+    });
+    f
+}
+
+#[test]
+fn publication_reader_accepts_only_authenticated_equal_adopted_tokens_without_claiming_them() {
+    for name in ["gh_access_token", "gh_access_token_alabsystems"] {
+        let f = adopted_publication_fixture(name);
+        let expected = config(&f.paths).unwrap().unwrap();
+        let state = load_state(&f.paths).unwrap();
+        assert!(!state.manifest.files.contains_key(name));
+        assert!(state.own.as_ref().unwrap().contains(name));
+        let before = std::fs::read(f.paths.state_file()).unwrap();
+        assert!(
+            read_verified_entry(&f.paths, &expected, name)
+                .unwrap()
+                .is_none()
+        );
+        let entry = read_publication_material(&f.paths, &expected, name)
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.value().as_slice(), b"inert-publication-token");
+        assert!(entry.snapshot().read(&f.paths).unwrap().is_none());
+        assert!(
+            entry
+                .snapshot()
+                .read_publication(&f.paths)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(std::fs::read(f.paths.state_file()).unwrap(), before);
+        for unrelated in [
+            "token",
+            "aterm-commons",
+            "~/.aterm/apple/devid-existing.key",
+        ] {
+            assert!(read_publication_material(&f.paths, &expected, unrelated).is_err());
+        }
+    }
+}
+
+#[test]
+fn publication_token_and_snapshot_refuse_stale_foreign_revoked_or_unsafe_material() {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+    let name = "gh_access_token";
+    for fault in [
+        "mismatch", "manifest", "audience", "revoked", "source", "public", "link", "hardlink",
+        "stale", "failed", "pending",
+    ] {
+        let f = adopted_publication_fixture(name);
+        let expected = config(&f.paths).unwrap().unwrap();
+        let entry = read_publication_material(&f.paths, &expected, name)
+            .unwrap()
+            .unwrap();
+        let path = materialize::target_path(&f.paths.home, name).unwrap();
+        match fault {
+            "mismatch" => fsx::write_atomic(&path, b"foreign", 0o600).unwrap(),
+            "manifest" => set_state(&f.paths, |s| {
+                s.manifest
+                    .files
+                    .insert(name.into(), materialize::digest_hex(b"foreign"));
+            }),
+            "audience" => f.publish(|doc| {
+                doc.unset_entry(&Audience::Everyone, name).unwrap();
+                doc.set_entry(
+                    &Audience::Hosts(vec!["peer".into()]),
+                    name,
+                    b"inert-publication-token",
+                )
+                .unwrap();
+            }),
+            "revoked" => set_state(&f.paths, |s| s.membership = Stored::Revoked),
+            "source" => {
+                let mut changed = expected.clone();
+                changed.source = Source::Path(f.paths.home.join("different.vault"));
+                save_config(&f.paths, &changed).unwrap();
+            }
+            "public" => {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap()
+            }
+            "link" => {
+                let held = path.with_extension("held");
+                std::fs::rename(&path, &held).unwrap();
+                symlink(held, &path).unwrap();
+            }
+            "hardlink" => std::fs::hard_link(&path, path.with_extension("held")).unwrap(),
+            "stale" => set_state(&f.paths, |s| s.seq = 0),
+            "failed" => set_state(&f.paths, |s| s.failed = true),
+            "pending" => set_state(&f.paths, |s| {
+                s.pending
+                    .insert(name.into(), materialize::digest_hex(b"pending"));
+            }),
+            _ => unreachable!(),
+        }
+        let before = std::fs::read(f.paths.state_file()).unwrap();
+        assert!(
+            !matches!(
+                read_publication_material(&f.paths, &expected, name),
+                Ok(Some(_))
+            ),
+            "{fault}"
+        );
+        assert!(
+            !matches!(entry.snapshot().read_publication(&f.paths), Ok(Some(_))),
+            "snapshot {fault}"
+        );
+        assert_eq!(std::fs::read(f.paths.state_file()).unwrap(), before);
+    }
+}
+
+#[test]
+fn signing_adopted_reader_keeps_current_authority_and_private_path_guards() {
+    use std::os::unix::fs::PermissionsExt as _;
+    for fault in [
+        "changed",
+        "manifest",
+        "failed",
+        "pending",
+        "revoked",
+        "audience",
+        "config",
+        "public",
+        "link",
+        "parent-link",
+    ] {
+        let f = adopted_signing_fixture(false);
+        let name = "~/.aterm/apple/devid-existing.key";
+        let expected = config(&f.paths).unwrap().unwrap();
+        let key = materialize::target_path(&f.paths.home, name).unwrap();
+        match fault {
+            "changed" => fsx::write_atomic(&key, b"foreign-key", 0o600).unwrap(),
+            "manifest" => set_state(&f.paths, |s| {
+                s.manifest
+                    .files
+                    .insert(name.into(), materialize::digest_hex(b"different"));
+            }),
+            "failed" => set_state(&f.paths, |s| s.failed = true),
+            "pending" => set_state(&f.paths, |s| {
+                s.pending
+                    .insert(name.into(), materialize::digest_hex(b"pending"));
+            }),
+            "revoked" => set_state(&f.paths, |s| s.membership = Stored::Revoked),
+            "audience" => f.publish(|doc| {
+                doc.unset_entry(&Audience::Everyone, name).unwrap();
+                doc.set_entry(
+                    &Audience::Hosts(vec!["peer".into()]),
+                    name,
+                    b"inert-existing-key",
+                )
+                .unwrap();
+            }),
+            "config" => {
+                let mut changed = expected.clone();
+                changed.source = Source::Path(f.paths.home.join("another.vault"));
+                save_config(&f.paths, &changed).unwrap();
+            }
+            "public" => {
+                std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap()
+            }
+            "link" => {
+                let kept = f.paths.home.join("kept-key");
+                std::fs::rename(&key, &kept).unwrap();
+                std::os::unix::fs::symlink(kept, &key).unwrap();
+            }
+            "parent-link" => {
+                let parent = key.parent().unwrap();
+                let kept = f.paths.home.join("kept-apple");
+                std::fs::rename(parent, &kept).unwrap();
+                std::os::unix::fs::symlink(kept, parent).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let before = (
+            std::fs::read(f.paths.state_file()).unwrap(),
+            std::fs::read(&key).ok(),
+        );
+        assert!(
+            !matches!(
+                read_signing_material(&f.paths, &expected, name),
+                Ok(Some(_))
+            ),
+            "{fault}"
+        );
+        assert_eq!(
+            before,
+            (
+                std::fs::read(f.paths.state_file()).unwrap(),
+                std::fs::read(&key).ok()
+            ),
+            "{fault}"
+        );
+    }
+}
+
+#[test]
+fn an_adopted_signing_key_requires_its_current_vault_owned_anchor_chain() {
+    use std::os::unix::fs::PermissionsExt as _;
+    for fault in ["none", "changed", "untracked", "missing", "public"] {
+        let f = adopted_signing_fixture(true);
+        let key_name = "~/.aterm/apple/devid-existing.key";
+        let cert_name = "~/.aterm/apple/devid-existing.cer";
+        let expected = config(&f.paths).unwrap().unwrap();
+        let cert = materialize::target_path(&f.paths.home, cert_name).unwrap();
+        let state = load_state(&f.paths).unwrap();
+        assert!(!state.manifest.files.contains_key(key_name));
+        assert!(state.own.as_ref().unwrap().contains(key_name));
+        assert!(state.manifest.files.contains_key(cert_name));
+        match fault {
+            "none" => {}
+            "changed" => fsx::write_atomic(&cert, b"foreign-anchor", 0o600).unwrap(),
+            "untracked" => set_state(&f.paths, |s| {
+                s.manifest.files.remove(cert_name);
+            }),
+            "missing" => std::fs::remove_file(&cert).unwrap(),
+            "public" => {
+                std::fs::set_permissions(&cert, std::fs::Permissions::from_mode(0o644)).unwrap()
+            }
+            _ => unreachable!(),
+        }
+        let before = std::fs::read(f.paths.state_file()).unwrap();
+        let accepted = read_signing_material(&f.paths, &expected, key_name)
+            .ok()
+            .flatten()
+            .is_some();
+        assert_eq!(accepted, fault == "none", "{fault}");
+        assert!(
+            read_verified_entry(&f.paths, &expected, key_name)
+                .ok()
+                .flatten()
+                .is_none()
+        );
+        assert_eq!(before, std::fs::read(f.paths.state_file()).unwrap());
+    }
 }
 
 #[test]

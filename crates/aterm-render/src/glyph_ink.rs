@@ -12,10 +12,16 @@
 //! the `R` of the settings card's `README.md` with a one-column stem at 76% coverage: its core
 //! reads 7.2:1 bare on GitHub Light, not the 15.8:1 of its colour, and under Comet's blue body it
 //! read 4.41:1 (looks9's settings round 2). [`GlyphInk::core`] is the coverage the lab's
-//! `trail-contrast` reads a glyph's core at, and [`GlyphInk::cell_box`] where in its cell the
-//! glyph lays ink, so the letter guard can judge that ink where it lies.
+//! `trail-contrast` reads a glyph's core at, [`GlyphInk::cell_box`] where in its cell the
+//! glyph lays ink, and [`GlyphInk::raster`] the glyph's own pixels as the renderer seats them,
+//! so the letter guard reads each letter as the judges read it: every stroke against the ring of
+//! ground round it.
 
 use crate::{GlyphImage, GlyphKey, Renderer, StyleBits, TextBlending};
+
+mod frame;
+pub(crate) use frame::FrameInkMemo;
+pub use frame::{FrameGlyphInk, GlyphInkEpoch};
 
 /// The first glyph [`GlyphInk`] measures (U+0020).
 const FIRST: u32 = 0x20;
@@ -56,6 +62,28 @@ impl Default for GlyphCoverage {
 }
 
 impl GlyphCoverage {
+    /// The actual coverage byte at the lower median of this glyph's core, with
+    /// the renderer's own coverage remap. None when this raster lays no ink.
+    #[must_use]
+    pub fn core_level(&self, fg_l: f32, bg_l: f32, corrected: bool) -> Option<u8> {
+        if self.max == 0 {
+            return None;
+        }
+        let cover = |a: u8| {
+            let a = f32::from(a) / 255.0;
+            if corrected {
+                crate::correct_alpha(fg_l, bg_l, a)
+            } else {
+                a
+            }
+        };
+        let full = cover(self.max);
+        let floor = (1..=self.max)
+            .find(|&a| cover(a) >= CORE_SHARE * full)
+            .unwrap_or(self.max);
+        Some(median_level(self, floor))
+    }
+
     /// The coverage histogram of a mono raster's bytes.
     #[must_use]
     pub fn of(bytes: &[u8]) -> Self {
@@ -107,17 +135,90 @@ impl GlyphCoverage {
     }
 }
 
+/// A glyph's raster as the renderer seats it in its cell: its coverage bytes, `w` wide, row by
+/// row, its top left `(x, y)` px from the cell's top left (`xmin` across, `baseline - height -
+/// ymin` down), trimmed to its inked pixels. It may reach past the cell, as the renderer draws it
+/// (an `|` a pixel under the row, a `W` past its right edge).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GlyphRaster {
+    /// The raster's left, px from the cell's left.
+    pub x: i32,
+    /// The raster's top, px from the cell's top.
+    pub y: i32,
+    /// Its width, px.
+    pub w: usize,
+    /// Its coverage bytes, `w` per row.
+    pub cov: Box<[u8]>,
+}
+
+impl GlyphRaster {
+    /// The raster of a mono bitmap `width` px wide whose top left lies at `(left, top)` in its
+    /// cell, trimmed to its inked pixels; `None` for one that lays no ink.
+    #[must_use]
+    pub fn placed(bytes: &[u8], width: usize, (left, top): (i32, i32)) -> Option<Self> {
+        if width == 0 {
+            return None;
+        }
+        let (mut x0, mut y0, mut x1, mut y1) = (usize::MAX, usize::MAX, 0, 0);
+        for (y, row) in bytes.chunks_exact(width).enumerate() {
+            for (x, _) in row.iter().enumerate().filter(|&(_, &a)| a > 0) {
+                (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x + 1), y1.max(y + 1));
+            }
+        }
+        if x0 >= x1 {
+            return None;
+        }
+        let w = x1 - x0;
+        let mut cov = Vec::with_capacity(w * (y1 - y0));
+        for row in bytes.chunks_exact(width).take(y1).skip(y0) {
+            cov.extend_from_slice(&row[x0..x1]);
+        }
+        Some(Self {
+            x: left.saturating_add(i32::try_from(x0).ok()?),
+            y: top.saturating_add(i32::try_from(y0).ok()?),
+            w,
+            cov: cov.into_boxed_slice(),
+        })
+    }
+
+    /// Its height, px.
+    #[inline]
+    #[must_use]
+    pub fn h(&self) -> usize {
+        self.cov.len().checked_div(self.w).unwrap_or(0)
+    }
+
+    /// The coverage it lays on pixel `(x, y)` of its cell (from the cell's top left; `0` off the
+    /// raster).
+    #[inline]
+    #[must_use]
+    pub fn at(&self, x: i32, y: i32) -> u8 {
+        let (Ok(dx), Ok(dy)) = (usize::try_from(x - self.x), usize::try_from(y - self.y)) else {
+            return 0;
+        };
+        if dx >= self.w {
+            return 0;
+        }
+        self.cov.get(dy * self.w + dx).copied().unwrap_or(0)
+    }
+}
+
 /// Each printable ASCII glyph's coverage at one renderer's face and size, regular and bold, and
 /// how that renderer remaps coverage ([`TextBlending`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GlyphInk {
     regular: Box<[GlyphCoverage; ASCII]>,
     bold: Box<[GlyphCoverage; ASCII]>,
+    /// Each glyph's raster as the renderer seats it ([`Self::raster`]), regular then bold, by
+    /// [`Self::index`]; empty for a table built from coverage alone ([`Self::from_coverage`]).
+    rasters: Box<[Option<GlyphRaster>]>,
     /// The glyph every other character is judged as: the alphanumeric whose core lies lowest.
     other: u8,
     corrected: bool,
     /// A hash of everything above, so a host can key on the table cheaply.
     fingerprint: u64,
+    /// Exact input glyphs, when a host requested [`Renderer::glyph_ink_for`].
+    frame: Option<FrameGlyphInk>,
 }
 
 impl GlyphInk {
@@ -168,10 +269,57 @@ impl GlyphInk {
         Self {
             regular: Box::new(regular),
             bold: Box::new(bold),
+            rasters: Box::new([]),
             other,
             corrected,
             fingerprint,
+            frame: None,
         }
+    }
+
+    /// This table with each glyph's raster as the renderer seats it ([`Self::raster`]),
+    /// `rasters` regular then bold printable ASCII in code order.
+    #[must_use]
+    pub fn with_rasters(mut self, rasters: Vec<Option<GlyphRaster>>) -> Self {
+        let mut fingerprint = self.fingerprint ^ 0x9E37_79B9_7F4A_7C15;
+        for raster in &rasters {
+            let words = match raster {
+                Some(r) => [r.x, r.y, i32::try_from(r.w).unwrap_or(i32::MAX)],
+                None => [i32::MIN; 3],
+            };
+            for v in words
+                .into_iter()
+                .map(i32::cast_unsigned)
+                .map(u64::from)
+                .chain(
+                    raster
+                        .iter()
+                        .flat_map(|r| r.cov.iter().copied().map(u64::from)),
+                )
+            {
+                fingerprint = (fingerprint ^ v).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        self.rasters = rasters.into_boxed_slice();
+        self.fingerprint = fingerprint;
+        self
+    }
+
+    /// Glyph `index`'s ([`Self::index`]) raster as the renderer seats it in its cell; `None` for
+    /// a glyph known only as another ([`Self::OTHER`]), one that draws nothing, or a table built
+    /// from coverage alone.
+    #[inline]
+    #[must_use]
+    pub fn raster(&self, index: u8) -> Option<&GlyphRaster> {
+        self.rasters.get(usize::from(index))?.as_ref()
+    }
+
+    /// Whether the renderer remaps coverage in linear light ([`TextBlending::LinearCorrected`]),
+    /// as [`crate::TextLevel`] takes it.
+    #[inline]
+    #[must_use]
+    pub const fn corrected(&self) -> bool {
+        self.corrected
     }
 
     /// A hash of the whole table: two tables with one fingerprint read every glyph alike.
@@ -231,6 +379,35 @@ impl GlyphInk {
             .unwrap_or(glyph.max);
         Some(cover(median_level(glyph, floor)))
     }
+
+    /// How far toward its ground, as a share of linear light, the darkest pixel of the face's
+    /// thinnest printable glyph lies when drawn in a colour of luminance `fg_l` on a cell ground
+    /// of `bg_l`: `1 −` the least fullest-pixel coverage, after the remap, over every printable
+    /// ASCII glyph that draws ink, regular and bold ([`crate::blend_text`] lays a pixel of
+    /// coverage `a` that far toward what lies under it). `0` for a face that lays its full ink on
+    /// every glyph, or draws none. A light laid under the text keeps a glyph's solid ink only as
+    /// far as its darkest pixel lies near the ink: Prism Glass's glass is solved for a face whose
+    /// share is at most `prism_glass::colour::THIN_INK_SHARE`.
+    #[must_use]
+    pub fn thin_share(&self, fg_l: f32, bg_l: f32) -> f32 {
+        let Some(least) = self
+            .regular
+            .iter()
+            .chain(self.bold.iter())
+            .map(|g| g.max)
+            .filter(|&a| a > 0)
+            .min()
+        else {
+            return 0.0;
+        };
+        let a = f32::from(least) / 255.0;
+        let cover = if self.corrected {
+            crate::correct_alpha(fg_l, bg_l, a)
+        } else {
+            a
+        };
+        (1.0 - cover).clamp(0.0, 1.0)
+    }
 }
 
 /// The lower median coverage of `glyph`'s pixels at or above `floor`.
@@ -270,12 +447,14 @@ impl Renderer {
             return std::sync::Arc::clone(ink);
         }
         let baseline = self.baseline;
+        let mut rasters = Vec::with_capacity(2 * ASCII);
         let mut measure = |style: Option<StyleBits>| -> [GlyphCoverage; ASCII] {
             std::array::from_fn(|i| {
                 let Some(ch) = u32::try_from(i)
                     .ok()
                     .and_then(|i| char::from_u32(FIRST + i))
                 else {
+                    rasters.push(None);
                     return GlyphCoverage::default();
                 };
                 let key: GlyphKey = match style {
@@ -294,19 +473,26 @@ impl Renderer {
                         let top = i32::try_from(*height).map_or(i32::MIN, |h| {
                             baseline.saturating_sub(h).saturating_sub(*ymin)
                         });
+                        rasters.push(GlyphRaster::placed(bytes, *width, (*xmin, top)));
                         GlyphCoverage::placed(bytes, *width, (*xmin, top))
                     }
-                    GlyphImage::Rgba { .. } => GlyphCoverage::default(),
+                    GlyphImage::Rgba { .. } => {
+                        rasters.push(None);
+                        GlyphCoverage::default()
+                    }
                 }
             })
         };
         let regular = measure(None);
         let bold = measure(Some(StyleBits::BOLD));
-        let ink = std::sync::Arc::new(GlyphInk::from_coverage(
-            regular,
-            bold,
-            matches!(self.text_blending, TextBlending::LinearCorrected),
-        ));
+        let ink = std::sync::Arc::new(
+            GlyphInk::from_coverage(
+                regular,
+                bold,
+                matches!(self.text_blending, TextBlending::LinearCorrected),
+            )
+            .with_rasters(rasters),
+        );
         self.glyph_ink_memo = Some((key, std::sync::Arc::clone(&ink)));
         ink
     }
@@ -380,6 +566,64 @@ mod tests {
             Some([3, 6, 5, 8])
         );
         assert_eq!(ink.cell_box(GlyphInk::OTHER), None);
+    }
+
+    /// A glyph's raster is its inked pixels, trimmed and seated where the raster's top left lies
+    /// in the cell, read back pixel by pixel (none off it); the table answers each glyph's raster
+    /// by its index, none for a glyph it knows only as another, and the rasters reach its
+    /// fingerprint. A raster with no ink has none.
+    #[test]
+    fn a_glyphs_raster_is_its_inked_pixels_where_its_cell_seats_them() {
+        let bytes = [0, 0, 0, 0, 0, 9, 200, 0, 0, 0, 255, 0];
+        let raster = GlyphRaster::placed(&bytes, 4, (2, 5)).expect("ink");
+        assert_eq!((raster.x, raster.y, raster.w, raster.h()), (3, 6, 2, 2));
+        assert_eq!(&*raster.cov, &[9, 200, 0, 255]);
+        assert_eq!(raster.at(3, 6), 9);
+        assert_eq!(raster.at(4, 6), 200);
+        assert_eq!(raster.at(4, 7), 255);
+        assert_eq!(raster.at(2, 6), 0);
+        assert_eq!(raster.at(3, 8), 0);
+        assert_eq!(raster.at(5, 6), 0);
+        assert_eq!(GlyphRaster::placed(&[0; 12], 4, (2, 5)), None);
+        let plain = table(flat(255, 40), false);
+        let mut rasters = vec![None; 2 * ASCII];
+        rasters[usize::from(GlyphInk::index('m', false))] = Some(raster.clone());
+        let seated = plain.clone().with_rasters(rasters);
+        assert_eq!(seated.raster(GlyphInk::index('m', false)), Some(&raster));
+        assert_eq!(seated.raster(GlyphInk::index('n', false)), None);
+        assert_eq!(seated.raster(GlyphInk::OTHER), None);
+        assert_eq!(plain.raster(GlyphInk::index('m', false)), None);
+        assert_ne!(seated.fingerprint(), plain.fingerprint());
+    }
+
+    /// The thin share is the thinnest glyph's: `1 −` the least fullest-pixel coverage, remapped
+    /// as the renderer lays it. A face whose every glyph lays a pixel at full coverage has none,
+    /// and so does one that draws nothing; a blank glyph (the space) is not the thinnest.
+    #[test]
+    fn the_thin_share_is_the_thinnest_glyphs_darkest_pixel() {
+        let (ink, paper) = (0.0164, 1.0);
+        assert_eq!(table(flat(255, 40), false).thin_share(ink, paper), 0.0);
+        assert_eq!(
+            table(GlyphCoverage::default(), true).thin_share(ink, paper),
+            0.0
+        );
+        let mut regular = [flat(255, 40); ASCII];
+        regular[0] = GlyphCoverage::default();
+        regular[usize::from(GlyphInk::index('"', false))] = flat(250, 6);
+        regular[usize::from(GlyphInk::index('_', false))] = flat(240, 12);
+        let raw = GlyphInk::from_coverage(regular, [flat(255, 40); ASCII], false);
+        assert!(
+            (raw.thin_share(ink, paper) - 15.0 / 255.0).abs() < 1e-6,
+            "the `_`'s 240: {}",
+            raw.thin_share(ink, paper)
+        );
+        let remapped = GlyphInk::from_coverage(regular, [flat(255, 40); ASCII], true);
+        let want = 1.0 - crate::correct_alpha(ink, paper, 240.0 / 255.0);
+        assert!((remapped.thin_share(ink, paper) - want).abs() < 1e-6);
+        assert!(
+            remapped.thin_share(ink, paper) < raw.thin_share(ink, paper),
+            "dark ink on paper covers more than its raw coverage"
+        );
     }
 
     /// Printable ASCII reads by its code, bold after regular; anything else as the thinnest

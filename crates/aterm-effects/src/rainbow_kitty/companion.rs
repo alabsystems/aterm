@@ -117,18 +117,20 @@ impl Flight {
     #[inline]
     #[must_use]
     pub fn squint_until(&self) -> Instant {
-        self.land_at
-            .checked_add(FLYING_SQUINT_TAIL_DUR)
-            .unwrap_or(self.land_at)
+        match self.land_at.checked_add(FLYING_SQUINT_TAIL_DUR) {
+            Some(t) => t,
+            None => self.land_at,
+        }
     }
 
     /// The 1-px look-back toward the launch ends here ([`FLYING_LOOKBACK_MS`] after arrival).
     #[inline]
     #[must_use]
     pub fn settled_at(&self) -> Instant {
-        self.land_at
-            .checked_add(FLYING_LOOKBACK_DUR)
-            .unwrap_or(self.land_at)
+        match self.land_at.checked_add(FLYING_LOOKBACK_DUR) {
+            Some(t) => t,
+            None => self.land_at,
+        }
     }
 }
 
@@ -174,7 +176,10 @@ pub fn impulse_for(body: Body, impulse: CompanionImpulse) -> BodyImpulse {
 /// The arrival edge `t₀ + T` (§6.7), derived once so the squash and the perk offer agree.
 #[inline]
 fn arrival(t0: Instant, t_flight: std::time::Duration) -> Instant {
-    t0.checked_add(t_flight).unwrap_or(t0)
+    match t0.checked_add(t_flight) {
+        Some(t) => t,
+        None => t0,
+    }
 }
 
 /// How many m1 heroes this impulse earns (§5.8, §7.2): one for Delight, zero otherwise.
@@ -225,13 +230,13 @@ impl Seat {
     /// The rows a host's layout lifts the body by (`KittyCursorLayout::lift`) for cells `cell_h` px tall: the sky seat's whole rows less the drop that keeps the head off the rows beside its own.
     #[inline]
     #[must_use]
-    pub fn lift(&self, cell_h: u16) -> f32 {
+    pub const fn lift(&self, cell_h: u16) -> f32 {
         let drop = if cell_h == 0 {
             0.0
         } else {
-            self.drop_px as f32 / f32::from(cell_h)
+            self.drop_px as f32 / (cell_h as f32)
         };
-        f32::from(self.lift_rows) - drop
+        (self.lift_rows as f32) - drop
     }
 }
 
@@ -319,17 +324,24 @@ where
     let blank =
         |r: i32| (0..rows).contains(&r) && (first..=last).all(|c| ink(r as u16, c) == Some(false));
     let (top_at_top, bottom_at_bottom) = (row * ch, (row + 1) * ch - h);
-    let moved = [top_at_top, bottom_at_bottom]
-        .into_iter()
-        .map(|y| {
-            if bottom_at_bottom >= top_at_top {
-                seat.y.clamp(top_at_top, bottom_at_bottom)
+    let moved = if bottom_at_bottom >= top_at_top {
+        let y = seat.y.clamp(top_at_top, bottom_at_bottom);
+        (y >= 0 && beside(y).all(blank)).then_some(y)
+    } else {
+        let (first_y, second_y) =
+            if (top_at_top - seat.y).abs() <= (bottom_at_bottom - seat.y).abs() {
+                (top_at_top, bottom_at_bottom)
             } else {
-                y
-            }
-        })
-        .filter(|&y| y >= 0 && beside(y).all(blank))
-        .min_by_key(|&y| (y - seat.y).abs());
+                (bottom_at_bottom, top_at_top)
+            };
+        if first_y >= 0 && beside(first_y).all(blank) {
+            Some(first_y)
+        } else if second_y >= 0 && beside(second_y).all(blank) {
+            Some(second_y)
+        } else {
+            None
+        }
+    };
     if let Some(y) = moved {
         seat.drop_px += y - seat.y;
         seat.y = y;

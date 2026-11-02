@@ -7,6 +7,40 @@ use std::collections::BTreeSet;
 
 use super::accounts::{self, Logins, Me, Point, Roster, State};
 
+/// Fixed explanation safe for projections that omit account-specific findings.
+pub const IDENTITY_MISMATCH_FINDING: &str = "Alternate login identity mismatch";
+
+/// The captured decision cannot classify a different account binding.
+pub const BINDINGS_CHANGED_FINDING: &str = "Account bindings changed; eligibility unknown";
+
+/// Fixed findings from the execution gate, independent of optional account rotation.
+pub const EXECUTION_PREPARED_FINDING: &str = "Account has preparation-only access";
+pub const EXECUTION_ROSTER_UNREAD_FINDING: &str = "Account roster is unreadable";
+pub const EXECUTION_CONTEXT_UNREAD_FINDING: &str = "Account execution context is unconfirmed";
+pub const EXECUTION_RECORDS_UNREAD_FINDING: &str = "Account execution records are unreadable";
+pub const EXECUTION_REFRESH_FINDING: &str = "Awaiting a fresh account execution check";
+pub const EXECUTION_HISTORY_PREFIX: &str = "Previous execution check: ";
+
+#[cfg(test)]
+#[path = "account_progress_ranking_tests.rs"]
+mod ranking_tests;
+
+#[cfg(test)]
+#[path = "account_progress_identity_conformance.rs"]
+mod identity_conformance;
+
+#[cfg(any(test, debug_assertions))]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountProgressRanking",
+        action = "Case",
+        reason = "Native fixture chooses trigger, current preparation or lease authority, and alternate capacity"
+    )
+)]
+#[doc(hidden)]
+pub fn account_progress_ranking_environment() {}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ProgressPhase {
     Unknown,
@@ -61,6 +95,14 @@ impl AccountProgress {
 /// Uses the caller's actual session identity and trigger; it neither runs advice
 /// nor substitutes measured capacity for an unread account. Eligibility stays
 /// unknown when no trigger was judged.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountProgressRanking",
+        action = "Project",
+        project = "aterm_agent::harness::account_progress::ranking_tests::ranking_transition"
+    )
+)]
 pub fn enrich_inventory(
     progress: &mut AccountProgress,
     roster: &Roster,
@@ -70,21 +112,71 @@ pub fn enrich_inventory(
     me: &Me<'_>,
     point: Option<&Point>,
 ) {
+    enrich_inventory_with_identity(progress, roster, state, logins, enrolled, me, point, |_| {
+        true
+    });
+}
+
+/// Add inventory using the same captured identity admission as the caller's decision.
+/// The predicate is asked only about policy-eligible alternatives. A contradiction
+/// excludes a candidate without changing its recorded authentication state.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The existing projection inputs share the decision's captured identity predicate"
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountProgressIdentity",
+        action = "Project",
+        project = "aterm_agent::harness::account_progress::identity_conformance::identity_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountProgressIdentity",
+        action = "Case",
+        reason = "The native fixture chooses captured policy and identity verdicts"
+    )
+)]
+pub fn enrich_inventory_with_identity(
+    progress: &mut AccountProgress,
+    roster: &Roster,
+    state: &State,
+    logins: &Logins,
+    enrolled: &BTreeSet<String>,
+    me: &Me<'_>,
+    point: Option<&Point>,
+    mut identity_matches: impl FnMut(&str) -> bool,
+) {
     progress.known = Some(roster.rows.len());
     let candidates = point.map(|point| {
+        let ranked_at =
+            accounts::effective_ranking_point(roster, state, me, point, progress.observed_at);
         accounts::candidates(
             roster,
             state,
             enrolled,
             me.label(),
-            point,
+            ranked_at.as_ref(),
             progress.observed_at,
         )
     });
+    let identity_rejected: BTreeSet<_> = candidates
+        .as_ref()
+        .into_iter()
+        .flatten()
+        .filter(|(label, result)| result.is_ok() && !identity_matches(label))
+        .map(|(label, _)| label.clone())
+        .collect();
+    if !identity_rejected.is_empty() {
+        progress.details.push(IDENTITY_MISMATCH_FINDING.into());
+    }
     progress.eligible = candidates.as_ref().map(|candidates| {
         candidates
             .iter()
-            .filter(|(_, result)| result.is_ok())
+            .filter(|(label, result)| result.is_ok() && !identity_rejected.contains(label))
             .count()
     });
     // The current account may need sign-in too; evidence is independent of
@@ -99,12 +191,13 @@ pub fn enrich_inventory(
         ) {
             continue;
         }
-        let Some(binding) = logins.get(&row.label) else {
-            continue;
-        };
         let before = progress.details.len();
         let label = &row.label;
-        if let Some(task) = binding.sign_in_task {
+        if state.account(label).auth == accounts::Auth::SignedOut {
+            progress.details.push(format!("{label}: signed out"));
+        }
+        let binding = logins.get(label);
+        if let Some(task) = binding.and_then(|binding| binding.sign_in_task) {
             let action = match task.action {
                 accounts::SignInAction::Browser => "browser sign-in needed",
                 accounts::SignInAction::Login => "CLI sign-in needed",
@@ -114,10 +207,11 @@ pub fn enrich_inventory(
                 .details
                 .push(task.action.next_step(accounts::Cli::Claude, label));
         }
-        if let Some(attempt) = &binding.sign_in_attempt {
+        if let Some(attempt) = binding.and_then(|binding| binding.sign_in_attempt.as_ref()) {
             let outcome = match attempt.outcome {
                 accounts::AttemptOutcome::NoRoute => Some("no usable sign-in route"),
                 accounts::AttemptOutcome::Failed => Some("sign-in route failed"),
+                accounts::AttemptOutcome::Blocked => Some("sign-in route stopped by its page"),
                 accounts::AttemptOutcome::SignedIn => None,
             };
             if let Some(outcome) = outcome {
@@ -142,6 +236,12 @@ pub fn enrich_inventory(
         }
     }
     for (label, result) in candidates.into_iter().flatten() {
+        if identity_rejected.contains(&label) {
+            progress.details.push(format!(
+                "{label}: stored login does not match expected identity"
+            ));
+            continue;
+        }
         if let Err(why) = result {
             progress.details.push(match why {
                 accounts::WhyNot::Me => continue,
@@ -157,11 +257,109 @@ pub fn enrich_inventory(
             });
         }
     }
+    // The other rows' reasons say only why none can take the session; why it may not keep its own
+    // account leads while it waits, as that is why it waits (a turn end's yield,
+    // docs/DESIGN-fluid-swarm-2026-10-28.md F19).
+    if let Some(line) = own_claim_note(roster, state, enrolled, me, progress.observed_at) {
+        if progress.phase == ProgressPhase::Waiting {
+            progress.details.insert(0, line);
+        } else {
+            progress.details.push(line);
+        }
+    }
+}
+
+/// Why this Mac may not keep the session's own account at `now` as its claims stand
+/// ([`State::lease_verdict`]: another Mac's senior live claim, or claims this Mac cannot record
+/// and the account not one of its home accounts), naming the owner's pin where it keeps the
+/// session from moving ([`accounts::begin_rotation`] admits no rotation off a pinned `active` that
+/// still runs); `None` where the claims leave the account to this Mac, and for a preparation-only
+/// account, whose hold the execution gate reports in its own fixed words
+/// ([`EXECUTION_PREPARED_FINDING`]). The cause leads, after the label, as the composer rule shows
+/// only a detail's first 32 columns.
+fn own_claim_note(
+    roster: &Roster,
+    state: &State,
+    enrolled: &BTreeSet<String>,
+    me: &Me<'_>,
+    now: i64,
+) -> Option<String> {
+    let label = me.label()?;
+    let why = match state.lease_verdict(label, now) {
+        Err(accounts::WhyNot::LeasedElsewhere { until }) => format!(
+            "another Mac holds it until {}",
+            super::usage::rfc3339_utc(until)
+        ),
+        Err(accounts::WhyNot::Unclaimed) => "this Mac cannot claim it: it cannot record account \
+                                             claims, and this is not one of its home accounts"
+            .to_owned(),
+        _ => return None,
+    };
+    let pin = state
+        .active
+        .as_deref()
+        .filter(|_| state.pinned)
+        .and_then(|active| roster.row(active))
+        .filter(|row| {
+            let here = enrolled.contains(&row.label);
+            accounts::condition(row, state, here, now).runs()
+        });
+    Some(match pin {
+        Some(row) => format!(
+            "{label}: {why}; the pin on {} keeps the session from moving",
+            row.label
+        ),
+        None => format!("{label}: {why}"),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn known_signed_out_account_is_explained_without_a_sign_in_attempt() {
+        let roster = Roster {
+            rows: vec![accounts::Row {
+                label: "current".into(),
+                ..Default::default()
+            }],
+        };
+        let mut state = State::default();
+        accounts::note_auth(&mut state, "current", accounts::Auth::SignedOut, 90);
+        let mut progress = AccountProgress::unknown(100);
+        progress.phase = ProgressPhase::Waiting;
+        progress
+            .details
+            .push("No eligible alternate account".into());
+        enrich_inventory(
+            &mut progress,
+            &roster,
+            &state,
+            &Logins::default(),
+            &BTreeSet::new(),
+            &Me {
+                account: Some("current"),
+                left: None,
+                default_home: true,
+                stored_login: true,
+            },
+            Some(&Point::Wall {
+                window: "seven_day".into(),
+                at: Some(90),
+            }),
+        );
+        assert_eq!(progress.known, Some(1));
+        assert_eq!(progress.eligible, Some(0));
+        assert_eq!(progress.phase, ProgressPhase::Waiting);
+        assert!(progress.details[0].contains("current: signed out"));
+        for narrow in [false, true] {
+            assert!(
+                super::super::footer::account_progress_text(&progress, narrow)
+                    .contains("current: signed out")
+            );
+        }
+    }
 
     #[test]
     fn current_blocker_leads_only_when_recovery_has_no_eligible_alternate() {
@@ -477,6 +675,127 @@ mod tests {
                 .details
                 .iter()
                 .any(|line| line.starts_with("unlogged:"))
+        );
+    }
+
+    /// A session whose turn end waits because this Mac may not keep its own account
+    /// (`docs/DESIGN-fluid-swarm-2026-10-28.md` F19: claims this Mac cannot record off its home
+    /// accounts, or another Mac's senior claim) says why first on the tab's account fact, ahead of
+    /// the other rows' reasons, and names the owner's pin where that keeps the session from
+    /// moving. Out of a wait the line goes last; with the claims leaving the account to this Mac,
+    /// nothing is said of it, nor of a preparation-only account, whose hold the execution gate
+    /// reports in its own fixed words.
+    ///
+    /// Negative controls, in separate builds: with `own_claim_note`'s line filtered out of
+    /// `enrich_inventory_with_identity`, the first assertion failed with `left: Some("main")`,
+    /// `right: Some("pool-a")`: the walled home row's reason led. With `own_claim_note` saying any
+    /// other refusal of `lease_verdict` in its own words (`Err(other) => other.as_str()`, the arm
+    /// it had before the preparation hold reached `lease_verdict`), the last assertion failed:
+    /// `["pool-a: prepared: awaiting execution authority", "main: limited until
+    /// 2026-09-21T17:15:50Z"]`.
+    #[test]
+    fn a_wait_on_an_account_this_mac_may_not_keep_says_why_first() {
+        const NOW: i64 = 1_790_000_000;
+        let roster = Roster {
+            rows: ["main", "pool-a"]
+                .map(|label| accounts::Row {
+                    label: label.into(),
+                    dir: Some(format!("/synthetic/{label}")),
+                    ..Default::default()
+                })
+                .into(),
+        };
+        let enrolled = BTreeSet::from(["main".to_string(), "pool-a".to_string()]);
+        let me = Me {
+            account: Some("pool-a"),
+            left: None,
+            default_home: true,
+            stored_login: true,
+        };
+        let mut unclaimed = State {
+            machine: "0a0b".into(),
+            active: Some("pool-a".into()),
+            proven: true,
+            unrecorded: true,
+            home_accounts: BTreeSet::from(["main".to_string()]),
+            ..State::default()
+        };
+        let walled = accounts::note_wall(
+            &mut unclaimed,
+            "main",
+            "five_hour",
+            Some(NOW + 3 * 3600),
+            NOW - 60,
+            NOW - 60,
+        );
+        assert!(!walled.is_empty());
+        let read = |state: &State, phase: ProgressPhase| {
+            let mut progress = AccountProgress::unknown(NOW);
+            progress.phase = phase;
+            enrich_inventory(
+                &mut progress,
+                &roster,
+                state,
+                &Logins::default(),
+                &enrolled,
+                &me,
+                Some(&Point::TurnEnd),
+            );
+            progress.details
+        };
+        let label = |line: &String| line.split(':').next().map(str::to_owned);
+        let first = |details: &[String]| details.first().and_then(label);
+
+        let waits = read(&unclaimed, ProgressPhase::Waiting);
+        assert_eq!(first(&waits), Some("pool-a".to_string()));
+        assert!(
+            waits
+                .iter()
+                .skip(1)
+                .any(|line| label(line).as_deref() == Some("main")),
+            "the walled home row's reason follows: {waits:?}"
+        );
+
+        let pinned = State {
+            pinned: true,
+            ..unclaimed.clone()
+        };
+        let held = read(&pinned, ProgressPhase::Waiting);
+        assert!(
+            held[0]
+                .strip_prefix(waits[0].as_str())
+                .is_some_and(|rest| rest.contains("pool-a")),
+            "the pin is named after the cause: {held:?}"
+        );
+
+        let mut senior = unclaimed.clone();
+        senior.unrecorded = false;
+        senior.note_lease("pool-a", "1c1d", NOW + 3600, NOW - 60);
+        let elsewhere = read(&senior, ProgressPhase::Waiting);
+        assert_eq!(first(&elsewhere), Some("pool-a".to_string()));
+        assert!(elsewhere[0].contains(&super::super::usage::rfc3339_utc(NOW + 3600)));
+
+        let ready = read(&unclaimed, ProgressPhase::Ready);
+        assert_ne!(first(&ready), Some("pool-a".to_string()));
+        assert_eq!(ready.last().and_then(label), Some("pool-a".to_string()));
+
+        let mut recorded = unclaimed.clone();
+        recorded.unrecorded = false;
+        assert!(
+            read(&recorded, ProgressPhase::Waiting)
+                .iter()
+                .all(|line| label(line).as_deref() != Some("pool-a")),
+            "claims this Mac records leave its own account unremarked"
+        );
+
+        let mut prepared = unclaimed.clone();
+        prepared.prepared_accounts.insert("pool-a".to_string());
+        let gated = read(&prepared, ProgressPhase::Waiting);
+        assert!(
+            gated
+                .iter()
+                .all(|line| label(line).as_deref() != Some("pool-a")),
+            "a preparation-only account is the execution gate's to report: {gated:?}"
         );
     }
 }

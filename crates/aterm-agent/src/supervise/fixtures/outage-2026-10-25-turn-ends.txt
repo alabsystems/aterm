@@ -1,0 +1,75 @@
+# aterm drive ledgers and `pmset -g log` · MEASURED 2026-10-25, 08:00–19:00 PDT, on the owner's Mac, the lid closed on battery from 08:59:46 (clamshell sleep, then only dark wakes) · the turn ends on a system message of the one session that met one (a Claude Code under the harness, its sid cut to `s-fb6b`), the harness's journal lines at them (main's rule), and the Mac's wakes · SCRUBBED: no account, email, token, prompt or path; the lines are aterm's own words and Claude Code's error row
+# rows: `session <harness> <sid> <turn ends on a system message>`; `dark|full <from> <to>` a span the Mac was awake (pmset DarkWake…Sleep, Wake…Sleep); `reach unknown|down|up <at>` the API as the harness's probe measured it from then on; `person <from> <to>` a person's grace the harness held (main's `a person is typing`); `end <at> user|notice|reread <error row>` a turn end on a system message, the transcript's last entry (`user`: the API never answered the prompt), or the same screen read again; `main <at> <journal line>` what main's harness journaled; `exit <at>` the session's end
+session claude s-fb6b 3
+session claude s-3e3a 0
+session agy s-514b 0
+reach unknown 08:00:00
+reach down 12:15:21
+reach up 16:13:54
+person 16:08:27 16:13:54
+end 12:02:37 user ⏺ API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)
+end 12:11:04 notice ⏺ API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)
+end 16:05:58 reread ⏺ API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)
+main 12:02:37 SKIPPED rule=wall-confirm@v1 unconfirmed wall: api-error — the transcript ends on a user turn: API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)
+main 12:02:37 WAITING the Mac woke: deciding again
+main 12:11:04 WAITING api-error retry 1
+main 12:15:21 WAITING api-error: the API is unreachable; continuing when it is reachable, or at this try
+main 16:08:27 WAITING a person is typing
+main 16:12:35 WAITING a person is typing
+main 16:13:54 CONTINUED rule=api-back@v1 Claude Code reported an API error (the API could not be reached), and the API is reachable again now. Carry on from where you stopped; if the result of your last step is missing, check whether it ran before you repeat it.
+exit 18:20:50
+dark 11:50:13 11:50:18
+dark 12:01:41 12:01:47
+dark 12:02:35 12:02:41
+dark 12:03:30 12:03:35
+dark 12:04:23 12:04:30
+dark 12:05:19 12:05:24
+dark 12:06:13 12:06:18
+dark 12:07:07 12:07:12
+dark 12:08:01 12:08:06
+dark 12:11:04 12:11:11
+dark 12:14:24 12:14:29
+dark 12:15:18 12:15:23
+dark 12:18:23 12:18:28
+dark 12:19:17 12:19:22
+dark 12:22:37 12:22:42
+dark 12:23:31 12:23:36
+dark 12:26:43 12:26:49
+dark 12:27:38 12:27:43
+dark 12:39:51 12:39:56
+dark 12:40:45 12:40:50
+dark 12:41:39 12:41:44
+dark 12:44:52 12:44:58
+dark 12:48:08 12:48:13
+dark 13:02:41 13:02:47
+dark 13:03:36 13:03:41
+dark 13:04:30 13:04:35
+dark 13:05:23 13:05:28
+dark 13:13:01 13:13:06
+dark 13:16:01 13:16:08
+dark 13:19:18 13:19:23
+dark 13:35:06 13:35:08
+dark 13:51:46 13:51:48
+dark 14:03:41 14:03:47
+dark 14:19:10 14:19:12
+dark 14:35:07 14:35:09
+dark 14:52:41 14:52:43
+dark 15:04:41 15:04:47
+dark 15:20:50 15:20:52
+dark 15:36:09 15:36:11
+dark 15:53:02 15:53:04
+dark 15:58:42 15:58:56
+dark 16:05:41 16:06:01
+dark 16:06:03 16:06:08
+full 16:08:19 16:08:50
+dark 16:12:19 16:14:20
+dark 16:18:45 16:18:50
+dark 16:32:14 16:32:21
+dark 16:47:35 16:47:37
+dark 17:05:08 17:05:10
+dark 17:08:45 17:08:51
+dark 17:24:39 17:24:41
+dark 17:39:43 17:39:45
+dark 17:54:51 17:54:53
+dark 18:09:45 18:10:05
+full 18:19:13 19:00:00

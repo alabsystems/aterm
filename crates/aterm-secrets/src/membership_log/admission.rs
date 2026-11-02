@@ -18,9 +18,7 @@
 //! - [`Log::next_label`]: C11's next free `m<N>` from what the log and the swarm roster hold.
 
 use super::entries::OpenedAudienceEntries;
-use super::{
-    Body, Entrant, EpochAudience, Evidence, Log, MemberId, Record, RecordId, eval, is_label,
-};
+use super::{Body, Entrant, EpochAudience, Evidence, Log, MemberId, Record, RecordId, is_label};
 use crate::Result;
 use crate::age::Recipient;
 use aterm_digest::Sha256;
@@ -101,6 +99,32 @@ impl Log {
         audiences: &[EpochAudience],
         authored_ms: u64,
     ) -> Result<Vec<Record>> {
+        self.admit_with(
+            signer,
+            entrant,
+            Evidence::Phrase,
+            opened,
+            audiences,
+            authored_ms,
+        )
+    }
+
+    /// [`Log::admit`] under `evidence`: [`Evidence::Manual`] where no phrase was run, as a
+    /// member's re-admission of a Mac that proved its fleet node key or the fleet's key
+    /// (`client::readmit`). A 0.147 reader takes an `Admit` of any of the three evidences from
+    /// any member, so this signs no record an older Mac refuses.
+    ///
+    /// # Errors
+    /// As [`Log::admit`].
+    pub fn admit_with(
+        &mut self,
+        signer: &Signer<'_>,
+        entrant: Entrant,
+        evidence: Evidence,
+        opened: &OpenedAudienceEntries,
+        audiences: &[EpochAudience],
+        authored_ms: u64,
+    ) -> Result<Vec<Record>> {
         let (epochs, lacking): (Vec<_>, Vec<_>) = Self::admission_epochs(opened, audiences)
             .into_iter()
             .partition(|(_, epoch)| opened.unwrapped_keys.contains_key(epoch));
@@ -120,14 +144,7 @@ impl Log {
         let recipient = entrant.request.binding().recipient();
         let mut signed = Vec::with_capacity(epochs.len() + 1);
         let admit = self
-            .draft(
-                signer.actor,
-                authored_ms,
-                Body::Admit {
-                    entrant,
-                    evidence: Evidence::Phrase,
-                },
-            )
+            .draft(signer.actor, authored_ms, Body::Admit { entrant, evidence })
             .sign(signer.seed, signer.incarnation)?;
         self.insert(admit.clone())?;
         signed.push(admit);
@@ -153,7 +170,7 @@ impl Log {
         opened: &OpenedAudienceEntries,
         audiences: &[EpochAudience],
     ) -> Vec<Gap> {
-        let effective = eval::effective_records(&self.order);
+        let effective = self.effective();
         let membership = self.membership();
         let mut gaps = Vec::new();
         for (audience, epoch) in Self::admission_epochs(opened, audiences) {
@@ -231,7 +248,7 @@ impl Log {
         else {
             return false;
         };
-        entry_at != epoch_at && !eval::effective_records(&self.order).before(entry_at, epoch_at)
+        entry_at != epoch_at && !self.effective().before(entry_at, epoch_at)
     }
 
     /// Where `me` stands among the members that can close `gap`: each effective member that
@@ -290,7 +307,7 @@ impl Log {
             return true;
         };
         let recipient = seat.binding.recipient();
-        let effective = eval::effective_records(&self.order);
+        let effective = self.effective();
         opened
             .maximal_epochs
             .get(audience)
@@ -307,6 +324,7 @@ impl Log {
                     .is_some_and(|&at| entry_at == at || effective.before(entry_at, at));
                 !wrapped && knew
             })
+            || self.audience_left_out_recipient(audience, &recipient)
     }
 
     /// [`Log::left_out`] evaluated directly from the log's effective `Epoch` and `Wrap` records
@@ -321,7 +339,10 @@ impl Log {
             return true;
         };
         let recipient = seat.binding.recipient();
-        let effective = eval::effective_records(&self.order);
+        if self.audience_left_out_recipient(audience, &recipient) {
+            return true;
+        }
+        let effective = self.effective();
         let mut epochs: Vec<(usize, RecordId)> = Vec::new();
         let mut wrapped_epochs: BTreeSet<RecordId> = BTreeSet::new();
         for (i, record) in self.order.iter().enumerate().skip(1) {
@@ -370,9 +391,19 @@ impl Log {
             .members()
             .values()
             .filter(|m| m.binding.recipient() == *recipient)
-            .filter_map(|seat| self.held.get(&seat.entry).copied())
-            .max();
-        let effective = eval::effective_records(&self.order);
+            .filter_map(|seat| {
+                let &at = self.held.get(&seat.entry)?;
+                let is_listed = matches!(
+                    self.order[at].body(),
+                    Body::Admit {
+                        evidence: super::Evidence::Listed,
+                        ..
+                    }
+                );
+                Some((at, is_listed))
+            })
+            .max_by_key(|&(at, is_listed)| (!is_listed, at));
+        let effective = self.effective();
         let mut epochs: Vec<(usize, RecordId)> = Vec::new();
         let mut epoch_ids: BTreeSet<RecordId> = BTreeSet::new();
         let mut wrapped_epochs: BTreeMap<RecordId, usize> = BTreeMap::new();
@@ -395,6 +426,8 @@ impl Log {
                 _ => {}
             }
         }
+        let is_commons_or_everyone =
+            matches!(audience, EpochAudience::Everyone | EpochAudience::Commons);
         let prior_wrap_indices: Vec<usize> = wrapped_epochs
             .iter()
             .filter_map(|(ep, &w_at)| epoch_ids.contains(ep).then_some(w_at))
@@ -410,12 +443,16 @@ impl Log {
                 if wrapped_epochs.contains_key(epoch) {
                     return false;
                 }
-                let knew_entry =
-                    matches!(audience, EpochAudience::Everyone | EpochAudience::Commons)
-                        && entry_at.is_some_and(|e_at| e_at == at || effective.before(e_at, at));
-                let knew_wrap = prior_wrap_indices
-                    .iter()
-                    .any(|&w_at| w_at == at || effective.before(w_at, at));
+                let knew_entry = is_commons_or_everyone
+                    && entry_at.is_some_and(|(e_at, _)| e_at == at || effective.before(e_at, at));
+                let knew_wrap = prior_wrap_indices.iter().any(|&w_at| {
+                    let superseded_by_entry = is_commons_or_everyone
+                        && entry_at.is_some_and(|(e_at, is_listed)| {
+                            effective.before(at, e_at)
+                                || (!is_listed && effective.before(w_at, e_at))
+                        });
+                    !superseded_by_entry && (w_at == at || effective.before(w_at, at))
+                });
                 knew_entry || knew_wrap
             })
     }

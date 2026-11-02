@@ -143,24 +143,29 @@ impl Op {
 
     fn decode(line: &str) -> Option<Op> {
         let f: Vec<&str> = line.split('\t').collect();
-        let s = |i: usize| f.get(i).map(|v| (*v).to_string());
-        let b = |i: usize| f.get(i) == Some(&"1");
-        Some(match *f.first()? {
-            "reach" => Op::Reach(s(1)?, b(2)),
-            "write" => Op::Write(s(1)?, WriteHow::from_word(f.get(2)?)?),
-            "unix" => Op::Unix(s(1)?, b(2)),
-            "udp" => Op::Udp,
-            "serve" => Op::Serve(s(1).filter(|d| !d.is_empty())),
-            "mach" => Op::Mach(s(1)?),
-            "preference-policy" => Op::PreferencePolicy(s(1)?, s(2)?),
+        let b = |v: &str| match v {
+            "1" => Some(true),
+            "0" => Some(false),
+            _ => None,
+        };
+        Some(match f.as_slice() {
+            ["reach", p, r] => Op::Reach((*p).to_string(), b(r)?),
+            ["write", p, h] => Op::Write((*p).to_string(), WriteHow::from_word(h)?),
+            ["unix", p, l] => Op::Unix((*p).to_string(), b(l)?),
+            ["udp"] => Op::Udp,
+            ["serve", d] => Op::Serve((!d.is_empty()).then(|| (*d).to_string())),
+            ["mach", n] => Op::Mach((*n).to_string()),
+            ["preference-policy", scope, n] => {
+                Op::PreferencePolicy((*scope).to_string(), (*n).to_string())
+            }
             #[cfg(test)]
-            "shm-read" => Op::ShmRead(s(1)?),
-            "signal" => Op::Signal(s(1)?),
-            "exec" => Op::Exec(s(1)?, s(2)?),
-            "claude" => Op::Claude(s(1)?),
-            "tiocsti" => Op::Tiocsti,
-            "remove" => Op::Remove(s(1)?, RemoveHow::from_word(f.get(2)?)?),
-            "meta" => Op::Meta(s(1)?, b(2)),
+            ["shm-read", n] => Op::ShmRead((*n).to_string()),
+            ["signal", w] => Op::Signal((*w).to_string()),
+            ["exec", w, s] => Op::Exec((*w).to_string(), (*s).to_string()),
+            ["claude", p] => Op::Claude((*p).to_string()),
+            ["tiocsti"] => Op::Tiocsti,
+            ["remove", p, h] => Op::Remove((*p).to_string(), RemoveHow::from_word(h)?),
+            ["meta", p, l] => Op::Meta((*p).to_string(), b(l)?),
             _ => return None,
         })
     }
@@ -1739,6 +1744,20 @@ mod tests {
         }
         let owned_shm = Op::ShmRead("/apple.cfprefs.owned-fixture".into());
         assert_eq!(Op::decode(&owned_shm.encode()), Some(owned_shm));
+        for malformed in [
+            "",
+            "reach\t/p",
+            "reach\t/p\t2",
+            "reach\t/p\t1\textra",
+            "unix\t/p\ttrue",
+            "meta\t/p\tx",
+            "udp\textra",
+            "tiocsti\textra",
+            "serve",
+            "serve\t/d\textra",
+        ] {
+            assert_eq!(Op::decode(malformed), None, "{malformed:?}");
+        }
     }
 
     #[test]

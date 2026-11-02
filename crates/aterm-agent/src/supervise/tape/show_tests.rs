@@ -136,6 +136,65 @@ fn a_decision_comes_back_with_its_screen_its_act_and_its_line() {
 }
 
 #[test]
+fn typed_attention_and_task_decisions_keep_the_act_and_its_authority() {
+    use crate::harness::contract::Scope;
+    use crate::supervise::tape::{corpus, ctl};
+
+    let cases: [(Scope, u64, &[&str]); 3] = [
+        (
+            Scope::Questions,
+            41,
+            &["@s-1", "meta", "set", "attention", "question"],
+        ),
+        (Scope::TurnEnd, 42, &["@s-1", "meta", "unset", "attention"]),
+        (Scope::TurnEnd, 43, &["@s-1", "task", "mark", "done"]),
+    ];
+    let mut items = Vec::new();
+    let mut expected = Vec::new();
+    for (scope, revision, argv) in cases {
+        let mark = DecideMark {
+            screen: None,
+            seq: revision,
+            generation: None,
+            rule: None,
+            outcome: "recorded action".to_string(),
+            facts: None,
+        };
+        items.push(emit(doors::DECIDE_TURN_END, mark.encode().as_bytes()));
+        for words in [&["@s-1", "status"][..], argv] {
+            items.push(Item::effect(EffectRecord::Exchange {
+                door: doors::CTL_DUTY.to_string(),
+                request: ctl::duty_request(scope, revision, words),
+                reply: ctl::encoded_reply(
+                    doors::CTL_DUTY,
+                    Some(Ok(CtlReply {
+                        code: 0,
+                        stdout: "OK\n".to_string(),
+                        stderr: String::new(),
+                    })),
+                ),
+            }));
+        }
+        let mut words: Vec<String> = argv.iter().map(|word| (*word).to_string()).collect();
+        words.extend([
+            format!("harness-duty={}", scope.word()),
+            format!("if-supervisor-revision={revision}"),
+        ]);
+        expected.push(words);
+    }
+    let tape = open(&written(&items), false).expect("binary typed tape");
+    let decided = decisions(&tape);
+    assert_eq!(decided.len(), expected.len());
+    let rendered = render_decisions(&decided);
+    for (decision, words) in decided.iter().zip(expected) {
+        assert_eq!(decision.act.as_ref(), Some(&words));
+        assert_eq!(decision.reply.as_deref(), Some("0 OK"));
+        assert!(rendered.contains(&words.join(" ")), "{rendered}");
+    }
+    assert_eq!(corpus::census(&tape).acts, 3, "typed reads are not acts");
+}
+
+#[test]
 fn either_form_reads_and_damage_is_refused_unless_salvaged() {
     let items = approval_items();
     let bytes = written(&items);
@@ -258,5 +317,283 @@ fn nothing_a_tape_holds_reaches_the_reader_as_a_control_character() {
     assert!(
         shown_row.contains("│ \\x1b]52;c;cHduZWQ=\\x07hello\\u{009b}2J\\x7f\\u{202e}"),
         "{shown_row}"
+    );
+}
+
+/// A duty act (`ctl.duty`) answered `stdout`, stamped `wall_ms`.
+fn duty_act(words: &[&str], stdout: &str, wall_ms: i64) -> Item {
+    use crate::harness::contract::Scope;
+    use crate::supervise::tape::ctl;
+    Item::stamped(
+        EffectRecord::Exchange {
+            door: doors::CTL_DUTY.to_string(),
+            request: ctl::duty_request(Scope::TurnEnd, 2, words),
+            reply: ctl::encoded_reply(
+                doors::CTL_DUTY,
+                Some(Ok(CtlReply {
+                    code: 0,
+                    stdout: stdout.to_string(),
+                    stderr: String::new(),
+                })),
+            ),
+        },
+        Stamp {
+            mono_ns: 0,
+            wall_ms,
+        },
+    )
+}
+
+/// A read (`ctl`) answered `stdout`, stamped `wall_ms`.
+fn read_at(words: &[&str], stdout: &str, wall_ms: i64) -> Item {
+    Item::stamped(
+        EffectRecord::Exchange {
+            door: doors::CTL.to_string(),
+            request: ctl_request(words),
+            reply: ok(stdout),
+        },
+        Stamp {
+            mono_ns: 0,
+            wall_ms,
+        },
+    )
+}
+
+/// A turn-end decision of `rule` at `seq`.
+fn decided(rule: Option<&str>, seq: u64, outcome: &str) -> Item {
+    let mark = DecideMark {
+        screen: None,
+        seq,
+        generation: None,
+        rule: rule.map(str::to_string),
+        outcome: outcome.to_string(),
+        facts: None,
+    };
+    emit(doors::DECIDE_TURN_END, mark.encode().as_bytes())
+}
+
+/// The words Land's instruction opens with, as a test writes them.
+const LAND_WORDS: &str = "[aterm harness] Autopilot is Land: land ALL of this work into the \
+                          remote main branch, no exceptions.";
+
+/// A screen read (`text --json`) at `wall_ms` whose composer shows `composer`, wrapped at 40
+/// columns as a program draws a long line.
+fn screen_at(composer: &str, seq: u64, wall_ms: i64) -> Item {
+    let mut rows = vec![
+        "⏺ Implemented the parser module.".to_string(),
+        String::new(),
+    ];
+    let chars: Vec<char> = format!("❯ {composer}").chars().collect();
+    rows.extend(chars.chunks(40).map(|c| c.iter().collect::<String>()));
+    let json = format!(
+        "{{\"rows\":[{}],\"seq\":{seq}}}",
+        rows.iter()
+            .map(|r| crate::supervise::journal::json_str(r))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    read_at(&["@s-1", "text", "--json"], &json, wall_ms)
+}
+
+/// THE LOOP'S WRITE IS TIMED APART FROM THE PROGRAM'S DRAW (rv1-l2's land-n, 2026-11-01): the
+/// decision at the point's clock, the `send` 70 ms on, the program drawing nothing for 24.8 s
+/// (a `status` read finding the text unread meanwhile), then aterm's Enter 0.6 s after the read
+/// that showed it. The hold is the write to the last read that did not show the text, and the
+/// `await seq` that then woke on its draw; the `await idle` settle after it is aterm's. An Enter
+/// the host turned away is no Enter, nor a decision that writes nothing, nor a write it turned
+/// away; a later write's reads are its own. Controls by mutation: a hold that counts every wait
+/// (or none), an Enter taken whatever the host answered.
+#[test]
+fn a_write_is_timed_from_its_decision_apart_from_the_programs_draw() {
+    const P: i64 = 1_793_556_697_159;
+    let send = [
+        "@s-1",
+        "send",
+        "if-human=0",
+        "if-gen=0.868",
+        "--",
+        LAND_WORDS,
+    ];
+    let nudge = [
+        "@s-1",
+        "send",
+        "if-human=0",
+        "if-gen=0.1301",
+        "--",
+        "Keep landing.",
+    ];
+    // The generation is bound apart from `key`: on one line the two read to gitleaks'
+    // generic-api-key rule as a key and its value, and the export guard refuses them.
+    let gen_1096 = "if-gen=0.1096";
+    let enter = ["@s-1", "key", gen_1096, "enter"];
+    let items = vec![
+        Item::effect(EffectRecord::Clock(u64::try_from(P).unwrap() * 1_000_000)),
+        screen_at("", 868, P),
+        decided(Some("land@v1"), 868, "Type { rule_id: \"land@v1\" }"),
+        duty_act(&["@s-1", "lease", "acquire"], "OK lease acquired\n", P + 68),
+        duty_act(&send, "OK seq=868\n", P + 70),
+        read_at(
+            &["@s-1", "await", "seq", "868", "timeout", "10000"],
+            "OK timeout\n",
+            P + 10_075,
+        ),
+        read_at(
+            &["@s-1", "status"],
+            "OK sid=4 input=pending input_bytes=565 input_wait_ms=10004 fg_rss_mb=-\n",
+            P + 10_080,
+        ),
+        read_at(
+            &["@s-1", "await", "idle", "600"],
+            "OK idle 868\n",
+            P + 10_700,
+        ),
+        screen_at("", 868, P + 10_710),
+        read_at(
+            &["@s-1", "await", "seq", "868", "timeout", "20000"],
+            "OK seq 1096\n",
+            P + 24_910,
+        ),
+        read_at(
+            &["@s-1", "await", "idle", "600"],
+            "OK idle 1096\n",
+            P + 25_400,
+        ),
+        screen_at(LAND_WORDS, 1096, P + 25_410),
+        read_at(
+            &["@s-1", "status"],
+            "OK sid=4 input=pending input_bytes=1 input_wait_ms=30500 fg_rss_mb=-\n",
+            P + 25_420,
+        ),
+        duty_act(&enter, "OK skipped changed\n", P + 25_430),
+        duty_act(&enter, "OK seq=1097\n", P + 25_460),
+        decided(Some("continue@v1"), 1200, "Type"),
+        duty_act(&nudge, "OK skipped changed\n", P + 30_000),
+        decided(Some("land-nudge@v1"), 1300, "Type"),
+        Item::effect(EffectRecord::Clock(
+            u64::try_from(P + 40_000).unwrap() * 1_000_000,
+        )),
+        decided(Some("land-nudge@v1"), 1301, "Type"),
+        duty_act(&nudge, "OK seq=1301\n", P + 40_050),
+        decided(None, 1301, "WaitUntil"),
+        read_at(
+            &["@s-1", "status"],
+            "OK sid=4 input=pending input_bytes=3 input_wait_ms=900 fg_rss_mb=-\n",
+            P + 41_000,
+        ),
+        screen_at("", 1301, P + 41_500),
+    ];
+    let tape = open(&written(&items), false).expect("reads");
+    let wrote = typed(&tape);
+    assert_eq!(
+        wrote,
+        vec![
+            Typed {
+                rule: Some("land@v1".to_string()),
+                seq: 868,
+                decided_ms: Some(P),
+                sent_ms: P + 70,
+                drawn_ms: Some(P + 25_410),
+                held_ms: Some(10_640 + 14_200),
+                unshown_ms: None,
+                unread: Some(Unread {
+                    at_ms: P + 10_080,
+                    word: "pending".to_string(),
+                    bytes: Some(565),
+                    wait_ms: Some(10_004),
+                }),
+                reaction: Some(false),
+                enter_ms: Some(P + 25_460),
+            },
+            Typed {
+                rule: Some("land-nudge@v1".to_string()),
+                seq: 1301,
+                decided_ms: Some(P + 40_000),
+                sent_ms: P + 40_050,
+                unshown_ms: Some(P + 41_500),
+                unread: Some(Unread {
+                    at_ms: P + 41_000,
+                    word: "pending".to_string(),
+                    bytes: Some(3),
+                    wait_ms: Some(900),
+                }),
+                ..Typed::default()
+            },
+        ]
+    );
+    assert_eq!(
+        wrote[0].aterm_ms(P),
+        Some(620),
+        "the point to the Enter, less the hold"
+    );
+    assert_eq!(wrote[1].aterm_ms(P + 40_000), None, "no Enter taken");
+}
+
+/// A LINE DRAWN PAST THE ECHO'S HANG (rv1-ab3's land-n): the write given up on, a decision that
+/// waits, then the line seen drawn and sent by a later decision of its rule, whose Enter is the
+/// write's. The program's hold runs to the last read that did not show it; a look aterm took late
+/// (here a wait that never woke on the screen) is aterm's, not the program's. An Enter under
+/// another rule's decision is not the write's. Controls by mutation: an Enter taken under any
+/// decision; a hold to the read that showed the line.
+#[test]
+fn a_line_drawn_late_is_the_programs_only_while_aterm_watched_for_it() {
+    const P: i64 = 1_793_600_000_000;
+    let send = [
+        "@s-1",
+        "send",
+        "if-human=0",
+        "if-gen=0.891",
+        "--",
+        LAND_WORDS,
+    ];
+    let enter = ["@s-1", "key", "if-gen=0.1115", "enter"];
+    let items = |submit_rule: &str| {
+        vec![
+            Item::effect(EffectRecord::Clock(u64::try_from(P).unwrap() * 1_000_000)),
+            screen_at("", 891, P),
+            decided(Some("land@v1"), 891, "Type"),
+            duty_act(&send, "OK seq=891\n", P + 4),
+            read_at(
+                &["@s-1", "await", "seq", "891", "timeout", "10000"],
+                "OK timeout\n",
+                P + 10_004,
+            ),
+            read_at(
+                &["@s-1", "status"],
+                "OK sid=4 input=pending input_bytes=565 input_wait_ms=10001 fg_rss_mb=-\n",
+                P + 10_010,
+            ),
+            screen_at("", 891, P + 60_010),
+            decided(None, 891, "WaitUntil"),
+            read_at(
+                &["@s-1", "await", "agent", "891", "timeout", "60000"],
+                "OK agent idle\n",
+                P + 90_000,
+            ),
+            screen_at(LAND_WORDS, 1115, P + 90_010),
+            decided(Some(submit_rule), 1115, "Submit"),
+            duty_act(&enter, "OK seq=1116\n", P + 90_700),
+        ]
+    };
+    let tape = open(&written(&items("land@v1")), false).expect("reads");
+    let wrote = typed(&tape);
+    assert_eq!(wrote.len(), 1, "{wrote:#?}");
+    assert_eq!(wrote[0].drawn_ms, Some(P + 90_010));
+    assert_eq!(
+        wrote[0].held_ms,
+        Some(60_006),
+        "to the last read that did not show it"
+    );
+    assert_eq!(
+        wrote[0].enter_ms,
+        Some(P + 90_700),
+        "the later Submit's Enter"
+    );
+    assert_eq!(wrote[0].reaction, Some(false), "its first look ran out");
+    assert_eq!(wrote[0].aterm_ms(P), Some(90_700 - 60_006));
+    let tape = open(&written(&items("land-check@v1")), false).expect("reads");
+    assert_eq!(
+        typed(&tape)[0].enter_ms,
+        None,
+        "another rule's Enter is not the write's"
     );
 }

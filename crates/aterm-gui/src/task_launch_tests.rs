@@ -120,7 +120,7 @@ fn a_task_is_refused_empty_absent_or_holding_a_nul() {
 
 #[test]
 fn the_task_file_is_the_task_a_blank_line_and_the_fact() {
-    let fact = fact_line("s-ab12", Autopilot::Land, "claude");
+    let fact = fact_line("s-ab12", Autopilot::Land, Program::Claude);
     assert!(!fact.contains('\n'), "one line: {fact}");
     assert!(fact.contains("`s-ab12`"), "names the starter: {fact}");
     assert!(
@@ -131,15 +131,35 @@ fn the_task_file_is_the_task_a_blank_line_and_the_fact() {
         fact.contains("`Nothing left:`"),
         "Land ends on the defense: {fact}"
     );
+    assert!(
+        fact.contains(aterm_primer::LAND_CHECK_ANSWER),
+        "and on the land check's answer, the primer's words: {fact}"
+    );
     assert!(fact.contains("`NEEDS YOU:`"), "a need goes on: {fact}");
     assert!(fact.contains("`spawn agent=claude`"), "{fact}");
-    let muse = fact_line("s-ab12", Autopilot::Land, "muse");
+    let muse = fact_line("s-ab12", Autopilot::Land, Program::Muse);
     assert!(muse.contains("`spawn agent=muse`"), "{muse}");
     assert!(!muse.contains("agent=claude"), "CONTROL: {muse}");
-    let cruise = fact_line("s-ab12", Autopilot::Cruise, "claude");
+    // THE CHECK ONLY WHERE ATERM TYPES IT (the post-landing review, 2026-11-01): codex-alab
+    // lands under its own supervision, and nothing types it aterm's land check.
+    for agent in [Program::Codex, Program::Grok] {
+        let theirs = fact_line("s-ab12", Autopilot::Land, agent);
+        assert!(
+            theirs.contains("`Nothing left:`") && !theirs.contains(aterm_primer::LAND_CHECK_ANSWER),
+            "{agent:?}: no land check promised: {theirs}"
+        );
+    }
+    for agent in [Program::Agy, Program::Muse] {
+        let carried = fact_line("s-ab12", Autopilot::Land, agent);
+        assert!(
+            carried.contains(aterm_primer::LAND_CHECK_ANSWER),
+            "CONTROL: {agent:?}: {carried}"
+        );
+    }
+    let cruise = fact_line("s-ab12", Autopilot::Cruise, Program::Claude);
     assert!(cruise.contains("Autopilot Cruise"), "{cruise}");
     assert!(
-        !cruise.contains("Nothing left:"),
+        !cruise.contains("Nothing left:") && !cruise.contains(aterm_primer::LAND_CHECK_ANSWER),
         "CONTROL: Cruise never ends: {cruise}"
     );
     for fact in [&fact, &cruise] {
@@ -150,7 +170,11 @@ fn the_task_file_is_the_task_a_blank_line_and_the_fact() {
     }
     assert_eq!(
         task_text(b"do it", Some("ctl"), Autopilot::Land, Program::Muse),
-        format!("do it\n\n{}\n", fact_line("ctl", Autopilot::Land, "muse")).into_bytes()
+        format!(
+            "do it\n\n{}\n",
+            fact_line("ctl", Autopilot::Land, Program::Muse)
+        )
+        .into_bytes()
     );
     assert_eq!(
         task_text(
@@ -161,7 +185,7 @@ fn the_task_file_is_the_task_a_blank_line_and_the_fact() {
         ),
         format!(
             "two\nlines\n\n{}\n",
-            fact_line("ctl", Autopilot::Cruise, "claude")
+            fact_line("ctl", Autopilot::Cruise, Program::Claude)
         )
         .into_bytes()
     );
@@ -224,11 +248,14 @@ fn an_agy_workers_first_prompt_holds_no_blank_line() {
     let folded = "First paragraph.\nSecond paragraph,\nits second line.\n";
     assert_eq!(
         text(task.as_bytes(), Some("s-ab12"), Program::Agy),
-        format!("{folded}{}\n", fact_line("s-ab12", Autopilot::Land, "agy"))
+        format!(
+            "{folded}{}\n",
+            fact_line("s-ab12", Autopilot::Land, Program::Agy)
+        )
     );
     assert_eq!(text(task.as_bytes(), None, Program::Agy), folded);
     for agent in [Program::Claude, Program::Codex, Program::Muse] {
-        let fact = fact_line("s-ab12", Autopilot::Land, agent.name());
+        let fact = fact_line("s-ab12", Autopilot::Land, agent);
         assert_eq!(
             text(task.as_bytes(), Some("s-ab12"), agent),
             format!("{task}\n{fact}\n"),
@@ -256,19 +283,23 @@ fn an_agy_workers_first_prompt_holds_no_blank_line() {
     );
     assert!(needs_you(&misread).is_empty(), "{misread}");
     let task = b"FOREVERLAB-WORKER. write the parser for this repository and land it";
-    let old = format!(
-        "{}\n\n{}",
-        std::str::from_utf8(task).expect("utf-8"),
-        fact_line("s-146719f2750f4a8f6909", Autopilot::Land, "agy")
-    );
     let drawn: Vec<&str> = first[user..user + 5]
         .iter()
         .map(|r| r.trim_start_matches('>').trim())
         .filter(|r| !r.is_empty())
         .collect();
-    assert_eq!(
-        drawn.join(" "),
-        old.split_whitespace().collect::<Vec<_>>().join(" ")
+    let drawn = drawn.join(" ");
+    // The screen was measured before the fact line named the land check (slice 13a): it drew the
+    // task, then that older line, which opens as today's does.
+    let fact = fact_line("s-146719f2750f4a8f6909", Autopilot::Land, Program::Agy);
+    let mode = "under Autopilot Land:";
+    let opens = &fact[..fact.find(mode).expect("the mode") + mode.len()];
+    assert!(
+        drawn.starts_with(&format!(
+            "{} {opens}",
+            std::str::from_utf8(task).expect("utf-8")
+        )),
+        "{drawn}"
     );
     let now = text(task, Some("s-146719f2750f4a8f6909"), Program::Agy);
     assert!(!now.contains("\n\n"), "{now}");
@@ -277,15 +308,7 @@ fn an_agy_workers_first_prompt_holds_no_blank_line() {
     one.remove(user + 1);
     assert_eq!(said_tail(&one).as_deref(), Some(reply));
     assert!(needs_you(reply).is_empty());
-    assert_eq!(
-        turn_opened_by(&one).as_deref(),
-        Some(
-            now.split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-                .as_str()
-        )
-    );
+    assert_eq!(turn_opened_by(&one).as_deref(), Some(drawn.as_str()));
 }
 
 #[test]
@@ -733,6 +756,13 @@ fn a_pooled_worker_runs_on_its_rows_login_alone() {
         var: "GROK_AUTH_PATH",
         value: Some("/g/work/auth.json".to_string()),
     };
+    // The row's socket in a grok home, joined as the host joins a path.
+    let socket_in = |grok_home: &Path| {
+        grok_home
+            .join("leader-work-9ca20914.sock")
+            .display()
+            .to_string()
+    };
     let onto = pool_onto(grok(&[]), Cli::Grok, &work, home).expect("grok row");
     assert_eq!(
         onto.args,
@@ -740,7 +770,7 @@ fn a_pooled_worker_runs_on_its_rows_login_alone() {
             "-m",
             "grok-4",
             "--leader-socket",
-            "/Users//u/.grok/leader-work-9ca20914.sock"
+            socket_in(&home.join(".grok")).as_str()
         ]))
     );
     assert_eq!(onto.unset, ["GROK_AUTH", "GROK_LEADER_SOCKET"]);
@@ -751,15 +781,21 @@ fn a_pooled_worker_runs_on_its_rows_login_alone() {
             "/g/work/auth.json".to_string()
         )]
     );
-    let carried = pool_onto(grok(&[("GROK_HOME", "/g/home")]), Cli::Grok, &work, home)
-        .expect("grok row in its starter's home");
+    let grok_home = crate::test_host::abs("/g/home");
+    let carried = pool_onto(
+        grok(&[("GROK_HOME", grok_home.as_str())]),
+        Cli::Grok,
+        &work,
+        home,
+    )
+    .expect("grok row in its starter's home");
     assert_eq!(
         carried.args,
         Ok(words(&[
             "-m",
             "grok-4",
             "--leader-socket",
-            "/g/home/leader-work-9ca20914.sock"
+            socket_in(Path::new(&grok_home)).as_str()
         ]))
     );
 
@@ -1082,7 +1118,10 @@ fn a_spawn_installs_no_agent_where_a_person_said_no_to_installs() {
     }
 
     let foreign = d.path().join("elsewhere");
-    let prefix = format!("[packages]\nprefix = \"{}\"\n", foreign.display());
+    let prefix = format!(
+        "[packages]\nprefix = {}\n",
+        crate::test_host::toml(&foreign)
+    );
     let excluded = format!("[packages]\nexclude = [\"{program}\"]\n");
     for (case, cfg, declined, words) in [
         (
@@ -1112,6 +1151,36 @@ fn a_spawn_installs_no_agent_where_a_person_said_no_to_installs() {
     }
 }
 
+#[test]
+fn a_spawn_installs_nothing_when_removal_evidence_is_unreadable() {
+    use aterm_agent::harness::worker::Readiness;
+    let cli = aterm_agent::harness::worker::worker_cli(Program::Claude).unwrap();
+    let program = cli.atpkg_program().unwrap();
+    let d = aterm_tempfile::Builder::new()
+        .prefix("aterm-spawn-removals")
+        .tempdir()
+        .unwrap();
+    let layout = atpkg::store::Layout {
+        prefix: d.path().join("pkg"),
+    };
+    std::fs::create_dir(&layout.prefix).unwrap();
+    std::fs::write(layout.removed(), [0xff]).unwrap();
+    let store = ConsentStore {
+        cfg: Default::default(),
+        layout: &layout,
+        installs: std::cell::Cell::new(0),
+    };
+    let admitted = admit_worker(cli, cli.plain(), None, &|_| {}, &|| (), &store).unwrap();
+    assert_ne!(admitted.readiness(), &Readiness::Installed);
+    assert!(
+        admitted
+            .kept_off()
+            .is_some_and(|why| why.contains("removal decisions are unreadable"))
+    );
+    assert_eq!(store.installs.get(), 0);
+    assert!(!store.present(program));
+}
+
 /// A LAUNCHER'S INSTALLING MARK LIVES ON ITS SESSION'S TIMELINE WHILE IT STANDS, AND GOES WHEN
 /// IT DROPS: the startup deadline reads it to leave an install unjudged.
 #[test]
@@ -1124,6 +1193,123 @@ fn an_installing_mark_stands_on_the_timeline_while_it_lives() {
         assert!(installing());
     }
     assert!(!installing(), "dropped with its install");
+}
+
+/// A CLAUDE CODE WORKER SPAWNED FROM A WALLED TAB starts on the row a wall would move it to: the
+/// starter on the default login (`main`, walled) gets `work`'s login seam; a fresh starter's row,
+/// `[harness] accounts = "off"`, and a starter on a home of its own keep the starter as it is.
+/// The configured mode reaches the pick: a low `main` moves its worker under the default
+/// `"early"` and keeps it under `"wall"` (`accounts::worker_row`'s own test holds the pin, the
+/// canary and the bound). NEGATIVE CONTROL: before, every Claude Code worker kept its starter's
+/// login, so a worker of a Limited tab started on the same wall; and the pick that read no mode
+/// moved a low tab's worker under `"wall"` too.
+#[test]
+fn a_claude_worker_of_a_walled_tab_starts_on_the_row_a_wall_moves_to() {
+    use aterm_agent::harness::accounts::{self, Cli};
+    use aterm_agent::harness::accounts_pool::Seat;
+    use aterm_agent::harness::worker::Starter;
+
+    const NOW: i64 = 1_792_700_000;
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().canonicalize().expect("canonical");
+    let (cfg, state, home) = (root.join("cfg"), root.join("state"), root.join("home"));
+    for dir in [&cfg, &state, &home] {
+        std::fs::create_dir_all(dir).expect("dir");
+    }
+    let work = root.join("logins/claude/work");
+    std::fs::create_dir_all(&work).expect("login dir");
+    std::fs::write(work.join(".claude.json"), "{}").expect("login");
+    std::fs::write(
+        cfg.join(accounts::ACCOUNTS_FILE),
+        format!(
+            "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n\
+             [[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = \"{}\"\n",
+            work.display()
+        ),
+    )
+    .expect("roster");
+    let seat = Seat {
+        config_dir: &cfg,
+        state: &state,
+        home: &home,
+        now: NOW,
+    };
+    let starter_on = |pairs: &[(&str, &str)]| Starter {
+        exe: PathBuf::from("/opt/claude"),
+        env: pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect(),
+        args: Ok(Vec::new()),
+        unset: Vec::new(),
+    };
+    let plain = starter_on(&[]);
+    assert_eq!(
+        super::claude_starter_in(plain.clone(), &seat, 1),
+        plain,
+        "CONTROL: a fresh row keeps the starter's login"
+    );
+
+    let mut note = None;
+    seat.store(Cli::Claude)
+        .transact_within(&accounts::LOCK_LADDER, NOW, &mut note, |s| {
+            Ok(accounts::note_wall(
+                s,
+                "main",
+                "five_hour",
+                Some(NOW + 3600),
+                NOW,
+                NOW,
+            ))
+        })
+        .expect("wall main");
+    let var = Cli::Claude.accounts().seam.var();
+    let moved = super::claude_starter_in(plain.clone(), &seat, 2);
+    assert_eq!(
+        moved.env,
+        vec![(var.to_string(), work.display().to_string())],
+        "the walled default login's worker starts on `work`"
+    );
+
+    let custom = starter_on(&[("CLAUDE_CONFIG_DIR", "/elsewhere/.claude")]);
+    assert_eq!(
+        super::claude_starter_in(custom.clone(), &seat, 3),
+        custom,
+        "a home of its own is left alone"
+    );
+    seat.store(Cli::Claude)
+        .transact_within(&accounts::LOCK_LADDER, NOW, &mut note, |s| {
+            s.accounts.remove("main");
+            Ok(accounts::note_sample(
+                s,
+                "main",
+                accounts::Sample {
+                    session_pct: Some(95),
+                    session_reset: Some(NOW + 3 * 3600),
+                    at: NOW - 60,
+                    ..accounts::Sample::default()
+                },
+                NOW,
+            ))
+        })
+        .expect("main low");
+    assert_eq!(
+        super::claude_starter_in(plain.clone(), &seat, 5).env,
+        vec![(var.to_string(), work.display().to_string())],
+        "\"early\" leaves a low row ahead of its wall"
+    );
+    std::fs::write(cfg.join("aterm.toml"), "[harness]\naccounts = \"wall\"\n").expect("cfg");
+    assert_eq!(
+        super::claude_starter_in(plain.clone(), &seat, 6),
+        plain,
+        "under \"wall\" a row that still runs keeps its worker"
+    );
+    std::fs::write(cfg.join("aterm.toml"), "[harness]\naccounts = \"off\"\n").expect("cfg");
+    assert_eq!(
+        super::claude_starter_in(plain.clone(), &seat, 4),
+        plain,
+        "`[harness] accounts = \"off\"` keeps it"
+    );
 }
 
 #[test]
@@ -1151,10 +1337,10 @@ fn pooled_starter_rotates_children_of_a_pooled_manager_and_preserves_custom_home
         cfg.join("accounts-codex.toml"),
         format!(
             "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n\
-             [[account]]\nlabel = \"codex-1\"\nclass = \"dedicated\"\ndir = \"{}\"\n\n\
-             [[account]]\nlabel = \"codex-2\"\nclass = \"dedicated\"\ndir = \"{}\"\n",
-            c1.display(),
-            c2.display()
+             [[account]]\nlabel = \"codex-1\"\nclass = \"dedicated\"\ndir = {}\n\n\
+             [[account]]\nlabel = \"codex-2\"\nclass = \"dedicated\"\ndir = {}\n",
+            crate::test_host::toml(&c1),
+            crate::test_host::toml(&c2)
         ),
     )
     .expect("roster");
@@ -1372,8 +1558,8 @@ fn a_codex_row_of_its_own_is_refused_on_a_program_that_ignores_codex_auth_path()
         cfg.join("accounts-codex.toml"),
         format!(
             "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n\
-             [[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = \"{}\"\n",
-            work.display()
+             [[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = {}\n",
+            crate::test_host::toml(&work)
         ),
     )
     .expect("roster");
@@ -1496,8 +1682,8 @@ fn a_carried_codex_row_under_rotation_off_is_told_a_way_back_that_works_there() 
         cfg.join("accounts-codex.toml"),
         format!(
             "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n\
-             [[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = \"{}\"\n",
-            work.display()
+             [[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = {}\n",
+            crate::test_host::toml(&work)
         ),
     )
     .expect("roster");
@@ -1594,7 +1780,7 @@ fn a_carried_codex_row_under_rotation_off_is_told_a_way_back_that_works_there() 
             Ok(Vec::new())
         })
         .expect("pin `work`");
-    assert!(seat.keyring_held(Cli::Codex) && seat.mode() == accounts::Mode::Off);
+    assert!(seat.keyring_held(Cli::Codex) && seat.mode_for(Cli::Codex) == accounts::Mode::Off);
     let work_auth = work.join("auth.json").display().to_string();
     let pinned = super::pooled_starter_in(
         on(vec![(AUTH_PATH_ENV.to_string(), work_auth)]),
@@ -1661,8 +1847,8 @@ impl CodexPool {
             cfg.join("accounts-codex.toml"),
             format!(
                 "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n\
-                 [[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = \"{}\"\n",
-                work.display()
+                 [[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = {}\n",
+                crate::test_host::toml(&work)
             ),
         )
         .expect("roster");
@@ -2158,4 +2344,121 @@ fn a_held_pooled_launch_starts_once_a_row_frees_partway_through_its_hold() {
         "started at {started}: the row served from {freed}, the wall ends at {until}"
     );
     assert_eq!(tries.get(), 2, "tried at the refusal and once a row served");
+}
+
+#[test]
+fn an_agy_worker_launch_is_held_while_every_model_pool_is_spent_and_starts_on_refill() {
+    use aterm_agent::harness::agy_quota::{Pick, Rotation, Standing};
+    use aterm_agent::harness::agy_quota_store::{Source, Store, launch_opening, rotate_launch};
+    use std::cell::Cell;
+
+    struct AgyClockSource<'a> {
+        clock: &'a Cell<i64>,
+        until: i64,
+        reads: Cell<u32>,
+    }
+
+    impl Source for AgyClockSource<'_> {
+        fn read(&self) -> Result<String, String> {
+            self.reads.set(self.reads.get() + 1);
+            let third_5h = if self.clock.get() >= self.until {
+                1.0
+            } else {
+                0.0
+            };
+            Ok(format!(
+                r#"{{"status":"SUCCESS","command":{{"name":"usage","data":{{"groups":[{{"name":"Gemini Models","description":"Models within this group: Gemini Flash, Gemini Pro","buckets":[{{"id":"gemini-weekly","window":"weekly","remaining_fraction":0,"reset_time":"2026-10-28T00:19:03Z"}}]}},{{"name":"Claude and GPT models","description":"Models within this group: Claude Opus, Claude Sonnet, GPT-OSS","buckets":[{{"id":"3p-weekly","window":"weekly","remaining_fraction":0.8,"reset_time":"2026-10-31T00:49:13Z"}},{{"id":"3p-5h","window":"5h","remaining_fraction":{third_5h},"reset_time":"2026-10-24T05:49:13Z"}}]}}]}}}}}}"#
+            ))
+        }
+
+        fn default_model(&self) -> Result<String, String> {
+            Ok("gemini-4-argon-high".to_owned())
+        }
+    }
+
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    let store = Store::new(tmp.path(), "home");
+    let rotation = Rotation::default();
+    let until = aterm_types::rfc3339::parse_utc_fractional("2026-10-24T05:49:13Z").expect("reset");
+    let start = until - 2_400;
+    let clock = Cell::new(start);
+    let source = AgyClockSource {
+        clock: &clock,
+        until,
+        reads: Cell::new(0),
+    };
+    let looks = RefCell::new(Vec::new());
+    let got = agy_pick_attempts(
+        |now| rotate_launch(None, &store, &source, &rotation, now).map(|l| l.pick),
+        |now| launch_opening(None, &store, &rotation, now),
+        || Some(clock.get()),
+        |wait| hold_one_look(wait, until, &clock, &looks),
+    )
+    .expect("the launch starts once the 5h Claude/GPT bucket refills");
+    assert_eq!(
+        got,
+        Some(Pick::Rotate {
+            from: "gemini-4-argon-high".to_owned(),
+            from_standing: Standing::Spent,
+            to: "claude-opus-5-5-medium".to_owned(),
+            to_standing: Standing::Open,
+        })
+    );
+    assert_eq!(clock.get(), until);
+    assert_eq!(
+        source.reads.get(),
+        2,
+        "agy is read once at the refusal and once when the hold reaches `until`"
+    );
+
+    // A refill whose server reading lags at `until` holds through `until + RESET_SETTLE_S` and
+    // starts once the settled read sees the refilled bucket.
+    let lag_store = Store::new(tmp.path(), "lag");
+    let settled = until + aterm_agent::harness::agy_quota_store::RESET_SETTLE_S;
+    clock.set(start);
+    let lag_source = AgyClockSource {
+        clock: &clock,
+        until: settled,
+        reads: Cell::new(0),
+    };
+    let got_lag = agy_pick_attempts(
+        |now| rotate_launch(None, &lag_store, &lag_source, &rotation, now).map(|l| l.pick),
+        |now| launch_opening(None, &lag_store, &rotation, now),
+        || Some(clock.get()),
+        |wait| {
+            let target = if clock.get() < until { until } else { settled };
+            hold_one_look(wait, target, &clock, &looks)
+        },
+    )
+    .expect("the launch holds across RESET_SETTLE_S and starts once settled");
+    assert_eq!(
+        got_lag
+            .and_then(|p| p.model().map(str::to_owned))
+            .as_deref(),
+        Some("claude-opus-5-5-medium")
+    );
+    assert_eq!(clock.get(), settled);
+    assert_eq!(lag_source.reads.get(), 3);
+
+    // CONTROL: a wait with no refill timestamp retries and stalls.
+    let tries = Cell::new(0);
+    let stalled = agy_pick_attempts(
+        |_| {
+            tries.set(tries.get() + 1);
+            Some(Pick::Wait {
+                model: "gemini-4-argon-high".to_owned(),
+                until: None,
+            })
+        },
+        |_| None,
+        || Some(start),
+        |wait| matches!(wait, PoolWait::Retry(_)),
+    );
+    assert!(
+        stalled
+            .as_ref()
+            .is_err_and(|e| e.contains("waits: every candidate's pool is spent")),
+        "{stalled:?}"
+    );
+    assert_eq!(tries.get(), 1 + POOL_RETRIES);
 }

@@ -79,8 +79,10 @@ type MemberIndex = BTreeMap<(String, String), PathBuf>;
 fn workspace_members(root: &Path) -> &'static MemberIndex {
     static MEMBERS: OnceLock<Mutex<BTreeMap<PathBuf, &'static MemberIndex>>> = OnceLock::new();
     let cache = MEMBERS.get_or_init(|| Mutex::new(BTreeMap::new()));
-    if let Ok(map) = cache.lock()
-        && let Some(hit) = map.get(root)
+    if let Some(hit) = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(root)
     {
         return hit;
     }
@@ -113,9 +115,10 @@ fn workspace_members(root: &Path) -> &'static MemberIndex {
         }
     }
     let leaked: &'static MemberIndex = Box::leak(Box::new(found));
-    if let Ok(mut map) = cache.lock() {
-        map.insert(root.to_path_buf(), leaked);
-    }
+    cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(root.to_path_buf(), leaked);
     leaked
 }
 
@@ -230,15 +233,19 @@ fn cached_facts(root: &Path, id: &PkgId, printed: Option<&Path>) -> PkgFacts {
     static CACHE: OnceLock<Mutex<BTreeMap<(PathBuf, PkgId), PkgFacts>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
     let key = (root.to_path_buf(), id.clone());
-    if let Ok(map) = cache.lock()
-        && let Some(hit) = map.get(&key)
+    if let Some(hit) = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+        .cloned()
     {
-        return hit.clone();
+        return hit;
     }
     let fresh = measure(root, id, printed);
-    if let Ok(mut map) = cache.lock() {
-        map.insert(key, fresh.clone());
-    }
+    cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key, fresh.clone());
     fresh
 }
 
@@ -284,7 +291,7 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
                 continue;
             }
             collect_rs(&path, out);
-        } else if path.extension().is_some_and(|e| e == "rs") {
+        } else if kind.is_file() && path.extension().is_some_and(|e| e == "rs") {
             out.push(path);
         }
     }
@@ -450,5 +457,18 @@ mod tests {
             PkgId::new("chacha20poly1305", "0.10.1"),
             "registry/chacha20poly1305-0.10.1"
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_rs_ignores_symlinked_rs_files() {
+        let tmp = aterm_tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::write(root.join("real.rs"), "pub fn ok() {}\n").expect("real.rs");
+        std::os::unix::fs::symlink(root.join("missing.rs"), root.join("dangling.rs"))
+            .expect("symlink");
+        let mut out = Vec::new();
+        collect_rs(root, &mut out);
+        assert_eq!(out, vec![root.join("real.rs")]);
     }
 }

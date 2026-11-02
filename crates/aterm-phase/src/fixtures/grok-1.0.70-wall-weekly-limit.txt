@@ -1,0 +1,50 @@
+# grok 1.0.70 · MEASURED 2026-10-29, `aterm ctl text` of a private headless aterm (144x50, aterm 0.146.0) running the real Grok Build, launched by path in the lab's jail with a scratch `HOME` and `GROK_HOME`, the lab's `XAI_API_KEY` and `GROK_XAI_API_BASE_URL`/`GROK_CLI_CHAT_PROXY_BASE_URL=http://127.0.0.1:<port>/v1` (a local stub of xAI's API, crates/aterm-lab) · the turn answered 402 `{"code": "insufficient_quota", "error": "lab stub: out of credits"}` (a custom stub mode; `insufficient_quota` and `status 402` are strings the binary carries): no retry (one request), and in the composer's place the weekly-limit upsell drawn as a question card: `You hit your weekly limit.`, `1 (○) Upgrade tier      Upgrade to a higher tier for more usage`, `2 (○) Buy more credits  Purchase credits to keep using Grok Build`, `3 (○) Try Again         Resubmit the last prompt once you have usage again`, `↑/↓ navigate · y copy` with `Enter:submit`, the key row `Tab:next answer  │  Esc:scrollback  │  Shift+x:dismiss` · cursor=48,56 (hidden) · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+  /p/t/at.lab0/proj                                                                                                   14K / 256K │ [Dashboard]
+
+
+     ❯ spend credits                                                                                                                 2:05 PM
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+
+  ┃
+  ┃  You hit your weekly limit.
+  ┃
+  ┃
+  ┃  1 (○) Upgrade tier      Upgrade to a higher tier for more usage
+  ┃  2 (○) Buy more credits  Purchase credits to keep using Grok Build
+  ┃  3 (○) Try Again         Resubmit the last prompt once you have usage again
+  ┃
+  ┃  ↑/↓ navigate · y copy                                                                                                    Enter:submit
+  ┃
+
+  Tab:next answer  │  Esc:scrollback  │  Shift+x:dismiss

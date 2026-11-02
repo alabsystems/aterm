@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::macos_doctor::accounts_visibility_tests::{Account, system};
-use aterm_machines::init::{Held, Records, converge_workstation_for_test};
+use aterm_machines::init::{Held, Records, Unheld, converge_workstation_for_test};
 use aterm_machines::items::{Ctx, Item};
 use aterm_machines::model::{ItemReport, Outcome, Probe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -56,9 +56,13 @@ struct InitAt {
 }
 
 impl Records for InitAt {
-    fn hold(&self, whole: bool, wait: &dyn Fn(&str)) -> Result<Box<dyn Held>, String> {
-        self.whole.lock().unwrap().push(whole);
-        Ok(Box::new(init_hold_at(&self.root, whole, wait)?))
+    fn hold(
+        &self,
+        pass: aterm_machines::init::Pass,
+        wait: Option<&dyn Fn(&str)>,
+    ) -> Result<Box<dyn Held>, Unheld> {
+        self.whole.lock().unwrap().push(pass.whole());
+        Ok(Box::new(init_hold_at(&self.root, pass, false, wait)?))
     }
 }
 

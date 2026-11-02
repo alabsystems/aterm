@@ -85,7 +85,7 @@ impl<R: Read> Bits<R> {
 
     /// Move what is left to the front of the buffer and read once more into it.
     fn refill(&mut self) -> Step<()> {
-        self.base += self.pos as u64;
+        self.base = self.base.saturating_add(self.pos as u64);
         self.buf.copy_within(self.pos..self.len, 0);
         self.len -= self.pos;
         self.pos = 0;
@@ -107,7 +107,10 @@ impl<R: Read> Bits<R> {
 
     /// How many bits of the input have been consumed.
     pub(crate) fn position(&self) -> u64 {
-        (self.base + self.pos as u64) * 8 - u64::from(self.nbits)
+        self.base
+            .saturating_add(self.pos as u64)
+            .saturating_mul(8)
+            .saturating_sub(u64::from(self.nbits))
     }
 
     /// Take at least `n` bits (`n <= 24`) when the input has them.

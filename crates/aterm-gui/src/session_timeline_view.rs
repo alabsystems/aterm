@@ -343,7 +343,7 @@ fn project_mark(r: &Rec) -> Option<(&'static str, String)> {
         Kind::Meta => (
             crate::session_timeline::META_CHANGE,
             format!(
-                "field={} value={}{}",
+                "field={} value={}{}{}",
                 text(f, Key::Field),
                 f.get_str(Key::Value)
                     .or_else(|| f.get_str(Key::AttnText))
@@ -351,7 +351,9 @@ fn project_mark(r: &Rec) -> Option<(&'static str, String)> {
                 match f.get(Key::LandAt) {
                     Some(Val::I(s)) => format!(" land_at={s}"),
                     _ => String::new(),
-                }
+                },
+                f.get_str(Key::Why)
+                    .map_or_else(String::new, |why| format!(" why={why}"))
             ),
         ),
         // Only a self-claim's act (`SessionLog::self_claim_act`, the one writer of

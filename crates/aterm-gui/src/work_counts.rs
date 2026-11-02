@@ -22,6 +22,8 @@ thread_local! {
     static ON_SCREEN_ASKS: Cell<usize> = const { Cell::new(0) };
     static END_RESTAMPS: Cell<usize> = const { Cell::new(0) };
     static TIMER_RESOLVES: Cell<usize> = const { Cell::new(0) };
+    static ACCOUNT_STORE_READS: Cell<usize> = const { Cell::new(0) };
+    static OUTLOOK_FILE_LOOKS: Cell<usize> = const { Cell::new(0) };
 }
 
 fn bump(counter: &'static std::thread::LocalKey<Cell<usize>>) {
@@ -30,6 +32,24 @@ fn bump(counter: &'static std::thread::LocalKey<Cell<usize>>) {
 
 fn take(counter: &'static std::thread::LocalKey<Cell<usize>>) -> usize {
     counter.with(|c| c.replace(0))
+}
+
+/// The accounts store read for the outlook's snapshot (`accounts_outlook::read_held`), on
+/// this thread.
+pub(crate) fn account_store_read() {
+    bump(&ACCOUNT_STORE_READS);
+}
+pub(crate) fn take_account_store_reads() -> usize {
+    take(&ACCOUNT_STORE_READS)
+}
+
+/// A file the outlook's memo looked at on this thread: a `stat` of the store, the logins or a
+/// series, or a series' read (`accounts_outlook`).
+pub(crate) fn outlook_file_look() {
+    bump(&OUTLOOK_FILE_LOOKS);
+}
+pub(crate) fn take_outlook_file_looks() -> usize {
+    take(&OUTLOOK_FILE_LOOKS)
 }
 
 pub(crate) fn plan_built() {
@@ -569,7 +589,6 @@ pub(crate) fn take_mode_row_reads() -> usize {
 pub(crate) fn footer_wake_armed() {
     bump(&FOOTER_WAKES_ARMED);
 }
-#[cfg(unix)]
 pub(crate) fn take_footer_wakes_armed() -> usize {
     take(&FOOTER_WAKES_ARMED)
 }

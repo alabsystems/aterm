@@ -27,6 +27,13 @@
 //! journal this build wrote reads the same, record for record, to a build of the journal before
 //! it, whose parse of a body is strict (aterm-link B05 review). A tail this build cannot read
 //! is no head: the record reads without one, and is not read back before it is published again.
+//!
+//! ONE CODEC, MORE THAN ONE JOURNAL: what a fact's record is ([`Record`]) and what a run of them
+//! says ([`Replay`]) are the only things a journal of its own supplies; the framing, the read
+//! and its ends, and the salvage past damage are this module's ([`encode`], [`read_as`],
+//! [`salvage_as`]). The asks journal ([`super::asks`]) is the other one: a file of its own,
+//! because a build of this journal reads [`FILE`] strictly and ends at a record it does not
+//! know as a fault ([`read`]).
 
 use std::collections::BTreeMap;
 use std::io;
@@ -55,6 +62,33 @@ pub(crate) const HANDED: &str = "journal/handed";
 /// next one waits for twice the rewritten size, so a rewrite's cost is spread over at least as
 /// many appended bytes as it wrote.
 pub(crate) const COMPACT_AT: u64 = 256 * 1024;
+
+/// One fact a journal records, as the record it is written as: a body of ASCII text, so no
+/// body can hold an astream frame of its own, and a tail every reader of the body skips (the
+/// module's A RECORD'S TAIL).
+pub(crate) trait Record: Sized + PartialEq {
+    /// The journal's name in a refusal or a fault: "post journal".
+    const JOURNAL: &'static str;
+
+    /// The body this fact is recorded as.
+    fn body(&self) -> String;
+
+    /// The tail it is recorded with.
+    fn tail(&self) -> String;
+
+    /// The fact a record holds, `None` for a body this build did not write. A tail this build
+    /// cannot read adds nothing to the fact.
+    fn of_record(body: &[u8], tail: &[u8]) -> Option<Self>;
+}
+
+/// What a journal's records say, applied in the order they were written.
+pub(crate) trait Replay: Default {
+    /// The fact each record holds.
+    type Record: Record;
+
+    /// What it says after `record`.
+    fn apply(&mut self, record: Self::Record);
+}
 
 /// One fact the journal records.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -91,7 +125,8 @@ fn is_sid(sid: &str) -> bool {
             .all(|b| b.is_ascii_graphic() && b != b'/' && b != b'.')
 }
 
-fn number(word: &str) -> Option<u64> {
+/// A word of ASCII digits as a number, `None` for anything else (a sign, a space, an overflow).
+pub(super) fn number(word: &str) -> Option<u64> {
     (!word.is_empty() && word.bytes().all(|b| b.is_ascii_digit()))
         .then(|| word.parse().ok())
         .flatten()
@@ -125,39 +160,8 @@ impl Frame {
         )
     }
 
-    /// The body this frame is recorded as.
-    fn body(&self) -> String {
-        match self {
-            Self::Reserve { sid, id, pin } => format!("reserve {sid} {id} {}", pin.render()),
-            Self::Retire { sid, id } => format!("retire {sid} {id}"),
-            Self::InFlight(entry) => format!("inflight\n{}\n", entry.render()),
-            Self::Landed(seq) => format!("landed {seq}"),
-            Self::Dropped(seq) => format!("dropped {seq}"),
-            Self::Attached(inc) => format!("attached {inc}"),
-        }
-    }
-
-    /// The tail this frame is recorded with: its heads, as words (the module's A RECORD'S TAIL).
-    fn tail(&self) -> String {
-        let (at, pin_at) = match self {
-            Self::Reserve { pin, .. } => (pin.at, None),
-            Self::InFlight(entry) => (entry.at, entry.pin.at),
-            Self::Retire { .. } | Self::Landed(_) | Self::Dropped(_) | Self::Attached(_) => {
-                (None, None)
-            }
-        };
-        let mut words = Vec::new();
-        if let Some(at) = at {
-            words.push(format!("at {at}"));
-        }
-        if let Some(at) = pin_at {
-            words.push(format!("pin-at {at}"));
-        }
-        words.join(" ")
-    }
-
-    /// This frame with the heads `tail` names (see [`Frame::tail`]); a tail this build cannot
-    /// read names none.
+    /// This frame with the heads `tail` names (see [`Frame`]'s [`Record::tail`]); a tail this
+    /// build cannot read names none.
     fn with_tail(mut self, tail: &[u8]) -> Self {
         let mut at = None;
         let mut pin_at = None;
@@ -184,11 +188,6 @@ impl Frame {
             _ => {}
         }
         self
-    }
-
-    /// The frame a record holds: its body ([`Frame::parse`]) with the heads its tail names.
-    fn of_record(body: &[u8], tail: &[u8]) -> Option<Self> {
-        Some(Self::parse(body)?.with_tail(tail))
     }
 
     /// Parse a body back, `None` for anything this build did not write.
@@ -227,6 +226,45 @@ impl Frame {
     }
 }
 
+impl Record for Frame {
+    const JOURNAL: &'static str = "post journal";
+
+    fn body(&self) -> String {
+        match self {
+            Self::Reserve { sid, id, pin } => format!("reserve {sid} {id} {}", pin.render()),
+            Self::Retire { sid, id } => format!("retire {sid} {id}"),
+            Self::InFlight(entry) => format!("inflight\n{}\n", entry.render()),
+            Self::Landed(seq) => format!("landed {seq}"),
+            Self::Dropped(seq) => format!("dropped {seq}"),
+            Self::Attached(inc) => format!("attached {inc}"),
+        }
+    }
+
+    /// Its heads, as words (the module's A RECORD'S TAIL).
+    fn tail(&self) -> String {
+        let (at, pin_at) = match self {
+            Self::Reserve { pin, .. } => (pin.at, None),
+            Self::InFlight(entry) => (entry.at, entry.pin.at),
+            Self::Retire { .. } | Self::Landed(_) | Self::Dropped(_) | Self::Attached(_) => {
+                (None, None)
+            }
+        };
+        let mut words = Vec::new();
+        if let Some(at) = at {
+            words.push(format!("at {at}"));
+        }
+        if let Some(at) = pin_at {
+            words.push(format!("pin-at {at}"));
+        }
+        words.join(" ")
+    }
+
+    /// Its body ([`Frame::parse`]) with the heads its tail names.
+    fn of_record(body: &[u8], tail: &[u8]) -> Option<Self> {
+        Some(Self::parse(body)?.with_tail(tail))
+    }
+}
+
 /// `frame` as the record at `step`: its body, then its tail (the module's A RECORD'S TAIL). A
 /// frame whose record would not read back as itself (a session id the body cannot carry, a
 /// reservation its reader refuses) is refused here, so the journal never holds a record its
@@ -234,13 +272,14 @@ impl Frame {
 ///
 /// # Errors
 /// That frame (`InvalidInput`), or a record past a step record's payload cap (`InvalidData`).
-pub(crate) fn encode(step: u64, frame: &Frame) -> io::Result<Vec<u8>> {
+pub(crate) fn encode<R: Record>(step: u64, frame: &R) -> io::Result<Vec<u8>> {
     let (body, tail) = (frame.body(), frame.tail());
-    if Frame::of_record(body.as_bytes(), tail.as_bytes()).as_ref() != Some(frame) {
+    if R::of_record(body.as_bytes(), tail.as_bytes()).as_ref() != Some(frame) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "a post journal record would not read back: {}",
+                "a {} record would not read back: {}",
+                R::JOURNAL,
                 body.lines().next().unwrap_or_default()
             ),
         ));
@@ -255,20 +294,20 @@ pub(crate) fn encode(step: u64, frame: &Frame) -> io::Result<Vec<u8>> {
     framed.map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("a post journal record does not frame: {e:?}"),
+            format!("a {} record does not frame: {e:?}", R::JOURNAL),
         )
     })
 }
 
-/// The frame of the intact record whose body is `body` in `bytes` (a range a step scan of
+/// The fact of the intact record whose body is `body` in `bytes` (a range a step scan of
 /// `bytes` gave): its body read with its tail, the bytes from the body's end to its frame's.
-fn record(bytes: &[u8], body: &std::ops::Range<usize>) -> Option<Frame> {
+fn record<R: Record>(bytes: &[u8], body: &std::ops::Range<usize>) -> Option<R> {
     use astream_wire::frame::decode_frame_header_bytes;
     let start = body.start.checked_sub(HEADER_SIZE + STEP_HEADER)?;
     let header = bytes.get(start..start.checked_add(HEADER_SIZE)?)?;
     let (len, _) = decode_frame_header_bytes(&<[u8; HEADER_SIZE]>::try_from(header).ok()?).ok()?;
     let end = start.checked_add(HEADER_SIZE)?.checked_add(len)?;
-    Frame::of_record(bytes.get(body.clone())?, bytes.get(body.end..end)?)
+    R::of_record(bytes.get(body.clone())?, bytes.get(body.end..end)?)
 }
 
 /// What the journal holds: every post reserved and not retired, every record in flight that
@@ -366,6 +405,14 @@ impl Index {
     }
 }
 
+impl Replay for Index {
+    type Record = Frame;
+
+    fn apply(&mut self, record: Frame) {
+        Self::apply(self, record);
+    }
+}
+
 /// How a journal's bytes end ([`read`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum End {
@@ -392,9 +439,9 @@ pub(crate) enum End {
 
 /// What a read of a journal's bytes found.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Read {
+pub(crate) struct Read<I = Index> {
     /// What the intact records say.
-    pub(crate) index: Index,
+    pub(crate) index: I,
     /// Where the intact records end.
     pub(crate) valid_len: u64,
     /// The step the next record carries.
@@ -403,16 +450,22 @@ pub(crate) struct Read {
     pub(crate) end: End,
 }
 
+/// Read the post journal's bytes ([`read_as`]).
+#[must_use]
+pub(crate) fn read(bytes: &[u8]) -> Read {
+    read_as(bytes)
+}
+
 /// Read a journal's bytes: the longest intact run of records from step 0
 /// ([`astream_wire::steps::scan_steps_from`]), applied in order, and what ended it. An intact
 /// record whose body this build cannot read ends the run as a fault at that record.
 #[must_use]
-pub(crate) fn read(bytes: &[u8]) -> Read {
+pub(crate) fn read_as<I: Replay>(bytes: &[u8]) -> Read<I> {
     let scan = scan_steps_from(bytes, 0);
-    let mut index = Index::default();
+    let mut index = I::default();
     let mut next_step = 0u64;
     for (step, body) in &scan.steps {
-        let Some(frame) = record(bytes, body) else {
+        let Some(frame) = record::<I::Record>(bytes, body) else {
             let at = body.start.saturating_sub(HEADER_SIZE + STEP_HEADER) as u64;
             return Read {
                 index,
@@ -420,7 +473,10 @@ pub(crate) fn read(bytes: &[u8]) -> Read {
                 next_step,
                 end: End::Fault {
                     at,
-                    why: format!("record {step} is not a post journal record this build reads"),
+                    why: format!(
+                        "record {step} is not a {} record this build reads",
+                        <I::Record as Record>::JOURNAL
+                    ),
                 },
             };
         };
@@ -455,8 +511,14 @@ pub(crate) fn read(bytes: &[u8]) -> Read {
 /// missing, and a retirement, landing or drop they held leaves its record in place.
 #[must_use]
 pub(crate) fn salvage(bytes: &[u8]) -> Index {
+    salvage_as(bytes)
+}
+
+/// What every whole record of a damaged journal says ([`salvage`]), for any journal.
+#[must_use]
+pub(crate) fn salvage_as<I: Replay>(bytes: &[u8]) -> I {
     use astream_wire::steps::{RESYNC_CRC_FLOOR, RESYNC_CRC_PER_BYTE};
-    let mut index = Index::default();
+    let mut index = I::default();
     let mut at = 0usize;
     let mut first = 0u64;
     let mut budget = RESYNC_CRC_PER_BYTE
@@ -467,7 +529,7 @@ pub(crate) fn salvage(bytes: &[u8]) -> Index {
         let mut resume_from = at.saturating_add(scan.valid_len);
         let mut stopped_early = false;
         for (step, body) in &scan.steps {
-            let Some(frame) = record(rest, body) else {
+            let Some(frame) = record::<I::Record>(rest, body) else {
                 let start = body.start.saturating_sub(HEADER_SIZE + STEP_HEADER);
                 resume_from = at.saturating_add(start).saturating_add(1);
                 stopped_early = true;
@@ -531,7 +593,7 @@ pub(crate) fn records_and_attaches(bytes: &[u8]) -> (u64, u64) {
     let attaches = scan
         .steps
         .iter()
-        .filter(|(_, body)| matches!(record(bytes, body), Some(Frame::Attached(_))))
+        .filter(|(_, body)| matches!(record::<Frame>(bytes, body), Some(Frame::Attached(_))))
         .count() as u64;
     (scan.steps.len() as u64 - attaches, attaches)
 }

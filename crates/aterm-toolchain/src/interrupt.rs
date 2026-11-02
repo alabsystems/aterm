@@ -4,12 +4,14 @@
 //! AN INTERRUPT ENDS A WAIT (`docs/DESIGN-adaptive-build-2026-10-24.md`, WAIT-INTERRUPT).
 //!
 //! A run that waits for room in the capacity ledger or for a named lock has started nothing, so
-//! SIGINT, SIGTERM or SIGHUP then should end it at once as NOT RUN, its place in the queue given
-//! up. The tools catch interrupts their own ways (verify ends its stage groups and dies of the
-//! signal, the release steps and the lab set a flag their work looks at, a bench keeps the
-//! default), and none of those reaches a loop that sleeps between looks, nor leaves its queue
+//! SIGINT, SIGTERM, SIGHUP or SIGQUIT then should end it at once as NOT RUN, its place in the
+//! queue given up. SIGQUIT (a terminal's `Ctrl-\`) is among them because its default action dumps
+//! core: a build's front waiting for its claim would otherwise die of it as a crash of the aterm
+//! image, when it had started nothing to crash. The tools catch interrupts their own ways
+//! (verify ends its stage groups and dies of the signal, the release steps and the lab set a flag
+//! their work looks at, a bench keeps the default), and none of those reaches a loop that sleeps between looks, nor leaves its queue
 //! entry behind it. So a wait holds a [`Watch`]: while one lives, the process's own handling of
-//! those three signals is set aside for this module's, which notes the first that comes; the
+//! those four signals is set aside for this module's, which notes the first that comes; the
 //! wait looks at it between short naps ([`Watch::nap`]); and the last watch to end puts the
 //! process's own handling back. A signal the process ignores (a background job's SIGINT) stays
 //! ignored. The wait that ends on the signal takes it ([`Watch::take`]), and its caller ends as
@@ -44,27 +46,28 @@ struct Held {
 
 /// The signals a wait ends on.
 #[cfg(unix)]
-const SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+const SIGNALS: [libc::c_int; 4] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
 
 #[cfg(unix)]
 extern "C" fn on_signal(sig: libc::c_int) {
     let _ = CAUGHT.compare_exchange(0, sig, Ordering::SeqCst, Ordering::SeqCst);
 }
 
-/// `SIGTERM`, `SIGINT`, `SIGHUP`, else `signal N`.
+/// `SIGTERM`, `SIGINT`, `SIGHUP`, `SIGQUIT`, else `signal N`.
 #[must_use]
 pub fn name(sig: i32) -> String {
     match sig {
         1 => "SIGHUP".to_owned(),
         2 => "SIGINT".to_owned(),
+        3 => "SIGQUIT".to_owned(),
         15 => "SIGTERM".to_owned(),
         n => format!("signal {n}"),
     }
 }
 
-/// A wait in progress: SIGINT, SIGTERM and SIGHUP, each the process does not ignore, are noted
-/// for it ([`Watch::caught`]) instead of reaching the process's own handling, until the last
-/// live watch ends.
+/// A wait in progress: SIGINT, SIGTERM, SIGHUP and SIGQUIT, each the process does not ignore,
+/// are noted for it ([`Watch::caught`]) instead of reaching the process's own handling, until
+/// the last live watch ends.
 #[derive(Debug)]
 pub struct Watch(());
 
@@ -208,6 +211,15 @@ mod tests {
     /// Set, a second SIGTERM reaches the stand-in after its wait took the first and before its
     /// watch ends: it sends it to itself there, holding that point of the race.
     const STANDIN_TWICE: &str = "ATERM_TOOLCHAIN_INTERRUPT_TWICE";
+    /// Set, the stand-in first catches SIGQUIT in a handler of its own that exits 4, as a tool's
+    /// own handling, so a SIGQUIT no watch notes ends it with no core.
+    const STANDIN_QUIT: &str = "ATERM_TOOLCHAIN_INTERRUPT_QUIT";
+
+    /// [`STANDIN_QUIT`]'s handler.
+    extern "C" fn quit_exits_4(_: libc::c_int) {
+        // SAFETY: `_exit` is async-signal-safe and ends the process at once.
+        unsafe { libc::_exit(4) }
+    }
 
     /// Run by the tests below in a process of its own: naps on a watch for twice its parent's
     /// one-minute hang detector, so only an interrupt the watch takes ends it in time, then
@@ -224,6 +236,12 @@ mod tests {
             }
             if std::env::var_os(STANDIN_IGNORE).is_some() {
                 libc::signal(libc::SIGINT, libc::SIG_IGN);
+            }
+            if std::env::var_os(STANDIN_QUIT).is_some() {
+                libc::signal(
+                    libc::SIGQUIT,
+                    quit_exits_4 as extern "C" fn(libc::c_int) as libc::sighandler_t,
+                );
             }
         }
         let watch = Watch::enter();
@@ -321,14 +339,16 @@ mod tests {
         (status, out, took)
     }
 
-    /// SIGTERM, and SIGINT where the process does not ignore it, end a wait as NOT RUN well
-    /// inside the one-minute hang detector (the time is reported), the wait naming the signal;
-    /// the process's own handling would have ended it by the signal instead (default action).
+    /// SIGTERM, SIGINT where the process does not ignore it, and SIGQUIT end a wait as NOT RUN
+    /// well inside the one-minute hang detector (the time is reported), the wait naming the
+    /// signal; the process's own handling would have ended it by the signal instead (default
+    /// action), or, for SIGQUIT, by its own handler's exit 4 (no core is dumped either way).
     #[test]
     fn an_interrupt_ends_a_watched_wait() {
         for (env, sig, word) in [
             (&[][..], libc::SIGTERM, "SIGTERM"),
             (&[STANDIN_SIGINT][..], libc::SIGINT, "SIGINT"),
+            (&[STANDIN_QUIT][..], libc::SIGQUIT, "SIGQUIT"),
         ] {
             let mut standin = standin(env);
             let (status, out, took) = signal(&mut standin, sig);

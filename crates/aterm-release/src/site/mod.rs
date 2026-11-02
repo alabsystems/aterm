@@ -75,12 +75,20 @@ pub const OWNED_FILES: [&str; 9] = [
 /// Repository-relative path of the installer served at `/install.sh`.
 pub const INSTALLER_SOURCE: &str = "tools/install.sh";
 
+/// One limit for source, staged and verified site files, including the installer.
+const MAX_SITE_FILE_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Reads and validates the public commit's installer for `/install.sh`.
 ///
 /// # Errors
-/// Returns an error if the installer is missing or targets another repository.
+/// Returns an error if the installer is not readable bounded UTF-8 regular text or
+/// targets another repository.
 pub fn installer(clone: &Path, slug: &str) -> Result<String, String> {
-    let text = std::fs::read_to_string(clone.join(INSTALLER_SOURCE)).map_err(|e| {
+    let text = crate::durable::read_regular_text(
+        &clone.join(INSTALLER_SOURCE),
+        MAX_SITE_FILE_BYTES,
+    )
+    .map_err(|e| {
         format!(
             "the public commit has no readable {INSTALLER_SOURCE} to serve as /install.sh ({e})"
         )
@@ -226,7 +234,7 @@ pub struct Env {
 /// The file exists and cannot be read or parsed.
 fn settings(repo: &Path) -> Result<Settings, String> {
     let path = repo.join("publish/site.toml");
-    match std::fs::read_to_string(&path) {
+    match crate::durable::read_regular_text(&path, 64 * 1024) {
         Ok(text) => aterm_toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Settings::default()),
         Err(e) => Err(format!("{}: {e}", path.display())),
@@ -285,9 +293,11 @@ impl Env {
                 .unwrap_or_else(|| sitemap::ORIGIN.into()),
             download_base: var("SITE_DOWNLOAD_BASE").unwrap_or_else(|| "https://github.com".into()),
             verify_retries: var("SITE_VERIFY_RETRIES")
+                .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(5),
             verify_sleep: var("SITE_VERIFY_SLEEP")
+                .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(3),
             today: var("SITE_SYNC_TODAY")
@@ -735,7 +745,7 @@ fn say(out: &mut dyn Write, line: &str) {
 }
 
 fn read_text(path: &Path) -> Option<String> {
-    std::fs::read_to_string(path).ok()
+    crate::durable::read_regular_text(path, MAX_SITE_FILE_BYTES).ok()
 }
 
 /// Synchronizes the site checkout to the public commit and elected release downloads.
@@ -1096,7 +1106,7 @@ fn steps(
 
     halt(launch, "the release list was read")?;
     let list = match &opts.releases {
-        Some(path) => std::fs::read_to_string(path)
+        Some(path) => crate::durable::read_regular_text(path, 32 * 1024 * 1024)
             .map_err(|e| refusal(Refusal::Io, format!("cannot read {}: {e}", path.display())))?,
         None => world
             .github(&format!("repos/{slug}/releases?per_page=100"), true)
@@ -1393,7 +1403,8 @@ fn steps(
     };
 
     let differs = |rel: &str, new: &str| {
-        std::fs::read(site_dir.join(rel)).map_or(true, |old| old != new.as_bytes())
+        crate::durable::read_regular_bytes(&site_dir.join(rel), MAX_SITE_FILE_BYTES)
+            .map_or(true, |old| old != new.as_bytes())
     };
     let mut changed: Vec<&str> = Vec::new();
     let mut touch: Vec<&str> = Vec::new();
@@ -1493,6 +1504,17 @@ fn steps(
     }
     for rel in &changed {
         let path = site_dir.join(rel);
+        if std::fs::symlink_metadata(&path)
+            .is_ok_and(|m| m.file_type().is_symlink() || !m.file_type().is_file())
+        {
+            return fail(
+                Refusal::Io,
+                format!(
+                    "cannot write {}: target is not a regular file",
+                    path.display()
+                ),
+            );
+        }
         let written = path
             .parent()
             .map_or(Ok(()), std::fs::create_dir_all)
@@ -1993,6 +2015,26 @@ pub fn report(ended: &Result<Outcome, Failure>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_installer_uses_the_site_file_bound() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let source = root.path().join(INSTALLER_SOURCE);
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        let mut text = "OFFICIAL_REPO_SLUG=\"alabsystems/aterm\"\n#".to_owned();
+        text.extend(std::iter::repeat_n(
+            ' ',
+            MAX_SITE_FILE_BYTES as usize - text.len(),
+        ));
+        std::fs::write(&source, &text).unwrap();
+        assert_eq!(installer(root.path(), "alabsystems/aterm").unwrap(), text);
+        assert_eq!(read_text(&source).as_deref(), Some(text.as_str()));
+
+        text.push('\n');
+        std::fs::write(&source, text).unwrap();
+        assert!(installer(root.path(), "alabsystems/aterm").is_err());
+        assert!(read_text(&source).is_none());
+    }
 
     /// A sync removes a scratch an earlier one kept only once its hold is spent (a restart
     /// here); a kept one still held, one with no stamp (a sync's live scratch) and a

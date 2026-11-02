@@ -516,10 +516,8 @@ pub fn parse_tcc(text: &str) -> Result<Vec<TccRow>, String> {
         else {
             return Err(format!("the TCC database printed {line:?}, not a row"));
         };
-        let auth_value = value
-            .trim()
-            .parse::<i64>()
-            .map_err(|_| format!("the TCC database printed {line:?}, not a row"))?;
+        let auth_value = crate::parse_int::<i64>(value.trim())
+            .ok_or_else(|| format!("the TCC database printed {line:?}, not a row"))?;
         rows.push(TccRow {
             client: client.to_owned(),
             service: service.to_owned(),
@@ -1295,5 +1293,6 @@ mod tests {
             ..Table::default()
         };
         assert!(expand(&bad, &ctx()).is_err());
+        assert!(parse_tcc("ai.aterm|kTCCServiceSystemPolicyAllFiles|+2\n").is_err());
     }
 }

@@ -27,6 +27,10 @@ aterm-types = { workspace = true }
 # (`str_grid_columns`), which hosts inject as `presence::Host::columns`.
 # Wasm-clean (aterm-core, which aterm-wasm ships, depends on it).
 aterm-grapheme = { workspace = true }
+# The motion vocabulary (`aterm_scene::motion`: the duration tokens, Q16 easings, the glide,
+# springs and cadences) the band draws with and re-exports, shared with every animated surface.
+# Dependency-free and wasm-clean.
+aterm-scene = { workspace = true }
 
 # tests/conformance_*.rs drive `MessageCenter` in lock step with aterm-models-session's
 # derived models on aterm-spec's interpreter.

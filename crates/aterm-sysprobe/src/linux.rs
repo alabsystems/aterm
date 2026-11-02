@@ -43,7 +43,7 @@ fn keyed(text: &str, key: &str) -> Option<u64> {
         if it.next()?.trim_end_matches(':') != key {
             return None;
         }
-        it.next()?.parse().ok()
+        crate::parse_uint(it.next()?)
     })
 }
 
@@ -86,14 +86,14 @@ pub fn auxv_value(bytes: &[u8], key: u64) -> Option<u64> {
 pub fn stat_pgrp(stat: &str) -> Option<u32> {
     let (_, rest) = stat.rsplit_once(')')?;
     let mut fields = rest.split_whitespace();
-    fields.nth(2)?.parse().ok()
+    crate::parse_uint(fields.nth(2)?)
 }
 
 /// The pids of a `/proc/<pid>/task/<tid>/children` text.
 #[must_use]
 pub fn children(text: &str) -> Vec<u32> {
     text.split_inclusive(' ')
-        .filter_map(|word| word.strip_suffix(' ')?.parse().ok())
+        .filter_map(|word| crate::parse_uint(word.strip_suffix(' ')?))
         .collect()
 }
 
@@ -123,14 +123,14 @@ pub fn proc_stat_cores(text: &str, cut: bool) -> Option<Vec<CoreTicks>> {
         if id.is_empty() {
             continue;
         }
-        let id: usize = id.parse().ok()?;
+        let id: usize = crate::parse_uint(id)?;
         if id >= MAX_CPUS {
             return None;
         }
         let mut f = [0u64; 7];
         let mut n = 0;
         for (slot, field) in f.iter_mut().zip(fields.by_ref()) {
-            *slot = field.parse().ok()?;
+            *slot = crate::parse_uint(field)?;
             n += 1;
         }
         if n < 4 {
@@ -190,7 +190,7 @@ pub fn cpulist(text: &str) -> Option<Vec<u16>> {
     let mut ids = Vec::new();
     for part in text.trim().split(',') {
         let (lo, hi) = part.split_once('-').unwrap_or((part, part));
-        let (lo, hi): (u16, u16) = (lo.trim().parse().ok()?, hi.trim().parse().ok()?);
+        let (lo, hi): (u16, u16) = (crate::parse_uint(lo.trim())?, crate::parse_uint(hi.trim())?);
         if lo > hi || usize::from(hi) >= MAX_CPUS {
             return None;
         }
@@ -303,7 +303,7 @@ pub fn net_dev(text: &str) -> Vec<NetDev> {
             let mut f = [0u64; 12];
             let mut n = 0;
             for (slot, field) in f.iter_mut().zip(rest.split_whitespace()) {
-                *slot = field.parse().ok()?;
+                *slot = crate::parse_uint(field)?;
                 n += 1;
             }
             (n == f.len()).then(|| NetDev {
@@ -335,7 +335,11 @@ const IFF_LOOPBACK: u32 = 0x8;
 pub fn hex_flags(text: &str) -> Option<u32> {
     let t = text.trim();
     let digits = t.strip_prefix("0x").unwrap_or(t);
-    u32::from_str_radix(digits, 16).ok()
+    digits
+        .bytes()
+        .all(|b| b.is_ascii_hexdigit())
+        .then(|| u32::from_str_radix(digits, 16).ok())
+        .flatten()
 }
 
 /// Whether the interface is up (`IFF_UP` set and `operstate` is `up` or `unknown`).
@@ -347,7 +351,7 @@ pub fn link_up(flags: u32, operstate: &str) -> bool {
 /// `/sys/class/net/<if>/speed` (Mb/s) as bits per second.
 #[must_use]
 pub fn speed_bps(text: &str) -> Option<u64> {
-    let mbps: i64 = text.trim().parse().ok()?;
+    let mbps: i64 = crate::parse_int(text.trim())?;
     u64::try_from(mbps)
         .ok()
         .filter(|m| *m > 0)
@@ -411,7 +415,7 @@ fn sys_link(dir: &mut PathBuf, row: NetDev) -> LinkReading {
     let wireless = in_dir(dir, "wireless", Path::exists);
     LinkReading {
         index: in_dir(dir, "ifindex", |p| {
-            crate::with_bounded(p, |t| t.trim().parse().ok())
+            crate::with_bounded(p, |t| crate::parse_uint(t.trim()))
         })
         .flatten()
         .unwrap_or(0),
@@ -460,21 +464,146 @@ pub fn tcp_counts_under_into(root: &Path, scratch: &mut Vec<u8>) -> Option<TcpCo
     any.then_some(counts)
 }
 
+/// `nlmsghdr`'s size, `NLMSG_HDRLEN` (`linux/netlink.h`).
 const NLMSG_HDRLEN: usize = 16;
+/// `NLMSG_NOOP` (`linux/netlink.h`): a message to skip.
 const NLMSG_NOOP: u16 = 1;
+/// `NLMSG_ERROR` (`linux/netlink.h`): an `int` errno (negative) or an acknowledgement (0).
 const NLMSG_ERROR: u16 = 2;
+/// `NLMSG_DONE` (`linux/netlink.h`): a dump's end, its payload the dump's `int` result.
 const NLMSG_DONE: u16 = 3;
+/// `NLMSG_OVERRUN` (`linux/netlink.h`): data was lost.
+const NLMSG_OVERRUN: u16 = 4;
+/// `NLM_F_REQUEST` (`linux/netlink.h`).
+const NLM_F_REQUEST: u16 = 0x1;
+/// `NLM_F_DUMP`, `NLM_F_ROOT | NLM_F_MATCH` (`linux/netlink.h`).
+const NLM_F_DUMP: u16 = 0x300;
+/// `NLM_F_DUMP_INTR` (`linux/netlink.h`): the table changed while the dump ran.
+const NLM_F_DUMP_INTR: u16 = 0x10;
+/// `SOCK_DIAG_BY_FAMILY` (`linux/sock_diag.h`): a dump request's type and each record's.
 const SOCK_DIAG_BY_FAMILY: u16 = 20;
+/// `nlattr`'s header size, `NLA_HDRLEN` (`linux/netlink.h`).
+const NLA_HDRLEN: usize = 4;
+/// `NLA_TYPE_MASK` (`linux/netlink.h`): an attribute's type without its two flag bits.
+const NLA_TYPE_MASK: u16 = 0x3fff;
 const INET_DIAG_MSG_LEN: usize = 72;
 const INET_DIAG_DST_AT: usize = 24;
 const INET_DIAG_INFO_ATTR: u16 = 2;
-const NLA_HDRLEN: usize = 4;
-const NLA_TYPE_MASK: u16 = 0x3fff;
 /// Byte offset of `tcpi_rtt` (`u32`, microseconds) inside Linux UAPI `struct tcp_info`.
 const TCPI_RTT_AT: usize = 68;
 const LINUX_AF_INET: u8 = 2;
 const LINUX_AF_INET6: u8 = 10;
 const LINUX_TCP_ESTABLISHED: u8 = 1;
+/// `AF_UNIX` (`linux/socket.h`), the family a unix dump names and every record of it carries.
+const LINUX_AF_UNIX: u8 = 1;
+/// `TCP_LISTEN` (`net/tcp_states.h`), the state a listening `AF_UNIX` socket is in.
+const LINUX_TCP_LISTEN: u8 = 10;
+/// `UDIAG_SHOW_NAME` (`linux/unix_diag.h`): each record carries its bound name.
+const UDIAG_SHOW_NAME: u32 = 0x1;
+/// `UDIAG_SHOW_VFS` (`linux/unix_diag.h`): each record carries the file its bind made.
+const UDIAG_SHOW_VFS: u32 = 0x2;
+/// `UNIX_DIAG_NAME` (`linux/unix_diag.h`): the attribute holding the bound name.
+const UNIX_DIAG_NAME: u16 = 0;
+/// `UNIX_DIAG_VFS` (`linux/unix_diag.h`): the attribute holding a `unix_diag_vfs`, the bound
+/// file's inode then its device, two `u32`s.
+const UNIX_DIAG_VFS: u16 = 1;
+/// `unix_diag_msg`'s size (`linux/unix_diag.h`): family, type, state, pad, inode, cookie.
+const UNIX_DIAG_MSG_LEN: usize = 16;
+
+/// `n` rounded up to the 4 bytes netlink aligns every message and attribute to (`NLMSG_ALIGN`,
+/// `NLA_ALIGN`).
+const fn align4(n: usize) -> usize {
+    (n + 3) & !3
+}
+
+/// The `u16` at `at`, in host byte order as netlink writes it.
+fn ne_u16(b: &[u8], at: usize) -> Option<u16> {
+    Some(u16::from_ne_bytes(b.get(at..at + 2)?.try_into().ok()?))
+}
+
+/// The `u32` at `at`, in host byte order.
+fn ne_u32(b: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_ne_bytes(b.get(at..at + 4)?.try_into().ok()?))
+}
+
+/// A `SOCK_DIAG_BY_FAMILY` dump request of `N` bytes under sequence `seq`: its `nlmsghdr`
+/// (length `N`, `NLM_F_REQUEST | NLM_F_DUMP`, port 0), then zeros for the family's request.
+fn sock_diag_dump_request<const N: usize>(seq: u32) -> [u8; N] {
+    let mut r = [0_u8; N];
+    r[0..4].copy_from_slice(&u32::try_from(N).unwrap_or(u32::MAX).to_ne_bytes());
+    r[4..6].copy_from_slice(&SOCK_DIAG_BY_FAMILY.to_ne_bytes());
+    r[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_DUMP).to_ne_bytes());
+    r[8..12].copy_from_slice(&seq.to_ne_bytes());
+    r
+}
+
+/// One message of a netlink datagram: its header's type, flags and sequence, and its payload.
+struct NlMessage<'a> {
+    kind: u16,
+    flags: u16,
+    seq: u32,
+    payload: &'a [u8],
+}
+
+/// The messages of one netlink datagram in order, each read by its header's length, the next
+/// one at that length rounded up to 4 (`NLMSG_ALIGN`). An `Err` ends the walk: a header cut
+/// short, or a length under a header or past the datagram, framing the kernel never writes.
+fn nl_messages(datagram: &[u8]) -> impl Iterator<Item = Result<NlMessage<'_>, &'static str>> {
+    let mut rest = datagram;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let header = (
+            ne_u32(rest, 0),
+            ne_u16(rest, 4),
+            ne_u16(rest, 6),
+            ne_u32(rest, 8),
+        );
+        let (Some(len), Some(kind), Some(flags), Some(seq)) = header else {
+            rest = &[];
+            return Some(Err("a message header cut short"));
+        };
+        let len = usize::try_from(len).unwrap_or(usize::MAX);
+        if len < NLMSG_HDRLEN || len > rest.len() {
+            rest = &[];
+            return Some(Err("a message length past its datagram"));
+        }
+        let payload = &rest[NLMSG_HDRLEN..len];
+        rest = rest.get(align4(len)..).unwrap_or_default();
+        Some(Ok(NlMessage {
+            kind,
+            flags,
+            seq,
+            payload,
+        }))
+    })
+}
+
+/// The attributes after a record's fixed part in order, `(type, value)` with the type's two flag
+/// bits taken off (`NLA_TYPE_MASK`), each read by its length, the next one at that length rounded
+/// up to 4 (`NLA_ALIGN`). An `Err` ends the walk: a header cut short, or a length under a header
+/// or past the record.
+fn nl_attributes(attrs: &[u8]) -> impl Iterator<Item = Result<(u16, &[u8]), &'static str>> {
+    let mut rest = attrs;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let (Some(len), Some(kind)) = (ne_u16(rest, 0), ne_u16(rest, 2)) else {
+            rest = &[];
+            return Some(Err("an attribute header cut short"));
+        };
+        let len = usize::from(len);
+        if len < NLA_HDRLEN || len > rest.len() {
+            rest = &[];
+            return Some(Err("an attribute past its record"));
+        }
+        let value = &rest[NLA_HDRLEN..len];
+        rest = rest.get(align4(len)..).unwrap_or_default();
+        Some(Ok((kind & NLA_TYPE_MASK, value)))
+    })
+}
 
 fn inet_diag_remote_peer(family: u8, dst: &[u8]) -> bool {
     if dst.len() < 16 {
@@ -516,62 +645,39 @@ pub fn parse_inet_diag_rtts_seq(
     expected_seq: Option<u32>,
     rtts: &mut Vec<f32>,
 ) -> Option<bool> {
-    let mut off = 0usize;
-    while off <= buf.len() && buf.len() - off >= NLMSG_HDRLEN {
-        let nlmsg_len = u32::from_ne_bytes(buf.get(off..off + 4)?.try_into().ok()?) as usize;
-        if nlmsg_len < NLMSG_HDRLEN || nlmsg_len > buf.len() - off {
-            return None;
+    for message in nl_messages(buf) {
+        let message = message.ok()?;
+        if expected_seq.is_some_and(|want| message.seq != want) {
+            continue;
         }
-        let nlmsg_type = u16::from_ne_bytes(buf.get(off + 4..off + 6)?.try_into().ok()?);
-        let nlmsg_seq = u32::from_ne_bytes(buf.get(off + 8..off + 12)?.try_into().ok()?);
-        if expected_seq.is_none_or(|want| nlmsg_seq == want) {
-            let msg = &buf[off + NLMSG_HDRLEN..off + nlmsg_len];
-            match nlmsg_type {
-                NLMSG_NOOP => {}
-                NLMSG_DONE => return Some(true),
-                NLMSG_ERROR => return None,
-                SOCK_DIAG_BY_FAMILY if msg.len() >= INET_DIAG_MSG_LEN => {
-                    let family = msg[0];
-                    let state = msg[1];
-                    let dst = &msg[INET_DIAG_DST_AT..INET_DIAG_DST_AT + 16];
-                    if state == LINUX_TCP_ESTABLISHED && inet_diag_remote_peer(family, dst) {
-                        let mut attrs = &msg[INET_DIAG_MSG_LEN..];
-                        while attrs.len() >= NLA_HDRLEN {
-                            let nla_len =
-                                u16::from_ne_bytes(attrs.get(0..2)?.try_into().ok()?) as usize;
-                            if nla_len < NLA_HDRLEN || nla_len > attrs.len() {
-                                break;
-                            }
-                            let nla_type = u16::from_ne_bytes(attrs.get(2..4)?.try_into().ok()?)
-                                & NLA_TYPE_MASK;
-                            if nla_type == INET_DIAG_INFO_ATTR {
-                                let info = &attrs[NLA_HDRLEN..nla_len];
-                                if let Some(raw) = info.get(TCPI_RTT_AT..TCPI_RTT_AT + 4) {
-                                    let rtt_us = u32::from_ne_bytes(raw.try_into().ok()?);
-                                    if rtt_us > 0 {
-                                        let ms = (rtt_us as f32) / 1_000.0;
-                                        if ms.is_finite() && ms > 0.0 {
-                                            rtts.push(ms);
-                                        }
-                                    }
+        let msg = message.payload;
+        match message.kind {
+            NLMSG_NOOP => {}
+            NLMSG_DONE => return Some(true),
+            NLMSG_ERROR => return None,
+            SOCK_DIAG_BY_FAMILY if msg.len() >= INET_DIAG_MSG_LEN => {
+                let family = msg[0];
+                let state = msg[1];
+                let dst = &msg[INET_DIAG_DST_AT..INET_DIAG_DST_AT + 16];
+                if state == LINUX_TCP_ESTABLISHED && inet_diag_remote_peer(family, dst) {
+                    for attr in nl_attributes(&msg[INET_DIAG_MSG_LEN..]) {
+                        let Ok((kind, info)) = attr else { break };
+                        if kind == INET_DIAG_INFO_ATTR
+                            && let Some(raw) = info.get(TCPI_RTT_AT..TCPI_RTT_AT + 4)
+                        {
+                            let rtt_us = u32::from_ne_bytes(raw.try_into().ok()?);
+                            if rtt_us > 0 {
+                                let ms = (rtt_us as f32) / 1_000.0;
+                                if ms.is_finite() && ms > 0.0 {
+                                    rtts.push(ms);
                                 }
                             }
-                            let step = nla_len.next_multiple_of(4);
-                            if step >= attrs.len() {
-                                break;
-                            }
-                            attrs = &attrs[step..];
                         }
                     }
                 }
-                _ => {}
             }
+            _ => {}
         }
-        let step = nlmsg_len.checked_next_multiple_of(4)?;
-        if step > buf.len() - off {
-            break;
-        }
-        off += step;
     }
     Some(false)
 }
@@ -593,8 +699,6 @@ pub fn median_rtt_ms(rtts: &mut [f32]) -> Option<f32> {
 #[must_use]
 pub fn tcp_srtt_ms() -> Option<f32> {
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
-    const NLM_F_REQUEST: u16 = 0x01;
-    const NLM_F_DUMP: u16 = 0x300;
     const REQ_LEN: usize = NLMSG_HDRLEN + 56;
     let mut rtts = Vec::new();
     let mut recv_buf = [0u8; 32 * 1024];
@@ -614,11 +718,7 @@ pub fn tcp_srtt_ms() -> Option<f32> {
         }
         // SAFETY: `raw` is a freshly created file descriptor >= 0.
         let sock = unsafe { OwnedFd::from_raw_fd(raw) };
-        let mut req = [0u8; REQ_LEN];
-        req[0..4].copy_from_slice(&(REQ_LEN as u32).to_ne_bytes());
-        req[4..6].copy_from_slice(&SOCK_DIAG_BY_FAMILY.to_ne_bytes());
-        req[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_DUMP).to_ne_bytes());
-        req[8..12].copy_from_slice(&seq.to_ne_bytes());
+        let mut req = sock_diag_dump_request::<REQ_LEN>(seq);
         req[NLMSG_HDRLEN] = family;
         req[NLMSG_HDRLEN + 1] = libc::IPPROTO_TCP as u8;
         req[NLMSG_HDRLEN + 2] = 1u8 << (INET_DIAG_INFO_ATTR - 1);
@@ -657,6 +757,163 @@ pub fn tcp_srtt_ms() -> Option<f32> {
     median_rtt_ms(&mut rtts)
 }
 
+/// The request for a dump of every listening `AF_UNIX` socket with its name and bound file
+/// (`sock_diag(7)`): one `nlmsghdr` of type `SOCK_DIAG_BY_FAMILY` with
+/// `NLM_F_REQUEST | NLM_F_DUMP` and sequence `seq`, then a `unix_diag_req` for family `AF_UNIX`,
+/// states `1 << TCP_LISTEN`, `UDIAG_SHOW_NAME | UDIAG_SHOW_VFS`, and no cookie.
+#[must_use]
+pub fn unix_diag_request(seq: u32) -> [u8; 40] {
+    let mut r = sock_diag_dump_request::<40>(seq);
+    r[NLMSG_HDRLEN] = LINUX_AF_UNIX;
+    r[20..24].copy_from_slice(&(1_u32 << LINUX_TCP_LISTEN).to_ne_bytes());
+    r[28..32].copy_from_slice(&(UDIAG_SHOW_NAME | UDIAG_SHOW_VFS).to_ne_bytes());
+    r[32..40].fill(0xff);
+    r
+}
+
+/// What one datagram of the socket dump said.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dump {
+    /// Its records were read, and the dump goes on in the next datagram.
+    More,
+    /// The dump ended here (`NLMSG_DONE`).
+    Done,
+}
+
+/// Why a socket dump cannot be read whole: a dump read in part proves no absence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DumpFault {
+    /// A message the kernel does not write: a length past its datagram, another request's
+    /// sequence, a record of another family, an attribute past its record, an overrun.
+    Torn(&'static str),
+    /// The kernel refused the request: `NLMSG_ERROR`, or `NLMSG_DONE` carrying an errno.
+    Refused(i32),
+    /// The kernel marked the dump interrupted (`NLM_F_DUMP_INTR`): the table changed under it.
+    Interrupted,
+}
+
+/// A listening `AF_UNIX` socket bound at a path, as one record of the socket dump names it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnixDiagListener {
+    /// The socket's inode, which a `/proc/<pid>/fd` link names it by (`socket:[<inode>]`).
+    pub inode: u64,
+    /// The name it was bound at: the attribute's bytes before the first NUL.
+    pub path: Vec<u8>,
+    /// The file its bind made, `None` when the record carries none.
+    pub file: Option<BoundFile>,
+}
+
+/// The file a listener's bind made (`UNIX_DIAG_VFS`), which every name linked to it shares, by
+/// its inode. The record's device is not kept: it is the superblock's (`s_dev`), which on btrfs
+/// is no file's `st_dev`, as `stat(2)` there reports each subvolume's own device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BoundFile {
+    /// The low 32 bits of its inode number: the record keeps no more.
+    pub ino: u32,
+}
+
+impl BoundFile {
+    /// Whether `ino`, an inode number as `stat(2)` reports one, is this file's, by its low 32 bits.
+    #[must_use]
+    pub fn is_inode(&self, ino: u64) -> bool {
+        u64::from(self.ino) == ino & u64::from(u32::MAX)
+    }
+}
+
+/// One `SOCK_DIAG_BY_FAMILY` record's payload: `Some` for a listener bound at a path, `None` for
+/// any other socket.
+fn unix_diag_record(record: &[u8]) -> Result<Option<UnixDiagListener>, DumpFault> {
+    let msg = record
+        .get(..UNIX_DIAG_MSG_LEN)
+        .ok_or(DumpFault::Torn("a socket record cut short"))?;
+    if msg[0] != LINUX_AF_UNIX {
+        return Err(DumpFault::Torn("a socket record of another family"));
+    }
+    let state = msg[2];
+    let inode = ne_u32(msg, 4).ok_or(DumpFault::Torn("a socket record cut short"))?;
+    let (mut name, mut file) = (None, None);
+    for attr in nl_attributes(&record[UNIX_DIAG_MSG_LEN..]) {
+        let (kind, value) = attr.map_err(DumpFault::Torn)?;
+        if kind == UNIX_DIAG_NAME && name.is_none() {
+            let end = value.iter().position(|b| *b == 0).unwrap_or(value.len());
+            name = Some(value[..end].to_vec());
+        }
+        if kind == UNIX_DIAG_VFS && file.is_none() {
+            let (Some(ino), 8) = (ne_u32(value, 0), value.len()) else {
+                return Err(DumpFault::Torn("a bound file attribute of another size"));
+            };
+            file = Some(BoundFile { ino });
+        }
+    }
+    Ok(name
+        .filter(|name| state == LINUX_TCP_LISTEN && !name.is_empty())
+        .map(|path| UnixDiagListener {
+            inode: u64::from(inode),
+            path,
+            file,
+        }))
+}
+
+/// One datagram of the answer to request `seq`, its records' listeners appended to `into` when
+/// the whole datagram reads: a `SOCK_DIAG_BY_FAMILY` record in state `TCP_LISTEN` whose
+/// `UNIX_DIAG_NAME` attribute holds a path, with the file its `UNIX_DIAG_VFS` attribute names. A
+/// name is its attribute's bytes before the first NUL (the kernel's copy of `sun_path` ends with
+/// one), whatever bytes they are: each record and attribute is length-delimited, so no socket name
+/// can make a second record, which `/proc/net/unix`'s text allows. An abstract name (a leading
+/// NUL) and a record with no name are left out.
+///
+/// # Errors
+///
+/// A [`DumpFault`]: the datagram is empty or torn (a file attribute not 8 bytes long included),
+/// answers another request, carries an error or an overrun, or marks the dump interrupted.
+/// Nothing is appended then.
+pub fn unix_diag_listeners(
+    datagram: &[u8],
+    seq: u32,
+    into: &mut Vec<UnixDiagListener>,
+) -> Result<Dump, DumpFault> {
+    if datagram.is_empty() {
+        return Err(DumpFault::Torn("an empty datagram"));
+    }
+    let mut read = Vec::new();
+    let mut dump = Dump::More;
+    for message in nl_messages(datagram) {
+        let message = message.map_err(DumpFault::Torn)?;
+        if message.seq != seq {
+            return Err(DumpFault::Torn("a message of another request"));
+        }
+        if message.flags & NLM_F_DUMP_INTR != 0 {
+            return Err(DumpFault::Interrupted);
+        }
+        let errno = || {
+            message
+                .payload
+                .get(..4)
+                .and_then(|b| Some(i32::from_ne_bytes(b.try_into().ok()?)))
+                .ok_or(DumpFault::Torn("an error or end cut short"))
+        };
+        match message.kind {
+            NLMSG_NOOP => {}
+            NLMSG_ERROR => match errno()? {
+                e if e < 0 => return Err(DumpFault::Refused(e.saturating_neg())),
+                _ => return Err(DumpFault::Torn("an acknowledgement nobody asked for")),
+            },
+            NLMSG_DONE => match errno()? {
+                e if e < 0 => return Err(DumpFault::Refused(e.saturating_neg())),
+                _ => {
+                    dump = Dump::Done;
+                    break;
+                }
+            },
+            NLMSG_OVERRUN => return Err(DumpFault::Torn("an overrun")),
+            SOCK_DIAG_BY_FAMILY => read.extend(unix_diag_record(message.payload)?),
+            _ => return Err(DumpFault::Torn("a message of another type")),
+        }
+    }
+    into.append(&mut read);
+    Ok(dump)
+}
+
 /// Count `socket:[...]` symlinks inside a `/proc/<pid>/fd` directory (at most 4096 descriptors).
 #[must_use]
 pub fn open_sockets_in_fd_dir(fd_dir: &Path) -> Option<u32> {
@@ -680,8 +937,8 @@ pub fn open_sockets_in_fd_dir(fd_dir: &Path) -> Option<u32> {
 pub fn loadavg_tasks(text: &str) -> Option<u64> {
     let line = whole_lines(text).next()?;
     let (running, total) = line.split_whitespace().nth(3)?.split_once('/')?;
-    let total: u64 = total.parse().ok()?;
-    (running.parse::<u64>().is_ok() && total > 0).then_some(total)
+    let total: u64 = crate::parse_uint(total)?;
+    (crate::parse_uint::<u64>(running).is_some() && total > 0).then_some(total)
 }
 
 /// One PSI file's ten-second averages (`/proc/pressure/memory`): the share of wall time some task, and every task, stalled on memory.
@@ -708,10 +965,10 @@ pub fn psi(text: &str) -> Option<Psi> {
             if it.next()? != kind {
                 return None;
             }
-            it.find_map(|f| f.strip_prefix("avg10="))?
-                .parse::<f32>()
+            let raw = it.find_map(|f| f.strip_prefix("avg10="))?;
+            raw.parse::<f32>()
                 .ok()
-                .filter(|v| v.is_finite() && *v >= 0.0)
+                .filter(|v| !raw.starts_with('+') && v.is_finite() && *v >= 0.0)
         })
     };
     Some(Psi {
@@ -902,11 +1159,11 @@ pub fn cgroup_v2_path(text: &str) -> Option<&str> {
 pub fn cpu_max_millicores(text: &str) -> Option<Option<u32>> {
     let mut it = text.split_whitespace();
     let quota = it.next()?;
-    let period: u64 = it.next()?.parse().ok().filter(|p| *p > 0)?;
+    let period: u64 = crate::parse_uint(it.next()?).filter(|p| *p > 0)?;
     if quota == "max" {
         return Some(None);
     }
-    let quota: u64 = quota.parse().ok()?;
+    let quota: u64 = crate::parse_uint(quota)?;
     let milli = u128::from(quota) * 1000 / u128::from(period);
     Some(Some(u32::try_from(milli).unwrap_or(u32::MAX)))
 }
@@ -918,7 +1175,7 @@ pub fn memory_max(text: &str) -> Option<Option<u64>> {
     if word == "max" {
         return Some(None);
     }
-    word.parse().ok().map(Some)
+    crate::parse_uint(word).map(Some)
 }
 
 /// The most thermal zones [`Root::zones`] reads.
@@ -1079,8 +1336,16 @@ fn system_wall_ms() -> Option<i64> {
 #[must_use]
 pub fn parse_uptime_ns(text: &str) -> Option<u64> {
     let field = text.split_whitespace().next()?;
-    let (whole, frac) = field.split_once('.').unwrap_or((field, ""));
-    if frac.len() > 9 || !frac.bytes().all(|b| b.is_ascii_digit()) {
+    let (whole, frac) = match field.split_once('.') {
+        Some((_, "")) => return None,
+        Some(parts) => parts,
+        None => (field, ""),
+    };
+    if whole.is_empty()
+        || !whole.bytes().all(|b| b.is_ascii_digit())
+        || frac.len() > 9
+        || !frac.bytes().all(|b| b.is_ascii_digit())
+    {
         return None;
     }
     let secs: u64 = whole.parse().ok()?;
@@ -1251,7 +1516,7 @@ impl Root {
                 let c = self
                     .read(
                         &format!("sys/devices/system/cpu/cpu{id}/cpu_capacity"),
-                        |t| t.trim().parse::<u32>().ok(),
+                        |t| crate::parse_uint::<u32>(t.trim()),
                     )
                     .flatten()?;
                 Some((*id, c))
@@ -1267,12 +1532,17 @@ impl Root {
                 let cpu = format!("sys/devices/system/cpu/cpu{id}");
                 let midr = self
                     .read(&format!("{cpu}/regs/identification/midr_el1"), |t| {
-                        u64::from_str_radix(t.trim().trim_start_matches("0x"), 16).ok()
+                        let t = t.trim();
+                        let h = t.strip_prefix("0x").unwrap_or(t);
+                        h.bytes()
+                            .all(|b| b.is_ascii_hexdigit())
+                            .then(|| u64::from_str_radix(h, 16).ok())
+                            .flatten()
                     })
                     .flatten()?;
                 let top = self
                     .read(&format!("{cpu}/cpufreq/cpuinfo_max_freq"), |t| {
-                        t.trim().parse::<u64>().ok()
+                        crate::parse_uint::<u64>(t.trim())
                     })
                     .flatten();
                 Some((*id, (midr & MIDR_DESIGN, top)))
@@ -1377,7 +1647,7 @@ impl Root {
     /// The thermal zones (`/sys/class/thermal/thermal_zoneN`), at most [`MAX_ZONES`], each with its temperature and up to [`MAX_TRIPS`] passive, hot and critical trips.
     #[must_use]
     pub fn zones(&self) -> Vec<Zone> {
-        let int = |t: &str| t.trim().parse::<i64>().ok();
+        let int = |t: &str| crate::parse_int::<i64>(t.trim());
         self.numbered("sys/class/thermal", "thermal_zone", MAX_ZONES)
             .into_iter()
             .filter_map(|(_, name)| {
@@ -1406,7 +1676,7 @@ impl Root {
     /// The CPUs' thermal throttle events since boot, summed.
     #[must_use]
     pub fn throttle_count(&self) -> Option<u64> {
-        let int = |t: &str| t.trim().parse::<u64>().ok();
+        let int = |t: &str| crate::parse_uint::<u64>(t.trim());
         let mut sum: Option<u64> = None;
         for id in self.present_or_parallelism().into_iter().take(256) {
             for counter in ["core_throttle_count", "package_throttle_count"] {
@@ -1461,7 +1731,7 @@ impl Root {
                 Err(Why::NotRead)
             } else if driver == "amdgpu" {
                 self.read(&format!("{dev}/gpu_busy_percent"), |t| {
-                    t.trim().parse::<u32>().ok()
+                    crate::parse_uint::<u32>(t.trim())
                 })
                 .flatten()
                 .map(|p| u8::try_from(p.min(100)).unwrap_or(100))
@@ -1520,7 +1790,7 @@ impl Root {
             let Some(pid) = entry
                 .file_name()
                 .to_str()
-                .and_then(|s| s.parse::<u32>().ok())
+                .and_then(crate::parse_uint::<u32>)
             else {
                 continue;
             };

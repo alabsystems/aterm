@@ -1208,6 +1208,7 @@ aterm-core	fea06ab0077f43e3	wall-backstop	aterm_core::render::EffectStreamDamage
 aterm-core	ffcb4982b75c06fa	rss-backstop	aterm_core::terminal::render_cells::<impl aterm_core::terminal::state::Terminal>::rotate_scrolled_scratch hardened_panic_boundary crates/aterm-core/src/terminal/render_cells.rs:893 `rows - n`
 aterm-ctl	-	cancelled	0
 aterm-dbus	-	cancelled	0
+aterm-dirfd	-	cancelled	0
 aterm-effects	-	cancelled	0
 aterm-effects	000222e16930585b	rss-backstop	aterm_effects::cursor_glow::ink_ledger::letter_guard::LetterGuard::paint::layer::at hardened_panic_boundary crates/aterm-effects/src/cursor_glow/ink_ledger/letter_guard.rs:926 `more[mi]`
 aterm-effects	000e94a81562229a	rss-backstop	aterm_effects::aos_momentum::policy::measure_trace arithmetic_overflow_add crates/aterm-effects/src/aos_momentum/policy.rs:1543 `ticks += 1`
@@ -15691,6 +15692,77 @@ aterm-hash	e1998e0965577fc0	wall-backstop	aterm_hash::hash_bytes slice_bounds_ch
 aterm-http	-	cancelled	0
 aterm-keeper	-	cancelled	0
 aterm-lexicon	-	cancelled	0
+aterm-link	-	cancelled	0
+aterm-link	0211a8b51b685dbe	rss-backstop	<aterm_link::fabric::FaceRead as core::cmp::PartialEq>::eq unreachable crates/aterm-link/src/fabric.rs:5108 `PartialEq`
+aterm-link	024479462e84ba90	rss-backstop	aterm_link::fabric_brief::render arithmetic_overflow_add crates/aterm-link/src/fabric_brief.rs:487 `used += line_tokens(&line)`
+aterm-link	074dadca661820fa	rss-backstop	aterm_link::wait_tally::Hist::since index_out_of_bounds crates/aterm-link/src/wait_tally.rs:308 `self.buckets[i]`
+aterm-link	0811b6d5bb7b533f	rss-backstop	aterm_link::fabric_brief::render arithmetic_overflow_sub crates/aterm-link/src/fabric_brief.rs:458 `shown.len() - i`
+aterm-link	098a3263e3e516ab	rss-backstop	aterm_link::fabric_brief::render hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:458 `more += shown.len() - i`
+aterm-link	0c8ac2669680c0d1	rss-backstop	<aterm_link::state::journal::Frame as core::cmp::PartialEq>::eq unreachable crates/aterm-link/src/state/journal.rs:60 `PartialEq`
+aterm-link	0e7d2f48e8ac2364	rss-backstop	aterm_link::wait_tally::Hist::floor hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:267 `(1u64 << (i - 1).min(63)) << unit.shift()`
+aterm-link	1884071c869688b7	rss-backstop	aterm_link::fabric_brief::render hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:477 `folded += 1`
+aterm-link	1bdbd350ac33cb53	rss-backstop	aterm_link::wait_tally::Tally::since index_out_of_bounds crates/aterm-link/src/wait_tally.rs:609 `self.rows[i]`
+aterm-link	1f57e203baca7237	rss-backstop	aterm_link::notify::Notifier::on_record arithmetic_overflow_add crates/aterm-link/src/notify.rs:1885 `self.counts.skipped += 1`
+aterm-link	20b11769e9aa1250	rss-backstop	aterm_link::wait_tally::Hist::floor hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:267 `(1u64 << (i - 1).min(63))`
+aterm-link	212f6c49b3a79063	rss-backstop	aterm_link::notify::Notifier::on_record hardened_panic_boundary crates/aterm-link/src/notify.rs:1891 `self.counts.standing += 1`
+aterm-link	225c1241356fb7c8	rss-backstop	aterm_link::fabric_brief::render hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:461 `(left / (shown.len() - i))`
+aterm-link	229574baefb15d03	rss-backstop	aterm_link::notify::Notifier::advance arithmetic_overflow_add crates/aterm-link/src/notify.rs:1688 `lag.records += 1`
+aterm-link	2361055d92137f0e	rss-backstop	aterm_link::fabric_brief::render hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:480 `foreign += space.foreign`
+aterm-link	2377090965fb1621	rss-backstop	aterm_link::fabric_brief::render arithmetic_overflow_add crates/aterm-link/src/fabric_brief.rs:458 `more += shown.len() - i`
+aterm-link	2c3850149e96388f	rss-backstop	aterm_link::fabric_brief::render arithmetic_overflow_add crates/aterm-link/src/fabric_brief.rs:475 `partial += 1`
+aterm-link	3346d2e4db12d134	rss-backstop	aterm_link::wait_tally::Hist::since hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:308 `self.buckets[i]`
+aterm-link	33ee17a69e7aa6b9	rss-backstop	aterm_link::wait_tally::Hist::floor shift_overflow_shl crates/aterm-link/src/wait_tally.rs:267 `(1u64 << (i - 1).min(63)) << unit.shift()`
+aterm-link	3752b25f84a580ed	rss-backstop	aterm_link::fabric_brief::render arithmetic_overflow_add crates/aterm-link/src/fabric_brief.rs:478 `dup += space.dup`
+aterm-link	387e316f4f699725	rss-backstop	aterm_link::wait_tally::Tally::since hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:609 `self.rows[i]`
+aterm-link	40095d2514c56067	rss-backstop	aterm_link::fabric_brief::render hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:475 `partial += 1`
+aterm-link	445992d0e8007d7c	rss-backstop	aterm_link::fabric_brief::render arithmetic_overflow_sub crates/aterm-link/src/fabric_brief.rs:461 `(shown.len() - i)`
+aterm-link	47162679d0dbe3d6	rss-backstop	aterm_link::fabric_brief::render arithmetic_overflow_add crates/aterm-link/src/fabric_brief.rs:479 `reordered += space.reordered`
+aterm-link	4a36bdd04e239ad6	rss-backstop	aterm_link::fabric_brief::render division_by_zero crates/aterm-link/src/fabric_brief.rs:461 `(left / (shown.len() - i))`
+aterm-link	4a7ac57e82f37e78	rss-backstop	aterm_link::wait_tally::Hist::since::{closure#1} index_out_of_bounds crates/aterm-link/src/wait_tally.rs:313 `earlier.buckets[i]`
+aterm-link	51ebfa14f79d61a8	rss-backstop	aterm_link::notify::Notifier::on_record arithmetic_overflow_add crates/aterm-link/src/notify.rs:1917 `self.counts.dropped += 1`
+aterm-link	570d41f11a4064b0	rss-backstop	<aterm_link::bridge::Unfetched as core::cmp::PartialEq>::eq unreachable crates/aterm-link/src/bridge.rs:821 `PartialEq`
+aterm-link	5b88a5cd55fba11b	rss-backstop	aterm_link::fabric_brief::render hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:461 `(shown.len() - i)`
+aterm-link	5cfb374264133f52	rss-backstop	<aterm_link::notify::Stand as core::cmp::PartialEq>::eq unreachable crates/aterm-link/src/notify.rs:449 `PartialEq`
+aterm-link	5d9e238b65f9dd94	rss-backstop	aterm_link::notify::Notifier::on_record hardened_panic_boundary crates/aterm-link/src/notify.rs:1885 `self.counts.skipped += 1`
+aterm-link	5ec7fd764dee70cf	rss-backstop	aterm_link::wait_tally::Tally::since::{closure#1} index_out_of_bounds crates/aterm-link/src/wait_tally.rs:611 `Row::ALL[i]`
+aterm-link	61b80e1cf063d707	rss-backstop	<aterm_link::fabric::Off as core::cmp::PartialEq>::eq unreachable crates/aterm-link/src/fabric.rs:2646 `PartialEq`
+aterm-link	6388e1a0f373147e	rss-backstop	aterm_link::notify::Notifier::on_record arithmetic_overflow_add crates/aterm-link/src/notify.rs:1905 `self.suppressed + 1`
+aterm-link	63ed858091e8e76d	rss-backstop	aterm_link::fabric_brief::render arithmetic_overflow_sub crates/aterm-link/src/fabric_brief.rs:464 `share - head_t`
+aterm-link	654705e432a991b6	rss-backstop	aterm_link::wait_tally::Hist::floor hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:267 `(i - 1)`
+aterm-link	6fd54875967dda05	rss-backstop	aterm_link::fabric_brief::render arithmetic_overflow_add crates/aterm-link/src/fabric_brief.rs:480 `foreign += space.foreign`
+aterm-link	7ef028fce8de5fc3	rss-backstop	aterm_link::wait_tally::Hist::since::{closure#1} index_out_of_bounds crates/aterm-link/src/wait_tally.rs:314 `self.buckets[i]`
+aterm-link	7f5055a7845cfb9f	rss-backstop	aterm_link::fabric_brief::render hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:481 `used += head_t + body_t`
+aterm-link	8026628bfa73ce79	rss-backstop	aterm_link::notify::Notifier::take_one::{closure#0} arithmetic_overflow_add crates/aterm-link/src/notify.rs:2301 `h.subject.len() + h.body.len()`
+aterm-link	8bb88fe0a3b9578f	rss-backstop	aterm_link::wait_tally::Hist::top::{closure#1} arithmetic_overflow_add crates/aterm-link/src/wait_tally.rs:294 `i + 1`
+aterm-link	8e31a3ea34290896	rss-backstop	aterm_link::notify::Notifier::verdicts hardened_panic_boundary crates/aterm-link/src/notify.rs:1751 `self.counts.fired + self.counts.dropped`
+aterm-link	8e7ebd407177de58	rss-backstop	aterm_link::fabric_brief::render hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:478 `dup += space.dup`
+aterm-link	94109d6dead4732a	rss-backstop	aterm_link::notify::Notifier::on_record hardened_panic_boundary crates/aterm-link/src/notify.rs:1917 `self.counts.dropped += 1`
+aterm-link	9743ba28059fc55d	rss-backstop	aterm_link::wait_tally::Tally::since::{closure#1} hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:611 `Row::ALL[i]`
+aterm-link	a2ac5ee46e2a5125	rss-backstop	aterm_link::wait_tally::Hist::since::{closure#1} hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:313 `earlier.buckets[i]`
+aterm-link	ac3d5961c23fb619	rss-backstop	aterm_link::wait_tally::Hist::top arithmetic_overflow_add crates/aterm-link/src/wait_tally.rs:294 `i + 1`
+aterm-link	b60cb31fa54f6cea	rss-backstop	aterm_link::fabric_brief::render hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:479 `reordered += space.reordered`
+aterm-link	b7462ab6e84f91fb	rss-backstop	aterm_link::wait_tally::Hist::since::{closure#1} hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:314 `self.buckets[i]`
+aterm-link	babf2ff556533207	rss-backstop	aterm_link::notify::Notifier::take_one::{closure#0} hardened_panic_boundary crates/aterm-link/src/notify.rs:2301 `h.subject.len() + h.body.len()`
+aterm-link	bc89177ca25bfa3a	rss-backstop	aterm_link::fabric_brief::render hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:481 `head_t + body_t`
+aterm-link	bcf144be669ab4a7	rss-backstop	aterm_link::notify::Notifier::take_one::{closure#1} slice_bounds_check crates/aterm-link/src/notify.rs:2356 `[idx]`
+aterm-link	c3ab39139c587f17	rss-backstop	aterm_link::fabric_brief::render hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:464 `share - head_t`
+aterm-link	c518112850c1c6e2	rss-backstop	<aterm_link::enable::Unset as core::cmp::PartialEq>::eq unreachable crates/aterm-link/src/enable.rs:2087 `PartialEq`
+aterm-link	c7ce6bf2d2d3f219	rss-backstop	aterm_link::notify::Notifier::on_record hardened_panic_boundary crates/aterm-link/src/notify.rs:1905 `self.suppressed + 1`
+aterm-link	c999c221a4ab0eef	rss-backstop	aterm_link::notify::Notifier::verdicts arithmetic_overflow_add crates/aterm-link/src/notify.rs:1751 `self.counts.fired + self.counts.dropped`
+aterm-link	c9a9ec440497d291	rss-backstop	aterm_link::fabric_brief::render arithmetic_overflow_add crates/aterm-link/src/fabric_brief.rs:477 `folded += 1`
+aterm-link	d0c265ec348e2764	rss-backstop	aterm_link::fabric_brief::render arithmetic_overflow_add crates/aterm-link/src/fabric_brief.rs:481 `head_t + body_t`
+aterm-link	d45ae2da9c9de2f6	rss-backstop	aterm_link::notify::Notifier::on_record arithmetic_overflow_add crates/aterm-link/src/notify.rs:1891 `self.counts.standing += 1`
+aterm-link	ddefa1c0c1ecc6cd	rss-backstop	aterm_link::wait_tally::Hist::floor arithmetic_overflow_sub crates/aterm-link/src/wait_tally.rs:267 `(i - 1)`
+aterm-link	dff396ba814d4249	rss-backstop	aterm_link::fabric_brief::render hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:487 `used += line_tokens(&line)`
+aterm-link	e060f8fcac5ff9fc	rss-backstop	aterm_link::fabric_brief::render arithmetic_overflow_add crates/aterm-link/src/fabric_brief.rs:481 `used += head_t + body_t`
+aterm-link	e738a97e548ded4b	rss-backstop	<aterm_link::ctl::Reply as core::cmp::PartialEq>::eq unreachable crates/aterm-link/src/ctl.rs:58 `PartialEq`
+aterm-link	e832ba1f6dba76aa	rss-backstop	aterm_link::wait_tally::Hist::top::{closure#1} hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:294 `i + 1`
+aterm-link	f2f664832ee08506	rss-backstop	aterm_link::wait_tally::Hist::floor shift_overflow_shl crates/aterm-link/src/wait_tally.rs:267 `(1u64 << (i - 1).min(63))`
+aterm-link	f4d1c17f67bce28c	rss-backstop	aterm_link::notify::Notifier::advance hardened_panic_boundary crates/aterm-link/src/notify.rs:1688 `lag.records += 1`
+aterm-link	f5d3ebc0653415a2	rss-backstop	<aterm_link::person::Act as core::cmp::PartialEq>::eq unreachable crates/aterm-link/src/person.rs:25 `PartialEq`
+aterm-link	f844e61506d2f4f9	rss-backstop	aterm_link::fabric_brief::render hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:458 `shown.len() - i`
+aterm-link	fbdebecf4dc514a1	rss-backstop	aterm_link::wait_tally::Hist::top hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:294 `i + 1`
+aterm-link	fd96d1e934f1346c	rss-backstop	<aterm_link::fabric::RetireRefusal as core::cmp::PartialEq>::eq unreachable crates/aterm-link/src/fabric.rs:3874 `PartialEq`
 aterm-log	-	cancelled	0
 aterm-machines	-	cancelled	0
 aterm-machines	00135a80b76f8425	rss-backstop	aterm_machines::port::secret::Secret::new assertion crates/aterm-machines/src/port/secret.rs:35 `secret.bytes`
@@ -15892,6 +15964,7 @@ aterm-machines	fbdb2ee003030d00	rss-backstop	aterm_machines::init_preferences::p
 aterm-machines	fbdb2ee003030d00	rss-backstop	aterm_machines::init_preferences::parse_mapping arithmetic_overflow_add crates/aterm-machines/src/init_preferences.rs:504 `at += 1`
 aterm-machines	fce2436ddcef0014	rss-backstop	aterm_machines::controller::inventory::host_block::{closure#4} arithmetic_overflow_add crates/aterm-machines/src/controller/inventory.rs:645 `last + i + 1`
 aterm-machines	ffd5d72c9b996886	rss-backstop	<aterm_machines::items::homebrew::RubyState as core::cmp::PartialEq>::eq unreachable crates/aterm-machines/src/items/homebrew.rs:298 `PartialEq`
+aterm-models-session	-	cancelled	0
 aterm-net	-	cancelled	0
 aterm-observe	-	cancelled	0
 aterm-phase	-	cancelled	158
@@ -15977,6 +16050,29 @@ aterm-slog	8dcba23829862e32	wall-backstop	aterm_slog::log::carry::<impl aterm_sl
 aterm-theme-pack	-	cancelled	0
 aterm-toml	-	cancelled	0
 aterm-toolchain	-	cancelled	0
+aterm-types	-	cancelled	0
+aterm-types	25f5bcd80270014a	wall-backstop	aterm_types::rfc3339::civil_from_days arithmetic_overflow_sub crates/aterm-types/src/rfc3339.rs:17 `(365 * yoe + yoe / 4 - yoe / 100)`
+aterm-types	325fc3a11a196f15	wall-backstop	aterm_types::rfc3339::civil_from_days arithmetic_overflow_add crates/aterm-types/src/rfc3339.rs:19 `doy - (153 * mp + 2) / 5 + 1`
+aterm-types	44524b949d33fda5	wall-backstop	aterm_types::scheme_typography::milli_text hardened_panic_boundary crates/aterm-types/src/scheme_typography.rs:269 `b'0' + u8::try_from(frac / 10 % 10).unwrap_or(0)`
+aterm-types	4f06e662d8a1be6e	wall-backstop	aterm_types::scheme_import::base64_decode arithmetic_overflow_add crates/aterm-types/src/scheme_import.rs:1939 `byte - b'0' + 52`
+aterm-types	59dd649914aaf34a	wall-backstop	aterm_types::rfc3339::civil_from_days arithmetic_overflow_sub crates/aterm-types/src/rfc3339.rs:19 `doy - (153 * mp + 2) / 5`
+aterm-types	5dee2614e4947625	wall-backstop	aterm_types::rfc3339::civil_from_days arithmetic_overflow_add crates/aterm-types/src/rfc3339.rs:21 `yoe + era * 400`
+aterm-types	5f9a0490aabf2c95	wall-backstop	aterm_types::rfc3339::civil_from_days arithmetic_overflow_add crates/aterm-types/src/rfc3339.rs:21 `yoe + era * 400 + (m <= 2) as i128`
+aterm-types	60c5b369c5669340	wall-backstop	aterm_types::scheme_import::base64_decode arithmetic_overflow_sub crates/aterm-types/src/scheme_import.rs:1951 `(1 << bits) - 1`
+aterm-types	7118b454a4e0f8ff	wall-backstop	aterm_types::rfc3339::civil_from_days arithmetic_overflow_add crates/aterm-types/src/rfc3339.rs:19 `(153 * mp + 2)`
+aterm-types	7975911aa765c4e9	wall-backstop	aterm_types::rfc3339::civil_from_days arithmetic_overflow_sub crates/aterm-types/src/rfc3339.rs:17 `doe - (365 * yoe + yoe / 4 - yoe / 100)`
+aterm-types	96fd3f6db8ffabcc	wall-backstop	aterm_types::scheme_typography::milli_text hardened_panic_boundary crates/aterm-types/src/scheme_typography.rs:268 `b'0' + u8::try_from(frac / 100).unwrap_or(0)`
+aterm-types	9c87a94a6a255457	wall-backstop	aterm_types::rfc3339::days_from_civil arithmetic_overflow_add crates/aterm-types/src/rfc3339.rs:36 `era * 146_097 + doe`
+aterm-types	cb93c4520fb997ee	wall-backstop	aterm_types::scheme_typography::milli_text hardened_panic_boundary crates/aterm-types/src/scheme_typography.rs:270 `b'0' + u8::try_from(frac % 10).unwrap_or(0)`
+aterm-types	cc2ca2e0ab9db6b8	wall-backstop	aterm_types::rfc3339::days_from_civil arithmetic_overflow_sub crates/aterm-types/src/rfc3339.rs:36 `era * 146_097 + doe - 719_468`
+aterm-types	ce9942d1ed6a021b	wall-backstop	aterm_types::scheme_import::base64_decode arithmetic_overflow_add crates/aterm-types/src/scheme_import.rs:1938 `byte - b'a' + 26`
+aterm-update	-	cancelled	0
+aterm-update	2ac1acd06086c3c8	wall-backstop	aterm_update::status::_::<impl aterm_serde::ser::Serialize for aterm_update::status::Status<'_>>::serialize hardened_panic_boundary crates/aterm-update/src/status.rs:13 `Serialize`
+aterm-update	2ac1acd06086c3c8	wall-backstop	aterm_update::status::_::<impl aterm_serde::ser::Serialize for aterm_update::status::Status<'_>>::serialize hardened_panic_boundary crates/aterm-update/src/status.rs:13 `Serialize`
+aterm-update	5b2e3a2861c61e57	wall-backstop	<aterm_update::health::_#1::<impl aterm_serde::de::Deserialize<'_> for aterm_update::health::Health>::deserialize::__Visitor<'_> as aterm_serde::de::Visitor<'_>>::visit_map unreachable crates/aterm-update/src/health.rs:16 `Deserialize`
+aterm-update	78ec7743a108f879	wall-backstop	aterm_update::status::_::<impl aterm_serde::ser::Serialize for aterm_update::status::Status<'_>>::serialize arithmetic_overflow_add crates/aterm-update/src/status.rs:13 `Serialize`
+aterm-update	78ec7743a108f879	wall-backstop	aterm_update::status::_::<impl aterm_serde::ser::Serialize for aterm_update::status::Status<'_>>::serialize arithmetic_overflow_add crates/aterm-update/src/status.rs:13 `Serialize`
+aterm-update	9b60fd70ab0a4398	wall-backstop	<aterm_update::health::_#1::<impl aterm_serde::de::Deserialize<'_> for aterm_update::health::Health>::deserialize::__Visitor<'_> as aterm_serde::de::Visitor<'_>>::visit_seq unreachable crates/aterm-update/src/health.rs:16 `Deserialize`
 aterm-update-core	-	cancelled	0
 aterm-verify	-	cancelled	0
 aterm-verify	01ed85c209709361	wall-backstop	aterm_verify::perf::trend::civil_date arithmetic_overflow_div crates/aterm-verify/src/perf/trend.rs:360 `doe / 146_096`
@@ -16102,205 +16198,178 @@ aterm-window	-	cancelled	0
 aterm-winit-keymap	-	cancelled	0
 aterm-winsign	-	cancelled	0
 atpkg	-	cancelled	0
-atpkg	00c09d433139a50c	rss-backstop	atpkg::build_cache::stale::unit_hash::{closure#0}::{closure#2} arithmetic_overflow_add crates/atpkg/src/build_cache_stale.rs:253 `i + 1`
 atpkg	01d123141e6a1d72	rss-backstop	atpkg::packages_log::redact_urls arithmetic_overflow_add crates/atpkg/src/packages_log.rs:528 `at + 3`
-atpkg	01facb3ba9d27170	wall-backstop	atpkg::abrew::commands::format_columns arithmetic_overflow_sub crates/atpkg/src/abrew/commands.rs:4668 `(width + gap) / cols - gap`
+atpkg	01facb3ba9d27170	wall-backstop	atpkg::abrew::commands::format_columns arithmetic_overflow_sub crates/atpkg/src/abrew/commands.rs:5330 `(width + gap) / cols - gap`
+atpkg	02b37e794e6189bd	rss-backstop	atpkg::build_admit::read_arming hardened_panic_boundary crates/atpkg/src/build_admit.rs:1376 `got[2]`
 atpkg	02eeb1776541c629	rss-backstop	atpkg::openpgp::hashed_subpackets hardened_panic_boundary crates/atpkg/src/openpgp.rs:464 `((usize::from(first) - 192) << 8) + usize::from(second)`
-atpkg	0309ba056ad8e459	rss-backstop	atpkg::abrew::commands::cmd_unpin arithmetic_overflow_add crates/atpkg/src/abrew/commands.rs:6343 `failures += 1`
-atpkg	0309ba056ad8e459	rss-backstop	atpkg::abrew::commands::cmd_unpin arithmetic_overflow_add crates/atpkg/src/abrew/commands.rs:6368 `failures += 1`
-atpkg	0309ba056ad8e459	rss-backstop	atpkg::abrew::commands::cmd_unpin arithmetic_overflow_add crates/atpkg/src/abrew/commands.rs:6375 `failures += 1`
-atpkg	042cd2e986a89fc0	rss-backstop	atpkg::seam::bin_holds_exactly arithmetic_overflow_add crates/atpkg/src/seam.rs:867 `seen += 1`
+atpkg	042cd2e986a89fc0	rss-backstop	atpkg::seam::bin_holds_exactly arithmetic_overflow_add crates/atpkg/src/seam.rs:869 `seen += 1`
 atpkg	045f96edce7de7e8	rss-backstop	atpkg::yolo::marker_matches slice_bounds_check crates/atpkg/src/yolo.rs:89 `bytes[1]`
 atpkg	049bc05b7c76a021	rss-backstop	<atpkg::vendor_direct::resolve::Head as core::cmp::PartialEq>::eq unreachable crates/atpkg/src/vendor_direct/resolve.rs:36 `PartialEq`
-atpkg	06565b482d360252	rss-backstop	atpkg::selfsetup::rm_link arithmetic_overflow_add crates/atpkg/src/selfsetup.rs:1739 `s.kept += 1`
+atpkg	04ba61b39107b6c5	rss-backstop	atpkg::build_admit::becoming::read_at_load unbounded_allocation crates/atpkg/src/build_admit_exec.rs:43 `Vec::with_capacity(SIGNALS.len())`
+atpkg	06565b482d360252	rss-backstop	atpkg::selfsetup::rm_link arithmetic_overflow_add crates/atpkg/src/selfsetup.rs:2074 `s.kept += 1`
 atpkg	068bc076803767b1	rss-backstop	atpkg::vendor_direct::watch::HeadWatch::check_pending_with_index_in_flight assertion @sysroot/core/src/macros/mod.rs:51 `-`
 atpkg	069c38ab8ca854a7	rss-backstop	atpkg::openpgp::hashed_subpackets unreachable crates/atpkg/src/openpgp.rs:451 `fn hashed_subpackets(area: &[u8]) -> Result<Hashed<'_>, PgpError> { … }`
-atpkg	06f0ff7fda17fcea	rss-backstop	atpkg::doctor::plist_bundle_version slice_bounds_check crates/atpkg/src/doctor.rs:4489 `[..end]`
-atpkg	073f0c57d8096576	rss-backstop	atpkg::status::held::begin arithmetic_overflow_add crates/atpkg/src/status.rs:648 `h.depth += 1`
+atpkg	06f0ff7fda17fcea	rss-backstop	atpkg::doctor::plist_bundle_version slice_bounds_check crates/atpkg/src/doctor.rs:4726 `[..end]`
+atpkg	073f0c57d8096576	rss-backstop	atpkg::status::held::begin arithmetic_overflow_add crates/atpkg/src/status.rs:650 `h.depth += 1`
 atpkg	07b5cbab666341dc	rss-backstop	atpkg::vendor_direct::lane::Reads::fill slice_bounds_check crates/atpkg/src/vendor_direct/lane.rs:582 `[i]`
-atpkg	07c383001e0356db	rss-backstop	atpkg::build_cache::look hardened_panic_boundary crates/atpkg/src/build_cache.rs:611 `depth + 1`
-atpkg	07c383001e0356db	rss-backstop	atpkg::build_cache::look hardened_panic_boundary crates/atpkg/src/build_cache.rs:612 `depth + 1`
-atpkg	07fdfabdcbeebb49	rss-backstop	atpkg::cli::report_vendor hardened_panic_boundary crates/atpkg/src/cli.rs:12039 `pass.failures += 1`
+atpkg	07fdfabdcbeebb49	rss-backstop	atpkg::cli::report_vendor hardened_panic_boundary crates/atpkg/src/cli.rs:12431 `pass.failures += 1`
+atpkg	08273ab8f13f523e	rss-backstop	atpkg::build_cache::registered::package::invoke slice_bounds_check crates/atpkg/src/build_cache_package.rs:1292 `[1..]`
 atpkg	08519a3cfcf768f9	rss-backstop	atpkg::lineage::parse_version hardened_panic_boundary crates/atpkg/src/lineage.rs:1055 `i + 10`
-atpkg	0911ea85e12caacc	rss-backstop	atpkg::build_cache::stale::unit_hash::{closure#0}::{closure#2} arithmetic_overflow_add crates/atpkg/src/build_cache_stale.rs:253 `i + 17`
 atpkg	09172c3225ce84da	rss-backstop	atpkg::reroute::signpost_block::{closure#0} unreachable crates/atpkg/src/reroute.rs:404 `|verb: &str, claim: &str| { … }`
 atpkg	094289e90fe4d256	rss-backstop	atpkg::net::ahead_of_walk arithmetic_overflow_add crates/atpkg/src/net.rs:550 `replays += 1`
-atpkg	0947139d6e4a38e5	rss-backstop	atpkg::yolo::is_shell_safe_marker index_out_of_bounds crates/atpkg/src/yolo.rs:68 `bytes[1]`
-atpkg	0a6d4a22b213e81b	rss-backstop	atpkg::cli::run_update_pass_in hardened_panic_boundary crates/atpkg/src/cli.rs:8838 `failures += report_channel_apply(layout, installed, &report, &vendor_failed, true)`
-atpkg	0aa87c6709ab8d19	rss-backstop	atpkg::build_cache::stale::compiler slice_bounds_check crates/atpkg/src/build_cache_stale.rs:270 `[..end]`
-atpkg	0ab0b3222d6bd96e	rss-backstop	atpkg::abrew::commands::cmd_outdated hardened_panic_boundary crates/atpkg/src/abrew/commands.rs:5178 `collected[0]`
-atpkg	0b4a456b9e70c045	rss-backstop	atpkg::abrew::bundle::parse_brewfile::{closure#0} arithmetic_overflow_add crates/atpkg/src/abrew/bundle.rs:162 `end + quote.len_utf8()`
-atpkg	0b77ed786aab5337	rss-backstop	atpkg::doctor::unknown_field_in slice_bounds_check crates/atpkg/src/doctor.rs:906 `[..end]`
-atpkg	0c532fec6290ceb9	rss-backstop	<atpkg::install::FromTree as core::cmp::PartialEq>::eq unreachable crates/atpkg/src/install.rs:196 `PartialEq`
+atpkg	0a6d4a22b213e81b	rss-backstop	atpkg::cli::run_update_pass_in hardened_panic_boundary crates/atpkg/src/cli.rs:9154 `failures += report_channel_apply(layout, installed, &report, &vendor_failed, true)`
+atpkg	0b63478ff3fe7823	rss-backstop	atpkg::zdotdir::ask_zsh division_by_zero crates/atpkg/src/zdotdir.rs:396 `out … .windows(begin.len())`
+atpkg	0b77ed786aab5337	rss-backstop	atpkg::doctor::unknown_field_in slice_bounds_check crates/atpkg/src/doctor.rs:987 `[..end]`
+atpkg	0c532fec6290ceb9	rss-backstop	<atpkg::install::FromTree as core::cmp::PartialEq>::eq unreachable crates/atpkg/src/install.rs:295 `PartialEq`
 atpkg	0caba1ffecc9b327	rss-backstop	atpkg::lineage::Matcher::<'_>::examine hardened_panic_boundary crates/atpkg/src/lineage.rs:936 `5 + n`
 atpkg	0caba1ffecc9b327	rss-backstop	atpkg::lineage::Matcher::<'_>::examine hardened_panic_boundary crates/atpkg/src/lineage.rs:936 `5 + n`
-atpkg	0cb1f45a4ff93d79	rss-backstop	<atpkg::flow::DepResult as core::cmp::PartialEq>::eq unreachable crates/atpkg/src/flow.rs:216 `PartialEq`
+atpkg	0cb1f45a4ff93d79	rss-backstop	<atpkg::flow::DepResult as core::cmp::PartialEq>::eq unreachable crates/atpkg/src/flow.rs:240 `PartialEq`
 atpkg	0d0f4e224b5879f1	rss-backstop	atpkg::lineage::scan_stream arithmetic_overflow_add crates/atpkg/src/lineage.rs:838 `chunk + TAIL + 2`
-atpkg	0d3227c68deb0f2d	rss-backstop	atpkg::build_cache::Sweep::<'_>::prune hardened_panic_boundary crates/atpkg/src/build_cache.rs:426 `incremental += 1`
-atpkg	0d9579876f3ddb63	rss-backstop	atpkg::hooks::write_hooks unbounded_allocation crates/atpkg/src/hooks.rs:235 `Vec::with_capacity(files.len())`
+atpkg	0d9579876f3ddb63	rss-backstop	atpkg::hooks::write_hooks unbounded_allocation crates/atpkg/src/hooks.rs:292 `Vec::with_capacity(files.len())`
 atpkg	0e9757a12b8d9a88	rss-backstop	atpkg::meter::bar arithmetic_overflow_mul crates/atpkg/src/meter.rs:103 `u128::from(done) * (width as u128) * 8`
-atpkg	0ea9a42b6055195c	rss-backstop	atpkg::selfsetup::profile_with_path_block hardened_panic_boundary crates/atpkg/src/selfsetup.rs:2078 `offset + line.len()`
+atpkg	0ea9a42b6055195c	rss-backstop	atpkg::selfsetup::profile_with_path_block hardened_panic_boundary crates/atpkg/src/selfsetup.rs:2445 `offset + line.len()`
 atpkg	0f05cd1d3d2e5241	rss-backstop	atpkg::landing::HandOver::<'_>::parse slice_bounds_check crates/atpkg/src/landing.rs:36 `[1..]`
-atpkg	0f6ffb8c3135a8b6	rss-backstop	atpkg::cli::lease_run_name::{closure#0}::{closure#0} slice_bounds_check crates/atpkg/src/cli.rs:3484 `[0]`
-atpkg	0fa041c19e19ccb0	rss-backstop	atpkg::ops::program_build_of_target arithmetic_overflow_add crates/atpkg/src/ops.rs:115 `i + 1`
+atpkg	0f6ffb8c3135a8b6	rss-backstop	atpkg::cli::lease_run_name::{closure#0}::{closure#0} slice_bounds_check crates/atpkg/src/cli.rs:3636 `[0]`
 atpkg	100ba68db5c8afee	rss-backstop	atpkg::meter::time_left hardened_panic_boundary crates/atpkg/src/meter.rs:129 `secs.div_ceil(5).max(1) * 5`
 atpkg	10257068f581a8f3	rss-backstop	atpkg::machine::universal_control_from_domain arithmetic_overflow_add crates/atpkg/src/machine.rs:223 `depth += 1`
-atpkg	10e1a9bc095b75a4	rss-backstop	atpkg::build_cache::stale::unit_hash::{closure#0}::{closure#2} hardened_panic_boundary crates/atpkg/src/build_cache_stale.rs:253 `i + 17`
-atpkg	10f812fc3325923b	rss-backstop	atpkg::cli::reclaim_build_cache arithmetic_overflow_add crates/atpkg/src/cli.rs:6358 `removed.len() + retired`
-atpkg	127eb5d01713c342	rss-backstop	atpkg::cli::settle_selfupdate assertion crates/atpkg/src/cli.rs:1667 `command`
-atpkg	13b27c924ce5dd44	rss-backstop	atpkg::selfsetup::rm_link hardened_panic_boundary crates/atpkg/src/selfsetup.rs:1739 `s.kept += 1`
+atpkg	10f812fc3325923b	rss-backstop	atpkg::cli::reclaim_build_cache arithmetic_overflow_add crates/atpkg/src/cli.rs:6675 `removed.len() + retired`
+atpkg	1150917eb4e858f7	rss-backstop	atpkg::zdotdir::ask_zsh hardened_panic_boundary crates/atpkg/src/zdotdir.rs:401 `start + begin.len()`
+atpkg	127eb5d01713c342	rss-backstop	atpkg::cli::settle_selfupdate assertion crates/atpkg/src/cli.rs:1717 `command`
+atpkg	13b27c924ce5dd44	rss-backstop	atpkg::selfsetup::rm_link hardened_panic_boundary crates/atpkg/src/selfsetup.rs:2074 `s.kept += 1`
 atpkg	13f6dfb725c55c8e	rss-backstop	atpkg::net::ahead_of_walk::{closure#5} hardened_panic_boundary crates/atpkg/src/net.rs:554 `asked += 1`
-atpkg	1422c4b5b3be3fa6	rss-backstop	atpkg::cli::pending_state hardened_panic_boundary crates/atpkg/src/cli.rs:2418 `row.bytes_done.saturating_mul(100) / row.bytes_total.max(1)`
-atpkg	154f13e167731f8f	rss-backstop	atpkg::cli::run_update_pass_in arithmetic_overflow_sub crates/atpkg/src/cli.rs:8901 `vendor.failures - failed_before`
-atpkg	154f13e167731f8f	rss-backstop	atpkg::cli::run_update_pass_in arithmetic_overflow_sub crates/atpkg/src/cli.rs:8946 `vendor.failures - failed_before`
+atpkg	1422c4b5b3be3fa6	rss-backstop	atpkg::cli::pending_state hardened_panic_boundary crates/atpkg/src/cli.rs:2492 `row.bytes_done.saturating_mul(100) / row.bytes_total.max(1)`
+atpkg	154f13e167731f8f	rss-backstop	atpkg::cli::run_update_pass_in arithmetic_overflow_sub crates/atpkg/src/cli.rs:9217 `vendor.failures - failed_before`
+atpkg	154f13e167731f8f	rss-backstop	atpkg::cli::run_update_pass_in arithmetic_overflow_sub crates/atpkg/src/cli.rs:9262 `vendor.failures - failed_before`
 atpkg	160bc6e22bbe4b55	rss-backstop	atpkg::dirwatch::imp::Watcher::wait unbounded_allocation crates/atpkg/src/dirwatch.rs:257 `Vec::with_capacity(got)`
-atpkg	16851c43931b57b7	rss-backstop	<atpkg::seam::Attached as core::cmp::PartialEq>::eq unreachable crates/atpkg/src/seam.rs:1104 `PartialEq`
-atpkg	16f68ec467bdd166	rss-backstop	atpkg::abrew::cask::segment_matches::inner slice_bounds_check crates/atpkg/src/abrew/cask.rs:1503 `p[i + 1]`
-atpkg	17d38f5f667dffc5	rss-backstop	atpkg::abrew::commands::bundle_file arithmetic_overflow_add crates/atpkg/src/abrew/commands.rs:9630 `failures += 1`
-atpkg	182eb36117dfd7c3	rss-backstop	atpkg::abrew::commands::upgrade_formula_names arithmetic_overflow_add crates/atpkg/src/abrew/commands.rs:5474 `failures += 1`
-atpkg	182eb36117dfd7c3	rss-backstop	atpkg::abrew::commands::upgrade_formula_names arithmetic_overflow_add crates/atpkg/src/abrew/commands.rs:5489 `failures += 1`
-atpkg	182eb36117dfd7c3	rss-backstop	atpkg::abrew::commands::upgrade_formula_names arithmetic_overflow_add crates/atpkg/src/abrew/commands.rs:5516 `failures += 1`
-atpkg	182eb36117dfd7c3	rss-backstop	atpkg::abrew::commands::upgrade_formula_names arithmetic_overflow_add crates/atpkg/src/abrew/commands.rs:5538 `failures += 1`
-atpkg	182eb36117dfd7c3	rss-backstop	atpkg::abrew::commands::upgrade_formula_names arithmetic_overflow_add crates/atpkg/src/abrew/commands.rs:5543 `failures += 1`
-atpkg	182eb36117dfd7c3	rss-backstop	atpkg::abrew::commands::upgrade_formula_names arithmetic_overflow_add crates/atpkg/src/abrew/commands.rs:5551 `failures += 1`
+atpkg	16851c43931b57b7	rss-backstop	<atpkg::seam::Attached as core::cmp::PartialEq>::eq unreachable crates/atpkg/src/seam.rs:1106 `PartialEq`
 atpkg	1841cd4046a1de54	rss-backstop	atpkg::openpgp::verify_one arithmetic_overflow_add crates/atpkg/src/openpgp.rs:548 `document.len() + sig.hashed_prefix.len() + 6`
-atpkg	1848a78a778bbc01	wall-backstop	atpkg::macho::load_names arithmetic_overflow_add crates/atpkg/src/macho.rs:202 `8 + i * entry`
-atpkg	18a5dd4fa0667229	rss-backstop	atpkg::abrew::bundle::parse_brewfile::{closure#0} hardened_panic_boundary crates/atpkg/src/abrew/bundle.rs:162 `end + quote.len_utf8()`
-atpkg	18c683c47711e2c9	rss-backstop	atpkg::doctor::short_line arithmetic_overflow_add crates/atpkg/src/doctor.rs:1319 `lead.chars().count() + tail.chars().count()`
-atpkg	191d5195098d8598	rss-backstop	<atpkg::abrew::install::InstallError as core::cmp::PartialEq>::eq unreachable crates/atpkg/src/abrew/install.rs:124 `PartialEq`
-atpkg	192c37db4e74dc89	rss-backstop	atpkg::cli::run_update_pass_in arithmetic_overflow_add crates/atpkg/src/cli.rs:8901 `failures += vendor.failures - failed_before`
-atpkg	192c37db4e74dc89	rss-backstop	atpkg::cli::run_update_pass_in arithmetic_overflow_add crates/atpkg/src/cli.rs:8946 `failures += vendor.failures - failed_before`
-atpkg	19c5f0438a11a6bf	rss-backstop	atpkg::warm::parse_env0::{closure#1}::{closure#3} hardened_panic_boundary crates/atpkg/src/warm.rs:326 `eq + 1`
-atpkg	19cc4413a4720a16	rss-backstop	atpkg::cli::reclaim_build_cache hardened_panic_boundary crates/atpkg/src/cli.rs:6349 `removed.len() - parts`
+atpkg	1848a78a778bbc01	wall-backstop	atpkg::macho::load_names arithmetic_overflow_add crates/atpkg/src/macho.rs:192 `8 + i * entry`
+atpkg	18c683c47711e2c9	rss-backstop	atpkg::doctor::short_line arithmetic_overflow_add crates/atpkg/src/doctor.rs:1404 `lead.chars().count() + tail.chars().count()`
+atpkg	192c37db4e74dc89	rss-backstop	atpkg::cli::run_update_pass_in arithmetic_overflow_add crates/atpkg/src/cli.rs:9217 `failures += vendor.failures - failed_before`
+atpkg	192c37db4e74dc89	rss-backstop	atpkg::cli::run_update_pass_in arithmetic_overflow_add crates/atpkg/src/cli.rs:9262 `failures += vendor.failures - failed_before`
+atpkg	19c5f0438a11a6bf	rss-backstop	atpkg::warm::parse_env0::{closure#1}::{closure#3} hardened_panic_boundary crates/atpkg/src/warm.rs:328 `eq + 1`
+atpkg	19cc4413a4720a16	rss-backstop	atpkg::cli::reclaim_build_cache hardened_panic_boundary crates/atpkg/src/cli.rs:6666 `removed.len() - parts`
 atpkg	1a27b087a86a328a	rss-backstop	atpkg::lineage::scan_file::{closure#0} assertion crates/atpkg/src/lineage.rs:821 `n.saturating_add(1).clamp(TAIL * 2, CHUNK)`
-atpkg	1af2012535312bcd	rss-backstop	atpkg::harness::is_harness arithmetic_overflow_sub crates/atpkg/src/harness.rs:24 `name.len() - tail.len()`
-atpkg	1b6fe5a2ecb53bfc	rss-backstop	atpkg::yolo::decide slice_bounds_check crates/atpkg/src/yolo.rs:376 `[..=i]`
+atpkg	1a49c0e018bc3329	rss-backstop	atpkg::cli::install_default_set_inner::{closure#30} arithmetic_overflow_add crates/atpkg/src/cli.rs:10018 `failures += bootstrap_group( … )`
+atpkg	1b6fe5a2ecb53bfc	rss-backstop	atpkg::yolo::decide slice_bounds_check crates/atpkg/src/yolo.rs:414 `[..=i]`
 atpkg	1c17fc2a3b38a2c7	rss-backstop	atpkg::install::acceptance_fixtures::add_acl assertion @sysroot/core/src/panic.rs:62 `-`
 atpkg	1cdde4e0a1abbef0	rss-backstop	atpkg::vendor_direct::watch::check_shared::{closure#0} hardened_panic_boundary crates/atpkg/src/vendor_direct/watch.rs:1071 `checked_at - last`
-atpkg	1d5c4c40669d0ebf	rss-backstop	atpkg::cli::list_human_lines hardened_panic_boundary crates/atpkg/src/cli.rs:4217 `no_live += 1`
-atpkg	1d65e71b5b520d6e	rss-backstop	atpkg::abrew::cask::segment_matches::inner slice_bounds_check crates/atpkg/src/abrew/cask.rs:1502 `p[i]`
-atpkg	1d65e71b5b520d6e	rss-backstop	atpkg::abrew::cask::segment_matches::inner slice_bounds_check crates/atpkg/src/abrew/cask.rs:1504 `p[i]`
-atpkg	1d65e71b5b520d6e	rss-backstop	atpkg::abrew::cask::segment_matches::inner slice_bounds_check crates/atpkg/src/abrew/cask.rs:1509 `p[i]`
-atpkg	1dbf637acc5e6cf9	rss-backstop	atpkg::gc::running_process_table hardened_panic_boundary crates/atpkg/src/gc.rs:834 `capacity * std::mem::size_of::<libc::c_int>()`
+atpkg	1d5c4c40669d0ebf	rss-backstop	atpkg::cli::list_human_lines hardened_panic_boundary crates/atpkg/src/cli.rs:4432 `no_live += 1`
+atpkg	1dbf637acc5e6cf9	rss-backstop	atpkg::gc::running_process_table hardened_panic_boundary crates/atpkg/src/gc.rs:854 `capacity * std::mem::size_of::<libc::c_int>()`
 atpkg	1e3db0845af5fe20	rss-backstop	atpkg::lineage::Matcher::<'_>::examine hardened_panic_boundary crates/atpkg/src/lineage.rs:954 `6 + 8 + used`
-atpkg	1f24e15adc0fc44c	rss-backstop	atpkg::build_cache::stale::unit_hash::{closure#0} arithmetic_overflow_add crates/atpkg/src/build_cache_stale.rs:248 `i + 17`
 atpkg	1fb6acd3070a7cfc	rss-backstop	atpkg::machine::UniversalControlState::from_reads hardened_panic_boundary crates/atpkg/src/machine.rs:42 `reads[1]`
 atpkg	1fb6acd3070a7cfc	rss-backstop	atpkg::machine::UniversalControlState::from_reads hardened_panic_boundary crates/atpkg/src/machine.rs:44 `reads[1]`
 atpkg	1fbefc43ad78a729	rss-backstop	atpkg::lineage::parse_version hardened_panic_boundary crates/atpkg/src/lineage.rs:1049 `i + 9`
-atpkg	206a5709130fd51c	rss-backstop	atpkg::cli::wait_then_run unbounded_allocation crates/atpkg/src/cli.rs:2293 `Vec::with_capacity(passthrough.len() + 2)`
-atpkg	212804c169b4adc0	rss-backstop	atpkg::caller_shell::env_value hardened_panic_boundary crates/atpkg/src/caller_shell.rs:164 `at + 1`
-atpkg	217065705ac0aaa0	rss-backstop	atpkg::abrew::commands::walk_prune_links hardened_panic_boundary crates/atpkg/src/abrew/commands.rs:6109 `*links += 1`
+atpkg	206a5709130fd51c	rss-backstop	atpkg::cli::wait_then_run unbounded_allocation crates/atpkg/src/cli.rs:2354 `Vec::with_capacity(passthrough.len() + 2)`
+atpkg	212804c169b4adc0	rss-backstop	atpkg::caller_shell::env_value hardened_panic_boundary crates/atpkg/src/caller_shell.rs:166 `at + 1`
+atpkg	21f82fd0c8d4bf43	rss-backstop	atpkg::build_cache::remove::sys::Walk::<'_, '_>::once arithmetic_overflow_add crates/atpkg/src/build_cache_remove.rs:788 `sweeps += 1`
 atpkg	2285a9a6627ae407	rss-backstop	atpkg::openpgp::hashed_subpackets arithmetic_overflow_add crates/atpkg/src/openpgp.rs:464 `((usize::from(first) - 192) << 8) + usize::from(second)`
-atpkg	228b183331ff4766	rss-backstop	atpkg::abrew::cask::brace_expand hardened_panic_boundary crates/atpkg/src/abrew/cask.rs:1623 `depth += 1`
-atpkg	23cfbc3616b9c1a8	rss-backstop	atpkg::selfsetup::profile_with_path_block arithmetic_overflow_add crates/atpkg/src/selfsetup.rs:2084 `offset += line.len()`
-atpkg	241e6cf4ec0bee4f	rss-backstop	atpkg::abrew::commands::LongLister::date hardened_panic_boundary crates/atpkg/src/abrew/commands.rs:6781 `month - 1`
+atpkg	23cfbc3616b9c1a8	rss-backstop	atpkg::selfsetup::profile_with_path_block arithmetic_overflow_add crates/atpkg/src/selfsetup.rs:2451 `offset += line.len()`
 atpkg	25756fffc752701b	rss-backstop	atpkg::vendor_direct::version::Version::revision hardened_panic_boundary crates/atpkg/src/vendor_direct/version.rs:170 `s - 1`
-atpkg	259d2d772104ed4c	rss-backstop	atpkg::abrew::commands::print_update_report hardened_panic_boundary crates/atpkg/src/abrew/commands.rs:5850 `of + oc`
-atpkg	259d2d772104ed4c	rss-backstop	atpkg::abrew::commands::print_update_report hardened_panic_boundary crates/atpkg/src/abrew/commands.rs:5861 `of + oc`
-atpkg	2623effae13b3b1c	rss-backstop	atpkg::doctor::ago hardened_panic_boundary crates/atpkg/src/doctor.rs:3928 `secs / 86_400`
-atpkg	265964131fce52cb	rss-backstop	atpkg::yolo::decide index_out_of_bounds crates/atpkg/src/yolo.rs:369 `head[i]`
-atpkg	265964131fce52cb	rss-backstop	atpkg::yolo::decide index_out_of_bounds crates/atpkg/src/yolo.rs:370 `head[i]`
+atpkg	2623effae13b3b1c	rss-backstop	atpkg::doctor::ago hardened_panic_boundary crates/atpkg/src/doctor.rs:4157 `secs / 86_400`
+atpkg	265964131fce52cb	rss-backstop	atpkg::yolo::decide index_out_of_bounds crates/atpkg/src/yolo.rs:407 `head[i]`
+atpkg	265964131fce52cb	rss-backstop	atpkg::yolo::decide index_out_of_bounds crates/atpkg/src/yolo.rs:408 `head[i]`
 atpkg	26df37ab2b864930	rss-backstop	atpkg::state::system_path slice_bounds_check crates/atpkg/src/state.rs:382 `[..end]`
-atpkg	270ba6b19b44d382	rss-backstop	atpkg::build_cache::look arithmetic_overflow_add crates/atpkg/src/build_cache.rs:611 `depth + 1`
-atpkg	270ba6b19b44d382	rss-backstop	atpkg::build_cache::look arithmetic_overflow_add crates/atpkg/src/build_cache.rs:612 `depth + 1`
-atpkg	272dc959e3cf6225	rss-backstop	atpkg::linkmode::link_if_checkout unbounded_allocation crates/atpkg/src/linkmode.rs:462 `Vec::with_capacity(bins.len())`
+atpkg	272dc959e3cf6225	rss-backstop	atpkg::linkmode::link_if_checkout unbounded_allocation crates/atpkg/src/linkmode.rs:485 `Vec::with_capacity(bins.len())`
 atpkg	274d038265aef11b	rss-backstop	atpkg::meter::spinner hardened_panic_boundary crates/atpkg/src/meter.rs:95 `ASCII[frame % ASCII.len()]`
-atpkg	285101385b51f5e5	wall-backstop	atpkg::macho::load_names hardened_panic_boundary crates/atpkg/src/macho.rs:202 `8 + i * entry`
+atpkg	285101385b51f5e5	wall-backstop	atpkg::macho::load_names hardened_panic_boundary crates/atpkg/src/macho.rs:192 `8 + i * entry`
+atpkg	28845018de22100f	rss-backstop	atpkg::doctor::toolset_findings arithmetic_overflow_add crates/atpkg/src/doctor.rs:3581 `present + missing_unexplained.len()`
 atpkg	28db3bf71f821671	rss-backstop	atpkg::packages_log::sanitize_capped arithmetic_overflow_add crates/atpkg/src/packages_log.rs:506 `count += 1`
 atpkg	295db67a91b866d3	rss-backstop	atpkg::lane::parse_args arithmetic_overflow_add crates/atpkg/src/lane.rs:103 `i += 1`
 atpkg	297f67d8b6e4da85	rss-backstop	atpkg::reroute::run_storeless unreachable @sysroot/core/src/panic.rs:62 `-`
 atpkg	29873d5aac49b7be	rss-backstop	atpkg::lineage::Matcher::<'_>::scan slice_bounds_check crates/atpkg/src/lineage.rs:895 `[i..to]`
 atpkg	29c0b17790c6f0ad	rss-backstop	atpkg::copies::trash_refusal slice_bounds_check crates/atpkg/src/copies.rs:69 `[open..]`
-atpkg	2b004223a6a1e23d	rss-backstop	atpkg::flow::apply_group_txn_inner slice_bounds_check crates/atpkg/src/flow.rs:1856 `[0]`
+atpkg	2b004223a6a1e23d	rss-backstop	atpkg::flow::apply_group_txn_inner slice_bounds_check crates/atpkg/src/flow.rs:1888 `[0]`
+atpkg	2b133f8e3f3e410c	rss-backstop	atpkg::build_cache::remove::sys::Walk::<'_, '_>::stays arithmetic_overflow_add crates/atpkg/src/build_cache_remove.rs:639 `self.left.stayed += 1`
 atpkg	2b6655c514752097	rss-backstop	atpkg::selfupdate::echo_words hardened_panic_boundary crates/atpkg/src/selfupdate.rs:199 `end -= 1`
-atpkg	2b7f46e0d4984738	rss-backstop	atpkg::doctor::exec_root_line slice_bounds_check crates/atpkg/src/doctor.rs:3750 `[0]`
+atpkg	2b7f46e0d4984738	rss-backstop	atpkg::doctor::exec_root_line slice_bounds_check crates/atpkg/src/doctor.rs:3968 `[0]`
 atpkg	2bb89ba2da46df49	rss-backstop	atpkg::net::newest_index arithmetic_overflow_sub crates/atpkg/src/net.rs:206 `miss - hit`
 atpkg	2c20cdcbbc993190	rss-backstop	atpkg::machine::universal_control_from_domain hardened_panic_boundary crates/atpkg/src/machine.rs:238 `found[0]`
-atpkg	2c345dc4462309d5	rss-backstop	atpkg::gc::running_process_table arithmetic_overflow_mul crates/atpkg/src/gc.rs:834 `capacity * std::mem::size_of::<libc::c_int>()`
-atpkg	2c9e56644aa84310	rss-backstop	atpkg::doctor::ago hardened_panic_boundary crates/atpkg/src/doctor.rs:3924 `secs / 60`
+atpkg	2c345dc4462309d5	rss-backstop	atpkg::gc::running_process_table arithmetic_overflow_mul crates/atpkg/src/gc.rs:854 `capacity * std::mem::size_of::<libc::c_int>()`
+atpkg	2c9e56644aa84310	rss-backstop	atpkg::doctor::ago hardened_panic_boundary crates/atpkg/src/doctor.rs:4153 `secs / 60`
 atpkg	2ca061fd1f1982ac	rss-backstop	atpkg::lineage::parse_version arithmetic_overflow_sub crates/atpkg/src/lineage.rs:1019 `i - start`
 atpkg	2ca061fd1f1982ac	rss-backstop	atpkg::lineage::parse_version arithmetic_overflow_sub crates/atpkg/src/lineage.rs:1037 `i - start`
-atpkg	2cc00e10d657b9c7	rss-backstop	atpkg::cli::report_channel_apply arithmetic_overflow_add crates/atpkg/src/cli.rs:12483 `failed_names.len() + also_failed.len()`
+atpkg	2cc00e10d657b9c7	rss-backstop	atpkg::cli::report_channel_apply arithmetic_overflow_add crates/atpkg/src/cli.rs:12875 `failed_names.len() + also_failed.len()`
 atpkg	2ceac1690c254ca8	rss-backstop	atpkg::meter::bar hardened_panic_boundary crates/atpkg/src/meter.rs:104 `width * 8`
 atpkg	2dd744a4b2152ba7	rss-backstop	atpkg::meter::bar hardened_panic_boundary crates/atpkg/src/meter.rs:113 `width - full`
-atpkg	2df65b802bee929c	rss-backstop	atpkg::cli::levenshtein unbounded_allocation crates/atpkg/src/cli.rs:517 `(0..=b_chars.len()).collect()`
-atpkg	2e4288f6a014080c	rss-backstop	atpkg::cli::levenshtein arithmetic_overflow_add crates/atpkg/src/cli.rs:522 `row[j] + 1`
+atpkg	2df65b802bee929c	rss-backstop	atpkg::cli::levenshtein unbounded_allocation crates/atpkg/src/cli.rs:549 `(0..=b_chars.len()).collect()`
+atpkg	2e4288f6a014080c	rss-backstop	atpkg::cli::levenshtein arithmetic_overflow_add crates/atpkg/src/cli.rs:554 `row[j] + 1`
+atpkg	2f89d6d5a7253853	rss-backstop	atpkg::zdotdir::ask_zsh slice_bounds_check crates/atpkg/src/zdotdir.rs:411 `[count_end + 1..]`
 atpkg	2fb9c3f170a99a3e	rss-backstop	atpkg::lineage::find_byte hardened_panic_boundary crates/atpkg/src/lineage.rs:1082 `i + 8`
 atpkg	2fb9c3f170a99a3e	rss-backstop	atpkg::lineage::find_byte hardened_panic_boundary crates/atpkg/src/lineage.rs:1084 `i + 8`
-atpkg	2fe0b28a30f408f3	rss-backstop	atpkg::abrew::commands::upgrade_formula_names assertion @sysroot/core/src/panic.rs:91 `-`
-atpkg	30494077b93809cf	rss-backstop	atpkg::selfsetup::sweep_path_blocks hardened_panic_boundary crates/atpkg/src/selfsetup.rs:1892 `s.removed += 1`
-atpkg	30494077b93809cf	rss-backstop	atpkg::selfsetup::sweep_path_blocks hardened_panic_boundary crates/atpkg/src/selfsetup.rs:1902 `s.removed += 1`
-atpkg	305a964840b014b4	rss-backstop	atpkg::cli::levenshtein arithmetic_overflow_add crates/atpkg/src/cli.rs:522 `(prev[j] + cost)`
-atpkg	30ee3839771ed126	rss-backstop	atpkg::cli::install_default_set_inner::{closure#29}::{closure#2} slice_bounds_check crates/atpkg/src/cli.rs:9642 `[*gi]`
-atpkg	31326c1abfafe98d	rss-backstop	atpkg::compat::differing_bytes hardened_panic_boundary crates/atpkg/src/compat.rs:292 `differing += mismatched as u64`
+atpkg	30494077b93809cf	rss-backstop	atpkg::selfsetup::sweep_path_blocks hardened_panic_boundary crates/atpkg/src/selfsetup.rs:2228 `s.removed += 1`
+atpkg	30494077b93809cf	rss-backstop	atpkg::selfsetup::sweep_path_blocks hardened_panic_boundary crates/atpkg/src/selfsetup.rs:2238 `s.removed += 1`
+atpkg	305a964840b014b4	rss-backstop	atpkg::cli::levenshtein arithmetic_overflow_add crates/atpkg/src/cli.rs:554 `(prev[j] + cost)`
+atpkg	31326c1abfafe98d	rss-backstop	atpkg::compat::differing_bytes hardened_panic_boundary crates/atpkg/src/compat.rs:288 `differing += mismatched as u64`
+atpkg	31a7a1b92ae84192	wall-backstop	atpkg::abrew::commands::ls_columns arithmetic_overflow_mul crates/atpkg/src/abrew/commands.rs:5374 `col * rows`
 atpkg	32253f139ca9dbb9	rss-backstop	atpkg::lineage::scan_stream arithmetic_overflow_sub crates/atpkg/src/lineage.rs:868 `end - keep`
 atpkg	322861c95390d48a	rss-backstop	atpkg::machine::universal_control_from_domain hardened_panic_boundary crates/atpkg/src/machine.rs:238 `found[1]`
-atpkg	3319713558b885a1	rss-backstop	atpkg::compat::differing_bytes arithmetic_overflow_sub crates/atpkg/src/compat.rs:293 `left -= n as u64`
-atpkg	34a2253775ccc900	rss-backstop	atpkg::abrew::commands::cmd_upgrade_casks hardened_panic_boundary crates/atpkg/src/abrew/commands.rs:5609 `failures += 1`
-atpkg	34a2253775ccc900	rss-backstop	atpkg::abrew::commands::cmd_upgrade_casks hardened_panic_boundary crates/atpkg/src/abrew/commands.rs:5652 `failures += 1`
-atpkg	34a2253775ccc900	rss-backstop	atpkg::abrew::commands::cmd_upgrade_casks hardened_panic_boundary crates/atpkg/src/abrew/commands.rs:5725 `failures += 1`
-atpkg	34a2253775ccc900	rss-backstop	atpkg::abrew::commands::cmd_upgrade_casks hardened_panic_boundary crates/atpkg/src/abrew/commands.rs:5740 `failures += 1`
-atpkg	34a2253775ccc900	rss-backstop	atpkg::abrew::commands::cmd_upgrade_casks hardened_panic_boundary crates/atpkg/src/abrew/commands.rs:5744 `failures += 1`
+atpkg	3319713558b885a1	rss-backstop	atpkg::compat::differing_bytes arithmetic_overflow_sub crates/atpkg/src/compat.rs:289 `left -= n as u64`
+atpkg	33e26c602cae75eb	rss-backstop	atpkg::selfsetup::would_make_lock hardened_panic_boundary crates/atpkg/src/selfsetup.rs:1118 `s.kept += 1`
+atpkg	345683bc68b4998a	rss-backstop	atpkg::peers::answer remainder_by_zero crates/atpkg/src/peers.rs:1176 `stepped %= pace.step`
 atpkg	34c00f72931885b0	rss-backstop	atpkg::copies::trash_refusal hardened_panic_boundary crates/atpkg/src/copies.rs:70 `open + len`
-atpkg	3528b29088732f01	rss-backstop	atpkg::cli::lease_run_name::{closure#0} slice_bounds_check crates/atpkg/src/cli.rs:3481 `[0]`
+atpkg	3528b29088732f01	rss-backstop	atpkg::cli::lease_run_name::{closure#0} slice_bounds_check crates/atpkg/src/cli.rs:3633 `[0]`
 atpkg	3643f8e93a0eb39a	rss-backstop	atpkg::meter::pass_body arithmetic_overflow_add crates/atpkg/src/meter.rs:248 `words(&position, &per_second) + 4`
 atpkg	36461332181d8626	rss-backstop	atpkg::machine::universal_control_from_domain hardened_panic_boundary crates/atpkg/src/machine.rs:238 `keys[1]`
+atpkg	3689e794b0a83937	rss-backstop	atpkg::cost::disk_ok hardened_panic_boundary crates/atpkg/src/cost.rs:53 `(required as u128) + (free_floor as u128)`
 atpkg	371787b043049961	rss-backstop	atpkg::lineage::parse_version arithmetic_overflow_add crates/atpkg/src/lineage.rs:1055 `i + 10`
 atpkg	37742c6162dfefa9	rss-backstop	atpkg::meter::spinner hardened_panic_boundary crates/atpkg/src/meter.rs:93 `BRAILLE[frame % BRAILLE.len()]`
 atpkg	377ed6ebf9351189	rss-backstop	atpkg::lineage::Matcher::<'_>::scan arithmetic_overflow_add crates/atpkg/src/lineage.rs:898 `i + p`
 atpkg	37acc32f51b6337e	rss-backstop	atpkg::macho::is_macho_header hardened_panic_boundary crates/atpkg/src/macho.rs:22 `word[3]`
-atpkg	37e5c53b7ad7ae80	rss-backstop	atpkg::doctor::spoken_list unreachable crates/atpkg/src/doctor.rs:3947 `fn spoken_list(names: &[&str], conj: &str) -> String { … }`
+atpkg	37e5c53b7ad7ae80	rss-backstop	atpkg::doctor::spoken_list unreachable crates/atpkg/src/doctor.rs:4176 `fn spoken_list(names: &[&str], conj: &str) -> String { … }`
 atpkg	385cac75e1efe0a5	rss-backstop	atpkg::macho::is_macho_header slice_bounds_check crates/atpkg/src/macho.rs:22 `word[1]`
-atpkg	3872cae93092ec5f	wall-backstop	atpkg::macho::load_names arithmetic_overflow_add crates/atpkg/src/macho.rs:206 `base + 8`
-atpkg	3872cae93092ec5f	wall-backstop	atpkg::macho::load_names arithmetic_overflow_add crates/atpkg/src/macho.rs:211 `base + 8`
+atpkg	3872cae93092ec5f	wall-backstop	atpkg::macho::load_names arithmetic_overflow_add crates/atpkg/src/macho.rs:196 `base + 8`
+atpkg	3872cae93092ec5f	wall-backstop	atpkg::macho::load_names arithmetic_overflow_add crates/atpkg/src/macho.rs:201 `base + 8`
+atpkg	38a5e47198d46c76	rss-backstop	atpkg::doctor::toolset_findings hardened_panic_boundary crates/atpkg/src/doctor.rs:3581 `present + missing_unexplained.len()`
 atpkg	39248714f7739ab0	rss-backstop	atpkg::lineage::Matcher::<'_>::examine hardened_panic_boundary crates/atpkg/src/lineage.rs:936 `5 + n + len`
-atpkg	3968e0a4a591f66a	rss-backstop	atpkg::abrew::cask::segment_matches::inner hardened_panic_boundary crates/atpkg/src/abrew/cask.rs:1503 `p[i + 2]`
-atpkg	3968e0a4a591f66a	rss-backstop	atpkg::abrew::cask::segment_matches::inner hardened_panic_boundary crates/atpkg/src/abrew/cask.rs:1504 `p[i + 2]`
-atpkg	3a17f8e0255a2e1b	rss-backstop	atpkg::build_cache::Sweep::<'_>::prune arithmetic_overflow_add crates/atpkg/src/build_cache.rs:427 `units += 1`
-atpkg	3a3d34ebed2b17fd	rss-backstop	atpkg::selfsetup::Sweep::<'_>::rm arithmetic_overflow_add crates/atpkg/src/selfsetup.rs:775 `self.skipped += 1`
-atpkg	3a6a8529be190c15	rss-backstop	atpkg::reroute::plan slice_bounds_check crates/atpkg/src/reroute.rs:1633 `[1..]`
-atpkg	3a87086a0ba882c8	rss-backstop	atpkg::cli::install_default_set_inner hardened_panic_boundary crates/atpkg/src/cli.rs:9491 `failures += 1`
-atpkg	3a87086a0ba882c8	rss-backstop	atpkg::cli::install_default_set_inner hardened_panic_boundary crates/atpkg/src/cli.rs:9767 `failures += 1`
-atpkg	3d14fe106ae0c718	rss-backstop	atpkg::harness::is_harness hardened_panic_boundary crates/atpkg/src/harness.rs:27 `name[at + i]`
+atpkg	3a13311ba88c3dc3	rss-backstop	atpkg::cli::install_default_set_inner::{closure#30} arithmetic_overflow_add crates/atpkg/src/cli.rs:10033 `failures += bootstrap_singleton( … )`
+atpkg	3a35a93dd8134340	rss-backstop	atpkg::build_cache::retired::pending::read_bound assertion crates/atpkg/src/build_cache_retired_pending.rs:143 `Duration::new(seconds, nanos as u32)`
+atpkg	3a3d34ebed2b17fd	rss-backstop	atpkg::selfsetup::Sweep::<'_>::rm arithmetic_overflow_add crates/atpkg/src/selfsetup.rs:799 `self.skipped += 1`
+atpkg	3a6a8529be190c15	rss-backstop	atpkg::reroute::plan slice_bounds_check crates/atpkg/src/reroute.rs:1688 `[1..]`
+atpkg	3a87086a0ba882c8	rss-backstop	atpkg::cli::install_default_set_inner hardened_panic_boundary crates/atpkg/src/cli.rs:10099 `failures += 1`
+atpkg	3a87086a0ba882c8	rss-backstop	atpkg::cli::install_default_set_inner hardened_panic_boundary crates/atpkg/src/cli.rs:9815 `failures += 1`
+atpkg	3b19b4fb5d20fd1a	rss-backstop	atpkg::build_admit::read_arming arithmetic_overflow_add crates/atpkg/src/build_admit.rs:1373 `have += n.unsigned_abs()`
 atpkg	3d52b4f8ff563438	rss-backstop	<atpkg::selfupdate::Decline<'_> as core::cmp::PartialEq>::eq unreachable crates/atpkg/src/selfupdate.rs:63 `PartialEq`
-atpkg	3dada00689cbb32f	rss-backstop	atpkg::flow::waited_words hardened_panic_boundary crates/atpkg/src/flow.rs:2140 `mins / 60`
+atpkg	3d93f2cf875aa4f3	rss-backstop	atpkg::build_admit::run_hidden slice_bounds_check crates/atpkg/src/build_admit.rs:1084 `rest`
+atpkg	3dada00689cbb32f	rss-backstop	atpkg::flow::waited_words hardened_panic_boundary crates/atpkg/src/flow.rs:2173 `mins / 60`
 atpkg	3de7fe291694ca75	rss-backstop	atpkg::meter::bar hardened_panic_boundary crates/atpkg/src/meter.rs:113 `width - full - 1`
-atpkg	3eac7d4b18b373e5	rss-backstop	atpkg::cli::cmd_refresh hardened_panic_boundary crates/atpkg/src/cli.rs:13073 `failed += 1`
-atpkg	3eac7d4b18b373e5	rss-backstop	atpkg::cli::cmd_refresh hardened_panic_boundary crates/atpkg/src/cli.rs:13077 `failed += 1`
-atpkg	3f7120c93ab59baa	rss-backstop	atpkg::capacity::lines hardened_panic_boundary crates/atpkg/src/capacity.rs:128 `claims.len() - held`
+atpkg	3e5262fe4178cfa9	rss-backstop	<atpkg::succession::Break as core::cmp::PartialEq>::eq unreachable crates/atpkg/src/succession.rs:119 `PartialEq`
+atpkg	3eac7d4b18b373e5	rss-backstop	atpkg::cli::cmd_refresh hardened_panic_boundary crates/atpkg/src/cli.rs:13501 `failed += 1`
+atpkg	3eac7d4b18b373e5	rss-backstop	atpkg::cli::cmd_refresh hardened_panic_boundary crates/atpkg/src/cli.rs:13505 `failed += 1`
+atpkg	3f7120c93ab59baa	rss-backstop	atpkg::capacity::lines hardened_panic_boundary crates/atpkg/src/capacity.rs:198 `claims.len() - held`
 atpkg	3fabb340e54b6a92	rss-backstop	atpkg::lineage::parse_version hardened_panic_boundary crates/atpkg/src/lineage.rs:1045 `i + 2`
-atpkg	3fd53b9fab50a586	rss-backstop	atpkg::cli::reclaim_build_cache arithmetic_overflow_sub crates/atpkg/src/cli.rs:6349 `removed.len() - parts`
-atpkg	40e1901029bb481c	rss-backstop	atpkg::selfsetup::sweep_store arithmetic_overflow_sub crates/atpkg/src/selfsetup.rs:1841 `foreign.len() - 3`
-atpkg	41334b20172c5179	rss-backstop	atpkg::cli::help_flag_addresses_atpkg slice_bounds_check crates/atpkg/src/cli.rs:433 `[..rest.len().min(1)]`
+atpkg	3fd53b9fab50a586	rss-backstop	atpkg::cli::reclaim_build_cache arithmetic_overflow_sub crates/atpkg/src/cli.rs:6666 `removed.len() - parts`
+atpkg	40e1901029bb481c	rss-backstop	atpkg::selfsetup::sweep_store arithmetic_overflow_sub crates/atpkg/src/selfsetup.rs:2176 `foreign.len() - 3`
+atpkg	41334b20172c5179	rss-backstop	atpkg::cli::help_flag_addresses_atpkg slice_bounds_check crates/atpkg/src/cli.rs:465 `[..rest.len().min(1)]`
 atpkg	4157cdb5d872e400	rss-backstop	atpkg::net::newest_index hardened_panic_boundary crates/atpkg/src/net.rs:206 `miss - hit`
-atpkg	4163d96a85fb2567	rss-backstop	atpkg::doctor::verdict hardened_panic_boundary crates/atpkg/src/doctor.rs:1342 `cannot + unproven`
+atpkg	4163d96a85fb2567	rss-backstop	atpkg::doctor::verdict hardened_panic_boundary crates/atpkg/src/doctor.rs:1427 `cannot + unproven`
 atpkg	421995e72e13934b	rss-backstop	atpkg::lineage::parse_version hardened_panic_boundary crates/atpkg/src/lineage.rs:1067 `i + 1`
-atpkg	428d4a087db9e342	rss-backstop	atpkg::install::stage_from_tree slice_bounds_check crates/atpkg/src/install.rs:269 `[0]`
-atpkg	428d4a087db9e342	rss-backstop	atpkg::install::stage_from_tree slice_bounds_check crates/atpkg/src/install.rs:269 `[0]`
-atpkg	42d48f27a2815017	rss-backstop	atpkg::converge::first_clause_end arithmetic_overflow_add crates/atpkg/src/converge.rs:340 `depth += 1`
-atpkg	42decd9dae7f7d3c	rss-backstop	atpkg::build_cache::stale::unit_hash::{closure#0} hardened_panic_boundary crates/atpkg/src/build_cache_stale.rs:248 `i + 1`
-atpkg	435e59b28010bd9b	rss-backstop	atpkg::selfsetup::self_uninstall_with_acaffiene arithmetic_overflow_add crates/atpkg/src/selfsetup.rs:1378 `s.shared_kept += 1`
+atpkg	428d4a087db9e342	rss-backstop	atpkg::install::stage_from_tree slice_bounds_check crates/atpkg/src/install.rs:368 `[0]`
+atpkg	428d4a087db9e342	rss-backstop	atpkg::install::stage_from_tree slice_bounds_check crates/atpkg/src/install.rs:368 `[0]`
+atpkg	42d48f27a2815017	rss-backstop	atpkg::converge::first_clause_end arithmetic_overflow_add crates/atpkg/src/converge.rs:344 `depth += 1`
+atpkg	435e59b28010bd9b	rss-backstop	atpkg::selfsetup::self_uninstall_with_acaffiene arithmetic_overflow_add crates/atpkg/src/selfsetup.rs:1714 `s.shared_kept += 1`
 atpkg	4376a3f070df777e	rss-backstop	atpkg::meter::pass_body hardened_panic_boundary crates/atpkg/src/meter.rs:248 `words(&position, &per_second) + 4`
 atpkg	43a7ed4e0735711d	rss-backstop	atpkg::lineage::Matcher::<'_>::scan hardened_panic_boundary crates/atpkg/src/lineage.rs:898 `i + p`
 atpkg	44589e4b2de33352	rss-backstop	atpkg::reroute::signpost_block::{closure#3} index_out_of_bounds crates/atpkg/src/reroute.rs:448 `args[i]`
-atpkg	445a0b7f4dc7e3ae	rss-backstop	atpkg::selfsetup::Sweep::<'_>::rm hardened_panic_boundary crates/atpkg/src/selfsetup.rs:775 `self.skipped += 1`
+atpkg	445a0b7f4dc7e3ae	rss-backstop	atpkg::selfsetup::Sweep::<'_>::rm hardened_panic_boundary crates/atpkg/src/selfsetup.rs:799 `self.skipped += 1`
 atpkg	44c8acd5a410eb0f	rss-backstop	atpkg::machine::universal_control_from_domain hardened_panic_boundary crates/atpkg/src/machine.rs:219 `found[at]`
-atpkg	45424f5c5e75ddb5	rss-backstop	atpkg::abrew::commands::cmd_missing arithmetic_overflow_add crates/atpkg/src/abrew/commands.rs:8416 `formulae.len() + casks.len()`
 atpkg	45ad0bfd6228cb80	rss-backstop	atpkg::net::direct_asset_url arithmetic_overflow_add crates/atpkg/src/net.rs:84 `seg_end + 1`
-atpkg	461335b448919140	rss-backstop	atpkg::cli::RiderQueue::<'_>::next slice_bounds_check crates/atpkg/src/cli.rs:11954 `[i]`
-atpkg	4688a33042eb68ba	rss-backstop	atpkg::cli::channel_apply_summary index_out_of_bounds crates/atpkg/src/cli.rs:12503 `current[0]`
+atpkg	461335b448919140	rss-backstop	atpkg::cli::RiderQueue::<'_>::next slice_bounds_check crates/atpkg/src/cli.rs:12330 `[i]`
+atpkg	465eb79b636b44db	rss-backstop	atpkg::build_admit::front::Front::end hardened_panic_boundary crates/atpkg/src/build_admit_front.rs:428 `128 + sig`
+atpkg	4688a33042eb68ba	rss-backstop	atpkg::cli::channel_apply_summary index_out_of_bounds crates/atpkg/src/cli.rs:12922 `current[0]`
 atpkg	46c5049cdf472fcd	rss-backstop	atpkg::packages_log::sanitize_capped hardened_panic_boundary crates/atpkg/src/packages_log.rs:506 `count += 1`
-atpkg	4770be1d56aa8c7b	rss-backstop	atpkg::abrew::cask::brace_expand arithmetic_overflow_add crates/atpkg/src/abrew/cask.rs:1634 `comma + 1`
-atpkg	477f1af6610566b4	rss-backstop	atpkg::selfsetup::Sweep::<'_>::rm_shared arithmetic_overflow_add crates/atpkg/src/selfsetup.rs:828 `self.shared_kept += 1`
+atpkg	477f1af6610566b4	rss-backstop	atpkg::selfsetup::Sweep::<'_>::rm_shared arithmetic_overflow_add crates/atpkg/src/selfsetup.rs:852 `self.shared_kept += 1`
 atpkg	48234ca74a8f403e	rss-backstop	atpkg::packages_log::redact_tokens hardened_panic_boundary crates/atpkg/src/packages_log.rs:610 `at + 1`
-atpkg	4834bdc9d47a78cd	rss-backstop	atpkg::abrew::commands::LongLister::date hardened_panic_boundary crates/atpkg/src/abrew/commands.rs:6784 `i128::from(self.now) - i128::from(mtime)`
-atpkg	48a2594dcdaaf8d2	rss-backstop	atpkg::cli::verb_names hardened_panic_boundary crates/atpkg/src/cli.rs:380 `out[i]`
+atpkg	4846d7ed99018269	rss-backstop	atpkg::cli::reclaim_build_cache hardened_panic_boundary crates/atpkg/src/cli.rs:6641 `stayed += 1`
+atpkg	4846d7ed99018269	rss-backstop	atpkg::cli::reclaim_build_cache hardened_panic_boundary crates/atpkg/src/cli.rs:6649 `stayed += 1`
+atpkg	48a2594dcdaaf8d2	rss-backstop	atpkg::cli::verb_names hardened_panic_boundary crates/atpkg/src/cli.rs:412 `out[i]`
 atpkg	48da3c401ef9427f	rss-backstop	atpkg::lineage::parse_version arithmetic_overflow_add crates/atpkg/src/lineage.rs:1067 `i + 1`
-atpkg	4b0c95d6f5997408	rss-backstop	atpkg::abrew::commands::walk_prune_links arithmetic_overflow_add crates/atpkg/src/abrew/commands.rs:6109 `*links += 1`
-atpkg	4b37d06a3ccf4046	rss-backstop	atpkg::doctor::plist_bundle_version hardened_panic_boundary crates/atpkg/src/doctor.rs:4486 `text.find(key)? + key.len()`
+atpkg	491d2b65b68374f5	rss-backstop	atpkg::store::first_exec::held_unproven_at slice_bounds_check crates/atpkg/src/store_first_exec.rs:289 `[0]`
+atpkg	491d2b65b68374f5	rss-backstop	atpkg::store::first_exec::held_unproven_at slice_bounds_check crates/atpkg/src/store_first_exec.rs:290 `[0]`
+atpkg	4b37d06a3ccf4046	rss-backstop	atpkg::doctor::plist_bundle_version hardened_panic_boundary crates/atpkg/src/doctor.rs:4723 `text.find(key)? + key.len()`
 atpkg	4b6a297c2868663a	rss-backstop	atpkg::flow::ahead::Ahead::plan_within unbounded_allocation crates/atpkg/src/flow/ahead.rs:131 `(0..n).map(|_| Slot::Queued).collect()`
+atpkg	4c168f47eeb18ee9	rss-backstop	atpkg::build_cache::registered::equivalent_placement_args slice_bounds_check crates/atpkg/src/build_cache_registered.rs:976 `[..at]`
 atpkg	4c67b52967c5f16d	rss-backstop	atpkg::net::ahead_of_walk hardened_panic_boundary crates/atpkg/src/net.rs:546 `4 * room`
-atpkg	4d31679ac875bd59	rss-backstop	atpkg::abrew::cask::brace_expand hardened_panic_boundary crates/atpkg/src/abrew/cask.rs:1634 `comma + 1`
 atpkg	4d334db77608d02a	rss-backstop	atpkg::machine::UniversalControlState::from_reads hardened_panic_boundary crates/atpkg/src/machine.rs:41 `reads[0]`
 atpkg	4d334db77608d02a	rss-backstop	atpkg::machine::UniversalControlState::from_reads hardened_panic_boundary crates/atpkg/src/machine.rs:43 `reads[0]`
 atpkg	4d3f933d0821f75c	rss-backstop	atpkg::lineage::parse_version arithmetic_overflow_add crates/atpkg/src/lineage.rs:1029 `i += 1`
@@ -16308,31 +16377,33 @@ atpkg	4d3f933d0821f75c	rss-backstop	atpkg::lineage::parse_version arithmetic_ove
 atpkg	4d3f933d0821f75c	rss-backstop	atpkg::lineage::parse_version arithmetic_overflow_add crates/atpkg/src/lineage.rs:1039 `i += 1`
 atpkg	4d3f933d0821f75c	rss-backstop	atpkg::lineage::parse_version arithmetic_overflow_add crates/atpkg/src/lineage.rs:1054 `i += 1`
 atpkg	4d4736c3da27f210	rss-backstop	atpkg::lineage::parse_version hardened_panic_boundary crates/atpkg/src/lineage.rs:1063 `i += 10`
-atpkg	4ec6ad5ea616feb4	rss-backstop	atpkg::doctor::index_age_days arithmetic_overflow_sub crates/atpkg/src/doctor.rs:4011 `(now - then)`
-atpkg	4f6b8595eecd3858	rss-backstop	atpkg::cli::install_default_set_inner::{closure#29} hardened_panic_boundary crates/atpkg/src/cli.rs:9686 `failures += bootstrap_group( … )`
-atpkg	4f72e934d2d082d8	wall-backstop	atpkg::abrew::commands::format_columns hardened_panic_boundary crates/atpkg/src/abrew/commands.rs:4668 `(width + gap) / cols - gap`
-atpkg	4f8aad6f07710a1b	rss-backstop	atpkg::vendor_direct::resolve::agy_release_dir::{closure#1} arithmetic_overflow_sub crates/atpkg/src/vendor_direct/resolve.rs:638 `url.len() - file.len()`
-atpkg	50a0e05e5ba932cd	rss-backstop	atpkg::cli::pending_state hardened_panic_boundary crates/atpkg/src/cli.rs:2459 `p + 1`
-atpkg	514b7a673ff9ccb4	rss-backstop	atpkg::selfsetup::Sweep::<'_>::skip hardened_panic_boundary crates/atpkg/src/selfsetup.rs:821 `self.skipped += 1`
+atpkg	4ec6ad5ea616feb4	rss-backstop	atpkg::doctor::index_age_days arithmetic_overflow_sub crates/atpkg/src/doctor.rs:4240 `(now - then)`
+atpkg	4f72e934d2d082d8	wall-backstop	atpkg::abrew::commands::format_columns hardened_panic_boundary crates/atpkg/src/abrew/commands.rs:5330 `(width + gap) / cols - gap`
+atpkg	4f8aad6f07710a1b	rss-backstop	atpkg::vendor_direct::resolve::agy_release_dir::{closure#1} arithmetic_overflow_sub crates/atpkg/src/vendor_direct/resolve.rs:656 `url.len() - file.len()`
+atpkg	50a0e05e5ba932cd	rss-backstop	atpkg::cli::pending_state hardened_panic_boundary crates/atpkg/src/cli.rs:2533 `p + 1`
+atpkg	514b7a673ff9ccb4	rss-backstop	atpkg::selfsetup::Sweep::<'_>::skip hardened_panic_boundary crates/atpkg/src/selfsetup.rs:845 `self.skipped += 1`
 atpkg	51698dd0bf067d9a	rss-backstop	atpkg::meter::bar unbounded_allocation crates/atpkg/src/meter.rs:120 `out.extend(std::iter::repeat_n(' ', width.saturating_sub(full)))`
-atpkg	51e9b66cfd4ced16	rss-backstop	atpkg::abrew::named_arg_types unreachable crates/atpkg/src/abrew/mod.rs:313 `fn named_arg_types(cmd: &str) -> String { … }`
+atpkg	521a86d1e12dd878	rss-backstop	atpkg::upstream_identity::files_equal_bounded slice_bounds_check crates/atpkg/src/upstream_identity.rs:260 `[..na]`
+atpkg	521a86d1e12dd878	rss-backstop	atpkg::upstream_identity::files_equal_bounded slice_bounds_check crates/atpkg/src/upstream_identity.rs:260 `[..na]`
+atpkg	521a86d1e12dd878	rss-backstop	atpkg::upstream_identity::files_equal_bounded slice_bounds_check crates/atpkg/src/upstream_identity.rs:260 `[..na]`
 atpkg	5224e5751083df18	rss-backstop	atpkg::cli::cmd_update_all_code assertion @sysroot/core/src/macros/mod.rs:51 `-`
 atpkg	5224e5751083df18	rss-backstop	atpkg::cli::cmd_update_all_code assertion @sysroot/core/src/macros/mod.rs:51 `-`
 atpkg	5224e5751083df18	rss-backstop	atpkg::cli::cmd_update_all_code assertion @sysroot/core/src/macros/mod.rs:51 `-`
 atpkg	522cce991503ebf8	rss-backstop	atpkg::lineage::Matcher::<'_>::examine slice_bounds_check crates/atpkg/src/lineage.rs:976 `[..len]`
-atpkg	523c183e065ed6ec	rss-backstop	atpkg::upstream_identity::trust_mark::{closure#0} arithmetic_overflow_add crates/atpkg/src/upstream_identity.rs:409 `end + 1`
-atpkg	528808a458a9826a	rss-backstop	atpkg::cli::pending_state arithmetic_overflow_add crates/atpkg/src/cli.rs:2459 `p + 1`
+atpkg	523c183e065ed6ec	rss-backstop	atpkg::upstream_identity::trust_mark::{closure#0} arithmetic_overflow_add crates/atpkg/src/upstream_identity.rs:437 `end + 1`
+atpkg	528808a458a9826a	rss-backstop	atpkg::cli::pending_state arithmetic_overflow_add crates/atpkg/src/cli.rs:2533 `p + 1`
+atpkg	52a90e77e42fea66	rss-backstop	atpkg::cli::install_default_set_inner::{closure#30} slice_bounds_check crates/atpkg/src/cli.rs:9993 `[gi]`
 atpkg	52b18002af4ee108	rss-backstop	atpkg::lineage::parse_version arithmetic_overflow_add crates/atpkg/src/lineage.rs:1048 `i += 2`
 atpkg	5315eeaf9c8081c7	rss-backstop	atpkg::openpgp::signature_packets arithmetic_overflow_add crates/atpkg/src/openpgp.rs:338 `((usize::from(first) - 192) << 8) + usize::from(second)`
 atpkg	531cd304a15bf67c	rss-backstop	atpkg::vendor_direct::version::Version::revision arithmetic_overflow_sub crates/atpkg/src/vendor_direct/version.rs:170 `s - 1`
-atpkg	53e667aec0acdafd	rss-backstop	atpkg::cli::levenshtein hardened_panic_boundary crates/atpkg/src/cli.rs:522 `row[j] + 1`
+atpkg	53e667aec0acdafd	rss-backstop	atpkg::cli::levenshtein hardened_panic_boundary crates/atpkg/src/cli.rs:554 `row[j] + 1`
 atpkg	54231da6235813ab	rss-backstop	atpkg::lineage::Matcher::<'_>::examine slice_bounds_check crates/atpkg/src/lineage.rs:929 `[..name_len]`
-atpkg	543c83c339b99afe	rss-backstop	atpkg::cli::reclaim_build_cache hardened_panic_boundary crates/atpkg/src/cli.rs:6358 `removed.len() + retired`
-atpkg	54b17435fe91a95f	rss-backstop	atpkg::doctor::ago arithmetic_overflow_div crates/atpkg/src/doctor.rs:3926 `secs / 3600`
+atpkg	543c83c339b99afe	rss-backstop	atpkg::cli::reclaim_build_cache hardened_panic_boundary crates/atpkg/src/cli.rs:6675 `removed.len() + retired`
+atpkg	54b17435fe91a95f	rss-backstop	atpkg::doctor::ago arithmetic_overflow_div crates/atpkg/src/doctor.rs:4155 `secs / 3600`
 atpkg	54c3b5af666c399f	rss-backstop	atpkg::openpgp::hashed_subpackets arithmetic_overflow_sub crates/atpkg/src/openpgp.rs:464 `(usize::from(first) - 192)`
-atpkg	54f24c3bd015588e	rss-backstop	atpkg::selfsetup::Sweep::<'_>::rm hardened_panic_boundary crates/atpkg/src/selfsetup.rs:780 `self.removed += 1`
+atpkg	54f24c3bd015588e	rss-backstop	atpkg::selfsetup::Sweep::<'_>::rm hardened_panic_boundary crates/atpkg/src/selfsetup.rs:804 `self.removed += 1`
 atpkg	559125ee0585ee55	rss-backstop	atpkg::flow::ahead::Ahead::next_with_wait::{closure#1}::{closure#1} slice_bounds_check crates/atpkg/src/flow/ahead.rs:255 `[k]`
-atpkg	5592996a5f83403b	rss-backstop	atpkg::doctor::retired_key_in::{closure#0} hardened_panic_boundary crates/atpkg/src/doctor.rs:912 `stderr.find(marker)? + marker.len()`
+atpkg	5592996a5f83403b	rss-backstop	atpkg::doctor::retired_key_in::{closure#0} hardened_panic_boundary crates/atpkg/src/doctor.rs:993 `stderr.find(marker)? + marker.len()`
 atpkg	560441b0f61e6ad2	rss-backstop	atpkg::openpgp::hashed_subpackets hardened_panic_boundary crates/atpkg/src/openpgp.rs:464 `((usize::from(first) - 192) << 8) + usize::from(second) + 192`
 atpkg	5692ca20f67fedad	rss-backstop	atpkg::packages_log::redact_tokens arithmetic_overflow_sub crates/atpkg/src/packages_log.rs:622 `word.len() - word.trim_start_matches(wrapping).len()`
 atpkg	56f80b0ddf6640f4	rss-backstop	atpkg::net::fetch_run unbounded_allocation crates/atpkg/src/net.rs:310 `(oldest..=newest) … .collect::<Result<Vec<_>, _>>()`
@@ -16340,129 +16411,113 @@ atpkg	572b117b8d22d976	rss-backstop	atpkg::lineage::parse_version hardened_panic
 atpkg	572b117b8d22d976	rss-backstop	atpkg::lineage::parse_version hardened_panic_boundary crates/atpkg/src/lineage.rs:1037 `i - start`
 atpkg	576ff0a8c2611d44	rss-backstop	atpkg::openpgp::signature_packets arithmetic_overflow_sub crates/atpkg/src/openpgp.rs:338 `(usize::from(first) - 192)`
 atpkg	57753160266265ef	rss-backstop	atpkg::net::direct_asset_url hardened_panic_boundary crates/atpkg/src/net.rs:79 `pos + seg.len()`
-atpkg	57de9c868e32f065	rss-backstop	atpkg::warm::parse_env0::{closure#1} slice_bounds_check crates/atpkg/src/warm.rs:318 `[..eq]`
+atpkg	57de9c868e32f065	rss-backstop	atpkg::warm::parse_env0::{closure#1} slice_bounds_check crates/atpkg/src/warm.rs:320 `[..eq]`
+atpkg	590291d7c6a85151	rss-backstop	atpkg::build_cache::registered::package::policies arithmetic_overflow_add crates/atpkg/src/build_cache_package.rs:704 `count += 1`
 atpkg	596fa4cbe1b938ee	rss-backstop	atpkg::net::ahead_of_walk::{closure#7} arithmetic_overflow_add crates/atpkg/src/net.rs:591 `asked += 1`
 atpkg	59dfb2def1400371	rss-backstop	atpkg::copies::trash_refusal hardened_panic_boundary crates/atpkg/src/copies.rs:68 `after.find('"')? + 1`
-atpkg	5a9a867a53dd5d5d	wall-backstop	atpkg::macho::load_names arithmetic_overflow_add crates/atpkg/src/macho.rs:207 `base + 16`
-atpkg	5b7a2c3cb21d15d6	rss-backstop	atpkg::cli::sweep_uninstall_targets arithmetic_overflow_add crates/atpkg/src/cli.rs:4390 `sweep.failures += 1`
-atpkg	5c7680008d91f8d9	rss-backstop	atpkg::yolo::decide::{closure#2} slice_bounds_check crates/atpkg/src/yolo.rs:326 `head[i]`
+atpkg	5a9a867a53dd5d5d	wall-backstop	atpkg::macho::load_names arithmetic_overflow_add crates/atpkg/src/macho.rs:197 `base + 16`
+atpkg	5b7a2c3cb21d15d6	rss-backstop	atpkg::cli::sweep_uninstall_targets arithmetic_overflow_add crates/atpkg/src/cli.rs:4605 `sweep.failures += 1`
+atpkg	5c3be2b386910fa5	rss-backstop	atpkg::zdotdir::ask_zsh slice_bounds_check crates/atpkg/src/zdotdir.rs:406 `[..count_end]`
+atpkg	5c7680008d91f8d9	rss-backstop	atpkg::yolo::decide::{closure#2} slice_bounds_check crates/atpkg/src/yolo.rs:363 `head[i]`
+atpkg	5cf139a2c96cd74c	rss-backstop	atpkg::cli::install_default_set_inner::{closure#30} hardened_panic_boundary crates/atpkg/src/cli.rs:10033 `failures += bootstrap_singleton( … )`
 atpkg	5cfbc3424a927776	rss-backstop	atpkg::lineage::parse_version hardened_panic_boundary crates/atpkg/src/lineage.rs:1019 `s[i]`
 atpkg	5cfbc3424a927776	rss-backstop	atpkg::lineage::parse_version hardened_panic_boundary crates/atpkg/src/lineage.rs:1036 `s[i]`
 atpkg	5cfbc3424a927776	rss-backstop	atpkg::lineage::parse_version hardened_panic_boundary crates/atpkg/src/lineage.rs:1036 `s[i]`
 atpkg	5cfbc3424a927776	rss-backstop	atpkg::lineage::parse_version hardened_panic_boundary crates/atpkg/src/lineage.rs:1036 `s[i]`
-atpkg	5d4ce86e882ae8a3	rss-backstop	atpkg::upstream_identity::trust_mark::{closure#0} hardened_panic_boundary crates/atpkg/src/upstream_identity.rs:409 `end + 1`
+atpkg	5d4ce86e882ae8a3	rss-backstop	atpkg::upstream_identity::trust_mark::{closure#0} hardened_panic_boundary crates/atpkg/src/upstream_identity.rs:437 `end + 1`
 atpkg	5d6dbc73e4c5ad22	rss-backstop	atpkg::meter::bar unbounded_allocation crates/atpkg/src/meter.rs:119 `out.extend(std::iter::repeat_n('#', full.min(width)))`
-atpkg	5e04363379b5bed7	rss-backstop	atpkg::net::GithubFetcher::walk_candidates::{closure#1} hardened_panic_boundary crates/atpkg/src/net.rs:784 `WALK_AHEAD_BUDGET.saturating_sub(asked_ahead) + 1`
-atpkg	5e9c0b129d080b14	rss-backstop	atpkg::selfsetup::self_uninstall_with_acaffiene arithmetic_overflow_add crates/atpkg/src/selfsetup.rs:1377 `s.kept += 1`
-atpkg	60b389dad5d395d8	rss-backstop	atpkg::cli::arity_refusal::{closure#2} slice_bounds_check crates/atpkg/src/cli.rs:2653 `[..at]`
+atpkg	5e04363379b5bed7	rss-backstop	atpkg::net::GithubFetcher::walk_candidates::{closure#1} hardened_panic_boundary crates/atpkg/src/net.rs:796 `WALK_AHEAD_BUDGET.saturating_sub(asked_ahead) + 1`
+atpkg	5e9c0b129d080b14	rss-backstop	atpkg::selfsetup::self_uninstall_with_acaffiene arithmetic_overflow_add crates/atpkg/src/selfsetup.rs:1713 `s.kept += 1`
 atpkg	62847cae75a97c31	rss-backstop	atpkg::meter::bar arithmetic_overflow_sub crates/atpkg/src/meter.rs:113 `width - full`
-atpkg	628c920d6a60f13b	rss-backstop	atpkg::cli::run_update_pass_in hardened_panic_boundary crates/atpkg/src/cli.rs:8901 `vendor.failures - failed_before`
-atpkg	628c920d6a60f13b	rss-backstop	atpkg::cli::run_update_pass_in hardened_panic_boundary crates/atpkg/src/cli.rs:8946 `vendor.failures - failed_before`
-atpkg	62f7e7a3aaabe12f	rss-backstop	atpkg::yolo::is_shell_safe_marker hardened_panic_boundary crates/atpkg/src/yolo.rs:68 `bytes[1]`
-atpkg	634b55200306be03	rss-backstop	atpkg::devtools::decline_holding::{closure#0} hardened_panic_boundary crates/atpkg/src/devtools.rs:1092 `at - before`
+atpkg	628c920d6a60f13b	rss-backstop	atpkg::cli::run_update_pass_in hardened_panic_boundary crates/atpkg/src/cli.rs:9217 `vendor.failures - failed_before`
+atpkg	628c920d6a60f13b	rss-backstop	atpkg::cli::run_update_pass_in hardened_panic_boundary crates/atpkg/src/cli.rs:9262 `vendor.failures - failed_before`
+atpkg	634b55200306be03	rss-backstop	atpkg::devtools::decline_holding::{closure#0} hardened_panic_boundary crates/atpkg/src/devtools.rs:1362 `at - before`
 atpkg	63a563ba8d5e3db1	rss-backstop	atpkg::meter::spinner index_out_of_bounds crates/atpkg/src/meter.rs:93 `BRAILLE[frame % BRAILLE.len()]`
+atpkg	642425178380567e	rss-backstop	atpkg::platform::probe_shim::Capture::script_forward arithmetic_overflow_add crates/atpkg/src/platform/probe_shim.rs:125 `depth + 1`
 atpkg	6445a6ef732075b8	rss-backstop	atpkg::macho::is_macho_header hardened_panic_boundary crates/atpkg/src/macho.rs:22 `word[2]`
-atpkg	64468c4d5c286da8	rss-backstop	atpkg::vendor_direct::resolve::agy_release_dir::{closure#1} hardened_panic_boundary crates/atpkg/src/vendor_direct/resolve.rs:638 `url.len() - file.len()`
-atpkg	64ea3a71d5a8b01e	rss-backstop	atpkg::status::held::end arithmetic_overflow_sub crates/atpkg/src/status.rs:665 `held[at].depth -= 1`
-atpkg	65fcefb7c335ec20	rss-backstop	atpkg::abrew::command_args hardened_panic_boundary crates/atpkg/src/abrew/mod.rs:958 `args[0]`
-atpkg	6680a0db4d43f8a6	rss-backstop	atpkg::abrew::commands::cmd_update unreachable crates/atpkg/src/abrew/commands.rs:5875 `pub(super) fn cmd_update(prefix: &Prefix, api: &Api) -> ExitCode { … }`
+atpkg	64468c4d5c286da8	rss-backstop	atpkg::vendor_direct::resolve::agy_release_dir::{closure#1} hardened_panic_boundary crates/atpkg/src/vendor_direct/resolve.rs:656 `url.len() - file.len()`
+atpkg	64ea3a71d5a8b01e	rss-backstop	atpkg::status::held::end arithmetic_overflow_sub crates/atpkg/src/status.rs:667 `held[at].depth -= 1`
+atpkg	6568a2fbd963d321	rss-backstop	atpkg::cli::install_default_set_inner::{closure#30} hardened_panic_boundary crates/atpkg/src/cli.rs:10018 `failures += bootstrap_group( … )`
+atpkg	6573abc77257fcb6	rss-backstop	atpkg::zdotdir::ask_zsh slice_bounds_check crates/atpkg/src/zdotdir.rs:419 `[count..]`
+atpkg	66780ff87031ae74	rss-backstop	atpkg::build_cache::registered::equivalent_placement_args slice_bounds_check crates/atpkg/src/build_cache_registered.rs:977 `[at + 2..]`
+atpkg	668acf9c00ff6c8e	rss-backstop	atpkg::build_cache::remove::sys::Walk::<'_, '_>::entry arithmetic_overflow_add crates/atpkg/src/build_cache_remove.rs:627 `*self.met.entry((stat.st_dev, stat.st_ino)).or_default() += 1`
 atpkg	671df34c84af5da1	rss-backstop	atpkg::seam::bin_plan arithmetic_overflow_add crates/atpkg/src/seam.rs:253 `tools += 1`
-atpkg	67315f0ae1ec52bf	rss-backstop	atpkg::cli::settle_selfupdate assertion crates/atpkg/src/cli.rs:1664 `&mut command`
+atpkg	67315f0ae1ec52bf	rss-backstop	atpkg::cli::settle_selfupdate assertion crates/atpkg/src/cli.rs:1714 `&mut command`
 atpkg	678f1aa268837da9	rss-backstop	atpkg::lineage::seed_mint_refusals_inner hardened_panic_boundary crates/atpkg/src/lineage.rs:653 `r.files.len() + r.links.len()`
 atpkg	67c947ae54502eca	rss-backstop	atpkg::lineage::find_byte slice_bounds_check crates/atpkg/src/lineage.rs:1091 `[i..]`
 atpkg	67d501bcc0cf8ca0	rss-backstop	atpkg::yolo::marker_matches hardened_panic_boundary crates/atpkg/src/yolo.rs:89 `bytes[0]`
-atpkg	67e263727b251bbf	rss-backstop	atpkg::cli::VendorPass::absorb hardened_panic_boundary crates/atpkg/src/cli.rs:11313 `self.failures += other.failures`
+atpkg	67e263727b251bbf	rss-backstop	atpkg::cli::VendorPass::absorb hardened_panic_boundary crates/atpkg/src/cli.rs:11676 `self.failures += other.failures`
 atpkg	686558bb73e581ac	rss-backstop	atpkg::net::ahead_of_walk::{closure#7} hardened_panic_boundary crates/atpkg/src/net.rs:591 `asked += 1`
-atpkg	68dae258d955f1c5	rss-backstop	atpkg::caller_shell::env_value arithmetic_overflow_add crates/atpkg/src/caller_shell.rs:164 `at + 1`
+atpkg	6878c94fdd6ab45e	rss-backstop	atpkg::peers::from_peer remainder_by_zero crates/atpkg/src/peers.rs:493 `stepped %= pace.step`
+atpkg	68dae258d955f1c5	rss-backstop	atpkg::caller_shell::env_value arithmetic_overflow_add crates/atpkg/src/caller_shell.rs:166 `at + 1`
 atpkg	68f49cf211ed98d3	rss-backstop	atpkg::lineage::scan_stream hardened_panic_boundary crates/atpkg/src/lineage.rs:838 `chunk + TAIL`
-atpkg	693bfeba6b9aaa8b	rss-backstop	atpkg::status::held::begin hardened_panic_boundary crates/atpkg/src/status.rs:648 `h.depth += 1`
+atpkg	693bfeba6b9aaa8b	rss-backstop	atpkg::status::held::begin hardened_panic_boundary crates/atpkg/src/status.rs:650 `h.depth += 1`
 atpkg	6948ecc190e38f6f	rss-backstop	atpkg::lineage::Matcher::<'_>::examine arithmetic_overflow_add crates/atpkg/src/lineage.rs:936 `5 + n + len`
-atpkg	69af4c0d0acd25e6	rss-backstop	atpkg::abrew::commands::cmd_unpin hardened_panic_boundary crates/atpkg/src/abrew/commands.rs:6343 `failures += 1`
-atpkg	69af4c0d0acd25e6	rss-backstop	atpkg::abrew::commands::cmd_unpin hardened_panic_boundary crates/atpkg/src/abrew/commands.rs:6368 `failures += 1`
-atpkg	69af4c0d0acd25e6	rss-backstop	atpkg::abrew::commands::cmd_unpin hardened_panic_boundary crates/atpkg/src/abrew/commands.rs:6375 `failures += 1`
 atpkg	69b21ad87ddedfab	rss-backstop	atpkg::lineage::parse_version arithmetic_overflow_add crates/atpkg/src/lineage.rs:1050 `i += 9`
-atpkg	69d2d0017aaf6066	rss-backstop	atpkg::abrew::commands::LongLister::date arithmetic_overflow_sub crates/atpkg/src/abrew/commands.rs:6784 `i128::from(self.now) - i128::from(mtime)`
-atpkg	69f383dea2d6bc4e	rss-backstop	atpkg::flow::apply_groups unbounded_allocation crates/atpkg/src/flow.rs:1417 `Vec::with_capacity(groups.len())`
+atpkg	69df8eab4a245213	rss-backstop	atpkg::peers::from_peer hardened_panic_boundary crates/atpkg/src/peers.rs:493 `stepped %= pace.step`
+atpkg	69f383dea2d6bc4e	rss-backstop	atpkg::flow::apply_groups unbounded_allocation crates/atpkg/src/flow.rs:1446 `Vec::with_capacity(groups.len())`
+atpkg	69f47312ceed2bd0	rss-backstop	atpkg::zdotdir::ask_zsh arithmetic_overflow_add crates/atpkg/src/zdotdir.rs:401 `start + begin.len()`
 atpkg	6a3168d0f2bf955f	rss-backstop	atpkg::install::acceptance_fixtures::DetachAll::assert_clean assertion @sysroot/core/src/panic.rs:62 `-`
-atpkg	6a7cfd8b0f661f8c	rss-backstop	atpkg::cli::list_human_lines hardened_panic_boundary crates/atpkg/src/cli.rs:4206 `live_count += 1`
-atpkg	6a7e6481b69702af	rss-backstop	atpkg::cli::run_update_pass_in arithmetic_overflow_add crates/atpkg/src/cli.rs:8882 `failures += net.failures`
+atpkg	6a7cfd8b0f661f8c	rss-backstop	atpkg::cli::list_human_lines hardened_panic_boundary crates/atpkg/src/cli.rs:4421 `live_count += 1`
+atpkg	6a7e6481b69702af	rss-backstop	atpkg::cli::run_update_pass_in arithmetic_overflow_add crates/atpkg/src/cli.rs:9198 `failures += net.failures`
 atpkg	6a9cec293e35ade8	rss-backstop	atpkg::openpgp::hashed_subpackets hardened_panic_boundary crates/atpkg/src/openpgp.rs:464 `(usize::from(first) - 192)`
-atpkg	6b9e51d1877d83b8	rss-backstop	atpkg::abrew::commands::upgrade_formula_names hardened_panic_boundary crates/atpkg/src/abrew/commands.rs:5474 `failures += 1`
-atpkg	6b9e51d1877d83b8	rss-backstop	atpkg::abrew::commands::upgrade_formula_names hardened_panic_boundary crates/atpkg/src/abrew/commands.rs:5489 `failures += 1`
-atpkg	6b9e51d1877d83b8	rss-backstop	atpkg::abrew::commands::upgrade_formula_names hardened_panic_boundary crates/atpkg/src/abrew/commands.rs:5516 `failures += 1`
-atpkg	6b9e51d1877d83b8	rss-backstop	atpkg::abrew::commands::upgrade_formula_names hardened_panic_boundary crates/atpkg/src/abrew/commands.rs:5538 `failures += 1`
-atpkg	6b9e51d1877d83b8	rss-backstop	atpkg::abrew::commands::upgrade_formula_names hardened_panic_boundary crates/atpkg/src/abrew/commands.rs:5543 `failures += 1`
-atpkg	6b9e51d1877d83b8	rss-backstop	atpkg::abrew::commands::upgrade_formula_names hardened_panic_boundary crates/atpkg/src/abrew/commands.rs:5551 `failures += 1`
-atpkg	6bfc84972ae073f5	rss-backstop	atpkg::selfsetup::profile_with_path_block arithmetic_overflow_add crates/atpkg/src/selfsetup.rs:2078 `offset + line.len()`
-atpkg	6cd4dc0c7c4fbfe0	rss-backstop	atpkg::build_cache::stale::unit_hash::{closure#0} hardened_panic_boundary crates/atpkg/src/build_cache_stale.rs:248 `i + 17`
-atpkg	6cd4dc0c7c4fbfe0	rss-backstop	atpkg::build_cache::stale::unit_hash::{closure#0} hardened_panic_boundary crates/atpkg/src/build_cache_stale.rs:249 `i + 17`
-atpkg	6d5994d7b40c6fc7	rss-backstop	atpkg::cli::set_progress_queue::{closure#1} arithmetic_overflow_add crates/atpkg/src/cli.rs:9802 `i + 1`
-atpkg	6dfa51e8b81849db	rss-backstop	atpkg::abrew::commands::print_update_report arithmetic_overflow_add crates/atpkg/src/abrew/commands.rs:5850 `of + oc`
-atpkg	6f3dd1a5dc89792c	rss-backstop	atpkg::abrew::commands::LongLister::date hardened_panic_boundary crates/atpkg/src/abrew/commands.rs:6789 `secs / 3_600`
-atpkg	6f4e1d919525380f	rss-backstop	atpkg::cli::list_human_lines arithmetic_overflow_add crates/atpkg/src/cli.rs:4217 `no_live += 1`
-atpkg	6f54546a40bb6df1	rss-backstop	atpkg::abrew::cask::brace_expand hardened_panic_boundary crates/atpkg/src/abrew/cask.rs:1631 `open + 1`
-atpkg	6f9d9bc9fc9961e0	rss-backstop	atpkg::yolo::decide hardened_panic_boundary crates/atpkg/src/yolo.rs:369 `head[i]`
-atpkg	6f9d9bc9fc9961e0	rss-backstop	atpkg::yolo::decide hardened_panic_boundary crates/atpkg/src/yolo.rs:370 `head[i]`
-atpkg	709c4d9a6eeb6441	rss-backstop	atpkg::compat::differing_bytes hardened_panic_boundary crates/atpkg/src/compat.rs:293 `left -= n as u64`
-atpkg	70b3cbf157b9f0c5	rss-backstop	<atpkg::seam::SeamStatus as core::fmt::Display>::fmt unreachable crates/atpkg/src/seam.rs:1999 `fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { … }`
-atpkg	717ca88f4962edcf	rss-backstop	atpkg::abrew::commands::cmd_missing hardened_panic_boundary crates/atpkg/src/abrew/commands.rs:8416 `formulae.len() + casks.len()`
-atpkg	7186f4a85000eb5b	rss-backstop	atpkg::packages_log::read_tail_of arithmetic_overflow_sub crates/atpkg/src/packages_log.rs:858 `max - out.len()`
-atpkg	7219c118f9f62680	rss-backstop	atpkg::selfsetup::Sweep::<'_>::rm_shared hardened_panic_boundary crates/atpkg/src/selfsetup.rs:828 `self.shared_kept += 1`
-atpkg	72240cd99158632f	rss-backstop	atpkg::abrew::commands::cmd_outdated hardened_panic_boundary crates/atpkg/src/abrew/commands.rs:5163 `collected[slot]`
-atpkg	72831bb39a3bbfc3	rss-backstop	atpkg::abrew::commands::prune_downloads arithmetic_overflow_add crates/atpkg/src/abrew/commands.rs:6275 `removed += 1`
-atpkg	728d56566b3f42bb	rss-backstop	atpkg::abrew::commands::cmd_tap_info hardened_panic_boundary crates/atpkg/src/abrew/commands.rs:9201 `commands += tap_command_names(tap).len()`
+atpkg	6bfc84972ae073f5	rss-backstop	atpkg::selfsetup::profile_with_path_block arithmetic_overflow_add crates/atpkg/src/selfsetup.rs:2445 `offset + line.len()`
+atpkg	6d5994d7b40c6fc7	rss-backstop	atpkg::cli::set_progress_queue::{closure#1} arithmetic_overflow_add crates/atpkg/src/cli.rs:10134 `i + 1`
+atpkg	6f4e1d919525380f	rss-backstop	atpkg::cli::list_human_lines arithmetic_overflow_add crates/atpkg/src/cli.rs:4432 `no_live += 1`
+atpkg	6f9d9bc9fc9961e0	rss-backstop	atpkg::yolo::decide hardened_panic_boundary crates/atpkg/src/yolo.rs:407 `head[i]`
+atpkg	6f9d9bc9fc9961e0	rss-backstop	atpkg::yolo::decide hardened_panic_boundary crates/atpkg/src/yolo.rs:408 `head[i]`
+atpkg	709c4d9a6eeb6441	rss-backstop	atpkg::compat::differing_bytes hardened_panic_boundary crates/atpkg/src/compat.rs:289 `left -= n as u64`
+atpkg	70b3cbf157b9f0c5	rss-backstop	<atpkg::seam::SeamStatus as core::fmt::Display>::fmt unreachable crates/atpkg/src/seam.rs:2001 `fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { … }`
+atpkg	7186f4a85000eb5b	rss-backstop	atpkg::packages_log::read_tail_of arithmetic_overflow_sub crates/atpkg/src/packages_log.rs:864 `max - out.len()`
+atpkg	7219c118f9f62680	rss-backstop	atpkg::selfsetup::Sweep::<'_>::rm_shared hardened_panic_boundary crates/atpkg/src/selfsetup.rs:852 `self.shared_kept += 1`
+atpkg	72aea0ac741f269d	rss-backstop	atpkg::platform::unix::shim_executable_to_env::{closure#2} hardened_panic_boundary crates/atpkg/src/platform/unix.rs:641 `line.len() - exec.len()`
 atpkg	72d6dc090f2e111a	rss-backstop	atpkg::lineage::Matcher::<'_>::examine arithmetic_overflow_add crates/atpkg/src/lineage.rs:936 `5 + n`
 atpkg	72d6dc090f2e111a	rss-backstop	atpkg::lineage::Matcher::<'_>::examine arithmetic_overflow_add crates/atpkg/src/lineage.rs:936 `5 + n`
+atpkg	72e2ceeb43e02a92	rss-backstop	atpkg::build_cache::registered::record_count arithmetic_overflow_add crates/atpkg/src/build_cache_registered.rs:438 `count += 1`
 atpkg	73065ad7e3dfc506	rss-backstop	atpkg::reroute::signpost_block::{closure#3} hardened_panic_boundary crates/atpkg/src/reroute.rs:448 `args[i]`
-atpkg	73b541aa41b2b4b7	rss-backstop	atpkg::net::GithubFetcher::walk_candidates::{closure#1} arithmetic_overflow_add crates/atpkg/src/net.rs:784 `WALK_AHEAD_BUDGET.saturating_sub(asked_ahead) + 1`
+atpkg	73b541aa41b2b4b7	rss-backstop	atpkg::net::GithubFetcher::walk_candidates::{closure#1} arithmetic_overflow_add crates/atpkg/src/net.rs:796 `WALK_AHEAD_BUDGET.saturating_sub(asked_ahead) + 1`
 atpkg	741640ef0ad66422	rss-backstop	atpkg::net::direct_asset_url arithmetic_overflow_add crates/atpkg/src/net.rs:79 `pos + seg.len()`
-atpkg	748d3faf2424ab89	rss-backstop	atpkg::build_cache::Sweep::<'_>::prune arithmetic_overflow_add crates/atpkg/src/build_cache.rs:426 `incremental += 1`
-atpkg	74bbb2a2867c3bbc	rss-backstop	atpkg::compat::differing_bytes arithmetic_overflow_add crates/atpkg/src/compat.rs:292 `differing += mismatched as u64`
-atpkg	75e3fb9fbc5f4032	rss-backstop	atpkg::abrew::cask::segment_matches::inner slice_bounds_check crates/atpkg/src/abrew/cask.rs:1503 `p[i + 2]`
-atpkg	75e3fb9fbc5f4032	rss-backstop	atpkg::abrew::cask::segment_matches::inner slice_bounds_check crates/atpkg/src/abrew/cask.rs:1504 `p[i + 2]`
-atpkg	7660440327131c1f	rss-backstop	atpkg::build_cache::Sweep::<'_>::prune hardened_panic_boundary crates/atpkg/src/build_cache.rs:427 `units += 1`
-atpkg	767776e1d9436b2e	rss-backstop	atpkg::cli::levenshtein arithmetic_overflow_add crates/atpkg/src/cli.rs:522 `prev[j + 1] + 1`
-atpkg	7679e89588b41f35	rss-backstop	atpkg::metadata_io::read_head unbounded_allocation crates/atpkg/src/metadata_io.rs:125 `Vec::with_capacity(limit)`
-atpkg	76883bc605aa44d6	rss-backstop	atpkg::cli::set_progress_queue::{closure#0} index_out_of_bounds crates/atpkg/src/cli.rs:9801 `groups[*gi]`
-atpkg	7797ee3b1ffaaaf0	wall-backstop	atpkg::macho::load_names hardened_panic_boundary crates/atpkg/src/macho.rs:207 `base + 16`
-atpkg	7856e224cb3a5db7	rss-backstop	atpkg::yolo::decide slice_bounds_check crates/atpkg/src/yolo.rs:378 `[i + 1..]`
-atpkg	7857beebe79bbc12	rss-backstop	atpkg::abrew::cask::segment_matches::inner slice_bounds_check crates/atpkg/src/abrew/cask.rs:1520 `[1..]`
-atpkg	787963235aac6b37	rss-backstop	atpkg::cli::parse_lease_args hardened_panic_boundary crates/atpkg/src/cli.rs:3443 `sep + 1`
-atpkg	7939cd66a718fe25	rss-backstop	atpkg::cli::lease_and_run slice_bounds_check crates/atpkg/src/cli.rs:3521 `[0]`
+atpkg	74bbb2a2867c3bbc	rss-backstop	atpkg::compat::differing_bytes arithmetic_overflow_add crates/atpkg/src/compat.rs:288 `differing += mismatched as u64`
+atpkg	767776e1d9436b2e	rss-backstop	atpkg::cli::levenshtein arithmetic_overflow_add crates/atpkg/src/cli.rs:554 `prev[j + 1] + 1`
+atpkg	76883bc605aa44d6	rss-backstop	atpkg::cli::set_progress_queue::{closure#0} index_out_of_bounds crates/atpkg/src/cli.rs:10133 `groups[*gi]`
+atpkg	7797ee3b1ffaaaf0	wall-backstop	atpkg::macho::load_names hardened_panic_boundary crates/atpkg/src/macho.rs:197 `base + 16`
+atpkg	7856e224cb3a5db7	rss-backstop	atpkg::yolo::decide slice_bounds_check crates/atpkg/src/yolo.rs:416 `[i + 1..]`
+atpkg	787963235aac6b37	rss-backstop	atpkg::cli::parse_lease_args hardened_panic_boundary crates/atpkg/src/cli.rs:3595 `sep + 1`
+atpkg	7939cd66a718fe25	rss-backstop	atpkg::cli::lease_and_run slice_bounds_check crates/atpkg/src/cli.rs:3673 `[0]`
 atpkg	79baab01b73ba71b	rss-backstop	atpkg::lane::parse_args hardened_panic_boundary crates/atpkg/src/lane.rs:103 `i += 1`
+atpkg	7a3700ab19dfb7a8	rss-backstop	atpkg::build_admit::read_arming hardened_panic_boundary crates/atpkg/src/build_admit.rs:1373 `have += n.unsigned_abs()`
 atpkg	7a74b4cecf60c09c	rss-backstop	atpkg::lineage::parse_version arithmetic_overflow_add crates/atpkg/src/lineage.rs:1049 `i + 9`
-atpkg	7af80cda4a9c83c7	rss-backstop	atpkg::abrew::commands::cmd_upgrade_casks arithmetic_overflow_add crates/atpkg/src/abrew/commands.rs:5609 `failures += 1`
-atpkg	7af80cda4a9c83c7	rss-backstop	atpkg::abrew::commands::cmd_upgrade_casks arithmetic_overflow_add crates/atpkg/src/abrew/commands.rs:5652 `failures += 1`
-atpkg	7af80cda4a9c83c7	rss-backstop	atpkg::abrew::commands::cmd_upgrade_casks arithmetic_overflow_add crates/atpkg/src/abrew/commands.rs:5725 `failures += 1`
-atpkg	7af80cda4a9c83c7	rss-backstop	atpkg::abrew::commands::cmd_upgrade_casks arithmetic_overflow_add crates/atpkg/src/abrew/commands.rs:5740 `failures += 1`
-atpkg	7af80cda4a9c83c7	rss-backstop	atpkg::abrew::commands::cmd_upgrade_casks arithmetic_overflow_add crates/atpkg/src/abrew/commands.rs:5744 `failures += 1`
+atpkg	7b2eb4c9cb3fb901	rss-backstop	atpkg::zdotdir::ask_zsh arithmetic_overflow_add crates/atpkg/src/zdotdir.rs:411 `count_end + 1`
 atpkg	7b5ca966b9899be8	rss-backstop	atpkg::vendor::https_host slice_bounds_check crates/atpkg/src/vendor.rs:125 `[..end]`
-atpkg	7b81fe624b37dd0d	rss-backstop	atpkg::selfsetup::sweep_acaffiene_with arithmetic_overflow_add crates/atpkg/src/selfsetup.rs:1068 `s.kept += 1`
-atpkg	7bbc260afc6e5957	rss-backstop	atpkg::cli::report_vendor arithmetic_overflow_add crates/atpkg/src/cli.rs:12039 `pass.failures += 1`
+atpkg	7b81fe624b37dd0d	rss-backstop	atpkg::selfsetup::sweep_acaffiene_with arithmetic_overflow_add crates/atpkg/src/selfsetup.rs:1310 `s.kept += 1`
+atpkg	7b81fe624b37dd0d	rss-backstop	atpkg::selfsetup::sweep_acaffiene_with arithmetic_overflow_add crates/atpkg/src/selfsetup.rs:1333 `s.kept += 1`
+atpkg	7bbc260afc6e5957	rss-backstop	atpkg::cli::report_vendor arithmetic_overflow_add crates/atpkg/src/cli.rs:12431 `pass.failures += 1`
+atpkg	7bc059cbe9ff12d6	rss-backstop	atpkg::config_split::split unreachable crates/atpkg/src/config_split.rs:57 `pub fn split(here_xdg: Option<&OsStr>, app_xdg: Option<&OsStr>, home: &Path) -> Option<Split> { … }`
 atpkg	7c19d4662c558ba1	rss-backstop	atpkg::vendor_direct::table::revision_floor assertion @sysroot/core/src/panic.rs:62 `-`
 atpkg	7d65bb6d83a1d455	rss-backstop	atpkg::openpgp::left_padded hardened_panic_boundary crates/atpkg/src/openpgp.rs:510 `len_bits - top.leading_zeros()`
 atpkg	7decbb8fc248a6b0	rss-backstop	atpkg::lineage::Matcher::<'_>::scan hardened_panic_boundary crates/atpkg/src/lineage.rs:900 `at + 1`
 atpkg	7e182605a563d238	rss-backstop	atpkg::lineage::scan_stream arithmetic_overflow_add crates/atpkg/src/lineage.rs:842 `old + chunk`
-atpkg	7e9b9187dfe636ef	rss-backstop	atpkg::packages_log::read_tail_of unbounded_allocation crates/atpkg/src/packages_log.rs:853 `out.extend( … )`
+atpkg	7e9b9187dfe636ef	rss-backstop	atpkg::packages_log::read_tail_of unbounded_allocation crates/atpkg/src/packages_log.rs:859 `out.extend( … )`
 atpkg	7f0f2b79f8b650bf	rss-backstop	atpkg::openpgp::signature_packets hardened_panic_boundary crates/atpkg/src/openpgp.rs:338 `((usize::from(first) - 192) << 8) + usize::from(second) + 192`
 atpkg	7fe8f5644435ef3d	rss-backstop	atpkg::packages_log::render_at hardened_panic_boundary crates/atpkg/src/packages_log.rs:401 `counts[1]`
 atpkg	80326717f9f14e91	rss-backstop	atpkg::flow::ahead::Ahead::next_with_wait::{closure#1}::{closure#0} slice_bounds_check crates/atpkg/src/flow/ahead.rs:252 `[k]`
 atpkg	80326717f9f14e91	rss-backstop	atpkg::flow::ahead::Ahead::next_with_wait::{closure#1}::{closure#0} slice_bounds_check crates/atpkg/src/flow/ahead.rs:253 `[k]`
 atpkg	80569042064e656d	rss-backstop	atpkg::packages_log::render_at hardened_panic_boundary crates/atpkg/src/packages_log.rs:400 `counts[0]`
-atpkg	8088784643dcaf0a	rss-backstop	atpkg::warm::parse_env0::{closure#1}::{closure#2} slice_bounds_check crates/atpkg/src/warm.rs:322 `[nl + 1..]`
+atpkg	8088784643dcaf0a	rss-backstop	atpkg::warm::parse_env0::{closure#1}::{closure#2} slice_bounds_check crates/atpkg/src/warm.rs:324 `[nl + 1..]`
 atpkg	832b0bcf5f590ee4	rss-backstop	atpkg::lineage::scan_stream arithmetic_overflow_add crates/atpkg/src/lineage.rs:847 `filled += n`
-atpkg	840b98c6445d6eed	rss-backstop	atpkg::yolo::decide::{closure#2} index_out_of_bounds crates/atpkg/src/yolo.rs:326 `head[i]`
-atpkg	848f3d999bff1cb6	rss-backstop	atpkg::seam::bin_holds_exactly hardened_panic_boundary crates/atpkg/src/seam.rs:867 `seen += 1`
-atpkg	84a732d11e15e697	rss-backstop	atpkg::compat::differing_bytes arithmetic_overflow_sub crates/atpkg/src/compat.rs:284 `a_len.max(b_len) - common`
-atpkg	857eba42f3952358	rss-backstop	atpkg::yolo::decide slice_bounds_check crates/atpkg/src/yolo.rs:356 `[head_len..]`
+atpkg	840b98c6445d6eed	rss-backstop	atpkg::yolo::decide::{closure#2} index_out_of_bounds crates/atpkg/src/yolo.rs:363 `head[i]`
+atpkg	848f3d999bff1cb6	rss-backstop	atpkg::seam::bin_holds_exactly hardened_panic_boundary crates/atpkg/src/seam.rs:869 `seen += 1`
+atpkg	84a732d11e15e697	rss-backstop	atpkg::compat::differing_bytes arithmetic_overflow_sub crates/atpkg/src/compat.rs:280 `a_len.max(b_len) - common`
+atpkg	857eba42f3952358	rss-backstop	atpkg::yolo::decide slice_bounds_check crates/atpkg/src/yolo.rs:393 `[head_len..]`
+atpkg	85ad57b58de9d287	rss-backstop	atpkg::platform::unix::shim_executable_to_env::{closure#2} arithmetic_overflow_sub crates/atpkg/src/platform/unix.rs:641 `line.len() - exec.len()`
 atpkg	85e4cb19ac498bfe	rss-backstop	atpkg::install::acceptance_fixtures::foo_app_image assertion @sysroot/core/src/panic.rs:62 `-`
-atpkg	863803e001adee94	rss-backstop	atpkg::build_cache::stale::unit_hash::{closure#0}::{closure#2} hardened_panic_boundary crates/atpkg/src/build_cache_stale.rs:253 `i + 1`
-atpkg	86a7df767a17c0dd	rss-backstop	atpkg::cli::set_progress_queue::{closure#1} hardened_panic_boundary crates/atpkg/src/cli.rs:9802 `i + 1`
+atpkg	867d8082ddcc8335	rss-backstop	atpkg::build_admit::read_arming hardened_panic_boundary crates/atpkg/src/build_admit.rs:1376 `got[3]`
+atpkg	86a7df767a17c0dd	rss-backstop	atpkg::cli::set_progress_queue::{closure#1} hardened_panic_boundary crates/atpkg/src/cli.rs:10134 `i + 1`
 atpkg	86b67445ae7e2908	rss-backstop	atpkg::lineage::find_byte arithmetic_overflow_add crates/atpkg/src/lineage.rs:1089 `i += 8`
 atpkg	8705660e32a1e3bf	rss-backstop	atpkg::net::ahead_of_walk hardened_panic_boundary crates/atpkg/src/net.rs:550 `replays += 1`
-atpkg	870af33a7b063399	rss-backstop	atpkg::abrew::commands::LongLister::date hardened_panic_boundary crates/atpkg/src/abrew/commands.rs:6789 `secs / 60`
-atpkg	876f8f65a5ef162c	rss-backstop	atpkg::cli::report_channel_apply arithmetic_overflow_add crates/atpkg/src/cli.rs:12449 `failures += 1`
-atpkg	8869ec55a9a38b5f	rss-backstop	atpkg::shim_env::split_entry hardened_panic_boundary crates/atpkg/src/shim_env.rs:202 `name.as_bytes()[0]`
+atpkg	876f8f65a5ef162c	rss-backstop	atpkg::cli::report_channel_apply arithmetic_overflow_add crates/atpkg/src/cli.rs:12841 `failures += 1`
+atpkg	87d102880f9255e6	rss-backstop	atpkg::cli::install_default_set_inner::{closure#30} slice_bounds_check crates/atpkg/src/cli.rs:10009 `[0]`
+atpkg	87d102880f9255e6	rss-backstop	atpkg::cli::install_default_set_inner::{closure#30} slice_bounds_check crates/atpkg/src/cli.rs:10037 `[0]`
 atpkg	88a37a8c4f5dc352	rss-backstop	atpkg::net::ahead_of_walk arithmetic_overflow_mul crates/atpkg/src/net.rs:546 `4 * room`
 atpkg	8989fb144c531317	rss-backstop	atpkg::openpgp::verify_one hardened_panic_boundary crates/atpkg/src/openpgp.rs:548 `document.len() + sig.hashed_prefix.len() + 6`
 atpkg	8a6a508bb4b62dcb	rss-backstop	atpkg::platform::unix::xattr_names unbounded_allocation @sysroot/alloc/src/macros.rs:47 `-`
@@ -16484,77 +16539,69 @@ atpkg	8a95aecc7435d2f4	rss-backstop	atpkg::vendor_direct::watch::HeadWatch::chec
 atpkg	8aeb07f0fd252639	rss-backstop	atpkg::tree::read_chunks slice_bounds_check crates/atpkg/src/tree.rs:258 `[..n.min(buf.len())]`
 atpkg	8bde0b674ba25714	rss-backstop	atpkg::vendor_direct::watch::HeadWatch::check_pending_with_index_in_flight::{closure#1} slice_bounds_check crates/atpkg/src/vendor_direct/watch.rs:654 `[index]`
 atpkg	8c319945fd537ad8	rss-backstop	atpkg::net::newest_index hardened_panic_boundary crates/atpkg/src/net.rs:207 `hit + (miss - hit) / 2`
-atpkg	8ca17831e630f5a4	rss-backstop	atpkg::cli::channel_apply_summary hardened_panic_boundary crates/atpkg/src/cli.rs:12503 `current[0]`
+atpkg	8ca17831e630f5a4	rss-backstop	atpkg::cli::channel_apply_summary hardened_panic_boundary crates/atpkg/src/cli.rs:12922 `current[0]`
 atpkg	8d3ccd20a2363684	rss-backstop	atpkg::net::newest_index arithmetic_overflow_add crates/atpkg/src/net.rs:207 `hit + (miss - hit) / 2`
-atpkg	8dc5dd3ba27fa04e	rss-backstop	atpkg::cli::verb_names slice_bounds_check crates/atpkg/src/cli.rs:380 `TABLE[i]`
-atpkg	8ebe44c44ab9d1b3	rss-backstop	atpkg::cli::parse_lease_args slice_bounds_check crates/atpkg/src/cli.rs:3443 `[..sep]`
+atpkg	8dc5dd3ba27fa04e	rss-backstop	atpkg::cli::verb_names slice_bounds_check crates/atpkg/src/cli.rs:412 `TABLE[i]`
+atpkg	8e4f7fc0d64cca94	rss-backstop	atpkg::build_admit::front::pipe hardened_panic_boundary crates/atpkg/src/build_admit_front.rs:183 `fds[1]`
+atpkg	8e84241f9ef9e9bc	rss-backstop	atpkg::zdotdir::under_home arithmetic_overflow_add crates/atpkg/src/zdotdir.rs:92 `links += 1`
+atpkg	8ebe44c44ab9d1b3	rss-backstop	atpkg::cli::parse_lease_args slice_bounds_check crates/atpkg/src/cli.rs:3595 `[..sep]`
 atpkg	8fa593353f1d4fef	rss-backstop	atpkg::lineage::Matcher::<'_>::examine slice_bounds_check crates/atpkg/src/lineage.rs:905 `[at..]`
-atpkg	9018230083d7f1f4	rss-backstop	atpkg::cli::verb_names hardened_panic_boundary crates/atpkg/src/cli.rs:380 `TABLE[i]`
-atpkg	90411e1e96db3ef2	rss-backstop	atpkg::cli::run_update_pass_in hardened_panic_boundary crates/atpkg/src/cli.rs:8901 `failures += vendor.failures - failed_before`
-atpkg	90411e1e96db3ef2	rss-backstop	atpkg::cli::run_update_pass_in hardened_panic_boundary crates/atpkg/src/cli.rs:8946 `failures += vendor.failures - failed_before`
+atpkg	9018230083d7f1f4	rss-backstop	atpkg::cli::verb_names hardened_panic_boundary crates/atpkg/src/cli.rs:412 `TABLE[i]`
+atpkg	90411e1e96db3ef2	rss-backstop	atpkg::cli::run_update_pass_in hardened_panic_boundary crates/atpkg/src/cli.rs:9217 `failures += vendor.failures - failed_before`
+atpkg	90411e1e96db3ef2	rss-backstop	atpkg::cli::run_update_pass_in hardened_panic_boundary crates/atpkg/src/cli.rs:9262 `failures += vendor.failures - failed_before`
 atpkg	90efa5ea5f6664b4	rss-backstop	atpkg::lineage::Matcher::<'_>::examine arithmetic_overflow_add crates/atpkg/src/lineage.rs:954 `6 + 8 + used`
 atpkg	910e1953677820b4	rss-backstop	atpkg::vendor_direct::watch::check_shared::{closure#0} arithmetic_overflow_sub crates/atpkg/src/vendor_direct/watch.rs:1071 `checked_at - last`
-atpkg	9126634f0b40301b	rss-backstop	atpkg::platform::unix::exit_code_like hardened_panic_boundary crates/atpkg/src/platform/unix.rs:791 `128 + sig`
-atpkg	9194569cf2535df2	rss-backstop	atpkg::ops::program_build_of_target arithmetic_overflow_add crates/atpkg/src/ops.rs:116 `i + 2`
-atpkg	9205a99f39a55282	rss-backstop	atpkg::abrew::named_arg_types slice_bounds_check crates/atpkg/src/abrew/mod.rs:330 `[..types.len() - 1]`
-atpkg	9298ae633b4a65f7	rss-backstop	atpkg::abrew::census::Tally::count hardened_panic_boundary crates/atpkg/src/abrew/census.rs:41 `*all += 1`
-atpkg	92cfd1a3e8d3c235	rss-backstop	atpkg::status::held::end hardened_panic_boundary crates/atpkg/src/status.rs:665 `held[at].depth -= 1`
-atpkg	93f86a6788562fa6	rss-backstop	atpkg::yolo::is_shell_safe_marker hardened_panic_boundary crates/atpkg/src/yolo.rs:67 `bytes[0]`
-atpkg	9454b9f131cf4ad4	rss-backstop	atpkg::doctor::ago arithmetic_overflow_div crates/atpkg/src/doctor.rs:3928 `secs / 86_400`
-atpkg	950e9cc043776a61	rss-backstop	atpkg::cli::pending_state division_by_zero crates/atpkg/src/cli.rs:2418 `row.bytes_done.saturating_mul(100) / row.bytes_total.max(1)`
-atpkg	9551734ad4a38a58	rss-backstop	atpkg::cli::run_update_pass_in arithmetic_overflow_add crates/atpkg/src/cli.rs:8838 `failures += report_channel_apply(layout, installed, &report, &vendor_failed, true)`
-atpkg	974731601f3ebc19	rss-backstop	atpkg::abrew::commands::cmd_linkage hardened_panic_boundary crates/atpkg/src/abrew/commands.rs:8956 `i + 1`
-atpkg	9817444a7f8ada57	rss-backstop	atpkg::abrew::commands::cmd_tap_info hardened_panic_boundary crates/atpkg/src/abrew/commands.rs:9200 `formulae += tap_formula_names(tap).len()`
-atpkg	9820ffc3e5821558	rss-backstop	atpkg::yolo::decide::{closure#2} hardened_panic_boundary crates/atpkg/src/yolo.rs:326 `head[i]`
+atpkg	9126634f0b40301b	rss-backstop	atpkg::platform::unix::exit_code_like hardened_panic_boundary crates/atpkg/src/platform/unix.rs:892 `128 + sig`
+atpkg	92cfd1a3e8d3c235	rss-backstop	atpkg::status::held::end hardened_panic_boundary crates/atpkg/src/status.rs:667 `held[at].depth -= 1`
+atpkg	9454b9f131cf4ad4	rss-backstop	atpkg::doctor::ago arithmetic_overflow_div crates/atpkg/src/doctor.rs:4157 `secs / 86_400`
+atpkg	950e9cc043776a61	rss-backstop	atpkg::cli::pending_state division_by_zero crates/atpkg/src/cli.rs:2492 `row.bytes_done.saturating_mul(100) / row.bytes_total.max(1)`
+atpkg	9551734ad4a38a58	rss-backstop	atpkg::cli::run_update_pass_in arithmetic_overflow_add crates/atpkg/src/cli.rs:9154 `failures += report_channel_apply(layout, installed, &report, &vendor_failed, true)`
+atpkg	9725c29f1bf40835	rss-backstop	atpkg::build_cache::registered::ordinary_clearance hardened_panic_boundary crates/atpkg/src/build_cache_registered.rs:119 `records += 1`
+atpkg	9820ffc3e5821558	rss-backstop	atpkg::yolo::decide::{closure#2} hardened_panic_boundary crates/atpkg/src/yolo.rs:363 `head[i]`
 atpkg	9870a945b1ccd46d	rss-backstop	atpkg::packages_log::redact_tokens slice_bounds_check crates/atpkg/src/packages_log.rs:609 `[..at]`
-atpkg	99530b4af0640235	rss-backstop	atpkg::selfsetup::sweep_path_blocks arithmetic_overflow_add crates/atpkg/src/selfsetup.rs:1892 `s.removed += 1`
-atpkg	99530b4af0640235	rss-backstop	atpkg::selfsetup::sweep_path_blocks arithmetic_overflow_add crates/atpkg/src/selfsetup.rs:1902 `s.removed += 1`
-atpkg	99c4a48e5fd2047c	rss-backstop	atpkg::doctor::ago arithmetic_overflow_div crates/atpkg/src/doctor.rs:3924 `secs / 60`
-atpkg	99cc097d397ff8d8	rss-backstop	atpkg::cli::levenshtein arithmetic_overflow_add crates/atpkg/src/cli.rs:519 `i + 1`
+atpkg	99530b4af0640235	rss-backstop	atpkg::selfsetup::sweep_path_blocks arithmetic_overflow_add crates/atpkg/src/selfsetup.rs:2228 `s.removed += 1`
+atpkg	99530b4af0640235	rss-backstop	atpkg::selfsetup::sweep_path_blocks arithmetic_overflow_add crates/atpkg/src/selfsetup.rs:2238 `s.removed += 1`
+atpkg	99c4a48e5fd2047c	rss-backstop	atpkg::doctor::ago arithmetic_overflow_div crates/atpkg/src/doctor.rs:4153 `secs / 60`
+atpkg	99cc097d397ff8d8	rss-backstop	atpkg::cli::levenshtein arithmetic_overflow_add crates/atpkg/src/cli.rs:551 `i + 1`
 atpkg	9a9f2d47865de22a	rss-backstop	atpkg::meter::bar hardened_panic_boundary crates/atpkg/src/meter.rs:103 `u128::from(done) * (width as u128) * 8`
 atpkg	9acf6fcc3aa359dc	rss-backstop	<atpkg::reroute::Policy as core::cmp::PartialEq>::eq unreachable crates/atpkg/src/reroute.rs:59 `PartialEq`
 atpkg	9adf86f7c207460e	rss-backstop	atpkg::lineage::Matcher::<'_>::examine::{closure#0}::{closure#0} slice_bounds_check crates/atpkg/src/lineage.rs:909 `buf[k]`
 atpkg	9adf86f7c207460e	rss-backstop	atpkg::lineage::Matcher::<'_>::examine::{closure#0}::{closure#0} slice_bounds_check crates/atpkg/src/lineage.rs:909 `buf[k]`
-atpkg	9b0690b44fa1b2ed	rss-backstop	atpkg::cli::levenshtein arithmetic_overflow_add crates/atpkg/src/cli.rs:522 `j + 1`
-atpkg	9b1eee855162bd90	rss-backstop	atpkg::cli::levenshtein hardened_panic_boundary crates/atpkg/src/cli.rs:522 `j + 1`
+atpkg	9b0690b44fa1b2ed	rss-backstop	atpkg::cli::levenshtein arithmetic_overflow_add crates/atpkg/src/cli.rs:554 `j + 1`
+atpkg	9b1eee855162bd90	rss-backstop	atpkg::cli::levenshtein hardened_panic_boundary crates/atpkg/src/cli.rs:554 `j + 1`
 atpkg	9b9609c6c3868418	rss-backstop	atpkg::lineage::seed_mint_refusals_inner arithmetic_overflow_add crates/atpkg/src/lineage.rs:653 `r.files.len() + r.links.len()`
-atpkg	9d0c234471001740	rss-backstop	atpkg::flow::waited_words arithmetic_overflow_rem crates/atpkg/src/flow.rs:2140 `mins % 60`
+atpkg	9d0c234471001740	rss-backstop	atpkg::flow::waited_words arithmetic_overflow_rem crates/atpkg/src/flow.rs:2173 `mins % 60`
+atpkg	9d4e6d0308ebec83	rss-backstop	atpkg::build_cache::registered::package::policies hardened_panic_boundary crates/atpkg/src/build_cache_package.rs:704 `count += 1`
+atpkg	9d662b547187b5f8	rss-backstop	atpkg::selfsetup::sweep_old_caffeine hardened_panic_boundary crates/atpkg/src/selfsetup.rs:1031 `s.kept += 1`
+atpkg	9d662b547187b5f8	rss-backstop	atpkg::selfsetup::sweep_old_caffeine hardened_panic_boundary crates/atpkg/src/selfsetup.rs:1062 `s.kept += 1`
 atpkg	9d6c398ab1f42e56	rss-backstop	atpkg::openpgp::left_padded unbounded_allocation @sysroot/alloc/src/macros.rs:47 `-`
-atpkg	9e5b655a96b03701	rss-backstop	atpkg::cli::main_entry slice_bounds_check crates/atpkg/src/cli.rs:535 `argv.remove(0)`
+atpkg	9e3dd382c92a1113	rss-backstop	atpkg::build_cache::registered::record_count hardened_panic_boundary crates/atpkg/src/build_cache_registered.rs:438 `count += 1`
+atpkg	9e5b655a96b03701	rss-backstop	atpkg::cli::main_entry slice_bounds_check crates/atpkg/src/cli.rs:573 `argv.remove(0)`
 atpkg	9f7a6b4b9c869c13	rss-backstop	atpkg::lineage::Matcher::<'_>::hit hardened_panic_boundary crates/atpkg/src/lineage.rs:883 `*self.hits.entry(e).or_insert(0) += 1`
-atpkg	9fb6505d4f936809	rss-backstop	atpkg::compat::differing_bytes hardened_panic_boundary crates/atpkg/src/compat.rs:284 `a_len.max(b_len) - common`
+atpkg	9fb6505d4f936809	rss-backstop	atpkg::compat::differing_bytes hardened_panic_boundary crates/atpkg/src/compat.rs:280 `a_len.max(b_len) - common`
 atpkg	a036834276837dd0	rss-backstop	atpkg::lineage::find_byte slice_bounds_check crates/atpkg/src/lineage.rs:1084 `[i..i + 8]`
-atpkg	a06131055b9872ed	rss-backstop	atpkg::abrew::commands::cmd_zap hardened_panic_boundary crates/atpkg/src/abrew/commands.rs:8346 `failures += 1`
-atpkg	a093c31a7fca036c	rss-backstop	atpkg::abrew::commands::cmd_outdated hardened_panic_boundary crates/atpkg/src/abrew/commands.rs:5182 `collected[1]`
-atpkg	a0aab4841d7dfcf2	rss-backstop	atpkg::cli::verb_names index_out_of_bounds crates/atpkg/src/cli.rs:380 `out[i]`
+atpkg	a0aab4841d7dfcf2	rss-backstop	atpkg::cli::verb_names index_out_of_bounds crates/atpkg/src/cli.rs:412 `out[i]`
 atpkg	a1da0f678a6b34a0	rss-backstop	atpkg::lineage::scan_stream unbounded_allocation crates/atpkg/src/lineage.rs:842 `buf.resize(old + chunk, 0)`
-atpkg	a2564fb646c52834	rss-backstop	atpkg::abrew::commands::bundle_file assertion @sysroot/core/src/panic.rs:91 `-`
-atpkg	a29e6d26479abce9	rss-backstop	atpkg::yolo::decide unbounded_allocation crates/atpkg/src/yolo.rs:337 `Vec::with_capacity(args.len() + policy.flags.len())`
-atpkg	a29e6d26479abce9	rss-backstop	atpkg::yolo::decide unbounded_allocation crates/atpkg/src/yolo.rs:375 `Vec::with_capacity(args.len() + policy.flags.len())`
-atpkg	a29f931f10f8e32d	rss-backstop	atpkg::cli::cmd_lease slice_bounds_check crates/atpkg/src/cli.rs:3648 `[0]`
-atpkg	a29f931f10f8e32d	rss-backstop	atpkg::cli::cmd_lease slice_bounds_check crates/atpkg/src/cli.rs:3654 `[0]`
-atpkg	a32d720f54bdddb7	rss-backstop	atpkg::upstream_identity::trust_mark slice_bounds_check crates/atpkg/src/upstream_identity.rs:408 `[at..]`
-atpkg	a33df585168bb2b9	rss-backstop	atpkg::abrew::cask::brace_expand assertion crates/atpkg/src/abrew/cask.rs:1631 `open + 1`
-atpkg	a3b7a3b6d2dbd4d1	rss-backstop	atpkg::abrew::commands::mode_string::{closure#0} hardened_panic_boundary crates/atpkg/src/abrew/commands.rs:6848 `(mode >> shift)`
-atpkg	a4987ba78e909cae	rss-backstop	atpkg::net::GithubFetcher::walk_candidates::{closure#1} hardened_panic_boundary crates/atpkg/src/net.rs:774 `heads += 1`
-atpkg	a4dd7fe0b101ffdc	rss-backstop	atpkg::cli::VendorPass::absorb arithmetic_overflow_add crates/atpkg/src/cli.rs:11313 `self.failures += other.failures`
+atpkg	a29e6d26479abce9	rss-backstop	atpkg::yolo::decide unbounded_allocation crates/atpkg/src/yolo.rs:374 `Vec::with_capacity(args.len() + policy.flags.len())`
+atpkg	a29e6d26479abce9	rss-backstop	atpkg::yolo::decide unbounded_allocation crates/atpkg/src/yolo.rs:413 `Vec::with_capacity(args.len() + policy.flags.len())`
+atpkg	a29f931f10f8e32d	rss-backstop	atpkg::cli::cmd_lease slice_bounds_check crates/atpkg/src/cli.rs:3800 `[0]`
+atpkg	a29f931f10f8e32d	rss-backstop	atpkg::cli::cmd_lease slice_bounds_check crates/atpkg/src/cli.rs:3806 `[0]`
+atpkg	a32d720f54bdddb7	rss-backstop	atpkg::upstream_identity::trust_mark slice_bounds_check crates/atpkg/src/upstream_identity.rs:436 `[at..]`
+atpkg	a40c4fc254b39a3d	rss-backstop	atpkg::build_admit::becoming::become_build slice_bounds_check crates/atpkg/src/build_admit_exec.rs:157 `[0]`
+atpkg	a40c4fc254b39a3d	rss-backstop	atpkg::build_admit::becoming::become_build slice_bounds_check crates/atpkg/src/build_admit_exec.rs:164 `[0]`
+atpkg	a4987ba78e909cae	rss-backstop	atpkg::net::GithubFetcher::walk_candidates::{closure#1} hardened_panic_boundary crates/atpkg/src/net.rs:786 `heads += 1`
+atpkg	a4dd7fe0b101ffdc	rss-backstop	atpkg::cli::VendorPass::absorb arithmetic_overflow_add crates/atpkg/src/cli.rs:11676 `self.failures += other.failures`
 atpkg	a549ee936bde747c	rss-backstop	atpkg::meter::bar arithmetic_overflow_sub crates/atpkg/src/meter.rs:113 `width - full - 1`
-atpkg	a56a8f4e94176e45	rss-backstop	atpkg::harness::is_harness slice_bounds_check crates/atpkg/src/harness.rs:27 `name[at + i]`
-atpkg	a5c54fae69dc390e	rss-backstop	atpkg::abrew::commands::cmd_tap_info arithmetic_overflow_add crates/atpkg/src/abrew/commands.rs:9200 `formulae += tap_formula_names(tap).len()`
 atpkg	a6b990f09e04ebb1	rss-backstop	atpkg::yolo::marker_matches slice_bounds_check crates/atpkg/src/yolo.rs:89 `bytes[0]`
-atpkg	a6be690cc5d328e3	rss-backstop	atpkg::doctor::index_age_days hardened_panic_boundary crates/atpkg/src/doctor.rs:4011 `(now - then)`
-atpkg	a6d0a09092cbd502	rss-backstop	atpkg::abrew::commands::LongLister::date arithmetic_overflow_div crates/atpkg/src/abrew/commands.rs:6789 `secs / 3_600`
-atpkg	a6fe2940155a42b4	rss-backstop	atpkg::store::StageRefusal::cooldown_secs shift_overflow_shl crates/atpkg/src/store.rs:733 `1_i64 << shift`
-atpkg	a7077ff351deb12f	rss-backstop	atpkg::flow::waited_words arithmetic_overflow_div crates/atpkg/src/flow.rs:2140 `mins / 60`
+atpkg	a6be690cc5d328e3	rss-backstop	atpkg::doctor::index_age_days hardened_panic_boundary crates/atpkg/src/doctor.rs:4240 `(now - then)`
+atpkg	a6fe2940155a42b4	rss-backstop	atpkg::store::StageRefusal::cooldown_secs shift_overflow_shl crates/atpkg/src/store.rs:810 `1_i64 << shift`
+atpkg	a7077ff351deb12f	rss-backstop	atpkg::flow::waited_words arithmetic_overflow_div crates/atpkg/src/flow.rs:2173 `mins / 60`
+atpkg	a800e42ec6a71ccf	rss-backstop	atpkg::cli::install_default_set_inner::{closure#20} slice_bounds_check crates/atpkg/src/cli.rs:9848 `[*gi]`
 atpkg	a8dfeb8950a44276	rss-backstop	atpkg::lineage::find_byte hardened_panic_boundary crates/atpkg/src/lineage.rs:1089 `i += 8`
-atpkg	a946b5dec3698b2f	rss-backstop	atpkg::cli::install_default_set_inner::{closure#29} hardened_panic_boundary crates/atpkg/src/cli.rs:9701 `failures += bootstrap_singleton( … )`
-atpkg	a96f817195e7938f	rss-backstop	atpkg::abrew::commands::prune_downloads hardened_panic_boundary crates/atpkg/src/abrew/commands.rs:6275 `removed += 1`
-atpkg	a9f7f4003d6bb9f2	rss-backstop	atpkg::selfsetup::self_uninstall_with_acaffiene hardened_panic_boundary crates/atpkg/src/selfsetup.rs:1388 `s.removed += 1`
-atpkg	a9f7f4003d6bb9f2	rss-backstop	atpkg::selfsetup::self_uninstall_with_acaffiene hardened_panic_boundary crates/atpkg/src/selfsetup.rs:1467 `s.removed += 1`
-atpkg	a9f7f4003d6bb9f2	rss-backstop	atpkg::selfsetup::self_uninstall_with_acaffiene hardened_panic_boundary crates/atpkg/src/selfsetup.rs:1677 `s.removed += 1`
-atpkg	a9f7f4003d6bb9f2	rss-backstop	atpkg::selfsetup::self_uninstall_with_acaffiene hardened_panic_boundary crates/atpkg/src/selfsetup.rs:1681 `s.removed += 1`
-atpkg	aa146bc04440b851	rss-backstop	atpkg::abrew::cask::segment_matches::inner hardened_panic_boundary crates/atpkg/src/abrew/cask.rs:1504 `s[0]`
-atpkg	aa146bc04440b851	rss-backstop	atpkg::abrew::cask::segment_matches::inner hardened_panic_boundary crates/atpkg/src/abrew/cask.rs:1509 `s[0]`
+atpkg	a9f7f4003d6bb9f2	rss-backstop	atpkg::selfsetup::self_uninstall_with_acaffiene hardened_panic_boundary crates/atpkg/src/selfsetup.rs:1724 `s.removed += 1`
+atpkg	a9f7f4003d6bb9f2	rss-backstop	atpkg::selfsetup::self_uninstall_with_acaffiene hardened_panic_boundary crates/atpkg/src/selfsetup.rs:1803 `s.removed += 1`
+atpkg	a9f7f4003d6bb9f2	rss-backstop	atpkg::selfsetup::self_uninstall_with_acaffiene hardened_panic_boundary crates/atpkg/src/selfsetup.rs:2012 `s.removed += 1`
+atpkg	a9f7f4003d6bb9f2	rss-backstop	atpkg::selfsetup::self_uninstall_with_acaffiene hardened_panic_boundary crates/atpkg/src/selfsetup.rs:2016 `s.removed += 1`
 atpkg	aa3484768fe4bb2d	rss-backstop	atpkg::flow::ahead::Ahead::next_with_wait slice_bounds_check crates/atpkg/src/flow/ahead.rs:259 `[i]`
 atpkg	aa3484768fe4bb2d	rss-backstop	atpkg::flow::ahead::Ahead::next_with_wait slice_bounds_check crates/atpkg/src/flow/ahead.rs:260 `[i]`
 atpkg	aa7a752ff3abfcce	rss-backstop	atpkg::lineage::parse_version hardened_panic_boundary crates/atpkg/src/lineage.rs:1029 `i += 1`
@@ -16563,29 +16610,27 @@ atpkg	aa7a752ff3abfcce	rss-backstop	atpkg::lineage::parse_version hardened_panic
 atpkg	aa7a752ff3abfcce	rss-backstop	atpkg::lineage::parse_version hardened_panic_boundary crates/atpkg/src/lineage.rs:1054 `i += 1`
 atpkg	ab7e49377b430e9d	rss-backstop	atpkg::lineage::find_byte::{closure#1} hardened_panic_boundary crates/atpkg/src/lineage.rs:1091 `p + i`
 atpkg	ac06d476f43bfb70	rss-backstop	atpkg::machine::universal_control_from_domain hardened_panic_boundary crates/atpkg/src/machine.rs:223 `depth += 1`
-atpkg	ac0879822ff48663	rss-backstop	atpkg::cli::link_args slice_bounds_check crates/atpkg/src/cli.rs:12789 `[2..]`
-atpkg	ac390466565c5c80	rss-backstop	atpkg::abrew::commands::LongLister::date hardened_panic_boundary crates/atpkg/src/abrew/commands.rs:6777 `i128::from(mtime) + i128::from(self.offset_at(mtime))`
-atpkg	acbd3efa54d8e19f	rss-backstop	atpkg::warm::login_shell_env slice_bounds_check crates/atpkg/src/warm.rs:287 `records.remove(asked)`
-atpkg	accb50a93b9c269d	rss-backstop	atpkg::cli::installed_line slice_bounds_check crates/atpkg/src/cli.rs:7517 `commands.remove(at)`
+atpkg	ac0879822ff48663	rss-backstop	atpkg::cli::link_args slice_bounds_check crates/atpkg/src/cli.rs:13220 `[2..]`
+atpkg	acbd3efa54d8e19f	rss-backstop	atpkg::warm::login_shell_env slice_bounds_check crates/atpkg/src/warm.rs:289 `records.remove(asked)`
+atpkg	accb50a93b9c269d	rss-backstop	atpkg::cli::installed_line slice_bounds_check crates/atpkg/src/cli.rs:7831 `commands.remove(at)`
 atpkg	ad2d2100e5b5ccc8	rss-backstop	atpkg::lineage::scan_stream unbounded_allocation crates/atpkg/src/lineage.rs:838 `Vec::with_capacity(chunk + TAIL + 2)`
 atpkg	ad40fc480009b580	rss-backstop	atpkg::net::newest_index hardened_panic_boundary crates/atpkg/src/net.rs:207 `(miss - hit)`
-atpkg	ad9f57e4272e988d	rss-backstop	atpkg::net::GithubFetcher::walk_candidates::{closure#1} arithmetic_overflow_add crates/atpkg/src/net.rs:786 `asked_ahead += round.len().saturating_sub(1)`
+atpkg	ad9f57e4272e988d	rss-backstop	atpkg::net::GithubFetcher::walk_candidates::{closure#1} arithmetic_overflow_add crates/atpkg/src/net.rs:798 `asked_ahead += round.len().saturating_sub(1)`
+atpkg	ada029f05826b9ac	rss-backstop	atpkg::cli::reclaim_build_cache arithmetic_overflow_add crates/atpkg/src/cli.rs:6663 `parts + stayed`
 atpkg	adb6ff3f5082c2ee	rss-backstop	atpkg::macho::is_macho_header slice_bounds_check crates/atpkg/src/macho.rs:22 `word[3]`
 atpkg	ae7b3d7498456757	rss-backstop	atpkg::lineage::parse_version arithmetic_overflow_add crates/atpkg/src/lineage.rs:1045 `i + 2`
+atpkg	af0087962a96b0ca	rss-backstop	atpkg::platform::probe_shim::Capture::script_forward hardened_panic_boundary crates/atpkg/src/platform/probe_shim.rs:125 `depth + 1`
 atpkg	af485964f4a5a314	rss-backstop	<atpkg::lineage::Evidence as core::cmp::Ord>::cmp unreachable crates/atpkg/src/lineage.rs:739 `Ord`
-atpkg	afd21ebe060df8ea	rss-backstop	atpkg::selfsetup::Sweep::<'_>::rm arithmetic_overflow_add crates/atpkg/src/selfsetup.rs:780 `self.removed += 1`
-atpkg	afdafc21acfe9e66	rss-backstop	atpkg::doctor::unreached_cause hardened_panic_boundary crates/atpkg/src/doctor.rs:4017 `at + FROM_CACHE.len()`
-atpkg	b01b89d7015782de	rss-backstop	atpkg::cli::parse_lease_args slice_bounds_check crates/atpkg/src/cli.rs:3443 `[sep + 1..]`
+atpkg	afd21ebe060df8ea	rss-backstop	atpkg::selfsetup::Sweep::<'_>::rm arithmetic_overflow_add crates/atpkg/src/selfsetup.rs:804 `self.removed += 1`
+atpkg	afdafc21acfe9e66	rss-backstop	atpkg::doctor::unreached_cause hardened_panic_boundary crates/atpkg/src/doctor.rs:4246 `at + FROM_CACHE.len()`
+atpkg	affa9adb265e5365	rss-backstop	atpkg::platform::unix::shim_executable_to_env hardened_panic_boundary crates/atpkg/src/platform/unix.rs:651 `at + block.len()`
+atpkg	b01b89d7015782de	rss-backstop	atpkg::cli::parse_lease_args slice_bounds_check crates/atpkg/src/cli.rs:3595 `[sep + 1..]`
 atpkg	b03390ff9cdd3ac0	rss-backstop	atpkg::packages_log::redact_urls hardened_panic_boundary crates/atpkg/src/packages_log.rs:528 `at + 3`
-atpkg	b03eddbebfa59294	rss-backstop	atpkg::abrew::cask::segment_matches::inner hardened_panic_boundary crates/atpkg/src/abrew/cask.rs:1502 `p[i]`
-atpkg	b03eddbebfa59294	rss-backstop	atpkg::abrew::cask::segment_matches::inner hardened_panic_boundary crates/atpkg/src/abrew/cask.rs:1504 `p[i]`
-atpkg	b03eddbebfa59294	rss-backstop	atpkg::abrew::cask::segment_matches::inner hardened_panic_boundary crates/atpkg/src/abrew/cask.rs:1509 `p[i]`
+atpkg	b039db839f2f72a9	rss-backstop	atpkg::build_cache::remove::sys::Walk::<'_, '_>::entry hardened_panic_boundary crates/atpkg/src/build_cache_remove.rs:627 `*self.met.entry((stat.st_dev, stat.st_ino)).or_default() += 1`
 atpkg	b044c5f6fb64be7f	rss-backstop	atpkg::lineage::parse_version index_out_of_bounds crates/atpkg/src/lineage.rs:1019 `s[i]`
 atpkg	b044c5f6fb64be7f	rss-backstop	atpkg::lineage::parse_version index_out_of_bounds crates/atpkg/src/lineage.rs:1036 `s[i]`
 atpkg	b044c5f6fb64be7f	rss-backstop	atpkg::lineage::parse_version index_out_of_bounds crates/atpkg/src/lineage.rs:1036 `s[i]`
-atpkg	b0c1d4b906c888fc	rss-backstop	atpkg::cli::install_default_set_inner::{closure#29} slice_bounds_check crates/atpkg/src/cli.rs:9677 `[0]`
-atpkg	b0c1d4b906c888fc	rss-backstop	atpkg::cli::install_default_set_inner::{closure#29} slice_bounds_check crates/atpkg/src/cli.rs:9705 `[0]`
-atpkg	b19fccfc8c00b10e	rss-backstop	atpkg::abrew::cask::brace_expand arithmetic_overflow_add crates/atpkg/src/abrew/cask.rs:1623 `depth += 1`
+atpkg	b203bd38c918e70a	rss-backstop	atpkg::peers::from_peer arithmetic_overflow_sub crates/atpkg/src/peers.rs:484 `declared - got`
 atpkg	b2a0e52f4d4ec159	rss-backstop	atpkg::flow::ahead::Ahead::claim slice_bounds_check crates/atpkg/src/flow/ahead.rs:305 `[i]`
 atpkg	b2a0e52f4d4ec159	rss-backstop	atpkg::flow::ahead::Ahead::claim slice_bounds_check crates/atpkg/src/flow/ahead.rs:307 `[i]`
 atpkg	b2a0e52f4d4ec159	rss-backstop	atpkg::flow::ahead::Ahead::claim slice_bounds_check crates/atpkg/src/flow/ahead.rs:308 `[i]`
@@ -16593,197 +16638,197 @@ atpkg	b2a0e52f4d4ec159	rss-backstop	atpkg::flow::ahead::Ahead::claim slice_bound
 atpkg	b2a0e52f4d4ec159	rss-backstop	atpkg::flow::ahead::Ahead::claim slice_bounds_check crates/atpkg/src/flow/ahead.rs:314 `[i]`
 atpkg	b2a0e52f4d4ec159	rss-backstop	atpkg::flow::ahead::Ahead::claim slice_bounds_check crates/atpkg/src/flow/ahead.rs:317 `[i]`
 atpkg	b2a0e52f4d4ec159	rss-backstop	atpkg::flow::ahead::Ahead::claim slice_bounds_check crates/atpkg/src/flow/ahead.rs:323 `[i]`
-atpkg	b2bef91b9a55dfe1	rss-backstop	atpkg::abrew::commands::prune_prefix_links arithmetic_overflow_add crates/atpkg/src/abrew/commands.rs:6060 `links += 1`
-atpkg	b3467d9145f2fc98	rss-backstop	atpkg::store::StageRefusal::cooldown_secs hardened_panic_boundary crates/atpkg/src/store.rs:733 `1_i64 << shift`
-atpkg	b46d3b5d18ff6aef	rss-backstop	atpkg::abrew::commands::mode_string::{closure#0} shift_overflow_shr crates/atpkg/src/abrew/commands.rs:6848 `(mode >> shift)`
-atpkg	b4cc211c9f0e8f72	wall-backstop	atpkg::macho::load_names hardened_panic_boundary crates/atpkg/src/macho.rs:212 `base + 12`
-atpkg	b52e73abbd7664c3	rss-backstop	atpkg::abrew::commands::LongLister::date arithmetic_overflow_add crates/atpkg/src/abrew/commands.rs:6777 `i128::from(mtime) + i128::from(self.offset_at(mtime))`
+atpkg	b3467d9145f2fc98	rss-backstop	atpkg::store::StageRefusal::cooldown_secs hardened_panic_boundary crates/atpkg/src/store.rs:810 `1_i64 << shift`
+atpkg	b4cc211c9f0e8f72	wall-backstop	atpkg::macho::load_names hardened_panic_boundary crates/atpkg/src/macho.rs:202 `base + 12`
+atpkg	b4e71d7a7950bc8f	rss-backstop	atpkg::cli::reclaim_build_cache hardened_panic_boundary crates/atpkg/src/cli.rs:6666 `removed.len() - parts - stayed`
 atpkg	b57ad7a35d322bce	rss-backstop	atpkg::packages_log::redact_tokens hardened_panic_boundary crates/atpkg/src/packages_log.rs:622 `word.len() - word.trim_start_matches(wrapping).len()`
-atpkg	b59eb9794700e81b	rss-backstop	atpkg::cli::levenshtein hardened_panic_boundary crates/atpkg/src/cli.rs:522 `(prev[j] + cost)`
+atpkg	b59eb9794700e81b	rss-backstop	atpkg::cli::levenshtein hardened_panic_boundary crates/atpkg/src/cli.rs:554 `(prev[j] + cost)`
 atpkg	b65719efb8524847	rss-backstop	atpkg::seam::bin_plan hardened_panic_boundary crates/atpkg/src/seam.rs:253 `tools += 1`
-atpkg	b7030b82d2ff7f50	rss-backstop	atpkg::abrew::commands::LongLister::date hardened_panic_boundary crates/atpkg/src/abrew/commands.rs:6789 `secs / 60 % 60`
-atpkg	b71ba7b1d06c091b	rss-backstop	atpkg::doctor::unknown_field_in hardened_panic_boundary crates/atpkg/src/doctor.rs:903 `stderr.find(marker)? + marker.len()`
-atpkg	b75cde66552e27a8	rss-backstop	<atpkg::abrew::bundle::BrewfileEntry as core::cmp::PartialEq>::eq unreachable crates/atpkg/src/abrew/bundle.rs:135 `PartialEq`
+atpkg	b70d31447a69461f	rss-backstop	atpkg::cli::reclaim_build_cache arithmetic_overflow_add crates/atpkg/src/cli.rs:6641 `stayed += 1`
+atpkg	b70d31447a69461f	rss-backstop	atpkg::cli::reclaim_build_cache arithmetic_overflow_add crates/atpkg/src/cli.rs:6649 `stayed += 1`
+atpkg	b71ba7b1d06c091b	rss-backstop	atpkg::doctor::unknown_field_in hardened_panic_boundary crates/atpkg/src/doctor.rs:984 `stderr.find(marker)? + marker.len()`
+atpkg	b75cde66552e27a8	rss-backstop	<atpkg::abrew::bundle::BrewfileEntry as core::cmp::PartialEq>::eq unreachable crates/atpkg/src/abrew/bundle.rs:198 `PartialEq`
 atpkg	b8877f7f03d1d673	rss-backstop	atpkg::lineage::Matcher::<'_>::examine slice_bounds_check crates/atpkg/src/lineage.rs:954 `[..6 + 8 + used]`
-atpkg	b9864f1876571927	rss-backstop	atpkg::abrew::command_args hardened_panic_boundary crates/atpkg/src/abrew/mod.rs:959 `args[1]`
-atpkg	b9eaa8a5a9e8e47a	rss-backstop	atpkg::harness::is_harness slice_bounds_check crates/atpkg/src/harness.rs:27 `tail[i]`
 atpkg	b9f124680f17616b	rss-backstop	atpkg::lineage::scan_stream hardened_panic_boundary crates/atpkg/src/lineage.rs:842 `old + chunk`
 atpkg	ba3c736dd1280a89	rss-backstop	atpkg::meter::spinner index_out_of_bounds crates/atpkg/src/meter.rs:95 `ASCII[frame % ASCII.len()]`
 atpkg	ba6299427eb73deb	rss-backstop	atpkg::flow::ahead::Ahead::work_with_bump slice_bounds_check crates/atpkg/src/flow/ahead.rs:184 `[i]`
 atpkg	ba6299427eb73deb	rss-backstop	atpkg::flow::ahead::Ahead::work_with_bump slice_bounds_check crates/atpkg/src/flow/ahead.rs:188 `[i]`
 atpkg	ba6299427eb73deb	rss-backstop	atpkg::flow::ahead::Ahead::work_with_bump slice_bounds_check crates/atpkg/src/flow/ahead.rs:189 `[i]`
-atpkg	ba88dd203195984a	rss-backstop	atpkg::abrew::census::Tally::count arithmetic_overflow_add crates/atpkg/src/abrew/census.rs:41 `*all += 1`
 atpkg	baa1493342787d69	rss-backstop	atpkg::openpgp::verify_one unbounded_allocation crates/atpkg/src/openpgp.rs:548 `Vec::with_capacity(document.len() + sig.hashed_prefix.len() + 6)`
-atpkg	bb2e0c7a8ceae02a	rss-backstop	atpkg::yolo::decide slice_bounds_check crates/atpkg/src/yolo.rs:309 `[..head_len]`
+atpkg	bb2e0c7a8ceae02a	rss-backstop	atpkg::yolo::decide slice_bounds_check crates/atpkg/src/yolo.rs:346 `[..head_len]`
 atpkg	bb9118853ce437f7	rss-backstop	atpkg::lineage::parse_version hardened_panic_boundary crates/atpkg/src/lineage.rs:1050 `i += 9`
 atpkg	bb96e5fa8036b228	rss-backstop	atpkg::yolo::marker_matches hardened_panic_boundary crates/atpkg/src/yolo.rs:89 `bytes[1]`
-atpkg	bcb151092379472b	rss-backstop	atpkg::harness::is_harness hardened_panic_boundary crates/atpkg/src/harness.rs:24 `name.len() - tail.len()`
-atpkg	bccbd0b51f6aef3a	rss-backstop	atpkg::yolo::strip_no_harness slice_bounds_check crates/atpkg/src/yolo.rs:420 `[..end]`
+atpkg	bccbd0b51f6aef3a	rss-backstop	atpkg::yolo::strip_no_harness slice_bounds_check crates/atpkg/src/yolo.rs:458 `[..end]`
 atpkg	bd6a905834623921	rss-backstop	atpkg::meter::pass_body hardened_panic_boundary crates/atpkg/src/meter.rs:194 `row.bytes_done.min(row.bytes_total).saturating_mul(100) / row.bytes_total`
 atpkg	bdeb93d3570713d4	rss-backstop	atpkg::lineage::scan_stream hardened_panic_boundary crates/atpkg/src/lineage.rs:847 `filled += n`
-atpkg	bdfdfe6d0023c8c5	rss-backstop	atpkg::cli::report_channel_apply hardened_panic_boundary crates/atpkg/src/cli.rs:12483 `failed_names.len() + also_failed.len()`
-atpkg	be64ab7b2924f02a	rss-backstop	atpkg::net::GithubFetcher::walk_candidates::{closure#1} arithmetic_overflow_add crates/atpkg/src/net.rs:774 `heads += 1`
-atpkg	beb3aa4b44036102	rss-backstop	atpkg::abrew::commands::LongLister::date arithmetic_overflow_div crates/atpkg/src/abrew/commands.rs:6789 `secs / 60`
+atpkg	bdfdfe6d0023c8c5	rss-backstop	atpkg::cli::report_channel_apply hardened_panic_boundary crates/atpkg/src/cli.rs:12875 `failed_names.len() + also_failed.len()`
+atpkg	be64ab7b2924f02a	rss-backstop	atpkg::net::GithubFetcher::walk_candidates::{closure#1} arithmetic_overflow_add crates/atpkg/src/net.rs:786 `heads += 1`
 atpkg	bf46d6b2f35e09dc	rss-backstop	atpkg::lineage::Matcher::<'_>::examine arithmetic_overflow_add crates/atpkg/src/lineage.rs:964 `6 + used`
-atpkg	c1556409e2ba809d	rss-backstop	atpkg::selfsetup::self_uninstall_with_acaffiene hardened_panic_boundary crates/atpkg/src/selfsetup.rs:1378 `s.shared_kept += 1`
-atpkg	c1c02cdcf0115219	rss-backstop	atpkg::cli::report_channel_apply hardened_panic_boundary crates/atpkg/src/cli.rs:12449 `failures += 1`
-atpkg	c1f9ae4f79982465	rss-backstop	atpkg::ops::program_build_of_target hardened_panic_boundary crates/atpkg/src/ops.rs:115 `i + 1`
-atpkg	c21ca9f0b74089a1	rss-backstop	atpkg::abrew::commands::cmd_zap arithmetic_overflow_add crates/atpkg/src/abrew/commands.rs:8346 `failures += 1`
-atpkg	c2473e7cf208879f	rss-backstop	atpkg::cli::install_default_set_inner arithmetic_overflow_add crates/atpkg/src/cli.rs:9491 `failures += 1`
-atpkg	c2473e7cf208879f	rss-backstop	atpkg::cli::install_default_set_inner arithmetic_overflow_add crates/atpkg/src/cli.rs:9767 `failures += 1`
+atpkg	c1556409e2ba809d	rss-backstop	atpkg::selfsetup::self_uninstall_with_acaffiene hardened_panic_boundary crates/atpkg/src/selfsetup.rs:1714 `s.shared_kept += 1`
+atpkg	c1c02cdcf0115219	rss-backstop	atpkg::cli::report_channel_apply hardened_panic_boundary crates/atpkg/src/cli.rs:12841 `failures += 1`
+atpkg	c1ce3c0ac6c955fe	rss-backstop	atpkg::peers::from_peer hardened_panic_boundary crates/atpkg/src/peers.rs:484 `declared - got`
+atpkg	c2473e7cf208879f	rss-backstop	atpkg::cli::install_default_set_inner arithmetic_overflow_add crates/atpkg/src/cli.rs:10099 `failures += 1`
+atpkg	c2473e7cf208879f	rss-backstop	atpkg::cli::install_default_set_inner arithmetic_overflow_add crates/atpkg/src/cli.rs:9815 `failures += 1`
 atpkg	c28444393f194860	rss-backstop	atpkg::meter::time_left arithmetic_overflow_mul crates/atpkg/src/meter.rs:129 `secs.div_ceil(5).max(1) * 5`
 atpkg	c37324890f49dc94	rss-backstop	atpkg::macho::is_macho_header slice_bounds_check crates/atpkg/src/macho.rs:22 `word[2]`
-atpkg	c3ccd746dc1190f3	rss-backstop	atpkg::warm::parse_env0::{closure#1}::{closure#3} arithmetic_overflow_add crates/atpkg/src/warm.rs:326 `eq + 1`
-atpkg	c3de8c69786132fa	rss-backstop	atpkg::yolo::is_shell_safe_marker slice_bounds_check crates/atpkg/src/yolo.rs:67 `bytes[0]`
-atpkg	c545c5bccaa245e6	rss-backstop	atpkg::abrew::census::Tally::count arithmetic_overflow_add crates/atpkg/src/abrew/census.rs:33 `self.refused += 1`
-atpkg	c5936a0c5380745f	rss-backstop	atpkg::platform::unix::exit_code_like arithmetic_overflow_add crates/atpkg/src/platform/unix.rs:791 `128 + sig`
+atpkg	c3ccd746dc1190f3	rss-backstop	atpkg::warm::parse_env0::{closure#1}::{closure#3} arithmetic_overflow_add crates/atpkg/src/warm.rs:328 `eq + 1`
+atpkg	c3e77ce43efd7947	rss-backstop	atpkg::selfsetup::would_make_lock arithmetic_overflow_add crates/atpkg/src/selfsetup.rs:1118 `s.kept += 1`
+atpkg	c54345f98f601398	rss-backstop	atpkg::zdotdir::under_home hardened_panic_boundary crates/atpkg/src/zdotdir.rs:92 `links += 1`
+atpkg	c5936a0c5380745f	rss-backstop	atpkg::platform::unix::exit_code_like arithmetic_overflow_add crates/atpkg/src/platform/unix.rs:892 `128 + sig`
+atpkg	c5f5d8930467cce9	rss-backstop	atpkg::cli::reclaim_build_cache hardened_panic_boundary crates/atpkg/src/cli.rs:6663 `parts + stayed`
 atpkg	c606af311b1bb755	rss-backstop	<atpkg::lineage::Evidence as core::cmp::PartialEq>::eq unreachable crates/atpkg/src/lineage.rs:739 `PartialEq`
 atpkg	c606de712e31b221	rss-backstop	atpkg::install::acceptance_fixtures::a_real_image_with_no_app_is_refused_and_detached assertion @sysroot/core/src/panic.rs:62 `-`
-atpkg	c67fcb68a6cd8eb7	rss-backstop	atpkg::abrew::census::Tally::count arithmetic_overflow_add crates/atpkg/src/abrew/census.rs:42 `*sole += alone`
 atpkg	c6a51c1545c22a06	rss-backstop	atpkg::lane::read_input division_by_zero crates/atpkg/src/lane.rs:28 `MAX_INPUT_BYTES / (1024 * 1024)`
+atpkg	c6f8018452589003	rss-backstop	atpkg::cost::disk_ok arithmetic_overflow_add crates/atpkg/src/cost.rs:53 `(required as u128) + (free_floor as u128)`
 atpkg	c8c1fcf985e7948a	rss-backstop	atpkg::lineage::scan_stream arithmetic_overflow_add crates/atpkg/src/lineage.rs:838 `chunk + TAIL`
 atpkg	c907d4b47ec7785b	rss-backstop	<atpkg::abrew::formula::Artifact as core::cmp::PartialEq>::eq unreachable crates/atpkg/src/abrew/formula.rs:656 `PartialEq`
 atpkg	c90db558319e1a2f	rss-backstop	atpkg::openpgp::signature_packets arithmetic_overflow_add crates/atpkg/src/openpgp.rs:338 `((usize::from(first) - 192) << 8) + usize::from(second) + 192`
 atpkg	c94f0df7350a29d3	rss-backstop	atpkg::meter::bar hardened_panic_boundary crates/atpkg/src/meter.rs:103 `u128::from(done) * (width as u128) * 8 / u128::from(total)`
-atpkg	c96240ef1b413e55	rss-backstop	atpkg::upstream_identity::cached_rustup_which slice_bounds_check crates/atpkg/src/upstream_identity.rs:256 `answer`
-atpkg	c98b1973bd757ddb	rss-backstop	atpkg::cli::sweep_uninstall_targets hardened_panic_boundary crates/atpkg/src/cli.rs:4390 `sweep.failures += 1`
-atpkg	c9a44d372d276180	rss-backstop	atpkg::abrew::commands::cmd_outdated index_out_of_bounds crates/atpkg/src/abrew/commands.rs:5163 `collected[slot]`
-atpkg	c9a44d372d276180	rss-backstop	atpkg::abrew::commands::cmd_outdated index_out_of_bounds crates/atpkg/src/abrew/commands.rs:5163 `collected[slot]`
+atpkg	c96240ef1b413e55	rss-backstop	atpkg::upstream_identity::cached_rustup_which slice_bounds_check crates/atpkg/src/upstream_identity.rs:284 `answer`
+atpkg	c98b1973bd757ddb	rss-backstop	atpkg::cli::sweep_uninstall_targets hardened_panic_boundary crates/atpkg/src/cli.rs:4605 `sweep.failures += 1`
 atpkg	c9c982cff1f0d17d	rss-backstop	atpkg::flow::ahead::Ahead::fetched_inline slice_bounds_check crates/atpkg/src/flow/ahead.rs:378 `[i]`
 atpkg	c9c982cff1f0d17d	rss-backstop	atpkg::flow::ahead::Ahead::fetched_inline slice_bounds_check crates/atpkg/src/flow/ahead.rs:379 `[i]`
 atpkg	c9c982cff1f0d17d	rss-backstop	atpkg::flow::ahead::Ahead::fetched_inline slice_bounds_check crates/atpkg/src/flow/ahead.rs:380 `[i]`
-atpkg	cbe893cc507d1b30	rss-backstop	atpkg::compat::inspect unreachable crates/atpkg/src/compat.rs:877 `pub fn inspect(layout: &Layout, build: u64) -> Option<Result<Inspection, String>> { … }`
+atpkg	cbe893cc507d1b30	rss-backstop	atpkg::compat::inspect unreachable crates/atpkg/src/compat.rs:873 `pub fn inspect(layout: &Layout, build: u64) -> Option<Result<Inspection, String>> { … }`
 atpkg	cc4f6fbc674b31c8	rss-backstop	atpkg::copies::trash_refusal slice_bounds_check crates/atpkg/src/copies.rs:67 `[stderr.find("Code=")?..]`
-atpkg	cc695217da1808f1	rss-backstop	atpkg::selfsetup::self_uninstall_with_acaffiene::{closure#7}::{closure#0}::{closure#0} hardened_panic_boundary crates/atpkg/src/selfsetup.rs:1460 `128 + std::os::unix::process::ExitStatusExt::signal(&st).unwrap_or(0)`
+atpkg	cc695217da1808f1	rss-backstop	atpkg::selfsetup::self_uninstall_with_acaffiene::{closure#7}::{closure#0}::{closure#0} hardened_panic_boundary crates/atpkg/src/selfsetup.rs:1796 `128 + std::os::unix::process::ExitStatusExt::signal(&st).unwrap_or(0)`
 atpkg	cc9cfbc5f8adb6a1	rss-backstop	atpkg::net::fan_out_upto::{closure#0} unbounded_allocation crates/atpkg/src/net.rs:144 `(1..items.len().min(width)) … .collect()`
-atpkg	cca404abbfe50745	rss-backstop	atpkg::abrew::commands::cmd_linkage arithmetic_overflow_add crates/atpkg/src/abrew/commands.rs:8956 `i + 1`
-atpkg	ccfbce16ed88a10c	rss-backstop	atpkg::abrew::commands::cmd_tap_info arithmetic_overflow_add crates/atpkg/src/abrew/commands.rs:9201 `commands += tap_command_names(tap).len()`
-atpkg	ce5718368c7d8992	rss-backstop	atpkg::status::held::end slice_bounds_check crates/atpkg/src/status.rs:666 `[at]`
-atpkg	ce6dcbf4190add73	rss-backstop	atpkg::flow::waited_words hardened_panic_boundary crates/atpkg/src/flow.rs:2140 `mins % 60`
-atpkg	ce9a6f97e8d8f479	rss-backstop	atpkg::abrew::commands::cmd_bundle slice_bounds_check crates/atpkg/src/abrew/commands.rs:9514 `[1..]`
-atpkg	cebc95ff6c9ac06f	rss-backstop	atpkg::converge::items::{closure#0} arithmetic_overflow_add crates/atpkg/src/converge.rs:428 `*n += 1`
-atpkg	ceeb51414e57eeb8	rss-backstop	atpkg::abrew::commands::LongLister::date arithmetic_overflow_rem crates/atpkg/src/abrew/commands.rs:6789 `secs / 60 % 60`
-atpkg	cf41b4f73872e0bd	rss-backstop	atpkg::cli::levenshtein hardened_panic_boundary crates/atpkg/src/cli.rs:522 `prev[j + 1] + 1`
+atpkg	cd7c5a70e0b20e54	wall-backstop	atpkg::abrew::commands::ls_columns hardened_panic_boundary crates/atpkg/src/abrew/commands.rs:5374 `col * rows`
+atpkg	ce5718368c7d8992	rss-backstop	atpkg::status::held::end slice_bounds_check crates/atpkg/src/status.rs:668 `[at]`
+atpkg	ce6dcbf4190add73	rss-backstop	atpkg::flow::waited_words hardened_panic_boundary crates/atpkg/src/flow.rs:2173 `mins % 60`
+atpkg	cebc95ff6c9ac06f	rss-backstop	atpkg::converge::items::{closure#0} arithmetic_overflow_add crates/atpkg/src/converge.rs:432 `*n += 1`
+atpkg	cf41b4f73872e0bd	rss-backstop	atpkg::cli::levenshtein hardened_panic_boundary crates/atpkg/src/cli.rs:554 `prev[j + 1] + 1`
 atpkg	cf5c2b00bb2c5ce4	rss-backstop	atpkg::vendor_direct::table::floor assertion @sysroot/core/src/panic.rs:62 `-`
-atpkg	cfab741e43506206	rss-backstop	atpkg::abrew::cask::segment_matches::inner slice_bounds_check crates/atpkg/src/abrew/cask.rs:1518 `[i + 1..]`
 atpkg	d007db0fe891682d	rss-backstop	atpkg::lineage::parse_version slice_bounds_check crates/atpkg/src/lineage.rs:1036 `s[i]`
-atpkg	d0f699e196516b21	rss-backstop	atpkg::cli::run_update_pass_in hardened_panic_boundary crates/atpkg/src/cli.rs:8882 `failures += net.failures`
-atpkg	d10a8ee22558476b	rss-backstop	atpkg::doctor::refused_line hardened_panic_boundary crates/atpkg/src/doctor.rs:3600 `r.count - shown`
+atpkg	d0a81bdcaf25a909	rss-backstop	atpkg::zdotdir::zshenv_safe hardened_panic_boundary crates/atpkg/src/zdotdir.rs:178 `links += 1`
+atpkg	d0f699e196516b21	rss-backstop	atpkg::cli::run_update_pass_in hardened_panic_boundary crates/atpkg/src/cli.rs:9198 `failures += net.failures`
+atpkg	d10a8ee22558476b	rss-backstop	atpkg::doctor::refused_line hardened_panic_boundary crates/atpkg/src/doctor.rs:3818 `r.count - shown`
 atpkg	d116122c2a577b35	rss-backstop	atpkg::openpgp::signature_packets hardened_panic_boundary crates/atpkg/src/openpgp.rs:338 `((usize::from(first) - 192) << 8) + usize::from(second)`
+atpkg	d207f3582d6dbe2d	rss-backstop	atpkg::build_cache::retired::remove_snapshot unreachable crates/atpkg/src/build_cache_retired.rs:720 `fn remove_snapshot( … }`
+atpkg	d3c375ea3a3ce7e5	rss-backstop	atpkg::doctor::toolset_findings arithmetic_overflow_add crates/atpkg/src/doctor.rs:3581 `present + missing_unexplained.len() + missing_on_purpose.len()`
 atpkg	d3d92eb640ec2baf	rss-backstop	atpkg::macho::is_macho_header hardened_panic_boundary crates/atpkg/src/macho.rs:22 `word[1]`
 atpkg	d4306e03759098a7	rss-backstop	atpkg::meter::bar hardened_panic_boundary crates/atpkg/src/meter.rs:103 `u128::from(done) * (width as u128)`
-atpkg	d4ad347bd32bf50f	rss-backstop	atpkg::doctor::index_age_days arithmetic_overflow_div crates/atpkg/src/doctor.rs:4011 `(now - then) / 86_400`
+atpkg	d4a12ceeb3ce5d7e	rss-backstop	atpkg::build_cache::registered::ordinary_clearance arithmetic_overflow_add crates/atpkg/src/build_cache_registered.rs:119 `records += 1`
+atpkg	d4ad347bd32bf50f	rss-backstop	atpkg::doctor::index_age_days arithmetic_overflow_div crates/atpkg/src/doctor.rs:4240 `(now - then) / 86_400`
+atpkg	d5048c90116f4ba0	rss-backstop	atpkg::build_admit::read_arming slice_bounds_check crates/atpkg/src/build_admit.rs:1358 `[have..]`
 atpkg	d5b03f1d167c8c65	rss-backstop	atpkg::lane::parse_args slice_bounds_check crates/atpkg/src/lane.rs:73 `[i + 1..]`
-atpkg	d6276f3906358129	rss-backstop	atpkg::warm::parse_env0::{closure#1}::{closure#2} hardened_panic_boundary crates/atpkg/src/warm.rs:322 `nl + 1`
+atpkg	d6276f3906358129	rss-backstop	atpkg::warm::parse_env0::{closure#1}::{closure#2} hardened_panic_boundary crates/atpkg/src/warm.rs:324 `nl + 1`
 atpkg	d64e0f77f59a0e42	rss-backstop	<atpkg::copies::Pruned as core::cmp::PartialEq>::eq unreachable crates/atpkg/src/copies.rs:75 `PartialEq`
-atpkg	d66b69b66fb79323	rss-backstop	atpkg::cli::install_toolset hardened_panic_boundary crates/atpkg/src/cli.rs:10326 `failures_outcome.failures += vendor.failures`
-atpkg	d683403859b86406	rss-backstop	atpkg::ops::program_build_of_target hardened_panic_boundary crates/atpkg/src/ops.rs:116 `i + 2`
+atpkg	d65871707b4d42dc	rss-backstop	atpkg::cli::install_default_set_inner::{closure#30}::{closure#2} slice_bounds_check crates/atpkg/src/cli.rs:9974 `[*gi]`
+atpkg	d66b69b66fb79323	rss-backstop	atpkg::cli::install_toolset hardened_panic_boundary crates/atpkg/src/cli.rs:10662 `failures_outcome.failures += vendor.failures`
 atpkg	d68619610de16c3d	rss-backstop	atpkg::meter::bar arithmetic_overflow_mul crates/atpkg/src/meter.rs:104 `width * 8`
 atpkg	d6c44d9a5ce1e615	rss-backstop	atpkg::install::acceptance_fixtures::has_acl assertion @sysroot/core/src/panic.rs:62 `-`
 atpkg	d75986004b22e13d	rss-backstop	atpkg::net::newest_index arithmetic_overflow_sub crates/atpkg/src/net.rs:207 `(miss - hit)`
 atpkg	d7bb48de44fbcd7e	rss-backstop	atpkg::lineage::find_byte arithmetic_overflow_add crates/atpkg/src/lineage.rs:1082 `i + 8`
 atpkg	d7bb48de44fbcd7e	rss-backstop	atpkg::lineage::find_byte arithmetic_overflow_add crates/atpkg/src/lineage.rs:1084 `i + 8`
-atpkg	d7c8d2634c770392	rss-backstop	<atpkg::flow::VendorFetchError as core::cmp::PartialEq>::eq unreachable crates/atpkg/src/flow.rs:71 `PartialEq`
+atpkg	d7c8d2634c770392	rss-backstop	<atpkg::flow::VendorFetchError as core::cmp::PartialEq>::eq unreachable crates/atpkg/src/flow.rs:83 `PartialEq`
 atpkg	d81e57c6652eed66	rss-backstop	atpkg::openpgp::left_padded arithmetic_overflow_sub crates/atpkg/src/openpgp.rs:510 `len_bits - top.leading_zeros()`
-atpkg	d8bac27c0517ce5e	rss-backstop	atpkg::abrew::bundle_args slice_bounds_check crates/atpkg/src/abrew/mod.rs:848 `[1..]`
+atpkg	d853506f78933491	rss-backstop	atpkg::build_cache::remove::sys::Walk::<'_, '_>::stays hardened_panic_boundary crates/atpkg/src/build_cache_remove.rs:639 `self.left.stayed += 1`
+atpkg	d8bac27c0517ce5e	rss-backstop	atpkg::abrew::bundle_args slice_bounds_check crates/atpkg/src/abrew/mod.rs:984 `[1..]`
 atpkg	d8f61b9374b87cff	rss-backstop	atpkg::lineage::parse_version hardened_panic_boundary crates/atpkg/src/lineage.rs:1048 `i += 2`
-atpkg	d9883572bbf332db	rss-backstop	atpkg::selfsetup::Sweep::<'_>::rm_shared arithmetic_overflow_add crates/atpkg/src/selfsetup.rs:827 `self.kept += 1`
+atpkg	d923a0b6e6e4a6c0	rss-backstop	atpkg::build_admit::front::pipe hardened_panic_boundary crates/atpkg/src/build_admit_front.rs:183 `fds[0]`
+atpkg	d9883572bbf332db	rss-backstop	atpkg::selfsetup::Sweep::<'_>::rm_shared arithmetic_overflow_add crates/atpkg/src/selfsetup.rs:851 `self.kept += 1`
 atpkg	d9dc65435a9efe1d	rss-backstop	atpkg::macho::is_macho_header slice_bounds_check crates/atpkg/src/macho.rs:22 `word[0]`
+atpkg	d9e3f023fc085b9b	rss-backstop	atpkg::doctor::toolset_findings hardened_panic_boundary crates/atpkg/src/doctor.rs:3581 `present + missing_unexplained.len() + missing_on_purpose.len()`
 atpkg	da41d361a6eda86b	rss-backstop	atpkg::net::ahead_of_walk::{closure#5} arithmetic_overflow_add crates/atpkg/src/net.rs:554 `asked += 1`
 atpkg	db9fd009ed2a54e4	rss-backstop	<atpkg::gc::Diverged as core::cmp::PartialEq>::eq unreachable crates/atpkg/src/gc.rs:35 `PartialEq`
 atpkg	dc0403967e44b29d	rss-backstop	atpkg::lineage::Matcher::<'_>::examine::{closure#0}::{closure#0} hardened_panic_boundary crates/atpkg/src/lineage.rs:909 `buf[k]`
-atpkg	dd1c5fb543a5c297	rss-backstop	atpkg::selfsetup::sweep_store hardened_panic_boundary crates/atpkg/src/selfsetup.rs:1841 `foreign.len() - 3`
-atpkg	dd2e0977c4132bc7	rss-backstop	atpkg::flow::waited_words arithmetic_overflow_div crates/atpkg/src/flow.rs:2139 `secs.max(0) / 60`
-atpkg	dd972a902110ff9a	rss-backstop	atpkg::flow::waited_words hardened_panic_boundary crates/atpkg/src/flow.rs:2139 `secs.max(0) / 60`
+atpkg	dd1c5fb543a5c297	rss-backstop	atpkg::selfsetup::sweep_store hardened_panic_boundary crates/atpkg/src/selfsetup.rs:2176 `foreign.len() - 3`
+atpkg	dd2e0977c4132bc7	rss-backstop	atpkg::flow::waited_words arithmetic_overflow_div crates/atpkg/src/flow.rs:2172 `secs.max(0) / 60`
+atpkg	dd972a902110ff9a	rss-backstop	atpkg::flow::waited_words hardened_panic_boundary crates/atpkg/src/flow.rs:2172 `secs.max(0) / 60`
 atpkg	dd9b91e6cd9841a9	rss-backstop	atpkg::selfupdate::echo_words arithmetic_overflow_sub crates/atpkg/src/selfupdate.rs:199 `end -= 1`
 atpkg	ddab75c23db521a9	rss-backstop	atpkg::flow::ahead::Ahead::next_with_wait::{closure#1} slice_bounds_check crates/atpkg/src/flow/ahead.rs:257 `[i]`
 atpkg	deb0e760cd9f6bd6	rss-backstop	atpkg::meter::pass_body division_by_zero crates/atpkg/src/meter.rs:194 `row.bytes_done.min(row.bytes_total).saturating_mul(100) / row.bytes_total`
-atpkg	def71270c0c3279c	rss-backstop	atpkg::harness::is_harness hardened_panic_boundary crates/atpkg/src/harness.rs:27 `tail[i]`
-atpkg	df18f8eead63eb54	rss-backstop	atpkg::doctor::refused_line arithmetic_overflow_sub crates/atpkg/src/doctor.rs:3600 `r.count - shown`
+atpkg	df18f8eead63eb54	rss-backstop	atpkg::doctor::refused_line arithmetic_overflow_sub crates/atpkg/src/doctor.rs:3818 `r.count - shown`
 atpkg	df498984b4911557	rss-backstop	atpkg::lineage::scan_stream hardened_panic_boundary crates/atpkg/src/lineage.rs:868 `end - keep`
-atpkg	df8fd9ca6b71e61c	rss-backstop	atpkg::cli::levenshtein hardened_panic_boundary crates/atpkg/src/cli.rs:519 `i + 1`
+atpkg	df8fd9ca6b71e61c	rss-backstop	atpkg::cli::levenshtein hardened_panic_boundary crates/atpkg/src/cli.rs:551 `i + 1`
 atpkg	dfa1ede13837d5fd	rss-backstop	atpkg::lineage::Matcher::<'_>::examine hardened_panic_boundary crates/atpkg/src/lineage.rs:964 `6 + used`
 atpkg	dfc77103888daa47	rss-backstop	atpkg::packages_log::redact_urls slice_bounds_check crates/atpkg/src/packages_log.rs:543 `[..q]`
 atpkg	dfcf58dafcc3b6ed	rss-backstop	<atpkg::abrew::formula::Requirement as core::cmp::PartialEq>::eq unreachable crates/atpkg/src/abrew/formula.rs:307 `PartialEq`
-atpkg	e04a287d68cd100d	rss-backstop	atpkg::abrew::commands::LongLister::date arithmetic_overflow_sub crates/atpkg/src/abrew/commands.rs:6781 `month - 1`
-atpkg	e10e342f117a90b8	rss-backstop	atpkg::selfsetup::Sweep::<'_>::skip arithmetic_overflow_add crates/atpkg/src/selfsetup.rs:821 `self.skipped += 1`
+atpkg	e097f1bfaed5e85e	rss-backstop	atpkg::build_cache::remove::sys::Walk::<'_, '_>::once hardened_panic_boundary crates/atpkg/src/build_cache_remove.rs:788 `sweeps += 1`
+atpkg	e10e342f117a90b8	rss-backstop	atpkg::selfsetup::Sweep::<'_>::skip arithmetic_overflow_add crates/atpkg/src/selfsetup.rs:845 `self.skipped += 1`
 atpkg	e1606d20d085ee66	rss-backstop	atpkg::vendor_direct::lane::install_one assertion crates/atpkg/src/vendor_direct/lane.rs:479 `&pending`
-atpkg	e17d646bbf3cccef	rss-backstop	atpkg::selfsetup::self_uninstall_with_acaffiene::{closure#7}::{closure#0}::{closure#0} assertion crates/atpkg/src/selfsetup.rs:1460 `128 + std::os::unix::process::ExitStatusExt::signal(&st).unwrap_or(0)`
+atpkg	e17d646bbf3cccef	rss-backstop	atpkg::selfsetup::self_uninstall_with_acaffiene::{closure#7}::{closure#0}::{closure#0} assertion crates/atpkg/src/selfsetup.rs:1796 `128 + std::os::unix::process::ExitStatusExt::signal(&st).unwrap_or(0)`
 atpkg	e1a691c0810aaf3b	rss-backstop	atpkg::meter::bar unbounded_allocation crates/atpkg/src/meter.rs:113 `out.extend(std::iter::repeat_n(' ', width - full - 1))`
 atpkg	e20f65dba7188ef6	rss-backstop	atpkg::lineage::find_byte::{closure#1} arithmetic_overflow_add crates/atpkg/src/lineage.rs:1091 `p + i`
 atpkg	e270e5c124264d8b	rss-backstop	atpkg::lane::read_input hardened_panic_boundary crates/atpkg/src/lane.rs:28 `MAX_INPUT_BYTES / (1024 * 1024)`
-atpkg	e2beb884a516bed1	rss-backstop	atpkg::abrew::census::Tally::count hardened_panic_boundary crates/atpkg/src/abrew/census.rs:33 `self.refused += 1`
-atpkg	e2e3c8a6bb4b91d6	rss-backstop	atpkg::cli::twin_carries_hand_over division_by_zero crates/atpkg/src/cli.rs:6558 `bytes … .windows(crate::selfupdate::HIDDEN_VERB.len())`
-atpkg	e38c387a1be48d0f	rss-backstop	<atpkg::reroute::Plan as core::cmp::PartialEq>::eq unreachable crates/atpkg/src/reroute.rs:1569 `PartialEq`
-atpkg	e3b5701ff2cff081	rss-backstop	atpkg::converge::items::{closure#0} hardened_panic_boundary crates/atpkg/src/converge.rs:428 `*n += 1`
+atpkg	e2b2ef327bd4f621	rss-backstop	atpkg::build_cache::remove::sys::Walk::<'_, '_>::move_up arithmetic_overflow_add crates/atpkg/src/build_cache_remove.rs:880 `self.moved += 1`
+atpkg	e2d2ee586bafb8d2	rss-backstop	atpkg::selfsetup::sweep_old_caffeine arithmetic_overflow_add crates/atpkg/src/selfsetup.rs:1031 `s.kept += 1`
+atpkg	e2d2ee586bafb8d2	rss-backstop	atpkg::selfsetup::sweep_old_caffeine arithmetic_overflow_add crates/atpkg/src/selfsetup.rs:1062 `s.kept += 1`
+atpkg	e2e3c8a6bb4b91d6	rss-backstop	atpkg::cli::twin_carries_hand_over division_by_zero crates/atpkg/src/cli.rs:6877 `bytes … .windows(crate::selfupdate::HIDDEN_VERB.len())`
+atpkg	e38c387a1be48d0f	rss-backstop	<atpkg::reroute::Plan as core::cmp::PartialEq>::eq unreachable crates/atpkg/src/reroute.rs:1624 `PartialEq`
+atpkg	e3b5701ff2cff081	rss-backstop	atpkg::converge::items::{closure#0} hardened_panic_boundary crates/atpkg/src/converge.rs:432 `*n += 1`
 atpkg	e3e89aa27909eb96	rss-backstop	atpkg::reroute::signpost_block::{closure#3} slice_bounds_check crates/atpkg/src/reroute.rs:448 `args[i]`
-atpkg	e43f4eafb3876fff	wall-backstop	atpkg::macho::load_names hardened_panic_boundary crates/atpkg/src/macho.rs:206 `base + 8`
-atpkg	e43f4eafb3876fff	wall-backstop	atpkg::macho::load_names hardened_panic_boundary crates/atpkg/src/macho.rs:211 `base + 8`
+atpkg	e43f4eafb3876fff	wall-backstop	atpkg::macho::load_names hardened_panic_boundary crates/atpkg/src/macho.rs:196 `base + 8`
+atpkg	e43f4eafb3876fff	wall-backstop	atpkg::macho::load_names hardened_panic_boundary crates/atpkg/src/macho.rs:201 `base + 8`
+atpkg	e55af8c613773f5f	rss-backstop	atpkg::zdotdir::zshenv_safe arithmetic_overflow_add crates/atpkg/src/zdotdir.rs:178 `links += 1`
+atpkg	e589bafdef06ba81	rss-backstop	atpkg::build_cache::remove::sys::Walk::<'_, '_>::move_up hardened_panic_boundary crates/atpkg/src/build_cache_remove.rs:880 `self.moved += 1`
 atpkg	e612185623d62169	rss-backstop	atpkg::machine::universal_control_from_domain hardened_panic_boundary crates/atpkg/src/machine.rs:238 `keys[0]`
-atpkg	e65a941bf91e9853	rss-backstop	atpkg::selfsetup::Sweep::<'_>::rm_shared hardened_panic_boundary crates/atpkg/src/selfsetup.rs:827 `self.kept += 1`
-atpkg	e67eb8b493669782	rss-backstop	atpkg::cli::list_human_lines arithmetic_overflow_add crates/atpkg/src/cli.rs:4206 `live_count += 1`
-atpkg	e7a247d027ad0e3a	rss-backstop	atpkg::abrew::commands::bundle_file hardened_panic_boundary crates/atpkg/src/abrew/commands.rs:9630 `failures += 1`
+atpkg	e65a941bf91e9853	rss-backstop	atpkg::selfsetup::Sweep::<'_>::rm_shared hardened_panic_boundary crates/atpkg/src/selfsetup.rs:851 `self.kept += 1`
+atpkg	e67eb8b493669782	rss-backstop	atpkg::cli::list_human_lines arithmetic_overflow_add crates/atpkg/src/cli.rs:4421 `live_count += 1`
+atpkg	e76a5ac23f61b0b5	rss-backstop	<atpkg::devtools::RefreshFailed as core::cmp::PartialEq>::eq unreachable crates/atpkg/src/devtools.rs:1485 `PartialEq`
+atpkg	e799495d0be8f04e	rss-backstop	atpkg::peers::answer hardened_panic_boundary crates/atpkg/src/peers.rs:1176 `stepped %= pace.step`
 atpkg	e7d0bf49bd491bb4	rss-backstop	atpkg::lineage::Matcher::<'_>::scan arithmetic_overflow_add crates/atpkg/src/lineage.rs:900 `at + 1`
 atpkg	e9114faf31674e19	rss-backstop	atpkg::lineage::parse_version arithmetic_overflow_add crates/atpkg/src/lineage.rs:1063 `i += 10`
-atpkg	e998b32335cc6284	rss-backstop	atpkg::abrew::census::Tally::count hardened_panic_boundary crates/atpkg/src/abrew/census.rs:42 `*sole += alone`
-atpkg	e9d4cb6b39cfbaf1	rss-backstop	atpkg::cli::set_progress_queue::{closure#0} hardened_panic_boundary crates/atpkg/src/cli.rs:9801 `groups[*gi]`
-atpkg	e9f6742a71893a67	rss-backstop	atpkg::doctor::ago hardened_panic_boundary crates/atpkg/src/doctor.rs:3926 `secs / 3600`
+atpkg	e9d4cb6b39cfbaf1	rss-backstop	atpkg::cli::set_progress_queue::{closure#0} hardened_panic_boundary crates/atpkg/src/cli.rs:10133 `groups[*gi]`
+atpkg	e9f6742a71893a67	rss-backstop	atpkg::doctor::ago hardened_panic_boundary crates/atpkg/src/doctor.rs:4155 `secs / 3600`
 atpkg	e9ff671a398173c0	rss-backstop	atpkg::lineage::scan_stream hardened_panic_boundary crates/atpkg/src/lineage.rs:838 `chunk + TAIL + 2`
-atpkg	eaba4c6a3d936007	rss-backstop	atpkg::build_cache::stale::unit_hash::{closure#0} arithmetic_overflow_add crates/atpkg/src/build_cache_stale.rs:248 `i + 1`
-atpkg	eb26a8f1e27d0835	rss-backstop	atpkg::platform::cmd_framed unbounded_allocation crates/atpkg/src/platform/mod.rs:276 `String::with_capacity(CMD_FRAME_BYTES + body.len())`
-atpkg	ec0f8fd8f6345c5c	rss-backstop	atpkg::capacity::lines arithmetic_overflow_sub crates/atpkg/src/capacity.rs:128 `claims.len() - held`
+atpkg	ea87f6577539df81	rss-backstop	atpkg::build_admit::read_arming hardened_panic_boundary crates/atpkg/src/build_admit.rs:1376 `got[1]`
+atpkg	eb26a8f1e27d0835	rss-backstop	atpkg::platform::cmd_framed unbounded_allocation crates/atpkg/src/platform/mod.rs:317 `String::with_capacity(CMD_FRAME_BYTES + body.len())`
+atpkg	ec0f8fd8f6345c5c	rss-backstop	atpkg::capacity::lines arithmetic_overflow_sub crates/atpkg/src/capacity.rs:198 `claims.len() - held`
 atpkg	ec5e5319cb8a155a	rss-backstop	atpkg::openpgp::hashed_subpackets arithmetic_overflow_add crates/atpkg/src/openpgp.rs:464 `((usize::from(first) - 192) << 8) + usize::from(second) + 192`
-atpkg	ed5a94997b82ae63	rss-backstop	atpkg::abrew::commands::prune_prefix_links hardened_panic_boundary crates/atpkg/src/abrew/commands.rs:6060 `links += 1`
-atpkg	eddbdf5228636ba7	rss-backstop	atpkg::net::GithubFetcher::walk_candidates::{closure#1} hardened_panic_boundary crates/atpkg/src/net.rs:786 `asked_ahead += round.len().saturating_sub(1)`
-atpkg	eddd09faae41a081	rss-backstop	atpkg::cli::install_default_set_inner::{closure#29} arithmetic_overflow_add crates/atpkg/src/cli.rs:9701 `failures += bootstrap_singleton( … )`
-atpkg	ee2a42597d54bba6	rss-backstop	atpkg::devtools::decline_holding::{closure#0} arithmetic_overflow_sub crates/atpkg/src/devtools.rs:1092 `at - before`
+atpkg	ec6f926993e0a3b0	rss-backstop	atpkg::cli::reclaim_build_cache arithmetic_overflow_sub crates/atpkg/src/cli.rs:6666 `removed.len() - parts - stayed`
+atpkg	eddbdf5228636ba7	rss-backstop	atpkg::net::GithubFetcher::walk_candidates::{closure#1} hardened_panic_boundary crates/atpkg/src/net.rs:798 `asked_ahead += round.len().saturating_sub(1)`
+atpkg	ee2a42597d54bba6	rss-backstop	atpkg::devtools::decline_holding::{closure#0} arithmetic_overflow_sub crates/atpkg/src/devtools.rs:1362 `at - before`
 atpkg	ee57e51d5829d5a3	rss-backstop	atpkg::openpgp::signature_packets hardened_panic_boundary crates/atpkg/src/openpgp.rs:338 `(usize::from(first) - 192)`
-atpkg	ef5f6e26451e2287	rss-backstop	atpkg::cli::install_default_set_inner::{closure#29} arithmetic_overflow_add crates/atpkg/src/cli.rs:9686 `failures += bootstrap_group( … )`
 atpkg	ef8601e5d9b11a31	rss-backstop	atpkg::packages_log::sanitize_capped unbounded_allocation crates/atpkg/src/packages_log.rs:493 `String::with_capacity(redacted.len().min(max_chars.saturating_mul(4)))`
-atpkg	eff1c2c84f6741f2	rss-backstop	atpkg::cli::set_progress_queue::{closure#0} slice_bounds_check crates/atpkg/src/cli.rs:9801 `groups[*gi].group`
-atpkg	efff775ebb0de84d	rss-backstop	atpkg::cli::vendor_plan_reading assertion crates/atpkg/src/cli.rs:11569 `&landing`
+atpkg	eff1c2c84f6741f2	rss-backstop	atpkg::cli::set_progress_queue::{closure#0} slice_bounds_check crates/atpkg/src/cli.rs:10133 `groups[*gi].group`
+atpkg	efff775ebb0de84d	rss-backstop	atpkg::cli::vendor_plan_reading assertion crates/atpkg/src/cli.rs:11942 `&landing`
 atpkg	f01acc7fdaa72faa	rss-backstop	atpkg::meter::bar hardened_panic_boundary crates/atpkg/src/meter.rs:112 `PARTIAL[eighths % 8]`
-atpkg	f09970bb78e8f0e0	rss-backstop	atpkg::extract::TreeAccumulator::root unbounded_allocation crates/atpkg/src/extract.rs:576 `Vec::with_capacity(self.paths.len())`
-atpkg	f0cd09393106ec10	rss-backstop	atpkg::packages_log::read_tail_of hardened_panic_boundary crates/atpkg/src/packages_log.rs:858 `max - out.len()`
+atpkg	f09970bb78e8f0e0	rss-backstop	atpkg::extract::TreeAccumulator::root unbounded_allocation crates/atpkg/src/extract.rs:578 `Vec::with_capacity(self.paths.len())`
+atpkg	f0cd09393106ec10	rss-backstop	atpkg::packages_log::read_tail_of hardened_panic_boundary crates/atpkg/src/packages_log.rs:864 `max - out.len()`
 atpkg	f0e3dfc3fb026d8f	rss-backstop	atpkg::net::direct_asset_url hardened_panic_boundary crates/atpkg/src/net.rs:84 `seg_end + 1`
-atpkg	f0f7e53a5b0f9701	wall-backstop	atpkg::macho::load_names hardened_panic_boundary crates/atpkg/src/macho.rs:202 `i * entry`
-atpkg	f1250f3b68f1ec2d	rss-backstop	atpkg::doctor::short_line hardened_panic_boundary crates/atpkg/src/doctor.rs:1319 `lead.chars().count() + tail.chars().count()`
-atpkg	f148365188e7ffb1	rss-backstop	atpkg::warm::parse_env0::{closure#1}::{closure#3} slice_bounds_check crates/atpkg/src/warm.rs:326 `[eq + 1..]`
-atpkg	f269157c89922039	wall-backstop	atpkg::macho::load_names arithmetic_overflow_add crates/atpkg/src/macho.rs:212 `base + 12`
+atpkg	f0f7e53a5b0f9701	wall-backstop	atpkg::macho::load_names hardened_panic_boundary crates/atpkg/src/macho.rs:192 `i * entry`
+atpkg	f1250f3b68f1ec2d	rss-backstop	atpkg::doctor::short_line hardened_panic_boundary crates/atpkg/src/doctor.rs:1404 `lead.chars().count() + tail.chars().count()`
+atpkg	f148365188e7ffb1	rss-backstop	atpkg::warm::parse_env0::{closure#1}::{closure#3} slice_bounds_check crates/atpkg/src/warm.rs:328 `[eq + 1..]`
+atpkg	f269157c89922039	wall-backstop	atpkg::macho::load_names arithmetic_overflow_add crates/atpkg/src/macho.rs:202 `base + 12`
 atpkg	f2801ca1505104dd	rss-backstop	atpkg::packages_log::render_at hardened_panic_boundary crates/atpkg/src/packages_log.rs:402 `counts[2]`
 atpkg	f2880ba19f2e53a4	rss-backstop	<atpkg::upstream_identity::Identity as core::cmp::PartialEq>::eq unreachable crates/atpkg/src/upstream_identity.rs:41 `PartialEq`
-atpkg	f2c3825a10974b94	rss-backstop	atpkg::linkmode::strip_exe_suffix slice_bounds_check crates/atpkg/src/linkmode.rs:173 `[cut..]`
-atpkg	f2fbd2f8e516cc3e	rss-backstop	atpkg::converge::first_clause_end hardened_panic_boundary crates/atpkg/src/converge.rs:340 `depth += 1`
-atpkg	f3a91dd1a6305612	rss-backstop	atpkg::cli::install_default_set_inner::{closure#29} slice_bounds_check crates/atpkg/src/cli.rs:9661 `[gi]`
-atpkg	f3c5f5bed72772ad	rss-backstop	atpkg::doctor::verdict arithmetic_overflow_add crates/atpkg/src/doctor.rs:1342 `cannot + unproven`
-atpkg	f3e4fd313eae47cb	rss-backstop	atpkg::reroute::direct_args unbounded_allocation crates/atpkg/src/reroute.rs:1994 `Vec::with_capacity(args.len() + 1)`
-atpkg	f3f08a224fb65ddd	rss-backstop	atpkg::cli::install_toolset arithmetic_overflow_add crates/atpkg/src/cli.rs:10326 `failures_outcome.failures += vendor.failures`
-atpkg	f46c3558b63d2d5a	rss-backstop	atpkg::cli::run_verb slice_bounds_check crates/atpkg/src/cli.rs:718 `[1..]`
+atpkg	f2c3825a10974b94	rss-backstop	atpkg::linkmode::strip_exe_suffix slice_bounds_check crates/atpkg/src/linkmode.rs:195 `[cut..]`
+atpkg	f2fbd2f8e516cc3e	rss-backstop	atpkg::converge::first_clause_end hardened_panic_boundary crates/atpkg/src/converge.rs:344 `depth += 1`
+atpkg	f30bd5bec9422e3b	rss-backstop	atpkg::build_admit::read_arming hardened_panic_boundary crates/atpkg/src/build_admit.rs:1376 `got[0]`
+atpkg	f3c5f5bed72772ad	rss-backstop	atpkg::doctor::verdict arithmetic_overflow_add crates/atpkg/src/doctor.rs:1427 `cannot + unproven`
+atpkg	f3e4fd313eae47cb	rss-backstop	atpkg::reroute::direct_args unbounded_allocation crates/atpkg/src/reroute.rs:2052 `Vec::with_capacity(args.len() + 1)`
+atpkg	f3f08a224fb65ddd	rss-backstop	atpkg::cli::install_toolset arithmetic_overflow_add crates/atpkg/src/cli.rs:10662 `failures_outcome.failures += vendor.failures`
+atpkg	f43bc9187c69ad73	rss-backstop	atpkg::build_admit::read_arming hardened_panic_boundary crates/atpkg/src/build_admit.rs:1382 `got[4]`
+atpkg	f46c3558b63d2d5a	rss-backstop	atpkg::cli::run_verb slice_bounds_check crates/atpkg/src/cli.rs:765 `[1..]`
 atpkg	f5e324ec8f316261	rss-backstop	atpkg::macho::is_macho_header hardened_panic_boundary crates/atpkg/src/macho.rs:22 `word[0]`
-atpkg	f5e6f6449177dfb7	rss-backstop	atpkg::reroute::storeless_plan slice_bounds_check crates/atpkg/src/reroute.rs:1960 `[1..]`
-atpkg	f604b0453a214eb9	rss-backstop	atpkg::selfsetup::sweep_acaffiene_with hardened_panic_boundary crates/atpkg/src/selfsetup.rs:1068 `s.kept += 1`
-atpkg	f6b9ff1e95b36cd4	rss-backstop	atpkg::selfsetup::self_uninstall_with_acaffiene arithmetic_overflow_add crates/atpkg/src/selfsetup.rs:1388 `s.removed += 1`
-atpkg	f6b9ff1e95b36cd4	rss-backstop	atpkg::selfsetup::self_uninstall_with_acaffiene arithmetic_overflow_add crates/atpkg/src/selfsetup.rs:1467 `s.removed += 1`
-atpkg	f6b9ff1e95b36cd4	rss-backstop	atpkg::selfsetup::self_uninstall_with_acaffiene arithmetic_overflow_add crates/atpkg/src/selfsetup.rs:1677 `s.removed += 1`
-atpkg	f6b9ff1e95b36cd4	rss-backstop	atpkg::selfsetup::self_uninstall_with_acaffiene arithmetic_overflow_add crates/atpkg/src/selfsetup.rs:1681 `s.removed += 1`
+atpkg	f5e6f6449177dfb7	rss-backstop	atpkg::reroute::storeless_plan slice_bounds_check crates/atpkg/src/reroute.rs:2015 `[1..]`
+atpkg	f604b0453a214eb9	rss-backstop	atpkg::selfsetup::sweep_acaffiene_with hardened_panic_boundary crates/atpkg/src/selfsetup.rs:1310 `s.kept += 1`
+atpkg	f604b0453a214eb9	rss-backstop	atpkg::selfsetup::sweep_acaffiene_with hardened_panic_boundary crates/atpkg/src/selfsetup.rs:1333 `s.kept += 1`
+atpkg	f6b9ff1e95b36cd4	rss-backstop	atpkg::selfsetup::self_uninstall_with_acaffiene arithmetic_overflow_add crates/atpkg/src/selfsetup.rs:1724 `s.removed += 1`
+atpkg	f6b9ff1e95b36cd4	rss-backstop	atpkg::selfsetup::self_uninstall_with_acaffiene arithmetic_overflow_add crates/atpkg/src/selfsetup.rs:1803 `s.removed += 1`
+atpkg	f6b9ff1e95b36cd4	rss-backstop	atpkg::selfsetup::self_uninstall_with_acaffiene arithmetic_overflow_add crates/atpkg/src/selfsetup.rs:2012 `s.removed += 1`
+atpkg	f6b9ff1e95b36cd4	rss-backstop	atpkg::selfsetup::self_uninstall_with_acaffiene arithmetic_overflow_add crates/atpkg/src/selfsetup.rs:2016 `s.removed += 1`
 atpkg	f7c0d11038ab697d	rss-backstop	atpkg::gc::running_process_table unbounded_allocation @sysroot/alloc/src/macros.rs:47 `-`
-atpkg	f8055e31909f3d5c	rss-backstop	atpkg::cli::cmd_refresh arithmetic_overflow_add crates/atpkg/src/cli.rs:13073 `failed += 1`
-atpkg	f8055e31909f3d5c	rss-backstop	atpkg::cli::cmd_refresh arithmetic_overflow_add crates/atpkg/src/cli.rs:13077 `failed += 1`
-atpkg	f813f6cd6368352f	rss-backstop	atpkg::selfsetup::profile_with_path_block hardened_panic_boundary crates/atpkg/src/selfsetup.rs:2084 `offset += line.len()`
-atpkg	f845bc88751fb7ae	rss-backstop	<atpkg::flow::VendorGet as core::cmp::PartialEq>::eq unreachable crates/atpkg/src/flow.rs:58 `PartialEq`
+atpkg	f8055e31909f3d5c	rss-backstop	atpkg::cli::cmd_refresh arithmetic_overflow_add crates/atpkg/src/cli.rs:13501 `failed += 1`
+atpkg	f8055e31909f3d5c	rss-backstop	atpkg::cli::cmd_refresh arithmetic_overflow_add crates/atpkg/src/cli.rs:13505 `failed += 1`
+atpkg	f813f6cd6368352f	rss-backstop	atpkg::selfsetup::profile_with_path_block hardened_panic_boundary crates/atpkg/src/selfsetup.rs:2451 `offset += line.len()`
+atpkg	f845bc88751fb7ae	rss-backstop	<atpkg::flow::VendorGet as core::cmp::PartialEq>::eq unreachable crates/atpkg/src/flow.rs:70 `PartialEq`
 atpkg	f912edbda4dea40a	rss-backstop	atpkg::meter::bar unbounded_allocation crates/atpkg/src/meter.rs:110 `out.extend(std::iter::repeat_n('█', full))`
 atpkg	f96d3db638247ab2	rss-backstop	atpkg::lineage::Matcher::<'_>::hit arithmetic_overflow_add crates/atpkg/src/lineage.rs:883 `*self.hits.entry(e).or_insert(0) += 1`
-atpkg	fa5b85098e25d734	rss-backstop	<atpkg::seam::Detached as core::cmp::PartialEq>::eq unreachable crates/atpkg/src/seam.rs:1800 `PartialEq`
+atpkg	fa5b85098e25d734	rss-backstop	<atpkg::seam::Detached as core::cmp::PartialEq>::eq unreachable crates/atpkg/src/seam.rs:1802 `PartialEq`
 atpkg	fad0cbd8682a953e	rss-backstop	atpkg::flow::ahead::Ahead::pick::{closure#1}::{closure#0} slice_bounds_check crates/atpkg/src/flow/ahead.rs:276 `[i]`
 atpkg	fad0cbd8682a953e	rss-backstop	atpkg::flow::ahead::Ahead::pick::{closure#1}::{closure#0} slice_bounds_check crates/atpkg/src/flow/ahead.rs:276 `[i]`
 atpkg	fadcbb961e27f01e	rss-backstop	atpkg::flow::ahead::Ahead::passed slice_bounds_check crates/atpkg/src/flow/ahead.rs:344 `[i]`
 atpkg	fadcbb961e27f01e	rss-backstop	atpkg::flow::ahead::Ahead::passed slice_bounds_check crates/atpkg/src/flow/ahead.rs:345 `[i]`
-atpkg	fae42d224ea9c6be	rss-backstop	atpkg::gc::running_process_table unbounded_allocation crates/atpkg/src/gc.rs:847 `Vec::with_capacity(pids.len())`
-atpkg	fb2ca7a24b829b49	rss-backstop	atpkg::flow::group_install_need unbounded_allocation crates/atpkg/src/flow.rs:2474 `Vec::with_capacity(install_members.len())`
-atpkg	fb9d9bc6dda5e76e	rss-backstop	atpkg::abrew::cask::segment_matches::inner hardened_panic_boundary crates/atpkg/src/abrew/cask.rs:1503 `p[i + 1]`
-atpkg	fbf1944ea0409008	rss-backstop	atpkg::selfsetup::self_uninstall_with_acaffiene hardened_panic_boundary crates/atpkg/src/selfsetup.rs:1377 `s.kept += 1`
-atpkg	fd17de8574c2c448	rss-backstop	atpkg::doctor::index_age_days hardened_panic_boundary crates/atpkg/src/doctor.rs:4011 `(now - then) / 86_400`
-atpkg	fde02e27fc64fcac	rss-backstop	atpkg::warm::parse_env0::{closure#1}::{closure#2} arithmetic_overflow_add crates/atpkg/src/warm.rs:322 `nl + 1`
+atpkg	fae42d224ea9c6be	rss-backstop	atpkg::gc::running_process_table unbounded_allocation crates/atpkg/src/gc.rs:867 `Vec::with_capacity(pids.len())`
+atpkg	fb2ca7a24b829b49	rss-backstop	atpkg::flow::group_install_need unbounded_allocation crates/atpkg/src/flow.rs:2507 `Vec::with_capacity(install_members.len())`
+atpkg	fbb2a2a97d56228a	rss-backstop	atpkg::build_admit::front::Front::end arithmetic_overflow_add crates/atpkg/src/build_admit_front.rs:428 `128 + sig`
+atpkg	fbf1944ea0409008	rss-backstop	atpkg::selfsetup::self_uninstall_with_acaffiene hardened_panic_boundary crates/atpkg/src/selfsetup.rs:1713 `s.kept += 1`
+atpkg	fc94ea01ed6a6440	rss-backstop	atpkg::zdotdir::ask_zsh hardened_panic_boundary crates/atpkg/src/zdotdir.rs:411 `count_end + 1`
+atpkg	fd17de8574c2c448	rss-backstop	atpkg::doctor::index_age_days hardened_panic_boundary crates/atpkg/src/doctor.rs:4240 `(now - then) / 86_400`
+atpkg	fde02e27fc64fcac	rss-backstop	atpkg::warm::parse_env0::{closure#1}::{closure#2} arithmetic_overflow_add crates/atpkg/src/warm.rs:324 `nl + 1`
 atpkg	ff28f7ac001408b3	rss-backstop	atpkg::meter::bar hardened_panic_boundary crates/atpkg/src/meter.rs:117 `(eighths + 4)`
 atpkg-keys	-	cancelled	0
 atpkg-publish	-	cancelled	0

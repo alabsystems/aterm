@@ -24,10 +24,9 @@ Result: **4 specs**, covering **15 tests**. **1 test is not a spec sample** (§4
 ## 0. Notation used in the statements
 
 - `Sfx(pid,r,c) = dec(pid) ++ "_" ++ hex16(r) ++ "_" ++ dec(c)`. `dec` is `u32`/`u64`
-  `to_string`. `hex16(r)` is the 16-char, zero-padded, lowercase hex of `r`, most significant
-  nibble first. Every char of `Sfx` is in `[0-9a-f_]`, and `Sfx` is never empty.
-- `Name(p,pid,r,c) = p ++ Sfx(pid,r,c)`. This is the equality with
-  `format!("{prefix}{pid}_{rand:016x}_{count}")` that the code comment in `unique_name` claims.
+  `to_string`; `hex16(r)` is the 16-char, zero-padded, lowercase hex of `r`, most significant
+  nibble first. `Sfx` is never empty and every char of it is in `[0-9a-f_]`.
+- `Name(p,pid,r,c) = p ++ Sfx(pid,r,c)`.
 - `C` is the static `COUNTER: AtomicU64`. One call of `unique_name` reads `c = C` and leaves
   `C = c+1` (`fetch_add`, which wraps only after 2^64 calls).
 - `r` is the value `os_random_u64` returns. It is `u64::from_ne_bytes(buf)` when `read_os_random`
@@ -61,8 +60,9 @@ Result: **4 specs**, covering **15 tests**. **1 test is not a spec sample** (§4
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes`, `difficulty (Rust features the proof
-must handle)`, `blocking_gaps` (audit §7 numbers).
+`subsumes` lists the primary tests; `difficulty` names the Rust features the proof must handle;
+`blocking_gaps` are rows of the gap table in `docs/AUDIT-trust-for-test-migration-2026-10-15.md`
+§7.
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
@@ -102,7 +102,7 @@ the fs halves of both (gap 8) → `fnv1a` → `stand-in-read-only-shared-inode`.
 
 ## 2. Test → spec map (TSV)
 
-`primary` is the spec that retires the test. `also` lists the other specs the same test samples.
+`primary` is the spec that retires the test; `also` lists the other specs it samples.
 
 ```tsv
 file	test	primary	also
@@ -124,7 +124,7 @@ crates/aterm-tempfile/src/lib.rs	a_cache_folder_not_the_users_alone_is_refused	s
 crates/aterm-tempfile/src/lib.rs	windows_os_random_succeeds	(none; §4)	
 ```
 
-## 3. Coverage
+## 3. Findings
 
 - 16 `#[test]` functions in `src/lib.rs` (including the `.ubd` quiet-folder suite and the stand-in suite of
   2026-10-28, plus the non-`#[test]` child helper `stand_in_cache_child_if_asked`). `tempdir-creates-fresh-private-dir-under-parent`
@@ -137,7 +137,7 @@ crates/aterm-tempfile/src/lib.rs	windows_os_random_succeeds	(none; §4)
 |---|---|---|
 | crates/aterm-tempfile/src/lib.rs::windows_os_random_succeeds | It is a `cfg(windows)` smoke check of the BCryptGenRandom FFI (without the former probabilistic `assert_ne!`). It belongs in the FFI assumption channel as an axiom on `read_os_random` (gap 8). | **move-to-bench**: move it to a Windows environment check, outside the unit-test suite, and record the OS-RNG success assumption as the FFI contract of `read_os_random`. |
 
-## 5. Implied specs that look wrong, or disagree with the code
+## 5. Proof order (easiest, high value first)
 
 1. **Resolved — `unique_name` doc.** Updated `unique_name`'s doc to state intra-process injectivity via the
    atomic counter and cross-process collision retry in `TempDir::made_in`.

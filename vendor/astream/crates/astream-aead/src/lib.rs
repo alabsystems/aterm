@@ -11,10 +11,10 @@
 //!   across the many independent producers on a bus — no cross-producer nonce
 //!   coordination. Additional authenticated data (AAD) is bound but not
 //!   encrypted.
-//! * [`SealedStream`] — a transparent, ordered-record AEAD adapter over any
-//!   `Read + Write`, opened by a handshake ([`SealedStream::handshake_client`] /
-//!   [`SealedStream::handshake_server`]). Each side sends a fresh random HELLO
-//!   in the clear, and every record's AAD is then
+//! * [`SealedStream`] (feature `stream`, on by default) — a transparent, ordered-record
+//!   AEAD adapter over any `Read + Write`, opened by a handshake
+//!   ([`SealedStream::handshake_client`] / [`SealedStream::handshake_server`]). Each side
+//!   sends a fresh random HELLO in the clear, and every record's AAD is then
 //!   `hello_client ‖ hello_server ‖ direction ‖ sequence`, so a record opens
 //!   only on the connection, in the direction, and at the position it was
 //!   sealed for: a record recorded from another connection, one reflected back
@@ -52,6 +52,8 @@
 //! sealed or opened. As with any wiping in Rust, a copy that a move left behind on the
 //! stack is out of reach.
 #![forbid(unsafe_code)]
+// The crate docs name `SealedStream`, which a build without `stream` does not compile.
+#![cfg_attr(not(feature = "stream"), allow(rustdoc::broken_intra_doc_links))]
 
 // A contracted fn is written once, through `contract_fn!`: under a Trust compiler
 // (`cfg(clean_islands)`, build.rs) it carries its `ensures` clause, which no stock rustc can
@@ -65,7 +67,9 @@ mod contract_fn;
 #[cfg(any(test, not(clean_islands)))]
 mod twins;
 
+#[cfg(feature = "stream")]
 mod stream;
+#[cfg(feature = "stream")]
 pub use stream::{
     aead_can_open_in_order, aead_seq_monotone, SealedStream, TryCloneable, HELLO_LEN, HELLO_MAGIC,
     MAX_PLAINTEXT, MAX_RECORD, SESSION_NONCE_LEN,
@@ -290,6 +294,7 @@ pub fn open(key: &[u8; KEY_LEN], aad: &[u8], sealed: &[u8]) -> Result<Vec<u8>, A
 /// zeroed (ring decrypts as it authenticates, then wipes what it decrypted) and the
 /// nonce and tag are left as they were, so nothing derived from an unauthentic
 /// message survives in the buffer.
+#[cfg(any(test, feature = "stream"))]
 pub(crate) fn open_in_place<'a>(
     key: &[u8; KEY_LEN],
     aad: &[u8],
@@ -387,6 +392,7 @@ mod tests {
     /// refused with `WouldBlock`: over a buffering transport, a handshake that
     /// waits for its peer before flushing what it sent would deadlock. A handshake
     /// meets a malformed, silent or unkeyed peer through it with no socket.
+    #[cfg(feature = "stream")]
     pub(crate) struct Scripted {
         peer: std::io::Cursor<Vec<u8>>,
         // Read by the handshake's wire pin only.
@@ -395,6 +401,7 @@ mod tests {
         unflushed: bool,
     }
 
+    #[cfg(feature = "stream")]
     impl Scripted {
         pub(crate) fn new(peer: Vec<u8>) -> Self {
             Scripted {
@@ -405,6 +412,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "stream")]
     impl std::io::Read for Scripted {
         fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
             if self.unflushed {
@@ -414,6 +422,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "stream")]
     impl std::io::Write for Scripted {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
             self.sent.extend_from_slice(bytes);

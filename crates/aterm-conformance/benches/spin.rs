@@ -17,10 +17,14 @@ mod measuring {
 
     use aterm_conformance::measure::Rig;
     use aterm_conformance::measure::instance::CouldNotRun;
-    use aterm_conformance::measure::spin::{EFFECT_LANE, SpinRow, SpinScene, measure};
+    use aterm_conformance::measure::spin::{
+        EFFECT_LANE, LIVE_LANE, NEEDLE_LANE, SpinRow, SpinScene, measure,
+    };
     use aterm_conformance::measure::starvation::ShapeVerdict;
 
     const MAX_ARMS: u64 = 100;
+    const RESTING_MAX_WAKES: u64 = 60;
+    const RESTING_MAX_FRAMES: u64 = 20;
 
     // `max_wakes` bounds every loop wake in the window (`event_wakes`), not only its timers: a loop
     // that wakes itself as it parks takes wait-cancelled wakes and turns, which neither
@@ -44,6 +48,7 @@ mod measuring {
                 max_owner_fires: &[],
                 needle_owed: false,
                 max_wakes: 150,
+                max_frames: None,
             },
         ),
         // No timer fired and no event came: 0 wakes measured in each take, bounded at one a second.
@@ -57,6 +62,7 @@ mod measuring {
                 max_owner_fires: &[],
                 needle_owed: false,
                 max_wakes: 6,
+                max_frames: None,
             },
         ),
         // A recording prompt frozen in an open Rewind view (design §14.5 R0 item 7). Proven red
@@ -74,6 +80,7 @@ mod measuring {
                 max_owner_fires: &[],
                 needle_owed: false,
                 max_wakes: 12,
+                max_frames: None,
             },
         ),
         // A bare prompt in a window: AppKit's loop, which no headless row runs. Under
@@ -100,6 +107,7 @@ mod measuring {
                 max_owner_fires: &[],
                 needle_owed: false,
                 max_wakes: 200,
+                max_frames: None,
             },
         ),
         // The window above at full motion (what the shipped `auto` resolves to on a Mac whose
@@ -122,18 +130,24 @@ mod measuring {
         // 2026-10-26: that build with a pet that asks for frames whenever it sleeps (a mutant,
         // reverted) measured 570 cursor-effect fires, 607 timer wakes and 698 wakes, focused and
         // asleep, and the four rows above passed on it. The window's Folded deck draws the dial,
-        // whose needle sweeps on its own deadline (`stats_needle`) after a reading that moves its
+        // whose needle sweeps on its deck clock (`deck_clock`) after a reading that moves its
         // tip a device pixel or more (`docs/DESIGN-stats-deck-now-left-2026-10-26.md` §4.3). The
         // dial reads the machine's own CPU, so how often it sweeps is the Mac's load: on main's
         // dev bundle of 2026-10-28, three takes asked 46, 19 and 34 needle frames at loads of
         // 8.4, 6.2 and 3.7, and a fixed bound of 20 failed two of them. The app counts the frames
         // each reading's episode owes the windows that animate the dial, on each window's own
-        // shortest effect interval (`needle_frames_owed`), and what the episode in flight as the
-        // window opens has left to fire (`needle_episode_left`), so the row bounds the needle's
+        // shortest deck frame interval (`needle_frames_owed`), and what the episode in flight as
+        // the window opens has left to fire (`needle_episode_left`), so the row bounds the needle's
         // fires by those, each counted between the window's opening and closing metrics: a needle
         // that fires more than its readings owed fails, whatever the
         // Mac's load. The needle's own wakes, two a fire, are left out of the 200, which the
-        // rest of the window kept to 91 or 92 in each of those takes.
+        // rest of the window kept to 91 or 92 in each of those takes. Since the window's rest
+        // (`idle_rest_secs`, ATERM-KI-1027-4) the row's head turns it off (`idle_rest_secs = 0`),
+        // so it stays the awake deck's row; a take whose window rests anyway is a refusal.
+        // Those takes predate the deck clock (`docs/DESIGN-stats-deck-gpu-motion-2026-10-26.md`
+        // S2): a Mac with a display link fires `deck_clock` only to resume its paused link a few
+        // periods before a frame due, and the link's vsyncs while it runs are window events,
+        // which the 200-wake bound counts. This row has not been measured at the desk since.
         (
             "a_pet_in_deep_sleep_fires_no_effect_wake",
             SpinRow {
@@ -144,6 +158,33 @@ mod measuring {
                 max_owner_fires: &[(EFFECT_LANE, 0)],
                 needle_owed: true,
                 max_wakes: 200,
+                max_frames: None,
+            },
+        ),
+        // The row above with the window's rest on (`idle_rest_secs = 30`, ATERM-KI-1027-4; the
+        // rest is off unless set), measured over 20 s from 40 s after its prompt went quiet, past
+        // the rest and the pet's deep sleep. A resting window's deck draws as an unfocused one's:
+        // no live-edge frame, no needle sweep, a reading every 5 s and a frame for each, so the
+        // live-edge, needle and cursor-effect lanes are bounded at 0, and its frames and wakes
+        // too, which no lane above bounds. A take whose window does not read `resting=true` as it
+        // opens and as it ends is a refusal (`rest_unready`). Two release builds of this branch
+        // (2026-10-29 and 2026-10-30, the rest then on by default) measured 4 frames, 6 timer
+        // wakes and 18 wakes (the vitals 4, the crash journal 2) in each, and a debug build of
+        // 569781e613 (off by default, on in this head) 4, 5 and 17, bounded at 20 frames and 60
+        // wakes. Proven red by the row above on the same builds: the window with its rest off
+        // drew 69, 60 and 47 frames in half the time, with 30 live-edge fires each and 29, 20 and
+        // 7 needle fires, which the lane, frame and wake bounds here each fail.
+        (
+            "a_resting_window_takes_no_live_frame",
+            SpinRow {
+                scene: SpinScene::Resting,
+                window: Duration::from_secs(20),
+                max_arms: MAX_ARMS,
+                max_timer_wakes: None,
+                max_owner_fires: &[(EFFECT_LANE, 0), (NEEDLE_LANE, 0), (LIVE_LANE, 0)],
+                needle_owed: false,
+                max_wakes: RESTING_MAX_WAKES,
+                max_frames: Some(RESTING_MAX_FRAMES),
             },
         ),
     ];

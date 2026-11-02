@@ -339,14 +339,17 @@ pub fn route_source_ipv4(to: Ipv4Addr) -> Option<Ipv4Addr> {
     let sequence = SEQUENCE
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         .wrapping_add(1);
-    // SAFETY: socket(2) takes no pointer; a descriptor it returns is owned below.
-    let raw = unsafe { libc::socket(libc::PF_ROUTE, libc::SOCK_RAW, libc::AF_INET) };
-    if raw < 0 {
-        return None;
-    }
-    // SAFETY: `raw` is the fresh descriptor socket(2) returned, owned by nothing else.
-    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
-    crate::keep_out_of_children(&fd).ok()?;
+    let fd = crate::kept_out(|| {
+        // SAFETY: socket(2) takes no pointer; a descriptor it returns is owned below.
+        let raw = unsafe { libc::socket(libc::PF_ROUTE, libc::SOCK_RAW, libc::AF_INET) };
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `raw` is the fresh descriptor socket(2) returned, owned by nothing else.
+        Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) })
+    })
+    .ok()?;
+    let raw = std::os::fd::AsRawFd::as_raw_fd(&fd);
     let request = route_get_request(to, sequence);
     // SAFETY: `request` is live and readable for its whole length. A destination no route takes
     // fails the write (`ESRCH`).
@@ -538,6 +541,12 @@ fn linux_default_gateway(route: &str) -> Option<Ipv4Addr> {
             continue;
         };
         let mask = column.nth(3);
+        if !flags.bytes().all(|b| b.is_ascii_hexdigit())
+            || gateway.len() != 8
+            || !gateway.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            continue;
+        }
         let Ok(flags) = u32::from_str_radix(flags, 16) else {
             continue;
         };
@@ -582,6 +591,9 @@ fn linux_neighbour_hardware(arp: &str, gateway: Ipv4Addr) -> Option<Box<[u8]>> {
             .strip_prefix("0x")
             .or_else(|| flags.strip_prefix("0X"))
             .unwrap_or(flags);
+        if flags_hex.is_empty() || !flags_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
         let Ok(arp_flags) = u32::from_str_radix(flags_hex, 16) else {
             continue;
         };
@@ -590,7 +602,11 @@ fn linux_neighbour_hardware(arp: &str, gateway: Ipv4Addr) -> Option<Box<[u8]>> {
         }
         let Some(bytes): Option<Vec<u8>> = hardware
             .split(':')
-            .map(|byte| u8::from_str_radix(byte, 16).ok())
+            .map(|byte| {
+                (byte.len() == 2 && byte.bytes().all(|b| b.is_ascii_hexdigit()))
+                    .then(|| u8::from_str_radix(byte, 16).ok())
+                    .flatten()
+            })
             .collect()
         else {
             continue;
@@ -731,20 +747,25 @@ impl RouteChanges {
             libc::SOCK_RAW | libc::SOCK_CLOEXEC,
             libc::NETLINK_ROUTE,
         );
-        // SAFETY: socket(2) takes no pointer; a descriptor it returns is owned below.
-        let raw = unsafe { libc::socket(domain, kind, protocol) };
-        if raw < 0 {
-            return None;
-        }
-        // SAFETY: `raw` is the fresh descriptor socket(2) returned, owned by nothing else.
-        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
-        #[cfg(target_os = "macos")]
-        {
+        let fd = crate::kept_out(|| {
+            // SAFETY: socket(2) takes no pointer; a descriptor it returns is owned below.
+            let raw = unsafe { libc::socket(domain, kind, protocol) };
+            if raw < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: `raw` is the fresh descriptor socket(2) returned, owned by nothing else.
+            let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+            // Before the mark, as F_SETFD replaces every descriptor flag.
+            #[cfg(target_os = "macos")]
             // SAFETY: F_SETFD takes an integer flag on this live descriptor.
             if unsafe { libc::fcntl(raw, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
-                return None;
+                return Err(std::io::Error::last_os_error());
             }
-        }
+            Ok(fd)
+        })
+        .ok()?;
+        #[cfg(target_os = "linux")]
+        let raw = std::os::fd::AsRawFd::as_raw_fd(&fd);
         #[cfg(target_os = "linux")]
         {
             // SAFETY: an all-zero sockaddr_nl is a valid value of the plain C struct.
@@ -763,7 +784,6 @@ impl RouteChanges {
                 return None;
             }
         }
-        crate::keep_out_of_children(&fd).ok()?;
         Some(RouteChanges(fd))
     }
 
@@ -772,7 +792,10 @@ impl RouteChanges {
     /// that fails otherwise waits out `most` and says none came, so a retry that waits on it
     /// keeps its own pace.
     pub fn wait(&self, most: std::time::Duration) -> bool {
-        let deadline = std::time::Instant::now() + most;
+        let now = std::time::Instant::now();
+        let deadline = now
+            .checked_add(most)
+            .unwrap_or_else(|| now + std::time::Duration::from_secs(365 * 24 * 3600));
         let wait_out = || {
             std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()));
             false
@@ -1140,9 +1163,15 @@ mod linux_gateway_tests {
         // Negative control: with no default-destination row there is no gateway.
         let no_default = "Iface\tDestination\tGateway\tFlags\nen0\t0001A8C0\t00000000\t0001\n";
         assert_eq!(linux_default_gateway(no_default), None);
+        let signed_route = "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\n\
+             en0\t00000000\t+101A8C0\t0003\t0\t0\t100\t00000000\n\
+             en0\t00000000\t0101A8C0\t+003\t0\t0\t100\t00000000\n";
+        assert_eq!(linux_default_gateway(signed_route), None);
 
         let arp = "IP address       HW type     Flags       HW address            Mask     Device\n\
              192.168.1.1      0x1         0x0         de:ad:be:ef:00:01     *        wlan0\n\
+             192.168.1.1      0x1         0x+2        de:ad:be:ef:00:01     *        wlan0\n\
+             192.168.1.1      0x1         0x2         +a:bb:cc:11:22:33     *        wlan0\n\
              192.168.1.1      0x1         0x2         aa:bb:cc:11:22:33     *        en0\n";
         assert_eq!(
             linux_neighbour_hardware(arp, Ipv4Addr::new(192, 168, 1, 1)).as_deref(),

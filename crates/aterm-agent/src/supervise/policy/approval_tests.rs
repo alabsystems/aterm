@@ -3641,7 +3641,8 @@ fn the_advisory_word_reads_this_process_home() {
     let word = |line: &str| readings_read_only(&[line.to_string()], &[]);
     for line in [
         "cat ~/.config/gh/hosts.yml".to_string(),
-        format!("cat {}/Library/Preferences/x.plist", home.display()),
+        // Quoted: a Windows home's `\` is the shell's escape outside quotes.
+        format!("cat '{}/Library/Preferences/x.plist'", home.display()),
     ] {
         let r = word(&line).expect_err(&line);
         assert!(r.contains("a read of a secret"), "{line}: {r}");
@@ -3941,6 +3942,16 @@ fn a_bash_read_of_a_secret_is_not_read_only() {
     let home = Some(Path::new("/Users/_owner"));
     let r = secrets_free(&[xargs.to_string()], &default_secrets(home), home).expect_err("a secret");
     assert!(r.contains("a read of a secret"), "{r}");
+    let env_chdir = "env -C ~ cat .claude.json";
+    let r = secrets_unreached(
+        &[env_chdir.to_string()],
+        &default_secrets(home),
+        home,
+        Start::Unplaced,
+        &|_| false,
+    )
+    .expect_err("a secret");
+    assert!(r.contains("a read of a secret"), "{r}");
     for cmd in [
         "git config -f/Users/_owner/.aws/credentials --list",
         "git config -f.aws/credentials --list",
@@ -4049,7 +4060,12 @@ fn a_read_is_held_to_the_secrets_as_the_shell_resolves_its_paths() {
         "rg token ~",
         "grep -R token /Users",
         "grep --recursive token ~",
+        "grep -d recurse token ~",
         "find ~ -name hosts.yml -exec cat {} \\;",
+        "git -C ~ show HEAD:.claude.json",
+        "git -C/Users/_owner show HEAD:.claude.json",
+        "diff ~ .",
+        "diff ~ /tmp/x",
     ] {
         for rows in boxes(line) {
             let r = reason(&on_screen(&rows, &git_host(ctx()))).to_string();
@@ -4067,6 +4083,11 @@ fn a_read_is_held_to_the_secrets_as_the_shell_resolves_its_paths() {
         ("cd \"$(dirname /etc/hosts)\" && cat hosts", "at run time"),
         ("cd - && cat .claude.json", "cannot follow"),
         ("cd -1 && cat .claude.json", "cannot follow"),
+        ("cat ~-/.claude.json", "`~-`"),
+        (
+            "while ! test -e .claude.json; do cd ..; done; cat .claude.json",
+            "a loop may repeat",
+        ),
     ] {
         for rows in boxes(line) {
             let r = reason(&on_screen(&rows, &git_host(ctx()))).to_string();
@@ -4082,9 +4103,57 @@ fn a_read_is_held_to_the_secrets_as_the_shell_resolves_its_paths() {
         "cat ~/.sshrc",
         "grep -rn token src",
         "rg token src",
-        "grep -r token .",
         "ls ~/.ssh",
         "sed -n '$p' README.md",
+        "git -C ~/proj show HEAD:README.md",
+        "diff a.txt b.txt",
+        "diff -u README.md /etc/hosts",
+        "diff /Users /tmp/x",
+    ] {
+        for rows in boxes(line) {
+            let d = on_screen(&rows, &git_host(ctx()));
+            assert!(approved(&d).is_some(), "{line}: {d:?}");
+        }
+        assert_eq!(word(line), Ok(()), "the word: {line}");
+    }
+    // A scratch cwd holds no secret; the word, which cannot place `.`, refuses it.
+    for rows in boxes("grep -r token .") {
+        let d = on_screen(&rows, &git_host(ctx()));
+        assert!(approved(&d).is_some(), "{d:?}");
+    }
+    assert!(word("grep -r token .").is_err());
+}
+
+/// A bracket expression is one character of a name however it spells its members: a POSIX
+/// class (`[:alpha:]`), an equivalence class (`[=s=]`), a collating element (`[.s.]`) or a `]`
+/// first among them closes no bracket. MEASURED 2026-10-29: bash 3.2.57 and zsh 5.9 expand
+/// `~/.[[:alpha:]]sh/config` and `~/.config/[[:alpha:]]h/hosts.yml` to `.ssh/config` and
+/// `.config/gh/hosts.yml` (`docs/measured/classifier-audit-3-fixes-2026-10-29.md`).
+#[test]
+fn a_bracket_expression_is_one_character_however_it_spells_its_members() {
+    let home = Path::new("/Users/_owner");
+    let boxes = |line: &str| [folder_box_with(line), no_rule_box(line)];
+    let word = |line: &str| readings_read_only_at(&[line.to_string()], &[], Some(home));
+    for line in [
+        "cat ~/.config/[[:alpha:]]h/hosts.yml",
+        "cat ~/.[[:alpha:]]sh/config",
+        "cat ~/.[[=s=]]sh/config",
+        "cat ~/.[[.s.]]sh/config",
+        "cat ~/.[!]]sh/config",
+        "cat ~/.[[:lower:]]ws/config",
+    ] {
+        for rows in boxes(line) {
+            let r = reason(&on_screen(&rows, &git_host(ctx()))).to_string();
+            assert!(r.contains("a read of a secret"), "{line}: {r}");
+        }
+        let r = word(line).expect_err(line);
+        assert!(r.contains("a read of a secret"), "the word: {line}: {r}");
+    }
+    // NEGATIVE CONTROL
+    for line in [
+        "cat ~/.[[:alpha:]]sx/config",
+        "cat ~/notes/[[:digit:]].txt",
+        "cat /etc/[[:alpha:]]osts",
     ] {
         for rows in boxes(line) {
             let d = on_screen(&rows, &git_host(ctx()));
@@ -4094,10 +4163,179 @@ fn a_read_is_held_to_the_secrets_as_the_shell_resolves_its_paths() {
     }
 }
 
+/// A basename rule is held to every name the last component may expand to, where one of the two
+/// holds no `*`: a literal rule's every glob (`.netr?` for `.netrc`, `.pypi*` for `.pypirc`)
+/// and a `*`-free glob for a globbed rule (`a.pe?` for `*.pem`). A `*` in both is held as
+/// written, so `cat src/*.rs` stays a read. MEASURED 2026-10-29: bash and zsh expand `.netr?`
+/// to `.netrc`.
+#[test]
+fn a_basename_rule_is_held_to_what_the_last_component_may_expand_to() {
+    let home = Path::new("/Users/_owner");
+    let boxes = |line: &str| [folder_box_with(line), no_rule_box(line)];
+    let word = |line: &str| readings_read_only_at(&[line.to_string()], &[], Some(home));
+    for line in [
+        "cat ~/.netr?",
+        "cat ~/.git-credential?",
+        "cat ~/.npmr[c]",
+        "head ~/.pypi*",
+        "cat ~/.vault-toke?",
+        "cat ~/.zsh_histor?",
+        "cat src/.en?",
+        "cat src/a.pe?",
+        "cat ~/proj/.env*",
+    ] {
+        for rows in boxes(line) {
+            let r = reason(&on_screen(&rows, &git_host(ctx()))).to_string();
+            assert!(r.contains("a read of a secret"), "{line}: {r}");
+        }
+        let r = word(line).expect_err(line);
+        assert!(r.contains("a read of a secret"), "the word: {line}: {r}");
+    }
+    // NEGATIVE CONTROL
+    for line in [
+        "cat src/*.rs",
+        "cat src/a.pem.txt",
+        "cat ~/.netrc.sample",
+        "cat ~/notes/?.md",
+    ] {
+        for rows in boxes(line) {
+            let d = on_screen(&rows, &git_host(ctx()));
+            assert!(approved(&d).is_some(), "{line}: {d:?}");
+        }
+        assert_eq!(word(line), Ok(()), "the word: {line}");
+    }
+}
+
+/// sed's `r` and `R` read the file their script names, and awk's `getline` and `ARGV` the file
+/// its program names: each is held to the secrets as an operand is, and one the program builds at
+/// run time (a concatenation, a variable, `ARGV`) is refused as unproven.
+#[test]
+fn a_file_a_sed_script_or_an_awk_program_names_is_held_to_the_secrets() {
+    let home = Path::new("/Users/_owner");
+    let boxes = |line: &str| [folder_box_with(line), no_rule_box(line)];
+    let word = |line: &str| readings_read_only_at(&[line.to_string()], &[], Some(home));
+    for line in [
+        "sed '1r /Users/_owner/.secrets/gh_access_token' /etc/hosts",
+        "sed 'r /Users/_owner/.config/gh/hosts.yml' /etc/hosts",
+        "sed '$r /Users/_owner/.claude.json' /etc/hosts",
+        "sed -e '/x/R /Users/_owner/.claude.json' /etc/hosts",
+        "cd ~ && sed '1r .claude.json' /etc/hosts",
+        "awk 'BEGIN{while((getline l < \"/Users/_owner/.secrets/x\")>0) print l}'",
+    ] {
+        for rows in boxes(line) {
+            let r = reason(&on_screen(&rows, &git_host(ctx()))).to_string();
+            assert!(r.contains("a read of a secret"), "{line}: {r}");
+        }
+        let r = word(line).expect_err(line);
+        assert!(r.contains("a read of a secret"), "the word: {line}: {r}");
+    }
+    for line in [
+        "awk 'BEGIN{f=\"/Users/_owner/.sec\" \"rets/x\"; while((getline l < f)>0) print l}'",
+        "awk 'BEGIN{ARGV[1]=\"/Users/_owner/.config/g\" \"h/hosts.yml\"; ARGC=2} {print}'",
+        "awk 'BEGIN{getline l < \"/Users/_owner/.sec\" \"rets/x\"; print l}'",
+    ] {
+        for rows in boxes(line) {
+            let r = reason(&on_screen(&rows, &git_host(ctx()))).to_string();
+            assert!(r.contains("builds at run time"), "{line}: {r}");
+        }
+        let r = word(line).expect_err(line);
+        assert!(r.contains("builds at run time"), "the word: {line}: {r}");
+    }
+    // NEGATIVE CONTROL
+    for line in [
+        "sed '1r README.md' /etc/hosts",
+        "sed -n '/r .ssh/p' README.md",
+        "awk 'BEGIN{while((getline l < \"/etc/hosts\")>0) print l}'",
+        "awk 'NR==1{getline; print}' README.md",
+        "awk '{print $1}' README.md",
+    ] {
+        for rows in boxes(line) {
+            let d = on_screen(&rows, &git_host(ctx()));
+            assert!(approved(&d).is_some(), "{line}: {d:?}");
+        }
+        assert_eq!(word(line), Ok(()), "the word: {line}");
+    }
+}
+
+/// Under zsh, `^` and a `#` inside a word glob when the startup sets `EXTENDED_GLOB` (`^x` any
+/// name but `x`, `g#h` any run of `g` then `h`), which the secret check does not read: a line
+/// holding one unquoted proves no box. MEASURED 2026-10-29: `/bin/zsh -f` with `setopt
+/// extendedglob` expands `~/.config/^x/hosts.yml` and `~/.s#h/config` to `.config/gh/hosts.yml`
+/// and `.ssh/config`. Under bash both are literal names.
+#[test]
+fn an_extended_glob_operator_under_zsh_proves_no_box() {
+    let zsh = zsh_startup("", "setopt extendedglob\n");
+    assert!(zsh.as_ref().is_ok_and(ShellStartup::may_run_zsh), "{zsh:?}");
+    let under = |shell: &Result<ShellStartup, String>| ApprovalCtx {
+        shell: shell.clone(),
+        ..git_host(ctx())
+    };
+    let bash = Ok(ShellStartup::default());
+    let boxes = |line: &str| [folder_box_with(line), no_rule_box(line)];
+    for line in [
+        "cat ~/.config/^x/hosts.yml",
+        "cat ~/.config/g#h/hosts.yml",
+        "cat ~/.s#h/config",
+        "git show HEAD^",
+    ] {
+        for rows in boxes(line) {
+            let r = reason(&on_screen(&rows, &under(&zsh))).to_string();
+            assert!(r.contains("not a plain line under zsh"), "{line}: {r}");
+            let d = on_screen(&rows, &under(&bash));
+            assert!(approved(&d).is_some(), "under bash {line}: {d:?}");
+        }
+    }
+    // NEGATIVE CONTROL
+    for line in [
+        "grep -n '^fn ' src/main.rs",
+        "echo \"a#b\"",
+        "ls *.rs # what's here",
+        "cat ~/notes/a.txt",
+    ] {
+        for rows in boxes(line) {
+            let d = on_screen(&rows, &under(&zsh));
+            assert!(approved(&d).is_some(), "{line}: {d:?}");
+        }
+    }
+}
+
+/// A whole `**` (zsh's, and bash's under `globstar`) takes any run of components, so an `Under`
+/// rule two directories below it is reached, where a `*` takes one. The rule list is that one
+/// directory: a default `Component` rule, which any `*` meets, would refuse each line first.
+#[test]
+fn a_whole_double_star_reaches_a_secret_any_depth_below() {
+    let c = ApprovalCtx {
+        secrets: vec![SecretRule::Under(PathBuf::from("/srv/a/vault"))],
+        ..git_host(ctx())
+    };
+    let boxes = |line: &str| [folder_box_with(line), no_rule_box(line)];
+    for line in [
+        "cat /srv/**/key.txt",
+        "cat /**/vault/key.txt",
+        "head /srv/***/key.txt",
+    ] {
+        for rows in boxes(line) {
+            let r = reason(&on_screen(&rows, &c)).to_string();
+            assert!(r.contains("a read of a secret"), "{line}: {r}");
+        }
+    }
+    // NEGATIVE CONTROL
+    for line in [
+        "cat /srv/*/key.txt",
+        "cat /*/vault/key.txt",
+        "cat /srv/b/**/key.txt",
+    ] {
+        for rows in boxes(line) {
+            let d = on_screen(&rows, &c);
+            assert!(approved(&d).is_some(), "{line}: {d:?}");
+        }
+    }
+}
+
 /// A read that prints a value of the environment, where a token lives as a file's secret does,
 /// proves no box of either kind, and the advisory word refuses it too: a variable off the plain
-/// list (in a braced default too), an indirection, `ps` showing environments, jq's `env` and
-/// `$ENV`, awk's `ENVIRON`, a process's `environ` file.
+/// list (in a braced default or after a zsh flag too), an indirection, `ps` showing environments,
+/// jq's `env` and `$ENV`, awk's `ENVIRON`, a process's `environ` file.
 #[test]
 fn a_read_that_prints_the_environment_proves_no_box() {
     let boxes = |line: &str| [folder_box_with(line), no_rule_box(line)];
@@ -4128,6 +4366,7 @@ fn a_read_that_prints_the_environment_proves_no_box() {
         ),
         ("cat /proc/self/environ", "names a process's environment"),
         ("cd /proc/1 && cat environ", "names a process's environment"),
+        ("jq -f env.jq data.json", "jq prints the environment"),
     ] {
         for rows in boxes(line) {
             let r = reason(&on_screen(&rows, &git_host(ctx()))).to_string();
@@ -4167,7 +4406,8 @@ fn a_read_that_prints_the_environment_proves_no_box() {
 
 /// A relative path is read against the session's cwd and where its Bash tool stands, and a
 /// session whose cwd is unknown reads no relative path; the advisory word, which knows neither,
-/// reads one against the directories the line names alone.
+/// reads one from a directory it cannot place, taken to lie outside every secret, so it refuses
+/// each of these too.
 #[test]
 fn a_relative_read_starts_where_the_session_stands() {
     let at = |cwd: &str| ApprovalCtx {
@@ -4180,6 +4420,11 @@ fn a_relative_read_starts_where_the_session_stands() {
         (at("/Users/_owner"), "cat .claude.json"),
         (at("/Users/_owner"), "rg token"),
         (at("/Users/_owner"), "grep -r token ."),
+        (at("/Users/_owner"), "grep -r token"),
+        (at("/Users/_owner"), "grep -r -e token 2>/dev/null"),
+        (at("/Users/_owner"), "git grep token"),
+        (at("/Users/_owner"), "find -name x -exec cat {} +"),
+        (at("/Users/_owner"), "cat ~+/.claude.json"),
         (
             at("/Users/_owner/proj"),
             "cd .. && cat .config/gh/hosts.yml",
@@ -4198,10 +4443,11 @@ fn a_relative_read_starts_where_the_session_stands() {
             "{line} in {:?}: {r}",
             c.cwd
         );
-        assert_eq!(
-            readings_read_only_at(&[line.to_string()], &[], Some(Path::new("/Users/_owner"))),
-            Ok(()),
-            "the word: {line}"
+        let word =
+            readings_read_only_at(&[line.to_string()], &[], Some(Path::new("/Users/_owner")));
+        assert!(
+            matches!(&word, Err(why) if why.contains("a read of a secret")),
+            "the word: {line}: {word:?}"
         );
     }
     let unknown = ApprovalCtx {
@@ -4215,10 +4461,203 @@ fn a_relative_read_starts_where_the_session_stands() {
         (at("/Users/_owner/proj"), "cat README.md"),
         (at("/Users/_owner/proj"), "grep -rn token src"),
         (at("/Users/_owner"), "cat notes.txt"),
+        (at("/Users/_owner"), "grep -rn TODO src"),
+        (at("/Users/_owner"), "rg TODO src"),
+        (
+            at("/Users/_owner"),
+            "find src -name '*.rs' -exec wc -l {} +",
+        ),
+        (at("/Users/_owner"), "git grep TODO -- src"),
         (unknown.clone(), "cat /etc/hosts"),
     ] {
         let d = on_screen(&folder_box_with(line), &c);
         assert_eq!(approved(&d), Some(RULE_READ_ONLY), "{line}: {d:?}");
+        assert_eq!(
+            readings_read_only_at(&[line.to_string()], &[], Some(Path::new("/Users/_owner"))),
+            Ok(()),
+            "the word: {line}"
+        );
+    }
+}
+
+/// A `cd` or `pushd` target bash and zsh may look up in a `CDPATH` (zsh's `cdpath`, which the
+/// worker's environment or a `.zshenv` may set): a relative one that is not `.` or `..` and not
+/// led by `./` or `../`, is also read from a directory the check cannot place, with every relative
+/// move after it, so a read below it is refused when a trailing part of a home rule's path leads
+/// the target and the read together, or when that directory is the root and an alias of the root
+/// leads them (`cd Volumes`, which a `CDPATH` of `/` places in `/Volumes`). A git read after such
+/// a move is refused, as git's settings there cannot be read. A line whose commands may stand in
+/// more than 64 directories reads no relative path.
+#[test]
+fn a_cd_cdpath_may_place_is_read_from_a_directory_the_check_cannot_place() {
+    let in_project = ApprovalCtx {
+        cwd: PathBuf::from("/Users/_owner/proj"),
+        ..git_host(ctx())
+    };
+    let floated = "from a directory this check cannot place";
+    let mut many = String::new();
+    for k in 0..22 {
+        many.push_str(&format!("cd d{k}; "));
+    }
+    many.push_str("cat README.md");
+    for (cmd, why) in [
+        ("cd gh && cat hosts.yml", floated),
+        (
+            "cd Volumes && cat 'Macintosh HD/Users/_owner/.claude.json'",
+            "a read of a secret",
+        ),
+        (
+            "cd System && cat Volumes/Data/Users/_owner/.secrets/t",
+            "a read of a secret",
+        ),
+        (
+            "cd .nofollow && cat Users/_owner/.claude.json",
+            "a read of a secret",
+        ),
+        ("cd proc && cat self/cwd/x", "through /proc's cwd"),
+        ("cd sub && git status", "CDPATH"),
+        ("cd sub; git log -1", "CDPATH"),
+        ("cd .config && cat gh/hosts.yml", floated),
+        ("cd src && cd .config && cat gh/hosts.yml", floated),
+        ("cd .config/aterm && cat secrets/k", floated),
+        ("cd Library && cat Preferences/x.plist", floated),
+        ("cd -P .config && head gh/hosts.yml", floated),
+        ("cd .con\u{FB01}g && cat gh/hosts.yml", floated),
+        (
+            "cd a; cd b; cd c; cd d; cd e; cd f; cd g; cat README.md",
+            "more than 64 directories",
+        ),
+        (many.as_str(), "more than 64 directories"),
+    ] {
+        let d = on_screen(&bash_box(&[cmd], Some("Read it")), &in_project);
+        let r = reason(&d);
+        assert!(r.contains(why), "{cmd}: expected {why:?}, got {r}");
+    }
+    // NEGATIVE CONTROL
+    for cmd in [
+        "cd ./gh && cat hosts.yml",
+        "cd sub && cat README.md",
+        "cd sub && cat .claude.json",
+        "cd crates/aterm-agent && cat SPECS.md",
+        "cd crates && grep -rn token .",
+        "cd .. && cat notes.txt",
+        "cd -P .. && cat notes.txt",
+        "cd a; cd a; cd a; cd a; cd a; cd a; cd a; cd a; cat README.md",
+        "cd Volumes && cat 'Macintosh HD/notes.txt'",
+        "cd proc && cat self/status",
+    ]
+    .into_iter()
+    // A git read after a move no `CDPATH` takes, where this check runs the worker's git (on
+    // Windows a `/` cwd names no drive, so there it is unproven).
+    .chain(cfg!(unix).then_some("cd ./sub && git status"))
+    {
+        let d = on_screen(&bash_box(&[cmd], Some("Read it")), &in_project);
+        assert_eq!(approved(&d), Some(RULE_READ_ONLY), "{cmd}: {d:?}");
+    }
+    // Three levels down, only `CDPATH`'s reading of `crates` reaches the home's tree.
+    let deep = ApprovalCtx {
+        cwd: PathBuf::from("/Users/_owner/w/x/y"),
+        ..git_host(ctx())
+    };
+    let r = reason(&on_screen(
+        &bash_box(&["cd crates && rg token .."], Some("Read it")),
+        &deep,
+    ))
+    .to_string();
+    assert!(r.contains(floated), "{r}");
+    let d = on_screen(
+        &bash_box(&["cd ./crates && rg token .."], Some("Read it")),
+        &deep,
+    );
+    assert_eq!(approved(&d), Some(RULE_READ_ONLY), "{d:?}");
+}
+
+/// The loop reads where the Bash tool stands for a box whose command reads a path from where it
+/// stands (an operand or a tree a reader descends with no root), and for no other Bash box, so a
+/// recorded tape of one that names none replays without that read.
+#[test]
+fn a_box_is_placed_where_the_bash_tool_stands_only_when_it_reads_from_there() {
+    let reads = |cmd: &str| {
+        let p = aterm_phase::prompt::parse_prompt_v2(&bash_box(&[cmd], None)).expect("a box");
+        reads_from_stand(&p)
+    };
+    for cmd in [
+        "cat ../.claude.json",
+        "cd /tmp && cat notes.txt",
+        "cd sub",
+        "cat ~+/notes.txt",
+        "touch notes.txt",
+        "rg token",
+        "grep -rn token",
+    ] {
+        assert!(reads(cmd), "{cmd}");
+    }
+    // NEGATIVE CONTROL
+    for cmd in [
+        "touch /private/tmp/proj/notes.txt",
+        "cat ~/notes.txt",
+        "ls",
+        "cat C:/Users/_owner/notes.txt",
+    ] {
+        assert!(!reads(cmd), "{cmd}");
+    }
+}
+
+/// The advisory word, which knows no cwd, reads a relative operand from a directory it cannot
+/// place, so it refuses one that may reach a secret from there, as the rules would from some cwd
+/// (`../.claude.json`, a recursive read of `.`); `aterm drive classify` reads one from the
+/// directory it is asked from, where the asking agent's line runs.
+#[test]
+fn the_advisory_word_and_the_classify_verb_place_a_relative_read() {
+    let home = Path::new("/Users/_owner");
+    let word = |line: &str| readings_read_only_at(&[line.to_string()], &[], Some(home));
+    let proj = Path::new("/Users/_owner/proj");
+    let verb = |line: &str, cwd| command_read_only_at(line, &[], Some(home), cwd);
+    for line in [
+        "cat ../.claude.json",
+        "cat ../../.secrets/t",
+        "cat .claude.json",
+        "cat gh/hosts.yml",
+        "rg token",
+        "grep -r token .",
+        "cd .. && cat .config/gh/hosts.yml",
+    ] {
+        let r = word(line).expect_err(line);
+        assert!(
+            r.contains("from a directory this check cannot place"),
+            "{line}: {r}"
+        );
+        let r = verb(line, None).expect_err(line);
+        assert!(
+            r.contains("a read of a secret"),
+            "the verb with no cwd: {line}: {r}"
+        );
+    }
+    // Its directory may be the root, read through the root's aliases too.
+    for line in [
+        "cat System/Volumes/Data/Users/_owner/.claude.json",
+        "cat .nofollow/Users/_owner/.claude.json",
+        "cat 'Volumes/Macintosh HD/Users/_owner/.secrets/t'",
+    ] {
+        let r = word(line).expect_err(line);
+        assert!(r.contains("a read of a secret"), "{line}: {r}");
+    }
+    let r = verb("cat ../.claude.json", Some(proj)).expect_err("the home's .claude.json");
+    assert!(r.contains("a read of a secret"), "{r}");
+    let r = verb("rg token ..", Some(proj)).expect_err("the home's tree");
+    assert!(r.contains("a read of a secret"), "{r}");
+    // NEGATIVE CONTROL
+    for line in [
+        "cat ../README.md",
+        "cat src/main.rs",
+        "grep -rn TODO src",
+        "cd src && cat lib.rs",
+        "cat System/Volumes/Data/Users/_owner/notes.txt",
+    ] {
+        assert_eq!(word(line), Ok(()), "the word: {line}");
+    }
+    for line in ["cat .claude.json", "cat gh/hosts.yml", "rg token"] {
+        assert_eq!(verb(line, Some(proj)), Ok(()), "the verb in proj: {line}");
     }
 }
 
@@ -4276,6 +4715,336 @@ fn a_secret_under_a_windows_home_is_not_read_only() {
     }
 }
 
+/// On a Windows host (here, a Windows home), Windows' own spellings of a name keep its rules: a
+/// name's trailing dots and spaces and its `:stream` suffix are dropped, and a short 8.3 name
+/// whose stem is a whole basis is held to every long name Windows may have made it of (`SSH~1` of
+/// `.ssh`, and, MEASURED 2026-10-30 in the Windows lane, `ALWU~1` of `Al Wu` and `A_B~1` of
+/// `a+b`, which Git Bash's `cat` opens); an 8.3 name that may stand for any long name (a cut stem,
+/// a hashed one, or an extension) and a UNC or
+/// device path (the NT namespace's `\??\` among them, which Git Bash's `cat` opens, MEASURED
+/// 2026-10-29 in the Windows lane), as an operand or as where a relative one is read, are
+/// unproven; a drive-relative
+/// path (`C:name`) is read from the drive's own directory, which the check cannot place. A Unix
+/// host with a Unix home reads none of these.
+#[test]
+fn windows_own_spellings_of_a_secret_are_not_read_only() {
+    let home = PathBuf::from(r"C:\Users\_owner");
+    let windows = |cwd: &str| ApprovalCtx {
+        secrets: default_secrets(Some(&home)),
+        home: Some(home.clone()),
+        cwd: PathBuf::from(cwd),
+        ..git_host(ctx())
+    };
+    let scratch = git_host(ctx()).cwd.to_string_lossy().into_owned();
+    let scratch = scratch.as_str();
+    for (cwd, cmd, why) in [
+        (
+            scratch,
+            "cat C:/Users/_owner/.claude.json.",
+            "a read of a secret",
+        ),
+        (
+            scratch,
+            "cat 'C:/Users/_owner/.claude.json. .'",
+            "a read of a secret",
+        ),
+        (scratch, "cat ~/.claude.json.", "a read of a secret"),
+        (
+            scratch,
+            "cat 'C:/Users/_owner/.claude.json::$DATA'",
+            "a read of a secret",
+        ),
+        (
+            scratch,
+            "cat '/c/Users/_owner/.secrets::$INDEX_ALLOCATION/t'",
+            "a read of a secret",
+        ),
+        (
+            scratch,
+            "cat '/c/Users/_owner/.secrets./t'",
+            "a read of a secret",
+        ),
+        (
+            scratch,
+            "cat C:/Users/_owner/SSH~1/config",
+            "a read of a secret",
+        ),
+        (
+            scratch,
+            "cat C:/Users/_owner/AWS~1/config",
+            "a read of a secret",
+        ),
+        (
+            scratch,
+            "cat C:/Users/_owner/CLAUDE~1.JSO",
+            "an 8.3 short name",
+        ),
+        (
+            scratch,
+            "cat C:/Users/_owner/SECRET~1/t",
+            "an 8.3 short name",
+        ),
+        (
+            scratch,
+            "cat C:/Users/_owner/CONFIG~1/gh/hosts.yml",
+            "an 8.3 short name",
+        ),
+        (
+            scratch,
+            "cat C:/Users/_owner/S1A2B~1/t",
+            "an 8.3 short name",
+        ),
+        (scratch, "cat C:/Users/_owner/PEM~1", "a read of a secret"),
+        (
+            scratch,
+            "cat C:/Users/_owner/proj/ENV~1",
+            "a read of a secret",
+        ),
+        (
+            scratch,
+            r"cat '\\?\C:\Users\_owner\.claude.json'",
+            "a UNC or device path",
+        ),
+        (
+            scratch,
+            r"cat '\\localhost\C$\Users\_owner\.claude.json'",
+            "a UNC or device path",
+        ),
+        (
+            scratch,
+            "cat //?/C:/Users/_owner/.claude.json",
+            "a UNC or device path",
+        ),
+        (
+            scratch,
+            "cd '//?/C:/Users/_owner' && cat .claude.json",
+            "a UNC or device path",
+        ),
+        (
+            scratch,
+            r"grep -r token '\\.\C:\Users'",
+            "a UNC or device path",
+        ),
+        (
+            scratch,
+            r"cat '\??\C:\Users\_owner\.claude.json'",
+            "a UNC or device path",
+        ),
+        (
+            scratch,
+            r"cd '\??\C:\Users\_owner' && cat .secrets/t",
+            "a UNC or device path",
+        ),
+        (
+            scratch,
+            "cat '/??/C:/Users/_owner/.claude.json'",
+            "a UNC or device path",
+        ),
+        (scratch, "cat C:.claude.json", "a read of a secret"),
+        (scratch, "cat C:../.secrets/t", "a read of a secret"),
+        (
+            r"C:\Users\_owner\proj",
+            "cat ../.claude.json",
+            "a read of a secret",
+        ),
+        (
+            r"C:\Users\_owner\proj",
+            r"cat '..\.claude.json'",
+            "a read of a secret",
+        ),
+        (
+            r"C:\Users\_owner\proj",
+            "cd .. && cat .secrets/t",
+            "a read of a secret",
+        ),
+        (
+            r"C:\Users\_owner\proj",
+            "cat ../.claude.json.",
+            "a read of a secret",
+        ),
+    ] {
+        let d = on_screen(&bash_box(&[cmd], Some("Read it")), &windows(cwd));
+        let r = reason(&d);
+        assert!(r.contains(why), "{cmd}: expected {why:?}, got {r}");
+    }
+    // NEGATIVE CONTROL
+    for (cwd, cmd) in [
+        (scratch, "cat C:/Users/_owner/notes.txt."),
+        (scratch, "cat C:/Users/_owner/HEAD~1"),
+        (scratch, "git diff HEAD~1"),
+        (scratch, "git show HEAD~2:src/main.rs"),
+        (scratch, "cat 'C:/Users/_owner/proj/notes.txt::$DATA'"),
+        (scratch, "sed -n 's:a:b:p' README.md"),
+        (scratch, "cat C:notes.txt"),
+        (scratch, "cat 'C:/Users/_owner/proj/??/notes.txt'"),
+        (scratch, "cat 'proj/??/notes.txt'"),
+        (r"C:\Users\_owner\proj", "cat ../notes.txt"),
+        (r"C:\Users\_owner\proj", r"cat '..\notes.txt'"),
+        (r"C:\Users\_owner\proj", "cat .claude.json"),
+    ] {
+        let d = on_screen(&bash_box(&[cmd], Some("Read it")), &windows(cwd));
+        assert_eq!(approved(&d), Some(RULE_READ_ONLY), "{cmd}: {d:?}");
+    }
+    // A home whose name Windows changes to make its basis: spaces dropped, `+` put as `_`.
+    for (home, cmd) in [
+        (r"C:\Users\Al Wu", "cat C:/Users//ALWU~1/.claude.json"),
+        (r"C:\Users\Al Wu", "cat /c/Users//alwu~1/.secrets/t"),
+        (r"C:\Users\a+b", "cat C:/Users//A_B~1/.secrets/t"),
+        (r"C:\Users\a+b", "cat C:/Users//A_B~1/.config/gh/hosts.yml"),
+    ] {
+        let home = PathBuf::from(home);
+        let c = ApprovalCtx {
+            secrets: default_secrets(Some(&home)),
+            home: Some(home),
+            ..git_host(ctx())
+        };
+        let d = on_screen(&bash_box(&[cmd], Some("Read it")), &c);
+        assert!(reason(&d).contains("a read of a secret"), "{cmd}: {d:?}");
+        // NEGATIVE CONTROL: another file under the same short name.
+        let notes = cmd
+            .replace(".claude.json", "notes.txt")
+            .replace(".secrets/t", "notes.txt");
+        let notes = notes.replace(".config/gh/hosts.yml", "notes.txt");
+        let d = on_screen(&bash_box(&[&notes], Some("Read it")), &c);
+        assert_eq!(approved(&d), Some(RULE_READ_ONLY), "{notes}: {d:?}");
+    }
+    // A Unix host with a Unix home: these are other names, no secret's.
+    if !cfg!(windows) {
+        let unix = Path::new("/Users/_owner");
+        for line in [
+            "cat /Users/_owner/.claude.json.",
+            "cat '/Users/_owner/.claude.json::$DATA'",
+            "cat /Users/_owner/CLAUDE~1.JSO",
+            "cat //?/C:/Users/_owner/.claude.json",
+        ] {
+            assert_eq!(
+                readings_read_only_at(&[line.to_string()], &[], Some(unix)),
+                Ok(()),
+                "{line}"
+            );
+        }
+    }
+}
+
+/// A rooted path through an alias the OS keeps of the root reaches the home's secrets as the
+/// root's own spelling does: MEASURED 2026-10-29 and 2026-10-30 on macOS 27.0.1,
+/// `/System/Volumes/Data/Users/…`, `/Volumes/Macintosh HD/Users/…` (a link to `/`),
+/// `/.nofollow/Users/…` and `/.resolve/<n>/Users/…` are the home's own inode, and
+/// `/.vol/<device>/<inode>/…` opens the home by its numbers; Linux's `/proc/<pid>/root` is a
+/// process's root and `/proc/<pid>/task/<tid>/…` a thread's view of its process (proc(5)), and
+/// their `cwd`, `fd` and `map_files` name what no rule can (a relative path spelled
+/// `proc/<pid>/fd/…` is refused too, stricter only); Windows' `Documents and Settings` is a
+/// junction of `C:\Users`, which Git Bash's `cat` (as `/c/…` and `C:/…`) and `findstr` open,
+/// MEASURED 2026-10-29 in the Windows lane, and Git Bash's `cat` opens `/proc/cygdrive/c/…`,
+/// MEASURED 2026-10-30 there (Cygwin's `/cygdrive/c/…` is read so too, REASONED).
+#[test]
+fn an_alias_the_os_keeps_of_the_root_reaches_the_homes_secrets() {
+    for (cmd, why) in [
+        (
+            "cat '/Volumes/Macintosh HD/Users/_owner/.claude.json'",
+            "a read of a secret",
+        ),
+        (
+            "cat /Volumes/Backup/Users/_owner/.secrets/t",
+            "a read of a secret",
+        ),
+        (
+            "cat /System/Volumes/Data/Users/_owner/.claude.json",
+            "a read of a secret",
+        ),
+        (
+            "cat /system/volumes/data/users/_owner/.claude.json",
+            "a read of a secret",
+        ),
+        (
+            "cd /System/Volumes/Data/Users/_owner && cat .claude.json",
+            "a read of a secret",
+        ),
+        ("grep -r token /Volumes", "a read of a secret"),
+        ("rg token /System/Volumes/Data/Users", "a read of a secret"),
+        (
+            "cat /proc/self/root/Users/_owner/.claude.json",
+            "a read of a secret",
+        ),
+        (
+            "cat /proc/1/root/proc/self/root/Users/_owner/.claude.json",
+            "a read of a secret",
+        ),
+        (
+            "cat /.nofollow/Users/_owner/.claude.json",
+            "a read of a secret",
+        ),
+        (
+            "cat /.resolve/1/Users/_owner/.secrets/t",
+            "a read of a secret",
+        ),
+        (
+            "cat /.nofollow/Users/_owner/.config/gh/hosts.yml",
+            "a read of a secret",
+        ),
+        (
+            "cat /.nofollow/System/Volumes/Data/Users/_owner/.claude.json",
+            "a read of a secret",
+        ),
+        ("grep -r token /.nofollow", "a read of a secret"),
+        ("rg token /.resolve/1", "a read of a secret"),
+        (
+            "cat /proc/1/task/1/root/Users/_owner/.claude.json",
+            "a read of a secret",
+        ),
+        ("cat /.vol/16777233/310201/.claude.json", "(/.vol)"),
+        ("cd /.vol/16777233/310201 && cat .claude.json", "(/.vol)"),
+        ("cat /proc/self/cwd/.claude.json", "through /proc's cwd"),
+        ("cat /proc/123/fd/3", "through /proc's fd"),
+        ("cat /proc/self/task/1/cwd/x", "through /proc's cwd"),
+        ("cat /proc/1/task/2/fd/3", "through /proc's fd"),
+    ] {
+        let d = on_screen(&bash_box(&[cmd], Some("Read it")), &git_host(ctx()));
+        let r = reason(&d);
+        assert!(r.contains(why), "{cmd}: expected {why:?}, got {r}");
+    }
+    let home = PathBuf::from(r"C:\Users\_owner");
+    let windows = ApprovalCtx {
+        secrets: default_secrets(Some(&home)),
+        home: Some(home.clone()),
+        ..git_host(ctx())
+    };
+    for cmd in [
+        "cat 'C:/Documents and Settings/_owner/.claude.json'",
+        r"cat 'C:\Documents and Settings\_owner\.secrets\t'",
+        "cat '/c/documents and settings/_owner/.secrets/t'",
+        "cat /proc/cygdrive/c/Users/_owner/.secrets/t",
+        "cat /proc/cygdrive/c/Users/_owner/.claude.json",
+        "cat /cygdrive/c/Users/_owner/.claude.json",
+        "cat C:'Documents and Settings/_owner/.claude.json'",
+    ] {
+        let d = on_screen(&bash_box(&[cmd], Some("Read it")), &windows);
+        assert!(reason(&d).contains("a read of a secret"), "{cmd}: {d:?}");
+    }
+    // NEGATIVE CONTROL
+    for cmd in [
+        "cat /Volumes/Backup/notes.txt",
+        "cat /System/Volumes/Data/private/etc/hosts",
+        "cat /proc/cpuinfo",
+        "cat /proc/self/status",
+        "cat /Volumes",
+        "cat notes/fd/x.txt",
+        "cat /.nofollow/Users/_owner/notes.txt",
+        "cat /.resolve/1/Users/_owner/notes.txt",
+        "cat /proc/self/task/1/status",
+    ] {
+        let d = on_screen(&bash_box(&[cmd], Some("Read it")), &git_host(ctx()));
+        assert_eq!(approved(&d), Some(RULE_READ_ONLY), "{cmd}: {d:?}");
+    }
+    for cmd in [
+        "cat 'C:/Documents and Settings/_owner/notes.txt'",
+        "cat /proc/cygdrive/c/Users/_owner/notes.txt",
+    ] {
+        let d = on_screen(&bash_box(&[cmd], Some("Read it")), &windows);
+        assert_eq!(approved(&d), Some(RULE_READ_ONLY), "{cmd}: {d:?}");
+    }
+}
+
 /// A Unix home whose first component is one letter (`/h/name`) is not read as Git Bash's
 /// drive: a Read box (whose path the rules read as written) and a Bash read keep its rules.
 #[test]
@@ -4294,7 +5063,62 @@ fn a_secret_under_a_one_letter_unix_home_is_not_approved() {
         assert!(reason(&d).contains("a read of a secret"), "{path}: {d:?}");
     }
     let d = on_screen(&read_box("~/notes/todo.md"), &c);
-    assert_eq!(approved(&d), Some(RULE_READ_OUTSIDE_CWD), "{d:?}");
+    if cfg!(windows) {
+        // The live probe resolves a `/` path on a Unix disk only: on Windows a Read of one
+        // goes to a person (as `a_read_outside_cwd_is_approved_…`, which is Unix's).
+        assert!(reason(&d).contains("symlinks cannot be resolved"), "{d:?}");
+    } else {
+        assert_eq!(approved(&d), Some(RULE_READ_OUTSIDE_CWD), "{d:?}");
+    }
+}
+
+/// Every name is compared to the secret rules case-folded, as a case-insensitive volume opens it:
+/// MEASURED 2026-10-28 on this Mac's APFS, `cat` opens `.ſecrets/t`, `\u{212A}eychains` (the
+/// Kelvin sign), `.claude.jſon`, `.paßword-store` and `.conﬁg` as the ASCII names they fold to,
+/// and keeps `.confıg` and `.İconfig` apart from `.config`.
+#[test]
+fn a_case_folded_spelling_of_a_secret_is_not_read_only() {
+    for cmd in [
+        "cat ~/.\u{17F}sh/config",
+        "cat ~/.pa\u{DF}word-store/x.gpg",
+        "cat ~/.pa\u{1E9E}word-store/x.gpg",
+        "cat ~/.con\u{FB01}g/gh/hosts.yml",
+        "cat ~/.claude.j\u{17F}on",
+        "cat ~/.\u{17F}ecrets/t",
+        "cat /tmp/x/\u{212A}eychains/login.keychain-db",
+        "cat src/server.\u{212A}ey",
+        "cat src/id_r\u{17F}a",
+        "cat ~/.\u{17F}s?/config",
+        "cat ~/.con\u{FB01}?/gh/hosts.yml",
+        "cd ~/.\u{17F}ecrets && cat t",
+        "grep -r token ~/.con\u{FB01}g",
+        // Stricter than APFS: `ı` folds to `i` here.
+        "cat ~/.conf\u{131}g/gh/hosts.yml",
+    ] {
+        let d = on_screen(&bash_box(&[cmd], Some("Read it")), &git_host(ctx()));
+        assert!(reason(&d).contains("a read of a secret"), "{cmd}: {d:?}");
+    }
+    let home = Some(Path::new("/Users/_owner"));
+    let r = secrets_free(
+        &["cat ~/.\u{17F}sh/config".to_string()],
+        &default_secrets(home),
+        home,
+    );
+    assert!(
+        matches!(&r, Err(why) if why.contains("a read of a secret")),
+        "the rm breaker's: {r:?}"
+    );
+    // NEGATIVE CONTROL
+    for cmd in [
+        "cat ~/proj/na\u{EF}ve.txt",
+        "cat ~/proj/stra\u{DF}e.md",
+        "cat ~/proj/\u{FB01}le.txt",
+        "cat ~/.\u{17F}shrc",
+        "cat ~/.\u{130}config/gh/hosts.yml",
+    ] {
+        let d = on_screen(&bash_box(&[cmd], Some("Read it")), &git_host(ctx()));
+        assert_eq!(approved(&d), Some(RULE_READ_ONLY), "{cmd}: {d:?}");
+    }
 }
 
 #[test]
@@ -7716,7 +8540,7 @@ fn shell_word(dir: &Path) -> String {
 
 fn scratch_git(dir: &Path, args: &[&str]) {
     let out = aterm_uds::deadline::output_until(
-        aterm_uds::spawnfd::command(aterm_uds::os_path!("git"))
+        aterm_uds::spawnfd::command(crate::test_program::git())
             .args(args)
             .current_dir(dir)
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -7830,6 +8654,47 @@ fn a_git_read_is_judged_where_the_bash_tool_stands() {
     let _ = std::fs::remove_dir_all(&launch);
 }
 
+/// A git read after a `cd` is judged where that `cd` lands, its operand read as the secrets
+/// check reads it ([`cd_operand`]): after the options bash and zsh take and a `--`, so
+/// `cd -- ./-x` lands in `./-x`; a `cd` it cannot follow (a `-N` stack entry, an option it does not
+/// read, zsh's two-word `cd old new`, and a target a `CDPATH` may look up, as `cd -- -x`) refuses
+/// the git read.
+#[test]
+fn a_git_read_after_a_cd_is_judged_where_the_cd_lands() {
+    let base = scratch_repo("cd-lands");
+    let dashed = base.join("-x");
+    std::fs::create_dir_all(&dashed).expect("a directory named -x");
+    scratch_git(&dashed, &["init", "-q", "."]);
+    scratch_git(&dashed, &["config", "core.fsmonitor", "./evil.sh"]);
+    let c = ApprovalCtx {
+        approve: Approve::Safe,
+        ..ApprovalCtx::new(
+            base.clone(),
+            Some(PathBuf::from("/Users/_owner")),
+            502,
+            None,
+            std::sync::Arc::new(crate::supervise::policy::LiveProbe),
+        )
+    };
+    for (line, why) in [
+        ("cd -- ./-x && git status", "core.fsmonitor"),
+        ("cd -P -- ./-x && git status", "core.fsmonitor"),
+        ("cd -- -x && git status", "CDPATH"),
+        ("cd -1 && git status", "a git read after `cd -1`"),
+        ("cd -z x && git status", "a git read after `cd -z x`"),
+        ("cd a b && git status", "a git read after `cd a b`"),
+    ] {
+        let r = reason(&on_screen(&bash_box(&[line], None), &c)).to_string();
+        assert!(r.contains(why), "{line}: {r}");
+    }
+    // NEGATIVE CONTROL
+    for line in ["git status --short", "cd -P . && git status --short"] {
+        let d = on_screen(&bash_box(&[line], None), &c);
+        assert_eq!(approved(&d), Some(RULE_READ_ONLY), "{line}: {d:?}");
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 #[test]
 fn a_git_read_is_judged_in_the_workers_environment() {
     let repo = scratch_repo("worker-env");
@@ -7888,7 +8753,7 @@ fn a_worker_path_entry_the_worker_writes_is_refused_before_the_probe_runs_it() {
     )
     .expect("git");
     std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-    let real_path = std::env::var("PATH").unwrap_or_default();
+    let real_path = crate::supervise::policy::git_config::test_worker_path();
     let c = ApprovalCtx {
         approve: Approve::Safe,
         ..ApprovalCtx::new(

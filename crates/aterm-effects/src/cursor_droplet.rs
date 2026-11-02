@@ -89,7 +89,7 @@ impl Default for DropletFrame {
 /// The band of water-ramp positions whose colour keeps
 /// [`CARET_PAGE_MIN_CONTRAST`] against `ground`, as `(lo, hi)`.
 #[inline]
-fn ramp_band_on(ground: u32) -> (f32, f32) {
+const fn ramp_band_on(ground: u32, dark: bool) -> (f32, f32) {
     const REF_DARK_BAND: (f32, f32) = ramp_band_solve(crate::cursor_glow::REF_DARK_PAGE, true);
     const REF_WHITE_BAND: (f32, f32) = ramp_band_solve(0x00FF_FFFF, false);
     let ground = ground & 0x00FF_FFFF;
@@ -98,7 +98,7 @@ fn ramp_band_on(ground: u32) -> (f32, f32) {
     } else if ground == 0x00FF_FFFF {
         REF_WHITE_BAND
     } else {
-        ramp_band_solve(ground, aterm_render::theme_is_dark(ground))
+        ramp_band_solve(ground, dark)
     }
 }
 
@@ -241,9 +241,11 @@ impl CursorDroplet {
             None => 0.0,
         };
         self.last = Some(now);
-        self.slosh = (self.slosh + dt * (SLOSH_IDLE + SLOSH_ACTIVE * e)).fract();
-        self.ripple = (self.ripple + dt * (RIPPLE_IDLE + RIPPLE_ACTIVE * e)).fract();
-        self.drip = (self.drip + dt * (DRIP_IDLE + DRIP_ACTIVE * e)).fract();
+        if dt > 0.0 {
+            self.slosh = (self.slosh + dt * (SLOSH_IDLE + SLOSH_ACTIVE * e)).fract();
+            self.ripple = (self.ripple + dt * (RIPPLE_IDLE + RIPPLE_ACTIVE * e)).fract();
+            self.drip = (self.drip + dt * (DRIP_IDLE + DRIP_ACTIVE * e)).fract();
+        }
         let phase = self.slosh * std::f32::consts::TAU;
         let (phase_sin, phase_cos) = crate::supernova::sin_cos_f32(phase);
         let shimmer =
@@ -264,7 +266,7 @@ impl CursorDroplet {
                 let (lo, hi) = match self.band_memo {
                     Some((g, band)) if g == ground => band,
                     _ => {
-                        let band = ramp_band_on(ground);
+                        let band = ramp_band_on(ground, dark);
                         self.band_memo = Some((ground, band));
                         band
                     }
@@ -399,6 +401,11 @@ impl CursorDroplet {
         // below (the ripple on the selected line under the prompt), so both
         // are cut at the row's foot, the water's surface: the near side of a
         // ring is under it, and a drop falls through it.
+        let foot = i32::from(geom.origin_y) + (i32::from(cr) + 1) * ch as i32;
+        #[cfg(test)]
+        let cut_surface = !self.uncut;
+        #[cfg(not(test))]
+        let cut_surface = true;
         let surface_from = out.len();
         let cov_ring_scale = cov_core * 0.55 * e;
         if cov_ring_scale >= 1.0 {
@@ -419,16 +426,13 @@ impl CursorDroplet {
                 let rx = radius * (0.9 + RIPPLE_REACH * u);
                 let ry = (rx * 0.22).max(2.0);
                 let thick = (rx * 0.12).max(1.5);
+                if cut_surface && (y0 - ry - thick * 0.5).floor() as i32 >= foot {
+                    continue;
+                }
                 let ring = premul_rgb(ring_rgb, cov);
                 push_ripple_ring(out, geom, (cx, y0), (rx, ry), thick, ring);
             }
         }
-
-        let foot = i32::from(geom.origin_y) + (i32::from(cr) + 1) * ch as i32;
-        #[cfg(test)]
-        let cut_surface = !self.uncut;
-        #[cfg(not(test))]
-        let cut_surface = true;
         const DRIP_BODY_RGB: u32 = water_ramp(0.68);
         let belly = cy + radius * 0.80;
         let body = DRIP_BODY_RGB;

@@ -326,9 +326,14 @@ pub fn decode_tail_payload<'a>(
             if [p0, p1, p2, p3] != [0; 4] {
                 return Err(TailFault::BadFlags);
             }
+            let rows = u16::from_le_bytes([r0, r1]);
+            let cols = u16::from_le_bytes([c0, c1]);
+            if rows == 0 || cols == 0 || rows > MAX_GRID_ROWS || cols > MAX_GRID_COLS {
+                return Err(TailFault::BadLength);
+            }
             Ok(TailRecord::Resize {
-                rows: u16::from_le_bytes([r0, r1]),
-                cols: u16::from_le_bytes([c0, c1]),
+                rows,
+                cols,
                 policy,
                 lifetime: u64::from_le_bytes([l0, l1, l2, l3, l4, l5, l6, l7]),
                 ordinal: u64::from_le_bytes([o0, o1, o2, o3, o4, o5, o6, o7]),

@@ -443,10 +443,20 @@ fn x4_an_ask_deduped_onto_a_note_records_no_expired() {
     eprintln!("expired re=<note off> on A's lane: {n}; ask records on B's lane: {b_asks}");
     assert_eq!(b_asks, 1, "only the control ask was ever published");
     assert_eq!(n, 0, "no expired verdict for a note that never waited");
-    let dl = std::fs::read_to_string(w.state.join("deadlines")).unwrap_or_default();
+    let standing = off_of(
+        w.verb(&format!(
+            "@{a} post to=@{b} kind=ask dl=3600000 --wait=60000 standing"
+        ))
+        .header(),
+    );
+    let held = aterm_link::state::StateDir::peek(&w.state).deadlines();
     assert!(
-        !dl.contains(&format!("off={x} ")),
-        "no deadline was ever held for the note's offset: {dl:?}"
+        held.iter().any(|deadline| deadline.off == standing),
+        "CONTROL: this read sees a deadline the running bridge holds: {held:?}"
+    );
+    assert!(
+        held.iter().all(|deadline| deadline.off != x),
+        "no deadline is held for the note's offset: {held:?}"
     );
 }
 

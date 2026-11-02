@@ -23,7 +23,12 @@ fn run_gap_ms() -> u64 {
     static GAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *GAP.get_or_init(|| {
         aterm_types::dev_seam!("ATERM_RESIZE_RUN_GAP_MS")
-            .and_then(|v| v.to_str()?.parse().ok())
+            .and_then(|v| {
+                let s = v.to_str()?;
+                (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                    .then(|| s.parse().ok())
+                    .flatten()
+            })
             .unwrap_or(RUN_GAP_MS)
     })
 }
@@ -121,25 +126,6 @@ impl SiteScope {
     pub(crate) fn current() -> Option<Site> {
         SCOPE.with(Cell::get)
     }
-}
-
-#[cfg(test)]
-thread_local! {
-    static CHROME_REGRID_SITES: std::cell::RefCell<Vec<Option<Site>>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// Record the site the every-window chrome re-grid is running under.
-#[cfg(test)]
-pub(crate) fn note_chrome_regrid_site_for_test() {
-    let site = SiteScope::current();
-    CHROME_REGRID_SITES.with(|s| s.borrow_mut().push(site));
-}
-
-/// The sites recorded since the last take, oldest first.
-#[cfg(test)]
-pub(crate) fn take_chrome_regrid_sites_for_test() -> Vec<Option<Site>> {
-    CHROME_REGRID_SITES.with(|s| std::mem::take(&mut *s.borrow_mut()))
 }
 
 impl Drop for SiteScope {
@@ -1198,11 +1184,17 @@ pub(crate) fn cmd_resizes(
     let mut since: Option<u64> = None;
     for tok in rest.split_whitespace() {
         if let Some(v) = tok.strip_prefix("since=") {
-            match v.parse::<u64>() {
-                Ok(id) => since = Some(id),
-                Err(_) => return USAGE.to_string(),
+            match (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| v.parse::<u64>().ok())
+                .flatten()
+            {
+                Some(id) => since = Some(id),
+                None => return USAGE.to_string(),
             }
-        } else if let Ok(v) = tok.parse::<usize>() {
+        } else if !tok.is_empty()
+            && tok.bytes().all(|b| b.is_ascii_digit())
+            && let Ok(v) = tok.parse::<usize>()
+        {
             n = v;
         } else {
             return USAGE.to_string();
@@ -1991,52 +1983,6 @@ mod tests {
         });
         assert!(unwound.is_err());
         assert_eq!(SiteScope::current(), None, "an unwind leaves the scope");
-    }
-
-    #[test]
-    fn the_bands_and_the_strips_regrid_is_booked_as_chrome_from_the_line_that_asked() {
-        let mut app = crate::App::headless_for_test();
-        let _ = take_chrome_regrid_sites_for_test();
-        let line = line!() + 1;
-        app.regrid_for_chrome_rows();
-        match take_chrome_regrid_sites_for_test().as_slice() {
-            [
-                Some(Site::Caller {
-                    cause: Cause::Chrome,
-                    at,
-                }),
-            ] => assert_eq!((at.file(), at.line()), (file!(), line)),
-            other => panic!("{other:?}"),
-        }
-        assert_eq!(SiteScope::current(), None, "left on return");
-        let now = std::time::Instant::now();
-        let msg = aterm_messages::Message::new(
-            aterm_messages::tags::CONFIG,
-            aterm_messages::Severity::Warn,
-            "Disk nearly full",
-        )
-        .now(aterm_messages::need::Ask::flash(
-            aterm_messages::need::Why::OnlyYou(aterm_messages::need::Reason::new(
-                "the disk is nearly full",
-            )),
-            aterm_messages::need::Then::step("Free some space"),
-            aterm_messages::need::Span::Ten,
-        ));
-        let stamp = aterm_messages::WallStamp {
-            unix_ms: 1_790_000_000_000,
-        };
-        let _ = app.messages.post(msg, stamp, now);
-        let _ = app.settle_messages(now);
-        assert_eq!(app.message_band_rows, 1, "the row reached the glass");
-        match take_chrome_regrid_sites_for_test().as_slice() {
-            [
-                Some(Site::Caller {
-                    cause: Cause::Chrome,
-                    at,
-                }),
-            ] => assert!(at.file().ends_with("messages_host.rs"), "{at}"),
-            other => panic!("{other:?}"),
-        }
     }
 
     #[test]

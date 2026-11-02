@@ -71,14 +71,14 @@ pub fn line_cells_tail(
     } else {
         -1i64
     };
-    let bias = i128::from(major.saturating_sub(1)) / 2;
-    let major128 = i128::from(major);
-    let start128 = i128::from(start);
+    let major64 = major as u64;
+    let bias = major64.saturating_sub(1) / 2;
+    let start64 = start as u64;
 
     if dc >= dr {
-        let num0 = start128 * i128::from(dr) + bias;
-        let mut r = i64::from(origin.0) + sr * ((num0 / major128) as i64);
-        let mut rem = (num0 % major128) as i64;
+        let num0 = start64 * (dr as u64) + bias;
+        let mut r = i64::from(origin.0) + sr * ((num0 / major64) as i64);
+        let mut rem = (num0 % major64) as i64;
         let mut c = i64::from(origin.1) + sc * start;
         let mut idx = start;
         while idx < available {
@@ -92,10 +92,10 @@ pub fn line_cells_tail(
             idx += 1;
         }
     } else {
-        let num0 = start128 * i128::from(dc) + bias;
+        let num0 = start64 * (dc as u64) + bias;
         let mut r = i64::from(origin.0) + sr * start;
-        let mut c = i64::from(origin.1) + sc * ((num0 / major128) as i64);
-        let mut rem = (num0 % major128) as i64;
+        let mut c = i64::from(origin.1) + sc * ((num0 / major64) as i64);
+        let mut rem = (num0 % major64) as i64;
         let mut idx = start;
         while idx < available {
             out.push((r as i32, c as i32));

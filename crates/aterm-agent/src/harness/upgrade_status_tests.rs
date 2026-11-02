@@ -1200,7 +1200,7 @@ fn jobs_on_a_tty(
         exe.display()
     );
     let pid_file = dir.join("back.pid");
-    let mut shell = std::process::Command::new("/bin/sh");
+    let mut shell = std::process::Command::new(crate::test_program::kept("/bin/sh"));
     shell
         .inherit_nothing()
         .args([
@@ -1856,7 +1856,7 @@ fn a_restarts_agent_no_look_saw_gone_is_read_gone_by_the_process_table() {
     }];
     let nobody = |_: &BTreeSet<String>| -> Option<Vec<Holder>> { Some(Vec::new()) };
     let gone = {
-        let mut child = aterm_uds::spawnfd::command("/usr/bin/true")
+        let mut child = aterm_uds::spawnfd::command(crate::test_program::kept("/usr/bin/true"))
             .spawn()
             .expect("spawn /usr/bin/true");
         let pid = child.id();
@@ -1931,7 +1931,7 @@ fn a_slow_shutdown_just_ended_in_a_watched_tab_is_its_carrys_to_relaunch() {
     }];
     let nobody = |_: &BTreeSet<String>| -> Option<Vec<Holder>> { Some(Vec::new()) };
     let gone = {
-        let mut child = aterm_uds::spawnfd::command("/usr/bin/true")
+        let mut child = aterm_uds::spawnfd::command(crate::test_program::kept("/usr/bin/true"))
             .spawn()
             .expect("spawn /usr/bin/true");
         let pid = child.id();
@@ -2024,7 +2024,7 @@ fn a_restarts_agent_the_process_table_says_gone_is_never_said_still_shutting_dow
     }];
     let nobody = |_: &BTreeSet<String>| -> Option<Vec<Holder>> { Some(Vec::new()) };
     let gone = {
-        let mut child = aterm_uds::spawnfd::command("/usr/bin/true")
+        let mut child = aterm_uds::spawnfd::command(crate::test_program::kept("/usr/bin/true"))
             .spawn()
             .expect("spawn /usr/bin/true");
         let pid = child.id();
@@ -2109,7 +2109,9 @@ fn a_press_closes_a_restart_its_tab_overtook_and_lands() {
     const A: &str = "aaaaaaaa-1111-2222-3333-444455556666";
     const B: &str = "bbbbbbbb-1111-2222-3333-444455556666";
     let dead = {
-        let mut child = aterm_uds::spawnfd::command("true").spawn().expect("spawn");
+        let mut child = aterm_uds::spawnfd::command(crate::test_program::kept("/usr/bin/true"))
+            .spawn()
+            .expect("spawn");
         let pid = child.id();
         child.wait().expect("reap");
         pid
@@ -2193,7 +2195,7 @@ fn a_restart_down_in_flight_is_lowered_once_its_conversation_is_live_again() {
     let session = "0badf00d-1111-2222-3333-444455556666";
     let other = "11112222-3333-4444-5555-666677778888";
     let gone = {
-        let mut child = aterm_uds::spawnfd::command("/usr/bin/true")
+        let mut child = aterm_uds::spawnfd::command(crate::test_program::kept("/usr/bin/true"))
             .spawn()
             .expect("spawn /usr/bin/true");
         let pid = child.id();
@@ -6132,6 +6134,72 @@ fn next_attention_at_names_every_change_by_time() {
     assert!(rows > 500, "{rows} rows swept");
 }
 
+#[test]
+fn next_attention_at_names_progress_quiet_limit_defer_and_unwatched_edges() {
+    let rearmed = Row {
+        phase: Phase::Pending,
+        minted_at: NOW - 2 * BACKSTOP_S,
+        progress_at: NOW - 3_600,
+        wait: "attended".into(),
+        wait_since: NOW - 60,
+        ..pending(2 * BACKSTOP_S)
+    };
+    assert_eq!(rearmed.attention(NOW), Attention::Quiet);
+    let backstop_at = rearmed.progress_at + BACKSTOP_S;
+    assert_eq!(rearmed.next_attention_at(NOW), Some(backstop_at));
+    assert_eq!(
+        rearmed.attention(backstop_at).level(),
+        Level::Fault("no-progress")
+    );
+
+    let quiet_limited = Row {
+        phase: Phase::Pending,
+        quiet: true,
+        wait: "limited".into(),
+        wait_since: NOW - 3_600,
+        limit_until: NOW - LIMIT_GRACE_S,
+        ..pending(3_600)
+    };
+    assert_eq!(quiet_limited.attention(NOW), Attention::Quiet);
+    let limit_at = quiet_limited.limit_until + LIMIT_GRACE_S + QUIET_MOVE_S;
+    assert_eq!(quiet_limited.next_attention_at(NOW), Some(limit_at));
+    assert_eq!(
+        quiet_limited.attention(limit_at).level(),
+        Level::Fault("limit-passed")
+    );
+
+    let defer_until = NOW + 1_200;
+    let deferred_failed = Row {
+        phase: Phase::Failed("not-a-shell-job".into()),
+        request: Request::DeferUntil(defer_until),
+        ..pending(3_600)
+    };
+    assert_eq!(deferred_failed.attention(NOW), Attention::Quiet);
+    assert_eq!(deferred_failed.next_attention_at(NOW), Some(defer_until));
+    assert_eq!(
+        deferred_failed.attention(defer_until).level(),
+        Level::Digest("refused-launch")
+    );
+    assert_eq!(
+        next_change(std::slice::from_ref(&deferred_failed), NOW),
+        Some(defer_until)
+    );
+
+    let unwatched_row = Row {
+        phase: Phase::Pending,
+        watch_at: NOW - super::super::WATCH_GAP,
+        looked_at: NOW - UNWATCHED_AFTER_S,
+        awake_since: NOW - WAKE_GRACE_S,
+        ..pending(3_600)
+    };
+    assert_eq!(unwatched_row.attention(NOW), Attention::Quiet);
+    assert_eq!(unwatched_row.next_attention_at(NOW), Some(NOW + 1));
+    assert_eq!(
+        unwatched_row.attention(NOW + 1).level(),
+        Level::Fault("unwatched")
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn a_mark_on_a_tab_left_as_it_stands_stays() {
@@ -8432,6 +8500,23 @@ fn a_recorded_line_ending_cd_reads_to_its_end_and_the_view_stands() {
         .as_deref(),
         Some("/l")
     );
+    assert_eq!(
+        resume_login(&format!(
+            "{LOGIN_ENV}='/old' {LOGIN_ENV}='/new' claude --resume a"
+        ))
+        .as_deref(),
+        Some("/new")
+    );
+    assert_eq!(
+        launch_of("claude --append-system-prompt --resume --permission-mode auto --resume a"),
+        Some(vec![
+            "claude".to_string(),
+            "--append-system-prompt".to_string(),
+            "--resume".to_string(),
+            "--permission-mode".to_string(),
+            "auto".to_string(),
+        ])
+    );
     let tabs = [LiveTab {
         sid: TAB.to_string(),
         fgpgid: Some(7),
@@ -9012,5 +9097,59 @@ fn a_stop_for_a_resume_by_someone_else_reads_as_its_own() {
         unnamed,
         stop_words(claude, "another-stop-nobody-named"),
         "control: the words for a stop nobody named"
+    );
+}
+
+/// The owner's press word reads the window's claims under the claims read's own bound, the
+/// `version` probe before it too, whatever the drive's bound: a window that never answers the
+/// probe sets nothing aside, so the word thread goes on; an answered roster is read (lanes:H9).
+#[test]
+fn the_press_words_claims_read_bounds_its_probe() {
+    let dir = ScratchDir::new("upgrade-status", "claims-probe");
+    let read = |what: &str, sock: String| {
+        let opts = Opts {
+            sock: Some(sock),
+            token: Some(super::super::HarnessToken::new("claims-tok")),
+            timings: crate::harness::Timings {
+                drive_reply: 2 * aterm_spec::wait::MUST_HAPPEN,
+                ..crate::harness::Timings::FAST
+            },
+            ..opts(&dir)
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(aside_tabs(&opts, true));
+        });
+        rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .unwrap_or_else(|_| panic!("{what}: no claims within the hang detector"))
+    };
+    let mute_dir = dir.join("mute");
+    std::fs::create_dir_all(&mute_dir).expect("mute");
+    let (mute, _asked) =
+        crate::harness::fake_instance(&mute_dir.join("c.sock"), "claims-tok", |_| {
+            crate::harness::UNANSWERED.to_string()
+        });
+    assert_eq!(
+        read("the unanswered probe", mute),
+        Aside::default(),
+        "an unanswered probe sets nothing aside"
+    );
+    let live_dir = dir.join("live");
+    std::fs::create_dir_all(&live_dir).expect("live");
+    let (live, _asked) =
+        crate::harness::fake_instance(&live_dir.join("c.sock"), "claims-tok", |l| match l {
+            "version" => "OK version 0".to_string(),
+            "sessions" => format!(
+                "OK 1\n1 {TAB} - live claude meta=1 window=1 supervisor=- autopilot=off upgrade=-"
+            ),
+            _ => crate::harness::UNANSWERED.to_string(),
+        });
+    assert_eq!(
+        read("the answered roster", live),
+        Aside {
+            off: [TAB.to_string()].into(),
+            ..Aside::default()
+        },
+        "an answered roster is read"
     );
 }

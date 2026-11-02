@@ -9,8 +9,20 @@ use super::Line;
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn serialize_lines(lines: &[Line]) -> Vec<u8> {
+    serialize_line_refs(lines.iter())
+}
+
+/// Serialize borrowed and owned lines in the same wire format as [`serialize_lines`].
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn serialize_line_views(lines: &[std::borrow::Cow<'_, Line>]) -> Vec<u8> {
+    serialize_line_refs(lines.iter().map(std::borrow::Cow::as_ref))
+}
+
+#[cfg_attr(trust_verify, trust::skip)]
+fn serialize_line_refs<'a>(lines: impl Clone + ExactSizeIterator<Item = &'a Line>) -> Vec<u8> {
     let estimate = lines
-        .iter()
+        .clone()
         .map(Line::serialized_size_estimate)
         .fold(4usize, usize::saturating_add);
     let mut result = if estimate < crate::codec::MAX_DECOMPRESSED_SCROLLBACK_PAGE_BYTES {

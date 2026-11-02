@@ -1,13 +1,23 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Lane transcripts, table formatting, and once-per-day notifications.
+//! Lane transcripts, table formatting, and deduplicated journal entries.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{Error, Result};
+
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn unique_tmp(path: &Path) -> PathBuf {
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".tmp.{}.{seq}", std::process::id()));
+    PathBuf::from(tmp)
+}
 
 /// Maximum log size before trimming to [`LOG_KEEP`] bytes.
 pub const LOG_MAX: u64 = 8 * 1024 * 1024;
@@ -103,10 +113,10 @@ impl Transcript {
 }
 
 fn trim_log(path: &Path) {
-    let Ok(meta) = std::fs::metadata(path) else {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
         return;
     };
-    if meta.len() <= LOG_MAX {
+    if !meta.is_file() || meta.len() <= LOG_MAX {
         return;
     }
     let Ok(bytes) = std::fs::read(path) else {
@@ -114,55 +124,37 @@ fn trim_log(path: &Path) {
     };
     let keep = usize::try_from(LOG_KEEP).unwrap_or(usize::MAX);
     let tail = &bytes[bytes.len().saturating_sub(keep)..];
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-    if std::fs::write(&tmp, tail).is_ok() {
-        let _ = std::fs::rename(&tmp, path);
+    let tmp = unique_tmp(path);
+    let _ = std::fs::remove_file(&tmp);
+    if std::fs::write(&tmp, tail).is_err() || std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
-/// Shows a person one line, out of band.
-pub trait Notifier {
-    /// Show `title`: `message`. Best effort: a notifier that cannot show it says nothing.
-    fn notify(&self, title: &str, message: &str);
+/// Records one publication notice.
+pub trait NoticeSink {
+    /// Record `title`: `message` without asking for attention.
+    fn record(&self, title: &str, message: &str);
 }
 
-/// macOS Notification Center through `osascript`; nothing elsewhere.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Osascript;
+/// Appends publication notices to the lane's existing transcript.
+#[derive(Clone, Copy, Debug)]
+pub struct Journal<'a>(pub &'a Transcript);
 
-impl Notifier for Osascript {
-    fn notify(&self, title: &str, message: &str) {
-        if !cfg!(target_os = "macos") {
-            return;
-        }
-        let clean = |s: &str| -> String {
-            s.chars()
-                .filter(|c| *c != '"' && *c != '\\')
-                .take(200)
-                .collect()
-        };
-        let script = format!(
-            "display notification \"{}\" with title \"{}\"",
-            clean(message),
-            clean(title)
-        );
-        let _ = aterm_uds::spawnfd::command(aterm_uds::os_path!("osascript"))
-            .arg("-e")
-            .arg(script)
-            .output();
+impl NoticeSink for Journal<'_> {
+    fn record(&self, title: &str, message: &str) {
+        self.0.say(format!("{title}: {message}"));
     }
 }
 
-/// A notifier that records (tests).
+/// A journal sink that records in memory (tests).
 #[derive(Debug, Default)]
 pub struct Recorded(Mutex<Vec<String>>);
 
 impl Recorded {
-    /// Every message shown, in order.
+    /// Every message recorded, in order.
     #[must_use]
-    pub fn shown(&self) -> Vec<String> {
+    pub fn entries(&self) -> Vec<String> {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -170,8 +162,8 @@ impl Recorded {
     }
 }
 
-impl Notifier for Recorded {
-    fn notify(&self, _title: &str, message: &str) {
+impl NoticeSink for Recorded {
+    fn record(&self, _title: &str, message: &str) {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -187,9 +179,9 @@ pub fn utc_day(now_unix: i64) -> String {
     stamp[..10].replace('-', "")
 }
 
-/// Show `message` unless it was already shown on this UTC day.
-pub fn notify_once(
-    notifier: &dyn Notifier,
+/// Record `message` unless it was already recorded on this UTC day.
+pub fn record_once(
+    notifier: &dyn NoticeSink,
     title: &str,
     dir: &Path,
     now_unix: i64,
@@ -210,7 +202,10 @@ pub fn notify_once(
         for e in entries.flatten() {
             let name = e.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with("notified-") && *name != *format!("notified-{day}") {
+            if name.starts_with("notified-")
+                && *name != *format!("notified-{day}")
+                && e.file_type().is_ok_and(|ft| ft.is_file())
+            {
                 let _ = std::fs::remove_file(e.path());
             }
         }
@@ -221,7 +216,7 @@ pub fn notify_once(
         .append(true)
         .open(&file)
         .and_then(|mut f| writeln!(f, "{message}"));
-    notifier.notify(title, &message);
+    notifier.record(title, &message);
 }
 
 /// Render rows as aligned columns: two spaces between, the last column unpadded.
@@ -259,14 +254,28 @@ pub fn columns(rows: &[Vec<String>]) -> Vec<String> {
 ///
 /// A could-not-run naming the file.
 pub fn write_atomic(path: &Path, text: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
+    write_atomic_bytes(path, text.as_bytes())
+}
+
+/// Write `bytes` to `path` through a temp file and a rename, so a reader never sees half
+/// and an existing symlink at `path` is replaced rather than followed.
+///
+/// # Errors
+///
+/// A could-not-run naming the file.
+pub fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)
             .map_err(|e| Error::io(format!("mkdir {}", parent.display()), &e))?;
     }
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-    std::fs::write(&tmp, text).map_err(|e| Error::io(format!("write {}", tmp.display()), &e))?;
-    std::fs::rename(&tmp, path)
-        .map_err(|e| Error::io(format!("rename {} into place", path.display()), &e))
+    let tmp = unique_tmp(path);
+    let _ = std::fs::remove_file(&tmp);
+    std::fs::write(&tmp, bytes).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        Error::io(format!("write {}", tmp.display()), &e)
+    })?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        Error::io(format!("rename {} into place", path.display()), &e)
+    })
 }

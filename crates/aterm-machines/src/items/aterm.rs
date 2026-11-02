@@ -185,7 +185,7 @@ pub fn is_version(v: &str) -> bool {
 pub fn at_least(have: &str, want: &str) -> bool {
     let nums = |s: &str| {
         s.split('.')
-            .map(|p| p.parse::<u64>().ok())
+            .map(crate::parse_uint::<u64>)
             .collect::<Option<Vec<u64>>>()
     };
     match (nums(have), nums(want)) {
@@ -855,7 +855,7 @@ fn ac_sleep_minutes(sys: &dyn System) -> Result<u64, Probe> {
             why: "this Mac's AC Power profile has no `sleep` setting".to_owned(),
         });
     };
-    value.parse().map_err(|_| Probe::Unusable {
+    crate::parse_uint(value).ok_or_else(|| Probe::Unusable {
         why: format!("`pmset -g custom` gave sleep {value:?}, not a number"),
     })
 }
@@ -1299,10 +1299,7 @@ mod tests {
     fn an_older_aterm_that_is_running_waits_for_an_idle_mac() {
         let sys = Fake::root();
         installed(&sys, "0.103.0", 501);
-        sys.on(
-            "/usr/bin/pgrep -f '/Applications/aterm\\.app/Contents/MacOS/'",
-            ok("5295\n"),
-        );
+        sys.running(&["/Applications/aterm.app/Contents/MacOS/aterm"]);
         let ctx = ctx_with(&sys, &[(ZIP_SHA, b"zip")], false);
         let items = expand(&table(), &ctx).unwrap();
         assert!(matches!(items[0].probe(&sys, &ctx), Probe::Deferred { .. }));

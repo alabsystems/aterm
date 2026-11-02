@@ -272,7 +272,11 @@ fn is_banner(line: &str) -> bool {
 
 /// A line that says what went wrong, as compilers, guards and test harnesses write one.
 fn is_error(line: &str) -> bool {
-    let t = line.trim_start();
+    // A census or forge row marks its failure `✗ FAIL …`, the line that names its fix.
+    let t = line
+        .trim_start()
+        .trim_start_matches('\u{2717}')
+        .trim_start();
     ["error", "ERROR", "fatal", "FAIL", "COULD NOT RUN"]
         .iter()
         .any(|p| t.starts_with(p))
@@ -446,5 +450,24 @@ mod tests {
             "an error cargo printed twice is shown once"
         );
         assert_eq!(excerpt("", 4), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_rows_marked_failure_is_in_the_excerpt() {
+        let forge = "      \u{2713} [OB-6] held\n\
+                     \x20     \u{2717} FAIL [OB-7] `a.rs` has no notice. FIX: add one.\n\
+                     \x20       [OB-7] scope: forks\n      \u{2713} [OB-8] held\n\
+                     \x20   cargo forge attest: FAILED \u{2014} 1 obligation violation(s).\n";
+        assert_eq!(
+            excerpt(forge, 12),
+            [
+                "      \u{2713} [OB-6] held",
+                "      \u{2717} FAIL [OB-7] `a.rs` has no notice. FIX: add one.",
+                "        [OB-7] scope: forks",
+                "      \u{2713} [OB-8] held",
+                "    cargo forge attest: FAILED \u{2014} 1 obligation violation(s).",
+            ],
+            "the row that names the fix is shown, not only the tally after it"
+        );
     }
 }

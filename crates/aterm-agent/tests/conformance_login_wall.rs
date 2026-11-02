@@ -398,6 +398,7 @@ fn first_wall(s: &S, st: &mut TurnEndState) -> TurnEndReading {
         assert!(st.seed_task_done(), "a task done at {s:?}");
         TurnEndReading {
             person: Some(Duration::from_secs(2)),
+            key: Some(Duration::from_secs(2)),
             ..reading(&with_tail(&[WALL_ROW]), None)
         }
     } else {
@@ -436,6 +437,7 @@ fn advised(st: &TurnEndState, renewed: bool, r: TurnEndReading) -> TurnEndReadin
     TurnEndReading {
         account: (renewed && asked).then(|| AccountAdvice::Move {
             to: LABEL.to_string(),
+            yields: None,
         }),
         ..r
     }
@@ -571,6 +573,7 @@ fn settled_at(
             let waited = until - now;
             let aged = TurnEndReading {
                 person: r.person.map(|ago| ago + waited),
+                key: r.key.map(|ago| ago + waited),
                 ..r.clone()
             };
             (decide_turn_end(st, &aged, cfg, until), aged, until)
@@ -613,16 +616,11 @@ fn tells_now(e: Option<&Exception>) -> Option<&'static str> {
 
 fn picks(known: bool) -> bool {
     let rows = screen(LOGIN_PICKER);
-    let read = aterm_phase::read(Some("claude"), &rows, Some(2));
-    let prompt = read.prompt.expect("the picker is a prompt");
     let Some(LoginScreen::Picker(picker)) = aterm_phase::login_screen(&rows) else {
         panic!("the measured picker reads as the picker");
     };
     let method = known.then_some(LoginMethod::Subscription);
-    matches!(
-        pick_method(&prompt, &picker, method),
-        Decision::Approve { .. }
-    )
+    matches!(pick_method(&picker, method), Decision::Approve { .. })
 }
 
 const SUPERVISOR_VARS: [&str; 9] = [
@@ -863,6 +861,7 @@ fn defective() -> Vec<(&'static str, Model)> {
         ("Buggy6", aterm_spec::interp::with_buggy(&model, 6)),
         ("Buggy7", aterm_spec::interp::with_buggy(&model, 7)),
         ("Buggy8", aterm_spec::interp::with_buggy(&model, 8)),
+        ("Buggy9", aterm_spec::interp::with_buggy(&model, 9)),
     ]
     .into_iter()
     .chain(
@@ -889,6 +888,7 @@ fn defective() -> Vec<(&'static str, Model)> {
             "SignInOverRenewed",
             "SignInAsRow",
             "AskToClose",
+            "OpenBrowser",
         ]
         .into_iter()
         .map(|knob| (knob, aterm_spec::interp::with_consts(&model, &[(knob, 1)]))),
@@ -905,7 +905,11 @@ fn the_real_code_conforms_to_the_login_wall_model() {
     let mut taken = BTreeSet::new();
     let renew_clean = real_renewal_is_clean();
     let picked = [picks(false), picks(true)];
-    assert_eq!(picked, [false, true], "the method known, and only then");
+    assert_eq!(
+        picked,
+        [false, false],
+        "no method picked, known or not: the pick opens the browser"
+    );
     assert!(
         renew_clean,
         "the real renewal checks its staging home alone"
@@ -965,7 +969,6 @@ fn the_real_code_conforms_to_the_login_wall_model() {
             "Follow",
             "BackOut",
             "TellNow",
-            "PickMethod",
             "Renew",
         ]),
         "every decision of the real code is taken somewhere"

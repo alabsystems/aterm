@@ -213,6 +213,8 @@ pub(crate) struct SpawnAsk {
     pub(crate) observe: Option<aterm_session::SessionId>,
     /// Worker task file seed (`ATERM_TASK_FILE`), cleaned up on failure.
     pub(crate) task: Option<crate::task_launch::TaskSeed>,
+    /// A driver-owned plain shell: clear a global command and require the explicit cwd.
+    pub(crate) shell: bool,
     /// Land a new tab behind the active tab without moving focus.
     pub(crate) background: bool,
     /// A tab nobody asked for (System State's Command Line Tools install,
@@ -224,6 +226,13 @@ pub(crate) struct SpawnAsk {
 }
 
 impl SpawnAsk {
+    /// A remote driver's fresh shell never holds the person's input to its hosting window.
+    pub(crate) fn for_fleet_shell(mut self) -> Self {
+        self.shell = true;
+        self.unasked = true;
+        self
+    }
+
     /// A plain ask inheriting the focused pane's folder unless named.
     pub(crate) fn new(cwd: Option<&str>) -> Self {
         Self {
@@ -242,16 +251,27 @@ impl SpawnAsk {
 }
 
 /// Capture this request's program without changing the factory other tabs inherit.
+/// A worker clears the inherited command; an explicit command always wins.
 fn tab_spawn_factory(
     mut factory: crate::spawn::SessionFactory,
     exec_command: Option<Vec<std::ffi::OsString>>,
+    own_shell: bool,
 ) -> crate::spawn::SessionFactory {
     if let Some(command) = exec_command {
         factory.exec_command = Some(command);
         factory.integrate = false;
+    } else if own_shell {
+        // A requested worker gets its own shell, not the host instance's `-e` command.
+        // The explicit --no-shell-integration policy remains the factory's.
+        factory.exec_command = None;
     }
     factory.reader_after_install = true;
     factory
+}
+
+/// A plain drive owns a new shell, not an idle spare with another session's history.
+fn can_adopt_spare(ask: &SpawnAsk) -> bool {
+    ask.task.is_none() && !ask.shell
 }
 
 /// Result returned by the spawner thread ([`crate::Wake::TabSpawned`]).
@@ -1180,7 +1200,7 @@ impl App {
         let inherited = self.inherited_theme(window, place, ask.theme.as_ref());
         let tried = if inherited.is_some() {
             Err("theme")
-        } else if ask.task.is_some() {
+        } else if !can_adopt_spare(&ask) {
             Err("ask")
         } else {
             self.try_adopt_spare(window, place.asked_from(window), grid, &ask)
@@ -1200,6 +1220,7 @@ impl App {
             folder_of,
             observe,
             task,
+            shell,
             background,
             unasked,
             theme,
@@ -1270,7 +1291,12 @@ impl App {
         } else {
             Vec::new()
         };
-        let factory = tab_spawn_factory(self.session_factory.clone(), exec_command);
+        let mut factory = tab_spawn_factory(
+            self.session_factory.clone(),
+            exec_command,
+            task.is_some() || shell,
+        );
+        factory.require_cwd = shell;
         #[cfg(windows)]
         let factory = {
             let mut factory = factory;
@@ -2068,6 +2094,7 @@ pub(crate) mod test_support {
         let id = book(app, wid, then);
         if let Some(booked) = app.tab_spawns.in_flight.iter_mut().find(|t| t.id == id) {
             booked.unasked = ask.unasked;
+            booked.background = ask.background;
         }
         id
     }
@@ -2153,7 +2180,7 @@ pub(crate) mod tests {
             OsString::from("argument with spaces"),
             OsString::from_vec(vec![b'a', 0xff]),
         ];
-        let explicit = tab_spawn_factory(app.session_factory.clone(), Some(command.clone()));
+        let explicit = tab_spawn_factory(app.session_factory.clone(), Some(command.clone()), false);
         assert_eq!(explicit.exec_command.as_ref(), Some(&command));
         assert!(explicit.reader_after_install);
         assert!(!explicit.integrate);
@@ -2161,15 +2188,75 @@ pub(crate) mod tests {
         assert!(!app.session_factory.reader_after_install);
         assert!(app.session_factory.integrate);
 
-        let ordinary = tab_spawn_factory(app.session_factory.clone(), None);
+        let ordinary = tab_spawn_factory(app.session_factory.clone(), None, false);
         assert_eq!(ordinary.exec_command.as_ref(), Some(&inherited));
         assert!(ordinary.reader_after_install);
         assert!(ordinary.integrate);
         app.session_factory.exec_command = None;
         assert!(
-            tab_spawn_factory(app.session_factory.clone(), None)
+            tab_spawn_factory(app.session_factory.clone(), None, false)
                 .exec_command
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn a_worker_uses_its_own_integrated_shell_without_changing_the_command_instance() {
+        use std::ffi::OsString;
+
+        let mut app = App::headless_for_test();
+        let command = vec![OsString::from("/bin/cat")];
+        app.session_factory.exec_command = Some(command.clone());
+        app.session_factory.integrate = true;
+        app.session_factory.shell_override = Some("/bin/zsh".into());
+        app.session_factory.shell_args = Some(vec!["-l".into(), "-i".into()]);
+        app.session_factory.cwd = Some("/work".into());
+
+        let worker = tab_spawn_factory(app.session_factory.clone(), None, true);
+        assert!(worker.exec_command.is_none());
+        assert!(worker.integrates_shell());
+        assert_eq!(worker.shell_override, app.session_factory.shell_override);
+        assert_eq!(worker.shell_args, app.session_factory.shell_args);
+        assert_eq!(worker.cwd, app.session_factory.cwd);
+        assert_eq!(app.session_factory.exec_command, Some(command.clone()));
+        assert!(!app.session_factory.integrates_shell());
+
+        let ordinary = tab_spawn_factory(app.session_factory.clone(), None, false);
+        assert_eq!(ordinary.exec_command, Some(command.clone()));
+        assert!(!ordinary.integrates_shell());
+
+        let explicit = tab_spawn_factory(app.session_factory.clone(), Some(command.clone()), true);
+        assert_eq!(explicit.exec_command, Some(command));
+        assert!(!explicit.integrates_shell());
+
+        app.session_factory.integrate = false;
+        let disabled = tab_spawn_factory(app.session_factory.clone(), None, true);
+        assert!(disabled.exec_command.is_none());
+        assert!(!disabled.integrates_shell());
+    }
+
+    #[test]
+    fn a_plain_drive_shell_is_fresh_and_clears_only_its_inherited_command() {
+        let mut app = App::headless_for_test();
+        app.session_factory.exec_command = Some(vec!["/bin/cat".into()]);
+        app.session_factory.integrate = true;
+        let ask = SpawnAsk {
+            cwd: Some("/private/tmp".to_owned()),
+            ..SpawnAsk::default()
+        }
+        .for_fleet_shell();
+        assert!(!can_adopt_spare(&ask));
+        assert!(ask.task.is_none(), "a plain shell has no artificial task");
+        let factory = tab_spawn_factory(app.session_factory.clone(), None, ask.shell);
+        assert!(factory.exec_command.is_none());
+        assert!(factory.integrates_shell());
+        assert!(
+            app.session_factory.exec_command.is_some(),
+            "the host's command stays its own"
+        );
+        assert!(
+            can_adopt_spare(&SpawnAsk::default()),
+            "ordinary tabs keep their existing policy"
         );
     }
 
@@ -2380,6 +2467,7 @@ pub(crate) mod tests {
             None,
             aterm_sandbox::Limits::inherit(),
             None,
+            None,
         )
         .expect("the private owned PTY child starts");
         let mut holdout = Holdout {
@@ -2518,9 +2606,9 @@ pub(crate) mod tests {
     }
 
     fn replay(app: &mut App, wid: WindowId, events: Vec<Released>) {
-        for (_, event, _) in events {
-            if let WindowEvent::Ime(Ime::Commit(text)) = event {
-                app.on_ime_commit(wid, text);
+        for (_, event, posted) in events {
+            if let WindowEvent::Ime(ime) = event {
+                app.dispatch_ime_event(wid, ime, posted);
             }
         }
     }
@@ -2546,6 +2634,25 @@ pub(crate) mod tests {
             app.defer_tab_spawn_input(wid, winit_id, typed("y"))
                 .is_none(),
             "a person's own new tab holds them to replay"
+        );
+    }
+
+    #[test]
+    fn a_remote_plain_shell_does_not_hold_the_persons_in_flight_typing() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let winit_id = WinitWindowId::from(0u64);
+        let (old, _old_pty) = piped_session(app.next_session_id);
+        app.push_stub_tab(wid, old);
+        let ask = SpawnAsk::default().for_fleet_shell();
+        super::test_support::book_as(&mut app, wid, &ask, TabSpawnThen::Nothing);
+        assert!(
+            app.defer_tab_spawn_input(wid, winit_id, typed("x"))
+                .is_some()
+        );
+        assert!(
+            app.tab_spawns.held.is_empty(),
+            "the remote spawn retains no physical key"
         );
     }
 
@@ -4137,6 +4244,125 @@ pub(crate) mod tests {
             "a key typed before Commit carries its word"
         );
         crate::control::PBPASTE_STUB.with(|board| *board.borrow_mut() = None);
+    }
+
+    /// Native delivery can wait until the raw ledger has moved on, and App's spawn hold can
+    /// delay it again. Both stages must preserve the source verdict, including definitive false.
+    #[test]
+    fn held_ime_replays_its_source_after_the_raw_ledger_forgets_it() {
+        use crate::hwkey::{
+            CURRENT_KEY_STUB, NS_EVENT_TYPE_KEY_DOWN, NS_EVENT_TYPE_KEY_UP, PostedKey,
+            event_posted, note_posted, with_window_event_posted_for_test,
+        };
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let winit_id = WinitWindowId::from(0u64);
+        app.winit_to_window.insert(winit_id, wid);
+        let (session, pty) = piped_session(app.next_session_id);
+        let ctx = Arc::clone(&session.ctx);
+        app.push_stub_tab(wid, session);
+        let a = PostedKey {
+            kind: NS_EVENT_TYPE_KEY_DOWN,
+            keycode: 0,
+            timestamp: 6_100.0,
+        };
+        let b = PostedKey {
+            timestamp: 6_101.0,
+            ..a
+        };
+        let up = PostedKey {
+            kind: NS_EVENT_TYPE_KEY_UP,
+            ..b
+        };
+        note_posted(&[a, b, up]).expect("room");
+        let retained_a = event_posted(a);
+        assert!(retained_a, "A was classified at its native source");
+        assert!(event_posted(b));
+        assert!(event_posted(up));
+        assert!(
+            !event_posted(a),
+            "PRECONDITION: later keys consumed A's raw ledger entry"
+        );
+
+        let marks = Arc::clone(&app.tab_spawns.menu);
+        let mark = marks.mint(Instant::now());
+        let hold = |app: &mut App, posted: bool, text: &str| {
+            with_window_event_posted_for_test(posted, || {
+                for ime in [
+                    Ime::Preedit(text.into(), Some((0, 0))),
+                    Ime::Commit(text.into()),
+                ] {
+                    let event = WindowEvent::Ime(ime);
+                    let arrived = crate::arriving_key_posted(&event);
+                    assert_eq!(arrived, posted);
+                    app.note_window_input_arrival(&event, arrived);
+                    app.key_event_posted = arrived;
+                    assert!(app.defer_tab_spawn_input(wid, winit_id, event).is_none());
+                    app.key_event_posted = false;
+                }
+            });
+        };
+        CURRENT_KEY_STUB.with(|current| current.set(None));
+        hold(&mut app, retained_a, "日本");
+        CURRENT_KEY_STUB.with(|current| current.set(Some(up)));
+        assert!(
+            crate::hwkey::current_event_posted(),
+            "the opposite ambient posted key"
+        );
+        hold(&mut app, false, "語");
+        CURRENT_KEY_STUB.with(|current| current.set(None));
+        assert!(marks.settle(mark));
+        let mut released = app.claim_menu_held_input(mark, app.tab_spawns.in_flight.len());
+        assert_eq!(
+            released
+                .iter()
+                .map(|(.., posted)| *posted)
+                .collect::<Vec<_>>(),
+            [true, true, false, false]
+        );
+        let physical = released.split_off(2);
+
+        with_window_event_posted_for_test(false, || replay(&mut app, wid, released));
+        crate::app_input::paste_order::await_drain_for_test(&ctx.sink);
+        assert_eq!(drain(&pty), "日本".as_bytes());
+        assert_eq!(
+            ctx.human_input.counts(),
+            crate::human_input::PersonCounts::default()
+        );
+        assert_eq!(
+            ctx.human_input.typed_ms_since(crate::metrics::now_us()),
+            None
+        );
+
+        CURRENT_KEY_STUB.with(|current| current.set(Some(up)));
+        with_window_event_posted_for_test(true, || replay(&mut app, wid, physical));
+        CURRENT_KEY_STUB.with(|current| current.set(None));
+        crate::app_input::paste_order::await_drain_for_test(&ctx.sink);
+        assert_eq!(drain(&pty), "語".as_bytes());
+        let counts = ctx.human_input.counts();
+        assert_eq!((counts.seq, counts.reached), (2, 2));
+        assert!(
+            ctx.human_input
+                .typed_ms_since(crate::metrics::now_us())
+                .is_some()
+        );
+        assert!(!app.person_gesture_refused());
+
+        app.incoming_handoff_pending = true;
+        for posted in [true, false] {
+            app.key_event_posted = posted;
+            app.queue_pre_commit_input(winit_id, WindowEvent::Ime(Ime::Commit("x".into())));
+        }
+        app.key_event_posted = false;
+        assert_eq!(
+            app.handoff_deferred_input
+                .iter()
+                .map(|(.., posted)| *posted)
+                .collect::<Vec<_>>(),
+            [true, false],
+            "handoff Commit retains IME provenance too"
+        );
     }
 
     #[test]

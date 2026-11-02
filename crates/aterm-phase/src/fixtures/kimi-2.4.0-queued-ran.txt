@@ -1,0 +1,33 @@
+# kimi 2.4.0 · MEASURED 2026-10-29, `aterm ctl text` of a private headless aterm (110x32, aterm 0.146.0) running the real Kimi Code, launched by path with a scratch `HOME` and `KIMI_CODE_HOME` whose `config.toml` names one `openai`-type provider at `http://127.0.0.1:<port>/v1` with a fake key (a local stub of the Chat Completions API, crates/aterm-lab), no login · the held turn's end, then the queued `lab typed while busy` sent as a turn of its own (the stub's next request) and ended
+   │                                                                                                        │
+   │ 1. Lab step one.                                                                                       │
+   │ 2. Lab step two.                                                                                       │
+   └────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+ Current plan
+   ExitPlanMode can only be called while plan mode is active. Only the user can turn plan mode on.
+
+ ● lab after the plan
+
+ ❯ lab hit the quota
+
+ ❯ lab hit an auth failure
+   Resumed session (session_d240495d-90d8-422b-bc70-82ea4e4c480f).
+
+ ❯ lab after resume
+
+ ● Hi! I am the local lab stub, not a model. (reply 32)
+
+ ❯ lab held for queueing
+
+ ● lab held reply, sent after 30 s
+
+ ❯ lab typed while busy
+
+ ● lab held reply, sent after 30 s
+
+ ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │ >                                                                                                        │
+ ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ lab-model  …/tmp/at.H2aa/proj                       /tasks to check progress and status for background tasks
+                                                                                   context: 26% (24.7k/97.7k)

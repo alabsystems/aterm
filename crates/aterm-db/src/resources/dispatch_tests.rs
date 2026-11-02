@@ -17,6 +17,35 @@ fn observed(outcome: Outcome) -> Observation {
 }
 
 #[test]
+fn expired_admission_deadline_never_debits_or_enters_the_adapter() {
+    let lab = Lab::new(&[Role::Writer]);
+    let allocation = allocation(&lab, &[2]);
+    let db = resources(&lab, 0, &allocation);
+    db.initialize().unwrap();
+    assert!(
+        db.dispatch_once_until(REQUEST, 1, OPERATION, std::time::Instant::now(), || panic!(
+            "expired admission"
+        ))
+        .is_err()
+    );
+    assert_eq!(db.snapshot().unwrap().used.values().sum::<u64>(), 0);
+    assert!(db.attempt(REQUEST).unwrap().is_none());
+    assert!(
+        db.dispatch_once_until(
+            REQUEST,
+            1,
+            OPERATION,
+            std::time::Instant::now() + Duration::from_secs(60),
+            || Some(observed(Outcome::Completed))
+        )
+        .unwrap()
+        .observation
+        .confirmed()
+        .is_some()
+    );
+}
+
+#[test]
 fn invocation_is_durable_before_entry_and_retries_never_reenter() {
     for outcome in [Outcome::Completed, Outcome::Rejected] {
         let lab = Lab::new(&[Role::Writer]);
@@ -638,16 +667,15 @@ fn invocation_lifecycle_conforms_and_duplicate_entry_is_detected() {
         })
         .collect();
     // Each step builds its own Lab in its own temporary home, so the steps share
-    // nothing and run on every core.
-    let reached =
-        aterm_spec::check::each_on(aterm_spec::fs_lane::PLACES, &steps, |(state, action)| {
-            let next = dispatch_transition(state, action);
-            assert!(
-                model.successors(action, state).contains(&next),
-                "{action}: {state:?} -> {next:?}"
-            );
-            next
-        });
+    // nothing and run on the lane's places.
+    let reached = aterm_spec::fs_lane::each(&steps, |(state, action)| {
+        let next = dispatch_transition(state, action);
+        assert!(
+            model.successors(action, state).contains(&next),
+            "{action}: {state:?} -> {next:?}"
+        );
+        next
+    });
     let step = |from: &aterm_spec::interp::State, action: &str| {
         steps
             .iter()

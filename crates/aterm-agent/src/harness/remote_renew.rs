@@ -1,0 +1,561 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! One bounded, unattended local renewal requested through an admitted fleet drive.
+//! Request IDs are scoped to their caller. An uncertain start is polled, never
+//! interpreted as permission to start another sign-in. Results are volatile:
+//! an unknown request after a server restart does not establish completion.
+
+use std::{
+    collections::BTreeMap,
+    path::Path,
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant},
+};
+
+#[cfg(any(unix, test))]
+use aterm_json::Value;
+use aterm_json::json;
+
+/// The control verb, available to local owners and admitted native drivers.
+pub const VERB: &str = "accounts-renew";
+const WITHIN: Duration = Duration::from_secs(15 * 60);
+const RETAIN: Duration = Duration::from_secs(30 * 60);
+#[cfg(any(unix, test))]
+const DIAL_WITHIN: Duration = Duration::from_secs(20);
+#[cfg(any(unix, test))]
+const POLL: Duration = Duration::from_secs(1);
+const MAX_JOBS: usize = 16;
+const MAX_OUTPUT: usize = 64 * 1024;
+#[cfg(unix)]
+const MAX_REPLY: usize = 1024 * 1024;
+
+/// The fixed local command's complete bounded output and exit status.
+#[derive(Clone)]
+pub struct Output {
+    /// Zero means the local due pass completed; its output says what it ran.
+    pub code: i32,
+    /// Complete standard output, never a tail standing in for a complete report.
+    pub stdout: String,
+    /// Complete standard error.
+    pub stderr: String,
+}
+
+/// The only two remote operations: start once, then observe that same request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Request<'a> {
+    Start(&'a str),
+    Poll(&'a str),
+}
+
+impl<'a> Request<'a> {
+    /// Parse a single bounded, canonical request ID and operation.
+    /// # Errors
+    /// The operation is unknown or the request ID is not 32 lowercase hex digits.
+    pub fn parse(rest: &'a str) -> Result<Self, String> {
+        let rest = rest.trim();
+        let (kind, nonce) = rest.split_once('=').ok_or_else(usage)?;
+        if nonce.len() != 32
+            || !nonce
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(usage());
+        }
+        match kind {
+            "start" => Ok(Self::Start(nonce)),
+            "poll" => Ok(Self::Poll(nonce)),
+            _ => Err(usage()),
+        }
+    }
+
+    const fn nonce(self) -> &'a str {
+        match self {
+            Self::Start(nonce) | Self::Poll(nonce) => nonce,
+        }
+    }
+}
+
+fn usage() -> String {
+    "accounts-renew start=<32 lowercase hex digits> | poll=<32 lowercase hex digits>".into()
+}
+
+#[derive(Clone)]
+enum State {
+    Working,
+    Done(Output),
+    Failed(String),
+}
+
+struct Entry {
+    at: Instant,
+    state: State,
+}
+
+#[derive(Default)]
+struct Book {
+    jobs: Mutex<BTreeMap<(String, String), Entry>>,
+}
+
+impl Book {
+    fn start(
+        self: &Arc<Self>,
+        caller: &str,
+        nonce: &str,
+        run: impl FnOnce() -> Result<Output, String> + Send + 'static,
+    ) -> Result<State, String> {
+        let key = (caller.to_owned(), nonce.to_owned());
+        let now = Instant::now();
+        let mut jobs = self.jobs.lock().unwrap_or_else(|p| p.into_inner());
+        jobs.retain(|_, job| {
+            matches!(job.state, State::Working) || now.duration_since(job.at) < RETAIN
+        });
+        if let Some(job) = jobs.get(&key) {
+            return Ok(job.state.clone());
+        }
+        if jobs.values().any(|job| matches!(job.state, State::Working)) {
+            return Err("another remote renewal is running".into());
+        }
+        if jobs.len() >= MAX_JOBS
+            && let Some(oldest) = jobs
+                .iter()
+                .min_by_key(|(_, job)| job.at)
+                .map(|(key, _)| key.clone())
+        {
+            jobs.remove(&oldest);
+        }
+        jobs.insert(
+            key.clone(),
+            Entry {
+                at: now,
+                state: State::Working,
+            },
+        );
+        drop(jobs);
+        let book = Arc::clone(self);
+        let kept = key.clone();
+        let started = std::thread::Builder::new()
+            .name("fleet-account-renewal".into())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
+                let state = match result {
+                    Ok(Ok(output)) => State::Done(output),
+                    Ok(Err(why)) => State::Failed(super::one_line(&why, 320)),
+                    Err(_) => State::Failed("renewal worker panicked".into()),
+                };
+                if let Some(job) = book
+                    .jobs
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get_mut(&kept)
+                {
+                    job.at = Instant::now();
+                    job.state = state;
+                }
+            });
+        if let Err(error) = started {
+            self.jobs
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&key);
+            return Err(format!("renewal worker could not start: {error}"));
+        }
+        Ok(State::Working)
+    }
+
+    fn poll(&self, caller: &str, nonce: &str) -> Result<State, String> {
+        let jobs = self.jobs.lock().unwrap_or_else(|p| p.into_inner());
+        jobs.get(&(caller.to_owned(), nonce.to_owned()))
+            .filter(|job| matches!(job.state, State::Working) || job.at.elapsed() < RETAIN)
+            .map(|job| job.state.clone())
+            .ok_or_else(|| {
+                "unknown renewal request; the server may have restarted; completion is unconfirmed"
+                    .into()
+            })
+    }
+}
+
+fn encode(nonce: &str, state: State) -> String {
+    let value = match state {
+        State::Working => json!({"schema":1,"request":nonce,"state":"working"}),
+        State::Done(output) => json!({"schema":1,"request":nonce,"state":"done",
+            "code":output.code,"stdout":output.stdout,"stderr":output.stderr}),
+        State::Failed(error) => json!({"schema":1,"request":nonce,"state":"failed","error":error}),
+    };
+    format!("OK 1\n{value}\n")
+}
+
+/// Execute a fixed unattended renewal in this process's own home and configuration.
+fn run(program: &Path) -> Result<Output, String> {
+    use aterm_uds::spawnfd::Tether as _;
+    let mut command = aterm_uds::spawnfd::command(program);
+    command.tether();
+    command.args(["harness", "accounts", "renew", "--due", "--here"]);
+    let output = aterm_uds::deadline::output_with_input_until(
+        &mut command,
+        aterm_uds::secret::Secret::new(&[]),
+        Instant::now() + WITHIN,
+        MAX_OUTPUT,
+    )
+    .map_err(|error| format!("local renewal did not complete: {error}"))?;
+    #[cfg(unix)]
+    let code = {
+        use std::os::unix::process::ExitStatusExt as _;
+        output
+            .status
+            .code()
+            .unwrap_or_else(|| 128 + output.status.signal().unwrap_or(1))
+    };
+    #[cfg(not(unix))]
+    let code = output.status.code().unwrap_or(1);
+    Ok(Output {
+        code,
+        stdout: String::from_utf8(output.stdout).map_err(|_| "renewal stdout was not UTF-8")?,
+        stderr: String::from_utf8(output.stderr).map_err(|_| "renewal stderr was not UTF-8")?,
+    })
+}
+
+/// The caller has already passed the current local-owner or fleet-drive gate.
+/// No caller-supplied command, account, path or environment reaches the child.
+pub fn serve(caller: &str, rest: &str) -> String {
+    static BOOK: OnceLock<Arc<Book>> = OnceLock::new();
+    let answer = (|| {
+        let request = Request::parse(rest)?;
+        let book = BOOK.get_or_init(|| Arc::new(Book::default()));
+        let state = match request {
+            Request::Start(nonce) => book.start(caller, nonce, || run(&crate::own_exe()?))?,
+            Request::Poll(nonce) => book.poll(caller, nonce)?,
+        };
+        Ok::<_, String>(encode(request.nonce(), state))
+    })();
+    answer.unwrap_or_else(|error| format!("ERR accounts-renew: {}\n", super::one_line(&error, 400)))
+}
+
+#[cfg(any(unix, test))]
+fn decode(nonce: &str, text: &str) -> Result<State, String> {
+    let value: Value = aterm_json::from_str(text).map_err(|_| "invalid renewal reply")?;
+    if value["schema"].as_u64() != Some(1) || value["request"].as_str() != Some(nonce) {
+        return Err("renewal reply belongs to another request or protocol".into());
+    }
+    match value["state"].as_str() {
+        Some("working") => Ok(State::Working),
+        Some("failed") => Err(value["error"]
+            .as_str()
+            .map(|error| {
+                format!(
+                    "remote renewal did not complete: {}",
+                    super::one_line(error, 320)
+                )
+            })
+            .unwrap_or_else(|| "invalid renewal failure reply".into())),
+        Some("done") => {
+            let code = value["code"]
+                .as_i64()
+                .filter(|code| (0..=255).contains(code))
+                .ok_or("invalid renewal exit code")?;
+            let text = |key: &str| {
+                value[key]
+                    .as_str()
+                    .filter(|text| text.len() <= MAX_OUTPUT)
+                    .map(str::to_owned)
+                    .ok_or_else(|| format!("invalid renewal {key}"))
+            };
+            Ok(State::Done(Output {
+                code: code as i32,
+                stdout: text("stdout")?,
+                stderr: text("stderr")?,
+            }))
+        }
+        _ => Err("invalid renewal state".into()),
+    }
+}
+
+#[cfg(any(unix, test))]
+fn request_with(
+    nonce: &str,
+    within: Duration,
+    mut call: impl FnMut(&str, Duration) -> Result<String, String>,
+    mut pause: impl FnMut(Duration),
+) -> Result<Output, String> {
+    let deadline = Instant::now() + within;
+    let decode_reply = |reply: &str| {
+        decode(nonce, reply)
+            .map_err(|error| format!("renewal completion unconfirmed (request {nonce}): {error}"))
+    };
+    // Even a failed write may have reached the peer. Only a poll can recover its
+    // answer; repeating start must never be the client's transport retry.
+    let mut state = match call(&format!("{VERB} start={nonce}"), within.min(DIAL_WITHIN)) {
+        Ok(reply) => decode_reply(&reply)?,
+        Err(_) => State::Working,
+    };
+    loop {
+        match state {
+            State::Done(output) => return Ok(output),
+            State::Failed(error) => return Err(error),
+            State::Working => {}
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(format!(
+                "renewal completion unconfirmed (request {nonce}); poll the same request"
+            ));
+        }
+        pause(left.min(POLL));
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(format!(
+                "renewal completion unconfirmed (request {nonce}); poll the same request"
+            ));
+        }
+        state = decode_reply(
+            &call(&format!("{VERB} poll={nonce}"), left.min(DIAL_WITHIN)).map_err(|error| {
+                format!("renewal completion unconfirmed (request {nonce}): {error}")
+            })?,
+        )?;
+    }
+}
+
+/// Renew the peer's own due accounts through its authenticated native drive.
+/// Each connection remains within the fleet's ordinary connection cap.
+/// # Errors
+/// The fleet does not admit the request, a reply is malformed or for another
+/// request, the remote pass fails, or completion is not observed within the bound.
+#[cfg(unix)]
+pub fn request(host: &str) -> Result<Output, String> {
+    use ring::rand::{SecureRandom as _, SystemRandom};
+    let mut random = [0; 16];
+    SystemRandom::new()
+        .fill(&mut random)
+        .map_err(|_| "renewal request randomness unavailable")?;
+    let nonce = aterm_codec::hex::encode_lower(&random);
+    request_with(
+        &nonce,
+        WITHIN + Duration::from_secs(30),
+        |line, within| {
+            let link = crate::drive_fleet(host, within).map_err(|error| error.to_string())?;
+            let mut client = crate::RelayClient::new(link.stream);
+            let (header, body) = client
+                .request_counted_with_limit(line, MAX_REPLY)
+                .map_err(|error| error.to_string())?;
+            if header != "OK 1" {
+                return Err(super::one_line(&header, 400));
+            }
+            Ok(body)
+        },
+        std::thread::sleep,
+    )
+}
+
+#[cfg(not(unix))]
+/// Native fleet renewal is unavailable on this platform.
+/// # Errors
+/// Always returns an unsupported-platform error.
+pub fn request(_host: &str) -> Result<Output, String> {
+    Err("native fleet renewal is unavailable on this platform".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    const ID: &str = "0123456789abcdef0123456789abcdef";
+    const OTHER: &str = "1123456789abcdef0123456789abcdef";
+
+    fn output(code: i32) -> Output {
+        Output {
+            code,
+            stdout: "a complete pass\n".into(),
+            stderr: String::new(),
+        }
+    }
+
+    #[test]
+    fn only_canonical_request_ids_reach_the_worker() {
+        assert_eq!(
+            Request::parse(&format!("start={ID}")),
+            Ok(Request::Start(ID))
+        );
+        assert_eq!(Request::parse(&format!("poll={ID}")), Ok(Request::Poll(ID)));
+        for rest in [
+            String::new(),
+            "start=".into(),
+            format!("start={ID} trailing"),
+            format!("poll={ID}\nstart={OTHER}"),
+            format!("run={ID}"),
+            format!("start={}", ID.to_uppercase()),
+            format!("start={ID}0"),
+        ] {
+            assert!(Request::parse(&rest).is_err(), "{rest:?}");
+        }
+    }
+
+    #[test]
+    fn duplicates_share_one_run_and_callers_cannot_read_each_others_results() {
+        let book = Arc::new(Book::default());
+        let (release, wait) = mpsc::channel();
+        assert!(matches!(
+            book.start("a", ID, move || {
+                wait.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap();
+                Ok(output(7))
+            }),
+            Ok(State::Working)
+        ));
+        assert!(matches!(
+            book.start("a", ID, || panic!("duplicate execution")),
+            Ok(State::Working)
+        ));
+        assert!(book.poll("b", ID).is_err());
+        assert!(
+            book.start("b", OTHER, || panic!("parallel execution"))
+                .is_err()
+        );
+        release.send(()).unwrap();
+        let done = aterm_spec::wait::within(
+            aterm_spec::wait::MUST_HAPPEN,
+            Duration::from_millis(1),
+            || match book.poll("a", ID) {
+                Ok(State::Done(value)) => Some(value),
+                _ => None,
+            },
+        )
+        .expect("the owned worker finished");
+        assert_eq!(done.code, 7);
+        assert!(matches!(
+            book.start("a", ID, || panic!("completed replay")),
+            Ok(State::Done(_))
+        ));
+        assert!(book.poll("b", ID).is_err());
+    }
+
+    #[test]
+    fn an_error_finishes_the_request_and_does_not_hold_the_worker_slot() {
+        let book = Arc::new(Book::default());
+        book.start("a", ID, || Err("no local route".into()))
+            .ok()
+            .unwrap();
+        aterm_spec::wait::within(
+            aterm_spec::wait::MUST_HAPPEN,
+            Duration::from_millis(1),
+            || matches!(book.poll("a", ID), Ok(State::Failed(_))).then_some(()),
+        )
+        .expect("the refused worker finished");
+        book.start("a", OTHER, || Ok(output(0))).ok().unwrap();
+        aterm_spec::wait::within(
+            aterm_spec::wait::MUST_HAPPEN,
+            Duration::from_millis(1),
+            || matches!(book.poll("a", OTHER), Ok(State::Done(_))).then_some(()),
+        )
+        .expect("another request used the released slot");
+    }
+
+    #[test]
+    fn complete_results_preserve_nonzero_exits_and_unknown_states_never_mean_success() {
+        let complete = json!({"schema":1,"request":ID,"state":"done","code":9,
+            "stdout":"not renewed\n","stderr":"provider refused\n"})
+        .to_string();
+        let State::Done(got) = decode(ID, &complete).ok().unwrap() else {
+            panic!("complete")
+        };
+        assert_eq!(got.code, 9);
+        assert_eq!(got.stderr, "provider refused\n");
+        for change in ["schema", "request", "state", "code", "stdout"] {
+            let mut bad: Value = aterm_json::from_str(&complete).unwrap();
+            let value = match change {
+                "schema" | "code" => json!(-1),
+                "request" => json!(OTHER),
+                "state" => json!("unknown"),
+                _ => json!("x".repeat(MAX_OUTPUT + 1)),
+            };
+            bad.as_object_mut().unwrap().insert(change.into(), value);
+            assert!(decode(ID, &bad.to_string()).is_err(), "{change}");
+        }
+    }
+
+    #[test]
+    fn a_lost_start_or_poll_never_restarts_the_sign_in() {
+        for lose_start in [true, false] {
+            let mut calls = Vec::new();
+            let result = request_with(
+                ID,
+                Duration::from_secs(60),
+                |line, _| {
+                    calls.push(line.to_owned());
+                    if lose_start || calls.len() > 1 {
+                        Err("connection closed".into())
+                    } else {
+                        Ok(json!({"schema":1,"request":ID,"state":"working"}).to_string())
+                    }
+                },
+                |_| {},
+            );
+            assert!(result.is_err());
+            assert_eq!(
+                calls.iter().filter(|line| line.contains("start=")).count(),
+                1
+            );
+            assert_eq!(calls.len(), 2);
+        }
+    }
+
+    #[test]
+    fn the_client_waits_for_a_complete_result_on_the_same_request() {
+        let mut calls = Vec::new();
+        let result = request_with(
+            ID,
+            Duration::from_secs(60),
+            |line, within| {
+                assert!(within <= DIAL_WITHIN);
+                calls.push(line.to_owned());
+                Ok(if calls.len() == 1 {
+                    json!({"schema":1,"request":ID,"state":"working"})
+                } else {
+                    json!({"schema":1,"request":ID,"state":"done","code":0,
+                    "stdout":"nothing is due on this machine\n","stderr":""})
+                }
+                .to_string())
+            },
+            |_| {},
+        )
+        .ok()
+        .unwrap();
+        assert_eq!(result.code, 0);
+        assert_eq!(
+            calls,
+            [
+                format!("accounts-renew start={ID}"),
+                format!("accounts-renew poll={ID}")
+            ]
+        );
+    }
+
+    #[test]
+    fn a_lost_start_reply_is_recovered_by_polling_without_another_start() {
+        let mut calls = Vec::new();
+        let result = request_with(
+            ID,
+            Duration::from_secs(60),
+            |line, _| {
+                calls.push(line.to_owned());
+                if calls.len() == 1 {
+                    Err("reply lost after the peer accepted".into())
+                } else {
+                    Ok(json!({"schema":1,"request":ID,"state":"done","code":0,
+                    "stdout":"completed once\n","stderr":""})
+                    .to_string())
+                }
+            },
+            |_| {},
+        )
+        .ok()
+        .unwrap();
+        assert_eq!(result.stdout, "completed once\n");
+        assert_eq!(
+            calls,
+            [
+                format!("accounts-renew start={ID}"),
+                format!("accounts-renew poll={ID}")
+            ]
+        );
+    }
+}

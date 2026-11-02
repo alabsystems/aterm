@@ -80,8 +80,8 @@ impl Model {
     #[must_use]
     pub fn parse(text: &str) -> Option<Self> {
         let mut parts = text.split('-');
-        let vendor = parts.next()?.parse().ok()?;
-        let product = parts.next()?.parse().ok()?;
+        let vendor = crate::parse_uint(parts.next()?)?;
+        let product = crate::parse_uint(parts.next()?)?;
         match (parts.next(), parts.next()) {
             (None | Some("0"), None) => Some(Self { vendor, product }),
             _ => None,
@@ -109,9 +109,9 @@ pub fn seen_models(entries: &Entries) -> Result<Vec<Model>, String> {
         .map(|(k, _)| {
             let parts: Vec<&str> = k.split('-').collect();
             match parts.as_slice() {
-                [product, vendor, n] if n.parse::<u32>().is_ok() => {
-                    match (product.parse(), vendor.parse()) {
-                        (Ok(product), Ok(vendor)) => Some(Model { vendor, product }),
+                [product, vendor, n] if crate::parse_uint::<u32>(n).is_some() => {
+                    match (crate::parse_uint(product), crate::parse_uint(vendor)) {
+                        (Some(product), Some(vendor)) => Some(Model { vendor, product }),
                         _ => None,
                     }
                 }

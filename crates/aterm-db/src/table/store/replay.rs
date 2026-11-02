@@ -7,7 +7,7 @@
 use super::{CONFLICT_SUBJECT, Receipt, SUBJECT, Stored, Witness};
 use crate::{
     Error, Result,
-    table::{Scope, Session},
+    table::{Envelope, ReadBatch},
 };
 use astream_wire::Offset;
 use aterm_digest::Sha256;
@@ -179,23 +179,26 @@ impl Builder {
     )
 )]
 pub(super) fn restore(
-    session: &Session<'_>,
-    scope: Scope,
+    batch: &ReadBatch<'_, '_>,
     receipt: Receipt,
     wire: Vec<u8>,
     acknowledged: u64,
 ) -> Result<Stored> {
-    let envelope = session.envelope(scope, &wire)?;
+    let scope = batch.scope;
+    // Store::open_region checks live authority around this held-source replay
+    // and before finalization. Keep signed-envelope and historical validation
+    // per record without repeating those filesystem checks for every entry.
+    let envelope = Envelope::parse(scope, &wire)?;
     let header = envelope.header.clone();
     super::operation_policy(scope, &header, envelope.body.len() - 16)?;
     let quarantine = if aterm_db_core::quarantine_eligible(
         acknowledged,
         receipt.offset,
-        session.discarded_source(&envelope),
+        batch.discarded_source(&envelope)?,
     ) {
         Some((envelope.roster, envelope.epoch, envelope.authored_ms))
     } else {
-        session.open_envelope(scope, envelope)?;
+        batch.open_envelope(envelope)?;
         None
     };
     if header.id != receipt.id {

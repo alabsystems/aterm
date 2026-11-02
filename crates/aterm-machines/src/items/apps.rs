@@ -5,7 +5,7 @@
 
 use super::{Ctx, Item};
 use crate::model::{Effect, Probe, Read, User};
-use crate::port::{Cmd, Ran, System};
+use crate::port::{Cmd, Process, Ran, System};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -720,28 +720,182 @@ fn installed_bundle(
     }
 }
 
-/// `s` with every extended-regex metacharacter escaped, for `pgrep -f`.
-fn regex_literal(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        if "\\.[]()*+?{}|^$".contains(c) {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
-}
-
-/// Returns whether any process is running an executable inside `bundle`.
+/// Whether a process other than this one runs from `bundle` ([`running_in`]), read in this
+/// process with no child ([`System::processes`]): no `pgrep -f`, which is a new program start that
+/// can hang at macOS's program check and reads every process's arguments, held ones included
+/// (`docs/DESIGN-leftover-processes-2026-10-16.md` M29). `Read::Unusable` where the process table
+/// cannot be read, so nothing is replaced under a process nobody could see.
 #[must_use]
 pub fn running(sys: &dyn System, bundle: &Path) -> Read<bool> {
-    let pattern = regex_literal(&format!("{}/Contents/MacOS/", bundle.display()));
-    match sys.run(&Cmd::new("/usr/bin/pgrep").arg("-f").arg(pattern)) {
-        Ok(ran) if ran.status == Some(0) => Read::Value(true),
-        Ok(ran) if ran.status == Some(1) => Read::Value(false),
-        Ok(ran) => Read::Unusable(format!("pgrep: {}", ran.describe())),
-        Err(e) => Read::Unusable(format!("pgrep: {e}")),
+    let Some(rows) = sys.processes() else {
+        return Read::Unusable("the process table could not be read".into());
+    };
+    Read::Value(running_in(
+        &rows,
+        std::process::id(),
+        &Programs::of(sys, bundle),
+        |row| sys.process_argv(row),
+    ))
+}
+
+/// What [`running_in`] judges a process table against: one bundle, as [`Programs::of`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Programs {
+    /// The bundle's path as given and its canonical form where that differs, since the kernel
+    /// names an executable in its on-disk spelling (`/private/var` for `/var`).
+    roots: Vec<PathBuf>,
+    /// The short names ([`Process::short_name`]) of the files in its `Contents/MacOS`: none where
+    /// that folder could not be listed.
+    names: Vec<String>,
+    /// The short names a process interpreting one of those files that is a script runs under
+    /// ([`interpreters`]): none where no file there is one.
+    interpreters: Vec<String>,
+}
+
+impl Programs {
+    /// `bundle`'s spellings, its programs' short names and those of their scripts' interpreters,
+    /// its `Contents/MacOS` listed at its canonical spelling. Each program's first line is read at
+    /// its canonical path, and only where that lies inside the bundle's canonical spelling,
+    /// through no link ([`System::read_head`]): a program linked to a file elsewhere in the bundle
+    /// (`Contents/MacOS/X -> ../Resources/run.sh`, which the kernel still runs as
+    /// `<bundle>/Contents/MacOS/X`) is read at that file, and nothing outside the bundle is read,
+    /// whether a program links out of it or a link replaces a file after its path was resolved.
+    fn of(sys: &dyn System, bundle: &Path) -> Self {
+        let real = sys.canonicalize(bundle).ok();
+        let mut roots = vec![bundle.to_path_buf()];
+        roots.extend(real.clone().filter(|real| real != bundle));
+        let folder = real.as_deref().unwrap_or(bundle).join("Contents/MacOS");
+        let files = sys.list_dir(&folder).unwrap_or_default();
+        let mut interpreters: Vec<String> = files
+            .iter()
+            .filter_map(|name| sys.canonicalize(&folder.join(name)).ok())
+            .filter(|program| real.as_ref().is_some_and(|real| program.starts_with(real)))
+            .flat_map(|program| interpreters(sys, &program))
+            .collect();
+        interpreters.sort();
+        interpreters.dedup();
+        Self {
+            roots,
+            names: files.iter().map(|name| Process::short_name(name)).collect(),
+            interpreters,
+        }
     }
+}
+
+/// The longest first line [`interpreters`] reads of a program: the kernel's own bound on a
+/// script's `#!` line (`IMG_SHSIZE`).
+const SHEBANG_MAX: usize = 512;
+
+/// The short names ([`Process::short_name`]) a process interpreting `program` runs under, where
+/// its first line is `#!<interpreter> [<word>...]`; none for another file, or one that cannot be
+/// read ([`System::read_head`]: a link, or no regular file). They are the interpreter's own name,
+/// the program an `env` interpreter is asked for, and the name of the file an absolute
+/// interpreter's path resolves to, since the kernel names a process after the file it execs, a
+/// link's target (`<prefix>/bin/python3 -> python3.12` runs as `python3.12`, a link `qsh ->
+/// /bin/bash` as `bash`): that resolution is the one the kernel makes at each start of the
+/// program, and a name it adds can widen only which processes launchd started, with no terminal,
+/// have their words read ([`running_in`]). Of each, for `sh` also the shell macOS's `/bin/sh` runs in its place under
+/// that shell's own name (the one `/private/var/select/sh` links to), and for a name that starts
+/// `python` also `Python`, the name a framework Python (Apple's, python.org's, Homebrew's) runs
+/// under once it re-execs into its `Python.app`. Measured on macOS 27: a script whose line names
+/// `/bin/sh` runs as `bash`, `/bin/zsh` as `zsh`, `/usr/bin/env perl` as `perl`, and
+/// `/usr/bin/python3`, `/usr/bin/env python3` and Homebrew's `python3.13` as `Python`, each with
+/// the script's path among its argument words.
+fn interpreters(sys: &dyn System, program: &Path) -> Vec<String> {
+    let Ok(head) = sys.read_head(program, SHEBANG_MAX) else {
+        return Vec::new();
+    };
+    let Some(line) = head.strip_prefix(b"#!") else {
+        return Vec::new();
+    };
+    let line = String::from_utf8_lossy(line.split(|b| *b == b'\n').next().unwrap_or_default());
+    let mut words = line.split_ascii_whitespace();
+    let mut runs: Vec<&str> = words.next().into_iter().collect();
+    if runs.first().and_then(|first| Path::new(first).file_name()) == Some("env".as_ref()) {
+        runs.extend(words.find(|word| !word.starts_with('-') && !word.contains('=')));
+    }
+    let mut names = Vec::new();
+    let spelled = runs.into_iter().map(Path::new).flat_map(|run| {
+        let real = run
+            .is_absolute()
+            .then(|| sys.canonicalize(run).ok())
+            .flatten();
+        [Some(run.to_path_buf()), real].into_iter().flatten()
+    });
+    for run in spelled {
+        let Some(name) = run.file_name() else {
+            continue;
+        };
+        let name = name.to_string_lossy();
+        if name == "sh" {
+            let shell = sys.canonicalize(Path::new("/private/var/select/sh")).ok();
+            names.extend(
+                shell
+                    .as_deref()
+                    .and_then(Path::file_name)
+                    .map(|shell| Process::short_name(&shell.to_string_lossy())),
+            );
+        }
+        if name.starts_with("python") {
+            names.push("Python".to_owned());
+        }
+        names.push(Process::short_name(&name));
+    }
+    names
+}
+
+/// Whether a process in `rows` other than `me` runs from `bundle`. No ancestor of `me` is left
+/// out: the aterm window whose tab runs this process still counts. A row counts when
+/// - the kernel names its executable at or below a root: an app, a helper, a login item or an XPC
+///   service in the bundle, a background job of it, and a command-line tool started by a link
+///   to one (`~/.local/bin/aterm`), whether macOS's program check holds it or not;
+/// - the kernel names no executable for it (its file was deleted) and its short name is one of
+///   the bundle's `names`;
+/// - its executable lies elsewhere, its short name is one of `names`, and `argv` reads its first
+///   word as a path at or below a root: a program started from the bundle that an earlier
+///   replacement moved aside, which still finds the bundle's files by that path;
+/// - launchd is its parent ([`Process::LAUNCHD`]) and it has no controlling terminal
+///   ([`Process::terminal`]), as an app LaunchServices opened, a launch agent or a login item
+///   runs, its short name is one of the bundle's `interpreters`, and `argv` reads any of its words
+///   as a path at or below a root: a script of the bundle started as an app, whose executable is
+///   the interpreter's, outside the bundle.
+///
+/// `argv` is asked only of a row of one of `names`, or of one of `interpreters` (none for a
+/// bundle with no script) that launchd is the parent of and that has no controlling terminal,
+/// and only once no row counts by the first two rules, so a table with no such row reads no
+/// process's arguments (M29). Its parent alone would not bound it: a terminal's shell that
+/// outlived its terminal's restart (each aterm tab's that outlives an aterm) has launchd for its
+/// parent too, so for a bundle with a `#!/bin/sh` program every such shell would be read, as many
+/// as the Mac has tabs. No terminal's shell, whether its terminal or launchd is its parent, and no
+/// shell's child forked and not yet exec'd (the exec a read races, §6.4) is read: a terminal's
+/// shells and their forks keep its terminal, and any other shell's fork has that shell for its
+/// parent. A script of the bundle that a shell runs is not counted by its words, though it counts
+/// by its image once it execs a program of the bundle. A row `argv` reads nothing of (a held
+/// program, another user's) does not count by its words.
+fn running_in(
+    rows: &[Process],
+    me: u32,
+    bundle: &Programs,
+    mut argv: impl FnMut(&Process) -> Option<Vec<std::ffi::OsString>>,
+) -> bool {
+    let inside = |path: &Path| bundle.roots.iter().any(|root| path.starts_with(root));
+    let named = |row: &Process| bundle.names.contains(&row.comm);
+    let others = || rows.iter().filter(move |row| row.pid != me);
+    others().any(|row| row.exe.as_deref().map_or_else(|| named(row), inside))
+        || others().any(|row| {
+            let reach = if row.ppid == Process::LAUNCHD
+                && !row.terminal
+                && bundle.interpreters.contains(&row.comm)
+            {
+                usize::MAX
+            } else if named(row) {
+                1
+            } else {
+                return false;
+            };
+            argv(row)
+                .is_some_and(|words| words.iter().take(reach).any(|word| inside(Path::new(word))))
+        })
 }
 
 /// Locates cached artifact `sha256` and re-verifies its SHA-256 digest.
@@ -2118,10 +2272,7 @@ pub(crate) mod tests {
     fn an_older_bundle_that_is_running_waits_for_an_idle_mac() {
         let sys = Fake::root();
         installed_caffeine(&sys, "1.1.3");
-        sys.on(
-            "/usr/bin/pgrep -f '/Applications/Caffeine\\.app/Contents/MacOS/'",
-            ok("1614\n"),
-        );
+        sys.running(&["/Applications/Caffeine.app/Contents/MacOS/Caffeine"]);
         let bytes = b"dmg";
         let sha = sha_of(bytes);
         let ctx = ctx_with(&sys, &[(&sha, bytes)], false);
@@ -2131,6 +2282,587 @@ pub(crate) mod tests {
         let row = one(&caffeine_row(&sha), &sys, &ctx, crate::model::Mode::Plan);
         assert_eq!(row.outcome, Outcome::Planned);
         assert_eq!(row.from.as_deref(), Some("1.1.3"));
+    }
+
+    /// The pid [`judged`] reads the table as.
+    const ME: u32 = 4000;
+
+    /// One row of a process table: a program launchd started, so with no controlling terminal.
+    fn proc_row(pid: u32, exe: Option<&str>, comm: &str) -> crate::port::Process {
+        crate::port::Process {
+            pid,
+            ppid: crate::port::Process::LAUNCHD,
+            terminal: false,
+            exe: exe.map(PathBuf::from),
+            comm: comm.into(),
+        }
+    }
+
+    /// [`running_in`] for Caffeine.app as [`running`] reads it ([`caffeine`]), read by [`ME`]:
+    /// [`judged_by`] that bundle.
+    fn judged(rows: &[crate::port::Process], words: &[(u32, &str)]) -> (bool, Vec<u32>) {
+        judged_by(&caffeine(), rows, words)
+    }
+
+    /// [`running_in`] for `bundle`, read by [`ME`], `words` being the first argument word a pid's
+    /// read finds, before `-v` (any other pid's read finds nothing, as a held program's): whether
+    /// it runs, and the pids whose arguments were read.
+    fn judged_by(
+        bundle: &Programs,
+        rows: &[crate::port::Process],
+        words: &[(u32, &str)],
+    ) -> (bool, Vec<u32>) {
+        let mut read = Vec::new();
+        let running = running_in(rows, ME, bundle, |row| {
+            read.push(row.pid);
+            words
+                .iter()
+                .find(|(pid, _)| *pid == row.pid)
+                .map(|(_, first)| vec![std::ffi::OsString::from(first), "-v".into()])
+        });
+        (running, read)
+    }
+
+    const CAFFEINE: &str = "/Applications/Caffeine.app";
+    const CAFFEINE_EXE: &str = "/Applications/Caffeine.app/Contents/MacOS/Caffeine";
+    /// The first bytes of a 64-bit Mach-O executable: a program that is no script.
+    const MACH_O: &[u8] = b"\xcf\xfa\xed\xfe\x0c\x00\x00\x01";
+
+    /// Caffeine.app as [`running`] reads it ([`Programs::of`]) where its `Contents/MacOS` holds the
+    /// one program `Caffeine`, no script, and its path is canonical.
+    fn caffeine() -> Programs {
+        let sys = Fake::root();
+        sys.file(CAFFEINE_EXE, MACH_O);
+        Programs::of(&sys, Path::new(CAFFEINE))
+    }
+
+    /// [`running`] judges a table against the bundle as given and as the kernel spells it once
+    /// its links are followed (a bundle under a linked folder, as `/var` is `/private/var`), and
+    /// [`judged`] against what [`running`] reads for Caffeine.app: its one canonical spelling, no
+    /// other the kernel never names. NEGATIVE CONTROL (scratch): a [`Programs::of`] that adds no
+    /// canonical spelling (`roots.extend(..)` dropped) fails the first assertion.
+    #[test]
+    fn a_bundle_counts_in_the_spelling_the_kernel_names_it() {
+        let sys = Fake::root();
+        sys.link(CAFFEINE, "/Volumes/Apps/Caffeine.app");
+        sys.running(&["/Volumes/Apps/Caffeine.app/Contents/MacOS/Caffeine"]);
+        assert_eq!(
+            running(&sys, Path::new(CAFFEINE)),
+            Read::Value(true),
+            "at its link's target"
+        );
+        sys.running(&["/Volumes/Apps/Other.app/Contents/MacOS/Caffeine"]);
+        assert_eq!(running(&sys, Path::new(CAFFEINE)), Read::Value(false));
+        assert_eq!(
+            caffeine(),
+            Programs {
+                roots: vec![PathBuf::from(CAFFEINE)],
+                names: vec!["Caffeine".into()],
+                interpreters: Vec::new(),
+            }
+        );
+    }
+
+    /// [`running`] reads the words of a process that runs one of the bundle's programs from
+    /// elsewhere (the bundle an earlier replacement moved aside), and it counts by its first word
+    /// naming a path inside the bundle; one whose first word is bare (a `PATH` lookup) does not.
+    /// NEGATIVE CONTROL (scratch): a [`running`] that reads no process's words (`|row|
+    /// sys.process_argv(row)` made `|_| None`) fails the second assertion.
+    #[test]
+    fn a_moved_aside_program_counts_by_the_words_running_reads() {
+        let sys = Fake::root();
+        sys.file(CAFFEINE_EXE, MACH_O);
+        let aside = "/Library/Management/aterm/stage/0/old/Caffeine.app/Contents/MacOS/Caffeine";
+        sys.process(
+            proc_row(Fake::PIDS, Some(aside), "Caffeine"),
+            Some(&["Caffeine", CAFFEINE_EXE]),
+        );
+        let bundle = Path::new(CAFFEINE);
+        assert_eq!(
+            running(&sys, bundle),
+            Read::Value(false),
+            "a bare first word"
+        );
+        sys.process(
+            proc_row(Fake::PIDS + 1, Some(aside), "Caffeine"),
+            Some(&[CAFFEINE_EXE, "-v"]),
+        );
+        assert_eq!(running(&sys, bundle), Read::Value(true), "its first word");
+    }
+
+    /// [`interpreters`] names what each `#!` line runs under: `/bin/sh` also as the shell
+    /// `/private/var/select/sh` links to, `env`'s program, an absolute interpreter also by the
+    /// file its path resolves to (a link `qsh -> /bin/bash` runs as `bash`, Homebrew's or conda's
+    /// `bin/python3 -> python3.13` as `python3.13`), a Python also as `Python` (a framework Python
+    /// re-execs into its `Python.app`, measured on macOS 27); none for a Mach-O or a file it
+    /// cannot read. NEGATIVE CONTROLS (scratch): no `Python` arm fails the three Python rows;
+    /// following no interpreter's link (`real` made `None`) fails the `qsh` and `python3` rows.
+    #[test]
+    fn a_script_s_line_names_what_its_interpreter_runs_under() {
+        let sys = Fake::root();
+        sys.link("/private/var/select/sh", "/bin/bash");
+        sys.link("/usr/local/bin/python3", "../Cellar/python/bin/python3.13");
+        sys.link("/opt/tools/bin/qsh", "/bin/bash");
+        let qs = "/Applications/Qs.app/Contents/MacOS";
+        for (line, names) in [
+            ("#!/bin/sh\nexec sleep 40\n", &["bash", "sh"][..]),
+            ("#! /bin/zsh -f\n", &["zsh"]),
+            ("#!/usr/bin/env -S LANG=C perl -w\n", &["env", "perl"]),
+            ("#!/usr/bin/env sh", &["bash", "env", "sh"]),
+            ("#!/opt/tools/bin/qsh -e\n", &["bash", "qsh"]),
+            (
+                "#!/usr/local/bin/python3\n",
+                &["Python", "python3", "python3.13"],
+            ),
+            ("#!/usr/bin/env python3\n", &["Python", "env", "python3"]),
+            (
+                "#!/opt/homebrew/bin/python3.13\n",
+                &["Python", "python3.13"],
+            ),
+            ("#!\n", &[]),
+        ] {
+            sys.file(&format!("{qs}/Qs"), line.as_bytes());
+            let mut got = interpreters(&sys, Path::new(&format!("{qs}/Qs")));
+            got.sort();
+            got.dedup();
+            assert_eq!(got, names, "{line:?}");
+        }
+        sys.file(&format!("{qs}/Qs"), MACH_O);
+        assert!(
+            interpreters(&sys, Path::new(&format!("{qs}/Qs"))).is_empty(),
+            "a Mach-O"
+        );
+        assert!(
+            interpreters(&sys, Path::new(&format!("{qs}/None"))).is_empty(),
+            "unread"
+        );
+    }
+
+    /// A program of the bundle that links to a file elsewhere in it (`../Resources/run.sh`, which
+    /// the kernel runs as the link's path, inside the bundle) gives its file's interpreter, the
+    /// bundle spelled through a link too; one that links out of the bundle, by an absolute path or
+    /// by `..`, gives none, so no file outside the bundle is read. NEGATIVE CONTROLS (scratch):
+    /// reading each program's first line at its path in `Contents/MacOS` (its `canonicalize(..)`
+    /// dropped) loses `zsh`; reading wherever it resolves (the `starts_with(real)` filter
+    /// dropped) adds `ksh` and `perl`.
+    #[test]
+    fn a_program_linked_inside_the_bundle_is_read_and_one_linked_out_of_it_is_not() {
+        let sys = Fake::root();
+        sys.link("/Volumes/Apps", "/Applications");
+        sys.file(
+            "/Applications/Qs.app/Contents/Resources/run.sh",
+            b"#!/bin/zsh\n",
+        );
+        sys.link(
+            "/Applications/Qs.app/Contents/MacOS/Qs",
+            "../Resources/run.sh",
+        );
+        sys.file("/Users//alice/outside.sh", b"#!/usr/bin/perl\n");
+        sys.link(
+            "/Applications/Qs.app/Contents/MacOS/Out",
+            "/Users//alice/outside.sh",
+        );
+        sys.file(
+            "/Applications/Other.app/Contents/MacOS/run",
+            b"#!/bin/ksh\n",
+        );
+        sys.link(
+            "/Applications/Qs.app/Contents/MacOS/Up",
+            "../../../Other.app/Contents/MacOS/run",
+        );
+        let qs = Programs::of(&sys, Path::new("/Volumes/Apps/Qs.app"));
+        assert_eq!(
+            (qs.names, qs.interpreters),
+            (
+                vec!["Out".to_owned(), "Qs".to_owned(), "Up".to_owned()],
+                vec!["zsh".to_owned()]
+            )
+        );
+    }
+
+    const QS: &str = "/Applications/Qs.app";
+    /// Qs.app's `sh` script, its `env perl` script and its Python script.
+    const QS_SH: &str = "/Applications/Qs.app/Contents/MacOS/Qs";
+    const QS_PERL: &str = "/Applications/Qs.app/Contents/MacOS/Tool";
+    const QS_PY: &str = "/Applications/Qs.app/Contents/MacOS/Py";
+
+    /// A Mac whose `/bin/sh` runs `bash`, with Qs.app installed: its programs are the three
+    /// scripts [`QS_SH`], [`QS_PERL`] and [`QS_PY`].
+    fn qs_installed() -> Fake {
+        let sys = Fake::root();
+        sys.link("/private/var/select/sh", "/bin/bash");
+        sys.file(QS_SH, b"#!/bin/sh\nexec sleep 40\n");
+        sys.file(QS_PERL, b"#!/usr/bin/env perl\n");
+        sys.file(QS_PY, b"#!/usr/bin/python3\n");
+        sys
+    }
+
+    /// A program of the bundle that is a script, started as an app, runs as its interpreter,
+    /// outside the bundle, under one of the names [`interpreters`] gives: [`running`] counts a
+    /// process launchd started under one of those names any of whose words is the script's path,
+    /// whether a shell, `perl` or a framework `Python`. NEGATIVE CONTROLS (scratch): a
+    /// [`running_in`] that reads no interpreter's words (its `bundle.interpreters.contains(..)`
+    /// arm dropped) fails all three; no `Python` arm in [`interpreters`] fails the `Python` one.
+    #[test]
+    fn a_script_of_the_bundle_started_as_an_app_counts_by_its_interpreter_s_words() {
+        let python = "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/\
+                      Versions/3.9/Resources/Python.app/Contents/MacOS/Python";
+        for (exe, comm, words) in [
+            ("/bin/bash", "bash", ["/bin/sh", QS_SH]),
+            ("/usr/bin/perl", "perl", ["perl", QS_PERL]),
+            (python, "Python", [python, QS_PY]),
+        ] {
+            let sys = qs_installed();
+            sys.process(proc_row(Fake::PIDS, Some(exe), comm), Some(&words));
+            assert_eq!(running(&sys, Path::new(QS)), Read::Value(true), "{comm}");
+        }
+    }
+
+    /// For a bundle with a `#!/bin/sh` program, [`running`] reads the words of a shell launchd
+    /// started (its parent launchd, with no controlling terminal) and of no other: not a
+    /// terminal's shells, whether the terminal is their parent or launchd adopted them when it
+    /// restarted (as it does each aterm tab's shell that outlives an aterm), nor the script one
+    /// runs, nor a child a shell forked that has not exec'd yet (whose exec into a program macOS's
+    /// program check holds can hang an argument read, §6.4), whatever their words would say, so
+    /// the shells of the Mac's tabs are never all read (M29); and no shell's words are read for a
+    /// bundle with no script. NEGATIVE CONTROLS (scratch): reading every shell launchd is the
+    /// parent of (`!row.terminal &&` dropped) puts pid 24 among the pids read; reading
+    /// every shell of the names (`row.ppid == Process::LAUNCHD &&` dropped as well) puts 21 there.
+    #[test]
+    fn no_terminal_s_shell_is_read_for_a_script_of_the_bundle_even_once_launchd_adopts_it() {
+        let qs = Programs::of(&qs_installed(), Path::new(QS));
+        let child_of = |pid, ppid, exe, comm| crate::port::Process {
+            ppid,
+            terminal: true,
+            ..proc_row(pid, Some(exe), comm)
+        };
+        let terminal = [
+            child_of(20, 19, "/bin/zsh", "zsh"),
+            child_of(21, 20, "/bin/bash", "bash"),
+            child_of(22, 21, "/bin/bash", "bash"),
+            child_of(24, crate::port::Process::LAUNCHD, "/bin/bash", "bash"),
+            child_of(25, crate::port::Process::LAUNCHD, "/bin/sh", "sh"),
+        ];
+        let words = [
+            (20, QS_SH),
+            (21, QS_SH),
+            (22, QS_SH),
+            (23, QS_SH),
+            (24, QS_SH),
+            (25, QS_SH),
+        ];
+        assert_eq!(
+            judged_by(&qs, &terminal, &words),
+            (false, Vec::new()),
+            "a terminal's shells, launchd's or not"
+        );
+        let mut launched = terminal.to_vec();
+        launched.push(proc_row(23, Some("/bin/bash"), "bash"));
+        assert_eq!(judged_by(&qs, &launched, &words), (true, vec![23]));
+        let rows = [proc_row(30, Some("/bin/bash"), "bash")];
+        assert_eq!(judged(&rows, &[(30, CAFFEINE_EXE)]), (false, Vec::new()));
+    }
+
+    /// The process that reads the table never counts, by any of the rules, but a parent of
+    /// it that runs from the bundle does (the aterm window whose tab runs `aterm init`): only the
+    /// reader's own pid is left out. NEGATIVE CONTROL (scratch): leaving every row in
+    /// (`filter(move |row| row.pid != me)` dropped) makes the first assertion fail.
+    #[test]
+    fn the_reading_process_never_counts_but_its_parent_does() {
+        let me = [
+            proc_row(ME, Some(CAFFEINE_EXE), "Caffeine"),
+            proc_row(ME, None, "Caffeine"),
+            proc_row(ME, Some("/private/tmp/stage/old/Caffeine.app"), "Caffeine"),
+        ];
+        assert_eq!(judged(&me, &[(ME, CAFFEINE_EXE)]), (false, Vec::new()));
+        let mut with_parent = me.to_vec();
+        with_parent.push(proc_row(ME - 1, Some(CAFFEINE_EXE), "Caffeine"));
+        assert_eq!(judged(&with_parent, &[]), (true, Vec::new()));
+    }
+
+    /// A process whose executable the kernel names inside the bundle counts by that alone, at any
+    /// depth (a helper app, which `pgrep -f '<bundle>/Contents/MacOS/'` missed), held at macOS's
+    /// program check or not, with no process's arguments read; one in a bundle whose name merely
+    /// starts the same (`Caffeine.app2`) or in another bundle does not. [`running`] reads no
+    /// table it cannot read as `Unusable`. NEGATIVE CONTROL (scratch): comparing paths as strings
+    /// (`path.to_string_lossy().starts_with(..)`) makes the `Caffeine.app2` row count.
+    #[test]
+    fn an_executable_inside_the_bundle_counts_by_its_image_alone() {
+        for exe in [
+            CAFFEINE_EXE,
+            "/Applications/Caffeine.app/Contents/Frameworks/Caffeine Helper.app/Contents/MacOS/Caffeine Helper",
+            "/Applications/Caffeine.app/Contents/Library/LoginItems/Starter.app/Contents/MacOS/Starter",
+        ] {
+            let rows = [
+                proc_row(1, Some("/sbin/launchd"), "launchd"),
+                proc_row(77, Some(exe), "Caffeine"),
+            ];
+            assert_eq!(judged(&rows, &[]), (true, Vec::new()), "{exe}");
+        }
+        for exe in [
+            "/Applications/Caffeine.app2/Contents/MacOS/Caffeine",
+            "/Applications/Other.app/Contents/MacOS/Other",
+            "/Applications/Caffeine",
+        ] {
+            let rows = [proc_row(77, Some(exe), "Other")];
+            assert_eq!(judged(&rows, &[]), (false, Vec::new()), "{exe}");
+        }
+        let sys = Fake::root();
+        assert!(
+            matches!(running(&sys, Path::new("/Applications/Caffeine.app")), Read::Unusable(why) if why.contains("process table")),
+            "an unread table"
+        );
+        sys.running(&[]);
+        assert_eq!(
+            running(&sys, Path::new("/Applications/Caffeine.app")),
+            Read::Value(false)
+        );
+    }
+
+    /// A process that runs one of the bundle's programs from elsewhere (the bundle an earlier
+    /// replacement moved aside) counts when its first argument word is a full path inside the
+    /// bundle, its words read only for a process of one of the bundle's names; a bare first word
+    /// (a `PATH` lookup) or one inside another bundle does not count, and neither does one whose
+    /// words read nothing (a program macOS's program check holds, whose arguments are never read
+    /// before its thread ran). NEGATIVE CONTROL (scratch): reading every row's words (the
+    /// `named(row) &&` guard dropped) puts pid 30 among the pids read.
+    #[test]
+    fn a_program_started_from_the_bundle_counts_by_its_first_word() {
+        let aside = "/Library/Management/aterm/stage/0/old/Caffeine.app/Contents/MacOS/Caffeine";
+        let rows = [
+            proc_row(30, Some("/bin/zsh"), "zsh"),
+            proc_row(10, Some(aside), "Caffeine"),
+        ];
+        assert_eq!(
+            judged(&rows, &[(10, CAFFEINE_EXE), (30, CAFFEINE_EXE)]),
+            (true, vec![10])
+        );
+        for first in [
+            "Caffeine",
+            "/Applications/Caffeine.app2/Contents/MacOS/Caffeine",
+            aside,
+        ] {
+            assert_eq!(judged(&rows, &[(10, first)]), (false, vec![10]), "{first}");
+        }
+        assert_eq!(judged(&rows, &[]), (false, vec![10]), "a held program");
+    }
+
+    /// A process whose executable the kernel no longer names (its file deleted, as a replacement
+    /// does to a running program) counts when its short name is one of the bundle's programs',
+    /// cut to the kernel's 16 bytes, and not otherwise, nor when the bundle's programs cannot be
+    /// listed. NEGATIVE CONTROL (scratch): counting no unnamed row (`|| named(row)` made
+    /// `|| false`) fails the first assertion.
+    #[test]
+    fn an_unnamed_process_counts_by_its_short_name() {
+        let rows = [proc_row(55, None, "Caffeine")];
+        assert_eq!(judged(&rows, &[]), (true, Vec::new()));
+        let rows = [proc_row(55, None, "zsh")];
+        assert_eq!(judged(&rows, &[(55, CAFFEINE_EXE)]), (false, vec![]));
+        let sys = Fake::root();
+        let long = "/Applications/Caffeine.app/Contents/MacOS/CaffeineLoginHelper";
+        sys.file(long, b"");
+        sys.process(proc_row(55, None, "CaffeineLoginHe"), None);
+        let bundle = Path::new("/Applications/Caffeine.app");
+        assert_eq!(running(&sys, bundle), Read::Value(false), "15 bytes");
+        sys.process(proc_row(56, None, "CaffeineLoginHel"), None);
+        assert_eq!(running(&sys, bundle), Read::Value(true), "16 bytes");
+        sys.list_fails_once(
+            "/Applications/Caffeine.app/Contents/MacOS",
+            std::io::ErrorKind::PermissionDenied,
+        );
+        assert_eq!(running(&sys, bundle), Read::Value(false), "none listed");
+    }
+
+    /// A real program run from a scratch bundle (a copy of `cat`, signed ad hoc, started by the
+    /// bare word a `PATH` lookup gives, so its words name no bundle) reads as running by its
+    /// executable alone; once a replacement moved its bundle aside, put another in its place and
+    /// deleted the old one (as [`swap_into`] and the stage's cleanup do), by its short name, since
+    /// the kernel then names no executable for it (a file deleted and re-made in the same folder
+    /// is named again, at its new file); and not once it is gone. The bundle is spelled through a
+    /// link of the test's own, which the kernel names at its target, so the canonical spelling is
+    /// what finds it whether or not `TMPDIR` is canonical. The copy is named after this test
+    /// process (`qz<pid>`), so no other run's program, unnamed once its bundle is deleted, counts
+    /// as this one. The live readers list it under its short name and on-disk path, and read its
+    /// words once its thread ran. Its bundle is moved and deleted only after it echoed a line
+    /// (AGENTS.md). NEGATIVE CONTROLS (scratch): a [`running`] that adds no canonical spelling to
+    /// the roots fails the first assertion, with `TMPDIR` canonical or not; one that counts no
+    /// unnamed row fails the second; the fixed name `qzrunning`, while another process of that
+    /// name whose file was deleted runs, fails the third.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_program_run_from_a_scratch_bundle_runs_until_it_is_gone() {
+        use aterm_uds::spawnfd::Stdio;
+        let sys = crate::port::Live::new();
+        let mut kept = aterm_uds::deadline::KeptUntilRan::new(
+            aterm_tempfile::tempdir().expect("a scratch dir").keep(),
+        );
+        let target = kept.path().join("target");
+        let spelled = kept.path().join("spelled");
+        std::fs::create_dir(&target).expect("the link's target");
+        std::os::unix::fs::symlink(&target, &spelled).expect("the link");
+        let bundle = spelled.join("Qz.app");
+        std::fs::create_dir_all(bundle.join("Contents/MacOS")).expect("the bundle");
+        let name = format!("qz{}", std::process::id());
+        let exe = bundle.join("Contents/MacOS").join(&name);
+        aterm_uds::deadline::ad_hoc_copy(Path::new("/bin/cat"), &exe);
+        let mut child = aterm_uds::spawnfd::command(&exe)
+            .arg0(&name)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn the copy");
+        let fed = aterm_uds::deadline::cat_echoes(&mut child);
+        kept.ran();
+        let ran = running(&sys, &bundle);
+        let row = sys
+            .processes()
+            .and_then(|rows| rows.into_iter().find(|row| row.pid == child.id()));
+        let words = row.as_ref().and_then(|row| sys.process_argv(row));
+        let aside = kept.path().join("aside");
+        let replaced = std::fs::rename(&bundle, &aside)
+            .and_then(|()| std::fs::create_dir_all(bundle.join("Contents/MacOS")))
+            .and_then(|()| std::fs::write(&exe, b""))
+            .and_then(|()| std::fs::remove_dir_all(&aside));
+        let unnamed = running(&sys, &bundle);
+        drop(fed);
+        aterm_uds::deadline::kill_within(&mut child, aterm_uds::deadline::ECHO_HANG);
+        let gone = running(&sys, &bundle);
+        let real = std::fs::canonicalize(&exe).expect("the copy's real path");
+        assert_eq!(ran, Read::Value(true), "by its executable");
+        replaced.expect("its bundle replaced");
+        assert_eq!(unnamed, Read::Value(true), "by its short name");
+        assert_eq!(gone, Read::Value(false), "once it is gone");
+        assert!(
+            !real.starts_with(&bundle),
+            "spelled as the kernel names it: no canonical root tested"
+        );
+        let row = row.expect("the child listed");
+        assert_eq!((row.exe, row.comm.as_str()), (Some(real), name.as_str()));
+        assert_eq!(words, Some(vec![name.into()]), "its words");
+    }
+
+    /// A real script run from a scratch bundle as an app runs (started in the background by a
+    /// shell in a session of its own that has then ended, so its parent is launchd and it has no
+    /// controlling terminal) reads as running by its interpreter's words, though the kernel names
+    /// the interpreter's executable, outside the bundle, and its short name, none of the bundle's;
+    /// and not before it starts. Three programs, each `qs<pid>` in a bundle of its own: a
+    /// `#!/bin/sh` script, which macOS's `/bin/sh` runs as the shell `/private/var/select/sh`
+    /// links to; a link to `../Resources/qs.sh`, that script, which the kernel runs at the link's
+    /// path; and a script whose line names a link of the test's own to `/bin/bash`, which runs as
+    /// `bash`. Each bundle is spelled through a link of the test's own, so its programs' first
+    /// lines are read only at their canonical paths, where no link lies on the path. Each script is
+    /// read only after it echoed a line, so its thread ran, and it ends at the end of its input
+    /// before the test does. NEGATIVE CONTROLS (scratch): a [`running_in`] that reads no
+    /// interpreter's words (its `bundle.interpreters.contains(..)` arm dropped), and a table read
+    /// that keeps no parent (`ppid: 0`) or gives every process a terminal (`terminal: true`), each
+    /// fail the first program's `ran` assertion; a [`Programs::of`] that reads each program at its
+    /// path in `Contents/MacOS` fails the linked program's, and an [`interpreters`] that follows no
+    /// interpreter's link fails the third's.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_script_started_from_a_scratch_bundle_as_an_app_runs_by_its_interpreter() {
+        let sys = crate::port::Live::new();
+        let scratch = aterm_tempfile::tempdir().expect("a scratch dir");
+        let target = scratch.path().join("target");
+        let spelled = scratch.path().join("spelled");
+        std::fs::create_dir(&target).expect("the link's target");
+        std::os::unix::fs::symlink(&target, &spelled).expect("the link");
+        let shell = scratch.path().join("qsh");
+        std::os::unix::fs::symlink("/bin/bash", &shell).expect("the interpreter's link");
+        let echo = "while read -r line; do echo \"$line\"; done\n";
+        let name = format!("qs{}", std::process::id());
+        for (case, line, linked) in [
+            ("Sh", "#!/bin/sh".to_owned(), false),
+            ("Linked", "#!/bin/sh".to_owned(), true),
+            ("Renamed", format!("#!{}", shell.display()), false),
+        ] {
+            let bundle = spelled.join(format!("{case}.app"));
+            let program = bundle.join("Contents/MacOS").join(&name);
+            let script = if linked {
+                bundle.join("Contents/Resources/qs.sh")
+            } else {
+                program.clone()
+            };
+            for folder in ["Contents/MacOS", "Contents/Resources"] {
+                std::fs::create_dir_all(bundle.join(folder)).expect("the bundle");
+            }
+            std::fs::write(&script, format!("{line}\n{echo}")).expect("the script");
+            std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .expect("make it runnable");
+            if linked {
+                std::os::unix::fs::symlink("../Resources/qs.sh", &program).expect("the program");
+            }
+            let before = running(&sys, &bundle);
+            let (ran, row) = started_as_an_app(&sys, &bundle, &program);
+            assert_eq!(before, Read::Value(false), "{case}: before it starts");
+            assert_eq!(ran, Read::Value(true), "{case}: by its interpreter's words");
+            assert_eq!(
+                (row.ppid, row.terminal),
+                (crate::port::Process::LAUNCHD, false),
+                "{case}: {row:?}: launchd's, with no terminal"
+            );
+            let real = std::fs::canonicalize(&bundle).expect("the bundle's real path");
+            assert!(
+                row.exe.as_ref().is_some_and(|exe| !exe.starts_with(&real)),
+                "{case}: {row:?}: run by an interpreter outside the bundle"
+            );
+            assert!(
+                Programs::of(&sys, &bundle).interpreters.contains(&row.comm),
+                "{case}: {row:?}: under its interpreter's name"
+            );
+        }
+    }
+
+    /// `program` of `bundle` started as an app runs (in the background by `/bin/sh` in a session
+    /// of its own, which is then killed), and once it echoed a line, whether [`running`] reads
+    /// `bundle` as running and its row in the process table. It ends at the end of its input, which
+    /// this closes, before this returns.
+    #[cfg(target_os = "macos")]
+    fn started_as_an_app(
+        sys: &crate::port::Live,
+        bundle: &Path,
+        program: &Path,
+    ) -> (Read<bool>, crate::port::Process) {
+        use aterm_uds::deadline::ECHO_HANG;
+        use aterm_uds::spawnfd::Stdio;
+        use std::io::{BufRead as _, Write as _};
+        let mut parent = aterm_uds::spawnfd::command("/bin/sh")
+            .arg("-c")
+            .arg("exec 3<&0; \"$0\" <&3 3<&- & echo \"$!\"")
+            .arg(program)
+            .setsid(true)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn the script's parent");
+        let mut fed = parent.stdin.take().expect("its input");
+        let out = std::io::BufReader::new(parent.stdout.take().expect("its output"));
+        let (tx, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in out.lines().map_while(Result::ok) {
+                let _ = tx.send(line);
+            }
+        });
+        let next = || {
+            lines
+                .recv_timeout(ECHO_HANG)
+                .expect("a line, within the hang detector")
+        };
+        let pid: u32 = next().parse().expect("the script's pid");
+        aterm_uds::deadline::kill_within(&mut parent, ECHO_HANG);
+        fed.write_all(b"ran\n").expect("feed the script");
+        assert_eq!(next(), "ran", "the script echoes");
+        let ran = running(sys, bundle);
+        let row = sys
+            .processes()
+            .and_then(|rows| rows.into_iter().find(|row| row.pid == pid));
+        drop(fed);
+        assert_eq!(
+            lines.recv_timeout(ECHO_HANG),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+            "it ends at the end of its input"
+        );
+        (ran, row.expect("the script listed"))
     }
 
     #[test]
@@ -2758,13 +3490,6 @@ pub(crate) mod tests {
         );
     }
 
-    #[test]
-    fn pgrep_s_pattern_is_the_literal_bundle_path() {
-        assert_eq!(
-            regex_literal("/Applications/Foo (1)+.app/Contents/MacOS/"),
-            "/Applications/Foo \\(1\\)\\+\\.app/Contents/MacOS/"
-        );
-    }
     /// The actual swap -> cleanup sequence retains displaced original bytes on
     /// failed restoration.
     #[test]

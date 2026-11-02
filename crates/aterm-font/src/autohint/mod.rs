@@ -62,6 +62,9 @@ pub(crate) enum DrawError {
     RecursionLimitExceeded,
     /// More than 65,535 points.
     TooManyPoints,
+    /// The glyph's `gvar` deltas would cost more than one outline may spend
+    /// (`VARIATION_STEPS` in `src/work.rs`).
+    VariationLimitExceeded,
     /// A composite anchors to a point it does not have.
     InvalidAnchorPoint,
     /// The outline data could not be read.

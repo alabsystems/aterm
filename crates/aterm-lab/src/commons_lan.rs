@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Ordinary hosts on separate physical Macs, with explicit synthetic prior vault approval.
+//! Ordinary hosts on separate physical Macs, plus a fresh default-vault admission probe.
+//! Paired profiles use synthetic prior approval; the automatic join uses the live ALab policy.
 //! Preparation never imports the recipient's private identity or supplies Commons admission.
 
 use crate::commons_startup::table::Table;
@@ -18,10 +19,13 @@ use std::io::Write as _;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+#[path = "commons_lan_auto.rs"]
+mod auto_join;
+
 const HANG: Duration = Duration::from_secs(60);
 const CAPSULE_LIMIT: usize = 32 * 1024;
 const APPLICATION: &str = "lan-startup-data";
-const USAGE: &str = "commons-lan prepare-recipient <new-world> | prepare-source <new-world> <recipient-key> | join <world> <capsule-file> | run <aterm> <world> <seconds> | follow <aterm> <world> <seconds> <owner-pid> | stop <run-directory> | declare <world> | write <world> <key> | read <world>";
+const USAGE: &str = "commons-lan auto-join <new-world> | prepare-recipient <new-world> | prepare-source <new-world> <recipient-key> | join <world> <capsule-file> | run <aterm> <world> <seconds> | follow <aterm> <world> <seconds> <owner-pid> | stop <run-directory> | declare <world> | write <world> <key> | read <world>";
 
 fn fail(error: impl std::fmt::Display) -> Fail {
     Fail::die(error.to_string())
@@ -207,11 +211,19 @@ fn run(aterm: &Path, root: &Path, seconds: u64, follows: Option<u32>) -> Res {
     let pid = instance
         .aterm_pid()
         .ok_or_else(|| Fail::die("ordinary host has no pid"))?;
+    let responsible_pid = crate::sys::responsible_pid(pid)
+        .ok_or_else(|| Fail::die("cannot read the ordinary host's privacy responsibility"))?;
+    if responsible_pid != pid {
+        return Err(Fail::die(format!(
+            "ordinary host {pid} is charged to process {responsible_pid}, not itself"
+        )));
+    }
     if follows == Some(pid as u32) {
         return Err(Fail::die("a follower must name another process"));
     }
     let started = json!({"phase":"started","role":role,"run":run.display().to_string(),
-        "aterm_pid":pid,"keeper_pid":instance.pid,"follows_pid":follows,
+        "aterm_pid":pid,"keeper_pid":instance.pid,"responsible_pid":responsible_pid,
+        "follows_pid":follows,
         "log":instance.log.display().to_string(),"socket":instance.sock.display().to_string()});
     write_new(
         &run.join("started.json"),
@@ -259,15 +271,19 @@ fn run(aterm: &Path, root: &Path, seconds: u64, follows: Option<u32>) -> Res {
                 &aterm_json::to_vec(&unavailable).map_err(fail)?,
             )?;
             emit(&unavailable)?;
-            let image = run.join("unavailable.png");
-            let _ = instance.ctl(&["image", &image.to_string_lossy()]);
+            if let Err(error) = crate::commons_startup::image(&instance, &run, "unavailable.png") {
+                eprintln!(
+                    "commons-lan: unavailable window image was not saved: {}",
+                    error.msg.as_deref().unwrap_or("capture failed")
+                );
+            }
             return Err(Fail::die(
                 "ordinary physical LAN host did not become active",
             ));
         }
         stop::sleep(Duration::from_millis(100))?;
     }
-    let until = Instant::now() + Duration::from_secs(seconds);
+    let until = stop::deadline_after(Duration::from_secs(seconds));
     let mut took_over = false;
     while Instant::now() < until && !run.join("stop").try_exists().map_err(fail)? {
         if !instance.running() {
@@ -323,6 +339,7 @@ fn table_snapshot(world: &World) -> Result<Value, Fail> {
 pub fn cmd(args: &[String]) -> Res {
     stop::install();
     let value = match args {
+        [verb, root] if verb == "auto-join" => return auto_join::run(Path::new(root)),
         [verb, root] if verb == "prepare-recipient" => prepare_recipient(Path::new(root))?,
         [verb, root, recipient] if verb == "prepare-source" => {
             prepare_source(Path::new(root), recipient)?
@@ -334,6 +351,9 @@ pub fn cmd(args: &[String]) -> Res {
             join_recipient(Path::new(root), bytes.as_slice())?
         }
         [verb, aterm, root, seconds] if verb == "run" => {
+            if !seconds.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(Fail::usage("run needs a whole number of seconds"));
+            }
             return run(
                 Path::new(aterm),
                 Path::new(root),
@@ -342,6 +362,11 @@ pub fn cmd(args: &[String]) -> Res {
             );
         }
         [verb, aterm, root, seconds, owner] if verb == "follow" => {
+            if !seconds.bytes().all(|b| b.is_ascii_digit())
+                || !owner.bytes().all(|b| b.is_ascii_digit())
+            {
+                return Err(Fail::usage("follow needs whole seconds and an owner pid"));
+            }
             let owner: u32 = owner.parse().map_err(fail)?;
             if owner == 0 {
                 return Err(Fail::usage("follow needs a nonzero owner pid"));

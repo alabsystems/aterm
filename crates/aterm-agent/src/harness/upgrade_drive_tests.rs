@@ -2,12 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::super::relaunch::{
-    Adopted, AtPrompt, CARRIED_DONE, CAUSE_EXIT, CAUSE_HOST, CONTINUE_FENCE_TRIES, EXIT_LOOK,
-    ExitRecord, MODEL_WAIT, NOBODY_ASKED, RELAUNCH_FENCE_TRIES, RelaunchLineError, Restart,
-    STALE_S, Snapshot, after_exit, after_host_ended, after_host_ended_from, await_new,
-    carry_on_with_tab_probe, continuation_session, exit_fallback, exit_record, fallback_origin,
-    follow, line_for, look_at_exit, model_restart, owed, relaunch_by_parent, restart_from, resume,
-    resume_as, resumed_prompt, shell_dialect, type_relaunch_line, with_model,
+    Adopted, AtPrompt, CARRIED_DONE, CAUSE_ASKED, CAUSE_EXIT, CAUSE_HOST, CONTINUE_FENCE_TRIES,
+    EXIT_LOOK, ExitRecord, MODEL_WAIT, NOBODY_ASKED, PERSON_FIRST, RELAUNCH_FENCE_TRIES,
+    RelaunchLineError, Restart, STALE_S, Snapshot, after_exit, after_host_ended,
+    after_host_ended_from, await_new, carry_on_with_tab_probe, continuation_session, exit_fallback,
+    exit_record, fallback_origin, follow, line_for, look_at_exit, model_restart, owed,
+    relaunch_by_parent, restart_from, resume, resume_as, resume_at_point, resumed_prompt,
+    shell_dialect, type_relaunch_line, with_model,
 };
 use super::super::upgrade::Dialect;
 use super::*;
@@ -68,7 +69,7 @@ fn file_holders_are_lsof_s() {
     std::os::unix::fs::symlink(&lock, &link).expect("link the lock");
     let mine = std::fs::File::open(&lock).expect("open the lock");
     let sleeper = |stdin: aterm_uds::spawnfd::Stdio| {
-        aterm_uds::spawnfd::command("/bin/sleep")
+        aterm_uds::spawnfd::command(aterm_uds::deadline::stand_in(Path::new("/bin/sleep")))
             .arg("600")
             .stdin(stdin)
             .spawn()
@@ -167,20 +168,22 @@ fn file_holders_are_lsof_s() {
 #[test]
 fn open_files_are_lsof_s() {
     let lsof_names = |pid: u32| -> Vec<std::path::PathBuf> {
-        let out = aterm_uds::spawnfd::command(aterm_uds::os_path!("lsof"))
-            .args([
-                "-n",
-                "-P",
-                "-w",
-                "-a",
-                "-p",
-                &pid.to_string(),
-                "-d",
-                "0-1023",
-                "-Fn",
-            ])
-            .output()
-            .expect("run lsof");
+        let out = aterm_uds::spawnfd::command(aterm_uds::deadline::stand_in(Path::new(
+            aterm_uds::os_path!("lsof"),
+        )))
+        .args([
+            "-n",
+            "-P",
+            "-w",
+            "-a",
+            "-p",
+            &pid.to_string(),
+            "-d",
+            "0-1023",
+            "-Fn",
+        ])
+        .output()
+        .expect("run lsof");
         String::from_utf8_lossy(&out.stdout)
             .lines()
             .filter_map(|l| l.strip_prefix('n').map(std::path::PathBuf::from))
@@ -191,13 +194,14 @@ fn open_files_are_lsof_s() {
     for file in [&input, &output, &other] {
         std::fs::write(file, b"").expect("write a file");
     }
-    let mut child = aterm_uds::spawnfd::command("/bin/sh")
-        .args(["-c", "echo ran; while :; do :; done"])
-        .stdin(std::fs::File::open(&input).expect("open"))
-        .stdout(std::fs::File::create(&output).expect("create"))
-        .stderr(aterm_uds::spawnfd::Stdio::null())
-        .spawn()
-        .expect("spawn a holder");
+    let mut child =
+        aterm_uds::spawnfd::command(aterm_uds::deadline::stand_in(Path::new("/bin/sh")))
+            .args(["-c", "echo ran; while :; do :; done"])
+            .stdin(std::fs::File::open(&input).expect("open"))
+            .stdout(std::fs::File::create(&output).expect("create"))
+            .stderr(aterm_uds::spawnfd::Stdio::null())
+            .spawn()
+            .expect("spawn a holder");
     let pid = child.id();
     let hang = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     while std::fs::read(&output).ok().as_deref() != Some(b"ran\n".as_slice()) {
@@ -402,6 +406,29 @@ fn the_harness_own_hand_holds_nothing_against_it_and_unread_input_holds_the_tab(
         let line = STATUS.replace("hand=-", &format!("hand=- input={input}"));
         assert!(!held_by_status(&line, 0), "{line}");
     }
+}
+
+/// A HAND NO WINDOW HOST HOLDS IS THE PERSON'S KEY (2026-10-30 review 8): every hand
+/// `driver_hand` counts but another harness process's own lease, whichever form names its holder.
+#[test]
+fn another_harness_processs_hand_is_no_outside_hand() {
+    for (hand, outside) in [
+        ("lease:orchestrator", true),
+        ("turn:7:manager", true),
+        ("lease:aterm-harness@1", false),
+        ("turn:7:aterm-harness%402", false),
+        ("turn:7", false),
+        ("-", false),
+    ] {
+        let line = STATUS.replace("hand=-", &format!("hand={hand}"));
+        assert_eq!(
+            crate::harness::relaunch::outside_hand(&line),
+            outside,
+            "{line}"
+        );
+    }
+    let ours = STATUS.replace("hand=-", &format!("hand=lease:{}", hand_name()));
+    assert!(!crate::harness::relaunch::outside_hand(&ours), "{ours}");
 }
 
 #[test]
@@ -1630,6 +1657,7 @@ fn a_launch_that_cannot_be_carried_is_refused_before_the_agent_is_asked_to_wind_
             line,
             tap_dropped: None,
             line_dir: None,
+            command: None,
         })
     };
     let report = || Report {
@@ -2734,7 +2762,9 @@ pub(super) fn side_by_side<'a>(cases: Vec<Box<dyn FnOnce() + Send + 'a>>) {
 
 /// A pid that was a process and is not one now.
 fn dead_pid() -> u32 {
-    let mut child = Command::new("true").spawn().expect("spawn");
+    let mut child = Command::new(aterm_uds::deadline::stand_in(Path::new("/usr/bin/true")))
+        .spawn()
+        .expect("spawn");
     let dead = child.id();
     child.wait().expect("reap");
     dead
@@ -3610,7 +3640,7 @@ const TOKEN: &str = "0badf00d0badf00d";
 struct Answers {
     /// Columns after the tab's `sessions` row (`active=1 wfocus=1`).
     row: &'static str,
-    /// The `text --json` body.
+    /// The `text --json` body ([`crate::harness::UNANSWERED`]: none).
     screen: String,
     /// After this many `text` replies, this body instead.
     after: Option<(usize, String)>,
@@ -3770,6 +3800,7 @@ fn instance_for(
                 match (&answers.after, std::fs::read_to_string(&screen_file)) {
                     (_, Ok(written)) => format!("OK {}", written.trim()),
                     (Some((n, later)), _) if texts > *n => format!("OK {later}"),
+                    _ if answers.screen == crate::harness::UNANSWERED => answers.screen.clone(),
                     _ => format!("OK {}", answers.screen),
                 }
             }
@@ -6208,7 +6239,9 @@ fn the_upgrades_first_move_onto_a_build_never_run_here_is_probed_first() {
     assert_eq!(ran.get(), 1, "the crash's probe alone");
 }
 
-/// [`build_start::probe`] runs the build as its relaunch would, without an agent.
+/// [`build_start::probe`] runs the build as its relaunch would, without an agent, and holds it
+/// from before its start until it exits with a code of its own: a probe killed at its bound leaves its
+/// build held ([`crate::harness::first_exec::held`]).
 #[cfg(unix)]
 #[test]
 fn the_start_probe_runs_the_build_with_its_help_flag_bounded() {
@@ -6226,21 +6259,33 @@ fn the_start_probe_runs_the_build_with_its_help_flag_bounded() {
     );
     let hangs = dir.join("hangs");
     sh_script(&hangs, "sleep 600");
+    let holds = dir.join("holds");
+    let held =
+        |exe: &Path| crate::harness::first_exec::held(&holds, exe, std::time::SystemTime::now());
     assert_eq!(
-        version_of(&crashing),
+        version_of(&crashing, &holds),
         Probed::Version(Version::parse("2.1.999").expect("v"))
     );
     assert_eq!(
-        probe(&crashing),
+        probe(&crashing, &holds),
         Probe::Exited,
         "a build that crashes at start"
     );
-    assert_eq!(probe(&starts), Probe::Starts);
-    assert_eq!(probe(&dir.join("absent")), Probe::NoExec);
+    assert_eq!(probe(&starts, &holds), Probe::Starts);
+    assert_eq!(probe(&dir.join("absent"), &holds), Probe::NoExec);
+    assert!(
+        !held(&dir),
+        "an exit of its own, or no start, releases the hold"
+    );
     assert_eq!(
-        probe_within(&hangs, Duration::from_millis(300)),
+        probe_within(&hangs, Duration::from_millis(300), Some(&holds)),
         Probe::TimedOut
     );
+    assert!(
+        held(&hangs),
+        "a probe killed at its bound leaves its build held"
+    );
+    assert!(!held(&starts));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -6521,16 +6566,17 @@ fn the_settings_chain_reads_no_recycled_pids_settings_flag() {
     .expect("transcript");
     let flag = dir.join("team.json");
     std::fs::write(&flag, r#"{"availableModels":["claude-fable-5-1"]}"#).expect("team");
-    let mut holder = aterm_uds::spawnfd::command("/bin/sh")
-        .arg("-c")
-        .arg("read line")
-        .arg("--settings")
-        .arg(&flag)
-        .stdin(aterm_uds::spawnfd::Stdio::piped())
-        .stdout(aterm_uds::spawnfd::Stdio::null())
-        .stderr(aterm_uds::spawnfd::Stdio::null())
-        .spawn()
-        .expect("the process");
+    let mut holder =
+        aterm_uds::spawnfd::command(aterm_uds::deadline::stand_in(Path::new("/bin/sh")))
+            .arg("-c")
+            .arg("read line")
+            .arg("--settings")
+            .arg(&flag)
+            .stdin(aterm_uds::spawnfd::Stdio::piped())
+            .stdout(aterm_uds::spawnfd::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::null())
+            .spawn()
+            .expect("the process");
     for _ in 0..3_000 {
         if atpkg::caller_shell::process_args(holder.id())
             .is_some_and(|a| a.argv.iter().any(|arg| arg == "--settings"))
@@ -7445,7 +7491,7 @@ fn a_relaunch_that_never_carries_on_is_noted_once_past_its_bound() {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn a_restart_whose_agent_is_not_reaped_yet_says_when_it_ended() {
-    let mut zombie = Command::new("/bin/sleep")
+    let mut zombie = Command::new(aterm_uds::deadline::stand_in(Path::new("/bin/sleep")))
         .arg("60")
         .stdin(aterm_uds::spawnfd::Stdio::null())
         .spawn()
@@ -7486,7 +7532,7 @@ fn relaunched_over(name: &str, pid: u32) -> St {
         sock: Some(sock),
         ..drive(&dir)
     };
-    let mut shell = Command::new("/bin/sleep")
+    let mut shell = Command::new(aterm_uds::deadline::stand_in(Path::new("/bin/sleep")))
         .arg("60")
         .process_group(0)
         .stdin(aterm_uds::spawnfd::Stdio::null())
@@ -8397,7 +8443,6 @@ fn the_real_classifier_conforms_to_the_upgrade_look_model() {
     let dir = scratch("look-bind");
     let mut opts = drive(&dir);
     opts.only_sid = Some(TAB.to_string());
-    seed_builds(&opts);
     let tabs = the_tab();
     let now = 1_000_000;
     #[derive(Clone, Copy, Debug, PartialEq)]
@@ -8446,7 +8491,7 @@ fn the_real_classifier_conforms_to_the_upgrade_look_model() {
                                     &opts,
                                     &files,
                                     &tabs,
-                                    || Targets::read(&opts.home),
+                                    newer,
                                     |_| args.clone(),
                                     |_| group.then_some(101),
                                     |_| match ids {
@@ -8507,7 +8552,7 @@ fn the_real_classifier_conforms_to_the_upgrade_look_model() {
             &opts,
             &[record("unknown")],
             &tabs,
-            || Targets::read(&opts.home),
+            newer,
             |_| Some(atpkg::caller_shell::ProcArgs::default()),
             |_| Some(101),
             |_| None,
@@ -8684,12 +8729,64 @@ fn a_conversation_resumed_in_another_tab_is_retabbed_at_the_attach() {
 /// A bash, a dialect the relaunch line is written for, alive until the test lets it go: it
 /// blocks in its own `read` of a pipe the handle holds, so it never ends on a clock a slow
 /// test outlives (a gone bash is a `<defunct>` zombie, a shell with no dialect).
-fn stand_in_shell() -> aterm_uds::spawnfd::Child {
-    Command::new("/bin/bash")
-        .args(["-c", "read -r _"])
+fn stand_in_shell() -> ShellChild {
+    stand_in_shell_at(None)
+}
+
+/// A private image whose real basename identifies the shell's dialect. Its child must write
+/// proof before the directory may go; an argv or executable-path read alone is insufficient.
+fn shell_image(from: &Path, name: &str) -> aterm_uds::deadline::KeptUntilRan {
+    let dir = aterm_tempfile::tempdir()
+        .expect("a shell image directory")
+        .keep();
+    let image = aterm_uds::deadline::KeptUntilRan::new(dir);
+    aterm_uds::deadline::ad_hoc_copy(from, &image.path().join(name));
+    image
+}
+
+struct ShellChild {
+    child: aterm_uds::spawnfd::Child,
+    _image: aterm_uds::deadline::KeptUntilRan,
+}
+
+impl std::ops::Deref for ShellChild {
+    type Target = aterm_uds::spawnfd::Child;
+
+    fn deref(&self) -> &Self::Target {
+        &self.child
+    }
+}
+
+impl std::ops::DerefMut for ShellChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.child
+    }
+}
+
+impl Drop for ShellChild {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn stand_in_shell_at(cwd: Option<&Path>) -> ShellChild {
+    let mut image = shell_image(Path::new("/bin/bash"), "bash");
+    let mut command = Command::new(image.path().join("bash"));
+    command
+        .args(["-c", "printf 'ran\\n'; read -r _"])
         .stdin(aterm_uds::spawnfd::Stdio::piped())
-        .spawn()
-        .expect("bash")
+        .stdout(aterm_uds::spawnfd::Stdio::piped());
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    let mut child = command.spawn().expect("bash");
+    aterm_uds::deadline::prints(&mut child, "ran", aterm_uds::deadline::ECHO_HANG);
+    image.ran();
+    ShellChild {
+        child,
+        _image: image,
+    }
 }
 
 /// The owner's `Skip` and `Not today` hold a crash's relaunch.
@@ -9445,7 +9542,7 @@ fn a_relaunch_on_exit_needs_an_exit_and_a_conversation_on_record() {
 struct DeadAgent {
     opts: Opts,
     dir: ScratchDir,
-    shell: aterm_uds::spawnfd::Child,
+    shell: ShellChild,
     snap: Snapshot,
     record: PathBuf,
 }
@@ -13394,6 +13491,15 @@ fn a_relaunch_of_a_task_done_under_land_is_carried_on_with_nothing() {
             .collect()
     };
     save(&opts, SESSION, &in_flight);
+    // No step adopted the agent (`relaunched_pid` 0, as a relaunch whose own step ended before
+    // the agent registered leaves it): the loop's first resume adopts it, as that step would
+    // have, and the next carries on.
+    let adopted = resume(&opts);
+    assert_eq!(
+        (adopted.step.as_str(), adopted.pid),
+        ("adopted", pid),
+        "{adopted:?}"
+    );
     let carried = resume(&opts);
     assert_eq!(carried.step, "wait:tab-ownership-changed", "{carried:?}");
     assert!(owed(&opts), "the carry-on is still owed");
@@ -13421,9 +13527,113 @@ fn a_relaunch_of_a_task_done_under_land_is_carried_on_with_nothing() {
         .collect();
     assert_eq!(rows, std::slice::from_ref(&st.outcome), "said once");
     assert_eq!(resume_as(&opts, true, None).step, "current");
+    // CRUISE'S STOP FOR REPLIES THAT REPEAT WITH NO WORK holds a carry-on as it holds the loop.
+    save(&opts, SESSION, &in_flight);
+    asked.lock().unwrap().clear();
+    let r = super::super::relaunch::resume_held(&opts, None);
+    assert_eq!(
+        (r.step.as_str(), r.pid),
+        (super::super::relaunch::CARRIED_HELD, pid),
+        "{r:?}"
+    );
+    assert!(!owed(&opts), "owed no more");
+    assert_eq!(typing(&asked), Vec::<String>::new(), "nothing typed");
     let _ = agent.kill();
     let _ = agent.wait();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A relaunch whose own step ended before its agent registered the conversation (its record
+/// never adopted the agent) is adopted at the loop's idle point, under the row kind that step's
+/// own row would have had (`upgrade` for an upgrade), and carried on at once, at the same point:
+/// typed on (`wait:tab-ownership-changed` here) or, at a task done under Land, carried on with
+/// nothing ([`CARRIED_DONE`]), the adoption's row before it either way. NEGATIVE CONTROL: an agent
+/// already adopted is only carried on, with no adoption row.
+#[cfg(unix)]
+#[test]
+fn a_relaunch_its_own_step_never_adopted_is_adopted_and_carried_on_at_the_loops_point() {
+    for done_under_land in [false, true] {
+        for (cause, kind) in [(CAUSE_HOST, "carry-on"), ("", "upgrade")] {
+            let case = format!("{kind}, done under Land {done_under_land}");
+            let dir = scratch(&format!("adopted-at-point-{kind}-{done_under_land}"));
+            let (sock, asked) = instance(&dir);
+            let opts = Opts {
+                sock: Some(sock),
+                only_sid: Some(TAB.to_string()),
+                background: false,
+                ..drive(&dir)
+            };
+            let mut agent = parked().spawn().expect("spawn");
+            let (pid, me) = (agent.id(), std::process::id());
+            wait_exec(pid);
+            register(&opts.home, pid, SESSION);
+            let in_flight = St {
+                phase: Phase::Relaunched { at_s: now_s() },
+                pid: dead_pid(),
+                shell: me,
+                tab: TAB.to_string(),
+                to: "9.9.9".to_string(),
+                source: "same".to_string(),
+                cause: cause.to_string(),
+                ..St::default()
+            };
+            let carried = if done_under_land {
+                CARRIED_DONE
+            } else {
+                "wait:tab-ownership-changed"
+            };
+            save(&opts, SESSION, &in_flight);
+            let mut rows = Vec::new();
+            let r = resume_at_point(&opts, done_under_land, None, |kind, r| {
+                rows.push((kind.to_string(), r.step.clone(), r.pid));
+            });
+            let mut want = vec![(kind.to_string(), "adopted".to_string(), pid)];
+            if done_under_land {
+                want.push(("carry-on".to_string(), CARRIED_DONE.to_string(), pid));
+            }
+            assert_eq!(
+                rows, want,
+                "{case}: the adoption's row, said as the relaunch's own, before the carry-on's"
+            );
+            assert_eq!(
+                (r.step.as_str(), r.pid),
+                (carried, pid),
+                "{case}: carried on at once, at the same point"
+            );
+            let st = load(&opts, SESSION).expect("state");
+            assert_eq!(st.relaunched_pid, pid, "{case}: adopted: {st:?}");
+            let typed = asked.lock().unwrap().iter().any(|l| {
+                let verb = l.split_whitespace().find(|w| !w.starts_with('@'));
+                matches!(verb, Some("turn" | "send" | "paste" | "key"))
+            });
+            assert!(!typed, "{case}: nothing typed");
+            save(
+                &opts,
+                SESSION,
+                &St {
+                    relaunched_pid: pid,
+                    ..in_flight
+                },
+            );
+            let mut again = Vec::new();
+            let r = resume_at_point(&opts, done_under_land, None, |kind, r| {
+                again.push((kind.to_string(), r.step.clone()));
+            });
+            let want: Vec<(String, String)> = if done_under_land {
+                vec![("carry-on".to_string(), CARRIED_DONE.to_string())]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                (r.step.as_str(), again),
+                (carried, want),
+                "{case}: NEGATIVE CONTROL: an agent already adopted is only carried on"
+            );
+            let _ = agent.kill();
+            let _ = agent.wait();
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
 }
 
 /// One move, one `adopted` row.
@@ -13529,7 +13739,7 @@ fn an_adoption_is_said_once_in_the_words_of_its_move() {
     assert_eq!((r.step.as_str(), r.pid), ("adopted", t), "{r:?}");
     let rows = ledger_details(&opts, "adopted");
     assert_eq!(rows.len(), 3, "a new move, its own row: {rows:?}");
-    assert_eq!(rows[2], Adopted::Land.detail(), "under Land: {rows:?}");
+    assert_eq!(rows[2], Adopted::Owed.detail(), "under Land too: {rows:?}");
     write_transcript(
         &opts.home,
         &[
@@ -13640,11 +13850,25 @@ fn land_row() -> String {
     user_row(&json[1..json.len() - 1])
 }
 
-/// A clean defense, escaped for [`turn_by`]: what lands a task answering
-/// Land's instruction ([`land_row`]; Autopilot Land).
+/// A clean defense, escaped for [`turn_by`]: what answers Land's instruction ([`land_row`];
+/// Autopilot Land) and is then audited by the land check ([`land_check_row`]).
 #[cfg(unix)]
 const LANDED_JSON: &str =
     "Landed and verified.\\nNothing left: it is merged into the remote main branch.";
+
+/// The land check as a [`user_row`], its words escaped for JSON.
+#[cfg(unix)]
+fn land_check_row() -> String {
+    let json = aterm_json::to_string(&aterm_json::Value::from(
+        crate::supervise::policy::turn_end::LAND_CHECK,
+    ))
+    .expect("json");
+    user_row(&json[1..json.len() - 1])
+}
+
+/// The land check's answer that lands a task ([`land_check_row`]).
+#[cfg(unix)]
+const LANDED_WORD: &str = crate::supervise::policy::land_check::LANDED;
 
 /// [`user_row`], recorded `at` (Claude Code's `timestamp`).
 #[cfg(unix)]
@@ -15167,14 +15391,7 @@ fn a_relaunch_into_the_shells_own_directory_spelled_another_way_needs_no_cd() {
     let spelled = dir.join("spelled");
     std::os::unix::fs::symlink(&real, &spelled).expect("a second spelling");
     // A bash the plan reads as one (its own exec path), standing in its directory.
-    let mut shell = Command::new("/bin/bash")
-        .args(["-c", "sleep 60; :"])
-        .current_dir(&real)
-        .stdin(aterm_uds::spawnfd::Stdio::null())
-        .stdout(aterm_uds::spawnfd::Stdio::null())
-        .stderr(aterm_uds::spawnfd::Stdio::null())
-        .spawn()
-        .expect("a bash");
+    let mut shell = stand_in_shell_at(Some(&real));
     let pid = shell.id();
     let line_in = |cwd: &Path| {
         let cwd = cwd.to_str().expect("utf-8").to_owned();
@@ -16372,41 +16589,21 @@ fn ledger_details(opts: &Opts, step: &str) -> Vec<String> {
         .collect()
 }
 
-/// `/bin/zsh`, or where none is installed (stock Debian and Ubuntu ship none) a
+/// A signed private `zsh`, or where none is installed (stock Debian and Ubuntu ship none) a
 /// copy of `/bin/sh` named `zsh`: [`tty_zsh`] needs a shell that leads its
 /// terminal and whose executable reads as zsh (`process_args(..).exec_path`,
 /// `Dialect::from_exe_name`), and only the file's name decides that.
 #[cfg(unix)]
-fn zsh_executable() -> &'static Path {
-    static ZSH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    ZSH.get_or_init(|| {
-        let installed = Path::new("/bin/zsh");
+fn zsh_image() -> aterm_uds::deadline::KeptUntilRan {
+    let installed = Path::new("/bin/zsh");
+    shell_image(
         if installed.exists() {
-            return installed.to_path_buf();
-        }
-        let exe = std::env::current_exe().expect("the test binary's path");
-        let dir = exe
-            .parent()
-            .expect("the test binary's folder")
-            .join("aterm-agent-zsh-stand-in");
-        let zsh = dir.join("zsh");
-        if zsh.exists() {
-            return zsh;
-        }
-        std::fs::create_dir_all(&dir).expect("the stand-in's folder");
-        let laying = dir.join(format!("zsh.{}", std::process::id()));
-        let copied = aterm_uds::deadline::output_until(
-            aterm_uds::spawnfd::command("cp")
-                .arg("/bin/sh")
-                .arg(&laying),
-            std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
-        )
-        .unwrap_or_else(|e| panic!("cp within the hang detector: {e}"))
-        .status;
-        assert!(copied.success(), "copy /bin/sh to {laying:?}: {copied}");
-        std::fs::rename(&laying, &zsh).expect("lay the stand-in");
-        zsh
-    })
+            installed
+        } else {
+            Path::new("/bin/sh")
+        },
+        "zsh",
+    )
 }
 
 /// A child running on a pseudo-terminal whose master descriptor stays open only
@@ -16415,6 +16612,7 @@ fn zsh_executable() -> &'static Path {
 struct TtyChild {
     child: std::process::Child,
     _master: std::os::fd::OwnedFd,
+    image: Option<aterm_uds::deadline::KeptUntilRan>,
 }
 
 #[cfg(unix)]
@@ -16441,7 +16639,7 @@ impl Drop for TtyChild {
     }
 }
 
-/// A zsh ([`zsh_executable`]) that is the session leader of a pseudo-terminal
+/// A zsh ([`zsh_image`]) that is the session leader of a pseudo-terminal
 /// of its own and its foreground process group (`pgid == tpgid`): the shell a
 /// relaunch waits to hold its terminal again.
 #[cfg(unix)]
@@ -16453,10 +16651,15 @@ fn tty_zsh() -> TtyChild {
     // SAFETY: both descriptors were just opened above and are owned exclusively here.
     let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
     let tty = |fd: &OwnedFd| std::process::Stdio::from(fd.try_clone().expect("dup"));
-    let exe = zsh_executable();
-    let mut zsh = std::process::Command::new(exe);
+    let image = zsh_image();
+    let exe = image.path().join("zsh");
+    let proof = image.path().join("ran");
+    let sleeper = aterm_uds::deadline::stand_in(Path::new("/bin/sleep"));
+    let mut zsh = std::process::Command::new(&exe);
     zsh.inherit_nothing()
-        .args(["-f", "-c", "sleep 60; :"])
+        .args(["-f", "-c", "printf 'ran\\n' > \"$1\"; \"$2\" 60; :", "zsh"])
+        .arg(&proof)
+        .arg(sleeper)
         .stdin(tty(&slave))
         .stdout(tty(&slave))
         .stderr(tty(&slave));
@@ -16473,17 +16676,23 @@ fn tty_zsh() -> TtyChild {
         panic!(
             "zsh spawn failed: {err:?}; exe={} ({:?})",
             exe.display(),
-            std::fs::symlink_metadata(exe).map(|m| (m.file_type(), m.len())),
+            std::fs::symlink_metadata(&exe).map(|m| (m.file_type(), m.len())),
         )
     });
     drop(slave);
-    let child = TtyChild {
+    let mut child = TtyChild {
         child,
         _master: master,
+        image: Some(image),
     };
     for _ in 0..6_000 {
-        if ids(child.id())
-            .is_some_and(|(_, pgid, tpgid)| i64::from(child.id()) == pgid && pgid == tpgid)
+        let proven = std::fs::read(&proof).ok().as_deref() == Some(b"ran\n".as_slice());
+        if proven {
+            child.image.as_mut().expect("the private zsh image").ran();
+        }
+        if proven
+            && ids(child.id())
+                .is_some_and(|(_, pgid, tpgid)| i64::from(child.id()) == pgid && pgid == tpgid)
             && atpkg::caller_shell::process_args(child.id())
                 .is_some_and(|a| a.exec_path.ends_with("zsh"))
         {
@@ -16491,7 +16700,7 @@ fn tty_zsh() -> TtyChild {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    panic!("zsh never held its terminal");
+    panic!("zsh never wrote its proof and held its terminal");
 }
 
 /// The pty host's argv: this test binary, running only [`host_a_pty_when_asked`].
@@ -16655,6 +16864,7 @@ fn tty_agent(env: &[(&str, &Path)], cwd: Option<&Path>) -> TtyChild {
     let child = TtyChild {
         child,
         _master: master,
+        image: None,
     };
     for _ in 0..6_000 {
         if ids(child.id())
@@ -17769,10 +17979,11 @@ fn the_wait_log_keeps_each_change_of_wait_with_the_facts_that_decided_it() {
     assert_eq!(st.waits.last().map(|w| w.word.as_str()), Some("w28"));
 }
 
-/// A version probe's deadline (300 ms here) bounds a child that keeps running and one that exits
-/// while its own child still holds stdout. Each script has run once before its probe
-/// ([`crate::harness::stand_in::proven`]), so the deadline meets the script, not macOS's
-/// assessment of a new file.
+/// A version probe's deadline (300 ms here) bounds a child that keeps running, one that exits
+/// while its own child still holds stdout, and one that closes stdout and keeps running; each it
+/// killed stays held, and each that exited on its own does not. Each script has run once before
+/// its probe ([`crate::harness::stand_in::proven`]), so the deadline meets the script, not
+/// macOS's assessment of a new file.
 #[cfg(unix)]
 #[test]
 fn a_version_probe_is_bounded_whole() {
@@ -17801,12 +18012,18 @@ fn a_version_probe_is_bounded_whole() {
             "printf '%s\n' \"$$\" > \"$0.pid\"\n/bin/sleep {parked} &\nprintf '%s\n' \"$!\" > \"$0.child\"\nprintf '%s\n' '2.1.282 (Claude Code)'\nexit 0"
         ),
     );
+    let closes = script(
+        "closes",
+        &format!("printf '%s\n' \"$$\" > \"$0.pid\"\nexec >&-\nexec /bin/sleep {parked}"),
+    );
     let answer = script("answer", "printf '%s\n' '2.1.282 (Claude Code)'");
     let silent = script("silent", "exit 3");
     dir.ran();
-    let results = [&hang, &lingers].map(|exe| version_within(exe, Duration::from_millis(300)));
+    let holds = dir.path().join("holds");
+    let results = [&hang, &lingers, &closes]
+        .map(|exe| version_within(exe, Duration::from_millis(300), Some(&holds)));
     let mut observed = Vec::new();
-    for exe in [&hang, &lingers] {
+    for exe in [&hang, &lingers, &closes] {
         for suffix in [".pid", ".child"] {
             let mut path = exe.as_os_str().to_owned();
             path.push(suffix);
@@ -17832,17 +18049,73 @@ fn a_version_probe_is_bounded_whole() {
     )
     .is_some();
     assert!(gone, "the recorded probe PIDs did not retire: {observed:?}");
-    for (name, result) in ["hang", "lingers"].into_iter().zip(results) {
+    for (name, result) in ["hang", "lingers", "closes"].into_iter().zip(results) {
         assert_eq!(result, Probed::TimedOut, "{name}");
     }
+    let held =
+        |exe: &Path| crate::harness::first_exec::held(&holds, exe, std::time::SystemTime::now());
+    assert!(
+        held(&hang) && held(&lingers) && held(&closes),
+        "a version probe killed at its bound leaves its program held"
+    );
     assert_eq!(
-        version_within(&answer, Duration::from_secs(60)),
+        version_within(&answer, Duration::from_secs(60), Some(&holds)),
         Probed::Version(Version::parse("2.1.282").expect("v"))
     );
     assert_eq!(
-        version_within(&silent, Duration::from_secs(60)),
+        version_within(&silent, Duration::from_secs(60), Some(&holds)),
         Probed::NoVersion
     );
+    assert!(
+        !held(&answer) && !held(&silent),
+        "an exit of its own releases the hold"
+    );
+}
+
+/// An arbitrary script at a managed agent path has no pinned launch policy. Admission must
+/// refuse it before a version probe can start it, even if its last line does not delegate.
+#[cfg(unix)]
+#[test]
+fn a_version_probe_refuses_an_arbitrary_script_at_a_managed_agent_path() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut dir = aterm_uds::deadline::KeptUntilRan::new(
+        aterm_tempfile::Builder::new()
+            .prefix("aterm-managed-script-version-probe-")
+            .tempdir()
+            .expect("exclusive probe directory")
+            .keep(),
+    );
+    let exe = dir.path().join("agents/claude");
+    std::fs::create_dir_all(exe.parent().expect("the agents dir")).expect("the agents dir");
+    std::fs::write(
+        &exe,
+        "#!/bin/sh\nprintf '%s\\n' ran > \"$0.ran\"\nprintf '%s\\n' '2.1.281 (Claude Code)'\n",
+    )
+    .expect("write the unstarted script");
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    let holds = dir.path().join("holds");
+    // Check actual admission first: a regression fails here without executing the script.
+    assert!(
+        crate::harness::first_exec::prepare(
+            &exe,
+            Some(&holds),
+            crate::harness::first_exec::ProbeWord::Version,
+        )
+        .is_err()
+    );
+    assert_eq!(
+        version_within(&exe, Duration::from_secs(60), Some(&holds)),
+        Probed::TimedOut,
+        "an unpinned launch supplies no version"
+    );
+    assert!(!exe.with_extension("ran").exists(), "the script never ran");
+    assert!(
+        !crate::harness::first_exec::held(&holds, &exe, std::time::SystemTime::now()),
+        "refusal registered no fallback hold"
+    );
+    // Both probes refused admission, so no child was started from this directory.
+    dir.ran();
 }
 
 /// The version cache remembers a clean answer while the file is unchanged, but a timeout is no
@@ -20799,6 +21072,29 @@ fn a_listed_model_replaces_every_launch_model_spelling() {
             Some("")
         ),
         v(&["--verbose", "--resume", "ID"])
+    );
+    assert_eq!(
+        with_model(
+            v(&[
+                "--append-system-prompt",
+                "--model",
+                "--add-dir",
+                "--resume",
+                "--resume",
+                "ID"
+            ]),
+            Some("sonnet")
+        ),
+        v(&[
+            "--append-system-prompt",
+            "--model",
+            "--add-dir",
+            "--resume",
+            "--model",
+            "sonnet",
+            "--resume",
+            "ID"
+        ])
     );
 }
 
@@ -24120,7 +24416,7 @@ fn a_relaunchs_lost_monitor_is_looked_at_and_recorded() {
     assert_eq!(rig.carry_on_from(&mut st, MODEL_WAIT).step, "continued");
     let lines = rig.typed();
     assert_eq!(lines.len(), 1, "{lines:?}");
-    assert!(lines[0].contains("may not have come back"), "{lines:?}");
+    assert!(lines[0].contains(upgrade::RELAUNCH_RESTORES), "{lines:?}");
     drop(rig);
     let old_warning = {
         let mut rows = finished_rows();
@@ -24204,6 +24500,8 @@ fn a_cold_restored_tab_reads_its_earlier_tabs_loop_turns_as_the_harnesss() {
         user_row("Fix the lexer and land it."),
         land_row(),
         turn_by("claude-opus-5-5", LANDED_JSON),
+        land_check_row(),
+        turn_by("claude-opus-5-5", LANDED_WORD),
         user_row_at("keep going", at),
         turn_by(
             "claude-opus-5-5",
@@ -24252,6 +24550,8 @@ fn a_cold_restores_note_of_its_earlier_tab_is_read_with_no_record() {
         user_row("Fix the lexer and land it."),
         land_row(),
         turn_by("claude-opus-5-5", LANDED_JSON),
+        land_check_row(),
+        turn_by("claude-opus-5-5", LANDED_WORD),
         user_row_at("keep going", at),
         turn_by(
             "claude-opus-5-5",
@@ -24305,6 +24605,8 @@ fn an_older_restores_tab_is_linked_to_its_earlier_tab_by_the_upgrade_ledger() {
         user_row("Fix the lexer and land it."),
         land_row(),
         turn_by("claude-opus-5-5", LANDED_JSON),
+        land_check_row(),
+        turn_by("claude-opus-5-5", LANDED_WORD),
         user_row_at("keep going", at),
         turn_by(
             "claude-opus-5-5",
@@ -24511,6 +24813,10 @@ fn a_moved_agents_finish_is_read_where_it_wrote_it_after_its_process_is_gone() {
                 + "
 " + &at(turn_by(M, LANDED_JSON), finished_at)
                 + "
+" + &at(land_check_row(), finished_at)
+                + "
+" + &at(turn_by(M, LANDED_WORD), finished_at)
+                + "
 ",
         )
         .expect("the worktree's transcript");
@@ -24589,6 +24895,10 @@ fn a_moved_agents_finish_is_found_by_its_relaunch_when_the_host_never_noted_it()
                 + "
 " + &at(turn_by(M, LANDED_JSON), finished_at)
                 + "
+" + &at(land_check_row(), finished_at)
+                + "
+" + &at(turn_by(M, LANDED_WORD), finished_at)
+                + "
 ",
         )
         .expect("the worktree's transcript");
@@ -24635,6 +24945,8 @@ fn an_earlier_tabs_loop_turns_count_only_until_the_conversation_left_it() {
         user_row("Fix the lexer and land it."),
         land_row(),
         turn_by("claude-opus-5-5", LANDED_JSON),
+        land_check_row(),
+        turn_by("claude-opus-5-5", LANDED_WORD),
         user_row_at("keep going", at),
         turn_by(
             "claude-opus-5-5",
@@ -24705,6 +25017,8 @@ fn finished_rows() -> Vec<String> {
         user_row("Fix the lexer and land it."),
         land_row(),
         turn_by("claude-opus-5-5", LANDED_JSON),
+        land_check_row(),
+        turn_by("claude-opus-5-5", LANDED_WORD),
         own_row(
             "task-notification",
             false,
@@ -24811,6 +25125,50 @@ fn a_finished_conversation_is_carried_on_with_nothing() {
     }
 }
 
+/// A RELAUNCH'S DONE CHECK SAYS THE GO-AHEAD IS NO NEED ONLY OUTSIDE THE PERSON'S HOUR, read off
+/// the `status` the hold is read from: with no typing in the tab, or typing an hour and more ago,
+/// the check is whole; with typing ten minutes ago (past the hold's grace) it says no go-ahead
+/// word, the rest of it the same; a reply whose typing stamp is old holds nothing though a scroll
+/// is recent.
+#[cfg(unix)]
+#[test]
+fn a_relaunchs_done_check_is_cut_within_the_persons_hour() {
+    use crate::supervise::policy::go_ahead::{NEVER_A_NEED, unless_held};
+    use crate::supervise::policy::turn_end::done_check_words;
+    let done = vec![
+        user_row("Fix the lexer and land it."),
+        turn_by(
+            "claude-opus-5-5",
+            "All tasks are complete and verified; nothing is left to do.",
+        ),
+    ];
+    let whole = done_check_words(0);
+    assert_ne!(unless_held(&whole, true), whole);
+    for (status, held) in [
+        ("OK schema=1 hold=0 hand=- human_ms=-", false),
+        ("OK schema=1 hold=0 hand=- human_ms=3700000", false),
+        ("OK schema=1 hold=0 hand=- human_ms=600000", true),
+        (
+            "OK schema=1 hold=0 hand=- human_ms=600000 human_typed_ms=3700000",
+            false,
+        ),
+    ] {
+        let rig = Rig::new(&format!("carry-hour-{}", status.len()), &done);
+        std::fs::write(rig.dir.join("t.status"), status).expect("status");
+        let mut st = rig.st.clone();
+        st.cause = CAUSE_HOST.to_string();
+        let r = rig.carry_on_from(&mut st, MODEL_WAIT);
+        assert_eq!(r.step, "continued:check", "{status}: {r:?}");
+        let typed = rig.typed();
+        assert_eq!(typed.len(), 1, "{status}: {typed:?}");
+        assert_eq!(
+            typed[0].contains(NEVER_A_NEED),
+            !held,
+            "{status}: {typed:?}"
+        );
+    }
+}
+
 /// A relaunch into a done report in words asks the done check, never [`upgrade::CARRY_ON`].
 #[cfg(unix)]
 #[test]
@@ -24853,7 +25211,7 @@ fn a_relaunch_into_a_done_report_in_words_asks_the_done_check() {
         user_row("<bash-input>git log --oneline -3</bash-input>"),
         user_row("<bash-stdout>abc123 fix lexer</bash-stdout><bash-stderr></bash-stderr>"),
     ];
-    let relaunched = upgrade::checking(&resumed_prompt("2.1.282", CAUSE_HOST), false);
+    let relaunched = upgrade::checking(&resumed_prompt("2.1.282", CAUSE_HOST), false, false);
     for (what, extra) in [
         ("a /model", vec![caveat.clone(), model_command, model_out]),
         ("a /usage", usage.to_vec()),
@@ -25034,7 +25392,9 @@ fn a_relaunch_into_a_done_report_in_words_asks_the_done_check() {
 #[cfg(unix)]
 #[test]
 fn a_relaunch_into_a_task_a_land_act_landed_types_nothing() {
-    use crate::supervise::policy::turn_end::{DONE_CHECK, LAND, RULE_API_RETRY, wall_retry_text};
+    use crate::supervise::policy::turn_end::{
+        DONE_CHECK, LAND, LAND_CHECK, RULE_API_RETRY, wall_retry_text,
+    };
     let at = "2026-10-15T10:00:00.000Z";
     let t_ms = i64::try_from(super::super::upgrade_models::parse_utc(at).expect("a time"))
         .expect("seconds")
@@ -25058,16 +25418,17 @@ fn a_relaunch_into_a_task_a_land_act_landed_types_nothing() {
         .collect::<Vec<_>>()
     };
     let done = turn_by("claude-opus-5-5", LANDED_JSON);
+    let landed = turn_by("claude-opus-5-5", LANDED_WORD);
     let idle = turn_by(
         "claude-opus-5-5",
         "No lander is running, so I'm not re-arming that watch.",
     );
-    let cut = |act: &str| {
+    let cut = |act: &str, answer: &String| {
         asked(&[
             user_row(act),
             wall.clone(),
             user_row_at(&retry, at),
-            done.clone(),
+            answer.clone(),
         ])
     };
     let case = |name: &str, rows: &[String], ledgered: bool| {
@@ -25083,19 +25444,41 @@ fn a_relaunch_into_a_task_a_land_act_landed_types_nothing() {
         (r.step, rig.typed().len())
     };
     assert_eq!(
-        case("land-done", &asked(&[user_row(LAND), done.clone()]), false),
+        case(
+            "land-done",
+            &asked(&[
+                user_row(LAND),
+                done.clone(),
+                user_row(LAND_CHECK),
+                landed.clone()
+            ]),
+            false
+        ),
         ("done:finished".to_string(), 0),
-        "LAND answered with the clean defense"
+        "LAND answered with the clean defense, the land check with LANDED"
     );
     assert_eq!(
-        case("cut-land-retried", &cut(LAND), true),
-        ("done:finished".to_string(), 0),
-        "the cut LAND's retry answered with the clean defense"
-    );
-    assert_eq!(
-        case("cut-land-unledgered", &cut(LAND), false),
+        case(
+            "land-defended",
+            &asked(&[user_row(LAND), done.clone()]),
+            false
+        ),
         ("continued:check".to_string(), 1),
-        "no ledger: the retry is someone's words"
+        "CONTROL: a clean defense alone lands nothing; the land check decides"
+    );
+    assert_eq!(
+        case("cut-land-check-retried", &cut(LAND_CHECK, &landed), true),
+        ("done:finished".to_string(), 0),
+        "the cut land check's retry answered with LANDED"
+    );
+    assert_eq!(
+        case(
+            "cut-land-check-unledgered",
+            &cut(LAND_CHECK, &landed),
+            false
+        ),
+        ("continued".to_string(), 1),
+        "no ledger: the retry is someone's words, and LANDED alone is no done report"
     );
     assert_eq!(
         case("land-idle", &asked(&[user_row(LAND), idle]), false),
@@ -25103,7 +25486,7 @@ fn a_relaunch_into_a_task_a_land_act_landed_types_nothing() {
         "an idle report answering LAND"
     );
     assert_eq!(
-        case("cut-check-retried", &cut(DONE_CHECK), true),
+        case("cut-check-retried", &cut(DONE_CHECK, &done), true),
         ("continued:check".to_string(), 1),
         "the Cruise prompt's retry answered with the defense"
     );
@@ -25615,6 +25998,188 @@ fn an_open_tasks_restore_line_is_never_decided_off_the_point() {
     assert!(rig.typed().is_empty(), "{:?}", rig.typed());
 }
 
+/// An unreadable ledger withholds an external relaunch's carry, rather than claiming its
+/// standing person exchange or already typed continuation is absent.
+#[cfg(unix)]
+#[test]
+fn a_relaunch_keeps_ledger_read_refusals_distinct_from_no_standing_evidence() {
+    use crate::supervise::approvals;
+    use crate::supervise::policy::turn_end::{RULE_API_RETRY, RULE_LEFT};
+    #[derive(Clone, Copy)]
+    enum Book {
+        Missing,
+        Empty,
+        Left,
+        Typed,
+        LargeLeft,
+        LargeTyped,
+        Invalid,
+        Directory,
+    }
+    let exchange = vec![
+        r#"{"type":"user","uuid":"u-1","isSidechain":false,"message":{"role":"user","content":"What is left?"},"origin":{"kind":"human"}}"#.to_string(),
+        r#"{"type":"assistant","uuid":"a-1","isSidechain":false,"message":{"model":"claude-opus-5-5","role":"assistant","content":[{"type":"text","text":"The parser and the docs."}]}}"#.to_string(),
+    ];
+    let line = now_s().saturating_sub(120);
+    let after = i64::try_from(line + 40).expect("seconds") * 1000;
+    for (name, book, step, typed) in [
+        ("evidence-missing", Book::Missing, "continued", 1),
+        ("evidence-empty", Book::Empty, "continued", 1),
+        ("evidence-left", Book::Left, "done:left", 0),
+        ("evidence-typed", Book::Typed, "done:carried", 0),
+        (
+            "evidence-large-left",
+            Book::LargeLeft,
+            "wait:ledger-evidence-unreadable",
+            0,
+        ),
+        (
+            "evidence-large-typed",
+            Book::LargeTyped,
+            "wait:ledger-evidence-unreadable",
+            0,
+        ),
+        (
+            "evidence-invalid",
+            Book::Invalid,
+            "wait:ledger-evidence-unreadable",
+            0,
+        ),
+        (
+            "evidence-directory",
+            Book::Directory,
+            "wait:ledger-evidence-unreadable",
+            0,
+        ),
+    ] {
+        let mut rig = Rig::new(name, &exchange);
+        let root = rig.dir.join("aterm-state");
+        let path = approvals::path_under(&root, Some(TAB)).expect("ledger dir");
+        let standing = match book {
+            Book::Left | Book::LargeLeft => {
+                Some((RULE_LEFT, approvals::Outcome::Skipped, "prompt:u-1"))
+            }
+            Book::Typed | Book::LargeTyped => Some((
+                RULE_API_RETRY,
+                approvals::Outcome::Typed,
+                "The API was overloaded; trying again.",
+            )),
+            _ => None,
+        };
+        let mut body = standing.map_or_else(Vec::new, |(rule_id, outcome, command)| {
+            (approvals::Row {
+                rule_id,
+                outcome,
+                command,
+                reason: "the turn-end policy",
+                box_seq: 1,
+            }
+            .to_json(after, Some(TAB))
+                + "\n")
+                .into_bytes()
+        });
+        match book {
+            Book::Missing => {}
+            Book::Directory => std::fs::create_dir(&path).expect("directory ledger"),
+            _ => {
+                if matches!(book, Book::LargeLeft | Book::LargeTyped) {
+                    // Valid blank rows put the still-open marker before every possible tail.
+                    body.resize((16 << 20) + 1, b'\n');
+                } else if matches!(book, Book::Invalid) {
+                    body.push(0xff);
+                }
+                std::fs::write(&path, body).expect("ledger");
+            }
+        }
+        rig.opts.aterm_state = Some(root);
+        let mut st = rig.st.clone();
+        st.cause = CAUSE_HOST.to_string();
+        st.relaunched(line);
+        let r = rig.carry_on_from(&mut st, MODEL_WAIT);
+        assert_eq!(r.step, step, "{name}: {r:?}");
+        assert_eq!(rig.typed().len(), typed, "{name}: {:?}", rig.typed());
+        if step.starts_with("wait:") {
+            assert!(
+                matches!(st.phase, Phase::Relaunched { .. }),
+                "{name}: the continuation remains owed"
+            );
+        }
+    }
+}
+
+/// Discovery refusals withhold a carry too: readable per-tab books do not prove the
+/// conversation has no acts or holds in a lineage the driver could not read.
+#[cfg(unix)]
+#[test]
+fn a_relaunch_preserves_unknown_lineage_and_upgrade_ledger_evidence() {
+    let rows = vec![
+        user_row("Fix the lexer and land it."),
+        turn_by("claude-opus-5-5", "The lexer and docs remain."),
+    ];
+    for global in [false, true] {
+        for (kind, readable) in [
+            ("missing", true),
+            ("empty", true),
+            ("ordinary", true),
+            ("oversized", false),
+            ("invalid", false),
+            ("directory", false),
+        ] {
+            let name = format!(
+                "discovery-{}-{kind}",
+                if global { "global" } else { "lineage" }
+            );
+            let mut rig = Rig::new(&name, &rows);
+            let root = rig.dir.join("aterm-state");
+            std::fs::create_dir_all(root.join("drive")).expect("drive directory");
+            let path = if global {
+                ledger_path(&rig.opts)
+            } else {
+                earlier_tabs_path(&root, TAB)
+            };
+            match kind {
+                "missing" => {
+                    if path.exists() {
+                        std::fs::remove_file(&path).expect("remove owned discovery file");
+                    }
+                }
+                "directory" => std::fs::create_dir(&path).expect("directory discovery file"),
+                _ => {
+                    let mut bytes = match kind {
+                        "ordinary" if global => {
+                            format!("{{\"t\":1,\"tab\":\"{TAB}\",\"session\":\"{SESSION}\"}}\n")
+                                .into_bytes()
+                        }
+                        "ordinary" => format!("{OLD_TAB}\n").into_bytes(),
+                        "invalid" => vec![0xff],
+                        _ => Vec::new(),
+                    };
+                    if kind == "oversized" {
+                        let cap = if global { 16 << 20 } else { 1 << 20 };
+                        bytes.resize(cap + 1, b'\n');
+                    }
+                    std::fs::write(&path, bytes).expect("discovery file");
+                }
+            }
+            rig.opts.aterm_state = Some(root);
+            let mut st = rig.st.clone();
+            st.cause = CAUSE_HOST.to_string();
+            let r = rig.carry_on_from(&mut st, MODEL_WAIT);
+            if readable {
+                assert_eq!(r.step, "continued", "{name}: {r:?}");
+                assert_eq!(rig.typed().len(), 1, "{name}: {:?}", rig.typed());
+            } else {
+                assert_eq!(r.step, "wait:ledger-evidence-unreadable", "{name}: {r:?}");
+                assert!(rig.typed().is_empty(), "{name}: {:?}", rig.typed());
+                assert!(
+                    matches!(st.phase, Phase::Relaunched { .. }),
+                    "{name}: {st:?}"
+                );
+            }
+        }
+    }
+}
+
 /// A relaunch into a person's own exchange types nothing.
 #[cfg(unix)]
 #[test]
@@ -25978,7 +26543,7 @@ fn a_finished_task_is_read_on_from_where_the_last_read_ended() {
             writeln!(f, "{row}").expect("row");
         }
     };
-    write(&finished_rows()[..3]);
+    write(&finished_rows()[..5]);
     let mut memo = Finished::default();
     assert_eq!(memo.of_in(&claude, SESSION, &[]), Some(true));
     let pad = "x".repeat(1000);
@@ -26013,7 +26578,12 @@ fn a_finished_task_is_read_on_from_where_the_last_read_ended() {
     );
     append(&[user_row("Now add the flag.")]);
     assert_eq!(memo.of_in(&claude, SESSION, &[]), Some(false));
-    append(&[land_row(), turn_by("claude-opus-5-5", LANDED_JSON)]);
+    append(&[
+        land_row(),
+        turn_by("claude-opus-5-5", LANDED_JSON),
+        land_check_row(),
+        turn_by("claude-opus-5-5", LANDED_WORD),
+    ]);
     assert_eq!(memo.of_in(&claude, SESSION, &[]), Some(true));
     assert_eq!(Finished::default().of_in(&claude, SESSION, &[]), Some(true));
     write(&finished_rows()[..1]);
@@ -26028,7 +26598,7 @@ fn a_finished_task_is_read_on_from_where_the_last_read_ended() {
 fn a_new_loops_first_read_reaches_a_token_behind_long_wakes() {
     let dir = scratch("finished-new-loop");
     let pad = "x".repeat(1000);
-    let mut rows = finished_rows()[..3].to_vec();
+    let mut rows = finished_rows()[..5].to_vec();
     rows.extend((0..300).flat_map(|_| {
         [
             own_row(
@@ -26079,7 +26649,7 @@ fn a_token_behind_more_wakes_than_a_restarts_read_ends_the_task() {
         })
         .collect();
     let then = |head: &[String]| -> Vec<String> { head.iter().chain(&wakes).cloned().collect() };
-    let finished = then(&finished_rows()[..3]);
+    let finished = then(&finished_rows()[..5]);
     assert!(finished.iter().map(String::len).sum::<usize>() as u64 > FINISHED_ONCE_BYTES + 100_000);
     let rig = Rig::new("carry-finished-behind-more-wakes", &finished);
     assert!(
@@ -26092,7 +26662,7 @@ fn a_token_behind_more_wakes_than_a_restarts_read_ends_the_task() {
     assert_eq!(r.step, "done:finished", "{r:?}");
     assert!(rig.typed().is_empty(), "{:?}", rig.typed());
     drop(rig);
-    let mut reopened = finished_rows()[..3].to_vec();
+    let mut reopened = finished_rows()[..5].to_vec();
     reopened.extend([
         user_row("Now add the flag."),
         turn_by("claude-opus-5-5", "Started on the flag."),
@@ -26309,7 +26879,7 @@ fn a_token_behind_long_wakes_is_moved_quietly_under_upgrade_ask() {
     for (name, head, announced) in [
         (
             "ask-finished-behind-wakes",
-            finished_rows()[..3].to_vec(),
+            finished_rows()[..5].to_vec(),
             false,
         ),
         ("ask-open-behind-wakes", open, true),
@@ -26357,7 +26927,7 @@ fn the_looks_memo_reads_on_and_a_carry_ons_readers_share_one_read() {
         Some(true),
         "the first look"
     );
-    rewrite("Nothing left:", "Nothing more ");
+    rewrite("LANDED", "LANDER");
     assert_eq!(
         records.finished_in(&memos, SESSION, &[]),
         Some(true),
@@ -27702,6 +28272,8 @@ fn a_moved_agents_finish_is_read_where_it_writes_now() {
         lines(&[
             land_row(),
             turn_by(M, LANDED_JSON),
+            land_check_row(),
+            turn_by(M, LANDED_WORD),
             own_row(
                 "task-notification",
                 false,
@@ -27795,6 +28367,10 @@ fn a_live_moved_agents_finish_is_read_where_it_writes_now() {
         land_row()
             + "
 " + &turn_by("claude-opus-5-5", LANDED_JSON)
+            + "
+" + &land_check_row()
+            + "
+" + &turn_by("claude-opus-5-5", LANDED_WORD)
             + "
 ",
     )
@@ -28181,10 +28757,12 @@ fn the_clis_sweep_reads_the_tabs_of_every_instance_it_is_given() {
     assert_eq!(none, Vec::<u32>::new(), "CONTROL: none given, none read");
 }
 
-/// Under autopilot land a relaunch's carry-on types nothing of cruise's.
+/// UNDER LAND A RELAUNCH IS CARRIED ON TOO (owner report 2026-11-01), with the restart's facts and
+/// no done check of Cruise's: a report of done is the Land loop's to weigh at the next turn end.
+/// CONTROL: Cruise's check is typed where the last words claim done.
 #[cfg(unix)]
 #[test]
-fn a_relaunch_under_land_types_no_carry_on_and_leaves_its_point_to_the_loop() {
+fn a_relaunch_under_land_is_carried_on_with_no_done_check_of_cruises() {
     use super::super::relaunch::{CAUSE_MEMORY, CAUSE_STALL};
     let working = vec![
         user_row("Fix the lexer and land it."),
@@ -28239,25 +28817,292 @@ fn a_relaunch_under_land_types_no_carry_on_and_leaves_its_point_to_the_loop() {
                 let case = format!(
                     "{what}, cause `{cause}`, land {land}, by status {by_status}: {r:?} {typed:?}"
                 );
+                assert_eq!(typed.len(), 1, "{case}");
                 if land || by_status {
-                    assert_eq!(r.step, "done:landing", "{case}");
-                    assert!(typed.is_empty(), "{case}");
-                    assert_eq!(st.phase, Phase::Done, "{case}");
-                    assert!(!moved(&r.step), "the point stands: {case}");
-                    assert_eq!(host_turn(&r.step), None, "{case}");
-                    assert!(st.confirming(), "the look stays open: {case}");
-                    assert_eq!(
-                        load(&opts, SESSION).map(|saved| saved.phase),
-                        Some(Phase::Done),
-                        "saved: {case}"
-                    );
+                    assert_eq!(r.step, "continued", "{case}");
+                    assert!(typed[0].contains(upgrade::RELAUNCH_RESTORES), "{case}");
                 } else {
                     assert_eq!(r.step, cruise, "{case}");
-                    assert_eq!(typed.len(), 1, "{case}");
                 }
             }
         }
     }
+}
+
+/// A RELAUNCH UNDER LAND WHOSE LAST REPLY DEFENDS THE WORK TYPES NOTHING, its land check not yet
+/// answered: the loop's check at this point reads the defense (`done:landing`). NEGATIVE CONTROLS:
+/// the check answered `LANDED` is `done:finished`; work going on under Land gets the carry-on; the
+/// same defense under Cruise is a done report. MUTANT: without [`WhereWritten::defended`]'s arm in
+/// `carry_on_once`, the defense under Land is typed the restart's facts and restarts the work.
+#[cfg(unix)]
+#[test]
+fn a_relaunch_under_land_into_a_defense_leaves_it_to_the_land_check() {
+    use super::super::relaunch::LANDING;
+    let defense = "Nothing left: all of it is merged into the remote main branch.";
+    let case = |name: &str, rows: &[String], land: bool| {
+        let rig = Rig::new(name, rows);
+        let opts = Opts {
+            land,
+            ..rig.opts.clone()
+        };
+        let mut st = rig.st.clone();
+        st.cause = CAUSE_HOST.to_string();
+        let mut c = connect(&opts, TAB).expect("control connection");
+        let r = carry_on_with_tab_probe(
+            &opts,
+            blank(&rig.sf),
+            &mut st,
+            &mut c,
+            SESSION,
+            &rig.sf,
+            MODEL_WAIT,
+            |_, _, _| true,
+            None,
+        );
+        (r.step, rig.typed().len())
+    };
+    let asked = user_row("Fix the lexer and land it.");
+    let defended = [
+        asked.clone(),
+        land_row(),
+        turn_by("claude-opus-5-5", defense),
+    ];
+    assert_eq!(
+        case("defended-land", &defended, true),
+        (LANDING.to_string(), 0)
+    );
+    assert_eq!(
+        case("defended-cruise", &defended, false),
+        ("continued:check".to_string(), 1)
+    );
+    let landed = [
+        asked.clone(),
+        land_row(),
+        turn_by("claude-opus-5-5", LANDED_JSON),
+        land_check_row(),
+        turn_by("claude-opus-5-5", LANDED_WORD),
+    ];
+    assert_eq!(
+        case("defended-landed", &landed, true),
+        ("done:finished".to_string(), 0)
+    );
+    let going = [
+        asked,
+        land_row(),
+        turn_by(
+            "claude-opus-5-5",
+            "Committed the parser; the lexer is next.",
+        ),
+    ];
+    assert_eq!(
+        case("defended-going", &going, true),
+        ("continued".to_string(), 1)
+    );
+}
+
+/// A row of a person's own message as Claude Code writes it, at unix second `at`.
+#[cfg(unix)]
+fn person_row_at(text: &str, at: u64) -> String {
+    format!(
+        r#"{{"type":"user","isSidechain":false,"origin":{{"kind":"human"}},"timestamp":"{}","message":{{"role":"user","content":"{text}"}}}}"#,
+        aterm_types::rfc3339::format_rfc3339(at)
+    )
+}
+
+/// The rows Claude Code 2.1.316 writes on resuming a conversation whose tool call the restart cut:
+/// the call's result, then a `<synthetic>` reply, both dated after the relaunch.
+#[cfg(unix)]
+fn restored_rows(at: u64) -> [String; 2] {
+    let at = aterm_types::rfc3339::format_rfc3339(at);
+    [
+        format!(
+            r#"{{"type":"user","isSidechain":false,"timestamp":"{at}","message":{{"role":"user","content":[{{"type":"tool_result","content":"[Tool call interrupted: the session ended before this call's result was recorded, so its outcome is unknown.]","is_error":true,"tool_use_id":"t1"}}]}}}}"#
+        ),
+        format!(
+            r#"{{"type":"assistant","isSidechain":false,"timestamp":"{at}","message":{{"model":"<synthetic>","role":"assistant","stop_reason":"stop_sequence","content":[{{"type":"text","text":"No response requested."}}]}}}}"#
+        ),
+    ]
+}
+
+/// The tab's screen holding `draft` in its composer, as the tab's instance answers it.
+#[cfg(unix)]
+fn composer_screen(draft: &str) -> String {
+    let rule = "─".repeat(20);
+    let col = 2 + draft.chars().count();
+    format!(
+        r#"{{"rows":["{rule}","❯ {draft}","{rule}"],"cursor":{{"row":1,"col":{col}}},"seq":77,"first":0,"gen":"4.77","human_ms":null}}"#
+    )
+}
+
+/// UNSENT INPUT KEEPS THE CARRY-ON OWED (owner report 2026-11-01): nothing is typed over a person's
+/// draft and the prompt is not given up for it; once the composer is empty it is typed, once.
+/// NEGATIVE CONTROL: main answered `done:no-continue` after two minutes and never typed it.
+#[cfg(unix)]
+#[test]
+fn a_draft_keeps_the_carry_on_owed_and_it_is_typed_once_the_composer_clears() {
+    let before = [
+        user_row("Fix the lexer and land it."),
+        turn_by("claude-opus-5-5", "Committing the parser now."),
+    ];
+    let rig = Rig::new("carry-draft", &before);
+    let screen = rig.dir.join("t.screen");
+    std::fs::write(&screen, composer_screen("half a thought")).expect("the draft");
+    let mut st = rig.st.clone();
+    st.cause = CAUSE_ASKED.to_string();
+    let r = rig.carry_on_from(&mut st, MODEL_WAIT);
+    assert_eq!(r.step, "wait:draft", "{r:?}");
+    assert_eq!(rig.typed(), Vec::<String>::new(), "nothing over the draft");
+    assert!(matches!(st.phase, Phase::Relaunched { .. }), "{st:?}");
+    std::fs::write(&screen, composer_screen("")).expect("the draft gone");
+    let r = rig.carry_on_from(&mut st, MODEL_WAIT);
+    assert_eq!(r.step, "continued", "{r:?}");
+    let typed = rig.typed();
+    assert_eq!(typed.len(), 1, "{typed:?}");
+    assert!(typed[0].contains(upgrade::RELAUNCH_RESTORES), "{typed:?}");
+}
+
+/// NOTHING IS TYPED UNDER OFF, and the carry-on stays owed for the switch back. CONTROL: the same
+/// record types under Cruise.
+#[cfg(unix)]
+#[test]
+fn a_relaunch_under_off_types_nothing_and_stays_owed() {
+    let before = [
+        user_row("Fix the lexer and land it."),
+        turn_by("claude-opus-5-5", "Committing the parser now."),
+    ];
+    let rig = Rig::new("carry-off", &before);
+    let status = rig.dir.join("t.status");
+    std::fs::write(
+        &status,
+        "OK schema=1 hold=0 hand=- supervisor=- autopilot=off\n",
+    )
+    .expect("status");
+    let mut st = rig.st.clone();
+    st.cause = CAUSE_ASKED.to_string();
+    let r = rig.carry_on_from(&mut st, MODEL_WAIT);
+    assert_eq!(r.step, "wait:off", "{r:?}");
+    assert_eq!(rig.typed(), Vec::<String>::new());
+    assert!(matches!(st.phase, Phase::Relaunched { .. }), "{st:?}");
+    std::fs::write(
+        &status,
+        "OK schema=1 hold=0 hand=- supervisor=- autopilot=cruise\n",
+    )
+    .expect("status");
+    let r = rig.carry_on_from(&mut st, MODEL_WAIT);
+    assert_eq!(r.step, "continued", "{r:?}");
+    assert_eq!(rig.typed().len(), 1);
+}
+
+/// EVERY CAUSE THAT RESUMES A CONVERSATION OWES ONE PROMPT, under Cruise and under Land: a restart
+/// asked for or forced by a stall, an upgrade's move past its notice (no cause), a crash, aterm's
+/// own end, a memory restart. It names what ended with the process, and a successor process that
+/// finds the same record owes nothing more. CONTROLS: a quiet move and an account's move are
+/// carried with nothing typed (`a_quiet_restart_is_carried_on_with_nothing`).
+#[cfg(unix)]
+#[test]
+fn every_cause_that_resumes_a_conversation_owes_one_prompt_and_a_successor_none() {
+    use super::super::relaunch::{CAUSE_HOST, CAUSE_MEMORY, CAUSE_STALL};
+    let before = [
+        user_row("Fix the lexer and land it."),
+        turn_by("claude-opus-5-5", "Committing the parser now."),
+    ];
+    for land in [false, true] {
+        for cause in [CAUSE_ASKED, CAUSE_STALL, "", CAUSE_HOST, CAUSE_MEMORY] {
+            let name = format!("carry-cause-{land}-{}", cause.replace(':', "-"));
+            let mut rig = Rig::new(&name, &before);
+            rig.opts.land = land;
+            rig.opts.only_sid = Some(TAB.to_string());
+            let mut st = rig.st.clone();
+            st.cause = cause.to_string();
+            let r = rig.carry_on_from(&mut st, MODEL_WAIT);
+            assert_eq!(r.step, "continued", "{name}: {r:?}");
+            let typed = rig.typed();
+            assert_eq!(typed.len(), 1, "{name}: {typed:?}");
+            assert!(
+                typed[0].contains(upgrade::RELAUNCH_RESTORES),
+                "{name}: {typed:?}"
+            );
+            // A successor process knows the conversation only by its record on disk.
+            let again = resume_as(&rig.opts, false, None);
+            assert_eq!(again.step, "wait:model", "{name}: a successor: {again:?}");
+            assert_eq!(rig.typed().len(), 1, "{name}: a successor: {again:?}");
+        }
+    }
+    // CONTROL: a record still owed is the successor's: it reads as owed, and a look through it
+    // goes on to the relaunched agent.
+    let mut rig = Rig::new("carry-successor-owed", &before);
+    rig.opts.only_sid = Some(TAB.to_string());
+    let mut st = rig.st.clone();
+    st.cause = CAUSE_ASKED.to_string();
+    save(&rig.opts, SESSION, &st);
+    assert!(owed(&rig.opts), "{st:?}");
+    let r = resume_as(&rig.opts, false, None);
+    assert_ne!(r.step, "current", "{r:?}");
+}
+
+/// A PERSON'S OWN MESSAGE THAT ARRIVES FIRST WINS: its row dated after the relaunch ends the
+/// carry-on with nothing typed. CONTROLS: the same row dated before the relaunch, and the records
+/// the resume itself restores (a cut call's result and a `<synthetic>` reply dated after it), owe
+/// the prompt still.
+#[cfg(unix)]
+#[test]
+fn a_persons_own_message_first_ends_the_carry_on_and_a_restored_record_does_not() {
+    let at = now_s().saturating_sub(60);
+    let asked = user_row("Fix the lexer and land it.");
+    let working = turn_by("claude-opus-5-5", "Committing the parser now.");
+    let run = |name: &str, rows: &[String]| {
+        let mut all = vec![asked.clone(), working.clone()];
+        all.extend_from_slice(rows);
+        let rig = Rig::new(name, &all);
+        let mut st = rig.st.clone();
+        st.cause = CAUSE_ASKED.to_string();
+        st.phase = Phase::Relaunched { at_s: at };
+        st.relaunched_at = at;
+        let r = rig.carry_on_from(&mut st, MODEL_WAIT);
+        (r.step, rig.typed().len(), st.outcome)
+    };
+    let (step, typed, outcome) = run("carry-person", &[person_row_at("did it restart?", at + 30)]);
+    assert_eq!((step.as_str(), typed), ("done:left", 0), "{outcome}");
+    assert!(
+        outcome.ends_with(&format!("nothing typed: {PERSON_FIRST}")),
+        "{outcome}"
+    );
+    let (step, typed, _) = run(
+        "carry-person-before",
+        &[person_row_at("restart it", at - 30), working.clone()],
+    );
+    assert_eq!((step.as_str(), typed), ("continued", 1));
+    let (step, typed, _) = run("carry-restored", &restored_rows(at + 5));
+    assert_eq!(
+        (step.as_str(), typed),
+        ("continued", 1),
+        "the resume's own records are nobody's message"
+    );
+}
+
+/// THE RELAUNCH'S FIRST REST IS ANY SCREEN NO IDLE COMES TO UNANSWERED. The owner's relaunch of
+/// 2026-11-01 logged `adopted` 19.5 s after the exit: 15 s of it was this wait running out on
+/// `Interrupted · What should Claude do instead?`, which read as a `question` then. A conversation
+/// that ended on the agent's own question still comes back on one.
+#[cfg(unix)]
+#[test]
+fn the_relaunchs_first_rest_is_a_question_a_box_or_a_wall_as_well_as_an_idle() {
+    let dir = scratch("first-rest");
+    let (sock, asked) = instance(&dir);
+    let opts = Opts {
+        sock: Some(sock),
+        ..drive(&dir)
+    };
+    let mut c = connect(&opts, TAB).expect("control connection");
+    let mut hand = Hand::take_or_none(&mut c, TAB);
+    super::super::relaunch::first_idle(&mut c, &mut hand, TAB, Duration::from_secs(15), || true);
+    let asked = asked.lock().unwrap();
+    assert!(
+        asked
+            .iter()
+            .any(|l| l.ends_with(" await agent idle,question,prompt,wall timeout=15000")),
+        "{asked:#?}"
+    );
 }
 
 /// The explicit restart offers exactly what its relaunch carries.
@@ -28886,9 +29731,10 @@ mod ladder_claude;
 #[cfg(unix)]
 #[test]
 fn a_bounded_reader_requires_complete_successful_utf8_evidence() {
+    let shell = aterm_uds::deadline::stand_in(Path::new("/bin/sh"));
     let read = |script: &str, cap| {
         bounded_output(
-            Path::new("/bin/sh"),
+            &shell,
             &["-c".as_ref(), script.as_ref()],
             Duration::from_secs(60),
             cap,
@@ -28911,8 +29757,8 @@ const CLOSED_TOKEN: &str = "closed-tok";
 /// another until one presents `stop` ([`token_server_seen`]). A connection whose `AUTH` names
 /// `refused` is answered `ERR auth` and closed at its first line, as a successor that rebound the
 /// socket answers the window's old token; one naming [`CLOSED_TOKEN`] is closed at its first line
-/// with nothing written; any other line is answered `ERR busy` when it asks for the hand and `OK`
-/// otherwise. Its receiver gets what it was sent, `(token, line)` in order.
+/// with nothing written; status reports an unclaimed session, a hand request gets `ERR busy`,
+/// and other lines get `OK`. Its receiver gets `(token, line)` in order.
 #[cfg(unix)]
 fn token_server(
     dir: &Path,
@@ -28951,6 +29797,8 @@ fn token_server(
                 }
                 let reply: &[u8] = if line.contains(" lease acquire ") {
                     b"ERR busy\n"
+                } else if line == "@s-1 status" {
+                    b"OK supervisor=- supervisor_contract=- supervisor_scope=- supervisor_revision=0\n"
                 } else {
                     b"OK\n"
                 };
@@ -29036,7 +29884,9 @@ fn the_window_drive_presents_the_harness_token_and_falls_back_beside_once() {
             pair("memory-tok", "@s-1 send v"),
             pair("beside-tok", "@s-1 send w"),
             pair("memory-tok", "version"),
+            pair("memory-tok", "@s-1 status"),
             pair("memory-tok", &lease),
+            pair("beside-tok", "@s-1 status"),
             pair("beside-tok", &lease),
         ]
     );
@@ -29081,7 +29931,7 @@ fn an_unparsable_session_file_fails_the_roster_only_while_this_users_process_may
         Some(0),
         "launchd's number: root's process writes no session of this user's"
     );
-    let zombie = Command::new("/bin/sh")
+    let zombie = Command::new(aterm_uds::deadline::stand_in(Path::new("/bin/sh")))
         .args(["-c", "exit 0"])
         .spawn()
         .expect("a child");
@@ -29202,8 +30052,8 @@ fn a_press_restarts_over_background_work_and_resumes() {
     let st = load(&h.opts, SESSION).expect("state");
     assert!(st.line.contains("--resume"), "resumed: {}", st.line);
     assert!(
-        st.quiet,
-        "a press from a round never asked is the quiet flow"
+        !st.quiet,
+        "a press that ended the agent's own work owes the carry-on that says so"
     );
     assert!(!st.press_stands(TAB, now_s()), "the press is spent: {st:?}");
 }
@@ -29296,4 +30146,341 @@ fn a_press_under_off_types_only_the_relaunch_line() {
         assert_eq!(st.quiet, quiet, "{name}: {st:?}");
         assert!(h.typed().is_empty(), "{name}: {:?}", h.typed());
     }
+}
+
+/// Carries `st` on over `rig` on a thread of its own, waited for at most the one-minute hang
+/// detector.
+#[cfg(unix)]
+fn carried(rig: Rig, mut st: St) -> (Rig, St, Report) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let r = rig.carry_on_from(&mut st, MODEL_WAIT);
+        let _ = tx.send((rig, st, r));
+    });
+    rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+        .expect("the carry within the hang detector")
+}
+
+/// A transcript whose last turn owes a continuation.
+#[cfg(unix)]
+fn owed_continuation() -> [String; 2] {
+    [
+        user_row("prepare"),
+        turn_by("claude-opus-5-5", "Saved.\\nATERM-UPGRADE-READY-0badf00d"),
+    ]
+}
+
+/// A carry whose screen read the window leaves unanswered types nothing and waits on the socket
+/// (`wait:no-socket`), its relaunch still in flight, never `done:no-continue`; the next carry, on
+/// a new connection the window answers, types the continuation.
+#[cfg(unix)]
+#[test]
+fn a_carry_whose_screen_read_goes_unanswered_waits_and_carries_on_next() {
+    let mut answers = fenced_answers(vec!["OK status=done"]);
+    answers.after = Some((1, answers.screen.clone()));
+    answers.screen = crate::harness::UNANSWERED.to_string();
+    let mut rig = Rig::with("carry-unanswered-screen", &owed_continuation(), answers);
+    rig.opts.timings.drive_reply = Duration::from_millis(200);
+    let st = rig.st.clone();
+    let (rig, st, r) = carried(rig, st);
+    assert_eq!(r.step, "wait:no-socket", "{r:?}");
+    assert!(matches!(st.phase, Phase::Relaunched { .. }), "{st:?}");
+    assert!(rig.typed().is_empty(), "{:?}", rig.typed());
+    let (rig, st, r) = carried(rig, st);
+    assert_eq!(r.step, "continued", "the next carry answered: {r:?}");
+    assert_eq!(rig.typed().len(), 1, "{:?}", rig.typed());
+    assert_eq!(st.phase, Phase::Done);
+}
+
+/// A continuation whose turn the window leaves unanswered is read off the agent's own record: an
+/// agent whose record never moved waits (`wait:unanswered`), its relaunch still in flight; one
+/// whose status left idle took it (`continued`).
+#[cfg(unix)]
+#[test]
+fn an_unanswered_continuation_is_read_off_the_agents_record() {
+    let answers = fenced_answers(vec![crate::harness::UNANSWERED]);
+    let mut rig = Rig::with(
+        "continuation-unanswered",
+        &owed_continuation(),
+        answers.clone(),
+    );
+    rig.opts.timings.drive_reply = Duration::from_millis(200);
+    let st = rig.st.clone();
+    let (rig, st, r) = carried(rig, st);
+    assert_eq!(r.step, "wait:unanswered", "{r:?}");
+    assert!(matches!(st.phase, Phase::Relaunched { .. }), "{st:?}");
+    assert_eq!(rig.typed().len(), 1, "{:?}", rig.typed());
+    drop(rig);
+
+    let mut rig = Rig::with(
+        "continuation-unanswered-taken",
+        &owed_continuation(),
+        answers,
+    );
+    rig.opts.timings.drive_reply = Duration::from_millis(200);
+    let file = rig
+        .opts
+        .home
+        .join(format!(".claude/sessions/{}.json", rig.sf.pid));
+    let asked = rig.asked.clone();
+    std::thread::spawn(move || {
+        let until = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        while Instant::now() < until {
+            if asked
+                .lock()
+                .is_ok_and(|a| a.iter().any(|l| l.contains(" turn ")))
+            {
+                let idle = std::fs::read_to_string(&file).expect("the agent's record");
+                let busy = idle.replace(
+                    r#""status":"idle","statusUpdatedAt":1"#,
+                    r#""status":"busy","statusUpdatedAt":2"#,
+                );
+                std::fs::write(&file, busy).expect("the agent takes the line");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    });
+    let st = rig.st.clone();
+    let (rig, st, r) = carried(rig, st);
+    assert_eq!(r.step, "continued", "{r:?}");
+    assert_eq!(st.phase, Phase::Done);
+    assert_eq!(rig.typed().len(), 1, "typed once: {:?}", rig.typed());
+}
+
+/// A relaunch line whose request the window leaves unanswered may have run: never the server's
+/// refusal (`failed:relaunch:…`), at a fenced prompt (`turn`) or at bash's (`send`), and nothing is
+/// typed after it on that connection; the step records it as typed and waits, its ask kept
+/// ([`super::super::relaunch::line_unanswered`]).
+#[cfg(unix)]
+#[test]
+fn an_unanswered_relaunch_line_may_have_run() {
+    let mut bash = stand_in_shell();
+    for _ in 0..6_000 {
+        if atpkg::caller_shell::process_args(bash.id())
+            .is_some_and(|a| Dialect::from_exe_name(&a.exec_path) == Some(Dialect::Bash))
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    for (name, shell, typing) in [
+        ("line-unanswered-zsh", std::process::id(), " turn "),
+        ("line-unanswered-bash", bash.id(), " send "),
+    ] {
+        let dir = scratch(name);
+        let (sock, asked) = instance_with(
+            &dir,
+            Answers {
+                send: crate::harness::UNANSWERED,
+                ..fenced_answers(vec![crate::harness::UNANSWERED])
+            },
+        );
+        let mut opts = Opts {
+            sock: Some(sock),
+            ..drive(&dir)
+        };
+        opts.timings.drive_reply = Duration::from_millis(200);
+        std::fs::create_dir_all(opts.home.join(".claude/sessions")).expect("empty roster");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut c = connect(&opts, TAB).expect("control connection");
+            let _ = tx.send(type_relaunch_line(
+                &opts,
+                &Records::of(&opts.home, None),
+                &mut c,
+                shell,
+                TAB,
+                SESSION,
+                "claude --resume",
+                None,
+                PromptLook {
+                    mark: &mut None,
+                    ended_at_s: 0,
+                    held_since_s: 0,
+                    line_grace_s: None,
+                },
+                |_, _, _| true,
+            ));
+        });
+        let got = rx
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("the line within the hang detector");
+        assert_eq!(got, Err(RelaunchLineError::Unanswered), "{name}");
+        let asked = asked.lock().map(|a| a.clone()).unwrap_or_default();
+        let at = asked
+            .iter()
+            .position(|l| l.contains(typing))
+            .unwrap_or_else(|| panic!("{name}: the line: {asked:#?}"));
+        assert_eq!(at + 1, asked.len(), "{name}: nothing after it: {asked:#?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    let _ = bash.kill();
+    let _ = bash.wait();
+
+    let dir = scratch("line-unanswered-record");
+    let opts = drive(&dir);
+    let mut st = St {
+        phase: Phase::Exiting { at_s: now_s() },
+        tab: TAB.to_string(),
+        ..St::default()
+    };
+    let r = super::super::relaunch::line_unanswered(
+        &opts,
+        Report {
+            pid: 0,
+            tab: TAB.to_string(),
+            session: SESSION.to_string(),
+            from: "-".to_string(),
+            to: "-".to_string(),
+            step: String::new(),
+        },
+        &mut st,
+        SESSION,
+        Some(7),
+        "claude --resume".to_string(),
+    );
+    assert_eq!(r.step, "wait:unanswered");
+    assert!(matches!(st.phase, Phase::Relaunched { .. }), "{st:?}");
+    assert_eq!(
+        (st.line.as_str(), st.line_block),
+        ("claude --resume", Some(7))
+    );
+    assert_eq!(
+        load(&opts, SESSION).map(|s| s.phase),
+        Some(st.phase.clone())
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A restore line whose turn the window leaves unanswered is read off the agent's own record: one
+/// whose record never moved waits (`wait:unanswered`), the look still open, never "its line could
+/// not be typed".
+#[cfg(unix)]
+#[test]
+fn an_unanswered_restore_line_waits_and_is_never_lost() {
+    let asked = [
+        user_row("Watch the artifact's comments and answer them."),
+        turn_by("claude-opus-5-5", "Watching the comments."),
+    ];
+    let mut rig = Rig::with(
+        "restore-unanswered",
+        &asked,
+        Answers {
+            turn: vec![crate::harness::UNANSWERED],
+            ..Answers::default()
+        },
+    );
+    rig.opts.timings.drive_reply = Duration::from_millis(200);
+    let mut st = rig.st.clone();
+    st.quiet = true;
+    st.relaunched_at = now_s().saturating_sub(5);
+    let r = rig.carry_on_from(&mut st, MODEL_WAIT);
+    assert_eq!(r.step, "done:resumed", "{r:?}");
+    rig.append(&[resumed_warning("2.1.282", now_s(), "warning")]);
+    let r = restore_look_at(&rig, &mut st, now_s()).expect("decided");
+    assert_eq!(r.step, "wait:unanswered", "{r:?}");
+    assert!(st.confirming(), "the look is still open");
+    assert_eq!(rig.typed().len(), 1, "{:?}", rig.typed());
+    assert!(rig.details("done:lost").is_empty(), "nothing lost");
+}
+
+#[test]
+fn agy_limit_reset_aligns_with_live_screen_model_and_unnamed_refill() {
+    use crate::harness::agy_quota::Rotation;
+    use crate::harness::agy_quota_store::{Source, Store, rotate_launch_at};
+
+    struct FixedUsage {
+        doc: String,
+        default: &'static str,
+    }
+    impl Source for FixedUsage {
+        fn read(&self) -> Result<String, String> {
+            Ok(self.doc.clone())
+        }
+        fn default_model(&self) -> Result<String, String> {
+            Ok(self.default.to_owned())
+        }
+    }
+
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("aterm-agy-limit-reset-")
+        .tempdir()
+        .expect("tempdir");
+    let now = 1_792_803_313_i64;
+    let gemini_reset = aterm_types::rfc3339::parse_utc_fractional("2026-10-28T00:19:03Z").unwrap();
+    let opus_reset = aterm_types::rfc3339::parse_utc_fractional("2026-10-24T05:49:13Z").unwrap();
+    let past_grace = i64::try_from(LIMIT_GRACE_S).unwrap() + 60;
+    let rotation = Rotation::default();
+
+    // 1. Live `/model` switch on screen: argv named `claude-opus-5-5-medium` (100% full), while
+    //    the live screen shows `Gemini 3.1 Pro (High)` (spent until `gemini_reset`). `agy_limit_reset_with`
+    //    evaluates the live screen model and returns `gemini_reset`, never a false past refill
+    //    from the stale argv model.
+    let gemini_spent_opus_full = FixedUsage {
+        doc: r#"{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{"name":"Gemini Models","buckets":[{"id":"gemini-weekly","window":"weekly","remaining_fraction":0,"reset_time":"2026-10-28T00:19:03Z"}]},{"name":"Claude and GPT models","buckets":[{"id":"3p-5h","window":"5h","remaining_fraction":1,"reset_time":"2026-10-24T05:49:13Z"}]}]}}}"#.to_owned(),
+        default: "claude-opus-5-5-medium",
+    };
+    let s1 = Store::new(dir.path(), "s1");
+    assert_eq!(
+        agy_limit_reset_with(
+            Some("claude-opus-5-5-medium"),
+            Some("Gemini 3.1 Pro (High)"),
+            now,
+            |asked| rotate_launch_at(asked, &s1, &gemini_spent_opus_full, &rotation, now, true),
+        ),
+        Some(u64::try_from(gemini_reset).unwrap())
+    );
+
+    // 2. Unrecognized screen label falls back cleanly to `argv_model`.
+    assert_eq!(
+        agy_limit_reset_with(
+            Some("gemini-4-argon-high"),
+            Some("Custom Wrapper"),
+            now,
+            |asked| rotate_launch_at(asked, &s1, &gemini_spent_opus_full, &rotation, now, true),
+        ),
+        Some(u64::try_from(gemini_reset).unwrap())
+    );
+
+    // 3. Unnamed `agy` launch (`argv_model = None`) whose live screen names `Claude Opus 5.5`:
+    //    returns `opus_reset` while both pools are spent, and `now - past_grace` once Opus refills
+    //    in place to 100%, while still returning `None` when neither argv nor screen names a model.
+    let both_spent = FixedUsage {
+        doc: r#"{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{"name":"Gemini Models","buckets":[{"id":"gemini-weekly","window":"weekly","remaining_fraction":0,"reset_time":"2026-10-28T00:19:03Z"}]},{"name":"Claude and GPT models","buckets":[{"id":"3p-5h","window":"5h","remaining_fraction":0,"reset_time":"2026-10-24T05:49:13Z"}]}]}}}"#.to_owned(),
+        default: "claude-opus-5-5-medium",
+    };
+    let s2 = Store::new(dir.path(), "s2");
+    assert_eq!(
+        agy_limit_reset_with(None, Some("Claude Opus 5.5"), now, |asked| {
+            rotate_launch_at(asked, &s2, &both_spent, &rotation, now, true)
+        }),
+        Some(u64::try_from(opus_reset).unwrap())
+    );
+
+    let s3 = Store::new(dir.path(), "s3");
+    assert_eq!(
+        agy_limit_reset_with(None, Some("Claude Opus 5.5"), now, |asked| {
+            rotate_launch_at(asked, &s3, &gemini_spent_opus_full, &rotation, now, true)
+        }),
+        Some(u64::try_from(now - past_grace).unwrap())
+    );
+    assert_eq!(
+        agy_limit_reset_with(None, None, now, |asked| {
+            rotate_launch_at(asked, &s3, &gemini_spent_opus_full, &rotation, now, true)
+        }),
+        None
+    );
+
+    let both_open_opus_full = FixedUsage {
+        doc: r#"{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{"name":"Gemini Models","buckets":[{"id":"gemini-weekly","window":"weekly","remaining_fraction":0.5,"reset_time":"2026-10-28T00:19:03Z"}]},{"name":"Claude and GPT models","buckets":[{"id":"3p-5h","window":"5h","remaining_fraction":1,"reset_time":"2026-10-24T05:49:13Z"}]}]}}}"#.to_owned(),
+        default: "claude-opus-5-5-medium",
+    };
+    let s4 = Store::new(dir.path(), "s4");
+    assert_eq!(
+        agy_limit_reset_with(None, None, now, |asked| {
+            rotate_launch_at(asked, &s4, &both_open_opus_full, &rotation, now, true)
+        }),
+        Some(u64::try_from(now - past_grace).unwrap())
+    );
 }

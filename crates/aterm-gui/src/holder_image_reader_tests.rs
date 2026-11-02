@@ -74,7 +74,53 @@ fn scripted_watch(shell: i32) -> Option<ProcWatch> {
     Some(watch)
 }
 
+static ROUTES: Mutex<Option<HashMap<i32, aterm_uds::proc_connector::RouteScript>>> =
+    Mutex::new(None);
+
+/// A proc connector route of its own (unit L2), live, routing only what the test posts.
+fn scripted_route(shell: i32) -> Option<aterm_uds::proc_connector::Route> {
+    let (route, script) = aterm_uds::proc_connector::Route::scripted(shell)?;
+    ROUTES
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .insert(shell, script);
+    Some(route)
+}
+
 static READS: Mutex<Option<HashMap<i32, usize>>> = Mutex::new(None);
+
+/// Each scripted group leader a sampler reads, and how often it was read.
+static SIGHTS: Mutex<Option<HashMap<i32, (crate::fg_sample::Sight, usize)>>> = Mutex::new(None);
+
+fn set_sight(pgid: i32, exe: &str) {
+    let sight = crate::fg_sample::Sight {
+        pgid,
+        start_us: 3,
+        exe: Arc::from(std::path::Path::new(exe)),
+    };
+    SIGHTS
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .insert(pgid, (sight, 0));
+}
+
+fn scripted_sight(pgid: i32) -> Option<crate::fg_sample::Sight> {
+    let mut sights = SIGHTS.lock().unwrap();
+    let (sight, reads) = sights.as_mut()?.get_mut(&pgid)?;
+    *reads += 1;
+    Some(sight.clone())
+}
+
+fn sight_reads(pgid: i32) -> usize {
+    SIGHTS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(&pgid))
+        .map_or(0, |(_, reads)| *reads)
+}
 
 fn reads(pgid: i32) -> usize {
     READS
@@ -179,6 +225,11 @@ struct Knobs {
     no_retire: bool,
     /// Temporal recording, seeded before the reader attaches.
     record: bool,
+    /// The foreground sampler of a reader with no watch, reading scripted leaders
+    /// ([`scripted_sight`]), as on Linux.
+    sight: bool,
+    /// Beside that sampler, a proc connector route (scripted, [`scripted_route`]), as on Linux.
+    connector: bool,
 }
 
 const SHIPPING: Knobs = Knobs {
@@ -188,10 +239,19 @@ const SHIPPING: Knobs = Knobs {
     kernel: false,
     no_retire: false,
     record: false,
+    sight: false,
+    connector: false,
 };
 
 const KERNEL: Knobs = Knobs {
     kernel: true,
+    ..SHIPPING
+};
+
+/// Linux's wiring: no process watch, the sampler, and the proc connector's route beside it.
+const CONNECTOR: Knobs = Knobs {
+    sight: true,
+    connector: true,
     ..SHIPPING
 };
 
@@ -222,6 +282,17 @@ impl Rig {
         app.session_factory.byte_arm = knobs.byte_arm;
         if knobs.kernel {
             app.session_factory.proc_watch = scripted_watch;
+        }
+        if knobs.sight {
+            app.session_factory.fg_sight = Some(crate::fg_sample::SightSeam {
+                read: scripted_sight,
+                now_us: || None,
+                tick_us: || None,
+            });
+        }
+        if knobs.connector {
+            app.session_factory.proc_connector =
+                crate::exec_edges::ConnectorSeam::Open(scripted_route);
         }
         app.session_factory.temporal_recording = knobs.record;
         let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
@@ -358,6 +429,29 @@ impl Rig {
         );
     }
 
+    /// The proc connector's route hands the gather `pid`'s exit (a group leader's, the only
+    /// exits it routes), and the gather drains it, as [`Rig::die`].
+    fn die_routed(&self, pid: i32) {
+        let script = self.route();
+        script.post(&[aterm_uds::proc_connector::Event::Exit { pid }]);
+        let drained = aterm_spec::wait::within(PATIENCE, Duration::from_millis(1), || {
+            (script.pending() == 0).then_some(())
+        });
+        assert!(
+            drained.is_some(),
+            "timed out waiting for {pid}'s routed exit to drain"
+        );
+    }
+
+    fn route(&self) -> aterm_uds::proc_connector::RouteScript {
+        ROUTES
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|m| m.get(&self.session.pid).cloned())
+            .expect("the reader made its route")
+    }
+
     fn script(&self) -> ProcScript {
         WATCHES
             .lock()
@@ -399,6 +493,9 @@ impl Drop for Rig {
         let _ = park_reader(&mut self.session, Instant::now() + PATIENCE);
         hold_hook::unwatch(self.id);
         if let Some(m) = WATCHES.lock().unwrap().as_mut() {
+            m.remove(&self.session.pid);
+        }
+        if let Some(m) = ROUTES.lock().unwrap().as_mut() {
             m.remove(&self.session.pid);
         }
         let master = std::mem::replace(&mut self.session.master, -1);
@@ -933,8 +1030,9 @@ fn a_watch_turns_the_byte_arms_c_cuts_and_rereads_off() {
 }
 
 /// Card engine §3.7, marks retired by liveness: drawer 0 stops (Ctrl-Z) and lives; drawers 1-7
-/// launch, stop, and die, each exit heard by the process watch; then drawer 8 launches. The
-/// fence's tokens after drawer 8's lay, and drawer 0's.
+/// launch, stop, and die, each exit heard by the process watch (with `knobs.connector`, routed by
+/// the proc connector instead, as on Linux); then drawer 8 launches. The fence's tokens after
+/// drawer 8's lay, and drawer 0's.
 fn dead_stopped_drawers_then_a_launch(id: u64, shell: i32, knobs: Knobs) -> (Vec<u64>, u64) {
     use aterm_core::terminal::MAX_HOLDER_MARKS;
     set_image(shell, zsh(shell));
@@ -966,7 +1064,9 @@ fn dead_stopped_drawers_then_a_launch(id: u64, shell: i32, knobs: Knobs) -> (Vec
             break;
         }
         rig.write(shell, &prompt(), &format!("<stopped {i}>"));
-        if i > 0 {
+        if i > 0 && knobs.connector {
+            rig.die_routed(job);
+        } else if i > 0 {
             rig.die(job);
         }
     }
@@ -984,6 +1084,20 @@ fn dead_stopped_drawers_then_a_launch(id: u64, shell: i32, knobs: Knobs) -> (Vec
 #[test]
 fn a_stopped_drawers_death_retires_its_mark_so_a_live_one_survives() {
     let (marks, live) = dead_stopped_drawers_then_a_launch(9340, 8400, KERNEL);
+    assert!(
+        marks.contains(&live),
+        "the live stopped drawer keeps its mark: {marks:?}"
+    );
+    assert_eq!(marks.len(), 2, "only it and the current drawer: {marks:?}");
+}
+
+/// L2: with no process watch (Linux), the proc connector's route hands the gather a stopped
+/// drawer's leader exit, and the parse stage retires its mark as it does a watch's
+/// (`retire_gone`). NEGATIVE CONTROL (scratch, `L2_NC=exitarm`): the gather's arm for a routed
+/// exit made a no-op fails "keeps its mark".
+#[test]
+fn a_routed_exit_retires_a_stopped_drawers_mark_so_a_live_one_survives() {
+    let (marks, live) = dead_stopped_drawers_then_a_launch(9372, 9_600, CONNECTOR);
     assert!(
         marks.contains(&live),
         "the live stopped drawer keeps its mark: {marks:?}"
@@ -1192,9 +1306,14 @@ fn write_slave(slave: i32, bytes: &[u8]) {
 /// reads before the foreground, so a job whose block's D the shell writes right after (here
 /// written by the foreground probe itself, between the two reads) is still placed in its own
 /// block; a prompt hook's exec heard once D and the prompt are parsed is placed in no block.
-/// Each is a real process (a `sleep`), so its names are the kernel's. NEGATIVE CONTROL
-/// (scratch): reading the foreground before the queue in `ExecEdges::note_execs` places the
-/// job's exec past its D, in no block (`Job(None)`), and the first assertion fails.
+/// Each is a real process (a `sleep`), so its names are the kernel's. Linux has no queue read: a
+/// master keeps no count of its unread output (`aterm_pty::output_queue_len` answers `None`; unit
+/// L1 measured `TIOCOUTQ` reading 0 there with bytes unread), so a watched exec there is placed
+/// by its stamp, `During::Window`, and never stands in (SPECS command-detail-privacy). NEGATIVE
+/// CONTROLS (scratch): reading the foreground before the queue in `ExecEdges::note_execs` places
+/// the job's exec past its D, in no block (`Job(None)`), and the first assertion fails on macOS;
+/// `output_queue_len` answering Linux's `TIOCOUTQ` (a 0 with bytes unread) places it in a block,
+/// and the first assertion fails on Linux.
 #[test]
 fn an_exec_is_placed_in_its_jobs_block_though_its_d_follows_at_once() {
     use crate::command_ran::{During, Window};
@@ -1266,6 +1385,161 @@ fn an_exec_is_placed_in_its_jobs_block_though_its_d_follows_at_once() {
     let _ = job.wait();
     let _ = hook.kill();
     let _ = hook.wait();
-    assert_eq!(job_place, Some(During::Job(Some(0))), "the job's own block");
-    assert_eq!(hook_place, Some(During::Job(None)), "a hook's: no block's");
+    let (job_want, hook_want) = if cfg!(target_os = "linux") {
+        (During::Window, During::Window)
+    } else {
+        (During::Job(Some(0)), During::Job(None))
+    };
+    assert_eq!(
+        job_place,
+        Some(job_want),
+        "the job's own block (Linux: its stamp)"
+    );
+    assert_eq!(
+        hook_place,
+        Some(hook_want),
+        "a hook's: no block's (Linux: its stamp)"
+    );
+}
+
+/// H3 (GATE3-2), THROUGH THE GATHER: a reader with no process watch (Linux) samples the group in
+/// front while a block runs, with no output to find it by: a job that takes the foreground after
+/// C and prints nothing has its leader's image heard once, placed in its block as its job's, and
+/// the running block reads that program; the shell's own group in front reads no leader. NEGATIVE
+/// CONTROL (scratch): the gather never ticking its sampler reads no leader, and the wait for the
+/// samples ends in its hang detector.
+#[test]
+fn a_silent_job_is_sampled_with_no_watch_and_its_block_reads_its_program() {
+    use crate::command_ran::{During, Window};
+    const ID: u64 = 9370;
+    const SHELL: i32 = 9_500;
+    const JOB: i32 = 9_501;
+    set_image(SHELL, zsh(SHELL));
+    set_sight(SHELL, "/bin/zsh");
+    set_sight(JOB, "/bin/sleep");
+    let rig = Rig::attach(
+        ID,
+        SHELL,
+        Knobs {
+            sight: true,
+            ..SHIPPING
+        },
+    );
+    rig.write(SHELL, &prompt(), "<p1>");
+    rig.write(
+        SHELL,
+        &[&b"qzwait 2\r\n"[..], &signed("133;C")].concat(),
+        "<typed>",
+    );
+    set_fg(rig.session.master, JOB);
+    let sampled = aterm_spec::wait::within(PATIENCE, Duration::from_millis(1), || {
+        (sight_reads(JOB) >= 3).then_some(())
+    });
+    assert!(sampled.is_some(), "timed out waiting for three samples");
+    let ran = &rig.session.ctx.ran;
+    let heard: Vec<During> = ran
+        .within(Some(Window { from: 0, to: None }))
+        .into_iter()
+        .filter(|e| e.pgid == JOB)
+        .map(|e| e.during)
+        .collect();
+    assert_eq!(heard, [During::Job(Some(0))], "heard once, in its block");
+    assert_eq!(
+        crate::session_status::executing_detail(&rig.session.term.lock().unwrap(), ran),
+        Some("sleep".to_owned()),
+        "the running block reads its program"
+    );
+    assert_eq!(sight_reads(SHELL), 0, "the shell's leader is never read");
+}
+
+/// L2, THROUGH THE GATHER: beside the sampler of a reader with no process watch (Linux), the
+/// proc connector's route hands the gather a job's `exec` too short for any sample (`true`, its
+/// leader gone before one reads it): read between batches while its group holds the front and
+/// the master is quiet, it is placed in its block as its job's and the running block reads that
+/// program; one handed with the terminal back at the shell is held by its stamp; and after the
+/// listener lost messages, the block's next `exec` only confirms. `status` names the
+/// connector. NEGATIVE CONTROLS (scratch): a gather that never polls its route
+/// (`L2_NC=poll`) hears nothing, and the wait ends in its hang detector; a loss never noted
+/// (`L2_NC=lostset`) fails "lost".
+#[test]
+fn a_connector_exec_too_short_for_a_sample_names_its_block_through_the_gather() {
+    use crate::command_ran::{During, Window};
+    const ID: u64 = 9371;
+    const SHELL: i32 = 9_510;
+    const JOB: i32 = 9_511;
+    const LATE: i32 = 9_512;
+    const AFTER: i32 = 9_513;
+    set_image(SHELL, zsh(SHELL));
+    set_sight(SHELL, "/bin/zsh");
+    let rig = Rig::attach(
+        ID,
+        SHELL,
+        Knobs {
+            sight: true,
+            connector: true,
+            ..SHIPPING
+        },
+    );
+    assert_eq!(rig.session.ctx.ran.watch_words(), ("connector", "live"));
+    rig.write(SHELL, &prompt(), "<p1>");
+    rig.write(
+        SHELL,
+        &[&b"qzwait 2\r\n"[..], &signed("133;C")].concat(),
+        "<typed>",
+    );
+    let script = rig.route();
+    let exec = |pid: i32, path: &str| {
+        aterm_uds::proc_connector::Event::Exec(aterm_uds::proc_connector::Exec {
+            pid,
+            pgid: pid,
+            tpgid: pid,
+            start_ns: 3_000,
+            at_ns: 4_000,
+            image: aterm_uds::proc_connector::Image {
+                path: path.into(),
+                file: None,
+            },
+            env_path: None,
+        })
+    };
+    let ran = &rig.session.ctx.ran;
+    let placed = |pgid: i32| -> Vec<During> {
+        ran.within(Some(Window { from: 0, to: None }))
+            .into_iter()
+            .filter(|e| e.pgid == pgid)
+            .map(|e| e.during)
+            .collect()
+    };
+    let heard = |pgid: i32| {
+        aterm_spec::wait::within(PATIENCE, Duration::from_millis(1), || {
+            (!placed(pgid).is_empty()).then_some(())
+        })
+        .is_some()
+    };
+    set_fg(rig.session.master, JOB);
+    script.post(&[exec(JOB, "/usr/bin/true")]);
+    assert!(heard(JOB), "timed out waiting for the routed exec");
+    assert_eq!(placed(JOB), [During::Job(Some(0))], "in its block");
+    assert_eq!(
+        crate::session_status::executing_detail(&rig.session.term.lock().unwrap(), ran),
+        Some("true".to_owned()),
+        "the running block reads its program"
+    );
+    set_fg(rig.session.master, SHELL);
+    script.post(&[exec(LATE, "/usr/bin/qzlate")]);
+    assert!(heard(LATE), "timed out waiting for the late exec");
+    assert_eq!(
+        placed(LATE),
+        [During::Window],
+        "the terminal back: its stamp"
+    );
+    set_fg(rig.session.master, AFTER);
+    script.lose();
+    script.post(&[exec(AFTER, "/usr/bin/qzafter")]);
+    assert!(
+        heard(AFTER),
+        "timed out waiting for the exec after the loss"
+    );
+    assert_eq!(placed(AFTER), [During::Window], "lost: its stamp");
+    assert_eq!(script.pending(), 0, "the gather drained what was posted");
 }

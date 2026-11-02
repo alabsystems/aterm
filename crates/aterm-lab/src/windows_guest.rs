@@ -34,6 +34,18 @@ pub const PWSH: (&str, &str, &str) = (
     "ddb2f3613a0ad27817b90601a0827f7347e81dfa5bce18d4be8009b8cb0e0a31",
 );
 
+/// MSYS2's zsh, which a person who runs zsh on Windows unpacks into Git for Windows: its
+/// package and the digest MSYS2's `msys.db` publishes for it. Git for Windows' `usr\bin`
+/// carries the MSYS2 runtime and ncurses it links.
+pub const MSYS2_ZSH: (&str, &str) = (
+    "zsh-5.9.2-1-x86_64.pkg.tar.zst",
+    "9a134200a152d90a0f1820d6aa74c3369d8539c068b523852549d74b16739fa8",
+);
+
+/// Where Windows keeps Developer Mode, which lets an unelevated process make a symlink.
+pub const DEVELOPER_MODE_KEY: &str =
+    r"HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock";
+
 /// WSL's arm64 package: its version, file and the digest GitHub publishes for the asset.
 pub const WSL: (&str, &str, &str) = (
     "3.0.3",
@@ -458,9 +470,23 @@ fn digest(sha256: &str) -> String {
     )
 }
 
-/// The provisioning plan, in order.
+/// Where the guest keeps Webster's Second (`web2`), the word list aterm-lexicon's dictionary
+/// gates are curated against: Windows ships none, so the lane lays this Mac's copy
+/// ([`crate::linux_guest::WEB2`]) at the Windows path aterm_uds's `web2` row looks at.
+pub const WEB2: &str = r"C:\usr\share\dict\web2";
+
+/// The provisioning plan, in order, with a `web2` step when this Mac's copy reads
+/// ([`provision_plan`]).
 #[must_use]
 pub fn provision_steps() -> Vec<Step> {
+    let web2 = std::fs::read(crate::linux_guest::WEB2).ok();
+    provision_plan(web2.as_deref().map(crate::linux_vz::sha256_hex).as_deref())
+}
+
+/// The provisioning plan, in order: its last step checks the `web2` the host copied to
+/// [`WEB2`] has the SHA-256 `web2`, when one is given.
+#[must_use]
+pub fn provision_plan(web2: Option<&str>) -> Vec<Step> {
     let (git_tag, git_file, git_sha) = GIT;
     let git = format!(
         "{PREAMBLE}$git = 'C:\\Program Files\\Git\\cmd\\git.exe'\n\
@@ -476,6 +502,28 @@ pub fn provision_steps() -> Vec<Step> {
             git_file
         ),
         digest(git_sha),
+    );
+    let (zsh_file, zsh_sha) = MSYS2_ZSH;
+    let zsh = format!(
+        "{PREAMBLE}$git = 'C:\\Program Files\\Git'\n\
+         $zsh = Join-Path $git 'usr\\bin\\zsh.exe'\n\
+         if (-not (Test-Path $zsh)) {{\n{}{}\
+         tar.exe -xf $f -C $git usr etc\n\
+         if ($LASTEXITCODE -ne 0) {{ throw \"tar exited $LASTEXITCODE unpacking {zsh_file}\" }}\n}}\n\
+         & $zsh -f -c 'print -r -- $ZSH_VERSION'\n\
+         if ($LASTEXITCODE -ne 0) {{ throw \"zsh.exe exited $LASTEXITCODE\" }}\n",
+        download(
+            &format!("https://repo.msys2.org/msys/x86_64/{zsh_file}"),
+            zsh_file
+        ),
+        digest(zsh_sha),
+    );
+    let developer_mode = format!(
+        "{PREAMBLE}$key = {key}\n\
+         if (-not (Test-Path $key)) {{ New-Item -Path $key | Out-Null }}\n\
+         Set-ItemProperty -Path $key -Name AllowDevelopmentWithoutDevLicense -Value 1 -Type DWord\n\
+         \"Developer Mode: $((Get-ItemProperty -Path $key).AllowDevelopmentWithoutDevLicense)\"\n",
+        key = ps_quote(DEVELOPER_MODE_KEY),
     );
     let (pwsh_version, pwsh_file, pwsh_sha) = PWSH;
     let pwsh = format!(
@@ -589,7 +637,7 @@ pub fn provision_steps() -> Vec<Step> {
         name = ps_quote(TERMINAL_PACKAGE),
         family = ps_quote(&format!("{TERMINAL_PACKAGE}_8wekyb3d8bbwe")),
     );
-    vec![
+    let mut steps = vec![
         Step {
             label: "lane directories, the runner's",
             script: dirs,
@@ -599,6 +647,18 @@ pub fn provision_steps() -> Vec<Step> {
         Step {
             label: "Git for Windows",
             script: git,
+            runner: false,
+            reboot: false,
+        },
+        Step {
+            label: "MSYS2's zsh in Git for Windows",
+            script: zsh,
+            runner: false,
+            reboot: false,
+        },
+        Step {
+            label: "Developer Mode",
+            script: developer_mode,
             runner: false,
             reboot: false,
         },
@@ -638,7 +698,20 @@ pub fn provision_steps() -> Vec<Step> {
         desktop_step(),
         japanese_installed_step(),
         wsl_distro_step(),
-    ]
+    ];
+    if let Some(sha) = web2 {
+        steps.push(Step {
+            label: "web2",
+            script: format!(
+                "{PREAMBLE}$f = {}\n{}\"web2: $((Get-Item $f).Length) bytes\"\n",
+                ps_quote(WEB2),
+                digest(sha)
+            ),
+            runner: false,
+            reboot: false,
+        });
+    }
+    steps
 }
 
 /// The Japanese IME made usable ([`JA_CAPABILITY`]). On a new install Windows leaves the
@@ -1258,12 +1331,40 @@ mod tests {
         assert!(powershell_command("dir").ends_with(" -EncodedCommand ZABpAHIA"));
     }
 
+    /// The host's web2 goes where the `web2` row looks on Windows, checked by its digest, and a
+    /// plan without it provisions again once it reads.
+    #[test]
+    fn the_guest_gets_the_hosts_web2_where_the_web2_row_looks() {
+        assert!(aterm_uds::host::tool("web2").at.contains(&WEB2));
+        let sha = "ab".repeat(32);
+        let plan = provision_plan(Some(&sha));
+        let web2 = plan.last().unwrap_or_else(|| unreachable!());
+        assert_eq!(web2.label, "web2");
+        assert!(web2.script.contains(&ps_quote(WEB2)) && web2.script.contains(&sha));
+        let without = provision_plan(None);
+        assert!(without.iter().all(|s| s.label != "web2"));
+        assert_ne!(fingerprint(&plan), fingerprint(&without));
+    }
+
     #[test]
     fn the_plan_pins_what_it_downloads_and_its_fingerprint_follows_it() {
         let steps = provision_steps();
         let all: String = steps.iter().map(|s| s.script.as_str()).collect();
         assert!(all.contains(GIT.2));
         assert!(all.contains(PWSH.2));
+        assert!(all.contains(MSYS2_ZSH.1) && all.contains(&ps_quote(DEVELOPER_MODE_KEY)));
+        let git = steps
+            .iter()
+            .position(|s| s.script.contains(GIT.2))
+            .unwrap_or_else(|| unreachable!());
+        let zsh = steps
+            .iter()
+            .position(|s| s.script.contains(MSYS2_ZSH.1))
+            .unwrap_or_else(|| unreachable!());
+        assert!(
+            git < zsh && !steps[zsh].runner,
+            "zsh unpacks into Git's tree, as its owner"
+        );
         assert!(all.contains(RUSTUP.1));
         assert!(all.contains(&format!("toolchain install {RUST}")));
         assert!(all.contains("x86_64-pc-windows-msvc"));
@@ -1300,8 +1401,8 @@ mod tests {
         assert!(desktop.reboot && !desktop.runner);
         assert_eq!(steps.iter().filter(|s| s.reboot).count(), 1);
         assert_eq!(
-            &steps[at + 1..],
-            &[japanese_installed_step(), wsl_distro_step()]
+            steps.get(at + 1..at + 3),
+            Some(&[japanese_installed_step(), wsl_distro_step()][..])
         );
         assert!(desktop.script.contains("AutoAdminLogon -Value '1'"));
         assert!(

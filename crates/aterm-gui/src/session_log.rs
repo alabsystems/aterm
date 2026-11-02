@@ -474,6 +474,129 @@ struct AgentRun {
     tracker: TurnTracker,
 }
 
+/// HOW LONG AN END aterm ASKED FOR STANDS ([`SessionLog::ask_end`]): the restart act's deadline
+/// ([`crate::restart_act::DEADLINE`], when its `SIGKILL` goes) and 5 s, so the end that `SIGKILL`
+/// brings still reads as asked.
+pub(crate) const ASKED_END_STANDS: std::time::Duration =
+    std::time::Duration::from_secs(crate::restart_act::DEADLINE.as_secs() + 5);
+
+/// Which of aterm's acts asked a program to end: the `word=` of its `act` mark.
+#[cfg_attr(not(unix), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AskWord {
+    /// The restart act's `SIGTERM` (`ctl restart`, the tab's restart pill).
+    Restart,
+    /// The `signal` verb's `term`, `kill`, `int`, `quit` or `hup`.
+    Signal,
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+impl AskWord {
+    /// The act's `word=` (one of `aterm_slog::WORD_WORDS`).
+    pub(crate) const fn word(self) -> &'static str {
+        match self {
+            Self::Restart => "restart",
+            Self::Signal => "signal",
+        }
+    }
+}
+
+/// WHO ASKS aterm TO END A SESSION'S PROGRAM, and the timeline whose log says so: the hook the
+/// `signal` verb and the restart act call just before they signal ([`SessionLog::ask_end`]).
+#[derive(Clone, Copy)]
+pub(crate) struct EndAsker<'a> {
+    /// The session's timeline.
+    pub(crate) timeline: &'a std::sync::Mutex<crate::session_timeline::SessionTimeline>,
+    /// Who asked.
+    pub(crate) by: Actor,
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+impl EndAsker<'_> {
+    /// The act's mark and its ask, just before the signal to group `pgid` ([`SessionLog::ask_end`]).
+    pub(crate) fn ask(self, pgid: i32, word: AskWord) {
+        with_slog(self.timeline, |slog, at| {
+            slog.ask_end(pgid, word, self.by, at);
+        });
+    }
+
+    /// The ask alone, for an act a seamless update's Commit cut ([`SessionLog::stand_ask`]).
+    pub(crate) fn stand(self, pgid: i32) {
+        with_slog(self.timeline, |slog, at| slog.stand_ask(pgid, self.by, at));
+    }
+
+    /// Whether the signal this asker asked of group `pgid` was delivered, from what its `kill` or
+    /// `killpg` returned (`rc`): one that was not takes its ask back
+    /// ([`SessionLog::withdraw_ask`]; its mark stays, and the reply is the ERR). The restart act's
+    /// `SIGTERM` and the `signal` verb read their signal by it; the act's `SIGKILL` escalation
+    /// never does, since the `SIGTERM` before it was delivered, and a `SIGKILL` refused there
+    /// finds the group already gone, on the end that `SIGTERM` asked for.
+    pub(crate) fn delivered(self, pgid: i32, rc: i32) -> bool {
+        if rc != 0 {
+            with_slog(self.timeline, |slog, _| slog.withdraw_ask(pgid));
+        }
+        rc == 0
+    }
+}
+
+/// The act's `SIGKILL` to group `pgid` renews the end it asked ([`SessionLog::renew_ask`]).
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn renew_ask(
+    timeline: &std::sync::Mutex<crate::session_timeline::SessionTimeline>,
+    pgid: i32,
+) {
+    with_slog(timeline, |slog, at| slog.renew_ask(pgid, at));
+}
+
+/// `f` on `timeline`'s log at its clock's now, under the timeline lock, its watchers rung after.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn with_slog(
+    timeline: &std::sync::Mutex<crate::session_timeline::SessionTimeline>,
+    f: impl FnOnce(&mut SessionLog, Stamp),
+) {
+    let mut g = timeline
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let at = g.slog().now();
+    f(g.slog_mut(), at);
+    let _ = g.slog_take_wake();
+}
+
+/// AN END aterm ASKED FOR ([`SessionLog::ask_end`]): the process group it signals, the `cmd`
+/// run that ends with it (none when the group is the shell's own), whether the log had yet to
+/// see that group's job in front (`unseen`: the command running at the ask is then decided by
+/// its own stamps, [`SessionLog::asked_cmd`]), who asked, and the stretch of the log's monotonic
+/// clock it stands for.
+#[derive(Clone, Copy, Debug)]
+struct AskedEnd {
+    pgid: i32,
+    cmd: Option<Node>,
+    unseen: bool,
+    by: Actor,
+    from_mono: u64,
+    until_mono: u64,
+}
+
+impl AskedEnd {
+    /// Whether an end at `at` is this ask's.
+    const fn stands(&self, at: Stamp) -> bool {
+        self.from_mono <= at.mono_ms && at.mono_ms <= self.until_mono
+    }
+}
+
+/// A program or agent run that left the front for the shell before its command's D
+/// ([`SessionLog::foreground_moved`]): closed `unknown` then, its outcome amended at that
+/// command's end ([`SessionLog::end_cmd`]).
+#[derive(Clone, Copy, Debug)]
+struct LeftFront {
+    run: Node,
+    kind: Kind,
+    pgid: i32,
+    cmd: Node,
+}
+
+const LEFT_FRONT_MAX: usize = 4;
+
 /// One session's log and the run and turn state its producers keep beside it.
 pub(crate) struct SessionLog {
     log: Log,
@@ -508,6 +631,12 @@ pub(crate) struct SessionLog {
     rollout: transcript::TapAnswers,
     /// This log is the one a seamless update's predecessor wrote, carried and read ([`Self::adopt`]), not one that started over after a gap.
     carried: bool,
+    /// The group the log last saw take the front ([`Self::foreground_moved`]), 0 before it saw one.
+    front_pgid: i32,
+    /// The end aterm last asked for ([`Self::ask_end`]): one per session, a newer one replaces it.
+    ask: Option<AskedEnd>,
+    /// The runs that left the front for the shell before the open command's D, at most [`LEFT_FRONT_MAX`].
+    left_front: Vec<LeftFront>,
 }
 
 /// A person's gesture as [`SessionLog::person_input`] takes it from the seam (`crate::app_input::note_person_reaching`): the number of the gesture when it opened a burst (`HumanInputStamp::note_reaching`), and whether it reached the program ([`crate::human_input::reaches_program`]).
@@ -524,6 +653,11 @@ pub(crate) fn ring_limits() -> Limits {
         aterm_types::dev_seam!("ATERM_SLOG_RING")
             .and_then(|v| {
                 let (records, bytes) = v.to_str()?.split_once(',')?;
+                if !records.bytes().all(|b| b.is_ascii_digit())
+                    || !bytes.bytes().all(|b| b.is_ascii_digit())
+                {
+                    return None;
+                }
                 Limits::new(records.parse().ok()?, bytes.parse().ok()?)
             })
             .unwrap_or(Limits::SESSION)
@@ -587,6 +721,9 @@ impl SessionLog {
             marked_through: 0,
             rollout: transcript::TapAnswers::default(),
             carried: false,
+            front_pgid: 0,
+            ask: None,
+            left_front: Vec::new(),
         }
     }
 }
@@ -896,6 +1033,9 @@ impl SessionLog {
         self.cmd_end = None;
         self.ceiling = None;
         self.seq_ceiling = None;
+        self.front_pgid = 0;
+        self.ask = None;
+        self.left_front.clear();
     }
 
     /// This session is a restore's new shell, standing in for `prev` (the session its leaf was, when the leaf names one), whose chain of restores began at `lineage` (`prev` itself when none is named).
@@ -1116,6 +1256,7 @@ impl SessionLog {
     fn new_block(&mut self, fact: &BlockFact, end: BlockEnd, front: Option<i32>, at: Stamp) {
         match end {
             BlockEnd::Running => {
+                self.left_front.clear();
                 let wall = fact.started_ms.unwrap_or(at.wall_ms);
                 let start = self.after_last_cmd(stamp_at_wall(at, wall));
                 let wall_from = predates_clock(at, start.wall_ms).then_some(start.wall_ms);
@@ -1217,31 +1358,111 @@ impl SessionLog {
 
     fn end_cmd(&mut self, c: CmdRun, how: CmdEnd, end: Stamp) {
         self.name_pending(Some(c), Some(end));
-        self.end_front_beside(c.node, end);
-        let front = self.end_front_under(c.node, end);
+        self.end_front_beside(c.node, how, end);
+        let front = self.end_front_under(c.node, how, end);
         let own = self.opened_at(c.node);
         let end = [c.child_end, front, own]
             .into_iter()
             .flatten()
             .fold(end, later);
         let wall = c.wall_from.map(|from| end.wall_ms.saturating_sub(from));
+        self.amend_left_front(c.node, how, end);
         self.close_cmd(c.node, how, wall, end);
+        self.left_front.clear();
     }
 
     fn opened_at(&self, node: Node) -> Option<Stamp> {
         self.log.open_entry(node).map(|e| Stamp::new(e.t, e.mono))
     }
 
+    /// The asker of the end aterm asked for that group `pgid`'s end at `at` is, if one stands.
+    fn asked_of_group(&self, pgid: i32, at: Stamp) -> Option<Actor> {
+        self.ask
+            .filter(|a| a.pgid == pgid && a.stands(at))
+            .map(|a| a.by)
+    }
+
+    /// The asker of the end aterm asked for that command `node`'s close at `at` is, if one stands:
+    /// the command the ask was made over, or, when the log had yet to see the asked group's job in
+    /// front, the command its own stamps say ran at the ask (opened by then, ending after). The
+    /// asked group led the terminal's foreground at the ask (the act's and the verb's fences), so
+    /// a group that was not the shell's was that command's job; a command whose D was still
+    /// unread had ended before the ask, and one begun after it is another's.
+    fn asked_cmd(&self, node: Node, at: Stamp) -> Option<Actor> {
+        self.ask
+            .filter(|a| {
+                a.stands(at)
+                    && (a.cmd == Some(node)
+                        || (a.unseen
+                            && self
+                                .opened_at(node)
+                                .is_some_and(|s| s.mono_ms <= a.from_mono)))
+            })
+            .map(|a| a.by)
+    }
+
+    /// THE END A PROGRAM OR AGENT RUN TAKES, closed at `at` by a path that names it `default`:
+    /// `signal` with its asker while an end aterm asked of its group `pgid` stands; else, when it
+    /// held the front until its command ended (`cmd`), that command's end, a failure read as
+    /// `gone`, since the command alone carries `code=` and the one `failure` it raises (D3); else
+    /// the path's own word.
+    fn run_end(
+        &self,
+        pgid: i32,
+        default: RunOut,
+        cmd: Option<CmdEnd>,
+        at: Stamp,
+    ) -> (RunOut, Option<Actor>) {
+        if let Some(by) = self.asked_of_group(pgid, at) {
+            return (RunOut::Signal, Some(by));
+        }
+        let out = match cmd {
+            None => default,
+            Some(CmdEnd::Exit(Some(0))) => RunOut::Ok,
+            Some(CmdEnd::Exit(Some(_))) => RunOut::Gone,
+            Some(CmdEnd::Exit(None) | CmdEnd::Unknown) => RunOut::Unknown,
+        };
+        (out, None)
+    }
+
+    /// The runs that left the front for the shell before `cmd`'s D take its end now, `how`
+    /// ([`Self::run_end`]): `amend <run> out=<word> src=shell conf=strong`, dated `at`, for each
+    /// whose word says more than `unknown`.
+    fn amend_left_front(&mut self, cmd: Node, how: CmdEnd, at: Stamp) {
+        let left = std::mem::take(&mut self.left_front);
+        for l in left.iter().filter(|l| l.cmd == cmd) {
+            let (out, by) = self.run_end(l.pgid, RunOut::Unknown, Some(how), at);
+            if out == RunOut::Unknown {
+                continue;
+            }
+            let Ok(f) = Fields::new().word(Key::Out, Out::Run(out).word()) else {
+                continue;
+            };
+            let mut amend = Amend::new(l.kind, Src::Shell, Conf::Strong, f);
+            if let Some(by) = by {
+                amend = amend.by(by);
+            }
+            let _ = self.log.amend(l.run, amend, at);
+        }
+    }
+
     fn close_cmd(&mut self, node: Node, how: CmdEnd, wall_ms: Option<u64>, at: Stamp) {
-        let (out, conf, code) = match how {
+        let (mut out, mut conf, code) = match how {
             CmdEnd::Exit(code) => {
                 let (out, conf) = run_out(code);
                 (out, conf, code)
             }
             CmdEnd::Unknown => (RunOut::Unknown, Conf::Strong, None),
         };
+        let by = self.asked_cmd(node, at).filter(|_| out != RunOut::Ok);
+        if by.is_some() {
+            (out, conf) = (RunOut::Signal, Conf::Strong);
+        }
         let f = with(Fields::new(), Key::Code, code.map(|c| Val::I(i64::from(c))));
         let mut close = Close::new(Out::Run(out), Src::Shell, conf).fields(f);
+        if let Some(by) = by {
+            close = close.by(by);
+        }
         if let Some(ms) = wall_ms {
             close = close.dur_wall(ms);
         }
@@ -1291,7 +1512,7 @@ impl SessionLog {
         }
     }
 
-    fn end_front_under(&mut self, parent: Node, at: Stamp) -> Option<Stamp> {
+    fn end_front_under(&mut self, parent: Node, how: CmdEnd, at: Stamp) -> Option<Stamp> {
         let agent = self
             .agent
             .as_ref()
@@ -1308,16 +1529,16 @@ impl SessionLog {
             .map(|e| Stamp::new(e.t, e.mono))
             .fold(at, later);
         if agent {
-            self.close_agent(at);
+            self.close_agent(Some(how), at);
         }
         if let Some(fg) = fg {
-            self.close_run(fg.node, RunOut::Unknown, at);
+            self.close_front_run(fg, Some(how), at);
             self.fg = None;
         }
         Some(at)
     }
 
-    fn end_front_beside(&mut self, cmd: Node, end: Stamp) {
+    fn end_front_beside(&mut self, cmd: Node, how: CmdEnd, end: Stamp) {
         let Some(from) = self.log.open_entry(cmd).map(|e| e.t) else {
             return;
         };
@@ -1330,7 +1551,8 @@ impl SessionLog {
                     .is_some_and(|e| from <= e.t && e.t <= end.wall_ms)
         };
         let agent = self.agent.as_ref().map(|a| a.node).filter(|n| beside(*n));
-        let fg = self.fg.map(|f| f.node).filter(|n| beside(*n));
+        let fg_run = self.fg.filter(|f| beside(f.node));
+        let fg = fg_run.map(|f| f.node);
         if agent.is_none() && fg.is_none() {
             return;
         }
@@ -1348,10 +1570,10 @@ impl SessionLog {
             .map(|e| Stamp::new(e.t, e.mono))
             .fold(end, later);
         if agent.is_some() {
-            self.close_agent(at);
+            self.close_agent(Some(how), at);
         }
-        if let Some(node) = fg {
-            self.close_run(node, RunOut::Unknown, at);
+        if let Some(fg) = fg_run {
+            self.close_front_run(fg, Some(how), at);
             self.fg = None;
         }
     }
@@ -1403,17 +1625,145 @@ impl SessionLog {
         self.root_pgid = pgid;
     }
 
-    /// The foreground group moved to `pgid`: the runs of the group that left close (`out=unknown`: leaving the front is not an exit status).
+    /// The foreground group moved to `pgid`: the runs of the group that left close (`out=unknown`: leaving the front is not an exit status; `out=signal by=<asker>` while an end aterm asked of that group stands). A run that left for the shell before its command's D is remembered, so that command's end amends it ([`Self::end_cmd`]); any other group taking the front forgets them.
     pub(crate) fn foreground_moved(&mut self, pgid: i32, at: Stamp) {
         self.resync();
         self.name_pending(self.cmd, None);
-        if self.agent.as_ref().is_some_and(|a| a.pgid != pgid) {
-            self.close_agent(at);
+        self.front_pgid = pgid;
+        let to_shell = self.root_pgid > 0 && pgid == self.root_pgid;
+        if !to_shell {
+            self.left_front.clear();
+        }
+        let cmd = self.cmd.filter(|_| to_shell);
+        let mut left = Vec::new();
+        if let Some(a) = self.agent.as_ref().filter(|a| a.pgid != pgid) {
+            left.extend(self.leaving_front(a.node, a.pgid, cmd, at));
+            self.close_agent(None, at);
         }
         if let Some(fg) = self.fg.filter(|f| f.pgid != pgid) {
-            self.close_run(fg.node, RunOut::Unknown, at);
+            left.extend(self.leaving_front(fg.node, fg.pgid, cmd, at));
+            self.close_front_run(fg, None, at);
             self.fg = None;
         }
+        self.keep_left_front(left);
+    }
+
+    /// A RUN CLOSES BEFORE ITS COMMAND'S END IS READ: run `node` of group `pgid` is about to close
+    /// `unknown` on a path that is not that end (the front back at the shell, its group's leader
+    /// no longer named, the screen no longer showing its agent). Read before the close: it is
+    /// kept for `cmd`'s end to amend ([`Self::amend_left_front`]) when it descends from `cmd`
+    /// and no end aterm asked of its group stands (that close is `signal` already).
+    fn leaving_front(
+        &self,
+        node: Node,
+        pgid: i32,
+        cmd: Option<CmdRun>,
+        at: Stamp,
+    ) -> Option<LeftFront> {
+        let c = cmd.filter(|c| self.descends(node, c.node))?;
+        let kind = self.log.open_entry(node)?.kind;
+        self.asked_of_group(pgid, at)
+            .is_none()
+            .then_some(LeftFront {
+                run: node,
+                kind,
+                pgid,
+                cmd: c.node,
+            })
+    }
+
+    /// Keeps the runs [`Self::leaving_front`] read, once their closes are written: each once, none
+    /// still open, at most [`LEFT_FRONT_MAX`] (the oldest goes first).
+    fn keep_left_front(&mut self, left: impl IntoIterator<Item = LeftFront>) {
+        for l in left {
+            if self.log.is_open(l.run) || self.left_front.iter().any(|k| k.run == l.run) {
+                continue;
+            }
+            if self.left_front.len() >= LEFT_FRONT_MAX {
+                self.left_front.remove(0);
+            }
+            self.left_front.push(l);
+        }
+    }
+
+    /// aterm IS ABOUT TO END GROUP `pgid` ON `by`'s ASK (the restart act's `SIGTERM`, the `signal`
+    /// verb's ending signals): `mark <run> act word=<restart|signal> by=<asker> src=aterm
+    /// conf=exact` on the group's agent run, else its program run, else the running command,
+    /// else the session; then the end stands as asked ([`Self::stand_ask`]).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn ask_end(&mut self, pgid: i32, word: AskWord, by: Actor, at: Stamp) {
+        self.resync();
+        let node = self
+            .agent
+            .as_ref()
+            .filter(|a| a.pgid == pgid)
+            .map(|a| a.node)
+            .or(self.fg.filter(|f| f.pgid == pgid).map(|f| f.node))
+            .or(self.cmd.map(|c| c.node))
+            .unwrap_or(Node::SESSION);
+        if let Ok(f) = Fields::new().word(Key::Word, word.word()) {
+            let _ = self.log.mark(
+                Mark::new(Kind::Act, Src::Aterm, Conf::Exact)
+                    .at(node)
+                    .by(by)
+                    .fields(f),
+                at,
+            );
+        }
+        self.stand_ask(pgid, by, at);
+    }
+
+    /// THE END OF GROUP `pgid` STANDS AS `by`'s ASK from `at` for [`ASKED_END_STANDS`], replacing
+    /// any other: with it the running `cmd` run, when the group is the one the log saw in front
+    /// (or its program or agent run's) and not the shell's own (a shell whose group is unread is
+    /// taken as in front). When the log still has the shell in front (its sweep has yet to see
+    /// the group's job), the command is the one whose own stamps span the ask
+    /// ([`Self::asked_cmd`]), so a command whose D is still unread then keeps its own end, and
+    /// one the sweep has yet to see running takes the asked end. A seamless update's carrier
+    /// registers the act a Commit cut this way, with no mark: its predecessor wrote it.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn stand_ask(&mut self, pgid: i32, by: Actor, at: Stamp) {
+        self.resync();
+        let shells = self.root_pgid <= 0 || pgid == self.root_pgid;
+        let in_front = pgid == self.front_pgid
+            || self.fg.is_some_and(|f| f.pgid == pgid)
+            || self.agent.as_ref().is_some_and(|a| a.pgid == pgid);
+        let shell_in_front = self.front_pgid <= 0 || self.front_pgid == self.root_pgid;
+        let stands = u64::try_from(ASKED_END_STANDS.as_millis()).unwrap_or(u64::MAX);
+        self.ask = Some(AskedEnd {
+            pgid,
+            cmd: self.cmd.filter(|_| in_front && !shells).map(|c| c.node),
+            unseen: !shells && !in_front && shell_in_front,
+            by,
+            from_mono: at.mono_ms,
+            until_mono: at.mono_ms.saturating_add(stands),
+        });
+    }
+
+    /// The act's `SIGKILL` renews the end it asked of group `pgid`: it stands again from `at`.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn renew_ask(&mut self, pgid: i32, at: Stamp) {
+        let stands = u64::try_from(ASKED_END_STANDS.as_millis()).unwrap_or(u64::MAX);
+        if let Some(a) = self.ask.as_mut().filter(|a| a.pgid == pgid) {
+            a.until_mono = a.until_mono.max(at.mono_ms.saturating_add(stands));
+        }
+    }
+
+    /// The signal asked of group `pgid` was never delivered: its ask is taken back (its mark
+    /// stays, and the act's reply says why).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn withdraw_ask(&mut self, pgid: i32) {
+        if self.ask.is_some_and(|a| a.pgid == pgid) {
+            self.ask = None;
+        }
+    }
+
+    /// The end aterm last asked for, if one is held: its group, its asker, and how long past its
+    /// ask it stands (ms), which a renewal by the act's `SIGKILL` lengthens.
+    #[cfg(test)]
+    pub(crate) fn asked_end(&self) -> Option<(i32, Actor, u64)> {
+        self.ask
+            .map(|a| (a.pgid, a.by, a.until_mono.saturating_sub(a.from_mono)))
     }
 
     /// The group in front, `pgid`, named its program (the resolver's answer, off the sweep): the name waits for the next block read ([`Self::shell_blocks`]), which knows the command it ran under.
@@ -1483,12 +1833,17 @@ impl SessionLog {
             if self.agent.as_ref().is_some_and(|a| a.node == fg.node) {
                 self.agent = None;
             }
-            let out = if program.is_some() {
-                RunOut::Superseded
+            if program.is_some() {
+                self.close_run(fg.node, RunOut::Superseded, None, at);
             } else {
-                RunOut::Unknown
-            };
-            self.close_run(fg.node, out, at);
+                // The group's leader can no longer be named (it ended before the shell took the
+                // front back, or a pipeline's leader went first): its run ends as one that left
+                // the front does ([`Self::foreground_moved`]), on the ask that stands for its
+                // group or, kept, on its command's end.
+                let left = self.leaving_front(fg.node, fg.pgid, under, at);
+                self.close_front_run(fg, None, at);
+                self.keep_left_front(left);
+            }
             self.fg = None;
             self.resync();
         }
@@ -1575,13 +1930,13 @@ impl SessionLog {
         }
     }
 
-    fn close_run(&mut self, node: Node, out: RunOut, at: Stamp) {
+    fn close_run(&mut self, node: Node, out: RunOut, by: Option<Actor>, at: Stamp) {
         let under_cmd = self.cmd.is_some_and(|c| self.descends(node, c.node));
-        let closed = self.close_node(
-            node,
-            Close::new(Out::Run(out), Src::Status, Conf::Strong),
-            at,
-        );
+        let mut close = Close::new(Out::Run(out), Src::Status, Conf::Strong);
+        if let Some(by) = by {
+            close = close.by(by);
+        }
+        let closed = self.close_node(node, close, at);
         if closed.is_ok()
             && under_cmd
             && let Some(c) = self.cmd.as_mut()
@@ -1593,14 +1948,24 @@ impl SessionLog {
         }
     }
 
-    fn close_agent(&mut self, at: Stamp) {
+    /// The agent run ends at `at`, its command's end `cmd` when it held the front until then
+    /// ([`Self::run_end`]).
+    fn close_agent(&mut self, cmd: Option<CmdEnd>, at: Stamp) {
         if let Some(a) = self.agent.take() {
             // The named agent's run is the front run: closing it is the
             // front run's to do (`foreground_moved`).
             if self.fg.is_none_or(|f| f.node != a.node) {
-                self.close_run(a.node, RunOut::Unknown, at);
+                let (out, by) = self.run_end(a.pgid, RunOut::Unknown, cmd, at);
+                self.close_run(a.node, out, by, at);
             }
         }
+    }
+
+    /// The front run `fg` ends at `at`, its command's end `cmd` when it held the front until
+    /// then ([`Self::run_end`]).
+    fn close_front_run(&mut self, fg: FgRun, cmd: Option<CmdEnd>, at: Stamp) {
+        let (out, by) = self.run_end(fg.pgid, RunOut::Unknown, cmd, at);
+        self.close_run(fg.node, out, by, at);
     }
 
     /// The published agent verdict moved: `mark agent word= rev= gen= fp=`, then the turn tracker's transitions.
@@ -1676,7 +2041,14 @@ impl SessionLog {
             )
         });
         if m.word == "-" && self.agent.as_ref().is_some_and(|a| a.by_screen) {
-            self.close_agent(at);
+            // The screen no longer shows the agent it alone named: its run ends as one that left
+            // the front does ([`Self::leaving_front`]).
+            let left = self
+                .agent
+                .as_ref()
+                .and_then(|a| self.leaving_front(a.node, a.pgid, self.cmd, at));
+            self.close_agent(None, at);
+            self.keep_left_front(left);
             return None;
         }
         wake
@@ -2242,12 +2614,13 @@ impl LogQuery {
                 }
                 continue;
             };
+            let digits = !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit());
             match k {
                 "lvl" => q.lvl = Some(parse_lvl(v).ok_or(LOG_USAGE)?),
-                "since" => since = Some(v.parse::<u64>().map_err(|_| LOG_USAGE)?),
-                "ep" => ep = Some(v.parse::<u32>().map_err(|_| LOG_USAGE)?),
-                "base" => base = Some(v.parse::<u32>().map_err(|_| LOG_USAGE)?),
-                "n" => q.n = Some(v.parse::<usize>().map_err(|_| LOG_USAGE)?),
+                "since" if digits => since = Some(v.parse::<u64>().map_err(|_| LOG_USAGE)?),
+                "ep" if digits => ep = Some(v.parse::<u32>().map_err(|_| LOG_USAGE)?),
+                "base" if digits => base = Some(v.parse::<u32>().map_err(|_| LOG_USAGE)?),
+                "n" if digits => q.n = Some(v.parse::<usize>().map_err(|_| LOG_USAGE)?),
                 "kinds" => {
                     for w in v.split(',') {
                         match Kind::from_word(w) {
@@ -2307,14 +2680,15 @@ impl BriefQuery {
                 }
                 continue;
             };
+            let digits = !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit());
             match k {
-                "budget" => {
+                "budget" if digits => {
                     let b = v.parse::<usize>().map_err(|_| BRIEF_USAGE)?;
                     q.budget = Some(b.max(1));
                 }
-                "since" => since = Some(v.parse::<u64>().map_err(|_| BRIEF_USAGE)?),
-                "ep" => ep = Some(v.parse::<u32>().map_err(|_| BRIEF_USAGE)?),
-                "base" => base = Some(v.parse::<u32>().map_err(|_| BRIEF_USAGE)?),
+                "since" if digits => since = Some(v.parse::<u64>().map_err(|_| BRIEF_USAGE)?),
+                "ep" if digits => ep = Some(v.parse::<u32>().map_err(|_| BRIEF_USAGE)?),
+                "base" if digits => base = Some(v.parse::<u32>().map_err(|_| BRIEF_USAGE)?),
                 _ => return Err(BRIEF_USAGE),
             }
         }
@@ -2710,6 +3084,10 @@ mod tests;
 #[cfg(test)]
 #[path = "session_log_mark_tests.rs"]
 mod mark_tests;
+
+#[cfg(test)]
+#[path = "session_log_end_tests.rs"]
+mod end_tests;
 
 #[cfg(all(test, unix))]
 #[path = "session_log_attribution_tests.rs"]

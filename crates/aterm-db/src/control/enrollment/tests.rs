@@ -88,6 +88,14 @@ impl Lab {
         Endpoint::pending_from_bootstrap(&self.bootstrap(1), self.paths[1].clone()).unwrap()
     }
     pub(crate) fn exchange(&self, peer: &Endpoint) -> (Result<Report>, Result<Report>) {
+        self.exchange_with(peer, &mut Repair::default())
+    }
+    /// [`Self::exchange`], keeping the dialing `peer`'s repair in `repair`.
+    pub(crate) fn exchange_with(
+        &self,
+        peer: &Endpoint,
+        repair: &mut Repair,
+    ) -> (Result<Report>, Result<Report>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let owner = self.endpoint(0);
@@ -102,7 +110,7 @@ impl Lab {
             let client = peer.exchange(
                 Connection::connect(addr, Scope::Loopback, Duration::from_secs(60)).unwrap(),
                 Side::Initiator,
-                &mut Repair::default(),
+                repair,
             );
             (server.join().unwrap(), client)
         })
@@ -145,13 +153,23 @@ fn second_device_enrolls_over_tls_and_retries_without_a_vault_server_or_new_epoc
     client.unwrap();
 }
 
+/// A member refuses a device it has not approved before it sends its hello, so the pending device
+/// dials it again at the ordinary interval (`Busy`), not the backoff of a peer that does not
+/// answer: it enrolls within seconds of its approval. NEGATIVE CONTROL: with `Outcome::of`
+/// reading authentication alone, the dial reads `Refused`.
 #[test]
 fn unrecorded_recipient_with_a_copied_audience_cannot_enroll() {
     let lab = Lab::new(false);
     let before = lab.bootstrap(0).access().unwrap().unwrap().generation();
-    let (server, client) = lab.exchange(&lab.pending());
+    let mut repair = Repair::default();
+    let (server, client) = lab.exchange_with(&lab.pending(), &mut repair);
     assert!(server.is_err());
     assert!(client.is_err());
+    assert!(repair.unanswered(), "{server:?} {client:?}");
+    assert_eq!(
+        crate::runtime::Outcome::of(false, &repair, None),
+        crate::runtime::Outcome::Busy
+    );
     assert_eq!(
         lab.bootstrap(0).access().unwrap().unwrap().generation(),
         before
@@ -468,5 +486,55 @@ fn roster_denied_member_is_refused_enrollment_and_commons_sync() {
     assert!(
         a.is_err(),
         "responder must refuse Commons sync from roster-denied peer: {a:?} {b:?}"
+    );
+
+    // 3. Renumbering the member's roster row to `m70` (while `"m2"` stays in `deny_labels` and on
+    //    the membership log seat's `m.label`/`m.name`) permits Commons sync again.
+    let admin = client::admin_open(&lab.paths[0]).unwrap();
+    let mut doc = admin.doc.clone();
+    let mut renumbered_roster = SwarmRoster {
+        members: vec![SwarmMember {
+            recipient: m2_rec.clone(),
+            vault_name: "m2".into(),
+            label: "m70".into(),
+            aliases: vec!["m88".into()],
+            hint: None,
+            admitted_ms: 2,
+            claimed_label: None,
+            claimed_at_ms: None,
+            node_id: Some("bb".repeat(16)),
+            node_key: None,
+        }],
+        deny_nodes: vec!["aa".repeat(16)],
+        deny_labels: vec!["m2".into()],
+    };
+    doc.set_entry(
+        &aterm_secrets::text::Audience::Everyone,
+        ROSTER_ENTRY,
+        renumbered_roster.to_toml().as_bytes(),
+    )
+    .unwrap();
+    client::admin_publish(&lab.paths[0], &admin, &doc).unwrap();
+
+    let (a, b) = lab.exchange(&enrolled);
+    a.expect("renumbered active member must pass responder check despite denied log label m2");
+    b.expect("renumbered active member must complete Commons sync");
+
+    // 4. Denying the renumbered row's alias ("m88") refuses Commons sync again.
+    let admin = client::admin_open(&lab.paths[0]).unwrap();
+    let mut doc = admin.doc.clone();
+    renumbered_roster.deny_labels.push("m88".into());
+    doc.set_entry(
+        &aterm_secrets::text::Audience::Everyone,
+        ROSTER_ENTRY,
+        renumbered_roster.to_toml().as_bytes(),
+    )
+    .unwrap();
+    client::admin_publish(&lab.paths[0], &admin, &doc).unwrap();
+
+    let (a, _) = lab.exchange(&enrolled);
+    assert!(
+        a.is_err(),
+        "responder must refuse Commons sync when peer's roster alias is denied"
     );
 }

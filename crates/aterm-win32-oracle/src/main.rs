@@ -360,6 +360,9 @@ fn parse_record(tsv: &str) -> Result<Value> {
         let key = parts.get(1).ok_or("record row lacks key")?;
         match parts.first().copied() {
             Some("layout") if parts.len() == 4 => {
+                if parts[2].starts_with('+') || parts[3].starts_with('+') {
+                    return Err("invalid digit found in string".into());
+                }
                 let size = parts[2].parse::<u64>().map_err(|e| e.to_string())?;
                 let align = parts[3].parse::<u64>().map_err(|e| e.to_string())?;
                 if items
@@ -379,6 +382,9 @@ fn parse_record(tsv: &str) -> Result<Value> {
                     .and_then(|v| v.get_mut("offsets"))
                     .and_then(Value::as_object_mut)
                     .ok_or("offset precedes layout")?;
+                if parts[3].starts_with('+') {
+                    return Err("invalid digit found in string".into());
+                }
                 let offset = parts[3].parse::<u64>().map_err(|e| e.to_string())?;
                 if offsets
                     .insert(parts[2].into(), Value::from(offset))

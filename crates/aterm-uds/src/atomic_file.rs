@@ -336,7 +336,8 @@ impl ConfigWriteLock {
             return Err(not_a_file());
         }
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        let deadline = Instant::now() + wait;
+        crate::keep_out_of_children(&file)?;
+        let deadline = crate::deadline::saturating_after(Instant::now(), wait);
         let mut backoff = Duration::from_millis(1);
         loop {
             #[expect(

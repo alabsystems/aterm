@@ -14,10 +14,12 @@ use super::bundle::{
 use super::corpus::{CorpusSplit, ItemKind};
 use super::fidelity::{LaneFidelity, NO_STEP_SLEPT, ORACLE};
 use super::lane::LANE_MODEL;
+use super::m4::{Serial, Spread};
 use super::m4_tests::{cold_only, evaluator, gap0, index_of, plan, searched};
 use super::plan::{PLAN_INTERPRETER, Split, Wake};
 use super::policy::{ITEMS_V1, MAX_ROUNDS};
 use super::search::{GridProposer, Mode, Proposer, ProposerId};
+use super::test_fixtures::refused_off_the_pinned_target;
 use super::{MomentumCode, NoStrandedLight, SHIPPED_CODE_NAME, profile_artifact, schema_artifact};
 
 /// The grid search's bundle, as its parts.
@@ -40,6 +42,9 @@ fn forged(field: BundleField, row: Option<&str>) -> Result<CandidateBundle, Bund
 /// An accepted bundle holds every part plan §5 lists (design §10.7), each as the evaluator computed it, with one row per corpus item in policy order, no publication and no timings.
 #[test]
 fn an_accepted_bundle_names_every_plan_s5_part() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = evaluator();
     let b = accepted();
     let p = gap0();
@@ -107,6 +112,9 @@ fn an_accepted_bundle_names_every_plan_s5_part() {
 /// A bundle round-trips through its bytes and verifies to itself, and the decode refuses every proper prefix, every flipped byte and an appended byte.
 #[test]
 fn a_bundle_round_trips_and_every_cut_or_flipped_byte_is_refused() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = evaluator();
     let bundle = searched().admitted.bundle();
     let bytes = bundle.encode();
@@ -156,9 +164,79 @@ fn a_bundle_round_trips_and_every_cut_or_flipped_byte_is_refused() {
     );
 }
 
+/// Every job, last first.
+struct Backwards;
+
+impl Spread for Backwards {
+    fn run(&self, n: usize, job: &(dyn Fn(usize) + Sync)) {
+        for i in (0..n).rev() {
+            job(i);
+        }
+    }
+}
+
+/// The even jobs only: the caller runs the rest in place.
+struct Evens;
+
+impl Spread for Evens {
+    fn run(&self, n: usize, job: &(dyn Fn(usize) + Sync)) {
+        for i in (0..n).step_by(2) {
+            job(i);
+        }
+    }
+}
+
+/// Every job on a scoped thread of its own.
+struct Threads;
+
+impl Spread for Threads {
+    fn run(&self, n: usize, job: &(dyn Fn(usize) + Sync)) {
+        std::thread::scope(|s| {
+            for i in 0..n {
+                s.spawn(move || job(i));
+            }
+        });
+    }
+}
+
+/// A bundle whose rows were altered at two places is refused naming the first, over a spread
+/// that judges the rows in order, last first, half of them, or on threads.
+#[test]
+fn a_bundle_altered_at_two_rows_names_the_first_over_any_spread() {
+    let mut b = accepted();
+    let (t1, last) = (index_of("train-01"), b.rows.len() - 1);
+    assert!(t1 < last);
+    b.rows[t1].ticks -= 1;
+    b.rows[last].ticks += 1;
+    let bytes = b.encode();
+    let spreads: [(&str, &dyn Spread); 4] = [
+        ("in order", &Serial),
+        ("last first", &Backwards),
+        ("half", &Evens),
+        ("threads", &Threads),
+    ];
+    for (how, spread) in spreads {
+        assert_eq!(
+            CandidateBundle::verify_spread(&bytes, evaluator(), spread),
+            forged(BundleField::Ticks, Some("train-01")),
+            "{how}"
+        );
+    }
+    // CONTROL: the last row alone is refused, so the first is named over the other.
+    let mut alone = accepted();
+    alone.rows[last].ticks += 1;
+    assert_eq!(
+        verify(&alone),
+        forged(BundleField::Ticks, Some(ITEMS_V1[last].id()))
+    );
+}
+
 /// A bundle resealed over altered evidence (rows, verdicts, identities, build, plan, sums, selection, grade, assumptions or timings) is refused as forged, naming the field and the row.
 #[test]
 fn a_resealed_bundle_with_altered_evidence_is_forged() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = evaluator();
     let good = accepted();
     let t1 = index_of("train-01");
@@ -341,6 +419,9 @@ fn a_resealed_bundle_with_altered_evidence_is_forged() {
 /// A refused candidate is no bundle: the cold-only plan's real rows are forged at the first lane item, resealed as they are or with their failures made passes.
 #[test]
 fn a_refused_candidate_is_no_bundle() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = evaluator();
     let p = cold_only();
     let ks: Vec<usize> = (0..ITEMS_V1.len()).collect();
@@ -373,6 +454,9 @@ fn a_refused_candidate_is_no_bundle() {
 /// The publication part is checked for consistency only: one naming another candidate, a failing candidate verdict, no later revision or a range past the head is forged.
 #[test]
 fn the_publication_is_checked_for_consistency_only() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let mut b = accepted();
     let pubn = Publication {
         head: PublishedHead {
@@ -465,6 +549,9 @@ fn publication_over(b: &UncheckedBundle, live: ArtifactId) -> Publication {
 /// The publication's live code must be a base the policy names, as compiled into the bundle's build, and meet that base's rule: a useful result over the shipped code, any admitted one over the demonstration fault.
 #[test]
 fn the_publication_replaces_a_base_of_the_policy_by_its_rule() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = evaluator();
     let useful = accepted();
     let cadence = ev
@@ -556,6 +643,9 @@ fn the_publication_replaces_a_base_of_the_policy_by_its_rule() {
 /// A search credited to the grid must be the grid's own selection, which `verify` re-runs, while another proposer's selection verifies as declared.
 #[test]
 fn a_selection_credited_to_the_grid_is_the_grids() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = evaluator();
     let grid = accepted();
     let relabel = |b: &mut UncheckedBundle, from: &UncheckedBundle| {

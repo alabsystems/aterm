@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::snapshot::CacheRoot;
 
+#[path = "artifact_use.rs"]
+mod in_use;
+
 /// The record's schema, and what the key and the bundle digest are taken under.
 pub const SCHEMA: &str = "aterm-release-artifact-v1";
 
@@ -200,7 +203,7 @@ pub fn macho_sha256(app: &Path) -> Result<String, String> {
 pub fn read(store: &Path, key: &str) -> Result<Option<Complete>, String> {
     let dir = store.join(key);
     let record = dir.join(COMPLETE_FILE);
-    let text = match std::fs::read_to_string(&record) {
+    let text = match crate::durable::read_regular_text(&record, 1024 * 1024) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("read {}: {e}", record.display())),
@@ -250,19 +253,20 @@ pub fn prove(complete: &Complete, app: &Path) -> Result<(), String> {
 
 /// This Mac's physical memory in bytes (`sysctl -n hw.memsize`); `None` when it will not say.
 pub(crate) fn host_memory_bytes() -> Option<u64> {
-    let out = std::process::Command::new("/usr/sbin/sysctl")
+    let out = aterm_uds::spawnfd::command("/usr/sbin/sysctl")
         .args(["-n", "hw.memsize"])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .stderr(aterm_uds::spawnfd::Stdio::null())
         .output()
         .ok()?;
     if !out.status.success() {
         return None;
     }
-    String::from_utf8_lossy(&out.stdout)
-        .trim()
-        .parse()
-        .ok()
+    let s = String::from_utf8_lossy(&out.stdout);
+    let s = s.trim();
+    (!s.starts_with('+'))
+        .then(|| s.parse().ok())
+        .flatten()
         .filter(|&bytes: &u64| bytes > 0)
 }
 
@@ -279,8 +283,11 @@ pub fn slices_fit(store: &Path, memory: Option<u64>) -> bool {
         .flatten()
         .filter_map(|e| {
             let record = e.path().join(COMPLETE_FILE);
-            let when = std::fs::metadata(&record).and_then(|m| m.modified()).ok()?;
-            let text = std::fs::read_to_string(&record).ok()?;
+            let when = std::fs::symlink_metadata(&record)
+                .ok()
+                .filter(|m| m.is_file())
+                .and_then(|m| m.modified().ok())?;
+            let text = crate::durable::read_regular_text(&record, 1024 * 1024).ok()?;
             let complete: Complete = aterm_toml::from_str(&text).ok()?;
             Some((when, complete))
         })
@@ -288,7 +295,11 @@ pub fn slices_fit(store: &Path, memory: Option<u64>) -> bool {
     let Some((_, complete)) = newest else {
         return true;
     };
-    let peaks: u64 = complete.slices.iter().filter_map(|s| s.peak_bytes).sum();
+    let peaks: u64 = complete
+        .slices
+        .iter()
+        .filter_map(|s| s.peak_bytes)
+        .fold(0u64, u64::saturating_add);
     peaks <= memory / 4 * 3
 }
 
@@ -324,12 +335,12 @@ pub fn build(repo: &Path, identity: &Identity) -> Result<Complete, String> {
     .map_err(|e| e.to_string())?;
     crate::gates::disk_gate(&store).map_err(|e| e.to_string())?;
     let dir = store.join(&key);
-    match std::fs::remove_dir_all(&dir) {
-        Ok(()) => println!(
+    match in_use::remove_unused(&dir) {
+        Ok(true) => println!(
             "==> {} held no usable build; removed, built again",
             dir.display()
         ),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(false) => {}
         Err(e) => return Err(format!("remove the unfinished {}: {e}", dir.display())),
     }
     crate::snapshot::private_dir(&dir, "release artifact")?;
@@ -395,7 +406,7 @@ pub fn build(repo: &Path, identity: &Identity) -> Result<Complete, String> {
 /// Either compiler cannot be asked for its commit.
 pub fn compilers() -> Result<Compilers, String> {
     let stage2 = crate::gates::trust_stage2_bin().map_err(|e| e.to_string())?;
-    let out = std::process::Command::new(stage2.join("trustc"))
+    let out = aterm_uds::spawnfd::command(stage2.join("trustc"))
         .arg("-vV")
         .output()
         .map_err(|e| format!("ask {} -vV: {e}", stage2.join("trustc").display()))?;
@@ -416,26 +427,16 @@ pub fn compilers() -> Result<Compilers, String> {
 /// a record is whole or absent.
 fn write_complete(dir: &Path, complete: &Complete) -> Result<(), String> {
     let text = aterm_toml::to_string(complete).map_err(|e| format!("serialize the record: {e}"))?;
-    let tmp = dir.join(format!(".{COMPLETE_FILE}.tmp"));
     let path = dir.join(COMPLETE_FILE);
-    let write = || -> std::io::Result<()> {
-        let mut file = std::fs::File::create(&tmp)?;
-        std::io::Write::write_all(&mut file, text.as_bytes())?;
-        crate::durable::sync_all(&file)?;
-        std::fs::rename(&tmp, &path)?;
-        crate::durable::sync_dir(dir)
-    };
-    write().map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("write {}: {e}", path.display())
-    })
+    crate::durable::write_atomic_durable(&path, text.as_bytes(), 0o600)
+        .map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 /// A byte copy of the store's bundle at `to` (which must not exist), re-proved against the record before anything signs it, so the cut signs the bytes `verify release` judged.
 /// # Errors
 /// A copy that fails, or bytes that differ from the record.
 pub fn copy_bundle(complete: &Complete, from: &Path, to: &Path) -> Result<(), String> {
-    if to.exists() {
+    if crate::bundle::exists_or_symlink(to) {
         return Err(format!(
             "{} exists — the verified bundle is copied into a fresh place",
             to.display()
@@ -470,23 +471,33 @@ pub fn place_records(dir: &Path, dist: &Path, version: &str) -> Result<(), Strin
     Ok(())
 }
 
-/// Remove every entry of `store` but those in `keep`: a release keeps only the bundle it is
-/// building or signing.
+/// Remove unused artifact entries except those in `keep`. Running images, configured
+/// services and first executions retain their backing bundles independently of release journals.
 fn prune(store: &Path, keep: &[&str]) {
     let Ok(entries) = std::fs::read_dir(store) else {
         return;
     };
+    let deadline = std::time::Instant::now() + in_use::LOOKUP_BUDGET;
     for entry in entries.flatten() {
         let name = entry.file_name();
         if keep.iter().any(|k| name.as_os_str() == *k) {
             continue;
         }
+        if !name.to_str().is_some_and(|name| {
+            name.len() == 64
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }) {
+            continue;
+        }
         let path = entry.path();
-        match std::fs::remove_dir_all(&path) {
-            Ok(()) => println!(
+        match in_use::remove_unused_until(&path, deadline) {
+            Ok(true) => println!(
                 "==> removed the release cache's older bundle {}",
                 path.display()
             ),
+            Ok(false) => {}
             Err(e) => println!("==> kept {} ({e}); the next build retries", path.display()),
         }
     }

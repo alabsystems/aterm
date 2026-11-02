@@ -4,6 +4,10 @@
 // Derived from winit 0.30.13 src/error.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
+// Modified by the aterm project in 2026; see the repository NOTICE. (Added
+// `EventLoopError::DisplayLost`: a display server that died under the loop is told apart from
+// every other way a run fails.)
+
 use std::{error, fmt};
 
 use crate::platform_impl;

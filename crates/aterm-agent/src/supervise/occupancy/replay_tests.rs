@@ -184,6 +184,34 @@ fn a_ring_with_no_free_window_gives_no_hold_room() {
         lines.get(lines.len() - 2).map(String::as_str),
         Some("hold-room@v1 first would never")
     );
+    let (pdt, pst) = (-7 * 3600, -8 * 3600);
+    let boundary_s = at(2, 0, 0).div_euclid(1000);
+    let dst = replay_lines_local(
+        &replayed,
+        rows.len(),
+        spans.len(),
+        (rows[0].at, at(13, 30, 0)),
+        &|s| Some(if s < boundary_s { pdt } else { pst }),
+    );
+    let flat = replay_lines(
+        &replayed,
+        rows.len(),
+        spans.len(),
+        (rows[0].at, at(13, 30, 0)),
+        pst,
+    );
+    assert_eq!(
+        dst[0],
+        format!(
+            "replay from 11:51 to 05:30 looks={} holds={}",
+            rows.len(),
+            spans.len()
+        )
+    );
+    assert!(
+        flat[0].starts_with("replay from 10:51 to 05:30 "),
+        "NEGATIVE CONTROL: {flat:#?}"
+    );
 }
 
 #[test]
@@ -287,6 +315,7 @@ fn the_window_takes_a_span() {
         ("24", None),
         ("h", None),
         ("-1h", None),
+        ("+1h", None),
         ("2w", None),
     ] {
         assert_eq!(window_ms(word), ms, "{word}");

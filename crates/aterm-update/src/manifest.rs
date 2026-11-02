@@ -9,6 +9,16 @@ use std::path::Path;
 use aterm_durable::Flush;
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
+std::thread_local! {
+    static FAIL_NEXT_DURABLE_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_durable_write() {
+    FAIL_NEXT_DURABLE_WRITE.with(|fail| fail.set(true));
+}
+
 /// Write `text` to `path` atomically, finishing its temporary and parent directory with
 /// `flush`. A refused file or directory flush is accepted. A genuine directory flush
 /// failure after the rename is logged: the record is already in place, but its entry
@@ -24,13 +34,37 @@ pub(crate) fn write_durable(
     flush: Flush,
 ) -> Result<(), String> {
     use std::io::Write as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let parent = match path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
         _ => Path::new("."),
     };
-    let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
+    let tmp = path.with_extension(format!(
+        "toml.{}-{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     let write = (|| -> std::io::Result<()> {
-        let mut file = std::fs::File::create(&tmp)?;
+        #[cfg(test)]
+        if FAIL_NEXT_DURABLE_WRITE.with(|fail| fail.replace(false)) {
+            return Err(std::io::Error::other("injected durable write failure"));
+        }
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(&tmp)?;
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "refusing to write non-regular file",
+            ));
+        }
+        file.set_len(0)?;
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
         file.write_all(text.as_bytes())?;
         aterm_durable::refusal_accepted(crate::durable::finish(&file, flush))
     })();
@@ -268,8 +302,8 @@ fn cheap_staged_identity_matches(ready: &Ready, app: &Path) -> Option<bool> {
     let Some(text) = crate::read_ledger_text(&plist) else {
         return Some(false);
     };
-    let Some(build) = xml_plist_string(&text, "<key>CFBundleVersion</key>")
-        .and_then(|value| value.parse::<u64>().ok())
+    let Some(build) =
+        xml_plist_string(&text, "<key>CFBundleVersion</key>").and_then(crate::parse_uint::<u64>)
     else {
         return Some(false);
     };
@@ -752,13 +786,19 @@ impl FailedMark {
                 return m;
             }
         }
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
         let Ok(text) = aterm_toml::to_string(&m) else {
             return m;
         };
-        let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
-        if std::fs::write(&tmp, text).is_ok() {
-            let _ = std::fs::rename(&tmp, path);
-        } else {
+        let tmp = path.with_extension(format!(
+            "toml.{}-{}.tmp",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        if crate::install::write_private_file(&tmp, text.as_bytes()).is_err()
+            || std::fs::rename(&tmp, path).is_err()
+        {
             let _ = std::fs::remove_file(&tmp);
         }
         m
@@ -1030,9 +1070,10 @@ mod tests {
         assert!(write_durable(&path, "new", "test record", Flush::Ordered).is_err());
         assert_eq!(std::fs::read(path.join("witness")).unwrap(), b"keep");
         assert!(
-            !path
-                .with_extension(format!("toml.{}.tmp", std::process::id()))
-                .exists()
+            std::fs::read_dir(&staging.root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|e| !e.file_name().to_string_lossy().ends_with(".tmp"))
         );
         assert!(crate::log_capture::take().is_empty());
     }

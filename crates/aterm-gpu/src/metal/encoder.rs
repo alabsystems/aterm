@@ -3,6 +3,7 @@
 
 //! The encoder: multi-pass command buffers.
 
+use std::ffi::c_void;
 use std::sync::Arc;
 
 use super::ffi::{
@@ -13,6 +14,9 @@ use super::ffi::{
 };
 use super::loss;
 use super::resources::SealedTexture;
+
+/// The most bytes Metal binds inline (`-setVertexBytes:length:atIndex:`): 4 KiB.
+const INLINE_BYTES_MAX: usize = 4096;
 
 /// What a render pass does with its results.
 #[derive(Clone, Copy, Debug)]
@@ -637,6 +641,61 @@ impl PassEncoder<'_, '_> {
             );
         }
         Ok(())
+    }
+
+    /// `bytes` as the vertex stage's buffer at `index` (`-setVertexBytes:length:atIndex:`): the
+    /// command buffer copies them during the call, so a small uniform needs no `MTLBuffer`.
+    /// Metal takes at most 4 KiB this way.
+    #[inline]
+    pub(crate) fn set_vertex_bytes(&self, bytes: &[u8], index: usize) -> Result<(), String> {
+        if index == super::ffi::INSTANCE_STREAM_SLOT {
+            return Err(format!(
+                "vertex buffer index {index} is INSTANCE_STREAM_SLOT — bind streams \
+                 through set_instance_stream, uniforms at their small MSL indices"
+            ));
+        }
+        if bytes.len() > INLINE_BYTES_MAX {
+            return Err(format!(
+                "{} bytes inline: Metal takes at most {INLINE_BYTES_MAX}",
+                bytes.len()
+            ));
+        }
+        // SAFETY: `-setVertexBytes:length:atIndex:` is `v40@0:8r^v16Q24Q32` on a live render
+        // command encoder; it copies `length` bytes from the pointer during the call, and the
+        // slice is live and that long.
+        unsafe {
+            let f: unsafe extern "C-unwind" fn(Id, Sel, *const c_void, usize, usize) =
+                checked_msg();
+            f(
+                self.enc.id(),
+                sel(c"setVertexBytes:length:atIndex:"),
+                bytes.as_ptr().cast(),
+                bytes.len(),
+                index,
+            );
+        }
+        Ok(())
+    }
+
+    /// `bytes` as the fragment stage's buffer at `index`, as [`Self::set_vertex_bytes`]; a slice
+    /// past 4 KiB binds nothing.
+    #[inline]
+    pub(crate) fn set_fragment_bytes(&self, bytes: &[u8], index: usize) {
+        if bytes.len() > INLINE_BYTES_MAX {
+            return;
+        }
+        // SAFETY: `-setFragmentBytes:length:atIndex:` as `set_vertex_bytes`.
+        unsafe {
+            let f: unsafe extern "C-unwind" fn(Id, Sel, *const c_void, usize, usize) =
+                checked_msg();
+            f(
+                self.enc.id(),
+                sel(c"setFragmentBytes:length:atIndex:"),
+                bytes.as_ptr().cast(),
+                bytes.len(),
+                index,
+            );
+        }
     }
 
     /// Bind the per-instance stream at [`super::ffi::INSTANCE_STREAM_SLOT`], the slot no MSL uniform block uses.

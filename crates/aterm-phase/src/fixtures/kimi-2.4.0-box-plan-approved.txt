@@ -1,0 +1,30 @@
+# kimi 2.4.0 · MEASURED 2026-10-29, `aterm ctl text` of a private headless aterm (110x32, aterm 0.146.0) running the real Kimi Code, launched by path with a scratch `HOME` and `KIMI_CODE_HOME` whose `config.toml` names one `openai`-type provider at `http://127.0.0.1:<port>/v1` with a fake key (a local stub of the Chat Completions API, crates/aterm-lab), no login · Enter on option 1: `Current plan · Approved: Lab plan A (Recommended)`, plan mode off (`plan` gone from the footer); the stub's second ExitPlanMode below is its own misread of Kimi's reminder message, refused by Kimi
+ ● Used Write (…95d-90d8-422b-bc70-82ea4e4c480f/agents/main/plans/us-agent-constantine-obsidian.md) · 4 lines
+      1  # Lab plan
+      2
+      3  1. Lab step one.
+      4  2. Lab step two.
+      5
+
+ ● lab plan written
+
+ ❯ lab exit plan mode now
+
+ Current plan · Approved: Lab plan A (Recommended)
+   ┌ plan: us-agent-constantine-obsidian.md ────────────────────────────────────────────────────────────────┐
+   │ Lab plan                                                                                               │
+   │                                                                                                        │
+   │ 1. Lab step one.                                                                                       │
+   │ 2. Lab step two.                                                                                       │
+   └────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+ Current plan
+   ExitPlanMode can only be called while plan mode is active. Only the user can turn plan mode on.
+
+ ● lab after the plan
+
+ ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │ >                                                                                                        │
+ ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ lab-model  …/tmp/at.H2aa/proj                                                           /help: show commands
+                                                                                   context: 26% (24.6k/97.7k)

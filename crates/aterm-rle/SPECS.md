@@ -1,59 +1,46 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-rle: spec recovery from its 58 unit tests
+# aterm-rle: spec recovery from its unit tests
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 46 tests it
-> deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
-> were taken before.
-
-> Status 2026-10-15: this file is the crate's migration worklist. Each of the 14 specs below is
-> proved through Trust/Clean about the compiled Rust function, and then the tests it subsumes are
-> deleted. The 2 tests in §4 sample no spec; delete them now. No test has been deleted yet.
-
-Source: `crates/aterm-rle` (`src/lib.rs`, `src/mutations.rs`; read only). I read every `#[test]`
-(`src/tests.rs` 13, `src/tests_boundary.rs` 13, `src/tests_exhaustive.rs` 18,
-`src/tests_saturation.rs` 9, `src/tests_performance.rs` 3, `tests/fuzz_rle.rs` 2 = 58) and the
-code each one reaches. Nothing was compiled or run. The claims below come from reading the code.
-
-Result: **14 specs**, covering **56 tests**. **2 tests are not spec samples** (§4).
+The general properties the tests of `crates/aterm-rle` (`src/tests*.rs`, `tests/fuzz_rle.rs`)
+sample, stated over `src/lib.rs` and `src/mutations.rs`. §1 lists the specs, §2 maps each test to
+the specs whose proofs retire it, and §5 lists where a test disagrees with the code.
 
 ## 0. Notation used in the statements
 
 - `MAX` = `u32::MAX`. Every statement is over all `T: Copy + PartialEq + Default`. The tests use
-  `T = u8` or `u16`, so each spec is one per-definition generic proof (gap 11), or one proof per
+  `T = u8`, so each spec is one per-definition generic proof (gap 11) or one proof per
   instantiation.
 - `expand(rs: [Run<T>]) : Seq T` = `concat_k replicate(rs[k].length, rs[k].value)`.
-  `model(r)` = `expand(r.runs)`. This is the abstraction function. Every functional spec below is a
-  statement about `model(r)`.
+  `model(r)` = `expand(r.runs)`, the abstraction function every functional spec is stated over.
 - `encode(xs: Seq T) : [Run<T>]` = the canonical RLE of `xs`: one run per maximal block of equal
   adjacent values, with `length` = the block size. `encode([]) = []`.
 - `Inv(r)` := `r.runs == encode(model(r))` ∧ `r.total_length as u64 == Σ_k r.runs[k].length as u64 ≤ MAX`.
   Equivalently: every run has `length > 0`, adjacent runs have different values, and the cached total
-  equals the exact (u64) sum. The run-count assertions in the tests (`run_count() == n`,
-  `runs()[k].length == m`) all follow from `Inv` plus the model contract of the operation.
+  equals the exact (u64) sum. The tests' run-count assertions follow from `Inv` and the operation's
+  model contract.
 - `Reach`: the `Rle` values reachable from `new()`, `default()`, `with_value(v,n)` and `from_iter(xs)`
   through any sequence of `push`, `try_push`, `extend_with`, `try_extend_with`, `set`, `set_range`,
   `resize`, `resize_with` and `clear`.
-- `len(r)` = `r.len()` = `r.total_length`. `start(r,k)` = `Σ_{j<k} r.runs[j].length` (the first cell
-  index of run `k`).
+- `len(r)` = `r.len()` = `r.total_length`. `start(r,k)` = `Σ_{j<k} r.runs[j].length`, the first cell
+  index of run `k`.
 - `clampadd(r,c)` = `min(c, MAX - len(r))`.
 - Sequence operations: `xs ++ ys`, `replicate(n,v)`, `xs[i:=v]`, `take(n,xs)`, and `resize(xs,n,v)`
   (`Vec::resize` semantics: truncate to `n` or pad with `v`).
 - Iterator state of `RleIter{runs, run_idx, offset_in_run}`: `rem(it)` = `expand(runs)` with its first
   `start(run_idx) + offset_in_run` cells dropped. `IterInv(it)`: `run_idx ≤ runs.len` ∧
   `(run_idx < runs.len ⇒ offset_in_run < runs[run_idx].length)` ∧ `(run_idx = runs.len ⇒ offset_in_run = 0)`.
-- `iters(call)`: the number of `count_run_iteration()` calls a call makes. Today that counter is a
-  `#[cfg(test)]` `thread_local` `Cell` in `src/lib.rs`, called from `find_run_linear`,
-  `split_range_multi_run` and `compact`. A proof needs it as a ghost counter.
-- Gap numbers refer to the table in
-  the historical development audit `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7.
-  Gap 0 (a seal that publishes Clean rows) blocks every row, so it is listed on each one.
+- `iters(call)`: the number of `count_run_iteration()` calls a call makes. The counter is a
+  `#[cfg(test)]` `thread_local` `Cell` in `src/lib.rs`, bumped in `find_run_linear`,
+  `split_range_multi_run` and `compact`; a proof needs it as a ghost counter.
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes (primary tests; secondary in §2)`,
-`difficulty (Rust features the proof must handle)`, `blocking gaps (audit §7)`.
+Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (primary tests; secondary in §2),
+`difficulty` (the Rust features the proof must handle), `blocking_gaps` (rows of §7 of
+`docs/AUDIT-trust-for-test-migration-2026-10-15.md`). Gap 0 (a seal that publishes Clean rows)
+blocks every row. A first proof can sidestep gap 11 by stating the spec at `T = u8`.
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
@@ -73,46 +60,9 @@ rle-capacity-error-display	contract	<RleCapacityError as Display>::fmt	∀ reque
 rle-find-run-cost	other (cost: ghost counter)	Rle::{find_run_linear,get,set}; internal: split_and_set	Over the ghost counter iters: ∀ r with Inv(r), index < len(r) with find_run(r,index) = Some((k,_)): find_run_linear makes exactly k+1 counted iterations; for index ≥ len it makes exactly run_count(r) (get and set return before calling it in that case). set(index,v) makes no counted iterations beyond its one find_run, because split_and_set and compact_around have no loops. So set on a one-run Rle costs exactly 1 counted iteration whatever len(r) is.	tests_performance::rle_set_well_compressed_is_constant	MEDIUM: a ghost counter in a loop (replacing the cfg(test) thread_local Cell), loop-iteration accounting, &self	0,1,3,5,7,11
 ```
 
-### Distribution by kind (14)
-
-| kind | count | ids |
-|---|---|---|
-| contract | 5 | rle-find-run, rle-ctor, rle-observers, rle-try-extend, rle-capacity-error-display |
-| refinement | 6 | rle-extend-clamped, rle-get-index, rle-set, rle-set-range, rle-resize, rle-iter |
-| invariant | 1 | rle-inv |
-| no-panic | 1 | rle-no-panic |
-| other | 1 | rle-find-run-cost (cost over a ghost counter) |
-
-### Gap histogram (number of specs each gap blocks)
-
-| gap | specs blocked |
-|---|---|
-| 0 | 14 |
-| 1 | 14 |
-| 2 | 12 (all but rle-ctor, rle-find-run-cost) |
-| 3 | 12 (all but rle-observers, rle-try-extend) |
-| 4 | 8 |
-| 5 | 6 |
-| 7 | 8 |
-| 8 | 1 (rle-capacity-error-display) |
-| 11 | 13 (all but rle-capacity-error-display) |
-
-No spec is blocked by gap 0 alone. Every spec needs gap 1 (`Vec<Run<T>>` content models or a
-struct/String carrier). Gap 11 (generics) can be sidestepped for a first proof by stating each spec
-at `T = u8`, which is what the tests use, and generalising once per-definition proofs land.
-
-### Proof dependency order
-
-`rle-observers` → `rle-ctor` (new/default/with_value half) → `rle-extend-clamped` → `rle-try-extend`
-→ `rle-find-run` → `rle-get-index` → `rle-set` → `rle-find-run-cost` → `rle-resize` → `rle-iter`
-→ `rle-ctor` (from_iter half) → `rle-set-range` → `rle-inv` (assembled from the per-operation
-preservation lemmas proved alongside each contract) → `rle-no-panic`. `rle-capacity-error-display`
-is independent.
-
 ## 2. Test → spec map (TSV)
 
-`primary` is the spec that retires the test. `also` lists the other specs the same test samples.
-The tests deleted since have no row.
+`primary` is the spec that retires the test; `also` lists the other specs it samples.
 
 ```tsv
 file	test	primary	also
@@ -134,14 +84,17 @@ src/tests_performance.rs	rle_set_range_linear_in_runs	rle-find-run-cost
 tests/fuzz_rle.rs	fuzz_rle_mutators_never_panic	rle-no-panic	rle-inv
 ```
 
+Three tests sample a spec but have no row:
+`tests_saturation::extend_and_push_clamp_to_the_remaining_capacity` (`rle-extend-clamped`),
+`tests_saturation::try_forms_take_a_whole_request_or_change_nothing` (`rle-try-extend`) and
+`tests_exhaustive::rle_set_range_exhaustive` (`rle-set-range`, `rle-inv`).
+The `rle-inv` row's `subsumes` names `tests_exhaustive::post_clamp_mutations_preserve_invariant`;
+the test is in `src/tests_saturation.rs`, as the map above has it.
+
 ## 3. Coverage
 
-- 58 tests read. 56 map to one of the 14 specs. 2 are not spec samples (§4).
-- The biggest collapses: `rle-set-range` (11 primary), `rle-ctor`, `rle-extend-clamped`,
-  `rle-try-extend` and `rle-resize` (6 each).
-- `rle-inv` has only 3 primary tests, but it is sampled by 16 tests and is the precondition of every
-  other functional spec. The fuzz harness's `assert_invariant` and the per-test structure checks
-  retire with it.
+`rle-inv` is the precondition of every other functional spec. The tests' structure checks
+(`assert_rle_matches_model` in `src/tests.rs`, `assert_invariant` in the fuzz) retire with it.
 
 ## 4. Tests that are not spec samples
 
@@ -150,8 +103,8 @@ tests/fuzz_rle.rs	fuzz_rle_mutators_never_panic	rle-no-panic	rle-inv
 > Status 2026-10-28: `tests_performance::rle_set_range_linear_in_runs` was rewritten (§5.2) to assert exact `count_run_iteration()` counts rather than a growth-rate ratio band, so 0 non-spec tests remain.
 
 Once `rle-find-run-cost` is proved over a ghost counter and its tests are deleted, the
-`#[cfg(test)]` `iteration_counter` module in `src/lib.rs` (and the `count_run_iteration()` calls in
-`src/mutations.rs`) can go too.
+`#[cfg(test)]` `iteration_counter` module in `src/lib.rs` and the `count_run_iteration()` calls in
+`src/mutations.rs` can go.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
@@ -166,21 +119,19 @@ Once `rle-find-run-cost` is proved over a ghost counter and its tests are delete
 4. *(Resolved)* **`tests_exhaustive::rle_index_trait_oob_panics` uses bare `#[should_panic]`** without
    pinning `core::slice`'s panic message text.
 
-## 6. The specs I would prove first (easiest, high value)
+## 6. Proof order (easiest high-value first)
 
-No spec here is blocked by gap 0 alone; all need at least gap 1 (a `Vec<Run<T>>` content model) and,
-unless stated at `T = u8`, gap 11.
+`rle-observers` → `rle-ctor` (new/default/with_value half) → `rle-extend-clamped` → `rle-try-extend`
+→ `rle-find-run` → `rle-get-index` → `rle-set` → `rle-find-run-cost` → `rle-resize` → `rle-iter`
+→ `rle-ctor` (from_iter half) → `rle-set-range` → `rle-inv` (assembled from the per-operation
+preservation lemmas proved alongside each contract) → `rle-no-panic`. `rle-capacity-error-display`
+is independent.
 
-1. **`rle-observers`** (gaps 0, 1, 2, 11). Field reads and one `u32` subtraction that cannot
-   underflow, with no loop and no call. It retires 1 test, but `len`/`run_count`/`remaining_capacity`
-   are the vocabulary every other spec is stated in, so it is the first `&self`-view proof to land.
-2. **`rle-try-extend`** with **`rle-extend-clamped`** (gaps 0, 1, 2, 4, 11; `extend-clamped` adds 3
-   for `u32::min`/`saturating_add`). No loops: `last_mut`, one compare, one push or one length bump.
-   Together they retire 12 tests and give the tail-only frame condition that `rle-ctor`'s
-   `with_value` and `rle-resize`'s growth path reuse.
-3. **`rle-find-run`** then **`rle-get-index`** (gaps add 3, 5, 7). One accumulator loop with an
-   obvious invariant (`accumulated = start(r,i) ≤ index`). It is the lemma `rle-set`, `rle-set-range`
-   and `rle-find-run-cost` stand on, and it retires 5 tests directly (4 via `rle-get-index`).
-
-Runner-up: `rle-ctor`'s `new`/`default`/`with_value` half (gaps 0, 1, 3, 11, no loop); its `from_iter`
-half waits on gap 7 (a loop over a generic iterator).
+1. **`rle-observers`**: field reads and one `u32` subtraction that cannot underflow, with no loop and
+   no call. `len`, `run_count` and `remaining_capacity` are the vocabulary every other spec uses.
+2. **`rle-try-extend`** with **`rle-extend-clamped`**: no loops (`last_mut`, one compare, one push or
+   one length bump). They give the tail-only frame condition that `rle-ctor`'s `from_iter` and
+   `rle-resize`'s growth path reuse.
+3. **`rle-find-run`**, then **`rle-get-index`**: one accumulator loop with an obvious invariant
+   (`accumulated = start(r,i) ≤ index`), the lemma `rle-set`, `rle-set-range` and
+   `rle-find-run-cost` stand on.

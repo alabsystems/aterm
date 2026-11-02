@@ -10,6 +10,7 @@ use std::time::Duration;
 
 #[cfg(target_os = "macos")]
 mod accessibility;
+pub mod claude_keychain;
 mod complete_input;
 mod console_session;
 mod create_new;
@@ -18,6 +19,7 @@ pub(crate) mod github_rest;
 mod identity;
 #[cfg(target_os = "macos")]
 mod low_data;
+mod processes;
 mod read_owned_file;
 mod relay;
 mod rename_noreplace;
@@ -38,6 +40,13 @@ pub use stops::name as stop_name;
 
 /// Default deadline for a single tool run.
 pub const DEFAULT_BUDGET: Duration = Duration::from_secs(60);
+
+pub(crate) fn deadline_after(budget: Duration) -> std::time::Instant {
+    let now = std::time::Instant::now();
+    now.checked_add(budget)
+        .or_else(|| now.checked_add(Duration::from_secs(365 * 24 * 60 * 60)))
+        .unwrap_or(now)
+}
 
 /// What [`Live`] spawns for one run: the program, its arguments and its environment.
 #[cfg(test)]
@@ -397,6 +406,40 @@ pub struct Stat {
     pub len: u64,
 }
 
+/// One live process ([`System::processes`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Process {
+    /// Its pid.
+    pub pid: u32,
+    /// Its parent's pid (`e_ppid`): [`Process::LAUNCHD`] for a program launchd started (an app
+    /// LaunchServices opened, a launch agent or daemon) or one whose parent ended.
+    pub ppid: u32,
+    /// Whether it has a controlling terminal (`e_tdev` names a device): a terminal's shell and
+    /// what it starts, which keep it when launchd adopts them (a tab's shell that outlived its
+    /// terminal's restart has [`Process::LAUNCHD`] for its parent). An app LaunchServices opened,
+    /// a launch agent and a login item have none.
+    pub terminal: bool,
+    /// The executable the kernel names for it (`proc_pidpath`), in its on-disk spelling; `None`
+    /// where the kernel names none (its file was deleted, or the read was refused).
+    pub exe: Option<PathBuf>,
+    /// The kernel's short name for it (`p_comm`: the name of the file it exec'd, cut as
+    /// [`Process::short_name`] cuts it).
+    pub comm: String,
+}
+
+impl Process {
+    /// launchd's pid: the parent of every program it starts, and of every orphan.
+    pub const LAUNCHD: u32 = 1;
+
+    /// The short name the kernel keeps for a process that exec'd a file named `name`: its first
+    /// 16 bytes (`MAXCOMLEN`), as [`Process::comm`] holds them.
+    #[must_use]
+    pub fn short_name(name: &str) -> String {
+        let bytes = name.as_bytes();
+        String::from_utf8_lossy(bytes.get(..16).unwrap_or(bytes)).into_owned()
+    }
+}
+
 /// A listening [`System::relay`].
 pub trait Relaying {
     /// The port it listens on, on `127.0.0.1`.
@@ -439,6 +482,50 @@ pub trait System: Sync {
         _body: Option<&[u8]>,
     ) -> Result<GithubResponse, String> {
         Err("GitHub REST requests are not implemented by this backend".into())
+    }
+
+    /// Where the controller's agh client sends: `Live` answers `HttpTransport::new(ProcessEnv)`
+    /// and `Endpoints::github_com()`. The default fails closed, as `github_api`'s and
+    /// `github_rest`'s do: a `ScriptedTransport` with nothing queued, which opens no socket and
+    /// answers every round trip as not sent, beside endpoints on 127.0.0.1's port 1, so a test
+    /// double that never says where GitHub is sends nothing anywhere. WP13 gives `Fake`
+    /// agh-fake's loopback. A release build has no test double, and there the method has no
+    /// default.
+    #[cfg(any(test, debug_assertions))]
+    fn github_transport(
+        &self,
+    ) -> (
+        std::sync::Arc<dyn agh::wire::Transport>,
+        agh::wire::Endpoints,
+    ) {
+        (
+            std::sync::Arc::new(agh::wire::scripted::ScriptedTransport::new()),
+            agh::wire::Endpoints::loopback(1, 1, 1, 1),
+        )
+    }
+
+    /// Where the controller's agh client sends: `Live` answers `HttpTransport::new(ProcessEnv)`
+    /// and `Endpoints::github_com()`.
+    #[cfg(not(any(test, debug_assertions)))]
+    fn github_transport(
+        &self,
+    ) -> (
+        std::sync::Arc<dyn agh::wire::Transport>,
+        agh::wire::Endpoints,
+    );
+
+    /// Where agh.toml is for the `fleet` profile (machines 5b): `Live` answers
+    /// `agh::config::Dirs::from_env()`; WP13 gives `Fake` a scratch `Dirs::under(root)`.
+    /// The default is `None`, so a test double never reads the real agh.toml or token files.
+    fn agh_dirs(&self) -> Option<agh::config::Dirs> {
+        None
+    }
+
+    /// The effect seam the controller's agh client runs on: `Fx::live()` by default; WP13 gives
+    /// `Fake` `Fx::simulated`, so the key writes' 1 s pacing (§4.6.5) takes no real time and a
+    /// test reads it in `Fx::slept`.
+    fn github_fx(&self) -> std::sync::Arc<agh::Fx> {
+        std::sync::Arc::new(agh::Fx::live())
     }
 
     /// Read the active session's natural scrolling preference via the native getter.
@@ -484,20 +571,85 @@ pub trait System: Sync {
         false
     }
 
+    /// Whether a person is at this Mac for a person step, read as the step asks: the Messages
+    /// and FaceTime sign-outs read it right before their clicks, and again after a wait for an
+    /// update's handoff (init-on-by-default design §6.4, §6.7). System State's setup run gives
+    /// the window's reading ([`Live::with_presence`]); a run with no reading of its own keeps
+    /// what its stage decided, and answers yes.
+    fn person_present(&self) -> bool {
+        true
+    }
+
+    /// The registry of update-boundary guards this port's items hold theirs in
+    /// (`aterm_types::update_boundary`): this process's, which an update's handoff reads,
+    /// unless a test gives its own.
+    fn update_boundary(&self) -> &aterm_types::update_boundary::Boundary {
+        aterm_types::update_boundary::Boundary::process()
+    }
+
     /// Run `cmd` with `input` and a trailing newline written to a private stdin pipe.
     fn run_fed(&self, cmd: &Cmd, input: &Secret) -> Result<Ran, RunFailed> {
         let _ = (cmd, input);
         Err(RunFailed::Refused("run_fed: not supported".into()))
     }
 
-    /// Prompt on `/dev/tty` and read one line, disabling echo when `secret` is true.
+    /// Prompt on `/dev/tty` and read one line, disabling echo when `secret` is true. With echo
+    /// off, whatever was typed before the prompt is discarded.
     fn ask(&self, prompt: &str, secret: bool) -> io::Result<Option<Secret>> {
         let _ = (prompt, secret);
         Err(io::Error::from(io::ErrorKind::Unsupported))
     }
 
+    /// [`System::ask`] with echo off that keeps what was typed before it: a line another program
+    /// typed into the terminal ahead of the read (System State's go line for the Command Line
+    /// Tools tab, typed once the tab landed) is read, never discarded.
+    fn ask_kept(&self, prompt: &str) -> io::Result<Option<Secret>> {
+        self.ask(prompt, true)
+    }
+
+    /// The executable path of every process running now ([`System::processes`]), read without a
+    /// child process; `None` where the process table or any listed process's executable cannot be
+    /// read.
+    fn process_paths(&self) -> Option<Vec<PathBuf>> {
+        processes::paths(self.processes())
+    }
+
+    /// Every live process the kernel lists, this one included: its pid, the executable the kernel
+    /// names for it and its short name, read in this process with no child and with no process's
+    /// arguments or environment (`docs/DESIGN-leftover-processes-2026-10-16.md` M29). A zombie,
+    /// and a process that exited before its executable was read, are left out. `None` where the
+    /// process table cannot be read (and off macOS).
+    fn processes(&self) -> Option<Vec<Process>> {
+        None
+    }
+
+    /// `process`'s argument words, `argv[0]` first (never its environment), read in this process
+    /// with no child and only once its one thread has run (`aterm_uds::process::thread_ran`: an
+    /// argument read of a program macOS's program check holds can hang, M29); kept only while the
+    /// same process holds the pid and the kernel names the executable `process` lists across the
+    /// read. `None` where they are not read: its thread has not run or that is unknown, it is
+    /// gone, it exec'd, or the read failed (another user's process, unless this one is root). No
+    /// read is atomic with an exec: one into a held program after the `thread_ran` read can still
+    /// hang the argument read, which nothing bounds (§6.4 of that design), so a caller asks this
+    /// of the few processes it must.
+    fn process_argv(&self, process: &Process) -> Option<Vec<OsString>> {
+        let _ = process;
+        None
+    }
+
     /// Read the bytes of `path`.
     fn read_file(&self, path: &Path) -> io::Result<Vec<u8>>;
+
+    /// The first `max` bytes of the regular file at `path` (all of it when shorter): a program's
+    /// `#!` line without reading the rest of a large executable. Refused where a link lies
+    /// anywhere on `path`, so nothing outside the folders it names is read, and where it is no
+    /// regular file, never waiting on a FIFO ([`aterm_uds::nofollow::open_reader`]); this default,
+    /// a test double's, reads `path` through [`System::read_file`].
+    fn read_head(&self, path: &Path, max: usize) -> io::Result<Vec<u8>> {
+        let mut bytes = self.read_file(path)?;
+        bytes.truncate(max);
+        Ok(bytes)
+    }
 
     /// Read the regular file at `path` (at most `max` bytes) after checking it is no symlink, is
     /// owned by `uid`, has no set-id or group/other write bit, and, when `private`, no group or
@@ -858,6 +1010,9 @@ pub struct Live {
     pub agent_exe: PathBuf,
     /// What [`System::full_disk_access`] answers: the runner's own measurement.
     full_disk_access: Option<bool>,
+    /// What [`System::person_present`] reads, where the runner gives a reading of its own
+    /// ([`Live::with_presence`]); otherwise yes, as its stage decided.
+    presence: Option<fn() -> bool>,
 }
 
 impl Live {
@@ -867,7 +1022,16 @@ impl Live {
         Self {
             agent_exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/nonexistent")),
             full_disk_access: None,
+            presence: None,
         }
+    }
+
+    /// This port, reading `present` for [`System::person_present`], as the person step asks:
+    /// System State's setup run gives the window's reading of a person at the page.
+    #[must_use]
+    pub const fn with_presence(mut self, present: fn() -> bool) -> Self {
+        self.presence = Some(present);
+        self
     }
 
     /// This port, answering `measured` for [`System::full_disk_access`].
@@ -986,7 +1150,7 @@ impl Live {
             .stdout(open(&out)?)
             .stderr(open(&err)?);
         let mut child = child.spawn().map_err(failed)?;
-        let deadline = std::time::Instant::now() + cmd.budget;
+        let deadline = deadline_after(cmd.budget);
         let mut exit = aterm_uds::deadline::ExitWait::new(&child);
         let status = loop {
             match child.try_wait() {
@@ -1205,6 +1369,24 @@ impl System for Live {
         )
     }
 
+    fn github_transport(
+        &self,
+    ) -> (
+        std::sync::Arc<dyn agh::wire::Transport>,
+        agh::wire::Endpoints,
+    ) {
+        (
+            std::sync::Arc::new(agh::wire::http::HttpTransport::new(std::sync::Arc::new(
+                agh::identity::ProcessEnv,
+            ))),
+            agh::wire::Endpoints::github_com(),
+        )
+    }
+
+    fn agh_dirs(&self) -> Option<agh::config::Dirs> {
+        agh::config::Dirs::from_env()
+    }
+
     fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
         std::fs::canonicalize(path)
     }
@@ -1239,7 +1421,7 @@ impl System for Live {
             ),
             None => aterm_uds::spawnfd::Stdio::null(),
         };
-        let deadline = std::time::Instant::now() + cmd.budget;
+        let deadline = deadline_after(cmd.budget);
         match aterm_uds::deadline::output_until_from(&mut child, stdin, deadline) {
             Ok(out) => Ok(Ran {
                 status: out.status.code(),
@@ -1275,7 +1457,7 @@ impl System for Live {
             ),
             None => aterm_uds::spawnfd::Stdio::null(),
         };
-        let deadline = std::time::Instant::now() + cmd.budget;
+        let deadline = deadline_after(cmd.budget);
         let out =
             aterm_uds::deadline::output_until_complete_stdout_from(&mut child, stdin, deadline)
                 .map_err(|error| match error {
@@ -1347,7 +1529,7 @@ impl System for Live {
             .and_then(|()| writer.write_all(b"\n"))
             .map_err(|e| RunFailed::Spawn(format!("the input pipe: {e}")))?;
         drop(writer);
-        let deadline = std::time::Instant::now() + cmd.budget;
+        let deadline = deadline_after(cmd.budget);
         match aterm_uds::deadline::output_until_from(
             &mut child,
             aterm_uds::spawnfd::Stdio::from(reader),
@@ -1366,7 +1548,24 @@ impl System for Live {
     }
 
     fn ask(&self, prompt: &str, secret: bool) -> io::Result<Option<Secret>> {
-        owning_terminal(|| secret::ask_tty(prompt, secret))
+        let read = if secret {
+            secret::Read::Hidden
+        } else {
+            secret::Read::Shown
+        };
+        owning_terminal(|| secret::ask_tty(prompt, read))
+    }
+
+    fn ask_kept(&self, prompt: &str) -> io::Result<Option<Secret>> {
+        owning_terminal(|| secret::ask_tty(prompt, secret::Read::HiddenKept))
+    }
+
+    fn processes(&self) -> Option<Vec<Process>> {
+        processes::processes()
+    }
+
+    fn process_argv(&self, process: &Process) -> Option<Vec<OsString>> {
+        processes::argv(process)
     }
 
     fn has_tty(&self) -> bool {
@@ -1377,8 +1576,24 @@ impl System for Live {
             .is_ok()
     }
 
+    fn person_present(&self) -> bool {
+        self.presence.is_none_or(|present| present())
+    }
+
     fn read_file(&self, path: &Path) -> io::Result<Vec<u8>> {
         std::fs::read(path)
+    }
+
+    /// Opened by [`aterm_uds::nofollow::open_reader`] (`O_NOFOLLOW_ANY | O_NONBLOCK`, then
+    /// `fstat`), so a link on `path` answers `ELOOP` and a FIFO is refused without waiting for a
+    /// writer; `Unsupported` off macOS.
+    fn read_head(&self, path: &Path, max: usize) -> io::Result<Vec<u8>> {
+        use std::io::Read as _;
+        let mut bytes = Vec::new();
+        std::fs::File::from(aterm_uds::nofollow::open_reader(path)?)
+            .take(u64::try_from(max).unwrap_or(u64::MAX))
+            .read_to_end(&mut bytes)?;
+        Ok(bytes)
     }
 
     fn read_owned_file(
@@ -1839,7 +2054,8 @@ struct Exclusive(std::fs::File);
 impl Exclusive {
     fn within(file: std::fs::File, limit: Duration, what: &Path) -> io::Result<Self> {
         let file: std::fs::File = file;
-        let deadline = std::time::Instant::now() + limit;
+        aterm_uds::keep_out_of_children(&file)?;
+        let deadline = deadline_after(limit);
         loop {
             #[expect(
                 clippy::disallowed_methods,
@@ -1966,6 +2182,9 @@ mod fake {
         scratch_close_errors: Mutex<BTreeMap<PathBuf, io::ErrorKind>>,
         /// Shared with [`System::catch_stops`]'s handle, which records its end.
         calls: Arc<Mutex<Vec<String>>>,
+        /// The [`System::rename_noreplace`] destinations renamed onto while a clone's publish
+        /// held the update boundary ([`Fake::guarded_renames`]).
+        guarded_renames: Mutex<Vec<PathBuf>>,
         files: Mutex<BTreeMap<PathBuf, (Vec<u8>, u32)>>,
         stats: Mutex<BTreeMap<PathBuf, Stat>>,
         stat_errors: Mutex<BTreeMap<PathBuf, io::ErrorKind>>,
@@ -1996,6 +2215,12 @@ mod fake {
         fed: Mutex<Vec<(String, Vec<u8>)>>,
         /// What [`System::has_tty`] answers: a person's terminal is there.
         pub tty: bool,
+        /// Nobody is at this Mac: what [`System::person_present`] answers is its opposite, read
+        /// as the step asks, so a test can send the person away while a step waits.
+        pub away: std::sync::atomic::AtomicBool,
+        /// This fake's own registry of update-boundary guards ([`System::update_boundary`]),
+        /// so a test that latches a handoff holds up no other test's items.
+        pub boundary: aterm_types::update_boundary::Boundary,
         /// What [`System::full_disk_access`] answers: `None`, not measured, unless a test
         /// grants it.
         pub full_disk_access: Option<bool>,
@@ -2031,6 +2256,11 @@ mod fake {
         tty_hook: Mutex<Option<Model>>,
         /// What [`System::administrator`] answers: unread unless a test sets it.
         pub admin: Option<bool>,
+        /// What [`System::processes`] (and so [`System::process_paths`]) answers
+        /// ([`Fake::running`], [`Fake::process`]): unread unless a test lists them.
+        processes: Mutex<Option<Vec<super::Process>>>,
+        /// What [`System::process_argv`] answers, by pid ([`Fake::process`]): unread when none.
+        argvs: Mutex<BTreeMap<u32, Vec<std::ffi::OsString>>>,
         /// What [`System::accessibility_trusted`] and [`System::request_accessibility`]
         /// answer, one reading each, the last repeating ([`Fake::trusts`]): unknown when none.
         trust: Mutex<Vec<bool>>,
@@ -2330,10 +2560,73 @@ mod fake {
             self
         }
 
+        /// The processes running now, by executable path ([`System::processes`],
+        /// [`System::process_paths`]), in place of any listed before: each under a pid from
+        /// [`Fake::PIDS`] on, started by launchd (so with no controlling terminal) and with its
+        /// file's [`super::Process::short_name`], its arguments unread.
+        pub fn running(&self, exes: &[&str]) -> &Self {
+            let rows = (Self::PIDS..)
+                .zip(exes)
+                .map(|(pid, exe)| {
+                    let exe = PathBuf::from(exe);
+                    let name = exe.file_name().unwrap_or_default().to_string_lossy();
+                    super::Process {
+                        pid,
+                        ppid: super::Process::LAUNCHD,
+                        terminal: false,
+                        comm: super::Process::short_name(&name),
+                        exe: Some(exe),
+                    }
+                })
+                .collect();
+            *self.processes.lock().unwrap() = Some(rows);
+            self
+        }
+
+        /// The first pid [`Fake::running`] gives: above every pid the kernel hands out (macOS's
+        /// top is 99 999, Linux's 4 194 304), so never the test process's own.
+        pub const PIDS: u32 = 1 << 23;
+
+        /// One more process running now ([`System::processes`]), and the argument words
+        /// [`System::process_argv`] reads of it (`None`: unread, as of a program macOS's program
+        /// check holds).
+        pub fn process(&self, row: super::Process, argv: Option<&[&str]>) -> &Self {
+            if let Some(words) = argv {
+                self.argvs
+                    .lock()
+                    .unwrap()
+                    .insert(row.pid, words.iter().map(Into::into).collect());
+            }
+            self.processes
+                .lock()
+                .unwrap()
+                .get_or_insert_with(Vec::new)
+                .push(row);
+            self
+        }
+
+        /// The next scripted answer ([`Fake::answer`]) to `prompt`.
+        fn next_answer(&self, prompt: &str) -> io::Result<Option<Secret>> {
+            match self.answers.lock().unwrap().pop_front() {
+                Some(Some(line)) => Secret::new(line.as_bytes()).map(Some),
+                Some(None) => Ok(None),
+                None => Err(io::Error::other(format!(
+                    "fake: no answer scripted for `{prompt}`"
+                ))),
+            }
+        }
+
         /// Recorded `(key, input)` pairs from [`System::run_fed`].
         #[must_use]
         pub fn fed(&self) -> Vec<(String, Vec<u8>)> {
             self.fed.lock().unwrap().clone()
+        }
+
+        /// The destinations [`System::rename_noreplace`] renamed onto while a clone's publish
+        /// held the update boundary (init-on-by-default design §6.7).
+        #[must_use]
+        pub fn guarded_renames(&self) -> Vec<PathBuf> {
+            self.guarded_renames.lock().unwrap().clone()
         }
 
         /// Install a dynamic command handler consulted before scripted replies.
@@ -2810,17 +3103,39 @@ mod fake {
         fn ask(&self, prompt: &str, secret: bool) -> io::Result<Option<Secret>> {
             let kind = if secret { "ask secret" } else { "ask" };
             self.calls.lock().unwrap().push(format!("{kind} {prompt}"));
-            match self.answers.lock().unwrap().pop_front() {
-                Some(Some(line)) => Secret::new(line.as_bytes()).map(Some),
-                Some(None) => Ok(None),
-                None => Err(io::Error::other(format!(
-                    "fake: no answer scripted for `{prompt}`"
-                ))),
-            }
+            self.next_answer(prompt)
+        }
+
+        /// Recorded as `ask kept <prompt>`; answered as [`System::ask`] is.
+        fn ask_kept(&self, prompt: &str) -> io::Result<Option<Secret>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("ask kept {prompt}"));
+            self.next_answer(prompt)
+        }
+
+        /// Answered as [`Fake::running`] and [`Fake::process`] say, and not recorded: a look
+        /// changes nothing.
+        fn processes(&self) -> Option<Vec<super::Process>> {
+            self.processes.lock().unwrap().clone()
+        }
+
+        /// Answered as [`Fake::process`] says, and not recorded.
+        fn process_argv(&self, process: &super::Process) -> Option<Vec<std::ffi::OsString>> {
+            self.argvs.lock().unwrap().get(&process.pid).cloned()
         }
 
         fn has_tty(&self) -> bool {
             self.tty
+        }
+
+        fn person_present(&self) -> bool {
+            !self.away.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn update_boundary(&self) -> &aterm_types::update_boundary::Boundary {
+            &self.boundary
         }
 
         fn full_disk_access(&self) -> Option<bool> {
@@ -3095,8 +3410,10 @@ mod fake {
                 return Err(io::Error::from(kind));
             }
             let files = self.files.lock().unwrap();
+            let links = self.links.lock().unwrap();
             let mut names: Vec<String> = files
                 .keys()
+                .chain(links.keys())
                 .filter(|p| p.parent() == Some(path))
                 .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
                 .collect();
@@ -3159,6 +3476,12 @@ mod fake {
                 from.display(),
                 to.display(),
             ));
+            if self
+                .boundary
+                .is_held(aterm_types::update_boundary::GuardedItem::ClonePublishRename)
+            {
+                self.guarded_renames.lock().unwrap().push(to.to_path_buf());
+            }
             if [from, to]
                 .iter()
                 .any(|p| p.as_os_str().as_encoded_bytes().contains(&0))
@@ -3393,23 +3716,42 @@ mod fake {
                 .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))
         }
 
+        /// `path` resolved one component at a time, as `realpath` resolves it: a seeded link
+        /// ([`Fake::link`]) is replaced by its target, read relative to the link's folder, and
+        /// `..` steps out of the folder reached so far, so no `..` is left in the answer.
         fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+            use std::path::Component;
             let links = self.links.lock().unwrap();
-            let mut path = path.to_path_buf();
-            for _ in 0..32 {
-                let Some((link, target)) = links.iter().find(|(link, _)| path.starts_with(link))
-                else {
-                    return Ok(path);
-                };
-                let target = link.parent().unwrap_or(Path::new("/")).join(target);
-                let rest = path.strip_prefix(link).unwrap_or(Path::new(""));
-                path = if rest.as_os_str().is_empty() {
-                    target
-                } else {
-                    target.join(rest)
-                };
+            let parts = |path: &Path| -> Vec<std::ffi::OsString> {
+                path.components()
+                    .rev()
+                    .map(|part| part.as_os_str().to_owned())
+                    .collect()
+            };
+            let mut todo = parts(path);
+            let mut real = PathBuf::new();
+            let mut hops = 0;
+            while let Some(part) = todo.pop() {
+                match Path::new(&part).components().next() {
+                    Some(Component::RootDir) => real = PathBuf::from("/"),
+                    Some(Component::ParentDir) => {
+                        real.pop();
+                    }
+                    Some(Component::Normal(_)) => {
+                        real.push(&part);
+                        if let Some(target) = links.get(&real) {
+                            hops += 1;
+                            if hops > 32 {
+                                return Err(io::Error::other("too many levels of symbolic links"));
+                            }
+                            real.pop();
+                            todo.extend(parts(target));
+                        }
+                    }
+                    _ => {}
+                }
             }
-            Err(io::Error::other("too many levels of symbolic links"))
+            Ok(real)
         }
 
         fn relay(&self, cmd: &Cmd) -> Result<Box<dyn Relaying + '_>, RunFailed> {
@@ -3848,6 +4190,42 @@ mod tests {
         assert!(matches!(err, RunFailed::Refused(_)), "{err:?}");
     }
 
+    /// A `System` that never says where GitHub is reaches none of it: its agh client's transport
+    /// sends nothing, its endpoints are 127.0.0.1's port 1, and it finds no agh.toml. The
+    /// defaults are read through `Spawns`, a double that overrides neither method, so the check
+    /// holds when WP13 gives `Fake` its own answers; `Fake` keeps the defaults today and is
+    /// checked beside it. NEGATIVE CONTROL: `Live` sends to github.com.
+    #[test]
+    fn a_system_that_names_no_github_sends_nowhere_and_reads_no_agh_toml() {
+        let live = Live::new();
+        let bare = super::spawns::Spawns::new(&live);
+        let (transport, endpoints) = bare.github_transport();
+        assert_eq!(endpoints, agh::wire::Endpoints::loopback(1, 1, 1, 1));
+        let sent = transport.round_trip(agh::wire::WireRequest::new(
+            agh::wire::Method::Get,
+            endpoints.url(agh::wire::OriginRole::Api, "/user"),
+            Vec::new(),
+            1024,
+            agh::wire::Deadlines::JSON,
+        ));
+        assert!(
+            matches!(&sent, Err(e) if e.phase == agh::wire::Phase::NotSent),
+            "{:?}",
+            sent.err()
+        );
+        assert!(bare.agh_dirs().is_none());
+        let fake = Fake::default();
+        assert_eq!(
+            fake.github_transport().1,
+            agh::wire::Endpoints::loopback(1, 1, 1, 1)
+        );
+        assert!(fake.agh_dirs().is_none());
+        assert_eq!(
+            Live::new().github_transport().1,
+            agh::wire::Endpoints::github_com()
+        );
+    }
+
     #[test]
     fn a_run_kept_to_its_deadline_ends_what_its_child_started_too() {
         let live = Live::new();
@@ -3943,7 +4321,7 @@ mod tests {
         std::fs::write(root.join("bin/built"), b"").unwrap();
         let live = |exe: &str| Live {
             agent_exe: root.join(exe),
-            full_disk_access: None,
+            ..Live::new()
         };
         assert_eq!(live("bin/aterm").running_app(), Some(app.clone()));
         assert_eq!(
@@ -3952,5 +4330,51 @@ mod tests {
         );
         assert_eq!(live("bin/built").running_app(), None, "a build is no app");
         assert_eq!(live("bin/gone").running_app(), None);
+    }
+
+    /// [`Live::read_head`] reads at most `max` bytes of a regular file, and refuses a link at the
+    /// end of the path or on its way (a program linked out of its bundle, a bundle under a linked
+    /// folder), so it reads nothing outside the folders the path names, and refuses a FIFO at
+    /// once, never waiting for a writer. NEGATIVE CONTROLS (scratch): a plain
+    /// `std::fs::File::open` in place of `open_reader` reads through both links and waits on the
+    /// FIFO until the one-minute detector fails; `O_NONBLOCK` alone in its place reads the FIFO
+    /// as an empty file; reading with no `take` fails the 512-byte assertion.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn read_head_reads_a_bounded_head_of_a_regular_file_alone() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let temp = aterm_tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let live = Live::new();
+        let program = root.join("program");
+        std::fs::write(&program, [b'#'; 2000]).unwrap();
+        assert_eq!(live.read_head(&program, 512).unwrap(), [b'#'; 512]);
+        std::fs::write(root.join("outside"), b"#!/bin/zsh\n").unwrap();
+        std::os::unix::fs::symlink(root.join("outside"), root.join("linked")).unwrap();
+        std::fs::create_dir(root.join("real")).unwrap();
+        std::fs::write(root.join("real/program"), b"#!/bin/zsh\n").unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("folder")).unwrap();
+        for linked in ["linked", "folder/program"] {
+            let read = live.read_head(&root.join(linked), 512);
+            assert!(
+                read.as_ref().is_err_and(aterm_uds::nofollow::is_link),
+                "{linked}: {read:?}"
+            );
+        }
+        let fifo = root.join("fifo");
+        let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a live owned C string names an absent file in this private fixture.
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let read = Live::new().read_head(&fifo, 512);
+            let _ = send.send(read.map_err(|e| aterm_uds::nofollow::not_regular(&e)));
+        });
+        assert_eq!(
+            receive
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("a FIFO's read must not wait for a writer"),
+            Err(true)
+        );
     }
 }

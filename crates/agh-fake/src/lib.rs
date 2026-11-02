@@ -2,12 +2,16 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! Loopback HTTP fake for GitHub API, uploads, web, and CDN origins used by `agh` tests.
+//! Loopback HTTP fake for GitHub API, uploads, web, and CDN origins used by `agh` tests: its
+//! reads, its release, asset, ref and key writes (with the faults that land a write and lose
+//! its answer, the listing lag and immutable releases), and the web origin's smart-HTTP git
+//! endpoints (protocol v0, delete-only pushes).
 
 #![forbid(unsafe_code)]
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 #![warn(missing_docs)]
 
+mod git_http;
 mod routes;
 mod server;
 mod state;
@@ -17,6 +21,12 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 
 use state::{Rule, State};
+
+pub(crate) fn parse_uint<T: std::str::FromStr>(s: &str) -> Option<T> {
+    (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| s.parse().ok())
+        .flatten()
+}
 
 fn seeded_hex(domain: &[u8], seed: &str) -> String {
     let mut hasher = aterm_digest::Sha256::new();
@@ -365,6 +375,19 @@ pub enum Fault {
     Torn,
     /// Redirects a CDN request to the CDN a second time (302).
     SecondHop,
+    /// Apply the write, then close with no answer: the model's `LandedLost`.
+    LandThenClose,
+    /// Apply the write, then answer `status` with GitHub's error body for it: a 502 whose
+    /// write landed.
+    LandThenStatus {
+        /// The status.
+        status: u16,
+    },
+    /// An upload: create the asset in state `starter`, then answer `status`.
+    StarterThen {
+        /// The status.
+        status: u16,
+    },
 }
 
 /// State mutation applied by the fake.
@@ -399,6 +422,67 @@ pub enum Change {
         /// Repository `owner/name` slug.
         slug: String,
     },
+    /// A release the listing lag hid becomes visible.
+    Reveal {
+        /// The release.
+        release_id: u64,
+    },
+}
+
+/// The Basic credential git sends for `token` under agh's helper username: the standard
+/// base64, padded, of `x-access-token:{token}`. Tests build it at runtime (§1, rule 7).
+#[must_use]
+pub fn basic(token: &str) -> String {
+    aterm_codec::base64::encode(format!("x-access-token:{token}").as_bytes()).unwrap_or_default()
+}
+
+/// A write's body as the fake received it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SeenBody {
+    /// Its request's index in `seen()`.
+    pub seen: usize,
+    /// Its length.
+    pub len: u64,
+    /// `sha256:{hex}` of its bytes.
+    pub sha256: String,
+    /// Its text, when it is JSON of at most 64 KiB.
+    pub json: Option<String>,
+}
+
+/// One SSH key the fake holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FakeKey {
+    /// The id, from 20000.
+    pub id: u64,
+    /// The title.
+    pub title: String,
+    /// `<type> <base64>`.
+    pub key: String,
+}
+
+/// A release as the fake holds it, hidden ones included: what a test asserts on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FakeRelease {
+    /// The id.
+    pub id: u64,
+    /// The tag.
+    pub tag: String,
+    /// Whether it is a draft.
+    pub draft: bool,
+    /// Whether it is a prerelease.
+    pub prerelease: bool,
+    /// Whether it is immutable.
+    pub immutable: bool,
+    /// Whether the listing lag hides it.
+    pub hidden: bool,
+    /// The `target_commitish` the create sent, if any.
+    pub target_commitish: Option<String>,
+    /// The notes.
+    pub body: String,
+    /// The `make_latest` the last create or PATCH sent, if any.
+    pub make_latest: Option<String>,
+    /// Its assets: id, name, state and `sha256:{hex}`.
+    pub assets: Vec<(u64, String, String, String)>,
 }
 
 /// Recorded incoming request with credentials redacted.
@@ -631,14 +715,127 @@ impl FakeGithub {
         assert!(violations.is_empty(), "{violations:?}");
     }
 
-    /// Clears the recorded request log.
+    /// Clears the recorded request log and the write bodies captured with it, so each
+    /// `SeenBody::seen` keeps indexing `seen()`.
     pub fn clear_seen(&self) {
-        self.state().seen.clear();
+        let mut state = self.state();
+        state.seen.clear();
+        state.bodies.clear();
+    }
+
+    /// `X-OAuth-Scopes` for `token`'s answers. A classic token without `admin:public_key`
+    /// gets 404 on every `/user/keys` call, as GitHub answers.
+    pub fn set_scopes(&self, token: &str, scopes: &[&str]) {
+        let mut state = self.state();
+        state.scopes.retain(|(t, _)| t != token);
+        state.scopes.push((
+            token.to_string(),
+            scopes.iter().map(|s| (*s).to_string()).collect(),
+        ));
+    }
+
+    /// Make release `release_id` immutable, or not.
+    /// # Panics
+    /// Panics if `release_id` does not exist.
+    pub fn set_immutable(&self, release_id: u64, immutable: bool) {
+        let mut state = self.state();
+        let index = state
+            .release_index(release_id)
+            .unwrap_or_else(|| panic!("agh-fake: no release {release_id}"));
+        state.releases[index].spec.immutable = immutable;
+    }
+
+    /// While on, a release POSTed to `slug`, or added with `add_release`, is hidden from every
+    /// listing and by-tag read (the API's `releases/tags/{tag}`, `releases/latest` and the web
+    /// origin's download by tag) until `Change::Reveal` names it. A by-id read still sees it,
+    /// as GitHub's does.
+    pub fn set_listing_lag(&self, slug: &str, on: bool) {
+        let mut state = self.state();
+        state.listing_lag.retain(|s| !s.eq_ignore_ascii_case(slug));
+        if on {
+            state.listing_lag.push(slug.to_string());
+        }
+    }
+
+    /// Give `login` an SSH key, and answer its id. The key is kept as GitHub keeps one, its
+    /// type and base64 without the comment, as a POSTed key is.
+    pub fn add_key(&self, login: &str, title: &str, key: &str) -> u64 {
+        self.state().add_key(login, title, key)
+    }
+
+    /// `login`'s keys, by id.
+    #[must_use]
+    pub fn keys(&self, login: &str) -> Vec<FakeKey> {
+        let state = self.state();
+        let mut keys: Vec<FakeKey> = state
+            .keys
+            .iter()
+            .filter(|k| k.login.eq_ignore_ascii_case(login))
+            .map(|k| k.key.clone())
+            .collect();
+        keys.sort_by_key(|k| k.id);
+        keys
+    }
+
+    /// Every write body so far, in order.
+    #[must_use]
+    pub fn bodies(&self) -> Vec<SeenBody> {
+        self.state().bodies.clone()
+    }
+
+    /// Every release of `slug`, by id, hidden ones included.
+    #[must_use]
+    pub fn releases_of(&self, slug: &str) -> Vec<FakeRelease> {
+        let state = self.state();
+        let Some(repo) = state.repo_index(slug).map(|i| state.repos[i].id) else {
+            return Vec::new();
+        };
+        let mut releases: Vec<FakeRelease> = state
+            .releases
+            .iter()
+            .filter(|r| r.repo == repo)
+            .map(|r| FakeRelease {
+                id: r.id,
+                tag: r.spec.tag.clone(),
+                draft: r.spec.draft,
+                prerelease: r.spec.prerelease,
+                immutable: r.spec.immutable,
+                hidden: r.hidden,
+                target_commitish: r.sent_target.clone(),
+                body: r.spec.body.clone().unwrap_or_default(),
+                make_latest: r.make_latest.clone(),
+                assets: r
+                    .assets
+                    .iter()
+                    .map(|a| {
+                        let digest = aterm_digest::Sha256::digest(&a.spec.bytes);
+                        (
+                            a.id,
+                            a.spec.name.clone(),
+                            a.spec.state.clone(),
+                            format!("sha256:{}", aterm_codec::hex::encode_lower(&digest)),
+                        )
+                    })
+                    .collect(),
+            })
+            .collect();
+        releases.sort_by_key(|r| r.id);
+        releases
+    }
+
+    /// `slug`'s refs: `refs/heads/…` and `refs/tags/…` with their shas, sorted.
+    #[must_use]
+    pub fn git_refs(&self, slug: &str) -> Vec<(String, String)> {
+        let state = self.state();
+        state
+            .repo_index(slug)
+            .map_or_else(Vec::new, |index| state.repos[index].refs())
     }
 }
 
 impl Drop for FakeGithub {
     fn drop(&mut self) {
+        self.end_hangs();
         self.stop.store(true, Ordering::SeqCst);
         for accept in &self.accepts {
             accept.thread().unpark();

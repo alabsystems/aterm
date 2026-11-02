@@ -600,6 +600,10 @@ fn a_weak_brokers_clean_stop_closes_its_log_and_a_reboot_keeps_its_identity() {
     let reopen = |log: &str, boot: Boot| {
         let mut opts = OpenOptions::new(Durability::Relaxed);
         opts.boot = boot;
+        // `mint.secret` beside the log, as a fabric root has it: its broker sealed it at rest.
+        let key = std::fs::read(s.path(aterm_link::at_rest::REST_KEY)).expect("the rest key");
+        opts.at_rest_key = Some(key.try_into().expect("32 bytes"));
+        opts.require_bound_at_rest = true;
         BrokerLog::open_opts(log, opts, || Ok(Prepared::Nothing)).expect("the log reopens")
     };
     let another_boot = Boot::Known([0x5a; 16]);
@@ -638,6 +642,7 @@ fn a_weak_brokers_clean_stop_closes_its_log_and_a_reboot_keeps_its_identity() {
             let copy = format!("{log}.copy");
             std::fs::copy(&log, &copy).expect("copy the log");
             std::fs::copy(format!("{log}.id"), format!("{copy}.id")).expect("and its sidecar");
+            std::fs::copy(format!("{log}.seal"), format!("{copy}.seal")).expect("and its seal");
             assert_eq!(
                 reopen(&copy, Boot::Detect).identity(),
                 before,
@@ -1242,6 +1247,57 @@ fn tail_replays_from_an_offset_hides_bodies_and_follows_live() {
     let rows = tail_rows(&live, 1);
     assert!(rows[0].starts_with(&format!("@{}", new[0])), "{rows:#?}");
     assert!(rows[0].contains(" report "), "{rows:#?}");
+}
+
+/// A RECORD WITH NO `text=` TAILS AS ITS FIELDS (fix unit E5, E2E-10): a session's presence
+/// row, replayed with `tail --json --bodies --from <off>`, shows its whole line as `body`
+/// and its bytes as `len`; without `--bodies` no field value is printed. NEGATIVE CONTROL
+/// (scratch, `fabric.rs`'s `traffic_of` back to the decoded `text=` alone): `len` 0 and an
+/// empty `body`.
+#[test]
+fn tail_bodies_show_a_presence_rows_fields_and_their_length() {
+    let s = Scratch::new("tail-fields");
+    let _broker = Broker::spawn(&s);
+    let node = "n-00000000000000aa";
+    let body = "v=1 t=1789400000000 state=live attention=QZP7WORD2";
+    let offs = publish(
+        &s.sock(),
+        &[(format!("/f/t1/pub/{node}/s-a/presence"), body.to_string())],
+    );
+    let from = offs[0].to_string();
+    let record = |args: &[&str]| -> (String, aterm_json::Value) {
+        let tail = Tail::spawn(&s, args);
+        loop {
+            let line = tail.line("the presence row's JSON line");
+            let Ok(v) = aterm_json::from_str::<aterm_json::Value>(&line) else {
+                continue;
+            };
+            if v.get("off").and_then(aterm_json::Value::as_u64) == Some(offs[0]) {
+                return (line, v);
+            }
+        }
+    };
+    let (line, v) = record(&["tail", "--json", "--bodies", "--from", &from]);
+    assert_eq!(
+        v.get("len").and_then(aterm_json::Value::as_u64),
+        Some(body.len() as u64),
+        "{line}"
+    );
+    let shown = v.get("body").and_then(aterm_json::Value::as_str);
+    assert!(
+        shown.is_some_and(|b| b.contains("attention=QZP7WORD2")),
+        "{line}"
+    );
+    let (line, v) = record(&["tail", "--json", "--from", &from]);
+    assert!(
+        !line.contains("QZP7WORD2"),
+        "no field value without --bodies: {line}"
+    );
+    assert_eq!(
+        v.get("len").and_then(aterm_json::Value::as_u64),
+        Some(body.len() as u64),
+        "{line}"
+    );
 }
 
 /// THE COMMAND LINE: a usage error is exit 2; `help` is exit 0.

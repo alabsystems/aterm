@@ -5,9 +5,9 @@
 
 #[cfg(unix)]
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
-use std::process::Command;
 
+#[cfg(unix)]
+use aterm_uds::spawnfd::command;
 #[cfg(unix)]
 use aterm_update_core::pins;
 #[cfg(unix)]
@@ -806,7 +806,7 @@ fn release_asset_url(slug: &str, asset: &str) -> String {
 #[cfg(unix)]
 fn curl_fetch(url: &str, cap: usize) -> std::result::Result<Vec<u8>, String> {
     let cap_s = cap.to_string();
-    let out = Command::new(aterm_uds::os_path!("curl"))
+    let out = command(aterm_uds::os_path!("curl"))
         .args([
             "-fsSL",
             "--proto",
@@ -1321,7 +1321,7 @@ fn link_farm(farm: &Path, target: &Path) -> std::result::Result<(), String> {
 #[cfg(unix)]
 fn front_door_check(bin: &Path) -> Check {
     front_door_verdict(bin, |tool| {
-        let out = Command::new(tool)
+        let out = command(tool)
             .arg("--version")
             .output()
             .map_err(|e| e.to_string())?;
@@ -1928,7 +1928,7 @@ fn notary_probe() -> NotaryProbe {
         };
     }
     let profile = crate::apple::NOTARY_PROFILE;
-    match Command::new(aterm_uds::os_path!("xcrun"))
+    match command(aterm_uds::os_path!("xcrun"))
         .args(["notarytool", "history", "--keychain-profile", profile])
         .output()
     {
@@ -2156,22 +2156,49 @@ fn profile_check_at(
 /// The channel token is the cut's GitHub identity.
 #[cfg(unix)]
 fn channel_token_check(slug: &str, may_change: bool) -> Check {
+    let path = publish::channel_token_path();
+    channel_token_check_at(slug, may_change, path.as_deref(), crate::github::has_token)
+}
+
+#[cfg(unix)]
+fn channel_token_check_at(
+    slug: &str,
+    may_change: bool,
+    path: Option<&Path>,
+    present: impl FnOnce() -> bool,
+) -> Check {
     use std::os::unix::fs::PermissionsExt as _;
-    let where_it_lives = publish::channel_token_path()
+    let where_it_lives = path
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "~/.secrets/gh_access_token_alabsystems".into());
-    let present = crate::github::has_token();
-    let path = publish::channel_token_path();
-    let open = path
-        .as_ref()
-        .and_then(|p| std::fs::metadata(p).ok())
-        .is_some_and(|m| m.permissions().mode() & 0o077 != 0);
+    let missing = || channel_token_verdict(&where_it_lives, slug, false, false, false);
+    let Some(path) = path else { return missing() };
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_file() => meta,
+        Ok(_) => {
+            return Check::Fail {
+                what: format!("{where_it_lives} is not a regular token file"),
+                fix: format!(
+                    "restore this machine's private regular token file at {where_it_lives}"
+                ),
+            };
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return missing(),
+        Err(error) => {
+            return Check::Fail {
+                what: format!("cannot inspect {where_it_lives}: {error}"),
+                fix: format!(
+                    "make this machine's private regular token file readable at {where_it_lives}"
+                ),
+            };
+        }
+    };
+    let present = present();
+    let open = meta.permissions().mode() & 0o077 != 0;
     let tightened = present
         && open
         && may_change
-        && path.is_some_and(|p| {
-            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600)).is_ok()
-        });
+        && std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).is_ok();
     channel_token_verdict(
         &where_it_lives,
         slug,
@@ -2448,6 +2475,79 @@ mod tests {
             channel_token_verdict(at, "alabsystems/aterm", true, false, true),
             Check::Pass(_)
         ));
+    }
+
+    #[test]
+    fn channel_token_file_admission_preserves_regular_rules_and_refuses_aliases_before_reading() {
+        use std::cell::Cell;
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let regular = dir.path().join("synthetic-token");
+        let check = |path: Option<&Path>, present, may_change| {
+            channel_token_check_at("alabsystems/aterm", may_change, path, || present)
+        };
+        assert!(matches!(check(None, false, false), Check::Owner { .. }));
+        assert!(matches!(
+            check(Some(&regular), false, false),
+            Check::Owner { .. }
+        ));
+        std::fs::write(&regular, b"synthetic-token-only").unwrap();
+        std::fs::set_permissions(&regular, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(matches!(check(Some(&regular), true, false), Check::Pass(_)));
+        assert!(matches!(
+            check(Some(&regular), false, false),
+            Check::Owner { .. }
+        ));
+        std::fs::set_permissions(&regular, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            check(Some(&regular), true, false),
+            Check::Fail { .. }
+        ));
+        assert!(matches!(check(Some(&regular), true, true), Check::Pass(_)));
+        assert_eq!(
+            std::fs::metadata(&regular).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::set_permissions(&regular, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let alias = dir.path().join("linked-token");
+        std::os::unix::fs::symlink(&regular, &alias).unwrap();
+        assert!(
+            aterm_update_core::github_rest::Token::from_file(&alias)
+                .unwrap()
+                .is_some(),
+            "the real token reader follows this synthetic fixture alias"
+        );
+        for may_change in [false, true] {
+            let calls = Cell::new(0);
+            let result =
+                channel_token_check_at("alabsystems/aterm", may_change, Some(&alias), || {
+                    calls.set(calls.get() + 1);
+                    aterm_update_core::github_rest::Token::from_file(&alias)
+                        .unwrap()
+                        .is_some()
+                });
+            assert!(matches!(result, Check::Fail { .. }), "{result:?}");
+            assert_eq!(
+                calls.get(),
+                0,
+                "unadmitted paths must not reach the token reader"
+            );
+            assert_eq!(
+                std::fs::metadata(&regular).unwrap().permissions().mode() & 0o777,
+                0o644
+            );
+        }
+        assert_eq!(std::fs::read(&regular).unwrap(), b"synthetic-token-only");
+        let missing = dir.path().join("missing");
+        let dangling = dir.path().join("dangling-token");
+        std::os::unix::fs::symlink(&missing, &dangling).unwrap();
+        for path in [dangling.as_path(), dir.path()] {
+            let result = channel_token_check_at("alabsystems/aterm", false, Some(path), || {
+                panic!("an unadmitted token path must not be read")
+            });
+            assert!(matches!(result, Check::Fail { .. }), "{result:?}");
+        }
     }
 
     #[test]

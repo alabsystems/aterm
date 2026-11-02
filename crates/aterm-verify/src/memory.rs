@@ -20,9 +20,11 @@
 //! them and a fifth more, at least 1 GiB more ([`aterm_capacity::peak_claim`]); where none is
 //! kept, the most any record of a wider selection in the same checkout keeps (a superset's build
 //! compiles the subset's crates too; the most of them, not the least, since a wider run over a
-//! warmer cache can have taken less than this one will); and where none of those either, a
-//! stage that compiles ([`compiles`]) claims the cold figure, 16 GiB and at most half of
-//! physical memory ([`aterm_capacity::cold_claim`]), and any other stage claims nothing
+//! warmer cache can have taken less than this one will); then the most its stage, selection and
+//! variant kept in another checkout; then the most a plain `targo` build of the same selection
+//! whose work holds the stage's kept ([`plain_like`], BUILD-ADMIT's book); and where none of those
+//! either, a stage that compiles ([`compiles`]) claims the cold figure, 16 GiB and at most half
+//! of physical memory ([`aterm_capacity::cold_claim`]), and any other stage claims nothing
 //! ([`need`]). A stage that touches no target directory ([`Lane::Pure`]: the formatter, the
 //! censuses) is never measured and never claims.
 
@@ -46,6 +48,69 @@ pub use aterm_capacity::book::Key;
 
 /// The record's file under this user's aterm state directory ([`Book::live`]).
 pub const RECORD: &str = aterm_capacity::book::VERIFY_RECORD;
+
+/// The unit a live compiler process compiles ([`UnitReader`]): its command line's `--crate-name`,
+/// `--test` or `--crate-type`, and its environment's `CARGO_PKG_NAME`, which cargo sets for every
+/// compiler it starts ([`crate::unitgraph::UnitName`]). `None` for a process that is not one, or
+/// one whose arguments could not be read (it ended first, or is another user's).
+#[must_use]
+pub fn read_unit(pid: u32) -> Option<crate::unitgraph::UnitName> {
+    let buf = aterm_sysprobe::procargs::read(pid)?;
+    let args = aterm_sysprobe::procargs::parse(&buf)?;
+    unit_of(
+        args.argv
+            .iter()
+            .map(|a| String::from_utf8_lossy(a).into_owned()),
+        args.env().map(|e| String::from_utf8_lossy(e).into_owned()),
+    )
+}
+
+/// [`read_unit`]'s reading of a command line `argv` and environment `env` (`KEY=value` words).
+#[must_use]
+pub fn unit_of(
+    argv: impl IntoIterator<Item = String>,
+    env: impl IntoIterator<Item = String>,
+) -> Option<crate::unitgraph::UnitName> {
+    let argv: Vec<String> = argv.into_iter().collect();
+    let after = |flag: &str| {
+        argv.iter()
+            .position(|a| a == flag)
+            .and_then(|i| argv.get(i + 1))
+            .cloned()
+    };
+    let crate_name = after("--crate-name")?;
+    let kind = if argv.iter().any(|a| a == "--test") {
+        "test".to_owned()
+    } else {
+        after("--crate-type")?
+    };
+    let package = env
+        .into_iter()
+        .find_map(|e| e.strip_prefix("CARGO_PKG_NAME=").map(str::to_owned))?;
+    Some(crate::unitgraph::UnitName {
+        package,
+        kind: format!("{crate_name} {kind}"),
+    })
+}
+
+/// What [`Book::keep`] did with a peak.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kept {
+    /// It is in the record.
+    Kept,
+    /// Light beside the heaviest peak its key kept in two weeks, which stands
+    /// ([`Records::keep_unless_light`]).
+    Light,
+    /// Below a quarter of the peak a shaped call's claim was planned by, bytes
+    /// ([`crate::shape::Part::planned`]): it compiled almost none of its work.
+    LightBeside(u64),
+    /// There is no record to keep it in, or the stage is not [`metered`].
+    Nowhere,
+}
+
+/// The plain builds' record beside it ([`Book::plain`]): what a `targo` build a shell, an agent
+/// or the lab started kept ([`plain_like`]).
+pub const PLAIN_RECORD: &str = aterm_capacity::book::TARGO_RECORD;
 
 /// Whether stage `id` compiles, and so claims [`aterm_capacity::cold_claim`] until a run of it is
 /// measured: each such stage runs a cargo or rustdoc build of its own (a test, lint, doctest,
@@ -108,11 +173,32 @@ struct Held {
     started: bool,
 }
 
+/// What names a compiler process for its unit's record ([`Meter::attributing`]): read once per
+/// process, `None` for one that compiles no unit or could not be read.
+pub type UnitReader = fn(u32) -> Option<crate::unitgraph::UnitName>;
+
+/// The footprint at which a stage's member is read for the unit it compiles
+/// ([`Meter::attributing`]): 1 GiB, so a run reads the few heavy compilers, not every one.
+pub const UNIT_FLOOR: u64 = 1 << 30;
+
+/// What a meter that attributes peaks to units holds ([`Meter::attributing`]).
+#[derive(Debug)]
+struct Units {
+    reader: UnitReader,
+    floor: u64,
+    /// Each member read so far, by pid and start: the unit it compiles (`None`: it compiles
+    /// none, or could not be read) and the most it held.
+    seen: std::collections::BTreeMap<(u32, u64), (Option<crate::unitgraph::UnitName>, u64)>,
+}
+
 /// A STAGE'S MEMORY METER: what its children's clocks read of their process groups
-/// ([`Meter::book`]), each group's footprint summed over its members, the stage's held together.
+/// ([`Meter::book`]), each group's footprint summed over its members, the stage's held together;
+/// and, for a meter that attributes them ([`Meter::attributing`]), each heavy compiler's peak by
+/// the unit it compiles.
 #[derive(Debug, Default)]
 pub struct Meter {
     held: Mutex<Held>,
+    units: Option<Mutex<Units>>,
 }
 
 impl Meter {
@@ -120,6 +206,38 @@ impl Meter {
     #[must_use]
     pub fn new() -> Arc<Meter> {
         Arc::new(Meter::default())
+    }
+
+    /// A meter that also attributes peaks to units: a member whose footprint reaches `floor` is
+    /// read once by `reader` for the unit it compiles ([`read_unit`] live), and the most it held
+    /// is that unit's ([`Meter::unit_peaks`]).
+    #[must_use]
+    pub fn attributing(reader: UnitReader, floor: u64) -> Arc<Meter> {
+        Arc::new(Meter {
+            held: Mutex::default(),
+            units: Some(Mutex::new(Units {
+                reader,
+                floor,
+                seen: std::collections::BTreeMap::new(),
+            })),
+        })
+    }
+
+    /// The most each unit's compiler held, by its name: the heavy ones the meter read
+    /// ([`Meter::attributing`]), each once at most (the most of two compilers of one unit).
+    #[must_use]
+    pub fn unit_peaks(&self) -> std::collections::BTreeMap<crate::unitgraph::UnitName, u64> {
+        let mut out = std::collections::BTreeMap::new();
+        if let Some(units) = &self.units {
+            let units = units.lock().unwrap_or_else(PoisonError::into_inner);
+            for (name, peak) in units.seen.values() {
+                if let Some(name) = name {
+                    let e = out.entry(name.clone()).or_insert(0);
+                    *e = (*e).max(*peak);
+                }
+            }
+        }
+        out
     }
 
     /// A child of the stage started, and its clock books into this meter: a stage none of whose
@@ -151,6 +269,19 @@ impl Meter {
         let lifetime = members.iter().map(|m| m.peak_footprint).max().unwrap_or(0);
         h.lifetime = h.lifetime.max(lifetime);
         h.read = true;
+        drop(h);
+        if let Some(units) = &self.units {
+            let mut units = units.lock().unwrap_or_else(PoisonError::into_inner);
+            for m in members {
+                let most = m.footprint.max(m.peak_footprint);
+                if let Some(seen) = units.seen.get_mut(&(m.pid, m.start)) {
+                    seen.1 = seen.1.max(most);
+                } else if most >= units.floor {
+                    let name = (units.reader)(m.pid);
+                    units.seen.insert((m.pid, m.start), (name, most));
+                }
+            }
+        }
     }
 
     /// The group `pgid` ended: what it held is the stage's no longer.
@@ -284,6 +415,12 @@ pub trait StageKey {
     /// selection where the stage reads it ([`reads_selection`]), and its variant: the requested
     /// test binaries at once for the test run, the cells for the cells lane's stages.
     fn of_run(id: StageId, ctx: &crate::Ctx) -> Key;
+
+    /// The key of planned stage `spec` in the run `ctx`: a call of a shaped test compile
+    /// ([`crate::shape::Part`]) keeps its record over its own crates under its variant
+    /// ([`crate::shape::Part::variant`]); every other stage, an unshaped test compile included,
+    /// under [`Self::of_run`].
+    fn of_stage(spec: &StageSpec, ctx: &crate::Ctx) -> Key;
 }
 
 impl StageKey for Key {
@@ -302,7 +439,11 @@ impl StageKey for Key {
     }
 
     fn of_run(id: StageId, ctx: &crate::Ctx) -> Key {
-        let mut key = if reads_selection(id, ctx.cells_pulled) {
+        // `-p` narrows a named `cells` as a pull does ([`crate::cells::narrows`]).
+        let cells_narrowed = ctx.cells_pulled
+            || (id == StageId::ForeignCells
+                && matches!(ctx.scope, crate::scope::Scope::Packages(_)));
+        let mut key = if reads_selection(id, cells_narrowed) {
             Key::of(id, &ctx.scope)
         } else {
             Key::of(id, &Scope::workspace())
@@ -328,6 +469,18 @@ impl StageKey for Key {
         };
         key
     }
+
+    fn of_stage(spec: &StageSpec, ctx: &crate::Ctx) -> Key {
+        match &spec.part {
+            Some(part) if part.shaped() => Key {
+                stage: format!("{:?}", spec.id),
+                checkout: ctx.root.display().to_string(),
+                crates: Some(part.piece.crates.clone()),
+                variant: part.variant(),
+            },
+            _ => Key::of_run(spec.id, ctx),
+        }
+    }
 }
 
 /// Why a stage claims what it does ([`StageNeed`]).
@@ -338,6 +491,9 @@ pub enum How {
     /// From the peaks its stage and selection kept in another checkout
     /// ([`Records::elsewhere`]), with none kept in its own.
     Elsewhere(Learned),
+    /// From the peaks a plain `targo` build of its selection kept ([`plain_like`]), with none of
+    /// its own kept anywhere.
+    Plain(Learned),
     /// No peak kept, and it compiles: the cold figure ([`aterm_capacity::cold_claim`]).
     Cold,
     /// No peak kept, and it compiles nothing.
@@ -383,6 +539,17 @@ impl fmt::Display for StageNeed {
                     .map_or("another checkout", |k| k.checkout.as_str()),
                 aterm_capacity::size(l.peak)
             ),
+            How::Plain(l) => {
+                let (verb, checkout) = l.wider.as_ref().map_or(("targo", "a checkout"), |k| {
+                    (k.stage.as_str(), k.checkout.as_str())
+                });
+                write!(
+                    f,
+                    "{bytes}, the most a plain `{verb}` of it in {checkout} used ({}) and a fifth \
+                     more, at least 1 GiB: verify keeps no run of it",
+                    aterm_capacity::size(l.peak)
+                )
+            }
             How::Cold => write!(
                 f,
                 "{bytes} cold: no run of it is kept, and it compiles (16 GiB, at most half of \
@@ -394,16 +561,88 @@ impl fmt::Display for StageNeed {
     }
 }
 
+/// Whether a plain build's targets (its variant's items) hold a stage's ([`plain_work`]).
+type Holds = fn(&[&str]) -> bool;
+
+/// The plain `targo` build whose work holds verify stage `stage`'s over the same selection, and
+/// which of its variants do: verify's test compile (`test --tests --no-run`: every target with
+/// `test = true`) is held by a plain `targo test` of no profile, target or features that names no
+/// target, `--tests` or `--all-targets`; its lint (`--all-targets`) by a plain `targo tippy` of
+/// `--all-targets`. `None` for every other stage.
+fn plain_work(stage: &str) -> Option<(&'static str, Holds)> {
+    fn tests(targets: &[&str]) -> bool {
+        targets.is_empty()
+            || targets
+                .iter()
+                .any(|t| matches!(*t, "--tests" | "--all-targets"))
+    }
+    fn lint(targets: &[&str]) -> bool {
+        targets.contains(&"--all-targets")
+    }
+    match stage {
+        "TestCompile" => Some(("targo test", tests)),
+        "Tippy" => Some(("targo tippy", lint)),
+        _ => None,
+    }
+}
+
+/// WHAT A PLAIN BUILD OF THE SAME WORK KEPT (BUILD-ADMIT's book, [`PLAIN_RECORD`]), for a stage
+/// whose record `key` names its selection and no variant: the most any record of `plain` keeps,
+/// in this checkout or another, for the plain build whose work holds the stage's ([`plain_work`])
+/// over the same crates, of a variant that names no profile, target or features (`release`,
+/// `profile …`, `target …`, `features …`, `--all-features`, `--no-default-features`) and whose
+/// targets hold the stage's. A plain build of less (`--lib`, one `--test`) is never read: it
+/// would bound the stage below what it builds. `None` where none is kept; its key names it.
+#[must_use]
+pub fn plain_like(plain: &Records, key: &Key) -> Option<Learned> {
+    let (verb, holds) = plain_work(&key.stage)?;
+    if key.variant.is_some() {
+        return None;
+    }
+    let shaped = |item: &str| {
+        matches!(item, "release" | "--all-features" | "--no-default-features")
+            || ["profile ", "target ", "features "]
+                .iter()
+                .any(|p| item.starts_with(p))
+    };
+    plain
+        .rows()
+        .iter()
+        .filter(|r| r.key.stage == verb && r.key.crates == key.crates)
+        .filter(|r| {
+            let items: Vec<&str> = r
+                .key
+                .variant
+                .as_deref()
+                .map_or_else(Vec::new, |v| v.split(", ").collect());
+            !items.iter().any(|i| shaped(i)) && holds(&items)
+        })
+        .filter_map(|r| r.peaks.iter().map(|p| p.bytes).max().map(|m| (m, r)))
+        .max_by_key(|(m, _)| *m)
+        .map(|(peak, r)| Learned {
+            peak,
+            runs: r.peaks.len(),
+            wider: Some(r.key.clone()),
+        })
+}
+
 /// What stage `spec`, its record kept under `key` ([`StageKey::of_run`]), claims on a machine of
 /// `physical` bytes (`None`: unread), by `records`: its learned peak and a fifth more, at least
 /// 1 GiB more ([`aterm_capacity::peak_claim`]); with none kept in its checkout, the most its
 /// stage and selection kept in another ([`Records::elsewhere`]: a new worktree's first run, the
 /// common case, would otherwise claim the cold figure for a compile some other worktree measured);
-/// with none kept anywhere, the cold figure for a stage that compiles
+/// with none of those, the most a plain build of the same work kept in `plain`
+/// ([`plain_like`]); with none kept anywhere, the cold figure for a stage that compiles
 /// ([`aterm_capacity::cold_claim`]) and nothing for any other; nothing for a stage that touches
 /// no target directory ([`metered`]).
 #[must_use]
-pub fn need(records: &Records, spec: &StageSpec, key: &Key, physical: Option<u64>) -> StageNeed {
+pub fn need(
+    records: &Records,
+    plain: &Records,
+    spec: &StageSpec,
+    key: &Key,
+    physical: Option<u64>,
+) -> StageNeed {
     if !metered(spec) {
         return StageNeed {
             bytes: 0,
@@ -416,10 +655,16 @@ pub fn need(records: &Records, spec: &StageSpec, key: &Key, physical: Option<u64
             how: How::Learned(l),
         };
     }
-    match records.elsewhere(key) {
-        Some(l) => StageNeed {
+    if let Some(l) = records.elsewhere(key) {
+        return StageNeed {
             bytes: aterm_capacity::peak_claim(l.peak),
             how: How::Elsewhere(l),
+        };
+    }
+    match plain_like(plain, key) {
+        Some(l) => StageNeed {
+            bytes: aterm_capacity::peak_claim(l.peak),
+            how: How::Plain(l),
         },
         None if compiles(spec.id) => StageNeed {
             bytes: aterm_capacity::cold_claim(physical),
@@ -439,6 +684,8 @@ pub struct Book {
     /// The record's file; `None` keeps nothing (no state directory), and every stage claims as
     /// though none were kept.
     pub path: Option<PathBuf>,
+    /// The plain builds' record, read and never written ([`plain_like`]); `None` reads none.
+    pub plain: Option<PathBuf>,
     /// Physical memory, bytes; `None` where unread.
     pub physical: Option<u64>,
     /// The most memory that can ever be available here, bytes
@@ -452,16 +699,19 @@ pub struct Book {
 
 impl Book {
     /// The live book: the record in this user's aterm state directory
-    /// (`aterm_types::dirs::account_state_dir`, [`RECORD`]), and the machine read now.
+    /// (`aterm_types::dirs::account_state_dir`, [`RECORD`]), the plain builds' beside it
+    /// ([`PLAIN_RECORD`]), and the machine read now.
     #[must_use]
     pub fn live() -> Book {
         use aterm_capacity::Machine as _;
         let reading = aterm_capacity::Live.read(None);
+        let state = aterm_types::dirs::account_state_dir();
         Book::at(
-            aterm_types::dirs::account_state_dir().map(|d| d.join(RECORD)),
+            state.as_ref().map(|d| d.join(RECORD)),
             reading.physical,
             reading.reachable(),
         )
+        .with_plain(state.map(|d| d.join(PLAIN_RECORD)))
     }
 
     /// A book kept at `path`, on a machine of `physical` bytes of which `reachable` can ever be
@@ -470,10 +720,18 @@ impl Book {
     pub fn at(path: Option<PathBuf>, physical: Option<u64>, reachable: Option<u64>) -> Book {
         Book {
             path,
+            plain: None,
             physical,
             reachable,
             lock: Mutex::new(()),
         }
+    }
+
+    /// This book reading the plain builds' record at `plain` too ([`Book::plain`]).
+    #[must_use]
+    pub fn with_plain(mut self, plain: Option<PathBuf>) -> Book {
+        self.plain = plain;
+        self
     }
 
     /// THE RUN'S MEMORY BUDGET, bytes: what its stages that claim memory may claim together
@@ -490,28 +748,100 @@ impl Book {
         self.path.as_deref().map(Records::load).unwrap_or_default()
     }
 
+    /// The plain builds' peaks kept now ([`Book::plain`]).
+    #[must_use]
+    pub fn plain_records(&self) -> Records {
+        self.plain.as_deref().map(Records::load).unwrap_or_default()
+    }
+
     /// What `spec`, its record kept under `key`, claims ([`need`]).
     #[must_use]
     pub fn need(&self, spec: &StageSpec, key: &Key) -> StageNeed {
-        need(&self.records(), spec, key, self.physical)
+        need(
+            &self.records(),
+            &self.plain_records(),
+            spec,
+            key,
+            self.physical,
+        )
     }
 
-    /// Keep `peak`, measured for `spec`, under `key` ([`Records::push`]); nothing for a stage
-    /// that is not [`metered`], and nothing with no file.
+    /// Keep each unit's peak in `peaks`, read in a run in `checkout`, under its unit's key
+    /// ([`crate::shape::unit_key`]), unless it was light beside the heaviest that key kept in two
+    /// weeks ([`Records::keep_unless_light`]): the units a heavy test compile's planner sums. The
+    /// units kept, heaviest first; none with no file.
     ///
     /// # Errors
-    /// The file could not be written ([`Records::save`]).
-    pub fn keep(&self, spec: &StageSpec, key: &Key, peak: u64) -> io::Result<()> {
+    /// The file could not be written ([`Records::update`]).
+    pub fn keep_units(
+        &self,
+        checkout: &str,
+        peaks: &std::collections::BTreeMap<crate::unitgraph::UnitName, u64>,
+    ) -> io::Result<Vec<(crate::unitgraph::UnitName, u64)>> {
+        let Some(path) = &self.path else {
+            return Ok(Vec::new());
+        };
+        let _held = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let at_ms = aterm_time::unix_millis().unwrap_or(0);
+        let mut kept = Vec::new();
+        for (name, peak) in peaks {
+            let key = crate::shape::unit_key(checkout, name);
+            if Records::keep_unless_light(path, key, *peak, at_ms)? {
+                kept.push((name.clone(), *peak));
+            }
+        }
+        kept.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        Ok(kept)
+    }
+
+    /// Keep the row `key` that refuses a cut ([`crate::shape::refusal_key`]), so the planner
+    /// never takes it again, under the record's lock ([`Records::update`]), so another process's
+    /// write at once cannot lose it; again each run its selection's plan reads it
+    /// ([`crate::shape::Part::refused`]), so its newest peak is never the oldest of a record that
+    /// lets that one go past [`ROWS_KEPT`] rows. Nothing with no file.
+    ///
+    /// # Errors
+    /// The file could not be written ([`Records::update`]).
+    pub fn refuse(&self, key: &Key) -> io::Result<()> {
         let Some(path) = &self.path else {
             return Ok(());
         };
+        let _held = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        Records::keep(path, key.clone(), 0, aterm_time::unix_millis().unwrap_or(0))
+    }
+
+    /// Keep `peak`, measured for `spec`, under `key` ([`Records::push`]); nothing for a stage
+    /// that is not [`metered`], and nothing with no file. A stage that compiles ([`compiles`])
+    /// keeps nothing for a run light beside the heaviest peak its key kept in the last two weeks
+    /// ([`Records::keep_unless_light`]): a compile whose units were fresh (the run after a cut
+    /// built them, or after a plain build) did none of the work its claim is for, and eight of
+    /// those would push the heavy peak out of its record. A shaped call keeps nothing for a run
+    /// below a quarter of the peak its claim was planned by ([`crate::shape::Part::planned`]),
+    /// however old, even under a key that holds none: the first shaped run of a selection is
+    /// often warm, and its calls' few MiB would be the first record under their keys.
+    ///
+    /// # Errors
+    /// The file could not be written ([`Records::update`]).
+    pub fn keep(&self, spec: &StageSpec, key: &Key, peak: u64) -> io::Result<Kept> {
+        let Some(path) = &self.path else {
+            return Ok(Kept::Nowhere);
+        };
         if !metered(spec) {
-            return Ok(());
+            return Ok(Kept::Nowhere);
+        }
+        if compiles(spec.id)
+            && let Some(by) = spec.part.as_ref().and_then(|p| p.planned)
+            && peak < by / aterm_capacity::book::LIGHT_SHARE
+        {
+            return Ok(Kept::LightBeside(by));
         }
         let _held = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut records = Records::load(path);
-        records.push(key.clone(), peak, aterm_time::unix_millis().unwrap_or(0));
-        records.save(path)
+        let at_ms = aterm_time::unix_millis().unwrap_or(0);
+        if compiles(spec.id) {
+            return Records::keep_unless_light(path, key.clone(), peak, at_ms)
+                .map(|kept| if kept { Kept::Kept } else { Kept::Light });
+        }
+        Records::keep(path, key.clone(), peak, at_ms).map(|()| Kept::Kept)
     }
 }
 

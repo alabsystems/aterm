@@ -163,7 +163,9 @@ pub(crate) fn read(dir: &Path) -> Result<Recording, String> {
 
 fn sequence(name: &str) -> Option<(&str, usize)> {
     let (seq, k) = name.rsplit_once('-')?;
-    Some((seq, k.parse().ok()?))
+    k.bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| Some((seq, k.parse().ok()?)))?
 }
 
 /// Judge `run` (frames by name, drawn on `adapter`) against `rec`.

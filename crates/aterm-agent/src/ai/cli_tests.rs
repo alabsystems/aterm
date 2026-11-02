@@ -1622,3 +1622,15 @@ fn a_claude_sign_in_accounts_v2_refuses_says_why_with_a_terminal_or_none() {
         "CONTROL: {out}"
     );
 }
+
+#[test]
+fn env_var_prefers_the_last_duplicate_entry() {
+    let b = machine(&["claude"]);
+    let env = env_of(
+        &b,
+        ONLY_CLAUDE,
+        &[("CLAUDE_CONFIG_DIR", "/old"), ("CLAUDE_CONFIG_DIR", "/new")],
+        false,
+    );
+    assert_eq!(env.var("CLAUDE_CONFIG_DIR").as_deref(), Some("/new"));
+}

@@ -130,6 +130,20 @@ fn the_key_is_the_stored_login_the_process_reads() {
         "one directory names one item"
     );
     assert_eq!(login_key(&env(&["ANTHROPIC_API_KEY=k", "PATH=/bin"])), None);
+    assert_eq!(
+        login_key(&env(&[
+            "CLAUDE_CONFIG_DIR=/work/first",
+            "CLAUDE_CONFIG_DIR=/work/second"
+        ])),
+        Some("dir:/work/second".to_string())
+    );
+    assert_eq!(
+        login_key(&env(&[
+            "CLAUDE_CONFIG_DIR=/work/first",
+            "CLAUDE_CONFIG_DIR="
+        ])),
+        None
+    );
     assert_eq!(login_key(&[]), None);
 }
 
@@ -173,4 +187,12 @@ fn a_release_says_whether_a_rows_carry_ended() {
     assert!(l.abandon_for("@1", &owner), "its own, a row's");
     assert!(l.carried_rows().is_empty());
     assert!(!l.abandon_for("@1", &owner), "ended already");
+
+    assert_eq!(l.carry_for("dir:/a", "@1", &owner, Some("work-a")), Ok(()));
+    assert_eq!(l.carry_for("dir:/b", "@1", &owner, None), Ok(()));
+    assert!(
+        !l.lock().contains_key("dir:/a"),
+        "idle prior latch is pruned when a tab switches login"
+    );
+    assert!(!l.abandon_for("@1", &owner));
 }

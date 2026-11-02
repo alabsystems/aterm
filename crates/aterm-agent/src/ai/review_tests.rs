@@ -56,6 +56,30 @@ fn credential_shaped_tokens_are_redacted_and_words_are_not() {
     assert!(out.ends_with("done"));
     let plain = "the ask-for-review flow, sk-learn, task-runner and eyJ prefix; -----BEGIN CERTIFICATE-----";
     assert_eq!(redact(plain), (plain.to_string(), 0));
+    let prose_before_pem = concat!(
+        "Checks `-----BEGIN ` (PRIVATE KEY), `-----`, and `-----END ` headers:\n",
+        "-----BEGIN RSA ",
+        "PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END RSA ",
+        "PRIVATE KEY-----\ndone"
+    );
+    let (redacted_prose, count) = redact(prose_before_pem);
+    assert_eq!(count, 1, "{redacted_prose}");
+    assert!(
+        !redacted_prose.contains("MIIEvQIBADANBgkqhkiG9w0BAQEFAASC"),
+        "prose mentioning PEM markers must not desynchronize redaction of a real key: {redacted_prose}"
+    );
+    let torn_end_before_second_pem = concat!(
+        "-----BEGIN EC ",
+        "PRIVATE KEY-----\nFIRSTKEYMATERIAL\n-----END \n-----BEGIN RSA ",
+        "PRIVATE KEY-----\nSECONDKEYMATERIAL\n-----END RSA ",
+        "PRIVATE KEY-----\ndone"
+    );
+    let (redacted_torn, count) = redact(torn_end_before_second_pem);
+    assert_eq!(count, 1, "{redacted_torn}");
+    assert!(
+        !redacted_torn.contains("FIRSTKEYMATERIAL") && !redacted_torn.contains("SECONDKEYMATERIAL"),
+        "incomplete -----END line must not consume the next key's opening dashes: {redacted_torn}"
+    );
 }
 
 #[test]
@@ -196,8 +220,11 @@ fn facts_of(c: &'static Connector, shim: PathBuf) -> Facts {
         accounts: None,
         limited_until: None,
         record: Record::default(),
+        record_scope: (c.id == "codex").then_some("file"),
+        credential_store_error: None,
         env_credentials: Vec::new(),
         pool: None,
+        review_source: None,
     }
 }
 
@@ -216,6 +243,32 @@ fn row_of(c: &'static Connector, state: State) -> Row {
         used: None,
         renew_by: None,
         limited_until: None,
+    }
+}
+
+fn claude_account(login: Option<&str>) -> ClaudeAccounts {
+    ClaudeAccounts {
+        store: None,
+        roster: None,
+        label: "main".into(),
+        listed: false,
+        refused: None,
+        unread: None,
+        launch_refused: None,
+        sign_in_refused: None,
+        renews: true,
+        login: login.map(str::to_owned),
+        made: true,
+        state: Some("ok"),
+        renew_by: None,
+        limited_until: None,
+        served_at: None,
+        renewed_at: None,
+        signed_out_at: None,
+        next_sign_in: None,
+        tried: None,
+        unattended: true,
+        off: None,
     }
 }
 
@@ -266,6 +319,7 @@ fn a_reviewer_that_cannot_authenticate_gives_way_to_the_next_and_a_timeout_does_
     };
     let now = || 1_800_000_000;
     let host = Host {
+        config: None,
         runner: &FakeRunner::quiet(),
         var: &var,
         vars: &[],
@@ -280,6 +334,7 @@ fn a_reviewer_that_cannot_authenticate_gives_way_to_the_next_and_a_timeout_does_
         })
     });
     let host = Host {
+        config: None,
         runner: &runner,
         ..host
     };
@@ -300,7 +355,7 @@ fn a_reviewer_that_cannot_authenticate_gives_way_to_the_next_and_a_timeout_does_
     assert_eq!(got, [("codex", Verdict::Auth), ("claude", Verdict::Served)]);
     assert_eq!(answers[1].text.as_deref(), Some("LGTM: no findings"));
     let rec = store.load().expect("load");
-    assert!(rec.of("codex").ended() && rec.of("claude").used_at.is_some());
+    assert!(rec.of_scope("codex", Some("file")).ended() && rec.of("claude").used_at.is_some());
     let runner = FakeRunner::with(|call| {
         if call.program == "codex" {
             Err(RunFailed::Timeout)
@@ -309,6 +364,7 @@ fn a_reviewer_that_cannot_authenticate_gives_way_to_the_next_and_a_timeout_does_
         }
     });
     let host = Host {
+        config: None,
         runner: &runner,
         ..host
     };
@@ -336,25 +392,7 @@ fn a_reviewer_runs_from_its_shim_in_the_repository_with_the_askers_environment_a
     let b = machine(&["claude", "codex"]);
     let store = Store::at(&b.state);
     let mut claude = facts_of(&CLAUDE, b.pkg.agents_dir().join("claude"));
-    claude.accounts = Some(ClaudeAccounts {
-        label: "main".into(),
-        listed: false,
-        refused: None,
-        unread: None,
-        renews: true,
-        login: Some("/state/accounts/logins/main+1".into()),
-        made: true,
-        state: Some("ok"),
-        renew_by: None,
-        limited_until: None,
-        served_at: None,
-        renewed_at: None,
-        signed_out_at: None,
-        next_sign_in: None,
-        tried: None,
-        unattended: true,
-        off: None,
-    });
+    claude.accounts = Some(claude_account(Some("/state/accounts/logins/main+1")));
     let facts = vec![claude, facts_of(&CODEX, b.pkg.agents_dir().join("codex"))];
     let rows = [row_of(&CLAUDE, State::Ok), row_of(&CODEX, State::Ok)];
     let reviewers: Vec<&'static Connector> = vec![&CLAUDE, &CODEX];
@@ -376,6 +414,7 @@ fn a_reviewer_runs_from_its_shim_in_the_repository_with_the_askers_environment_a
     let runner = FakeRunner::with(|_| Ok(ran(0, "fine", "")));
     let now = || 0;
     let host = Host {
+        config: None,
         runner: &runner,
         var: &var,
         vars: &vars,
@@ -490,6 +529,7 @@ fn the_primers_marker_never_reaches_the_asker_and_a_failure_says_why() {
     let var = |_: &str| None;
     let now = || 0;
     let host = Host {
+        config: None,
         runner: &runner,
         var: &var,
         vars: &[],
@@ -672,6 +712,7 @@ fn an_outcome_under_another_home_is_recorded_nowhere() {
     };
     let other = |k: &str| (k == "CODEX_HOME").then(|| "/profiles/w/.codex".to_string());
     let host = Host {
+        config: None,
         runner: &runner,
         var: &other,
         vars: &[],
@@ -679,9 +720,13 @@ fn an_outcome_under_another_home_is_recorded_nowhere() {
         now: &now,
     };
     let _ = run_review(&host, &cands, &facts, &ask);
-    assert_eq!(store.load().expect("load").of("codex"), Record::default());
+    assert_eq!(
+        store.load().expect("load").of_scope("codex", Some("file")),
+        Record::default()
+    );
     let none = |_: &str| None;
     let host = Host {
+        config: None,
         runner: &runner,
         var: &none,
         vars: &[],
@@ -689,7 +734,13 @@ fn an_outcome_under_another_home_is_recorded_nowhere() {
         now: &now,
     };
     let _ = run_review(&host, &cands, &facts, &ask);
-    assert!(store.load().expect("load").of("codex").ended());
+    assert!(
+        store
+            .load()
+            .expect("load")
+            .of_scope("codex", Some("file"))
+            .ended()
+    );
 }
 
 #[test]
@@ -704,6 +755,7 @@ fn a_limit_keeps_the_cli_out_of_reviews_for_a_while() {
     let now = || 1_000;
     let none = |_: &str| None;
     let host = Host {
+        config: None,
         runner: &runner,
         var: &none,
         vars: &[],
@@ -720,7 +772,11 @@ fn a_limit_keeps_the_cli_out_of_reviews_for_a_while() {
     };
     let _ = run_review(&host, &cands, &facts, &ask);
     assert_eq!(
-        store.load().expect("load").of("codex").limited_until,
+        store
+            .load()
+            .expect("load")
+            .of_scope("codex", Some("file"))
+            .limited_until,
         Some(1_000 + LIMIT_WAIT_S)
     );
 }
@@ -729,10 +785,13 @@ fn review_auth_after_login(replacement_at: Option<i64>) -> (Record, Option<Recor
     let b = machine(&["codex"]);
     let store = Store::at(&b.state);
     store
-        .note("codex", How::Login, Outcome::Worked, 100)
+        .note_scope("codex", Some("file"), How::Login, Outcome::Worked, 100)
         .expect("initial login");
     let mut fact = facts_of(&CODEX, b.pkg.agents_dir().join("codex"));
-    fact.record = store.load().expect("initial record").of("codex");
+    fact.record = store
+        .load()
+        .expect("initial record")
+        .of_scope("codex", Some("file"));
     let facts = [fact];
     let rows = [row_of(&CODEX, State::Ok)];
     let reviewers: Vec<&'static Connector> = vec![&CODEX];
@@ -743,16 +802,21 @@ fn review_auth_after_login(replacement_at: Option<i64>) -> (Record, Option<Recor
     let runner = FakeRunner::with(move |_| {
         if let Some(at) = replacement_at {
             during_run
-                .note("codex", How::Login, Outcome::Worked, at)
+                .note_scope("codex", Some("file"), How::Login, Outcome::Worked, at)
                 .expect("new login");
-            *seen.lock().expect("replacement") =
-                Some(during_run.load().expect("new record").of("codex"));
+            *seen.lock().expect("replacement") = Some(
+                during_run
+                    .load()
+                    .expect("new record")
+                    .of_scope("codex", Some("file")),
+            );
         }
         Ok(ran(1, "", "ERROR: unexpected status 401 Unauthorized"))
     });
     let var = |_: &str| None;
     let now = || 300;
     let host = Host {
+        config: None,
         runner: &runner,
         var: &var,
         vars: &[],
@@ -785,7 +849,13 @@ fn review_auth_after_login(replacement_at: Option<i64>) -> (Record, Option<Recor
         "the old run's own answer stays truthful"
     );
     let expected = replacement.lock().expect("replacement").clone();
-    (store.load().expect("final record").of("codex"), expected)
+    (
+        store
+            .load()
+            .expect("final record")
+            .of_scope("codex", Some("file")),
+        expected,
+    )
 }
 
 #[test]
@@ -838,6 +908,7 @@ fn review_at(c: &'static Connector, level: Level) -> (Vec<Answer>, Vec<Vec<Strin
     let none = |_: &str| None;
     let now = || 0;
     let host = Host {
+        config: None,
         runner: &runner,
         var: &none,
         vars: &[],
@@ -932,7 +1003,20 @@ fn each_reviewer_runs_at_the_level_in_its_own_flags() {
     let muse = args_at(&MUSE, Level::Yolo);
     let yolo = muse.iter().position(|a| a == "--yolo").expect("--yolo");
     let exec = muse.iter().position(|a| a == "exec").expect("exec");
-    assert!(yolo < exec, "{muse:?}");
+    assert_eq!(exec, 0, "{muse:?}");
+    assert!(exec < yolo, "{muse:?}");
+    assert!(
+        has(&muse, &["--contributor-mode", "off"]),
+        "a Muse review runs contributor mode off: {muse:?}"
+    );
+    assert!(
+        has(&muse, &["--model", "muse-wonder-full-1.0"]),
+        "a Muse review runs the default model: {muse:?}"
+    );
+    assert!(
+        has(&muse, &["--reasoning-effort", "xhigh"]),
+        "a Muse review runs at xhigh: {muse:?}"
+    );
 }
 
 /// KIMI CODE REVIEWS AT YOLO ALONE, WITH NO LEVEL FLAG: 2.3.3's `-p` forces Never Ask and exits 1
@@ -1118,6 +1202,7 @@ fn a_skipped_reviewer_names_what_a_person_does_first() {
         let none = |_: &str| None;
         let now = || 0;
         let host = Host {
+            config: None,
             runner: &runner,
             var: &none,
             vars: &[],
@@ -1150,6 +1235,7 @@ fn scripted_claude_answer(exit: i32, stdout: String, stderr: String) -> Answer {
     let none = |_: &str| None;
     let now = || 1_000;
     let host = Host {
+        config: None,
         runner: &runner,
         var: &none,
         vars: &[],
@@ -1215,11 +1301,12 @@ fn review_on_frozen_login_with_env(
 ) -> (Answer, Record, Vec<crate::ai::testing::Call>) {
     let b = machine(&[c.id]);
     let store = Store::at(&b.state);
+    let scope = (c.id == "codex").then_some("file");
     store
-        .note(c.id, How::Login, Outcome::Worked, 100)
+        .note_scope(c.id, scope, How::Login, Outcome::Worked, 100)
         .expect("initial login");
     let mut fact = facts_of(c, b.pkg.agents_dir().join(c.id));
-    fact.record = store.load().expect("record").of(c.id);
+    fact.record = store.load().expect("record").of_scope(c.id, scope);
     fact.env_credentials = key.into_iter().collect();
     let facts = [fact];
     let rows = [row_of(c, State::Ok)];
@@ -1263,6 +1350,7 @@ fn review_on_frozen_login_with_env(
     });
     let now = || 300;
     let host = Host {
+        config: None,
         runner: &runner,
         var: &var,
         vars: &vars,
@@ -1297,7 +1385,7 @@ fn review_on_frozen_login_with_env(
     }
     (
         answers.into_iter().next().expect("answer"),
-        store.load().expect("final record").of(c.id),
+        store.load().expect("final record").of_scope(c.id, scope),
         calls,
     )
 }
@@ -1415,7 +1503,7 @@ fn alab_launcher(b: &crate::ai::testing::Box3, reads: bool) {
     let exe = crate::harness::codex_alab::lay_package(&b.dir.path().join("store/codex"), reads);
     std::fs::write(
         b.pkg.agents_dir().join("codex"),
-        format!("#!/bin/sh\nexec '{}' \"$@\"\n", exe.display()),
+        crate::harness::codex_alab::twin_text(&exe),
     )
     .expect("launcher");
 }
@@ -1465,6 +1553,7 @@ fn a_pooled_codex_review_on_a_row_of_its_own_needs_a_build_that_reads_codex_auth
         Ok(ran(0, "", ""))
     });
     let host = Host {
+        config: None,
         runner: &runner,
         var: &var,
         vars: &[],
@@ -1644,6 +1733,7 @@ fn a_pooled_codex_review_limit_marks_only_the_serving_account_so_the_next_accoun
     let runner_limit = FakeRunner::with(|_| Ok(ran(1, "", "ERROR: You've hit your usage limit")));
     let now = || now_val;
     let host_limit = Host {
+        config: None,
         runner: &runner_limit,
         var: &var,
         vars: &vars,
@@ -1669,7 +1759,11 @@ fn a_pooled_codex_review_limit_marks_only_the_serving_account_so_the_next_accoun
     );
     assert_eq!(answers1[0].verdict, Verdict::Limit);
     assert_eq!(
-        store.load().expect("ai store").of("codex").limited_until,
+        store
+            .load()
+            .expect("ai store")
+            .of_scope("codex", Some("file"))
+            .limited_until,
         None,
         "isolated pool account limit does not poison CLI-wide connections.json"
     );
@@ -1701,6 +1795,7 @@ fn a_pooled_codex_review_limit_marks_only_the_serving_account_so_the_next_accoun
         Ok(ran(0, "", ""))
     });
     let host_ok = Host {
+        config: None,
         runner: &runner_ok,
         ..host_limit
     };
@@ -1722,7 +1817,21 @@ fn a_pooled_codex_review_limit_marks_only_the_serving_account_so_the_next_accoun
     );
     assert_eq!(answers2[0].verdict, Verdict::Served);
     assert_eq!(
-        store.load().expect("ai store").of("codex").used_at,
+        store
+            .load()
+            .expect("ai store")
+            .of_scope("codex", Some("file"))
+            .used_at,
+        None
+    );
+    assert_eq!(
+        acct_store
+            .load_logins(now_val)
+            .unwrap()
+            .0
+            .get("work-2")
+            .unwrap()
+            .served_at,
         Some(now_val)
     );
 }
@@ -1741,6 +1850,14 @@ impl ReviewPool {
     const NOW: i64 = 1_800_000_000;
 
     fn new(cli: crate::harness::accounts::Cli, reads: Option<bool>) -> ReviewPool {
+        Self::with_scope(cli, reads, true)
+    }
+
+    fn with_scope(
+        cli: crate::harness::accounts::Cli,
+        reads: Option<bool>,
+        listed: bool,
+    ) -> ReviewPool {
         let c = cli.connector();
         let b = machine(&[c.id]);
         if let Some(reads) = reads {
@@ -1749,13 +1866,24 @@ impl ReviewPool {
         let config = b.dir.path().join("config");
         std::fs::create_dir_all(&config).expect("config");
         let pool = ReviewPool { b, config, cli };
-        let store = c.stores.first().copied().expect("a login file");
+        let store = if cli == crate::harness::accounts::Cli::Claude {
+            std::fs::write(
+                pool.b.home.join(".claude.json"),
+                r#"{"oauthAccount":{"emailAddress":"owner@example.com"}}"#,
+            )
+            .expect("Claude profile");
+            ".credentials.json"
+        } else {
+            c.stores.first().copied().expect("a login file")
+        };
         let default = pool.b.home.join(cli.accounts().default_home).join(store);
         for login in [&default, &pool.work().join(store)] {
             std::fs::create_dir_all(login.parent().expect("parent")).expect("login home");
             std::fs::write(login, "{}").expect("stand-in login");
         }
-        pool.roster(None);
+        if listed {
+            pool.roster(None);
+        }
         pool
     }
 
@@ -1815,6 +1943,39 @@ impl ReviewPool {
             state.active = Some(label.to_string());
             state.pinned = true;
         });
+    }
+
+    fn share_work(&self) {
+        self.store()
+            .transact_logins(Self::NOW, &mut None, |_, logins| {
+                logins.shared.begin(
+                    crate::harness::accounts::shared::Intent {
+                        source: crate::harness::accounts::shared::Source {
+                            network: [1; 32],
+                            account: [2; 32],
+                        },
+                        decision: [3; 32],
+                        generation: 1,
+                        configuration: [4; 32],
+                        request: [5; 16],
+                        label: "work".into(),
+                        identity: "work@example.com".into(),
+                        staging: self
+                            .b
+                            .dir
+                            .path()
+                            .join("shared-staging")
+                            .to_str()
+                            .unwrap()
+                            .into(),
+                        before_generation: None,
+                        begun_at: Self::NOW,
+                    },
+                    None,
+                )?;
+                Ok(Vec::new())
+            })
+            .unwrap();
     }
 
     fn wall(&self, label: &str) {
@@ -1914,15 +2075,6 @@ impl ReviewPool {
 
     /// What `aterm ai review --with <cli>` answers, and the environment of each run it made.
     fn review(&self) -> (Answer, Vec<Vec<(String, String)>>) {
-        let c = self.cli.connector();
-        let home = self.b.home.display().to_string();
-        let vars = vec![("HOME".to_string(), home.clone())];
-        let var = |k: &str| (k == "HOME").then(|| home.clone());
-        let store = Store::at(&self.b.state);
-        let facts = vec![self.facts()];
-        let rows = [crate::ai::state::assess(&facts[0], true, Self::NOW)];
-        let reviewers: Vec<&'static Connector> = vec![c];
-        let cands = candidates(&reviewers, Some(&[c.id]), "claude", &rows, Self::NOW);
         let runner = FakeRunner::with(|call| {
             if let Some(out) = call
                 .args
@@ -1933,13 +2085,34 @@ impl ReviewPool {
             }
             Ok(ran(0, "no findings", ""))
         });
-        let now = || Self::NOW;
+        self.review_using(&runner)
+    }
+
+    fn review_using(&self, runner: &FakeRunner) -> (Answer, Vec<Vec<(String, String)>>) {
+        self.review_using_clock(runner, &|| Self::NOW)
+    }
+
+    fn review_using_clock(
+        &self,
+        runner: &FakeRunner,
+        now: &(dyn Fn() -> i64 + Sync),
+    ) -> (Answer, Vec<Vec<(String, String)>>) {
+        let c = self.cli.connector();
+        let home = self.b.home.display().to_string();
+        let vars = vec![("HOME".to_string(), home.clone())];
+        let var = |k: &str| (k == "HOME").then(|| home.clone());
+        let store = Store::at(&self.b.state);
+        let facts = vec![self.facts()];
+        let rows = [crate::ai::state::assess(&facts[0], true, Self::NOW)];
+        let reviewers: Vec<&'static Connector> = vec![c];
+        let cands = candidates(&reviewers, Some(&[c.id]), "claude", &rows, Self::NOW);
         let host = Host {
-            runner: &runner,
+            config: None,
+            runner,
             var: &var,
             vars: &vars,
             store: &store,
-            now: &now,
+            now,
         };
         let mut answers = run_review(
             &host,
@@ -1957,6 +2130,2154 @@ impl ReviewPool {
         assert_eq!(answers.len(), 1, "{answers:?}");
         let envs = runner.calls().into_iter().map(|call| call.env).collect();
         (answers.remove(0), envs)
+    }
+}
+
+#[test]
+fn a_review_result_cannot_heal_or_limit_a_replacement_login() {
+    use crate::harness::accounts::{self, Auth, Cli};
+    for outcome in 0..3 {
+        for (label, change) in [
+            ("main", 0),
+            ("main", 1),
+            ("main", 2),
+            ("work", 0),
+            ("work", 1),
+            ("work", 2),
+        ] {
+            let pool = ReviewPool::new(Cli::Codex, Some(true));
+            pool.pin(label);
+            if label == "main" {
+                let token = crate::harness::codex_app_login::tests::make_chatgpt_jwt(
+                    Some("owner@example.com"),
+                    "plus",
+                    ReviewPool::NOW + 3600,
+                );
+                std::fs::write(
+                    pool.b.home.join(".codex/auth.json"),
+                    aterm_json::json!({"tokens":{"access_token":token}}).to_string(),
+                )
+                .unwrap();
+            }
+            let account_store = pool.store();
+            let replacement = pool.b.home.join(".aterm/logins/codex/replacement");
+            let runner = FakeRunner::with(move |call| {
+                account_store
+                    .transact_logins(ReviewPool::NOW, &mut None, |state, logins| {
+                        let mut events = Vec::new();
+                        if change == 1 {
+                            events.extend(accounts::note_renewed(
+                                state,
+                                logins,
+                                label,
+                                None,
+                                replacement.to_str().unwrap(),
+                                None,
+                                ReviewPool::NOW - 1,
+                            ));
+                        }
+                        if change == 2 {
+                            events.extend(accounts::note_auth(
+                                state,
+                                label,
+                                Auth::SignedOut,
+                                ReviewPool::NOW - 1,
+                            ));
+                            events.extend(accounts::note_signed_back(
+                                state,
+                                logins,
+                                label,
+                                ReviewPool::NOW - 1,
+                            ));
+                        } else if outcome == 0 {
+                            events.extend(accounts::note_auth(
+                                state,
+                                label,
+                                Auth::SignedOut,
+                                ReviewPool::NOW - 1,
+                            ));
+                        }
+                        Ok(events)
+                    })
+                    .unwrap();
+                match outcome {
+                    0 => {
+                        let out = call
+                            .args
+                            .windows(2)
+                            .find_map(|w| (w[0] == "-o").then_some(&w[1]))
+                            .unwrap();
+                        std::fs::write(out, "no findings").unwrap();
+                        Ok(ran(0, "", ""))
+                    }
+                    1 => Ok(ran(1, "", "ERROR: unexpected status 401 Unauthorized")),
+                    2 => Ok(ran(1, "", "ERROR: You've hit your usage limit")),
+                    _ => unreachable!(),
+                }
+            });
+            let (answer, calls) = pool.review_using(&runner);
+            assert_eq!(calls.len(), 1, "{label}/{outcome}/{change}: {answer:?}");
+            assert_eq!(
+                answer.verdict,
+                [Verdict::Served, Verdict::Auth, Verdict::Limit][outcome]
+            );
+            let state = pool.store().load(ReviewPool::NOW).unwrap().0;
+            let logins = pool.store().load_logins(ReviewPool::NOW).unwrap().0;
+            let account = state.accounts.get(label).unwrap();
+            let record = Store::at(&pool.b.state)
+                .load()
+                .unwrap()
+                .of_scope("codex", Some("file"));
+            assert_eq!(record.ended_at, None);
+            assert_eq!(record.limited_until, None);
+            if outcome == 0 {
+                assert_eq!(
+                    account.auth,
+                    if change == 1 {
+                        Auth::SignedOut
+                    } else {
+                        Auth::Ok
+                    }
+                );
+                assert_eq!(logins.sign_in_receipts.contains_key(label), change != 1);
+                assert_eq!(record.used_at, None);
+            } else if outcome == 1 {
+                assert_eq!(
+                    account.auth,
+                    if change != 0 {
+                        Auth::Ok
+                    } else {
+                        Auth::SignedOut
+                    }
+                );
+            } else {
+                assert_eq!(account.walls.contains_key("five_hour"), change == 0);
+            }
+            if change == 2 {
+                assert_eq!(
+                    logins.sign_in_clock, 1,
+                    "the prior sign-in receipt is preserved"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn an_in_flight_review_cannot_restore_a_cleared_quota_wall() {
+    use crate::harness::accounts::{self, Cli};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicI64, Ordering},
+    };
+    for clear_at in [None, Some(ReviewPool::NOW), Some(ReviewPool::NOW + 1)] {
+        let pool = ReviewPool::new(Cli::Codex, Some(true));
+        pool.pin("main");
+        let store = pool.store();
+        let roster = pool.config.join(Cli::Codex.accounts().roster_file);
+        let clock = Arc::new(AtomicI64::new(ReviewPool::NOW));
+        let written_clock = Arc::clone(&clock);
+        let runner = FakeRunner::with(move |_| {
+            if let Some(cleared_at) = clear_at {
+                store
+                    .transact(cleared_at, &mut None, |state| {
+                        Ok(vec![accounts::pin(
+                            state,
+                            &accounts::Roster::load(&roster)?,
+                            &["main".to_owned()].into_iter().collect(),
+                            "main",
+                            cleared_at,
+                        )?])
+                    })
+                    .unwrap();
+            }
+            written_clock.store(ReviewPool::NOW + 2, Ordering::SeqCst);
+            Ok(ran(1, "", "ERROR: You've hit your usage limit"))
+        });
+        let (answer, calls) = pool.review_using_clock(&runner, &|| clock.load(Ordering::SeqCst));
+        assert_eq!(answer.verdict, Verdict::Limit);
+        assert_eq!(calls.len(), 1);
+        let state = pool.store().load(ReviewPool::NOW + 2).unwrap().0;
+        assert_eq!(
+            state.accounts["main"].walls.contains_key("five_hour"),
+            clear_at.is_none()
+        );
+        let record = Store::at(&pool.b.state)
+            .load()
+            .unwrap()
+            .of_scope("codex", Some("file"));
+        assert_eq!(record.limited_until, None);
+    }
+}
+
+#[test]
+fn an_isolated_review_cannot_heal_or_extend_default_login_health() {
+    use crate::ai::store::{Ended, How, Outcome};
+    let pool = ReviewPool::new(crate::harness::accounts::Cli::Codex, Some(true));
+    pool.pin("work");
+    let store = Store::at(&pool.b.state);
+    store
+        .note_scope(
+            "codex",
+            Some("file"),
+            How::Review,
+            Outcome::Limited(Some(ReviewPool::NOW + 3600)),
+            ReviewPool::NOW - 2,
+        )
+        .unwrap();
+    store
+        .note_scope(
+            "codex",
+            Some("file"),
+            How::Review,
+            Outcome::Ended(Ended::ReviewAuth),
+            ReviewPool::NOW - 1,
+        )
+        .unwrap();
+    let before = store.load().unwrap().of_scope("codex", Some("file"));
+    assert!(before.ended());
+    let (answer, calls) = pool.review();
+    assert_eq!(answer.verdict, Verdict::Served, "{answer:?}");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        store.load().unwrap().of_scope("codex", Some("file")),
+        before
+    );
+    assert_eq!(
+        pool.store()
+            .load_logins(ReviewPool::NOW)
+            .unwrap()
+            .0
+            .get("work")
+            .unwrap()
+            .served_at,
+        Some(ReviewPool::NOW)
+    );
+}
+
+#[test]
+fn unlisted_claude_reviews_leave_no_retained_implicit_account() {
+    for empty_file in [false, true] {
+        for outcome in 0..3 {
+            let pool = ReviewPool::with_scope(crate::harness::accounts::Cli::Claude, None, false);
+            if empty_file {
+                std::fs::write(pool.config.join("accounts.toml"), "").unwrap();
+            }
+            let runner = FakeRunner::with(move |_| match outcome {
+                0 => Ok(ran(0, "no findings", "")),
+                1 => Ok(ran(
+                    1,
+                    "",
+                    "Failed to authenticate. API Error: 401 OAuth session expired",
+                )),
+                _ => Ok(ran(1, "", "You've hit your limit")),
+            });
+            let (answer, calls) = pool.review_using(&runner);
+            assert_eq!(calls.len(), 1, "{answer:?}");
+            assert_eq!(
+                answer.verdict,
+                [Verdict::Served, Verdict::Auth, Verdict::Limit][outcome]
+            );
+            assert!(!pool.store().state_file().exists());
+            assert!(!pool.store().logins_file().exists());
+            let record = Store::at(&pool.b.state).load().unwrap().of("claude");
+            assert_eq!(record.ended_at.is_some(), outcome == 1);
+            assert_eq!(record.limited_until.is_some(), outcome == 2);
+            assert_eq!(record.used_at.is_some(), outcome != 1);
+        }
+    }
+}
+
+#[test]
+fn unlisted_claude_uses_default_health_without_rebinding_retained_history() {
+    use crate::harness::accounts::{self, Auth, Cli};
+    for isolated in [false, true] {
+        let pool = ReviewPool::with_scope(Cli::Claude, None, false);
+        let account_store = pool.store();
+        let old_login = pool.work();
+        account_store
+            .transact_logins(ReviewPool::NOW, &mut None, |state, logins| {
+                let mut events = if isolated {
+                    accounts::note_renewed(
+                        state,
+                        logins,
+                        "this-mac",
+                        None,
+                        old_login.to_str().unwrap(),
+                        None,
+                        ReviewPool::NOW - 20,
+                    )
+                } else {
+                    accounts::note_served_login(logins, "this-mac", ReviewPool::NOW - 20);
+                    Vec::new()
+                };
+                events.extend(accounts::note_auth(
+                    state,
+                    "this-mac",
+                    Auth::SignedOut,
+                    ReviewPool::NOW - 10,
+                ));
+                events.extend(accounts::note_wall(
+                    state,
+                    "this-mac",
+                    "five_hour",
+                    Some(ReviewPool::NOW + 600),
+                    ReviewPool::NOW - 10,
+                    ReviewPool::NOW - 10,
+                ));
+                Ok(events)
+            })
+            .unwrap();
+        let images = || {
+            [account_store.state_file(), account_store.logins_file()]
+                .map(|path| std::fs::read(path).unwrap())
+        };
+        let before = images();
+        let fact = pool.facts();
+        let account = fact.accounts.as_ref().unwrap();
+        assert!(!account.listed);
+        assert_eq!(account.login, None);
+        assert_eq!(account.state, None);
+        assert_eq!(account.served_at, None);
+        assert!(fact.default_record().is_some());
+        assert!(
+            crate::ai::state::assess(&fact, true, ReviewPool::NOW)
+                .state
+                .usable()
+        );
+        let runner = FakeRunner::with(|_| {
+            Ok(ran(
+                1,
+                "",
+                "Failed to authenticate. API Error: 401 OAuth session expired",
+            ))
+        });
+        let (answer, calls) = pool.review_using(&runner);
+        assert_eq!(answer.verdict, Verdict::Auth);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            crate::ai::state::assess(&pool.facts(), true, ReviewPool::NOW).state,
+            State::SignedOut
+        );
+        assert_eq!(images(), before);
+    }
+}
+
+#[test]
+fn an_unlisted_claude_review_cannot_report_over_newly_adopted_accounts() {
+    use crate::harness::accounts;
+    for outcome in 0..3 {
+        let pool = ReviewPool::with_scope(accounts::Cli::Claude, None, false);
+        let path = pool.config.join("accounts.toml");
+        let roster = accounts::append_rows_for(
+            accounts::Cli::Claude,
+            "",
+            &[accounts::Row {
+                label: "main".into(),
+                email: Some("owner@example.com".into()),
+                ..accounts::Row::default()
+            }],
+        )
+        .unwrap();
+        let account_store = pool.store();
+        let runner = FakeRunner::with(move |_| {
+            std::fs::write(&path, &roster).unwrap();
+            account_store
+                .transact(ReviewPool::NOW, &mut None, |state| {
+                    Ok(accounts::note_auth(
+                        state,
+                        "main",
+                        accounts::Auth::Ok,
+                        ReviewPool::NOW,
+                    ))
+                })
+                .unwrap();
+            match outcome {
+                0 => Ok(ran(0, "no findings", "")),
+                1 => Ok(ran(
+                    1,
+                    "",
+                    "Failed to authenticate. API Error: 401 OAuth session expired",
+                )),
+                _ => Ok(ran(1, "", "You've hit your limit")),
+            }
+        });
+        let (_, calls) = pool.review_using(&runner);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            pool.store().load(ReviewPool::NOW).unwrap().0.accounts["main"].auth,
+            accounts::Auth::Ok
+        );
+        assert_eq!(
+            Store::at(&pool.b.state).load().unwrap().of("claude"),
+            Record::default()
+        );
+    }
+}
+
+#[test]
+fn claude_review_results_follow_the_observed_account_and_receipt() {
+    use crate::harness::accounts::{self, Auth, Cli};
+    for label in ["main", "work"] {
+        for outcome in 0..3 {
+            for change in 0..3 {
+                let pool = ReviewPool::new(Cli::Claude, None);
+                pool.pin(label);
+                let store = pool.store();
+                store
+                    .transact_logins(ReviewPool::NOW, &mut None, |state, logins| {
+                        accounts::note_served_login(logins, label, ReviewPool::NOW - 20);
+                        Ok(accounts::note_auth(
+                            state,
+                            label,
+                            Auth::Ok,
+                            ReviewPool::NOW - 20,
+                        ))
+                    })
+                    .unwrap();
+                let observed_store = store.clone();
+                let replacement = pool.b.home.join("replacement");
+                let runner = FakeRunner::with(move |_| {
+                    observed_store
+                        .transact_logins(ReviewPool::NOW, &mut None, |state, logins| {
+                            let mut events = Vec::new();
+                            if change == 1 {
+                                std::fs::create_dir_all(&replacement).unwrap();
+                                std::fs::write(replacement.join(".credentials.json"), "{}")
+                                    .unwrap();
+                                events.extend(accounts::note_renewed(
+                                    state,
+                                    logins,
+                                    label,
+                                    None,
+                                    replacement.to_str().unwrap(),
+                                    None,
+                                    ReviewPool::NOW - 1,
+                                ));
+                            }
+                            if change == 2 {
+                                events.extend(accounts::note_auth(
+                                    state,
+                                    label,
+                                    Auth::SignedOut,
+                                    ReviewPool::NOW - 1,
+                                ));
+                                events.extend(accounts::note_signed_back(
+                                    state,
+                                    logins,
+                                    label,
+                                    ReviewPool::NOW - 1,
+                                ));
+                            } else if outcome == 0 {
+                                events.extend(accounts::note_auth(
+                                    state,
+                                    label,
+                                    Auth::SignedOut,
+                                    ReviewPool::NOW - 1,
+                                ));
+                            }
+                            Ok(events)
+                        })
+                        .unwrap();
+                    match outcome {
+                        0 => Ok(ran(0, "no findings", "")),
+                        1 => Ok(ran(
+                            1,
+                            "",
+                            "Failed to authenticate. API Error: 401 OAuth session expired",
+                        )),
+                        _ => Ok(ran(1, "", "You've hit your limit")),
+                    }
+                });
+                let (answer, calls) = pool.review_using(&runner);
+                assert_eq!(calls.len(), 1, "{label}/{outcome}/{change}: {answer:?}");
+                assert_eq!(
+                    answer.verdict,
+                    [Verdict::Served, Verdict::Auth, Verdict::Limit][outcome]
+                );
+                let state = store.load(ReviewPool::NOW).unwrap().0;
+                let logins = store.load_logins(ReviewPool::NOW).unwrap().0;
+                let account = &state.accounts[label];
+                let expected_auth = match (outcome, change) {
+                    (0, 1) | (1, 0) => Auth::SignedOut,
+                    _ => Auth::Ok,
+                };
+                assert_eq!(account.auth, expected_auth, "{label}/{outcome}/{change}");
+                assert_eq!(
+                    account.walls.contains_key("five_hour"),
+                    outcome == 2 && change == 0
+                );
+                assert_eq!(
+                    logins.sign_in_receipts.contains_key(label),
+                    change == 2 || (outcome == 0 && change == 0)
+                );
+                assert_eq!(
+                    Store::at(&pool.b.state).load().unwrap().of("claude"),
+                    Record::default()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_claude_review_cannot_heal_a_different_default_identity() {
+    use crate::harness::accounts::{self, Auth, Cli};
+    let pool = ReviewPool::new(Cli::Claude, None);
+    pool.pin("main");
+    let account_store = pool.store();
+    let profile = pool.b.home.join(".claude.json");
+    let runner = FakeRunner::with(move |_| {
+        account_store
+            .transact(ReviewPool::NOW, &mut None, |state| {
+                Ok(accounts::note_auth(
+                    state,
+                    "main",
+                    Auth::SignedOut,
+                    ReviewPool::NOW - 1,
+                ))
+            })
+            .unwrap();
+        std::fs::write(
+            &profile,
+            r#"{"oauthAccount":{"emailAddress":"different@example.com"}}"#,
+        )
+        .unwrap();
+        Ok(ran(0, "no findings", ""))
+    });
+    let (answer, calls) = pool.review_using(&runner);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(answer.verdict, Verdict::Served);
+    assert_eq!(
+        pool.store().load(ReviewPool::NOW).unwrap().0.accounts["main"].auth,
+        Auth::SignedOut
+    );
+    assert_eq!(
+        Store::at(&pool.b.state).load().unwrap().of("claude"),
+        Record::default()
+    );
+}
+
+#[test]
+fn a_review_that_heals_an_unbound_login_retains_its_served_time() {
+    use crate::harness::accounts::{self, Auth, Cli};
+    for (label, plain) in [
+        ("main", false),
+        ("work", false),
+        ("main", true),
+        ("work", true),
+    ] {
+        let pool = ReviewPool::new(Cli::Claude, None);
+        if plain {
+            let path = pool.config.join("accounts.toml");
+            let mut roster = accounts::Roster::load(&path).unwrap();
+            for row in &mut roster.rows {
+                row.email = None;
+            }
+            std::fs::write(
+                path,
+                accounts::append_rows_for(Cli::Claude, "", &roster.rows).unwrap(),
+            )
+            .unwrap();
+        }
+        pool.pin(label);
+        assert!(
+            pool.store()
+                .load_logins(ReviewPool::NOW)
+                .unwrap()
+                .0
+                .get(label)
+                .is_none()
+        );
+        let account_store = pool.store();
+        let runner = FakeRunner::with(move |_| {
+            account_store
+                .transact(ReviewPool::NOW, &mut None, |state| {
+                    Ok(accounts::note_auth(
+                        state,
+                        label,
+                        Auth::SignedOut,
+                        ReviewPool::NOW - 1,
+                    ))
+                })
+                .unwrap();
+            Ok(ran(0, "no findings", ""))
+        });
+        let (answer, calls) = pool.review_using(&runner);
+        assert_eq!(calls.len(), 1, "{answer:?}");
+        assert_eq!(answer.verdict, Verdict::Served);
+        let records = pool
+            .store()
+            .read_account_records(Some(&pool.config.join("accounts.toml")), ReviewPool::NOW)
+            .unwrap();
+        assert_eq!(records.state.accounts[label].auth, Auth::Ok);
+        assert_eq!(
+            records.logins.get(label).unwrap().served_at,
+            Some(ReviewPool::NOW)
+        );
+        assert!(records.logins.sign_in_receipts.contains_key(label));
+        assert_eq!(
+            crate::ai::state::assess(&pool.facts(), true, ReviewPool::NOW).state,
+            State::Ok
+        );
+        assert_eq!(
+            Store::at(&pool.b.state).load().unwrap().of("claude"),
+            Record::default()
+        );
+    }
+}
+
+#[test]
+fn a_later_review_wave_uses_current_selection_and_refuses_unusable_accounts() {
+    use crate::harness::accounts::{self, Auth, Cli};
+    for refuse in [false, true] {
+        let codex = ReviewPool::new(Cli::Codex, Some(true));
+        let claude = ReviewPool::new(Cli::Claude, None);
+        claude.pin("main");
+        let facts = vec![codex.facts(), claude.facts()];
+        let rows: Vec<_> = facts
+            .iter()
+            .map(|f| crate::ai::state::assess(f, true, ReviewPool::NOW))
+            .collect();
+        let cands = candidates(
+            &[&CODEX, &CLAUDE],
+            Some(&["codex", "claude"]),
+            "muse",
+            &rows,
+            ReviewPool::NOW,
+        );
+        let account_store = claude.store();
+        let runner = FakeRunner::with(move |call| {
+            if call.program == "codex" {
+                if refuse {
+                    account_store
+                        .transact(ReviewPool::NOW, &mut None, |state| {
+                            let mut events = accounts::note_auth(
+                                state,
+                                "main",
+                                Auth::SignedOut,
+                                ReviewPool::NOW,
+                            );
+                            events.extend(accounts::note_auth(
+                                state,
+                                "work",
+                                Auth::SignedOut,
+                                ReviewPool::NOW,
+                            ));
+                            Ok(events)
+                        })
+                        .unwrap();
+                } else {
+                    account_store
+                        .transact(ReviewPool::NOW, &mut None, |state| {
+                            state.active = Some("work".into());
+                            state.pinned = true;
+                            Ok(Vec::new())
+                        })
+                        .unwrap();
+                }
+                Ok(ran(1, "", "ERROR: You've hit your usage limit"))
+            } else {
+                assert!(!refuse, "a refused wave must never launch");
+                Ok(ran(0, "no findings", ""))
+            }
+        });
+        let home = claude.b.home.display().to_string();
+        let vars = vec![("HOME".into(), home.clone())];
+        let var = |key: &str| (key == "HOME").then(|| home.clone());
+        let store = Store::at(&claude.b.state);
+        let host = Host {
+            config: None,
+            runner: &runner,
+            var: &var,
+            vars: &vars,
+            store: &store,
+            now: &|| ReviewPool::NOW,
+        };
+        let answers = run_review(
+            &host,
+            &cands,
+            &facts,
+            &Ask {
+                change: &change(),
+                asker: "muse",
+                words: None,
+                count: 1,
+                budget: Duration::from_secs(5),
+                level: Level::Yolo,
+            },
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(answers.len(), 2, "{answers:?}");
+        assert_eq!(calls.len(), if refuse { 1 } else { 2 }, "{answers:?}");
+        assert_eq!(
+            answers[1].verdict,
+            if refuse {
+                Verdict::Failed
+            } else {
+                Verdict::Served
+            }
+        );
+        if !refuse {
+            assert!(calls[1].env.contains(&(
+                "CLAUDE_SECURESTORAGE_CONFIG_DIR".into(),
+                claude.work().display().to_string()
+            )));
+            let logins = claude.store().load_logins(ReviewPool::NOW).unwrap().0;
+            assert_eq!(logins.get("work").unwrap().served_at, Some(ReviewPool::NOW));
+            assert!(
+                logins
+                    .get("main")
+                    .is_none_or(|binding| binding.served_at.is_none())
+            );
+        }
+    }
+}
+
+#[test]
+fn a_roster_created_between_review_waves_controls_the_later_login() {
+    use crate::harness::accounts::Cli;
+    let first = ReviewPool::new(Cli::Claude, None);
+    let later = std::sync::Arc::new(ReviewPool::with_scope(Cli::Codex, Some(true), false));
+    let facts = vec![first.facts(), later.facts()];
+    assert!(facts[1].pool.is_none(), "an absent roster is not a UI pool");
+    let rows: Vec<_> = facts
+        .iter()
+        .map(|fact| crate::ai::state::assess(fact, true, ReviewPool::NOW))
+        .collect();
+    let cands = candidates(
+        &[&CLAUDE, &CODEX],
+        Some(&["claude", "codex"]),
+        "muse",
+        &rows,
+        ReviewPool::NOW,
+    );
+    let changed = std::sync::Arc::clone(&later);
+    let runner = FakeRunner::with(move |call| {
+        if call.program == "claude" {
+            changed.roster(None);
+            changed.pin("work");
+            Ok(ran(1, "", "You've hit your limit"))
+        } else {
+            assert_eq!(call.program, "codex");
+            if let Some(out) = call
+                .args
+                .windows(2)
+                .find_map(|words| (words[0] == "-o").then_some(&words[1]))
+            {
+                std::fs::write(out, "no findings").unwrap();
+            }
+            Ok(ran(0, "no findings", ""))
+        }
+    });
+    let home = later.b.home.display().to_string();
+    let vars = vec![("HOME".into(), home.clone())];
+    let var = |key: &str| (key == "HOME").then(|| home.clone());
+    let store = Store::at(&later.b.state);
+    let host = Host {
+        config: None,
+        runner: &runner,
+        var: &var,
+        vars: &vars,
+        store: &store,
+        now: &|| ReviewPool::NOW,
+    };
+    let answers = run_review(
+        &host,
+        &cands,
+        &facts,
+        &Ask {
+            change: &change(),
+            asker: "muse",
+            words: None,
+            count: 1,
+            budget: Duration::from_secs(5),
+            level: Level::Yolo,
+        },
+    );
+    let calls = runner.calls();
+    assert_eq!(calls.len(), 2, "{answers:?}");
+    assert_eq!(answers[1].verdict, Verdict::Served, "{answers:?}");
+    assert!(calls[1].env.contains(&(
+        "CODEX_AUTH_PATH".into(),
+        later.work().join("auth.json").display().to_string()
+    )));
+    let logins = later.store().load_logins(ReviewPool::NOW).unwrap().0;
+    assert_eq!(logins.get("work").unwrap().served_at, Some(ReviewPool::NOW));
+    assert!(logins.get("main").is_none());
+    assert_eq!(
+        store.load().unwrap().of_scope("codex", Some("file")),
+        Record::default()
+    );
+}
+
+#[test]
+fn a_roster_created_during_an_unmanaged_review_rejects_its_old_health_result() {
+    use crate::harness::accounts::{Auth, Cli};
+    let pool = std::sync::Arc::new(ReviewPool::with_scope(Cli::Codex, Some(true), false));
+    let changed = std::sync::Arc::clone(&pool);
+    let runner = FakeRunner::with(move |_| {
+        changed.roster(None);
+        changed.pin("work");
+        Ok(ran(1, "", "ERROR: unexpected status 401 Unauthorized"))
+    });
+    let (answer, calls) = pool.review_using(&runner);
+    assert_eq!(answer.verdict, Verdict::Auth);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        Store::at(&pool.b.state)
+            .load()
+            .unwrap()
+            .of_scope("codex", Some("file")),
+        Record::default(),
+        "the old unmanaged result cannot mark the new account scope signed out"
+    );
+    assert!(
+        pool.store()
+            .load(ReviewPool::NOW)
+            .unwrap()
+            .0
+            .accounts
+            .get("work")
+            .is_none_or(|account| account.auth != Auth::SignedOut)
+    );
+}
+
+fn prepare_from(pool: &ReviewPool, original: &Facts) -> PreparedReview {
+    let home = pool.b.home.display().to_string();
+    let var = |key: &str| (key == "HOME").then(|| home.clone());
+    let runner = FakeRunner::quiet();
+    let store = Store::at(&pool.b.state);
+    prepare_review(
+        &Host {
+            config: None,
+            runner: &runner,
+            var: &var,
+            vars: &[],
+            store: &store,
+            now: &|| ReviewPool::NOW,
+        },
+        original,
+    )
+}
+
+fn codex_storage(pool: &ReviewPool, mode: &str) {
+    std::fs::write(
+        pool.b.home.join(".codex/config.toml"),
+        format!("cli_auth_credentials_store = {mode:?}\n"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn completed_codex_health_does_not_cross_credential_backends() {
+    use crate::harness::accounts::Cli;
+    for limited in [false, true] {
+        for observed in ["file", "keyring", "auto", "ephemeral"] {
+            for current in ["file", "keyring", "auto", "ephemeral"] {
+                let pool = ReviewPool::with_scope(Cli::Codex, Some(true), false);
+                codex_storage(&pool, observed);
+                let runner = FakeRunner::with(move |_| {
+                    Ok(if limited {
+                        ran(1, "", "ERROR: You've hit your usage limit")
+                    } else {
+                        ran(1, "", "ERROR: unexpected status 401 Unauthorized")
+                    })
+                });
+                let (answer, calls) = pool.review_using(&runner);
+                assert_eq!(calls.len(), 1);
+                assert_eq!(
+                    answer.verdict,
+                    if limited {
+                        Verdict::Limit
+                    } else {
+                        Verdict::Auth
+                    }
+                );
+                codex_storage(&pool, current);
+                let row = crate::ai::state::assess(&pool.facts(), true, ReviewPool::NOW);
+                assert_eq!(
+                    row.state.usable(),
+                    observed != current,
+                    "limited={limited}, {observed} -> {current}: {row:?}"
+                );
+                // Switching back must recover the original observation, not erase it.
+                codex_storage(&pool, observed);
+                let original = crate::ai::state::assess(&pool.facts(), true, ReviewPool::NOW);
+                assert!(!original.state.usable());
+            }
+        }
+    }
+}
+
+#[test]
+fn legacy_health_is_retained_without_guessing_a_codex_backend() {
+    use crate::harness::accounts::Cli;
+    let pool = ReviewPool::with_scope(Cli::Codex, Some(true), false);
+    let store = Store::at(&pool.b.state);
+    store
+        .note(
+            "codex",
+            How::Review,
+            Outcome::Ended(Ended::ReviewAuth),
+            ReviewPool::NOW,
+        )
+        .unwrap();
+    let legacy = store.load().unwrap().of("codex");
+    for backend in ["file", "keyring", "auto", "ephemeral"] {
+        codex_storage(&pool, backend);
+        let facts = pool.facts();
+        assert_eq!(facts.record, Record::default());
+        assert_eq!(facts.record_scope, Some(backend));
+        assert!(
+            crate::ai::state::assess(&facts, true, ReviewPool::NOW)
+                .state
+                .usable()
+        );
+        assert_eq!(store.load().unwrap().of("codex"), legacy);
+    }
+}
+
+#[test]
+fn an_unreadable_preparation_cannot_publish_into_a_restored_health_store() {
+    use crate::harness::accounts::Cli;
+    for raw in ["not JSON", r#"{"schema":3,"clis":{}}"#] {
+        let pool = ReviewPool::with_scope(Cli::Codex, Some(true), false);
+        codex_storage(&pool, "keyring");
+        let store = Store::at(&pool.b.state);
+        store.ensure().unwrap();
+        let path = store.dir().join(crate::ai::store::RECORD_FILE);
+        std::fs::write(&path, raw).unwrap();
+        let prepared = prepare_from(&pool, &pool.facts());
+        assert!(!prepared.health_readable);
+        let runner = FakeRunner::with(move |_| {
+            std::fs::write(&path, r#"{"schema":2,"clis":{},"scopes":{}}"#).unwrap();
+            Ok(ran(1, "", "ERROR: unexpected status 401 Unauthorized"))
+        });
+        let (answer, calls) = pool.review_using(&runner);
+        assert_eq!(answer.verdict, Verdict::Auth);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(store.load().unwrap(), crate::ai::store::Records::default());
+    }
+}
+
+#[test]
+fn review_preparation_refreshes_codex_storage_mode() {
+    use crate::harness::accounts::Cli;
+    for initial in ["file", "keyring", "auto", "ephemeral"] {
+        for current in ["file", "keyring", "auto", "ephemeral"] {
+            let pool = ReviewPool::new(Cli::Codex, Some(true));
+            pool.pin("work");
+            codex_storage(&pool, initial);
+            let original = pool.facts();
+            codex_storage(&pool, current);
+            let prepared = prepare_from(&pool, &original);
+            assert!(prepared.refused.is_none(), "{initial} -> {current}");
+            assert_eq!(prepared.fact.hidden_store, current != "file");
+            let isolated = prepared.env.iter().any(|(key, value)| {
+                key == "CODEX_AUTH_PATH"
+                    && value == &pool.work().join("auth.json").display().to_string()
+            });
+            assert_eq!(isolated, current == "file", "{initial} -> {current}");
+            assert_eq!(prepared.fact.default_record().is_some(), current != "file");
+            assert_eq!(prepared.observation.is_some(), current == "file");
+        }
+    }
+}
+
+#[test]
+fn review_outcomes_do_not_cross_codex_storage_changes() {
+    use crate::harness::accounts::Cli;
+    for initial in ["file", "keyring", "auto", "ephemeral"] {
+        for current in ["file", "keyring", "auto", "ephemeral"] {
+            if initial == current {
+                continue;
+            }
+            let pool = std::sync::Arc::new(ReviewPool::new(Cli::Codex, Some(true)));
+            pool.pin("work");
+            codex_storage(&pool, initial);
+            let account_store = pool.store();
+            let before = std::fs::read(account_store.logins_file()).ok();
+            let changed = std::sync::Arc::clone(&pool);
+            let runner = FakeRunner::with(move |_| {
+                codex_storage(&changed, current);
+                Ok(ran(1, "", "ERROR: unexpected status 401 Unauthorized"))
+            });
+            let (answer, calls) = pool.review_using(&runner);
+            assert_eq!(calls.len(), 1, "{initial} -> {current}: {answer:?}");
+            assert_eq!(answer.verdict, Verdict::Auth);
+            assert_eq!(
+                std::fs::read(account_store.logins_file()).ok(),
+                before,
+                "{initial} -> {current}"
+            );
+            assert_eq!(
+                Store::at(&pool.b.state)
+                    .load()
+                    .unwrap()
+                    .of_scope("codex", Some("file")),
+                Record::default(),
+                "{initial} -> {current}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_codex_storage_change_after_preparation_refuses_the_child() {
+    use crate::harness::accounts::Cli;
+    for initial in ["file", "keyring"] {
+        let pool = ReviewPool::new(Cli::Codex, Some(true));
+        pool.pin("work");
+        codex_storage(&pool, initial);
+        let prepared = prepare_from(&pool, &pool.facts());
+        codex_storage(&pool, if initial == "file" { "keyring" } else { "file" });
+        let runner = FakeRunner::quiet();
+        let store = Store::at(&pool.b.state);
+        let (answer, outcome) = run_prepared(
+            &Host {
+                config: None,
+                runner: &runner,
+                var: &|_| None,
+                vars: &[],
+                store: &store,
+                now: &|| ReviewPool::NOW,
+            },
+            &prepared,
+            &Ask {
+                change: &change(),
+                asker: "claude",
+                words: None,
+                count: 1,
+                budget: Duration::from_secs(5),
+                level: Level::Yolo,
+            },
+        );
+        assert_eq!(answer.verdict, Verdict::Failed);
+        assert!(outcome.is_none());
+        assert!(runner.calls().is_empty(), "{initial}: {answer:?}");
+    }
+}
+
+fn review_storage_case(initial: i64, selected: i64, current: i64) -> [bool; 5] {
+    use crate::harness::accounts::{Auth, Cli};
+    let modes = ["file", "keyring", "auto", "ephemeral"];
+    let mode = |index: i64| modes[usize::try_from(index).unwrap()];
+    let pool = std::sync::Arc::new(ReviewPool::new(Cli::Codex, Some(true)));
+    pool.pin("work");
+    codex_storage(&pool, mode(initial));
+    let original = pool.facts();
+    codex_storage(&pool, mode(selected));
+    let prepared = prepare_from(&pool, &original);
+    assert!(prepared.refused.is_none());
+    let hidden = prepared.fact.hidden_store;
+    let file_evidence = prepared.fact.login_file.is_some();
+    let isolated = prepared.env.iter().any(|(key, value)| {
+        key == "CODEX_AUTH_PATH" && value == &pool.work().join("auth.json").display().to_string()
+    });
+    codex_storage(&pool, mode(current));
+    let runner = FakeRunner::quiet();
+    let store = Store::at(&pool.b.state);
+    let _ = run_prepared(
+        &Host {
+            config: None,
+            runner: &runner,
+            var: &|_| None,
+            vars: &[],
+            store: &store,
+            now: &|| ReviewPool::NOW,
+        },
+        &prepared,
+        &Ask {
+            change: &change(),
+            asker: "claude",
+            words: None,
+            count: 1,
+            budget: Duration::from_secs(5),
+            level: Level::Yolo,
+        },
+    );
+    let launches = !runner.calls().is_empty();
+
+    // Exercise completion separately: the change happens inside the child,
+    // after it has demonstrably passed the launch fence.
+    codex_storage(&pool, mode(selected));
+    let changed = std::sync::Arc::clone(&pool);
+    let mode_after = mode(current);
+    let runner = FakeRunner::with(move |_| {
+        codex_storage(&changed, mode_after);
+        Ok(ran(1, "", "ERROR: unexpected status 401 Unauthorized"))
+    });
+    let rows = [crate::ai::state::assess(&original, true, ReviewPool::NOW)];
+    let cands = candidates(
+        &[&CODEX],
+        Some(&["codex"]),
+        "claude",
+        &rows,
+        ReviewPool::NOW,
+    );
+    let home = pool.b.home.display().to_string();
+    let var = |key: &str| (key == "HOME").then(|| home.clone());
+    let answers = run_review(
+        &Host {
+            config: None,
+            runner: &runner,
+            var: &var,
+            vars: &[("HOME".into(), home.clone())],
+            store: &store,
+            now: &|| ReviewPool::NOW,
+        },
+        &cands,
+        &[original],
+        &Ask {
+            change: &change(),
+            asker: "claude",
+            words: None,
+            count: 1,
+            budget: Duration::from_secs(5),
+            level: Level::Yolo,
+        },
+    );
+    let calls = runner.calls();
+    assert_eq!(
+        calls.len(),
+        1,
+        "{initial}, {selected}, {current}: {answers:?}"
+    );
+    let account_recorded = pool
+        .store()
+        .load(ReviewPool::NOW)
+        .unwrap()
+        .0
+        .accounts
+        .get("work")
+        .is_some_and(|account| account.auth == Auth::SignedOut);
+    let default_recorded = store
+        .load()
+        .unwrap()
+        .of_scope("codex", Some(mode(selected)))
+        != Record::default();
+    let records = account_recorded || default_recorded;
+    if records {
+        assert_eq!(
+            account_recorded,
+            selected == 0,
+            "only the file account owns file health"
+        );
+        assert_eq!(
+            default_recorded,
+            selected != 0,
+            "only the default login owns hidden-backend health"
+        );
+    }
+    [hidden, isolated, launches, records, file_evidence]
+}
+
+pub(crate) fn review_storage_transition(
+    state: &aterm_spec::interp::State,
+    action: &str,
+) -> aterm_spec::interp::State {
+    let mut next = state.clone();
+    match action {
+        "Initial" => {
+            next.insert("initial", state["initial"] + 1);
+        }
+        "Select" => {
+            next.insert("selected", state["selected"] + 1);
+        }
+        "Current" => {
+            next.insert("current", state["current"] + 1);
+        }
+        "Check" => {
+            next.insert("phase", 1);
+            for (field, value) in ["hidden", "isolated", "launches", "records", "file_evidence"]
+                .into_iter()
+                .zip(review_storage_case(
+                    state["initial"],
+                    state["selected"],
+                    state["current"],
+                ))
+            {
+                next.insert(field, i64::from(value));
+            }
+        }
+        _ => unreachable!(),
+    }
+    next
+}
+
+#[test]
+fn review_storage_conforms_to_current_backend() {
+    let model = aterm_models_harness::account_review_storage_model();
+    assert_eq!(aterm_spec::interp::prove_and_catch(&model), 128);
+    for state in aterm_spec::interp::reachable_states(&model) {
+        for action in &model.actions {
+            if model.action_enabled(action.name, &state) {
+                let next = review_storage_transition(&state, action.name);
+                assert!(
+                    model.successors(action.name, &state).contains(&next),
+                    "{}: {state:?} -> {next:?}",
+                    action.name
+                );
+            }
+        }
+    }
+    for (field, law) in [
+        ("hidden", "CurrentBackend"),
+        ("isolated", "CurrentSeam"),
+        ("launches", "LaunchFence"),
+        ("records", "OutcomeFence"),
+    ] {
+        let mut bad = review_storage_transition(&model.init_state(), "Check");
+        bad.insert(field, 1 - bad[field]);
+        assert!(!model.check_invariant(law, &bad));
+    }
+    let mut hidden = model.init_state();
+    hidden.insert("selected", 1);
+    let mut bad = review_storage_transition(&hidden, "Check");
+    bad.insert("file_evidence", 1);
+    assert!(!model.check_invariant("FileEvidence", &bad));
+}
+
+#[test]
+fn invalid_codex_storage_configuration_refuses_reviews_and_health() {
+    use crate::harness::accounts::Cli;
+    for invalid in [
+        "not toml",
+        "cli_auth_credentials_store = 1",
+        "cli_auth_credentials_store = \"unknown\"",
+    ] {
+        let pool = std::sync::Arc::new(ReviewPool::new(Cli::Codex, Some(true)));
+        pool.pin("work");
+        let original = pool.facts();
+        let config = pool.b.home.join(".codex/config.toml");
+        std::fs::write(&config, invalid).unwrap();
+        assert!(prepare_from(&pool, &original).refused.is_some());
+        codex_storage(&pool, "file");
+        let config_during_run = config.clone();
+        let runner = FakeRunner::with(move |_| {
+            std::fs::write(&config_during_run, invalid).unwrap();
+            Ok(ran(1, "", "ERROR: unexpected status 401 Unauthorized"))
+        });
+        let (answer, calls) = pool.review_using(&runner);
+        assert_eq!(answer.verdict, Verdict::Auth);
+        assert_eq!(calls.len(), 1);
+        assert!(
+            !pool
+                .store()
+                .load(ReviewPool::NOW)
+                .unwrap()
+                .0
+                .accounts
+                .contains_key("work")
+        );
+        assert_eq!(
+            Store::at(&pool.b.state)
+                .load()
+                .unwrap()
+                .of_scope("codex", Some("file")),
+            Record::default()
+        );
+    }
+}
+
+#[test]
+fn explicit_codex_homes_use_their_own_backend_fence() {
+    use crate::harness::accounts::Cli;
+    for invalid in ["not TOML", "cli_auth_credentials_store = 'future'"] {
+        let pool = ReviewPool::with_scope(Cli::Codex, Some(true), false);
+        let explicit = pool.b.dir.path().join("explicit-codex");
+        std::fs::create_dir_all(&explicit).unwrap();
+        let config = explicit.join("config.toml");
+        let custom = explicit.display().to_string();
+        let var = |key: &str| (key == "CODEX_HOME").then(|| custom.clone());
+        let store = Store::at(&pool.b.state);
+        let runner = FakeRunner::quiet();
+        let host = Host {
+            config: None,
+            runner: &runner,
+            var: &var,
+            vars: &[],
+            store: &store,
+            now: &|| ReviewPool::NOW,
+        };
+        let facts = pool.facts();
+        let ask = Ask {
+            change: &change(),
+            asker: "claude",
+            words: None,
+            count: 1,
+            budget: Duration::from_secs(5),
+            level: Level::Yolo,
+        };
+        std::fs::write(&config, invalid).unwrap();
+        let refused = prepare_review(&host, &facts);
+        assert!(refused.refused.is_some());
+        assert_eq!(refused.fact.home.as_ref().unwrap(), &explicit);
+        let _ = run_prepared(&host, &refused, &ask);
+        assert!(runner.calls().is_empty());
+        std::fs::write(&config, "cli_auth_credentials_store = 'file'").unwrap();
+        let prepared = prepare_review(&host, &facts);
+        assert!(prepared.refused.is_none());
+        assert_eq!(prepared.fact.home.as_ref().unwrap(), &explicit);
+        std::fs::write(&config, invalid).unwrap();
+        let (answer, outcome) = run_prepared(&host, &prepared, &ask);
+        assert_eq!(answer.verdict, Verdict::Failed);
+        assert!(outcome.is_none());
+        assert!(runner.calls().is_empty());
+        assert_eq!(store.load().unwrap(), crate::ai::store::Records::default());
+    }
+}
+
+#[test]
+fn a_review_checks_the_same_explicit_home_it_passes_to_the_child() {
+    use crate::harness::accounts::Cli;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let pool = ReviewPool::with_scope(Cli::Codex, Some(true), false);
+    let good = pool.b.dir.path().join("good-home");
+    let bad = pool.b.dir.path().join("bad-home");
+    std::fs::create_dir_all(&good).unwrap();
+    std::fs::create_dir_all(&bad).unwrap();
+    std::fs::write(
+        good.join("config.toml"),
+        "cli_auth_credentials_store = 'file'",
+    )
+    .unwrap();
+    std::fs::write(bad.join("config.toml"), "not TOML").unwrap();
+    for first_good in [false, true] {
+        let reads = AtomicUsize::new(0);
+        let first = if first_good { &good } else { &bad };
+        let second = if first_good { &bad } else { &good };
+        let var = |key: &str| {
+            (key == "CODEX_HOME").then(|| {
+                if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                    first
+                } else {
+                    second
+                }
+                .display()
+                .to_string()
+            })
+        };
+        let store = Store::at(&pool.b.state);
+        let runner = FakeRunner::quiet();
+        let prepared = prepare_review(
+            &Host {
+                config: None,
+                runner: &runner,
+                var: &var,
+                vars: &[],
+                store: &store,
+                now: &|| ReviewPool::NOW,
+            },
+            &pool.facts(),
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        assert_eq!(prepared.fact.home.as_ref().unwrap(), first);
+        assert_eq!(prepared.refused.is_none(), first_good);
+        assert!(
+            prepared
+                .env
+                .contains(&("CODEX_HOME".into(), first.display().to_string()))
+        );
+    }
+}
+
+#[test]
+fn removing_a_review_home_override_requires_fresh_default_account_context() {
+    use crate::harness::accounts::Cli;
+    let pool = ReviewPool::new(Cli::Codex, Some(true));
+    pool.pin("work");
+    let mut original = pool.facts();
+    original.home_var = Some("/old-explicit-home".into());
+    original.home = Ok("/old-explicit-home".into());
+    original.pool = None;
+    original.review_source = None;
+    let fresh = pool.b.home.display().to_string();
+    let var = |key: &str| (key == "HOME").then(|| fresh.clone());
+    let store = Store::at(&pool.b.state);
+    let runner = FakeRunner::quiet();
+    let prepared = prepare_review(
+        &Host {
+            config: None,
+            runner: &runner,
+            var: &var,
+            vars: &[("HOME".into(), "/stale-home".into())],
+            store: &store,
+            now: &|| ReviewPool::NOW,
+        },
+        &original,
+    );
+    assert!(prepared.refused.is_some());
+    assert!(prepared.observation.is_none());
+    let _ = run_prepared(
+        &Host {
+            config: None,
+            runner: &runner,
+            var: &var,
+            vars: &[],
+            store: &store,
+            now: &|| ReviewPool::NOW,
+        },
+        &prepared,
+        &Ask {
+            change: &change(),
+            asker: "claude",
+            words: None,
+            count: 1,
+            budget: Duration::from_secs(5),
+            level: Level::Yolo,
+        },
+    );
+    assert!(runner.calls().is_empty());
+    assert_eq!(store.load().unwrap(), crate::ai::store::Records::default());
+}
+
+#[test]
+fn a_broken_roster_is_ignored_only_by_current_non_file_storage() {
+    use crate::harness::accounts::Cli;
+    for initial in ["file", "keyring"] {
+        for current in ["file", "keyring"] {
+            let pool = ReviewPool::new(Cli::Codex, Some(true));
+            std::fs::write(
+                pool.config.join(Cli::Codex.accounts().roster_file),
+                "broken toml",
+            )
+            .unwrap();
+            codex_storage(&pool, initial);
+            let original = pool.facts();
+            assert!(original.pool.as_ref().unwrap().refused.is_some());
+            codex_storage(&pool, current);
+            let prepared = prepare_from(&pool, &original);
+            assert_eq!(
+                prepared.refused.is_some(),
+                current == "file",
+                "{initial} -> {current}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_roster_discovered_by_the_cli_respects_the_configured_rotation_mode() {
+    use crate::harness::accounts::Cli;
+    for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
+        let pool = ReviewPool::with_scope(cli, (cli == Cli::Codex).then_some(true), false);
+        let config = pool.config.join("review-policy.toml");
+        std::fs::write(&config, "[harness]\naccounts = \"off\"\n").unwrap();
+        let env = crate::ai::cli::Env {
+            now: ReviewPool::NOW,
+            home: Some(pool.b.home.clone()),
+            vars: vec![("HOME".into(), pool.b.home.display().to_string())],
+            config: Some(config),
+            aterm_state: Some(pool.b.state.clone()),
+            harness_state: Some(pool.b.state.clone()),
+            pkg: Some(pool.b.pkg.clone()),
+            exclude: Vec::new(),
+            cwd: pool.b.dir.path().to_path_buf(),
+            stdin_tty: false,
+            exe: None,
+            asker: crate::ai::permission::Asker::Person,
+        };
+        let original = crate::ai::cli::look(&env)
+            .facts
+            .into_iter()
+            .find(|fact| fact.connector.id == cli.id())
+            .unwrap();
+        assert!(original.pool.is_none());
+        pool.roster(None);
+        pool.state(|state| {
+            state.active = Some("work".into());
+            state.pinned = false;
+        });
+        let prepared = prepare_from(&pool, &original);
+        assert!(prepared.refused.is_none(), "{:?}", prepared.refused);
+        assert_eq!(
+            prepared
+                .observation
+                .as_ref()
+                .unwrap()
+                .1
+                .row()
+                .unwrap()
+                .label,
+            "main",
+            "{cli:?}: rotation off keeps the default login after discovery"
+        );
+        let (key, _) = prepared.observation.as_ref().unwrap().1.login(cli);
+        assert!(
+            !prepared
+                .env
+                .iter()
+                .any(|(name, value)| name == key && !value.is_empty())
+        );
+    }
+}
+
+#[test]
+fn a_discovered_codex_roster_keeps_current_recovery_advice() {
+    use crate::harness::{accounts::Cli, codex_alab::DefaultRow};
+    for walled in [false, true] {
+        let pool = ReviewPool::with_scope(Cli::Codex, Some(true), false);
+        let mut original = pool.facts();
+        let review_program = pool.b.dir.path().join("stock-codex");
+        std::fs::write(&review_program, "a program with no isolated-auth contract").unwrap();
+        original.managed.as_mut().unwrap().path = review_program;
+        pool.roster(None);
+        pool.pin("work");
+        if walled {
+            pool.wall("main");
+        }
+        let prepared = prepare_from(&pool, &original);
+        assert!(prepared.refused.is_none(), "{:?}", prepared.refused);
+        let runner = FakeRunner::quiet();
+        let store = Store::at(&pool.b.state);
+        let home = pool.b.home.display().to_string();
+        let var = |key: &str| (key == "HOME").then(|| home.clone());
+        let (answer, outcome) = run_prepared(
+            &Host {
+                config: None,
+                runner: &runner,
+                var: &var,
+                vars: &[],
+                store: &store,
+                now: &|| ReviewPool::NOW,
+            },
+            &prepared,
+            &Ask {
+                change: &change(),
+                asker: "claude",
+                words: None,
+                count: 1,
+                budget: Duration::from_secs(5),
+                level: Level::Yolo,
+            },
+        );
+        assert_eq!(answer.verdict, Verdict::Failed);
+        assert!(outcome.is_none());
+        assert!(runner.calls().is_empty());
+        assert_eq!(
+            answer.fix.as_deref(),
+            (!walled).then_some("aterm harness accounts use main --cli codex")
+        );
+        let selected = prepared.fact.pool.as_ref().unwrap();
+        assert_eq!(selected.pinned.as_deref(), Some("work"));
+        assert!(
+            matches!(
+                selected.default_row.as_ref(),
+                Some(DefaultRow::Serves(label)) if !walled && label == "main"
+            ) || matches!(selected.default_row.as_ref(), Some(DefaultRow::Walled { label, .. }) if walled && label == "main")
+        );
+    }
+}
+
+#[test]
+fn an_absent_pooled_roster_has_a_review_source_without_account_history() {
+    use crate::harness::accounts::Cli;
+    for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
+        let pool = ReviewPool::with_scope(cli, (cli == Cli::Codex).then_some(true), false);
+        let account_store = pool.store();
+        let files = [account_store.state_file(), account_store.logins_file()];
+        assert!(files.iter().all(|path| !path.exists()));
+        let original = pool.facts();
+        assert!(original.pool.is_none());
+        assert!(original.review_source.is_some());
+        let prepared = prepare_from(&pool, &original);
+        assert!(
+            prepared.refused.is_none(),
+            "{cli:?}: {:?}",
+            prepared.refused
+        );
+        assert!(prepared.fact.pool.is_none());
+        assert!(prepared.fact.default_record().is_some());
+        assert!(prepared.observation.as_ref().unwrap().1.row().is_none());
+        assert!(files.iter().all(|path| !path.exists()));
+    }
+}
+
+#[test]
+fn a_directory_or_dangling_link_roster_cannot_launch_a_pooled_review() {
+    use crate::harness::accounts::Cli;
+    for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
+        for dangling in [false, true] {
+            #[cfg(not(unix))]
+            if dangling {
+                continue;
+            }
+            let pool = ReviewPool::with_scope(cli, (cli == Cli::Codex).then_some(true), false);
+            let path = pool.config.join(cli.accounts().roster_file);
+            if dangling {
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(pool.config.join("missing.toml"), &path).unwrap();
+            } else {
+                std::fs::create_dir(&path).unwrap();
+            }
+            let facts = pool.facts();
+            assert!(facts.pool.as_ref().unwrap().refused.is_some());
+            let prepared = prepare_from(&pool, &facts);
+            assert!(prepared.refused.is_some(), "{cli:?}, dangling={dangling}");
+            let (answer, runs) = pool.review();
+            assert_ne!(answer.verdict, Verdict::Served);
+            assert!(runs.is_empty(), "{cli:?}, dangling={dangling}");
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_linked_roster_created_after_gather_selects_its_witnessed_login() {
+    use crate::harness::accounts::Cli;
+    let pool = ReviewPool::with_scope(Cli::Codex, Some(true), false);
+    let original = pool.facts();
+    assert!(original.pool.is_none());
+    pool.roster(None);
+    pool.pin("work");
+    let path = pool.config.join(Cli::Codex.accounts().roster_file);
+    let target = pool.config.join("linked-accounts.toml");
+    std::fs::rename(&path, &target).unwrap();
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+    let prepared = prepare_from(&pool, &original);
+    assert!(prepared.refused.is_none(), "{:?}", prepared.refused);
+    assert!(prepared.env.contains(&(
+        "CODEX_AUTH_PATH".into(),
+        pool.work().join("auth.json").display().to_string()
+    )));
+    assert_eq!(
+        prepared
+            .observation
+            .as_ref()
+            .unwrap()
+            .1
+            .row()
+            .unwrap()
+            .label,
+        "work"
+    );
+    assert!(prepared.fact.default_record().is_none());
+}
+
+fn preparation_case_for(cli: crate::harness::accounts::Cli, scope: i64, changed: i64) -> [bool; 4] {
+    use crate::harness::accounts::{self, Auth, Cli};
+    let pool = ReviewPool::with_scope(cli, (cli == Cli::Codex).then_some(true), scope != 0);
+    if scope != 0 {
+        pool.pin(if scope == 2 { "work" } else { "main" });
+    }
+    let mut original = pool.facts();
+    if changed == 1 || changed == 2 {
+        pool.roster(None);
+        pool.pin("work");
+        if changed == 2 {
+            pool.state(|state| {
+                accounts::note_auth(state, "main", Auth::SignedOut, ReviewPool::NOW);
+                accounts::note_auth(state, "work", Auth::SignedOut, ReviewPool::NOW);
+            });
+        }
+    }
+    let account_store = pool.store();
+    if changed == 3 {
+        std::fs::create_dir_all(account_store.state_file().parent().unwrap()).unwrap();
+        std::fs::write(account_store.state_file(), "damaged account state").unwrap();
+        original = pool.facts();
+        if cli == Cli::Claude {
+            assert!(original.accounts.as_ref().unwrap().unread.is_some());
+        } else {
+            assert!(original.review_source.is_some());
+        }
+    }
+    if changed == 4 {
+        pool.roster(None);
+        pool.state(|state| {
+            state
+                .prepared_accounts
+                .extend(["main".into(), "work".into()]);
+        });
+    }
+    let images = || {
+        [account_store.state_file(), account_store.logins_file()]
+            .map(|path| std::fs::read(path).ok())
+    };
+    let before = images();
+    let store = Store::at(&pool.b.state);
+    let runner = FakeRunner::quiet();
+    let home = pool.b.home.display().to_string();
+    let var = |key: &str| (key == "HOME").then(|| home.clone());
+    let host = Host {
+        config: None,
+        runner: &runner,
+        var: &var,
+        vars: &[],
+        store: &store,
+        now: &|| ReviewPool::NOW,
+    };
+    let prepared = prepare_review(&host, &original);
+    if prepared.refused.is_some() {
+        let (answer, outcome) = run_prepared(
+            &host,
+            &prepared,
+            &Ask {
+                change: &change(),
+                asker: "codex",
+                words: None,
+                count: 1,
+                budget: Duration::from_secs(5),
+                level: Level::Yolo,
+            },
+        );
+        assert_eq!(answer.verdict, Verdict::Failed);
+        assert!(outcome.is_none());
+        assert!(runner.calls().is_empty());
+    }
+    let (managed, isolated) =
+        prepared
+            .observation
+            .as_ref()
+            .map_or((false, false), |(_, witness)| {
+                let (key, expected) = witness.login(cli);
+                let actual = prepared
+                    .env
+                    .iter()
+                    .find(|(name, _)| name == key)
+                    .map(|(_, value)| value)
+                    .filter(|value| !value.is_empty());
+                assert_eq!(actual, expected.as_ref(), "the child uses its witness");
+                let managed = prepared.fact.default_record().is_none();
+                assert_eq!(
+                    managed,
+                    witness.row().is_some(),
+                    "health follows its witness"
+                );
+                (managed, actual.is_some())
+            });
+    [
+        prepared.refused.is_none(),
+        managed,
+        isolated,
+        before == images(),
+    ]
+}
+
+fn preparation_case(scope: i64, changed: i64) -> [bool; 4] {
+    use crate::harness::accounts::Cli;
+    let observed = preparation_case_for(Cli::Claude, scope, changed);
+    for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
+        assert_eq!(
+            preparation_case_for(cli, scope, changed),
+            observed,
+            "{cli:?}, scope={scope}, change={changed}"
+        );
+    }
+    observed
+}
+
+pub(crate) fn review_preparation_transition(
+    state: &aterm_spec::interp::State,
+    action: &str,
+) -> aterm_spec::interp::State {
+    let mut next = state.clone();
+    match action {
+        "Scope" => {
+            next.insert("scope", state["scope"] + 1);
+        }
+        "Change" => {
+            next.insert("change", state["change"] + 1);
+        }
+        "Prepare" => {
+            next.insert("phase", 1);
+            for (field, value) in ["ready", "managed", "isolated", "preserved"]
+                .into_iter()
+                .zip(preparation_case(state["scope"], state["change"]))
+            {
+                next.insert(field, i64::from(value));
+            }
+        }
+        _ => unreachable!(),
+    }
+    next
+}
+
+#[test]
+fn review_preparation_conforms_to_current_account_scope() {
+    let model = aterm_models_harness::account_review_preparation_model();
+    assert_eq!(aterm_spec::interp::prove_and_catch(&model), 30);
+    for state in aterm_spec::interp::reachable_states(&model) {
+        for action in &model.actions {
+            if model.action_enabled(action.name, &state) {
+                let next = review_preparation_transition(&state, action.name);
+                assert!(
+                    model.successors(action.name, &state).contains(&next),
+                    "{}: {state:?} -> {next:?}",
+                    action.name
+                );
+            }
+        }
+    }
+    for (changed, field, law) in [
+        (0, "ready", "ReadyRuns"),
+        (2, "ready", "RefusalStops"),
+        (0, "managed", "ImplicitStaysUnmanaged"),
+        (1, "isolated", "CurrentSeam"),
+        (0, "preserved", "ReadPreservesHistory"),
+        (4, "ready", "PreparationHeld"),
+    ] {
+        let mut initial = model.init_state();
+        initial.insert("change", changed);
+        let mut bad = review_preparation_transition(&initial, "Prepare");
+        bad.insert(field, 1 - bad[field]);
+        assert!(!model.check_invariant(law, &bad));
+    }
+}
+
+#[test]
+fn a_prepared_credential_needs_execution_authority_before_review_or_launch() {
+    use crate::harness::accounts::Cli;
+    for (cli, reads) in [
+        (Cli::Claude, None),
+        (Cli::Kimi, None),
+        (Cli::Grok, None),
+        (Cli::Codex, Some(true)),
+        (Cli::Codex, Some(false)),
+    ] {
+        for off in [false, true] {
+            let pool = ReviewPool::new(cli, reads);
+            pool.main_alone();
+            if off {
+                std::fs::write(
+                    pool.config.join("aterm.toml"),
+                    "[harness]\naccounts = \"off\"\n",
+                )
+                .unwrap();
+            }
+            let (answer, calls) = pool.review();
+            assert_eq!(calls.len(), 1, "positive control {cli:?}/{off}: {answer:?}");
+            pool.state(|state| {
+                state.prepared_accounts.insert("main".into());
+            });
+            let before = std::fs::read(pool.store().state_file()).unwrap();
+            let (answer, calls) = pool.review();
+            assert!(calls.is_empty(), "held {cli:?}/{off}: {answer:?}");
+            assert_ne!(answer.verdict, Verdict::Served);
+            assert_eq!(std::fs::read(pool.store().state_file()).unwrap(), before);
+            if cli != Cli::Claude {
+                assert!(pool.launch().is_err(), "held launch {cli:?}/{off}");
+            }
+            pool.state(|state| {
+                state.prepared_accounts.remove("main");
+            });
+            let (answer, calls) = pool.review();
+            assert_eq!(calls.len(), 1, "released {cli:?}/{off}: {answer:?}");
+        }
+    }
+}
+
+#[test]
+fn a_claude_review_skips_a_prepared_credential_for_an_authorized_one() {
+    use crate::harness::accounts::Cli;
+    let pool = ReviewPool::new(Cli::Claude, None);
+    pool.state(|state| {
+        state.active = Some("work".into());
+        state.prepared_accounts.insert("work".into());
+    });
+    let facts = pool.facts();
+    assert_eq!(facts.accounts.as_ref().unwrap().label, "main");
+    let (answer, calls) = pool.review();
+    assert_eq!(calls.len(), 1, "{answer:?}");
+    assert!(calls[0].contains(&(crate::harness::accounts::LOGIN_ENV.into(), String::new(),)));
+    assert!(
+        pool.store()
+            .load(ReviewPool::NOW)
+            .unwrap()
+            .0
+            .prepared_accounts
+            .contains("work")
+    );
+}
+
+#[test]
+fn a_prepared_pin_never_falls_through_to_another_account() {
+    use crate::harness::accounts::Cli;
+    for (cli, reads) in [
+        (Cli::Claude, None),
+        (Cli::Kimi, None),
+        (Cli::Grok, None),
+        (Cli::Codex, Some(true)),
+    ] {
+        let pool = ReviewPool::new(cli, reads);
+        pool.pin("work");
+        let (answer, calls) = pool.review();
+        assert_eq!(calls.len(), 1, "control {cli:?}: {answer:?}");
+        pool.state(|state| {
+            state.prepared_accounts.insert("work".into());
+        });
+        let (answer, calls) = pool.review();
+        assert!(calls.is_empty(), "held pin {cli:?}: {answer:?}");
+        if cli == Cli::Claude {
+            let facts = pool.facts();
+            let account = facts.accounts.as_ref().unwrap();
+            assert_eq!(account.label, "work");
+            assert!(account.launch_refused.is_some());
+            let row = crate::ai::state::assess(&facts, true, ReviewPool::NOW);
+            assert_eq!(row.mark, crate::ai::state::Mark::Note);
+        } else {
+            assert!(pool.launch().is_err(), "held pin {cli:?}");
+        }
+        pool.state(|state| {
+            state.prepared_accounts.remove("work");
+        });
+        let (answer, calls) = pool.review();
+        assert_eq!(calls.len(), 1, "released pin {cli:?}: {answer:?}");
+    }
+}
+
+#[test]
+fn a_prepared_fallback_does_not_hide_an_authorized_accounts_health() {
+    use crate::harness::accounts::{Auth, Cli};
+    for (cli, reads) in [
+        (Cli::Claude, None),
+        (Cli::Kimi, None),
+        (Cli::Grok, None),
+        (Cli::Codex, Some(true)),
+        (Cli::Codex, Some(false)),
+    ] {
+        for expired in [false, true] {
+            let pool = ReviewPool::new(cli, reads);
+            pool.state(|state| {
+                state.prepared_accounts.insert("work".into());
+                if expired {
+                    crate::harness::accounts::note_auth(
+                        state,
+                        "main",
+                        Auth::SignedOut,
+                        ReviewPool::NOW,
+                    );
+                }
+            });
+            if !expired {
+                pool.wall("main");
+            }
+            let facts = pool.facts();
+            let label = facts
+                .accounts
+                .as_ref()
+                .map(|a| a.label.as_str())
+                .or_else(|| facts.pool.as_ref().and_then(|p| p.serving_label.as_deref()));
+            assert_eq!(label, Some("main"), "{cli:?}/{expired}");
+            let row = crate::ai::state::assess(&facts, true, ReviewPool::NOW);
+            if expired {
+                assert_eq!(row.state, State::SignedOut, "{cli:?}: {row:?}");
+            } else {
+                assert!(matches!(row.state, State::Limited(_)), "{cli:?}: {row:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn prepared_and_shared_accounts_are_not_local_sign_in_alternatives() {
+    use crate::harness::accounts::{Auth, Cli};
+    for (cli, reads) in [
+        (Cli::Claude, None),
+        (Cli::Kimi, None),
+        (Cli::Grok, None),
+        (Cli::Codex, Some(true)),
+    ] {
+        for shared in [false, true] {
+            let pool = ReviewPool::new(cli, reads);
+            pool.wall("main");
+            pool.state(|state| {
+                crate::harness::accounts::note_auth(
+                    state,
+                    "work",
+                    Auth::SignedOut,
+                    ReviewPool::NOW,
+                );
+            });
+            let before = pool.facts();
+            let next = before
+                .accounts
+                .as_ref()
+                .and_then(|a| a.next_sign_in.as_deref())
+                .or_else(|| before.pool.as_ref().and_then(|p| p.next_sign_in.as_deref()));
+            assert_eq!(next, Some("work"), "positive control {cli:?}");
+            if shared {
+                pool.share_work();
+            } else {
+                pool.state(|state| {
+                    state.prepared_accounts.insert("work".into());
+                });
+            }
+            let facts = pool.facts();
+            let next = facts
+                .accounts
+                .as_ref()
+                .and_then(|a| a.next_sign_in.as_deref())
+                .or_else(|| facts.pool.as_ref().and_then(|p| p.next_sign_in.as_deref()));
+            assert_eq!(next, None, "{cli:?}/{shared}");
+            if let Some(p) = &facts.pool {
+                assert_ne!(p.next.as_deref(), Some("work"));
+            }
+            let row = crate::ai::state::assess(&facts, true, ReviewPool::NOW);
+            assert!(
+                matches!(row.state, State::Limited(_)),
+                "{cli:?}/{shared}: {row:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_prepared_expired_pin_explains_its_hold_without_offering_sign_in() {
+    use crate::harness::accounts::{Auth, Cli};
+    for (cli, reads) in [
+        (Cli::Claude, None),
+        (Cli::Kimi, None),
+        (Cli::Grok, None),
+        (Cli::Codex, Some(true)),
+        (Cli::Codex, Some(false)),
+    ] {
+        let pool = ReviewPool::new(cli, reads);
+        pool.state(|state| {
+            state.prepared_accounts.insert("work".into());
+            crate::harness::accounts::note_auth(state, "work", Auth::SignedOut, ReviewPool::NOW);
+        });
+        pool.pin("work");
+        let facts = pool.facts();
+        let row = crate::ai::state::assess(&facts, true, ReviewPool::NOW);
+        assert_eq!(row.mark, crate::ai::state::Mark::Note, "{cli:?}: {row:?}");
+        assert!(
+            row.fact.contains("awaiting execution authority"),
+            "{cli:?}: {row:?}"
+        );
+        assert!(row.fix.is_none() && row.mend.is_none(), "{cli:?}: {row:?}");
+        assert!(crate::ai::login::refusal(&facts, &row).is_some(), "{cli:?}");
+        let (_, calls) = pool.review();
+        assert!(calls.is_empty(), "{cli:?}");
+    }
+}
+
+#[test]
+fn a_lone_default_keeps_its_existing_sign_out_and_lease_policy() {
+    use crate::harness::accounts::{AccountLease, Auth, Cli};
+    for (cli, reads) in [
+        (Cli::Kimi, None),
+        (Cli::Grok, None),
+        (Cli::Codex, Some(true)),
+        (Cli::Codex, Some(false)),
+    ] {
+        let pool = ReviewPool::new(cli, reads);
+        pool.main_alone();
+        pool.state(|state| {
+            crate::harness::accounts::note_auth(state, "main", Auth::SignedOut, ReviewPool::NOW);
+            state.leases.insert(
+                "main".into(),
+                AccountLease {
+                    holder: "other-mac".into(),
+                    until: ReviewPool::NOW + 3600,
+                    at: ReviewPool::NOW,
+                },
+            );
+        });
+        assert_eq!(pool.launch().unwrap(), None, "{cli:?}");
+    }
+}
+
+#[test]
+fn healthy_shared_accounts_remain_healthy_without_local_sign_in() {
+    use crate::harness::accounts::Cli;
+    for (cli, reads) in [
+        (Cli::Claude, None),
+        (Cli::Kimi, None),
+        (Cli::Grok, None),
+        (Cli::Codex, Some(true)),
+    ] {
+        let pool = ReviewPool::new(cli, reads);
+        pool.pin("work");
+        pool.share_work();
+        let facts = pool.facts();
+        let row = crate::ai::state::assess(&facts, true, ReviewPool::NOW);
+        assert_eq!(row.mark, crate::ai::state::Mark::Ok, "{cli:?}: {row:?}");
+        assert!(
+            !row.fact.contains("local sign-in is refused"),
+            "{cli:?}: {row:?}"
+        );
+        assert!(crate::ai::login::refusal(&facts, &row).is_some());
+    }
+}
+
+#[test]
+fn a_legacy_codex_held_pin_preserves_its_repin_guidance() {
+    use crate::harness::accounts::Cli;
+    let pool = ReviewPool::new(Cli::Codex, Some(false));
+    pool.pin("work");
+    pool.state(|state| {
+        state.prepared_accounts.insert("work".into());
+    });
+    let row = crate::ai::state::assess(&pool.facts(), true, ReviewPool::NOW);
+    assert_eq!(row.mark, crate::ai::state::Mark::Warn, "{row:?}");
+    assert!(
+        row.mend
+            .as_deref()
+            .is_some_and(|step| step.contains("re-pin")),
+        "{row:?}"
+    );
+}
+
+#[test]
+fn isolated_claude_review_outcomes_preserve_default_health() {
+    let b = machine(&["claude"]);
+    let home = b.home.display().to_string();
+    let var = |key: &str| (key == "HOME").then(|| home.clone());
+    for isolated in [false, true] {
+        for outcome in 0..3 {
+            let root = aterm_tempfile::TempDir::new().unwrap();
+            let store = Store::at(root.path());
+            let mut fact = facts_of(&CLAUDE, b.pkg.agents_dir().join("claude"));
+            fact.accounts = Some(claude_account(isolated.then_some("/isolated/login")));
+            let rows = [row_of(&CLAUDE, State::Ok)];
+            let cands = candidates(&[&CLAUDE], Some(&["claude"]), "codex", &rows, 0);
+            let runner = FakeRunner::with(move |_| match outcome {
+                0 => Ok(ran(0, "no findings", "")),
+                1 => Ok(ran(
+                    1,
+                    "",
+                    "Failed to authenticate. API Error: 401 OAuth session expired",
+                )),
+                2 => Ok(ran(1, "", "You've hit your limit")),
+                _ => unreachable!(),
+            });
+            let host = Host {
+                config: None,
+                runner: &runner,
+                var: &var,
+                vars: &[],
+                store: &store,
+                now: &|| ReviewPool::NOW,
+            };
+            let answers = run_review(
+                &host,
+                &cands,
+                &[fact],
+                &Ask {
+                    change: &change(),
+                    asker: "codex",
+                    words: None,
+                    count: 1,
+                    budget: Duration::from_secs(5),
+                    level: Level::Yolo,
+                },
+            );
+            assert_eq!(runner.calls().len(), 1);
+            assert_eq!(
+                answers[0].verdict,
+                [Verdict::Served, Verdict::Auth, Verdict::Limit][outcome]
+            );
+            let record = store.load().unwrap().of("claude");
+            assert_eq!(record.ended_at.is_some(), !isolated && outcome == 1);
+            assert_eq!(record.limited_until.is_some(), !isolated && outcome == 2);
+            assert_eq!(
+                record.used_at.is_some(),
+                !isolated && (outcome == 0 || outcome == 2)
+            );
+        }
     }
 }
 
@@ -2135,6 +4456,17 @@ fn a_lone_default_row_launch_takes_no_row_and_the_facts_refuse_none() {
             pool.main_alone();
             set(&pool);
             assert_eq!(pool.launch(), Ok(None), "{at}");
+            let witness = crate::harness::accounts_sync::capture_current_review(
+                &pool.store(),
+                cli,
+                Some(&pool.config.join(cli.accounts().roster_file)),
+                crate::harness::accounts::Mode::Early,
+                pool.program().as_deref(),
+                ReviewPool::NOW,
+            )
+            .expect("a no-row launch still runs on the default login")
+            .witness;
+            assert_eq!(witness.row().map(|row| row.label.as_str()), Some("main"));
             let facts = pool.facts();
             let accounts = facts.pool.as_ref().expect("the pool");
             assert_eq!(accounts.launch_refused, None, "{at}: {accounts:?}");
@@ -2151,4 +4483,13 @@ fn a_lone_default_row_launch_takes_no_row_and_the_facts_refuse_none() {
             cli.id()
         );
     }
+
+    let scratch = aterm_tempfile::tempdir().expect("tempdir");
+    let run = crate::ai::run::RunDir::make(scratch.path()).expect("run dir");
+    for bad in ["", ".", "..", "../escape", "sub/file", "sub\\file"] {
+        assert!(run.write(bad, "x").is_err(), "{bad:?}");
+        assert!(run.subdir(bad).is_err(), "{bad:?}");
+    }
+    assert!(run.write("prompt.txt", "ok").is_ok());
+    assert!(run.subdir("work").is_ok());
 }

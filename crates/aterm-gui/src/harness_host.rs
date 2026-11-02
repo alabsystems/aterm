@@ -8,16 +8,21 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::Write;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use aterm_agent::harness::account_series;
 use aterm_agent::harness::accounts;
 
+#[cfg(target_os = "macos")]
+use aterm_agent::harness::disk::maintenance as cache_maintenance;
 mod progress;
 use aterm_agent::harness::accounts_pool;
 use aterm_agent::harness::accounts_sync::UpkeepStep;
+use aterm_agent::harness::agent_image;
+use aterm_agent::harness::contract::Scope;
 use aterm_agent::harness::laps;
 use aterm_agent::harness::login_latch::{self, LoginLatches};
 use aterm_agent::harness::netwatch::Route;
@@ -32,6 +37,7 @@ use aterm_agent::harness::tap;
 use aterm_agent::harness::upgrade;
 use aterm_agent::harness::upgrade_drive::{self, After, Behind, Due};
 use aterm_agent::harness::upgrade_wake::{ActivationWake, WakeTrigger};
+use aterm_agent::harness::witness::{self, RouteKey, Target};
 use aterm_agent::supervise::memory::AgentMemory;
 use aterm_agent::supervise::policy::turn_end::{
     AccountAdvice, AccountAt, AccountBad, AccountPoint, HeldBy, Reach, Ready, RosterWord,
@@ -43,9 +49,9 @@ use aterm_agent::supervise::policy::{
 use aterm_agent::supervise::tap_clock::{TapWindow, UsageWindow};
 use aterm_agent::supervise::tape::store as tape;
 use aterm_agent::supervise::{
-    AgentResumed, Autopilot, Ctl, CtlReply, Endpoint, Guard, HostStep, IdleHost, IdlePoint,
-    Interrupter, ProbeMiss, RelayCtl, Session, StallSeen, SuperviseOpts, SupervisorConfig,
-    UsageSeen,
+    AgentResumed, Autopilot, BuiltinAuthority, Ctl, CtlReply, Endpoint, Guard, HostStep, IdleHost,
+    IdlePoint, Interrupter, ProbeMiss, RelayCtl, Session, StallSeen, SuperviseOpts,
+    SupervisorConfig, UsageSeen,
 };
 use aterm_log::words::{Len, Panic};
 
@@ -79,6 +85,11 @@ static USAGE_TAP: AtomicBool = AtomicBool::new(false);
 
 static USAGE_CREDITS: AtomicBool = AtomicBool::new(false);
 
+/// `[harness] accounts` as the last [`Switches::set`] ranked it ([`ACCOUNTS_OFF`],
+/// [`ACCOUNTS_WALL`], [`ACCOUNTS_EARLY`]), for readers with no host at hand: the footer's
+/// accounts outlook replays the executor's policy under this mode (`claude_footer`).
+static LIVE_ACCOUNTS_MODE: AtomicU8 = AtomicU8::new(ACCOUNTS_OFF);
+
 const TAP_NOT_OWN: &str = "reading not this machine's own login's";
 
 static AGENTS_OFF: Mutex<Vec<Program>> = Mutex::new(Vec::new());
@@ -91,6 +102,19 @@ pub(crate) fn upgrade_ask() -> bool {
 /// [`USAGE_CREDITS`], read now.
 pub(crate) fn usage_credits() -> bool {
     USAGE_CREDITS.load(Ordering::SeqCst)
+}
+
+/// [`LIVE_ACCOUNTS_MODE`], read now.
+pub(crate) fn accounts_mode() -> accounts::Mode {
+    mode_of_rank(LIVE_ACCOUNTS_MODE.load(Ordering::SeqCst))
+}
+
+const fn mode_of_rank(rank: u8) -> accounts::Mode {
+    match rank {
+        ACCOUNTS_EARLY => accounts::Mode::Early,
+        ACCOUNTS_WALL => accounts::Mode::Wall,
+        _ => accounts::Mode::Off,
+    }
 }
 
 /// [`USAGE_TAP`]: `[harness] usage_tap` is on and the harness supervises Claude Code
@@ -152,6 +176,10 @@ pub(crate) struct Switches {
     parked: AtomicBool,
     /// Rotation mode and login repair published together ([`AccountControls`]).
     account_controls: AtomicU8,
+    /// Each other pooled CLI's rotation mode and login repair as its own switches read them
+    /// (`SupervisorConfig::accounts_for`, `logins_for`), three bits apiece in `OTHER_CLIS`
+    /// order ([`Self::pool_controls`]), so Claude Code switched off leaves the other pools on.
+    pool_controls: AtomicU16,
     /// The host says nothing of the accounts as a whole.
     mute: AtomicBool,
     /// `[harness] limit_reset` as the window last parsed it, and `false` with `[harness] enabled = false`.
@@ -167,6 +195,8 @@ pub(crate) struct Switches {
     accounts_said: AtomicU64,
     /// The hash of the [`PoolSaid`]s the window was last told ([`pools_tell`]), `0` for none.
     pools_said: AtomicU64,
+    /// The hash of the sheet's conflicts the window was last told ([`sheet_tell`]), `0` for none.
+    sheet_said: AtomicU64,
     /// `[harness] autopilot`: the default Autopilot of a session with no word of its own ([`OffSessions`]).
     autopilot: AtomicU8,
     /// `[harness] claim_credits`, `false` where the policy supervises nothing here or Claude Code
@@ -187,6 +217,14 @@ const ACCOUNTS_WALL: u8 = 1;
 const ACCOUNTS_EARLY: u8 = 2;
 const ACCOUNTS_MODE: u8 = 3;
 const LOGINS_ON: u8 = 4;
+
+/// The [`AccountControls`] three bits hold (a mode of [`ACCOUNTS_MODE`] and [`LOGINS_ON`]).
+const fn controls_of(bits: u8) -> AccountControls {
+    AccountControls {
+        mode: mode_of_rank(bits & ACCOUNTS_MODE),
+        logins: bits & LOGINS_ON != 0,
+    }
+}
 
 /// One coherent observation of the controls used to select an account move.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -278,22 +316,33 @@ impl Switches {
         UPGRADE_ASK.store(cfg.upgrade_ask, Ordering::SeqCst);
         USAGE_CREDITS.store(cfg.usage_credits, Ordering::SeqCst);
         *AGENTS_OFF.lock().unwrap_or_else(PoisonError::into_inner) = cfg.off.clone();
-        let accounts_on = would_supervise(cfg, headless) && cfg.on_for(Program::Claude);
-        let accounts = match cfg.accounts {
-            _ if !accounts_on => ACCOUNTS_OFF,
-            accounts::Mode::Off => ACCOUNTS_OFF,
-            accounts::Mode::Wall => ACCOUNTS_WALL,
-            accounts::Mode::Early => ACCOUNTS_EARLY,
+        // The pool's own switches (`accounts_for`, `logins_for`), which a launch and the
+        // upkeep read too, and the host's: it moves and signs in only what it supervises here.
+        let supervises = would_supervise(cfg, headless);
+        let accounts_on = supervises && cfg.on_for(Program::Claude);
+        let controls = |agent: Program| {
+            let mode = match cfg.accounts_for(agent) {
+                _ if !supervises => ACCOUNTS_OFF,
+                accounts::Mode::Off => ACCOUNTS_OFF,
+                accounts::Mode::Wall => ACCOUNTS_WALL,
+                accounts::Mode::Early => ACCOUNTS_EARLY,
+            };
+            mode | if supervises && cfg.logins_for(agent) {
+                LOGINS_ON
+            } else {
+                0
+            }
         };
-        self.account_controls.store(
-            accounts
-                | if accounts_on && cfg.logins {
-                    LOGINS_ON
-                } else {
-                    0
-                },
-            Ordering::SeqCst,
-        );
+        let claude = controls(Program::Claude);
+        self.account_controls.store(claude, Ordering::SeqCst);
+        LIVE_ACCOUNTS_MODE.store(claude & ACCOUNTS_MODE, Ordering::SeqCst);
+        let pools = aterm_agent::harness::accounts_sync::OTHER_CLIS
+            .iter()
+            .enumerate()
+            .fold(0u16, |bits, (at, cli)| {
+                bits | (u16::from(controls(cli.program())) << (3 * at))
+            });
+        self.pool_controls.store(pools, Ordering::SeqCst);
         self.mute.store(
             cfg.enabled && !would_supervise(cfg, headless),
             Ordering::SeqCst,
@@ -352,15 +401,20 @@ impl Switches {
     }
 
     fn account_controls(&self) -> AccountControls {
-        let bits = self.account_controls.load(Ordering::SeqCst);
-        AccountControls {
-            mode: match bits & ACCOUNTS_MODE {
-                ACCOUNTS_EARLY => accounts::Mode::Early,
-                ACCOUNTS_WALL => accounts::Mode::Wall,
-                _ => accounts::Mode::Off,
-            },
-            logins: bits & LOGINS_ON != 0,
-        }
+        controls_of(self.account_controls.load(Ordering::SeqCst))
+    }
+
+    /// Another pooled CLI's own [`AccountControls`], read live (Claude Code's are
+    /// [`Self::account_controls`]).
+    fn pool_controls(&self, cli: accounts::Cli) -> AccountControls {
+        let at = aterm_agent::harness::accounts_sync::OTHER_CLIS
+            .iter()
+            .position(|other| *other == cli);
+        let Some(at) = at else {
+            return self.account_controls();
+        };
+        let bits = self.pool_controls.load(Ordering::SeqCst) >> (3 * at);
+        controls_of(u8::try_from(bits & 0b111).unwrap_or(ACCOUNTS_OFF))
     }
 
     /// [`Self::mute`].
@@ -881,6 +935,17 @@ fn claimed_by_another(status: &str) -> Option<String> {
     (!upgrade_drive::is_host_holder(&named)).then_some(named)
 }
 
+/// This is only a conservative stand-down check. It grants no native act and does not
+/// replace the existing act's guards with a snapshot-based per-duty permission.
+fn foreign_scoped_coordination(status: &str) -> bool {
+    let mut words = status.split_whitespace();
+    words.any(|word| word == "supervisor_contract=3")
+        && status
+            .split_whitespace()
+            .find_map(|word| word.strip_prefix("supervisor="))
+            .is_none_or(|word| word != aterm_control::wire::pct_encode(&holder()))
+}
+
 /// What a stopped worker is still allowed to send: a bare `meta` read and a `meta unset …`.
 fn cleanup_request(args: &[&str]) -> bool {
     let mut words = args.iter().copied().skip_while(|a| a.starts_with('@'));
@@ -906,13 +971,34 @@ pub(crate) struct HostCtl {
     fence: Option<String>,
     /// Watch-only beside this proven self-claim's holder ([`WorkerJob::beside`]).
     watch_only: Option<String>,
+    /// The private hosted adapter's one exact target. Ordinary operator clients use none.
+    duty_sid: Option<String>,
+    /// The hosted loop's read of its session's act ([`crate::agent_act::hosted`]); an ordinary
+    /// operator client confirms no agent and says [`agent_image::Act::On`].
+    act: Option<ActRead>,
 }
+
+/// What the host's kernel read says the harness may do in a session, by its sid.
+type ActRead = Arc<dyn Fn(&str) -> agent_image::Act + Send + Sync>;
 
 /// Whether `args` types into the session.
 fn is_typing(args: &[&str]) -> bool {
     args.iter()
         .find(|a| !a.starts_with('@'))
         .is_some_and(|verb| matches!(*verb, "key" | "send" | "paste" | "turn" | "feed-bin"))
+}
+
+fn duty_write(args: &[&str]) -> bool {
+    let words: Vec<_> = args
+        .iter()
+        .copied()
+        .filter(|word| !word.starts_with('@'))
+        .collect();
+    is_typing(args)
+        || matches!(
+            words.as_slice(),
+            ["post", ..] | ["meta", "set" | "unset", "attention", ..] | ["task", "mark", ..]
+        )
 }
 
 /// `args` with `if-supervisor=<holder>` put right after the verb of a write the server fences on its claim (`key`, `send`, `paste`, `turn`).
@@ -945,6 +1031,8 @@ impl HostCtl {
             admission: None,
             fence: None,
             watch_only: None,
+            duty_sid: None,
+            act: None,
         }
     }
 
@@ -968,8 +1056,30 @@ impl HostCtl {
     }
 }
 
-impl Ctl for HostCtl {
-    fn call(&mut self, args: &[&str]) -> Result<CtlReply, String> {
+impl HostCtl {
+    fn observed_authority(&mut self, sid: &str) -> BuiltinAuthority {
+        let sid = sid.strip_prefix('@').unwrap_or(sid);
+        if self.duty_sid.as_deref() != Some(sid) || !self.prefer || self.token.is_none() {
+            return BuiltinAuthority::Unknown;
+        }
+        // A stopped worker may still finish owned metadata cleanup. Its input remains cut;
+        // the same one-time redial used by cleanup_request permits this read-only proof.
+        if self.cut.load(Ordering::SeqCst) && !self.redialed {
+            self.inner = self.relay();
+            self.redialed = true;
+        }
+        let target = format!("@{sid}");
+        match self.inner.call(&[&target, "status"]) {
+            Ok(reply) if reply.ok() => BuiltinAuthority::from_status(&reply.stdout, &holder()),
+            _ => BuiltinAuthority::Unknown,
+        }
+    }
+
+    fn call_checked(
+        &mut self,
+        args: &[&str],
+        duty: Option<(Scope, u64)>,
+    ) -> Result<CtlReply, String> {
         if self
             .admission
             .as_ref()
@@ -998,11 +1108,79 @@ impl Ctl for HostCtl {
                 ),
             });
         }
+        if let Some(sid) = self.duty_sid.clone() {
+            let writes = duty_write(args);
+            if writes {
+                let Some((scope, revision)) = duty else {
+                    return Ok(duty_denied());
+                };
+                if args.first().copied() != Some(format!("@{sid}").as_str()) {
+                    return Ok(duty_denied());
+                }
+                let authority = self.observed_authority(&sid);
+                if authority.revision() != Some(revision) || !authority.keeps(scope) {
+                    return Ok(duty_denied());
+                }
+                if is_typing(args) {
+                    if !matches!(
+                        scope,
+                        Scope::Approvals | Scope::Questions | Scope::TurnEnd | Scope::Walls
+                    ) {
+                        return Ok(duty_denied());
+                    }
+                    let fence = format!("if-supervisor={}", holder());
+                    let revision = format!("if-supervisor-revision={revision}");
+                    let duty = format!("harness-duty={}", scope.word());
+                    let Some(mut words) = fenced_write(args, &fence) else {
+                        return Ok(duty_denied());
+                    };
+                    let at = words.iter().position(|word| *word == fence).unwrap() + 1;
+                    words.splice(at..at, [&revision, &duty].map(String::as_str));
+                    return self.inner.call(&words);
+                }
+                return self.inner.call(args);
+            }
+        }
         let fence = self.fence.as_ref().map(|h| format!("if-supervisor={h}"));
         match fence.as_deref().and_then(|f| fenced_write(args, f)) {
             Some(fenced) => self.inner.call(&fenced),
             None => self.inner.call(args),
         }
+    }
+}
+
+fn duty_denied() -> CtlReply {
+    CtlReply {
+        code: 1,
+        stdout: String::new(),
+        stderr: "aterm-ctl: ERR denied supervisor input authority\n".to_string(),
+    }
+}
+
+impl Ctl for HostCtl {
+    fn call(&mut self, args: &[&str]) -> Result<CtlReply, String> {
+        self.call_checked(args, None)
+    }
+
+    fn call_for_duty(
+        &mut self,
+        duty: Scope,
+        revision: u64,
+        args: &[&str],
+    ) -> Option<Result<CtlReply, String>> {
+        self.duty_sid.as_ref()?;
+        Some(self.call_checked(args, Some((duty, revision))))
+    }
+
+    fn builtin_authority(&mut self, sid: &str) -> BuiltinAuthority {
+        self.observed_authority(sid)
+    }
+
+    fn agent_act(&mut self, sid: &str) -> agent_image::Act {
+        let sid = sid.strip_prefix('@').unwrap_or(sid);
+        self.act
+            .as_ref()
+            .map_or(agent_image::Act::On, |read| read(sid))
     }
 
     fn interrupter(&self) -> Option<Interrupter> {
@@ -1218,8 +1396,81 @@ pub(crate) struct Kept {
     lost: Option<Lost>,
     /// A relaunch after aterm ended landed in the tab.
     carry_asked: bool,
+    /// When the hold of the loop's own act on an owed carry-on ends ([`WorkerIdle::carry_holds`]).
+    carry_hold: Option<Instant>,
     /// The relaunch snapshot read still out ([`start_point_read`]).
     point_read: Option<Arc<PointRead>>,
+    /// The upgrade read off the idle point ([`due_at_point`]).
+    due: DueKept,
+    /// The session's work record reads ([`WorkKept`]).
+    work: WorkKept,
+}
+
+/// What the host keeps of a session's work record reads across its workers, for the agent group
+/// they were made for ([`work_read_starts`], [`Self::of`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct WorkKept {
+    /// The group of the agent the rest is kept for ([`WorkerIdle::group`]).
+    group: i32,
+    /// When the last read started; `None` before the agent's first.
+    started: Option<Instant>,
+    /// A read is under way: its thread clears this as it ends ([`WorkReading`]).
+    reading: bool,
+    /// The task's face is landed: no read starts until it opens again.
+    landed: bool,
+}
+
+impl WorkKept {
+    /// What is kept for the agent in group `group`. Kept for another group (the tab's agent
+    /// relaunched, or another agent started in it), it starts over: the new agent's first look
+    /// reads, and a landing told for the other holds none of its reads back. Only a read still
+    /// under way carries over, as it still runs.
+    fn of(&mut self, group: i32) -> &mut Self {
+        if self.group != group {
+            *self = Self {
+                group,
+                reading: self.reading,
+                ..Self::default()
+            };
+        }
+        self
+    }
+}
+
+/// Where a work record look is made ([`WorkerIdle::work_look`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkLook {
+    /// A busy read: a read starts here and nothing waits for it.
+    Busy,
+    /// A decided turn break: the break waits for its read
+    /// ([`aterm_agent::harness::repo_work::PROBE_ASK`] at most).
+    Break,
+}
+
+/// Whether a work record read starts at `look` at `now` ([`WorkerIdle::work_look`]), over what
+/// the session keeps for its agent (`kept`, [`WorkKept::of`]) and whether macOS's program check
+/// holds new starts back (`held`, [`crate::program_check_watch::starts_held`]): none while a read
+/// is under way, while the task is landed or while starts are held; the agent's first look of
+/// either kind starts one; after that a turn break
+/// [`aterm_agent::harness::work_record::WORK_FLOOR`] or more after the last read started does.
+fn work_read_starts(kept: &WorkKept, look: WorkLook, now: Instant, held: bool) -> bool {
+    if kept.reading || kept.landed || held {
+        return false;
+    }
+    kept.started.is_none_or(|last| {
+        look == WorkLook::Break
+            && now.saturating_duration_since(last) >= aterm_agent::harness::work_record::WORK_FLOOR
+    })
+}
+
+/// A work record read under way ([`WorkKept::reading`]): dropped as its read ends, panics and a
+/// thread that never started included, it marks the read over.
+struct WorkReading(Arc<Mutex<Kept>>);
+
+impl Drop for WorkReading {
+    fn drop(&mut self) {
+        with_kept_of(&self.0, |k| k.work.reading = false);
+    }
 }
 
 /// Whether a relaunch's answer says it took (`adopted`, `relaunched`, `continued`, `done`, each with or without its `:<detail>`).
@@ -1290,11 +1541,15 @@ impl ExitWatched {
 #[derive(Default)]
 struct AccountKept {
     progress: Option<progress::BoundProgress>,
+    execution_progress: Option<progress::BoundProgress>,
     advised: Option<Advised>,
     /// The newest calculation owns publication; queued advice remains usable until replaced.
     advice_id: Arc<()>,
     held: Option<&'static str>,
     stay: Option<&'static str>,
+    /// Why the last account advice could not be judged ([`WorkerIdle::account_unjudged`]),
+    /// logged once per change; `None` once one was.
+    unjudged: Option<&'static str>,
     moved: Option<Moved>,
     lost: Option<LostSeen>,
     came_back: Option<Option<String>>,
@@ -1656,6 +1911,41 @@ struct AdviceRequest {
     snap: Option<Snapshot>,
 }
 
+/// Policy trigger and lazily checked identities from one worker decision.
+struct AccountJudgment {
+    point: accounts::Point,
+    roster: accounts::Roster,
+    identities: AccountIdentities,
+}
+
+struct AccountIdentities {
+    seat: AccountSeat,
+    profile_env: Vec<String>,
+    verdicts: BTreeMap<String, (accounts::Row, bool)>,
+}
+
+impl AccountIdentities {
+    fn new(seat: &AccountSeat, profile_env: &[String]) -> Self {
+        Self {
+            seat: seat.clone(),
+            profile_env: profile_env.to_vec(),
+            verdicts: BTreeMap::new(),
+        }
+    }
+
+    fn matches(&mut self, row: &accounts::Row) -> bool {
+        if let Some((checked, matches)) = self.verdicts.get(&row.label)
+            && checked == row
+        {
+            return *matches;
+        }
+        let matches = account_identity_matches(&self.seat, row, &self.profile_env);
+        self.verdicts
+            .insert(row.label.clone(), (row.clone(), matches));
+        matches
+    }
+}
+
 impl AdviceTurn {
     fn begin(kept: &Mutex<Kept>) -> Self {
         with_kept_of(kept, |k| {
@@ -1757,7 +2047,7 @@ impl AdviceRequest {
             let advice = advice.filter(|_| self.snap.is_some());
             k.account.progress = progress;
             k.account.advised = match advice.as_ref().and_then(AccountAdvice::past_probe) {
-                Some(AccountAdvice::Move { to }) => Some(Advised {
+                Some(AccountAdvice::Move { to, .. }) => Some(Advised {
                     to: to.clone(),
                     point,
                     request: self,
@@ -2234,6 +2524,12 @@ type FactFn = dyn Fn(&str, crate::HarnessFact) + Send + Sync;
 type NeedsFn = dyn Fn(&str, &[String], &str) -> bool + Send + Sync;
 /// Why Land still holds, stored where the window reads it ([`Hooks::hold`]).
 type LandHoldFn = dyn Fn(&str, Option<aterm_agent::harness::acts::LandHeld>) -> bool + Send + Sync;
+/// The hold's own words, stored where the window reads them ([`Hooks::said`]).
+type LandSaidFn =
+    dyn Fn(&str, Option<&aterm_agent::harness::hold_said::HoldSaid>) -> bool + Send + Sync;
+/// What aterm checked at a landing, stored where the window reads it ([`Hooks::receipt`]).
+type LandReceiptFn =
+    dyn Fn(&str, Option<&aterm_agent::harness::acts::LandReceipt>) -> bool + Send + Sync;
 
 type EpochFn = dyn Fn() -> u64 + Send + Sync;
 type StepFn = dyn Fn(&str, u32, upgrade_drive::Tell) -> String + Send + Sync;
@@ -2249,6 +2545,9 @@ pub(crate) struct CarryPoint {
     pub(crate) land: bool,
     /// The loop read the point as a task landed under Land ([`IdlePoint::done_under_land`]: a clean `Nothing left:` defense at a land act's yield).
     pub(crate) done_under_land: bool,
+    /// The stop for replies that repeat with no work holds the loop's typing here
+    /// ([`IdlePoint::replies_held`]).
+    pub(crate) replies_held: bool,
     /// The one agent whose record is carried ([`carries_only`]).
     pub(crate) only: Option<upgrade::Agent>,
 }
@@ -2372,6 +2671,14 @@ type RestartFn =
 type WatchFn = dyn Fn(&str, u32, &upgrade_drive::Watcher) -> upgrade_drive::Watched + Send + Sync;
 /// An agent's route to its API, read now from its pid, argv and directory ([`Acts::route`]).
 type RouteFn = dyn Fn(u32, &[String], &str) -> Route + Send + Sync;
+/// A Claude Code agent's launch's route variables by its pid, argv and directory, or why they
+/// name no one route ([`Acts::claude_env`]).
+type ClaudeEnvFn = dyn Fn(u32, &[String], &str) -> Result<Vec<String>, aterm_agent::harness::netwatch::Unnamed>
+    + Send
+    + Sync;
+/// What an agy agent's `settings.json` says of its model backend ([`Acts::agy_backend`]).
+type AgyBackendFn =
+    dyn Fn(&Snapshot, &[String]) -> aterm_agent::harness::witness::AgyBackend + Send + Sync;
 /// An agent's memory, measured now from its tab and pid ([`Acts::memory`]).
 type MemoryFn = dyn Fn(&str, u32) -> Option<AgentMemory> + Send + Sync;
 /// Whether the conversation a tab's agent holds has a task ([`upgrade_drive::Tasked::of_snapshot`], the tab's supervisor's own turns none).
@@ -2385,6 +2692,21 @@ type LimitResetFn = dyn Fn(&Snapshot) -> Option<u64> + Send + Sync;
 type TranscriptTailFn = dyn Fn(&Snapshot) -> Option<String> + Send + Sync;
 /// What the repository the session a snapshot names works in holds that no remote has ([`Acts::repo_work`]).
 type RepoWorkFn = dyn Fn(&Snapshot) -> aterm_agent::harness::repo_work::RepoRead + Send + Sync;
+/// Where tab `sid`'s agent works, read with git ([`Acts::work_read`]): its kept snapshot, where
+/// one is kept, names its start folder and transcript, and no git starts while the hold given
+/// says new starts are held back.
+type WorkReadFn = dyn Fn(
+        &str,
+        Program,
+        Option<&Snapshot>,
+        &dyn Fn() -> bool,
+    ) -> aterm_agent::harness::work_record::WorkRead
+    + Send
+    + Sync;
+/// Where tab `sid`'s agent in group `group` works, put where the survey reads it, or cleared
+/// (`None`) ([`Acts::work_put`]).
+type WorkPutFn =
+    dyn Fn(&str, i32, Option<aterm_agent::harness::work_record::WorkRecord>) + Send + Sync;
 /// That transcript and the file it is ([`upgrade_drive::snapshot_transcript`]; [`Acts::transcript`]).
 type TranscriptFn = dyn Fn(&Snapshot) -> Option<(PathBuf, String)> + Send + Sync;
 /// A tasked session's record told its agent is gone for good ([`Acts::task_exited`]): its sid.
@@ -2410,6 +2732,8 @@ type AccountGoneFn = dyn Fn(&str) + Send + Sync;
 type AccountSeatFn = dyn Fn() -> Option<AccountSeat> + Send + Sync;
 /// The captured process's verified exec environment, `KEY=value` entries ([`Acts::account_env`]).
 type AccountEnvFn = dyn Fn(&Snapshot) -> Option<Vec<String>> + Send + Sync;
+/// A current screen's usage wall, bound to the captured Claude process.
+type AccountScreenWallFn = dyn Fn(&str, &Snapshot) -> Option<ScreenAccountWall> + Send + Sync;
 /// Whether an agent's settings files and the vendor's profile store leave it its stored login.
 type AccountSettingsFn = dyn Fn(u32, &[String], &str) -> bool + Send + Sync;
 /// [`Acts::tap_born`].
@@ -2422,7 +2746,7 @@ type AccountMadeFn = dyn Fn(&str, &str, AccountAt) + Send + Sync;
 type AccountColdFn = dyn Fn(&Snapshot) -> Option<String> + Send + Sync;
 /// A cold Codex relaunch's snapshot moved onto the serving pool row ([`Acts::codex_cold`]); `None` keeps the one the layout carried.
 type CodexColdFn = dyn Fn(&Snapshot) -> Option<Snapshot> + Send + Sync;
-/// Whether `snap` is a foreground agent that aterm's relaunch resumed on its conversation ([`Acts::agent_resumed`]).
+/// Whether `snap` is a foreground agent that resumes a conversation ([`Acts::agent_resumed`]).
 type AgentResumedFn = dyn Fn(&str, &Snapshot) -> bool + Send + Sync;
 type BackoffFn = dyn Fn(usize) -> Duration + Send + Sync;
 type PauseFn = dyn Fn(Duration) -> Duration + Send + Sync;
@@ -2608,6 +2932,11 @@ pub(crate) enum HostNote {
     /// What the other CLIs' pools this machine keeps say ([`PoolSaid`]), every one in one note:
     /// the machine's fact and no tab's. None is a note only after some pool said something.
     Pools(Vec<PoolSaid>),
+    /// The vault sheet's rows that give one address conflicting assignments, each address left
+    /// out of this machine's pools until its rows agree
+    /// (`aterm_agent::harness::accounts_sync::sheet_conflicts`): the machine's fact and no tab's.
+    /// None is a note only after some conflict was told.
+    SheetConflicts(Vec<aterm_agent::harness::accounts_sync::SheetConflict>),
     /// The tab's supervisor informs a person ([`IdleHost::inform`]).
     Inform { sid: String, text: String },
     /// The tab's supervisor warns a person ([`IdleHost::warn`], the memory ceiling's).
@@ -2787,6 +3116,10 @@ pub(crate) struct Hooks {
     pub(crate) needs: Arc<NeedsFn>,
     /// Why land still holds, stored where the window reads it.
     pub(crate) hold: Arc<LandHoldFn>,
+    /// The hold's own words, stored where the window reads them (§14.17 item 1, slice 4b).
+    pub(crate) said: Arc<LandSaidFn>,
+    /// What aterm checked at the landing, stored where the window reads it (§14.9, slice 9b).
+    pub(crate) receipt: Arc<LandReceiptFn>,
 
     pub(crate) claim_epoch: Arc<EpochFn>,
     pub(crate) acts: Acts,
@@ -2825,12 +3158,17 @@ pub(crate) struct Acts {
     /// When tab `sid`'s last command started, unix ms, while no person's gesture has reached the tab since.
     pub(crate) launch: Arc<LaunchFn>,
     pub(crate) due: Arc<DueFn>,
+    /// How long an idle point waits for its upgrade read ([`due_at_point`]): [`POINT_READ_BOUND`]
+    /// live; `Acts::inert`'s a hang detector's minute.
+    pub(crate) due_read: Duration,
     /// The session is behind — from its worker's attach, and from each activation notice.
     pub(crate) behind: Arc<BehindFn>,
     pub(crate) step: Arc<StepFn>,
     /// The upgrade's step at a break of the agent's own background work.
     pub(crate) notice: Arc<StepFn>,
     pub(crate) owed: Arc<OwedFn>,
+    /// The carry-on of [`Self::owed`] not yet taken, its confirmation looks apart ([`relaunch::carry_owed_of`]).
+    pub(crate) carry_owed: Arc<OwedFn>,
     /// The owed carry-on, at the loop's idle point ([`WorkerIdle::at_idle_on`]).
     pub(crate) resume: Arc<ResumeFn>,
     /// The carry-on [`Self::owed`] names, settled with nothing typed where the agent rests at a point the tab's loop withheld from this host.
@@ -2845,6 +3183,10 @@ pub(crate) struct Acts {
     pub(crate) jobs_board: &'static crate::vitals_jobs::JobsBoard,
     /// Whether a call's leader still lives at its birth ([`WorkerIdle::facts`]' re-proof): live [`crate::vitals_jobs::leader_lives`], a test's own in tests.
     pub(crate) leader_lives: fn(u32, u64) -> bool,
+    /// Whether macOS's program check still holds the reading's exec for its told wait
+    /// ([`WorkerIdle::facts`]): live [`crate::vitals_jobs::held_as_long`] brackets the held and
+    /// process-age reads with the actual exec version; a test's own in tests.
+    pub(crate) held_now: fn(&aterm_agent::supervise::HeldCall) -> bool,
     /// The program check's board the worker reads whether macOS's program check is stuck from ([`WorkerIdle::program_check_stuck`]).
     pub(crate) program_check: &'static Mutex<crate::program_check_watch::Board>,
     /// The occupancy facts board the worker reads the machine from ([`WorkerIdle::occupancy`], the occupancy door's reading).
@@ -2864,9 +3206,9 @@ pub(crate) struct Acts {
     /// The worker went: no loop is left to tell its session's answers heard ([`WorkerIdle`]'s drop, live [`crate::occupancy_wakes::left`]).
     pub(crate) wakes_left: Arc<WakesLeftFn>,
     pub(crate) snapshot: Arc<SnapshotFn>,
-    /// How long an idle point waits for its relaunch snapshot read ([`refresh_snapshot_at_point`]):
-    /// [`POINT_READ_BOUND`] live; `Acts::inert`'s a hang detector's minute, so a test's read lands
-    /// before its point goes on unless the test shortens the wait.
+    /// How long a worker waits for its relaunch snapshot read ([`reread`]) and its note behind
+    /// ([`note_within`]): [`POINT_READ_BOUND`] live; `Acts::inert`'s a hang detector's minute, so a
+    /// test's read lands before its worker goes on unless the test shortens the wait.
     pub(crate) point_read: Duration,
     pub(crate) follow: Arc<FollowFn>,
     pub(crate) status: Arc<StatusFn>,
@@ -2910,7 +3252,7 @@ pub(crate) struct Acts {
     pub(crate) adopted_gone: Arc<AdoptedGoneFn>,
     /// Whether a restored step that panicked may have typed its line, by the conversation's record.
     pub(crate) in_flight_here: Arc<InFlightHereFn>,
-    /// Whether `snap` is a foreground agent that aterm's relaunch resumed on its conversation ([`relaunch::agent_resumed`]).
+    /// Whether `snap` is a foreground agent that resumes a conversation, aterm's relaunch or its own arguments ([`relaunch::resumes_conversation`]).
     pub(crate) agent_resumed: Arc<AgentResumedFn>,
     /// One step of a restart the outgoing instance left in flight at a seamless update's Commit.
     #[cfg_attr(not(any(unix, test)), allow(dead_code))]
@@ -2927,6 +3269,12 @@ pub(crate) struct Acts {
     pub(crate) transcript_tail: Arc<TranscriptTailFn>,
     /// What the session's repository holds that no remote has.
     pub(crate) repo_work: Arc<RepoWorkFn>,
+    /// Where the session's agent works ([`WorkerIdle::work_look`]): live, the folder
+    /// [`aterm_agent::harness::work_record::work_dir`] chooses read by
+    /// [`aterm_agent::harness::repo_work::read_work`], nothing in a summary worker's folder.
+    pub(crate) work_read: Arc<WorkReadFn>,
+    /// That record put on the session's timeline for the survey ([`work_put_live`]).
+    pub(crate) work_put: Arc<WorkPutFn>,
     /// The transcript a task's result is snapshotted from.
     pub(crate) transcript: Arc<TranscriptFn>,
     /// The task is over with its agent: a tasked session whose agent left and that nothing brings back.
@@ -2949,6 +3297,8 @@ pub(crate) struct Acts {
     pub(crate) account_seat: Arc<AccountSeatFn>,
     /// The agent's exec environment while its kernel identity, command and login match the snapshot.
     pub(crate) account_env: Arc<AccountEnvFn>,
+    /// A settled, current screen's usage wall for this process, without requiring a transcript row.
+    pub(crate) account_screen_wall: Arc<AccountScreenWallFn>,
     /// Whether the agent's settings leave it its stored login.
     pub(crate) account_settings: Arc<AccountSettingsFn>,
     /// When the kernel started process `pid`, in Unix seconds (`aterm_uds::process::read_process_birth`).
@@ -2965,6 +3315,14 @@ pub(crate) struct Acts {
     pub(crate) hold: Arc<HoldFn>,
     /// The route a Claude Code agent's API requests take.
     pub(crate) route: Arc<RouteFn>,
+    /// The route variables a Claude Code agent's launch sets, across its environment and settings
+    /// ([`aterm_agent::harness::netwatch::launch_env`]), read for the endpoint of a route of its
+    /// own ([`WorkerIdle::endpoint`]).
+    pub(crate) claude_env: Arc<ClaudeEnvFn>,
+    /// What an agy agent's `settings.json` says of its model backend
+    /// ([`aterm_agent::harness::witness::agy_backend_on_disk`]), read once its exec environment is
+    /// read ([`WorkerIdle::endpoint`]).
+    pub(crate) agy_backend: Arc<AgyBackendFn>,
     /// This Mac's network path, which a windowed host's API reach probe watches from its first
     /// ask, peek or path-only read ([`NetProbe::watch_path`]), none made with `probe_api` off:
     /// Network.framework's path monitor live ([`crate::harness_netprobe::SystemPath`]), none in
@@ -2985,6 +3343,8 @@ pub(crate) struct WalledAgent<'a> {
     pub(crate) session: &'a str,
     /// `[harness] usage_notes`, read live.
     pub(crate) own: bool,
+    /// A current screen wall, excluded while a wall-triggered account move awaits its reply.
+    pub(crate) screen_wall: Option<ScreenAccountWall>,
 }
 
 /// Mark a stop without waking the worker or invoking its connection callback.
@@ -3202,9 +3562,14 @@ fn worker_run(mut job: WorkerJob, hooks: &Hooks) -> WorkerExit {
         job.unset_mark = false;
         *job.interrupt.lock().unwrap_or_else(PoisonError::into_inner) = None;
         (hooks.waiting)(&job.sid, None);
+        // THE RECEIPT GOES WITH THE RUN (§14.9.3), stored before the face's unknown, whose wake
+        // carries it; the next run's loop tells it again from its journal with the landed face.
+        let _ = (hooks.receipt)(&job.sid, None);
+        let _ = (hooks.said)(&job.sid, None);
         (hooks.fact)(&job.sid, crate::HarnessFact::Task(None));
         (hooks.fact)(&job.sid, crate::HarnessFact::Pause(None));
         (hooks.fact)(&job.sid, crate::HarnessFact::Waiting(None));
+        (hooks.fact)(&job.sid, crate::HarnessFact::SwitchAsked(false));
         if (hooks.hold)(&job.sid, None) {
             (hooks.fact)(&job.sid, crate::HarnessFact::LandHeld);
         }
@@ -3345,7 +3710,11 @@ fn attach(job: &WorkerJob, hooks: &Hooks) {
     if !upgrades(job.agent) && !relaunches(job.agent) {
         return;
     }
-    with_kept(job, |k| k.carry_asked = false);
+    with_kept(job, |k| {
+        k.carry_asked = false;
+        k.carry_hold = None;
+    });
+    due_moved(&job.kept);
     let due = if job.switches.upgrade() && upgrades(job.agent) {
         (hooks.acts.due)(&job.sid)
     } else {
@@ -3363,14 +3732,9 @@ fn attach(job: &WorkerJob, hooks: &Hooks) {
     let looks = due != Due::No;
     if looks {
         owe_note(&job.note, crate::upgrade_host::now_s());
-        if matches!(
-            ask_note(&job.sid, &job.note, hooks),
-            Some(Behind::Busy | Behind::Unread(_))
-        ) {
-            ring();
-        }
+        note_within(&job.sid, &job.note, hooks, hooks.acts.point_read);
     }
-    refresh_snapshot(&job.sid, &job.kept, hooks);
+    reread(&job.sid, &job.kept, hooks, None, hooks.acts.point_read);
     let incomplete = with_kept(job, |k| {
         k.snapshot.as_ref().is_none_or(|s| s.session.is_none())
     });
@@ -3388,6 +3752,10 @@ const fn upgrades(agent: Program) -> bool {
 const fn relaunches(agent: Program) -> bool {
     aterm_agent::harness::lanes::lanes(agent).relaunch
 }
+
+/// How long the loop's own act waits on a carry-on owed, a person's hold renewing it
+/// ([`WorkerIdle::carry_holds`]).
+const CARRY_HOLD: Duration = Duration::from_secs(relaunch::STALE_S);
 
 /// Whether this host carries `agent`'s relaunch on exit at its idle point ([`WorkerIdle::idle_step`]).
 fn host_carries_relaunch(agent: Program) -> bool {
@@ -3411,6 +3779,27 @@ const fn reads_transcript(agent: Program) -> bool {
         | Program::Grok
         | Program::Kimi
         | Program::Agy
+        | Program::Muse
+        | Program::Generic => false,
+    }
+}
+
+/// Whether the host reads `agent`'s usage-limit reset timestamp ([`WorkerIdle::limit_until`]).
+const fn reads_limit_until(agent: Program) -> bool {
+    match agent {
+        Program::Claude | Program::Agy => true,
+        Program::Codex | Program::Grok | Program::Kimi | Program::Muse | Program::Generic => false,
+    }
+}
+
+/// Whether the host re-evaluates `agent`'s model quota rotation on turn and wall events.
+const fn rotates_model_quota(agent: Program) -> bool {
+    match agent {
+        Program::Agy => true,
+        Program::Claude
+        | Program::Codex
+        | Program::Grok
+        | Program::Kimi
         | Program::Muse
         | Program::Generic => false,
     }
@@ -3509,7 +3898,8 @@ fn land(owed: &mut Option<Owed>) -> (bool, bool) {
     })
 }
 
-/// An ask in flight ([`ask_note`]) that has not landed: an act that panics lands it as it unwinds.
+/// An ask in flight ([`asked_note`]) that has not landed: unwinding forgets failed work while
+/// preserving a note owed again during the ask.
 struct InFlight<'a>(Option<&'a Mutex<Option<Owed>>>);
 
 impl Drop for InFlight<'_> {
@@ -3517,64 +3907,156 @@ impl Drop for InFlight<'_> {
         let Some(note) = self.0.take() else {
             return;
         };
-        let (rings, _) = land(&mut note.lock().unwrap_or_else(PoisonError::into_inner));
-        if rings {
+        let reowed = {
+            let mut owed = note.lock().unwrap_or_else(PoisonError::into_inner);
+            let (_, reowed) = land(&mut owed);
+            if !reowed {
+                *owed = None;
+            }
+            reowed
+        };
+        if reowed {
             ring();
         }
     }
 }
 
-/// Ask the session's owed note once ([`Acts::behind`], with no lock held over the ask) and keep what it decides.
+/// Take the session's owed note for one ask ([`Owed::flying`]): the second it is owed since, or
+/// none where nothing is owed or an ask is in flight (told to ring the host as it lands). An ask
+/// taken to `ring` rings the host as it lands where the host is to wake for it again.
+fn take_note(note: &Mutex<Option<Owed>>, rings: bool) -> Option<u64> {
+    let mut owed = note.lock().unwrap_or_else(PoisonError::into_inner);
+    let o = owed.as_mut()?;
+    if o.flying {
+        o.skipped = true;
+        return None;
+    }
+    o.flying = true;
+    o.skipped |= rings;
+    Some(o.since)
+}
+
+/// Ask the session's owed note once on the caller's thread ([`asked_note`]).
+#[cfg(test)]
 fn ask_note(sid: &str, note: &Mutex<Option<Owed>>, hooks: &Hooks) -> Option<Behind> {
-    let lock = || note.lock().unwrap_or_else(PoisonError::into_inner);
-    let since = {
-        let mut owed = lock();
-        let o = owed.as_mut()?;
-        if o.flying {
-            o.skipped = true;
-            return None;
-        }
-        o.flying = true;
-        o.since
+    let since = take_note(note, false)?;
+    Some(asked_note(sid, note, since, hooks))
+}
+
+/// Ask the session's owed note on a thread of its own ([`fly_note`]), one ask in flight per
+/// session, waiting `bound` at most: the ask lands as it ends, and rings the host where it is to
+/// wake again.
+fn note_within(sid: &str, note: &Note, hooks: &Hooks, bound: Duration) {
+    let Some(since) = take_note(note, true) else {
+        return;
     };
+    if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+        fly_note(sid, note, since, hooks).recv_timeout(bound)
+    {
+        aterm_log::info!(
+            "harness @{sid}: its note behind is still out after {} ms; the worker goes on, and \
+             the note lands as it ends",
+            bound.as_millis()
+        );
+    }
+}
+
+/// Ask a note taken ([`take_note`]) on a thread of its own: what it decides, sent as it lands.
+fn fly_note(
+    sid: &str,
+    note: &Note,
+    since: u64,
+    hooks: &Hooks,
+) -> std::sync::mpsc::Receiver<Behind> {
+    let (said, heard) = std::sync::mpsc::sync_channel(1);
+    let (job_sid, job_note, job_hooks, job_said) = (
+        sid.to_string(),
+        Arc::clone(note),
+        hooks.clone(),
+        said.clone(),
+    );
+    let spawned = std::thread::Builder::new()
+        .name(format!("{THREAD_PREFIX}note-behind"))
+        .spawn(move || {
+            if let Some(word) = asked_caught(&job_sid, &job_note, since, &job_hooks) {
+                let _ = job_said.send(word);
+            }
+        });
+    if let Err(e) = spawned {
+        aterm_log::warn!("harness @{sid}: no thread for its note behind ({e}); it is asked here");
+        if let Some(word) = asked_caught(sid, note, since, hooks) {
+            let _ = said.send(word);
+        }
+    }
+    heard
+}
+
+/// [`asked_note`], caught after its unwind has settled the failed ask.
+fn asked_caught(
+    sid: &str,
+    note: &Mutex<Option<Owed>>,
+    since: u64,
+    hooks: &Hooks,
+) -> Option<Behind> {
+    catch_note_ask(sid, || asked_note(sid, note, since, hooks))
+}
+
+fn catch_note_ask(sid: &str, ask: impl FnOnce() -> Behind) -> Option<Behind> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(ask))
+        .map_err(|payload| {
+            aterm_log::warn!(
+                "harness @{sid}: its note behind stopped after an internal panic: {}",
+                Panic::of(payload.as_ref())
+            );
+        })
+        .ok()
+}
+
+/// Ask a note taken ([`take_note`]) once ([`Acts::behind`], with no lock held over the ask) and keep what it decides.
+fn asked_note(sid: &str, note: &Mutex<Option<Owed>>, since: u64, hooks: &Hooks) -> Behind {
+    let lock = || note.lock().unwrap_or_else(PoisonError::into_inner);
     let mut flight = InFlight(Some(note));
     let said = (hooks.acts.behind)(sid, since);
-    flight.0 = None;
     let now = Instant::now();
     let mut owed = lock();
+    // A pause hook can unwind. Keep the ask in flight until every fallible part is prepared,
+    // then commit its state and disarm the guard before another activation can take the lock.
+    let next = match (said, owed.as_ref()) {
+        (_, Some(o)) if o.reowed => None,
+        (Behind::Busy, Some(_)) => Some(now + (hooks.pause)(relaunch::BUSY)),
+        (Behind::Unread(_), Some(o)) => NOTE_AGAIN
+            .get(o.unread as usize)
+            .map(|pause| now + (hooks.pause)(*pause)),
+        _ => None,
+    };
     let (rings, reowed) = land(&mut owed);
     match (said, owed.as_mut()) {
         _ if reowed => {}
         (Behind::Noted | Behind::Nothing, _) => *owed = None,
         (Behind::Busy, Some(o)) => {
             o.asked = Some(now);
-            o.by = Some(now + (hooks.pause)(relaunch::BUSY));
+            o.by = next;
         }
         (Behind::Unread(_), Some(o)) => {
             o.asked = Some(now);
-            o.by = NOTE_AGAIN
-                .get(o.unread as usize)
-                .map(|pause| now + (hooks.pause)(*pause));
+            o.by = next;
             o.unread = o.unread.saturating_add(1);
         }
         (_, None) => {}
     }
+    flight.0 = None;
     drop(owed);
     if said == Behind::Noted {
         note_upgrade_act();
     } else if rings && (reowed || matches!(said, Behind::Busy | Behind::Unread(_))) {
         ring();
     }
-    Some(said)
+    said
 }
 
-/// Query a worker's owed note at a wake ([`Owed`]) once its instant arrives or the worker ends.
-fn host_note(
-    sid: &str,
-    note: &Mutex<Option<Owed>>,
-    now: Instant,
-    hooks: &Hooks,
-) -> Option<Instant> {
+/// Query a worker's owed note at a wake ([`Owed`]) once its instant arrives or the worker ends: the
+/// ask runs on a thread of its own ([`fly_note`]), and its landing rings the host.
+fn host_note(sid: &str, note: &Note, now: Instant, hooks: &Hooks) -> Option<Instant> {
     let asks = {
         let mut owed = note.lock().unwrap_or_else(PoisonError::into_inner);
         let o = owed.as_mut()?;
@@ -3588,9 +4070,8 @@ fn host_note(
                 && o.asked
                     .is_some_and(|at| now >= at + (hooks.pause)(NOTE_GAP)))
     };
-    if asks && host_caught(sid, "its note behind", || ask_note(sid, note, hooks)).is_none() {
-        *note.lock().unwrap_or_else(PoisonError::into_inner) = None;
-        return None;
+    if asks && let Some(since) = take_note(note, true) {
+        drop(fly_note(sid, note, since, hooks));
     }
     host_wake(note)
 }
@@ -3735,8 +4216,8 @@ fn conversation_typed(
     o: &upgrade_drive::Opts,
     sid: &str,
     snap: &Snapshot,
-) -> Vec<aterm_agent::supervise::approvals::Typed> {
-    upgrade_drive::conversation_typed(o, sid, snap.session.as_deref(), &[])
+) -> Option<Vec<aterm_agent::supervise::approvals::Typed>> {
+    upgrade_drive::conversation_typed(o, sid, snap.session.as_deref(), &[]).ok()
 }
 
 const LIMIT_READ_AGAIN: Duration = Duration::from_secs(60);
@@ -3794,14 +4275,48 @@ impl Points {
 }
 
 /// How a worker reads its session's API reach ([`WorkerIdle::reach_read`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ReachRead {
     /// `probe_api` is off: nothing is read, so it is Unknown with no next look.
     Off,
-    /// The instance's probe measures it ([`NetProbe::ask`]).
-    Measured,
+    /// The instance's probe of the endpoint the session's launch names measures it
+    /// ([`NetProbe::to`], [`NetProbe::ask`]).
+    Measured(Target),
     /// The network path alone gives it ([`NetProbe::path_reach`]).
     Path,
+}
+
+/// What the agent's launch names of its API route, as last read for one agent process and
+/// directory ([`WorkerIdle::route_of`], [`WorkerIdle::endpoint`]).
+#[derive(Debug, Default)]
+struct Launch {
+    /// The process read: its pid, kernel start and working directory.
+    of: Option<(u32, String, String)>,
+    /// Its route as Claude Code's settings chain reads it ([`Acts::route`]).
+    route: Option<Route>,
+    /// The endpoint it names ([`witness::endpoint_of`]).
+    endpoint: Option<witness::Endpoint>,
+    /// Its gap for an environment or a settings source not read was logged: one not read is
+    /// read again at each ask, and said once.
+    unread_said: bool,
+}
+
+impl Launch {
+    /// The cache for agent `pid` (started `start`, in `cwd`): this one where it is that agent's,
+    /// else emptied for it.
+    fn of(&mut self, pid: u32, start: &str, cwd: &str) -> &mut Self {
+        let same = self
+            .of
+            .as_ref()
+            .is_some_and(|(p, s, c)| *p == pid && s == start && c == cwd);
+        if !same {
+            *self = Self {
+                of: Some((pid, start.to_string(), cwd.to_string())),
+                ..Self::default()
+            };
+        }
+        self
+    }
 }
 
 /// The worker's part at its loop's idle points ([`IdleHost`]).
@@ -3835,8 +4350,9 @@ pub(crate) struct WorkerIdle {
     clock_hold: Mutex<Option<u64>>,
     /// The instance's one API reach probe ([`NetProbe`]).
     net: Arc<NetProbe>,
-    /// The agent's route as last read, by its pid, kernel start and working directory.
-    route: Mutex<Option<(u32, String, String, Route)>>,
+    /// The agent's route and endpoint as last read, by its pid, kernel start and working
+    /// directory ([`Launch`]).
+    route: Mutex<Launch>,
     /// The agent's memory as last measured, by its pid and when ([`WorkerIdle::memory`]).
     memory: Mutex<Option<(u32, Instant, Option<AgentMemory>)>>,
     /// What the loop last offered and withheld ([`Points`]).
@@ -3855,6 +4371,9 @@ pub(crate) struct WorkerIdle {
     told: AtomicU8,
     /// The session's repository probe, read on its own thread ([`IdleHost::repo_work`]).
     repo_probe: aterm_agent::harness::repo_work::Probing,
+    /// The group of the session's agent, as its job's ([`WorkerJob::group`]): the one a work
+    /// record read is put for ([`Acts::work_put`]).
+    group: Arc<AtomicI32>,
 }
 
 /// Which told wait a worker last handed the window ([`WorkerIdle::told`]).
@@ -3886,9 +4405,117 @@ impl WorkerIdle {
         with_kept_of(&self.kept, |k| k.snapshot.clone())
     }
 
+    /// The kept snapshot, followed, while its agent holds the tab ([`Acts::follow`]).
+    fn kept_in_tab(&self) -> Option<Snapshot> {
+        let mut snap = self.followed_kept()?;
+        ((self.hooks.acts.follow)(&self.sid, &mut snap) == Foreground::Agent).then_some(snap)
+    }
+
+    /// The snapshot a read of a Claude Code's transcript goes by: the relaunch record read again
+    /// within [`Acts::point_read`] ([`reread`]). Where that read is still out, the kept snapshot
+    /// while its agent holds the tab ([`Self::kept_in_tab`]), as the idle point goes on with it;
+    /// none where the read ended with none landed.
+    fn transcript_kept(&self) -> Option<Snapshot> {
+        if !reads_transcript(self.agent) {
+            return None;
+        }
+        let hooks = &self.hooks;
+        match reread(&self.sid, &self.kept, hooks, None, hooks.acts.point_read) {
+            Reread::Landed => with_kept_of(&self.kept, |k| k.snapshot.clone()),
+            Reread::Out => self.kept_in_tab(),
+            Reread::Unlanded => None,
+        }
+    }
+
+    /// Read the relaunch record again after an act that ended at `acted`, within
+    /// [`Acts::point_read`]: a read begun since ([`reread`]).
+    fn reread_after_act(&self, acted: Instant) -> Reread {
+        let hooks = &self.hooks;
+        reread(
+            &self.sid,
+            &self.kept,
+            hooks,
+            Some(acted),
+            hooks.acts.point_read,
+        )
+    }
+
     /// Whether macOS's program check reads stuck on the worker's board ([`Acts::program_check`]).
     fn program_check_stuck(&self) -> bool {
         crate::program_check_watch::stuck(self.hooks.acts.program_check)
+    }
+
+    /// The work record's look at `look`, at `now`: where [`work_read_starts`] says, a read starts
+    /// on a thread of its own and puts what it finds ([`Self::work_reader`]); a turn break waits
+    /// for it [`aterm_agent::harness::repo_work::PROBE_ASK`] at most, or until the worker is
+    /// stopped, and a read still going on past that puts its record as it ends.
+    fn work_look(&self, look: WorkLook, now: Instant) {
+        use aterm_agent::harness::repo_work::{PROBE_ASK, Probing};
+        use aterm_agent::harness::work_record::WorkRead;
+        let held = crate::program_check_watch::starts_held(self.hooks.acts.program_check);
+        let group = self.group.load(Ordering::SeqCst);
+        let starts = with_kept_of(&self.kept, |k| {
+            let work = k.work.of(group);
+            let starts = work_read_starts(work, look, now, held);
+            if starts {
+                work.started = Some(now);
+                work.reading = true;
+            }
+            starts
+        });
+        if !starts {
+            return;
+        }
+        let wait = match look {
+            WorkLook::Busy => Duration::ZERO,
+            WorkLook::Break => PROBE_ASK,
+        };
+        let probing = Probing::<WorkRead>::named(format!("{THREAD_PREFIX}work-{}", self.sid));
+        let _ = probing.ask(|| self.work_reader(), wait, &self.stop);
+    }
+
+    /// One work record read, for its own thread: it starts no git while macOS's program check
+    /// holds starts back (checked again here, as the read begins, and by the read before each
+    /// git it starts), puts a record it reads and clears one where there is nothing to show, and
+    /// leaves the last record standing where it could not read.
+    fn work_reader(
+        &self,
+    ) -> impl FnOnce() -> aterm_agent::harness::work_record::WorkRead + Send + 'static {
+        use aterm_agent::harness::work_record::{WorkRead, WorkRecord};
+        let reading = WorkReading(Arc::clone(&self.kept));
+        let snap = with_kept_of(&self.kept, |k| k.snapshot.clone());
+        let (sid, agent, group) = (
+            self.sid.clone(),
+            self.agent,
+            self.group.load(Ordering::SeqCst),
+        );
+        let (read, put) = (
+            Arc::clone(&self.hooks.acts.work_read),
+            Arc::clone(&self.hooks.acts.work_put),
+        );
+        let board = self.hooks.acts.program_check;
+        move || {
+            let _reading = reading;
+            let held = || crate::program_check_watch::starts_held(board);
+            if held() {
+                return WorkRead::Unread;
+            }
+            let found = read(&sid, agent, snap.as_ref(), &held);
+            match &found {
+                WorkRead::Read(record) => put(&sid, group, Some(WorkRecord::clone(record))),
+                WorkRead::None => put(&sid, group, None),
+                WorkRead::Unread => {}
+            }
+            found
+        }
+    }
+
+    /// The task's face, as the work record reads it: no read starts for this worker's agent
+    /// while it is landed.
+    fn work_face(&self, face: aterm_agent::harness::acts::TaskFace) {
+        let landed = face == aterm_agent::harness::acts::TaskFace::Landed;
+        let group = self.group.load(Ordering::SeqCst);
+        with_kept_of(&self.kept, |k| k.work.of(group).landed = landed);
     }
 
     /// The host's account advice for a pooled CLI other than Claude Code. The pool
@@ -3950,7 +4577,7 @@ impl WorkerIdle {
                 env: &pairs,
                 sample,
                 point: at,
-                mode: self.switches.accounts(),
+                mode: self.switches.pool_controls(cli).mode,
                 relaunch: relaunch::PoolRelaunch {
                     dialect: snap.dialect.unwrap_or(upgrade::Dialect::Zsh),
                     cd: Some(&snap.cwd),
@@ -3967,9 +4594,17 @@ impl WorkerIdle {
                 look.note_pool_session(&self.kept, note);
             },
         );
-        if let accounts::Advice::Move { to, .. } = planned.advice() {
+        if let accounts::Advice::Move { to, yields, .. } = planned.advice() {
             aterm_log::info!("harness @{}: account advice: move to {to}", self.sid);
-            return Some(AccountAdvice::Move { to: to.clone() });
+            let clock = Instant::now();
+            let yields = yields.map(|until| {
+                let secs = u64::try_from(until.saturating_sub(seat.now)).unwrap_or(0);
+                clock + Duration::from_secs(secs)
+            });
+            return Some(AccountAdvice::Move {
+                to: to.clone(),
+                yields,
+            });
         }
         aterm_log::info!(
             "harness @{}: account advice at {point:?} for {}: {}",
@@ -3999,6 +4634,12 @@ impl WorkerIdle {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .is_some()
+    }
+
+    fn native_stands_down(&self) -> bool {
+        (self.hooks.acts.status)(&self.sid)
+            .as_deref()
+            .is_some_and(foreign_scoped_coordination)
     }
 
     /// The stored login the session's agent signs in with, as the host's latch keys its sign-in ([`login_latch::login_key`]).
@@ -4117,25 +4758,54 @@ impl IdleHost for WorkerIdle {
     }
 
     /// This tab's live agent calls at no progress ([`IdleHost::facts`]), worst first, as of the
-    /// board's view; `None` with no view or one older than [`crate::vitals_jobs::JOBS_FRESH`]. A
-    /// call is named only once its leader is proved alive at its birth ([`Acts::leader_lives`],
-    /// asked after the board's lock is let go).
+    /// board's view, and the programs of its calls (and their orphans) macOS's program check holds
+    /// ([`crate::vitals_jobs::JobsBoard::held`]); `None` with no view or one older than
+    /// [`crate::vitals_jobs::JOBS_FRESH`]. A call is named only once its leader is proved alive at
+    /// its birth ([`Acts::leader_lives`]), and a held program only once it is proved held now in
+    /// the same exec, in a process as old as its told wait ([`Acts::held_now`]), each asked after
+    /// the board's lock is let go; each held for its view's time plus the view's age. The held part
+    /// is as of that re-proof (the view that names a held program is read every 30 s, and a fact is told only
+    /// from a reading 5 s old). A re-proof drops what it cannot prove and proves no absence: a
+    /// view whose held rows it proves none of is a part unread (`None`), which opens and closes
+    /// nothing, since a program held since the view is in no row; only a view that names none is a
+    /// part with none, as of the view.
     fn facts(&self) -> Option<aterm_agent::supervise::FactsReading> {
-        let (age, calls) = self
-            .hooks
-            .acts
-            .jobs_board
-            .facts(&self.sid, Instant::now())?;
+        let now = Instant::now();
+        let board = self.hooks.acts.jobs_board;
+        let (age, calls) = board.facts(&self.sid, now)?;
+        let held = board.held(&self.sid, now);
         let now_ms = i64::try_from(aterm_time::unix_millis()?).ok()?;
-        let age_ms = i64::try_from(age.as_millis()).unwrap_or(i64::MAX);
+        let ms = |age: Duration| i64::try_from(age.as_millis()).unwrap_or(i64::MAX);
         let lives = self.hooks.acts.leader_lives;
+        let held_now = self.hooks.acts.held_now;
         Some(aterm_agent::supervise::FactsReading {
-            as_of_ms: now_ms.saturating_sub(age_ms),
+            as_of_ms: now_ms.saturating_sub(ms(age)),
             no_progress: calls
                 .into_iter()
                 .filter(|(leader, call)| call.birth.is_some_and(|birth| lives(*leader, birth)))
                 .map(|(_, call)| call)
                 .collect(),
+            held: held.and_then(|(age, rows)| {
+                let age_ms = ms(age);
+                if rows.is_empty() {
+                    return Some(aterm_agent::supervise::HeldReading {
+                        as_of_ms: now_ms.saturating_sub(age_ms),
+                        programs: Vec::new(),
+                    });
+                }
+                let programs: Vec<aterm_agent::supervise::HeldCall> = rows
+                    .into_iter()
+                    .map(|h| aterm_agent::supervise::HeldCall {
+                        held_ms: h.held_ms.saturating_add(age_ms.unsigned_abs()),
+                        ..h
+                    })
+                    .filter(held_now)
+                    .collect();
+                (!programs.is_empty()).then_some(aterm_agent::supervise::HeldReading {
+                    as_of_ms: now_ms,
+                    programs,
+                })
+            }),
         })
     }
 
@@ -4280,6 +4950,7 @@ impl IdleHost for WorkerIdle {
             snap: &snap,
             session: &session,
             own,
+            screen_wall: None,
         };
         let word = (self.hooks.acts.account_usage)(&self.sid, &walled, &settled, seen, listed);
         let credits = if seen.credits.is_some() {
@@ -4299,9 +4970,10 @@ impl IdleHost for WorkerIdle {
         }
     }
 
-    /// The live upgrade's wind-down owns the turn ends.
+    /// The live upgrade's wind-down owns the turn ends, or a relaunch's carry-on is owed
+    /// ([`Self::carry_holds`]).
     fn owns_turn_end(&self) -> bool {
-        self.on() && self.owns.load(Ordering::SeqCst) && self.switches.upgrade()
+        self.winding_down() || self.carry_holds()
     }
 
     /// The disk is full for this session.
@@ -4375,6 +5047,7 @@ impl IdleHost for WorkerIdle {
     ) -> Option<(String, aterm_agent::supervise::policy::turn_end::HostTurn)> {
         self.points.offered(crate::upgrade_host::now_s());
         if !self.on()
+            || self.native_stands_down()
             || self.beside()
             || !upgrades(self.agent)
             || !self.switches.upgrade()
@@ -4445,6 +5118,9 @@ impl IdleHost for WorkerIdle {
     /// The agent rests at a point its loop's guard withheld from this worker
     /// ([`IdleHost::at_withheld_point`]: a limit episode, a wall, the loop's own act in flight).
     fn at_withheld_point(&self, wake: bool) -> Option<String> {
+        if self.native_stands_down() {
+            return None;
+        }
         if !self.on() || (wake && !self.settle_later.load(Ordering::SeqCst)) {
             return None;
         }
@@ -4465,7 +5141,7 @@ impl IdleHost for WorkerIdle {
 
     /// The restart in place its loop asks for ([`Restart`]).
     fn restart(&self, why: &Restart) -> Option<String> {
-        if !self.can_restart() || self.beside() {
+        if !self.can_restart() || self.beside() || self.native_stands_down() {
             return None;
         }
         if let Restart::Account { to, at } = why {
@@ -4488,7 +5164,7 @@ impl IdleHost for WorkerIdle {
             self.park.store(true, Ordering::SeqCst);
         }
         note_upgrade_act();
-        refresh_snapshot(&self.sid, &self.kept, hooks);
+        self.reread_after_act(Instant::now());
         Some(step)
     }
 
@@ -4552,21 +5228,24 @@ impl IdleHost for WorkerIdle {
         (self.hooks.acts.owed)(&self.sid, carries_only(self.agent))
     }
 
-    /// Whether the foreground agent in the tab was relaunched by aterm to resume its conversation
-    /// ([`IdleHost::agent_resumed`]). Refreshes the snapshot when a new foreground process has not
-    /// been captured yet.
+    /// The carry-on not yet taken, its confirmation looks apart: a resume's cut read as the restart's
+    /// goes no further, and a person's Esc in the looks after the carry-on is theirs.
+    fn carry_owed(&self) -> bool {
+        (self.hooks.acts.carry_owed)(&self.sid, carries_only(self.agent))
+    }
+
+    /// Whether the foreground agent in the tab resumes a conversation, aterm's relaunch or its own
+    /// arguments ([`IdleHost::agent_resumed`]). Refreshes the snapshot when a new foreground process
+    /// has not been captured yet.
     fn agent_resumed(&self) -> Option<AgentResumed> {
-        let live_foreground = |mut snap: Snapshot| {
-            ((self.hooks.acts.follow)(&self.sid, &mut snap) == Foreground::Agent).then_some(snap)
-        };
-        let snap = self.followed_kept().and_then(live_foreground).or_else(|| {
+        let snap = self.kept_in_tab().or_else(|| {
             refresh_snapshot_at_point(
                 &self.sid,
                 &self.kept,
                 &self.hooks,
                 self.hooks.acts.point_read,
             );
-            self.followed_kept().and_then(live_foreground)
+            self.kept_in_tab()
         })?;
         Some(AgentResumed {
             pid: snap.pid,
@@ -4600,16 +5279,20 @@ impl IdleHost for WorkerIdle {
     }
 
     /// What the host reads of this session's API reach ([`Self::reach_read`]): with `probe_api`
-    /// off, nothing (Unknown); else what the probe measures of Claude Code's default API route
-    /// ([`Self::measures_reach`]); and every other session (another agent, whose endpoint the
-    /// Anthropic probe does not measure, a Claude Code on a route of its own, or one not yet
-    /// snapshotted) reads the network path alone ([`NetProbe::path_reach`]: Down while it is
-    /// lost or settling, else Unknown), which probes nothing, so its outage holds and its
+    /// off, nothing (Unknown); else what the instance's probe of the endpoint the session's launch
+    /// names measures ([`Self::measured`]: Claude Code's default API route, Muse Code's
+    /// `--base-url`, agy's `GOOGLE_GEMINI_BASE_URL`); and every other session (one whose launch
+    /// names no endpoint the host can reach as it does, a program whose route is not read, or one
+    /// not yet snapshotted) reads the network path alone ([`NetProbe::path_reach`]: Down while
+    /// it is lost or settling, else Unknown), which probes nothing, so its outage holds and its
     /// return re-decides the wait.
     fn reach(&self) -> Reach {
         match self.reach_read() {
             ReachRead::Off => Reach::Unknown,
-            ReachRead::Measured => self.net.ask(&self.sid),
+            ReachRead::Measured(target) => self
+                .net
+                .to(&target)
+                .map_or_else(|| self.net.path_reach(), |probe| probe.ask(&self.sid)),
             ReachRead::Path => self.net.path_reach(),
         }
     }
@@ -4621,7 +5304,10 @@ impl IdleHost for WorkerIdle {
     fn reach_peek(&self) -> Reach {
         match self.reach_read() {
             ReachRead::Off => Reach::Unknown,
-            ReachRead::Measured => self.net.peek(),
+            ReachRead::Measured(target) => self
+                .net
+                .to(&target)
+                .map_or_else(|| self.net.path_reach(), |probe| probe.peek()),
             ReachRead::Path => self.net.path_reach(),
         }
     }
@@ -4633,9 +5319,34 @@ impl IdleHost for WorkerIdle {
     fn reach_at(&self) -> Option<Instant> {
         match self.reach_read() {
             ReachRead::Off => None,
-            ReachRead::Measured => self.net.landing(),
+            ReachRead::Measured(target) => self
+                .net
+                .to(&target)
+                .map_or_else(|| self.net.path_landing(), |probe| probe.landing()),
             ReachRead::Path => self.net.path_landing(),
         }
+    }
+
+    /// This session's turn ended on a real reply `at` ([`IdleHost::answered`]): booked on the
+    /// instance's book as a witness on its route ([`Self::route_key`], [`NetProbe::answered`]),
+    /// nothing for a gap. It reads no network, so `probe_api` does not gate it.
+    fn answered(&self, ago_ms: u64) {
+        if let Some(key) = self.route_key() {
+            let now = Instant::now();
+            let age = Duration::from_millis(ago_ms);
+            if age < witness::WITNESS_KEPT
+                && let Some(at) = now.checked_sub(age)
+            {
+                self.net.answered(key, &self.sid, at);
+            }
+        }
+    }
+
+    /// The newest answer of another session on this session's route ([`IdleHost::witness`],
+    /// [`NetProbe::witness`]), none for a gap.
+    fn witness(&self) -> Option<Instant> {
+        let key = self.route_key()?;
+        self.net.witness(&key, &self.sid)
     }
 
     /// What the host measures of the agent's memory ([`IdleHost::memory`]).
@@ -4667,6 +5378,10 @@ impl IdleHost for WorkerIdle {
                 .unwrap_or_else(PoisonError::into_inner)
                 .served = Some(pid);
         }
+        if rotates_model_quota(self.agent) && self.switches.upgrade() {
+            due_moved(&self.kept);
+            self.park.store(true, Ordering::SeqCst);
+        }
         let unnamed = self.unnamed();
         let mut run = self.run.lock().unwrap_or_else(PoisonError::into_inner);
         let climbed = run.same > 0;
@@ -4696,6 +5411,7 @@ impl IdleHost for WorkerIdle {
     fn turn_break(&self, theirs: Option<Guard>) {
         if self.on() {
             self.disk_ask_found(theirs);
+            self.work_look(WorkLook::Break, Instant::now());
         }
     }
 
@@ -4715,6 +5431,9 @@ impl IdleHost for WorkerIdle {
         disk_ask_busy(self.hooks.acts.disk_board, &self.sid);
         if let Some(word) = self.tap_step(TapAt::Busy) {
             aterm_log::info!("harness @{}: usage tap mid-turn: {word}", self.sid);
+        }
+        if self.on() {
+            self.work_look(WorkLook::Busy, Instant::now());
         }
     }
 
@@ -4818,41 +5537,45 @@ impl IdleHost for WorkerIdle {
             .last_turn()
     }
 
-    /// The usage limit's reset the conversation's transcript names ([`IdleHost::limit_until`]) for the kept record a Claude Code holds.
+    /// The usage limit's reset the conversation's transcript or quota reading names ([`IdleHost::limit_until`]).
     fn limit_until(&self) -> Option<u64> {
-        if !reads_transcript(self.agent) {
+        if !reads_limit_until(self.agent) {
             return None;
         }
-        let snap = self.followed_kept().filter(|s| s.session.is_some())?;
-        (self.hooks.acts.limit_reset)(&snap)
+        let quota_lane = rotates_model_quota(self.agent);
+        let snap = self
+            .followed_kept()
+            .or_else(|| {
+                if !quota_lane {
+                    return None;
+                }
+                refresh_snapshot_at_point(
+                    &self.sid,
+                    &self.kept,
+                    &self.hooks,
+                    self.hooks.acts.point_read,
+                );
+                self.followed_kept()
+            })
+            .filter(|s| quota_lane || s.session.is_some())?;
+        let reset = (self.hooks.acts.limit_reset)(&snap);
+        if quota_lane && self.switches.upgrade() {
+            due_moved(&self.kept);
+            if (self.hooks.acts.due)(&self.sid) == Due::Yes {
+                self.park.store(true, Ordering::SeqCst);
+            }
+        }
+        reset
     }
 
     /// The transcript that confirms a wall ([`IdleHost::transcript_tail`]).
     fn transcript_tail(&self) -> Option<String> {
-        if !reads_transcript(self.agent) || !refresh_snapshot(&self.sid, &self.kept, &self.hooks) {
-            return None;
-        }
-        let snap = self
-            .kept
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .snapshot
-            .clone()?;
-        (self.hooks.acts.transcript_tail)(&snap)
+        (self.hooks.acts.transcript_tail)(&self.transcript_kept()?)
     }
 
     /// The transcript a task's result is snapshotted from ([`IdleHost::transcript`]).
     fn transcript(&self) -> Option<(PathBuf, String)> {
-        if !reads_transcript(self.agent) || !refresh_snapshot(&self.sid, &self.kept, &self.hooks) {
-            return None;
-        }
-        let snap = self
-            .kept
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .snapshot
-            .clone()?;
-        (self.hooks.acts.transcript)(&snap)
+        (self.hooks.acts.transcript)(&self.transcript_kept()?)
     }
 
     /// The same transcript read again ([`IdleHost::transcript_tail_again`]).
@@ -4880,22 +5603,17 @@ impl IdleHost for WorkerIdle {
 
     /// The limit only the transcript shows ([`IdleHost::standing_limit`]): the Claude Code in the tab now.
     fn standing_limit(&self) -> Option<aterm_agent::harness::upgrade::StandingLimit> {
-        if !reads_transcript(self.agent) || !refresh_snapshot(&self.sid, &self.kept, &self.hooks) {
-            return None;
-        }
-        let snap = self
-            .kept
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .snapshot
-            .clone()?;
-        (self.hooks.acts.standing_limit)(&self.sid, &snap)
+        (self.hooks.acts.standing_limit)(&self.sid, &self.transcript_kept()?)
     }
     /// The loop's limit episode opened or closed.
     fn limited(&self, open: bool) {
         if upgrades(self.agent) {
             if open {
                 self.owns.store(false, Ordering::SeqCst);
+            }
+            if rotates_model_quota(self.agent) && self.switches.upgrade() {
+                due_moved(&self.kept);
+                self.park.store(true, Ordering::SeqCst);
             }
             let now = aterm_time::unix_secs().unwrap_or(0);
             *self
@@ -5008,17 +5726,19 @@ impl IdleHost for WorkerIdle {
     }
 
     /// An act of the harness's ([`IdleHost::act_taken`]).
-    fn act_taken(&self, act: aterm_agent::harness::acts::Act) {
+    fn act_taken(&self, act: aterm_agent::harness::acts::TakenAct) {
         (self.hooks.fact)(&self.sid, crate::HarnessFact::Act(act));
     }
 
     /// The task's face ([`IdleHost::task_face`]).
     fn task_face(&self, face: aterm_agent::harness::acts::TaskFace) {
+        self.work_face(face);
         (self.hooks.fact)(&self.sid, crate::HarnessFact::Task(Some(face)));
     }
 
     /// The task's face restated at the loop's start ([`IdleHost::task_face_noted`]), with the time its end was journaled.
     fn task_face_noted(&self, face: aterm_agent::harness::acts::TaskFace, noted_ms: i64) {
+        self.work_face(face);
         (self.hooks.fact)(&self.sid, crate::HarnessFact::TaskNoted(face, noted_ms));
     }
 
@@ -5029,11 +5749,30 @@ impl IdleHost for WorkerIdle {
         }
     }
 
+    /// The hold's own words (§14.17 item 1, slice 4b): stored under the tab's leaf lock with no
+    /// wake of their own, since the loop tells the hold right after them, and that hold's store
+    /// says they moved.
+    fn land_said(&self, said: Option<&aterm_agent::harness::hold_said::HoldSaid>) {
+        let _ = (self.hooks.said)(&self.sid, said);
+    }
+
     /// Why land still holds: the hold the loop tells where it moved.
     fn land_held(&self, held: Option<aterm_agent::harness::acts::LandHeld>) {
         if (self.hooks.hold)(&self.sid, held) {
             (self.hooks.fact)(&self.sid, crate::HarnessFact::LandHeld);
         }
+    }
+
+    /// Land asked once more at the person's switch over a held tab (v6 §14.17 item 3): the state
+    /// line says so while its answer is out.
+    fn switch_asked(&self, asked: bool) {
+        (self.hooks.fact)(&self.sid, crate::HarnessFact::SwitchAsked(asked));
+    }
+
+    /// What aterm checked at the landing (§14.9, slice 9b): stored under the tab's leaf lock with
+    /// no wake of its own, since the loop tells it before the face whose wake follows.
+    fn land_receipt(&self, receipt: Option<&aterm_agent::harness::acts::LandReceipt>) {
+        let _ = (self.hooks.receipt)(&self.sid, receipt);
     }
 
     /// What the roster advises about this session's account at `point` ([`IdleHost::account`]).
@@ -5047,10 +5786,115 @@ impl IdleHost for WorkerIdle {
         let mut judged = None;
         let advice = self.account_advice(point, owed, &mut judged);
         let progress =
-            self.read_account_progress(&request, point, advice.as_ref(), judged.as_ref());
+            self.read_account_progress(&request, point, advice.as_ref(), judged.as_mut());
         let advice = request.publish_progress(&self.kept, advice, point, progress);
         (self.hooks.note)(HostNote::AccountProgress);
         advice
+    }
+
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "AccountExecutionVisibility",
+            action = "Case",
+            reason = "Native fixture chooses account policy, actual gate inputs, and process or publication changes"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountExecutionVisibility",
+            action = "Observe",
+            project = "harness_host::tests::account_advice::execution_transition"
+        )
+    )]
+    fn account_execution_hold(&self) -> Option<Instant> {
+        use aterm_agent::harness::account_progress::{
+            EXECUTION_CONTEXT_UNREAD_FINDING, EXECUTION_PREPARED_FINDING,
+            EXECUTION_RECORDS_UNREAD_FINDING, EXECUTION_ROSTER_UNREAD_FINDING,
+        };
+        let mut captured = self.capture_execution_progress();
+        let mut reason = EXECUTION_CONTEXT_UNREAD_FINDING;
+        let mut account = None;
+        let result = (|| {
+            if self.beside() {
+                return None;
+            }
+            let cli = accounts::Cli::of(self.agent)?;
+            let seat = (self.hooks.acts.account_seat)()?;
+            let config_dir = seat.roster.as_deref()?.parent()?;
+            let pool = accounts_pool::Seat {
+                config_dir,
+                state: &seat.state,
+                home: &seat.home,
+                now: seat.now,
+            };
+            let wait = || {
+                Some(
+                    Instant::now()
+                        + Duration::from_secs(
+                            u64::try_from(aterm_agent::harness::claims::RECHECK_S).unwrap_or(1),
+                        ),
+                )
+            };
+            let (roster, look, store) = if cli == accounts::Cli::Claude {
+                let roster = match roster_read(&seat) {
+                    Ok(roster) => roster,
+                    Err(RosterUnread::Nothing) => return None,
+                    Err(why) => {
+                        reason = if why == RosterUnread::LoginsUnread {
+                            EXECUTION_RECORDS_UNREAD_FINDING
+                        } else {
+                            EXECUTION_ROSTER_UNREAD_FINDING
+                        };
+                        return wait();
+                    }
+                };
+                let Some(look) = self.account_look(&roster) else {
+                    return wait();
+                };
+                (roster, look, accounts::Store::at(&seat.state))
+            } else {
+                let roster = match pool.bound_roster(cli) {
+                    Ok(roster) if roster.rows.is_empty() => return None,
+                    Ok(roster) => roster,
+                    Err(_) => {
+                        reason = EXECUTION_ROSTER_UNREAD_FINDING;
+                        return wait();
+                    }
+                };
+                let Some((look, _)) = self.pool_account_look(cli, &roster) else {
+                    return wait();
+                };
+                (roster, look, pool.store(cli))
+            };
+            if let Some(bound) = &mut captured {
+                bound.execution_context(&seat, &roster);
+            }
+            let current =
+                || look.with_current(&self.kept, |k| k.account.flying.is_none()) == Some(true);
+            if !current() {
+                return wait();
+            }
+            let label = look.judged(&roster)?;
+            account = Some(label.to_owned());
+            let hold = match store.load(seat.now) {
+                Ok((state, _)) => {
+                    let held = state.execution_verdict(label).is_err();
+                    if held {
+                        reason = EXECUTION_PREPARED_FINDING;
+                    }
+                    held
+                }
+                _ => {
+                    reason = EXECUTION_RECORDS_UNREAD_FINDING;
+                    true
+                }
+            };
+            (hold || !current()).then(wait).flatten()
+        })();
+        self.publish_execution_progress(captured, result, reason, account);
+        result
     }
 
     /// The account this session moved to served a turn ([`IdleHost::account_served`]).
@@ -5198,7 +6042,9 @@ impl IdleHost for WorkerIdle {
         };
         let enrolled = accounts::enrolled(&roster);
         let limit = AccountPoint::Wall {
-            kind: aterm_phase::WallKind::UsageWeekly,
+            kind: look
+                .screen_wall
+                .map_or(aterm_phase::WallKind::UsageWeekly, |wall| wall.kind),
         };
         let (at, _, _) = account_point_read(&seat, &look, limit, seat.now);
         Some(roster_word_of(
@@ -5337,6 +6183,7 @@ impl Drop for WorkerIdle {
         (self.hooks.fact)(&self.sid, crate::HarnessFact::Task(None));
         (self.hooks.fact)(&self.sid, crate::HarnessFact::Pause(None));
         (self.hooks.fact)(&self.sid, crate::HarnessFact::Waiting(None));
+        (self.hooks.fact)(&self.sid, crate::HarnessFact::SwitchAsked(false));
         let silent = self
             .tap
             .get_mut()
@@ -5637,6 +6484,7 @@ impl WorkerIdle {
         };
         let mut held_back = false;
         let mut low_or_limited = false;
+        let mut series = None;
         let noted = self.usage_observed(&seat, &captured, &look.who, |state, now| {
             let (events, held) = accounts::note_reading_held(state, &label, &read, now);
             held_back = held;
@@ -5645,12 +6493,34 @@ impl WorkerIdle {
                     .accounts
                     .get(&label)
                     .is_some_and(|a| a.low(now) || a.limited_until(now).is_some());
+            let windows = state.accounts.get(&label).map(|a| &a.windows);
+            series = Some((
+                state.machine.clone(),
+                windows
+                    .and_then(|w| w.get(accounts::SESSION_LIMIT))
+                    .cloned(),
+                windows.and_then(|w| w.get(accounts::WEEK_LIMIT)).cloned(),
+                account_series::recorded(&events, held),
+                now,
+            ));
             Ok(events)
         });
         match noted {
             Ok(events) => {
                 if low_or_limited {
                     (self.hooks.acts.accounts_upkeep).make(UpkeepStep::Renew);
+                }
+                // The readings series takes the reading the store just recorded, under its own
+                // lock (docs/DESIGN-accounts-outlook-2026-10-25.md §4.2).
+                if let Some((machine, five, seven, recorded, now)) = series {
+                    let _ = account_series::note_recorded(
+                        &seat.state,
+                        &label,
+                        &machine,
+                        (five.as_ref(), seven.as_ref()),
+                        recorded,
+                        now,
+                    );
                 }
                 if !held_back {
                     self.tap
@@ -5775,6 +6645,13 @@ impl WorkerIdle {
         }
         self.park.store(false, Ordering::SeqCst);
         drop(look);
+        // A point that rests only for a relaunch's carry-on: nothing else of this worker's steps
+        // at a question ([`IdlePoint::carry_only`]).
+        if point.carry_only {
+            with_kept_of(&self.kept, |k| k.carry_asked = false);
+            let step = self.idle_step(point);
+            return step.filter(|_| self.on());
+        }
         let adopted_ahead = with_kept_of(&self.kept, |k| {
             k.carry_asked = false;
             std::mem::take(&mut k.account.adopted_ahead)
@@ -5899,6 +6776,9 @@ impl WorkerIdle {
 
     /// The host's step at an idle point ([`Self::idle_point`], which sets a look after it while the conversation is unnamed).
     fn idle_step(&self, point: IdlePoint) -> Option<HostStep> {
+        if self.native_stands_down() {
+            return None;
+        }
         let upgraded = upgrades(self.agent);
         let relaunched = relaunches(self.agent);
         if !self.on() || !(upgraded || host_carries_relaunch(self.agent)) {
@@ -5912,7 +6792,7 @@ impl WorkerIdle {
         self.hold_clock();
         laps::lap("clock");
         if upgraded && self.switches.upgrade() {
-            ask_note(&self.sid, &self.note, hooks);
+            note_within(&self.sid, &self.note, hooks, hooks.acts.point_read);
             laps::lap("note");
         }
         let mut run = self.run.lock().unwrap_or_else(PoisonError::into_inner);
@@ -5920,10 +6800,11 @@ impl WorkerIdle {
         if run.activations != activations {
             run.activations = activations;
             run.worded();
+            due_moved(&self.kept);
         }
         let due = || {
             if upgraded && self.switches.upgrade() {
-                (hooks.acts.due)(&self.sid)
+                due_at_point(&self.sid, &self.kept, hooks, hooks.acts.due_read)
             } else {
                 Due::No
             }
@@ -5932,15 +6813,24 @@ impl WorkerIdle {
         let owed = (hooks.acts.owed)(&self.sid, only);
         laps::lap("owed");
         let (what, step) = if owed {
-            if !self.on() {
+            // NOTHING IS TYPED UNDER OFF, the carry-on kept owed: its tab's worker stands down at
+            // the next pass, and a turn of the switch back finds it.
+            if !self.on() || self.autopilot() == Autopilot::Off {
                 return None;
             }
             let carry = CarryPoint {
                 land: self.autopilot() == Autopilot::Land,
                 done_under_land: point.done_under_land,
+                replies_held: point.replies_held,
                 only,
             };
             let step = (hooks.acts.resume)(&self.sid, self.grace, carry);
+            due_moved(&self.kept);
+            if relaunch::carry_stands(&step) {
+                with_kept_of(&self.kept, |k| {
+                    k.carry_hold = Some(Instant::now() + CARRY_HOLD);
+                });
+            }
             laps::lap("resume");
             if step == "done:lost" {
                 (hooks.note)(HostNote::Relaunch {
@@ -5949,6 +6839,8 @@ impl WorkerIdle {
                 });
             }
             ("carry-on", step)
+        } else if point.carry_only {
+            return None;
         } else {
             let due = due();
             laps::lap("due");
@@ -5994,7 +6886,7 @@ impl WorkerIdle {
         let repeat = run.repeats(&step);
         note_upgrade_act();
         if relaunched {
-            refresh_snapshot(&self.sid, &self.kept, hooks);
+            self.reread_after_act(Instant::now());
             laps::lap("snapshot.after");
         }
         match run.after(&step, self.grace) {
@@ -6072,6 +6964,7 @@ impl WorkerIdle {
 
     /// That step is over, returned or unwound ([`Self::act`]).
     fn acted(&self) {
+        due_moved(&self.kept);
         self.stepped.store(
             STEP_STAMPS.fetch_add(1, Ordering::SeqCst) + 1,
             Ordering::SeqCst,
@@ -6085,6 +6978,32 @@ impl WorkerIdle {
         !self.stop.load(Ordering::SeqCst) && self.switches.on_for(self.agent)
     }
 
+    /// The live upgrade's wind-down owns the turn ends.
+    fn winding_down(&self) -> bool {
+        self.on() && self.owns.load(Ordering::SeqCst) && self.switches.upgrade()
+    }
+
+    /// Whether the loop's own act waits on the carry-on owed here. The relaunched agent is told what
+    /// ended: the loop's plain prompt at the restored row would take that turn and leave the carry-on
+    /// to close as already carried, so the loop waits while the carry-on stands, for a person's draft
+    /// or grace and between its looks. The wait is bounded, from this worker's first sight of it and
+    /// from each look that found a person's hold ([`relaunch::carry_stands`]): a carry-on nothing
+    /// takes never parks Cruise or Land.
+    fn carry_holds(&self) -> bool {
+        if !self.on() || !relaunches(self.agent) || self.beside() {
+            return false;
+        }
+        let owed = IdleHost::carry_owed(self) && !self.native_stands_down();
+        let now = Instant::now();
+        with_kept_of(&self.kept, |k| {
+            if !owed {
+                k.carry_hold = None;
+                return false;
+            }
+            *k.carry_hold.get_or_insert(now + CARRY_HOLD) > now
+        })
+    }
+
     /// Why this worker refuses every fact line of its session (slice 1's refusals, a wake's
     /// claim's too): off, beside a self-supervising agent, the wind-down owning its turn ends, or
     /// a relaunch's carry-on owed; `None` where it takes them.
@@ -6094,9 +7013,11 @@ impl WorkerIdle {
             Some(PaceRefusal::Off)
         } else if self.beside() {
             Some(PaceRefusal::Beside)
-        } else if self.owns_turn_end() {
+        } else if self.winding_down() {
             Some(PaceRefusal::Owns)
-        } else if host_carries_relaunch(self.agent) && with_kept_of(&self.kept, |k| k.carry_asked) {
+        } else if self.carry_holds()
+            || (host_carries_relaunch(self.agent) && with_kept_of(&self.kept, |k| k.carry_asked))
+        {
             Some(PaceRefusal::CarryOwed)
         } else {
             None
@@ -6270,41 +7191,149 @@ impl WorkerIdle {
     /// [`IdleHost::reach_peek`]). `probe_api` gates all of its reads: off, nothing is read, so
     /// no probe runs and no path watch starts (a lab instance's scratch config writes it off,
     /// which keeps a windowed lab run off this Mac's network path too); on, the probe measures a
-    /// session it can ([`Self::measures_reach`]) and every other reads the path alone.
+    /// session whose endpoint it can reach ([`Self::measured`]) and every other reads the path
+    /// alone.
     fn reach_read(&self) -> ReachRead {
         if !self.switches.probe_api() {
             ReachRead::Off
-        } else if self.measures_reach() {
-            ReachRead::Measured
+        } else if let Some(target) = self.measured() {
+            ReachRead::Measured(target)
         } else {
             ReachRead::Path
         }
     }
 
-    /// Whether the instance's probe can measure this session's API reach ([`Self::reach_read`]):
-    /// only a Claude Code with a snapshot taken and the Default route (`probe_api` is the
-    /// caller's gate).
-    fn measures_reach(&self) -> bool {
-        match self.agent {
-            Program::Claude => {}
-            Program::Codex
-            | Program::Grok
-            | Program::Kimi
-            | Program::Agy
-            | Program::Muse
-            | Program::Generic => return false,
+    /// The endpoint the instance's probe measures for this session ([`Self::reach_read`]; v6
+    /// §14.17.5.4 widened it from Claude Code's default route): the one its launch names
+    /// ([`Self::endpoint`]), none for a gap or before a snapshot (`probe_api` is the caller's
+    /// gate).
+    fn measured(&self) -> Option<Target> {
+        match self.endpoint()? {
+            witness::Endpoint::Named(base) => Some(base.target),
+            witness::Endpoint::Gap(_) => None,
         }
-        let agent = self
-            .kept
+    }
+
+    /// THE ROUTE THIS SESSION'S WITNESSES SHARE (v6 §14.17.5.4): its program and the endpoint its
+    /// launch names ([`RouteKey::of`]), none for a gap.
+    fn route_key(&self) -> Option<RouteKey> {
+        RouteKey::of(self.agent, &self.endpoint()?)
+    }
+
+    /// The endpoint the agent's launch names ([`witness::endpoint_of_with_agy`]): Claude Code's
+    /// from its route ([`Self::route_of`]) and, on a route of its own, its launch's route
+    /// variables ([`Acts::claude_env`]), Muse Code's from its argv, agy's from its verified exec
+    /// environment ([`Acts::account_env`]) and `<config>/settings.json` ([`Acts::agy_backend`]);
+    /// none before a snapshot. Read once per agent process and directory, and a gap logged once;
+    /// an environment or a settings source that could not be read (agy's or Muse Code's
+    /// environment, agy's [`witness::AgyBackend::Unread`], Claude Code's route variables'
+    /// [`aterm_agent::harness::netwatch::Unnamed::Unread`]) is read again at the next ask, its gap
+    /// said once.
+    fn endpoint(&self) -> Option<witness::Endpoint> {
+        let snap = with_kept_of(&self.kept, |k| k.snapshot.clone())?;
+        let cached = self
+            .route
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .snapshot
-            .as_ref()
-            .map(|s| (s.pid, s.start.clone(), s.argv.clone(), s.cwd.clone()));
-        let Some((pid, start, argv, cwd)) = agent else {
-            return false;
+            .of(snap.pid, &snap.start, &snap.cwd)
+            .endpoint
+            .clone();
+        if let Some(endpoint) = cached {
+            return Some(endpoint);
+        }
+        let route = || self.route_of(snap.pid, &snap.start, &snap.argv, &snap.cwd);
+        // What was not read this time, which the next ask reads again: agy's or Muse Code's
+        // environment, agy's unread settings.json, Claude Code's route variables' unread source.
+        let (env, agy, unread) = match self.agent {
+            Program::Agy => match (self.hooks.acts.account_env)(&snap) {
+                None => (
+                    None,
+                    witness::AgyBackend::GeminiApi,
+                    Some("agy's environment could not be read".to_string()),
+                ),
+                Some(env) => {
+                    let backend = (self.hooks.acts.agy_backend)(&snap, &env);
+                    let unread = match &backend {
+                        witness::AgyBackend::Unread(why) => Some(why.clone()),
+                        witness::AgyBackend::GeminiApi | witness::AgyBackend::Other(_) => None,
+                    };
+                    (Some(env), backend, unread)
+                }
+            },
+            Program::Muse => {
+                let env = (self.hooks.acts.account_env)(&snap);
+                let unread = env
+                    .is_none()
+                    .then(|| "Muse Code's environment could not be read".to_string());
+                (env, witness::AgyBackend::GeminiApi, unread)
+            }
+            Program::Claude => match route() {
+                Route::Default => (None, witness::AgyBackend::GeminiApi, None),
+                Route::Custom(_) => {
+                    match (self.hooks.acts.claude_env)(snap.pid, &snap.argv, &snap.cwd) {
+                        Ok(env) => (Some(env), witness::AgyBackend::GeminiApi, None),
+                        Err(unnamed) if unnamed.settled() => {
+                            aterm_log::info!(
+                                "harness @{}: pid {}'s route variables name no one route: {}",
+                                self.sid,
+                                snap.pid,
+                                unnamed.why()
+                            );
+                            (None, witness::AgyBackend::GeminiApi, None)
+                        }
+                        Err(unnamed) => (
+                            None,
+                            witness::AgyBackend::GeminiApi,
+                            Some(unnamed.why().to_string()),
+                        ),
+                    }
+                }
+            },
+            Program::Codex | Program::Grok | Program::Kimi | Program::Generic => {
+                (None, witness::AgyBackend::GeminiApi, None)
+            }
         };
-        matches!(self.route_of(pid, &start, &argv, &cwd), Route::Default)
+        let endpoint =
+            witness::endpoint_of_with_agy(self.agent, &snap.argv, env.as_deref(), route, || agy);
+        if let Some(why) = unread {
+            let said = std::mem::replace(
+                &mut self
+                    .route
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .of(snap.pid, &snap.start, &snap.cwd)
+                    .unread_said,
+                true,
+            );
+            if !said {
+                aterm_log::info!(
+                    "harness @{}: no probe and no witness of pid {}'s own route yet: {why} (read \
+                     again at each ask)",
+                    self.sid,
+                    snap.pid
+                );
+            }
+            return Some(endpoint);
+        }
+        match &endpoint {
+            witness::Endpoint::Named(base) => aterm_log::info!(
+                "harness @{}: pid {} reaches {}",
+                self.sid,
+                snap.pid,
+                base.says()
+            ),
+            witness::Endpoint::Gap(why) => aterm_log::info!(
+                "harness @{}: no probe and no witness of pid {}'s own route: {why}",
+                self.sid,
+                snap.pid
+            ),
+        }
+        self.route
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .of(snap.pid, &snap.start, &snap.cwd)
+            .endpoint = Some(endpoint.clone());
+        Some(endpoint)
     }
 
     /// The agent's route ([`Acts::route`]), read once per agent process and directory (again when the directory is filled in).
@@ -6313,9 +7342,9 @@ impl WorkerIdle {
             .route
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-            .filter(|(p, s, c, _)| *p == pid && s == start && c == cwd)
-            .map(|(_, _, _, route)| route.clone());
+            .of(pid, start, cwd)
+            .route
+            .clone();
         if let Some(route) = cached {
             return route;
         }
@@ -6326,8 +7355,11 @@ impl WorkerIdle {
                 self.sid
             );
         }
-        *self.route.lock().unwrap_or_else(PoisonError::into_inner) =
-            Some((pid, start.to_string(), cwd.to_string(), route.clone()));
+        self.route
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .of(pid, start, cwd)
+            .route = Some(route.clone());
         route
     }
 
@@ -6347,6 +7379,7 @@ impl WorkerIdle {
             snap: &snap,
             session: &session,
             own: self.switches.notes(),
+            screen_wall: self.account_screen_wall(&snap),
         };
         let (word, label) = (self.hooks.acts.account_wall)(&self.sid, &walled, &settled);
         match label {
@@ -6645,10 +7678,26 @@ impl WorkerIdle {
         Some(AccountLook {
             who,
             label,
+            screen_wall: self.account_screen_wall(&snap),
             snap,
             generation,
             profile_env: profile_environment(&env),
         })
+    }
+
+    /// A resumed wall cannot exhaust the account a wall-triggered move just selected. Until
+    /// that move is answered, only its own new transcript rejection can establish a wall.
+    fn account_screen_wall(&self, snap: &Snapshot) -> Option<ScreenAccountWall> {
+        let pending = with_kept_of(&self.kept, |k| {
+            k.account.moved.as_ref().is_some_and(|moved| {
+                moved.at == AccountAt::Wall
+                    && !moved.answered
+                    && account_process_matches(&moved.process, snap)
+            })
+        });
+        (!pending)
+            .then(|| (self.hooks.acts.account_screen_wall)(&self.sid, snap))
+            .flatten()
     }
 
     /// What a non-Claude pooled CLI's own process environment says of its login, without reading
@@ -6672,6 +7721,7 @@ impl WorkerIdle {
             AccountLook {
                 who,
                 label,
+                screen_wall: None,
                 snap,
                 generation,
                 profile_env: Vec::new(),
@@ -6693,23 +7743,33 @@ impl WorkerIdle {
         &self,
         point: AccountPoint,
         owed: bool,
-        judged: &mut Option<accounts::Point>,
+        judged: &mut Option<AccountJudgment>,
     ) -> Option<AccountAdvice> {
         let mode = self.switches.accounts();
         let notes = self.switches.notes();
+        let pool = accounts::Cli::of(self.agent).filter(|cli| *cli != accounts::Cli::Claude);
         if !self.switches.accounts_live() {
             if !notes {
                 accounts_tell(&self.switches, &self.hooks, AccountsSaid::Nothing, false);
             }
-            return None;
+            // Claude Code's rotation off ends a Claude Code session's look; another pool reads
+            // its own switches below.
+            pool?;
         }
-        if accounts::Cli::of(self.agent).is_some_and(|cli| cli != accounts::Cli::Claude) {
+        if let Some(cli) = pool {
+            // Its own switches, not Claude Code's: Claude Code switched off moves no other pool.
+            let controls = self.switches.pool_controls(cli);
+            if controls.mode == accounts::Mode::Off && !controls.logins {
+                return None;
+            }
             return self.pool_advice(point);
         }
         if !accounts_for(self.agent) {
             return None;
         }
-        let seat = (self.hooks.acts.account_seat)()?;
+        let Some(seat) = (self.hooks.acts.account_seat)() else {
+            return self.account_unjudged("no account seat (no harness state directory)", None);
+        };
         let roster = match roster_read(&seat) {
             Ok(roster) => roster,
             Err(unread) => {
@@ -6736,24 +7796,41 @@ impl WorkerIdle {
             accounts_tell(&self.switches, &self.hooks, AccountsSaid::Nothing, false);
             return None;
         }
-        let look = self.account_look(&roster)?;
-        let seen = self.lost_seen(&look, point, seat.now)?;
+        let Some(look) = self.account_look(&roster) else {
+            return self.account_unjudged("its process's login could not be read", None);
+        };
+        let Some(seen) = self.lost_seen(&look, point, seat.now) else {
+            return self.account_unjudged("its process changed while its login was read", None);
+        };
         let (at, wall, unwritten) = account_point_read(&seat, &look, point, seen);
-        *judged = Some(at.clone());
-        if let Some(to) =
-            self.account_untold(&seat, &look, point, usage_limit(point) && wall.is_none())
-        {
+        let judged = judged.insert(AccountJudgment {
+            point: at.clone(),
+            roster: roster.clone(),
+            identities: AccountIdentities::new(&seat, &look.profile_env),
+        });
+        if let Some(to) = self.account_untold(
+            &seat,
+            &look,
+            point,
+            usage_limit(point) && wall.as_ref().is_none_or(|wall| wall.from_screen),
+        ) {
             aterm_log::info!(
                 "harness @{}: account advice: its move to {to} has landed; told as made",
                 self.sid
             );
-            return Some(AccountAdvice::Move { to });
+            return Some(AccountAdvice::Move { to, yields: None });
         }
         let store = accounts::Store::at(&seat.state);
         if at == accounts::Point::LoginEnded {
             self.login_ended(&seat, &roster, &look);
         }
-        let (state, unread) = store.load(seat.now).ok()?;
+        let (state, unread) = match store.load(seat.now) {
+            Ok(read) => read,
+            Err(why) => {
+                return self.account_unjudged("the accounts state could not be read", Some(why));
+            }
+        };
+        with_kept_of(&self.kept, |k| k.account.unjudged = None);
         let enrolled = accounts::enrolled(&roster);
         if unread.is_none()
             && let Ok((logins, None)) = store.load_logins(seat.now)
@@ -6775,11 +7852,12 @@ impl WorkerIdle {
             self.login_served(&seat, &roster, &look);
         }
         let me = asked_at(look.who.me(&roster), point, self.switches.logins());
-        let advice = checked_account_advice(&seat, &roster, &look, &state, seat.now, |state| {
-            accounts::advise(&roster, state, &enrolled, &me, &at, mode, seat.now)
-        });
+        let advice =
+            checked_account_advice(&roster, &state, &mut judged.identities, seat.now, |state| {
+                accounts::advise(&roster, state, &enrolled, &me, &at, mode, seat.now)
+            });
         let past = matches!(advice, accounts::Advice::Probe).then(|| {
-            checked_account_advice(&seat, &roster, &look, &state, seat.now, |state| {
+            checked_account_advice(&roster, &state, &mut judged.identities, seat.now, |state| {
                 accounts::advise_past_probe(&roster, state, &enrolled, &me, &at, mode, seat.now)
             })
         });
@@ -6870,6 +7948,23 @@ impl WorkerIdle {
             (self.hooks.acts.accounts_upkeep).make(UpkeepStep::Renew);
         }
         advised
+    }
+
+    /// No account advice, because what it is judged from could not be read (`why`, with the
+    /// read's own error where there is one): logged once per change of `why`, so a session whose
+    /// walls are all waited out says why at the first, and kept ([`AccountKept::unjudged`]).
+    fn account_unjudged(&self, why: &'static str, error: Option<String>) -> Option<AccountAdvice> {
+        let said = with_kept_of(&self.kept, |k| k.account.unjudged.replace(why));
+        if said != Some(why) {
+            match error {
+                Some(error) => aterm_log::info!(
+                    "harness @{}: account advice: none: {why}: {error}",
+                    self.sid
+                ),
+                None => aterm_log::info!("harness @{}: account advice: none: {why}", self.sid),
+            }
+        }
+        None
     }
 
     /// The session's row for the report (`aterm harness accounts`: `on: @s-… (held: jobs)`).
@@ -7548,8 +8643,9 @@ impl WorkerIdle {
         let enrolled = accounts::enrolled(&roster);
         let advise = |state: &accounts::State, now: i64| {
             let me = asked_at(look.who.me(&roster), advised.point, controls.logins);
+            let mut identities = AccountIdentities::new(&seat, &look.profile_env);
             // The writer calls this again after validating the complete bound roster.
-            checked_account_advice(&seat, &roster, &look, state, now, |state| {
+            checked_account_advice(&roster, state, &mut identities, now, |state| {
                 accounts::advise_past_probe(
                     &roster,
                     state,
@@ -7578,6 +8674,7 @@ impl WorkerIdle {
         if matches!(
             claim,
             aterm_agent::harness::claims::Touched::HeldElsewhere(_)
+                | aterm_agent::harness::claims::Touched::PreparationOnly
         ) || (matches!(claim, aterm_agent::harness::claims::Touched::Unrecorded(_))
             && !state.home_accounts.contains(to))
         {
@@ -7731,7 +8828,8 @@ impl WorkerIdle {
             "refused:supervisor-off".to_string()
         };
         note_upgrade_act();
-        let fresh = refresh_snapshot(&self.sid, &self.kept, hooks);
+        let acted = Instant::now();
+        let fresh = self.reread_after_act(acted) == Reread::Landed;
         let after = with_kept_of(&self.kept, |k| k.snapshot.clone()).filter(|_| fresh);
         let rejected = |why, held| RejectedMove {
             on: label.clone(),
@@ -7794,6 +8892,7 @@ impl WorkerIdle {
             &self.kept,
             hooks,
             Landing::Immediate,
+            Some(acted),
             &generation,
         ) {
             Applied::Yes => step,
@@ -7832,6 +8931,7 @@ fn snapshot_refused(sid: &str, why: Option<&'static str>) {
 }
 
 /// Read the relaunch record again.
+#[cfg(test)]
 fn refresh_snapshot(sid: &str, kept: &Mutex<Kept>, hooks: &Hooks) -> bool {
     refresh_snapshot_guarded(sid, kept, hooks, None)
 }
@@ -7935,25 +9035,85 @@ fn land_snapshot(
     true
 }
 
-/// How long an idle point waits for its relaunch snapshot read before it goes on without it: at
-/// load average 268 one read took 57 s.
+/// How long a worker waits for a read it runs off its thread (the relaunch snapshot, the upgrade's,
+/// the note behind) before it goes on without it: on a loaded machine an idle step that made the
+/// snapshot read took up to 57 s (`docs/measured/idle-look-under-load-2026-10-23.md`).
 const POINT_READ_BOUND: Duration = Duration::from_millis(500);
 
-/// What [`Acts::inert`]'s idle point waits for its read: a hang detector's minute.
+/// What [`Acts::inert`]'s worker waits for such a read: a hang detector's minute.
 #[cfg(any(test, feature = "bench-support"))]
 const INERT_POINT_READ: Duration = Duration::from_secs(60);
+
+/// How long an upgrade read that outlived its point stays the next point's answer ([`due_at_point`]):
+/// twice the unread ladder's longest look, since a look on that rung comes the point's bound and the
+/// loop's lateness after the rung.
+const DUE_KEPT_FOR: Duration = UNREAD_LOOK[UNREAD_LOOK.len() - 1].saturating_mul(2);
+
+/// [`Due::Unread`]'s word for an idle point whose upgrade read did not come back within its bound ([`due_at_point`]).
+const UNREAD_OUT: &str = "read-out";
+
+/// [`Due::Unread`]'s word for an idle point whose upgrade read ended within its bound with no answer
+/// to take: a step moved the session while it was out ([`due_moved`]), or it unwound.
+const UNREAD_VOID: &str = "read-void";
 
 /// An idle step that took this long is logged with where its time went ([`laps`]).
 const SLOW_STEP: Duration = Duration::from_secs(1);
 
-/// A relaunch snapshot read started on a thread of its own: whether it ended.
-#[derive(Default)]
+/// Which read off an idle point a [`PointRead`] is.
+#[derive(Clone, Copy)]
+enum OffPoint {
+    /// The relaunch snapshot's ([`start_point_read`]).
+    Snapshot,
+    /// The upgrade's ([`start_due_read`]).
+    Due,
+}
+
+impl OffPoint {
+    /// Where the session keeps this read while it is out.
+    fn out(self, k: &mut Kept) -> &mut Option<Arc<PointRead>> {
+        match self {
+            Self::Snapshot => &mut k.point_read,
+            Self::Due => &mut k.due.out,
+        }
+    }
+
+    /// Its thread's name, after [`THREAD_PREFIX`].
+    const fn thread(self) -> &'static str {
+        match self {
+            Self::Snapshot => "point-read",
+            Self::Due => "due-read",
+        }
+    }
+}
+
+/// A read started off a worker's thread on a thread of its own: which it is, when it began,
+/// whether it is a passive repair's, whether it ended, and whether it landed.
 struct PointRead {
+    of: OffPoint,
+    began: Instant,
+    passive: bool,
     ended: Mutex<bool>,
     end: Condvar,
+    /// It landed (a snapshot read, [`SnapshotRead::refresh`]'s word; an upgrade read kept for its
+    /// epoch, [`land_due`]'s), set before it ends.
+    landed: AtomicBool,
+    /// A read is to begin as this one ends ([`Self::follow_up`]).
+    again: AtomicBool,
 }
 
 impl PointRead {
+    fn begun(of: OffPoint, passive: bool) -> Self {
+        Self {
+            of,
+            began: Instant::now(),
+            passive,
+            ended: Mutex::new(false),
+            end: Condvar::new(),
+            landed: AtomicBool::new(false),
+            again: AtomicBool::new(false),
+        }
+    }
+
     /// Wait for the read to end, `bound` at most: whether it ended.
     fn wait(&self, bound: Duration) -> bool {
         let ended = self.ended.lock().unwrap_or_else(PoisonError::into_inner);
@@ -7964,19 +9124,101 @@ impl PointRead {
         *ended
     }
 
-    /// The read `read` of the session `kept` is over: no longer out, and every point waiting on it goes on.
-    fn over(kept: &Mutex<Kept>, read: &Arc<Self>) {
+    /// Have a read begin as this one ends: false where it has ended already.
+    fn follow_up(&self) -> bool {
+        let ended = self.ended.lock().unwrap_or_else(PoisonError::into_inner);
+        if !*ended {
+            self.again.store(true, Ordering::SeqCst);
+        }
+        !*ended
+    }
+
+    /// The read `read` of the session `kept` is over: no longer out, and every point waiting on it
+    /// goes on. Whether a read is to begin after it ([`Self::follow_up`]).
+    fn over(kept: &Mutex<Kept>, read: &Arc<Self>) -> bool {
         with_kept_of(kept, |k| {
-            if k.point_read
-                .as_ref()
-                .is_some_and(|out| Arc::ptr_eq(out, read))
-            {
-                k.point_read = None;
+            let out = read.of.out(k);
+            if out.as_ref().is_some_and(|out| Arc::ptr_eq(out, read)) {
+                *out = None;
             }
         });
-        *read.ended.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        let again = {
+            let mut ended = read.ended.lock().unwrap_or_else(PoisonError::into_inner);
+            *ended = true;
+            read.again.load(Ordering::SeqCst)
+        };
         read.end.notify_all();
+        again
     }
+}
+
+/// What reading the relaunch record again came to ([`reread`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reread {
+    /// The read landed its snapshot.
+    Landed,
+    /// The read ended with none landed: it failed, or a newer snapshot landed first.
+    Unlanded,
+    /// The read is still out past the wait, and lands as it ends.
+    Out,
+}
+
+/// Start or join the session's one read `of` that is out: `read` runs on a thread of its own with
+/// what `begin` took under the lock, and `unspawned` instead where no thread can be had, each
+/// saying whether its read landed. A read that is not `passive` takes the place of a passive one
+/// out rather than join it; a read asked to be followed ([`PointRead::follow_up`]) runs `again`
+/// as it ends.
+fn start_off_point<B: Clone + Send + 'static>(
+    kept: &Arc<Mutex<Kept>>,
+    of: OffPoint,
+    passive: bool,
+    begin: impl FnOnce(&Kept) -> B,
+    read: impl FnOnce(B, &Mutex<Kept>) -> bool + Send + 'static,
+    again: impl FnOnce(&Arc<Mutex<Kept>>) + Send + 'static,
+    unspawned: impl FnOnce(B, std::io::Error) -> bool,
+) -> Arc<PointRead> {
+    let (out, begun) = {
+        let mut k = kept.lock().unwrap_or_else(PoisonError::into_inner);
+        match of.out(&mut k).clone() {
+            Some(out) if passive || !out.passive => (out, None),
+            _ => {
+                let out = Arc::new(PointRead::begun(of, passive));
+                *of.out(&mut k) = Some(Arc::clone(&out));
+                (out, Some(begin(&k)))
+            }
+        }
+    };
+    let Some(begun) = begun else {
+        return out;
+    };
+    let fallback = begun.clone();
+    let (job_kept, job_out) = (Arc::clone(kept), Arc::clone(&out));
+    let spawned = std::thread::Builder::new()
+        .name(format!("{THREAD_PREFIX}{}", of.thread()))
+        .spawn(move || {
+            /// The read is over as its thread returns or unwinds; a read asked to follow it begins
+            /// as it returns.
+            struct Over<F: FnOnce(&Arc<Mutex<Kept>>)>(Arc<Mutex<Kept>>, Arc<PointRead>, Option<F>);
+            impl<F: FnOnce(&Arc<Mutex<Kept>>)> Drop for Over<F> {
+                fn drop(&mut self) {
+                    if PointRead::over(&self.0, &self.1)
+                        && !std::thread::panicking()
+                        && let Some(again) = self.2.take()
+                    {
+                        again(&self.0);
+                    }
+                }
+            }
+            let over = Over(job_kept, job_out, Some(again));
+            let landed = read(begun, &over.0);
+            over.1.landed.store(landed, Ordering::SeqCst);
+        });
+    if let Err(e) = spawned {
+        let landed = unspawned(fallback, e);
+        out.landed.store(landed, Ordering::SeqCst);
+        PointRead::over(kept, &out);
+    }
+    out
 }
 
 /// Read the relaunch record again at an idle point on a thread of its own, one per session, waiting `bound` at most: whether it ended.
@@ -7986,79 +9228,161 @@ fn refresh_snapshot_at_point(
     hooks: &Hooks,
     bound: Duration,
 ) -> bool {
-    let read = start_point_read(sid, kept, hooks, None);
-    let ended = read.wait(bound);
-    if !ended {
-        aterm_log::info!(
-            "harness @{sid}: its relaunch snapshot read is still out after {} ms; the idle point \
-             goes on with the snapshot kept, and the read lands as it ends",
-            bound.as_millis()
-        );
-    }
-    ended
+    reread(sid, kept, hooks, None, bound) != Reread::Out
 }
 
-/// Start or join the one outstanding snapshot read. Passive repairs do not wait or read inline.
+/// Read the relaunch record again on the session's one read off the worker's thread
+/// ([`start_point_read`]), waiting `bound` at most. A read out that began before `since` (one an
+/// act since may have outdated), or one an earlier act's reader asked to be followed, is let end
+/// and followed by another, for every reader; where it outlives `bound`, the one after it begins
+/// as it ends.
+fn reread(
+    sid: &str,
+    kept: &Arc<Mutex<Kept>>,
+    hooks: &Hooks,
+    since: Option<Instant>,
+    bound: Duration,
+) -> Reread {
+    let until = Instant::now() + bound;
+    loop {
+        let read = start_point_read(sid, kept, hooks, None);
+        let outdated =
+            read.again.load(Ordering::SeqCst) || since.is_some_and(|since| read.began < since);
+        if outdated && !read.follow_up() {
+            continue;
+        }
+        if !read.wait(until.saturating_duration_since(Instant::now())) {
+            aterm_log::info!(
+                "harness @{sid}: its relaunch snapshot read is still out after {} ms; the worker \
+                 goes on with the snapshot kept, and the read lands as it ends",
+                bound.as_millis()
+            );
+            return Reread::Out;
+        }
+        if !outdated {
+            return if read.landed.load(Ordering::SeqCst) {
+                Reread::Landed
+            } else {
+                Reread::Unlanded
+            };
+        }
+    }
+}
+
+/// Start or join the one outstanding snapshot read. Passive repairs do not wait or read inline. A
+/// plain read takes the place of a passive one out, which lands only for its own worker
+/// generation and primary ([`land_passive_read`]) and is never waited on.
 fn start_point_read(
     sid: &str,
     kept: &Arc<Mutex<Kept>>,
     hooks: &Hooks,
     owner: Option<PassiveReadOwner>,
 ) -> Arc<PointRead> {
-    let (read, begun) = {
-        let mut k = kept.lock().unwrap_or_else(PoisonError::into_inner);
-        match &k.point_read {
-            Some(out) => (Arc::clone(out), None),
-            None => {
-                let read = Arc::new(PointRead::default());
-                k.point_read = Some(Arc::clone(&read));
-                (read, Some(SnapshotRead::capture(&k)))
+    let passive = owner.is_some();
+    let job = Arc::new((sid.to_string(), hooks.clone()));
+    let follow = Arc::clone(&job);
+    start_off_point(
+        kept,
+        OffPoint::Snapshot,
+        passive,
+        SnapshotRead::capture,
+        move |before, kept| {
+            let (sid, hooks) = &*job;
+            match owner {
+                Some(owner) => land_passive_read(sid, kept, hooks, &before, &owner),
+                None => before.refresh(sid, kept, hooks, None),
             }
-        }
-    };
-    if let Some(before) = begun {
-        let passive = owner.is_some();
-        let fallback = before.clone();
-        let (job_sid, job_kept, job_hooks, job_read) = (
-            sid.to_string(),
-            Arc::clone(kept),
-            hooks.clone(),
-            Arc::clone(&read),
-        );
-        let spawned = std::thread::Builder::new()
-            .name(format!("{THREAD_PREFIX}point-read"))
-            .spawn(move || {
-                /// The read is over as its thread returns or unwinds.
-                struct Over(Arc<Mutex<Kept>>, Arc<PointRead>);
-                impl Drop for Over {
-                    fn drop(&mut self) {
-                        PointRead::over(&self.0, &self.1);
-                    }
-                }
-                let over = Over(job_kept, job_read);
-                match owner {
-                    Some(owner) => {
-                        land_passive_read(&job_sid, &over.0, &job_hooks, &before, &owner);
-                    }
-                    None => {
-                        before.refresh(&job_sid, &over.0, &job_hooks, None);
-                    }
-                }
-            });
-        if let Err(e) = spawned {
+        },
+        move |kept| {
+            let (sid, hooks) = &*follow;
+            start_point_read(sid, kept, hooks, None);
+        },
+        |before, e| {
             if passive {
                 aterm_log::warn!("harness @{sid}: no thread for the passive snapshot read ({e})");
+                false
             } else {
                 aterm_log::warn!(
-                    "harness @{sid}: no thread for the relaunch snapshot read ({e}); the idle point \
+                    "harness @{sid}: no thread for the relaunch snapshot read ({e}); the worker \
                      reads it itself"
                 );
-                fallback.refresh(sid, kept, hooks, None);
+                before.refresh(sid, kept, hooks, None)
             }
-            PointRead::over(kept, &read);
-        }
+        },
+    )
+}
+
+/// What the host keeps of the upgrade reads off a session's idle points ([`due_at_point`]).
+#[derive(Default)]
+struct DueKept {
+    /// The read still out, begun at the current epoch: a step leaves an older one to end alone.
+    out: Option<Arc<PointRead>>,
+    /// What a read found that no point has taken yet, and when it landed.
+    landed: Option<(Due, Instant)>,
+    /// Moved by each step that can change what a read finds ([`due_moved`]).
+    epoch: u64,
+}
+
+/// Whether an upgrade is due at an idle point: an answer landed since the last point while it is
+/// fresh ([`DUE_KEPT_FOR`]), else a read on a thread of its own, one per session, waited for `bound`
+/// at most; [`UNREAD_OUT`] while it is still out, [`UNREAD_VOID`] where it ended with nothing to take.
+fn due_at_point(sid: &str, kept: &Arc<Mutex<Kept>>, hooks: &Hooks, bound: Duration) -> Due {
+    let take = || with_kept_of(kept, |k| k.due.landed.take());
+    if let Some((due, at)) = take()
+        && at.elapsed() < DUE_KEPT_FOR
+    {
+        return due;
     }
-    read
+    if start_due_read(sid, kept, hooks).wait(bound) {
+        return take().map_or(Due::Unread(UNREAD_VOID), |(due, _)| due);
+    }
+    aterm_log::info!(
+        "harness @{sid}: its upgrade read is still out after {} ms; the idle point goes on with the \
+         upgrade unread ({UNREAD_OUT}), and the read lands as it ends",
+        bound.as_millis()
+    );
+    Due::Unread(UNREAD_OUT)
+}
+
+/// Start or join the session's one upgrade read at its current epoch ([`Acts::due`]).
+fn start_due_read(sid: &str, kept: &Arc<Mutex<Kept>>, hooks: &Hooks) -> Arc<PointRead> {
+    let (job_sid, job_hooks) = (sid.to_string(), hooks.clone());
+    start_off_point(
+        kept,
+        OffPoint::Due,
+        false,
+        |k| k.due.epoch,
+        move |epoch, kept| land_due(kept, epoch, (job_hooks.acts.due)(&job_sid)),
+        |_| {},
+        |epoch, e| {
+            aterm_log::warn!(
+                "harness @{sid}: no thread for the upgrade read ({e}); the idle point reads it itself"
+            );
+            land_due(kept, epoch, (hooks.acts.due)(sid))
+        },
+    )
+}
+
+/// Keep `due`, read from `epoch`, for the next point, unless a step has moved the session since:
+/// whether it was kept.
+fn land_due(kept: &Mutex<Kept>, epoch: u64, due: Due) -> bool {
+    with_kept_of(kept, |k| {
+        let current = k.due.epoch == epoch;
+        if current {
+            k.due.landed = Some((due, Instant::now()));
+        }
+        current
+    })
+}
+
+/// A step that can change what an upgrade read finds was taken, or a worker attached: no answer
+/// kept, or read begun, before it decides a point, and no point waits on a read begun before it.
+fn due_moved(kept: &Mutex<Kept>) {
+    with_kept_of(kept, |k| {
+        k.due.epoch = k.due.epoch.wrapping_add(1);
+        k.due.landed = None;
+        k.due.out = None;
+    });
 }
 
 /// The primary's restart identity, excluding ordinary record progress and heartbeat changes.
@@ -8185,6 +9509,17 @@ fn publish_snapshot_from(sid: &str, snap: Option<&Snapshot>, handed: bool) -> bo
         };
         before.as_ref().map(carried) != snap.as_ref().map(carried)
     };
+    if moved && let Some(snap) = &snap {
+        aterm_log::info!(
+            "harness @{sid}: the relaunch snapshot kept names pid {}{}",
+            snap.pid,
+            if snap.session.is_some() {
+                " and its conversation"
+            } else {
+                ", no conversation"
+            }
+        );
+    }
     if snap
         .as_ref()
         .and_then(|snap| snap.session.as_deref())
@@ -9457,17 +10792,27 @@ const LANDED_LOOK: Duration = Duration::from_secs(1);
 /// The agent a relaunch landed, read.
 fn read_landed(
     sid: &str,
-    kept: &Mutex<Kept>,
+    kept: &Arc<Mutex<Kept>>,
     hooks: &Hooks,
     group: i32,
     waiting: &dyn Fn() -> bool,
 ) -> bool {
+    // Each read begins after the landing, and one still out is waited for again in `point_read`
+    // slices while the landing is waited for and the session is wanted: past a stop, or once the
+    // session is unwanted, the read is given up.
+    let landed = Some(Instant::now());
+    let read = || loop {
+        match reread(sid, kept, hooks, landed, hooks.acts.point_read) {
+            Reread::Out if waiting() && (hooks.still_wanted)(sid, group) => {}
+            done => return done == Reread::Landed,
+        }
+    };
     loop {
-        if refresh_snapshot(sid, kept, hooks) {
+        if read() {
             return true;
         }
         if !waiting() {
-            return refresh_snapshot(sid, kept, hooks);
+            return read();
         }
         if !(hooks.still_wanted)(sid, group) {
             return false;
@@ -10499,7 +11844,12 @@ pub(crate) use aterm_agent::supervise::HELD_HEAD;
 /// [`HELD_DEADLINE`], or the development seam's ([`HELD_DEADLINE_SEAM`]).
 fn held_deadline() -> Duration {
     aterm_types::dev_seam!(HELD_DEADLINE_SEAM)
-        .and_then(|v| v.to_str()?.parse::<u64>().ok())
+        .and_then(|v| {
+            let s = v.to_str()?;
+            (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| s.parse::<u64>().ok())
+                .flatten()
+        })
         .map_or(HELD_DEADLINE, Duration::from_millis)
 }
 
@@ -13770,7 +15120,7 @@ fn claimed_tabs(held: &HashMap<String, u64>, workers: &Workers) -> Vec<String> {
 struct OffNote {
     /// The agent's process group and the activations its note was last owed for.
     seen: (i32, u64),
-    note: Mutex<Option<Owed>>,
+    note: Note,
 }
 
 /// The notes behind of the tabs `unworked` names (each with its agent and its stamp) whose agent
@@ -13813,7 +15163,7 @@ fn note_off_tabs(
         let owed = notes.get(sid).is_none_or(|kept| kept.seen != seen);
         let kept = notes.entry(sid.clone()).or_insert_with(|| OffNote {
             seen,
-            note: Mutex::default(),
+            note: Note::default(),
         });
         if owed {
             kept.seen = seen;
@@ -15017,6 +16367,7 @@ fn start_worker(
         beside: Arc::clone(&beside),
         told: AtomicU8::new(0),
         repo_probe: Default::default(),
+        group: Arc::clone(&group),
     });
     if let Some(seat) = (hooks.acts.account_seat)() {
         tap::sweep(
@@ -15214,6 +16565,9 @@ fn roster_of(store: &Store) -> Vec<(String, Program, FollowStamp)> {
                 )
             };
             let vendor = !codex_alab_runs(&h.ctx, agent, stamp.group, Probe::Read);
+            if !vendor {
+                crate::agent_act::roster_read(&h.ctx, h.sid.as_str(), agent, stamp.group);
+            }
             Some((
                 h.sid.as_str().to_string(),
                 agent,
@@ -15226,6 +16580,8 @@ fn roster_of(store: &Store) -> Vec<(String, Program, FollowStamp)> {
         images.retain(|sid, _| roster.iter().any(|(named, _, _)| named == sid));
     }
     drop(images);
+    let live: Vec<&str> = roster.iter().map(|(sid, _, _)| sid.as_str()).collect();
+    crate::agent_act::forget_gone(&live);
     roster
 }
 
@@ -15293,9 +16649,13 @@ fn alab_image_by(
             if let Some(read) = cached.filter(|read| read.exe == exe) {
                 return read.alab;
             }
-            let alab = exe
-                .as_deref()
-                .is_some_and(aterm_agent::harness::codex_alab::alab_bytes);
+            let alab = exe.as_deref().is_some_and(|exe| {
+                agent_image::in_vendor_layout(
+                    Program::Codex,
+                    &agent_image::Image::at(exe),
+                    &agent_image::Places::default(),
+                )
+            });
             ALAB_IMAGES
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -15619,9 +16979,13 @@ fn still_supervisable(store: &Store, sid: &str) -> bool {
     admitted(&ctx).is_some()
 }
 
-/// One run of the loop over this instance's own socket.
-fn hosted_body(sock: &str, job: &WorkerJob) -> BodyEnd {
+/// One run of the loop over this instance's own socket. The loop types into its session only
+/// while the host's kernel read confirms the agent there ([`crate::agent_act::hosted`], the one
+/// gate `Session::call` holds every input verb to); otherwise it observes.
+fn hosted_body(sock: &str, store: &Store, job: &WorkerJob) -> BodyEnd {
     let mut ctl = HostCtl::as_harness(Endpoint::Socket(sock.to_string()));
+    let acts = store.clone();
+    ctl.act = Some(Arc::new(move |sid| crate::agent_act::hosted(&acts, sid)));
     ctl.admission = Some((Arc::clone(&job.switches), job.agent));
     ctl.watch_only = job.watch_beside();
     ctl.fence = Some(holder());
@@ -15630,15 +16994,27 @@ fn hosted_body(sock: &str, job: &WorkerJob) -> BodyEnd {
         return BodyEnd::Stopped;
     }
     let sel = format!("@{}", job.sid);
+    ctl.duty_sid = Some(job.sid.clone());
     if (job.clear_badge && !with_kept(job, |k| lost_marked(k))) || job.unset_mark {
         let owner = format!("owner={RELAUNCH_ATTENTION_OWNER}");
-        if let Err(e) = ctl.call(&[&sel, "meta", "unset", "attention", &owner]) {
-            return held_or_failed(e);
+        let authority = ctl.builtin_authority(&sel);
+        if let Some(revision) = authority
+            .revision()
+            .filter(|_| authority.keeps(Scope::Relaunch))
+            && let Some(Err(error)) = ctl.call_for_duty(
+                Scope::Relaunch,
+                revision,
+                &[&sel, "meta", "unset", "attention", &owner],
+            )
+        {
+            return held_or_failed(error);
         }
     }
     let mut out = LogLines::review(job.sid.clone());
     let mut session = Session::new(&mut ctl, Some(sel));
     session.set_supervisor_name(Some(holder()));
+    session.set_builtin_duties(true);
+    session.set_confirms_agent(true);
     session.type_under_hand(true);
     session.set_handover(Arc::clone(&job.handover));
     session.set_beside(job.watch_beside());
@@ -15801,11 +17177,15 @@ fn live_acts(store: Store, sock: String) -> Acts {
     let account_home = home.clone();
     let upkeep = live_accounts_upkeep();
     let wall_upkeep = upkeep.clone();
+    let screen_wall_store = store.clone();
     let usage_home = home.clone();
     let seat_home = home.clone();
     let cold_home = home.clone();
     let codex_cold_home = home.clone();
     let repo_home = home.clone();
+    let work_home = home.clone();
+    let work_store = store.clone();
+    let put_store = store.clone();
     let limit_read: Mutex<HashMap<String, (Instant, Option<u64>)>> = Mutex::default();
     let fg_store = store.clone();
     let holds_store = store.clone();
@@ -15835,7 +17215,8 @@ fn live_acts(store: Store, sock: String) -> Acts {
     let o_adopted = Arc::clone(&opts);
     let o_in_flight = Arc::clone(&opts);
     let o_resumed = Arc::clone(&opts);
-    let [o1, o2, o3, o4, o5, o6, o7, o8, o9, o10] = std::array::from_fn(|_| Arc::clone(&opts));
+    let [o1, o2, o3, o4, o5, o6, o7, o8, o9, o10, o_carry] =
+        std::array::from_fn(|_| Arc::clone(&opts));
     let [o11, o12, o13, o14, o15, o16, o17, o18, o19, o20] =
         std::array::from_fn(|_| Arc::clone(&opts));
     let o_self = Arc::clone(&opts);
@@ -15846,7 +17227,19 @@ fn live_acts(store: Store, sock: String) -> Acts {
         open: Arc::new(move |sid| open(&store, sid)),
         holds: Arc::new(move |sid, group| holds(&holds_store, sid, group)),
         launch: Arc::new(move |sid| launch_of(&launch_store, sid)),
-        due: Arc::new(move |sid| o1(sid, 0).map_or(Due::No, |o| upgrade_drive::due(&o))),
+        due: Arc::new(move |sid| {
+            let began = Instant::now();
+            let due = o1(sid, 0).map_or(Due::No, |o| upgrade_drive::due(&o));
+            let took = began.elapsed();
+            if took >= SLOW_STEP {
+                aterm_log::info!(
+                    "harness @{sid}: an upgrade read took {} ms ({due:?})",
+                    took.as_millis()
+                );
+            }
+            due
+        }),
+        due_read: POINT_READ_BOUND,
         behind: Arc::new(move |sid, since| {
             o11(sid, 0).map_or(Behind::Nothing, |o| upgrade_drive::note_behind(&o, since))
         }),
@@ -15875,6 +17268,9 @@ fn live_acts(store: Store, sock: String) -> Acts {
             r.step
         }),
         owed: Arc::new(move |sid, only| o6(sid, 0).is_some_and(|o| relaunch::owed_of(&o, only))),
+        carry_owed: Arc::new(move |sid, only| {
+            o_carry(sid, 0).is_some_and(|o| relaunch::carry_owed_of(&o, only))
+        }),
         disk_resume: Arc::new(move |sid, text| {
             disk_resumed(
                 &disk_store,
@@ -15893,6 +17289,7 @@ fn live_acts(store: Store, sock: String) -> Acts {
         disk_board: &crate::disk_board::SHELF,
         jobs_board: &crate::vitals_jobs::BOARD,
         leader_lives: crate::vitals_jobs::leader_lives,
+        held_now: crate::vitals_jobs::held_as_long,
         program_check: &crate::program_check_watch::BOARD,
         occupancy: Arc::new(crate::occupancy_host::reading_for),
         occupancy_pace: Arc::new(crate::occupancy_host::pace_for),
@@ -15906,18 +17303,17 @@ fn live_acts(store: Store, sock: String) -> Acts {
             let Some(o) = o7(sid, grace) else {
                 return "refused:no-home".to_string();
             };
-            let r = relaunch::resume_as(
-                &upgrade_drive::Opts {
-                    land: carry.land,
-                    ..o
-                },
-                carry.done_under_land,
-                carry.only,
-            );
-            if r.is_act() {
-                w3(sid, "carry-on", &r);
-            }
-            r.step
+            let o = upgrade_drive::Opts {
+                land: carry.land,
+                ..o
+            };
+            resume_rows(sid, &*w3, |said| {
+                if carry.replies_held && !carry.done_under_land {
+                    relaunch::resume_held_at_point(&o, carry.only, said)
+                } else {
+                    relaunch::resume_at_point(&o, carry.done_under_land, carry.only, said)
+                }
+            })
         }),
         settle: Arc::new(move |sid| {
             let Some(o) = o_settle(sid, 0) else {
@@ -16078,7 +17474,7 @@ fn live_acts(store: Store, sock: String) -> Acts {
             })
         }),
         agent_resumed: Arc::new(move |sid, snap| {
-            o_resumed(sid, 0).is_some_and(|o| relaunch::agent_resumed(&o, snap))
+            relaunch::resumes_conversation(o_resumed(sid, 0).as_ref(), snap)
         }),
         carry_in_flight: Arc::new(move |sid, grace| {
             let o = o17(sid, grace)?;
@@ -16123,31 +17519,47 @@ fn live_acts(store: Store, sock: String) -> Acts {
         }),
         tasked: Arc::new(move |sid, snap, memo| {
             let o = o10(sid, 0)?;
-            memo.of_snapshot(&o.home, snap, &conversation_typed(&o, sid, snap))
+            memo.of_snapshot(&o.home, snap, &conversation_typed(&o, sid, snap)?)
         }),
         finished: Arc::new(move |sid, snap, memo| {
             let o = o_finished(sid, 0)?;
-            let finished = memo.of_snapshot(&o.home, snap, &conversation_typed(&o, sid, snap));
+            let finished = memo.of_snapshot(&o.home, snap, &conversation_typed(&o, sid, snap)?);
             if let Some(dir) = memo.dir() {
                 upgrade_drive::note_writes(&o, snap, dir);
             }
             finished
         }),
-        limit_reset: Arc::new(move |snap| {
-            let session = snap.session.as_deref()?;
-            limit_reset_kept(&limit_read, session, || {
-                limit_home
-                    .as_deref()
-                    .and_then(|home| upgrade_drive::named_limit_reset(home, snap))
-            })
+        limit_reset: Arc::new(move |snap| match snap.agent() {
+            upgrade::Agent::Agy => limit_home
+                .as_deref()
+                .and_then(|home| upgrade_drive::named_limit_reset(home, snap)),
+            upgrade::Agent::Claude | upgrade::Agent::Codex | upgrade::Agent::Muse => {
+                let session = snap.session.as_deref()?;
+                limit_reset_kept(&limit_read, session, || {
+                    limit_home
+                        .as_deref()
+                        .and_then(|home| upgrade_drive::named_limit_reset(home, snap))
+                })
+            }
         }),
         transcript_tail: Arc::new(upgrade_drive::snapshot_transcript_tail),
         repo_work: Arc::new(move |snap| {
+            use aterm_agent::harness::{repo_work, upgrade_models};
             let tail = upgrade_drive::snapshot_transcript_tail(snap);
-            aterm_agent::harness::repo_work::session_dir(&snap.cwd, tail.as_deref())
+            let used = repo_work::Used::of_session(
+                upgrade_models::parse_lstart(&snap.start),
+                tail.as_deref(),
+            );
+            repo_work::session_dir(&snap.cwd, tail.as_deref())
                 .map_or_else(Default::default, |dir| {
-                    session_repo_work(&dir, repo_home.as_deref())
+                    session_repo_work(&dir, repo_home.as_deref(), &used)
                 })
+        }),
+        work_read: Arc::new(move |sid, agent, snap, held| {
+            work_read_live(&work_store, work_home.as_deref(), sid, agent, snap, held)
+        }),
+        work_put: Arc::new(move |sid, group, record| {
+            work_put_live(&put_store, sid, group, record);
         }),
         transcript: Arc::new(upgrade_drive::snapshot_transcript),
         task_exited: Arc::new(move |sid| task_exited_live(&task_sock, sid)),
@@ -16169,6 +17581,9 @@ fn live_acts(store: Store, sock: String) -> Acts {
         account_gone: Arc::new(account_gone_live),
         account_seat: Arc::new(move || account_seat_live(seat_home.as_deref())),
         account_env: Arc::new(upgrade_drive::snapshot_login_env),
+        account_screen_wall: Arc::new(move |sid, snap| {
+            screen_account_wall(&screen_wall_store, sid, snap)
+        }),
         account_settings: Arc::new(crate::harness_netprobe::stored_login_of_agent),
         tap_born: Arc::new(|pid| {
             aterm_uds::process::read_process_birth(i32::try_from(pid).ok()?)
@@ -16210,6 +17625,14 @@ fn live_acts(store: Store, sock: String) -> Acts {
             o12(sid, 0).is_none_or(|o| upgrade_drive::hold_clock(&o, until))
         }),
         route: Arc::new(crate::harness_netprobe::route_of_agent),
+        claude_env: Arc::new(crate::harness_netprobe::launch_env_of_agent),
+        agy_backend: Arc::new(|snap, env| {
+            aterm_agent::harness::witness::agy_backend_on_disk(
+                &snap.argv,
+                env,
+                aterm_types::dirs::home_dir().as_deref(),
+            )
+        }),
         net_path: Arc::new(crate::harness_netprobe::SystemPath),
         memory: {
             let board = Arc::new(MemoryBoard::default());
@@ -16284,6 +17707,7 @@ fn account_wall_at(
         env: &env,
         settled: accounts::judged_label(roster.roster(), &who).is_some() && settled(),
         wall: upgrade_drive::named_standing_wall(home, agent.snap),
+        screen_wall: agent.screen_wall,
         started: process_started(&agent.snap.start),
     };
     account_wall_of(store, &roster, sid, &read, now)
@@ -16299,6 +17723,7 @@ struct WallRead<'a> {
     env: &'a [String],
     settled: bool,
     wall: Option<aterm_agent::harness::upgrade::StandingWall>,
+    screen_wall: Option<ScreenAccountWall>,
     started: Option<i64>,
 }
 
@@ -16318,7 +17743,8 @@ fn account_wall_of(
         stored_login: who.stored_login && read.settled,
         ..who
     };
-    let Some(wall) = read.wall.as_ref() else {
+    let screen_wall = read.screen_wall.map(ScreenAccountWall::standing);
+    let Some(wall) = read.wall.as_ref().or(screen_wall.as_ref()) else {
         return ("no-wall", None);
     };
     let Some(started) = read.started else {
@@ -16339,12 +17765,13 @@ fn account_wall_of(
     (word, label)
 }
 
-/// What a session working in `dir` holds that no remote main has (`IdleHost::repo_work`, [`aterm_agent::harness::repo_work::probe`]).
+/// What a session working in `dir`, having used `used`, holds that no remote main has (`IdleHost::repo_work`, [`aterm_agent::harness::repo_work::probe_session`]).
 pub(crate) fn session_repo_work(
     dir: &std::path::Path,
     home: Option<&std::path::Path>,
+    used: &aterm_agent::harness::repo_work::Used,
 ) -> aterm_agent::harness::repo_work::RepoRead {
-    session_repo_work_under(dir, home, aterm_types::dirs::state_dir().as_deref())
+    session_repo_work_under(dir, home, aterm_types::dirs::state_dir().as_deref(), used)
 }
 
 /// [`session_repo_work`] under the state root `state`.
@@ -16352,12 +17779,112 @@ pub(crate) fn session_repo_work_under(
     dir: &std::path::Path,
     home: Option<&std::path::Path>,
     state: Option<&std::path::Path>,
+    used: &aterm_agent::harness::repo_work::Used,
 ) -> aterm_agent::harness::repo_work::RepoRead {
     use aterm_agent::harness::repo_work;
     if state.is_some_and(|state| crate::summarize::in_summary_folder_under(dir, state)) {
         return repo_work::RepoRead::Clean;
     }
-    repo_work::probe(dir, home, repo_work::PROBE_LIMIT)
+    repo_work::probe_session(dir, home, used, repo_work::PROBE_LIMIT)
+}
+
+/// The product's [`Acts::work_read`]: the folder tab `sid`'s `agent` works in
+/// ([`aterm_agent::harness::work_record::work_dir`], from its snapshot `snap`, Claude Code's
+/// transcript, codex's rollout and the terminal's own folder) read under `home`, no git started
+/// while `held` says starts are held back, and nothing to show in a summary worker's folder.
+fn work_read_live(
+    store: &Store,
+    home: Option<&Path>,
+    sid: &str,
+    agent: Program,
+    snap: Option<&Snapshot>,
+    held: &dyn Fn() -> bool,
+) -> aterm_agent::harness::work_record::WorkRead {
+    use aterm_agent::harness::{repo_work, work_record};
+    let (rollout, engine) = session_folders(store, sid);
+    let tail = snap
+        .filter(|_| reads_transcript(agent))
+        .and_then(upgrade_drive::snapshot_transcript_tail);
+    let Some(dir) = work_record::work_dir(
+        agent,
+        work_record::Folders {
+            started: snap.map(|snap| snap.cwd.as_str()),
+            transcript: tail.as_deref(),
+            rollout: rollout.as_deref(),
+            engine: engine.as_deref(),
+        },
+    ) else {
+        return work_record::WorkRead::None;
+    };
+    if aterm_types::dirs::state_dir()
+        .is_some_and(|state| crate::summarize::in_summary_folder_under(&dir, &state))
+    {
+        return work_record::WorkRead::None;
+    }
+    let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+    repo_work::read_work(&dir, home, xdg.as_deref(), repo_work::PROBE_LIMIT, held)
+}
+
+/// Tab `sid`'s codex rollout cwd, while that codex is in front, and its terminal's own working
+/// directory ([`work_read_live`]).
+fn session_folders(store: &Store, sid: &str) -> (Option<PathBuf>, Option<PathBuf>) {
+    use crate::cwd_native::ReportedCwd as _;
+    let Some(h) = store
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .by_sid(&aterm_session::SessionId::new(sid))
+        .cloned()
+    else {
+        return (None, None);
+    };
+    let rollout = h
+        .ctx
+        .timeline
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .codex_survey()
+        .and_then(|codex| codex.facts.cwd.clone());
+    let engine = match h.term.try_lock() {
+        Ok(t) => t
+            .native_working_directory()
+            .map(std::borrow::Cow::into_owned),
+        Err(std::sync::TryLockError::Poisoned(p)) => p
+            .into_inner()
+            .native_working_directory()
+            .map(std::borrow::Cow::into_owned),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+    .filter(|cwd| !cwd.is_empty())
+    .map(PathBuf::from);
+    (rollout, engine)
+}
+
+/// The product's [`Acts::work_put`]: `record`, stamped with this host's name, on tab `sid`'s
+/// timeline while group `group` is in front ([`crate::session_timeline::SessionTimeline::set_work`]).
+fn work_put_live(
+    store: &Store,
+    sid: &str,
+    group: i32,
+    record: Option<aterm_agent::harness::work_record::WorkRecord>,
+) {
+    let Some(h) = store
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .by_sid(&aterm_session::SessionId::new(sid))
+        .cloned()
+    else {
+        return;
+    };
+    let record = record.map(|record| aterm_agent::harness::work_record::WorkRecord {
+        host: aterm_uds::process::lan_host_name().unwrap_or_default(),
+        ..record
+    });
+    let _ = h
+        .ctx
+        .timeline
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .set_work(group, record);
 }
 
 /// The product's [`Acts::task_exited`], over this instance's own socket ([`task_exited_with`]).
@@ -16389,6 +17916,7 @@ fn task_exited_words(line: &str) -> String {
     let rev = words
         .next()
         .and_then(|word| word.strip_prefix("rev="))
+        .filter(|value| !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
         .and_then(|value| value.parse::<u64>().ok());
     let state = words
         .next()
@@ -17226,14 +18754,14 @@ fn login_transact_of(
         project = "harness_host::tests::account_landing_snapshot::snapshot_transition"
     )
 )]
-fn account_land(sid: &str, kept: &Mutex<Kept>, hooks: &Hooks, landing: Landing) -> Applied {
+fn account_land(sid: &str, kept: &Arc<Mutex<Kept>>, hooks: &Hooks, landing: Landing) -> Applied {
     let gate = with_kept_of(kept, |k| Arc::clone(&k.account.landing));
     let _held = match gate.try_lock() {
         Ok(held) => held,
         Err(std::sync::TryLockError::Poisoned(held)) => held.into_inner(),
         Err(std::sync::TryLockError::WouldBlock) => return Applied::Unread,
     };
-    account_land_held(sid, kept, hooks, landing, &gate)
+    account_land_held(sid, kept, hooks, landing, None, &gate)
 }
 
 /// Resolves a pending move while its caller holds this generation's completion gate.
@@ -17271,12 +18799,13 @@ fn account_land(sid: &str, kept: &Mutex<Kept>, hooks: &Hooks, landing: Landing) 
 )]
 fn account_land_held(
     sid: &str,
-    kept: &Mutex<Kept>,
+    kept: &Arc<Mutex<Kept>>,
     hooks: &Hooks,
     landing: Landing,
+    acted: Option<Instant>,
     gate: &Arc<Mutex<()>>,
 ) -> Applied {
-    let Some(pending) = PendingAccountLanding::observe(sid, kept, hooks, gate) else {
+    let Some(pending) = PendingAccountLanding::observe(sid, kept, hooks, acted, gate) else {
         return Applied::Unread;
     };
     let Some(recorded) = pending.record(sid, kept, hooks, gate) else {
@@ -17309,10 +18838,15 @@ impl PendingAccountLanding {
             })
     }
 
+    /// What the move in flight came to, read off its process's environment. Where the kept
+    /// snapshot still names the process it left, the relaunch record is read again within
+    /// [`Acts::point_read`] ([`reread`]), by a read begun after the move's act ended at `acted`;
+    /// a read still out past that leaves the move unread (none), as any it cannot read.
     fn observe(
         sid: &str,
-        kept: &Mutex<Kept>,
+        kept: &Arc<Mutex<Kept>>,
         hooks: &Hooks,
+        acted: Option<Instant>,
         gate: &Arc<Mutex<()>>,
     ) -> Option<Self> {
         let flying = with_kept_of(kept, |k| {
@@ -17331,15 +18865,14 @@ impl PendingAccountLanding {
         let (snap, on, roster, profile_env) = if let Some(rejected) = &flying.rejected {
             (None, Some(rejected.on.clone()), None, Vec::new())
         } else {
-            let snap = other().or_else(|| {
-                refresh_snapshot(sid, kept, hooks);
-                other()
-            })?;
+            let read_again = |since| reread(sid, kept, hooks, since, hooks.acts.point_read);
+            let snap =
+                other().or_else(|| (read_again(acted) != Reread::Out).then(other).flatten())?;
             let roster = account_roster(&seat)?;
             let (snap, observed) = match observed_account(hooks, &roster, &snap) {
                 Ok(observed) => (snap, observed),
                 Err(()) => {
-                    if !refresh_snapshot(sid, kept, hooks) {
+                    if read_again(Some(Instant::now())) != Reread::Landed {
                         return None;
                     }
                     let current = other()?;
@@ -17848,19 +19381,76 @@ fn pools_tell(switches: &Switches, hooks: &Hooks, said: Vec<PoolSaid>, again: bo
     (hooks.note)(HostNote::Pools(said));
 }
 
+/// Tell the window the sheet's conflicts, once per change ([`HostNote::SheetConflicts`]); with
+/// `again`, a standing one is told again. None, where none was, is no note.
+fn sheet_tell(
+    switches: &Switches,
+    hooks: &Hooks,
+    said: Vec<aterm_agent::harness::accounts_sync::SheetConflict>,
+    again: bool,
+) {
+    use std::hash::{Hash as _, Hasher as _};
+    let hash = if said.is_empty() {
+        0
+    } else {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        said.hash(&mut hasher);
+        hasher.finish().max(1)
+    };
+    let told = switches.sheet_said.swap(hash, Ordering::SeqCst) == hash;
+    if told && !(again && hash != 0) {
+        return;
+    }
+    (hooks.note)(HostNote::SheetConflicts(said));
+}
+
+/// The sheet's conflicts this machine's pools skip, read beside `seat`'s roster
+/// (`accounts_sync::sheet_conflicts`, which reads `[harness] accounts` alone, the one switch
+/// every pool's sync reads; [`accounts_look`] asks only while some pool rotates).
+fn sheet_said(seat: &AccountSeat) -> Vec<aterm_agent::harness::accounts_sync::SheetConflict> {
+    seat.roster
+        .as_deref()
+        .and_then(Path::parent)
+        .map(|dir| {
+            aterm_agent::harness::accounts_sync::sheet_conflicts(
+                &seat.home,
+                &dir.join("aterm.toml"),
+            )
+        })
+        .unwrap_or_default()
+}
+
 /// The host's own look at the accounts, told ([`accounts_said`] under the mode read live, [`accounts_tell`] with `again`).
 fn accounts_look(switches: &Switches, hooks: &Hooks, latches: &LoginLatches, again: bool) {
     if switches.mute() {
         return;
     }
-    let pools = if switches.logins() {
+    let others = aterm_agent::harness::accounts_sync::OTHER_CLIS;
+    let renews = |cli| switches.pool_controls(cli).logins;
+    let pooled = others.into_iter().any(renews);
+    let rotates = switches.accounts() != accounts::Mode::Off
+        || others
+            .into_iter()
+            .any(|cli| switches.pool_controls(cli).mode != accounts::Mode::Off);
+    // One read of the seat serves the pools' lines and the sheet's.
+    let seat = if pooled || rotates {
         (hooks.acts.account_seat)()
-            .map(|seat| pools_said(&seat))
-            .unwrap_or_default()
     } else {
-        Vec::new()
+        None
+    };
+    let pools = match &seat {
+        Some(seat) if pooled => pools_said(seat)
+            .into_iter()
+            .filter(|pool| renews(pool.cli))
+            .collect(),
+        _ => Vec::new(),
     };
     pools_tell(switches, hooks, pools, again);
+    let conflicts = match &seat {
+        Some(seat) if rotates => sheet_said(seat),
+        _ => Vec::new(),
+    };
+    sheet_tell(switches, hooks, conflicts, again);
     let rotation = switches.accounts() != accounts::Mode::Off;
     let notes = switches.notes();
     let said = if switches.accounts_live() || notes {
@@ -17885,6 +19475,7 @@ fn accounts_look(switches: &Switches, hooks: &Hooks, latches: &LoginLatches, aga
 struct AccountLook {
     who: accounts::ProcessLogin,
     label: Option<String>,
+    screen_wall: Option<ScreenAccountWall>,
     snap: Snapshot,
     generation: Arc<Mutex<()>>,
     /// Only the profile selectors from the same process environment as `who`.
@@ -18159,6 +19750,76 @@ struct OwnWall {
     window: String,
     until: Option<i64>,
     at: i64,
+    /// A screen fallback cannot prove a resumed transcript's wall belongs to the new account.
+    from_screen: bool,
+}
+
+/// An explicit usage wall read from the current Claude process's settled screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ScreenAccountWall {
+    kind: aterm_phase::WallKind,
+    at: u64,
+}
+
+impl ScreenAccountWall {
+    fn standing(self) -> aterm_agent::harness::upgrade::StandingWall {
+        aterm_agent::harness::upgrade::StandingWall {
+            at: self.at,
+            until: None,
+            // UsageSession includes a generic usage-limit banner, which names no window.
+            window: Some(
+                match self.kind {
+                    aterm_phase::WallKind::UsageWeekly => "seven_day",
+                    _ => accounts::UNNAMED_WINDOW,
+                }
+                .to_string(),
+            ),
+            credits: None,
+        }
+    }
+}
+
+/// Read only the screen the phase reader has finished publishing, while that same frame and
+/// process still hold the tab. Account callers separately validate the process's login.
+fn screen_account_wall(store: &Store, sid: &str, snap: &Snapshot) -> Option<ScreenAccountWall> {
+    let handle = store
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .by_sid(&aterm_session::SessionId::new(sid))?
+        .clone();
+    let term = handle.term.try_lock().ok()?;
+    if term.frame_unfinished_at(Instant::now()) {
+        return None;
+    }
+    let timeline = handle.ctx.timeline.try_lock().ok()?;
+    let published = timeline.agent();
+    if published.stamp?.generation != crate::control::screen_gen(&term) {
+        return None;
+    }
+    screen_account_wall_of(published, snap)
+}
+
+fn screen_account_wall_of(
+    published: &crate::session_timeline::AgentPublication,
+    snap: &Snapshot,
+) -> Option<ScreenAccountWall> {
+    if !matches!(snap.run, relaunch::AgentRun::Claude)
+        || snap.session.is_none()
+        || i64::from(published.program_pgid) != i64::from(snap.pid)
+        || !published.reader.is_some_and(accounts_for)
+        || !identified_agent(published).is_some_and(accounts_for)
+        || published.word != published.screen_word
+    {
+        return None;
+    }
+    let kind = match published.word {
+        "wall:usage-session" => aterm_phase::WallKind::UsageSession,
+        "wall:usage-weekly" => aterm_phase::WallKind::UsageWeekly,
+        _ => return None,
+    };
+    let started = u64::try_from(process_started(&snap.start)?).ok()?;
+    let at = published.screen_word_unix_ms / 1000;
+    (at >= started).then_some(ScreenAccountWall { kind, at })
 }
 
 /// The standing usage wall of `snap`'s own process (the recorder's rule, `accounts::record_wall`).
@@ -18202,6 +19863,7 @@ fn standing_wall(seat: &AccountSeat, snap: &Snapshot) -> Standing {
             .unwrap_or_else(|| accounts::UNNAMED_WINDOW.to_string()),
         until: wall.until.and_then(|until| i64::try_from(until).ok()),
         at: written.min(seat.now),
+        from_screen: false,
     })
 }
 
@@ -18252,7 +19914,7 @@ fn account_point_read(
             kind: aterm_phase::WallKind::Auth,
         } => (accounts::Point::LostLogin { seen }, None, false),
         AccountPoint::LoginEnded => (accounts::Point::LoginEnded, None, false),
-        AccountPoint::Wall { .. } => match standing_wall(seat, &look.snap) {
+        AccountPoint::Wall { kind } => match standing_wall(seat, &look.snap) {
             Standing::Own(wall) => (
                 accounts::Point::Wall {
                     window: wall.window.clone(),
@@ -18261,7 +19923,27 @@ fn account_point_read(
                 Some(wall),
                 false,
             ),
-            Standing::Unwritten => (accounts::Point::TurnEnd, None, true),
+            Standing::Unwritten => match look.screen_wall.filter(|wall| wall.kind == kind) {
+                Some(screen) => {
+                    let wall = screen.standing();
+                    let at = i64::try_from(wall.at).unwrap_or(i64::MAX).min(seat.now);
+                    let window = wall.window.expect("screen wall names its window");
+                    (
+                        accounts::Point::Wall {
+                            window: window.clone(),
+                            at: Some(at),
+                        },
+                        Some(OwnWall {
+                            window,
+                            until: None,
+                            at,
+                            from_screen: true,
+                        }),
+                        false,
+                    )
+                }
+                None => (accounts::Point::TurnEnd, None, true),
+            },
             Standing::NotOwn => (accounts::Point::TurnEnd, None, false),
         },
     }
@@ -18562,10 +20244,9 @@ fn account_identity_matches(
 /// Exclude known identity contradictions only from this selection. Recompute with
 /// the whole roster, pin and canary intact; the persisted authentication state is unchanged.
 fn checked_account_advice(
-    seat: &AccountSeat,
     roster: &accounts::Roster,
-    look: &AccountLook,
     state: &accounts::State,
+    identities: &mut AccountIdentities,
     now: i64,
     advise: impl Fn(&accounts::State) -> accounts::Advice,
 ) -> accounts::Advice {
@@ -18579,7 +20260,7 @@ fn checked_account_advice(
         let Some(row) = roster.row(to) else {
             return accounts::Advice::Stay(accounts::StayWhy::NoCandidate);
         };
-        if account_identity_matches(seat, row, &look.profile_env) {
+        if identities.matches(row) {
             return advice;
         }
         if state.active.as_deref() == Some(to.as_str()) {
@@ -19153,7 +20834,11 @@ fn disk_remover(
     store: &Store,
 ) -> impl FnMut(&aterm_agent::harness::disk::Row) -> std::io::Result<aterm_agent::harness::disk::Removed>
 + '_ {
-    aterm_agent::harness::disk::remover(judge, move || disk_sessions_now(store))
+    aterm_agent::harness::disk::remover(
+        judge,
+        harness_state().map(|state| aterm_agent::harness::first_exec::holds_dir(&state)),
+        move || disk_sessions_now(store),
+    )
 }
 
 /// Why tier 3 takes nothing this look.
@@ -19275,6 +20960,9 @@ impl DiskRuns {
 }
 
 static DISK_RUNS: DiskRuns = DiskRuns::new();
+#[cfg(target_os = "macos")]
+static DISK_CACHE_CHECK: Mutex<cache_maintenance::Schedule> =
+    Mutex::new(cache_maintenance::Schedule::new());
 const DISK_SHORT_LOOKS: u32 = 2;
 static DISK_NOTES_SAID: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 static DISK_PRIVATE_SAID: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
@@ -19492,6 +21180,53 @@ fn disk_look_pass(
             && private.is_none(),
         board,
     ) {
+        #[cfg(target_os = "macos")]
+        {
+            let placing = (private.is_none() && table.complete)
+                .then(|| aterm_agent::harness::disk::discover::placing_of(&home, &table))
+                .flatten();
+            let eligible = cache_maintenance::eligible(
+                &config,
+                level,
+                private.is_none(),
+                placing.is_some(),
+                demand.is_some() || projected.is_some(),
+            );
+            let result = cache_maintenance::run(
+                &DISK_CACHE_CHECK,
+                Instant::now(),
+                eligible,
+                || {
+                    let lock = aterm_agent::harness::disk::reserve::pass_lock_for(&home);
+                    let dir = lock.parent().ok_or_else(|| {
+                        std::io::Error::other("cache maintenance has no pass-lock directory")
+                    })?;
+                    cache_maintenance::claim(dir, now)
+                },
+                || {
+                    let pass = disk_sweep_journalled(&state, now, board, |record| {
+                        atpkg::build_cache::reclaim_home_watched(
+                            atpkg::build_cache::RECLAIM_GONE,
+                            placing.as_ref(),
+                            record,
+                        )
+                    });
+                    let (freed, went) = disk_swept(&pass.swept, &pass.sized);
+                    disk_reclaimed(looked, freed);
+                    if freed > 0 {
+                        aterm_log::info!(
+                            "harness disk watch: daily managed-cache maintenance reclaimed {} \
+                             from {} entries",
+                            atpkg::cost::human_bytes(freed),
+                            went.len()
+                        );
+                    }
+                },
+            );
+            if let Err(error) = result {
+                aterm_log::warn!("harness disk watch: daily cache maintenance deferred: {error}");
+            }
+        }
         if let Some(told) = disk_look_without_pass(&reading, free, &DISK_RUNS) {
             note(told);
         }
@@ -19582,11 +21317,13 @@ fn disk_look_pass(
         }
         Err(e) => {
             aterm_log::warn!(
-                "harness disk watch: the pass lock {} could not be taken ({e}); the pass runs \
-                 without it",
+                "harness disk watch: the pass lock {} could not be taken ({e}); the pass is \
+                 deferred",
                 lock_path.display()
             );
-            None
+            looked.contended = true;
+            disk_episode_after(board, level, 0, &[]);
+            return;
         }
     };
     let short = config.below_auto_floor(free);
@@ -19615,7 +21352,7 @@ fn disk_look_pass(
         });
         let (freed, went) = disk_swept(&pass.swept, &pass.sized);
         disk_reclaimed(looked, freed);
-        let after = if pass.swept.is_empty() {
+        let after = if went.is_empty() {
             free
         } else {
             measure().map(|reading| reading.free)
@@ -19666,7 +21403,17 @@ fn disk_look_pass(
                 started.elapsed(),
             );
         }
-        if !swept.is_empty() {
+        let kept = disk_kept_lines(&swept);
+        if !kept.is_empty() {
+            aterm_log::info!(
+                "harness disk watch: kept {} build cache entr{} its removal was refused after \
+                 its check, nothing of it gone: {}",
+                kept.len(),
+                if kept.len() == 1 { "y" } else { "ies" },
+                kept.join("; "),
+            );
+        }
+        if !went.is_empty() {
             aterm_log::info!(
                 "harness disk watch: {} ({} GiB free against a {} GiB warning and a {} GiB \
                  floor), swept {} build cache{}, about {} back: {}",
@@ -19674,8 +21421,8 @@ fn disk_look_pass(
                 free.map_or(0, |f| f >> 30),
                 config.warn_free_gib,
                 config.auto_free_gib,
-                swept.len(),
-                if swept.len() == 1 { "" } else { "s" },
+                went.len(),
+                if went.len() == 1 { "" } else { "s" },
                 aterm_agent::harness::disk::human_bytes(freed),
                 went.join("; "),
             );
@@ -19713,23 +21460,16 @@ fn disk_look_pass(
         disk_pass_ran(
             started,
             free,
-            swept.is_empty()
+            went.is_empty()
                 && (level_after == Level::Emergency
                     || (level_after == Level::Unknown && level == Level::Emergency)),
             level,
-            !swept.is_empty(),
+            !went.is_empty(),
         );
         disk_pass_summary(
             home_key.as_ref(),
             after.as_ref().map(|s| s.free),
-            (
-                if swept.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![1]
-                },
-                false,
-            ),
+            (if went.is_empty() { Vec::new() } else { vec![1] }, false),
             freed,
             demand,
             &config,
@@ -19738,7 +21478,7 @@ fn disk_look_pass(
         if level_after == Level::Unknown {
             return;
         }
-        match DISK_RUNS.pass(!swept.is_empty(), after.as_ref().map(|s| s.free), config) {
+        match DISK_RUNS.pass(!went.is_empty(), after.as_ref().map(|s| s.free), config) {
             DiskOutcome::Plenty => note(HostNote::DiskPlenty),
             DiskOutcome::Short => {}
             DiskOutcome::Low { free_gib, .. } => note(HostNote::DiskLow {
@@ -20469,20 +22209,14 @@ pub(crate) fn disk_fill_ask(
         })
 }
 
-const DISK_PASS_EVERY: Duration = Duration::from_secs(10 * 60);
-const DISK_EMERGENCY_DROP: u64 = 512 << 20;
-const DISK_LOW_EVERY: Duration = Duration::from_secs(3600);
-const DISK_LOW_EVERY_MAX: Duration = Duration::from_secs(8 * 3600);
+#[cfg(test)]
+use aterm_agent::harness::disk::cadence::{
+    EMERGENCY_DROP as DISK_EMERGENCY_DROP, LOW_EVERY as DISK_LOW_EVERY,
+    LOW_EVERY_MAX as DISK_LOW_EVERY_MAX, PASS_EVERY as DISK_PASS_EVERY,
+};
 
 /// The last pass ([`disk_pass_due`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DiskPass {
-    at: Instant,
-    free: Option<u64>,
-    fruitless: bool,
-    level: aterm_agent::harness::disk::Level,
-    low_every: Duration,
-}
+type DiskPass = aterm_agent::harness::disk::cadence::Pass;
 
 static DISK_LAST_PASS: Mutex<Option<DiskPass>> = Mutex::new(None);
 
@@ -20495,45 +22229,17 @@ fn disk_pass_due(
     poked: bool,
     room: u64,
 ) -> bool {
-    use aterm_agent::harness::disk::Level;
-    if matches!(level, Level::Unknown | Level::Ok) {
-        return false;
-    }
-    let Some(pass) = last.as_mut() else {
-        return true;
-    };
-    if level != Level::Emergency {
-        pass.fruitless = false;
-    }
-    let since = now.saturating_duration_since(pass.at);
-    if level == Level::Low {
-        let fell = matches!((pass.free, free), (Some(was), Some(is))
-            if is.saturating_add(room / 4) < was);
-        return poked || pass.level != Level::Low || fell || since >= pass.low_every;
-    }
-    if since >= DISK_PASS_EVERY {
-        return true;
-    }
-    if pass.fruitless {
-        return matches!((pass.free, free), (Some(was), Some(is))
-            if is.saturating_add(DISK_EMERGENCY_DROP) < was);
-    }
-    poked || level == Level::Emergency || pass.level < Level::Short
+    aterm_agent::harness::disk::cadence::due(last, now, level, free, poked, room)
 }
 
 /// The cadence after a pass at `level` that `freed` something or not, the last one's `before` ([`DiskPass::low_every`]).
+#[cfg(test)]
 fn disk_low_every(
     level: aterm_agent::harness::disk::Level,
     freed: bool,
     before: Option<&DiskPass>,
 ) -> Duration {
-    use aterm_agent::harness::disk::Level;
-    match before {
-        Some(last) if level == Level::Low && !freed && last.level == Level::Low => {
-            last.low_every.saturating_mul(2).min(DISK_LOW_EVERY_MAX)
-        }
-        _ => DISK_LOW_EVERY,
-    }
+    aterm_agent::harness::disk::cadence::low_every(level, freed, before)
 }
 
 /// A pass that started at `at` in a look that measured `free` at `level` ran.
@@ -20547,14 +22253,7 @@ fn disk_pass_ran(
     let mut last = DISK_LAST_PASS
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    let low_every = disk_low_every(level, freed, last.as_ref());
-    *last = Some(DiskPass {
-        at,
-        free,
-        fruitless,
-        level,
-        low_every,
-    });
+    aterm_agent::harness::disk::cadence::ran(&mut last, at, free, fruitless, level, freed);
 }
 
 /// What a pass did, on the board for `await sys` to answer from (`crate::disk_board::PassSummary`).
@@ -20602,12 +22301,7 @@ fn disk_episode_freed(board: &Shelf, freed: u64, went: &[String]) -> (u64, Vec<S
 }
 
 /// What the no-session sweep did, journalled ([`disk_sweep_journalled`]).
-#[derive(Debug, Default)]
-struct SweepJournalled {
-    swept: Vec<(PathBuf, atpkg::build_cache::Unused)>,
-    sized: Vec<(PathBuf, atpkg::build_cache::Unused, u64)>,
-    unrecorded: bool,
-}
+type SweepJournalled = aterm_agent::harness::cli::DiskSweep;
 
 /// The no-session sweep, journalled.
 fn disk_sweep_journalled(
@@ -20618,32 +22312,20 @@ fn disk_sweep_journalled(
         &mut dyn FnMut(&Path, atpkg::build_cache::Unused) -> bool,
     ) -> Vec<(PathBuf, atpkg::build_cache::Unused)>,
 ) -> SweepJournalled {
-    let mut sized: Vec<(PathBuf, atpkg::build_cache::Unused, u64)> = Vec::new();
-    let mut unrecorded = false;
-    let swept = sweep(&mut |path, why| {
-        let (bytes, _) = aterm_agent::harness::disk::dir_bytes(path);
-        let on_record =
-            aterm_agent::harness::cli::disk_sweep_journal(state, path, bytes, why, false, now);
-        if on_record {
-            sized.push((path.to_path_buf(), why, bytes));
-        } else {
-            unrecorded = true;
-        }
-        on_record
-    });
-    let removals = disk_sweep_removals(&swept, &sized);
-    for ((path, why), (bytes, _)) in swept.iter().zip(&removals) {
-        aterm_agent::harness::cli::disk_sweep_journal(state, path, *bytes, *why, true, now);
-    }
+    let pass = aterm_agent::harness::cli::disk_sweep_journalled(state, now, sweep);
+    let removals = disk_sweep_removals(&pass.swept, &pass.sized);
     board.tally_freed(&removals);
-    SweepJournalled {
-        swept,
-        sized,
-        unrecorded,
-    }
+    pass
 }
 
-/// What the no-session sweep freed.
+/// Whether the sweep returned `why` for an entry nothing of which went
+/// ([`atpkg::build_cache::Unused::Refused`]): its outcome row says `kept`, and it is neither a
+/// line of what went nor a removal of today's freed tally.
+const fn disk_kept(why: atpkg::build_cache::Unused) -> bool {
+    why.nothing_went()
+}
+
+/// What the no-session sweep freed: its bytes, and a line for each entry some of which went.
 fn disk_swept(
     swept: &[(PathBuf, atpkg::build_cache::Unused)],
     sized: &[(PathBuf, atpkg::build_cache::Unused, u64)],
@@ -20651,6 +22333,7 @@ fn disk_swept(
     let mut freed = 0u64;
     let went = swept
         .iter()
+        .filter(|(_, why)| !disk_kept(*why))
         .map(|(p, why)| {
             let bytes = disk_sized(sized, p, *why);
             freed = freed.saturating_add(bytes);
@@ -20666,29 +22349,41 @@ fn disk_swept(
 }
 
 /// The size `path` was given before its removal (`sized`), or nothing for one not sized; for a
-/// stage a removal could not finish, the bytes of it that went (`Unused::Stayed`).
+/// stage a removal could not finish or whose permission was revoked, only the bytes that went;
+/// for one nothing of which went ([`disk_kept`]), none.
 fn disk_sized(
     sized: &[(PathBuf, atpkg::build_cache::Unused, u64)],
     path: &Path,
     why: atpkg::build_cache::Unused,
 ) -> u64 {
-    if let atpkg::build_cache::Unused::Stayed { freed, .. } = why {
-        return freed;
-    }
-    sized
-        .iter()
-        .find(|(p, w, _)| p == path && *w == why)
-        .map_or(0, |(_, _, b)| *b)
+    aterm_agent::harness::cli::disk_sweep_sized(sized, path, why)
 }
 
-/// The no-session sweep's removals as today's freed tally counts them ([`crate::disk_board::Shelf::tally_freed`]).
+/// The no-session sweep's removals as today's freed tally counts them ([`crate::disk_board::Shelf::tally_freed`]): each entry but one nothing of which went ([`disk_kept`]).
 fn disk_sweep_removals(
     swept: &[(PathBuf, atpkg::build_cache::Unused)],
     sized: &[(PathBuf, atpkg::build_cache::Unused, u64)],
 ) -> Vec<(u64, &'static str)> {
     swept
         .iter()
+        .filter(|(_, why)| !disk_kept(*why))
         .map(|(p, why)| (disk_sized(sized, p, *why), crate::disk_board::BUILD_CACHES))
+        .collect()
+}
+
+/// A line for each entry the no-session sweep kept, nothing of it gone ([`disk_kept`]): its path
+/// and what refused it after its check.
+fn disk_kept_lines(swept: &[(PathBuf, atpkg::build_cache::Unused)]) -> Vec<String> {
+    swept
+        .iter()
+        .filter(|(_, why)| disk_kept(*why))
+        .map(|(p, why)| {
+            format!(
+                "{} ({})",
+                p.display(),
+                aterm_agent::harness::disk::sweep_reason(*why)
+            )
+        })
         .collect()
 }
 
@@ -21391,7 +23086,7 @@ fn accounts_on_move() {
     if STARTED.set(()).is_err() {
         return;
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     CLAIMS_LIVE.store(true, Ordering::SeqCst);
     let mut moved = crate::network_moved::watch();
     let spawned = std::thread::Builder::new()
@@ -21417,15 +23112,27 @@ fn accounts_on_move() {
 }
 
 /// This window's network moved, as `woke` heard (docs/DESIGN-fluid-swarm-2026-10-28.md F3c):
-/// the automatic sign-in ladder's waits end and the upkeep runs now, then the account claims are
-/// read again and settled ([`aterm_agent::harness::claims::touch`]).
+/// the automatic sign-in ladder's waits end (a heard peer leaves that of a row a page stopped,
+/// [`aterm_agent::harness::accounts_sync::peer_heard`]) and the upkeep runs now, then the account
+/// claims are read again and settled ([`aterm_agent::harness::claims::touch`]).
 fn accounts_moved(woke: crate::network_moved::Woke) {
+    use crate::network_moved::Woke;
+    let peer = matches!(woke, Woke::Beacon | Woke::Browse);
     aterm_log::info!(
-        "harness: accounts-upkeep: the network moved ({}): the sign-in ladder's waits end, the \
+        "harness: accounts-upkeep: the network moved ({}): the sign-in ladder's {} end, the \
          upkeep runs now, and the account claims are settled again",
-        woke.words()
+        woke.words(),
+        if peer {
+            "waits, but a page's,"
+        } else {
+            "waits"
+        },
     );
-    aterm_agent::harness::accounts_sync::network_moved();
+    if peer {
+        aterm_agent::harness::accounts_sync::peer_heard();
+    } else {
+        aterm_agent::harness::accounts_sync::network_moved();
+    }
     maintain_accounts_live(UpkeepStep::Both);
     claims_look();
 }
@@ -21438,51 +23145,156 @@ pub(crate) fn claims_look() {
     claims_touch(aterm_agent::harness::claims::Act::Look);
 }
 
-/// [`claims_look`] as this Mac goes to sleep (`Act::Quiet`): the claims it keeps last at most
-/// `claims::SESSION_FRESH_S` more, so other Macs read a sleeping Mac's accounts free then.
-#[cfg(target_os = "macos")]
-fn claims_quiet() {
-    claims_touch(aterm_agent::harness::claims::Act::Quiet);
-}
-
 /// This process looks at the account claims ([`accounts_on_move`] started).
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 static CLAIMS_LIVE: AtomicBool = AtomicBool::new(false);
 
-/// The longest the main thread waits on [`claims_quiet`] as the Mac goes to sleep (macOS lets a
-/// will-sleep observer hold sleep up to 30 s).
-#[cfg(target_os = "macos")]
+/// The longest a caller waits on [`claims_down`] (the main thread as the Mac goes to sleep or as
+/// the window's run ends at a logout, restart or shut down, the node job as it stops): its touch
+/// and its push to the peers together. macOS lets a will-sleep observer hold sleep up to 30 s,
+/// and launchd waits 20 s for a job it stops.
+#[cfg(unix)]
 const QUIET_WITHIN: Duration = Duration::from_secs(5);
 
 /// The window's answer to the Mac going to sleep (`crate::platform`'s will-sleep observer, on the
-/// main thread): where this process looks at the account claims, [`claims_quiet`] on its own
-/// thread, waited for at most [`QUIET_WITHIN`], so a busy store never holds the main thread longer.
+/// main thread): where this process looks at the account claims, the claims it keeps last at
+/// most `claims::SESSION_FRESH_S` more (`Act::Quiet`), so other Macs read a sleeping Mac's
+/// accounts free then ([`claims_down`]).
 #[cfg(target_os = "macos")]
 pub(crate) fn claims_quiet_before_sleep() {
-    if !CLAIMS_LIVE.load(Ordering::SeqCst) {
-        return;
+    if CLAIMS_LIVE.load(Ordering::SeqCst) {
+        claims_down(aterm_agent::harness::claims::Act::Quiet, "sleep");
     }
-    let (done, quieted) = std::sync::mpsc::channel();
+}
+
+/// The window's answer to the Mac logging out, restarting or shutting down, at the end of its
+/// run (`crate::main_entry_with_network`, once the event loop ended): where the system's quit
+/// went ahead (`crate::system_quit::by_the_system`, a quit nobody cancelled) and this process
+/// looks at the account claims, every claim given up (`Act::Off`), so other Macs read its
+/// accounts free at once, not at its row's `until` up to a day away ([`claims_down`]). Not at
+/// the system's notice (`NSWorkspaceWillPowerOffNotification`): aterm may still cancel the quit
+/// then (a quit sheet nobody answers), and its sessions would run on with no claims.
+#[cfg(target_os = "macos")]
+pub(crate) fn claims_off_as_the_system_quits() {
+    if crate::system_quit::by_the_system() && CLAIMS_LIVE.load(Ordering::SeqCst) {
+        claims_down(
+            aterm_agent::harness::claims::Act::Off,
+            "logging out, restarting or shutting down",
+        );
+    }
+}
+
+/// The window's answer to a terminating signal (SIGTERM, SIGINT or SIGHUP;
+/// [`arm_claims_off_as_the_window_dies`]): where this process looks at the account claims, every
+/// claim given up (`Act::Off`, [`claims_down`]). A shut down or restart that sends no quit Apple
+/// event (`shutdown -r`, an MDM restart, a `launchctl bootout` logout, any on Linux) ends the
+/// window this way, and its sessions end with it.
+#[cfg(unix)]
+pub(crate) fn claims_off_as_the_window_dies() {
+    if CLAIMS_LIVE.load(Ordering::SeqCst) {
+        claims_down(
+            aterm_agent::harness::claims::Act::Off,
+            "a terminating signal ending this window",
+        );
+    }
+}
+
+/// Arm the window's terminating signals (`crate::owned_endpoint::arm_orderly_quit`): `off` first
+/// (production passes [`claims_off_as_the_window_dies`]), then the process dies of the signal as
+/// it did before, with no clean exit marked (`crate::owned_endpoint::die_of_signal`); a second
+/// signal ends it at once. A headless instance arms its own orderly quit instead.
+#[cfg(unix)]
+pub(crate) fn arm_claims_off_as_the_window_dies(off: fn()) {
+    if let Err(err) = crate::owned_endpoint::arm_orderly_quit(move |sig| {
+        off();
+        crate::owned_endpoint::die_of_signal(sig);
+    }) {
+        aterm_log::warn!(
+            "harness: a terminating signal ends this window at once: its account claims' release \
+             could not be armed ({err}); this Mac's claims stand until their rows lapse"
+        );
+    }
+}
+
+/// The node job's answer to stopping while no window runs (`crate::node_serve`, launchd's SIGTERM
+/// as the person logs out, restarts or shuts down): every claim given up (`Act::Off`,
+/// [`claims_down`]).
+#[cfg(unix)]
+pub(crate) fn claims_off_as_the_node_job_stops() {
+    claims_down(
+        aterm_agent::harness::claims::Act::Off,
+        "the node job stopping",
+    );
+}
+
+/// `act` (`Act::Quiet` or `Act::Off`) on its own thread, its row then handed to the peers at once
+/// (`claims::touch_pushing`) until [`QUIET_WITHIN`] from now, and waited for that long at most, so
+/// a busy store or an unreachable peer never holds the caller longer. `before` names the moment
+/// in the log.
+#[cfg(unix)]
+fn claims_down(act: aterm_agent::harness::claims::Act<'static>, before: &'static str) {
+    let deadline = std::time::Instant::now() + QUIET_WITHIN;
+    let (done, finished) = std::sync::mpsc::channel();
     let spawned = std::thread::Builder::new()
         .name(format!("{THREAD_PREFIX}quiet"))
         .spawn(move || {
-            claims_quiet();
+            claims_touch_pushing(act, before, deadline);
             let _ = done.send(());
         });
     match spawned {
         Ok(_) => {
-            if quieted.recv_timeout(QUIET_WITHIN).is_err() {
+            if finished.recv_timeout(QUIET_WITHIN).is_err() {
                 aterm_log::info!(
-                    "harness: the account claims' quiet before sleep did not finish in {} s; it \
+                    "harness: the account claims' answer to {before} did not finish in {} s; it \
                      finishes on its own thread",
                     QUIET_WITHIN.as_secs()
                 );
             }
         }
         Err(e) => aterm_log::warn!(
-            "harness: the account claims' quiet before sleep could not start: {e}; this Mac's \
+            "harness: the account claims' answer to {before} could not start: {e}; this Mac's \
              claims stand until their rows lapse"
         ),
+    }
+}
+
+/// [`claims_down`]'s work: the touch, the push, and a log line saying where the row went.
+#[cfg(unix)]
+fn claims_touch_pushing(
+    act: aterm_agent::harness::claims::Act<'static>,
+    before: &str,
+    deadline: std::time::Instant,
+) {
+    let (Some(home), Some(state)) = (aterm_primer::home_dir(), harness_state()) else {
+        return;
+    };
+    let Some(now) = aterm_time::unix_secs().and_then(|now| i64::try_from(now).ok()) else {
+        return;
+    };
+    let roster = accounts::default_roster_path();
+    let (touched, pushed) = aterm_agent::harness::claims::touch_pushing(
+        &home,
+        &state,
+        roster.as_deref(),
+        accounts::Cli::Claude,
+        act,
+        now,
+        deadline,
+    );
+    match (touched, pushed) {
+        (_, Some(Ok(()))) => aterm_log::info!(
+            "harness: account claims: this Mac's row before {before} went to a peer"
+        ),
+        (_, Some(Err(why))) => aterm_log::info!(
+            "harness: account claims: this Mac's row before {before} went to no peer ({why}); \
+             each peer reads it at its next repair round with this Mac, else this Mac's claims \
+             at their row's until"
+        ),
+        (aterm_agent::harness::claims::Touched::Unrecorded(why), None) => aterm_log::info!(
+            "harness: account claims: this Mac's row before {before} was not written ({why}); \
+             its claims stand until their row lapses"
+        ),
+        (_, None) => {}
     }
 }
 
@@ -21916,7 +23728,12 @@ pub(crate) fn start_default(
     let (s1, s2, s3, s4) = (store.clone(), store.clone(), store.clone(), store.clone());
     let s6 = store.clone();
     let s7 = store.clone();
-    let s8 = store.clone();
+    let StoreHooks {
+        needs,
+        hold,
+        said,
+        receipt,
+    } = store_hooks(&store);
     let upgrade_store = store.clone();
     let upgrade_source_store = store.clone();
     let s5 = store;
@@ -21935,7 +23752,7 @@ pub(crate) fn start_default(
             roster: Arc::new(move || roster_of(&s1)),
             autopilot: Arc::new(move || words_of(&words)),
             still_wanted: Arc::new(move |sid, group| still_wanted(&s2, sid, group)),
-            body: Arc::new(move |job| hosted_body(&k1, job)),
+            body: Arc::new(move |job| hosted_body(&k1, &s7, job)),
             badge: Arc::new(move |sid, text| set_badge(&k2, sid, text)),
             waiting: {
                 let proxy = proxy.clone();
@@ -21949,8 +23766,10 @@ pub(crate) fn start_default(
                     let _ = proxy.send_event(wake);
                 })
             },
-            needs: Arc::new(move |sid, needs, entry| store_needs(&s7, sid, needs, entry)),
-            hold: Arc::new(move |sid, held| store_land_held(&s8, sid, held)),
+            needs,
+            hold,
+            said,
+            receipt,
             claim_epoch: Arc::new(|| CLAIM_EPOCH.load(Ordering::SeqCst)),
             acts: live_acts(s3, k3),
             backoff: Arc::new(|n| aterm_gui_timing::current().of(restart_backoff(n))),
@@ -21968,6 +23787,27 @@ pub(crate) fn start_default(
     );
     spawn_activation_wake(host.clone());
     host
+}
+
+/// The hooks that store what a loop tells on its tab's timeline, live: [`Hooks::needs`],
+/// [`Hooks::hold`] and [`Hooks::receipt`]. [`start_default`] gives these to its host, and the
+/// store tests drive the same ones through a real [`HostHandle`].
+pub(crate) struct StoreHooks {
+    pub(crate) needs: Arc<NeedsFn>,
+    pub(crate) hold: Arc<LandHoldFn>,
+    pub(crate) said: Arc<LandSaidFn>,
+    pub(crate) receipt: Arc<LandReceiptFn>,
+}
+
+/// [`StoreHooks`] over `store`.
+pub(crate) fn store_hooks(store: &Store) -> StoreHooks {
+    let (s1, s2, s3, s4) = (store.clone(), store.clone(), store.clone(), store.clone());
+    StoreHooks {
+        needs: Arc::new(move |sid, needs, entry| store_needs(&s1, sid, needs, entry)),
+        hold: Arc::new(move |sid, held| store_land_held(&s2, sid, held)),
+        said: Arc::new(move |sid, said| store_land_said(&s4, sid, said)),
+        receipt: Arc::new(move |sid, receipt| store_land_receipt(&s3, sid, receipt)),
+    }
 }
 
 /// [`Hooks::needs`], live.
@@ -22014,6 +23854,82 @@ pub(crate) fn store_land_held(
         .set_land_held(held)
 }
 
+/// [`Hooks::said`], live: the hold's own words on tab `sid`, as its loop told them, each through
+/// the presentation sanitizer (an item at most [`aterm_agent::harness::hold_said::ITEM_BYTES`],
+/// a path at most that too), and none where nothing is left of them; whether they moved.
+pub(crate) fn store_land_said(
+    store: &Store,
+    sid: &str,
+    said: Option<&aterm_agent::harness::hold_said::HoldSaid>,
+) -> bool {
+    use aterm_agent::harness::hold_said::{HoldSaid, ITEM_BYTES};
+    let found = store
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .by_sid(&aterm_session::SessionId::new(sid))
+        .map(|h| Arc::clone(&h.ctx.timeline));
+    let Some(timeline) = found else {
+        return false;
+    };
+    let clean = |words: &[String]| -> Vec<String> {
+        words
+            .iter()
+            .map(|w| crate::session_timeline::sanitize_presentation_line(w, ITEM_BYTES))
+            .filter(|w| !w.is_empty())
+            .collect()
+    };
+    let said = said
+        .map(|s| HoldSaid {
+            open: clean(&s.open),
+            more: s.more,
+            paths: clean(&s.paths),
+        })
+        .filter(|s| !s.is_empty())
+        .map(Arc::new);
+    timeline
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .set_land_said(said)
+}
+
+/// [`Hooks::receipt`], live: what aterm checked at tab `sid`'s landing, as its loop told it, its
+/// words (the agent's, the folder, the branch and the ref) through the presentation sanitizer;
+/// whether the stored receipt moved.
+pub(crate) fn store_land_receipt(
+    store: &Store,
+    sid: &str,
+    receipt: Option<&aterm_agent::harness::acts::LandReceipt>,
+) -> bool {
+    let found = store
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .by_sid(&aterm_session::SessionId::new(sid))
+        .map(|h| Arc::clone(&h.ctx.timeline));
+    let Some(timeline) = found else {
+        return false;
+    };
+    // Every word a surface draws goes through the sanitizer: the agent's, and the folder, the
+    // branch and the ref git named, which a folder or a cloned repository's branch can fill with
+    // hidden characters (a bidi override, a zero-width space); a name is never cut.
+    let line = |text: &str| crate::session_timeline::sanitize_presentation_line(text, text.len());
+    let receipt = receipt.map(|r| {
+        Arc::new(aterm_agent::harness::acts::LandReceipt {
+            said: crate::session_timeline::sanitize_presentation_line(
+                &r.said,
+                aterm_agent::harness::land_receipt::SAID_BYTES,
+            ),
+            repo: line(&r.repo),
+            branch: line(&r.branch),
+            main_ref: line(&r.main_ref),
+            ..r.clone()
+        })
+    });
+    timeline
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .set_land_receipt(receipt)
+}
+
 /// Live [`Hooks::log_usage`] implementation recording `mark - usage h5=<pct> d7=<pct>` on tab `sid`.
 pub(crate) fn log_usage(store: &Store, sid: &str, h5: Option<u32>, d7: Option<u32>) {
     let found = store
@@ -22031,6 +23947,18 @@ pub(crate) fn log_usage(store: &Store, sid: &str, h5: Option<u32>, d7: Option<u3
 }
 
 /// The live acts' one row writer.
+/// The loop's resume hook at tab `sid`'s idle point (`Acts::resume`): `at`
+/// ([`relaunch::resume_at_point`]) says each act's row under the kind it names, and `row` writes
+/// each one under that kind, so the adoption of an upgrade no step of its own adopted keeps kind
+/// `upgrade` and its label says "upgrading to <ver>". The step it ends on.
+fn resume_rows(
+    sid: &str,
+    row: &RowFn,
+    at: impl FnOnce(&mut dyn FnMut(&str, &upgrade_drive::Report)) -> upgrade_drive::Report,
+) -> String {
+    at(&mut |kind, r| row(sid, kind, r)).step
+}
+
 fn live_row(store: Store) -> Arc<RowFn> {
     Arc::new(move |sid, kind, r| {
         aterm_log::info!("harness @{sid}: {}", r.line_as(kind));
@@ -22126,10 +24054,12 @@ impl Acts {
             holds: Arc::new(|_, _| None),
             launch: Arc::new(|_| None),
             due: Arc::new(|_| Due::No),
+            due_read: INERT_POINT_READ,
             behind: Arc::new(|_, _| Behind::Nothing),
             step: Arc::new(|_, _, _| "current".to_string()),
             notice: Arc::new(|_, _, _| "current".to_string()),
             owed: Arc::new(|_, _| false),
+            carry_owed: Arc::new(|_, _| false),
             resume: Arc::new(|_, _, _| "current".to_string()),
             settle: Arc::new(|_| "current".to_string()),
             disk_resume: Arc::new(|_, _| "wait:inert".to_string()),
@@ -22144,6 +24074,8 @@ impl Acts {
             },
             // Nothing is proved alive: no call is told of.
             leader_lives: |_, _| false,
+            // Nothing is proved held: no held program is told of.
+            held_now: |_| false,
             program_check: {
                 static INERT: Mutex<crate::program_check_watch::Board> =
                     Mutex::new(crate::program_check_watch::Board::new());
@@ -22189,6 +24121,8 @@ impl Acts {
             limit_reset: Arc::new(|_| None),
             transcript_tail: Arc::new(|_| None),
             repo_work: Arc::new(|_| Default::default()),
+            work_read: Arc::new(|_, _, _, _| aterm_agent::harness::work_record::WorkRead::None),
+            work_put: Arc::new(|_, _, _| {}),
             transcript: Arc::new(|_| None),
             task_exited: Arc::new(|_| {}),
             startups: Arc::new(|_| Vec::new()),
@@ -22200,6 +24134,7 @@ impl Acts {
             account_gone: Arc::new(|_| {}),
             account_seat: Arc::new(|| None),
             account_env: Arc::new(|_| None),
+            account_screen_wall: Arc::new(|_, _| None),
             account_settings: Arc::new(|_, _, _| true),
             tap_born: Arc::new(|_| None),
             account_restart: Arc::new(|_, _| None),
@@ -22208,6 +24143,12 @@ impl Acts {
             codex_cold: Arc::new(|_| None),
             hold: Arc::new(|_, _| true),
             route: Arc::new(|_, _, _| Route::Custom("inert".to_string())),
+            claude_env: Arc::new(|_, _, _| {
+                Err(aterm_agent::harness::netwatch::Unnamed::Conflict(
+                    "inert".to_string(),
+                ))
+            }),
+            agy_backend: Arc::new(|_, _| aterm_agent::harness::witness::AgyBackend::GeminiApi),
             net_path: Arc::new(crate::harness_netprobe::InertPath),
             memory: Arc::new(|_, _| None),
             watch: Arc::new(|_, _, _| upgrade_drive::Watched::default()),
@@ -22239,6 +24180,8 @@ impl HostHandle {
             fact: Arc::new(|_, _| {}),
             needs: Arc::new(|_, _, _| false),
             hold: Arc::new(|_, _| false),
+            said: Arc::new(|_, _| false),
+            receipt: Arc::new(|_, _| false),
             claim_epoch: Arc::new(|| 0),
             acts,
             backoff: Arc::new(|_| Duration::from_millis(10)),
@@ -22380,6 +24323,8 @@ impl HostHandle {
             fact: Arc::new(|_, _| {}),
             needs: Arc::new(|_, _, _| false),
             hold: Arc::new(|_, _| false),
+            said: Arc::new(|_, _| false),
+            receipt: Arc::new(|_, _| false),
             claim_epoch: Arc::new(|| 0),
             acts,
             backoff: Arc::new(|_| Duration::from_millis(10)),
@@ -22413,6 +24358,8 @@ impl HostHandle {
             fact: Arc::new(|_, _| {}),
             needs: Arc::new(|_, _, _| false),
             hold: Arc::new(|_, _| false),
+            said: Arc::new(|_, _| false),
+            receipt: Arc::new(|_, _| false),
             claim_epoch: Arc::new(|| 0),
             acts,
             backoff: Arc::new(|_| Duration::from_millis(10)),
@@ -22470,6 +24417,9 @@ pub(crate) use disk_ask::draft_shown;
 #[path = "harness_credit_claim.rs"]
 pub(crate) mod credit_claim;
 
+#[cfg(test)]
+#[path = "harness_duty_tests.rs"]
+mod duty_tests;
 #[cfg(test)]
 #[path = "harness_host_tests.rs"]
 mod tests;

@@ -39,7 +39,8 @@ impl MetalBlit {
 
     /// Compiles `shaders/blit.metal` and allocates the blit pipeline, sampler, and uniform buffer.
     pub(crate) fn new(format: PixelFormat) -> Result<Self, String> {
-        let device = Device::preferred().ok_or_else(|| "no Metal device".to_owned())?;
+        let device =
+            Device::preferred_listed().ok_or_else(|| "no listed Metal device".to_owned())?;
         let queue = device
             .new_command_queue()
             .ok_or_else(|| "MTLCommandQueue allocation failed".to_owned())?;
@@ -201,7 +202,7 @@ pub(crate) fn crown_row_bytes(
     }
 
     let _pool = ffi::AutoreleasePool::new();
-    let dev = Device::preferred().ok_or_else(|| "no Metal device".to_owned())?;
+    let dev = Device::preferred_listed().ok_or_else(|| "no listed Metal device".to_owned())?;
     let (row_id, fmt) = if hdr {
         (Pipeline::HdrGlow, PixelFormat::Rgba16Float)
     } else {

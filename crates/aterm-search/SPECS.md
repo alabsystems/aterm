@@ -1,29 +1,11 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-search: spec recovery from its 340 unit tests
+# aterm-search: spec recovery from unit tests
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 279 tests
-> it deleted and 10 specs whose functions it deleted are gone, and the spec rows no longer cite
-> those tests. The §3 gap table counts the 38 specs left. Other counts in this file were taken
-> before.
-
-> Status 2026-10-15: this is the crate's migration worklist. Each spec in §1 is proved
-> through Trust/Clean about the compiled Rust function, and then the tests it subsumes are
-> deleted. The tests in §4 marked **delete** sample no spec and can go now, together with
-> the `#[cfg(test)]`-only code they exercise. No test has been deleted yet.
-
-Source: `crates/aterm-search` (read only). Every `#[test]` fn in `src/` and `tests/` was read,
-along with the code each one reaches. Nothing was compiled or run; the claims below come from
-reading the code. `grep '#[test]'` counts 343, but 3 of those are inside comments (the doc
-comment of `tests/search_suite.rs` and the headers of `tests/index_release_memory.rs` and
-`tests/index_column_map_memory.rs`), so the crate has **340** real tests.
-
-Result: **48 specs**, covering **269 tests**. **71 tests are not spec
-samples** (§4).
-
-All paths below are relative to `crates/aterm-search/`. `tests/*.rs` means the integration
-test files; `src/tests.rs` is a unit test module.
+The claims the crate's tests sample, stated so that a Trust/Clean proof of the compiled Rust
+function can retire them (§1), and the map from each test to its spec (§2). Nothing here is
+proved. Paths are relative to `crates/aterm-search/`.
 
 ## 0. Notation used in the statements
 
@@ -31,12 +13,12 @@ test files; `src/tests.rs` is a unit test module.
   sigma) mapped to U+03C3 (spec `lower-fold`). `LBM_t` = `grapheme::LowerByteMap::new(t).map_to_original`,
   which maps a byte offset in `Fold(t)` back to one in `t`.
 - `Abs(idx)` for a `SearchIndex` = `(Rows: line → (text, Option<LineCells>), amb, cap, hw = len(),
-  next, lowest, incomplete)`. This is the abstract state of spec `index-model`. Postings, bloom,
+  next, lowest, incomplete)`, the abstract state of spec `index-model`. Postings, bloom,
   `key_base`, `column_maps` and `lower_scratch` are representation, never compared.
-- `CM(n)`: the column map of retained line `n`. It is `ColumnMap::with_cells(text, cells)` if the line
+- `CM(n)`: the column map of retained line `n`, `ColumnMap::with_cells(text, cells)` if the line
   was indexed with cells, else `ColumnMap::new(text, amb)`.
-- `Occ_cs(q,t)`: the ascending byte offsets `p` with `t[p..p+|q|] = q`. These are all occurrences,
-  overlapping ones included, and they are char boundaries because `q` and `t` are UTF-8.
+- `Occ_cs(q,t)`: the ascending byte offsets `p` with `t[p..p+|q|] = q`, overlapping ones
+  included; they are char boundaries because `q` and `t` are UTF-8.
   `Occ_ci(q,t)`: the ascending char-boundary offsets `p` of `Fold(t)` at which `Fold(t)[p..]`
   starts with `Fold(q)`.
 - `LM_cs(n)`, `LM_ci(n)`, `LM_rx(n)`: the per-line match lists defined in `index-literal-cs`,
@@ -44,7 +26,7 @@ test files; `src/tests.rs` is a unit test module.
   spans of zero display width are dropped. `All_mode` = `LM_mode(n)` concatenated over
   `n ∈ dom Rows` ascending, uncapped. `MAX` = `MAX_SEARCH_MATCHES`.
 - `Tr` = `{n ∈ dom Rows | Rows[n].cells = Some(c) ∧ c.is_truncated()}`: the lines whose text
-  stops short of the line's end (their reader stopped at a byte bound).
+  stops short of the line's end.
 - `Batch(All, d)` = `SearchResults { matches: d = Forward ? take(MAX, All) : the last MAX of All
   (ascending), incomplete: results_may_be_incomplete() ∨ |matches| ≥ MAX ∨ cut_short_lines > 0,
   lowest_retained_line: lowest_retained_line(), cut_short_lines: S + |Tr| }`, where `S` is the
@@ -59,10 +41,10 @@ test files; `src/tests.rs` is a unit test module.
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (the tests this spec retires; every
-test appears under exactly one spec), `gaps` (the audit §7 gap numbers that block the proof; gap 0,
-a seal that publishes Clean rows, blocks every spec and is listed on each), `difficulty` (the Rust
-features the proof must handle).
+`subsumes` names the tests a proof retires; `gaps` the rows of the gap list in
+`docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7 that block it (gap 0, a seal that
+publishes Clean rows, blocks every spec); `difficulty` the Rust features the proof must
+handle.
 
 ```tsv
 id	kind	functions	statement	subsumes	gaps	difficulty
@@ -89,7 +71,7 @@ column-map-with-cells	contract	grapheme::ColumnMap::with_cells, cells::LineCells
 column-map-runs-compact	invariant	grapheme::RunBuilder::{push,finish}, grapheme::ColumnMap::heap_bytes	The runs of a ColumnMap are the greedy maximal run-length encoding of its per-grapheme list. A new run starts exactly when a grapheme folds or follows a gap (start ≠ before), or breaks the run's byte/column stride. A map whose list is the identity (every byte one grapheme one column wide from 0, total = |t| > 0) stores zero runs. Hence a line that repeats one shape is one run, whatever its length.	src/grapheme.rs::a_line_of_one_shape_is_one_run	0,1,5,7	Vec push with last_mut, u16/u32 narrowing
 display-columns	equivalence	grapheme::{display_columns,display_columns_with}	∀ t, a: display_columns_with(t,a) = ColumnMap::new(t,a).span(|t|,|t|).1, the total grid columns of t (str_grid_columns_with). For printable-ASCII t it is |t|. display_columns(t) = display_columns_with(t, Single).	src/grapheme.rs::width_only_matches_coordinate_map_for_unicode_and_controls	0,1,5,7,12	&str byte-predicate loop, cross-crate width routine
 line-cells-column-queries	contract	cells::LineCells::{byte_at_column,bytes_in_columns,columns_of}	byte_at_column(col) = Some(byte of the first cell in line order with cell.col ≤ col < cell.end_col and width > 0), else None. bytes_in_columns(s,e) = Some(min byte .. max end) over the cells with width > 0, cell.col < e and cell.end_col > s, else None (so None whenever e ≤ s). columns_of(t,b0,b1) = ColumnMap::with_cells(t,self).span(b0,b1).	src/cells.rs::a_column_names_the_cell_drawn_over_it, src/cells.rs::a_column_range_takes_the_cells_drawn_over_it	0,1,3,5,7	div_ceil, NonZeroUsize, Range<usize>, iterator find_map
-index-model	refinement	index::SearchIndex::{new,with_capacity,with_capacity_and_max,with_max_cached_lines,set_max_cached_lines,index_line,index_line_cow,push_line,make_room_for,rekey,evict_below_window,note_window_eviction,evict_oldest_lines,clear,release,drop_history_below,retain_history_from,set_history_prefix_eviction,set_ambiguous_width,len,lowest_retained_line,results_may_be_incomplete}, TerminalSearch (delegating mutators)	Constructors give Rows = ∅, hw = next = lowest = 0, incomplete = false, cap = max(cap,1). index_line_cow(n,t,c): if Rows[n].text = t, only Rows[n].cells := c, and only when c is given. Otherwise let newest = max(hw−1, n) and floor = newest − MAX_KEY_SPAN. If Rows ≠ ∅ ∧ n < floor, the line is dropped, lowest := max(lowest, floor) and incomplete := true. Otherwise rows below floor are dropped (with the same honesty update if any were), Rows[n] := (t,c), hw := max(hw, n+1), next := max(next, n+1), and if |Rows| > cap, the |Rows| − ⌊3cap/4⌋ smallest lines are dropped, lowest := the smallest remaining line (or next) and incomplete := true. push_line(t) = index_line(next, t), returning next. clear/release: Rows = ∅, hw = next = lowest = 0, incomplete = false (cap and amb kept). drop_history_below(f): if f > the smallest retained line, drop rows < f; honesty unchanged. retain_history_from(f): the same drop, then lowest := max(lowest,f), incomplete := true. set_history_prefix_eviction(Some(b>0)): lowest := b, incomplete := true; any other argument sets lowest := 0, incomplete := false. Observers: len() = hw, lowest_retained_line() = lowest, results_may_be_incomplete() = incomplete. Owned text is moved into the cache, not copied. TerminalSearch delegates: index_visible_content(b,ls) = index_line(b+i, ls[i]) in order; index_scrollback_line = push_line.	src/tests.rs::len_is_a_high_water_mark, src/tests.rs::eviction_with_sparse_line_numbers, src/tests.rs::eviction_sets_incomplete_signal_and_watermark, src/tests.rs::cap_is_configurable_and_clear_resets_signal, src/tests.rs::terminal_search_surfaces_eviction_signal, src/tests.rs::drop_history_below_matches_fresh_rebuild_including_completeness, src/tests.rs::drop_history_below_is_a_noop_at_or_below_the_first_cached_line, src/index_key_window_tests.rs::lines_that_cannot_share_the_newest_lines_window_are_reported_evicted, src/index_key_window_tests.rs::an_index_kept_across_four_billion_rows_rekeys_and_stays_complete, src/index_key_window_tests.rs::a_descending_run_of_lines_moves_the_window_once	0,1,2,3,4,5,7,12	FxHashMap<usize,String>, sort_unstable of keys, Cow, &mut self, u32 key-window arithmetic, logging side effect
+index-model	refinement	index::SearchIndex::{new,with_capacity,with_capacity_and_max,with_max_cached_lines,set_max_cached_lines,index_line,index_line_cow,push_line,make_room_for,rekey,evict_below_window,note_window_eviction,evict_oldest_lines,clear,release,drop_history_below,retain_history_from,set_history_prefix_eviction,set_ambiguous_width,len,lowest_retained_line,results_may_be_incomplete}, TerminalSearch (delegating mutators)	Constructors give Rows = ∅, hw = next = lowest = 0, incomplete = false, cap = max(cap,1). index_line_cow(n,t,c): if Rows[n].text = t, only Rows[n].cells := c, and only when c is given. Otherwise let newest = max(max(dom Rows), n) and floor = newest − MAX_KEY_SPAN. If Rows ≠ ∅ ∧ n < floor, the line is dropped, lowest := max(lowest, floor) and incomplete := true. Otherwise rows below floor are dropped (with the same honesty update if any were), Rows[n] := (t,c), hw := max(hw, n+1), next := max(next, n+1), and if |Rows| > cap, the |Rows| − ⌊3cap/4⌋ smallest lines are dropped, lowest := the smallest remaining line (or next) and incomplete := true. push_line(t) = index_line(next, t), returning next. clear/release: Rows = ∅, hw = next = lowest = 0, incomplete = false (cap and amb kept). drop_history_below(f): if f > the smallest retained line, drop rows < f; honesty unchanged. retain_history_from(f): the same drop, then lowest := max(lowest,f), incomplete := true. set_history_prefix_eviction(Some(b>0)): lowest := b, incomplete := true; any other argument sets lowest := 0, incomplete := false. Observers: len() = hw, lowest_retained_line() = lowest, results_may_be_incomplete() = incomplete. Owned text is moved into the cache, not copied. TerminalSearch delegates: index_visible_content(b,ls) = index_line(b+i, ls[i]) in order; index_scrollback_line = push_line.	src/tests.rs::len_is_a_high_water_mark, src/tests.rs::eviction_with_sparse_line_numbers, src/tests.rs::eviction_sets_incomplete_signal_and_watermark, src/tests.rs::cap_is_configurable_and_clear_resets_signal, src/tests.rs::terminal_search_surfaces_eviction_signal, src/tests.rs::drop_history_below_matches_fresh_rebuild_including_completeness, src/tests.rs::drop_history_below_is_a_noop_at_or_below_the_first_cached_line, src/index_key_window_tests.rs::lines_that_cannot_share_the_newest_lines_window_are_reported_evicted, src/index_key_window_tests.rs::an_index_kept_across_four_billion_rows_rekeys_and_stays_complete, src/index_key_window_tests.rs::a_descending_run_of_lines_moves_the_window_once	0,1,2,3,4,5,7,12	FxHashMap<usize,String>, sort_unstable of keys, Cow, &mut self, u32 key-window arithmetic, logging side effect
 index-posting-invariant	invariant	index::SearchIndex::{index_line_cow,reindex_changed_row_postings,posting_trigram_set,insert_posting,evict_oldest_lines,evict_below_window,drop_history_below,make_room_for,rekey,might_contain,search (cfg(test))}	T(t) = windows3(bytes t) ∪ (lower_need(t) = Ascii ? windows3(ascii_lower t) : lower_need(t) = Unicode ? windows3(Fold t) : ∅). ∀ reachable idx: dom(trigrams) = ⋃_{n ∈ Rows} T(Rows[n].text); ∀ w: {key_base+k | k ∈ Abs(trigrams[w])} = {n ∈ dom Rows | w ∈ T(Rows[n].text)}, and no list is empty; every cached line is in [key_base, key_base+MAX_KEY]; ∀ w ∈ dom(trigrams): bloom.might_contain_bytes(w). Consequences: might_contain(q) is true whenever |q| < 3 or every trigram of q is in dom(trigrams), so it has no false negatives; the cfg(test) candidate iterator search(q) yields ascending lines ⊇ {n | q occurs in Rows[n].text}, and every retained line when |q| < 3.	src/tests.rs::bloom_filter_rejection, src/tests.rs::reindex_line	0,1,2,3,5,7	FxHashMap<[u8;3],SparseBitmap>, set difference over FxHashSet, quantified map invariant
 index-bloom-dictionary	invariant	index::{insert_posting,SearchIndex::rebuild_bloom,SearchIndex::index_line_cow}	bloom.item_count() = the number of times a trigram's posting list went from absent or empty to non-empty since the last rebuild_bloom/clear, because insert_posting inserts into the bloom only then. Re-indexing a line with unchanged text leaves the bloom and postings unchanged. After rebuild_bloom: item_count = |dom trigrams| and num_bits = BloomFilter::with_capacity(min(max(|dom trigrams|,1000), MAX_EFFECTIVE_CAPACITY)).num_bits. Whenever index_line_cow returns with |dom trigrams| < MAX_EFFECTIVE_CAPACITY, ¬bloom.is_saturated(). Neither the row count nor per-row occurrence counts ever size the filter.	src/index_bloom_tests.rs::repeated_output_and_unchanged_refreshes_do_not_grow_the_filter, src/index_bloom_tests.rs::dictionary_growth_rebuilds_without_losing_live_trigrams, src/tests.rs::bloom_rebuild_tracks_trigram_volume_for_bulk_scrollback	0,1,2,3,5,6,7	HashMap entry API, float saturation predicate
 index-literal-cs	refinement	index::SearchIndex::{search_with_positions,search_from_line,search_before_line,search_results_opts_direction (cs literal)}, iterators::{SearchMatchIterator,SearchMatchReverseIterator,next_literal_match,CandidateSource}, TerminalSearch::search	LM_cs(n) = [SearchMatch(n,s,e) | p ∈ Occ_cs(q,Rows[n].text) ascending, (s,e) = CM(n).span(p,p+|q|), s ≠ e]. ∀ reachable idx, q: if q = "" every call yields nothing. Otherwise search_with_positions(q) = take(MAX, All_cs); search_from_line(q,f) lazily yields [m ∈ All_cs | m.line ≥ f] (uncapped); search_before_line(q,b) yields reverse([m ∈ All_cs | m.line < b]); search_results_opts_direction(q,true,false,d) = Batch(All_cs,d). Candidate pruning (bloom, trigram postings, key base) never removes a match.	src/tests.rs::empty_query_search_with_positions, src/tests.rs::empty_query_terminal_search, src/tests.rs::search_from_line_basic, src/tests.rs::search_from_line_short_query, src/tests.rs::search_before_line_basic, src/tests.rs::search_match_iterator_multiple_matches_per_line, src/tests.rs::search_reverse_iterator_multiple_matches_per_line, src/tests.rs::search_iterator_multibyte_no_panic, src/tests.rs::search_single_multibyte_char_repeated, src/tests.rs::terminal_search_index_scrollback_lines_batch, src/tests.rs::terminal_search_index_visible_content, src/tests.rs::search_before_line_zero_returns_empty, src/tests.rs::zero_display_width_matches_are_skipped, src/iterators.rs::forward_literal_matches_equal_a_str_find_reference, tests/search_vs_bruteforce.rs::verified_search_matches_bruteforce, src/index_key_window_tests.rs::rows_past_u32_max_are_found_at_their_own_line_numbers	0,1,2,3,4,5,7	lazy iterators over HashMap lookups, Searcher, ColumnMap, u32 key/line conversion
@@ -100,7 +82,7 @@ regex-compile	contract	index::SearchIndex::compile_regex, budgeted::BudgetedSear
 index-point-find	contract	TerminalSearch::find_direction_opts, index::SearchIndex::{find_next_case_insensitive_from,find_prev_case_insensitive_from,find_regex_direction,find_compiled_regex_from,point_answer}, TerminalSearch::{find_next,find_prev,find_next_opts,find_prev_opts} (cfg(test))	Let All be the UNCAPPED match list of the mode (All_cs, All_ci or regex) and ≺ the lexicographic order on (line, start_col). find_direction_opts(q,cs,rx,{anchor a, dir, inclusive, wrap}): Forward returns the ≺-first m ∈ All with (m.line,m.start_col) ≻ a (⪰ if inclusive); Backward returns the ≺-last m with (m.line,m.start_col) ≺ a (⪯ if inclusive). If there is none and wrap is set, Forward returns the ≺-first m ∈ All and Backward the ≺-last; otherwise None. Regex mode first propagates compile errors, and returns Err(ScanCutShort) iff the answer is None and some line the walk(s) scanned had Cut(n). Results never depend on MAX. An empty query (or empty fold) gives Ok(None).	src/tests.rs::terminal_search_find_next_prev, src/tests.rs::find_next_prev_same_line_column_boundary, src/tests.rs::find_prev_usize_max_does_not_overflow, src/tests.rs::find_next_past_last_line, src/tests.rs::terminal_search_option_navigation_is_ordered_and_case_insensitive	0,1,2,4,5,7,12	closures over iterators, saturating anchor arithmetic, Result
 literal-candidate-bound	contract	index::SearchIndex::literal_candidate_bound	Let e = cs ? q : Fold(q). literal_candidate_bound(q,cs) = None if |e| < 3; Some(0) if Rows = ∅ or some trigram of e has no posting list (a bloom rejection implies this); otherwise Some(min over trigrams w of e of |{n ∈ Rows | w ∈ T(Rows[n].text)}|). This bound is ≥ the number of candidate lines the engine's own walk visits for e.	src/tests.rs::literal_candidate_bound_reports_the_engines_own_candidate_count	0,1,3,5,7	Option, iterator min over posting lengths
 narrowed-search	contract	index::SearchIndex::search_literal_narrowed, index::CaseInsensitiveMatcher::has_occurrence, types::LineFrame::{with_base,push_offset,lines,contains,len,is_empty}	For q ≠ "": search_literal_narrowed(q,cs,None).results = Batch(All_mode,Forward), and its occurrence_lines is None if the walk was capped, else Some(F) with lines(F) = the ascending {n ∈ dom Rows | Contains(Rows[n].text,q)}, as absolute lines (base+offset) unaffected by later re-keying. search_literal_narrowed(q,cs,Some(F)).results.matches = take(MAX, LM_mode(n) concatenated over n ∈ lines(F) ∩ dom Rows ascending), with incomplete/lowest as in Batch; its occurrence_lines = (capped ? None : Some({n ∈ lines(F) ∩ dom Rows | Contains(Rows[n].text,q)})); no posting list or bloom probe is touched. Hence, if F is the occurrence frame of any char-prefix q' of q (q' = q included) on an index with the same Rows, results = Batch(All_mode,Forward), because every match line of q contains q' (Fold(q'++r) = Fold(q')++Fold(r)). q = "" gives (SearchResults::new([], incomplete, lowest).with_cut_short_lines(|Tr|), None). Every result counts |Tr| in cut_short_lines, as Batch does.	src/tests.rs::narrowed_typing_equals_batch_for_every_prefix_step, src/tests.rs::occurrence_frame_keeps_zero_width_only_lines_narrable, src/tests.rs::frame_reverifies_its_own_query_after_backspace, src/tests.rs::capped_narrowed_walk_matches_forward_batch_and_yields_no_frame, src/tests.rs::narrowed_walk_carries_eviction_honesty_like_batch, src/index_key_window_tests.rs::a_frame_survives_the_index_rekeying_under_it	0,1,2,4,5,7,11	generic enum over iterators, labelled break, u32 offsets
-index-candidate-cost	other (cost)	index::SearchIndex::{literal_candidates_forward,literal_candidates_backward,posting_lists,search_from_line,search_before_line,find_next_case_insensitive_from,find_prev_case_insensitive_from}, index::CaseInsensitiveMatcher::visit_matches, iterators::CandidateSource	For a literal walk with folded query fq from line f: if |fq| < 3 the candidate sequence is the numeric range [max(f, first_cached_line), line_count) (descending for backward walks). It is empty when Rows = ∅, the bloom rejects, or a trigram has no posting. Otherwise it is the ascending intersection of the DISTINCT posting lists of fq's trigrams, restricted to ≥ f; posting_lists deduplicates identical lists, so LAST_UNIQUE = the number of distinct trigrams. Walks visit candidates lazily in order, once per candidate line, and stop at the line holding the first qualifying match. The case-insensitive verifier lowers a line into its buffer iff ¬(text ASCII ∧ fq ASCII ∧ |fq| ≤ 2), exactly once per visited line.	src/tests.rs::find_next_range_query_skips_prefix_matches, src/tests.rs::case_sensitive_point_navigation_stops_at_the_neighbouring_match, src/tests.rs::case_insensitive_100k_ascii_short_query_work_is_bounded, src/tests.rs::case_insensitive_short_query_skips_sparse_empty_prefix, src/tests.rs::case_sensitive_reverse_short_query_skips_sparse_empty_prefix, src/tests.rs::case_insensitive_navigation_visits_only_trigram_candidates, src/tests.rs::case_insensitive_repeated_prefix_uses_linear_matcher_path	0,1,2,5,7	cost counters, lazy iterators, pointer-identity dedup
+index-candidate-cost	other (cost)	index::SearchIndex::{literal_candidates_forward,literal_candidates_backward,posting_lists,search_from_line,search_before_line,find_next_case_insensitive_from,find_prev_case_insensitive_from}, index::CaseInsensitiveMatcher::visit_matches, iterators::CandidateSource	For a literal walk with folded query fq from line f: if |fq| < 3 the candidate sequence is the numeric range [max(f, first_cached_line), line_count) (descending for backward walks) or, when that range spans over 4·|Rows| keys, only the lines of dom Rows in it, in the same order. It is empty when Rows = ∅, the bloom rejects, or a trigram has no posting. Otherwise it is the ascending intersection of the DISTINCT posting lists of fq's trigrams, restricted to ≥ f; posting_lists deduplicates identical lists, so LAST_UNIQUE = the number of distinct trigrams. Walks visit candidates lazily in order, once per candidate line, and stop at the line holding the first qualifying match. The case-insensitive verifier lowers a line into its buffer iff ¬(text ASCII ∧ fq ASCII ∧ |fq| ≤ 2), exactly once per visited line.	src/tests.rs::find_next_range_query_skips_prefix_matches, src/tests.rs::case_sensitive_point_navigation_stops_at_the_neighbouring_match, src/tests.rs::case_insensitive_100k_ascii_short_query_work_is_bounded, src/tests.rs::case_insensitive_short_query_skips_sparse_empty_prefix, src/tests.rs::case_sensitive_reverse_short_query_skips_sparse_empty_prefix, src/tests.rs::case_insensitive_navigation_visits_only_trigram_candidates, src/tests.rs::case_insensitive_repeated_prefix_uses_linear_matcher_path, src/index_key_window_tests.rs::a_short_query_over_far_apart_lines_visits_only_the_lines_held	0,1,2,5,7	cost counters, lazy iterators, pointer-identity dedup
 index-observational-equivalence	equivalence	SearchIndex (all observers), TerminalSearch::{index_numbered_content_owned,index_visible_content}, SearchIndex::{reindex_changed_row_postings,rebuild_bloom,rekey}	A corollary of index-model plus the query specs. ∀ reachable idx1, idx2 with Abs(idx1) = Abs(idx2), every observer returns equal values: search_with_positions, search_from_line, search_before_line, search_results_opts[_direction], find_*, search_literal_narrowed, literal_candidate_bound (as defined by Abs), len, lowest_retained_line, results_may_be_incomplete. In particular an arbitrary edit script equals a fresh build over the final texts; A→B→A equals no edit; rebuild_bloom and re-keying are invisible; owned and borrowed indexing are indistinguishable.	src/tests.rs::changed_row_reindex_matches_from_scratch_rebuild, src/tests.rs::changed_row_reindex_round_trip_is_identity, src/tests.rs::lowercase_fast_path_keeps_insert_remove_symmetric, src/tests.rs::owned_numbered_content_matches_borrowed_indexing, src/index_bloom_tests.rs::replacing_last_posting_and_reintroducing_it_preserves_all_search_modes	0,1,2,4,5,7	relational (two-state) reasoning over HashMap-backed state
 budgeted-refines-one-shot	equivalence	budgeted::BudgetedSearch::{new,with_max_cached_lines,with_ambiguous_width,feed_row,feed_row_owned,feed_row_cells,feed_row_cow,verify_row,results}	∀ rows r_0..r_{N−1} (text with optional LineCells), base, q, cs, rx, cap, amb: if BudgetedSearch::with_max_cached_lines(q,cs,rx,base,N,cap) = Ok(b), with with_ambiguous_width(amb) applied, and each r_i is fed in order by feed_row_owned or feed_row_cells (feed_row is the cfg(test) borrowed twin), then after the N-th feed b.results() equals the one-shot search over the depth window: with k = N − min(N, max(cap,1)), a SearchIndex with max_cached_lines = cap and ambiguous_width = amb, built by index_line_cow(base+i, r_i.text, r_i.cells) for k ≤ i < N and set_history_prefix_eviction(Some(base+k) if k > 0, else None), then search_results_opts(q,cs,rx).unwrap(). It is not the append-path index fed every row, which evicts to its low-water mark (eviction-schedule) once past the cap. The equality covers matches, incomplete, lowest_retained_line and cut_short_lines. Construction fails exactly when that batch call would (regex-compile).	src/budgeted.rs::owned_feed_matches_borrowed_and_batch_unicode_coordinates, src/budgeted.rs::match_cap_matches_one_shot_and_reports_incomplete, src/budgeted.rs::past_its_cap_the_search_equals_the_depth_window_not_the_eviction_schedule, src/budgeted.rs::combined_match_cap_and_depth_window_equals_one_shot, src/budgeted.rs::a_row_the_regex_scan_cannot_finish_is_reported_like_the_one_shot, src/budgeted.rs::a_row_read_short_of_its_end_is_reported_like_the_one_shot, src/budgeted.rs::the_row_feed_equals_one_shot_across_all_modes	0,1,2,4,5,7,12	Cow, enum matcher with captured closures, cross-crate regex, relational equality with the index model
 budgeted-progressive	contract	budgeted::BudgetedSearch::{feed_row_cow,rows_fed,total_rows,is_complete,results,results_range,result_count}	rows_fed grows by exactly 1 per feed while rows_fed < total_rows; a feed when rows_fed ≥ total_rows changes nothing. is_complete() ⇔ rows_fed ≥ total_rows. results().lowest_retained_line is the final watermark fixed at construction (base + total − max(cap,1) when total > max(cap,1), else 0), and no emitted match lies below it. results().matches after k feeds is a prefix of results().matches after k+1 feeds. results_range(s,l) = results() with matches[min(s,n) .. min(s+l,n)] (n = result_count()) and the same incomplete/lowest/cut_short_lines.	src/budgeted.rs::partial_results_are_a_prefix_and_overfeed_is_a_noop, src/budgeted.rs::result_ranges_are_bounded_and_stable_past_the_cap	0,1,2,3,5	Vec slice/clone, saturating min arithmetic
@@ -108,8 +90,8 @@ budgeted-progressive	contract	budgeted::BudgetedSearch::{feed_row_cow,rows_fed,t
 
 ## 2. Test → spec map (TSV)
 
-`spec` is the spec that retires the test. A test in §4 has `-` here and its §4 action in
-`action`. Rows are grouped by file.
+`spec` is the spec that retires the test. A test that samples no spec has `-` there and its
+§4 action in `action`.
 
 ```tsv
 file	test	spec	action
@@ -167,6 +149,8 @@ src/index.rs	the_pathological_pattern_over_a_long_line_stops_at_the_ceiling	inde
 src/index_bloom_tests.rs	dictionary_growth_rebuilds_without_losing_live_trigrams	index-bloom-dictionary	
 src/index_bloom_tests.rs	repeated_output_and_unchanged_refreshes_do_not_grow_the_filter	index-bloom-dictionary	
 src/index_bloom_tests.rs	replacing_last_posting_and_reintroducing_it_preserves_all_search_modes	index-observational-equivalence	
+src/index_key_window_tests.rs	a_short_query_answers_the_same_either_side_of_a_sparse_range	index-literal-cs	
+src/index_key_window_tests.rs	a_short_query_over_far_apart_lines_visits_only_the_lines_held	index-candidate-cost	
 src/index_key_window_tests.rs	a_descending_run_of_lines_moves_the_window_once	index-model	
 src/index_key_window_tests.rs	a_frame_survives_the_index_rekeying_under_it	narrowed-search	
 src/index_key_window_tests.rs	an_index_kept_across_four_billion_rows_rekeys_and_stays_complete	index-model	
@@ -233,52 +217,25 @@ tests/index_release_memory.rs	release_reclaims_real_heap_that_clear_retains_with
 tests/search_vs_bruteforce.rs	verified_search_matches_bruteforce	index-literal-cs	
 ```
 
-## 3. Coverage
-
-- 340 tests read. 269 map to one of the 48 specs. 71 are not spec samples (§4): 47 delete, 16 becomes-spec-after-fix, 8 move-to-bench.
-- The biggest collapses: `index-literal-cs` (26), `searcher-find-rfind` (12), `bitmap-set-refinement` (12), `index-model` (12).
-- `lower-fold` retires no test by itself; it is the lemma under every case-insensitive spec. `index-observational-equivalence` is a corollary of `index-model` and the query specs.
-- Specs blocked by each audit §7 gap (a spec counts once per gap it lists):
-
-| gap | specs blocked |
-|---|---|
-| 0 | 38 |
-| 1 | 34 |
-| 2 | 23 |
-| 3 | 25 |
-| 4 | 10 |
-| 5 | 30 |
-| 6 | 2 |
-| 7 | 31 |
-| 11 | 2 |
-| 12 | 9 |
+Three tests are missing from the map: `src/grapheme.rs::column_map_matches_byte_to_column`
+samples `column-map-walk`, `src/grapheme.rs::lower_byte_map_matches_map_lower_byte_to_original`
+samples `lower-byte-map`, and `src/literal.rs::finds_every_ascii_case_insensitive_occurrence`
+samples `ascii-ci-matches`.
 
 ## 4. Tests that are not spec samples
 
-> Status 2026-10-16: 46 of the 47 tests marked **delete** have been deleted, with the
-> `#[cfg(test)]`-only `SparseBitmap::remove_range`, `range_before` and `range` they alone used;
-> the last of them went with the streaming engine. One **delete** row was not confirmed and
-> remains: `src/grapheme.rs::a_map_is_no_larger_than_before`.
-> Status 2026-10-17: that test is a `const _` assertion beside `ColumnMap` now, and the
-> generation counter (§5.2) is deleted with `generation_stable_across_read_operations` and
-> `generation_bumps_once_per_mutation`; their rows are gone.
-> Rows marked `move-to-bench` remain.
+`move-to-bench` means the test asserts a statistical, capacity or heap budget, a measurement
+rather than a universal property, so it belongs in `aterm-bench`:
 
-`delete` means the test samples no spec (usually it tests `#[cfg(test)]`-only code with no
-production caller); delete it now, together with that code. `move-to-bench` means it asserts a
-statistical, latency or heap budget: a measurement, not a universal property, so it belongs in
-`aterm-bench`. `becomes-spec-after-fix` means it pins state production cannot observe; fix the
-code (expose the accessor, or remove the field) and it becomes a spec or goes away (§5.2).
-
-| test | why | action |
-|---|---|---|
-| src/bloom_tests.rs::bloom_false_positive_rate | A statistical false-positive ratio over a hash. A Bloom filter permits any false positive, so there is no universal property. | **move-to-bench** |
-| src/index.rs::ordinary_patterns_over_a_long_joined_line_find_their_matches | Capacity check that aterm-regex step costs for chosen patterns over 100 KB–4.3 MB lines stay under the budget: a performance property of another crate. | **move-to-bench** |
-| tests/index_column_map_memory.rs::an_index_of_non_ascii_rows_holds_a_small_multiple_of_their_text | Net-heap ratio bounds under a counting global allocator (CJK ≤ 4× text, etc.): a memory budget. The run-encoding property is `column-map-runs-compact`. | **move-to-bench** |
-| tests/index_release_memory.rs::release_reclaims_real_heap_that_clear_retains_without_disturbing_siblings | Net/gross heap ratios under a counting allocator (release frees > 80%, clear retains 2× what release does, refresh growth < 16 KiB): memory budgets. The observable reset is `index-model`; eviction cost is `bitmap-eviction-cost`. | **move-to-bench** |
-
-No test is a pure regression of a removed bug with no general property: every regression test
-read is an instance of one of the §1 specs.
+- `src/bloom_tests.rs::bloom_false_positive_rate`: a false-positive ratio over a hash. A Bloom
+  filter permits any false positive.
+- `src/index.rs::ordinary_patterns_over_a_long_joined_line_find_their_matches`: aterm-regex
+  step costs for chosen patterns over long lines stay under the budget, a performance property
+  of another crate.
+- `tests/index_column_map_memory.rs::an_index_of_non_ascii_rows_holds_a_small_multiple_of_their_text`
+  and `tests/index_release_memory.rs::release_reclaims_real_heap_that_clear_retains_without_disturbing_siblings`:
+  heap ratios under a counting allocator. Their properties are `column-map-runs-compact`,
+  `index-model` and `bitmap-eviction-cost`.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
@@ -320,33 +277,23 @@ read is an instance of one of the §1 specs.
 
 ## 6. Proof order
 
-No spec here is blocked by gap 0 alone: each needs at least one Trust/Clean widening (gap 3 for
-scalar arithmetic beyond straight-line code, gap 1 once a `Vec`/`&str` appears). The order is
-easiest high-value first.
+Every spec needs at least one widening beyond gap 0. Easiest high-value first:
 
-1. **Scalar or near-scalar, gap 3 (plus 1, 2 or 12) only:** `regex-line-budget` (pure `u64`
-   clamp; retires 1 test and is the lemma under every regex spec), `bloom-layout` (`usize`
-   rounding and saturation; retires 7 tests), `search-result-types`, `bloom-estimated-fpr` (also
-   gap 6, f64), and the closed forms of `eviction-schedule` (the low-water watermark and
-   `max_cached_for_retained`; the equality with the real index waits on `index-model`).
+1. **Scalar, gap 3 (plus 1, 2, 6 or 12):** `regex-line-budget` (a `u64` saturating multiply
+   and a clamp, `omega`-class, and the lemma under every regex spec), `bloom-layout` (`usize`
+   rounding and saturation with no loop; it fixes the sizes `index-bloom-dictionary` depends
+   on), `search-result-types`, `bloom-estimated-fpr`, and the closed forms of
+   `eviction-schedule` (its equality with the real index waits on `index-model`).
 2. **Small loops over slices:** `memchr-family`, `ascii-ci-matches`, `lower-fold`,
-   `lower-byte-map`, then `searcher-find-rfind` (12 tests, including the exhaustive binary/ternary
-   alphabets) with `searcher-linear-time`.
-3. **`SparseBitmap`:** `bitmap-set-refinement` + `bitmap-canonical-encoding` (15 tests), then
+   `lower-byte-map`, then `searcher-find-rfind` with `searcher-linear-time`.
+3. **`SparseBitmap`:** `bitmap-set-refinement` and `bitmap-canonical-encoding`, then
    `bitmap-eviction-cost`.
 4. **Bloom filter:** `bloom-no-false-negatives`, `bloom-clear-count-empty`, `bloom-probe-cost`.
 5. **Coordinates:** `line-cells-model`, `column-map-walk`, `column-map-with-cells`,
    `column-map-runs-compact`, `display-columns`, `line-cells-column-queries` (gap 12 for the
    cross-crate `aterm_grapheme` calls).
-6. **The index:** `index-model` + `index-posting-invariant` + `index-bloom-dictionary`, then
-   `index-literal-cs` (26 tests), `index-literal-ci`, `index-regex-batch`, `index-batch-cap`,
-   `regex-compile`, then `index-point-find`, `literal-candidate-bound`, `narrowed-search`,
-   `index-candidate-cost`, then `index-observational-equivalence` (a corollary).
+6. **The index:** `index-model`, `index-posting-invariant` and `index-bloom-dictionary`; then
+   `index-literal-cs`, `index-literal-ci`, `index-regex-batch`, `index-batch-cap`,
+   `regex-compile`; then `index-point-find`, `literal-candidate-bound`, `narrowed-search`,
+   `index-candidate-cost`; then `index-observational-equivalence`, a corollary.
 7. **Budgeted search:** `budgeted-refines-one-shot`, `budgeted-progressive`.
-
-The two to prove first:
-
-1. **`regex-line-budget`**: one `u64` saturating multiply and a clamp, an `omega`-class proof once
-   gap 3 admits `saturating_mul`/`clamp`. Every regex spec cites it.
-2. **`bloom-layout`**: `usize` division, modulo and saturation with no loop. It retires 7 tests and
-   fixes the sizes `index-bloom-dictionary` depends on.

@@ -710,7 +710,7 @@ fn install_takes_one_operand() {
 fn zero_arity_verbs_refuse_arguments_instead_of_swallowing_them() {
     let none: Vec<&str> = TABLE
         .iter()
-        .filter(|v| v.arity == Arity::None)
+        .filter(|v| matches!(v.arity, Arity::None))
         .map(|v| v.name)
         .collect();
     assert_eq!(none, ["gc", "seed"]);
@@ -723,16 +723,6 @@ fn zero_arity_verbs_refuse_arguments_instead_of_swallowing_them() {
         );
         assert!(arity_refusal(&[], verb).is_none(), "bare `{verb}` proceeds");
     }
-    let arg = |a: &[&str]| a.iter().map(ToString::to_string).collect::<Vec<_>>();
-    for refused in [&["--dry-run"][..], &["--json", "--json"], &["--json", "x"]] {
-        assert_eq!(
-            arity_refusal(&arg(refused), "repair"),
-            Some(ExitCode::from(2)),
-            "{refused:?}"
-        );
-    }
-    assert!(arity_refusal(&json, "repair").is_none());
-    assert!(arity_refusal(&[], "repair").is_none());
     for verb in ["doctor", "status"] {
         use crate::doctor::Detail::{Everything, Problems};
         let arg = |a: &[&str]| a.iter().map(ToString::to_string).collect::<Vec<_>>();
@@ -767,7 +757,7 @@ fn zero_arity_verbs_refuse_arguments_instead_of_swallowing_them() {
 #[test]
 fn the_one_operand_gate_never_refuses_a_multi_name_grammar() {
     let two = vec!["ta".to_string(), "tb".to_string()];
-    for verb in ["install", "link", "refresh", "run"] {
+    for verb in ["link", "refresh", "run"] {
         assert!(arity_refusal(&two, verb).is_none(), "{verb}");
     }
 }
@@ -867,7 +857,7 @@ fn uninstall_not_installed_refuses() {
         "nothing bears the name, so nothing was uninstalled"
     );
     assert!(
-        !removed_programs(&layout).contains("ty"),
+        !removed_programs(&layout).unwrap().contains("ty"),
         "no removed-marker is minted for a program that was never here"
     );
     std::fs::create_dir_all(layout.build_dir("ty", 7)).unwrap();
@@ -881,7 +871,7 @@ fn uninstall_not_installed_refuses() {
         "the debris really came off"
     );
     assert!(
-        removed_programs(&layout).contains("ty"),
+        removed_programs(&layout).unwrap().contains("ty"),
         "a real removal still records itself for the seed lane"
     );
     let _ = std::fs::remove_dir_all(&layout.prefix);
@@ -1025,7 +1015,12 @@ fn repair_refuses_a_read_only_rc_and_a_linked_aterm_dir() {
         std::fs::write(store.join("zshrc"), mine).unwrap();
         std::os::unix::fs::symlink(store.join("zshrc"), &zshrc).unwrap();
         std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let ro = crate::hooks::pass_at(&layout, &home, RcWiring::Rewire, None);
+        let ro = crate::hooks::pass_at(
+            &layout,
+            &crate::hooks::RcHome::at(&home),
+            RcWiring::Rewire,
+            None,
+        );
         std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(ro.rc(), [(".zshrc", RcOutcome::WriteFailed)]);
         assert_eq!(std::fs::read_to_string(store.join("zshrc")).unwrap(), mine);
@@ -1035,7 +1030,12 @@ fn repair_refuses_a_read_only_rc_and_a_linked_aterm_dir() {
     std::fs::create_dir_all(refused.join("elsewhere")).unwrap();
     std::os::unix::fs::symlink(refused.join("elsewhere"), refused.join(".aterm")).unwrap();
     std::fs::write(refused.join(".zshrc"), mine).unwrap();
-    let pass = crate::hooks::pass_at(&layout, &refused, RcWiring::Rewire, None);
+    let pass = crate::hooks::pass_at(
+        &layout,
+        &crate::hooks::RcHome::at(&refused),
+        RcWiring::Rewire,
+        None,
+    );
     assert_eq!(pass, HookPass::NotHardened);
     assert_eq!(
         std::fs::read_to_string(refused.join(".zshrc")).unwrap(),
@@ -4038,6 +4038,7 @@ fn repair_says_an_rc_it_left_alone() {
         home: Some(home.to_path_buf()),
         exe: None,
         rustup_home: None,
+        zsh: Default::default(),
         login_rc: None,
         pass: crate::converge::repair::Pass::Repair,
         reads: Default::default(),
@@ -4055,6 +4056,175 @@ fn repair_says_an_rc_it_left_alone() {
             .any(|line| line.starts_with("repair: ~/.zshrc left alone — atpkg edits only")),
         "{lines:?}"
     );
+}
+
+#[test]
+fn repair_selection_rejects_incomplete_repeated_and_unknown_options() {
+    let words = |values: &[&str]| {
+        values
+            .iter()
+            .map(|word| (*word).to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(super::repair_args(&[]).unwrap(), (false, None));
+    let json = words(&["--json"]);
+    assert_eq!(super::repair_args(&json).unwrap(), (true, None));
+    for values in [
+        &["--only"][..],
+        &["--only="][..],
+        &["--only", "--json"][..],
+        &["--only", "base.pkg.shims", "--only", "base.shell.rc"][..],
+        &["--only=base.pkg.shims", "--only=base.shell.rc"][..],
+        &["--json", "--json"][..],
+        &["--dry-run"][..],
+        &["--json", "x"][..],
+        &["--unknown"][..],
+        &["base.pkg.shims"][..],
+        &["--only", "base.pkg.nosuch"][..],
+        &["--only=nosuch"][..],
+    ] {
+        assert!(super::repair_args(&words(values)).is_err(), "{values:?}");
+    }
+    let only = words(&["--only", crate::converge::repair::SHIMS]);
+    assert_eq!(
+        super::repair_args(&only).unwrap(),
+        (false, Some(crate::converge::repair::SHIMS))
+    );
+}
+
+#[test]
+fn scoped_repair_refreshes_healthy_shims_without_other_repair_items() {
+    let layout = temp_layout("repair-only-shims");
+    let home = crate::testdir::dir("repair-only-home-");
+    let build = layout.build_dir("trust", 15698);
+    std::fs::create_dir_all(build.join("bin")).unwrap();
+    for name in ["targo", "targo-tippy"] {
+        let exe = build.join("bin").join(name);
+        std::fs::write(&exe, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    crate::store::mark_build_ready(&build).unwrap();
+    crate::activate::install_shims(
+        &layout,
+        &build,
+        &["targo".into(), "targo-tippy".into()],
+        crate::Aliases::Off,
+    )
+    .unwrap();
+    crate::activate::activate_build(&layout, &build).unwrap();
+    let shims: Vec<_> = ["targo", "targo-tippy"]
+        .into_iter()
+        .map(|name| {
+            let path = layout.bin_dir().join(name);
+            let expected = std::fs::read(&path).unwrap();
+            let mut old = expected.clone();
+            old.extend_from_slice(b"# previous shim producer\n");
+            std::fs::write(&path, &old).unwrap();
+            (path, expected, old)
+        })
+        .collect();
+    let rc = home.join(".zshrc");
+    std::fs::write(&rc, "# owner's rc: leave unchanged\n").unwrap();
+    let link_dir = home.join(".local/bin");
+    std::fs::create_dir_all(&link_dir).unwrap();
+    let old = home.join("Old/aterm.app/Contents/MacOS");
+    let release = home.join("Applications/aterm.app/Contents/MacOS");
+    for directory in [&old, &release] {
+        std::fs::create_dir_all(directory).unwrap();
+        for name in ["aterm", "amacs", "atpkg"] {
+            std::fs::write(directory.join(name), b"inert app image").unwrap();
+        }
+    }
+    for name in ["aterm", "amacs"] {
+        std::os::unix::fs::symlink(old.join(name), link_dir.join(name)).unwrap();
+    }
+    let ground = |pass| {
+        std::sync::Arc::new(crate::converge::repair::Ground {
+            layout: crate::store::Layout {
+                prefix: layout.prefix.clone(),
+            },
+            home: Some(home.to_path_buf()),
+            exe: Some(release.join("aterm")),
+            rustup_home: None,
+            zsh: Default::default(),
+            login_rc: Some(".zshrc"),
+            pass,
+            reads: Default::default(),
+        })
+    };
+    let doctor = ground(crate::converge::repair::Pass::Doctor);
+    let ids = super::repair_selection(&doctor, Some(crate::converge::repair::SHIMS))
+        .unwrap()
+        .unwrap();
+    let rows = super::repair_rows(
+        &doctor,
+        &mut aterm_converge::NoJournal,
+        Some(&ids),
+        aterm_converge::Scope::REPAIR,
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].outcome, aterm_converge::Outcome::Ok);
+    for (path, _, old) in &shims {
+        assert_eq!(
+            &std::fs::read(path).unwrap(),
+            old,
+            "healthy Doctor remains a no-op"
+        );
+    }
+    let repair = ground(crate::converge::repair::Pass::Repair);
+    for values in [
+        vec![
+            "--only".to_owned(),
+            crate::converge::repair::SHIMS.to_owned(),
+        ],
+        vec![
+            format!("--only={}", crate::converge::repair::SHIMS),
+            "--json".to_owned(),
+        ],
+    ] {
+        let (_, only) = super::repair_args(&values).unwrap();
+        let selected = super::repair_selection(&repair, only).unwrap().unwrap();
+        let rows = super::repair_rows(
+            &repair,
+            &mut aterm_converge::NoJournal,
+            Some(&selected),
+            aterm_converge::Scope::REPAIR,
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            [crate::converge::repair::SHIMS]
+        );
+        assert_eq!(super::repair_exit(&rows), ExitCode::SUCCESS);
+    }
+    for (path, expected, _) in &shims {
+        assert_eq!(
+            &std::fs::read(path).unwrap(),
+            expected,
+            "Repair forces the selected healthy shim refresh"
+        );
+    }
+    assert_eq!(
+        std::fs::read_link(layout.program_current("trust")).unwrap(),
+        build
+    );
+    assert_eq!(
+        std::fs::read_to_string(&rc).unwrap(),
+        "# owner's rc: leave unchanged\n"
+    );
+    assert!(!home.join(".aterm/shell.d").exists(), "HOOKS was excluded");
+    for name in ["aterm", "amacs"] {
+        assert_eq!(
+            std::fs::read_link(link_dir.join(name)).unwrap(),
+            old.join(name),
+            "LINKS was excluded"
+        );
+    }
+    for unknown in ["not-an-item", "pkg", "base.pkg.shims,base.shell.rc"] {
+        assert!(
+            super::repair_selection(&repair, Some(unknown)).is_err(),
+            "{unknown}"
+        );
+    }
 }
 
 #[test]
@@ -4220,7 +4390,7 @@ fn uninstalling_retires_the_program_row() {
         "the program really came off"
     );
     assert!(
-        removed_programs(&layout).contains("ay"),
+        removed_programs(&layout).unwrap().contains("ay"),
         "and the seed lane is told not to put it back"
     );
     let s = crate::status::read(&layout).expect("record present");
@@ -4313,12 +4483,12 @@ fn retirement_refuses_names_that_are_not_programs() {
         "a flag is not a program name here either"
     );
     assert!(
-        !removed_programs(&layout).contains("--help"),
+        !removed_programs(&layout).unwrap().contains("--help"),
         "no removed-marker is minted for a flag"
     );
     assert!(uninstall_and_retire(&layout, "a/b").is_err());
     assert!(
-        removed_programs(&layout).is_empty(),
+        removed_programs(&layout).unwrap().is_empty(),
         "no removed-marker is minted for a name the delete would refuse"
     );
     let _ = std::fs::remove_dir_all(&layout.prefix);
@@ -4355,7 +4525,7 @@ fn a_delete_cut_short_still_leaves_the_removal_recorded() {
         "precondition: shims gone, tree half there — what a kill mid-delete leaves"
     );
     assert!(
-        layout.removed_programs().contains("ay"),
+        layout.removed_programs().unwrap().contains("ay"),
         "the unattended lanes are told the removal was deliberate"
     );
     assert!(
@@ -4748,7 +4918,7 @@ fn the_vendor_lane_completes_the_vendor_half_of_the_default_set() {
     let layout = world::layout("vendor-half");
     std::fs::create_dir_all(layout.removed().parent().unwrap()).unwrap();
     std::fs::write(layout.removed(), "agy\n").unwrap();
-    let removed = removed_programs(&layout);
+    let removed = removed_programs(&layout).unwrap();
     let f = Fake::default();
     f.offline.set(true);
     let cfg = crate::config::PackagesConfig {
@@ -4875,31 +5045,150 @@ fn a_single_program_removal_is_not_undone_by_the_seed_lane() {
         prefix: dir.clone(),
     };
 
-    assert!(removed_programs(&layout).is_empty());
-    record_removed(&layout, "ny");
-    record_removed(&layout, "clean");
-    record_removed(&layout, "ny"); // idempotent
-    let rm = removed_programs(&layout);
+    assert!(removed_programs(&layout).unwrap().is_empty());
+    record_removed(&layout, "ny").unwrap();
+    record_removed(&layout, "clean").unwrap();
+    record_removed(&layout, "ny").unwrap(); // idempotent
+    let rm = removed_programs(&layout).unwrap();
     assert!(rm.contains("ny") && rm.contains("clean"), "{rm:?}");
     assert_eq!(rm.len(), 2, "no duplicate from the repeat: {rm:?}");
     assert!(!rm.iter().any(|p| p.starts_with('#')), "{rm:?}");
 
-    clear_removed(&layout, &["ny".to_string()]);
-    let rm = removed_programs(&layout);
+    clear_removed(&layout, &["ny".to_string()]).unwrap();
+    let rm = removed_programs(&layout).unwrap();
     assert!(
         !rm.contains("ny"),
         "an explicit install lifts just that one"
     );
     assert!(rm.contains("clean"), "and leaves the others alone");
 
-    clear_removed(&layout, &["clean".to_string()]);
+    clear_removed(&layout, &["clean".to_string()]).unwrap();
     assert!(
-        removed_programs(&layout).is_empty(),
+        removed_programs(&layout).unwrap().is_empty(),
         "emptying the set removes the file rather than leaving a header behind"
     );
     assert!(!layout.removed().exists());
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A removal file the real writer can publish still suppresses unattended installation when
+/// its aggregate size exceeds the old metadata read cap; another removal preserves the set.
+#[test]
+fn large_removal_sets_round_trip_without_reinstalling_or_forgetting_programs() {
+    let dir = crate::testdir::dir("atpkg-large-removals-");
+    let layout = crate::store::Layout {
+        prefix: dir.clone(),
+    };
+    let cfg = crate::config::PackagesConfig::default();
+    assert!(removed_programs(&layout).unwrap().is_empty());
+    assert!(vendor_wanted(
+        &cfg,
+        &removed_programs(&layout).unwrap(),
+        "codex"
+    ));
+    record_removed(&layout, "codex").unwrap();
+    assert!(!vendor_wanted(
+        &cfg,
+        &removed_programs(&layout).unwrap(),
+        "codex"
+    ));
+
+    let mut expected = std::collections::BTreeSet::from(["codex".to_string()]);
+    for n in 0..300 {
+        let name = format!("package-{n:03}-{}", "x".repeat(208));
+        retirement_name_gate(&name).unwrap();
+        expected.insert(name);
+    }
+    write_removed(&layout, &expected).unwrap();
+    assert!(std::fs::metadata(layout.removed()).unwrap().len() > 64 * 1024);
+    let actual = removed_programs(&layout).unwrap();
+    assert_eq!(
+        actual, expected,
+        "the writer's complete set must remain readable"
+    );
+    assert!(
+        !vendor_wanted(&cfg, &actual, "codex"),
+        "no unattended reinstall"
+    );
+    record_removed(&layout, "claude").unwrap();
+    expected.insert("claude".to_string());
+    assert_eq!(
+        removed_programs(&layout).unwrap(),
+        expected,
+        "another removal preserves every opt-out"
+    );
+    clear_removed(&layout, &["claude".to_string()]).unwrap();
+    expected.remove("claude");
+    assert_eq!(
+        removed_programs(&layout).unwrap(),
+        expected,
+        "lifting one preserves the others"
+    );
+}
+
+#[test]
+fn refused_removal_evidence_holds_installation_and_is_never_overwritten() {
+    for case in ["utf8", "overlong", "directory"] {
+        let dir = crate::testdir::dir("atpkg-refused-removals-");
+        let layout = crate::store::Layout {
+            prefix: dir.clone(),
+        };
+        let path = layout.removed();
+        let bytes = match case {
+            "utf8" => vec![0xff],
+            "overlong" => vec![b'x'; crate::store::REMOVAL_LINE_BYTES + 1],
+            _ => Vec::new(),
+        };
+        if case == "directory" {
+            std::fs::create_dir(&path).unwrap();
+        } else {
+            std::fs::write(&path, &bytes).unwrap();
+        }
+        assert!(removed_programs(&layout).is_err(), "{case}");
+        assert!(record_removed(&layout, "codex").is_err(), "{case}");
+        assert!(clear_removed(&layout, &["codex".into()]).is_err(), "{case}");
+        let fetcher = CountingFetcher::new(dir.join("empty-source"));
+        let out = install_default_set(
+            &layout,
+            &fetcher,
+            &test_anchor(),
+            &crate::config::PackagesConfig::default(),
+            0,
+        );
+        assert_eq!(out.failures, 1, "{case}");
+        assert!(
+            !out.announced
+                && out
+                    .index_error
+                    .as_ref()
+                    .is_some_and(|e| e.contains("removal decisions")),
+            "{case}"
+        );
+        assert_eq!(
+            fetcher.resolves(),
+            0,
+            "{case}: no install planning without removal evidence"
+        );
+        if case == "directory" {
+            assert!(path.is_dir());
+        } else {
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "{case}");
+        }
+    }
+    let dir = crate::testdir::dir("atpkg-removal-record-bound-");
+    let layout = crate::store::Layout {
+        prefix: dir.clone(),
+    };
+    record_removed(&layout, "codex").unwrap();
+    let before = std::fs::read(layout.removed()).unwrap();
+    let too_long = std::collections::BTreeSet::from(["x".repeat(crate::store::REMOVAL_LINE_BYTES)]);
+    assert!(write_removed(&layout, &too_long).is_err());
+    assert_eq!(
+        std::fs::read(layout.removed()).unwrap(),
+        before,
+        "producer refuses before replacing valid evidence"
+    );
 }
 
 #[cfg(unix)]
@@ -4911,11 +5200,11 @@ fn a_removal_record_that_cannot_be_written_is_reported_not_swallowed() {
         prefix: dir.clone(),
     };
 
-    record_removed(&layout, "ny");
-    assert!(removed_programs(&layout).contains("ny"));
+    record_removed(&layout, "ny").unwrap();
+    assert!(removed_programs(&layout).unwrap().contains("ny"));
 
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
-    let mut all = removed_programs(&layout);
+    let mut all = removed_programs(&layout).unwrap();
     all.insert("clean".to_string());
     let published = write_removed(&layout, &all);
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -4925,7 +5214,7 @@ fn a_removal_record_that_cannot_be_written_is_reported_not_swallowed() {
     );
 
     assert_eq!(
-        removed_programs(&layout),
+        removed_programs(&layout).unwrap(),
         std::collections::BTreeSet::from(["ny".to_string()]),
         "a failed write must not cost the removals already recorded"
     );
@@ -7156,7 +7445,7 @@ fn a_manifest_exposing_another_programs_name_lays_no_stub_over_it() {
     write_registry(&dir, "stable");
     write_pkg_exposing(&dir, "lk", 3, current_triple(), &["lk", "lk-x", "ay", "z3"]);
     let layout = temp_layout("exposed-owned");
-    record_removed(&layout, "ay");
+    record_removed(&layout, "ay").unwrap();
     let fetcher = SharedDownloads {
         inner: crate::DirFetcher::new(dir.clone()),
         asked: std::sync::Mutex::default(),
@@ -12442,10 +12731,10 @@ fn the_toolset_verb_changes_its_mind_before_its_pass() {
     };
     let trust = world::trust();
     let seams = world_seams(&trust);
-    record_removed(&layout, "codex");
+    record_removed(&layout, "codex").unwrap();
     record_decline(&layout);
     assert!(
-        removed_programs(&layout).contains("codex") && declined(&layout),
+        removed_programs(&layout).unwrap().contains("codex") && declined(&layout),
         "fixture: the old mind is on disk"
     );
     install_toolset(&layout, &cfg, &f, &seams);
@@ -12454,7 +12743,7 @@ fn the_toolset_verb_changes_its_mind_before_its_pass() {
         "the removed member is installed by the verb asked to restore the set"
     );
     assert!(
-        removed_programs(&layout).is_empty(),
+        removed_programs(&layout).unwrap().is_empty(),
         "the removals are gone"
     );
     assert!(!declined(&layout), "the decline is gone");
@@ -13429,4 +13718,262 @@ fn a_summary_from_the_cached_index_says_so() {
         None,
         "nothing current or moved says nothing"
     );
+}
+
+#[test]
+fn restore_installed_shims_and_live_without_shim_refuse_symlinked_or_unverified_targets() {
+    let l = temp_layout("restore-verified-current");
+    let owned = [String::from("foo")];
+    let ready = seed_ready_build(&l, "foo", 1);
+
+    let foreign = l.prefix.join("foreign");
+    std::fs::create_dir_all(foreign.join("bin")).unwrap();
+    let foreign_exe = foreign.join("bin").join("foo");
+    std::fs::write(&foreign_exe, b"#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&foreign_exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    std::fs::create_dir_all(l.program_current("foo").parent().unwrap()).unwrap();
+    std::fs::remove_file(l.program_current("foo")).ok();
+    std::os::unix::fs::symlink(&foreign, l.program_current("foo")).unwrap();
+    assert_eq!(
+        restore_installed_shims(&l, "foo", Some(&owned)).unwrap(),
+        Restored::NoBuild,
+        "current pointing outside store/<program>/<build> must not be restored"
+    );
+
+    std::fs::remove_file(l.program_current("foo")).unwrap();
+    let other_ready = seed_ready_build(&l, "bar", 2);
+    std::os::unix::fs::symlink(&other_ready, l.program_current("foo")).unwrap();
+    assert_eq!(
+        restore_installed_shims(&l, "foo", Some(&owned)).unwrap(),
+        Restored::NoBuild,
+        "current pointing to another program's build must not be restored"
+    );
+
+    std::fs::remove_file(l.program_current("foo")).unwrap();
+    let incomplete = l.build_dir("foo", 3);
+    std::fs::create_dir_all(incomplete.join("bin")).unwrap();
+    std::fs::write(incomplete.join("bin").join("foo"), b"#!/bin/sh\n").unwrap();
+    std::os::unix::fs::symlink(&incomplete, l.program_current("foo")).unwrap();
+    assert_eq!(
+        restore_installed_shims(&l, "foo", Some(&owned)).unwrap(),
+        Restored::NoBuild,
+        "current pointing to an incomplete build must not be restored"
+    );
+
+    std::fs::remove_file(l.program_current("foo")).unwrap();
+    activate_seeded(&l, "foo", &ready);
+    let foo_bin = ready.join("bin").join("foo");
+    std::fs::remove_file(&foo_bin).unwrap();
+    std::os::unix::fs::symlink(&foreign_exe, &foo_bin).unwrap();
+    let foo_tool = crate::store::ToolName::new("foo").unwrap();
+    std::fs::remove_file(l.shim(&foo_tool)).unwrap();
+    assert_eq!(
+        restore_installed_shims(&l, "foo", Some(&owned)).unwrap(),
+        Restored::Nothing,
+        "symlinked bin/<tool> inside build_dir must not be restored as a shim"
+    );
+    assert_eq!(
+        live_without_shim_of(&l, "foo", "foo"),
+        None,
+        "symlinked bin/<tool> must not be treated as live_without_shim"
+    );
+
+    let _ = std::fs::remove_dir_all(&l.prefix);
+}
+
+#[test]
+fn relative_current_preserves_restore_and_the_trust_reassert_decision() {
+    let l = temp_layout("restore-relative-current");
+    let owned = ["foo".to_string()];
+    let build = seed_ready_build(&l, "foo", 1);
+    activate_seeded(&l, "foo", &build);
+    assert_eq!(
+        restore_installed_shims(&l, "foo", Some(&owned)).unwrap(),
+        Restored::Laid(1),
+        "ordinary absolute current"
+    );
+    std::fs::remove_file(l.program_current("foo")).unwrap();
+    std::os::unix::fs::symlink("1", l.program_current("foo")).unwrap();
+    let relative = restore_installed_shims(&l, "foo", Some(&owned)).unwrap();
+    let trust = seed_ready_build(&l, "trust", 2);
+    std::os::unix::fs::symlink("2", l.program_current("trust")).unwrap();
+    let reassert = verified_current_build_dir(&l, "trust");
+    // The real unlink branch uses this same predicate; no rustup process or real home is used.
+    let foreign = l.prefix.join("foreign");
+    std::fs::create_dir(&foreign).unwrap();
+    std::fs::remove_file(l.program_current("foo")).unwrap();
+    std::os::unix::fs::symlink(&foreign, l.program_current("foo")).unwrap();
+    assert_eq!(
+        restore_installed_shims(&l, "foo", Some(&owned)).unwrap(),
+        Restored::NoBuild,
+        "foreign current still refused"
+    );
+    assert_eq!(
+        relative,
+        Restored::Laid(1),
+        "a relative current selects the same complete build"
+    );
+    assert_eq!(
+        reassert,
+        Some(trust),
+        "the unlink decision must reassert, not detach, a valid selected trust build"
+    );
+}
+
+#[test]
+fn staged_artifact_links_restore_and_recover_shims_without_admitting_foreign_aliases() {
+    use crate::extract::fixtures::{gzip_bytes, tar_bytes};
+    let l = temp_layout("restore-artifact-links");
+    let ordinary = seed_ready_build(&l, "foo", 1);
+    activate_seeded(&l, "foo", &ordinary);
+    let owned_foo = ["foo".to_string()];
+    assert_eq!(
+        restore_installed_shims(&l, "foo", Some(&owned_foo)).unwrap(),
+        Restored::Laid(1)
+    );
+    std::fs::remove_file(l.shim(&crate::store::ToolName::new("foo").unwrap())).unwrap();
+    assert!(
+        live_without_shim_of(&l, "foo", "foo").is_some(),
+        "ordinary missing shim"
+    );
+
+    let relative = "Emacs.app/Contents/MacOS/Emacs";
+    let bytes = b"inert app command bytes\n";
+    let archive = l.prefix.join("emacs.tar.gz");
+    std::fs::write(
+        &archive,
+        gzip_bytes(&tar_bytes(&[(relative, b'0', "", bytes, 0o755)])),
+    )
+    .unwrap();
+    let replica = l.prefix.join("expected");
+    std::fs::create_dir_all(replica.join("Emacs.app/Contents/MacOS")).unwrap();
+    std::fs::create_dir(replica.join("bin")).unwrap();
+    std::fs::write(replica.join(relative), bytes).unwrap();
+    std::fs::set_permissions(
+        replica.join(relative),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+        "../Emacs.app/Contents/MacOS/Emacs",
+        replica.join("bin/emacs"),
+    )
+    .unwrap();
+    let expected = crate::tree::tree_root(&replica).unwrap();
+    let artifact: crate::manifest::Artifact = aterm_toml::from_str(&format!(
+        "target = \"{}\"\nkind = \"binary\"\nprotocol = \"https\"\npayload = \"tar-gz\"\nsha256 = \"{}\"\ntree_root = \"{expected}\"\n[links]\nemacs = \"{relative}\"\n",
+        current_triple(), crate::tree::file_sha256(&archive).unwrap()
+    )).unwrap();
+    let build = l.build_dir("emacs", 1);
+    assert_eq!(
+        crate::verify_and_stage(
+            &artifact,
+            &archive,
+            &build,
+            &crate::install::StageHooks::NONE
+        )
+        .unwrap(),
+        expected
+    );
+    assert!(crate::store::build_is_complete(&build));
+    assert!(
+        std::fs::symlink_metadata(build.join("bin/emacs"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "actual Artifact.links output"
+    );
+    crate::activate::activate_build(&l, &build).unwrap();
+    let owned = ["emacs".to_string()];
+    let restored = restore_installed_shims(&l, "emacs", Some(&owned)).unwrap();
+    let shim = l.shim(&crate::store::ToolName::new("emacs").unwrap());
+    if std::fs::symlink_metadata(&shim).is_ok() {
+        std::fs::remove_file(&shim).unwrap();
+    }
+    let lost = live_without_shim_of(&l, "emacs", "emacs");
+    let alias = build.join("bin/emacs");
+    let foreign = l.prefix.join("foreign-command");
+    std::fs::write(&foreign, b"unrelated bytes").unwrap();
+    for target in [&foreign, &replica] {
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(target, &alias).unwrap();
+        assert_eq!(
+            restore_installed_shims(&l, "emacs", Some(&owned)).unwrap(),
+            Restored::Nothing,
+            "foreign or nonregular alias"
+        );
+        assert!(live_without_shim_of(&l, "emacs", "emacs").is_none());
+    }
+    assert_eq!(std::fs::read(&foreign).unwrap(), b"unrelated bytes");
+    assert_eq!(
+        restored,
+        Restored::Laid(1),
+        "a root-verified staged Artifact.links command remains supported"
+    );
+    assert!(
+        lost.is_some(),
+        "its ordinary missing managed shim is recoverable"
+    );
+}
+
+#[test]
+fn command_links_are_fenced_before_targets_and_bounded_to_sixteen_hops() {
+    let l = temp_layout("bounded-command-links");
+    let build = seed_ready_build(&l, "foo", 1);
+    activate_seeded(&l, "foo", &build);
+    let tool = crate::store::ToolName::new("foo").unwrap();
+    std::fs::remove_file(l.shim(&tool)).unwrap();
+    let alias = build.join("bin/foo");
+    let payload = build.join("payload");
+    std::fs::create_dir(&payload).unwrap();
+    std::fs::rename(&alias, payload.join("tool")).unwrap();
+    for n in 0..15 {
+        let target = if n == 14 {
+            "tool".to_string()
+        } else {
+            format!("link{}", n + 1)
+        };
+        std::os::unix::fs::symlink(target, payload.join(format!("link{n}"))).unwrap();
+    }
+    std::os::unix::fs::symlink("../payload/link0", &alias).unwrap();
+    assert!(
+        live_without_shim_of(&l, "foo", "foo").is_some(),
+        "sixteen contained final links"
+    );
+    let owned = ["foo".to_string()];
+    assert_eq!(
+        restore_installed_shims(&l, "foo", Some(&owned)).unwrap(),
+        Restored::Laid(1)
+    );
+    std::fs::remove_file(l.shim(&tool)).unwrap();
+    // A seventeenth link is refused, rather than relying on an OS-specific ELOOP boundary.
+    std::fs::remove_file(payload.join("link14")).unwrap();
+    std::os::unix::fs::symlink("link15", payload.join("link14")).unwrap();
+    std::os::unix::fs::symlink("tool", payload.join("link15")).unwrap();
+    assert!(live_without_shim_of(&l, "foo", "foo").is_none());
+    assert_eq!(
+        restore_installed_shims(&l, "foo", Some(&owned)).unwrap(),
+        Restored::Nothing
+    );
+    let foreign = l.prefix.join("foreign-command");
+    std::fs::write(&foreign, b"unrelated bytes").unwrap();
+    std::os::unix::fs::symlink(&payload, payload.join("indirect")).unwrap();
+    for target in [
+        "../../../../foreign-command", // escapes the selected build before target lookup
+        "../payload/missing",          // dangling contained target
+        "foo",                         // final-link loop
+        "../payload/indirect/tool",    // linked intermediate directory, not producer-supported
+        "../payload",                  // contained nonregular target
+    ] {
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(target, &alias).unwrap();
+        assert!(live_without_shim_of(&l, "foo", "foo").is_none(), "{target}");
+        assert_eq!(
+            restore_installed_shims(&l, "foo", Some(&owned)).unwrap(),
+            Restored::Nothing,
+            "{target}"
+        );
+    }
+    assert_eq!(std::fs::read(foreign).unwrap(), b"unrelated bytes");
 }

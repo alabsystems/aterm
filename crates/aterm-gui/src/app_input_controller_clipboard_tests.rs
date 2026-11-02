@@ -17,7 +17,7 @@ use std::sync::Arc;
 use aterm_session::sink::SinkWriter;
 
 use crate::app_take_over::CLIPBOARD_REFUSED;
-use crate::input::Source;
+use crate::input::{InputEvent, Source};
 use crate::menu::MenuAction;
 use crate::{App, WindowId};
 
@@ -577,6 +577,138 @@ fn hw_key(app: &mut App, ch: &str, mods: aterm_window::keyboard::ModifiersState,
         app.dispatch_hw_key(WID, event, posted);
     });
     app.windows.get_mut(&WID).unwrap().mods = ModifiersState::empty();
+}
+
+#[test]
+fn posted_native_keys_deliver_bytes_without_claiming_a_person_typed() {
+    use aterm_window::keyboard::ModifiersState;
+    let (mut app, mut reader, sink) = app_reading_pty();
+    let sid = app.front_terminal(WID).expect("front terminal").session;
+    let ctx = app.pool.get(sid).unwrap().ctx.clone();
+    let person_rows = || {
+        ctx.timeline
+            .lock()
+            .unwrap()
+            .since(None)
+            .filter(|row| row.kind == "human")
+            .count()
+    };
+    let _ = program_read(&mut reader, &sink);
+
+    hw_key(&mut app, "x", ModifiersState::empty(), true);
+    assert_eq!(program_read(&mut reader, &sink), "x");
+    assert_eq!(
+        ctx.human_input.counts(),
+        crate::human_input::PersonCounts::default()
+    );
+    assert_eq!(
+        ctx.human_input.typed_ms_since(crate::metrics::now_us()),
+        None
+    );
+    assert_eq!(person_rows(), 0);
+
+    app.with_controller_mark(true, |app| {
+        app.with_controller_mark(false, |app| {
+            assert_eq!(
+                app.input(WID, InputEvent::Text("y".into()), Source::Human),
+                crate::input::InputOutcome::Ok
+            );
+        })
+    });
+    assert_eq!(program_read(&mut reader, &sink), "y");
+    assert_eq!(
+        ctx.human_input.counts(),
+        crate::human_input::PersonCounts::default()
+    );
+    assert_eq!(person_rows(), 0);
+    assert!(
+        !app.person_gesture_refused(),
+        "the controller mark is restored"
+    );
+
+    hw_key(&mut app, "x", ModifiersState::empty(), false);
+    assert_eq!(
+        program_read(&mut reader, &sink),
+        "x",
+        "the same native route delivers the physical key"
+    );
+    let counts = ctx.human_input.counts();
+    assert_eq!((counts.seq, counts.reached), (1, 1));
+    assert!(
+        ctx.human_input
+            .typed_ms_since(crate::metrics::now_us())
+            .is_some()
+    );
+    assert_eq!(person_rows(), 1);
+}
+
+/// Posted compositions and both commit routes deliver their text without claiming a person
+/// typed. The same callbacks with an unposted source retain physical IME accounting, even
+/// while an unrelated posted native key is current.
+#[test]
+fn posted_ime_callbacks_deliver_text_without_claiming_a_person_typed() {
+    use aterm_window::event::{Ime, WindowEvent};
+
+    for (text, sent) in [("日本", "日本"), ("ls\n", "ls\r")] {
+        for posted in [true, false] {
+            let (mut app, mut reader, sink) = app_reading_pty();
+            app.confirm_multiline_paste = false;
+            let sid = app.front_terminal(WID).expect("front terminal").session;
+            let ctx = app.pool.get(sid).unwrap().ctx.clone();
+            let _ = program_read(&mut reader, &sink);
+            let deliver = |app: &mut App, ime: Ime| {
+                // The callback's retained verdict wins over the opposite ambient key.
+                dispatching(current_key(7, !posted), || {
+                    crate::hwkey::with_window_event_posted_for_test(posted, || {
+                        let event = WindowEvent::Ime(ime.clone());
+                        let arrived = crate::arriving_key_posted(&event);
+                        assert_eq!(arrived, posted);
+                        app.note_window_input_arrival(&event, arrived);
+                        app.dispatch_ime_event(WID, ime, arrived);
+                    });
+                });
+                assert!(
+                    !app.person_gesture_refused(),
+                    "the dispatch mark is restored"
+                );
+            };
+
+            deliver(&mut app, Ime::Preedit("に".into(), Some((3, 3))));
+            assert_eq!(app.windows[&WID].preedit, "に");
+            assert!(program_read(&mut reader, &sink).is_empty());
+            let counts = ctx.human_input.counts();
+            assert_eq!(
+                (counts.seq, counts.reached),
+                if posted { (0, 0) } else { (1, 0) }
+            );
+            assert!(app.last_keystroke_at.is_some());
+            assert_eq!(app.last_person_input_at.is_some(), !posted);
+
+            deliver(&mut app, Ime::Commit(text.into()));
+            assert_eq!(program_read(&mut reader, &sink), sent);
+            assert!(app.windows[&WID].preedit.is_empty());
+            let counts = ctx.human_input.counts();
+            assert_eq!(
+                (counts.seq, counts.reached),
+                if posted { (0, 0) } else { (2, 2) }
+            );
+            assert_eq!(
+                ctx.human_input
+                    .typed_ms_since(crate::metrics::now_us())
+                    .is_some(),
+                !posted
+            );
+            let person_rows = ctx
+                .timeline
+                .lock()
+                .unwrap()
+                .since(None)
+                .filter(|row| row.kind == "human")
+                .count();
+            assert_eq!(person_rows > 0, !posted);
+            assert_eq!(app.last_person_input_at.is_some(), !posted);
+        }
+    }
 }
 
 /// A KEY `hwkey` POSTED REACHES NO CLIPBOARD BY THE PERSON'S KEY PATH: `hwkey v mods=cmd` and

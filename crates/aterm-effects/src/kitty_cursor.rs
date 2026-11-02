@@ -1039,9 +1039,6 @@ impl CursorCat {
     /// so a backgrounded window resumes with one ordinary frame's worth.
     #[inline]
     fn stride_advance(&mut self, now: Instant) {
-        if self.stride_at == Some(now) {
-            return;
-        }
         let dt = match self.stride_at {
             Some(l) => now.saturating_duration_since(l).as_secs_f32().min(0.10),
             None => 0.0,
@@ -1105,7 +1102,7 @@ impl CursorCat {
         match self.disp_at {
             None => self.disp = target,
             Some(prev) => {
-                if prev != now && self.disp != target {
+                if self.disp != target {
                     let dt = now.saturating_duration_since(prev).as_secs_f32().min(0.1);
                     if dt > 0.0 {
                         const INV_DISP_TAU: f32 = 1.0 / DISP_TAU;
@@ -1701,7 +1698,7 @@ pub fn emit_exit_fx(
     out: &mut Vec<GlowQuad>,
     halos: &mut Vec<RainHalo>,
 ) {
-    if matches!(exit, CatExit::Plain) {
+    if matches!(exit, CatExit::Plain) || fade_out <= 0.0 || fade_out >= 1.0 {
         return;
     }
     let ch = geom.ch as i32;

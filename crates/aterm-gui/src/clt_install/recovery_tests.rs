@@ -30,7 +30,7 @@ fn landed_child_for_owner(mark: &std::path::Path, owner: u64) -> (crate::Session
     source.access_steps.set_reach(dialog_reach());
     let id = if source.workstation_setup.developer_tools_mark.opened() {
         source.workstation_setup.developer_tools = Install::Pressed;
-        test_support::book(&mut source, wid, pressed_tab_then(LINE.into()))
+        test_support::book(&mut source, wid, pressed_tab_then())
     } else {
         book(&mut source, wid, 4)
     };
@@ -44,7 +44,7 @@ fn landed_child_for_owner(mark: &std::path::Path, owner: u64) -> (crate::Session
         session: Ok(session),
         reader_gate: None,
     }));
-    assert_eq!(drain(&read), format!("exec {LINE}; exit $?\r").as_bytes());
+    assert_eq!(drain(&read), go_line());
     assert!(source.developer_tools_install_active());
     assert!(macos_dialog_up());
     assert!(mark.is_file());
@@ -111,7 +111,7 @@ fn clt_recovery_a_live_adopted_installer_keeps_custody_without_retyping_its_comm
         recovered.developer_tools_install_active(),
         "a verified live child must recover its installer custody, not just its PTY"
     );
-    assert!(recovered.developer_tools_install_step().is_some());
+    assert!(step(&mut recovered).is_some());
     assert!(recovered.system_state_handoff_pending());
     assert!(macos_dialog_up(), "other automatic prompts remain held");
     assert!(
@@ -128,7 +128,7 @@ fn clt_recovery_a_live_adopted_installer_keeps_custody_without_retyping_its_comm
 
     assert!(recovered.exit_session_logical(local).is_empty());
     assert!(!recovered.developer_tools_install_active());
-    assert_eq!(recovered.developer_tools_install_step(), None);
+    assert_eq!(step(&mut recovered), None);
     assert!(!recovered.system_state_handoff_pending());
     assert!(!macos_dialog_up());
     assert!(
@@ -139,6 +139,43 @@ fn clt_recovery_a_live_adopted_installer_keeps_custody_without_retyping_its_comm
         .expect("the exact recovered child's exit releases custody");
     drop(available);
     assert!(drain(&read).is_empty(), "exit submits no further command");
+}
+
+/// A launch that adopted live shells takes the shim's mark off with the rest an earlier launch
+/// left, and the account's mark reads the tools unfinished; an install those shells carry on with
+/// is one that runs, though: its want comes with it and new shells get the shim again while it
+/// runs, until its end leaves nothing installing them.
+/// NEGATIVE CONTROL: a recovery that brings no want, or keeps the tools unfinished, leaves new
+/// shells with Apple's own dialog while the adopted install runs.
+#[test]
+fn clt_recovery_an_adopted_live_installer_puts_the_shim_back_on_new_shells() {
+    if !crate::test_alone::alone() {
+        return;
+    }
+    let directory = aterm_tempfile::tempdir().unwrap();
+    let mark = directory.path().join("command-line-tools-tab");
+    let (session, _read) = landed_child(&mark);
+    let (mut recovered, _) = recovered_page(&mark);
+    let shim = shim_in(&mut recovered, directory.path());
+    recovered
+        .workstation_setup
+        .developer_tools_shim
+        .reconcile(true);
+    recovered.workstation_setup.developer_tools_unfinished = true;
+    assert!(!wanted(&shim));
+    let local = recovered.next_session_id + 30;
+    let session = adopted(session, local);
+    App::register_session(&recovered.store, &session, None);
+    recovered.pool_insert(session);
+    assert!(recovered.developer_tools_install_active());
+    assert_eq!(recovered.workstation_setup.developer_tools_want, Some(0));
+    assert!(
+        wanted(&shim),
+        "the adopted install runs on: new shells get the shim"
+    );
+    assert!(recovered.exit_session_logical(local).is_empty());
+    assert!(!wanted(&shim), "its end leaves nothing installing them");
+    assert!(shim.is_dir(), "the directory goes at the next launch");
 }
 
 #[test]
@@ -202,7 +239,7 @@ fn clt_recovery_a_cold_or_mismatched_child_never_inherits_installer_custody() {
         App::register_session(&recovered.store, &session, None);
         recovered.pool_insert(session);
         assert!(!recovered.developer_tools_install_active(), "{case}");
-        assert_eq!(recovered.developer_tools_install_step(), None, "{case}");
+        assert_eq!(step(&mut recovered), None, "{case}");
         assert!(!recovered.system_state_handoff_pending(), "{case}");
         assert!(!macos_dialog_up(), "{case}");
         assert!(
@@ -261,7 +298,7 @@ fn clt_recovery_each_live_child_keeps_custody_until_its_own_exit() {
         recovered.developer_tools_install_active(),
         "the second child still owns custody"
     );
-    assert!(recovered.developer_tools_install_step().is_some());
+    assert!(step(&mut recovered).is_some());
     assert!(recovered.system_state_handoff_pending());
     assert!(macos_dialog_up());
     recovered.headless = false;
@@ -311,7 +348,7 @@ fn clt_recovery_receipt_before_command_bytes_restores_custody_without_starting_t
     App::register_session(&recovered.store, &child, None);
     recovered.pool_insert(child);
     assert!(recovered.developer_tools_install_active());
-    assert!(recovered.developer_tools_install_step().is_some());
+    assert!(step(&mut recovered).is_some());
     assert!(recovered.system_state_handoff_pending());
     assert!(macos_dialog_up());
     assert!(
@@ -349,18 +386,18 @@ fn clt_recovery_a_receipt_collision_refuses_dispatch_and_keeps_the_existing_reco
         session: Ok(child),
         reader_gate: None,
     }));
-    let submitted = String::from_utf8(drain(&read)).unwrap();
-    assert!(
-        !submitted.contains(LINE),
-        "no installer command after recovery-state failure"
+    assert_eq!(
+        drain(&read),
+        format!("{TAB_STOP}\r").into_bytes(),
+        "no go line after recovery-state failure: the program ends having started nothing"
     );
+    let shown: Vec<String> = {
+        let term = crate::term_lock(&source.pool.get(id).expect("the result tab").term);
+        (0..200).filter_map(|row| term.row_text(row)).collect()
+    };
     assert!(
-        submitted.contains("/usr/bin/printf"),
-        "the result tab receives the refusal"
-    );
-    assert!(
-        submitted.ends_with("; exit 1\r"),
-        "the error child ends after its result"
+        shown.concat().contains(&not_started_line()),
+        "the result tab says why, in plain words: {shown:?}"
     );
     assert!(source.developer_tools_install_active());
     assert!(macos_dialog_up());

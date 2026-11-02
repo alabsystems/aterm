@@ -458,4 +458,14 @@ mod tests {
         }
         assert_ne!(out, symbols);
     }
+
+    #[test]
+    fn byte_aligned_short_last_probability_round_trips() {
+        let norm: [i16; 7] = [0, 16, 0, 12, 2, 1, -1];
+        let mut desc = Vec::new();
+        write_description(&norm, 5, &mut desc);
+        assert_eq!(desc, 0x4F41_8810u32.to_le_bytes());
+        let mut dt = FseTable::new(35);
+        assert_eq!(dt.build_decoder(&desc, 9).unwrap(), 4);
+    }
 }

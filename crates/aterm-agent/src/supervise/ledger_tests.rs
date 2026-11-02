@@ -688,6 +688,7 @@ fn since_takes_ms_or_a_time_word() {
         Some(DAY + 7 * 3_600_000)
     );
     assert_eq!(parse_since("2026-09-14T00:00:00Z", -7 * 3600), Some(DAY));
+    assert_eq!(parse_since("2026-09-14T00:00:00z", -7 * 3600), Some(DAY));
     assert_eq!(parse_since("2026-09-14T10:30", 0), Some(DAY + 37_800_000));
     assert_eq!(
         parse_since("2026-09-14 10:30:05", 0),
@@ -701,6 +702,10 @@ fn since_takes_ms_or_a_time_word() {
         parse_since("2026-09-14T10:30:00+0200", 0),
         Some(DAY + 37_800_000 - 2 * 3_600_000)
     );
+    assert_eq!(
+        inbox_rows("post 9 to=%40s-work kind=task off=- len=64\n", "@s-work").1,
+        [9]
+    );
     for bad in [
         "",
         "yesterday",
@@ -709,11 +714,35 @@ fn since_takes_ms_or_a_time_word() {
         "2026-09-14T25:00",
         "2026-09-14T10",
         "2026-09-14T10:30:00Q",
+        "2026-09-14T10:30:00+25:00",
+        "2026-09-14T10:30:00+07:60",
+        "2026-09-14T10:30:00+700",
         "-1",
         "2026-09-14T10:30:00:00",
     ] {
         assert_eq!(parse_since(bad, 0), None, "{bad}");
     }
+
+    // Zoneless `--since` across a daylight change uses the parsed instant's local offset.
+    const PDT: i64 = -7 * 3600;
+    const PST: i64 = -8 * 3600;
+    const CHANGE: i64 = 1_793_523_600; // 2026-11-01T09:00:00Z
+    let la_at = |unix: i64| Some(if unix < CHANGE { PDT } else { PST });
+    assert_eq!(
+        parse_since_local("2026-10-31T22:00", PST, &la_at),
+        Some(1_793_509_200_000),
+        "2026-10-31 22:00 PDT (05:00Z) asked after falling back to PST"
+    );
+    assert_eq!(
+        parse_since("2026-10-31T22:00", PST),
+        Some(1_793_512_800_000),
+        "CONTROL: flat PST places pre-change --since an hour late"
+    );
+    assert_eq!(
+        parse_since_local("2026-10-31", PST, &la_at),
+        Some(1_793_430_000_000),
+        "zoneless date midnight 2026-10-31 00:00 PDT (07:00Z)"
+    );
 }
 
 #[test]
@@ -981,7 +1010,12 @@ fn the_ledger_renders_its_goldens() {
     let (dir, path) = journal_file("golden", &journal_lines());
     let l = read(&mut whole_host(), &opts(Some(path.clone())));
     let named = path.display().to_string();
-    let shown = |format: Format| render(&l, format).replace(&named, "<journal>");
+    // The md render escapes a Windows path's `\` as markdown does.
+    let shown = |format: Format| {
+        render(&l, format)
+            .replace(&md_cell(&named), "<journal>")
+            .replace(&named, "<journal>")
+    };
     let html = shown(Format::Html)
         .replace(super::super::ledger_html::STYLE, "<style>…</style>\n")
         .replace(super::super::ledger_html::SCRIPT, "…\n");

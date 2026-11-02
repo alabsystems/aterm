@@ -34,6 +34,16 @@ const FIXTURE_FONT: &str = concat!(
 /// The light instance a tab's own dark theme stands in.
 const LIGHT_INSTANCE: &str = "Default Light";
 
+/// The rig's window on a scale-2 display (`docs/design/PRISM-GLASS.md` §15.8 amendment 53), as
+/// the light corpus's `scale 2` lays it (`TrailRig::scale`): its font twice the 1x size (the
+/// fixture at 24 px, 14x32 px cells), as a 12 pt window's is on a Retina display, whose face lays
+/// its thinnest glyph near enough the full ink for the light glass to draw under it; at 1x (12 px)
+/// the frame draws main's paper arm. Set before the grid, so the grid is laid at that size; kept by
+/// every config the run admits after.
+pub(crate) fn at_scale_two(rig: &mut TrailRig, at: Instant) {
+    rig.scale(2.0, at);
+}
+
 /// A dark ground the pin sweeps.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Ground {
@@ -560,20 +570,20 @@ fn run_with(
     entry: Entry,
     extra: &str,
 ) -> (TrailRig, Vec<Drawn>) {
-    run_at(ground, page, stand, entry, extra, None, "")
+    run_at(ground, page, stand, entry, extra, (None, "", 2.0))
 }
 
 /// [`run_with`] with the window previewing the live level `live` (the dump's `live <level>`;
 /// `None`: `prism_glass::LIVE`), each typed letter echoed after `ink` (an SGR the echo carries
-/// first; empty: the theme's own ink).
+/// first; empty: the theme's own ink), on a display of `scale`: 2 ([`at_scale_two`], every run
+/// [`run`] makes, whose cells the glass draws under) or the dump's own 1.
 fn run_at(
     ground: Ground,
     page: Page,
     stand: Stand,
     entry: Entry,
     extra: &str,
-    live: Option<Live>,
-    ink: &str,
+    (live, ink, scale): (Option<Live>, &str, f64),
 ) -> (TrailRig, Vec<Drawn>) {
     let mut rig = TrailRig::new(std::path::Path::new(FIXTURE_FONT)).expect("the rig");
     let t0 = rig.t0();
@@ -601,6 +611,9 @@ fn run_at(
             app.config.motion = Some("full".into());
             app.config.trail_sounds = Some(false);
         }),
+    }
+    if scale > 1.0 {
+        at_scale_two(&mut rig, t0);
     }
     rig.grid(8, 40, t0).expect("the grid");
     rig.live(live);
@@ -701,9 +714,10 @@ fn run_at(
 }
 
 /// Every dark ground, under every page, wherever it stands, through both of the host's entries
-/// to the cursor frame: every frame draws by main's rule, and none reaches a light symbol. Each
-/// ground under each page runs on a core of its own, its stands in order (its twin first), each
-/// run on a rig of its own.
+/// to the cursor frame, on a scale-2 display (whose face the glass draws under) and at the dump's
+/// own 1x (whose face draws none, `host::PageFacts::glass`): every frame draws by main's rule,
+/// and none reaches a light symbol. Each ground under each page at each scale runs on a core of
+/// its own, its stands in order (its twin first), each run on a rig of its own.
 #[test]
 fn the_light_fork_is_unreachable_on_every_dark_ground() {
     let grounds = Ground::dark();
@@ -723,11 +737,15 @@ fn the_light_fork_is_unreachable_on_every_dark_ground() {
         "{} dark schemes swept",
         grounds.len() - 1
     );
-    let cases: Vec<(Ground, Page)> = grounds
+    let cases: Vec<(Ground, Page, f64)> = grounds
         .iter()
-        .flat_map(|&ground| Page::ALL.map(|page| (ground, page)))
+        .flat_map(|&ground| {
+            Page::ALL
+                .into_iter()
+                .flat_map(move |page| [2.0, 1.0].map(|scale| (ground, page, scale)))
+        })
         .collect();
-    let swept = aterm_spec::check::each(&cases, |&(ground, page)| {
+    let swept = aterm_spec::check::each(&cases, |&(ground, page, scale)| {
         let (mut runs, mut frames, mut twinned) = (0, 0, 0);
         // Which polarities main's rule read: dark on a plain page, light under DECSCNM and OSC 11.
         let mut polarity = [false; 2];
@@ -736,8 +754,8 @@ fn the_light_fork_is_unreachable_on_every_dark_ground() {
         let mut twins: [Vec<Drawn>; Entry::ALL.len()] = Default::default();
         for stand in Stand::ALL.into_iter().filter(|stand| stand.takes(ground)) {
             for (e, entry) in Entry::ALL.into_iter().enumerate() {
-                let case = format!("{ground} {page:?} {stand:?} {entry:?}");
-                let (_, drawn) = run(ground, page, stand, entry);
+                let case = format!("{ground} {page:?} {stand:?} {entry:?} at {scale}x");
+                let (_, drawn) = run_at(ground, page, stand, entry, "", (None, "", scale));
                 runs += 1;
                 match stand {
                     Stand::Instance => twins[e].clone_from(&drawn),
@@ -784,8 +802,9 @@ fn the_light_fork_is_unreachable_on_every_dark_ground() {
     let tab_stands = Stand::ALL.len() - 1;
     assert_eq!(
         runs,
-        Page::ALL.len() * Entry::ALL.len() * (1 + (grounds.len() - 1) * (1 + tab_stands)),
-        "every ground ran under every page, at every stand that takes it, through both entries"
+        2 * Page::ALL.len() * Entry::ALL.len() * (1 + (grounds.len() - 1) * (1 + tab_stands)),
+        "every ground ran under every page, at every stand that takes it, through both entries, \
+         at both scales"
     );
     assert_eq!(polarity, [true, true], "main's rule read both polarities");
     assert!(twinned > 0, "caret fills were held to their twins");
@@ -841,8 +860,8 @@ fn a_recoloured_caret_beside_its_dark_twin_fails_the_pin() {
 
 /// The light reads' wiring: on a light configured scheme the latch admits, so the reads the pin
 /// holds to [`Light::OFF`] on every dark ground carry its light there, each read from the code
-/// that draws by it. The glass's own symbols (`glass_px`, the ledger's light-owned spans) stay
-/// off while the live phase is [`Live::Off`].
+/// that draws by it. The glass's own symbols (`glass_px`, the ledger's light-owned spans) are
+/// read at [`Live::Glass`] by [`the_glass_reads_carry_the_glass`].
 #[test]
 fn the_light_reads_carry_a_light_schemes_light() {
     let (_, drawn) = run(
@@ -875,18 +894,18 @@ fn the_light_reads_carry_a_light_schemes_light() {
 #[test]
 fn the_glass_reads_carry_the_glass() {
     const RED: &str = "\x1b[38;2;196;38;46m";
-    let broke = |ground: Ground| -> std::collections::BTreeSet<&'static str> {
+    let broke_at = |ground: Ground, scale: f64| -> std::collections::BTreeSet<&'static str> {
         let (_, drawn) = run_at(
             ground,
             Page::Plain,
             Stand::Instance,
             Entry::Present,
             "",
-            Some(Live::Glass),
-            RED,
+            (Some(Live::Glass), RED, scale),
         );
         drawn.iter().flat_map(breaks).collect()
     };
+    let broke = |ground: Ground| broke_at(ground, 2.0);
     let shipped = broke(Ground::Builtin(LIGHT_INSTANCE));
     for read in [
         "light_arms_drawn",
@@ -922,6 +941,22 @@ fn the_glass_reads_carry_the_glass() {
         solving.contains("palettes"),
         "the ribbon holds the solve: {solving:?}"
     );
+    // §15.8 amendment 53: the same frames at the dump's 1x size, whose face lays its thinnest
+    // glyph with no pixel near the full ink, keep the latched light but draw main's paper arm: no
+    // glass read breaks.
+    let short = broke_at(Ground::Builtin(LIGHT_INSTANCE), 1.0);
+    assert!(short.contains("latch"), "the latch admits at 1x: {short:?}");
+    for read in [
+        "light_arms_drawn",
+        "bed glass",
+        "ribbon_glass_into",
+        "glass_px",
+        "glass_drew",
+        "glass_span",
+        "yield",
+    ] {
+        assert!(!short.contains(read), "{read} at 1x: {short:?}");
+    }
 }
 
 /// The pin's negative control (§15.1 P0.9): on a dark ground, a frame forced onto the light

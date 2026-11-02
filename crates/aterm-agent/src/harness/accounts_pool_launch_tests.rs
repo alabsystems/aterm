@@ -11,7 +11,13 @@ pub(crate) fn launch_transition(
     let world = World::new("launch-admission");
     let case = state["case"];
     let cli = if case == 6 { Cli::Kimi } else { Cli::Codex };
-    if case == 1 {
+    if case == 11 {
+        std::fs::write(
+            world.cfg.join(cli.accounts().roster_file),
+            "[[account]]\nlabel='main'\nclass='dedicated'\nheld_by='m2'\n",
+        )
+        .unwrap();
+    } else if case == 1 {
         let store = world.seat().store(cli);
         store.ensure().unwrap();
         std::fs::write(store.state_file(), b"unrelated old cache").unwrap();
@@ -152,6 +158,46 @@ fn intentional_unmanaged_launches_are_successful_no_ops() {
 }
 
 #[test]
+fn a_lone_default_held_elsewhere_refuses_a_managed_launch() {
+    for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
+        for mode in [Mode::Early, Mode::Wall] {
+            for held in [false, true] {
+                let world = World::new("launch-lone-held");
+                std::fs::write(
+                    world.cfg.join("aterm.toml"),
+                    format!("[harness]\naccounts='{}'\n", mode.as_str()),
+                )
+                .unwrap();
+                let holder = if held { "held_by='m2'\n" } else { "" };
+                std::fs::write(
+                    world.cfg.join(cli.accounts().roster_file),
+                    format!("[[account]]\nlabel='main'\nclass='dedicated'\n{holder}"),
+                )
+                .unwrap();
+                let roster = world.seat().bound_roster(cli).unwrap();
+                assert_eq!(roster.rows.len(), 1);
+                let enrolled = accounts::enrolled_in(cli, &roster, &world.home);
+                let reported = super::super::launch_now(
+                    (cli, false, mode),
+                    &roster,
+                    &State::default(),
+                    &enrolled,
+                    None,
+                    NOW,
+                );
+                assert_eq!(reported.is_err(), held, "{cli:?} {mode:?}: {reported:?}");
+                let launched = super::super::launch_env(&world.seat(), cli, &no_usage);
+                assert_eq!(launched.is_err(), held, "{cli:?} {mode:?}: {launched:?}");
+                if !held {
+                    assert_eq!(reported, Ok(None));
+                    assert_eq!(launched, Ok(None));
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn pins_refuse_bad_rows_and_new_walls_release_the_override() {
     for mode in ["off", "early"] {
         for missing in [false, true] {
@@ -231,7 +277,8 @@ fn pins_refuse_bad_rows_and_new_walls_release_the_override() {
 #[test]
 fn managed_launch_refusals_do_not_become_unmanaged_starters() {
     let model = aterm_models_harness::account_pool_launch_model();
-    assert!(aterm_spec::interp::prove_and_catch(&model) > 1);
+    assert_eq!(model.mutant_dials(), (1..=10).collect::<Vec<_>>());
+    assert_eq!(aterm_spec::interp::prove_and_catch(&model), 23);
     for state in aterm_spec::interp::reachable_states(&model) {
         if model.action_enabled("Choose", &state) {
             let next = launch_transition(&state, "Choose");
@@ -239,10 +286,15 @@ fn managed_launch_refusals_do_not_become_unmanaged_starters() {
                 model.successors("Choose", &state).contains(&next),
                 "{state:?}: {next:?}"
             );
-            if state["case"] == 3 {
+            if matches!(state["case"], 3 | 11) {
                 let mut escaped = next;
                 escaped.insert("outcome", 0);
-                assert!(!model.check_invariant("UnreadHeld", &escaped));
+                let law = if state["case"] == 3 {
+                    "UnreadHeld"
+                } else {
+                    "HeldDefaultRefused"
+                };
+                assert!(!model.check_invariant(law, &escaped));
             }
         }
     }

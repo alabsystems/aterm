@@ -372,13 +372,15 @@ pub const fn at_luminance_hue(ink: u32, lt: f32) -> u32 {
         return at_luminance_with(table, ink, lc, lt);
     }
     let [l0, a0, b0] = oklab(ink);
+    let dl = 1.0 - l0;
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
     let (mut lo_rgb, mut hi_rgb) = (ink & 0x00FF_FFFF, 0x00FF_FFFF);
     let mut step = 0;
     while step < 12 {
         step += 1;
         let mid = (lo + hi) * 0.5;
-        let mid_rgb = oklab_to_rgb([l0 + (1.0 - l0) * mid, a0 * (1.0 - mid), b0 * (1.0 - mid)]);
+        let one_minus_mid = 1.0 - mid;
+        let mid_rgb = oklab_to_rgb([l0 + dl * mid, a0 * one_minus_mid, b0 * one_minus_mid]);
         if mid_rgb == lo_rgb {
             lo = mid;
             continue;
@@ -621,7 +623,6 @@ pub const fn dot_look(
     } else {
         1.0
     };
-    let breath = breath.clamp(BREATH_FLOOR, 1.0);
     #[inline]
     const fn strength_at(dark: bool, level: f32) -> f32 {
         if dark {
@@ -645,16 +646,12 @@ pub const fn dot_look(
     let hue = palette.art(row_hue(palette, k, dark), dark);
     let (ink, light) = match mood {
         DotMood::Running | DotMood::Quiet | DotMood::Tool => {
-            let quiet = matches!(mood, DotMood::Quiet);
-            let tool = matches!(mood, DotMood::Tool);
-            let fresh = fade_chroma(hue, if quiet { QUIET_KEEP * sat } else { 1.0 });
-            let fade = match mood {
-                DotMood::Quiet => sat,
-                DotMood::Tool => TOOL_GLOW,
-                _ => 1.0,
+            let (fresh, fade, radius) = match mood {
+                DotMood::Quiet => (fade_chroma(hue, QUIET_KEEP * sat), sat, radius_at(level)),
+                DotMood::Tool => (hue & 0x00FF_FFFF, TOOL_GLOW, TOOL_RADIUS),
+                _ => (hue & 0x00FF_FFFF, 1.0, radius_at(level)),
             };
             let strength = strength_at(dark, level) * fade;
-            let radius = if tool { TOOL_RADIUS } else { radius_at(level) };
             let ink = if dark {
                 at_luminance_hue(fresh, DOT_LUMA_MIN + DOT_LUMA_GAIN * level)
             } else {
@@ -673,6 +670,7 @@ pub const fn dot_look(
         }
         DotMood::Stuck => {
             const INV_BREATH_SPAN: f32 = 1.0 / (1.0 - BREATH_FLOOR);
+            let breath = breath.clamp(BREATH_FLOOR, 1.0);
             let fresh = fade_chroma(hue, sat);
             let ink = if dark {
                 at_luminance_hue(fresh, DOT_LUMA_MIN * breath)
@@ -758,7 +756,7 @@ fn push_radial(
     let (cx, cy) = (i32::from(place.cx), i32::from(place.cy));
     let (clip0, clip1) = (i32::from(place.clip.0), i32::from(place.clip.1));
     let ch_px = i32::from(place.ch);
-    let band_top = cy - (f32::from(place.ch) / 2.0).round() as i32;
+    let band_top = cy - (ch_px + 1) / 2;
     let (rxi, ryi) = (rx.round() as i32, ry.round() as i32);
     let y_min = (cy - ryi).max(clip0);
     let y_max = (cy + ryi).min(clip1);

@@ -17,7 +17,8 @@ fn an_orphan_is_named_with_its_remedy_and_a_live_one_is_not() {
         up: Some(Duration::from_secs(7 * 86_400 + 3600)),
     };
     let note = foreign_note_text(&[(42199, "/tmp/aq/a.sock", &orphan)]).expect("a note");
-    assert!(note.contains("`kill 42199`"), "{note}");
+    assert!(note.contains(SYS_LEFT), "{note}");
+    assert!(!note.contains("kill"), "{note}");
     assert!(note.contains("up 7d 1h"), "{note}");
 
     let live = ForeignFacts::Writer {
@@ -26,13 +27,16 @@ fn an_orphan_is_named_with_its_remedy_and_a_live_one_is_not() {
         up: Some(Duration::from_secs(90)),
     };
     let note = foreign_note_text(&[(7, "/tmp/b.sock", &live)]).expect("a note");
-    assert!(!note.contains("kill"), "{note}");
+    assert!(!note.contains("kill") && !note.contains(SYS_LEFT), "{note}");
     assert!(note.contains("up 1m 30s"), "{note}");
     assert_eq!(foreign_note_text(&[]), None);
     assert_eq!(ForeignFacts::default().describe(), None);
 }
 
 const WRITTEN: u64 = 1_790_000_000;
+
+/// The view an adopted instance's note points at.
+const SYS_LEFT: &str = "`aterm ctl sys left scope=aterm`";
 
 fn at(seconds: u64) -> ProcessBirth {
     ProcessBirth {
@@ -102,7 +106,7 @@ fn a_pid_younger_than_its_entry_is_stale_and_never_offered_a_kill() {
     let writer = judge(orphan_reading(at(WRITTEN - 7 * 86_400)));
     assert!(writer.orphaned(), "{writer:?}");
     let note = foreign_note_text(&[(501, "/tmp/aq/a.sock", &writer)]).expect("a note");
-    assert!(note.contains("`kill 501`"), "{note}");
+    assert!(note.contains(SYS_LEFT), "{note}");
 }
 
 #[test]
@@ -150,7 +154,7 @@ fn a_deleted_binary_is_claimed_only_on_the_kernel_s_word() {
     assert_eq!(facts, ForeignFacts::Unknown, "no path proves nothing");
     assert!(!facts.orphaned());
     let note = foreign_note_text(&[(42199, "/tmp/aq/a.sock", &facts)]).expect("a note");
-    assert!(!note.contains("kill"), "{note}");
+    assert!(!note.contains("kill") && !note.contains(SYS_LEFT), "{note}");
 
     let mut exited = orphan_reading(born);
     exited.birth_after = None;
@@ -204,7 +208,7 @@ fn a_launchd_started_instance_is_never_offered_a_kill() {
     r.lineage = Some(lineage(born, LAUNCHD));
     let facts = judge(r);
     let note = foreign_note_text(&[(42199, "/tmp/aq/a.sock", &facts)]).expect("a note");
-    assert!(!note.contains("kill"), "{note}");
+    assert!(!note.contains("kill") && !note.contains(SYS_LEFT), "{note}");
     assert!(!facts.orphaned(), "{facts:?}");
     assert!(
         matches!(
@@ -220,11 +224,22 @@ fn a_launchd_started_instance_is_never_offered_a_kill() {
     assert!(said.contains("launchd started it"), "{said}");
 }
 
+/// An instance launchd adopted is pointed at `sys left`, which lists it with its proof and the
+/// token `end` takes where the proof offers one: no pid is printed to type, since a pid names
+/// whatever holds it by the time it is typed. NEGATIVE CONTROL: restore a `kill <pid>` clause,
+/// and the note names a pid to type.
 #[test]
-fn an_adopted_instance_is_named_with_its_kill() {
+fn an_adopted_instance_is_named_with_the_pointer_to_sys_left() {
     let facts = judge(orphan_reading(at(WRITTEN - 60)));
     let note = foreign_note_text(&[(42199, "/tmp/aq/a.sock", &facts)]).expect("a note");
-    assert!(note.contains("`kill 42199`"), "{note}");
+    assert!(note.contains(SYS_LEFT), "{note}");
+    assert!(note.contains("`aterm ctl end <token>`"), "{note}");
+    assert!(!note.contains("kill"), "{note}");
+    assert_eq!(
+        note.matches("42199").count(),
+        1,
+        "the pid only in the instance's own row: {note}"
+    );
     assert!(facts.orphaned(), "{facts:?}");
     assert!(
         matches!(
@@ -247,7 +262,7 @@ fn unread_flavors_keep_todays_words_and_offer_no_kill() {
     unread.lineage = None;
     let facts = judge(unread);
     let note = foreign_note_text(&[(42199, "/tmp/aq/a.sock", &facts)]).expect("a note");
-    assert!(!note.contains("kill"), "{note}");
+    assert!(!note.contains("kill") && !note.contains(SYS_LEFT), "{note}");
     assert!(!facts.orphaned(), "{facts:?}");
     assert_eq!(
         facts,
@@ -290,7 +305,7 @@ fn a_lineage_of_another_birth_proves_nothing() {
     let facts = judge(other);
     assert!(!facts.orphaned(), "{facts:?}");
     let note = foreign_note_text(&[(42199, "/tmp/aq/a.sock", &facts)]).expect("a note");
-    assert!(!note.contains("kill"), "{note}");
+    assert!(!note.contains("kill") && !note.contains(SYS_LEFT), "{note}");
 }
 
 /// A lineage that keeps no launcher version (Linux's) says nothing of who launched the process,
@@ -314,15 +329,15 @@ fn a_lineage_without_a_launcher_version_proves_nothing() {
             "launchd {launchd:?}: {facts:?}"
         );
         let note = foreign_note_text(&[(42199, "/tmp/aq/a.sock", &facts)]).expect("a note");
-        assert!(!note.contains("kill"), "{note}");
+        assert!(!note.contains("kill") && !note.contains(SYS_LEFT), "{note}");
     }
 }
 
-/// `aterm ctl`'s hint, when private instances are what it found, offers `kill` for exactly the
-/// writers launchd adopted: never one launchd started, an unjudged one, or a stale entry, and no
-/// hint at all when every entry's writer is gone.
+/// `aterm ctl`'s hint, when private instances are what it found, points at `sys left` only when
+/// a writer launchd adopted is among them, never naming a pid: not for one launchd started, an
+/// unjudged one, or a stale entry, and no hint at all when every entry's writer is gone.
 #[test]
-fn a_foreign_hint_offers_kill_for_exactly_the_adopted_writers() {
+fn a_foreign_hint_points_at_sys_left_for_exactly_the_adopted_writers() {
     let born = at(WRITTEN - 60);
     let writer = |lineage: Option<Lineage>| {
         let mut r = orphan_reading(born);
@@ -359,8 +374,12 @@ fn a_foreign_hint_offers_kill_for_exactly_the_adopted_writers() {
         foreign(503, &ForeignFacts::Stale),
     ])
     .expect("a hint");
-    assert!(said.contains("`kill 42199` ends it"), "{said}");
-    for other in ["501", "502", "503"] {
+    assert!(said.contains(SYS_LEFT), "{said}");
+    assert!(
+        said.contains("lists it with its proof"),
+        "one adopted: {said}"
+    );
+    for other in ["42199", "501", "502", "503"] {
         assert!(!said.contains(other), "{said}");
     }
     let said = hint(&[foreign(501, &started), foreign(502, &unjudged)]).expect("a hint");
@@ -368,7 +387,7 @@ fn a_foreign_hint_offers_kill_for_exactly_the_adopted_writers() {
         said.starts_with("only whoever started a `foreign` instance can drive it"),
         "{said}"
     );
-    assert!(!said.contains("kill"), "{said}");
+    assert!(!said.contains("kill") && !said.contains(SYS_LEFT), "{said}");
     assert_eq!(
         hint(&[
             foreign(503, &ForeignFacts::Stale),
@@ -484,5 +503,115 @@ fn a_process_whose_launcher_exited_reads_as_adopted_through_both_readers() {
             Some(Ok(aterm_uds::process::Ended { gone: true, .. }))
         ),
         "the proven sleep is ended: {ended:?}"
+    );
+}
+
+/// Live (macOS): a job this test submits to launchd, a shell that writes its pid and waits, reads
+/// as started by launchd through both readers, the census's kernel and the reads `ForeignFacts`
+/// judges: the launcher version its lineage keeps is launchd's own pid version. The test removes
+/// the job on its way out, and the job removes itself after five minutes, so a test killed before
+/// its end leaves it running no longer than that. NEGATIVE CONTROL: have `launchd_idversion`
+/// read launchd's `p_orig_ppidversion` for its pid version, and both readers judge the job
+/// adopted.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_process_launchd_started_reads_as_launchd_s_through_both_readers() {
+    use crate::census::{Kernel as _, LiveKernel};
+    /// A hang detector for launchctl and for launchd starting the job, never a budget.
+    const HANG: Duration = Duration::from_secs(60);
+    /// The submitted job's label: dropped, the job is removed, its process group with it.
+    struct Job(String);
+    impl Drop for Job {
+        fn drop(&mut self) {
+            let _ = aterm_uds::deadline::output_within(
+                aterm_uds::spawnfd::command("/bin/launchctl").args(["remove", &self.0]),
+                HANG,
+            );
+        }
+    }
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let written = dir.path().join("pid");
+    let job = Job(format!(
+        "aterm.test.launchd-started.{}",
+        dir.path()
+            .file_name()
+            .expect("the scratch's own name")
+            .to_string_lossy()
+    ));
+    let out = aterm_uds::deadline::output_within(
+        aterm_uds::spawnfd::command("/bin/launchctl")
+            .args(["submit", "-l", &job.0, "--", "/bin/sh", "-c"])
+            .arg(r#"echo $$ > "$1"; /bin/sleep 300; exec /bin/launchctl remove "$2""#)
+            .arg("sh")
+            .arg(&written)
+            .arg(&job.0),
+        HANG,
+    )
+    .expect("launchctl submit runs");
+    assert!(
+        out.status.success(),
+        "launchctl submit {}: {}",
+        job.0,
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    let started = std::time::Instant::now();
+    let pid: u32 = loop {
+        let line = std::fs::read_to_string(&written).unwrap_or_default();
+        if let Some(pid) = line.strip_suffix('\n').and_then(|p| p.parse().ok()) {
+            break pid;
+        }
+        assert!(
+            started.elapsed() < HANG,
+            "launchd never ran {}: {line:?}",
+            job.0
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+
+    let row = LiveKernel
+        .listed()
+        .expect("the table reads")
+        .into_iter()
+        .find(|r| r.pid == pid)
+        .expect("the job is listed");
+    let lineage = LiveKernel.lineage(pid);
+    let launchd = LiveKernel.launchd_version();
+    assert_eq!(
+        Parent::of(row.ppid, lineage.as_ref(), row.birth, launchd),
+        Parent::Launchd,
+        "{row:?} {lineage:?} launchd {launchd:?}"
+    );
+    let reading = ProcessReading::read(pid).expect("the job reads");
+    assert_eq!(
+        Parent::of(
+            reading.parent,
+            reading.lineage.as_ref(),
+            Some(reading.birth),
+            reading.launchd
+        ),
+        Parent::Launchd,
+        "{reading:?}"
+    );
+}
+
+/// W-writer's read: an entry in the rendezvous's `graph` folder naming a live pid proves no
+/// writer when that pid runs no aterm (this test binary), and neither does a folder with no
+/// entry naming it. NEGATIVE CONTROL: read any live pid an entry names as its writer, and this
+/// test binary reads as one.
+#[test]
+fn a_graph_entry_naming_a_program_that_is_no_aterm_proves_no_writer() {
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let me = std::process::id();
+    assert!(!super::graph_writer(dir.path(), me), "no graph folder");
+    std::fs::create_dir(dir.path().join("graph")).expect("graph folder");
+    std::fs::write(
+        dir.path().join("graph").join("a"),
+        format!("sock /tmp/none.sock\npid {me}\n"),
+    )
+    .expect("an entry");
+    assert!(!super::graph_writer(dir.path(), me));
+    assert!(
+        !super::graph_writer(dir.path(), me + 1),
+        "an entry for another pid"
     );
 }

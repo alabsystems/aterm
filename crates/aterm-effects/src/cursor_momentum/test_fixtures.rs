@@ -269,6 +269,7 @@ pub(super) const fn config(dark: bool, hue: u32) -> MomentumGlowConfig {
         theme_fg: if dark { 0x00C8_C8D2 } else { 0x0024_292F },
         theme_bg: if dark { 0x0010_1016 } else { 0x00FF_FFFF },
         block: true,
+        bar: false,
         glyph_span: None,
         light_vivid: false,
         chosen_hue: false,
@@ -328,6 +329,7 @@ pub(super) fn light_page_burst() -> Vec<Ev> {
             hue: if k >= 3 { 0x00CF_222E } else { 0x0009_69DA },
             theme_fg: if k == 4 { 0xFF24_292F } else { 0x0024_292F },
             block: k != 5,
+            bar: false,
             ..cfg
         };
         r.push(Ev::Key { at: now, tau: TAU });

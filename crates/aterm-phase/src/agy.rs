@@ -16,7 +16,7 @@ use crate::wall::{ApiCause, Placement, Wall, WallKind};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 6, "0.6");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 7, "0.7");
 
 const SPINNER: std::ops::RangeInclusive<char> = '\u{2801}'..='\u{28FF}';
 
@@ -603,6 +603,23 @@ pub fn fresh(rows: &[String]) -> bool {
     })
 }
 
+/// The opening exchange whole: the logo naming the build, then one message under it
+/// ([`crate::ScreenReader::opening`]).
+#[must_use]
+pub fn opening(rows: &[String]) -> bool {
+    frame(rows).is_some_and(|f| {
+        rows[..f.top]
+            .iter()
+            .rposition(|r| is_banner_row(r))
+            .is_some_and(|banner| {
+                (banner + 1..f.top)
+                    .filter(|&i| is_user_row(rows, i))
+                    .count()
+                    == 1
+            })
+    })
+}
+
 /// Whether a person's message (its caret row under its rule) stands above the composer, or
 /// anywhere when none is drawn ([`crate::ScreenReader::message_drawn`]).
 #[must_use]
@@ -634,11 +651,21 @@ pub fn said_tail(rows: &[String]) -> Option<String> {
     said_reply(rows).map(|(_, said)| said)
 }
 
+/// The cells agy leaves between a reply's rows and the pane's right edge.
+const REPLY_MARGIN: usize = 2;
+
+/// [`said_tail`], each line agy wrapped across rows read as one ([`crate::wrap::said_lines`]).
+#[must_use]
+pub fn said_lines(rows: &[String], apart: crate::reader::Apart) -> Option<String> {
+    said_reply_rows(rows).map(|(_, said)| crate::wrap::said_lines(rows, &said, REPLY_MARGIN, apart))
+}
+
 /// Whether the reply [`said_tail`] reads is whole on `rows`: a row above its first is on screen
 /// and not part of it (the person's message it answers, or agy's own row).
 #[must_use]
 pub fn said_whole(rows: &[String]) -> bool {
-    said_reply(rows).is_some_and(|(head, _)| head > 1 || (head == 1 && !is_caret_row(&rows[0])))
+    said_reply_rows(rows)
+        .is_some_and(|(head, _)| head > 1 || (head == 1 && !is_caret_row(&rows[0])))
 }
 
 /// Where a walk up the history above the screen stops for a reply [`said_whole`] finds cut: a row
@@ -654,7 +681,16 @@ pub fn said_history_stop(row: &str) -> bool {
 /// blank line. A tool's output under its `●`/`○` row is none.
 #[must_use]
 pub fn turn_said_before(rows: &[String]) -> Option<String> {
-    let (_, said) = turn_before(rows)?;
+    let (_, said) = turn_before(rows, crate::wrap::said_rows)?;
+    (!said.is_empty()).then(|| said.join("\n\n"))
+}
+
+/// [`turn_said_before`], its lines read as [`said_lines`] reads them.
+#[must_use]
+pub fn turn_lines_before(rows: &[String], apart: crate::reader::Apart) -> Option<String> {
+    let (_, said) = turn_before(rows, |said| {
+        crate::wrap::said_lines(rows, said, REPLY_MARGIN, apart)
+    })?;
     (!said.is_empty()).then(|| said.join("\n\n"))
 }
 
@@ -662,7 +698,7 @@ pub fn turn_said_before(rows: &[String]) -> Option<String> {
 /// ([`said_whole`]), and so is the person's message that opened it.
 #[must_use]
 pub fn turn_whole(rows: &[String]) -> bool {
-    said_whole(rows) && turn_before(rows).is_some_and(|(opened, _)| opened)
+    said_whole(rows) && turn_before(rows, crate::wrap::said_rows).is_some_and(|(opened, _)| opened)
 }
 
 /// WHETHER THE LAST TURN RAN A TOOL: a tool's `●`/`○` row under the person's message that opened it, a thought's (`○ Thought for 4.9s (…)`) none.
@@ -701,7 +737,7 @@ pub fn turn_history_stop(row: &str) -> bool {
 /// under it, joined by a space.
 #[must_use]
 pub fn turn_opened_by(rows: &[String]) -> Option<String> {
-    said_reply(rows)?;
+    said_reply_rows(rows)?;
     let f = frame(rows)?;
     let user = last_user(rows, f.top)?;
     let end = (user + 1..f.top)
@@ -715,9 +751,12 @@ pub fn turn_opened_by(rows: &[String]) -> Option<String> {
     Some(text.join(" "))
 }
 
-fn turn_before(rows: &[String]) -> Option<(bool, Vec<String>)> {
+fn turn_before(
+    rows: &[String],
+    read: impl Fn(&[(usize, &str)]) -> String,
+) -> Option<(bool, Vec<String>)> {
     let f = frame(rows)?;
-    let (head, _) = said_reply(rows)?;
+    let (head, _) = said_reply_rows(rows)?;
     let user = last_user(rows, f.top);
     let from = user.map_or(0, |u| {
         (u + 1..f.top).find(|&i| blank(&rows[i])).unwrap_or(f.top)
@@ -739,18 +778,25 @@ fn turn_before(rows: &[String]) -> Option<(bool, Vec<String>)> {
         }
         let output = start > 0 && crate::text::trim_start(&rows[start - 1]).starts_with(['●', '○']);
         if !output {
-            let words: Vec<&str> = rows[start..=last]
-                .iter()
-                .map(|r| crate::text::trim(r))
-                .filter(|t| !t.is_empty())
-                .collect();
-            said.push(words.join("\n"));
+            said.push(read(&texts(rows, start, last)));
         }
     }
     Some((user.is_some(), said))
 }
 
 fn said_reply(rows: &[String]) -> Option<(usize, String)> {
+    said_reply_rows(rows).map(|(head, said)| (head, crate::wrap::said_rows(&said)))
+}
+
+/// Rows `first..=last` of `rows` that hold words, each with its text there, trimmed.
+fn texts(rows: &[String], first: usize, last: usize) -> Vec<(usize, &str)> {
+    (first..=last)
+        .map(|i| (i, crate::text::trim(&rows[i])))
+        .filter(|(_, t)| !t.is_empty())
+        .collect()
+}
+
+fn said_reply_rows(rows: &[String]) -> Option<(usize, Vec<(usize, &str)>)> {
     let f = frame(rows)?;
     if spinning(rows, f.top) {
         return None;
@@ -779,12 +825,7 @@ fn said_reply(rows: &[String]) -> Option<(usize, String)> {
     {
         return None;
     }
-    let out: Vec<&str> = rows[first..=last]
-        .iter()
-        .map(|r| crate::text::trim(r))
-        .filter(|t| !t.is_empty())
-        .collect();
-    Some((head, out.join("\n")))
+    Some((head, texts(rows, first, last)))
 }
 
 /// Whether a person stopped the last turn: under the last message, agy's `⎿ Interrupted · What
@@ -832,7 +873,9 @@ pub fn wall(rows: &[String]) -> Option<Wall> {
 
 fn error_block(rows: &[String], f: Frame) -> Option<(usize, usize)> {
     let from = last_user(rows, f.top).map_or(0, |u| u + 1);
-    let id = (from..f.top).rev().find(|&i| !blank(&rows[i]))?;
+    let id = (from..f.top)
+        .rev()
+        .find(|&i| !blank(&rows[i]) && !is_card_row(&rows[i]))?;
     if !rows[id].starts_with(const { crate::anchor!("agy.error.id") }) {
         return None;
     }
@@ -854,9 +897,72 @@ fn api_status(message: &str) -> Option<u16> {
     })
 }
 
+/// The status in a gRPC-style failure, as reported by the reconstructed agy 1.4.12 quota
+/// fixture: `RESOURCE_EXHAUSTED (code 429): …`.
+fn grpc_status(message: &str) -> Option<u16> {
+    message.match_indices("(code ").find_map(|(at, w)| {
+        let rest = &message[at + w.len()..];
+        let code = rest.get(..3)?;
+        if !code.bytes().all(|b| b.is_ascii_digit()) || !rest[3..].starts_with(')') {
+            return None;
+        }
+        code.parse().ok()
+    })
+}
+
+/// The reset a subscription quota names (`Resets in 4h29m33s`, `Resets in 23h54m15s`,
+/// `Resets in 41s`), as `in <seconds>s`; `None` where none is named or it does not parse.
+fn resets_in(message: &str) -> Option<String> {
+    let lower = message.to_ascii_lowercase();
+    let (at, w) = lower.match_indices("resets in ").last()?;
+    let rest = &lower[at + w.len()..];
+    let mut secs: u64 = 0;
+    let mut digits = String::new();
+    let mut any = false;
+    let mut spaced = false;
+    for c in rest.chars() {
+        if c.is_ascii_whitespace() {
+            spaced = true;
+            continue;
+        }
+        if c.is_ascii_digit() {
+            digits.push(c);
+            spaced = false;
+            continue;
+        }
+        let unit = match c {
+            'd' => 86_400,
+            'h' => 3600,
+            'm' => 60,
+            's' => 1,
+            _ => break,
+        };
+        if digits.is_empty() {
+            if any && spaced {
+                break;
+            }
+            return None;
+        }
+        let n: u64 = digits.parse().ok()?;
+        secs = secs.checked_add(n.checked_mul(unit)?)?;
+        digits.clear();
+        any = true;
+        spaced = false;
+        if unit == 1 {
+            break;
+        }
+    }
+    (any && digits.is_empty()).then(|| format!("in {secs}s"))
+}
+
 const API_KEY_INVALID: &str = "api_key_invalid";
 const QUOTA_EXCEEDED: &str = "exceeded your current quota";
+/// The subscription-quota wording agy 1.4.12 prints directly (`⚠ Individual quota reached. …`)
+/// or inside a gRPC executor failure (`RESOURCE_EXHAUSTED (code 429): Individual quota reached. …`).
+const INDIVIDUAL_QUOTA: &str = "individual quota reached";
 const OVERLOADED: &str = "overloaded";
+/// What agy says before a failure of the model call itself: the backend answered with it.
+const GENERATING: &str = "generating and executing: ";
 
 const OWN_WALLS: [(&str, WallKind); 4] = [
     (crate::anchor!("agy.wall.overloaded"), WallKind::Overloaded),
@@ -905,7 +1011,10 @@ fn failure_kind(message: &str) -> Option<WallKind> {
         return Some(kind);
     }
     let lower = message.to_lowercase();
-    let Some(code) = api_status(message) else {
+    if lower.contains(INDIVIDUAL_QUOTA) {
+        return Some(WallKind::UsageSession);
+    }
+    let Some(code) = api_status(message).or_else(|| grpc_status(message)) else {
         return (crate::wall::is_unreachable(message) || lower.contains("fetch failed")).then_some(
             WallKind::ApiError {
                 code: None,
@@ -953,9 +1062,20 @@ fn failed_turn(rows: &[String], f: Frame) -> Option<Wall> {
         .map(|r| crate::text::trim(r.strip_prefix("⚠ ").unwrap_or(r)))
         .collect::<Vec<_>>()
         .join(" ");
+    // A model call that failed in words no arm here knows (`generating and executing: …`, the
+    // backend's answer) is still a server's error, waited out and tried again, never a reply the
+    // agent gave. A failure before any call (`failed to construct executor: …`, agy's own
+    // settings) stays an ended turn: sent again it meets the same.
+    let kind = failure_kind(&message).or_else(|| {
+        message.contains(GENERATING).then_some(WallKind::ApiError {
+            code: None,
+            retryable: true,
+            cause: ApiCause::Server,
+        })
+    })?;
     Some(Wall {
-        kind: failure_kind(&message)?,
-        reset: retry_delay(&message),
+        kind,
+        reset: retry_delay(&message).or_else(|| resets_in(&message)),
         message,
         row: head,
         placement: Placement::Banner,
@@ -1403,7 +1523,9 @@ fn question_text(row: &str) -> Option<&str> {
     let rest = crate::text::trim(row).strip_prefix("Question ")?;
     let (count, text) = rest.split_once(": ")?;
     let (a, b) = count.split_once('/')?;
-    (a.parse::<u8>().is_ok() && b.parse::<u8>().is_ok()).then_some(text)
+    let uint =
+        |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) && s.parse::<u8>().is_ok();
+    (uint(a) && uint(b)).then_some(text)
 }
 
 const ONBOARDING: [&str; 2] = [
@@ -1495,6 +1617,29 @@ fn onboarding(rows: &[String]) -> Option<PromptV2> {
 #[must_use]
 pub fn composer_rules(rows: &[String]) -> Option<(usize, usize)> {
     frame(rows).map(|f| (f.top, f.bottom))
+}
+
+/// Where the transcript ends on `rows` ([`crate::ScreenReader::transcript_end`]): the spinner row
+/// when a turn is running over the composer, else just past the last transcript row above the
+/// composer (or the feedback survey when it hides the composer, skipping dismissable `┃` notice
+/// cards and blank rows), else past the last non-blank row.
+#[must_use]
+pub fn transcript_end(rows: &[String]) -> usize {
+    let bound = if let Some(f) = frame(rows) {
+        let from = last_user(rows, f.top).map_or(0, |u| u + 1);
+        if let Some(spin) = (from..f.top).find(|&i| is_spinner_row(&rows[i])) {
+            return spin;
+        }
+        f.top
+    } else if let Some(s) = survey(rows) {
+        s.head
+    } else {
+        return rows.iter().rposition(|r| !blank(r)).map_or(0, |i| i + 1);
+    };
+    (0..bound)
+        .rev()
+        .find(|&i| !blank(&rows[i]) && !is_card_row(&rows[i]))
+        .map_or(0, |i| i + 1)
 }
 
 /// Where a running turn's spinner row can be: under this session's last user message above the
@@ -1668,18 +1813,40 @@ fn parse_agy_model_row(text: &str) -> Option<(String, Option<String>)> {
     Some((t.to_owned(), None))
 }
 
+fn is_agy_footer_meta_segment(seg: &str) -> bool {
+    seg == "/tasks"
+        || seg.ends_with(const { crate::anchor!("agy.footer.tasks") })
+        || seg.ends_with(const { crate::anchor!("agy.footer.subagents") })
+}
+
 fn parse_agy_footer_model(row: &str) -> Option<(String, Option<String>)> {
     let t = crate::text::trim_end(row);
+    let right_col = leading_spaces(row) > 2 || crate::text::trim_start(row).contains("  ");
     let right = t.rsplit("  ").next().map(crate::text::trim)?;
     let mut parts = right.split(" \u{00B7} ").map(crate::text::trim);
-    let model = parts
-        .next()
-        .filter(|m| !m.is_empty() && *m != "(initializing...)" && !m.starts_with('?'))?;
-    let effort = parts
-        .next()
-        .map(str::to_ascii_lowercase)
-        .filter(|e| matches!(e.as_str(), "low" | "medium" | "high" | "xhigh" | "max"))?;
-    Some((model.to_owned(), Some(effort)))
+    let model = parts.next().filter(|m| {
+        !m.is_empty()
+            && *m != "(initializing...)"
+            && !m.starts_with('?')
+            && !is_agy_footer_meta_segment(m)
+            && !is_queued_hint(m)
+            && !is_exit_hint(m)
+            && !FOOTERS.iter().any(|(text, _)| m.starts_with(text))
+    })?;
+    match parts.next() {
+        Some(seg) => {
+            let lower = seg.to_ascii_lowercase();
+            if matches!(lower.as_str(), "low" | "medium" | "high" | "xhigh" | "max") {
+                Some((model.to_owned(), Some(lower)))
+            } else if right_col && is_agy_footer_meta_segment(seg) {
+                Some((model.to_owned(), None))
+            } else {
+                None
+            }
+        }
+        None if right_col => Some((model.to_owned(), None)),
+        None => None,
+    }
 }
 
 /// The signed-in email and optional plan on the launch card's second row
@@ -1727,6 +1894,16 @@ pub fn launch_card(rows: &[String]) -> Option<LaunchCard> {
     launch_card_read(rows).map(|read| read.card)
 }
 
+/// THE MODEL AGY'S LIVE FOOTER NAMES (`Gemini 3.1 Pro` of `Gemini 3.1 Pro · low`), never the launch
+/// card's, which names the model the session started on: `None` where the footer names none, as at
+/// a pane under about 40 columns at idle ([`fixtures::lab::NARROW_36_END`], whose draft beside it
+/// names one: [`fixtures::lab::NARROW_36_DRAFT`]).
+#[must_use]
+pub fn footer_model(rows: &[String]) -> Option<String> {
+    let f = frame(rows)?;
+    parse_agy_footer_model(rows.get(f.footer?)?).map(|(model, _)| model)
+}
+
 /// [`launch_card`] with the rows it was read from ([`crate::LaunchCardRead`]): the banner row for
 /// the card's version (and its model when no footer names one), and the footer's row when the
 /// model came from the live footer.
@@ -1744,15 +1921,22 @@ pub fn launch_card_read(rows: &[String]) -> Option<crate::LaunchCardRead> {
         Some((p.top, ver, model, effort))
     });
     let (card, banner, status) = match (card_info, footer_model) {
-        (Some((top, version, _card_model, card_effort)), Some((row, (f_model, f_effort)))) => (
-            LaunchCard {
-                version,
-                model: f_model,
-                effort: f_effort.or(card_effort),
-            },
-            Some(top),
-            Some(row),
-        ),
+        (Some((top, version, card_model, card_effort)), Some((row, (f_model, f_effort)))) => {
+            let effort = if f_model == card_model {
+                f_effort.or(card_effort)
+            } else {
+                f_effort
+            };
+            (
+                LaunchCard {
+                    version,
+                    model: f_model,
+                    effort,
+                },
+                Some(top),
+                Some(row),
+            )
+        }
         (Some((top, version, model, effort)), None) => (
             LaunchCard {
                 version,
@@ -1784,7 +1968,11 @@ fn parse_agy_usage_row(row: &str) -> Option<(&str, u32, Option<String>)> {
     let (group, rest) = row.split_once("Weekly Limit Remaining")?;
     let group = crate::text::trim(group);
     let (pct, after) = crate::text::trim(rest).split_once('%')?;
-    let left: u32 = pct.split_whitespace().next_back()?.parse().ok()?;
+    let left = pct.split_whitespace().next_back()?;
+    if !left.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let left: u32 = left.parse().ok()?;
     if left > 100 {
         return None;
     }
@@ -1812,7 +2000,11 @@ pub fn usage_card_weekly_for_model(
         .or_else(|| launch_card(rows).map(|c| c.model));
     let third_party = active_model.as_deref().is_some_and(|m| {
         let lower = m.to_ascii_lowercase();
-        lower.contains("claude") || lower.contains("gpt")
+        lower.contains("claude")
+            || lower.contains("opus")
+            || lower.contains("sonnet")
+            || lower.contains("haiku")
+            || lower.contains("gpt")
     });
     let matches_group = |group: &str| {
         let lower = group.to_ascii_lowercase();
@@ -2015,6 +2207,38 @@ pub mod fixtures {
         /// A per-day 429, RetryInfo 41397.204181s: not retried.
         pub const ERROR_429_LONG: &str =
             include_str!("fixtures/agy-1.4.0-lab-error-day429long.txt");
+        /// agy 1.4.12's subscription quota for a signed-in account, `RESOURCE_EXHAUSTED (code 429):
+        /// Individual quota reached. … Resets in 4h29m33s.`, reported at once (reconstructed from
+        /// its log, not captured).
+        pub const ERROR_429_INDIVIDUAL: &str =
+            include_str!("fixtures/agy-1.4.12-error-429-individual-quota.txt");
+        /// agy 1.4.12's measured subscription-quota wall (`⚠ Individual quota reached. … Resets in
+        /// 124h19m39s.`), with a background command task running in the panel under the composer
+        /// and `/model` switched onto `Claude Opus 5.5 · high`.
+        pub const WALL_INDIVIDUAL_QUOTA: &str =
+            include_str!("fixtures/agy-1.4.12-wall-individual-quota.txt");
+        /// agy 1.4.12 at a 30-column pane: the end of a turn whose reply is 14 short rows, its
+        /// footer `? for shortcuts` alone (the model left off beside it).
+        pub const NARROW_30_END: &str = include_str!("fixtures/agy-1.4.12-lab-narrow-30-end.txt");
+        /// [`NARROW_30_END`] with `a note for later` typed: the footer's left blank, the model back.
+        pub const NARROW_30_DRAFT: &str =
+            include_str!("fixtures/agy-1.4.12-lab-narrow-30-draft.txt");
+        /// [`NARROW_30_END`] at 36 columns: the model still left off.
+        pub const NARROW_36_END: &str = include_str!("fixtures/agy-1.4.12-lab-narrow-36-end.txt");
+        /// [`NARROW_36_END`] with `a note for later` typed: the model back.
+        pub const NARROW_36_DRAFT: &str =
+            include_str!("fixtures/agy-1.4.12-lab-narrow-36-draft.txt");
+        /// [`NARROW_30_END`] at 44 columns: `? for shortcuts` and the model both drawn.
+        pub const NARROW_44_END: &str = include_str!("fixtures/agy-1.4.12-lab-narrow-44-end.txt");
+        /// [`NARROW_44_END`] with `a note for later` typed.
+        pub const NARROW_44_DRAFT: &str =
+            include_str!("fixtures/agy-1.4.12-lab-narrow-44-draft.txt");
+        /// The end of a turn whose reply is 14 short rows, at 144 columns.
+        pub const LONG_REPLY_END: &str = include_str!("fixtures/agy-1.4.12-lab-long-reply-end.txt");
+        /// [`LONG_REPLY_END`] under 60 lines pasted as one bracketed paste: one composer row,
+        /// `[Pasted text #1 +60 lines]`, the footer's left side blank and the model drawn, as
+        /// beside a draft.
+        pub const TALL_PASTE: &str = include_str!("fixtures/agy-1.4.12-lab-tall-paste.txt");
         /// A command task running on after the turn: the panel (`  ● [17:50:42] … running`)
         /// under the empty composer, the footer counting `1 task(s)`.
         pub const BG_TASK: &str = include_str!("fixtures/agy-1.4.0-lab-bg-task.txt");

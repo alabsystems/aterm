@@ -218,6 +218,10 @@ impl Default for RenderCell {
     }
 }
 
+/// The least WCAG contrast between a glyph's ink and its ground at which
+/// [`Terminal::screen_row_echo_cells_into`] counts the glyph shown.
+pub const ECHO_MIN_CONTRAST: f32 = 1.5;
+
 type PlainStyleKey = (crate::grid::PackedColors, CellFlags, bool);
 
 type PlainStyle = ([u8; 3], [u8; 3], UnderlineStyle, bool, bool, bool, bool);
@@ -294,6 +298,64 @@ impl Terminal {
     #[inline]
     pub fn render_row_at_screen_into(&self, screen_row: usize, out: &mut Vec<RenderCell>) {
         self.render_row_into_impl(screen_row, out, None, true);
+    }
+
+    /// The live screen row `row` as an echo proof reads it, whatever the viewport shows (scroll
+    /// does not move it, as [`Self::print_anchor_glyph`] reads): `chars` gets every column's
+    /// char in [`Self::row_cols_into`]'s convention (`'\0'` at a wide continuation, `' '` for a
+    /// blank) and `visible` whether that column's glyph is shown. A glyph is shown when it is not
+    /// concealed (SGR 8), carries no combining mark and no image, and both the colours its program
+    /// asked for (resolved through the live palette, no contrast floor) and the colours it is
+    /// drawn in contrast by at least [`ECHO_MIN_CONTRAST`]. Both vectors are cleared first and left
+    /// empty for a row past the screen; `drawn` is scratch.
+    pub fn screen_row_echo_cells_into(
+        &self,
+        row: u16,
+        chars: &mut Vec<char>,
+        visible: &mut Vec<bool>,
+        drawn: &mut Vec<RenderCell>,
+    ) {
+        chars.clear();
+        visible.clear();
+        if row >= self.grid.rows() {
+            drawn.clear();
+            return;
+        }
+        self.render_row_at_screen_into(usize::from(row), drawn);
+        let blank = self.implicit_blank_render_cell();
+        let view = self.grid.screen_row_view(row);
+        let (palette, fg0, bg0) = (
+            self.color_palette(),
+            self.default_foreground(),
+            self.default_background(),
+        );
+        let reverse = self.modes().reverse_video();
+        let rgb = |c: [u8; 3]| aterm_types::Rgb {
+            r: c[0],
+            g: c[1],
+            b: c[2],
+        };
+        let cols = self.grid.cols();
+        chars.reserve(usize::from(cols));
+        visible.reserve(usize::from(cols));
+        for col in 0..cols {
+            chars.push(view.col_char(col));
+            let shown = drawn.get(usize::from(col)).unwrap_or(&blank);
+            let drawn_contrast = super::color_resolve::contrast_ratio(rgb(shown.fg), rgb(shown.bg));
+            let asked = match view.cell(col) {
+                None => true,
+                Some(cell) => {
+                    let extra = view.cell_data(col, cell).cell_extra();
+                    let (fg, bg) = super::color_resolve::resolve_colors(
+                        &cell, extra, palette, fg0, bg0, reverse,
+                    );
+                    !cell.flags().contains(CellFlags::HIDDEN)
+                        && extra.is_none_or(|e| e.combining().is_empty() && e.images().is_empty())
+                        && super::color_resolve::contrast_ratio(fg, bg) >= ECHO_MIN_CONTRAST
+                }
+            };
+            visible.push(asked && drawn_contrast >= ECHO_MIN_CONTRAST);
+        }
     }
 
     fn render_row_into_impl(

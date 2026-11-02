@@ -339,6 +339,20 @@ impl Terminal {
         }
     }
 
+    /// Trim only the primary history between replayed input slices. A slice is
+    /// processed in full before this call, so it may still use every row it
+    /// created; the next recorded slice was admitted against this same suffix.
+    #[must_use]
+    pub fn trim_replay_history(&mut self, max_history: usize) -> bool {
+        if self.modes.alternate_screen {
+            self.alt_grid
+                .as_mut()
+                .is_none_or(|main| main.trim_replay_history(max_history))
+        } else {
+            self.grid.trim_replay_history(max_history)
+        }
+    }
+
     /// Authorize a clipboard access class for parser-origin sequences: `Write` covers OSC 52 set/clear and OSC 1337 `CopyToClipboard` / `EndCopy` / `Copy=`; `Query` covers OSC 52 queries.
     #[inline]
     pub const fn authorize_clipboard_access(
@@ -448,6 +462,29 @@ impl Terminal {
     #[must_use]
     pub const fn kitty_graphics_commands(&self) -> u64 {
         self.transient.kitty_commands
+    }
+
+    /// Whether either grid or the image protocols retain image state.
+    /// Includes stored, virtual, floating, and incomplete Kitty transmissions;
+    /// history images are checked even when no image remains on screen.
+    #[must_use]
+    pub fn has_image_state(&self) -> bool {
+        let t = &self.transient;
+        !t.kitty_images.is_empty()
+            || !t.kitty_frames.is_empty()
+            || !t.kitty_variants.is_empty()
+            || !t.kitty_virtual.is_empty()
+            || !t.kitty_relations.is_empty()
+            || !t.kitty_floating.is_empty()
+            || !t.kitty_numbers.is_empty()
+            || t.kitty_pending.is_some()
+            || self.sixel.pending_image.is_some()
+            || self.grid.extras().any_image()
+            || self.grid.history_any_image(&|_| true)
+            || self
+                .alt_grid
+                .as_ref()
+                .is_some_and(|grid| grid.extras().any_image() || grid.history_any_image(&|_| true))
     }
 
     /// Number of Kitty unscrolls (`CSI n + T`) run on the main screen since construction, whatever each pulled: a pure counter, never reset.
@@ -619,6 +656,13 @@ impl Terminal {
             Some((row, col)) => Some((row, col, self.transient.print_anchor_seq)),
             None => None,
         }
+    }
+
+    /// The per-print sequence [`Self::print_anchor`] carries, read also while no anchor is set: it advances on every PTY print run and on nothing else.
+    #[inline]
+    #[must_use]
+    pub const fn print_seq(&self) -> u64 {
+        self.transient.print_anchor_seq
     }
 
     /// What the active grid holds now at the echo anchor run's last cell (`(row, col - 1)` of [`Self::print_anchor`], independent of scroll), in [`Self::row_cols_into`]'s per-column convention: the lead char, `'\0'` at a wide continuation, `' '` for a blank.

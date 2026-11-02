@@ -27,8 +27,8 @@ use crate::pipeline::{HeldCommit, Link};
 use crate::presence::{Fields, Marked, Mode, Slot};
 use crate::render::trust_of;
 use crate::state::{
-    Asked, BridgeLock, Deadline, InFlight, LogWitness, PublishIdentity, PublishPin, StandingHalt,
-    StateDir, TopicCursor, ASKED_KEEP, DEADLINES_KEEP, INC_MAX,
+    asks, Asked, BridgeLock, Deadline, InFlight, LogWitness, PublishIdentity, PublishPin,
+    StandingHalt, StateDir, TopicCursor, ASKED_KEEP, DEADLINES_KEEP, INC_MAX,
 };
 use crate::subject::{self, Reject};
 use crate::transport::{self, Backoff, Conn};
@@ -51,7 +51,7 @@ fn ack_deadline() -> Duration {
     static AT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
     *AT.get_or_init(|| {
         aterm_types::dev_seam!(ACK_DEADLINE_SEAM)
-            .and_then(|ms| ms.to_str()?.parse::<u64>().ok())
+            .and_then(|ms| crate::parse_uint::<u64>(ms.to_str()?))
             .map_or(ACK_DEADLINE, Duration::from_millis)
     })
 }
@@ -70,7 +70,7 @@ fn live_deadline() -> Duration {
     static AT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
     *AT.get_or_init(|| {
         aterm_types::dev_seam!(LIVE_DEADLINE_SEAM)
-            .and_then(|ms| ms.to_str()?.parse::<u64>().ok())
+            .and_then(|ms| crate::parse_uint::<u64>(ms.to_str()?))
             .map_or(LIVE_DEADLINE, Duration::from_millis)
     })
 }
@@ -232,7 +232,7 @@ fn reclaim_after() -> Duration {
     static AT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
     *AT.get_or_init(|| {
         aterm_types::dev_seam!(RECLAIM_AFTER_SEAM)
-            .and_then(|ms| ms.to_str()?.parse::<u64>().ok())
+            .and_then(|ms| crate::parse_uint::<u64>(ms.to_str()?))
             .map_or(RECLAIM_AFTER, Duration::from_millis)
     })
 }
@@ -357,6 +357,12 @@ fn parse_bridge_roster<'a>(
                 "malformed bridge roster row",
             ));
         }
+        if local.is_empty() || !local.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid bridge roster local id",
+            ));
+        }
         let local = local.parse::<u64>().map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidData, "invalid bridge roster local id")
         })?;
@@ -469,11 +475,17 @@ fn parse_batch_status<'a>(
     let mut agent_deferred = false;
     for tok in tokens {
         if let Some(v) = tok.strip_prefix("sid=") {
-            if sid.replace(v.parse::<u64>().ok()?).is_some() {
+            if v.is_empty()
+                || !v.bytes().all(|b| b.is_ascii_digit())
+                || sid.replace(v.parse::<u64>().ok()?).is_some()
+            {
                 return None;
             }
         } else if let Some(v) = tok.strip_prefix("revision=") {
-            if revision.replace(v.parse::<u64>().ok()?).is_some() {
+            if v.is_empty()
+                || !v.bytes().all(|b| b.is_ascii_digit())
+                || revision.replace(v.parse::<u64>().ok()?).is_some()
+            {
                 return None;
             }
         } else if let Some(v) = tok.strip_prefix("hold=") {
@@ -538,7 +550,11 @@ fn parse_batch_rows<'a>(
     let mut seen = BTreeSet::new();
     for line in lines {
         let mut words = line.split_whitespace();
-        let Some(local) = words.next().and_then(|w| w.parse::<u64>().ok()) else {
+        let Some(local) = words
+            .next()
+            .filter(|w| !w.is_empty() && w.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|w| w.parse::<u64>().ok())
+        else {
             continue;
         };
         let Some(expected_sid) = locals.get(&local) else {
@@ -1182,7 +1198,11 @@ pub struct Bridge {
     halt_unconfirmed: bool,
     halt_ack_pending: Option<u64>,
     halt_reason: String,
-    committed: u64,
+    /// The furthest offset this run's inbox commits have landed through on this log, or
+    /// `None` before one has (and again once the log's offsets are forgotten): a fresh log's
+    /// first record sits at offset 0, so a bare 0 could not tell that record committed from
+    /// nothing committed ([`Bridge::committed_through`]).
+    committed: Option<u64>,
     commit_refused: bool,
     endpoint_lane: u32,
     mirror: Option<Box<mirror_run::MirrorRun>>,
@@ -1253,20 +1273,21 @@ pub struct Bridge {
     seq_block: Option<SeqBlock>,
     lanes_opened: BTreeSet<String>,
     deadlines: BTreeMap<u64, Deadline>,
-    /// The deadline table's changes no write of it has taken yet, by the ask's offset, with its
-    /// asker: a deadline noted, or one settled, expired or dropped, that the disk does not hold
-    /// as `deadlines` does (item F4). Empty once a write takes. It stays small while the disk
-    /// refuses: a post held over its own unwritten deadline holds its sender's queue, and an
-    /// answer withheld over its own holds the inbox, so each entry is a deadline the table
-    /// held, or one more per sender.
+    /// The deadline table's changes no write of the asks journal has taken yet, by the ask's
+    /// offset, with its asker: a deadline noted, or one settled, expired or dropped, that the
+    /// disk does not hold as `deadlines` does (item F4). Empty once a write takes
+    /// ([`Bridge::persist_asks`]): the state dir notes every change in the journal's index
+    /// whether its write takes or not, and a write after a refused one rewrites the file from
+    /// that index. It stays small while the disk refuses: a post held over its own unwritten
+    /// deadline holds its sender's queue, and an answer withheld over its own holds the inbox,
+    /// so each entry is a deadline the table held, or one more per sender.
     deadlines_unwritten: BTreeMap<u64, String>,
-    /// Asks whose post was left queued because their deadline was not on disk
-    /// ([`Bridge::note_deadline`]): the retry at the post's pin notes the deadline again, and
-    /// one settled meanwhile (its answer delivered, or the sweep's `expired` published, while
-    /// the post was held) is not armed again (F4 review).
-    deadlines_held: BTreeSet<u64>,
     asked: BTreeMap<u64, String>,
     expired: BTreeMap<u64, String>,
+    /// The asks a record settled while no deadline of theirs stood, by offset, with their asker:
+    /// what a held post's retry settles instead of arming
+    /// ([`Bridge::settle_a_retry_answered_ahead`]).
+    settled_unarmed: BTreeMap<u64, String>,
     deadline_due: Instant,
     closers: Vec<(Source, Arc<BusCloser>)>,
     link: LinkReport,
@@ -1481,6 +1502,7 @@ impl Bridge {
         let log_witness = state.log_witness().unwrap_or_default();
         let acked = state.self_acked_log();
         let mirror = mirror_run::MirrorRun::new(cfg.log, &state, fx.now(), || fx.alias_key());
+        let (asked, deadlines) = state.asks_tables();
         let now = fx.now();
         Ok(Self {
             node,
@@ -1499,11 +1521,11 @@ impl Bridge {
             collided: None,
             seq_block: None,
             lanes_opened: BTreeSet::new(),
-            deadlines: state.deadlines().into_iter().map(|d| (d.off, d)).collect(),
+            deadlines: deadlines.into_iter().map(|d| (d.off, d)).collect(),
             deadlines_unwritten: BTreeMap::new(),
-            deadlines_held: BTreeSet::new(),
-            asked: state.asked().into_iter().map(|a| (a.off, a.to)).collect(),
+            asked: asked.into_iter().map(|a| (a.off, a.to)).collect(),
             expired: BTreeMap::new(),
+            settled_unarmed: BTreeMap::new(),
             deadline_due: now + roster_refresh(),
             state,
             caps,
@@ -1558,7 +1580,7 @@ impl Bridge {
             halt_unconfirmed: false,
             halt_ack_pending: None,
             halt_reason: String::new(),
-            committed: 0,
+            committed: None,
             commit_refused: false,
             endpoint_lane: 0,
             mirror,
@@ -2053,11 +2075,11 @@ impl Bridge {
             (Then::Mirror { .. }, _) => {}
             (Then::Post(sent), outcome) => self.conclude_post(*sent, outcome),
             (Then::Commit { upto, .. }, Ok(_)) => {
-                self.committed = self.committed.max(upto);
+                self.note_committed(upto);
                 self.commit_refused = false;
                 if self
                     .inbox_pending
-                    .is_some_and(|owed| owed <= self.committed)
+                    .is_some_and(|owed| self.committed_through(owed))
                 {
                     self.inbox_pending = None;
                 }
@@ -2831,7 +2853,7 @@ impl Bridge {
             self.drop_deadline(*off);
         }
         if !orphaned.is_empty() {
-            self.persist_deadlines();
+            self.persist_asks();
         }
         Ok(fresh)
     }
@@ -3577,7 +3599,7 @@ impl Bridge {
             return None;
         }
         let upto = self.inbox_pending?;
-        if upto < self.committed || (upto == self.committed && upto != 0) {
+        if self.committed_through(upto) {
             return None;
         }
         #[cfg(test)]
@@ -3619,7 +3641,7 @@ impl Bridge {
         let Some(upto) = self.inbox_pending else {
             return;
         };
-        if upto < self.committed || (upto == self.committed && upto != 0) {
+        if self.committed_through(upto) {
             self.inbox_pending = None;
             return;
         }
@@ -3658,7 +3680,7 @@ impl Bridge {
         let Some(upto) = self.inbox_pending.and_then(|off| self.commit_target(off)) else {
             return;
         };
-        if upto < self.committed || (upto == self.committed && upto != 0) {
+        if self.committed_through(upto) {
             return;
         }
         match self.state.set_inbox_owed(upto) {
@@ -4075,7 +4097,7 @@ impl Bridge {
         if self.fault == Fault::LoseAtermBeforeDeliver {
             self.fault = Fault::None;
             Fault::LoseAtermBeforeDeliver.fired(&self.state);
-            let _ = self.ctl.get_ref().shutdown(std::net::Shutdown::Both);
+            let _ = self.ctl.shutdown(std::net::Shutdown::Both);
         }
         let mut taken = None;
         let outcome = match self.ctl_request(&line) {
@@ -4084,7 +4106,7 @@ impl Bridge {
                     .header()
                     .split_whitespace()
                     .nth(1)
-                    .and_then(|n| n.parse::<u64>().ok());
+                    .and_then(crate::parse_uint::<u64>);
                 Delivery::Accounted
             }
             Ok(reply) => match deliver_verdict(reply.header(), topic.is_some()) {
@@ -4726,7 +4748,7 @@ impl Bridge {
         let (off, deduped) = self.observe(started, answer, None)?;
         self.bus_high = self.bus_high.max(off.saturating_add(1));
         if !deduped {
-            self.committed = self.committed.max(upto);
+            self.note_committed(upto);
         }
         Ok((off, deduped))
     }
@@ -5084,78 +5106,87 @@ impl Bridge {
         }
     }
 
-    /// Note the deadline of the ask at `off`, and say whether the table that holds it is on
-    /// disk. A post whose deadline is not stays queued ([`Bridge::post_landed`]): a bridge that
-    /// dies before the table is written leaves the next one no deadline to sweep, and the ask
-    /// never expires (item F4: the sim's world found a refused write of the table lose one
-    /// across a kill). The retry lands at its pin and notes it again, which writes the table
-    /// a refused write left behind.
+    /// Note the deadline of the ask at `off`, write what the asks journal owes (the ask's
+    /// recipient [`Bridge::note_asked`] noted with it, in the same append), and say whether the
+    /// journal on disk holds the deadline. A post whose deadline it does not stays queued
+    /// ([`Bridge::post_landed`]): a bridge that dies before it is written leaves the next one no
+    /// deadline to sweep, and the ask never expires (item F4: the sim's world found a refused
+    /// write of the table lose one across a kill). The retry lands at its pin and notes it
+    /// again, which writes what a refused write left behind.
     ///
     /// NOTED ONCE (F4 review): a deadline the held post's first landing noted is not noted
-    /// afresh by its retry. While the post was held its ask may have been settled, its answer
-    /// delivered or the sweep's `expired` published, which took the deadline out of the table;
-    /// armed again at `now + dl`, it would expire an ask whose answer, or whose `expired`, the
-    /// asker holds once retention gave that record up.
+    /// afresh by its retry, and one settled since is not armed again. While the post was held its
+    /// ask may have been settled, its answer delivered or the sweep's `expired` published, which
+    /// took the deadline out of the table; armed again at `now + dl`, it would expire an ask whose
+    /// answer, or whose `expired`, the asker holds once retention gave that record up. The
+    /// settle is the journal's ([`StateDir::deadline_settled`], `asks::Frame::DeadlineGone`):
+    /// written, it holds for a retry by the next bridge too, after a kill (C04: a bridge before
+    /// it held the post's ask in memory only).
     fn note_deadline(&mut self, sid: &str, off: u64, dl: u64, to: Option<String>) -> bool {
-        let held = self.deadlines_held.remove(&off);
-        if !held && !self.deadlines.contains_key(&off) {
+        #[cfg(test)]
+        let settled = !self.fx.mutant(crate::sim::world::Mutant::ArmOverASettle)
+            && self.state.deadline_settled(off, sid);
+        #[cfg(not(test))]
+        let settled = self.state.deadline_settled(off, sid);
+        if !settled && !self.deadlines.contains_key(&off) {
             let was_empty = self.deadlines.is_empty();
-            self.deadlines.insert(
+            let deadline = Deadline {
                 off,
-                Deadline {
-                    off,
-                    sid: sid.to_string(),
-                    at: self.fx.wall_ms().saturating_add(dl),
-                    dl,
-                    to,
-                },
-            );
+                sid: sid.to_string(),
+                at: self.fx.wall_ms().saturating_add(dl),
+                dl,
+                to,
+            };
+            self.deadlines.insert(off, deadline.clone());
             self.deadlines_unwritten.insert(off, sid.to_string());
             while self.deadlines.len() > DEADLINES_KEEP {
                 if let Some((trimmed, d)) = self.deadlines.pop_first() {
                     self.deadlines_unwritten.insert(trimmed, d.sid);
                 }
             }
+            self.note_asks([asks::Frame::Deadline(deadline)]);
             self.arm_deadline_sweep(was_empty, false);
         }
-        let on_disk = self.deadline_on_disk(off);
-        if !on_disk {
-            self.deadlines_held.insert(off);
-            while self.deadlines_held.len() > DEADLINES_KEEP {
-                self.deadlines_held.pop_first();
-            }
-        }
-        on_disk
+        self.deadline_on_disk(off)
     }
 
-    /// Whether the table on disk holds what `deadlines` does at `off`: no change there is
-    /// unwritten, or a write of the table takes now.
+    /// Whether the journal on disk holds what `deadlines` does at `off`, after a write of what
+    /// it owes: that write took, or no change at `off` is unwritten.
     fn deadline_on_disk(&mut self, off: u64) -> bool {
-        !self.deadlines_unwritten.contains_key(&off) || self.persist_deadlines()
+        self.persist_asks() || !self.deadlines_unwritten.contains_key(&off)
     }
 
-    /// Take the deadline at `off` out of the table, its removal unwritten until a write takes.
+    /// Take the deadline at `off` out of the table, its settle owed to the asks journal and its
+    /// removal unwritten until a write takes.
     fn drop_deadline(&mut self, off: u64) {
         if let Some(d) = self.deadlines.remove(&off) {
+            self.note_asks([asks::Frame::DeadlineGone {
+                off,
+                sid: d.sid.clone(),
+            }]);
             self.deadlines_unwritten.insert(off, d.sid);
         }
     }
 
+    /// Note who the ask at `off` went to: owed to the asks journal, written by the next write
+    /// with the ask's deadline where it has one ([`Bridge::post_landed`]).
     fn note_asked(&mut self, off: u64, to: &str) {
         self.asked.insert(off, to.to_string());
         while self.asked.len() > ASKED_KEEP {
             self.asked.pop_first();
         }
-        let list: Vec<Asked> = self
-            .asked
-            .iter()
-            .map(|(off, to)| Asked {
-                off: *off,
-                to: to.clone(),
-            })
-            .collect();
-        if let Err(e) = self.state.set_asked(&list) {
-            stderr_line!("aterm-link: could not persist the asked table: {e}");
+        self.note_asks([asks::Frame::Asked(Asked {
+            off,
+            to: to.to_string(),
+        })]);
+    }
+
+    /// Owe `frames` to the asks journal ([`StateDir::note_asks`]). One whose record would not
+    /// read back is noted nowhere, and said: the bridge's own tables never hold one, since
+    /// every asker and recipient is a principal.
+    fn note_asks(&self, frames: impl IntoIterator<Item = asks::Frame>) {
+        if let Err(e) = self.state.note_asks(frames) {
+            stderr_line!("aterm-link: the asks journal cannot hold this: {e}");
         }
     }
 
@@ -5184,29 +5215,41 @@ impl Bridge {
     /// `sid`'s, or one whose removal is written, is delivered whatever else a refused write left
     /// unwritten, as before item F4; one whose removal a refused write left unwritten (this
     /// one, tried before, or the sweep's after its `expired`) waits until a write takes.
+    ///
+    /// ONE STILL TO BE ARMED IS REMEMBERED (C04): the deadline can come after this record, where
+    /// an earlier bridge's write of it was refused and that bridge died, and this one reads the
+    /// answer ahead of the post's retry, which settles it then
+    /// ([`Bridge::settle_a_retry_answered_ahead`]). It is
+    /// held in memory and costs the answer no write, so a kill before the retry forgets it: the
+    /// next bridge arms the deadline and its sweep reads the answer back from the bus.
     fn settle_deadline_for(&mut self, sid: &str, off: u64) -> bool {
         if self.deadlines.get(&off).is_some_and(|d| d.sid == sid) {
             self.drop_deadline(off);
+        } else if !self.deadlines.contains_key(&off) {
+            self.settled_unarmed.insert(off, sid.to_string());
+            while self.settled_unarmed.len() > EXPIRED_KEEP {
+                self.settled_unarmed.pop_first();
+            }
         }
         let unwritten = !self.deadlines.contains_key(&off)
             && self
                 .deadlines_unwritten
                 .get(&off)
                 .is_some_and(|asker| asker == sid);
-        !unwritten || self.persist_deadlines()
+        !unwritten || self.persist_asks()
     }
 
-    /// Write the deadline table, and say whether it is on disk now; a refusal leaves
-    /// [`Bridge::deadlines_unwritten`] for the next write to take.
-    fn persist_deadlines(&mut self) -> bool {
-        let list: Vec<Deadline> = self.deadlines.values().cloned().collect();
-        match self.state.set_deadlines(&list) {
+    /// Write what the asks journal owes ([`StateDir::write_asks`]: one append, or a rewrite
+    /// after a refused write), and say whether the journal holds everything the bridge noted
+    /// now; a refusal leaves [`Bridge::deadlines_unwritten`] for the next write to take.
+    fn persist_asks(&mut self) -> bool {
+        match self.state.write_asks() {
             Ok(()) => {
                 self.deadlines_unwritten.clear();
                 true
             }
             Err(e) => {
-                stderr_line!("aterm-link: could not persist the deadline table: {e}");
+                stderr_line!("aterm-link: could not persist the asks journal: {e}");
                 false
             }
         }
@@ -5280,7 +5323,7 @@ impl Bridge {
             }
         }
         if changed {
-            self.persist_deadlines();
+            self.persist_asks();
         }
     }
 
@@ -5584,10 +5627,21 @@ impl Bridge {
         match self.inbox_commit_floor() {
             Some(floor) if off >= floor => {
                 let below = floor.checked_sub(1)?;
-                (below > self.committed).then_some(below)
+                (!self.committed_through(below)).then_some(below)
             }
             _ => Some(off),
         }
+    }
+
+    /// Whether this run's inbox commits already reach `off`: `false` before any has landed,
+    /// at offset 0 too.
+    fn committed_through(&self, off: u64) -> bool {
+        self.committed.is_some_and(|through| off <= through)
+    }
+
+    /// An inbox commit through `upto` landed.
+    fn note_committed(&mut self, upto: u64) {
+        self.committed = Some(self.committed.map_or(upto, |through| through.max(upto)));
     }
 
     fn inbox_commit_floor(&self) -> Option<u64> {
@@ -6020,9 +6074,9 @@ impl Bridge {
         self.acked_appendable = acked.appendable;
         self.deadlines.retain(|off, _| kept(*off));
         self.deadlines_unwritten.retain(|off, _| kept(*off));
-        self.deadlines_held.retain(|off| kept(*off));
         self.asked.retain(|off, _| kept(*off));
         self.expired.retain(|off, _| kept(*off));
+        self.settled_unarmed.retain(|off, _| kept(*off));
         let open = before - self.deadlines.len();
         for cursors in self.per_sid.topics.values_mut() {
             for cursor in cursors.values_mut() {
@@ -6048,7 +6102,7 @@ impl Bridge {
         self.commit_floor = self.commit_floor.filter(|o| kept(*o));
         self.indexed_subjects.clear();
         self.seen_nodes.clear();
-        self.committed = 0;
+        self.committed = None;
         #[cfg(test)]
         let kept = |off: u64| {
             kept(off)
@@ -6170,7 +6224,7 @@ impl Bridge {
                     .and_then(|by_topic| by_topic.get(topic))
                     .map(|cursor| cursor.next);
                 let next = match held
-                    .or_else(|| since.strip_prefix('@').and_then(|n| n.parse::<u64>().ok()))
+                    .or_else(|| since.strip_prefix('@').and_then(crate::parse_uint::<u64>))
                 {
                     Some(next) => next,
                     None => match self.fresh_broadcast_head() {
@@ -6262,7 +6316,7 @@ impl Bridge {
             .header()
             .split_whitespace()
             .find_map(|w| w.strip_prefix("seen="))
-            .and_then(|n| n.parse::<u64>().ok());
+            .and_then(crate::parse_uint::<u64>);
         if !self.load_persisted_topics(sid) {
             return false;
         }
@@ -6280,7 +6334,7 @@ impl Bridge {
             let since = words
                 .find_map(|w| w.strip_prefix("since="))
                 .unwrap_or("head");
-            let offset = since.strip_prefix('@').and_then(|n| n.parse::<u64>().ok());
+            let offset = since.strip_prefix('@').and_then(crate::parse_uint::<u64>);
             needs_head |= !have.contains_key(topic) && offset.is_none();
             parsed.push((topic.to_string(), offset));
         }
@@ -7376,6 +7430,7 @@ impl Bridge {
                             );
                             self.claim(off, pin.seq);
                             let identity = pin.identity.clone();
+                            self.settle_a_retry_answered_ahead(&post, off);
                             let next =
                                 self.post_landed(&post, &subject, &pin, off, false, identity);
                             return self.follow(&post.sid, next);
@@ -7396,6 +7451,7 @@ impl Bridge {
                         if !pin.via_key {
                             self.claim(off, pin.seq);
                         }
+                        self.settle_a_retry_answered_ahead(&post, off);
                         self.post_landed(&post, &subject, &pin, off, deduped, actual)
                     }
                     Err(e) => self.post_refused(&post, &subject, pin.seq, e),
@@ -7515,6 +7571,19 @@ impl Bridge {
         self.group_record = record;
     }
 
+    /// A held post's retry landed at `off`: where this bridge already delivered that ask's answer
+    /// with no deadline standing, the settle is owed, so the landing arms nothing
+    /// ([`Bridge::settle_deadline_for`]). Only a retry: an ask's first landing is armed whatever
+    /// overtook its ack, for the sweep to read back.
+    fn settle_a_retry_answered_ahead(&mut self, post: &QueuedPost, off: u64) {
+        if post.dl.is_some() && self.settled_unarmed.get(&off) == Some(&post.sid) {
+            self.note_asks([asks::Frame::DeadlineGone {
+                off,
+                sid: post.sid.clone(),
+            }]);
+        }
+    }
+
     fn post_landed(
         &mut self,
         post: &QueuedPost,
@@ -7571,15 +7640,21 @@ impl Bridge {
         let to = actual
             .as_ref()
             .and_then(|identity| replier_of(&identity.subject));
-        if appended && WAITING_KINDS.contains(&post.kind.as_str()) {
+        // THE ASK'S RECIPIENT AND ITS DEADLINE ARE ONE APPEND to the asks journal (C04), where a
+        // build before it replaced two whole tables here, ahead of the `outbox sent` that
+        // releases the sender.
+        let waiting = appended && WAITING_KINDS.contains(&post.kind.as_str());
+        if waiting {
             if let Some(to) = &to {
                 self.note_asked(off, to);
             }
         }
-        if let Some(dl) = post
-            .dl
-            .filter(|_| appended && WAITING_KINDS.contains(&post.kind.as_str()))
-        {
+        if waiting && post.dl.is_none() && to.is_some() {
+            // The recipient alone: a refused write is said and rewritten at the next, as the
+            // asked table's was.
+            self.persist_asks();
+        }
+        if let Some(dl) = post.dl.filter(|_| waiting) {
             let noted = self.note_deadline(&post.sid, off, dl, to);
             #[cfg(test)]
             let noted = noted
@@ -7981,22 +8056,23 @@ impl Bridge {
                 self.drain_outbox();
             }
             "inbox-seen" => {
-                let Some(sid) = target.parse::<u64>().ok().and_then(|l| self.locals.get(&l)) else {
+                let Some(sid) = crate::parse_uint::<u64>(target).and_then(|l| self.locals.get(&l))
+                else {
                     return;
                 };
                 let sid = sid.clone();
-                let named: Option<u64> = toks.next().and_then(|t| t.parse().ok());
+                let named: Option<u64> = toks.next().and_then(crate::parse_uint);
                 let mut off: Option<u64> = None;
                 let mut floor: Option<Option<u64>> = None;
                 let mut watermark: Option<u64> = None;
                 let mut decided = false;
                 for t in toks {
                     if let Some(n) = t.strip_prefix("off=") {
-                        off = n.parse().ok();
+                        off = crate::parse_uint(n);
                     } else if let Some(f) = t.strip_prefix("floor=") {
-                        floor = Some(f.parse().ok());
+                        floor = Some(crate::parse_uint(f));
                     } else if let Some(w) = t.strip_prefix("seen=") {
-                        watermark = w.parse().ok();
+                        watermark = crate::parse_uint(w);
                     } else if t.starts_with("verdict=") {
                         decided = true;
                     }
@@ -8019,7 +8095,8 @@ impl Bridge {
                 self.replay_topics(false);
             }
             "hold" => {
-                let Some(sid) = target.parse::<u64>().ok().and_then(|l| self.locals.get(&l)) else {
+                let Some(sid) = crate::parse_uint::<u64>(target).and_then(|l| self.locals.get(&l))
+                else {
                     return;
                 };
                 let sid = sid.clone();
@@ -8035,14 +8112,16 @@ impl Bridge {
                 self.converge_hold(&sid, EndpointHold::of(held, standing.or(origin)));
             }
             "topic" => {
-                let Some(sid) = target.parse::<u64>().ok().and_then(|l| self.locals.get(&l)) else {
+                let Some(sid) = crate::parse_uint::<u64>(target).and_then(|l| self.locals.get(&l))
+                else {
                     return;
                 };
                 let sid = sid.clone();
                 self.topic_change(&sid, &mut toks);
             }
             "agent" => {
-                let Some(sid) = target.parse::<u64>().ok().and_then(|l| self.locals.get(&l)) else {
+                let Some(sid) = crate::parse_uint::<u64>(target).and_then(|l| self.locals.get(&l))
+                else {
                     return;
                 };
                 let sid = sid.clone();
@@ -8062,7 +8141,8 @@ impl Bridge {
                 {
                     return;
                 }
-                let Some(sid) = target.parse::<u64>().ok().and_then(|l| self.locals.get(&l)) else {
+                let Some(sid) = crate::parse_uint::<u64>(target).and_then(|l| self.locals.get(&l))
+                else {
                     return;
                 };
                 let sid = sid.clone();
@@ -8889,6 +8969,7 @@ impl Bridge {
     }
 
     fn end_run(&self) {
+        self.hand_asks_to_files();
         if self.bye == Some(Bye::Handoff) {
             self.hand_posts_to_files();
             stderr_line!(
@@ -8936,6 +9017,19 @@ impl Bridge {
                 "aterm-link: this run's state files could not all be flushed: {e}; no marker \
                  is removed to force legacy recovery; unavailable recovery stays fail-closed"
             ),
+        }
+    }
+
+    /// At a stop, the asks journal's tables written as the files an older build reads
+    /// ([`StateDir::hand_asks_to_files`]), for whichever bridge runs next. A refusal is said and
+    /// stops nothing: a bridge of this build reads the journal, and a rollback reads the tables
+    /// the last hand-off that took wrote.
+    fn hand_asks_to_files(&self) {
+        if let Err(e) = self.state.hand_asks_to_files() {
+            stderr_line!(
+                "aterm-link: the asks journal's tables could not be written as the files a \
+                 bridge of an older build reads: {e}; a bridge of this build reads the journal"
+            );
         }
     }
 
@@ -9067,7 +9161,7 @@ impl Bridge {
                 .split_whitespace()
                 .find_map(|tok| tok.strip_prefix(key)?.strip_prefix('='))
         };
-        self.endpoint_lane = field("lane").and_then(|n| n.parse().ok()).unwrap_or(0);
+        self.endpoint_lane = field("lane").and_then(crate::parse_uint).unwrap_or(0);
         self.endpoint_build = field("build").map(str::to_string);
         let header = header.to_string();
         self.mirror_hello_answered(&header);
@@ -9339,7 +9433,7 @@ impl Bridge {
 
     fn tally_idle(&mut self) {
         let (mailbox, state) = (&self.mailbox, &self.state);
-        self.waits.idle(self.committed, |t| {
+        self.waits.idle(self.committed.unwrap_or(0), |t| {
             mailbox.copy_wakes(t);
             state.copy_dir_rows(t);
         });
@@ -9631,7 +9725,7 @@ fn watch_ack(line: &str) -> Option<(u64, &str)> {
     if toks.next() != Some("sub") {
         return None;
     }
-    let local = toks.next()?.parse::<u64>().ok()?;
+    let local = crate::parse_uint::<u64>(toks.next()?)?;
     let sid = toks.next().filter(|s| subject::is_principal(s))?;
     Some((local, sid))
 }
@@ -9928,7 +10022,8 @@ fn halt_reason_token(raw: Option<&str>) -> String {
 
 fn presence_inc(body: &Body) -> Option<u64> {
     body.unknown
-        .get("inc")?
+        .get("inc")
+        .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))?
         .parse()
         .ok()
         .filter(|inc| *inc <= INC_MAX)
@@ -9939,7 +10034,11 @@ fn carried_elsewhere(body: &Body, inc: u64, self_inc: u64, host: &str) -> Option
         return None;
     }
     let row_host = body.unknown.get("host").map(|h| crate::pct::decode(h));
-    let row_pid = body.unknown.get("pid").and_then(|p| p.parse::<u32>().ok());
+    let row_pid = body
+        .unknown
+        .get("pid")
+        .filter(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|p| p.parse::<u32>().ok());
     if row_host.as_deref() == Some(host)
         && row_pid
             .is_some_and(|pid| pid == std::process::id() || !aterm_uds::process::pid_alive(pid))
@@ -10069,14 +10168,19 @@ pub struct OwedReceipt {
 }
 
 fn parse_receipt_line(line: &str) -> Option<OwedReceipt> {
+    let dec = |v: &str| {
+        (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| v.parse::<u64>().ok())
+            .flatten()
+    };
     let (mut sid, mut rid, mut off, mut verdict, mut kind, mut from) =
         (None, None, None, None, None, None);
     let mut earlier_log = false;
     for tok in line.split_whitespace() {
         match tok.split_once('=') {
             Some(("sid", v)) => sid = Some(v),
-            Some(("rid", v)) => rid = v.parse::<u64>().ok(),
-            Some(("off", v)) => off = v.parse::<u64>().ok(),
+            Some(("rid", v)) => rid = dec(v),
+            Some(("off", v)) => off = dec(v),
             Some(("verdict", v)) => verdict = Some(v),
             Some(("kind", v)) => kind = Some(v),
             Some(("from", v)) => from = Some(v),
@@ -10099,6 +10203,11 @@ fn parse_receipt_line(line: &str) -> Option<OwedReceipt> {
 /// Parses a raw `outbox` response frame into posts, receipts, fetches, and `more` flag.
 #[must_use]
 pub fn parse_drain(frame: &[u8]) -> Drain {
+    let dec64 = |v: &str| {
+        (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| v.parse::<u64>().ok())
+            .flatten()
+    };
     let mut out = Drain::default();
     let mut rest = frame;
     while !rest.is_empty() {
@@ -10126,7 +10235,7 @@ pub fn parse_drain(frame: &[u8]) -> Drain {
                 if let Some(s) = tok.strip_prefix("sid=") {
                     sid = Some(s);
                 } else if let Some(n) = tok.strip_prefix("off=") {
-                    off = n.parse().ok();
+                    off = dec64(n);
                 }
             }
             if let (Some(sid), Some(off)) = (sid, off) {
@@ -10155,14 +10264,18 @@ pub fn parse_drain(frame: &[u8]) -> Drain {
             };
             match k {
                 "sid" => post.sid = v.to_string(),
-                "id" => post.id = v.parse().unwrap_or(0),
+                "id" => post.id = dec64(v).unwrap_or(0),
                 "to" => post.to = v.to_string(),
                 "kind" => post.kind = v.to_string(),
-                "re" => post.re = v.parse().ok(),
-                "dl" => post.dl = v.parse().ok(),
+                "re" => post.re = dec64(v),
+                "dl" => post.dl = dec64(v),
                 "via" => post.via = Some(v.to_string()),
                 "key" => post.key = Some(v.to_string()),
-                "len" => len = v.parse().ok(),
+                "len" => {
+                    len = (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                        .then(|| v.parse().ok())
+                        .flatten()
+                }
                 _ => {}
             }
         }
@@ -10972,7 +11085,7 @@ mod tests {
         let state_path = dir.path().join("state");
         StateDir::open(&state_path)
             .unwrap()
-            .set_deadlines(&[Deadline {
+            .set_deadlines_as_an_older_build(&[Deadline {
                 off: 1,
                 sid: "s-one".into(),
                 at: 0,
@@ -17428,7 +17541,7 @@ mod tests {
                 bridge.committed,
                 bridge.per_sid.lane_owed.contains_key(SID),
             ),
-            (21, 22, vec![21, 22], 22, false),
+            (21, 22, vec![21, 22], Some(22), false),
             "declining one broadcast must not turn the session's lane into a fault"
         );
     }
@@ -17468,7 +17581,8 @@ mod tests {
         assert_eq!(lane.delivery_offsets(), [22]);
         assert_eq!(bridge.inbox_commit_floor(), Some(20));
         assert_eq!(
-            bridge.committed, 19,
+            bridge.committed,
+            Some(19),
             "a later record commits the group up to the owed one, never past it"
         );
 
@@ -17477,7 +17591,8 @@ mod tests {
         lane.answer_deliveries_to(OTHER, "ERR no such session\n");
         bridge.on_inbox_record(&mail(OTHER, 24));
         assert_eq!(
-            bridge.committed, 19,
+            bridge.committed,
+            Some(19),
             "and they do not move it past the floor"
         );
 
@@ -17582,9 +17697,9 @@ mod tests {
             assert_eq!(
                 committed,
                 if unattributed.is_some() {
-                    vec![9, 9, 9, 9]
+                    [9, 9, 9, 9].map(Some)
                 } else {
-                    vec![19, 29, 29, 43]
+                    [19, 29, 29, 43].map(Some)
                 },
                 "only departed, attributed debt is discharged: {unattributed:?}"
             );
@@ -17635,10 +17750,18 @@ mod tests {
             "the faulted lane stays held, owing nothing on B yet"
         );
         bridge.on_inbox_record(&mail(HEALTHY, 40));
-        assert_eq!(bridge.committed, 40, "B's mail commits past A's old debt");
+        assert_eq!(
+            bridge.committed,
+            Some(40),
+            "B's mail commits past A's old debt"
+        );
         bridge.on_inbox_record(&mail(FAULTED, 50));
         bridge.on_inbox_record(&mail(HEALTHY, 60));
-        assert_eq!(bridge.committed, 49, "B's own owed record bounds B's group");
+        assert_eq!(
+            bridge.committed,
+            Some(49),
+            "B's own owed record bounds B's group"
+        );
     }
 
     #[test]
@@ -19357,7 +19480,11 @@ mod tests {
         assert!(bridge.attach_broker());
         let (healthy, _) = writer.publish(82, 33, &face(HEALTHY), body).unwrap();
         bridge.on_inbox_record(&(healthy, face(HEALTHY), body.to_vec()));
-        assert_eq!(bridge.committed, healthy, "A's debt cannot clamp B's group");
+        assert_eq!(
+            bridge.committed,
+            Some(healthy),
+            "A's debt cannot clamp B's group"
+        );
         assert_eq!(
             bridge.per_sid.lane_owed.get(HELD),
             Some(&None),
@@ -19369,7 +19496,11 @@ mod tests {
         bridge.on_inbox_record(&(owed, face(HELD), body.to_vec()));
         let (later, _) = writer.publish(82, 35, &face(HEALTHY), body).unwrap();
         bridge.on_inbox_record(&(later, face(HEALTHY), body.to_vec()));
-        assert_eq!(bridge.committed, owed - 1, "B's new owed row bounds B");
+        assert_eq!(
+            bridge.committed,
+            Some(owed - 1),
+            "B's new owed row bounds B"
+        );
         assert_eq!(bridge.per_sid.lane_owed[HELD], Some(owed));
         assert_eq!(lane.delivery_offsets(), [delivered, vec![later]].concat());
     }
@@ -20137,7 +20268,11 @@ mod tests {
         run_rounds(&mut bridge);
         let offs: Vec<u64> = burst.iter().map(|r| r.0).collect();
         assert_eq!(lane.delivery_offsets(), offs, "every record, in order");
-        assert_eq!(bridge.committed, burst[15].0, "committed through the last");
+        assert_eq!(
+            bridge.committed,
+            Some(burst[15].0),
+            "committed through the last"
+        );
         assert_eq!(
             log_head(&mut reader) - before,
             1,
@@ -20148,7 +20283,7 @@ mod tests {
         for rec in singles {
             bridge.on_inbox_record(rec);
         }
-        assert_eq!(bridge.committed, singles[15].0);
+        assert_eq!(bridge.committed, Some(singles[15].0));
         assert_eq!(
             log_head(&mut reader) - before,
             16,
@@ -20215,7 +20350,7 @@ mod tests {
         assert!(bridge.mailbox.is_idle());
         assert!(bridge.round(Duration::ZERO));
         assert_eq!(bridge.conn.as_ref().map(Link::unacked), Some(0));
-        assert_eq!(bridge.committed, records[0].0, "the group is there");
+        assert_eq!(bridge.committed, Some(records[0].0), "the group is there");
         assert_eq!(bridge.inbox_pending, None);
         assert!(
             lane.sent
@@ -20294,7 +20429,8 @@ mod tests {
             "the commit and the post were one writer batch"
         );
         assert_eq!(
-            bridge.committed, records[0].0,
+            bridge.committed,
+            Some(records[0].0),
             "the group is through the delivery"
         );
         assert_eq!(bridge.inbox_pending, None);
@@ -20373,7 +20509,7 @@ mod tests {
             .collect();
         bridge.settle_acks();
         assert_eq!(
-            Some(bridge.committed),
+            bridge.committed,
             rode.first().copied(),
             "the broker acked the commit that rode"
         );
@@ -20382,7 +20518,9 @@ mod tests {
 
     /// **THE WIND-DOWN LANDS A HELD INBOX COMMIT** (critic item B08): a commit held for the
     /// next write when aterm closes the bridge is the owed commit the wind-down lands, so
-    /// the group is through the delivery and the next bridge redelivers nothing.
+    /// the group is through the delivery and the next bridge redelivers nothing. The delivery
+    /// is a fresh log's first record, at offset 0, so the broker's group is read beside the
+    /// bridge's own cursor: each says whether a commit through 0 landed.
     ///
     /// NEGATIVE CONTROL: with the held commit dropped at the wind-down
     /// ([`crate::sim::world::Mutant::DropHeldCommitAtWindDown`]) the group stays where it
@@ -20400,9 +20538,14 @@ mod tests {
         ] {
             let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-b")]);
             bridge.fx = fx;
-            let (records, _reader, _socket, _broker, _server) =
+            let (records, _reader, _socket, broker, _server) =
                 burst_rig(&lane, &mut bridge, "s-b", 1);
-            let before = bridge.committed;
+            let group = subject::inbox_group(&bridge.cfg.fleet, &bridge.node);
+            assert_eq!(
+                broker.group_start(&group),
+                0,
+                "PRECONDITION: never committed"
+            );
             bridge.in_round = true;
             bridge.on_inbox_record(&records[0]);
             bridge.in_round = false;
@@ -20410,12 +20553,22 @@ mod tests {
             assert!(bridge.commit_held.is_some(), "PRECONDITION: held");
 
             bridge.wind_down();
+            let ended = (
+                bridge.committed,
+                bridge.inbox_pending,
+                bridge.state.inbox_owed(),
+                broker.group_start(&group),
+            );
             if lands {
-                assert_eq!(bridge.committed, records[0].0, "landed at the wind-down");
+                assert_eq!(
+                    ended,
+                    (Some(records[0].0), None, None, records[0].0 + 1),
+                    "landed at the wind-down"
+                );
             } else {
                 assert_eq!(
-                    (bridge.committed, bridge.state.inbox_owed()),
-                    (before, None),
+                    ended,
+                    (None, None, None, 0),
                     "NEGATIVE CONTROL: dropped, neither landed nor left"
                 );
             }
@@ -20424,12 +20577,17 @@ mod tests {
 
     /// **A HELD INBOX COMMIT GOES ALONE ONCE ITS GRACE IS OUT** (critic item B08): at the
     /// park's backstop when nothing came, and at the next settle when what came published
-    /// nothing. Neither waits on a clock here: the hold is dated a grace ago.
+    /// nothing: an endpoint line that publishes nothing keeps the hold while it is handled,
+    /// sending nothing, and the settle after it sends the commit once the grace is out.
+    /// Neither waits on a clock here: the hold is dated a grace ago. The first delivery is a
+    /// fresh log's first record, at offset 0, so each landing is read off the broker's group
+    /// beside the bridge's own cursor: each says whether a commit through 0 landed.
     #[cfg(unix)]
     #[test]
     fn a_held_inbox_commit_goes_alone_once_its_grace_is_out() {
         let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-b")]);
-        let (records, _reader, _socket, _broker, _server) = burst_rig(&lane, &mut bridge, "s-b", 2);
+        let (records, _reader, _socket, broker, _server) = burst_rig(&lane, &mut bridge, "s-b", 2);
+        let group = subject::inbox_group(&bridge.cfg.fleet, &bridge.node);
         let a_grace_ago = |bridge: &Bridge| {
             bridge
                 .fx
@@ -20447,7 +20605,12 @@ mod tests {
         assert!(bridge.park_and_take(aterm_spec::wait::MUST_HAPPEN));
         assert_eq!(bridge.commit_held, None);
         assert_eq!(
-            bridge.committed, records[0].0,
+            (
+                bridge.committed,
+                bridge.inbox_pending,
+                broker.group_start(&group)
+            ),
+            (Some(records[0].0), None, records[0].0 + 1),
             "the backstop sent it and read its ack"
         );
 
@@ -20456,18 +20619,135 @@ mod tests {
         bridge.in_round = false;
         bridge.settle_owed();
         assert!(bridge.commit_held.is_some(), "PRECONDITION: held again");
+        *lane.outbox.lock().unwrap() = Some(String::new());
+        bridge.mailbox.push_event("EVENT 1 post 1".to_string());
+        assert!(bridge.park_and_take(aterm_spec::wait::MUST_HAPPEN));
+        assert!(bridge.mailbox.is_idle(), "PRECONDITION: the line was taken");
+        assert!(
+            bridge.commit_held.is_some(),
+            "a line that published nothing keeps the hold"
+        );
+        assert_eq!(
+            (
+                bridge.conn.as_ref().map(Link::unacked),
+                bridge.inbox_pending
+            ),
+            (Some(0), Some(records[1].0)),
+            "and sent nothing"
+        );
+
         bridge.commit_held = Some(a_grace_ago(&bridge));
         bridge.settle_owed();
         assert_eq!(bridge.commit_held, None);
-        assert!(
-            bridge
-                .conn
-                .as_ref()
-                .is_some_and(|link| link.owed().any(Then::is_commit)),
+        // The settle may already have read the commit's ack off the socket, so it is judged by
+        // where the cursor lands, not by what is still owed; reading acks sends nothing.
+        bridge.settle_acks();
+        assert_eq!(
+            (
+                bridge.committed,
+                bridge.inbox_pending,
+                broker.group_start(&group)
+            ),
+            (Some(records[1].0), None, records[1].0 + 1),
             "the settle sent it alone"
         );
+        assert_eq!(
+            bridge.conn.as_ref().map(Link::unacked),
+            Some(0),
+            "nothing is left owed"
+        );
+    }
+
+    /// **RECORD 0 COMMITS BELOW A RECORD OWED JUST PAST IT**: on a fresh log the first record
+    /// sits at offset 0. With it delivered and the next one still owed to a session (a lane
+    /// fault leaves one), the inbox commit stops just below the owed record, at record 0, as
+    /// it stops below any other ([`Bridge::commit_target`]), and the link lands it once: a
+    /// bridge that committed nothing yet has not committed through offset 0, and one that
+    /// has does not commit it again.
+    #[cfg(unix)]
+    #[test]
+    fn record_zero_commits_below_a_record_owed_just_past_it() {
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-b")]);
+        let (records, _reader, _socket, broker, _server) =
+            owe_the_record_past_record_zero(&lane, &mut bridge);
+        let group = subject::inbox_group(&bridge.cfg.fleet, &bridge.node);
+        bridge.flush_inbox_commit();
+        let commits: Vec<u64> = bridge
+            .conn
+            .as_ref()
+            .expect("the link stands")
+            .owed()
+            .filter_map(|then| match then {
+                Then::Commit { upto, .. } => Some(*upto),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            commits,
+            [records[0].0],
+            "through record 0, short of the owed one"
+        );
         bridge.settle_acks();
-        assert_eq!(bridge.committed, records[1].0);
+        assert_eq!(
+            (bridge.committed, broker.group_start(&group)),
+            (Some(records[0].0), records[1].0),
+            "the group resumes at the owed record"
+        );
+
+        bridge.flush_inbox_commit();
+        bridge.settle_owed();
+        assert!(!bridge.holds_inbox_commit(), "nothing more is held");
+        assert_eq!(
+            bridge.conn.as_ref().map(Link::unacked),
+            Some(0),
+            "nor sent again"
+        );
+    }
+
+    /// **RECORD 0 IS LEFT FOR THE NEXT BRIDGE BELOW A RECORD OWED JUST PAST IT**: the case of
+    /// [`record_zero_commits_below_a_record_owed_just_past_it`] with no link to commit on,
+    /// so the wind-down hands record 0's commit to the next bridge.
+    #[cfg(unix)]
+    #[test]
+    fn record_zero_is_left_for_the_next_bridge_below_a_record_owed_just_past_it() {
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-b")]);
+        let (records, _writer, _socket, _broker, _server) =
+            owe_the_record_past_record_zero(&lane, &mut bridge);
+        bridge.conn = None;
+        bridge.wind_down();
+        assert_eq!(
+            bridge.state.inbox_owed(),
+            Some(records[0].0),
+            "left for the next bridge"
+        );
+    }
+
+    /// A fresh log's first two records delivered to `s-b`, the second still owed to it.
+    #[cfg(unix)]
+    fn owe_the_record_past_record_zero(
+        lane: &FakeVerbLane,
+        bridge: &mut Bridge,
+    ) -> (
+        Vec<BrokerRecord>,
+        Conn,
+        String,
+        astream_broker::Broker,
+        astream_broker::BrokerHandle,
+    ) {
+        let rig = burst_rig(lane, bridge, "s-b", 2);
+        let records = &rig.0;
+        assert_eq!(records[0].0, 0, "PRECONDITION: a fresh log's first record");
+        bridge.in_round = true;
+        for rec in records {
+            bridge.on_inbox_record(rec);
+        }
+        bridge.in_round = false;
+        bridge
+            .per_sid
+            .lane_owed
+            .insert("s-b".to_string(), Some(records[1].0));
+        assert_eq!(bridge.inbox_pending, Some(records[1].0), "PRECONDITION");
+        rig
     }
 
     /// **A COMMIT THAT A RECORD OWED TO A SESSION STOPS IS NOT HELD** (critic item B08
@@ -20485,14 +20765,18 @@ mod tests {
         bridge.in_round = false;
         bridge.flush_inbox_commit();
         bridge.settle_acks();
-        assert_eq!(bridge.committed, records[0].0, "PRECONDITION: committed");
+        assert_eq!(
+            bridge.committed,
+            Some(records[0].0),
+            "PRECONDITION: committed"
+        );
 
         bridge.in_round = true;
         for rec in &records[1..] {
             bridge.on_inbox_record(rec);
         }
         bridge.in_round = false;
-        let owed_off = bridge.committed + 1;
+        let owed_off = records[0].0 + 1;
         bridge
             .per_sid
             .lane_owed
@@ -20514,7 +20798,7 @@ mod tests {
             assert!(bridge.park_and_take(wait));
             assert_eq!(bridge.parked, Some(wait), "the park takes its full wait");
         }
-        assert_eq!(bridge.committed, records[0].0);
+        assert_eq!(bridge.committed, Some(records[0].0));
         assert_eq!(bridge.conn.as_ref().map(Link::unacked), Some(0));
     }
 
@@ -20558,7 +20842,7 @@ mod tests {
         );
         assert!(!bridge.holds_inbox_commit());
         bridge.settle_acks();
-        assert_eq!(bridge.committed, records[0].0);
+        assert_eq!(bridge.committed, Some(records[0].0));
         assert_eq!(
             bridge.inbox_pending,
             Some(records[1].0),
@@ -20604,13 +20888,13 @@ mod tests {
             bridge.conn.is_some(),
             "a commit refused by a rolled-back batch is an answer, not a lost link"
         );
-        assert_eq!(bridge.committed, 0, "the group has not moved");
+        assert_eq!(bridge.committed, None, "the group has not moved");
         assert_eq!(bridge.inbox_pending, Some(r0), "the debt is kept");
 
         fsync_fails(false);
         bridge.land_inbox_commit();
         assert!(bridge.conn.is_some(), "the link stood throughout");
-        assert_eq!(bridge.committed, r0, "the retry landed the group");
+        assert_eq!(bridge.committed, Some(r0), "the retry landed the group");
         assert_eq!(bridge.inbox_pending, None);
 
         bridge.inbox_pending = Some(r1);
@@ -20626,7 +20910,7 @@ mod tests {
             bridge.conn.is_none(),
             "a refused retry is the link down, as the blocking commit's was"
         );
-        assert_eq!(bridge.committed, r0, "the group stayed where it was");
+        assert_eq!(bridge.committed, Some(r0), "the group stayed where it was");
         assert_eq!(
             bridge.inbox_pending,
             Some(r1),
@@ -20653,7 +20937,7 @@ mod tests {
 
             queue_inbox(&bridge, &records);
             run_rounds(&mut bridge);
-            assert_eq!(bridge.committed, records[3].0, "on={on}");
+            assert_eq!(bridge.committed, Some(records[3].0), "on={on}");
             let counted = bridge.waits.tally();
             if !on {
                 assert_eq!(counted, Tally::default(), "an off tally counts nothing");
@@ -20749,7 +21033,7 @@ mod tests {
             offs,
             "redelivered, answered from the endpoint's memory, appended nowhere"
         );
-        assert_eq!(bridge.committed, offs[N - 1]);
+        assert_eq!(bridge.committed, Some(offs[N - 1]));
         assert_eq!(log_head(&mut reader) - before, 1, "and committed once");
         let (mut writer, _) = bridge.connect().unwrap();
         let (sentinel, _) = writer
@@ -20795,10 +21079,10 @@ mod tests {
         let accepted = record(1, HOSTED);
         bridge.on_inbox_record(&accepted);
         assert_eq!(lane.delivery_offsets(), [accepted.0], "endpoint control");
-        assert_eq!(bridge.committed, accepted.0);
+        assert_eq!(bridge.committed, Some(accepted.0));
         let refused = record(2, ABSENT);
         bridge.on_inbox_record(&refused);
-        assert_eq!(bridge.committed, refused.0, "durable refusal control");
+        assert_eq!(bridge.committed, Some(refused.0), "durable refusal control");
 
         let (mut reader, _) = bridge.connect().unwrap();
         let ev_face = bridge.ev_face(None);
@@ -20822,7 +21106,11 @@ mod tests {
             bridge.conn.is_none(),
             "the pre-write refusal lost the publisher"
         );
-        assert_eq!(bridge.committed, refused.0, "no failed write committed");
+        assert_eq!(
+            bridge.committed,
+            Some(refused.0),
+            "no failed write committed"
+        );
         assert!(
             !verdict_landed(&mut reader, unproved.0),
             "no verdict landed"
@@ -20883,7 +21171,8 @@ mod tests {
         run_rounds(&mut bridge);
         assert_eq!(bridge.inbox_commit_floor(), Some(records[1].0));
         assert_eq!(
-            bridge.committed, records[0].0,
+            bridge.committed,
+            Some(records[0].0),
             "the burst's commit stops below the owed record"
         );
 
@@ -20895,7 +21184,8 @@ mod tests {
         assert_eq!(bridge.inbox_pending, Some(records[5].0), "accounted for");
         bridge.wind_down();
         assert_eq!(
-            bridge.committed, records[0].0,
+            bridge.committed,
+            Some(records[0].0),
             "the exit's commit is still below the owed record"
         );
         assert_eq!(bridge.inbox_commit_floor(), Some(records[1].0));
@@ -20913,7 +21203,7 @@ mod tests {
         let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, OK)]);
         let (records, _reader, _socket, _broker, _server) = burst_rig(&lane, &mut bridge, OK, 4);
         bridge.on_inbox_record(&records[0]);
-        assert_eq!(bridge.committed, records[0].0);
+        assert_eq!(bridge.committed, Some(records[0].0));
 
         bridge.in_round = true;
         bridge.on_inbox_record(&records[1]);
@@ -20939,7 +21229,8 @@ mod tests {
         );
         bridge.wind_down();
         assert_eq!(
-            bridge.committed, records[1].0,
+            bridge.committed,
+            Some(records[1].0),
             "through the delivered record, and not past the unaccounted one"
         );
         assert!(
@@ -21006,14 +21297,15 @@ mod tests {
                 bridge.settle_acks();
                 assert_eq!(bridge.inbox_pending, Some(after), "answered: all three");
                 bridge.land_inbox_commit();
-                assert_eq!(bridge.committed, after);
+                assert_eq!(bridge.committed, Some(after));
                 continue;
             }
             bridge.conn = None;
             assert_eq!(bridge.inbox_pending, Some(delivered), "the claim went too");
             assert!(bridge.attach_broker(), "re-attached to the same log");
             assert_eq!(
-                bridge.committed, delivered,
+                bridge.committed,
+                Some(delivered),
                 "the attach commits what was proven, and no further"
             );
             let (sentinel, _) = writer.publish(91, 4, &hosted, &body).unwrap();
@@ -21035,7 +21327,7 @@ mod tests {
         let node = bridge.node.clone();
         let face = format!("/f/f/in/{node}/{SID}/n-peer/note");
         bridge.on_inbox_record(&records[0]);
-        assert_eq!(bridge.committed, records[0].0);
+        assert_eq!(bridge.committed, Some(records[0].0));
         let refused = b"v=1 t=1 from=s-peer via=NOT-A-PRINCIPAL text=x";
         let (mut writer, _) = bridge.connect().unwrap();
         let off = writer.publish(93, 1, &face, refused).unwrap().0;
@@ -21049,7 +21341,11 @@ mod tests {
         assert_eq!(bridge.inbox_pending, None, "nothing it did is proven");
 
         assert!(bridge.attach_broker(), "re-attached to the same log");
-        assert_eq!(bridge.committed, records[0].0, "nothing past the refusal");
+        assert_eq!(
+            bridge.committed,
+            Some(records[0].0),
+            "nothing past the refusal"
+        );
         let (sentinel, _) = writer
             .publish(94, 1, &face, b"v=1 t=2 from=s-peer text=s")
             .unwrap();
@@ -21100,7 +21396,7 @@ mod tests {
             let first = first_offered(&socket, &node, "the durable cursor after the handoff");
             if handed {
                 assert_eq!(first, sentinel, "the burst is committed, not offered again");
-                assert_eq!(next.committed, burst[3].0);
+                assert_eq!(next.committed, Some(burst[3].0));
                 assert_eq!(next.state.inbox_owed(), None, "and the hand-over forgotten");
             } else {
                 assert_eq!(first, burst[0].0, "the control: the whole burst again");
@@ -21259,7 +21555,7 @@ mod tests {
             "the ev, and notice+commit"
         );
         assert_eq!(answered(&mut reader), [Some(live)]);
-        assert_eq!(bridge.committed, live);
+        assert_eq!(bridge.committed, Some(live));
         let group = subject::inbox_group("f", &node);
         let filter = subject::inbox_filter("f", &node);
         let (mut w, _) = bridge.connect().unwrap();
@@ -21308,7 +21604,7 @@ mod tests {
         let before = log_head(&mut reader);
         bridge.on_inbox_record(&(refilled, face.clone(), refused.to_vec()));
         assert_eq!(log_head(&mut reader) - before, 2, "ev and a plain commit");
-        assert_eq!(bridge.committed, refilled);
+        assert_eq!(bridge.committed, Some(refilled));
 
         let floored = refused_at(4);
         bridge.commit_floor = Some(floored);
@@ -21319,7 +21615,7 @@ mod tests {
             3,
             "ev, the notice alone, and a commit stopped below the floor"
         );
-        assert_eq!(bridge.committed, floored - 1, "never at the floor");
+        assert_eq!(bridge.committed, Some(floored - 1), "never at the floor");
         assert_eq!(
             answered(&mut reader),
             [Some(live), Some(old_way), Some(refilled), Some(floored)],
@@ -24289,6 +24585,357 @@ mod tests {
                 "{case}: the retry armed the settled ask's deadline again: {:?}",
                 bridge.deadlines
             );
+        }
+    }
+
+    /// **A HELD ASK'S RETRY BY THE NEXT BRIDGE ARMS NO DEADLINE THE HOLD SAW SETTLED** (C04,
+    /// closing F4's residual), on a real broker: as above, an ask with `dl=` is held while the
+    /// state dir refuses its deadline, and its answer is delivered while it is held; then the
+    /// bridge is killed, and the next bridge on the same state dir retries the post at its pin.
+    /// The settle is the asks journal's, replayed at the next open, so the retry retires the
+    /// post and arms nothing. CONTROL (`Mutant::ArmOverASettle`, the journal's settle not
+    /// consulted, as a bridge before C04 held the hold in memory only): the retry arms the
+    /// answered ask's deadline again, which a sweep expires once retention gave the answer up.
+    #[cfg(unix)]
+    #[test]
+    fn a_held_asks_retry_after_a_kill_arms_no_deadline_the_hold_saw_settled() {
+        const SID: &str = "s-host";
+        const POST: &str = "post sid=s-host id=1 to=h-a kind=ask dl=60000 len=1\nq";
+        for control in [false, true] {
+            let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
+            let state = bridge.state.root().to_path_buf();
+            let (socket, _broker, _server) = serve_log(&lane, "held-ask-kill");
+            bridge.cfg.broker = socket.clone();
+            bridge.conn = Some(bridge.connect().unwrap().0.into());
+            assert!(bridge.refresh_sessions().is_ok());
+            lane.retire_from_outbox();
+            bridge.state.refuse_writes_of(Some("deadlines"));
+            *lane.outbox.lock().unwrap() = Some(POST.to_string());
+            bridge.drain_outbox();
+            assert!(
+                lane.sent.lock().unwrap().is_empty(),
+                "held while its deadline is not on disk"
+            );
+            let ask = *bridge
+                .deadlines
+                .keys()
+                .next()
+                .expect("the held ask's deadline, in memory");
+            bridge.state.refuse_writes_of(None);
+            let node = bridge.node.clone();
+            let mut body = Body::new(1);
+            body.re = Some(ask);
+            body.text = "a".to_string();
+            let subject = format!("/f/f/in/{node}/{SID}/h-a/answer");
+            let (mut peer, _) = bridge.connect().unwrap();
+            let (off, _) = peer.publish(9_200, 1, &subject, &body.encode()).unwrap();
+            bridge.deliver_record(off, &subject, &body.encode());
+            assert!(
+                lane.delivery_offsets().contains(&off),
+                "the answer is delivered"
+            );
+            assert!(
+                bridge.deadlines.is_empty(),
+                "settled while its post was held"
+            );
+            drop(bridge);
+
+            let (next_lane, mut next) = FakeVerbLane::bridge_with_state(&[(1, SID)], Some(&state));
+            if control {
+                next.fx = crate::fx::Fx::os_without(crate::sim::world::Mutant::ArmOverASettle);
+            }
+            next.cfg.broker = socket;
+            next.conn = Some(next.connect().unwrap().0.into());
+            assert!(next.refresh_sessions().is_ok());
+            next_lane.retire_from_outbox();
+            *next_lane.outbox.lock().unwrap() = Some(POST.to_string());
+            next.drain_outbox();
+            assert!(
+                next_lane
+                    .sent
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|l| l.starts_with(&format!("outbox sent {SID} 1 off={ask}"))),
+                "control={control}: the next bridge's retry retires the post at its pin: {:?}",
+                next_lane.sent.lock().unwrap()
+            );
+            if control {
+                assert!(
+                    next.deadlines.contains_key(&ask),
+                    "CONTROL: the answered ask's deadline is armed again"
+                );
+                continue;
+            }
+            assert!(
+                next.deadlines.is_empty() && next.state.deadlines().is_empty(),
+                "the retry armed the settled ask's deadline again: {:?}",
+                next.deadlines
+            );
+        }
+    }
+
+    /// **AN ANSWER THE NEXT BRIDGE DELIVERS AHEAD OF THE RETRY ARMS NO DEADLINE** (C04 review), on
+    /// a real broker: an ask with `dl=` is held while the state dir refuses its deadline, so the
+    /// journal holds none, and the bridge is killed. The next bridge reads the answer first, as a
+    /// real attach does (`Bridge::refill_pending_admissions` ahead of the drain). Its retry then
+    /// writes the settle and arms nothing, where a sweep would expire the answered ask once
+    /// retention gave the answer up. CONTROL (`Mutant::ArmOverASettle`, the settle not consulted):
+    /// the retry arms it.
+    #[cfg(unix)]
+    #[test]
+    fn an_answer_the_next_bridge_delivers_ahead_of_the_retry_arms_no_deadline() {
+        const SID: &str = "s-host";
+        const POST: &str = "post sid=s-host id=1 to=h-a kind=ask dl=60000 len=1\nq";
+        for control in [false, true] {
+            let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
+            let state = bridge.state.root().to_path_buf();
+            let (socket, _broker, _server) = serve_log(&lane, "answer-first");
+            bridge.cfg.broker = socket.clone();
+            bridge.conn = Some(bridge.connect().unwrap().0.into());
+            assert!(bridge.refresh_sessions().is_ok());
+            lane.retire_from_outbox();
+            bridge.state.refuse_writes_of(Some("deadlines"));
+            *lane.outbox.lock().unwrap() = Some(POST.to_string());
+            bridge.drain_outbox();
+            assert!(lane.sent.lock().unwrap().is_empty(), "held");
+            let ask = *bridge.deadlines.keys().next().expect("in memory");
+            let node = bridge.node.clone();
+            drop(bridge);
+            assert!(
+                StateDir::peek(&state).deadlines().is_empty(),
+                "the journal holds no deadline"
+            );
+
+            let (next_lane, mut next) = FakeVerbLane::bridge_with_state(&[(1, SID)], Some(&state));
+            if control {
+                next.fx = crate::fx::Fx::os_without(crate::sim::world::Mutant::ArmOverASettle);
+            }
+            next.cfg.broker = socket;
+            next.conn = Some(next.connect().unwrap().0.into());
+            assert!(next.refresh_sessions().is_ok());
+            let mut body = Body::new(1);
+            body.re = Some(ask);
+            body.text = "a".to_string();
+            let subject = format!("/f/f/in/{node}/{SID}/h-a/answer");
+            let (mut peer, _) = next.connect().unwrap();
+            let (off, _) = peer.publish(9_200, 1, &subject, &body.encode()).unwrap();
+            next.deliver_record(off, &subject, &body.encode());
+            assert!(next_lane.delivery_offsets().contains(&off), "delivered");
+
+            next_lane.retire_from_outbox();
+            *next_lane.outbox.lock().unwrap() = Some(POST.to_string());
+            next.drain_outbox();
+            assert!(
+                next_lane
+                    .sent
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|l| l.starts_with(&format!("outbox sent {SID} 1 off={ask}"))),
+                "the retry retires the post at its pin: {:?}",
+                next_lane.sent.lock().unwrap()
+            );
+            if control {
+                assert!(next.deadlines.contains_key(&ask), "CONTROL: armed");
+                continue;
+            }
+            assert!(
+                next.deadlines.is_empty() && next.state.deadlines().is_empty(),
+                "the retry armed the answered ask's deadline: {:?}",
+                next.deadlines
+            );
+            drop(next);
+            assert!(
+                StateDir::open(&state)
+                    .expect("reopen")
+                    .deadline_settled(ask, SID),
+                "the settle is written"
+            );
+        }
+    }
+
+    /// A post's journal costs, as the outbox spends them, for `post` retired on a real broker.
+    #[cfg(unix)]
+    fn cost_of_post(
+        bridge: &mut Bridge,
+        lane: &FakeVerbLane,
+        post: String,
+    ) -> crate::state::FileOps {
+        lane.sent.lock().unwrap().clear();
+        let before = bridge.state.ops();
+        *lane.outbox.lock().unwrap() = Some(post.clone());
+        bridge.drain_outbox();
+        assert!(
+            lane.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.starts_with("outbox sent")),
+            "{post}: {:?}",
+            lane.sent.lock().unwrap()
+        );
+        bridge.state.ops() - before
+    }
+
+    /// **A LANDED ASK IS ONE APPEND OF THE ASKS JOURNAL, ITS DEADLINE RIDING WITH ITS RECIPIENT**
+    /// (C04 review, the change's main lever): on the real outbox path, against a real broker, an
+    /// ask with `dl=` spends what one without does, and each one append more than a note, which
+    /// writes nothing to this journal; no ask replaces a file a note does not. A kill right after
+    /// the `outbox sent` loses neither row, the recipient-alone write of an ask with no deadline
+    /// included.
+    #[cfg(unix)]
+    #[test]
+    fn a_landed_ask_is_one_append_its_deadline_riding_with_its_recipient() {
+        const SID: &str = "s-host";
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
+        let state = bridge.state.root().to_path_buf();
+        let (socket, _broker, _server) = serve_log(&lane, "ask-cost");
+        bridge.cfg.broker = socket;
+        bridge.conn = Some(bridge.connect().unwrap().0.into());
+        assert!(bridge.refresh_sessions().is_ok());
+        lane.retire_from_outbox();
+        let post = |id: u64, tail: &str| format!("post sid={SID} id={id} to=h-a {tail} len=1\nq");
+        cost_of_post(&mut bridge, &lane, post(1, "kind=note"));
+        let note = cost_of_post(&mut bridge, &lane, post(2, "kind=note"));
+        let bare = cost_of_post(&mut bridge, &lane, post(3, "kind=ask"));
+        let with_deadline = cost_of_post(&mut bridge, &lane, post(4, "kind=ask dl=60000"));
+        assert_eq!(bare.appends, note.appends + 1, "an ask, past a note");
+        assert_eq!(
+            with_deadline.appends, bare.appends,
+            "its deadline rides in the recipient's append"
+        );
+        assert_eq!(
+            (bare.replaces, with_deadline.replaces),
+            (note.replaces, note.replaces),
+            "no file replaced"
+        );
+        drop(bridge);
+        let disk = StateDir::peek(&state);
+        assert_eq!(disk.asked().len(), 2, "both recipients: {:?}", disk.asked());
+        assert_eq!(disk.deadlines().len(), 1, "the deadline");
+    }
+
+    /// **THE SWEEP'S SETTLE IS ON DISK BEFORE THE NEXT BRIDGE** (C04 review): the sweep publishes
+    /// `expired`, then writes its settle, so a kill after the sweep leaves the next bridge no
+    /// deadline to expire twice, on a real broker. The orphan prune's likewise: a deadline whose
+    /// session is gone leaves the journal with the refresh that saw it go.
+    #[cfg(unix)]
+    #[test]
+    fn the_sweep_and_the_orphan_prune_write_their_settles() {
+        const SID: &str = "s-host";
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
+        let state = bridge.state.root().to_path_buf();
+        let (socket, _broker, _server) = serve_log(&lane, "settle-written");
+        bridge.cfg.broker = socket;
+        bridge.conn = Some(bridge.connect().unwrap().0.into());
+        assert!(bridge.refresh_sessions().is_ok());
+        let node = bridge.node.clone();
+        let (mut peer, _) = bridge.connect().unwrap();
+        let ask_lane = format!("/f/f/in/n-far/s-far/{node}/ask");
+        let (ask, _) = peer
+            .publish(9_100, 1, &ask_lane, b"v=1 t=1 text=q")
+            .unwrap();
+        bridge.note_deadline(SID, ask, 1_000, Some("n-far".to_string()));
+        assert!(!StateDir::peek(&state).deadlines().is_empty(), "armed");
+        bridge.expire_deadlines(true);
+        let verdicts = format!("/f/f/in/{node}/{SID}/{node}/expired");
+        let (rows, _) = peer.fetch(0, &verdicts, 8).unwrap();
+        assert_eq!(rows.len(), 1, "the sweep expired the ask");
+        assert!(
+            StateDir::peek(&state).deadlines().is_empty(),
+            "a kill here leaves no deadline to expire twice"
+        );
+
+        bridge.note_deadline("s-gone", ask + 100, 1_000, None);
+        assert_eq!(StateDir::peek(&state).deadlines().len(), 1, "armed");
+        assert!(bridge.refresh_sessions().is_ok());
+        assert!(bridge.deadlines.is_empty(), "pruned");
+        assert!(
+            StateDir::peek(&state).deadlines().is_empty(),
+            "a kill here leaves no deadline of a session that is gone"
+        );
+    }
+
+    /// **A SWEEP READS BACK AN `expired` A KILLED BRIDGE PUBLISHED** (F4), on a real broker: a
+    /// deadline still standing with this node's `expired` for it on the asker's lane. The sweep
+    /// takes that for its verdict, publishes no second one and drops the deadline. CONTROL
+    /// (`Mutant::ExpireWithoutReadingBack`): a second `expired` goes over the first. The seeded
+    /// worlds reached this only through a retry arming a deadline over an `expired` it replayed,
+    /// which `Bridge::settle_a_retry_answered_ahead` closes (C04 review), so this is its control.
+    #[cfg(unix)]
+    #[test]
+    fn a_sweep_reads_back_an_expired_a_killed_bridge_published() {
+        const SID: &str = "s-host";
+        for control in [false, true] {
+            let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
+            let (socket, _broker, _server) = serve_log(&lane, "own-expired");
+            bridge.cfg.broker = socket;
+            bridge.conn = Some(bridge.connect().unwrap().0.into());
+            assert!(bridge.refresh_sessions().is_ok());
+            if control {
+                bridge.fx =
+                    crate::fx::Fx::os_without(crate::sim::world::Mutant::ExpireWithoutReadingBack);
+            }
+            let node = bridge.node.clone();
+            let (mut peer, _) = bridge.connect().unwrap();
+            let ask_lane = format!("/f/f/in/n-far/s-far/{node}/ask");
+            let (ask, _) = peer
+                .publish(9_100, 1, &ask_lane, b"v=1 t=1 text=q")
+                .unwrap();
+            let verdicts = format!("/f/f/in/{node}/{SID}/{node}/expired");
+            peer.publish(9_100, 2, &verdicts, &expired_body(1, ask, 1_000).encode())
+                .unwrap();
+            bridge.note_deadline(SID, ask, 1_000, Some("n-far".to_string()));
+            bridge.expire_deadlines(true);
+            assert!(bridge.deadlines.is_empty(), "control={control}: settled");
+            let (rows, _) = peer.fetch(0, &verdicts, 8).unwrap();
+            assert_eq!(
+                rows.len(),
+                if control { 2 } else { 1 },
+                "control={control}: how many `expired` the ask has"
+            );
+        }
+    }
+
+    /// **A STOP HANDS THE ASKS JOURNAL BACK AS THE TABLES AN OLDER BUILD READS** (C04 review), the
+    /// rollback safety the changelog promises: whichever way the bridge stops, `Bridge::end_run`
+    /// leaves each recipient and each deadline where a build before the journal looks, under a
+    /// line naming the hand-off the journal records. CONTROL: nothing is there before the stop.
+    #[cfg(unix)]
+    #[test]
+    fn a_stop_hands_the_asks_journal_back_as_the_tables_an_older_build_reads() {
+        const SID: &str = "s-host";
+        for bye in [None, Some(Bye::Handoff)] {
+            let (_lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
+            let state = bridge.state.root().to_path_buf();
+            bridge.note_asked(7, "h-a");
+            bridge.note_deadline(SID, 7, 60_000, Some("h-a".to_string()));
+            let (asked, deadlines) = (state.join(asks::ASKED), state.join(asks::DEADLINES));
+            assert!(!asked.exists() && !deadlines.exists(), "CONTROL: {bye:?}");
+            bridge.bye = bye;
+            bridge.end_run();
+            let asked = std::fs::read_to_string(&asked).expect("the asked table");
+            let deadlines = std::fs::read_to_string(&deadlines).expect("the deadline table");
+            let read_asked: Vec<Asked> = asked.lines().filter_map(Asked::parse).collect();
+            assert_eq!(
+                read_asked,
+                [Asked {
+                    off: 7,
+                    to: "h-a".to_string()
+                }],
+                "{bye:?}"
+            );
+            let read_deadlines: Vec<Deadline> =
+                deadlines.lines().filter_map(Deadline::parse).collect();
+            assert_eq!(read_deadlines.len(), 1, "{bye:?}");
+            assert_eq!(
+                (read_deadlines[0].off, read_deadlines[0].sid.as_str()),
+                (7, SID),
+                "{bye:?}"
+            );
+            assert_eq!(asks::legacy_mark(&asked), Some(1), "{bye:?}");
+            assert_eq!(asks::legacy_mark(&deadlines), Some(1), "{bye:?}");
         }
     }
 

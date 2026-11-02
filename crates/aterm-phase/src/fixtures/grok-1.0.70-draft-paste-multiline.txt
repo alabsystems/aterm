@@ -1,0 +1,50 @@
+# grok 1.0.70 · MEASURED 2026-10-29, `aterm ctl text` of a private headless aterm (144x50, aterm 0.146.0) running the real Grok Build, launched by path in the lab's jail with a scratch `HOME` and `GROK_HOME`, the lab's `XAI_API_KEY` and `GROK_XAI_API_BASE_URL`/`GROK_CLI_CHAT_PROXY_BASE_URL=http://127.0.0.1:<port>/v1` (a local stub of xAI's API, crates/aterm-lab) · three lines pasted as one bracketed paste (`ESC[200~first pasted line CR second pasted line CR third pasted line ESC[201~`, fed raw; bracketed paste is on): the paste kept whole as a three-row draft, the box grown upward (its top edge two rows higher, the bottom edge where it was), continuation rows indented under `❯`, the draft key row · cursor=45,23 (visible, blinking_block: after the last pasted line) · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+  /p/t/at.lab0/proj                                                                                                   11K / 256K │ [Dashboard]
+
+
+     ❯ a held turn                                                                                                                   1:56 PM
+
+
+     The held reply, after 30 s of silence.                                                                                          1:56 PM
+
+     Worked for 30s
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ ❯ first pasted line                                                                                                                      │
+  │   second pasted line                                                                                                                     │
+  │   third pasted line                                                                                                                      │
+  ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── lab-stub ─╯
+
+  Enter:send  │  Opt+Enter:newline  │  Shift+Tab:mode  │  Ctrl+x:shortcuts

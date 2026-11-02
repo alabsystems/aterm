@@ -171,6 +171,7 @@ fn pagination(
         }
         let target_page = params
             .remove("page")
+            .filter(|page| !page.is_empty() && page.bytes().all(|b| b.is_ascii_digit()))
             .and_then(|page| page.parse::<usize>().ok())
             .filter(|page| *page != 0)
             .ok_or("invalid GitHub pagination page")?;

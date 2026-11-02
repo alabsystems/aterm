@@ -158,6 +158,14 @@ fn reselection_trace(corrupt_payload: bool) -> Vec<State> {
     let dir = lab._home.path().join("selected-again");
     let mut store = Store::join(&session, &dir, scope).unwrap();
     store.ingest_conflict(&session, &proof).unwrap();
+    let observer = Session::open(&b).unwrap();
+    let recovery_path = crate::catalog::Directory::new(&lab.paths[1], b.trust())
+        .recovery()
+        .path(scope)
+        .unwrap();
+    let mut recovery = Store::join_recovery(&observer, &recovery_path, scope).unwrap();
+    recovery.ingest_conflict(&observer, &proof).unwrap();
+    drop((recovery, observer));
     assert!(store.liability_evidence(&session).is_err());
     let writable = store
         .commit_catalog(&session, b"cannot skip quarantined source")
@@ -178,11 +186,30 @@ fn reselection_trace(corrupt_payload: bool) -> Vec<State> {
     ingest(&lab, &good);
     lab.rotate(&[Role::Writer, Role::Writer]);
     let session = Session::open(&a).unwrap();
-    assert!(!session.discarded_source(&session.envelope(scope, &source).unwrap()));
+    assert!(
+        !session
+            .discarded_source(&session.envelope(scope, &source).unwrap())
+            .unwrap()
+    );
     assert!(Conflict::authenticate(&session, scope, &proof).is_err());
     assert!(!Conflict::restore(&session, scope, &proof).unwrap().active());
     let mut store = Store::open(&session, &dir, scope).unwrap();
     assert!(store.proof_inventory(&session).unwrap().is_empty());
+    let observer = Session::open(&b).unwrap();
+    let recovery = Store::observe_recovery(&observer, &recovery_path, scope).unwrap();
+    assert!(recovery.proof_inventory(&observer).unwrap().is_empty());
+    let mut primary = Store::join(
+        &observer,
+        &lab._home.path().join("reselected-primary"),
+        scope,
+    )
+    .unwrap();
+    assert_eq!(
+        primary.reconcile_recovery(&observer, recovery).is_ok(),
+        corrupt_payload,
+        "an unexported proof can still carry an unresolved liability"
+    );
+    drop((primary, observer));
     assert!(
         store.catalog(&session).unwrap().is_empty(),
         "a negative proof never admits payload"
@@ -368,6 +395,23 @@ fn an_existing_quarantine_proof_does_not_hide_a_later_fork() {
     assert!(
         target.inventory(&sb).unwrap().next().is_none(),
         "proofs do not admit payload"
+    );
+    let recovery_path = crate::catalog::Directory::new(&f.lab.paths[1], b.trust())
+        .recovery()
+        .path(f.scope)
+        .unwrap();
+    let mut recovery = Store::join_recovery(&sb, &recovery_path, f.scope).unwrap();
+    for retained in target.conflicts.values() {
+        recovery
+            .ingest_conflict(&sb, retained.conflict.wire())
+            .unwrap();
+    }
+    drop(recovery);
+    let recovery = Store::observe_recovery(&sb, &recovery_path, f.scope).unwrap();
+    assert!(recovery.liability_evidence(&sb).is_err());
+    assert!(
+        target.reconcile_recovery(&sb, recovery).is_err(),
+        "a fork-masked discarded source remains a liability"
     );
     target
         .commit_catalog(&sb, b"independent writer remains available")
@@ -1111,4 +1155,155 @@ fn retained_but_withheld_operations_do_not_bounce_between_replicas() {
         );
         assert_eq!(sent.deferred + received.deferred, 0);
     }
+}
+
+#[test]
+fn log_enrolled_writer_fork_proof_survives_log_retirement_and_control_journal_fork() {
+    use aterm_secrets::{
+        client::{Paths, admit_member_in_log, load_records, remove_member_in_log, save_records},
+        commons::bootstrap::{Bootstrap, Device},
+        membership_log::{Entrant, Evidence},
+    };
+    let lab = Lab::with_foundation(&[Role::Writer, Role::Writer]);
+    client::seed_vault_genesis(&lab.paths[0], &lab._home.path().join("genesis.v2")).unwrap();
+    save_records(
+        &lab.paths[1],
+        &load_records(&lab.paths[0]).unwrap().encode(),
+    )
+    .unwrap();
+
+    let b1 = lab.bootstrap(0);
+    let trust = b1.trust();
+    let pinned = format!(
+        "{}#{}",
+        lab._home.path().join("test.vault").display(),
+        lab.signer
+    );
+
+    // Admit newcomer `m3` via the membership log (`F18`) with no `Fact::Bind` in `Journal`.
+    let m3 = Paths::for_home(&lab._home.path().join("m3"));
+    client::configure_log_member(&m3, &pinned, "m3").unwrap();
+    let _ = client::machine_identity(&m3).unwrap();
+    let req3 = Device::open(&m3)
+        .unwrap()
+        .unwrap()
+        .request(trust.network, trust.authority)
+        .unwrap();
+    let actor_m3 = req3.binding().actor();
+    admit_member_in_log(
+        &lab.paths[1],
+        Entrant {
+            request: req3,
+            node_key: [0x33; 32],
+            name: "m3".to_owned(),
+            label: "m3".to_owned(),
+        },
+        Evidence::Phrase,
+    )
+    .unwrap();
+    let log_wire = load_records(&lab.paths[1]).unwrap().encode();
+    save_records(&lab.paths[0], &log_wire).unwrap();
+    save_records(&m3, &log_wire).unwrap();
+    let b3 = Bootstrap::required(&m3).unwrap();
+
+    // Fork `m1`'s legacy control `Journal` into `State::Conflict` to prove log-backed `Conflict`
+    // verification does not depend on an unambiguous legacy `Journal::constraints()` head.
+    let admin = client::admin_open(&lab.paths[0]).unwrap();
+    let grants = || {
+        (0..2)
+            .map(|n| {
+                Grant::recorded(
+                    format!("m{}", n + 1),
+                    lab.bootstrap(n).request().unwrap().binding().clone(),
+                    Role::Writer,
+                )
+            })
+            .collect()
+    };
+    {
+        let journal = Journal::open_existing(b1.journal_dir(), trust).unwrap();
+        let left = admin.prepare_commons_rotation(&journal, grants()).unwrap();
+        let right = admin.prepare_commons_rotation(&journal, grants()).unwrap();
+        drop(journal);
+        let mut journal = Journal::open_existing(b1.journal_dir(), trust).unwrap();
+        journal.ingest(left.bytes()).unwrap();
+        journal.ingest(right.bytes()).unwrap();
+        assert!(matches!(
+            journal.state(),
+            aterm_secrets::commons::journal::State::Conflict { .. }
+        ));
+    }
+
+    let s1 = Session::open(&b1).unwrap();
+    let scope = s1.scope().unwrap();
+    let dir1 = lab._home.path().join("m1-table");
+    let dir2 = lab._home.path().join("m2-table");
+    let mut store1 = Store::join(&s1, &dir1, scope).unwrap();
+    drop((store1, s1));
+
+    let s3 = Session::open(&b3).unwrap();
+    let causal = || Causal {
+        sequence: 1,
+        previous: None,
+        parents: &[],
+    };
+    let branch_a = s3.seal(scope, causal(), b"m3 branch one").unwrap();
+    let branch_b = s3.seal(scope, causal(), b"m3 branch two").unwrap();
+    drop(s3);
+
+    // `m1` ingests both conflicting branches from `m3` and exports the native `ACTF1` proof.
+    let s1 = Session::open(&b1).unwrap();
+    store1 = Store::open(&s1, &dir1, scope).unwrap();
+    store1.ingest(&s1, &branch_a).unwrap();
+    store1.ingest(&s1, &branch_b).unwrap();
+    let proof_wire = store1
+        .conflict_wire(&s1, &actor_m3)
+        .unwrap()
+        .expect("native fork proof for log-admitted writer");
+
+    // `m2` authenticates, ingests, and replays the `ACTF1` proof.
+    let b2 = lab.bootstrap(1);
+    let s2 = Session::open(&b2).unwrap();
+    let mut store2 = Store::join(&s2, &dir2, scope).unwrap();
+    let receipt = store2.ingest_conflict(&s2, &proof_wire).unwrap();
+    assert_eq!(store2.ingest_conflict(&s2, &proof_wire).unwrap(), receipt);
+    assert_eq!(
+        store2.conflict_inventory(&s2).unwrap(),
+        BTreeSet::from([actor_m3])
+    );
+    drop((store1, store2, s1, s2));
+
+    // Retire `m3` in the membership log; the `ACTF1` proof remains authentic and survives replay.
+    remove_member_in_log(&lab.paths[0], actor_m3).unwrap();
+    let retired_wire = load_records(&lab.paths[0]).unwrap().encode();
+    save_records(&lab.paths[1], &retired_wire).unwrap();
+
+    let s1 = Session::open(&b1).unwrap();
+    let s2 = Session::open(&b2).unwrap();
+    assert_eq!(
+        Conflict::authenticate(&s1, scope, &proof_wire)
+            .unwrap()
+            .actor(),
+        actor_m3
+    );
+    let store2 = Store::open(&s2, &dir2, scope).unwrap();
+    assert_eq!(
+        store2.conflict_wire(&s2, &actor_m3).unwrap().unwrap(),
+        proof_wire
+    );
+
+    // An un-enrolled forged actor is still rejected.
+    let mut forged = [branch_a, branch_b];
+    let unknown = [0x79; 32];
+    let at = 5 + crate::table::SCOPE_LEN + 32 + 8;
+    for wire in &mut forged {
+        wire[at..at + 32].copy_from_slice(&crypto::public(&unknown).unwrap());
+        let end = wire.len() - 64;
+        let sig = crypto::signed(&unknown, crate::table::DOMAIN, &wire[..end]).unwrap();
+        wire[end..].copy_from_slice(&sig);
+    }
+    let err = Conflict::from_pair(&s1, scope, &forged[0], &forged[1])
+        .err()
+        .unwrap();
+    assert!(err.0.contains("enrollment"), "unexpected error: {err:?}");
 }

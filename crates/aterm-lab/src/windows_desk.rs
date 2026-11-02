@@ -853,11 +853,20 @@ pub fn parse_windows(text: &str) -> Vec<Window> {
                 machine: word(l, "machine")?.to_string(),
                 conversion: match word(l, "conv")? {
                     "-" => None,
-                    hex => Some(u32::from_str_radix(hex, 16).ok()?),
+                    hex => Some(
+                        hex.bytes()
+                            .all(|b| b.is_ascii_hexdigit())
+                            .then(|| u32::from_str_radix(hex, 16).ok())
+                            .flatten()?,
+                    ),
                 },
                 move_size: word(l, "movesize")? == "1",
-                style: u32::from_str_radix(word(l, "style")?, 16).ok()?,
-                exstyle: u32::from_str_radix(word(l, "exstyle")?, 16).ok()?,
+                style: word(l, "style")
+                    .filter(|h| h.bytes().all(|b| b.is_ascii_hexdigit()))
+                    .and_then(|h| u32::from_str_radix(h, 16).ok())?,
+                exstyle: word(l, "exstyle")
+                    .filter(|h| h.bytes().all(|b| b.is_ascii_hexdigit()))
+                    .and_then(|h| u32::from_str_radix(h, 16).ok())?,
                 backdrop: word(l, "backdrop")?.parse().ok(),
                 dark: word(l, "dark")?.parse().ok(),
             })

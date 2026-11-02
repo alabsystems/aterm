@@ -177,12 +177,21 @@ pub fn managed_preferences(worker: &WorkerEnv, dir: &Path) -> Vec<Source> {
 
 /// Each value `argv` gives `flag`, as `flag value` or `flag=value`, in order.
 fn flag_values<'a>(argv: &'a [String], flag: &'a str) -> impl Iterator<Item = &'a str> + 'a {
-    argv.iter()
-        .enumerate()
-        .filter_map(move |(i, arg)| match arg.strip_prefix(flag)? {
-            "" => argv.get(i + 1).map(String::as_str),
-            rest => rest.strip_prefix('='),
-        })
+    let mut args = argv.iter().map(String::as_str);
+    std::iter::from_fn(move || {
+        while let Some(arg) = args.next() {
+            if arg == "--" {
+                return None;
+            }
+            if arg == flag {
+                return args.next();
+            }
+            if let Some(val) = arg.strip_prefix(flag).and_then(|r| r.strip_prefix('=')) {
+                return Some(val);
+            }
+        }
+        None
+    })
 }
 
 /// Whether Claude Code reads the user's `cowork_settings.json` in place of
@@ -373,7 +382,21 @@ pub fn hook_may_match(matcher: Option<&str>, tool: &str) -> bool {
 fn main_worktree(dir: &Path, fence: Option<&Path>) -> Result<Option<PathBuf>, String> {
     let small = |path: &Path| -> Result<Option<String>, String> {
         Ok(match opens(fence, path) {
-            Ok(true) => crate::harness::footer::read_small(path, 4096),
+            Ok(true) => {
+                let text = crate::harness::footer::read_small(path, 4097).ok_or_else(|| {
+                    format!(
+                        "cannot be found: {} cannot be read as a regular file",
+                        path.display()
+                    )
+                })?;
+                if text.len() > 4096 {
+                    return Err(format!(
+                        "cannot be found: {} is larger than 4096 bytes",
+                        path.display()
+                    ));
+                }
+                Some(text)
+            }
             Ok(false) => None,
             Err(why) => return Err(format!("cannot be found: {} lies in {why}", path.display())),
         })
@@ -445,7 +468,10 @@ fn opens(fence: Option<&Path>, path: &Path) -> Result<bool, &'static str> {
 /// where one is there but cannot be read whole: not a regular file (a planted
 /// FIFO is never opened to block on), larger than [`MAX_SETTINGS_BYTES`],
 /// unreadable, or fenced ([`opens`]).
-fn read_settings_in(fence: Option<&Path>, path: &Path) -> Result<Option<String>, String> {
+pub(crate) fn read_settings_in(
+    fence: Option<&Path>,
+    path: &Path,
+) -> Result<Option<String>, String> {
     if !opens(fence, path).map_err(|why| format!("lie in {why}"))? {
         return Ok(None);
     }

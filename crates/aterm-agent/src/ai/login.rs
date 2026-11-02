@@ -387,6 +387,9 @@ pub fn pool_target(
             crate::harness::one_line(why, 160),
         ));
     }
+    if let Some(why) = &pool.sign_in_refused {
+        return Err(format!("no local sign-in can repair this account: {why}"));
+    }
     if default_home_sign_in(pool)
         && let Some(label) = &pool.default_label
     {
@@ -515,6 +518,9 @@ pub fn pool_sign_in(
 #[must_use]
 pub fn refusal(f: &Facts, row: &Row) -> Option<String> {
     let c = f.connector;
+    if let Some(why) = &f.credential_store_error {
+        return Some(why.clone());
+    }
     if matches!(row.state, State::Off) {
         return Some(row.fact.clone());
     }
@@ -524,7 +530,16 @@ pub fn refusal(f: &Facts, row: &Row) -> Option<String> {
             c.id
         ));
     }
-    let pooled_default = match (&f.pool, crate::harness::accounts::Cli::parse(c.id)) {
+    if f.home_var.is_none()
+        && !f.hidden_store
+        && let Some(why) = f
+            .accounts
+            .as_ref()
+            .and_then(|a| a.sign_in_refused.as_deref())
+    {
+        return Some(format!("no local sign-in can repair this account: {why}"));
+    }
+    let pooled_default = match (f.login_pool(), crate::harness::accounts::Cli::parse(c.id)) {
         (Some(pool), Some(cli)) if !default_home_sign_in(pool) => {
             return pool_target(cli, pool).err();
         }
@@ -564,13 +579,30 @@ pub fn sign_in(h: &Host<'_>, f: &Facts, row: &Row, out: &mut dyn Write) -> Done 
     if let Some(why) = refusal(f, row) {
         return Done::Refused(why);
     }
+    let storage_current = || {
+        c.id != super::connector::CODEX.id
+            || (c.home.var.and_then(h.var).filter(|s| !s.is_empty()) == f.home_var
+                && f.home.as_ref().is_ok_and(|home| {
+                    super::facts::codex_auth_store(home)
+                        .is_ok_and(|storage| Some(storage.scope()) == f.record_scope)
+                }))
+    };
+    if !storage_current() {
+        return Done::Refused(
+            "Codex credential storage changed or cannot be read; refresh before signing in".into(),
+        );
+    }
     // Where Codex's own login signs in the pool's row on this machine's own login: that row's
     // label and the pool's store.
-    let default_row = match (&f.pool, crate::harness::accounts::Cli::parse(c.id)) {
+    let default_row = match (f.login_pool(), crate::harness::accounts::Cli::parse(c.id)) {
         (Some(pool), Some(cli)) if !default_home_sign_in(pool) => {
             return pool_sign_in(h, f, cli, pool, out);
         }
-        (Some(pool), Some(_)) => pool.default_label.as_deref().zip(pool.store.as_ref()),
+        (Some(pool), Some(cli)) => pool
+            .default_label
+            .as_deref()
+            .zip(pool.store.as_ref())
+            .map(|(label, store)| (label, store, cli, pool.roster.as_path())),
         _ => None,
     };
     let (args, remote, tell, after) = match &c.login {
@@ -636,8 +668,26 @@ pub fn sign_in(h: &Host<'_>, f: &Facts, row: &Row, out: &mut dyn Write) -> Done 
         env.retain(|(k, _)| k != "PATH");
         env.push(("PATH".to_string(), path.to_string()));
     }
+    let default_witness = default_row.as_ref().and_then(|(label, store, _, path)| {
+        crate::harness::accounts_sync::capture_default_login(store, path, label, (h.now)())
+    });
+    let default_home = c
+        .home
+        .var
+        .is_none_or(|v| (h.var)(v).is_none_or(|s| s.is_empty()));
+    let managed_default = default_home && !f.hidden_store && default_row.is_some();
+    if managed_default && default_witness.is_none() {
+        return Done::Refused(
+            "the default account changed, requires shared authority, or could not be read; no sign-in was run".into(),
+        );
+    }
     let _ = writeln!(out, "{}: {tell}", c.product);
     let _ = out.flush();
+    if !storage_current() {
+        return Done::Refused(
+            "Codex credential storage changed before sign-in; refresh before retrying".into(),
+        );
+    }
     let exited = h
         .runner
         .terminal(&kept.program, &program_args, &env, Some(run.path()));
@@ -647,6 +697,14 @@ pub fn sign_in(h: &Host<'_>, f: &Facts, row: &Row, out: &mut dyn Write) -> Done 
     let Some(status) = after else {
         return Done::NotChecked;
     };
+    if !storage_current() {
+        return Done::NotChecked;
+    }
+    let health_observation = h
+        .store
+        .load()
+        .ok()
+        .map(|records| records.of_scope(c.id, f.record_scope));
     let ran = h.runner.run(&Job {
         program: &managed.path,
         args: &as_args(status.args),
@@ -656,29 +714,68 @@ pub fn sign_in(h: &Host<'_>, f: &Facts, row: &Row, out: &mut dyn Write) -> Done 
         budget: STATUS_BUDGET,
     });
     let now = (h.now)();
-    let default_home = c
-        .home
-        .var
-        .is_none_or(|v| (h.var)(v).is_none_or(|s| s.is_empty()));
+    if !storage_current() {
+        return Done::NotChecked;
+    }
     let note = |outcome| {
-        if default_home {
-            let _ = h.store.note(c.id, How::Login, outcome, now);
+        if default_home
+            && (f.hidden_store || default_row.is_none())
+            && let Some(expected) = &health_observation
+        {
+            let _ = h.store.note_if_current_scope(
+                c.id,
+                f.record_scope,
+                expected,
+                How::Login,
+                outcome,
+                now,
+            );
         }
     };
     match read_status(status, &ran) {
         Said::In(method) => {
-            note(Outcome::Worked);
-            if default_home && let Some((label, pool_store)) = default_row {
-                let _ = pool_store.transact_logins(now, &mut None, |state, logins| {
-                    Ok(crate::harness::accounts::note_signed_back(
-                        state, logins, label, now,
-                    ))
-                });
+            if managed_default {
+                let (Some((_label, pool_store, cli, roster_path)), Some(witness), Ok(home)) =
+                    (default_row, default_witness.as_ref(), &f.home)
+                else {
+                    return Done::Failed("the default account context is unavailable".into());
+                };
+                match crate::harness::accounts_sync::record_default_sign_in(
+                    pool_store,
+                    cli,
+                    roster_path,
+                    witness,
+                    home,
+                    now,
+                ) {
+                    Ok(crate::harness::accounts_sync::DefaultSignIn::Accepted) => {}
+                    Ok(crate::harness::accounts_sync::DefaultSignIn::WrongIdentity) => {
+                        return Done::Failed("the provider login identity could not be verified for the selected account; that account remains signed out".into());
+                    }
+                    Err(why) => return Done::Failed(why),
+                }
             }
+            note(Outcome::Worked);
             Done::SignedIn(Some(method))
         }
         Said::Out => {
             note(Outcome::Ended(Ended::StatusSignedOut));
+            if default_home
+                && !f.hidden_store
+                && let Some((_label, pool_store, cli, roster_path)) = default_row
+                && let Some(witness) = default_witness.as_ref()
+                && let Ok(home) = &f.home
+            {
+                let _ = crate::harness::accounts_sync::record_review_login(
+                    pool_store,
+                    cli,
+                    roster_path,
+                    witness,
+                    home,
+                    Outcome::Ended(Ended::StatusSignedOut),
+                    now,
+                );
+            }
             Done::SignedOut
         }
         Said::Unread(_) => match exited {

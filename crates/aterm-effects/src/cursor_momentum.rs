@@ -125,6 +125,9 @@ pub struct MomentumGlowConfig {
     pub theme_bg: u32,
     /// Whether the cursor is a block (the body tint applies); bar/underline get the halo only.
     pub block: bool,
+    /// Whether the cursor is a bar: the halo then sits on the bar's insertion point
+    /// ([`crate::cursor_fx::BAR_HEAD_DX`] of the cell across), not the block's centre.
+    pub bar: bool,
     /// The caret row's letters as columns `first..end` (a blank between two glyphs counts, as it
     /// reads as part of the line), or `None` for a blank row.
     pub glyph_span: Option<(i32, i32)>,
@@ -139,6 +142,32 @@ pub struct MomentumGlowConfig {
     /// Whether `base` is a colour the user CHOSE: the block caret's charge then keeps its hue
     /// and never raises its chroma ([`chosen_charge`]), on either page.
     pub chosen_base: bool,
+}
+
+impl MomentumGlowConfig {
+    /// Where the halo sits on the caret `(cr, cc)`: [`seat_at`] for [`Self::bar`].
+    #[inline]
+    #[must_use]
+    pub(crate) const fn seat(&self, geom: &Geom, at: (u16, u16)) -> (f32, f32) {
+        seat_at(geom, at, self.bar)
+    }
+}
+
+/// Where a halo sits on the caret `(cr, cc)`: on a `bar`, its insertion point
+/// ([`crate::cursor_fx::BAR_HEAD_DX`] of the cell across), else the cell's centre, at the
+/// cell's middle height.
+#[inline]
+#[must_use]
+pub(crate) const fn seat_at(geom: &Geom, (cr, cc): (u16, u16), bar: bool) -> (f32, f32) {
+    let (x, y) = geom.cell_center(cr, cc);
+    if bar {
+        (
+            x + (crate::cursor_fx::BAR_HEAD_DX - 0.5) * geom.cw as f32,
+            y,
+        )
+    } else {
+        (x, y)
+    }
 }
 
 /// One tick's outputs.
@@ -238,6 +267,19 @@ impl MomentumGlow {
         self.hot() && !self.changed()
     }
 
+    /// Whether the engine is in its exact resting state ([`Self::DEFAULT`], ignoring `light_ink_memo`).
+    #[must_use]
+    #[inline]
+    pub(crate) const fn is_at_rest(&self) -> bool {
+        self.rate.value.to_bits() == 0
+            && self.rate.at.is_none()
+            && self.fp_last == 0
+            && self.fp_prev == 0
+            && self.latched.to_bits() == 0
+            && self.stamp.is_none()
+            && self.tau.to_bits() == 0
+    }
+
     /// The last real tick latched an amplitude at or above [`MOMENTUM_GLOW_HOT`].
     #[must_use]
     #[inline]
@@ -290,13 +332,19 @@ impl MomentumGlow {
     #[must_use]
     #[inline]
     pub(crate) fn settle_forecast(&self) -> Option<Instant> {
+        self.settle_forecast_with_cold(self.cold_at())
+    }
+
+    #[must_use]
+    #[inline]
+    pub(crate) fn settle_forecast_with_cold(&self, cold_at: Option<Instant>) -> Option<Instant> {
         let step = (self.latched * 255.0).floor();
         let step_at = if step >= 1.0 {
             self.decays_to(step / 255.0)
         } else {
             None
         };
-        match (step_at, self.cold_at()) {
+        match (step_at, cold_at) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (Some(a), None) => Some(a),
             (None, b) => b,
@@ -328,23 +376,22 @@ impl MomentumGlow {
         out: &mut Vec<GlowQuad>,
         under: &mut Vec<GlowQuad>,
     ) -> MomentumGlowFrame {
-        let raw = self.rate.value(now, cfg.tau_s);
-        let a = if cfg.intensity.is_finite() {
-            (raw * cfg.intensity.clamp(0.0, 1.0)).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
         let Some((cr, cc)) = cur else {
             return self.inert();
         };
         if !cfg.enabled
             || cfg.intensity <= 0.0
+            || !cfg.intensity.is_finite()
             || geom.cw == 0
             || geom.ch == 0
-            || a < MOMENTUM_GLOW_HOT
             || (cr as usize) >= geom.rows
             || (cc as usize) >= geom.cols
         {
+            return self.inert();
+        }
+        let raw = self.rate.value(now, cfg.tau_s);
+        let a = (raw * cfg.intensity.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+        if a < MOMENTUM_GLOW_HOT {
             return self.inert();
         }
         self.latched = a;
@@ -447,7 +494,7 @@ fn emit_halo(
     out: &mut Vec<GlowQuad>,
 ) {
     let (cw, ch) = (geom.cw as f32, geom.ch as f32);
-    let (cx, cy) = geom.cell_center(cr, cc);
+    let (cx, cy) = cfg.seat(&geom, (cr, cc));
     let rx = cw * (0.55 + cfg.radius_cells * s);
     let ry = ch * (0.45 + 0.6 * cfg.radius_cells * s);
     let peak = HALO_PEAK_COV * a * (2.0 - a);
@@ -478,6 +525,9 @@ fn emit_halo(
                 let (r0, l1, r_in, right_in, l_in, left_in) = prev;
                 let (r1, l0, r_out, right_out, l_out, left_out) = next;
                 prev = next;
+                if r_in == 0 && r_out == 0 && l_in == 0 && l_out == 0 {
+                    break;
+                }
                 if r_in > 0 || r_out > 0 {
                     push_fx_ramp(out, geom, r0, y, r1 - r0, row_h, right_in, right_out);
                 }
@@ -718,22 +768,12 @@ const fn light_glow_ink(hue: u32, theme_fg: u32, theme_bg: u32, vivid: bool) -> 
     if stacks(table, &bodies, l_fg, vivid) {
         return vivid;
     }
-    #[inline]
-    const fn mix(walked: u32, vivid: u32, t: f32) -> u32 {
-        #[inline]
-        const fn ch(walked: u32, vivid: u32, t: f32, sh: u32) -> u32 {
-            let a = ((walked >> sh) & 0xff) as f32;
-            let b = ((vivid >> sh) & 0xff) as f32;
-            ((a + (b - a) * t).round().clamp(0.0, 255.0) as u32) << sh
-        }
-        ch(walked, vivid, t, 16) | ch(walked, vivid, t, 8) | ch(walked, vivid, t, 0)
-    }
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
     let (mut lo_rgb, mut hi_rgb) = (walked, vivid);
     let mut step = 0;
     while step < 10 {
         let mid = 0.5 * (lo + hi);
-        let mid_rgb = mix(walked, vivid, mid);
+        let mid_rgb = mix_rgb(walked, vivid, mid);
         let passes = if mid_rgb == lo_rgb {
             true
         } else if mid_rgb == hi_rgb {
@@ -811,7 +851,7 @@ fn emit_light_halo(
 ) {
     use crate::cursor_glow::{LIGHT_MARK_QUADS, push_ink_ellipse_shaped};
     let (cw, ch) = (geom.cw as f32, geom.ch as f32);
-    let (cx, cy) = geom.cell_center(cr, cc);
+    let (cx, cy) = cfg.seat(&geom, (cr, cc));
     let rx_full = cw * (0.55 + cfg.radius_cells * s);
     let ry_full = ch * (0.45 + 0.6 * cfg.radius_cells * s);
     let peak = LIGHT_GLOW_PEAK * a;
@@ -928,6 +968,7 @@ mod tests {
             theme_fg: if dark { 0x00C8_C8D2 } else { 0x0024_292F },
             theme_bg: if dark { 0x0010_1016 } else { 0x00FF_FFFF },
             block: true,
+            bar: false,
             glyph_span: None,
             light_vivid: false,
             chosen_hue: false,

@@ -732,9 +732,18 @@ fn picker_path_opens_only_the_exact_local_document_grant() {
         None,
         "choosing one file must not acquire ambient directory authority"
     );
-    assert!(
-        app.open_local_document_path(AppKind::Editor, &dir).is_err(),
-        "directories are never document grants"
+    app.open_local_document_path(AppKind::Editor, &dir)
+        .expect("an explicitly chosen directory opens as a listing");
+    let directory_uri =
+        crate::native_document_host::path_to_file_uri(&std::fs::canonicalize(&dir).unwrap())
+            .unwrap();
+    let directory = app.document_store.id_for_uri(&directory_uri).unwrap();
+    assert!(app.document_store.directory(directory).is_some());
+    assert_eq!(app.document_store.dirty(directory), Some(false));
+    assert_eq!(
+        app.document_store.id_for_uri(&unchosen_uri),
+        None,
+        "listing a directory does not open or grant its children"
     );
     let _ = fs::remove_dir_all(dir);
 }

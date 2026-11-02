@@ -52,18 +52,15 @@ aterm-durable = { workspace = true }
 # `$HOME`, so a tool run under a scratch home claims in the one ledger.
 # Workspace crate; aterm-types already links it.
 aterm-uds = { workspace = true }
+# `O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK` for bounded regular-file opens, and `kill`/`signal` in
+# interrupt tests: aterm-libc, first-party, which aterm-toolchain already links.
+libc = { workspace = true }
 
 [dev-dependencies]
 # The stand-in holder dies by `kill_self_now()`, and is started by
 # `spawnfd::command`; the one-minute hang detector (`aterm_spec::wait`).
 aterm-uds = { workspace = true }
 aterm-spec = { workspace = true }
-
-# The interrupt tests send their waiting stand-ins SIGINT or SIGTERM (`kill`), and
-# a stand-in installs a tool's own handler (`signal`): aterm-libc, first-party,
-# which aterm-toolchain already links.
-[target.'cfg(unix)'.dev-dependencies]
-libc = { workspace = true }
 
 [lints]
 workspace = true

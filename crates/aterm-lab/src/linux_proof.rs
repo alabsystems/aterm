@@ -579,6 +579,24 @@ fn verifier_rows(up: &Up, arch: Arch, tag: &str, repo: &str, lane: &str) -> Vec<
 /// The shell integration's suite (aterm-shell-integration's unit and integration tests), on real shells on a real pty.
 pub const SHELLS: &str = "aterm-shell-integration";
 
+/// What [`SHELLS`]' tests get beside the arch's cargo environment: the guest's GNU bash 5.3 ([`guest::BASH_5_3`]) named as the `bash-5.3` tool, so each bash test runs on it as well as on the distro's bash, and one that is missing or answers no 5.3 fails the row rather than leaving the 5.3 paths unrun.
+#[must_use]
+pub fn shells_bash() -> (String, String) {
+    (
+        aterm_uds::host::tool("bash-5.3").var(),
+        guest::BASH_5_3.path(),
+    )
+}
+
+/// The [`SHELLS`] row's name for the arch `tag`: each shell its tests run.
+#[must_use]
+pub fn shells_row(tag: &str) -> String {
+    format!(
+        "{tag} tests: shell integration (bash, bash {}, zsh, fish, pwsh)",
+        guest::BASH_5_3.version
+    )
+}
+
 /// The first-party windowing crates (LW.6).
 pub const WINDOWING: [&str; 5] = [
     "aterm-dl",
@@ -2116,12 +2134,16 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
                 stopped = Some(s);
                 break 'arches;
             }
-            println!("\n=== {tag}: {SHELLS} tests (bash, zsh, fish, pwsh) ===");
-            let out = test_run(&up, workspace, &["--no-fail-fast", "--tests", "-p", SHELLS]);
-            rows.push(test_verdict(
-                &format!("{tag} tests: shell integration (bash, zsh, fish, pwsh)"),
-                &out,
-            ));
+            let name = shells_row(&tag);
+            println!("\n=== {name}: {SHELLS} ===");
+            let mut shells_env = env.clone();
+            shells_env.push(shells_bash());
+            let out = test_run(
+                &up,
+                |args: &[&str]| cargo(&shells_env, &manifest, "test", args),
+                &["--no-fail-fast", "--tests", "-p", SHELLS],
+            );
+            rows.push(test_verdict(&name, &out));
             if let Err(s) = crate::stop::check() {
                 stopped = Some(s);
                 break 'arches;

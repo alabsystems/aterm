@@ -71,7 +71,7 @@ pub fn mail_link_of(waiting: &[MailWaiting], turn: &Rec) -> MailLinkOf {
 /// The mail `cause=@<off>` names, if the turn's cause is mail.
 fn caused_off(turn: &Rec) -> Option<u64> {
     match turn.f.get(Key::Cause) {
-        Some(Val::Id(id)) => id.as_str().strip_prefix('@')?.parse().ok(),
+        Some(Val::Id(id)) => crate::line::parse_u(id.as_str().strip_prefix('@')?),
         _ => None,
     }
 }

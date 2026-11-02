@@ -92,14 +92,19 @@ fn the_face_moves_at_the_points_that_end_a_task_and_is_told_once() {
     );
     assert_eq!(st.face_moved(), None, "an act moves no face");
     now += 2 * MIN;
-    at(&mut st, &land(idle(LANDING_REPLY, Some(2 * MIN))), now);
+    let defended = land(idle(LANDING_REPLY, Some(2 * MIN)));
+    let a = at(&mut st, &defended, now);
+    assert_eq!(st.face_moved(), None, "the defense lands nothing");
+    let (_, then) = check_answered(&mut st, &defended, &a, now, LANDED_WORD);
+    now = then;
     assert_eq!(st.face_moved(), Some(TaskFace::Landed));
     assert_eq!(st.face_moved(), None, "told once");
-    at(&mut st, &land(idle(LANDING_REPLY, None)), now + MIN);
+    at(&mut st, &land(idle(LANDED_WORD, None)), now + MIN);
     assert_eq!(st.face_moved(), None, "the same point read again");
     now += 5 * MIN;
     let thanks = land(TurnEndReading {
         person: Some(Duration::from_secs(8)),
+        key: Some(Duration::from_secs(8)),
         ..idle("You're welcome!", Some(Duration::from_secs(5)))
     });
     at(&mut st, &thanks, now);
@@ -148,11 +153,11 @@ ATERM-TASK-DONE",
     st.took();
     assert_eq!(st.face_moved(), None, "its own turn read live");
     now += 3 * MIN;
-    at(&mut st, &land(idle(LANDING_REPLY, Some(3 * MIN))), now);
+    lands_on_check(&mut st, &land(idle(LANDING_REPLY, Some(3 * MIN))), now);
     assert_eq!(
         st.face_moved(),
         Some(TaskFace::Landed),
-        "the fourth nudge's defense"
+        "the fourth nudge's defense, then its check"
     );
 }
 
@@ -167,7 +172,7 @@ fn someone_elses_live_turn_opens_the_face_and_the_policys_own_does_not() {
         st.face_start();
         act(&mut st, &land(idle("Stage 1 landed.", Some(3 * MIN))), now);
         now += 2 * MIN;
-        at(&mut st, &land(idle(LANDING_REPLY, Some(2 * MIN))), now);
+        let now = lands_on_check(&mut st, &land(idle(LANDING_REPLY, Some(2 * MIN))), now);
         assert_eq!(st.face_moved(), Some(TaskFace::Landed));
         (st, now)
     };
@@ -189,6 +194,7 @@ fn someone_elses_live_turn_opens_the_face_and_the_policys_own_does_not() {
     // so it never shows `theirs` there (owner rulings 2026-10-26 and 2026-10-27).
     let greeting = TurnEndReading {
         person: Some(Duration::from_secs(8)),
+        key: Some(Duration::from_secs(8)),
         ..idle(
             "Hi! What would you like me to work on?",
             Some(Duration::from_secs(5)),
@@ -285,7 +291,7 @@ fn a_seeded_landing_holds_only_at_a_first_point_still_a_clean_defense() {
     assert_eq!(later, land_instruction());
     let mut st = TurnEndState::default();
     st.seed_landed(None);
-    st.start_lifted_off();
+    st.start_lifted_off(OffStood::Person);
     let (a, _) = first(&mut st, LANDING_REPLY);
     assert_eq!(a, TurnEndAction::Nothing);
     assert!(st.landed());
@@ -400,7 +406,7 @@ fn a_reply_a_wall_cut_never_said_done_though_the_done_report_before_it_stands() 
     st.observe(&land(idle(PROGRESS, None)), t + s(500));
     assert!(!st.said_done(), "mid-landing: the carry-on is owed");
     let mut st = reported();
-    act(
+    lands_on_check(
         &mut st,
         &land(idle(LANDING_REPLY, Some(s(300)))),
         t + s(400),
@@ -429,6 +435,7 @@ fn someone_elses_live_turn_and_a_persons_own_exchange_never_said_done() {
     st.observe(
         &land(TurnEndReading {
             person: Some(Duration::from_secs(8)),
+            key: Some(Duration::from_secs(8)),
             ..idle(done, quick)
         }),
         t,

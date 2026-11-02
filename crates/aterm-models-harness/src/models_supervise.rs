@@ -122,6 +122,21 @@ pub fn supervisor_focus_choice_model() -> Model {
 }
 
 /// Formal model for the turn-end decision policy across Autopilot modes.
+///
+/// An answer that names a need (`WorkedNeeds`) is a blocked reply, kept although it ran tools, so
+/// the same again holds (§14.17.5; `Buggy = 9` is the old rule that dropped it).
+///
+/// The short-turn streak counts the agent's own short answers (`own`, §14.17.5.7): a person's own
+/// short turn (`PersonTurnShort`) adds nothing, and nor does the act a wall cut
+/// (`WorkedHitsTheWall`) where it is the wall's one pass at this rung (`free`, the cut acts left
+/// uncounted since the agent's own answer or real work); a cut act past the pass counts, so a wall
+/// that cuts every act, each try answered short (`RetryAnsweredShort`: the wall cleared at its
+/// first try, as a flapping outage's does; a wall's words met again keep the tries they had, which
+/// this model leaves to a wall that clears at once; at Budget = 0 alone, as the scenario Budget = 2
+/// with it is past the interpreter's state budget), still climbs the ladder.
+/// Real work still ends the streak. `Buggy = 10` counts every cut act and `Buggy = 11` the
+/// person's turn, the rules before it (`NoPassedCutOrPersonsTurnCounts`); `Buggy = 12` leaves
+/// every cut act uncounted (`AWallPassesOncePerRung`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn supervisor_turn_end_model() -> Model {
@@ -139,6 +154,8 @@ pub fn supervisor_turn_end_model() -> Model {
             var person = 0;
             var used = 0;
             var short = 0;
+            var own = 0;
+            var free = 0;
             var backoff = 0;
             var pending = 0;
             var waited = 0;
@@ -207,6 +224,8 @@ pub fn supervisor_turn_end_model() -> Model {
             }
             action HumanWork when (pending == 0 && box_up == 0 && wall == 0) {
                 short = 0;
+                own = 0;
+                free = 0;
                 backoff = 0;
                 earned = 0;
                 long = 1;
@@ -221,6 +240,24 @@ pub fn supervisor_turn_end_model() -> Model {
                 same = 0;
                 run = 0;
                 quiet = 0;
+            }
+            action PersonTurnShort when (pending == 0 && box_up == 0 && wall == 0) {
+                short = if Buggy == 11 && short <= Streak - 1 { short + 1 } else { short };
+                backoff = if short > 0 || Buggy == 11 { 1 } else { 0 };
+                earned = if short > 0 || Buggy == 11 { 1 } else { 0 };
+                long = 0;
+                draft = 0;
+                asked = 1;
+                tasked = 1;
+                claim = 0;
+                other = 0;
+                need = 0;
+                rested = 0;
+                held = 0;
+                same = 0;
+                run = 0;
+                quiet = 0;
+                person = 1;
             }
             action OtherTurnRuns when (
                 pending == 0 && box_up == 0 && wall == 0 && draft == 0 && other == 0
@@ -245,6 +282,8 @@ pub fn supervisor_turn_end_model() -> Model {
             ) {
                 harness = harness + 1;
                 short = if Buggy == 1 { short } else { 0 };
+                own = 0;
+                free = 0;
                 backoff = if Buggy == 1 { backoff } else { 0 };
                 earned = if Buggy == 1 { earned } else { 0 };
                 long = 1;
@@ -259,6 +298,8 @@ pub fn supervisor_turn_end_model() -> Model {
                 other == 0 && person == 0
             ) {
                 short = if short <= Streak - 1 { short + 1 } else { short };
+                own = if own <= Streak - 1 { own + 1 } else { own };
+                free = 0;
                 backoff = 1;
                 earned = 1;
                 long = 0;
@@ -280,12 +321,23 @@ pub fn supervisor_turn_end_model() -> Model {
                 draft == 0 && other == 0 && person == 0
             ) {
                 short = if short <= Streak - 1 { short + 1 } else { short };
+                own = if own <= Streak - 1 { own + 1 } else { own };
+                free = 0;
                 backoff = 1;
                 earned = 1;
                 long = 0;
                 same = if Buggy == 8 { 1 } else { 2 };
                 run = if Buggy == 8 { 0 } else if run <= NoWork + Futile - 1 { run + 1 } else { run };
                 quiet = if quiet <= NoWork + Futile - 1 { quiet + 1 } else { quiet };
+            }
+            action Recover when (
+                pending == 0 && wall == 0 && other == 0 && rested == 0 && held == 0 &&
+                (same == 2 || NoWork <= run) && tasked == 1 &&
+                box_up == 0 && person == 0 && draft == 0 && backoff == 0 &&
+                (Budget == 0 || used <= Budget - 1)
+            ) {
+                used = if Budget == 0 { used } else { used + 1 };
+                pending = 1;
             }
             action Continue when (
                 pending == 0 && wall == 0 && other == 0 && rested == 0 && held == 0 &&
@@ -306,6 +358,8 @@ pub fn supervisor_turn_end_model() -> Model {
             action WorkedShort when (pending == 1) {
                 pending = 0;
                 short = if short <= Streak - 1 { short + 1 } else { short };
+                own = if own <= Streak - 1 { own + 1 } else { own };
+                free = 0;
                 backoff = 1;
                 earned = 1;
                 long = 0;
@@ -317,6 +371,8 @@ pub fn supervisor_turn_end_model() -> Model {
             action WorkedShortSame when (pending == 1 && same > 0 && claim == 0) {
                 pending = 0;
                 short = if short <= Streak - 1 { short + 1 } else { short };
+                own = if own <= Streak - 1 { own + 1 } else { own };
+                free = 0;
                 backoff = 1;
                 earned = 1;
                 long = 0;
@@ -328,7 +384,9 @@ pub fn supervisor_turn_end_model() -> Model {
             action WorkedHitsTheWall when (pending == 1) {
                 pending = 0;
                 wall = 1;
-                short = if short <= Streak - 1 { short + 1 } else { short };
+                short = if Buggy == 10 && short <= Streak - 1 { short + 1 } else if Buggy == 12 { short } else if free > 0 && short <= Streak - 1 { short + 1 } else { short };
+                own = if free > 0 && own <= Streak - 1 { own + 1 } else { own };
+                free = if Buggy == 10 { free } else if Buggy == 12 && free <= 1 { free + 1 } else if Buggy == 12 { free } else if free > 0 { free } else { free + 1 };
                 long = 0;
                 claim = 0;
                 same = 0;
@@ -340,6 +398,8 @@ pub fn supervisor_turn_end_model() -> Model {
             action WorkedLong when (pending == 1) {
                 pending = 0;
                 short = 0;
+                own = 0;
+                free = 0;
                 backoff = 0;
                 earned = 0;
                 long = 1;
@@ -351,6 +411,8 @@ pub fn supervisor_turn_end_model() -> Model {
             action WorkedLongQuiet when (pending == 1) {
                 pending = 0;
                 short = 0;
+                own = 0;
+                free = 0;
                 backoff = 0;
                 earned = 0;
                 long = 1;
@@ -362,6 +424,8 @@ pub fn supervisor_turn_end_model() -> Model {
             action WorkedLongQuietSame when (pending == 1 && same > 0 && claim == 0) {
                 pending = 0;
                 short = if short <= Streak - 1 { short + 1 } else { short };
+                own = if own <= Streak - 1 { own + 1 } else { own };
+                free = 0;
                 backoff = 1;
                 earned = 1;
                 long = 0;
@@ -372,6 +436,8 @@ pub fn supervisor_turn_end_model() -> Model {
             action WorkedClaimsDone when (pending == 1) {
                 pending = 0;
                 short = if short <= Streak - 1 { short + 1 } else { short };
+                own = if own <= Streak - 1 { own + 1 } else { own };
+                free = 0;
                 backoff = 1;
                 earned = 1;
                 long = 0;
@@ -384,13 +450,15 @@ pub fn supervisor_turn_end_model() -> Model {
             action WorkedNeeds when (pending == 1) {
                 pending = 0;
                 short = 0;
+                own = 0;
+                free = 0;
                 backoff = 0;
                 earned = 0;
                 long = 1;
                 claim = 0;
                 need = 1;
                 held = if Buggy == 1 { 1 } else { held };
-                same = 0;
+                same = if Buggy == 9 { 0 } else { 1 };
                 run = 0;
                 quiet = 0;
             }
@@ -405,6 +473,8 @@ pub fn supervisor_turn_end_model() -> Model {
                 latched = if Buggy == 1 { 1 } else { latched };
                 pending = if Buggy == 1 { 3 } else { 0 };
                 short = if Buggy == 1 || short == Streak { short } else { short + 1 };
+                own = if Buggy == 1 || own == Streak { own } else { own + 1 };
+                free = if Buggy == 1 { free } else { 0 };
                 backoff = if Buggy == 1 { backoff } else { 1 };
                 earned = if Buggy == 1 { earned } else { 1 };
                 long = if Buggy == 1 { long } else { 0 };
@@ -428,8 +498,8 @@ pub fn supervisor_turn_end_model() -> Model {
             }
             action SubmitDraft when (
                 pending == 0 && draft == 1 && (wall == 0 || wall == 2) && tasked == 1 &&
-                other == 0 && rested == 0 && held == 0 && same <= 1 && tries <= Futile - 1 &&
-                (run <= NoWork - 1 || (wall == 2 && run <= NoWork + Futile - 1)) &&
+                other == 0 && rested == 0 && held == 0 && (same <= 1 || wall == 0) && tries <= Futile - 1 &&
+                (wall == 0 || (wall == 2 && run <= NoWork + Futile - 1)) &&
                 box_up == 0 && person == 0 && backoff == 0 &&
                 (Budget == 0 || used <= Budget - 1)
             ) {
@@ -442,6 +512,8 @@ pub fn supervisor_turn_end_model() -> Model {
                 pending = 0;
                 wall = 0;
                 short = if Buggy == 4 { short } else { 0 };
+                own = 0;
+                free = 0;
                 backoff = if Buggy == 4 && short > 0 { 1 } else { 0 };
                 earned = if Buggy == 4 && short > 0 { 1 } else { 0 };
                 long = 1;
@@ -450,6 +522,19 @@ pub fn supervisor_turn_end_model() -> Model {
                 retried = 0;
                 run = 0;
                 quiet = 0;
+            }
+            action RetryAnsweredShort when (pending == 2 && tries == 0 && Budget == 0) {
+                pending = 0;
+                wall = 0;
+                backoff = if short > 0 { 1 } else { 0 };
+                earned = if short > 0 { 1 } else { 0 };
+                long = 0;
+                claim = 0;
+                same = 1;
+                tries = 0;
+                retried = 0;
+                run = if run <= NoWork + Futile - 1 { run + 1 } else { run };
+                quiet = if quiet <= NoWork + Futile - 1 { quiet + 1 } else { quiet };
             }
             action RetryHitsTheWall when (pending == 2) {
                 pending = 0;
@@ -480,10 +565,12 @@ pub fn supervisor_turn_end_model() -> Model {
             invariant NeverBackOffAfterRealWork: backoff == 0 || long == 0;
             invariant CruiseNeverRests: rested == 0;
             invariant ANeedNeverBlocks: held == 0;
-            invariant ANoWorkReplyGetsOneMoreActAtMost: typed_same == 0;
+            invariant RepeatedRepliesUseRecovery: typed_same == 0;
             invariant AWallGetsItsTriesAndNoMore: typed_futile == 0;
             invariant AWallsTriesAreItsOwnRetries: tries <= retried;
-            invariant ANoWorkRunGetsNoMoreActs: typed_run == 0;
+            invariant RoutineContinuationRespectsNoWorkBudget: typed_run == 0;
+            invariant NoPassedCutOrPersonsTurnCounts: short == own;
+            invariant AWallPassesOncePerRung: free <= 1;
         }
     }
 }
@@ -602,6 +689,14 @@ pub fn supervisor_cruise_model() -> Model {
                 open = 0;
                 pending = 3;
             }
+            action Recover when (
+                pending == 0 && bg == 0 && walled == 0 && rested == 0 && same == 2 &&
+                backoff == 0 && (down == 0 || down == 2 || capped == 1)
+            ) {
+                asked = 0;
+                open = 0;
+                pending = 1;
+            }
             action Continue when (
                 pending == 0 && bg == 0 && walled == 0 && asked == 0 && rested == 0 &&
                 (backoff == 0 || Buggy == 1) && (claim == 0 || Buggy == 1) &&
@@ -642,14 +737,14 @@ pub fn supervisor_cruise_model() -> Model {
             }
             action BackoffDue when (
                 pending == 0 && bg == 0 && walled == 0 && backoff == 1 &&
-                (same <= 1 || Buggy == 2) && (
+                (same == 2 ||
                     (claim == 0 && asked == 0) ||
                     (claim == 1 && (managed == 0 || short > 3 || Buggy == 1)) ||
                     (asked == 1 &&
                         (managed == 0 || (short > 3 && (Buggy == 0 || Buggy == 2 || Buggy == 3))))
                 )
             ) {
-                waited = if managed == 1 && short <= 3 && (claim == 1 || asked == 1) {
+                waited = if same <= 1 && managed == 1 && short <= 3 && (claim == 1 || asked == 1) {
                     1
                 } else {
                     waited
@@ -732,13 +827,23 @@ pub fn supervisor_cruise_model() -> Model {
             invariant AManagerIsNeverKeptWaiting: waited == 0;
             invariant AWorkerThatKeepsAskingWaitsTheBackOff: rushed == 0;
             invariant TheBusyScreenGetsNoAct: typed_busy == 0;
-            invariant ANoWorkReplyGetsOneMoreActAtMost: typed_same == 0;
+            invariant RepeatedRepliesUseRecovery: typed_same == 0;
             invariant NoContinuationIsTypedIntoAMeasuredOutageBeforeItsCap: typed_down == 0;
         }
     }
 }
 
 /// Formal model for Autopilot Land convergence to a clean pushed `origin/main`.
+///
+/// `said` is the reply standing: 0 progress, 1 a done claim, 2 a `Nothing left:` defense, 3 a
+/// defense the reader reads open, then the land check's answers (`pending == 4` is the check
+/// awaited): 4 `LANDED`, which retracts no standing need (it lands over a clean repository, the
+/// need left standing beside it, and over a dirty one nothing lands), 5 the agent's list, 6 a
+/// need alone. The land check's mutants are `Buggy` 6 (a defense lands on its words), 7 (a
+/// defense checked twice), 8 (a check over a dirty repository), 9 (an act typed into a need's
+/// rest) and 10 (a `LANDED` takes the need down though nothing retracted it). The owed
+/// check (`owed`) waits no back-off, so no back-off falls due while it is owed, and a measured
+/// outage holds it as it holds the other acts, its cap counted from the owed check.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn supervisor_land_model() -> Model {
@@ -767,8 +872,19 @@ pub fn supervisor_land_model() -> Model {
             var relanded = 0;
             var hold = 0;
             var hlegs = 0;
+            // The agent's list, its answer to the land check, stands: no real work, no other
+            // turn and no new check since. While it stands it is the hold's Open leg at every
+            // land act's yield, quoted, and no Defense leg is raised beside it (slice 4b).
+            var listed = 0;
             var same = 0;
             var typed_same = 0;
+            var owed = 0;
+            var audited = 0;
+            var rest = 0;
+            var typed_check_dirty = 0;
+            var typed_check_audited = 0;
+            var typed_in_rest = 0;
+            var dropped = 0;
             var withheld = 0;
             var down = 0;
             var capped = 0;
@@ -783,7 +899,7 @@ pub fn supervisor_land_model() -> Model {
             action OutageCapDue when (
                 down == 1 && capped == 0 && pending == 0 && walled == 0 && other == 0 &&
                 quiet == 0 && held == 0 && (same <= 1 || Buggy == 3) &&
-                (backoff == 0 || (typed == 0 && asked == 0))
+                (backoff == 0 || owed == 1 || (typed == 0 && asked == 0))
             ) {
                 capped = 1;
             }
@@ -801,18 +917,37 @@ pub fn supervisor_land_model() -> Model {
                 hold = 1;
                 hlegs = 0;
             }
+            action Check when (
+                pending == 0 && walled == 0 && (owed == 1 || (Buggy == 7 && audited == 1)) &&
+                landed == 0 && other == 0 && quiet == 0 && held == 0 && rest == 0 &&
+                (same <= 1 || Buggy == 3) &&
+                (down == 0 || down == 2 || capped == 1 || Buggy == 5)
+            ) {
+                typed_same = if same == 2 { 1 } else { typed_same };
+                typed_down = if down == 1 && capped == 0 { 1 } else { typed_down };
+                typed_check_dirty = if dirty == 1 { 1 } else { typed_check_dirty };
+                typed_check_audited = if audited == 1 { 1 } else { typed_check_audited };
+                owed = 0;
+                audited = 1;
+                listed = 0;
+                pending = 4;
+                relanded = 0;
+                hold = if judged == 1 { 2 } else { 1 };
+            }
             action Nudge when (
                 pending == 0 && walled == 0 && asked == 0 && typed == 1 && backoff == 0 &&
                 (landed == 0 || Buggy == 1) && other == 0 && quiet == 0 &&
-                held == 0 && (same <= 1 || Buggy == 3) &&
+                held == 0 && owed == 0 && (rest == 0 || Buggy == 9) && (same <= 1 || Buggy == 3) &&
                 (down == 0 || down == 2 || capped == 1 || Buggy == 5)
             ) {
                 typed_landed = if landed == 1 { 1 } else { typed_landed };
                 typed_same = if same == 2 { 1 } else { typed_same };
                 typed_down = if down == 1 && capped == 0 { 1 } else { typed_down };
+                typed_in_rest = if rest == 1 { 1 } else { typed_in_rest };
                 nudges = if Buggy == 1 && nudges <= 1 { nudges + 1 } else { nudges };
                 pending = 1;
                 relanded = 0;
+                rest = 0;
                 hold = if landed == 1 { 0 } else if judged == 1 { 2 } else { 1 };
                 hlegs = if landed == 1 { 0 } else { hlegs };
             }
@@ -838,13 +973,14 @@ pub fn supervisor_land_model() -> Model {
             }
             action BackoffDue when (
                 pending == 0 && walled == 0 && backoff == 1 && landed == 0 && other == 0 &&
-                (same <= 1 || Buggy == 3) &&
+                owed == 0 && (rest == 0 || Buggy == 9) && (same <= 1 || Buggy == 3) &&
                 (typed == 1 || asked == 1 || Buggy == 4)
             ) {
                 withheld = if typed == 0 && asked == 0 { 1 } else { withheld };
                 backoff = 0;
             }
-            action YieldWork when (pending > 0) {
+            action YieldWork when (pending > 0 && pending <= 3) {
+                listed = 0;
                 said = 0;
                 dirty = 0;
                 asked = 0;
@@ -854,12 +990,14 @@ pub fn supervisor_land_model() -> Model {
                 short = 0;
                 backoff = 0;
                 pending = 0;
-                judged = if pending == 1 || (pending == 3 && cut == 1) { 1 } else { judged };
+                owed = 0;
+                audited = 0;
+                judged = if (pending == 1 || (pending == 3 && cut == 1)) { 1 } else { judged };
                 hold = if StaleHold == 1 || Buggy == 2 {
                     hold
                 } else if typed == 0 || relanded == 1 {
                     0
-                } else if pending == 1 || (pending == 3 && cut == 1) {
+                } else if (pending == 1 || (pending == 3 && cut == 1)) {
                     2
                 } else {
                     hold
@@ -868,14 +1006,14 @@ pub fn supervisor_land_model() -> Model {
                     hlegs
                 } else if typed == 0 || relanded == 1 {
                     0
-                } else if pending == 1 || (pending == 3 && cut == 1) {
+                } else if (pending == 1 || (pending == 3 && cut == 1)) {
                     8
                 } else {
                     hlegs
                 };
                 same = 0;
             }
-            action YieldAsk when (pending > 0) {
+            action YieldAsk when (pending > 0 && pending <= 3) {
                 said = 0;
                 dirty = 0;
                 asked = 1;
@@ -885,12 +1023,13 @@ pub fn supervisor_land_model() -> Model {
                 short = if pending == 3 { short } else { 1 };
                 backoff = if pending == 3 { short } else { 1 };
                 pending = 0;
-                judged = if pending == 1 || (pending == 3 && cut == 1) { 1 } else { judged };
+                owed = 0;
+                judged = if (pending == 1 || (pending == 3 && cut == 1)) { 1 } else { judged };
                 hold = if StaleHold == 1 || Buggy == 2 {
                     hold
                 } else if typed == 0 || relanded == 1 {
                     0
-                } else if pending == 1 || (pending == 3 && cut == 1) {
+                } else if (pending == 1 || (pending == 3 && cut == 1)) {
                     2
                 } else {
                     hold
@@ -899,14 +1038,14 @@ pub fn supervisor_land_model() -> Model {
                     hlegs
                 } else if typed == 0 || relanded == 1 {
                     0
-                } else if pending == 1 || (pending == 3 && cut == 1) {
-                    8
+                } else if (pending == 1 || (pending == 3 && cut == 1)) {
+                    if listed == 1 { 4 } else { 8 }
                 } else {
                     hlegs
                 };
                 same = 1;
             }
-            action YieldAskSame when (pending > 0 && same > 0) {
+            action YieldAskSame when (pending > 0 && pending <= 3 && same > 0 && said == 0) {
                 said = 0;
                 dirty = 0;
                 asked = 1;
@@ -916,12 +1055,13 @@ pub fn supervisor_land_model() -> Model {
                 short = if pending == 3 { short } else { 1 };
                 backoff = if pending == 3 { short } else { 1 };
                 pending = 0;
-                judged = if pending == 1 || (pending == 3 && cut == 1) { 1 } else { judged };
+                owed = 0;
+                judged = if (pending == 1 || (pending == 3 && cut == 1)) { 1 } else { judged };
                 hold = if StaleHold == 1 || Buggy == 2 {
                     hold
                 } else if typed == 0 || relanded == 1 {
                     0
-                } else if pending == 1 || (pending == 3 && cut == 1) {
+                } else if (pending == 1 || (pending == 3 && cut == 1)) {
                     2
                 } else {
                     hold
@@ -930,14 +1070,15 @@ pub fn supervisor_land_model() -> Model {
                     hlegs
                 } else if typed == 0 || relanded == 1 {
                     0
-                } else if pending == 1 || (pending == 3 && cut == 1) {
-                    8
+                } else if (pending == 1 || (pending == 3 && cut == 1)) {
+                    if listed == 1 { 4 } else { 8 }
                 } else {
                     hlegs
                 };
                 same = 2;
             }
-            action YieldWall when (pending > 0) {
+            action YieldWall when (pending > 0 && pending <= 3) {
+                listed = 0;
                 walled = 1;
                 cut = if pending == 1 { 1 } else if pending == 3 { cut } else { 0 };
                 dirty = 0;
@@ -947,9 +1088,12 @@ pub fn supervisor_land_model() -> Model {
                 short = 0;
                 backoff = 0;
                 pending = 0;
+                owed = 0;
+                audited = 0;
                 same = 0;
             }
-            action YieldClaim when (pending > 0) {
+            action YieldClaim when (pending > 0 && pending <= 3) {
+                listed = 0;
                 said = 1;
                 dirty = 0;
                 asked = 0;
@@ -967,12 +1111,14 @@ pub fn supervisor_land_model() -> Model {
                 short = if pending == 3 { short } else { 1 };
                 backoff = if pending == 3 { short } else { 1 };
                 pending = 0;
-                judged = if pending == 1 || (pending == 3 && cut == 1) { 1 } else { judged };
+                owed = 0;
+                audited = 0;
+                judged = if (pending == 1 || (pending == 3 && cut == 1)) { 1 } else { judged };
                 hold = if StaleHold == 1 || Buggy == 2 {
                     hold
                 } else if typed == 0 || relanded == 1 {
                     0
-                } else if pending == 1 || (pending == 3 && cut == 1) {
+                } else if (pending == 1 || (pending == 3 && cut == 1)) {
                     2
                 } else {
                     hold
@@ -981,43 +1127,57 @@ pub fn supervisor_land_model() -> Model {
                     hlegs
                 } else if typed == 0 || relanded == 1 {
                     0
-                } else if pending == 1 || (pending == 3 && cut == 1) {
+                } else if (pending == 1 || (pending == 3 && cut == 1)) {
                     8
                 } else {
                     hlegs
                 };
                 same = 0;
             }
-            action YieldDefense when (pending > 0) {
+            action YieldDefense when (pending > 0 && pending <= 3) {
+                listed = 0;
                 said = 2;
                 need = 0;
                 dirty = 0;
                 asked = 0;
-                landed = if pending == 1 || (pending == 3 && cut == 1) { 1 } else { 0 };
-                told = if pending == 1 || (pending == 3 && cut == 1) { 1 } else { 0 };
+                landed = if Buggy == 6 && (pending == 1 || (pending == 3 && cut == 1)) { 1 } else { 0 };
+                told = if Buggy == 6 && (pending == 1 || (pending == 3 && cut == 1)) { 1 } else { 0 };
                 cut = 0;
                 short = if pending == 3 { short } else { 1 };
                 backoff = if pending == 3 { short } else { 1 };
                 pending = 0;
-                judged = if pending == 1 || (pending == 3 && cut == 1) { 0 } else { judged };
-                relanded = if pending == 1 || (pending == 3 && cut == 1) { 1 } else { relanded };
+                owed = if (Buggy <= 5 || Buggy > 6) && (pending == 1 || (pending == 3 && cut == 1)) { 1 } else { 0 };
+                audited = 0;
+                judged = if Buggy == 6 && (pending == 1 || (pending == 3 && cut == 1)) {
+                    0
+                } else if (pending == 1 || (pending == 3 && cut == 1)) {
+                    1
+                } else {
+                    judged
+                };
+                relanded = if Buggy == 6 && (pending == 1 || (pending == 3 && cut == 1)) { 1 } else { relanded };
                 hold = if StaleHold == 1 || Buggy == 2 {
                     hold
-                } else if typed == 0 || relanded == 1 || pending == 1 || (pending == 3 && cut == 1) {
+                } else if typed == 0 || relanded == 1 || (Buggy == 6 && (pending == 1 || (pending == 3 && cut == 1))) {
                     0
+                } else if (pending == 1 || (pending == 3 && cut == 1)) {
+                    2
                 } else {
                     hold
                 };
                 hlegs = if StaleHold == 1 || Buggy == 2 {
                     hlegs
-                } else if typed == 0 || relanded == 1 || pending == 1 || (pending == 3 && cut == 1) {
+                } else if typed == 0 || relanded == 1 || (Buggy == 6 && (pending == 1 || (pending == 3 && cut == 1))) {
+                    0
+                } else if (pending == 1 || (pending == 3 && cut == 1)) {
                     0
                 } else {
                     hlegs
                 };
                 same = 0;
             }
-            action YieldDefenseDirty when (pending > 0) {
+            action YieldDefenseDirty when (pending > 0 && pending <= 3) {
+                listed = 0;
                 said = 2;
                 need = 0;
                 dirty = 1;
@@ -1036,12 +1196,14 @@ pub fn supervisor_land_model() -> Model {
                 short = if pending == 3 { short } else { 1 };
                 backoff = if pending == 3 { short } else { 1 };
                 pending = 0;
-                judged = if pending == 1 || (pending == 3 && cut == 1) { 1 } else { judged };
+                owed = if Buggy == 8 && (pending == 1 || (pending == 3 && cut == 1)) { 1 } else { 0 };
+                audited = 0;
+                judged = if (pending == 1 || (pending == 3 && cut == 1)) { 1 } else { judged };
                 hold = if StaleHold == 1 || Buggy == 2 {
                     hold
                 } else if typed == 0 || relanded == 1 {
                     0
-                } else if pending == 1 || (pending == 3 && cut == 1) {
+                } else if (pending == 1 || (pending == 3 && cut == 1)) {
                     2
                 } else {
                     hold
@@ -1050,14 +1212,15 @@ pub fn supervisor_land_model() -> Model {
                     hlegs
                 } else if typed == 0 || relanded == 1 {
                     0
-                } else if pending == 1 || (pending == 3 && cut == 1) {
+                } else if (pending == 1 || (pending == 3 && cut == 1)) {
                     2
                 } else {
                     hlegs
                 };
                 same = 0;
             }
-            action YieldDefenseNeeds when (pending > 0) {
+            action YieldDefenseNeeds when (pending > 0 && pending <= 3) {
+                listed = 0;
                 said = 2;
                 need = 1;
                 dirty = 0;
@@ -1076,12 +1239,14 @@ pub fn supervisor_land_model() -> Model {
                 short = if pending == 3 { short } else { 1 };
                 backoff = if pending == 3 { short } else { 1 };
                 pending = 0;
-                judged = if pending == 1 || (pending == 3 && cut == 1) { 1 } else { judged };
+                owed = if (pending == 1 || (pending == 3 && cut == 1)) { 1 } else { 0 };
+                audited = 0;
+                judged = if (pending == 1 || (pending == 3 && cut == 1)) { 1 } else { judged };
                 hold = if StaleHold == 1 || Buggy == 2 {
                     hold
                 } else if typed == 0 || relanded == 1 {
                     0
-                } else if pending == 1 || (pending == 3 && cut == 1) {
+                } else if (pending == 1 || (pending == 3 && cut == 1)) {
                     2
                 } else {
                     hold
@@ -1090,14 +1255,15 @@ pub fn supervisor_land_model() -> Model {
                     hlegs
                 } else if typed == 0 || relanded == 1 {
                     0
-                } else if pending == 1 || (pending == 3 && cut == 1) {
+                } else if (pending == 1 || (pending == 3 && cut == 1)) {
                     1
                 } else {
                     hlegs
                 };
                 same = 0;
             }
-            action YieldOpenDefense when (pending > 0) {
+            action YieldOpenDefense when (pending > 0 && pending <= 3) {
+                listed = 0;
                 said = 3;
                 need = 0;
                 dirty = 0;
@@ -1108,12 +1274,14 @@ pub fn supervisor_land_model() -> Model {
                 short = if pending == 3 { short } else { 1 };
                 backoff = if pending == 3 { short } else { 1 };
                 pending = 0;
-                judged = if pending == 1 || (pending == 3 && cut == 1) { 1 } else { judged };
+                owed = if (pending == 1 || (pending == 3 && cut == 1)) { 1 } else { 0 };
+                audited = 0;
+                judged = if (pending == 1 || (pending == 3 && cut == 1)) { 1 } else { judged };
                 hold = if StaleHold == 1 || Buggy == 2 {
                     hold
                 } else if typed == 0 || relanded == 1 {
                     0
-                } else if pending == 1 || (pending == 3 && cut == 1) {
+                } else if (pending == 1 || (pending == 3 && cut == 1)) {
                     2
                 } else {
                     hold
@@ -1122,12 +1290,83 @@ pub fn supervisor_land_model() -> Model {
                     hlegs
                 } else if typed == 0 || relanded == 1 {
                     0
-                } else if pending == 1 || (pending == 3 && cut == 1) {
-                    4
+                } else if (pending == 1 || (pending == 3 && cut == 1)) {
+                    0
                 } else {
                     hlegs
                 };
                 same = 0;
+            }
+            action YieldLanded when (pending == 4) {
+                listed = 0;
+                said = 4;
+                dropped = if Buggy == 10 && need == 1 { 1 } else { dropped };
+                need = if Buggy == 10 { 0 } else { need };
+                dirty = 0;
+                asked = 0;
+                landed = 1;
+                told = 1;
+                cut = 0;
+                short = 1;
+                backoff = 0;
+                pending = 0;
+                judged = 0;
+                relanded = 1;
+                hold = if StaleHold == 1 || Buggy == 2 { hold } else { 0 };
+                hlegs = if StaleHold == 1 || Buggy == 2 { hlegs } else { 0 };
+                same = 1;
+            }
+            action YieldLandedDirty when (pending == 4) {
+                listed = 0;
+                said = 4;
+                dropped = if Buggy == 10 && need == 1 { 1 } else { dropped };
+                need = if Buggy == 10 { 0 } else { need };
+                dirty = 1;
+                asked = 0;
+                landed = 0;
+                told = 0;
+                cut = 0;
+                short = 1;
+                backoff = 1;
+                pending = 0;
+                judged = 1;
+                hold = if StaleHold == 1 || Buggy == 2 { hold } else { 2 };
+                hlegs = if StaleHold == 1 || Buggy == 2 { hlegs } else { 2 };
+                same = 1;
+            }
+            action YieldList when (pending == 4) {
+                listed = 1;
+                said = 5;
+                dirty = 0;
+                asked = 0;
+                landed = 0;
+                told = 0;
+                cut = 0;
+                short = 1;
+                backoff = 1;
+                pending = 0;
+                judged = 1;
+                hold = if StaleHold == 1 || Buggy == 2 { hold } else { 2 };
+                hlegs = if StaleHold == 1 || Buggy == 2 { hlegs } else { 4 };
+                same = 1;
+            }
+            action YieldNeedOnly when (pending == 4) {
+                listed = 0;
+                said = 6;
+                need = 1;
+                dirty = 0;
+                asked = 0;
+                landed = 0;
+                told = 0;
+                cut = 0;
+                short = 1;
+                backoff = 1;
+                pending = 0;
+                rest = 1;
+                judged = 1;
+                hold = if StaleHold == 1 || Buggy == 2 { hold } else { 2 };
+                hlegs = if StaleHold == 1 || Buggy == 2 { hlegs } else { 1 };
+                same = 1;
             }
             action OtherTurnRuns when (pending == 0 && walled == 0 && other == 0) {
                 other = 1;
@@ -1137,6 +1376,7 @@ pub fn supervisor_land_model() -> Model {
                 hlegs = 0;
             }
             action HumanWork when (pending == 0 && walled == 0) {
+                listed = 0;
                 said = 0;
                 need = 0;
                 dirty = 0;
@@ -1151,8 +1391,12 @@ pub fn supervisor_land_model() -> Model {
                 hold = if typed == 1 && relanded == 0 { 1 } else { 0 };
                 hlegs = 0;
                 same = 0;
+                owed = 0;
+                audited = 0;
+                rest = 0;
             }
             action OtherTurnDefense when (pending == 0 && walled == 0) {
+                listed = 0;
                 said = 2;
                 need = 0;
                 dirty = 0;
@@ -1167,19 +1411,25 @@ pub fn supervisor_land_model() -> Model {
                 hold = if typed == 1 && relanded == 0 { 1 } else { 0 };
                 hlegs = 0;
                 same = 0;
+                owed = 0;
+                audited = 0;
+                rest = 0;
             }
             // A person's own exchange once the session worked (a reply, or a landing): under Land it
             // interrupts the work, a turn end Land carries on from as from a person's work (owner
-            // ruling 2026-10-27). The exchange that opens a session is theirs, and lies outside
-            // this model, whose walks begin after a point.
+            // ruling 2026-10-27). It is no prompt of aterm's, so it adds nothing to the short
+            // streak (v6 §14.17.5.7): the streak stands at the agent's own short answers, and
+            // Land's next act waits the back-off they earned, from this point, or none. The
+            // exchange that opens a session is theirs, and lies outside this model, whose walks
+            // begin after a point.
             action PersonExchange when (pending == 0 && walled == 0 && (said > 0 || landed == 1)) {
+                listed = 0;
                 said = 0;
                 need = 0;
                 dirty = 0;
                 asked = 0;
                 cut = 0;
-                short = 0;
-                backoff = 0;
+                backoff = short;
                 landed = 0;
                 other = 0;
                 told = 0;
@@ -1187,8 +1437,11 @@ pub fn supervisor_land_model() -> Model {
                 hold = if typed == 1 && relanded == 0 { 1 } else { 0 };
                 hlegs = 0;
                 same = 0;
+                owed = 0;
+                rest = 0;
             }
             action OtherTurnWall when (pending == 0 && walled == 0) {
+                listed = 0;
                 said = 0;
                 dirty = 0;
                 asked = 0;
@@ -1202,12 +1455,15 @@ pub fn supervisor_land_model() -> Model {
                 hold = if typed == 1 && relanded == 0 { 1 } else { 0 };
                 hlegs = 0;
                 same = 0;
+                owed = 0;
+                audited = 0;
+                rest = 0;
             }
             action SeedLanded when (
                 pending == 0 && (walled == 0 || Buggy == 1) && need == 0 && other == 0
             ) {
                 landed = 1;
-                said = 2;
+                said = 4;
                 dirty = 0;
                 told = 1;
                 judged = 0;
@@ -1229,8 +1485,11 @@ pub fn supervisor_land_model() -> Model {
             }
 
             invariant LandNeverGoesQuiet: quiet == 0;
-            invariant LandedOnlyByCleanDefense:
-                landed == 0 || (said == 2 && need == 0 && dirty == 0);
+            invariant LandedOnlyByAudit: landed == 0 || (said == 4 && dirty == 0);
+            invariant NoCheckOverDirty: typed_check_dirty == 0;
+            invariant OneCheckPerDefense: typed_check_audited == 0;
+            invariant ANeedRestTypesNothing: typed_in_rest == 0;
+            invariant ALandedKeepsItsNeed: dropped == 0;
             invariant ANeedNeverBlocks: held == 0;
             invariant NeverTypeIntoALandedTask: typed_landed == 0;
             invariant AWallIsNeverLeftOnALandedTask: walled == 0 || landed == 0;
@@ -1248,15 +1507,21 @@ pub fn supervisor_land_model() -> Model {
                     ((hold == 1 && judged == 0 && hlegs == 0) ||
                         (hold == 2 && judged == 1 &&
                             (cut == 1 ||
-                                hlegs == (if said <= 1 { 8 } else { 0 }) +
-                                    (if said == 3 { 4 } else { 0 }) +
-                                    (if said == 2 && need == 1 { 1 } else { 0 }) +
+                                hlegs == (if said <= 1 && listed == 0 { 8 } else { 0 }) +
+                                    (if listed == 1 { 4 } else { 0 }) +
+                                    (if (said == 2 || said == 6) && need == 1 { 1 } else { 0 }) +
                                     (if dirty == 1 { 2 } else { 0 })))));
         }
     }
 }
 
-/// Liveness specification asserting Autopilot Land never rests short of landing.
+/// Liveness specification asserting Autopilot Land never rests short of landing, every act and
+/// the outage's cap weakly fair. A person's exchange adds nothing to the short streak (v6
+/// §14.17.5.7), so it re-arms only the back-off the agent's own short answers earned, and another
+/// comes only past the agent's reply, which an act of Land's or a turn of real work (no streak
+/// left) went before: no run of other turns leaves the nudge or the cap enabled again and again
+/// without either standing, and the decider types the nudge at the first point past each
+/// back-off, as the cap's clock runs on.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::liveness(supervisor_land_model)]
@@ -1267,15 +1532,16 @@ pub fn supervisor_land_liveness() -> Liveness {
         goal: or_(
             or_(
                 or_(eq(var("pending"), int(1)), eq(var("pending"), int(2))),
-                eq(var("pending"), int(3)),
+                or_(eq(var("pending"), int(3)), eq(var("pending"), int(4))),
             ),
             or_(
-                eq(var("landed"), int(1)),
+                or_(eq(var("landed"), int(1)), eq(var("rest"), int(1))),
                 or_(eq(var("other"), int(1)), eq(var("same"), int(2))),
             ),
         ),
         weak: vec![
             "Instruction",
+            "Check",
             "Nudge",
             "Answer",
             "WallAct",
@@ -2193,9 +2459,19 @@ pub fn supervisor_decline_keys_model() -> Model {
 /// last try, *may have cleared* for a blind try. That the line is all that is typed, never a
 /// retry's words, is the conformance walk's to hold: the model has no words but the line's.
 ///
+/// Slice 12c (v6 §14.17.5.4) adds what clears an outage ahead of a blind try. A WITNESS, another
+/// session's turn on the same route (the program and the endpoint its launch names) finished
+/// with a real reply after the wall's last try, resumes the wait at once, *has cleared*: once per
+/// outage (a resume on a witness that meets the wall again leaves the ladder to try it), never
+/// into a route measured down, and never at a rate limit, which is the account's. Another route's
+/// witness clears nothing. And a rate limit whose words name its `retry-after` takes its first
+/// try then, bounded by the cap, and no later try sooner than it.
+///
 /// `kind`: 0 no wall, 1 a connection the host measures, 2 an overload or a server error (never
-/// measured). `reach`, at a connection wall: 0 unknown, 1 down, 2 up since the last try, 3 up
-/// before it. `gap` is the decider's rung, `rung` the ladder's own.
+/// measured), 3 a rate limit (429) naming its `retry-after`, `After` ticks. `reach`, at a
+/// connection wall: 0 unknown, 1 down, 2 up since the last try, 3 up before it. `gap` is the
+/// decider's rung, `rung` the ladder's own. `witness`: 0 none since the last try, 1 one on the
+/// wall's own route, 2 one on another route only; `witnessed` the track's resume on a witness.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn supervisor_outage_wait_model() -> Model {
@@ -2203,6 +2479,7 @@ pub fn supervisor_outage_wait_model() -> Model {
         SupervisorOutageWait {
             const Buggy = 0;
             const First = 1;
+            const After = 2;
             const Cap = 4;
             var kind = 0;
             var reach = 0;
@@ -2214,14 +2491,35 @@ pub fn supervisor_outage_wait_model() -> Model {
             var typed_down = 0;
             var early = 0;
             var misworded = 0;
+            var witness = 0;
+            var witnessed = 0;
+            var witness_resumes = 0;
+            var rushed = 0;
+            var crossed = 0;
+            var rate_cleared = 0;
 
             action ConnectionMeets when (kind == 0 && turn == 0) {
                 kind = 1;
                 waited = 0;
+                witness = 0;
             }
             action OverloadMeets when (kind == 0 && turn == 0) {
                 kind = 2;
                 waited = 0;
+                witness = 0;
+            }
+            action RateMeets when (kind == 0 && turn == 0) {
+                kind = 3;
+                waited = 0;
+                witness = 0;
+                gap = if Buggy == 5 { gap } else { After };
+            }
+
+            action SameRouteAnswers when (kind > 0 && turn == 0 && (witness == 0 || witness == 2)) {
+                witness = 1;
+            }
+            action OtherRouteAnswers when (kind > 0 && turn == 0 && witness == 0) {
+                witness = 2;
             }
 
             action MeasureDown when (kind == 1 && turn == 0 && (reach == 0 || reach > 1)) {
@@ -2244,6 +2542,8 @@ pub fn supervisor_outage_wait_model() -> Model {
             ) {
                 resumes = if resumes <= 1 { resumes + 1 } else { resumes };
                 misworded = if reach == 2 { misworded } else { 1 };
+                witnessed = if witness == 1 { 1 } else { witnessed };
+                witness = 0;
                 gap = if Buggy == 2 {
                     gap
                 } else if gap + gap <= Cap || (Buggy == 3 && gap <= Cap) {
@@ -2255,15 +2555,65 @@ pub fn supervisor_outage_wait_model() -> Model {
                 waited = 0;
                 turn = 1;
             }
+            action ResumeWitnessed when (
+                kind > 0 && turn == 0 && (Buggy <= 8 || Buggy > 9) &&
+                (kind == 2 || kind == 3 || reach == 0 || reach == 1 || reach == 3) &&
+                (
+                    (witness == 1 && (witnessed == 0 || Buggy == 7) &&
+                        (kind == 2 || (kind == 1 && (reach == 0 || reach == 3)) ||
+                            Buggy == 8)) ||
+                    (Buggy == 6 && witness == 2 && witnessed == 0 &&
+                        (kind == 2 || (kind == 1 && (reach == 0 || reach == 3))))
+                )
+            ) {
+                typed_down = if kind == 1 && reach == 1 { 1 } else { typed_down };
+                crossed = if witness == 2 { 1 } else { crossed };
+                rate_cleared = if kind == 3 { 1 } else { rate_cleared };
+                witness_resumes = if witness_resumes <= 1 { witness_resumes + 1 } else { witness_resumes };
+                witnessed = 1;
+                witness = 0;
+                gap = if Buggy == 2 {
+                    gap
+                } else if kind == 3 {
+                    if rung + rung <= Cap {
+                        if After <= rung + rung { rung + rung } else { After }
+                    } else {
+                        Cap
+                    }
+                } else if gap + gap <= Cap || (Buggy == 3 && gap <= Cap) {
+                    gap + gap
+                } else {
+                    Cap
+                };
+                rung = if rung + rung <= Cap { rung + rung } else { Cap };
+                waited = 0;
+                turn = 1;
+            }
             action TryBlind when (
                 kind > 0 && turn == 0 && gap <= waited &&
-                (kind == 2 || reach == 0 || reach == 3 || Buggy == 1)
+                (kind == 2 || reach == 0 || reach == 3 || Buggy == 1) &&
+                (witness == 0 || witness == 2 || witnessed == 1 || kind == 3 ||
+                    (kind == 1 && reach == 1) || Buggy == 1 || Buggy == 9)
             ) {
                 typed_down = if kind == 1 && reach == 1 { 1 } else { typed_down };
                 early = if waited <= rung - 1 { 1 } else { early };
-                misworded = if kind == 1 && reach == 2 { 1 } else { misworded };
+                rushed = if kind == 3 && waited <= After - 1 { 1 } else { rushed };
+                misworded = if (kind == 1 && reach == 2) ||
+                    (witness == 1 && witnessed == 0 &&
+                        (kind == 2 || (kind == 1 && (reach == 0 || reach == 3)))) {
+                    1
+                } else {
+                    misworded
+                };
+                witness = 0;
                 gap = if Buggy == 2 {
                     gap
+                } else if kind == 3 && (Buggy <= 4 || Buggy > 5) {
+                    if rung + rung <= Cap {
+                        if After <= rung + rung { rung + rung } else { After }
+                    } else {
+                        Cap
+                    }
                 } else if gap + gap <= Cap || (Buggy == 3 && gap <= Cap) {
                     gap + gap
                 } else {
@@ -2286,17 +2636,25 @@ pub fn supervisor_outage_wait_model() -> Model {
                 gap = First;
                 rung = First;
                 reach = if reach == 2 { 3 } else { reach };
+                witness = 0;
+                witnessed = 0;
+                witness_resumes = 0;
             }
 
             invariant NothingTypedWhileMeasuredDown: typed_down == 0;
             invariant NoTryBeforeItsRung: early == 0;
+            invariant NoTryBeforeItsRetryAfter: rushed == 0;
             invariant OneResumePerMeasuredClearing: resumes <= 1;
+            invariant OneWitnessedResumePerOutage: witness_resumes <= 1;
+            invariant NoWitnessOfAnotherRouteClears: crossed == 0;
+            invariant NoWitnessClearsARateLimit: rate_cleared == 0;
             invariant TheGapStaysUnderItsCap: gap <= Cap;
             invariant TheLineSaysHowItCleared: misworded == 0;
             bound GapBox: gap <= Cap + Cap;
             bound WaitedBox: waited <= Cap + Cap;
             bound RungBox: rung <= Cap;
             bound ResumesBox: resumes <= 2;
+            bound WitnessResumesBox: witness_resumes <= 2;
         }
     }
 }

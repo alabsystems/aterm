@@ -6,8 +6,6 @@
 
 use crate::handoff_env::HandoffName;
 
-const SUCCESSOR_DESCRIPTOR_FLOOR: u64 = 4096;
-
 /// The lane a successor's sessions arrive on, for the record its raise leaves
 /// ([`settle_incoming_descriptor_limit`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,8 +83,7 @@ fn raise_descriptor_limit_for_tabs() {
 
 /// The soft limit to raise to from `soft` under `hard`.
 pub(crate) fn raised_soft_limit(soft: u64, hard: u64) -> Option<u64> {
-    let target = SUCCESSOR_DESCRIPTOR_FLOOR.min(hard);
-    (target > soft).then_some(target)
+    aterm_uds::spawnfd::raised_soft_nofile_target(soft, hard)
 }
 
 static LAUNCHER_SOFT_NOFILE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();

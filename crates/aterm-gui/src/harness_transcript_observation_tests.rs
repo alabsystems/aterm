@@ -90,7 +90,7 @@ fn transcript_usage_and_walls_admit_the_captured_source_at_the_writer() {
                                 logins,
                                 "main",
                                 None,
-                                "/login/new",
+                                &crate::test_host::abs("/login/new"),
                                 None,
                                 ACCT_NOW,
                             ))
@@ -147,6 +147,7 @@ fn transcript_usage_and_walls_admit_the_captured_source_at_the_writer() {
             );
             let before = bytes(writer);
             let wall = WallRead {
+                screen_wall: None,
                 env: &env,
                 settled: true,
                 started: Some(ACCT_NOW - 120),

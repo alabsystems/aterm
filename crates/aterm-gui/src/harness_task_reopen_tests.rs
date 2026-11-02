@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for `App::reopen_self_claim_landing` on turns started after a proven self-claim landing.
+//! Tests for `App::reopen_self_claim_landing` on turns started after a proven self-claim landing, and the end its next landing is.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -832,6 +832,76 @@ fn a_self_claims_face_stands_across_its_own_reexec() {
         tab.says(WORKING);
         tab.sweep();
         assert_eq!(tab.face(), Some(TaskFace::Open), "{case}: the next turn");
+        tab.done();
+    }
+}
+
+/// THE PROGRAM'S OWN REPORTS ARE ITS WORK (§11.2.3's floor, `END_WORK_MS`): aterm's reader reads
+/// no phase from codex-alab's screen (`agent=unknown`), so the A/B book charges the turns its OSC
+/// 7501 reports say, and a landing after 40 s of them is an end, a Done for you row's; one after
+/// 8 s is none.
+#[test]
+fn a_self_claims_reported_work_past_the_floor_makes_its_landing_an_end() {
+    for (worked, end) in [(40_000, true), (8_000, false)] {
+        let mut tab = Tab::new();
+        tab.says(IDLE);
+        tab.sweep();
+        tab.lands();
+        assert!(!tab.app.end_unseen(tab.session), "from no face: no end");
+        tab.says(WORKING);
+        tab.sweep();
+        assert_eq!(tab.face(), Some(TaskFace::Open), "a turn begun reopens it");
+        crate::turn_ledger::advance_for_test(worked);
+        tab.says(DONE);
+        tab.sweep();
+        let now = crate::turn_ledger::now_ms();
+        let charged = tab.app.harness_screen.ab.worked(tab.session, now);
+        assert!(
+            (worked..worked + 1_000).contains(&charged),
+            "the reported turn is the task's work: {charged} ms"
+        );
+        tab.lands();
+        assert_eq!(
+            tab.app.end_unseen(tab.session),
+            end,
+            "a landing after {worked} ms of reported work"
+        );
+        tab.done();
+    }
+}
+
+/// AN ERROR REPORT IS A WAIT, NOT A TURN END (§14.17.5): a codex-alab turn an API or connection
+/// error ended (`state=error`) opens no A/B stretch, where an idle or done report opens an
+/// at-prompt one, which Cruise and Land would book against the harness. CONTROL: `done` opens it.
+#[test]
+fn a_self_claims_error_report_charges_no_phase() {
+    use crate::harness_ab::AbPhase;
+    const ERROR: &[u8] = b"\x1b]7501;state=error:app=codex\x1b\\";
+    for (rest, phase) in [(ERROR, None), (DONE, Some(AbPhase::AtPrompt))] {
+        let mut tab = Tab::new();
+        tab.says(WORKING);
+        tab.sweep();
+        assert_eq!(
+            tab.app
+                .harness_screen
+                .ab
+                .stretch(tab.session)
+                .map(|(p, _, _)| p),
+            Some(AbPhase::Busy),
+            "a reported turn is busy"
+        );
+        tab.says(rest);
+        tab.sweep();
+        assert_eq!(
+            tab.app
+                .harness_screen
+                .ab
+                .stretch(tab.session)
+                .map(|(p, _, _)| p),
+            phase,
+            "{}",
+            String::from_utf8_lossy(rest)
+        );
         tab.done();
     }
 }

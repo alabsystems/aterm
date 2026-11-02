@@ -891,7 +891,7 @@ pub fn principal_in_home(home: &Path) -> Option<[u8; 32]> {
 }
 
 /// How long a cached `/usage` reading stays current ([`current_windows`]).
-const USAGE_CURRENT_S: i64 = 15 * 60;
+pub(crate) const USAGE_CURRENT_S: i64 = 15 * 60;
 
 /// How long a weekly figure is shown at all ([`WeeklyFigure::words`]): past
 /// [`USAGE_CURRENT_S`] with its age, past this not at all (Claude Code reuses its own
@@ -901,7 +901,7 @@ pub const USAGE_SHOWN_S: i64 = 60 * 60;
 /// How far ahead of the reader's clock a weekly figure may be stamped and still read as just
 /// read ([`WeeklyFigure::words`]): a tap reading written in the second after the resolver
 /// took its clock, or a fleet peer's clock a little ahead.
-const USAGE_SKEW_S: i64 = 60;
+pub(crate) const USAGE_SKEW_S: i64 = 60;
 
 /// Facts for the requested on-screen account/subscription display.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -1021,11 +1021,11 @@ impl WeeklyGap {
     #[must_use]
     pub const fn words(self) -> &'static str {
         match self {
-            Self::TapOff => "weekly ? \u{b7} tap off",
-            Self::Unoffered(_) | Self::Unrestarted => "weekly ? \u{b7} untapped",
-            Self::Untapped => "weekly ? \u{b7} until relaunch",
-            Self::NoReply => "weekly ? \u{b7} no reply yet",
-            Self::Stale => "weekly ? \u{b7} no reply 1h",
+            Self::TapOff => "weekly \u{2013} \u{b7} tap off",
+            Self::Unoffered(_) | Self::Unrestarted => "weekly \u{2013} \u{b7} untapped",
+            Self::Untapped => "weekly \u{2013} \u{b7} until relaunch",
+            Self::NoReply => "weekly \u{2013} \u{b7} no reply yet",
+            Self::Stale => "weekly \u{2013} \u{b7} no reply 1h",
         }
     }
 
@@ -1173,6 +1173,22 @@ static MUSE_USAGE_FETCHING: std::sync::atomic::AtomicBool =
 /// own mint bound, so a retry never asks sooner than the mint could answer.
 const MUSE_USAGE_RETRY_S: i64 = 60;
 
+fn non_empty_env_var<'a>(env: &'a [String], key: &str) -> Option<&'a str> {
+    env.iter().find_map(|entry| {
+        entry
+            .strip_prefix(key)?
+            .strip_prefix('=')
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn abs_home_dir(env: &[String], user_home: &Path) -> PathBuf {
+    non_empty_env_var(env, "HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| user_home.to_path_buf())
+}
+
 /// The account a Muse Code process is signed in as, with its weekly quota
 /// ([`SubscriptionDisplay`]): the login `~/.config/muse/auth.json` names, and the week a
 /// bounded `muse serve` usage refresh reads ([`super::muse_usage`]), cached per config
@@ -1187,19 +1203,14 @@ pub fn muse_subscription_for(
     prev: &SubscriptionDisplay,
     now: i64,
 ) -> Option<SubscriptionDisplay> {
-    let var = |key: &str| {
-        env.iter()
-            .find_map(|entry| entry.strip_prefix(key)?.strip_prefix('='))
-            .filter(|value| !value.is_empty())
-    };
+    let var = |key: &str| non_empty_env_var(env, key);
     if var("META_API_KEY").is_some() {
         return None;
     }
+    let home_dir = abs_home_dir(env, user_home);
     let config = match var("XDG_CONFIG_HOME").map(PathBuf::from) {
         Some(xdg) if xdg.is_absolute() => xdg,
-        _ => var("HOME")
-            .map_or_else(|| user_home.to_path_buf(), PathBuf::from)
-            .join(".config"),
+        _ => home_dir.join(".config"),
     }
     .join("muse");
     let provider = match muse_provider_arg(argv) {
@@ -1254,7 +1265,6 @@ pub fn muse_subscription_for(
         && !muse_usage_attempt_recent(cached.as_ref(), now)
         && let Some(exe) = muse_exe_for(argv, env, user_home)
     {
-        let home_dir = var("HOME").map_or_else(|| user_home.to_path_buf(), PathBuf::from);
         kick_muse_usage_fetch(
             key.clone(),
             exe,
@@ -1393,10 +1403,7 @@ fn launched_exe_for(
         if first.is_absolute() && first.is_file() {
             return Some(first.to_path_buf());
         }
-        if let Some(path) = env
-            .iter()
-            .find_map(|entry| entry.strip_prefix("PATH="))
-            .filter(|value| !value.is_empty())
+        if let Some(path) = non_empty_env_var(env, "PATH")
             && let Some(exe) = super::login_drive::on_path(first, std::ffi::OsStr::new(path))
         {
             return Some(exe);
@@ -1428,9 +1435,7 @@ fn muse_exe_for(argv: &[String], env: &[String], user_home: &Path) -> Option<Pat
 /// store [`muse_subscription_for`] just read the login from.
 fn muse_serve_env(env: &[String], home_dir: &Path) -> Vec<(&'static str, std::ffi::OsString)> {
     let named = |key: &str| {
-        env.iter()
-            .find_map(|entry| entry.strip_prefix(key)?.strip_prefix('='))
-            .filter(|value| !value.is_empty())
+        non_empty_env_var(env, key)
             .map(std::ffi::OsString::from)
             .or_else(|| std::env::var_os(key).filter(|value| !value.is_empty()))
     };
@@ -1441,10 +1446,8 @@ fn muse_serve_env(env: &[String], home_dir: &Path) -> Vec<(&'static str, std::ff
         .collect();
     out.push(("PATH", named("PATH").unwrap_or_default()));
     out.push(("HOME", home_dir.as_os_str().to_os_string()));
-    if let Some(xdg) = env
-        .iter()
-        .find_map(|entry| entry.strip_prefix("XDG_CONFIG_HOME="))
-        .filter(|value| Path::new(value).is_absolute())
+    if let Some(xdg) =
+        non_empty_env_var(env, "XDG_CONFIG_HOME").filter(|value| Path::new(value).is_absolute())
     {
         out.push(("XDG_CONFIG_HOME", std::ffi::OsString::from(xdg)));
     }
@@ -1458,24 +1461,27 @@ fn muse_provider_arg(argv: &[String]) -> Option<String> {
             .then(|| value.trim().trim_matches('"').trim().to_ascii_lowercase())
     };
     let mut provider = None;
-    let mut i = 0;
+    let mut i = 1;
     while let Some(arg) = argv.get(i) {
         if arg == "--" {
             break;
         }
         if arg == "--provider" {
-            provider = argv.get(i + 1).map(|value| value.to_ascii_lowercase());
-            i += 2;
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--provider=") {
+            if let Some(value) = argv.get(i + 1).filter(|s| s.as_str() != "--") {
+                provider = Some(value.to_ascii_lowercase());
+                i += 2;
+                continue;
+            }
+        } else if let Some(value) = arg.strip_prefix("--provider=") {
             provider = Some(value.to_ascii_lowercase());
         } else if matches!(arg.as_str(), "-c" | "--config") {
-            if let Some(named) = argv.get(i + 1).and_then(|spec| config_provider(spec)) {
-                provider = Some(named);
+            if let Some(spec) = argv.get(i + 1).filter(|s| s.as_str() != "--") {
+                if let Some(named) = config_provider(spec) {
+                    provider = Some(named);
+                }
+                i += 2;
+                continue;
             }
-            i += 2;
-            continue;
         } else if let Some(named) = arg
             .strip_prefix("-c=")
             .or_else(|| arg.strip_prefix("--config="))
@@ -1483,6 +1489,11 @@ fn muse_provider_arg(argv: &[String]) -> Option<String> {
             .and_then(config_provider)
         {
             provider = Some(named);
+        } else if super::upgrade_muse::takes_value(arg)
+            && argv.get(i + 1).is_some_and(|s| s.as_str() != "--")
+        {
+            i += 2;
+            continue;
         }
         i += 1;
     }
@@ -1504,7 +1515,12 @@ pub fn parse_agy_auth_log(bytes: &[u8]) -> Option<String> {
         let Some((_, rest)) = line.split_once("applyAuthResult: ") else {
             continue;
         };
-        let (email, after) = rest.strip_prefix("email=")?.split_once(", authMethod=")?;
+        let Some((email, after)) = rest
+            .strip_prefix("email=")
+            .and_then(|s| s.split_once(", authMethod="))
+        else {
+            continue;
+        };
         let method = after.split(',').next().unwrap_or_default().trim();
         let email = email.trim();
         return (method == "consumer"
@@ -1577,15 +1593,21 @@ where
             break;
         }
         if matches!(arg.as_str(), "--log-file" | "-log-file") {
-            log_arg = argv.get(i + 1).cloned();
-            i += 2;
-            continue;
-        }
-        if let Some(v) = arg
+            if let Some(next) = argv.get(i + 1).filter(|s| s.as_str() != "--") {
+                log_arg = Some(next.clone());
+                i += 2;
+                continue;
+            }
+        } else if let Some(v) = arg
             .strip_prefix("--log-file=")
             .or_else(|| arg.strip_prefix("-log-file="))
         {
             log_arg = Some(v.to_owned());
+        } else if super::upgrade_agy::takes_value(arg)
+            && argv.get(i + 1).is_some_and(|s| s.as_str() != "--")
+        {
+            i += 2;
+            continue;
         }
         i += 1;
     }
@@ -1666,6 +1688,14 @@ pub fn parse_agy_model_label(label: &str) -> Option<(String, Option<String>)> {
             return Some((named, Some(level.to_owned())));
         }
     }
+    if !t.contains(' ')
+        && let Some((stem, tail)) = t.rsplit_once('-')
+        && let Some(level) = super::footer::effort_level(&tail.to_ascii_lowercase())
+        && let Some(named) =
+            super::footer::footer_model_name(if t.starts_with("claude-") { stem } else { t })
+    {
+        return Some((named, Some(level.to_owned())));
+    }
     super::footer::footer_model_name(t).map(|named| (named, None))
 }
 
@@ -1680,7 +1710,7 @@ pub fn parse_agy_model_log(bytes: &[u8]) -> Option<(String, Option<String>)> {
         else {
             continue;
         };
-        let Some(label) = rest.strip_suffix('"').or_else(|| rest.split('"').next()) else {
+        let Some((label, _)) = rest.split_once('"') else {
             continue;
         };
         if let Some(parsed) = parse_agy_model_label(label) {
@@ -1690,7 +1720,10 @@ pub fn parse_agy_model_log(bytes: &[u8]) -> Option<(String, Option<String>)> {
     None
 }
 
-fn non_claude_argv_model_effort(argv: &[String]) -> (Option<String>, Option<String>, bool, bool) {
+fn non_claude_argv_model_effort(
+    argv: &[String],
+    is_muse: bool,
+) -> (Option<String>, Option<String>, bool, bool) {
     fn apply_config_kv(
         spec: &str,
         raw_model: &mut Option<String>,
@@ -1707,6 +1740,11 @@ fn non_claude_argv_model_effort(argv: &[String]) -> (Option<String>, Option<Stri
             }
         }
     }
+    let takes_value = if is_muse {
+        super::upgrade_muse::takes_value
+    } else {
+        super::upgrade_agy::takes_value
+    };
     let mut raw_model = None;
     let mut raw_effort = None;
     let mut i = 1;
@@ -1715,11 +1753,12 @@ fn non_claude_argv_model_effort(argv: &[String]) -> (Option<String>, Option<Stri
             break;
         }
         if matches!(arg.as_str(), "--model" | "-model" | "-m") {
-            raw_model = argv.get(i + 1).cloned();
-            i += 2;
-            continue;
-        }
-        if let Some(v) = arg
+            if let Some(next) = argv.get(i + 1).filter(|s| s.as_str() != "--") {
+                raw_model = Some(next.clone());
+                i += 2;
+                continue;
+            }
+        } else if let Some(v) = arg
             .strip_prefix("--model=")
             .or_else(|| arg.strip_prefix("-model="))
             .or_else(|| arg.strip_prefix("-m="))
@@ -1729,9 +1768,11 @@ fn non_claude_argv_model_effort(argv: &[String]) -> (Option<String>, Option<Stri
             arg.as_str(),
             "--effort" | "-effort" | "--reasoning-effort" | "-reasoning-effort"
         ) {
-            raw_effort = argv.get(i + 1).cloned();
-            i += 2;
-            continue;
+            if let Some(next) = argv.get(i + 1).filter(|s| s.as_str() != "--") {
+                raw_effort = Some(next.clone());
+                i += 2;
+                continue;
+            }
         } else if let Some(v) = arg
             .strip_prefix("--effort=")
             .or_else(|| arg.strip_prefix("-effort="))
@@ -1739,18 +1780,22 @@ fn non_claude_argv_model_effort(argv: &[String]) -> (Option<String>, Option<Stri
             .or_else(|| arg.strip_prefix("-reasoning-effort="))
         {
             raw_effort = Some(v.to_owned());
-        } else if matches!(arg.as_str(), "-c" | "--config") {
-            if let Some(spec) = argv.get(i + 1) {
+        } else if is_muse && matches!(arg.as_str(), "-c" | "--config") {
+            if let Some(spec) = argv.get(i + 1).filter(|s| s.as_str() != "--") {
                 apply_config_kv(spec, &mut raw_model, &mut raw_effort);
+                i += 2;
+                continue;
             }
-            i += 2;
-            continue;
-        } else if let Some(spec) = arg
-            .strip_prefix("-c=")
-            .or_else(|| arg.strip_prefix("--config="))
-            .or_else(|| arg.strip_prefix("-c"))
+        } else if is_muse
+            && let Some(spec) = arg
+                .strip_prefix("-c=")
+                .or_else(|| arg.strip_prefix("--config="))
+                .or_else(|| arg.strip_prefix("-c"))
         {
             apply_config_kv(spec, &mut raw_model, &mut raw_effort);
+        } else if takes_value(arg) && argv.get(i + 1).is_some_and(|s| s.as_str() != "--") {
+            i += 2;
+            continue;
         }
         i += 1;
     }
@@ -1797,15 +1842,12 @@ pub fn agy_model_effort_for(
     env: &[String],
     user_home: &Path,
 ) -> (Option<String>, Option<String>, bool, bool) {
-    let (argv_model, argv_effort, model_open, effort_open) = non_claude_argv_model_effort(argv);
+    let (argv_model, argv_effort, model_open, effort_open) =
+        non_claude_argv_model_effort(argv, false);
     if argv_model.is_some() && argv_effort.is_some() {
         return (argv_model, argv_effort, model_open, effort_open);
     }
-    let var = |key: &str| {
-        env.iter()
-            .find_map(|entry| entry.strip_prefix(key)?.strip_prefix('='))
-            .filter(|value| !value.is_empty())
-    };
+    let var = |key: &str| non_empty_env_var(env, key);
     let Some(config) = (match var("AGY_CLI_CONFIG_DIR").map(PathBuf::from) {
         Some(dir) if dir.is_absolute() => Some(dir),
         _ => super::upgrade_agy::config_dir(argv, var("HOME"), user_home),
@@ -1837,20 +1879,15 @@ pub fn muse_model_effort_for(
     env: &[String],
     user_home: &Path,
 ) -> (Option<String>, Option<String>, bool, bool) {
-    let (argv_model, argv_effort, model_open, effort_open) = non_claude_argv_model_effort(argv);
+    let (argv_model, argv_effort, model_open, effort_open) =
+        non_claude_argv_model_effort(argv, true);
     if argv_model.is_some() && argv_effort.is_some() {
         return (argv_model, argv_effort, model_open, effort_open);
     }
-    let var = |key: &str| {
-        env.iter()
-            .find_map(|entry| entry.strip_prefix(key)?.strip_prefix('='))
-            .filter(|value| !value.is_empty())
-    };
+    let var = |key: &str| non_empty_env_var(env, key);
     let config = match var("XDG_CONFIG_HOME").map(PathBuf::from) {
         Some(xdg) if xdg.is_absolute() => xdg,
-        _ => var("HOME")
-            .map_or_else(|| user_home.to_path_buf(), PathBuf::from)
-            .join(".config"),
+        _ => abs_home_dir(env, user_home).join(".config"),
     }
     .join("muse");
     let (cfg_model, cfg_effort) = settings_model_effort(&config.join("settings.json"));
@@ -1951,11 +1988,7 @@ pub fn agy_resume_for(
     user_home: &Path,
     files: Option<&[PathBuf]>,
 ) -> Option<String> {
-    let var = |key: &str| {
-        env.iter()
-            .find_map(|entry| entry.strip_prefix(key)?.strip_prefix('='))
-            .filter(|value| !value.is_empty())
-    };
+    let var = |key: &str| non_empty_env_var(env, key);
     let default_config = super::upgrade_agy::config_dir(argv, var("HOME"), user_home);
     let config = match var("AGY_CLI_CONFIG_DIR").map(PathBuf::from) {
         Some(dir) if dir.is_absolute() => dir,
@@ -1988,11 +2021,7 @@ pub fn agy_excerpts_for(
     files: Option<&[PathBuf]>,
 ) -> Option<(super::excerpt::Excerpts, u64)> {
     const WINDOW: u64 = 64 * 1024;
-    let var = |key: &str| {
-        env.iter()
-            .find_map(|entry| entry.strip_prefix(key)?.strip_prefix('='))
-            .filter(|value| !value.is_empty())
-    };
+    let var = |key: &str| non_empty_env_var(env, key);
     let config = match var("AGY_CLI_CONFIG_DIR").map(PathBuf::from) {
         Some(dir) if dir.is_absolute() => dir,
         _ => super::upgrade_agy::config_dir(argv, var("HOME"), user_home)?,
@@ -2021,11 +2050,7 @@ fn muse_active_session_lock(
     user_home: &Path,
     files: Option<&[PathBuf]>,
 ) -> Option<(String, Option<PathBuf>)> {
-    let var = |key: &str| {
-        env.iter()
-            .find_map(|entry| entry.strip_prefix(key)?.strip_prefix('='))
-            .filter(|value| !value.is_empty())
-    };
+    let var = |key: &str| non_empty_env_var(env, key);
     let data = super::upgrade_muse::data_home(
         var(super::upgrade_muse::DATA_ENV),
         var(super::upgrade_muse::HOME_ENV),
@@ -2096,11 +2121,7 @@ pub fn muse_resume_for(
     user_home: &Path,
     files: Option<&[PathBuf]>,
 ) -> Option<String> {
-    let var = |key: &str| {
-        env.iter()
-            .find_map(|entry| entry.strip_prefix(key)?.strip_prefix('='))
-            .filter(|value| !value.is_empty())
-    };
+    let var = |key: &str| non_empty_env_var(env, key);
     let (session, _) = muse_active_session_lock(pid, argv, env, user_home, files)?;
     let relaunch_env = super::upgrade_muse::relaunch_env(var, user_home);
     super::upgrade_muse::told_line(&session, &relaunch_env)
@@ -2176,11 +2197,13 @@ fn agy_quota_store_for(
     cfg_var: Option<&str>,
     user_home: &Path,
 ) -> Option<super::agy_quota_store::Store> {
-    if cfg_var.is_some() || !std::env::var_os("HOME").is_some_and(|h| Path::new(&h) == user_home) {
+    let abs_cfg = cfg_var.filter(|dir| Path::new(dir).is_absolute());
+    if abs_cfg.is_some() || !std::env::var_os("HOME").is_some_and(|h| Path::new(&h) == user_home) {
         return None;
     }
     let state = super::agy_quota_store::machine_state()?;
-    let home_override = home_var.filter(|h| Path::new(h) != user_home);
+    let home_override =
+        home_var.filter(|h| Path::new(h).is_absolute() && Path::new(h) != user_home);
     let flags = super::upgrade_agy::config_flags(argv);
     Some(super::agy_quota_store::Store::new(
         &state,
@@ -2198,11 +2221,7 @@ pub fn agy_subscription_for(
     model: Option<&str>,
     now: i64,
 ) -> Option<SubscriptionDisplay> {
-    let var = |key: &str| {
-        env.iter()
-            .find_map(|entry| entry.strip_prefix(key)?.strip_prefix('='))
-            .filter(|value| !value.is_empty())
-    };
+    let var = |key: &str| non_empty_env_var(env, key);
     let store = agy_quota_store_for(argv, var("HOME"), var("AGY_CLI_CONFIG_DIR"), user_home);
     agy_subscription_with_store(argv, env, user_home, prev, model, now, store.as_ref())
 }
@@ -2216,15 +2235,11 @@ fn agy_subscription_with_store(
     now: i64,
     store: Option<&super::agy_quota_store::Store>,
 ) -> Option<SubscriptionDisplay> {
-    let var = |key: &str| {
-        env.iter()
-            .find_map(|entry| entry.strip_prefix(key)?.strip_prefix('='))
-            .filter(|value| !value.is_empty())
-    };
+    let var = |key: &str| non_empty_env_var(env, key);
     if var("GEMINI_API_KEY").is_some() || var("GOOGLE_API_KEY").is_some() {
         return None;
     }
-    let home_dir = var("HOME").map_or_else(|| user_home.to_path_buf(), PathBuf::from);
+    let home_dir = abs_home_dir(env, user_home);
     let config = match var("AGY_CLI_CONFIG_DIR").map(PathBuf::from) {
         Some(dir) if dir.is_absolute() => dir,
         _ => super::upgrade_agy::config_dir(argv, var("HOME"), user_home)?,
@@ -2250,7 +2265,11 @@ fn agy_subscription_with_store(
     });
     let third_party = active_model.as_deref().is_some_and(|m| {
         let lower = m.to_ascii_lowercase();
-        lower.contains("claude") || lower.contains("gpt")
+        lower.contains("claude")
+            || lower.contains("opus")
+            || lower.contains("sonnet")
+            || lower.contains("haiku")
+            || lower.contains("gpt")
     });
     let same_email = prev.email.as_deref() == Some(email.as_str());
     let account_switched = prev.email.is_some() && !same_email;
@@ -2309,7 +2328,7 @@ fn agy_subscription_with_store(
                     let bytes = fetch_agy_usage_doc(
                         &exe,
                         argv,
-                        var("AGY_CLI_CONFIG_DIR"),
+                        var("AGY_CLI_CONFIG_DIR").filter(|dir| Path::new(dir).is_absolute()),
                         &home_dir,
                         super::agy_quota_store::LAUNCH_READ_BUDGET,
                     );

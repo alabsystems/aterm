@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 const UNDO_LIMIT: usize = 64;
 /// Admission budget shared by startup, watcher reloads and Manual's semantic analysis.
-pub(crate) const MAX_CONFIG_FILE_BYTES: usize = 512 * 1024;
+pub(crate) const MAX_CONFIG_FILE_BYTES: usize = atpkg::config::MAX_PACKAGES_CONFIG_BYTES;
 
 #[derive(Clone, PartialEq)]
 pub(crate) struct ConfigSnapshot {

@@ -441,7 +441,7 @@ pub fn exec_ran(row: &ItemReport) -> Result<Ran, String> {
         Some("killed") => None,
         Some(to) => Some(
             to.strip_prefix("exit ")
-                .and_then(|n| n.parse::<i32>().ok())
+                .and_then(crate::parse_int::<i32>)
                 .ok_or_else(|| format!("exec: {to:?} is not an exit status"))?,
         ),
     };
@@ -1322,6 +1322,15 @@ mod tests {
             String::from_utf8(fake.written("/A/state/runs/1-5/progress.ndjson").unwrap()).unwrap();
         assert_eq!(text.lines().count(), 2);
         assert!(text.starts_with("{\"started\""));
+    }
+
+    #[test]
+    fn exec_ran_rejects_plus_prefixed_exit_status() {
+        let mut r = row("exec.check", "exec", "check".into());
+        r.to = Some("exit +0".into());
+        assert!(exec_ran(&r).is_err());
+        r.to = Some("exit 0".into());
+        assert_eq!(exec_ran(&r).unwrap().status, Some(0));
     }
 }
 

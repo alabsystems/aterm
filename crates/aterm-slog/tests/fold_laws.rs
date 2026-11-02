@@ -520,6 +520,68 @@ fn clause_rows_in_order() {
     assert!(log.state().top_need().is_none(), "`seen` clears a failure");
 }
 
+/// A RUNNING PROGRAM'S CLAUSE (fix J1-2, SMOKE-2d): the fold's run slot is the deepest open
+/// run, so while a command's external program runs it is the `prog` run the status sweep opened
+/// beneath the `cmd` (whose open carries no `detail=` until its program is heard), and the
+/// clause names the program as the `cmd` row names a command; a lone command still reads its
+/// `detail=`, and an agent run at rest still reads `idle`.
+#[test]
+fn a_running_programs_clause_names_it() {
+    use aterm_slog::ClauseRow;
+    let now = |ms: u64| WALL0 + ms;
+    let clause = |log: &Log, ms: u64| {
+        log.fold()
+            .clause(now(ms))
+            .map(|c| (c.row, c.words.as_str().to_string(), c.tone))
+    };
+    let mut log = Log::new(0);
+    let cmd = log
+        .open(Open::new(Kind::Cmd, Src::Shell, Conf::Strong), at(0))
+        .expect("cmd");
+    let prog = log
+        .open(
+            Open::new(Kind::Prog, Src::Status, Conf::Strong)
+                .under(cmd)
+                .fields(Fields::new().tok(Key::Prog, "sleep").expect("prog")),
+            at(1_000),
+        )
+        .expect("prog");
+    assert_eq!(
+        log.state().run().map(|r| (r.node, r.kind)),
+        Some((prog, Kind::Prog)),
+        "the run slot is the program's"
+    );
+    assert_eq!(
+        clause(&log, 41_000),
+        Some((ClauseRow::Run, "sleep · 40s".to_string(), Tone::Working)),
+        "a running program's clause names it, aged from its own open"
+    );
+
+    let mut log = Log::new(0);
+    let f = Fields::new().tok(Key::Detail, "make").expect("detail");
+    let cmd = log
+        .open(
+            Open::new(Kind::Cmd, Src::Shell, Conf::Strong).fields(f),
+            at(0),
+        )
+        .expect("cmd");
+    assert_eq!(
+        clause(&log, 90_000),
+        Some((ClauseRow::Run, "make · 1m".to_string(), Tone::Working)),
+        "a lone command names its detail"
+    );
+    log.open(
+        Open::new(Kind::Agent, Src::Status, Conf::Strong).under(cmd),
+        at(1),
+    )
+    .expect("agent");
+    assert_eq!(
+        clause(&log, 2),
+        Some((ClauseRow::Run, "idle".to_string(), Tone::Idle)),
+        "an agent run at rest reads idle"
+    );
+}
+
 /// THE FAILURE-SUPERSEDE RULE ([`aterm_slog::lifts_failure`]): a shell
 /// command's failure is the newest command's outcome, as `status outcome=`
 /// holds it.

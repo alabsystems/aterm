@@ -250,6 +250,7 @@ const fn noted_swatch(w: Noted) -> &'static str {
         | Noted::Deferred
         | Noted::Thawed
         | Noted::Note
+        | Noted::Receipt
         | Noted::Unstuck
         | Noted::Sleep => "event",
     }
@@ -294,6 +295,7 @@ const fn noted_marks(w: Noted) -> &'static str {
         Noted::Unstuck => {
             "watcher: an UNSTUCK line, Esc on a turn the Mac slept through in the vendor's API retry"
         }
+        Noted::Receipt => "watcher: a RECEIPT line, what aterm checked at a landing",
     }
 }
 

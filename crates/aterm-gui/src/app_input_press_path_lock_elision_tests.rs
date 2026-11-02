@@ -230,6 +230,425 @@ fn glow_tick(
     glow.spawns()
 }
 
+#[cfg(unix)]
+fn preedit_agent() -> (App, i32, crate::cursor_glow::GlowConfig) {
+    let (mut app, pipe, cfg) = rainbow_app();
+    let session = app.front_terminal(WindowId(0)).unwrap().session;
+    const GROUP: i32 = 40_001;
+    app.session_factory.fg_probe = |master| master;
+    app.session_factory.handed_terminal = |_| false;
+    app.pool.sessions.get_mut(&session).unwrap().session.master = GROUP;
+    let ctx = app.pool.get(session).unwrap().ctx.clone();
+    {
+        let mut timeline = ctx.timeline.lock().unwrap();
+        timeline.note_foreground_group(GROUP);
+        timeline.set_program(GROUP, Some("codex".into()));
+    }
+    assert!(app.boundary_keeps_hand(WindowId(0)));
+    (app, pipe, cfg)
+}
+
+/// The real terminal's cursor and print run feed the same engine as the GUI producer.
+#[cfg(unix)]
+fn preedit_frame(app: &mut App, cfg: &crate::cursor_glow::GlowConfig, at: std::time::Instant) {
+    let term = app.front_terminal(WindowId(0)).unwrap().term.clone();
+    let (caret, visible, anchor, glyph, row) = {
+        let term = term_lock(&term);
+        let caret = term.cursor();
+        let mut row = Vec::new();
+        let _ = term.row_cols_into(usize::from(caret.row), &mut row);
+        (
+            (caret.row, caret.col),
+            term.cursor_visible(),
+            term.print_anchor(),
+            term.print_anchor_glyph(),
+            row,
+        )
+    };
+    let glow = &mut app
+        .windows
+        .get_mut(&WindowId(0))
+        .unwrap()
+        .fx
+        .cursor_mut()
+        .glow;
+    glow.observe_caret_drawn(visible);
+    glow.observe_print_anchor_glyph(anchor, glyph);
+    glow.observe_row(caret.0, caret.1, &row, at);
+    glow_tick(app, cfg, caret, at);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_inactive_ime_clear_cannot_park_the_first_echo_when_the_agent_reader_is_busy() {
+    type Notify = fn(&mut App, WindowId);
+    let notifications: [(&str, Notify, bool); 3] = [
+        (
+            "empty preedit",
+            |app, wid| app.on_ime_preedit(wid, String::new(), None),
+            false,
+        ),
+        ("enablement", App::on_ime_enablement_changed, false),
+        (
+            "former generic boundary",
+            |app, wid| {
+                app.clear_move_license(wid);
+                app.on_ime_preedit(wid, String::new(), None);
+            },
+            true,
+        ),
+    ];
+    for ended in [false, true] {
+        for (name, notify, refused) in notifications {
+            let (mut app, pipe, cfg) = preedit_agent();
+            let wid = WindowId(0);
+            let tape = Tape::new();
+            let term = app.front_terminal(wid).unwrap().term.clone();
+            let ctx = app
+                .pool
+                .get(app.front_terminal(wid).unwrap().session)
+                .unwrap()
+                .ctx
+                .clone();
+            let at = tape.step();
+            app.windows.get_mut(&wid).unwrap().ime_compose = ended.then_some((at, true));
+            {
+                let _reader = ctx.timeline.lock().unwrap();
+                notify(&mut app, wid);
+            }
+            assert!(app.windows[&wid].preedit.is_empty());
+            assert_eq!(app.windows[&wid].preedit_caret, None);
+            term_lock(&term).process(b"\x1b[2;1Hstatus\x1b[1;1H");
+            preedit_frame(&mut app, &cfg, tape.step());
+            assert_eq!(
+                app.windows[&wid].fx.cursor().glow.caret_row_parked(),
+                refused,
+                "{name}, ended={ended}"
+            );
+            tape.step();
+            human_press(&mut app, Key::Character('x'), Modifiers::empty());
+            assert_eq!(drain(pipe), b"x");
+            term_lock(&term).process(b"x");
+            preedit_frame(&mut app, &cfg, tape.step());
+            let glow = &app.windows[&wid].fx.cursor().glow;
+            assert_eq!(glow.spawns(), u64::from(!refused), "{name}, ended={ended}");
+            let verdict = glow.admission_log().last().unwrap();
+            assert_eq!(
+                verdict.phase == crate::cursor_glow::AdmissionPhase::Declined,
+                refused
+            );
+            assert_eq!(verdict.program_row_refusal.is_some(), refused);
+            drop(app);
+            unsafe {
+                libc::close(pipe);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn real_preedit_start_and_active_clear_keep_their_generic_boundary() {
+    for (text, keep_preedit) in [("compose", false), ("", false), ("", true)] {
+        let (mut app, pipe, cfg) = preedit_agent();
+        let wid = WindowId(0);
+        let tape = Tape::new();
+        let term = app.front_terminal(wid).unwrap().term.clone();
+        let ctx = app
+            .pool
+            .get(app.front_terminal(wid).unwrap().session)
+            .unwrap()
+            .ctx
+            .clone();
+        if text.is_empty() {
+            // Establish a real active composition while its known owner is readable.
+            // This case must create its own doubt, not inherit the start case's.
+            app.on_ime_preedit(wid, "compose".into(), None);
+            let window = app.windows.get_mut(&wid).unwrap();
+            if !keep_preedit {
+                // Native fields retain the text outside the window projection.
+                window.preedit.clear();
+            }
+        }
+        assert!(!app.windows[&wid].fx.cursor().glow.caret_row_parked());
+        let at = tape.step();
+        app.windows
+            .get_mut(&wid)
+            .unwrap()
+            .fx
+            .cursor_mut()
+            .glow
+            .note_typed(at);
+        {
+            let _reader = ctx.timeline.lock().unwrap();
+            // A posted composition uses the same boundary without taking the person's
+            // blocking ledger path while this test deliberately holds its reader.
+            app.with_controller_mark(true, |app| app.on_ime_preedit(wid, text.into(), None));
+        }
+        assert!(!app.windows[&wid].fx.cursor().glow.move_licensed(at));
+        assert_eq!(app.windows[&wid].preedit, text);
+        assert_eq!(app.windows[&wid].ime_compose.unwrap().1, text.is_empty());
+        term_lock(&term).process(b"\x1b[2;1Hstatus\x1b[1;1H");
+        preedit_frame(&mut app, &cfg, tape.step());
+        assert!(app.windows[&wid].fx.cursor().glow.caret_row_parked());
+        assert!(drain(pipe).is_empty(), "preedit never commits input");
+        assert_eq!(app.windows[&wid].fx.cursor().glow.spawns(), 0);
+        drop(app);
+        unsafe {
+            libc::close(pipe);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn an_inactive_ime_clear_retires_hints_without_settling_existing_parked_doubt() {
+    let (mut app, pipe, cfg) = preedit_agent();
+    let wid = WindowId(0);
+    let tape = Tape::new();
+    let term = app.front_terminal(wid).unwrap().term.clone();
+    let ctx = app
+        .pool
+        .get(app.front_terminal(wid).unwrap().session)
+        .unwrap()
+        .ctx
+        .clone();
+    let boundary_at = tape.step();
+    {
+        let _reader = ctx.timeline.lock().unwrap();
+        app.on_ime_commit(wid, String::new());
+    }
+    term_lock(&term).process(b"\x1b[2;1Hstatus\x1b[1;1H");
+    preedit_frame(&mut app, &cfg, tape.step());
+    let at = tape.step();
+    app.windows
+        .get_mut(&wid)
+        .unwrap()
+        .fx
+        .cursor_mut()
+        .glow
+        .note_typed(at);
+    assert!(app.windows[&wid].fx.cursor().glow.move_licensed(at));
+    assert!(app.windows[&wid].fx.cursor().glow.caret_row_parked());
+    {
+        let _reader = ctx.timeline.lock().unwrap();
+        app.on_ime_preedit(wid, String::new(), None);
+    }
+    let glow = &app.windows[&wid].fx.cursor().glow;
+    assert!(!glow.move_licensed(at));
+    assert!(glow.caret_row_parked());
+    assert_eq!(glow.spawns(), 0);
+    assert_eq!(glow.admission_log().count(), 0);
+    assert!(drain(pipe).is_empty());
+    tape.step();
+    human_press(&mut app, Key::Character('x'), Modifiers::empty());
+    assert_eq!(drain(pipe), b"x");
+    term_lock(&term).process(b"x");
+    preedit_frame(&mut app, &cfg, tape.step());
+    let record = app.windows[&wid]
+        .fx
+        .cursor()
+        .glow
+        .admission_log()
+        .last()
+        .copied()
+        .unwrap();
+    assert_eq!(record.phase, crate::cursor_glow::AdmissionPhase::Declined);
+    assert_eq!(
+        record.parked_boundary,
+        Some(crate::cursor_glow::CaretBoundary {
+            seq: 1,
+            origin: crate::cursor_glow::BoundaryOrigin::ImeCommit,
+            at: boundary_at,
+        })
+    );
+    drop(app);
+    unsafe {
+        libc::close(pipe);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_same_grid_window_resize_keeps_the_first_echo_owned_without_relaxing_control_fences() {
+    for (raw_control, window_px) in [(false, false), (false, true), (true, false)] {
+        let (mut app, pipe, cfg) = rainbow_app();
+        let wid = WindowId(0);
+        let tape = Tape::new();
+        assert!(
+            !app.boundary_keeps_hand(wid),
+            "the cold owner cannot supply a composer exemption"
+        );
+        let term = app.front_terminal(wid).unwrap().term.clone();
+        let ctx = app
+            .pool
+            .get(app.front_terminal(wid).unwrap().session)
+            .unwrap()
+            .ctx
+            .clone();
+        app.reconcile_licence(wid);
+        tape.step();
+        if raw_control {
+            let keep_hand = crate::control::control_fence(
+                aterm_types::control_verbs::input_of("send"),
+                "send",
+                "x",
+                false,
+            )
+            .expect("the raw control attempt has a fence");
+            ctx.licence.fence(keep_hand);
+            app.reconcile_licence(wid);
+        }
+        let (rows, cols) = (app.windows[&wid].rows, app.windows[&wid].cols);
+        let size = app.window_frame_px_for(wid, rows, cols);
+        assert_eq!(app.grid_dims_for(wid, size), (rows, cols));
+        if window_px {
+            assert_eq!(
+                app.input(
+                    wid,
+                    InputEvent::ResizeWindowPx {
+                        width: size.width,
+                        height: size.height,
+                    },
+                    Source::Controller,
+                ),
+                crate::input::InputOutcome::Ok,
+            );
+        } else {
+            app.on_resize(wid, size);
+        }
+        assert_eq!(
+            (app.windows[&wid].rows, app.windows[&wid].cols),
+            (rows, cols)
+        );
+        assert!(
+            !app.windows[&wid]
+                .fx
+                .cursor()
+                .glow
+                .move_licensed(tape.step())
+        );
+        term_lock(&term).process(b"\x1b[2;1Hstatus\x1b[1;1H");
+        preedit_frame(&mut app, &cfg, tape.step());
+        assert_eq!(
+            app.windows[&wid].fx.cursor().glow.caret_row_parked(),
+            raw_control
+        );
+        tape.step();
+        human_press(&mut app, Key::Character('x'), Modifiers::empty());
+        assert_eq!(drain(pipe), b"x");
+        term_lock(&term).process(b"x");
+        preedit_frame(&mut app, &cfg, tape.step());
+        let glow = &app.windows[&wid].fx.cursor().glow;
+        assert_eq!(glow.spawns(), u64::from(!raw_control));
+        let record = glow.admission_log().last().unwrap();
+        assert_eq!(
+            record.phase == crate::cursor_glow::AdmissionPhase::Declined,
+            raw_control
+        );
+        if raw_control {
+            assert_eq!(
+                record.parked_boundary.unwrap().origin,
+                crate::cursor_glow::BoundaryOrigin::ControlFence
+            );
+        }
+        drop(app);
+        unsafe {
+            libc::close(pipe);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_same_grid_resize_retires_hints_without_replacing_an_existing_parked_boundary() {
+    let (mut app, pipe, cfg) = rainbow_app();
+    let wid = WindowId(0);
+    let tape = Tape::new();
+    let term = app.front_terminal(wid).unwrap().term.clone();
+    let boundary_at = tape.step();
+    app.clear_move_license(wid);
+    term_lock(&term).process(b"\x1b[2;1Hstatus\x1b[1;1H");
+    preedit_frame(&mut app, &cfg, tape.step());
+    assert!(app.windows[&wid].fx.cursor().glow.caret_row_parked());
+    let at = tape.step();
+    app.windows
+        .get_mut(&wid)
+        .unwrap()
+        .fx
+        .cursor_mut()
+        .glow
+        .note_typed(at);
+    assert!(app.windows[&wid].fx.cursor().glow.move_licensed(at));
+    let (rows, cols) = (app.windows[&wid].rows, app.windows[&wid].cols);
+    let size = app.window_frame_px_for(wid, rows, cols);
+    app.on_resize(wid, size);
+    assert!(!app.windows[&wid].fx.cursor().glow.move_licensed(at));
+    assert!(app.windows[&wid].fx.cursor().glow.caret_row_parked());
+    tape.step();
+    human_press(&mut app, Key::Character('x'), Modifiers::empty());
+    assert_eq!(drain(pipe), b"x");
+    term_lock(&term).process(b"x");
+    preedit_frame(&mut app, &cfg, tape.step());
+    let record = app.windows[&wid]
+        .fx
+        .cursor()
+        .glow
+        .admission_log()
+        .last()
+        .copied()
+        .unwrap();
+    assert_eq!(record.phase, crate::cursor_glow::AdmissionPhase::Declined);
+    assert_eq!(record.parked_boundary.unwrap().at, boundary_at);
+    assert_eq!(record.parked_boundary.unwrap().seq, 1);
+    drop(app);
+    unsafe {
+        libc::close(pipe);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_changed_window_grid_retires_old_key_credit_before_new_coordinate_output() {
+    let (mut app, pipe, cfg) = rainbow_app();
+    let wid = WindowId(0);
+    let tape = Tape::new();
+    let term = app.front_terminal(wid).unwrap().term.clone();
+    let at = tape.step();
+    human_press(&mut app, Key::Character('a'), Modifiers::empty());
+    assert_eq!(drain(pipe), b"a");
+    assert!(app.windows[&wid].fx.cursor().glow.move_licensed(at));
+    let (rows, cols) = (app.windows[&wid].rows + 1, app.windows[&wid].cols);
+    let size = app.window_frame_px_for(wid, rows, cols);
+    assert_eq!(app.grid_dims_for(wid, size), (rows, cols));
+    app.on_resize(wid, size);
+    assert_eq!(
+        (app.windows[&wid].rows, app.windows[&wid].cols),
+        (rows, cols)
+    );
+    assert!(
+        !app.windows[&wid]
+            .fx
+            .cursor()
+            .glow
+            .move_licensed(tape.step())
+    );
+    preedit_frame(&mut app, &cfg, tape.step());
+    term_lock(&term).process(b"a");
+    preedit_frame(&mut app, &cfg, tape.step());
+    let glow = &app.windows[&wid].fx.cursor().glow;
+    assert_eq!(glow.spawns(), 0, "the old key pays for no post-regrid move");
+    assert_eq!(
+        glow.admission_log().last().unwrap().phase,
+        crate::cursor_glow::AdmissionPhase::Declined
+    );
+    assert!(drain(pipe).is_empty());
+    drop(app);
+    unsafe {
+        libc::close(pipe);
+    }
+}
+
 /// Admission history belongs to the views that produced it, not the tab or
 /// same-session mirror that happens to be front when the diagnostics are read.
 #[cfg(unix)]

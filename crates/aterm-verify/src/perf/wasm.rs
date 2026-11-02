@@ -280,14 +280,15 @@ fn build_modules(
 ) -> Result<PathBuf, String> {
     // STOCK EXCEPTION: Trust lacks a wasm32 std.
     let stable = crate::rustup::Toolchain::resolve(rustup, "stable")?;
-    let neutral = std::env::temp_dir().join(format!("aterm-wasm-bench-{}", std::process::id()));
-    std::fs::create_dir_all(&neutral)
-        .map_err(|e| format!("could not create {}: {e}", neutral.display()))?;
+    let neutral = aterm_tempfile::Builder::new()
+        .prefix("aterm-wasm-bench-")
+        .tempdir()
+        .map_err(|e| format!("could not create neutral build directory: {e}"))?;
     eprintln!("  building aterm-wasm + aterm-gpu-web (wasm32, {profile}) on stable");
     let mut build = stable.cargo();
     let target = root.join("target");
     if let Some(value) =
-        crate::fallback_build_dir(&crate::EnvSnapshot::capture(), &neutral, &target)
+        crate::fallback_build_dir(&crate::EnvSnapshot::capture(), neutral.path(), &target)
     {
         build.arg("--config").arg(value);
     }
@@ -295,7 +296,7 @@ fn build_modules(
         .env_remove("RUSTFLAGS")
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .env("CARGO_TARGET_DIR", &target)
-        .current_dir(&neutral)
+        .current_dir(neutral.path())
         .args([
             "build",
             "--profile",
@@ -316,7 +317,7 @@ fn build_modules(
         build.env("CARGO_NET_OFFLINE", "false");
     }
     let built = build.status();
-    let _ = std::fs::remove_dir_all(&neutral);
+    drop(neutral);
     match built {
         Ok(s) if s.success() => {}
         Ok(s) => return Err(format!("the stable wasm32 build exited {:?}", s.code())),

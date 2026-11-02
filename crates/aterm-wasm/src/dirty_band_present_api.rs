@@ -14,7 +14,7 @@ use aterm_wasm_abi::export;
 /// RGBA8, alpha = `255 - TT`).
 #[inline]
 pub(crate) fn expand_rgba_band(pixels: &[u32], rgba: &mut [u8], start: usize, end: usize) {
-    let end = end.min(pixels.len());
+    let end = end.min(pixels.len()).min(rgba.len() / 4);
     let start = start.min(end);
     for (&p, out) in pixels[start..end]
         .iter()
@@ -35,9 +35,14 @@ pub(crate) fn shift_rgba_band(rgba: &mut [u8], w: usize, y0: usize, y1: usize, f
     if w == 0 || y0 >= y1 || frac_px == 0 {
         return;
     }
-    let stride = w * 4;
+    let Some(stride) = w.checked_mul(4) else {
+        return;
+    };
+    if y1.checked_mul(stride).is_none_or(|end| end > rgba.len()) {
+        return;
+    }
     let band_h = y1 - y0;
-    let mag = frac_px.unsigned_abs() as usize;
+    let mag = usize::try_from(frac_px.unsigned_abs()).unwrap_or(usize::MAX);
     let moved = band_h.saturating_sub(mag);
     if frac_px > 0 {
         for i in 0..moved {
@@ -91,8 +96,12 @@ pub(crate) fn dirty_rows_to_bands(
         while r < dirty.len() && dirty[r] {
             r += 1;
         }
-        let y0 = (grid_top + run_start * cell_h).min(frame_h);
-        let y1 = (grid_top + r * cell_h).min(frame_h);
+        let y0 = grid_top
+            .saturating_add(run_start.saturating_mul(cell_h))
+            .min(frame_h);
+        let y1 = grid_top
+            .saturating_add(r.saturating_mul(cell_h))
+            .min(frame_h);
         if y1 > y0 {
             out.extend_from_slice(&[0, y0 as i32, frame_w as i32, (y1 - y0) as i32]);
         }
@@ -137,7 +146,7 @@ impl AtermTerminal {
                     self.width,
                     grid_top,
                     y1,
-                    i64::from(delta_rows) * ch as i64,
+                    i64::from(delta_rows).saturating_mul(i64::try_from(ch).unwrap_or(i64::MAX)),
                 );
                 dirty_rows_to_bands(
                     self.win.dirty_rows(),
@@ -224,6 +233,13 @@ mod tests {
         assert_eq!(out, vec![0, 95, 80, 5]);
         dirty_rows_to_bands(&[true], 100, 10, 80, 100, &mut out);
         assert!(out.is_empty(), "fully out-of-frame band drops");
+        dirty_rows_to_bands(&[false, true], usize::MAX, usize::MAX, 80, 100, &mut out);
+        assert!(out.is_empty());
+        let mut short = [1u8, 2, 3, 4];
+        expand_rgba_band(&[0x00112233, 0x00445566], &mut short, 0, 2);
+        assert_eq!(short, [0x11, 0x22, 0x33, 0xff]);
+        shift_rgba_band(&mut short, 1, 0, 2, 1);
+        assert_eq!(short, [0x11, 0x22, 0x33, 0xff]);
     }
 
     #[test]

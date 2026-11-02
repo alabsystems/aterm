@@ -256,10 +256,17 @@ fn a_store_keeps_the_signed_bytes_of_each_unit_while_a_server_of_it_is_live() {
     crate::store::discard_build(&build);
     assert!(!beside.exists(), "a discarded build takes its unit with it");
     sweep_kept(&layout);
-    assert!(
-        !units_dir(&layout).join(&sha).exists(),
-        "and gc's sweep its link under units/"
-    );
+    if cfg!(unix) {
+        assert!(
+            !units_dir(&layout).join(&sha).exists(),
+            "and gc's sweep its link under units/"
+        );
+    } else {
+        // Off Unix there is no link count to read: the unit stands until the person's off.
+        assert!(units_dir(&layout).join(&sha).exists(), "kept until --off");
+        turn_off(&layout).unwrap();
+        assert!(!units_dir(&layout).exists(), "--off takes every unit");
+    }
 }
 
 #[test]
@@ -843,6 +850,16 @@ fn an_oversized_or_incomplete_request_head_is_refused_without_answering() {
         ask(&addr, &format!("GET /unit/{sha} HTTP/1.1\r\n\r\n")).starts_with("HTTP/1.1 200 OK\r\n"),
         "valid request still served"
     );
+
+    // Conflicting duplicate Content-Length headers are rejected; identical ones pass.
+    let mut dup_conflict = io::Cursor::new(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nContent-Length: 4\r\n\r\n".as_slice(),
+    );
+    assert_eq!(response_length(&mut dup_conflict), None);
+    let mut dup_same = io::Cursor::new(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nContent-Length: 9\r\n\r\n".as_slice(),
+    );
+    assert_eq!(response_length(&mut dup_same), Some(9));
 
     running.store(false, Ordering::Release);
     thread.join().unwrap();

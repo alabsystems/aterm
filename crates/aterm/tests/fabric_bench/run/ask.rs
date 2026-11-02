@@ -1293,10 +1293,54 @@ fn need_leg(s: &Stage, spec: &Spec) -> Vec<NeedBlock> {
 }
 
 /// The rows of the bridge's asked and deadline tables, read through the
-/// bridge's own state API (`StateDir::asked`, `deadlines`): every ask
-/// rewrites both whole (`set_asked`, `set_deadlines`).
+/// bridge's own state API (`StateDir::asked`, `deadlines`): what the asks
+/// journal (`journal/asks`) holds, each ask's recipient and deadline one
+/// append to it (C04).
 fn table_rows(state: &StateDir) -> (usize, usize) {
     (state.asked().len(), state.deadlines().len())
+}
+
+/// The principal every pre-filled asked row names ([`prefill_asked`]).
+const PREFILL_TO: &str = "n-prefill";
+
+/// C04'S KNOB: the asked table pre-filled to `rows` rows before the legs,
+/// written where a build before the asks journal kept it (`<state>/asked`,
+/// one `<off> <to>` line a row, no hand-off named) and taken in by the
+/// bridge aterm restarts after a kill, as a node that upgraded with a full
+/// table holds it. Its offsets run up from 0: an ask the legs post at one of
+/// them takes over that row, and one past them trims the lowest, so at
+/// [`crate::spec::ASKED_PREFILL_MAX`] the table stays full through every leg.
+fn prefill_asked(w: &World, rows: usize) {
+    if rows == 0 {
+        return;
+    }
+    let table: Vec<String> = (0..rows as u64)
+        .map(|off| {
+            aterm_link::state::Asked {
+                off,
+                to: PREFILL_TO.to_string(),
+            }
+            .render()
+        })
+        .collect();
+    std::fs::write(w.state.join("asked"), table.join("\n") + "\n")
+        .expect("the asked table an older build wrote");
+    eprintln!(
+        "fabric bench: asks, the asked table pre-filled to {rows} rows; restarting the bridge"
+    );
+    // A bridge opens its tally's name exclusively (`Recorder::at`), and the killed one would
+    // leave it occupied, so the next bridge would run with no tally. This one keeps writing to
+    // the file it holds open until the kill.
+    std::fs::remove_file(w.state.join(wait_tally::FILE)).expect("the old bridge's tally's name");
+    w.restart_bridge();
+    let read = StateDir::open(&w.state)
+        .expect("the bridge's state dir")
+        .asked();
+    assert!(
+        read.len() >= rows,
+        "the pre-filled asked table reads {} rows, not {rows}",
+        read.len()
+    );
 }
 
 /// Whether both tables grew by a leg's `asks` unanswered asks (each to its
@@ -1352,6 +1396,15 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         0,
         "the ask world's sessions' presence rows, and every bystander's, to say live",
     );
+    if spec.asked_prefill > 0 {
+        prefill_asked(&w, spec.asked_prefill);
+        wait_live(
+            &w,
+            &live,
+            0,
+            "the ask world's presence rows to say live again after the bridge's restart",
+        );
+    }
     let ruler = Ruler::for_world(&w);
     let mut cal_seq = 0;
     let cal_before = calibrate(&ruler, &w.node, clock, &mut cal_seq);
@@ -1458,6 +1511,7 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             .map(|(at, (asked, deadlines))| json!({ "at": at, "asked": asked, "deadlines": deadlines }))
             .collect::<Vec<_>>(),
         "asks": spec.asks,
+        "asked_prefill": spec.asked_prefill,
         "warmup": spec.warmup,
         "bystanders": spec.bystanders,
     });
@@ -1468,19 +1522,29 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             "A world of its own, the bridge's wait tally on, {} idle bystander session(s). An ask \
              (`post kind=ask dl={DL_MS}`) waits for its landing by default: aterm answers `OK \
              <id> off=<n>` — RELEASES it — once the bridge retires the post (`outbox sent`), \
-             after its ack and `post_landed`'s writes (the self-ack append, and for an ask the \
-             asked and deadline tables, each rewritten whole). Acked and durable are the broker's \
+             after its ack and `post_landed`'s writes (the self-ack append, and for an ask one \
+             append of its recipient and its deadline to the asks journal, `journal/asks`). \
+             Acked and durable are the broker's \
              heads, as in the messaging section. A release later than {:.3} ms after its ack — \
              the bridge's idle ack grace ({} ms, `IDLE_ACK_GRACE`) plus one barrier ({} ms, the \
              ordered yardstick's p50) — is counted late. Every block waits for the bridge's \
              tally past the last post's inbox commit before the next, so the tally's rows below \
-             are each block's own. Every ask rewrites the bridge's asked and deadline tables \
-             whole, and they grow over the legs (none of the arm's asks is answered but the \
-             receipts', and none expires inside the run): their rows were {}.\n",
+             are each block's own. The bridge's asked and deadline tables (the asks journal's) \
+             grow over the legs (none of the arm's asks is answered but the receipts', and none \
+             expires inside the run){}: their rows were {}.\n",
             spec.bystanders,
             ctx.threshold,
             ms_of(IDLE_ACK_GRACE),
             fmt_x(barrier),
+            if spec.asked_prefill > 0 {
+                format!(
+                    ", the asked table pre-filled to {} rows before them (an older build's \
+                     table, taken in by a restarted bridge)",
+                    spec.asked_prefill
+                )
+            } else {
+                String::new()
+            },
             tables_text(&legs.tables),
         ),
     ];
@@ -2085,8 +2149,9 @@ fn person_report(ctx: &Reading, p: &Person) -> (Value, Vec<String>) {
     }
     md.push(
         "Where the bridge's loop spent an ask, without and with the pager (the pager's own \
-         writes are not the bridge's, so no row counts them; among the state dir's replaces \
-         are the bridge's asked and deadline tables, each rewritten whole by every ask):\n"
+         writes are not the bridge's, so no row counts them; among the state dir's appends \
+         is each ask's one to the asks journal, and among its replaces that journal's rewrite \
+         at its size bound):\n"
             .to_string(),
     );
     md.extend(steps_rows(&[
@@ -2473,6 +2538,43 @@ mod tests {
         assert!(moved.contains("0/0 after 100 unanswered asks"), "{moved}");
         assert!(tables_grew((0, 0), (100, 0), 100).is_err());
         assert!(tables_grew((5, 5), (104, 105), 100).is_err());
+    }
+
+    /// C04: the prefill fills the asked table to its cap and no further, and
+    /// it is written as a build before the asks journal wrote the table, so the
+    /// bridge's state API reads every row of it. CONTROL: a row past the cap
+    /// is trimmed, the lowest offset first.
+    #[test]
+    fn the_asked_prefill_fills_the_table_to_its_cap_as_an_older_build_wrote_it() {
+        use super::*;
+        use aterm_link::state::{ASKED_KEEP, Asked};
+
+        assert_eq!(crate::spec::ASKED_PREFILL_MAX, ASKED_KEEP);
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("fb-prefill")
+            .tempdir_in("/tmp")
+            .expect("scratch");
+        let rows = |n: u64| -> String {
+            (0..n)
+                .map(|off| {
+                    Asked {
+                        off,
+                        to: PREFILL_TO.to_string(),
+                    }
+                    .render()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n"
+        };
+        std::fs::write(dir.path().join("asked"), rows(ASKED_KEEP as u64)).expect("the table");
+        let read = StateDir::peek(dir.path()).asked();
+        assert_eq!(read.len(), ASKED_KEEP);
+        assert!(read.iter().all(|row| row.to == PREFILL_TO));
+        std::fs::write(dir.path().join("asked"), rows(ASKED_KEEP as u64 + 1)).expect("CONTROL");
+        let read = StateDir::peek(dir.path()).asked();
+        assert_eq!(read.len(), ASKED_KEEP, "CONTROL: trimmed to the cap");
+        assert_eq!(read[0].off, 1, "CONTROL: the lowest offset first");
     }
 
     #[test]

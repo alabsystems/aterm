@@ -26,7 +26,7 @@ const ARCHES: [&str; 2] = ["arm64", "x86_64"];
 /// line, whose releases are its minors, only 10.15.
 fn release(version: &str) -> Option<&'static (u64, &'static str, &'static str)> {
     let mut parts = version.split('.');
-    let major: u64 = parts.next()?.parse().ok()?;
+    let major: u64 = parts.next().filter(|s| !s.starts_with('+'))?.parse().ok()?;
     if major == 10 && parts.next() != Some("15") {
         return None;
     }
@@ -40,7 +40,12 @@ pub fn release_xcode(macos: &str) -> Option<String> {
     if let Some((.., xcode)) = release(macos) {
         return Some((*xcode).to_string());
     }
-    let major: u64 = macos.split('.').next()?.parse().ok()?;
+    let major: u64 = macos
+        .split('.')
+        .next()
+        .filter(|s| !s.starts_with('+'))?
+        .parse()
+        .ok()?;
     (major > RELEASES[0].0).then(|| format!("{major}.0"))
 }
 
@@ -151,7 +156,12 @@ impl Machine {
     /// The macOS major version (`27`).
     #[must_use]
     pub fn macos_major(&self) -> Option<u64> {
-        self.macos_version()?.split('.').next()?.parse().ok()
+        self.macos_version()?
+            .split('.')
+            .next()
+            .filter(|s| !s.starts_with('+'))?
+            .parse()
+            .ok()
     }
 
     /// The installed Xcode's version, for `depends_on xcode:` floors.
@@ -628,6 +638,8 @@ mod tests {
             ("30.0", Some("30.0")),
             ("20.0", None),
             ("9.3", None),
+            ("+27.0", None),
+            ("+30.0", None),
             ("garbage", None),
         ] {
             assert_eq!(release_xcode(macos).as_deref(), xcode, "{macos}");

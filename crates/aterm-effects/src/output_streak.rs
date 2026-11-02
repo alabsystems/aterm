@@ -979,8 +979,8 @@ impl OutputStreak {
             };
             ci += 1;
             let life = 1.0 - c.progress;
-            let y = i32::from(c.row) * ch_i;
-            if y >= 0 && life > 0.0 {
+            if (c.row as usize) < geom.rows && life > 0.0 {
+                let y = i32::from(c.row) * ch_i;
                 let head = c.from_col as f32 + (c.to_col - c.from_col) as f32 * c.progress;
                 let col_end = (head.round() as i32).min(max_col);
                 let tail_f = f32::from(c.tail);
@@ -1015,17 +1015,18 @@ impl OutputStreak {
         if let Some(r) = self.ribbon {
             const INV_RIBBON_LINGER_S: f32 = 1000.0 / (RIBBON_LINGER_MS as f32);
             let fade = 1.0 - (r.since_output_s * INV_RIBBON_LINGER_S).clamp(0.0, 1.0) * 0.5;
-            let hue_step = HUE_SPAN / geom.cols.max(1) as f32;
-            let y = i32::from(r.row) * ch_i;
             let shape = 0.55 * fade;
             let a = (amp_255 * shape.clamp(0.0, 1.0)).round() as u8;
-            if y >= 0 && shape > 0.0 && a > 0 {
+            if (r.row as usize) < geom.rows && shape > 0.0 && a > 0 {
+                let hue_step = HUE_SPAN / geom.cols.max(1) as f32;
+                let y = i32::from(r.row) * ch_i;
                 let mut col = r.from_col.max(0);
                 let col_end = r.to_col.min(max_col);
+                let mut t = r.hue + col as f32 * hue_step;
                 while col <= col_end {
-                    let t = r.hue + col as f32 * hue_step;
                     Self::push_cell_alpha(out, geom, cfg, (y, col), t, a);
                     col += 1;
+                    t += hue_step;
                 }
             }
             fp = fp

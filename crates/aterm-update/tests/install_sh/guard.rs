@@ -162,18 +162,22 @@ fn a_truncated_pipe_runs_nothing() {
     assert!(breaches.is_empty(), "{}", breaches.join("\n"));
 }
 
-/// The first line of the whole-file group that stops any shell but bash.
+/// The one line before the whole-file group that stops any shell but bash.
 #[cfg(target_os = "macos")]
-const BASH_ONLY: &str = "if [ -z \"${BASH_VERSION:-}\" ]; then\n";
+const BASH_ONLY: &str = "[ -n \"${BASH_VERSION:-}\" ] || { echo ";
 
-/// What follows that stop: bash leaves POSIX mode.
+/// The whole-file group's first line.
+#[cfg(target_os = "macos")]
+const GROUP: &str = "\n{\n";
+
+/// What the group does first: bash leaves POSIX mode.
 #[cfg(target_os = "macos")]
 const LEAVE_POSIX: &str = "\nset +o posix\nshopt -u inherit_errexit 2>/dev/null || :\n";
 
-/// `<script>` piped into zsh, as `curl … | zsh` runs it, under a scratch home `<name>` with
-/// curl and gh logging stand-ins first on PATH.
+/// `<script>` piped into `<shell>`, as `curl … | <shell>` runs it, under a scratch home `<name>`
+/// with curl and gh logging stand-ins first on PATH.
 #[cfg(target_os = "macos")]
-fn piped_into_zsh(scratch: &Scratch, script: &Path, name: &str) -> Truncated {
+fn piped_into(scratch: &Scratch, shell: &str, script: &Path, name: &str) -> Truncated {
     let home = scratch.home(name);
     let log = scratch.join(&format!("{name}/calls.log"));
     let shim = scratch.mkdir(&format!("{name}/shim"));
@@ -181,7 +185,7 @@ fn piped_into_zsh(scratch: &Scratch, script: &Path, name: &str) -> Truncated {
     scratch.stand_in(&format!("{name}/shim/gh"), LOGGER);
     let mut cmd = aterm_uds::spawnfd::command("/bin/sh");
     cmd.arg("-c")
-        .arg(format!("exec /bin/zsh -s -- --no-open <{}", q(s(script))))
+        .arg(format!("exec {shell} -s -- --no-open <{}", q(s(script))))
         .env_clear();
     let path = format!("{}:{}", s(&shim), system_path());
     for (key, value) in hermetic(&home, &[("PATH", &path), ("SHIM_LOG", s(&log))]) {
@@ -195,50 +199,72 @@ fn piped_into_zsh(scratch: &Scratch, script: &Path, name: &str) -> Truncated {
     }
 }
 
-/// zsh parses the whole-file group and runs it by its own rules, so the group's first command
-/// stops any shell but bash, before a write or a request (round 12: `curl … | zsh` wrote
-/// --no-toolchain's lasting `auto_install = false` though no flag asked for it, and refused
-/// every release tag). The control, the script as it was, writes that exclusion.
+/// install.sh split around its stop line: what precedes it, the line, and what follows.
+#[cfg(target_os = "macos")]
+fn around_the_stop(text: &str) -> (&str, &str, &str) {
+    let at = text
+        .find(BASH_ONLY)
+        .expect("install.sh stops any shell but bash");
+    let end = at + text[at..].find('\n').expect("the stop is one line") + 1;
+    (&text[..at], &text[at..end], &text[end..])
+}
+
+/// The shells macOS ships that are not bash, as `curl … | <shell>` may run the script: zsh
+/// parses the whole-file group and would run it by its own rules, and dash (the `sh` of Debian
+/// and Ubuntu) and ksh cannot parse it at all.
+#[cfg(target_os = "macos")]
+const NOT_BASH: [&str; 3] = ["/bin/zsh", "/bin/dash", "/bin/ksh"];
+
+/// Any shell but bash stops at the line before the whole-file group and says to run the script
+/// with bash, before a write or a request (round 12: `curl … | zsh` wrote --no-toolchain's
+/// lasting `auto_install = false` though no flag asked for it, and refused every release tag;
+/// round 13: dash and ksh, which cannot parse the group, printed a syntax error from deep in
+/// the file, since a stop inside the group never ran for them). The controls: with no stop,
+/// zsh writes that exclusion; with the stop inside the group, as round 12 had it, dash and ksh
+/// never print the bash line.
 #[cfg(target_os = "macos")]
 #[test]
 fn only_bash_runs_the_installer() {
     let scratch = Scratch::new();
-    let zsh = piped_into_zsh(&scratch, &install_sh(), "guarded");
-    assert_eq!(zsh.run.code(), 2, "{}", zsh.run.all());
-    assert!(
-        zsh.run.stderr.contains("run this installer with bash")
-            && zsh.run.stderr.contains("| bash"),
-        "{}",
-        zsh.run.all()
-    );
-    assert!(
-        zsh.home.is_empty() && zsh.tmp.is_empty() && zsh.calls.is_empty(),
-        "HOME {:?}, TMPDIR {:?}, calls {:?}",
-        zsh.home,
-        zsh.tmp,
-        zsh.calls
-    );
+    for shell in NOT_BASH {
+        if !Path::new(shell).is_file() {
+            aterm_uds::host::could_not_run(format!("no {shell}: macOS ships it"));
+        }
+        let name = format!("guarded{}", shell.replace('/', "-"));
+        let piped = piped_into(&scratch, shell, &install_sh(), &name);
+        assert_eq!(piped.run.code(), 2, "{shell}: {}", piped.run.all());
+        assert!(
+            piped.run.stderr.contains("run this installer with bash")
+                && piped.run.stderr.contains("| bash"),
+            "{shell}: {}",
+            piped.run.all()
+        );
+        assert!(
+            piped.home.is_empty() && piped.tmp.is_empty() && piped.calls.is_empty(),
+            "{shell}: HOME {:?}, TMPDIR {:?}, calls {:?}",
+            piped.home,
+            piped.tmp,
+            piped.calls
+        );
+    }
 
-    // The control is the script as it was: bash's own mode taken only when bash runs it.
     let text = std::fs::read_to_string(install_sh()).expect("install.sh");
-    let at = text
-        .find(BASH_ONLY)
-        .expect("install.sh stops any shell but bash");
-    let end = at
-        + text[at..]
-            .find(LEAVE_POSIX)
-            .expect("then leaves POSIX mode")
-        + LEAVE_POSIX.len();
+    let (before, stop, after) = around_the_stop(&text);
+
+    // The first control is the script with no stop: bash's own mode taken only when bash runs it.
+    let leave = after
+        .find(LEAVE_POSIX)
+        .expect("the group first leaves POSIX mode");
     let unguarded = scratch.write(
         "unguarded/install.sh",
         format!(
-            "{}if [ -n \"${{BASH_VERSION:-}}\" ]; then\n{}fi\n{}",
-            &text[..at],
+            "{before}{}if [ -n \"${{BASH_VERSION:-}}\" ]; then\n{}fi\n{}",
+            &after[..=leave],
             LEAVE_POSIX.trim_start_matches('\n'),
-            &text[end..]
+            &after[leave + LEAVE_POSIX.len()..]
         ),
     );
-    let control = piped_into_zsh(&scratch, &unguarded, "control");
+    let control = piped_into(&scratch, "/bin/zsh", &unguarded, "control");
     assert!(
         control.home.iter().any(|e| e.ends_with("aterm/aterm.toml")),
         "without the stop zsh writes the exclusion: HOME {:?}: {}",
@@ -250,6 +276,28 @@ fn only_bash_runs_the_installer() {
         "{}",
         control.run.all()
     );
+
+    // The second is the stop inside the group, where round 12 put it.
+    let group = after.find(GROUP).expect("the whole-file group") + GROUP.len();
+    let inside = scratch.write(
+        "inside/install.sh",
+        format!("{before}{}{stop}{}", &after[..group], &after[group..]),
+    );
+    for shell in ["/bin/dash", "/bin/ksh"] {
+        let name = format!("inside{}", shell.replace('/', "-"));
+        let piped = piped_into(&scratch, shell, &inside, &name);
+        assert!(
+            piped.run.code() != 0 && !piped.run.stderr.contains("run this installer with bash"),
+            "{shell} never reaches a stop inside the group: {}",
+            piped.run.all()
+        );
+        assert!(
+            piped.home.is_empty() && piped.calls.is_empty(),
+            "{shell} runs nothing of it either: HOME {:?}, calls {:?}",
+            piped.home,
+            piped.calls
+        );
+    }
 }
 
 /// A cut inside a word runs nothing either: at every byte of each top-level line's first
@@ -999,6 +1047,8 @@ fn a_zdotdir_names_the_zshrc_to_edit_and_to_sweep() {
     assert!(run.all().contains(&listed), "{}", run.all());
 
     let mut lib = Lib::new();
+    // An ordinary account may name another directory; the test's scratch HOME is its account.
+    lib.step("account_homes() { printf '%s\\n' \"$HOME\"; }");
     let hint = |zdotdir: &str| {
         format!(
             "( {zdotdir}; SHELL=/bin/zsh BIN_DIR=/nowhere/bin ROOT_LOOKUP_PATH=/usr/bin \
@@ -1006,10 +1056,14 @@ fn a_zdotdir_names_the_zshrc_to_edit_and_to_sweep() {
         )
     };
     let home_var = lib.call("echo \"$HOME\"", &[]);
+    let outside = scratch.mkdir("outside-hint");
     let rows = [
-        ("export ZDOTDIR=/z", Some("/z/.zshrc")),
-        ("unset ZDOTDIR", None),
-        ("export ZDOTDIR=dots", None),
+        (
+            format!("export ZDOTDIR={}", q(s(&outside))),
+            Some(s(&outside.join(".zshrc")).to_owned()),
+        ),
+        ("unset ZDOTDIR".to_owned(), None),
+        ("export ZDOTDIR=dots".to_owned(), None),
     ];
     let calls: Vec<usize> = rows
         .iter()
@@ -1022,12 +1076,506 @@ fn a_zdotdir_names_the_zshrc_to_edit_and_to_sweep() {
             recs[i].out,
             format!(
                 "install.sh: NOTE: /nowhere/bin is not on your PATH — add it in {}, e.g.:",
-                want.unwrap_or(&zshrc)
+                want.as_deref().unwrap_or(&zshrc)
             ),
             "{set}: {}",
             recs[i].err
         );
     }
+}
+
+/// A `ZDOTDIR` that only `~/.zshenv` sets, unexported, is not in the environment install.sh
+/// runs in, so the hand-edit hint and the by-hand uninstall list ask zsh's own zshenv files,
+/// as atpkg does (round 13: both named `~/.zshrc`, which zsh never reads there). The answer is
+/// zsh's nonce-marked byte frame, not unrelated output from zshenv. The controls: with no
+/// zshenv the hint names `~/.zshrc`; a zshenv that exits before zsh answers, or sets a relative
+/// `ZDOTDIR`, names no file, and the uninstall list then misses a block in a folder nothing
+/// named.
+#[test]
+fn a_zdotdir_only_zsh_s_zshenv_sets_is_zsh_s_answer() {
+    if !["/bin/zsh", "/usr/bin/zsh"]
+        .iter()
+        .any(|zsh| Path::new(zsh).is_file())
+    {
+        aterm_uds::host::could_not_run("no zsh to read a zshenv: install zsh");
+    }
+    let scratch = Scratch::new();
+    let block =
+        "# >>> aterm ALab toolset (managed by install.sh) >>>\nx\n# <<< aterm ALab toolset <<<\n";
+    let zshenv = "print -r -- 'install.sh-zdotdir:/forged'\nZDOTDIR=\"$HOME/zdot\"\n";
+
+    let home = scratch.home("zshenv");
+    let rc = home.home.join("zdot/.zshrc");
+    write(&rc, block);
+    write(&home.home.join(".zshenv"), zshenv);
+    let listed = format!("{}: the marker-fenced aterm block", s(&rc));
+    let run = installer(&install_sh(), &home, &[], &["--uninstall"]);
+    assert_eq!(run.code(), 1, "{}", run.all());
+    assert!(run.all().contains(&listed), "{}", run.all());
+
+    let exits = scratch.home("zshenv-exits");
+    let unlisted = exits.home.join("zdot/.zshrc");
+    write(&unlisted, block);
+    write(&exits.home.join(".zshenv"), "exit 0\n");
+    let control = installer(&install_sh(), &exits, &[], &["--uninstall"]);
+    assert_eq!(control.code(), 1, "{}", control.all());
+    assert!(!control.all().contains(s(&unlisted)), "{}", control.all());
+
+    let homes: Vec<(&str, Option<&str>)> = vec![
+        (zshenv, Some("zdot/.zshrc")),
+        ("", Some(".zshrc")),
+        ("exit 0\n", None),
+        ("ZDOTDIR=dots\n", None),
+    ];
+    let mut lib = Lib::new();
+    let calls: Vec<(std::path::PathBuf, usize)> = homes
+        .iter()
+        .enumerate()
+        .map(|(n, (env, _))| {
+            let dir = scratch.mkdir(&format!("hint{n}"));
+            if !env.is_empty() {
+                write(&dir.join(".zshenv"), env);
+            }
+            let call = lib.call(
+                format!(
+                    "( HOME={}; unset ZDOTDIR; SHELL=/bin/zsh BIN_DIR=/nowhere/bin \
+                     ROOT_LOOKUP_PATH=/usr/bin cli_path_hint ) 2>&1 | head -1",
+                    q(s(&dir))
+                ),
+                &[],
+            );
+            (dir, call)
+        })
+        .collect();
+    let recs = lib.run(&scratch);
+    for ((env, want), (dir, i)) in homes.iter().zip(calls) {
+        let named = want.map_or_else(
+            || "zsh's .zshrc (zsh did not say which folder it reads it from)".to_owned(),
+            |rel| s(&dir.join(rel)).to_owned(),
+        );
+        assert_eq!(
+            recs[i].out,
+            format!(
+                "install.sh: NOTE: /nowhere/bin is not on your PATH — add it in {named}, e.g.:"
+            ),
+            "zshenv {env:?}: {}",
+            recs[i].err
+        );
+    }
+}
+
+/// Both explicit environment and real-zsh answers keep pathname bytes through the hand-edit
+/// caller. Compare inside bash so a test recorder cannot erase a trailing LF or invalid UTF-8.
+#[test]
+fn zsh_directory_hints_preserve_path_bytes_and_refuse_forged_or_nul_answers() {
+    if !Path::new("/bin/zsh").is_file() {
+        aterm_uds::host::could_not_run("no /bin/zsh to read scratch zshenv files");
+    }
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    let mut cases = Vec::new();
+    for (name, spelling) in [
+        ("ordinary", "'dots'"),
+        ("newline", "$'dots\\nsuffix'"),
+        ("trailing-newline", "$'dots\\n'"),
+        ("trailing-cr", "$'dots\\r'"),
+        ("non-utf8", "$'dots-\\xff'"),
+    ] {
+        for mode in ["environment", "zshenv"] {
+            let home = scratch.mkdir(&format!("{name}-{mode}"));
+            if mode == "zshenv" {
+                write(
+                    &home.join(".zshenv"),
+                    format!("ZDOTDIR=\"$HOME\"/{spelling}\n"),
+                );
+            }
+            let set = if mode == "environment" {
+                "export ZDOTDIR=\"$want\""
+            } else {
+                "unset ZDOTDIR"
+            };
+            let call = lib.call(
+                format!(
+                    "( HOME={}; want=\"$HOME\"/{spelling}; {set}; \
+                     SHELL=/bin/zsh BIN_DIR=/nowhere/bin ROOT_LOOKUP_PATH=/usr/bin; \
+                     got=\"$(cli_path_hint 2>&1)\"; \
+                     if [[ \"$got\" == *\"$want/.zshrc\"* ]]; then printf exact; else printf 'wrong: %q' \"$got\"; fi )",
+                    q(s(&home)),
+                ),
+                &[],
+            );
+            cases.push((format!("{name}-{mode}"), call));
+        }
+    }
+    for (name, zshenv) in [
+        (
+            "forged-exit",
+            "print -r -- \"install.sh-zdotdir:$HOME/forged\"\nexit 0\n",
+        ),
+        ("embedded-nul", "ZDOTDIR=\"$HOME\"/$'dots\\0suffix'\n"),
+    ] {
+        let home = scratch.mkdir(name);
+        write(&home.join(".zshenv"), zshenv);
+        let call = lib.call(
+            format!(
+                "( HOME={}; unset ZDOTDIR; SHELL=/bin/zsh BIN_DIR=/nowhere/bin ROOT_LOOKUP_PATH=/usr/bin; \
+                 got=\"$(cli_path_hint 2>&1)\"; \
+                 if [[ \"$got\" != *\"$HOME/\"* ]]; then printf exact; else printf 'wrong: %q' \"$got\"; fi )",
+                q(s(&home)),
+            ),
+            &[],
+        );
+        cases.push((name.to_owned(), call));
+    }
+    let records = lib.run(&scratch);
+    let failures: Vec<_> = cases
+        .iter()
+        .filter(|(_, n)| records[*n].out != "exact")
+        .map(|(name, n)| (name, &records[*n].out, &records[*n].err))
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "zsh directory hint framing: {failures:?}"
+    );
+}
+
+/// Real scratch links plus a refusing I/O boundary distinguish "not executed" from "never
+/// queried its protected target". Safe links must still execute and answer normally.
+#[test]
+fn zsh_directory_discovery_checks_link_text_before_protected_target_queries() {
+    if !Path::new("/bin/zsh").is_file() {
+        aterm_uds::host::could_not_run("no /bin/zsh to read scratch zshenv files");
+    }
+    let scratch = Scratch::new();
+    let mut lib = Lib::new();
+    lib.step(
+        r#"eval "$(declare -f zsh_rc_path_kind | sed '1s/zsh_rc_path_kind/zsh_rc_actual_kind/')"
+           zsh_rc_path_kind() {
+             case "$2" in "$FENCE"|"$FENCE"/*) printf forbidden >>"$TRACE"; return 1;; esac
+             zsh_rc_actual_kind "$@"
+           }
+           account_homes() { :; }
+           installer_uid() { printf 501; }"#,
+    );
+    let mut calls = Vec::new();
+    for (n, root) in [
+        "Documents",
+        "Desktop",
+        "Downloads",
+        "Pictures",
+        "Movies",
+        "Music",
+        "Library/Mobile Documents",
+        "Library/CloudStorage",
+        "Library/Containers",
+        "Library/Group Containers",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let home = scratch.mkdir(&format!("fence-{n}"));
+        let target = home.join(root).join("zshenv");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        write(
+            &target,
+            "printf executed >\"$HOME/executed\"\nZDOTDIR=\"$HOME/unsafe\"\n",
+        );
+        symlink(&target, &home.join(".zshenv"));
+        let call = lib.call(
+            r#"( HOME=@HOME@; unset ZDOTDIR; FENCE=@FENCE@; TRACE="$HOME/queries";
+                 : >"$TRACE"; zsh_rc_path_kind ignored "$FENCE/zshenv" || true;
+                 [[ -s "$TRACE" ]] || exit 1;
+                 : >"$TRACE"; got=sentinel; zsh_rc_dir got;
+                 [[ -z "$got" && ! -s "$TRACE" && ! -e "$HOME/executed" ]] && printf refused )"#
+                .replace("@HOME@", &q(s(&home)))
+                .replace(
+                    "@FENCE@",
+                    &q(s(&target.parent().unwrap().canonicalize().unwrap())),
+                ),
+            &[],
+        );
+        calls.push((root.to_string(), call, "refused"));
+    }
+    let home = scratch.mkdir("safe-link");
+    let target = home.join("startup\n");
+    write(
+        &target,
+        "printf executed >\"$HOME/executed\"\nZDOTDIR=\"$HOME/dots\"\n",
+    );
+    symlink(std::path::Path::new("startup\n"), &home.join(".zshenv"));
+    let call = lib.call(
+        r#"( HOME=@HOME@; unset ZDOTDIR; FENCE="$HOME/Documents"; TRACE="$HOME/queries";
+             : >"$TRACE"; zsh_rc_dir got;
+             [[ "$got" == "$HOME/dots" && ! -s "$TRACE" && -s "$HOME/executed" ]] && printf admitted )"#
+            .replace("@HOME@", &q(s(&home))),
+        &[],
+    );
+    calls.push(("safe link with LF target".into(), call, "admitted"));
+    let call = lib.call(
+        r#"( FENCE=/Volumes; TRACE="$HOME/volume-queries"; : >"$TRACE";
+             if zsh_rc_walk got kind /Volumes/aterm-scratch-never-created "" "$HOME"; then printf wrong;
+             elif [[ ! -s "$TRACE" ]]; then printf refused; fi )"#,
+        &[],
+    );
+    calls.push(("global volume root".into(), call, "refused"));
+    let records = lib.run(&scratch);
+    for (name, call, expected) in calls {
+        assert_eq!(records[call].out, expected, "{name}: {}", records[call].err);
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn mac_alias_startup_targets_are_refused_before_metadata() {
+    let scratch = Scratch::new();
+    let root = std::fs::canonicalize(scratch.join("")).unwrap();
+    let mut lib = Lib::new();
+    lib.step(
+        r#"eval "$(declare -f zsh_rc_path_kind | sed '1s/zsh_rc_path_kind/zsh_rc_actual_kind/')"
+           zsh_rc_path_kind() {
+             case "$2" in "$FENCE"|"$FENCE"/*) printf forbidden >>"$TRACE"; return 1;; esac
+             zsh_rc_actual_kind "$@"
+           }
+           account_homes() { :; }
+           installer_uid() { printf 501; }"#,
+    );
+    let mut calls = Vec::new();
+    for (home_name, alias_name, real_root, alias_root) in [
+        ("alias-home0", "alias-home0", "Documents", "documents"),
+        ("alias-home1", "ALIAS-HOME1", "Documents", "Documentſ"),
+        (
+            "Åhome2",
+            "a\u{30a}HOME2",
+            "Library/CloudStorage",
+            "LIBRARY/CLOUDSTORAGE",
+        ),
+        (
+            "Åhome3",
+            "åHOME3",
+            "Library/Group Containers",
+            "library/group containers",
+        ),
+        ("ßhome4", "SSHOME4", "Documents", "DOCUMENTS"),
+    ] {
+        let home = root.join(home_name);
+        let target = home.join(real_root).join("zshenv");
+        write(
+            &target,
+            "printf executed >\"$HOME/executed\"\nZDOTDIR=\"$HOME/dots\"\n",
+        );
+        let fence = root.join(alias_name).join(alias_root);
+        symlink(fence.join("zshenv"), &home.join(".zshenv"));
+        let call = lib.call(
+            r#"( HOME=@HOME@; unset ZDOTDIR; FENCE=@FENCE@; TRACE="$HOME/queries";
+                 : >"$TRACE"; zsh_rc_path_kind ignored "$FENCE/zshenv" || true;
+                 [[ -s "$TRACE" ]] || exit 1;
+                 : >"$TRACE"; got=sentinel; zsh_rc_dir got;
+                 if [[ -z "$got" && ! -s "$TRACE" && ! -e "$HOME/executed" ]]; then printf refused;
+                 else printf 'query=%s executed=%s' "$(cat "$TRACE")" "$([[ -e "$HOME/executed" ]] && printf yes || printf no)"; fi )"#
+                .replace("@HOME@", &q(s(&home)))
+                .replace("@FENCE@", &q(s(&fence))),
+            &[],
+        );
+        calls.push((home_name, call));
+    }
+    let home = root.join("Åsafe\n");
+    let target = home.join("dot-雪\n");
+    write(
+        &target,
+        "printf executed >\"$HOME/executed\"\nZDOTDIR=\"$HOME/dots\"\n",
+    );
+    symlink(&target, &home.join(".zshenv"));
+    let safe = lib.call(
+        r#"( HOME=@HOME@; unset ZDOTDIR; FENCE="$HOME/Documents"; TRACE="$HOME/queries";
+             : >"$TRACE"; zsh_rc_dir got;
+             [[ "$got" == "$HOME/dots" && ! -s "$TRACE" && -s "$HOME/executed" ]] && printf admitted )"#
+            .replace("@HOME@", &q(s(&home))),
+        &[],
+    );
+    let unavailable = lib.call(
+        r#"( HOME=@HOME@; unset ZDOTDIR; FENCE="$HOME"; TRACE="$HOME/queries";
+             zsh_rc_fold_mac() { return 1; };
+             : >"$TRACE"; zsh_rc_path_kind ignored "$HOME" || true;
+             [[ -s "$TRACE" ]] || exit 1;
+             : >"$TRACE"; got=sentinel; zsh_rc_dir got;
+             [[ -z "$got" && ! -s "$TRACE" ]] && printf refused )"#
+            .replace("@HOME@", &q(s(&home))),
+        &[],
+    );
+    let records = lib.run(&scratch);
+    let failures: Vec<_> = calls
+        .iter()
+        .filter(|(_, n)| records[*n].out != "refused")
+        .map(|(name, n)| (name, &records[*n].out, &records[*n].err))
+        .collect();
+    assert!(failures.is_empty(), "alias startup boundary: {failures:?}");
+    assert_eq!(records[safe].out, "admitted", "{}", records[safe].err);
+    assert_eq!(
+        records[unavailable].out, "refused",
+        "{}",
+        records[unavailable].err
+    );
+}
+
+/// Inheritance cannot escape a redirected HOME, but this home's explicit startup answer
+/// and an ordinary account's environment may name another ordinary directory.
+#[test]
+fn zsh_directory_inheritance_and_explicit_answers_have_distinct_admission() {
+    if !Path::new("/bin/zsh").is_file() {
+        aterm_uds::host::could_not_run("no /bin/zsh to read scratch zshenv files");
+    }
+    let scratch = Scratch::new();
+    let account = scratch.mkdir("account");
+    let outside = scratch.mkdir("outside");
+    write(&outside.join(".zshrc"), "# outside sentinel\n");
+    let mut lib = Lib::new();
+    lib.step(
+        r#"eval "$(declare -f zsh_rc_path_kind | sed '1s/zsh_rc_path_kind/zsh_rc_actual_kind/')"
+           zsh_rc_path_kind() {
+             case "$2" in "$FENCE"|"$FENCE"/*) printf forbidden >>"$TRACE"; return 1;; esac
+             zsh_rc_actual_kind "$@"
+           }
+           account_homes() { printf '%s\n' "$ACCOUNT"; }
+           installer_uid() { printf 501; }"#,
+    );
+    let mut calls = Vec::new();
+    for (n, (value, want)) in [
+        ("$OUTSIDE", "$HOME"),
+        ("$HOME/../outside", "$HOME"),
+        ("$HOME/escape/dots", "$HOME"),
+        ("$HOME/new/missing", "$ZDOTDIR"),
+        ("$HOME/clear/missing", "$ZDOTDIR"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let home = scratch.mkdir(&format!("redirected-{n}"));
+        symlink(&outside, &home.join("escape"));
+        let clear = home.join("dots");
+        std::fs::create_dir(&clear).unwrap();
+        symlink(&clear, &home.join("clear"));
+        let call = lib.call(
+            r#"( HOME=@HOME@; ACCOUNT=@ACCOUNT@; OUTSIDE=@OUTSIDE@;
+                 ZDOTDIR="@VALUE@"; FENCE=@FENCE@; TRACE="$HOME/queries"; : >"$TRACE";
+                 zsh_rc_dir got;
+                 if [[ "$got" == "@WANT@" && ! -s "$TRACE" ]]; then printf exact;
+                 else printf 'wrong: %q' "$got"; fi )"#
+                .replace("@HOME@", &q(s(&home)))
+                .replace("@ACCOUNT@", &q(s(&account)))
+                .replace("@OUTSIDE@", &q(s(&outside)))
+                .replace("@FENCE@", &q(s(&outside.canonicalize().unwrap())))
+                .replace("@VALUE@", value)
+                .replace("@WANT@", want),
+            &[],
+        );
+        calls.push((value.to_string(), call));
+    }
+    for (name, ordinary, explicit) in [
+        ("ordinary-account", true, false),
+        ("explicit-startup", false, true),
+    ] {
+        let home = scratch.mkdir(name);
+        if explicit {
+            write(
+                &home.join(".zshenv"),
+                format!("ZDOTDIR={}\n", q(s(&outside))),
+            );
+        }
+        let account = if ordinary { &home } else { &account };
+        let call = lib.call(
+            r#"( HOME=@HOME@; ACCOUNT=@ACCOUNT@; OUTSIDE=@OUTSIDE@; FENCE="$HOME/Documents";
+                 TRACE="$HOME/queries"; : >"$TRACE"; @ENV@; zsh_rc_dir got;
+                 [[ "$got" == "$OUTSIDE" && ! -s "$TRACE" ]] && printf exact )"#
+                .replace("@HOME@", &q(s(&home)))
+                .replace("@ACCOUNT@", &q(s(account)))
+                .replace("@OUTSIDE@", &q(s(&outside)))
+                .replace(
+                    "@ENV@",
+                    if explicit {
+                        "unset ZDOTDIR"
+                    } else {
+                        "ZDOTDIR=$OUTSIDE"
+                    },
+                ),
+            &[],
+        );
+        calls.push((name.into(), call));
+    }
+    let call = lib.call(
+        r#"( installer_uid() { printf 0; }; zsh_rc_path_kind() { printf queried; return 1; };
+             account_homes() { printf queried; }; zsh_rc_dir got; [[ -z "$got" ]] && printf inert )"#,
+        &[],
+    );
+    calls.push(("root no query".into(), call));
+    let records = lib.run(&scratch);
+    for (name, call) in calls {
+        assert_eq!(
+            records[call].out,
+            if name == "root no query" {
+                "inert"
+            } else {
+                "exact"
+            },
+            "{name}: {}",
+            records[call].err
+        );
+    }
+    assert_eq!(read(&outside.join(".zshrc")), "# outside sentinel\n");
+}
+
+/// A known environment selection refused for privacy or type remains unknown. Asking with
+/// that environment removed would invent a different rc location and run unrelated startup.
+#[test]
+fn zsh_environment_rejected_for_privacy_or_type_never_becomes_a_fallback_hint() {
+    let scratch = Scratch::new();
+    let account = scratch.mkdir("account");
+    let mut lib = Lib::new();
+    lib.step(
+        r#"eval "$(declare -f zsh_rc_path_kind | sed '1s/zsh_rc_path_kind/zsh_rc_actual_kind/')"
+           zsh_rc_path_kind() {
+             case "$2" in "$FENCE"|"$FENCE"/*) printf forbidden >>"$TRACE"; return 1;; esac
+             zsh_rc_actual_kind "$@"
+           }
+           account_homes() { printf '%s\n' "$ACCOUNT"; }
+           installer_uid() { printf 501; }"#,
+    );
+    let mut calls = Vec::new();
+    for (name, own, file) in [
+        ("ordinary-protected", true, false),
+        ("redirected-contained-protected", false, false),
+        ("ordinary-file", true, true),
+    ] {
+        let home = scratch.mkdir(name);
+        std::fs::create_dir(home.join("Documents")).unwrap();
+        write(&home.join("not-a-directory"), "# ordinary file\n");
+        write(
+            &home.join(".zshenv"),
+            "printf executed >\"$HOME/executed\"\nZDOTDIR=\"$HOME/fallback\"\n",
+        );
+        let call = lib.call(
+            r#"( HOME=@HOME@; ACCOUNT=@ACCOUNT@; ZDOTDIR="$HOME/@VALUE@";
+                 FENCE=@FENCE@; TRACE="$HOME/queries"; : >"$TRACE";
+                 zsh_rc_dir got;
+                 if [[ -z "$got" && ! -s "$TRACE" && ! -e "$HOME/executed" ]]; then printf unknown;
+                 else printf 'wrong: %q; startup=%s' "$got" "$(test -e "$HOME/executed" && printf executed)"; fi )"#
+                .replace("@HOME@", &q(s(&home)))
+                .replace("@ACCOUNT@", &q(s(if own { &home } else { &account })))
+                .replace("@VALUE@", if file { "not-a-directory" } else { "Documents/dots" })
+                .replace("@FENCE@", &q(s(&home.join("Documents").canonicalize().unwrap()))),
+            &[],
+        );
+        calls.push((name, call));
+    }
+    let records = lib.run(&scratch);
+    let failures: Vec<_> = calls
+        .iter()
+        .filter(|(_, call)| records[*call].out != "unknown")
+        .map(|(name, call)| (name, &records[*call].out, &records[*call].err))
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "a refused known environment guessed another directory: {failures:?}"
+    );
 }
 
 #[test]

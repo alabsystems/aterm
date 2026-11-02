@@ -8,10 +8,60 @@ use std::path::{Path, PathBuf};
 use crate::ctx::Ctx;
 use crate::error::{Error, Result};
 
+/// Maximum size in bytes of a machine key file (`PKCS#8` Ed25519 is 83 bytes; allow generous
+/// headroom while rejecting oversized files or streams).
+const MAX_KEY_BYTES: u64 = 16 * 1024;
+
+/// Overwrite `buf` with zeroes through volatile writes so dead-store elimination keeps them.
+fn scrub_bytes(buf: &mut [u8]) {
+    for b in buf {
+        // SAFETY: `b` is a live, uniquely borrowed, aligned `u8` from `buf`.
+        unsafe { std::ptr::write_volatile(b, 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
+
+fn read_key_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    if meta.len() > MAX_KEY_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("key file exceeds {MAX_KEY_BYTES} bytes"),
+        ));
+    }
+    let mut buf = Vec::new();
+    if let Err(e) = file.take(MAX_KEY_BYTES + 1).read_to_end(&mut buf) {
+        scrub_bytes(&mut buf);
+        return Err(e);
+    }
+    if u64::try_from(buf.len()).unwrap_or(u64::MAX) > MAX_KEY_BYTES {
+        scrub_bytes(&mut buf);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("key file exceeds {MAX_KEY_BYTES} bytes"),
+        ));
+    }
+    Ok(buf)
+}
+
 /// The secret machine key, loaded.
 pub struct MachineKey {
     pkcs8: Vec<u8>,
     path: PathBuf,
+}
+
+impl Drop for MachineKey {
+    fn drop(&mut self) {
+        scrub_bytes(&mut self.pkcs8);
+    }
 }
 
 impl std::fmt::Debug for MachineKey {
@@ -30,7 +80,7 @@ impl MachineKey {
     /// A refusal when the key file cannot be read, naming the provisioning verbs that mint
     /// one, or when it is not a pkcs8 Ed25519 key.
     pub fn load(ctx: &Ctx, path: &Path) -> Result<Self> {
-        let pkcs8 = std::fs::read(path).map_err(|e| {
+        let pkcs8 = read_key_bytes(path).map_err(|e| {
             Error::refused(format!(
                 "no machine key at {} ({e}) — nothing here can sign a document any client \
                  accepts. Mint one from the paper master: `atpkg-keys setup --id <id>` (the \
@@ -38,12 +88,13 @@ impl MachineKey {
                 ctx.shown(path)
             ))
         })?;
-        atpkg_keys::pubkey_b64(&pkcs8)
-            .map_err(|e| Error::refused(format!("{}: {e}", ctx.shown(path))))?;
-        Ok(Self {
+        let key = Self {
             pkcs8,
             path: path.to_path_buf(),
-        })
+        };
+        atpkg_keys::pubkey_b64(&key.pkcs8)
+            .map_err(|e| Error::refused(format!("{}: {e}", ctx.shown(path))))?;
+        Ok(key)
     }
 
     /// Its base64 public key — what the roster lists for it.
@@ -76,7 +127,7 @@ impl MachineKey {
         let mut out = doc.as_os_str().to_owned();
         out.push(".sig");
         let out = PathBuf::from(out);
-        std::fs::write(&out, sig).map_err(|e| Error::io(format!("write {}", out.display()), &e))?;
+        crate::lane::report::write_atomic_bytes(&out, &sig)?;
         Ok(out)
     }
 }
@@ -238,5 +289,24 @@ mod tests {
         .expect("write host machine.toml");
         let signer = signer_for(&ctx, &ring.roster).expect("release-ring record signs");
         assert_eq!(signer.record.id, "m3");
+
+        let mut secret = vec![0xaa, 0x55, 0xff, 0x01];
+        scrub_bytes(&mut secret);
+        assert_eq!(secret, [0, 0, 0, 0]);
+
+        let oversized = home.join("oversized.key");
+        let max_len = usize::try_from(MAX_KEY_BYTES).expect("usize") + 1;
+        std::fs::write(&oversized, vec![0x42u8; max_len]).expect("write oversized");
+        let err = MachineKey::load(&ctx, &oversized)
+            .expect_err("oversized key must fail")
+            .to_string();
+        assert!(err.contains("exceeds"), "unexpected error: {err}");
+        let err_dir = MachineKey::load(&ctx, home)
+            .expect_err("directory must fail")
+            .to_string();
+        assert!(
+            err_dir.contains("not a regular file"),
+            "unexpected error: {err_dir}"
+        );
     }
 }

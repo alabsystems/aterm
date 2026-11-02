@@ -30,18 +30,23 @@ pub(super) fn join_host(paths: &Paths, source: &str, host: &str) {
 }
 
 fn start_loopback_server(store: &Path) -> crate::server::Running {
+    start_loopback_server_at(store, None)
+}
+
+fn start_loopback_server_at(store: &Path, clock: Option<fn() -> u64>) -> crate::server::Running {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
-    crate::server::start(
-        listener,
-        &ServerOptions {
-            listen: "127.0.0.1:0".parse().expect("addr"),
-            store: store.to_path_buf(),
-            advertise: None,
-            pins: Vec::new(),
-            hold: Duration::from_millis(100),
-            keep_awake: false,
-        },
-    )
+    let options = ServerOptions {
+        listen: "127.0.0.1:0".parse().expect("addr"),
+        store: store.to_path_buf(),
+        advertise: None,
+        pins: Vec::new(),
+        hold: Duration::from_millis(100),
+        keep_awake: false,
+    };
+    match clock {
+        Some(clock) => crate::server::start_with_clock(listener, &options, clock),
+        None => crate::server::start(listener, &options),
+    }
     .expect("start server")
 }
 
@@ -1038,16 +1043,28 @@ fn commons_log_model_conforms_and_catches_its_mutants() {
         aterm_spec::interp::reachable_states(&model).len()
     );
 
+    // Every state but the start was found by one action from a state before it, so its path is
+    // that state's path and that action: the replay of the action there is the replay of the
+    // state's own path, and is judged against the state itself. Only the start is replayed alone.
+    let found_by: BTreeMap<&[&str], &aterm_spec::interp::State> = paths
+        .iter()
+        .map(|(state, path)| (path.as_slice(), state))
+        .collect();
+    assert_eq!(
+        found_by.len(),
+        paths.len(),
+        "every state has a path of its own"
+    );
+
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let fixture = CommonsLogFixture::build(root.path());
     let mut run_id = 0usize;
 
+    let start = model.init_state();
+    let observed = CommonsLogHarness::replay(&fixture, &root.path().join("s0"), &[]).observe();
+    assert_eq!(observed, start, "state mismatch after []");
+    let mut judged = BTreeSet::from([&start]);
     for (state, path) in &paths {
-        run_id += 1;
-        let observed =
-            CommonsLogHarness::replay(&fixture, &root.path().join(format!("s{run_id}")), path)
-                .observe();
-        assert_eq!(&observed, state, "state mismatch after {path:?}");
         for action in &model.actions {
             if model.action_enabled(action.name, state) {
                 run_id += 1;
@@ -1058,14 +1075,27 @@ fn commons_log_model_conforms_and_catches_its_mutants() {
                 );
                 h.apply(action.name);
                 let next_obs = h.observe();
-                assert!(
-                    model.successors(action.name, state).contains(&next_obs),
-                    "{} after {path:?} gave {next_obs:?}",
-                    action.name
-                );
+                let next_path = [path.as_slice(), &[action.name]].concat();
+                match found_by.get(next_path.as_slice()) {
+                    // The walk found `next` among this action's successors here.
+                    Some(&next) => {
+                        assert_eq!(&next_obs, next, "state mismatch after {next_path:?}");
+                        judged.insert(next);
+                    }
+                    None => assert!(
+                        model.successors(action.name, state).contains(&next_obs),
+                        "{} after {path:?} gave {next_obs:?}",
+                        action.name
+                    ),
+                }
             }
         }
     }
+    assert_eq!(
+        judged.len(),
+        paths.len(),
+        "every state was replayed and judged"
+    );
 
     // Negative control: claiming reconciliation finished without running `reconcile_commons_log`
     // after concurrent removals + newcomer admission violates both `WrapGapClosedAfterReconcile`
@@ -1127,8 +1157,18 @@ pub(super) fn two_macs(entries: &[(Audience, &str, &[u8])]) -> TwoMacs {
 
 /// [`two_macs`], with `m7` an admin too where `m7_admin`.
 pub(super) fn two_macs_with(entries: &[(Audience, &str, &[u8])], m7_admin: bool) -> TwoMacs {
+    two_macs_at(entries, m7_admin, None)
+}
+
+/// [`two_macs_with`], its server started by [`crate::server::start_with_clock`] on `clock` (unix
+/// seconds) where one is given.
+pub(super) fn two_macs_at(
+    entries: &[(Audience, &str, &[u8])],
+    m7_admin: bool,
+    clock: Option<fn() -> u64>,
+) -> TwoMacs {
     let root = aterm_tempfile::tempdir().expect("tempdir");
-    let server = start_loopback_server(&root.path().join("s1"));
+    let server = start_loopback_server_at(&root.path().join("s1"), clock);
     let url = format!("http://{}/v1/alab", server.addr);
     let m22 = Paths::for_home(&root.path().join("m22"));
     let created = test_create_unbound(&m22, &url, None, Some("m22")).unwrap();
@@ -1590,10 +1630,19 @@ fn split_admins() -> SplitAdmins {
 
 /// What a `0.145` Mac holding `id` reads from the envelope `url` serves: entry name to value.
 fn envelope_view(url: &str, id: &Identity) -> (u64, BTreeMap<String, Vec<u8>>) {
-    let Fetched::Body(served) = transport::fetch(
+    envelope_view_as(url, id, None)
+}
+
+fn envelope_view_as(
+    url: &str,
+    id: &Identity,
+    subscriber: Option<&str>,
+) -> (u64, BTreeMap<String, Vec<u8>>) {
+    let Fetched::Body(served) = transport::fetch_as(
         &Source::Url(url.to_owned()),
         None,
         aterm_spec::wait::MUST_HAPPEN,
+        subscriber,
     )
     .unwrap() else {
         panic!("expected a served envelope on {url}");
@@ -2821,6 +2870,55 @@ pub(super) fn hand(
     )
 }
 
+#[test]
+fn bounded_member_cached_head_applies_new_admission_and_removal_without_a_server() {
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
+    let (m22, m7) = (&macs.m22, &macs.m7);
+    let (m40, request, allowed) = newcomer(macs.root.path(), m7, "m40");
+    join_host(&m40, &format!("{}#{}", macs.url, macs.signer), "m40");
+    assert_eq!(load_state(&m40).unwrap().membership, Stored::Pending);
+    assert!(held_copy(&m40, &configured(&m40).unwrap(), &load_state(&m40).unwrap()).is_none());
+
+    let (_, logged) = hand(m7, &request, &allowed, true);
+    assert!(logged);
+    let admission = load_records(m7).unwrap().encode();
+    save_records(&m40, &admission).unwrap();
+    save_records(m22, &admission).unwrap();
+    remove_member_in_log(m22, request.binding().actor()).expect("signed removal");
+    let removal = load_records(m22).unwrap().encode();
+    macs.server.stop();
+
+    let config = configured(&m40).unwrap();
+    let outcome = apply_fetched_until(
+        &m40,
+        config,
+        load_state(&m40).unwrap(),
+        Fetched::Missing,
+        None,
+        Some(Instant::now() + aterm_spec::wait::MUST_HAPPEN),
+    )
+    .expect("cached pending envelope applies the signed admission locally");
+    assert!(matches!(outcome, SyncOutcome::Applied { .. }));
+    assert_eq!(load_state(&m40).unwrap().membership, Stored::In);
+    assert_eq!(
+        std::fs::read(m40.home.join(".secrets/shared")).unwrap(),
+        b"everyone-v1"
+    );
+
+    save_records(&m40, &removal).unwrap();
+    assert_eq!(
+        sync_reader_until(&m40, Instant::now() + aterm_spec::wait::MUST_HAPPEN)
+            .expect("unreachable envelope server cannot delay a signed removal"),
+        SyncOutcome::NotIn,
+    );
+    assert_eq!(load_state(&m40).unwrap().membership, Stored::Revoked);
+    assert!(
+        read_verified_entry(&m40, &configured(&m40).unwrap(), "shared")
+            .unwrap()
+            .is_none()
+    );
+}
+
 /// F15: m7, a plain member that holds no admin locker, lets m40 in by itself. m40 reads its
 /// files and F18's Commons control from the log at once, follows the vault from the log with the
 /// admin never acting for it, an admin's later publish keeps the epoch m7 wrapped to m40 rather
@@ -3304,18 +3402,14 @@ fn forged_log_bundle(
         &mut log,
         draft.sign(&founder_seed, founder_incarnation).unwrap(),
     );
-    let wrap = log
-        .draft_wrap(
-            &founder_actor,
-            1_003,
-            *epoch.id(),
-            &key,
-            identity.recipient(),
-        )
-        .unwrap()
-        .sign(&founder_seed, founder_incarnation)
-        .unwrap();
-    sign(&mut log, wrap);
+    for recipient in [founder_identity.recipient(), identity.recipient()] {
+        let wrap = log
+            .draft_wrap(&founder_actor, 1_003, *epoch.id(), &key, recipient)
+            .unwrap()
+            .sign(&founder_seed, founder_incarnation)
+            .unwrap();
+        sign(&mut log, wrap);
+    }
     let entry = Entry {
         name: "gh-token".to_owned(),
         value: SecretBytes::from(value),
@@ -5169,6 +5263,19 @@ fn excluding_member_from_commons_control_rotates_commons_epoch_and_keeps_it_out_
     remove_member_in_log(m22, req40.binding().actor()).unwrap();
     sync_records(&m40, None).unwrap();
     assert_eq!(steward_alab_policy_role(&m40), None);
+    // Signed removal remains authoritative even while the local apply is incomplete.
+    let removed_state = load_state(&m40).unwrap();
+    let mut incomplete = removed_state.clone();
+    incomplete.failed = true;
+    incomplete
+        .pending
+        .insert("a-file".to_owned(), "pending".to_owned());
+    save_state(&m40, &incomplete).unwrap();
+    assert!(matches!(
+        steward::observe_alab_role(&m40),
+        steward::AlabRoleObservation::Denied
+    ));
+    save_state(&m40, &removed_state).unwrap();
     assert!(
         steward::check_standby_eligibility(&m40, None)
             .unwrap()
@@ -5596,6 +5703,7 @@ fn log_only_member_tracks_rotated_signer_applies_log_sync_and_revokes_cascade_by
                         provider: "claude".to_owned(),
                         method: "oauth".to_owned(),
                         device: request50.binding().clone(),
+                        intent: None,
                         secret: Some(crate::commons::accounts::SecretRef {
                             vault: admin.config.name.clone(),
                             signer: genesis_signer,
@@ -5674,6 +5782,21 @@ fn log_only_member_tracks_rotated_signer_applies_log_sync_and_revokes_cascade_by
         .request(trust.network, trust.authority)
         .unwrap();
     let actor60 = req60.binding().actor();
+    // A listener's memoized deny list (`swarm_denied_nodes_now`) and the node's memoized roster
+    // (`swarm_roster_now`), read before `m60` is admitted and removed, take in the log-only
+    // removal at their next read. NEGATIVE CONTROLS (2026-11-01): with the memo never reading
+    // again (`true` for its stamp comparison), the memoized list below lacks `[0x60; 32]` and the
+    // `assert_eq!` against `pre_mirror_denied` fails; with `swarm_roster_now` alone never reading
+    // again (a `OnceLock` of its first call's roster in place of `MEMO.read`), it answers the
+    // roster read before, without `m60`, and the `assert_eq!` against `pre_mirror_roster` fails.
+    let primed = swarm_denied_nodes_now(m22)
+        .unwrap()
+        .expect("primed swarm_denied_nodes_now");
+    assert!(!primed.contains(&hex(&[0x60; 32])));
+    let primed_roster = swarm_roster_now(m22)
+        .unwrap()
+        .expect("primed swarm_roster_now");
+    assert!(!primed_roster.deny_labels.contains(&"m60".to_owned()));
     admit_member_in_log(
         m22,
         Entrant {
@@ -5697,6 +5820,18 @@ fn log_only_member_tracks_rotated_signer_applies_log_sync_and_revokes_cascade_by
         .unwrap()
         .expect("pre-mirror swarm_denied_nodes");
     assert!(pre_mirror_denied.contains(&hex(&[0x60; 32])));
+    assert_eq!(
+        swarm_denied_nodes_now(m22)
+            .unwrap()
+            .expect("memoized swarm_denied_nodes_now"),
+        pre_mirror_denied
+    );
+    assert_eq!(
+        swarm_roster_now(m22)
+            .unwrap()
+            .expect("memoized swarm_roster_now"),
+        pre_mirror_roster
+    );
 
     envelope::TEST_RETIRED.with(|cell| {
         *cell.borrow_mut() = Some(Retired {
@@ -5772,5 +5907,353 @@ fn log_only_member_tracks_rotated_signer_applies_log_sync_and_revokes_cascade_by
         .expect("roster after m7 steward_finish_revokes");
     assert!(roster.deny_labels.contains(&"m7".to_owned()));
 
+    // 8. `machine_denied_by_roster_or_log` honors an active log/roster seat (`m22`) even when
+    //    passed a stale denied `[machines]` host name (`"m7"`), while denying a seatless
+    //    recipient whose `[machines]` host name is denied.
+    let log_now = load_records(m22).unwrap().log().unwrap().clone();
+    let m22_rec = read_identity(m22).unwrap().unwrap().recipient();
+    let seatless_rec = Identity::from_secret_bytes([0x99; 32]).recipient();
+    assert!(
+        !log_entries::machine_denied_by_roster_or_log(Some(&roster), &log_now, "m7", &m22_rec),
+        "active member m22 must not be denied by a stale denied host label"
+    );
+    assert!(
+        log_entries::machine_denied_by_roster_or_log(Some(&roster), &log_now, "m7", &seatless_rec),
+        "seatless machine with denied host label m7 must be denied"
+    );
+
+    macs.server.stop();
+}
+
+/// m7, a member with no admin locker, puts `shared = value` in the log alone, and the records
+/// reach the vault's server and m22.
+fn put_in_log_only(macs: &TwoMacs, value: &[u8]) {
+    let (m22, m7) = (&macs.m22, &macs.m7);
+    let log = load_records(m7).unwrap().log().unwrap().clone();
+    let id7 = read_identity(m7).unwrap().unwrap();
+    let opened = log.open_audience_entries(&id7).unwrap().unwrap();
+    let epoch = opened.maximal_epochs[&EpochAudience::Everyone][0];
+    let key = *opened.unwrapped_keys[&epoch];
+    let (b7, a7, i7) = member_key(m7);
+    let entry = Entry {
+        name: "shared".to_owned(),
+        value: SecretBytes::from(value),
+        audience: Audience::Everyone,
+        if_absent: false,
+        anchor: None,
+    };
+    let put = b7
+        .device()
+        .with_seed(|seed| {
+            log.draft_put(&a7, 9_000, epoch, &key, &entry)
+                .unwrap()
+                .sign(seed, i7)
+        })
+        .unwrap();
+    transport::post_records(&macs.url, &encode_records(std::slice::from_ref(&put))).unwrap();
+    sync_records(m22, None).expect("m22 takes the Put");
+}
+
+/// F20's wire behavior with a synthetic unproved subscriber: an observation within 14 days keeps
+/// the mirror on, so a log-only edit reaches the envelope. This does not execute a 0.145 binary.
+///
+/// NEGATIVE CONTROL: make `mirror_still_needed` return `false` whatever was heard (the mirror
+/// stopped early): the first mirror publishes nothing, and the 0.145 Mac keeps reading `v1`.
+#[test]
+fn a_0_145_member_heard_in_14_days_keeps_the_mirror_on() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    const START: u64 = 1_800_000_000;
+    static CLOCK: AtomicU64 = AtomicU64::new(START);
+    fn clock() -> u64 {
+        CLOCK.load(Ordering::SeqCst)
+    }
+    let macs = two_macs_at(
+        &[(Audience::Everyone, "shared", b"v1".as_slice())],
+        false,
+        Some(clock),
+    );
+    assert!(
+        transport::fetch_heard(&macs.url).is_err(),
+        "new telemetry is not a complete history"
+    );
+    CLOCK.store(
+        START + log_entries::OLD_MAC_WINDOW_SECS + 1,
+        Ordering::SeqCst,
+    );
+    let old = Identity::from_secret_bytes([0x45; 32])
+        .recipient()
+        .to_bech32();
+    transport::fetch_within_as(&macs.url, None, Duration::from_secs(60), Some(&old))
+        .expect("the 0.145 Mac subscribes");
+    let heard = transport::fetch_heard(&macs.url)
+        .unwrap()
+        .expect("the route answers");
+    assert!(
+        heard
+            .subscribers
+            .contains_key(&transport::heard_tag(&Recipient::parse(&old).unwrap())),
+        "{heard:?}"
+    );
+    assert!(
+        !heard.subscribers.keys().any(|tag| tag.contains("age1")),
+        "the route names no key"
+    );
+
+    put_in_log_only(&macs, b"v2");
+    let id7 = read_identity(&macs.m7).unwrap().unwrap();
+    assert!(
+        admin_mirror_log(&macs.m22, &[]).unwrap().is_some(),
+        "an unproved Mac heard today keeps the mirror on"
+    );
+    let (_, view) = envelope_view(&macs.url, &id7);
+    assert_eq!(
+        view.get("shared").map(Vec::as_slice),
+        Some(b"v2".as_slice())
+    );
+    macs.server.stop();
+
+    // No unproved Mac heard: the members read the log, and nothing reads a mirror.
+    CLOCK.store(START, Ordering::SeqCst);
+    let quiet = two_macs_at(
+        &[(Audience::Everyone, "shared", b"v1".as_slice())],
+        false,
+        Some(clock),
+    );
+    CLOCK.store(
+        START + log_entries::OLD_MAC_WINDOW_SECS + 1,
+        Ordering::SeqCst,
+    );
+    put_in_log_only(&quiet, b"v2");
+    let quiet_id = id7_of(&quiet);
+    let quiet_recipient = quiet_id.recipient().to_bech32();
+    let (seq_before, _) = envelope_view_as(&quiet.url, &quiet_id, Some(&quiet_recipient));
+    assert_eq!(admin_mirror_log(&quiet.m22, &[]).unwrap(), None);
+    let (seq_after, view) = envelope_view_as(&quiet.url, &quiet_id, Some(&quiet_recipient));
+    assert_eq!(seq_after, seq_before, "the mirror stopped");
+    assert_eq!(
+        view.get("shared").map(Vec::as_slice),
+        Some(b"v1".as_slice())
+    );
+    sync(&quiet.m7, None).expect("the current member reads the log without a new mirror");
+    assert_eq!(
+        std::fs::read(quiet.m7.home.join(".secrets/shared")).unwrap(),
+        b"v2"
+    );
+    // Even a complete quiet history cannot suppress the envelope that removes a machine.
+    let removed = id7_of(&quiet);
+    let (_, actor, _) = member_key(&quiet.m7);
+    remove_member_in_log(&quiet.m22, actor).expect("remove m7 in the log");
+    assert!(
+        admin_mirror_log(&quiet.m22, &[]).unwrap().is_some(),
+        "membership removal must reseal"
+    );
+    let Fetched::Body(served) = transport::fetch(
+        &Source::Url(quiet.url.clone()),
+        None,
+        Duration::from_secs(60),
+    )
+    .unwrap() else {
+        panic!("envelope");
+    };
+    assert!(
+        open_lockers(&envelope::parse(&served).unwrap(), &removed)
+            .unwrap()
+            .is_none(),
+        "a removed machine still opens the new mirror"
+    );
+    quiet.server.stop();
+}
+
+/// F20 beside an admin at work: an admin that opens the vault (as its approver, the ALab release
+/// check and the steward's lease do routinely) names itself to the vault's server and to each
+/// candidate it probes, so its own reads keep no mirror on once every plain read is past the
+/// window.
+///
+/// NEGATIVE CONTROL: read without naming the reader in `admin_open_with_candidates` (plain
+/// `transport::fetch` for the primary, or plain `fetch_within` for the probes): the open books a
+/// plain read on that server inside the window, and the mirror is published.
+#[test]
+fn an_admin_opening_the_vault_keeps_no_mirror_on() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    const START: u64 = 1_820_000_000;
+    static CLOCK: AtomicU64 = AtomicU64::new(START);
+    fn clock() -> u64 {
+        CLOCK.load(Ordering::SeqCst)
+    }
+    let macs = two_macs_at(
+        &[(Audience::Everyone, "shared", b"v1".as_slice())],
+        false,
+        Some(clock),
+    );
+    let peer = start_loopback_server_at(&macs.root.path().join("peer"), Some(clock));
+    let peer_url = format!("http://{}/v1/alab", peer.addr);
+    let envelope = std::fs::read(macs.m22.cache_file()).expect("envelope");
+    transport::publish(&Source::Url(peer_url.clone()), &envelope).expect("seed peer");
+    let candidates = [peer_url];
+    CLOCK.store(
+        START + log_entries::OLD_MAC_WINDOW_SECS + 1,
+        Ordering::SeqCst,
+    );
+
+    admin_open_with_candidates(&macs.m22, &candidates).expect("the admin opens the vault");
+    put_in_log_only(&macs, b"v2");
+    assert_eq!(
+        admin_mirror_log(&macs.m22, &candidates).unwrap(),
+        None,
+        "the admin's own reads kept the mirror on"
+    );
+    peer.stop();
+    macs.server.stop();
+}
+
+fn id7_of(macs: &TwoMacs) -> Identity {
+    read_identity(&macs.m7).unwrap().unwrap()
+}
+
+/// F20's gate on its own: unknown keeps the mirror on; an unproved recipient counts only within
+/// 14 days; members' own recipients never keep it on.
+#[test]
+fn the_mirror_gate_counts_only_unproved_macs_heard_in_14_days() {
+    let macs = two_macs(&[]);
+    let log = load_records(&macs.m22).unwrap().log().unwrap().clone();
+    let members: Vec<Recipient> = [&macs.m22, &macs.m7]
+        .iter()
+        .map(|p| read_identity(p).unwrap().unwrap().recipient())
+        .collect();
+    let old = Identity::from_secret_bytes([0x46; 32]).recipient();
+    let now = 2_000_000_000;
+    let day = 24 * 60 * 60;
+    let heard = |extra: Option<u64>| {
+        let mut map: BTreeMap<String, u64> = members
+            .iter()
+            .map(|r| (transport::heard_tag(r), now))
+            .collect();
+        if let Some(at) = extra {
+            map.insert(transport::heard_tag(&old), at);
+        }
+        transport::Heard {
+            as_of: now,
+            subscribers: map,
+            anonymous: None,
+        }
+    };
+    assert!(log_entries::mirror_still_needed(&log, None, now));
+    assert!(!log_entries::mirror_still_needed(
+        &log,
+        Some(&heard(None)),
+        now
+    ));
+    assert!(log_entries::mirror_still_needed(
+        &log,
+        Some(&heard(Some(now - 13 * day))),
+        now
+    ));
+    assert!(log_entries::mirror_still_needed(
+        &log,
+        Some(&heard(Some(now - 14 * day))),
+        now
+    ));
+    assert!(!log_entries::mirror_still_needed(
+        &log,
+        Some(&heard(Some(now - 14 * day - 1))),
+        now
+    ));
+    assert!(!log_entries::mirror_still_needed(
+        &log,
+        Some(&heard(Some(now - 15 * day))),
+        now
+    ));
+    macs.server.stop();
+}
+
+/// A modern server cannot speak for a server whose heard route is unsupported or unavailable.
+/// The second real loopback server first answers the same 404 an old server does, then holds
+/// the vault and supplies its own observations to the union.
+#[test]
+fn every_server_must_answer_before_the_mirror_can_stop() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    const START: u64 = 1_810_000_000;
+    static CLOCK: AtomicU64 = AtomicU64::new(START);
+    fn clock() -> u64 {
+        CLOCK.load(Ordering::SeqCst)
+    }
+    let macs = two_macs_at(&[], false, Some(clock));
+    let log = load_records(&macs.m22).unwrap().log().unwrap().clone();
+    let peer = start_loopback_server_at(&macs.root.path().join("peer"), Some(clock));
+    let peer_url = format!("http://{}/v1/alab", peer.addr);
+    let now = aterm_time::unix_secs().expect("clock");
+    CLOCK.store(
+        START + log_entries::OLD_MAC_WINDOW_SECS - 1,
+        Ordering::SeqCst,
+    );
+    assert!(
+        log_entries::heard_across(std::slice::from_ref(&macs.url), now).is_none(),
+        "partial window became complete"
+    );
+    CLOCK.store(
+        START + log_entries::OLD_MAC_WINDOW_SECS + 1,
+        Ordering::SeqCst,
+    );
+    assert!(transport::fetch_heard(&peer_url).unwrap().is_none());
+    for urls in [
+        vec![macs.url.clone(), peer_url.clone()],
+        vec![peer_url.clone(), macs.url.clone()],
+        Vec::new(),
+    ] {
+        let heard = log_entries::heard_across(&urls, now);
+        assert!(heard.is_none(), "an unanswered server was treated as empty");
+        assert!(log_entries::mirror_still_needed(&log, heard.as_ref(), now));
+    }
+
+    let unavailable = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let unavailable_url = format!("http://{}/v1/alab", unavailable.local_addr().unwrap());
+    drop(unavailable);
+    assert!(log_entries::heard_across(&[macs.url.clone(), unavailable_url], now).is_none());
+
+    let envelope = std::fs::read(macs.m22.cache_file()).expect("envelope");
+    transport::publish(&Source::Url(peer_url.clone()), &envelope).expect("seed peer");
+    let urls = [macs.url.clone(), peer_url.clone()];
+    let heard = log_entries::heard_across(&urls, now).expect("both modern servers answer");
+    assert!(!log_entries::mirror_still_needed(&log, Some(&heard), now));
+
+    // A plain GET is the tagged 0.145 request shape, with neither new purpose header. The
+    // current transport supplies that exact absence of identity; no old executable is run.
+    transport::fetch_within(&peer_url, None, Duration::from_secs(60)).unwrap();
+    let heard = log_entries::heard_across(&urls, now).unwrap();
+    assert_eq!(heard.anonymous, Some(now));
+    assert!(log_entries::mirror_still_needed(&log, Some(&heard), now));
+    CLOCK.store(
+        START + 2 * log_entries::OLD_MAC_WINDOW_SECS + 1,
+        Ordering::SeqCst,
+    );
+    transport::observe_after_nowait(&peer_url, None, Duration::from_secs(60)).unwrap();
+    let heard = log_entries::heard_across(&urls, now).unwrap();
+    assert!(
+        log_entries::mirror_still_needed(&log, Some(&heard), now),
+        "the exact anonymous TTL was excluded"
+    );
+    CLOCK.store(
+        START + 2 * log_entries::OLD_MAC_WINDOW_SECS + 2,
+        Ordering::SeqCst,
+    );
+    transport::observe_after_nowait(&peer_url, None, Duration::from_secs(60)).unwrap();
+    let heard = log_entries::heard_across(&urls, now).unwrap();
+    assert!(
+        !log_entries::mirror_still_needed(&log, Some(&heard), now),
+        "an observer renewed an expired anonymous consumer"
+    );
+
+    let old = Identity::from_secret_bytes([0x47; 32]).recipient();
+    transport::fetch_within_as(
+        &peer_url,
+        None,
+        Duration::from_secs(60),
+        Some(&old.to_bech32()),
+    )
+    .expect("the unproved Mac subscribes only to the second server");
+    let heard = log_entries::heard_across(&urls, now).expect("both servers answer");
+    assert!(heard.subscribers.contains_key(&transport::heard_tag(&old)));
+    assert!(log_entries::mirror_still_needed(&log, Some(&heard), now));
+    peer.stop();
     macs.server.stop();
 }

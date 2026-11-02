@@ -100,6 +100,7 @@ fn reading(as_of_ms: i64, calls: Vec<BackgroundCall>) -> FactsReading {
     FactsReading {
         as_of_ms,
         no_progress: calls,
+        held: None,
     }
 }
 
@@ -191,6 +192,203 @@ fn a_seed_holds_a_told_call_by_its_own_key_alone() {
     assert!(!s.is_told(born_since), "a call born since");
     let r = reading(T0, vec![call(27090, Some(1), 40), call(27090, Some(2), 5)]);
     assert_eq!(s.pending(Some(&r), T0).map(|f| f.key), Some(born_since));
+}
+
+fn held_calls(pids: &[(u32, u64)]) -> Vec<HeldCall> {
+    pids.iter()
+        .map(|&(pid, held_ms)| HeldCall {
+            pid,
+            exec_version: Some(1),
+            held_ms,
+        })
+        .collect()
+}
+
+/// A reading of the held programs alone, as of `as_of_ms`.
+fn held(as_of_ms: i64, pids: &[(u32, u64)]) -> FactsReading {
+    FactsReading {
+        as_of_ms,
+        no_progress: Vec::new(),
+        held: Some(HeldReading {
+            as_of_ms,
+            programs: held_calls(pids),
+        }),
+    }
+}
+
+/// Observes `r` at `now`, then the fact it tells.
+fn ask(s: &mut FactsState, r: Option<&FactsReading>, now: i64) -> Option<Fact> {
+    s.observe(r, now);
+    s.pending(r, now)
+}
+
+/// ONE HELD EPISODE IS TOLD ONCE, WHICHEVER PROGRAMS COME AND GO, UNTIL A FRESH READING NAMES
+/// NONE: the first fresh reading naming pid 1 opens it and tells it; pid 1 ending while pid 2 is
+/// held is the same episode, still told; an absent held part, or one past the forgetting bound,
+/// closes nothing; a fresh one naming none closes it, and the next held program is a new episode,
+/// told again.
+#[test]
+fn a_held_episode_is_told_once_until_a_fresh_reading_names_none() {
+    let mut s = FactsState::default();
+    let first = ask(&mut s, Some(&held(T0, &[(1, 20_000)])), T0).expect("a fact");
+    assert_eq!(first.key.kind, FactKind::ProgramCheck);
+    assert_eq!(first.as_of_ms, T0);
+    s.told(first.key, T0);
+    let later = T0 + 60_000;
+    assert_eq!(
+        ask(&mut s, Some(&held(later, &[(2, 5_000)])), later),
+        None,
+        "pid 1 ended and pid 2 is held: the same episode, still told"
+    );
+    let stale = later + NO_PROGRESS_FRESH_MS + 1;
+    for (seen, now) in [
+        (None, later),
+        (
+            Some(FactsReading {
+                held: None,
+                ..held(later, &[])
+            }),
+            later,
+        ),
+        (Some(held(later, &[])), stale),
+    ] {
+        s.observe(seen.as_ref(), now);
+        assert!(s.is_told(first.key), "{seen:?} at {now} closes nothing");
+    }
+    let clear = later + 2_000;
+    assert_eq!(ask(&mut s, Some(&held(clear, &[])), clear), None);
+    assert!(!s.is_told(first.key), "a fresh reading naming none: over");
+    let again = clear + 2_000;
+    let next = ask(&mut s, Some(&held(again, &[(3, 1_000)])), again).expect("a new episode");
+    assert_ne!(next.key, first.key);
+    assert_eq!(next.key.kind, FactKind::ProgramCheck);
+}
+
+/// THE HELD SENTENCE SAYS COUNTS, PIDS AND AGES ONLY: one program by its pid and its age; three by
+/// theirs, oldest first, and the oldest's age; past four pids, four then `…`; the longest it can
+/// be (a ten-digit count, four seven-digit pids then `…`, `9999999 h 59 m`) fits [`FACT_CAP`];
+/// and none says nothing.
+#[test]
+fn the_held_sentence_says_counts_pids_and_ages_only() {
+    let words = |pids: &[(u32, u64)]| {
+        HeldReading {
+            as_of_ms: T0,
+            programs: held_calls(pids),
+        }
+        .told()
+    };
+    assert_eq!(
+        words(&[(72955, 20 * 60_000 + 59_999)]),
+        "macOS's program check is holding 1 program this tab started (pid 72955), for 20 m; a \
+         retry waits in the same line"
+    );
+    assert_eq!(
+        words(&[(1, 19 * 60_000), (2, 60_000), (3, 0)]),
+        "macOS's program check is holding 3 programs this tab started (pid 1, pid 2, pid 3), the \
+         oldest for 19 m; a retry waits in the same line"
+    );
+    let fifty: Vec<(u32, u64)> = (1..=50).map(|pid| (pid, 1_000)).collect();
+    assert!(
+        words(&fifty).chars().count() <= FACT_CAP,
+        "{} chars: {}",
+        words(&fifty).chars().count(),
+        words(&fifty)
+    );
+    assert!(
+        words(&fifty).contains("(pid 1, pid 2, pid 3, pid 4, …), the oldest for 1 s;"),
+        "{}",
+        words(&fifty)
+    );
+    let mut worst = HeldReading {
+        as_of_ms: T0,
+        programs: held_calls(&[(9_999_999, (9_999_999 * 3600 + 59 * 60) * 1000); 5]),
+    }
+    .told();
+    worst = worst.replacen(" 5 programs ", " 4294967295 programs ", 1);
+    assert!(
+        worst.contains("pid 9999999, …), the oldest for 9999999 h 59 m;"),
+        "{worst}"
+    );
+    assert!(
+        worst.chars().count() <= FACT_CAP,
+        "{} chars: {worst}",
+        worst.chars().count()
+    );
+    assert_eq!(words(&[]), "");
+}
+
+/// A CALL AT NO PROGRESS IS TOLD BEFORE A HELD PROGRAM: with both untold in one fresh reading, the
+/// call first; told, the held programs next.
+#[test]
+fn a_call_at_no_progress_is_told_before_a_held_program() {
+    let r = FactsReading {
+        no_progress: vec![call(27090, Some(1), 31)],
+        ..held(T0, &[(72955, 600_000)])
+    };
+    let mut s = FactsState::default();
+    let first = ask(&mut s, Some(&r), T0).expect("a fact");
+    assert_eq!(first.key.kind, FactKind::NoProgress);
+    s.told(first.key, T0);
+    let second = ask(&mut s, Some(&r), T0).expect("the held programs");
+    assert_eq!(second.key.kind, FactKind::ProgramCheck);
+}
+
+/// A HELD PART OLDER THAN THE GATE TELLS NOTHING: by its own time, whatever the no-progress
+/// part's, a held part 6 s old tells nothing and one 4 s old tells; the no-progress part's age
+/// does not hold it back.
+#[test]
+fn a_held_part_older_than_the_gate_tells_nothing() {
+    for (age, tells) in [
+        (FACT_FRESH_MS + 1_000, false),
+        (FACT_FRESH_MS - 1_000, true),
+    ] {
+        let r = FactsReading {
+            as_of_ms: T0 - NO_PROGRESS_FRESH_MS,
+            no_progress: Vec::new(),
+            held: Some(HeldReading {
+                as_of_ms: T0 - age,
+                programs: held_calls(&[(72955, 600_000)]),
+            }),
+        };
+        let mut s = FactsState::default();
+        assert_eq!(
+            ask(&mut s, Some(&r), T0).map(|f| (f.key.kind, f.as_of_ms)),
+            tells.then_some((FactKind::ProgramCheck, T0 - age)),
+            "a held part {age} ms old"
+        );
+    }
+}
+
+/// A RESTART HOLDS A TOLD HELD EPISODE UNTIL IT CLEARS: a successor seeded from a typed
+/// `fact-program-check@v1` row ten minutes old opens its own episode (another id) and still holds
+/// it told; a fresh reading naming none releases the kind, and the next held program is told.
+#[test]
+fn a_restart_holds_a_told_held_episode_until_it_clears() {
+    let told = EpisodeKey {
+        kind: FactKind::ProgramCheck,
+        id: (T0 - 600_000).unsigned_abs(),
+    };
+    let mut s = FactsState::default();
+    s.seed(
+        &[
+            (told, T0 - 600_000, SeedOutcome::Intent),
+            (told, T0 - 600_000, SeedOutcome::Typed),
+        ],
+        T0,
+    );
+    assert_eq!(
+        ask(&mut s, Some(&held(T0, &[(72955, 600_000)])), T0),
+        None,
+        "the successor's episode is another id, held told"
+    );
+    let clear = T0 + 2_000;
+    assert_eq!(ask(&mut s, Some(&held(clear, &[])), clear), None);
+    let again = clear + 2_000;
+    assert_eq!(
+        ask(&mut s, Some(&held(again, &[(72956, 1_000)])), again).map(|f| f.key.kind),
+        Some(FactKind::ProgramCheck),
+        "seen clear: the next held program is told"
+    );
 }
 
 /// TWO WAKES, THE FIRST TYPED (the slice-2 plan's S3): a successor seeded from the ledger's rows

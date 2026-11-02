@@ -201,7 +201,15 @@ impl Log {
                     "journal capacity or unretained prefix is invalid",
                 ));
             }
-            for record in &page {
+            for (idx, record) in page.iter().enumerate() {
+                if record.seq.0 != scan.0 + idx as u64
+                    || record.subject.is_empty()
+                    || astream_broker::store::is_hidden_subject(&record.subject)
+                {
+                    return Err(io::Error::other(
+                        "acknowledged journal prefix does not decode",
+                    ));
+                }
                 if record.body.len() > limits.record_bytes {
                     return Err(io::Error::other("journal record size exceeds its capacity"));
                 }
@@ -387,11 +395,23 @@ pub struct Acknowledged {
 
 /// An acknowledged prefix a reader has already decoded, and how many records
 /// it holds. Hand it back to [`read_committed`] to be told only what changed.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Up to eight MiB of private physical bytes are retained for fresh comparisons.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Prefix {
     acknowledged: Acknowledged,
     records: u64,
     max_record_bytes: usize,
+    bytes: Option<Arc<[u8]>>,
+}
+const PREFIX_BYTES: usize = 8 * 1024 * 1024;
+impl std::fmt::Debug for Prefix {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.debug_struct("Prefix")
+            .field("acknowledged", &self.acknowledged)
+            .field("records", &self.records)
+            .field("max_record_bytes", &self.max_record_bytes)
+            .finish()
+    }
 }
 impl Prefix {
     pub const fn acknowledged(&self) -> Acknowledged {
@@ -431,8 +451,10 @@ pub enum Committed {
 /// A checkpoint renamed over while it was being opened or read is read again,
 /// a bounded number of times; past that, the one read last stands, which the
 /// newer one only extends.
-/// With `known`, its bytes are hashed again: when they still head the new
-/// prefix of the same file, only the records after them are decoded.
+/// With `known`, equal freshly read bytes and the same acknowledgement reuse its
+/// digest when those bytes were retained. Other inputs are hashed again: when
+/// the known bytes still head the new prefix of the same file, only the records
+/// after them are decoded.
 /// Nothing is repaired, archived or written.
 /// # Errors
 /// Refuses an invalid name, anchor or limits (as [`Log::open`] does); a
@@ -523,6 +545,19 @@ pub fn read_committed(
             .map_err(|_| io::Error::other("journal checkpoint length overflow"))?
     ];
     file.read_exact(&mut bytes)?;
+    if let Some(known) = known
+        && known.acknowledged == acknowledged
+        && known.records <= limits.records as u64
+        && known.max_record_bytes <= limits.record_bytes
+        && known
+            .bytes
+            .as_ref()
+            .is_some_and(|saved| saved.as_ref() == bytes.as_slice())
+    {
+        return Ok(Committed::Unchanged);
+    }
+    #[cfg(test)]
+    tests::hashing();
     let mut hash = aterm_digest::Sha256::new();
     let mut hashed = 0;
     let mut extends = None;
@@ -560,6 +595,7 @@ pub fn read_committed(
                     acknowledged,
                     records: known.records + records.len() as u64,
                     max_record_bytes,
+                    bytes: (bytes.len() <= PREFIX_BYTES).then(|| Arc::from(bytes)),
                 },
                 records,
             })
@@ -572,6 +608,7 @@ pub fn read_committed(
                     acknowledged,
                     records: records.len() as u64,
                     max_record_bytes,
+                    bytes: (bytes.len() <= PREFIX_BYTES).then(|| Arc::from(bytes)),
                 },
                 records,
             })
@@ -597,7 +634,10 @@ fn decode(mut bytes: &[u8], first: u64, layout: &Layout) -> io::Result<Vec<Broke
             return Err(undecodable());
         }
         let record = BrokerRecord::from_payload(payload).ok_or_else(undecodable)?;
-        if record.seq.0 != offset {
+        if record.seq.0 != offset
+            || record.subject.is_empty()
+            || astream_broker::store::is_hidden_subject(&record.subject)
+        {
             return Err(undecodable());
         }
         if record.body.len() > layout.limits.record_bytes {
@@ -627,9 +667,9 @@ fn lock(dir: &Path, layout: &Layout, deadline: Instant) -> io::Result<WriterLock
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error),
     }
-    let (file, metadata) = private_file::open_private(dir, &layout.file("lock"))
-        .map_err(|_| io::Error::other("journal lock is not private"))?;
-    aterm_uds::keep_out_of_children(&file)?;
+    let (file, metadata) =
+        aterm_uds::kept_out(|| private_file::open_private(dir, &layout.file("lock")))
+            .map_err(|_| io::Error::other("journal lock is not private"))?;
     private_file::lock_exclusive_until_with(
         &file,
         deadline,
@@ -716,7 +756,11 @@ impl Checkpoint {
         if length < self.length
             || length > layout.limits.bytes as u64
             || metadata.len() < length
-            || metadata.len() > (layout.limits.bytes + layout.limits.record_bytes) as u64
+            || metadata.len()
+                > layout
+                    .limits
+                    .bytes
+                    .saturating_add(layout.limits.record_bytes) as u64
         {
             return Err(io::Error::other(
                 "journal lost acknowledged bytes or exceeded its capacity",
@@ -753,11 +797,13 @@ impl Checkpoint {
 fn recover_uncommitted(dir: &Path, layout: &Layout, fresh: bool) -> io::Result<(u64, u64)> {
     let (_, admitted) = private_file::open_private(dir, &layout.file("astream"))
         .map_err(|_| io::Error::other("journal is not private"))?;
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(dir.join(layout.file("astream")))?;
+    let file = aterm_uds::kept_out(|| {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(dir.join(layout.file("astream")))
+    })?;
     let opened = file.metadata()?;
     if opened.dev() != admitted.dev()
         || opened.ino() != admitted.ino()
@@ -766,7 +812,6 @@ fn recover_uncommitted(dir: &Path, layout: &Layout, fresh: bool) -> io::Result<(
     {
         return Err(io::Error::other("journal changed during private open"));
     }
-    aterm_uds::keep_out_of_children(&file)?;
     #[expect(
         clippy::disallowed_methods,
         reason = "WriterLock is CLOEXEC/CLOFORK and unlocks the physical file before transferring ownership to astream"
@@ -781,6 +826,15 @@ fn recover_uncommitted(dir: &Path, layout: &Layout, fresh: bool) -> io::Result<(
     if checked.dev() != opened.dev() || checked.ino() != opened.ino() {
         return Err(io::Error::other(
             "journal changed while its prefix was checked",
+        ));
+    }
+    let max_journal_bytes = layout
+        .limits
+        .bytes
+        .saturating_add(layout.limits.record_bytes);
+    if checked.len() > max_journal_bytes as u64 {
+        return Err(io::Error::other(
+            "journal lost acknowledged bytes or exceeded its capacity",
         ));
     }
     let tail_len = checked
@@ -802,7 +856,7 @@ fn recover_uncommitted(dir: &Path, layout: &Layout, fresh: bool) -> io::Result<(
         layout.archive_prefix(),
         aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(&tail))
     );
-    match private_file::read_private(dir, &name, layout.limits.bytes + layout.limits.record_bytes) {
+    match private_file::read_private(dir, &name, max_journal_bytes) {
         Ok(old) if old == tail => {}
         Err(PrivateFileError::Missing) => {
             let mut bytes = tail.len() as u64;

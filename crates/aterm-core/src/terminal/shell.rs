@@ -64,11 +64,17 @@ impl StartFlags {
     pub fn parse(value: &str) -> Option<Self> {
         let mut parts = value.split(',');
         let mut field = |name: &str| -> Option<&str> { parts.next()?.strip_prefix(name) };
-        let pre = field("pre:")?.parse().ok()?;
-        let sched = field("s:")?.parse().ok()?;
+        let uint = |s: &str| -> Option<u32> {
+            s.bytes()
+                .all(|b| b.is_ascii_digit())
+                .then(|| s.parse().ok())
+                .flatten()
+        };
+        let pre = uint(field("pre:")?)?;
+        let sched = uint(field("s:")?)?;
         let jobs = match field("j:")? {
             "-" => None,
-            n => Some(n.parse().ok()?),
+            n => Some(uint(n)?),
         };
         let periodic = match field("r:")? {
             "0" => false,

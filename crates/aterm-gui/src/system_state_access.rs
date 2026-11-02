@@ -28,7 +28,9 @@
 //!   mints the yes, and its pages wait for the step moment
 //!   ([`App::open_access_from_system_state`]).
 //! * Each step appends `<revision> <row> <outcome>` to `<state>/system-state-access`
-//!   ([`aterm_types::macos_setup::access_record`]), which System State reads.
+//!   ([`aterm_types::macos_setup::access_record`]), which System State reads. Local Network
+//!   carries the loaded-code subject when known; its readers accept only matching known
+//!   subjects.
 //! * The menu line ([`menu_line`]) is the only signal posted; the digest entries it replaced
 //!   are withdrawn ([`RETIRED_KEYS`]).
 //! * A `[privacy]` switch off, and a debugger the person turned off, are told to the setup
@@ -36,6 +38,8 @@
 
 #[cfg(any(target_os = "macos", test))]
 use std::net::Ipv4Addr;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use aterm_types::macos_setup::opt_out::OptOut;
@@ -47,14 +51,40 @@ use crate::status_item::SystemStateLine;
 use crate::system_state::ToolsWait;
 use crate::{App, SetupStatus, devtools_helper};
 
-/// How long the Local Network alert counts as up after the trigger
-/// ([`aterm_types::macos_setup::LOCAL_NETWORK_QUESTION_HOLD`], a bound, not a reading).
+/// How long the person must have been at the Mac, counted from their first input after the
+/// step's trigger, for macOS's Local Network alert to count as seen and answered when the LAN
+/// re-probe heard no answer ([`aterm_types::macos_setup::LOCAL_NETWORK_QUESTION_HOLD`]): macOS
+/// reports neither the alert nor its answer, and the alert stands, unanswered, while nobody is
+/// there ([`App::look_at_local_network_alert`]).
 pub(crate) const LOCAL_NETWORK_ALERT_HOLD: Duration =
     aterm_types::macos_setup::LOCAL_NETWORK_QUESTION_HOLD;
 
-/// How long a Local Network trigger that found no LAN to name waits before it
-/// looks again (the Wi-Fi may join after launch).
+/// Within how long a touch of the keyboard or pointer reads the person present while the Local
+/// Network alert's hold counts their time ([`App::look_at_local_network_alert`]): the permission
+/// walk's own presence ([`crate::permission_walk::START_PRESENT_WITHIN`]). Time between two looks
+/// counts only with the person present at both, and never more than this of it.
+const ALERT_PRESENT_WITHIN: Duration = crate::permission_walk::START_PRESENT_WITHIN;
+
+/// How long a Local Network trigger that named a LAN but could not make its socket waits before
+/// it looks again. One that found no LAN to name looks again only once this Mac's network moves
+/// ([`StepsReach::watch_network`]): the Wi-Fi may join after launch, and nothing else changes
+/// what it finds.
 const LOCAL_NETWORK_RETRY: Duration = Duration::from_secs(60);
+
+/// The Local Network row's words while this Mac is on no network at all ([`LanHere::Offline`]):
+/// the row reads calm, not waiting ([`App::access_opt_outs`]), and the step asks once a network
+/// move brings one. Every network has something to ask with ([`lan_ask`]).
+pub(crate) const LOCAL_NETWORK_NOTHING_TO_ASK: &str = "Nothing to ask yet: this Mac is on no \
+    network. aterm asks macOS's Local Network question once it joins one.";
+
+/// What this Mac's interfaces give the Local Network step to ask with ([`StepsReach::lan_here`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LanHere {
+    /// A network: a subnet to name ([`lan_target`]) or a Bonjour browse to make ([`lan_ask`]).
+    Lan,
+    /// No network at all.
+    Offline,
+}
 
 /// A failed access-record save retries independently of the step that ended.
 const ACCESS_RECORD_RETRY: Duration = Duration::from_secs(1);
@@ -80,6 +110,14 @@ const OPT_OUT_ROWS: [Access; 4] = [
 /// A Permissions row's description while a `[privacy]` switch is off.
 pub(crate) const PRIVACY_OFF: &str =
     "You turned aterm's privacy steps off in aterm.toml ([privacy]).";
+
+/// The Local Network row's description while `[swarm] enabled = false` holds System State's Local
+/// Network step ([`App::local_network_pending`]): setup asks nothing of the local network then, so
+/// the row settles for the Permissions stage, said calmly. It claims no answer to macOS's
+/// question, which a session's own first use of the local network (an `ssh` to a Mac here) still
+/// raises, as it does for any app.
+pub(crate) const SHARING_OFF_LAN: &str = "Setup asks for no Local Network while sharing with your \
+     other Macs is off in aterm.toml ([swarm]).";
 
 /// The Debugger row's description once its off reading is the person's choice, published as
 /// [`OptOut::WhileOff`] so it shows only while the row reads off.
@@ -138,6 +176,18 @@ pub(crate) enum LocalNetworkProbe {
     Unanswered,
 }
 
+/// Whether the LAN re-probe heard macOS's Local Network answer (pure): a LAN server answered, or
+/// macOS refused a `.local` lookup; one that ran out heard none.
+const fn probe_heard_an_answer(probe: LocalNetworkProbe) -> bool {
+    match probe {
+        LocalNetworkProbe::Granted => true,
+        #[cfg(any(target_os = "macos", test))]
+        LocalNetworkProbe::Refused => true,
+        #[cfg(any(target_os = "macos", test))]
+        LocalNetworkProbe::Unanswered => false,
+    }
+}
+
 /// What the access steps reach outside the App, injected so the steps are
 /// tested without a LAN, a state directory or the process-wide dialog count.
 #[derive(Clone, Copy)]
@@ -171,6 +221,10 @@ pub(crate) struct StepsReach {
     /// Hand this process's LAN to the Commons runtime
     /// ([`aterm_types::macos_setup::lan_first_use::hand_over`]) once the step's trigger has asked.
     pub(crate) hand_lan_over: fn(u64),
+    /// Whether a first LAN use of this process asked macOS through the door past the wait for
+    /// the step ([`aterm_types::macos_setup::lan_first_use::asked`]): the step reads that ask as
+    /// its question, and the door's hold as its alert's.
+    pub(crate) door_asked: fn() -> bool,
     /// Whether the window holds a [`MacosDialog`] while its own gesture is up
     /// (a live windowed instance only: the count is process-wide).
     pub(crate) holds_dialog: bool,
@@ -178,6 +232,13 @@ pub(crate) struct StepsReach {
     /// ([`App::note_local_network_hold`]): only where the step can run, a live windowed macOS
     /// instance, never on an instance whose arms reach nothing.
     pub(crate) names_holds: bool,
+    /// What this Mac's interfaces give the Local Network step to name now (`getifaddrs`: no
+    /// socket, so no question), read once its trigger named nothing.
+    pub(crate) lan_here: fn() -> LanHere,
+    /// Subscribe, request one fresh App reading, then request another after every non-timeout
+    /// network wake on a process-lifetime thread. Its latest source may hide a route move;
+    /// the App rechecks local state at the step's moment, including an Offline change.
+    pub(crate) watch_network: fn(devtools_helper::Wake),
 }
 
 impl std::fmt::Debug for StepsReach {
@@ -203,8 +264,11 @@ impl StepsReach {
         quiet: |_, _| false,
         dialog_up: || false,
         hand_lan_over: |_| {},
+        door_asked: || false,
         holds_dialog: false,
         names_holds: false,
+        lan_here: || LanHere::Offline,
+        watch_network: |_| {},
     };
 
     /// The live arms of a windowed macOS instance.
@@ -222,8 +286,11 @@ impl StepsReach {
             quiet: App::step_moment_is_quiet,
             dialog_up: aterm_types::macos_setup::macos_dialog_up,
             hand_lan_over: aterm_types::macos_setup::lan_first_use::hand_over,
+            door_asked: aterm_types::macos_setup::lan_first_use::asked,
             holds_dialog: true,
             names_holds: true,
+            lan_here: live_lan_here,
+            watch_network: live_watch_network,
         }
     }
 }
@@ -236,11 +303,21 @@ pub(crate) struct AccessSteps {
     local_network_done: Option<u64>,
     /// The revision whose record this process read for Local Network.
     local_network_read: Option<u64>,
-    /// Until when the Local Network alert counts as up.
-    local_network_until: Option<Instant>,
-    /// The revision whose Local Network trigger found nothing to connect to (no LAN yet, or no
-    /// socket), and when to try it again.
-    local_network_retry: Option<(u64, Instant)>,
+    /// macOS's Local Network alert the step raised, while it counts as up
+    /// ([`App::look_at_local_network_alert`]).
+    local_network_alert: Option<LocalNetworkAlert>,
+    /// The revision whose Local Network trigger found nothing to connect to, and when to try it
+    /// again: a minute after one that named a LAN but had no socket, `None` once this Mac's
+    /// network moves ([`Self::network_moved`]) after one that found no LAN to name.
+    local_network_retry: Option<(u64, Option<Instant>)>,
+    /// This Mac's network moved since the step last looked for a LAN to name, as the watch
+    /// started at its first such look tells it ([`StepsReach::watch_network`]).
+    network_moved: Arc<AtomicBool>,
+    /// That watch was started (once per process).
+    watching_network: bool,
+    /// The step's last look found this Mac on no network at all ([`LanHere::Offline`]): the
+    /// Local Network row reads calm ([`LOCAL_NETWORK_NOTHING_TO_ASK`]).
+    nothing_to_ask: bool,
     /// What held the Local Network step from its moment at the last look that found it held
     /// ([`App::local_network_holds`]), as aterm.log last said it: a look that finds the same
     /// says nothing.
@@ -293,6 +370,33 @@ pub(crate) struct AccessSteps {
     fda_unverified_here: bool,
 }
 
+/// macOS's Local Network alert the step raised, and the person's time with it
+/// ([`App::look_at_local_network_alert`]).
+#[derive(Clone, Copy, Debug)]
+struct LocalNetworkAlert {
+    /// When the step's trigger asked.
+    asked: Instant,
+    /// The person's time at the Mac counted since a look first found them present with an input
+    /// after the ask; `None` until a look does.
+    present_for: Option<Duration>,
+    /// The last look that read the person.
+    looked: Instant,
+    /// Whether that look read them present.
+    present: bool,
+}
+
+impl LocalNetworkAlert {
+    /// The alert the trigger raised at `now`.
+    const fn asked(now: Instant) -> Self {
+        Self {
+            asked: now,
+            present_for: None,
+            looked: now,
+            present: false,
+        }
+    }
+}
+
 struct RecordedAccess {
     revision: u64,
     access: Access,
@@ -329,8 +433,11 @@ impl AccessSteps {
             reach,
             local_network_done: None,
             local_network_read: None,
-            local_network_until: None,
+            local_network_alert: None,
             local_network_retry: None,
+            network_moved: Arc::new(AtomicBool::new(false)),
+            watching_network: false,
+            nothing_to_ask: false,
             local_network_held: None,
             opt_outs: None,
             pane_act: None,
@@ -361,14 +468,30 @@ impl AccessSteps {
         self.reach = reach;
     }
 
+    /// Raise the Local Network alert's hold as the step's trigger at `asked` does, the person
+    /// touching the Mac at once (tests): it ends once they have had [`LOCAL_NETWORK_ALERT_HOLD`]
+    /// with it, or the re-probe hears an answer.
+    #[cfg(test)]
+    pub(crate) const fn alert_seen_at_for_test(&mut self, asked: Instant) {
+        self.local_network_alert = Some(LocalNetworkAlert {
+            asked,
+            present_for: Some(Duration::ZERO),
+            looked: asked,
+            present: true,
+        });
+    }
+
     /// Whether the menu line names a regressed Full Disk Access grant (tests).
     #[cfg(test)]
     pub(crate) const fn fda_regressed(&self) -> bool {
         self.fda_regressed
     }
 
-    fn local_network_alert_up(&self, now: Instant) -> bool {
-        self.local_network_until.is_some_and(|until| now < until)
+    /// Whether macOS's Local Network alert the step raised counts as up: until the LAN re-probe
+    /// hears its answer, or the person has had [`LOCAL_NETWORK_ALERT_HOLD`] with it
+    /// ([`App::look_at_local_network_alert`]).
+    const fn local_network_alert_up(&self) -> bool {
+        self.local_network_alert.is_some()
     }
 
     fn pane_up(&self, now: Instant) -> bool {
@@ -392,9 +515,11 @@ pub(crate) struct LanInterface {
 /// The unicast LAN address the Local Network trigger names (pure): from this
 /// Mac's IPv4 interfaces that are up, not loopback and broadcast-capable (Apple
 /// TN3179's own filter), a private one first (10/8, 172.16/12, 192.168/16),
-/// else link-local (169.254/16); the subnet's first host, or its second when
-/// the first is this Mac. `None` when no such subnet has a mask from /8 to /30
-/// (a /31, a /32, an empty mask, a mask with holes, or none at all).
+/// then link-local (169.254/16), then any other directly attached subnet (a
+/// campus network may hand out public addresses, and TN3179 counts any host on
+/// an attached subnet as local network); the subnet's first host, or its second
+/// when the first is this Mac. `None` when no such subnet has a mask from /8 to
+/// /30 (a /31, a /32, an empty mask, a mask with holes, or none at all).
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn lan_target(interfaces: &[LanInterface]) -> Option<Ipv4Addr> {
     let pick = |wanted: fn(Ipv4Addr) -> bool| {
@@ -417,45 +542,34 @@ pub(crate) fn lan_target(interfaces: &[LanInterface]) -> Option<Ipv4Addr> {
             })
         })
     };
-    pick(|address| address.is_private()).or_else(|| pick(|address| address.is_link_local()))
+    pick(|address| address.is_private())
+        .or_else(|| pick(|address| address.is_link_local()))
+        .or_else(|| pick(|_| true))
 }
 
-/// Why System State's Local Network step will not ask macOS on a network it has no subnet to
-/// name on ([`lan_target`]): one with only public IPv4 addresses (a campus network may hand those
-/// out), or an IPv6-only one.
+/// How the Local Network step makes macOS ask its question on this Mac's network
+/// ([`lan_ask`]).
 #[cfg(any(target_os = "macos", test))]
-pub(crate) const LOCAL_NETWORK_STEP_NO_LAN: &str = "this Mac's network has no private or \
-    link-local IPv4 subnet, so System State's Local Network step has nothing to ask macOS with";
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LanAsk {
+    /// A UDP connect (nothing sent) to a host on a directly attached subnet ([`lan_target`]).
+    Connect(Ipv4Addr),
+    /// A short Bonjour browse of the step's own ([`LOCAL_NETWORK_BROWSE_FOR`]): a network with
+    /// no IPv4 subnet to name (IPv6 alone, a /31 or /32 link), where a browse is still a Local
+    /// Network use macOS asks about.
+    Browse,
+}
 
-/// Why System State's Local Network step will not run in a window here (pure): `config_off`,
-/// the reason `aterm.toml` gives ([`crate::app_config::local_network_step_off_setting`]), else
-/// [`LOCAL_NETWORK_STEP_NO_LAN`] where this Mac is on a network (an IPv4 LAN segment among
-/// `interfaces`, or `ipv6_network`) but its `interfaces` give the step no LAN to name, so its
-/// trigger asks nothing ([`App::tick_local_network_step`]); `None` while it may, a Mac on no
-/// network yet included (the step asks once it joins one it can name). Uses that wait for the
-/// step go where it will not run.
+/// How the Local Network step asks macOS on this Mac's network now (pure): a connect to the
+/// subnet [`lan_target`] names, else a Bonjour browse on any network (a LAN segment among
+/// `interfaces`, or `ipv6_network`), else `None`: a Mac on no network at all has nothing to ask
+/// with yet.
 #[cfg(any(target_os = "macos", test))]
-pub(crate) fn local_network_step_off_with(
-    config_off: Option<&'static str>,
-    interfaces: &[LanInterface],
-    ipv6_network: bool,
-) -> Option<&'static str> {
-    config_off.or_else(|| {
-        (lan_target(interfaces).is_none()
-            && (ipv6_network || interfaces.iter().any(|interface| interface.broadcast)))
-        .then_some(LOCAL_NETWORK_STEP_NO_LAN)
+pub(crate) fn lan_ask(interfaces: &[LanInterface], ipv6_network: bool) -> Option<LanAsk> {
+    lan_target(interfaces).map(LanAsk::Connect).or_else(|| {
+        (ipv6_network || interfaces.iter().any(|interface| interface.broadcast))
+            .then_some(LanAsk::Browse)
     })
-}
-
-/// [`local_network_step_off_with`] of `aterm.toml` and this Mac's interfaces as they read now
-/// (`getifaddrs`: no socket, so no question).
-#[cfg(target_os = "macos")]
-pub(crate) fn local_network_step_off_here() -> Option<&'static str> {
-    local_network_step_off_with(
-        crate::app_config::local_network_step_off_setting(),
-        &interface_addresses(),
-        ipv6_network_up(),
-    )
 }
 
 /// `status`'s `setup=` (pure): where this Mac's setup stands, from the last status the worker
@@ -548,12 +662,8 @@ const fn setup_word(subject: Subject) -> &'static str {
 /// back, alone, reads `System State: Restore failed for <row>`. The note is the Secrets row's
 /// while it needs you (a waiting vault approval code, or a move to Applications), else the
 /// GitHub repositories row's while it needs you (its token's remedy, in the page's words).
-/// `None` when nothing does, and while a review closed unanswered waits for an answer: nobody
-/// approved its permission steps, so none of them needs anyone yet (§3.3).
+/// `None` when nothing does.
 pub(crate) fn menu_line(status: &SetupStatus, fda_regressed: bool) -> Option<SystemStateLine> {
-    if status.unanswered {
-        return None;
-    }
     let selection = status
         .plan
         .as_ref()
@@ -570,12 +680,14 @@ pub(crate) fn menu_line(status: &SetupStatus, fda_regressed: bool) -> Option<Sys
     let fda = Subject::Access(Access::FullDiskAccess);
     let repositories = Subject::Setting(Setting::Repositories);
     let tools = status.repositories_tools_wait();
-    // Apple's Command Line Tools installing is a wait that ends by itself (§3.3): no line.
+    // Apple's Command Line Tools installing, or a press of Install… waiting for a dialog, is a
+    // wait that ends by itself (§3.3): no line.
+    // The vault's join asking quietly is a wait that usually ends by itself too
+    // ([`SetupStatus::joins_quietly`]).
+    let secrets = Subject::Setting(Setting::Secrets);
     let mut needs: Vec<Subject> = managed_with(Standing::NeedsYou)
-        .filter(|subject| {
-            *subject != repositories
-                || !matches!(tools, Some(ToolsWait::Installing | ToolsWait::Queued))
-        })
+        .filter(|subject| *subject != repositories || !tools.is_some_and(ToolsWait::calm))
+        .filter(|subject| *subject != secrets || !status.joins_quietly())
         .collect();
     if fda_regressed && !needs.contains(&fda) {
         needs.push(fda);
@@ -634,16 +746,14 @@ pub(crate) fn menu_line(status: &SetupStatus, fda_regressed: bool) -> Option<Sys
             .and_then(|observation| observation.note.clone())
             .filter(|note| !note.trim().is_empty())
     };
-    // Their tab asking for the password says where the person is needed, as the headline does.
+    // Their tab asking for the password or restored, or Apple's installer window, says where the
+    // person is needed, as the page does.
     let note = note_of(Setting::Secrets).or_else(|| {
-        note_of(Setting::Repositories).map(|note| {
-            if tools == Some(ToolsWait::Password) {
-                crate::system_state::TOOLS_PASSWORD_HEADLINE.to_owned()
-            } else if tools == Some(ToolsWait::Recovered) {
-                crate::system_state::TOOLS_RECOVERED_HEADLINE.to_owned()
-            } else {
-                note
-            }
+        note_of(Setting::Repositories).map(|note| match tools {
+            Some(ToolsWait::Password) => crate::system_state::TOOLS_PASSWORD_HEADLINE.to_owned(),
+            Some(ToolsWait::Recovered) => crate::system_state::TOOLS_RECOVERED_HEADLINE.to_owned(),
+            Some(ToolsWait::AppleWindow) => crate::system_state::APPLE_WINDOW_NOTE.to_owned(),
+            _ => note,
         })
     });
     Some(SystemStateLine { label, note })
@@ -684,11 +794,16 @@ impl App {
     }
 
     /// Which Permissions rows the person opted out of, in [`OPT_OUT_ROWS`] order: every row
-    /// while a `[privacy]` switch is off ([`OptOut::Always`]), and the debugger wherever its off
+    /// while a `[privacy]` switch is off ([`OptOut::Always`]), the debugger wherever its off
     /// reading is their choice ([`crate::debugger_access::off_is_chosen`], read from the
-    /// debugger record, so it holds with or without the window's own admission). The record
-    /// says what an off reading means, so the debugger's is [`OptOut::WhileOff`]: a debugger
-    /// that reads on, or could not be read, keeps its own words.
+    /// debugger record, so it holds with or without the window's own admission), and Local
+    /// Network while `[swarm] enabled = false` holds its step ([`SHARING_OFF_LAN`]), which then
+    /// never runs, so the Permissions stage would wait on it for good, or while this Mac is on no
+    /// network at all, so the step has nothing to ask macOS with yet
+    /// ([`LOCAL_NETWORK_NOTHING_TO_ASK`]: settled calm, not the person's choice, but no step waits
+    /// on it). The record says what an off
+    /// reading means, so the debugger's is [`OptOut::WhileOff`]: a debugger that reads on, or
+    /// could not be read, keeps its own words.
     pub(crate) fn access_opt_outs(&self) -> [Option<OptOut>; 4] {
         let off = (!self.access_steps_allowed()).then_some(OptOut::Always(PRIVACY_OFF));
         OPT_OUT_ROWS.map(|access| match access {
@@ -696,6 +811,12 @@ impl App {
                 .debugger_change
                 .off_is_chosen()
                 .then_some(OptOut::WhileOff(DEBUGGER_OFF))),
+            Access::LocalNetwork => off
+                .or((!self.config.swarm_enabled()).then_some(OptOut::Always(SHARING_OFF_LAN)))
+                .or(self
+                    .access_steps
+                    .nothing_to_ask
+                    .then_some(OptOut::Always(LOCAL_NETWORK_NOTHING_TO_ASK))),
             _ => off,
         })
     }
@@ -799,7 +920,7 @@ impl App {
                 .panel()
                 .is_some_and(|panel| panel.origin() != devtools_helper::Origin::Walk)
             || self.consent_warmup.is_live()
-            || self.access_steps.local_network_alert_up(now)
+            || self.access_steps.local_network_alert_up()
             || self.access_steps.pane_up(now)
     }
 
@@ -844,13 +965,19 @@ impl App {
     /// Win the dialog slot for a page of the control verb's permission walk while the walk holds
     /// none (its first page), under the steps' one-gesture rule: `false` while another of the
     /// window's gestures ([`Self::access_gesture_up_beside_walk`]) or another macOS dialog of
-    /// this process is up, and while a person's Install… press waits for the slot or its tab is
+    /// this process is up, while a person's Install… press waits for the slot or its tab is
     /// on its way ([`Self::install_press_waits`]): a person's press never waits behind a
-    /// control client's walk. A guard the window holds then is the walk's own, taken at a turn's
-    /// end while it waited ([`Self::settle_access_steps`]): it is given up and the slot won only
-    /// when none is up, so a setup-worker prompt that was up first is waited out, not stacked on.
+    /// control client's walk, and while System Settings asks something or may still
+    /// ([`Self::system_settings_may_ask`], read last since it may read the window list): a page
+    /// opened under its own sheet is lost, its panel left beside that question. A guard the
+    /// window holds then is the walk's own, taken at a turn's end while it waited
+    /// ([`Self::settle_access_steps`]): it is given up and the slot won only when none is up, so a
+    /// setup-worker prompt that was up first is waited out, not stacked on.
     pub(crate) fn reserve_walk_dialog(&mut self, now: Instant) -> bool {
-        if self.access_gesture_up_beside_walk(now) || self.install_press_waits() {
+        if self.access_gesture_up_beside_walk(now)
+            || self.install_press_waits()
+            || self.system_settings_may_ask()
+        {
             return false;
         }
         self.drop_access_dialog();
@@ -1014,7 +1141,7 @@ impl App {
         if self.consent_warmup.is_live() {
             hold("the launch folder pass is walking");
         }
-        if self.access_steps.local_network_alert_up(now) {
+        if self.access_steps.local_network_alert_up() {
             hold("the Local Network alert's hold");
         }
         if self.access_steps.pane_up(now) {
@@ -1132,6 +1259,8 @@ impl App {
         let recorded = (self.access_steps.reach.recorded)(revision, Access::LocalNetwork).is_some();
         if recorded {
             self.access_steps.local_network_done = Some(revision);
+            self.access_steps.local_network_retry = None;
+            self.access_steps.nothing_to_ask = false;
         }
         recorded
     }
@@ -1151,16 +1280,19 @@ impl App {
             && !self.walk_waits_for_the_person(now)
     }
 
-    /// Drain a completed 1 s × 30 s LAN grant re-probe: release the Local Network alert hold and
-    /// its dialog slot first so the worker's Secrets lane sees no dialog up when [`AccessOutcome::Granted`]
-    /// wakes it, then record `Granted` when a LAN server answered. Whatever it heard, the LAN
-    /// readers look again now ([`StepsReach::lan_answer_moved`]): a grant or a Don't Allow moved
-    /// the answer, and a probe that heard nothing (no ALab vault on this network, or an answer
-    /// after its 30 s) still ends with the question asked, which a look before it did not know.
+    /// Drain a completed 1 s × 30 s LAN grant re-probe: on an answer heard (a LAN server answered,
+    /// or macOS refused a `.local` lookup) release the Local Network alert hold and its dialog slot
+    /// first so the worker's Secrets lane sees no dialog up when [`AccessOutcome::Granted`] wakes
+    /// it, then record `Granted` when a LAN server answered. A probe that heard nothing (no ALab
+    /// vault on this network, an answer after its 30 s, or nobody there to answer) leaves the hold
+    /// to the person's time with the alert ([`Self::look_at_local_network_alert`]). Whatever it
+    /// heard, the LAN readers look again now ([`StepsReach::lan_answer_moved`]): a grant or a
+    /// Don't Allow moved the answer, and a probe that heard nothing still ends with the question
+    /// asked, which a look before it did not know.
     pub(crate) fn on_local_network_probe_ready(&mut self, now: Instant) {
         if !self.config.swarm_enabled() {
             cancel_local_network_probe();
-            self.access_steps.local_network_until = None;
+            self.access_steps.local_network_alert = None;
             self.release_unused_access_dialog(now);
             return;
         }
@@ -1170,8 +1302,13 @@ impl App {
         if self.access_steps.local_network_done != Some(revision) {
             return;
         }
-        self.access_steps.local_network_until = None;
-        self.release_unused_access_dialog(now);
+        // An answer heard ends the alert's hold; a re-probe that heard none leaves it to the
+        // person's time with the alert ([`Self::look_at_local_network_alert`]): one raised while
+        // they were away still stands, unanswered, when they come back.
+        if probe_heard_an_answer(probe) {
+            self.access_steps.local_network_alert = None;
+            self.release_unused_access_dialog(now);
+        }
         if probe == LocalNetworkProbe::Granted {
             self.record_access_at(revision, Access::LocalNetwork, AccessOutcome::Granted);
             aterm_log::info!(
@@ -1181,25 +1318,88 @@ impl App {
         (self.access_steps.reach.lan_answer_moved)();
     }
 
+    /// Count the person's time with macOS's Local Network alert the step raised, and end its hold
+    /// once they have had [`LOCAL_NETWORK_ALERT_HOLD`] with it. macOS says neither whether the
+    /// alert is still up nor how it was answered, and the re-probe hears an answer only where a
+    /// LAN server answers or macOS refuses (`on_local_network_probe_ready` ends the hold then); an
+    /// alert raised while the person was away (present within the steps' five minutes, the step's
+    /// moment, but not at the screen) stands, unanswered, until they come back. So the count
+    /// starts at the first look that reads them present ([`ALERT_PRESENT_WITHIN`], the screen not
+    /// locked or switched away) with a touch of the keyboard or pointer since the ask
+    /// ([`Self::person_present_within`]), and adds the time between two looks only with them
+    /// present at both, at most [`ALERT_PRESENT_WITHIN`] of it: time away does not count. While
+    /// the hold stands no page or dialog of the window's comes up beside the alert (it is one of
+    /// the window's gestures, [`Self::access_gesture_up`]), the permission walk's start among
+    /// them. Called at each turn's first look at the steps (`App::tick_permission_walk`) and at
+    /// the step's own.
+    pub(crate) fn look_at_local_network_alert(&mut self, now: Instant) {
+        let Some(mut alert) = self.access_steps.local_network_alert else {
+            return;
+        };
+        let present =
+            !(self.screen_away)() && self.person_present_within(ALERT_PRESENT_WITHIN, now);
+        alert.present_for = match alert.present_for {
+            None => (present
+                && self.person_present_within(now.saturating_duration_since(alert.asked), now))
+            .then_some(Duration::ZERO),
+            Some(counted) if present && alert.present => Some(
+                counted
+                    + now
+                        .saturating_duration_since(alert.looked)
+                        .min(ALERT_PRESENT_WITHIN),
+            ),
+            Some(counted) => Some(counted),
+        };
+        alert.looked = now;
+        alert.present = present;
+        if alert
+            .present_for
+            .is_some_and(|counted| counted >= LOCAL_NETWORK_ALERT_HOLD)
+        {
+            self.access_steps.local_network_alert = None;
+            aterm_log::info!(
+                "system state: the Local Network alert's hold is over: the person has been at \
+                 the Mac {} s since their first input after the ask",
+                LOCAL_NETWORK_ALERT_HOLD.as_secs()
+            );
+        } else {
+            self.access_steps.local_network_alert = Some(alert);
+        }
+    }
+
+    /// When the next look at the Local Network alert's hold may end it
+    /// ([`Self::look_at_local_network_alert`]): the rest of [`LOCAL_NETWORK_ALERT_HOLD`] while the
+    /// person is being counted present, else a [`devtools_helper::RECHECK_EVERY`], to see them
+    /// touch the Mac or come back.
+    fn local_network_alert_deadline(&self, now: Instant) -> Option<Instant> {
+        let alert = self.access_steps.local_network_alert?;
+        Some(match alert.present_for {
+            Some(counted) if alert.present => {
+                now + LOCAL_NETWORK_ALERT_HOLD.saturating_sub(counted)
+            }
+            _ => now + devtools_helper::RECHECK_EVERY,
+        })
+    }
+
     /// The Local Network step, first in the run: once per approved revision, a UDP connect
-    /// (nothing sent) to a unicast LAN address, which makes macOS ask its Local Network
-    /// question; recorded `triggered`. A revision already recorded is done. With no LAN to name
-    /// the other steps go on, and it looks again every [`LOCAL_NETWORK_RETRY`] at its moment
-    /// only: a retry due away from it is moved on. A retry is dropped only for another approved
-    /// revision; while none is approved it is kept but arms no deadline
-    /// ([`Self::next_access_step_deadline`]), so the same revision coming back looks again.
+    /// (nothing sent) to a host on an attached subnet, or a short Bonjour browse of its own on a
+    /// network with no IPv4 subnet to name ([`lan_ask`]), which makes macOS ask its Local Network
+    /// question; recorded `triggered`. A revision already recorded is done. On no network at all
+    /// the other steps go on, and it looks again, at its moment only, after its watch subscribes
+    /// and when this Mac's network moves ([`StepsReach::watch_network`]), not on a timer: nothing
+    /// else changes what it finds, and the Local Network row reads calm meanwhile
+    /// ([`LOCAL_NETWORK_NOTHING_TO_ASK`]). aterm.log says so once per such look. A trigger that
+    /// had a network to ask on but no socket or browse
+    /// looks again [`LOCAL_NETWORK_RETRY`] later, at its moment only: one due away from it is
+    /// moved on. A retry is dropped only for another approved revision; while none is approved
+    /// it is kept but arms no deadline ([`Self::next_access_step_deadline`]), so the same
+    /// revision coming back looks again.
     pub(crate) fn tick_local_network_step(&mut self, now: Instant) {
         self.on_local_network_probe_ready(now);
         if !self.config.swarm_enabled() {
             return;
         }
-        if self
-            .access_steps
-            .local_network_until
-            .is_some_and(|until| now >= until)
-        {
-            self.access_steps.local_network_until = None;
-        }
+        self.look_at_local_network_alert(now);
         if self
             .access_steps
             .pane_until
@@ -1219,24 +1419,42 @@ impl App {
             .is_some_and(|(failed, _)| failed != revision)
         {
             self.access_steps.local_network_retry = None;
+            self.access_steps.nothing_to_ask = false;
         }
         if self.access_steps.local_network_done == Some(revision) {
-            // A trigger that found no LAN is tried again: the network may have
-            // come up since, and the run's Permissions stage waits for it.
+            // A trigger that found nothing is tried again: once the network moved after one that
+            // found no LAN, a minute on after one with no socket.
             let Some((_, at)) = self.access_steps.local_network_retry else {
                 return;
             };
-            if now < at {
-                return;
-            }
-            if !self.local_network_moment(now) {
-                // Due, but not the step's moment (the person is in a terminal
-                // tab, typing, or away): look again a retry later, never at once.
-                self.access_steps.local_network_retry = Some((revision, now + LOCAL_NETWORK_RETRY));
-                return;
+            match at {
+                Some(at) if now < at => return,
+                Some(_) => {
+                    if !self.local_network_moment(now) {
+                        // Due, but not the step's moment (the person is in a terminal tab,
+                        // typing, or away): look again a retry later, never at once.
+                        self.access_steps.local_network_retry =
+                            Some((revision, Some(now + LOCAL_NETWORK_RETRY)));
+                        return;
+                    }
+                }
+                // The move stays told until the step's moment comes.
+                None if !self
+                    .access_steps
+                    .network_moved
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    || !self.local_network_moment(now) =>
+                {
+                    return;
+                }
+                None => {}
             }
         }
         if self.local_network_on_record(revision) {
+            return;
+        }
+        if (self.access_steps.reach.door_asked)() {
+            self.local_network_asked_through_the_door(revision);
             return;
         }
         if !self.local_network_moment(now) {
@@ -1249,8 +1467,9 @@ impl App {
             // record wakes it. The quiet-moment check cannot reserve the slot.
             let Some(dialog) = MacosDialog::when_none_up(Duration::ZERO) else {
                 // A worker won the slot after the moment was checked. A due
-                // retry waits again rather than leave a deadline due now.
-                if let Some((_, at)) = &mut self.access_steps.local_network_retry {
+                // timed retry waits again rather than leave a deadline due now;
+                // a network move stays told for the next look.
+                if let Some((_, Some(at))) = &mut self.access_steps.local_network_retry {
                     *at = now + LOCAL_NETWORK_RETRY;
                 }
                 return;
@@ -1258,11 +1477,16 @@ impl App {
             self.access_steps.dialog = Some(dialog);
         }
         self.access_steps.local_network_done = Some(revision);
+        // This look reads the network as it is now: a move told before it is spent.
+        self.access_steps
+            .network_moved
+            .store(false, std::sync::atomic::Ordering::Release);
         if (self.access_steps.reach.trigger_local_network)() {
             // macOS asked under this step's slot: the Commons runtime may use the LAN now.
             (self.access_steps.reach.hand_lan_over)(revision);
             self.access_steps.local_network_retry = None;
-            self.access_steps.local_network_until = Some(now + LOCAL_NETWORK_ALERT_HOLD);
+            self.access_steps.nothing_to_ask = false;
+            self.access_steps.local_network_alert = Some(LocalNetworkAlert::asked(now));
             self.record_access_step(Access::LocalNetwork, AccessOutcome::Triggered);
             // The record now says asked, so a LAN look made before it (`sync.peers`' "macOS has
             // not asked") is stale from here: the readers look again now.
@@ -1271,13 +1495,62 @@ impl App {
             aterm_log::info!("system state: Local Network asked for (revision {revision})");
         } else {
             self.access_steps.dialog = None;
-            self.access_steps.local_network_retry = Some((revision, now + LOCAL_NETWORK_RETRY));
+            self.local_network_named_nothing(revision, now);
+        }
+    }
+
+    /// A first LAN use of this process already asked macOS's Local Network question through the
+    /// door, past the wait for the step (`lan_first_use::asked`): that ask is the step's question
+    /// for `revision`, recorded `triggered` as the step's own trigger is, and the door holds this
+    /// process's dialog slot for the question's hold, counting the person's time as the step's
+    /// alert hold does. So the step raises nothing, holds no alert of its own and hands nothing
+    /// over: one question, one hold. The re-probe listens for the answer as after the step's own.
+    fn local_network_asked_through_the_door(&mut self, revision: u64) {
+        self.access_steps.local_network_held = None;
+        self.access_steps.local_network_done = Some(revision);
+        self.access_steps.local_network_retry = None;
+        self.access_steps.nothing_to_ask = false;
+        self.record_access_step(Access::LocalNetwork, AccessOutcome::Triggered);
+        (self.access_steps.reach.lan_answer_moved)();
+        (self.access_steps.reach.start_local_network_probe)(revision);
+        aterm_log::info!(
+            "system state: Local Network was asked through the door by a first LAN use (revision \
+             {revision}); the step reads it as its question"
+        );
+    }
+
+    /// The Local Network trigger for `revision` asked nothing: on no network at all the step
+    /// looks again once this Mac's network moves (the watch started now, once per process) and
+    /// the row reads calm; on a network with no socket or browse to ask with, a
+    /// [`LOCAL_NETWORK_RETRY`] later. aterm.log says which, once per look.
+    fn local_network_named_nothing(&mut self, revision: u64, now: Instant) {
+        let here = (self.access_steps.reach.lan_here)();
+        self.access_steps.nothing_to_ask = here == LanHere::Offline;
+        if here == LanHere::Lan {
+            self.access_steps.local_network_retry =
+                Some((revision, Some(now + LOCAL_NETWORK_RETRY)));
             aterm_log::info!(
-                "system state: nothing to ask Local Network with: no LAN to name, or no \
-                 socket (revision {revision}); trying again in {}s",
+                "system state: no socket or browse for the Local Network trigger (revision \
+                 {revision}); trying again in {}s",
                 LOCAL_NETWORK_RETRY.as_secs()
             );
+            return;
         }
+        self.access_steps.local_network_retry = Some((revision, None));
+        if !self.access_steps.watching_network {
+            self.access_steps.watching_network = true;
+            let moved = Arc::clone(&self.access_steps.network_moved);
+            let wake = self.devtools_hand_over_wake();
+            (self.access_steps.reach.watch_network)(Arc::new(move || {
+                moved.store(true, std::sync::atomic::Ordering::Release);
+                wake();
+            }));
+        }
+        aterm_log::info!(
+            "system state: this Mac is on no network, so the Local Network step has nothing to \
+             ask macOS with yet (revision {revision}); the Local Network row reads calm, and the \
+             step looks again when the network changes"
+        );
     }
 
     /// The end of the consent lanes' turn: park or release a walking launch folder pass, hold
@@ -1391,9 +1664,9 @@ impl App {
     pub(crate) fn refresh_system_state_menu_line(&mut self) {
         let regressed = self.access_steps.fda_regressed && !self.fda_declined_in_revision();
         let status = self.system_state_host.latest_status();
-        // While the first launch's review is up its headline is the one signal, on a tab in
-        // front: no menu line, as no diamond (§3.3, §3.6).
-        let line = if self.system_state_review_pending() {
+        // While the launch's offer waits for the page's answer at its first tick, its headline
+        // is the one signal: no menu line, as no diamond (§3.3, §3.6).
+        let line = if self.system_state_launch_offer_waits() {
             None
         } else {
             menu_line(status, regressed).map(|mut line| {
@@ -1439,22 +1712,31 @@ impl App {
     /// away from its moment, so this never arms a deadline that is due again at once.
     pub(crate) fn next_access_step_deadline(&self, now: Instant) -> Option<Instant> {
         let hold = self
-            .access_steps
-            .local_network_until
+            .local_network_alert_deadline(now)
             .into_iter()
             .chain(self.access_steps.pane_until);
         let waits = (self.local_network_pending() && self.access_steps.reach.holds_dialog)
             || self.access_steps.pane_act.is_some();
+        // A retry that waits for the network to move arms nothing until it has (the watch wakes
+        // the loop then), and then looks for the step's moment.
         let retry = self
             .access_steps
             .local_network_retry
-            .filter(|(failed, _)| Some(*failed) == self.access_revision());
+            .filter(|(failed, _)| Some(*failed) == self.access_revision())
+            .and_then(|(_, at)| match at {
+                Some(at) => Some(at.max(now)),
+                None => self
+                    .access_steps
+                    .network_moved
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    .then(|| now + devtools_helper::RECHECK_EVERY),
+            });
         // Focus is read only when something waits for the moment.
         let focused = (waits || retry.is_some())
             && self.access_steps_allowed()
             && self.any_os_window_focused();
         let look = (focused && waits).then(|| now + devtools_helper::RECHECK_EVERY);
-        let retry = retry.filter(|_| focused).map(|(_, at)| at.max(now));
+        let retry = retry.filter(|_| focused);
         let saves = self
             .access_steps
             .recorded
@@ -1625,7 +1907,7 @@ impl App {
         if let Some(panel) = self.devtools_helper.panel() {
             return Some(panel.page().access());
         }
-        if self.access_steps.local_network_alert_up(Instant::now()) {
+        if self.access_steps.local_network_alert_up() {
             return Some(Access::LocalNetwork);
         }
         let revision = self.access_revision()?;
@@ -2241,14 +2523,26 @@ fn live_open_access_pane(_: &App, _: Access) -> bool {
     false
 }
 
-/// The live trigger: name a LAN peer from this Mac's interfaces and connect a
-/// UDP socket to it. Nothing is sent. `false` when nothing was attempted (no
-/// LAN to name, or no socket), so nothing is recorded and no hold is taken.
+/// How long the Local Network step's own Bonjour browse runs ([`LanAsk::Browse`]): macOS asks
+/// as the browse starts, and its answer outlives the browse.
+#[cfg(target_os = "macos")]
+const LOCAL_NETWORK_BROWSE_FOR: Duration = Duration::from_secs(5);
+
+/// The live trigger: from this Mac's interfaces ([`lan_ask`]), connect a UDP socket to a host
+/// on an attached subnet (nothing is sent), or, on a network with no IPv4 subnet to name, start
+/// a short `_alab._tcp` browse on a thread of its own. `false` when nothing was attempted (no
+/// network, no socket, no thread), so nothing is recorded and no hold is taken.
 #[cfg(target_os = "macos")]
 fn live_trigger_local_network() -> bool {
-    let Some(target) = lan_target(&interface_addresses()) else {
-        return false;
-    };
+    match lan_ask(&interface_addresses(), ipv6_network_up()) {
+        None => false,
+        Some(LanAsk::Connect(target)) => live_connect_local_network(target),
+        Some(LanAsk::Browse) => live_browse_local_network(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn live_connect_local_network(target: Ipv4Addr) -> bool {
     let socket = match std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) {
         Ok(socket) => socket,
         Err(error) => {
@@ -2264,10 +2558,104 @@ fn live_trigger_local_network() -> bool {
     true
 }
 
+/// The step's own Bonjour browse ([`LanAsk::Browse`]): `_alab._tcp` on `local.`, the service
+/// the bundle declares, for [`LOCAL_NETWORK_BROWSE_FOR`], hearing nothing it keeps.
+#[cfg(target_os = "macos")]
+fn live_browse_local_network() -> bool {
+    let Ok(service) = std::ffi::CString::new(aterm_agent::node_service::ALAB_TCP_SERVICE) else {
+        return false;
+    };
+    let spawned = std::thread::Builder::new()
+        .name("aterm-local-network-ask".into())
+        .spawn(move || {
+            let until = Instant::now() + LOCAL_NETWORK_BROWSE_FOR;
+            let browsed = aterm_net::bonjour::browse_while(
+                &service,
+                c"local.",
+                Duration::from_millis(500),
+                || Instant::now() < until,
+                |_| std::ops::ControlFlow::Continue(()),
+            );
+            if let Err(error) = browsed {
+                // A browse macOS refused is still the question asked, as a connect's is.
+                aterm_log::info!("system state: the Local Network browse ended: {error}");
+            }
+        });
+    match spawned {
+        Ok(_) => {
+            aterm_log::info!(
+                "system state: this Mac's network has no IPv4 subnet to name, so the Local \
+                 Network step asks through a short Bonjour browse"
+            );
+            true
+        }
+        Err(error) => {
+            aterm_log::info!("system state: no thread for the Local Network browse: {error}");
+            false
+        }
+    }
+}
+
 #[cfg(not(target_os = "macos"))]
 fn live_trigger_local_network() -> bool {
     let _ = LOCAL_NETWORK_PORT;
     false
+}
+
+/// What this Mac's interfaces give the Local Network step to ask with now ([`LanHere`]).
+#[cfg(target_os = "macos")]
+fn live_lan_here() -> LanHere {
+    if lan_ask(&interface_addresses(), ipv6_network_up()).is_some() {
+        LanHere::Lan
+    } else {
+        LanHere::Offline
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn live_lan_here() -> LanHere {
+    LanHere::Offline
+}
+
+/// Request an App reading after subscription and every network wake, on a thread of its own
+/// for the life of the process. The signal's latest cause can hide a coalesced route change;
+/// the App reads current local state at its permitted moment, including an Offline change.
+#[cfg(target_os = "macos")]
+fn live_watch_network(moved: devtools_helper::Wake) {
+    let spawned = std::thread::Builder::new()
+        .name("aterm-local-network-moves".into())
+        .spawn(move || {
+            let mut watch = crate::network_moved::watch();
+            watch_network_moves(
+                std::iter::repeat_with(|| watch.wait(crate::network_moved::LONG)),
+                || moved(),
+            );
+        });
+    if let Err(error) = spawned {
+        aterm_log::warn!(
+            "system state: the Local Network step's network watch could not start: {error}"
+        );
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn live_watch_network(_moved: devtools_helper::Wake) {}
+
+/// Request initial reconciliation only after the source is subscribed, then after every
+/// non-timeout move. This level callback asks the App for its authoritative fresh reading;
+/// filtering with a worker-local LAN snapshot could retain a stale Offline status while
+/// its callback waits. The live source is infinite; tests use finite moves without a worker.
+#[cfg(any(target_os = "macos", test))]
+fn watch_network_moves(
+    moves: impl IntoIterator<Item = crate::network_moved::Woke>,
+    mut moved: impl FnMut(),
+) {
+    moved();
+    for wake in moves {
+        if wake != crate::network_moved::Woke::Timer {
+            moved();
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]

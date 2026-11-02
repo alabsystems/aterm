@@ -545,7 +545,7 @@ pub(crate) fn refresh_view_with(
         return refresh_linked_view(layout, name, &checkout, running);
     }
     let current = store_current(layout);
-    let build = std::fs::read_link(&current).map(|raw| absolute_target(&raw, &current))?;
+    let build = verified_store_current_build(layout, &current)?;
     let src_bin = build.join("bin");
     let view = view_dir(layout, name);
     layout.ensure_dir(&views_root(layout))?;
@@ -1036,7 +1036,7 @@ fn normalize(path: &Path) -> PathBuf {
     out
 }
 
-fn absolute_target(raw: &Path, link: &Path) -> PathBuf {
+pub(crate) fn absolute_target(raw: &Path, link: &Path) -> PathBuf {
     if raw.is_absolute() {
         return normalize(raw);
     }
@@ -1303,7 +1303,7 @@ pub fn stale_against_store(layout: &Layout, sysroot: &Path) -> Option<Stale> {
     if view_source(layout) != ViewSource::Store {
         return None;
     }
-    let store = store_current(layout);
+    let store = verified_store_current_build(layout, &store_current(layout)).ok()?;
     std::fs::metadata(&store).ok()?;
     match std::fs::metadata(sysroot) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Some(Stale::Dangling),
@@ -2324,6 +2324,23 @@ pub fn detach_recorded(layout: &Layout, rustup_home: &Path) -> Vec<SeamEvent> {
             Err(refusal) => SeamEvent::Refused { name, refusal },
         })
         .collect()
+}
+
+fn verified_store_current_build(layout: &Layout, current: &Path) -> io::Result<PathBuf> {
+    let build = std::fs::read_link(current).map(|raw| absolute_target(&raw, current))?;
+    if !crate::ops::store_build_of(&layout.prefix, &build)
+        .is_some_and(|(owner, _)| owner == SEAM_PROGRAM)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} -> {} is outside store/{SEAM_PROGRAM}/<build>",
+                current.display(),
+                build.display()
+            ),
+        ));
+    }
+    Ok(build)
 }
 
 #[cfg(test)]
@@ -5117,5 +5134,26 @@ mod tests {
             .mode();
         assert_eq!(mode & 0o7777, 0o700);
         assert_eq!(inode_stamps(&build), store, "a store inode moved");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refresh_view_and_stale_against_store_refuse_store_current_outside_trust_build() {
+        let fx = Fixture::new("store-current-outside");
+        let foreign = fx.root.path().join("foreign-trust");
+        std::fs::create_dir_all(foreign.join("bin")).unwrap();
+        std::fs::write(foreign.join("bin").join("trustc"), b"foreign").unwrap();
+
+        let current = store_current(&fx.layout);
+        std::fs::create_dir_all(current.parent().unwrap()).unwrap();
+        link(&foreign, &current);
+
+        let err = refresh_view(&fx.layout, "trust").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        assert_eq!(
+            stale_against_store(&fx.layout, &fx.root.path().join("absent-sysroot")),
+            None,
+            "stale_against_store must refuse a store/trust/current pointing outside store/trust/<build>"
+        );
     }
 }

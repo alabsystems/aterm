@@ -10,7 +10,10 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use aterm_types::MutexExt;
 
 use crate::live_ctl::Ctl;
 use crate::{child_output, headless_boot, launch_isolation};
@@ -191,7 +194,11 @@ pub fn await_keeper(root: &Path, word: &str) {
 /// (`aterm_keeper::code`), a new program whose first exec macOS holds for as long as its
 /// queue of new programs makes it (over a minute behind a build's), so the one-minute wait for
 /// its answer starts once it showed it runs ([`await_start`]).
+/// Fresh copies share macOS's code-admission service: serialize their startup within this
+/// test process, then let the running keepers and their recovery scenarios proceed together.
 pub fn keeper(root: &Path) -> Proc {
+    static KEEPER_START: Mutex<()> = Mutex::new(());
+    let _start = KEEPER_START.lock_or_recover();
     let log = root.join("keeper.log");
     let file = std::fs::File::create(&log).expect("the keeper's log");
     #[expect(
@@ -223,9 +230,13 @@ pub fn keeper(root: &Path) -> Proc {
         Start::NoCopy => {
             aterm_uds::deadline::require_trust_service();
             panic!(
-                "the keeper (pid {pid}) made no copy of its code to run from in {HANG:?}: no \
-                 exec stamp in one, nothing in its log"
+                "the keeper (pid {pid}) made no copy of its code to run from in {HANG:?}, \
+                 nothing in its log"
             );
+        }
+        Start::NotStamped => {
+            aterm_uds::deadline::require_trust_service();
+            panic!("the keeper (pid {pid}) copied its code but never stamped it for exec");
         }
         Start::NotRun => {
             let held = aterm_uds::process::at_program_check(i32::try_from(pid).unwrap_or(0));
@@ -266,18 +277,21 @@ pub enum Start {
     Ran,
     /// It exited.
     Ended,
-    /// No copy of its code was stamped for its exec, nor did it write a line.
+    /// No completed copy of its code exists, nor did it write a line.
     NoCopy,
+    /// A completed copy exists but its code check did not reach exec.
+    NotStamped,
     /// Its copy was stamped for its exec and never showed it runs.
     NotRun,
 }
 
-/// Wait for keeper `pid` to show it runs, `ended` saying whether it exited, in two waits. First
-/// up to `copy_hang` for its copy's exec stamp ([`aterm_uds::deadline::EXEC_STAMP`], written
-/// just before it runs again from the copy): the work before is its own, its first exec (this
-/// build's) warmed by [`launch_isolation::apply`]. Then up to `run_hang` for the copy's mark
-/// ([`aterm_keeper::code::RAN`]): that wait is macOS's first-exec check of the copy. A line
-/// in its log answers either wait ([`keeper_reached`]).
+/// Wait for keeper `pid` to show it runs, `ended` saying whether it exited, in three waits.
+/// First allow `copy_hang` for its completed copy, then a separate `copy_hang` for the code
+/// admission check and exec stamp ([`aterm_uds::deadline::EXEC_STAMP`]). The admission check
+/// has its own one-minute deadline; copying must not consume that time. Finally allow
+/// `run_hang` for the copy's mark ([`aterm_keeper::code::RAN`]), macOS's first-exec check.
+/// Its initial exec (this build's) is warmed by [`launch_isolation::apply`]. A line in its
+/// log answers any wait ([`keeper_reached`]).
 pub fn await_start(
     root: &Path,
     pid: u32,
@@ -290,13 +304,19 @@ pub fn await_start(
             if ended() {
                 Some(Start::Ended)
             } else {
-                keeper_reached(root, pid, mark).then_some(Start::Ran)
+                keeper_at(root, pid, mark).then_some(Start::Ran)
             }
         })
     };
-    match wait(copy_hang, aterm_uds::deadline::EXEC_STAMP) {
+    match wait(copy_hang, None) {
         None => Start::NoCopy,
-        Some(Start::Ran) => wait(run_hang, aterm_keeper::code::RAN).unwrap_or(Start::NotRun),
+        Some(Start::Ran) => match wait(copy_hang, Some(aterm_uds::deadline::EXEC_STAMP)) {
+            None => Start::NotStamped,
+            Some(Start::Ran) => {
+                wait(run_hang, Some(aterm_keeper::code::RAN)).unwrap_or(Start::NotRun)
+            }
+            Some(other) => other,
+        },
         Some(other) => other,
     }
 }
@@ -307,6 +327,10 @@ pub fn await_start(
 /// exits, serves from this build, or could not stamp its copy (a world made for it holds no
 /// earlier keeper's copy for its sweep to speak of).
 pub fn keeper_reached(root: &Path, pid: u32, mark: &str) -> bool {
+    keeper_at(root, pid, Some(mark))
+}
+
+fn keeper_at(root: &Path, pid: u32, mark: Option<&str>) -> bool {
     let said = std::fs::metadata(root.join("keeper.log")).is_ok_and(|meta| meta.len() > 0);
     said || std::fs::read_dir(keeper_code(root))
         .into_iter()
@@ -316,7 +340,7 @@ pub fn keeper_reached(root: &Path, pid: u32, mark: &str) -> bool {
             let name = entry.file_name().to_string_lossy().into_owned();
             !name.ends_with(".partial")
                 && aterm_keeper::code::owner_of(&name).is_some_and(|(owner, _)| owner == pid)
-                && entry.path().join(mark).exists()
+                && mark.is_none_or(|mark| entry.path().join(mark).exists())
         })
 }
 

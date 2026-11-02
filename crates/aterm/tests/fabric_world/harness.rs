@@ -28,6 +28,18 @@ pub fn broker_opts(tier: aterm_link::durability::Durability) -> OpenOptions {
     opts
 }
 
+/// The key a test's sealed log is opened under.
+pub const REST_KEY: [u8; 32] = *b"fabric-world-at-rest-key-32-byte";
+
+/// `opts` sealing the log at rest and refusing an unbound one, as `aterm link broker` opens a log
+/// with a key beside it (`aterm_link::durability::open_escalating`).
+#[must_use]
+pub fn sealed_opts(mut opts: OpenOptions) -> OpenOptions {
+    opts.at_rest_key = Some(REST_KEY);
+    opts.require_bound_at_rest = true;
+    opts
+}
+
 #[must_use]
 pub fn open_broker(log: impl AsRef<Path>, opts: &OpenOptions) -> Broker {
     let broker = open_broker_unretained(log, opts);
@@ -106,24 +118,33 @@ pub fn until<T>(what: &str, f: impl FnMut() -> Option<T>) -> T {
 /// [`until`] with a stated budget, for an observable with a period of its own.
 pub use aterm_spec::wait::until_within;
 
-/// A copy of the program `of` at `dir/name`, signed ad hoc (a copied Apple binary must be): a
-/// program that is its own image, its canonical file name `name`, so the session's process
-/// watch reads `name` whenever it hears it. A link to `/bin/sh` would not do: macOS's `/bin/sh`
-/// re-execs the shell `/private/var/select/sh` names within a few ms, and a drain after that
-/// reads only that shell's names.
-pub fn own_image(dir: &Path, name: &str, of: &str) -> PathBuf {
-    let path = dir.join(name);
-    let _ = std::fs::remove_file(&path);
-    std::fs::copy(of, &path).unwrap_or_else(|error| panic!("copy {of} to {name}: {error}"));
-    let mut sign = aterm_uds::spawnfd::command("/usr/bin/codesign");
-    sign.args(["--force", "--sign", "-"]).arg(&path);
-    let signed = aterm_uds::deadline::output_until(&mut sign, Instant::now() + DEADLINE)
-        .unwrap_or_else(|error| panic!("codesign {name}: {error:?}"));
-    assert!(
-        signed.status.success(),
-        "codesign {name}: {}",
-        String::from_utf8_lossy(&signed.stderr)
-    );
+/// A copy of `/bin/bash`, signed ad hoc ([`aterm_uds::deadline::ad_hoc_copy`]), named `name` in
+/// a folder of its own under `dir`: a program that is its own image, its canonical file name
+/// `name`, so the session's process watch reads `name` whenever it hears it. A link to `/bin/sh`
+/// would not do: macOS's `/bin/sh` re-execs the shell `/private/var/select/sh` names within a
+/// few ms, and a drain after that reads only that shell's names. The copy runs once here and
+/// writes a line ([`aterm_uds::deadline::prints`]) before it is handed on: a `status detail=`
+/// naming the copy is no proof macOS finished assessing its first exec, since the kernel names an
+/// image before it runs. The folder is `dir`'s, a world's scratch, which a failing test keeps
+/// whole and a pass removes once the world's instances are stopped (a [`World`]'s drop, an owner
+/// world's): nothing handed back removes it while a session runs the copy, and a copy that never
+/// writes its line panics here and leaves it.
+pub fn own_image(dir: &Path, name: &str) -> PathBuf {
+    let path = aterm_tempfile::Builder::new()
+        .prefix(&format!("{name}-"))
+        .tempdir_in(dir)
+        .unwrap_or_else(|error| panic!("a folder for {name}: {error}"))
+        .keep()
+        .join(name);
+    aterm_uds::deadline::ad_hoc_copy(Path::new("/bin/bash"), &path);
+    let mut proof = aterm_uds::spawnfd::command(&path)
+        .env_clear()
+        .args(["-c", "printf 'own-image-ran\\n'"])
+        .stdout(OwnedStdio::piped())
+        .spawn()
+        .unwrap_or_else(|error| panic!("run {name}: {error}"));
+    aterm_uds::deadline::prints(&mut proof, "own-image-ran", DEADLINE);
+    aterm_uds::deadline::kill_within(&mut proof, DEADLINE);
     path
 }
 
@@ -442,11 +463,12 @@ pub fn node_grants(node: &str) -> Vec<String> {
     aterm_link::enable::node_grants(FLEET, node)
 }
 
-/// Strips inherited `ATERM_*` environment variables and configures test GUI defaults on `cmd`
+/// Strips every inherited `ATERM_*` environment variable but the verify run's mark
+/// ([`aterm_uds::process::stripped_from_child`]) and configures test GUI defaults on `cmd`
 /// ([`TEST_WAITS`]).
 pub fn prepare_gui_environment(cmd: &mut Command) {
     for (name, _) in std::env::vars_os() {
-        if stripped(&name) {
+        if aterm_uds::process::stripped_from_child(&name) {
             cmd.env_remove(&name);
         }
     }
@@ -488,8 +510,33 @@ pub struct BrokerChild {
     pub lifeline: aterm_uds::lifeline::Lifeline,
 }
 
-/// Spawns `aterm link broker <args>…` armed with a [`aterm_uds::lifeline::Lifeline`], at test
-/// pace ([`FAST_TIMERS`]): it sees a poisoned log or a cut lifeline within its fast wake.
+/// Removes from `cmd` every `ATERM_*` variable of this test runner's environment but the verify
+/// run's mark ([`aterm_uds::process::stripped_from_child`]): a child the harness starts runs the
+/// same from any terminal, and the run still reads it as its own. What `cmd` sets after this
+/// call reaches the child.
+pub fn kept_from_runner(cmd: &mut aterm_uds::spawnfd::Command) -> &mut aterm_uds::spawnfd::Command {
+    for (name, _) in std::env::vars_os() {
+        if aterm_uds::process::stripped_from_child(&name) {
+            cmd.env_remove(&name);
+        }
+    }
+    cmd
+}
+
+/// `<aterm> link broker <args>…`, kept from this runner's settings ([`kept_from_runner`]), at
+/// test pace ([`FAST_TIMERS`]): what [`spawn_broker`] starts.
+pub fn broker_command(aterm: &str, args: &[&str]) -> aterm_uds::spawnfd::Command {
+    let mut cmd = aterm_uds::spawnfd::command(aterm);
+    kept_from_runner(&mut cmd)
+        .args(["link", "broker"])
+        .args(args)
+        .env(FAST_TIMERS.0, FAST_TIMERS.1);
+    cmd
+}
+
+/// Spawns `aterm link broker <args>…` ([`broker_command`]) armed with a
+/// [`aterm_uds::lifeline::Lifeline`]: at its test pace it sees a poisoned log or a cut lifeline
+/// within its fast wake.
 ///
 /// # Panics
 /// The lifeline's FIFO in `dir` could not be set up, or the spawn failed.
@@ -498,10 +545,7 @@ pub fn spawn_broker(
     args: &[&str],
     stdio: impl FnOnce(&mut aterm_uds::spawnfd::Command),
 ) -> BrokerChild {
-    let mut cmd = aterm_uds::spawnfd::command(aterm_to_launch());
-    cmd.args(["link", "broker"])
-        .args(args)
-        .env(FAST_TIMERS.0, FAST_TIMERS.1);
+    let mut cmd = broker_command(aterm_to_launch(), args);
     stdio(&mut cmd);
     let lifeline = aterm_uds::lifeline::Lifeline::arm(&mut cmd, dir)
         .unwrap_or_else(|e| panic!("arm the broker's lifeline in {}: {e}", dir.display()));
@@ -1977,31 +2021,23 @@ fn scratch_home(tmp: &std::path::Path) -> std::path::PathBuf {
     home
 }
 
-/// Configures `cmd` with the scratch directories of `tmp` and strips inherited `ATERM_*` variables.
+/// Configures `cmd` with the scratch directories of `tmp` and strips every inherited `ATERM_*`
+/// variable but the verify run's mark ([`prepare_gui_environment`]).
 pub fn scratch_cli<'a>(cmd: &'a mut Command, tmp: &Path) -> &'a mut Command {
     prepare_gui_environment(cmd);
     cmd.envs(scratch_cli_env(tmp))
 }
 
-/// [`scratch_cli`] for a child built with `aterm_uds::spawnfd::command`.
+/// [`scratch_cli`] for a child built with `aterm_uds::spawnfd::command` ([`kept_from_runner`]).
 pub fn scratch_spawnfd<'a>(
     cmd: &'a mut aterm_uds::spawnfd::Command,
     tmp: &Path,
 ) -> &'a mut aterm_uds::spawnfd::Command {
-    for (name, _) in std::env::vars_os() {
-        if stripped(&name) {
-            cmd.env_remove(&name);
-        }
-    }
+    kept_from_runner(cmd);
     for (name, wait) in TEST_WAITS {
         cmd.env(name, wait.as_millis().to_string());
     }
     cmd.envs(scratch_cli_env(tmp))
-}
-
-fn stripped(name: &std::ffi::OsStr) -> bool {
-    let name = name.to_string_lossy();
-    name.starts_with("ATERM_") && name != aterm_uds::process::VERIFY_RUN_VAR
 }
 
 fn scratch_cli_env(tmp: &Path) -> [(&'static str, PathBuf); 3] {

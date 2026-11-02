@@ -5,10 +5,10 @@
 # is, where plain targo puts its build intermediates, when a checkout is gone, the
 # lease a run holds on the toolchain it resolved, and the named lock and the
 # interrupt every wait for a lock or for capacity ends on. Std only but for
-# aterm-libc's signal declarations, so the check runner (aterm-verify), the libc
-# oracle's gate and the package manager (atpkg, which re-exports every module
-# under its old path) depend on it instead of compiling a file of another crate
-# by `#[path]`.
+# aterm-libc's signal declarations and aterm-sysprobe's process sweep (a wait's
+# stuck holder), so the check runner (aterm-verify), the libc oracle's gate and
+# the package manager (atpkg, which re-exports every module under its old path)
+# depend on it instead of compiling a file of another crate by `#[path]`.
 
 [package]
 name = "aterm-toolchain"
@@ -17,15 +17,17 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
-description = "The pinned Trust toolchain's discovery, rustup's home, the shared build-cache rule, the gone-checkout rule and the toolchain lease, std only"
+description = "The pinned Trust toolchain's discovery, rustup's home, the shared build-cache rule, the gone-checkout rule, the toolchain lease and the named lock whose wait names a stuck holder"
 
 [dependencies]
-# None: std only — but on Windows, where a device is a volume serial and one
-# path has many spellings: there the gone-checkout rule reads a device through
-# the one identity export and compares paths through the one key
-# (`aterm_sysprobe::volumes::file_id`, `aterm_sysprobe::paths`), both pure Rust
-# and kernel32 FFI with no dependency of their own.
-[target.'cfg(windows)'.dependencies]
+# The process sweep (`aterm_sysprobe::processes`): a wait for a named lock reads
+# its holder's process tree, its CPU time and its writes, to tell a holder that
+# works from one that makes no progress (`src/stall.rs`). On Windows, where a
+# device is a volume serial and one path has many spellings, the gone-checkout
+# rule reads a device through the one identity export and compares paths
+# through the one key (`aterm_sysprobe::volumes::file_id`,
+# `aterm_sysprobe::paths`). Workspace crate; every crate that depends on this
+# one already reaches it.
 aterm-sysprobe = { workspace = true }
 
 # A wait's interrupt (`interrupt::Watch`) sets the process's own SIGINT, SIGTERM and

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Unified incremental numeric versioning for every CLI harness (`codex-alab`, `claude`, `agy`,
+//! Unified incremental numeric versioning for every CLI harness (`claude`, `agy`,
 //! `grok`, `kimi`, `muse`).
 //!
 //! A harness version is `MAJOR.MINOR`, never a third part. Its minor goes up by one once per
@@ -149,8 +149,6 @@ impl fmt::Display for HarnessVersion {
 /// Every CLI harness with an independent incremental numeric [`HarnessVersion`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CliHarness {
-    /// OpenAI Codex / `codex-alab`.
-    CodexAlab,
     /// Anthropic Claude Code (`claude`).
     ClaudeCode,
     /// Google Antigravity CLI (`agy`).
@@ -168,8 +166,7 @@ pub const SHARED_LANE: &str = "crates/aterm-agent/src/harness/";
 
 impl CliHarness {
     /// Every CLI harness in declaration order.
-    pub const ALL: [CliHarness; 6] = [
-        CliHarness::CodexAlab,
+    pub const ALL: [CliHarness; 5] = [
         CliHarness::ClaudeCode,
         CliHarness::Agy,
         CliHarness::Grok,
@@ -177,12 +174,11 @@ impl CliHarness {
         CliHarness::Muse,
     ];
 
-    /// Canonical harness identifier (`"codex-alab"`, `"claude"`, `"agy"`, …).
+    /// Canonical harness identifier (`"claude"`, `"agy"`, …).
     #[inline]
     #[must_use]
     pub const fn id(self) -> &'static str {
         match self {
-            CliHarness::CodexAlab => "codex-alab",
             CliHarness::ClaudeCode => "claude",
             CliHarness::Agy => "agy",
             CliHarness::Grok => "grok",
@@ -191,12 +187,11 @@ impl CliHarness {
         }
     }
 
-    /// Lowercase CLI executable name: `"codex"` for codex-alab, else the [`id`](Self::id).
+    /// Lowercase CLI executable name ([`Self::id`]).
     #[inline]
     #[must_use]
     pub const fn cli(self) -> &'static str {
         match self {
-            CliHarness::CodexAlab => "codex",
             CliHarness::ClaudeCode => "claude",
             CliHarness::Agy => "agy",
             CliHarness::Grok => "grok",
@@ -210,7 +205,6 @@ impl CliHarness {
     #[must_use]
     pub const fn product(self) -> &'static str {
         match self {
-            CliHarness::CodexAlab => "codex-alab",
             CliHarness::ClaudeCode => "Claude Code",
             CliHarness::Agy => "Antigravity CLI",
             CliHarness::Grok => "Grok",
@@ -224,7 +218,6 @@ impl CliHarness {
     #[must_use]
     pub const fn version(self) -> HarnessVersion {
         match self {
-            CliHarness::CodexAlab => crate::codex::HARNESS_VER,
             CliHarness::ClaudeCode => crate::phase::HARNESS_VER,
             CliHarness::Agy => crate::agy::HARNESS_VER,
             CliHarness::Grok => crate::grok::HARNESS_VER,
@@ -238,7 +231,6 @@ impl CliHarness {
     #[must_use]
     pub const fn version_file(self) -> &'static str {
         match self {
-            CliHarness::CodexAlab => "crates/aterm-phase/src/codex.rs",
             CliHarness::ClaudeCode => "crates/aterm-phase/src/phase.rs",
             CliHarness::Agy => "crates/aterm-phase/src/agy.rs",
             CliHarness::Grok => "crates/aterm-phase/src/grok.rs",
@@ -271,7 +263,6 @@ impl CliHarness {
         let base = first.rsplit(['/', '\\']).next().unwrap_or(first);
         let word = base.trim_start_matches('-').to_ascii_lowercase();
         match word.as_str() {
-            "codex-alab" | "codex" | "codex-cli" | "codex-old" => Some(CliHarness::CodexAlab),
             "claude" | "claude-code" => Some(CliHarness::ClaudeCode),
             "agy" | "antigravity" | "antigravity-cli" => Some(CliHarness::Agy),
             "grok" | "grok-build" => Some(CliHarness::Grok),
@@ -386,20 +377,20 @@ impl<'a> Runs<'a> {
 /// It allocates nothing: a top rule asks it on every frame that draws one.
 #[must_use]
 pub fn cli_version_later(to: &str, from: &str) -> bool {
+    fn number(part: Option<&str>) -> (usize, &str) {
+        let stripped = part.unwrap_or("").trim_start_matches('0');
+        (stripped.len(), stripped)
+    }
     let (Some(to), Some(from)) = (cli_version_core(to), cli_version_core(from)) else {
         return false;
     };
-    let number = |part: Option<&str>| part.map_or(Some(0), |p| p.parse::<u64>().ok());
     let (mut a, mut b) = (to.split('.'), from.split('.'));
     loop {
         let (x, y) = (a.next(), b.next());
         if x.is_none() && y.is_none() {
             return false;
         }
-        let (Some(x), Some(y)) = (number(x), number(y)) else {
-            return false;
-        };
-        match x.cmp(&y) {
+        match number(x).cmp(&number(y)) {
             Ordering::Equal => {}
             later => return later == Ordering::Greater,
         }
@@ -433,20 +424,22 @@ mod tests {
             assert_eq!(reader, harness.version_file());
             assert_eq!(lane, SHARED_LANE);
         }
-        assert_eq!(
-            CliHarness::CodexAlab.cli(),
-            "codex",
-            "never `alab codex-alab harness`"
-        );
         for (name, harness) in [
             ("grok build", CliHarness::Grok),
             (" \tGrOk BuIlD\n", CliHarness::Grok),
             ("Kimi Code", CliHarness::Kimi),
-            ("codex-cli", CliHarness::CodexAlab),
         ] {
             assert_eq!(CliHarness::for_name(name), Some(harness), "{name:?}");
         }
-        for retired in ["gemini", "gemini-cli", "Gemini CLI"] {
+        for retired in [
+            "gemini",
+            "gemini-cli",
+            "Gemini CLI",
+            "codex",
+            "codex-alab",
+            "codex-cli",
+            "codex-old",
+        ] {
             assert_eq!(
                 CliHarness::for_name(retired),
                 None,
@@ -613,6 +606,14 @@ mod tests {
             !cli_version_later("1.4.10-R6500.1", "1.4.10-R6427.1"),
             "CONTROL: the cores alone are equal"
         );
+        assert!(cli_version_later(
+            "1.4.99999999999999999999999999",
+            "1.4.99999999999999999999999998"
+        ));
+        assert!(!cli_version_offered(
+            "1.4.99999999999999999999999998-R6500.1",
+            "1.4.99999999999999999999999999-R6427.1"
+        ));
         for (raw, build) in [
             ("1.4.10-R6500.1", Some("R6500.1")),
             ("0.164.0-dev.12521+g1a2b3c4d5", Some("dev.12521")),

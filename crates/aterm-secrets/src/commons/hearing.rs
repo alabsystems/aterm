@@ -54,7 +54,11 @@ impl Version {
     /// The `MAJOR.MINOR.PATCH` that `text` starts with: `0.146.0+g1a2b3c` reads as `0.146.0`.
     pub fn parse(text: &str) -> Option<Self> {
         let core = text.split(['+', '-']).next()?;
-        let mut parts = core.split('.').map(|part| part.parse().ok());
+        let mut parts = core.split('.').map(|part| {
+            (!part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| part.parse().ok())
+                .flatten()
+        });
         let version = Self(parts.next()??, parts.next()??, parts.next()??);
         parts.next().is_none().then_some(version)
     }
@@ -259,19 +263,24 @@ impl Ledger {
         if pinned != trust || pins.next().is_some() {
             return None;
         }
+        let uint = |s: &str| {
+            (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| s.parse::<u64>().ok())
+                .flatten()
+        };
         let (since, through) = lines.next()?.split_once(' ')?;
-        let (since, through): (u64, u64) = (since.parse().ok()?, through.parse().ok()?);
+        let (since, through) = (uint(since)?, uint(through)?);
         let mut ledger = Self::new(trust);
         ledger.watch = (since > 0 && since <= through).then_some((since, through));
         for line in lines {
             let mut words = line.split(' ');
             let actor = bytes(words.next()?)?;
-            let at_ms = words.next()?.parse().ok()?;
+            let at_ms = uint(words.next()?)?;
             let version = match words.next()? {
                 "-" => None,
                 word => Some(Version::parse(word)?),
             };
-            let said_ms = words.next()?.parse().ok()?;
+            let said_ms = uint(words.next()?)?;
             if words.next().is_some()
                 || ledger.heard.len() >= MAX_BINDINGS
                 || ledger

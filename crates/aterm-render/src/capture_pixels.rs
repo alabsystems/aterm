@@ -30,9 +30,14 @@ impl TexelDecode {
     #[inline]
     pub fn fetch(&self, data: &[u8], base: usize) -> [u32; 4] {
         if self.f16 {
-            let half = |channel: usize| {
-                u16::from_le_bytes([data[base + channel * 2], data[base + channel * 2 + 1]])
+            let Some(end) = base.checked_add(8) else {
+                return [0; 4];
             };
+            let Some(bytes) = data.get(base..end) else {
+                return [0; 4];
+            };
+            let half =
+                |channel: usize| u16::from_le_bytes([bytes[channel * 2], bytes[channel * 2 + 1]]);
             let linear = tone_map_scrgb_to_sdr(
                 [
                     f16_to_f32(half(0)),
@@ -49,10 +54,16 @@ impl TexelDecode {
                 alpha,
             ]
         } else {
+            let Some(end) = base.checked_add(4) else {
+                return [0; 4];
+            };
+            let Some(bytes) = data.get(base..end) else {
+                return [0; 4];
+            };
             let raw = if self.bgra {
-                [data[base + 2], data[base + 1], data[base], data[base + 3]]
+                [bytes[2], bytes[1], bytes[0], bytes[3]]
             } else {
-                [data[base], data[base + 1], data[base + 2], data[base + 3]]
+                [bytes[0], bytes[1], bytes[2], bytes[3]]
             };
             if self.display_p3 {
                 let srgb = display_p3_to_srgb8([raw[0], raw[1], raw[2]]);
@@ -115,6 +126,12 @@ pub fn mapped_to_rgba8(
     half_res: bool,
 ) -> Result<(Vec<u8>, u32, u32), String> {
     let bpp = texel.bpp;
+    let min_bpp = if texel.f16 { 8 } else { 4 };
+    if bpp < min_bpp {
+        return Err(format!(
+            "presented-frame texel size {bpp} is smaller than {min_bpp}"
+        ));
+    }
     let (sw, sh) = mapped_geometry(data.len(), src_w, src_h, padded_row, bpp)?;
 
     let (dw, dh) = if half_res {
@@ -255,6 +272,9 @@ pub fn display_p3_to_srgb8(p3: [u8; 3]) -> [u8; 3] {
 /// Tone-map scRGB/EDR to SDR-linear by removing `sdr_white_scale` and compressing over-white channels by peak.
 #[must_use]
 pub fn tone_map_scrgb_to_sdr(scrgb: [f32; 3], sdr_white_scale: f32) -> [f32; 3] {
+    if !sdr_white_scale.is_finite() || sdr_white_scale <= 0.0 {
+        return [0.0; 3];
+    }
     let mut linear = scrgb.map(|channel| {
         let bounded = if channel.is_nan() || channel <= 0.0 {
             0.0
@@ -263,7 +283,7 @@ pub fn tone_map_scrgb_to_sdr(scrgb: [f32; 3], sdr_white_scale: f32) -> [f32; 3] 
         } else {
             channel
         };
-        bounded / sdr_white_scale
+        (bounded / sdr_white_scale).min(f32::MAX)
     });
     let peak = linear[0].max(linear[1]).max(linear[2]);
     if peak > 1.0 {
@@ -436,5 +456,9 @@ mod tests {
             let sdr_white_scale = 1.0 + f32::from((word >> 48) as u16) / 8192.0;
             agree(tone_map_scrgb_to_sdr(scrgb, sdr_white_scale));
         }
+        let inf_mapped = tone_map_scrgb_to_sdr([f32::INFINITY, 1.0, 0.0], 0.5);
+        agree(inf_mapped);
+        assert_eq!(inf_mapped.map(srgb8_from_linear), [255, 0, 0]);
+        assert_eq!(tone_map_scrgb_to_sdr([1.0, 1.0, 1.0], 0.0), [0.0; 3]);
     }
 }

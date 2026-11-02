@@ -9,6 +9,7 @@
 
 mod models_atpkg_build_admit;
 mod models_atpkg_contention_release;
+mod models_atpkg_deep_fence;
 mod models_atpkg_flip_quiet;
 mod models_atpkg_full_pass;
 mod models_atpkg_head_watch_hosts;
@@ -23,6 +24,7 @@ mod models_atpkg_vendor_pending;
 
 pub use models_atpkg_build_admit::atpkg_build_admit_model;
 pub use models_atpkg_contention_release::atpkg_contention_release_park_model;
+pub use models_atpkg_deep_fence::atpkg_deep_removal_fence_model;
 pub use models_atpkg_flip_quiet::atpkg_flip_quiet_model;
 pub use models_atpkg_full_pass::atpkg_full_pass_rule_model;
 pub use models_atpkg_head_watch_hosts::atpkg_head_watch_hosts_model;

@@ -55,6 +55,30 @@ pub fn send(stream: &UnixStream, bytes: &[u8], fd: Option<BorrowedFd<'_>>) -> io
     Ok(())
 }
 
+/// Count descriptor-carrying reply frames queued in `buf` (including a trailing partial frame
+/// whose leading kind byte has already arrived).
+fn queued_descriptor_slots(mut buf: &[u8]) -> Result<usize, ProtoError> {
+    let mut slots = 0usize;
+    while !buf.is_empty() {
+        if Reply::carries_descriptor(buf[0]) {
+            slots += 1;
+        }
+        let Some(header) = buf.first_chunk::<{ crate::proto::HEADER }>() else {
+            break;
+        };
+        let len = u32::from_le_bytes([header[1], header[2], header[3], header[4]]) as usize;
+        if len > crate::proto::MAX_MESSAGE {
+            return Err(ProtoError::TooLarge(len as u64));
+        }
+        let end = crate::proto::HEADER + len;
+        let Some(rest) = buf.get(end..) else {
+            break;
+        };
+        buf = rest;
+    }
+    Ok(slots)
+}
+
 impl Channel {
     /// A channel over `stream`.
     #[must_use]
@@ -110,12 +134,27 @@ impl Channel {
 
     /// The next whole message's kind and payload, reading as needed, or `None` at EOF
     /// between messages.
-    fn next(&mut self) -> Result<Option<(u8, Vec<u8>)>, ProtoError> {
+    fn next(&mut self, allow_reply_fds: bool) -> Result<Option<(u8, Vec<u8>)>, ProtoError> {
         loop {
             if let Some((kind, payload, used)) = split(&self.buf)? {
                 let payload = payload.to_vec();
                 self.buf.drain(..used);
                 return Ok(Some((kind, payload)));
+            }
+            if allow_reply_fds {
+                let allowed = usize::from(
+                    self.buf
+                        .first()
+                        .copied()
+                        .is_some_and(Reply::carries_descriptor),
+                );
+                if self.fds.len() > allowed {
+                    self.fds.clear();
+                    return Err(ProtoError::Malformed("unexpected descriptor on reply"));
+                }
+            } else if !self.fds.is_empty() {
+                self.fds.clear();
+                return Err(ProtoError::Malformed("unexpected descriptor on request"));
             }
             let mut chunk = [0u8; 64 * 1024];
             let got = loop {
@@ -130,7 +169,15 @@ impl Channel {
                 }
             };
             self.fds.extend(got.fds);
+            if !allow_reply_fds && !self.fds.is_empty() {
+                self.fds.clear();
+                return Err(ProtoError::Malformed("unexpected descriptor on request"));
+            }
             if got.bytes == 0 {
+                if !self.fds.is_empty() {
+                    self.fds.clear();
+                    return Err(ProtoError::Malformed("unexpected descriptor on reply"));
+                }
                 return if self.buf.is_empty() {
                     Ok(None)
                 } else {
@@ -147,7 +194,7 @@ impl Channel {
     /// The socket failed, a descriptor arrived on the request stream, or the message is not a
     /// request.
     pub fn recv_request(&mut self) -> Result<Option<Request>, ProtoError> {
-        let next = self.next()?;
+        let next = self.next(false)?;
         if !self.fds.is_empty() {
             self.fds.clear();
             return Err(ProtoError::Malformed("unexpected descriptor on request"));
@@ -161,10 +208,10 @@ impl Channel {
     /// The next reply and the descriptor it carries, or `None` at EOF.
     ///
     /// # Errors
-    /// The socket failed (a read past the span among them), the message is not a reply, or a
-    /// `Connected` came with no descriptor.
+    /// The socket failed (a read past the span among them), the message is not a reply, a
+    /// `Connected` came with no descriptor, or an unexpected descriptor arrived.
     pub fn recv_reply(&mut self) -> Result<Option<(Reply, Option<OwnedFd>)>, ProtoError> {
-        let Some((kind, payload)) = self.next()? else {
+        let Some((kind, payload)) = self.next(true)? else {
             return Ok(None);
         };
         let reply = Reply::decode(kind, &payload)?;
@@ -173,6 +220,10 @@ impl Channel {
         } else {
             None
         };
+        if self.fds.len() > queued_descriptor_slots(&self.buf)? {
+            self.fds.clear();
+            return Err(ProtoError::Malformed("unexpected descriptor on reply"));
+        }
         Ok(Some((reply, fd)))
     }
 
@@ -280,11 +331,40 @@ mod tests {
             Some(extra.as_fd()),
         )
         .unwrap();
-        drop((req_a, b, extra));
+        drop((req_a, b));
         let mut req_r = Channel::new(req_b);
         assert!(matches!(
             req_r.recv_request(),
             Err(ProtoError::Malformed("unexpected descriptor on request"))
+        ));
+
+        let (rep_a, rep_b) = UnixStream::pair().unwrap();
+        send(
+            &rep_a,
+            &Reply::Started.encode().unwrap(),
+            Some(extra.as_fd()),
+        )
+        .unwrap();
+        drop(rep_a);
+        let mut rep_r = Channel::new(rep_b);
+        assert!(matches!(
+            rep_r.recv_reply(),
+            Err(ProtoError::Malformed("unexpected descriptor on reply"))
+        ));
+
+        let (dup_a, dup_b) = UnixStream::pair().unwrap();
+        let (extra2, _extra2_far) = UnixStream::pair().unwrap();
+        aterm_uds::fdpass::send_with_fds(
+            &dup_a,
+            &Reply::Connected { id: 1, port: 1024 }.encode().unwrap(),
+            &[extra.as_fd(), extra2.as_fd()],
+        )
+        .unwrap();
+        drop((dup_a, extra, extra2));
+        let mut dup_r = Channel::new(dup_b);
+        assert!(matches!(
+            dup_r.recv_reply(),
+            Err(ProtoError::Malformed("unexpected descriptor on reply"))
         ));
     }
 

@@ -71,7 +71,9 @@ fn failure(kind: agh::Kind) -> GithubFailure {
 fn read_with(client: &agh::Github, endpoint: &str) -> Result<GithubResponse, GithubError> {
     if !endpoint.starts_with('/')
         || endpoint.starts_with("//")
-        || endpoint.bytes().any(|byte| byte.is_ascii_control())
+        || endpoint
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte == b' ' || byte == b'#')
     {
         return Err(GithubError::other("invalid GitHub API endpoint"));
     }
@@ -257,6 +259,8 @@ mod tests {
             "https://example.invalid/user",
             "//example.invalid/user",
             "/user\n",
+            "/user name",
+            "/user#frag",
         ] {
             assert!(read_with(&client, endpoint).is_err());
         }

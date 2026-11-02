@@ -78,7 +78,13 @@ pub(crate) fn hardened(codesign_dv: &str) -> bool {
     codesign_dv
         .split_whitespace()
         .filter_map(|w| w.strip_prefix("flags=0x"))
-        .filter_map(|h| u32::from_str_radix(h.split('(').next().unwrap_or(h), 16).ok())
+        .filter_map(|h| {
+            let h = h.split('(').next().unwrap_or(h);
+            h.bytes()
+                .all(|b| b.is_ascii_hexdigit())
+                .then(|| u32::from_str_radix(h, 16).ok())
+                .flatten()
+        })
         .any(|f| f & CS_RUNTIME != 0)
 }
 

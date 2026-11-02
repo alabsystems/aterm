@@ -1,7 +1,7 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-winsign: spec recovery from its 22 unit tests
+# aterm-winsign: spec recovery from its unit tests
 
 > Each of the 19 specs below is proved through Trust/Clean about the compiled Rust function, and
 > then the tests it subsumes are deleted. The one test that sampled no spec (§4) is deleted.
@@ -21,25 +21,21 @@ alone.** Every one needs gap 1 (non-scalar carriers), because the crate works on
 
 ## 0. Notation used in the statements
 
-- `text(ran)` = `ran.stdout ++ "\n" ++ ran.stderr`. `Lines(text)` = `str::lines`, which strips
-  `"\n"` and `"\r\n"`. For a line `L`, `trim(L)` = `str::trim`, and `depth(L)` = the byte index of
-  the first non-whitespace char of `L`, or `|L|` when there is none.
-- `s ⊑ t`: `s` is a substring of `t`.
-- `Chain(ran)`: the list of certs `(depth, to, by)` that `parse_verify_output`'s line loop collects.
-  - Collection is on only inside the FIRST `"Signing Certificate Chain:"` block. A later header
-    turns it on again only while the list is still empty.
+- `text(ran)` = `ran.stdout ++ "\n" ++ ran.stderr`. `s ⊑ t`: `s` is a substring of `t`.
+- `Chain(ran)`: the certs `(depth, to, by)` that `parse_verify_output` collects over the
+  `str::lines` of `text(ran)` (which strips `"\n"` and `"\r\n"`). For a line `L`, `trim(L)` =
+  `str::trim` and `depth(L)` = the byte index of its first non-whitespace char, or `|L|`.
+  - Collection is on inside the first `"Signing Certificate Chain:"` block; a later header turns it
+    on again only while the list is empty.
   - It turns off after a line whose `trim` starts with `"The signature is timestamped"`,
     `"Timestamp Verified by:"`, `"File has page hashes"` or `"Successfully verified"`.
-  - Each `"Issued to: v"` line pushes `(depth(L), trim(v), None)`.
-  - An `"Issued by: v"` line sets `by = trim(v)` on the last cert, but only when that cert has the
-    same depth and its `by` is still `None`.
-- `Leaf(ran)` = `last(Chain)` when `Chain ≠ []` and `∀ c ∈ init(Chain): c.depth < last.depth`.
-  Otherwise `Leaf(ran) = ⊥`. A one-cert chain is its own leaf.
-- `Lane`, `Tier`, `VerifyReport` and `Config` are the crate's types. `Tier::Active { publisher }`
-  is written `Active(p)`.
-- `WJ(b, ps)` = `win_join` on encoded bytes. It is a `foldl` over `ps` of
-  `(acc, p) ↦ acc ++ (if last(acc) ∉ {⊥, '\\', '/', ':'} then "\\" else "") ++ p`, starting
-  from `bytes(b)`.
+  - `"Issued to: v"` pushes `(depth(L), trim(v), None)`. `"Issued by: v"` sets `by = trim(v)` on
+    the last cert when it has the same depth and `by = None`.
+- `Leaf(ran)` = `last(Chain)` when `Chain ≠ []` and every earlier cert is strictly shallower;
+  otherwise `⊥`. A one-cert chain is its own leaf.
+- `Active(p)` = `Tier::Active { publisher: p }`.
+- `WJ(b, ps)` = `win_join` on encoded bytes: a `foldl` over `ps` from `bytes(b)` of
+  `(acc, p) ↦ acc ++ (if last(acc) ∉ {⊥, '\\', '/', ':'} then "\\" else "") ++ p`.
 - `Vers(ns)` = `versions_newest_first(ns)`.
 - `get(k)`: the value of the first source `s` in `resolve_config`'s source order with `k ∈ dom(s)`,
   or `None`.
@@ -65,9 +61,8 @@ alone.** Every one needs gap 1 (non-scalar carriers), because the crate works on
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (primary tests; secondary ones are in
-§2), `rust_features` (what the proof must handle), and `blocking_gaps` (audit §7 numbers, gap 0
-omitted).
+`subsumes` names the primary tests (secondary ones are in §2), `rust_features` what the proof must
+handle, and `blocking_gaps` the audit §7 gaps, gap 0 omitted.
 
 ```tsv
 id	kind	functions	statement	subsumes	rust_features	blocking_gaps
@@ -92,45 +87,9 @@ winsign-run-sign-protocol	contract	run, run_inner, report_file, sign_args, verif
 winsign-run-verify-verdict	contract	run, run_inner, report_file, judge, parse_verify_output	∀ T, H, files ≠ [] with signtool found: for verify (and for sign after a successful signtool sign), file f is accepted ⇔ judge(T, r_f) = Ok ∧ r_f.verified, where r_f = parse_verify_output(reply to (st, verify_args(f), [])). The exit code is 0 ⇔ every file is accepted, else 1. In particular, under T = Inactive an unsigned or untrusted-chain exe still exits 1 and a verified one exits 0. Every file is reported; there is no early stop.	verify_reports_an_untrusted_chain_with_exit_one_even_when_inactive	&dyn Host::run, a loop accumulating a code, println!/eprint! effects, composition with judge and parse_verify_output	1, 3, 4, 7, 8, 13
 ```
 
-### Distribution by kind (19)
-
-| kind | count | ids |
-|---|---|---|
-| contract | 14 | winsign-tier-from, winsign-verify-flags, winsign-verify-leaf, winsign-sign-verify-args, winsign-profile-grammar, winsign-config-precedence, winsign-win-join, winsign-versions-newest-first, winsign-find-signtool, winsign-find-dlib, winsign-find-dotnet-runtime, winsign-run-exit-classes, winsign-run-sign-protocol, winsign-run-verify-verdict |
-| table-property | 3 | winsign-judge, winsign-default-timestamp, winsign-config-lane |
-| round-trip | 1 | winsign-metadata-json-roundtrip |
-| other | 1 | winsign-pin-is-leaf (composition) |
-
-### Blocking gaps (audit §7), specs blocked by each
-
-| gap | specs | note |
-|---|---|---|
-| 0 | 19 | prerequisite for all; omitted from the column |
-| 1 | 19 | non-scalar carriers; the binding gap for this crate |
-| 3 | 17 | E6 body widening (every spec but default-timestamp and pin-is-leaf) |
-| 7 | 14 | loops |
-| 5 | 10 | quantified clauses |
-| 13 | 10 | closures (iterator adaptors, sort_by, find_map) |
-| 4 | 4 | callee-ensures composition (pin-is-leaf and the three run specs) |
-| 8 | 3 | effects (the three run specs) |
-| 11 | 2 | generics (win-join, versions-newest-first) |
-| 2 | 1 | `&mut` through `last_mut`/`Option::filter` (verify-leaf) |
-| 12 | 1 | cross-crate citation of `pins::anchor_active` (tier-from) |
-| 14 | 1 | Clean elaborator, for the JSON unescape model (metadata round-trip) |
-
-### Proof dependency order
-
-`winsign-default-timestamp`, `winsign-tier-from`, `winsign-judge`, `winsign-verify-flags`,
-`winsign-sign-verify-args` → `winsign-verify-leaf` → `winsign-pin-is-leaf` (composition).
-Independently: `winsign-win-join`, `winsign-versions-newest-first` → `winsign-find-signtool`,
-`winsign-find-dlib`, `winsign-find-dotnet-runtime`. Also independent: `winsign-profile-grammar`,
-`winsign-config-precedence`, `winsign-config-lane`, and `winsign-metadata-json-roundtrip`. The
-three `winsign-run-*` specs come last; they compose every spec above under the host trace.
-
 ## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
-All tests are in `crates/aterm-winsign/src/lib.rs` `mod tests`.
 
 ```tsv
 file	test	primary	also

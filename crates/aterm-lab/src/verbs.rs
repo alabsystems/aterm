@@ -108,7 +108,7 @@ pub fn set_custom_mode(run: &Run, m: &str, spec: &J) -> Result<String, Fail> {
 /// `m` is not such a name.
 pub fn custom_mode_name(m: &str) -> Result<String, Fail> {
     let name = crate::stub::clean_mode(m);
-    if name != m || name.contains(':') {
+    if name != m || name.contains(':') || name == "." || name == ".." {
         return Err(Fail::die(format!(
             "mode: a custom mode's name is letters, digits, '.', '_' and '-' ('{m}')"
         )));
@@ -174,7 +174,7 @@ pub fn cmd_limit(args: &[String]) -> Res {
             "limit: SECONDS is a whole number of seconds from now",
         ));
     };
-    let reset = now_secs() + n;
+    let reset = now_secs().saturating_add(n);
     let answer = set_limit(&run, &claim, reset, &plan)?;
     println!("{answer}");
     println!(
@@ -931,9 +931,18 @@ pub fn sandbox_log(minutes: &str) -> String {
 pub fn refusal_of(line: &str, pids: &[String]) -> Option<String> {
     let i = line.find("Sandbox: ")?;
     let rest = &line[i + 9..];
-    let open = rest.find('(')?;
-    let close = rest[open..].find(") deny")?;
-    if rest[..open].contains(' ') || !pids.iter().any(|p| *p == rest[open + 1..open + close]) {
+    let close = rest.find(") deny")?;
+    if !matches!(rest.as_bytes().get(close + 6), None | Some(b'(' | b' ')) {
+        return None;
+    }
+    let open = rest[..close].rfind('(')?;
+    let cmd = &rest[..open];
+    if cmd.is_empty()
+        || cmd
+            .split_once(" duplicate report")
+            .is_some_and(|(n, _)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        || !pids.iter().any(|p| p == &rest[open + 1..close])
+    {
         return None;
     }
     let time = line
@@ -1044,6 +1053,24 @@ pub fn fixture_header_on(run: &Run, door: &Door<'_>, tab: Option<&str>, what: &s
              real Muse Code, launched by path with a scratch `HOME`, a fake `META_API_KEY` and `--base-url \
              http://127.0.0.1:<port>` (a local stub of Meta's model API, crates/aterm-lab) · {what}",
             run.muse_ver
+        );
+    }
+    if run.agent() == "grok" {
+        return format!(
+            "# grok {} · MEASURED {day}, `aterm ctl text` of a private headless aterm ({size}, aterm {av}) running the \
+             real Grok Build, launched by path in the lab's jail with a scratch `HOME` and `GROK_HOME`, the lab's \
+             `XAI_API_KEY` and `GROK_XAI_API_BASE_URL`/`GROK_CLI_CHAT_PROXY_BASE_URL=http://127.0.0.1:<port>/v1` (a \
+             local stub of xAI's API, crates/aterm-lab) · {what}",
+            run.grok_ver
+        );
+    }
+    if run.agent() == "kimi" {
+        return format!(
+            "# kimi {} · MEASURED {day}, `aterm ctl text` of a private headless aterm ({size}, aterm {av}) running the \
+             real Kimi Code, launched by path with a scratch `HOME` and `KIMI_CODE_HOME` whose `config.toml` names one \
+             `openai`-type provider at `http://127.0.0.1:<port>/v1` with a fake key (a local stub of the Chat \
+             Completions API, crates/aterm-lab), no login · {what}",
+            run.kimi_ver
         );
     }
     if run.agent() == "agy" {
@@ -2058,14 +2085,47 @@ mod tests {
     #[test]
     fn a_custom_mode_is_named_what_the_stub_serves_from_its_file() {
         assert_eq!(custom_mode_name("fable-noreset").unwrap(), "fable-noreset");
+        assert_eq!(custom_mode_name("v1..v2").unwrap(), "v1..v2");
         let refused = |m: &str| custom_mode_name(m).unwrap_err().msg.unwrap_or_default();
         for m in ["ok", "limit", "tool", "bg", "slow", "rate-limit"] {
             assert!(refused(m).contains("is a built-in mode"), "{m}");
         }
         assert!(refused("refresh").contains("token refresh"));
-        for m in ["a b", "custom:x", "limit:five_hour:1", "x/../y"] {
+        for m in [
+            "",
+            ".",
+            "..",
+            "a b",
+            "custom:x",
+            "limit:five_hour:1",
+            "x/../y",
+        ] {
             assert!(refused(m).contains("letters, digits"), "{m}");
         }
+        let pids = ["4242".to_string()];
+        assert_eq!(
+            refusal_of(
+                "2026-10-29 19:45:00.123-0700 0x1 Error 0 0 kernel: Sandbox: Antigravity Helper (Plugin)(4242) deny(1) file-read-data /x",
+                &pids,
+            )
+            .as_deref(),
+            Some("19:45:00.123 Antigravity Helper (Plugin)(4242) deny(1) file-read-data /x")
+        );
+        assert_eq!(
+            refusal_of(
+                "2026-10-29 19:45:00.123-0700 0x1 Error 0 0 kernel: Sandbox: foo(bar)(4242) deny(1) mach-lookup x",
+                &pids,
+            )
+            .as_deref(),
+            Some("19:45:00.123 foo(bar)(4242) deny(1) mach-lookup x")
+        );
+        assert!(
+            refusal_of(
+                "2026-10-29 19:45:00.123-0700 0x1 Error 0 0 kernel: Sandbox: 2 duplicate reports for node(4242) deny(1) file-read-data /x",
+                &pids,
+            )
+            .is_none()
+        );
     }
 
     #[test]

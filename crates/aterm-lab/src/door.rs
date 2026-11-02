@@ -288,17 +288,19 @@ impl<'a> Door<'a> {
             .strip_prefix("idle ")
             .and_then(|ms| ms.parse().ok())
             .map_or(Duration::ZERO, Duration::from_millis);
-        let slice = Duration::from_secs(1) + quiet;
+        let slice = Duration::from_secs(1).saturating_add(quiet);
         let mut client = self.connect()?;
         let what = if pattern.is_empty() {
             kind.to_string()
         } else {
             format!("{kind} {}", wire_pattern(pattern))
         };
-        let end = Instant::now() + total;
+        let end = Instant::now().checked_add(total);
         loop {
             stop::check()?;
-            let left = end.saturating_duration_since(Instant::now());
+            let left = end.map_or(Duration::MAX, |e| {
+                e.saturating_duration_since(Instant::now())
+            });
             let ms = left.min(slice).as_millis();
             let line = client
                 .request_line(&format!("await {what} timeout={ms}"))

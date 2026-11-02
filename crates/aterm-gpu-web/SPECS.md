@@ -28,16 +28,16 @@ here once the callee's theorem can be cited across crates (gap 12).
 
 ## 0. Notation used in the statements
 
-- Paths in `functions` are relative to `crates/aterm-gpu-web/src`. A bare name is a method of
-  `AtermGpuTerminal` unless it carries a module, type or crate prefix.
+- A bare name in `functions` is a method of `AtermGpuTerminal`. A module prefix
+  (`scroll_input_api::`, …) names a module shared from `crates/aterm-wasm/src`.
 - `T` = `AtermGpuTerminal`. `Reach` = the `T` values reachable from `T::new(..) = Ok` or
   `T::new_from_system(..) = Some` by any sequence of public calls, plus the crate-internal
   `*_at` clocked twins. Test helpers that assign `t.term` directly (e.g. `install_tiered_history`)
   are outside `Reach`.
-- "Engine" = `aterm_core::terminal::Terminal`. "Twin" = `aterm-wasm`, the CPU web module, whose
-  messages/predict/scroll/notifications glue is a near-copy of this crate's.
+- "Engine" = `aterm_core::terminal::Terminal`. "Twin" = `aterm-wasm`, the CPU web module, which
+  compiles the same `*_api.rs` glue.
 - `hvg(t)` = `t.host_visual_gen: u64`, bumped only by `note_host_visual_change`
-  (`wrapping_add(1)`). "bump" below means exactly that call.
+  (`wrapping_add(1)`). "bump" means exactly that call.
 - `Key(t)` = `FrameGateKey { damage_epoch: t.term.damage_epoch(), host_visual_gen: hvg(t),
   effects_active: t.effects.is_active() }`.
 - `Open(t)` = `Key(t).effects_active ∨ t.pending_reflow.is_some() ∨ t.last_present_frac ≠ 0 ∨
@@ -48,13 +48,14 @@ here once the callee's theorem can be cited across crates (gap 12).
 - `frac(s)` = `ScrollInputState.frac_rows: f64`. IEEE-754 binary64 throughout; `trunc`/`round`
   are `f64::trunc`/`f64::round`; `as i32` is Rust's saturating float-to-int cast.
 - `bp` = `term.modes().bracketed_paste()`.
-- Floats, `&str` formatting and `Vec`/`String` are refused by E6 today (gaps 3 and 1). Every
-  spec is also blocked by gap 0 (the installed seal); it is not repeated in the column.
+- `blocking_gaps` numbers are rows of the gap table in
+  `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7. Gap 0 (the installed seal) blocks every
+  spec and is not repeated in the column.
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (primary tests; secondary in §2),
-`difficulty` (Rust features the proof must handle), `blocking_gaps` (audit §7 numbers).
+`subsumes` lists the primary tests (secondary ones are in §2); `difficulty` names the Rust
+features the proof must handle.
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
@@ -110,7 +111,7 @@ streak-polarity	contract	effects_api::streak_is_dark; aterm_render::theme_is_dar
 ## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists other specs the same test samples.
-Files are relative to `crates/aterm-gpu-web`.
+Files are relative to `crates/aterm-gpu-web`; `shared X.rs` is `crates/aterm-wasm/src/X.rs`.
 
 ```tsv
 file	test	primary	also
@@ -210,7 +211,7 @@ crates/aterm-wasm/src/scrollback_tiers_api.rs	tier_capabilities_json_pins_the_wi
 tests/cpu_gpu_parity.rs	web_cpu_gpu_rgba8_parity	cpu-gpu-parity	
 ```
 
-## 3. Coverage
+## 3. Tests with no row
 
 - 94 live tests read. All 94 map to one of the 47 specs; 0 remain non-spec samples (§4).
 - Biggest collapses: `web-themes` (11 primary), `predict-facade-gates` (8 primary),
@@ -226,11 +227,24 @@ tests/cpu_gpu_parity.rs	web_cpu_gpu_rgba8_parity	cpu-gpu-parity
   (given the bitflags round trip), and the facade halves of `frame-gate`, `reflow-*` and
   `predict-facade-gates`.
 
-## 4. Tests that are not spec samples
+## 4. Proof order (easiest high-value first)
 
 > Status: `predict_api::session_reset_forgets_rtt_while_coordinate_reset_preserves_it` was deleted with the shared `aterm-wasm` `predict_api.rs` mount (it depended on a real 20 ms sleep and `Instant::now`; RTT retention belongs to `aterm-predict`'s injected-clock spec, and the facade halves are in `predict-facade-gates`).
 
-## 5. Implied specs that look wrong, or disagree with the code
+1. **The `ScrollInputState` family** (`scroll-accumulator`, `scroll-clamp-and-reset`,
+   `scroll-frac-px-and-stamp`): scalar `f64` arithmetic on a one-field struct, with no loops and
+   no cross-crate calls. Factoring each method into a pure `fn(f64, …) -> (f64, i32)` that the
+   `&mut self` method calls removes gap 2; the rest is an IEEE binary64 model in Clean
+   (`t − trunc(t)` exact, saturating `as i32`). The facade half of `scroll-export-composition`
+   then needs only gap 4 and aterm-core's `scroll_display` clamp.
+2. **`tier-caps-json`** (gaps 1, 3): one `format!` of a bool, the smallest `String`-carrier case.
+3. **`visual-mutators-bump`** (gaps 2, 4): a `u64::wrapping_add` and a frame lemma over disjoint
+   fields, which `frame-gate` stands on. `frame-gate` follows with a `damage_epoch` citation from
+   aterm-core (gap 12) that also settles §5.1.
+4. **`notification-queue-bounded-fifo`**: a bounded FIFO with the invariant `|q| ≤ 64`. Factoring
+   a pure `enqueue(&mut VecDeque, n)` out of the `Arc<Mutex<…>>` leaves gaps 1 and 4.
+5. **`webgl-present-result`**, its `is_ok` clause (an enum carrier only). The message clause waits
+   for the `String` model.
 
 1. **No test samples `swapchain-sized-to-surface-rows`.** The spec is blocked on a
    GPU-surface model (gap 8), and no source-text count of `.frame_size(` lines stands in for
@@ -272,34 +286,22 @@ tests/cpu_gpu_parity.rs	web_cpu_gpu_rgba8_parity	cpu-gpu-parity
    `messages_api_tests` and `tests/cpu_gpu_parity.rs` now call `aterm_spec::host::could_not_run`
    when no system monospace font or GPU adapter is available rather than returning silently.
 
-## 6. Proof order (easiest high-value first)
+## 5. Open findings
 
-No spec here is blocked by gap 0 alone: every one needs at least floats, `&mut self` or a
-non-scalar carrier. The order below takes the smallest gap sets first and the specs others
-build on.
-
-1. **The `ScrollInputState` family**: `scroll-accumulator`, `scroll-clamp-and-reset`,
-   `scroll-frac-px-and-stamp` (gaps 2, 3, plus 14 and 1 for the stamp half). This is pure scalar
-   `f64` arithmetic on a one-field struct, with no loops and no cross-crate calls, and it retires
-   10 tests. Factoring each method into a pure `fn(f64, …) -> (f64, i32)` that the `&mut self`
-   method calls removes gap 2 for the core; the remaining work is an IEEE binary64 model in Clean
-   (`t − trunc(t)` exact, saturating `as i32`). Once it lands, the facade half of
-   `scroll-export-composition` (4 more tests) needs only gap 4 plus aterm-core's
-   `scroll_display` clamp.
-2. **`tier-caps-json`** (gaps 1, 3). This is one `format!` of a bool through a one-variant enum,
-   the smallest first `String`-carrier case in the crate. It is also a good probe for gap 1's
-   `String` model.
-3. **`visual-mutators-bump`** (gaps 2, 4). This is a `u64::wrapping_add` and a frame lemma over
-   disjoint fields. It retires 2 tests, including the one that enumerates every setter, and it is
-   the lemma `frame-gate` (2 tests) stands on. `frame-gate` then follows, with a `damage_epoch`
-   citation from aterm-core (gap 12) that also settles §5.2.
-4. **`notification-queue-bounded-fifo`** (gaps 1, 4; 8 and 13 disappear after factoring a pure
-   `enqueue(&mut VecDeque, n)` out of the `Arc<Mutex<…>>`). This is a bounded FIFO with an
-   obvious invariant `|q| ≤ 64`, and it is the first `VecDeque` content-model case.
-5. **`webgl-present-result`**, `is_ok` clause (gaps 1, 3; enum carrier only). The message
-   clause waits for the `String` model.
-
-After these, the delegation specs (`mode-getters-delegate`, `encode-key-refines-mode`,
-`dims-mirror-grid`, `notification-auth-gate`, `chrome-frame-size`) are trivial on the facade
-side and wait on gap 12 and their owning crates' proofs. `cpu-gpu-parity` and
-`swapchain-sized-to-surface-rows` come last (gap 8).
+1. **`needs_frame` skips `open_frame`'s pumps.** Its doc says "Whether the next `render` would
+   draw", but `open_frame` first runs `drain_compress_backlog_on_render`, which applies a pending
+   budget share and trickles staged lines. If that advances `damage_epoch`, a `false` is followed
+   by a drawn frame. Prove it never does (and state it in `frame-gate`), or weaken the doc.
+2. **The predict clock is a thread-local test pin, not an injected field.** Every export reads
+   `predict_api::clock`, which the predict tests pin through `pin_clock`; production reads the
+   real clock, so `predict-facade-gates` is not about a pure function. The state-machine claims
+   belong in aterm-predict with an injected clock.
+3. **A magic drain bound.** `spill_exports_surface_band_content_on_the_cpu_face` asserts the
+   aurora drains within `DRAIN_FRAMES = 125` frames. The spec states the bound as a function of
+   the glow config.
+4. **The messages glue is shared.** Both web crates compile `crates/aterm-wasm/src/messages_api.rs`,
+   so the string-reply clause of `messages-twin-equivalence` holds by construction. Its band-row
+   clause still compares the two hosts' `RenderInput`s.
+5. **Coverage witnesses are not spec.** The `build_frame_*` tests read the `#[cfg(test)]` field
+   `last_refill`, a real production return value, but their `scoped >= 5` / `full >= 2` counts
+   witness the chosen stream and are not part of `scoped-refill-equals-full`.

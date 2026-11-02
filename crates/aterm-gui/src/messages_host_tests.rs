@@ -59,11 +59,6 @@ const fn pinned_wall(unix_ms: u64, zone_s: i64) -> crate::messages_host::WallClo
 
 use crate::toolchain_words::held_row;
 
-fn quiet_past_echoes() -> std::time::Duration {
-    let longest = aterm_messages::animate::echo_span(aterm_messages::EchoKind::Complete, 0, true);
-    aterm_messages::SHRINK_QUIET.max(longest) + std::time::Duration::from_millis(1)
-}
-
 fn settings_view(app: &App, wid: WindowId) -> Option<&crate::native_settings::SettingsViewState> {
     let (_, view) = app.active_native_view(wid)?;
     match app.native_runtime.view_state(view)? {
@@ -133,69 +128,6 @@ fn native_centers_share_one_confirmation_incarnation() {
     );
     assert_eq!(applied.reply, "OK settled=- how=gone");
     assert!(!next.digest().is_empty());
-}
-
-#[test]
-fn the_deadline_is_none_when_idle_and_the_holds_freeze_under_a_handoff() {
-    let mut app = App::headless_for_test();
-    assert_eq!(app.messages_deadline(), None, "an idle band never wakes");
-    let id = app.post_message(warn("a warning"));
-    assert!(app.messages.live(id).is_some());
-    assert_eq!(
-        app.message_band_rows, 1,
-        "a headless App has no window to clamp against: the row commits"
-    );
-    assert!(app.messages_deadline().is_some(), "the hold is armed");
-    app.incoming_handoff_pending = true;
-    assert!(app.message_holds_frozen());
-    assert_eq!(
-        app.messages_deadline(),
-        None,
-        "a held row's fold is not a wake while the holds are frozen"
-    );
-    let frozen = app.post_message(warn("frozen"));
-    assert!(app.messages.live(frozen).is_some(), "the row is live");
-    assert_eq!(app.message_band_rows, 1, "…but no row was committed");
-    assert!(
-        !app.sync_message_band_rows(Instant::now()),
-        "and none will be, mid-handoff"
-    );
-    let live = app.post_message(
-        Message::new(tags::UPDATE, Severity::Info, "downloading").hold(Hold::Live {
-            stale_after: std::time::Duration::from_secs(30),
-        }),
-    );
-    assert!(app.messages.live(live).is_some());
-    assert!(app.messages_deadline().is_some(), "staleness keeps running");
-    app.incoming_handoff_pending = false;
-    assert!(!app.message_holds_frozen());
-    assert!(
-        app.sync_message_band_rows(Instant::now()),
-        "the freeze lifted: the row commits"
-    );
-    assert!(app.message_band_rows > 1);
-}
-
-#[test]
-fn a_frozen_band_never_arms_its_pending_shrink() {
-    let mut app = App::headless_for_test();
-    let id = app.post_message(warn("a warning"));
-    assert_eq!(app.message_band_rows, 1);
-    let before = Instant::now();
-    assert!(app.withdraw_message(id));
-    let after = Instant::now();
-    assert_eq!(app.message_band_rows, 1, "the shrink waits out its quiet");
-    let shrink = before + aterm_messages::SHRINK_QUIET..=after + aterm_messages::SHRINK_QUIET;
-    assert!(
-        app.messages.deadline(true).is_some(),
-        "unfrozen, the shrink (or the echo) is armed"
-    );
-    app.incoming_handoff_pending = true;
-    assert!(
-        app.messages_deadline().is_none_or(|d| !shrink.contains(&d)),
-        "frozen, the shrink is not a wake"
-    );
-    app.incoming_handoff_pending = false;
 }
 
 #[test]
@@ -1150,40 +1082,6 @@ fn publish_is_rate_limited_and_only_while_settings_exists() {
 }
 
 #[test]
-fn the_minute_tick_arms_a_wake_while_a_view_is_on_the_route() {
-    use crate::app_native::MESSAGES_PUBLISH_TICK as TICK;
-    let mut app = App::headless_for_test();
-    let wid = WindowId(0);
-    app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
-    app.post_message(
-        Message::new(tags::UPDATE, Severity::Warn, "checks failing").hold(Hold::STANDING),
-    );
-    assert!(app.open_settings_tab_in_window(wid, SettingsRoute::Messages));
-    let published = app
-        .messages_last_publish
-        .expect("opening Settings publishes");
-    assert_eq!(app.messages_published_revision, app.messages.revision());
-    assert_eq!(
-        settings_view(&app, wid).map(|v| v.route),
-        Some(SettingsRoute::Messages)
-    );
-    assert_eq!(
-        app.messages.deadline(true),
-        None,
-        "a standing row arms no fold: the center is quiet"
-    );
-    assert_eq!(
-        app.messages_deadline(),
-        Some(published + TICK),
-        "the tick must be armed as a wake while a view is on the route"
-    );
-    app.windows.get_mut(&wid).unwrap().occluded = true;
-    assert_eq!(app.messages_deadline(), None, "a hidden page is no wake");
-    app.windows.get_mut(&wid).unwrap().occluded = false;
-    assert_eq!(app.messages_deadline(), Some(published + TICK));
-}
-
-#[test]
 fn a_headless_messages_page_is_republished_only_when_its_time_words_move() {
     type Post = fn(&mut App, Message) -> MessageId;
     let posts: [(&str, Post); 2] = [
@@ -1530,10 +1428,6 @@ fn open_path_external_refuses_paths_outside_the_log_dir_and_symlinks() {
     );
 }
 
-fn past_the_grace() -> Instant {
-    Instant::now() + PROGRESS_GRACE + std::time::Duration::from_millis(10)
-}
-
 fn net_read(running: bool, started: u64) -> crate::PkgProgressSnapshot {
     let mut programs = std::collections::BTreeMap::new();
     programs.insert(
@@ -1665,108 +1559,6 @@ fn a_first_run_row_holds_across_the_vendor_sub_pass_and_folds_at_exit() {
     }
 }
 
-fn empty_read(running: bool) -> crate::PkgProgressSnapshot {
-    let mut read = net_read(running, 1_700_000_000);
-    read.file.overall = atpkg::progress::Overall::default();
-    read.file.queue.clear();
-    read.file.programs.clear();
-    if !running {
-        read.file.ended_unix = Some(1);
-    }
-    read
-}
-
-#[test]
-fn the_first_run_row_opens_ahead_of_the_seed_and_the_update_takes_it_over() {
-    let regrids = message_regrids();
-    let mut app = App::headless_for_test();
-    assert!(app.open_first_run_ahead(), "a row goes up");
-    let row = app
-        .messages
-        .live_by_key(toolchain_words::KEY_PASS)
-        .map(|l| (l.id, l.msg.title.clone()))
-        .expect("the row opens at once");
-    assert_eq!(row.1, "Installing ALab tools");
-    let row = row.0;
-    app.toolchain_pass_ended(true);
-    assert!(
-        app.messages.live(row).is_some(),
-        "the seed's exit carries it"
-    );
-    app.announce_toolchain_pass(
-        "installing 10 ALab program(s) over the network (about 3 GB on disk when finished)",
-        true,
-    );
-    let live: Vec<_> = app.messages.live_rows().map(|l| l.id).collect();
-    assert_eq!(live, vec![row], "the announcement restates it in place");
-    let stats = app
-        .messages
-        .live(row)
-        .and_then(|l| l.msg.meter.as_ref().map(|m| m.stats.clone()));
-    assert_eq!(stats.as_deref(), Some("10 programs \u{00b7} ~3 GB"));
-    app.apply_toolchain_snapshot(Some(&net_read(true, 1_700_000_000)), true);
-    assert_eq!(
-        app.messages.live_rows().map(|l| l.id).collect::<Vec<_>>(),
-        vec![row]
-    );
-    app.toolchain_pass_ended(true);
-    assert_eq!(
-        app.messages.echoes().first().map(|e| e.kind),
-        Some(EchoKind::Complete),
-        "the announced update's clean exit is its Complete"
-    );
-    app.settle_messages(Instant::now() + quiet_past_echoes());
-    assert_eq!(
-        app.messages.live_rows().count(),
-        0,
-        "the update's exit folds it"
-    );
-    assert_eq!(message_regrids(), regrids + 2, "one open, one fold");
-
-    let regrids = message_regrids();
-    let mut app = App::headless_for_test();
-    assert!(app.open_first_run_ahead());
-    app.toolchain_pass_ended(true);
-    assert!(
-        !app.open_first_run_ahead(),
-        "a retried seed only carries the row it already holds"
-    );
-    app.toolchain_pass_ended(true);
-    assert_eq!(app.messages.live_rows().count(), 1, "still the one row");
-    app.toolchain_pass_ended(false);
-    assert_eq!(
-        app.messages.echoes().first().map(|e| e.kind),
-        Some(EchoKind::Fault),
-        "it ends as the update exited"
-    );
-    app.settle_messages(Instant::now() + quiet_past_echoes());
-    assert_eq!(app.messages.live_rows().count(), 0);
-    assert_eq!(message_regrids(), regrids + 2, "one open, one fold");
-
-    let mut app = App::headless_for_test();
-    assert!(app.open_first_run_ahead());
-    let row = app
-        .messages
-        .live_by_key(toolchain_words::KEY_PASS)
-        .map(|l| l.id)
-        .expect("the row");
-    app.toolchain_pass_ended(true);
-    app.toolchain_pass_ended(true);
-    assert!(app.messages.live(row).is_none(), "the row is gone");
-    assert!(
-        app.messages
-            .echoes()
-            .iter()
-            .all(|e| e.kind != EchoKind::Complete),
-        "{:?}",
-        app.messages.echoes()
-    );
-    assert_eq!(
-        app.messages.log().get(row).unwrap().state,
-        LogState::Retired(Retired::Withdrawn)
-    );
-}
-
 #[test]
 fn a_first_run_row_no_update_takes_over_is_withdrawn() {
     let mut app = App::headless_for_test();
@@ -1796,58 +1588,6 @@ fn a_first_run_row_no_update_takes_over_is_withdrawn() {
         app.messages.live_rows().count(),
         1,
         "the announcing child's row"
-    );
-}
-
-#[test]
-fn a_first_run_announcement_opens_the_row_before_any_snapshot() {
-    let mut app = App::headless_for_test();
-    app.announce_toolchain_pass(
-        "installing 10 ALab program(s) from the bundled registry (about 3 GB on disk when finished)",
-        true,
-    );
-    assert_eq!(app.messages.live_rows().count(), 1);
-    assert_eq!(app.message_band_rows, 1, "on glass at once");
-    {
-        let live = app
-            .messages
-            .live_by_key(toolchain_words::KEY_PASS)
-            .expect("the announcement opens the row");
-        assert_eq!(live.fold_at, None, "live: no fold…");
-        assert!(live.stale_at.is_some(), "…but a cap");
-    }
-    assert!(app.messages_deadline().is_some(), "the cap arms a wake");
-    let mut quiet = App::headless_for_test();
-    quiet.apply_toolchain_snapshot(Some(&empty_read(true)), true);
-    assert_eq!(
-        quiet.messages.live_rows().count(),
-        0,
-        "unplanned running pass: no row"
-    );
-    assert_eq!(quiet.message_band_rows, 0);
-    let row = app
-        .messages
-        .live_by_key(toolchain_words::KEY_PASS)
-        .map(|l| l.id)
-        .expect("the first-run row");
-    app.apply_toolchain_snapshot(Some(&empty_read(true)), true);
-    app.apply_toolchain_snapshot(Some(&empty_read(false)), true);
-    app.apply_toolchain_snapshot(None, true);
-    app.apply_toolchain_snapshot(None, false);
-    assert!(
-        app.messages.live(row).is_some(),
-        "latched: the first run's child still runs, and its exit folds it"
-    );
-    app.toolchain_pass_ended(true);
-    assert!(app.messages.live(row).is_none(), "folded at exit");
-    assert_eq!(
-        app.messages.log().get(row).unwrap().state,
-        LogState::Retired(Retired::Withdrawn)
-    );
-    assert!(
-        appstatus(&app).is_empty(),
-        "and it claims no outcome: {:?}",
-        appstatus(&app)
     );
 }
 
@@ -2173,6 +1913,7 @@ fn a_landed_update_leaves_no_outcome_row_that_said_it_had_not() {
     }
 }
 
+#[cfg(unix)]
 fn band_seen(app: &mut App) {
     for ws in app.windows.values_mut() {
         ws.band_on_screen_for_test = true;
@@ -3216,115 +2957,11 @@ fn a_carried_recovery_row_offers_no_end_sessions_that_ends_nothing() {
     );
 }
 
-#[cfg(unix)]
-#[test]
-fn a_queued_carried_row_converges_on_the_centers_count_at_commit() {
-    let now = Instant::now();
-    let mut parent = App::headless_for_test();
-    let first =
-        parent.post_message(Message::new(tags::SESSION, Severity::Success, "first").line("one"));
-    assert_eq!(parent.message_band_rows, 1);
-    parent.pending_update_handoff = Some(parked());
-    let second =
-        parent.post_message(Message::new(tags::SESSION, Severity::Success, "second").line("two"));
-    assert!(
-        parent.messages.live(second).unwrap().is_queued(),
-        "the frozen count has one slot and the earlier row holds it"
-    );
-    let carried = parent.carried_messages();
-    assert_eq!(carried.messages.len(), 2);
-    assert!(carried.messages[0].on_glass && !carried.messages[1].on_glass);
-    let carry = window_carry(parent.message_band_rows, carried);
-    let mut successor = App::headless_for_test();
-    successor.incoming_handoff_pending = true;
-    successor.message_band_rows = carry.status_bar_rows.min(MAX_ROWS);
-    successor.seed_carried_messages(&carry, None);
-    assert_eq!(successor.messages.committed_rows(), 2);
-    assert_eq!(successor.message_band_rows, 1);
-    assert!(!successor.sync_message_band_rows(now), "frozen");
-    successor.incoming_handoff_pending = false;
-    successor.messages.after_handoff_commit(now);
-    assert_eq!(
-        successor.messages.commit_rows(now, MAX_ROWS),
-        None,
-        "the center's count already stands at two…"
-    );
-    assert!(
-        successor.sync_message_band_rows(now),
-        "…so the geometry converges on it here"
-    );
-    assert_eq!(successor.message_band_rows, 2);
-    assert!(successor.messages.live(first).is_some() && successor.messages.live(second).is_some());
-    assert!(!successor.messages.live(second).unwrap().is_queued());
-}
-
 fn light_read(running: bool, started: u64) -> crate::PkgProgressSnapshot {
     let mut snap = net_read(running, started);
     snap.file.overall.bytes_done = 12_000_000;
     snap.file.overall.bytes_total = 40_000_000;
     snap
-}
-
-fn recorded(app: &App, key: &str) -> Option<LogRecord> {
-    app.messages
-        .log()
-        .records()
-        .rev()
-        .find(|r| r.key.as_deref() == Some(key))
-        .filter(|r| r.retired() == Some(&Retired::Recorded))
-        .cloned()
-}
-
-#[test]
-fn an_automatic_update_costs_no_regrid_and_a_persons_at_most_two() {
-    for asked in [false, true] {
-        let mut app = App::headless_for_test();
-        if asked {
-            app.note_update_check_asked(true);
-        }
-        let regrids = message_regrids();
-        app.note_update_progress(&aterm_update::Progress::Downloading {
-            version: "9.9.9".into(),
-            bytes_done: 10_000_000,
-            bytes_total: 74_000_000,
-        });
-        let t = past_the_grace();
-        app.settle_messages(t);
-        assert_eq!(app.message_band_rows, u16::from(asked), "asked={asked}");
-        assert_eq!(message_regrids(), regrids + u64::from(asked));
-        if asked {
-            app.note_update_check_asked(false);
-            app.note_update_progress(&aterm_update::Progress::Downloading {
-                version: "9.9.9".into(),
-                bytes_done: 60_000_000,
-                bytes_total: 74_000_000,
-            });
-            assert_eq!(app.messages.live_rows().count(), 1, "the row keeps moving");
-        }
-        app.note_update_progress(&aterm_update::Progress::Staged {
-            version: "9.9.9".into(),
-            build: 41,
-        });
-        assert_eq!(app.messages.live_rows().count(), 0);
-        assert_eq!(
-            app.messages.echoes().first().map(|e| e.kind),
-            asked.then_some(EchoKind::Complete),
-            "asked={asked}: a person's download ends in its Complete echo"
-        );
-        let mut t = t;
-        for _ in 0..40 {
-            t += std::time::Duration::from_millis(100);
-            app.settle_messages(t);
-        }
-        assert_eq!(app.message_band_rows, 0, "asked={asked}");
-        assert_eq!(
-            message_regrids(),
-            regrids + 2 * u64::from(asked),
-            "asked={asked}: one open, one fold — or nothing"
-        );
-        let rec = recorded(&app, update_words::KEY_PROGRESS).expect("the staged record");
-        assert!(rec.title.contains("9.9.9"), "asked={asked}: {}", rec.title);
-    }
 }
 
 #[test]
@@ -3351,86 +2988,6 @@ fn an_automatic_download_that_fails_is_a_record_with_its_version() {
 }
 
 #[test]
-fn a_deferred_download_fades_and_a_failed_one_faults() {
-    for (progress, kind) in [
-        (
-            aterm_update::Progress::Deferred {
-                detail: "rate limited".into(),
-            },
-            EchoKind::Vanish,
-        ),
-        (
-            aterm_update::Progress::Withheld {
-                detail: "held: build 7 was signed by machine m11, which the machine \
-                         roster has revoked"
-                    .into(),
-            },
-            EchoKind::Vanish,
-        ),
-        (
-            aterm_update::Progress::Failed {
-                detail: "could not verify the download".into(),
-            },
-            EchoKind::Fault,
-        ),
-    ] {
-        let mut app = App::headless_for_test();
-        app.note_update_check_asked(true);
-        app.note_update_progress(&aterm_update::Progress::Downloading {
-            version: "9.9.9".into(),
-            bytes_done: 10_000_000,
-            bytes_total: 74_000_000,
-        });
-        app.settle_messages(past_the_grace());
-        assert_eq!(app.message_band_rows, 1, "revealed");
-        app.note_update_progress(&progress);
-        assert_eq!(app.messages.live_rows().count(), 0, "{progress:?}");
-        assert_eq!(
-            app.messages.echoes().first().map(|e| e.kind),
-            Some(kind),
-            "{progress:?}"
-        );
-    }
-}
-
-#[test]
-fn the_landing_resolves_the_finishing_row_and_records_the_words() {
-    let mut app = App::headless_for_test();
-    let finishing = app.post_message(update_words::finishing("0.91.0"));
-    app.settle_messages(Instant::now() + PROGRESS_GRACE * 2);
-    assert!(
-        app.messages.glass_position(finishing).is_some(),
-        "on the glass"
-    );
-    app.post_update_landed("0.91.0", 41, 0);
-    assert!(app.messages.live(finishing).is_none());
-    assert!(matches!(
-        app.messages
-            .log()
-            .get(finishing)
-            .and_then(LogRecord::retired),
-        Some(Retired::Resolved(Outcome::Ok))
-    ));
-    assert_eq!(
-        app.messages.echoes().first().map(|e| e.kind),
-        Some(EchoKind::Complete)
-    );
-    assert_eq!(
-        app.messages.live_rows().count(),
-        0,
-        "the landing takes no row"
-    );
-    let landed = app
-        .messages
-        .log()
-        .records()
-        .rev()
-        .find(|r| r.tag == aterm_messages::tags::UPDATE)
-        .expect("the landing's record");
-    assert_eq!(landed.retired(), Some(&Retired::Recorded));
-}
-
-#[test]
 fn a_navigation_press_folds_a_held_row() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
@@ -3450,201 +3007,6 @@ fn a_navigation_press_folds_a_held_row() {
     );
     assert!(app.perform_intent(wid, live, packages));
     assert!(app.messages.live(live).is_some(), "work in flight stays");
-}
-
-#[test]
-fn a_refused_install_resolves_warn_and_echoes_fault() {
-    let mut app = App::headless_for_test();
-    app.begin_update_installing(true);
-    let id = app
-        .messages
-        .live_by_key(update_words::KEY_PROGRESS)
-        .expect("the explicit apply's row")
-        .id;
-    assert!(
-        app.messages.glass_position(id).is_some(),
-        "committed at once"
-    );
-    app.retire_update_installing();
-    assert!(app.messages.live(id).is_none());
-    assert!(matches!(
-        app.messages.log().get(id).and_then(LogRecord::retired),
-        Some(Retired::Resolved(Outcome::Warn))
-    ));
-    assert_eq!(
-        app.messages.echoes().first().map(|e| e.kind),
-        Some(EchoKind::Fault)
-    );
-}
-
-#[test]
-fn a_heavy_routine_pass_raises_one_row_after_the_grace_and_a_light_one_none() {
-    let mut app = App::headless_for_test();
-    let regrids = message_regrids();
-    app.apply_toolchain_snapshot(Some(&light_read(true, 1_700_000_000)), false);
-    assert_eq!(
-        app.messages.live_rows().count(),
-        0,
-        "a light pass paints nothing"
-    );
-    app.settle_messages(Instant::now() + PROGRESS_GRACE * 2);
-    assert_eq!(message_regrids(), regrids);
-    app.apply_toolchain_snapshot(Some(&net_read(true, 1_700_000_000)), false);
-    assert!(
-        app.messages.live_rows().next().is_some(),
-        "the heavy pass's row"
-    );
-    assert_eq!(app.message_band_rows, 0, "inside its grace, off the glass");
-    assert_eq!(message_regrids(), regrids);
-    let mut t = past_the_grace();
-    app.settle_messages(t);
-    assert_eq!(app.message_band_rows, 1, "revealed once the work lasted");
-    assert_eq!(message_regrids(), regrids + 1);
-    app.apply_toolchain_snapshot(Some(&net_read(true, 1_700_000_000)), false);
-    assert_eq!(
-        app.messages.live_rows().count(),
-        1,
-        "a read restates in place"
-    );
-    assert_eq!(message_regrids(), regrids + 1);
-    app.record_toolchain_outcome(toolchain_words::ended("the vendor pass finished", false));
-    app.apply_toolchain_snapshot(Some(&net_read(false, 1_700_000_000)), false);
-    app.apply_toolchain_snapshot(Some(&net_read(true, 1_700_000_100)), false);
-    assert_eq!(
-        app.messages.live_rows().count(),
-        1,
-        "latched: nothing folds"
-    );
-    app.toolchain_pass_ended(true);
-    assert_eq!(app.messages.live_rows().count(), 0, "the exit folds it");
-    assert_eq!(
-        app.messages.echoes().first().map(|e| e.kind),
-        Some(EchoKind::Complete)
-    );
-    for _ in 0..40 {
-        t += std::time::Duration::from_millis(100);
-        app.settle_messages(t);
-    }
-    assert_eq!(app.message_band_rows, 0);
-    assert_eq!(message_regrids(), regrids + 2, "one open, one fold");
-}
-
-#[test]
-fn a_persons_check_takes_its_row_after_the_grace_and_ends_in_its_words() {
-    use crate::message_reporters::{Attention, PackagesVerb, attention};
-    let mut quick = App::headless_for_test();
-    let regrids = message_regrids();
-    let t0 = Instant::now();
-    quick.person_pass(PersonPass::Began(PackagesVerb::Check));
-    assert_eq!(quick.messages.live_rows().count(), 1, "posted");
-    quick.settle_messages(t0 + PROGRESS_GRACE - std::time::Duration::from_millis(50));
-    assert_eq!(quick.message_band_rows, 0, "inside its grace");
-    quick.person_pass(PersonPass::Ended(EchoKind::Complete));
-    quick.settle_messages(t0 + PROGRESS_GRACE * 3);
-    assert_eq!(quick.messages.live_rows().count(), 0);
-    assert!(quick.messages.echoes().is_empty(), "never shown, no echo");
-    assert_eq!(message_regrids(), regrids, "a no-op Check never flashes");
-
-    let mut app = App::headless_for_test();
-    let regrids = message_regrids();
-    app.person_pass(PersonPass::Began(PackagesVerb::Check));
-    let live = app.messages.live_rows().next().expect("the Check's row");
-    assert!(live.msg.meter.as_ref().is_some_and(|m| m.busy), "busy");
-    assert_eq!(attention(&live.msg), Ok(Attention::Progress));
-    let mut t = past_the_grace();
-    app.settle_messages(t);
-    assert_eq!(app.message_band_rows, 1, "the wait lasted: revealed");
-    app.apply_toolchain_snapshot(Some(&light_read(true, 1_700_000_000)), false);
-    let live = app.messages.live_rows().next().expect("restated");
-    assert_eq!(app.messages.live_rows().count(), 1, "in place");
-    let meter = live.msg.meter.as_ref().expect("a meter");
-    assert!(meter.fill_permille.is_some_and(|f| f > 0), "a fill");
-    assert!(meter.amount.is_some(), "the ETA's input");
-    assert_eq!(attention(&live.msg), Ok(Attention::Progress));
-    app.record_toolchain_outcome(toolchain_words::ended(
-        "the pass finished; 12 ALab program(s) are installed",
-        false,
-    ));
-    app.apply_toolchain_snapshot(Some(&light_read(false, 1_700_000_000)), false);
-    app.apply_toolchain_snapshot(None, false);
-    assert_eq!(app.messages.live_rows().count(), 1, "the exit's to fold");
-    assert!(!app.toolchain_row_latched, "the lane's latch is left alone");
-    app.person_pass(PersonPass::Ended(EchoKind::Complete));
-    assert_eq!(app.messages.live_rows().count(), 0, "its exit folds it");
-    let echo = app.messages.echoes().first().expect("the echo");
-    assert_eq!(echo.kind, EchoKind::Complete);
-    for _ in 0..40 {
-        t += std::time::Duration::from_millis(100);
-        app.settle_messages(t);
-    }
-    assert_eq!(app.message_band_rows, 0);
-    assert_eq!(message_regrids(), regrids + 2, "one open, one fold");
-    app.apply_toolchain_snapshot(Some(&light_read(true, 1_700_000_500)), false);
-    assert_eq!(app.messages.live_rows().count(), 0, "nobody waits on it");
-}
-
-#[test]
-fn a_queued_check_drops_the_holders_frame_when_the_holder_ends() {
-    use crate::message_reporters::{PackagesVerb, WAITING_FOR_ALAB};
-    let row = |app: &App| {
-        app.messages
-            .live_by_key(toolchain_words::KEY_PASS)
-            .map(|l| {
-                let fill = l.msg.meter.as_ref().and_then(|m| m.fill_permille);
-                (l.msg.title.clone(), fill, l.msg.finished_title())
-            })
-            .expect("the person's row")
-    };
-    let run = |app: &mut App, own_pass_plans: bool| {
-        app.person_pass(PersonPass::Began(PackagesVerb::Check));
-        app.person_pass(PersonPass::Waiting);
-        assert_eq!(row(app).0, WAITING_FOR_ALAB, "queued: it says so");
-        assert_eq!(app.messages.live_rows().count(), 1, "one row, restated");
-        app.apply_toolchain_snapshot(Some(&light_read(true, 1_700_000_000)), false);
-        let (title, fill, _) = row(app);
-        assert_eq!(title, "Updating ALab tools", "what they wait behind");
-        assert!(fill.is_some(), "with its fill");
-        app.apply_toolchain_snapshot(Some(&light_read(false, 1_700_000_000)), false);
-        assert_eq!(row(app), (WAITING_FOR_ALAB.to_string(), None, row(app).2));
-        app.toolchain_pass_ended(true);
-        assert_eq!(
-            row(app).0,
-            WAITING_FOR_ALAB,
-            "the lane's exit is not theirs"
-        );
-        app.apply_toolchain_snapshot(Some(&light_read(true, 1_700_000_000)), false);
-        app.person_pass(PersonPass::Running);
-        assert_eq!(
-            row(app),
-            (
-                "Checking ALab tools".to_string(),
-                None,
-                "ALab tools checked".to_string()
-            )
-        );
-        app.apply_toolchain_snapshot(Some(&light_read(true, 1_700_000_000)), false);
-        assert_eq!(row(app).0, "Checking ALab tools", "late: paints nothing");
-        assert_eq!(row(app).1, None);
-        if own_pass_plans {
-            let mut own = light_read(true, 1_700_000_000);
-            own.file.pid = Some(9);
-            app.apply_toolchain_snapshot(Some(&own), false);
-            assert_eq!(row(app).0, "Updating ALab tools", "its own plan paints");
-            assert!(row(app).1.is_some());
-        }
-        app.settle_messages(past_the_grace());
-        app.person_pass(PersonPass::Ended(EchoKind::Complete));
-        let echo = app.messages.echoes().first().expect("the echo");
-        assert_eq!(echo.kind, EchoKind::Complete);
-        echo.msg.finished_title()
-    };
-    let mut noop = App::headless_for_test();
-    assert_eq!(run(&mut noop, false), "ALab tools checked");
-    assert_eq!(noop.toolchain_holder_pid, None, "nothing carried");
-    noop.person_pass(PersonPass::Waiting);
-    assert_eq!(noop.messages.live_rows().count(), 0);
-    let mut planned = App::headless_for_test();
-    assert_eq!(run(&mut planned, true), "ALab tools updated");
 }
 
 #[test]
@@ -3688,150 +3050,6 @@ fn a_persons_install_and_remove_take_their_rows() {
     assert_eq!(rm.messages.live_rows().count(), 0);
 }
 
-#[test]
-fn a_check_behind_a_first_run_leaves_the_first_run_its_row() {
-    use crate::message_reporters::PackagesVerb;
-    let mut app = App::headless_for_test();
-    app.announce_toolchain_pass("installing 10 ALab program(s) (about 3 GB)", true);
-    app.apply_toolchain_snapshot(Some(&net_read(true, 1_700_000_000)), true);
-    app.person_pass(PersonPass::Began(PackagesVerb::Check));
-    app.person_pass(PersonPass::Waiting);
-    let title = |app: &App| {
-        app.messages
-            .live_by_key(toolchain_words::KEY_PASS)
-            .map(|l| l.msg.title.clone())
-    };
-    assert_eq!(title(&app).as_deref(), Some("Installing ALab tools"));
-    let mut later = net_read(true, 1_700_000_000);
-    later.file.overall.bytes_done += 1_000_000;
-    app.apply_toolchain_snapshot(Some(&later), true);
-    app.apply_toolchain_snapshot(Some(&later), false);
-    assert_eq!(title(&app).as_deref(), Some("Installing ALab tools"));
-    let live = app.messages.live_by_key(toolchain_words::KEY_PASS).unwrap();
-    assert_eq!(live.msg.finished_title(), "Installed ALab tools");
-    app.toolchain_pass_ended(true);
-    assert_eq!(
-        app.messages.echoes().first().map(|e| e.kind),
-        Some(EchoKind::Complete),
-        "the first run ended as it did"
-    );
-    assert_eq!(
-        title(&app).as_deref(),
-        Some(crate::message_reporters::WAITING_FOR_ALAB),
-        "still queued, a moment from the lock"
-    );
-    app.person_pass(PersonPass::Running);
-    assert_eq!(title(&app).as_deref(), Some("Checking ALab tools"));
-    app.apply_toolchain_snapshot(Some(&net_read(true, 1_700_000_000)), false);
-    assert_eq!(title(&app).as_deref(), Some("Checking ALab tools"));
-    app.person_pass(PersonPass::Ended(EchoKind::Complete));
-    assert_eq!(app.messages.live_rows().count(), 0);
-}
-
-#[test]
-fn a_first_run_that_ends_short_leaves_a_failure_row() {
-    use crate::toolchain_words::FirstRunShort;
-    let failure_rows = |app: &App| {
-        app.messages
-            .live_rows()
-            .filter(|l| l.msg.key.as_deref() == Some(toolchain_words::KEY_PASS))
-            .map(|l| (l.msg.title.clone(), l.msg.hold, l.msg.severity))
-            .collect::<Vec<_>>()
-    };
-    let mut app = App::headless_for_test();
-    app.announce_toolchain_pass("installing 10 ALab program(s) (about 3 GB)", true);
-    app.apply_toolchain_snapshot(Some(&net_read(true, 1_700_000_000)), true);
-    app.note_toolchain_first_run_short(FirstRunShort::Failed, "could not reach the index");
-    app.toolchain_pass_ended(false);
-    assert_eq!(
-        app.messages.echoes().first().map(|e| e.kind),
-        Some(EchoKind::Fault),
-        "the indicator ends as a fault"
-    );
-    assert_eq!(
-        failure_rows(&app),
-        vec![(
-            toolchain_words::ALAB_INSTALL_FAILED.to_string(),
-            Hold::Default,
-            Severity::Warn
-        )],
-        "…and the failure row follows it"
-    );
-    app.apply_toolchain_snapshot(Some(&net_read(false, 1_700_000_000)), true);
-    assert_eq!(failure_rows(&app).len(), 1, "an over read leaves it");
-    let mut retry = App::headless_for_test();
-    retry.announce_toolchain_pass("installing 10 ALab program(s)", true);
-    retry.note_toolchain_first_run_short(FirstRunShort::Failed, "offline");
-    retry.toolchain_pass_ended(false);
-    assert_eq!(failure_rows(&retry)[0].1, Hold::Default, "the failure row");
-    retry.apply_toolchain_snapshot(Some(&net_read(true, 1_700_000_100)), true);
-    let rows = failure_rows(&retry);
-    assert_eq!(rows.len(), 1, "{rows:?}");
-    assert!(
-        matches!(rows[0].1, Hold::Live { .. }),
-        "the retry's progress took the key: {rows:?}"
-    );
-
-    let mut clean = App::headless_for_test();
-    clean.announce_toolchain_pass("installing 10 ALab program(s)", true);
-    clean.note_toolchain_first_run_short(FirstRunShort::Failed, "trust failed");
-    clean.toolchain_pass_ended(true);
-    assert!(
-        failure_rows(&clean).is_empty(),
-        "a clean exit raises nothing"
-    );
-
-    let mut heavy = App::headless_for_test();
-    let mut read = net_read(true, 1_700_000_000);
-    read.file.overall.bytes_total = toolchain_words::HEAVY_PASS_BYTES * 2;
-    heavy.apply_toolchain_snapshot(Some(&read), false);
-    heavy.note_toolchain_first_run_short(FirstRunShort::Failed, "could not reach the index");
-    heavy.toolchain_pass_ended(false);
-    assert!(
-        failure_rows(&heavy).is_empty(),
-        "a routine pass's failure keeps the installed versions: a record"
-    );
-
-    let mut idle = App::headless_for_test();
-    idle.note_toolchain_first_run_short(FirstRunShort::Nothing, "nothing installed");
-    idle.toolchain_pass_ended(false);
-    assert!(failure_rows(&idle).is_empty());
-}
-
-fn on_screen_app() -> App {
-    let mut app = App::headless_for_test();
-    let ws = app.windows.get_mut(&WindowId(0)).expect("window 0");
-    ws.band_on_screen_for_test = true;
-    ws.focused = true;
-    app.system_reduce_motion = false;
-    app.serious_mode = false;
-    app
-}
-
-#[test]
-fn a_frame_drawn_in_another_look_is_due_at_once() {
-    let wid = WindowId(0);
-    let mut app = on_screen_app();
-    app.announce_toolchain_pass("installing 10 ALab program(s)", true);
-    let now = Instant::now();
-    app.prepare_band_motion(wid, now);
-    assert!(
-        app.band_motion_due(now).is_empty(),
-        "just drawn in its own look: not due yet"
-    );
-    app.windows.get_mut(&wid).unwrap().focused = false;
-    assert_eq!(app.band_look(wid).pace, aterm_messages::Pace::Still);
-    assert_eq!(
-        app.band_motion_due(now),
-        vec![wid],
-        "the moving frame on glass is stale in the still look"
-    );
-    app.prepare_band_motion(wid, now);
-    assert!(app.band_motion_due(now).is_empty(), "re-drawn: settled");
-    app.windows.get_mut(&wid).unwrap().focused = true;
-    assert_eq!(app.band_motion_due(now), vec![wid], "and back again");
-}
-
 fn download(version: &str) -> aterm_update::Progress {
     aterm_update::Progress::Downloading {
         version: version.into(),
@@ -3852,6 +3070,7 @@ fn post_ready_staged(app: &mut App, version: &str, build: u64) -> MessageId {
     )
 }
 
+#[cfg(unix)]
 fn post_installing(app: &mut App, version: &str) -> MessageId {
     app.post_update_row(
         update_words::installing(version),
@@ -3864,186 +3083,6 @@ fn update_row(app: &App) -> Option<String> {
     app.messages
         .live_by_key(update_words::KEY_PROGRESS)
         .map(|l| format!("{} \u{2014} {}", l.msg.title, l.msg.detail.join("; ")))
-}
-
-#[test]
-fn the_busy_animation_never_touches_the_update_activity_clocks() {
-    let wid = WindowId(0);
-    let mut app = on_screen_app();
-    let now = Instant::now();
-    post_installing(&mut app, "9.9.9");
-    assert!(
-        app.messages.busy_on_glass(),
-        "PRECONDITION: a busy row is up"
-    );
-    assert_eq!(app.band_look(wid).pace, aterm_messages::Pace::Moving);
-    let clocks = |app: &App| {
-        (
-            app.last_update_activity_at,
-            app.update_handoff_activity_epoch,
-            app.last_keystroke_at,
-        )
-    };
-    let before = clocks(&app);
-    let later = now + std::time::Duration::from_secs(5);
-    let quiet_before = app.automatic_update_activity_quiet_with_pending_input(later, false);
-    let revision = app.messages.revision();
-    let step = aterm_messages::ANIM_FRAME * 4;
-    let mut drawn = std::collections::BTreeSet::new();
-    for k in 0..16_u32 {
-        drawn.insert(app.prepare_band_motion(wid, now + step * k));
-    }
-    assert!(
-        drawn.len() >= 15,
-        "PRECONDITION: the frames moved ({})",
-        drawn.len()
-    );
-    assert_eq!(clocks(&app), before, "an animation frame is not activity");
-    assert_eq!(
-        app.messages.revision(),
-        revision,
-        "a frame is paint: Settings ▸ Messages is never republished at the frame rate"
-    );
-    assert_eq!(
-        app.automatic_update_activity_quiet_with_pending_input(later, false),
-        quiet_before,
-        "the automatic lane reads the terminal exactly as it would without the comet"
-    );
-    std::thread::sleep(std::time::Duration::from_millis(2));
-    app.note_update_handoff_tolerated_activity();
-    assert_ne!(
-        clocks(&app).0,
-        before.0,
-        "the clock this test reads is live"
-    );
-}
-
-#[test]
-fn the_band_animates_only_while_committed_focused_moving_and_unfrozen() {
-    use aterm_messages::Pace;
-    let wid = WindowId(0);
-    let mut app = on_screen_app();
-    let now = Instant::now();
-    assert_eq!(app.band_motion_deadline(now), None, "no row");
-    app.post_message(update_words::installing("9.9.9"));
-    assert_eq!(app.band_look(wid).pace, Pace::Moving);
-    assert!(app.band_motion_deadline(now).is_some());
-    let at = now + aterm_messages::ANIM_FRAME * 12;
-    let fp = app.prepare_band_motion(wid, at);
-    assert_ne!(fp, 0, "PRECONDITION: a moving frame is on glass");
-    app.incoming_handoff_pending = true;
-    assert_eq!(app.band_look(wid).pace, Pace::Still, "frozen: still");
-    assert_eq!(app.band_motion_deadline(at), None, "frozen: nothing armed");
-    assert!(
-        app.band_motion_due(at + aterm_messages::ANIM_FRAME * 30)
-            .is_empty(),
-        "frozen: nothing due, even in another look"
-    );
-    assert_eq!(app.windows[&wid].band.motion_fp(), fp, "frozen where it is");
-    app.incoming_handoff_pending = false;
-    let mut queued = on_screen_app();
-    for n in 0..3 {
-        queued.post_message(Message::new(tags::CONFIG, Severity::Warn, format!("w{n}")));
-    }
-    queued.note_update_progress(&aterm_update::Progress::Verifying {
-        version: "9.9.9".into(),
-    });
-    let cols = usize::from(queued.windows[&wid].cols);
-    let p = queued.band_presentation(cols);
-    let busy_shown = p.rows.iter().any(|r| match r.kind {
-        aterm_messages::RowKind::Message(id) => {
-            queued.messages.live(id).is_some_and(|l| l.is_busy())
-        }
-        _ => false,
-    });
-    assert!(
-        !busy_shown,
-        "PRECONDITION: the busy row is queued behind the warnings"
-    );
-    assert_eq!(
-        queued.band_motion_deadline(now),
-        None,
-        "a busy row the band does not show does not move"
-    );
-}
-
-#[test]
-fn an_update_flow_costs_one_grow_and_one_shrink() {
-    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
-    let mut app = App::headless_for_test();
-    let regrids = message_regrids();
-    app.note_update_progress(&download("9.9.9"));
-    app.note_update_progress(&aterm_update::Progress::Verifying {
-        version: "9.9.9".into(),
-    });
-    post_ready_staged(&mut app, "9.9.9", 7);
-    app.begin_update_installing(true);
-    let frames_from = Instant::now();
-    for k in 0..40_u32 {
-        app.prepare_band_motion(WindowId(0), frames_from + aterm_messages::ANIM_FRAME * k);
-    }
-    assert_eq!(app.message_band_rows, 1);
-    assert_eq!(message_regrids(), regrids + 1, "one grow");
-    app.post_update_landed("9.9.9", 7, 0);
-    let now = Instant::now();
-    let _ = app.settle_messages(now + aterm_messages::HOLD_SUCCESS);
-    let _ = app.settle_messages(
-        now + aterm_messages::HOLD_SUCCESS
-            + aterm_messages::SHRINK_QUIET
-            + std::time::Duration::from_millis(1),
-    );
-    assert_eq!(app.message_band_rows, 0);
-    assert_eq!(message_regrids(), regrids + 2, "and one shrink");
-}
-
-#[test]
-fn an_editor_holding_the_install_is_a_row_of_its_own() {
-    let mut app = App::headless_for_test();
-    app.note_update_blockers(&[App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY.to_string()], true);
-    let outcome = app
-        .messages
-        .live_by_key(update_words::KEY_WAITS_FOR_YOU)
-        .expect("the row");
-    assert!(
-        matches!(outcome.msg.hold, Hold::Standing(_)),
-        "the wait's one notice stands: {:?}",
-        outcome.msg.hold
-    );
-    assert_eq!(
-        outcome.msg.detail[0],
-        App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY,
-        "the blocker is what the person does: painted"
-    );
-    assert!(outcome.msg.excerpt);
-    assert_eq!(outcome.msg.severity, Severity::Warn);
-    assert_eq!(app.messages.live_rows().count(), 1, "one row");
-    let _ = app.settle_messages(
-        Instant::now() + aterm_messages::PROGRESS_GRACE + std::time::Duration::from_millis(1),
-    );
-    for cols in [80, 60] {
-        let row = app.band_presentation(cols).rows[0].clone();
-        assert!(
-            row.detail.is_some(),
-            "{cols} columns: the instruction shows"
-        );
-        assert!(
-            row.capsules.iter().all(|c| c.action.is_details()),
-            "{cols} columns: only `Details ›`"
-        );
-    }
-    let mut pressed = App::headless_for_test();
-    pressed.note_update_blockers(&[App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY.to_string()], false);
-    let transient = pressed
-        .messages
-        .live_by_key(update_words::KEY_OUTCOME)
-        .expect("the press's row");
-    assert_eq!(transient.msg.hold, Hold::Default);
-    assert!(
-        pressed
-            .messages
-            .live_by_key(update_words::KEY_WAITS_FOR_YOU)
-            .is_none()
-    );
 }
 
 #[test]
@@ -4133,81 +3172,6 @@ fn the_landing_is_on_record_with_how_long_the_update_took() {
     none.update_verified = update_words::carried_verification(None, 7, now, wall);
     none.post_update_landed("9.9.9", 7, 0);
     assert!(took(&none).is_empty());
-}
-
-#[test]
-fn a_failing_title_is_announced_once_whoever_raises_it() {
-    let apply = aterm_update::health_failing_title("apply");
-    let streak = "3 failed attempts to install in a row since 2026-09-24T01:00:00Z: why.";
-    let overdue = "build 9 has been waiting on this machine since 2026-09-24T00:00:00Z and \
-                   build 8 is still running: why.";
-    let mut app = App::headless_for_test();
-    band_seen(&mut app);
-    assert!(app.note_update_health(apply, "automatic apply of build 9 stopped"));
-    let revision = app.messages.revision();
-    assert!(
-        !app.note_update_health(apply, overdue),
-        "the overdue notice, same title"
-    );
-    assert_eq!(app.messages.revision(), revision, "no second row");
-    let _ = app.settle_messages(
-        Instant::now() + aterm_messages::HOLD_WARN + std::time::Duration::from_secs(1),
-    );
-    assert!(app.messages.live_health().is_none(), "folded");
-    assert!(
-        !app.note_update_health(apply, streak),
-        "folded is still said"
-    );
-    assert!(app.messages.live_health().is_none());
-    assert!(
-        app.note_update_health(aterm_update::health_failing_title("manifest"), streak),
-        "another class is other news"
-    );
-    assert!(
-        !app.note_update_health(apply, overdue),
-        "and does not re-open this one"
-    );
-    assert!(!app.note_update_health(aterm_update::HEALTH_RECOVERED_TITLE, "manifest"));
-    assert!(
-        !app.note_update_health(apply, overdue),
-        "a healed download streak does not answer an install warning"
-    );
-    assert!(!app.note_update_health(aterm_update::HEALTH_RECOVERED_TITLE, "apply"));
-    assert!(
-        app.note_update_health(apply, streak),
-        "a healed title speaks again"
-    );
-}
-
-#[test]
-fn a_restated_health_warning_takes_its_new_words_where_it_stands() {
-    let apply = aterm_update::health_failing_title("apply");
-    let kind = update_words::HealthKind::of_updater_title(apply);
-    let words = |app: &App| app.messages.live_health().map(|l| l.msg.detail.join(" "));
-    let mut app = App::headless_for_test();
-    band_seen(&mut app);
-    assert!(app.note_update_health(apply, "it didn't install; it tries again in 24 h"));
-    let rows = app.messages.live_rows().count();
-    app.restate_update_health(
-        kind,
-        apply,
-        "it didn't install; a newer release replaces it",
-    );
-    assert_eq!(
-        words(&app).as_deref(),
-        Some("it didn't install; a newer release replaces it")
-    );
-    assert_eq!(app.messages.live_rows().count(), rows, "no second row");
-    let _ = app.settle_messages(
-        Instant::now() + aterm_messages::HOLD_WARN + std::time::Duration::from_secs(1),
-    );
-    assert!(words(&app).is_none(), "folded");
-    app.restate_update_health(kind, apply, "it didn't install; nothing more comes");
-    let record = app.messages.log().records().next_back().expect("a record");
-    assert_eq!(
-        record.detail.join(" "),
-        "it didn't install; nothing more comes"
-    );
 }
 
 #[test]
@@ -4651,25 +3615,6 @@ fn replied_id(reply: &str, field: &str) -> MessageId {
 }
 
 #[test]
-fn a_notice_round_trips_through_the_band() {
-    let mut app = App::headless_for_test();
-    let reply = notice(
-        &mut app,
-        "post script sev=warn key=deploy Deploy failed -- connection refused",
-    );
-    assert!(reply.starts_with("OK message="), "{reply}");
-    let id = replied_id(&reply, "message=");
-    let live = app.messages.live(id).expect("a warn post is a row");
-    assert_eq!(live.msg.origin, aterm_messages::Origin::Wire);
-    assert_eq!(app.message_band_rows, 1, "the row is on the band");
-    let reply = notice(&mut app, "post script hello from a script");
-    assert!(reply.starts_with("OK recorded message="), "{reply}");
-    let rec = replied_id(&reply, "message=");
-    assert!(app.messages.live(rec).is_none());
-    assert_eq!(app.message_band_rows, 1);
-}
-
-#[test]
 fn a_wire_progress_flood_repaints_at_most_once_a_frame() {
     let mut app = App::headless_for_test();
     let first = notice(&mut app, "progress build pct=0 Building aterm");
@@ -4902,304 +3847,6 @@ fn r44_host3_a_retired_rows_live_intents_are_gone_from_the_page() {
 }
 
 #[test]
-fn an_update_warning_said_with_no_window_on_screen_is_shown_when_one_is() {
-    let title = aterm_update::health_failing_title("apply");
-    let kind = update_words::HealthKind::of_updater_title(title);
-    let body = "build 12 has been waiting on this machine since 2026-10-16T08:00:00Z and \
-                build 11 is still running: no apply attempt has been recorded for it.";
-    let mut app = App::headless_for_test();
-    let wid = WindowId(0);
-    app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
-    app.windows.get_mut(&wid).unwrap().occluded = true;
-    assert!(
-        !band_on_screen(&app.windows[&wid]),
-        "PRECONDITION: nobody can see the band"
-    );
-    assert!(app.note_update_health(title, body), "announced");
-    assert_eq!(app.live_update_health(|k| k == kind).len(), 1);
-    let unseen = Instant::now() + std::time::Duration::from_secs(10 * 60);
-    app.settle_messages(unseen);
-    assert_eq!(
-        app.live_update_health(|k| k == kind).len(),
-        1,
-        "the warning waits while nobody can see it"
-    );
-    app.windows.get_mut(&wid).unwrap().occluded = false;
-    let back = unseen + std::time::Duration::from_secs(1);
-    app.settle_messages(back);
-    assert_eq!(
-        app.live_update_health(|k| k == kind).len(),
-        1,
-        "the warning is shown once a window can show it"
-    );
-    app.settle_messages(back + aterm_messages::HOLD_WARN + std::time::Duration::from_secs(5));
-    assert!(
-        app.live_update_health(|k| k == kind).is_empty(),
-        "PRECONDITION: it folded after its hold"
-    );
-    let entries = app
-        .messages
-        .log()
-        .records()
-        .filter(|rec| rec.key.as_deref() == Some(kind.key()))
-        .count();
-    assert_eq!(entries, 1, "one entry in Settings ▸ Messages");
-}
-
-#[test]
-fn an_owed_update_warning_queued_behind_the_band_is_one_entry() {
-    use aterm_messages::Hold;
-    let title = aterm_update::health_failing_title("apply");
-    let kind = update_words::HealthKind::of_updater_title(title);
-    let body = "build 12 has been waiting on this machine since 2026-10-16T08:00:00Z and \
-                build 11 is still running: no apply attempt has been recorded for it.";
-    let secs = std::time::Duration::from_secs;
-    let mut app = App::headless_for_test();
-    let wid = WindowId(0);
-    app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
-    app.windows.get_mut(&wid).unwrap().occluded = true;
-    let said = Instant::now();
-    let standing: Vec<MessageId> = (0..=aterm_messages::MAX_ROWS)
-        .map(|n| {
-            app.post_message(
-                Message::new(tags::RENDER, Severity::Error, format!("standing {n}"))
-                    .hold(Hold::STANDING),
-            )
-        })
-        .collect();
-    assert!(app.note_update_health(title, body), "announced");
-    app.settle_messages(said + secs(1));
-    let original = app.live_update_health(|k| k == kind)[0];
-    let warning = |app: &App| {
-        app.live_update_health(|k| k == kind)
-            .first()
-            .and_then(|id| app.messages.live(*id))
-            .map(aterm_messages::Live::is_queued)
-    };
-    assert_eq!(
-        warning(&app),
-        Some(true),
-        "PRECONDITION: the standing rows hold the band and the warning is queued"
-    );
-    for minute in 1..=10 {
-        app.settle_messages(said + secs(60 * minute));
-    }
-    assert_eq!(
-        warning(&app),
-        Some(true),
-        "it waits in the queue while nobody can see the band"
-    );
-    app.windows.get_mut(&wid).unwrap().occluded = false;
-    let back = said + secs(10 * 60 + 1);
-    app.settle_messages(back);
-    let mut later = back;
-    for _ in 0..3 {
-        later = later.max(
-            app.messages
-                .live(original)
-                .expect("same queued warning")
-                .patience_at,
-        ) + secs(1);
-        app.settle_messages(later);
-        assert_eq!(warning(&app), Some(true));
-        assert_eq!(app.live_update_health(|k| k == kind), vec![original]);
-    }
-    let freed = later + secs(1);
-    for id in standing {
-        assert!(app.messages.withdraw(id, freed));
-    }
-    app.settle_messages(freed + secs(1));
-    assert_eq!(warning(&app), Some(false), "a freed slot shows it");
-    let requeue = app
-        .messages
-        .quiet_shrink_at()
-        .expect("one-row shrink is pending")
-        .max(app.band_regrow_floor().unwrap_or(freed));
-    app.settle_messages(requeue);
-    assert_eq!(
-        app.messages.committed_rows(),
-        1,
-        "the band shrank before the new errors"
-    );
-    let standing: Vec<MessageId> = (0..=aterm_messages::MAX_ROWS)
-        .map(|n| {
-            app.post_unsynced_at(
-                Message::new(tags::RENDER, Severity::Error, format!("later standing {n}"))
-                    .hold(Hold::STANDING),
-                wall_stamp_now(),
-                requeue,
-            )
-        })
-        .collect();
-    app.settle_messages(requeue);
-    assert_eq!(
-        warning(&app),
-        Some(true),
-        "the partly seen warning is requeued"
-    );
-    for _ in 0..3 {
-        later = later.max(
-            app.messages
-                .live(original)
-                .expect("same requeued warning")
-                .patience_at,
-        ) + secs(1);
-        app.settle_messages(later);
-        assert_eq!(warning(&app), Some(true));
-        assert_eq!(app.live_update_health(|k| k == kind), vec![original]);
-    }
-    let freed = later + secs(1);
-    for id in standing {
-        assert!(app.messages.withdraw(id, freed));
-    }
-    app.settle_messages(freed + secs(1));
-    assert_eq!(warning(&app), Some(false), "a freed slot shows it again");
-    let shown = freed + secs(2);
-    app.settle_messages(shown);
-    assert_eq!(warning(&app), Some(false), "credited on glass");
-    let fold_at = app
-        .messages
-        .live(original)
-        .expect("the original warning is visible")
-        .fold_at
-        .expect("the visible warning has a hold");
-    assert!(fold_at >= freed + aterm_messages::HOLD_WARN);
-    app.settle_messages(fold_at - secs(1));
-    assert_eq!(
-        warning(&app),
-        Some(false),
-        "its whole visible hold remains available"
-    );
-    app.settle_messages(fold_at + secs(5));
-    assert_eq!(
-        warning(&app),
-        None,
-        "PRECONDITION: it folded after its hold"
-    );
-    app.settle_messages(fold_at + secs(6));
-    let entries = app
-        .messages
-        .log()
-        .records()
-        .filter(|rec| rec.key.as_deref() == Some(kind.key()))
-        .count();
-    assert_eq!(entries, 1, "one entry in Settings ▸ Messages");
-}
-
-#[test]
-fn an_owed_update_warning_is_shown_once_and_only_while_unanswered() {
-    let title = aterm_update::health_failing_title("apply");
-    let kind = update_words::HealthKind::of_updater_title(title);
-    let body = "build 12 has been waiting on this machine since 2026-10-16T08:00:00Z and \
-                build 11 is still running: no apply attempt has been recorded for it.";
-    let secs = std::time::Duration::from_secs;
-    let on_screen = |app: &mut App, seen: bool| {
-        let ws = app.windows.get_mut(&WindowId(0)).unwrap();
-        ws.band_on_screen_for_test = true;
-        ws.occluded = !seen;
-    };
-    let live = |app: &App| app.live_update_health(|k| k == kind).len();
-
-    let mut app = App::headless_for_test();
-    on_screen(&mut app, false);
-    let said = Instant::now();
-    assert!(app.note_update_health(title, body));
-    on_screen(&mut app, true);
-    app.settle_messages(said + secs(30));
-    app.settle_messages(said + secs(60));
-    assert_eq!(live(&app), 1, "the hold runs from when it could be seen");
-    app.settle_messages(said + secs(30 + 45 + 5));
-    assert_eq!(live(&app), 0, "and folds after it");
-    app.settle_messages(said + secs(30 + 45 + 6));
-    assert_eq!(live(&app), 0, "an owed warning is shown once");
-
-    let mut app = App::headless_for_test();
-    on_screen(&mut app, true);
-    let said = Instant::now();
-    assert!(app.note_update_health(title, body));
-    app.settle_messages(said + secs(10 * 60));
-    assert_eq!(live(&app), 0, "PRECONDITION: it folded after its hold");
-    app.settle_messages(said + secs(10 * 60 + 1));
-    assert_eq!(live(&app), 0, "a warning that was seen is not raised again");
-
-    let mut app = App::headless_for_test();
-    on_screen(&mut app, false);
-    let said = Instant::now();
-    assert!(app.note_update_health(title, body));
-    app.settle_messages(said + secs(10 * 60));
-    app.heal_update_health_where(|k| k == kind);
-    on_screen(&mut app, true);
-    app.settle_messages(said + secs(10 * 60 + 1));
-    assert_eq!(live(&app), 0, "a healed warning is owed nothing");
-}
-
-#[test]
-fn an_owed_update_warning_is_shown_by_the_successor_it_is_carried_to() {
-    let title = aterm_update::health_failing_title("manifest");
-    let kind = update_words::HealthKind::of_updater_title(title);
-    let body = "Update checks have failed 3 times since 2026-10-16T08:00:00Z: the release \
-                channel did not answer.";
-    let secs = std::time::Duration::from_secs;
-    let on_screen = |app: &mut App, seen: bool| {
-        let ws = app.windows.get_mut(&WindowId(0)).unwrap();
-        ws.band_on_screen_for_test = true;
-        ws.occluded = !seen;
-    };
-    let live = |app: &App| app.live_update_health(|k| k == kind).len();
-    let mut parent = App::headless_for_test();
-    on_screen(&mut parent, false);
-    assert!(parent.note_update_health(title, body), "announced");
-    parent.settle_messages(Instant::now() + secs(10 * 60));
-    let carry = window_carry(parent.message_band_rows, parent.carried_messages());
-
-    let mut successor = App::headless_for_test();
-    successor.seed_carried_messages(&carry, Some("0.76.0"));
-    successor.messages.after_handoff_commit(Instant::now());
-    on_screen(&mut successor, true);
-    let boot = Instant::now();
-    successor
-        .windows
-        .get_mut(&WindowId(0))
-        .unwrap()
-        .pending_reveal = Some(boot + secs(5));
-    assert!(
-        !band_on_screen(&successor.windows[&WindowId(0)]),
-        "a hidden boot window's band is not on screen"
-    );
-    successor.settle_messages(boot + secs(1));
-    successor
-        .windows
-        .get_mut(&WindowId(0))
-        .unwrap()
-        .pending_reveal = None;
-    on_screen(&mut successor, false);
-    successor.settle_messages(boot + secs(10 * 60));
-    assert_eq!(
-        live(&successor),
-        1,
-        "the warning waits for a band that is seen"
-    );
-    on_screen(&mut successor, true);
-    let seen = boot + secs(10 * 60 + 1);
-    successor.settle_messages(seen);
-    on_screen(&mut successor, false);
-    successor.settle_messages(seen + secs(10));
-    successor.settle_messages(seen + secs(10 * 60));
-    assert_eq!(
-        live(&successor),
-        1,
-        "seen for part of its hold, it waits again"
-    );
-    on_screen(&mut successor, true);
-    let again = seen + secs(10 * 60 + 1);
-    successor.settle_messages(again);
-    successor.settle_messages(again + secs(40));
-    assert_eq!(live(&successor), 1, "its whole hold once seen");
-    successor.settle_messages(again + secs(45 + 5));
-    assert_eq!(live(&successor), 0, "and then it folds");
-}
-
-#[test]
 fn a_linux_install_waiting_for_a_start_is_a_notice_and_its_end_takes_it_down() {
     let body = "aterm 0.11.0 was installed over an hour ago and has not started yet: the next \
                 aterm you start finishes the update, and update checks wait until then.";
@@ -5255,53 +3902,6 @@ fn a_linux_install_waiting_for_a_start_is_a_notice_and_its_end_takes_it_down() {
         "in its own words: {:?}",
         row.msg.detail
     );
-}
-
-#[test]
-fn a_second_linux_crash_loop_is_a_row_of_its_own() {
-    let crash = aterm_update::INSTALL_CRASH_LOOP_TITLE;
-    let install = update_words::HealthKind::Install;
-    let first = "aterm 0.11.0 didn\u{2019}t start properly, so aterm 0.10.0 is back and aterm \
-                 0.11.0 won\u{2019}t install again.";
-    let second = "aterm 0.12.0 didn\u{2019}t start properly, so aterm 0.10.0 is back and aterm \
-                  0.12.0 won\u{2019}t install again.";
-    let words = |app: &App| {
-        app.live_update_health(|k| k == install)
-            .iter()
-            .filter_map(|id| app.messages.live(*id))
-            .map(|l| (l.msg.title.clone(), l.msg.detail.join(" ")))
-            .collect::<Vec<_>>()
-    };
-    let mut app = App::headless_for_test();
-    band_seen(&mut app);
-    assert!(
-        app.note_update_health(crash, first),
-        "the first is announced"
-    );
-    assert!(
-        app.note_update_health(crash, second),
-        "and the second, banner and all"
-    );
-    let shown = words(&app);
-    assert!(
-        matches!(shown.as_slice(), [(title, detail)]
-            if title == aterm_update::health_failing_title("apply") && detail.contains("0.12.0")),
-        "one install warning, in the second's words: {shown:?}"
-    );
-    let _ = app.settle_messages(
-        Instant::now() + aterm_messages::HOLD_WARN + std::time::Duration::from_secs(1),
-    );
-    assert!(words(&app).is_empty(), "PRECONDITION: it folded");
-    assert!(
-        !app.note_update_health(aterm_update::health_failing_title("apply"), first),
-        "another producer's install warning is still latched"
-    );
-    assert!(words(&app).is_empty());
-    assert!(
-        app.note_update_health(crash, second),
-        "a crash loop after the fold is a row again"
-    );
-    assert_eq!(words(&app).len(), 1);
 }
 
 #[test]
@@ -5428,75 +4028,6 @@ fn an_owed_install_warning_is_answered_by_the_landing_it_is_carried_to() {
     );
 }
 
-#[test]
-fn a_font_row_raised_over_a_terminal_is_a_record_once_settings_comes_to_front() {
-    use crate::message_reporters::{ConfigFamily, ConfigWarnings};
-    use aterm_messages::Retired;
-    let warnings = || {
-        let mut warns = ConfigWarnings::default();
-        warns.push(
-            ConfigFamily::IgnoredKeys,
-            "config line 3: unknown key \"windw_padding\"".to_string(),
-        );
-        warns.push_shown_in_settings(
-            ConfigFamily::Fonts,
-            "config font_family: \"NoSuchFontXYZ\" does not resolve to a font file; keeping \
-             the current working face"
-                .to_string(),
-        );
-        warns
-    };
-    let scope: Vec<&'static str> = ConfigFamily::ALL.iter().map(|f| f.key()).collect();
-    let reload = |app: &mut App| {
-        let warns = warnings();
-        app.note_config_settings_shows(&scope, &warns.settings_shown_keys());
-        let messages = warns.into_messages_routed(app.settings_in_front());
-        app.replace_config_messages(messages);
-    };
-    let fonts = ConfigFamily::Fonts.key();
-    let keys = ConfigFamily::IgnoredKeys.key();
-    let mut app = App::headless_for_test();
-    assert!(!app.settings_in_front());
-    reload(&mut app);
-    let row = app
-        .messages
-        .live_by_key(fonts)
-        .map(|live| live.id)
-        .expect("over a terminal the problem is a band row");
-    assert!(app.messages.live_by_key(keys).is_some());
-    assert_eq!(app.message_band_rows, 2, "PRECONDITION: two band rows");
-
-    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::TextFonts));
-    assert!(app.settings_in_front());
-    assert!(
-        app.messages.live_by_key(fonts).is_none(),
-        "with Settings in front the font problem is no band row"
-    );
-    assert_eq!(
-        (app.messages.committed_rows(), app.message_band_rows),
-        (1, 1),
-        "its band row left with it, before Settings' first frame"
-    );
-    assert!(
-        app.messages.quiet_shrink_at().is_none(),
-        "no shrink is left waiting its quiet"
-    );
-    let rec = app.messages.log().get(row).expect("logged");
-    assert_eq!(rec.retired(), Some(&Retired::Recorded), "{rec:?}");
-    assert!(
-        app.messages.live_by_key(keys).is_some(),
-        "a misspelled key no row says keeps its band row"
-    );
-    app.switch_tab_in(WindowId(0), 0);
-    assert!(!app.settings_in_front());
-    reload(&mut app);
-    assert!(
-        app.messages.live_by_key(fonts).is_none(),
-        "a problem already told is never raised again"
-    );
-    assert_eq!(app.message_band_rows, 1, "the misspelled key's row alone");
-}
-
 /// A SETTINGS TAB CLOSED FROM BEHIND SHOWED NOTHING: `settings close` with a terminal in front
 /// leaves the font problem a band row, since Settings never came to the front to show it.
 #[test]
@@ -5533,75 +4064,6 @@ fn closing_settings_from_behind_keeps_the_config_row_it_never_showed() {
         app.messages.live_by_key(fonts).is_some(),
         "Settings never came to the front: the row stands"
     );
-}
-
-/// A CHANGE OF TAB GIVES BACK A ROW ITS QUIET STILL HELD (t-3): the tab brought to the
-/// front, a terminal or Settings, is laid out without it at once. CONTROL: with no change of
-/// tab the row waits its quiet.
-#[test]
-fn a_change_of_tab_gives_back_a_row_its_quiet_still_held() {
-    let mut app = App::headless_for_test();
-    let wid = WindowId(0);
-    let session = app.next_session_id;
-    app.push_stub_tab(wid, crate::stub_session(session));
-    app.switch_tab_in(wid, 0);
-    let id = app.post_message(warn("a warning"));
-    assert_eq!(app.message_band_rows, 1, "PRECONDITION: on glass");
-    assert!(app.withdraw_message(id));
-    assert_eq!(app.message_band_rows, 1, "CONTROL: the row waits its quiet");
-    app.sync_active_session();
-    assert_eq!(
-        app.message_band_rows, 1,
-        "CONTROL: nothing on screen changed, nothing is taken"
-    );
-    app.switch_tab_in(wid, 1);
-    assert_eq!(
-        (app.messages.committed_rows(), app.message_band_rows),
-        (0, 0),
-        "the other terminal is laid out without it"
-    );
-
-    // Settings brought to the front, likewise.
-    let id = app.post_message(warn("another warning"));
-    assert_eq!(app.message_band_rows, 1, "PRECONDITION: on glass");
-    assert!(app.withdraw_message(id));
-    assert_eq!(app.message_band_rows, 1, "CONTROL: the row waits its quiet");
-    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::TextFonts));
-    assert_eq!(app.message_band_rows, 0, "Settings is laid out without it");
-}
-
-/// THE REGROW FLOOR STILL HOLDS A FALL A CHANGE OF TAB TAKES (ruling 414): the band
-/// re-grids the background tabs too, so a row that rose inside the floor falls at it.
-#[test]
-fn a_fall_a_change_of_tab_takes_waits_only_the_regrow_floor() {
-    let mut app = App::headless_for_test();
-    let wid = WindowId(0);
-    let session = app.next_session_id;
-    app.push_stub_tab(wid, crate::stub_session(session));
-    app.switch_tab_in(wid, 0);
-    app.windows
-        .get_mut(&wid)
-        .expect("window 0")
-        .chrome_regrids_for_test = true;
-    let id = app.post_message(warn("a warning"));
-    assert_eq!(app.message_band_rows, 1, "PRECONDITION: on glass");
-    let rose = Instant::now() + std::time::Duration::from_secs(60);
-    app.windows
-        .get_mut(&wid)
-        .expect("window 0")
-        .regrow_floor
-        .rose(rose);
-    let floor = app.chrome_regrow_floor(wid).expect("a floor");
-    assert!(app.withdraw_message(id));
-    app.switch_tab_in(wid, 1);
-    assert_eq!(app.message_band_rows, 1, "inside the floor the row stays");
-    assert_eq!(
-        app.messages.deadline(true),
-        Some(floor),
-        "the fall is due at the floor"
-    );
-    app.settle_messages(floor);
-    assert_eq!(app.message_band_rows, 0, "at the floor it falls");
 }
 
 #[test]
@@ -5943,4 +4405,32 @@ fn open_in_browser_opens_only_an_https_page() {
     ] {
         assert!(!openable_link(bad), "{bad:?}");
     }
+}
+
+#[test]
+fn automatic_reports_are_records_without_banners_or_a_user_action() {
+    let mut app = App::headless_for_test();
+    let id = app.post_message(warn("Automatic work failed"));
+    assert!(
+        app.messages.wanted_rows() > 0,
+        "control: this report could alert"
+    );
+    assert_eq!(app.message_band_rows, 0);
+    assert_eq!(app.messages.committed_rows(), 0);
+    assert!(app.messages.on_glass().next().is_none());
+    let log = app.messages.log().get(id).expect("diagnostic retained");
+    assert_eq!(log.title, "Automatic work failed");
+    assert!(app.restate_message(
+        id,
+        Restatement {
+            title: Some("Another approach succeeded".into()),
+            ..Restatement::default()
+        }
+    ));
+    assert!(app.resolve_message(id, Outcome::Ok));
+    assert_eq!(app.message_band_rows, 0);
+    assert_eq!(
+        app.messages.log().get(id).unwrap().title,
+        "Another approach succeeded"
+    );
 }

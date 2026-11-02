@@ -6,8 +6,9 @@
 //! [`check_credentials_perms`]).
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, Instant};
+
+use aterm_uds::spawnfd::{Command, Stdio, command};
 
 const CODESIGN: &str = aterm_uds::os_path!("codesign");
 const SPCTL: &str = aterm_uds::os_path!("spctl");
@@ -84,18 +85,18 @@ impl ReleaseCredentials {
             return Ok(None);
         };
         let key_path = Path::new(&home).join(atpkg_keys::provision::MACHINE_KEY_REL);
-        if !key_path.exists() {
-            return Ok(None);
+        let meta = match std::fs::symlink_metadata(&key_path) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("read {}: {error}", key_path.display())),
+        };
+        if !meta.file_type().is_file() {
+            return Err(format!(
+                "REFUSING {} — not a regular file",
+                key_path.display()
+            ));
         }
-        let meta = std::fs::metadata(&key_path)
-            .map_err(|error| format!("read {}: {error}", key_path.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt as _;
-            check_credentials_perms(meta.uid(), meta.mode(), current_uid()?, &key_path)?;
-        }
-        let pkcs8 = std::fs::read(&key_path)
-            .map_err(|error| format!("read {}: {error}", key_path.display()))?;
+        let pkcs8 = read_credentials_bytes(&key_path, 4 * 1024)?;
         let keypair = ring::signature::Ed25519KeyPair::from_pkcs8(&pkcs8).map_err(|_| {
             format!(
                 "{}: not a PKCS#8 Ed25519 key — re-mint with `atpkg-keys join --id <id>`",
@@ -122,14 +123,29 @@ impl ReleaseCredentials {
     /// Load and validate the profile at `path`, reading a `~/` `machine_roster` under `home`
     /// ([`roster_path`]).
     pub fn load(path: &Path, home: Option<&Path>) -> Result<Self, String> {
-        let meta =
-            std::fs::metadata(path).map_err(|error| format!("read {}: {error}", path.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt as _;
-            check_credentials_perms(meta.uid(), meta.mode(), current_uid()?, path)?;
-        }
-        let text = std::fs::read_to_string(path)
+        Self::load_with_identity(path, home, |home, profile| {
+            #[cfg(unix)]
+            {
+                let paths = aterm_secrets::client::Paths::for_home(home);
+                aterm_secrets::client::release::effective_signing_identity(&paths, profile)
+                    .ok()
+                    .flatten()
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (home, profile);
+                None
+            }
+        })
+    }
+
+    fn load_with_identity(
+        path: &Path,
+        home: Option<&Path>,
+        shared_identity: impl FnOnce(&Path, &Path) -> Option<String>,
+    ) -> Result<Self, String> {
+        let bytes = read_credentials_bytes(path, 64 * 1024)?;
+        let text = String::from_utf8(bytes)
             .map_err(|error| format!("read {}: {error}", path.display()))?;
         let encoded = credentials_signing_key(&text)?;
         let pkcs8 =
@@ -156,16 +172,9 @@ impl ReleaseCredentials {
         let identity_sha1 = credentials_value(&text, "signing_identity_sha1")
             .map_err(|e| format!("{}: {e}", path.display()))?
             .map(str::to_string);
-        #[cfg(unix)]
-        let identity_sha1 = if let Some(home) = home {
-            let paths = aterm_secrets::client::Paths::for_home(home);
-            aterm_secrets::client::release::effective_signing_identity(&paths, path)
-                .ok()
-                .flatten()
-                .or(identity_sha1)
-        } else {
-            identity_sha1
-        };
+        let identity_sha1 = home
+            .and_then(|home| shared_identity(home, path))
+            .or(identity_sha1);
         let machine_id = credentials_value(&text, "machine_id")
             .map_err(|e| format!("{}: {e}", path.display()))?
             .map(str::to_string);
@@ -332,20 +341,62 @@ pub fn check_credentials_perms(
     Ok(())
 }
 
+fn read_credentials_bytes(path: &Path, max: u64) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    let pre = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("read {}: {error}", path.display()))?;
+    if !pre.file_type().is_file() {
+        return Err(format!("REFUSING {} — not a regular file", path.display()));
+    }
+    let file = astream_sys::open_nonblocking(path, astream_sys::Links::Refuse)
+        .map_err(|error| format!("read {}: {error}", path.display()))?;
+    let meta = file
+        .metadata()
+        .map_err(|error| format!("read {}: {error}", path.display()))?;
+    if !meta.is_file() {
+        return Err(format!("REFUSING {} — not a regular file", path.display()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        check_credentials_perms(meta.uid(), meta.mode(), current_uid()?, path)?;
+    }
+    if meta.len() > max {
+        return Err(format!(
+            "read {}: credential file exceeds {max} bytes",
+            path.display()
+        ));
+    }
+    let cap = usize::try_from(meta.len().min(64 * 1024)).unwrap_or(0);
+    let mut bytes = Vec::with_capacity(cap);
+    file.take(max.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read {}: {error}", path.display()))?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max {
+        return Err(format!(
+            "read {}: credential file exceeds {max} bytes",
+            path.display()
+        ));
+    }
+    Ok(bytes)
+}
+
 /// Current uid via `id -u`; keeps the crate free of a libc dependency for one syscall.
 #[cfg(unix)]
 fn current_uid() -> Result<u32, String> {
-    let out = Command::new(ID_TOOL)
+    let out = command(ID_TOOL)
         .arg("-u")
         .output()
         .map_err(|e| format!("spawn id -u: {e}"))?;
     if !out.status.success() {
         return Err("id -u failed".into());
     }
-    String::from_utf8_lossy(&out.stdout)
-        .trim()
-        .parse()
-        .map_err(|e| format!("id -u parse: {e}"))
+    let text = String::from_utf8_lossy(&out.stdout);
+    let trimmed = text.trim();
+    if !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("id -u parse: invalid uid {trimmed:?}"));
+    }
+    trimmed.parse().map_err(|e| format!("id -u parse: {e}"))
 }
 
 /// The Developer-ID certificate this cut signs with, resolved from the anchor.
@@ -512,6 +563,21 @@ pub fn resolve_apple_tier(
     team_id: &str,
     credentials: Option<&ReleaseCredentials>,
 ) -> Result<AppleTier, String> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    resolve_apple_tier_with(
+        team_id,
+        credentials,
+        home.as_deref(),
+        &crate::dev_identity::Bounded,
+    )
+}
+
+fn resolve_apple_tier_with(
+    team_id: &str,
+    credentials: Option<&ReleaseCredentials>,
+    home: Option<&Path>,
+    run: &dyn crate::dev_identity::Run,
+) -> Result<AppleTier, String> {
     // Fail-closed: an empty anchor never reaches the signing machinery below.
     if team_id.is_empty() {
         return Ok(AppleTier::Inactive);
@@ -535,13 +601,7 @@ pub fn resolve_apple_tier(
             profile.display()
         )
     })?;
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let identity = locate_identity(
-        team_id,
-        credentials.signing_identity_sha1(),
-        home.as_deref(),
-        &crate::dev_identity::Bounded,
-    )?;
+    let identity = locate_identity(team_id, credentials.signing_identity_sha1(), home, run)?;
     Ok(AppleTier::Active {
         identity,
         auth: auth.clone().with_team_id(team_id),
@@ -610,7 +670,7 @@ pub fn sign_app(
                 id.common_name
             );
             run_checked(
-                Command::new(CODESIGN).args(app_sign_args(app, entitlements, id)),
+                command(CODESIGN).args(app_sign_args(app, entitlements, id)),
                 "codesign app",
             )?;
             id.provenance()
@@ -618,15 +678,13 @@ pub fn sign_app(
         None => {
             println!("==> codesign (ad-hoc): runs locally, not distributable to other Macs");
             run_checked(
-                Command::new(CODESIGN)
-                    .args(["--force", "--sign", "-"])
-                    .arg(app),
+                command(CODESIGN).args(["--force", "--sign", "-"]).arg(app),
                 "codesign app (ad-hoc)",
             )?;
             "ad-hoc".to_string()
         }
     };
-    if let Ok(out) = Command::new(CODESIGN)
+    if let Ok(out) = command(CODESIGN)
         .args(["--verify", "--verbose=2"])
         .arg(app)
         .output()
@@ -647,7 +705,7 @@ pub fn sign_dmg(dmg: &Path, sign_id: &DevIdIdentity) -> Result<(), String> {
     };
     println!("==> codesign dmg (Developer-ID): {}", sign_id.common_name);
     run_checked(
-        Command::new(CODESIGN).args(dmg_sign_args(dmg, sign_id)),
+        command(CODESIGN).args(dmg_sign_args(dmg, sign_id)),
         "codesign dmg",
     )
 }
@@ -854,18 +912,14 @@ pub(crate) fn designated_requirement(codesign_output: &str) -> Option<&str> {
 
 /// Run [`devid_preflight`] against an on-disk artifact.
 pub fn check_devid_signed(target: &Path) -> Result<(), String> {
-    let out = Command::new(CODESIGN)
+    let out = command(CODESIGN)
         .args(["-dv", "--verbose=2"])
         .arg(target)
         .output()
         .map_err(|e| format!("spawn codesign -dv: {e}"))?;
     let mut info = String::from_utf8_lossy(&out.stderr).to_string();
     info.push_str(&String::from_utf8_lossy(&out.stdout));
-    if let Ok(dr) = Command::new(CODESIGN)
-        .args(["-d", "-r-"])
-        .arg(target)
-        .output()
-    {
+    if let Ok(dr) = command(CODESIGN).args(["-d", "-r-"]).arg(target).output() {
         info.push_str(&String::from_utf8_lossy(&dr.stderr));
         info.push_str(&String::from_utf8_lossy(&dr.stdout));
     }
@@ -888,7 +942,7 @@ pub fn notarize(artifact: &Path, auth: &NotaryAuth) -> Result<(), String> {
                 zip.display()
             );
             run_checked(
-                Command::new(DITTO)
+                command(DITTO)
                     .args(["-c", "-k"])
                     .args(crate::dmg::ARCHIVE_NO_METADATA)
                     .arg("--keepParent")
@@ -908,7 +962,7 @@ pub fn notarize(artifact: &Path, auth: &NotaryAuth) -> Result<(), String> {
 
     println!("==> xcrun notarytool submit {} --wait", submit.display());
     let result = run_streamed(
-        Command::new(XCRUN)
+        command(XCRUN)
             .args(["notarytool", "submit"])
             .arg(&submit)
             .args(auth.args())
@@ -923,22 +977,18 @@ pub fn notarize(artifact: &Path, auth: &NotaryAuth) -> Result<(), String> {
 
     println!("==> xcrun stapler staple {}", artifact.display());
     run_streamed(
-        Command::new(XCRUN)
-            .args(["stapler", "staple"])
-            .arg(artifact),
+        command(XCRUN).args(["stapler", "staple"]).arg(artifact),
         "stapler staple",
         STAPLE_TIMEOUT,
     )?;
     run_streamed(
-        Command::new(XCRUN)
-            .args(["stapler", "validate"])
-            .arg(artifact),
+        command(XCRUN).args(["stapler", "validate"]).arg(artifact),
         "stapler validate",
         STAPLE_TIMEOUT,
     )?;
 
     println!("==> spctl assessment");
-    let mut spctl = Command::new(SPCTL);
+    let mut spctl = command(SPCTL);
     if ext == "dmg" {
         spctl.args([
             "-a",
@@ -1014,7 +1064,7 @@ fn tool_ok(argv: &[&str], target: &Path) -> Result<bool, String> {
     let (program, args) = argv
         .split_first()
         .ok_or_else(|| "tool_ok called with an empty argv".to_string())?;
-    let out = Command::new(program)
+    let out = command(program)
         .args(args)
         .arg(target)
         .output()
@@ -1033,7 +1083,7 @@ impl AppleTools for RealAppleTools {
         notarize(artifact, auth)
     }
     fn codesign_verify_strict(&self, target: &Path) -> Result<(), String> {
-        let out = Command::new(CODESIGN)
+        let out = command(CODESIGN)
             .args(["--verify", "--deep", "--strict"])
             .arg(target)
             .output()
@@ -1044,7 +1094,7 @@ impl AppleTools for RealAppleTools {
         Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
     }
     fn codesign_dv(&self, target: &Path) -> Result<String, String> {
-        let out = Command::new(CODESIGN)
+        let out = command(CODESIGN)
             .args(["-dv", "--verbose=2"])
             .arg(target)
             .output()
@@ -1163,7 +1213,7 @@ fn run_checked(cmd: &mut Command, what: &str) -> Result<(), String> {
 /// and `Command::status()` would wait forever on an Apple stall.
 fn run_streamed(cmd: &mut Command, what: &str, timeout: Duration) -> Result<(), String> {
     let mut child = cmd
-        .stdin(std::process::Stdio::null())
+        .stdin(Stdio::null())
         .spawn()
         .map_err(|e| format!("spawn {what}: {e}"))?;
     let started = Instant::now();
@@ -1194,7 +1244,10 @@ fn run_streamed(cmd: &mut Command, what: &str, timeout: Duration) -> Result<(), 
 
 #[cfg(all(test, unix))]
 mod keychain_tests {
-    use super::{DevIdIdentity, app_sign_args, devid_sign_args, dmg_sign_args, locate_identity};
+    use super::{
+        AppleTier, DevIdIdentity, ReleaseCredentials, app_sign_args, devid_sign_args,
+        dmg_sign_args, locate_identity, resolve_apple_tier_with,
+    };
     use crate::release_keychain::fake::{Fake, Kc, World};
     use crate::release_keychain::{Keychains, login_keychain_path};
     use aterm_update_core::pins::APPLE_TEAM_ID as TEAM;
@@ -1214,6 +1267,243 @@ mod keychain_tests {
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
+    }
+
+    /// The release audit changes keychain metadata after a successful automatic proof.
+    /// The next profile load must keep that proven shared identity, even when its old pin
+    /// is unavailable. Readiness still requires a new proof of the changed keychain.
+    #[test]
+    fn profile_reload_keeps_shared_identity_after_partition_upkeep() {
+        use aterm_secrets::{client, fsx, materialize::digest_hex, text::Audience};
+        use aterm_update_core::roster::{Machine, Roster, SUPPORTED_SCHEMA};
+        use ring::signature::{Ed25519KeyPair, KeyPair as _};
+        use std::os::unix::fs::MetadataExt as _;
+
+        let (_dir, home) = scratch();
+        let paths = client::Paths::for_home(&home);
+        client::test_create_unbound(
+            &paths,
+            home.join("fixture.vault").to_str().unwrap(),
+            None,
+            Some("m1"),
+        )
+        .unwrap();
+        let certificate = b"shared signing certificate fixture";
+        let private_key = b"shared signing private key fixture";
+        let shared = aterm_codec::hex::encode_lower(
+            ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, certificate).as_ref(),
+        )
+        .to_ascii_uppercase();
+        let admin = client::admin_open(&paths).unwrap();
+        let mut doc = admin.doc.clone();
+        doc.set_entry(
+            &Audience::Everyone,
+            "~/.aterm/apple/devid-shared.cer",
+            certificate,
+        )
+        .unwrap();
+        doc.set_entry(
+            &Audience::Everyone,
+            "~/.aterm/apple/devid-shared.key",
+            private_key,
+        )
+        .unwrap();
+        client::admin_publish(&paths, &admin, &doc).unwrap();
+
+        let rng = ring::rand::SystemRandom::new();
+        let key = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let signer = Ed25519KeyPair::from_pkcs8(key.as_ref()).unwrap();
+        let master_key = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let master = Ed25519KeyPair::from_pkcs8(master_key.as_ref()).unwrap();
+        let anchor = aterm_secrets::b64::encode_padded(master.public_key().as_ref());
+        let ring = home.join(".aterm/release-ring");
+        fsx::ensure_private_dir(&ring.join("roster")).unwrap();
+        let profile = ring.join("release-credentials.toml");
+        fsx::write_atomic(&profile, format!(
+            "signing_key = \"{}\"\nmachine_id = \"m1\"\nmachine_roster = \"~/.aterm/release-ring/roster/aterm-machines.toml\"\nnotary_profile = \"fixture\"\nsigning_identity_sha1 = \"{SHA1}\"\n",
+            aterm_secrets::b64::encode_padded(key.as_ref()),
+        ).as_bytes(), 0o600).unwrap();
+        fsx::write_atomic(&ring.join("machine.key"), key.as_ref(), 0o600).unwrap();
+        let mut roster = Roster {
+            schema: SUPPORTED_SCHEMA,
+            roster_seq: 1,
+            valid_until: "9999-12-31T00:00:00Z".into(),
+            revoked: vec![],
+            machines: vec![Machine {
+                id: "m1".into(),
+                pubkey: aterm_secrets::b64::encode_padded(signer.public_key().as_ref()),
+                added_at: "1970-01-01T00:00:00Z".into(),
+                not_after: None,
+            }],
+        };
+        let roster_text = roster.to_toml().unwrap();
+        fsx::write_atomic(
+            &ring.join("roster/aterm-machines.toml"),
+            roster_text.as_bytes(),
+            0o644,
+        )
+        .unwrap();
+        fsx::write_atomic(
+            &ring.join("roster/aterm-machines.toml.sig"),
+            master.sign(roster_text.as_bytes()).as_ref(),
+            0o644,
+        )
+        .unwrap();
+
+        let mut world = World::new(&shared);
+        let login = login_keychain_path(&home);
+        world.keychains.insert(login.clone(), Kc::default());
+        world.search_list.push(login);
+        let fake = Fake::new(world);
+        let kc = Keychains::new(&home, &fake);
+        kc.install_pair(Path::new("/fixture/certificate"), Path::new("/fixture/key"))
+            .unwrap();
+        assert_eq!(
+            crate::release_keychain::prove_can_sign(
+                &kc,
+                &shared,
+                crate::release_keychain::Leave::Write
+            )
+            .unwrap(),
+            crate::release_keychain::Proof::Signed
+        );
+        let meta = std::fs::symlink_metadata(kc.release()).unwrap();
+        let password = fsx::read_private(&crate::release_keychain::password_path(&home), 1024)
+            .unwrap()
+            .unwrap();
+        let local = format!(
+            "{}:{}:{}:{}:{}:{}",
+            meta.dev(),
+            meta.ino(),
+            meta.len(),
+            meta.mtime(),
+            meta.mtime_nsec(),
+            digest_hex(password.as_slice())
+        );
+        let proved = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        fsx::write_atomic(&paths.dir.join("release-signing-proof.toml"), format!(
+            "material = \"{}:{}\"\nlocal = {local:?}\nidentity = {shared:?}\nproved = {proved}\n",
+            digest_hex(certificate), digest_hex(private_key),
+        ).as_bytes(), 0o600).unwrap();
+        let selection = |profile: &Path| {
+            client::release::test_signing_observation(&paths, profile, &[&anchor], proved as i64)
+                .unwrap()
+        };
+        let observation = || selection(&profile);
+        let load = || {
+            ReleaseCredentials::load_with_identity(&profile, Some(&home), |_, profile| {
+                selection(profile).0
+            })
+            .unwrap()
+        };
+        assert_eq!(load().signing_identity_sha1(), Some(shared.as_str()));
+        assert!(matches!(
+            observation().1,
+            client::release::SigningStatus::Ready(_)
+        ));
+
+        struct PartitionWrite<'a> {
+            fake: &'a Fake,
+            path: PathBuf,
+        }
+        impl crate::dev_identity::Run for PartitionWrite<'_> {
+            fn run(
+                &self,
+                cmd: &mut aterm_uds::spawnfd::Command,
+                wait: std::time::Duration,
+            ) -> Result<std::process::Output, aterm_uds::deadline::RunError> {
+                let partition =
+                    cmd.get_args().next() == Some(std::ffi::OsStr::new("set-key-partition-list"));
+                let output = crate::dev_identity::Run::run(self.fake, cmd, wait)?;
+                if partition && output.status.success() {
+                    std::fs::write(&self.path, b"partition list reasserted").unwrap();
+                }
+                Ok(output)
+            }
+        }
+        let upkeep = PartitionWrite {
+            fake: &fake,
+            path: kc.release(),
+        };
+        let before = load();
+        let AppleTier::Active { identity, .. } =
+            resolve_apple_tier_with(TEAM, Some(&before), Some(&home), &upkeep).unwrap()
+        else {
+            panic!("active Apple tier")
+        };
+        assert_eq!(identity.sha1, shared);
+        assert_eq!(identity.keychain.as_deref(), Some(kc.release().as_path()));
+        assert_ne!(std::fs::metadata(kc.release()).unwrap().len(), meta.len());
+        assert!(matches!(
+            observation().1,
+            client::release::SigningStatus::Pending(_)
+        ));
+        let after = load();
+        assert_eq!(after.signing_identity_sha1(), Some(shared.as_str()));
+        let AppleTier::Active { identity, .. } =
+            resolve_apple_tier_with(TEAM, Some(&after), Some(&home), &fake).unwrap()
+        else {
+            panic!("active Apple tier after reload")
+        };
+        assert_eq!(identity.sha1, shared);
+        assert!(
+            !fake
+                .0
+                .borrow()
+                .keychains
+                .values()
+                .any(|kc| kc.certs.iter().any(|id| id == SHA1)),
+            "the profile's old identity is unavailable"
+        );
+
+        let unrelated = home.join("unrelated-release.toml");
+        fsx::write_atomic(&unrelated, &std::fs::read(&profile).unwrap(), 0o600).unwrap();
+        let unrelated =
+            ReleaseCredentials::load_with_identity(&unrelated, Some(&home), |_, profile| {
+                selection(profile).0
+            })
+            .unwrap();
+        assert_eq!(unrelated.signing_identity_sha1(), Some(SHA1));
+
+        let admin = client::admin_open(&paths).unwrap();
+        let mut doc = admin.doc.clone();
+        doc.set_entry(
+            &Audience::Everyone,
+            "~/.aterm/apple/devid-shared.key",
+            b"changed signing material",
+        )
+        .unwrap();
+        client::admin_publish(&paths, &admin, &doc).unwrap();
+        assert_eq!(load().signing_identity_sha1(), Some(SHA1));
+        let admin = client::admin_open(&paths).unwrap();
+        let mut doc = admin.doc.clone();
+        doc.set_entry(
+            &Audience::Everyone,
+            "~/.aterm/apple/devid-shared.key",
+            private_key,
+        )
+        .unwrap();
+        client::admin_publish(&paths, &admin, &doc).unwrap();
+        assert_eq!(load().signing_identity_sha1(), Some(shared.as_str()));
+
+        roster.revoked.push("m1".into());
+        let revoked = roster.to_toml().unwrap();
+        fsx::write_atomic(
+            &ring.join("roster/aterm-machines.toml"),
+            revoked.as_bytes(),
+            0o644,
+        )
+        .unwrap();
+        fsx::write_atomic(
+            &ring.join("roster/aterm-machines.toml.sig"),
+            master.sign(revoked.as_bytes()).as_ref(),
+            0o644,
+        )
+        .unwrap();
+        assert_eq!(load().signing_identity_sha1(), Some(SHA1));
     }
 
     /// A Mac `ship provision` filled signs from the release keychain by path: the cut opens it
@@ -1485,5 +1775,30 @@ mod dr_tests {
              Authority=Developer ID Application: Jane Doe (TEAMID)\n";
         devid_preflight(no_probe, true).expect("no DR probe in the text is not a refusal");
         devid_preflight(UNSIGNED_DR, true).unwrap_err();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn release_credentials_refuse_symlinks() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.toml");
+        std::fs::write(&real, "signing_key = \"abc\"\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.path().join("profile.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let err = super::ReleaseCredentials::load(&link, Some(dir.path())).unwrap_err();
+        assert!(err.contains("not a regular file"), "{err}");
+
+        let key_path = dir.path().join(atpkg_keys::provision::MACHINE_KEY_REL);
+        std::fs::create_dir_all(key_path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&real, &key_path).unwrap();
+        let err = super::ReleaseCredentials::resolve_with(
+            None,
+            dir.path(),
+            Some(dir.path().to_str().unwrap()),
+        )
+        .unwrap_err();
+        assert!(err.contains("not a regular file"), "{err}");
     }
 }

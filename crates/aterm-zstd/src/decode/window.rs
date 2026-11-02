@@ -200,6 +200,9 @@ impl BlockBuf {
         offset: usize,
         n: usize,
     ) -> Result<(), DecodeError> {
+        if offset == 0 {
+            return Err(DecodeError::Corrupt("match offset of zero"));
+        }
         let mut left = n;
         if offset > self.len {
             let back = offset - self.len;
@@ -345,6 +348,7 @@ mod tests {
         let mut out = BlockBuf::default();
         out.start(16);
         assert!(out.copy_match(&empty, 1, 3).is_err());
+        assert!(out.copy_match(&empty, 0, 3).is_err());
     }
 
     #[test]

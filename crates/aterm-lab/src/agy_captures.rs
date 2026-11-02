@@ -320,7 +320,80 @@ fn captures(c: &Cap, want: &dyn Fn(&str) -> bool) -> Result<String, Fail> {
     }
     walls(c, want)?;
     refusals(c, want)?;
+    composer_frames(c, want)?;
     Ok(prefix)
+}
+
+/// The stub's reply for [`composer_frames`]: rows enough to fill the turn's part of the point's key
+/// at every width, each short enough to stand on one row of the narrowest pane.
+fn long_reply() -> String {
+    (1..=14)
+        .map(|i| format!("Stub reply row {i} of 14.\n"))
+        .collect()
+}
+
+/// The point's key under agy's composer (ATERM-KI-1101-2): at each narrow pane, the end of a turn
+/// and the same end with a draft typed, its footer as agy fits it; at the default width, the end
+/// of a turn and the same end under a paste of 60 lines.
+fn composer_frames(c: &Cap, want: &dyn Fn(&str) -> bool) -> Result<(), Fail> {
+    let ended = |run: &Run| -> Result<(), Fail> {
+        std::fs::write(run.w.join("reply.txt"), long_reply())
+            .map_err(|e| Fail::die(format!("cannot write the stub's reply: {e}")))?;
+        c.settle(run, 15)?;
+        c.turn(run, "carry on with the task")?;
+        c.wait(run, "Stub reply row 14 of 14", 60)?;
+        c.settle(run, 15)
+    };
+    for cols in ["30", "36", "44"] {
+        let (end, draft) = (format!("narrow-{cols}-end"), format!("narrow-{cols}-draft"));
+        if !want(&end) && !want(&draft) {
+            continue;
+        }
+        let run = c.fresh_seeded(Some(cols), &[], &Launch::default())?;
+        ended(&run)?;
+        c.cap(
+            &run,
+            &end,
+            &format!(
+                "the pane at {cols} columns: the end of a turn whose reply is 14 short rows (the \
+                 stub's reply.txt), idle"
+            ),
+        )?;
+        c.ctl(&run, &["send", "a note for later"])?;
+        stop::sleep(Duration::from_millis(1500))?;
+        c.settle(&run, 10)?;
+        c.cap(
+            &run,
+            &draft,
+            &format!(
+                "the pane at {cols} columns: the same end with `a note for later` typed into the \
+                 composer, never sent"
+            ),
+        )?;
+    }
+    if want("long-reply-end") || want("tall-paste") {
+        let run = c.fresh_agent(&Launch::default())?;
+        ended(&run)?;
+        c.cap(
+            &run,
+            "long-reply-end",
+            "the end of a turn whose reply is 14 short rows (the stub's reply.txt), idle",
+        )?;
+        let paste: String = (1..=60)
+            .map(|i| format!("pasted line {i} of 60\n"))
+            .collect();
+        let pasted = Door::new(&run)?.ctl_input(&["paste", "-"], paste.as_bytes())?;
+        c.must(pasted.code == 0, "ctl paste -")?;
+        stop::sleep(Duration::from_millis(1500))?;
+        c.settle(&run, 10)?;
+        c.cap(
+            &run,
+            "tall-paste",
+            "the same end with 60 lines (`pasted line N of 60`) pasted into the composer as one \
+             bracketed paste, never sent",
+        )?;
+    }
+    Ok(())
 }
 
 /// Write `text` at `rel` in the lab's project (through no link: the

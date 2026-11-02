@@ -9,11 +9,10 @@
 //! and heals it by rewriting the file; a missing or empty file cuts nothing. A release build
 //! never reads it.
 //!
-//! The two connect funnels read it: aterm-net's (`tcp_connect::connect_timeout_kept`: every fleet
-//! dial, and a loopback-scope `lan::Connection::connect`) and aterm-http's
-//! (`connect::connect_timeout`, every vault request). A LAN-scope `lan::Connection` dials through
-//! `lan::native`, which it does not cut, and an accepted connection is never cut: only the side
-//! that dials is.
+//! The one TCP connect funnel reads it: [`crate::connect_tcp`] (every fleet dial, a loopback-scope
+//! `lan::Connection::connect`, every vault request through aterm-http's `connect::connect_timeout`,
+//! and atpkg's peer fetches). A LAN-scope `lan::Connection` dials through `lan::native`, which it
+//! does not cut, and an accepted connection is never cut: only the side that dials is.
 
 use std::io;
 use std::net::SocketAddr;

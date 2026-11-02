@@ -194,13 +194,15 @@ impl CursorBeamRod {
             None => 0.0,
         };
         self.last = Some(now);
-        let rate = BREATHE_IDLE + BREATHE_ACTIVE * e;
-        let rate = if cfg.shimmer {
-            (rate * SHIMMER_RATE_MUL).min(SHIMMER_MAX_TURNS_PER_S)
-        } else {
-            rate
-        };
-        self.breathe = (self.breathe + dt * rate).fract();
+        if dt > 0.0 {
+            let rate = BREATHE_IDLE + BREATHE_ACTIVE * e;
+            let rate = if cfg.shimmer {
+                (rate * SHIMMER_RATE_MUL).min(SHIMMER_MAX_TURNS_PER_S)
+            } else {
+                rate
+            };
+            self.breathe = (self.breathe + dt * rate).fract();
+        }
 
         let fill = if cfg.bar {
             None
@@ -280,6 +282,9 @@ impl CursorBeamRod {
         let h = ch + 2.0 * over;
         let cov_axis =
             (COV_IDLE + (COV_MAX - COV_IDLE) * e) * cfg.intensity * (0.90 + 0.10 * breathe);
+        if cov_axis < 1.0 {
+            return;
+        }
         const WHITE: u32 = 0x00FF_FFFF;
         let layers: [(f32, f32, u32, f32); 4] = [
             (0.045, 1.00, WHITE, 0.55),   // white-hot axis
@@ -296,7 +301,7 @@ impl CursorBeamRod {
             i += 1;
             let cov = (cov_axis * cmul).min(COV_CAP) as u8;
             if cov == 0 {
-                continue;
+                break;
             }
             let w = ((cw * hw * 2.0) as i32).max(1);
             let x = (ax - cw * hw) as i32;
@@ -328,7 +333,7 @@ impl CursorBeamRod {
         cfg: &BeamRodConfig,
         under: &mut Vec<GlowQuad>,
     ) {
-        use crate::cursor_glow::{LIGHT_BODY_ALPHA_CAP, light_body_ink};
+        use crate::cursor_glow::{LIGHT_BODY_ALPHA_CAP, LightGround};
         const INV_COV_MAX: f32 = 1.0 / COV_MAX;
         let cw = geom.cw as f32;
         let ax = f32::from(geom.origin_x) + (cc as f32) * cw + cw * 0.10;
@@ -341,19 +346,16 @@ impl CursorBeamRod {
             return;
         }
         let key = (
-            cfg.color & 0x00FF_FFFF,
+            (cfg.color & 0x00FF_FFFF) | (u32::from(cfg.chosen) << 24),
             cfg.theme_fg & 0x00FF_FFFF,
             cfg.theme_bg & 0x00FF_FFFF,
         );
         let ink = match self.light_ink_memo {
             Some((k, ink)) if k == key => ink,
             _ => {
-                let ink = light_body_ink(
-                    cfg.color,
-                    cfg.theme_fg,
-                    cfg.theme_bg,
-                    LIGHT_BODY_ALPHA_CAP as u8,
-                );
+                // A colour the user chose keeps its own chroma ([`LightGround::chosen`]).
+                let ground = LightGround::on(cfg.theme_fg, cfg.theme_bg);
+                let ink = if cfg.chosen { ground.chosen() } else { ground }.body_ink(cfg.color);
                 self.light_ink_memo = Some((key, ink));
                 ink
             }
@@ -442,7 +444,7 @@ impl CursorBeamRod {
                             (prev, next);
                         prev = next;
                         if c_in == 0 && c_out == 0 {
-                            continue;
+                            break;
                         }
                         let (r0, r1) = (r_in.max(cell_x1), r_out);
                         push_fx_ramp(out, geom, r0, y, r1 - r0, h, (inner, 0), (outer, 0));

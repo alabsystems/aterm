@@ -48,7 +48,7 @@ pub(super) fn worker_stall(status_stdout: &str) -> Option<WorkerStall> {
         "stopped" => "stopped",
         _ => return None,
     };
-    let num = |field: &str| status_field(status_stdout, field).and_then(|v| v.parse().ok());
+    let num = |field: &str| status_field(status_stdout, field).and_then(crate::parse_uint);
     Some(WorkerStall {
         word,
         bytes: num("input_bytes"),
@@ -190,11 +190,11 @@ impl<C: Ctl> Session<'_, C> {
     /// Holds a suspected stall before entering `wait_for_next`.
     pub(super) fn stall_before_wait(
         &mut self,
-        seq: u64,
+        seen: &Turn,
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
         if self.stall_in_hand(review) {
-            self.stall_step(seq, review)?;
+            self.stall_step(seen, review)?;
         }
         Ok(())
     }
@@ -262,7 +262,7 @@ impl<C: Ctl> Session<'_, C> {
             word: field("input").unwrap_or_default(),
             stall: worker_stall(&r.stdout),
             program: field("program"),
-            human_ms: field("human_ms").and_then(|v| v.parse().ok()),
+            human_ms: field("human_ms").and_then(|v| crate::parse_uint(&v)),
             hand: field("hand"),
         }))
     }
@@ -279,6 +279,8 @@ impl<C: Ctl> Session<'_, C> {
         };
         let read_rest = read;
         self.stall_suspect = false;
+        self.stall_withheld = false;
+        self.withheld_ask = None;
         self.box_ask = None;
         self.adopted_box = false;
         self.turn_end_due = None;
@@ -348,7 +350,7 @@ impl<C: Ctl> Session<'_, C> {
             || !review.unattended()
             || !relaunched
             || !hands_off
-            || self.claim.remedies_withheld()
+            || self.remedies_withheld()
         {
             return Ok(());
         }
@@ -471,8 +473,47 @@ impl<C: Ctl> Session<'_, C> {
         Ok(())
     }
 
+    /// Re-arms an act or raises an ask badge withheld for [`Self::stall_suspect`] when the next
+    /// probe found no stall.
+    fn stall_suspect_cleared(
+        &mut self,
+        seq: u64,
+        handed: bool,
+        review: &mut dyn Review,
+    ) -> Result<(), Fail> {
+        if self.stalled.is_some() {
+            return Ok(());
+        }
+        let ask = self.withheld_ask.take();
+        let act = std::mem::take(&mut self.stall_withheld);
+        if let Some(ask) = ask {
+            self.attention_duty = ask.duty;
+            self.attention_desired = Some(super::escalate::AttentionTarget::Set {
+                text: ask.text,
+                kind: super::escalate::Escalation::Ask,
+            });
+            let said = self.write_attention_target()?;
+            if ask.turn_end_badge {
+                self.turn_end_badge = true;
+            }
+            review.note(&format!(
+                "ESCALATED seq={seq} attention={said}{}",
+                ask.again
+            ));
+        }
+        if act && handed {
+            self.set_due(self.fx.mono(), "the suspected input stall cleared");
+        }
+        Ok(())
+    }
+
     /// Probes input stall state after an unlatched wait step.
-    pub(super) fn stall_step(&mut self, seq: u64, review: &mut dyn Review) -> Result<bool, Fail> {
+    pub(super) fn stall_step(
+        &mut self,
+        seen: &Turn,
+        review: &mut dyn Review,
+    ) -> Result<bool, Fail> {
+        let seq = seen.screen.seq;
         if !review.unattended()
             || (self.caps.input == Some(false) && self.stalled.is_none() && !self.stall_suspect)
         {
@@ -481,9 +522,11 @@ impl<C: Ctl> Session<'_, C> {
         let read = self.stall_probe()?;
         self.stall_suspect = false;
         let Some(read) = read else {
+            self.stall_suspect_cleared(seq, true, review)?;
             return Ok(self.stalled.is_some());
         };
         if read.stall.is_none() {
+            self.stall_suspect_cleared(seq, true, review)?;
             return Ok(self.stalled.is_some());
         }
         if self.stalled.is_some() {
@@ -498,10 +541,11 @@ impl<C: Ctl> Session<'_, C> {
     /// Checks held or suspected stall state at the start of a look.
     pub(super) fn stall_look(
         &mut self,
-        seq: u64,
+        turn: &Turn,
         state: &mut Looking,
         review: &mut dyn Review,
     ) -> Result<bool, Fail> {
+        let seq = turn.screen.seq;
         if self.stalled.is_none() && !std::mem::take(&mut self.stall_suspect) {
             return Ok(false);
         }
@@ -519,6 +563,7 @@ impl<C: Ctl> Session<'_, C> {
             other => {
                 let word = other.map_or_else(String::new, |r| r.word);
                 self.thaw(seq, &word, state, review);
+                self.stall_suspect_cleared(seq, state.handed.is_some(), review)?;
                 Ok(false)
             }
         }

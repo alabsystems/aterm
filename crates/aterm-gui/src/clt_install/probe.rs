@@ -1,38 +1,84 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Read-only evidence that Apple's Command Line Tools installer is running.
+//! Read-only evidence of Apple's Command Line Tools installer on this Mac
+//! ([`super::Activity`]).
 
 #[cfg(any(target_os = "macos", all(test, unix)))]
 use std::path::Path;
 
+/// The [`super::Reading`] with the placeholder there or not (`placeholder`), over the executable
+/// paths of the processes running, each read as `aterm init` and the root half read it
+/// ([`aterm_types::macos_setup::tools_installer`]): the exact paths of Apple's `softwareupdate`
+/// and `installer` ([`is_install_process`]) hold the on-demand placeholder while installing; an
+/// absolute path ending in Apple's installer app's own executable identifies its window. So
+/// [`super::activity`] reads an install exactly where
+/// [`aterm_types::macos_setup::tools_install_running`] does.
 #[cfg(any(target_os = "macos", all(test, unix)))]
-const APP: &str =
-    "Install Command Line Developer Tools.app/Contents/MacOS/Install Command Line Developer Tools";
-
-#[cfg(any(target_os = "macos", all(test, unix)))]
-fn installing_from(placeholder: bool, paths: impl IntoIterator<Item = impl AsRef<Path>>) -> bool {
-    paths.into_iter().any(|path| {
-        let path = path.as_ref();
-        path.is_absolute() && (path.ends_with(APP) || (placeholder && is_softwareupdate(path)))
-    })
+fn reading_from(
+    placeholder: bool,
+    paths: impl IntoIterator<Item = impl AsRef<Path>>,
+) -> super::Reading {
+    use aterm_types::macos_setup::{ToolsInstaller, tools_installer};
+    let mut reading = super::Reading {
+        placeholder,
+        ..super::Reading::default()
+    };
+    for path in paths {
+        match tools_installer(path.as_ref(), is_install_process) {
+            Some(ToolsInstaller::CommandLine) => reading.install_process = true,
+            Some(ToolsInstaller::AppleWindow) => reading.apple_window = true,
+            None => {}
+        }
+    }
+    reading
 }
 
+/// Whether `path` is one of Apple's command-line installers: compared, never run.
 #[cfg(any(target_os = "macos", all(test, unix)))]
-fn is_softwareupdate(path: &::std::path::Path) -> bool {
+fn is_install_process(path: &::std::path::Path) -> bool {
     path == ::std::path::Path::new("/usr/sbin/softwareupdate")
+        || path == ::std::path::Path::new("/usr/sbin/installer")
 }
 
 #[cfg(target_os = "macos")]
-pub(super) fn installing_now() -> bool {
-    let placeholder =
-        std::path::Path::new(aterm_types::macos_setup::COMMAND_LINE_TOOLS_INSTALLING).exists();
-    installing_from(placeholder, process_paths())
+pub(super) fn installing_now() -> super::Reading {
+    let path = std::path::Path::new(aterm_types::macos_setup::COMMAND_LINE_TOOLS_INSTALLING);
+    let mut reading = reading_from(path.exists(), process_paths());
+    reading.live_run = stamp_of(path, 0).is_some_and(|stamp| {
+        aterm_types::macos_setup::placeholder_held_by_a_live_run(&stamp, |pid| {
+            aterm_sysprobe::kproc::record(pid).map(|record| record.start_s)
+        })
+    });
+    reading
+}
+
+/// The stamp in the placeholder at `path`, as `aterm init` reads it: a regular file `owner`
+/// (root, whose root half alone writes a run's stamp) owns and no group or other may write, no
+/// longer than a stamp ([`aterm_types::macos_setup::PLACEHOLDER_STAMP_MAX`]), read without
+/// following a link or waiting on a pipe; `None` for an empty one (Apple's own) or any other.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn stamp_of(path: &Path, owner: u32) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    let max = aterm_types::macos_setup::PLACEHOLDER_STAMP_MAX;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.uid() != owner || meta.mode() & 0o6022 != 0 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(max as u64 + 1).read_to_end(&mut bytes).ok()?;
+    (!bytes.is_empty() && bytes.len() <= max).then_some(bytes)
 }
 
 #[cfg(not(target_os = "macos"))]
-pub(super) fn installing_now() -> bool {
-    false
+pub(super) fn installing_now() -> super::Reading {
+    super::Reading::default()
 }
 
 #[cfg(target_os = "macos")]
@@ -68,32 +114,127 @@ fn process_ids() -> Vec<u32> {
 mod tests {
     use super::*;
 
+    fn activity(
+        placeholder: bool,
+        paths: impl IntoIterator<Item = impl AsRef<Path>>,
+    ) -> super::super::Activity {
+        super::super::activity(reading_from(placeholder, paths))
+    }
+
     const INSTALLER: &str = "/System/Library/CoreServices/Install Command Line Developer Tools.app/Contents/MacOS/Install Command Line Developer Tools";
 
+    /// The page reads an install exactly where `aterm init` does: the one predicate
+    /// ([`aterm_types::macos_setup::tools_install_running`]) over the same processes, or a
+    /// placeholder a live run's stamp names ([`aterm_types::macos_setup::placeholder_held_by_a_live_run`],
+    /// the one reader both share): a run between its steps, or waiting on Apple's installer
+    /// window a person closed, with no installer process running.
     #[test]
-    fn a_leftover_placeholder_without_a_live_installer_is_not_an_install() {
-        assert!(!installing_from(true, std::iter::empty::<&str>()));
-        assert!(!installing_from(
-            true,
-            ["/System/Library/CoreServices/Software Update.app/Contents/Resources/softwareupdated"]
-        ));
-        assert!(!installing_from(true, ["/tmp/softwareupdate"]));
+    fn the_page_reads_an_install_where_init_and_the_root_half_do() {
+        for placeholder in [false, true] {
+            for live_run in [false, true] {
+                for paths in [
+                    &[][..],
+                    &["/usr/sbin/softwareupdate"],
+                    &["/usr/sbin/installer"],
+                    &[INSTALLER],
+                    &["/bin/zsh", "/usr/sbin/installer"],
+                    &["/tmp/softwareupdate", INSTALLER],
+                ] {
+                    let mut reading = reading_from(placeholder, paths.iter().copied());
+                    reading.live_run = live_run;
+                    let init = placeholder
+                        && (aterm_types::macos_setup::tools_install_running(
+                            true,
+                            paths.iter().copied(),
+                            is_install_process,
+                        ) || live_run);
+                    assert_eq!(
+                        super::super::activity(reading) == super::super::Activity::Installing,
+                        init,
+                        "{placeholder} {live_run} {paths:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The page reads a run's stamp as `aterm init` does: a regular file of the placeholder's
+    /// owner that no group or other may write, no longer than a stamp, never through a link;
+    /// an empty placeholder (Apple's own) has none.
+    #[test]
+    fn the_page_reads_a_runs_stamp_as_init_does() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let path = dir.path().join("placeholder");
+        let stamp = aterm_types::macos_setup::placeholder_stamp(4242, 1000);
+        std::fs::write(&path, &stamp).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let me = path.metadata().unwrap().uid();
+        assert_eq!(stamp_of(&path, me).as_deref(), Some(stamp.as_bytes()));
+        assert_eq!(stamp_of(&path, me.wrapping_add(1)), None, "another owner's");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert_eq!(stamp_of(&path, me), None, "one anyone may write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert_eq!(stamp_of(&link, me), None, "never through a link");
+        std::fs::write(&path, b"").unwrap();
+        assert_eq!(stamp_of(&path, me), None, "Apple's own, empty");
+        std::fs::write(
+            &path,
+            vec![b'a'; aterm_types::macos_setup::PLACEHOLDER_STAMP_MAX + 1],
+        )
+        .unwrap();
+        assert_eq!(stamp_of(&path, me), None, "longer than a stamp");
     }
 
     #[test]
+    fn a_leftover_placeholder_without_a_live_installer_is_not_an_install() {
+        let idle = super::super::Activity::Idle;
+        assert_eq!(activity(true, std::iter::empty::<&str>()), idle);
+        assert_eq!(
+            activity(
+                true,
+                [
+                    "/System/Library/CoreServices/Software Update.app/Contents/Resources/softwareupdated"
+                ]
+            ),
+            idle
+        );
+        assert_eq!(activity(true, ["/tmp/softwareupdate"]), idle);
+    }
+
+    /// Only the tools installers' live evidence makes the wait calm; Apple's installer app before
+    /// its install starts (no placeholder yet) waits for the person's press. Another program
+    /// named like an installer is none.
+    #[test]
     fn only_the_tools_installers_live_evidence_makes_the_wait_calm() {
-        assert!(installing_from(true, ["/usr/sbin/softwareupdate"]));
-        assert!(installing_from(false, [INSTALLER]));
-        assert!(!installing_from(false, ["/usr/sbin/softwareupdate"]));
-        assert!(!installing_from(
-            false,
-            ["/tmp/Install Command Line Developer Tools.app/Contents/MacOS/unrelated"]
-        ));
-        assert!(!installing_from(
-            false,
-            [
-                "Install Command Line Developer Tools.app/Contents/MacOS/Install Command Line Developer Tools"
-            ]
-        ));
+        use super::super::Activity::{AppleWindow, Idle, Installing};
+        assert_eq!(activity(true, ["/usr/sbin/softwareupdate"]), Installing);
+        assert_eq!(activity(true, ["/usr/sbin/installer"]), Installing);
+        assert_eq!(activity(false, ["/usr/sbin/installer"]), Idle);
+        assert_eq!(activity(true, ["/usr/local/bin/installer"]), Idle);
+        assert_eq!(activity(true, ["/tmp/installer"]), Idle);
+        assert_eq!(activity(true, ["usr/sbin/installer"]), Idle);
+        assert_eq!(activity(true, ["/usr/local/bin/softwareupdate"]), Idle);
+        assert_eq!(activity(true, [INSTALLER]), Installing);
+        assert_eq!(activity(false, [INSTALLER]), AppleWindow);
+        assert_eq!(activity(false, ["/usr/sbin/softwareupdate"]), Idle);
+        assert_eq!(
+            activity(
+                false,
+                ["/tmp/Install Command Line Developer Tools.app/Contents/MacOS/unrelated"]
+            ),
+            Idle
+        );
+        assert_eq!(
+            activity(
+                false,
+                [
+                    "Install Command Line Developer Tools.app/Contents/MacOS/Install Command Line Developer Tools"
+                ]
+            ),
+            Idle
+        );
     }
 }

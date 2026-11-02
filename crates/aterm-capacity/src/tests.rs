@@ -59,6 +59,7 @@ fn admitted(w: Waiter, m: &Fixed) -> crate::Claim {
     match w.poll(m) {
         Polled::Admitted(c) => c,
         Polled::Waiting(_, short) => panic!("expected admission, waits: {short}"),
+        Polled::Gone(e) => panic!("expected admission, gone: {e}"),
     }
 }
 
@@ -68,6 +69,7 @@ fn waits(w: Waiter, m: &Fixed) -> (Waiter, crate::Shortfall) {
     match w.poll(m) {
         Polled::Waiting(w, short) => (w, short),
         Polled::Admitted(c) => panic!("expected a wait, admitted: {:?}", c.record()),
+        Polled::Gone(e) => panic!("expected a wait, gone: {e}"),
     }
 }
 
@@ -128,13 +130,16 @@ const STANDIN_DISK: &str = "ATERM_CAPACITY_TEST_STANDIN_DISK";
 /// Set, the stand-in's claim is a quiet one of this bound instead, admitted on a machine with no
 /// load.
 const STANDIN_QUIET: &str = "ATERM_CAPACITY_TEST_STANDIN_QUIET";
+/// Set, the stand-in credits its claim with this pid ([`crate::Claim::credit`]) once admitted.
+const STANDIN_CREDIT: &str = "ATERM_CAPACITY_TEST_STANDIN_CREDIT";
 #[cfg(unix)]
 const STANDIN_TEST: &str = "tests::standin_holds_a_claim_then_dies";
 
 /// Run by [`a_dead_holder_releases_its_claim_on_the_next_poll`] in a process of its own:
 /// holds a 30 GiB claim (of disk where [`STANDIN_DISK`] says, the quiet machine where
-/// [`STANDIN_QUIET`] does) in the ledger under the directory [`STANDIN`] names, says so, and once told to dies by `SIGKILL`, with the claim
-/// still held.
+/// [`STANDIN_QUIET`] does) in the ledger under the directory [`STANDIN`] names, credited with
+/// the pid [`STANDIN_CREDIT`] names where it names one, says so, and once told to dies by
+/// `SIGKILL`, with the claim still held.
 #[test]
 fn standin_holds_a_claim_then_dies() {
     let Some(dir) = std::env::var_os(STANDIN).map(PathBuf::from) else {
@@ -154,7 +159,7 @@ fn standin_holds_a_claim_then_dies() {
         (None, Some(bound)) => (mac48(), Need::new("stand-in A").quiet(bound)),
         (None, None) => (mac48(), Need::new("stand-in A").mem_gib(30)),
     };
-    let claim = admit_with(
+    let mut claim = admit_with(
         &Ledger::at(dir.join("ledger")),
         &m,
         need,
@@ -163,6 +168,12 @@ fn standin_holds_a_claim_then_dies() {
         &mut |_| {},
     )
     .expect("the stand-in's claim");
+    if let Some(pid) = std::env::var(STANDIN_CREDIT)
+        .ok()
+        .and_then(|p| p.parse().ok())
+    {
+        claim.credit(&[pid]).expect("credited");
+    }
     std::fs::write(dir.join("held"), std::process::id().to_string()).expect("said held");
     until_within(MUST_HAPPEN, "the test to tell the stand-in to die", || {
         dir.join("die").exists().then_some(())
@@ -181,20 +192,26 @@ fn standin(s: &Scratch) -> (aterm_uds::spawnfd::Child, u32) {
 /// [`standin`], its claim `disk` GiB of disk on [`vol`]`(200, 100, 10)` where given.
 #[cfg(unix)]
 fn standin_needing(s: &Scratch, disk: Option<u64>) -> (aterm_uds::spawnfd::Child, u32) {
-    standin_with(s, disk.map(|gib| (STANDIN_DISK, gib.to_string())))
+    standin_with(
+        s,
+        &disk
+            .map(|gib| (STANDIN_DISK, gib.to_string()))
+            .into_iter()
+            .collect::<Vec<_>>(),
+    )
 }
 
 /// [`standin`], its claim the quiet machine below a load of `bound`.
 #[cfg(unix)]
 fn standin_quiet(s: &Scratch, bound: f64) -> (aterm_uds::spawnfd::Child, u32) {
-    standin_with(s, Some((STANDIN_QUIET, bound.to_string())))
+    standin_with(s, &[(STANDIN_QUIET, bound.to_string())])
 }
 
-/// [`standin`], with `env` set to say what its claim is.
+/// [`standin`], with `envs` set to say what its claim is.
 #[cfg(unix)]
-fn standin_with(s: &Scratch, env: Option<(&str, String)>) -> (aterm_uds::spawnfd::Child, u32) {
+fn standin_with(s: &Scratch, envs: &[(&str, String)]) -> (aterm_uds::spawnfd::Child, u32) {
     let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().expect("the test binary"));
-    if let Some((key, value)) = env {
+    for (key, value) in envs {
         cmd.env(key, value);
     }
     let child = cmd
@@ -706,6 +723,7 @@ fn one_holders_tree_is_credited_once_across_its_claims() {
         ppid: 1,
         footprint: 20 * GIB,
         written: 0,
+        cpu_ns: 0,
     }])));
     let (c, short) = waits(enter(&s, &m, Need::new("C").mem_gib(20)), &m);
     assert_eq!(
@@ -741,6 +759,7 @@ fn a_child_claimants_use_is_credited_to_it_alone() {
         ppid,
         footprint: gib * GIB,
         written: 0,
+        cpu_ns: 0,
     };
     let procs = Procs::of(vec![
         p(100, 1, 2),
@@ -808,6 +827,7 @@ fn a_claim_inside_held_work_is_held_to_the_other_held_claims_only() {
         ppid,
         footprint: 0,
         written: 0,
+        cpu_ns: 0,
     };
     let started_by_verify = Procs::of(vec![p(1, 0), p(10, 1), p(9, 10), p(20, 9), p(11, 1)]);
     assert_eq!(started_by_verify.ancestors(20), [9, 10, 1, 0]);
@@ -847,6 +867,7 @@ fn a_holders_child_is_admitted_beside_its_ancestors_claim() {
         ppid,
         footprint: 0,
         written: 0,
+        cpu_ns: 0,
     };
     m.set_procs(Some(Procs::of(vec![p(holder, 1), p(me, 1)])));
     let need = Need::new("lab linux boot").disk(40 * GIB, "/vol");
@@ -882,6 +903,7 @@ fn a_tree_sums_its_descendants() {
         ppid,
         footprint: mib << 20,
         written: mib,
+        cpu_ns: 0,
     };
     let procs = Procs::of(vec![
         p(1, 0, 1000),
@@ -2739,6 +2761,7 @@ fn a_vms_own_processes_are_credited_against_its_claim() {
         ppid: 1,
         footprint: 14 * GIB,
         written: 0,
+        cpu_ns: 0,
     }])));
     let windows = || Need::new("windows").mem_gib(8).margin(8 * GIB);
     let mut lima = admitted(
@@ -2894,6 +2917,48 @@ fn a_waiter_whose_claim_file_is_removed_ends_its_wait() {
     }
 }
 
+/// A waiter polled by hand (as the Trust lane's launch gate polls its head) whose claim file is
+/// removed while it waits is [`Polled::Gone`] at its next look, naming the file: its grant could
+/// never be written, so polling on would wait for ever. Negative control: with its file in
+/// place, the same waiter is still waiting at every look. Unix only, as above.
+#[cfg(unix)]
+#[test]
+fn a_waiter_polled_by_hand_whose_claim_file_is_removed_is_gone() {
+    for remove in [true, false] {
+        let s = scratch("gone");
+        let m = mac48();
+        let a = admitted(enter(&s, &m, Need::new("A").mem_gib(30)), &m);
+        let (mut w, _) = waits(enter(&s, &m, Need::new("B").mem_gib(20)), &m);
+        if remove {
+            for e in s.ledger.dir().read_dir().expect("the ledger").flatten() {
+                if e.file_name().to_string_lossy().ends_with(".wait") {
+                    std::fs::remove_file(e.path()).expect("B's file removed");
+                }
+            }
+        }
+        let mut looks = 0;
+        let gone = loop {
+            looks += 1;
+            match w.poll(&m) {
+                Polled::Gone(e) => break Some(e),
+                Polled::Waiting(again, _) if looks < 3 => w = again,
+                Polled::Waiting(..) => break None,
+                Polled::Admitted(c) => panic!("removed {remove}: admitted {:?}", c.record()),
+            }
+        };
+        match (remove, gone) {
+            (true, Some(e)) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
+                names(&e.to_string(), &[".wait", "was removed while it waited"]);
+                assert_eq!(looks, 1, "gone at the look after");
+            }
+            (false, None) => {}
+            (_, other) => panic!("removed {remove}: {other:?}"),
+        }
+        drop(a);
+    }
+}
+
 /// A claim's grant is written once: an admission whose rename fails (here the ledger's directory
 /// made unwritable; in use, the file removed meanwhile) and is tried again writes no second grant
 /// and keeps the first, and the claim then reads back with it.
@@ -3027,11 +3092,20 @@ fn a_claim_names_the_checkout_it_runs_for() {
     );
     let cwd = std::env::current_dir().expect("a working directory");
     let here = &w.record().checkout;
-    assert!(
-        cwd.starts_with(here) && Path::new(here).join(".git").symlink_metadata().is_ok(),
-        "{here} is the checkout around {}",
-        cwd.display()
-    );
+    if cwd
+        .ancestors()
+        .any(|d| d.join(".git").symlink_metadata().is_ok())
+    {
+        assert!(
+            cwd.starts_with(here) && Path::new(here).join(".git").symlink_metadata().is_ok(),
+            "{here} is the checkout around {}",
+            cwd.display()
+        );
+    } else {
+        // A copy with no `.git` (the Windows lane's `C:\lane\src`): no checkout encloses the
+        // working directory, so the claim names the directory itself.
+        assert_eq!(Path::new(here), cwd, "no checkout around {}", cwd.display());
+    }
 }
 
 /// A parallel-build machine's large volume must reach its automatic pressure floor before
@@ -3209,6 +3283,36 @@ fn a_held_ledger_lock_names_its_holder() {
     drop(turn);
     let admitted_c = joined(waiting, "C's admission").expect("admitted");
     assert_eq!(admitted_c, "waiter-c");
+    #[cfg(unix)]
+    {
+        let victim = s.dir.path().join("victim.txt");
+        std::fs::write(&victim, "keep-me").expect("victim");
+        let lock_path = s.ledger.dir().join("ledger.lock");
+        let _ = std::fs::remove_file(&lock_path);
+        std::os::unix::fs::symlink(&victim, &lock_path).expect("symlink lock");
+        assert!(
+            s.ledger.try_turn().is_err(),
+            "symlinked ledger.lock is refused"
+        );
+        assert_eq!(std::fs::read_to_string(&victim).expect("intact"), "keep-me");
+        std::fs::remove_file(&lock_path).expect("unlink lock");
+
+        let stray = s.ledger.dir().join("0000000000001-99-0.claim");
+        std::os::unix::fs::symlink(&victim, &stray).expect("stray symlink claim");
+        assert!(
+            s.ledger.list().expect("list").is_empty(),
+            "stray symlink claim is ignored"
+        );
+        let c = enter(&s, &m, Need::new("after-stray").mem_gib(1));
+        let Polled::Admitted(claim) = c.poll(&m) else {
+            panic!("stray symlink must not block poll");
+        };
+        drop(claim);
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("still intact"),
+            "keep-me"
+        );
+    }
 }
 
 /// A volume of `total` GiB with `free` GiB free and a `floor` GiB floor, mounted at `/vol`.
@@ -3416,14 +3520,14 @@ const HERE: u64 = 0x5eed_0001;
 #[test]
 fn a_run_claims_what_the_last_runs_wrote() {
     let mut f = crate::Footprints::default();
-    let empty = f.need(0, 27 * GIB, HERE);
+    let empty = f.need(0, 27 * GIB, HERE, None);
     assert_eq!((empty.bytes, empty.runs), (27 * GIB, 0));
     names(&empty.to_string(), &["27 GiB", "cold budget"]);
-    let cold = f.need(5 * GIB, 27 * GIB, HERE);
+    let cold = f.need(5 * GIB, 27 * GIB, HERE, None);
     assert_eq!((cold.bytes, cold.runs), (22 * GIB, 0), "less what is there");
     names(&cold.to_string(), &["22 GiB", "27 GiB", "5 GiB"]);
     assert_eq!(
-        f.need(35 * GIB, 27 * GIB, HERE).bytes,
+        f.need(35 * GIB, 27 * GIB, HERE, None).bytes,
         0,
         "warm, with no record: nothing to claim"
     );
@@ -3432,18 +3536,19 @@ fn a_run_claims_what_the_last_runs_wrote() {
         grew: 3 * GIB,
         at_ms: 1,
         dirs: None,
+        scope: None,
     });
     assert_eq!(
-        f.need(38 * GIB, 27 * GIB, HERE).bytes,
+        f.need(38 * GIB, 27 * GIB, HERE, None).bytes,
         3 * GIB,
         "warm: its growth"
     );
     assert_eq!(
-        f.need(4 * GIB, 72 * GIB, HERE).bytes,
+        f.need(4 * GIB, 72 * GIB, HERE, None).bytes,
         36 * GIB,
         "reclaimed since: its peak again"
     );
-    let capped = f.need(4 * GIB, 27 * GIB, HERE);
+    let capped = f.need(4 * GIB, 27 * GIB, HERE, None);
     assert_eq!(
         (capped.bytes, capped.capped),
         (27 * GIB, true),
@@ -3454,9 +3559,10 @@ fn a_run_claims_what_the_last_runs_wrote() {
         grew: GIB,
         at_ms: 2,
         dirs: None,
+        scope: None,
     });
     assert_eq!(
-        f.need(40 * GIB, 27 * GIB, HERE).bytes,
+        f.need(40 * GIB, 27 * GIB, HERE, None).bytes,
         3 * GIB,
         "a light run does not hide a heavier one"
     );
@@ -3466,9 +3572,10 @@ fn a_run_claims_what_the_last_runs_wrote() {
         grew: 24 << 20,
         at_ms: 1,
         dirs: None,
+        scope: None,
     });
     names(
-        &light.need(24 << 20, 27 * GIB, HERE).to_string(),
+        &light.need(24 << 20, 27 * GIB, HERE, None).to_string(),
         &["24 MiB", "1 run(s)"],
     );
     for at_ms in 3..20 {
@@ -3477,18 +3584,39 @@ fn a_run_claims_what_the_last_runs_wrote() {
             grew: GIB,
             at_ms,
             dirs: None,
+            scope: None,
         });
     }
     assert_eq!(f.runs().len(), crate::footprint::KEPT);
     assert_eq!(
-        f.need(41 * GIB, 27 * GIB, HERE).bytes,
+        f.need(41 * GIB, 27 * GIB, HERE, None).bytes,
         GIB,
         "the heavy run aged out"
     );
     let s = scratch("footprints");
     let path = s.dir.path().join("verify/footprint.json");
     f.save(&path).expect("saved");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&path)
+            .expect("saved meta")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "footprint history is private");
+    }
     assert_eq!(crate::Footprints::load(&path), f);
+    #[cfg(unix)]
+    {
+        let link = s.dir.path().join("verify/footprint-link.json");
+        std::os::unix::fs::symlink(&path, &link).expect("linked");
+        assert_eq!(
+            crate::Footprints::load(&link),
+            crate::Footprints::default(),
+            "symlinked footprint file is refused"
+        );
+    }
     assert_eq!(
         crate::Footprints::load(&s.dir.path().join("none")),
         crate::Footprints::default()
@@ -3522,7 +3650,7 @@ fn a_peak_of_more_than_one_run_writes_claims_the_cold_budget() {
     let (holds, cold) = (tenths(242), 72 * GIB);
     let live = crate::Footprints::decode(LIVE);
     assert_eq!(live.runs().len(), 8, "the record reads back");
-    let claim = live.need(holds, cold, HERE);
+    let claim = live.need(holds, cold, HERE, None);
     assert_eq!(
         (claim.bytes, claim.runs, claim.capped),
         (cold, 8, true),
@@ -3533,7 +3661,7 @@ fn a_peak_of_more_than_one_run_writes_claims_the_cold_budget() {
     for run in &live.runs()[4..] {
         moved.push(*run);
     }
-    let after = moved.need(holds, cold, HERE);
+    let after = moved.need(holds, cold, HERE, None);
     assert_eq!((after.bytes, after.capped), (217_149_440, false), "{after}");
     names(&after.to_string(), &["208 MiB", "24.2 GiB"]);
 }
@@ -3559,6 +3687,7 @@ fn a_run_measured_on_other_directories_is_not_counted() {
         grew,
         at_ms: 1,
         dirs,
+        scope: None,
     };
     let of = |runs: &[crate::Footprint]| {
         let mut f = crate::Footprints::default();
@@ -3576,21 +3705,21 @@ fn a_run_measured_on_other_directories_is_not_counted() {
         run(25 * GIB, 0, Some(HERE)),
     ];
     let mixed = of(&[there[0], there[1], here[0], here[1]]);
-    let claim = mixed.need(holds, cold, HERE);
-    assert_eq!(claim, of(&here).need(holds, cold, HERE), "{claim}");
+    let claim = mixed.need(holds, cold, HERE, None);
+    assert_eq!(claim, of(&here).need(holds, cold, HERE, None), "{claim}");
     assert_eq!(
         (claim.bytes, claim.runs, claim.capped),
         (26 * GIB - holds, 2, false),
         "{claim}"
     );
-    let elsewhere = of(&there).need(holds, cold, HERE);
+    let elsewhere = of(&there).need(holds, cold, HERE, None);
     assert_eq!(
         (elsewhere.bytes, elsewhere.runs, elsewhere.capped),
         (cold - holds, 0, false),
         "{elsewhere}"
     );
     names(&elsewhere.to_string(), &["47.8 GiB", "72 GiB", "24.2 GiB"]);
-    let emptied = of(&there).need(0, cold, HERE);
+    let emptied = of(&there).need(0, cold, HERE, None);
     assert_eq!(
         (emptied.bytes, emptied.runs, emptied.capped),
         (cold, 0, false),
@@ -3602,7 +3731,7 @@ fn a_run_measured_on_other_directories_is_not_counted() {
         {\"at_ms\":1793144355648,\"grew\":217149440,\"peak\":26130784256}],\"schema\":1}";
     let old = crate::Footprints::decode(OLD);
     assert!(old.runs().iter().all(|r| r.dirs.is_none()), "{old:?}");
-    let today = old.need(holds, cold, HERE);
+    let today = old.need(holds, cold, HERE, None);
     assert_eq!(
         (today.bytes, today.runs, today.capped),
         (cold, 2, true),
@@ -3616,8 +3745,92 @@ fn a_run_measured_on_other_directories_is_not_counted() {
     assert_eq!(text.matches("\"dirs\"").count(), 4, "{text}");
 
     let s = scratch("meter-tag");
-    let meter = crate::Meter::start(vec![s.dir.path().to_path_buf()], HERE, 0, None);
+    let meter = crate::Meter::start(vec![s.dir.path().to_path_buf()], HERE, None, 0, None);
     assert_eq!(meter.finish().dirs, Some(HERE));
+}
+
+/// A RUN CLAIMS WHAT THE LAST RUNS OF ITS OWN SCOPE WROTE ([`crate::Footprint::scope`]): on
+/// directories holding 2 GiB under a 72 GiB cold budget, after three `-p` runs that each grew
+/// them by 200 MiB, a whole-workspace run claims the budget less what they hold (70 GiB, no run
+/// read), not 200 MiB; after a whole-workspace run that grew them by 30 GiB, a `-p` run never
+/// measured claims as that wide run would from no record, the budget less what they hold, not
+/// 30 GiB, and once a run of its own scope grew them by 1 GiB, that. A run kept before runs were
+/// scoped counts for a kind with one scope (a VM's boot) and for no scoped run. Each scope keeps
+/// its own last [`crate::footprint::KEPT`] runs, so twenty wide runs do not age out the one heavy
+/// narrow run, and only the [`crate::footprint::SCOPES`] scopes run most recently are kept. The
+/// scope reads back as written. A meter's run carries its scope. Negative control: with the
+/// scope ignored, the wide run claims 200 MiB from 3 runs and the `-p` run 30 GiB.
+#[test]
+fn a_run_claims_only_what_runs_of_its_own_scope_wrote() {
+    const NARROW: Option<u64> = Some(1);
+    const WIDE: Option<u64> = Some(2);
+    let (holds, cold) = (2 * GIB, 72 * GIB);
+    let run = |grew: u64, scope: Option<u64>, at_ms: u64| crate::Footprint {
+        peak: holds + grew,
+        grew,
+        at_ms,
+        dirs: Some(HERE),
+        scope,
+    };
+    let mut f = crate::Footprints::default();
+    for at in 0..3 {
+        f.push(run(200 << 20, NARROW, at));
+    }
+    let wide = f.need(holds, cold, HERE, WIDE);
+    assert_eq!((wide.bytes, wide.runs), (cold - holds, 0), "{wide}");
+    let narrow = f.need(holds, cold, HERE, NARROW);
+    assert_eq!((narrow.bytes, narrow.runs), (200 << 20, 3), "{narrow}");
+
+    let mut f = crate::Footprints::default();
+    f.push(run(30 * GIB, WIDE, 1));
+    let unmeasured = f.need(holds, cold, HERE, NARROW);
+    assert_eq!(
+        (unmeasured.bytes, unmeasured.runs),
+        (cold - holds, 0),
+        "{unmeasured}"
+    );
+    f.push(run(GIB, NARROW, 2));
+    let measured = f.need(holds, cold, HERE, NARROW);
+    assert_eq!((measured.bytes, measured.runs), (GIB, 1), "{measured}");
+    assert_eq!(f.need(holds, cold, HERE, WIDE).bytes, 30 * GIB);
+
+    let mut old = crate::Footprints::default();
+    old.push(run(5 * GIB, None, 1));
+    assert_eq!(
+        old.need(holds, cold, HERE, None).bytes,
+        5 * GIB,
+        "one scope"
+    );
+    assert_eq!(old.need(holds, cold, HERE, NARROW).bytes, cold - holds);
+
+    let mut f = crate::Footprints::default();
+    f.push(run(40 * GIB, NARROW, 0));
+    for at in 1..=20 {
+        f.push(run(GIB, WIDE, at));
+    }
+    assert_eq!(f.need(holds, cold, HERE, NARROW).bytes, 40 * GIB, "kept");
+    assert_eq!(
+        f.runs().iter().filter(|r| r.scope == WIDE).count(),
+        crate::footprint::KEPT
+    );
+    for scope in 3..(3 + crate::footprint::SCOPES as u64) {
+        f.push(run(GIB, Some(scope), 100 + scope));
+    }
+    assert!(
+        f.runs().iter().all(|r| r.scope != NARROW),
+        "the scope run longest ago is let go: {f:?}"
+    );
+    assert_eq!(
+        f.need(holds, cold, HERE, Some(3)).runs,
+        1,
+        "a recent scope stays"
+    );
+    let text = f.encode();
+    assert_eq!(crate::Footprints::decode(&text), f, "{text}");
+
+    let s = scratch("meter-scope");
+    let meter = crate::Meter::start(vec![s.dir.path().to_path_buf()], HERE, WIDE, 0, None);
+    assert_eq!(meter.finish().scope, WIDE);
 }
 
 /// What a run grew its directories by is believed whatever its size, and a peak within the
@@ -3639,6 +3852,7 @@ fn a_runs_growth_is_believed_and_a_peak_within_the_cold_budget_is_written_again(
         grew,
         at_ms: 1,
         dirs: None,
+        scope: None,
     };
     let table: [(&str, Vec<crate::Footprint>, u64, u64, bool); 9] = [
         (
@@ -3698,7 +3912,7 @@ fn a_runs_growth_is_believed_and_a_peak_within_the_cold_budget_is_written_again(
         for r in &runs {
             f.push(*r);
         }
-        let e = f.need(holds, cold, HERE);
+        let e = f.need(holds, cold, HERE, None);
         assert_eq!(
             (e.bytes, e.runs, e.capped),
             (claims, runs.len(), capped),
@@ -4190,6 +4404,40 @@ fn saturating_reservations_and_wrote_bounds_never_wrap_or_pass_record_max() {
         )
         .is_none()
     );
+
+    let corrupt = scratch("non-utf8-claim");
+    let m_ok = mac48();
+    let valid = admitted(enter(&corrupt, &m_ok, Need::new("valid").mem_gib(1)), &m_ok);
+    let bad_claim = corrupt.ledger.dir().join("0-999999-0.claim");
+    let mut bad_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&bad_claim)
+        .expect("bad claim created");
+    std::io::Write::write_all(&mut bad_file, &[0xff, 0xfe, b'\n']).expect("non-utf8 bytes");
+    let _bad_lock =
+        aterm_toolchain::record_lock::RecordLock::try_lock(bad_file, crate::ledger::RECORD_MAX)
+            .expect("locked bad claim");
+    #[cfg(unix)]
+    {
+        let target = corrupt.dir.path().join("outside.claim");
+        std::fs::write(&target, b"outside\n").expect("outside file");
+        std::os::unix::fs::symlink(&target, corrupt.ledger.dir().join("1-999999-1.claim"))
+            .expect("symlink claim");
+        let fifo = corrupt.ledger.dir().join("2-999999-2.wait");
+        let fifo_c =
+            std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(fifo.as_os_str()))
+                .expect("fifo cstr");
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+    }
+    let listed = corrupt
+        .ledger
+        .list()
+        .expect("non-utf8 or non-regular claim entries never abort scan");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].need.what, "valid");
+    drop(valid);
 }
 
 /// On macOS the live machine's lineage of a child is the walk up its parents, this process among
@@ -4221,4 +4469,399 @@ fn the_live_lineage_of_a_child_walks_up_to_this_process() {
         drop(c.stdin.take());
         assert!(c.wait().expect("its end").success());
     }
+}
+
+/// A held claim whose holder's tree makes no progress is named so once it has made none for the
+/// waiter's bound: its row in the wait line says how long, and the wait is stuck behind it,
+/// naming its pid, which the waiter believes on its second such look; the claim stays held, its
+/// holder unsignalled. Negative control: once the holder's CPU time moves between looks it is no
+/// longer named, and stays unnamed while it moves.
+#[cfg(unix)]
+#[test]
+fn a_waiter_names_a_held_claims_holder_that_makes_no_progress() {
+    let s = scratch("stuck");
+    let (mut child, holder) = standin_needing(&s, Some(60));
+    let m = on(vol(200, 100, 10));
+    let me = std::process::id();
+    let at = |cpu_ns| {
+        Procs::of(vec![
+            Proc {
+                pid: holder,
+                ppid: 1,
+                cpu_ns,
+                ..Proc::default()
+            },
+            Proc {
+                pid: me,
+                ppid: 1,
+                ..Proc::default()
+            },
+        ])
+    };
+    let bound = Duration::from_millis(200);
+    m.set_procs(Some(at(5)));
+    let need = Need::new("lab linux boot")
+        .disk(40 * GIB, "/vol")
+        .ends_when_stuck(bound);
+    let (w, short) = waits(enter(&s, &m, need), &m);
+    assert_eq!(short.holders.len(), 1, "{short}");
+    assert_eq!(short.holders[0].stalled, None, "stuck at its first look");
+    // Past the bound with no work: the condition under test, not a wait for anything.
+    std::thread::sleep(bound + Duration::from_millis(50));
+    let (w, short) = waits(w, &m);
+    let held = &short.holders[0];
+    assert!(held.stalled.is_some_and(|d| d >= bound), "{held:?}");
+    let line = w.line(&short);
+    names(
+        &line,
+        &[
+            &format!("pid {holder} holds"),
+            ", which has made no progress for 0 s (no CPU time, nothing written)",
+        ],
+    );
+    let stuck = crate::admit::stuck(&short.holders).expect("stuck behind it");
+    assert_eq!(stuck.holders, [holder]);
+    assert!(stuck.span >= bound, "{stuck:?}");
+    assert!(w.stuck().is_none(), "one look is not believed");
+    let (w, _) = waits(w, &m);
+    assert_eq!(
+        w.stuck().map(|s| s.holders.clone()),
+        Some(vec![holder]),
+        "believed on its second look"
+    );
+    // It works again: named no longer, however long the waiter has waited.
+    let mut w = w;
+    for cpu in 6..9 {
+        m.set_procs(Some(at(cpu)));
+        let (again, short) = waits(w, &m);
+        assert_eq!(short.holders[0].stalled, None, "{short}");
+        assert!(crate::admit::stuck(&short.holders).is_none());
+        assert!(again.stuck().is_none());
+        w = again;
+        std::thread::sleep(bound + Duration::from_millis(50));
+    }
+    std::fs::write(s.dir.path().join("die"), "").expect("told to die");
+    let _ = child.wait().expect("the stand-in's end");
+    drop(w);
+}
+
+/// A WAIT THAT ASKS TO END BEHIND A HOLDER THAT MAKES NO PROGRESS ENDS THERE
+/// (CW-WAIT-UNBOUNDED): behind a stand-in's held claim whose tree reads idle, a need that ends
+/// when stuck after a short bound gives up within the hang detector, naming the stand-in and how
+/// long it made no progress, and leaves the queue; the stand-in's claim stays held and the
+/// stand-in lives on, unsignalled. Its work is read with the processes its claim is credited
+/// with: idle itself, its credited VM working keeps the wait on. NEGATIVE CONTROLS: the same wait
+/// behind the stand-in working (its CPU time moving between looks), or behind it idle with its
+/// credited process working, goes on past three bounds and is admitted once the stand-in ends; a
+/// wait that ignores the end it asked for, or reads no credited process, fails the first part
+/// or the second by name.
+#[cfg(unix)]
+#[test]
+fn a_wait_that_asks_to_end_behind_a_stuck_holder_ends_there() {
+    let s = scratch("ends-stuck");
+    // A process launchd parents, outside the stand-in's tree, credited to its claim: its VM.
+    let vm = 99_991;
+    let (mut child, holder) = standin_with(
+        &s,
+        &[
+            (STANDIN_DISK, "60".to_owned()),
+            (STANDIN_CREDIT, vm.to_string()),
+        ],
+    );
+    let m = Arc::new(on(vol(200, 100, 10)));
+    let me = std::process::id();
+    let at = move |cpu_ns, vm_ns| {
+        Procs::of(vec![
+            Proc {
+                pid: holder,
+                ppid: 1,
+                cpu_ns,
+                ..Proc::default()
+            },
+            Proc {
+                pid: vm,
+                ppid: 1,
+                cpu_ns: vm_ns,
+                ..Proc::default()
+            },
+            Proc {
+                pid: me,
+                ppid: 1,
+                ..Proc::default()
+            },
+        ])
+    };
+    m.set_procs(Some(at(5, 5)));
+    let bound = Duration::from_millis(200);
+    let pace = Pace {
+        poll: Duration::from_millis(10),
+        line_every: Duration::from_secs(60),
+    };
+    let wait = |stop: Arc<AtomicBool>| {
+        let (ledger, machine) = (s.ledger.clone(), Arc::clone(&m));
+        std::thread::spawn(move || {
+            admit_until(
+                &ledger,
+                &*machine,
+                Need::new("verify lint")
+                    .disk(40 * GIB, "/vol")
+                    .ends_when_stuck(bound),
+                Admit::Wait,
+                pace,
+                &mut |_| {},
+                &|| stop.load(Ordering::SeqCst),
+            )
+        })
+    };
+    let begun = std::time::Instant::now();
+    match joined(wait(Arc::default()), "the stuck wait's end") {
+        Err(e @ Error::Stuck { .. }) => {
+            if let Error::Stuck { stuck, .. } = &e {
+                assert_eq!(stuck.holders, [holder]);
+                assert!(stuck.span >= bound, "{stuck:?}");
+            }
+            names(
+                &e.to_string(),
+                &[
+                    "gave up its wait",
+                    &format!("pid {holder} holds 60 GiB of disk"),
+                    "which has made no progress for",
+                ],
+            );
+        }
+        other => panic!("expected the wait to end behind the stuck holder, got {other:?}"),
+    }
+    assert!(begun.elapsed() >= bound, "{:?}", begun.elapsed());
+    let listed: Vec<(u32, bool, Vec<u32>)> = s
+        .ledger
+        .list()
+        .expect("listed")
+        .into_iter()
+        .map(|r| (r.pid, r.held.is_some(), r.credit))
+        .collect();
+    assert_eq!(
+        listed,
+        [(holder, true, vec![vm])],
+        "it left the queue; the claim stays"
+    );
+    assert!(matches!(child.try_wait(), Ok(None)), "the holder lives on");
+
+    // Behind the holder idle with its credited VM working, then behind the holder working, the
+    // wait goes on: the first is stopped, the second admitted once the holder ends. The mover
+    // runs until then, so no span after it is one of no progress.
+    let (moving, holder_moves) = (
+        Arc::new(AtomicBool::new(true)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let mover = {
+        let (m, moving, holder_moves) = (
+            Arc::clone(&m),
+            Arc::clone(&moving),
+            Arc::clone(&holder_moves),
+        );
+        std::thread::spawn(move || {
+            let mut ns = 6;
+            while moving.load(Ordering::SeqCst) {
+                m.set_procs(Some(if holder_moves.load(Ordering::SeqCst) {
+                    at(ns, 5)
+                } else {
+                    at(5, ns)
+                }));
+                ns += 1;
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        })
+    };
+    for holder_works in [false, true] {
+        holder_moves.store(holder_works, Ordering::SeqCst);
+        let stop = Arc::new(AtomicBool::new(false));
+        let waiting = wait(Arc::clone(&stop));
+        // Three bounds of the condition under test, not a wait for anything.
+        std::thread::sleep(bound * 3);
+        assert!(
+            !waiting.is_finished(),
+            "a wait behind a working holder ended (the holder itself works: {holder_works}): {:?}",
+            joined(waiting, "its end")
+        );
+        if holder_works {
+            std::fs::write(s.dir.path().join("die"), "").expect("told to die");
+            let _ = child.wait().expect("the stand-in's end");
+            let claim = joined(waiting, "the admission once the holder ends").expect("admitted");
+            assert_eq!(claim.record().need.what, "verify lint");
+        } else {
+            stop.store(true, Ordering::SeqCst);
+            assert!(
+                matches!(
+                    joined(waiting, "the stopped wait's end"),
+                    Err(Error::Stopped { .. })
+                ),
+                "stopped"
+            );
+        }
+    }
+    moving.store(false, Ordering::SeqCst);
+    joined(mover, "the mover's end");
+}
+
+/// A wait is stuck only when every claim it names is held by a holder named stuck, for as long
+/// as the last of them to work: one that waits ahead, or a held one that works, keeps it
+/// unstuck, and a short no claim holds has none.
+#[test]
+fn a_wait_is_stuck_only_behind_holders_that_are_all_stuck() {
+    let h = |pid, held, stalled: Option<u64>| crate::Holder {
+        pid,
+        what: "x".into(),
+        checkout: String::new(),
+        held,
+        age: Duration::ZERO,
+        mem: 0,
+        claimed: 0,
+        alone: false,
+        disk: GIB,
+        quiet: false,
+        order: (0, pid, 0),
+        stalled: stalled.map(Duration::from_secs),
+        credit: Vec::new(),
+    };
+    let stuck =
+        crate::admit::stuck(&[h(9, true, Some(960)), h(7, true, Some(900))]).expect("both stuck");
+    assert_eq!(
+        (stuck.holders, stuck.span),
+        (vec![7, 9], Duration::from_secs(900))
+    );
+    assert!(crate::admit::stuck(&[h(9, true, Some(960)), h(7, true, None)]).is_none());
+    assert!(crate::admit::stuck(&[h(9, true, Some(960)), h(7, false, None)]).is_none());
+    assert!(crate::admit::stuck(&[]).is_none());
+}
+
+/// A HANDED-OFF CLAIM is held by its adopter alone: a copy of its descriptor, adopted, proves
+/// itself and reads its record; its maker hands it off and the ledger still lists it; the
+/// adopter's drop lets it go. The adoption refuses a descriptor of another file, one of the
+/// claim's file whose description holds no lock (a fresh open), and the claim's own descriptor
+/// named through a link to its file, letting nothing go. NEGATIVE CONTROL: a maker that drops its
+/// claim instead lets the lock go for its adopter too, and the ledger lists nothing while the
+/// adopted claim lives; and, by hand, with the path's metadata and fresh open following links,
+/// the claim is adopted through the link.
+#[cfg(unix)]
+#[test]
+fn a_handed_off_claim_is_held_by_its_adopter_alone() {
+    use crate::Claim;
+    let s = scratch("handoff");
+    let m = mac48();
+    let claim = || {
+        admit_with(
+            &s.ledger,
+            &m,
+            Need::new("targo test [a]").mem(2 * GIB).covers(),
+            Admit::Wait,
+            Pace::default(),
+            &mut |_| {},
+        )
+        .expect("admitted")
+    };
+    let made = claim();
+    let path = made.path().to_path_buf();
+    let fresh = std::fs::File::open(&path).expect("a fresh open");
+    assert!(
+        Claim::adopt(fresh.into(), &path).is_err(),
+        "no lock of its own"
+    );
+    let other = std::fs::File::create(s.dir.path().join("other")).expect("another file");
+    assert!(Claim::adopt(other.into(), &path).is_err(), "another file");
+    let links = s.dir.path().join("links");
+    std::fs::create_dir(&links).expect("a folder for the link");
+    let link = links.join(path.file_name().expect("its name"));
+    std::os::unix::fs::symlink(&path, &link).expect("a link to the claim, named as it is");
+    assert!(
+        Claim::adopt(made.descriptor().expect("a copy"), &link).is_err(),
+        "a link to the claim"
+    );
+    assert_eq!(
+        s.ledger.list().expect("listed").len(),
+        1,
+        "refusals let go nothing"
+    );
+    let adopted = Claim::adopt(made.descriptor().expect("a copy"), &path).expect("adopted");
+    assert_eq!(
+        (
+            adopted.record().pid,
+            &adopted.record().need.what,
+            adopted.record().held
+        ),
+        (
+            made.record().pid,
+            &made.record().need.what,
+            made.record().held
+        ),
+        "its record"
+    );
+    made.hand_off();
+    let listed = s.ledger.list().expect("listed");
+    assert_eq!(listed.len(), 1, "the adopter holds it: {listed:?}");
+    drop(adopted);
+    assert!(
+        s.ledger.list().expect("listed").is_empty(),
+        "its adopter let it go"
+    );
+
+    let dropped = claim();
+    let path = dropped.path().to_path_buf();
+    let adopted = Claim::adopt(dropped.descriptor().expect("a copy"), &path).expect("adopted");
+    drop(dropped);
+    assert!(
+        s.ledger.list().expect("listed").is_empty(),
+        "a claim dropped, not handed off, lets go for its adopter too"
+    );
+    drop(adopted);
+}
+
+/// AN ADOPTION PROVES THE CLAIM'S LOCK IS HELD, AND ONE THAT FAILS LETS NOTHING GO: a descriptor
+/// of a claim file no description locks (a copy of a held claim's, which nobody holds) is
+/// refused, adopting nothing; and a held claim's own descriptor whose fresh open fails (its file
+/// made unreadable) is refused too, its maker still holding the claim, its file in the ledger and
+/// its lock against a fresh open. NEGATIVE CONTROL (by hand, the order this replaced: the lock
+/// taken through the descriptor before a fresh open's is tried): the unheld copy is adopted; and
+/// with the fresh open's error returned after that lock, the refusal removes the claim's file
+/// and lets its lock go for its maker, so the ledger lists nothing.
+#[cfg(unix)]
+#[test]
+fn an_adoption_proves_its_lock_is_held_and_one_that_fails_lets_nothing_go() {
+    use crate::Claim;
+    use std::os::unix::fs::PermissionsExt as _;
+    let s = scratch("adopt-proofs");
+    let m = mac48();
+    let made = admit_with(
+        &s.ledger,
+        &m,
+        Need::new("targo check [a]").mem(2 * GIB).covers(),
+        Admit::Wait,
+        Pace::default(),
+        &mut |_| {},
+    )
+    .expect("admitted");
+    let path = made.path().to_path_buf();
+    let copy = s.dir.path().join(path.file_name().expect("its name"));
+    std::fs::copy(&path, &copy).expect("a copy nobody locks");
+    let unheld = std::fs::File::open(&copy).expect("the copy's open");
+    let refused = Claim::adopt(unheld.into(), &copy).expect_err("nobody holds its lock");
+    assert_eq!(refused.kind(), std::io::ErrorKind::InvalidData, "{refused}");
+
+    let mode = std::fs::metadata(&path).expect("its mode").permissions();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("unreadable");
+    let failed = Claim::adopt(made.descriptor().expect("a copy"), &path);
+    std::fs::set_permissions(&path, mode).expect("readable again");
+    assert!(failed.is_err(), "its fresh open fails");
+    assert!(path.exists(), "its file stays");
+    let fresh = std::fs::File::open(&path).expect("a fresh open");
+    assert!(
+        matches!(
+            aterm_toolchain::record_lock::RecordLock::try_lock(fresh, crate::ledger::RECORD_MAX),
+            Err(std::fs::TryLockError::WouldBlock)
+        ),
+        "its maker still holds its lock"
+    );
+    let listed = s.ledger.list().expect("listed");
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    drop(made);
+    assert!(s.ledger.list().expect("listed").is_empty());
 }

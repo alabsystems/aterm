@@ -10,13 +10,14 @@ use aterm_grapheme::{GraphemeClusters, grapheme_display_width};
 use super::view::EditorBufferView;
 
 pub(super) fn line_start(text: &str, position: usize) -> usize {
-    text[..position.min(text.len())]
+    let position = clamp_to_char_boundary(text, position);
+    text[..position]
         .rfind('\n')
         .map_or(0, |at| at.saturating_add(1))
 }
 
 pub(super) fn line_end(text: &str, position: usize) -> usize {
-    let position = position.min(text.len());
+    let position = clamp_to_char_boundary(text, position);
     text[position..]
         .find('\n')
         .map_or(text.len(), |relative| position.saturating_add(relative))

@@ -194,7 +194,7 @@ fn interrupted(stop: &AtomicBool) -> io::Result<()> {
     }
 }
 
-fn read_config(path: &Path) -> io::Result<(Vec<u8>, u32)> {
+pub(super) fn read_config(path: &Path) -> io::Result<(Vec<u8>, u32)> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())

@@ -141,6 +141,19 @@ impl Group {
             .filter_map(Bucket::reset_at)
             .max()
     }
+
+    /// When the group next refills from a quota wall: [`Self::unblocks_at`] when a limit is spent,
+    /// else the earliest reset among partially used limits (`remaining < 1.0`).
+    #[must_use]
+    pub fn wall_refills_at(&self) -> Option<i64> {
+        self.unblocks_at().or_else(|| {
+            self.buckets
+                .iter()
+                .filter(|b| !b.disabled && b.remaining.is_some_and(|f| f + f64::EPSILON < 1.0))
+                .filter_map(Bucket::reset_at)
+                .min()
+        })
+    }
 }
 
 /// How much a pool has left, as rotation reads it ([`Group::standing`]).
@@ -196,12 +209,37 @@ impl Group {
     pub fn holds(&self, model: &str) -> bool {
         let family = family(model);
         !family.is_empty()
-            && (self.name.to_ascii_lowercase().contains(&family)
-                || self
-                    .models
-                    .as_deref()
-                    .is_some_and(|m| m.to_ascii_lowercase().contains(&family)))
+            && (text_holds_family(&self.name, &family)
+                || self.models.as_deref().is_some_and(|m| {
+                    let body = strip_group_models_prefix(m);
+                    text_holds_family(body, &family)
+                }))
     }
+}
+
+fn strip_group_models_prefix(text: &str) -> &str {
+    const PREFIX: &str = "models within this group:";
+    let trimmed = text.trim();
+    if trimmed
+        .get(..PREFIX.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(PREFIX))
+    {
+        trimmed[PREFIX.len()..].trim()
+    } else {
+        trimmed
+    }
+}
+
+fn text_holds_family(text: &str, family: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    lower.match_indices(family).any(|(at, _)| {
+        let end = at + family.len();
+        let prev = at.checked_sub(1).and_then(|i| bytes.get(i)).copied();
+        let next = bytes.get(end).copied();
+        prev.is_none_or(|b| !b.is_ascii_alphanumeric() && b != b'-')
+            && next.is_none_or(|b| !b.is_ascii_alphanumeric())
+    })
 }
 
 /// A model's family: `gemini`, `claude`, `gpt-oss`, … — its first word, lowercased, `gpt-oss`
@@ -210,13 +248,24 @@ impl Group {
 pub fn family(model: &str) -> String {
     let lower = model.trim().to_ascii_lowercase();
     if lower.starts_with("gpt-oss") || lower.starts_with("gpt oss") {
-        return "gpt-oss".to_owned();
+        let rest = &lower["gpt-oss".len()..];
+        if rest
+            .as_bytes()
+            .first()
+            .is_none_or(|b| !b.is_ascii_alphanumeric())
+        {
+            return "gpt-oss".to_owned();
+        }
     }
-    lower
-        .split(['-', ' ', '_'])
-        .next()
-        .unwrap_or_default()
-        .to_owned()
+    let first = lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .find(|w| !w.is_empty())
+        .filter(|w| !matches!(*w, "model" | "models" | "within" | "this" | "group" | "and"))
+        .unwrap_or_default();
+    match first {
+        "opus" | "sonnet" | "haiku" => "claude".to_owned(),
+        _ => first.to_owned(),
+    }
 }
 
 /// agy's quota, every group.
@@ -309,12 +358,14 @@ impl Rotation {
             }
         }
         if let Some(v) = agy.get("order") {
-            let order: Option<Vec<String>> = v.as_array().map(|a| {
+            let order: Option<Vec<String>> = v.as_array().and_then(|a| {
                 a.iter()
-                    .filter_map(aterm_toml::Value::as_str)
-                    .map(str::trim)
-                    .filter(|m| !m.is_empty())
-                    .map(str::to_owned)
+                    .map(|item| {
+                        item.as_str()
+                            .map(str::trim)
+                            .filter(|m| super::upgrade::is_model_id(m) && !m.starts_with('-'))
+                            .map(str::to_owned)
+                    })
                     .collect()
             });
             match order.filter(|o| !o.is_empty()) {
@@ -476,6 +527,72 @@ pub fn pick(quota: &Quota, asked: &str, named: bool, rotation: &Rotation) -> Pic
     }
 }
 
+/// Choose the model for a running `agy` session stopped at a quota wall on screen on `asked`
+/// under `quota`.
+///
+/// Unlike [`pick`], a named model at a low pool (or a model stopped at a per-model quota wall
+/// after spending part of its pool) rotates to the first candidate in an open pool, else to the
+/// candidate in a low pool with the most left, else waits for the earliest refill. When `asked`'s
+/// pool has refilled to 100% (`Open`), `asked` is kept so the supervisor resumes it in place.
+#[must_use]
+pub fn pick_at_wall(quota: &Quota, asked: &str, rotation: &Rotation) -> Pick {
+    let Some(group) = quota.group_of(asked) else {
+        return Pick::Unknown {
+            model: asked.to_owned(),
+        };
+    };
+    let standing = group.standing(rotation.low);
+    let keep = Pick::Keep {
+        model: asked.to_owned(),
+        standing,
+    };
+    if !rotation.enabled {
+        return keep;
+    }
+    let bucket_full = group
+        .buckets
+        .iter()
+        .any(|b| !b.disabled && b.remaining.is_some_and(|f| (f - 1.0).abs() <= f64::EPSILON));
+    if standing == Standing::Open && bucket_full {
+        return keep;
+    }
+    let candidates: Vec<(&str, &Group)> = rotation
+        .order
+        .iter()
+        .filter_map(|m| quota.group_of(m).map(|g| (m.as_str(), g)))
+        .filter(|(_, g)| g.name != group.name)
+        .collect();
+    let open = candidates
+        .iter()
+        .find(|(_, g)| g.standing(rotation.low) == Standing::Open);
+    let low = || {
+        let left = |g: &Group| g.least_left().unwrap_or(0.0);
+        candidates
+            .iter()
+            .filter(|(_, g)| g.standing(rotation.low) == Standing::Low)
+            .fold(None, |best: Option<&(&str, &Group)>, c| match best {
+                Some(b) if left(b.1) >= left(c.1) => Some(b),
+                _ => Some(c),
+            })
+    };
+    match open.or_else(low) {
+        Some((to, g)) => Pick::Rotate {
+            from: asked.to_owned(),
+            from_standing: standing,
+            to: (*to).to_owned(),
+            to_standing: g.standing(rotation.low),
+        },
+        None if standing != Standing::Spent && bucket_full => keep,
+        None => Pick::Wait {
+            model: asked.to_owned(),
+            until: std::iter::once(group.wall_refills_at())
+                .chain(candidates.iter().map(|(_, g)| g.unblocks_at()))
+                .flatten()
+                .min(),
+        },
+    }
+}
+
 fn text(obj: &Map, key: &str) -> Option<String> {
     obj.get(key)
         .and_then(Value::as_str)
@@ -578,13 +695,22 @@ pub fn parse(doc: &str) -> Result<Quota, String> {
 pub fn parse_model(doc: &str) -> Result<String, String> {
     let root: Value = aterm_json::from_str(doc.trim())
         .map_err(|e| format!("agy's /model output is not JSON: {e}"))?;
+    let root = root
+        .as_object()
+        .ok_or_else(|| "agy's /model output is not a JSON object".to_owned())?;
+    if let Some(status) = text(root, "status")
+        && status != "SUCCESS"
+    {
+        let why = text(root, "response").unwrap_or_default();
+        return Err(format!("agy's /model reported {status}: {why}"));
+    }
     root.get("command")
         .filter(|c| c.get("name").and_then(Value::as_str) == Some("model"))
         .and_then(|c| c.get("data"))
         .and_then(|d| d.get("id"))
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|id| !id.is_empty())
+        .filter(|id| super::upgrade::is_model_id(id) && !id.starts_with('-'))
         .map(str::to_owned)
         .ok_or_else(|| "agy's /model output names no model id".to_owned())
 }
@@ -626,12 +752,13 @@ fn bucket_text(b: &Bucket, now: i64) -> String {
         Some(f) => {
             let _ = write!(s, "{} left", percent(f));
         }
-        None => s.push('?'),
+        // Never a bare `?`: agy's quota read named the limit and gave no fraction for it.
+        None => s.push_str("\u{2013} (no figure given)"),
     }
     if let Some(at) = b.reset_at()
         && b.remaining.is_none_or(|f| f < 1.0)
     {
-        let _ = write!(s, " (refills in {})", span(at - now));
+        let _ = write!(s, " (refills in {})", span(at.saturating_sub(now)));
     }
     s
 }
@@ -675,7 +802,7 @@ pub fn to_json(quota: &Quota, now: i64) -> Value {
                     o.insert("reset_time".to_owned(), Value::from(b.reset.clone()));
                     o.insert(
                         "reset_in_s".to_owned(),
-                        Value::from(b.reset_at().map(|at| (at - now).max(0))),
+                        Value::from(b.reset_at().map(|at| at.saturating_sub(now).max(0))),
                     );
                     o.insert("disabled".to_owned(), Value::from(b.disabled));
                     o.insert("spent".to_owned(), Value::from(b.spent()));

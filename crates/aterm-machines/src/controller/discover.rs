@@ -224,7 +224,7 @@ pub fn parse_browse(text: &str, service: &str) -> Vec<Instance> {
             "Rmv" => false,
             _ => continue,
         };
-        let (Ok(interface), true) = (cols[3].parse::<u32>(), cols[5] == want) else {
+        let (Some(interface), true) = (crate::parse_uint::<u32>(cols[3]), cols[5] == want) else {
             continue;
         };
         if name.is_empty() {
@@ -303,11 +303,11 @@ pub fn parse_resolve(text: &str) -> Vec<(String, u16)> {
             continue;
         };
         let host = host.trim_end_matches('.');
-        let Ok(port) = port.parse::<u16>() else {
+        let Some(port) = crate::parse_uint::<u16>(port).filter(|&p| p != 0) else {
             continue;
         };
         let plain = !host.is_empty()
-            && !host.starts_with('-')
+            && !host.starts_with(['.', '-'])
             && host
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'));
@@ -372,7 +372,7 @@ pub fn hosts_of(cidr: &str) -> Result<Vec<Ipv4Addr>, String> {
     let prefix: u8 = prefix
         .parse()
         .ok()
-        .filter(|p| *p <= 32)
+        .filter(|p| !prefix.starts_with('+') && *p <= 32)
         .ok_or_else(|| format!("{cidr:?}: /{prefix} is not a prefix length"))?;
     if prefix < WIDEST_PREFIX {
         return Err(format!(

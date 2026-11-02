@@ -148,6 +148,21 @@ fn the_rooms_persist_in_the_harness_state_directory() {
     rooms.save(tmp.path()).expect("saved");
     let back = Rooms::load(tmp.path());
     assert_eq!(back.meters["fsid:7"].days(), rooms.meters["fsid:7"].days());
+    let room_path = tmp.path().join(ROOM_FILE);
+    std::fs::write(&room_path, vec![b' '; 65 * 1024]).expect("oversize room file");
+    assert_eq!(Rooms::load(tmp.path()), Rooms::default());
+    #[cfg(unix)]
+    {
+        let real = tmp.path().join("real-room.json");
+        std::fs::write(&real, rooms.encode()).expect("real json");
+        std::fs::remove_file(&room_path).expect("removed oversize");
+        std::os::unix::fs::symlink(&real, &room_path).expect("linked");
+        assert_eq!(
+            Rooms::load(tmp.path()),
+            Rooms::default(),
+            "symlinked room file is refused"
+        );
+    }
 }
 
 #[test]

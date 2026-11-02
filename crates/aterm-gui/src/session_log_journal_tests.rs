@@ -257,12 +257,34 @@ fn the_gate_is_on_by_default_and_follows_the_desk() {
     assert!(default.session_log_journal(), "asked for by default");
     assert!(!off.session_log_journal(), "`journal = false` opts out");
     for desk in [Desk::Window, Desk::LabHeadless, Desk::Headless] {
-        assert!(!gate(&off, desk), "`journal = false` ({desk:?})");
-        assert!(
-            !gate(&no_restore, desk),
+        assert_eq!(
+            inactive(&off, desk),
+            Some(Inactive::Disabled),
+            "`journal = false` ({desk:?})"
+        );
+        assert_eq!(
+            inactive(&no_restore, desk),
+            Some(Inactive::RestoreOff),
             "follows restore_session ({desk:?})"
         );
+        assert_eq!(
+            admit(&off, desk, || panic!(
+                "an ineligible launch asks for no logs folder"
+            )),
+            Err(Off::Inactive(Inactive::Disabled))
+        );
     }
+    assert_eq!(
+        admit(&default, Desk::Window, || None),
+        Err(Off::NoFolder),
+        "an eligible launch with no logs folder says so"
+    );
+    assert_eq!(
+        admit(&default, Desk::Window, || Some(PathBuf::from(
+            "/private/tmp/x"
+        ))),
+        Ok(PathBuf::from("/private/tmp/x"))
+    );
     for (requested, restore, desk, supported, expected) in [
         (false, true, Desk::Window, true, Some(Inactive::Disabled)),
         (true, true, Desk::Window, false, Some(Inactive::Unsupported)),
@@ -273,13 +295,17 @@ fn the_gate_is_on_by_default_and_follows_the_desk() {
     ] {
         assert_eq!(eligibility(requested, restore, desk, supported), expected);
     }
-    assert_eq!(gate(&default, Desk::Window), cfg!(unix), "on by default");
+    assert_eq!(inactive(&default, Desk::Window), None, "on by default");
     assert_eq!(
-        gate(&default, Desk::LabHeadless),
-        cfg!(unix),
+        inactive(&default, Desk::LabHeadless),
+        None,
         "the lab's seam"
     );
-    assert!(!gate(&default, Desk::Headless), "headless keeps no desk");
+    assert_eq!(
+        inactive(&default, Desk::Headless),
+        Some(Inactive::NoDesk),
+        "headless keeps no desk"
+    );
 }
 
 /// with `journal = false` (the opt-out since D3 is on) the lane
@@ -301,7 +327,7 @@ fn journal_false_creates_nothing() {
         ..crate::app_config::Config::default()
     };
     let mut lane = Lane::new(
-        gate(&off, crate::desk::Desk::Window).then(|| logs.clone()),
+        admit(&off, crate::desk::Desk::Window, || Some(logs.clone())),
         false,
     );
     lane.start(crate::session_store::new_store());
@@ -318,6 +344,7 @@ fn journal_false_creates_nothing() {
     let mut failed = Lane {
         shared: Some(Arc::clone(&failed_shared)),
         logs: Some(logs.clone()),
+        off: None,
         armed: false,
         started: false,
     };
@@ -328,8 +355,18 @@ fn journal_false_creates_nothing() {
         failed.status(),
         Status {
             phase: Some(Phase::Stopped),
-            attention: Attention::Stopped(Cause::Spawn)
+            attention: Attention::Stopped(Cause::Spawn),
+            off: None,
         }
+    );
+    assert_eq!(
+        failed.status().words(),
+        "log_journal=stopped log_journal_why=spawn"
+    );
+    assert_eq!(
+        lane.status().words(),
+        "log_journal=off log_journal_why=disabled",
+        "the opted-out lane says why it keeps none"
     );
     assert_eq!(
         Arc::strong_count(&store),
@@ -1126,11 +1163,11 @@ fn a_journal_off_predecessor_hands_to_a_default_on_successor() {
         ..Config::default()
     };
     assert!(
-        !gate(&off, Desk::Window),
+        inactive(&off, Desk::Window).is_some(),
         "the predecessor keeps no journal"
     );
     assert!(
-        gate(&Config::default(), Desk::Window),
+        inactive(&Config::default(), Desk::Window).is_none(),
         "the successor's default keeps one"
     );
     let a: Timeline = Arc::new(Mutex::new(SessionTimeline::for_test()));
@@ -1340,6 +1377,7 @@ fn a_stuck_writer_never_holds_the_exit() {
     let lane = Lane {
         shared: Some(Arc::clone(&shared)),
         logs: None,
+        off: None,
         armed: false,
         started: true,
     };
@@ -3439,4 +3477,127 @@ fn the_real_journals_flushes_are_only_ordered() {
         "the directory's entries"
     );
     drop(held);
+}
+
+/// `status log_journal=`/`log_journal_why=` (fix unit E5): a lane the launch kept off names
+/// why, a running one says `on -`, and the writer's word wins over a phase it has not
+/// published yet, so a pause or a stop never reads as running.
+#[test]
+fn status_words_name_what_the_journal_does_and_why() {
+    for (off, why) in [
+        (Off::Inactive(Inactive::Disabled), "disabled"),
+        (Off::Inactive(Inactive::RestoreOff), "no-restore"),
+        (Off::Inactive(Inactive::NoDesk), "no-desk"),
+        (Off::Inactive(Inactive::Unsupported), "unsupported"),
+        (Off::NoFolder, "no-folder"),
+    ] {
+        assert_eq!(
+            Lane::new(Err(off), false).status().words(),
+            format!("log_journal=off log_journal_why={why}"),
+            "{off:?}"
+        );
+    }
+    assert_eq!(
+        Lane::inert().status().words(),
+        "log_journal=off log_journal_why=-"
+    );
+    let shared = Shared::new();
+    let lane = Lane {
+        shared: Some(Arc::clone(&shared)),
+        logs: None,
+        off: None,
+        armed: true,
+        started: true,
+    };
+    let words = |phase: Phase, attention: Attention| {
+        shared.phase.store(phase as u8, Ordering::Release);
+        shared.report.say(attention);
+        lane.status().words()
+    };
+    for (phase, attention, expected) in [
+        (Phase::Armed, Attention::None, "armed -"),
+        (Phase::Running, Attention::None, "on -"),
+        (
+            Phase::Running,
+            Attention::Paused(Cause::Full),
+            "paused full",
+        ),
+        (
+            Phase::Backoff,
+            Attention::Paused(Cause::Full),
+            "paused full",
+        ),
+        (Phase::Backoff, Attention::Paused(Cause::Io), "paused io"),
+        (
+            Phase::Running,
+            Attention::Stopped(Cause::Denied),
+            "stopped denied",
+        ),
+        (
+            Phase::Stopped,
+            Attention::Stopped(Cause::Unsupported),
+            "stopped no-lock",
+        ),
+        (
+            Phase::Stopped,
+            Attention::Stopped(Cause::Panic),
+            "stopped panic",
+        ),
+        (Phase::Stopped, Attention::None, "stopped -"),
+        (Phase::Handed, Attention::None, "handed -"),
+    ] {
+        let (journal, why) = expected.split_once(' ').expect("two words");
+        assert_eq!(
+            words(phase, attention),
+            format!("log_journal={journal} log_journal_why={why}"),
+            "{phase:?} {attention:?}"
+        );
+    }
+}
+
+/// `help status` names exactly the words `log_journal=` and `log_journal_why=` can print:
+/// each is one generated list ([`LogJournal::ALL`], [`JournalWhy::ALL`]), so a new word cannot
+/// reach `status` unnamed (fix unit E5).
+#[test]
+fn help_status_names_exactly_the_log_journal_words_aterm_writes() {
+    use std::collections::BTreeSet;
+    let help = aterm_types::control_verbs::spec("status")
+        .expect("the status verb")
+        .help_line();
+    let named = |key: &str| -> BTreeSet<String> {
+        let lists: Vec<&str> = help.split(&format!(" {key}=<")).skip(1).collect();
+        assert_eq!(lists.len(), 1, "help status names one {key}= vocabulary");
+        lists[0]
+            .split_once('>')
+            .expect("the vocabulary closes")
+            .0
+            .split('|')
+            .map(str::to_string)
+            .collect()
+    };
+    for (key, written) in [
+        (
+            "log_journal",
+            LogJournal::ALL
+                .iter()
+                .map(|w| w.word().to_string())
+                .collect::<BTreeSet<_>>(),
+        ),
+        (
+            "log_journal_why",
+            JournalWhy::ALL
+                .iter()
+                .map(|w| w.word().to_string())
+                .collect::<BTreeSet<_>>(),
+        ),
+    ] {
+        let named = named(key);
+        let unwritten: Vec<&String> = named.difference(&written).collect();
+        let unnamed: Vec<&String> = written.difference(&named).collect();
+        assert!(
+            unwritten.is_empty() && unnamed.is_empty(),
+            "help status names {key}= words nothing writes {unwritten:?} and leaves out words \
+             aterm writes {unnamed:?}"
+        );
+    }
 }

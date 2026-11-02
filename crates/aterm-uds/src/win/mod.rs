@@ -383,7 +383,9 @@ impl io::Read for &CtlStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let inner = &self.0;
         let timeout = inner.read_timeout_ms.load(Ordering::Relaxed);
-        let deadline = (timeout != 0).then(|| Instant::now() + Duration::from_millis(timeout));
+        let deadline = (timeout != 0).then(|| {
+            crate::deadline::saturating_after(Instant::now(), Duration::from_millis(timeout))
+        });
         let len = buf.len().min(i32::MAX as usize) as i32;
         loop {
             let n = unsafe { ffi::recv(inner.raw, buf.as_mut_ptr(), len, 0) };
@@ -423,7 +425,9 @@ impl CtlStream {
     fn send_with(&self, mut attempt: impl FnMut() -> Option<usize>) -> io::Result<usize> {
         let inner = &self.0;
         let timeout = inner.write_timeout_ms.load(Ordering::Relaxed);
-        let deadline = (timeout != 0).then(|| Instant::now() + Duration::from_millis(timeout));
+        let deadline = (timeout != 0).then(|| {
+            crate::deadline::saturating_after(Instant::now(), Duration::from_millis(timeout))
+        });
         loop {
             if let Some(n) = attempt() {
                 return Ok(n);

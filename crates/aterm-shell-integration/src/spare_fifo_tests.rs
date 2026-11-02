@@ -3,7 +3,6 @@
 
 use super::*;
 use aterm_spec::wait::MUST_HAPPEN;
-use std::path::PathBuf;
 
 fn mkfifo(path: &Path) {
     use std::os::unix::ffi::OsStrExt as _;
@@ -153,152 +152,278 @@ fn a_failed_wake_open_keeps_both_names_for_a_later_release() {
     // the failure boundary, not the EMFILE cause that can also reach it for a real FIFO.
     std::fs::create_dir(&path).unwrap();
     std::os::unix::fs::symlink(name, &link).unwrap();
-    assert!(release(&path, &link).is_none());
+    assert!(release(&path, &link, write_end).is_none());
     assert!(std::fs::symlink_metadata(&path).unwrap().is_dir());
     assert_eq!(std::fs::read_link(&link).unwrap(), Path::new(name));
 
     std::fs::remove_dir(&path).unwrap();
+    std::fs::write(&path, b"not a fifo").unwrap();
+    assert!(release(&path, &link, write_end).is_none());
+    assert!(std::fs::symlink_metadata(&path).unwrap().is_file());
+    assert_eq!(std::fs::read_link(&link).unwrap(), Path::new(name));
+    std::fs::remove_file(&path).unwrap();
+
+    let outside = dir.path().join("outside-fifo");
+    mkfifo(&outside);
+    std::os::unix::fs::symlink(&outside, &path).unwrap();
+    assert!(release(&path, &link, write_end).is_none());
+    assert!(
+        std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(std::fs::symlink_metadata(&outside).is_ok());
+    std::fs::remove_file(&path).unwrap();
+    std::fs::remove_file(&outside).unwrap();
+
     mkfifo(&path);
-    let wake = release(&path, &link).expect("the FIFO's read/write wake");
+    let wake = release(&path, &link, write_end).expect("the FIFO's read/write wake");
     assert!(std::fs::symlink_metadata(&path).is_err());
     assert!(std::fs::symlink_metadata(&link).is_err());
     drop(wake);
 }
 
-/// A dead owner's FIFO released while no reader holds it: a shell that resolved its link before
-/// the release and opens the FIFO while the release holds its wake gets through at once, and reads
-/// the end when the wake closes, though a child this process forked while the wake was held has
-/// yet to exec (on Darwin, where the wake is close-on-fork).
+/// Lines written through a read-write open of `late`, held until the caller drops it: a reader
+/// left waiting at any step of [`read_late`], or of a test's own read, gets through, so no thread
+/// is left blocked when a test fails.
+fn let_through(late: &Path) -> Option<std::fs::File> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let rescue = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(late)
+        .ok()?;
+    let _ = (&rescue).write_all(b"\n\n");
+    Some(rescue)
+}
+
+/// What a shell that resolved its FIFO as `late` before a release, and opens it only now, reads:
+/// its first line, then what the read after it returns (0 is end-of-file: nothing holds the FIFO
+/// open to write any more). A one-minute hang detector bounds the reads.
+fn read_late(
+    late: &Path,
+) -> Result<Result<(String, usize), std::io::ErrorKind>, std::sync::mpsc::RecvTimeoutError> {
+    use std::io::{BufRead as _, Read as _};
+    let (got, got_rx) = std::sync::mpsc::channel();
+    let shell = std::thread::spawn({
+        let late = late.to_owned();
+        move || {
+            let read = std::fs::File::open(&late)
+                .map(std::io::BufReader::new)
+                .and_then(|mut fifo| {
+                    let mut line = String::new();
+                    fifo.read_line(&mut line)?;
+                    let after = fifo.read(&mut [0u8; 8])?;
+                    Ok((line, after))
+                });
+            let _ = got.send(read.map_err(|e| e.kind()));
+        }
+    });
+    let read = got_rx.recv_timeout(MUST_HAPPEN);
+    let rescue = read.is_err().then(|| let_through(late));
+    shell.join().expect("the shell's thread");
+    drop(rescue);
+    read
+}
+
+/// The names left in `dir`.
+fn names_in(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .expect("read")
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+/// A dead owner's FIFO swept while no reader holds it: a shell that resolved its link before the
+/// unlinks and enters the FIFO's open only once the sweep has returned gets through, reads the
+/// line the sweep left there, and then end-of-file, once the sweep's wake has closed because the
+/// FIFO is empty.
 #[test]
-fn a_shell_opening_its_fifo_during_the_release_reads_the_end() {
-    use std::io::Read as _;
+fn a_shell_opening_its_fifo_after_the_sweep_reads_the_end_line_then_end_of_file() {
+    let dir = aterm_tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("7-1-s-0a");
+    mkfifo(&path);
+    std::os::unix::fs::symlink("7-1-s-0a", dir.path().join("s-0a")).expect("link");
+    // The FIFO as the shell holds it once it has resolved the link: a name the sweep keeps.
+    let late = dir.path().join("late");
+    std::fs::hard_link(&path, &late).expect("hard link");
+
+    sweep_dead_with(dir.path(), |_| None, |_| ProcessPresence::Absent);
+    assert_eq!(
+        names_in(dir.path()),
+        ["late"],
+        "the sweep unlinked the link and the FIFO"
+    );
+    assert_eq!(
+        read_late(&late),
+        Ok(Ok(("end\n".to_owned(), 0))),
+        "the shell's open finds the sweep's wake, reads its line, then the end of the file"
+    );
+}
+
+/// A shell that opens its FIFO as the release starts, so it waits in the open or enters it while
+/// the wake is held, is let through by the wake before the line is written, and the line comes
+/// only once both names are gone: read sooner, it would send the shell back to a name still
+/// there, to wait on the kept wake for a line that never comes.
+#[test]
+fn a_shell_in_its_fifos_open_reads_the_line_only_once_both_names_are_gone() {
+    use std::io::BufRead as _;
     use std::sync::mpsc::channel;
     let dir = aterm_tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("7-1-s-0a");
     mkfifo(&path);
     let link = dir.path().join("s-0a");
     std::os::unix::fs::symlink("7-1-s-0a", &link).expect("link");
-    // The FIFO as the shell holds it once it has resolved the link: a name the release keeps.
-    let resolved: PathBuf = dir.path().join("resolved");
-    std::fs::hard_link(&path, &resolved).expect("hard link");
-
-    let wake = release(&path, &link);
-    assert!(
-        std::fs::symlink_metadata(&link).is_err() && std::fs::symlink_metadata(&path).is_err(),
-        "the release unlinked the link and the FIFO"
-    );
+    let late = dir.path().join("late");
+    std::fs::hard_link(&path, &late).expect("hard link");
     let (opened, opened_rx) = channel();
-    let (read, read_rx) = channel();
+    let (line, line_rx) = channel();
     let shell = std::thread::spawn({
-        let resolved = resolved.clone();
+        let late = late.clone();
         move || {
-            let mut fifo = std::fs::File::open(&resolved).expect("open the FIFO");
-            let _ = opened.send(());
-            let mut buf = [0u8; 8];
-            let _ = read.send(fifo.read(&mut buf).map_err(|e| e.kind()));
+            let read = std::fs::File::open(&late).and_then(|fifo| {
+                let _ = opened.send(());
+                let mut got = String::new();
+                std::io::BufReader::new(fifo)
+                    .read_line(&mut got)
+                    .map(|_| got)
+            });
+            let _ = line.send(read.map_err(|e| e.kind()));
         }
     });
-    if opened_rx.recv_timeout(MUST_HAPPEN).is_err() {
-        // Let the waiting open through, so no thread is left blocked in it.
-        drop(
-            std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&resolved),
-        );
-        panic!("the shell's open waited: the release held no wake on the FIFO");
-    }
-    #[cfg(target_vendor = "apple")]
-    let forked = Parked::fork();
-    drop(wake);
-    assert_eq!(
-        read_rx.recv_timeout(MUST_HAPPEN),
-        Ok(Ok(0)),
-        "the shell reads the end once the wake closes"
-    );
-    #[cfg(target_vendor = "apple")]
-    forked.release();
+
+    let mut at_the_line = None;
+    let wake = release(&path, &link, |wake| {
+        at_the_line = Some((
+            opened_rx.recv_timeout(MUST_HAPPEN).is_ok(),
+            std::fs::symlink_metadata(&link).is_err() && std::fs::symlink_metadata(&path).is_err(),
+        ));
+        write_end(wake)
+    });
+    let got = line_rx.recv_timeout(MUST_HAPPEN);
+    let rescue = got.is_err().then(|| let_through(&late));
     shell.join().expect("the shell's thread");
+    drop((rescue, wake));
+    assert_eq!(
+        at_the_line,
+        Some((true, true)),
+        "when the line is written the wake has let the shell through, and both names are gone"
+    );
+    assert_eq!(got, Ok(Ok("end\n".to_owned())), "the shell reads the line");
 }
 
-/// A child forked from this process and parked before its exec, holding a copy of each of this
-/// process's descriptors that is not close-on-fork; it ends without an exec once released.
-#[cfg(target_vendor = "apple")]
-struct Parked {
-    go: Option<std::io::PipeWriter>,
-    spawner: Option<std::thread::JoinHandle<std::io::Result<std::process::Child>>>,
+/// Return once `reader`, a non-blocking reader of a FIFO, reads end-of-file: nothing writes the
+/// FIFO any more. A child that another test forks holds a copy of each descriptor until it execs,
+/// so a closed wake can go on writing for that long; what the FIFO still holds is read and passed
+/// over.
+fn until_end_of_file(reader: &mut std::fs::File, what: &str) {
+    use std::io::Read as _;
+    aterm_spec::wait::until_within(MUST_HAPPEN, what, || match reader.read(&mut [0u8; 8]) {
+        Ok(0) => Some(()),
+        Ok(_) => None,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => None,
+        Err(e) => panic!("{what}: {e}"),
+    });
 }
 
-#[cfg(target_vendor = "apple")]
-impl Parked {
-    /// Fork the child, and return once it is parked.
-    fn fork() -> Self {
-        use std::io::Read as _;
-        use std::os::fd::AsRawFd as _;
-        use std::os::unix::process::CommandExt as _;
-        let (mut forked_r, forked_w) = std::io::pipe().expect("pipe");
-        let (go_r, go_w) = std::io::pipe().expect("pipe");
-        let (forked_fd, go_fd, go_w_fd) =
-            (forked_w.as_raw_fd(), go_r.as_raw_fd(), go_w.as_raw_fd());
-        let spawner = std::thread::spawn(move || {
-            let mut cmd = std::process::Command::new("/usr/bin/true");
-            cmd.stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
-            // SAFETY: the hook runs in the forked child before its exec and calls only
-            // async-signal-safe functions (close, write, read) on descriptors this closure keeps
-            // open across the spawn; it ends the child before any exec.
-            unsafe {
-                cmd.pre_exec(move || {
-                    libc::close(go_w_fd);
-                    if libc::write(forked_fd, b"f".as_ptr().cast(), 1) != 1 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    let mut b = 0u8;
-                    while libc::read(go_fd, (&raw mut b).cast(), 1) < 0 {
-                        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
-                        {
-                            break;
-                        }
-                    }
-                    Err(std::io::Error::from_raw_os_error(libc::ECANCELED))
-                });
-            }
-            let spawned = cmd.spawn();
-            drop((forked_w, go_r));
-            spawned
-        });
-        let mut b = [0u8; 1];
-        forked_r.read_exact(&mut b).expect("the child forked");
-        Self {
-            go: Some(go_w),
-            spawner: Some(spawner),
+/// A kept wake closes once a shell has emptied its FIFO, or once a minute has passed with its line
+/// unread, and not before.
+#[test]
+fn a_kept_wake_closes_once_its_fifo_is_read_or_its_minute_is_up() {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let dir = aterm_tempfile::tempdir().expect("tempdir");
+    let released = |sid: &str| {
+        let path = dir.path().join(format!("7-1-{sid}"));
+        mkfifo(&path);
+        let late = dir.path().join(format!("late-{sid}"));
+        std::fs::hard_link(&path, &late).expect("hard link");
+        let wake = release(&path, &dir.path().join(sid), write_end).expect("the wake");
+        (wake, late)
+    };
+    let reader = |late: &Path| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(late)
+            .expect("a reader")
+    };
+    let mut buf = [0u8; 8];
+    let (read_wake, read_late) = released("s-0a");
+    let (unread_wake, unread_late) = released("s-0b");
+    let t0 = Instant::now();
+    let mut keeper = Keeper::default();
+    keeper.keep(read_wake, t0);
+    keeper.keep(unread_wake, t0);
+    let mut shell = reader(&read_late);
+    assert_eq!(
+        shell
+            .read(&mut buf)
+            .map(|n| buf[..n].to_vec())
+            .map_err(|e| e.kind()),
+        Ok(END.to_vec()),
+        "a shell reads one FIFO's line"
+    );
+
+    keeper.reap(t0);
+    assert_eq!(
+        keeper.kept.len(),
+        1,
+        "the emptied FIFO's wake closes; the other's line is unread"
+    );
+    until_end_of_file(
+        &mut shell,
+        "the emptied FIFO's closed wake to stop writing it",
+    );
+    keeper.reap(t0 + KEEP_FOR - Duration::from_millis(1));
+    assert_eq!(
+        keeper.kept.len(),
+        1,
+        "the unread line keeps its wake for its minute"
+    );
+    keeper.reap(t0 + KEEP_FOR);
+    assert!(keeper.kept.is_empty(), "its minute up, the wake closes");
+    until_end_of_file(
+        &mut reader(&unread_late),
+        "the unread FIFO's closed wake to stop writing it",
+    );
+}
+
+/// The hold's two ends: each close-on-exec, so no other child of the host's gets one; the host's
+/// writes never wait (`O_NONBLOCK`), and the shell's end blocks, as a hold's `read` needs (a
+/// non-blocking read fails at once and spends the retries). What the host writes, the shell's
+/// end reads, and once the host's end closes it reads end-of-file.
+#[test]
+fn the_hold_ends_are_close_on_exec_and_only_the_shells_blocks() {
+    use std::io::{Read as _, Write as _};
+    use std::os::fd::AsRawFd as _;
+    let dir = aterm_tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("7-1-s-0a");
+    mkfifo(&path);
+    let HoldEnds { host, shell } = hold_ends(&path).expect("the hold's ends");
+    let flags = |fd: i32| {
+        // SAFETY: `F_GETFD` and `F_GETFL` read the flags of `fd`, open here; no memory is touched.
+        unsafe {
+            (
+                libc::fcntl(fd, libc::F_GETFD) & libc::FD_CLOEXEC != 0,
+                libc::fcntl(fd, libc::F_GETFL) & libc::O_NONBLOCK != 0,
+            )
         }
-    }
-
-    /// End the child before its exec, and see it reaped.
-    fn release(mut self) {
-        drop(self.go.take());
-        let spawned = self
-            .spawner
-            .take()
-            .expect("forked")
-            .join()
-            .expect("the spawner");
-        assert_eq!(
-            spawned.err().and_then(|e| e.raw_os_error()),
-            Some(libc::ECANCELED),
-            "the child ended before its exec"
-        );
-    }
-}
-
-#[cfg(target_vendor = "apple")]
-impl Drop for Parked {
-    fn drop(&mut self) {
-        drop(self.go.take());
-        if let Some(spawner) = self.spawner.take() {
-            let _ = spawner.join();
-        }
-    }
+    };
+    assert_eq!(
+        (flags(host.as_raw_fd()), flags(shell.as_raw_fd())),
+        ((true, true), (true, false)),
+        "(close-on-exec, non-blocking) of the host's end, then the shell's"
+    );
+    (&host).write_all(b"go\n").expect("the host writes");
+    drop(host);
+    let mut read = String::new();
+    (&shell)
+        .read_to_string(&mut read)
+        .expect("the line, then end-of-file");
+    assert_eq!(read, "go\n");
 }

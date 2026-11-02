@@ -22,7 +22,7 @@ impl TerminalHandler<'_> {
     #[inline]
     fn parse_shell_osc(&self, params: &[&[u8]]) -> Option<(char, u64, u16)> {
         let code = params.get(1).and_then(|p| std::str::from_utf8(p).ok())?;
-        let cmd = code.chars().next()?;
+        let cmd = (code.len() == 1).then(|| code.chars().next()).flatten()?;
         let cursor = self.grid.cursor();
         let row = self.grid.visible_to_absolute(cursor.row);
         Some((cmd, row, cursor.col))
@@ -230,7 +230,7 @@ impl TerminalHandler<'_> {
 
     /// Leave and archive the alternate screen when a shell prompt (`A`) arrives on it.
     fn prompt_leaves_orphaned_alt_screen(&mut self, params: &[&[u8]]) {
-        if params.get(1).and_then(|p| p.first()) != Some(&b'A') {
+        if params.get(1).copied() != Some(b"A") {
             return;
         }
         self.drop_held_size_report();
@@ -460,7 +460,7 @@ impl TerminalHandler<'_> {
                     Some('x') => {
                         chars.next();
                         let hex: String = chars.by_ref().take(2).collect();
-                        if hex.len() == 2 {
+                        if hex.len() == 2 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
                             match u8::from_str_radix(&hex, 16) {
                                 Ok(byte) if byte.is_ascii() => result.push(byte as char),
                                 Ok(_) => result.push(char::REPLACEMENT_CHARACTER),
@@ -1052,12 +1052,15 @@ mod spare_mark_tests {
             "AtermStartFlags=pre:0,s:0",
             "AtermStartFlags=pre:0,s:0,j:0,r:2",
             "AtermStartFlags=pre:x,s:0,j:0,r:0",
+            "AtermStartFlags=pre:+0,s:0,j:0,r:0",
+            "AtermStartFlags=pre:0,s:+0,j:0,r:0",
+            "AtermStartFlags=pre:0,s:0,j:+0,r:0",
             "AtermStartFlags=pre:0,s:0,j:0,r:0,z:1",
             "AtermStartRc=",
         ] {
             t.process(&p(bad, &id));
         }
-        assert_eq!(t.spare_marks_refused(), 7);
+        assert_eq!(t.spare_marks_refused(), 10);
         assert!(!t.take_spare_parked());
         assert_eq!(t.take_start_mark(), None);
 
@@ -1082,7 +1085,7 @@ mod spare_mark_tests {
 
         record(&mut t, "/other", "pre:0,s:0,j:0,r:0", "cold");
         assert_eq!(t.take_start_mark(), None);
-        assert_eq!(t.spare_marks_refused(), 7, "a later record is not refused");
+        assert_eq!(t.spare_marks_refused(), 10, "a later record is not refused");
     }
 
     #[test]
@@ -1837,5 +1840,13 @@ mod dead_screen_carry_tests {
         local.process(b"\x1b[?1049hpager\x1b[H\x1b]133;A\x07PS> ");
         assert!(!local.is_alternate_screen(), "the local leave");
         assert_eq!(local.dead_alt_screen_carry(), None);
+        assert_eq!(
+            super::TerminalHandler::unescape_vscode_string("a\\x+ab\\x41"),
+            "a\\x+abA"
+        );
+        let mut alt = Terminal::new(ROWS, 40);
+        alt.process(b"\x1b[?1049hpager\x1b]133;Aextra\x07\x1b]633;Eextra;echo hi\x07");
+        assert!(alt.is_alternate_screen(), "multi-byte subcommand is not A");
+        assert_eq!(alt.take_osc_event(), None);
     }
 }

@@ -326,8 +326,12 @@ pub(crate) enum ChipFace {
     CruiseUntil,
     /// `⤓ land`: Land, its task open or unknown.
     Land,
-    /// `✓ landed`: under Land, a clean `Nothing left:` defense, and no repository check found work
-    /// left to land ([`aterm_agent::supervise::mode_words::LANDED_WORDS`]).
+    /// `✓ landed`: under Land, a clean `Nothing left:` defense, `LANDED` answered to the land
+    /// check (or codex-alab's own check), and no repository check found work left to land; its
+    /// hovered title says what aterm checked there in brief
+    /// ([`aterm_agent::supervise::mode_words::landed_brief`]) and its description whole, with
+    /// whether the land check was answered
+    /// ([`aterm_agent::supervise::mode_words::landed_words`], §14.9 slice 9c).
     Landed,
     /// `⤓ quiet`: a person's own exchange.
     Theirs,
@@ -885,9 +889,6 @@ pub(crate) struct BorderSwitch {
     /// The paint it was drawn with (`claude_footer::switch_words` rebuilds its words from it).
     pub(crate) paint: crate::claude_footer::SwitchPaint,
     pub(crate) program: aterm_phase::Program,
-    /// The line's Autopilot chip stood down beside it ([`crate::claude_footer::chip_stands_down`]),
-    /// so the line is the switch's alone.
-    pub(crate) chip_down: bool,
 }
 
 /// One panel row's title, `in Bash 4m12s` ([`WindowLights::panel_readings`]).
@@ -943,7 +944,7 @@ impl TitleReading {
         generation: u64,
         built: (AutopilotView, ChipGlass),
         read_words: impl FnOnce() -> ReadWords,
-        read_trail: impl FnOnce(bool) -> (String, Option<i64>),
+        read_trail: impl FnOnce(bool, bool) -> (String, Option<i64>),
     ) -> bool {
         if self.generation == generation && self.built == built {
             return false;
@@ -970,13 +971,17 @@ pub(crate) struct TitleParts {
 /// THE ONE COMPOSITION of an Autopilot chip's title under `built` (the view and glass a frame
 /// noted), from the words and the trail its readers give: the hover's reading
 /// ([`TitleReading::refresh`] and its first build) and `chrome`'s `title=` ([`title_parts`]).
+/// While a read hold is shown under `⤓ land`, the trail leaves out Land's own acts, which the
+/// hold's `landing since 10:30, 2 nudges` already says (said once, §14.4).
 fn compose_title(
     built: &(AutopilotView, ChipGlass),
     read_words: impl FnOnce() -> ReadWords,
-    read_trail: impl FnOnce(bool) -> (String, Option<i64>),
+    read_trail: impl FnOnce(bool, bool) -> (String, Option<i64>),
 ) -> TitleParts {
-    let (hold, need, stopped) = read_words();
-    let (trail, today) = read_trail(title_stamped(&built.1) || hold.is_some());
+    let (hold, need, stopped, switch, receipt, said) = read_words();
+    let held = ChipFace::of(built.0, &built.1) == ChipFace::Land
+        && hold.is_some_and(crate::harness_glass::HeldGlass::read);
+    let (trail, today) = read_trail(title_stamped(&built.1) || hold.is_some(), held);
     let (whole, short) = autopilot_title(
         built.0,
         &built.1,
@@ -984,8 +989,11 @@ fn compose_title(
         today,
         TitleWords {
             hold: hold.as_ref(),
+            said: said.as_deref(),
             need: need.as_ref(),
             stopped,
+            switch,
+            receipt: receipt.as_deref(),
         },
     );
     TitleParts {
@@ -1000,14 +1008,15 @@ fn compose_title(
 /// it reads now ([`compose_title`]).
 pub(crate) fn title_parts(
     harness_glass: &std::collections::HashMap<u64, crate::harness_glass::SessionGlass>,
+    hold_said: &HoldSaidMap,
     pool: &crate::SessionPool,
     session: u64,
     built: &(AutopilotView, ChipGlass),
 ) -> TitleParts {
     compose_title(
         built,
-        || title_words_of(harness_glass, pool, session),
-        |stamped| crate::harness_glass::trail_title(harness_glass, session, stamped),
+        || title_words_of(harness_glass, hold_said, pool, session),
+        |stamped, held| crate::harness_glass::trail_title(harness_glass, session, stamped, held),
     )
 }
 
@@ -1294,23 +1303,6 @@ impl WindowLights {
         (self.hover == at, self.selected == at)
     }
 
-    /// Whether the pointer or the keyboard is on `session`'s Autopilot chip, so its title is laid.
-    #[must_use]
-    pub(crate) fn autopilot_lit(&self, session: u64) -> bool {
-        let at = Some((session, Target::Chip(Chip::Autopilot)));
-        self.hover == at || self.selected == at
-    }
-
-    /// The frame cells `(row, col)` this frame painted `chip` of `session` in, left to right.
-    #[cfg(test)]
-    pub(crate) fn painted_cells(&self, session: u64, chip: Chip) -> Vec<(usize, usize)> {
-        self.hits
-            .iter()
-            .filter(|h| h.session == session && h.chip == Some(chip))
-            .map(|h| (h.frame_row, h.col))
-            .collect()
-    }
-
     /// Whether this frame drew a block of chips for `session`.
     #[must_use]
     pub(crate) fn shows_block(&self, session: u64) -> bool {
@@ -1427,22 +1419,6 @@ impl WindowLights {
     /// Fold in whether `session`'s mode row is rewritten on its pane's glass this frame.
     fn note_rewritten(&mut self, session: u64, rewritten: bool) {
         self.sessions.entry(session).or_default().rewritten = rewritten;
-    }
-
-    /// `session`'s chip is laid on its program's top line this frame
-    /// (`crate::claude_footer::ChipLine::TopLine`), where Autopilot is its one chip: what an
-    /// earlier program in the session left of Claude Code's lights (their reading, a toggle in
-    /// flight or refused, a toggle's notice, a fact menu's notice) and of the Team chip is let
-    /// go, or a tab that ran Claude Code in plan mode would lay its mode light beside the chip.
-    pub(crate) fn note_top_line(&mut self, session: u64) {
-        let s = self.sessions.entry(session).or_default();
-        s.shown = lights::Reading::UNKNOWN;
-        s.pending = None;
-        s.refused = None;
-        s.notice = None;
-        s.fact_notice = None;
-        s.team = None;
-        s.rewritten = false;
     }
 
     /// [`Self::note_autopilot_at`] at `now`.
@@ -2572,18 +2548,6 @@ impl ChipFace {
         self.glyph()
     }
 
-    /// The cells it takes laid whole with `glass` ([`Face::width`]): its glyph, its word and its
-    /// clock.
-    #[must_use]
-    pub(crate) fn cells(self, glass: &ChipGlass) -> usize {
-        Face {
-            word: self.word(),
-            clock: self.clock(glass),
-            ..Face::plain(self.glyph(), None, [0; 3])
-        }
-        .width()
-    }
-
     /// The word drawn a space after the glyph.
     #[must_use]
     pub(crate) const fn word(self) -> Option<&'static str> {
@@ -2666,8 +2630,11 @@ impl ChipFace {
         use crate::autopilot::mode_words;
         use aterm_agent::supervise::Autopilot;
         if let Some(stopped) = words.stop_under(self) {
-            let stop =
-                crate::harness_glass::stop_words(stopped, crate::harness_glass::HoldForm::Title);
+            let stop = crate::harness_glass::stop_words(
+                stopped,
+                crate::harness_glass::HoldForm::Title,
+                words.switch_under(self),
+            );
             let held = words
                 .hold
                 .filter(|_| self == ChipFace::Land)
@@ -2677,6 +2644,7 @@ impl ChipFace {
                         words.need,
                         crate::harness_glass::HoldForm::Title,
                         today,
+                        words.said,
                     )
                 });
             return Some(match held {
@@ -2697,6 +2665,7 @@ impl ChipFace {
                     words.need,
                     crate::harness_glass::HoldForm::Title,
                     today,
+                    words.said,
                 );
                 return Some(match held {
                     Some(held) if hold.read() => held.into(),
@@ -2706,7 +2675,11 @@ impl ChipFace {
                     None => sentence.into(),
                 });
             }
-            ChipFace::Landed => aterm_agent::supervise::mode_words::LANDED_WORDS,
+            ChipFace::Landed => {
+                return Some(
+                    aterm_agent::supervise::mode_words::landed_brief(words.receipt).into(),
+                );
+            }
             ChipFace::Theirs => {
                 "a person's own exchange; the harness types nothing until someone else's turn ends"
             }
@@ -2785,19 +2758,38 @@ pub(crate) const LEAN_FORMS: usize = aterm_agent::harness::footer::LEAN_FORMS;
 pub(crate) struct TitleWords<'a> {
     /// Land's hold as the loop told it, whatever the face.
     pub(crate) hold: Option<&'a crate::harness_glass::HeldGlass>,
+    /// The hold's own words, where the loop told them (slice 4b, [`crate::App::hold_said`]).
+    pub(crate) said: Option<&'a aterm_agent::harness::hold_said::HoldSaid>,
     /// The session's need, where the published one is a harness's own ask.
     pub(crate) need: Option<&'a crate::needs::HarnessAsk>,
     /// The arm that stopped the typing, as the loop told it, whatever the face (§14.3).
     pub(crate) stopped: Option<aterm_agent::harness::acts::HeldBy>,
+    /// The person's switch to Land would ask once more over the stop, as the loop told it
+    /// (`crate::harness_glass::SessionGlass::stop_switch`): said only under Cruise
+    /// ([`Self::switch_under`]).
+    pub(crate) switch: bool,
+    /// What aterm checked at the landing, beside a landed face (§14.9, slice 9c): the landed
+    /// title's explanation says it in brief (`mode_words::landed_brief`) and its screen-reader
+    /// description whole (`mode_words::landed_words`); `None` says aterm has no record of checking it.
+    pub(crate) receipt: Option<&'a aterm_agent::harness::acts::LandReceipt>,
 }
 
-/// What a title reads of a session beside its glass, copied out: Land's hold, the need and the
-/// stop ([`TitleWords`]).
+/// What a title reads of a session beside its glass, copied out: Land's hold, the need, the
+/// stop, whether the person's switch would ask over it, the landing's receipt, and the hold's
+/// own words
+/// ([`TitleWords`]).
 pub(crate) type ReadWords = (
     Option<crate::harness_glass::HeldGlass>,
     Option<crate::needs::HarnessAsk>,
     Option<aterm_agent::harness::acts::HeldBy>,
+    bool,
+    Option<std::sync::Arc<aterm_agent::harness::acts::LandReceipt>>,
+    Option<std::sync::Arc<aterm_agent::harness::hold_said::HoldSaid>>,
 );
+
+/// The Land holds' own words beside their glass ([`crate::App::hold_said`]).
+pub(crate) type HoldSaidMap =
+    std::collections::HashMap<u64, std::sync::Arc<aterm_agent::harness::hold_said::HoldSaid>>;
 
 impl<'a> TitleWords<'a> {
     /// The need said on its own part of the title (`· needs you: …; carrying on`).
@@ -2827,39 +2819,63 @@ impl<'a> TitleWords<'a> {
     pub(crate) fn stop_under(self, face: ChipFace) -> Option<aterm_agent::harness::acts::HeldBy> {
         self.stopped.filter(|_| face.carries())
     }
+
+    /// Whether the stop said under `face` names the person's switch to Land: where it would ask
+    /// once more, and only on a face that can switch to Land
+    /// ([`crate::harness_glass::switch_face`]).
+    #[must_use]
+    pub(crate) fn switch_under(self, face: ChipFace) -> bool {
+        self.switch && crate::harness_glass::switch_face(face)
+    }
 }
 
 /// The words a title reads of session `session` ([`TitleWords`]), copied out.
 fn title_words_of(
     glass: &std::collections::HashMap<u64, crate::harness_glass::SessionGlass>,
+    said: &HoldSaidMap,
     pool: &crate::SessionPool,
     session: u64,
 ) -> ReadWords {
     let own = glass.get(&session);
     let hold = own.and_then(crate::harness_glass::SessionGlass::hold);
     let stopped = own.and_then(crate::harness_glass::SessionGlass::stopped);
+    let (need, receipt) = with_title_reads(pool, session, |need, receipt| {
+        (need.cloned(), receipt.cloned())
+    });
     (
         hold,
-        with_harness_ask(pool, session, |need| need.cloned()),
+        need,
         stopped,
+        own.is_some_and(crate::harness_glass::SessionGlass::stop_switch),
+        receipt,
+        said.get(&session).cloned().filter(|_| hold.is_some()),
     )
 }
 
-/// Session `session`'s published need where it is a harness's ask.
-fn with_harness_ask<R>(
+/// Session `session`'s published need where it is a harness's ask, and what aterm checked at its
+/// landing beside a landed face (§14.9, slice 9c), read under the one lock of its timeline.
+fn with_title_reads<R>(
     pool: &crate::SessionPool,
     session: u64,
-    f: impl FnOnce(Option<&crate::needs::HarnessAsk>) -> R,
+    f: impl FnOnce(
+        Option<&crate::needs::HarnessAsk>,
+        Option<&std::sync::Arc<aterm_agent::harness::acts::LandReceipt>>,
+    ) -> R,
 ) -> R {
     match pool.get(session) {
-        Some(s) => f(s
-            .ctx
-            .timeline
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .need()
-            .harness_ask()),
-        None => f(None),
+        Some(s) => {
+            let timeline = s
+                .ctx
+                .timeline
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let receipt = timeline
+                .task_face()
+                .filter(|(face, _)| *face == aterm_agent::harness::acts::TaskFace::Landed)
+                .and_then(|_| timeline.land_receipt());
+            f(timeline.need().harness_ask(), receipt)
+        }
+        None => f(None, None),
     }
 }
 
@@ -3343,9 +3359,21 @@ impl App {
                     if reading.refresh(
                         generation,
                         built,
-                        || title_words_of(&self.harness_glass, &self.pool, session),
-                        |stamped| {
-                            crate::harness_glass::trail_title(&self.harness_glass, session, stamped)
+                        || {
+                            title_words_of(
+                                &self.harness_glass,
+                                &self.hold_said,
+                                &self.pool,
+                                session,
+                            )
+                        },
+                        |stamped, held| {
+                            crate::harness_glass::trail_title(
+                                &self.harness_glass,
+                                session,
+                                stamped,
+                                held,
+                            )
                         },
                     ) {
                         lights.fits += 1;
@@ -3359,7 +3387,13 @@ impl App {
                         today,
                         whole,
                         short,
-                    } = title_parts(&self.harness_glass, &self.pool, session, &built);
+                    } = title_parts(
+                        &self.harness_glass,
+                        &self.hold_said,
+                        &self.pool,
+                        session,
+                        &built,
+                    );
                     lights.fits += 1;
                     lights.readings.push(TitleReading {
                         session,
@@ -4723,9 +4757,17 @@ pub(crate) fn autopilot_description(
     last: Option<String>,
 ) -> Option<String> {
     let stopped = words.stop_under(face);
+    let switch = words.switch_under(face);
+    let landed = (face == ChipFace::Landed).then(|| {
+        format!(
+            "{}.",
+            aterm_agent::supervise::mode_words::landed_words(words.receipt)
+        )
+    });
     let parts: Vec<String> = [
+        landed,
         stopped.map(|arm| {
-            crate::harness_glass::stop_words(arm, crate::harness_glass::HoldForm::Spoken)
+            crate::harness_glass::stop_words(arm, crate::harness_glass::HoldForm::Spoken, switch)
         }),
         words.hold_under(face).and_then(|hold| {
             crate::harness_glass::hold_words(
@@ -4733,6 +4775,7 @@ pub(crate) fn autopilot_description(
                 words.need,
                 crate::harness_glass::HoldForm::Spoken,
                 today,
+                words.said,
             )
         }),
         words
@@ -4763,21 +4806,35 @@ impl App {
         let own = self.harness_glass.get(&session);
         let hold = own.and_then(crate::harness_glass::SessionGlass::hold);
         let stopped = own.and_then(crate::harness_glass::SessionGlass::stopped);
+        let switch = own.is_some_and(crate::harness_glass::SessionGlass::stop_switch);
         let held = TitleWords {
             hold: hold.as_ref(),
+            said: None,
             need: None,
             stopped: None,
+            switch: false,
+            receipt: None,
         }
         .hold_under(face)
         .is_some();
         let today = (glass.task_at.is_some() || glass.pause.is_some() || held)
             .then(|| crate::harness_glass::wall_today().1);
-        let last = crate::harness_glass::spoken_last_now(&self.harness_glass, session);
-        let description = with_harness_ask(&self.pool, session, |need| {
+        let read =
+            face == ChipFace::Land && hold.is_some_and(crate::harness_glass::HeldGlass::read);
+        let last = crate::harness_glass::spoken_last_now(&self.harness_glass, session, read);
+        let said = self
+            .hold_said
+            .get(&session)
+            .cloned()
+            .filter(|_| hold.is_some());
+        let description = with_title_reads(&self.pool, session, |need, receipt| {
             let words = TitleWords {
                 hold: hold.as_ref(),
+                said: said.as_deref(),
                 need,
                 stopped,
+                switch,
+                receipt: receipt.map(std::sync::Arc::as_ref),
             };
             autopilot_description(face, glass, words, today, last)
         });

@@ -5,7 +5,8 @@ use aterm_spec::derive::Model;
 
 /// Each provider recovers a checkpoint only against its current identity and parent binding.
 /// Native transitions cover clock rollback, deletion, legacy bindings, schema rejection and
-/// unrelated renewals inside the real account store.
+/// unrelated renewals inside the real account store. Only a committed recovery
+/// releases the captured local retry; unrelated holds remain.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn account_recovery_policy_model() -> Model {
@@ -13,6 +14,7 @@ pub fn account_recovery_policy_model() -> Model {
         AccountRecoveryPolicy {
             const Buggy = 0;
             var phase = 0; var provider = 1; var case = 1; var recovered = 0;
+            var local_hold = 1; var foreign_hold = 1;
             action AnotherProvider when (phase == 0 && provider <= 3) { provider = provider + 1; }
             action AnotherCase when (phase == 0 && case <= 30) { case = case + 1; }
             action Choose when (phase == 0) { phase = 1; }
@@ -41,6 +43,10 @@ pub fn account_recovery_policy_model() -> Model {
                         || (case == 18 && Buggy == 18) || (case == 21 && Buggy == 21)
                         || (case == 23 && Buggy == 23) || (case == 24 && Buggy == 24)
                         || (case == 25 && Buggy == 25) || (case == 26 && Buggy == 26) {1} else {0};
+                local_hold = if Buggy == 34 {1} else if Buggy == 35 {0}
+                    else if case == 1 || case == 9 || case == 19 || case == 20 || case == 22 || case == 30
+                        || ((case == 27 || case == 28 || case == 29) && provider <= 3) {0} else {1};
+                foreign_hold = if Buggy == 36 {0} else {1};
             }
             invariant AdmissibleRecoveryOnly: phase <= 1 || recovered == 0
                 || case == 1 || case == 9 || case == 19 || case == 20 || case == 22 || case == 30
@@ -50,6 +56,8 @@ pub fn account_recovery_policy_model() -> Model {
                 || case == 21 || case == 31 || (case > 22 && case <= 26)
                 || ((case == 27 || case == 28 || case == 29) && provider == 4)
                 || recovered == 1;
+            invariant RecoveryReleasesOwnRetry: phase <= 1 || local_hold + recovered == 1;
+            invariant ForeignRetryPreserved: foreign_hold == 1;
         }
     }
 }

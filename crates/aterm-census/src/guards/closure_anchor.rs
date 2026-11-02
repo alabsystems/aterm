@@ -134,24 +134,25 @@ fn anchors_in(file: &SourceFile, unlinked: bool) -> Vec<Anchor<'_>> {
     found
 }
 
-/// The length of the parenthesised argument list `code` starts with (blanks before it allowed),
-/// through its closing paren.
+/// The length of the bracketed argument list `code` starts with (blanks before it allowed),
+/// through its closing delimiter.
 fn arguments(code: &str) -> Option<usize> {
     let open = code.len() - code.trim_start().len();
-    if !code[open..].starts_with('(') {
-        return None;
-    }
+    let (open_ch, close_ch) = match code[open..].chars().next()? {
+        '(' => ('(', ')'),
+        '[' => ('[', ']'),
+        '{' => ('{', '}'),
+        _ => return None,
+    };
     let mut depth = 0usize;
     for (at, c) in code[open..].char_indices() {
-        match c {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(open + at + 1);
-                }
+        if c == open_ch {
+            depth += 1;
+        } else if c == close_ch {
+            depth -= 1;
+            if depth == 0 {
+                return Some(open + at + 1);
             }
-            _ => {}
         }
     }
     None
@@ -174,26 +175,26 @@ fn value<'a>(args: &'a str, key: &str) -> Option<&'a str> {
 /// `test` (`test`, `all(unix, test)`), read as the census reads a `cfg` that proves an item
 /// test-only?
 fn test_gated(before: &str) -> bool {
-    let Some(open) = before.rfind("cfg_attr(") else {
-        return false;
-    };
-    let inside = &before[open + "cfg_attr(".len()..];
-    let mut depth = 0usize;
-    let mut end = None;
-    for (at, c) in inside.char_indices() {
-        match c {
-            '(' => depth += 1,
-            // The `cfg_attr` closed before the anchor: the anchor is not its attribute.
-            ')' if depth == 0 => return false,
-            ')' => depth -= 1,
-            ',' if depth == 0 && end.is_none() => end = Some(at),
-            _ => {}
+    let item_start = before.rfind([';', '}']).map_or(0, |p| p + 1);
+    let slice = &before[item_start..];
+    super::hits(slice, "cfg_attr", super::Bound::Word).any(|at| {
+        let Some(inside) = super::after_ws(&slice[at + "cfg_attr".len()..], "(") else {
+            return false;
+        };
+        let mut depth = 0usize;
+        let mut end = None;
+        for (i, c) in inside.char_indices() {
+            match c {
+                '(' => depth += 1,
+                // The `cfg_attr` closed before the anchor: the anchor is not its attribute.
+                ')' if depth == 0 => return false,
+                ')' => depth -= 1,
+                ',' if depth == 0 && end.is_none() => end = Some(i),
+                _ => {}
+            }
         }
-    }
-    let Some(end) = end else {
-        return false;
-    };
-    crate::cfg_pred_entails_unshipped(&inside[..end])
+        end.is_some_and(|end| crate::cfg_pred_entails_unshipped(&inside[..end]))
+    })
 }
 
 /// `crates/<name>/` and the path inside it.
@@ -239,7 +240,9 @@ mod tests {
                      #[cfg_attr(any(test, all(test, unix)), aterm_spec_anchor::refines(\
                      machine = \"M\", action = \"G4\"))]\nfn g() {}\n\
                      #[cfg_attr(any(test, unix), aterm_spec_anchor::refines(\
-                     machine = \"M\", action = \"E\"))]\nfn h() {}\n";
+                     machine = \"M\", action = \"E\"))]\nfn h() {}\n\
+                     #[cfg_attr(test, cfg_attr(unix, aterm_spec_anchor::refines[\
+                     machine = \"M\", action = \"G5\"]))]\nfn i() {}\n";
         let found = run(
             &CLOSURE_ANCHOR,
             &[
@@ -273,6 +276,7 @@ mod tests {
                 "crates/x/src/gated.rs:5",
                 "crates/x/src/gated.rs:16",
                 "crates/x/src/gated.rs:18",
+                "crates/x/src/gated.rs:22",
                 "crates/x/src/lib.rs:9",
                 "crates/x/src/main.rs:3",
                 "crates/x/src/rig.rs:3",

@@ -352,7 +352,12 @@ fn columns() -> usize {
     }
     std::env::var("COLUMNS")
         .ok()
-        .and_then(|c| c.trim().parse::<usize>().ok())
+        .and_then(|c| {
+            let c = c.trim();
+            (!c.starts_with('+'))
+                .then(|| c.parse::<usize>().ok())
+                .flatten()
+        })
         .filter(|c| *c > 0)
         .unwrap_or(80)
 }

@@ -181,6 +181,16 @@ fn install_tools_env_saying(
         }
     }
     files.iter().try_for_each(crate::lay::write_in_process)?;
+    // The sidecar is the same record by another route (a launcher reaching the
+    // binary by its own path reads it there, never from a shim's text), so a lay
+    // carrying an env records it too, as `install_shim_env` does. A plain lay
+    // records nothing: the build's declaration stands over a shim laid plain
+    // (`crate::ops::exec_env`), and only a landing undeclares.
+    if !env.is_empty()
+        && let Some(build) = crate::shim_env::store_build_of(&build_dir.join("bin"))
+    {
+        crate::shim_env::write_sidecar(&build, env)?;
+    }
     #[cfg(all(test, unix))]
     for tool in tools {
         agents_checkpoint::at(layout, agents_checkpoint::Event::Written(tool.as_str()));
@@ -1361,10 +1371,20 @@ mod tests {
             crate::platform::shim_env_of(&shim_of(&layout, "claude")),
             crate::shim_env::ShimEnv::NONE
         );
+        assert_eq!(
+            crate::shim_env::read_sidecar(&b19),
+            env,
+            "a shim laid plain does not undeclare the build's env"
+        );
         install_tools_env(&layout, &b19, &[tool("claude")], Aliases::Off, &env).unwrap();
         assert_eq!(
             crate::platform::shim_env_of(&shim_of(&layout, "claude")),
             env
+        );
+        assert_eq!(
+            crate::shim_env::read_sidecar(&b19),
+            env,
+            "the recorded env follows an env-carrying lay"
         );
         activate_build(&layout, &b19).unwrap();
         undo_activation(&layout, &b19);

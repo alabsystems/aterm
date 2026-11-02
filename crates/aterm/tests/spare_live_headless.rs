@@ -19,6 +19,22 @@ fn shell() -> LoginShell {
     headless_boot::login_shell()
 }
 
+/// The file whose milliseconds the aterm [`boot_spare`] starts under `tmp` gives each spare's warm
+/// rc as it starts warming (`T_READY`): the hang detector, as every healthy rc here must reach its
+/// prompt however loaded the machine is, until a test that makes one spare slow lowers it.
+fn t_ready_file(tmp: &Path) -> PathBuf {
+    tmp.join("spare-t-ready-ms")
+}
+
+/// [`t_ready_file`] under `tmp` holds `ms`, put in place whole: the aterm reads it whenever a
+/// spare starts warming, so it never finds it empty or cut short.
+fn set_t_ready(tmp: &Path, ms: u128) {
+    let file = t_ready_file(tmp);
+    let next = tmp.join("spare-t-ready-ms.next");
+    std::fs::write(&next, ms.to_string()).expect("write T_READY");
+    std::fs::rename(&next, &file).expect("put T_READY in place");
+}
+
 fn boot_spare(prefix: &str, rc: &str, config: &str, seams: &[(&str, &str)]) -> Instance {
     let rc = rc.to_owned();
     let config = config.to_owned();
@@ -40,6 +56,8 @@ fn boot_spare(prefix: &str, rc: &str, config: &str, seams: &[(&str, &str)]) -> I
                 "ATERM_DEBUG_SPARE_PARKED_MS",
                 aterm_spec::wait::MUST_HAPPEN.as_millis().to_string(),
             );
+            set_t_ready(tmp, aterm_spec::wait::MUST_HAPPEN.as_millis());
+            cmd.env("ATERM_DEBUG_SPARE_TREADY_MS", t_ready_file(tmp));
             for (k, v) in &seams {
                 cmd.env(k, v);
             }
@@ -466,13 +484,9 @@ fn await_learned_spare_ready(inst: &Instance) {
                 gate_log(inst)
             );
         }
+        // Its warm rc is given the hang detector ([`t_ready_file`]), so a T_READY that ran out
+        // is no loaded machine's.
         if field(&m, "spare_gate") == Some("backoff") {
-            if field(&m, "spare_discard").is_some_and(|d| d.contains("rc_timeout:")) {
-                a_budget_decided_it(
-                    inst,
-                    "the learned generation's warm rc ran past its T_READY deadline",
-                );
-            }
             if field(&m, "spare_discard").is_some_and(|d| d.contains("escaped:"))
                 && let Some(escape) =
                     a_strangers_orphan(&log_through(inst, "verified at its hold: Backoff", 1))
@@ -563,29 +577,6 @@ fn await_private_file(inst: &Instance, path: &Path) {
             path.display(),
             ctl_ok(inst, &["metrics"]),
             gate_log(inst)
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-}
-
-fn await_slow_part(inst: &Instance, entered: &Path) {
-    let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
-    loop {
-        let timed_out = metric(inst, "spare_discard").contains("rc_timeout:");
-        if std::fs::symlink_metadata(entered).is_ok_and(|meta| meta.is_file()) {
-            return;
-        }
-        if timed_out {
-            a_budget_decided_it(
-                inst,
-                "the warm rc ran past its 1 s T_READY before it reached its slow part",
-            );
-        }
-        assert!(
-            Instant::now() < give_up,
-            "the warm rc never reached its slow part: {}\n{}",
-            ctl_ok(inst, &["metrics"]),
-            hang_report(inst)
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
@@ -1039,20 +1030,6 @@ impl Leftover {
     fn alive(&self) -> bool {
         aterm_pty::process_birth(self.pid) == Some(self.birth)
     }
-
-    /// Whether the shell runs and waits in the kernel: once nothing writes its FIFO, the only wait
-    /// its hold has left is the open of that FIFO.
-    fn waits(&self) -> bool {
-        let req = aterm_sysprobe::jobs::ReadReq {
-            pid: self.pid.unsigned_abs(),
-            fds: false,
-        };
-        aterm_sysprobe::jobs::JobsReader::new()
-            .read(req)
-            .is_some_and(|f| {
-                f.start == Some(self.birth) && f.state == aterm_sysprobe::jobs::RunState::Sleeping
-            })
-    }
 }
 
 impl Drop for Leftover {
@@ -1064,8 +1041,8 @@ impl Drop for Leftover {
     }
 }
 
-/// An rc whose warm spare ignores the hangup and writes its pid to `~/spare-pid`, so only a
-/// retire or a release of its FIFO ends it.
+/// An rc whose warm spare ignores the hangup and writes its pid to `~/spare-pid`, so the hangup a
+/// killed instance's closed master sends does not end it: a retire does, or its hold's end-of-file.
 const HUP_DEAF_RC: &str = "if [[ ${__aterm_spare_mode-} == warm ]]; then\n  trap '' HUP\n  echo $$ > \"$HOME/spare-pid\"\nfi\nPS1='SPARE%# '\n";
 
 /// [`boot_spare`] with [`HUP_DEAF_RC`], once its spare is ready: the instance and that spare.
@@ -1093,18 +1070,19 @@ fn boot_hup_deaf_spare(prefix: &str) -> (Instance, Leftover) {
 }
 
 #[test]
-fn a_crashed_instances_spare_is_released_by_the_next_launch() {
+fn a_crashed_instances_spare_ends_itself_and_the_next_launch_sweeps_its_fifo() {
     let (mut crashed, spare) = boot_hup_deaf_spare("aterm-spare-l12");
     let spare_dir = crashed.tmp.join("run/aterm/spare");
     crashed.child.kill().expect("SIGKILL the instance");
     crashed.child.wait().expect("reap the instance");
-    assert!(
-        spare.alive(),
-        "the HUP-ignoring spare outlived its instance"
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the HUP-ignoring spare ends at its hold once its instance is gone",
+        || (!spare.alive()).then_some(()),
     );
     assert!(
         !spare_entries(&spare_dir).is_empty(),
-        "and its FIFO with it"
+        "its FIFO outlives it: only the instance's own drop unlinks it"
     );
 
     let run = crashed.tmp.join("run");
@@ -1116,11 +1094,10 @@ fn a_crashed_instances_spare_is_released_by_the_next_launch() {
         |_| true,
     );
     let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
-    while spare.alive() || !spare_entries(&spare_dir).is_empty() {
+    while !spare_entries(&spare_dir).is_empty() {
         assert!(
             Instant::now() < give_up,
-            "the next launch never released the crashed instance's spare (alive: {}; left: {:?})",
-            spare.alive(),
+            "the next launch never swept the crashed instance's FIFO (left: {:?})",
             spare_entries(&spare_dir)
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -1128,49 +1105,27 @@ fn a_crashed_instances_spare_is_released_by_the_next_launch() {
 }
 
 #[test]
-fn a_test_worlds_teardown_releases_its_killed_instances_spare() {
-    let (mut inst, spare) = boot_hup_deaf_spare("aterm-spare-l15");
-    inst.child.kill().expect("SIGKILL the instance");
-    inst.child.wait().expect("reap the instance");
-    // The teardown starts once the shell waits opening its FIFO again: earlier, the world's removal
-    // could unlink the link before the shell looks for it, and the shell would end with no release.
-    aterm_spec::wait::until_within(
-        aterm_spec::wait::MUST_HAPPEN,
-        "the spare's shell waits opening its FIFO",
-        || spare.waits().then_some(()),
-    );
-    drop(inst);
-    let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
-    while spare.alive() {
-        assert!(
-            Instant::now() < give_up,
-            "the spare's shell (pid {}) outlived its instance's teardown",
-            spare.pid
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-}
-
-#[test]
 fn a_warm_spare_past_t_ready_is_killed_and_its_generation_backs_off() {
+    // The healthy warm rc takes longer than the T_READY the slow one is then given, as a loaded
+    // machine can make any rc take: only the spare that warms once the test lowers T_READY is
+    // held to it.
     let inst = boot_spare(
         "aterm-spare-l5",
         r#"if [[ ${__aterm_spare_mode-} == warm && -e $HOME/slow ]]; then
-  : > "$HOME/warm-rc-entered"
   while [[ ! -e $HOME/warm-rc-release ]]; do /bin/sleep 0.01; done
+elif [[ ${__aterm_spare_mode-} == warm ]]; then
+  /bin/sleep 2
 fi
 PS1='SPARE%# '
 "#,
         "spare_shell_needs_person = false",
-        &[
-            ("ATERM_DEBUG_SPARE_IDLE_MS", "100"),
-            ("ATERM_DEBUG_SPARE_TREADY_MS", "1000"),
-        ],
+        &[("ATERM_DEBUG_SPARE_IDLE_MS", "100")],
     );
     let _release = RcRelease(inst.tmp.join("home/warm-rc-release"));
     learn_three_visible_runs(&inst);
     await_learned_spare_ready(&inst);
     assert_eq!(metric(&inst, "spare_gate"), "eligible");
+    set_t_ready(&inst.tmp, 1000);
     std::fs::write(inst.tmp.join("home/slow"), b"").expect("slow");
     let sid = spawn(&inst, &[]);
     assert_eq!(
@@ -1178,7 +1133,7 @@ PS1='SPARE%# '
         "spare-ready",
         "the ready one was not held by the barrier"
     );
-    await_slow_part(&inst, &inst.tmp.join("home/warm-rc-entered"));
+    // The spare warming now never reaches its prompt: wherever its rc is at 1 s, T_READY ends it.
     let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     while !metric(&inst, "spare_discard").contains("rc_timeout:1") {
         assert!(Instant::now() < give_up, "{}", ctl_ok(&inst, &["metrics"]));

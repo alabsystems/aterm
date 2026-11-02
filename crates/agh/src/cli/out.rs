@@ -373,7 +373,10 @@ pub fn note(ctx: &mut Ctx, line: &str) {
 
 /// Appends a redacted receipt value to `out`, quoting when it contains spaces, quotes, or control bytes.
 pub(crate) fn receipt_value(out: &mut String, value: &str) {
-    if value.bytes().any(|b| b == b' ' || b == b'"' || b < 0x20) {
+    if value
+        .bytes()
+        .any(|b| b == b' ' || b == b'"' || b.is_ascii_control())
+    {
         out.push('"');
         push_escaped(out, value);
         out.push('"');

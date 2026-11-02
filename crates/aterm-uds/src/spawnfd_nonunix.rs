@@ -14,7 +14,12 @@ pub type StdCommand = std::process::Command;
 
 /// Non-Unix child command builder (`std::process::Command`).
 pub type Command = StdCommand;
+pub use crate::{SOFT_NOFILE_FLOOR, raised_soft_nofile_target};
 pub use std::process::{Child, Stdio};
+
+/// The Unix soft descriptor raise, a no-op off Unix: no `RLIMIT_NOFILE`
+/// governs a Windows process's handles.
+pub fn raise_soft_nofile() {}
 
 /// Run `spawn` once (non-Unix twin of the Unix `ETXTBSY` retry helper).
 ///

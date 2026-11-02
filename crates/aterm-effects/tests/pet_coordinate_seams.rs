@@ -1187,15 +1187,8 @@ fn an_adopted_body_goes_on_in_the_look_the_user_saw() {
         ("standing, then Enter", 3, 30, Some(&b"\r\n$ "[..])),
     ] {
         let mut h = Host::split_settled();
-        // The stretch and the stride are caught on spaces: a letter typed at a settled
-        // cat's feet springs it ahead of the keys instead (`PetBrain::first_keys_spring`).
-        let key: &[u8] = if matches!(case, "mid-stretch" | "mid-stride") {
-            b" "
-        } else {
-            b"l"
-        };
         for _ in 0..keys {
-            h.term.process(key);
+            h.term.process(b"l");
             h.present();
             h.present();
         }
@@ -1970,9 +1963,7 @@ fn caught(h: &mut Host, caught: &str) -> Shot {
             200,
         ),
         "mid-stretch" => {
-            // A space: a letter typed at the sleeper's feet springs it ahead of the keys
-            // instead of stretching (`PetBrain::first_keys_spring`).
-            h.term.process(b" ");
+            h.term.process(b"l");
             (
                 |p: &PetFrame| p.pose == PetGlyphId::PetStretch && p.scale_x > 1.05,
                 40,

@@ -18,6 +18,9 @@ fn canonical_host_chrome_order_is_base_then_tray_then_bell_then_overlay() {
         dx: 5,
         dy: 5,
         scrim: None,
+        serial: 0,
+        delta: None,
+        above: &[],
     };
     let overlay = OverlayGlow {
         accent: 0x0000_FF00,
@@ -70,6 +73,9 @@ fn a_tray_over_a_chrome_row_continues_through_the_remainder_bands() {
         dx: 0,
         dy: 3,
         scrim: None,
+        serial: 0,
+        delta: None,
+        above: &[],
     };
     for (edge_rows, invert) in [(0..5, false), (0..5, true), (0..2, false)] {
         let mut dst = vec![0u32; dw * dh];
@@ -159,6 +165,8 @@ fn band_aware_overlay_twins_shift_without_touching_bands() {
         fp: 0,
         geom: 0,
         raster_fingerprint_once: std::sync::OnceLock::new(),
+        serial: 0,
+        delta: None,
     };
     let mut t2 = vec![0u32; 4 * 3];
     composite_tray_at(&mut t2, 4, 3, 1, 2, &card);
@@ -190,6 +198,9 @@ fn a_tray_scrim_composites_as_the_window_sized_card_it_replaces() {
         dx,
         dy,
         scrim,
+        serial: 0,
+        delta: None,
+        above: &[],
     };
     let mut layered = base.clone();
     let scrim = aterm_gpu::TrayScrim { rgba: smoke, top };
@@ -216,6 +227,9 @@ fn a_tray_scrim_composites_as_the_window_sized_card_it_replaces() {
         dx: 0,
         dy: 0,
         scrim: None,
+        serial: 0,
+        delta: None,
+        above: &[],
     };
     composite_tray_quad_at(&mut baked, w, h, 0, 0, window_sized);
     assert_eq!(
@@ -252,6 +266,8 @@ fn composite_tray_src_over_and_clamps() {
         fp: 0,
         geom: 0,
         raster_fingerprint_once: std::sync::OnceLock::new(),
+        serial: 0,
+        delta: None,
     };
     let mut fb = vec![0x0010_2030u32; 4];
     composite_tray(&mut fb, 2, 2, &card(vec![0xAA, 0xBB, 0xCC, 0xFF], 0, 0));
@@ -291,6 +307,8 @@ fn tray_floor_crop_preserves_banner_and_exact_rgba_suffix() {
         fp: 0,
         geom: 0,
         raster_fingerprint_once: std::sync::OnceLock::new(),
+        serial: 0,
+        delta: None,
     };
     let original = card.rgba.clone();
     let quad = tray_quad_below_y(&card, 3).expect("two uncovered rows");

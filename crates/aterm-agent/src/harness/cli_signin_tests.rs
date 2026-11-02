@@ -296,6 +296,9 @@ fn kimi_env(tag: &str) -> (Tmp, Env) {
     (tmp, env)
 }
 
+/// Unix only, as the overlay staging home it signs in to is; off Unix,
+/// `a_sign_in_that_needs_an_overlay_runs_nothing_where_aterm_makes_no_links` holds the refusal.
+#[cfg(unix)]
 #[test]
 fn a_kimi_row_renews_through_its_own_sign_in_and_a_failed_one_changes_nothing() {
     let (tmp, env) = kimi_env("signin-kimi");
@@ -402,6 +405,9 @@ fn a_codex_row_is_proved_by_its_app_servers_account_and_another_account_is_refus
     );
 }
 
+/// Unix only, as the overlay staging home it signs in to is; off Unix,
+/// `a_sign_in_that_needs_an_overlay_runs_nothing_where_aterm_makes_no_links` holds the refusal.
+#[cfg(unix)]
 #[test]
 fn a_second_sign_in_waits_for_the_machines_lock_then_reports_it_held() {
     let (tmp, env) = kimi_env("signin-lock");
@@ -446,7 +452,12 @@ fn a_codex_sign_ins_staging_home_keeps_only_auth_json_under_codex_auth_path_and_
         .find(|l| l.contains("by hand with:"))
         .unwrap_or_default()
         .to_owned();
-    let staging = home.join(".aterm/logins/codex/codex-one+1");
+    // As the product joins it, a component at a time (`\` on Windows).
+    let staging = home
+        .join(".aterm")
+        .join("logins")
+        .join("codex")
+        .join("codex-one+1");
     assert!(
         said.contains("CODEX_AUTH_PATH=")
             && said.contains(&staging.join("auth.json").display().to_string()),
@@ -534,6 +545,9 @@ fn under_a_keyring_login_the_default_rows_renewal_refusal_is_its_own() {
     }
 }
 
+/// Unix only, as the overlay staging home its failed Kimi renewal signs in to is; off Unix,
+/// `a_sign_in_that_needs_an_overlay_runs_nothing_where_aterm_makes_no_links` holds the refusal.
+#[cfg(unix)]
 #[test]
 fn ledger_accounts_reads_the_named_clis_ledger() {
     let (tmp, env) = kimi_env("ledger-cli");
@@ -562,6 +576,37 @@ fn ledger_accounts_reads_the_named_clis_ledger() {
     assert!(parsed("ledger accounts --cli nope").is_err());
     assert!(parsed("ledger disk --cli kimi").is_err());
     assert!(parsed("ledger accounts --cli kimi --region global").is_err());
+}
+
+/// Off Unix, a renewal whose staging home is an overlay (Kimi's) runs no sign-in: aterm links an
+/// overlay only on Unix, so the renewal says so, binds nothing and leaves no staging home.
+#[cfg(not(unix))]
+#[test]
+fn a_sign_in_that_needs_an_overlay_runs_nothing_where_aterm_makes_no_links() {
+    let (tmp, env) = kimi_env("signin-no-links");
+    let home = tmp.path().join("home");
+    let store = env.accounts_store_for(Cli::Kimi).expect("kimi's store");
+    let before = read(&store.logins_file());
+    let host = SignInHost::new(Script::Kimi("kimi 0"), &home);
+    let (code, out, err) = renew("accounts renew kimi-one --cli kimi", &env, &host);
+    let said = format!("{out}{err}");
+    assert_eq!(code, exit(1), "{said}");
+    assert!(
+        said.contains("its staging home could not be linked to")
+            && said.contains("which aterm makes only on Unix")
+            && said.contains("nothing was run"),
+        "{said}"
+    );
+    assert_eq!(host.calls.get(), 0, "no sign-in ran");
+    assert!(
+        stagings(&home.join(".aterm").join("logins").join("kimi"), "kimi-one").is_empty(),
+        "staging removed"
+    );
+    assert_eq!(
+        read(&store.logins_file()),
+        before,
+        "the binding is unchanged"
+    );
 }
 
 #[test]
@@ -710,6 +755,54 @@ fn codex_adopt_default_checks_an_explicit_canonical_identity() {
     }
 }
 
+#[test]
+fn codex_stats_and_adoption_leave_non_file_credentials_untouched() {
+    fn no_file_read(
+        _: Cli,
+        _: &Path,
+        _: Option<&str>,
+        _: i64,
+    ) -> Option<crate::harness::codex_app_login::Usage> {
+        panic!("a non-file backend must not refresh dormant file credentials");
+    }
+    for configuration in [
+        "cli_auth_credentials_store = 'keyring'",
+        "cli_auth_credentials_store = 'auto'",
+        "cli_auth_credentials_store = 'ephemeral'",
+        "cli_auth_credentials_store = 'future'",
+        "not TOML",
+    ] {
+        let tmp = tmp_dir("codex-non-file-stats");
+        let env = env_at(&tmp);
+        let host = PoolHost {
+            account: Some("file-account@example.test"),
+            usage: Some(&no_file_read),
+        };
+        let path = tmp.path().join("accounts-codex.toml");
+        let home = env.home.as_ref().unwrap().join(".codex");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("config.toml"), configuration).unwrap();
+        let (code, out, err) = renew("accounts adopt-default new --cli codex", &env, &host);
+        assert_eq!(code, exit(1), "{configuration}: {out}{err}");
+        assert!(
+            !path.exists(),
+            "no earlier row can make this rejection pass"
+        );
+        std::fs::write(
+            home.join("config.toml"),
+            "cli_auth_credentials_store = 'file'",
+        )
+        .unwrap();
+        let (code, out, err) = renew("accounts adopt-default existing --cli codex", &env, &host);
+        assert_eq!(code, exit(0), "{out}{err}");
+        let before = read(&path);
+        std::fs::write(home.join("config.toml"), configuration).unwrap();
+        let (code, out, err) = renew("accounts stats --cli codex", &env, &host);
+        assert_eq!(code, exit(0), "{configuration}: {out}{err}");
+        assert_eq!(read(&path), before);
+    }
+}
+
 fn full_main(
     cli: Cli,
     home: &Path,
@@ -785,6 +878,10 @@ fn a_pools_stats_list_each_row_alike_as_text_and_json() {
 /// through) at its region's sign-in page, and records only the page's host and how the window
 /// ended. CONTROL: a mainland row opens kimi.com, and a window closed with nothing signed in
 /// exits 1.
+///
+/// Unix only, where aterm opens a sign-in window (`browser_window::no_window_desk_in`); off Unix,
+/// `a_grok_rows_next_steps_name_its_login_never_a_renewal` holds the refusal.
+#[cfg(unix)]
 #[test]
 fn accounts_browser_opens_the_rows_own_profile_at_its_regions_page_and_records_no_secret() {
     let (tmp, env) = kimi_env("browser-kimi");
@@ -856,6 +953,10 @@ fn accounts_browser_opens_the_rows_own_profile_at_its_regions_page_and_records_n
 /// fetch that failed opens nothing, takes no sign-in lock and makes no profile, and says why with
 /// what else works. CONTROL: with a window browser installed nothing is fetched; a row refused
 /// for its own reasons (no email) fetches nothing either.
+///
+/// Unix only, where aterm opens a sign-in window (`browser_window::no_window_desk_in`); off Unix,
+/// `a_grok_rows_next_steps_name_its_login_never_a_renewal` holds the refusal.
+#[cfg(unix)]
 #[test]
 fn accounts_browser_fetches_its_own_window_browser_where_none_is_installed() {
     let (tmp, env) = kimi_env("browser-fetch");
@@ -945,6 +1046,10 @@ fn accounts_browser_fetches_its_own_window_browser_where_none_is_installed() {
 /// build stays for the next run rather than that nothing was fetched. CONTROL: the same host's
 /// fetch giving the build opens the window in it
 /// (`accounts_browser_fetches_its_own_window_browser_where_none_is_installed`).
+///
+/// Unix only, where aterm opens a sign-in window (`browser_window::no_window_desk_in`); off Unix,
+/// `a_grok_rows_next_steps_name_its_login_never_a_renewal` holds the refusal.
+#[cfg(unix)]
 #[test]
 fn accounts_browser_stopped_as_its_fetch_placed_the_build_opens_nothing() {
     let (tmp, env) = kimi_env("browser-fetch-stopped");
@@ -985,6 +1090,10 @@ fn accounts_browser_stopped_as_its_fetch_placed_the_build_opens_nothing() {
 /// signals that would end this process, which is still held through the pass after the window
 /// and put back once the window is recorded; a pass that ran removes the mark. CONTROL: a pass
 /// that failed leaves the mark, for the next headless launch on the profile to make up.
+///
+/// Unix only, where aterm opens a sign-in window (`browser_window::no_window_desk_in`); off Unix,
+/// `a_grok_rows_next_steps_name_its_login_never_a_renewal` holds the refusal.
+#[cfg(unix)]
 #[test]
 fn accounts_browser_holds_its_ends_through_the_pass_after_the_window_and_marks_it_until_then() {
     let (tmp, env) = kimi_env("browser-holds");
@@ -1182,6 +1291,11 @@ fn accounts_browser_refuses_without_a_terminal_over_ssh_under_a_held_lock_or_an_
 
 /// `ACCOUNTS BROWSER` opens nothing for a row with no email, an unknown label, a Kimi row with no
 /// region (whose roster is refused whole) or a machine with no window browser.
+///
+/// Unix only, where aterm opens a sign-in window (`browser_window::no_window_desk_in`): off Unix
+/// every row is refused for that first, as `a_grok_rows_next_steps_name_its_login_never_a_renewal`
+/// holds.
+#[cfg(unix)]
 #[test]
 fn accounts_browser_refuses_no_email_no_region_no_window_browser_and_an_unknown_label() {
     let (tmp, env) = kimi_env("browser-rows");
@@ -1223,6 +1337,10 @@ fn accounts_browser_refuses_no_email_no_region_no_window_browser_and_an_unknown_
 
 /// A renewal whose page stops on the vendor's sign-in names `accounts browser` in its NEEDS YOU
 /// line. CONTROL: a stop for any other reason keeps naming `accounts login`.
+///
+/// Unix only, as the overlay staging home it signs in to is; off Unix,
+/// `a_sign_in_that_needs_an_overlay_runs_nothing_where_aterm_makes_no_links` holds the refusal.
+#[cfg(unix)]
 #[test]
 fn a_renewal_finding_the_profile_signed_out_names_accounts_browser() {
     let (tmp, env) = kimi_env("browser-renew");
@@ -1363,15 +1481,26 @@ fn a_grok_rows_next_steps_name_its_login_never_a_renewal() {
 
     let desk = SignInHost::desk(&home);
     let (code, out, err) = renew("accounts browser grok-one --cli grok", &env, &desk);
-    assert_eq!(code, exit(0), "{out}{err}");
-    assert_eq!(desk.opened.borrow().len(), 1, "one window");
-    assert!(
-        out.contains("next: aterm harness accounts login grok-one --cli grok")
-            && !out.contains("accounts renew")
-            && !out.contains("the renewal checks it")
-            && !out.contains("headlessly"),
-        "{out}"
-    );
+    if cfg!(unix) {
+        assert_eq!(code, exit(0), "{out}{err}");
+        assert_eq!(desk.opened.borrow().len(), 1, "one window");
+        assert!(
+            out.contains("next: aterm harness accounts login grok-one --cli grok")
+                && !out.contains("accounts renew")
+                && !out.contains("the renewal checks it")
+                && !out.contains("headlessly"),
+            "{out}"
+        );
+    } else {
+        // Off Unix aterm opens no sign-in window, and says so.
+        assert_eq!(code, exit(1), "{out}{err}");
+        assert!(
+            err.contains("not run: a sign-in window opens on macOS and Linux only")
+                && err.contains("nothing was opened"),
+            "{err}"
+        );
+        assert!(desk.opened.borrow().is_empty(), "no window");
+    }
 
     let store = env.accounts_store_for(Cli::Grok).expect("grok's store");
     let signed_out = SignInHost::new(
@@ -1403,18 +1532,22 @@ fn a_grok_rows_next_steps_name_its_login_never_a_renewal() {
         Some(accounts::SignInAction::Login)
     );
 
+    // The Kimi CONTROL signs in to an overlay staging home, which aterm links only on Unix
+    // (`a_sign_in_that_needs_an_overlay_runs_nothing_where_aterm_makes_no_links`).
     let kimi = env.accounts_store_for(Cli::Kimi).expect("kimi's store");
-    let (code, out, _) = renew("accounts renew kimi-one --cli kimi", &env, &signed_out);
-    assert_eq!(code, exit(1), "CONTROL: {out}");
-    assert!(
-        out.contains("accounts browser kimi-one --cli kimi")
-            && out.contains("aterm's later renewals approve its sign-in there by themselves"),
-        "CONTROL: {out}"
-    );
-    assert_eq!(
-        task(&kimi, "kimi-one"),
-        Some(accounts::SignInAction::Browser)
-    );
+    if cfg!(unix) {
+        let (code, out, _) = renew("accounts renew kimi-one --cli kimi", &env, &signed_out);
+        assert_eq!(code, exit(1), "CONTROL: {out}");
+        assert!(
+            out.contains("accounts browser kimi-one --cli kimi")
+                && out.contains("aterm's later renewals approve its sign-in there by themselves"),
+            "CONTROL: {out}"
+        );
+        assert_eq!(
+            task(&kimi, "kimi-one"),
+            Some(accounts::SignInAction::Browser)
+        );
+    }
 
     assert_eq!(
         accounts::SignInAction::Browser.next_step(Cli::Grok, "grok-one"),
@@ -1431,6 +1564,10 @@ fn a_grok_rows_next_steps_name_its_login_never_a_renewal() {
 /// A renewal whose page met Cloudflare's bot check, which did not clear, ends as a failure on
 /// record naming Cloudflare (design R-13): no NEEDS YOU line and no person's sign-in task, and
 /// its ledger row says `bot-check`. CONTROL: a stop on the vendor's sign-in still names one.
+///
+/// Unix only, as the overlay staging home it signs in to is; off Unix,
+/// `a_sign_in_that_needs_an_overlay_runs_nothing_where_aterm_makes_no_links` holds the refusal.
+#[cfg(unix)]
 #[test]
 fn a_renewal_on_a_bot_check_fails_on_record_and_asks_no_one() {
     let (tmp, env) = kimi_env("bot-check-renew");
@@ -1587,6 +1724,10 @@ fn an_unrecorded_bot_check_still_ends_as_a_bot_check() {
 
 /// `ACCOUNTS BROWSER` with no `--cli` serves Claude Code's pool: claude.ai's sign-in page, in the
 /// profile its headless opener keys on. CONTROL: the record lands in Claude Code's own ledger.
+///
+/// Unix only, where aterm opens a sign-in window (`browser_window::no_window_desk_in`); off Unix,
+/// `a_grok_rows_next_steps_name_its_login_never_a_renewal` holds the refusal.
+#[cfg(unix)]
 #[test]
 fn accounts_browser_serves_claude_codes_pool() {
     let tmp = tmp_dir("browser-claude");
@@ -1665,6 +1806,10 @@ fn accounts_browser_takes_one_label() {
 /// off, and its dropped identity-provider cookies are counted. CONTROLS: the session kept exits 0
 /// and names `renew`; a pass that could not run exits 1 and says the identity provider's sign-in
 /// may be left.
+///
+/// Unix only, where aterm opens a sign-in window (`browser_window::no_window_desk_in`); off Unix,
+/// `a_grok_rows_next_steps_name_its_login_never_a_renewal` holds the refusal.
+#[cfg(unix)]
 #[test]
 fn accounts_browser_judges_the_sign_in_by_the_vendors_session_never_a_cookie_store() {
     use crate::harness::browser_window::WindowEnd;
@@ -1777,6 +1922,11 @@ fn accounts_browser_opens_nothing_on_a_profile_a_headless_sign_in_holds() {
 /// a block page, its time ran out) is `NeedsPerson`, and one that met Cloudflare's bot check is
 /// `BotCheck`, which the background's backoff keys on alike. CONTROL: a sign-in the CLI said
 /// failed is a plain failure.
+///
+/// Unix only, as the overlay staging home its Kimi row signs in to is; off Unix,
+/// `a_sign_in_that_needs_an_overlay_runs_nothing_where_aterm_makes_no_links` holds the refusal
+/// and `a_grok_rows_next_steps_name_its_login_never_a_renewal` a stop for a person.
+#[cfg(unix)]
 #[test]
 fn a_renewal_that_stopped_for_a_person_says_so() {
     let (tmp, env) = kimi_env("renew-needs-person");
@@ -1830,6 +1980,9 @@ fn a_renewal_that_stopped_for_a_person_says_so() {
     );
 }
 
+/// Unix only, as the overlay staging home its Kimi row signs in to is; off Unix,
+/// `a_sign_in_that_needs_an_overlay_runs_nothing_where_aterm_makes_no_links` holds the refusal.
+#[cfg(unix)]
 #[test]
 fn a_background_renewal_keeps_its_human_step_when_both_output_streams_are_discarded() {
     let (tmp, env) = kimi_env("background-sign-in-task");
@@ -1961,7 +2114,11 @@ fn codex_signin_binds_auth_path_overlay_suffixes_reconcile_and_due_renewals_orde
     };
     let (code, out, err) = renew("accounts renew codex-one --cli codex", &env, &host);
     assert_eq!(code, exit(0), "{out}{err}");
-    let staging_one = home.join(".aterm/logins/codex/codex-one+1");
+    let staging_one = home
+        .join(".aterm")
+        .join("logins")
+        .join("codex")
+        .join("codex-one+1");
     let store = env.accounts_store_for(Cli::Codex).expect("codex store");
     let (logins, _) = store.load_logins(env.now).expect("logins");
     let file_roster =
@@ -1976,6 +2133,12 @@ fn codex_signin_binds_auth_path_overlay_suffixes_reconcile_and_due_renewals_orde
         env_one.value,
         Some(staging_one.join("auth.json").display().to_string())
     );
+
+    // The rest links overlay homes, which aterm makes only on Unix
+    // (`a_sign_in_that_needs_an_overlay_runs_nothing_where_aterm_makes_no_links`).
+    if !cfg!(unix) {
+        return;
+    }
 
     // `reconcile_staging_overlay_suffixes` adopts missing suffix files into `default_home` on an
     // overlay seam and never overwrites an existing default-home file.

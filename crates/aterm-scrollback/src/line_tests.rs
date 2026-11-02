@@ -280,6 +280,29 @@ fn deserialize_caps_hyperlink_span_count() {
         de.hyperlink_count() >= 1,
         "the cap keeps spans up to the limit, it does not drop them all"
     );
+
+    let mut v4 = line;
+    v4.set_underline_colors(vec![UnderlineColorSpan::new(0, 2, 0x01_11_22_33)]);
+    let v4_bytes = v4.serialize();
+    let v4_de = Line::deserialize(&v4_bytes).expect("v4 line with capped hyperlinks deserializes");
+    assert_eq!(v4_de.hyperlink_count(), MAX_HYPERLINK_SPANS);
+    assert_eq!(
+        v4_de.get_underline_color(0),
+        Some(0x01_11_22_33),
+        "excess hyperlink spans must still advance past the v3 hyperlink section to reach v4 underline colours"
+    );
+
+    let mut truncated_v4 = vec![
+        4, 0, // v4, no flags
+        2, 0, 0, 0, b'h', b'i', // content "hi"
+        0,    // has_attrs = 0
+        1, 0, // 1 hyperlink
+        0, 0, 2, 0, 100, 0, 0, 0, // start=0, end=2, url_len=100 (truncated!)
+    ];
+    // 10 trailing URL bytes that would look like [count=1][start=0][end=2][color=0x01ABCDEF] if misread as v4 underline colors.
+    truncated_v4.extend_from_slice(&[1, 0, 0, 0, 2, 0, 0xEF, 0xCD, 0xAB, 0x01]);
+    let trunc_de = Line::deserialize(&truncated_v4).expect("truncated v4 tail still returns line");
+    assert!(!trunc_de.has_underline_colors());
 }
 
 #[test]
@@ -1269,4 +1292,70 @@ fn bounded_line_blocks_preserve_wire_bytes_at_their_budget() {
         assert!(serialize_lines_bounded(&lines, 0).is_none());
         assert_eq!(deserialize_lines(&bounded).len(), lines.len());
     }
+}
+
+#[test]
+fn borrowed_line_blocks_preserve_the_owned_wire_format() {
+    use std::borrow::Cow;
+
+    let mut attrs = Rle::with_value(CellAttrs::from_raw(0x01_FF_00_00, DEFAULT_BG, 1), 1);
+    attrs.extend_with(CellAttrs::DEFAULT, 3);
+    let mut styled = Line::with_hyperlinks(
+        "é界e\u{301}",
+        attrs,
+        vec![HyperlinkSpan::with_id(
+            0,
+            4,
+            Arc::from("https://example.test/borrowed"),
+            Some(Arc::from("same-wire")),
+        )],
+    );
+    styled.set_wrapped(true);
+    styled.set_underline_colors(vec![UnderlineColorSpan::new(0, 4, 0x01_AA_BB_CC)]);
+    let lines = [Line::new(), Line::from("long ".repeat(80).as_str()), styled];
+    for count in 0..=lines.len() {
+        let views: Vec<_> = lines[..count]
+            .iter()
+            .enumerate()
+            .map(|(i, line)| {
+                if i % 2 == 0 {
+                    Cow::Borrowed(line)
+                } else {
+                    Cow::Owned(line.clone())
+                }
+            })
+            .collect();
+        let expected = serialize_lines(&lines[..count]);
+        assert_eq!(serialize_line_views(&views), expected);
+        assert_eq!(deserialize_lines(&expected).len(), count);
+    }
+}
+
+#[test]
+fn attribute_memory_counts_inline_and_spilled_runs() {
+    let attrs = CellAttrs::from_raw(1, 2, 3);
+    let uniform = Line::with_attrs("abc", Rle::with_value(attrs, 3));
+    let base = std::mem::size_of::<Line>() + std::mem::size_of::<Rle<CellAttrs>>();
+    assert_eq!(
+        uniform.memory_used(),
+        base,
+        "short text and one run are inline"
+    );
+    let mut mixed = Rle::with_value(attrs, 1);
+    mixed.extend_with(CellAttrs::from_raw(3, 4, 5), 1);
+    let two = Line::with_attrs("ab", mixed.clone());
+    assert_eq!(two.memory_used(), base, "two style runs stay inline");
+    mixed.extend_with(CellAttrs::from_raw(6, 7, 8), 1);
+    let run_heap = mixed.heap_bytes();
+    assert!(run_heap > 0);
+    let mut three = Line::with_attrs("abc", mixed);
+    assert_eq!(three.memory_used(), base + run_heap);
+    let runs = three.attrs.as_mut().unwrap();
+    runs.set_range(0, 3, attrs);
+    assert_eq!(runs.run_count(), 1);
+    assert_eq!(
+        three.memory_used(),
+        base + run_heap,
+        "collapsing runs retains the allocated heap capacity"
+    );
 }

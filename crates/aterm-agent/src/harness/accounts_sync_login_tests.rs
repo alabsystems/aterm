@@ -462,6 +462,7 @@ fn a_default_row_the_roster_already_named_is_healed_by_one_check() {
         heal,
         DefaultHeal {
             label: "m2-2".to_owned(),
+            expected_identity: "proton.m2@example.test".to_owned(),
             signed_out_at: NOW + 20,
             was: Some("m2".to_owned()),
         }

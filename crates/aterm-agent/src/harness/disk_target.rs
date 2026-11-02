@@ -94,6 +94,7 @@ pub const PROJECTED_MIN_IDLE_S: i64 = 60 * 60;
 
 #[cfg(any(unix, windows))]
 const MAX_DELETE_DEPTH: usize = 256;
+const MAX_CUSTODY_DEPTH: usize = 256;
 
 /// The profile walk's bounds.
 #[derive(Debug, Clone, Copy)]
@@ -230,6 +231,7 @@ impl TargetDir {
 
     /// The fences a build directory must clear before anything in it is removed.
     pub fn fences(&self) -> Result<String, String> {
+        ordinary_custody(&self.path)?;
         if let Some(why) = &self.volume {
             return Err(why.clone());
         }
@@ -735,8 +737,29 @@ fn off_fixed_disk(path: &Path) -> Option<String> {
     }
 }
 
+fn managed_cache(path: &Path) -> bool {
+    atpkg::build_cache::registered::custody_present(path)
+}
+
+const MANAGED_CACHE: &str =
+    "its registered build-cache policy owns retirement, not ordinary target cleanup";
+
+fn ordinary_custody(path: &Path) -> Result<(), String> {
+    for (depth, ancestor) in path.ancestors().enumerate() {
+        if depth >= MAX_CUSTODY_DEPTH {
+            return Err("its build-cache ancestry is too deep to establish custody".into());
+        }
+        if managed_cache(ancestor) {
+            return Err(MANAGED_CACHE.into());
+        }
+    }
+    Ok(())
+}
+
 fn root_facts(path: &Path) -> (Option<String>, Option<String>) {
-    let marker = if cachedir_tag_signed(&path.join("CACHEDIR.TAG")) {
+    let marker = if managed_cache(path) {
+        None
+    } else if cachedir_tag_signed(&path.join("CACHEDIR.TAG")) {
         Some("CACHEDIR.TAG".to_owned())
     } else if std::fs::symlink_metadata(path.join(RUSTC_INFO)).is_ok_and(|m| m.is_file()) {
         Some(RUSTC_INFO.to_owned())
@@ -769,6 +792,8 @@ mod held {
         /// Take `file`'s `flock` (Windows: `LockFileEx`) exclusively without waiting.
         pub(super) fn try_take(file: std::fs::File) -> io::Result<Option<HeldLock>> {
             let file: std::fs::File = file;
+            #[cfg(unix)]
+            aterm_uds::keep_out_of_children(&file)?;
             #[expect(
                 clippy::disallowed_methods,
                 reason = "the guard's own take: its Drop releases by LOCK_UN"
@@ -916,6 +941,8 @@ pub enum Stage {
     Locked,
     Deleting,
     Released,
+    #[cfg(test)]
+    Removing,
 }
 
 /// Reclaim one build directory's idle `incremental/` caches.
@@ -935,6 +962,32 @@ pub fn reclaim_with(
     hook: &mut dyn FnMut(Stage, &Path),
 ) -> io::Result<Removed> {
     fd::reclaim(path, judge, Select::Idle { leave: &[] }, hook)
+}
+
+/// Remove an independently admitted cache entry through pinned directory descriptors.
+/// The caller supplies its surveyed identity and a cheap, live policy permission check.
+/// Managed build custody and a refusal from `permit` stop the whole pass; any bytes already
+/// released and the reason for a partial removal are retained in [`Removed`].
+/// # Errors
+/// The entry cannot be pinned on a fixed local volume, is a link or special file, its identity
+/// changed, or custody or the caller's permission cannot be established before deletion starts.
+pub fn remove_unmanaged_tree(
+    path: &Path,
+    expected: aterm_sysprobe::volumes::FileId,
+    permit: &mut dyn FnMut() -> Result<(), String>,
+) -> io::Result<Removed> {
+    fd::remove_unmanaged_tree(path, expected, permit)
+}
+
+/// Establish that an entry's pinned ancestors and reachable subtree carry no managed custody.
+/// Directory links are skipped, never followed. This read grants no removal authority and
+/// does not replace the remover's live checks.
+/// # Errors
+/// The path cannot be pinned, a custody marker is present or unreadable, a directory is on
+/// another device or unreadable, the entry is not a regular file or directory, or a bound ends
+/// the scan before it is complete.
+pub fn unmanaged_custody(path: &Path, budget: WalkBudget) -> Result<(), String> {
+    fd::unmanaged_custody(path, budget)
 }
 
 /// Under pressure, reclaim one profile's `incremental/`.
@@ -1085,8 +1138,9 @@ impl Select<'_> {
 #[cfg(any(unix, windows))]
 mod fd {
     use super::{
-        CACHE_DIRS, CARGO_LOCKS, CLOCK_DIRS, HeldLock, INCREMENTAL, Judge, MAX_DELETE_DEPTH, Path,
-        PathBuf, Removed, Select, Stage, TargetDir, WalkBudget, io, root_facts,
+        CACHE_DIRS, CARGO_LOCKS, CLOCK_DIRS, HeldLock, INCREMENTAL, Judge, MAX_CUSTODY_DEPTH,
+        MAX_DELETE_DEPTH, Path, PathBuf, Removed, Select, Stage, TargetDir, WalkBudget, io,
+        root_facts,
     };
     use aterm_dirfd::{self as dirfd, AtFlags, Dir, Errno, Mode, OFlags, OwnedFd};
     #[cfg(windows)]
@@ -1124,6 +1178,60 @@ mod fd {
 
     fn dir_flags() -> OFlags {
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK
+    }
+
+    fn marker_absent_at(root: &OwnedFd) -> Result<(), String> {
+        for marker in atpkg::build_cache::registered::CUSTODY_MARKERS {
+            match dirfd::openat(
+                root,
+                *marker,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+                Mode::empty(),
+            ) {
+                Err(error) if error.0 == code::NOENT => {}
+                _ => return Err(super::MANAGED_CACHE.into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Follow the pinned directory's actual parents, including after a rename.
+    #[cfg(unix)]
+    fn ordinary_custody_at(root: &OwnedFd, _: &Path) -> Result<(), String> {
+        let mut parent = None;
+        for _ in 0..MAX_CUSTODY_DEPTH {
+            let current = parent.as_ref().unwrap_or(root);
+            marker_absent_at(current)?;
+            let next = dirfd::openat(current, "..", dir_flags(), Mode::empty())
+                .map_err(|e| format!("its build-cache ancestry could not be opened: {e}"))?;
+            let identity = |fd: &OwnedFd| dirfd::fstat(fd).map(|s| (s.st_dev, s.st_ino));
+            if identity(current).map_err(|e| e.to_string())?
+                == identity(&next).map_err(|e| e.to_string())?
+            {
+                return Ok(());
+            }
+            parent = Some(next);
+        }
+        Err("its build-cache ancestry is too deep to establish custody".into())
+    }
+
+    /// Windows does not admit `..` relative opens; refuse a changed name and pin each ancestor.
+    #[cfg(windows)]
+    fn ordinary_custody_at(root: &OwnedFd, path: &Path) -> Result<(), String> {
+        marker_absent_at(root)?;
+        let named = pin(path).map_err(|e| e.to_string())?;
+        if dirfd::file_id(&named).map_err(|e| e.to_string())?
+            != dirfd::file_id(root).map_err(|e| e.to_string())?
+        {
+            return Err("its name now names another directory".into());
+        }
+        for (depth, ancestor) in path.ancestors().enumerate() {
+            if depth >= MAX_CUSTODY_DEPTH {
+                return Err("its build-cache ancestry is too deep to establish custody".into());
+            }
+            marker_absent_at(&pin(ancestor).map_err(|e| e.to_string())?)?;
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1687,17 +1795,59 @@ mod fd {
         kept: Vec<String>,
     }
 
+    struct Removal<'a> {
+        on: u64,
+        custody: Option<(&'a OwnedFd, &'a Path)>,
+        revoked: bool,
+        _hook: &'a mut dyn FnMut(Stage, &Path),
+        permit: Option<&'a mut dyn FnMut() -> Result<(), String>>,
+    }
+
+    impl Removal<'_> {
+        fn permit(&mut self, at: (&OwnedFd, &Path), here: &Path, out: &mut Deleted) -> bool {
+            if self.revoked {
+                return false;
+            }
+            #[cfg(test)]
+            (self._hook)(Stage::Removing, here);
+            if let Some(permit) = &mut self.permit
+                && let Err(why) = permit()
+            {
+                self.revoked = true;
+                out.kept.push(format!("{}: {why}", here.display()));
+                return false;
+            }
+            if let Some((root, path)) = self.custody
+                && let Err(why) = ordinary_custody_at(root, path).and_then(|()| {
+                    if std::ptr::eq(root, at.0) {
+                        Ok(())
+                    } else {
+                        ordinary_custody_at(at.0, at.1)
+                    }
+                })
+            {
+                self.revoked = true;
+                out.kept.push(format!("{}: {why}", here.display()));
+                return false;
+            }
+            true
+        }
+    }
+
     #[cfg(unix)]
     fn remove_tree_at(
         parent: &OwnedFd,
         child: &Child,
         at: &Path,
-        on: u64,
         depth: usize,
         out: &mut Deleted,
+        pass: &mut Removal<'_>,
     ) {
         let name = child.name.as_os_str();
         let here = at.join(name);
+        if !pass.permit((parent, at), &here, out) {
+            return;
+        }
         let dir = match dirfd::openat(parent, name, dir_flags(), Mode::empty()) {
             Ok(fd) => Some(fd),
             Err(Errno::NOENT) => return,
@@ -1713,6 +1863,9 @@ mod fd {
             let freed = open_file(parent, name)
                 .and_then(|f| f.metadata().ok())
                 .map_or(0, |m| super::released(&m));
+            if !pass.permit((parent, at), &here, out) {
+                return;
+            }
             match dirfd::unlinkat(parent, name, AtFlags::empty()) {
                 Ok(()) => out.bytes = out.bytes.saturating_add(freed),
                 Err(Errno::NOENT) => {}
@@ -1722,7 +1875,10 @@ mod fd {
             }
             return;
         };
-        if dev(&fd).ok() != Some(on) {
+        if !pass.permit((&fd, &here), &here, out) {
+            return;
+        }
+        if dev(&fd).ok() != Some(pass.on) {
             return out.kept.push(format!(
                 "{} is on another device and was not entered",
                 here.display()
@@ -1738,10 +1894,16 @@ mod fd {
             Ok(mut children) => {
                 children.sort_by_key(|c| CARGO_LOCKS.iter().any(|l| c.name == *l));
                 for child in children {
-                    remove_tree_at(&fd, &child, &here, on, depth + 1, out);
+                    remove_tree_at(&fd, &child, &here, depth + 1, out, pass);
+                    if pass.revoked {
+                        return;
+                    }
                 }
             }
             Err(e) => out.kept.push(format!("{}: {e}", here.display())),
+        }
+        if !pass.permit((parent, at), &here, out) {
+            return;
         }
         match dirfd::unlinkat(parent, name, AtFlags::REMOVEDIR) {
             Ok(()) | Err(Errno::NOENT) => {}
@@ -1757,12 +1919,15 @@ mod fd {
         parent: &OwnedFd,
         child: &Child,
         at: &Path,
-        on: u64,
         depth: usize,
         out: &mut Deleted,
+        pass: &mut Removal<'_>,
     ) {
         let name = child.name.as_os_str();
         let here = at.join(name);
+        if !pass.permit((parent, at), &here, out) {
+            return;
+        }
         let keep = |out: &mut Deleted, e: Errno| {
             out.kept
                 .push(format!("{}: {}", here.display(), io::Error::from(e)));
@@ -1777,6 +1942,9 @@ mod fd {
             } else {
                 released_at(parent, child)
             };
+            if !pass.permit((parent, at), &here, out) {
+                return;
+            }
             match dirfd::unlinkat(parent, name, AtFlags::empty(), child.id) {
                 Ok(()) => out.bytes = out.bytes.saturating_add(freed),
                 Err(Errno::NOENT | Errno::DELETE_PENDING) => {}
@@ -1799,7 +1967,10 @@ mod fd {
             Ok(_) => return keep(out, Errno::CHANGED),
             Err(e) => return keep(out, e),
         }
-        if dev(&fd).ok() != Some(on) {
+        if !pass.permit((&fd, &here), &here, out) {
+            return;
+        }
+        if dev(&fd).ok() != Some(pass.on) {
             return out.kept.push(format!(
                 "{} is on another device and was not entered",
                 here.display()
@@ -1815,10 +1986,16 @@ mod fd {
             Ok(mut children) => {
                 children.sort_by_key(|c| CARGO_LOCKS.iter().any(|l| c.name == *l));
                 for grandchild in children {
-                    remove_tree_at(&fd, &grandchild, &here, on, depth + 1, out);
+                    remove_tree_at(&fd, &grandchild, &here, depth + 1, out, pass);
+                    if pass.revoked {
+                        return;
+                    }
                 }
             }
             Err(e) => out.kept.push(format!("{}: {e}", here.display())),
+        }
+        if !pass.permit((parent, at), &here, out) {
+            return;
         }
         match dirfd::unlinkat(parent, name, AtFlags::REMOVEDIR, child.id) {
             Ok(()) | Err(Errno::NOENT) => {}
@@ -1899,7 +2076,15 @@ mod fd {
             ));
         }
         let mut deleted = Deleted::default();
-        remove_tree_at(&parent, &child, folder, on, 0, &mut deleted);
+        let mut hook = |_, _: &Path| {};
+        let mut pass = Removal {
+            on,
+            custody: None,
+            revoked: false,
+            _hook: &mut hook,
+            permit: None,
+        };
+        remove_tree_at(&parent, &child, folder, 0, &mut deleted, &mut pass);
         if deleted.kept.is_empty() {
             Ok(deleted.bytes)
         } else {
@@ -1909,6 +2094,225 @@ mod fd {
                 deleted.kept.join("; ")
             )))
         }
+    }
+
+    fn identity(fd: &OwnedFd) -> io::Result<aterm_sysprobe::volumes::FileId> {
+        let st = dirfd::fstat(fd)?;
+        Ok(aterm_sysprobe::volumes::FileId {
+            dev: st.st_dev,
+            #[cfg(unix)]
+            ino: u128::from(st.st_ino),
+            #[cfg(windows)]
+            ino: st.st_ino,
+        })
+    }
+
+    struct CustodyWalk {
+        budget: WalkBudget,
+        started: Instant,
+        entries: usize,
+        on: u64,
+    }
+
+    impl CustodyWalk {
+        fn timely(&self) -> Result<(), String> {
+            if self.started.elapsed() >= self.budget.wall {
+                Err("its managed-custody scan ran out of time".into())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn visit(&mut self, fd: &OwnedFd, path: &Path, depth: usize) -> Result<(), String> {
+            self.timely()?;
+            marker_absent_at(fd)?;
+            let entries = Dir::read_from(fd).map_err(|e| e.to_string())?;
+            for entry in entries {
+                self.timely()?;
+                let entry = entry.map_err(|e| e.to_string())?;
+                #[cfg(unix)]
+                let name = OsStr::from_bytes(entry.file_name().to_bytes());
+                #[cfg(windows)]
+                let name = entry.file_name();
+                if name == "." || name == ".." {
+                    continue;
+                }
+                self.entries = self.entries.saturating_add(1);
+                if self.entries > self.budget.entries {
+                    return Err("its managed-custody scan reached the entry bound".into());
+                }
+                let child = match dirfd::openat(fd, name, dir_flags(), Mode::empty()) {
+                    Ok(child) => child,
+                    Err(error) => {
+                        #[cfg(unix)]
+                        let leaf = code::NOT_ENTERED.contains(&error.0);
+                        #[cfg(windows)]
+                        let leaf = matches!(error, Errno::NOTDIR | Errno::LOOP);
+                        if leaf {
+                            continue;
+                        }
+                        return Err(format!(
+                            "{} could not be pinned: {error}",
+                            path.join(name).display()
+                        ));
+                    }
+                };
+                if dev(&child).map_err(|e| e.to_string())? != self.on {
+                    return Err("its managed-custody scan reached another device".into());
+                }
+                if depth >= self.budget.depth.min(MAX_CUSTODY_DEPTH) {
+                    return Err("its managed-custody scan reached the depth bound".into());
+                }
+                self.visit(&child, &path.join(name), depth + 1)?;
+            }
+            self.timely()
+        }
+    }
+
+    pub(super) fn unmanaged_custody(path: &Path, budget: WalkBudget) -> Result<(), String> {
+        let started = Instant::now();
+        let (Some(folder), Some(name)) = (path.parent(), path.file_name()) else {
+            return Err("not a plain absolute cache entry".into());
+        };
+        fixed_volume(path).map_err(|e| e.to_string())?;
+        let parent = pin(folder).map_err(|e| e.to_string())?;
+        let root = dirfd::openat(
+            &parent,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .map_err(|e| e.to_string())?;
+        let stat = dirfd::fstat(&root).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        let kind = dirfd::FileType::from_raw_mode(stat.st_mode);
+        #[cfg(windows)]
+        let kind = stat.file_type();
+        let mut walk = CustodyWalk {
+            budget,
+            started,
+            entries: 0,
+            on: stat.st_dev,
+        };
+        if kind.is_dir() {
+            ordinary_custody_at(&root, path)?;
+            walk.visit(&root, path, 0)
+        } else if kind.is_file() {
+            ordinary_custody_at(&parent, folder)?;
+            walk.timely()
+        } else {
+            Err("not a regular file or directory".into())
+        }
+    }
+
+    pub(super) fn remove_unmanaged_tree(
+        path: &Path,
+        expected: aterm_sysprobe::volumes::FileId,
+        permit: &mut dyn FnMut() -> Result<(), String>,
+    ) -> io::Result<Removed> {
+        let (Some(folder), Some(name)) = (path.parent(), path.file_name()) else {
+            return Err(io::Error::other("not a plain absolute cache entry"));
+        };
+        fixed_volume(path)?;
+        let parent = pin(folder)?;
+        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
+        let root = dirfd::openat(&parent, name, flags, Mode::empty())?;
+        if identity(&root)? != expected {
+            return Err(io::Error::other(
+                "its identity changed after its fences were read",
+            ));
+        }
+        let st = dirfd::fstat(&root)?;
+        #[cfg(unix)]
+        let kind = dirfd::FileType::from_raw_mode(st.st_mode);
+        #[cfg(windows)]
+        let kind = st.file_type();
+        if !kind.is_dir() && !kind.is_file() {
+            return Err(io::Error::other("not a regular file or directory"));
+        }
+        let custody = if kind.is_dir() {
+            (&root, path)
+        } else {
+            (&parent, folder)
+        };
+        ordinary_custody_at(custody.0, custody.1).map_err(io::Error::other)?;
+        permit().map_err(io::Error::other)?;
+        let mut hook = |_, _: &Path| {};
+        let mut pass = Removal {
+            on: expected.dev,
+            custody: Some(custody),
+            revoked: false,
+            _hook: &mut hook,
+            permit: Some(permit),
+        };
+        let mut deleted = Deleted::default();
+        if kind.is_dir() {
+            for child in children(&root)? {
+                remove_tree_at(&root, &child, path, 1, &mut deleted, &mut pass);
+                if pass.revoked {
+                    break;
+                }
+            }
+        }
+        let mut gone = false;
+        if deleted.kept.is_empty() && pass.permit(custody, path, &mut deleted) {
+            let named = dirfd::openat(&parent, name, flags, Mode::empty())
+                .map_err(io::Error::from)
+                .and_then(|named| identity(&named));
+            match named {
+                Ok(id) if id == expected => {
+                    let removed: io::Result<u64> = if kind.is_dir() {
+                        rmdir_named(&parent, name, &root)
+                            .map(|()| 0)
+                            .map_err(Into::into)
+                    } else {
+                        dirfd::fstat(&root)
+                            .map_err(io::Error::from)
+                            .and_then(|current| {
+                                #[cfg(unix)]
+                                let freed = if current.st_nlink == 1 {
+                                    current.st_blocks.saturating_mul(512)
+                                } else {
+                                    0
+                                };
+                                #[cfg(windows)]
+                                let freed = if current.st_nlink == 1 {
+                                    current.allocation
+                                } else {
+                                    0
+                                };
+                                #[cfg(unix)]
+                                let removed = dirfd::unlinkat(&parent, name, AtFlags::empty());
+                                #[cfg(windows)]
+                                let removed =
+                                    dirfd::unlinkat(&parent, name, AtFlags::empty(), current.id());
+                                removed.map(|()| freed).map_err(Into::into)
+                            })
+                    };
+                    match removed {
+                        Ok(freed) => {
+                            gone = true;
+                            deleted.bytes = deleted.bytes.saturating_add(freed);
+                        }
+                        Err(error) => deleted.kept.push(format!("{}: {error}", path.display())),
+                    }
+                }
+                Ok(_) => deleted
+                    .kept
+                    .push("its name now names another entry, which is left".into()),
+                Err(error) => deleted.kept.push(format!("{}: {error}", path.display())),
+            }
+        }
+        Ok(Removed {
+            bytes: deleted.bytes,
+            units: if gone {
+                vec![path.to_path_buf()]
+            } else {
+                Vec::new()
+            },
+            skipped: Vec::new(),
+            trouble: deleted.kept,
+        })
     }
 
     fn rmdir_named(parent: &OwnedFd, name: &OsStr, dir: &OwnedFd) -> Result<(), Errno> {
@@ -1927,10 +2331,12 @@ mod fd {
         bytes: u64,
         gone: bool,
         kept: Vec<String>,
+        revoked: bool,
     }
 
     fn reclaim_profile(
         profile: &OwnedFd,
+        custody: (&OwnedFd, &Path),
         path: &Path,
         on: u64,
         judge: &Judge,
@@ -1960,8 +2366,28 @@ mod fd {
             Err(e) => return Err(format!("its incremental/ could not be opened: {e}")),
         };
         hook(Stage::Deleting, path);
+        if let Err(why) = ordinary_custody_at(custody.0, custody.1) {
+            drop(held);
+            hook(Stage::Released, path);
+            return Ok(Profiled {
+                bytes: 0,
+                gone: false,
+                kept: vec![format!("{}: {why}", path.display())],
+                revoked: true,
+            });
+        }
         let mut deleted = Deleted::default();
-        remove_tree_at(profile, &target, path, on, 0, &mut deleted);
+        let revoked = {
+            let mut pass = Removal {
+                on,
+                custody: Some(custody),
+                revoked: false,
+                _hook: hook,
+                permit: None,
+            };
+            remove_tree_at(profile, &target, path, 0, &mut deleted, &mut pass);
+            pass.revoked
+        };
         let gone = matches!(open_dir(profile, inc), Ok(None));
         drop(held);
         hook(Stage::Released, path);
@@ -1969,6 +2395,7 @@ mod fd {
             bytes: deleted.bytes,
             gone,
             kept: deleted.kept,
+            revoked,
         })
     }
 
@@ -2073,32 +2500,46 @@ mod fd {
             return Err(refuse("its name now names another directory".to_owned()));
         }
         hook(Stage::Deleting, path);
+        ordinary_custody_at(&root, path).map_err(refuse)?;
         let mut deleted = Deleted::default();
+        let mut pass = Removal {
+            on: root_dev,
+            custody: Some((&root, path)),
+            revoked: false,
+            _hook: hook,
+            permit: None,
+        };
         match children(&root) {
             Ok(mut children) => {
                 children.sort_by_key(|c| CARGO_LOCKS.iter().any(|l| c.name == *l));
                 for child in children {
-                    remove_tree_at(&root, &child, path, root_dev, 1, &mut deleted);
+                    remove_tree_at(&root, &child, path, 1, &mut deleted, &mut pass);
+                    if pass.revoked {
+                        break;
+                    }
                 }
             }
             Err(e) => deleted.kept.push(format!("{}: {e}", path.display())),
         }
         let mut gone = false;
-        if deleted.kept.is_empty() {
-            if named(&parent_fd)? {
-                match rmdir_named(&parent_fd, name, &root) {
+        if deleted.kept.is_empty() && pass.permit((&root, path), path, &mut deleted) {
+            match named(&parent_fd) {
+                Ok(true) => match rmdir_named(&parent_fd, name, &root) {
                     Ok(()) => gone = true,
                     Err(e) => {
                         deleted
                             .kept
                             .push(format!("{}: {}", path.display(), io::Error::from(e)))
                     }
-                }
-            } else {
-                deleted.kept.push(format!(
+                },
+                Ok(false) => deleted.kept.push(format!(
                     "{}: its name now names another directory, which is left",
                     path.display()
-                ));
+                )),
+                Err(e) => deleted.kept.push(format!(
+                    "{}: its final name could not be inspected: {e}",
+                    path.display()
+                )),
             }
         }
 
@@ -2384,6 +2825,10 @@ mod fd {
                 break;
             }
             hook(Stage::Deleting, profile);
+            if let Err(why) = ordinary_custody_at(&root, path) {
+                stop = Some((i, why));
+                break;
+            }
             let deps = open_dir(&fd, OsStr::new("deps"))
                 .ok()
                 .flatten()
@@ -2407,9 +2852,22 @@ mod fd {
             }
             order.sort_by_key(|c| content_rank(&c.name));
             let mut deleted = Deleted::default();
-            for entry in order {
-                remove_tree_at(&fd, &entry, profile, root_dev, 1, &mut deleted);
-            }
+            let revoked = {
+                let mut pass = Removal {
+                    on: root_dev,
+                    custody: Some((&root, path)),
+                    revoked: false,
+                    _hook: hook,
+                    permit: None,
+                };
+                for entry in order {
+                    remove_tree_at(&fd, &entry, profile, 1, &mut deleted, &mut pass);
+                    if pass.revoked {
+                        break;
+                    }
+                }
+                pass.revoked
+            };
             drop(held);
             hook(Stage::Released, profile);
             done.bytes = done.bytes.saturating_add(deleted.bytes);
@@ -2417,6 +2875,14 @@ mod fd {
                 done.units.push(profile.clone());
             }
             done.trouble.extend(deleted.kept);
+            if revoked {
+                stop = Some((
+                    i + 1,
+                    "cleanup stopped because build-cache custody could no longer be established"
+                        .into(),
+                ));
+                break;
+            }
         }
         if let Some((from, why)) = stop {
             for p in &profiles[from..] {
@@ -2518,13 +2984,16 @@ mod fd {
                 }
                 continue;
             }
-            match reclaim_profile(&fd, profile, root_dev, judge, select, hook) {
+            match reclaim_profile(&fd, (&root, path), profile, root_dev, judge, select, hook) {
                 Ok(p) => {
                     done.bytes = done.bytes.saturating_add(p.bytes);
                     if p.gone {
                         done.units.push(profile.join(INCREMENTAL));
                     }
                     done.trouble.extend(p.kept);
+                    if p.revoked {
+                        break;
+                    }
                 }
                 Err(why) => done.skipped.push((profile.clone(), why)),
             }
@@ -2841,6 +3310,16 @@ pub(crate) use fd::{mark_cloned, mark_theirs, only_owners_pass};
 #[cfg(not(any(unix, windows)))]
 mod fd {
     use super::{Judge, Path, PathBuf, Removed, Select, Stage, WalkBudget, io};
+    pub(super) fn unmanaged_custody(_path: &Path, _budget: WalkBudget) -> Result<(), String> {
+        Err("reading cache custody needs unix or Windows".into())
+    }
+    pub(super) fn remove_unmanaged_tree(
+        _path: &Path,
+        _expected: aterm_sysprobe::volumes::FileId,
+        _permit: &mut dyn FnMut() -> Result<(), String>,
+    ) -> io::Result<Removed> {
+        Err(io::Error::other("removing caches needs unix or Windows"))
+    }
     pub(super) fn clock(_path: &Path, _budget: WalkBudget) -> Option<i64> {
         None
     }

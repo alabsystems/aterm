@@ -26,14 +26,30 @@ const LIFETIME_SEAM: &str = "ATERM_DEBUG_FLEET_LIFETIME_MS";
 
 const HEARTBEAT_SEAM: &str = "ATERM_DEBUG_FLEET_HEARTBEAT_MS";
 
-/// The dev seam that sets, in milliseconds, how long the fleet listener gives each connection's
-/// TLS and both proofs ([`aterm_net::fleet::HANDSHAKE_WITHIN`]): a test world whose every dialer
-/// is an aterm on the same machine, and so must finish its handshake, gives it its hang detector.
+/// How long one background heartbeat round takes at most: each member it dials, and then the
+/// adverts, gets a share of it ([`aterm_net::fleet_member::heartbeat_members`]).
 #[cfg(unix)]
-const HANDSHAKE_SEAM: &str = "ATERM_DEBUG_FLEET_HANDSHAKE_MS";
+const HEARTBEAT_ROUND: Duration = Duration::from_secs(10);
 
-/// Timeout for each member one background heartbeat round registers with.
-const HEARTBEAT_WITHIN: Duration = Duration::from_secs(10);
+/// The dev seam that sets, in milliseconds, [`heartbeat_within`] for a test of the binary.
+const HEARTBEAT_WITHIN_SEAM: &str = "ATERM_DEBUG_FLEET_HEARTBEAT_WITHIN_MS";
+
+/// The round [`spawn_member_heartbeat_at`] gives its dials: [`HEARTBEAT_ROUND`], or what
+/// [`HEARTBEAT_WITHIN_SEAM`] names. A test's members are its own (a unit test's in-process node
+/// jobs, a test world's aterms on this machine, and the places either test holds), which answer
+/// or hang up however loaded the machine is, and a round that misses one waits
+/// [`heartbeat_every`] for the next, so each dial's share of a unit test's round waits the hang
+/// detector, as a test world's does under the seam.
+#[cfg(unix)]
+fn heartbeat_within() -> Duration {
+    #[cfg(not(test))]
+    const ROUND: Duration = HEARTBEAT_ROUND;
+    #[cfg(test)]
+    const ROUND: Duration = aterm_spec::wait::MUST_HAPPEN
+        .saturating_mul(aterm_net::fleet_member::HEARTBEAT_MEMBERS as u32 + 1);
+    static WITHIN: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *WITHIN.get_or_init(|| seam_or(HEARTBEAT_WITHIN_SEAM, ROUND))
+}
 
 /// Timeout for a facts push to the issuer this Mac's book names. A unit test's issuer is its own
 /// in-process server, which answers, so its push waits the hang detector.
@@ -45,7 +61,12 @@ const FACTS_PUSH_WITHIN: Duration = aterm_spec::wait::MUST_HAPPEN;
 /// The milliseconds the dev seam `seam` names, else `default`.
 fn seam_or(seam: &str, default: Duration) -> Duration {
     aterm_types::dev_seam!(seam)
-        .and_then(|v| v.to_str()?.trim().parse::<u64>().ok())
+        .and_then(|v| {
+            let s = v.to_str()?.trim();
+            (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| s.parse::<u64>().ok())
+                .flatten()
+        })
         .filter(|&ms| ms > 0)
         .map_or(default, Duration::from_millis)
 }
@@ -95,6 +116,15 @@ impl HeartbeatClock {
         moved: crate::network_moved::Watch,
     ) -> Self {
         Self { last, every, moved }
+    }
+
+    /// Whether [`Self::due`] would answer at `now`, answering nothing: a caller asks it before it
+    /// asks the LAN door, which only a use about to go may go through.
+    pub(crate) fn is_due(&self, now: std::time::Instant) -> bool {
+        self.moved.due_at(now)
+            || self
+                .last
+                .is_none_or(|last| now.saturating_duration_since(last) >= self.every)
     }
 
     /// Whether a heartbeat is due at `now`, and why: a move not yet answered and due at `now`
@@ -156,6 +186,7 @@ const SERVES: &[FleetOp] = &[
     FleetOp::Facts,
     FleetOp::MailCode,
     FleetOp::Census,
+    FleetOp::VaultJoin,
 ];
 
 const SERVES_DRIVE: &[FleetOp] = &[
@@ -166,6 +197,7 @@ const SERVES_DRIVE: &[FleetOp] = &[
     FleetOp::Facts,
     FleetOp::MailCode,
     FleetOp::Census,
+    FleetOp::VaultJoin,
 ];
 
 /// C16 3-minute heartbeat interval for pushing `survey facts` to the fleet issuer.
@@ -382,7 +414,9 @@ fn update_denied_nodes_cache(
 }
 
 /// Read the verified swarm roster's `deny_nodes`, retaining the last authoritative list when the
-/// local vault is mid-apply or unreadable.
+/// local vault is mid-apply or unreadable. It is read again only when one of the vault files it
+/// reads changed ([`aterm_secrets::client::swarm_denied_nodes_now`]), so the listener's
+/// per-dialer lookup and each control request cost no vault decrypt.
 #[cfg(unix)]
 fn denied_nodes_now() -> Arc<[String]> {
     let isolated = cfg!(test)
@@ -392,7 +426,7 @@ fn denied_nodes_now() -> Arc<[String]> {
         return Arc::from(&[][..]);
     }
     let observed = aterm_secrets::client::Paths::live()
-        .and_then(|paths| aterm_secrets::client::swarm_denied_nodes(&paths));
+        .and_then(|paths| aterm_secrets::client::swarm_denied_nodes_now(&paths));
     let mut guard = DENIED_NODES.lock_or_recover();
     update_denied_nodes_cache(&mut guard, observed)
 }
@@ -1102,11 +1136,8 @@ fn serve_fleet_port(generation: u64, addr: SocketAddr) {
                 return;
             }
         };
-        let listener = match TcpListener::bind(addr) {
-            Ok(listener) => {
-                let _ = aterm_uds::keep_out_of_children(&listener);
-                listener
-            }
+        let listener = match aterm_uds::kept_out(|| TcpListener::bind(addr)) {
+            Ok(listener) => listener,
             Err(error)
                 if matches!(
                     error.kind(),
@@ -1181,15 +1212,18 @@ fn serve_fleet_port(generation: u64, addr: SocketAddr) {
             &listener,
             (
                 &listening,
-                &|| {
+                Arc::new(|| {
                     let serving = served_now();
                     (serving.scope, serving.ops())
-                },
-                &|| denied_under(&denied_nodes_now(), window_log().as_deref()),
+                }),
+                Arc::new(|| denied_under(&denied_nodes_now(), window_log().as_deref())),
             ),
             members_ask(),
             &running,
-            seam_or(HANDSHAKE_SEAM, aterm_net::fleet::HANDSHAKE_WITHIN),
+            seam_or(
+                aterm_net::fleet::HANDSHAKE_SEAM,
+                aterm_net::fleet::HANDSHAKE_WITHIN,
+            ),
             move |served, op| {
                 let peer = served.peer_addr();
                 if op == FleetOp::Join {
@@ -1227,6 +1261,26 @@ fn serve_fleet_port(generation: u64, addr: SocketAddr) {
                         serve_census_request(stream, peer)
                     });
                 }
+                if op == FleetOp::VaultJoin {
+                    let judged = aterm_types::dirs::state_dir()
+                        .ok_or_else(|| "this Mac has no state directory".to_owned())
+                        .and_then(|state| {
+                            judge_vault_join_at(
+                                &served,
+                                &join_secret,
+                                (&state, &served_now().grants),
+                                &denied_nodes_now(),
+                                window_log().as_deref(),
+                                aterm_secrets::client::Paths::live().ok().as_ref(),
+                            )
+                        });
+                    return served.answer(|stream| {
+                        stream.set_read_timeout(Some(aterm_net::fleet::HANDSHAKE_WITHIN))?;
+                        stream.set_write_timeout(Some(aterm_net::fleet::HANDSHAKE_WITHIN))?;
+                        crate::members_desk::serve_vault_join(stream, peer, judged);
+                        Ok(())
+                    });
+                }
                 if op == FleetOp::Drive {
                     let (driver, grant) = match admit_driver(&served) {
                         Ok(admitted) => admitted,
@@ -1235,15 +1289,7 @@ fn serve_fleet_port(generation: u64, addr: SocketAddr) {
                         }
                     };
                     let (near, far) = aterm_uds::CtlStream::pair()?;
-                    let Some(_open) = Opened::served_with_denied(
-                        true,
-                        Some(grant),
-                        &near,
-                        served_now,
-                        &holds_now(),
-                        &denied_nodes_now(),
-                    )?
-                    else {
+                    let Some(_open) = Opened::served_live(true, Some(grant), &near)? else {
                         return refuse_driver(
                             served,
                             peer,
@@ -1426,6 +1472,42 @@ fn admit_driver_at(
     Ok((crate::fabric::Driver { node, host }, grant))
 }
 
+/// What a `vault-join` channel is worth on this Mac ([`aterm_agent::vault_join::judge`]): the node
+/// key it proved; the fleet's key only where the listener's secret (`listening`) is the fleet code
+/// the vault at `vault` holds now and this Mac's drive admission takes the node under `grants`
+/// ([`aterm_net::fleet_member::proven_driver`]); whether the book in `state` binds the node id
+/// to a key `log` holds out; and what the book's peers say of the fleet
+/// ([`aterm_agent::vault_join::book_word`]). Read on the connection's thread.
+#[cfg(unix)]
+pub(crate) fn judge_vault_join_at(
+    served: &aterm_net::fleet::Served,
+    listening: &aterm_net::fleet::FleetSecret,
+    (state, grants): (&std::path::Path, &[aterm_net::fleet::DriveGrant]),
+    denied: &[String],
+    log: Option<&aterm_net::fleet_member::MemberKeys>,
+    vault: Option<&aterm_secrets::client::Paths>,
+) -> Result<aterm_agent::vault_join::Judged, String> {
+    let proof = served.peer_node();
+    let driven = aterm_net::fleet_member::proven_driver(served, state, grants, log).is_ok();
+    let bound =
+        proof.and_then(|proof| aterm_net::fleet_member::Keyring::read(state).bound(&proof.node));
+    let peers = aterm_net::fleet_member::read_peers(state).unwrap_or_default();
+    aterm_agent::vault_join::judge(
+        proof,
+        (
+            listening.mark(),
+            vault.and_then(aterm_agent::vault_join::vault_code_mark),
+        ),
+        driven,
+        (bound, denied, log),
+        (
+            &peers,
+            served.peer_addr().map(|at| at.ip()),
+            aterm_time::unix_millis().unwrap_or(0),
+        ),
+    )
+}
+
 /// Whether this Mac lets the peer of `served` drive it under `grants`.
 #[cfg(unix)]
 fn lists_driver(
@@ -1488,6 +1570,29 @@ impl Opened {
         Self::served_with_denied(content, driver, line, now, holds, &[])
     }
 
+    #[cfg(unix)]
+    fn served_live(
+        content: bool,
+        driver: Option<aterm_net::fleet::DriveGrant>,
+        line: &aterm_uds::CtlStream,
+    ) -> std::io::Result<Option<Self>> {
+        let id = OPENED.fetch_add(1, Ordering::Relaxed);
+        let line = aterm_uds::kept_out(|| line.try_clone())?;
+        OPEN.lock_or_recover().push(Open {
+            id,
+            content,
+            driver: driver.clone(),
+            line,
+        });
+        let held = Self(id);
+        let now = served_now();
+        let holds = holds_now();
+        let denied = denied_nodes_now();
+        Ok(now
+            .serves(content, driver.as_ref(), &holds, &denied)
+            .then_some(held))
+    }
+
     fn served_with_denied(
         content: bool,
         driver: Option<aterm_net::fleet::DriveGrant>,
@@ -1497,8 +1602,7 @@ impl Opened {
         denied_nodes: &[String],
     ) -> std::io::Result<Option<Self>> {
         let id = OPENED.fetch_add(1, Ordering::Relaxed);
-        let line = line.try_clone()?;
-        let _ = aterm_uds::keep_out_of_children(&line);
+        let line = aterm_uds::kept_out(|| line.try_clone())?;
         OPEN.lock_or_recover().push(Open {
             id,
             content,
@@ -1631,7 +1735,7 @@ fn register_member_at<S: std::io::Read + std::io::Write>(
         let node = read_node_id(state)
             .map_err(|e| e.to_string())?
             .ok_or_else(no_node_id)?;
-        let host = own_host(addr).ok_or_else(|| "its LAN name is no host".to_owned())?;
+        let host = own_host(addr).ok_or_else(|| "it has no LAN address to advertise".to_owned())?;
         Ok(Issuer {
             node,
             host,
@@ -1667,16 +1771,22 @@ fn no_node_id() -> String {
     )
 }
 
-/// The host this Mac names itself by to the fleet while it listens at `addr`: the loopback
-/// address of a loopback fleet, else its LAN name, else the address it listens at.
+/// The address this Mac advertises while it listens at `addr`: its explicit bind
+/// address, or the same LAN route a first automatic join advertises for a wildcard bind.
 #[cfg(unix)]
 pub(crate) fn own_host(addr: SocketAddr) -> Option<String> {
-    if addr.ip().is_loopback() {
+    own_host_from(addr, aterm_secrets::server::route_sources)
+}
+
+#[cfg(unix)]
+fn own_host_from(
+    addr: SocketAddr,
+    routes: impl FnOnce() -> [Option<std::net::IpAddr>; 3],
+) -> Option<String> {
+    if !addr.ip().is_unspecified() {
         return Some(addr.ip().to_string());
     }
-    aterm_uds::process::lan_host_name()
-        .filter(|name| aterm_net::fleet_member::is_host(name))
-        .or_else(|| (!addr.ip().is_unspecified()).then(|| addr.ip().to_string()))
+    aterm_net::fleet_member::automatic_host(routes())
 }
 
 /// A member's read of this machine's book of peers.
@@ -1715,6 +1825,13 @@ fn share_book_at<S: std::io::Write>(
                 &me,
                 (&host, addr.port(), aterm_types::version::app_version()),
                 now_ms.unwrap_or_default(),
+            )
+            .with_primary_name(
+                &me,
+                aterm_net::fleet_member::read_primary_name(state)
+                    .ok()
+                    .flatten()
+                    .as_deref(),
             )
         });
     let node = || {
@@ -1878,7 +1995,7 @@ fn maybe_refresh_local_census_at(state: &std::path::Path, home: Option<&std::pat
     }
 }
 
-/// Where [`push_facts_to_issuer`] delivered a C16 `survey facts` snapshot.
+/// Where [`push_facts_to_issuer_with_denied`] delivered a C16 `survey facts` snapshot.
 #[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FactsPushOutcome {
@@ -1888,25 +2005,36 @@ pub(crate) enum FactsPushOutcome {
     PushedRemote { host: String, port: u16 },
 }
 
-/// Keep `payload` (`OK <n>\n…` C16 survey facts, this Mac's own) here, where this Mac computes its
-/// census from (docs/DESIGN-fluid-swarm-2026-10-28.md F17), and push it to the fleet issuer this
-/// Mac's book names, whose census a Mac that predates F17 dials for. The facts stay here whatever
-/// the issuer answers; one that names another node is pushed (and refused there), never kept.
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 pub(crate) fn push_facts_to_issuer(
     state_dir: &std::path::Path,
     secret: &aterm_net::fleet::FleetSecret,
     payload: &str,
 ) -> Result<FactsPushOutcome, String> {
+    push_facts_to_issuer_with_denied(state_dir, secret, (&[], None), payload)
+}
+
+/// Keep `payload` (`OK <n>\n…` C16 survey facts, this Mac's own) here, where this Mac computes its
+/// census from (docs/DESIGN-fluid-swarm-2026-10-28.md F17), and push it to the fleet issuer this
+/// Mac's book names, whose census a Mac that predates F17 dials for. The facts stay here whatever
+/// the issuer answers; one that names another node is pushed (and refused there), never kept.
+#[cfg(unix)]
+pub(crate) fn push_facts_to_issuer_with_denied(
+    state_dir: &std::path::Path,
+    secret: &aterm_net::fleet::FleetSecret,
+    (denied_nodes, log): (&[String], Option<&aterm_net::fleet_member::MemberKeys>),
+    payload: &str,
+) -> Result<FactsPushOutcome, String> {
     use aterm_net::fleet_member::{
-        Via, push_facts_to_peer, read_node_identity, read_peers, store_pushed_facts,
+        Via, push_facts_to_bound_peer, read_node_identity, read_peers, store_pushed_facts_with_key,
     };
     let parsed = aterm_agent::survey_facts::SwarmSurveyFacts::from_survey_reply(payload)?;
     let me = read_node_identity(state_dir)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "no fleet node identity on disk".to_owned())?;
     if parsed.node.as_deref().is_none_or(|node| node == me.node()) {
-        store_pushed_facts(state_dir, me.node(), payload).map_err(|e| e.to_string())?;
+        store_pushed_facts_with_key(state_dir, me.node(), Some(me.key()), payload)
+            .map_err(|e| e.to_string())?;
     }
     let peers = read_peers(state_dir).unwrap_or_default();
     let Some(peer) = peers
@@ -1915,11 +2043,10 @@ pub(crate) fn push_facts_to_issuer(
     else {
         return Ok(FactsPushOutcome::StoredLocally(me.node().to_owned()));
     };
-    push_facts_to_peer(
-        &peer.host,
-        peer.addr,
-        peer.port,
+    push_facts_to_bound_peer(
+        peer,
         (secret, Some(&me)),
+        (denied_nodes, log),
         payload,
         FACTS_PUSH_WITHIN,
     )?;
@@ -1949,7 +2076,11 @@ fn push_facts_heartbeat(secret: &aterm_net::fleet::FleetSecret) {
         here.instances,
         false,
     );
-    if let Err(why) = push_facts_to_issuer(&state, secret, &payload) {
+    let denied = denied_nodes_now();
+    let log = window_log();
+    if let Err(why) =
+        push_facts_to_issuer_with_denied(&state, secret, (&denied, log.as_deref()), &payload)
+    {
         aterm_log::debug!(
             "fleet: survey facts heartbeat push skipped: {}",
             aterm_log::sanitize_record(&why)
@@ -2088,7 +2219,15 @@ fn watch_fleet_generation(
         let why = match read_fleet_key() {
             Ok(now) if now == *secret && node_now() == proved => {
                 follow_serving(generation, addr);
-                if last_facts_push.elapsed() >= FACTS_HEARTBEAT_EVERY {
+                // A facts push and a heartbeat round dial members on the LAN: neither goes while
+                // System State's Local Network step, which asks macOS first, is still to come.
+                // The door is asked only once one of them is due, right before it goes: past the
+                // step's wait it takes the dialog slot for macOS's question.
+                let now = std::time::Instant::now();
+                let facts_due = last_facts_push.elapsed() >= FACTS_HEARTBEAT_EVERY;
+                let lan = (facts_due || heartbeat.is_due(now))
+                    && aterm_types::macos_setup::lan_first_use::may_use();
+                if lan && facts_due {
                     last_facts_push = std::time::Instant::now();
                     push_facts_heartbeat(secret);
                 }
@@ -2096,7 +2235,7 @@ fn watch_fleet_generation(
                     last_census_refresh = std::time::Instant::now();
                     maybe_refresh_local_census();
                 }
-                if let Some(woke) = heartbeat.due(std::time::Instant::now()) {
+                if lan && let Some(woke) = heartbeat.due(now) {
                     say_heartbeat_woke("fleet listener", woke);
                     spawn_member_heartbeat(addr, secret.clone(), &hb_in_flight);
                 }
@@ -2158,6 +2297,26 @@ fn spawn_member_heartbeat(
         in_flight,
         (denied, log, crate::network_moved::alab_tcp()),
     );
+}
+
+/// Note a heartbeat round's `answered` members, each of which proved its node to this Mac, as
+/// evidence of the network each answered from ([`aterm_secrets::home_lan::note`]): the vault
+/// server observes a join on the home ALab LAN only where members answered. Runs on the round's
+/// thread, never the event loop.
+#[cfg(unix)]
+fn note_home_lan(answered: &[aterm_net::fleet_member::Answered]) {
+    if answered.is_empty() {
+        return;
+    }
+    let heard: Vec<(String, std::net::IpAddr)> = answered
+        .iter()
+        .map(|done| (done.node.clone(), done.at.ip()))
+        .collect();
+    let noted = aterm_secrets::client::Paths::live()
+        .and_then(|paths| aterm_secrets::home_lan::note(&paths, &heard));
+    if let Err(error) = noted {
+        aterm_log::debug!("fleet heartbeat: the home-LAN evidence was not noted: {error}");
+    }
 }
 
 /// How long a heartbeat round resolves the `_alab._tcp` adverts its browse holds.
@@ -2230,7 +2389,14 @@ fn spawn_member_heartbeat_at(
         key: None,
         signed: None,
     }
-    .signed_by(&me, aterm_time::unix_millis().unwrap_or_default());
+    .signed_by(&me, aterm_time::unix_millis().unwrap_or_default())
+    .with_primary_name(
+        &me,
+        aterm_net::fleet_member::read_primary_name(&state)
+            .ok()
+            .flatten()
+            .as_deref(),
+    );
     let started = std::thread::Builder::new()
         .name("aterm-fleet-hb".to_owned())
         .spawn(move || {
@@ -2242,7 +2408,8 @@ fn spawn_member_heartbeat_at(
                 }
             }
             let _guard = Guard(flag);
-            let hb_deadline = std::time::Instant::now() + HEARTBEAT_WITHIN;
+            let within = heartbeat_within();
+            let hb_deadline = std::time::Instant::now() + within;
             let hints = || {
                 let left = hb_deadline
                     .saturating_duration_since(std::time::Instant::now())
@@ -2256,22 +2423,38 @@ fn spawn_member_heartbeat_at(
                 &state,
                 (&secret, &me),
                 &reg,
-                HEARTBEAT_WITHIN,
+                within,
                 (log.as_deref(), &denied, &hints),
             ) {
                 Ok(answered) => {
+                    // Each answer proved its node to this Mac: evidence of the network it came
+                    // from, which the vault server and approver tell the home ALab LAN by.
+                    note_home_lan(&answered);
                     if !answered.is_empty()
                         && let Some((_, payload)) =
                             aterm_net::fleet_member::read_pushed_facts(&state)
                                 .into_iter()
                                 .find(|(n, _)| n == me.node())
                     {
+                        let keyring = aterm_net::fleet_member::Keyring::read(&state);
                         for done in &answered {
-                            let _ = aterm_net::fleet_member::push_facts_to_peer(
-                                &done.joined.issuer.host,
-                                Some(done.at.ip()),
-                                done.at.port(),
+                            let peer = aterm_net::fleet_member::Peer {
+                                node: Some(done.node.clone()),
+                                key: keyring.bound(&done.node),
+                                key_from: None,
+                                host: done.joined.issuer.host.clone(),
+                                addr: Some(done.at.ip()),
+                                port: done.at.port(),
+                                version: Some(done.joined.issuer.version.clone()),
+                                seen_ms: None,
+                                via: aterm_net::fleet_member::Via::Joined,
+                                fleet: None,
+                                signed: None,
+                            };
+                            let _ = aterm_net::fleet_member::push_facts_to_bound_peer(
+                                &peer,
                                 (&secret, Some(&me)),
+                                (&denied, log.as_deref()),
                                 &payload,
                                 Duration::from_secs(3),
                             );
@@ -2415,6 +2598,31 @@ fn note_fleet(line: &str, refusal: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn wildcard_heartbeats_keep_the_automatic_joins_lan_address() {
+        let routes = [
+            Some("10.0.0.2".parse().unwrap()),
+            Some("192.168.1.102".parse().unwrap()),
+            Some("2001:db8::1".parse().unwrap()),
+        ];
+        assert_eq!(
+            own_host_from("0.0.0.0:7100".parse().unwrap(), || routes).as_deref(),
+            Some("192.168.1.102")
+        );
+        assert_eq!(
+            own_host_from("0.0.0.0:7100".parse().unwrap(), || [None; 3]),
+            None
+        );
+        for address in ["127.0.0.1:7100", "[::1]:7100", "192.168.1.2:7100"] {
+            let address: SocketAddr = address.parse().unwrap();
+            assert_eq!(
+                own_host_from(address, || panic!("an explicit bind needs no route")),
+                Some(address.ip().to_string())
+            );
+        }
+    }
 
     /// What a Mac whose keyring binds each node as `bound` says holds: a node under that key.
     fn held_by(
@@ -3260,9 +3468,11 @@ mod tests {
         let server = std::thread::spawn(move || {
             aterm_net::fleet::serve_offering_with_ask_within(
                 &listener,
-                (&listening, &|| (FleetScope::Facts, SERVES), &|| {
-                    Arc::new(aterm_net::fleet::Denied::default())
-                }),
+                (
+                    &listening,
+                    Arc::new(|| (FleetScope::Facts, SERVES)),
+                    Arc::new(|| Arc::new(aterm_net::fleet::Denied::default())),
+                ),
                 None,
                 &server_running,
                 aterm_spec::wait::MUST_HAPPEN,

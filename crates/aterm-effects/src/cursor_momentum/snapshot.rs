@@ -404,16 +404,18 @@ impl MomentumGlowSnapshot {
                 tau: self.tau,
             });
         }
-        let p_ns = MOMENTUM_PROFILE.horizon.as_nanos();
-        let env_ns = MOMENTUM_ENVELOPE.horizon.as_nanos();
-        let min_ns = if p_ns < env_ns { p_ns } else { env_ns };
-        let horizon = if min_ns > i128::MAX as u128 {
-            i128::MAX
-        } else {
-            min_ns as i128
+        const HORIZON: i128 = {
+            let p_ns = MOMENTUM_PROFILE.horizon.as_nanos();
+            let env_ns = MOMENTUM_ENVELOPE.horizon.as_nanos();
+            let min_ns = if p_ns < env_ns { p_ns } else { env_ns };
+            if min_ns > i128::MAX as u128 {
+                i128::MAX
+            } else {
+                min_ns as i128
+            }
         };
         if let Some(offset) = self.rate_at
-            && offset > horizon
+            && offset > HORIZON
         {
             return Err(SnapshotRefusal::Horizon {
                 field: SnapshotField::RateAt,
@@ -421,7 +423,7 @@ impl MomentumGlowSnapshot {
             });
         }
         if let Some(offset) = self.stamp
-            && offset > horizon
+            && offset > HORIZON
         {
             return Err(SnapshotRefusal::Horizon {
                 field: SnapshotField::Stamp,

@@ -207,6 +207,7 @@ fn realm_case(case: i64) -> [(&'static str, i64); 5] {
         &FleetRoster {
             source: "fixture".into(),
             accounts: fleet.clone(),
+            ..FleetRoster::default()
         }
         .to_toml(),
     );

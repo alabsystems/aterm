@@ -25,26 +25,19 @@ Result: **16 specs**, covering **25 tests**. **0 non-spec tests remain** (§4).
 ## 0. Notation used in the statements
 
 - `MAX` = `MAX_LOG_EVENTS` = `1 << 16`.
-- For an `EventLog` `g`:
-  - `R(g)` is the ring as a list of `Event`s, oldest first.
-  - `T(g)` = `g.total`.
-  - `seqs(g)` = `map (.seq.0) R(g)`.
-  - `lo(g)` = `T(g) − |R(g)| + 1`, the oldest live seq.
-- `LogReach`: the logs reachable from `EventLog::default()` by `append_at` calls, under the
-  precondition `T < u64::MAX`. Surface's private `append` is `append_at(op, Ticks(0))`. At
-  `u64::MAX` the `saturating_add` would repeat a seq, but 2^64 appends cannot happen.
-- For a `Surface` `s`:
-  - `L(s)` is the abstract line list `[(LineId, String)]`, which is the
-    `Arc<Vec<(LineId, Arc<String>)>>` with both `Arc`s dereferenced.
-  - `N(s)` = `next_line`.
-  - `G(s)` = `*s.log`.
-- `Reach`: the surfaces reachable from `Surface::new()` by `apply` and `transact`, and by
+- For an `EventLog` `g`: `R(g)` is the ring as a list of `Event`s, oldest first; `T(g)` =
+  `g.total`; `seqs(g)` = `map (.seq.0) R(g)`; `lo(g)` = `T(g) − |R(g)| + 1`, the oldest live seq.
+- `LogReach`: the logs reachable from `EventLog::default()` by `append_at`, assuming
+  `T < u64::MAX` (at `u64::MAX`, `saturating_add` would repeat a seq; 2^64 appends cannot
+  happen). Surface's private `append` is `append_at(op, Ticks(0))`.
+- For a `Surface` `s`: `L(s)` is the line list `[(LineId, String)]`, the
+  `Arc<Vec<(LineId, Arc<String>)>>` with both `Arc`s dereferenced; `N(s)` = `next_line`;
+  `G(s)` = `*s.log`.
+- `Reach`: the surfaces reachable from `Surface::new()` by `apply`, `transact`, and
   `clone`/`snapshot` of a reachable surface.
-- `M(L, N, e)`, the model step for `apply`:
-  - `AppendLine(t)` gives `(L ++ [(LineId(N), t)], N+1)`.
-  - `SetLine(id, t)` replaces the text of the entry whose id is `id` with `t`, if that entry
-    exists, and otherwise leaves `L` unchanged. `N` is unchanged.
-  - `ClearLine(id)` is `SetLine(id, "")`.
+- `M(L, N, e)`, the model step of `apply`: `AppendLine(t)` gives `(L ++ [(LineId(N), t)], N+1)`.
+  `SetLine(id, t)` replaces the text of the entry with id `id` if it exists, else leaves `L`
+  unchanged; `N` is unchanged. `ClearLine(id)` is `SetLine(id, "")`.
 - `op(e)` is `Append(LineId(N))`, `Write(id)` or `Clear(id)`, by the variant of `e`.
 - `sorted(L)`: the ids in `L` strictly ascend, and all are `< N`.
 - `lb(id)` = `line_lower_bound(id)`.
@@ -58,13 +51,11 @@ Result: **16 specs**, covering **25 tests**. **0 non-spec tests remain** (§4).
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes (primary tests; secondary in §2)`,
-`difficulty (Rust features the proof must handle)`, `blocking gaps (audit §7 numbers)`.
-
-Gap 0 (an installed seal that publishes Clean rows) blocks every row, so it is listed once here
-and left out of the column. No spec is blocked by gap 0 alone. Every one needs at least gaps
-1 and 2 (non-scalar carriers and certified `&self`/`&mut self` views). §6 says how to cut
-scalar cores out of the first few, so that they can be proved before those gaps close.
+`subsumes` lists the primary tests (secondary ones are in §2). `difficulty` names the Rust
+features a proof must handle. `blocking gaps` are rows of the gap table in
+`docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7. Gap 0 (a seal that publishes Clean rows)
+blocks every row and is left out. Every row also needs gaps 1 and 2 (non-scalar carriers,
+certified `&self`/`&mut self` views); §6 says how to start before they close.
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking gaps
@@ -122,7 +113,7 @@ refines-kernel-family-models	refinement	Surface::{apply,transact,poll,snapshot},
 
 ## 2. Test → spec map (TSV)
 
-`primary` is the spec that retires the test. `also` lists the other specs the same test samples.
+`primary` is the spec that retires the test; `also` lists the other specs it samples.
 
 ```tsv
 file	test	primary	also
@@ -202,29 +193,39 @@ Status 2026-10-28: 0 standalone non-spec tests remain; `conformance_kernel::a_ga
 8. **The raw test count is 26, and there are 25 live tests.** `tests/buffer_suite.rs` mentions
    `#[test]` only in a doc comment. A naive substring grep over-counts this crate by one.
 
-## 6. The three specs I would prove first (easiest, high value)
+- **5.2 `ring-capacity-bound` rests on unspecified std behaviour.** `capacity ≤ MAX+1` holds only
+  if `VecDeque`'s amortized growth lands exactly on 65536 and `reserve_exact(1)` does not
+  over-allocate; std promises neither. Allocating `VecDeque::with_capacity(MAX + 1)` up front
+  and dropping the `reserve_exact` branch of `EventLog::append_at` makes the bound the code's own
+  (`len ≤ MAX+1` at every push, a corollary of `log-window-invariant`), at the cost of about
+  2 MiB per log from the start.
+- **5.3 `conformance_snapshot` checks a tautology.** It hard-codes `snapped = 1` and
+  `leaked = 0` into the observed state and checks `SnapshotIsolated` on that constant. Only its
+  text-equality asserts test the code; `snapshot-isolation` states what they sample.
+- **5.4 `conformance_subscribe` projects the test's cursor, not the code's.** Both tests track the
+  cursor themselves and hard-code `lost = 0`, so the guard comparison checks the test's own
+  projection. `conformance_cursor` reads the cursor back through `poll`; `poll-contract` states
+  the returned `Cursor`.
+- **5.5 The logarithmic-work test is loose and needs test-only instrumentation.**
+  `narrow_tail_line_operations_do_logarithmic_work` counts comparisons through the
+  `#[cfg(test)]` `LINE_ID_COMPARISONS` thread-local. Its bounds at 4096 lines
+  (`2 * usize::BITS` for a read, `usize::BITS` for a `SetLine`) are far above the 13 iterations
+  one lower bound takes. `line-lower-bound` states the loop's decreases bound instead; the
+  instrumentation goes with the test.
+- **5.6 Three test files restate the cap.** `conformance_eventlog.rs`, `conformance_evict_full.rs`
+  and `conformance_subscribe.rs` define `CAP = 1 << 16` instead of using
+  `aterm_buffer::MAX_LOG_EVENTS`.
+- **5.7 A "control" that is a positive sample.** `dropping_the_evicted_event_loses_seqs_control`
+  asserts only that after `MAX + 1000` appends the live window starts at seq 1001 and holds
+  `MAX` events: `log-window-invariant`'s corollary `lo = T − MAX + 1`. The loss it names is the
+  host's; `no-silent-loss` states the positive side (the returned `Some(ev)` is the only
+  remaining copy).
 
-Every spec here waits on gaps 0, 1 and 2, because `EventLog` and `Surface` are a `VecDeque`, an
-`Arc<Vec<…>>` and `&mut self` throughout. The way to start before those gaps close is to cut
-the scalar core out of each spec into a pure `fn` over `u64`/`usize`. Each core is then blocked
-only by gap 0 (and gap 3 for `min`/`saturating_*`). The code-level spec is then proved over it
-once gaps 1 and 2 land.
+## 6. Proof order
 
-1. **`append-at-contract` with `log-window-invariant`.** The scalar core is the step on
-   `(T, |R|)`: `T' = T+1` and `|R'| = min(|R|+1, MAX)`, with `ev.is_some() ⇔ |R| = MAX`. Together
-   with `lo = T − |R| + 1`, this is linear arithmetic (`omega`). The full statements retire 6
-   tests as primary (the 2 temporal/kernel `append_at` tests and the 4 eventlog/evict_full window
-   tests), and every other spec builds on them.
-2. **`live-after-is-filter`.** The scalar core is the seek-index function
-   `min(after.saturating_add(1).saturating_sub(lo), |R|)`, proved in range and equal to the count
-   of live seqs `≤ after`. Factor it out of `live_after` as a named `fn`. It retires the
-   `live_after_seek_…` test and is the half of `poll-contract` (4 tests) that says which events
-   are delivered. `poll-contract`'s other half, the Gap predicate `R ≠ [] ∧ lo > at+1`, is
-   another scalar fn of the same kind.
-3. **`transact-occ`**, via `apply-refines-line-model`'s seq clause. Its control flow is one
-   `seq != base` branch and a fold of `apply`. The scalar core (Conflict leaves `seq` unchanged;
-   Committed gives `base + |body|`) is a callee-ensures composition (gap 4) over SeqIsCount. It
-   retires 3 tests, including both transact conformance tests.
+To start before gaps 1 and 2 close, cut each spec's scalar core into a pure `fn` over
+`u64`/`usize`, blocked only by gap 0 (and gap 3 for `min`/`saturating_*`), and prove the
+code-level spec over it once those gaps land.
 
 Runner-up: **`ring-capacity-bound`**. With the §5.2 pop-before-push fix in `record`
 (`VecDeque::with_capacity(MAX_LOG_ENTRIES)` and `if len == MAX { pop_front }`), `len ≤ MAX` holds at

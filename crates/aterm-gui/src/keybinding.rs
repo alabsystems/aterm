@@ -281,6 +281,9 @@ impl Action {
     pub fn parse(name: &str) -> Option<Action> {
         let n = name.trim();
         if let Some(rest) = n.strip_prefix("switch_tab_") {
+            if !rest.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
             let idx: u8 = rest.parse().ok()?;
             return (1..=9).contains(&idx).then_some(Action::SwitchTab(idx));
         }
@@ -1005,6 +1008,9 @@ pub(crate) fn parse_byte_sequence(s: &str) -> Result<Vec<u8>, String> {
                         None => return Err("unterminated \\u{".to_string()),
                     }
                 }
+                if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(format!("bad \\u{{{hex}}}"));
+                }
                 let cp = u32::from_str_radix(&hex, 16).map_err(|_| format!("bad \\u{{{hex}}}"))?;
                 let ch = char::from_u32(cp).ok_or_else(|| format!("invalid scalar U+{hex}"))?;
                 out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
@@ -1577,6 +1583,7 @@ mod tests {
     #[test]
     fn key_sequence_unicode_brace_edge_cases() {
         assert!(parse_byte_sequence("\\u{}").is_err());
+        assert!(parse_byte_sequence("\\u{+41}").is_err());
         assert!(parse_byte_sequence("\\u{D800}").is_err());
         assert!(parse_byte_sequence("\\u{110000}").is_err());
         assert_eq!(

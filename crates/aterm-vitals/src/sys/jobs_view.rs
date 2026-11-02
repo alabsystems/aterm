@@ -89,12 +89,28 @@ pub fn summary(rows: &[&JobRow]) -> String {
             parts.push(format!("{n} {}", v.word()));
         }
     }
-    if let Some(w) = worst(rows) {
+    let described = worst(rows);
+    if let Some(w) = described {
         let phi = phi_text(w.phi_milli.unwrap_or(0));
+        let label = if w.working_descendant.is_some() {
+            "worst local"
+        } else {
+            "worst"
+        };
         parts.push(match w.gap() {
-            Some(gap) => format!("worst: {gap}, φ {phi}"),
-            None => format!("worst: φ {phi}"),
+            Some(gap) => format!("{label}: {gap}, φ {phi}"),
+            None => format!("{label}: φ {phi}"),
         });
+    }
+    if let Some(w) = described.or_else(|| worst_live(rows))
+        && let Some((pid, start)) = w.working_descendant
+    {
+        let local = if described.is_some() {
+            String::new()
+        } else {
+            format!("local {}: ", w.verdict.word())
+        };
+        parts.push(format!("{local}working descendant pid={pid} birth={start}"));
     }
     parts.join(" · ")
 }
@@ -130,12 +146,19 @@ pub fn status_fields(view: Option<&JobsView>, keys: &[u64], age_ms: u64) -> Stri
         return "job=- job_quiet_ms=-".to_owned();
     };
     match worst_live(&rows_in(view, keys)) {
-        Some(r) => format!(
-            "job={} job_quiet_ms={}",
-            r.verdict.word(),
-            r.quiet_ms
-                .map_or_else(|| "-".to_owned(), |q| q.saturating_add(age_ms).to_string())
-        ),
+        Some(r) => {
+            let descendant = r
+                .working_descendant
+                .map_or_else(String::new, |(pid, start)| {
+                    format!(" job_working_descendant={pid} job_working_descendant_start={start}")
+                });
+            format!(
+                "job={} job_quiet_ms={}{descendant}",
+                r.verdict.word(),
+                r.quiet_ms
+                    .map_or_else(|| "-".to_owned(), |q| q.saturating_add(age_ms).to_string())
+            )
+        }
         None => "job=none job_quiet_ms=-".to_owned(),
     }
 }
@@ -200,6 +223,7 @@ pub fn findings_in(f: &Findings, keys: &[u64], all: bool) -> Findings {
             .cloned()
             .collect(),
         program_check_aterm: f.program_check_aterm,
+        program_check_after_grant: f.program_check_after_grant,
         program_check_episode: f.program_check_episode,
         program_check_drained: f.program_check_drained,
         translating: f
@@ -212,6 +236,12 @@ pub fn findings_in(f: &Findings, keys: &[u64], all: bool) -> Findings {
             .not_started
             .iter()
             .filter(|n| mine(n.tab))
+            .cloned()
+            .collect(),
+        stopped_unstarted: f
+            .stopped_unstarted
+            .iter()
+            .filter(|s| mine(s.named.tab))
             .cloned()
             .collect(),
         probably_program_check: f
@@ -437,6 +467,16 @@ pub fn findings_json(f: &Findings) -> Jv {
     items.extend(f.program_check.iter().map(|n| named("program_check", n)));
     items.extend(f.translating.iter().map(|n| named("translating", n)));
     items.extend(f.not_started.iter().map(|n| named("not_started", n)));
+    items.extend(f.stopped_unstarted.iter().map(|s| {
+        Jv::obj([
+            ("kind", Jv::s("stopped_unstarted")),
+            ("pid", Jv::u(u64::from(s.named.pid))),
+            ("exe", Jv::s(exe_word(&s.named.name))),
+            ("stopped", Jv::Bool(s.stopped)),
+            ("traced", Jv::Bool(s.traced)),
+            ("for_ms", Jv::u(s.named.for_ms)),
+        ])
+    }));
     items.extend(f.probably_program_check.iter().map(|n| {
         Jv::obj([
             ("kind", Jv::s("probably_program_check")),
@@ -467,6 +507,7 @@ pub(crate) mod fixtures {
             id: id.into(),
             tab,
             kind: JobKind::AgentCall,
+            orphan_of: None,
             consumer: Consumer::AgentBg,
             promoted_ms: None,
             task: Some("bq7f2k1za".into()),
@@ -567,8 +608,10 @@ mod tests {
     fn status_counts_this_tabs_held_programs_and_the_oldest_to_now() {
         let held = |pid, tab, for_ms| Named {
             pid,
+            exec_version: None,
             name: "git-remote-https".into(),
             tab,
+            job: None,
             for_ms,
         };
         let view = JobsView {
@@ -608,6 +651,7 @@ mod tests {
             demand: crate::jobs::Demand::Fast,
             lanes_off: Vec::new(),
             parked_tabs: Vec::new(),
+            at_ms: 0,
         }
     }
 
@@ -681,19 +725,100 @@ mod tests {
     }
 
     #[test]
+    fn short_views_qualify_local_verdicts_with_the_same_descendant_generation() {
+        let mut wrapper = stuck("a48757", 7);
+        wrapper.class = Class::Polling;
+        wrapper.no_progress = false;
+        for birth in [1_793_213_706_219_818, u64::MAX] {
+            wrapper.working_descendant = Some((16998, birth));
+            let raw = wrapper.wire();
+            let v = view(vec![wrapper.clone()]);
+            assert_eq!(
+                status_fields(Some(&v), &[7], 3_000),
+                format!(
+                    "job=stuck job_quiet_ms=1155000 job_working_descendant=16998 job_working_descendant_start={birth}"
+                )
+            );
+            let text = summary(&rows_in(&v, &[7]));
+            assert!(text.contains("worst local:"), "{text}");
+            assert!(text.contains("working descendant pid=16998"), "{text}");
+            assert!(text.contains(&format!("birth={birth}")), "{text}");
+            assert_eq!(brief_line(&v, &[7]), Some(format!("jobs {text}")));
+            assert_eq!(v.rows[0].wire(), raw);
+            assert_eq!(v.rows[0].class, Class::Polling);
+            assert_eq!(v.rows[0].verdict, Verdict::Stuck);
+            assert!(!v.rows[0].no_progress);
+        }
+    }
+
+    #[test]
+    fn short_views_do_not_borrow_another_jobs_descendant_context() {
+        let local = stuck("a1", 7);
+        let mut other = stuck("a2", 7);
+        other.phi_milli = Some(4_000);
+        other.quiet_ms = Some(4_000);
+        other.working_descendant = Some((16998, 99));
+        let mut v = view(vec![local, other]);
+        assert_eq!(
+            status_fields(Some(&v), &[7], 0),
+            "job=stuck job_quiet_ms=1152000"
+        );
+        let text = summary(&rows_in(&v, &[7]));
+        assert!(!text.contains("working descendant"), "{text}");
+        assert!(!text.contains("worst local"), "{text}");
+        v.rows[1].tab = 8;
+        assert_eq!(
+            status_fields(Some(&v), &[7], 0),
+            "job=stuck job_quiet_ms=1152000"
+        );
+        assert!(
+            status_fields(Some(&v), &[8], 0)
+                .contains("job_working_descendant=16998 job_working_descendant_start=99")
+        );
+        assert!(!brief_line(&v, &[7]).unwrap().contains("working descendant"));
+    }
+
+    #[test]
+    fn a_qualified_summary_without_phi_keeps_the_local_verdict_explicit() {
+        let mut wrapper = row("a1", 7, Class::Polling, Verdict::Quiet);
+        wrapper.working_descendant = Some((16998, 99));
+        let mut v = view(vec![wrapper]);
+        let text = summary(&rows_in(&v, &[7]));
+        assert!(text.contains("local quiet:"), "{text}");
+        assert!(
+            text.contains("working descendant pid=16998 birth=99"),
+            "{text}"
+        );
+        assert!(!text.contains('φ'), "unknown phi is not zero: {text}");
+        v.rows[0].working_descendant = None;
+        assert_eq!(summary(&rows_in(&v, &[7])), "1 job · 1 quiet");
+        assert_eq!(status_fields(Some(&v), &[7], 0), "job=quiet job_quiet_ms=-");
+        v.rows[0].working_descendant = Some((16998, 99));
+        v.rows[0].class = Class::Exited;
+        v.rows[0].verdict = Verdict::Exited;
+        assert_eq!(summary(&rows_in(&v, &[7])), "1 job · 1 exited");
+        assert_eq!(status_fields(Some(&v), &[7], 0), "job=none job_quiet_ms=-");
+        assert_eq!(brief_line(&v, &[7]), None);
+    }
+
+    #[test]
     fn a_finding_prints_only_where_the_scope_reaches_unless_global() {
         let two = |pid: u32, name: &str| {
             vec![
                 Named {
                     pid,
+                    exec_version: None,
                     name: name.into(),
                     tab: Some(7),
+                    job: None,
                     for_ms: 4_000,
                 },
                 Named {
                     pid: pid + 1,
+                    exec_version: None,
                     name: name.into(),
                     tab: None,
+                    job: None,
                     for_ms: 4_000,
                 },
             ]
@@ -702,33 +827,49 @@ mod tests {
             stopped: vec![
                 Named {
                     pid: 10,
+                    exec_version: None,
                     name: "vim".into(),
                     tab: Some(7),
+                    job: None,
                     for_ms: 0,
                 },
                 Named {
                     pid: 11,
+                    exec_version: None,
                     name: "someone-elses".into(),
                     tab: None,
+                    job: None,
                     for_ms: 0,
                 },
             ],
             program_check: vec![
                 Named {
                     pid: 63454,
+                    exec_version: None,
                     name: "git-remote-https".into(),
                     tab: Some(7),
+                    job: None,
                     for_ms: 1_139_000,
                 },
                 Named {
                     pid: 25311,
+                    exec_version: None,
                     name: "gh".into(),
                     tab: None,
+                    job: None,
                     for_ms: 35_940_000,
                 },
             ],
             translating: two(7010, "x86tool"),
             not_started: two(7020, "nfsprog"),
+            stopped_unstarted: two(7040, "debuggee")
+                .into_iter()
+                .map(|named| crate::jobs::StoppedUnstarted {
+                    named,
+                    stopped: true,
+                    traced: false,
+                })
+                .collect(),
             probably_program_check: two(7030, "trustc"),
             own_procs: 300,
             process_limit: Some(5_000),
@@ -752,6 +893,15 @@ mod tests {
             [[7010], [7020], [7030]],
             "nor does a program that has not started, or one that probably waits"
         );
+        assert_eq!(
+            mine.stopped_unstarted
+                .iter()
+                .map(|s| s.named.pid)
+                .collect::<Vec<_>>(),
+            [7040],
+            "nor one that reads stopped or traced"
+        );
+        assert_eq!(findings_in(&f, &[7], true).stopped_unstarted.len(), 2);
         let global = findings_in(&f, &[7], true);
         assert_eq!(global.stopped.len(), 2);
         assert_eq!(global.program_check.len(), 2);
@@ -769,6 +919,7 @@ mod tests {
             r#"{"kind":"program_check","pid":63454,"exe":"git-remote-https","for_ms":1139000}"#,
             r#"{"kind":"translating","pid":7010,"exe":"x86tool","for_ms":4000}"#,
             r#"{"kind":"not_started","pid":7020,"exe":"nfsprog","for_ms":4000}"#,
+            r#"{"kind":"stopped_unstarted","pid":7040,"exe":"debuggee","stopped":true,"traced":false,"for_ms":4000}"#,
             r#"{"kind":"probably_program_check","pid":7030,"exe":"trustc","heuristic":"fresh-dylib"}"#,
         ] {
             assert!(j.to_text().contains(item), "{item}: {}", j.to_text());
@@ -776,8 +927,10 @@ mod tests {
         let odd = Findings {
             stopped: vec![Named {
                 pid: 12,
+                exec_version: None,
                 name: "evil\u{1b}[31m".into(),
                 tab: Some(7),
+                job: None,
                 for_ms: 0,
             }],
             ..Findings::default()

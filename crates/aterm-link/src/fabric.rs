@@ -5,7 +5,7 @@
 //! (`on`, `off`, `doctor` in [`crate::enable`]), and person commands (`mint-for`, `halt`,
 //! `inbox`, `post` in [`crate::person`]).
 
-#[cfg(any(test, not(target_os = "macos")))]
+#[cfg(test)]
 use aterm_uds::spawnfd::Stdio;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
@@ -70,9 +70,11 @@ file `fabric.toml` that `on` writes, else in a running instance's bridge command
                    {\"gap\":{...}} line
   tail             stream bus records as they land, until Ctrl-C
   --from <offset>  tail: replay from bus offset <offset> first
-  --bodies         tail: print each record's text after its trust label (--json:
-                   `body`); an `ev` record's text is the session log's bus line, whose
-                   grammar `aterm help fabric` gives under THE SESSION LOG ON THE BUS
+  --bodies         tail: print each record's body after its trust label (--json:
+                   `body`): its `text=`, or, for a record with no `text=`, its whole
+                   first line and never a byte past it (a presence row's fields; an `ev`
+                   record's session log bus line, whose grammar `aterm help fabric` gives
+                   under THE SESSION LOG ON THE BUS); `len` counts the body's bytes
   --filter <f>     tail: one full subject pattern, `/f/<F>/…` (`*` one segment, `>`
                    the rest), instead of the whole fleet
   brief            fold each session's mirrored log into a few lines (need, open work,
@@ -197,7 +199,7 @@ pub(crate) fn io_timeout() -> Duration {
     static AT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
     *AT.get_or_init(|| {
         aterm_types::dev_seam!(IO_TIMEOUT_SEAM)
-            .and_then(|ms| ms.to_str()?.parse::<u64>().ok())
+            .and_then(|ms| crate::parse_uint::<u64>(ms.to_str()?))
             .map_or(UNSEAMED, Duration::from_millis)
     })
 }
@@ -816,82 +818,96 @@ pub(crate) fn bridge_config<S: AsRef<str>>(argv: &[S]) -> Result<Config, String>
     crate::cli::parse(&flags).map(|p| p.cfg)
 }
 
-/// One process, as `ps` shows it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Proc {
-    pub pid: u32,
-    pub ppid: u32,
-    /// Its command line, space-joined as `ps` prints it.
-    pub cmd: String,
-}
-
-/// Parse `ps -o pid= -o ppid= -o command=` output.
-#[must_use]
-pub fn parse_ps(text: &str) -> Vec<Proc> {
-    text.lines()
-        .filter_map(|line| {
-            let mut it = line.trim_start().splitn(2, char::is_whitespace);
-            let pid = it.next()?.parse().ok()?;
-            let rest = it.next()?.trim_start();
-            let mut it = rest.splitn(2, char::is_whitespace);
-            let ppid = it.next()?.parse().ok()?;
-            let cmd = it.next().unwrap_or("").trim().to_string();
-            Some(Proc { pid, ppid, cmd })
+/// The bridges among an instance's aterm children ([`aterm_ctl::census::Listing::aterm_children`]):
+/// the ones whose words are `aterm link serve …` or `aterm-link serve …` ([`serve_flags`]). A
+/// child whose words were not read (its thread had not run, or they are unread) is no bridge.
+fn bridges_among(children: &[aterm_ctl::census::Child]) -> Vec<u32> {
+    children
+        .iter()
+        .filter(|c| {
+            c.words
+                .as_deref()
+                .is_some_and(|words| serve_flags(words).is_some())
         })
+        .map(|c| c.pid)
         .collect()
-}
-
-/// The machine's process table, or empty when it cannot be read (a sandbox), so every consumer
-/// says "not found" rather than guessing.
-pub(crate) fn process_table() -> Vec<Proc> {
-    #[cfg(target_os = "macos")]
-    {
-        use aterm_sysprobe::kproc;
-        kproc::records()
-            .unwrap_or_default()
-            .iter()
-            .map(|r| Proc {
-                pid: r.pid,
-                ppid: r.ppid,
-                cmd: kproc::ps_args(r, kproc::Locale::Utf8).trim().to_string(),
-            })
-            .collect()
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        ps_table()
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn ps_table() -> Vec<Proc> {
-    aterm_uds::spawnfd::command(aterm_uds::os_path!("ps"))
-        .args(["-A", "-ww", "-o", "pid=", "-o", "ppid=", "-o", "command="])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .map(|o| parse_ps(&String::from_utf8_lossy(&o.stdout)))
-        .unwrap_or_default()
 }
 
 /// The process serving the broker at `sock`: the one process of this user holding the listening
 /// socket bound there, by the socket's own record ([`aterm_uds::holders::scan_listener_holders`]),
-/// never by a command line that names the socket. `None` when no process holds it, two do, or the
-/// scan cannot run here.
-pub(crate) fn listener_pid(sock: &str) -> Option<u32> {
-    aterm_uds::holders::scan_listener_holders(Path::new(sock), &[])
-        .ok()
-        .as_ref()
-        .and_then(the_one_holder)
+/// never by a command line that names the socket. `Ok(None)` when no process holds it, or when
+/// which one does is unknown with nothing bound to the socket's file ([`unknown_unless_unbound`]).
+///
+/// # Errors
+/// Which process serves it is unknown, and why, while a socket may be bound to its file: the
+/// scan cannot run here, does not answer in time or cannot tell (a connection refused by a
+/// listener whose accept queue is full, say), a table that may hold the listener did not read,
+/// or two processes hold the listener ([`the_one_holder`]).
+pub(crate) fn listener_pid(sock: &str) -> Result<Option<u32>, String> {
+    let path = Path::new(sock);
+    let held = aterm_uds::holders::scan_listener_holders(path, &[])
+        .map_err(|e| format!("the listener scan cannot tell ({e})"))
+        .and_then(|scan| the_one_holder(&scan));
+    unknown_unless_unbound(held, || aterm_uds::holders::bound_at(path))
 }
 
-/// The holder a scan found, when it found exactly one. A table the scan could not read does not
-/// unseat it: Linux seals every non-dumpable process's table (an `ssh-agent`), so a scan that
-/// had to read every table would name no broker on most hosts, and a broker never seals its own.
-fn the_one_holder(scan: &aterm_uds::holders::HolderScan) -> Option<u32> {
+/// `held`, the scan's answer ([`listener_pid`]), but where it is unknown and a probe of the
+/// socket's file (`bound`, [`aterm_uds::holders::bound_at`]) finds nothing bound to it (no file,
+/// or a socket file whose listener closed, as a killed broker leaves one), no process serves the
+/// socket: none. A cause the scan cannot outlast (a table this build misreads, a kernel with no
+/// socket dump) then leaves no broker unrenewed where none can be. The probe is made only for an
+/// unknown.
+///
+/// # Errors
+/// `held`'s unknown, with what the probe found, when it found a socket bound there or failed.
+fn unknown_unless_unbound(
+    held: Result<Option<u32>, String>,
+    bound: impl FnOnce() -> io::Result<aterm_uds::holders::Bound>,
+) -> Result<Option<u32>, String> {
+    use aterm_uds::holders::Bound;
+    let Err(unknown) = held else {
+        return held;
+    };
+    match bound() {
+        Ok(Bound::Nothing) => Ok(None),
+        Ok(Bound::Stream) => Err(format!("{unknown}; a stream socket is bound there")),
+        Ok(Bound::Datagram) => Err(format!("{unknown}; a datagram socket is bound there")),
+        Err(e) => Err(format!("{unknown}; what is bound there is unknown ({e})")),
+    }
+}
+
+/// The holder a scan found: `Ok(None)` when it found none and read every table it had to, the
+/// one it found, or an error naming each when it found more than one, as which one serves is
+/// then unknown. A table the scan could not read does not unseat the one it found: Linux seals
+/// every non-dumpable process's table (an `ssh-agent`), so a scan that had to read every table
+/// would name no broker on most hosts, and a broker never seals its own. Where it found none,
+/// such a table may hold the listener, so which process does is unknown: Linux's scan reads the
+/// tables only once the kernel's socket dump names a listener holding the path (none is read
+/// for a path no listener holds), and macOS's leaves both lists empty.
+///
+/// # Errors
+/// The scan found two or more holders, or none with a table it could not read.
+fn the_one_holder(scan: &aterm_uds::holders::HolderScan) -> Result<Option<u32>, String> {
     match scan.holders.as_slice() {
-        [one] => Some(*one),
-        _ => None,
+        [] if !(scan.sealed.is_empty() && scan.unreadable.is_empty()) => Err(format!(
+            "no table the scan read holds its listener, and the tables of {} did not read",
+            scan.sealed
+                .iter()
+                .chain(&scan.unreadable)
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+        [] => Ok(None),
+        [one] => Ok(Some(*one)),
+        many => Err(format!(
+            "{} processes hold its listener ({})",
+            many.len(),
+            many.iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
     }
 }
 
@@ -902,7 +918,11 @@ fn the_one_holder(scan: &aterm_uds::holders::HolderScan) -> Option<u32> {
 pub fn parse_launchctl(text: &str, pid: u32) -> Option<String> {
     text.lines().find_map(|line| {
         let mut cols = line.split_whitespace();
-        let p: u32 = cols.next()?.parse().ok()?;
+        let p: u32 = cols
+            .next()
+            .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))?
+            .parse()
+            .ok()?;
         let _status = cols.next()?;
         let label = cols.next()?;
         (p == pid).then(|| label.to_string())
@@ -945,6 +965,9 @@ pub struct BrokerView {
     pub cap_expired: bool,
     /// The pid serving it: the one process of this user holding its listener ([`listener_pid`]).
     pub pid: Option<u32>,
+    /// Why the pid serving it is unknown, where [`listener_pid`] could not tell; `None` where it
+    /// could, so [`Self::pid`] names the holder or that no process holds the listener.
+    pub pid_unknown: Option<String>,
     /// The launchd job running that pid (macOS).
     pub launchd: Option<String>,
     /// The bus head offset — the next offset the log will assign.
@@ -977,6 +1000,9 @@ pub struct BrokerView {
     /// The log the serving process's argv names ([`crate::broker_args::BrokerArgs::log_path`]),
     /// beside which astream keeps its health snapshot.
     pub log: Option<PathBuf>,
+    /// The log a fabric root keeps beside the configured socket, when one is there: what
+    /// [`Self::at_rest`] reads while no serving process names a log.
+    pub root_log: Option<PathBuf>,
     /// astream's health snapshot beside that log (`<log>.health`: what the log holds, who is
     /// attached, its flushes and its poison), as [`astream_broker::read_health`] found it, with
     /// whether the process that wrote it still serves the log.
@@ -986,10 +1012,28 @@ pub struct BrokerView {
 const GUARD_PROBE_SECRET: &[u8] = b"aterm fabric guard probe: no broker's secret";
 
 impl BrokerView {
+    /// `sealed` or `plaintext`, of the log the serving process names, or with none serving of the
+    /// fabric root's own: a refused broker is when a person asks about the seal. `None` when there
+    /// is neither.
+    #[must_use]
+    pub fn at_rest(&self) -> Option<&'static str> {
+        self.log
+            .as_deref()
+            .or(self.root_log.as_deref())
+            .map(crate::at_rest::word)
+    }
+
     /// Whether the bus was read: connect, `Hello`, every attach and the head query all answered.
     #[must_use]
     pub const fn read_ok(&self) -> bool {
         self.reachable && self.attached && self.head.is_some()
+    }
+
+    /// Whether a process may hold its listener: one is named ([`Self::pid`]), or which one is
+    /// unknown ([`Self::pid_unknown`]).
+    #[must_use]
+    pub const fn held(&self) -> bool {
+        self.pid.is_some() || self.pid_unknown.is_some()
     }
 
     /// The tier the report names: the one the serving process's argv names
@@ -1026,8 +1070,8 @@ impl BrokerView {
             .or_else(|| self.snapshot_now().and_then(|h| h.poisoned.as_deref()))
     }
 
-    /// Name the pid serving [`Self::endpoint`] ([`listener_pid`]), its launchd job, and what
-    /// its own argv says it serves; no other process is read.
+    /// Name the pid serving [`Self::endpoint`] ([`listener_pid`]), or why it is unknown, its
+    /// launchd job, and what its own argv says it serves; no other process is read.
     pub(crate) fn locate(&mut self) {
         self.locate_with(listener_pid, launchd_label, replaced_build, |pid| {
             aterm_uds::process::read_process_argv(i32::try_from(pid).ok()?)
@@ -1036,12 +1080,15 @@ impl BrokerView {
 
     fn locate_with(
         &mut self,
-        mut holder: impl FnMut(&str) -> Option<u32>,
+        mut holder: impl FnMut(&str) -> Result<Option<u32>, String>,
         mut label: impl FnMut(u32) -> Option<String>,
         mut replaced: impl FnMut(u32, &str) -> Option<String>,
         mut argv: impl FnMut(u32) -> Option<Vec<std::ffi::OsString>>,
     ) {
-        self.pid = holder(&self.endpoint);
+        (self.pid, self.pid_unknown) = match holder(&self.endpoint) {
+            Ok(pid) => (pid, None),
+            Err(why) => (None, Some(why)),
+        };
         self.launchd = self.pid.and_then(&mut label);
         let words = self.pid.and_then(&mut argv);
         let exe = words
@@ -1101,29 +1148,31 @@ pub(crate) fn running_image_inode(pid: u32) -> Option<u64> {
     not(any(target_os = "linux", target_os = "macos"))
 ))]
 fn lsof_image_inode(pid: u32) -> Option<u64> {
-    let out = aterm_uds::spawnfd::command(aterm_uds::os_path!("lsof"))
-        .args([
-            "-n",
-            "-P",
-            "-a",
-            "-p",
-            &pid.to_string(),
-            "-d",
-            "txt",
-            "-F",
-            "i",
-        ])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+    let mut cmd = aterm_uds::spawnfd::command(aterm_uds::os_path!("lsof"));
+    cmd.args([
+        "-n",
+        "-P",
+        "-a",
+        "-p",
+        &pid.to_string(),
+        "-d",
+        "txt",
+        "-F",
+        "i",
+    ]);
+    let out =
+        aterm_uds::deadline::output_within(&mut cmd, std::time::Duration::from_secs(15)).ok()?;
     lsof_first_inode(&String::from_utf8_lossy(&out.stdout))
 }
 
 #[cfg(any(test, not(any(target_os = "linux", target_os = "macos"))))]
 fn lsof_first_inode(text: &str) -> Option<u64> {
-    text.lines()
-        .find_map(|l| l.strip_prefix('i').and_then(|n| n.parse().ok()))
+    text.lines().find_map(|l| {
+        let n = l.strip_prefix('i')?;
+        (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| n.parse().ok())
+            .flatten()
+    })
 }
 
 /// The faces a report may read when the broker is guarded and `/f/<F>/>` is not granted: every
@@ -1182,6 +1231,9 @@ pub(crate) fn probe_broker(cfg: &Config) -> (BrokerView, Option<Conn>) {
             Ok(read) => read.map(Ok),
             Err(e) => Some(Err(e.to_string())),
         });
+    view.root_log = crate::enable::root_of(&cfg.broker)
+        .map(|root| root.join(crate::enable::BUS_LOG))
+        .filter(|log| log.exists());
     reach(cfg, view)
 }
 
@@ -1420,6 +1472,11 @@ pub struct DoctorSummary {
     pub text: String,
     /// The observation did not establish health, independently of its display level.
     pub unmeasured: bool,
+    /// Who serves the fabric's socket, as this read found it: `Some(Some(pid))` the one process
+    /// found holding its listener (the probe's [`BrokerView::pid`]), `Some(None)` nobody, since
+    /// the fabric is off, and `None` when nothing read says: the probe found no one holder (none
+    /// holds it, two do, or the scan cannot read), which proves no broker is not the one serving.
+    pub serving: Option<Option<u32>>,
 }
 
 /// The top-level `aterm doctor`'s `fabric:` row: probes the broker the command names
@@ -1451,6 +1508,7 @@ fn summary_for(
             return DoctorSummary {
                 level: SummaryLevel::Note,
                 unmeasured: false,
+                serving: Some(None),
                 text: "off: no [fabric] command in aterm.toml and no rendezvous file \
                        (`aterm fabric on` turns it on; an instance started while it was on keeps \
                        its bridge until it is relaunched, which `aterm fabric` reports)"
@@ -1461,6 +1519,7 @@ fn summary_for(
             return DoctorSummary {
                 level: SummaryLevel::Warn,
                 unmeasured: true,
+                serving: None,
                 text: format!(
                     "the fabric's config cannot be read ({}) — `aterm fabric` says where",
                     safe(&e, 256)
@@ -1473,11 +1532,13 @@ fn summary_for(
         (Ok(_), Some(why)) => DoctorSummary {
             level: SummaryLevel::Note,
             unmeasured: true,
+            serving: None,
             text: format!("not read ({why})"),
         },
         (Err(e), _) => DoctorSummary {
             level: SummaryLevel::Warn,
             unmeasured: true,
+            serving: None,
             text: format!(
                 "the [fabric] command does not parse ({}) — `aterm fabric` says where it is",
                 safe(&e, 256)
@@ -1496,6 +1557,7 @@ pub fn summary_of(b: &BrokerView) -> DoctorSummary {
         level: SummaryLevel::Warn,
         unmeasured,
         text,
+        serving: b.pid.map(Some),
     };
     if let Some(skew) = b.protocol {
         return warn(
@@ -1553,6 +1615,7 @@ pub fn summary_of(b: &BrokerView) -> DoctorSummary {
         Some(_) => DoctorSummary {
             level: SummaryLevel::Ok,
             unmeasured: false,
+            serving: b.pid.map(Some),
             text: format!(
                 "the broker at {at} answers, {served}, and says its log is not poisoned \
                  (`aterm fabric` reads the rest)"
@@ -1561,6 +1624,7 @@ pub fn summary_of(b: &BrokerView) -> DoctorSummary {
         None => DoctorSummary {
             level: SummaryLevel::Note,
             unmeasured: true,
+            serving: b.pid.map(Some),
             text: format!(
                 "the broker at {at} answers and {served}, and does not say whether its log is \
                  poisoned (it predates the health entry; `aterm fabric` reads the rest)"
@@ -1589,11 +1653,12 @@ pub struct Traffic {
     pub to: String,
     /// The record's kind: the `in` kind, or the face's leaf (`presence`, …).
     pub kind: String,
-    /// The body's text length in bytes.
+    /// The body's length in bytes ([`Traffic::text`]'s, as the record holds it).
     pub len: usize,
     /// The receiver's trust label, computed from the address alone ([`crate::render::trust_of`]).
     pub trust: &'static str,
-    /// The text itself — only `tail --bodies` ever prints it.
+    /// The body ([`traffic_of`]): the decoded `text=` when the record's first line carries one,
+    /// else that whole first line — only `tail --bodies` ever prints it.
     pub text: String,
 }
 
@@ -1610,7 +1675,7 @@ fn render_from(src: &str, body_from: Option<&str>) -> String {
     }
 }
 
-/// Classify one record.
+/// Classify one record. Its body ([`Traffic::text`]) and `len` follow [`first_line_body`].
 #[must_use]
 pub fn traffic_of(fleet: &str, off: u64, subject: &str, raw: &[u8]) -> Traffic {
     if raw.starts_with(b"v=2 ") {
@@ -1618,7 +1683,12 @@ pub fn traffic_of(fleet: &str, off: u64, subject: &str, raw: &[u8]) -> Traffic {
             return t;
         }
     }
-    traffic_of_body(fleet, off, subject, Body::decode(raw).0)
+    let mut t = traffic_of_body(fleet, off, subject, Body::decode(raw).0);
+    if let Some((text, len)) = first_line_body(raw) {
+        t.text = text;
+        t.len = len;
+    }
+    t
 }
 
 fn mirrored_traffic(fleet: &str, off: u64, subject: &str, raw: &[u8]) -> Option<Traffic> {
@@ -1629,10 +1699,30 @@ fn mirrored_traffic(fleet: &str, off: u64, subject: &str, raw: &[u8]) -> Option<
         return None;
     }
     t.t_ms = b.rec.t;
-    t.len = raw.len();
     t.trust = b.rec.src.word();
-    t.text = text.to_string();
+    (t.text, t.len) = first_line_body(raw).unwrap_or_else(|| {
+        let text = Body::decode(raw).0.text;
+        let len = text.len();
+        (text, len)
+    });
     Some(t)
+}
+
+/// THE BODY OF A RECORD WITH NO `text=` (fix unit E5, E2E-10): when `raw`'s first line (its
+/// bytes before the first newline) carries no `text=` token, the body `tail --bodies` prints is
+/// that whole first line, read as UTF-8 lossily, and `len` its bytes: a presence row's fields,
+/// a halt's `state=`, an `ev` record's session-log line, a `term/in` header. `None` when the
+/// first line carries `text=`, whose decoded text is the body. Never a byte after the first
+/// newline: a `term/in` body's payload past it is keystrokes.
+fn first_line_body(raw: &[u8]) -> Option<(String, usize)> {
+    let head = raw.split(|b| *b == b'\n').next().unwrap_or_default();
+    if head
+        .split(|b| *b == b' ')
+        .any(|tok| tok.starts_with(b"text="))
+    {
+        return None;
+    }
+    Some((String::from_utf8_lossy(head).into_owned(), head.len()))
 }
 
 /// [`traffic_of`] over a body already decoded.
@@ -2124,12 +2214,17 @@ impl GivenUpRange {
     /// `@<from>..@<to>` (`from <= to`), and `count` as its records where it is a number.
     #[must_use]
     pub fn parse(range: &str, count: Option<&str>) -> Option<Self> {
+        let dec = |s: &str| {
+            (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| s.parse::<u64>().ok())
+                .flatten()
+        };
         let (from, to) = range.strip_prefix('@')?.split_once("..@")?;
-        let (from, to) = (from.parse::<u64>().ok()?, to.parse::<u64>().ok()?);
+        let (from, to) = (dec(from)?, dec(to)?);
         (from <= to).then(|| Self {
             from,
             to,
-            records: count.and_then(|n| n.parse().ok()),
+            records: count.and_then(dec),
         })
     }
 
@@ -2188,7 +2283,8 @@ pub struct InstanceView {
     /// The program that command runs ([`bridge_program`]), resolved when the report was read so
     /// a substituted program is named beside its flags.
     pub program: Option<String>,
-    /// Its bridge child pid(s), from the process table.
+    /// Its bridge children: the aterm children the census proves by their executable whose words
+    /// are `aterm link serve …` ([`bridges_among`]).
     pub bridge_pids: Vec<u32>,
     /// The node its bridge answers as, from that command's state dir.
     pub node: Option<String>,
@@ -2228,8 +2324,8 @@ pub fn kv<'a>(line: &'a str, key: &str) -> Option<&'a str> {
 /// header counts every unlisted row as `pending=`, and it lists every un-landed post) and
 /// `inbox --peek --meta` (every message row).
 pub fn fill_inbox(s: &mut LocalSession, header0: &str, posts: &[String], full: &[String]) {
-    let num = |k: &str| kv(header0, k).and_then(|v| v.parse::<u64>().ok());
-    s.hold = kv(header0, "hold").and_then(|v| v.parse::<u8>().ok());
+    let num = |k: &str| kv(header0, k).and_then(crate::parse_uint::<u64>);
+    s.hold = kv(header0, "hold").and_then(crate::parse_uint::<u8>);
     s.holder = kv(header0, "holder").unwrap_or("-").to_string();
     s.seen = num("seen");
     s.dropped = num("dropped");
@@ -2246,10 +2342,10 @@ pub fn fill_inbox(s: &mut LocalSession, header0: &str, posts: &[String], full: &
             if words.next() != Some("msg") {
                 return None;
             }
-            let id = words.next()?.parse::<u64>().ok()?;
+            let id = crate::parse_uint::<u64>(words.next()?)?;
             Some(MsgMeta {
                 id,
-                off: kv(r, "off")?.parse().ok()?,
+                off: crate::parse_uint(kv(r, "off")?)?,
                 from: kv(r, "from").unwrap_or("-").to_string(),
                 kind: kv(r, "kind").unwrap_or("-").to_string(),
             })
@@ -2337,22 +2433,21 @@ fn read_session(ctl: &mut Ctl, sid: &str) -> LocalSession {
     s
 }
 
-fn read_instance(pid: u32, sock: &str, procs: &[Proc], sessions: bool) -> Option<InstanceView> {
+fn read_instance(
+    pid: u32,
+    sock: &str,
+    listing: Option<&aterm_ctl::census::Listing>,
+    sessions: bool,
+) -> Option<InstanceView> {
     let mut v = InstanceView {
         pid,
         sock: sock.to_string(),
         pid_reaches: aterm_ctl::pid_reaches(pid, sock),
         ..InstanceView::default()
     };
-    v.bridge_pids = procs
-        .iter()
-        .filter(|p| {
-            p.ppid == pid
-                && pid != 0
-                && serve_flags(&aterm_types::fabric_command::split_line(&p.cmd)).is_some()
-        })
-        .map(|p| p.pid)
-        .collect();
+    v.bridge_pids = listing
+        .map(|l| bridges_among(&l.aterm_children(pid)))
+        .unwrap_or_default();
     let mut ctl = match open_instance(pid, sock, io_timeout()) {
         Ok(Some(c)) => c,
         Ok(None) => return None,
@@ -2366,15 +2461,15 @@ fn read_instance(pid: u32, sock: &str, procs: &[Proc], sessions: bool) -> Option
             let h = r.header();
             v.fabric = kv(h, "state").map(str::to_string);
             v.reason = kv(h, "reason").filter(|r| *r != "-").map(str::to_string);
-            v.rtt_ms = kv(h, "rtt_ms").and_then(|n| n.parse().ok());
-            v.link_age_ms = kv(h, "link_age_ms").and_then(|n| n.parse().ok());
+            v.rtt_ms = kv(h, "rtt_ms").and_then(crate::parse_uint);
+            v.link_age_ms = kv(h, "link_age_ms").and_then(crate::parse_uint);
             v.supervised = kv(h, "supervised").map(|s| s == "1");
             v.build = kv(h, "build").filter(|b| *b != "-").map(str::to_string);
             v.bridge_build = kv(h, "bridge_build")
                 .filter(|b| *b != "-")
                 .map(str::to_string);
-            v.lane_faults = kv(h, "lane_faults").and_then(|n| n.parse().ok());
-            v.mail_gaps = kv(h, "mail_gaps").and_then(|n| n.parse().ok());
+            v.lane_faults = kv(h, "lane_faults").and_then(crate::parse_uint);
+            v.mail_gaps = kv(h, "mail_gaps").and_then(crate::parse_uint);
             v.mail_gap =
                 kv(h, "mail_gap").and_then(|r| GivenUpRange::parse(r, kv(h, "mail_gap_count")));
             v.command = status_argv(h);
@@ -2624,7 +2719,7 @@ pub fn gather() -> Result<Report, Off> {
             Some(found) => Some(found),
             None => rendezvous_command().map_err(Off::Unreadable)?,
         };
-    let procs = process_table();
+    let listing = aterm_ctl::census::Listing::read().ok();
 
     let (listed, discovery_error) = match aterm_ctl::local_instances() {
         Ok(list) => (list, None),
@@ -2632,7 +2727,7 @@ pub fn gather() -> Result<Report, Off> {
     };
     let instances: Vec<InstanceView> = listed
         .iter()
-        .filter_map(|(pid, sock)| read_instance(*pid, sock, &procs, true))
+        .filter_map(|(pid, sock)| read_instance(*pid, sock, listing.as_ref(), true))
         .collect();
 
     let (source, command) = match resolved {
@@ -2881,10 +2976,7 @@ fn join_sessions(report: &mut Report, roster: Option<&crate::glance::Glance>) {
         for row in rows {
             let live = row.field("state") == "live";
             if !live {
-                let recent = row
-                    .field("t")
-                    .parse::<u64>()
-                    .ok()
+                let recent = crate::parse_uint::<u64>(row.field("t"))
                     .is_some_and(|t| now.saturating_sub(t) <= GONE_SHOW_MS);
                 if !(recent && local_nodes.contains(&row.node)) {
                     report.exited += 1;
@@ -4042,7 +4134,10 @@ pub fn render_text(r: &Report) -> String {
             match (b.pid, &b.launchd) {
                 (Some(p), Some(l)) => format!("{p} (launchd {})", safe(l, 128)),
                 (Some(p), None) => format!("{p}"),
-                (None, _) => "- (no `link broker` process serves this socket)".to_string(),
+                (None, _) => b.pid_unknown.as_deref().map_or_else(
+                    || "- (no `link broker` process serves this socket)".to_string(),
+                    |why| format!("- (unknown: {})", safe(why, 256)),
+                ),
             },
             b.replaced
                 .as_deref()
@@ -4079,6 +4174,9 @@ pub fn render_text(r: &Report) -> String {
                 crate::durability::describe_served(d, b.served, b.guarded)
             ),
         ));
+    }
+    if let Some(word) = b.at_rest() {
+        kvs.push(("at-rest", word.to_string()));
     }
     if let Some(row) = health_row(b) {
         kvs.push(("health", row));
@@ -4468,7 +4566,7 @@ pub fn render_json(r: &Report) -> String {
                         s.context
                             .as_deref()
                             .and_then(|c| c.strip_suffix('%'))
-                            .and_then(|n| n.parse().ok()),
+                            .and_then(crate::parse_uint),
                     ),
                 ),
                 (
@@ -4476,7 +4574,7 @@ pub fn render_json(r: &Report) -> String {
                     J::opt_n(
                         l.and_then(|l| l.hold)
                             .map(u64::from)
-                            .or_else(|| s.bus_hold.as_deref().and_then(|h| h.parse().ok())),
+                            .or_else(|| s.bus_hold.as_deref().and_then(crate::parse_uint)),
                     ),
                 ),
                 (
@@ -4602,6 +4700,7 @@ pub fn render_json(r: &Report) -> String {
                     "served",
                     J::opt_s(b.served.map(|s| crate::durability::tier_name(s.served))),
                 ),
+                ("at_rest", J::opt_s(b.at_rest())),
                 (
                     "faces",
                     b.faces
@@ -4870,7 +4969,7 @@ pub(crate) fn configured_for_reads() -> Result<Config, ExitCode> {
                 aterm_ctl::local_instances()
                     .unwrap_or_default()
                     .iter()
-                    .filter_map(|(pid, sock)| read_instance(*pid, sock, &[], false))
+                    .filter_map(|(pid, sock)| read_instance(*pid, sock, None, false))
                     .find(|i| i.supervised == Some(true))
                     .and_then(|i| i.command)
             });
@@ -6416,37 +6515,27 @@ mod tests {
         assert_eq!(bridge_program(&words("aterm link ls --fleet lab")), None);
     }
 
+    /// An instance's bridges are its aterm children whose words serve a fleet, by either
+    /// spelling: a broker child and a child whose words were not read are none. NEGATIVE
+    /// CONTROL: count a child with unread words as a bridge, and it joins.
     #[test]
-    fn the_process_table_names_the_broker() {
-        let ps = "\
-    1     0 /sbin/launchd
-48078     1 /Users//u/.local/bin/aterm link broker /Users//u/f/bus.sock /Users//u/f/bus.log
-15678     1 /x/target/debug/aterm-link broker /tmp/other.sock /tmp/other.log
-48224 66439 /Users//u/.local/bin/aterm link serve --fleet local --broker /Users//u/f/bus.sock
-15792 15335 /x/aterm-link serve --fleet t --broker /tmp/other.sock
-  900   800 vim notes-about-aterm-link-serve.txt
-  700     1 /Users//u/Applications/aterm (dev).app/Contents/MacOS/aterm link broker /Users//u/g/bus.sock /Users//u/g/bus.log
-";
-        let procs = parse_ps(ps);
-        assert_eq!(procs.len(), 7);
-        assert_eq!(
-            procs[1],
-            Proc {
-                pid: 48078,
-                ppid: 1,
-                cmd: "/Users//u/.local/bin/aterm link broker /Users//u/f/bus.sock /Users//u/f/bus.log"
-                    .to_string()
-            }
-        );
-        assert_eq!(
-            (procs[6].pid, procs[6].ppid, procs[6].cmd.as_str()),
-            (
-                700,
-                1,
-                "/Users//u/Applications/aterm (dev).app/Contents/MacOS/aterm link broker /Users//u/g/bus.sock /Users//u/g/bus.log"
-            ),
-            "a command keeps its spaces"
-        );
+    fn an_instance_s_bridges_are_its_aterm_children_that_serve() {
+        use aterm_ctl::census::Child;
+        let child = |pid: u32, words: Option<&[&str]>| Child {
+            pid,
+            words: words.map(|w| w.iter().map(ToString::to_string).collect()),
+        };
+        let children = [
+            child(71, Some(&["/x/aterm", "link", "serve", "--fleet", "f"])),
+            child(72, Some(&["aterm-link", "serve", "--fleet", "f"])),
+            child(73, Some(&["aterm", "link", "broker", "/s", "/l"])),
+            child(74, None),
+        ];
+        assert_eq!(bridges_among(&children), [71, 72]);
+    }
+
+    #[test]
+    fn the_launchd_label_is_read_from_launchctl() {
         let launchctl =
             "PID\tStatus\tLabel\n-\t0\tcom.apple.x\n48078\t0\tsystems.alab.astream-broker\n";
         assert_eq!(
@@ -6586,16 +6675,34 @@ mod tests {
         );
         assert_eq!(forged.from, "s-evil");
 
-        let p = traffic_of(
-            "lab",
-            1,
-            "/f/lab/pub/n-a/s-w/presence",
-            b"v=1 t=2 state=live",
-        );
+        // A record whose meaning is in its fields, not a `text=` (fix unit E5, E2E-10): its
+        // body is its whole first line and `len` that line's bytes, shown under `--bodies`
+        // alone. NEGATIVE CONTROL (scratch): today's decoded-text rule gives `len` 0 and an
+        // empty body.
+        let row: &[u8] = b"v=1 t=2 state=live attention=QZP7WORD1";
+        let p = traffic_of("lab", 1, "/f/lab/pub/n-a/s-w/presence", row);
         assert_eq!(
             (p.from.as_str(), p.to.as_str(), p.kind.as_str(), p.len),
-            ("s-w@n-a", "-", "presence", 0)
+            ("s-w@n-a", "-", "presence", row.len())
         );
+        assert_eq!(p.text.as_bytes(), row);
+        let subject = "/f/lab/pub/n-a/s-w/presence";
+        assert!(!traffic_cells(&p, 0, 0).join(" ").contains("QZP7WORD1"));
+        assert!(!tail_line(&p, 0, 0, false).contains("QZP7WORD1"));
+        assert!(!tail_json("lab", subject, &p, false).contains("QZP7WORD1"));
+        assert!(tail_line(&p, 0, 0, true).ends_with("text=v=1 t=2 state=live attention=QZP7WORD1"));
+        assert!(tail_json("lab", subject, &p, true).contains("attention=QZP7WORD1"));
+        // Never a byte past the first newline: a `term/in` body's payload is keystrokes.
+        // NEGATIVE CONTROL (scratch): taking the whole raw body prints them.
+        let keys: &[u8] = b"v=1 t=1 gen=1:ab len=9\nQZP7KEYS1";
+        let k = traffic_of("lab", 13, "/f/lab/term/n-a/s-w/in/h-andrew", keys);
+        assert_eq!((k.text.as_str(), k.len), ("v=1 t=1 gen=1:ab len=9", 22));
+        for shown in [
+            tail_line(&k, 0, 0, true),
+            tail_json("lab", "/f/lab/term/n-a/s-w/in/h-andrew", &k, true),
+        ] {
+            assert!(!shown.contains("QZP7KEYS1"), "{shown}");
+        }
         let n = traffic_of("lab", 2, "/f/lab/pub/n-a/node/presence", b"v=1 t=2");
         assert_eq!(n.from, "n-a");
         let s = traffic_of(
@@ -6610,6 +6717,11 @@ mod tests {
         );
         let bare = traffic_of("lab", 151, "/f/lab/pub/n-a/s-w/say/say", b"v=1 t=1");
         assert_eq!((bare.to.as_str(), bare.kind.as_str()), ("say:say", "note"));
+        assert_eq!(
+            (bare.text.as_str(), bare.len),
+            ("v=1 t=1", 7),
+            "a bare body's own line"
+        );
         let ev = traffic_of("lab", 3, "/f/lab/pub/n-a/s-w/ev", b"v=1 t=2");
         assert_eq!(ev.trust, SCREEN);
         let halt = traffic_of("lab", 8, "/f/lab/fleet/h-andrew/halt", b"v=1 t=2 state=on");
@@ -6884,6 +6996,33 @@ mod tests {
         );
     }
 
+    /// Who serves the fabric's socket is said only of the one process its probe found holding
+    /// the listener: a probe that found no one holder (none, two, or a scan that did not read)
+    /// says nothing, so doctor judges no broker unsupervised by it. NEGATIVE CONTROL: take a
+    /// probe that found no holder for one that found nobody serving, and the live broker whose
+    /// listener the scan could not read is judged unsupervised.
+    #[test]
+    fn only_the_one_holder_found_says_who_serves_the_fabric() {
+        let found = BrokerView {
+            endpoint: "/r/bus.sock".into(),
+            pid: Some(4242),
+            ..BrokerView::default()
+        };
+        assert_eq!(summary_of(&found).serving, Some(Some(4242)));
+        let unfound = BrokerView {
+            pid: None,
+            ..found.clone()
+        };
+        assert_eq!(summary_of(&unfound).serving, None);
+        let reachable = BrokerView {
+            reachable: true,
+            attached: true,
+            head: Some(7),
+            ..unfound
+        };
+        assert_eq!(summary_of(&reachable).serving, None, "an answering broker");
+    }
+
     #[test]
     fn a_withheld_fabric_row_says_why_and_probes_nothing() {
         let absent = std::env::temp_dir().join(format!("atl-withheld-{}", std::process::id()));
@@ -7030,6 +7169,131 @@ mod tests {
         }
     }
 
+    /// A sealed log's refusal is the last line of broker.err at its real length, a home folder's
+    /// path in it twice: the quote cuts at 256 characters, and the fix still reads it, whichever of
+    /// the two refusals it is, and says every way out itself, since the quote may have cut them.
+    #[test]
+    fn a_sealed_logs_refusal_gets_its_remedy_at_real_lengths() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("al-sealed")
+            .tempdir()
+            .expect("scratch");
+        let root = dir.path().join("Users/someone/.local/share/aterm-fabric");
+        std::fs::create_dir_all(&root).expect("root");
+        let log = root.join("bus.log");
+        std::fs::write(&log, b"sealed").expect("log");
+        std::fs::write(root.join("bus.log.seal"), b"binding").expect("seal");
+        assert!(crate::at_rest::is_sealed(&log));
+        let role = crate::enable::Role::default();
+        let fix = |w: &str| crate::enable::fix_for(w, &role);
+        let warnings = |last: &str| {
+            std::fs::write(dir.path().join("broker.err"), format!("{last}\n")).expect("err");
+            let mut r = healthy();
+            r.broker.reachable = false;
+            r.broker.error = Some("connect: No such file or directory (os error 2)".into());
+            r.broker.last_word = crate::enable::supervisor_last_word(dir.path());
+            let inst = &mut r.instances[0];
+            inst.fabric = Some("stalled".to_string());
+            inst.reason = Some("no-socket".to_string());
+            let w = warned(&r);
+            let pick = |needle: &str| {
+                w.iter()
+                    .find(|l| l.contains(needle))
+                    .unwrap_or_else(|| panic!("no {needle:?} warning: {w:#?}"))
+                    .clone()
+            };
+            [
+                pick("does not answer (connect:"),
+                pick("broker link is down"),
+            ]
+        };
+        let line = |remedy: String| format!("aterm link broker: {remedy}");
+        let refused = crate::at_rest::open_remedy(&log, std::io::ErrorKind::InvalidData)
+            .expect("the open's remedy");
+        let missing = crate::at_rest::refusal(&log, "no such file").remedy;
+        for remedy in [refused, missing] {
+            let whole = line(remedy);
+            assert!(whole.chars().count() > 256, "PRECONDITION: {whole}");
+            for w in warnings(&whole) {
+                assert!(w.contains("supervisor's broker.err"), "{w}");
+                let f = fix(&w);
+                assert!(
+                    f.starts_with("the broker refuses its log, sealed at rest")
+                        && !f.contains("fix that first")
+                        && f.contains(crate::at_rest::REST_KEY)
+                        && f.contains("--repair <log>")
+                        && f.contains("dropping the records from there on")
+                        && f.contains(crate::at_rest::RETIRE_VERB),
+                    "{f}\nfor: {w}"
+                );
+            }
+        }
+        std::fs::write(root.join("bus.log.retiring"), b"retired-1").expect("marker");
+        let stopped = crate::at_rest::unfinished_retire(&log).expect("stopped part way");
+        for w in warnings(&line(stopped.remedy)) {
+            let f = fix(&w);
+            assert!(
+                f.starts_with("a `--retire-log` of the broker's log stopped part way")
+                    && f.contains(crate::at_rest::RETIRE_VERB),
+                "{f}\nfor: {w}"
+            );
+        }
+    }
+
+    /// `aterm fabric` has an `at-rest` row and `--json` an `at_rest` value: of the log the serving
+    /// process names, and with none serving of the root's own, since a refused broker is when a
+    /// person asks about the seal. With neither there is no row, rather than a guess.
+    #[test]
+    fn the_at_rest_row_reads_the_served_log_or_with_none_serving_the_roots() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("al-rest")
+            .tempdir()
+            .expect("scratch");
+        let log = dir.path().join("bus.log");
+        let seal = dir.path().join("bus.log.seal");
+        let cfg = unix_config(&dir.path().join("bus.sock"));
+        let row = |r: &Report| {
+            render_text(r)
+                .lines()
+                .find(|l| l.trim_start().starts_with("at-rest"))
+                .map(|l| l.split_whitespace().last().unwrap_or("").to_string())
+        };
+        let down = || {
+            let (view, conn) = probe_broker(&cfg);
+            assert!(conn.is_none() && !view.reachable, "nothing serves here");
+            let mut r = healthy();
+            r.broker = view;
+            r
+        };
+
+        let none = down();
+        assert_eq!(row(&none), None, "no log: no row");
+        assert_eq!(none.broker.at_rest(), None);
+
+        std::fs::write(&log, b"records").expect("log");
+        let plain = down();
+        assert_eq!(row(&plain).as_deref(), Some("plaintext"));
+        assert!(
+            render_json(&plain).contains("\"at_rest\":\"plaintext\""),
+            "{}",
+            render_json(&plain)
+        );
+
+        std::fs::write(&seal, b"binding").expect("seal");
+        let sealed = down();
+        assert_eq!(row(&sealed).as_deref(), Some("sealed"));
+        assert!(render_json(&sealed).contains("\"at_rest\":\"sealed\""));
+
+        let mut served = healthy();
+        served.broker.root_log = Some(log.clone());
+        served.broker.log = Some(dir.path().join("elsewhere.log"));
+        assert_eq!(
+            row(&served).as_deref(),
+            Some("plaintext"),
+            "a serving process's log is the one that counts"
+        );
+    }
+
     #[test]
     fn the_report_says_what_the_broker_says_of_its_log() {
         use astream_broker::{FlushCounts, HelloHealth};
@@ -7147,6 +7411,38 @@ mod tests {
             summary.text.contains("does not answer (connect: refused)"),
             "{}",
             summary.text
+        );
+    }
+
+    /// The report says a holder the scan could not name is unknown, and why, where one nobody
+    /// holds reads as no broker process; the JSON's `pid` is null either way.
+    #[test]
+    fn the_report_says_an_unknown_holder_is_unknown() {
+        let mut r = healthy();
+        r.broker.pid = None;
+        r.broker.launchd = None;
+        let pid_row = |r: &Report| {
+            render_text(r)
+                .lines()
+                .find(|line| line.trim_start().starts_with("pid"))
+                .map(str::to_string)
+                .expect("a pid row")
+        };
+        let none = pid_row(&r);
+        assert!(
+            none.contains("- (no `link broker` process serves this socket)"),
+            "{none}"
+        );
+        r.broker.pid_unknown = Some("2 processes hold its listener (71, 72)".to_string());
+        let unknown = pid_row(&r);
+        assert!(
+            unknown.contains("- (unknown: 2 processes hold its listener (71, 72))"),
+            "{unknown}"
+        );
+        assert!(
+            render_json(&r).contains("\"pid\":null,\"launchd\":null"),
+            "{}",
+            render_json(&r)
         );
     }
 
@@ -7519,92 +7815,6 @@ mod tests {
             "p57558\nftxt\ni366658160\nn/x/slp\nftxt\ni1152921500312609216\nn/usr/lib/dyld\n";
         assert_eq!(lsof_first_inode(lsof), Some(366_658_160));
         assert_eq!(lsof_first_inode(""), None);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn the_process_table_is_the_one_ps_prints() {
-        use std::collections::{BTreeMap, BTreeSet};
-        let sock = format!("/tmp/kproc-s\u{f6}k-{}.sock", std::process::id());
-        let sock = sock.as_str();
-        let mut fixture = aterm_uds::spawnfd::command("/bin/bash");
-        fixture
-            .arg0("aterm")
-            .args(["-c", "read x", "link", "broker", sock, "a\nb"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let mut fixture = fixture.spawn().expect("spawn bash");
-        let expected = format!("aterm -c read x link broker {sock} a\\012b");
-        let started = std::time::Instant::now();
-        while !process_table()
-            .iter()
-            .any(|p| p.pid == fixture.id() && p.cmd == expected)
-        {
-            assert!(
-                started.elapsed() < std::time::Duration::from_secs(60),
-                "bash's exec: not within 60s"
-            );
-            std::thread::yield_now();
-        }
-        let uid = aterm_sysprobe::kproc::record(std::process::id())
-            .expect("this process")
-            .uid;
-        let mine: BTreeSet<u32> = aterm_sysprobe::kproc::records()
-            .expect("records")
-            .iter()
-            .filter(|r| r.uid == uid)
-            .map(|r| r.pid)
-            .collect();
-        let keyed =
-            |t: Vec<Proc>| -> BTreeMap<u32, Proc> { t.into_iter().map(|p| (p.pid, p)).collect() };
-        let a = keyed(process_table());
-        let out = aterm_uds::spawnfd::command("/bin/ps")
-            .args(["-A", "-ww", "-o", "pid=", "-o", "ppid=", "-o", "command="])
-            .env("LC_ALL", "C.UTF-8")
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-            .expect("run ps");
-        let oracle = parse_ps(&String::from_utf8_lossy(&out.stdout));
-        let b = keyed(process_table());
-        let id = fixture.id();
-        drop(fixture.stdin.take());
-        let _ = fixture.kill();
-        let _ = fixture.wait();
-        let mut compared = BTreeSet::new();
-        for row in &oracle {
-            let (Some(x), Some(y)) = (a.get(&row.pid), b.get(&row.pid)) else {
-                continue;
-            };
-            if x != y {
-                continue;
-            }
-            if mine.contains(&row.pid) {
-                assert_eq!(x, row, "the row of {}", row.pid);
-            } else {
-                assert_eq!(
-                    (x.pid, x.ppid),
-                    (row.pid, row.ppid),
-                    "the row of {}",
-                    row.pid
-                );
-            }
-            compared.insert(row.pid);
-        }
-        assert!(compared.contains(&id) && compared.contains(&std::process::id()));
-        assert_eq!(a[&id].cmd, expected);
-        assert_eq!(
-            oracle.iter().find(|p| p.pid == id).map(|p| p.cmd.as_str()),
-            Some(expected.as_str()),
-            "ps prints the fixture's row as the table does"
-        );
-        assert!(
-            compared.len() * 2 >= oracle.len(),
-            "{} of {} rows compared",
-            compared.len(),
-            oracle.len()
-        );
     }
 
     #[test]
@@ -8913,7 +9123,7 @@ mod running_argv_tests {
         for (argv, expected) in cases {
             let mut read = Vec::new();
             view.locate_with(
-                |_| Some(71),
+                |_| Ok(Some(71)),
                 |pid| {
                     assert_eq!(pid, 71);
                     None
@@ -8935,11 +9145,19 @@ mod running_argv_tests {
     }
 
     /// Every other read (label, argv, replaced build) is of the holder, and none is made when
-    /// nothing holds it.
+    /// nothing holds it or which process does is unknown. An unknown holder is kept as why, and
+    /// the socket then reads as held, as one a named process holds does; one nobody holds does
+    /// not. NEGATIVE CONTROL: read the scan's error as no holder, and the unknown holder is
+    /// neither said nor held.
     #[test]
     fn the_broker_is_the_process_holding_its_listener() {
         let argv = words(&["/opt/aterm", "link", "broker", "/r/bus.sock", "/r/bus.log"]);
-        for (held, want) in [(Some(71), Some(71)), (None, None)] {
+        let unknown = "the listener scan cannot tell (connection refused)".to_string();
+        for (held, want) in [
+            (Ok(Some(71)), Some(71)),
+            (Ok(None), None),
+            (Err(unknown.clone()), None),
+        ] {
             let mut view = BrokerView {
                 endpoint: "/r/bus.sock".into(),
                 ..BrokerView::default()
@@ -8949,7 +9167,7 @@ mod running_argv_tests {
             view.locate_with(
                 |sock| {
                     sockets.push(sock.to_string());
-                    held
+                    held.clone()
                 },
                 |pid| {
                     asked.borrow_mut().push(("label", pid));
@@ -8970,6 +9188,8 @@ mod running_argv_tests {
                 "the holder is asked of the endpoint"
             );
             assert_eq!(view.pid, want, "held by {held:?}");
+            assert_eq!(view.pid_unknown, held.as_ref().err().cloned(), "{held:?}");
+            assert_eq!(view.held(), held != Ok(None), "{held:?}");
             let wanted: Vec<(&str, u32)> = want
                 .map(|pid| vec![("label", pid), ("argv", pid), ("replaced", pid)])
                 .unwrap_or_default();
@@ -8996,7 +9216,12 @@ mod running_argv_tests {
             };
             let log = format!("{word}.log");
             let argv = words(&["/bin/aterm", "link", "broker", &word, &log]);
-            view.locate_with(|_| Some(71), |_| None, |_, _| None, |_| Some(argv.clone()));
+            view.locate_with(
+                |_| Ok(Some(71)),
+                |_| None,
+                |_, _| None,
+                |_| Some(argv.clone()),
+            );
             view.log
         };
         assert_eq!(
@@ -9012,23 +9237,101 @@ mod running_argv_tests {
         );
     }
 
-    /// A table the scan could not read still leaves the one holder it found the broker.
+    /// One holder is the broker, none is none, and two leave which one serves unknown, naming
+    /// both. A table the scan could not read still leaves the one holder it found the broker,
+    /// but where it found none, a sealed or unreadable table may hold the listener: unknown.
+    /// NEGATIVE CONTROL: read no holder as none whatever did not read, and a scan whose one
+    /// possible holder was sealed names no holder.
     #[test]
-    fn one_holder_is_the_broker_and_two_are_none() {
+    fn one_holder_is_the_broker_and_two_are_unknown() {
         let scan = |holders: &[u32]| aterm_uds::holders::HolderScan {
             holders: holders.to_vec(),
             scanned: 9,
             ..aterm_uds::holders::HolderScan::default()
         };
-        assert_eq!(the_one_holder(&scan(&[71])), Some(71));
-        assert_eq!(the_one_holder(&scan(&[])), None);
-        assert_eq!(the_one_holder(&scan(&[71, 72])), None);
+        assert_eq!(the_one_holder(&scan(&[71])), Ok(Some(71)));
+        assert_eq!(the_one_holder(&scan(&[])), Ok(None));
+        assert_eq!(
+            the_one_holder(&scan(&[71, 72])),
+            Err("2 processes hold its listener (71, 72)".to_string())
+        );
         let incomplete = aterm_uds::holders::HolderScan {
             sealed: vec![80],
             unreadable: vec![81],
             ..scan(&[71])
         };
-        assert_eq!(the_one_holder(&incomplete), Some(71));
+        assert_eq!(the_one_holder(&incomplete), Ok(Some(71)));
+        for (sealed, unreadable) in [(vec![80], vec![]), (vec![], vec![81]), (vec![80], vec![81])] {
+            let unread = aterm_uds::holders::HolderScan {
+                sealed,
+                unreadable,
+                ..scan(&[])
+            };
+            assert!(the_one_holder(&unread).is_err(), "{unread:?}");
+        }
+    }
+
+    /// Where which process holds the listener is unknown, a probe of the socket's file that finds
+    /// nothing bound there (no file, a socket file whose listener closed) makes it none, whatever
+    /// the scan could not read or tell; a stream socket there, a datagram one or a probe that
+    /// fails leaves it unknown. A scan that named a holder or none is not probed. On a real
+    /// socket, a stale file reads none and a live listener stays unknown. NEGATIVE CONTROL: leave
+    /// every unknown unknown, and a stale socket file beside a scan that cannot run is never
+    /// none.
+    #[test]
+    fn an_unknown_holder_is_none_where_nothing_is_bound_to_the_socket() {
+        use aterm_uds::holders::Bound;
+        let unknown = || Err::<Option<u32>, _>("the listener scan cannot tell (x)".to_string());
+        let probed = std::cell::Cell::new(0);
+        let bound = |found: io::Result<Bound>| {
+            probed.set(probed.get() + 1);
+            found
+        };
+        assert_eq!(
+            unknown_unless_unbound(unknown(), || bound(Ok(Bound::Nothing))),
+            Ok(None)
+        );
+        for found in [
+            Ok(Bound::Stream),
+            Ok(Bound::Datagram),
+            Err(io::Error::from(io::ErrorKind::TimedOut)),
+        ] {
+            let still = unknown_unless_unbound(unknown(), || bound(found));
+            assert!(
+                still
+                    .as_ref()
+                    .is_err_and(|why| why.starts_with("the listener scan cannot tell (x)")),
+                "{still:?}"
+            );
+        }
+        probed.set(0);
+        for held in [Ok(Some(71)), Ok(None)] {
+            assert_eq!(
+                unknown_unless_unbound(held.clone(), || bound(Ok(Bound::Nothing))),
+                held
+            );
+        }
+        assert_eq!(probed.get(), 0, "a scan that answered is not probed");
+        #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+        {
+            let dir = aterm_tempfile::Builder::new()
+                .tempdir_in("/tmp")
+                .expect("a scratch folder short enough for sun_path");
+            let (stale, live) = (dir.path().join("stale.sock"), dir.path().join("live.sock"));
+            drop(std::os::unix::net::UnixListener::bind(&stale).expect("a listener closed"));
+            let listener = std::os::unix::net::UnixListener::bind(&live).expect("a listener");
+            let real = |path: &Path| {
+                unknown_unless_unbound(unknown(), || aterm_uds::holders::bound_at(path))
+            };
+            assert_eq!(
+                real(&stale),
+                Ok(None),
+                "a socket file whose listener closed"
+            );
+            assert_eq!(real(&dir.path().join("none.sock")), Ok(None), "no file");
+            assert!(real(&live).is_err(), "a live listener");
+            drop(listener);
+        }
     }
 
     /// With no argv read, the replaced-build check is not made.
@@ -9047,7 +9350,7 @@ mod running_argv_tests {
             };
             let mut asked = Vec::new();
             view.locate_with(
-                |_| Some(72),
+                |_| Ok(Some(72)),
                 |_| None,
                 |pid, exe| {
                     assert_eq!(pid, 72);

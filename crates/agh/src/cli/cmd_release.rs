@@ -84,16 +84,26 @@ pub(crate) fn release_list(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
         .releases(&slug)
         .how(how.clone())
         .list(&opts.with_limit(None))?;
-    let mut releases: Vec<ReleaseObject> = listing
+    let mut releases = Vec::new();
+    for release in listing
         .items
         .into_iter()
         .filter(|release| prerelease.is_none_or(|want| release.prerelease == want))
-        .filter(|release| {
-            regex
-                .as_ref()
-                .is_none_or(|regex| regex.is_match(&release.tag_name))
-        })
-        .collect();
+    {
+        let matched = match &regex {
+            None => true,
+            Some(regex) => regex.try_is_match(&release.tag_name).map_err(|e| {
+                inv.usage(format!(
+                    "--tag-regex {:?} gave up on a {}-byte tag: {e}",
+                    regex.as_str(),
+                    release.tag_name.len()
+                ))
+            })?,
+        };
+        if matched {
+            releases.push(release);
+        }
+    }
     let completeness = Completeness::of(crate::page::cut(listing.end, &mut releases, opts.limit));
     let latest = latest_if_wanted(&gh, &slug, &how, inv, Noun::ReleaseList)?;
     let mut receipt = Receipt::for_repo(inv, &gh, &slug);

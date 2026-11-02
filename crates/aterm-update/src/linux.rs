@@ -664,7 +664,7 @@ fn probe_candidate(
             .stderr(Stdio::from(error))
             .spawn()
             .map_err(|e| format!("authenticated Linux candidate cannot start: {e}"))?;
-        let deadline = Instant::now() + timeout;
+        let deadline = crate::instant_after(Instant::now(), timeout);
         let status = loop {
             let oversized = [&output_path, &error_path]
                 .into_iter()
@@ -964,7 +964,12 @@ const TIME_NAMESPACE: &str = "/proc/self/ns/time";
 /// namespace (`time_namespace`) they count on ([`Steady`]); `None` when the boot has no
 /// name to read or the clock cannot be read, and the wall clock judges alone.
 fn steady_clock(boot_id: &Path, time_namespace: &Path) -> Option<Steady> {
-    let boot = fs::read_to_string(boot_id).ok()?;
+    let mut boot = String::new();
+    File::open(boot_id)
+        .ok()?
+        .take(64)
+        .read_to_string(&mut boot)
+        .ok()?;
     astream_sys::parse_boot_id(boot.as_bytes())?;
     let boot = boot.trim();
     let namespace = fs::read_link(time_namespace)
@@ -1884,15 +1889,13 @@ pub fn confirm(current_build: u64, current_commit: &str) -> bool {
         }
         let _lock = context.lock()?;
         let mut state = context.read_state()?.ok_or(MISSING_ENROLLMENT)?;
-        let executable = File::open("/proc/self/exe").map_err(|e| e.to_string())?;
-        let actual = executable.metadata().map_err(|e| e.to_string())?;
         confirm_lane_locked(
             context,
             &mut state,
             lane,
             current_build,
             current_commit,
-            (actual.dev(), actual.ino()),
+            proc_self_inode()?,
         )
         .map(|confirmed| matches!(confirmed, Confirmed::Yes | Confirmed::NotPending))
     })()

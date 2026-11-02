@@ -9,6 +9,7 @@
 //! targo --unverified run -q -p aterm-census -- --guards          # just the source guards
 //! targo --unverified run -q -p aterm-census -- --locks --scope   # just these two
 //! targo --unverified run -q -p aterm-census -- --all <root>      # everything, another checkout
+//! targo --unverified run -q -p aterm-census -- mirror record …    # the mirror-proof registry
 //! ```
 //!
 //! Bare `aterm-census` is `--all`; census flags combine. In
@@ -162,8 +163,34 @@ fn run(selected: &[&'static Census], root: &Path, verbose: bool) -> bool {
     ok
 }
 
+/// `aterm-census mirror …`: the mirror-proof registry's generator ([`aterm_census::mirror`]).
+fn mirror(args: &[String]) -> ExitCode {
+    let root = default_root();
+    if !root.join(CHECKOUT_MARKER).is_file() {
+        eprintln!(
+            "aterm-census: {} is not an aterm checkout (no {CHECKOUT_MARKER}); run it from one",
+            root.display()
+        );
+        return ExitCode::from(2);
+    }
+    match aterm_census::mirror::cli(&root, args) {
+        Ok(log) => {
+            print!("{log}");
+            ExitCode::SUCCESS
+        }
+        Err(why) => {
+            eprintln!("aterm-census mirror: {why}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn main() -> ExitCode {
-    let invocation = match parse(std::env::args().skip(1)) {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("mirror") {
+        return mirror(&args[1..]);
+    }
+    let invocation = match parse(args) {
         Ok(Some(invocation)) => invocation,
         Ok(None) => {
             print!("{}", usage());

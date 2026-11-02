@@ -188,12 +188,82 @@ pub trait ReleaseHost {
         false
     }
 
+    /// Whether this identity or an anonymous reader observes repository `slug`.
+    /// `Ok(false)` means both repository reads answered HTTP 404. A missing repository and
+    /// a private repository hidden from both readers are indistinguishable by those answers;
+    /// this is a visibility result, not proof of nonexistence. A pack's upload asks it when
+    /// this identity cannot list the public owner's releases, and permits private dev staging
+    /// after those two 404s (the harness design's §11 D50), without publishing publicly.
+    ///
+    /// # Errors
+    ///
+    /// Why it could not be told. A host that cannot ask says so (this default), which keeps
+    /// the caller's could-not-run.
+    fn repo_seen(&self, slug: &Slug) -> Result<bool, HostError> {
+        Err(HostError::Unreachable(format!(
+            "this host cannot tell whether {slug} exists"
+        )))
+    }
+
     /// Updates the scratch clone `dir` of `slug` as this identity.
     ///
     /// # Errors
     ///
     /// Why the fetch failed.
     fn fetch_repo(&self, slug: &Slug, dir: &Path) -> Result<(), HostError>;
+
+    /// The published releases of `slug`, read as Read (design §10.3): no draft, and no writer
+    /// needed. Default: `releases(slug)` without its drafts.
+    ///
+    /// # Errors
+    ///
+    /// As `releases`.
+    fn published_releases(&self, slug: &Slug) -> Result<Vec<Release>, HostError> {
+        Ok(self
+            .releases(slug)?
+            .into_iter()
+            .filter(|r| !r.draft)
+            .collect())
+    }
+
+    /// The published release `tag` of `slug`, read as Read (`GET /releases/tags/{tag}`).
+    /// Default: `release(slug, tag)`, a draft answering `NotFound`.
+    ///
+    /// # Errors
+    ///
+    /// As `release`, and [`HostError::NotFound`] for a draft.
+    fn published_by_tag(&self, slug: &Slug, tag: &str) -> Result<Release, HostError> {
+        match self.release(slug, tag) {
+            Ok(release) if release.draft => Err(HostError::NotFound),
+            other => other,
+        }
+    }
+
+    /// Whether a write to `slug` can be sent now: design §10.2's pre-claim check, run before a
+    /// build number is claimed or anything is built (finding F2). Default: `Ok(())`.
+    ///
+    /// # Errors
+    ///
+    /// Why a write to `slug` could not be sent now.
+    fn write_preflight(&self, slug: &Slug) -> Result<(), HostError> {
+        let _ = slug;
+        Ok(())
+    }
+
+    /// Fetches `slug`'s `refs/heads/main` from this host into the repository `dir` as the ref
+    /// `into`, as this identity, writing no other ref: the main of record a pack's source is
+    /// held to (D25), read from the host and never from `dir`'s own `origin`.
+    ///
+    /// # Errors
+    ///
+    /// Why the fetch failed. A host that cannot read a repository's main refuses, so a source
+    /// check over it never passes.
+    fn fetch_main(&self, slug: &Slug, dir: &Path, into: &str) -> Result<(), HostError> {
+        let _ = (dir, into);
+        Err(HostError::Refused(format!(
+            "this host does not read {slug}'s main"
+        )))
+    }
 }
 
 /// A shared handle to a host.
@@ -216,5 +286,46 @@ impl Hosts {
             staging: host.clone(),
             channel: host,
         }
+    }
+
+    /// The host that serves `owner`: `staging` for `accounts.staging`, `channel` for
+    /// `accounts.public` (ASCII case-insensitive), else `None` (finding F5). `staging` is
+    /// asked first, so when both accounts name `owner`, as in the public build where both
+    /// are `alabsystems`, it is `staging`, the host M1 read every seed through.
+    #[must_use]
+    pub fn for_owner(&self, accounts: &crate::ctx::Accounts, owner: &str) -> Option<&HostRef> {
+        if accounts.staging.eq_ignore_ascii_case(owner) {
+            Some(&self.staging)
+        } else if accounts.public.eq_ignore_ascii_case(owner) {
+            Some(&self.channel)
+        } else {
+            None
+        }
+    }
+}
+
+/// Which of a run's two hosts a write goes through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostRole {
+    /// `ctx.hosts.staging`: the writes to `ctx.staging_slug(..)`.
+    Staging,
+    /// `ctx.hosts.channel`: the writes to `ctx.index_slug()` and `ctx.public_slug(..)`.
+    Channel,
+}
+
+/// Whether the host in `role` is `RestHost` under `ctx.host_choice()`: both roles under `Gh`,
+/// `Channel` alone under `AghStaging`, and neither under `Agh`. A pre-claim check keeps its
+/// token-file test where this holds, and calls `write_preflight` on that role's host where it
+/// does not, so every M1 test that runs the lanes over `FakeHost` with the default choice sees
+/// the token checks it always saw. It is keyed by the host a write goes through, never by
+/// owner: in the public build both accounts are `alabsystems`, and an owner's answer would give
+/// staging's writes, which go through AghHost under `AghStaging`, the channel's token test.
+#[must_use]
+pub fn gh_serves(ctx: &crate::ctx::Ctx, role: HostRole) -> bool {
+    use crate::ctx::HostChoice;
+    match ctx.host_choice() {
+        HostChoice::Gh => true,
+        HostChoice::AghStaging => role == HostRole::Channel,
+        HostChoice::Agh => false,
     }
 }

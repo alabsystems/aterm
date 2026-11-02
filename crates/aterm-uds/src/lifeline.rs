@@ -204,7 +204,15 @@ pub fn close_inherited_copies(lifeline: &OwnedFd) -> io::Result<Vec<RawFd>> {
         return Ok(Vec::new());
     };
     let numbers: Vec<RawFd> = std::fs::read_dir("/dev/fd")?
-        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+        .filter_map(|entry| {
+            entry
+                .ok()?
+                .file_name()
+                .to_str()
+                .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))?
+                .parse()
+                .ok()
+        })
         .collect();
     let mut closed = Vec::new();
     for fd in numbers {
@@ -631,13 +639,14 @@ mod tests {
             return;
         }
         let dir = scratch("copies");
-        let out = Command::new(std::env::current_exe().expect("the test binary"))
-            .arg("an_inherited_copy_of_the_lifeline_is_closed_and_the_cut_then_arrives")
-            .arg("--nocapture")
-            .arg("--test-threads=1")
-            .env(COPIES_STAGE_ENV, &dir)
-            .output()
-            .expect("re-exec this test binary as the instance");
+        let out = crate::deadline::std_ends_within(
+            Command::new(std::env::current_exe().expect("the test binary"))
+                .arg("an_inherited_copy_of_the_lifeline_is_closed_and_the_cut_then_arrives")
+                .arg("--nocapture")
+                .arg("--test-threads=1")
+                .env(COPIES_STAGE_ENV, &dir),
+            crate::deadline::ECHO_HANG,
+        );
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
             out.status.success() && stdout.contains("1 passed"),
@@ -674,13 +683,14 @@ mod tests {
             }
             return;
         }
-        let out = Command::new(std::env::current_exe().expect("the test binary"))
-            .arg("the_sweep_never_closes_a_socket_that_merely_stats_alike")
-            .arg("--nocapture")
-            .arg("--test-threads=1")
-            .env(SOCKETS_STAGE_ENV, "1")
-            .output()
-            .expect("re-exec this test binary as the instance");
+        let out = crate::deadline::std_ends_within(
+            Command::new(std::env::current_exe().expect("the test binary"))
+                .arg("the_sweep_never_closes_a_socket_that_merely_stats_alike")
+                .arg("--nocapture")
+                .arg("--test-threads=1")
+                .env(SOCKETS_STAGE_ENV, "1"),
+            crate::deadline::ECHO_HANG,
+        );
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
             out.status.success() && stdout.contains("1 passed"),
@@ -728,13 +738,17 @@ mod tests {
             return;
         }
         let dir = scratch("contended");
-        let out = Command::new(std::env::current_exe().expect("the test binary"))
-            .arg("a_copy_is_swept_while_its_number_is_looked_up_elsewhere")
-            .arg("--nocapture")
-            .arg("--test-threads=1")
-            .env(CONTENDED_STAGE_ENV, &dir)
-            .output()
-            .expect("re-exec this test binary as the instance");
+        // The instance races under its own one-minute hang detector (`racing_lookups`), which its
+        // last round can overrun; this one is past both, a third minute covering its start and
+        // its end.
+        let out = crate::deadline::std_ends_within(
+            Command::new(std::env::current_exe().expect("the test binary"))
+                .arg("a_copy_is_swept_while_its_number_is_looked_up_elsewhere")
+                .arg("--nocapture")
+                .arg("--test-threads=1")
+                .env(CONTENDED_STAGE_ENV, &dir),
+            3 * crate::deadline::ECHO_HANG,
+        );
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
         if let Some(why) = stderr

@@ -102,7 +102,15 @@ pub const USAGE: &str = "\
                                    app's processes (a guest-side watch of the kernel's process table
                                    every 50 ms): the quit, the reopen with its pid, the reopened
                                    pid's first aterm.log line, setup followed across it (the guest's
-                                   disk grown to 100 GB first)
+                                   disk grown to 100 GB first); and the window at each milestone
+                                   through the guest's own aterm ctl image (the guest helper
+                                   following those watches, never a timer): first present, each
+                                   stage's start, each card setup= names and clears, each person
+                                   stage's dialog up and gone (System Settings, Local Network,
+                                   SecurityAgent, Apple's install dialog, ...), a relaunch, and
+                                   setup=done (or the wait's end), copied back with a contact sheet
+                                   into <record>-frames/ beside --record FILE (else the lab's state
+                                   folder, mac-nux/frames/)
                   terminal-launch  a bare aterm on a terminal (Terminal.app's shape) to its shell's first
                                    prompt, cold then warm
                   app-launch       the app opened to its first tab's prompt, cold then warm
@@ -187,6 +195,10 @@ const PERSON_AGENT: &str = "com.aterm.nux.person";
 
 /// The app's process watch's record, in [`GUEST_NUX`].
 const PROCS_RECORD: &str = "procs.txt";
+
+/// The `setup=` readings of the wait on setup ([`setup_reading`]), in [`GUEST_NUX`]: `setup <epoch
+/// ms> <the field>`, each as the reading took it, for the milestone captures ([`capture`]).
+const SETUP_READINGS: &str = "setup.txt";
 
 /// The progress record setup keeps (`initial.rs`), under the account's home.
 const SETUP_RECORD: &str = "Library/Application Support/aterm/doctor/initial-setup.json";
@@ -2281,9 +2293,14 @@ fn typed_cell(typed: &[Typed], skipped: usize) -> Value {
 fn setup_reading(g: &Guest) -> Result<crate::mac_nux_guest::Reading, Fail> {
     let sessions = g.run(&format!("{} ctl ls 2>/dev/null", g.aterm), STEP)?;
     let at = first_session(&sessions).map_or_else(String::new, |sid| format!("@{sid} "));
+    // The status line's first line, its `setup=` also appended to [`SETUP_READINGS`] with the
+    // guest's clock.
     let out = g.run(
         &format!(
-            "{} ctl {at}status 2>/dev/null | head -1; echo '--- record'; cat \"$HOME/{SETUP_RECORD}\" 2>/dev/null; \
+            "{} ctl {at}status 2>/dev/null | /usr/bin/perl -MTime::HiRes=time -ne \
+             'next if $. > 1; print; /(?:^|\\s)setup=(\\S+)/ or next; \
+             open(my $o, \">>\", \"{GUEST_NUX}/{SETUP_READINGS}\") and printf $o \"setup %d %s\\n\", time * 1000, $1'; \
+             echo '--- record'; cat \"$HOME/{SETUP_RECORD}\" 2>/dev/null; \
              echo; echo '--- acts'; cat {GUEST_NUX}/person.txt {GUEST_NUX}/{PROCS_RECORD} 2>/dev/null \
              | grep -E '^(click|typed|up|down) '; true",
             g.aterm
@@ -3547,7 +3564,7 @@ fn launch_repairs(g: &Guest, row: &mut Row) -> Result<(), Fail> {
 
 /// `first-launch`: the app opened by a person (with `--person`, one at the console), then
 /// watched until setup is done or stood still a minute with nothing new from the person or in the
-/// app's processes ([`wait_setup`]).
+/// app's processes ([`wait_setup`]), the window captured at each milestone ([`capture`]).
 fn first_launch(g: &Guest, ask: &Ask, row: &mut Row) -> Result<(), Fail> {
     g.sh(PROMPT_MARKER, STEP)?;
     let around = Around::take(g)?;
@@ -3557,6 +3574,8 @@ fn first_launch(g: &Guest, ask: &Ask, row: &mut Row) -> Result<(), Fail> {
     if ask.person {
         person_start(g, ask.later)?;
     }
+    // The page at each milestone the records name, from before the open on.
+    let captures = capture::Captures::start(g);
     // What the app asks after the ALab vault while it is watched: System State's watch for the
     // vault looks on a Mac that has none.
     start_mdns(g)?;
@@ -3564,11 +3583,18 @@ fn first_launch(g: &Guest, ask: &Ask, row: &mut Row) -> Result<(), Fail> {
     let open_ms = secs_to_ms(opened);
     g.mark_ms.set(Some(open_ms));
     prompt_cell(row, "open to prompt", prompt);
+    captures.now(g, "first-present", "the first tab showed its prompt");
     let present = first_present_ms(g)?;
     metrics_cells(g, row, "")?;
     state_snapshot(g, row, "window focus")?;
     let waited_from = g.clock_ms()?.saturating_sub(open_ms);
     let done = wait_setup(g, row, "", waited_from)?;
+    match done {
+        Some(_) => captures.now(g, "setup-done", "aterm ctl status said setup=done"),
+        None => captures.now(g, "end", "the wait on setup ended before setup=done"),
+    }
+    // Before the reads below: the ~/Desktop control's own consent dialog is no milestone.
+    captures.stop(g);
     reopen_cells(g, ask, row, open_ms)?;
     percentile_cells(g, row, "during setup: ")?;
     let mdns = stop_mdns(g)?;
@@ -3712,6 +3738,24 @@ fn first_launch(g: &Guest, ask: &Ask, row: &mut Row) -> Result<(), Fail> {
         },
     );
     person_stage_cells(g, ask, row)?;
+    let variant = capture::variant(ask);
+    let stamp = crate::util::compact_stamp(crate::util::now_secs());
+    let frames = capture::frames_dir(
+        ask.record.as_deref(),
+        &paths().state,
+        Scenario::FirstLaunch.name(),
+        &variant,
+        &stamp,
+    );
+    let title = format!(
+        "first-launch, {}, {stamp}",
+        if variant.is_empty() {
+            "nobody at the console"
+        } else {
+            variant.as_str()
+        }
+    );
+    captures.finish(g, row, open_ms, &frames, &title)?;
     state_snapshot(g, row, "the end")?;
     around.cells(g, row, "")?;
     Ok(())
@@ -5014,6 +5058,9 @@ pub fn cmd_nux(args: &[String]) -> Res {
 
 #[path = "mac_nux_advert.rs"]
 mod advert;
+
+#[path = "mac_nux_capture.rs"]
+mod capture;
 
 #[path = "mac_nux_fault.rs"]
 mod fault;

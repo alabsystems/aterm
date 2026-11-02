@@ -576,8 +576,7 @@ impl Detached {
 impl Start for Detached {
     fn start(&mut self, paths: &Paths) -> Result<u32, String> {
         use std::os::unix::fs::OpenOptionsExt as _;
-        let run = paths.run_dir();
-        std::fs::create_dir_all(&run).map_err(|e| format!("{}: {e}", run.display()))?;
+        paths.prepare_run_dir()?;
         let log_path = paths.helper_log();
         let log = std::fs::OpenOptions::new()
             .create(true)

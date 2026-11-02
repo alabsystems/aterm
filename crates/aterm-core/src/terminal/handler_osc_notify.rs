@@ -68,12 +68,8 @@ impl TerminalHandler<'_> {
                 continue;
             };
             match key {
-                "i" =>
-                {
-                    #[allow(clippy::collapsible_match)]
-                    if !value.is_empty() && value.len() <= 256 {
-                        id = Some(value.to_string());
-                    }
+                "i" => {
+                    id = (!value.is_empty() && value.len() <= 256).then(|| value.to_string());
                 }
                 "p" => {
                     payload_kind = match value {
@@ -359,6 +355,14 @@ mod tests {
         assert_eq!(got.id.as_deref(), Some("42"));
         assert_eq!(got.title.as_deref(), Some("My Title"));
         assert_eq!(got.body.as_deref(), Some("My Body"));
+
+        term.process(b"\x1b]99;i=old:i=;Anon\x07");
+        let got = captured
+            .lock()
+            .expect("poisoned")
+            .clone()
+            .expect("dispatched");
+        assert_eq!(got.id, None);
     }
 
     fn capture_all(term: &mut Terminal) -> Arc<Mutex<Vec<Notification>>> {

@@ -143,7 +143,9 @@ impl ExactTileKey for AnimalBakeKey {
     fn bake_tile_with(&self, recycled: Option<Tile>, _mask_scratch: &mut Option<Tile>) -> Tile {
         let (w, h) = (u32::from(self.w), u32::from(self.h));
         let mut tile = take_or_new_tile(recycled, w, h);
-        paint_species_onto(&mut tile, self.species, &self.fills(), w, h);
+        if w != 0 && h != 0 {
+            paint_species_onto(&mut tile, self.species, &self.fills(), w, h);
+        }
         tile
     }
 }

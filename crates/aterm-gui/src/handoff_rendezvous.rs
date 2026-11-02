@@ -359,15 +359,19 @@ fn sweep_dead_rendezvous(dir: &Path) {
         let Some((pid, _)) = rest.split_once('-') else {
             continue;
         };
+        if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
         let Ok(pid) = pid.parse::<i32>() else {
             continue;
         };
         if pid == std::process::id() as i32 {
             continue;
         }
-        // SAFETY: `kill(pid, 0)` only probes process existence.
-        let alive = unsafe { libc::kill(pid, 0) } == 0
-            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        // SAFETY: `kill(pid, 0)` with `pid > 1` only probes single-process existence.
+        let alive = pid > 1
+            && (unsafe { libc::kill(pid, 0) } == 0
+                || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM));
         if !alive {
             let _ = std::fs::remove_file(entry.path());
         }
@@ -817,9 +821,8 @@ impl Rendezvous {
         }
         let claim = aterm_uds::rand::hex_token::<CLAIM_SECRET_BYTES>()
             .map_err(|error| RendezvousError::Secret(error.to_string()))?;
-        let listener =
-            CtlListener::bind(&path).map_err(|error| RendezvousError::Bind(error.to_string()))?;
-        let _ = aterm_uds::keep_out_of_children(&listener);
+        let listener = aterm_uds::kept_out(|| CtlListener::bind(&path))
+            .map_err(|error| RendezvousError::Bind(error.to_string()))?;
         let bound = Self {
             path,
             listener,
@@ -1002,9 +1005,8 @@ impl Rendezvous {
             if polled == 0 {
                 continue;
             }
-            match self.listener.accept() {
+            match aterm_uds::kept_out(|| self.listener.accept()) {
                 Ok((stream, _)) => {
-                    let _ = aterm_uds::keep_out_of_children(&stream);
                     stream
                         .set_nonblocking(false)
                         .map_err(|error| RendezvousError::Accept(error.to_string()))?;

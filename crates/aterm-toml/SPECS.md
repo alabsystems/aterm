@@ -18,41 +18,39 @@ Result: **28 specs**, covering **51 tests**. **1 test is not a spec sample** (§
 
 ## 0. Notation used in the statements
 
-- `P(s)` = `edit::parse::parse_document(s, ParseLimits::default())`, with `max_depth = 128`. It is
-  the one parser. `DocumentMut::from_str` = `P`.
-  `de::from_str::<T>(s)` = `P(s) >>= T::deserialize(Deserializer::new(Some(s), Node::from_item(root)))`.
+- `P(s)` = `edit::parse::parse_document(s, ParseLimits::default())`, with `max_depth = 128`: the
+  one parser. `DocumentMut::from_str` = `P`. `de::from_str::<T>(s)` =
+  `P(s) >>= T::deserialize(Deserializer::new(Some(s), Node::from_item(root)))`.
   `aterm_toml::Value::from_str` = `Table::from_str` = `from_str`. `edit::Value::from_str` =
   `parse::parse_value`. `Key::parse` = `parse::parse_key_path`.
 - `print(d)` = `<DocumentMut as Display>` (`encode::encode_document`).
-- `L` = the TOML 1.0.0 documents (the ABNF plus the spec's key-uniqueness and table-redefinition
-  rules), plus crate policy: TOML 1.1 additions are refused (`\e`, `\x`, newlines in inline tables,
-  times without seconds), a finite float literal that overflows binary64 is refused in both signs,
-  and DEL is refused in comments. `L_val` = the single-value production `val`, with no surrounding
+- `L`: the TOML 1.0.0 documents (the ABNF plus the key-uniqueness and table-redefinition rules)
+  under crate policy: TOML 1.1 additions are refused (`\e`, `\x`, newlines in inline tables,
+  times without seconds), and so are a finite float literal that overflows binary64 in either
+  sign and DEL in a comment. `L_val`: the single-value production `val`, with no surrounding
   trivia.
-- `depth(s)` = the depth of the parsed tree below the root. Every header segment, dotted-key
-  segment, array and inline table adds one level, and levels from different constructs add up.
-- `[[s]]` = the TOML 1.0 meaning of `s` as an `aterm_toml::Value` table. Escapes are decoded. The
-  multi-line delimiter-run rule applies (1 or 2 delimiters before the close are content). The
-  first newline after an opening multi-line delimiter is trimmed. A line-ending backslash folds.
-  CRLF inside a multi-line string becomes LF. Integers keep radix and underscores out of the
-  value. Floats round to nearest (underflow gives ±0.0). Dotted keys build nested tables.
-  Implicit super-tables merge with a later explicit header. `[[h]]` gives an array of tables.
+- `depth(s)`: the depth of the parsed tree below the root. Every header segment, dotted-key
+  segment, array and inline table adds a level, and levels from different constructs add up.
+- `[[s]]`: the TOML 1.0 meaning of `s` as an `aterm_toml::Value` table. Escapes are decoded; 1 or
+  2 delimiters before a multi-line close are content; the first newline after an opening
+  multi-line delimiter is trimmed; a line-ending backslash folds; CRLF in a multi-line string
+  becomes LF; an integer's value carries no radix prefix or underscores; floats round to nearest
+  (underflow gives ±0.0); dotted keys build nested tables; implicit super-tables merge with a
+  later explicit header; `[[h]]` gives an array of tables.
 - `CharAligned(s,r)` := `r.start ≤ r.end ≤ s.len() ∧ s.is_char_boundary(r.start) ∧ s.is_char_boundary(r.end)`.
 - `Entries` := {`P`, `from_str::<T>`, `aterm_toml::Value::from_str`, `Table::from_str`,
   `edit::Value::from_str`, `Key::parse`}.
-- `M(v)` = the serde data model of a `Value`. A Table becomes a map whose unknown keys are passed
-  through; an Integer becomes `i64`; a Float `f64`; a String `str`; an Array a seq with a length;
-  a Datetime the private `DATETIME_STRUCT`/`DATETIME_FIELD` struct.
-- Gap numbers are the rows of the table in
-  the historical development audit `docs/AUDIT-trust-for-test-migration-2026-10-15.md`
-  §7. **Gap 0 (a seal that publishes Clean rows) blocks every spec**, so the column lists only the
-  gaps beyond it. No spec here is blocked by gap 0 alone: every one needs at least gap 1
-  (non-scalar carriers), because even the scalar cores take `&str`, `Option` or `Result`.
+- `M(v)`: the serde data model of a `Value`. A Table is a map that passes unknown keys through;
+  an Integer is `i64`, a Float `f64`, a String `str`, an Array a seq with a length, a Datetime
+  the private `DATETIME_STRUCT`/`DATETIME_FIELD` struct.
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes (primary tests; secondary in §2)`,
-`difficulty (Rust features the proof must handle)`, `blocking gaps (audit §7, beyond gap 0)`.
+`subsumes` lists the primary tests (secondary ones are in §2). `difficulty` names the Rust
+features a proof must handle. `blocking_gaps` are rows of the gap table in
+`docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7. Gap 0 (a seal that publishes Clean rows)
+blocks every row and is left out. Every row also needs gap 1 (non-scalar carriers), since even
+the scalar cores take `&str`, `Option` or `Result`.
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
@@ -109,7 +107,7 @@ error-log-words	contract	Error::log_words, <LogWords as Display>::fmt	What an ap
 
 ## 2. Test → spec map (TSV)
 
-`primary` is the spec that retires the test. `also` lists the other specs the same test samples.
+`primary` is the spec that retires the test; `also` lists the other specs it samples.
 
 ```tsv
 file	test	primary	also
@@ -182,8 +180,8 @@ tests/spec.rs	log_words_keeps_the_position_and_never_the_line	error-log-words	sc
 
 | test | why | action |
 |---|---|---|
-| cost::many_lines_under_a_long_header_cost_one_pass | It checks that parsing is linear in input size (`current_table` resolves by position, not by name), and detects a regression only by never finishing, so it is a hang or timing check in disguise. Trust cannot state a complexity bound today. Its functional assertions (table length = `LINES`, byte round-trip, the serde half agrees) are samples of `roundtrip` and `value-semantics`. | **move-to-bench** (`aterm-bench`), then delete it here |
-| roundtrip::every_toml_file_in_the_repository_round_trips_byte_for_byte (repository-content half only) | Half of this test is a guard over the repository's content: every tracked `.toml` parses (handoff fixtures excluded). No crate spec can subsume that. It reads the filesystem, silently `continue`s on unreadable files, and `corpus()` asserts more than 100 files. The test's crate half is a sample of `roundtrip`. | **move the content half to an `aterm-census` guard** once `roundtrip` and `entry-points-agree` are proved; the test then goes |
+| cost::many_lines_under_a_long_header_cost_one_pass | It checks that parsing is linear in input size (`current_table` resolves by position, not by name) and catches a regression only by never finishing: a hang check. Trust cannot state a complexity bound. Its functional assertions (table length, byte round trip, the serde half agrees) sample `roundtrip` and `value-semantics`. | **move-to-bench** (`aterm-bench`), then delete it here |
+| roundtrip::every_toml_file_in_the_repository_round_trips_byte_for_byte (repository-content half) | This half guards the repository's content: every tracked `.toml` parses (handoff fixtures excluded). No crate spec can subsume it. It reads the filesystem, silently skips unreadable files, and `corpus()` asserts more than 100 files. The crate half samples `roundtrip`. | **move the content half to an `aterm-census` guard** once `roundtrip` and `entry-points-agree` are proved; the test then goes |
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
@@ -219,31 +217,51 @@ tests/spec.rs	log_words_keeps_the_position_and_never_the_line	error-log-words	sc
    necessary but not sufficient. A new §7 row is needed, or the parser and `Drop` must be made
    iterative so that the bound is a loop variant.
 
-## 6. Proof order (easiest high-value first)
+- **5.3 A test name claims more than the test checks.** `spec::token_spans_underline_the_token`
+  checks only bounds and char alignment, repeating `parse_errors_carry_a_span_inside_the_source`
+  through the `DocumentMut` entry; underlining is pinned at one point (`int = 010` → `6..9`). It
+  samples `span-aligned`. A general token-span rule for errors would be a new spec, the
+  error-side analogue of `parsed-spans`.
+- **5.5 An assertion message names the wrong operator.** In `edit::the_walking_surface`,
+  "indexing an absent key must vivify to the vacant item" describes `IndexMut`. `&doc["missing"]`
+  goes through `Index`, which returns a static `VACANT` and inserts nothing
+  (`parsed-tree-shape` (d)).
+- **5.6 A pinned output may contradict the edit contract.** `edit::a_byte_order_mark_stays_first`
+  pins a root key set into a keyless root as landing above the file's leading comment
+  (`"\u{feff}font_px = 14.0\n# my aterm settings\n..."`). That agrees with
+  `edit-byte-locality` (c), a new root key at the end of the root region, only if the comment
+  belongs to the next table. Confirm the placement is intended.
+- **5.7 The depth limit's boundary is never sampled.** The depth tests probe 32 and ≥ 10,000
+  levels and mixed constructs that stack past the limit, never 128 accepted and 129 refused,
+  which `depth-bound` states. The message checks ("nesting" or "limit" in one test, "limit" in
+  another) pin prose; the spec keeps only "limit".
+- **5.9 `no-panic-bounded-stack` has no gap row.** It needs a stack-depth bound over recursion and
+  drop glue (`Item` has no `Drop` impl; the row's `<Item as Drop>` is its drop glue). No row of
+  audit §7 covers stack depth; gaps 1, 3, 7 and 16 are necessary, not sufficient. It needs a new
+  §7 row, or an iterative parser and drop so the bound is a loop variant.
 
 No spec is blocked by gap 0 alone: gap 1 (non-scalar carriers) is the floor for all 28. So the order
 below starts with specs whose only other blocker is gap 3 (calls, matches, loops in reflected bodies)
 and gap 7 (loops), on scalar or near-scalar cores.
 
-1. **`seq-drained` (a)**, **`days-in-month` (a)**, **`char-boundary`**. Scalar or near-scalar:
-   one comparison and `saturating_sub`; a match on integer literals with `is_multiple_of`; two
-   `usize` while-loops over `is_char_boundary`. Gaps 1, 3 (and 7 for `char-boundary`). They retire
-   no test alone, but they are the lemmas under `span-aligned`, `error-display`, `accept-domain` and
-   the fixed-length half of `seq-drained`.
-2. **`item-kind-predicates`**, **`unit-variant-empty`**, **`unicode-escape`**. Enum matches and
-   `&self`/`&mut self` views (gaps 1, 2, 3, plus 7 for the escape window). They retire 4 tests
-   outright and are the first users of gap 2.
-3. **`error-display`**, **`number-literal`**, **`key-parse-spelling`**. String-scanning contracts
-   (gaps 1, 3, 7; plus 11 for the `Formatter`, 5 for keys). `number-literal` needs a float-parse
-   model for its round-to-nearest clause; its range half (None on overflow) can land first.
-4. **`span-aligned`**, **`eof-empty-span`**, **`depth-bound`**, **`value-index`**. Invariants over
-   every error site and the depth guard (gaps 1, 2, 3, 5, 7). `span-aligned` retires 2 tests and is
-   shared by 8 more.
-5. The whole-parser refinements: **`roundtrip`**, **`accept-domain`**, **`value-semantics`**,
-   **`entry-points-agree`**, plus **`standalone-value`**, **`parsed-spans`**, **`parsed-tree-shape`**
-   and **`no-panic-bounded-stack`**. These need a Lean model of TOML 1.0 (gaps 10, 14) and the
-   stack-depth gap of §5.9. They retire the fuzz, spec and roundtrip files.
-6. The edit specs (**`edit-byte-locality`**, **`edit-semantics`**), then the serde specs
-   (**`canonical-encoding`**, **`deser-refines-model`**, **`schema-error-location`**,
-   **`seq-drained`** (b), **`serde-roundtrip`**). The serde specs need gap 9 (serde derives across
-   the proc-macro boundary) and gap 11 (generic `T`).
+Gap 1 is the floor for every spec, so the order starts with scalar or near-scalar cores.
+
+1. **`seq-drained` (a)**, **`days-in-month` (a)**, **`char-boundary`** (gaps 1, 3; 7 for
+   `char-boundary`): a comparison and `saturating_sub`; a match on integer literals with
+   `is_multiple_of`; two `usize` loops over `is_char_boundary`. They retire no test alone but are
+   the lemmas under `span-aligned`, `error-display`, `accept-domain` and `seq-drained` (b).
+2. **`item-kind-predicates`**, **`unit-variant-empty`**, **`unicode-escape`** (gaps 1, 2, 3; 7 for
+   the escape window): enum matches and `&self`/`&mut self` views, the first users of gap 2.
+3. **`error-display`**, **`number-literal`**, **`key-parse-spelling`** (gaps 1, 3, 7; 11 for the
+   `Formatter`, 5 for keys): string-scanning contracts. `number-literal`'s round-to-nearest
+   clause needs a float-parse model; its range half (None on overflow) can land first.
+4. **`span-aligned`**, **`eof-empty-span`**, **`depth-bound`**, **`value-index`**: invariants over
+   every error site, and the depth guard.
+5. The whole-parser specs: `roundtrip`, `accept-domain`, `value-semantics`,
+   `entry-points-agree`, `standalone-value`, `parsed-spans`, `parsed-tree-shape` and
+   `no-panic-bounded-stack`. They need a Lean model of TOML 1.0 (gaps 10, 14) and the stack-depth
+   row of §5.9.
+6. The edit specs (`edit-byte-locality`, `edit-semantics`), then the serde specs
+   (`canonical-encoding`, `deser-refines-model`, `schema-error-location`, `seq-drained` (b),
+   `serde-roundtrip`), which need gap 9 (serde derives across the proc-macro boundary) and gap 11
+   (generic `T`).

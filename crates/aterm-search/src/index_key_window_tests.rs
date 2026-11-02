@@ -172,6 +172,21 @@ fn lines_that_cannot_share_the_newest_lines_window_are_reported_evicted() {
         assert_eq!(lines_of(&got.matches), vec![floor + 1, far]);
         assert_eq!(got.lowest_retained_line, floor);
     }
+
+    // After dropping a far high-water mark so the cache is empty, adjacent low rows
+    // compute their window from live cached rows rather than the ghost high-water mark.
+    let mut reused = SearchIndex::new();
+    reused.index_line(10 * TWO_32, "ancient high");
+    reused.drop_history_below(10 * TWO_32 + 1);
+    reused.index_line(5, "needle five");
+    reused.index_line(4, "needle four");
+    assert!(!reused.results_may_be_incomplete());
+    for (query, is_regex) in [("needle", false), ("n", false), ("ne+dle", true)] {
+        let got = reused
+            .search_results_opts(query, true, is_regex)
+            .expect("valid");
+        assert_eq!(lines_of(&got.matches), vec![4, 5], "{query:?}");
+    }
 }
 
 #[test]
@@ -191,4 +206,85 @@ fn a_descending_run_of_lines_moves_the_window_once() {
         .expect("literal");
     assert_eq!(lines_of(&got.matches), (top - 40..=top).collect::<Vec<_>>());
     assert!(!got.incomplete);
+}
+
+/// A short query has no posting list, so it walks a range of line numbers: over far-apart lines
+/// it visits the lines held, and answers as it does over close ones.
+#[test]
+fn a_short_query_over_far_apart_lines_visits_only_the_lines_held() {
+    let far = TWO_32 + 100;
+    let lines = [far - MAX_KEY_SPAN + 1, far - MAX_KEY_SPAN + 1_000_000, far];
+    let visits = || {
+        SearchIndex::take_search_from_line_candidates()
+            + SearchIndex::take_case_insensitive_candidate_visits()
+    };
+    let mut index = SearchIndex::new();
+    for line in lines {
+        index.index_line(line, "Needle row");
+    }
+    assert!(!index.results_may_be_incomplete());
+    for direction in [SearchDirection::Forward, SearchDirection::Backward] {
+        for (query, case_sensitive, is_regex) in [
+            ("Ne", true, false),
+            ("ne", false, false),
+            ("N", true, false),
+            ("Ne+dle", true, true),
+            ("ne+dle", false, true),
+        ] {
+            let _ = visits();
+            let got = index
+                .search_results_opts_direction(query, case_sensitive, is_regex, direction)
+                .expect("valid");
+            let mut found = lines_of(&got.matches);
+            found.sort_unstable();
+            assert_eq!(found, lines, "{query:?} {direction:?}");
+            assert!(!got.incomplete, "{query:?} {direction:?}");
+            let visited = visits();
+            assert!(
+                (lines.len()..=lines.len() + 1).contains(&visited),
+                "{query:?} {direction:?} visited {visited}"
+            );
+        }
+    }
+    // A search anchored between them reads only its own side.
+    let at = |found: Vec<SearchMatch>| lines_of(&found);
+    assert_eq!(
+        at(index.search_from_line("Ne", lines[1]).collect()),
+        [lines[1], lines[2]]
+    );
+    assert_eq!(
+        at(index.search_from_line("Ne", lines[1] + 1).collect()),
+        [lines[2]]
+    );
+    assert_eq!(
+        at(index.search_before_line("Ne", lines[2]).collect()),
+        [lines[1], lines[0]]
+    );
+    assert_eq!(
+        at(index.search_before_line("Ne", lines[1]).collect()),
+        [lines[0]]
+    );
+}
+
+/// Either side of where a range turns sparse, a short query answers the same, its window's lowest
+/// line and its last line included.
+#[test]
+fn a_short_query_answers_the_same_either_side_of_a_sparse_range() {
+    for gap in [1, 2, 3, 4, 10, 1_000] {
+        let lines: Vec<usize> = (0..8).map(|n| 50 + n * gap).collect();
+        let mut index = SearchIndex::new();
+        for &line in &lines {
+            index.index_line(line, "needle row");
+        }
+        for direction in [SearchDirection::Forward, SearchDirection::Backward] {
+            for (query, is_regex) in [("ne", false), ("n+e", true)] {
+                let got = index
+                    .search_results_opts_direction(query, true, is_regex, direction)
+                    .expect("valid");
+                let mut found = lines_of(&got.matches);
+                found.sort_unstable();
+                assert_eq!(found, lines, "gap {gap}, {query:?} {direction:?}");
+            }
+        }
+    }
 }

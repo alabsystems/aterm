@@ -568,7 +568,20 @@ pub const NETWORK: &str = r"\\";
 
 /// Absolute, and no `.` or `..` component.
 fn plain_absolute(p: &Path) -> bool {
+    #[cfg(unix)]
+    let has_dot = {
+        use std::os::unix::ffi::OsStrExt as _;
+        p.as_os_str()
+            .as_bytes()
+            .split(|&b| b == b'/')
+            .any(|seg| matches!(seg, b"." | b".."))
+    };
+    #[cfg(not(unix))]
+    let has_dot = p
+        .to_str()
+        .is_some_and(|s| s.split(['/', '\\']).any(|seg| matches!(seg, "." | "..")));
     p.is_absolute()
+        && !has_dot
         && !p
             .components()
             .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
@@ -594,8 +607,13 @@ pub fn parse_firmlinks(text: &str) -> Vec<(PathBuf, PathBuf)> {
         .filter_map(|l| {
             let (root, rel) = l.split_once('\t')?;
             let (root, rel) = (Path::new(root.trim()), rel.trim());
-            (root.is_absolute() && plain_absolute(root) && !rel.is_empty() && !rel.starts_with('/'))
-                .then(|| (root.to_path_buf(), Path::new(DATA_VOLUME).join(rel)))
+            let target = Path::new(DATA_VOLUME).join(rel);
+            (root.is_absolute()
+                && plain_absolute(root)
+                && !rel.is_empty()
+                && !rel.starts_with('/')
+                && plain_absolute(&target))
+            .then(|| (root.to_path_buf(), target))
         })
         .collect()
 }
@@ -1167,7 +1185,8 @@ mod arm {
             .iter()
             .map(|full| {
                 let name = full
-                    .trim_start_matches(r"\\?\")
+                    .strip_prefix(r"\\?\")
+                    .unwrap_or(full)
                     .trim_end_matches('\\')
                     .to_owned();
                 VolumeSeen {

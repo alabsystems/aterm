@@ -17,6 +17,18 @@ pub struct ListenerId {
     born: Option<SystemTime>,
 }
 
+impl ListenerId {
+    /// Identity from one already-read metadata record. In particular, metadata
+    /// read without following links never gives a symlink a socket identity.
+    #[must_use]
+    pub fn from_metadata(metadata: &std::fs::Metadata) -> Option<Self> {
+        socket_file(metadata).map(|file| Self {
+            file,
+            born: metadata.created().ok(),
+        })
+    }
+}
+
 /// The [`ListenerId`] of the socket `path` names now, a link followed.
 #[must_use]
 pub fn listener_at(path: impl AsRef<Path>) -> Option<ListenerId> {
@@ -33,10 +45,7 @@ pub fn listener_at(path: impl AsRef<Path>) -> Option<ListenerId> {
 pub fn listener_read(path: impl AsRef<Path>) -> std::io::Result<Option<ListenerId>> {
     use std::io::ErrorKind::{NotADirectory, NotFound};
     match std::fs::metadata(path) {
-        Ok(meta) => Ok(socket_file(&meta).map(|file| ListenerId {
-            file,
-            born: meta.created().ok(),
-        })),
+        Ok(meta) => Ok(ListenerId::from_metadata(&meta)),
         Err(e) if matches!(e.kind(), NotFound | NotADirectory) => Ok(None),
         Err(e) => Err(e),
     }

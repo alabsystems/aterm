@@ -20,10 +20,10 @@ Result: **6 specs**, covering **9 tests**. **0 remaining non-spec tests** (§4).
 Ownership. The `observe-*` specs are about aterm-observe code. `regex-step-budget-exact` is an
 obligation on aterm-regex that this crate cites. Its proof belongs to `crates/aterm-regex/SPECS.md`
 (`step-budget-contract`, `step-cost-lower-bound`, `pikevm-linear-cost`, `cut-short-sticky-shared`).
-The `watch-*` specs are about aterm-core code that these integration tests reach. They compose
+The `watch-*` specs are about aterm-core code these tests reach: they compose
 `crates/aterm-core/SPECS.md` (`obs-observe-latch-step`, `obs-terminal-watch-arm-eval`) with
-`observe-verdict-trichotomy`. They also depend on the grid and parser specs that fix `row_text(i)`
-after `process_at`.
+`observe-verdict-trichotomy`, and depend on the grid and parser specs that fix `row_text(i)` after
+`process_at`.
 
 ## 0. Notation used in the statements
 
@@ -33,33 +33,32 @@ after `process_at`.
   `progsize(p) = 64·insts(p)` is the per-instruction charge against `size_limit`.
 - `Parses(p)`: the aterm-regex parser accepts `p`.
 - `Adm(p)` := `|p| <= 1024` ∧ `Parses(p)` ∧ `progsize(p) <= 131072`.
-- `Lang(p,row)`: the semantic unanchored is-match of the compiled program of `p` on `row`. This is the
-  Lean regex-language model owned by aterm-regex.
-- `work(p,row)`: the step units that the aterm-regex Pike VM `search(text, 0, true, &mut budget)` uses
-  up to decide `row`. This is `C(prog,row,0,true)` in aterm-regex's notation. It is deterministic and
-  does not depend on the budget.
-- `V(m,row)` = `RegexRowMatch::verdict(&m,row)` ∈ {`Match`, `NoMatch`, `Undecided`}. Through the default
-  methods of the `RowMatch` trait, `matches(row)` ⇔ `V = Match` and `clears(row)` ⇔ `V = NoMatch`.
-- `Eval(t)`: the evaluation points of a watcher armed on Terminal `t`. These are the arm call itself
-  (`fresh = true`), plus each later `process_at` after which `WatcherSet::is_advance(content_seq, alt,
-  epoch)` holds. At a point `e`, `Rows_e` is the `Vec<Option<String>>` of visible-row texts gathered
-  there: `[]` when no range the watchers scanning there read meets the grid
-  (`WatcherSet::row_scan_hull` = `None`); otherwise one entry per visible row, the text of every row
-  in that hull (so every in-grid row of `r`) and `None` outside it. `Hit` and `Clear` read the same in
-  both shapes: an unlatched watcher scans at each of its points, so `r` is one of those ranges; in the
-  `[]` case it meets none of the grid's `n` rows, so `r.covers_any(0)` and `r.covers_any(n)` are both
-  false and no in-range row has text. `cseq_e` is the `content_seq` there.
-- `Hit(m,r,e)` := ∃ i < |Rows_e|: `r.contains(i)` ∧ `Rows_e[i] = Some(s)` ∧ `m.matches(s)`. This is
-  `any_row_matches`.
-- `Clear(m,r,e)` := `r.covers_any(|Rows_e|)` ∧ ∀ i: (`r.contains(i)` ∧ `Rows_e[i] = Some(s)`) ⇒ `m.clears(s)`.
-  This is `covers_any` ∧ `every_row_clear`.
+- `Lang(p,row)`: the semantic unanchored is-match of the compiled program of `p` on `row`, from the
+  Lean regex-language model aterm-regex owns.
+- `work(p,row)`: the step units the aterm-regex Pike VM `search(text, 0, true, &mut budget)` spends
+  to decide `row` (`C(prog,row,0,true)` in aterm-regex's notation). It is deterministic and does not
+  depend on the budget.
+- `V(m,row)` = `RegexRowMatch::verdict(&m,row)` ∈ {`Match`, `NoMatch`, `Undecided`}. The `RowMatch`
+  defaults give `matches(row)` ⇔ `V = Match` and `clears(row)` ⇔ `V = NoMatch`.
+- `Eval(t)`: the points where a row watcher armed on Terminal `t` scans: the arm call, and each
+  later observation (after a `process_at`, or a frame-hang expiry in `watch_expire`) that follows a
+  surface advance (`WatcherSet::is_advance(content_seq, alt, epoch)`). A scan that falls due inside
+  an unfinished frame waits for the next whole-frame observation. At a point `e`, `Rows_e` is the
+  `Vec<Option<String>>` of visible-row texts: the text of every row in `WatcherSet::row_scan_hull`
+  and `None` outside it, or `[]` when the hull is `None`. In the `[]` case the watcher's range `r`
+  meets no grid row, so `Hit` and `Clear` are false in both shapes. `cseq_e` is the `content_seq`
+  at `e`.
+- `Hit(m,r,e)` := ∃ i < |Rows_e|: `r.contains(i)` ∧ `Rows_e[i] = Some(s)` ∧ `m.matches(s)`
+  (`any_row_matches`).
+- `Clear(m,r,e)` := `r.covers_any(|Rows_e|)` ∧ ∀ i: (`r.contains(i)` ∧ `Rows_e[i] = Some(s)`) ⇒
+  `m.clears(s)` (`covers_any` ∧ `every_row_clear`).
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (primary tests; the secondary ones are in
-§2), `difficulty` (the Rust features the proof must handle), `blocking_gaps` (audit §7 numbers).
-
-Gap 0 (the installed seal publishes no Lean-discharged row) blocks every row, so every row lists it.
+Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (primary tests; secondary ones are in
+§2), `difficulty` (the Rust features the proof must handle), `blocking_gaps` (rows of §7 of
+`docs/AUDIT-trust-for-test-migration-2026-10-15.md`). Gap 0 (an installed seal that publishes
+Lean-discharged rows) blocks every row.
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
@@ -90,8 +89,7 @@ aterm-regex `step-budget-contract`, `pikevm-linear-cost`, `step-cost-lower-bound
 
 ## 2. Test → spec map (TSV)
 
-`primary` is the spec that retires the test. `also` lists the other specs the same test samples. All
-tests are in `crates/aterm-observe/src/lib.rs`, `mod tests`.
+`primary` is the spec that retires the test; `also` lists the other specs it samples.
 
 ```tsv
 file	test	primary	also
@@ -121,7 +119,9 @@ crates/aterm-observe/src/lib.rs	watcher_budget_and_row_verdict_wire_roundtrip	ob
 
 ## 4. Tests that are not spec samples
 
-None. The one test this section listed, a workspace-manifest guard, is deleted.
+`watcher_budget_and_row_verdict_wire_roundtrip` has no row: it checks the watcher-budget and
+row-verdict wire codecs (`encode_watcher_budget_wire`, `decode_watcher_budget_wire`,
+`encode_row_verdict_wire`, `decode_row_verdict_wire`), which no spec in §1 states.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 

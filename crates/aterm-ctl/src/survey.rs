@@ -176,6 +176,7 @@ pub(crate) fn parse_args(parts: &[String]) -> Result<Args, String> {
             "--timeout" => {
                 args.within = rest
                     .next()
+                    .filter(|s| !s.starts_with('+'))
                     .and_then(|s| s.parse::<f64>().ok())
                     .filter(|s| *s > 0.0 && *s <= FLEET_WITHIN_MAX.as_secs_f64())
                     .map(Duration::from_secs_f64)
@@ -185,14 +186,19 @@ pub(crate) fn parse_args(parts: &[String]) -> Result<Args, String> {
             "--budget" => {
                 args.budget = rest
                     .next()
+                    .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
                     .and_then(|n| n.parse().ok())
                     .filter(|&n| n > 0)
                     .ok_or_else(|| USAGE.to_string())?;
                 budget = true;
             }
             "--sid" => {
-                let sid = rest.next().ok_or_else(|| USAGE.to_string())?;
-                args.sid = Some(sid.trim_start_matches('@').to_owned());
+                let sid = rest
+                    .next()
+                    .map(|s| s.trim_start_matches('@'))
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| USAGE.to_string())?;
+                args.sid = Some(sid.to_owned());
             }
             _ => return Err(USAGE.to_string()),
         }
@@ -277,8 +283,8 @@ impl Fields {
             .filter(|v| !v.is_empty() && *v != "-")
     }
 
-    fn number(&self, key: &str) -> Option<u64> {
-        self.get(key).and_then(|v| v.parse().ok())
+    pub(crate) fn number(&self, key: &str) -> Option<u64> {
+        crate::parse_uint(self.get(key)?)
     }
 }
 
@@ -406,6 +412,21 @@ fn running(s: &Fields) -> Option<&str> {
         s.get("program")
             .filter(|_| s.get("program_kind") != Some("shell"))
     })
+}
+
+/// What a build's front waiting for memory (`wait=memory`) claims, as its line says it after its
+/// program: ` (<GiB> GiB, <n> ahead)`, either half where its record says only that one, nothing
+/// where it says neither. A figure that is no number (a peer's) is not shown.
+fn claim_shown(s: &Fields) -> String {
+    let gib = s
+        .get("wait_gib")
+        .filter(|g| g.len() <= 8 && g.bytes().all(|b| b.is_ascii_digit() || b == b'.'));
+    let ahead = s.number("wait_ahead").map(|n| format!("{n} ahead"));
+    match (gib.map(|g| format!("{g} GiB")), ahead) {
+        (Some(gib), Some(ahead)) => format!(" ({gib}, {ahead})"),
+        (Some(one), None) | (None, Some(one)) => format!(" ({one})"),
+        (None, None) => String::new(),
+    }
 }
 
 fn age(ms: u64) -> String {
@@ -790,6 +811,11 @@ fn session_line(s: &Fields, own: Option<&str>, remote: bool, cut: bool) -> Strin
             }
         }
         None => match checked(running(s)) {
+            Some(what) if s.get("wait") == Some("memory") => {
+                line.push_str(" waiting for memory to run ");
+                line.push_str(&shown(what, 24));
+                line.push_str(&claim_shown(s));
+            }
             Some(what) => {
                 line.push_str(" running ");
                 line.push_str(&shown(what, 24));
@@ -912,7 +938,11 @@ fn session_line(s: &Fields, own: Option<&str>, remote: bool, cut: bool) -> Strin
 fn newest_bell(s: &Fields) -> Option<(u64, &str, Option<&str>)> {
     let newest = s.get("last_bell")?.split(',').next()?;
     let mut parts = newest.splitn(3, '/');
-    let ms = parts.next()?.parse().ok()?;
+    let ms = parts
+        .next()
+        .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))?
+        .parse()
+        .ok()?;
     let sound = parts.next().filter(|w| !w.is_empty())?;
     let program = parts.next()?;
     Some((
@@ -950,7 +980,7 @@ fn tail(text: &str, cap: usize) -> String {
 }
 
 struct Excerpt {
-    /// The label: `attention`, `goal`, `asked` or `said`.
+    /// The label: `attention`, `goal`, `asked`, `said` or `work`.
     word: &'static str,
     /// The record's text, decoded.
     text: String,
@@ -993,7 +1023,33 @@ fn excerpts(s: &Fields, facts: bool) -> Vec<Excerpt> {
                 keeps_end: key == "said" && finished && !text.ends_with('…'),
             })
         })
+        .chain(work_said(s).map(|text| Excerpt {
+            word: "work",
+            text,
+            keeps_end: false,
+        }))
         .collect()
+}
+
+/// Where a session's agent works, as its `work_*` fields say (`feat/x · 12 files · 3 behind
+/// origin/main · 40s ago`); `None` for a row with no `work=` (a facts row, a session no record
+/// was read for). The names themselves are `--sid`'s and `--json`'s to show.
+fn work_said(s: &Fields) -> Option<String> {
+    let mut parts = vec![s.get("work")?.to_owned()];
+    if let Some(n) = s.number("work_files") {
+        parts.push(format!("{n} {}", if n == 1 { "file" } else { "files" }));
+    }
+    if let Some(behind) = s.number("work_behind") {
+        let main = s
+            .get("work_base")
+            .and_then(|base| base.rsplit_once('@'))
+            .map_or("its main", |(main, _)| main);
+        parts.push(format!("{behind} behind {main}"));
+    }
+    if let Some(ms) = s.number("work_ms") {
+        parts.push(format!("{} ago", age(ms)));
+    }
+    Some(parts.join(" · "))
 }
 
 struct Block {
@@ -1027,7 +1083,8 @@ struct Shown {
     width: usize,
 }
 
-const EVERY_EXCERPT: u8 = 0b1111;
+/// Every excerpt an entry can have: [`excerpts`] makes at most five.
+const EVERY_EXCERPT: u8 = 0b1_1111;
 
 impl Shown {
     fn all(blocks: &Blocks, upto: Class, width: usize) -> Shown {
@@ -1424,9 +1481,9 @@ pub(crate) fn render_sid(replies: &[HostReply], sid: &str, own: Option<&str>) ->
         }
         for (key, value) in &s.0 {
             let key = shown(key, 32);
-            if key == "rows" {
+            if key == "rows" || key == "work_paths" {
                 for row in value.split('\n') {
-                    out.push_str(&format!("  rows: {}\n", shown(row, EXCERPT_CHARS * 4)));
+                    out.push_str(&format!("  {key}: {}\n", shown(row, EXCERPT_CHARS * 4)));
                 }
             } else if key == "account" {
                 out.push_str(&format!("  account: {}\n", shown(&masked_label(value), 64)));

@@ -1762,7 +1762,7 @@ impl SessionFabric {
         mut inbox: std::sync::MutexGuard<'a, Inbox>,
         wait: std::time::Duration,
     ) -> Option<std::sync::MutexGuard<'a, Inbox>> {
-        let deadline = std::time::Instant::now() + wait;
+        let deadline = deadline_after(wait);
         while inbox.hold_fenced {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             if left.is_zero() {
@@ -2249,7 +2249,12 @@ fn stale_after() -> std::time::Duration {
     static AT: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
     *AT.get_or_init(|| {
         aterm_types::dev_seam!(STALE_AFTER_SEAM)
-            .and_then(|ms| ms.to_str()?.parse::<u64>().ok())
+            .and_then(|ms| {
+                ms.to_str()
+                    .filter(|s| !s.starts_with('+'))?
+                    .parse::<u64>()
+                    .ok()
+            })
             .map_or(STALE_AFTER, std::time::Duration::from_millis)
     })
 }
@@ -2795,9 +2800,9 @@ pub fn cmd_hello(rest: &str, generation: Option<BridgeGeneration>) -> String {
         } else if let Some(v) = kv(tok, "refill") {
             refills_broadcasts = v.split(',').any(|lane| lane == "say");
         } else if let Some(v) = kv(tok, "lane") {
-            match v.parse::<u32>() {
-                Ok(n) => lane = Some(n),
-                Err(_) => return HELLO_USAGE.to_string(),
+            match parse_uint::<u32>(v) {
+                Some(n) => lane = Some(n),
+                None => return HELLO_USAGE.to_string(),
             }
         } else if let Some(v) = kv(tok, "build") {
             let token = !v.is_empty()
@@ -2963,7 +2968,7 @@ fn cmd_link_set_aside<'a>(
     let files = toks
         .next()
         .and_then(|tok| kv(tok, "files"))
-        .and_then(|v| v.parse::<u64>().ok())
+        .and_then(parse_uint::<u64>)
         .filter(|n| *n > 0);
     let (Some(files), None) = (files, toks.next()) else {
         return LINK_USAGE.to_string();
@@ -2993,7 +2998,7 @@ fn cmd_link_quarantine<'a>(
     let torn = toks
         .next()
         .and_then(|tok| kv(tok, "torn"))
-        .and_then(|v| v.parse::<u64>().ok());
+        .and_then(parse_uint::<u64>);
     let (Some(torn), None) = (torn, toks.next()) else {
         return LINK_USAGE.to_string();
     };
@@ -3059,8 +3064,8 @@ fn cmd_link_gap<'a>(
         } else {
             return LINK_USAGE.to_string();
         };
-        match (slot.0.is_none(), slot.1.parse::<u64>()) {
-            (true, Ok(n)) => *slot.0 = Some(n),
+        match (slot.0.is_none(), parse_uint::<u64>(slot.1)) {
+            (true, Some(n)) => *slot.0 = Some(n),
             _ => return LINK_USAGE.to_string(),
         }
     }
@@ -3375,9 +3380,9 @@ pub fn cmd_link_waking(
                 if let Some(v) = kv(tok, "continues")
                     && fork.is_none()
                 {
-                    match v.parse::<u64>() {
-                        Ok(n) => fork = Some(n),
-                        Err(_) => return LINK_USAGE.to_string(),
+                    match parse_uint::<u64>(v) {
+                        Some(n) => fork = Some(n),
+                        None => return LINK_USAGE.to_string(),
                     }
                 } else if let Some(v) = kv(tok, "was")
                     && was.is_none()
@@ -3414,9 +3419,9 @@ pub fn cmd_link_waking(
     let mut reason: Option<String> = None;
     for tok in toks {
         if let Some(v) = kv(tok, "rtt") {
-            match v.parse::<u64>() {
-                Ok(n) => rtt = Some(n),
-                Err(_) => return LINK_USAGE.to_string(),
+            match parse_uint::<u64>(v) {
+                Some(n) => rtt = Some(n),
+                None => return LINK_USAGE.to_string(),
             }
         } else if let Some(v) = kv(tok, "reason") {
             reason = Some(link_reason_token(v));
@@ -4022,7 +4027,7 @@ fn apply_hold_as(
     wake: &dyn Fn(),
 ) -> Applied {
     let mut inbox = ctx.fabric().lock();
-    let deadline = fence_wait.map(|wait| std::time::Instant::now() + wait);
+    let deadline = fence_wait.map(deadline_after);
     while inbox.hold_fenced {
         inbox = match deadline {
             None => {
@@ -4589,17 +4594,21 @@ pub fn cmd_deliver_waking(store: &impl AsStore, rest: &str, wake: &dyn Fn(&Sessi
     deliver_row(&ctx, &rest_toks, &session_wake)
 }
 
+fn parse_uint<T: std::str::FromStr>(v: &str) -> Option<T> {
+    (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit())).then(|| v.parse().ok())?
+}
+
 fn deliver_receipt(ctx: &dyn FabricSession, toks: &[&str]) -> String {
     let mut rid: Option<u64> = None;
     let mut landed = false;
     for tok in toks {
         if let Some(v) = kv(tok, "receipt") {
-            match v.parse() {
-                Ok(n) => rid = Some(n),
-                Err(_) => return DELIVER_USAGE.to_string(),
+            match parse_uint(v) {
+                Some(n) => rid = Some(n),
+                None => return DELIVER_USAGE.to_string(),
             }
         } else if let Some(v) = kv(tok, "off") {
-            if v != "-" && v.parse::<u64>().is_err() {
+            if v != "-" && parse_uint::<u64>(v).is_none() {
                 return DELIVER_USAGE.to_string();
             }
             landed = true;
@@ -4633,9 +4642,9 @@ fn deliver_fetched(ctx: &dyn FabricSession, toks: &[&str]) -> String {
     let mut fields: Vec<&str> = Vec::with_capacity(toks.len());
     for tok in toks {
         if let Some(v) = kv(tok, "fetched") {
-            match v.parse() {
-                Ok(n) => off = Some(n),
-                Err(_) => return DELIVER_USAGE.to_string(),
+            match parse_uint(v) {
+                Some(n) => off = Some(n),
+                None => return DELIVER_USAGE.to_string(),
             }
         } else if let Some(v) = kv(tok, "err") {
             // The bridge's output is still input: the reason is one bounded token or the line is
@@ -4645,14 +4654,14 @@ fn deliver_fetched(ctx: &dyn FabricSession, toks: &[&str]) -> String {
             }
             err = Some(v.to_string());
         } else if let Some(v) = kv(tok, "floor") {
-            match v.parse() {
-                Ok(n) => floor = Some(n),
-                Err(_) => return DELIVER_USAGE.to_string(),
+            match parse_uint(v) {
+                Some(n) => floor = Some(n),
+                None => return DELIVER_USAGE.to_string(),
             }
         } else if let Some(v) = kv(tok, "at") {
-            match v.parse() {
-                Ok(n) => at = n,
-                Err(_) => return DELIVER_USAGE.to_string(),
+            match parse_uint(v) {
+                Some(n) => at = n,
+                None => return DELIVER_USAGE.to_string(),
             }
         } else if *tok == "more=1" {
             more = true;
@@ -4803,9 +4812,9 @@ fn parse_deliver_fields(toks: &[&str], len_max: usize) -> Result<DeliverFields, 
     let mut text = String::new();
     for tok in toks {
         if let Some(v) = kv(tok, "off") {
-            match v.parse() {
-                Ok(n) => f.off = Some(n),
-                Err(_) => return Err(DELIVER_USAGE.to_string()),
+            match parse_uint(v) {
+                Some(n) => f.off = Some(n),
+                None => return Err(DELIVER_USAGE.to_string()),
             }
         } else if let Some(v) = kv(tok, "from") {
             f.from = v.to_string();
@@ -4814,14 +4823,14 @@ fn parse_deliver_fields(toks: &[&str], len_max: usize) -> Result<DeliverFields, 
         } else if let Some(v) = kv(tok, "trust") {
             f.trust = v.to_string();
         } else if let Some(v) = kv(tok, "re") {
-            match v.parse() {
-                Ok(n) => f.re = Some(n),
-                Err(_) => return Err(DELIVER_USAGE.to_string()),
+            match parse_uint(v) {
+                Some(n) => f.re = Some(n),
+                None => return Err(DELIVER_USAGE.to_string()),
             }
         } else if let Some(v) = kv(tok, "dl") {
-            match v.parse() {
-                Ok(n) => f.dl = Some(n),
-                Err(_) => return Err(DELIVER_USAGE.to_string()),
+            match parse_uint(v) {
+                Some(n) => f.dl = Some(n),
+                None => return Err(DELIVER_USAGE.to_string()),
             }
         } else if let Some(v) = kv(tok, "late") {
             f.late = v == "1";
@@ -4851,8 +4860,8 @@ fn parse_deliver_fields(toks: &[&str], len_max: usize) -> Result<DeliverFields, 
             }
             f.verdict = Some(v.to_string());
         } else if let Some(v) = kv(tok, "len") {
-            match v.parse::<usize>() {
-                Ok(n) if n <= len_max => declared_len = Some(n),
+            match parse_uint::<usize>(v) {
+                Some(n) if n <= len_max => declared_len = Some(n),
                 _ => return Err("ERR too large\n".to_string()),
             }
         } else if let Some(v) = kv(tok, "text") {
@@ -4884,9 +4893,9 @@ fn deliver_landed(ctx: &dyn FabricSession, toks: &[&str], wake: &dyn Fn()) -> St
     let mut off: Option<u64> = None;
     for tok in toks {
         if let Some(v) = kv(tok, "landed") {
-            post_id = v.parse().ok();
+            post_id = parse_uint(v);
         } else if let Some(v) = kv(tok, "off") {
-            off = v.parse().ok();
+            off = parse_uint(v);
         } else {
             return DELIVER_USAGE.to_string();
         }
@@ -4982,9 +4991,10 @@ pub fn cmd_outbox_verb_waking(
     wake: &dyn Fn(&SessionId),
 ) -> String {
     let store = &store.as_store();
-    match rest.split_once(' ') {
+    let trimmed = rest.trim();
+    match trimmed.split_once(' ') {
         Some(("sent", tail)) => cmd_outbox_sent_waking(store, tail, wake),
-        _ if rest.trim() == "sent" => OUTBOX_USAGE.to_string(),
+        None if trimmed == "sent" => OUTBOX_USAGE.to_string(),
         _ => cmd_outbox(store, rest),
     }
 }
@@ -4999,9 +5009,9 @@ pub fn cmd_outbox(store: &impl AsStore, rest: &str) -> String {
             earlier_receipts = true;
             continue;
         }
-        match tok.parse::<usize>() {
-            Ok(n) => max = n,
-            Err(_) => return OUTBOX_USAGE.to_string(),
+        match parse_uint::<usize>(tok) {
+            Some(n) => max = n,
+            None => return OUTBOX_USAGE.to_string(),
         }
     }
     let handles = store.read().unwrap_or_else(|p| p.into_inner()).sessions();
@@ -5151,7 +5161,7 @@ pub fn cmd_outbox_sent_waking(
             _ => return OUTBOX_USAGE.to_string(),
         }
     }
-    let Ok(post_id) = id.parse::<u64>() else {
+    let Some(post_id) = parse_uint::<u64>(id) else {
         return OUTBOX_USAGE.to_string();
     };
     let Some(off_raw) = kv(off_tok, "off") else {
@@ -5159,9 +5169,9 @@ pub fn cmd_outbox_sent_waking(
     };
     let off = match off_raw {
         "-" => None,
-        v => match v.parse::<u64>() {
-            Ok(n) => Some(n),
-            Err(_) => return OUTBOX_USAGE.to_string(),
+        v => match parse_uint::<u64>(v) {
+            Some(n) => Some(n),
+            None => return OUTBOX_USAGE.to_string(),
         },
     };
     if dup && off.is_none() {
@@ -5544,19 +5554,24 @@ const INBOX_USAGE: &str = "ERR usage: inbox [<n>] [since=<id>] [--peek] [--meta]
 
 /// `inbox` — the whole keyword, sub-forms included.
 pub fn cmd_inbox_verb(ctx: &dyn FabricSession, rest: &str) -> String {
+    let trimmed = rest.trim();
     if serving_driver().is_some() {
-        if let Some(word) = rest.strip_prefix("seen ") {
+        if trimmed == "seen" {
+            return fleet_mail::acknowledge(ctx, "");
+        }
+        if let Some(word) = trimmed.strip_prefix("seen ") {
             return fleet_mail::acknowledge(ctx, word);
         }
-        return fleet_mail::inbox(
-            ctx,
-            rest.strip_prefix("fleet").unwrap_or(rest).trim(),
-            false,
-        );
+        let tail = if trimmed == "fleet" {
+            ""
+        } else {
+            trimmed.strip_prefix("fleet ").unwrap_or(trimmed).trim()
+        };
+        return fleet_mail::inbox(ctx, tail, false);
     }
-    match rest.split_once(' ') {
+    match trimmed.split_once(' ') {
         Some(("fleet", tail)) => fleet_mail::inbox(ctx, tail, false),
-        Some(("seen", tail)) if tail.starts_with('f') => {
+        Some(("seen", tail)) if tail.trim_start().starts_with('f') => {
             match tail.split_whitespace().collect::<Vec<_>>().as_slice() {
                 [id, "forget"] => fleet_mail::forget(ctx, id),
                 _ => "ERR usage: inbox seen f<id> forget\n".to_owned(),
@@ -5564,8 +5579,8 @@ pub fn cmd_inbox_verb(ctx: &dyn FabricSession, rest: &str) -> String {
         }
         Some(("get", tail)) => cmd_inbox_get(ctx, tail),
         Some(("seen", tail)) => cmd_inbox_seen(ctx, tail),
-        _ if rest.trim() == "fleet" => fleet_mail::inbox(ctx, "", false),
-        _ if matches!(rest.trim(), "get" | "seen") => INBOX_USAGE.to_string(),
+        None if trimmed == "fleet" => fleet_mail::inbox(ctx, "", false),
+        None if matches!(trimmed, "get" | "seen") => INBOX_USAGE.to_string(),
         _ => cmd_inbox(ctx, rest),
     }
 }
@@ -5583,15 +5598,15 @@ pub fn cmd_inbox(ctx: &dyn FabricSession, rest: &str) -> String {
     let mut meta_only = false;
     for tok in rest.split_whitespace() {
         if let Some(v) = kv(tok, "since") {
-            match v.parse() {
-                Ok(n) => since = n,
-                Err(_) => return INBOX_USAGE.to_string(),
+            match parse_uint(v) {
+                Some(n) => since = n,
+                None => return INBOX_USAGE.to_string(),
             }
         } else if tok == "--peek" {
             peek = true;
         } else if tok == "--meta" {
             meta_only = true;
-        } else if let Ok(n) = tok.parse::<usize>() {
+        } else if let Some(n) = parse_uint::<usize>(tok) {
             limit = Some(n);
         } else {
             return INBOX_USAGE.to_string();
@@ -5730,12 +5745,12 @@ pub fn cmd_inbox_get(ctx: &dyn FabricSession, rest: &str) -> String {
         return INBOX_USAGE.to_string();
     };
     if let Some(off) = arg.strip_prefix('@') {
-        return match off.parse::<u64>() {
-            Ok(off) => inbox_get_at(ctx, off),
-            Err(_) => INBOX_USAGE.to_string(),
+        return match parse_uint::<u64>(off) {
+            Some(off) => inbox_get_at(ctx, off),
+            None => INBOX_USAGE.to_string(),
         };
     }
-    let Ok(id) = arg.parse::<u64>() else {
+    let Some(id) = parse_uint::<u64>(arg) else {
         return INBOX_USAGE.to_string();
     };
     let inbox = ctx.fabric().lock();
@@ -5786,7 +5801,7 @@ fn inbox_get_at_within(ctx: &dyn FabricSession, off: u64, wait: std::time::Durat
             let _ = ctx.record_fact("fetch", FabricFact::Fetch { off });
         }
     }
-    let deadline = std::time::Instant::now() + wait;
+    let deadline = deadline_after(wait);
     loop {
         let Some(i) = inbox.fetches.iter().position(|(o, _)| *o == off) else {
             // Evicted from under a parked read, though only an answered slot is evicted and this
@@ -5840,7 +5855,7 @@ fn fetch_failure(why: &str, off: u64) -> String {
 /// `inbox seen <id> [handled|refused|deferred]`.
 pub fn cmd_inbox_seen(ctx: &dyn FabricSession, rest: &str) -> String {
     let mut toks = rest.split_whitespace();
-    let Some(id) = toks.next().and_then(|t| t.parse::<u64>().ok()) else {
+    let Some(id) = toks.next().and_then(parse_uint::<u64>) else {
         return INBOX_USAGE.to_string();
     };
     let verdict = match toks.next() {
@@ -5918,8 +5933,8 @@ const POST_LEN_USAGE: &str = "ERR usage: post len=<n> must be a byte count\n";
 
 /// Parse a `post` `len=` value.
 pub fn post_len(v: &str) -> Result<usize, String> {
-    match v.parse::<usize>() {
-        Ok(n) if n <= BODY_MAX => Ok(n),
+    match parse_uint::<usize>(v) {
+        Some(n) if n <= BODY_MAX => Ok(n),
         _ if !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) => Err(post_body_too_large()),
         _ => Err(POST_LEN_USAGE.to_string()),
     }
@@ -5998,9 +6013,9 @@ pub fn cmd_post(ctx: &dyn FabricSession, rest: &str, body: Option<Vec<u8>>) -> S
                 None => return POST_USAGE.to_string(),
             }
         } else if let Some(v) = kv(tok, "dl") {
-            match v.parse() {
-                Ok(n) => dl = Some(n),
-                Err(_) => return POST_USAGE.to_string(),
+            match parse_uint(v) {
+                Some(n) => dl = Some(n),
+                None => return POST_USAGE.to_string(),
             }
         } else if let Some(v) = kv(tok, "via") {
             via = Some(v.to_string());
@@ -6019,16 +6034,16 @@ pub fn cmd_post(ctx: &dyn FabricSession, rest: &str, body: Option<Vec<u8>>) -> S
         } else if tok == "--wait" {
             wait = Some(None);
         } else if let Some(v) = kv(tok, "--wait") {
-            match v.parse::<u64>() {
-                Ok(n) => wait = Some(Some(n.min(WAIT_MAX_MS))),
-                Err(_) => return POST_USAGE.to_string(),
+            match parse_uint::<u64>(v) {
+                Some(n) => wait = Some(Some(n.min(WAIT_MAX_MS))),
+                None => return POST_USAGE.to_string(),
             }
         } else if tok == "--wait-ack" {
             wait_ack = Some(None);
         } else if let Some(v) = kv(tok, "--wait-ack") {
-            match v.parse::<u64>() {
-                Ok(n) => wait_ack = Some(Some(n.min(WAIT_MAX_MS))),
-                Err(_) => return POST_USAGE.to_string(),
+            match parse_uint::<u64>(v) {
+                Some(n) => wait_ack = Some(Some(n.min(WAIT_MAX_MS))),
+                None => return POST_USAGE.to_string(),
             }
         }
     }
@@ -6138,8 +6153,9 @@ pub fn cmd_post(ctx: &dyn FabricSession, rest: &str, body: Option<Vec<u8>>) -> S
     if wait_is_futile() {
         return fabric_wait_refusal(id);
     }
-    let deadline = std::time::Instant::now()
-        + std::time::Duration::from_millis(wait.unwrap_or(WAIT_DEFAULT_MS));
+    let deadline = deadline_after(std::time::Duration::from_millis(
+        wait.unwrap_or(WAIT_DEFAULT_MS),
+    ));
     let (off, dup, watch) = match wait_landing(ctx, id, deadline) {
         Ok(landed) => landed,
         Err(reply) => return reply,
@@ -6210,6 +6226,12 @@ fn wait_receipt(ctx: &dyn FabricSession, id: u64, off: u64, dup: &str, bound_ms:
     wait_receipt_on_log(ctx, id, dup, &watch, bound_ms)
 }
 
+fn deadline_after(wait: std::time::Duration) -> std::time::Instant {
+    let now = std::time::Instant::now();
+    now.checked_add(wait)
+        .unwrap_or_else(|| now + std::time::Duration::from_secs(365 * 24 * 3600))
+}
+
 fn wait_receipt_on_log(
     ctx: &dyn FabricSession,
     id: u64,
@@ -6218,7 +6240,7 @@ fn wait_receipt_on_log(
     bound_ms: u64,
 ) -> String {
     let off = post.off;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(bound_ms);
+    let deadline = deadline_after(std::time::Duration::from_millis(bound_ms));
     let mut guard = ctx.fabric().lock();
     loop {
         // The post's own record must still be on the log (a moved generation below the fork
@@ -6258,7 +6280,7 @@ fn park_until(deadline: std::time::Instant) -> std::time::Instant {
     let horizon = stale_in()
         .filter(|d| !d.is_zero())
         .unwrap_or_else(stale_after);
-    deadline.min(std::time::Instant::now() + horizon)
+    deadline.min(deadline_after(horizon))
 }
 
 fn fabric_wait_refusal(id: u64) -> String {
@@ -6289,34 +6311,44 @@ pub fn cmd_await_inbox(ctx: &dyn FabricSession, args: &[&str], timeout_ms: u64) 
                          [timeout=<ms>] | await inbox re=<off> [since=<id>] [kinds=<k|hold,...>] \
                          [topic=<t>] [timeout=<ms>]\n";
     let mut since: Option<u64> = None;
-    let mut fleet_since = 0;
+    let mut fleet_since: Option<u64> = None;
     let mut direct_only = false;
     let mut re: Option<u64> = None;
     let mut kinds: Option<Vec<String>> = None;
     let mut topic: Option<String> = None;
     for tok in args {
         if let Some(v) = kv(tok, "since") {
-            if let Some(value) = v.strip_prefix('f').and_then(|s| s.parse().ok()) {
-                fleet_since = value;
+            if since.is_some() {
+                return USAGE.to_string();
+            }
+            if let Some(value) = v.strip_prefix('f').and_then(parse_uint) {
+                if fleet_since.replace(value).is_some() {
+                    return USAGE.to_string();
+                }
                 direct_only = true;
                 since = Some(0);
                 continue;
             }
-            match v.parse() {
-                Ok(n) => since = Some(n),
-                Err(_) => return USAGE.to_string(),
+            match parse_uint(v) {
+                Some(n) => since = Some(n),
+                None => return USAGE.to_string(),
             }
         } else if let Some(value) = kv(tok, "fleet_since")
             .and_then(|s| s.strip_prefix('f'))
-            .and_then(|s| s.parse().ok())
+            .and_then(parse_uint)
         {
-            fleet_since = value;
+            if direct_only || fleet_since.replace(value).is_some() {
+                return USAGE.to_string();
+            }
         } else if let Some(v) = kv(tok, "re") {
             match parse_bus_offset(v) {
-                Some(n) => re = Some(n),
-                None => return USAGE.to_string(),
+                Some(n) if re.replace(n).is_none() => {}
+                _ => return USAGE.to_string(),
             }
         } else if let Some(v) = kv(tok, "kinds") {
+            if kinds.is_some() {
+                return USAGE.to_string();
+            }
             let list: Vec<String> = v.split(',').map(str::to_string).collect();
             if list
                 .iter()
@@ -6328,10 +6360,9 @@ pub fn cmd_await_inbox(ctx: &dyn FabricSession, args: &[&str], timeout_ms: u64) 
         } else if let Some(v) = kv(tok, "topic") {
             // `is_topic` is the grammar `post to=say:<t>` and `topic add` take: no row carries a
             // topic outside it, so a wait on one could only time out.
-            if !is_topic(v) {
+            if !is_topic(v) || topic.replace(v.to_string()).is_some() {
                 return USAGE.to_string();
             }
-            topic = Some(v.to_string());
         } else {
             return USAGE.to_string();
         }
@@ -6341,9 +6372,10 @@ pub fn cmd_await_inbox(ctx: &dyn FabricSession, args: &[&str], timeout_ms: u64) 
         (None, Some(_)) => 0,
         (None, None) => return USAGE.to_string(),
     };
-    if direct_only && (re.is_some() || topic.is_some()) {
+    if (direct_only || fleet_since.is_some()) && (re.is_some() || topic.is_some()) {
         return USAGE.to_owned();
     }
+    let fleet_since = fleet_since.unwrap_or(0);
     let watch_hold = kinds
         .as_ref()
         .is_some_and(|k| k.iter().any(|k| k == "hold"));
@@ -6358,7 +6390,7 @@ pub fn cmd_await_inbox(ctx: &dyn FabricSession, args: &[&str], timeout_ms: u64) 
             && (topic.is_none() || r.topic == topic)
     };
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let deadline = deadline_after(std::time::Duration::from_millis(timeout_ms));
     let mut guard = ctx.fabric().lock();
     if since > guard.last_msg_id {
         return format!("ERR bad since high={}\n", guard.last_msg_id);
@@ -9747,6 +9779,11 @@ mod inbox_hold {
         );
         assert_eq!(deliver(&store, &sid, 3, "h-a", "ask", "?"), "OK 3\n");
         assert_eq!(cmd_await_inbox(&ctx, &["since=1"], 5), "OK inbox 3\n");
+        assert_eq!(
+            cmd_await_inbox(&ctx, &["since=1"], u64::MAX),
+            "OK inbox 3\n",
+            "extreme timeout_ms saturates cleanly without Instant overflow"
+        );
         assert_eq!(
             cmd_await_inbox(&ctx, &["since=3"], 5),
             "OK timeout\n",
@@ -13228,5 +13265,81 @@ mod inbox_hold {
             assert_eq!(inbox.posts[0].id, 1);
             assert!(inbox.posts[0].off.is_none() && !inbox.posts[0].dead);
         }
+    }
+
+    #[test]
+    fn wire_parsers_reject_leading_plus_signs_on_unsigned_fields() {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            let generation = next_bridge_generation();
+            attach_up(&store, generation);
+
+            assert_eq!(cmd_hello("lane=+1 build=x", Some(generation)), HELLO_USAGE);
+            for bad in [
+                "set-aside files=+1",
+                "quarantine torn=+1",
+                "gap from=+1 to=2",
+                "gap from=1 to=+2",
+                "gap from=1 to=2 records=+1",
+                "up rtt=+1",
+                "log aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.1 continues=+1 was=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.0",
+            ] {
+                assert_eq!(cmd_link(&store, bad, Some(generation)), LINK_USAGE, "{bad}");
+            }
+            for bad in [
+                format!("{sid} off=+1 from=h-a kind=note text=x"),
+                format!("{sid} off=1 from=h-a kind=note re=+1 text=x"),
+                format!("{sid} off=1 from=h-a kind=note dl=+1 text=x"),
+                format!("{sid} landed=+1 off=1"),
+                format!("{sid} landed=1 off=+1"),
+                format!("{sid} receipt=+1 off=1"),
+                format!("{sid} receipt=1 off=+1"),
+                format!("{sid} fetched=+1 err=no-record"),
+                format!("{sid} fetched=1 err=retained floor=+1"),
+                format!("{sid} fetched=1 from=h-a kind=note at=+1 text=x"),
+            ] {
+                assert_eq!(cmd_deliver(&store, &bad), DELIVER_USAGE, "{bad}");
+            }
+            assert_eq!(
+                cmd_deliver(
+                    &store,
+                    &format!("{sid} off=1 from=h-a kind=note len=+1 text=x")
+                ),
+                "ERR too large\n"
+            );
+            assert_eq!(cmd_outbox(&store, "+1"), OUTBOX_USAGE);
+            assert_eq!(
+                cmd_outbox_sent(&store, &format!("{sid} +1 off=1")),
+                OUTBOX_USAGE
+            );
+            assert_eq!(
+                cmd_outbox_sent(&store, &format!("{sid} 1 off=+1")),
+                OUTBOX_USAGE
+            );
+            assert_eq!(cmd_inbox(&ctx, "+1"), INBOX_USAGE);
+            assert_eq!(cmd_inbox(&ctx, "since=+1"), INBOX_USAGE);
+            assert_eq!(cmd_inbox_get(&ctx, "+1"), INBOX_USAGE);
+            assert_eq!(cmd_inbox_get(&ctx, "@+1"), INBOX_USAGE);
+            assert_eq!(cmd_inbox_seen(&ctx, "+1"), INBOX_USAGE);
+            assert_eq!(post_len("+1"), Err(POST_LEN_USAGE.to_string()));
+            for bad in [
+                "to=h-a kind=note dl=+1 hi",
+                "to=h-a kind=ask --wait=+1 hi",
+                "to=h-a kind=ask --wait --wait-ack=+1 hi",
+            ] {
+                assert_eq!(cmd_post(&ctx, bad, None), POST_USAGE, "{bad}");
+            }
+            for bad in [
+                &["since=+1"][..],
+                &["since=f+1"][..],
+                &["since=0", "fleet_since=f+1"][..],
+            ] {
+                assert!(
+                    cmd_await_inbox(&ctx, bad, 0).starts_with("ERR usage"),
+                    "{bad:?}"
+                );
+            }
+        });
     }
 }

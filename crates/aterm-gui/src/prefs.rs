@@ -46,7 +46,7 @@ pub(crate) const EDIT_TRAIL_SOUND_BED: &str = "trail_sound_bed";
 pub(crate) const EDIT_TRAIL_SOUND_STYLE: &str = "trail_sound_style";
 /// The held-key sing-along riff's own switch (`Config::trail_sound_riff`, default ON).
 pub(crate) const EDIT_TRAIL_SOUND_RIFF: &str = "trail_sound_riff";
-/// Audible terminal bell (`Config::bell_sound`, default ON).
+/// Audible terminal bell (`Config::bell_sound`, default OFF).
 pub(crate) const EDIT_BELL_SOUND: &str = "bell_sound";
 /// The curse bonk's two gates.
 pub(crate) const EDIT_SPARKLE_BONK: &str = "sparkle_words.profanity.bonk";
@@ -55,9 +55,6 @@ pub(crate) const EDIT_SPARKLE_BONK_DETONATION: &str = "sparkle_words.profanity.b
 pub(crate) const EDIT_OUTPUT_STREAK_SOUND: &str = "output_streak.sound";
 /// Prism wake's switch (`[output_streak] enabled`).
 pub(crate) const EDIT_OUTPUT_STREAK_ENABLED: &str = "output_streak.enabled";
-
-/// The `[presence]` leaf the View menu's needs switch writes.
-pub(crate) const EDIT_PRESENCE_RIM: &str = "presence.rim";
 
 /// Every config key that changes what aterm sounds like, and nothing else.
 pub(crate) const SOUND_MENU_KEYS: &[&str] = &[
@@ -295,8 +292,6 @@ pub(crate) const EDIT_TAB_STATUS_DWELL_MS: &str = "tab_status_dwell_ms";
 pub(crate) const EDIT_TAB_STATUS_BADGE: &str = "tab_status_badge";
 /// The tab connection mark's opt-out (Session Connections).
 pub(crate) const EDIT_TAB_CONNECTION_BADGE: &str = "tab_connection_badge";
-/// Preference key controlling whether `aterm` posts its own notices as desktop notifications.
-pub(crate) const EDIT_DESKTOP_ALERTS: &str = "desktop_alerts";
 pub(crate) const EDIT_SEARCH_HISTORY_LINES: &str = "search_history_lines";
 pub(crate) const EDIT_ALLOW_OSC52_QUERY: &str = "allow_osc52_query";
 /// macOS Secure Keyboard Entry (`Config::secure_keyboard_entry`, default OFF).
@@ -358,11 +353,11 @@ pub(crate) const EDIT_HARNESS_ANSWER_QUESTIONS: &str = "harness.answer_questions
 pub(crate) const EDIT_HARNESS_QUESTION_PRIORITY: &str = "harness.question_priority";
 /// `[harness.claude] enabled`.
 pub(crate) const EDIT_HARNESS_CLAUDE_ENABLED: &str = "harness.claude.enabled";
-/// `[harness.codex] enabled` — [`EDIT_HARNESS_CLAUDE_ENABLED`] for Codex.
+/// Compatibility policy key allowing codex-alab's native Autopilot.
 pub(crate) const EDIT_HARNESS_CODEX_ENABLED: &str = "harness.codex.enabled";
 
 /// The label of Codex's own switch ([`EDIT_HARNESS_CODEX_ENABLED`]).
-pub(crate) const CODEX_SWITCH_LABEL: &str = "Watch codex-alab sessions";
+pub(crate) const CODEX_SWITCH_LABEL: &str = "Enable codex-alab Autopilot";
 
 /// The label of the switch of the agent named `product` (`Program::product`).
 #[must_use]
@@ -475,6 +470,23 @@ pub(crate) const PREDICTIVE_ECHO_MODES: &[&str] = &["off", "adaptive", "always"]
 pub(crate) const TEXT_BLENDINGS: &[&str] = &["linear-corrected", "linear"];
 /// Closed domain for the `motion` accessibility policy.
 pub(crate) const MOTION_MODES: &[&str] = &["auto", "full", "reduced"];
+
+/// The Motion row's value for a written `motion`: a spelling the engine reads as Full or
+/// Reduced (`reduce`, `none`, `off`; `MotionMode::parse`) is that mode's row, so the row shows
+/// it as the engine plays it. Anything else stays as written (an unknown spelling is shown as
+/// itself, the current value outside the domain).
+pub(crate) fn motion_row_value(value: &str) -> &str {
+    use crate::motion::MotionMode;
+    let token = value.trim();
+    if token.eq_ignore_ascii_case("auto") {
+        return value;
+    }
+    match MotionMode::parse(token) {
+        MotionMode::Full => "full",
+        MotionMode::Reduced => "reduced",
+        MotionMode::Auto => value,
+    }
+}
 /// Closed domain for `window_colorspace`.
 pub(crate) const WINDOW_COLORSPACES: &[&str] = &["srgb", "display-p3"];
 /// Closed domain for `background_material` (vibrancy).
@@ -943,11 +955,6 @@ pub(crate) const NESTED_LEAVES: &[NestedLeaf] = &[
         label: "Note when a program starts printing",
         kind: EditKind::Bool,
     },
-    NestedLeaf {
-        key: EDIT_PRESENCE_RIM,
-        label: "Show needs in windows",
-        kind: EditKind::Bool,
-    },
 ];
 
 /// Registry lookup for a dotted nested key.
@@ -1185,7 +1192,6 @@ pub(crate) fn edit_kind(key: &str) -> EditKind {
         | EDIT_TAB_STATUS
         | EDIT_TAB_STATUS_BADGE
         | EDIT_TAB_CONNECTION_BADGE
-        | EDIT_DESKTOP_ALERTS
         | EDIT_SERIOUS_MODE
         | EDIT_LOAD_ADAPTIVE_MOTION
         | EDIT_CURSOR_TRAIL_RING
@@ -2816,7 +2822,6 @@ fn nested_seed_placeholder(cfg: &Config, key: &str) -> (Option<String>, String) 
             Some(cfg.output_streak_enabled_or_default()),
             crate::app_config::DEFAULT_DECORATIVE_EFFECTS,
         ),
-        EDIT_PRESENCE_RIM => boolean(Some(cfg.presence_rim_enabled()), true),
         _ => (None, String::new()),
     }
 }
@@ -2950,7 +2955,6 @@ pub(crate) fn section_of(key: &str) -> Section {
         | EDIT_PREDICTIVE_ECHO
         | EDIT_PREDICTIVE_ECHO_EDITING => Section::Input,
         EDIT_FOCUS_BOOST | EDIT_GPU | EDIT_TEMPORAL_RECORDING => Section::Terminal,
-        EDIT_DESKTOP_ALERTS => Section::Security,
         EDIT_PACKAGES_ENABLED | EDIT_PACKAGES_AUTO_INSTALL | EDIT_REROUTE_ANNOUNCE => {
             Section::Packages
         }
@@ -3112,7 +3116,6 @@ pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
             ("Keyboard", 1)
         }
         EDIT_FOCUS_BOOST | EDIT_GPU | EDIT_TEMPORAL_RECORDING => ("System", 3),
-        EDIT_DESKTOP_ALERTS => ("Notifications", 2),
         EDIT_PACKAGES_ENABLED | EDIT_PACKAGES_AUTO_INSTALL | EDIT_REROUTE_ANNOUNCE => {
             ("ALab Tools", 0)
         }
@@ -3272,9 +3275,6 @@ pub(crate) fn footnote_of(key: &str) -> Option<&'static str> {
         EDIT_AMBIGUOUS_WIDTH => "Narrow gives characters like ① or ※ one cell, Wide two.",
         EDIT_MACHINE_UNIVERSAL_CONTROL => {
             "Off keeps the pointer on this Mac: it won\u{2019}t move to a nearby Mac or iPad."
-        }
-        EDIT_DESKTOP_ALERTS => {
-            "When off, aterm's alerts stay in the window, the menu bar and Messages."
         }
         EDIT_PACKAGES_ENABLED => {
             "Keeps ALab tools and the coding agents aterm manages up to date, starting at once."
@@ -3671,7 +3671,7 @@ fn numeric_symbol(key: &str) -> Option<&'static str> {
         | "matrix_rain.mutation_ms"
         | "privacy.warmup_hold_ms"
         | "privacy.probe_interval_ms" => " ms",
-        "matrix_rain.idle_secs" | "output_streak.idle_secs" => " s",
+        "matrix_rain.idle_secs" | "output_streak.idle_secs" | "idle_rest_secs" => " s",
         "sparkle_words.profanity.supernova_chance" | "sparkle_words.custom.burst.chance" => "%",
         EDIT_LINE_HEIGHT | EDIT_CURSOR_TRAIL_BLOOM_RADIUS => "\u{00d7}",
         _ => return None,
@@ -3960,17 +3960,6 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
             "history",
             "time",
         ],
-        EDIT_DESKTOP_ALERTS => &[
-            "notification",
-            "notifications",
-            "alert",
-            "alerts",
-            "banner",
-            "desktop",
-            "messages",
-            "script",
-            "editor",
-        ],
         EDIT_WINDOW_PADDING | EDIT_WINDOW_PADDING_TOP => &[
             "padding", "margin", "border", "spacing", "inset", "edge", "sides", "bottom", "top",
         ],
@@ -4200,17 +4189,6 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
             "running",
             "failed",
             "session",
-        ],
-        EDIT_PRESENCE_RIM => &[
-            "presence",
-            "needs",
-            "border",
-            "rim",
-            "pill",
-            "stuck",
-            "decide",
-            "attention",
-            "window",
         ],
         EDIT_TAB_CONNECTION_BADGE => &[
             "connection",
@@ -5416,13 +5394,6 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
                 .clone()
                 .unwrap_or_else(|| "none (default)".to_string()),
             seed: background_material,
-        },
-        EditField {
-            label: "Desktop notifications from aterm",
-            key: EDIT_DESKTOP_ALERTS,
-            kind: EditKind::Bool,
-            seed: Some(cfg.desktop_alerts_or_default().to_string()),
-            placeholder: String::new(),
         },
         EditField {
             label: "Rewind (keep recent screen history)",

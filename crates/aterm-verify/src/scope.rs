@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! What the checks that read a selection (lint, test, doc) build and
-//! test: the whole workspace (`--all`), the packages `-p` named, or the change
+//! What the checks that read a selection (lint, test, doc; `cells` under `-p`
+//! or pulled) build and test: the whole workspace (`--all`), the packages `-p` named, or the change
 //! cone ([`crate::changed`]). The driver flags and the label derive from one
 //! value, so a check can never print `--workspace` while running `-p`.
 
@@ -145,7 +145,7 @@ impl Scope {
 /// The package name a `-p` spec names: what follows a path spec's `#`, up to
 /// its `@<version>`. `None` for a spec whose `@` has no version after it
 /// (`name@`), which names no package.
-fn spec_name(spec: &str) -> Option<&str> {
+pub fn spec_name(spec: &str) -> Option<&str> {
     let tail = spec.rsplit_once('#').map_or(spec, |(_, t)| t);
     match tail.split_once('@') {
         None => Some(tail),

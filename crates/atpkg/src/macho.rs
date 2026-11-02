@@ -489,7 +489,7 @@ pub(crate) fn is_native_object(path: &Path) -> bool {
 }
 
 /// Whether `head` opens this platform's native executable format: Mach-O on macOS, ELF on every other unix.
-fn is_native_executable(head: &[u8]) -> bool {
+pub(crate) fn is_native_executable(head: &[u8]) -> bool {
     if cfg!(target_os = "macos") {
         is_macho_header(head)
     } else {

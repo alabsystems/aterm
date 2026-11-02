@@ -147,12 +147,7 @@ pub fn stamp_with(
         staged.driver_rel,
     );
     let dest = staged.root.join(LINEAGE_FILE);
-    let tmp = staged.root.join(format!(".{LINEAGE_FILE}.atpkg-stamp"));
-    std::fs::write(&tmp, &text)
-        .and_then(|()| std::fs::rename(&tmp, &dest))
-        .map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            vec![format!("write {}: {e}", dest.display())]
-        })?;
+    crate::lane::report::write_atomic(&dest, &text)
+        .map_err(|e| vec![format!("write {}: {e}", dest.display())])?;
     Ok(text)
 }

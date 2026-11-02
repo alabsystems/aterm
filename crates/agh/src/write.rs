@@ -19,7 +19,7 @@ pub enum Outcome<T> {
     /// posts again.
     Refused(Error),
     /// Sent, and the answer was a 5xx or never came. The intent stays open, and only a
-    /// WriterRead discovery or a person's `agh intent retract` closes it.
+    /// WriterRead discovery or an `agh intent retract` closes it.
     Unknown {
         /// The open intent.
         intent: IntentId,
@@ -227,11 +227,14 @@ pub fn unix_only() -> Error {
 
 /// Design §10.2's settle table, over one one-shot attempt's result. The one table every
 /// one-shot write settles by (`Github::one_shot`, `Releases::create`):
-/// - `Err` with `side_effect` none and no `http` (nothing was sent) → `Settled::NeverSent`;
+/// - `Err` with `side_effect` none, no `http` and a kind other than OutcomeUnknown (nothing
+///   was sent) → `Settled::NeverSent`. A door that refuses after the exchange (a recording
+///   whose answer the tape refuses) sets `side_effect` unknown, so it settles `Unknown`;
 /// - `Ok` → `Settled::Created` with `created`, or `Settled::Unknown`, why
 ///   `GitHub answered {status} with no object id`, when `created` is `None`;
 /// - `Err` whose `http.status` is 400–499 → `Settled::Refused { status }`;
-/// - any other `Err` (a 5xx, or `side_effect` unknown) → `Settled::Unknown { why }`, the
+/// - any other `Err` (a 5xx, kind OutcomeUnknown, or `side_effect` unknown) →
+///   `Settled::Unknown { why }`, the
 ///   error's why through `Redactor::shapes`. M1 builds a why raw from GitHub's `message` and
 ///   the transport's detail and redacts only where it renders one, so this is where a why
 ///   bound for the journal is redacted. A caller holding a redactor (`Github::one_shot`,
@@ -249,7 +252,11 @@ pub(crate) fn settle_table(
                 why: format!("GitHub answered {} with no object id", answered.status),
             },
         },
-        Err(error) if error.side_effect == SideEffect::None && error.http.is_none() => {
+        Err(error)
+            if error.side_effect == SideEffect::None
+                && error.http.is_none()
+                && error.kind != Kind::OutcomeUnknown =>
+        {
             Settled::NeverSent
         }
         Err(error) => match &error.http {
@@ -293,6 +300,26 @@ mod tests {
             assert!(!why.contains(&token), "the journal's why holds the token");
             assert_eq!(why, crate::redact::Redactor::shapes(&why));
         }
+    }
+
+    #[test]
+    fn only_an_error_that_proves_nothing_was_sent_settles_never_sent() {
+        let not_sent = Error::could_not_run("connect refused");
+        assert!(matches!(
+            settle_table(&Err(not_sent), None),
+            Settled::NeverSent
+        ));
+        let lost = Error::new(Kind::OutcomeUnknown, "no answer was read");
+        assert!(matches!(
+            settle_table(&Err(lost), None),
+            Settled::Unknown { .. }
+        ));
+        let refused_after_the_exchange = Error::could_not_run("a tape cannot hold this answer")
+            .with_side_effect(SideEffect::Unknown);
+        assert!(matches!(
+            settle_table(&Err(refused_after_the_exchange), None),
+            Settled::Unknown { .. }
+        ));
     }
 
     #[test]

@@ -283,6 +283,7 @@ fn a_different_auth_context_neither_falls_back_nor_claims_an_old_move() {
             &idle.kept,
             Some(AccountAdvice::Move {
                 to: "work-2".into(),
+                yields: None,
             }),
             usage_wall(),
         );

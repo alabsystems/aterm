@@ -465,7 +465,6 @@ impl App {
                 && crate::menu::local_file_picker_available(),
             front_person_hold,
             front_remote_hold,
-            needs_in_windows: self.presence_rim_on(),
             stats_bars: Some(self.stats_bars_form()),
             deck_size: Some(self.deck_size_pref()),
             agents: self.agents_live(),
@@ -790,13 +789,13 @@ impl App {
                 self.hand_back(wid);
             }
             PaletteTarget::Menu(crate::menu::MenuAction::Find) => {
-                self.clear_move_license(wid);
+                self.clear_move_license_from(wid, crate::cursor_glow::BoundaryOrigin::Palette);
                 self.find_requested_in(wid);
             }
             PaletteTarget::Menu(
                 action @ (crate::menu::MenuAction::FindNext | crate::menu::MenuAction::FindPrev),
             ) => {
-                self.clear_move_license(wid);
+                self.clear_move_license_from(wid, crate::cursor_glow::BoundaryOrigin::Palette);
                 if let Err(why) =
                     self.search_find_again_in(wid, action == crate::menu::MenuAction::FindNext)
                 {
@@ -3062,6 +3061,38 @@ mod tests {
         app.windows[&WindowId(0)]
             .palette()
             .expect("the palette is open")
+    }
+
+    /// The lab's pointer selects a palette row on a headless window that never drew the card, as
+    /// a person's pointer selects one on glass: `pointer move item=<n>` lays the glass the next
+    /// frame shows first. A row scrolled off is no aim (§14.16).
+    #[test]
+    fn the_labs_pointer_selects_a_palette_row_the_window_never_drew() {
+        use crate::app_mouse::PointerAction;
+        let mut app = App::headless_for_test();
+        assert!(
+            app.windows[&WindowId(0)].input_scratch.cells.is_empty(),
+            "a headless window composed no frame"
+        );
+        app.palette_enter();
+        let head = |app: &App| front_palette(app).controls_lines()[0].clone();
+        assert!(head(&app).contains(" selected=0 "), "{}", head(&app));
+        for item in [3, 1] {
+            app.pointer_cmd(PointerAction::MoveItem(item))
+                .unwrap_or_else(|why| panic!("row {item}: {why}"));
+            assert!(
+                head(&app).contains(&format!(" selected={item} ")),
+                "the pointer over row {item} selects it: {}",
+                head(&app)
+            );
+        }
+        let off = front_palette(&app).filtered().len() - 1;
+        assert_eq!(
+            app.pointer_cmd(PointerAction::MoveItem(off)),
+            Err(format!("item {off} is not a row the card shows")),
+            "the last of {} rows is scrolled off a 24-row window",
+            off + 1
+        );
     }
 
     fn highlight(app: &mut App, id: &str) {

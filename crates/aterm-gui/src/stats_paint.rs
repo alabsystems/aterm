@@ -893,6 +893,7 @@ impl<'a> Painter<'a> {
                     r_outer: r,
                     thickness: lw,
                     track: c,
+                    start: 0.0,
                     frac: 0.0,
                     fill: c,
                 });
@@ -906,6 +907,7 @@ impl<'a> Painter<'a> {
                     r_outer: r,
                     thickness: lw,
                     track: c,
+                    start: 0.0,
                     frac: 0.0,
                     fill: c,
                 });
@@ -915,6 +917,7 @@ impl<'a> Painter<'a> {
                     r_outer: r - lw,
                     thickness: r - lw,
                     track: rgba(ink, 0),
+                    start: 0.0,
                     frac: frac.clamp(0.06, 1.0),
                     fill: c,
                 });
@@ -1019,6 +1022,7 @@ pub(crate) mod tests {
             id: id.into(),
             tab: 7,
             kind: JobKind::Shell,
+            orphan_of: None,
             consumer: Consumer::default(),
             promoted_ms: None,
             task: None,

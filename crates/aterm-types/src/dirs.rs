@@ -17,7 +17,9 @@ pub fn home_dir() -> Option<PathBuf> {
     }
     #[cfg(windows)]
     {
-        std::env::var_os("USERPROFILE").map(PathBuf::from)
+        std::env::var_os("USERPROFILE")
+            .map(PathBuf::from)
+            .filter(|home| home.is_absolute())
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -75,8 +77,11 @@ fn home_from_passwd(contents: &[u8], uid: u32) -> Option<PathBuf> {
         let (Some(&uid_field), Some(&home)) = (fields.get(2), fields.get(5)) else {
             continue;
         };
-        if uid_field == uid_str.as_bytes() && !home.is_empty() {
-            return Some(PathBuf::from(OsStr::from_bytes(home)));
+        if uid_field == uid_str.as_bytes() {
+            let home_path = PathBuf::from(OsStr::from_bytes(home));
+            if home_path.is_absolute() {
+                return Some(home_path);
+            }
         }
     }
     None
@@ -100,6 +105,39 @@ pub fn resolve_aterm_config_path(
     home: Option<&OsStr>,
 ) -> Option<PathBuf> {
     resolve_aterm_config_dir(xdg_config_home, appdata, home).map(|dir| dir.join("aterm.toml"))
+}
+
+/// Why `aterm.toml` (the file a path or its symlink ends at) is refused, by the one rule every
+/// reader of it holds (the window's settings, the `[swarm] enabled` switch, Commons' policy):
+/// the file must be owned by this user (`me`) or by root, with no group or other write bit and
+/// no setuid or setgid bit (`mode`). A file root owns and nobody else can write is one
+/// home-manager links from its read-only store; a file another user owns, or any user can write
+/// past its owner, could turn sharing on or off for this user. `None` where the file passes.
+#[must_use]
+pub fn aterm_config_refusal(owner: u32, mode: u32, me: u32) -> Option<String> {
+    if owner != me && owner != 0 {
+        return Some(format!("owned by uid {owner}, not this user or root"));
+    }
+    let why = if mode & 0o022 != 0 {
+        "lets other users write it"
+    } else if mode & 0o6000 != 0 {
+        "carries a set-id bit"
+    } else {
+        return None;
+    };
+    Some(format!(
+        "mode {:o} {why}; run chmod 600 on it",
+        mode & 0o7777
+    ))
+}
+
+/// [`aterm_config_refusal`] of the file `meta` describes (the one a read opened, a symlink
+/// followed), against this process's effective user.
+#[cfg(all(unix, not(target_family = "wasm")))]
+#[must_use]
+pub fn aterm_config_file_refusal(meta: &std::fs::Metadata) -> Option<String> {
+    use std::os::unix::fs::MetadataExt as _;
+    aterm_config_refusal(meta.uid(), meta.mode(), aterm_uds::peer::our_uid())
 }
 
 /// The aterm config directory.
@@ -451,6 +489,29 @@ pub fn resolve_logs_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `aterm.toml` passes for this user's file or root's, with no group or other write and no
+    /// set-id bit; another user's, or one others may write, is refused, saying why.
+    #[test]
+    fn aterm_toml_is_this_users_or_roots_and_nobody_elses_to_write() {
+        let me = 501;
+        assert_eq!(aterm_config_refusal(me, 0o100_600, me), None);
+        assert_eq!(aterm_config_refusal(me, 0o100_644, me), None);
+        assert_eq!(
+            aterm_config_refusal(0, 0o100_444, me),
+            None,
+            "home-manager's store"
+        );
+        let other = aterm_config_refusal(502, 0o100_600, me).expect("another user's");
+        assert!(other.contains("uid 502"), "{other}");
+        for mode in [0o100_664, 0o100_646, 0o104_600, 0o102_600] {
+            assert!(aterm_config_refusal(me, mode, me).is_some(), "{mode:o}");
+            assert!(
+                aterm_config_refusal(0, mode, me).is_some(),
+                "root's {mode:o}"
+            );
+        }
+    }
 
     /// The account's own shell is the one whose `$HOME` is the account record's home (as
     /// written or as resolved), not root and not under a private state root; each other
@@ -927,6 +988,8 @@ mod tests {
         assert_eq!(home_from_passwd(passwd, 9999), None);
         let passwd = ["broken:", "x", ":500:500:Broken User::/bin/sh\n"].concat();
         assert_eq!(home_from_passwd(passwd.as_bytes(), 500), None);
+        let relative = ["rel:", "x", ":501:501:Rel User:relative/home:/bin/sh\n"].concat();
+        assert_eq!(home_from_passwd(relative.as_bytes(), 501), None);
         let passwd = b"short:x\n\
                       valid:x:42:42:User:/home/valid:/bin/sh\n\
                       \n";

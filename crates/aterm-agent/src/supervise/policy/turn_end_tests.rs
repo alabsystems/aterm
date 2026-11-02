@@ -84,8 +84,9 @@ fn idle(said: &str, worked: Option<Duration>) -> TurnEndReading {
         said_cut: false,
         opens_cut: false,
         turn_said: None,
+        said_lines: None,
+        turn_lines: None,
         opened_by: None,
-        opened_words: None,
         message_drawn: false,
         submits: None,
         inputs_before: None,
@@ -105,7 +106,9 @@ fn idle(said: &str, worked: Option<Duration>) -> TurnEndReading {
         left_record: false,
         left_work: None,
         person: None,
+        key: None,
         reach: Default::default(),
+        witness: None,
         login_back: false,
         auto_continue: None,
         since_limit: None,
@@ -120,6 +123,7 @@ fn idle(said: &str, worked: Option<Duration>) -> TurnEndReading {
         account: None,
         autopilot: Autopilot::Cruise,
         login_label: None,
+        autopilot_by_person: false,
         login_superseded: false,
         login_notice: None,
         login_screen: None,
@@ -189,12 +193,22 @@ fn typed(rule: &'static str) -> TurnEndAction {
     }
 }
 
-/// Cruise's continuation within a person's hold: the hour after their turn, it does not say the
-/// go-ahead is no need ([`super::go_ahead::unless_held`]).
+/// Cruise's continuation within the hour the person's last key holds the go-ahead: it does not say
+/// the go-ahead is no need ([`super::go_ahead::unless_held`]).
 fn continued_held() -> TurnEndAction {
     TurnEndAction::Type {
         text: super::go_ahead::unless_held(&continuation_text(&cfg(), None), true).into_owned(),
         rule_id: RULE_CONTINUE,
+    }
+}
+
+/// Cruise's continuation at `now`, within a person's hold or past it: a screen whose prompt is a
+/// person's message, read first at a wall, is their turn (2026-10-29 review 5).
+fn continued_for(st: &TurnEndState, now: Instant) -> TurnEndAction {
+    if st.go_ahead_held(now) {
+        continued_held()
+    } else {
+        typed(RULE_CONTINUE)
     }
 }
 
@@ -526,7 +540,7 @@ fn the_dones_instant_is_the_read_that_decided_it() {
         "the read that decided the done"
     );
     let mut now = done + Duration::from_secs(5);
-    st.observe(&land(idle(DEFENSE, None)), now);
+    st.observe(&land(idle(LANDED_WORD, None)), now);
     assert_eq!(st.done_shown(), Some(done), "read again");
     let night = Duration::from_secs(2 * 3600);
     st.slept(night);
@@ -539,7 +553,7 @@ fn the_dones_instant_is_the_read_that_decided_it() {
     assert_eq!(a, land_nudged());
     st.acted(&a, &theirs, now);
     now += 3 * MIN;
-    st.observe(&land(idle(DEFENSE, Some(3 * MIN))), now);
+    now = lands_on_check(&mut st, &land(idle(DEFENSE, Some(3 * MIN))), now);
     assert_eq!(st.done_shown(), Some(now), "its own landing");
     let mut st = TurnEndState::default();
     st.observe(&land(idle("Half of the README.", Some(3 * MIN))), now);
@@ -787,6 +801,61 @@ fn a_limit_whose_notice_left_the_screen_waits_for_the_reset_it_named() {
         t,
     );
     assert_eq!(at(&mut st, &cancelled, t + MIN), typed(RULE_LIMIT_RESUME));
+}
+
+/// A login that came back to a usage limit, or moved off its account, drops the limit's reset: a
+/// reset the usage tap read before, carried onto a reading with the notice gone, is that login's
+/// and names the limit no more, on that reading or after it, where it named it again and the limit
+/// waited to the old login's reset. A carried reset with no login between keeps it named.
+#[test]
+fn a_login_back_or_moved_drops_the_taps_reset_of_a_usage_limit() {
+    let t = t0();
+    let reset = t + 90 * MIN;
+    let armed = captured(AUTO_CONTINUE_ARMED, Some(reset), Duration::ZERO);
+    let cancelled = captured(AUTO_CONTINUE_CANCELLED, None, Duration::ZERO);
+    let carried = TurnEndReading {
+        reset_at: Some(reset),
+        ..cancelled.clone()
+    };
+    for (name, dropped) in [
+        (
+            "login back",
+            TurnEndReading {
+                login_back: true,
+                ..carried.clone()
+            },
+        ),
+        (
+            "login moved",
+            TurnEndReading {
+                login_moved: true,
+                ..carried.clone()
+            },
+        ),
+    ] {
+        let mut st = TurnEndState::default();
+        at(&mut st, &armed, t);
+        assert!(st.tracks_tapped_limit(), "{name}");
+        assert_eq!(
+            at(&mut st, &dropped, t + MIN),
+            typed(RULE_LIMIT_RESUME),
+            "{name}"
+        );
+        assert!(!st.waits_on_named_reset(), "{name}: dropped on its reading");
+        assert!(
+            !st.tracks_tapped_limit(),
+            "{name}: the tap names it no more"
+        );
+        at(&mut st, &carried, t + 2 * MIN);
+        assert!(!st.waits_on_named_reset(), "{name}: nor after it");
+    }
+    let mut st = TurnEndState::default();
+    at(&mut st, &armed, t);
+    at(&mut st, &carried, t + MIN);
+    assert!(
+        st.waits_on_named_reset() && st.tracks_tapped_limit(),
+        "the control"
+    );
 }
 
 #[test]
@@ -1141,7 +1210,11 @@ fn a_limit_the_vendor_continued_by_itself_gets_no_usage_resume() {
         "the continue policy's back-off: {a:?}"
     );
     for now in [reset + 10 * MIN, reset + 60 * MIN] {
-        assert_eq!(at(&mut st, &resumed, now), typed(RULE_CONTINUE), "{now:?}");
+        assert_eq!(
+            at(&mut st, &resumed, now),
+            continued_for(&st, now),
+            "{now:?}"
+        );
     }
     let held = SupervisorConfig {
         continue_policy: false,
@@ -1205,7 +1278,11 @@ fn a_bucket_the_vendor_continued_by_itself_gets_no_usage_resume() {
     );
     assert!(!st.waits_on_named_reset());
     for now in [reset + 10 * MIN, reset + 60 * MIN] {
-        assert_eq!(at(&mut st, &resumed, now), typed(RULE_CONTINUE), "{now:?}");
+        assert_eq!(
+            at(&mut st, &resumed, now),
+            continued_for(&st, now),
+            "{now:?}"
+        );
     }
     let chose: Vec<String> = screen(fx::WALL_SONNET_BUCKET_GENERIC_COUNTDOWN_MODEL_SET_2_1_302);
     let at_model = chose
@@ -1306,7 +1383,7 @@ fn the_vendors_own_continuation_delivers_the_check_a_limit_cut_again() {
             checked()
         };
         let (cut_reply, cut_want) = if mode == Autopilot::Land {
-            (DEFENSE, None)
+            (DEFENSE, Some(land_check_typed()))
         } else {
             // The cut check delivered by the vendor's continuation and answered: the next angle.
             (done, Some(checked_at_angle(1)))
@@ -2475,8 +2552,8 @@ fn a_limits_end_under_land_gets_lands_own_act_and_under_off_nothing() {
         "the wall's retry, once Land's instruction was given: one line"
     );
     now += 3 * MIN;
-    at(&mut st, &land(idle(DEFENSE, Some(3 * MIN))), now);
-    let a = decide_turn_end(&st, &land(idle(DEFENSE, None)), &cfg(), now + 60 * MIN);
+    let now = lands_on_check(&mut st, &land(idle(DEFENSE, Some(3 * MIN))), now);
+    let a = decide_turn_end(&st, &land(idle(LANDED_WORD, None)), &cfg(), now + 60 * MIN);
     if !st.landed() || a != TurnEndAction::Nothing {
         wrong.push(format!(
             "the retry's defense: landed {}, {a:?}",
@@ -4157,6 +4234,65 @@ fn agys_sign_in_menu_is_escalated_with_how_it_signs_in() {
     );
 }
 
+/// The first [`super::REASON_CELLS`] cells of an escalation's reason: what the person's badge keeps.
+fn badge_keeps(a: &TurnEndAction) -> String {
+    let TurnEndAction::Escalate { reason } = a else {
+        panic!("not an escalation: {a:?}");
+    };
+    reason
+        .chars()
+        .scan(0, |cells, c| {
+            *cells += aterm_grapheme::char_width(c);
+            (*cells <= super::REASON_CELLS).then_some(c)
+        })
+        .collect()
+}
+
+#[test]
+fn a_lost_logins_sign_in_step_is_never_cut_off_the_badge() {
+    use aterm_phase::agy::fixtures::lab;
+    use aterm_phase::muse::fixtures as u;
+    let t = t0();
+    let screen = aterm_phase::prompt::fixtures::screen;
+    let mut off = cfg();
+    off.retry_api_errors = false;
+    for (program, text) in [
+        ("agy", lab::ERROR_401),
+        ("agy", lab::ERROR_400_KEY),
+        ("muse", u::KEY_REJECTED),
+    ] {
+        let rows = screen(text);
+        let reading = aterm_phase::read(Some(program), &rows, None);
+        let r = TurnEndReading::of(&reading, &rows, false, Some(3 * MIN), None, None);
+        let how = super::sign_in_how(r.program, &r.wall_message);
+        for c in [cfg(), off.clone()] {
+            let mut st = TurnEndState::default();
+            st.observe(&r, t);
+            let a = decide_turn_end(&st, &r, &c, t);
+            let kept = badge_keeps(&a);
+            assert!(
+                kept.starts_with("the login is gone") && kept.contains(&how),
+                "{program} (retry_api_errors {}): the badge keeps {kept:?}, not {how:?}",
+                c.retry_api_errors
+            );
+        }
+    }
+    // The control: a wall whose words leave room keeps them first.
+    let r = read_screen(
+        &login_screen(&["⏺ Login expired · Please run /login"]),
+        Some(3 * MIN),
+    );
+    let mut st = TurnEndState::default();
+    st.observe(&r, t);
+    let a = decide_turn_end(&st, &r, &off, t);
+    let kept = badge_keeps(&a);
+    assert!(
+        kept.starts_with(&format!("the login is gone: {}", r.wall_message))
+            && kept.ends_with("(retry_api_errors is off; sign in with /login)"),
+        "the control: {a:?}"
+    );
+}
+
 #[test]
 fn agys_failed_turns_are_answered_by_their_wall() {
     use aterm_phase::agy::fixtures::lab;
@@ -4610,9 +4746,16 @@ fn the_rules_ride_in_the_continuation() {
             continuation_text(&cfg(), Some(rules)),
             done_check_text(Some(rules), false),
             done_check_text(Some(rules), true),
-            act_words(
+            // The check with every clause, as the loop fits it ([`words_act`]): the open work's
+            // names take the room the check, its reversible clause and NEEDS YOU's
+            // acknowledgment leave.
+            fitted_act(
                 &done_check_words(5),
-                &[&open, DONE_CHECK_REVERSIBLE, NEEDS_ACK],
+                &[
+                    Suffix::Open(OPEN_HEADS),
+                    Suffix::Fixed(DONE_CHECK_REVERSIBLE),
+                    Suffix::Fixed(NEEDS_ACK),
+                ],
                 Some(rules),
             ),
             act_words(
@@ -5075,6 +5218,7 @@ fn a_draft_over_an_open_menu_is_not_submitted() {
     let standing = TurnEndReading {
         composer: Composer::Diverted,
         person: Some(grace),
+        key: Some(grace),
         ..idle("Fixed the parser.", Some(JOB))
     };
     let mut st = TurnEndState::default();
@@ -5100,6 +5244,7 @@ fn a_draft_over_an_open_menu_is_not_submitted() {
     let typed_reading = TurnEndReading {
         composer: Composer::Typed,
         person: Some(grace),
+        key: Some(grace),
         ..idle("Fixed the parser.", Some(JOB))
     };
     let mut st = TurnEndState::default();
@@ -5313,6 +5458,7 @@ fn a_draft_over_a_selection_drawn_in_colour_only_is_what_enter_runs_measured() {
         let standing = TurnEndReading {
             composer,
             person: Some(grace),
+            key: Some(grace),
             ..idle("Fixed the parser.", Some(JOB))
         };
         assert_eq!(at(&mut st, &standing, t0()), act);
@@ -5588,6 +5734,7 @@ fn a_point_the_upgrade_owns_is_never_continued_at_the_grace_lapse() {
         let r = TurnEndReading {
             upgrading: owns,
             person: Some(ago),
+            key: Some(ago),
             ..idle("Nothing of mine is running.", Some(10 * MIN))
         };
         let mut st = TurnEndState::default();
@@ -5758,6 +5905,7 @@ fn a_persons_keystroke_holds_every_act_for_the_grace() {
     ] {
         let held = TurnEndReading {
             person: Some(ago),
+            key: Some(ago),
             ..r.clone()
         };
         let mut st = TurnEndState::default();
@@ -5765,6 +5913,7 @@ fn a_persons_keystroke_holds_every_act_for_the_grace() {
         assert!(waits_until(&a, now + grace - ago), "{r:?}: {a:?}");
         let old = TurnEndReading {
             person: Some(grace),
+            key: Some(grace),
             ..r.clone()
         };
         let mut st = TurnEndState::default();
@@ -6391,6 +6540,7 @@ fn a_persons_exchange_a_loop_left_stays_theirs_in_a_new_loop_and_a_relaunch() {
         let mut st = TurnEndState::default();
         let theirs = TurnEndReading {
             person: Some(Duration::from_secs(8)),
+            key: Some(Duration::from_secs(8)),
             ..idle(said, Some(Duration::from_secs(5)))
         };
         assert_eq!(at(&mut st, &theirs, now), TurnEndAction::Nothing, "{said}");
@@ -6450,6 +6600,7 @@ fn fresh_left(said: &str, now: Instant) -> TurnEndState {
     let mut st = TurnEndState::default();
     let theirs = TurnEndReading {
         person: Some(Duration::from_secs(8)),
+        key: Some(Duration::from_secs(8)),
         ..land(idle(said, Some(Duration::from_secs(5))))
     };
     assert_eq!(at(&mut st, &theirs, now), TurnEndAction::Nothing);
@@ -6499,6 +6650,7 @@ fn the_hosts_turn_after_a_persons_exchange_is_the_hosts() {
         now += 3 * MIN;
         let theirs = TurnEndReading {
             person: Some(quick + Duration::from_secs(3)),
+            key: Some(quick + Duration::from_secs(3)),
             ..idle(reply, Some(quick))
         };
         let a = at(&mut st, &theirs, now);
@@ -6522,6 +6674,7 @@ fn a_persons_own_exchange_is_left_to_them_whatever_it_says_under_land() {
     let quick = Some(Duration::from_secs(5));
     let theirs = |said: &str| TurnEndReading {
         person: Some(Duration::from_secs(8)),
+        key: Some(Duration::from_secs(8)),
         ..idle(said, quick)
     };
     for said in [
@@ -6541,6 +6694,7 @@ fn a_persons_own_exchange_is_left_to_them_whatever_it_says_under_land() {
         for later in [2 * MIN, 60 * MIN, 24 * 60 * MIN] {
             let r = TurnEndReading {
                 person: Some(later),
+                key: Some(later),
                 ..theirs(said)
             };
             let a = decide_turn_end(&st, &r, &cfg(), now + later);
@@ -6551,6 +6705,7 @@ fn a_persons_own_exchange_is_left_to_them_whatever_it_says_under_land() {
     let mut st = TurnEndState::default();
     let r = TurnEndReading {
         person: Some(long + Duration::from_secs(8)),
+        key: Some(long + Duration::from_secs(8)),
         ..idle("Keep the token: it costs nothing.", Some(long))
     };
     assert_eq!(at(&mut st, &r, now), TurnEndAction::Nothing);
@@ -6564,6 +6719,7 @@ fn a_persons_own_exchange_is_left_to_them_whatever_it_says_under_land() {
     let mut st = TurnEndState::default();
     let old = TurnEndReading {
         person: Some(5 * MIN),
+        key: Some(5 * MIN),
         ..idle(said, quick)
     };
     at(&mut st, &old, now);
@@ -6575,10 +6731,12 @@ fn a_persons_own_exchange_is_left_to_them_whatever_it_says_under_land() {
         },
         TurnEndReading {
             person: Some(Duration::from_secs(8)),
+            key: Some(Duration::from_secs(8)),
             ..walled(WallKind::Overloaded, "529", quick)
         },
         TurnEndReading {
             person: Some(JOB),
+            key: Some(JOB),
             ..idle("Added the flag; the parser is next.", Some(JOB))
         },
     ] {
@@ -6602,6 +6760,7 @@ fn a_check_in_on_a_carried_task_stays_on_the_ladder() {
     let quick = Some(Duration::from_secs(5));
     let check_in = TurnEndReading {
         person: Some(Duration::from_secs(8)),
+        key: Some(Duration::from_secs(8)),
         ..idle("Going well: stage 3 of 5 is next.", quick)
     };
     for _ in 0..2 {
@@ -6617,6 +6776,7 @@ fn a_check_in_on_a_carried_task_stays_on_the_ladder() {
     now += MIN;
     let thanks = TurnEndReading {
         person: Some(Duration::from_secs(8)),
+        key: Some(Duration::from_secs(8)),
         ..idle("You're welcome!", quick)
     };
     let mut left = st.clone();
@@ -6640,6 +6800,7 @@ fn a_check_in_on_a_carried_task_stays_on_the_ladder() {
     at(&mut st, &idle("Waiting on the build.", Some(10 * MIN)), now);
     let woke = TurnEndReading {
         person: Some(5 * MIN),
+        key: Some(5 * MIN),
         ..idle("The build passed.", quick)
     };
     at(&mut st, &woke, now + 6 * MIN);
@@ -6656,6 +6817,7 @@ fn a_task_never_passes_to_a_person_mid_session_under_land() {
     let quick = Some(Duration::from_secs(5));
     let theirs = |said: &str, worked: Option<Duration>| TurnEndReading {
         person: Some(worked.unwrap_or_default() + Duration::from_secs(3)),
+        key: Some(worked.unwrap_or_default() + Duration::from_secs(3)),
         ..idle(said, worked)
     };
     let carried = |now: Instant| {
@@ -6720,6 +6882,7 @@ fn a_turn_read_running_before_the_loop_is_a_persons_only_by_a_key_inside_it() {
         // Land's: Cruise leaves no exchange (owner ruling 2026-10-26).
         let r = TurnEndReading {
             person: Some(key),
+            key: Some(key),
             ..land(idle("Keep the token: it survives a restart.", worked))
         };
         at(&mut st, &r, now);
@@ -6744,6 +6907,7 @@ fn a_persons_exchange_on_a_wall_gets_its_retry_and_stays_theirs() {
     let quick = Some(Duration::from_secs(5));
     let r = TurnEndReading {
         person: Some(Duration::from_secs(8)),
+        key: Some(Duration::from_secs(8)),
         ..walled(WallKind::Overloaded, "529", quick)
     };
     at(&mut st, &r, now);
@@ -6751,6 +6915,7 @@ fn a_persons_exchange_on_a_wall_gets_its_retry_and_stays_theirs() {
     now += 10 * MIN;
     let retry = TurnEndReading {
         person: None,
+        key: None,
         worked: None,
         ..r
     };
@@ -6764,11 +6929,13 @@ fn a_persons_exchange_on_a_wall_gets_its_retry_and_stays_theirs() {
         let mut st = TurnEndState::default();
         let r = TurnEndReading {
             person: before,
+            key: before,
             ..walled(WallKind::Overloaded, "529", before)
         };
         at(&mut st, &r, now);
         let retry = TurnEndReading {
             person: None,
+            key: None,
             worked: None,
             ..r
         };
@@ -6790,6 +6957,7 @@ fn a_persons_exchange_at_a_wall_stays_theirs_in_a_new_loop() {
     let mut st = TurnEndState::default();
     let r = TurnEndReading {
         person: Some(Duration::from_secs(8)),
+        key: Some(Duration::from_secs(8)),
         ..walled(WallKind::Overloaded, "529", quick)
     };
     at(&mut st, &r, t0());
@@ -6797,6 +6965,7 @@ fn a_persons_exchange_at_a_wall_stays_theirs_in_a_new_loop() {
     let mut st = TurnEndState::default();
     let r = TurnEndReading {
         person: Some(JOB),
+        key: Some(JOB),
         ..walled(WallKind::Overloaded, "529", Some(JOB))
     };
     at(&mut st, &r, t0());
@@ -6810,6 +6979,7 @@ fn a_persons_exchange_at_a_wall_stays_theirs_in_a_new_loop() {
             let first = TurnEndReading {
                 left_record: row,
                 person: None,
+                key: None,
                 worked: None,
                 ..walled(WallKind::Overloaded, "529", None)
             };
@@ -8045,6 +8215,176 @@ fn a_cut_measured_down_stays_the_connections_outage_in_the_loop_that_follows() {
     );
 }
 
+/// A CODE-LESS SERVER ERROR MEASURED DOWN IS THE CONNECTION'S OUTAGE (v6 §14.17.5.2), as a cut
+/// measured down is: with no status nothing shows the request reached a server, and nothing gets
+/// through a route measured down (Claude Code's `/goal` echo read alone, its error row out of
+/// sight). It types nothing while the route reads Down, its blind rung long past, within the
+/// outage's one cap (the next test), and the edge up measured after the wall resumes it once with
+/// the measured line, the cap passed or not. Controls: read while the route
+/// is not measured down it is the API error, tried blind, and an Up after the wall clears nothing;
+/// a server error with a status (500, 429) and an overload stay blind on every route.
+#[test]
+fn a_code_less_server_error_measured_down_is_the_connections_outage() {
+    const ECHO: &str = "Goal still active · the API was unavailable or the connection dropped · \
+                        retrying in 5 min (2/3) · send a message to retry now";
+    let t = t0();
+    let code_less = WallKind::ApiError {
+        code: None,
+        retryable: true,
+        cause: ApiCause::Server,
+    };
+    assert_eq!(
+        outage_of(code_less, true, Program::Claude),
+        Some(Outage::Connection)
+    );
+    assert_eq!(
+        outage_of(code_less, false, Program::Claude),
+        Some(Outage::ApiError)
+    );
+    for code in [500, 429] {
+        let kind = WallKind::ApiError {
+            code: Some(code),
+            retryable: true,
+            cause: ApiCause::Server,
+        };
+        assert_eq!(
+            outage_of(kind, true, Program::Claude),
+            Some(Outage::ApiError),
+            "{code}: blind on every route"
+        );
+    }
+    assert_eq!(
+        outage_of(WallKind::Overloaded, true, Program::Claude),
+        Some(Outage::Overload)
+    );
+    let down = api_wall(
+        ApiCause::Server,
+        ECHO,
+        Some(3 * MIN),
+        Reach::Down { since: t },
+    );
+    let cap = TurnEndTiming::default().outage_cap;
+    let mut st = TurnEndState::default();
+    let (mut now, mut r) = (t, down.clone());
+    while now < t + cap {
+        let a = act(&mut st, &r, now);
+        assert!(
+            outage_waits(&a, t + cap, Outage::Connection, true),
+            "typed into a route measured down at {:?}: {a:?}",
+            now - t
+        );
+        r = again(&down);
+        now += 7 * MIN;
+    }
+    let edge = TurnEndReading {
+        reach: Reach::Up { since: now - MIN },
+        ..again(&down)
+    };
+    assert_eq!(
+        act(&mut st, &edge, now),
+        resumed(Outage::Connection, Clearing::Measured)
+    );
+    // CONTROL: read with the route up, it is the API error on its blind rung, whatever Up follows.
+    let up = TurnEndReading {
+        reach: Reach::Up { since: t },
+        ..down.clone()
+    };
+    let mut st = TurnEndState::default();
+    assert!(outage_waits(
+        &at(&mut st, &up, t),
+        t + 2 * MIN,
+        Outage::ApiError,
+        true
+    ));
+    let edge = TurnEndReading {
+        reach: Reach::Up { since: t + MIN },
+        ..again(&up)
+    };
+    assert!(outage_waits(
+        &act(&mut st, &edge, t + MIN),
+        t + 2 * MIN,
+        Outage::ApiError,
+        true
+    ));
+    assert_eq!(
+        act(&mut st, &again(&edge), t + 2 * MIN),
+        resumed(Outage::ApiError, Clearing::Blind)
+    );
+}
+
+/// A DOWN ONLY THE MEASURE MAKES A WALL'S OUTAGE HOLDS IT ONE CAP (v6 §14.17.5.2): a code-less
+/// server error is the connection's outage only by the host's measure, never by its own words (the
+/// `/goal` echo's reason covers a 529 too), so a Down holds its try as a measured outage holds a
+/// wall-less point's act ([`TurnEndTiming::outage_holds_until`]): until `outage_cap` has passed
+/// since the Down began, and then it is tried blind. A probe wrong about the route (a firewall
+/// that lets the agent through and not the probe) costs the session one cap, once per outage, not
+/// a stop for as long as the probe reads Down. Controls: a wall whose own words name the
+/// connection (an unreachable route, a cut measured down) waits out the same Down with no cap.
+#[test]
+fn a_code_less_server_error_measured_down_holds_its_try_one_cap() {
+    const ECHO: &str = "Goal still active · the API was unavailable or the connection dropped · \
+                        retrying in 5 min (2/3) · send a message to retry now";
+    let t = t0();
+    let cap = TurnEndTiming::default().outage_cap;
+    let down = api_wall(
+        ApiCause::Server,
+        ECHO,
+        Some(3 * MIN),
+        Reach::Down { since: t },
+    );
+    let mut st = TurnEndState::default();
+    assert!(outage_waits(
+        &act(&mut st, &down, t),
+        t + cap,
+        Outage::Connection,
+        true
+    ));
+    assert!(outage_waits(
+        &act(&mut st, &again(&down), t + cap - MIN),
+        t + cap,
+        Outage::Connection,
+        true
+    ));
+    assert_eq!(
+        act(&mut st, &again(&down), t + cap),
+        resumed(Outage::Connection, Clearing::Blind),
+        "past the cap the Down is no reason to hold it"
+    );
+    // Once per outage: a Down that began a cap before the wall holds nothing, and the wall is
+    // tried on its own blind rung.
+    let long = TurnEndReading {
+        reach: Reach::Down { since: t - cap },
+        ..down.clone()
+    };
+    let mut st = TurnEndState::default();
+    let first = TurnEndTiming::default().outage_first;
+    assert!(outage_waits(
+        &act(&mut st, &long, t),
+        t + first,
+        Outage::Connection,
+        true
+    ));
+    assert_eq!(
+        act(&mut st, &again(&long), t + first),
+        resumed(Outage::Connection, Clearing::Blind)
+    );
+    // CONTROL: a wall whose own words name the connection waits the Down out past the cap.
+    const SLEEP: &str = "API Error: Your computer went to sleep mid-response.";
+    for (cause, message) in [
+        (ApiCause::Unreachable, ENOTFOUND),
+        (ApiCause::CutOff, SLEEP),
+    ] {
+        let named = api_wall(cause, message, Some(3 * MIN), Reach::Down { since: t });
+        let mut st = TurnEndState::default();
+        act(&mut st, &named, t);
+        let a = act(&mut st, &again(&named), t + cap + MIN);
+        assert!(
+            outage_waits(&a, t + 2 * cap, Outage::Connection, false),
+            "{cause:?}: {a:?}"
+        );
+    }
+}
+
 /// A PERSON'S OWN TURN OF WORK ENDS AN OUTAGE'S LADDER (v6 §14.17.5.2: the ladder ends when the
 /// agent works again), as a try's answered work does: a new outage wall at that turn's end is tried
 /// two minutes from its own wall, never at once on the old ladder's rung.
@@ -8085,6 +8425,7 @@ fn a_persons_own_turn_of_work_at_an_outage_starts_its_ladder_anew() {
     let now = met + 21 * MIN;
     let theirs = TurnEndReading {
         person: Some(20 * MIN),
+        key: Some(20 * MIN),
         worked: Some(20 * MIN),
         ran_tools: true,
         ..wall.clone()
@@ -8524,6 +8865,11 @@ fn a_walls_act_never_types_the_screens_words() {
         WallKind::ApiError {
             code: None,
             retryable: true,
+            cause: ApiCause::Server,
+        },
+        WallKind::ApiError {
+            code: None,
+            retryable: true,
             cause: ApiCause::Unreachable,
         },
         WallKind::ApiError {
@@ -8592,9 +8938,12 @@ fn a_walls_act_never_types_the_screens_words() {
                         (first.clone(), now + 3 * MIN)
                     };
                 }
-                // A connection error measured down for all six hours is waited out in silence.
+                // A connection error measured down for all six hours is waited out in silence,
+                // where its own words name the connection; one only the measure makes the
+                // connection's (a code-less server error) is held one cap, then tried.
                 if matches!(reach, Reach::Down { .. })
                     && outage_of(kind, true, program) == Some(Outage::Connection)
+                    && outage_named(kind) == Some(Outage::Connection)
                 {
                     assert_eq!(acts, 0, "{case}: typed into a route measured down");
                 } else {
@@ -8804,6 +9153,7 @@ fn only_an_api_walls_wait_is_the_next_try() {
     assert!(!retry, "{w}");
     let typing = TurnEndReading {
         person: Some(Duration::ZERO),
+        key: Some(Duration::ZERO),
         ..walled(unreachable, "API Error", Some(3 * MIN))
     };
     let (w, retry) = wait(&at(&mut TurnEndState::default(), &typing, t));
@@ -10022,117 +10372,6 @@ fn a_worker_that_keeps_asking_waits_the_back_off_past_its_bound() {
 }
 
 #[test]
-fn a_worker_that_asks_the_same_again_is_answered_once_more_then_held_until_it_changes() {
-    use super::super::exception::{Exception, exception_for};
-    const ASKS: &str = "Does the parser have to keep the old syntax?";
-    const QUICK: Duration = Duration::from_secs(30);
-    let answered = |a: &TurnEndAction| matches!(a, TurnEndAction::Type { rule_id, .. } if is_answer_rule(rule_id));
-    let t = t0();
-    let mut st = TurnEndState::default();
-    st.set_managed(true);
-    assert!(answered(&act(&mut st, &idle(ASKS, None), t)));
-    st.took();
-    let a = act(&mut st, &idle(ASKS, Some(QUICK)), t + QUICK);
-    assert!(
-        answered(&a),
-        "the first same answer is answered once more: {a:?}"
-    );
-    st.took();
-    let r = idle(ASKS, Some(QUICK));
-    let a = act(&mut st, &r, t + 2 * QUICK);
-    assert_eq!(a, TurnEndAction::Nothing, "the second is held");
-    assert_eq!(
-        exception_for(&st, &r, &cfg(), t + 2 * QUICK),
-        Some(Exception::repeats(crate::harness::acts::HeldBy::SameReply)),
-        "the tab says so, and nothing escalates"
-    );
-    assert_eq!(
-        decide_turn_end(&st, &r, &cfg(), t + 30 * MIN),
-        TurnEndAction::Nothing
-    );
-    let other = idle("Should the parser warn on the old syntax?", None);
-    assert!(
-        answered(&act(&mut st, &other, t + 31 * MIN)),
-        "a different reply ends the hold"
-    );
-}
-
-#[test]
-fn a_restart_made_is_a_change_the_same_reply_is_answered_once_more() {
-    const SAME: &str = "Stage 3 of 5 is still open.";
-    const QUICK: Duration = Duration::from_secs(30);
-    let t = t0();
-    let typed = |a: &TurnEndAction| matches!(a, TurnEndAction::Type { .. });
-    let held = |restart: bool| {
-        let mut st = TurnEndState::default();
-        st.set_managed(true);
-        let mut now = t;
-        assert!(typed(&act(&mut st, &idle(SAME, Some(10 * MIN)), now)));
-        for _ in 0..2 {
-            st.took();
-            now += QUICK;
-            let r = idle(SAME, Some(QUICK));
-            let mut a = at(&mut st, &r, now);
-            if let TurnEndAction::WaitUntil { until, .. } = a {
-                now = until;
-                a = decide_turn_end(&st, &r, &cfg(), now);
-            }
-            st.acted(&a, &r, now);
-        }
-        let r = idle(SAME, None);
-        if restart {
-            st.restarted(&Restart::Memory, true, &r, now);
-        }
-        decide_turn_end(&st, &r, &cfg(), now + 60 * MIN)
-    };
-    assert_eq!(held(false), TurnEndAction::Nothing, "the same reply twice");
-    let after = held(true);
-    assert!(
-        typed(&after),
-        "a restart made lets one more act go: {after:?}"
-    );
-}
-
-#[test]
-fn a_program_whose_reader_reads_no_words_is_held_at_its_second_same_answer() {
-    const QUICK: Duration = Duration::from_secs(30);
-    let typed = |a: &TurnEndAction| matches!(a, TurnEndAction::Type { .. });
-    let wordless = |worked| TurnEndReading {
-        program: Program::Generic,
-        said_tail: None,
-        ..idle("", Some(worked))
-    };
-    let mut st = TurnEndState::default();
-    st.set_managed(true);
-    let mut now = t0();
-    assert!(
-        typed(&act(&mut st, &wordless(10 * MIN), now)),
-        "the act after the work"
-    );
-    let answer = |st: &mut TurnEndState, now: &mut Instant, worked| {
-        st.took();
-        *now += QUICK;
-        let r = wordless(worked);
-        let mut a = at(st, &r, *now);
-        if let TurnEndAction::WaitUntil { until, .. } = a {
-            *now = until;
-            a = decide_turn_end(st, &r, &cfg(), *now);
-        }
-        st.acted(&a, &r, *now);
-        a
-    };
-    let a = answer(&mut st, &mut now, QUICK);
-    assert!(
-        typed(&a),
-        "the first no-work answer is answered once more: {a:?}"
-    );
-    let a = answer(&mut st, &mut now, QUICK);
-    assert_eq!(a, TurnEndAction::Nothing, "the second is held");
-    let a = answer(&mut st, &mut now, 10 * MIN);
-    assert!(typed(&a), "the control: real work ends the hold: {a:?}");
-}
-
-#[test]
 fn claude_codes_measured_group_rows_are_a_tool_run() {
     // MEASURED 2026-10-09 on Claude Code 2.1.295: a turn whose one tool was a search, drawn as
     // the collapsed `Searched for` row (the anchor's only other screen is hand-built and wrapped).
@@ -10185,96 +10424,6 @@ fn claude_codes_measured_group_rows_are_a_tool_run() {
             "the control: the measured words above it"
         );
     }
-}
-
-#[test]
-fn a_short_turn_counts_its_earlier_words_and_a_tool_or_new_words_after_min_work_is_real_work() {
-    const FAILS: &str = "The build still fails: `parse_expr` is missing a lifetime.";
-    const RAN: Duration = Duration::from_secs(90);
-    let typed = |a: &TurnEndAction| matches!(a, TurnEndAction::Type { .. });
-    // The acts typed, each once the back-off is waited out, answering up to four answers in a row
-    // before one is held (and stays held an hour on).
-    let run_as = |program: aterm_phase::Program,
-                  said_before: &dyn Fn(u32) -> Option<String>,
-                  worked: Duration,
-                  tools: bool|
-     -> u32 {
-        let mut st = TurnEndState::default();
-        let mut now = t0();
-        let first = act(&mut st, &idle(FAILS, Some(10 * MIN)), now);
-        assert!(typed(&first), "{first:?}");
-        for k in 1..=4 {
-            st.took();
-            now += worked;
-            let r = TurnEndReading {
-                turn_said: said_before(k),
-                ran_tools: tools,
-                program,
-                ..idle(FAILS, Some(worked))
-            };
-            let mut a = at(&mut st, &r, now);
-            if let TurnEndAction::WaitUntil { until, .. } = a {
-                now = until;
-                a = decide_turn_end(&st, &r, &cfg(), now);
-            }
-            if !typed(&a) {
-                assert_eq!(a, TurnEndAction::Nothing);
-                assert_eq!(
-                    decide_turn_end(&st, &r, &cfg(), now + 60 * MIN),
-                    TurnEndAction::Nothing
-                );
-                return k - 1;
-            }
-            st.acted(&a, &r, now);
-        }
-        4
-    };
-    let run = |said_before: &dyn Fn(u32) -> Option<String>, worked: Duration, tools: bool| {
-        run_as(aterm_phase::Program::Claude, said_before, worked, tools)
-    };
-    let fix = |k: u32| {
-        [
-            "a named lifetime",
-            "an elided one",
-            "a 'static bound",
-            "a clone",
-        ][k as usize - 1]
-    };
-    assert_eq!(
-        run(&|k| Some(format!("Trying {}.", fix(k))), RAN, false),
-        4,
-        "earlier words that change are another reply"
-    );
-    assert_eq!(
-        run(&|k| Some(format!("Trying fix {k} of 4.")), RAN, false),
-        1,
-        "the control: a number is no word, so a count alone changes nothing"
-    );
-    assert_eq!(
-        run(&|_| Some("Rebuilding.".to_string()), RAN, false),
-        1,
-        "the same words, before and last, under min_work and no tool are the same reply"
-    );
-    assert_eq!(
-        run(&|_| Some("Rebuilding.".to_string()), RAN, true),
-        4,
-        "a turn that ran a tool did real work, however short"
-    );
-    assert_eq!(
-        run(&|_| None, MIN_WORK, false),
-        1,
-        "min_work's busy spell that ran no tool where tool rows are read is no work said again"
-    );
-    assert_eq!(
-        run(&|k| Some(format!("Trying {}.", fix(k))), MIN_WORK, false),
-        4,
-        "the control: min_work's busy spell in new words is work"
-    );
-    assert_eq!(
-        run_as(aterm_phase::Program::Generic, &|_| None, MIN_WORK, false),
-        4,
-        "the control: where no tool row is read, min_work's busy spell is work"
-    );
 }
 
 #[test]
@@ -11143,7 +11292,10 @@ fn open_work_reads_three_rounds_of_real_reports_as_labelled() {
 
 fn advised(r: &TurnEndReading, to: &str) -> TurnEndReading {
     TurnEndReading {
-        account: Some(AccountAdvice::Move { to: to.to_string() }),
+        account: Some(AccountAdvice::Move {
+            to: to.to_string(),
+            yields: None,
+        }),
         ..r.clone()
     }
 }
@@ -13245,11 +13397,13 @@ fn a_session_held_at_its_wall_waits_for_whatever_comes_first() {
         ahead: false,
         rotates: true,
         takes_canary: false,
+        yields: None,
     };
     assert_eq!(
         map(&moved, Some(now + 120), true),
         Some(AccountAdvice::Move {
-            to: "work-2".to_string()
+            to: "work-2".to_string(),
+            yields: None,
         })
     );
     assert_eq!(
@@ -13290,9 +13444,11 @@ fn a_session_held_at_its_wall_waits_for_whatever_comes_first() {
         ahead: true,
         rotates: true,
         takes_canary: false,
+        yields: None,
     };
     let to_two = AccountAdvice::Move {
         to: "work-2".to_string(),
+        yields: None,
     };
     assert_eq!(map(&Advice::Probe, None, false), probe(None));
     assert_eq!(
@@ -13445,6 +13601,7 @@ fn the_decider_reads_a_probe_as_its_otherwise_at_every_account_fixture() {
         None,
         Some(AccountAdvice::Move {
             to: "work-2".to_string(),
+            yields: None,
         }),
         Some(AccountAdvice::Wait { until: t + 5 * MIN }),
         Some(AccountAdvice::Wait {
@@ -13505,6 +13662,7 @@ fn the_decider_reads_a_probe_as_its_otherwise_at_every_account_fixture() {
 
     let move_to = Some(AccountAdvice::Move {
         to: "work-2".to_string(),
+        yields: None,
     });
     for (r, at) in [
         (session_wall(t), AccountAt::Wall),
@@ -13561,6 +13719,113 @@ fn a_turn_end_on_an_account_claimed_elsewhere_holds_its_continuation() {
     assert_eq!(decided(&advised_as(&r, breaker)), alone);
 }
 
+/// A junior's move ahead that its turn end does not make yields too (F19, §3.5.3): the roster
+/// advises the move the session yields its account by (`yields`), but its relaunch onto that row
+/// was refused within the hour, or the session has made its four moves in it, so the turn end
+/// holds what it would type until the yield's instant (at least a minute), as with no row to move
+/// to. Where the move can be made, the move is the act and its fallback is the continuation. A
+/// session whose own account no other Mac holds types its continuation past a move it cannot make.
+///
+/// NEGATIVE CONTROL: hold a yielding move only at the loop's fallback (`account_hold` passing the
+/// point's act), and the refused and capped junior type; hold it whatever the act, and the point's
+/// own move is held.
+#[test]
+fn a_juniors_move_ahead_its_turn_end_cannot_make_holds_its_continuation() {
+    let t = t0();
+    let now = t + MIN;
+    let r = idle("Added the flag.", Some(5 * MIN));
+    let moving = |yields: Option<Instant>| {
+        advised_as(
+            &r,
+            Some(AccountAdvice::Move {
+                to: "work-2".to_string(),
+                yields,
+            }),
+        )
+    };
+    let refused = || {
+        let mut st = TurnEndState::default();
+        let ahead = to_account("work-2", AccountAt::Ahead);
+        st.restart_unmade(&ahead, Some("refused:line"), &r, t);
+        st
+    };
+    let capped = || {
+        let mut st = TurnEndState::default();
+        st.seed_account_moves(&[MIN, 2 * MIN, 3 * MIN, 4 * MIN], now);
+        st
+    };
+    let yields = t + 5 * MIN;
+
+    let made = at(&mut TurnEndState::default(), &moving(Some(yields)), now);
+    assert!(
+        restarts(&made, &to_account("work-2", AccountAt::Ahead), RULE_ACCOUNT),
+        "{made:?}"
+    );
+    assert_eq!(otherwise_of(&made), &typed(RULE_CONTINUE));
+    for (why, st) in [("refused", refused()), ("capped", capped())] {
+        let held = at(&mut st.clone(), &moving(Some(yields)), now);
+        assert!(waits_until(&held, yields), "{why}: {held:?}");
+        let soon = at(&mut st.clone(), &moving(Some(now)), now);
+        assert!(waits_until(&soon, now + MIN), "{why}: {soon:?}");
+        let own = at(&mut st.clone(), &moving(None), now);
+        assert_eq!(own, typed(RULE_CONTINUE), "{why}");
+    }
+}
+
+/// A junior whose turn end owes an act the decider types ahead of a move (here a `/compact`'s
+/// continuation, `TurnEndState::after`) makes the move it yields its account by, that act its
+/// fallback: holding the act leaves it owed, so every point the hold's end decides again would
+/// owe it again and hold it, and no move would ever be asked while a row it may use sits free
+/// (F19, §3.5.3).
+///
+/// NEGATIVE CONTROL: hold the yielding move's act whatever the decider would ask (no move made at
+/// the hold), and the junior holds at the point and again at the hold's end; make the move
+/// whatever its latch, and the junior whose move was refused within the hour asks it again. A
+/// session whose own account no other Mac holds types the owed act as before.
+#[test]
+fn a_juniors_owed_act_makes_the_move_it_yields_its_account_by() {
+    let t = t0();
+    let now = t + MIN;
+    let r = idle("Added the flag.", Some(5 * MIN));
+    let moving = |yields: Option<Instant>| {
+        advised_as(
+            &r,
+            Some(AccountAdvice::Move {
+                to: "work-2".to_string(),
+                yields,
+            }),
+        )
+    };
+    let compact = TurnEndAction::TypeCommand {
+        command: "/compact".to_string(),
+        rule_id: RULE_COMPACT,
+        then: Then::Continue,
+    };
+    let owing = || {
+        let mut st = TurnEndState::default();
+        st.acted(&compact, &r, t);
+        st
+    };
+    let yields = now + 5 * MIN;
+    let owed = at(&mut owing(), &moving(None), now);
+    assert!(
+        matches!(&owed, TurnEndAction::Type { rule_id, .. } if *rule_id == RULE_COMPACT),
+        "{owed:?}"
+    );
+
+    let ahead = to_account("work-2", AccountAt::Ahead);
+    for (when, until) in [("the point", now), ("the hold's end", yields)] {
+        let made = at(&mut owing(), &moving(Some(until + 5 * MIN)), until);
+        assert!(restarts(&made, &ahead, RULE_ACCOUNT), "{when}: {made:?}");
+        assert_eq!(otherwise_of(&made), &owed, "{when}");
+    }
+
+    let mut refused = owing();
+    refused.restart_unmade(&ahead, Some("refused:line"), &r, t);
+    let held = at(&mut refused, &moving(Some(yields)), now);
+    assert!(waits_until(&held, yields), "{held:?}");
+}
+
 #[test]
 fn the_probes_gate_is_true_at_a_plain_idle_point_and_false_with_any_condition_flipped() {
     let t = t0();
@@ -13587,6 +13852,7 @@ fn the_probes_gate_is_true_at_a_plain_idle_point_and_false_with_any_condition_fl
         &base,
         Some(AccountAdvice::Move {
             to: "work-2".to_string(),
+            yields: None,
         }),
     );
     assert!(gate(&seen(&behind), &behind, &cfg()));
@@ -13608,6 +13874,7 @@ fn the_probes_gate_is_true_at_a_plain_idle_point_and_false_with_any_condition_fl
             with(&|r| {
                 r.account = Some(AccountAdvice::Move {
                     to: "work-2".to_string(),
+                    yields: None,
                 });
             }),
         ),
@@ -13767,6 +14034,7 @@ fn the_probes_gate_is_true_at_a_plain_idle_point_and_false_with_any_condition_fl
     done.observe(
         &land(TurnEndReading {
             person: Some(Duration::from_secs(8)),
+            key: Some(Duration::from_secs(8)),
             ..idle(
                 "Hi! What would you like me to work on?",
                 Some(Duration::from_secs(5)),
@@ -14623,6 +14891,15 @@ fn land(r: TurnEndReading) -> TurnEndReading {
     under(Autopilot::Land, r)
 }
 
+/// `r` with its word set by the person (meta `autopilot_by=human:…`): only their own switch to
+/// Land over a held tab asks (v6 §14.17 item 3).
+fn by_person(r: TurnEndReading) -> TurnEndReading {
+    TurnEndReading {
+        autopilot_by_person: true,
+        ..r
+    }
+}
+
 fn land_instruction() -> TurnEndAction {
     TurnEndAction::Type {
         text: LAND.to_string(),
@@ -14648,18 +14925,86 @@ const DEFENSE: &str = "Merged the parser and the lexer and pushed main.\nNothing
                        branch is merged into the remote main branch and pushed, the worktrees \
                        are removed, and the suites pass on main.";
 
+/// The land check's one landing answer.
+const LANDED_WORD: &str = super::land_check::LANDED;
+
+/// THE LAND CHECK as Land types it with no ack and no standing rules (`land-check@v1`).
+fn land_check_typed() -> TurnEndAction {
+    TurnEndAction::Type {
+        text: LAND_CHECK.to_string(),
+        rule_id: RULE_LAND_CHECK,
+    }
+}
+
+/// `r`'s point answered `said` a short turn later (no work: the check's own answer).
+fn answering(r: &TurnEndReading, said: &str) -> TurnEndReading {
+    TurnEndReading {
+        phase: Phase::Idle,
+        said_tail: Some(said.to_string()),
+        said_cut: false,
+        worked: Some(Duration::from_secs(10)),
+        ran_tools: false,
+        person: None,
+        ..r.clone()
+    }
+}
+
+/// THE CHECK `a` TYPED AT A DEFENSE'S YIELD (decided on `r` at `now`), then answered `said` a
+/// minute later: the decision at that answer, and its time.
+fn check_answered(
+    st: &mut TurnEndState,
+    r: &TurnEndReading,
+    a: &TurnEndAction,
+    now: Instant,
+    said: &str,
+) -> (TurnEndAction, Instant) {
+    assert_eq!(
+        a.rule_id(),
+        Some(RULE_LAND_CHECK),
+        "the land check at the defense's yield: {a:?}"
+    );
+    st.acted(a, r, now);
+    let then = now + MIN;
+    (at(st, &answering(r, said), then), then)
+}
+
+/// A DEFENSE AT LAND'S YIELD (`r` at `now`) gets the land check, whose `LANDED` lands the task:
+/// the time of that answer. A wait first (a person typing, the back-off) is waited out on the same
+/// point read again, the person's keys as old as the wait made them.
+fn lands_on_check(st: &mut TurnEndState, r: &TurnEndReading, now: Instant) -> Instant {
+    let start = now;
+    let mut now = now;
+    let mut a = at(st, r, now);
+    let mut same = r.clone();
+    for _ in 0..10 {
+        let TurnEndAction::WaitUntil { until, .. } = a else {
+            break;
+        };
+        now = until;
+        same = TurnEndReading {
+            worked: None,
+            person: r.person.map(|ago| ago + (now - start)),
+            ..r.clone()
+        };
+        a = at(st, &same, now);
+    }
+    assert!(
+        !st.landed(),
+        "a defense lands nothing: the check decides: {st:?}"
+    );
+    let (b, then) = check_answered(st, &same, &a, now, LANDED_WORD);
+    assert_eq!(b, TurnEndAction::Nothing, "LANDED: {st:?}");
+    assert!(st.landed() && st.task_done(), "{st:?}");
+    then
+}
+
 fn landed_at(t: Instant) -> (TurnEndState, Instant) {
     let mut st = TurnEndState::default();
     assert_eq!(
         act(&mut st, &land(idle("Stage 1 landed.", Some(3 * MIN))), t),
         land_instruction()
     );
-    let now = t + 3 * MIN;
-    assert_eq!(
-        at(&mut st, &land(idle(DEFENSE, Some(3 * MIN))), now),
-        TurnEndAction::Nothing
-    );
-    assert!(st.landed() && st.task_done(), "{st:?}");
+    let now = lands_on_check(&mut st, &land(idle(DEFENSE, Some(3 * MIN))), t + 3 * MIN);
     (st, now)
 }
 
@@ -14788,12 +15133,12 @@ fn land_types_the_instruction_then_nudges_without_bound() {
 }
 
 #[test]
-fn land_lands_only_on_a_clean_defense() {
+fn land_lands_only_on_its_checks_landed() {
     let (mut st, now) = landed_at(t0());
     assert_eq!(st.face(), TaskFace::Landed);
     for later in [2 * MIN, 60 * MIN, 24 * 60 * MIN] {
         assert_eq!(
-            at(&mut st, &land(idle(DEFENSE, None)), now + later),
+            at(&mut st, &land(idle(LANDED_WORD, None)), now + later),
             TurnEndAction::Nothing,
             "{later:?}"
         );
@@ -14802,20 +15147,25 @@ fn land_lands_only_on_a_clean_defense() {
     let mut st = TurnEndState::default();
     act(&mut st, &land(idle("Stage 1 landed.", Some(3 * MIN))), t0());
     let nothing = format!("{DEFENSE}\nNEEDS YOU: nothing");
-    assert_eq!(
-        at(
-            &mut st,
-            &land(idle(&nothing, Some(3 * MIN))),
-            t0() + 3 * MIN
-        ),
-        TurnEndAction::Nothing
+    lands_on_check(
+        &mut st,
+        &land(idle(&nothing, Some(3 * MIN))),
+        t0() + 3 * MIN,
     );
     assert!(st.landed() && st.standing_needs().is_empty());
-    for reply in [
-        "All done. Nothing left to do.",
-        FINISHED_REPORT,
-        &format!("{DEFENSE}\nNEEDS YOU: the signing credential"),
-    ] {
+    let mut st = TurnEndState::default();
+    act(&mut st, &land(idle("Stage 1 landed.", Some(3 * MIN))), t0());
+    let need = format!("{DEFENSE}\nNEEDS YOU: the signing credential");
+    assert_eq!(
+        at(&mut st, &land(idle(&need, Some(3 * MIN))), t0() + 3 * MIN),
+        TurnEndAction::Type {
+            text: land_check::land_check_text(None, true, None),
+            rule_id: RULE_LAND_CHECK,
+        },
+        "a need never bars the check: it carries the ack"
+    );
+    assert!(!st.landed() && !st.task_done());
+    for reply in ["All done. Nothing left to do.", FINISHED_REPORT] {
         let mut st = TurnEndState::default();
         act(&mut st, &land(idle("Stage 1 landed.", Some(3 * MIN))), t0());
         let (a, _) = past_backoff(&mut st, &land(idle(reply, Some(3 * MIN))), t0() + 3 * MIN);
@@ -14830,8 +15180,11 @@ fn land_lands_only_on_a_clean_defense() {
     assert!(!st.landed());
 }
 
+/// A DEFENSE THE READER READS OPEN gets the land check at once, hinted with its first open clause
+/// (§14.17 item 5): the reader picks the quote and decides nothing, and its words are never
+/// Land's nudge suffix (main's arm: the nudge naming them after the back-off).
 #[test]
-fn a_defense_naming_unlanded_work_is_nudged_with_the_suffix() {
+fn a_defense_naming_unlanded_work_gets_the_hinted_check() {
     let blocked = "Merged the parser.\nStill open: the release tag (blocked on the owner's \
                    credential).\nNothing left: everything else is on remote main.";
     for reply in [
@@ -14843,16 +15196,24 @@ fn a_defense_naming_unlanded_work_is_nudged_with_the_suffix() {
         assert!(!clean_defense(Some(reply)), "{reply}");
         let open = land_open_words(Some(reply));
         let suffix = open_work_suffix(&open).unwrap_or_else(|| panic!("{reply}"));
+        let hint = land_check::hint_clause(reply).unwrap_or_else(|| panic!("{reply}"));
         let mut st = TurnEndState::default();
         act(&mut st, &land(idle("Stage 1 landed.", Some(3 * MIN))), t0());
-        let (a, _) = past_backoff(&mut st, &land(idle(reply, Some(3 * MIN))), t0() + 3 * MIN);
+        let a = at(&mut st, &land(idle(reply, Some(3 * MIN))), t0() + 3 * MIN);
         assert_eq!(
             a,
             TurnEndAction::Type {
-                text: act_words(LAND_NUDGE, &[&suffix], None),
-                rule_id: RULE_LAND_NUDGE,
+                text: land_check::land_check_text(Some(&hint), false, None),
+                rule_id: RULE_LAND_CHECK,
             },
             "{reply}"
+        );
+        let TurnEndAction::Type { text, .. } = &a else {
+            unreachable!()
+        };
+        assert!(
+            text.contains(land_check::LAND_CHECK_HINT_OPEN) && !text.contains(&suffix),
+            "{text}"
         );
         assert!(!st.landed(), "{reply}");
     }
@@ -14996,7 +15357,13 @@ fn land_lands_nothing_over_repo_work() {
         assert_eq!(
             a,
             TurnEndAction::Type {
-                text: act_words(LAND_NUDGE, &[&repo_work_suffix(&repo)], None),
+                text: land_contradicted(
+                    &crate::harness::repo_work::RepoRead::Found(repo.clone()),
+                    None,
+                    &[],
+                    None
+                )
+                .expect("git's leg"),
                 rule_id: RULE_LAND_NUDGE,
             },
             "{repo:?}"
@@ -15007,10 +15374,7 @@ fn land_lands_nothing_over_repo_work() {
         now = then;
     }
     now += 3 * MIN;
-    assert_eq!(
-        at(&mut st, &land(idle(DEFENSE, Some(3 * MIN))), now),
-        TurnEndAction::Nothing
-    );
+    lands_on_check(&mut st, &land(idle(DEFENSE, Some(3 * MIN))), now);
     assert!(st.landed() && st.task_done());
     let (st, _) = landed_at(t0());
     assert!(st.landed());
@@ -15087,7 +15451,7 @@ fn a_starved_repository_probe_never_ends_land() {
         "pushed, the probe finished and named its HEAD: {:?}",
         r.repo
     );
-    assert_eq!(at(&mut st, &r, now), TurnEndAction::Nothing);
+    lands_on_check(&mut st, &r, now);
     assert!(st.landed() && st.task_done());
 }
 
@@ -15107,6 +15471,7 @@ fn a_checked_reading_decides_as_clean() {
             head: "3f9a1c2e4b7d".repeat(4)[..40].to_string(),
             main_ref: if remote { "origin/main" } else { "" }.to_string(),
             remote,
+            branch: "main".to_string(),
         })
     };
     let land_yield = |repo: RepoRead| {
@@ -15119,7 +15484,8 @@ fn a_checked_reading_decides_as_clean() {
             repo,
             ..idle(DEFENSE, Some(3 * MIN))
         });
-        let (a, _) = past_backoff(&mut st, &r, t0() + 3 * MIN);
+        let a = at(&mut st, &r, t0() + 3 * MIN);
+        let (a, _) = check_answered(&mut st, &r, &a, t0() + 3 * MIN, LANDED_WORD);
         (a, st.landed(), st.task_done(), st.face(), st.land_held())
     };
     let cruise_claim = |repo: RepoRead| {
@@ -15151,85 +15517,31 @@ fn a_checked_reading_decides_as_clean() {
     }
 }
 
+/// A NEED THE TURN RETRACTED IS NO BLOCKED REPLY (the second review, 2026-11-01): a reply whose
+/// earlier message named a need its last word took back (`NEEDS YOU: nothing`) says the agent
+/// waits on no person, so the same words again are not held as one blocked on a person
+/// ([`blocked_reply`] reads [`TurnEndReading::names_need`]). CONTROL: the need unretracted is a
+/// blocked reply. Negative control: `blocked_reply` reading each message's needs on its own (12a's
+/// first reader) reads the retracted need.
 #[test]
-fn a_need_gets_the_act_and_its_ack_never_an_escalation() {
-    let acked = |base: &str, rule: &'static str| TurnEndAction::Type {
-        text: act_words(base, &[NEEDS_ACK], None),
-        rule_id: rule,
-    };
-    let need = "Fixed the parser; the lexer is next.\nNEEDS YOU: the signing credential";
-    let mut now = t0();
-    let mut st = TurnEndState::default();
-    act(&mut st, &idle("Stage 1 landed.", Some(3 * MIN)), now);
-    now += 3 * MIN;
-    let r = idle(need, Some(3 * MIN));
-    let a = at_under(&mut st, &r, now, &no_answers());
-    assert_eq!(a, acked(&cfg().continue_text, RULE_CONTINUE));
-    assert_eq!(st.standing_needs(), ["the signing credential"]);
-    assert!(st.needs_ack_owed());
-    let key = st.needs_key();
-    assert_ne!(key, 0);
-    st.acted(&a, &r, now);
-    assert!(!st.needs_ack_owed());
-    now += 3 * MIN;
-    assert_eq!(
-        act(&mut st, &idle(need, Some(3 * MIN)), now),
-        typed(RULE_CONTINUE)
-    );
-    assert_eq!(st.needs_key(), key);
-    now += 3 * MIN;
-    let r = TurnEndReading {
-        composer: Composer::Placeholder("keep going".to_string()),
-        ..idle(
-            "Fixed the lexer.\nNEEDS YOU: a decision on the schema",
-            Some(3 * MIN),
-        )
-    };
-    let a = at(&mut st, &r, now);
-    assert_eq!(a, acked(&cfg().continue_text, RULE_CONTINUE));
-    assert_ne!(st.needs_key(), key);
-    st.acted(&a, &r, now);
-    now += 3 * MIN;
-    let r = TurnEndReading {
-        composer: Composer::Placeholder("keep going".to_string()),
-        ..idle(
-            "Fixed the docs.\nNEEDS YOU: a decision on the schema",
-            Some(3 * MIN),
-        )
-    };
-    assert_eq!(at(&mut st, &r, now), typed(RULE_CONTINUE));
-    let mut st = TurnEndState::default();
-    let r = idle(
-        "Fixed the parser.\nNEEDS YOU: approval to force-push main",
-        Some(3 * MIN),
-    );
-    assert_eq!(
-        at(&mut st, &r, t0()),
-        TurnEndAction::Type {
-            text: act_words(
-                &cfg().continue_text,
-                &[DONE_CHECK_REVERSIBLE, NEEDS_ACK],
-                None
-            ),
-            rule_id: RULE_CONTINUE,
-        }
-    );
-    let mut st = TurnEndState::default();
-    let r = idle(
-        "All done.\nNEEDS YOU: the signing credential",
-        Some(3 * MIN),
-    );
-    let (a, _) = past_backoff(&mut st, &r, t0());
-    assert_eq!(a, acked(&done_check_words(0), RULE_DONE_CHECK));
-    let mut st = TurnEndState::default();
-    act(&mut st, &land(idle("Stage 1 landed.", Some(3 * MIN))), t0());
-    let r = land(idle(
-        &format!("{DEFENSE}\nNEEDS YOU: the signing credential"),
-        Some(3 * MIN),
-    ));
-    let (a, _) = past_backoff(&mut st, &r, t0() + 3 * MIN);
-    assert_eq!(a, acked(LAND_NUDGE, RULE_LAND_NUDGE));
-    assert!(!st.landed());
+fn a_need_the_turn_retracted_is_no_blocked_reply() {
+    for (last, blocked) in [
+        (
+            "The flake was mine: fixed it and pushed. NEEDS YOU: nothing",
+            false,
+        ),
+        (
+            "The flake is not mine; the suite still fails on main.",
+            true,
+        ),
+    ] {
+        let r = TurnEndReading {
+            turn_said: Some("NEEDS YOU: decide whether to delete tests/test_clock.sh.".into()),
+            ..idle(last, Some(Duration::from_secs(40)))
+        };
+        assert_eq!(r.names_need(), blocked, "{last}");
+        assert_eq!(blocked_reply(&r), blocked, "{last}");
+    }
 }
 
 #[test]
@@ -15268,6 +15580,7 @@ fn the_standing_needs_clear_on_nothing_someone_elses_turn_or_off() {
         &mut st,
         &TurnEndReading {
             person: Some(5 * MIN),
+            key: Some(5 * MIN),
             ..idle("Answered the question about the lexer.", Some(5 * MIN))
         },
         now + 10 * MIN,
@@ -15331,36 +15644,6 @@ fn a_landed_task_switched_to_cruise_reopens() {
 }
 
 #[test]
-fn the_land_texts_carry_the_heads_and_the_rules() {
-    let mark = crate::harness::upgrade::HARNESS_MARK;
-    assert!(LAND.starts_with(mark) && LAND_NUDGE.starts_with(mark));
-    assert!(!LAND_ANSWER.starts_with(mark));
-    for text in [LAND, LAND_NUDGE] {
-        assert!(text.contains(needs::NEEDS_YOU), "{text}");
-        assert!(text.trim_end().ends_with(needs::NOTHING_LEFT), "{text}");
-        assert!(!text.contains(FINISHED), "{text}");
-    }
-    for (text, built) in [
-        (LAND, land_text(Some("never push to main"))),
-        (LAND_NUDGE, land_nudge_text(Some("never push to main"))),
-        (LAND_ANSWER, land_answer_text(Some("never push to main"))),
-    ] {
-        assert_eq!(
-            built,
-            format!("{text} (standing rules: never push to main)")
-        );
-    }
-    assert_eq!(
-        (RULE_LAND, RULE_LAND_NUDGE, RULE_LAND_ANSWER),
-        ("land@v1", "land-nudge@v1", "land-answer@v1")
-    );
-    for rule in [RULE_LAND, RULE_LAND_NUDGE, RULE_LAND_ANSWER] {
-        assert!(is_land_rule(rule) && is_continue_rule(rule), "{rule}");
-    }
-    assert!(!is_land_rule(RULE_CONTINUE) && !is_land_rule(RULE_DONE_CHECK));
-}
-
-#[test]
 fn a_turn_of_someone_elses_keeps_the_land_episode() {
     let progress = "Committing the parser now; the lexer is next.";
     let mut now = t0();
@@ -15401,7 +15684,7 @@ fn a_done_report_under_land_gets_the_instruction_not_the_check() {
         assert_eq!(a, land_nudged(), "{said}");
         assert!(!st.task_done(), "{said}");
         st.acted(&a, &r, then);
-        at(
+        lands_on_check(
             &mut st,
             &land(idle(DEFENSE, Some(Duration::from_secs(4)))),
             then + MIN,
@@ -15483,7 +15766,7 @@ fn a_question_under_land_gets_the_land_answer() {
     );
     assert_eq!(st.land_episode(), (true, 0), "an answer is no nudge");
     t += MIN;
-    at(&mut st, &land(idle(DEFENSE, Some(MIN))), t);
+    lands_on_check(&mut st, &land(idle(DEFENSE, Some(MIN))), t);
     assert!(st.task_done() && st.landed());
 }
 
@@ -15534,10 +15817,10 @@ fn leaving_land_forgets_the_episode_and_a_landed_task_goes_on_under_cruise() {
         "a new episode"
     );
     now += 3 * MIN;
-    at(&mut st, &land(idle(DEFENSE, Some(3 * MIN))), now);
+    now = lands_on_check(&mut st, &land(idle(DEFENSE, Some(3 * MIN))), now);
     assert!(st.task_done() && st.landed());
     now += 10 * MIN;
-    let a = at(&mut st, &idle(DEFENSE, None), now);
+    let a = at(&mut st, &idle(LANDED_WORD, None), now);
     assert_eq!(a.rule_id(), Some(RULE_DONE_CHECK), "{a:?}");
     assert!(!st.task_done() && st.land_episode() == (false, 0));
 }
@@ -15574,12 +15857,12 @@ fn leaving_land_for_an_off_park_types_the_instruction_again() {
     let mut st = TurnEndState::default();
     act(&mut st, &land(idle("Stage 1 landed.", Some(3 * MIN))), now);
     now += 3 * MIN;
-    at(&mut st, &land(idle(DEFENSE, Some(3 * MIN))), now);
+    now = lands_on_check(&mut st, &land(idle(DEFENSE, Some(3 * MIN))), now);
     assert!(st.landed());
     st.park_off();
     now += MIN;
     assert_eq!(
-        at(&mut st, &land(idle(DEFENSE, None)), now),
+        at(&mut st, &land(idle(LANDED_WORD, None)), now),
         TurnEndAction::Nothing
     );
     assert!(st.task_done() && st.landed());
@@ -15592,6 +15875,7 @@ fn a_persons_own_exchange_is_theirs_under_land_and_off() {
     let said = "Hi! What would you like me to work on?";
     let theirs = TurnEndReading {
         person: Some(Duration::from_secs(8)),
+        key: Some(Duration::from_secs(8)),
         ..idle(said, quick)
     };
     for mode in [Autopilot::Land, Autopilot::Off] {
@@ -15608,6 +15892,7 @@ fn a_persons_own_exchange_is_theirs_under_land_and_off() {
                 mode,
                 TurnEndReading {
                     person: Some(later),
+                    key: Some(later),
                     ..theirs.clone()
                 },
             );
@@ -15631,19 +15916,21 @@ fn a_persons_own_exchange_is_theirs_under_land_and_off() {
 /// under a loop before it ([`TurnEndState::seed_worked`]), interrupts that work, and Land carries
 /// it on after the reply. Measured: a worker spawned on a landing task, asked mid-job "are you
 /// working on anything?", was left quiet with its work unlanded. Off still leaves it.
-/// NEGATIVE CONTROLS: with `Autopilot::Land => true` in `observe`'s `(None, Some(d))` arm, Land
-/// leaves every reply and the test fails; with `first_point` out of it, the one after this loop's
-/// point; with `seeded_point.is_none()` out of it, the one after a point a loop before seeded;
-/// with `!self.worked_before` out of it, the one after a loop before that worked; with
-/// `!resuming` out of `observe`'s fresh mark, the one after this loop's own relaunch; with
-/// `self.opened_fresh = false` out of `restarted`, the one after a banner read mid-relaunch.
-/// With `self.resumed = None` out of `new_point`, a fresh program's after a relaunch and a point
-/// is carried; so is one at `RESUME_DRAWN` past the relaunch with that bound out of `resuming`.
+/// NEGATIVE CONTROLS: with `Autopilot::Land => true` in `TurnEndState::mode_leaves_exchange`, Land
+/// leaves every reply and the test fails; with `first_point` out of `observe`'s `(None, Some(d))`
+/// arm, the one after this loop's point; with `seeded_point.is_none()` out of it, the one after a
+/// point a loop before seeded; with `!self.worked_before` out of it, the one after a loop before
+/// that worked; with `!resuming` out of `observe`'s fresh mark, the one after this loop's own
+/// relaunch; with `self.opened_fresh = false` out of `restarted`, the one after a banner read
+/// mid-relaunch. With `self.resumed = None` out of `new_point`, a fresh program's after a
+/// relaunch and a point is carried; so is one at `RESUME_DRAWN` past the relaunch with that bound
+/// out of `resuming`.
 #[test]
 fn under_land_a_persons_message_mid_job_does_not_park_the_work() {
     let quick = Some(Duration::from_secs(5));
     let asked = TurnEndReading {
         person: Some(Duration::from_secs(8)),
+        key: Some(Duration::from_secs(8)),
         ..idle(
             "Nothing is running now; the branch is pushed and waits on its gate.",
             quick,
@@ -15651,6 +15938,7 @@ fn under_land_a_persons_message_mid_job_does_not_park_the_work() {
     };
     let later = |r: &TurnEndReading, ago: Duration| TurnEndReading {
         person: Some(ago),
+        key: Some(ago),
         ..r.clone()
     };
     let work = idle(
@@ -15824,14 +16112,176 @@ fn under_land_a_persons_message_mid_job_does_not_park_the_work() {
     }
 }
 
+/// LAND TAKES BACK AN EXCHANGE OFF LEFT AFTER WORK (owner ruling 2026-10-27): a person's message
+/// mid-job answered while the session was Off is left to them and parks; once the word is Land
+/// again, the point judged again (no work since, no record read: the loop's rejudge after
+/// UNPARKED) is a turn end like any other, and Land carries the work on. Before the fix the
+/// exchange Off judged outlived the switch, so Land rested on it (`left_to_person`).
+/// NEGATIVE CONTROLS: the session's opening message, judged under Off, stays the person's under
+/// Land, and Off judging the point again keeps it left: with `TurnEndState::mode_takes_exchange`
+/// reading `reading.autopilot == Autopilot::Off` for its `mode_leaves_exchange`, Land carries
+/// the opening message too and the test fails.
+#[test]
+fn land_takes_back_an_exchange_off_left_after_work() {
+    let quick = Some(Duration::from_secs(5));
+    let asked = TurnEndReading {
+        person: Some(Duration::from_secs(8)),
+        key: Some(Duration::from_secs(8)),
+        ..idle(
+            "Nothing is running now; the branch is pushed and waits on its gate.",
+            quick,
+        )
+    };
+    let again = |mode: Autopilot| {
+        under(
+            mode,
+            TurnEndReading {
+                person: Some(2 * MIN),
+                key: Some(2 * MIN),
+                worked: None,
+                ..asked.clone()
+            },
+        )
+    };
+    let work = idle(
+        "The fix is committed and verified; it waits on the gate.",
+        Some(20 * MIN),
+    );
+    for mode in [Autopilot::Land, Autopilot::Off] {
+        // The session worked under Land; the reply to the person's message was judged under Off.
+        let now = t0();
+        let mut st = TurnEndState::default();
+        at(&mut st, &land(work.clone()), now);
+        let asked_at = now + 20 * MIN;
+        at(&mut st, &under(Autopilot::Off, asked.clone()), asked_at);
+        assert!(st.left_to_person(), "{mode:?}: Off leaves it");
+        assert!(!st.exchange_opens(), "{mode:?}: a message after work");
+        st.park_off();
+        assert!(!st.reads_record(&again(mode)), "{mode:?}: no record read");
+        let a = at(&mut st, &again(mode), asked_at + 2 * MIN);
+        match mode {
+            Autopilot::Land => {
+                assert!(!st.left_to_person(), "Land takes it back");
+                assert!(a == land_instruction() || a == land_nudged(), "{a:?}");
+            }
+            Autopilot::Cruise | Autopilot::Off => {
+                assert!(st.left_to_person(), "Off keeps it");
+                assert_eq!(a, TurnEndAction::Nothing);
+            }
+        }
+        // The session's opening message, judged under Off, stays the person's.
+        let mut st = TurnEndState::default();
+        at(&mut st, &under(Autopilot::Off, asked.clone()), now);
+        assert!(
+            st.left_to_person() && st.exchange_opens(),
+            "{mode:?}: opening"
+        );
+        st.park_off();
+        let a = at(&mut st, &again(mode), now + 2 * MIN);
+        assert!(st.left_to_person(), "{mode:?}: the opening message");
+        assert_eq!(a, TurnEndAction::Nothing, "{mode:?}: the opening message");
+    }
+}
+
+/// LAND CARRIES AN EXCHANGE OFF LEFT AFTER WORK WHEN ITS RECORD IS READ AGAIN (owner ruling
+/// 2026-10-27): the loop's own `LEFT` row for the reply Off left is read at the same turn once
+/// the word is Land, where the turn it names is still that exchange's: the answer to the retry
+/// Land typed at its wall (the row's key, kept through the retry by `approvals::left_after_typed`,
+/// names the turn the retry opened), or a relaunch's start-up. That row came after work, as a
+/// loop before this one's would (`TurnEndState::seed_left_after_work`), and the work goes on.
+/// Before the fix the row put the exchange back on the person as the session's opening message,
+/// and Land rested on it.
+/// NEGATIVE CONTROL: the session's opening message, left under Off the same ways, stays theirs
+/// under Land: with every exchange left counted as after work (`self.left_after_work = true` in
+/// `TurnEndState::observe`'s `(None, Some(d))` arm), Land carries the opening message from its
+/// relaunch's start-up and the test fails.
+#[test]
+fn land_carries_an_exchange_off_left_after_work_when_its_record_is_read_again() {
+    let quick = Duration::from_secs(5);
+    let reply = "Nothing is running now; the branch is pushed and waits on its gate.";
+    let work = idle(
+        "The fix is committed and verified; it waits on the gate.",
+        Some(20 * MIN),
+    );
+    let at_wall = TurnEndReading {
+        person: Some(Duration::from_secs(8)),
+        key: Some(Duration::from_secs(8)),
+        ..walled(WallKind::Overloaded, "529", Some(Duration::from_secs(3)))
+    };
+    let asked = TurnEndReading {
+        person: Some(Duration::from_secs(8)),
+        key: Some(Duration::from_secs(8)),
+        ..idle(reply, Some(quick))
+    };
+    let answered = land(TurnEndReading {
+        left_record: true,
+        ..idle(reply, Some(quick))
+    });
+    let startup = land(TurnEndReading {
+        left_record: true,
+        ..recorded(Some(false), idle(POST_RESUME, Some(quick)))
+    });
+    let carried = |st: &TurnEndState, a: &TurnEndAction, worked: bool, how: &str| {
+        if worked {
+            assert!(!st.left_to_person(), "after work, {how}: Land carries it");
+            assert!(
+                matches!(a.rule_id(), Some(RULE_LAND | RULE_LAND_NUDGE)),
+                "after work, {how}: {a:?}"
+            );
+        } else {
+            assert!(st.left_to_person(), "the opening message, {how}");
+            assert_eq!(*a, TurnEndAction::Nothing, "the opening message, {how}");
+        }
+    };
+    for worked in [true, false] {
+        let now = t0();
+        let left_at = now + 20 * MIN;
+        let session = || {
+            let mut st = TurnEndState::default();
+            if worked {
+                at(&mut st, &land(work.clone()), now);
+            }
+            st
+        };
+        // Off leaves the reply at a wall; Land types the wall's retry and reads its answer.
+        let mut st = session();
+        at(&mut st, &under(Autopilot::Off, at_wall.clone()), left_at);
+        assert!(st.exchange_at_wall(), "worked={worked}: the at-wall row");
+        assert_eq!(st.exchange_opens(), !worked, "worked={worked}");
+        st.park_off();
+        let retry = land(TurnEndReading {
+            person: None,
+            key: None,
+            worked: None,
+            ..at_wall.clone()
+        });
+        let (a, t) = until_acted(&mut st, &retry, left_at + 2 * MIN);
+        assert_eq!(
+            a.rule_id(),
+            Some(RULE_OUTAGE_RESUME),
+            "worked={worked}: {a:?}"
+        );
+        let (a, _) = past_backoff(&mut st, &answered, t + quick);
+        carried(&st, &a, worked, "the retry's answer");
+        // Off leaves a quick reply; the session is relaunched and its start-up read under Land.
+        let mut st = session();
+        at(&mut st, &under(Autopilot::Off, asked.clone()), left_at);
+        assert!(st.left_to_person(), "worked={worked}: Off leaves it");
+        assert_eq!(st.exchange_opens(), !worked, "worked={worked}");
+        st.park_off();
+        let (a, _) = past_backoff(&mut st, &startup, left_at + 2 * MIN);
+        carried(&st, &a, worked, "a relaunch's start-up");
+    }
+}
+
 /// CRUISE NEVER PARKS AT A REPLY TO THE PERSON'S OWN MESSAGE (owner ruling 2026-10-26): the
 /// person's own exchange (their message, answered within 10 minutes) is theirs under Land and Off
 /// alone; under Cruise it is a turn end like any other, whatever the reply says (a greeting, a
 /// question to them, a done report, a `NEEDS YOU:` line, an answer at length), held only while
 /// their hands are on the keys and carried once they are off. NEGATIVE CONTROL: with
-/// `TurnEndState::observe`'s exchange taken under Cruise again (`autopilot != Cruise` dropped from
-/// its `(None, Some(d))` arm, or `cruise_takes_exchange` out), Cruise leaves the reply and the
-/// test fails.
+/// `TurnEndState::observe`'s exchange taken under Cruise again (`Autopilot::Cruise => true` in
+/// `TurnEndState::mode_leaves_exchange`, or `mode_takes_exchange` out), Cruise leaves the reply
+/// and the test fails.
 #[test]
 fn cruise_never_parks_at_a_reply_to_the_persons_own_message() {
     let now = t0();
@@ -15846,6 +16296,7 @@ fn cruise_never_parks_at_a_reply_to_the_persons_own_message() {
     ] {
         let theirs = TurnEndReading {
             person: Some(Duration::from_secs(8)),
+            key: Some(Duration::from_secs(8)),
             ..idle(said, quick)
         };
         let mut st = TurnEndState::default();
@@ -15858,6 +16309,7 @@ fn cruise_never_parks_at_a_reply_to_the_persons_own_message() {
         for later in [2 * MIN, 60 * MIN, 24 * 60 * MIN] {
             let quiet = TurnEndReading {
                 person: Some(later),
+                key: Some(later),
                 ..theirs.clone()
             };
             let a = decide_turn_end(&st, &quiet, &cfg(), now + later);
@@ -15878,6 +16330,7 @@ fn cruise_never_parks_at_a_reply_to_the_persons_own_message() {
                 mode,
                 TurnEndReading {
                     person: Some(60 * MIN),
+                    key: Some(60 * MIN),
                     ..theirs.clone()
                 },
             );
@@ -15892,6 +16345,7 @@ fn cruise_never_parks_at_a_reply_to_the_persons_own_message() {
     // loop's record that left it holds no Cruise session either.
     let left = TurnEndReading {
         person: Some(Duration::from_secs(8)),
+        key: Some(Duration::from_secs(8)),
         ..idle("Hello!", quick)
     };
     let mut st = TurnEndState::default();
@@ -15899,6 +16353,7 @@ fn cruise_never_parks_at_a_reply_to_the_persons_own_message() {
     assert!(st.left_to_person());
     let back = TurnEndReading {
         person: Some(30 * MIN),
+        key: Some(30 * MIN),
         worked: None,
         ..left.clone()
     };
@@ -15921,6 +16376,7 @@ fn a_landing_and_a_persons_own_exchange_compose() {
     let quick = Some(Duration::from_secs(5));
     let hand = |r: TurnEndReading| TurnEndReading {
         person: Some(Duration::from_secs(8)),
+        key: Some(Duration::from_secs(8)),
         ..r
     };
     let progress = "Committing the parser now; the lexer is next.";
@@ -15941,7 +16397,7 @@ fn a_landing_and_a_persons_own_exchange_compose() {
         let next = land(idle("Going well: the lexer is next.", None));
         assert_eq!(act(&mut st, &next, now), land_nudged());
         now += MIN;
-        at(&mut st, &hand(land(idle(DEFENSE, quick))), now);
+        now = lands_on_check(&mut st, &hand(land(idle(DEFENSE, quick))), now);
         assert!(st.landed() && !st.left_to_person());
         now += MIN;
         if let Some(r) = closing {
@@ -15994,6 +16450,7 @@ fn an_off_park_ends_the_carry_and_land_begins_again_after_a_persons_greeting() {
                 mode,
                 TurnEndReading {
                     person: Some(Duration::from_secs(8)),
+                    key: Some(Duration::from_secs(8)),
                     ..idle("Hello!", quick)
                 },
             );
@@ -16002,6 +16459,7 @@ fn an_off_park_ends_the_carry_and_land_begins_again_after_a_persons_greeting() {
                 mode,
                 TurnEndReading {
                     person: Some(10 * MIN),
+                    key: Some(10 * MIN),
                     ..idle("Hello!", None)
                 },
             );
@@ -16057,7 +16515,7 @@ fn a_first_point_no_read_saw_busy_is_never_left_to_a_person() {
         ("a fresh loop", |_, _, _| {}),
         ("a loop started as Off lifted", |st, _, now| {
             st.seed_acts(&[Duration::from_secs(80)], now);
-            st.start_lifted_off();
+            st.start_lifted_off(OffStood::Person);
         }),
         ("a restart mid-run (control)", |st, _, now| {
             st.seed_acts(&[Duration::from_secs(80)], now);
@@ -16103,16 +16561,18 @@ fn a_loop_started_as_off_lifted_keeps_the_carry_for_the_turn_it_attached_to() {
     let now = t0();
     let mut st = TurnEndState::default();
     st.seed_acts(&[4 * MIN], now);
-    st.start_lifted_off();
+    st.start_lifted_off(OffStood::Person);
     st.took();
     let tail = TurnEndReading {
         person: Some(Duration::from_secs(10)),
+        key: Some(Duration::from_secs(10)),
         ..idle(said, Some(Duration::from_secs(40)))
     };
     at(&mut st, &tail, now);
     assert!(!st.left_to_person());
     let later = TurnEndReading {
         person: Some(60 * MIN),
+        key: Some(60 * MIN),
         ..idle(said, None)
     };
     assert_eq!(
@@ -16121,7 +16581,7 @@ fn a_loop_started_as_off_lifted_keeps_the_carry_for_the_turn_it_attached_to() {
     );
     let mut st = TurnEndState::default();
     st.seed_acts(&[4 * MIN], now);
-    st.start_lifted_off();
+    st.start_lifted_off(OffStood::Person);
     at(&mut st, &idle("Waiting for your word.", None), now);
     assert!(!st.left_to_person());
     st.took();
@@ -16129,6 +16589,7 @@ fn a_loop_started_as_off_lifted_keeps_the_carry_for_the_turn_it_attached_to() {
     // does Land, since the session worked before it (owner ruling 2026-10-27).
     let hello = TurnEndReading {
         person: Some(Duration::from_secs(5)),
+        key: Some(Duration::from_secs(5)),
         ..idle("Hello!", Some(Duration::from_secs(5)))
     };
     let mut carried = st.clone();
@@ -16223,19 +16684,25 @@ fn a_land_acts_reply_is_landed_however_long_it_worked() {
         now += worked;
         let r = land(TurnEndReading {
             person: hand,
+            key: hand,
             ..idle(reply, Some(worked))
         });
-        st.observe(&r, now);
+        let answered = lands_on_check(&mut st, &r, now);
         assert!(st.landed() && !st.left_to_person(), "{worked:?}: {st:?}");
-        let later = land(TurnEndReading {
+        let landed_later = land(TurnEndReading {
             person: Some(60 * MIN),
-            ..idle(reply, None)
+            ..idle(LANDED_WORD, None)
         });
         assert_eq!(
-            decide_turn_end(&st, &later, &cfg(), now + 60 * MIN),
+            decide_turn_end(&st, &landed_later, &cfg(), answered + 60 * MIN),
             TurnEndAction::Nothing,
             "{worked:?}"
         );
+        let later = land(TurnEndReading {
+            person: Some(60 * MIN),
+            key: Some(60 * MIN),
+            ..idle(reply, None)
+        });
         let mut st = TurnEndState::default();
         st.observe(&r, now);
         assert!(!st.landed(), "{worked:?}");
@@ -16257,11 +16724,13 @@ fn a_wall_split_job_is_landed_and_a_split_exchange_is_left_under_land() {
         let mut st = TurnEndState::default();
         let r = land(TurnEndReading {
             person: Some(before),
+            key: Some(before),
             ..walled(WallKind::Overloaded, "529", Some(before))
         });
         at(&mut st, &r, now);
         let retry = TurnEndReading {
             person: None,
+            key: None,
             worked: None,
             ..r
         };
@@ -16338,6 +16807,7 @@ fn after_an_off_park_a_persons_turn_is_judged_by_the_exchange_bound() {
                 mode,
                 TurnEndReading {
                     person: Some(worked + Duration::from_secs(8)),
+                    key: Some(worked + Duration::from_secs(8)),
                     ..idle(said, Some(worked))
                 },
             );
@@ -16346,6 +16816,7 @@ fn after_an_off_park_a_persons_turn_is_judged_by_the_exchange_bound() {
                 mode,
                 TurnEndReading {
                     person: Some(10 * MIN),
+                    key: Some(10 * MIN),
                     ..idle(said, None)
                 },
             );
@@ -16385,16 +16856,18 @@ fn a_lifted_loops_kept_carry_holds_inside_the_exchange_bound() {
     let minutes = 8 * MIN;
     let mut st = TurnEndState::default();
     st.seed_acts(&[4 * MIN], now);
-    st.start_lifted_off();
+    st.start_lifted_off(OffStood::Person);
     st.took();
     let tail = TurnEndReading {
         person: Some(Duration::from_secs(10)),
+        key: Some(Duration::from_secs(10)),
         ..idle(said, Some(minutes))
     };
     st.observe(&tail, now);
     assert!(!st.left_to_person());
     let later = TurnEndReading {
         person: Some(60 * MIN),
+        key: Some(60 * MIN),
         ..idle(said, None)
     };
     assert_eq!(
@@ -16404,7 +16877,7 @@ fn a_lifted_loops_kept_carry_holds_inside_the_exchange_bound() {
     let after_an_unseen_first_point = |mode: Autopilot, worked: Duration| {
         let mut st = TurnEndState::default();
         st.seed_acts(&[4 * MIN], now);
-        st.start_lifted_off();
+        st.start_lifted_off(OffStood::Person);
         at(
             &mut st,
             &under(mode, idle("Waiting for your word.", None)),
@@ -16414,6 +16887,7 @@ fn a_lifted_loops_kept_carry_holds_inside_the_exchange_bound() {
         st.took();
         let theirs = TurnEndReading {
             person: Some(worked + Duration::from_secs(8)),
+            key: Some(worked + Duration::from_secs(8)),
             ..idle(said, Some(worked))
         };
         st.observe(&under(mode, theirs), now + 30 * MIN);
@@ -16447,11 +16921,13 @@ fn a_persons_exchange_on_a_wall_keeps_its_work_across_an_off_park() {
         let mut st = TurnEndState::default();
         let r = land(TurnEndReading {
             person: Some(before),
+            key: Some(before),
             ..walled(WallKind::Overloaded, "529", Some(before))
         });
         at(&mut st, &r, now);
         let retry = TurnEndReading {
             person: None,
+            key: None,
             worked: None,
             ..r
         };
@@ -16491,12 +16967,14 @@ fn a_persons_exchange_retried_on_a_wall_and_unseen_after_an_off_park_is_never_le
                 mode,
                 TurnEndReading {
                     person: Some(4 * MIN),
+                    key: Some(4 * MIN),
                     ..walled(WallKind::Overloaded, "529", Some(4 * MIN))
                 },
             );
             at(&mut st, &r, now);
             let retry = TurnEndReading {
                 person: None,
+                key: None,
                 worked: None,
                 ..r
             };
@@ -16511,6 +16989,7 @@ fn a_persons_exchange_retried_on_a_wall_and_unseen_after_an_off_park_is_never_le
                     mode,
                     TurnEndReading {
                         person: Some(ago),
+                        key: Some(ago),
                         ..idle(said, None)
                     },
                 )
@@ -16529,12 +17008,13 @@ fn a_persons_exchange_retried_on_a_wall_and_unseen_after_an_off_park_is_never_le
             _ => typed(RULE_CONTINUE),
         };
         // Land's instruction waits no back-off (v6 §14.10); Cruise, which never takes the turn
-        // for the person's (owner ruling 2026-10-26), backs off first or types at once.
+        // for the person's (owner ruling 2026-10-26), backs off first or types at once, within
+        // the hour of the person's key without saying the go-ahead is no need.
         if mode == Autopilot::Land {
             assert_eq!(first, want, "{mode:?}: at once");
         } else {
             assert!(
-                matches!(first, TurnEndAction::WaitUntil { .. }) || first == want,
+                matches!(first, TurnEndAction::WaitUntil { .. }) || first == continued_held(),
                 "{mode:?}: backed off first: {first:?}"
             );
         }
@@ -16608,13 +17088,17 @@ fn a_wall_inside_a_land_act_or_the_done_check_keeps_the_act_it_cut() {
     let reply = "All done: committed and pushed.";
     let progress = "Committing the parser now; the lexer is next.";
     for lead in [&[][..], &[progress; 3][..]] {
-        let (st, a) = wall_split_reply(Autopilot::Land, lead, "Stage 1 landed.", DEFENSE);
+        let (mut st, a) = wall_split_reply(Autopilot::Land, lead, "Stage 1 landed.", DEFENSE);
+        assert!(!st.landed(), "{} nudges: {st:?}", lead.len());
+        assert_eq!(a, land_check_typed(), "{} nudges", lead.len());
+        let late = t0() + 24 * 60 * MIN;
+        let (b, _) = check_answered(&mut st, &land(idle(DEFENSE, None)), &a, late, LANDED_WORD);
         assert!(
             st.landed() && st.task_done(),
             "{} nudges: {st:?}",
             lead.len()
         );
-        assert_eq!(a, TurnEndAction::Nothing, "{} nudges", lead.len());
+        assert_eq!(b, TurnEndAction::Nothing, "{} nudges", lead.len());
     }
     let (st, a) = wall_split_reply(Autopilot::Cruise, &["Stage 1 landed."], reply, reply);
     assert_eq!(st.followed(), Some(RULE_DONE_CHECK), "{st:?}");
@@ -16681,7 +17165,7 @@ fn a_full_context_inside_the_done_check_gets_the_check_again_after_the_compactio
         }
     );
     now += 3 * MIN;
-    at(&mut st, &land(idle(DEFENSE, Some(3 * MIN))), now);
+    lands_on_check(&mut st, &land(idle(DEFENSE, Some(3 * MIN))), now);
     assert!(st.landed(), "{st:?}");
     let mut st = TurnEndState::default();
     let mut now = t0();
@@ -16777,6 +17261,7 @@ fn a_renewable_logins_end_waits_on_its_rows_own_sign_in() {
             login_superseded: true,
             account: Some(AccountAdvice::Move {
                 to: "m7-a".to_string(),
+                yields: None,
             }),
             ..ended.clone()
         };
@@ -17199,6 +17684,7 @@ fn a_roster_rows_sign_in_menu_waits_on_its_own_sign_in() {
     );
     let keyed = TurnEndReading {
         person: Some(Duration::from_secs(1)),
+        key: Some(Duration::from_secs(1)),
         ..renewed.clone()
     };
     let a = at(&mut TurnEndState::default(), &keyed, t + MIN);
@@ -17532,6 +18018,7 @@ fn a_wall_splits_a_job_in_a_new_loop_too() {
         let mut st = TurnEndState::default();
         let r = TurnEndReading {
             person: Some(before),
+            key: Some(before),
             ..walled(WallKind::Overloaded, "529", Some(before))
         };
         at(&mut st, &r, t0());
@@ -17540,6 +18027,7 @@ fn a_wall_splits_a_job_in_a_new_loop_too() {
         assert_eq!(written, before, "{name}");
         let retry = TurnEndReading {
             person: None,
+            key: None,
             worked: None,
             ..r
         };
@@ -17559,6 +18047,7 @@ fn a_wall_splits_a_job_in_a_new_loop_too() {
             left_record: true,
             left_work: carried.then_some(written),
             person: None,
+            key: None,
             worked: None,
             ..walled(WallKind::Overloaded, "529", None)
         };
@@ -17623,7 +18112,7 @@ fn a_loop_started_as_off_lifted_leaves_a_first_point_an_earlier_loop_left() {
         let lifted = || {
             let mut st = TurnEndState::default();
             st.seed_acts(&[4 * MIN], later);
-            st.start_lifted_off();
+            st.start_lifted_off(OffStood::Person);
             st
         };
         let mut st = lifted();
@@ -17640,7 +18129,7 @@ fn a_loop_started_as_off_lifted_leaves_a_first_point_an_earlier_loop_left() {
 }
 
 #[test]
-fn only_a_land_acts_clean_defense_is_the_records_landing() {
+fn only_the_land_checks_landed_is_the_records_landing() {
     use crate::harness::upgrade::FinishedScan;
     let json = |text: &str| aterm_json::to_string(&aterm_json::Value::from(text)).expect("json");
     let user = |text: &str| {
@@ -17673,19 +18162,37 @@ fn only_a_land_acts_clean_defense_is_the_records_landing() {
     let ruled = land_text(Some("never push to main"));
     for asked in [LAND, LAND_NUDGE, ruled.as_str()] {
         let s = scan(asked, DEFENSE);
-        assert!(s.finished(), "{asked}");
+        assert!(
+            !s.finished() && s.said_done(),
+            "a defense lands nothing: {asked}"
+        );
         let s = scan(asked, "All done.");
         assert!(!s.finished(), "a done phrase: {asked}");
         assert!(s.said_done(), "a done phrase: {asked}");
         let needs = format!("{DEFENSE}\nNEEDS YOU: the release credential.");
         assert!(!scan(asked, &needs).finished(), "a need: {asked}");
     }
+    let hinted = land_check::land_check_text(
+        Some("the docs PR is open"),
+        true,
+        Some("never push to main"),
+    );
+    for check in [LAND_CHECK, hinted.as_str()] {
+        assert!(scan(check, LANDED_WORD).finished(), "{check}");
+        for reply in [
+            DEFENSE,
+            "LANDED, except the docs PR",
+            "NEEDS YOU: the release credential.",
+        ] {
+            assert!(!scan(check, reply).finished(), "{reply}: {check}");
+        }
+    }
     let s = scan(DONE_CHECK, DEFENSE);
     assert!(!s.finished(), "the Cruise prompt");
     assert!(s.said_done(), "the Cruise prompt");
-    let quoted = format!("Please read this: {LAND}");
+    let quoted = format!("Please read this: {LAND_CHECK}");
     assert!(
-        !scan(&quoted, DEFENSE).finished(),
+        !scan(&quoted, LANDED_WORD).finished(),
         "CONTROL: a person's prompt"
     );
     for reply in ["All done.", DEFENSE] {
@@ -17849,45 +18356,6 @@ fn a_seeded_check_a_529_cut_is_typed_again_after_the_compaction() {
         );
         now += MIN;
         assert_eq!(act(&mut st, &compacted, now), want, "{case}");
-    }
-}
-
-#[test]
-fn a_reply_that_came_again_holds_a_commands_owed_continuation_and_a_resets_own() {
-    let t = t0();
-    let after = idle("Conversation compacted.", None);
-    let held = Replies::of(&[Kept {
-        mark: reply_mark(&after),
-        answers: 2,
-        walled: false,
-        tries: 0,
-    }]);
-    type Owe = fn(&mut TurnEndState, Instant);
-    let owing: [(&str, Owe); 2] = [
-        ("a command's owed continuation", |st, _| {
-            st.seed_compact_check(RULE_DONE_CHECK);
-        }),
-        ("a reset's own continuation", |st, t| {
-            st.reset_told(&ResetOutcome::Kept, t);
-        }),
-    ];
-    for (what, owe) in owing {
-        let decided = |replies| {
-            let mut st = TurnEndState::default();
-            owe(&mut st, t);
-            st.seed_replies(replies, MIN, t);
-            at(&mut st, &after, t + Duration::from_secs(1))
-        };
-        assert_eq!(
-            decided(held),
-            TurnEndAction::Nothing,
-            "{what}: the reply came again"
-        );
-        let typed = decided(Replies::default());
-        assert!(
-            matches!(typed, TurnEndAction::Type { .. }),
-            "the control: {what} is typed: {typed:?}"
-        );
     }
 }
 
@@ -18260,9 +18728,29 @@ mod land_review {
     include!("turn_end_land_review_tests.rs");
 }
 
+mod land_check_acts {
+    use super::*;
+    include!("turn_end_land_check_tests.rs");
+}
+
+mod hold_said {
+    use super::*;
+    include!("turn_end_hold_said_tests.rs");
+}
+
 mod agy_messages {
     use super::*;
     include!("turn_end_agy_message_tests.rs");
+}
+
+mod needs_wrap {
+    use super::*;
+    include!("turn_end_needs_wrap_tests.rs");
+}
+
+mod pace {
+    use super::*;
+    include!("turn_end_pace_tests.rs");
 }
 
 mod corpora {
@@ -18292,6 +18780,16 @@ mod angles {
 mod go_ahead {
     use super::*;
     include!("turn_end_go_ahead_tests.rs");
+}
+
+mod contradicted {
+    use super::*;
+    include!("turn_end_contradicted_tests.rs");
+}
+
+mod witness_clears {
+    use super::*;
+    include!("turn_end_witness_tests.rs");
 }
 
 #[test]
@@ -18330,6 +18828,7 @@ fn a_turn_end_trace_names_the_rule_that_decided() {
     assert!(steps.iter().any(|s| s.check == "no-task"), "{steps:#?}");
     let typing = TurnEndReading {
         person: Some(Duration::from_secs(1)),
+        key: Some(Duration::from_secs(1)),
         ..r
     };
     let mut steps = Vec::new();
@@ -18353,10 +18852,12 @@ fn a_lost_login_over_a_done_task_is_signed_in() {
     let key = Duration::from_secs(2);
     let wall = land(TurnEndReading {
         person: Some(key),
+        key: Some(key),
         ..walled(WallKind::Auth, "Login expired · Please run /login", None)
     });
     let aged = |by: Duration| TurnEndReading {
         person: Some(key + by),
+        key: Some(key + by),
         ..wall.clone()
     };
     let done = || {
@@ -18422,6 +18923,7 @@ fn a_lost_login_over_a_done_task_is_signed_in() {
     st.observe(&wall, t);
     let typed_since = TurnEndReading {
         person: Some(Duration::from_secs(1)),
+        key: Some(Duration::from_secs(1)),
         ..wall.clone()
     };
     let now = t + Duration::from_secs(30);
@@ -18456,6 +18958,7 @@ fn the_exchange_a_lost_login_swallowed_is_carried_through_its_sign_in() {
         let r = aterm_phase::read(Some("claude"), &rows, Some(2));
         TurnEndReading {
             person: Some(person),
+            key: Some(person),
             autopilot: mode,
             ..TurnEndReading::of(&r, &rows, false, worked, None, None)
         }
@@ -18485,6 +18988,7 @@ fn the_exchange_a_lost_login_swallowed_is_carried_through_its_sign_in() {
         let quiet = at_wall + LOGIN_QUIET;
         let wall = TurnEndReading {
             person: Some(LOGIN_QUIET + Duration::from_millis(200)),
+            key: Some(LOGIN_QUIET + Duration::from_millis(200)),
             ..wall
         };
         let a = decide_turn_end(&st, &wall, &cfg(), quiet);
@@ -18741,6 +19245,7 @@ fn a_dialog_whose_login_came_back_elsewhere_is_backed_out_of() {
     let mut st = typed();
     let r = TurnEndReading {
         person: Some(Duration::from_secs(1)),
+        key: Some(Duration::from_secs(1)),
         ..shared(real_point(LOGIN_HANDOFF), true)
     };
     let a = at(&mut st, &r, t + MIN);
@@ -18819,6 +19324,7 @@ fn a_renewal_made_while_the_login_was_up_is_followed_once_it_is_left() {
         login_superseded: superseded,
         account: Some(AccountAdvice::Move {
             to: "m7-a".to_string(),
+            yields: None,
         }),
         ..renewable(&real_point(LOGIN_INTERRUPTED), "m7-a")
     };
@@ -18879,6 +19385,7 @@ fn a_renewal_over_a_landings_lost_login_is_asked_for_once_its_login_is_left() {
     let key = Duration::from_secs(2);
     let wall = land(TurnEndReading {
         person: Some(key),
+        key: Some(key),
         restartable: true,
         ..renewable(
             &walled(WallKind::Auth, "Login expired · Please run /login", None),
@@ -18892,6 +19399,7 @@ fn a_renewal_over_a_landings_lost_login_is_asked_for_once_its_login_is_left() {
     let now = t + past;
     let aged = TurnEndReading {
         person: Some(key + past),
+        key: Some(key + past),
         ..wall.clone()
     };
     let a = decide_turn_end(&st, &aged, &cfg(), now);
@@ -18925,6 +19433,7 @@ fn a_renewal_over_a_landings_lost_login_is_asked_for_once_its_login_is_left() {
     let moved = TurnEndReading {
         account: Some(AccountAdvice::Move {
             to: "m7-a".to_string(),
+            yields: None,
         }),
         ..gone
     };
@@ -18991,6 +19500,7 @@ fn the_dialog_aterm_opened_over_a_roster_row_is_backed_out_of() {
         login_superseded: superseded,
         account: superseded.then(|| AccountAdvice::Move {
             to: "m7-a".to_string(),
+            yields: None,
         }),
         ..renewable(&real_point(text), "m7-a")
     };
@@ -19686,7 +20196,7 @@ fn a_bucket_the_vendor_continued_under_its_generic_row_gets_no_usage_resume() {
     assert!(!st.waits_on_named_reset(), "the bucket went on");
     assert_eq!(
         at(&mut st, &continued, reset + 10 * MIN),
-        typed(RULE_CONTINUE)
+        continued_for(&st, reset + 10 * MIN)
     );
     let cancelled = captured(
         aterm_phase::prompt::fixtures::WALL_SONNET_BUCKET_CANCELLED_UNDER_24H_2_1_302,
@@ -19820,7 +20330,7 @@ fn a_bucket_the_vendor_continued_on_a_short_pane_gets_no_usage_resume() {
     assert!(!st.waits_on_named_reset(), "the bucket went on");
     assert_eq!(
         at(&mut st, &continued, reset + 10 * MIN),
-        typed(RULE_CONTINUE)
+        continued_for(&st, reset + 10 * MIN)
     );
     let other = captured_rows(&continued_at("7:10pm"));
     let mut st = TurnEndState::default();
@@ -20265,15 +20775,15 @@ fn a_walls_continuation_under_land_is_the_cleared_line_once_the_instruction_was_
         "the limit's resume under Land: one line, no Land prompt again"
     );
     assert!(!says_cruise(&a), "{a:?}");
-    assert_eq!(
-        at(
-            &mut st,
-            &land(idle(DEFENSE, Some(3 * MIN))),
-            reset + 14 * MIN
-        ),
-        TurnEndAction::Nothing
+    lands_on_check(
+        &mut st,
+        &land(idle(DEFENSE, Some(3 * MIN))),
+        reset + 14 * MIN,
     );
-    assert!(st.landed(), "the resume's defense lands the task");
+    assert!(
+        st.landed(),
+        "the resume's defense, then the check, lands the task"
+    );
     let mut st = TurnEndState::default();
     let limit = limit_at(Autopilot::Land, None, reset);
     at(&mut st, &limit, t);
@@ -20287,15 +20797,12 @@ fn a_walls_continuation_under_land_is_the_cleared_line_once_the_instruction_was_
         "the instruction's words before the episode had them"
     );
     assert_eq!(st.land_episode(), (true, 0), "the instruction is given");
-    assert_eq!(
-        at(
-            &mut st,
-            &land(idle(DEFENSE, Some(3 * MIN))),
-            reset + 14 * MIN
-        ),
-        TurnEndAction::Nothing
+    lands_on_check(
+        &mut st,
+        &land(idle(DEFENSE, Some(3 * MIN))),
+        reset + 14 * MIN,
     );
-    assert!(st.landed(), "its defense lands the task");
+    assert!(st.landed(), "its defense, then the check, lands the task");
     let mut st = TurnEndState::default();
     assert_eq!(
         act(&mut st, &land(idle("Stage 1 landed.", Some(3 * MIN))), t),
@@ -20517,11 +21024,24 @@ fn an_act_answered_before_any_read_saw_it_run_is_taken_by_the_message_opening_it
         (st, sent)
     };
     let (mut st, sent) = landing(PROMPT);
-    let a = at(&mut st, &land(opened(DEFENSE, LAND)), sent + fast);
+    let r = land(opened(DEFENSE, LAND));
+    let a = at(&mut st, &r, sent + fast);
+    assert_eq!(a, land_check_typed(), "{st:?}");
+    assert_eq!(st.followed(), Some(RULE_LAND), "{st:?}");
+    st.acted(&a, &r, sent + fast);
+    let a = at(
+        &mut st,
+        &land(opened(LANDED_WORD, LAND_CHECK)),
+        sent + 2 * fast,
+    );
     assert_eq!(a, TurnEndAction::Nothing, "{st:?}");
     assert!(st.landed() && st.task_done(), "{st:?}");
-    assert_eq!(st.followed(), Some(RULE_LAND), "{st:?}");
-    let a = at(&mut st, &land(opened(DEFENSE, LAND)), sent + 20 * fast);
+    assert_eq!(st.followed(), Some(RULE_LAND_CHECK), "{st:?}");
+    let a = at(
+        &mut st,
+        &land(opened(LANDED_WORD, LAND_CHECK)),
+        sent + 20 * fast,
+    );
     assert_eq!(a, TurnEndAction::Nothing, "{st:?}");
     assert!(st.landed(), "{st:?}");
     let untaken = |what: &str, r: TurnEndReading, over: &str| {
@@ -20635,7 +21155,6 @@ fn a_draft_submitted_and_answered_before_any_read_saw_it_run_is_taken_by_the_tur
             TurnEndReading {
                 answered: None,
                 opened_by: None,
-                opened_words: None,
                 ..shown(FIRST, PROMPT)
             },
             shown(REPLY, DRAFT),
@@ -20646,7 +21165,6 @@ fn a_draft_submitted_and_answered_before_any_read_saw_it_run_is_taken_by_the_tur
             TurnEndReading {
                 answered: None,
                 opened_by: None,
-                opened_words: None,
                 ..shown(REPLY, DRAFT)
             },
         );
@@ -20724,6 +21242,7 @@ fn a_turn_no_read_saw_run_since_the_last_point_is_judged_where_it_shows_once() {
             &mut st,
             &land(TurnEndReading {
                 person: Some(secs(3)),
+                key: Some(secs(3)),
                 ..theirs.clone()
             }),
             t + secs(10),
@@ -20734,6 +21253,7 @@ fn a_turn_no_read_saw_run_since_the_last_point_is_judged_where_it_shows_once() {
             &mut st,
             &TurnEndReading {
                 person: Some(secs(3)),
+                key: Some(secs(3)),
                 ..theirs.clone()
             },
             t + secs(10),
@@ -20835,6 +21355,7 @@ fn a_judged_turn_whose_opener_comes_into_sight_is_not_judged_again() {
     let (mut st, text, done_at) = start();
     let wheeled = TurnEndReading {
         person: Some(secs(5)),
+        key: Some(secs(5)),
         ..closing(REPORT, &text, Some(secs(602)))
     };
     let a = at(&mut st, &wheeled, done_at + secs(30));
@@ -20844,7 +21365,16 @@ fn a_judged_turn_whose_opener_comes_into_sight_is_not_judged_again() {
         &closing(REPORT, &text, Some(secs(602))),
         done_at + secs(60),
     );
-    assert_eq!(a, checked(), "continued once they left: {a:?}");
+    // Their key, five seconds old, holds their hour: the check leaves the go-ahead's word out.
+    assert_eq!(
+        a,
+        TurnEndAction::Type {
+            text: crate::supervise::policy::go_ahead::unless_held(&done_check_words(0), true)
+                .into_owned(),
+            rule_id: RULE_DONE_CHECK,
+        },
+        "continued once they left: {a:?}"
+    );
     let (mut st, text, done_at) = start();
     let judged = st.point_number();
     let whole = closing(&format!("{HEAD}\n{REPORT}"), &text, Some(secs(602)));
@@ -20867,7 +21397,6 @@ fn a_judged_turn_whose_opener_comes_into_sight_is_not_judged_again() {
 fn a_revealed_opener_keeps_a_landed_task_landed() {
     const PROMPT: &str = "write the parser for this repository and land it";
     const OPEN: &str = "The lexer is still open; I will finish it next.";
-    const HEAD: &str = "Landed in three merges, the last one the lexer.";
     let secs = Duration::from_secs;
     let t = t0();
     let landed = || {
@@ -20882,35 +21411,48 @@ fn a_revealed_opener_keeps_a_landed_task_landed() {
             ..closing(OPEN, LAND, None)
         });
         let (a, sent) = past_backoff(&mut st, &open, t + secs(20));
-        let TurnEndAction::Type { text, rule_id } = &a else {
+        let TurnEndAction::Type { rule_id, .. } = &a else {
             panic!("Land's next act: {a:?}")
         };
         assert_eq!(*rule_id, RULE_LAND_NUDGE);
-        let nudge = text.clone();
         st.acted(&a, &land(closing(OPEN, LAND, None)), sent);
-        let landed_at = sent + secs(600);
+        let defended_at = sent + secs(600);
+        let defended = land(TurnEndReading {
+            worked: Some(secs(600)),
+            ..idle(DEFENSE, None)
+        });
+        let a = at(&mut st, &defended, defended_at);
+        let TurnEndAction::Type { text, rule_id } = &a else {
+            panic!("Land's check: {a:?}")
+        };
+        assert_eq!(*rule_id, RULE_LAND_CHECK);
+        let check = text.clone();
+        st.acted(&a, &defended, defended_at);
+        let landed_at = defended_at + secs(30);
         let a = at(
             &mut st,
             &land(TurnEndReading {
-                worked: Some(secs(600)),
-                ..idle(DEFENSE, None)
+                worked: Some(secs(30)),
+                ..idle(LANDED_WORD, None)
             }),
             landed_at,
         );
         assert_eq!(a, TurnEndAction::Nothing, "{st:?}");
         assert!(st.landed() && st.task_done(), "landed: {st:?}");
-        (st, nudge, landed_at)
+        (st, check, landed_at)
     };
     let (mut st, _, landed_at) = landed();
-    let a = at(&mut st, &land(idle(DEFENSE, None)), landed_at + secs(30));
+    let a = at(
+        &mut st,
+        &land(idle(LANDED_WORD, None)),
+        landed_at + secs(30),
+    );
     assert_eq!(a, TurnEndAction::Nothing);
     assert!(st.landed());
-    for (case, said) in [
-        ("the same words", DEFENSE.to_string()),
-        ("the defense's head", format!("{HEAD}\n{DEFENSE}")),
-    ] {
+    {
+        let (case, said) = ("the same words", LANDED_WORD.to_string());
         let (mut st, nudge, landed_at) = landed();
-        let revealed = land(closing(&said, &nudge, Some(secs(602))));
+        let revealed = land(closing(&said, &nudge, Some(secs(32))));
         let a = at(&mut st, &revealed, landed_at + secs(60));
         assert_eq!(a, TurnEndAction::Nothing, "{case}: {st:?}");
         assert!(st.landed() && st.task_done(), "{case}: landed: {st:?}");
@@ -21022,7 +21564,6 @@ fn a_turn_asked_since_the_point_is_told_by_its_submission_whatever_its_words() {
         let out_of_sight = |said: &str| TurnEndReading {
             answered: None,
             opened_by: None,
-            opened_words: None,
             program,
             ..idle(said, None)
         };
@@ -21216,11 +21757,18 @@ fn the_harnesss_own_keys_ask_no_turn() {
                 ..counted(shown(DEFENSE, LAND), 2, 200)
             });
             let a = at(&mut st, &defense, t + 3 * MIN);
+            assert_eq!(a, land_check_typed(), "{program:?}: {st:?}");
+            st.acted(&a, &defense, t + 3 * MIN);
+            let answer = land(TurnEndReading {
+                worked: Some(secs(20)),
+                ..counted(shown(LANDED_WORD, LAND_CHECK), 3, 250)
+            });
+            let a = at(&mut st, &answer, t + 3 * MIN + secs(20));
             assert_eq!(a, TurnEndAction::Nothing, "{program:?}: {st:?}");
             assert!(st.landed(), "{program:?}: landed");
             st
         };
-        let redrawn = land(counted(shown(DEFENSE, LAND), 3, 300));
+        let redrawn = land(counted(shown(LANDED_WORD, LAND_CHECK), 4, 350));
         let mut st = landed();
         st.host_moved();
         let a = at(&mut st, &redrawn, t + 4 * MIN);
@@ -21232,7 +21780,7 @@ fn the_harnesss_own_keys_ask_no_turn() {
             TurnEndAction::Nothing,
             "{program:?}: nothing typed: {a:?}"
         );
-        let asked = land(counted(shown(REPLY, ASK), 4, 400));
+        let asked = land(counted(shown(REPLY, ASK), 5, 450));
         let before = st.point_number();
         let _ = at(&mut st, &asked, t + 5 * MIN);
         assert_ne!(st.point_number(), before, "{program:?}: a turn asked");
@@ -21359,7 +21907,6 @@ fn a_launch_card_read_with_nothing_submitted_is_the_conversation_redrawn() {
         |st: &TurnEndState, submits: Option<u64>, inputs: Option<u64>| TurnEndReading {
             said_tail: None,
             opened_by: None,
-            opened_words: None,
             taskless: !st.redrawn_fresh(submits, inputs),
             submits,
             inputs_before: inputs,
@@ -21370,7 +21917,6 @@ fn a_launch_card_read_with_nothing_submitted_is_the_conversation_redrawn() {
     let rewrapped = |st: &TurnEndState, submits: Option<u64>| TurnEndReading {
         said_tail: None,
         opened_by: None,
-        opened_words: None,
         taskless: !st.redrawn_fresh(submits, Some(7)),
         submits,
         inputs_before: Some(7),
@@ -21587,6 +22133,7 @@ fn host_agent_resumed_covers_external_late_and_delayed_relaunches_without_hiding
     let asked = TurnEndReading {
         autopilot: Autopilot::Land,
         person: Some(Duration::from_secs(30)),
+        key: Some(Duration::from_secs(30)),
         ..idle("The test still passes.", Some(30 * Duration::from_secs(1)))
     };
 
@@ -21678,6 +22225,330 @@ fn host_agent_resumed_covers_external_late_and_delayed_relaunches_without_hiding
     st.observe(&asked, relaunch + Duration::from_secs(40));
     assert!(st.exchange_opens());
     assert!(st.left_to_person());
+}
+
+/// A LOOP STARTED AS THE SESSION'S OFF LIFTED ATTACHES TO A SESSION THAT RAN UNDER OFF (D2-2):
+/// nobody judged its points, so its books are empty, but a person may have driven it by hand for
+/// an hour, so under Land their quick turn the loop first reads busy interrupts that work and Land
+/// carries it on after the reply, as any message once a session has worked. Off leaves it as
+/// before. CONTROLS: a fresh program's banner the lifted loop read first (`opened_fresh`), a
+/// program that began within the turn (`TurnEndState::observe`'s fresh launch) and a loop not
+/// lifted (a session's first) still leave the message to the person. MUTANT: with
+/// `self.worked_before = true` out of `seed_off_stood`, the turn after Off is left and Land rests
+/// with the work unlanded.
+#[test]
+fn a_loop_lifted_off_off_carries_a_persons_quick_turn_on_the_session_off_left() {
+    let now = t0();
+    let asked = TurnEndReading {
+        person: Some(Duration::from_secs(8)),
+        key: Some(Duration::from_secs(8)),
+        ..idle(
+            "I changed parser.rs and lexer.rs; neither is committed yet.",
+            Some(Duration::from_secs(5)),
+        )
+    };
+    let later = TurnEndReading {
+        person: Some(2 * MIN),
+        key: Some(2 * MIN),
+        ..asked.clone()
+    };
+    let banner = TurnEndReading {
+        taskless: true,
+        ..idle("", None)
+    };
+    for mode in [Autopilot::Land, Autopilot::Off] {
+        let mut st = TurnEndState::default();
+        st.start_lifted_off(OffStood::Person);
+        at(&mut st, &under(mode, asked.clone()), now);
+        assert!(!st.exchange_opens(), "{mode:?}: the session ran under Off");
+        assert_eq!(st.left_to_person(), mode == Autopilot::Off, "{mode:?}");
+        let want = match mode {
+            Autopilot::Land => land_instruction(),
+            Autopilot::Cruise | Autopilot::Off => TurnEndAction::Nothing,
+        };
+        let a = decide_turn_end(&st, &under(mode, later.clone()), &cfg(), now + 2 * MIN);
+        assert_eq!(a, want, "{mode:?}");
+        // CONTROL: the lifted loop read a fresh program's banner first.
+        let mut st = TurnEndState::default();
+        st.start_lifted_off(OffStood::Person);
+        at(&mut st, &under(mode, banner.clone()), now);
+        at(&mut st, &under(mode, asked.clone()), now + MIN);
+        assert!(st.exchange_opens(), "{mode:?}: a fresh program's banner");
+        assert!(st.left_to_person(), "{mode:?}: a fresh program's banner");
+        // CONTROL: a program started fresh within the turn the loop first reads busy.
+        let mut st = TurnEndState::default();
+        st.start_lifted_off(OffStood::Person);
+        st.agent_started(now - Duration::from_secs(9));
+        st.agent_started_unix(1_793_000_000);
+        st.host_agent_resumed(Some(AgentResumed {
+            pid: 900,
+            started: Some(1_793_000_000),
+            resumed: false,
+        }));
+        at(&mut st, &under(mode, asked.clone()), now);
+        assert!(st.exchange_opens(), "{mode:?}: a program begun in the turn");
+        assert!(st.left_to_person(), "{mode:?}: a program begun in the turn");
+        // CONTROL: a loop not lifted, its books empty: the session's opening message.
+        let mut st = TurnEndState::default();
+        at(&mut st, &under(mode, asked.clone()), now);
+        assert!(st.exchange_opens(), "{mode:?}: the session's first");
+        assert!(st.left_to_person(), "{mode:?}: the session's first");
+    }
+}
+
+/// A LOOP LIFTED OFF OFF READS THE SESSION'S OPENING EXCHANGE OFF ITS FIRST POINT'S SCREEN (R1):
+/// the lift marks the session worked (D2-2), but where that point shows the program's launch card
+/// over the one message (`aterm_phase::ScreenReader::opening`), the message opens the session and
+/// under Land it is the person's, whatever the tab's books say. CONTROLS, carried under Land: the
+/// point read without the launch card over it, a lifted loop's later point, a program that resumes
+/// a conversation, and a loop not lifted whose books hold work. MUTANT: with the opening read out
+/// of `observe`, the opening is carried and Land types its instruction after it.
+#[test]
+fn a_loop_lifted_off_off_leaves_the_opening_exchange_its_screen_shows_to_the_person() {
+    let now = t0();
+    let asked = TurnEndReading {
+        person: Some(Duration::from_secs(8)),
+        key: Some(Duration::from_secs(8)),
+        ..idle(
+            "This repository is a terminal emulator written in Rust.",
+            Some(Duration::from_secs(20)),
+        )
+    };
+    let later = TurnEndReading {
+        person: Some(2 * MIN),
+        key: Some(2 * MIN),
+        ..asked.clone()
+    };
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Case {
+        Opening,
+        OpeningOverBooks,
+        Unread,
+        LaterPoint,
+        Resumed,
+        NotLifted,
+    }
+    // Every case is checked, and the mismatches told together, so each mutant names its own.
+    let mut wrong = Vec::new();
+    for mode in [Autopilot::Land, Autopilot::Off] {
+        for case in [
+            Case::Opening,
+            Case::OpeningOverBooks,
+            Case::Unread,
+            Case::LaterPoint,
+            Case::Resumed,
+            Case::NotLifted,
+        ] {
+            let what = format!("{mode:?}: {case:?}");
+            let mut st = TurnEndState::default();
+            if matches!(case, Case::OpeningOverBooks | Case::NotLifted) {
+                st.seed_worked();
+                st.seed_point(30 * MIN, now);
+            }
+            if case != Case::NotLifted {
+                st.start_lifted_off(OffStood::Person);
+            }
+            if case == Case::LaterPoint {
+                st.observe(
+                    &under(mode, idle("Implemented the parser fix.", None)),
+                    now - MIN,
+                );
+            }
+            if case == Case::Resumed {
+                st.host_agent_resumed(Some(AgentResumed {
+                    pid: 31,
+                    started: Some(1_793_000_000),
+                    resumed: true,
+                }));
+            }
+            st.opening_read(case != Case::Unread);
+            at(&mut st, &under(mode, asked.clone()), now);
+            let opens = matches!(case, Case::Opening | Case::OpeningOverBooks);
+            if st.exchange_opens() != opens {
+                wrong.push(format!("{what}: opens {}", st.exchange_opens()));
+            }
+            if st.left_to_person() != (opens || mode == Autopilot::Off) {
+                wrong.push(format!("{what}: left {}", st.left_to_person()));
+            }
+            if mode == Autopilot::Land {
+                let a = decide_turn_end(&st, &under(mode, later.clone()), &cfg(), now + 2 * MIN);
+                let want = if opens {
+                    TurnEndAction::Nothing
+                } else {
+                    land_instruction()
+                };
+                if a != want {
+                    wrong.push(format!("{what}: {a:?}"));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A PROGRAM STARTED FRESH IN A REUSED TAB OPENS ITS SESSION THOUGH THE LOOP NEVER READ ITS
+/// BANNER (D2-9): the person typed ahead, or ran `claude "<question>"`, so the loop's first read
+/// of the new program is busy and no taskless reading sets `opened_fresh`. The host vouches the
+/// process resumes no conversation (`AgentResumed::resumed`), it began within the turn the
+/// person's message opened, and this is the loop's first settled read of it, so that message is
+/// the program's opening one whatever the tab's books say, and under Land it is theirs.
+/// CONTROLS, each carried under Land: a process that resumes a conversation (aterm's relaunch,
+/// or its own `--continue`), one that began long before the turn, one whose screen the loop had
+/// read settled already, and no host's word. MUTANTS: with any of those conditions out of
+/// `observe`'s fresh launch, its control is left to the person; with the fresh launch out, the
+/// opening message is carried.
+#[test]
+fn a_fresh_programs_opening_message_read_busy_first_opens_its_session() {
+    const BEGAN: i64 = 1_793_000_000;
+    let now = t0();
+    let asked = TurnEndReading {
+        person: Some(Duration::from_secs(4)),
+        key: Some(Duration::from_secs(4)),
+        ..idle(
+            "This repository is a terminal emulator written in Rust.",
+            Some(Duration::from_secs(20)),
+        )
+    };
+    let later = TurnEndReading {
+        person: Some(2 * MIN),
+        key: Some(2 * MIN),
+        ..asked.clone()
+    };
+    let work = idle("Implemented the parser fix.", None);
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Case {
+        Fresh,
+        Resumed,
+        BeganLongBefore,
+        ReadSettled,
+        NoHost,
+    }
+    // Every case is checked, and the mismatches told together, so each mutant names its own.
+    let mut wrong = Vec::new();
+    for mode in [Autopilot::Land, Autopilot::Off] {
+        for books in [false, true] {
+            for case in [
+                Case::Fresh,
+                Case::Resumed,
+                Case::BeganLongBefore,
+                Case::ReadSettled,
+                Case::NoHost,
+            ] {
+                let what = format!("{mode:?}, books {books}: {case:?}");
+                let mut st = TurnEndState::default();
+                // The tab's books hold an earlier program's work.
+                st.seed_worked();
+                if books {
+                    st.seed_point(30 * MIN, now);
+                }
+                let began = if case == Case::BeganLongBefore {
+                    now - 60 * MIN
+                } else {
+                    now - Duration::from_secs(25)
+                };
+                st.agent_started(began);
+                st.agent_started_unix(BEGAN);
+                if case != Case::NoHost {
+                    st.host_agent_resumed(Some(AgentResumed {
+                        pid: 777,
+                        started: Some(BEGAN),
+                        resumed: case == Case::Resumed,
+                    }));
+                }
+                if case == Case::ReadSettled {
+                    at(
+                        &mut st,
+                        &under(mode, work.clone()),
+                        now - Duration::from_secs(22),
+                    );
+                    st.host_agent_resumed(Some(AgentResumed {
+                        pid: 777,
+                        started: Some(BEGAN),
+                        resumed: false,
+                    }));
+                }
+                at(&mut st, &under(mode, asked.clone()), now);
+                let opens = case == Case::Fresh;
+                if st.exchange_opens() != opens {
+                    wrong.push(format!("{what}: opens {}", st.exchange_opens()));
+                }
+                if st.left_to_person() != (opens || mode == Autopilot::Off) {
+                    wrong.push(format!("{what}: left {}", st.left_to_person()));
+                }
+                if mode == Autopilot::Land {
+                    let a =
+                        decide_turn_end(&st, &under(mode, later.clone()), &cfg(), now + 2 * MIN);
+                    let want = if opens {
+                        TurnEndAction::Nothing
+                    } else {
+                        land_instruction()
+                    };
+                    if a != want {
+                        wrong.push(format!("{what}: {a:?}"));
+                    }
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A PROGRAM THAT RESUMES A CONVERSATION OPENS NO SESSION (D2-2): a new tab's `claude --continue
+/// "<question>"` (the host's `AgentResumed::resumed`, `relaunch::resumes_conversation`) carries on
+/// a session that worked before this loop's books begin, so under Land the person's quick question
+/// at its first point interrupts that work and Land carries it on; Off leaves it. CONTROLS: the
+/// same first point with the host's word of a fresh process, or with no host's word, is the
+/// session's opening, left to the person. MUTANT: with the resumed launch out of `observe`'s
+/// opening, the resumed session's question is left and Land rests.
+#[test]
+fn a_resumed_conversations_first_question_opens_no_session() {
+    const BEGAN: i64 = 1_793_000_000;
+    let now = t0();
+    let asked = TurnEndReading {
+        person: Some(Duration::from_secs(6)),
+        key: Some(Duration::from_secs(6)),
+        ..idle(
+            "The last commit added the lexer; the parser change is not staged.",
+            Some(Duration::from_secs(12)),
+        )
+    };
+    let later = TurnEndReading {
+        person: Some(2 * MIN),
+        key: Some(2 * MIN),
+        ..asked.clone()
+    };
+    for mode in [Autopilot::Land, Autopilot::Off] {
+        for resumed in [Some(true), Some(false), None] {
+            let what = format!("{mode:?}: host says resumed {resumed:?}");
+            let mut st = TurnEndState::default();
+            st.agent_started(now - Duration::from_secs(20));
+            st.agent_started_unix(BEGAN);
+            if let Some(resumed) = resumed {
+                st.host_agent_resumed(Some(AgentResumed {
+                    pid: 4242,
+                    started: Some(BEGAN),
+                    resumed,
+                }));
+            }
+            at(&mut st, &under(mode, asked.clone()), now);
+            let opens = resumed != Some(true);
+            assert_eq!(st.exchange_opens(), opens, "{what}");
+            assert_eq!(
+                st.left_to_person(),
+                opens || mode == Autopilot::Off,
+                "{what}"
+            );
+            if mode == Autopilot::Land {
+                let a = decide_turn_end(&st, &under(mode, later.clone()), &cfg(), now + 2 * MIN);
+                let want = if opens {
+                    TurnEndAction::Nothing
+                } else {
+                    land_instruction()
+                };
+                assert_eq!(a, want, "{what}");
+            }
+        }
+    }
 }
 
 /// A MEASURED OUTAGE HOLDS THE CONTINUATION ([`outage_hold`]): at a point no wall stands at, a
@@ -21848,4 +22719,21 @@ fn a_measured_outage_holds_the_continuation_and_its_return_types_it() {
         ),
         "a connection wall at a Down waits its own measured wait: {wall_wait:?}"
     );
+    assert!(
+        done_row_work(&["✻ Cooked for 9999999999999999999h 1s · done 4:24 PM".to_owned()])
+            .is_none()
+    );
+    let far = AccountAdvice::of_roster_at(
+        &crate::harness::accounts::Advice::Wait { until: i64::MAX },
+        None,
+        &crate::harness::accounts::State::default(),
+        None,
+        true,
+        i64::MIN,
+        t,
+    );
+    assert!(matches!(far, Some(AccountAdvice::Wait { until }) if until > t));
 }
+
+#[path = "sysmsg_replay_tests.rs"]
+mod sysmsg_replay;

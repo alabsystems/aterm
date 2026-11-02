@@ -29,7 +29,12 @@ impl<'a> InitialSetupWithheldStopTest<'a> {
     /// A whole-profile init interrupted after recording its withheld item,
     /// before its verification or any effect: admitted, with no completed stage.
     pub fn unfinished(root: &'a Path) -> Result<Self, String> {
-        let held = init_hold_at(root, true, &|_| {})?;
+        let held = init_hold_at(
+            root,
+            aterm_machines::init::Pass::Whole { clones: true },
+            false,
+            Some(&|_| {}),
+        )?;
         aterm_machines::init::Held::withheld(&held, &[WIDGETS.to_owned()])?;
         drop(held);
         Ok(Self {

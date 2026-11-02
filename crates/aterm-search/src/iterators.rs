@@ -70,6 +70,30 @@ impl CandidateSource {
         }
     }
 
+    /// The sorted `keys`, ascending.
+    #[inline]
+    pub(super) fn listed(base: usize, keys: Vec<u32>) -> Self {
+        Self {
+            base,
+            keys: CandidateKeys::FilteredForward {
+                candidates: keys.into_iter(),
+                filters: Vec::new(),
+            },
+        }
+    }
+
+    /// The sorted `keys`, descending.
+    #[inline]
+    pub(super) fn listed_rev(base: usize, keys: Vec<u32>) -> Self {
+        Self {
+            base,
+            keys: CandidateKeys::FilteredBackward {
+                candidates: keys.into_iter(),
+                filters: Vec::new(),
+            },
+        }
+    }
+
     /// Builds a lazy ascending intersection from borrowed posting lists starting at `from_key`.
     pub(super) fn from_postings_forward(
         base: usize,

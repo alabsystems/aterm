@@ -16,7 +16,7 @@ use super::super::config::{Approve, SupervisorConfig};
 use super::a_or_an;
 use super::box_command;
 use super::claude_settings::{AskKind, OwnerAsk};
-use super::git_config::{GitView, WorkerEnv, git_reads, hazard};
+use super::git_config::{GitView, WorkerEnv, cd_operand, cdpath_searched, git_reads, hazard};
 use super::guard::row_guard;
 use super::probe::{PolicyProbe, WorkerWrites};
 use super::rm_breaker::{RmScope, ScratchRoot, abs_components, clip, resolve_rm_line};
@@ -27,21 +27,21 @@ use crate::harness::lights::Mode;
 use crate::supervise::classify::{
     QUOTED_SUBSTITUTION, SUBSTITUTION, brace_expansion, classify_command_except,
     classify_command_with, classify_except_rm, command_words, command_words_globbed,
-    expanded_parameters, git_subcommand, glob_match, path_operands_except, plain_zsh_line, program,
-    runs, unquoted_glob,
+    expanded_parameters, git_subcommand, glob_match, grammar_names_operand, path_operands_except,
+    plain_zsh_line, program, runs, unquoted_glob, unredirected,
 };
 
 /// Rule identifier for the read-only Bash classifier approval rule.
-pub const RULE_READ_ONLY: &str = "read-only@classify-v10";
+pub const RULE_READ_ONLY: &str = "read-only@classify-v11";
 /// [`RULE_READ_ONLY`]'s proof over a Bash box whose one note is Claude Code's no-rule note
 /// (`This command requires approval`).
-pub const RULE_NO_RULE_READ_ONLY: &str = "no-rule-read-only@v5";
+pub const RULE_NO_RULE_READ_ONLY: &str = "no-rule-read-only@v6";
 /// The rm circuit-breaker rule's id; it does not run [`proof_gaps_clear`], whose assignments the
 /// rm resolver follows.
-pub const RULE_RM_BREAKER: &str = "rm-breaker@v9";
+pub const RULE_RM_BREAKER: &str = "rm-breaker@v10";
 /// The rm circuit breaker's too-many box ([`RmBreakerKind::TooManySubstitutions`]) over a
 /// command that names no rm.
-pub const RULE_BREAKER_READ_ONLY: &str = "breaker-read-only@v10";
+pub const RULE_BREAKER_READ_ONLY: &str = "breaker-read-only@v11";
 /// The rm circuit breaker the safe rules could not prove, approved with a warning under
 /// `approve = "safe"` ([`rm_breaker_warn`]).
 pub const RULE_RM_BREAKER_WARN: &str = "rm-breaker-warn@v1";
@@ -83,7 +83,7 @@ pub const RULE_AUTO_MODE_SETUP: &str = "auto-mode-setup@v1";
 /// `aterm harness disk` ([`crate::harness::disk::fence::runs_harness_disk`]) is approved under
 /// it, and every other permission box the worker raises is declined under it, with
 /// [`DISK_WORKER_DECLINE`] or, for such a Bash box that a proof did not hold for, why not.
-pub const RULE_DISK_WORKER: &str = "disk-worker@v2";
+pub const RULE_DISK_WORKER: &str = "disk-worker@v3";
 
 /// What [`RULE_DISK_WORKER`] types into a disk-free worker's refusal of a command that is not a
 /// read nor `aterm harness disk` or a System State read, and of every other tool's box.
@@ -1165,7 +1165,7 @@ fn decide_unfenced(
                 Decision::escalate("no login dialog the reader vouches for")
             }
             aterm_phase::LoginScreen::Picker(picker) if ctx.login_carry => {
-                super::login::pick_method(prompt, &picker, ctx.login_method)
+                super::login::pick_method(&picker, ctx.login_method)
             }
             aterm_phase::LoginScreen::Picker(picker)
                 if ctx.login_back || ctx.login_roster || ctx.login_renewed =>
@@ -2440,7 +2440,8 @@ fn environment_unread(readings: &[String]) -> Result<(), String> {
 }
 
 /// [`readings_proven`], then the default secret list under this process's `HOME`: the advisory
-/// word for a Bash box.
+/// word for a Bash box. It knows no session's cwd, so a relative path is read from a directory it
+/// cannot place ([`Start::Unplaced`]).
 ///
 /// # Errors
 ///
@@ -2458,19 +2459,25 @@ fn readings_read_only_at(
     python_allow: &[String],
     home: Option<&Path>,
 ) -> Result<(), String> {
+    readings_read_only_from(readings, python_allow, home, Start::Unplaced)
+}
+
+/// [`readings_read_only_at`], a relative path read from `start`.
+fn readings_read_only_from(
+    readings: &[String],
+    python_allow: &[String],
+    home: Option<&Path>,
+    start: Start<'_>,
+) -> Result<(), String> {
     readings_proven(readings, python_allow)?;
-    secrets_unreached(
-        readings,
-        &default_secrets(home),
-        home,
-        Start::Unconsulted,
-        &|_| false,
-    )
+    secrets_unreached(readings, &default_secrets(home), home, start, &|_| false)
 }
 
 /// The advisory word's verdict ([`readings_read_only`]) on `line`, a shell command line as typed,
-/// with the default secret list under `home`: `aterm drive classify`'s verdict after the
-/// classifier's, so the verb and the word agree on every line.
+/// with the default secret list under `home` and a relative path read from `cwd`, where the line
+/// runs (from a directory the check cannot place, as the word reads it, with none): `aterm drive
+/// classify`'s verdict after the classifier's, so the verb approves no line the harness's rules
+/// would refuse from there.
 ///
 /// # Errors
 ///
@@ -2479,8 +2486,15 @@ pub fn command_read_only_at(
     line: &str,
     python_allow: &[String],
     home: Option<&Path>,
+    cwd: Option<&Path>,
 ) -> Result<(), String> {
-    readings_read_only_at(&[line.to_string()], python_allow, home)
+    let cwds: Vec<PathBuf> = cwd.map(Path::to_path_buf).into_iter().collect();
+    let start = if cwds.is_empty() {
+        Start::Unplaced
+    } else {
+        Start::Known(&cwds)
+    };
+    readings_read_only_from(&[line.to_string()], python_allow, home, start)
 }
 
 /// The home the advisory word resolves `~` and the secret list against.
@@ -2958,7 +2972,9 @@ fn read_comps_allowed(comps: &[String], shown: &str, ctx: &ApprovalCtx) -> Resul
 /// - a drive path (`C:\a`, `C:/a`) read as Git Bash spells it (`c`, `a`), so a Windows path's
 ///   spellings and a rule under a Windows home (`C:\Users\name/.secrets`) share components;
 /// - a rooted path's `..` kept as a component (a symlink before it may lead elsewhere, as `cat`
-///   resolves `..` on disk) and also taken lexically, for when none does.
+///   resolves `..` on disk) and also taken lexically, for when none does;
+/// - a rooted path led by an alias the OS keeps of the root also read without it
+///   ([`root_alias_free`]).
 fn path_readings(path: &str) -> Vec<Vec<String>> {
     let (drive, rest) = match path.split_at_checked(2) {
         Some((d, rest))
@@ -3001,19 +3017,142 @@ fn path_readings(path: &str) -> Vec<Vec<String>> {
         out.push(literal);
         out.extend(lexical);
     }
+    if drive.is_some() || rest.starts_with(['/', '\\']) {
+        for reading in out.clone() {
+            out.extend(below_aliases(&reading));
+        }
+    }
     out
+}
+
+/// `comps`, a rooted path's, read without each alias of the root that leads it in turn
+/// ([`root_alias_free`]).
+fn below_aliases(comps: &[String]) -> Vec<Vec<String>> {
+    let mut out = Vec::new();
+    let mut below = root_alias_free(comps);
+    while let Some(c) = below {
+        below = root_alias_free(&c);
+        out.push(c);
+    }
+    out
+}
+
+/// `comps`, a rooted path's, read without an alias the OS keeps of the root that leads it, if one
+/// does: macOS's lookup prefixes `/.nofollow/` and `/.resolve/<n>/`, its data volume
+/// (`/System/Volumes/Data`) and a mounted volume (`/Volumes/<name>`, whose boot volume's entry is
+/// a link to `/`; each MEASURED 2026-10-29 or 2026-10-30 on macOS 27.0.1 to open the home by its
+/// own inode), Linux's `/proc/<pid>/root` (a thread's `/proc/<pid>/task/<tid>/…` read as its
+/// process's; REASONED from proc(5)), Git Bash's `/proc/cygdrive/<drive>/` (MEASURED 2026-10-30
+/// in the Windows lane) and Cygwin's `/cygdrive/<drive>/` (REASONED), each `<drive>` as
+/// [`path_readings`] spells a drive (`c`), and Windows' `Documents and Settings` junction of a
+/// drive's `Users` (Git Bash's `cat` and `findstr` open a file through it, MEASURED 2026-10-29 in
+/// the Windows lane). A directory that holds one of these (`/.nofollow`, `/.resolve`, `/System`,
+/// `/Volumes`, `/proc`, a process's) is read as the root, for a recursive reader that descends
+/// it. Names are compared by [`same_name`], `.nofollow` and `.resolve` too, which macOS reads
+/// case-sensitively (MEASURED): a stricter reading, never a looser one.
+fn root_alias_free(comps: &[String]) -> Option<Vec<String>> {
+    let drive = |d: &String, rest: &[String]| Some([d].into_iter().chain(rest).cloned().collect());
+    match comps {
+        [n, rest @ ..] if same_name(n, ".nofollow") => Some(rest.to_vec()),
+        [r] | [r, _] if same_name(r, ".resolve") => Some(Vec::new()),
+        [r, _, rest @ ..] if same_name(r, ".resolve") => Some(rest.to_vec()),
+        [p, c, d, rest @ ..]
+            if same_name(p, "proc") && same_name(c, "cygdrive") && d.len() == 1 =>
+        {
+            drive(d, rest)
+        }
+        [c, d, rest @ ..] if same_name(c, "cygdrive") && d.len() == 1 => drive(d, rest),
+        [p, pid, t, rest @ ..] if same_name(p, "proc") && same_name(t, "task") => Some(
+            [p, pid]
+                .into_iter()
+                .chain(rest.iter().skip(1))
+                .cloned()
+                .collect(),
+        ),
+        [s] | [s, _]
+            if same_name(s, "System") && comps.get(1).is_none_or(|v| same_name(v, "Volumes")) =>
+        {
+            Some(Vec::new())
+        }
+        [s, v, d, rest @ ..]
+            if same_name(s, "System") && same_name(v, "Volumes") && same_name(d, "Data") =>
+        {
+            Some(rest.to_vec())
+        }
+        [v] if same_name(v, "Volumes") => Some(Vec::new()),
+        [v, _, rest @ ..] if same_name(v, "Volumes") => Some(rest.to_vec()),
+        [c] if same_name(c, "cygdrive") => Some(Vec::new()),
+        [p] | [p, _] if same_name(p, "proc") => Some(Vec::new()),
+        [p, _, r, rest @ ..] if same_name(p, "proc") && same_name(r, "root") => Some(rest.to_vec()),
+        [d, docs, rest @ ..] if d.len() == 1 && same_name(docs, "Documents and Settings") => Some(
+            [d.clone(), "Users".to_string()]
+                .into_iter()
+                .chain(rest.iter().cloned())
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// Why one of `comps` may name a file by a handle no name rule sees: macOS's volfs
+/// (`/.vol/<device>/<inode>/…`, MEASURED 2026-10-29 on macOS 27.0.1 to open the home by its device
+/// and inode numbers), or Linux's `/proc/<pid>/cwd`, `fd` or `map_files` (a process's working
+/// directory, or a file it holds open; a thread's, `/proc/<pid>/task/<tid>/…`, among the readings
+/// [`root_alias_free`] gives).
+fn handle_read<'a>(comps: impl IntoIterator<Item = &'a Vec<String>>) -> Option<String> {
+    comps.into_iter().find_map(|c| match c.as_slice() {
+        [v, ..] if same_name(v, ".vol") => {
+            Some("a read by volume and inode number (/.vol), which may name any file".to_string())
+        }
+        [p, _, k, ..]
+            if same_name(p, "proc")
+                && ["cwd", "fd", "map_files"].iter().any(|h| same_name(k, h)) =>
+        {
+            Some(format!(
+                "a read through /proc's {k}, which may name any file"
+            ))
+        }
+        _ => None,
+    })
 }
 
 fn secret_hit<'a>(comps: &[String], secrets: &'a [SecretRule]) -> Option<&'a SecretRule> {
     secrets.iter().find(|rule| match rule {
-        SecretRule::Under(dir) => path_readings(&dir.to_string_lossy()).iter().any(|d| {
-            comps.len() >= d.len() && d.iter().zip(comps).all(|(a, b)| a.eq_ignore_ascii_case(b))
-        }),
-        SecretRule::Component(name) => comps.iter().any(|c| c.eq_ignore_ascii_case(name)),
+        SecretRule::Under(dir) => path_readings(&dir.to_string_lossy())
+            .iter()
+            .any(|d| comps.len() >= d.len() && d.iter().zip(comps).all(|(a, b)| same_name(a, b))),
+        SecretRule::Component(name) => comps.iter().any(|c| same_name(c, name)),
         SecretRule::Basename(glob) => comps
             .last()
-            .is_some_and(|c| glob_match(&glob.to_ascii_lowercase(), &c.to_ascii_lowercase())),
+            .is_some_and(|c| glob_match(&folded(glob), &folded(c))),
     })
+}
+
+/// `c` case-folded fully, as APFS compares names: lower, upper, then lower again, so `ſ`, the
+/// Kelvin sign, `ß`, `ẞ` and the `ﬁ` ligatures fold to the ASCII they open (`.ſsh` is `.ssh`). It
+/// also folds `ı` to `i`, which APFS keeps apart: a stricter reading, never a looser one.
+fn fold_char(c: char) -> impl Iterator<Item = char> {
+    c.to_lowercase()
+        .flat_map(char::to_uppercase)
+        .flat_map(char::to_lowercase)
+}
+
+/// `name` with each character case-folded by [`fold_char`].
+fn folded(name: &str) -> String {
+    if name.is_ascii() {
+        name.to_ascii_lowercase()
+    } else {
+        name.chars().flat_map(fold_char).collect()
+    }
+}
+
+/// Whether a case-insensitive volume may open `a` as `b`: equal once both are [`folded`].
+fn same_name(a: &str, b: &str) -> bool {
+    if a.is_ascii() && b.is_ascii() {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        folded(a) == folded(b)
+    }
 }
 
 /// The texts an operand may name, each read by [`path_readings`]: the word itself, a `~` lead
@@ -3078,33 +3217,67 @@ fn secrets_free(
     Ok(())
 }
 
+/// Whether a reading of `prompt`'s command reads a path from where its command stands: an operand,
+/// or a tree a reader descends, with no root (`~+/…` among them), which [`secrets_unreached`] reads
+/// from where the Bash tool stands ([`ApprovalCtx::shell_cwds`]). The loop reads that for such a
+/// box alone, so a recorded tape of a box that names none replays without the read. A reading the
+/// check cannot split names none, as [`secrets_unreached`] refuses it.
+pub(crate) fn reads_from_stand(prompt: &PromptV2) -> bool {
+    let from_stand = |w: &str| !rooted(w) && (!w.starts_with('~') || w.starts_with("~+"));
+    prompt.readings().iter().any(|line| {
+        let operands = path_operands_except(line, &|_| false).unwrap_or_default();
+        let segments = command_words(line).unwrap_or_default();
+        operands.iter().any(|op| from_stand(op))
+            || segments.iter().any(|seg| {
+                runs(seg).ok().flatten().is_some_and(|run| {
+                    descends(seg, run.at)
+                        .iter()
+                        .any(|(root, _)| from_stand(root))
+                })
+            })
+    })
+}
+
 /// Where a line's relative paths start, for [`secrets_unreached`].
 #[derive(Clone, Copy)]
 enum Start<'a> {
-    /// The directories the session's command may run in: its cwd and where its Bash tool stands.
+    /// The directories the command may run in: the session's cwd and where its Bash tool stands,
+    /// or the directory `aterm drive classify` is asked from.
     Known(&'a [PathBuf]),
     /// The session's cwd is unknown (meta `cwd=-`): a relative path may name any file.
     Unknown,
-    /// Not consulted (the advisory word and `aterm drive classify`, which know no session's
-    /// cwd): a relative path is read against the directories the line itself names.
-    Unconsulted,
+    /// Unplaced (the advisory word, which knows no session's cwd, and `aterm drive classify` with
+    /// no working directory): a relative path is read from a directory this check cannot place
+    /// ([`Bases::floating`]) and from the directories the line itself names.
+    Unplaced,
 }
 
 impl Start<'_> {
-    /// The directories it names, and why a relative path may name any file.
-    fn bases(self) -> (Vec<String>, Option<String>) {
-        match self {
+    /// Its [`Bases`] before the line moves.
+    fn bases(self) -> Bases {
+        let (dirs, floating, lost) = match self {
             Self::Known(dirs) => (
                 dirs.iter()
                     .map(|d| d.to_string_lossy().into_owned())
                     .collect(),
+                if dirs.iter().any(|d| d == Path::new("/")) {
+                    vec![String::new()]
+                } else {
+                    Vec::new()
+                },
                 None,
             ),
             Self::Unknown => (
                 Vec::new(),
+                Vec::new(),
                 Some("with the session's cwd unknown (meta cwd=-)".to_string()),
             ),
-            Self::Unconsulted => (Vec::new(), None),
+            Self::Unplaced => (Vec::new(), vec![String::new()], None),
+        };
+        Bases {
+            dirs,
+            floating,
+            lost,
         }
     }
 }
@@ -3128,15 +3301,18 @@ fn secrets_unreached_in(
 /// `Ok` when no path a reading's commands may read lies under a secret rule, as the shell
 /// resolves it: each operand ([`path_operands_except`], the words of a command `passed` holds
 /// read as naming no file) read by [`operand_comps`], a relative one also against every
-/// directory the line may run it in ([`line_bases`]); a glob held to the rules by what it may
-/// expand to ([`secret_reach`]); and every tree a recursive reader descends ([`descends`]) held
-/// to the home-rooted rules above it.
+/// directory the line may run it in ([`line_bases`]) and below each it cannot place
+/// ([`secret_led`]); a glob held to the rules by what it may expand to ([`secret_reach`]); and
+/// every tree a reader descends ([`descends`]) held to the home-rooted rules above which it
+/// starts, within the levels it reads (below a directory it cannot place, only a tree that is an
+/// operand or the `.` a reader names none in place of).
 ///
 /// # Errors
 ///
 /// The first read of a secret, named; else the first path this check cannot hold to the rules:
-/// one the shell builds at run time (an expansion or a substitution), or a relative one after a
-/// move it cannot follow or with the session's cwd unknown.
+/// one the line builds at run time (a shell expansion or substitution, or an awk program's own,
+/// [`path_operands_except`]), or a relative one after a move it cannot follow, on a line whose
+/// commands may stand in more than [`STANDS_MAX`] directories, or with the session's cwd unknown.
 fn secrets_unreached(
     readings: &[String],
     secrets: &[SecretRule],
@@ -3147,6 +3323,7 @@ fn secrets_unreached(
     if secrets.is_empty() {
         return Ok(());
     }
+    let windows = cfg!(windows) || home.is_some_and(|h| drive_led(&h.to_string_lossy()));
     let mut doubt = None;
     for line in readings {
         let name = reading_name(line);
@@ -3155,28 +3332,35 @@ fn secrets_unreached(
         let segments = command_words(line).map_err(not_read)?;
         let bases = line_bases(&segments, start, home);
         for op in &operands {
-            let (comps, unsure) = operand_reach(op, home, &bases, true);
-            if let Some(rule) = comps.iter().find_map(|c| secret_reach(c, secrets, false)) {
-                return Err(format!("a read of a secret ({rule:?}) ({name}): {op}"));
+            let reach = windows_reach(op, home, &bases, true, windows);
+            if let Some(rule) = reach.secret(secrets, 0) {
+                return Err(format!("a read of a secret {rule} ({name}): {op}"));
             }
             if doubt.is_none() {
-                doubt = unsure.map(|u| format!("{u} ({name}): {op}"));
+                doubt = reach.doubt().map(|u| format!("{u} ({name}): {op}"));
             }
         }
         for seg in &segments {
             let Ok(Some(run)) = runs(seg) else {
                 continue;
             };
-            for root in descends(seg, run.at) {
-                let (comps, unsure) = operand_reach(root, home, &bases, false);
-                if let Some(rule) = comps.iter().find_map(|c| secret_reach(c, secrets, true)) {
+            for (root, below) in descends(seg, run.at) {
+                let mut reach = windows_reach(root, home, &bases, false, windows);
+                if root != "." && !operands.iter().any(|o| o == root) {
+                    // A word the grammar reads as no path (grep's pattern), held to the rules
+                    // only where the line may stand.
+                    reach.tails.clear();
+                }
+                if let Some(rule) = reach.secret(secrets, below) {
                     return Err(format!(
-                        "a read of a secret ({rule:?}) ({name}): {} descends from {root}",
+                        "a read of a secret {rule} ({name}): {} descends from {root}",
                         program(&seg[run.at])
                     ));
                 }
                 if doubt.is_none() {
-                    doubt = unsure.map(|u| format!("{u} ({name}): {root}, where it descends"));
+                    doubt = reach
+                        .doubt()
+                        .map(|u| format!("{u} ({name}): {root}, where it descends"));
                 }
             }
         }
@@ -3188,17 +3372,29 @@ fn secrets_unreached(
 /// a relative path may name any file ([`Start::Unknown`]'s, or a move this check cannot follow).
 struct Bases {
     dirs: Vec<String>,
+    /// Directories named from one this check cannot place, each as a path from it (`""` for that
+    /// directory itself): the advisory word's start ([`Start::Unplaced`]), and a `cd` or `pushd`
+    /// target bash and zsh may look up in a `CDPATH` (zsh's `cdpath`), which the worker's
+    /// environment or a `.zshenv` may set ([`cdpath_searched`]), with every relative move after
+    /// either. That directory is taken to lie outside every secret: a read below it is held to
+    /// the rules by [`secret_led`].
+    floating: Vec<String>,
     lost: Option<String>,
 }
 
+/// The most directories [`line_bases`] follows a line's commands into: each relative target is
+/// joined to every directory before it, so a line of distinct ones doubles them.
+const STANDS_MAX: usize = 64;
+
 /// [`Bases`] of a line of `segments`: `start`'s, and every `cd` target and `git -C` directory
-/// the line names, a relative one joined to every directory before it, in any order the line
-/// may run them. A move it cannot follow: `cd -`, a directory-stack entry, `popd`, a target
+/// the line names, a relative one joined to every directory before it (a floating one's too), in
+/// any order the line may run them, and a `cd` or `pushd` target `CDPATH` may place also
+/// floating. A move it cannot follow: `cd -`, a directory-stack entry, `popd`, a target
 /// built at run time or globbed, another user's home, a second operand (zsh's `cd old new`
-/// edits `PWD`), or a relative target a loop may repeat.
+/// edits `PWD`), a relative target a loop may repeat, or one that takes the line past
+/// [`STANDS_MAX`] directories.
 fn line_bases(segments: &[Vec<String>], start: Start<'_>, home: Option<&Path>) -> Bases {
-    let (dirs, lost) = start.bases();
-    let mut b = Bases { dirs, lost };
+    let mut b = start.bases();
     let looped = segments.iter().any(|seg| {
         seg.iter()
             .find(|w| w.as_str() != "!")
@@ -3209,12 +3405,18 @@ fn line_bases(segments: &[Vec<String>], start: Start<'_>, home: Option<&Path>) -
             continue;
         };
         let at = run.at;
-        let moves: Vec<Result<Option<&str>, ()>> = match program(&seg[at]) {
-            "cd" | "pushd" => vec![cd_operand(&seg[at + 1..])],
-            "popd" => vec![Err(())],
-            "git" => git_dirs(seg, at).into_iter().map(|d| Ok(Some(d))).collect(),
-            _ => continue,
-        };
+        let cd = matches!(program(&seg[at]), "cd" | "pushd");
+        let mut moves: Vec<Result<Option<&str>, ()>> =
+            run.chdir.iter().map(|&d| Ok(Some(d))).collect();
+        match program(&seg[at]) {
+            "cd" | "pushd" => moves.push(cd_operand(&seg[at + 1..])),
+            "popd" => moves.push(Err(())),
+            "git" => moves.extend(git_dirs(seg, at).into_iter().map(|d| d.map(Some))),
+            _ => {}
+        }
+        if moves.is_empty() {
+            continue;
+        }
         for m in moves {
             let moved = match m {
                 Ok(None) => home
@@ -3232,44 +3434,72 @@ fn line_bases(segments: &[Vec<String>], start: Start<'_>, home: Option<&Path>) -
                     b.lost.get_or_insert(format!("after {why}"));
                 }
             }
+            if let Ok(Some(t)) = m
+                && !rooted(t)
+                && !t.starts_with('~')
+            {
+                let looked_up = (cd && cdpath_searched(t)).then(|| t.to_string());
+                let floated: Vec<String> = b.floating.iter().map(|f| joined(f, t)).collect();
+                b.floating.extend(floated.into_iter().chain(looked_up));
+            }
+            distinct(&mut b.dirs);
+            distinct(&mut b.floating);
+            if b.dirs.len() + b.floating.len() > STANDS_MAX {
+                b.lost.get_or_insert(format!(
+                    "on a line whose commands may stand in more than {STANDS_MAX} directories"
+                ));
+                // Every relative path is unproven now: reading it from each directory would
+                // only name it otherwise.
+                b.dirs.clear();
+                b.floating.clear();
+                return b;
+            }
         }
     }
     b
 }
 
-/// The operand of `cd` with `args`: `None` for the home, else its one operand; `Err` when it
-/// takes an option other than `-L`, `-P`, `-e`, `-@`, `-q` or `-s` (zsh's `-N` reads the
-/// directory stack), names `-` (`OLDPWD`) or a stack entry (`+N`), or takes two operands.
-fn cd_operand(args: &[String]) -> Result<Option<&str>, ()> {
+/// `v` without the repeats of a directory it holds, in order.
+fn distinct(v: &mut Vec<String>) {
     let mut k = 0;
-    while let Some(w) = args.get(k).filter(|w| w.len() > 1 && w.starts_with('-')) {
-        k += 1;
-        if w == "--" {
-            break;
-        }
-        if !w[1..]
-            .chars()
-            .all(|c| matches!(c, 'L' | 'P' | 'e' | '@' | 'q' | 's'))
-        {
-            return Err(());
+    while k < v.len() {
+        if v[..k].contains(&v[k]) {
+            v.remove(k);
+        } else {
+            k += 1;
         }
     }
-    match args.get(k..).unwrap_or(&[]) {
-        [] => Ok(None),
-        [t] if t != "-" && !t.starts_with('+') => Ok(Some(t)),
-        _ => Err(()),
+}
+
+/// `rel` read from `dir`, or alone from `""` ([`Bases::floating`]'s directory it cannot place).
+fn joined(dir: &str, rel: &str) -> String {
+    if dir.is_empty() {
+        rel.to_string()
+    } else {
+        format!("{}/{rel}", dir.trim_end_matches('/'))
     }
 }
 
 /// The directories git's `-C` options before its subcommand name, in order.
-fn git_dirs(seg: &[String], at: usize) -> Vec<&str> {
+fn git_dirs(seg: &[String], at: usize) -> Vec<Result<&str, ()>> {
     let mut out = Vec::new();
     let mut j = at + 1;
     while let Some(t) = seg.get(j).map(String::as_str) {
-        if t == "-C" {
-            out.extend(seg.get(j + 1).map(String::as_str));
-            j += 2;
-        } else if matches!(t, "-c" | "--namespace" | "--git-dir" | "--work-tree") {
+        if t == "--" {
+            break;
+        }
+        if let Some(glued) = t.strip_prefix("-C") {
+            if glued.is_empty() {
+                out.push(seg.get(j + 1).map(String::as_str).ok_or(()));
+                j += 2;
+            } else {
+                out.push(Ok(glued));
+                j += 1;
+            }
+        } else if matches!(
+            t,
+            "-c" | "--namespace" | "--super-prefix" | "--attr-source" | "--git-dir" | "--work-tree"
+        ) {
             j += 2;
         } else if t.starts_with('-') {
             j += 1;
@@ -3319,23 +3549,57 @@ fn cd_moves(
     if looped {
         return Err(format!("`cd {t}`, a relative move a loop may repeat"));
     }
-    Ok(dirs
-        .iter()
-        .map(|d| format!("{}/{t}", d.trim_end_matches('/')))
-        .collect())
+    Ok(dirs.iter().map(|d| joined(d, t)).collect())
+}
+
+/// What an operand may name, for [`secrets_unreached`] ([`operand_reach`]).
+struct Reach {
+    /// Every component list it may name.
+    comps: Vec<Vec<String>>,
+    /// What it names below a directory this check cannot place ([`Bases::floating`]), past that
+    /// directory ([`lexical_tails`]).
+    tails: Vec<Vec<String>>,
+    /// Why it may name another file this check cannot see.
+    unsure: Option<String>,
+}
+
+impl Reach {
+    /// The rule it may fall under, read `below` levels down ([`secret_reach`] over its
+    /// components, [`secret_led`] over its tails), named.
+    fn secret(&self, secrets: &[SecretRule], below: usize) -> Option<String> {
+        if let Some(rule) = self
+            .comps
+            .iter()
+            .find_map(|c| secret_reach(c, secrets, below))
+        {
+            return Some(format!("({rule:?})"));
+        }
+        self.tails
+            .iter()
+            .find_map(|t| secret_led(t, secrets, below))
+            .map(|rule| format!("({rule:?}) from a directory this check cannot place"))
+    }
+
+    /// Why it may name a file no rule sees: its `unsure`, else a read by a handle
+    /// ([`handle_read`]) among its components or its tails.
+    fn doubt(self) -> Option<String> {
+        self.unsure
+            .or_else(|| handle_read(self.comps.iter().chain(&self.tails)))
+    }
 }
 
 /// Every component list `op` may name: [`operand_comps`]' readings (a relative `op`'s, its words
 /// as written, only with `literal`), `~user/…` read under the home when `user` is its owner's
-/// name, and a relative `op` (and `~+/…`) joined to each of `bases`' directories; and why it may
-/// name another file this check cannot see (a path the shell builds at run time, `~-`, or a
-/// relative one after `bases`' lost move).
-fn operand_reach(
-    op: &str,
-    home: Option<&Path>,
-    bases: &Bases,
-    literal: bool,
-) -> (Vec<Vec<String>>, Option<String>) {
+/// name, and a relative `op` (and `~+/…`) joined to each of `bases`' directories and read below
+/// each it floats (and from the root, where an alias of the root leads what it names below one,
+/// [`below_aliases`]); and why it may name another file this check cannot see (a path the line
+/// builds at run time, `~-`, or a relative one after `bases`' lost move).
+fn operand_reach(op: &str, home: Option<&Path>, bases: &Bases, literal: bool) -> Reach {
+    let only = |comps: Vec<Vec<String>>, unsure: Option<String>| Reach {
+        comps,
+        tails: Vec::new(),
+        unsure,
+    };
     let as_written = literal || rooted(op) || op.starts_with(['~', '$']);
     let mut comps = if as_written {
         operand_comps(op, home)
@@ -3343,9 +3607,9 @@ fn operand_reach(
         Vec::new()
     };
     if op.contains(SUBSTITUTION) || op.contains(QUOTED_SUBSTITUTION) {
-        return (
+        return only(
             comps,
-            Some("a read of a path the shell builds at run time, which may name a secret".into()),
+            Some("a read of a path the line builds at run time, which may name a secret".into()),
         );
     }
     let mut relative = (!rooted(op) && !op.starts_with('~')).then_some(op);
@@ -3357,7 +3621,7 @@ fn operand_reach(
         match user {
             "+" => relative = Some(tail),
             "-" => {
-                return (
+                return only(
                     comps,
                     Some("a read under `~-` (OLDPWD), which this check cannot resolve".into()),
                 );
@@ -3377,45 +3641,261 @@ fn operand_reach(
         }
     }
     let Some(rel) = relative else {
-        return (comps, None);
+        return only(comps, None);
     };
     for d in &bases.dirs {
-        comps.extend(path_readings(&format!("{}/{rel}", d.trim_end_matches('/'))));
+        comps.extend(path_readings(&joined(d, rel)));
     }
+    let tails: Vec<Vec<String>> = bases
+        .floating
+        .iter()
+        .flat_map(|f| lexical_tails(&joined(f, rel)))
+        .collect();
+    // A directory it cannot place may be the root: a tail an alias of the root leads is also
+    // read from there.
+    comps.extend(tails.iter().flat_map(|t| below_aliases(t)));
     let unsure = bases
         .lost
         .as_ref()
         .map(|lost| format!("a read of a relative path {lost}"));
-    (comps, unsure)
+    Reach {
+        comps,
+        tails,
+        unsure,
+    }
 }
 
-/// The rule a path `comps` names may fall under, its components globs the shell may expand: an
-/// [`SecretRule::Under`] directory some expansion names or lies under, a [`SecretRule::Component`]
-/// some component may expand to, or a [`SecretRule::Basename`] the last component matches as
-/// written (a glob that may expand to a secret's basename is not held to it: `cat src/*` may read
-/// `src/a.pem`). With `recursive` (a tree a reader descends, whose root the operand check holds
-/// to every rule), the `Under` rules alone, a directory above one reaching it too.
-fn secret_reach<'a>(
-    comps: &[String],
+/// The components `rel`, a path from a directory this check cannot place, names below that
+/// directory or one above it: split at `/` (and at `\` too, where it holds one), each `..`
+/// taking the component before it, or none.
+fn lexical_tails(rel: &str) -> Vec<Vec<String>> {
+    let mut out = Vec::new();
+    for seps in [&['/'][..], &['/', '\\']] {
+        if seps.len() == 2 && !rel.contains('\\') {
+            break;
+        }
+        let mut tail: Vec<String> = Vec::new();
+        for c in rel.split(seps).filter(|c| !c.is_empty() && *c != ".") {
+            if c == ".." {
+                tail.pop();
+            } else {
+                tail.push(c.to_string());
+            }
+        }
+        out.push(tail);
+    }
+    out
+}
+
+/// The rule `tail`, a path below a directory this check cannot place ([`lexical_tails`]), may fall
+/// under, read `below` levels down. That directory is taken to lie outside every secret, so this
+/// is a [`SecretRule::Under`] rule a trailing part of whose path leads `tail` (`.claude.json`,
+/// `../.claude.json`, and `gh/hosts.yml` read from above `~/.config`), or a component or basename
+/// rule as [`secret_reach`] holds it.
+fn secret_led<'a>(
+    tail: &[String],
     secrets: &'a [SecretRule],
-    recursive: bool,
+    below: usize,
 ) -> Option<&'a SecretRule> {
     secrets.iter().find(|rule| match rule {
         SecretRule::Under(dir) => path_readings(&dir.to_string_lossy())
             .iter()
-            .any(|d| reaches(comps, d, recursive)),
-        SecretRule::Component(_) | SecretRule::Basename(_) if recursive => false,
-        SecretRule::Component(name) => comps.iter().any(|c| component_meets(c, name)),
-        SecretRule::Basename(glob) => comps
-            .last()
-            .is_some_and(|c| glob_match(&glob.to_ascii_lowercase(), &c.to_ascii_lowercase())),
+            .any(|d| (0..d.len()).any(|j| reaches(tail, &d[j..], below))),
+        _ => secret_reach(tail, std::slice::from_ref(*rule), below).is_some(),
     })
 }
 
-/// Whether some expansion of `comps` names `dir` or a path under it, or, with `recursive`, a
-/// directory above it: each component compared by [`component_meets`], a whole `**` (zsh's, and
-/// bash's under `globstar`) taking any run of components.
-fn reaches(comps: &[String], dir: &[String], recursive: bool) -> bool {
+/// [`operand_reach`], on a Windows host (`windows`: built for Windows, or a drive home) with
+/// Windows' own spellings of each name ([`windows_spellings`]); a drive-relative `op` (`C:name`)
+/// read as relative from each directory the line may stand in and from its drive's own working
+/// directory, which this check cannot place (the drive's root among them, read as
+/// [`path_readings`] reads `C:/name`); and a UNC or device path ([`unc`]), as an operand or
+/// a directory a relative one is read from, unproven.
+fn windows_reach(
+    op: &str,
+    home: Option<&Path>,
+    bases: &Bases,
+    literal: bool,
+    windows: bool,
+) -> Reach {
+    if !windows {
+        return operand_reach(op, home, bases, literal);
+    }
+    let relative = !rooted(op) && (!op.starts_with('~') || op.starts_with("~+"));
+    if unc(op) || relative && bases.dirs.iter().any(|d| unc(d)) {
+        return Reach {
+            comps: Vec::new(),
+            tails: Vec::new(),
+            unsure: Some(
+                "a read of a UNC or device path, which may name this machine's disk under another \
+                 root"
+                    .into(),
+            ),
+        };
+    }
+    let mut reach = match op.get(2..).filter(|_| drive_led(op) && !rooted(op)) {
+        Some(rest) => {
+            let mut reach = operand_reach(rest, home, bases, false);
+            if literal {
+                reach.comps.extend(operand_comps(op, home));
+            }
+            reach.tails.extend(lexical_tails(rest));
+            // That directory may be the drive's root, read through its aliases too.
+            reach
+                .comps
+                .extend(path_readings(&format!("{}/{rest}", &op[..2])));
+            reach
+        }
+        None => operand_reach(op, home, bases, literal),
+    };
+    let (comps, short) = windows_spellings(std::mem::take(&mut reach.comps));
+    let (tails, tail_short) = windows_spellings(std::mem::take(&mut reach.tails));
+    reach.comps = comps;
+    reach.tails = tails;
+    if reach.unsure.is_none() {
+        reach.unsure = short.or(tail_short);
+    }
+    reach
+}
+
+/// Whether `t` is led by a drive (`C:`), rooted (`C:\…`) or relative to the drive's own working
+/// directory (`C:name`).
+fn drive_led(t: &str) -> bool {
+    let b = t.as_bytes();
+    b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
+}
+
+/// Whether `op` is a UNC or device path (`\\host\share`, `\\?\C:\…`, `//./C:/…`, and the NT
+/// namespace's `\??\C:\…`, which Git Bash's `cat` opens, MEASURED 2026-10-29 in the Windows lane),
+/// on Windows a spelling of this machine's disk (`\\localhost\C$`) under another root.
+fn unc(op: &str) -> bool {
+    let sep = |b: u8| matches!(b, b'/' | b'\\');
+    match op.as_bytes() {
+        [a, b, ..] if sep(*a) && sep(*b) => true,
+        [a, b'?', b'?', b, ..] => sep(*a) && sep(*b),
+        _ => false,
+    }
+}
+
+/// Leads a component [`windows_spellings`] reads as the basis of a short 8.3 name (`\0SSH`, of
+/// `SSH~1`), which [`component_meets`] and [`basename_meets`] hold to every long name Windows may
+/// have made that basis of ([`short_meets`]). No path component holds a NUL.
+const SHORT: char = '\0';
+
+/// `lists` and Windows' own spellings of each: each name without its `:stream` suffix and its
+/// trailing dots and spaces, and a short 8.3 name whose stem holds a whole basis (`SSH~1`, of
+/// `.ssh`; `ALWU~1`, of `Al Wu`) read as that basis led by [`SHORT`]; and why a name may stand for
+/// one this check cannot see: an 8.3 name its stem filled to eight characters (cut to fit, or
+/// hashed) or with an extension, which Windows may resolve to any long name.
+fn windows_spellings(lists: Vec<Vec<String>>) -> (Vec<Vec<String>>, Option<String>) {
+    let mut out = Vec::with_capacity(lists.len() * 2);
+    let mut doubt = None;
+    for comps in lists {
+        let mut bare = Vec::with_capacity(comps.len());
+        for c in &comps {
+            let name = c.split(':').next().unwrap_or(c);
+            let name = match name.trim_end_matches(['.', ' ']) {
+                "" => name,
+                trimmed => trimmed,
+            };
+            match short_name(name) {
+                Some(Some(basis)) => bare.push(format!("{SHORT}{basis}")),
+                cut => {
+                    if cut.is_some() {
+                        doubt.get_or_insert_with(|| {
+                            format!(
+                                "a read of an 8.3 short name ({name}), which Windows may resolve \
+                                 to any long name"
+                            )
+                        });
+                    }
+                    bare.push(name.to_string());
+                }
+            }
+        }
+        if bare != comps {
+            out.push(bare);
+        }
+        out.push(comps);
+    }
+    (out, doubt)
+}
+
+/// Whether `name` has a short 8.3 name's shape (`STEM~N`, `STEM~N.EXT`, in characters):
+/// `Some(Some(basis))` when its stem holds the whole basis Windows made it of and it has no
+/// extension (`SSH~1`, `ALWU~1`: under eight bytes, which bound its OEM code page's, and not the
+/// one character and four hex digits a hashed name keeps of a one-character basis), `Some(None)`
+/// when it may stand for any long name (a stem filled to eight, cut or hashed, or an extension),
+/// else `None`. REASONED from FAT's and NTFS's short-name rules.
+fn short_name(name: &str) -> Option<Option<&str>> {
+    let (stem, ext) = match name.split_once('.') {
+        Some((stem, ext)) => (stem, Some(ext)),
+        None => (name, None),
+    };
+    let (lead, n) = stem.rsplit_once('~')?;
+    let shaped = !lead.is_empty()
+        && !n.is_empty()
+        && n.bytes().all(|b| b.is_ascii_digit())
+        && stem.chars().count() <= 8
+        && ext.is_none_or(|e| !e.is_empty() && e.chars().count() <= 3 && !e.contains('.'));
+    let hashed = lead.chars().count() == 5 && lead.chars().skip(1).all(|c| c.is_ascii_hexdigit());
+    shaped.then(|| (stem.len() < 8 && ext.is_none() && !hashed).then_some(lead))
+}
+
+/// Whether a short 8.3 name whose stem holds `basis` whole ([`short_name`]) may stand for a long
+/// name `name` (a rule's name, or a basename rule's glob, its `*` and `?` as [`glob_match`] reads
+/// them). Windows makes a long name's basis by dropping every space and dot (its leading ones
+/// among them), putting `_` for each of `+,;=[]` and for a character its OEM code page lacks, and
+/// upper-casing it (REASONED from FAT's and NTFS's short-name rules; MEASURED 2026-10-30 in the
+/// Windows lane, `ALWU~1` of `Al Wu` and `A_B~1` of `a+b`): so a character of `name` Windows may
+/// replace, and a non-ASCII one of `basis`, is any one, and a `?` of the glob, which may match a
+/// dropped space or dot, any run.
+fn short_meets(basis: &str, name: &str) -> bool {
+    let tok = |c: char| {
+        if c.is_ascii() {
+            Tok::Lit(c.to_ascii_lowercase())
+        } else {
+            Tok::One
+        }
+    };
+    let basis: Vec<Tok> = basis.chars().map(tok).collect();
+    let long: Vec<Tok> = name
+        .chars()
+        .filter(|c| !matches!(c, ' ' | '.'))
+        .map(|c| match c {
+            '*' | '?' => Tok::Star,
+            '+' | ',' | ';' | '=' | '[' | ']' => Tok::One,
+            c => tok(c),
+        })
+        .collect();
+    tokens_meet(&basis, &long)
+}
+
+/// The rule a path `comps` names may fall under, its components globs the shell may expand: an
+/// [`SecretRule::Under`] directory some expansion names or lies under, a [`SecretRule::Component`]
+/// some component may expand to, or a [`SecretRule::Basename`] the last component may expand to
+/// a name of ([`basename_meets`]). With `below` above zero (a tree a reader descends, whose root
+/// the operand check holds to every rule), the `Under` rules alone, a directory up to `below`
+/// levels above one reaching it too.
+fn secret_reach<'a>(
+    comps: &[String],
+    secrets: &'a [SecretRule],
+    below: usize,
+) -> Option<&'a SecretRule> {
+    secrets.iter().find(|rule| match rule {
+        SecretRule::Under(dir) => path_readings(&dir.to_string_lossy())
+            .iter()
+            .any(|d| reaches(comps, d, below)),
+        SecretRule::Component(_) | SecretRule::Basename(_) if below > 0 => false,
+        SecretRule::Component(name) => comps.iter().any(|c| component_meets(c, name)),
+        SecretRule::Basename(glob) => comps.last().is_some_and(|c| basename_meets(c, glob)),
+    })
+}
+
+/// Whether some expansion of `comps` names `dir` or a path under it, or a directory at most
+/// `below` levels above it: each component compared by [`component_meets`], a whole `**` (zsh's,
+/// and bash's under `globstar`) taking any run of components.
+fn reaches(comps: &[String], dir: &[String], below: usize) -> bool {
     let (n, m) = (comps.len(), dir.len());
     let mut ok = vec![vec![false; m + 1]; n + 1];
     for i in (0..=n).rev() {
@@ -3423,7 +3903,7 @@ fn reaches(comps: &[String], dir: &[String], recursive: bool) -> bool {
             ok[i][j] = if j == m {
                 true
             } else if i == n {
-                recursive
+                m - j <= below
             } else if matches!(comps[i].as_str(), "**" | "***") {
                 ok[i + 1][j] || ok[i][j + 1]
             } else {
@@ -3434,68 +3914,163 @@ fn reaches(comps: &[String], dir: &[String], recursive: bool) -> bool {
     ok[0][0]
 }
 
-/// Whether the shell may expand `pattern`, one path component of a word, to `name`, ignoring
-/// case as the default volume does: `*` any run of characters (a leading dot too, as under
-/// `dotglob` or zsh's `GLOB_DOTS`), `?` and a bracket expression any one, and a component
-/// holding an extended-glob group (`(…|…)`) any name.
-fn component_meets(pattern: &str, name: &str) -> bool {
-    #[derive(Clone, Copy)]
-    enum Tok {
-        Star,
-        One,
-        Lit(char),
-    }
+/// One character of a glob, for [`glob_tokens`] and [`tokens_meet`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tok {
+    /// `*`: any run of characters.
+    Star,
+    /// `?` or a bracket expression: any one character.
+    One,
+    /// The character itself, case-folded ([`fold_char`]).
+    Lit(char),
+}
+
+/// The tokens the shell globs one path component `pattern` by, ignoring case as the default
+/// volume does: `*`, `?`, a bracket expression ([`bracket_end`]) any one character, every other
+/// character itself; `None` for a component holding an extended-glob group (`(…|…)`), which may
+/// expand to any name.
+fn glob_tokens(pattern: &str) -> Option<Vec<Tok>> {
     if pattern.contains(['(', '|']) {
-        return true;
+        return None;
     }
     let cs: Vec<char> = pattern.chars().collect();
     let mut toks = Vec::new();
     let mut i = 0;
     while i < cs.len() {
-        match cs[i] {
-            '*' => toks.push(Tok::Star),
-            '?' => toks.push(Tok::One),
-            '[' if cs.iter().skip(i + 2).any(|c| *c == ']') => {
+        match (cs[i], bracket_end(&cs, i)) {
+            ('*', _) => toks.push(Tok::Star),
+            ('?', _) => toks.push(Tok::One),
+            ('[', Some(end)) => {
                 toks.push(Tok::One);
-                i += 2 + cs[i + 2..].iter().position(|c| *c == ']').unwrap_or(0);
+                i = end;
             }
-            c => toks.extend(c.to_lowercase().map(Tok::Lit)),
+            (c, _) if c.is_ascii() => toks.push(Tok::Lit(c.to_ascii_lowercase())),
+            (c, _) => toks.extend(fold_char(c).map(Tok::Lit)),
         }
         i += 1;
     }
-    let name: Vec<char> = name.chars().flat_map(char::to_lowercase).collect();
-    let (n, m) = (toks.len(), name.len());
+    Some(toks)
+}
+
+/// Where the bracket expression opening at `cs[open]` closes, as bash and zsh read one: a `!` or
+/// `^` first negates, a `]` first (after it) is a member, and a POSIX class (`[:alpha:]`), an
+/// equivalence class (`[=s=]`) or a collating element (`[.s.]`) inside is read whole, its `]`
+/// none; `None` when `cs[open]` is no `[` or the expression never closes (the `[` is then
+/// itself).
+fn bracket_end(cs: &[char], open: usize) -> Option<usize> {
+    if cs.get(open) != Some(&'[') {
+        return None;
+    }
+    let mut j = open + 1;
+    if matches!(cs.get(j), Some('!' | '^')) {
+        j += 1;
+    }
+    if cs.get(j) == Some(&']') {
+        j += 1;
+    }
+    while j < cs.len() {
+        match cs[j] {
+            ']' => return Some(j),
+            '[' if matches!(cs.get(j + 1), Some(':' | '=' | '.')) => {
+                let d = cs[j + 1];
+                j = (j + 2..cs.len().saturating_sub(1))
+                    .find(|&k| cs[k] == d && cs[k + 1] == ']')
+                    .map_or(j + 1, |k| k + 2);
+            }
+            _ => j += 1,
+        }
+    }
+    None
+}
+
+/// Whether some name matches both token runs `a` and `b`.
+fn tokens_meet(a: &[Tok], b: &[Tok]) -> bool {
+    let (n, m) = (a.len(), b.len());
     let mut ok = vec![vec![false; m + 1]; n + 1];
-    ok[n][m] = true;
-    for i in (0..n).rev() {
+    for i in (0..=n).rev() {
         for j in (0..=m).rev() {
-            ok[i][j] = match toks[i] {
-                Tok::Star => ok[i + 1][j] || (j < m && ok[i][j + 1]),
-                Tok::One => j < m && ok[i + 1][j + 1],
-                Tok::Lit(c) => j < m && name[j] == c && ok[i + 1][j + 1],
+            ok[i][j] = match (a.get(i), b.get(j)) {
+                (None, None) => true,
+                (Some(Tok::Star), _) => ok[i + 1][j] || (j < m && ok[i][j + 1]),
+                (_, Some(Tok::Star)) => ok[i][j + 1] || (i < n && ok[i + 1][j]),
+                (Some(x), Some(y)) => {
+                    let one = matches!((x, y), (Tok::One, _) | (_, Tok::One)) || x == y;
+                    one && ok[i + 1][j + 1]
+                }
+                _ => false,
             };
         }
     }
     ok[0][0]
 }
 
-/// The trees the command at `seg[at]` reads every file below, as written: for `grep -r` (and
-/// `-R`, `--recursive`, `-d recurse`), `rg`, `find` that runs `-exec`, `-execdir`, `-ok` or
-/// `-okdir`, and `git grep`, every word after the program that is no option (its operands among
-/// them) and `.`, where each starts with none named; for `diff -r` and `git diff --no-index`, its
-/// words. A word built at run time is left to the operand check, which refuses it.
-fn descends(seg: &[String], at: usize) -> Vec<&str> {
-    fn words(seg: &[String], from: usize, here: bool) -> Vec<&str> {
-        seg.get(from..)
-            .unwrap_or(&[])
-            .iter()
-            .map(String::as_str)
+/// Whether the shell may expand `pattern`, one path component of a word, to `name`, ignoring
+/// case as the default volume does: `*` any run of characters (a leading dot too, as under
+/// `dotglob` or zsh's `GLOB_DOTS`), `?` and a bracket expression any one, and a component
+/// holding an extended-glob group (`(…|…)`) any name ([`glob_tokens`]); a short 8.3 name's basis
+/// ([`SHORT`]) also any long name Windows may have made it of ([`short_meets`]).
+fn component_meets(pattern: &str, name: &str) -> bool {
+    if let Some(basis) = pattern.strip_prefix(SHORT)
+        && short_meets(basis, name)
+    {
+        return true;
+    }
+    if !pattern.contains(['*', '?', '[', '(', '|']) {
+        return same_name(pattern, name);
+    }
+    let name: Vec<Tok> = folded(name).chars().map(Tok::Lit).collect();
+    glob_tokens(pattern).is_none_or(|toks| tokens_meet(&toks, &name))
+}
+
+/// Whether `c`, a path's last component and a glob the shell may expand, may name a file the
+/// basename rule `glob` (its `*` and `?` as [`glob_match`] reads them) matches: `glob` matched
+/// against `c` as written, or some expansion of `c` ([`glob_tokens`], a `*` taking a leading dot
+/// too) matching `glob` when one of the two holds no `*`: a literal rule's every spelling
+/// (`.netr?`, `.npmr[c]`, `.pypi*`, `*.json` for `.credentials.json`) and a `*`-free glob's
+/// (`a.pe?` for `*.pem`). A `*` in both is held as written, so `cat src/*.rs` stays a read,
+/// though `id_rsa*` names `id_rsa.rs`. A short 8.3 name's basis ([`SHORT`]) also meets a rule
+/// some long name Windows may have made it of matches ([`short_meets`]).
+fn basename_meets(c: &str, glob: &str) -> bool {
+    if let Some(basis) = c.strip_prefix(SHORT)
+        && short_meets(basis, glob)
+    {
+        return true;
+    }
+    if glob_match(&folded(glob), &folded(c)) {
+        return true;
+    }
+    let rule: Vec<Tok> = folded(glob)
+        .chars()
+        .map(|ch| match ch {
+            '*' => Tok::Star,
+            '?' => Tok::One,
+            ch => Tok::Lit(ch),
+        })
+        .collect();
+    glob_tokens(c).is_none_or(|toks| {
+        !(toks.contains(&Tok::Star) && rule.contains(&Tok::Star)) && tokens_meet(&toks, &rule)
+    })
+}
+
+/// The trees the command at `seg[at]` reads files below, as written, each with how many levels
+/// below it it reads ([`TREE`] for any): for `grep -r` (and `-R`, `--recursive`, `-d recurse`),
+/// `rg`, `find` that runs `-exec`, `-execdir`, `-ok` or `-okdir`, and `git grep`, every word
+/// after the program that is no option (its operands among them), and `.` when it names no tree
+/// to start from (grep's and rg's operands past the pattern, by [`grammar_names_operand`]; find's
+/// paths before its expression, [`find_names_a_path`]; a path after git grep's `--`); for `diff
+/// -r` and `git diff --no-index`, its words; for `diff`, its words one level down, as it compares
+/// each file two directories both hold. A word built at run time is left to the operand check,
+/// which refuses it; a word a redirect takes is none.
+fn descends(seg: &[String], at: usize) -> Vec<(&str, usize)> {
+    fn words(args: Vec<&str>, here: bool, below: usize) -> Vec<(&str, usize)> {
+        args.into_iter()
             .filter(|w| !w.starts_with('-'))
             .filter(|w| !w.contains(SUBSTITUTION) && !w.contains(QUOTED_SUBSTITUTION))
             .chain(here.then_some("."))
+            .map(|w| (w, below))
             .collect()
     }
-    let args = &seg[at + 1..];
+    let args = unredirected(seg, at + 1);
     let short = |letters: &[char]| {
         args.iter().any(|a| {
             a.len() > 1 && a.starts_with('-') && !a.starts_with("--") && a[1..].contains(letters)
@@ -3514,26 +4089,69 @@ fn descends(seg: &[String], at: usize) -> Vec<&str> {
                 || long(&["recursive", "dereference-recursive", "directories"])
                 || args.iter().any(|a| a.contains("recurse")) =>
         {
-            words(seg, at + 1, true)
+            let here = !grammar_names_operand(seg, at);
+            words(args, here, TREE)
         }
-        "rg" => words(seg, at + 1, true),
+        "rg" => {
+            let here = !grammar_names_operand(seg, at);
+            words(args, here, TREE)
+        }
         "find"
             if args
                 .iter()
-                .any(|a| matches!(a.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir")) =>
+                .any(|a| matches!(*a, "-exec" | "-execdir" | "-ok" | "-okdir")) =>
         {
-            words(seg, at + 1, true)
+            let here = !find_names_a_path(&args);
+            words(args, here, TREE)
         }
-        "diff" if short(&['r']) || long(&["recursive"]) => words(seg, at + 1, false),
+        "diff" if short(&['r']) || long(&["recursive"]) => words(args, false, TREE),
+        "diff" => words(args, false, 1),
         "git" => match git_subcommand(seg, at) {
-            Some((sub, "grep")) => words(seg, sub + 1, true),
-            Some((sub, "diff")) if args.iter().any(|a| a == "--no-index") => {
-                words(seg, sub + 1, false)
+            Some((sub, "grep")) => {
+                let rest = unredirected(seg, sub + 1);
+                let here = rest
+                    .iter()
+                    .position(|a| *a == "--")
+                    .is_none_or(|k| k + 1 == rest.len());
+                words(rest, here, TREE)
+            }
+            Some((sub, "diff")) if args.contains(&"--no-index") => {
+                words(unredirected(seg, sub + 1), false, TREE)
             }
             _ => Vec::new(),
         },
         _ => Vec::new(),
     }
+}
+
+/// How many levels below a tree [`descends`] names a recursive reader reads: any.
+const TREE: usize = usize::MAX;
+
+/// Whether find's words `args` (after the program) name a path to start from: a word past its
+/// options (`-H`, `-L`, `-P` and BSD's `-E`, `-X`, `-d`, `-s`, `-x`, alone or clustered; GNU's
+/// `-D` with its value and `-O<level>`) that opens no expression (`-…`, `(`, `!`), or BSD's `-f`
+/// with its path. With none, GNU find starts from `.`.
+fn find_names_a_path(args: &[&str]) -> bool {
+    let mut k = 0;
+    while let Some(a) = args.get(k) {
+        match *a {
+            "-f" => return k + 1 < args.len(),
+            "-D" => k += 2,
+            "--" => {
+                k += 1;
+                break;
+            }
+            w if w.starts_with("-O") => k += 1,
+            w if w.len() > 1
+                && w.starts_with('-')
+                && w[1..].chars().all(|c| "HLPEXdsx".contains(c)) =>
+            {
+                k += 1;
+            }
+            _ => break,
+        }
+    }
+    args.get(k).is_some_and(|w| !w.starts_with(['-', '(', '!']))
 }
 
 fn trust_dialog(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {

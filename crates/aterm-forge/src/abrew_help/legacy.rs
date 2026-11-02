@@ -182,7 +182,11 @@ impl Reader<'_> {
                             if ch == '}' {
                                 break;
                             }
-                            if ch != '_' {
+                            if ch == '_' {
+                                if hex.is_empty() {
+                                    return Err("invalid Unicode escape digits".into());
+                                }
+                            } else {
                                 if !ch.is_ascii_hexdigit() || hex.len() == 6 {
                                     return Err("invalid Unicode escape digits".into());
                                 }
@@ -219,5 +223,6 @@ pub(super) const ALIASES: &[(&str, &str)] = &[("y", "x")];
         assert!(
             tables(&source.replace("(\"y\", \"x\")", "(\"y\", \"x\"), (\"y\", \"x\")")).is_err()
         );
+        assert!(tables(&source.replace("\\u{1f408}", "\\u{_1f408}")).is_err());
     }
 }

@@ -224,6 +224,7 @@ fn stamps_round_trip_and_a_malformed_one_is_refused() {
         "4096",
         "4096 abab 7",
         &s.replace("ab", "AB"),
+        &s.replacen("ab", "+b", 1),
         &format!("{s} extra"),
         &s.replacen(' ', "  ", 1),
         &format!("+4096 {hex} 777"),

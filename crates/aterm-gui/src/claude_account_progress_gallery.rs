@@ -33,19 +33,141 @@ fn capture(app: &mut crate::App, wid: crate::WindowId) -> Vec<u8> {
     })
 }
 
-/// Writes opt-in review images; it never opens a provider or reads account credentials.
+/// Renders review images without opening a provider or reading account credentials.
 #[test]
-#[ignore = "writes App-rendered fixture PNGs: set ATERM_ACCOUNT_PROGRESS_GALLERY"]
 fn account_progress_gallery() {
-    let Some(dir) = std::env::var_os("ATERM_ACCOUNT_PROGRESS_GALLERY") else {
-        return;
-    };
-    let dir = std::path::PathBuf::from(dir);
-    std::fs::create_dir_all(&dir).expect("gallery output directory");
+    let (dir, _gallery) =
+        crate::scripted_redraw_fixture::gallery_directory("ATERM_ACCOUNT_PROGRESS_GALLERY");
     let mut manifest = String::from(
         "# Synthetic owner-bound account facts and Claude-style screen; no live account state.\nscene\tcolumns\trows\tfile\n",
     );
     for (name, cols, phase, eligible, wall, next_at, detail) in [
+        (
+            "activity-menu-execution-expired-off",
+            120,
+            ProgressPhase::Unknown,
+            0,
+            None,
+            None,
+            aterm_agent::harness::account_progress::EXECUTION_REFRESH_FINDING,
+        ),
+        (
+            "activity-menu-execution-expired-off-narrow",
+            60,
+            ProgressPhase::Unknown,
+            0,
+            None,
+            None,
+            aterm_agent::harness::account_progress::EXECUTION_REFRESH_FINDING,
+        ),
+        (
+            "activity-menu-execution-expired-probing-off",
+            120,
+            ProgressPhase::Probing,
+            0,
+            None,
+            None,
+            aterm_agent::harness::account_progress::EXECUTION_REFRESH_FINDING,
+        ),
+        (
+            "activity-menu-execution-expired-probing-off-narrow",
+            60,
+            ProgressPhase::Probing,
+            0,
+            None,
+            None,
+            aterm_agent::harness::account_progress::EXECUTION_REFRESH_FINDING,
+        ),
+        (
+            "activity-menu-execution-prepared-off",
+            120,
+            ProgressPhase::Waiting,
+            0,
+            None,
+            Some(1_793_040_005),
+            aterm_agent::harness::account_progress::EXECUTION_PREPARED_FINDING,
+        ),
+        (
+            "activity-menu-execution-prepared-off-narrow",
+            60,
+            ProgressPhase::Waiting,
+            0,
+            None,
+            Some(1_793_040_005),
+            aterm_agent::harness::account_progress::EXECUTION_PREPARED_FINDING,
+        ),
+        (
+            "activity-menu-execution-roster-unread",
+            120,
+            ProgressPhase::Waiting,
+            0,
+            None,
+            Some(1_793_040_005),
+            aterm_agent::harness::account_progress::EXECUTION_ROSTER_UNREAD_FINDING,
+        ),
+        (
+            "activity-menu-execution-roster-unread-narrow",
+            60,
+            ProgressPhase::Waiting,
+            0,
+            None,
+            Some(1_793_040_005),
+            aterm_agent::harness::account_progress::EXECUTION_ROSTER_UNREAD_FINDING,
+        ),
+        (
+            "activity-menu-execution-probing-off",
+            120,
+            ProgressPhase::Probing,
+            0,
+            None,
+            Some(1_793_040_005),
+            aterm_agent::harness::account_progress::EXECUTION_PREPARED_FINDING,
+        ),
+        (
+            "activity-menu-execution-probing-off-narrow",
+            60,
+            ProgressPhase::Probing,
+            0,
+            None,
+            Some(1_793_040_005),
+            aterm_agent::harness::account_progress::EXECUTION_PREPARED_FINDING,
+        ),
+        (
+            "activity-menu-bindings-changed",
+            120,
+            ProgressPhase::Waiting,
+            0,
+            Some("weekly"),
+            None,
+            aterm_agent::harness::account_progress::BINDINGS_CHANGED_FINDING,
+        ),
+        (
+            "activity-menu-bindings-changed-narrow",
+            60,
+            ProgressPhase::Waiting,
+            0,
+            Some("weekly"),
+            None,
+            aterm_agent::harness::account_progress::BINDINGS_CHANGED_FINDING,
+        ),
+        (
+            "activity-menu-identity-mismatch",
+            120,
+            ProgressPhase::Waiting,
+            0,
+            Some("weekly"),
+            None,
+            aterm_agent::harness::account_progress::IDENTITY_MISMATCH_FINDING,
+        ),
+        (
+            "activity-menu-identity-mismatch-narrow",
+            60,
+            ProgressPhase::Waiting,
+            0,
+            Some("weekly"),
+            None,
+            aterm_agent::harness::account_progress::IDENTITY_MISMATCH_FINDING,
+        ),
         (
             "activity-menu-no-next-short",
             60,
@@ -149,6 +271,42 @@ fn account_progress_gallery() {
             "No recovery action is in flight",
         ),
         (
+            "unobserved-recovery",
+            120,
+            ProgressPhase::Unknown,
+            0,
+            None,
+            None,
+            aterm_agent::harness::footer::UNOBSERVED_RECOVERY_FINDING,
+        ),
+        (
+            "unobserved-recovery-narrow",
+            60,
+            ProgressPhase::Unknown,
+            0,
+            None,
+            None,
+            aterm_agent::harness::footer::UNOBSERVED_RECOVERY_FINDING,
+        ),
+        (
+            "activity-menu-unobserved-recovery",
+            120,
+            ProgressPhase::Unknown,
+            0,
+            None,
+            None,
+            aterm_agent::harness::footer::UNOBSERVED_RECOVERY_FINDING,
+        ),
+        (
+            "activity-menu-unobserved-recovery-narrow",
+            60,
+            ProgressPhase::Unknown,
+            0,
+            None,
+            None,
+            aterm_agent::harness::footer::UNOBSERVED_RECOVERY_FINDING,
+        ),
+        (
             "watching",
             120,
             ProgressPhase::Watching,
@@ -168,7 +326,27 @@ fn account_progress_gallery() {
             details: vec![detail.into()],
             next_at,
         };
-        if name.starts_with("activity-menu") {
+        if name.contains("bindings-changed") {
+            progress.eligible = None;
+        }
+        if name.contains("execution-") {
+            progress.known = None;
+            progress.eligible = None;
+            if name.contains("execution-expired-") {
+                progress.details.push(format!(
+                    "{}{}",
+                    aterm_agent::harness::account_progress::EXECUTION_HISTORY_PREFIX,
+                    aterm_agent::harness::account_progress::EXECUTION_PREPARED_FINDING,
+                ));
+            }
+            progress
+                .details
+                .push("Automatic account rotation is off".into());
+            if name.contains("roster-unread") {
+                progress.account = None;
+            }
+        }
+        if name.starts_with("activity-menu") && !name.contains("execution-") {
             progress
                 .details
                 .push("Local sign-in activity: fixture-current".into());
@@ -177,17 +355,27 @@ fn account_progress_gallery() {
                 aterm_agent::harness::usage::rfc3339_utc(progress.observed_at - 30),
             ));
         }
-        let menu_progress = progress.clone();
         let mut facts = probe::facts();
         facts.account = progress.account.clone();
         facts.account_progress = Some(progress);
-        if name == "transcript-wall" {
+        if name == "transcript-wall" || name.contains("unobserved-recovery") {
             facts.usage.get_or_insert_with(Default::default).wall =
                 Some(aterm_agent::harness::session_usage::Wall {
                     label: "7d",
-                    resets: "tomorrow".into(),
+                    resets: if name.contains("unobserved-recovery") {
+                        "tomorrow at 3pm"
+                    } else {
+                        "tomorrow"
+                    }
+                    .into(),
                 });
         }
+        if name.contains("unobserved-recovery") {
+            facts.account_progress = None;
+        }
+        let menu_progress = facts
+            .account_progress_view()
+            .map(std::borrow::Cow::into_owned);
         let live = probe::Live {
             status: if wall.is_some() {
                 "You've hit your limit · synthetic fixture"
@@ -233,7 +421,7 @@ fn account_progress_gallery() {
                     })
                     .into(),
             };
-            let (accounts, _) = crate::fact_menu::account_menu_rows_from(
+            let (mut accounts, _) = crate::fact_menu::account_menu_rows_from(
                 &roster,
                 &Default::default(),
                 &Default::default(),
@@ -241,13 +429,21 @@ fn account_progress_gallery() {
                 Some("fixture-current"),
                 None,
                 Default::default(),
-                menu_progress.observed_at,
+                menu_progress
+                    .as_ref()
+                    .map_or(0, |progress| progress.observed_at),
             );
+            if name.contains("unobserved-recovery") {
+                accounts.clear();
+            }
             let facts = crate::fact_menu::FactMenuFacts {
-                account_progress: Some(menu_progress),
+                account_progress: menu_progress,
                 cli: Some(aterm_agent::harness::accounts::Cli::Claude),
                 auto_rotate: true,
                 accounts,
+                accounts_refused: name
+                    .contains("unobserved-recovery")
+                    .then(|| "Account roster has not been observed".into()),
                 ..Default::default()
             };
             let menu = app.autopilot_menu.as_mut().unwrap();
@@ -265,26 +461,51 @@ fn account_progress_gallery() {
 }
 
 #[test]
-#[ignore = "writes App-rendered PNGs: set ATERM_NETWORK_HISTORY_GALLERY and ATERM_DEV_STATS_DECK_HEADLESS=1"]
 fn network_history_gallery() {
     use aterm_types::network_state::{
-        HistoryState, MachineIdentity, NetworkStateSnapshot, PeerObservation, Reachability,
-        ServiceAvailability, ServiceState, Visibility,
+        AuthenticatedEndpoint, HistoryState, MachineIdentity, NetworkStateSnapshot,
+        PeerObservation, PresenceSample, Reachability, RepairObservation, RepairOutcome,
+        RepairStage, ServiceAvailability, ServiceState, Visibility,
     };
-    let Some(dir) = std::env::var_os("ATERM_NETWORK_HISTORY_GALLERY") else {
-        return;
-    };
-    let dir = std::path::PathBuf::from(dir);
-    std::fs::create_dir_all(&dir).expect("gallery output directory");
-    assert!(
-        crate::stats_deck::deck_on_headless(),
-        "enable resource-panel capture"
-    );
-    for (name, cols, limited, details) in [
+    let (dir, _gallery) =
+        crate::scripted_redraw_fixture::gallery_directory("ATERM_NETWORK_HISTORY_GALLERY");
+    let _stats = crate::stats_deck::tests::attach_stats();
+    for (name, mut cols, limited, details) in [
         ("baseline", 120, false, false),
+        ("reader-busy", 120, false, false),
+        ("reader-busy-narrow", 60, false, false),
+        ("reader-busy-details", 120, false, true),
+        ("reader-busy-details-narrow", 60, false, true),
+        ("history-unavailable", 120, false, false),
+        ("history-unavailable-narrow", 60, false, false),
+        ("history-unavailable-relayed", 120, false, false),
+        ("history-unavailable-relayed-narrow", 60, false, false),
+        ("history-restoring", 120, false, false),
+        ("history-restoring-narrow", 60, false, false),
         ("peer-current", 120, false, true),
         ("peer-expired", 120, false, true),
         ("peer-unknown", 120, false, true),
+        ("peer-current-endpoint", 120, false, true),
+        ("peer-current-endpoint-narrow", 60, false, true),
+        ("peer-current-endpoint-short", 60, false, true),
+        ("peer-current-repair-failed", 120, false, true),
+        ("peer-current-repair-failed-narrow", 60, false, true),
+        ("peer-current-repair-failed-short", 60, false, true),
+        ("peer-current-repair-deferred", 120, false, true),
+        ("peer-current-repair-deferred-narrow", 60, false, true),
+        ("peer-current-repair-deferred-short", 60, false, true),
+        ("peer-current-repair-completed", 120, false, true),
+        ("peer-current-repair-completed-narrow", 60, false, true),
+        ("peer-current-repair-completed-short", 60, false, true),
+        ("peer-expired-endpoint", 120, false, true),
+        ("peer-history-current", 120, false, true),
+        ("peer-history-current-short", 60, false, true),
+        ("peer-history-current-rollback", 120, false, true),
+        ("peer-history-current-rollback-short", 60, false, true),
+        ("peer-history-expired", 120, false, true),
+        ("peer-history-expired-short", 60, false, true),
+        ("peer-history-only", 120, false, true),
+        ("peer-history-only-short", 60, false, true),
         ("waiting", 120, true, true),
         ("waiting-narrow", 60, true, true),
         ("waiting-short", 60, true, true),
@@ -298,6 +519,17 @@ fn network_history_gallery() {
         ("services-failed", 120, false, true),
         ("services-failed-narrow", 60, false, true),
         ("services-failed-short", 60, false, true),
+        ("services-refresh-failed", 120, false, true),
+        ("services-refresh-failed-narrow", 60, false, true),
+        ("services-refresh-failed-reader-busy", 120, false, true),
+        (
+            "services-refresh-failed-reader-busy-narrow",
+            60,
+            false,
+            true,
+        ),
+        ("services-refresh-recovered", 120, false, true),
+        ("services-refresh-recovered-narrow", 60, false, true),
         ("services-catalog", 120, false, true),
         ("services-catalog-short", 60, false, true),
         ("services-short", 60, false, true),
@@ -313,6 +545,35 @@ fn network_history_gallery() {
         app.config.cursor_trail_style = Some("off".into());
         app.recompute_sparkle();
         let rows = if name.contains("short") { 14 } else { 26 };
+        let mut history_peers = 1;
+        if name == "history-unavailable-relayed-narrow" {
+            let scale = (app.windows[&wid].scale as f32).max(0.5);
+            let (cw, _) = app.win_cell_size(wid);
+            let pad = app.win_pad(wid);
+            let width = |text| {
+                crate::tray_raster::ui_text_width_for(
+                    crate::widget::TextFace::Ui,
+                    text,
+                    9.5 * scale,
+                )
+                .ceil()
+            };
+            // Keep cached service cells visible while retained peer boxes leave exactly
+            // enough caption room for the shorter failure cue.
+            (cols, history_peers) = (40_u16..=60)
+                .rev()
+                .find_map(|cols| {
+                    let w = f32::from(cols) * cw as f32 + 2.0 * pad as f32;
+                    (1..=40).find_map(|peers| {
+                        let room = w - (144.0 + 14.0 * peers as f32) * scale;
+                        (room > 70.0 * scale
+                            && room < width("History unavailable")
+                            && room >= width("History error"))
+                        .then_some((cols, peers))
+                    })
+                })
+                .expect("constrained history caption fixture");
+        }
         assert!(app.apply_term_resize(wid, rows, cols));
         // A headless test window has no native attach to reserve chrome space.
         let ws = &app.windows[&wid];
@@ -342,10 +603,115 @@ fn network_history_gallery() {
             first_seen_ms: 1_793_030_000_000,
             last_seen_ms: 1_793_040_000_000,
             last_checked_ms: Some(1_793_040_000_000),
+            last_repair: None,
+            last_authenticated_endpoint: None,
             reachability: Reachability::Reachable,
             instances: None,
             samples: Vec::new(),
         });
+        let repair_scene = name.contains("-repair-");
+        if repair_scene {
+            let outcome = if name.contains("failed") {
+                RepairOutcome::Failed
+            } else if name.contains("deferred") {
+                RepairOutcome::Deferred
+            } else {
+                RepairOutcome::Exchanged
+            };
+            snapshot.network.peers[0].last_repair = Some(RepairObservation {
+                completed_at_ms: snapshot.network.observed_at_ms - 10_000,
+                outbound: true,
+                stage: Some(RepairStage::Application),
+                outcome,
+                table: Some([7; 32]),
+                sent: Some(7),
+                received: (outcome != RepairOutcome::Failed).then_some(3),
+                deferred: Some(if outcome == RepairOutcome::Exchanged {
+                    0
+                } else {
+                    2
+                }),
+            });
+            for service in [
+                &mut snapshot.services.accounts,
+                &mut snapshot.services.secrets,
+            ] {
+                *service = ServiceState {
+                    availability: ServiceAvailability::Cached,
+                    observed_at_ms: snapshot.network.observed_at_ms,
+                    detail: "Synthetic local cache; the recorded repair does not establish remote currency or provider sign-in".into(),
+                    ..ServiceState::default()
+                };
+            }
+        }
+        let recorded_repair = repair_scene.then(|| snapshot.network.peers[0].last_repair.clone());
+        if name.starts_with("history-") {
+            snapshot.network.history = if name.starts_with("history-unavailable") {
+                HistoryState::Unavailable
+            } else {
+                HistoryState::Restoring
+            };
+            snapshot.network.peers[0].reachability = Reachability::Unknown;
+            snapshot.network.detail = if snapshot.network.history == HistoryState::Unavailable {
+                "Fixture journal cannot be read or safely written; authenticated contacts are not accepted".into()
+            } else {
+                "Fixture retained network history is being restored".into()
+            };
+            for slot in 2..=history_peers {
+                let mut peer = snapshot.network.peers[0].clone();
+                peer.slot = slot as u64;
+                peer.identity = identity(slot as u8 + 1, &format!("fixture-retained-{slot}"));
+                snapshot.network.peers.push(peer);
+            }
+            if name.contains("relayed") {
+                snapshot.network.via_local_process = Some(42);
+            }
+            for service in [
+                &mut snapshot.services.accounts,
+                &mut snapshot.services.secrets,
+            ] {
+                *service = ServiceState {
+                    availability: ServiceAvailability::Cached,
+                    observed_at_ms: snapshot.network.observed_at_ms,
+                    detail: "Synthetic locally cached shared metadata; current remote state and provider login are not established".into(),
+                    ..ServiceState::default()
+                };
+            }
+        }
+        if name.contains("endpoint") {
+            let peer = &mut snapshot.network.peers[0];
+            peer.identity.label = None;
+            peer.last_authenticated_endpoint = Some(AuthenticatedEndpoint {
+                address: "[2001:db8::7]:9699".parse().expect("fixture endpoint"),
+                observed_at_ms: peer.last_seen_ms - 86_400_000,
+            });
+        }
+        if name.starts_with("peer-history-") {
+            let at = snapshot.network.observed_at_ms;
+            snapshot.network.peers[0].samples = [
+                (at - 120_000, Reachability::Reachable),
+                (at - 90_000, Reachability::LastSeen),
+                (at - 60_000, Reachability::Reachable),
+                (at, Reachability::Reachable),
+            ]
+            .map(|(at_ms, state)| PresenceSample { at_ms, state })
+            .into();
+            if name.contains("rollback") {
+                snapshot.network.peers[0].first_seen_ms = at + 9_999;
+                snapshot.network.peers[0].samples = [
+                    (at + 9_999, Reachability::Reachable),
+                    (at - 1, Reachability::LastSeen),
+                    (at, Reachability::Reachable),
+                ]
+                .map(|(at_ms, state)| PresenceSample { at_ms, state })
+                .into();
+            }
+            if name.starts_with("peer-history-only") {
+                snapshot.network.visibility = Visibility::Unavailable;
+                snapshot.network.detail =
+                    "Retained history; current reachability has not been checked".into();
+            }
+        }
         if name.starts_with("services") || name.starts_with("waiting") {
             snapshot.services.accounts = ServiceState {
                 availability: ServiceAvailability::Unknown,
@@ -366,6 +732,19 @@ fn network_history_gallery() {
                 snapshot.services.accounts.refresh_failed = false;
                 snapshot.services.accounts.detail = "2 account proposals retained; catalog access does not prove login readiness or remote currency".into();
             }
+            if name.starts_with("services-refresh") {
+                use aterm_types::network_state::{VaultNetworkRefresh, VaultNetworkRefreshOutcome};
+                let failed = name.starts_with("services-refresh-failed");
+                snapshot.services.secrets.refresh_failed = failed;
+                snapshot.services.secrets.network_refresh = Some(VaultNetworkRefresh {
+                    completed_at_ms: snapshot.network.observed_at_ms - 2_000,
+                    outcome: if failed {
+                        VaultNetworkRefreshOutcome::Failed
+                    } else {
+                        VaultNetworkRefreshOutcome::Succeeded
+                    },
+                });
+            }
         }
         if name.starts_with("waiting") {
             snapshot.network.visibility = Visibility::Waiting;
@@ -385,20 +764,49 @@ fn network_history_gallery() {
         }
         app.network_source = None;
         app.network_snapshot = Arc::new(snapshot);
+        if name.contains("reader-busy") {
+            app.network_snapshot = crate::network_deck::snapshot_after_read(
+                None,
+                &app.network_snapshot,
+                &mut app.network_source_busy,
+                None,
+            );
+        }
         if name.starts_with("peer-") {
             let mut snapshot = app.network_snapshot.as_ref().clone();
             let contact_at = snapshot.network.observed_at_ms;
-            snapshot.network.observed_at_ms += 8_000;
+            if !name.contains("rollback") {
+                snapshot.network.observed_at_ms += 8_000;
+            }
             if name == "peer-unknown" {
                 snapshot.network.peers[0].last_checked_ms = None;
             }
-            let age = if name == "peer-current" {
-                15_000
-            } else {
-                15_001
-            };
+            let age =
+                if name.starts_with("peer-current") || name.starts_with("peer-history-current") {
+                    15_000
+                } else if name.starts_with("peer-history-expired") {
+                    30_001
+                } else {
+                    15_001
+                };
             app.network_snapshot =
                 crate::network_deck::fresh_snapshot(Arc::new(snapshot), Some(contact_at + age));
+        }
+        if let Some(recorded_repair) = recorded_repair {
+            let snapshot = &app.network_snapshot;
+            assert_eq!(snapshot.network.peers[0].last_repair, recorded_repair);
+            assert_eq!(
+                snapshot.network.peers[0].reachability,
+                Reachability::Reachable
+            );
+            assert_eq!(
+                snapshot.services.accounts.availability,
+                ServiceAvailability::Cached
+            );
+            assert_eq!(
+                snapshot.services.secrets.availability,
+                ServiceAvailability::Cached
+            );
         }
         let mut screen = probe::screen_at(&probe::AT_REST, rows, cols);
         screen[0] = format!("SYNTHETIC NETWORK HISTORY · {name}");
@@ -413,7 +821,7 @@ fn network_history_gallery() {
             }
             if name.starts_with("services") {
                 app.windows.get_mut(&wid).unwrap().stats_lens.network_target =
-                    if name.contains("failed") || name.contains("catalog") {
+                    if name.starts_with("services-failed") || name.contains("catalog") {
                         crate::network_deck::Target::Accounts
                     } else {
                         crate::network_deck::Target::Secrets

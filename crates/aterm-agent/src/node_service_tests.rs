@@ -343,6 +343,157 @@ fn sync_node_installs_respects_off_and_fleet_leave_removes_job() {
     assert!(plist_path(&home).is_file());
 }
 
+fn join_node_book(state: &Path) {
+    use aterm_net::fleet_member::{Began, write_held};
+    write_held(state, Began::Here, |book| book.write_key(&[7; 20]))
+        .unwrap()
+        .unwrap();
+}
+
+fn leave_node_book(state: &Path) {
+    aterm_net::fleet_member::leave_held(state, |book| {
+        book.write_off().unwrap();
+        assert!(book.remove(aterm_net::fleet::KEY_FILE).unwrap());
+    })
+    .unwrap();
+    assert!(!aterm_net::fleet_member::book_held(state));
+}
+
+fn joined_node_job(at: &Path) -> (PathBuf, PathBuf, PathBuf, FakeSupervisor) {
+    std::fs::create_dir_all(at).unwrap();
+    let home = at.join("home");
+    let state = at.join("state");
+    let program = at.join("program");
+    std::fs::write(&program, b"inert program bytes").unwrap();
+    aterm_uds::private_file::ensure_private_dir(&state).unwrap();
+    join_node_book(&state);
+    let supervisor = FakeSupervisor::new(None);
+    let said =
+        ensure_for_sync_with(&home, &state, None, Some(&program), false, &supervisor).unwrap();
+    assert!(said.contains("installed and started"), "{said}");
+    assert_eq!(*supervisor.loads.borrow(), 1);
+    (home, state, program, supervisor)
+}
+
+#[test]
+fn a_delayed_fleet_leave_keeps_the_node_a_later_join_started() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let (home, state, program, sup) = joined_node_job(&tmp.path().join("ordinary"));
+    leave_node_book(&state);
+    assert_eq!(
+        remove_after_fleet_leave_with(&home, &state, &sup).unwrap(),
+        Some(plist_path(&home))
+    );
+    assert_eq!(*sup.unloads.borrow(), 1);
+    assert!(!plist_path(&home).exists());
+    assert!(!node_turned_off(&state));
+
+    // In the reverse administration order, a later join and ensure start it again.
+    join_node_book(&state);
+    let said = ensure_for_sync_with(&home, &state, None, Some(&program), false, &sup).unwrap();
+    assert!(said.contains("installed and started"), "{said}");
+    assert_eq!((*sup.loads.borrow(), *sup.unloads.borrow()), (2, 1));
+    assert!(plist_path(&home).is_file());
+
+    let (home, state, _, sup) = joined_node_job(&tmp.path().join("delayed"));
+    leave_node_book(&state);
+    // A new join owns the key, and sync.node writes/starts its new unit before the old
+    // leave reaches its separate service removal. Both book phases use the real guards.
+    join_node_book(&state);
+    let next = tmp.path().join("next-program");
+    std::fs::write(&next, b"inert newer program bytes").unwrap();
+    let said = ensure_for_sync_with(&home, &state, None, Some(&next), false, &sup).unwrap();
+    assert!(said.contains("installed and started"), "{said}");
+    assert_eq!(*sup.loads.borrow(), 2);
+    let unit = plist_path(&home);
+    let before = std::fs::read(&unit).unwrap();
+    assert_eq!(
+        kept_program_in_unit(std::str::from_utf8(&before).unwrap()),
+        Some(next)
+    );
+    let removed = remove_after_fleet_leave_with(&home, &state, &sup).unwrap();
+    assert_eq!(removed, None, "the old leave no longer owns this node job");
+    assert_eq!(*sup.unloads.borrow(), 0);
+    assert_eq!(*sup.pid.borrow(), Some(4242));
+    assert_eq!(std::fs::read(&unit).unwrap(), before);
+    assert!(aterm_net::fleet::read_key_file(&state).is_ok());
+}
+
+#[test]
+fn a_fleet_leave_with_unknown_membership_keeps_the_node_job() {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let mut lost = Vec::new();
+    for kind in ["malformed", "directory", "alias", "open-mode"] {
+        let (home, state, _, sup) = joined_node_job(&tmp.path().join(kind));
+        leave_node_book(&state);
+        let key = state.join(aterm_net::fleet::KEY_FILE);
+        match kind {
+            "directory" => std::fs::create_dir(&key).unwrap(),
+            "alias" => {
+                let target = state.join("owned-decoy");
+                std::fs::write(&target, b"not absence").unwrap();
+                symlink(target, &key).unwrap();
+            }
+            _ => {
+                std::fs::write(&key, b"not a fleet key\n").unwrap();
+                std::fs::set_permissions(
+                    &key,
+                    std::fs::Permissions::from_mode(if kind == "open-mode" {
+                        0o644
+                    } else {
+                        0o600
+                    }),
+                )
+                .unwrap();
+            }
+        }
+        assert!(aterm_net::fleet::read_key_file(&state).is_err());
+        let unit = plist_path(&home);
+        let before = std::fs::read(&unit).unwrap();
+        let result = remove_after_fleet_leave_with(&home, &state, &sup);
+        if result.is_ok()
+            || *sup.unloads.borrow() != 0
+            || std::fs::read(&unit).ok().as_ref() != Some(&before)
+        {
+            lost.push(kind);
+        }
+    }
+    assert!(
+        lost.is_empty(),
+        "unknown membership removed node jobs: {lost:?}"
+    );
+}
+
+#[test]
+fn a_waiting_fleet_leave_rechecks_membership_after_taking_node_admin() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let state = tmp.path().join("state");
+    let program = tmp.path().join("program");
+    std::fs::write(&program, b"inert program bytes").unwrap();
+    aterm_uds::private_file::ensure_private_dir(&state).unwrap();
+    join_node_book(&state);
+    let unit = install_with(&program, &home, &state, false, &FileOnlySupervisor).unwrap();
+    leave_node_book(&state);
+    let guard = node_admin_lock(&state).unwrap();
+    let (told, waiting) = std::sync::mpsc::channel();
+    let worker_home = home.clone();
+    let worker_state = state.clone();
+    let worker = std::thread::spawn(move || {
+        NODE_ADMIN_WAITER.with(|waiter| *waiter.borrow_mut() = Some(told));
+        remove_after_fleet_leave_with(&worker_home, &worker_state, &FileOnlySupervisor)
+    });
+    waiting.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap();
+    // Only the node-admin lock is held here: the new membership can be written without
+    // waiting on a supervisor, while the old leave is proven to be waiting behind us.
+    join_node_book(&state);
+    let before = std::fs::read(&unit).unwrap();
+    drop(guard);
+    assert_eq!(worker.join().unwrap().unwrap(), None);
+    assert_eq!(std::fs::read(&unit).unwrap(), before);
+}
+
 #[test]
 fn systemd_unload_requires_a_stop_or_an_explicitly_absent_unit() {
     let absent = "LoadState=not-found\nActiveState=inactive\nMainPID=0\n";
@@ -464,8 +615,13 @@ struct ScriptedLaunchctl {
     refuses_stop: bool,
     print_error: Option<i32>,
     pid: Option<u32>,
+    /// The plist `print` names the job loaded from (its `path = …` line), if it names one.
+    path: Option<&'static str>,
     calls: RefCell<Vec<String>>,
 }
+
+/// The plist the unload tests' home loads the job from.
+const UNIT: &str = "/x/Library/LaunchAgents/systems.alab.aterm-node.plist";
 
 impl ScriptedLaunchctl {
     fn new(held: Option<&'static str>, gui: bool) -> Self {
@@ -476,6 +632,7 @@ impl ScriptedLaunchctl {
             refuses_stop: false,
             print_error: None,
             pid: Some(77),
+            path: None,
             calls: RefCell::new(Vec::new()),
         }
     }
@@ -509,10 +666,13 @@ impl Launchctl for ScriptedLaunchctl {
             ["print", "user/501"] => (true, String::new()),
             ["print", target] => match domain_of(target) {
                 Some(domain) if held.is_some_and(|at| at == domain) => {
-                    let text = self.pid.map_or_else(
+                    let mut text = self.path.map_or_else(String::new, |path| {
+                        format!("\tpath = {path}\n\ttype = LaunchAgent\n")
+                    });
+                    text.push_str(&self.pid.map_or_else(
                         || "\tstate = waiting\n".to_owned(),
                         |pid| format!("\tstate = running\n\tpid = {pid}\n"),
-                    );
+                    ));
                     (true, text)
                 }
                 _ => (false, String::new()),
@@ -598,27 +758,48 @@ fn a_background_job_moves_to_the_login_at_the_screen() {
         "it stands where it belongs"
     );
     seen.refuses_stop = true;
-    assert!(seen.launchd().unload().is_err());
+    assert!(seen.launchd().unload(Path::new(UNIT)).is_err());
     assert_eq!(*seen.held.borrow(), Some("gui/501"));
     seen.refuses_stop = false;
-    seen.launchd().unload().unwrap();
+    seen.launchd().unload(Path::new(UNIT)).unwrap();
     assert_eq!(*seen.held.borrow(), None);
-    seen.launchd().unload().unwrap();
+    seen.launchd().unload(Path::new(UNIT)).unwrap();
 
     let mut unknown = ScriptedLaunchctl::new(Some("user/501"), true);
     unknown.print_error = Some(1);
-    assert!(unknown.launchd().unload().is_err());
+    assert!(unknown.launchd().unload(Path::new(UNIT)).is_err());
     assert_eq!(*unknown.held.borrow(), Some("user/501"));
 
     let mut idle = ScriptedLaunchctl::new(Some("user/501"), false);
     idle.pid = None;
     idle.refuses_stop = true;
-    assert!(idle.launchd().unload().is_err());
+    assert!(idle.launchd().unload(Path::new(UNIT)).is_err());
     assert_eq!(*idle.held.borrow(), Some("user/501"));
     idle.refuses_stop = false;
-    idle.launchd().unload().unwrap();
+    idle.launchd().unload(Path::new(UNIT)).unwrap();
     assert_eq!(*idle.held.borrow(), None);
-    idle.launchd().unload().unwrap();
+    idle.launchd().unload(Path::new(UNIT)).unwrap();
+}
+
+/// AN UNLOAD LEAVES ANOTHER HOME'S JOB ALONE: launchd holds one job of this label per domain, so
+/// a leave or an `off` in an isolated home (a test's, whose HOME is scratch) finds the person's own
+/// job there; one launchd names another plist for stays loaded, and only the one this home's plist
+/// loaded goes.
+#[test]
+fn an_unload_leaves_a_job_another_homes_plist_loaded() {
+    let mut person = ScriptedLaunchctl::new(Some("gui/501"), true);
+    person.path = Some("/Users//person/Library/LaunchAgents/systems.alab.aterm-node.plist");
+    person.launchd().unload(Path::new(UNIT)).unwrap();
+    assert_eq!(
+        *person.held.borrow(),
+        Some("gui/501"),
+        "the person's job stays"
+    );
+    assert!(person.acts().is_empty(), "{:?}", person.acts());
+    person.path = Some(UNIT);
+    person.launchd().unload(Path::new(UNIT)).unwrap();
+    assert_eq!(*person.held.borrow(), None, "this home's job goes");
+    assert_eq!(person.acts(), [format!("bootout gui/501/{NODE_LABEL}")]);
 }
 
 /// A MOVE THE LOGIN'S SESSION REFUSES LEAVES THE JOB RUNNING: the job goes back to the background
@@ -941,4 +1122,33 @@ fn an_unknown_running_node_path_cannot_be_replaced_as_a_fresh_install() {
     );
     assert!(sup.release_probes.borrow().is_empty());
     assert_eq!(*sup.loads.borrow(), 0);
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let unit = sup.unit_file(&home);
+        std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
+        let c_unit = CString::new(unit.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_unit` is a valid NUL-terminated path inside our owned scratch directory.
+        assert_eq!(unsafe { libc::mkfifo(c_unit.as_ptr(), 0o600) }, 0);
+        assert_eq!(
+            state_with(&home, &sup).unwrap(),
+            NodeJobState::Absent,
+            "a FIFO at the unit path must report Absent immediately without blocking"
+        );
+    }
+}
+
+#[test]
+fn systemd_exec_start_program_round_trips_quotes_and_backslashes() {
+    let tricky = Path::new("/opt/a\"b\\c\\\"d$e%f/aterm");
+    let home = Path::new("/home/tester");
+    let unit = node_systemd_unit_text(tricky, home);
+    assert_eq!(
+        kept_program_in_unit(&unit).as_deref(),
+        Some(tricky),
+        "{unit}"
+    );
 }

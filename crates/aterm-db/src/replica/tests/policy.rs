@@ -68,6 +68,68 @@ fn a_policy_change_fires_once_at_only_its_selected_session_boundary() {
 }
 
 #[test]
+fn vault_read_spans_session_admission_and_ends_with_the_local_batch() {
+    use std::{cell::Cell, rc::Rc};
+
+    let p = Pair::new(false, 1);
+    let replica =
+        Replica::new(p.lab.paths[0].clone(), vec![(p.scope, p.paths[0].clone())]).unwrap();
+    let peer = p.lab.bootstrap(1).request().unwrap().binding().actor();
+    let round = replica.round(peer).unwrap();
+    let writer = Rc::new(
+        aterm_uds::private_file::open_private(&p.lab.paths[0].dir, ".lock")
+            .unwrap()
+            .0,
+    );
+    let acquired = Rc::new(Cell::new(false));
+    let calls = Rc::new(Cell::new(0));
+    let before = std::fs::read(p.paths[0].join("table.astream")).unwrap();
+    let result = {
+        let contender = writer.clone();
+        let held = acquired.clone();
+        let called = calls.clone();
+        let _change = Change::install(0, move || {
+            called.set(called.get() + 1);
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the contender tests the gap before repair-session admission"
+            )]
+            let attempt = contender.try_lock();
+            match attempt {
+                Ok(()) => held.set(true),
+                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(error) => panic!("vault contender failed: {error}"),
+            }
+        });
+        round.local(peer, |session| {
+            let store = Store::observe(session, &p.paths[0], p.scope)?;
+            Ok(store.inventory(session)?.count())
+        })
+    };
+    if acquired.get() {
+        writer.unlock().unwrap();
+    }
+    assert_eq!(calls.get(), 1);
+    assert_eq!(
+        result.expect("vault writers cannot enter before session admission"),
+        1
+    );
+    assert!(!acquired.get());
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the source read must end before this local batch returns to network I/O"
+    )]
+    writer
+        .try_lock()
+        .expect("vault writer can proceed after the batch");
+    writer.unlock().unwrap();
+    assert_eq!(
+        std::fs::read(p.paths[0].join("table.astream")).unwrap(),
+        before
+    );
+}
+
+#[test]
 fn policy_changes_before_session_open_refuse_the_old_round() {
     let lab = Lab::new(&[Role::Writer, Role::Writer]);
     let config = lab.paths[0].home.join("config.toml");
@@ -194,6 +256,7 @@ impl Fixture {
                 self.peer,
                 self.scope.digest(),
                 BatchKind::Operation,
+                &mut Repair::default(),
                 &mut report,
             )
         } else {
@@ -342,7 +405,7 @@ fn policy_admission_conforms_and_stale_policy_and_false_receipts_are_detected() 
         model.actions.len()
     );
     let states = aterm_spec::interp::reachable_states(&model);
-    // Every selection's real run, each on its own Lab, on every core.
+    // Every selection's real run, each on its own Lab, on the lane's places.
     let selections: Vec<_> = states
         .iter()
         .map(|state| {
@@ -355,11 +418,9 @@ fn policy_admission_conforms_and_stale_policy_and_false_receipts_are_detected() 
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    aterm_spec::check::each_on(
-        aterm_spec::fs_lane::PLACES,
-        &selections,
-        |&(policy, receiving, point)| scenario_once(policy, receiving, point),
-    );
+    aterm_spec::fs_lane::each(&selections, |&(policy, receiving, point)| {
+        scenario_once(policy, receiving, point)
+    });
     for state in states {
         for action in &model.actions {
             if model.action_enabled(action.name, &state) {

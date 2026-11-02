@@ -8,8 +8,8 @@ use crate::autopilot::{HarnessSwitch, SwitchOff};
 use aterm_effects::harness_card::CardPalette;
 use aterm_phase::Program;
 
-/// Metadata from the measured ALab image; this scene does not create a live upgrade offer.
-const PRODUCT: &str = "0.1.0-dev.13764+codex.0.164.0.g4b3a367a0";
+/// A sample Claude Code version; this scene does not create a live upgrade offer.
+const PRODUCT: &str = "2.1.305";
 
 #[derive(Default)]
 struct Layouts {
@@ -66,15 +66,15 @@ fn paint_with(layouts: &mut Layouts, input: &mut RenderInput, cell: (usize, usiz
     long.extend(std::iter::repeat_n('7', CLI_VERSION_MAX - long.len()));
     let samples = [
         (
-            "Synthetic: Codex product at rest",
-            Program::Codex,
+            "Synthetic: Claude Code at rest",
+            Program::Claude,
             HoverAt::None,
             PRODUCT,
             UpState::None,
         ),
         (
-            "Synthetic: Codex product label hover",
-            Program::Codex,
+            "Synthetic: Claude Code label hover",
+            Program::Claude,
             HoverAt::Label,
             PRODUCT,
             UpState::None,
@@ -95,7 +95,7 @@ fn paint_with(layouts: &mut Layouts, input: &mut RenderInput, cell: (usize, usiz
         ),
         (
             "Synthetic: 128-byte version label hover",
-            Program::Codex,
+            Program::Claude,
             HoverAt::Label,
             long.as_str(),
             UpState::None,
@@ -166,22 +166,13 @@ fn paint_with(layouts: &mut Layouts, input: &mut RenderInput, cell: (usize, usiz
             switch = switch.with_jobs("1 shell");
         }
         let rule = RenderCell {
-            ch: if program == Program::Codex {
-                ' '
-            } else {
-                '\u{2500}'
-            },
+            ch: '\u{2500}',
             fg: mix(blank.fg, blank.bg, 0.6),
             ..blank
         };
         let key = TopKey {
             frame_row,
             term_row: frame_row - input.grid_top_row,
-            line: if program == Program::Codex {
-                TopLine::Slab
-            } else {
-                TopLine::Rule
-            },
             run: TopRun {
                 col: 2,
                 len: input.cols.saturating_sub(4),
@@ -191,11 +182,7 @@ fn paint_with(layouts: &mut Layouts, input: &mut RenderInput, cell: (usize, usiz
                 end: input.cols.saturating_sub(2),
             },
             program,
-            build: if program == Program::Codex {
-                Build::Alab
-            } else {
-                Build::Vendor
-            },
+            build: Build::Vendor,
             switch: Some(switch),
             palette: Some(if harness_off || program == Program::Muse {
                 CardPalette::Off
@@ -209,7 +196,6 @@ fn paint_with(layouts: &mut Layouts, input: &mut RenderInput, cell: (usize, usiz
             clip: aterm_core::render::PxRect::EVERYWHERE,
             mark_hover: false,
             title_gen: 0,
-            chip: TopChip::NONE,
         };
         layouts.footers[i].session = i as u64 + 1;
         let top = layouts.footers[i].compose_top(key, &[], &mut layouts.marks, &mut layouts.rings);
@@ -259,7 +245,7 @@ fn paint_chip_and_effort_samples(
         Some(&block),
         rule,
         blank,
-        [0xd7, 0x77, 0x57],
+        ([0xd7, 0x77, 0x57], WARN_FG),
         None,
     );
     input.cells[base + 31].fill(rule);
@@ -316,7 +302,7 @@ fn paint_effort_sample(
         None,
         rule,
         blank,
-        [0xd7, 0x77, 0x57],
+        ([0xd7, 0x77, 0x57], WARN_FG),
         None,
     );
     input.cells[base + 34].fill(rule);
@@ -400,7 +386,7 @@ mod tests {
             assert_eq!(input, original, "invalid metrics do not replace the frame");
             paint(&mut input, (7, 14));
             let row = |offset: usize| read_glass(&input.cells[input.grid_top_row + offset]);
-            assert!(!row(3).contains(PRODUCT));
+            assert!(row(3).contains(PRODUCT));
             assert!(row(7).contains(PRODUCT));
             assert!(row(11).contains("1 shell"));
             assert!(row(11).contains(UP_ARROW), "the actionable colour arrow");

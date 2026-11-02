@@ -358,6 +358,10 @@ thread_local! {
     /// head flush beside the caret stays there and a lifted one sits a pixel
     /// over its top.
     pub static HEAD_CARET_RING_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The negative control of the graze's step (composed r3): a head a bob
+    /// lays a few pixels onto a lettered row is lifted clear over the whole
+    /// row, as before.
+    pub static HEAD_GRAZE_LIFTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// One cursor-kitty placement resolved once for palette sampling and sprite emission.
@@ -451,23 +455,22 @@ impl KittyCursorPlacement {
         // The top of the highest lettered cell the head at (x, y) would
         // cover, or `None` when it covers no letter.
         let inked = |x: i32, y: i32| -> Option<i32> {
-            let mut top = None::<i32>;
             let (r0, r1) = ((y.max(0)) / ch, ((y + h - 1).max(0)) / ch);
             let (c0, c1) = ((x.max(0)) / cw, ((x + w - 1).max(0)) / cw);
+            let r_end = r1.min(rows - 1);
+            let c_end = c1.min(cols - 1);
             let mut r = r0;
-            while r <= r1.min(rows - 1) {
+            while r <= r_end {
                 let mut c = c0;
-                while c <= c1.min(cols - 1) {
+                while c <= c_end {
                     if ink(r as u16, c as u16) == Some(true) {
-                        let t = r * ch;
-                        top = Some(top.map_or(t, |p| p.min(t)));
-                        break;
+                        return Some(r * ch);
                     }
                     c += 1;
                 }
                 r += 1;
             }
-            top
+            None
         };
         // The same, with the caret's ring's top for the caret's ring: `None`
         // when the head covers neither the ring nor a letter.
@@ -479,10 +482,20 @@ impl KittyCursorPlacement {
                 (a, b) => a.or(b),
             }
         };
+        let is_clear = |nx: i32, ny: i32| -> bool {
+            !(nx < kept.1 && nx + w > kept.0 && ny < kept.3 && ny + h > kept.2)
+                && inked(nx, ny).is_none()
+        };
         let (x, y) = (draw.rect.x, draw.rect.y);
-        if blocked(x, y).is_none() {
+        let ringed_xy =
+            (x < kept.1 && x + w > kept.0 && y < kept.3 && y + h > kept.2).then_some(kept.2);
+        let inked_xy = inked(x, y);
+        let Some(blocked_xy) = (match (ringed_xy, inked_xy) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }) else {
             return;
-        }
+        };
         #[cfg(test)]
         if HEAD_KEEPS_OFF_OFF.with(std::cell::Cell::get) {
             return;
@@ -494,7 +507,7 @@ impl KittyCursorPlacement {
         let in_cell =
             x < caret_box.1 && x + w > caret_box.0 && y < caret_box.3 && y + h > caret_box.2;
         let grid_h = rows.saturating_mul(ch);
-        let nudged = if in_cell || inked(x, y).is_some() {
+        let nudged = if in_cell || inked_xy.is_some() {
             None
         } else {
             [
@@ -509,10 +522,28 @@ impl KittyCursorPlacement {
                     && nx + w <= grid_w
                     && ny >= 0
                     && ny + h <= grid_h
-                    && blocked(nx, ny).is_none()
+                    && is_clear(nx, ny)
             })
             .map(|(_, at)| at)
             .min_by_key(|&(nx, ny)| (nx - x).abs() + (ny - y).abs())
+        };
+        // A head off the caret's ring that grazes a lettered row by a bob's
+        // few pixels (no more than the ring's width) steps back off it by the
+        // least vertical move. Lifted clear, it was thrown over the whole
+        // lettered row for the frames the bob lay on it and fell back after,
+        // a blink (composed r2's Nyan rainbow at fold rest: its head sat
+        // beside the caret under a full line at `f1100` and `f1400` and over
+        // the line at `f1250`, one pixel of bob into the line's row).
+        #[cfg(test)]
+        let graze_lifts = HEAD_GRAZE_LIFTS.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let graze_lifts = false;
+        let grazed = if in_cell || ringed_xy.is_some() || graze_lifts {
+            None
+        } else {
+            (1..=gap)
+                .flat_map(|d| [(x, y + d), (x, y - d)])
+                .find(|&(nx, ny)| ny >= 0 && ny + h <= grid_h && is_clear(nx, ny))
         };
         let ahead = x + w / 2 > (caret_box.0 + caret_box.1) / 2;
         let pushed = if ahead {
@@ -522,24 +553,21 @@ impl KittyCursorPlacement {
             let px = x.min(caret_box.0 - gap - w);
             (px >= 0).then_some(px)
         };
-        let to = match (nudged, pushed) {
+        let to = match (nudged.or(grazed), pushed) {
             (Some(at), _) => Some(at),
-            (None, Some(px)) if blocked(px, y).is_none() => Some((px, y)),
+            (None, Some(px)) if is_clear(px, y) => Some((px, y)),
             _ => {
                 // Lift clear of each cell it would cover, a row at a time.
-                let mut ly = y;
+                let mut ly = blocked_xy - h - 1;
                 let mut found = None;
-                let mut tries = 0;
-                while tries <= rows {
+                let mut tries = 1;
+                while tries <= rows && ly >= 0 {
                     match blocked(x, ly) {
                         None => {
                             found = Some((x, ly));
                             break;
                         }
                         Some(top) => ly = top - h - 1,
-                    }
-                    if ly < 0 {
-                        break;
                     }
                     tries += 1;
                 }
@@ -1066,6 +1094,12 @@ const fn alignment_edge(
     {
         return None;
     }
+    let recent = seq.wrapping_sub(ep.seen_seq) <= REKEY_MAX_SEQ_GAP;
+    let exact_ctx_or_profanity =
+        ep.ctx_fp == candidate.ctx_fp || matches!(occ.class, Class::Profanity);
+    if !exact_ctx_or_profanity && !(recent && (ep.seed == occ.seed || same_width)) {
+        return None;
+    }
     let width = (if cols > 1 { cols } else { 1 }) as u32;
     let old_pos = (ep.last_row as u32)
         .saturating_mul(width)
@@ -1075,7 +1109,6 @@ const fn alignment_edge(
         .saturating_add(occ.start_col as u32);
     let distance = old_pos.abs_diff(new_pos);
     let max_distance = width.saturating_mul(REKEY_MAX_LINEAR_ROWS);
-    let recent = seq.wrapping_sub(ep.seen_seq) <= REKEY_MAX_SEQ_GAP;
 
     if recent && ep.seed == occ.seed {
         return if distance <= max_distance {
@@ -1084,13 +1117,10 @@ const fn alignment_edge(
             None
         };
     }
-    if ep.ctx_fp == candidate.ctx_fp {
+    if exact_ctx_or_profanity {
         return Some((1, distance));
     }
-    if matches!(occ.class, Class::Profanity) {
-        return Some((1, distance));
-    }
-    if same_width && recent && distance <= max_distance {
+    if distance <= max_distance {
         Some((2, distance))
     } else {
         None
@@ -2984,9 +3014,7 @@ impl WordDecorations {
         if let Some(s) = &sprite {
             fp = fold_free(fp, s);
         }
-        let mut mote_sprites: [Option<FreeSprite>; crate::kitty_pet::PET_MOTES_MAX] =
-            [const { None }; crate::kitty_pet::PET_MOTES_MAX];
-        let mut mote_len = 0usize;
+        let mut dep_insert = free.len();
         if pet.alpha > 0 {
             const INV_255: f32 = 1.0 / 255.0;
             let pet_alpha_scale = f32::from(pet.alpha) * INV_255;
@@ -3064,8 +3092,7 @@ impl WordDecorations {
                     z: FreeZ::OverText,
                 };
                 fp = fold_free(fp, &mote_sprite);
-                mote_sprites[mote_len] = Some(mote_sprite);
-                mote_len += 1;
+                free.push(mote_sprite);
             }
         }
         let mut di = 0;
@@ -3075,16 +3102,14 @@ impl WordDecorations {
                 && let Some(sp) = self.pet_departure_sprite(d, &pet, geom, colors, (nat_w, nat_h))
             {
                 fp = fold_free(fp, &sp);
-                free.push(sp);
+                if dep_insert == free.len() {
+                    free.push(sp);
+                } else {
+                    free.insert(dep_insert, sp);
+                }
+                dep_insert += 1;
             }
             di += 1;
-        }
-        let mut mi = 0;
-        while mi < mote_len {
-            if let Some(m) = mote_sprites[mi].take() {
-                free.push(m);
-            }
-            mi += 1;
         }
         if let Some(s) = sprite {
             free.push(s);
@@ -4760,8 +4785,8 @@ impl WordDecorations {
                     .sort_unstable_by_key(|(k, ep)| (ep.last_row, ep.last_col, *k));
             }
 
-            winner[..group_len].fill(None);
             if !self.align_old.is_empty() {
+                winner[..group_len].fill(None);
                 prev_scores[..=group_len].fill(AlignScore::default());
                 decisions[1..=group_len].fill(2);
                 let same_width = self.have_scanned && self.cols == cols;
@@ -4835,20 +4860,22 @@ impl WordDecorations {
             let mut group_has_live_caret_completion = false;
             let mut typed_keys = [0u64; MAX_OCCURRENCES];
             let mut typed_keys_len = 0usize;
-            let mut gi = 0;
-            while gi < group.len() {
-                let k = group[gi];
-                if typed_here[k] {
-                    if pending[k].live_caret_completion {
-                        group_has_live_caret_completion = true;
+            if typed_witness && has_tainted_old {
+                let mut gi = 0;
+                while gi < group.len() {
+                    let k = group[gi];
+                    if typed_here[k] {
+                        if pending[k].live_caret_completion {
+                            group_has_live_caret_completion = true;
+                        }
+                        if pending[k].at_live_cursor && typed_keys_len < MAX_OCCURRENCES {
+                            let occ = &out[usize::from(pending[k].occ_idx)];
+                            typed_keys[typed_keys_len] = occ.ident ^ pending[k].ctx_fp;
+                            typed_keys_len += 1;
+                        }
                     }
-                    if pending[k].at_live_cursor && typed_keys_len < MAX_OCCURRENCES {
-                        let occ = &out[usize::from(pending[k].occ_idx)];
-                        typed_keys[typed_keys_len] = occ.ident ^ pending[k].ctx_fp;
-                        typed_keys_len += 1;
-                    }
+                    gi += 1;
                 }
-                gi += 1;
             }
             let group_has_at_live_cursor = typed_keys_len > 0;
 
@@ -4856,7 +4883,9 @@ impl WordDecorations {
             while j < group.len() {
                 let k = group[j];
                 let occ = &mut out[usize::from(pending[k].occ_idx)];
-                if let Some(oi) = winner[j] {
+                if !self.align_old.is_empty()
+                    && let Some(oi) = winner[j]
+                {
                     matched[oi] = true;
                     let (old_ident, mut ep) = self.align_old[oi];
                     ep.last_seen = now;
@@ -5149,7 +5178,8 @@ impl WordDecorations {
                     })
                 )
                 && (matches!(occ.spec.burst, Some(b) if b.kind == BurstKind::Nova)
-                    || !self.supers.is_empty()
+                    || (!self.supers.is_empty()
+                        && matches!(occ.spec.burst, Some(b) if b.kind == BurstKind::SuperNova))
                     || !self.coupling.is_empty())
             {
                 ink_fx(
@@ -8309,7 +8339,7 @@ const fn cat_color_context_footprint(
             {
                 (cell.bg, prev_band)
             } else {
-                let b = CatColorKey::background_band_with(table, rgb3_to_u32(cell.bg));
+                let b = CatColorKey::background_band_rgb(table, cell.bg);
                 last_bg = Some((cell.bg, b));
                 (cell.bg, b)
             };
@@ -17273,6 +17303,64 @@ mod tests {
             1,
             "control: round 2 lifts it a pixel over the caret"
         );
+    }
+
+    /// A HEAD A BOB LAYS ON A LETTERED ROW STEPS BACK OFF IT (composed r2's
+    /// judges: Nyan rainbow's earned head at fold rest sat beside the caret
+    /// under a full line at `f1100` and `f1400` and over the line at `f1250`,
+    /// one capture in three, a hop the companion laws call blinking). Its
+    /// bob put the top of its box a pixel into the lettered row above, and
+    /// the keep-off lifted it clear over the whole row; it now steps back off
+    /// by the least vertical move, within the caret ring's width. The fold:
+    /// row 3 lettered across, the caret on row 4 after two letters, the head
+    /// beside it on row 4, its top 1 to 3 px into row 3. Control:
+    /// `HEAD_GRAZE_LIFTS` throws it over row 3.
+    #[test]
+    fn a_head_a_bob_lays_on_a_lettered_row_steps_back_off_it() {
+        let g = geom20();
+        let ch = i32::from(g.cell_h);
+        let gap = WordDecorations::kitty_cursor_lead_px(g.cell_w) / HEAD_CARET_GAP_DEN;
+        let caret = (4, 2);
+        let ink = |row: u16, col: u16| Some(row == 3 || (row == 4 && col < 2));
+        let t0 = Instant::now();
+        let kept = |rise: i32, lifts: bool| -> (CatFootprint, CatFootprint) {
+            HEAD_GRAZE_LIFTS.with(|c| c.set(lifts));
+            let mut wd = WordDecorations::default();
+            let mut placement = wd
+                .prepare_kitty_cursor_placement(
+                    still_layout(g, caret),
+                    settled_at(t0),
+                    crate::kitty_cursor::CatPose::STILL,
+                )
+                .expect("placeable companion");
+            if let Some(draw) = placement.drawn.as_mut() {
+                // Its top `rise` px into row 3.
+                draw.rect.y = 4 * ch - rise;
+            }
+            let before = placement.drawn_footprint().expect("drawn");
+            placement.keep_off_letters(g, caret, ink);
+            let after = placement.drawn_footprint().expect("drawn");
+            HEAD_GRAZE_LIFTS.with(|c| c.set(false));
+            (before, after)
+        };
+        for rise in 1..=gap.min(3) {
+            let (before, after) = kept(rise, false);
+            assert!(
+                before.x >= 3 * i32::from(g.cell_w),
+                "fixture: the head sits beside the caret, off its ring: {before:?}"
+            );
+            assert_eq!(after.x, before.x, "a {rise} px graze: {after:?}");
+            assert_eq!(
+                after.y,
+                4 * ch,
+                "a {rise} px graze steps down off row 3, onto its own row's top: {after:?}"
+            );
+            let (_, lifted) = kept(rise, true);
+            assert!(
+                lifted.y + i32::from(lifted.h) <= 3 * ch,
+                "control: a {rise} px graze lifts the head over row 3: {lifted:?}"
+            );
+        }
     }
 
     #[test]

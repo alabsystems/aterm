@@ -199,15 +199,52 @@ pub struct Row {
 #[must_use]
 pub fn iso_ms(s: &str) -> Option<i64> {
     let (date, time) = s.strip_suffix('Z')?.split_once('T')?;
-    let mut d = date.split('-').map(|p| p.parse::<i64>().ok());
-    let (y, m, day) = (d.next()??, d.next()??, d.next()??);
-    let (hms, frac) = time.split_once('.').unwrap_or((time, "0"));
-    let mut t = hms.split(':').map(|p| p.parse::<i64>().ok());
-    let (h, mi, sec) = (t.next()??, t.next()??, t.next()??);
-    let ms: i64 = format!("{frac:0<3}").get(..3)?.parse().ok()?;
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
+    let mut d = date.split('-');
+    let (ys, ms_s, ds) = (d.next()?, d.next()?, d.next()?);
+    if d.next().is_some()
+        || ys.len() != 4
+        || ms_s.len() != 2
+        || ds.len() != 2
+        || ![ys, ms_s, ds]
+            .into_iter()
+            .all(|p| p.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return None;
+    }
+    let (y, m, day): (i64, i64, i64) = (ys.parse().ok()?, ms_s.parse().ok()?, ds.parse().ok()?);
+    let (hms, frac) = match time.split_once('.') {
+        Some((t, f)) if !f.is_empty() && f.bytes().all(|b| b.is_ascii_digit()) => (t, f),
+        Some(_) => return None,
+        None => (time, "0"),
+    };
+    let mut t = hms.split(':');
+    let (hs, mis, ss) = (t.next()?, t.next()?, t.next()?);
+    if t.next().is_some()
+        || hs.len() != 2
+        || mis.len() != 2
+        || ss.len() != 2
+        || ![hs, mis, ss]
+            .into_iter()
+            .all(|p| p.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return None;
+    }
+    let (h, mi, sec): (i64, i64, i64) = (hs.parse().ok()?, mis.parse().ok()?, ss.parse().ok()?);
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let max_day = match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if !(1..=max_day).contains(&day) || h >= 24 || mi >= 60 || sec > 60 {
+        return None;
+    }
+    let ms: i64 = format!("{frac:0<3}")[..3].parse().ok()?;
+    let y_adj = if m <= 2 { y - 1 } else { y };
+    let era = y_adj.div_euclid(400);
+    let yoe = y_adj - era * 400;
     let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146_097 + doe - 719_468;
@@ -341,7 +378,13 @@ pub fn never_stalled(moves: &[(u64, String)], now_rev: Option<u64>) -> bool {
 /// One session's block of a `survey` text.
 #[must_use]
 pub fn survey_block(text: &str, sid: &str) -> String {
-    let mut lines = text.lines().skip_while(|l| !l.starts_with(sid));
+    if sid.is_empty() {
+        return String::new();
+    }
+    let mut lines = text.lines().skip_while(|l| {
+        !l.strip_prefix(sid)
+            .is_some_and(|r| r.is_empty() || r.starts_with(char::is_whitespace))
+    });
     let mut b = String::new();
     if let Some(head) = lines.next() {
         b.push_str(head);
@@ -1351,6 +1394,19 @@ mod tests {
         assert_eq!(iso_ms("2000-03-01T00:00:01Z"), Some(951_868_801_000));
         assert_eq!(iso_ms("2026-10-16 10:24:42"), None);
         assert_eq!(iso_ms("2026-10-26 09:11:48Z"), None);
+        for bad in [
+            "-9223372036854775808-01-01T00:00:00Z",
+            "999999999999-01-01T00:00:00Z",
+            "2026-13-01T00:00:00Z",
+            "2026-02-29T00:00:00Z",
+            "2026-10-16T24:00:00Z",
+            "2026-10-16T10:60:00Z",
+            "2026-10-16T10:24:42.Z",
+            "2026-10-16T10:24:42.738xyzZ",
+            "2026-10-16-01T10:24:42Z",
+        ] {
+            assert_eq!(iso_ms(bad), None, "{bad}");
+        }
     }
 
     #[test]
@@ -1647,6 +1703,8 @@ mod tests {
             0
         );
         assert_eq!(survey_shown(text, &[want("s-z", "", "")]), 0);
+        assert_eq!(survey_block(text, "s"), "");
+        assert_eq!(survey_block(text, ""), "");
     }
 
     #[test]

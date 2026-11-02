@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use super::*;
 
@@ -91,6 +91,11 @@ struct LockHost {
     next: i32,
     now: i64,
     check_error: bool,
+    /// The sign-in that holds the lock, which ends at this host's first answer on retrying.
+    running: RefCell<Option<accounts::Lock>>,
+    /// What that sign-in leaves in the records as it ends.
+    left: RefCell<Option<Box<dyn FnOnce()>>>,
+    agent: bool,
 }
 
 impl LockHost {
@@ -103,6 +108,9 @@ impl LockHost {
             next: 0,
             now: env.now,
             check_error: false,
+            running: RefCell::new(None),
+            left: RefCell::new(None),
+            agent: false,
         }
     }
     fn held(&self) {
@@ -126,6 +134,16 @@ impl LockHost {
 impl AccountsHost for LockHost {
     fn stdin_is_terminal(&self) -> bool {
         true
+    }
+    fn retries_sign_in_lock(&self, _: u32) -> bool {
+        let ended = self.running.borrow_mut().take().is_some();
+        if let Some(left) = self.left.borrow_mut().take() {
+            left();
+        }
+        ended
+    }
+    fn machine_var(&self, name: &str) -> Option<std::ffi::OsString> {
+        (self.agent && name == "CLAUDECODE").then(|| "1".into())
     }
     fn unaskable(&self) -> Option<String> {
         None
@@ -223,6 +241,86 @@ fn claude_login_and_renewal_wait_for_other_providers_and_hold_through_checks() {
             "the next provider can sign in after completion"
         );
     }
+}
+
+/// A person's own sign-in waits for the one that holds the lock, told so, since that one ends by
+/// itself and they have just asked. NEGATIVE CONTROL: an agent's terminal is refused at once, by
+/// the same lock, with the same host willing to retry.
+#[test]
+fn a_person_waits_out_the_sign_in_that_holds_the_lock() {
+    for renewal in [false, true] {
+        for agent in [false, true] {
+            let (_tmp, env, form) = fixture("claude-signin-person", renewal);
+            let mut host = LockHost::new(&env, Ok(0));
+            host.agent = agent;
+            let held = host.peer.signin_now().unwrap().unwrap();
+            host.running.replace(Some(held));
+            let (code, out, err) = acc(form, &env, &host);
+            assert_eq!(code, exit(u8::from(agent)), "{out}{err}");
+            assert_eq!(out.contains("waiting for it to end"), !agent, "{out}{err}");
+            assert_eq!(out.contains(": held: "), agent, "{out}{err}");
+            assert_eq!(host.login_calls.get(), usize::from(!agent));
+        }
+    }
+}
+
+/// What a person's wait outlasted is what they go by: the sign-in they waited for renewed another
+/// row, which moves the store's clock and so every parent captured before it, and theirs still
+/// runs. Without the capture under the lock it is refused with nothing run.
+#[test]
+fn a_person_goes_by_what_the_sign_in_they_waited_for_left() {
+    for renewal in [false, true] {
+        let (_tmp, env, form) = fixture("claude-signin-moved", renewal);
+        let host = LockHost::new(&env, Ok(0));
+        let held = host.peer.signin_now().unwrap().unwrap();
+        host.running.replace(Some(held));
+        let (store, now) = (env.accounts_store(), env.now);
+        host.left.replace(Some(Box::new(move || {
+            let (mut logins, _) = store.load_logins(now).unwrap();
+            logins.generation_clock += 1;
+            store.save_logins(&logins).unwrap();
+        })));
+        let (code, out, err) = acc(form, &env, &host);
+        assert_eq!(code, exit(0), "{out}{err}");
+        assert_eq!(host.login_calls.get(), 1, "{out}{err}");
+    }
+}
+
+/// What a person waited for may be the very sign-in they came to make, so nothing runs a second
+/// time. The test above is its control: a renewal of another row runs theirs.
+#[test]
+fn a_person_is_not_signed_in_again_over_a_renewal_they_waited_for() {
+    for renewal in [false, true] {
+        let (_tmp, env, form) = fixture("claude-signin-renewed", renewal);
+        let host = LockHost::new(&env, Ok(0));
+        let held = host.peer.signin_now().unwrap().unwrap();
+        host.running.replace(Some(held));
+        let label = if renewal { "main" } else { "work-2" };
+        let (store, now) = (env.accounts_store(), env.now);
+        let dir = store.login_dir(label).unwrap().to_str().unwrap().to_owned();
+        host.left.replace(Some(Box::new(move || {
+            store
+                .transact_logins(now, &mut None, |state, logins| {
+                    Ok(accounts::note_renewed(
+                        state, logins, label, None, &dir, None, now,
+                    ))
+                })
+                .unwrap();
+        })));
+        let (code, out, err) = acc(form, &env, &host);
+        assert_eq!(code, exit(0), "{out}{err}");
+        assert_eq!(host.login_calls.get(), 0, "{out}{err}");
+        assert!(out.contains(RENEWED_WHILE_WAITING), "{out}{err}");
+    }
+}
+
+/// The wait outlasts the longest sign-in that can hold the lock, which is another CLI's and not
+/// Claude Code's: the lock is one for every CLI ([`accounts::Store::shared_dir`]).
+#[test]
+fn a_persons_wait_outlasts_every_cli_s_sign_in() {
+    let waits = u64::from(PERSON_LOCK_TRIES) * LOCK_TRY_S;
+    assert!(waits > UNATTENDED_RENEWAL_BUDGET.as_secs());
+    assert!(waits > crate::harness::login_drive::HANG.as_secs());
 }
 
 #[test]

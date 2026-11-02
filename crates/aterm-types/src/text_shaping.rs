@@ -57,7 +57,11 @@ impl FontFeature {
         } else if let Some(rest) = token.strip_prefix('-') {
             (rest, 0u32)
         } else if let Some((tag, val)) = token.split_once('=') {
-            (tag, val.trim().parse::<u32>().ok()?)
+            let val = val.trim();
+            if val.is_empty() || !val.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            (tag, val.parse::<u32>().ok()?)
         } else {
             (token, 1u32)
         };

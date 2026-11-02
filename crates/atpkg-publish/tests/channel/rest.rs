@@ -13,7 +13,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use agh_fake::{AssetSpec, FakeGithub, FakeOrigin, Fault, Match, ReleaseSpec, RepoSpec};
+use agh_fake::{
+    AssetSpec, CommitSpec, FakeGithub, FakeOrigin, Fault, Match, ReleaseSpec, RepoSpec,
+};
 use aterm_uds::spawnfd::Command;
 use aterm_update_core::github_rest::{Direct, Origins, Spawn};
 use atpkg_publish::host::rest::{RestHost, STAGED, probe_of};
@@ -298,6 +300,91 @@ fn an_upload_replaces_only_when_asked_and_a_draft_is_published_by_tag() {
     rig.fake.assert_clean();
 }
 
+/// `repo_seen` answers `false` only when `/repos/<slug>` is 404 both to the identity and to an
+/// anonymous reader. This missing-repository control does not establish nonexistence from
+/// those answers; the private-hidden control below has the same result.
+#[test]
+fn a_repository_is_unseen_only_when_the_identity_and_an_anonymous_reader_both_get_404() {
+    let rig = Rig::new();
+    let host = rig.host();
+    let absent = Slug::new("fixture-pub", "absent");
+    assert!(
+        matches!(host.release(&absent, "atpkg-x-1"), Err(HostError::Unreachable(m)) if m.contains("not visible")),
+        "the upload's own read of a repository nobody created"
+    );
+    let from = rig.fake.seen().len();
+    assert!(matches!(host.repo_seen(&absent), Ok(false)));
+    let asked: Vec<(String, bool)> = rig.fake.seen()[from..]
+        .iter()
+        .map(|s| (s.path_and_query.clone(), s.had_authorization))
+        .collect();
+    assert_eq!(
+        asked,
+        [
+            ("/repos/fixture-pub/absent".to_string(), true),
+            ("/repos/fixture-pub/absent".to_string(), false),
+        ],
+        "as the identity, then anonymously"
+    );
+
+    assert!(
+        matches!(host.repo_seen(&slug()), Ok(true)),
+        "a public repository"
+    );
+    rig.fake
+        .add_repo("fixture-pub/hidden", RepoSpec::private().push(LOGIN));
+    assert!(
+        matches!(
+            host.repo_seen(&Slug::new("fixture-pub", "hidden")),
+            Ok(true)
+        ),
+        "a private repository the identity can see"
+    );
+    rig.fake.fault_always(
+        Match::api("/repos/fixture-pub/down"),
+        Fault::Status {
+            status: 500,
+            body: String::new(),
+            headers: Vec::new(),
+        },
+    );
+    assert!(
+        host.repo_seen(&Slug::new("fixture-pub", "down")).is_err(),
+        "an owner that does not answer is not an answer"
+    );
+}
+
+#[test]
+fn a_private_repository_hidden_from_both_readers_is_not_seen() {
+    let rig = Rig::new();
+    let hidden = Slug::new("fixture-pub", "private-hidden");
+    rig.fake
+        .add_repo("fixture-pub/private-hidden", RepoSpec::private());
+    let host = rig.host();
+    assert!(
+        matches!(
+            host.release(&hidden, "atpkg-x-1"),
+            Err(HostError::Unreachable(_))
+        ),
+        "the existing private repository is unreadable to LOGIN"
+    );
+    let from = rig.fake.seen().len();
+    assert_eq!(host.repo_seen(&hidden), Ok(false));
+    let asked: Vec<(String, bool)> = rig.fake.seen()[from..]
+        .iter()
+        .map(|seen| (seen.path_and_query.clone(), seen.had_authorization))
+        .collect();
+    assert_eq!(
+        asked,
+        [
+            ("/repos/fixture-pub/private-hidden".to_string(), true),
+            ("/repos/fixture-pub/private-hidden".to_string(), false),
+        ],
+        "an existing private repository returns the same two 404s as a missing one"
+    );
+    rig.fake.assert_clean();
+}
+
 #[test]
 fn a_write_without_a_token_is_refused_before_anything_is_sent() {
     let rig = Rig::new();
@@ -558,6 +645,194 @@ fn a_file_remote_clones_and_fetches_with_no_credential_asked() {
     assert_eq!(rig.fake.seen().len(), 0, "git never asked the API");
 }
 
+fn main_record_git(dir: &Path, args: &[&str]) -> String {
+    let out = aterm_uds::fixture_git::git()
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("git");
+    assert!(out.status.success(), "git {args:?}: {out:?}");
+    String::from_utf8(out.stdout)
+        .expect("git's text")
+        .trim()
+        .into()
+}
+
+/// A real Git mirror whose initial main agrees with the independently served API. The
+/// checkout's URL rewrite routes the host's HTTPS URL to this mirror without contacting GitHub.
+fn main_record_fixture(rig: &Rig) -> (RestHost, PathBuf, String) {
+    let remotes = rig.dir.path().join("mirror");
+    let bare = remotes.join("fixture-dev/packs.git");
+    std::fs::create_dir_all(&bare).expect("the mirror directory");
+    main_record_git(
+        &bare,
+        &["init", "--quiet", "--bare", "--initial-branch=main"],
+    );
+    let checkout = rig.dir.path().join("checkout");
+    std::fs::create_dir(&checkout).expect("the checkout");
+    main_record_git(&checkout, &["init", "--quiet", "--initial-branch=main"]);
+    std::fs::write(checkout.join("README"), "API main\n").expect("the source");
+    main_record_git(&checkout, &["add", "README"]);
+    main_record_git(
+        &checkout,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "commit",
+            "--quiet",
+            "-m",
+            "API main",
+        ],
+    );
+    main_record_git(
+        &checkout,
+        &["remote", "add", "origin", bare.to_str().expect("utf-8")],
+    );
+    main_record_git(&checkout, &["push", "--quiet", "-u", "origin", "main"]);
+    let sha = main_record_git(&checkout, &["rev-parse", "HEAD"]);
+    rig.fake.add_commit(
+        SLUG,
+        CommitSpec {
+            sha: sha.clone(),
+            message: "API main".into(),
+            author_login: Some(LOGIN.into()),
+            author_name: "Fixture".into(),
+            date: "2026-10-31T00:00:00Z".into(),
+            paths: vec!["README".into()],
+        },
+    );
+    rig.fake.set_branch(SLUG, "refs/heads/main", &sha);
+    main_record_git(
+        &checkout,
+        &[
+            "config",
+            &format!("url.file://{}/.insteadOf", remotes.display()),
+            "https://github.com/",
+        ],
+    );
+    (rig.host_at("https://github.com"), checkout, sha)
+}
+
+#[test]
+fn a_main_of_record_is_bound_to_the_authenticated_hosts_commit() {
+    use atpkg_publish::artifact::package::MAIN_OF_RECORD;
+
+    let rig = Rig::new();
+    let (host, checkout, api_main) = main_record_fixture(&rig);
+    host.fetch_main(&slug(), &checkout, MAIN_OF_RECORD)
+        .expect("the rewritten mirror transports the API's exact main");
+    assert_eq!(
+        main_record_git(&checkout, &["rev-parse", MAIN_OF_RECORD]),
+        api_main
+    );
+    main_record_git(
+        &checkout,
+        &["update-ref", "refs/atpkg-publish/unrelated", &api_main],
+    );
+
+    std::fs::write(checkout.join("README"), "mirror only\n").expect("the mirror-only source");
+    main_record_git(
+        &checkout,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "commit",
+            "--quiet",
+            "-am",
+            "mirror only",
+        ],
+    );
+    main_record_git(&checkout, &["push", "--quiet", "origin", "main"]);
+    let mirror_main = main_record_git(&checkout, &["rev-parse", "HEAD"]);
+    assert_ne!(mirror_main, api_main);
+    let tracking = main_record_git(&checkout, &["rev-parse", "refs/remotes/origin/main"]);
+    let err = host
+        .fetch_main(&slug(), &checkout, MAIN_OF_RECORD)
+        .expect_err("a fresh fetch of a rewritten mirror cannot define the host's main");
+    assert!(matches!(err, HostError::Unreachable(_)), "{err:?}");
+    assert!(
+        err.to_string().contains(&mirror_main) && err.to_string().contains(&api_main),
+        "{err}"
+    );
+    assert_eq!(
+        main_record_git(
+            &checkout,
+            &["for-each-ref", "--format=%(refname)", "refs/atpkg-publish/"]
+        ),
+        "refs/atpkg-publish/unrelated",
+        "only the failed attempt's exact record ref is removed"
+    );
+    assert_eq!(
+        main_record_git(&checkout, &["rev-parse", "refs/remotes/origin/main"]),
+        tracking,
+        "the checkout's remote-tracking ref is untouched"
+    );
+    let seen = rig.fake.seen();
+    assert_eq!(seen.len(), 2, "one API read per attempt, without retries");
+    assert!(seen.iter().all(|request| {
+        request.method == "GET"
+            && request.path_and_query == format!("/repos/{SLUG}/commits/refs/heads/main")
+            && request.as_login.as_deref() == Some(LOGIN)
+            && request.had_authorization
+    }));
+}
+
+#[test]
+fn an_unreadable_main_of_record_never_starts_its_git_fetch() {
+    use atpkg_publish::artifact::package::MAIN_OF_RECORD;
+
+    let rig = Rig::new();
+    let (host, checkout, api_main) = main_record_fixture(&rig);
+    main_record_git(&checkout, &["update-ref", MAIN_OF_RECORD, &api_main]);
+    std::fs::write(checkout.join("README"), "mirror only\n").expect("the mirror-only source");
+    main_record_git(
+        &checkout,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "commit",
+            "--quiet",
+            "-am",
+            "mirror only",
+        ],
+    );
+    main_record_git(&checkout, &["push", "--quiet", "origin", "main"]);
+    let api_path = format!("/repos/{SLUG}/commits/refs/heads/main");
+    let bodies = [
+        "{}".to_string(),
+        "{\"sha\":null}".to_string(),
+        "{\"sha\":42}".to_string(),
+        "{\"sha\":\"abc\"}".to_string(),
+        format!("{{\"sha\":\"{}\"}}", "A".repeat(40)),
+        format!("{{\"sha\":\"{}\"}}", "g".repeat(40)),
+        format!("{{\"sha\":\"{}\"}}", "a".repeat(41)),
+        format!("{{\"sha\":\" {api_main}\"}}"),
+    ];
+    let attempts = bodies.len() + 1;
+    for fault in bodies
+        .into_iter()
+        .map(|body| Fault::Status {
+            status: 200,
+            body,
+            headers: Vec::new(),
+        })
+        .chain([Fault::Close])
+    {
+        rig.fake.fault(Match::api(&api_path), fault);
+        let err = host
+            .fetch_main(&slug(), &checkout, MAIN_OF_RECORD)
+            .expect_err("an unreadable API main is no authority");
+        assert!(matches!(err, HostError::Unreachable(_)), "{err:?}");
+        assert!(err.to_string().contains("host API"), "{err}");
+        assert_eq!(
+            main_record_git(&checkout, &["rev-parse", MAIN_OF_RECORD]),
+            api_main,
+            "the API refusal happens before fetching or cleaning any record ref"
+        );
+    }
+    assert_eq!(rig.fake.seen().len(), attempts, "no API retry");
+}
+
 #[test]
 fn git_hands_its_token_over_whatever_helpers_and_use_http_path_the_users_config_holds() {
     let rig = Rig::new();
@@ -771,6 +1046,16 @@ fn a_download_shorter_than_its_listing_is_refused_and_leaves_no_file() {
     );
     assert!(!out.join("a.bin").exists());
     assert!(!out.join("a.bin.atpkg-part").exists());
+
+    std::fs::create_dir_all(out.join("a.bin")).expect("blocking directory");
+    let blocked = host.download(&slug(), "atpkg-ay-1", &["a.bin"], &out);
+    assert!(
+        matches!(&blocked, Err(HostError::Refused(_))),
+        "{blocked:?}"
+    );
+    assert!(!out.join("a.bin.atpkg-part").exists());
+    std::fs::remove_dir(out.join("a.bin")).expect("remove blocking directory");
+
     host.download(&slug(), "atpkg-ay-1", &["a.bin"], &out)
         .expect("the download");
     assert_eq!(

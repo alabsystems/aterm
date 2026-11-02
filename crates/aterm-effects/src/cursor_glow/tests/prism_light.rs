@@ -47,8 +47,8 @@ fn an_admitted_frame_is_lit_at_the_live_level_and_a_refused_one_is_off() {
     }
     assert_eq!(
         Light::admitted(true, crate::rainbow_kitty::prism_glass::LIVE),
-        Light::at(Live::Off),
-        "until 1.12 a latched scheme draws no arm"
+        Light::at(Live::Glass),
+        "from 1.12 a latched scheme draws the glass, and no lip until 2.7"
     );
 }
 

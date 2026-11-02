@@ -313,7 +313,7 @@ pub fn rows(layout: &impl Keys, us: &impl Keys) -> Rows {
 }
 
 fn sleep(secs: f64) -> Result<(), Stopped> {
-    stop::sleep(Duration::from_secs_f64(secs))
+    stop::sleep(Duration::try_from_secs_f64(secs).unwrap_or(Duration::ZERO))
 }
 
 /// `bytes` as the dump prints them.
@@ -696,13 +696,63 @@ fn cmd_restore() -> Res {
     Ok(0)
 }
 
-/// `meta-keys --window [--layout ID]... [--aterm PATH] [--keep]`, or `meta-keys --restore`.
+/// Plan one composition on the currently selected source without changing input sources.
+fn current_control() -> Res {
+    let selected = crate::sys::tis::selected();
+    let read = || -> Result<aterm_json::Value, String> {
+        let id = selected
+            .as_deref()
+            .ok_or("HIToolbox names no selected keyboard input source")?;
+        let layout = crate::sys::tis::Layout::of(id)?;
+        let us = crate::sys::tis::Layout::of(US)?;
+        let plan = rows(&layout, &us);
+        let case = plan
+            .control
+            .first()
+            .ok_or("the selected layout has no control row")?;
+        let want = std::str::from_utf8(&case.want).map_err(|e| e.to_string())?;
+        if case.keys.len() < 2 || want.is_ascii() || want.chars().count() != 1 {
+            return Err("the selected layout's first control is not a multikey composition".into());
+        }
+        if crate::sys::tis::selected().as_deref() != Some(id) {
+            return Err("the selected input source changed while its control was read".into());
+        }
+        Ok(aterm_json::json!({
+            "status": "READY",
+            "selected_id": id,
+            "keyboard_type": layout.keyboard_type(),
+            "what": case.what.clone(),
+            "keys": case.keys.clone(),
+            "want_utf8": want,
+            "want_hex": hex(&case.want),
+        }))
+    };
+    let (report, code) = match read() {
+        Ok(report) => (report, 0),
+        Err(reason) => (
+            aterm_json::json!({
+                "status": "UNOBSERVED",
+                "selected_id": selected,
+                "reason": reason,
+            }),
+            3,
+        ),
+    };
+    println!(
+        "{}",
+        aterm_json::to_string(&report).map_err(|e| Fail::die(e.to_string()))?
+    );
+    Ok(code)
+}
+
+/// `meta-keys --window [--layout ID]... [--aterm PATH] [--keep]`, `--current-control`, or `--restore`.
 ///
 /// # Errors
 /// Usage, a lane that could not run, or an interrupt.
 pub fn cmd_meta_keys(args: &[String]) -> Res {
     stop::install();
     let mut a = args.to_vec();
+    let current = instance::take_flag(&mut a, "--current-control");
     let window = instance::take_flag(&mut a, "--window");
     let keep = instance::take_flag(&mut a, "--keep");
     let restore = instance::take_flag(&mut a, "--restore");
@@ -713,6 +763,14 @@ pub fn cmd_meta_keys(args: &[String]) -> Res {
         return Err(Fail::usage(format!(
             "meta-keys: unexpected '{extra}' ({LAB} help)"
         )));
+    }
+    if current {
+        if window || keep || restore || plan_only || aterm.is_some() || !asked.is_empty() {
+            return Err(Fail::usage(
+                "meta-keys --current-control takes no other options",
+            ));
+        }
+        return current_control();
     }
     if restore {
         return cmd_restore();

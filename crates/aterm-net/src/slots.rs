@@ -337,7 +337,7 @@ impl Evictor {
     }
 }
 
-/// The watchdog's claim at its deadline.
+/// Claim the elapsed deadline without replacing an earlier decision.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -354,6 +354,8 @@ fn claim_deadline(state: &AtomicU8) -> bool {
 
 /// The unauthenticated-phase watchdog.
 pub(crate) struct HandshakeWatchdog {
+    started: Instant,
+    within: Duration,
     /// The state claimed by exactly one of the handshake, the watchdog and an [`Evictor`].
     state: Arc<AtomicU8>,
     /// The parked watchdog thread (`None` once [`Self::finish`] or [`Drop`] has joined it).
@@ -361,6 +363,8 @@ pub(crate) struct HandshakeWatchdog {
     /// Set by the thread each time it is about to wait.
     #[cfg(test)]
     waiting: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(all(test, unix))]
+    joining: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
 impl HandshakeWatchdog {
@@ -369,6 +373,17 @@ impl HandshakeWatchdog {
     /// # Errors
     /// If the socket cannot be cloned (Windows) or the watchdog thread cannot start.
     pub(crate) fn arm(tcp: &TcpStream, handshake_timeout: Duration) -> io::Result<Self> {
+        Self::arm_with_clock(tcp, handshake_timeout, Instant::now)
+    }
+
+    fn arm_with_clock(
+        tcp: &TcpStream,
+        handshake_timeout: Duration,
+        now: impl Fn() -> Instant + Send + 'static,
+    ) -> io::Result<Self> {
+        // Thread creation and delayed scheduling are part of this handshake's
+        // budget. The worker must not restart its clock when it finally runs.
+        let start = now();
         let state = Arc::new(AtomicU8::new(WD_RUNNING));
         let _ = aterm_uds::keep_out_of_children(tcp);
         #[cfg(unix)]
@@ -384,14 +399,14 @@ impl HandshakeWatchdog {
         #[cfg(test)]
         let wd_waiting = Arc::clone(&waiting);
         let thread = std::thread::Builder::new().spawn(move || {
-            let start = Instant::now();
             let cut_off = loop {
                 match wd_state.load(Ordering::Acquire) {
                     WD_RUNNING => {}
-                    WD_EVICTED => break true,
+                    WD_EVICTED | WD_FIRED => break true,
                     _ => break false, // finished early — nothing to cut off
                 }
-                let remaining = handshake_timeout.saturating_sub(start.elapsed());
+                let remaining =
+                    handshake_timeout.saturating_sub(now().saturating_duration_since(start));
                 if remaining.is_zero() {
                     // Deadline reached: claim FIRED iff still running. A lost
                     // claim is re-read above: the handshake's leaves the socket
@@ -424,11 +439,21 @@ impl HandshakeWatchdog {
             }
         })?;
         Ok(Self {
+            started: start,
+            within: handshake_timeout,
             state,
             thread: Some(thread),
             #[cfg(test)]
             waiting,
+            #[cfg(all(test, unix))]
+            joining: None,
         })
+    }
+
+    /// Observe the descriptor immediately before joining the watchdog thread.
+    #[cfg(all(test, unix))]
+    pub(crate) fn observe_join(&mut self, probe: impl FnOnce() + Send + Sync + 'static) {
+        self.joining = Some(Box::new(probe));
     }
 
     /// Whether the deadline claimed the phase, so the watchdog hung the socket up at it: what a
@@ -451,7 +476,8 @@ impl HandshakeWatchdog {
         }
     }
 
-    /// Claim [`WD_AUTHED`] iff no deadline or eviction claimed the phase first, wake the watchdog.
+    /// Claim [`WD_AUTHED`] only before the deadline and if no eviction claimed the phase first,
+    /// then wake the watchdog.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -460,7 +486,16 @@ impl HandshakeWatchdog {
             project = "slots::tests::slots_conform_to_net_slot_displacement"
         )
     )]
-    pub(crate) fn finish(mut self) -> Claim {
+    pub(crate) fn finish(self) -> Claim {
+        self.finish_at(Instant::now())
+    }
+
+    fn finish_at(mut self, now: Instant) -> Claim {
+        // A delayed watchdog cannot grant time to a handshake that completed
+        // after its original deadline. An earlier eviction still wins.
+        if now.saturating_duration_since(self.started) >= self.within {
+            let _ = claim_deadline(&self.state);
+        }
         let claim = match self.state.compare_exchange(
             WD_RUNNING,
             WD_AUTHED,
@@ -472,6 +507,10 @@ impl HandshakeWatchdog {
             Err(_) => Claim::Deadline,
         };
         if let Some(thread) = self.thread.take() {
+            #[cfg(all(test, unix))]
+            if let Some(probe) = self.joining.take() {
+                probe();
+            }
             thread.thread().unpark();
             let _ = thread.join();
         }
@@ -488,6 +527,10 @@ impl Drop for HandshakeWatchdog {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             );
+            #[cfg(all(test, unix))]
+            if let Some(probe) = self.joining.take() {
+                probe();
+            }
             thread.thread().unpark();
             let _ = thread.join();
         }
@@ -576,6 +619,62 @@ pub(crate) mod tests {
         assert_eq!(
             listener.accept().unwrap_err().kind(),
             io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn a_late_watchdog_start_does_not_restart_the_handshake_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let tcp = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_peer, _) = listener.accept().unwrap();
+        tcp.set_read_timeout(Some(MUST_HAPPEN)).unwrap();
+        let creator = std::thread::current().id();
+        let started = Instant::now();
+        let budget = MUST_HAPPEN * 10;
+        // The worker's first observation is already beyond the deadline.
+        // No sleep or assumption about actual scheduler latency is involved.
+        let now = move || {
+            if std::thread::current().id() == creator {
+                started
+            } else {
+                started + budget * 2
+            }
+        };
+        let watchdog = HandshakeWatchdog::arm_with_clock(&tcp, budget, now).unwrap();
+        let mut byte = [0; 1];
+        let read = (&tcp).read(&mut byte);
+        assert!(
+            matches!(&read, Ok(0)) || read.as_ref().is_err_and(|error| !is_deadline(error)),
+            "a delayed watchdog must cut the expired handshake before waiting again: {read:?}"
+        );
+        assert_eq!(watchdog.finish(), Claim::Deadline);
+    }
+
+    #[test]
+    fn a_late_handshake_cannot_outrun_its_delayed_watchdog() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let tcp = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_peer, _) = listener.accept().unwrap();
+        tcp.set_read_timeout(Some(MUST_HAPPEN)).unwrap();
+        let started = Instant::now();
+        let budget = MUST_HAPPEN * 10;
+        let watchdog = HandshakeWatchdog::arm_with_clock(&tcp, budget, move || started).unwrap();
+        let until = Instant::now() + MUST_HAPPEN;
+        while !watchdog.waiting.load(Ordering::Acquire) {
+            assert!(Instant::now() < until, "the watchdog never began waiting");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // The exact boundary is expired even if the timer has not run.
+        assert_eq!(
+            watchdog.finish_at(started + budget),
+            Claim::Deadline,
+            "completion must check elapsed time even while the watchdog is still waiting"
+        );
+        let mut byte = [0; 1];
+        let read = (&tcp).read(&mut byte);
+        assert!(
+            matches!(&read, Ok(0)) || read.as_ref().is_err_and(|error| !is_deadline(error)),
+            "a completion that claims the deadline must close its socket: {read:?}"
         );
     }
 

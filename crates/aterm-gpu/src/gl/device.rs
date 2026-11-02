@@ -558,6 +558,13 @@ fn first_that_opens<D: Copy, T>(
 impl GlDevice {
     /// A headless device: no window system, rendering only into textures it reads back.
     pub(crate) fn headless() -> Result<Self, String> {
+        Self::headless_with_policy(crate::DevicePolicy::Headless)
+    }
+
+    /// Enumerated or surfaceless EGL for headless callers; only a windowed policy
+    /// may ask EGL for its default native display when neither route is available.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn headless_with_policy(policy: crate::DevicePolicy) -> Result<Self, String> {
         // Creation binds the new context on this thread, which would unbind a
         // device held here.
         if !HELD.with(Cell::get).is_null() {
@@ -622,6 +629,9 @@ impl GlDevice {
             }
             let mut tracked = tracked && display != ffi::EGL_NO_DISPLAY;
             if display == ffi::EGL_NO_DISPLAY {
+                if policy == crate::DevicePolicy::Headless {
+                    return Err("gl: no enumerated or surfaceless headless display".to_owned());
+                }
                 // SAFETY: EGL_DEFAULT_DISPLAY is always a legal argument.
                 display = unsafe { (egl.fns.get_display)(ffi::EGL_DEFAULT_DISPLAY) };
                 tracked = false;

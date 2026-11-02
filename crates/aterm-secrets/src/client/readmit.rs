@@ -1,0 +1,726 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! A Mac that is ALab's already gets back into the vault with nobody (owner, 2026-11-01: "No
+//! more asking to join"; `docs/DESIGN-automatic-alab-lan-admission-2026-10-29.md` §8).
+//!
+//! The Mac proves one of two things to any member, on a fresh challenge, and that member lets it
+//! in by itself ([`admit_by_proof`]):
+//!
+//! - **Its seat's node key.** The log binds its fleet node key to a seat by authority: the genesis
+//!   lists that key for the founder, or the seat's own `Node` record carries the key's signature
+//!   for it. The Mac's vault key changed (a reinstall, a reset vault folder), so the member signs
+//!   a `Remove` of the old seat and, after it, an `Admit` of the new key under the old seat's
+//!   label with the same node key. The evaluator reads that `Admit` as the same Mac back (the
+//!   removed seat is superseded by the node key, `eval.rs`), so the label, the node key and every
+//!   grant tied to them carry over. A seat that only its own `Admit` binds to the key (no proof by
+//!   the key in the log) moves only where the Mac also proved the fleet's current key below.
+//! - **The fleet's current key.** The fleet handshake (`atf/2`) proved the fleet secret the vault
+//!   holds now and the node key, bound to that connection's TLS exporter, and this member's own
+//!   drive admission takes the node: the fleet already lets that Mac drive this one and read its
+//!   files, so the vault is never easier to enter than the fleet. A node key no seat binds gets a
+//!   new seat under the next free label.
+//!
+//! Only record kinds and evidences a 0.147 Mac takes are signed (`Remove`, `Admit` of
+//! [`Evidence::Manual`], `Wrap`): a record of a kind it does not know would stop it taking any
+//! record of the stream. A 0.147 evaluator does not supersede a seat by its node key: it would
+//! read the moved seat's node key and the new recipient as removed, and its epoch tending would
+//! leave the returned Mac out of every newer key for good. So a seat moves only once every member
+//! the deciding member's fleet book heard lately runs 0.148 or later ([`Book::moved_seats_read`]).
+//!
+//! What keeps a proof from doing harm ([`decide`]):
+//!
+//! - A Mac the log removed stays out: its vault key, its recipient, its writer key, its node key,
+//!   and a node id the fleet book bound to a key the log holds out. A seat moved off a key never
+//!   moves back to it, since that key's seat is then a removed one.
+//! - Two Macs holding one node key (Migration Assistant, a restore, a cloned disk) never trade a
+//!   seat back and forth: a seat moves only once it signed nothing for [`DARK_FOR_MS`] and the
+//!   fleet book does not hear its node key from another address, at most once in
+//!   [`READMIT_EVERY_MS`] and at most [`MAX_READMISSIONS`] times in all, and a key another `Admit`
+//!   already names, a key two seats hold, and a key a member replaced go to a person. The Mac a
+//!   move left out is offered no Undo of it.
+//! - A member signs at most [`AUTOMATIC_PER_HOUR`] such admissions an hour; no member signs one
+//!   once the log holds [`PROVEN_PER_DAY`] `Admit`s of [`Evidence::Manual`] from the last day, or
+//!   is [`PROVEN_FILL`] full; and a node id the fleet book binds to another seat's key takes no
+//!   new seat.
+//! - Nothing is kept unless the evaluator, run over the signed records, seats the new key under
+//!   the label decided, with the node key it proved.
+
+use super::admit::{
+    LogAdmission, held_audiences, held_log, labels_taken, log_bundle, node_removal, removal_naming,
+    roster_keeps_out, wraps_lacking,
+};
+use super::*;
+use crate::commons::binding::Request;
+use crate::members::Allowed;
+use crate::membership_log::{
+    Body, Entrant, EpochAudience, Evidence, Kind, Log, MAX_RECORDS, MemberId, NodeStanding, Record,
+    RecordId, Signer, encode_records,
+};
+
+/// How long after a seat took a new key it may take another by proof: two Macs that hold one
+/// node key then wait for a person instead of trading the seat back and forth.
+pub const READMIT_EVERY_MS: u64 = 24 * 60 * 60 * 1000;
+/// How many times one node key's seat moves by proof in all; past it a person decides.
+pub const MAX_READMISSIONS: usize = 4;
+/// How many Macs one member lets in by proof an hour.
+pub const AUTOMATIC_PER_HOUR: usize = 4;
+/// How many `Admit`s of [`Evidence::Manual`] (what a proof signs, and a person's Allow too) the
+/// whole log may hold from the last day before no member lets another Mac in by proof: a limit
+/// every member reads alike from the log, so ~86 members' hourly shares cannot add up to
+/// hundreds of seats a day for one holder of the fleet's key.
+pub const PROVEN_PER_DAY: usize = 8;
+/// The share of [`MAX_RECORDS`] past which no member lets a Mac in by proof: the log grows and is
+/// never pruned, and a full log takes no `Admit`, `Remove` or `Put` again, so the last quarter
+/// is kept for what people do.
+pub const PROVEN_FILL: (usize, usize) = (3, 4);
+/// How long a seat must have signed nothing before a proof of its node key moves it: a Mac still
+/// running under the seat (its fleet key copied by Migration Assistant, a restore or a cloned
+/// disk onto a Mac that made a new vault key) keeps it, and a person decides.
+pub const DARK_FOR_MS: u64 = 24 * 60 * 60 * 1000;
+/// How long a member reads the vault's newest records before it decides a proof: one that reads
+/// none from any server or peer in that time may not know of a removal, and lets no new key in.
+pub const FRESH_WITHIN: Duration = Duration::from_secs(5);
+const HOUR_MS: u64 = 60 * 60 * 1000;
+
+/// What a Mac proved to this member on one connection.
+#[derive(Clone, Copy, Debug)]
+pub struct Proven<'a> {
+    /// Its self-signed device request; the possession challenge proved it holds that request's
+    /// age identity and writer key.
+    pub request: &'a Request,
+    /// Its fleet node key, proven on this connection: by the fleet handshake's node proof, bound
+    /// to the connection's TLS exporter, or by its signature over this member's fresh greeting
+    /// challenge.
+    pub node: [u8; 32],
+    /// The machine name it asks under, for display.
+    pub name: &'a str,
+    /// The fleet handshake also proved the fleet's current key, and this member's own drive
+    /// admission takes the node.
+    pub fleet: bool,
+    /// What this member's fleet book says of the Mac and of the fleet.
+    pub book: Book,
+}
+
+/// What this member's fleet book says of a Mac proving itself and of the fleet, as the caller
+/// that holds the book read it (`aterm_agent::vault_join::book_word`): never the Mac's own word.
+/// [`Book::default`] is the book that lets nothing move.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Book {
+    /// The book binds the node id the Mac proved to another key the log holds out: a removed
+    /// Mac that minted a fresh node key under its old node id.
+    pub node_id_held_out: bool,
+    /// The book binds the node id the Mac proved to another key the log seats: one Mac (a VM that
+    /// re-mints its node key at each boot, say) takes one seat by the fleet's key, not one a boot.
+    pub node_id_seated: bool,
+    /// The book heard the node key the Mac proved, within its live window, from another address
+    /// than the one the proof came from: two Macs may hold that key, so its seat stays.
+    pub node_elsewhere: bool,
+    /// Every member the book heard in the last 14 days runs aterm 0.148.0 or later, whose
+    /// evaluator reads a seat moved by its node key (a `Remove` of the old seat, then an `Admit`
+    /// of the same node key) as the same Mac back. A 0.146 or 0.147 Mac reads the node key as
+    /// removed and so the new seat's key as a removed Mac's: its vault pass mints new
+    /// `[everyone]` and Commons keys that leave the returned Mac out, and every build reads that
+    /// as on purpose, so the Mac would lose every newer secret for good. Until then a seat moves
+    /// by no proof.
+    pub moved_seats_read: bool,
+}
+
+/// How a proof let a Mac in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum How {
+    /// The log let it in already, by this member or another: only the `Wrap`s it lacked.
+    Already,
+    /// Its node key is the seat `label`'s: the old seat went and the new key took its label.
+    Seat {
+        /// The seat's label.
+        label: String,
+    },
+    /// Its node key is the one the genesis lists for the founder `label`, which no Mac proved.
+    Founder {
+        /// The founder's label.
+        label: String,
+    },
+    /// No seat binds its node key, and it proved the fleet's current key: a new seat.
+    Fleet {
+        /// The label it took.
+        label: String,
+    },
+}
+
+/// What [`admit_by_proof`] came to.
+#[derive(Debug)]
+pub enum Readmit {
+    /// Let in.
+    Let {
+        /// The log bundle the Mac writes its vault from ([`write_from_log_bundle`]).
+        bundle: SecretBytes,
+        /// How.
+        how: How,
+        /// How many records this member signed.
+        signed: usize,
+    },
+    /// No proof lets it in here: why, for the Mac's log. It asks a person instead.
+    Refused(String),
+    /// A vault pass holds this Mac's state; the Mac tries another member.
+    Busy,
+    /// This member admits nobody through the log: no trusted log with epochs, no seat for its
+    /// device key in it, or an `[everyone]` epoch it cannot hand on.
+    NotHere,
+}
+
+/// What the log says of a proof, before anything is signed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Decision {
+    /// The log seats the Mac already.
+    Already,
+    /// Remove `seat` at `cutoff`, then admit the new key under `label`.
+    Replace {
+        /// The seat whose node key the Mac proved.
+        seat: MemberId,
+        /// That seat's last record the log holds, else the record that let it in.
+        cutoff: RecordId,
+        /// The label the seat claimed.
+        label: String,
+    },
+    /// Admit the new key under the founder's `label`.
+    Founder {
+        /// The label the genesis lists.
+        label: String,
+    },
+    /// Admit the new key under the next free label.
+    Fleet,
+    /// Let nobody in: why.
+    Refuse(String),
+}
+
+/// Whether the log binds `node` to `seat` by authority: the genesis lists it for that founder,
+/// the seat's own `Node` record carries it, whose proof by the key [`Record::decode`] verified,
+/// or the seat took it by proof from a seat bound so ([`moved_by_proof`]). Any other `Admit`'s
+/// entrant key is the admitting member's word alone.
+fn bound_by_authority(log: &Log, seat: &MemberId, node: &[u8; 32]) -> bool {
+    authority_within(log, seat, node, MAX_READMISSIONS + 1)
+}
+
+fn authority_within(log: &Log, seat: &MemberId, node: &[u8; 32], depth: usize) -> bool {
+    let listed = matches!(
+        log.genesis().body(),
+        Body::Genesis { founders, .. }
+            if founders.iter().any(|f| f.member() == Some(*seat) && f.node_key == Some(*node))
+    );
+    listed
+        || log.records().any(|r| {
+            r.actor() == seat && matches!(r.body(), Body::Node { node_key, .. } if node_key == node)
+        })
+        || (depth > 0 && moved_by_proof(log, seat, node, depth - 1))
+}
+
+/// Whether an `Admit` of [`Evidence::Manual`] let `seat` in with `node` right after its signer
+/// removed a seat the log binds `node` to by authority: what [`admit_by_proof`] signs once the Mac
+/// proved `node` to that member. The Mac that took a seat so never signs a `Node` record for a
+/// key the log binds to it already (`publish_local_node_key`), so this is how its next move is
+/// proven too.
+fn moved_by_proof(log: &Log, seat: &MemberId, node: &[u8; 32], depth: usize) -> bool {
+    log.records().any(|r| {
+        matches!(r.body(), Body::Admit { entrant, evidence: Evidence::Manual }
+            if entrant.member() == *seat && entrant.node_key == *node)
+            && r.previous().and_then(|p| log.get(p)).is_some_and(|before| {
+                before.actor() == r.actor()
+                    && matches!(before.body(), Body::Remove { member, .. }
+                        if authority_within(log, member, node, depth))
+            })
+    })
+}
+
+/// Whether `seat` signed any record at or after `since_ms` (its signer's clock): its Mac may
+/// still run under it.
+fn signed_since(log: &Log, seat: &MemberId, since_ms: u64) -> bool {
+    log.records()
+        .any(|r| r.kind() != Kind::Genesis && r.actor() == seat && r.authored_ms() >= since_ms)
+}
+
+/// Whether `remover` removed `seat` only to seat a new vault key under it by the seat's node key
+/// (what [`admit_by_proof`] signs: the `Remove`, then at once an `Admit` of [`Evidence::Manual`]
+/// of a node key bound to `seat`). The Mac left out by such a move is offered no Undo of it.
+pub(super) fn seat_moved_by(log: &Log, remover: &MemberId, seat: &MemberId) -> bool {
+    log.records().any(|r| {
+        r.actor() == remover
+            && matches!(r.body(), Body::Admit { entrant, evidence: Evidence::Manual }
+                if binds(log, seat, &entrant.node_key))
+            && r.previous().and_then(|p| log.get(p)).is_some_and(|before| {
+                before.actor() == remover
+                    && matches!(before.body(), Body::Remove { member, .. } if member == seat)
+            })
+    })
+}
+
+/// Whether any record binds `node` to `member`: the genesis, an `Admit` of it, or its `Node`.
+fn binds(log: &Log, member: &MemberId, node: &[u8; 32]) -> bool {
+    bound_by_authority(log, member, node)
+        || log.records().any(|r| {
+            matches!(r.body(), Body::Admit { entrant, .. }
+                if entrant.member() == *member && entrant.node_key == *node)
+        })
+}
+
+/// When each move of `node`'s seat by proof was signed (the signer's clock, in UTC
+/// milliseconds): an `Admit` of [`Evidence::Manual`] naming `node` whose signer's previous record
+/// is the `Remove` of a seat bound to `node`.
+pub(super) fn readmissions(log: &Log, node: &[u8; 32]) -> Vec<u64> {
+    log.records()
+        .filter(|r| {
+            matches!(r.body(), Body::Admit { entrant, evidence: Evidence::Manual }
+                if entrant.node_key == *node)
+                && r.previous().and_then(|p| log.get(p)).is_some_and(|before| {
+                    before.actor() == r.actor()
+                        && matches!(before.body(), Body::Remove { member, .. }
+                            if binds(log, member, node))
+                })
+        })
+        .map(Record::authored_ms)
+        .collect()
+}
+
+/// How many `Admit`s of [`Evidence::Manual`] `me` signed in the hour before `now_ms`.
+fn automatic_this_hour(log: &Log, me: &MemberId, now_ms: u64) -> usize {
+    log.records()
+        .filter(|r| {
+            r.actor() == me
+                && matches!(
+                    r.body(),
+                    Body::Admit {
+                        evidence: Evidence::Manual,
+                        ..
+                    }
+                )
+                && now_ms.saturating_sub(r.authored_ms()) < HOUR_MS
+        })
+        .count()
+}
+
+/// How many `Admit`s of [`Evidence::Manual`] any member signed in the day before `now_ms`.
+fn manual_this_day(log: &Log, now_ms: u64) -> usize {
+    log.records()
+        .filter(|r| {
+            matches!(
+                r.body(),
+                Body::Admit {
+                    evidence: Evidence::Manual,
+                    ..
+                }
+            ) && now_ms.saturating_sub(r.authored_ms()) < READMIT_EVERY_MS
+        })
+        .count()
+}
+
+/// Whether a log of `records` records still has room for a Mac let in by proof ([`PROVEN_FILL`]).
+const fn room_for_proven(records: usize) -> bool {
+    records * PROVEN_FILL.1 < MAX_RECORDS * PROVEN_FILL.0
+}
+
+/// The label `seat` claimed: its genesis entry's, else its `Admit`'s.
+fn claimed_label(log: &Log, seat: &MemberId) -> Option<String> {
+    if let Body::Genesis { founders, .. } = log.genesis().body()
+        && let Some(f) = founders.iter().find(|f| f.member() == Some(*seat))
+    {
+        return Some(f.label.clone());
+    }
+    let entry = log.membership().get(seat)?.entry;
+    match log.get(&entry)?.body() {
+        Body::Admit { entrant, .. } => Some(entrant.label.clone()),
+        _ => None,
+    }
+}
+
+/// What the log says the member `me` may do with `proven` at `now_ms` (its clock): the rule in
+/// the module's head, read from `log` alone, so every member decides one proof alike.
+pub(super) fn decide(log: &Log, me: &MemberId, proven: &Proven<'_>, now_ms: u64) -> Decision {
+    let refuse = |why: &str| Decision::Refuse(why.to_owned());
+    let binding = proven.request.binding();
+    let actor = binding.actor();
+    let recipient = binding.recipient();
+    let node = proven.node;
+    let membership = log.membership();
+    if node == [0; 32] {
+        return refuse("it proved no node key");
+    }
+    if membership.get(me).and_then(|m| m.node_key) == Some(node) {
+        return refuse("it proved this member's own node key");
+    }
+    if removal_naming(log, binding).is_some()
+        || log.recipient_is_removed(&recipient)
+        || node_removal(log, *binding.writer()).is_some()
+    {
+        return refuse("the vault removed this Mac's key: a person's Allow again decides");
+    }
+    if proven.book.node_id_held_out {
+        return refuse("its node id held a key the vault removed: a person decides");
+    }
+    if log.audience_left_out_recipient(&EpochAudience::Everyone, &recipient)
+        || (membership.contains(&actor) && log.audience_left_out(&EpochAudience::Everyone, &actor))
+    {
+        return refuse("the vault's newest key leaves this Mac out on purpose");
+    }
+    if membership.contains(&actor) {
+        return Decision::Already;
+    }
+    if automatic_this_hour(log, me, now_ms) >= AUTOMATIC_PER_HOUR {
+        return refuse("this member let its share of Macs in this hour; another member may");
+    }
+    if manual_this_day(log, now_ms) >= PROVEN_PER_DAY {
+        return refuse(
+            "the vault let as many Macs in as it lets in by proof a day: a person decides, or the \
+             Mac comes in by itself tomorrow",
+        );
+    }
+    if !room_for_proven(log.records().count()) {
+        return refuse(
+            "the membership log is three quarters full, and the rest is kept for what people do: \
+             a person decides",
+        );
+    }
+    match membership.node(&node) {
+        NodeStanding::Member(seat) => {
+            let Some(held) = membership.get(&seat) else {
+                return refuse("the seat this node key names is gone");
+            };
+            if log.recipient_is_removed(&held.binding.recipient())
+                || membership.member_node_removed(held)
+                || log.audience_left_out(&EpochAudience::Everyone, &seat)
+            {
+                return refuse("the seat this node key names is held out");
+            }
+            if !bound_by_authority(log, &seat, &node) && !proven.fleet {
+                return refuse(
+                    "only that seat's Admit binds this node key, which no proof by the key backs: \
+                     proving the fleet's key too, or a person's Allow, lets it in",
+                );
+            }
+            let past = readmissions(log, &node);
+            if past.len() >= MAX_READMISSIONS {
+                return refuse("this node key's seat took a new key too often: a person decides");
+            }
+            if past
+                .iter()
+                .any(|&at| now_ms.saturating_sub(at) < READMIT_EVERY_MS)
+            {
+                return refuse(
+                    "this node key's seat took a new key less than a day ago, so two Macs may \
+                     hold it (a clone or a restore): a person decides",
+                );
+            }
+            if signed_since(log, &seat, now_ms.saturating_sub(DARK_FOR_MS)) {
+                return refuse(
+                    "the seat this node key names signed a record in the last day, so its Mac may \
+                     still run (a copy of its fleet key on a Mac with a new vault key?): a person \
+                     decides",
+                );
+            }
+            if proven.book.node_elsewhere {
+                return refuse(
+                    "this member's fleet book heard that node key from another address just now, \
+                     so two Macs may hold it: a person decides",
+                );
+            }
+            if !proven.book.moved_seats_read {
+                return refuse(
+                    "a member heard in the last 14 days runs an aterm older than 0.148, which \
+                     would read the moved seat as removed and leave this Mac out of the vault's \
+                     newer keys for good: the seat moves by itself once every member updated",
+                );
+            }
+            let Some(label) = claimed_label(log, &seat) else {
+                return refuse("the seat this node key names claims no label");
+            };
+            let cutoff = log
+                .records()
+                .filter(|r| r.kind() != Kind::Genesis && *r.actor() == seat)
+                .max_by(|a, b| a.sequence().cmp(&b.sequence()).then(b.id().cmp(a.id())))
+                .map_or(held.entry, |r| *r.id());
+            Decision::Replace {
+                seat,
+                cutoff,
+                label,
+            }
+        }
+        NodeStanding::Unknown => {
+            if log.records().any(
+                |r| matches!(r.body(), Body::Admit { entrant, .. } if entrant.node_key == node),
+            ) {
+                return refuse(
+                    "another Admit names this node key already, so two Macs may hold it: a person \
+                     decides",
+                );
+            }
+            if proven.book.node_id_seated {
+                return refuse(
+                    "its node id holds another seat's node key already, and one Mac takes one \
+                     seat: a person decides",
+                );
+            }
+            if let Some(founder) = membership
+                .unproved()
+                .iter()
+                .find(|f| f.node_key == Some(node))
+            {
+                return Decision::Founder {
+                    label: founder.label.clone(),
+                };
+            }
+            if !proven.fleet {
+                return refuse(
+                    "no seat binds this node key, and the Mac did not prove the fleet's key",
+                );
+            }
+            Decision::Fleet
+        }
+        NodeStanding::Retired(_) => refuse("a member replaced this node key with another"),
+        NodeStanding::Contested => refuse("two seats hold this node key: a person decides"),
+        NodeStanding::Removed(_) => refuse("the vault removed this node key: a person decides"),
+    }
+}
+
+/// The machine name an `Allowed` and an `Admit` carry for a Mac asking under `asked`.
+fn admitted_name(asked: &str) -> String {
+    let lower = asked.to_ascii_lowercase();
+    if text::valid_machine_name(&lower) {
+        lower
+    } else {
+        "machine".to_owned()
+    }
+}
+
+/// Let the Mac `proven` names in by its proof, as the member at `paths`, at `now_ms` (this Mac's
+/// clock): read the vault's newest records (within [`FRESH_WITHIN`]; a member that reads none
+/// signs nothing new), [`decide`], then under this Mac's state lock sign what the decision says and keep it
+/// only where the evaluator seats the new key as decided, and hand the log bundle, with an
+/// `Allowed` this member signs for the approvers 0.145 Macs read. Its records go to every vault
+/// server off the caller's thread. Nothing here waits on a person, and nothing runs on a window's
+/// main thread: the callers are the fleet listener's connection threads.
+///
+/// # Errors
+/// Local state cannot be read or written, or signing fails.
+pub fn admit_by_proof(paths: &Paths, proven: &Proven<'_>, now_ms: u64) -> crate::Result<Readmit> {
+    // The vault's newest records first, from its servers and peers: a member that has not read
+    // a removal since (asleep, or away with only the removed Mac) would let that Mac back in.
+    let fresh =
+        super::sync_records_until(paths, None, &[], None, Some(Instant::now() + FRESH_WITHIN))
+            .is_ok();
+    let Some(lock) = StateLock::try_take_until(paths, Instant::now() + HANDOVER_LOCK_WAIT)? else {
+        return Ok(Readmit::Busy);
+    };
+    let Some((mut store, mut log, _, opened)) = held_log(paths)? else {
+        return Ok(Readmit::NotHere);
+    };
+    let binding = proven.request.binding();
+    if let Some(why) = roster_keeps_out(paths, Some(&opened), binding, proven.node) {
+        return Ok(Readmit::Refused(why));
+    }
+    let Some((me, device, incarnation)) = log_entries::open_local_member_signer(paths, &log)?
+    else {
+        return Ok(Readmit::NotHere);
+    };
+    if log.audience_left_out(&EpochAudience::Everyone, &me) {
+        return Ok(Readmit::NotHere);
+    }
+    let Some(audiences) = held_audiences(&log, &opened, &me) else {
+        return Ok(Readmit::NotHere);
+    };
+    let decision = decide(&log, &me, proven, now_ms);
+    if let Decision::Refuse(why) = decision {
+        return Ok(Readmit::Refused(why));
+    }
+    if !fresh && decision != Decision::Already {
+        return Ok(Readmit::Refused(
+            "this member read the vault's newest records from no server or peer just now, so it \
+             may not know of a removal: another member may let the Mac in"
+                .to_owned(),
+        ));
+    }
+    let actor = binding.actor();
+    let name = admitted_name(proven.name);
+    let entrant = |label: String| Entrant {
+        request: proven.request.clone(),
+        node_key: proven.node,
+        name: name.clone(),
+        label,
+    };
+    let (taken, counted) = labels_taken(&opened.by_audience);
+    let (signed, how) = device.with_seed(|seed| -> crate::Result<(Vec<Record>, How)> {
+        let signer = Signer {
+            actor: &me,
+            seed,
+            incarnation,
+        };
+        Ok(match decision.clone() {
+            Decision::Already => (
+                wraps_lacking(&mut log, &opened, &audiences, &signer, &actor, now_ms)?,
+                How::Already,
+            ),
+            Decision::Replace {
+                seat,
+                cutoff,
+                label,
+            } => {
+                let remove = log
+                    .draft(
+                        &me,
+                        now_ms,
+                        Body::Remove {
+                            member: seat,
+                            cutoff,
+                        },
+                    )
+                    .sign(seed, incarnation)?;
+                log.insert(remove.clone())?;
+                let mut signed = vec![remove];
+                signed.extend(log.admit_with(
+                    &signer,
+                    entrant(label.clone()),
+                    Evidence::Manual,
+                    &opened,
+                    &audiences,
+                    now_ms,
+                )?);
+                (signed, How::Seat { label })
+            }
+            Decision::Founder { label } => (
+                log.admit_with(
+                    &signer,
+                    entrant(label.clone()),
+                    Evidence::Manual,
+                    &opened,
+                    &audiences,
+                    now_ms,
+                )?,
+                How::Founder { label },
+            ),
+            Decision::Fleet => {
+                let label = log
+                    .next_label(&name, &taken, &counted)
+                    .ok_or_else(|| Error::new("no m<N> label up to m99999 is free"))?;
+                (
+                    log.admit_with(
+                        &signer,
+                        entrant(label.clone()),
+                        Evidence::Manual,
+                        &opened,
+                        &audiences,
+                        now_ms,
+                    )?,
+                    How::Fleet { label },
+                )
+            }
+            Decision::Refuse(why) => return Err(Error::new(why)),
+        })
+    })?;
+    // The evaluator, over what was signed, must seat the new key as decided: else nothing is
+    // kept, and the Mac asks a person.
+    let membership = log.membership();
+    let Some(seated) = membership.get(&actor) else {
+        return Ok(Readmit::Refused(
+            "the membership log does not seat this Mac after its proof".to_owned(),
+        ));
+    };
+    let label_held = match &how {
+        How::Already => true,
+        How::Seat { label } | How::Founder { label } | How::Fleet { label } => {
+            seated.label == *label
+        }
+    };
+    let node_held = match &how {
+        How::Seat { .. } => membership.node(&proven.node) == NodeStanding::Member(actor),
+        _ => true,
+    };
+    if !label_held || !node_held {
+        return Ok(Readmit::Refused(format!(
+            "the membership log would seat this Mac as {} after its proof, not as decided",
+            seated.label
+        )));
+    }
+    let admission = LogAdmission {
+        admit: seated.entry,
+        label: seated.label.clone(),
+        signed: signed.clone(),
+        records: Vec::new(),
+    };
+    if !signed.is_empty() {
+        store.ingest(&encode_records(&signed))?;
+        fsx::write_atomic(&paths.records_file(), &store.encode(), 0o600)?;
+    }
+    let allowed = device.with_seed(|seed| Allowed::sign(binding, &name, seed))?;
+    let bundle = log_bundle(
+        paths,
+        &allowed,
+        LogAdmission {
+            records: store.encode(),
+            ..admission
+        },
+    )?;
+    drop(lock);
+    if !signed.is_empty() {
+        post_aside(paths);
+    }
+    Ok(Readmit::Let {
+        bundle: bundle.encode()?,
+        how,
+        signed: signed.len(),
+    })
+}
+
+/// A desk's [`crate::members::desk::Prove`] for the member at `paths`: [`admit_by_proof`] of the
+/// Mac `proving` names at this Mac's clock, its bundle where it let the Mac in, else why not,
+/// which the Mac reads (and then asks a person). `book` is the fleet book's word ([`Book`]); a
+/// proof on the desk's own port names no node id.
+///
+/// # Errors
+/// It let the Mac in by no proof here, or local state failed.
+pub fn prove_at(
+    paths: &Paths,
+    proving: &crate::members::desk::Proving<'_>,
+    book: Book,
+) -> crate::Result<SecretBytes> {
+    prove_at_ms(paths, proving, book, aterm_time::unix_millis().unwrap_or(0))
+}
+
+/// [`prove_at`] at `now_ms` (this Mac's clock).
+///
+/// # Errors
+/// As [`prove_at`].
+pub fn prove_at_ms(
+    paths: &Paths,
+    proving: &crate::members::desk::Proving<'_>,
+    book: Book,
+    now_ms: u64,
+) -> crate::Result<SecretBytes> {
+    let proven = Proven {
+        request: proving.request,
+        node: proving.node,
+        name: proving.name,
+        fleet: proving.fleet,
+        book,
+    };
+    match admit_by_proof(paths, &proven, now_ms)? {
+        Readmit::Let { bundle, .. } => Ok(bundle),
+        Readmit::Refused(why) => Err(Error::new(why)),
+        Readmit::Busy => Err(Error::new(
+            "a vault pass on this member holds its state; try another member or again soon",
+        )),
+        Readmit::NotHere => Err(Error::new(
+            "this member admits nobody through the membership log",
+        )),
+    }
+}
+
+/// Post this Mac's records to every vault server it reaches ([`post_records_to_servers`]), on a
+/// thread of its own: the bundle goes back to the Mac first.
+fn post_aside(paths: &Paths) {
+    let paths = paths.clone();
+    let _ = std::thread::Builder::new()
+        .name("readmit-post".to_owned())
+        .spawn(move || drop(post_records_to_servers(&paths)));
+}
+
+#[cfg(test)]
+#[path = "readmit_tests.rs"]
+mod tests;

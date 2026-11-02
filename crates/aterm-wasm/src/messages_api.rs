@@ -266,7 +266,9 @@ impl WebBand {
     #[inline]
     fn geometry(cols: usize, cell_w: usize, pad: usize) -> Geometry {
         Geometry {
-            win_w: cols * cell_w + 2 * pad,
+            win_w: cols
+                .saturating_mul(cell_w)
+                .saturating_add(pad.saturating_mul(2)),
             cells_x: pad,
             cell_w: cell_w.max(1),
         }
@@ -422,12 +424,12 @@ impl WebBand {
         }
         while self.journal.len() > JOURNAL_CAP {
             self.journal.pop_front();
-            self.journal_first += 1;
+            self.journal_first = self.journal_first.saturating_add(1);
         }
     }
 
     fn log_since(&self, cursor: u64) -> String {
-        let end = self.journal_first + self.journal.len() as u64;
+        let end = self.journal_first.saturating_add(self.journal.len() as u64);
         let from = cursor.min(end);
         let mut lines = Vec::new();
         if from < self.journal_first {

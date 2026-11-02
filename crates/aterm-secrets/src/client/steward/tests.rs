@@ -3,6 +3,63 @@
 
 use super::*;
 
+#[test]
+fn binding_denial_observation_does_not_wait_for_device_custody() {
+    let lab = lab("denial-observation");
+    let device = crate::commons::bootstrap::Device::open(&lab.m1)
+        .unwrap()
+        .expect("existing secrets identity");
+    let request = device.request([1; 16], [2; 32]).unwrap();
+    let publish_denied = |key: &str| {
+        let admin = admin_open(&lab.m1).unwrap();
+        let mut doc = admin.doc.clone();
+        doc.set_entry(
+            &Audience::Everyone,
+            crate::SWARM_ROSTER_ENTRY,
+            format!("deny_nodes = [\"{key}\"]\n").as_bytes(),
+        )
+        .unwrap();
+        admin_publish(&lab.m1, &admin, &doc).unwrap();
+    };
+    publish_denied(&aterm_codec::hex::encode_lower(&[0x91; 32]));
+    assert!(
+        !local_recipient_denied_in_roster(&lab.m1),
+        "an unrelated denied key does not revoke this device"
+    );
+    publish_denied(&aterm_codec::hex::encode_lower(request.binding().writer()));
+    assert!(
+        local_recipient_denied_in_roster(&lab.m1),
+        "the authenticated local writer is denied before custody is held"
+    );
+
+    let custody_dir = lab.m1.dir.clone();
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let lock = aterm_uds::private_file::PrivateLock::take(
+            &custody_dir,
+            "commons-device.lock",
+            Duration::from_secs(60),
+            "the fixture takes device custody before the query",
+        )
+        .unwrap();
+        held_tx.send(()).unwrap();
+        // A hang detector, not a latency budget: release even on the old deadlock.
+        let finished = done_rx.recv_timeout(Duration::from_secs(60));
+        drop(lock);
+        finished
+    });
+    held_rx.recv_timeout(Duration::from_secs(60)).unwrap();
+    let denied = local_recipient_denied_in_roster(&lab.m1);
+    let _ = done_tx.send(());
+    let finished_while_held = holder.join().unwrap();
+    assert!(
+        finished_while_held.is_ok(),
+        "the denial query waited on a device lock while its holder waited for the query"
+    );
+    assert!(denied, "observation must retain the known writer denial");
+}
+
 /// A vault that publishes no default fleet code, `m1` its admin, at a path.
 struct Lab {
     root: aterm_tempfile::TempDir,
@@ -13,10 +70,14 @@ struct Lab {
 }
 
 fn lab(name: &str) -> Lab {
+    lab_with_host(name, "m1")
+}
+
+fn lab_with_host(name: &str, host: &str) -> Lab {
     let root = aterm_tempfile::tempdir().unwrap();
     let m1 = Paths::for_home(&root.path().join("m1"));
     let source = root.path().join(format!("{name}.vault"));
-    let created = test_create_unbound(&m1, source.to_str().unwrap(), None, Some("m1")).unwrap();
+    let created = test_create_unbound(&m1, source.to_str().unwrap(), None, Some(host)).unwrap();
     let admin = admin_open(&m1).unwrap();
     admin_keys::legacy::publish_legacy(&m1, &admin);
     let signer = config(&m1).unwrap().unwrap().signer.unwrap();
@@ -27,6 +88,80 @@ fn lab(name: &str) -> Lab {
         source,
         signer,
     }
+}
+
+#[test]
+fn a_legacy_reserved_host_gets_an_admitted_discovery_name_without_reconfiguration() {
+    let lab = lab_with_host("alab", crate::alab_advertised());
+    lab.as_alab(|| {
+        let source_before = std::fs::read(lab.m1.source_file()).unwrap();
+        let identity_before = std::fs::read(lab.m1.identity_file()).unwrap();
+        let healthy = load_state(&lab.m1).unwrap();
+        let store = lab.root.path().join("server");
+        std::fs::create_dir(&store).unwrap();
+        std::fs::write(store.join("alab.vault"), lab.published()).unwrap();
+        let mut role = crate::cli::ServeRole::default();
+        let expected = format!(
+            "alab-member-{}",
+            join_code(&read_identity(&lab.m1).unwrap().unwrap().recipient())
+        );
+        assert!(crate::text::valid_machine_name(&expected));
+        assert_ne!(expected, crate::alab_advertised());
+        let decide = |role: &mut crate::cli::ServeRole| {
+            role.decide(
+                &crate::cli::Advertise::AlabIfHeld,
+                &store,
+                &lab.m1,
+                &mut Vec::new(),
+                Some(lab.signer),
+            )
+            .0
+        };
+        assert_eq!(decide(&mut role).as_deref(), Some(expected.as_str()));
+        assert_eq!(decide(&mut role).as_deref(), Some(expected.as_str()));
+        let start = Instant::now();
+        let mut watcher = crate::server::AlabNameWatcher::new();
+        for (seconds, takes) in [(0, false), (90, true)] {
+            assert_eq!(
+                watcher.decide(
+                    &crate::server::AlabNameInput {
+                        own_label: &expected,
+                        own_seq: Some(healthy.seq),
+                        holders: &[],
+                        now: start + Duration::from_secs(seconds),
+                    },
+                    |_| None
+                ),
+                takes
+            );
+        }
+
+        for pending in [false, true] {
+            let mut incomplete = healthy.clone();
+            incomplete.failed = !pending;
+            if pending {
+                incomplete.pending.insert("a-file".into(), "pending".into());
+            }
+            save_state(&lab.m1, &incomplete).unwrap();
+            assert!(decide(&mut crate::cli::ServeRole::default()).is_none());
+            assert_eq!(decide(&mut role).as_deref(), Some(expected.as_str()));
+        }
+        save_state(&lab.m1, &healthy).unwrap();
+        std::fs::remove_file(lab.m1.identity_file()).unwrap();
+        assert!(decide(&mut crate::cli::ServeRole::default()).is_none());
+        assert!(decide(&mut role).is_none());
+        assert!(
+            !lab.m1.identity_file().exists(),
+            "observation never recreates identity"
+        );
+        fsx::write_atomic(&lab.m1.identity_file(), &identity_before, 0o600).unwrap();
+        assert_eq!(decide(&mut role).as_deref(), Some(expected.as_str()));
+        assert_eq!(std::fs::read(lab.m1.source_file()).unwrap(), source_before);
+        assert_eq!(
+            std::fs::read(lab.m1.identity_file()).unwrap(),
+            identity_before
+        );
+    });
 }
 
 impl Lab {
@@ -85,6 +220,201 @@ impl Lab {
             .entry(&Audience::Everyone, fleet::FLEET_CODE_ENTRY)
             .map(|entry| entry.value.as_slice().to_vec())
     }
+}
+
+#[test]
+fn server_role_survives_only_same_context_transient_reads() {
+    let lab = lab("alab");
+    let m2 = lab.machine("m2", false);
+    let store = lab.root.path().join("server");
+    let mut role = crate::cli::ServeRole::default();
+    let mut pins = Vec::new();
+    let advertised = crate::cli::Advertise::Named(crate::alab_advertised().to_owned());
+    let mut decide = |role: &mut crate::cli::ServeRole| {
+        role.decide(&advertised, &store, &m2, &mut pins, Some(lab.signer))
+            .0
+    };
+    lab.as_alab(|| {
+        let healthy = load_state(&m2).unwrap();
+        let mut pending = healthy.clone();
+        pending
+            .pending
+            .insert("a-file".into(), "in-progress".into());
+        assert_eq!(decide(&mut role).as_deref(), Some("m2"));
+        save_state(&m2, &pending).unwrap();
+        assert_eq!(decide(&mut role).as_deref(), Some("m2"));
+        assert!(decide(&mut crate::cli::ServeRole::default()).is_none());
+        let mut failed = healthy.clone();
+        failed.failed = true;
+        save_state(&m2, &failed).unwrap();
+        assert_eq!(decide(&mut role).as_deref(), Some("m2"));
+        fsx::write_atomic(&m2.state_file(), b"not valid toml [", 0o600).unwrap();
+        assert_eq!(decide(&mut role).as_deref(), Some("m2"));
+        save_state(&m2, &healthy).unwrap();
+        assert_eq!(decide(&mut role).as_deref(), Some("m2"));
+
+        // The final context check catches a change after the eligibility reads themselves.
+        let original = config(&m2).unwrap().unwrap();
+        let mut changed = original.clone();
+        changed.host = "m27".to_owned();
+        assert!(matches!(
+            observe_alab_role_with(&m2, || {
+                save_config(&m2, &changed).unwrap();
+            }),
+            AlabRoleObservation::Unavailable(None)
+        ));
+        save_config(&m2, &original).unwrap();
+
+        // Pending work under a different configured source is not the retained grant.
+        let mut changed = original.clone();
+        changed.source = Source::Url("http://different.invalid/v1/alab".to_owned());
+        save_state(&m2, &pending).unwrap();
+        save_config(&m2, &changed).unwrap();
+        assert!(decide(&mut role).is_none());
+        save_config(&m2, &original).unwrap();
+        assert!(
+            decide(&mut role).is_none(),
+            "context loss discarded the old grant"
+        );
+        save_state(&m2, &healthy).unwrap();
+        assert_eq!(decide(&mut role).as_deref(), Some("m2"));
+
+        // A new local recipient never inherits the previous recipient's role.
+        let identity = fsx::read_private(&m2.identity_file(), 16 << 10)
+            .unwrap()
+            .unwrap();
+        let other = Paths::for_home(&lab.root.path().join("other"));
+        machine_identity(&other).unwrap();
+        let other_identity = fsx::read_private(&other.identity_file(), 16 << 10)
+            .unwrap()
+            .unwrap();
+        fsx::write_atomic(&m2.identity_file(), other_identity.as_slice(), 0o600).unwrap();
+        save_state(&m2, &pending).unwrap();
+        assert!(decide(&mut role).is_none());
+        fsx::write_atomic(&m2.identity_file(), identity.as_slice(), 0o600).unwrap();
+        assert!(decide(&mut role).is_none());
+        save_state(&m2, &healthy).unwrap();
+        assert_eq!(decide(&mut role).as_deref(), Some("m2"));
+
+        // A scoped server whose source disappears never re-enters standalone bootstrap.
+        std::fs::remove_file(m2.source_file()).unwrap();
+        assert!(decide(&mut role).is_none());
+        assert_eq!(
+            decide(&mut crate::cli::ServeRole::default()).as_deref(),
+            Some(crate::alab_advertised())
+        );
+        save_config(&m2, &original).unwrap();
+    });
+    // Explicit Off and named services are not replaced by a cached own-label decision.
+    lab.as_alab(|| {
+        assert!(
+            role.decide(
+                &crate::cli::Advertise::Off,
+                &store,
+                &m2,
+                &mut pins,
+                Some(lab.signer)
+            )
+            .0
+            .is_none()
+        );
+        assert_eq!(
+            role.decide(
+                &crate::cli::Advertise::Named("personal".to_owned()),
+                &store,
+                &m2,
+                &mut pins,
+                Some(lab.signer)
+            )
+            .0
+            .as_deref(),
+            Some("personal")
+        );
+    });
+    // The same non-ALab personal vault keeps its explicit name too.
+    assert_eq!(
+        role.decide(
+            &crate::cli::Advertise::Named("personal".to_owned()),
+            &store,
+            &m2,
+            &mut pins,
+            None
+        )
+        .0
+        .as_deref(),
+        Some("personal")
+    );
+}
+
+#[test]
+fn denied_server_never_falls_back_during_a_failed_or_pending_apply() {
+    let lab = lab("alab");
+    let m2 = lab.machine("m2", false);
+    lab.as_alab(|| {
+        let store = lab.root.path().join("server");
+        std::fs::create_dir(&store).unwrap();
+        std::fs::write(store.join("alab.vault"), lab.published()).unwrap();
+        let original = config(&m2).unwrap().unwrap();
+        // On its first tick, store evidence is not a remembered ALab configuration. Losing
+        // the source between those reads must not use the old direct-name fallback.
+        assert!(
+            crate::cli::ServeRole::default()
+                .decide_after_store(
+                    &crate::cli::Advertise::AlabIfHeld,
+                    &store,
+                    &m2,
+                    &mut Vec::new(),
+                    Some(lab.signer),
+                    || {
+                        std::fs::remove_file(m2.source_file()).unwrap();
+                    },
+                )
+                .0
+                .is_none()
+        );
+        save_config(&m2, &original).unwrap();
+        let mut role = crate::cli::ServeRole::default();
+        let mut pins = Vec::new();
+        let mut decide = |role: &mut crate::cli::ServeRole| {
+            role.decide(
+                &crate::cli::Advertise::AlabIfHeld,
+                &store,
+                &m2,
+                &mut pins,
+                Some(lab.signer),
+            )
+            .0
+        };
+        assert_eq!(decide(&mut role).as_deref(), Some("m2"));
+        let admin = admin_open(&lab.m1).unwrap();
+        let mut doc = admin.doc.clone();
+        doc.set_entry(
+            &Audience::Everyone,
+            crate::SWARM_ROSTER_ENTRY,
+            b"deny_labels = [\"m2\"]\n",
+        )
+        .unwrap();
+        admin_publish(&lab.m1, &admin, &doc).unwrap();
+        sync(&m2, None).unwrap();
+        let mut denied = load_state(&m2).unwrap();
+        denied.failed = true;
+        denied.pending.insert("a-file".into(), "in-progress".into());
+        save_state(&m2, &denied).unwrap();
+        assert!(matches!(
+            observe_alab_role(&m2),
+            AlabRoleObservation::Denied
+        ));
+        assert!(decide(&mut role).is_none());
+        assert!(decide(&mut crate::cli::ServeRole::default()).is_none());
+
+        denied.membership = Stored::Revoked;
+        save_state(&m2, &denied).unwrap();
+        assert!(matches!(
+            observe_alab_role(&m2),
+            AlabRoleObservation::Denied
+        ));
+        assert!(decide(&mut role).is_none());
+    });
 }
 
 /// Only the ALab vault's admin is its steward: a member is none, and a personal vault (the same
@@ -555,6 +885,21 @@ fn denied_roster_and_log_excluded_admins_cannot_serve_or_claim_steward_lease() {
                 .unwrap()
                 .is_err()
         );
+        let m2_clean_state = load_state(&m2).unwrap();
+        let mut m2_failed_state = m2_clean_state.clone();
+        m2_failed_state.failed = true;
+        save_state(&m2, &m2_failed_state).unwrap();
+        assert_eq!(
+            steward_alab_policy_role(&m2),
+            None,
+            "failed apply state must not let denied m2 fall back to config.host for server role"
+        );
+        assert!(
+            check_standby_eligibility(&m2, Some("net-alab"))
+                .unwrap()
+                .is_err()
+        );
+        save_state(&m2, &m2_clean_state).unwrap();
         assert!(matches!(
             steward_lease_check(&m2, Some("net-alab"), 1_760_000_000).unwrap(),
             StewardLease::Idle(_)
@@ -573,6 +918,17 @@ fn denied_roster_and_log_excluded_admins_cannot_serve_or_claim_steward_lease() {
             steward_lease_check(&lab.m1, Some("net-alab"), 1_760_000_000).unwrap(),
             StewardLease::Due { .. }
         ));
+        // A symlinked `network-id` fallback in `~/.config/aterm/secrets` is refused rather than
+        // followed when `observed_network_id` is `None`.
+        let forged_net = lab.root.path().join("forged-net");
+        std::fs::write(&forged_net, "net-alab\n").unwrap();
+        let net_link = lab.m1.dir.join("network-id");
+        std::os::unix::fs::symlink(&forged_net, &net_link).unwrap();
+        assert!(matches!(
+            steward_lease_check(&lab.m1, None, 1_760_000_000).unwrap(),
+            StewardLease::Idle(_)
+        ));
+        std::fs::remove_file(&net_link).unwrap();
 
         // Now publish a lease held by denied `m2` with 6 hours remaining: `swarm_lease_holder`
         // must return `None` for the denied holder, and `m1` must immediately take over at
@@ -612,6 +968,40 @@ fn denied_roster_and_log_excluded_admins_cannot_serve_or_claim_steward_lease() {
                 .unwrap()
                 .as_deref(),
             Some("m1")
+        );
+
+        // Positive control for renumbered member: if `m1`'s local `source.toml` still records a
+        // pre-renumber `host = "m5"` that is in `deny_labels`, while `m1`'s roster row for its
+        // recipient has active un-denied `label = "m1"`, `local_recipient_denied_in_roster` and
+        // `read_reserved_entry` must honor the active roster row rather than denying `m1` via its
+        // stale `config.host`.
+        let opened = admin_open(&lab.m1).unwrap();
+        let mut doc = opened.doc.clone();
+        let mut roster_with_m5_denied = crate::swarm_roster::SwarmRoster::from_document(&doc)
+            .unwrap()
+            .unwrap();
+        roster_with_m5_denied.deny_labels.push("m5".to_owned());
+        doc.set_entry(
+            &Audience::Everyone,
+            crate::SWARM_ROSTER_ENTRY,
+            roster_with_m5_denied.to_toml().as_bytes(),
+        )
+        .unwrap();
+        admin_publish(&lab.m1, &opened, &doc).unwrap();
+        sync(&lab.m1, None).unwrap();
+
+        let mut m1_cfg = config(&lab.m1).unwrap().unwrap();
+        m1_cfg.host = "m5".to_owned();
+        save_config(&lab.m1, &m1_cfg).unwrap();
+        assert!(
+            !local_recipient_denied_in_roster(&lab.m1),
+            "active roster member m1 must not be denied by stale config.host m5"
+        );
+        assert!(
+            entry::read_reserved_entry(&lab.m1, &m1_cfg, crate::SWARM_LEASE_ENTRY)
+                .unwrap()
+                .is_some(),
+            "active roster member m1 must still read reserved entries when config.host is stale"
         );
     });
 }

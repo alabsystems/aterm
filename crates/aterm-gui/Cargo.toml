@@ -15,6 +15,17 @@ path = "src/main.rs"
 # main.rs holds no tests; integration tests still get the binary.
 test = false
 
+# Owns main so the real fixed `harness native-launch` entry can run in this
+# original image before fixture arguments are parsed. No installed image is used.
+# Selected explicitly with `--test native_host`; ordinary test/bench selection
+# must not run this effect fixture or forward libtest arguments to its main.
+[[test]]
+name = "native_host"
+path = "tests/native_host.rs"
+harness = false
+test = false
+bench = false
+
 # The Phase 1a redraw gate. A BINARY because `EventLoop` construction panics off
 # the process main thread and libtest runs every `#[test]` on a spawned one, so
 # only a target owning `fn main` can hand `GuiHost` a real `EventLoopProxy` — see
@@ -36,6 +47,16 @@ name = "footer_pass_cost"
 path = "benches/footer_pass_cost.rs"
 harness = false
 required-features = ["bench-support"]
+
+# A native page's paint-only motion frame (an 1800x96 px band through the engine,
+# and the System State spinner through the window's whole native frame beside the
+# content path it replaced), timed: a measurement, not a gate; by hand it is
+# `targo --unverified bench -p aterm-gui --features bench-support,dev-seams --bench native_motion_cost`.
+[[bench]]
+name = "native_motion_cost"
+path = "benches/native_motion_cost.rs"
+harness = false
+required-features = ["bench-support", "dev-seams"]
 
 # A Settings page's frame of a preview's clock at short and shipped windows,
 # timed: a measurement, not a gate; by hand it is
@@ -149,6 +170,26 @@ path = "examples/objc_window_drive.rs"
 name = "objc_event_drive"
 path = "examples/objc_event_drive.rs"
 
+# THE FRAME CLOCK DRIVER, the display link's row. The deck's clock runs on a
+# window's CADisplayLink (`crates/aterm-window/src/platform_impl/macos/frame_clock.rs`,
+# the view's `atermFrameTick:`), which no test can reach: tests and headless
+# code never touch WindowServer, so the clock's port has an inert test arm.
+# This one opens a real window, runs the deck's own clock (`stats_clock.rs`'s
+# `DeckClock`, through the app's port) on its link, and judges, by the link's
+# own timestamps, the ticks' period, target and gaps; a paused link's silence
+# (and the link's own -isPaused) while the clock's hang detector trips, and the
+# resume on the next tick; ticks while the main run loop runs in
+# NSEventTrackingRunLoopMode; and the close's invalidation (a weak reference to
+# every CADisplayLink the view made loads nil after it, and no tick fires for a
+# vsync after it). It takes the links through aterm-window's debug seams
+# `frame_clock_link` and `frame_clock_links`, so it runs in a build with debug
+# assertions. Its body is `src/frame_clock_drive.rs`. Also run by
+# `targo --unverified verify appkit`; by hand it is
+# `targo --unverified run -p aterm-gui --example objc_frame_clock_drive`.
+[[example]]
+name = "objc_frame_clock_drive"
+path = "examples/objc_frame_clock_drive.rs"
+
 # `lab trail-diff`'s dump (docs/design/PRISM-GLASS.md §15.1 P0.4, §15.7.2): runs `.trail`
 # scripts on the app's own frame (the headless test App through the windowless capture path,
 # at an injected clock) and prints each frame's stream, pixel, deadline, sound and state words.
@@ -192,6 +233,7 @@ dev-seams = [
 ]
 
 [dependencies]
+aterm-mail = { workspace = true }
 aterm-core = { workspace = true, features = ["serde"] }
 # The anchor attributes' registry (std-only): this crate's own
 # `#[cfg_attr(any(test, debug_assertions), aterm_spec_anchor::refines(…))]` anchors expand in
@@ -330,6 +372,9 @@ aterm-update-core = { workspace = true }
 # binary; the one in-process fetch is the vendor head watch's GET, a hint that the
 # `atpkg update` it triggers re-verifies.
 atpkg = { workspace = true }
+# The capacity ledger's records: `sys jobs` reads a waiting build front's claim in it each pass
+# (vitals_jobs.rs). Already in this binary's tree through atpkg.
+aterm-capacity = { workspace = true }
 libc = { workspace = true }
 aterm-window = { workspace = true }
 # Config file parsing. Both crates are ALREADY in this binary's tree (via the
@@ -402,6 +447,7 @@ aterm-tempfile = { workspace = true }
 # model `ty check` proves.
 aterm-spec = { workspace = true }
 # The models its tests drive (a model edit rebuilds only their tests).
+aterm-models-aos = { workspace = true }
 aterm-models-atpkg = { workspace = true }
 aterm-models-core = { workspace = true }
 aterm-models-effects = { workspace = true }

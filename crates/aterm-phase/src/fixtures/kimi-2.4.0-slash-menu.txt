@@ -1,0 +1,33 @@
+# kimi 2.4.0 · MEASURED 2026-10-29, `aterm ctl text` of a private headless aterm (110x32, aterm 0.146.0) running the real Kimi Code, launched by path with a scratch `HOME` and `KIMI_CODE_HOME` whose `config.toml` names one `openai`-type provider at `http://127.0.0.1:<port>/v1` with a fake key (a local stub of the Chat Completions API, crates/aterm-lab), no login · `/exit` typed: the slash-command menu under the composer, `→ exit  Exit the application` selected
+
+ Current plan · Approved: Lab plan A (Recommended)
+   ┌ plan: us-agent-constantine-obsidian.md ────────────────────────────────────────────────────────────────┐
+   │ Lab plan                                                                                               │
+   │                                                                                                        │
+   │ 1. Lab step one.                                                                                       │
+   │ 2. Lab step two.                                                                                       │
+   └────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+ Current plan
+   ExitPlanMode can only be called while plan mode is active. Only the user can turn plan mode on.
+
+ ● lab after the plan
+
+ ❯ lab hit the quota
+   Error: [provider.rate_limit] 429 You exceeded your current quota, please check your plan and billing
+ details.
+   If this persists, run `/export-debug-zip` and share the file with us for diagnosis. Please don't share it
+ publicly.
+
+ ❯ lab hit an auth failure
+   Error: [provider.auth_error] 401 Invalid Authentication
+   If this persists, run `/export-debug-zip` and share the file with us for diagnosis. Please don't share it
+ publicly.
+
+ ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │ > /exit                                                                                                  │
+ ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ │   → exit         Exit the application                                                                    │
+ │     experiments  Manage experimental features                                                            │
+ lab-model  …/tmp/at.H2aa/proj
+                                                                                   context: 26% (24.6k/97.7k)

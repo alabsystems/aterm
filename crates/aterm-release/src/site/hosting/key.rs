@@ -73,12 +73,14 @@ impl Key {
     /// A file that cannot be read, or one that is not a service-account key with an RSA
     /// PKCS#8 private key; each said by the path and the field, never by a byte of the key.
     pub fn read(path: &Path) -> Result<Key, String> {
-        let bytes = std::fs::read(path).map(Secret::from_vec).map_err(|e| {
-            format!(
-                "cannot read the service-account key {}: {e}",
-                path.display()
-            )
-        })?;
+        let bytes = crate::durable::read_regular_bytes(path, 256 * 1024)
+            .map(Secret::from_vec)
+            .map_err(|e| {
+                format!(
+                    "cannot read the service-account key {}: {e}",
+                    path.display()
+                )
+            })?;
         Self::parse(&bytes).map_err(|why| format!("{}: {why}", path.display()))
     }
 
@@ -88,6 +90,10 @@ impl Key {
     pub fn parse(bytes: &Secret) -> Result<Key, String> {
         let fields: Fields = aterm_json::from_slice(bytes.expose())
             .map_err(|_| "not a service-account key (it is not JSON of the expected shape)")?;
+        let pem = fields
+            .private_key
+            .filter(|v| !v.is_empty())
+            .map(|v| Secret::from_vec(v.into_bytes()));
         if fields.kind.as_deref() != Some("service_account") {
             return Err("not a service-account key (its type is not service_account)".into());
         }
@@ -98,8 +104,8 @@ impl Key {
         };
         let email = need(fields.client_email, "client_email")?;
         let token_uri = need(fields.token_uri, "token_uri")?;
-        let pem = Secret::from_vec(need(fields.private_key, "private_key")?.into_bytes());
-        let der = Secret::from_vec(pkcs8(pem.expose())?);
+        let pem = pem.ok_or_else(|| "the service-account key has no private_key".to_string())?;
+        let der = pkcs8(pem.expose())?;
         let pair = ring::signature::RsaKeyPair::from_pkcs8(der.expose()).map_err(|e| {
             format!("the service-account key's private_key is not an RSA PKCS#8 key ({e})")
         })?;
@@ -126,7 +132,7 @@ impl Key {
             "scope": SCOPE,
             "aud": self.token_uri.as_str(),
             "iat": now,
-            "exp": now + LIFETIME_SECS,
+            "exp": now.saturating_add(LIFETIME_SECS),
         });
         let input = format!(
             "{}.{}",
@@ -181,7 +187,7 @@ const BEGIN: &str = concat!("-----BEGIN ", "PRIVATE KEY-----");
 const END: &str = concat!("-----END ", "PRIVATE KEY-----");
 
 /// The DER inside a `PRIVATE KEY` PEM block.
-fn pkcs8(pem: &[u8]) -> Result<Vec<u8>, String> {
+fn pkcs8(pem: &[u8]) -> Result<Secret, String> {
     let refused =
         || "the service-account key's private_key is not a PRIVATE KEY PEM block".to_string();
     let text = std::str::from_utf8(pem).map_err(|_| refused())?;
@@ -196,7 +202,9 @@ fn pkcs8(pem: &[u8]) -> Result<Vec<u8>, String> {
             .collect::<Vec<u8>>(),
     );
     let joined = std::str::from_utf8(joined.expose()).map_err(|_| refused())?;
-    aterm_codec::base64::decode(joined).map_err(|_| refused())
+    aterm_codec::base64::decode(joined)
+        .map(Secret::from_vec)
+        .map_err(|_| refused())
 }
 
 #[cfg(test)]
@@ -294,6 +302,10 @@ pub(crate) mod tests {
         assert!(grant.expose().starts_with(
             b"grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=ey"
         ));
+        let max_jwt =
+            String::from_utf8(key.assertion(u64::MAX).unwrap().expose().to_vec()).unwrap();
+        let max_claims = verified(&max_jwt, &public()).expect("u64::MAX saturates exp");
+        assert_eq!(max_claims["exp"], aterm_json::json!(u64::MAX));
     }
 
     /// A file that is not a service-account key is refused by field, and no refusal or
@@ -321,5 +333,27 @@ pub(crate) mod tests {
             assert!(!why.contains(&pem_line[..16]), "{why}");
             assert!(why.contains("service-account key"), "{why}");
         }
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let dir_err = Key::read(scratch.path()).unwrap_err();
+        assert!(
+            dir_err.contains("cannot read the service-account key"),
+            "{dir_err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_read_refuses_symlinks() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("aterm-hosting-key-link-")
+            .tempdir()
+            .unwrap();
+        let real = dir.path().join("real.json");
+        let link = dir.path().join("link.json");
+        std::fs::write(&real, key_json("https://oauth2.googleapis.com/token")).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(Key::read(&real).is_ok());
+        let err = Key::read(&link).unwrap_err();
+        assert!(err.contains("cannot read the service-account key"), "{err}");
     }
 }

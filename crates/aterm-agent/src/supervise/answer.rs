@@ -103,7 +103,7 @@ struct Focus {
 
 fn option_named<'a>(options: &'a [QuestionOption], word: &str) -> Option<&'a QuestionOption> {
     let word = word.trim();
-    if let Ok(n) = word.parse::<u8>() {
+    if let Some(n) = crate::parse_uint::<u8>(word) {
         return options.iter().find(|o| o.n == n);
     }
     options
@@ -309,9 +309,9 @@ fn plan_by_role(
             )),
         };
     }
-    let named = |o: &&Opt| match answer.parse::<u8>() {
-        Ok(n) => o.n == Some(n),
-        Err(_) => o.label.trim().eq_ignore_ascii_case(answer),
+    let named = |o: &&Opt| match crate::parse_uint::<u8>(answer) {
+        Some(n) => o.n == Some(n),
+        None => o.label.trim().eq_ignore_ascii_case(answer),
     };
     let Some(o) = prompt.options.iter().find(named) else {
         return Err(names_no_option(answer, who));
@@ -389,6 +389,7 @@ pub struct AnswerOpts {
 impl<C: Ctl> Session<'_, C> {
     /// Answer the question on display (module header): one line to `out`, the exit code back.
     pub fn answer(&mut self, opts: &AnswerOpts, out: &mut dyn Write) -> Result<u8, String> {
+        let _duty = self.duty_guard(Scope::Questions);
         let who = self
             .setup
             .sid

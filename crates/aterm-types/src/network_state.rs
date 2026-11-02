@@ -4,7 +4,7 @@
 //! Read-only local observations, never membership or global liveness claims.
 
 /// Stable authenticated machine identity and its latest observed installation.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MachineIdentity {
     /// UUID from the verified Commons binding, never an address or display name.
     pub machine_id: [u8; 16],
@@ -12,6 +12,26 @@ pub struct MachineIdentity {
     pub incarnation: [u8; 16],
     /// Optional authenticated display metadata.
     pub label: Option<String>,
+}
+
+/// Historical peer-reported agreement on retained account-proposal operation IDs.
+/// This says nothing about current state, projections, eligibility or secrets.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct AccountsExchangeObservation {
+    /// Exact account-proposals table, audience generation and Commons trust digest.
+    pub scope_digest: [u8; 32],
+    /// Local authenticated actor captured by the exchange.
+    pub local_actor: [u8; 48],
+    /// Original admitted control head and basis, never renewed by a later read.
+    pub control_observation: [u8; 64],
+    /// Number of retained operation IDs reported matching in that exchange.
+    pub inventory_count: u64,
+    /// SHA-256 of those exact canonically ordered retained IDs.
+    pub inventory_fingerprint: [u8; 32],
+    /// Peer resolved through authenticated Commons membership, not its address.
+    pub peer: MachineIdentity,
+    /// Original sample time in Unix milliseconds; replay never makes it current.
+    pub sampled_at_ms: u64,
 }
 
 /// Whether this local observer can currently check the network.
@@ -66,6 +86,70 @@ pub struct PresenceSample {
     pub state: Reachability,
 }
 
+/// An outbound service address that completed an authenticated exchange.
+/// This is historical local evidence, not current reachability or physical identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthenticatedEndpoint {
+    /// Address dialled by the successful exchange with this exact peer incarnation.
+    pub address: std::net::SocketAddr,
+    /// Local completion time, milliseconds since Unix epoch.
+    pub observed_at_ms: u64,
+}
+
+/// Local boundary reported by an automatic repair attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepairStage {
+    /// Routing or authenticated transport setup.
+    Transport,
+    /// Peer admission or signed membership records.
+    Membership,
+    /// Shared control history and its acknowledgements.
+    Control,
+    /// Application catalog, inventory or record exchange.
+    Application,
+    /// Optional credential handoff after application repair.
+    Credentials,
+}
+
+/// Historical outcome of one local attempt, never a network convergence claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepairOutcome {
+    /// This local attempt failed; the remote cause is not established.
+    Failed,
+    /// The owner stopped this attempt before completion.
+    Cancelled,
+    /// Some inventory or offered records could not be processed in this round.
+    Deferred,
+    /// No application exchange completed, including with older peers.
+    NotObserved,
+    /// The application exchange selected no common table.
+    NoCommonTable,
+    /// One application exchange completed; other tables or records may remain.
+    Exchanged,
+}
+
+/// Sanitized metadata from the most recent attempt with an authenticated peer.
+/// Reads retain its original timestamp and never make it current or authorize access.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepairObservation {
+    /// Original worker completion time, milliseconds since Unix epoch.
+    pub completed_at_ms: u64,
+    /// True when this owner dialled the peer; false for an incoming connection.
+    pub outbound: bool,
+    /// The local failure/defer boundary, or the last entered boundary if unknown.
+    pub stage: Option<RepairStage>,
+    /// What this one attempt established, independently of current reachability.
+    pub outcome: RepairOutcome,
+    /// Selected application table, when reported by this attempt.
+    pub table: Option<[u8; 32]>,
+    /// Durable positive receipts observed from the peer, including retries.
+    pub sent: Option<u64>,
+    /// Accepted local positive ingests, including retries. A failed attempt's count is a lower bound.
+    pub received: Option<u64>,
+    /// Offered positive records without a durable acknowledgement in this attempt.
+    pub deferred: Option<u64>,
+}
+
 /// One retained authenticated machine, in stable first-observed slot order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerObservation {
@@ -79,6 +163,10 @@ pub struct PeerObservation {
     pub last_seen_ms: u64,
     /// Latest current-lifetime observation, if any.
     pub last_checked_ms: Option<u64>,
+    /// Latest bounded repair metadata for this peer incarnation, independent of reachability.
+    pub last_repair: Option<RepairObservation>,
+    /// Latest successful outbound exchange; absent for older or inbound-only observations.
+    pub last_authenticated_endpoint: Option<AuthenticatedEndpoint>,
     /// Current local evidence, never inferred from replayed contact.
     pub reachability: Reachability,
     /// Absent until authenticated per-process descriptors exist.
@@ -111,6 +199,8 @@ pub struct NetworkObservation {
     pub unverified_endpoints: usize,
     /// Older detail or identities were compacted at the retention boundary.
     pub retention_limited: bool,
+    /// Most recent admitted matching-ID exchange; retained history only.
+    pub accounts_exchange: Option<AccountsExchangeObservation>,
 }
 
 /// Local access to one shared service, independent of network reachability.
@@ -127,6 +217,56 @@ pub enum ServiceAvailability {
     Current,
 }
 
+/// The URL's role in a historical vault network observation.
+/// The kind reveals no URL and does not authenticate the serving machine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum VaultNetworkSource {
+    /// The configured URL supplied the response.
+    ConfiguredUrl,
+    /// A peer URL supplied the response.
+    PeerUrl,
+}
+
+/// A historical network fetch followed by successful local vault materialization.
+/// This establishes neither remote currency nor provider sign-in readiness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct VaultNetworkMaterialization {
+    /// Closed source kind, without an endpoint or machine identity.
+    pub source: VaultNetworkSource,
+    /// The signed envelope sequence materialized by that pass.
+    pub sequence: u64,
+    /// Original network observation time in milliseconds since Unix epoch.
+    pub sampled_at_ms: u64,
+}
+
+/// A retained actual HTTP 204 response, separate from signed vault materialization.
+/// Its status establishes neither vault contents nor authorization or remote currency.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct VaultHttp204Response {
+    /// Closed source role, without an endpoint or machine identity.
+    pub source: VaultNetworkSource,
+    /// Original response-received time in milliseconds since Unix epoch.
+    pub responded_at_ms: u64,
+}
+
+/// The result of a retained actual vault network-refresh pass, not cache access.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum VaultNetworkRefreshOutcome {
+    /// The pass completed after an actual network response; no global currency is implied.
+    Succeeded,
+    /// The attempted network refresh failed; usable local state may remain.
+    Failed,
+}
+
+/// Sanitized historical refresh evidence, independently of local usability and receipts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct VaultNetworkRefresh {
+    /// Original completion time; reads and local cache repairs never renew it.
+    pub completed_at_ms: u64,
+    /// Closed result without an endpoint, error text, credential or response payload.
+    pub outcome: VaultNetworkRefreshOutcome,
+}
+
 /// Sanitized facts from a service-specific producer, containing no secret values.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ServiceState {
@@ -136,6 +276,12 @@ pub struct ServiceState {
     pub observed_at_ms: u64,
     /// Most recent successful local read/refresh if known.
     pub last_success_ms: Option<u64>,
+    /// Historical signed network fetch and materialization, independently of local usability.
+    pub network_materialization: Option<VaultNetworkMaterialization>,
+    /// Retained HTTP status evidence, independent of local usability and signed materialization.
+    pub http204_response: Option<VaultHttp204Response>,
+    /// Retained network-refresh result for the current source/configuration and identity.
+    pub network_refresh: Option<VaultNetworkRefresh>,
     /// Public sequence or frontier metadata only.
     pub revision: Option<String>,
     /// Sanitized explanation, not raw provider/vault error text.

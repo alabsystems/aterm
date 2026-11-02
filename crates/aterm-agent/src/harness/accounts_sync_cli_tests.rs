@@ -41,22 +41,6 @@ fn malformed_automatic_source_is_a_refusal_and_preserves_account_records() {
             format!("email,computer,{member},{alias}\nnew@example.test,m16,{value},0\n"),
             "ambiguous",
         )];
-        for second in [
-            format!("NEW@example.test,m22,{value},\n"),
-            format!("NEW@example.test,m16,{value},banned\n"),
-            format!("NEW@example.test,?,{value},\n"),
-            "NEW@example.test,m16,0,banned\n".to_owned(),
-            "NEW@example.test,m16,unsupported-membership,\n".to_owned(),
-        ] {
-            let first = format!("new@example.test,m16,{value},\n");
-            for rows in [format!("{first}{second}"), format!("{second}{first}")] {
-                sources.push((
-                    ACCOUNTS_CSV_FILE.to_owned(),
-                    format!("email,computer,{member},notes\n{rows}"),
-                    "conflicting duplicate",
-                ));
-            }
-        }
         for (fields, diagnostic) in [
             ("machines=['m16', 17]", "`machines`"),
             ("machines=['m16', 'unassigned']", "`machines`"),
@@ -108,6 +92,528 @@ fn malformed_automatic_source_is_a_refusal_and_preserves_account_records() {
             assert_eq!(Bed::tree(&bed.secrets()), secrets);
         }
     }
+}
+
+/// A SHEET ROW THAT CONFLICTS skips its address alone: rows that give one address another
+/// machine, a disqualifying note, a `?` machine, a `0` with a note or a value the column does not
+/// take, in either order, leave that address out of every pool while the sync takes the sheet's
+/// other row, and [`sheet_conflicts`] names the rows (never the address) for the window's
+/// digest. NEGATIVE CONTROL: before, the sync refused the whole sheet ("conflicting
+/// duplicate"), so one bad row stopped every account's sync on every Mac.
+#[test]
+fn a_conflicting_sheet_row_skips_that_address_and_the_sync_reads_the_rest() {
+    for cli in [Cli::Claude, Cli::Codex, Cli::Grok, Cli::Kimi] {
+        let member = csv_columns(cli)[0];
+        let value = if cli == Cli::Kimi { "global" } else { "1" };
+        for second in [
+            format!("NEW@example.test,m22,{value},\n"),
+            format!("NEW@example.test,m16,{value},banned\n"),
+            format!("NEW@example.test,?,{value},\n"),
+            "NEW@example.test,m16,0,banned\n".to_owned(),
+            "NEW@example.test,m16,unsupported-membership,\n".to_owned(),
+        ] {
+            let first = format!("new@example.test,m16,{value},\n");
+            for rows in [format!("{first}{second}"), format!("{second}{first}")] {
+                let bed = Bed::new("sheet-conflict");
+                bed.secret(
+                    ACCOUNTS_CSV_FILE,
+                    &format!(
+                        "email,computer,{member},notes\n{rows}other@example.test,m16,{value},\n"
+                    ),
+                );
+                let synced = if cli == Cli::Claude {
+                    sync_accounts_for_init(&bed.home, &bed.state, &bed.roster(cli), NOW).map(|_| ())
+                } else {
+                    bed.keep_roster(cli);
+                    bed.sync(cli, None).map(|_| ())
+                };
+                assert!(synced.is_ok(), "{cli:?} {rows}: {synced:?}");
+                let emails: Vec<String> = bed
+                    .rows(cli)
+                    .into_iter()
+                    .filter_map(|row| row.email)
+                    .collect();
+                assert!(
+                    emails
+                        .iter()
+                        .any(|e| accounts::email_matches(e, "other@example.test")),
+                    "{cli:?} {rows}: the other row is synced: {emails:?}"
+                );
+                assert!(
+                    !emails
+                        .iter()
+                        .any(|e| accounts::email_matches(e, "new@example.test")),
+                    "{cli:?} {rows}: the conflicting address is in no row: {emails:?}"
+                );
+                let conflicts = sheet_conflicts(&bed.home, &bed.aterm_toml());
+                assert_eq!(conflicts.len(), 1, "{cli:?} {rows}: {conflicts:?}");
+                assert_eq!(
+                    (conflicts[0].cli, conflicts[0].rows.clone()),
+                    (cli, vec![2, 3])
+                );
+            }
+        }
+    }
+}
+
+/// A CONFLICT KEEPS THE ROW THIS MACHINE ALREADY LISTS: Claude Code's sync rebuilds the roster
+/// from the sheet, so an address whose rows come to conflict would lose its row, and a
+/// signed-in account its login, at the next sync. The row stays as it was (label, login
+/// directory, class) with the conflicting row below its member row or above it, and the
+/// conflict is still named. NEGATIVE CONTROL: without [`carry_conflicting`] the second sync
+/// drops the row.
+#[test]
+fn a_conflicting_sheet_address_this_machine_lists_keeps_its_row() {
+    let head = "email,computer,claude,notes\nkeep@example.test,m16,1,\n";
+    let member = "alt@example.test,m16,1,\n";
+    let conflict = "ALT@example.test,m22,1,\n";
+    for rows in [format!("{member}{conflict}"), format!("{conflict}{member}")] {
+        let bed = Bed::new("sheet-conflict-kept");
+        let roster = bed.roster(Cli::Claude);
+        bed.secret(ACCOUNTS_CSV_FILE, &format!("{head}{member}"));
+        let first = sync_accounts_for_init(&bed.home, &bed.state, &roster, NOW);
+        assert!(first.is_ok(), "{first:?}");
+        let alt = |bed: &Bed| {
+            bed.rows(Cli::Claude).into_iter().find(|row| {
+                row.email
+                    .as_deref()
+                    .is_some_and(|email| accounts::email_matches(email, "alt@example.test"))
+            })
+        };
+        let before = alt(&bed).expect("the sheet's row is synced");
+        assert!(
+            before.dir.is_some(),
+            "an alternate row of its own: {before:?}"
+        );
+        bed.secret(ACCOUNTS_CSV_FILE, &format!("{head}{rows}"));
+        let synced = sync_accounts_for_init(&bed.home, &bed.state, &roster, NOW + 60);
+        assert!(synced.is_ok(), "{rows}: {synced:?}");
+        assert_eq!(
+            alt(&bed),
+            Some(before),
+            "{rows}: the listed row is kept as it was"
+        );
+        assert!(
+            bed.rows(Cli::Claude).iter().any(|row| row
+                .email
+                .as_deref()
+                .is_some_and(|email| accounts::email_matches(email, "keep@example.test"))),
+            "{rows}: the rest of the sheet is read"
+        );
+        let conflicts = sheet_conflicts(&bed.home, &bed.aterm_toml());
+        assert_eq!(
+            conflicts
+                .iter()
+                .map(|conflict| (conflict.cli, conflict.rows.clone()))
+                .collect::<Vec<_>>(),
+            [(Cli::Claude, vec![3, 4])],
+            "{rows}"
+        );
+    }
+}
+
+/// A CONFLICT NAMING ONLY OTHER MACHINES DROPS THE ROW, as one row naming another machine does:
+/// m16 synced `alt@` as `m16-2`, then the sheet lists it for m22 and m33, rows that conflict
+/// with each other and agree it is not m16's. The second sync drops the row, exits 0 and names
+/// no conflict, the plain drop of the CONTROL, one row `alt@,m22`. NEGATIVE CONTROL: a carry
+/// that looked at the address alone kept `m16-2`, while nothing on m16 said why.
+#[test]
+fn a_conflict_naming_only_other_machines_drops_the_row_as_one_such_row_does() {
+    let head = "email,computer,claude,notes\nkeep@example.test,m16,1,\n";
+    for later in [
+        "alt@example.test,m22,1,\n",
+        "alt@example.test,m22,1,\nALT@example.test,m33,1,\n",
+    ] {
+        let bed = Bed::new("sheet-conflict-elsewhere");
+        let roster = bed.roster(Cli::Claude);
+        bed.secret(
+            ACCOUNTS_CSV_FILE,
+            &format!("{head}alt@example.test,m16,1,\n"),
+        );
+        let first = sync_accounts_for_init(&bed.home, &bed.state, &roster, NOW);
+        assert!(first.is_ok(), "{first:?}");
+        let alt = |bed: &Bed| {
+            bed.rows(Cli::Claude).into_iter().find(|row| {
+                row.email
+                    .as_deref()
+                    .is_some_and(|email| accounts::email_matches(email, "alt@example.test"))
+            })
+        };
+        assert!(
+            alt(&bed).is_some_and(|row| row.dir.is_some()),
+            "the sheet's row is synced"
+        );
+        bed.secret(ACCOUNTS_CSV_FILE, &format!("{head}{later}"));
+        let env = quiet_env(&bed.home, &bed.state, &bed.aterm_toml(), NOW + 60);
+        let sheet = bed.secrets().join(ACCOUNTS_CSV_FILE);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = run_accounts_sync(&env, sheet.to_str(), None, false, &mut out, &mut err);
+        let err = String::from_utf8(err).unwrap();
+        assert_eq!(code, ExitCode::SUCCESS, "{later}: {err}");
+        assert_eq!(alt(&bed), None, "{later}: the row drops");
+        assert!(
+            !err.contains("conflicting assignments"),
+            "{later}: no conflict of this machine's: {err}"
+        );
+        assert_eq!(
+            sheet_conflicts(&bed.home, &bed.aterm_toml()),
+            Vec::<SheetConflict>::new(),
+            "{later}"
+        );
+        assert!(
+            bed.rows(Cli::Claude).iter().any(|row| row
+                .email
+                .as_deref()
+                .is_some_and(|email| accounts::email_matches(email, "keep@example.test"))),
+            "{later}: the rest of the sheet is read"
+        );
+    }
+}
+
+/// A CARRIED ROW GETS ITS TRANSCRIPT WALLS: the walls a sync reads from Claude Code's transcripts
+/// go to the rows it publishes by address, and a row a conflict carries ([`carry_conflicting`])
+/// is one of them. A transcript that signed in as `alt@` and hit its weekly limit puts that
+/// wall on `m16-2`, the row the sync kept. NEGATIVE CONTROL: the rows the walls were matched
+/// against came from the sheet before the carry, which lists no `alt@`, so the wall went
+/// nowhere.
+#[test]
+fn a_row_a_conflict_carries_gets_its_transcript_walls() {
+    let head = "email,computer,claude,notes\nkeep@example.test,m16,1,\n";
+    let bed = Bed::new("sheet-conflict-walls");
+    let roster = bed.roster(Cli::Claude);
+    bed.secret(
+        ACCOUNTS_CSV_FILE,
+        &format!("{head}alt@example.test,m16,1,\n"),
+    );
+    let first = sync_accounts_for_init(&bed.home, &bed.state, &roster, NOW);
+    assert!(first.is_ok(), "{first:?}");
+    let label = bed
+        .rows(Cli::Claude)
+        .into_iter()
+        .find(|row| {
+            row.email
+                .as_deref()
+                .is_some_and(|email| accounts::email_matches(email, "alt@example.test"))
+        })
+        .expect("the sheet's row is synced")
+        .label;
+    let projects = bed.home.join(".claude").join("projects").join("work");
+    fs::create_dir_all(&projects).unwrap();
+    fs::write(
+        projects.join("session.jsonl"),
+        "{\"type\":\"attachment\",\"attachment\":{\"type\":\"session_context\",\
+         \"context\":{\"userEmail\":\"alt@example.test\",\"cwd\":\"/Users//someone/work\"}}}\n\
+         {\"type\":\"assistant\",\"timestamp\":\"2026-10-22T06:00:00Z\",\"isApiErrorMessage\":true,\
+         \"error\":\"rate_limit\",\"message\":{\"model\":\"<synthetic>\",\"content\":[{\"type\":\
+         \"text\",\"text\":\"You've hit your weekly limit\"}]},\"quotaLimits\":{\"status\":\
+         \"rejected\",\"resetsAt\":1792767600,\"rateLimitType\":\"seven_day\"}}\n",
+    )
+    .unwrap();
+    bed.secret(
+        ACCOUNTS_CSV_FILE,
+        &format!("{head}alt@example.test,m16,1,\nALT@example.test,m22,1,\n"),
+    );
+    let synced = sync_accounts_for_init(&bed.home, &bed.state, &roster, NOW + 60);
+    assert!(synced.is_ok(), "{synced:?}");
+    assert!(
+        bed.rows(Cli::Claude).iter().any(|row| row.label == label),
+        "the conflict carries `{label}`"
+    );
+    let (state, _) = accounts::Store::at(&bed.state).load(NOW + 60).unwrap();
+    let walls = state
+        .accounts
+        .get(&label)
+        .map(|account| account.walls.clone())
+        .unwrap_or_default();
+    assert_eq!(
+        walls.get("seven_day").and_then(|wall| wall.until),
+        Some(1_792_767_600),
+        "the transcript's wall is `{label}`'s: {walls:?}"
+    );
+}
+
+/// THE SYNC VERBS NAME THE SHEET'S CONFLICTS ON THEIR EXITS THAT SYNC NOTHING, where a row of
+/// this machine's that conflicts is often why: Claude Code's "no active Claude accounts found",
+/// another pool's by-default sync that finds no row of this machine's
+/// ([`CliSync::Unlisted`]), and its sync of a named source that lists none. Each exits 1 and
+/// says the CLI and the rows, never the address. CONTROL: the same exits with no conflict say
+/// none. NEGATIVE CONTROL: before, only init, doctor and the upkeep's log said it.
+#[test]
+fn a_sync_that_syncs_nothing_names_the_sheets_conflicts() {
+    let mut wrong = Vec::new();
+    for cli in [Cli::Claude, Cli::Codex, Cli::Grok, Cli::Kimi] {
+        let member = csv_columns(cli)[0];
+        let value = if cli == Cli::Kimi { "global" } else { "1" };
+        let exits: &[bool] = if cli == Cli::Claude {
+            &[true]
+        } else {
+            &[false, true]
+        };
+        for &named in exits {
+            for conflicted in [true, false] {
+                let bed = Bed::new("sheet-conflict-nothing");
+                // Rows 2 and 3 give `new@` m16 and m22, so m16 lists none; the CONTROL's give
+                // it m9 alone, which lists none of m16's either.
+                let (first, second) = if conflicted {
+                    ("m16", "NEW@example.test,m22")
+                } else {
+                    ("m9", "other@example.test,m9")
+                };
+                bed.secret(
+                    ACCOUNTS_CSV_FILE,
+                    &format!(
+                        "email,computer,{member},notes\nnew@example.test,{first},{value},\n\
+                         {second},{value},\nlast@example.test,m9,{value},\n"
+                    ),
+                );
+                if cli != Cli::Claude && named {
+                    bed.keep_roster(cli);
+                }
+                let env = quiet_env(&bed.home, &bed.state, &bed.aterm_toml(), NOW);
+                let sheet = bed.secrets().join(ACCOUNTS_CSV_FILE);
+                let (mut out, mut err) = (Vec::new(), Vec::new());
+                let code = if cli == Cli::Claude {
+                    run_accounts_sync(&env, sheet.to_str(), None, false, &mut out, &mut err)
+                } else {
+                    let source = named.then(|| sheet.to_str()).flatten();
+                    run_cli_accounts_sync(cli, &env, (source, None, false), &mut out, &mut err)
+                };
+                let err = String::from_utf8(err).unwrap();
+                assert_eq!(code, ExitCode::FAILURE, "{cli:?} {named}: {err}");
+                assert!(
+                    err.contains("accounts found for machine `m16`"),
+                    "{cli:?} {named}: the exit is the one that syncs nothing: {err}"
+                );
+                let said = format!("conflicting assignments ({} rows 2, 3)", cli.id());
+                if err.contains(&said) != conflicted {
+                    wrong.push(format!(
+                        "{cli:?} named={named} conflicted={conflicted}: {err}"
+                    ));
+                }
+                assert!(
+                    !err.to_ascii_lowercase().contains("new@example.test"),
+                    "{cli:?}: no address is said: {err}"
+                );
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "each exit says its conflicts: {wrong:#?}");
+}
+
+/// `aterm harness accounts sync` SAYS THE SHEET'S CONFLICTS, Claude Code's and `--cli`'s, plain
+/// and `--json`: the CLI and its rows, never the address, so a Mac with no window learns why an
+/// account is missing. CONTROL: a sheet whose rows agree says none. NEGATIVE CONTROL: before,
+/// only the window's digest said it.
+#[test]
+fn an_accounts_sync_names_the_sheets_conflicting_rows() {
+    for cli in [Cli::Claude, Cli::Codex, Cli::Grok, Cli::Kimi] {
+        let member = csv_columns(cli)[0];
+        let value = if cli == Cli::Kimi { "global" } else { "1" };
+        for (conflicted, json) in [(true, false), (true, true), (false, false)] {
+            let bed = Bed::new("sheet-conflict-said");
+            let second = if conflicted {
+                format!("NEW@example.test,m22,{value},\n")
+            } else {
+                String::new()
+            };
+            bed.secret(
+                ACCOUNTS_CSV_FILE,
+                &format!(
+                    "email,computer,{member},notes\nnew@example.test,m16,{value},\n{second}\
+                     other@example.test,m16,{value},\n"
+                ),
+            );
+            if cli != Cli::Claude {
+                bed.keep_roster(cli);
+            }
+            let env = quiet_env(&bed.home, &bed.state, &bed.aterm_toml(), NOW);
+            let sheet = bed.secrets().join(ACCOUNTS_CSV_FILE);
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = if cli == Cli::Claude {
+                run_accounts_sync(&env, sheet.to_str(), None, json, &mut out, &mut err)
+            } else {
+                run_cli_accounts_sync(cli, &env, (None, None, json), &mut out, &mut err)
+            };
+            let (out, err) = (
+                String::from_utf8(out).unwrap(),
+                String::from_utf8(err).unwrap(),
+            );
+            assert_eq!(code, ExitCode::SUCCESS, "{cli:?}: {err}");
+            let said = format!("conflicting assignments ({} rows 2, 3)", cli.id());
+            assert_eq!(err.contains(&said), conflicted, "{cli:?} {json}: {err}");
+            assert!(
+                !format!("{out}{err}")
+                    .to_ascii_lowercase()
+                    .contains("new@example.test"),
+                "{cli:?}: no address is said: {out}{err}"
+            );
+            if json {
+                let report: Value = aterm_json::from_str(out.trim()).unwrap();
+                let listed = report.get("sheet_conflicts").and_then(Value::as_array);
+                assert_eq!(
+                    listed.map(Vec::len),
+                    Some(1),
+                    "{cli:?}: the report lists the conflict: {out}"
+                );
+            }
+        }
+    }
+}
+
+/// THE UPKEEP LOGS A SHEET CONFLICT ONCE PER CHANGE: a Mac with no window shows no digest, so the
+/// window's upkeep, where it syncs, logs the conflicts the sheet's rows make in a pool it syncs
+/// (the CLI and its rows, never the address) once, again when they change, and once when the
+/// rows agree. NEGATIVE CONTROL: before, the upkeep logged none.
+#[test]
+fn the_upkeep_logs_a_sheet_conflict_once_per_change() {
+    let bed = Bed::new("sheet-conflict-log");
+    bed.keep_roster(Cli::Kimi);
+    let sheet = |rows: &str| {
+        bed.secret(
+            ACCOUNTS_CSV_FILE,
+            &format!("email,computer,kimi,notes\nother@example.test,m16,global,\n{rows}"),
+        );
+    };
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let rediscovery = Mutex::new(Rediscovery::default());
+    let upkeep_once = || {
+        let into = Arc::clone(&lines);
+        let log: SignInLog = Arc::new(move |line: &str| into.lock().unwrap().push(line.to_owned()));
+        let fetch = |_: &Env, source: &str| -> Result<String, String> {
+            Err(format!("no fetch in a test: {source}"))
+        };
+        with_logged_effects((&|_work| Ok(()), &fetch), (&rediscovery, log), |fx| {
+            let _ = upkeep(
+                &bed.home,
+                &bed.state,
+                (
+                    &bed.config.join(accounts::ACCOUNTS_FILE),
+                    NOW,
+                    UpkeepStep::Sync,
+                ),
+                fx,
+            );
+        });
+        let said: Vec<String> = lines
+            .lock()
+            .unwrap()
+            .drain(..)
+            .filter(|line| line.contains("account sheet"))
+            .collect();
+        said
+    };
+    sheet("new@example.test,m16,global,\nNEW@example.test,m22,global,\n");
+    let said = upkeep_once();
+    assert!(
+        said.len() == 1 && said[0].contains("(kimi rows 3, 4)"),
+        "{said:?}"
+    );
+    assert!(!said[0].to_ascii_lowercase().contains("new@example.test"));
+    assert_eq!(
+        upkeep_once(),
+        Vec::<String>::new(),
+        "said once, not per upkeep"
+    );
+    sheet(
+        "new@example.test,m16,global,\nNEW@example.test,m22,global,\nnew@example.test,m9,global,\n",
+    );
+    let said = upkeep_once();
+    assert!(
+        said.len() == 1 && said[0].contains("(kimi rows 3, 4, 5)"),
+        "a change is said again: {said:?}"
+    );
+    sheet("new@example.test,m16,global,\n");
+    let said = upkeep_once();
+    assert!(
+        said.len() == 1 && said[0].contains("agree now"),
+        "the end is said once: {said:?}"
+    );
+    assert_eq!(upkeep_once(), Vec::<String>::new());
+}
+
+/// THE UPKEEP TELLS A SHEET IT CANNOT READ FROM ROWS THAT AGREE: a conflict it logged ends with
+/// "agree now" only where the sheet was read whole; where the sheet is gone or no longer parses,
+/// the log says once that whether its rows conflict is not known. NEGATIVE CONTROL: before, a
+/// removed or broken sheet was logged as rows that agree.
+#[test]
+fn the_upkeep_tells_an_unread_sheet_from_rows_that_agree() {
+    let bed = Bed::new("sheet-conflict-unread");
+    bed.keep_roster(Cli::Kimi);
+    let conflict = "email,computer,kimi,notes\nother@example.test,m16,global,\n\
+                    new@example.test,m16,global,\nNEW@example.test,m22,global,\n";
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let rediscovery = Mutex::new(Rediscovery::default());
+    let upkeep_once = || {
+        let into = Arc::clone(&lines);
+        let log: SignInLog = Arc::new(move |line: &str| into.lock().unwrap().push(line.to_owned()));
+        let fetch = |_: &Env, source: &str| -> Result<String, String> {
+            Err(format!("no fetch in a test: {source}"))
+        };
+        with_logged_effects((&|_work| Ok(()), &fetch), (&rediscovery, log), |fx| {
+            let _ = upkeep(
+                &bed.home,
+                &bed.state,
+                (
+                    &bed.config.join(accounts::ACCOUNTS_FILE),
+                    NOW,
+                    UpkeepStep::Sync,
+                ),
+                fx,
+            );
+        });
+        let said: Vec<String> = lines
+            .lock()
+            .unwrap()
+            .drain(..)
+            .filter(|line| line.starts_with("accounts sync: the account sheet"))
+            .collect();
+        said
+    };
+    let sheet = bed.secrets().join(ACCOUNTS_CSV_FILE);
+    for unread in [
+        None,
+        Some("email,computer,kimi,notes\n\"broken@example.test,m16,global,\n"),
+    ] {
+        bed.secret(ACCOUNTS_CSV_FILE, conflict);
+        let said = upkeep_once();
+        assert!(
+            said.len() == 1 && said[0].contains("(kimi rows 3, 4)"),
+            "{unread:?}: {said:?}"
+        );
+        match unread {
+            None => fs::remove_file(&sheet).unwrap(),
+            Some(text) => bed.secret(ACCOUNTS_CSV_FILE, text),
+        }
+        let said = upkeep_once();
+        assert!(
+            said.len() == 1 && said[0].contains("not read whole") && !said[0].contains("agree"),
+            "{unread:?}: an unread sheet is not rows that agree: {said:?}"
+        );
+        assert_eq!(upkeep_once(), Vec::<String>::new(), "{unread:?}: said once");
+    }
+}
+
+/// A LOOK AT THE SHEET ASKS THE HOST ITS NAME ONCE: the window's look reads the sheet's conflicts
+/// ([`sheet_conflicts`]) on every pass, and Claude Code's half reads [`fleet_origin`], which asks
+/// [`sheet_names_this_machine`] whose machine comes from the host where `[fleet] machine` names
+/// none. That is read once per process ([`detected_machine`]), never two `scutil`s and a
+/// `hostname` per look. NEGATIVE CONTROL: [`machine_for`] asked the host on every call.
+#[test]
+fn a_look_at_the_sheet_asks_the_host_its_name_once() {
+    let bed = Bed::new("host-once");
+    fs::write(bed.aterm_toml(), "").unwrap();
+    bed.secret(
+        ACCOUNTS_CSV_FILE,
+        "email,computer,claude,notes\nnew@example.test,m16,1,\n",
+    );
+    let sheet = bed.secrets().join(ACCOUNTS_CSV_FILE);
+    let config = bed.aterm_toml();
+    let _ = sheet_names_this_machine(&bed.home, Some(&config), &sheet);
+    let asked = HOST_ASKED.with(std::cell::Cell::get);
+    for _ in 0..3 {
+        let _ = sheet_names_this_machine(&bed.home, Some(&config), &sheet);
+    }
+    assert_eq!(HOST_ASKED.with(std::cell::Cell::get), asked);
 }
 
 #[test]
@@ -308,6 +814,34 @@ fn the_source_table_includes_pending_rows_without_a_sync_or_machine_id() {
     assert_eq!(fleet.held[0].label, "kimi-m22");
     assert_eq!(fleet.held[0].machines, ["m22"]);
     assert!(!bed.roster(Cli::Kimi).exists());
+
+    let pool_bed = Bed::new("source-table-ai-pool-no-machine");
+    fs::write(pool_bed.aterm_toml(), "").unwrap();
+    pool_bed.secret(
+        super::super::ai_pool::AI_POOL_FILE,
+        "version = 1\n\n[[account]]\nprovider = \"codex\"\nemail = \"codex-one@example.test\"\nwarm = [\"m16\"]\n",
+    );
+    let pool_env = quiet_env(&pool_bed.home, &pool_bed.state, &pool_bed.aterm_toml(), NOW);
+    let pool_fleet =
+        account_source_table(Cli::Codex, &pool_env, None).expect("ai-pool source table");
+    assert_eq!(pool_fleet.roster.accounts.len(), 1);
+    assert_eq!(pool_fleet.roster.accounts[0].label, "codex-m16");
+    assert_eq!(pool_fleet.roster.accounts[0].machines, ["m16"]);
+    assert!(matches!(
+        pool_bed.sync(Cli::Codex, None),
+        Ok(CliSync::Unlisted { machine: None, .. })
+    ));
+    assert_eq!(
+        cli_sync_due(
+            Cli::Codex,
+            &pool_bed.home,
+            &pool_bed.state,
+            &pool_bed.aterm_toml(),
+            NOW,
+        ),
+        Ok(Vec::new())
+    );
+    assert!(cli_pools_due(&pool_bed.aterm_toml(), &pool_bed.state, &pool_bed.home, NOW).is_empty());
 }
 
 #[test]
@@ -993,6 +1527,22 @@ fn with_effects<R>(
     fetch: &Fetch<'_>,
     run: impl FnOnce(&UpkeepEffects<'_>) -> R,
 ) -> R {
+    with_logged_effects(
+        (spawn, fetch),
+        (
+            &Mutex::new(Rediscovery::default()),
+            std::sync::Arc::new(|_: &str| {}),
+        ),
+        run,
+    )
+}
+
+/// [`with_effects`] keeping what the upkeep remembers in `rediscovery` and logging to `log`.
+fn with_logged_effects<R>(
+    (spawn, fetch): (&SpawnRenewal, &Fetch<'_>),
+    (rediscovery, log): (&Mutex<Rediscovery>, SignInLog),
+    run: impl FnOnce(&UpkeepEffects<'_>) -> R,
+) -> R {
     let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
     let cooldown = Mutex::new(None);
     let fx = UpkeepEffects {
@@ -1000,14 +1550,14 @@ fn with_effects<R>(
         spawn_renewal: spawn,
         quota_refresh: &|_, _, _, _| {},
         sync_cooldown: &cooldown,
-        rediscovery: &Mutex::new(Rediscovery::default()),
+        rediscovery,
         renew_guard: &guard,
         find_browser: &|_: &Path| false,
         vault_sync: |_: &Path| crate::harness::sign_in_ladder::Vault::NotMember,
         spawn_vault: &|_work| Ok(()),
         default_check: |_: &Path| crate::harness::cli::LoginCheck::CouldNotRun(String::new()),
         mailbox: &ladder_mailbox_files,
-        log: std::sync::Arc::new(|_: &str| {}),
+        log,
         run_attempt: None,
         shared: shared_renewal::Effects::default(),
     };
@@ -1068,8 +1618,8 @@ fn harness_accounts_off_turns_every_automatic_sync_off() {
         fs::write(
             bed.aterm_toml(),
             format!(
-                "{switch}[fleet]\nmachine = \"m16\"\naccounts_source = \"{}\"\n",
-                sheet.display()
+                "{switch}[fleet]\nmachine = \"m16\"\naccounts_source = {}\n",
+                crate::harness::host_path::toml(&sheet)
             ),
         )
         .unwrap();
@@ -1144,6 +1694,126 @@ fn a_vault_pool_imports_without_a_local_roster() {
     };
     assert_eq!(synced.added, ["kimi-1"]);
     assert!(bed.roster(Cli::Kimi).is_file());
+}
+
+/// A KEPT ROSTER'S DUE LOGIN RENEWS UNLESS ITS SIGN-INS ARE OFF: the window renews the due login
+/// of Kimi's roster, unless `[harness] logins = "off"` or `[harness] enabled = false` turns its
+/// sign-ins off; Claude Code's own switch leaves them on
+/// ([`each_pools_sign_ins_read_the_harness_and_its_own_switch`] holds the rule for every CLI).
+#[test]
+fn a_kept_pools_due_login_renews_unless_its_sign_ins_are_off() {
+    let bed = Bed::new("renew-switches");
+    bed.secret(&cli_fleet_file(Cli::Kimi), KIMI_FLEET);
+    fake_headless_browser(&bed.home);
+    bed.keep_roster(Cli::Kimi);
+    let roster_path = bed.config.join(accounts::ACCOUNTS_FILE);
+    let init = sync_cli_accounts_for_init(&bed.home, &bed.state, &roster_path, NOW);
+    let Some((_, Ok(CliSync::Synced(synced)))) = init.iter().find(|(cli, _)| *cli == Cli::Kimi)
+    else {
+        panic!("a kept roster syncs at init: {init:?}");
+    };
+    assert_eq!(synced.added, ["kimi-1"]);
+    signed_out_kimi_login(&bed, "kimi-1");
+    assert_eq!(
+        upkeep_over(&bed, UpkeepStep::Both),
+        1,
+        "CONTROL: the window renews the due login of a kept roster"
+    );
+    let pools = cli_pools(&bed.aterm_toml(), &bed.state, &bed.home, NOW);
+    assert_eq!(cli_pools_words(&pools).as_deref(), Some("kimi 2"));
+    fs::write(
+        bed.aterm_toml(),
+        "[fleet]\nmachine = \"m16\"\n[harness]\nlogins = \"off\"\n",
+    )
+    .unwrap();
+    assert_eq!(
+        upkeep_over(&bed, UpkeepStep::Both),
+        0,
+        "`[harness] logins = \"off\"` stops the background renewal"
+    );
+    fs::write(
+        bed.aterm_toml(),
+        "[fleet]\nmachine = \"m16\"\n[harness]\nenabled = false\n",
+    )
+    .unwrap();
+    assert_eq!(
+        upkeep_over(&bed, UpkeepStep::Both),
+        0,
+        "`[harness] enabled = false` stops it too, as it stops the host's"
+    );
+    fs::write(
+        bed.aterm_toml(),
+        "[fleet]\nmachine = \"m16\"\n[harness.claude]\nenabled = false\n",
+    )
+    .unwrap();
+    assert_eq!(
+        upkeep_over(&bed, UpkeepStep::Both),
+        1,
+        "CONTROL: Claude Code switched off leaves Kimi Code's renewal on"
+    );
+}
+
+/// EACH POOL'S SIGN-INS READ THE HARNESS AND ITS OWN SWITCH: the automatic sign-in of a CLI's
+/// rows is off where `[harness] accounts = "off"`, `[harness] logins = "off"` or
+/// `[harness] enabled = false`, and where that CLI's own `[harness.<cli>] enabled = false`
+/// (Claude Code's and Codex's; Grok Build and Kimi Code have no table of their own), never for
+/// another CLI's. The switch `aterm ai` names for a CLI's rows ([`sign_ins_off_for`]) is the one
+/// that keeps them off, its own table's included; the harness-wide words the gates every pool
+/// shares read ([`sign_ins_off`]) name no CLI's table. NEGATIVE CONTROL: the rule that read the
+/// harness-wide switches alone kept Codex's sign-ins on under `[harness.codex] enabled = false`,
+/// and Claude Code's under `[harness.claude] enabled = false`, and named no switch for either.
+#[test]
+fn each_pools_sign_ins_read_the_harness_and_its_own_switch() {
+    let bed = Bed::new("sign-ins-switches");
+    let all = [Cli::Claude, Cli::Codex, Cli::Grok, Cli::Kimi];
+    for (config, off, said) in [
+        ("", &[][..], None),
+        (
+            "[harness]\naccounts = \"off\"\n",
+            &all[..],
+            Some("`[harness] accounts = \"off\"`"),
+        ),
+        (
+            "[harness]\nlogins = \"off\"\n",
+            &all[..],
+            Some("`[harness] logins = \"off\"`"),
+        ),
+        (
+            "[harness]\nenabled = false\n",
+            &all[..],
+            Some("`[harness] enabled = false`"),
+        ),
+        (
+            "[harness.codex]\nenabled = false\n",
+            &[Cli::Codex][..],
+            Some("`[harness.codex] enabled = false`"),
+        ),
+        (
+            "[harness.claude]\nenabled = false\n",
+            &[Cli::Claude][..],
+            Some("`[harness.claude] enabled = false`"),
+        ),
+    ] {
+        fs::write(bed.aterm_toml(), config).unwrap();
+        for cli in all {
+            let held = off.contains(&cli);
+            assert_eq!(
+                sign_ins_on(&bed.aterm_toml(), cli),
+                !held,
+                "{config}{cli:?}"
+            );
+            assert_eq!(
+                sign_ins_off_for(&bed.aterm_toml(), cli),
+                said.filter(|_| held),
+                "{config}{cli:?}: the switch named"
+            );
+        }
+        assert_eq!(
+            sign_ins_off(&bed.aterm_toml()),
+            said.filter(|_| off.len() == all.len()),
+            "{config}: the harness-wide switch"
+        );
+    }
 }
 
 /// The roster `aterm.toml` stands beside in a bed: the path init, the upkeep and the resync take.
@@ -1298,8 +1968,8 @@ fn codex_by_default_writes_nothing_where_the_fleet_lists_no_row_of_this_macs() {
     let before = Bed::tree(bed._dir.path());
     let unlisted = bed.sync(Cli::Codex, None);
     assert!(
-        matches!(&unlisted, Ok(CliSync::Unlisted { machine: Some(m), source })
-            if m == "m9" && source.ends_with(ACCOUNTS_CSV_FILE)),
+        matches!(&unlisted, Ok(CliSync::Unlisted { machine: Some(m), source, conflicts })
+            if m == "m9" && source.ends_with(ACCOUNTS_CSV_FILE) && conflicts.is_empty()),
         "{unlisted:?}"
     );
     let init = sync_cli_accounts_for_init(&bed.home, &bed.state, &claude_roster(&bed), NOW);
@@ -1383,6 +2053,42 @@ fn an_unlisted_mac_syncs_codex_again_only_once_its_inputs_change() {
                 .contains_key(&Cli::Codex),
             "a sync that wrote rows forgets the hold"
         );
+    });
+
+    let pool_bed = Bed::new("codex-unlisted-ai-pool-quiet");
+    fs::write(pool_bed.aterm_toml(), "[fleet]\nmachine = \"m9\"\n").unwrap();
+    pool_bed.secret(
+        super::super::ai_pool::AI_POOL_FILE,
+        "version = 1\n\n[[account]]\nprovider = \"codex\"\nemail = \"codex-one@example.com\"\nwarm = [\"m16\"]\n",
+    );
+    let pool_inputs = || cli_sync_inputs(Cli::Codex, &pool_bed.home, &pool_bed.aterm_toml());
+    with_effects(&|_work| Ok(()), &read_named, |fx| {
+        let upkeep_pools_now = || {
+            upkeep_pools(
+                &pool_bed.home,
+                &pool_bed.state,
+                (&claude_roster(&pool_bed), NOW, UpkeepStep::Sync),
+                fx,
+            );
+        };
+        upkeep_pools_now();
+        assert!(!pool_bed.roster(Cli::Codex).exists());
+        assert!(default_sync_holds(
+            fx.rediscovery,
+            Cli::Codex,
+            &pool_inputs()
+        ));
+
+        pool_bed.secret(
+            super::super::ai_pool::AI_POOL_FILE,
+            "version = 1\n\n[[account]]\nprovider = \"codex\"\nemail = \"codex-one@example.com\"\nwarm = [\"m9\"]\n",
+        );
+        assert!(
+            !default_sync_holds(fx.rediscovery, Cli::Codex, &pool_inputs()),
+            "ai-pool.toml edits lift the default sync hold"
+        );
+        upkeep_pools_now();
+        assert_eq!(codex_labels(&pool_bed), [ACCOUNTS_OWN_LABEL, "codex-m9"]);
     });
 }
 
@@ -1529,8 +2235,13 @@ fn the_dashboard_shows_a_card_per_kept_pool_and_none_where_none_is_kept() {
     assert!(!html.contains('@'), "no email on the page: {html}");
     fs::write(
         bed.roster(Cli::Grok),
-        "[[account]]\nlabel = \"grok-1\"\nclass = \"dedicated\"\nemail = \"grok-1@example.com\"\n\n\
-         [[account]]\nlabel = \"grok-2\"\nclass = \"dedicated\"\ndir = \"/x/grok-2\"\n",
+        at!(
+            "[[account]]\nlabel = \"grok-1\"\nclass = \"dedicated\"\n\
+             email = \"grok-1@example.com\"\n\n\
+             [[account]]\nlabel = \"grok-2\"\nclass = \"dedicated\"\ndir = \"",
+            "/x/grok-2",
+            "\"\n"
+        ),
     )
     .unwrap();
     let html = pools_html(
@@ -1545,9 +2256,11 @@ fn the_dashboard_shows_a_card_per_kept_pool_and_none_where_none_is_kept() {
     );
     // A Kimi row with no email: `login`, beside its emailed row's renewal.
     let mut kimi = fs::read_to_string(bed.roster(Cli::Kimi)).unwrap();
-    kimi.push_str(
-        "\n[[account]]\nlabel = \"kimi-2\"\nclass = \"dedicated\"\ndir = \"/x/kimi-2\"\n",
-    );
+    kimi.push_str(at!(
+        "\n[[account]]\nlabel = \"kimi-2\"\nclass = \"dedicated\"\ndir = \"",
+        "/x/kimi-2",
+        "\"\n"
+    ));
     fs::write(bed.roster(Cli::Kimi), kimi).unwrap();
     let html = pools_html(
         &cli_pools(&bed.aterm_toml(), &bed.state, &bed.home, NOW),
@@ -1608,12 +2321,12 @@ fn pool_inventory_recovers_an_admitted_login_before_reading_the_card() {
             ))
         })
     };
-    renew("/old").unwrap();
+    renew(at!("/old")).unwrap();
     let witness = store.state_witness_file();
     let retained = witness.with_extension("retained");
     fs::rename(&witness, &retained).unwrap();
     fs::create_dir(&witness).unwrap();
-    assert!(renew("/new").is_err());
+    assert!(renew(at!("/new")).is_err());
     assert!(store.load(NOW).is_err(), "publication was admitted");
     fs::rename(&witness, witness.with_extension("obstruction")).unwrap();
     fs::rename(&retained, &witness).unwrap();
@@ -1622,7 +2335,7 @@ fn pool_inventory_recovers_an_admitted_login_before_reading_the_card() {
     assert_eq!(cli_pools_words(&pools).as_deref(), Some("kimi 1"));
     assert_eq!(
         pools[0].rows.as_ref().unwrap().rows[0].dir.as_deref(),
-        Some("/new")
+        Some(at!("/new"))
     );
     assert_eq!(pools[0].state.account("main").auth, accounts::Auth::Ok);
 }
@@ -1638,15 +2351,23 @@ fn pool_inventory_recovers_an_admitted_login_before_reading_the_card() {
 /// row with no email starts nothing.
 #[test]
 fn a_grok_rows_background_renewal_hands_off_nothing_and_a_kimi_rows_still_starts() {
-    const GROK_ROSTER: &str = "[[account]]\nlabel = \"grok-1\"\nclass = \"dedicated\"\n\
-         email = \"grok-one@example.com\"\ndir = \"/x/grok-1\"\n";
-    const KIMI_ROSTER: &str = "[[account]]\nlabel = \"kimi-1\"\nclass = \"dedicated\"\n\
-         email = \"kimi-one@example.com\"\nregion = \"global\"\ndir = \"/x/kimi-1\"\n\n\
-         [[account]]\nlabel = \"kimi-2\"\nclass = \"dedicated\"\ndir = \"/x/kimi-2\"\n";
+    const GROK_ROSTER: &str = at!(
+        "[[account]]\nlabel = \"grok-1\"\nclass = \"dedicated\"\n\
+         email = \"grok-one@example.com\"\ndir = \"",
+        "/x/grok-1",
+        "\"\n"
+    );
+    let kimi_roster = format!(
+        "[[account]]\nlabel = \"kimi-1\"\nclass = \"dedicated\"\n\
+         email = \"kimi-one@example.com\"\nregion = \"global\"\ndir = \"{}\"\n\n\
+         [[account]]\nlabel = \"kimi-2\"\nclass = \"dedicated\"\ndir = \"{}\"\n",
+        at!("/x/kimi-1"),
+        at!("/x/kimi-2")
+    );
     let bed = Bed::new("grok-renewal");
     fake_headless_browser(&bed.home);
     let grok = Roster::parse_for(Cli::Grok, GROK_ROSTER).unwrap();
-    let kimi = Roster::parse_for(Cli::Kimi, KIMI_ROSTER).unwrap();
+    let kimi = Roster::parse_for(Cli::Kimi, &kimi_roster).unwrap();
     let handed = Arc::new(Mutex::new(0usize));
     let count = Arc::clone(&handed);
     let spawn = move |_work: Box<dyn FnOnce() + Send>| {
@@ -1692,7 +2413,7 @@ fn a_grok_rows_background_renewal_hands_off_nothing_and_a_kimi_rows_still_starts
     let bed = Bed::new("grok-selection");
     fake_headless_browser(&bed.home);
     fs::write(bed.roster(Cli::Grok), GROK_ROSTER).unwrap();
-    fs::write(bed.roster(Cli::Kimi), KIMI_ROSTER).unwrap();
+    fs::write(bed.roster(Cli::Kimi), &kimi_roster).unwrap();
     let pending = |cli: Cli| {
         let store = accounts::Store::at_for(&bed.state, cli, &bed.home);
         store.load(NOW).unwrap().0.pending_pin
@@ -1768,7 +2489,8 @@ fn interrupted_vendor_staging_renewal_recovers_binding_and_proof_only_when_compl
             &store,
             &bed.roster(Cli::Kimi),
             &guard,
-            NOW
+            NOW,
+            shared_renewal::CheckpointAuthority::Unavailable,
         ),
         "CONTROLS: neither wrong-CLI checkpoint nor credential-less staging dir may recover"
     );
@@ -1798,7 +2520,8 @@ fn interrupted_vendor_staging_renewal_recovers_binding_and_proof_only_when_compl
             &store,
             &bed.roster(Cli::Kimi),
             &guard,
-            NOW
+            NOW,
+            shared_renewal::CheckpointAuthority::Unavailable,
         ),
         "CONTROL: recovery yields while signin.lock is held"
     );
@@ -2951,14 +3674,14 @@ fn explicit_vendor_account_selection_holds_wakes_and_resumes_to_completion() {
     fs::write(
         bed.roster(Cli::Codex),
         format!(
-            "[[account]]\nlabel = \"codex-1\"\nclass = \"dedicated\"\ndir = \"{}\"\n\
+            "[[account]]\nlabel = \"codex-1\"\nclass = \"dedicated\"\ndir = {}\n\
              email = \"codex-one@example.com\"\n\n\
-             [[account]]\nlabel = \"codex-2\"\nclass = \"dedicated\"\ndir = \"{}\"\n\
+             [[account]]\nlabel = \"codex-2\"\nclass = \"dedicated\"\ndir = {}\n\
              email = \"codex-two@example.com\"\n\n\
-             [[account]]\nlabel = \"codex-3\"\nclass = \"dedicated\"\ndir = \"{}\"\n",
-            login_1.display(),
-            login_2.display(),
-            login_3.display(),
+             [[account]]\nlabel = \"codex-3\"\nclass = \"dedicated\"\ndir = {}\n",
+            crate::harness::host_path::toml(&login_1),
+            crate::harness::host_path::toml(&login_2),
+            crate::harness::host_path::toml(&login_3),
         ),
     )
     .unwrap();

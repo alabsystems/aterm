@@ -45,6 +45,13 @@
 //! are still in the log. A file that ends inside a frame (a torn append), or in zeros, is
 //! cut at that frame. Anything else that does not read refuses the open, naming the file.
 //!
+//! The cut is made once nothing refuses the open ([`HeldStore::make_owed_cut`]), never at the
+//! read: only the log's scan can say the store was read under the right key. Read without its
+//! key, a sealed frame is its nonce first, and about one sealed store in 256 reads as rules cut
+//! above the base. A log with a `<log>.seal` beside it refuses a keyless open before this read
+//! (`refuse_keyless_sealed`, in `store.rs`), but one whose `.seal` is gone reaches it, as a v1 log
+//! does, and its scan refuses it only after: with the cut owed, that open changes nothing here.
+//!
 //! # Bounded
 //!
 //! The held records are bounded by their classes' `max_bytes` (`retention.rs`). The file is
@@ -167,7 +174,7 @@ const fn held_bound_aad(id: [u8; 16], index: u64) -> [u8; 40] {
 }
 
 #[cfg(feature = "at-rest")]
-fn seal(key: Option<AtRestRef<'_>>, index: u64, plain: &[u8]) -> Vec<u8> {
+pub(crate) fn seal(key: Option<AtRestRef<'_>>, index: u64, plain: &[u8]) -> Vec<u8> {
     match key {
         Some(AtRestRef {
             key: k,
@@ -192,7 +199,7 @@ fn seal(_key: Option<AtRestRef<'_>>, _index: u64, plain: &[u8]) -> Vec<u8> {
 }
 
 #[cfg(feature = "at-rest")]
-fn unseal(key: Option<AtRestRef<'_>>, index: u64, payload: Vec<u8>) -> Option<Vec<u8>> {
+pub(crate) fn unseal(key: Option<AtRestRef<'_>>, index: u64, payload: Vec<u8>) -> Option<Vec<u8>> {
     match key {
         Some(AtRestRef {
             key: k,
@@ -491,6 +498,9 @@ fn truncate(f: &File, len: u64) -> io::Result<()> {
 /// THE HELD STORE in memory, beside its file (see the module docs).
 #[derive(Default)]
 pub(crate) struct HeldStore {
+    /// The cut the open's read found and has not made: the file and where
+    /// ([`Self::make_owed_cut`]).
+    owed_cut: Option<(File, u64)>,
     /// The rules the store holds by: set this open, or the ones the file was last held
     /// under.
     pub(crate) rules: Option<Retention>,
@@ -804,8 +814,6 @@ impl HeldStore {
         }
         let mut file = r.into_inner();
         if let Some((at, frames)) = cut_at {
-            truncate(&file, at)?;
-            flush_file(&file, &path)?;
             pos = at;
             index = frames;
         }
@@ -814,15 +822,34 @@ impl HeldStore {
         st.frames = index;
         if st.len == 0 {
             // Nothing survived, not even the rules: as if there were no file.
-            return Ok(HeldStore::default());
+            return Ok(HeldStore {
+                owed_cut: cut_at.map(|(at, _)| (file, at)),
+                ..HeldStore::default()
+            });
         }
         st.stamped_to = match st.stamps.last() {
             Some(&(head, _)) => head,
             None => 0,
         };
         st.prune_stamps(base);
+        st.owed_cut = match cut_at {
+            Some((at, _)) => Some((file.try_clone()?, at)),
+            None => None,
+        };
         st.file = Some(file);
         Ok(st)
+    }
+
+    /// THE CUT [`Self::load`] FOUND (a compaction that never landed, a torn append), made once
+    /// nothing refuses the open: an open that refuses, for a sealed store read without its key
+    /// above all, leaves the file as it found it (see the module docs). A crash before this finds
+    /// the same frames at the next open and owes the same cut.
+    pub(crate) fn make_owed_cut(&mut self, log: &Path) -> io::Result<()> {
+        if let Some((file, at)) = self.owed_cut.take() {
+            truncate(&file, at)?;
+            flush_file(&file, &held_path(log))?;
+        }
+        Ok(())
     }
 
     /// THE OPEN'S LOG HEAD `next`, its base `base` (the log at `log`): stamps read back past

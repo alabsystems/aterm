@@ -39,6 +39,8 @@ fn hooks() -> Hooks {
         fact: Arc::new(|_, _| panic!("reader must not emit actions")),
         needs: Arc::new(|_, _, _| panic!("reader must not ask for credentials")),
         hold: Arc::new(|_, _| panic!("reader must not change holds")),
+        said: Arc::new(|_, _| panic!("reader must not store a hold's words")),
+        receipt: Arc::new(|_, _| panic!("reader must not store a receipt")),
         claim_epoch: Arc::new(|| 0),
         acts: Acts::inert(),
         backoff: Arc::new(|_| Duration::ZERO),
@@ -71,16 +73,27 @@ fn fixture() -> (HostHandle, Arc<Mutex<Kept>>) {
         born: Some(BORN),
         state: None,
         labels: BTreeSet::new(),
+        execution_until: None,
         value,
     });
     let kept = Arc::new(Mutex::new(kept));
+    let host = host_for(Arc::clone(&kept), switches, hooks());
+    (host, kept)
+}
+
+pub(in crate::harness_host) fn host_for(
+    kept: Arc<Mutex<Kept>>,
+    switches: Arc<Switches>,
+    hooks: Hooks,
+) -> HostHandle {
+    let sid = kept.lock().unwrap().snapshot.as_ref().unwrap().tab.clone();
     let shared = Shared {
         state: Mutex::new(State::default()),
         headless: true,
         desk: crate::desk::Desk::of(true),
         faults: Mutex::default(),
         host_faults: Mutex::default(),
-        kept: Mutex::new(HashMap::from([(SID.to_owned(), kept.clone())])),
+        kept: Mutex::new(HashMap::from([(sid, kept)])),
         switches,
         activations: Arc::default(),
         wake: std::sync::OnceLock::new(),
@@ -93,14 +106,11 @@ fn fixture() -> (HostHandle, Arc<Mutex<Kept>>) {
         restart_panics: AtomicBool::new(false),
         passes_panic: AtomicBool::new(false),
     };
-    (
-        HostHandle {
-            shared: Arc::new(shared),
-            thread: Arc::default(),
-            hooks: hooks(),
-        },
-        kept,
-    )
+    HostHandle {
+        shared: Arc::new(shared),
+        thread: Arc::default(),
+        hooks,
+    }
 }
 
 fn read(host: &HostHandle) -> Option<AccountProgress> {
@@ -160,6 +170,132 @@ fn displayed_wait_deadlines_round_up_and_refuse_overflow() {
         assert_eq!(wait_deadline(100, wait), expected);
     }
     assert_eq!(wait_deadline(i64::MAX, Duration::from_nanos(1)), None);
+}
+
+#[test]
+fn private_execution_deadlines_notify_only_when_the_gui_must_rearm() {
+    let base = Instant::now();
+    let now = base + Duration::from_secs(10);
+    for (old, next, notify) in [
+        (20, 30, false),
+        (30, 20, true),
+        (5, 20, true),
+        (5, 8, false),
+    ] {
+        let (_host, kept) = fixture();
+        let mut kept = kept.lock().unwrap();
+        let mut bound = kept.account.progress.as_ref().unwrap().clone();
+        bound.value.phase = ProgressPhase::Waiting;
+        bound.value.next_at = None; // Missing/frozen wall time can leave both values identical.
+        bound.execution_until = Some(base + Duration::from_secs(old));
+        kept.account.execution_progress = Some(bound.clone());
+        let value = bound.value.clone();
+        bound.execution_until = Some(base + Duration::from_secs(next));
+        assert_eq!(
+            replace_execution_progress(&mut kept, Some(bound), now),
+            notify
+        );
+        let retained = kept.account.execution_progress.as_ref().unwrap();
+        assert_eq!(
+            retained.execution_until,
+            Some(base + Duration::from_secs(next))
+        );
+        assert_eq!(
+            retained.value, value,
+            "private currentness never restamps visible evidence"
+        );
+    }
+}
+
+#[test]
+fn a_concurrent_silent_extension_keeps_either_the_new_or_the_earlier_expiry_wake() {
+    let base = Instant::now();
+    let old_until = base + Duration::from_secs(5);
+    let new_until = base + Duration::from_secs(20);
+    for extend_in_clock in [true, false] {
+        let (host, kept) = fixture();
+        {
+            let mut kept = kept.lock().unwrap();
+            let mut bound = kept.account.progress.as_ref().unwrap().clone();
+            bound.execution_until = Some(old_until);
+            bound.state = Some("/synthetic/state".into());
+            bound.value.phase = ProgressPhase::Waiting;
+            kept.account.execution_progress = Some(bound);
+        }
+        let extend = || {
+            let mut kept = kept.lock().unwrap();
+            let mut next = kept.account.execution_progress.as_ref().unwrap().clone();
+            next.execution_until = Some(new_until);
+            assert!(!replace_execution_progress(
+                &mut kept,
+                Some(next),
+                old_until - Duration::from_nanos(1)
+            ));
+        };
+        let read = host
+            .account_progress_read_with_activity(
+                SID,
+                4242,
+                Some(BORN),
+                Some(CONVERSATION),
+                || {
+                    if extend_in_clock {
+                        extend();
+                    }
+                    (
+                        if extend_in_clock {
+                            old_until
+                        } else {
+                            old_until - Duration::from_nanos(1)
+                        },
+                        Some(100),
+                    )
+                },
+                |_, _, _| {
+                    if !extend_in_clock {
+                        extend();
+                    }
+                    Some(Vec::new())
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            read.progress.as_ref().unwrap().phase,
+            ProgressPhase::Waiting
+        );
+        // A snapshot that still carries the old lease must retain even an already-past wake.
+        assert_eq!(
+            read.next_poll(old_until + Duration::from_secs(1)),
+            Some(if extend_in_clock {
+                new_until
+            } else {
+                old_until
+            })
+        );
+    }
+}
+
+#[test]
+fn an_unavailable_activity_read_without_a_gate_remains_unavailable() {
+    let (host, kept) = fixture();
+    kept.lock()
+        .unwrap()
+        .account
+        .progress
+        .as_mut()
+        .unwrap()
+        .state = Some("/synthetic/state".into());
+    assert!(
+        host.account_progress_with_activity(
+            SID,
+            4242,
+            Some(BORN),
+            Some(CONVERSATION),
+            || (Instant::now(), Some(100)),
+            |_, _, _| None
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -416,4 +552,214 @@ fn account_progress_contention_is_unavailable_and_never_waits_for_a_writer() {
     thread.join().unwrap();
     assert!(observed.expect("the nonblocking read returned").is_err());
     assert!(read(&host).is_some());
+}
+
+#[test]
+fn service_progress_retries_a_busy_activity_read_and_then_shows_sign_in() {
+    use aterm_agent::harness::account_progress::EXECUTION_PREPARED_FINDING;
+    use aterm_agent::harness::accounts_sync::LoginActivity;
+    use aterm_agent::harness::footer::{FactsOwner, FooterFacts};
+
+    for discard_contention in [false, true] {
+        let start = Instant::now();
+        let until = start + Duration::from_secs(100);
+        let mut app = crate::App::headless_for_test();
+        let local = app.focused_session_id(crate::WindowId(0)).unwrap();
+        let ctx = app.pool.get(local).unwrap().ctx.clone();
+        let sid = app.session_sid(local).unwrap();
+        let (host, kept) = fixture();
+        host.shared
+            .switches
+            .account_controls
+            .store(ACCOUNTS_OFF, Ordering::SeqCst);
+        {
+            let mut map = host.shared.kept.lock().unwrap();
+            let entry = map.remove(SID).unwrap();
+            map.insert(sid.clone(), entry);
+        }
+        let retained = {
+            let mut kept = kept.lock().unwrap();
+            kept.snapshot.as_mut().unwrap().tab = sid.clone();
+            let mut bound = kept.account.progress.take().unwrap();
+            bound.snapshot.tab = sid.clone();
+            bound.state = Some("/synthetic/state".into());
+            bound.labels.insert("alternate".into());
+            bound.value.phase = ProgressPhase::Waiting;
+            bound.value.observed_at = 100;
+            bound.value.next_at = Some(200);
+            bound.value.details.push(EXECUTION_PREPARED_FINDING.into());
+            bound.execution_until = Some(until);
+            let retained = bound.value.clone();
+            kept.account.execution_progress = Some(bound);
+            retained
+        };
+        {
+            let mut timeline = ctx.timeline.lock().unwrap();
+            timeline.note_foreground_group(4242);
+            timeline.set_program(4242, Some("node".into()));
+            timeline.set_agent_reader_program_for_test(Some(Program::Claude));
+            timeline.set_claude_footer(
+                4242,
+                Some(BORN),
+                Some(FooterFacts {
+                    owner: Some(FactsOwner {
+                        floor: Some(BORN),
+                        session_id: CONVERSATION.into(),
+                    }),
+                    ..FooterFacts::default()
+                }),
+            );
+        }
+        app.harness = Some(host);
+        for step in 0..3 {
+            let now = start + Duration::from_secs(step);
+            let mut calls = 0;
+            app.service_harness_account_progress_with_reader(
+                now,
+                |host, asked_sid, pid, birth, conversation| {
+                    calls += 1;
+                    assert_eq!(asked_sid, sid);
+                    let mut read = host
+                        .account_progress_read_with_activity(
+                            asked_sid,
+                            pid,
+                            birth,
+                            conversation,
+                            || (now, Some(100)),
+                            |_, _, stamp| match step {
+                                0 => None,
+                                1 => Some(vec![LoginActivity {
+                                    label: "alternate".into(),
+                                    route: None,
+                                    active: true,
+                                    observed_at: stamp,
+                                    next_at: None,
+                                }]),
+                                _ => Some(Vec::new()),
+                            },
+                        )
+                        .unwrap();
+                    if discard_contention {
+                        read.activity_contended = false;
+                    }
+                    Ok(read)
+                },
+            );
+            assert_eq!(calls, 1);
+            let observed = ctx
+                .timeline
+                .lock()
+                .unwrap()
+                .claude_footer()
+                .unwrap()
+                .account_progress
+                .clone()
+                .unwrap();
+            assert_eq!(
+                observed.phase,
+                if step == 1 {
+                    ProgressPhase::SigningIn {
+                        label: "alternate".into(),
+                        route: None,
+                    }
+                } else {
+                    ProgressPhase::Waiting
+                }
+            );
+            assert_eq!(observed.next_at, retained.next_at);
+            assert_eq!(observed.details.first(), retained.details.first());
+            assert!(
+                observed
+                    .details
+                    .iter()
+                    .any(|s| s == "Automatic account rotation is off")
+            );
+            if discard_contention {
+                // Identical Waiting reaches the timeline, but lost contention misses the earlier retry.
+                assert_eq!(app.harness_progress_next_poll, Some(until));
+                break;
+            }
+            assert_eq!(
+                app.harness_progress_next_poll,
+                Some(if step != 2 {
+                    now + Duration::from_secs(1)
+                } else {
+                    until
+                })
+            );
+            assert_eq!(
+                kept.lock()
+                    .unwrap()
+                    .account
+                    .execution_progress
+                    .as_ref()
+                    .unwrap()
+                    .value,
+                retained
+            );
+        }
+    }
+}
+
+#[test]
+fn service_progress_follows_reader_owned_claude_but_not_an_unrelated_program() {
+    use aterm_agent::harness::footer::{FactsOwner, FooterFacts};
+
+    for (program, reader, accepted) in [
+        ("node", Some(Program::Claude), true),
+        ("bun", Some(Program::Claude), true),
+        ("vim", Some(Program::Claude), false),
+        ("node", None, false),
+    ] {
+        let mut app = crate::App::headless_for_test();
+        let local = app.focused_session_id(crate::WindowId(0)).unwrap();
+        let ctx = app.pool.get(local).unwrap().ctx.clone();
+        let sid = app.session_sid(local).unwrap();
+        let (host, kept) = fixture();
+        {
+            let mut map = host.shared.kept.lock().unwrap();
+            let entry = map.remove(SID).unwrap();
+            map.insert(sid.clone(), entry);
+        }
+        {
+            let mut kept = kept.lock().unwrap();
+            kept.snapshot.as_mut().unwrap().tab = sid.clone();
+            let bound = kept.account.progress.as_mut().unwrap();
+            bound.snapshot.tab = sid.clone();
+            bound.value.phase = ProgressPhase::Waiting;
+            bound.value.known = Some(2);
+            bound.value.eligible = Some(0);
+            bound.value.wall = Some("weekly allowance".into());
+        }
+        let expected = host
+            .account_progress(&sid, 4242, Some(BORN), Some(CONVERSATION))
+            .unwrap()
+            .unwrap();
+        {
+            let mut timeline = ctx.timeline.lock().unwrap();
+            timeline.note_foreground_group(4242);
+            timeline.set_program(4242, Some(program.into()));
+            timeline.set_agent_reader_program_for_test(reader);
+            timeline.set_claude_footer(
+                4242,
+                Some(BORN),
+                Some(FooterFacts {
+                    owner: Some(FactsOwner {
+                        floor: Some(BORN),
+                        session_id: CONVERSATION.into(),
+                    }),
+                    ..FooterFacts::default()
+                }),
+            );
+        }
+        app.harness = Some(host);
+        app.service_harness_account_progress(Instant::now());
+        let timeline = ctx.timeline.lock().unwrap();
+        let observed = timeline.claude_footer().unwrap().account_progress.as_ref();
+        assert_eq!(
+            observed,
+            accepted.then_some(&expected),
+            "{program} with reader {reader:?}: only the current Claude owner receives its bound observation"
+        );
+    }
 }

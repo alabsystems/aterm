@@ -214,7 +214,7 @@ pub struct Tui {
     inject_panic: Option<char>,
 }
 
-/// One file open in the face.
+/// One document open in the face.
 pub struct Buffer {
     store: DocumentStore,
     grants: DocumentGrantStore,
@@ -329,6 +329,7 @@ pub(crate) fn host_error(path: &Path, error: &DocumentHostError) -> String {
 const fn store_words(error: &DocumentError) -> &'static str {
     match error {
         DocumentError::UnknownDocument | DocumentError::UnknownView => "the buffer is gone",
+        DocumentError::ReadOnly => "the directory is read-only",
         DocumentError::Closing | DocumentError::CloseNotReady => "the buffer is closing",
         DocumentError::InvalidRange | DocumentError::OverlappingEdits => {
             "the buffer refused the edit"
@@ -449,6 +450,11 @@ impl Tui {
             .map_err(refused)?;
         let mut store = DocumentStore::new(self.write);
         let document = store.open(uri, granted.text.clone());
+        if let Some(listing) = granted.directory {
+            store
+                .set_directory(document, listing)
+                .map_err(|error| format!("directory open failed: {error:?}"))?;
+        }
         // A file whose every line ends CRLF is held with LF: a yank writes a kill's CRLF as LF.
         self.workspace.crlf_on_disk = matches!(
             granted.observed.encoding().eol,
@@ -465,6 +471,11 @@ impl Tui {
             .workspace
             .attach(&mut store, document, view_id)
             .map_err(|e| named(error_text(&e).to_string()))?;
+        if let Some(listing) = store.directory(document) {
+            view.selections = vec![Selection::caret(
+                listing.entries.first().map_or(0, |(range, _)| range.start),
+            )];
+        }
         let text: Arc<str> = Arc::from(granted.text.as_str());
         if let Some((line, column)) = target.line {
             view.selections = vec![Selection::caret(line_column_offset(&text, line, column))];
@@ -808,6 +819,54 @@ impl Tui {
         effect: EditorEffect,
     ) -> io::Result<Option<Close>> {
         match effect {
+            EditorEffect::OpenPath { uri } => {
+                let result = files::file_uri_path(&uri)
+                    .map_err(|error| error.to_string())
+                    .and_then(|path| self.open(&Target { path, line: None }));
+                match result {
+                    Ok(next) => *buffer = next,
+                    Err(message) => self.status = Some(message),
+                }
+            }
+            EditorEffect::RefreshDirectory { document } => {
+                let listing = buffer
+                    .persistence
+                    .grant(document)
+                    .ok_or(DocumentHostError::UnknownGrant)
+                    .and_then(|grant| {
+                        buffer
+                            .grants
+                            .refresh_directory(grant, DEFAULT_DOCUMENT_LIMIT)
+                    });
+                match listing {
+                    Ok(listing) => {
+                        let old = buffer.store.directory(document);
+                        let target =
+                            old.and_then(|old| old.target_at(buffer.view.primary_selection().head));
+                        let point = listing.point_for(target);
+                        let deltas = old.map_or_else(Vec::new, |old| {
+                            amacs::diff::minimal_edits(&old.text, &listing.text)
+                                .into_iter()
+                                .map(|edit| amacs::store::EditDelta {
+                                    old: edit.range,
+                                    inserted_len: edit.insert.len(),
+                                })
+                                .collect::<Vec<_>>()
+                        });
+                        if let Err(error) = buffer.store.set_directory(document, listing) {
+                            self.status = Some(format!("directory refresh failed: {error:?}"));
+                            return Ok(None);
+                        }
+                        if let Some(snapshot) = buffer.store.snapshot(document) {
+                            buffer.view.observe_external(snapshot.seq, &deltas);
+                            buffer.view.selections = vec![Selection::caret(point)];
+                            buffer.view.primary = 0;
+                            buffer.view.viewport_anchor = point;
+                        }
+                    }
+                    Err(error) => self.status = Some(error.to_string()),
+                }
+            }
             EditorEffect::SaveDocument { .. } => {
                 self.save(buffer);
             }
@@ -1169,6 +1228,81 @@ pub fn run_tui(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directory_opens_refreshes_and_visits_a_file() {
+        use aterm_tty::tty::MemTty;
+        // SAFETY: this test launches the editor with only its own scratch files.
+        let authority = unsafe { aterm_cap::Authority::root_authority() };
+        let mut tui = Tui::new(
+            authority.grant(aterm_cap::Tier::Trusted),
+            Options::default(),
+        );
+        let scratch = aterm_tempfile::TempDir::new().unwrap();
+        let path = std::fs::canonicalize(scratch.path()).unwrap();
+        let mut buffer = tui
+            .open(&Target {
+                path: path.clone(),
+                line: None,
+            })
+            .unwrap();
+        std::fs::write(path.join("entry.txt"), "contents").unwrap();
+        let (mut tty, _peer) = MemTty::pair(Size { cols: 80, rows: 24 });
+        tui.input(
+            &mut tty,
+            &mut buffer,
+            EditorInput::Key {
+                key: Key::Character('g'),
+                mods: Modifiers::empty(),
+                text: Some("g".into()),
+            },
+        )
+        .unwrap();
+        let listing = buffer.store.directory(buffer.document).unwrap();
+        assert!(listing.text.contains("entry.txt"));
+        let origin = listing.text.len();
+        buffer.view.minibuffer = amacs::editor::Minibuffer::Search {
+            query: "entry.txt".into(),
+            origin,
+        };
+        std::fs::remove_file(path.join("entry.txt")).unwrap();
+        let document = buffer.document;
+        tui.effect(
+            &mut tty,
+            &mut buffer,
+            EditorEffect::RefreshDirectory { document },
+        )
+        .unwrap();
+        let amacs::editor::Minibuffer::Search { origin, .. } = &buffer.view.minibuffer else {
+            panic!("search remains open")
+        };
+        let origin = *origin;
+        assert_eq!(origin, buffer.text().len());
+        assert!(buffer.text().is_char_boundary(origin));
+        buffer.view.clear_minibuffer();
+        std::fs::write(path.join("entry.txt"), "contents").unwrap();
+        tui.effect(
+            &mut tty,
+            &mut buffer,
+            EditorEffect::RefreshDirectory { document },
+        )
+        .unwrap();
+        let listing = buffer.store.directory(buffer.document).unwrap();
+        buffer.view.selections = vec![Selection::caret(listing.entries.last().unwrap().0.start)];
+        let effects = tui
+            .workspace
+            .execute(
+                &mut buffer.store,
+                &mut buffer.view,
+                amacs::editor::EditorCommand::Newline,
+            )
+            .unwrap();
+        for effect in effects {
+            tui.effect(&mut tty, &mut buffer, effect).unwrap();
+        }
+        assert_eq!(buffer.text().as_ref(), "contents");
+        assert!(buffer.store.directory(buffer.document).is_none());
+    }
 
     /// G2 review: a kill holding CRLF (from a file held byte for byte) yanked into a file whose
     /// every line ends CRLF goes in as LF, the text it is held as, so the file does not save CR

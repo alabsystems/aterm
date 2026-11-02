@@ -52,6 +52,21 @@ impl Paths {
         self.state_dir.join("acaffiene-code.noindex")
     }
 
+    /// What keeps the mug from keeping this Mac awake, and since when ([`crate::trouble`]).
+    #[must_use]
+    pub fn trouble_file(&self) -> PathBuf {
+        self.state_dir.join("acaffiene.trouble")
+    }
+
+    /// The record that the person turned Enable at Startup off for `label`
+    /// ([`crate::launchd::choose_startup`]): while it is there, no launch turns it back on.
+    #[must_use]
+    pub fn startup_off_file(&self, label: &str) -> PathBuf {
+        self.state_dir
+            .join("acaffiene")
+            .join(format!("{label}.startup-off"))
+    }
+
     /// The folder of the session-only launchd plists ([`Self::session_plist`]).
     #[must_use]
     pub fn session_dir(&self) -> PathBuf {
@@ -111,5 +126,10 @@ mod tests {
             Some(paths.launch_agents().as_path())
         );
         assert_eq!(paths.log_file(), PathBuf::from("/l/acaffiene.log"));
+        assert_eq!(paths.trouble_file(), PathBuf::from("/s/acaffiene.trouble"));
+        assert_eq!(
+            paths.startup_off_file("x.y"),
+            PathBuf::from("/s/acaffiene/x.y.startup-off")
+        );
     }
 }

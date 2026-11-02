@@ -207,7 +207,7 @@ pub(crate) mod fixture {
                     let length = headers
                         .iter()
                         .find(|(name, _)| name == "content-length")
-                        .and_then(|(_, value)| value.parse::<usize>().ok())
+                        .and_then(|(_, value)| crate::parse_uint::<usize>(value))
                         .unwrap_or(0);
                     let mut body = vec![0; length];
                     if reader.read_exact(&mut body).is_err() {

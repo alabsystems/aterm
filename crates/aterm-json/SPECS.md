@@ -1,34 +1,16 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-json: spec recovery from its 24 unit tests
+# aterm-json: spec recovery from unit tests
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 1 test it
-> deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
-> were taken before.
+The general properties the tests in `crates/aterm-json/tests/json.rs` sample, stated as specs to prove
+through Trust/Clean about the compiled Rust functions (§1), and which spec retires each test (§2). Most
+tests are digest-pinned sweeps that hash their verdicts and output bytes into one FNV-1a value; a spec
+replaces the sweep, not the digest (§5.3). Every claim comes from reading the code; nothing was
+compiled or run.
 
-> Audit amendment: The 2026-10-16 code audit corrected the source docs identified in §5.1/2/7. The dated inventory and those observations below record the earlier snapshot; parser behavior is unchanged.
-
-> Status 2026-10-16: this is the crate's migration worklist. Each of the 19 specs below is proved
-> through Trust/Clean about the compiled Rust function, and then the tests it subsumes are deleted.
-> No test has been deleted yet. Every test samples at least one spec (§4), so none goes before its
-> spec is Certified.
-
-Source: `crates/aterm-json` (read only). All 24 tests are in `tests/json.rs`. The library has no
-unit tests in `src/` (`[lib] test = false`). I read every test and all of
-`src/{de,ser,value,lib,macros,error}.rs`. Nothing was compiled or run. The claims below come from
-reading the code.
-
-Result: **19 specs**, covering **24 tests**. **0 tests are not spec samples** (§4). Most tests
-are digest-pinned sweeps: they hash their verdicts and output bytes into one FNV-1a value. A spec
-replaces the sweep, not the digest (§5.3).
-
-This revision corrects `typed-integer-targets`: `i128` accepts `-0` as 0 (§5.7). The other 18 specs
-were re-checked against every test and the source and are unchanged in substance.
-
-Gap numbers refer to the table in
-`AUDIT-trust-for-test-migration-2026-10-15.md` §7 (historical internal audit).
-Gap 0 (a seal that publishes Clean rows) is a prerequisite for every row, so every row lists it.
+Gap numbers are rows of the gap table in `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7.
+Gap 0 (no Lean-discharged row is published) blocks every spec, so every row lists it.
 
 ## 0. Notation used in the statements
 
@@ -105,9 +87,9 @@ Gap 0 (a seal that publishes Clean rows) is a prerequisite for every row, so eve
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes`, `difficulty (Rust features the proof
-must handle)`, `blocking_gaps` (audit §7 numbers). `subsumes` lists every test the spec samples;
-§2 names the one that retires each test. Function paths are relative to `crates/aterm-json/src`.
+Columns: `id`, `kind`, `functions` (relative to `crates/aterm-json/src`), `statement`, `subsumes`
+(every test the spec samples; §2 names the spec that retires each), `difficulty` (the Rust features
+the proof must handle), `blocking_gaps`.
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
@@ -131,45 +113,6 @@ json-macro-denotation	other (macro denotation)	macros::{json,json_build}	∀ jso
 json-pointer-rfc6901	contract	value::Value::pointer, value::array_index	∀ v: Value, p: &str: pointer("") = Some(v); p not starting with `/` gives None; otherwise fold over p.split('/').skip(1), each token unescaped `~1`→`/` first, then `~0`→`~`: an Object steps to map.get(token), an Array to items.get(array_index(token)?), anything else or any miss is None. array_index(t) = Some(n) ⇔ t ∈ (0 | [1-9][0-9]*) ∧ n = dec(t) ≤ usize::MAX; so `00`, `+0`, `-` and non-digits give None.	json::json_pointer	MEDIUM: str::split iterator, str::replace (allocation), starts_with, str::parse::<usize> (which accepts a leading `+`, hence the explicit guard), a loop with `?` on Option, BTreeMap::get, Vec::get. array_index alone is EASY.	0,1,3,5,7
 index-total	no-panic	<Value as Index<&str>>::index, <Value as Index<usize>>::index, value::Value::{get,get_index,is_null,as_u64}	∀ v: Value, k: &str, i: usize: the index sugar never panics. v[k] is the value under k if v is an object holding k, else &Null. v[i] is items[i] if v is an array with i < len, else &Null. Indexing a scalar always gives Null.	json::index_sugar_is_total	EASY: enum match, BTreeMap::get, slice get, unwrap_or on a reference to a static	0,1,3
 ```
-
-### Distribution by kind (19)
-
-| kind | count | ids |
-|---|---|---|
-| contract | 11 | json-accepts-exactly-grammar, value-encoding, integer-format, float-f64-shortest-roundtrip, float-f32-shortest, float-parse-correctly-rounded, typed-integer-targets, to-value-exact, key-serializer-refuses, serializer-data-model, json-pointer-rfc6901 |
-| invariant | 2 | recursion-limit, number-normal-form |
-| round-trip | 2 | value-roundtrip, string-escape-roundtrip |
-| equivalence | 1 | skip-equals-materialize |
-| refinement | 1 | deserializer-faithful |
-| no-panic | 1 | index-total |
-| other | 1 | json-macro-denotation |
-
-### Blocking-gap histogram (gap → specs it blocks)
-
-| gap | specs | gap | specs |
-|---|---|---|---|
-| 0 | 19 | 7 | 11 |
-| 1 | 19 | 8 | 2 |
-| 2 | 11 | 9 | 2 |
-| 3 | 18 | 11 | 12 |
-| 4 | 8 | 12 | 5 |
-| 5 | 13 | 13 | 2 |
-| | | 14 | 3 |
-
-No spec is blocked by gap 0 alone. Every spec needs gap 1 (`&str`, `&[u8]`, `Vec`, `String` and
-`Value` as content-modelled carriers), and every spec except the macro needs gap 3 (E6 body widening).
-None needs gaps 6, 10, 15, 16 or 17 specifically. Those gaps (and the std numeric parse/format models
-in §5.6) apply to the whole migration.
-
-### Proof dependency order
-
-`number-normal-form`, `integer-format`, `array_index` → the writer half of `string-escape-roundtrip`
-→ `value-encoding` (floats assumed) → `recursion-limit` → `skip-equals-materialize` lemma
-(`skip_string_body` ≡ `parse_string_body`) → `json-accepts-exactly-grammar` → `value-roundtrip`
-(needs the float specs for its float case) → `typed-integer-targets`, `to-value-exact`,
-`key-serializer-refuses`, `serializer-data-model` → `deserializer-faithful`. The float specs
-(`float-parse-correctly-rounded`, `float-f64-shortest-roundtrip`, `float-f32-shortest`) form a
-separate chain that needs an IEEE model first.
 
 ## 2. Test → spec map (TSV)
 
@@ -208,28 +151,22 @@ crates/aterm-json/src/lib.rs	json_const_helpers_round_trip	recursion-limit	json-
 
 ## 3. Coverage
 
-- 25 tests read. All 25 map to one of the 19 specs. 18 specs retire at least one test as primary;
-  `number-normal-form` retires none and is a lemma of `value-roundtrip`.
-- The biggest collapse: `json-accepts-exactly-grammar` retires the four input sweeps (generated,
-  mutated, arbitrary and named), which together pin several thousand verdicts.
-- `deserializer-faithful` retires 4 tests as primary and is also sampled by 2 more. It is the hardest
-  spec (gaps 9 and 13). `to_value_and_from_value_round_trip` and
-  `typed_models_serialize_to_pinned_bytes_and_read_back` both need it before they can go.
-- A test goes only when all its specs (primary and `also`) are Certified. Example:
-  `wide_integers_round_trip_or_fail` needs `typed-integer-targets`, `integer-format` and
-  `to-value-exact`.
+- `number-normal-form` retires no test as primary; it is a lemma of `value-roundtrip`.
+- A test goes only when every spec it samples (`primary` and `also`) is Certified. For example,
+  `wide_integers_round_trip_or_fail` needs `typed-integer-targets`, `integer-format` and `to-value-exact`.
+- `src/lib.rs`'s `const_tests::json_const_helpers_round_trip` has no row, and `[lib] test = false`
+  keeps it from running.
 
 ## 4. Tests that are not spec samples
 
-None. Every test samples at least one general property. Two pieces of test-only code go with the tests:
+None. Two pieces of test-only code go with the tests:
 
 | item | why | action |
 |---|---|---|
-| `Golden` (FNV-1a digest) and the digest constants `GENERATED`, `MUTATED`, `ARBITRARY`, `NAMED`, `RECURSION`, `FLOATS`, `F32S`, `STRINGS`, `TYPED`, `TYPED_READS`, `SCALARS` in `crates/aterm-json/tests/json.rs` | These are golden pins, not specs (§5.3). They exist only to compress the sweeps. | **delete** each constant in the commit that deletes the last sweep using it, and `Golden` with the last constant |
+| `Golden` (FNV-1a digest) and the digest constants `GENERATED`, `MUTATED`, `ARBITRARY`, `NAMED`, `RECURSION`, `FLOATS`, `F32S`, `STRINGS`, `TYPED`, `TYPED_READS`, `SCALARS` in `crates/aterm-json/tests/json.rs` | Golden pins, not specs (§5.3); they only compress the sweeps. | **delete** each constant in the commit that deletes the last sweep using it, and `Golden` with the last constant |
 | the `parse` helper (lossless re-serialization check) in `crates/aterm-json/tests/json.rs` | It samples `value-roundtrip` with a weaker equality (§5.4). | **delete** with the last test that calls it |
 
-(`test_support/serde_corpus.rs` is shared by other crates through `#[path]` and is not part of this
-crate's migration.)
+`test_support/serde_corpus.rs` serves other crates' tests through `#[path]` and is outside this file.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
@@ -253,14 +190,12 @@ crate's migration.)
    `PartialEq`, catching any loss of `-0.0` (`Num::NegZero`) as stated by `value-roundtrip`.
 5. **The shortest-digits sweep is close to a tautology, and one doc claim is unproved.**
    - In `a_power_of_two_gets_the_shortest_digits`, the digit-count assertion follows from the
-     construction. `shortest_f64`/`shortest_f32` take their precision from `{:e}` and use the closest
-     decimal of that length only if it reads back, so they cannot have fewer digits without
-     contradicting `{:e}`'s minimality. Only the four pinned literals and the read-back checks carry
-     information.
-   - The `ser.rs` doc on `shortest_f64` claims that when the closest decimal does not read back,
-     `{:e}`'s digits are "the only decimal of that length the interval holds". This is unproved, and
-     `float-f64-shortest-roundtrip` depends on it. It needs a proof or a counterexample before the spec
-     is attempted.
+     construction: `shortest_f64`/`shortest_f32` take their precision from `{:e}`. Only the four pinned
+     literals and the read-back checks carry information.
+   - When the closest decimal of `{:e}`'s length does not read back, they fall back to `{:e}`'s
+     digits. That those are then the closest decimal of that length that reads back is unproved;
+     `float-f64-shortest-roundtrip` rests on it, and it needs a proof or a counterexample before the
+     spec is attempted.
 6. **No audit gap covers std numeric parsing and formatting.** `json-accepts-exactly-grammar`,
    `float-parse-correctly-rounded`, `typed-integer-targets`, `json-pointer-rfc6901` and both float
    writers rest on `str::parse::<u64/i64/u128/i128/usize/f64>` (dec2flt) and the `{:e}` float
@@ -272,23 +207,21 @@ crate's migration.)
    `serde_json`), while `u128` and narrower integer targets reject `-0`. Both `visit_number`'s doc
    and `typed-integer-targets` state the `i128` path explicitly.
 
-## 6. The specs I would prove first (easiest, high value)
+## 6. Proof order (easiest, high value)
 
-No spec is blocked by gap 0 alone. Every one needs at least gap 1, so these are ordered by the smallest
-gap set and by what each unlocks.
+Every spec needs gap 1 and, except the macro, gap 3.
 
-1. **`index-total`** (gaps 0,1,3). An enum match, `BTreeMap::get`, slice `get` and a static `Null`.
-   There are no loops. It retires `index_sugar_is_total` and is the cleanest first use of a `Value`
-   carrier, the gap-1 work every other spec needs.
-2. **`number-normal-form`** (gaps 0,1,3). A private-field enum invariant plus three accessors. It retires
-   no test alone, but it is the lemma that makes `value-roundtrip` true. It is also the smallest real
-   type invariant in the crate.
-3. **`integer-format`** (gaps 0,1,2,3,5,7). One digit loop over a `[u8;39]` buffer on `u128`, with an
-   obvious invariant. It retires `integer_formatting` and is a third of `wide_integers_round_trip_or_fail`.
-   It is also the lemma behind integer keys in `key-serializer-refuses`.
-
-Runner-up: `array_index` (canonical decimal, the core of `json-pointer-rfc6901`) and the writer half of
-`string-escape-roundtrip` (`Q(s)`, one byte loop). After them, `recursion-limit` is the first parser spec
-and the cheapest one with a security property: bounded stack on any input. The float specs and
-`deserializer-faithful` go last, since they need an IEEE/shortest-digits model (gaps 8, 14) and
-higher-order serde specs (gaps 9, 13).
+1. **`index-total`** (gaps 0, 1, 3): an enum match, `BTreeMap::get`, slice `get` and a static `Null`,
+   with no loops. It retires `index_sugar_is_total` and is the cleanest first `Value` carrier.
+2. **`number-normal-form`** (gaps 0, 1, 3): a private-field enum invariant plus three accessors, and
+   the lemma that makes `value-roundtrip` true.
+3. **`integer-format`** (gaps 0, 1, 2, 3, 5, 7): one digit loop over a `[u8; 39]` buffer on `u128`. It
+   retires `integer_formatting` and is the lemma behind integer keys in `key-serializer-refuses`.
+4. Then, in dependency order: `array_index` (the core of `json-pointer-rfc6901`), the writer half of
+   `string-escape-roundtrip`, `value-encoding` (floats assumed), `recursion-limit` (bounded stack on
+   any input), the `skip-equals-materialize` lemma (`skip_string_body` ≡ `parse_string_body`),
+   `json-accepts-exactly-grammar`, `value-roundtrip`, then `typed-integer-targets`, `to-value-exact`,
+   `key-serializer-refuses` and `serializer-data-model`.
+5. Last: `deserializer-faithful` (higher-order serde specs, gaps 9 and 13) and the float specs
+   (`float-parse-correctly-rounded`, `float-f64-shortest-roundtrip`, `float-f32-shortest`), a separate
+   chain that needs an IEEE model first (§5.6; the two writers also need gaps 8 and 14).

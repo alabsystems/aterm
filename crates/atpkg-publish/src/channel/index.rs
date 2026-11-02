@@ -726,7 +726,10 @@ pub fn plan(
         }
     }
 
-    let index_build = base.index_build + 1;
+    let index_build = base
+        .index_build
+        .checked_add(1)
+        .ok_or_else(|| Error::refused("index_build overflowed u64::MAX"))?;
     let pairs = |v: &[(String, Build)]| {
         if v.is_empty() {
             "<none>".to_string()
@@ -1096,7 +1099,7 @@ pub fn publish_with(ctx: &Ctx, request: &IndexRequest, log: &mut Log) -> Result<
          <YYYY-MM-DDTHH:MM:SSZ in the future>"
     };
     let until = horizon("the index's", &valid_until, ctx.now_unix, remedy)?;
-    if until - ctx.now_unix < HORIZON_WARN_SECS {
+    if until.saturating_sub(ctx.now_unix) < HORIZON_WARN_SECS {
         log.warn(format!(
             "the index's horizon {valid_until} is under 30 days away: every client refuses it \
              from then, and nothing re-signs it automatically"
@@ -1263,9 +1266,7 @@ fn write_quad(
 
     let text = render(plan);
     let index_path = out.join(QUAD_FILES[0]);
-    let write = |path: &Path, bytes: &[u8]| {
-        std::fs::write(path, bytes).map_err(|e| Error::io(format!("write {}", path.display()), &e))
-    };
+    let write = |path: &Path, bytes: &[u8]| crate::lane::report::write_atomic_bytes(path, bytes);
     write(&index_path, text.as_bytes())?;
     write(&out.join(QUAD_FILES[1]), &key.sign(text.as_bytes())?)?;
     write(&out.join(QUAD_FILES[2]), &roster.bytes)?;
@@ -1736,9 +1737,14 @@ fn parse(args: &[String], verb: bool) -> Result<(Delta, Options)> {
             }
             "--index-build" if verb => {
                 let v = flag_value(args, &mut i, flag)?;
-                o.first_build = Some(v.parse().map_err(|_| {
-                    Error::usage(format!("--index-build {v}: expected a positive number"))
-                })?);
+                o.first_build = Some(
+                    (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                        .then(|| v.parse().ok())
+                        .flatten()
+                        .ok_or_else(|| {
+                            Error::usage(format!("--index-build {v}: expected a positive number"))
+                        })?,
+                );
             }
             other => {
                 return Err(Error::usage(format!(

@@ -151,9 +151,17 @@ pub enum MarkdownImageAction {
 /// Pure image-policy reducer.
 pub fn reduce_image_action(image: &MarkdownImage, user_initiated: bool) -> MarkdownImageAction {
     if image.remote {
+        let lower = image.source_uri.to_ascii_lowercase();
+        let host = lower
+            .strip_prefix("https://")
+            .or_else(|| lower.strip_prefix("http://"))
+            .unwrap_or("");
         let safe = image.source_uri.len() <= 2_048
-            && (image.source_uri.starts_with("https://")
-                || image.source_uri.starts_with("http://"));
+            && !host.is_empty()
+            && !image
+                .source_uri
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control());
         return if safe && user_initiated {
             MarkdownImageAction::OpenRemote {
                 uri: image.source_uri.clone(),
@@ -172,7 +180,13 @@ pub fn reduce_image_action(image: &MarkdownImage, user_initiated: bool) -> Markd
     let local = !image.source_uri.is_empty()
         && image.source_uri.len() <= 4_096
         && !image.source_uri.starts_with('/')
-        && !image.source_uri.contains('\0')
+        && !image.source_uri.starts_with('\\')
+        && !image.source_uri.starts_with('#')
+        && !image.source_uri.contains(':')
+        && !image
+            .source_uri
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control())
         && !image
             .source_uri
             .split(['/', '\\'])
@@ -324,7 +338,7 @@ pub fn parse(source: &str) -> MarkdownDocument {
             while i < lines.len() {
                 let candidate = &lines[i];
                 end = candidate.end;
-                if candidate.text.trim_start().starts_with(fence) {
+                if is_fence_close(candidate.text, fence) {
                     i += 1;
                     break;
                 }
@@ -896,9 +910,17 @@ impl BlockFrame {
     /// ([`reader_columns`]).
     #[must_use]
     pub fn columns(&self, width: f32) -> usize {
-        (self.text_width(width) / self.advance().max(1.0))
-            .floor()
-            .max(4.0) as usize
+        if !width.is_finite() || !self.inset_left.is_finite() || !self.inset_right.is_finite() {
+            return 4;
+        }
+        let adv = self.advance();
+        let denom = if adv.is_finite() { adv.max(1.0) } else { 1.0 };
+        let cols = (self.text_width(width) / denom).floor();
+        if cols.is_finite() && cols >= 4.0 {
+            cols.min(1_000_000.0) as usize
+        } else {
+            4
+        }
     }
 
     /// The height of the block's rectangle with `rows` rows of text.
@@ -911,9 +933,19 @@ impl BlockFrame {
     /// painter draws in it, none cut by its edge.
     #[must_use]
     pub fn rows_in(&self, height: f32) -> usize {
-        ((height - self.inset_top + 0.01) / self.line_h)
-            .floor()
-            .max(1.0) as usize
+        if !height.is_finite()
+            || !self.inset_top.is_finite()
+            || !self.line_h.is_finite()
+            || self.line_h <= 0.0
+        {
+            return 1;
+        }
+        let rows = ((height - self.inset_top + 0.01) / self.line_h).floor();
+        if rows.is_finite() && rows >= 1.0 {
+            rows.min(1_000_000.0) as usize
+        } else {
+            1
+        }
     }
 }
 
@@ -1097,7 +1129,12 @@ pub fn layout_visible_blocks(
     viewport_height: f32,
     ty: ReaderType,
 ) -> VirtualBlockLayout {
-    if document.blocks.is_empty() || viewport_width <= 0.0 || viewport_height <= 0.0 {
+    if document.blocks.is_empty()
+        || !viewport_width.is_finite()
+        || viewport_width <= 0.0
+        || !viewport_height.is_finite()
+        || viewport_height <= 0.0
+    {
         return VirtualBlockLayout::default();
     }
     let anchor_index = block_at_source(document, source_anchor).unwrap_or(0);
@@ -1291,7 +1328,7 @@ pub fn move_visual_distance(
     distance: f32,
     direction: i32,
 ) -> MarkdownLocation {
-    if document.blocks.is_empty() || direction == 0 {
+    if document.blocks.is_empty() || direction == 0 || !distance.is_finite() {
         return location;
     }
     let mut block = block_at_source(document, location.source_anchor).unwrap_or(0);
@@ -1660,18 +1697,27 @@ pub fn wrap_reader_text_window(
 }
 
 fn link_policy(destination: &str) -> LinkPolicy {
+    if destination.is_empty()
+        || destination
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control())
+    {
+        return LinkPolicy::DeniedScheme;
+    }
     if destination.starts_with('#') {
         return LinkPolicy::LocalAnchor;
     }
-    if !destination.contains(':') {
-        return LinkPolicy::LocalDocument;
+    if destination.starts_with("//") || destination.starts_with('\\') {
+        return LinkPolicy::DeniedScheme;
     }
-    let scheme = destination
-        .split_once(':')
-        .map_or("", |(scheme, _)| scheme)
-        .to_ascii_lowercase();
-    match scheme.as_str() {
-        "https" | "http" | "mailto" => LinkPolicy::ExplicitExternal,
+    let Some((scheme, rest)) = destination.split_once(':') else {
+        return LinkPolicy::LocalDocument;
+    };
+    match scheme.to_ascii_lowercase().as_str() {
+        "https" | "http" if rest.starts_with("//") && rest.len() > 2 => {
+            LinkPolicy::ExplicitExternal
+        }
+        "mailto" if !rest.is_empty() => LinkPolicy::ExplicitExternal,
         _ => LinkPolicy::DeniedScheme,
     }
 }
@@ -1718,26 +1764,24 @@ fn mask_html_comments(source: &str) -> Cow<'_, str> {
     let mut masked = None::<Vec<u8>>;
     let mut in_comment = false;
     let mut inline_code_ticks = None::<usize>;
-    let mut fence_marker = None::<u8>;
+    let mut open_fence = None::<&str>;
 
     for line in source_lines(source) {
         let bytes = line.text.as_bytes();
-        let trimmed = line.text.trim_start().as_bytes();
+        let trimmed = line.text.trim();
 
-        if let Some(marker) = fence_marker {
-            if trimmed.starts_with(&[marker, marker, marker]) {
-                fence_marker = None;
+        if let Some(fence) = open_fence {
+            if is_fence_close(line.text, fence) {
+                open_fence = None;
             }
             continue;
         }
-        if !in_comment && inline_code_ticks.is_none() {
-            let marker = trimmed.first().copied();
-            if matches!(marker, Some(b'`' | b'~'))
-                && marker.is_some_and(|marker| trimmed.starts_with(&[marker, marker, marker]))
-            {
-                fence_marker = marker;
-                continue;
-            }
+        if !in_comment
+            && inline_code_ticks.is_none()
+            && let Some(fence) = fence_start(trimmed)
+        {
+            open_fence = Some(fence);
+            continue;
         }
 
         let mut index = 0usize;
@@ -2188,9 +2232,19 @@ fn decode_entity(entity: &str) -> Option<char> {
         "apos" => Some('\''),
         "nbsp" => Some('\u{a0}'),
         value if value.starts_with("#x") || value.starts_with("#X") => {
-            char::from_u32(u32::from_str_radix(&value[2..], 16).ok()?)
+            let hex = &value[2..];
+            if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return None;
+            }
+            char::from_u32(u32::from_str_radix(hex, 16).ok()?).filter(|&c| c != '\0')
         }
-        value if value.starts_with('#') => char::from_u32(value[1..].parse().ok()?),
+        value if value.starts_with('#') => {
+            let dec = &value[1..];
+            if dec.is_empty() || !dec.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            char::from_u32(dec.parse().ok()?).filter(|&c| c != '\0')
+        }
         _ => None,
     }
 }
@@ -2204,13 +2258,22 @@ fn heading(line: &str) -> Option<(u8, &str)> {
 }
 
 fn fence_start(line: &str) -> Option<&str> {
-    if line.starts_with("```") {
-        Some("```")
-    } else if line.starts_with("~~~") {
-        Some("~~~")
-    } else {
-        None
+    let bytes = line.as_bytes();
+    let marker = *bytes.first()?;
+    if !matches!(marker, b'`' | b'~') {
+        return None;
     }
+    let run = ascii_run(bytes, 0, marker);
+    if run < 3 || (marker == b'`' && line[run..].contains('`')) {
+        return None;
+    }
+    Some(&line[..run])
+}
+
+fn is_fence_close(line: &str, open_fence: &str) -> bool {
+    let trimmed = line.trim();
+    let marker = open_fence.as_bytes()[0];
+    trimmed.len() >= open_fence.len() && trimmed.bytes().all(|byte| byte == marker)
 }
 
 fn is_thematic(line: &str) -> bool {
@@ -2686,6 +2749,19 @@ mod tests {
             reduce_image_action(&document.images[2], true),
             MarkdownImageAction::Denied { .. }
         ));
+        let schemes = parse(
+            "![f](file:///etc/passwd) ![j](javascript:alert(1)) ![d](data:image/png;base64,AA==) ![u](\\\\evil\\share\\x.png) ![a](#frag)",
+        );
+        for img in &schemes.images {
+            assert!(
+                matches!(
+                    reduce_image_action(img, true),
+                    MarkdownImageAction::Denied { .. }
+                ),
+                "scheme/UNC/anchor image must be denied: {:?}",
+                img.source_uri
+            );
+        }
     }
 
     #[test]
@@ -2734,11 +2810,14 @@ mod tests {
 
     #[test]
     fn unsafe_schemes_are_never_external_open_requests() {
-        let document =
-            parse("[ok](https://example.com) [bad](javascript:alert) [local](README.md)");
+        let document = parse(
+            "[ok](https://example.com) [bad](javascript:alert) [local](README.md) [proto](//evil.example/a) [unc](\\\\evil\\share\\a)",
+        );
         assert_eq!(document.links[0].policy, LinkPolicy::ExplicitExternal);
         assert_eq!(document.links[1].policy, LinkPolicy::DeniedScheme);
         assert_eq!(document.links[2].policy, LinkPolicy::LocalDocument);
+        assert_eq!(document.links[3].policy, LinkPolicy::DeniedScheme);
+        assert_eq!(document.links[4].policy, LinkPolicy::DeniedScheme);
     }
 
     #[test]
@@ -2957,6 +3036,21 @@ mod tests {
         assert_eq!(
             move_block_anchor(&document, middle, -3),
             document.blocks[2_497].source().start
+        );
+        assert!(
+            layout_visible_blocks(&document, middle, 0, f32::NAN, 720.0, TYPE)
+                .blocks
+                .is_empty()
+        );
+        assert!(
+            layout_visible_blocks(&document, middle, 0, 680.0, f32::NAN, TYPE)
+                .blocks
+                .is_empty()
+        );
+        let loc = MarkdownLocation::new(middle, 0);
+        assert_eq!(
+            move_visual_distance(&document, loc, 680.0, TYPE, f32::NAN, 1),
+            loc
         );
     }
 
@@ -3215,5 +3309,91 @@ mod tests {
         skipped.insert("steps", 1);
         assert_eq!(admits(&model, &before, &skipped), None);
         assert!(!model.check_invariant("ExactIntraBlockProgress", &skipped));
+    }
+
+    #[test]
+    fn decode_entity_rejects_signed_and_null_numeric_entities() {
+        let doc = parse("&#65; &#x41; &#+65; &#x+41; &#0; &#x0;\n");
+        assert_eq!(doc.blocks.len(), 1);
+        assert_eq!(
+            doc.blocks[0],
+            MarkdownBlock::Paragraph {
+                text: "A A &#+65; &#x+41; &#0; &#x0;".to_string(),
+                source: 0..39,
+            }
+        );
+    }
+
+    #[test]
+    fn four_backtick_fence_preserves_inner_three_backtick_fences_and_masks_comments() {
+        let source = "````carousel\n<!-- inner comment inside code fence -->\n```rust\nfn main() {}\n```\n````\n<!--real comment-->\nParagraph\n";
+        let doc = parse(source);
+        assert_eq!(doc.blocks.len(), 2);
+        match &doc.blocks[0] {
+            MarkdownBlock::CodeBlock { language, code, .. } => {
+                assert_eq!(language.as_deref(), Some("carousel"));
+                assert!(code.contains("<!-- inner comment inside code fence -->"));
+                assert!(code.contains("```rust\nfn main() {}\n```"));
+            }
+            other => panic!("expected CodeBlock, got {other:?}"),
+        }
+        match &doc.blocks[1] {
+            MarkdownBlock::Paragraph { text, .. } => assert_eq!(text, "Paragraph"),
+            other => panic!("expected Paragraph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inline_triple_backtick_code_span_is_not_treated_as_unclosed_code_fence() {
+        let source = "```inline```\n\n<!--comment-->\nNext paragraph\n";
+        let doc = parse(source);
+        assert_eq!(doc.blocks.len(), 2);
+        match &doc.blocks[0] {
+            MarkdownBlock::Paragraph { text, .. } => assert_eq!(text, "inline"),
+            other => panic!("expected Paragraph, got {other:?}"),
+        }
+        match &doc.blocks[1] {
+            MarkdownBlock::Paragraph { text, .. } => assert_eq!(text, "Next paragraph"),
+            other => panic!("expected Paragraph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn link_and_image_policies_reject_malformed_and_whitespace_targets() {
+        assert_eq!(
+            link_policy("https://example.com/a b"),
+            LinkPolicy::DeniedScheme
+        );
+        assert_eq!(link_policy("https://"), LinkPolicy::DeniedScheme);
+        assert_eq!(link_policy("https:example.com"), LinkPolicy::DeniedScheme);
+        assert_eq!(link_policy("mailto:"), LinkPolicy::DeniedScheme);
+        assert_eq!(
+            reduce_image_action(
+                &MarkdownImage {
+                    alt: None,
+                    source_uri: "https://example.com/img.png\n".to_string(),
+                    source: 0..10,
+                    remote: true,
+                },
+                true,
+            ),
+            MarkdownImageAction::Denied {
+                message: "unsupported or oversized remote image URL",
+            }
+        );
+        assert_eq!(
+            reduce_image_action(
+                &MarkdownImage {
+                    alt: None,
+                    source_uri: "https://".to_string(),
+                    source: 0..8,
+                    remote: true,
+                },
+                true,
+            ),
+            MarkdownImageAction::Denied {
+                message: "unsupported or oversized remote image URL",
+            }
+        );
     }
 }

@@ -4,7 +4,7 @@
 //! The cost of one Prism Glass `PaletteSolve` unit (`docs/design/PRISM-GLASS.md` §15.2 1.4), the
 //! measurement `SOLVE_UNITS_PER_FRAME` is set from.
 //!
-//! Every shipped light page (six glass, two lip-forward) is solved unit by unit, [`REPS`] times;
+//! Every shipped light page (five glass, three lip-forward) is solved unit by unit, [`REPS`] times;
 //! each unit's cost is its least over the repetitions, so a preemption does not count. The
 //! report gives, per unit kind, the count, p50, p99 and most of one unit, and the units a frame
 //! can run inside [`FRAME_BUDGET_US`] at the most costly unit.

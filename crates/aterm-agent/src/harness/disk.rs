@@ -75,6 +75,20 @@ pub mod fence;
 #[path = "disk_fill.rs"]
 pub mod fill;
 
+/// The pressure scheduling rule shared by automatic watches.
+#[path = "disk_cadence.rs"]
+pub mod cadence;
+
+/// The daily automatic managed-cache schedule shared with the GUI watch.
+#[cfg(target_os = "macos")]
+#[path = "disk_cache_maintenance.rs"]
+pub mod maintenance;
+
+/// A standalone automatic watch using the ordinary paged planner and real host facts.
+#[cfg(target_os = "macos")]
+#[path = "disk_watch.rs"]
+pub mod watch;
+
 #[cfg(windows)]
 #[path = "disk_win.rs"]
 pub(crate) mod win;
@@ -1425,13 +1439,16 @@ fn gc_retains(store: &[StoreBuild], program: &str, live: &str, build: &str) -> b
     if build == live {
         return true;
     }
-    let (Ok(live), Ok(build)) = (live.parse::<u64>(), build.parse::<u64>()) else {
+    let (Some(live), Some(build)) = (
+        crate::parse_uint::<u64>(live),
+        crate::parse_uint::<u64>(build),
+    ) else {
         return true;
     };
     let rollback = store
         .iter()
         .filter(|b| b.program == program)
-        .filter_map(|b| b.build.parse::<u64>().ok())
+        .filter_map(|b| crate::parse_uint::<u64>(&b.build))
         .filter(|b| *b < live)
         .max();
     rollback == Some(build)
@@ -2637,6 +2654,15 @@ pub fn sweep_words(why: atpkg::build_cache::Unused) -> String {
             human_bytes(freed),
             if stayed == 1 { "y" } else { "ies" }
         ),
+        Unused::Revoked { freed } => format!(
+            "retirement permission was revoked after {} went; the retained remainder was not counted",
+            human_bytes(freed)
+        ),
+        Unused::Refused { by } => format!(
+            "nothing of it went ({}): {}",
+            by.word(),
+            by.reason()
+        ),
     }
 }
 
@@ -2671,6 +2697,10 @@ pub fn sweep_reason(why: atpkg::build_cache::Unused) -> String {
             "{stayed} entr{} stayed, the rest went",
             if stayed == 1 { "y" } else { "ies" }
         ),
+        Unused::Revoked { .. } => {
+            "retirement permission revoked; retained remainder not counted".to_owned()
+        }
+        Unused::Refused { by } => format!("kept, nothing of it went ({})", by.word()),
     }
 }
 
@@ -2685,30 +2715,128 @@ fn sweep_span(d: std::time::Duration) -> String {
     }
 }
 
+/// The `kind` of a build-cache sweep's rows in the disk ledger ([`sweep_row`]).
+pub const SWEEP_ROW_KIND: &str = "build-cache-sweep";
+
+/// WHAT A `build-cache-sweep` ROW SAYS OF ITS ENTRY, its `action` ([`sweep_row`]): the
+/// write-ahead intent, or the outcome that closes it. The sweep returns one outcome for every
+/// intent it put on record (`atpkg::build_cache::reclaim_watched`), so every intent row is
+/// followed by one outcome row ([`sweep_in_flight`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SweepAction {
+    /// The intent, journalled before its removal starts.
+    Removing,
+    /// An outcome: it went whole, or what stayed of its stage is named (`Unused::Stayed`,
+    /// `Unused::Revoked`), the bytes that went counted.
+    Removed,
+    /// An outcome: nothing of it went (`Unused::Refused`), `bytes` 0 and what refused it in
+    /// `error`.
+    Kept,
+}
+
+impl SweepAction {
+    /// Every action, the intent first.
+    pub const ALL: [Self; 3] = [Self::Removing, Self::Removed, Self::Kept];
+
+    /// The `action` word its rows carry.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Removing => "removing",
+            Self::Removed => "removed",
+            Self::Kept => "kept",
+        }
+    }
+
+    /// The action an `action` word names, or `None` for another word.
+    #[must_use]
+    pub fn parse(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|a| a.as_str() == word)
+    }
+
+    /// Whether a row of it closes an intent: every outcome does.
+    #[must_use]
+    pub const fn closes(self) -> bool {
+        !matches!(self, Self::Removing)
+    }
+
+    /// The outcome row's action for what the sweep returned for an intent (`why`): [`Kept`]
+    /// for one nothing of which went, [`Removed`] for the rest.
+    ///
+    /// [`Kept`]: Self::Kept
+    /// [`Removed`]: Self::Removed
+    #[must_use]
+    pub const fn outcome(why: atpkg::build_cache::Unused) -> Self {
+        if why.nothing_went() {
+            Self::Kept
+        } else {
+            Self::Removed
+        }
+    }
+}
+
+/// HOW MANY BUILD-CACHE REMOVALS THE DISK LEDGER HOLDS IN FLIGHT: its `rows` read in order, each
+/// sweep intent (`removing`) opens one and each sweep outcome (`removed`, `kept`) closes one, the
+/// sweep journalling one outcome for each intent in their order (a stage some of which stayed
+/// under the stage's path); an outcome with none open (its intent cut off the ledger's head)
+/// closes nothing. What stays open is an intent no outcome followed: a pass still running, or
+/// one that ended without its outcome on record.
+#[must_use]
+pub fn sweep_in_flight<'a>(rows: impl IntoIterator<Item = &'a str>) -> usize {
+    rows.into_iter()
+        .filter_map(|line| {
+            let row = aterm_json::from_str::<Value>(line).ok()?;
+            if row["kind"].as_str() != Some(SWEEP_ROW_KIND) {
+                return None;
+            }
+            SweepAction::parse(row["action"].as_str()?)
+        })
+        .fold(0, |open: usize, action| {
+            if action.closes() {
+                open.saturating_sub(1)
+            } else {
+                open.saturating_add(1)
+            }
+        })
+}
+
 /// One `build-cache-sweep` row of the disk ledger: a build directory of aterm's Rust build cache,
-/// or what stayed of a stage a removal could not finish, named as it stands now
-/// (`atpkg::build_cache::remove::stayed_words`).
+/// or what stayed of a stage a removal could not finish, each entry as that removal counted it,
+/// with its reason (`atpkg::build_cache::remove::stayed_words`), or an entry nothing of which
+/// went ([`SweepAction::Kept`]: `bytes` 0, and what refused it in `error`,
+/// `atpkg::build_cache::Refusal::word`).
 #[must_use]
 pub fn sweep_row(
     now: i64,
     path: &Path,
-    action: &str,
+    action: SweepAction,
     bytes: u64,
     why: atpkg::build_cache::Unused,
 ) -> String {
     let mut o = Map::new();
     o.insert("ts".to_owned(), Value::from(rfc3339_utc(now)));
     o.insert("sid".to_owned(), Value::from(String::new()));
-    o.insert(
-        "kind".to_owned(),
-        Value::from("build-cache-sweep".to_owned()),
-    );
-    o.insert("action".to_owned(), Value::from(action.to_owned()));
+    o.insert("kind".to_owned(), Value::from(SWEEP_ROW_KIND.to_owned()));
+    o.insert("action".to_owned(), Value::from(action.as_str().to_owned()));
     o.insert("path".to_owned(), Value::from(path_text(path)));
+    let bytes = if action == SweepAction::Kept {
+        0
+    } else {
+        bytes
+    };
     o.insert("bytes".to_owned(), Value::from(bytes));
+    if let atpkg::build_cache::Unused::Refused { by } = why {
+        o.insert("error".to_owned(), Value::from(by.word()));
+    }
     let what = match why {
         atpkg::build_cache::Unused::Stale { .. } => "part of a build cache",
-        atpkg::build_cache::Unused::Stayed { .. } => "part of a stage",
+        atpkg::build_cache::Unused::Stayed { .. } | atpkg::build_cache::Unused::Revoked { .. } => {
+            "part of a stage"
+        }
+        atpkg::build_cache::Unused::Refused {
+            by: atpkg::build_cache::Refusal::Staged,
+        } => "kept in its stage",
+        atpkg::build_cache::Unused::Refused { .. } => "kept whole",
         atpkg::build_cache::Unused::Tooling { .. } => "a pinned tool, whole",
         atpkg::build_cache::Unused::GivenUp => "a tooling scratch, whole",
         _ => "a build cache, whole",
@@ -2720,7 +2848,7 @@ pub fn sweep_row(
     }
     o.insert("text".to_owned(), Value::from(text));
     aterm_json::to_string(&Value::Object(o))
-        .unwrap_or_else(|_| "{\"kind\":\"build-cache-sweep\"}".to_owned())
+        .unwrap_or_else(|_| format!("{{\"kind\":\"{SWEEP_ROW_KIND}\"}}"))
 }
 
 /// One `poke` row of the disk ledger.
@@ -3073,13 +3201,16 @@ fn remove_rows(
     }
 }
 
-/// The real remover.
+/// The real remover; a Claude Code version a hold under `first_exec` names stays
+/// ([`super::first_exec::held`]).
 pub fn remover(
     judge: Judge,
+    first_exec: Option<PathBuf>,
     sessions: impl Fn() -> idle::Sessions,
 ) -> impl FnMut(&Row) -> std::io::Result<Removed> {
     remover_among(
         judge,
+        first_exec,
         discover::scan_processes,
         discover::running_claude_census,
         sessions,
@@ -3090,6 +3221,7 @@ pub fn remover(
 /// [`remover`], judging gone owners and sessions against `processes` ([`discover::Processes`]) and `census` ([`discover::Census`]).
 pub(crate) fn remover_among(
     judge: Judge,
+    first_exec: Option<PathBuf>,
     processes: impl Fn(&[PathBuf], &[u32]) -> std::io::Result<aterm_uds::holders::PathScan>,
     census: impl Fn(Option<&Path>) -> discover::ClaudeCensus,
     sessions: impl Fn() -> idle::Sessions,
@@ -3190,7 +3322,19 @@ pub(crate) fn remover_among(
             _ => target::reclaim(&row.path, &judge),
         },
         Class::ClaudeStaleVersions => {
-            remove_tree(&row.path)?;
+            if let Some(holds) = first_exec.as_deref() {
+                super::first_exec::remove_when_unheld(
+                    holds,
+                    &row.path,
+                    std::time::SystemTime::now(),
+                    || remove_tree(&row.path),
+                )
+                .map_err(|error| {
+                    std::io::Error::other(format!("no longer a candidate: {error}"))
+                })?;
+            } else {
+                remove_tree(&row.path)?;
+            }
             Ok(Removed {
                 bytes: row.bytes,
                 units: vec![row.path.clone()],
@@ -3238,11 +3382,11 @@ pub fn type_resume(
         Ok(c) => c,
         Err(e) => return format!("wait:no-socket:{e}"),
     };
-    match super::upgrade_drive::type_fenced(
+    match super::upgrade_drive::type_fenced_for_duty(
         &mut c,
         sid,
         text,
-        None,
+        super::contract::Scope::TurnEnd,
         super::upgrade_drive::Put::Paste,
         super::Timings::for_build().fence_every,
     ) {
@@ -3264,6 +3408,9 @@ pub struct Roots {
     pub version_locks: Option<PathBuf>,
     /// The digest cache under the harness state directory ([`versions::HASH_FILE`]).
     pub version_hashes: Option<PathBuf>,
+    /// The holds of programs the harness started and has not seen run, under the harness state
+    /// directory ([`super::first_exec::holds_dir`]): a version one names is KEPT.
+    pub first_exec: Option<PathBuf>,
     /// The package store's root (`<prefix>/store`), read only.
     pub store_dir: Option<PathBuf>,
     /// Candidate build directories, named by the caller.

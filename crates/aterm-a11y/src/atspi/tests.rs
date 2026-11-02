@@ -591,6 +591,30 @@ fn unknown_objects_interfaces_and_members_answer_as_zbus_did() {
         s.ok(gone, "org.freedesktop.DBus.Peer", "Ping", vec![]),
         Vec::<Value>::new()
     );
+    assert_eq!(super::serve::parse_machine_id(""), None);
+    assert_eq!(super::serve::parse_machine_id("uninitialized\n"), None);
+    assert_eq!(
+        super::serve::parse_machine_id("  0123456789abcdef0123456789abcdef\n"),
+        Some("0123456789abcdef0123456789abcdef")
+    );
+    let mid_dir = std::env::temp_dir().join(format!("aterm-a11y-mid-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&mid_dir);
+    std::fs::create_dir_all(&mid_dir).unwrap();
+    let empty_etc = mid_dir.join("etc-machine-id");
+    let uninit_etc = mid_dir.join("uninit-machine-id");
+    let valid_var = mid_dir.join("dbus-machine-id");
+    std::fs::write(&empty_etc, "").unwrap();
+    std::fs::write(&uninit_etc, "uninitialized\n").unwrap();
+    std::fs::write(&valid_var, "89abcdef0123456789abcdef01234567\n").unwrap();
+    assert_eq!(
+        super::serve::machine_id_from_files(&[&empty_etc, &uninit_etc, &valid_var]).as_deref(),
+        Some("89abcdef0123456789abcdef01234567")
+    );
+    assert_eq!(
+        super::serve::machine_id_from_files(&[&empty_etc, &uninit_etc, &mid_dir]),
+        None
+    );
+    let _ = std::fs::remove_dir_all(&mid_dir);
 }
 
 #[test]

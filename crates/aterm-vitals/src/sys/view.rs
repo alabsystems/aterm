@@ -89,19 +89,32 @@ pub(super) fn header_line(
     h
 }
 
+/// When the figures `view` prints were read, their age and their window. A view a snapshot
+/// carries from an earlier reading speaks as of that reading: `why`'s fragment, and the jobs
+/// view of the engine's last pass (a reading the engine did not run on keeps its view), aged by
+/// [`Snapshot::jobs_age_ms`], which the host reads off the one clock the pass and the reading
+/// share.
 fn as_of(view: View, ctx: &Ctx<'_>) -> Option<(u64, u64, Option<u64>)> {
     let snap = ctx.snap?;
-    match snap.why.as_deref().filter(|_| view == View::Why) {
-        Some(f) => {
-            let older = snap.at_ns.saturating_sub(f.at_ns) / 1_000_000;
-            Some((
-                ctx.as_of_unix_ms.saturating_sub(older),
-                ctx.age_ms.saturating_add(older),
+    let carried = match view {
+        View::Why => snap.why.as_deref().map(|f| {
+            (
+                snap.at_ns.saturating_sub(f.at_ns) / 1_000_000,
                 Some(f.window_ns / 1_000_000),
-            ))
-        }
-        None => Some((ctx.as_of_unix_ms, ctx.age_ms, window_ms(snap))),
-    }
+            )
+        }),
+        View::Jobs => snap
+            .jobs
+            .as_deref()
+            .map(|_| (snap.jobs_age_ms, window_ms(snap))),
+        _ => None,
+    };
+    let (older, window) = carried.unwrap_or((0, window_ms(snap)));
+    Some((
+        ctx.as_of_unix_ms.saturating_sub(older),
+        ctx.age_ms.saturating_add(older),
+        window,
+    ))
 }
 
 /// Rate window covered by a snapshot's figures, in milliseconds.
@@ -737,7 +750,7 @@ pub fn render_text(q: &SysQuery, ctx: &Ctx<'_>) -> Reply {
             .map(|e| event_line(ctx, s, e))
             .collect()
     });
-    let hw_notes: Vec<Line> = match (ctx.snap, q.view) {
+    let mut hw_notes: Vec<Line> = match (ctx.snap, q.view) {
         (Some(s), View::Cores | View::Why) => super::hardware::lines(s)
             .into_iter()
             .map(|s| note("cpu_hardware", s))
@@ -761,7 +774,8 @@ pub fn render_text(q: &SysQuery, ctx: &Ctx<'_>) -> Reply {
             View::Disk => disk_text(q, ctx, s, &mut lines),
             View::Net => net_text(q, s, &mut lines),
             View::Procs => procs_text(q, ctx, s, &mut lines),
-            View::Why => why::why_text(q, ctx, s, &mut lines, &hw_notes, &events),
+            View::Why => why::why_text(q, ctx, s, &mut lines, &mut hw_notes, &events),
+            View::Left => super::left::left_text(q, ctx, s, &mut lines),
             View::Report => {
                 lines.push(note("report", "CPU diagnostic report; cause not established. Use --json to export raw evidence."));
                 lines.extend(
@@ -1996,8 +2010,13 @@ fn disk_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
             lines.push(line(
                 format!("dir {n}.{}", rank + 1),
                 format!(
-                    "dir root={n} {place} alloc_bytes={} entries={}",
-                    d.alloc, d.entries
+                    "dir root={n} {place} alloc_bytes={} entries={} walked_s={}",
+                    d.alloc,
+                    d.entries,
+                    r.size
+                        .sizes()
+                        .and_then(|s| s.age_s)
+                        .map_or_else(|| "unavailable(not_sampled)".to_owned(), |s| s.to_string())
                 ),
             ));
         }
@@ -2866,6 +2885,7 @@ pub fn render_json(q: &SysQuery, ctx: &Ctx<'_>) -> Jv {
         }
         View::Why => why::why_json(q, ctx, s, &mut o),
         View::Report => o.set("report", super::hardware::report_json(s)),
+        View::Left => super::left::left_json(q, ctx, s, &mut o),
     }
     if matches!(q.view, View::Cores | View::Procs)
         || (q.view == View::Why && crate::scheduling::idle_performance(s).is_some())
@@ -3565,6 +3585,10 @@ fn disk_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
                         ("rank", Jv::u(rank as u64 + 1)),
                         ("alloc_bytes", Jv::u(d.alloc)),
                         ("entries", Jv::u(d.entries)),
+                        (
+                            "walked_age_s",
+                            Jv::known_or(r.size.sizes().and_then(|s| s.age_s), "not_sampled"),
+                        ),
                     ]);
                     if path_ok {
                         o.set("path", Jv::s(d.rel.clone()));

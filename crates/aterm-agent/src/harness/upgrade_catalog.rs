@@ -81,8 +81,10 @@ fn parse_pairs(s: &str) -> Vec<(String, String)> {
             let (k, v) = kv.split_once(':')?;
             let k = k.trim().trim_matches('"');
             let v = v.trim().strip_prefix('"')?.strip_suffix('"')?;
-            (k.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') && is_model_id(v))
-                .then(|| (k.to_string(), v.to_string()))
+            (!k.is_empty()
+                && k.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+                && is_model_id(v))
+            .then(|| (k.to_string(), v.to_string()))
         })
         .collect()
 }
@@ -192,21 +194,6 @@ pub fn scan_build(binary: &Path) -> BuildFacts {
         let mut hay = std::mem::take(&mut carry);
         let carried = hay.len();
         hay.extend_from_slice(chunk.get(..n).unwrap_or(&[]));
-        let mut from = carried.saturating_sub(VNEEDLE.len() + 24);
-        while let Some(at) = find_from(&hay, VNEEDLE, from) {
-            from = at + 1;
-            if at + VNEEDLE.len() + 24 <= carried {
-                continue;
-            }
-            let v0 = at + VNEEDLE.len();
-            let tail = hay.get(v0..(v0 + 24).min(hay.len())).unwrap_or(&[]);
-            if let Some(end) = tail.iter().position(|&b| b == b'"')
-                && let Some(v) = tail.get(..end).and_then(|t| std::str::from_utf8(t).ok())
-                && is_version(v)
-            {
-                *counts.entry(v.to_string()).or_default() += 1;
-            }
-        }
         if out.baked.is_none()
             && let Some(pos) = find_from(&hay, MARKER, carried.saturating_sub(MARKER.len()))
         {
@@ -221,6 +208,19 @@ pub fn scan_build(binary: &Path) -> BuildFacts {
             let start = pos.saturating_sub(WINDOW_BEFORE);
             let text = String::from_utf8_lossy(hay.get(start..end).unwrap_or(&[]));
             out.baked = parse_window(&text);
+        }
+        let mut from = carried.saturating_sub(VNEEDLE.len() + 24);
+        while let Some(at) = find_from(&hay, VNEEDLE, from) {
+            from = at + 1;
+            let v0 = at + VNEEDLE.len();
+            let tail = hay.get(v0..(v0 + 24).min(hay.len())).unwrap_or(&[]);
+            if let Some(end) = tail.iter().position(|&b| b == b'"')
+                && v0 + end >= carried
+                && let Some(v) = tail.get(..end).and_then(|t| std::str::from_utf8(t).ok())
+                && is_version(v)
+            {
+                *counts.entry(v.to_string()).or_default() += 1;
+            }
         }
         let keep = hay.len().saturating_sub(WINDOW_BEFORE + MARKER.len());
         carry = hay.split_off(keep);
@@ -304,8 +304,11 @@ pub fn parse_facts(text: &str) -> Option<BuildFacts> {
                 .filter_map(|p| {
                     let a = p.as_array()?;
                     let id = a.get(1)?.as_str()?;
-                    let fam = a.first()?.as_str()?.to_string();
-                    is_model_id(id).then(|| (fam, id.to_string()))
+                    let fam = a.first()?.as_str()?;
+                    (!fam.is_empty()
+                        && fam.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+                        && is_model_id(id))
+                    .then(|| (fam.to_string(), id.to_string()))
                 })
                 .collect(),
             models: m
@@ -315,10 +318,20 @@ pub fn parse_facts(text: &str) -> Option<BuildFacts> {
                     if !is_model_id(id) {
                         return None;
                     }
+                    let family = o
+                        .get("family")?
+                        .as_str()
+                        .filter(|f| !f.is_empty() && f.bytes().all(|b| b.is_ascii_lowercase()))?;
+                    let display_name = o.get("display_name")?.as_str().filter(|d| {
+                        !d.is_empty()
+                            && !d
+                                .chars()
+                                .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+                    })?;
                     Some(BakedModel {
                         id: id.to_string(),
-                        family: o.get("family")?.as_str()?.to_string(),
-                        display_name: o.get("display_name")?.as_str()?.to_string(),
+                        family: family.to_string(),
+                        display_name: display_name.to_string(),
                         native_1m: o.get("native_1m")?.as_bool()?,
                         efforts: o
                             .get("efforts")?
@@ -335,18 +348,26 @@ pub fn parse_facts(text: &str) -> Option<BuildFacts> {
     Some(BuildFacts { baked, version })
 }
 
-/// Returns the target binary path from the last `exec '<path>' "$@"` line of a managed twin shim.
+/// Returns the absolute target binary path from the last line of a managed twin shim:
+/// `exec '/<path>' "$@"` after a `#!/bin/sh` line in a `sh` twin, `@"<path>" %* & @exit /b`
+/// (or the legacy ` %*` tail) in a Windows `.cmd` twin, absolute as Windows reads a path.
 #[must_use]
 pub fn twin_binary(twin_text: &str) -> Option<std::path::PathBuf> {
-    if !twin_text.starts_with("#!/bin/sh\n") {
-        return None;
+    let last = twin_text
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())?
+        .trim();
+    if twin_text.starts_with("#!/bin/sh\n") {
+        let target = atpkg::platform::sh_exec_target(last)?;
+        return target
+            .to_str()
+            .is_some_and(|target| target.starts_with('/'))
+            .then_some(target);
     }
-    let last = twin_text.lines().rev().find(|l| !l.trim().is_empty())?;
-    let quoted = last
-        .trim()
-        .strip_prefix("exec '")?
-        .strip_suffix("' \"$@\"")?;
-    (!quoted.contains('\'') && quoted.starts_with('/')).then(|| std::path::PathBuf::from(quoted))
+    let (path, tail) = last.strip_prefix("@\"")?.split_once('"')?;
+    (matches!(tail, " %* & @exit /b" | " %*") && Path::new(path).is_absolute())
+        .then(|| std::path::PathBuf::from(path))
 }
 
 /// Returns the baked catalog of `binary`, cached under `cache_dir` by path, size, and mtime.
@@ -361,8 +382,9 @@ pub fn baked_cached(binary: &Path, cache_dir: &Path) -> Option<Baked> {
     let key = format!("{}|{}|{mtime}", binary.display(), m.len());
     let h = aterm_hash::fnv1a_64(key.as_bytes());
     let file = cache_dir.join(format!("{h:016x}.json"));
-    if let Some(facts) = std::fs::read_to_string(&file)
+    if let Some(facts) = super::accounts::read_bounded(&file, 1024 * 1024)
         .ok()
+        .flatten()
         .and_then(|t| parse_facts(&t))
     {
         return facts.baked;
@@ -376,6 +398,35 @@ pub fn baked_cached(binary: &Path, cache_dir: &Path) -> Option<Baked> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_twin_names_its_binary_in_either_dialect_and_only_absolutely() {
+        let sh = |p: &str| format!("#!/bin/sh\nexec '{p}' \"$@\"\n");
+        let cmd = |p: &str| format!("@echo off\r\n@\"{p}\" %* & @exit /b\r\n");
+        let named = |p: &str| Some(std::path::PathBuf::from(p));
+        assert_eq!(twin_binary(&sh("/s/codex")), named("/s/codex"));
+        let windows = if cfg!(windows) {
+            r"C:\s\codex.exe"
+        } else {
+            "/s/codex"
+        };
+        assert_eq!(twin_binary(&cmd(windows)), named(windows));
+        assert_eq!(
+            twin_binary(&format!("@\"{windows}\" %*\r\n")),
+            named(windows),
+            "the legacy tail"
+        );
+        for relative in ["s/codex", r"s\codex.exe"] {
+            assert_eq!(twin_binary(&sh(relative)), None, "{relative}");
+            assert_eq!(twin_binary(&cmd(relative)), None, "{relative}");
+        }
+        assert_eq!(
+            twin_binary(&sh(r"C:\s\codex.exe")),
+            None,
+            "a sh twin names a `/` path"
+        );
+        assert_eq!(twin_binary(&format!("@\"{windows}\" %* & echo\r\n")), None);
+    }
 
     const WINDOW: &str = concat!(
         r#"models:[{id:"claude-opus-5",family:"opus",display_name:"Opus 5",knowledge_cutoff:"May 2026","#,
@@ -426,14 +477,16 @@ mod tests {
 
     #[test]
     fn the_scan_finds_a_marker_across_a_chunk_boundary() {
+        const BOUNDARY_SINGLE: &[u8] = b"VERSION:\"9.9.9\"";
         let dir =
             std::env::temp_dir().join(format!("aterm-upgrade-catalog-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
         let path = dir.join("claude");
-        let mut bytes = vec![b'x'; CHUNK - 100];
+        let mut bytes = vec![b'x'; CHUNK - 15 - BOUNDARY_SINGLE.len()];
+        bytes.extend_from_slice(BOUNDARY_SINGLE);
         bytes.extend_from_slice(WINDOW.as_bytes());
         bytes.extend(std::iter::repeat_n(b'y', 1000));
-        bytes.extend_from_slice(b"VERSION:\"2.0.0\" VERSION:\"2.1.281\" VERSION:\"2.1.281\"");
+        bytes.extend_from_slice(b"VERSION:\"2.1.281\" VERSION:\"2.1.281\"");
         std::fs::write(&path, &bytes).expect("write");
         let f = scan_build(&path);
         let b = f.baked.expect("found");
@@ -442,7 +495,23 @@ mod tests {
         assert_eq!(
             f.version.as_deref(),
             Some("2.1.281"),
-            "the most frequent literal wins"
+            "the most frequent literal wins without double-counting carry"
+        );
+
+        let mut near_end = vec![b'x'; CHUNK - WINDOW.len()];
+        near_end.extend_from_slice(WINDOW.as_bytes());
+        assert_eq!(near_end.len(), CHUNK);
+        near_end.extend_from_slice(b"VERSION:\"2.1.281\" VERSION:\"2.1.281\"");
+        std::fs::write(&path, &near_end).expect("write");
+        let f2 = scan_build(&path);
+        assert_eq!(
+            f2.baked.as_ref().and_then(|b| b.latest("opus")),
+            Some("claude-opus-5-5")
+        );
+        assert_eq!(
+            f2.version.as_deref(),
+            Some("2.1.281"),
+            "a marker near chunk end still scans version literals in the lookahead window"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -470,5 +539,15 @@ mod tests {
         ] {
             assert_eq!(twin_binary(other), None, "{other}");
         }
+        let facts = parse_facts(
+            r#"{"version":"2.1.281","latest_per_family":[["","claude-opus-5-5"],["opus","claude-opus-5-5"]],"models":[{"id":"claude-opus-5-5","family":"OPUS","display_name":"Opus","native_1m":true,"efforts":[]},{"id":"claude-sonnet-5-5","family":"sonnet","display_name":"Sonnet\u0007","native_1m":false,"efforts":[]}]}"#,
+        )
+        .expect("parsed");
+        let baked = facts.baked.expect("baked");
+        assert_eq!(
+            baked.latest_per_family,
+            vec![("opus".to_string(), "claude-opus-5-5".to_string())]
+        );
+        assert!(baked.models.is_empty());
     }
 }

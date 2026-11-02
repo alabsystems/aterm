@@ -11,7 +11,7 @@
 use super::Direction;
 use super::ShapeFace;
 use super::apply::{
-    ApplyContext, Outcome, SkippyIter, apply_chain_context_lookup, apply_context_lookup,
+    ApplyContext, Budget, Outcome, SkippyIter, apply_chain_context_lookup, apply_context_lookup,
 };
 use super::buffer::{Attachment, Buffer, GlyphPosition, SCRATCH_HAS_GPOS_ATTACHMENT};
 use super::face::{PosLookup, lookup_flags};
@@ -35,6 +35,9 @@ pub(crate) fn apply_lookup(ctx: &mut ApplyContext, lookup: &PosLookup) -> Option
         return None;
     }
     for subtable in &lookup.subtables {
+        if !ctx.budget.charge() {
+            return None;
+        }
         if apply_subtable(ctx, subtable).is_some() {
             return Some(());
         }
@@ -290,6 +293,7 @@ fn apply_cursive(ctx: &mut ApplyContext, table: &CursiveAdjustment<'_>) -> Optio
     reverse_cursive_minor_offset(
         &mut ctx.buffer.pos[..len],
         &mut ctx.buffer.attach[..len],
+        &ctx.budget,
         child,
         direction,
         parent,
@@ -320,9 +324,31 @@ fn apply_cursive(ctx: &mut ApplyContext, table: &CursiveAdjustment<'_>) -> Optio
     Some(())
 }
 
+fn apply_reversed_cursive_minor_offset(
+    pos: &mut [GlyphPosition],
+    attach: &mut [Attachment],
+    curr: usize,
+    next: usize,
+    chain: i16,
+    kind: u8,
+    direction: Direction,
+) {
+    if direction.is_horizontal() {
+        pos[next].y_offset = pos[curr].y_offset.wrapping_neg();
+    } else {
+        pos[next].x_offset = pos[curr].x_offset.wrapping_neg();
+    }
+
+    attach[next] = Attachment {
+        chain: chain.wrapping_neg(),
+        kind,
+    };
+}
+
 fn reverse_cursive_minor_offset(
     pos: &mut [GlyphPosition],
     attach: &mut [Attachment],
+    budget: &Budget,
     i: usize,
     direction: Direction,
     new_parent: usize,
@@ -345,18 +371,36 @@ fn reverse_cursive_minor_offset(
         return;
     }
 
-    reverse_cursive_minor_offset(pos, attach, j, direction, new_parent);
-
-    if direction.is_horizontal() {
-        pos[j].y_offset = pos[i].y_offset.wrapping_neg();
-    } else {
-        pos[j].x_offset = pos[i].x_offset.wrapping_neg();
+    if attach[j].chain == 0 || attach[j].kind & attach_type::CURSIVE == 0 {
+        apply_reversed_cursive_minor_offset(pos, attach, i, j, chain, kind, direction);
+        return;
     }
 
-    attach[j] = Attachment {
-        chain: chain.wrapping_neg(),
-        kind,
-    };
+    let mut stack = vec![(i, j, chain, kind)];
+    let mut curr = j;
+    loop {
+        let c = attach[curr].chain;
+        let k = attach[curr].kind;
+        if c == 0 || k & attach_type::CURSIVE == 0 {
+            break;
+        }
+        attach[curr].chain = 0;
+        let Some(next) = curr
+            .checked_add_signed(isize::from(c))
+            .filter(|&next| next < pos.len())
+        else {
+            break;
+        };
+        if next == new_parent || !budget.charge() {
+            break;
+        }
+        stack.push((curr, next, c, k));
+        curr = next;
+    }
+
+    while let Some((curr, next, c, k)) = stack.pop() {
+        apply_reversed_cursive_minor_offset(pos, attach, curr, next, c, k, direction);
+    }
 }
 
 fn apply_mark_array(
@@ -420,6 +464,9 @@ fn apply_mark_to_base(ctx: &mut ApplyContext, table: &MarkToBaseAdjustment<'_>) 
         let mut j = ctx.buffer.idx;
         let stop = ctx.last_base_until as usize;
         while j > stop {
+            if !ctx.budget.charge() {
+                return None;
+            }
             let mut outcome = iter.match_(&ctx.buffer.info[j - 1]);
             if outcome == Outcome::Match
                 && !accept_base(ctx.buffer, j - 1)
@@ -477,6 +524,9 @@ fn apply_mark_to_ligature(
         let mut j = ctx.buffer.idx;
         let stop = ctx.last_base_until as usize;
         while j > stop {
+            if !ctx.budget.charge() {
+                return None;
+            }
             if iter.match_(&ctx.buffer.info[j - 1]) == Outcome::Match {
                 found = i32::try_from(j - 1).ok();
                 break;
@@ -573,10 +623,12 @@ pub(crate) fn propagate_attachments(buffer: &mut Buffer) {
     }
     let len = buffer.len;
     let direction = buffer.direction;
+    let advances = advance_sums(&buffer.pos[..len]);
     for i in 0..len {
         propagate_attachment_offsets(
             &mut buffer.pos[..len],
             &mut buffer.attach[..len],
+            &advances,
             len,
             i,
             direction,
@@ -584,9 +636,76 @@ pub(crate) fn propagate_attachments(buffer: &mut Buffer) {
     }
 }
 
+/// The running sums of the glyphs' advances, `sums[k]` totalling glyphs `..k`, wrapping as
+/// adding them one at a time wraps. A mark moves back by the advances between it and its base:
+/// two of these sums give them in one step, where adding them up mark by mark costs the square
+/// of a run of marks on one base.
+fn advance_sums(pos: &[GlyphPosition]) -> Vec<(i32, i32)> {
+    #[cfg(all(any(test, debug_assertions), not(trust_verify)))]
+    crate::work::note(|s| s.attachment_steps += pos.len() as u64);
+    let mut sums = Vec::with_capacity(pos.len() + 1);
+    let mut sum = (0i32, 0i32);
+    sums.push(sum);
+    for p in pos {
+        sum = (
+            sum.0.wrapping_add(p.x_advance),
+            sum.1.wrapping_add(p.y_advance),
+        );
+        sums.push(sum);
+    }
+    sums
+}
+
+fn apply_propagated_attachment_offset(
+    pos: &mut [GlyphPosition],
+    advances: &[(i32, i32)],
+    curr: usize,
+    next: usize,
+    kind: u8,
+    direction: Direction,
+) {
+    #[cfg(all(any(test, debug_assertions), not(trust_verify)))]
+    crate::work::note(|s| s.attachment_steps += 1);
+    match kind {
+        attach_type::MARK if next < curr => {
+            pos[curr].x_offset = pos[curr].x_offset.wrapping_add(pos[next].x_offset);
+            pos[curr].y_offset = pos[curr].y_offset.wrapping_add(pos[next].y_offset);
+
+            // Forward, less the advances of `next..curr`; backward, plus those of
+            // `next + 1..=curr`.
+            if direction.is_forward() {
+                let (x, y) = advances_between(advances, next, curr);
+                pos[curr].x_offset = pos[curr].x_offset.wrapping_sub(x);
+                pos[curr].y_offset = pos[curr].y_offset.wrapping_sub(y);
+            } else {
+                let (x, y) = advances_between(advances, next + 1, curr + 1);
+                pos[curr].x_offset = pos[curr].x_offset.wrapping_add(x);
+                pos[curr].y_offset = pos[curr].y_offset.wrapping_add(y);
+            }
+        }
+        attach_type::CURSIVE => {
+            if direction.is_horizontal() {
+                pos[curr].y_offset = pos[curr].y_offset.wrapping_add(pos[next].y_offset);
+            } else {
+                pos[curr].x_offset = pos[curr].x_offset.wrapping_add(pos[next].x_offset);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The advances of glyphs `start..end`, from [`advance_sums`].
+fn advances_between(advances: &[(i32, i32)], start: usize, end: usize) -> (i32, i32) {
+    (
+        advances[end].0.wrapping_sub(advances[start].0),
+        advances[end].1.wrapping_sub(advances[start].1),
+    )
+}
+
 fn propagate_attachment_offsets(
     pos: &mut [GlyphPosition],
     attach: &mut [Attachment],
+    advances: &[(i32, i32)],
     len: usize,
     i: usize,
     direction: Direction,
@@ -606,32 +725,31 @@ fn propagate_attachment_offsets(
         return;
     };
 
-    propagate_attachment_offsets(pos, attach, len, j, direction);
+    if attach[j].chain == 0 {
+        apply_propagated_attachment_offset(pos, advances, i, j, kind, direction);
+        return;
+    }
 
-    match kind {
-        attach_type::MARK if j < i => {
-            pos[i].x_offset = pos[i].x_offset.wrapping_add(pos[j].x_offset);
-            pos[i].y_offset = pos[i].y_offset.wrapping_add(pos[j].y_offset);
+    let mut stack = vec![(i, j, kind)];
+    let mut curr = j;
+    loop {
+        let c = attach[curr].chain;
+        if c == 0 {
+            break;
+        }
+        let k = attach[curr].kind;
+        attach[curr].chain = 0;
+        let Some(next) = curr
+            .checked_add_signed(isize::from(c))
+            .filter(|&next| next < len)
+        else {
+            break;
+        };
+        stack.push((curr, next, k));
+        curr = next;
+    }
 
-            if direction.is_forward() {
-                for k in j..i {
-                    pos[i].x_offset = pos[i].x_offset.wrapping_sub(pos[k].x_advance);
-                    pos[i].y_offset = pos[i].y_offset.wrapping_sub(pos[k].y_advance);
-                }
-            } else {
-                for k in j + 1..=i {
-                    pos[i].x_offset = pos[i].x_offset.wrapping_add(pos[k].x_advance);
-                    pos[i].y_offset = pos[i].y_offset.wrapping_add(pos[k].y_advance);
-                }
-            }
-        }
-        attach_type::CURSIVE => {
-            if direction.is_horizontal() {
-                pos[i].y_offset = pos[i].y_offset.wrapping_add(pos[j].y_offset);
-            } else {
-                pos[i].x_offset = pos[i].x_offset.wrapping_add(pos[j].x_offset);
-            }
-        }
-        _ => {}
+    while let Some((curr, next, k)) = stack.pop() {
+        apply_propagated_attachment_offset(pos, advances, curr, next, k, direction);
     }
 }

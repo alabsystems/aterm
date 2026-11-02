@@ -240,6 +240,15 @@ fn vref_of(r: &Rec) -> Option<&str> {
     }
 }
 
+/// Whether a bus body carries a field past its header.
+fn carries_a_field(body: &str) -> bool {
+    !aterm_slog::decode_bus(body)
+        .expect("a bus body decodes")
+        .rec
+        .f
+        .is_empty()
+}
+
 fn vendor(r: &Rec, conf: Conf) {
     assert_eq!(
         (r.src, r.by, r.conf),
@@ -379,6 +388,20 @@ pub(crate) fn a_prompt_after_the_settle_confirms_the_closed_turn_late() {
     assert_eq!((recs.len(), recs[0].op, recs[0].node), (1, Op::Amend, t1));
     assert_eq!(r.log.state().last[1].as_ref().map(|c| c.node), Some(t1));
     assert_eq!(r.tr.tx_view().mapped, Some(t1));
+    // The late match's `vref=` amend is a host fact alone: no take of the log publishes it as
+    // an amend of nothing (fix unit E5, E2E-16).
+    let take = r
+        .log
+        .clone()
+        .bus_copy(64, at(r.now))
+        .encode(aterm_slog::Tier::WireMeta, &|_: &ShortId| None);
+    assert!(
+        !take
+            .slots
+            .iter()
+            .any(|s| s.body.contains(" op=amend ") && !carries_a_field(&s.body)),
+        "{take:#?}"
+    );
 
     let mut r = Rig::bound();
     r.see(Verdict::Busy);

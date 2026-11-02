@@ -292,6 +292,57 @@ fn the_stuck_line_left_at_a_break_is_settled_at_the_next_look() {
     }
 }
 
+/// THE WORDS STANDING ARE ASKED ABOUT ONCE: a line the withdrawn `prompt` left holds the point as
+/// aterm's own words ([`OWN_WORDS_STAND`]), and a look at the unchanged composer decides nothing:
+/// it reads the composer as the point was decided on it, or each look would raise the badge again.
+/// NEGATIVE CONTROL: the words cleared, the next look decides.
+#[test]
+fn own_words_a_withdrawn_prompt_left_are_decided_once_until_they_clear() {
+    let ran = Run {
+        host: wake_host(&[job_wake(1, WakeState::Ready)]),
+        standing: Some(1),
+        policy_from: Some((1, points(Occupancy::Observe))),
+        ..Run::new(
+            "left-withdrawn-looks",
+            points(Occupancy::Prompt),
+            &[
+                (0, Step::Break),
+                (6 * 60, Step::End),
+                (6 * 60 + 1, Step::Look),
+                (6 * 60 + 2, Step::Look),
+                (6 * 60 + 3, Step::Look),
+            ],
+        )
+    }
+    .run(&[], &mut |s, _, i| {
+        if i == 0 {
+            s.set_local_lookup(|_| Some(0));
+            s.ctl
+                .m
+                .key_replies
+                .push_back(ok("OK skipped reason=person seq=101\n"));
+        }
+        if i == 4 {
+            s.ctl.m.screens = vec![ran_then_ended(
+                "Stage 1 of the parser is in; the lexer is next.",
+            )];
+            s.ctl.m.screen_cols.clear();
+        }
+    });
+    assert_eq!(
+        ran.decided,
+        [
+            format!(
+                "{:?}",
+                TurnEndAction::Escalate {
+                    reason: OWN_WORDS_STAND.to_string()
+                }
+            ),
+            LOOK_DECIDED.to_string(),
+        ],
+    );
+}
+
 /// THE OWNER'S `prompt` WITHDRAWN OVER A LINE IT LEFT (the slice-2 plan's 2.9b edge, decided under
 /// the safety lens: nothing `prompt` typed is submitted under `observe`): a wake's line left at a
 /// break, the next point's composer still holding it and the owner's mode now `observe`, the

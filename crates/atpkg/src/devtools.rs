@@ -385,7 +385,13 @@ fn log_when_needed(
 /// (`aterm_types::dirs::aterm_config_path`).
 fn config_observer_off() -> bool {
     aterm_types::dirs::aterm_config_path()
-        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|path| {
+            crate::metadata_io::read_bounded_regular_utf8_follow_final_links(
+                &path,
+                crate::config::MAX_PACKAGES_CONFIG_BYTES,
+            )
+            .ok()
+        })
         .is_some_and(|text| observer_off_in(&text))
 }
 
@@ -620,8 +626,10 @@ pub fn brief(facts: &Facts) -> Option<String> {
 
 /// The `devtools:` row's words for `held` programs (at least one) of this user that macOS's
 /// program check holds now. A one-shot reading has no first sighting, so the age is the oldest
-/// one's fork age, an upper bound: "started … ago", never "held for".
-fn held_words(held: aterm_uds::process::HeldNow) -> String {
+/// one's fork age, an upper bound: "started … ago", never "held for". Doctor's line on a prime it
+/// holds back says the same.
+#[must_use]
+pub fn held_words(held: aterm_uds::process::HeldNow) -> String {
     let age = aterm_uds::process::held_age(held.oldest_ms);
     if held.count == 1 {
         format!("now 1 program of this user waits for macOS's program check; it started {age} ago")
@@ -669,12 +677,51 @@ impl Listed {
     }
 }
 
+/// An aterm instance's own reading of the Developer Tools list, made inside its bundle: the
+/// bundle id it is about and its row's word (`on`, `off`, `absent` or `unknown`), as
+/// `aterm ctl privacy --json` gives them (`devtools.subject`, `devtools.list`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowList {
+    /// The bundle id the reading is about.
+    pub subject: String,
+    /// The row's word.
+    pub list: String,
+}
+
+/// The word for the row of the app whose bundle id is `app_id`: the list as read here
+/// ([`Listed::of`]), `window` never asked, unless this program's read was refused for running
+/// outside a `.app` (verify from a checkout); then `window` is asked once, and its reading,
+/// made inside the bundle of the instance verify runs in, is the word when it is about
+/// `app_id`; otherwise [`Listed::Unknown`].
+#[must_use]
+pub fn listed_word(
+    local: &DevToolList,
+    app_id: &str,
+    window: impl FnOnce() -> Option<WindowList>,
+) -> Listed {
+    if local.label != DevToolListLabel::RefusedOutOfBundle {
+        return Listed::of(local);
+    }
+    match window() {
+        Some(w) if w.subject == app_id => match w.list.as_str() {
+            "on" => Listed::Yes,
+            "off" | "absent" => Listed::No,
+            _ => Listed::Unknown,
+        },
+        _ => Listed::Unknown,
+    }
+}
+
 /// The app macOS holds responsible for `pid` (its display name; `None` when macOS names none)
 /// and whether the Developer Tools list holds that app's bundle switched on. The list is read
 /// under the probe's own fence ([`consent::probe_devtool_list`]), which judges the running
-/// executable: a program outside a `.app` (verify, a test binary) reads [`Listed::Unknown`].
+/// executable: a program outside a `.app` (verify, a test binary) is refused the read, and its
+/// word is what `window` reads, asked only then ([`listed_word`]).
 #[must_use]
-pub fn listed_for_responsible(pid: i32) -> (Option<String>, Listed) {
+pub fn listed_for_responsible(
+    pid: i32,
+    window: impl FnOnce() -> Option<WindowList>,
+) -> (Option<String>, Listed) {
     let Some(app) = consent::responsible_app(pid) else {
         return (None, Listed::Unknown);
     };
@@ -682,7 +729,11 @@ pub fn listed_for_responsible(pid: i32) -> (Option<String>, Listed) {
     let listed = consent::app_bundle_root(&app.path)
         .and_then(|root| consent::bundle_id_of(&root, &protected))
         .map_or(Listed::Unknown, |id| {
-            Listed::of(&consent::probe_devtool_list(ProbeGate::on(), &id))
+            listed_word(
+                &consent::probe_devtool_list(ProbeGate::on(), &id),
+                &id,
+                window,
+            )
         });
     (Some(app.display_name), listed)
 }
@@ -861,7 +912,9 @@ impl PageMarkers {
     /// [`Self::last_opened`] with `<state>` given.
     #[must_use]
     pub fn last_opened_in(self, state: &std::path::Path) -> Option<(String, u64)> {
-        let text = std::fs::read_to_string(state.join(self.opened)).ok()?;
+        let text =
+            crate::metadata_io::read_bounded_regular_utf8(&state.join(self.opened), 64 * 1024)
+                .ok()?;
         text.lines().filter_map(parse_opened).next_back()
     }
 
@@ -882,7 +935,10 @@ impl PageMarkers {
     /// [`Self::opened_as`] with `<state>` given; a file that cannot be read names nothing.
     #[must_use]
     pub fn opened_as_in(self, state: &std::path::Path, key: &str) -> Option<(String, u64)> {
-        let read = |name: &str| std::fs::read_to_string(state.join(name)).unwrap_or_default();
+        let read = |name: &str| {
+            crate::metadata_io::read_bounded_regular_utf8(&state.join(name), 64 * 1024)
+                .unwrap_or_default()
+        };
         let by: Vec<(String, u64)> = read(&self.opened_by())
             .lines()
             .filter_map(parse_opened)
@@ -1001,7 +1057,10 @@ impl PageMarkers {
         key: &str,
         now: u64,
     ) -> std::io::Result<()> {
-        let read = |name: &str| std::fs::read_to_string(state.join(name)).unwrap_or_default();
+        let read = |name: &str| {
+            crate::metadata_io::read_bounded_regular_utf8(&state.join(name), 64 * 1024)
+                .unwrap_or_default()
+        };
         let by = self.opened_by();
         let by_text = read(&by);
         let by_lines: Vec<(String, u64)> = by_text.lines().filter_map(parse_opened).collect();
@@ -1033,7 +1092,9 @@ impl PageMarkers {
     /// [`Self::declined_until`] with `<state>` and the clock (`now`, unix seconds) given.
     #[must_use]
     pub fn declined_until_in(self, state: &std::path::Path, now: u64) -> Option<Declined> {
-        let text = std::fs::read_to_string(state.join(self.declined)).ok()?;
+        let text =
+            crate::metadata_io::read_bounded_regular_utf8(&state.join(self.declined), 64 * 1024)
+                .ok()?;
         decline_holding(&text, now)
     }
 
@@ -1046,7 +1107,9 @@ impl PageMarkers {
     /// [`Self::last_declined`] with `<state>` given.
     #[must_use]
     pub fn last_declined_in(self, state: &std::path::Path) -> Option<(String, u64)> {
-        let text = std::fs::read_to_string(state.join(self.declined)).ok()?;
+        let text =
+            crate::metadata_io::read_bounded_regular_utf8(&state.join(self.declined), 64 * 1024)
+                .ok()?;
         text.lines().filter_map(parse_opened).next_back()
     }
 
@@ -1073,7 +1136,8 @@ impl PageMarkers {
     ) -> std::io::Result<()> {
         let _ = aterm_types::fs_restricted::create_dir_all_unshared(state, 0o755);
         let path = state.join(self.declined);
-        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let text =
+            crate::metadata_io::read_bounded_regular_utf8(&path, 64 * 1024).unwrap_or_default();
         write_marker(&path, &with_decline(&text, version, now))
     }
 }
@@ -1233,7 +1297,10 @@ fn opened_ago(at: u64, now: u64, window_s: u64) -> Option<u64> {
 /// One marker line, `<key> <unix seconds>`. Pure.
 fn parse_opened(text: &str) -> Option<(String, u64)> {
     let mut words = text.split_whitespace();
-    let (version, at) = (words.next()?, words.next()?.parse().ok()?);
+    let (version, at) = (
+        words.next()?,
+        words.next().filter(|s| !s.starts_with('+'))?.parse().ok()?,
+    );
     words.next().is_none().then(|| (version.to_string(), at))
 }
 
@@ -1345,13 +1412,13 @@ pub fn await_switch(
     read: impl Fn(&str) -> DevToolList,
     ended: impl Fn() -> bool,
 ) -> DevToolList {
-    let until = std::time::Instant::now() + limit;
+    let until = std::time::Instant::now().checked_add(limit);
     loop {
         let list = read(subject);
         if list.listing == DevToolListing::On
             || list.label != DevToolListLabel::Read
             || ended()
-            || std::time::Instant::now() >= until
+            || until.is_some_and(|u| std::time::Instant::now() >= u)
         {
             return list;
         }
@@ -1419,72 +1486,139 @@ fn prime_command(bundle: &std::path::Path) -> aterm_uds::spawnfd::Command {
     command
 }
 
+/// Why [`refresh_verdict`] did not make macOS ask about aterm again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RefreshFailed {
+    /// The prime's new program did not finish before its ceiling: macOS's program check holds it
+    /// in a backed-up queue (the leftover-processes design's U14). It is no refusal and says
+    /// nothing of the grant, so it is asked again once the queue drains. It carries the words
+    /// that said so where the prime said any (its first line, which names the copy it kept).
+    NotSettled(Option<String>),
+    /// It could not run, or it was refused: the first line of why.
+    Failed(String),
+}
+
+/// What [`RefreshFailed::NotSettled`] says when the prime said nothing of its own.
+const NOT_SETTLED: &str = "not settled: macOS's queue is backed up";
+
+impl std::fmt::Display for RefreshFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotSettled(said) => f.write_str(said.as_deref().unwrap_or(NOT_SETTLED)),
+            Self::Failed(why) => f.write_str(why),
+        }
+    }
+}
+
+/// [`PRIME_VERB`]'s exit when its new program did not finish before [`PRIME_CEILING`]
+/// (`EX_TEMPFAIL`): [`refresh_verdict`] reads it as [`RefreshFailed::NotSettled`].
+pub const PRIME_UNSETTLED: u8 = 75;
+
 /// Make macOS assess aterm again once the owner switched it on: [`run_prime`] in aterm's own
 /// executable, started as its own responsible process.
 ///
 /// # Errors
-/// Why it could not run: not a bundled aterm, a macOS without the responsibility attribute
-/// (`aterm_uds::spawnfd::Command::disclaim_responsibility`), or the verb's own first line of
-/// complaint.
-pub fn refresh_verdict() -> Result<(), String> {
+/// [`RefreshFailed::NotSettled`] when the prime, or the verb that runs it, did not finish in
+/// time; [`RefreshFailed::Failed`] with why it could not run: not a bundled aterm, a macOS
+/// without the responsibility attribute (`aterm_uds::spawnfd::Command::disclaim_responsibility`),
+/// or the verb's own first line of complaint.
+pub fn refresh_verdict() -> Result<(), RefreshFailed> {
     #[cfg(target_os = "macos")]
     {
-        let exe = consent::fence_exe().ok_or("aterm's own executable is unknown")?;
-        let bundle = consent::app_bundle_root(&exe)
-            .ok_or("not a bundled aterm, which is what macOS asks about")?;
-        let out = aterm_uds::deadline::output_until(
+        let exe = consent::fence_exe()
+            .ok_or_else(|| RefreshFailed::Failed("aterm's own executable is unknown".into()))?;
+        let bundle = consent::app_bundle_root(&exe).ok_or_else(|| {
+            RefreshFailed::Failed("not a bundled aterm, which is what macOS asks about".into())
+        })?;
+        refresh_outcome(aterm_uds::deadline::output_until(
             prime_command(&bundle).disclaim_responsibility(true),
             std::time::Instant::now() + PRIME_CEILING + REACH_CEILING * 2,
-        )
-        .map_err(|e| format!("aterm pkg {PRIME_VERB}: {e}"))?;
-        if out.status.success() {
-            return Ok(());
-        }
-        let said = String::from_utf8_lossy(&out.stderr);
-        let first = said.lines().next().unwrap_or_default().trim();
-        Err(if first.is_empty() {
-            format!("aterm pkg {PRIME_VERB} exited {:?}", out.status.code())
-        } else {
-            crate::progress::sanitize_for_tty(first, 160)
-        })
+        ))
     }
     #[cfg(not(target_os = "macos"))]
     {
-        Err("the Developer Tools list is macOS's".to_string())
+        Err(RefreshFailed::Failed(
+            "the Developer Tools list is macOS's".to_string(),
+        ))
     }
 }
 
+/// How many characters of [`PRIME_VERB`]'s first line [`refresh_outcome`] keeps: room for the
+/// path of the copy a prime that did not settle kept.
+#[cfg(any(target_os = "macos", test))]
+const SAID_CAP: usize = 320;
+
+/// What [`PRIME_VERB`]'s run says of the refresh: its exit 0 took; a run that outlived its
+/// deadline, or a [`PRIME_UNSETTLED`] exit (with the verb's first line, which names the copy it
+/// kept), did not settle; anything else failed, with the verb's first line of complaint or its
+/// exit.
+#[cfg(any(target_os = "macos", test))]
+fn refresh_outcome(
+    ran: Result<std::process::Output, aterm_uds::deadline::RunError>,
+) -> Result<(), RefreshFailed> {
+    let out = match ran {
+        Ok(out) => out,
+        Err(aterm_uds::deadline::RunError::TimedOut) => {
+            return Err(RefreshFailed::NotSettled(None));
+        }
+        Err(e) => {
+            return Err(RefreshFailed::Failed(format!(
+                "aterm pkg {PRIME_VERB}: {e}"
+            )));
+        }
+    };
+    if out.status.success() {
+        return Ok(());
+    }
+    let said = String::from_utf8_lossy(&out.stderr);
+    let first = said.lines().next().unwrap_or_default().trim();
+    let first = (!first.is_empty()).then(|| crate::progress::sanitize_for_tty(first, SAID_CAP));
+    if out.status.code() == Some(i32::from(PRIME_UNSETTLED)) {
+        return Err(RefreshFailed::NotSettled(first));
+    }
+    Err(RefreshFailed::Failed(first.unwrap_or_else(|| {
+        format!("aterm pkg {PRIME_VERB} exited {:?}", out.status.code())
+    })))
+}
+
 /// [`PRIME_VERB`]: start one program nobody has assessed, so macOS asks about this process
-/// (aterm, started as its own responsible process by [`refresh_verdict`]), and then exit.
+/// (aterm, started as its own responsible process by [`refresh_verdict`]), and then exit: 0 once
+/// it ran, [`PRIME_UNSETTLED`] when it did not finish in time, 1 otherwise.
 pub fn run_prime() -> std::process::ExitCode {
     match prime() {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(why) => {
             eprintln!("aterm pkg {PRIME_VERB}: {why}");
-            std::process::ExitCode::FAILURE
+            match why {
+                RefreshFailed::NotSettled(_) => std::process::ExitCode::from(PRIME_UNSETTLED),
+                RefreshFailed::Failed(_) => std::process::ExitCode::FAILURE,
+            }
         }
     }
 }
 
 /// [`run_prime`]'s work.
-fn prime() -> Result<(), String> {
+fn prime() -> Result<(), RefreshFailed> {
     #[cfg(target_os = "macos")]
     {
+        let failed = RefreshFailed::Failed;
         let by = std::time::Instant::now() + REACH_CEILING + PRIME_CEILING;
-        let token = aterm_uds::rand::hex_token::<8>().map_err(|e| format!("no name: {e}"))?;
+        let token =
+            aterm_uds::rand::hex_token::<8>().map_err(|e| failed(format!("no name: {e}")))?;
         let dir = std::env::temp_dir().join(format!("aterm-devtools-prime-{token}"));
-        crate::prereq::private_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        crate::prereq::private_dir(&dir).map_err(|e| failed(format!("{}: {e}", dir.display())))?;
         let remove = crate::prereq::RemoveOnDrop(&dir);
         let name = format!("aterm-devtools-{token}");
         let program = dir.join(&name);
-        std::fs::copy("/usr/bin/true", &program).map_err(|e| format!("copy: {e}"))?;
+        std::fs::copy("/usr/bin/true", &program).map_err(|e| failed(format!("copy: {e}")))?;
         let program = program
             .to_str()
-            .ok_or("the private directory's path is not UTF-8")?;
+            .ok_or_else(|| failed("the private directory's path is not UTF-8".into()))?;
         run_quietly(
             "/usr/bin/codesign",
             &["--force", "--sign", "-", "--identifier", &name, program],
-        )?;
+        )
+        .map_err(failed)?;
         let out = match aterm_uds::deadline::output_until(
             &mut aterm_uds::spawnfd::command(program),
             by,
@@ -1495,30 +1629,107 @@ fn prime() -> Result<(), String> {
                 // Killed, signalled or unstarted: macOS may still be assessing its first exec.
                 std::mem::forget(remove);
                 let why = match other {
+                    Err(aterm_uds::deadline::RunError::TimedOut) => {
+                        return Err(RefreshFailed::NotSettled(Some(format!(
+                            "{NOT_SETTLED}; kept {} since {name} never showed it ran",
+                            dir.display()
+                        ))));
+                    }
                     Ok(out) => format!("ended by {}", out.status),
                     Err(e) => e.to_string(),
                 };
-                return Err(format!(
+                return Err(failed(format!(
                     "{name}: {why}; kept {} since it never showed it ran",
                     dir.display()
-                ));
+                )));
             }
         };
         if out.status.success() {
             Ok(())
         } else {
-            Err(format!("{name} exited {:?}", out.status.code()))
+            Err(failed(format!("{name} exited {:?}", out.status.code())))
         }
     }
     #[cfg(not(target_os = "macos"))]
     {
-        Err("the Developer Tools list is macOS's".to_string())
+        Err(RefreshFailed::Failed(
+            "the Developer Tools list is macOS's".to_string(),
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A prime whose program outlived its ceiling, inside the verb (its [`PRIME_UNSETTLED`] exit)
+    /// or around it (the verb's own run timed out), did not settle: macOS's queue is backed up,
+    /// which says nothing of the grant. The verb's own line names the copy it kept. A verb that
+    /// could not run or exited otherwise failed, with its first line of complaint.
+    #[test]
+    fn a_timed_out_prime_is_not_settled_and_a_refusal_is_a_failure() {
+        use aterm_uds::deadline::RunError;
+        let exited = |code: i32, stderr: &str| {
+            #[cfg(unix)]
+            let status = std::os::unix::process::ExitStatusExt::from_raw(code << 8);
+            #[cfg(windows)]
+            let status = std::os::windows::process::ExitStatusExt::from_raw(code.unsigned_abs());
+            Ok(std::process::Output {
+                status,
+                stdout: Vec::new(),
+                stderr: stderr.as_bytes().to_vec(),
+            })
+        };
+        assert_eq!(refresh_outcome(exited(0, "")), Ok(()));
+        let kept = "aterm pkg __devtools-prime: not settled: macOS's queue is backed up; kept \
+                    /var/folders/l5/abcdefghijklmnopqrstuvwxyz01/T/aterm-devtools-prime-\
+                    0123456789abcdef since aterm-devtools-0123456789abcdef never showed it ran";
+        let unsettled =
+            refresh_outcome(exited(i32::from(PRIME_UNSETTLED), &format!("{kept}\nmore")));
+        assert_eq!(
+            unsettled,
+            Err(RefreshFailed::NotSettled(Some(kept.into()))),
+            "the prime's program did not finish in time"
+        );
+        assert!(
+            unsettled.is_err_and(|e| e.to_string().ends_with("never showed it ran")),
+            "it names the copy it kept"
+        );
+        assert_eq!(
+            refresh_outcome(exited(i32::from(PRIME_UNSETTLED), "")),
+            Err(RefreshFailed::NotSettled(None))
+        );
+        assert_eq!(
+            refresh_outcome(Err(RunError::TimedOut)),
+            Err(RefreshFailed::NotSettled(None)),
+            "the verb itself did not finish in time"
+        );
+        assert_eq!(
+            refresh_outcome(exited(1, "aterm pkg __devtools-prime: copy: denied\nmore")),
+            Err(RefreshFailed::Failed(
+                "aterm pkg __devtools-prime: copy: denied".into()
+            ))
+        );
+        assert_eq!(
+            refresh_outcome(exited(1, "")),
+            Err(RefreshFailed::Failed(
+                "aterm pkg __devtools-prime exited Some(1)".into()
+            ))
+        );
+        let spawn = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert!(
+            matches!(
+                refresh_outcome(Err(RunError::Spawn(spawn))),
+                Err(RefreshFailed::Failed(why)) if why.starts_with("aterm pkg __devtools-prime: could not start")
+            ),
+            "a verb that could not start is a failure"
+        );
+        assert_eq!(
+            RefreshFailed::NotSettled(None).to_string(),
+            "not settled: macOS's queue is backed up"
+        );
+        assert_eq!(RefreshFailed::Failed("why".into()).to_string(), "why");
+    }
 
     #[test]
     fn the_prime_runs_the_bundles_front_door_whatever_name_this_aterm_ran_under() {
@@ -1847,6 +2058,65 @@ mod tests {
         assert_eq!(
             [Listed::Yes, Listed::No, Listed::Unknown].map(Listed::word),
             ["yes", "no", "unknown"]
+        );
+    }
+
+    /// A program outside a `.app` is refused the read; its word is then the reading of the
+    /// instance it runs in, made inside that instance's bundle and asked once, when that reading
+    /// is about the same bundle: on is yes, off and no row are no. A list read here, or a read
+    /// refused for any other reason, is the word, and the instance is never asked. NEGATIVE
+    /// CONTROLS: a reading about another bundle, one that is `unknown`, or none at all leaves it
+    /// unknown; ask the instance whatever the read here was, and a read list asks it.
+    #[test]
+    fn a_read_refused_out_of_bundle_takes_the_instances_reading_of_the_same_bundle() {
+        let refused = DevToolList::refused(DevToolListLabel::RefusedOutOfBundle);
+        let asked = std::cell::Cell::new(0);
+        let window = |subject: &'static str, list: &'static str| {
+            let asked = &asked;
+            move || {
+                asked.set(asked.get() + 1);
+                Some(WindowList {
+                    subject: subject.to_owned(),
+                    list: list.to_owned(),
+                })
+            }
+        };
+        let id = "com.aterm.aterm";
+        for (list, want) in [
+            ("on", Listed::Yes),
+            ("off", Listed::No),
+            ("absent", Listed::No),
+            ("unknown", Listed::Unknown),
+        ] {
+            asked.set(0);
+            assert_eq!(listed_word(&refused, id, window(id, list)), want, "{list}");
+            assert_eq!(asked.get(), 1, "{list}: asked once");
+        }
+        assert_eq!(
+            listed_word(&refused, id, window("com.apple.Terminal", "on")),
+            Listed::Unknown,
+            "another bundle's reading"
+        );
+        assert_eq!(listed_word(&refused, id, || None), Listed::Unknown);
+        asked.set(0);
+        assert_eq!(
+            listed_word(&read(DevToolListing::Off, 1), id, window(id, "on")),
+            Listed::No,
+            "the list read here"
+        );
+        assert_eq!(
+            listed_word(
+                &DevToolList::refused(DevToolListLabel::NoFullDiskAccess),
+                id,
+                window(id, "on")
+            ),
+            Listed::Unknown,
+            "a read refused for another reason"
+        );
+        assert_eq!(
+            asked.get(),
+            0,
+            "the instance asked though the read was not refused out of bundle"
         );
     }
 

@@ -57,6 +57,82 @@ fn ids(store: &Store, session: &Session<'_>) -> Vec<Digest> {
         .collect()
 }
 
+/// A populated table is reopened and read without changing its records. Run this alone when
+/// measuring: process CPU includes every test on this process. Timing is never a pass condition.
+#[test]
+fn a_populated_table_reopen_reports_its_cpu() {
+    const RECORDS: usize = 128;
+    const MEASURED: u32 = 64;
+    let lab = Lab::new(&[Role::Writer]);
+    let root = aterm_tempfile::tempdir().unwrap();
+    let path = root.path().join("table");
+    let bootstrap = lab.bootstrap(0);
+    let session = Session::open(&bootstrap).unwrap();
+    let mut store = Store::create(&session, &path).unwrap();
+    let scope = store.scope();
+    let expected: std::collections::BTreeSet<_> = (0..RECORDS)
+        .map(|_| {
+            store
+                .commit_catalog(&session, b"inert-replay-metadata")
+                .unwrap()
+                .id
+        })
+        .collect();
+    assert_eq!(expected.len(), RECORDS);
+    drop(store);
+    let read = |observed| {
+        let store = if observed {
+            Store::observe(&session, &path, scope).unwrap()
+        } else {
+            Store::open(&session, &path, scope).unwrap()
+        };
+        let records = store.catalog(&session).unwrap();
+        assert_eq!(records.len(), RECORDS);
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.header().id)
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected
+        );
+        assert!(
+            records
+                .iter()
+                .all(|record| record.payload() == b"inert-replay-metadata")
+        );
+    };
+    let process_cpu = || {
+        let pid = std::process::id();
+        let sweep = aterm_sysprobe::processes().unwrap();
+        Duration::from_nanos(
+            sweep
+                .procs
+                .iter()
+                .find(|process| process.pid == pid)
+                .unwrap()
+                .cpu_ns
+                .unwrap(),
+        )
+    };
+    for observed in [false, true] {
+        for _ in 0..2 {
+            read(observed);
+        }
+        let before = process_cpu();
+        let start = process_cpu();
+        let overhead = start - before;
+        for _ in 0..MEASURED {
+            read(observed);
+        }
+        let elapsed = process_cpu() - start;
+        let mode = if observed { "observe" } else { "reopen" };
+        eprintln!(
+            "TABLE-READ {RECORDS} records, {mode} process CPU per read over {MEASURED} iterations: {:?} (CPU read {overhead:?})",
+            elapsed / MEASURED
+        );
+    }
+}
+
 #[test]
 fn future_epoch_republication_does_not_strand_witnessed_tables_after_fresh_rotation() {
     use aterm_secrets::commons::node::Edit;

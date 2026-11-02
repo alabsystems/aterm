@@ -13,7 +13,7 @@ use atpkg::vendor_direct::Version as BuildVersion;
 pub fn build_version(version: &str, build: Option<&str>) -> Option<BuildVersion> {
     let v = BuildVersion::parse(version.trim())?;
     match build {
-        Some(dir) => (dir.parse::<u64>().ok() == Some(v.build_id())).then_some(v),
+        Some(dir) => (crate::parse_uint::<u64>(dir) == Some(v.build_id())).then_some(v),
         None => Some(v),
     }
 }
@@ -129,6 +129,24 @@ fn run_event<'a>(payload_type: &str, payload: &'a Value) -> Option<(&'a str, &'a
         return None;
     }
     Some((payload.get("run_id")?.as_str()?, payload.get("event")?))
+}
+
+/// THE PROMPTS RUNS STARTED ON IN `log` AT OR AFTER `since_us`, oldest first: what was said to the
+/// session since. A run an inbox item woke starts on no prompt, and a torn line says nothing.
+#[must_use]
+pub fn prompts_since(log: &str, since_us: u64) -> Vec<String> {
+    log.lines()
+        .filter(|line| line.contains("\"started\""))
+        .filter_map(|line| aterm_json::from_str::<Value>(line.trim()).ok())
+        .filter_map(|v| {
+            let (kind, payload, recorded) = record(&v)?;
+            let (_, event) = run_event(kind, payload)?;
+            (recorded? >= since_us && event.get("kind")?.as_str()? == "started")
+                .then(|| event.get("prompt")?.as_str().map(str::to_owned))
+                .flatten()
+        })
+        .filter(|prompt| !prompt.trim().is_empty())
+        .collect()
 }
 
 /// The task events that end a task: nothing follows one.

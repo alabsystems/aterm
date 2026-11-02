@@ -318,8 +318,11 @@ fn the_line_of_a_minimal_error() {
 
 #[test]
 fn the_line_escapes() {
-    let line = Error::usage("a\"b\\c\nd\re\tf\u{1}g").line("-", &Redactor::new());
-    assert!(line.contains(r#"why="a\"b\\c\nd\re\tf\x01g""#), "{line}");
+    let line = Error::usage("a\"b\\c\nd\re\tf\u{1}g\u{7f}h").line("-", &Redactor::new());
+    assert!(
+        line.contains(r#"why="a\"b\\c\nd\re\tf\x01g\x7fh""#),
+        "{line}"
+    );
 }
 
 #[test]
@@ -585,4 +588,69 @@ fn the_request_id_cannot_add_a_field() {
     let line = error.line("-", &Redactor::new());
     assert!(line.contains(" req=AB:12sideeffectapplied "), "{line}");
     assert_eq!(line.matches("side_effect=").count(), 1, "{line}");
+}
+
+#[test]
+fn m2_sub_slugs() {
+    let cases: Vec<(Sub, &str)> = vec![
+        (
+            Sub::LoginMismatch {
+                expected: "fixture-dev-bot".into(),
+                got: "fixture-ext-bot".into(),
+            },
+            "login_mismatch",
+        ),
+        (Sub::ForeignDraft { id: 5000 }, "foreign_draft"),
+        (Sub::Immutable { id: 5000 }, "immutable"),
+        (
+            Sub::GuardFailed {
+                what: "the release is published".into(),
+            },
+            "guard_failed",
+        ),
+        (Sub::JournalFault { at: 42 }, "journal_fault"),
+        (Sub::JournalFull { len: 1 << 26 }, "journal_full"),
+        (
+            Sub::IntentOpen {
+                intent: "0-0123456789ab".into(),
+            },
+            "intent_open",
+        ),
+        (
+            Sub::NotOpen {
+                state: "settled".into(),
+            },
+            "not_open",
+        ),
+        (Sub::Git { exit: Some(128) }, "git"),
+        (
+            Sub::GitConfig {
+                key: "url.x.insteadOf".into(),
+            },
+            "git_config",
+        ),
+        (
+            Sub::Forbid(Forbid::Scope {
+                needed: "workflow".into(),
+            }),
+            "forbid.scope",
+        ),
+    ];
+    let mut slugs = BTreeSet::new();
+    for (sub, slug) in cases {
+        assert_eq!(sub.slug().as_deref(), Some(slug), "{sub:?}");
+        assert!(slugs.insert(slug), "{slug} twice");
+    }
+}
+
+#[test]
+fn stream_digest_is_a_replay() {
+    assert_eq!(Replay::StreamDigest.slug(), "stream_digest");
+    let error = Error::replay(
+        Replay::StreamDigest,
+        "the sidecar's sha256 is not the tape's",
+    );
+    assert_eq!(error.sub, Sub::Replay(Replay::StreamDigest));
+    assert_eq!(error.sub.slug().as_deref(), Some("replay.stream_digest"));
+    assert_eq!((error.kind, error.exit()), (Kind::CouldNotRun, 3));
 }

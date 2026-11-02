@@ -80,6 +80,12 @@ fn usage() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, USAGE)
 }
 
+fn parse_u64(v: &str) -> Option<u64> {
+    (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| v.parse().ok())
+        .flatten()
+}
+
 fn parse(parts: &[String]) -> io::Result<Request> {
     let (leading, rest) = match parts.first() {
         Some(sel) if sel.starts_with('@') => (Some(sel.as_str()), &parts[1..]),
@@ -119,7 +125,7 @@ fn parse(parts: &[String]) -> io::Result<Request> {
             if request.since.is_some() {
                 return Err(usage());
             }
-            request.since = Some(rev.parse().map_err(|_| usage())?);
+            request.since = Some(parse_u64(rev).ok_or_else(usage)?);
         } else if word == "facts=1" {
             if request.facts {
                 return Err(usage());
@@ -129,7 +135,7 @@ fn parse(parts: &[String]) -> io::Result<Request> {
             if request.fact_since.is_some() {
                 return Err(usage());
             }
-            request.fact_since = Some(rev.parse().map_err(|_| usage())?);
+            request.fact_since = Some(parse_u64(rev).ok_or_else(usage)?);
         } else {
             let value = match word.strip_prefix("timeout=") {
                 Some(value) => value,
@@ -139,7 +145,7 @@ fn parse(parts: &[String]) -> io::Result<Request> {
             if request.timeout.is_some() {
                 return Err(usage());
             }
-            request.timeout = Some(Duration::from_millis(value.parse().map_err(|_| usage())?));
+            request.timeout = Some(Duration::from_millis(parse_u64(value).ok_or_else(usage)?));
         }
     }
     if let Some(sel) = leading {
@@ -173,10 +179,10 @@ fn target(element: &str) -> io::Result<Target> {
     let (selector, since, fact_since) = match body.split_once(':') {
         Some((selector, revs)) => {
             let (rev, fact) = match revs.split_once(':') {
-                Some((rev, fact)) => (rev, Some(fact.parse().map_err(|_| usage())?)),
+                Some((rev, fact)) => (rev, Some(parse_u64(fact).ok_or_else(usage)?)),
                 None => (revs, None),
             };
-            (selector, Some(rev.parse().map_err(|_| usage())?), fact)
+            (selector, Some(parse_u64(rev).ok_or_else(usage)?), fact)
         }
         None => (body, None, None),
     };
@@ -314,6 +320,13 @@ const DRIVEN_LEG_MAX: Duration = Duration::from_secs(20);
 
 const DRIVEN_SLACK: Duration = Duration::from_secs(8);
 
+/// What a leg over a drive waits past the wait it asks the peer for, room for its dial, handshake
+/// and reply: [`DRIVEN_SLACK`], or what the drive's dev seam names for a test of the binary
+/// ([`crate::remote::drive_seam`]).
+fn driven_slack() -> Duration {
+    crate::remote::drive_seam().unwrap_or(DRIVEN_SLACK)
+}
+
 /// What a wait over a drive keeps of ctl's own `--timeout` past the wait its last leg asks the
 /// peer for, room for that leg's dial, handshake and reply: a second, at most a quarter of it.
 fn cut_reserve(flag: Duration) -> Duration {
@@ -327,7 +340,7 @@ const AGAIN_AFTER: Duration = Duration::from_secs(1);
 /// or this where it has none.
 const AGAIN_FOR: Duration = Duration::from_secs(60);
 
-/// One leg over a drive, within its wait and [`DRIVEN_SLACK`], or what is left of ctl's own
+/// One leg over a drive, within its wait and [`driven_slack`], or what is left of ctl's own
 /// `--timeout` (`cut`: when it runs out, and the `--timeout`) where that is shorter, which a cut
 /// says a longer one waits out (`longer`: the wait's, where the `--timeout` ends it, else the
 /// leg's own); a peer that took the connection and sent no handshake within it keeps that cause
@@ -340,7 +353,7 @@ fn driven_leg(
 ) -> Leg {
     use crate::remote::{Longer, Within};
     use io::ErrorKind::{TimedOut, WouldBlock};
-    let own = wait.saturating_add(DRIVEN_SLACK);
+    let own = wait.saturating_add(driven_slack());
     let left = cut.map(|(at, flag)| (at.saturating_duration_since(Instant::now()), flag));
     let (within, said) = match left {
         Some((left, flag)) if left < own => (
@@ -472,15 +485,13 @@ fn row_field<'a>(row: &'a str, key: &str) -> Option<&'a str> {
 }
 
 fn row_rev(row: &str) -> Option<u64> {
-    row_field(row, "rev").and_then(|rev| rev.parse().ok())
+    row_field(row, "rev").and_then(parse_u64)
 }
 
 /// A row's `fact_rev=`, 0 where it has none (a record whose fact word was never edited, or any
 /// row from an older server).
 fn row_fact_rev(row: &str) -> u64 {
-    row_field(row, "fact_rev")
-        .and_then(|rev| rev.parse().ok())
-        .unwrap_or(0)
+    row_field(row, "fact_rev").and_then(parse_u64).unwrap_or(0)
 }
 
 fn row_sid(row: &str) -> Option<&str> {
@@ -1296,6 +1307,12 @@ mod tests {
             "await task @s-a:4:2",
             "await task @s-a:4:x facts=1",
             "await task @s-a::2 facts=1",
+            "await task @s-a:+4",
+            "await task @s-a:4:+2 facts=1",
+            "await task since=+1",
+            "await task facts=1 fact_since=+1",
+            "await task timeout=+1500",
+            "await task timeout +1500",
         ] {
             assert!(parse(&parts(bad)).is_err(), "{bad:?}");
         }
@@ -2539,11 +2556,12 @@ mod tests {
                 "a longer --timeout waits as long as it names, and 0 until the news comes, where a \
                  peer that answers no leg is asked again for a minute",
             ),
-            // Its timeout= ran out inside the --timeout: a longer one waits out the leg alone.
+            // Its timeout= ran out inside the --timeout: a longer one waits out the leg alone, what
+            // was left of its timeout= and 8 s.
             (
                 "await task @s-a1 timeout=1000",
                 frozen_short,
-                "a longer --timeout, or 0, waits up to the drive's own 8 s",
+                "a longer --timeout, or 0, waits up to the drive's own 8",
             ),
         ] {
             let began = Instant::now();
@@ -2558,8 +2576,8 @@ mod tests {
                     assert_eq!(rows, [BUSY], "the row it read");
                     assert!(
                         why.to_string().starts_with(&format!(
-                            "no answer came from lab-mini within this call's --timeout of 1 s \
-                             ({longer})"
+                            "no answer came from lab-mini within this call's --timeout of 1.5 s \
+                             ({longer}"
                         )),
                         "{why}"
                     );

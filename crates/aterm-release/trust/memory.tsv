@@ -114,7 +114,7 @@ aterm-models-misc	16.0	-	-	-	-	-
 aterm-models-native	-	-	-	-	-	-
 aterm-models-release	16.0	-	-	-	-	-
 aterm-models-render	16.0	-	-	-	-	-
-aterm-models-session	16.0	-	-	-	-	-
+aterm-models-session	-	-	-	-	-	-
 aterm-models-update	16.0	-	-	-	-	-
 aterm-net	-	8	4.0	1.0	=	2026-10-04: the 8 GiB A18 Pro Mac with RAM faked to 32 GiB (DYLD interposer), seal 321aaeda7, tree 105c6930c, the lane argv, nothing ran out: 54 proved of 195, over the floor's 49. At this host's real 1.0 GiB ceiling every run peaks past it (1.1-1.2) and proves less: this tree 44 of 197, 52404cdba^ 43 of 190, and the floor's own tree eaabb0fb9 38 of 163 (m7: 49 of 164). The 2026-09-29 seed, 0.6 `=` at 1.0, was not a census peak with room
 aterm-net	-	128	16.0	1.3	=	2026-10-18

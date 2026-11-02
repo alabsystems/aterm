@@ -2,6 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! A live sample of the system-awareness readers on this host, and what each costs.
+//! `--start <pid>...` reads only each pid's start facts now and how `jobs::judge_start` judges
+//! them.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -13,6 +15,17 @@ fn main() {
         println!("hardware_initial {:?}", hardware.sample());
         std::thread::sleep(Duration::from_secs(1));
         println!("hardware_interval {:?}", hardware.sample());
+        return;
+    }
+    if let Some(i) = args.iter().position(|a| a == "--start") {
+        use aterm_sysprobe::jobs::{judge_start, now_us, read_start};
+        for pid in args[i + 1..].iter().filter_map(|p| p.parse::<u32>().ok()) {
+            let facts = read_start(pid, now_us());
+            println!(
+                "start pid={pid} facts={facts:?} judged={:?}",
+                facts.as_ref().map(judge_start)
+            );
+        }
         return;
     }
     let calls = args

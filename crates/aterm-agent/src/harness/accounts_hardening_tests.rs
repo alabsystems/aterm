@@ -157,8 +157,9 @@ fn a_renewal_reads_the_machine_only_through_its_guard() {
 }
 
 /// The time that ends a sign-in's cooldown is its mail's, never its mail folder's: the mark a
-/// sign-in leaves beside a message it used (`.clicked`) moves the folder's time and not this
-/// one. CONTROL: a new message moves it.
+/// sign-in leaves for a message it used (`.clicked`, in the folder's root, or beside the message
+/// in `new/` where an earlier aterm left it) moves the folder's time and not this one. CONTROL: a
+/// new message moves it.
 #[test]
 fn a_sign_ins_own_marks_never_end_its_cooldown() {
     let tmp = aterm_tempfile::tempdir().unwrap();
@@ -173,6 +174,7 @@ fn a_sign_ins_own_marks_never_end_its_cooldown() {
     let delivered = SystemTime::now() - Duration::from_secs(3600);
     set_mtime(&message, delivered);
     assert_eq!(latest_mailbox_mtime(Some(&home), &store), Some(delivered));
+    fs::write(mailbox.join("1.eml.clicked"), "").unwrap();
     fs::write(mailbox.join("new").join("1.eml.clicked"), "").unwrap();
     fs::write(mailbox.join("cur").join("2.eml.seen"), "").unwrap();
     assert_eq!(
@@ -270,6 +272,279 @@ fn future_mail_does_not_hide_a_valid_new_input_from_the_retry_guard() {
         "CONTROL: the unchanged valid message respects the retry hold"
     );
     assert_eq!(fs::metadata(&message).unwrap().modified().unwrap(), future);
+}
+
+#[test]
+fn mailbox_admission_keeps_distinct_retry_inputs_independent() {
+    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let clock = Instant::now();
+    let left = std::time::UNIX_EPOCH + Duration::from_secs(1_000);
+    let right = left + Duration::from_secs(1);
+    for (key, input) in [("work", left), ("codex:work", right)] {
+        drop(AutoRenewPermit::claim_with_mailbox(&guard, key, clock, false, Some(input)).unwrap());
+    }
+    for _ in 0..2 {
+        for (key, input) in [("work", left), ("codex:work", right)] {
+            assert!(
+                AutoRenewPermit::claim_with_mailbox(&guard, key, clock, false, Some(input))
+                    .is_none(),
+                "an unchanged input must not be rearmed by another retry key"
+            );
+        }
+    }
+}
+
+#[test]
+fn mailbox_admission_refusal_preserves_attempt_history() {
+    for hold in ["busy", "person", "bot"] {
+        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let clock = Instant::now();
+        let before = std::time::UNIX_EPOCH + Duration::from_secs(1_000);
+        let changed = before + Duration::from_secs(1);
+        for key in ["work", "codex:work"] {
+            drop(
+                AutoRenewPermit::claim_with_mailbox(&guard, key, clock, false, Some(before))
+                    .unwrap(),
+            );
+        }
+        let attempts = {
+            let mut state = guard.lock().unwrap();
+            match hold {
+                "busy" => state.in_flight = true,
+                "person" => {
+                    state.parked.insert("work".into(), clock);
+                }
+                "bot" => {
+                    state.bot_checked.insert("work".into(), clock);
+                }
+                _ => unreachable!(),
+            }
+            state.last_attempt.clone()
+        };
+        assert!(
+            AutoRenewPermit::claim_with_mailbox(&guard, "work", clock, false, Some(changed))
+                .is_none()
+        );
+        {
+            let mut state = guard.lock().unwrap();
+            assert_eq!(
+                state.last_attempt, attempts,
+                "{hold} refusal changed history"
+            );
+            state.in_flight = false;
+            state.parked.clear();
+            state.bot_checked.clear();
+        }
+        drop(
+            AutoRenewPermit::claim_with_mailbox(&guard, "work", clock, false, Some(changed))
+                .expect("the unconsumed input wakes this row after its hold clears"),
+        );
+        assert_eq!(guard.lock().unwrap().last_attempt["codex:work"], clock);
+        assert!(
+            AutoRenewPermit::claim_with_mailbox(&guard, "work", clock, false, Some(changed))
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn mailbox_admission_each_row_consumes_a_common_change_once() {
+    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let clock = Instant::now();
+    let before = std::time::UNIX_EPOCH + Duration::from_secs(1_000);
+    let changed = before + Duration::from_secs(1);
+    for key in ["work", "codex:work"] {
+        drop(AutoRenewPermit::claim_with_mailbox(&guard, key, clock, false, Some(before)).unwrap());
+    }
+    let later = clock + Duration::from_secs(1);
+    drop(AutoRenewPermit::claim_with_mailbox(&guard, "work", later, false, Some(changed)).unwrap());
+    assert_eq!(guard.lock().unwrap().last_attempt["codex:work"], clock);
+    drop(
+        AutoRenewPermit::claim_with_mailbox(&guard, "codex:work", later, false, Some(changed))
+            .unwrap(),
+    );
+    for key in ["work", "codex:work"] {
+        assert_eq!(guard.lock().unwrap().last_attempt[key], later);
+        assert!(
+            AutoRenewPermit::claim_with_mailbox(&guard, key, later, false, Some(changed)).is_none()
+        );
+    }
+}
+
+#[test]
+fn mailbox_admission_does_not_rearm_non_mailbox_preparations() {
+    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let clock = Instant::now();
+    let before = std::time::UNIX_EPOCH + Duration::from_secs(1_000);
+    let changed = before + Duration::from_secs(1);
+    for key in ["native:account", "shared:network:account"] {
+        drop(AutoRenewPermit::claim_with_mailbox(&guard, key, clock, false, None).unwrap());
+    }
+    for input in [before, changed] {
+        drop(
+            AutoRenewPermit::claim_with_mailbox(&guard, "work", clock, false, Some(input)).unwrap(),
+        );
+        for key in ["native:account", "shared:network:account"] {
+            assert_eq!(guard.lock().unwrap().last_attempt[key], clock);
+            assert!(AutoRenewPermit::claim_with_mailbox(&guard, key, clock, false, None).is_none());
+        }
+    }
+}
+
+struct MailboxAdmission {
+    guard: Arc<Mutex<AutoRenewGuard>>,
+    clock: Instant,
+    input: SystemTime,
+    calls: [i64; 2],
+}
+
+impl MailboxAdmission {
+    const KEYS: [&str; 2] = ["work", "codex:work"];
+
+    fn new() -> Self {
+        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let clock = Instant::now();
+        let input = std::time::UNIX_EPOCH + Duration::from_secs(1_000);
+        for key in Self::KEYS {
+            drop(
+                AutoRenewPermit::claim_with_mailbox(&guard, key, clock, false, Some(input))
+                    .unwrap(),
+            );
+        }
+        Self {
+            guard,
+            clock,
+            input,
+            calls: [0; 2],
+        }
+    }
+
+    fn step(&mut self, action: &str) {
+        if matches!(action, "Left" | "Right") {
+            let index = usize::from(action == "Right");
+            let elapsed = Duration::from_secs(u64::try_from(index + 1).unwrap());
+            if let Some(permit) = AutoRenewPermit::claim_with_mailbox(
+                &self.guard,
+                Self::KEYS[index],
+                self.clock + elapsed,
+                false,
+                Some(self.input + elapsed),
+            ) {
+                self.calls[index] += 1;
+                drop(permit);
+            }
+            return;
+        }
+        let mut state = self.guard.lock().unwrap();
+        match action {
+            "Busy" => state.in_flight = true,
+            "Person" => {
+                for key in Self::KEYS {
+                    state.parked.insert(key.into(), self.clock);
+                }
+            }
+            "Bot" => {
+                for key in Self::KEYS {
+                    state.bot_checked.insert(key.into(), self.clock);
+                }
+            }
+            "Release" => {
+                state.in_flight = false;
+                state.parked.clear();
+                state.bot_checked.clear();
+            }
+            _ => panic!("unknown mailbox admission action"),
+        }
+    }
+
+    fn observe(&self) -> aterm_spec::interp::State {
+        let state = self.guard.lock().unwrap();
+        let hold = if state.in_flight {
+            1
+        } else if state.parked.contains_key(Self::KEYS[0]) {
+            2
+        } else if state.bot_checked.contains_key(Self::KEYS[0]) {
+            3
+        } else {
+            0
+        };
+        let input = |key| {
+            state.mailbox_mtimes.get(key).map_or(0, |at| {
+                i64::try_from(at.duration_since(self.input).unwrap().as_secs()).unwrap() + 1
+            })
+        };
+        let stamp = |key| {
+            state.last_attempt.get(key).map_or(0, |at| {
+                i64::try_from(at.duration_since(self.clock).as_secs()).unwrap() + 1
+            })
+        };
+        aterm_spec::interp::State::from([
+            ("hold", hold),
+            ("left", input(Self::KEYS[0])),
+            ("right", input(Self::KEYS[1])),
+            ("left_stamp", stamp(Self::KEYS[0])),
+            ("right_stamp", stamp(Self::KEYS[1])),
+            ("left_calls", self.calls[0]),
+            ("right_calls", self.calls[1]),
+        ])
+    }
+}
+
+pub(crate) fn mailbox_admission_transition(
+    state: &aterm_spec::interp::State,
+    action: &str,
+) -> aterm_spec::interp::State {
+    let mut fixture = MailboxAdmission::new();
+    if state["left_calls"] == 1 {
+        fixture.step("Left");
+    }
+    if state["right_calls"] == 1 {
+        fixture.step("Right");
+    }
+    match state["hold"] {
+        0 => {}
+        1 => fixture.step("Busy"),
+        2 => fixture.step("Person"),
+        3 => fixture.step("Bot"),
+        _ => panic!("unknown mailbox hold"),
+    }
+    assert_eq!(
+        &fixture.observe(),
+        state,
+        "reconstruct the declared input state"
+    );
+    fixture.step(action);
+    fixture.observe()
+}
+
+#[test]
+fn mailbox_admission_conforms_and_rejects_lost_history() {
+    let model = aterm_models_harness::mailbox_renewal_admission_model();
+    assert_eq!(model.mutant_dials(), (1..=4).collect::<Vec<_>>());
+    assert!(aterm_spec::interp::prove_and_catch(&model) > 0);
+    for state in aterm_spec::interp::reachable_states(&model) {
+        for action in &model.actions {
+            if model.action_enabled(action.name, &state) {
+                let observed = mailbox_admission_transition(&state, action.name);
+                assert!(model.successors(action.name, &state).contains(&observed));
+                let mut wrong = observed.clone();
+                wrong.insert("left_stamp", 0);
+                assert!(!model.successors(action.name, &state).contains(&wrong));
+            }
+        }
+    }
+    let mut fixture = MailboxAdmission::new();
+    let mut state = fixture.observe();
+    for action in [
+        "Busy", "Left", "Right", "Release", "Person", "Left", "Release", "Bot", "Right", "Release",
+        "Left", "Right", "Left", "Right",
+    ] {
+        assert!(model.action_enabled(action, &state));
+        fixture.step(action);
+        let observed = fixture.observe();
+        assert!(model.successors(action, &state).contains(&observed));
+        state = observed;
+    }
 }
 
 /// What an earlier sync left in `~/.secrets`: aterm's own copy of a list found on this Mac,

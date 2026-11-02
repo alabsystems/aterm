@@ -1307,16 +1307,17 @@ impl EditorWorkspace {
                 self.grid_row(store, view, RowEdit::Insert)
             }
             EditorCommand::GridDeleteRow => self.grid_row(store, view, RowEdit::Delete),
-            EditorCommand::Undo | EditorCommand::Redo => {
-                self.grid_history(store, view, command == EditorCommand::Undo)
+            EditorCommand::Undo | EditorCommand::Redo | EditorCommand::UndoAgentEdit => {
+                self.grid_history(store, view, command)
             }
             EditorCommand::RecenterTopBottom => {
                 let snapshot = snapshot_for_view(store, view)?;
                 if let Ok(table) = self.grid_table(&snapshot, grid_delimiter(view)) {
                     let (record, _) = current_cell(&table, view);
                     let data = GridRows::of(view.viewport_lines()).data;
+                    let max_top = table.records.len().saturating_sub(data).max(1);
                     if let Some(grid) = view.grid_mut() {
-                        grid.top_record = record.saturating_sub(data / 2).max(1);
+                        grid.top_record = record.saturating_sub(data / 2).clamp(1, max_top);
                     }
                 }
                 Ok(Vec::new())
@@ -1390,18 +1391,19 @@ impl EditorWorkspace {
         Ok(Vec::new())
     }
 
-    /// Undo or redo the document's last change, then put the cursor on the cell it touched.
-    /// The history's own words (a frame that was not yours) come back as its effects.
+    /// Undo or redo the document's last change, or undo its newest agent edit, then put the
+    /// cursor on the cell it touched. The history's own words (a frame that was not yours) come
+    /// back as its effects.
     fn grid_history(
         &mut self,
         store: &mut DocumentStore,
         view: &mut EditorBufferView,
-        undo: bool,
+        command: EditorCommand,
     ) -> Result<Vec<EditorEffect>, EditorError> {
-        let effects = if undo {
-            self.undo(store, view)?
-        } else {
-            self.redo(store, view)?
+        let effects = match command {
+            EditorCommand::Undo => self.undo(store, view)?,
+            EditorCommand::Redo => self.redo(store, view)?,
+            _ => self.undo_agent_edit(store, view)?,
         };
         let touched = self
             .pending_commits
@@ -1726,6 +1728,25 @@ impl EditorWorkspace {
         }
         Ok(Vec::new())
     }
+
+    /// Scroll a grid view to show the cell its primary caret is in, and set its column to that
+    /// cell's, leaving the selection itself untouched (so an incremental search keeps its match
+    /// range).
+    pub(super) fn grid_reveal_caret(&mut self, store: &DocumentStore, view: &mut EditorBufferView) {
+        if view.grid().is_none() || view.grid_draft().is_some() {
+            return;
+        }
+        let Ok(snapshot) = snapshot_for_view(store, view) else {
+            return;
+        };
+        let Ok(table) = self.grid_table(&snapshot, grid_delimiter(view)) else {
+            return;
+        };
+        let head = view.primary_selection().head;
+        let record = table.record_at(head);
+        let column = table.cell_at(record, head);
+        grid_scroll_to(view, &table, &snapshot.text, record, column);
+    }
 }
 
 /// What a commit says when another writer changed the rows around an open cell: the cell the
@@ -1781,6 +1802,18 @@ fn grid_place(
     view.primary = 0;
     view.mark_active = false;
     view.desired_column = None;
+    grid_scroll_to(view, table, text, record, column);
+}
+
+/// Remember `column` as the grid cursor's column and scroll the grid's rows and columns to show
+/// `record`, `column`, leaving the view's selections as they stand.
+fn grid_scroll_to(
+    view: &mut EditorBufferView,
+    table: &Table,
+    text: &str,
+    record: usize,
+    column: usize,
+) {
     let data = GridRows::of(view.viewport_lines()).data;
     let records = table.records.len();
     if let Some(grid) = view.grid_mut() {
@@ -4047,5 +4080,132 @@ mod tests {
             3,
             "inside a character: its start"
         );
+    }
+
+    #[test]
+    fn search_and_goto_line_sync_grid_column_and_scroll_and_c_g_restores_origin() {
+        let (mut store, mut workspace, mut view, _) = grid_editor(MAIN);
+        goto(&mut store, &mut workspace, &mut view, 1, 6);
+        press(
+            &mut store,
+            &mut workspace,
+            &mut view,
+            &[ch('g', Modifiers::CTRL)],
+        );
+        assert_eq!(
+            cell_of(&store, &mut workspace, &view),
+            (1, 6),
+            "C-g outside a search/goto-line minibuffer keeps a missing cell's column"
+        );
+
+        // From missing cell (1, 6), searching for "authenticator" (the last present cell of short
+        // row 3) must land on (3, 3), not falsely retain column 6.
+        press(
+            &mut store,
+            &mut workspace,
+            &mut view,
+            &[
+                ch('s', Modifiers::CTRL),
+                EditorInput::Text("authenticator".into()),
+                named(NamedKey::Enter),
+            ],
+        );
+        assert_eq!(cell_of(&store, &mut workspace, &view), (3, 3));
+
+        // In a tall table with a short viewport, search, search-next, C-g, goto-line, and
+        // recenter-top-bottom keep the grid cursor and scroll in sync.
+        let mut csv = String::from("id,name,notes\n");
+        for idx in 1..=20 {
+            csv.push_str(&format!("r{idx},row-{idx},val-{idx}\n"));
+        }
+        let (mut store, mut workspace, mut view, _) = grid_editor(&csv);
+        view.reconcile_viewport(&csv, 8);
+        goto(&mut store, &mut workspace, &mut view, 1, 2);
+        workspace.scroll_grid_columns(&store, &mut view, 1).unwrap();
+        assert!(view.grid().unwrap().scrolled);
+
+        press(
+            &mut store,
+            &mut workspace,
+            &mut view,
+            &[ch('s', Modifiers::CTRL), EditorInput::Text("val-18".into())],
+        );
+        assert_eq!(cell_of(&store, &mut workspace, &view), (18, 2));
+        assert!(!view.grid().unwrap().scrolled);
+        let data = GridRows::of(view.viewport_lines()).data;
+        let top = view.grid().unwrap().top_record;
+        assert!(
+            (top..top + data).contains(&18),
+            "incremental search scrolls top_record ({top}) to show row 18 (data={data})"
+        );
+
+        // Cancelling incremental search with C-g restores origin (1, 2) and scrolls back to it.
+        press(
+            &mut store,
+            &mut workspace,
+            &mut view,
+            &[ch('g', Modifiers::CTRL)],
+        );
+        assert_eq!(cell_of(&store, &mut workspace, &view), (1, 2));
+        let top = view.grid().unwrap().top_record;
+        assert!((top..top + data).contains(&1));
+
+        // goto-line jumps to row 19 column 0 and scrolls it into view.
+        workspace
+            .invoke(
+                &mut store,
+                &mut view,
+                crate::editor::Invocation {
+                    command: EditorCommand::GotoLine,
+                    count: None,
+                    args: vec!["20".into()],
+                },
+            )
+            .unwrap();
+        assert_eq!(cell_of(&store, &mut workspace, &view), (19, 0));
+        let top = view.grid().unwrap().top_record;
+        assert!((top..top + data).contains(&19));
+
+        // RecenterTopBottom on the last row clamps top_record to max_top.
+        goto(&mut store, &mut workspace, &mut view, 20, 0);
+        workspace
+            .execute(&mut store, &mut view, EditorCommand::RecenterTopBottom)
+            .unwrap();
+        let max_top = 21usize.saturating_sub(data).max(1);
+        assert_eq!(view.grid().unwrap().top_record, max_top);
+    }
+
+    #[test]
+    fn undo_agent_edit_in_grid_places_cursor_on_undone_cell() {
+        use crate::editor::{Origin, Request};
+        use crate::store::TextEdit;
+
+        let (mut store, mut workspace, mut view, document) = grid_editor(MAIN);
+        let snapshot = store.snapshot(document).unwrap();
+        let target = snapshot.text.find("authenticator").unwrap();
+        let (seq, deltas) = workspace
+            .apply(
+                &mut store,
+                document,
+                snapshot.seq,
+                Request {
+                    edits: vec![TextEdit {
+                        range: target..target + "authenticator".len(),
+                        insert: "passkey".into(),
+                    }],
+                    origin: Origin::Agent {
+                        principal: "@1".into(),
+                        label: "update factor".into(),
+                    },
+                },
+            )
+            .unwrap();
+        view.observe_external(seq, &deltas);
+        goto(&mut store, &mut workspace, &mut view, 1, 0);
+        workspace
+            .execute(&mut store, &mut view, EditorCommand::UndoAgentEdit)
+            .unwrap();
+        assert_eq!(cell_of(&store, &mut workspace, &view), (3, 3));
+        assert_eq!(text_of(&store, document), MAIN);
     }
 }

@@ -1,0 +1,50 @@
+# grok 1.0.70 · MEASURED 2026-10-29, `aterm ctl text` of a private headless aterm (144x50, aterm 0.146.0) running the real Grok Build, launched by path in the lab's jail with a scratch `HOME` and `GROK_HOME`, the lab's `XAI_API_KEY` and `GROK_XAI_API_BASE_URL`/`GROK_CLI_CHAT_PROXY_BASE_URL=http://127.0.0.1:<port>/v1` (a local stub of xAI's API, crates/aterm-lab) · the stub's `tool` mode asks for `write` of `<project>/notes.txt`: the diff above (`◆ Creating notes.txt`, `1  a line the lab wrote`), the status row `◆ Running Write \`…/notes.txt\` 0.7s`, and the card `›  Allow Edit to /private/tmp/at.lab0/proj/notes.txt?` with four options, the focused one `3 (●) Yes`, key row `1/4:select  │  Tab:next option  │  Ctrl+o:always-approve  │  Ctrl+c:cancel  │  Esc:scrollback` · cursor=37,6 (hidden) · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+  /p/t/at.lab0/proj                                                                                                   12K / 256K │ [Dashboard]
+
+
+     ❯ toolstart write the notes                                                                                                     1:59 PM
+
+
+     ◆ Creating notes.txt
+
+       1  a line the lab wrote
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+
+    ◆ Running Write `/private/tmp/at.lab0/proj/notes.txt` 5.8s                                                              5.9s ⇣12.7k [stop]
+
+  ┃
+  ┃  ›  Allow Edit to /private/tmp/at.lab0/proj/notes.txt?
+  ┃
+  ┃  1 (○) Yes, and don't ask again for anything (always-approve mode)
+  ┃  2 (○) Yes, allow all edits during this session
+  ┃  3 (●) Yes
+  ┃  4 (○) No, reject (type to add feedback)
+  ┃
+
+  1/4:select  │  Tab:next option  │  Ctrl+o:always-approve  │  Ctrl+c:cancel  │  Esc:scrollback

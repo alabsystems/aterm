@@ -27,6 +27,7 @@ fn parked_session(script: &str) -> SpawnedShell {
         None,
         aterm_sandbox::Limits::inherit(),
         None,
+        None,
     )
     .expect("the parked session must spawn");
     set_nonblocking(sh.master, true).expect("nonblocking master");

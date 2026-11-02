@@ -28,6 +28,51 @@ fn window_read() -> Option<StubSeen> {
 }
 
 #[test]
+fn a_prearmed_wall_remains_observable_after_point_and_act_share_a_read() {
+    let mut seen = Seen {
+        journal: vec![j(3_800, "EVENT idle seq=1 Implemented the parser")],
+        ..Seen::default()
+    };
+    assert!(first_point_unanswered(&seen, T0));
+    assert!(awaits_first_raise(Chain::RedrawWall, &seen, T0));
+    assert!(!awaits_first_raise(Chain::Off, &seen, T0));
+    let mut raised = seen.clone();
+    raised.cover.wall = wall_at(460_000);
+    assert!(!awaits_first_raise(Chain::RedrawWall, &raised, T0));
+    seen.journal.push(j(
+        4_400,
+        "CONTINUED seq=1 rule=land@v1 [aterm harness] Autopilot is Land:",
+    ));
+    assert!(
+        !first_point_unanswered(&seen, T0),
+        "outage eligibility stays unchanged"
+    );
+    assert!(
+        awaits_first_raise(Chain::RedrawWall, &seen, T0),
+        "the late wall observer must still observe the atomic admission"
+    );
+}
+
+#[test]
+fn a_wall_observer_keeps_the_admission_time_and_reset() {
+    let status =
+        J::parse(r#"{"limit_arm":{"raised_ms":1790000000123,"reset_s":1790000220}}"#).unwrap();
+    assert_eq!(
+        armed_wall(&status),
+        Some((1_790_000_000_123, 1_790_000_220))
+    );
+    for absent in [
+        "{}",
+        r#"{"limit_arm":null}"#,
+        r#"{"limit_arm":{"raised_ms":0,"reset_s":1790000220}}"#,
+        r#"{"limit_arm":{"raised_ms":1790000000123,"reset_s":1790000000}}"#,
+        r#"{"limit_arm":{"raised_ms":1790000000123}}"#,
+    ] {
+        assert_eq!(armed_wall(&J::parse(absent).unwrap()), None, "{absent}");
+    }
+}
+
+#[test]
 fn the_wall_is_raised_again_at_its_reset_as_each_chain_shifts() {
     let reset = 1_300;
     let mut c = Cover {
@@ -327,7 +372,7 @@ fn a_typed_resume_that_meets_the_wall_again_waits_the_new_reset_out() {
     assert!(
         why.contains("usage-resume@v1 at +361.0 s (61.0 s past the first reset)")
             && why.contains("the wall drawn again +366.0 s")
-            && why.contains("gone on: usage-resume@v1 at +661.0 s (61.0 s past the new reset; the loop's floor after a resume that met the wall again: +996.0 s)"),
+            && why.contains("gone on: usage-resume@v1 at +661.0 s (61.0 s past the new reset)"),
         "{why}"
     );
     let fail = |s: &Seen, p: &str, needle: &str| {
@@ -434,8 +479,9 @@ fn agy_redrawn() -> Seen {
                 "CONTINUED seq=2 rule=usage-resume@v1 [aterm harness] Still landing:",
             ),
             j(554_300, &agy_limited(3, 211)),
+            // the take window's wait, written just after the point
             j(
-                554_300,
+                554_310,
                 &format!(
                     "WAITING seq=3 until={} the worker to take the usage-resume@v1 act",
                     stamp(583_600)
@@ -481,39 +527,105 @@ fn agy_redrawn() -> Seen {
     }
 }
 
+/// W4's records on agy once the loop waits out a nearer reset: as
+/// [`agy_redrawn`] to the redraw read at +554.3 s (the new reset +764.1 s, its
+/// notice's `in 211s` read at +554.3 s naming +765.3 s), then the loop's wait
+/// to that reset, agy's grace (60 s) and a jitter of 23 s, +848.3 s, the
+/// resume at +849.0 s, landed at +852.4 s.
+fn agy_redrawn_to_reset() -> Seen {
+    let mut s = agy_redrawn();
+    s.journal[9] = j(
+        584_300,
+        &format!("WAITING seq=3 until={} spend resets", stamp(848_300)),
+    );
+    s.journal[10] = j(
+        849_000,
+        "CONTINUED seq=3 rule=usage-resume@v1 [aterm harness] Still landing:",
+    );
+    s.journal[11] = j(852_400, "EVENT idle seq=4 Nothing left: the parser");
+    s.journal[12] = j(852_400, "DONE seq=4 rule=land@v1 x");
+    s.ledger[5] = typed(849_000, "usage-resume@v1", LAND_NUDGE);
+    s.ledger[6] = point(852_400, 4);
+    s.ledger[7] = task_done(852_400);
+    s.status[1].0 = T0 + 853_500;
+    s.end_ms = T0 + 852_400 + 1_025_000;
+    s
+}
+
+/// W4 HOLDS THE GOING-ON PAST THE NEW RESET TO THAT RESET: after a typed
+/// resume that met the wall again under a reset four minutes on, the loop
+/// waits to the new reset, the grace and the jitter (the margin a first wall
+/// gets), and the resume there passes. NEGATIVE CONTROLS: the records of a
+/// loop waiting `TurnEndTiming::limit_backoff`'s first rung past the new
+/// reset FAIL as a wait past it, as does a wait 3 s past the due and the
+/// jitter (the slack is 2 s), where one to the due and the jitter passes; the
+/// resume past the new reset's due and [`WALL_LOST_MS`] FAILs as persistence
+/// lost, as does one at the floor after a first going-on of another rule.
 #[test]
-fn the_redraw_after_a_typed_resume_is_waited_on_the_loops_floor() {
+fn the_redraw_after_a_typed_resume_is_waited_out_to_the_new_reset() {
     let w4 = |s: &Seen| one(Chain::RedrawWall, s, "agy", Scenario::W4);
-    let (w, why) = w4(&agy_redrawn());
+    let (w, why) = w4(&agy_redrawn_to_reset());
     assert_eq!(w, "PASS", "{why}");
     assert!(
-        why.contains("gone on: usage-resume@v1 at +1185.0 s (421.0 s past the new reset; the loop's floor after a resume that met the wall again: +1184.3 s)"),
+        why.contains("gone on: usage-resume@v1 at +849.0 s (85.0 s past the new reset)"),
         "{why}"
     );
-    let mut s = agy_redrawn();
+    let (w, why) = w4(&agy_redrawn());
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(
+        why.contains("WAITED PAST THE NEW RESET: the loop's wait at +584.3 s ran to +1183.0 s, 419.0 s past the new reset (due by +944.0 s)"),
+        "{why}"
+    );
+    // the jitter's edge: a wait to the new reset's due and the jitter
+    // passes; one past them and the slack fails
+    let waited_to = |until: i64| {
+        let mut s = agy_redrawn_to_reset();
+        s.journal[9] = j(
+            584_300,
+            &format!("WAITING seq=3 until={} spend resets", stamp(until)),
+        );
+        let shift = until + 1_000 - 849_000;
+        for (t, _) in s.journal.iter_mut().skip(10) {
+            *t += shift;
+        }
+        for r in s.ledger.iter_mut().skip(5) {
+            r.ts += shift;
+        }
+        s.status[1].0 += shift;
+        s.end_ms += shift;
+        s
+    };
+    let (w, why) = w4(&waited_to(944_000));
+    assert_eq!(w, "PASS", "{why}");
+    let (w, why) = w4(&waited_to(947_000));
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(
+        why.contains("WAITED PAST THE NEW RESET: the loop's wait at +584.3 s ran to +947.0 s"),
+        "{why}"
+    );
+    // past the new reset's due and 5 min, the wait itself in time
+    let mut s = agy_redrawn_to_reset();
     for (t, _) in s.journal.iter_mut().skip(10) {
-        *t += 300_000;
+        *t += 400_000;
     }
     for r in s.ledger.iter_mut().skip(5) {
-        r.ts += 300_000;
+        r.ts += 400_000;
     }
-    s.status[1].0 += 300_000;
-    s.end_ms += 300_000;
+    s.status[1].0 += 400_000;
+    s.end_ms += 400_000;
     let (w, why) = w4(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(
-        why.contains("PERSISTENCE LOST: usage-resume@v1 at +1485.0 s"),
+        why.contains("PERSISTENCE LOST: usage-resume@v1 at +1249.0 s, 485.0 s past the new reset"),
         "{why}"
     );
+    // a first going-on of another rule, the resume at the floor all the same
     let mut s = agy_redrawn();
     s.journal[6].1 = "CONTINUED seq=2 rule=land@v1 [aterm harness] Autopilot is Land:".into();
     s.ledger[3] = typed(553_800, "land@v1", LAND);
     let (w, why) = w4(&s);
     assert_eq!(w, "FAIL", "{why}");
-    assert!(
-        why.contains("PERSISTENCE LOST: usage-resume@v1 at +1185.0 s, 421.0 s past the new reset"),
-        "{why}"
-    );
+    assert!(why.contains("WAITED PAST THE NEW RESET"), "{why}");
 }
 
 fn claude_switched() -> Seen {
@@ -684,7 +796,13 @@ fn another_agent_in_the_tab_is_not_held_by_the_first_agents_limit() {
     assert!(why.contains("short of claude's reset"), "{why}");
 }
 
-fn muse_nudged() -> Seen {
+/// W5 with the first agent's streak carried across the switch: the tab's
+/// episode had Land's act typed already (the first agent's land act met the
+/// wall), so the loop's act on the second agent is Land's nudge, at the
+/// back-off its work point named (`2 short turn(s) in a row: 4 min
+/// back-off`). Muse Code's point at +230 s, the nudge at +470.5 s, landed at
+/// +474 s.
+fn muse_nudged_carried() -> Seen {
     let mut s = claude_switched();
     s.journal[6] = j(
         230_100,
@@ -706,13 +824,41 @@ fn muse_nudged() -> Seen {
     s
 }
 
+/// W5 with Muse Code's own streak: as [`muse_nudged_carried`], its work point
+/// naming one short turn's back-off (`1 short turn(s) in a row: 2 min
+/// back-off`), Land's nudge at +350.5 s, landed at +354 s.
+fn muse_nudged() -> Seen {
+    let mut s = claude_switched();
+    s.journal[7] = j(
+        350_500,
+        "CONTINUED seq=10 rule=land-nudge@v1 [aterm harness] Still landing:",
+    );
+    s.journal[8] = j(354_000, "EVENT idle seq=11 Nothing left: the parser");
+    s.journal[9] = j(354_000, "DONE seq=11 rule=land@v1 x");
+    s.ledger.truncate(4);
+    s.ledger.extend([
+        typed(350_500, "land-nudge@v1", LAND_NUDGE),
+        point(354_000, 2),
+        task_done(354_000),
+    ]);
+    s.status[1].0 = T0 + 355_000;
+    s
+}
+
+/// W5's LAND ACT IS LAND'S RULE, AT THE SECOND AGENT'S OWN BACK-OFF: Land's
+/// nudge on the second agent is its land act, due at the back-off its point
+/// named, one short turn's, and [`PERSISTENCE_GRACE_MS`]. NEGATIVE CONTROLS:
+/// the first agent's streak carried into the second (two short turns), the
+/// nudge past its due, a resume typed before it, and a continuation of
+/// another rule in its place each FAIL; no land act watched short of its due
+/// is UNOBSERVED, and watched past it FAILs.
 #[test]
-fn the_second_agents_land_act_is_lands_nudge_at_the_back_off_the_loop_named() {
+fn the_second_agents_land_act_is_lands_nudge_at_its_own_back_off() {
     let w5 = |s: &Seen| one(Chain::SwitchWall, s, "claude", Scenario::W5);
     let (w, why) = w5(&muse_nudged());
     assert_eq!(w, "PASS", "{why}");
     assert!(
-        why.contains("muse's land act at +470.5 s (250.5 s after its prompt, 549.5 s before claude's reset): land-nudge@v1, due by +530.0 s"),
+        why.contains("muse's land act at +350.5 s (130.5 s after its prompt, 669.5 s before claude's reset): land-nudge@v1, due by +410.0 s"),
         "{why}"
     );
     let fail = |s: &Seen, needle: &str| {
@@ -720,6 +866,12 @@ fn the_second_agents_land_act_is_lands_nudge_at_the_back_off_the_loop_named() {
         assert_eq!(w, "FAIL", "{needle}: {why}");
         assert!(why.contains(needle), "{needle}: {why}");
     };
+    // the first agent's streak carried into the second
+    fail(
+        &muse_nudged_carried(),
+        "claude's STREAK CARRIED into muse: its first point named WAITING seq=10 until=",
+    );
+    // the nudge past the named due and its grace
     let mut s = muse_nudged();
     for (t, _) in s.journal.iter_mut().skip(7) {
         *t += 70_000;
@@ -730,46 +882,48 @@ fn the_second_agents_land_act_is_lands_nudge_at_the_back_off_the_loop_named() {
     s.status[1].0 += 70_000;
     fail(
         &s,
-        "its land act (land-nudge@v1) at +540.5 s came past its due +530.0 s (WAITING seq=10",
+        "its land act (land-nudge@v1) at +420.5 s came past its due +410.0 s (WAITING seq=10",
     );
     let mut s = muse_nudged();
     s.journal.insert(
         7,
         j(
-            400_000,
+            300_000,
             "CONTINUED seq=10 rule=usage-resume@v1 [aterm harness] Still landing:",
         ),
     );
     s.ledger
-        .insert(4, typed(400_000, "usage-resume@v1", LAND_NUDGE));
+        .insert(4, typed(300_000, "usage-resume@v1", LAND_NUDGE));
     fail(
         &s,
-        "TYPED before muse's land act: usage-resume@v1 at +400.0 s",
+        "TYPED before muse's land act: usage-resume@v1 at +300.0 s",
     );
     let mut s = muse_nudged();
     s.journal[7] = j(
-        470_500,
+        350_500,
         "CONTINUED seq=10 rule=continue@v1 [aterm harness] Keep going",
     );
-    s.ledger[4] = typed(470_500, "continue@v1", "Keep going");
-    fail(&s, "TYPED before muse's land act: continue@v1 at +470.5 s");
+    s.ledger[4] = typed(350_500, "continue@v1", "Keep going");
+    fail(&s, "TYPED before muse's land act: continue@v1 at +350.5 s");
+    // no land act, watched short of the named due and its grace (+410 s)
     let mut s = muse_nudged();
     s.journal.truncate(7);
     s.ledger.truncate(4);
     s.status.truncate(1);
-    s.end_ms = T0 + 500_000;
+    s.end_ms = T0 + 400_000;
     let (w, why) = w5(&s);
     assert_eq!(w, "UNOBSERVED", "{why}");
     assert!(
         why.contains(
-            "watched to +500.0 s, before muse's land act was due (+530.0 s: WAITING seq=10"
+            "watched to +400.0 s, before muse's land act was due (+410.0 s: WAITING seq=10"
         ),
         "{why}"
     );
-    s.end_ms = T0 + 531_000;
+    // ... and watched past it, FAIL
+    s.end_ms = T0 + 411_000;
     fail(
         &s,
-        "claude's LIMIT HELD muse: no land act in the 311.0 s after its prompt (due by +530.0 s",
+        "claude's LIMIT HELD muse: no land act in the 191.0 s after its prompt (due by +410.0 s",
     );
 }
 
@@ -1169,36 +1323,47 @@ fn a_usage_wall_under_cruise_is_waited_out_and_cruise_goes_on() {
     let (w, why) = w8(&s, "muse");
     assert_eq!(w, "UNOBSERVED", "{why}");
     assert!(why.contains("never drawn as a limit point"), "{why}");
-    let climbed = |act_at: i64| {
+    // CRUISE'S ACT IS DUE WHERE THE LOOP SAID, at the chain's two short
+    // turns' back-off: the act past that due and its grace FAILs; with no
+    // back-off named, the act past the fixed window FAILs
+    let late = |act_at: i64| {
         let mut s = muse_cruise_walled();
-        s.journal[7] = j(
-            365_100,
-            "WAITING seq=3 until=x 3 short turn(s) in a row: 8 min back-off",
-        );
         s.journal[8].0 = T0 + act_at;
         s.ledger[5].ts = T0 + act_at;
         s.end_ms = T0 + act_at + 10_000;
         s
     };
-    let (w, why) = w8(&climbed(845_000), "muse");
+    let (w, why) = w8(&late(605_000), "muse");
     assert_eq!(w, "PASS", "{why}");
     assert!(
         why.contains(
-            "the back-off it named due +845.0 s (3 short turn(s) in a row: 8 min back-off)"
+            "the back-off it named due +605.0 s (2 short turn(s) in a row: 4 min back-off)"
         ),
         "{why}"
     );
     fail(
-        &climbed(845_000 + 61_000),
+        &late(605_000 + 61_000),
         "muse",
-        "PERSISTENCE LOST: Cruise's continue-done-check@v1 only at +906.0 s",
+        "PERSISTENCE LOST: Cruise's continue-done-check@v1 only at +666.0 s",
     );
-    let mut s = climbed(845_000);
+    let mut s = late(845_000);
     s.journal.remove(7);
     fail(
         &s,
         "muse",
         "PERSISTENCE LOST: Cruise's continue-done-check@v1 only at +845.0 s",
+    );
+    // NEGATIVE CONTROL: the going on past the wall counted as one more short
+    // turn, three short turns, 8 min, though Cruise's act came at that due
+    let mut s = late(845_000);
+    s.journal[7] = j(
+        365_100,
+        "WAITING seq=3 until=x 3 short turn(s) in a row: 8 min back-off",
+    );
+    fail(
+        &s,
+        "muse",
+        "THE STREAK AFTER THE WALL is not the chain's two short turns (the done claim, the done check the wall cut): WAITING seq=3 until=",
     );
 }
 

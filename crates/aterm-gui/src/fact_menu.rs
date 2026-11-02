@@ -142,7 +142,11 @@ pub(crate) fn weekly_meter_bar(text: &str) -> String {
 fn weekly_pct(text: &str) -> Option<u32> {
     let n = text.split_whitespace().find_map(|w| w.strip_suffix('%'))?;
     let (whole, tenths) = n.split_once('.').unwrap_or((n, ""));
-    let whole = whole.parse::<u32>().ok()?;
+    let whole = whole
+        .bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| whole.parse::<u32>().ok())
+        .flatten()?;
     let tenths = tenths.bytes().any(|b| (b'1'..=b'9').contains(&b));
     Some(whole_left(whole.saturating_mul(10) + u32::from(tenths)))
 }
@@ -364,6 +368,13 @@ pub(crate) struct FactMenuFacts {
     pub(crate) note: Option<String>,
     /// A slash press is in flight for the session: the typed rows wait.
     pub(crate) typing: bool,
+    /// The accounts outlook of Claude Code's pool, from the resolver's snapshot
+    /// ([`crate::accounts_outlook::snapshot`]).
+    pub(crate) outlook: Option<std::sync::Arc<aterm_agent::harness::outlook::Outlook>>,
+    /// The roster label of this session's own account, the outlook's row for "this tab".
+    pub(crate) account_row: Option<String>,
+    /// The pane's rows the card may take, where its height is known.
+    pub(crate) height: Option<usize>,
 }
 
 const HIDEABLE: [FactKind; 5] = [
@@ -383,6 +394,116 @@ fn item(fact: Fact, glyph: &'static str, label: &str, act: FactAct, enabled: boo
         enabled,
         checked: false,
     }
+}
+
+/// A roster row's item on the Accounts card: it chooses `acct` ([`FactAct::UseAccount`]), its
+/// check and its enabling the store's, its words `label` and `spoken`.
+fn account_item(fact: Fact, acct: &AccountMenuRow, label: String, spoken: String) -> MenuRow {
+    MenuRow::Item {
+        glyph: "\u{2386}",
+        label,
+        spoken,
+        act: MenuAct::Fact(fact, FactAct::UseAccount(acct.account)),
+        enabled: acct.enabled,
+        checked: acct.active,
+    }
+}
+
+const fn plot_ink(ink: aterm_agent::harness::outlook::CardInk) -> PlotInk {
+    use aterm_agent::harness::outlook::CardInk;
+    match ink {
+        CardInk::Meter => PlotInk::Meter,
+        CardInk::Track => PlotInk::Track,
+        CardInk::Warn => PlotInk::Warn,
+        CardInk::Value => PlotInk::Value,
+        CardInk::Axis => PlotInk::Axis,
+    }
+}
+
+/// The outlook's card rows ([`aterm_agent::harness::outlook::Outlook::card_rows`]) as menu
+/// rows: its notes, plots and rules as they come, and each roster row's item in roster order
+/// with the act, the check and the enabling of [`FactMenuFacts::accounts`], a row the outlook
+/// has no words for keeping the store's (`docs/DESIGN-accounts-outlook-2026-10-25.md` §8).
+fn outlook_rows(
+    fact: Fact,
+    outlook: &aterm_agent::harness::outlook::Outlook,
+    facts: &FactMenuFacts,
+    height: Option<usize>,
+) -> Vec<MenuRow> {
+    use aterm_agent::harness::outlook::CardRow;
+    let label = facts.account_row.as_deref();
+    let mut card = outlook.card_rows(label, facts.room, height);
+    // The card is 60 cells wide only beside a drawn row (`autopilot_menu::max_content`).
+    if facts.room > autopilot_menu::MAX_CONTENT
+        && !card.iter().any(|row| matches!(row, CardRow::Plot { .. }))
+    {
+        card = outlook.card_rows(label, autopilot_menu::MAX_CONTENT, height);
+    }
+    let map = |row: CardRow| match row {
+        CardRow::Note {
+            text,
+            spoken,
+            warn,
+            value,
+        } => MenuRow::Note {
+            spoken: spoken.unwrap_or_else(|| autopilot_menu::spoken_words(&text)),
+            text,
+            tone: if warn {
+                autopilot_menu::NoteTone::Warn
+            } else if value {
+                autopilot_menu::NoteTone::Value
+            } else {
+                autopilot_menu::NoteTone::Label
+            },
+        },
+        CardRow::Plot { cells, spoken } => MenuRow::plot(
+            cells
+                .into_iter()
+                .map(|(ch, ink)| PlotCell {
+                    ch,
+                    ink: plot_ink(ink),
+                    busy: false,
+                })
+                .collect::<Vec<_>>(),
+            spoken,
+        ),
+        CardRow::Rule | CardRow::Account { .. } => MenuRow::Rule,
+    };
+    let mut head = Vec::new();
+    let mut groups: Vec<(String, String, String, Vec<MenuRow>)> = Vec::new();
+    for row in card {
+        match row {
+            CardRow::Account {
+                label,
+                text,
+                spoken,
+            } => groups.push((label, text, spoken, Vec::new())),
+            row => match groups.last_mut() {
+                Some((.., under)) => under.push(map(row)),
+                None => head.push(map(row)),
+            },
+        }
+    }
+    let mut out = head;
+    for acct in &facts.accounts {
+        match groups
+            .iter()
+            .position(|(label, ..)| label == acct.account.as_str())
+        {
+            Some(at) => {
+                let (_, text, spoken, under) = groups.remove(at);
+                out.push(account_item(fact, acct, text, spoken));
+                out.extend(under);
+            }
+            None => out.push(account_item(
+                fact,
+                acct,
+                acct.label.clone(),
+                acct.label.clone(),
+            )),
+        }
+    }
+    out
 }
 
 fn recovery_observed_line(at: i64) -> String {
@@ -541,6 +662,9 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
                     FactAct::CopyRecovery,
                     true,
                 ));
+                if let Some(limit) = &progress.wall {
+                    out.push(MenuRow::note(format!("Limit: {limit}")));
+                }
                 if progress.phase == aterm_agent::harness::account_progress::ProgressPhase::Watching
                     && progress.wall.is_none()
                 {
@@ -573,7 +697,12 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
                     aterm_agent::harness::footer::ACCOUNT_MARK
                 )));
             }
-            if let Some(meter) = &facts.weekly_meter {
+            // Under the outlook the week's bar row carries the meter (§8.1).
+            if let Some(meter) = facts
+                .weekly_meter
+                .as_ref()
+                .filter(|_| facts.outlook.is_none())
+            {
                 out.push(MenuRow::note(format!(
                     "{}  {meter}",
                     aterm_agent::harness::footer::WEEKLY_MARK
@@ -675,16 +804,23 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
                 });
                 return out;
             }
-            out.push(MenuRow::Rule);
-            for acct in &facts.accounts {
-                out.push(MenuRow::Item {
-                    glyph: "\u{2386}",
-                    label: acct.label.clone(),
-                    spoken: acct.label.clone(),
-                    act: MenuAct::Fact(fact, FactAct::UseAccount(acct.account)),
-                    enabled: acct.enabled,
-                    checked: acct.active,
-                });
+            match &facts.outlook {
+                Some(outlook) => {
+                    // The rows below the head, the auto-rotate and the settings items.
+                    let height = facts.height.map(|h| h.saturating_sub(out.len() + 3));
+                    out.extend(outlook_rows(fact, outlook, facts, height));
+                }
+                None => {
+                    out.push(MenuRow::Rule);
+                    for acct in &facts.accounts {
+                        out.push(account_item(
+                            fact,
+                            acct,
+                            acct.label.clone(),
+                            acct.label.clone(),
+                        ));
+                    }
+                }
             }
             out.push(MenuRow::Rule);
             out.push(MenuRow::Item {
@@ -853,7 +989,8 @@ pub(crate) fn traffic_rows(
                     busy,
                 }
             }));
-            out.push(MenuRow::Plot(cells.into()));
+            // The graph's caption is the peak note below it, for every row of it.
+            out.push(MenuRow::plot(cells, String::new()));
         }
     }
     let minute = |t: i64| {
@@ -872,7 +1009,7 @@ pub(crate) fn traffic_rows(
                 busy: false,
             }),
     );
-    out.push(MenuRow::Plot(axis.into()));
+    out.push(MenuRow::plot(axis, String::new()));
     let (total_in, total_out) = view.totals;
     let tokens = format!(
         "\u{2191}{} in \u{b7} \u{2193}{} out",
@@ -1102,6 +1239,9 @@ pub(crate) fn account_menu_rows_from(
             }
             (accounts::Condition::NotEnrolled, _, false) => "not enrolled".to_string(),
             (_, Some((pct, age)), _) => format!("{pct}% left{age}"),
+            (accounts::Condition::NotEnrolled, None, true) => {
+                format!("{}; quota unknown (auto-login)", cond.as_str())
+            }
             (_, None, _) => format!("{}; quota unknown", cond.as_str()),
         };
         let enabled = !matches!(
@@ -1176,6 +1316,12 @@ impl App {
                         .as_deref()
                         .is_some_and(crate::claude_slash::takes_key_toggle);
                 let facts = facts.filled_from(timeline.claude_card());
+                // The roster row this tab's login is judged to, the outlook's "this tab".
+                out.account_row = facts
+                    .subscription
+                    .as_ref()
+                    .and_then(|s| s.label.clone())
+                    .or_else(|| facts.account.clone());
                 if let Some(sub) = &facts.subscription {
                     let email_str = sub.email.as_deref().filter(|s| !s.is_empty());
                     let plan_str = sub.plan.as_deref().filter(|s| !s.is_empty());
@@ -1216,6 +1362,12 @@ impl App {
         if fact == Fact::Account {
             let cli = self.session_cli(session);
             out.cli = cli;
+            // The outlook the resolver last posted (`docs/DESIGN-accounts-outlook-2026-10-25.md`
+            // §10): no file is read on this thread, and the rows stay the account reader's.
+            out.outlook = (cli == Some(aterm_agent::harness::accounts::Cli::Claude))
+                .then(crate::accounts_outlook::snapshot)
+                .flatten()
+                .and_then(|s| s.outlook.clone());
             (out.refresh_usage, out.own_login) = match program {
                 Some(aterm_phase::Program::Muse) => (
                     true,
@@ -1266,11 +1418,23 @@ impl App {
     }
 
     fn fact_menu_rows(&self, wid: WindowId, session: u64, fact: Fact) -> (Vec<MenuRow>, String) {
-        let pane_cols = self.autopilot_menu_pane(wid, session).1.len();
+        let (pane_rows, pane_cols) = self.autopilot_menu_pane(wid, session);
+        let pane_cols = pane_cols.len();
         if fact != Fact::Usage {
+            let facts = self.fact_menu_facts(session, fact);
+            // The Accounts card under the outlook is up to 60 cells wide, as the traffic card
+            // (§8.1), and as tall as the pane less its border.
             let facts = FactMenuFacts {
-                room: content_room(pane_cols),
-                ..self.fact_menu_facts(session, fact)
+                room: if facts.outlook.is_some() {
+                    content_room_up_to(pane_cols, TRAFFIC_MAX_CONTENT)
+                } else {
+                    content_room(pane_cols)
+                },
+                height: facts
+                    .outlook
+                    .is_some()
+                    .then(|| pane_rows.len().saturating_sub(2)),
+                ..facts
             };
             return (rows(fact, &facts), facts.spoken);
         }
@@ -1365,6 +1529,12 @@ impl App {
     ) {
         self.close_autopilot_menu();
         self.autopilot_menu_spent = None;
+        if fact == Fact::Account {
+            // The resolver looks at the store at its next read and wakes the card on a new
+            // snapshot; the card opens on the one it holds (§10).
+            crate::accounts_outlook::card_open(Some(session));
+            self.request_account_read(session);
+        }
         let (rows, spoken) = self.fact_menu_rows(wid, session, fact);
         let highlight = keyboard
             .then(|| step(&rows, None, true, rows.len()))

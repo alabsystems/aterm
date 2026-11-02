@@ -27,12 +27,14 @@ use std::collections::{BTreeMap, BTreeSet};
 pub(crate) mod command;
 mod configuration;
 mod graph;
+mod intents;
 pub use configuration::Configuration;
 use graph::History;
 pub use graph::State;
 
 pub struct Activations {
     paths: Paths,
+    deadline: Option<std::time::Instant>,
 }
 
 /// A point-in-time authorization. It does not promise unseen offline decisions,
@@ -59,7 +61,25 @@ impl Preparation {
 
 impl Activations {
     pub fn at(paths: Paths) -> Self {
-        Self { paths }
+        Self {
+            paths,
+            deadline: None,
+        }
+    }
+
+    /// Share one deadline across discovery, proposal checks, and durable issue.
+    pub fn at_until(paths: Paths, deadline: std::time::Instant) -> Self {
+        Self {
+            paths,
+            deadline: Some(deadline),
+        }
+    }
+
+    fn proposals(&self) -> super::proposals::Proposals {
+        match self.deadline {
+            Some(deadline) => super::proposals::Proposals::at_until(self.paths.clone(), deadline),
+            None => super::proposals::Proposals::at(self.paths.clone()),
+        }
     }
 
     pub fn initialize(&self) -> Result<Scope> {
@@ -69,6 +89,119 @@ impl Activations {
     pub fn state(&self, account: Digest) -> Result<State> {
         self.with_store(false, |session, store, scope| {
             Ok(History::read(session, store, scope.trust())?.status(account))
+        })
+    }
+
+    /// Read the current root decision and its exact proposal closure. This
+    /// carries no credential or permission to execute; use `prepare` for an
+    /// addressed credential and recheck authority before every effect.
+    pub fn current_configuration(&self, account: Digest) -> Result<(Record, Configuration)> {
+        self.current_configuration_after(account, || {})
+    }
+
+    /// Observe one current root configuration and its currently admitted
+    /// prepared devices with two shared history passes and one configuration
+    /// capture, independent of fleet size.
+    /// This is metadata only; consumers still call `prepare` before key use.
+    pub fn current_configuration_members(
+        &self,
+        account: Digest,
+    ) -> Result<(
+        Record,
+        Configuration,
+        Vec<aterm_secrets::commons::binding::Binding>,
+    )> {
+        self.current_configuration_members_after(account, || {})
+    }
+
+    fn current_configuration_members_after(
+        &self,
+        account: Digest,
+        after: impl FnOnce(),
+    ) -> Result<(
+        Record,
+        Configuration,
+        Vec<aterm_secrets::commons::binding::Binding>,
+    )> {
+        let (record, members) = self.observe_store(|session, store, scope| {
+            let history = History::read(session, store, scope.trust())?;
+            let statuses = history.statuses();
+            let Some(State::Ready(head)) = statuses.get(&account) else {
+                return Err(Error::new("account has no current decision"));
+            };
+            let record = history.records[head].clone();
+            intents::current(&history, &record)?;
+            let members = prepared_members(session, &history, &statuses, &record)?;
+            Ok((record, members))
+        })?;
+        let configuration = Configuration::capture_until(&self.paths, &record, self.deadline)?;
+        after();
+        self.observe_store(|session, store, scope| {
+            let history = History::read(session, store, scope.trust())?;
+            let statuses = history.statuses();
+            if statuses.get(&account) != Some(&State::Ready(record.id())) {
+                return Err(Error::new("account changed during member observation"));
+            }
+            intents::current(&history, &record)?;
+            if prepared_members(session, &history, &statuses, &record)? != members {
+                return Err(Error::new("prepared members changed during observation"));
+            }
+            Ok(())
+        })?;
+        Ok((record, configuration, members.into_keys().collect()))
+    }
+
+    fn current_configuration_after(
+        &self,
+        account: Digest,
+        after_capture: impl FnOnce(),
+    ) -> Result<(Record, Configuration)> {
+        let record = self.observe_store(|session, store, scope| {
+            let history = History::read(session, store, scope.trust())?;
+            let State::Ready(head) = history.status(account) else {
+                return Err(Error::new("account has no unique current root decision"));
+            };
+            let record = history.records[&head].clone();
+            intents::current(&history, &record)?;
+            Ok(record)
+        })?;
+        let configuration = Configuration::capture_until(&self.paths, &record, self.deadline)?;
+        after_capture();
+        self.observe_store(|session, store, scope| {
+            let history = History::read(session, store, scope.trust())?;
+            if history.status(account) != State::Ready(record.id()) {
+                return Err(Error::new("account decision changed during observation"));
+            }
+            intents::current(&history, &record)?;
+            Ok(())
+        })?;
+        Ok((record, configuration))
+    }
+
+    /// Current unambiguous preparations addressed to this installation. This
+    /// supplies discovery, not reusable permission: consumers must call
+    /// `prepare` again before each effect and retain their consumption floor.
+    pub fn local_preparations(&self) -> Result<Vec<(Digest, Digest)>> {
+        self.with_store(false, |session, store, scope| {
+            let history = History::read(session, store, scope.trust())?;
+            let accounts: BTreeSet<_> = history
+                .records
+                .values()
+                .map(|record| record.request().account)
+                .collect();
+            Ok(accounts
+                .into_iter()
+                .filter_map(|account| {
+                    let State::Ready(decision) = history.status(account) else {
+                        return None;
+                    };
+                    intents::current(&history, &history.records[&decision]).ok()?;
+                    session
+                        .permit_account(&history.records[&decision])
+                        .ok()
+                        .map(|()| (account, decision))
+                })
+                .collect())
         })
     }
 
@@ -82,7 +215,7 @@ impl Activations {
         actor: Actor,
         parents: Vec<Digest>,
     ) -> Result<Request> {
-        let snapshot = super::proposals::Proposals::at(self.paths.clone()).snapshot()?;
+        let snapshot = self.proposals().snapshot()?;
         let plan = super::plans::inspect(&snapshot, key)?;
         if plan["complete"].as_bool() != Some(true) {
             return Err(Error::new("account proposal is not complete"));
@@ -128,6 +261,7 @@ impl Activations {
                     method: value["method"].as_str().unwrap().into(),
                     device: session.peer(actor)?,
                     secret,
+                    intent: None,
                 })),
             };
             Ok(request)
@@ -152,9 +286,7 @@ impl Activations {
     pub fn inspect(&self, account: Digest) -> Result<aterm_json::Value> {
         use aterm_codec::hex::encode_lower as hex;
         use aterm_json::json;
-        crate::documents::application::observe_store(
-            &self.paths,
-            descriptor,
+        self.observe_store(
             |session, store, scope| {
                 let history = History::read(session, store, scope.trust())?;
                 let state = history.status(account);
@@ -168,7 +300,7 @@ impl Activations {
                 };
                 let decisions:Vec<_>=history.records.values().filter(|r|r.request().account==account).map(|r|json!({
                 "decision":hex(&r.id()),"generation":r.request().generation,"parents":r.request().parents.iter().map(|p|hex(p)).collect::<Vec<_>>(),
-                "kind":if matches!(r.request().action,Action::Stop){"stop"}else{"prepare"},"control":hex(&r.control()),
+                "kind":match &r.request().action { Action::Stop=>"stop", Action::Intent(_)=>"intent", Action::Prepare(_)=>"prepare" },"control":hex(&r.control()),
                 "authored_at_unix_ms":r.authored_ms(),"time_source":"root-signed-author-claim"
             })).collect();
                 let transport:Vec<_>=store.metadata_evidence(session)?.into_iter().filter_map(|e| {
@@ -195,8 +327,23 @@ impl Activations {
         request: [u8; 16],
         wanted: Request,
     ) -> Result<(Record, Receipt)> {
+        self.issue_in(admin, request, wanted, false)
+    }
+
+    fn issue_in(
+        &self,
+        admin: &Admin,
+        request: [u8; 16],
+        wanted: Request,
+        automatic: bool,
+    ) -> Result<(Record, Receipt)> {
         if request == [0; 16] {
             return Err(Error::new("account publication needs a nonzero request"));
+        }
+        if matches!(&wanted.action, Action::Intent(_))
+            || matches!(&wanted.action, Action::Prepare(p) if p.intent.is_some())
+        {
+            Configuration::capture_request_until(&self.paths, &wanted, self.deadline)?;
         }
         self.with_store(true, |session, store, scope| {
             session.writer()?;
@@ -204,6 +351,7 @@ impl Activations {
             if history.unavailable > 0 {
                 return Err(Error::new("account history is not fully available"));
             }
+            intents::namespace(&history, &wanted)?;
             if let Some(decision) = history.retry(session.actor(), request, &wanted)? {
                 let receipt = store
                     .metadata_evidence(session)?
@@ -221,31 +369,68 @@ impl Activations {
                 return Ok((decision.clone(), receipt));
             }
             history.check_next(&wanted)?;
-            let decision = session.issue_account(admin, wanted)?;
+            let decision = match intents::current_request(&history, &wanted)? {
+                Some(intent) if automatic && !intents::direct_issuer(session, intent)? => session
+                    .issue_account_with_recovered_issuer(
+                    &self.paths,
+                    admin,
+                    wanted,
+                    intent,
+                    self.deadline.unwrap_or_else(crate::admission::deadline),
+                )?,
+                Some(intent) => session.issue_account_with_intent(admin, wanted, intent)?,
+                None => session.issue_account(admin, wanted)?,
+            };
             let mut payload = b"AAOP1".to_vec();
             payload.extend_from_slice(&request);
             payload.extend_from_slice(decision.bytes());
-            let receipt = store.commit_catalog(session, &payload)?;
+            let receipt = crate::documents::application::append(session, store, &payload)?;
             Ok((decision, receipt))
         })
     }
 
     /// Read fresh membership and the full retained root history, then return
-    /// the exact bound credential bytes. No CLI login or provider request runs.
+    /// the exact bound credential bytes from the active writer's recipient.
+    /// A successor still requires the caller's original configured source.
+    /// No CLI login or provider request runs.
     pub fn prepare(
         &self,
         account: Digest,
         expected: &aterm_secrets::client::Config,
     ) -> Result<Preparation> {
-        let observed = self.with_store(false, |session, store, scope| {
+        let (observed, paths) = self.with_store(false, |session, store, scope| {
             let history = History::read(session, store, scope.trust())?;
             let State::Ready(id) = history.status(account) else {
                 return Err(Error::new("account has no complete preparation decision"));
             };
+            intents::current(&history, &history.records[&id])?;
             session.permit_account(&history.records[&id])?;
-            Ok(history.records[&id].clone())
+            Ok((history.records[&id].clone(), session.paths().clone()))
         })?;
-        let configuration = Configuration::capture(&self.paths, &observed)?;
+        let recovered = paths != self.paths;
+        let caller_current = || -> Result<()> {
+            if aterm_secrets::client::config(&self.paths)
+                .map_err(crate::table::failure)?
+                .as_ref()
+                != Some(expected)
+            {
+                return Err(Error::new(
+                    "configured vault changed during account preparation",
+                ));
+            }
+            Ok(())
+        };
+        let credential_config = if recovered
+            && matches!(&observed.request().action, Action::Prepare(p) if p.secret.is_some())
+        {
+            caller_current()?;
+            aterm_secrets::client::config(&paths)
+                .map_err(crate::table::failure)?
+                .ok_or_else(|| Error::new("account credential vault is not configured"))?
+        } else {
+            expected.clone()
+        };
+        let configuration = Configuration::capture_until(&self.paths, &observed, self.deadline)?;
         self.with_store(false, |session, store, scope| {
             let history = History::read(session, store, scope.trust())?;
             let State::Ready(id) = history.status(account) else {
@@ -254,24 +439,33 @@ impl Activations {
                 ));
             };
             let decision = history.records[&id].clone();
+            intents::current(&history, &decision)?;
             if id != observed.id() {
                 return Err(Error::new("account decision changed during preparation"));
             }
             session.permit_account(&decision)?;
             let credential = match &decision.request().action {
-                Action::Prepare(p) if p.secret.is_some() => Some(
-                    aterm_secrets::client::read_account_bound_entry(
-                        &self.paths,
-                        expected,
+                Action::Prepare(p) if p.secret.is_some() => {
+                    if recovered {
+                        caller_current()?;
+                    }
+                    let entry = aterm_secrets::client::read_account_bound_entry(
+                        &paths,
+                        &credential_config,
                         &decision,
                     )
-                    .map_err(crate::table::failure)?
-                    .ok_or_else(|| {
+                    .map_err(crate::table::failure)?;
+                    if recovered {
+                        caller_current()?;
+                    }
+                    Some(entry.ok_or_else(|| {
                         Error::new("account credential does not match its signed binding")
-                    })?,
-                ),
+                    })?)
+                }
                 Action::Prepare(_) => None,
-                Action::Stop => return Err(Error::new("account is stopped")),
+                Action::Stop | Action::Intent(_) => {
+                    return Err(Error::new("account is not a device preparation"));
+                }
             };
             Ok(Preparation {
                 decision,
@@ -286,7 +480,33 @@ impl Activations {
         create: bool,
         action: impl FnOnce(&Session<'_>, &mut Store, Scope) -> Result<T>,
     ) -> Result<T> {
-        crate::documents::application::with_store(&self.paths, create, descriptor, action)
+        match self.deadline {
+            Some(deadline) => crate::documents::application::with_store_until(
+                &self.paths,
+                create,
+                descriptor,
+                deadline,
+                action,
+            ),
+            None => {
+                crate::documents::application::with_store(&self.paths, create, descriptor, action)
+            }
+        }
+    }
+
+    fn observe_store<T>(
+        &self,
+        action: impl FnOnce(&Session<'_>, &Store, Scope) -> Result<T>,
+    ) -> Result<T> {
+        match self.deadline {
+            Some(deadline) => crate::documents::application::observe_store_until(
+                &self.paths,
+                descriptor,
+                deadline,
+                action,
+            ),
+            None => crate::documents::application::observe_store(&self.paths, descriptor, action),
+        }
     }
 }
 
@@ -311,5 +531,57 @@ fn next_generation(history: &History, parents: &[Digest]) -> Result<u64> {
         .ok_or_else(|| Error::new("account decision generation exhausted"))
 }
 
+fn prepared_members(
+    session: &Session<'_>,
+    history: &History,
+    statuses: &BTreeMap<Digest, State>,
+    record: &Record,
+) -> Result<BTreeMap<aterm_secrets::commons::binding::Binding, Digest>> {
+    let incompatible = if matches!(record.request().action, Action::Intent(_)) {
+        intents::invalid_device_namespaces(history, record.request().account)
+    } else {
+        BTreeSet::new()
+    };
+    let current = session.observed_account_targets()?;
+    let mut counts = BTreeMap::new();
+    for member in &current {
+        *counts.entry(*member.machine()).or_insert(0usize) += 1;
+    }
+    let mut result = BTreeMap::new();
+    for member in current {
+        if counts[member.machine()] != 1 {
+            continue;
+        }
+        match &record.request().action {
+            Action::Prepare(terms) if terms.device == member => {
+                result.insert(member, record.id());
+            }
+            Action::Intent(intent) => {
+                let reference = aterm_secrets::commons::accounts::IntentRef {
+                    account: record.request().account,
+                    decision: record.id(),
+                };
+                let account = reference.device_account(&member);
+                if incompatible.contains(&account) {
+                    continue;
+                }
+                let Some(State::Ready(head)) = statuses.get(&account) else {
+                    continue;
+                };
+                let child = &history.records[head];
+                if matches!(&child.request().action,Action::Prepare(terms) if **terms==intent.for_device(reference,member.clone()))
+                {
+                    result.insert(member, *head);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod frontier_tests;

@@ -606,6 +606,82 @@ fn light_grains_are_ink_and_keep_off_the_letters() {
     }
 }
 
+/// Sparkle's paper marks keep off the typed line's letters behind the caret.
+/// Two beads a typed space shed hovered in the blank cell between `&&` and
+/// the caret on the paper Settings card, two stacked gold rings that read as
+/// a typed `:` (composed r2's judges). A mark in the glyph band of the caret's
+/// row, short of the caret, within two columns of a letter is not drawn on
+/// paper; the air past the caret keeps its sparkle, and the dark shower (a
+/// soft glow, not a rimmed bead) is as it was. Control:
+/// `sparkle_typed_band_open` draws the mark among the letters again.
+#[test]
+fn a_paper_sparkle_mark_keeps_off_the_letters_just_typed() {
+    let g = geom();
+    let at = Instant::now();
+    let caret = 24u16;
+    let draws = |dark: bool, col: u16, seed: u32, open: bool| {
+        let mut c = cfg(GlowStyle::Sparkle, true);
+        c.dark_theme = dark;
+        if !dark {
+            c.theme_fg = 0x001F_2328;
+            c.theme_bg = 0x00FF_FFFF;
+        }
+        let mut glow = CursorGlow::default();
+        let mut row = [' '; 40];
+        for (i, ch) in "md && ".chars().enumerate() {
+            row[17 + i] = ch;
+        }
+        let blank = [' '; 40];
+        glow.observe_row(2, caret, &row, at);
+        glow.observe_neighbor_rows(Some(&blank), Some(&blank));
+        let mut out = Vec::new();
+        glow.tick(Some((2, caret)), at, &c, g, &mut out);
+        glow.particles.clear();
+        glow.sparkle_typed_band_open = open;
+        let (x, y) = g.cell_center(2, col);
+        glow.particles.push(Particle {
+            vx: 30.0,
+            vy: -20.0,
+            ..grain(x, y, seed_hue(seed), at)
+        });
+        let (mut out, mut halos, mut under) = (Vec::new(), Vec::new(), Vec::new());
+        glow.emit_particles(
+            at,
+            &c,
+            g,
+            &mut out,
+            &mut halos,
+            &mut crate::cursor_glow::glow_sink(
+                &mut under,
+                &mut aterm_render::GlowRamps::default(),
+                true,
+            ),
+            CursorGlow::MAX_QUADS,
+        );
+        !out.is_empty() || !halos.is_empty() || !under.is_empty()
+    };
+    // Column 22 is the blank cell after `&&` (columns 20 and 21), column 23
+    // the typed space under the caret's reach, column 30 the air past it.
+    for seed in [1u32, 4, 5, 7] {
+        assert!(
+            !draws(false, 22, seed, false),
+            "seed {seed}: a paper mark among the letters just typed reads as a letter"
+        );
+        assert!(
+            draws(false, 30, seed, false),
+            "seed {seed}: a paper mark in the air past the caret draws"
+        );
+        assert!(
+            draws(true, 22, seed, false),
+            "seed {seed}: the dark shower's glow among the typed letters is as it was"
+        );
+        assert!(
+            draws(false, 22, seed, true),
+            "seed {seed}: control: with the typed band open the paper mark draws among the letters"
+        );
+    }
+}
+
 #[test]
 fn a_full_pool_sheds_the_oldest_grains_never_the_head() {
     let g = geom();
@@ -1350,7 +1426,12 @@ fn dense_row_marks(
         (c.dark_theme, c.theme_fg) = (false, 0x001F_2328);
     }
     let at = Instant::now();
-    let mut glow = CursorGlow::default();
+    // One frame laid on its own: the air past the caret has held clear
+    // before it ([`CursorGlow::DENSE_SEAT_HOLD_S`]).
+    let mut glow = CursorGlow {
+        dense_seat_unheld: true,
+        ..CursorGlow::default()
+    };
     seams(&mut glow);
     let mut cells = vec![vec![RenderCell::default(); g.cols]; g.rows];
     let mut typed = vec![' '; g.cols];
@@ -1743,9 +1824,12 @@ fn a_dense_row_s_seat_holds_while_the_caret_crosses_a_gap() {
             (c.dark_theme, c.theme_fg) = (false, 0x001F_2328);
         }
         let at = Instant::now();
+        // One instant for every frame: the air past the caret has held
+        // clear before it ([`CursorGlow::DENSE_SEAT_HOLD_S`]).
         let mut glow = CursorGlow {
             dense_seat_at_caret: at_caret,
             dense_embers_level: true,
+            dense_seat_unheld: true,
             ..CursorGlow::default()
         };
         // Row 1 lettered from column 10 on (air above the gap's column), row
@@ -1859,5 +1943,123 @@ fn a_dense_row_s_seat_holds_while_the_caret_crosses_a_gap() {
                 old[0].len()
             );
         }
+    }
+}
+
+/// Composed E2, A DENSE ROW'S SEATS HOLD BEFORE THEY LIGHT
+/// ([`CursorGlow::DENSE_SEAT_HOLD_S`]): Sparkle's stars and moons and Fire's
+/// embers seated in the air past the caret lie where a shell's ghost text
+/// lands (fish draws its autosuggestion after the keystroke's echo). Typing
+/// a dense row on the reference dark, 80 ms a key on a 16 ms frame grid,
+/// each echo lands a frame before a hint past the caret: the air past the
+/// caret shows no seated mark for a run of fewer than three frames that the
+/// hint then puts out, so the seats do not flash on each key. Typing the
+/// same row with no hint, seated marks show. Negative control: seats lit
+/// the frame the air turns clear (`dense_seat_unheld`) flash under the hint
+/// on the keys.
+#[test]
+fn a_dense_row_s_seated_marks_do_not_flash_before_a_late_hint() {
+    use aterm_core::terminal::RenderCell;
+    let g = geom();
+    let page = 0x0011_1318u32;
+    let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+    let row = 2u16;
+    // Whether a seated mark shows past the caret, frame by frame.
+    let lay = |style: GlowStyle, hint: bool, unheld: bool| -> Vec<bool> {
+        let mut c = cfg(style, true);
+        c.theme_bg = page;
+        let mut glow = CursorGlow {
+            dense_seat_unheld: unheld,
+            ..CursorGlow::default()
+        };
+        let mut text = vec![' '; g.cols];
+        let t0 = Instant::now();
+        let mut caret = 6u16;
+        let mut lit = Vec::new();
+        for f in 0..=60u64 {
+            let t = t0 + Duration::from_millis(16 * f);
+            if f > 0 && f % 5 == 0 {
+                text[usize::from(caret)] = 'm';
+                caret += 1;
+                glow.note_synthetic_typed(t, 1);
+            }
+            let hinted = hint && f % 5 != 0;
+            let shown: Vec<char> = (0..g.cols)
+                .map(|col| {
+                    let past = col >= usize::from(caret) && col < usize::from(caret) + 6;
+                    if hinted && past { 's' } else { text[col] }
+                })
+                .collect();
+            let mut cells = vec![vec![RenderCell::default(); g.cols]; g.rows];
+            for (r, line) in cells.iter_mut().enumerate() {
+                for (col, cell) in line.iter_mut().enumerate() {
+                    cell.bg = rgb(page);
+                    if r + 1 == usize::from(row) || r == usize::from(row) + 1 {
+                        (cell.ch, cell.bg) = ('m', rgb(0x0026_4F78));
+                    } else if r == usize::from(row) {
+                        cell.ch = shown[col];
+                    }
+                }
+            }
+            glow.observe_row(row, caret, &shown, t);
+            glow.observe_frame_text(Some((row, caret)), &cells, t);
+            let mut out = Vec::new();
+            glow.tick(Some((row, caret)), t, &c, g, &mut out);
+            let caret_box = CursorGlow::caret_box(g, row, caret);
+            // A cell past the caret's own edge: the seats, not the caret's
+            // glow the letter guard cuts at the hint.
+            let from = caret_box.2 + g.cw as i32;
+            let (top, bottom) = (caret_box.1, caret_box.3);
+            let mark = |x: u16, y: u16, w: u16, h: u16| {
+                let (x, y, w, h) = (i32::from(x), i32::from(y), i32::from(w), i32::from(h));
+                x >= from && y >= top && y + h <= bottom && w <= g.ch as i32
+            };
+            lit.push(
+                out.iter()
+                    .chain(glow.under_quads())
+                    .any(|q| mark(q.x, q.y, q.w, q.h))
+                    || glow.halos().iter().any(|h| mark(h.x, h.y, h.w, h.h)),
+            );
+        }
+        lit
+    };
+    let flashes = |lit: &[bool]| {
+        let (mut n, mut run) = (0usize, 0usize);
+        for &on in lit {
+            if on {
+                run += 1;
+            } else {
+                n += usize::from(run > 0 && run < 3);
+                run = 0;
+            }
+        }
+        n
+    };
+    let shown = |lit: &[bool]| {
+        lit.iter()
+            .map(|&on| if on { '#' } else { '.' })
+            .collect::<String>()
+    };
+    for style in [GlowStyle::Sparkle, GlowStyle::Fire] {
+        let hinted = lay(style, true, false);
+        assert_eq!(
+            flashes(&hinted),
+            0,
+            "{style:?}: the seats flash before the hint: {}",
+            shown(&hinted)
+        );
+        let bare = lay(style, false, false);
+        assert!(
+            bare.iter().filter(|&&on| on).count() >= 20,
+            "{style:?}: with no hint the seats show: {}",
+            shown(&bare)
+        );
+        let unheld = lay(style, true, true);
+        assert!(
+            flashes(&unheld) >= 6,
+            "control: {style:?}'s seats lit the frame the air turns clear flash {} times: {}",
+            flashes(&unheld),
+            shown(&unheld)
+        );
     }
 }

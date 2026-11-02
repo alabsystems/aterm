@@ -4,6 +4,10 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/common/xkb/compose.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
+//! Modified by the aterm project in 2026; see the repository NOTICE. (`SmolStr` from
+//! `crate::keyboard`. libxkbcommon's compose entry points are first-party aterm-xkb's, where
+//! upstream used xkbcommon-dl's: docs/AUDIT-third-party-2026-10-15.md, LW.7.)
+//!
 //! XKB compose handling.
 
 use std::env;

@@ -4,6 +4,8 @@
 //! Process-global render/latency counters, read over the control socket by the `metrics` verb so a driver can measure responsiveness and detect lag directly.
 
 pub(crate) mod instrument;
+#[cfg(test)]
+mod key_queue_tests;
 #[cfg(all(unix, any(test, debug_assertions)))]
 mod restore_experiment;
 pub(crate) mod startup;
@@ -37,6 +39,9 @@ pub(crate) use startup::{
 };
 #[cfg(target_os = "macos")]
 pub(crate) use startup::{mark_handoff_claimed, process_main_start};
+use std::cell::Cell;
+use std::marker::PhantomData;
+use std::rc::Rc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -44,11 +49,62 @@ use std::time::{Duration, Instant};
 /// The process's metrics, written by the App and read by the control thread's `metrics` verb.
 pub(crate) static METRICS: Metrics = Metrics::new();
 
+#[derive(Clone, Copy)]
+struct KeyArrival {
+    // Identity only: never dereferenced. The scope borrows this metrics root.
+    metrics: *const Metrics,
+    at_ns: u64,
+    queue_measured: bool,
+}
+
+/// One claimed write's dispatch clock and whether its native queue age was observed.
+/// A missing stamp is control/release input, not an unavailable hardware measurement.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct KeyWriteStamp {
+    at_ns: u64,
+    queue_measured: bool,
+}
+
+thread_local! {
+    static KEY_ARRIVAL: Cell<Option<KeyArrival>> = const { Cell::new(None) };
+}
+
+/// Restores the enclosing hardware dispatch; only closure-scoped entry exposes it.
+struct KeyArrivalScope<'a> {
+    previous: Option<KeyArrival>,
+    _metrics: &'a Metrics,
+    _thread: PhantomData<Rc<()>>,
+}
+
+impl Drop for KeyArrivalScope<'_> {
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DispatchClockOwnership",
+            action = "ExitInner",
+            project = "aterm_gui::metrics::dispatch_clock_ownership_tests::ownership_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DispatchClockOwnership",
+            action = "ExitOuter",
+            project = "aterm_gui::metrics::dispatch_clock_ownership_tests::ownership_transition"
+        )
+    )]
+    fn drop(&mut self) {
+        KEY_ARRIVAL.with(|arrival| arrival.set(self.previous));
+    }
+}
+
 /// A metrics root: the measurement window, the live state beside it, and the window's epoch.
 pub(crate) struct Metrics {
     pub(crate) window: Window,
     pub(crate) live: Live,
     epoch: AtomicU64,
+    /// Chrome receipts never repeat across windows or measurement resets.
+    chrome_generation: AtomicU64,
 }
 
 impl Metrics {
@@ -57,6 +113,7 @@ impl Metrics {
             window: Window::new(),
             live: Live::new(),
             epoch: AtomicU64::new(0),
+            chrome_generation: AtomicU64::new(0),
         }
     }
 
@@ -93,6 +150,27 @@ window_ledger! {
         /// When the worst `latency` was booked (`now_ns`), and the gap since its window's previous present.
         pub(crate) latency_at: Last,
         pub(crate) latency_gap: Last,
+        /// The worst `latency`'s own frame: its `render`, its redraw's `pre_present` and
+        /// `acquire_wait` (the latest of each when it presented, so a second window's redraw in
+        /// between would be read as its own), and how long its window had shown nothing before it,
+        /// whether or not that stretch began before the measurement window.
+        pub(crate) latency_render: Last,
+        pub(crate) latency_pre_present: Last,
+        pub(crate) latency_acquire: Last,
+        pub(crate) latency_idle: Last,
+        /// The worst `latency`'s frame from its compose's end to its present's booking: the wall
+        /// time, the UI thread's CPU time in it (off a core for the rest: blocked or preempted),
+        /// the process's page faults in it (those three read only by a debug or `dev-seams`
+        /// build, 0 in a shipped one), and its GPU encode ([`GpuLedger::encode_last`]).
+        pub(crate) latency_submit_wall: Last,
+        pub(crate) latency_submit_cpu: Last,
+        pub(crate) latency_submit_faults: Last,
+        pub(crate) latency_encode: Last,
+        /// The latest frame's (`last_submit_ms`, `last_submit_cpu_ms`, `last_submit_faults`), as
+        /// [`record_present`] closed them for the snapshot above (debug and `dev-seams` builds).
+        pub(crate) submit_wall: Last,
+        pub(crate) submit_cpu: Last,
+        pub(crate) submit_faults: Last,
         pub(crate) tainted: Dist,
         /// Output→present samples diverted to `tainted`.
         pub(crate) tainted_samples: Counter,
@@ -102,6 +180,23 @@ window_ledger! {
         pub(crate) capture_presents: Counter,
         /// Causal frame CPU work: compose plus CPU raster/copy, or encoding GPU commands and calling `queue.submit`.
         pub(crate) render: Dist,
+        /// A present that showed a changed stats deck card: main-thread time from what asked for it (the deck clock's tick, else the redraw's entry) to the present's return. `present_*` books none of the deck's frames, which are not PTY output.
+        pub(crate) deck_frame: Dist,
+        /// The deck clock (`stats_clock.rs`): the vsyncs it delivered, those whose sample of the
+        /// deck asked for a frame, and how long, ns, some window's clock ran.
+        pub(crate) deck_clock_ticks: Counter,
+        pub(crate) deck_clock_frames: Counter,
+        pub(crate) deck_clock_run: Counter,
+        /// The deck clock's display links (`stats_clock.rs`, `LINK_SILENCE`): the ticks the links
+        /// themselves sent, the times a link asked to run sent none for `LINK_SILENCE` and its
+        /// window's clock fell back to the loop's timer, and the times such a link ticked again
+        /// and its clock went back on it.
+        pub(crate) deck_clock_link_ticks: Counter,
+        pub(crate) deck_clock_link_fallbacks: Counter,
+        pub(crate) deck_clock_link_resumes: Counter,
+        /// A deck frame's lateness on glass: its drawable's `presentedTime` after the vsync its
+        /// clock tick targeted, 0 when on time (Metal on screen only).
+        pub(crate) deck_glass_late: Dist,
         /// Frames whose `render` exceeded [`SLOW_FRAME_THRESHOLD_NS`].
         pub(crate) slow: Counter,
         pub(crate) frame_gap: Max,
@@ -132,6 +227,10 @@ window_ledger! {
         pub(crate) key_write: Dist,
         /// The NSEvent-QUEUE RESIDENCE that `key_write` is BACKDATED by: how long each hardware key sat in the OS event queue before the loop dispatched it.
         pub(crate) key_queue: Dist,
+        /// Presses without a usable native queue clock; excluded from `key_queue`.
+        pub(crate) key_queue_unavailable: Counter,
+        /// Completed writes with only a dispatch-time fallback; excluded from `key_write`.
+        pub(crate) key_write_unavailable: Counter,
         pub(crate) out_req: Dist,
         pub(crate) ime: Histogram,
         pub(crate) ime_cancelled: Counter,
@@ -162,6 +261,12 @@ window_ledger! {
         pub(crate) total: Peak,
         pub(crate) attempts: Counter,
         pub(crate) early_outs: Counter,
+        /// Overlay-only presents (`docs/DESIGN-stats-deck-gpu-motion-2026-10-26.md` §3.3): frames
+        /// whose only change was the deck's, which the renderer showed as the last frame with the
+        /// deck's new tray.
+        pub(crate) overlay_presents: Counter,
+        /// Deck-only frames the renderer would not show overlay-only, presented in full instead.
+        pub(crate) overlay_refusals: Counter,
         pub(crate) sync_holds: Counter,
         pub(crate) retry_gated: Counter,
         pub(crate) refills_scoped: Counter,
@@ -227,9 +332,16 @@ window_ledger! {
         pub(crate) streak_heals_by_owner: Tally<{ DeadlineOwner::COUNT }>,
         pub(crate) wake_late: MaxBy,
         pub(crate) deadline_late: MaxBy,
-        /// Readings that set the dial's needle sweeping, and the frames their episodes owe the windows that animate a dial ([`crate::stats_needle::Needle::frames_owed`]): each a `stats_needle` deadline, so that owner's fires in a window are at most these and what the episode in flight as it opened had left to fire ([`needle_episode_left`]), while no window moves to a faster display mid-episode.
+        /// Readings that set the dial's needle sweeping, and the frames their episodes owe the windows that animate a dial ([`crate::stats_needle::Needle::frames_owed`]): each a frame of a window's deck clock, so its `deck_clock` deadlines' fires in a window are at most these and what the episode in flight as it opened had left to fire ([`needle_episode_left`]), while no window moves to a faster display mid-episode.
         pub(crate) needle_sweeps: Counter,
         pub(crate) needle_frames_owed: Counter,
+        /// The vitals reader's latest reading on [`now_ns`]'s clock (0: none since the reset): when
+        /// the loop asked it, when the reader began it, and when the reader handed it over. A
+        /// window's first key after rest reads these beside its own booking
+        /// (`max_input_present_at_ms`) to tell whether a reading ran beside its echo and frame.
+        pub(crate) reading_asked: Last,
+        pub(crate) reading_began: Last,
+        pub(crate) reading_handed: Last,
     }
 }
 
@@ -292,6 +404,10 @@ window_ledger! {
         /// aterm-core's fx layer seals and payload deep copies (`aterm_core::render::fx_layer_builds`, `fx_payload_copies`) since the reset.
         pub(crate) fx_layer_builds: Baselined,
         pub(crate) fx_payload_copies: Baselined,
+        /// The renderer's tray card uploads, the bytes they sent, and the card bytes it compared against the last upload to find what changed, since the reset (`GpuRenderer::tray_uploads`, `tray_upload_bytes`, `tray_compare_bytes`).
+        pub(crate) tray_uploads: Baselined,
+        pub(crate) tray_upload_bytes: Baselined,
+        pub(crate) tray_compare_bytes: Baselined,
     }
 }
 
@@ -326,6 +442,8 @@ pub(crate) struct Live {
     pub(crate) backend_gpu: AtomicBool,
     pub(crate) perf_reduced: AtomicBool,
     pub(crate) sync_holding_windows: AtomicU64,
+    /// Windows whose deck clock's display link fell silent ([`DeckLinkSilence`]).
+    pub(crate) deck_links_silent: AtomicU64,
     pub(crate) capture_depth: AtomicU64,
     pub(crate) taint_until: AtomicU64,
     pub(crate) fx_glow_quads_last: AtomicU64,
@@ -337,10 +455,9 @@ pub(crate) struct Live {
     pub(crate) last_deadline_owner: AtomicU64,
     pub(crate) last_deadline_due: AtomicU64,
     pub(crate) last_deadline_late: AtomicU64,
-    pub(crate) lat_key: AtomicU64,
     pub(crate) handoff_input_dropped: AtomicU64,
     pub(crate) handoff_input_incoherent: AtomicU64,
-    /// The frames the needle's latest episode owed the windows when its reading landed (0 where it rested), and the `stats_needle` deadlines fired since.
+    /// The frames the needle's latest episode owed the windows when its reading landed (0 where it rested), and the `deck_clock` deadlines fired since.
     pub(crate) needle_episode_owed: AtomicU64,
     pub(crate) needle_episode_fired: AtomicU64,
     pub(crate) pty_sessions: AtomicUsize,
@@ -353,6 +470,7 @@ impl Live {
             backend_gpu: AtomicBool::new(false),
             perf_reduced: AtomicBool::new(false),
             sync_holding_windows: AtomicU64::new(0),
+            deck_links_silent: AtomicU64::new(0),
             capture_depth: AtomicU64::new(0),
             taint_until: AtomicU64::new(0),
             fx_glow_quads_last: AtomicU64::new(0),
@@ -364,7 +482,6 @@ impl Live {
             last_deadline_owner: AtomicU64::new(0),
             last_deadline_due: AtomicU64::new(0),
             last_deadline_late: AtomicU64::new(0),
-            lat_key: AtomicU64::new(0),
             handoff_input_dropped: AtomicU64::new(0),
             handoff_input_incoherent: AtomicU64::new(0),
             needle_episode_owed: AtomicU64::new(0),
@@ -483,6 +600,7 @@ label_enum! {
         HandoffPark => "handoff_park",
         MessageBandMotion => "message_band_motion",
         SessionWaits => "session_waits",
+        AosEchoHold => "aos_echo_hold",
         InputWatch => "input_watch",
         CrashJournal => "crash_journal",
         UpdateChecker => "update_checker",
@@ -504,7 +622,8 @@ label_enum! {
         StatsLens => "stats_lens",
         AgentsPanel => "agents_panel",
         StatsLive => "stats_live",
-        StatsNeedle => "stats_needle",
+        DeckClock => "deck_clock",
+        NativeMotion => "native_motion",
     }
 }
 
@@ -658,6 +777,28 @@ pub(crate) fn note_gpu_park(ns: u64) {
     let _ = METRICS.window.redraw.gpu_park.record(ns);
 }
 
+/// A step of the vitals reader's latest reading, now ([`SchedLedger::reading_asked`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadingStep {
+    /// The loop asked it.
+    Asked,
+    /// The reader began it.
+    Began,
+    /// The reader handed it over.
+    Handed,
+}
+
+/// Stamps `step` of the vitals reader's latest reading at [`now_ns`].
+pub(crate) fn note_reading(step: ReadingStep) {
+    let sched = &METRICS.window.sched;
+    let stamp = match step {
+        ReadingStep::Asked => &sched.reading_asked,
+        ReadingStep::Began => &sched.reading_began,
+        ReadingStep::Handed => &sched.reading_handed,
+    };
+    stamp.set(now_ns());
+}
+
 /// A frame whose causal CPU work exceeds the ~30 fps (33.3 ms) budget below which interaction visibly stutters.
 pub(crate) const SLOW_FRAME_THRESHOLD_NS: u64 = 33_333_333;
 
@@ -738,6 +879,8 @@ pub(crate) fn record_present(
     observer: &mut PresentObserver,
     capture_forced: bool,
 ) {
+    #[cfg(any(debug_assertions, feature = "dev-seams"))]
+    submit_split::close();
     let clock = PresentClock::read(&METRICS, capture_forced);
     startup::STARTUP.publish_first_present(startup_timing);
     let booking = METRICS.record_present_at(clock, latency_ns, render_ns, window, observer);
@@ -792,6 +935,28 @@ impl Metrics {
                 if present.latency.record(latency_ns) {
                     present.latency_at.set(now);
                     present.latency_gap.set(since_previous_present);
+                    present.latency_render.set(render_ns);
+                    present
+                        .latency_pre_present
+                        .set(self.window.redraw.pre_present.last());
+                    present
+                        .latency_acquire
+                        .set(self.window.redraw.acquire_wait.last());
+                    present.latency_idle.set(
+                        window
+                            .as_deref()
+                            .map(|w| w.last_present_ns)
+                            .filter(|&at| at != 0)
+                            .map_or(0, |at| now.saturating_sub(at)),
+                    );
+                    present.latency_submit_wall.set(present.submit_wall.get());
+                    present.latency_submit_cpu.set(present.submit_cpu.get());
+                    present
+                        .latency_submit_faults
+                        .set(present.submit_faults.get());
+                    present
+                        .latency_encode
+                        .set(self.window.gpu.encode_last.get());
                 }
                 observer.note_slow_present(
                     self,
@@ -1010,6 +1175,82 @@ pub(crate) fn note_gpu_frame(shape: aterm_gpu::FrameShape, encode_ns: u64) {
     METRICS.window.gpu.note_frame(shape, encode_ns);
 }
 
+/// The renderer's running tray card totals: uploads, bytes uploaded and card bytes compared
+/// (`GpuRenderer::tray_uploads`, `tray_upload_bytes`, `tray_compare_bytes`). One renderer serves
+/// every window, so each total only rises.
+pub(crate) fn note_tray_totals(uploads: u64, upload_bytes: u64, compare_bytes: u64) {
+    let gpu = &METRICS.window.gpu;
+    gpu.tray_uploads.raise_total(uploads);
+    gpu.tray_upload_bytes.raise_total(upload_bytes);
+    gpu.tray_compare_bytes.raise_total(compare_bytes);
+}
+
+/// A present that showed a changed stats deck card, `ns` after what asked for it
+/// ([`PresentLedger::deck_frame`]).
+pub(crate) fn note_deck_frame(ns: u64) {
+    let _ = METRICS.window.present.deck_frame.record(ns);
+}
+
+/// A vsync the deck clock delivered, and whether its sample asked for a frame
+/// ([`PresentLedger::deck_clock_ticks`]).
+pub(crate) fn note_deck_clock_tick(asked: bool) {
+    let present = &METRICS.window.present;
+    present.deck_clock_ticks.add(1);
+    if asked {
+        present.deck_clock_frames.add(1);
+    }
+}
+
+/// `ns` more of some window's deck clock running ([`PresentLedger::deck_clock_run`]).
+pub(crate) fn note_deck_clock_run(ns: u64) {
+    METRICS.window.present.deck_clock_run.add(ns);
+}
+
+/// A tick some window's display link sent ([`PresentLedger::deck_clock_link_ticks`]).
+pub(crate) fn note_deck_link_tick() {
+    METRICS.window.present.deck_clock_link_ticks.inc();
+}
+
+/// Some window's display link fell silent and its deck clock fell back to the loop's timer
+/// ([`PresentLedger::deck_clock_link_fallbacks`]).
+pub(crate) fn note_deck_link_silent() {
+    METRICS.window.present.deck_clock_link_fallbacks.inc();
+}
+
+/// A silent display link ticked and its window's deck clock went back on it
+/// ([`PresentLedger::deck_clock_link_resumes`]).
+pub(crate) fn note_deck_link_resumed() {
+    METRICS.window.present.deck_clock_link_resumes.inc();
+}
+
+/// How many windows' deck clocks have a silent display link now ([`Live::deck_links_silent`]).
+pub(crate) fn deck_links_silent() -> u64 {
+    METRICS.live.deck_links_silent.load(Ordering::Relaxed)
+}
+
+/// A window's lease on [`Live::deck_links_silent`]: whether its deck clock's display link fell
+/// silent (`stats_clock::LINK_SILENCE`). A dropped window lets go.
+#[derive(Debug, Default)]
+pub(crate) struct DeckLinkSilence {
+    held: bool,
+}
+
+impl DeckLinkSilence {
+    pub(crate) fn set(&mut self, silent: bool) {
+        transition_window_gauge(&mut self.held, silent, &METRICS.live.deck_links_silent);
+    }
+
+    pub(crate) const fn get(&self) -> bool {
+        self.held
+    }
+}
+
+impl Drop for DeckLinkSilence {
+    fn drop(&mut self) {
+        transition_window_gauge(&mut self.held, false, &METRICS.live.deck_links_silent);
+    }
+}
+
 const fn ablation_code(mode: aterm_gpu::UnormAblation) -> u8 {
     use aterm_gpu::UnormAblation::{Drop, Off, Thin};
     match mode {
@@ -1188,10 +1429,16 @@ fn emit_gpu(ctx: &wire::ReadCtx, s: &mut dyn wire::FieldSink) {
     }
     s.count("fx_layer_builds", gpu.fx_layer_builds.since_reset());
     s.count("fx_payload_copies", gpu.fx_payload_copies.since_reset());
+    s.count("tray_uploads", gpu.tray_uploads.since_reset());
+    s.count("tray_upload_bytes", gpu.tray_upload_bytes.since_reset());
+    s.count("tray_compare_bytes", gpu.tray_compare_bytes.since_reset());
 }
 
 fn note_present_glass(report: aterm_gpu::present_glass::GlassReport) {
     METRICS.window.glass.note(report);
+    if let Some(late) = report.deck_late_ns {
+        let _ = METRICS.window.present.deck_glass_late.record(late);
+    }
 }
 
 impl GlassLedger {
@@ -1449,7 +1696,48 @@ fn emit_lateness(ctx: &wire::ReadCtx, s: &mut dyn wire::FieldSink) {
         "max_present_latency_gap_ms",
         ms(w.present.latency_gap.get()),
     );
+    s.decimal(
+        "max_present_latency_render_ms",
+        ms(w.present.latency_render.get()),
+    );
+    s.decimal(
+        "max_present_latency_pre_present_ms",
+        ms(w.present.latency_pre_present.get()),
+    );
+    s.decimal(
+        "max_present_latency_acquire_ms",
+        ms(w.present.latency_acquire.get()),
+    );
+    s.decimal(
+        "max_present_latency_idle_ms",
+        ms(w.present.latency_idle.get()),
+    );
+    s.decimal(
+        "max_present_latency_submit_wall_ms",
+        ms(w.present.latency_submit_wall.get()),
+    );
+    s.decimal(
+        "max_present_latency_submit_cpu_ms",
+        ms(w.present.latency_submit_cpu.get()),
+    );
+    s.decimal(
+        "max_present_latency_encode_ms",
+        ms(w.present.latency_encode.get()),
+    );
+    s.decimal("last_submit_ms", ms(w.present.submit_wall.get()));
+    s.decimal("last_submit_cpu_ms", ms(w.present.submit_cpu.get()));
+    s.count("last_submit_faults", w.present.submit_faults.get());
+    s.count(
+        "max_present_latency_submit_faults",
+        w.present.latency_submit_faults.get(),
+    );
     s.decimal("max_input_present_at_ms", ms(w.input.input_at.get()));
+    s.decimal("last_reading_asked_at_ms", ms(w.sched.reading_asked.get()));
+    s.decimal("last_reading_began_at_ms", ms(w.sched.reading_began.get()));
+    s.decimal(
+        "last_reading_handed_at_ms",
+        ms(w.sched.reading_handed.get()),
+    );
     s.decimal("metrics_now_ms", ms(ctx.now_ns));
 }
 
@@ -1600,19 +1888,115 @@ struct DrainedEdge {
 }
 
 impl Metrics {
-    fn input_arrival_ns(&self, now: u64) -> u64 {
-        let key = self.live.lat_key.load(Ordering::Relaxed);
-        if key != 0 && now.saturating_sub(key) < 500_000_000 {
-            key
-        } else {
-            now
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DispatchClockOwnership",
+            action = "EnterOuter",
+            project = "aterm_gui::metrics::dispatch_clock_ownership_tests::ownership_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DispatchClockOwnership",
+            action = "EnterInner",
+            project = "aterm_gui::metrics::dispatch_clock_ownership_tests::ownership_transition"
+        )
+    )]
+    fn with_key_arrival_at<R>(
+        &self,
+        at_ns: u64,
+        queue_measured: bool,
+        dispatch: impl FnOnce() -> R,
+    ) -> R {
+        let previous = KEY_ARRIVAL.with(|arrival| {
+            arrival.replace(Some(KeyArrival {
+                metrics: std::ptr::from_ref(self),
+                at_ns,
+                queue_measured,
+            }))
+        });
+        let _scope = KeyArrivalScope {
+            previous,
+            _metrics: self,
+            _thread: PhantomData,
+        };
+        dispatch()
+    }
+
+    fn key_arrival_ns(&self) -> u64 {
+        KEY_ARRIVAL.with(|arrival| {
+            arrival
+                .get()
+                .filter(|stamp| std::ptr::eq(stamp.metrics, self))
+                .map_or(0, |stamp| stamp.at_ns)
+        })
+    }
+
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DispatchClockOwnership",
+            action = "ClaimUi",
+            project = "aterm_gui::metrics::dispatch_clock_ownership_tests::ownership_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DispatchClockOwnership",
+            action = "ClaimWorker",
+            project = "aterm_gui::metrics::dispatch_clock_ownership_tests::ownership_transition"
+        )
+    )]
+    fn take_key_arrival(&self) -> u64 {
+        KEY_ARRIVAL.with(|arrival| match arrival.get() {
+            Some(stamp) if std::ptr::eq(stamp.metrics, self) => {
+                arrival.set(Some(KeyArrival { at_ns: 0, ..stamp }));
+                stamp.at_ns
+            }
+            _ => 0,
+        })
+    }
+
+    fn take_key_write_stamp(&self) -> KeyWriteStamp {
+        let queue_measured = KEY_ARRIVAL.with(|arrival| {
+            arrival
+                .get()
+                .filter(|stamp| std::ptr::eq(stamp.metrics, self))
+                .is_some_and(|stamp| stamp.queue_measured)
+        });
+        KeyWriteStamp {
+            at_ns: self.take_key_arrival(),
+            queue_measured,
         }
+    }
+
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DispatchClockOwnership",
+            action = "PeekWorker",
+            project = "aterm_gui::metrics::dispatch_clock_ownership_tests::ownership_transition"
+        )
+    )]
+    fn input_arrival_ns(&self, now: u64) -> u64 {
+        let key = self.key_arrival_ns();
+        if key == 0 { now } else { key }
     }
 
     fn note_window_input(&self, pending: &mut PendingInputStamp, now: u64) {
         if !pending.arm(self.input_arrival_ns(now), now) {
             self.window.input.edges_dropped.inc();
         }
+    }
+
+    fn note_session_input(&self, now: u64) {
+        self.window
+            .input
+            .session_stamp
+            .arm(self.input_arrival_ns(now));
     }
 
     fn note_native_window_input(&self, pending: &mut PendingInputStamp, arrival_ns: u64, now: u64) {
@@ -1711,13 +2095,94 @@ pub(crate) fn record_native_content_present(
     METRICS.record_native_content_present(&mut taken.edges, now_ns());
 }
 
+/// An opaque receipt for the latest contiguous chrome input in one window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ChromeInputToken(u64);
+
+/// Per-window input whose answer is painted chrome, independent of native leaves and PTYs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PendingChromeInputStamp {
+    token: Option<ChromeInputToken>,
+    edges: PendingInputStamp,
+}
+
+impl PendingChromeInputStamp {
+    /// Retain contiguous pending keys and issue a fresh receipt for their latest answer.
+    /// A full edge ring still advances the receipt: the older accepted keys await the new
+    /// pixels too. Receipt exhaustion refuses further input rather than reusing a token.
+    pub(crate) fn arm(&mut self, arrival_ns: u64) -> Option<ChromeInputToken> {
+        METRICS.arm_chrome_input_at(self, arrival_ns, now_ns())
+    }
+
+    /// The receipt a composition must carry with the chrome it actually painted.
+    pub(crate) const fn token(&self) -> Option<ChromeInputToken> {
+        self.token
+    }
+
+    /// Abandon an answer whose selection or visibility changed outside its key sequence.
+    pub(crate) fn retire(&mut self) {
+        self.token = None;
+        self.edges = PendingInputStamp::default();
+    }
+
+    /// Book only a successful live present carrying this ring's latest painted receipt.
+    /// Return the number of clean samples booked. Captures and their taint retire the ring,
+    /// so an observer's frame cannot satisfy an edge or leave it for a later clean sample.
+    pub(crate) fn record(&mut self, token: ChromeInputToken, capture_forced: bool) -> usize {
+        METRICS.record_chrome_input_at(self, token, PresentClock::read(&METRICS, capture_forced))
+    }
+}
+
+impl Metrics {
+    fn arm_chrome_input_at(
+        &self,
+        pending: &mut PendingChromeInputStamp,
+        arrival_ns: u64,
+        now: u64,
+    ) -> Option<ChromeInputToken> {
+        let next = self
+            .chrome_generation
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1));
+        let Ok(previous) = next else {
+            pending.retire();
+            self.window.input.edges_dropped.inc();
+            return None;
+        };
+        pending.token = previous.checked_add(1).map(ChromeInputToken);
+        if !pending.edges.arm(arrival_ns, now) {
+            self.window.input.edges_dropped.inc();
+        }
+        pending.token
+    }
+
+    fn record_chrome_input_at(
+        &self,
+        pending: &mut PendingChromeInputStamp,
+        token: ChromeInputToken,
+        clock: PresentClock,
+    ) -> usize {
+        if clock.capture_forced || clock.tainted {
+            pending.retire();
+            return 0;
+        }
+        if pending.token != Some(token) {
+            return 0;
+        }
+        let mut booked = 0;
+        pending.edges.drain_into(clock.now, clock.epoch, |edge| {
+            if !edge.before_epoch {
+                self.window.input.book_present(edge.slice_ns, clock.now);
+                booked += 1;
+            }
+        });
+        pending.retire();
+        booked
+    }
+}
+
 /// Stamp the arrival of PTY-bound input that names a session but no window (a control `send`/`feed` to a background session, a controller host write), keeping the oldest unpresented arrival.
 pub(crate) fn note_input() {
-    let m = &METRICS;
-    m.window
-        .input
-        .session_stamp
-        .arm(m.input_arrival_ns(now_ns()));
+    METRICS.note_session_input(now_ns());
 }
 
 /// Stamp the arrival of a window-bounds change (`WindowEvent::Resized`), opening the stale-frame window that the next present closes.
@@ -1747,26 +2212,33 @@ pub(crate) fn latency_trace_on() -> bool {
     *LAT_TRACE_ON.get_or_init(|| aterm_types::dev_seam!("ATERM_TRACE_LATENCY").is_some())
 }
 
-/// Microsecond view of the metrics clock, the epoch of [`note_key_arrival_queued`].
+/// Microsecond view of the metrics clock, the epoch of [`with_key_arrival_queued`].
 #[must_use]
 pub(crate) fn now_us() -> u64 {
     now_ns() / 1000
 }
 
-/// Stamp the true arrival of a printable hardware keystroke (winit `KeyboardInput`, before encode/write), backdated by `queue_ns`, the NSEvent's time in the OS event queue (macOS and X11: `platform::current_event_queue_age_ns`; 0 elsewhere).
-pub(crate) fn note_key_arrival_queued(queue_ns: u64) {
-    METRICS.note_key_arrival_queued(queue_ns);
+/// A press keeps its dispatch-time fallback for input/FX even when its native
+/// queue age is unavailable. Only observed ages enter hardware distributions.
+/// A release shields its dispatch from any enclosing press's stamp.
+pub(crate) fn with_key_arrival_queued<R>(
+    pressed: bool,
+    queue_ns: Option<u64>,
+    dispatch: impl FnOnce() -> R,
+) -> R {
+    METRICS.with_key_dispatch(pressed, queue_ns, dispatch)
 }
 
 /// Disarm the key-arrival stamp after a key's dispatch ends without a PTY write.
 pub(crate) fn clear_key_arrival() {
-    METRICS.live.lat_key.store(0, Ordering::Relaxed);
+    let _ = METRICS.take_key_arrival();
 }
 
-/// The current key's true hardware arrival in ms (the backdated stamp [`note_key_arrival_queued`] wrote), as a peek.
+/// The current dispatch's arrival in ms: observed native age when available,
+/// otherwise dispatch time. This is input/FX timing, not proof of a native clock.
 #[must_use]
 pub(crate) fn key_arrival_ms() -> Option<u32> {
-    match METRICS.live.lat_key.load(Ordering::Relaxed) {
+    match METRICS.key_arrival_ns() {
         0 => None,
         ns => Some(((ns / 1_000_000) as u32).max(1)),
     }
@@ -1779,34 +2251,67 @@ pub(crate) fn note_pty_write() {
 
 /// Claim the pending key-arrival stamp without recording anything, for whoever performs the write.
 #[must_use]
-pub(crate) fn take_key_arrival() -> u64 {
-    METRICS.live.lat_key.swap(0, Ordering::Relaxed)
+pub(crate) fn take_key_arrival() -> KeyWriteStamp {
+    METRICS.take_key_write_stamp()
 }
 
 /// Record a key→write slice against a stamp claimed by [`take_key_arrival`], for writes that complete off the UI thread.
-pub(crate) fn note_pty_write_at(key: u64) {
-    if key == 0 {
-        return;
-    }
-    let input = &METRICS.window.input;
-    let d = now_ns().saturating_sub(key);
-    let _ = input.key_write.record(d);
-    if latency_trace_on() {
+pub(crate) fn note_pty_write_at(key: KeyWriteStamp) {
+    let measured = METRICS.record_key_write_at(key, now_ns());
+    if let Some(d) = measured
+        && latency_trace_on()
+    {
         crate::logging::stderr_line!(
             "KEYWRITE key->write={:.2}ms (last OS queue {:.2}ms + UI encode + term_locks \
              + PTY write)",
             d as f64 / 1_000_000.0,
-            input.key_queue.last() as f64 / 1_000_000.0
+            METRICS.window.input.key_queue.last() as f64 / 1_000_000.0
         );
     }
 }
 
 impl Metrics {
-    fn note_key_arrival_queued(&self, queue_ns: u64) {
-        self.live
-            .lat_key
-            .store(now_ns().saturating_sub(queue_ns).max(1), Ordering::Relaxed);
-        let _ = self.window.input.key_queue.record(queue_ns);
+    fn with_key_dispatch<R>(
+        &self,
+        pressed: bool,
+        queue_ns: Option<u64>,
+        dispatch: impl FnOnce() -> R,
+    ) -> R {
+        if pressed {
+            self.with_key_arrival_queued(queue_ns, dispatch)
+        } else {
+            self.with_key_arrival_at(0, false, dispatch)
+        }
+    }
+
+    fn record_key_write_at(&self, key: KeyWriteStamp, now: u64) -> Option<u64> {
+        if key.at_ns == 0 {
+            None
+        } else if key.queue_measured {
+            self.record_pty_write_at(key.at_ns, now)
+        } else {
+            self.window.input.key_write_unavailable.inc();
+            None
+        }
+    }
+
+    fn record_pty_write_at(&self, key: u64, now: u64) -> Option<u64> {
+        if key == 0 {
+            return None;
+        }
+        let elapsed = now.saturating_sub(key);
+        let _ = self.window.input.key_write.record(elapsed);
+        Some(elapsed)
+    }
+
+    fn with_key_arrival_queued<R>(&self, queue_ns: Option<u64>, dispatch: impl FnOnce() -> R) -> R {
+        let arrival = now_ns().saturating_sub(queue_ns.unwrap_or(0)).max(1);
+        if let Some(queue_ns) = queue_ns {
+            let _ = self.window.input.key_queue.record(queue_ns);
+        } else {
+            self.window.input.key_queue_unavailable.inc();
+        }
+        self.with_key_arrival_at(arrival, queue_ns.is_some(), dispatch)
     }
 }
 
@@ -1830,7 +2335,8 @@ pub(crate) struct SyncHoldingGauge {
     held: bool,
 }
 
-fn transition_sync_holding(held: &mut bool, new: bool, count: &AtomicU64) {
+/// Moves one window's lease on a count of windows (`held`) to `new`.
+fn transition_window_gauge(held: &mut bool, new: bool, count: &AtomicU64) {
     if *held == new {
         return;
     }
@@ -1839,7 +2345,7 @@ fn transition_sync_holding(held: &mut bool, new: bool, count: &AtomicU64) {
         count.fetch_add(1, Ordering::Relaxed);
     } else {
         let previous = count.fetch_sub(1, Ordering::Relaxed);
-        debug_assert!(previous > 0, "sync holding gauge underflow");
+        debug_assert!(previous > 0, "window gauge underflow");
     }
 }
 
@@ -1849,7 +2355,7 @@ impl SyncHoldingGauge {
     }
 
     pub(crate) fn set(&mut self, held: bool) {
-        transition_sync_holding(&mut self.held, held, &METRICS.live.sync_holding_windows);
+        transition_window_gauge(&mut self.held, held, &METRICS.live.sync_holding_windows);
     }
 
     /// Whether the window holds a synchronized update (the tests, and `crate::trail_rig`'s
@@ -1862,13 +2368,13 @@ impl SyncHoldingGauge {
 
 impl Drop for SyncHoldingGauge {
     fn drop(&mut self) {
-        transition_sync_holding(&mut self.held, false, &METRICS.live.sync_holding_windows);
+        transition_window_gauge(&mut self.held, false, &METRICS.live.sync_holding_windows);
     }
 }
 
 #[cfg(test)]
 mod sync_holding_gauge_tests {
-    use super::transition_sync_holding;
+    use super::transition_window_gauge;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
@@ -1877,22 +2383,22 @@ mod sync_holding_gauge_tests {
         let mut a = false;
         let mut b = false;
 
-        transition_sync_holding(&mut a, true, &count);
-        transition_sync_holding(&mut a, true, &count);
+        transition_window_gauge(&mut a, true, &count);
+        transition_window_gauge(&mut a, true, &count);
         assert_eq!(count.load(Ordering::Relaxed), 1);
 
-        transition_sync_holding(&mut b, true, &count);
+        transition_window_gauge(&mut b, true, &count);
         assert_eq!(count.load(Ordering::Relaxed), 2);
 
-        transition_sync_holding(&mut a, false, &count);
-        transition_sync_holding(&mut a, false, &count);
+        transition_window_gauge(&mut a, false, &count);
+        transition_window_gauge(&mut a, false, &count);
         assert_eq!(
             count.load(Ordering::Relaxed),
             1,
             "one window releasing cannot clear its held sibling"
         );
 
-        transition_sync_holding(&mut b, false, &count);
+        transition_window_gauge(&mut b, false, &count);
         assert_eq!(count.load(Ordering::Relaxed), 0);
     }
 }
@@ -1936,6 +2442,16 @@ pub(crate) fn note_os_window_event(kind: OsWindowEvent) {
 /// The stable RepaintKey/predictor/effect gate proved that no pixels changed.
 pub(crate) fn note_redraw_early_out() {
     METRICS.window.redraw.early_outs.inc();
+}
+
+/// A redraw showed its deck-only change by an overlay-only present (`true`), or the renderer
+/// refused one and the redraw presents in full (`false`).
+pub(crate) fn note_overlay_present(shown: bool) {
+    if shown {
+        METRICS.window.redraw.overlay_presents.inc();
+    } else {
+        METRICS.window.redraw.overlay_refusals.inc();
+    }
 }
 
 /// The presented-path frame extraction completed.
@@ -2246,6 +2762,79 @@ pub(crate) fn note_redraw_retry_gated() {
 
 pub(crate) fn note_pre_present(compose_ns: u64) {
     METRICS.window.redraw.note_pre_present(compose_ns);
+    #[cfg(any(debug_assertions, feature = "dev-seams"))]
+    submit_split::open();
+}
+
+/// The latest frame's submit, from its compose's end ([`note_pre_present`]) to its present's
+/// booking ([`record_present`]): wall time, the UI thread's CPU time and the process's page faults.
+/// A debug or `dev-seams` build reads it; a shipped one pays none of its reads on a frame. Each
+/// read is taken outside the spans the others report: faults, then CPU time, then the wall clock
+/// at the open, and the reverse at the close.
+#[cfg(any(debug_assertions, feature = "dev-seams"))]
+mod submit_split {
+    use super::{METRICS, now_ns};
+
+    thread_local! {
+        /// Where the latest frame's submit began on this thread: the wall clock, the thread's CPU
+        /// time and the process's page faults.
+        static FROM: std::cell::Cell<(u64, u64, u32)> = const { std::cell::Cell::new((0, 0, 0)) };
+    }
+
+    pub(super) fn open() {
+        let faults = process_faults();
+        let cpu = thread_cpu_ns();
+        FROM.set((now_ns(), cpu, faults));
+    }
+
+    pub(super) fn close() {
+        let (wall_from, cpu_from, faults_from) = FROM.get();
+        if wall_from == 0 {
+            return;
+        }
+        let wall = now_ns();
+        let cpu = thread_cpu_ns();
+        let faults = process_faults();
+        let present = &METRICS.window.present;
+        present.submit_wall.set(wall.saturating_sub(wall_from));
+        present.submit_cpu.set(cpu.saturating_sub(cpu_from));
+        present
+            .submit_faults
+            .set(u64::from(faults.wrapping_sub(faults_from)));
+    }
+
+    /// The process's page faults so far (`pti_faults` of its task info, which wraps; the read walks
+    /// the whole task); 0 off macOS.
+    fn process_faults() -> u32 {
+        #[cfg(target_os = "macos")]
+        {
+            crate::input_stall::pid_task_info(std::process::id().cast_signed())
+                .map_or(0, |info| info.pti_faults.cast_unsigned())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            0
+        }
+    }
+
+    /// The calling thread's CPU time in nanoseconds; 0 where it cannot be read.
+    fn thread_cpu_ns() -> u64 {
+        #[cfg(unix)]
+        {
+            let mut stamp = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: `stamp` is a valid, writable `timespec` that outlives the call.
+            if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &raw mut stamp) } == 0 {
+                return u64::try_from(stamp.tv_sec)
+                    .unwrap_or(0)
+                    .saturating_mul(1_000_000_000)
+                    .saturating_add(u64::try_from(stamp.tv_nsec).unwrap_or(0));
+            }
+        }
+        0
+    }
 }
 
 pub(crate) fn note_present_drop(reason: PresentDropReason, parked: bool) {
@@ -2321,7 +2910,7 @@ pub(crate) fn note_needle_episode(owed: u64) {
     METRICS.note_needle_episode(owed);
 }
 
-/// What the needle's latest episode has left to fire: what it owed less the `stats_needle` deadlines fired since.
+/// What the needle's latest episode has left to fire: what it owed less the `deck_clock` deadlines fired since.
 fn needle_episode_left(live: &Live) -> u64 {
     live.needle_episode_owed
         .load(Ordering::Relaxed)
@@ -2404,7 +2993,7 @@ impl Metrics {
             EventWakeKind::Timer => {
                 sched.timer_wakes.inc();
                 sched.fires_by_owner.inc(owner.index());
-                if owner == DeadlineOwner::StatsNeedle {
+                if owner == DeadlineOwner::DeckClock {
                     live.needle_episode_fired.fetch_add(1, Ordering::Relaxed);
                 }
                 let due = live.last_deadline_due.load(Ordering::Relaxed);
@@ -2598,6 +3187,32 @@ pub(crate) fn emit_summary(
     s.decimal("max_present_latency_ms", ms(w.present.latency.max()));
     s.decimal("last_frame_render_ms", ms(w.present.render.last()));
     s.decimal("max_frame_render_ms", ms(w.present.render.max()));
+    s.decimal("last_deck_frame_ms", ms(w.present.deck_frame.last()));
+    s.decimal("max_deck_frame_ms", ms(w.present.deck_frame.max()));
+    s.count("deck_clock_ticks", w.present.deck_clock_ticks.get());
+    s.count("deck_clock_frames", w.present.deck_clock_frames.get());
+    s.decimal("deck_clock_run_ms", ms(w.present.deck_clock_run.get()));
+    s.count(
+        "deck_clock_link_ticks",
+        w.present.deck_clock_link_ticks.get(),
+    );
+    s.count(
+        "deck_clock_link_fallbacks",
+        w.present.deck_clock_link_fallbacks.get(),
+    );
+    s.count(
+        "deck_clock_link_resumes",
+        w.present.deck_clock_link_resumes.get(),
+    );
+    s.count("deck_clock_links_silent", deck_links_silent());
+    s.decimal(
+        "last_deck_glass_late_ms",
+        ms(w.present.deck_glass_late.last()),
+    );
+    s.decimal(
+        "max_deck_glass_late_ms",
+        ms(w.present.deck_glass_late.max()),
+    );
     s.count("slow_frames", w.present.slow.get());
     s.decimal("slow_threshold_ms", ms1(SLOW_FRAME_THRESHOLD_NS));
     s.decimal("last_input_present_ms", ms(w.input.input.last()));
@@ -2619,6 +3234,7 @@ pub(crate) fn emit_summary(
     );
     s.decimal("last_key_write_ms", ms(w.input.key_write.last()));
     s.decimal("max_key_write_ms", ms(w.input.key_write.max()));
+    emit_key_clock_availability(&w.input, s);
     s.decimal(
         "last_resize_present_ms",
         ms(w.present.resize_present.last()),
@@ -2642,6 +3258,8 @@ pub(crate) fn emit_summary(
     s.decimal("max_redraw_total_ms", ms(w.redraw.total.max()));
     s.count("redraw_attempts", w.redraw.attempts.get());
     s.count("redraw_early_outs", w.redraw.early_outs.get());
+    s.count("redraw_overlay_presents", w.redraw.overlay_presents.get());
+    s.count("redraw_overlay_refusals", w.redraw.overlay_refusals.get());
     s.count("redraw_sync_holds", w.redraw.sync_holds.get());
     s.count("redraw_retry_gated", w.redraw.retry_gated.get());
     s.count("frame_refills_scoped", w.redraw.refills_scoped.get());
@@ -2837,6 +3455,26 @@ pub(crate) fn emit_percentiles(ctx: &wire::ReadCtx, s: &mut dyn wire::FieldSink)
     emit_quantiles(
         s,
         [
+            "n_deck_frame",
+            "deck_frame_p50_ms",
+            "deck_frame_p95_ms",
+            "deck_frame_p99_ms",
+        ],
+        &w.present.deck_frame.copy_out(),
+    );
+    emit_quantiles(
+        s,
+        [
+            "n_deck_glass_late",
+            "deck_glass_late_p50_ms",
+            "deck_glass_late_p95_ms",
+            "deck_glass_late_p99_ms",
+        ],
+        &w.present.deck_glass_late.copy_out(),
+    );
+    emit_quantiles(
+        s,
+        [
             "n_key_write",
             "key_write_p50_ms",
             "key_write_p95_ms",
@@ -2856,6 +3494,7 @@ pub(crate) fn emit_percentiles(ctx: &wire::ReadCtx, s: &mut dyn wire::FieldSink)
     );
     s.decimal("last_key_queue_ms", ms(w.input.key_queue.last()));
     s.decimal("max_key_queue_ms", ms(w.input.key_queue.max()));
+    emit_key_clock_availability(&w.input, s);
     emit_quantiles(
         s,
         [
@@ -2950,6 +3589,11 @@ pub(crate) fn emit_percentiles(ctx: &wire::ReadCtx, s: &mut dyn wire::FieldSink)
     emit_present_glass(ctx, s);
     emit_input_legs(ctx, s);
     emit_gpu(ctx, s);
+}
+
+fn emit_key_clock_availability(input: &InputLedger, s: &mut dyn wire::FieldSink) {
+    s.count("key_queue_unavailable", input.key_queue_unavailable.get());
+    s.count("key_write_unavailable", input.key_write_unavailable.get());
 }
 
 fn emit_quantiles(s: &mut dyn wire::FieldSink, keys: [&str; 4], h: &HistCopy) {
@@ -3183,6 +3827,7 @@ mod present_glass_tests {
             sample,
             tag,
             successor,
+            deck_late_ns: None,
         }
     }
 
@@ -3488,6 +4133,320 @@ mod gpu_tests {
 }
 
 #[cfg(test)]
+mod dispatch_clock_ownership_tests {
+    use super::{Metrics, PendingInputStamp, PresentClock, PresentObserver, WindowPresentState};
+    use aterm_models_session::dispatch_clock_ownership_model;
+    use aterm_spec::interp::State;
+    use aterm_spec::verify::{prove_and_catch_tiered, validate_transition_tiered};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[derive(Default)]
+    struct ClockTrace {
+        depth: i64,
+        saved: u64,
+        outer_remaining: u64,
+        inner_remaining: u64,
+        worker_read: u64,
+        worker_claim: u64,
+        ui_claim: u64,
+    }
+
+    fn token(stamp: u64) -> i64 {
+        match stamp {
+            0 => 0,
+            1_000 => 1,
+            1_100 => 2,
+            1_500 => 3,
+            other => panic!("unexpected native clock stamp {other}"),
+        }
+    }
+
+    fn ownership_transition(trace: &ClockTrace, current: u64) -> State {
+        State::from([
+            ("depth", trace.depth),
+            ("current", token(current)),
+            ("saved", token(trace.saved)),
+            ("outer_remaining", token(trace.outer_remaining)),
+            ("inner_remaining", token(trace.inner_remaining)),
+            ("worker_read", token(trace.worker_read)),
+            ("worker_claim", token(trace.worker_claim)),
+            ("ui_claim", token(trace.ui_claim)),
+        ])
+    }
+
+    fn assert_ownership(action: &str, before: &State, after: &State, admitted: bool) {
+        let model = dispatch_clock_ownership_model();
+        let label = format!("dispatch clock {action} admitted={admitted}");
+        let (actual, evidence) =
+            validate_transition_tiered(&model, &[], before, after, Some(action), &label);
+        eprintln!("{label}: {evidence}");
+        assert_eq!(actual, admitted, "{label}: {after:?}");
+        if admitted {
+            for law in &model.invariants {
+                assert!(model.check_invariant(law.name, after), "{}", law.name);
+            }
+        }
+    }
+
+    fn record(trace: &ClockTrace, before: &mut State, action: &str, current: u64) {
+        let after = ownership_transition(trace, current);
+        assert_ownership(action, before, &after, true);
+        *before = after;
+    }
+
+    fn initial(metrics: &Metrics) -> (ClockTrace, State) {
+        let trace = ClockTrace {
+            worker_read: metrics.input_arrival_ns(1_500),
+            ..ClockTrace::default()
+        };
+        let state = ownership_transition(&trace, metrics.key_arrival_ns());
+        assert_eq!(state, dispatch_clock_ownership_model().init_state());
+        (trace, state)
+    }
+
+    fn old_shared_atomic_control() {
+        let metrics = Metrics::new();
+        let (mut trace, mut state) = initial(&metrics);
+        let shared = AtomicU64::new(1_000);
+        trace.depth = 1;
+        trace.outer_remaining = shared.load(Ordering::Relaxed);
+        record(
+            &trace,
+            &mut state,
+            "EnterOuter",
+            shared.load(Ordering::Relaxed),
+        );
+        let (observed, after_peek, claimed, after_claim) = std::thread::scope(|threads| {
+            threads
+                .spawn(|| {
+                    let key = shared.load(Ordering::Relaxed);
+                    let observed = if key != 0 && 1_500u64.saturating_sub(key) < 500_000_000 {
+                        key
+                    } else {
+                        1_500
+                    };
+                    let after_peek = shared.load(Ordering::Relaxed);
+                    let claimed = shared.swap(0, Ordering::Relaxed);
+                    (
+                        observed,
+                        after_peek,
+                        claimed,
+                        shared.load(Ordering::Relaxed),
+                    )
+                })
+                .join()
+                .expect("old shared-clock observer")
+        });
+        assert_eq!((observed, claimed), (1_000, 1_000));
+        trace.worker_read = observed;
+        let after = ownership_transition(&trace, after_peek);
+        assert_ownership("PeekWorker", &state, &after, false);
+        state = after;
+        trace.worker_claim = claimed;
+        let after = ownership_transition(&trace, after_claim);
+        assert_ownership("ClaimWorker", &state, &after, false);
+        assert_eq!(
+            shared.swap(0, Ordering::Relaxed),
+            0,
+            "the owner lost its stamp"
+        );
+    }
+
+    #[test]
+    fn background_input_cannot_borrow_or_consume_a_hardware_dispatch() {
+        let coverage = prove_and_catch_tiered(
+            &dispatch_clock_ownership_model(),
+            "dispatch clock ownership",
+        )
+        .expect("dispatch clock checker coverage");
+        eprintln!("dispatch clock ownership: {coverage:?}");
+        let metrics = Metrics::new();
+        let (mut trace, mut state) = initial(&metrics);
+        metrics.with_key_arrival_at(1_000, true, || {
+            trace.depth = 1;
+            trace.outer_remaining = metrics.key_arrival_ns();
+            record(&trace, &mut state, "EnterOuter", metrics.key_arrival_ns());
+            let observed = std::thread::scope(|threads| {
+                threads
+                    .spawn(|| {
+                        let mut pending = PendingInputStamp::default();
+                        metrics.note_window_input(&mut pending, 1_500);
+                        metrics.note_session_input(1_500);
+                        (
+                            pending.edges[0].arrival_ns,
+                            metrics.window.input.session_stamp.take(),
+                            metrics.take_key_arrival(),
+                        )
+                    })
+                    .join()
+                    .expect("background observer")
+            });
+            assert_eq!(observed, (1_500, Some(1_500), 0));
+            trace.worker_read = observed.0;
+            record(&trace, &mut state, "PeekWorker", metrics.key_arrival_ns());
+            trace.worker_claim = observed.2;
+            record(&trace, &mut state, "ClaimWorker", metrics.key_arrival_ns());
+            trace.ui_claim = metrics.take_key_arrival();
+            trace.outer_remaining = metrics.key_arrival_ns();
+            record(&trace, &mut state, "ClaimUi", metrics.key_arrival_ns());
+            assert_eq!(metrics.take_key_arrival(), 0);
+        });
+        trace.depth = 0;
+        trace.outer_remaining = 0;
+        record(&trace, &mut state, "ExitOuter", metrics.key_arrival_ns());
+        old_shared_atomic_control();
+    }
+
+    #[test]
+    fn local_metrics_do_not_share_an_arrival_on_the_same_thread() {
+        let first = Metrics::new();
+        let second = Metrics::new();
+        let (mut trace, mut state) = initial(&first);
+        first.with_key_arrival_at(1_000, true, || {
+            trace.depth = 1;
+            trace.outer_remaining = first.key_arrival_ns();
+            record(&trace, &mut state, "EnterOuter", first.key_arrival_ns());
+            assert_eq!(second.input_arrival_ns(1_500), 1_500);
+            assert_eq!(second.take_key_arrival(), 0);
+            trace.saved = first.key_arrival_ns();
+            second.with_key_arrival_at(1_100, true, || {
+                trace.depth = 2;
+                trace.inner_remaining = second.key_arrival_ns();
+                record(&trace, &mut state, "EnterInner", second.key_arrival_ns());
+                assert_eq!(first.input_arrival_ns(1_500), 1_500);
+                assert_eq!(first.take_key_arrival(), 0);
+                trace.ui_claim = second.take_key_arrival();
+                trace.inner_remaining = second.key_arrival_ns();
+                record(&trace, &mut state, "ClaimUi", second.key_arrival_ns());
+            });
+            trace.depth = 1;
+            trace.saved = 0;
+            trace.inner_remaining = 0;
+            record(&trace, &mut state, "ExitInner", first.key_arrival_ns());
+            trace.ui_claim = first.take_key_arrival();
+            trace.outer_remaining = first.key_arrival_ns();
+            record(&trace, &mut state, "ClaimUi", first.key_arrival_ns());
+        });
+        trace.depth = 0;
+        trace.outer_remaining = 0;
+        record(&trace, &mut state, "ExitOuter", first.key_arrival_ns());
+        assert_eq!(second.key_arrival_ns(), 0);
+    }
+
+    #[test]
+    fn nested_pressed_and_empty_scopes_restore_only_the_outer_remaining_stamp() {
+        let metrics = Metrics::new();
+        let (mut trace, mut state) = initial(&metrics);
+        metrics.with_key_arrival_at(1_000, true, || {
+            trace.depth = 1;
+            trace.outer_remaining = metrics.key_arrival_ns();
+            record(&trace, &mut state, "EnterOuter", metrics.key_arrival_ns());
+            trace.saved = metrics.key_arrival_ns();
+            metrics.with_key_arrival_at(1_100, true, || {
+                trace.depth = 2;
+                trace.inner_remaining = metrics.key_arrival_ns();
+                record(&trace, &mut state, "EnterInner", metrics.key_arrival_ns());
+                assert_eq!(metrics.input_arrival_ns(1_500), 1_100);
+                trace.ui_claim = metrics.take_key_arrival();
+                trace.inner_remaining = metrics.key_arrival_ns();
+                record(&trace, &mut state, "ClaimUi", metrics.key_arrival_ns());
+                assert_eq!(metrics.take_key_arrival(), 0);
+            });
+            trace.depth = 1;
+            trace.saved = 0;
+            trace.inner_remaining = 0;
+            record(&trace, &mut state, "ExitInner", metrics.key_arrival_ns());
+            metrics.with_key_arrival_at(0, false, || {
+                assert_eq!(metrics.input_arrival_ns(1_500), 1_500);
+                assert_eq!(metrics.take_key_arrival(), 0);
+            });
+            trace.ui_claim = metrics.take_key_arrival();
+            trace.outer_remaining = metrics.key_arrival_ns();
+            record(&trace, &mut state, "ClaimUi", metrics.key_arrival_ns());
+            trace.saved = metrics.key_arrival_ns();
+            metrics.with_key_arrival_at(1_100, true, || {
+                trace.depth = 2;
+                trace.inner_remaining = metrics.key_arrival_ns();
+                record(&trace, &mut state, "EnterInner", metrics.key_arrival_ns());
+            });
+            trace.depth = 1;
+            trace.saved = 0;
+            trace.inner_remaining = 0;
+            record(&trace, &mut state, "ExitInner", metrics.key_arrival_ns());
+        });
+        trace.depth = 0;
+        trace.outer_remaining = 0;
+        record(&trace, &mut state, "ExitOuter", metrics.key_arrival_ns());
+        assert_eq!(metrics.input_arrival_ns(1_500), 1_500);
+    }
+
+    #[test]
+    fn unwinding_restores_the_outer_scope_and_then_retires_it() {
+        let metrics = Metrics::new();
+        let escaped = std::panic::catch_unwind(|| {
+            metrics.with_key_arrival_at(1_000, true, || {
+                let nested = std::panic::catch_unwind(|| {
+                    metrics.with_key_arrival_at(1_100, true, || {
+                        assert_eq!(metrics.take_key_arrival(), 1_100);
+                        panic!("nested dispatch");
+                    });
+                });
+                assert!(nested.is_err());
+                assert_eq!(metrics.key_arrival_ns(), 1_000);
+                panic!("outer dispatch");
+            });
+        });
+        assert!(escaped.is_err());
+        assert_eq!(metrics.take_key_arrival(), 0);
+    }
+
+    #[test]
+    fn an_owned_queued_stamp_outlives_its_dispatch_without_leaving_an_ambient_stamp() {
+        let metrics = Metrics::new();
+        let queued = metrics.with_key_arrival_at(1_000, true, || metrics.take_key_arrival());
+        assert_eq!(metrics.key_arrival_ns(), 0);
+        std::thread::scope(|threads| {
+            threads
+                .spawn(|| {
+                    assert_eq!(metrics.take_key_arrival(), 0);
+                    assert_eq!(metrics.record_pty_write_at(queued, 1_500), Some(500));
+                    assert_eq!(metrics.record_pty_write_at(0, 1_600), None);
+                })
+                .join()
+                .expect("queued writer");
+        });
+        assert_eq!(metrics.window.input.key_write.copy_out().n(), 1);
+        assert_eq!(metrics.window.input.key_write.max(), 500);
+    }
+
+    #[test]
+    fn an_owned_hardware_arrival_keeps_a_long_os_queue_wait() {
+        const MS: u64 = 1_000_000;
+        let metrics = Metrics::new();
+        let mut window = WindowPresentState::default();
+        let arrival = 1_000;
+        metrics.with_key_arrival_at(arrival, true, || {
+            metrics.note_window_input(&mut window.pending_input, arrival + 700 * MS);
+        });
+        let booked = metrics.record_present_at(
+            PresentClock {
+                now: arrival + 730 * MS,
+                epoch: 0,
+                capture_forced: false,
+                tainted: false,
+            },
+            1,
+            1,
+            Some(&mut window),
+            &mut PresentObserver::default(),
+        );
+        assert_eq!(booked.input_booked, 1);
+        assert_eq!(metrics.window.input.input.copy_out().n(), 1);
+        assert_eq!(metrics.window.input.input.max(), 730 * MS);
+    }
+}
+
+#[cfg(test)]
 mod window_input_attribution_tests {
     use super::{DrainedEdge, INPUT_SLICE_CAP_NS, Metrics, PendingInputStamp};
 
@@ -3590,6 +4549,160 @@ mod window_input_attribution_tests {
             pending.drain_slices(1 + INPUT_SLICE_CAP_NS),
             vec![INPUT_SLICE_CAP_NS]
         );
+    }
+}
+
+#[cfg(test)]
+mod chrome_input_receipt_tests {
+    use super::{
+        ChromeInputToken, INPUT_EDGE_RING, INPUT_SLICE_CAP_NS, Metrics, PendingChromeInputStamp,
+        PresentClock,
+    };
+    use std::sync::atomic::Ordering;
+
+    fn arm(m: &Metrics, pending: &mut PendingChromeInputStamp, at: u64) -> ChromeInputToken {
+        m.arm_chrome_input_at(pending, at, at)
+            .expect("fresh receipt")
+    }
+
+    fn present(
+        m: &Metrics,
+        pending: &mut PendingChromeInputStamp,
+        token: ChromeInputToken,
+        now: u64,
+        epoch: u64,
+    ) -> usize {
+        m.record_chrome_input_at(pending, token, PresentClock::at(false, now, epoch, 0, 0))
+    }
+
+    #[test]
+    fn only_the_latest_painted_receipt_books_a_contiguous_burst_once() {
+        let m = Metrics::new();
+        let mut pending = PendingChromeInputStamp::default();
+        let first = arm(&m, &mut pending, 10);
+        let latest = arm(&m, &mut pending, 20);
+        assert_ne!(first, latest);
+        assert_eq!(present(&m, &mut pending, first, 100, 0), 0, "stale paint");
+        assert_eq!(pending.token(), Some(latest));
+        assert_eq!(present(&m, &mut pending, latest, 110, 0), 2);
+        assert_eq!(
+            present(&m, &mut pending, latest, 120, 0),
+            0,
+            "repeat present"
+        );
+        assert_eq!(m.window.input.input.copy_out().n(), 2);
+        assert_eq!(pending.token(), None);
+    }
+
+    #[test]
+    fn retired_foreign_and_restored_receipts_do_not_alias() {
+        let m = Metrics::new();
+        let mut a = PendingChromeInputStamp::default();
+        let mut b = PendingChromeInputStamp::default();
+        let old = arm(&m, &mut a, 10);
+        let saved = a;
+        a.retire();
+        assert_eq!(present(&m, &mut a, old, 20, 0), 0);
+        let new = arm(&m, &mut a, 30);
+        let foreign = arm(&m, &mut b, 40);
+        assert_ne!(old, new);
+        assert_ne!(new, foreign);
+        assert_eq!(present(&m, &mut a, old, 50, 0), 0, "retire/reopen ABA");
+        assert_eq!(present(&m, &mut a, foreign, 50, 0), 0, "another window");
+        assert_eq!(present(&m, &mut b, new, 50, 0), 0, "another window");
+        a = saved;
+        let restored = arm(&m, &mut a, 60);
+        assert!([old, new, foreign].iter().all(|token| *token != restored));
+        assert_eq!(
+            present(&m, &mut a, new, 70, 0),
+            0,
+            "snapshot cannot rewind allocator"
+        );
+        assert_eq!(present(&m, &mut a, restored, 80, 0), 2);
+        assert_eq!(present(&m, &mut b, foreign, 80, 0), 1);
+    }
+
+    #[test]
+    fn epoch_and_age_limits_apply_without_recycling_receipts() {
+        let m = Metrics::new();
+        let mut pending = PendingChromeInputStamp::default();
+        let old = arm(&m, &mut pending, 10);
+        m.epoch.store(11, Ordering::Relaxed);
+        assert_eq!(present(&m, &mut pending, old, 100, 11), 0);
+        let current = arm(&m, &mut pending, 11);
+        assert_ne!(old, current);
+        assert_eq!(present(&m, &mut pending, current, 100, 11), 1);
+        let aged = arm(&m, &mut pending, 1);
+        assert_eq!(
+            present(&m, &mut pending, aged, INPUT_SLICE_CAP_NS + 2, 0),
+            0
+        );
+        assert_eq!(m.window.input.input.copy_out().n(), 1);
+    }
+
+    #[test]
+    fn full_edge_ring_advances_receipts_and_aged_edges_make_room() {
+        let m = Metrics::new();
+        let mut pending = PendingChromeInputStamp::default();
+        let mut token = arm(&m, &mut pending, 1);
+        for at in 2..=INPUT_EDGE_RING as u64 {
+            token = arm(&m, &mut pending, at);
+        }
+        let refused_edge = arm(&m, &mut pending, 100);
+        assert_ne!(refused_edge, token);
+        assert_eq!(m.window.input.edges_dropped.get(), 1);
+        assert_eq!(present(&m, &mut pending, token, 1_000, 0), 0);
+        assert_eq!(
+            present(&m, &mut pending, refused_edge, 1_000, 0),
+            INPUT_EDGE_RING
+        );
+        for at in 1..=INPUT_EDGE_RING as u64 {
+            arm(&m, &mut pending, at);
+        }
+        let fresh_at = INPUT_SLICE_CAP_NS + INPUT_EDGE_RING as u64 + 1;
+        let fresh = arm(&m, &mut pending, fresh_at);
+        assert_eq!(present(&m, &mut pending, fresh, fresh_at + 7, 0), 1);
+        assert_eq!(
+            m.window.input.edges_dropped.get(),
+            1,
+            "aged edges do not refuse a key"
+        );
+    }
+
+    #[test]
+    fn receipt_exhaustion_fails_closed_instead_of_wrapping() {
+        let m = Metrics::new();
+        let mut pending = PendingChromeInputStamp::default();
+        m.chrome_generation.store(u64::MAX - 1, Ordering::Relaxed);
+        let last = arm(&m, &mut pending, 10);
+        assert_eq!(m.arm_chrome_input_at(&mut pending, 20, 20), None);
+        assert_eq!(pending.token(), None);
+        assert_eq!(present(&m, &mut pending, last, 30, 0), 0);
+        assert_eq!(m.arm_chrome_input_at(&mut pending, 40, 40), None);
+        assert_eq!(m.window.input.edges_dropped.get(), 2);
+        assert_eq!(m.window.input.input.copy_out().n(), 0);
+    }
+
+    #[test]
+    fn capture_and_taint_retire_edges_before_any_later_clean_present() {
+        let m = Metrics::new();
+        for clock in [
+            PresentClock::at(true, 100, 0, 0, 0),
+            PresentClock::at(false, 100, 0, 101, 0),
+            PresentClock::at(false, 100, 0, 0, 1),
+        ] {
+            let mut pending = PendingChromeInputStamp::default();
+            let stale = arm(&m, &mut pending, 10);
+            let current = arm(&m, &mut pending, 20);
+            assert_eq!(m.record_chrome_input_at(&mut pending, stale, clock), 0);
+            assert_eq!(
+                pending.token(),
+                None,
+                "capture retires even if its receipt was stale"
+            );
+            assert_eq!(present(&m, &mut pending, current, 120, 0), 0);
+        }
+        assert_eq!(m.window.input.input.copy_out().n(), 0);
     }
 }
 
@@ -3882,8 +4995,8 @@ mod lateness_attribution_tests {
         }
     }
 
-    /// The needle's latest episode has left what it owed less its own `stats_needle` fires (never
-    /// the grid's, never an interrupted wait), a rested episode owes none, and a reset clears the
+    /// The needle's latest episode has left what it owed less its own `deck_clock` fires (never
+    /// the live edge's `stats_live`, never an interrupted wait), a rested episode owes none, and a reset clears the
     /// window's sweeps and owed frames but keeps what the episode in flight has left: what the
     /// `measure` spin row bounds the needle's fires by.
     #[test]
@@ -3896,11 +5009,11 @@ mod lateness_attribution_tests {
             m.note_event_wake(EventWakeKind::Timer);
         };
         m.note_needle_episode(5);
-        fire(DeadlineOwner::StatsNeedle);
+        fire(DeadlineOwner::DeckClock);
         fire(DeadlineOwner::StatsLive);
-        fire(DeadlineOwner::StatsNeedle);
+        fire(DeadlineOwner::DeckClock);
         m.note_deadline(
-            DeadlineOwner::StatsNeedle,
+            DeadlineOwner::DeckClock,
             Some(soon),
             now,
             passed(Some(soon)),
@@ -3929,7 +5042,7 @@ mod lateness_attribution_tests {
             "a reset keeps what the episode in flight has left"
         );
         for _ in 0..4 {
-            fire(DeadlineOwner::StatsNeedle);
+            fire(DeadlineOwner::DeckClock);
         }
         assert_eq!(needle_episode_left(&m.live), 0, "fires past it leave none");
         m.note_needle_episode(7);
@@ -4069,6 +5182,10 @@ mod lateness_attribution_tests {
             ..WindowPresentState::default()
         };
         let mut observer = PresentObserver::default();
+        present.submit_wall.set(700_000);
+        present.submit_cpu.set(300_000);
+        present.submit_faults.set(12);
+        m.window.gpu.encode_last.set(400_000);
         let booked = m.record_present_at(
             clock,
             latency_ns,
@@ -4090,6 +5207,44 @@ mod lateness_attribution_tests {
             "the frame gap of the winning sample is what separates a stall from an \
              idle stretch"
         );
+        assert_eq!(
+            present.latency_render.get(),
+            1_000_000,
+            "its own frame's render"
+        );
+        assert_eq!(present.latency_idle.get(), gap_ns);
+        assert_eq!(
+            (
+                present.latency_submit_wall.get(),
+                present.latency_submit_cpu.get(),
+                present.latency_submit_faults.get(),
+                present.latency_encode.get()
+            ),
+            (700_000, 300_000, 12, 400_000),
+            "its own frame's submit, on and off a core, and its encode"
+        );
+        let reset = PresentClock {
+            now: now + 2_000_000,
+            epoch: now + 1_500_000,
+            ..clock
+        };
+        let mut idle = WindowPresentState {
+            last_present_ns: now - gap_ns,
+            ..WindowPresentState::default()
+        };
+        let fresh = Metrics::new();
+        let _ =
+            fresh.record_present_at(reset, latency_ns, 2_000_000, Some(&mut idle), &mut observer);
+        assert_eq!(
+            fresh.window.present.latency_gap.get(),
+            0,
+            "the gap starts at the metrics window"
+        );
+        assert_eq!(
+            fresh.window.present.latency_idle.get(),
+            gap_ns + 2_000_000,
+            "the idle stretch before the frame does not"
+        );
 
         let later = PresentClock {
             now: now + 1_000_000,
@@ -4104,6 +5259,19 @@ mod lateness_attribution_tests {
         );
         assert_eq!(present.latency_at.get(), now);
         assert_eq!(present.latency_gap.get(), gap_ns);
+        present.submit_wall.set(9_000_000);
+        let _ = m.record_present_at(
+            later,
+            2_000_000,
+            1_000_000,
+            Some(&mut window),
+            &mut observer,
+        );
+        assert_eq!(
+            present.latency_submit_wall.get(),
+            700_000,
+            "a faster present leaves the worst one's frame"
+        );
     }
 
     #[test]
@@ -4221,14 +5389,15 @@ mod lateness_attribution_tests {
 
         let parked_ns = 17_000_000;
         let before = now_ns();
-        m.note_key_arrival_queued(parked_ns);
-        let after = now_ns();
-        let arrival = m.live.lat_key.load(Ordering::Relaxed);
-        assert!(
-            (before.saturating_sub(parked_ns).max(1)..=after.saturating_sub(parked_ns).max(1))
-                .contains(&arrival),
-            "the arrival stamp is backdated by the queue wait"
-        );
+        m.with_key_arrival_queued(Some(parked_ns), || {
+            let after = now_ns();
+            let arrival = m.key_arrival_ns();
+            assert!(
+                (before.saturating_sub(parked_ns).max(1)..=after.saturating_sub(parked_ns).max(1))
+                    .contains(&arrival),
+                "the arrival stamp is backdated by the queue wait"
+            );
+        });
         assert_eq!(
             (queue.last(), queue.max()),
             (parked_ns, parked_ns),
@@ -4242,7 +5411,7 @@ mod lateness_attribution_tests {
              upper edge; got {queue_p99} ns"
         );
 
-        m.note_key_arrival_queued(0);
+        m.with_key_arrival_queued(Some(0), || {});
         assert_eq!(
             (queue.last(), queue.max()),
             (0, parked_ns),
@@ -4250,7 +5419,7 @@ mod lateness_attribution_tests {
         );
         assert_eq!(queue.copy_out().n(), 2);
 
-        m.note_key_arrival_queued(parked_ns);
+        m.with_key_arrival_queued(Some(parked_ns), || {});
         assert_eq!(queue.copy_out().n(), 3);
         assert_eq!((queue.last(), queue.max()), (parked_ns, parked_ns));
         assert_eq!(m.window.input.key_write.copy_out().n(), 0);
@@ -4357,6 +5526,7 @@ mod window_tests {
         live.spare_ptys.store(2, Ordering::Relaxed);
         let counts = [
             &live.sync_holding_windows,
+            &live.deck_links_silent,
             &live.capture_depth,
             &live.taint_until,
             &live.fx_glow_quads_last,
@@ -4368,7 +5538,6 @@ mod window_tests {
             &live.last_deadline_owner,
             &live.last_deadline_due,
             &live.last_deadline_late,
-            &live.lat_key,
             &live.handoff_input_dropped,
             &live.handoff_input_incoherent,
             &live.needle_episode_owed,

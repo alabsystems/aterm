@@ -3,17 +3,15 @@
 
 use super::*;
 
-fn startup()
--> LiveSetupStartup<impl FnMut(Plan, StartupLook, StartupHandoff) -> aterm_gui::SetupAnswer> {
-    startup_answering(|_, _, _| aterm_gui::WorkstationSetupDecision::Unavailable.into())
+fn startup() -> LiveSetupStartup<impl FnMut(Plan, StartupHandoff) -> aterm_gui::SetupAnswer> {
+    startup_answering(|_, _| aterm_gui::WorkstationSetupDecision::Unavailable.into())
 }
 
 fn startup_answering(
-    offer: impl FnMut(Plan, StartupLook, StartupHandoff) -> aterm_gui::SetupAnswer,
-) -> LiveSetupStartup<impl FnMut(Plan, StartupLook, StartupHandoff) -> aterm_gui::SetupAnswer> {
+    offer: impl FnMut(Plan, StartupHandoff) -> aterm_gui::SetupAnswer,
+) -> LiveSetupStartup<impl FnMut(Plan, StartupHandoff) -> aterm_gui::SetupAnswer> {
     LiveSetupStartup {
         offer,
-        review: Review::Offered,
         receipt: None,
         authorization: None,
         last_failure: None,
@@ -24,7 +22,6 @@ fn startup_answering(
         sent: StartupSent::default(),
         retry_seen: SETUP_WAKES.count(),
         recovered: false,
-        reviewed: None,
     }
 }
 
@@ -152,7 +149,7 @@ fn startup_retry_wake_an_offers_own_coming_to_the_front_does_not_end_its_retry_w
     let _io = TestIo::install();
     watch_setup_signals();
     aterm_types::macos_setup::set_system_state_front(false);
-    let mut host = startup_answering(|_, _, _| {
+    let mut host = startup_answering(|_, _| {
         aterm_types::macos_setup::set_system_state_front(true);
         aterm_types::macos_setup::set_system_state_front(false);
         aterm_gui::WorkstationSetupDecision::Unavailable.into()

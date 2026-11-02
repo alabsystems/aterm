@@ -111,6 +111,36 @@ fn members(log: &Log) -> BTreeSet<MemberId> {
     log.membership().members().keys().copied().collect()
 }
 
+#[test]
+fn membership_tracks_landed_removals_while_unchanged_clones_keep_their_own_prefix() {
+    let mut original = found(&[(A, "m1"), (B, "m2")]);
+    assert_eq!(members(&original), ids(&[A, B]));
+    let mut sender = original.clone();
+    let renamed = sender.keep(sign(
+        &sender,
+        B,
+        Body::Name {
+            name: "renamed".to_owned(),
+        },
+    ));
+    let removed = sender.keep(remove(&sender, A, B, renamed.id()));
+    assert_eq!(members(&sender), ids(&[A]));
+    assert_eq!(members(&original), ids(&[A, B]));
+
+    let mut receiver = original.clone();
+    assert_eq!(receiver.insert(removed).unwrap(), Inserted::Waiting);
+    assert_eq!(members(&receiver), ids(&[A, B]));
+    assert_eq!(receiver.insert(renamed).unwrap(), Inserted::Held);
+    assert_eq!(receiver.waiting(), 0);
+    assert_eq!(members(&receiver), ids(&[A]));
+    assert_eq!(receiver.membership(), eval::evaluate(&receiver.order));
+    assert_eq!(members(&original), ids(&[A, B]));
+
+    original.merge(&receiver).unwrap();
+    assert_eq!(original.membership(), sender.membership());
+    assert_eq!(members(&original), ids(&[A]));
+}
+
 /// A real fleet node identity, from its tag: `Mac`'s `[n; 32]` node keys are no Ed25519 keys.
 fn node_pair(tag: u8) -> Ed25519KeyPair {
     Ed25519KeyPair::from_seed_unchecked(&[tag ^ 0xa5; 32]).unwrap()
@@ -1243,6 +1273,8 @@ fn a_removed_mac_admit_carrying_a_members_node_key_does_not_poison_it() {
         "after quorum removal",
         "backdated sybil admit-and-remove",
         "backdated replay of independently removed mac",
+        "honest member removes sybil carrying member node key",
+        "redundant re-admit of removed mac carrying member node key",
     ] {
         let mut lab = found(&[(A, "m1"), (B, "m2")]);
         if case == "backdated replay of independently removed mac" {
@@ -1276,6 +1308,44 @@ fn a_removed_mac_admit_carrying_a_members_node_key_does_not_poison_it() {
             ));
             let rem_p = lab.keep(remove(&lab, X, P, admit_p.id()));
             removal_cutoff = *rem_p.id();
+        } else if case == "honest member removes sybil carrying member node key" {
+            let mut entrant = P.entrant("m99");
+            entrant.node_key = [A.0; 32];
+            let admit_p = lab.keep(sign(
+                &lab,
+                X,
+                Body::Admit {
+                    entrant,
+                    evidence: Evidence::Manual,
+                },
+            ));
+            // Even while P is admitted and after A removes P, A's node key stays Member(A).
+            assert_eq!(
+                lab.membership().node(&[A.0; 32]),
+                NodeStanding::Member(A.id()),
+                "{case} (before removing P)"
+            );
+            let _rem_p = lab.keep(remove(&lab, A, P, admit_p.id()));
+            assert_eq!(
+                lab.membership().node(&[A.0; 32]),
+                NodeStanding::Member(A.id()),
+                "{case} (after A removes P, while X is still active)"
+            );
+            removal_cutoff = *admit_p.id();
+        } else if case == "redundant re-admit of removed mac carrying member node key" {
+            let admit_y = lab.keep(admit(&lab, A, Y, "m4"));
+            let mut entrant = Y.entrant("m4");
+            entrant.node_key = [A.0; 32];
+            let readmit_y = lab.keep(sign(
+                &lab,
+                X,
+                Body::Admit {
+                    entrant,
+                    evidence: Evidence::Manual,
+                },
+            ));
+            let _rem_y = lab.keep(remove(&lab, A, Y, admit_y.id()));
+            removal_cutoff = *readmit_y.id();
         }
 
         let removers: &[Mac] = if case == "after quorum removal" {
@@ -1289,7 +1359,9 @@ fn a_removed_mac_admit_carrying_a_members_node_key_does_not_poison_it() {
 
         match case {
             "before plain removal cutoff"
-            | "sybil admit-and-remove before plain removal cutoff" => {}
+            | "sybil admit-and-remove before plain removal cutoff"
+            | "honest member removes sybil carrying member node key"
+            | "redundant re-admit of removed mac carrying member node key" => {}
             "backdated sybil admit-and-remove" => {
                 let mut entrant = P.entrant("m99");
                 entrant.node_key = [A.0; 32];

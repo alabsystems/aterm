@@ -4,7 +4,6 @@
 //! Headless `person` stand-in and `status` end-marker tests.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use aterm_agent::harness::acts::TaskFace;
 
@@ -175,7 +174,7 @@ fn a_stand_in_look_sees_the_front_tabs_end_by_the_one_rule() {
     assert!(app.end_unseen(0), "PRECONDITION: a background end stands");
     assert_eq!(marks(&app)[0], ChipLevel::Done);
     assert_eq!(app.status_glance().done.len(), 1);
-    assert_eq!(app.status_glance().button_title(), "\u{276f}\u{2022}");
+    assert_eq!(app.status_glance().button_title(), "\u{276f}");
     app.switch_tab_in(WindowId(0), 0);
     assert!(app.end_unseen(0), "a headless window: nobody looks");
     app.switch_tab_in(WindowId(0), 1);
@@ -189,7 +188,7 @@ fn a_stand_in_look_sees_the_front_tabs_end_by_the_one_rule() {
     assert!(app.end_unseen(0), "a look sees the front tab alone");
     assert_eq!(marks(&app)[0], ChipLevel::Done, "the `•` stands");
     assert_eq!(app.status_glance().done.len(), 1, "the row stands");
-    assert_eq!(app.status_glance().button_title(), "\u{276f}\u{2022}");
+    assert_eq!(app.status_glance().button_title(), "\u{276f}");
 
     app.take_status_rebuild();
     app.switch_tab_in(WindowId(0), 0);
@@ -216,7 +215,7 @@ fn a_stand_in_look_sees_the_front_tab_at_once() {
     app.switch_tab_in(WindowId(0), 0);
     assert!(app.end_unseen(0), "in front, nobody looks: it stands");
     assert_eq!(app.status_glance().done.len(), 1);
-    assert_eq!(app.status_glance().button_title(), "\u{276f}\u{2022}");
+    assert_eq!(app.status_glance().button_title(), "\u{276f}");
     app.take_status_rebuild();
 
     assert_eq!(
@@ -273,178 +272,6 @@ fn a_look_at_a_window_behind_sees_nothing() {
     app.switch_tab_in(WindowId(0), 0);
     assert!(!app.end_unseen(0), "in front, looked at: seen");
     assert!(app.status_glance().done.is_empty(), "the row goes");
-}
-
-mod card {
-    use std::sync::Arc;
-
-    use aterm_agent::harness::footer::FooterFacts;
-    use aterm_core::terminal::{CutKind, HolderCut};
-
-    use crate::{App, WindowId};
-
-    const VERSION: &str = "2.1.283";
-    const PGID: i32 = 4242;
-
-    fn screen(rows: usize, cols: usize) -> Vec<String> {
-        let rule = "\u{2500}".repeat(cols);
-        let mut screen = vec![
-            String::new(),
-            format!(
-                " \u{2590}\u{259B}\u{2588}\u{2588}\u{2588}\u{259B}\u{2588}   {}{VERSION}",
-                aterm_phase::anchor!("launch.banner")
-            ),
-            "\u{259D}\u{259C}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2580}  Opus 5.5 \u{b7} Claude Max"
-                .to_string(),
-            " \u{259D}\u{259D}   \u{259D}\u{259D}   ~/aterm".to_string(),
-        ];
-        while screen.len() < rows - 4 {
-            screen.push(String::new());
-        }
-        screen.extend([
-            rule.clone(),
-            "\u{276F} ".to_string(),
-            rule,
-            "  \u{23F5}\u{23F5} bypass permissions on (shift+tab to cycle)".to_string(),
-        ]);
-        screen
-    }
-
-    fn feed(app: &App, session: u64, rows: &[String]) {
-        let mut out = String::from("\x1b[2J");
-        for (i, row) in rows.iter().enumerate() {
-            let sgr = if row.ends_with("~/aterm") {
-                "\x1b[38;2;130;130;130m"
-            } else {
-                ""
-            };
-            out.push_str(&format!("\x1b[{};1H{sgr}{row}\x1b[0m", i + 1));
-        }
-        let caret = rows
-            .iter()
-            .rposition(|r| r.starts_with('\u{276F}'))
-            .unwrap_or(0);
-        out.push_str(&format!("\x1b[{};3H", caret + 1));
-        let term = app.pool.get(session).expect("session").term.clone();
-        crate::term_lock(&term).process(out.as_bytes());
-    }
-
-    fn launch(app: &App, session: u64) {
-        use atpkg::image::{ImageBuild, ImageSource, ProgramTag};
-        let build = atpkg::vendor_direct::Version::parse(VERSION)
-            .expect("a vendor build")
-            .build_id();
-        let image = crate::holder_image::HolderImage::of(
-            PGID,
-            Some(1),
-            Some(std::path::PathBuf::from(format!(
-                "/p/pkg/store/claude/{build}/bin/claude"
-            ))),
-            ImageBuild {
-                program: ProgramTag::new("claude"),
-                build,
-                source: ImageSource::Store,
-            },
-            1,
-        );
-        let token = image.token.expect("a token");
-        {
-            let entry = app.pool.get(session).expect("session");
-            let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
-            timeline.note_foreground_group(PGID);
-            timeline.offer_holder_image(Arc::new(image), crate::holder_image::EdgeKind::Group);
-            timeline.set_claude_footer(
-                PGID,
-                None,
-                Some(FooterFacts {
-                    model: Some("Opus 5.5".into()),
-                    version: Some(VERSION.into()),
-                    ..FooterFacts::default()
-                }),
-            );
-        }
-        let term = app.pool.get(session).expect("session").term.clone();
-        crate::term_lock(&term).note_holder_cut(HolderCut {
-            to: Some(token),
-            kind: CutKind::Group,
-            from_alive: false,
-        });
-    }
-
-    /// One frame through the capture route's order (`App::render_image`'s terminal arm): words, the strip, then the footer's splice.
-    pub(super) fn frame(app: &mut App, wid: WindowId) {
-        app.capture_words(wid, std::time::Instant::now());
-        let (plan, route) = app.active_visible_frame_layout(wid).expect("a layout");
-        app.splice_tab_strip(wid);
-        app.splice_claude_footer(wid, &plan, route);
-    }
-
-    /// A headless window 120 columns wide, its front session (returned) a Claude Code whose launch card is on its screen.
-    pub(super) fn glass() -> (App, u64) {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        let session = app.focused_session_id(wid).expect("the front session");
-        assert!(app.apply_term_resize(wid, 24, 120));
-        launch(&app, session);
-        feed(&app, session, &screen(24, 120));
-        (app, session)
-    }
-}
-
-#[test]
-fn a_stand_in_look_arms_no_timer() {
-    let wid = WindowId(0);
-    let (mut app, session) = card::glass();
-    let host = host();
-    app.harness = Some(host.0.clone());
-    claim(&app, session);
-    let other = app.next_session_id;
-    app.push_stub_tab(wid, crate::stub_session(other));
-    app.pool
-        .get(other)
-        .expect("the second tab")
-        .ctx
-        .meta
-        .lock()
-        .expect("meta")
-        .attention = Some("approve the deploy?".to_string());
-    app.refresh_presence_session(other);
-    app.switch_tab_in(wid, 0);
-    app.announce_toolchain_pass("installing 10 ALab program(s)", true);
-    app.prepare_band_motion(wid, Instant::now());
-    card::frame(&mut app, wid);
-    assert!(app.claude_cards_live(), "PRECONDITION: a card on show");
-    assert!(app.presence_pill(wid).is_some(), "PRECONDITION: a pill");
-    let later = Instant::now() + Duration::from_secs(2);
-    let wakes = |app: &App| {
-        (
-            app.claude_card_wake(),
-            app.band_motion_deadline(later),
-            app.messages_deadline(),
-            app.presence_deadline(later),
-            app.harness_acts_deadline(),
-            app.session_on_screen(session),
-        )
-    };
-    let before = wakes(&app);
-    assert_eq!(
-        (before.0, before.1, before.5),
-        (None, None, false),
-        "PRECONDITION: headless, nothing on screen wakes"
-    );
-    assert_eq!(
-        look(&mut app, Some(0)),
-        Ok("person look window=0".to_string())
-    );
-    assert_eq!(wakes(&app), before, "the look armed nothing");
-    app.windows
-        .get_mut(&wid)
-        .expect("window 0")
-        .band_on_screen_for_test = true;
-    let on_screen = wakes(&app);
-    assert!(on_screen.0.is_some(), "on a screen the card wants a frame");
-    assert!(on_screen.1.is_some(), "and the band's row moves");
-    assert!(on_screen.5, "and the session is on screen");
 }
 
 /// The `statusmenu` line `chrome` prints after the one starting `head`, and
@@ -631,7 +458,7 @@ fn status_says_the_end_seen_and_cheered_apart() {
     assert_eq!(field(&line, "pause").as_deref(), Some("-"), "{line}");
     assert!(field(&line, "task_state").is_some(), "{line}");
     assert!(
-        line.contains(" land_since=- held=- waiting=- end="),
+        line.contains(" land_since=- held=- waiting=- land_asked=- landed_head=- landed_on=- landed_leg=- landed_repo=- end="),
         "right after `pause=`, Land's hold (slice 3c), the stop (3a) and the outage wait (12b): {line}"
     );
     let serial = app.harness_glass[&0].end().expect("an end").serial;

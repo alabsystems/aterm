@@ -17,6 +17,15 @@ use crate::{Error, age};
 /// `[everyone]`.
 pub const MAX_HOST_AUDIENCES: usize = 62;
 
+/// Validate the same four fields the subscriber's notary consumer reads, without
+/// opening a keychain or launching any tool.
+///
+/// # Errors
+/// The bytes do not have the consumer's `use=aterm`, Apple id, team id and password shape.
+pub fn validate_notary_contribution(bytes: &[u8]) -> crate::Result<()> {
+    super::release::parse_notary(bytes).map(|_| ())
+}
+
 /// What a copy from vault text did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Copied {
@@ -33,6 +42,88 @@ pub enum Copied {
 }
 
 impl Admin {
+    /// Fill a requester's own audience from a delivered value. This path cannot rotate a
+    /// value; an existing entry may only be copied unchanged into another audience.
+    /// The caller validates the want and rechecks membership and policy before publication.
+    ///
+    /// # Errors
+    /// The requester is unknown, the want/entries are invalid, an existing value differs,
+    /// the audience limit is reached, or the draft refuses an entry.
+    pub fn contribute_to_requester(
+        &mut self,
+        recipient: &age::Recipient,
+        want: &crate::need::Want,
+        values: &crate::need::transfer::Values,
+    ) -> crate::Result<String> {
+        values.encode()?;
+        let expected = want.entries();
+        if !want.posted()
+            || values.0.first().map(|(name, _)| name) != expected.first()
+            || values.0.iter().any(|(name, _)| !expected.contains(name))
+        {
+            return Err(Error::new(
+                "credential contribution does not match the want",
+            ));
+        }
+        let host = self
+            .host_of_recipient(recipient)
+            .ok_or_else(|| Error::new("the vault does not name the requester's recipient"))?;
+        let own = Audience::Hosts(vec![host.clone()]);
+        let audiences: std::collections::BTreeSet<_> = self
+            .doc
+            .entries()
+            .into_iter()
+            .map(|entry| entry.audience)
+            .filter(|audience| matches!(audience, Audience::Hosts(_)))
+            .collect();
+        if !audiences.contains(&own) && audiences.len() >= MAX_HOST_AUDIENCES {
+            return Err(Error::new("the vault host-audience limit is reached"));
+        }
+        let mut draft = self.doc.clone();
+        for (name, value) in &values.0 {
+            let entries = self.published_doc.entries();
+            if let Some(held) = entries
+                .iter()
+                .find(|entry| entry.name == *name && entry.audience.includes(&host))
+            {
+                if held.value.as_slice() != value.as_slice() {
+                    return Err(Error::new(
+                        "a contribution cannot replace the requester's existing entry",
+                    ));
+                }
+                continue;
+            }
+            if entries.iter().any(|entry| entry.name == *name)
+                && !entries
+                    .iter()
+                    .any(|entry| entry.name == *name && entry.value.as_slice() == value.as_slice())
+            {
+                return Err(Error::new(
+                    "a contribution cannot rotate a value the vault holds",
+                ));
+            }
+            draft
+                .set_entry_with(&own, name, value.as_slice(), want.if_absent(), None)
+                .map_err(|_| Error::new("the vault refused the contribution"))?;
+        }
+        self.doc = draft;
+        Ok(host)
+    }
+
+    /// Sign this connection-bound credential handoff with the current vault key.
+    ///
+    /// # Errors
+    /// The transcript names another vault or has an invalid vault name.
+    pub fn prove_credential_custody(
+        &self,
+        exchange: &crate::need::transfer::Exchange,
+    ) -> crate::Result<[u8; 64]> {
+        if exchange.vault != self.config.name {
+            return Err(Error::new("credential handoff names another vault"));
+        }
+        exchange.prove(&self.seed)
+    }
+
     /// The vault signing key this admin signs with, which every member pins.
     ///
     /// # Errors
@@ -66,24 +157,31 @@ impl Admin {
         {
             return None;
         }
-        let roster = (self.log_base == super::log_entries::LogBase::NoLog)
-            .then(|| {
-                crate::swarm_roster::SwarmRoster::from_document(&self.published_doc)
-                    .ok()
-                    .flatten()
-            })
-            .flatten();
+        let roster = matches!(
+            self.log_base,
+            super::log_entries::LogBase::NoLog | super::log_entries::LogBase::Behind
+        )
+        .then(|| {
+            crate::swarm_roster::SwarmRoster::from_document(&self.published_doc)
+                .ok()
+                .flatten()
+        })
+        .flatten();
         self.published_doc
             .machines()
             .into_iter()
             .find(|machine| {
                 machine.recipient == wanted
                     && !roster.as_ref().is_some_and(|r| {
-                        r.is_label_denied(&machine.name)
-                            || r.member_by_recipient(&machine.recipient)
-                                .is_some_and(|row| {
-                                    super::steward::member_is_denied_in_roster(r, row)
-                                })
+                        if let Some(row) = r.member_by_recipient(&machine.recipient) {
+                            super::steward::member_is_denied_in_roster(r, row)
+                        } else {
+                            r.is_label_denied(&machine.name)
+                                || r.member_by_label_or_alias(&machine.name)
+                                    .is_some_and(|row| {
+                                        super::steward::member_is_denied_in_roster(r, row)
+                                    })
+                        }
                     })
             })
             .map(|machine| machine.name)

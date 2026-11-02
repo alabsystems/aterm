@@ -7,6 +7,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use aterm_agent::supervise::policy::land_check::{LAND_CHECK_HEAD, LANDED};
+
 use crate::LAB;
 use crate::door::{Door, Reply};
 use crate::lab::{Launch, UpOpts};
@@ -43,11 +45,25 @@ fn land_typed(door: &Door<'_>, sid: &str) -> Result<Vec<String>, String> {
         .collect())
 }
 
+/// The stub's mode for Land: the defense, and to the land check the one word that lands.
+fn landed_mode() -> J {
+    J::obj([
+        ("stream", J::Bool(true)),
+        ("text", J::s(LANDED_TEXT)),
+        (
+            "replies",
+            J::Arr(vec![J::obj([
+                ("last", J::s(LAND_CHECK_HEAD)),
+                ("text", J::s(LANDED)),
+            ])]),
+        ),
+    ])
+}
+
 fn land_first(run: &Run, door: &Door<'_>, sid: &str) -> Result<Vec<String>, Fail> {
-    let spec = J::obj([("stream", J::Bool(true)), ("text", J::s(LANDED_TEXT))]);
     crate::util::atomic_write(
         &run.w.join(format!("modes/{LANDED_MODE}.json")),
-        spec.py().as_bytes(),
+        landed_mode().py().as_bytes(),
     )
     .map_err(|e| could_not(&format!("the stub's mode: {e}")))?;
     crate::verbs::set_mode(run, LANDED_MODE)?;
@@ -188,7 +204,8 @@ fn carry_on_judged(lines: &[String], want: &str, autopilot: &str) -> Result<(), 
     let steps: Vec<&str> = lines.iter().filter_map(|l| carry_on_step(l)).collect();
     let settled = carry_on_settled(lines);
     let read_done = want != CARRIED_DONE && steps.contains(&CARRIED_DONE);
-    if settled == Some(want) && !steps.contains(&"continued") && !read_done && autopilot == "land" {
+    let typed_too = want != CONTINUED && steps.contains(&CONTINUED);
+    if settled == Some(want) && !typed_too && !read_done && autopilot == "land" {
         Ok(())
     } else {
         Err(format!(
@@ -211,18 +228,13 @@ fn carry_on_seen(run: &Run, sid: &str) -> Result<Vec<String>, Fail> {
     }
 }
 
-const LAND_RESUMED: &str = "done:landing";
+/// A relaunch's carry-on typed: the step a Cruise control and `--land-open` both ask for.
+const CONTINUED: &str = "continued";
 
-const CRUISE_RESUMED: &str = "continued";
-
-/// The carry-on step a Cruise control asks for: [`CRUISE_RESUMED`]; after `--clear`,
+/// The carry-on step a Cruise control asks for: [`CONTINUED`]; after `--clear`,
 /// `done:taskless`.
 const fn cruise_step(clear: bool) -> &'static str {
-    if clear {
-        "done:taskless"
-    } else {
-        CRUISE_RESUMED
-    }
+    if clear { "done:taskless" } else { CONTINUED }
 }
 
 /// How many of the upgrade ledger's `rows` say a continuation was typed (`continued`, `continued:check`).
@@ -241,10 +253,8 @@ fn cruise_judged(
     use aterm_agent::harness::relaunch::CARRIED_DONE;
     let steps: Vec<&str> = lines.iter().filter_map(|l| carry_on_step(l)).collect();
     let settled = carry_on_settled(lines);
-    let landed = steps
-        .iter()
-        .any(|s| [LAND_RESUMED, CARRIED_DONE].contains(s));
-    let typed_as_asked = (typed > 0) == want.starts_with(CRUISE_RESUMED);
+    let landed = steps.contains(&CARRIED_DONE);
+    let typed_as_asked = (typed > 0) == want.starts_with(CONTINUED);
     if settled == Some(want) && !landed && typed_as_asked && autopilot == "cruise" {
         Ok(())
     } else {
@@ -1098,8 +1108,8 @@ fn run_restore(
                 }
                 println!("  status    {}", door.out(&["status"]).trim());
                 let carry_on = status_word(&door, "autopilot")
-                    .and_then(|autopilot| carry_on_judged(&journal, LAND_RESUMED, &autopilot));
-                if carry_on.is_err() || continued_typed(&rows) > 0 {
+                    .and_then(|autopilot| carry_on_judged(&journal, CONTINUED, &autopilot));
+                if carry_on.is_err() || continued_typed(&rows) != 1 {
                     println!(
                         "restore {how} --land-open: FAIL: {}, carry-on line(s) typed {}",
                         carry_on
@@ -1110,7 +1120,7 @@ fn run_restore(
                     return Ok(Verdict::Failed);
                 }
                 println!(
-                    "restore {how} --land-open: the work under Land was not read as done, and no carry-on of Cruise's was typed"
+                    "restore {how} --land-open: the work under Land was not read as done, and the relaunch's carry-on was typed once"
                 );
             }
         }
@@ -1299,10 +1309,6 @@ mod tests {
             carry_on_step("HOST seq=3 carry-on step=continued"),
             Some("continued")
         );
-        assert_eq!(
-            carry_on_step("HOST seq=5 carry-on step=done:landing"),
-            Some(LAND_RESUMED)
-        );
         assert_eq!(carry_on_step("HOST seq=3 carry-on step=wait:held"), None);
         assert_eq!(carry_on_step("HOST seq=3 upgrade step=announced:1"), None);
         assert_eq!(carry_on_step("DONE seq=4 carry-on step=continued"), None);
@@ -1310,6 +1316,7 @@ mod tests {
 
     #[test]
     fn the_carry_on_settles_past_another_sweeps_lock() {
+        use aterm_agent::harness::relaunch::CARRIED_DONE;
         let lines = |words: &[&str]| -> Vec<String> {
             words
                 .iter()
@@ -1318,8 +1325,8 @@ mod tests {
                 .collect()
         };
         assert_eq!(
-            carry_on_settled(&lines(&["busy:another-sweep", "done:landing"])),
-            Some(LAND_RESUMED)
+            carry_on_settled(&lines(&["busy:another-sweep", CARRIED_DONE])),
+            Some(CARRIED_DONE)
         );
         assert_eq!(
             carry_on_settled(&lines(&["wait:resume", "busy:another-sweep", "continued"])),
@@ -1359,9 +1366,9 @@ mod tests {
         ] {
             assert_eq!(carry_on_step(&lines(&[word])[0]), Some(word), "{word}");
             assert_eq!(
-                carry_on_settled(&lines(&["busy:another-sweep", word, LAND_RESUMED])),
+                carry_on_settled(&lines(&["busy:another-sweep", word, CONTINUED])),
                 Some(word),
-                "{word}: the step, not a later done:landing"
+                "{word}: the step, not a later continued"
             );
         }
     }
@@ -1376,20 +1383,17 @@ mod tests {
                 .map(|(seq, word)| format!("HOST seq={seq} carry-on step={word}"))
                 .collect()
         };
-        let open = |words: &[&str], autopilot: &str| {
-            carry_on_judged(&lines(words), LAND_RESUMED, autopilot)
-        };
-        assert_eq!(open(&["busy:another-sweep", LAND_RESUMED], "land"), Ok(()));
+        let open =
+            |words: &[&str], autopilot: &str| carry_on_judged(&lines(words), CONTINUED, autopilot);
+        assert_eq!(open(&["busy:another-sweep", CONTINUED], "land"), Ok(()));
         assert_eq!(
             carry_on_judged(&lines(&["wait:resume", CARRIED_DONE]), CARRIED_DONE, "land"),
             Ok(())
         );
         for wrong in [
-            &["failed:no-resume", LAND_RESUMED][..],
-            &["typed:a-word-never-taught", LAND_RESUMED],
-            &["continued", LAND_RESUMED],
-            &[LAND_RESUMED, "continued"],
-            &[LAND_RESUMED, CARRIED_DONE],
+            &["failed:no-resume", CONTINUED][..],
+            &["typed:a-word-never-taught", CONTINUED],
+            &[CONTINUED, CARRIED_DONE],
             &[CARRIED_DONE],
             &["busy:another-sweep"],
             &[],
@@ -1397,11 +1401,15 @@ mod tests {
             let said = open(wrong, "land").expect_err(&format!("{wrong:?}"));
             assert!(said.contains("carry-on settled on"), "{said}");
         }
-        assert!(open(&[LAND_RESUMED], "cruise").is_err(), "not under Land");
-        assert!(open(&[LAND_RESUMED], "?").is_err(), "no autopilot word");
+        assert!(open(&[CONTINUED], "cruise").is_err(), "not under Land");
+        assert!(open(&[CONTINUED], "?").is_err(), "no autopilot word");
         assert!(
-            carry_on_judged(&lines(&[LAND_RESUMED]), CARRIED_DONE, "land").is_err(),
+            carry_on_judged(&lines(&[CONTINUED]), CARRIED_DONE, "land").is_err(),
             "--land settles on done:said-done"
+        );
+        assert!(
+            carry_on_judged(&lines(&[CARRIED_DONE, CONTINUED]), CARRIED_DONE, "land").is_err(),
+            "--land types nothing"
         );
         assert_eq!(land_proves_the_journal("land").map_err(|f| f.code), Err(3));
         for before in ["cruise", "off", "?"] {
@@ -1467,16 +1475,15 @@ mod tests {
         };
         let plain = cruise_step(false);
         let cleared = cruise_step(true);
-        assert_eq!((plain, cleared), (CRUISE_RESUMED, "done:taskless"));
+        assert_eq!((plain, cleared), (CONTINUED, "done:taskless"));
         let cruise =
             |words: &[&str], typed: usize| cruise_judged(&lines(words), plain, typed, "cruise");
         assert_eq!(cruise(&["continued", "done"], 1), Ok(()));
         assert_eq!(cruise(&["busy:another-sweep", "continued"], 1), Ok(()));
         for (wrong, typed) in [
-            (&[LAND_RESUMED][..], 0),
-            (&[CARRIED_DONE], 0),
-            (&["busy:another-sweep", LAND_RESUMED], 0),
-            (&["continued", LAND_RESUMED], 1),
+            (&[CARRIED_DONE][..], 0),
+            (&["busy:another-sweep", CARRIED_DONE], 0),
+            (&["continued", CARRIED_DONE], 1),
             (&["done:taskless"], 0),
             (&["failed:no-resume", "continued"], 1),
             (&["busy:another-sweep"], 0),
@@ -1669,5 +1676,19 @@ mod tests {
         assert!(!clean_defense(Some(
             "Committed and pushed the lab's work; nothing is left to do.\nATERM-TASK-DONE"
         )));
+    }
+
+    #[test]
+    fn the_land_drills_stub_answers_the_land_check_with_the_word_that_lands() {
+        use aterm_agent::supervise::policy::land_check::LAND_CHECK;
+        let mode = landed_mode();
+        let reply = |last: &str| {
+            crate::stub::scripted_reply(&mode, &["the task".to_string(), last.to_string()])
+                .and_then(|rule| rule.get("text"))
+                .and_then(J::as_str)
+                .map(str::to_string)
+        };
+        assert_eq!(reply(LAND_CHECK).as_deref(), Some(LANDED));
+        assert_ne!(reply("Land it").as_deref(), Some(LANDED));
     }
 }

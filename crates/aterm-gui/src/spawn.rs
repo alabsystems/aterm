@@ -587,6 +587,8 @@ pub(crate) struct SessionFactory {
     /// `-e <cmd>`: run this instead of `$SHELL` (no shell integration), as the OS's argv gave it
     /// ([`crate::cli::Cli::exec_command`]).
     pub(crate) exec_command: Option<Vec<std::ffi::OsString>>,
+    /// A drive's plain shell must use its explicit folder, never a fallback.
+    pub(crate) require_cwd: bool,
     /// Config `shell` / `--shell`.
     pub(crate) shell_override: Option<String>,
     /// Config `shell_args`: extra argv passed to `shell_override` (e.g. `-l -i`).
@@ -599,7 +601,8 @@ pub(crate) struct SessionFactory {
     pub(crate) terminal_config: Option<aterm_core::config::TerminalConfig>,
     /// Whether program-state projection can keep an adopted box receipt standing.
     pub(crate) tab_status: bool,
-    /// Whether to inject OSC 133/633 shell integration, with a fresh nonce per tab.
+    /// Whether shell spawns may inject OSC 133/633 integration, with a fresh nonce per tab.
+    /// A direct command never receives it, even when this policy permits worker shells.
     pub(crate) integrate: bool,
     /// Latency epoch shared across tabs.
     pub(crate) lat_epoch: Instant,
@@ -648,6 +651,21 @@ pub(crate) struct SessionFactory {
     /// Each PTY reader's process watch on its shell (card engine §3.3), made at attach.
     #[cfg(unix)]
     pub(crate) proc_watch: fn(i32) -> Option<aterm_uds::procwatch::ProcWatch>,
+    /// How a PTY reader with no process watch reads the leader of the group in front while a
+    /// block runs ([`crate::fg_sample::FgSampler`]; `None`: it samples nothing, the test App's
+    /// inert arm).
+    #[cfg(unix)]
+    pub(crate) fg_sight: Option<crate::fg_sample::SightSeam>,
+    /// Whether a PTY reader with no process watch, its sampler running, asks Linux's proc
+    /// connector for its session's `exec`s ([`crate::exec_edges::wire_connector`]; the test App's
+    /// inert arm asks none).
+    #[cfg(unix)]
+    pub(crate) proc_connector: crate::exec_edges::ConnectorSeam,
+    /// The birth of a process that has exec'd since its fork (`crate::fg_sample::execd_start`):
+    /// a PTY reader with no process watch hears the image of a sampled edge's leader only once
+    /// it has with that same birth ([`sampled_edge_image`]; the test App's inert arm reads none).
+    #[cfg(unix)]
+    pub(crate) leader_execd: fn(i32) -> Option<u64>,
     /// The shell's live children, read after a restore for the groups its carried stopped
     /// drawers lead ([`shell_children`]).
     #[cfg(unix)]
@@ -667,6 +685,11 @@ pub(crate) struct SessionFactory {
 }
 
 impl SessionFactory {
+    /// Whether this spawn runs an interactive shell whose integration is permitted.
+    pub(crate) fn integrates_shell(&self) -> bool {
+        self.integrate && records_shell_start(false, self.exec_command.as_deref())
+    }
+
     /// What a spare spawned by this factory shares with a cold tab spawned by it now
     /// (`crate::spare`'s gate G4).
     pub(crate) fn spawn_fingerprint(&self) -> u64 {
@@ -676,6 +699,7 @@ impl SessionFactory {
             sandbox_cap: _,
             env_add,
             exec_command,
+            require_cwd,
             shell_override,
             shell_args,
             cwd,
@@ -702,6 +726,12 @@ impl SessionFactory {
             #[cfg(unix)]
                 proc_watch: _,
             #[cfg(unix)]
+                fg_sight: _,
+            #[cfg(unix)]
+                proc_connector: _,
+            #[cfg(unix)]
+                leader_execd: _,
+            #[cfg(unix)]
                 shell_children: _,
             card_probe: _,
             rekey_deferred: _,
@@ -715,6 +745,7 @@ impl SessionFactory {
         self.shell_colorfgbg().hash(&mut h);
         env_add.hash(&mut h);
         exec_command.hash(&mut h);
+        require_cwd.hash(&mut h);
         shell_override.hash(&mut h);
         shell_args.hash(&mut h);
         cwd.hash(&mut h);
@@ -727,6 +758,9 @@ impl SessionFactory {
             .level()
             .hash(&mut h);
         daily_driver_limits().open_files.hash(&mut h);
+        // A spare spawned before the git-and-friends shim was wanted (or after) has the PATH of
+        // that moment, not the one a cold tab gets now.
+        crate::clt_shim::wanted_dir().hash(&mut h);
         static LAUNCH_ENV: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         LAUNCH_ENV
             .get_or_init(|| {
@@ -1704,11 +1738,12 @@ pub(crate) fn spawn_session(
     let mut integrated_shell = None;
     let (mut env_add, argv_override, shell_nonce) = if adopt.is_some() {
         (Vec::new(), None, None)
-    } else if factory.integrate {
+    } else if factory.integrates_shell() {
         match prepare_shell_integration(shell_override, shell_args) {
             Some((si_env, argv_override, nonce, shell)) => {
                 integrated_shell = Some(shell);
                 let mut env = factory.env_add.clone();
+                env.push((SHELL_INTEGRATION_LOADED_GUARD.to_string(), String::new()));
                 env.extend(si_env);
                 if let Some(pair) = aterm_core::shell_integration::wsl_cwd_env(
                     shell,
@@ -1732,6 +1767,17 @@ pub(crate) fn spawn_session(
             &mut env_add,
             crate::default_editor::decides(runs_command, integrated_shell),
             &|key| std::env::var_os(key),
+        );
+        // While the window installs Apple's Command Line Tools (`App::settle_developer_tools_shim`:
+        // a setup pass wants them, they are missing, this account may install them, and no
+        // install of them ended unfinished since one last started), the shim directory is
+        // wanted: this shell gets it ahead of `/usr/bin`, and named in `ATERM_CLT_SHIM` for its
+        // integration to keep it there (design §6.3), decided now, so a tab opened during the
+        // install reaches it and one opened after does not.
+        crate::clt_shim::settle_session_path(
+            &mut env_add,
+            &|key| std::env::var(key).ok(),
+            crate::clt_shim::wanted_dir().as_deref(),
         );
     }
 
@@ -1852,9 +1898,26 @@ pub(crate) fn spawn_session(
                 };
                 let start =
                     crate::spawn_folder::start_folder(cwd_override.or(factory.cwd.as_deref()));
+                if factory.require_cwd
+                    && (!cwd_override.is_some_and(|cwd| std::path::Path::new(cwd).is_absolute())
+                        || start.fell_back.is_some())
+                {
+                    return Err(std::io::Error::other(
+                        "the explicit shell folder is unavailable",
+                    ));
+                }
                 if spare.is_some() && start.fell_back.is_some() {
                     return Err(std::io::Error::other(crate::spare::FolderFallsBack));
                 }
+                // A spare's shell reads its hold on the end handed to it here; when this
+                // process ends, that read is end-of-file and the shell ends itself.
+                #[cfg(unix)]
+                let pass = spare_fifo.as_ref().map(|fifo| aterm_pty::PassedFd {
+                    fd: fifo.shell_end(),
+                    at: aterm_core::shell_integration::spare_fifo::HOLD_FD,
+                });
+                #[cfg(not(unix))]
+                let pass = None;
                 crate::watchdog::park_before_fork();
                 let spawned = aterm_pty::spawn_shell_with_pid_cell_px(
                     rows,
@@ -1870,6 +1933,7 @@ pub(crate) fn spawn_session(
                     factory.sandbox_wrap.as_deref(),
                     limits,
                     cell_px,
+                    pass,
                 );
                 if let Some(note) = aterm_pty::take_console_host_fallback() {
                     aterm_log::warn!("console host: {note}");
@@ -1976,6 +2040,7 @@ pub(crate) fn spawn_session(
         watchers: observed.watchers,
         frame: Default::default(),
         fenced_writes: Default::default(),
+        native_policy: Default::default(),
         witness: spare.map_or_else(Arc::default, |s| Arc::clone(&s.link.witness)),
     });
     if !adopted && integrated_shell.is_some() {
@@ -3660,6 +3725,19 @@ fn attach_reader_inner(
     read_buf.resize(65_536, 0);
     let (wake_rd, wake_wr) = aterm_pty::make_wake_pipe().unwrap_or((-1, -1));
     reset_reader_latches(session);
+    #[cfg(unix)]
+    let proc_watch = (factory.proc_watch)(session.pid);
+    #[cfg(unix)]
+    let connector = {
+        let (route, watching) = crate::exec_edges::wire_connector(
+            factory.proc_connector,
+            proc_watch.is_some(),
+            factory.fg_sight.is_some(),
+            session.pid,
+        );
+        session.ctx.ran.watched_by(watching);
+        route
+    };
     let reader = spawn_pty_reader(PtyReaderWiring {
         master: session.master,
         id: session.id,
@@ -3700,7 +3778,10 @@ fn attach_reader_inner(
             image: factory.edge_image,
             inbox: factory.edge_inbox.clone(),
             byte_arm: factory.byte_arm,
-            proc_watch: (factory.proc_watch)(session.pid),
+            proc_watch,
+            connector,
+            sight: factory.fg_sight,
+            execd: factory.leader_execd,
             ran: crate::command_ran::RanFeed::new(session.ctx.ran.clone(), session.pid),
         },
         timeline: session.ctx.timeline.clone(),
@@ -3812,6 +3893,10 @@ impl UpdatePark {
 /// Park a session's PTY reader, the overlap handoff's quiescence step.
 #[cfg(any(unix, test))]
 pub(crate) fn park_reader(session: &mut Session, deadline: Instant) -> bool {
+    let _waiting = session
+        .temporal_drain
+        .as_ref()
+        .map(crate::temporal::TemporalDrain::waiting);
     session.temporal_tx = None;
     let Some(join) = session.reader_join.take() else {
         return true;
@@ -3836,6 +3921,7 @@ pub(crate) fn park_reader(session: &mut Session, deadline: Instant) -> bool {
         return false;
     }
     if let Some(drain) = session.temporal_drain.take() {
+        drain.request_urgency();
         while !drain.is_finished() {
             if Instant::now() >= deadline {
                 session.temporal_drain = Some(drain);
@@ -4556,6 +4642,7 @@ mod park_reader_tests {
         assert!(stopped.is_some(), "timed out waiting for the reader to end");
         session.reader_join = Some(reader);
         let (drain, finish_writer) = crate::temporal::TemporalDrain::held_for_test();
+        let observed_drain = drain.clone();
         session.temporal_drain = Some(drain);
         assert!(!park_reader(&mut session, std::time::Instant::now()));
         assert!(
@@ -4567,6 +4654,7 @@ mod park_reader_tests {
             "the unwritten queue's drain is kept"
         );
         assert!(!super::reader_attach_ready(&session));
+        assert_eq!(observed_drain.demands_for_test(), [1, 0, 0]);
         drop(finish_writer);
         let joined = aterm_spec::wait::within(
             aterm_spec::wait::MUST_HAPPEN,
@@ -4574,6 +4662,32 @@ mod park_reader_tests {
             || super::reader_attach_ready(&session).then_some(()),
         );
         assert!(joined.is_some(), "timed out waiting for the writer to end");
+        assert_eq!(observed_drain.demands_for_test(), [0, 0, 0]);
+    }
+
+    #[test]
+    fn an_abandoned_writer_can_finish_parking_without_claiming_capture() {
+        let mut session = crate::stub_session(80);
+        let reader = std::thread::spawn(|| {});
+        assert!(
+            aterm_spec::wait::within(
+                aterm_spec::wait::MUST_HAPPEN,
+                std::time::Duration::ZERO,
+                || reader.is_finished().then_some(()),
+            )
+            .is_some()
+        );
+        session.reader_join = Some(reader);
+        let (drain, finish_writer) = crate::temporal::TemporalDrain::held_for_test();
+        let observed_drain = drain.clone();
+        session.temporal_drain = Some(drain);
+        assert!(!park_reader(&mut session, std::time::Instant::now()));
+        assert_eq!(observed_drain.demands_for_test(), [1, 0, 0]);
+        finish_writer.abandon();
+        assert!(super::reader_attach_ready(&session));
+        assert!(!observed_drain.capture_complete_for_test());
+        assert_eq!(observed_drain.demands_for_test(), [0, 0, 0]);
+        assert!(park_reader(&mut session, std::time::Instant::now()));
     }
 }
 
@@ -6117,7 +6231,10 @@ impl ShellExit {
         wake_rd: i32,
         stop: &AtomicBool,
     ) -> ShellRetirement {
-        let deadline = Instant::now() + within;
+        let now = Instant::now();
+        let deadline = now
+            .checked_add(within)
+            .unwrap_or_else(|| now + std::time::Duration::from_secs(365 * 24 * 3600));
         let stopped = || stop.load(Ordering::Acquire);
         if self.watch.is_some() {
             loop {
@@ -6233,18 +6350,26 @@ fn the_parse_hold_probe_tells_a_held_term_lock_from_a_free_one() {
 }
 
 /// The image a gather with no process watch reads for a sampled foreground edge to `to`, read
-/// with `edge_image` and noted in `ran`: where nothing hears `exec`s (Linux, a watch that could
-/// not open), the in-front image each edge reads is the session's one record of what ran.
+/// with `edge_image` and noted in `ran` once `execd` says its leader has exec'd since its fork:
+/// where nothing hears `exec`s (Linux, a watch that could not open), the in-front image each edge
+/// reads is the session's record of what ran, and a leader that has not exec'd (a shell's child
+/// between its fork and its exec, or one whose command was not found) still maps the shell's
+/// image, which no command ran. The exec evidence is birth-bracketed before the image and must
+/// match the holder image's birth, so a reused PID never lends its old affirmative flag.
 #[cfg(unix)]
 pub(crate) fn sampled_edge_image(
     edge_image: crate::holder_image::ReadImage,
+    execd: fn(i32) -> Option<u64>,
     ran: &crate::command_ran::RanFeed,
     to: i32,
     filled: usize,
 ) -> Option<Arc<crate::holder_image::HolderImage>> {
     (to > 0).then(|| {
+        let exec_start = execd(to);
         let image = edge_image(to, None);
-        ran.image(&image, filled);
+        if exec_start == Some(image.start_us) {
+            ran.image(&image, filled);
+        }
         Arc::new(image)
     })
 }
@@ -6510,6 +6635,9 @@ fn spawn_pty_gather(
     fg_holder: Arc<std::sync::atomic::AtomicI32>,
     edge_image: crate::holder_image::ReadImage,
     proc_watch: Option<aterm_uds::procwatch::ProcWatch>,
+    connector: Option<aterm_uds::proc_connector::Route>,
+    sight: Option<crate::fg_sample::SightSeam>,
+    execd: fn(i32) -> Option<u64>,
     ran: crate::command_ran::RanFeed,
     lane_guard: crate::manual_reset::LaneGuard,
     journal: Option<Arc<crate::crash_restore::SessionJournal>>,
@@ -6541,6 +6669,17 @@ fn spawn_pty_gather(
                     .reading_queue(aterm_pty::output_queue_len, master)
             });
             let proc_rd = exec.as_ref().map_or(-1, crate::exec_edges::ExecEdges::fd);
+            // Where no watch hears execs, the group in front is sampled while a block runs.
+            let mut sampler = sight
+                .filter(|_| exec.is_none())
+                .map(crate::fg_sample::FgSampler::new);
+            // And on Linux the proc connector's route hands its sampler the session's execs,
+            // read between batches (`crate::fg_sample::FgSampler::connected`).
+            let route = connector.filter(|_| sampler.is_some());
+            let woken_rd = route
+                .as_ref()
+                .map_or(proc_rd, aterm_uds::proc_connector::Route::fd);
+            let mut routed = Vec::new();
             let send_byte_free = |cutter: &mut crate::foreground_handback::FgCutter,
                                   exec: &mut crate::exec_edges::ExecEdges|
              -> bool {
@@ -6593,8 +6732,9 @@ fn spawn_pty_gather(
                         &mut buf,
                         wake_rd,
                         exit_rd,
-                        proc_rd,
+                        woken_rd,
                         lane_guard.poke_rd,
+                        sampler.as_ref().map_or(-1, |s| s.wait_ms(Instant::now())),
                     ),
                     Some(left) => {
                         let room = left.min(buf.len());
@@ -6632,6 +6772,30 @@ fn spawn_pty_gather(
                             if !send_byte_free(&mut cutter, x) || !send_gone(x) {
                                 break;
                             }
+                        } else if let (Some(r), Some(s)) = (route.as_ref(), sampler.as_mut()) {
+                            // Every byte read so far has gone out, as at a sample.
+                            if r.drain(&mut routed) {
+                                s.connector_lost(&ran, || aterm_pty::has_unread(master));
+                            }
+                            let mut sent = true;
+                            for event in routed.drain(..) {
+                                match event {
+                                    aterm_uds::proc_connector::Event::Exec(e) => {
+                                        s.connected(
+                                            &e,
+                                            &ran,
+                                            || fg_probe(master),
+                                            || aterm_pty::has_unread(master),
+                                        );
+                                    }
+                                    aterm_uds::proc_connector::Event::Exit { pid } => {
+                                        sent = sent && filled_tx.send(GatherMsg::Gone(pid)).is_ok();
+                                    }
+                                }
+                            }
+                            if !sent {
+                                break;
+                            }
                         }
                     }
                     aterm_pty::ReadOutcome::Wake => {
@@ -6654,10 +6818,21 @@ fn spawn_pty_gather(
                         }
                     }
                     aterm_pty::ReadOutcome::Idle => {
-                        // Wake-pipe-less fallback (fd exhaustion): honor the stop flag.
+                        // Wake-pipe-less fallback (fd exhaustion), or the sampler's bound: honor
+                        // the stop flag.
                         if stop.load(std::sync::atomic::Ordering::Acquire) {
                             let _ = filled_tx.send(GatherMsg::Wake);
                             break;
+                        }
+                        // The sampler's wait ended with nothing to read: every byte read so far
+                        // has gone out (`crate::command_ran::RanFeed::sampled`).
+                        if let Some(s) = sampler.as_mut() {
+                            s.tick(
+                                Instant::now(),
+                                &ran,
+                                || fg_probe(master),
+                                || aterm_pty::has_unread(master),
+                            );
                         }
                     }
                     aterm_pty::ReadOutcome::Eof => {
@@ -6709,7 +6884,9 @@ fn spawn_pty_gather(
                                     x.read_edge(e.to, absorbed)
                                 })
                             }),
-                            (Some(e), None) => sampled_edge_image(edge_image, &ran, e.to, filled),
+                            (Some(e), None) => {
+                                sampled_edge_image(edge_image, execd, &ran, e.to, filled)
+                            }
                             (None, _) => None,
                         };
                         let holder = cutter.holder();
@@ -6730,6 +6907,9 @@ fn spawn_pty_gather(
                             .is_err()
                         {
                             break;
+                        }
+                        if let Some(s) = sampler.as_mut() {
+                            s.handed(Instant::now());
                         }
                         if owed > 0 {
                             owed = owed.saturating_sub(filled);
@@ -6783,6 +6963,9 @@ struct ForegroundWiring {
     inbox: crate::holder_image::EdgeInbox,
     byte_arm: bool,
     proc_watch: Option<aterm_uds::procwatch::ProcWatch>,
+    connector: Option<aterm_uds::proc_connector::Route>,
+    sight: Option<crate::fg_sample::SightSeam>,
+    execd: fn(i32) -> Option<u64>,
     ran: crate::command_ran::RanFeed,
 }
 
@@ -7244,6 +7427,9 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                 fg.holder,
                 fg.image,
                 fg.proc_watch,
+                fg.connector,
+                fg.sight,
+                fg.execd,
                 fg.ran,
                 lane_guard,
                 gather_journal,
@@ -7395,8 +7581,11 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                 )> = None;
                 let mut cuts = crate::cast::CastCuts::default();
                 let mut emitted = 0usize;
-                let spine_copy: Option<std::sync::Arc<[u8]>> =
-                    temporal_lane.0.as_ref().map(|_| std::sync::Arc::from(buf));
+                let spine_copy: Option<std::sync::Arc<[u8]>> = temporal_lane
+                    .0
+                    .as_ref()
+                    .filter(|tx| temporal_lane.1.needs_input(tx))
+                    .map(|_| std::sync::Arc::from(buf));
                 #[cfg(unix)]
                 let mut journal_keyframe: Option<crate::crash_restore::Captured> = None;
                 let (response, reports) = {
@@ -7724,7 +7913,9 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                             backlog = t.lazy_backlog_len();
                             let moved = screen_moves.fed(crate::control::screen_gen(&t));
                             job_feed.fed(&t, &bytes[off..end], moved, Instant::now);
-                            if let (Some(tx), Some(pre)) = (&temporal_lane.0, slice_pre) {
+                            if let (Some(tx), Some(pre)) = (&temporal_lane.0, slice_pre)
+                                && temporal_lane.1.needs_input(tx)
+                            {
                                 let input = match &spine_copy {
                                     Some(copy) => crate::temporal::InputSlice::new(
                                         copy.clone(),
@@ -8830,7 +9021,10 @@ fn login_shell_path_with(
             }
         }
     });
-    let deadline = std::time::Instant::now() + budget;
+    let now = std::time::Instant::now();
+    let deadline = now
+        .checked_add(budget)
+        .unwrap_or_else(|| now + std::time::Duration::from_secs(365 * 24 * 3600));
     #[cfg(unix)]
     let mut exit_watch = aterm_uds::exitwatch::exit_fd(child.id());
     let answered = loop {
@@ -11614,7 +11808,13 @@ mod kitty_transfer_tests {
             "a file outside the temporary directories is kept"
         );
 
-        let mut escaped = marked.clone();
+        // Built on the marked directory's plain spelling: under a Windows verbatim (`\\?\`) path a
+        // pushed `..` is resolved as it is pushed, so the path would never name the root as written.
+        let plain = |path: &Path| {
+            let text = path.to_string_lossy();
+            std::path::PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text))
+        };
+        let mut escaped = plain(&marked);
         for _ in 0..64 {
             escaped.push("..");
         }
@@ -11625,7 +11825,7 @@ mod kitty_transfer_tests {
         );
         escaped.push(format!("x-{MARKER}.rgba"));
         assert!(
-            escaped.starts_with(temp) && escaped.to_string_lossy().contains(MARKER),
+            escaped.starts_with(plain(temp)) && escaped.to_string_lossy().contains(MARKER),
             "as written, the path names the marker under the temporary root"
         );
         assert!(roots.consume(&escaped), "the file is still read");

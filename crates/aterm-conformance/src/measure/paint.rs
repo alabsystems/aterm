@@ -192,7 +192,8 @@ impl Companion {
     #[must_use]
     pub const fn height_holds(self, px: usize, cell_h: usize) -> bool {
         let (lo, hi) = self.height_bounds();
-        lo * cell_h <= 100 * px && 100 * px <= hi * cell_h
+        let (px100, cell) = ((px as u128) * 100, cell_h as u128);
+        (lo as u128) * cell <= px100 && px100 <= (hi as u128) * cell
     }
 }
 
@@ -261,7 +262,8 @@ impl Reach {
     #[must_use]
     pub const fn holds(self, px: usize, cell_h: usize) -> bool {
         let (lo, hi) = self.bounds();
-        lo * cell_h <= 100 * px && 100 * px <= hi * cell_h
+        let (px100, cell) = ((px as u128) * 100, cell_h as u128);
+        (lo as u128) * cell <= px100 && px100 <= (hi as u128) * cell
     }
 }
 
@@ -459,8 +461,10 @@ fn continuity_holds(row: &PaintRow, s: &ScanReport) -> Result<bool, CouldNotRun>
         }
         return Ok(s.rainbow_gap <= 1);
     }
-    Ok(2 * s.driven.dark_us <= 3 * s.driven.nominal_dt_us
-        && s.driven.mature_lead_us <= MATURE_LEAD_MAX_US)
+    Ok(
+        2 * i128::from(s.driven.dark_us) <= 3 * i128::from(s.driven.nominal_dt_us)
+            && s.driven.mature_lead_us <= MATURE_LEAD_MAX_US,
+    )
 }
 
 fn ink_holds(row: &PaintRow, s: &ScanReport) -> Result<bool, CouldNotRun> {
@@ -522,7 +526,7 @@ pub fn judge(row: &PaintRow, ledger: &Ledger, s: &ScanReport) -> Result<ShapeVer
             let window_dark = !row.capture.is_video()
                 || (s.driven.dark_us >= 0
                     && s.driven.nominal_dt_us > 0
-                    && 2 * s.driven.dark_us > 3 * s.driven.nominal_dt_us);
+                    && 2 * i128::from(s.driven.dark_us) > 3 * i128::from(s.driven.nominal_dt_us));
             ledger.trail_quiet()
                 && ledger.companions_off()
                 && window_dark

@@ -44,8 +44,8 @@ pub(super) fn run_captured(
 
 /// `aterm init`'s repository item for `user` with no `[github]` token source in init.toml: the
 /// same stage the first launch runs, after the secrets item `after` names when one does (the
-/// vault writes the token it reads). With no `[github]` table at all (`unasked`), a missing
-/// token leaves the default stage pending until the vault supplies its input.
+/// vault writes the token it reads). With no `[github]` table at all (`unasked`), a Mac with no
+/// token is no stage of this run.
 pub(super) fn item(user: &User, after: Option<String>, unasked: bool) -> Box<dyn Item> {
     Box::new(NativeRepositories {
         after,
@@ -98,8 +98,8 @@ struct NativeRepositories {
     captured: Option<Captured>,
     /// The secrets item it waits for in `aterm init` ([`item`]).
     after: Option<String>,
-    /// `aterm init`'s default, which waits for the vault's token without asking for a separate
-    /// GitHub setup step.
+    /// `aterm init`'s default, which nobody configured: no token on this Mac is no stage here,
+    /// not a person's step.
     unasked: bool,
     /// What the last probe or apply read, for the step after it: the apply reuses the probe's
     /// inventory and verdicts, and the read-back reads again only what the apply cloned.
@@ -480,11 +480,11 @@ struct Block {
 impl Block {
     /// The probe's answer for this block (System State design §3.6): a person's step where only
     /// their act ends the wait ([`Wait::kind`]), so its row needs them and no pass retries it,
-    /// else a wait that ends by itself. For `aterm init`'s default (`unasked`), a missing token
-    /// is an unfinished prerequisite, not an inapplicable stage; `mac` names the host.
+    /// else a wait that ends by itself. For `aterm init`'s default (`unasked`), a machine the
+    /// vault wrote no token to has no stage to run, which asks nobody anything; `mac` names it.
     fn probe(self, unasked: bool, mac: bool) -> Probe {
         match self.wait {
-            Some(Wait::Token) if unasked => Probe::Blocked {
+            Some(Wait::Token) if unasked => Probe::NotApplicable {
                 why: format!(
                     "no GitHub token on this {} yet: the ALab vault's sync writes ~/{} \
                      (init.toml [github] token_file names another)",
@@ -699,7 +699,7 @@ enum Install {
     Keychain { pin: bool },
 }
 
-fn unconfigure_to_vault(
+pub(super) fn unconfigure_to_vault(
     git: &Git,
     sys: &dyn System,
     user: &User,
@@ -863,8 +863,8 @@ pub(super) mod tests {
         );
         let rows = run_captured(&sys, &ctx, Mode::Plan, captured, Box::new(|| Ok(true))).unwrap();
         assert_eq!(Reading::of(&rows[0]), Some(Reading::Waits(Wait::Token)));
-        // Wait for the vault subscriber to supply the GitHub token.
-        assert_eq!(rows[0].outcome, crate::model::Outcome::Blocked);
+        // The vault this Mac reads holds no GitHub token: only a person puts one there.
+        assert_eq!(rows[0].outcome, crate::model::Outcome::Person);
         assert!(!sys.calls().iter().any(|call| call.contains(" agh GET ")));
     }
 
@@ -1768,8 +1768,8 @@ pub(super) mod tests {
 
     /// One whole pass over 50 repositories already in `~` and 10 to clone: GitHub's account and
     /// listing are read once, each present worktree is read once (one rev-parse, one origin), and
-    /// the read-back reads only the 10 clones. Before: three listings and twelve git runs per
-    /// present worktree (836 git runs here); after: one listing and two (286).
+    /// the read-back reads only the 10 clones. Each missing repository has one remote inventory
+    /// and one clone; local route admission is repeated before network operations.
     #[test]
     fn a_whole_pass_reads_github_and_each_worktree_once_and_reads_back_only_its_clones() {
         let (present, missing) = (names("repo", 50), names("new", 10));
@@ -1806,11 +1806,19 @@ pub(super) mod tests {
         for name in &missing {
             assert_eq!(ran_in(&calls, &home.join(name), TOP_LEVEL), 1, "{name}");
         }
-        let git = calls
-            .iter()
-            .filter(|call| call.contains(crate::items::github::CLT_GIT))
-            .count();
-        assert_eq!(git, 286, "{calls:#?}");
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.contains("ls-remote --symref"))
+                .count(),
+            missing.len(),
+            "{calls:#?}"
+        );
+        assert_eq!(
+            calls.iter().filter(|call| call.contains(" clone ")).count(),
+            missing.len(),
+            "{calls:#?}"
+        );
     }
 
     /// Up to four clones run at once: each of the first four waits, inside its clone, for the
@@ -1924,14 +1932,14 @@ pub(super) mod tests {
     }
 
     /// `aterm init`'s default stage on a Mac the vault wrote no GitHub token to asks nobody
-    /// anything: its row stays blocked, and neither git nor GitHub is asked. A `[github]`
+    /// anything: its row is not applicable, and neither git nor GitHub is asked. A `[github]`
     /// table that scopes the stage makes the same Mac the person's step (the control).
     #[test]
-    fn init_s_default_stage_without_a_token_stays_pending_and_asks_nothing() {
+    fn init_s_default_stage_without_a_token_is_not_applicable_and_asks_nothing() {
         let (sys, bare) = bare();
         let context = crate::items::defaults::tests::ctx(std::slice::from_ref(&bare.user));
         match item(&bare.user, None, true).probe(&sys, &context) {
-            Probe::Blocked { why } => {
+            Probe::NotApplicable { why } => {
                 assert!(why.contains("~/.secrets/gh_access_token"), "{why}");
                 assert!(why.contains("on this Mac yet"), "{why}");
             }
@@ -1947,13 +1955,13 @@ pub(super) mod tests {
         );
         assert!(matches!(
             item(&bare.user, None, false).probe(&sys, &context),
-            Probe::Blocked { .. }
+            Probe::Person { .. }
         ));
         // On Linux the row names the machine, not a Mac.
         let (mut linux, _) = self::bare();
         linux.linux = true;
         match item(&bare.user, None, true).probe(&linux, &context) {
-            Probe::Blocked { why } => assert!(why.contains("on this machine yet"), "{why}"),
+            Probe::NotApplicable { why } => assert!(why.contains("on this machine yet"), "{why}"),
             other => panic!("{other:?}"),
         }
     }
@@ -2062,55 +2070,65 @@ pub(super) mod tests {
 
         // Control: gh's helper for github.com is someone else's. The one missing repository
         // clones with the keychain's credential pinned on its own command line.
-        let (sys, item) = fixture();
-        answer(
-            &sys,
-            &item.user,
-            &format!("{ACCESSIBLE}&page=1"),
-            aterm_json::json!([repository("alice", "new", 1)]),
-        );
-        let unchecked = || Ok::<(), String>(());
-        let pinned = repos::CloneGuard::pinned("alice", &unchecked);
-        super::repos::tests::script_clone_named(&sys, &item.user, "new", 0, false, Some(&pinned));
-        super::repos::tests::script_existing(
-            &sys,
-            &item.user,
-            &Path::new(&item.user.home).join("new"),
-            "new",
-        );
-        let helper = "credential.https://github.com.helper";
-        sys.on(
-            &script::helpers(&item.user),
-            Ran::ok(&script::printed(&[
-                (script::CLT_CONFIG, "credential.helper", "osxkeychain"),
-                ("/Users//alice/.gitconfig", helper, ""),
-                (
-                    "/Users//alice/.gitconfig",
-                    helper,
-                    "!/opt/homebrew/bin/gh auth git-credential",
-                ),
-            ])),
-        );
-        script::holds(&sys, Some(&item.user), GITHUB, "alice", TOKEN);
-        let rows = run(&sys, &context, Mode::Apply).unwrap();
-        assert_eq!(rows[0].outcome, crate::model::Outcome::Changed, "{rows:?}");
-        let now = rows[0].to.as_deref().unwrap();
-        assert!(
+        for rewritten in [false, true] {
+            let (sys, item) = fixture();
+            answer(
+                &sys,
+                &item.user,
+                &format!("{ACCESSIBLE}&page=1"),
+                aterm_json::json!([repository("alice", "new", 1)]),
+            );
+            let unchecked = || Ok::<(), String>(());
+            let pinned = repos::CloneGuard::pinned("alice", &unchecked);
+            super::repos::tests::script_clone_named_route(
+                &sys,
+                &item.user,
+                "new",
+                0,
+                false,
+                Some(&pinned),
+                rewritten,
+            );
+            super::repos::tests::script_existing(
+                &sys,
+                &item.user,
+                &Path::new(&item.user.home).join("new"),
+                "new",
+            );
+            let helper = "credential.https://github.com.helper";
+            sys.on(
+                &script::helpers(&item.user),
+                Ran::ok(&script::printed(&[
+                    (script::CLT_CONFIG, "credential.helper", "osxkeychain"),
+                    ("/Users//alice/.gitconfig", helper, ""),
+                    (
+                        "/Users//alice/.gitconfig",
+                        helper,
+                        "!/opt/homebrew/bin/gh auth git-credential",
+                    ),
+                ])),
+            );
+            script::holds(&sys, Some(&item.user), GITHUB, "alice", TOKEN);
+            let rows = run(&sys, &context, Mode::Apply).unwrap();
+            assert_eq!(rows[0].outcome, crate::model::Outcome::Changed, "{rows:?}");
+            let now = rows[0].to.as_deref().unwrap();
+            assert!(
             now.contains(
                 "git's own GitHub settings left as they are (credential.https://github.com.helper \
                  in /Users//alice/.gitconfig)"
             ),
             "{now}"
         );
-        assert!(!now.contains("gh auth"), "{now}");
-        assert!(
-            sys.calls()
-                .iter()
-                .all(|call| !call.contains("--global") && !call.contains("credential approve")),
-            "{:?}",
-            sys.calls()
-        );
-        assert_eq!(journaled(&sys)[0]["revert"], aterm_json::Value::Null);
+            assert!(!now.contains("gh auth"), "{now}");
+            assert!(
+                sys.calls()
+                    .iter()
+                    .all(|call| !call.contains("--global") && !call.contains("credential approve")),
+                "{:?}",
+                sys.calls()
+            );
+            assert_eq!(journaled(&sys)[0]["revert"], aterm_json::Value::Null);
+        }
     }
 
     #[test]

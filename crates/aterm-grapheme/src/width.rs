@@ -68,6 +68,12 @@ fn grapheme_width_inner(s: &str, cjk: bool) -> GraphemeInfo {
 
 /// Calculate the display width of a single grapheme cluster.
 ///
+/// This is the cluster's presentation width, not always the columns the grid
+/// gives it: a minimally qualified ZWJ sequence on a narrow emoji base (U+2764
+/// U+200D U+1F525, with no VS16) measures 2 here while the grid keeps it in its
+/// base's one column. Cursor and selection columns come from
+/// [`GridColumns`](crate::GridColumns).
+///
 /// REQUIRES: `grapheme` is valid UTF-8 (`&str` invariant).
 /// ENSURES: returns a terminal cell width in the inclusive range `0..=2`.
 #[inline]

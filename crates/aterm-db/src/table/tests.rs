@@ -117,11 +117,22 @@ fn negative_only_ciphertext_never_promotes_malformed_payloads() {
         )
         .unwrap();
     assert!(session.negative_record(scope, &wire).unwrap().is_some());
+    let valid = wire.clone();
     let last_payload = wire.len() - 65;
     wire[last_payload] ^= 1;
     resign(&bootstrap, &mut wire);
-    assert!(session.authenticate(scope, &wire).is_err());
-    assert!(session.negative_record(scope, &wire).unwrap().is_none());
+    for _ in 0..2 {
+        assert!(session.authenticate(scope, &wire).is_err());
+        assert!(session.negative_record(scope, &wire).unwrap().is_none());
+    }
+    session
+        .with_read_batch(scope, |batch| {
+            assert!(batch.authenticate(&valid).is_ok());
+            assert!(batch.authenticate(&wire).is_err());
+            assert!(batch.authenticate(&valid).is_ok());
+            Ok(())
+        })
+        .unwrap();
     let foreign = Scope::new(scope.trust(), *scope.table(), 2).unwrap();
     assert!(session.negative_record(foreign, &wire).is_err());
 }
@@ -152,6 +163,7 @@ impl Lab {
         Self::build(roles, roles.len(), true)
     }
     fn build(roles: &[Role], enrolled: usize, foundation: bool) -> Self {
+        aterm_spec::fs_lane::join();
         let home = aterm_tempfile::tempdir().unwrap();
         let source = home.path().join("test.vault");
         let paths: Vec<_> = (0..roles.len())
@@ -397,12 +409,48 @@ fn readers_can_authenticate_but_cannot_write_even_with_a_copied_header() {
     let at = 5 + SCOPE_LEN + 32 + 8;
     forgery[at..at + 48].copy_from_slice(&sb.actor());
     resign(&b, &mut forgery);
-    assert!(
-        sa.authenticate(scope, &forgery)
-            .err()
-            .unwrap()
-            .0
-            .contains("historical writer")
+    for _ in 0..2 {
+        assert!(
+            sa.authenticate(scope, &forgery)
+                .err()
+                .unwrap()
+                .0
+                .contains("historical writer")
+        );
+    }
+}
+
+/// [`Session::writers`] names exactly the members [`Session::peer_writer`] accepts one at a
+/// time: a Reader and a Writer the swarm roster denies are left out.
+#[test]
+fn writers_are_the_members_each_peer_writer_check_accepts() {
+    let lab = Lab::new(&[Role::Writer, Role::Reader, Role::Writer]);
+    let denied = lab.bootstrap(2).request().unwrap().binding().clone();
+    let admin = client::admin_open(&lab.paths[0]).unwrap();
+    let mut doc = admin.doc.clone();
+    let deny = format!(
+        "deny_nodes = [\"{}\"]\n",
+        aterm_codec::hex::encode_lower(denied.machine())
+    );
+    doc.set_entry(
+        &Audience::Everyone,
+        aterm_secrets::swarm_roster::ROSTER_ENTRY,
+        deny.as_bytes(),
+    )
+    .unwrap();
+    client::admin_publish(&lab.paths[0], &admin, &doc).unwrap();
+    client::sync(&lab.paths[0], None).unwrap();
+    let bootstrap = lab.bootstrap(0);
+    let session = Session::observe(&bootstrap).unwrap();
+    let accepted = session
+        .members()
+        .into_iter()
+        .filter(|binding| session.peer_writer(binding.actor()).is_ok())
+        .collect::<Vec<_>>();
+    assert_eq!(session.writers(), accepted);
+    assert_eq!(
+        accepted,
+        vec![bootstrap.request().unwrap().binding().clone()]
     );
 }
 
@@ -712,6 +760,83 @@ fn waiting_session_revalidates_source_identity_and_device_custody() {
     }
 }
 
+#[test]
+fn an_admitted_successor_does_not_inherit_the_lock_wait_deadline() {
+    use crate::{catalog::Descriptor, table::store::Store};
+    use std::time::Instant;
+
+    let lab = Lab::new(&[Role::Writer; 3]);
+    let original = lab.bootstrap(0);
+    let scope = {
+        let session = Session::open(&original).unwrap();
+        let directory = crate::catalog::Directory::new(&lab.paths[0], original.trust());
+        let descriptor =
+            Descriptor::application(original.trust(), "admission-test", "records", 1).unwrap();
+        let scope = directory.publish(&session, &descriptor).unwrap();
+        Store::open(&session, &directory.path(scope).unwrap(), scope)
+            .unwrap()
+            .commit_catalog(&session, b"retained before succession")
+            .unwrap();
+        scope
+    };
+    let wire = {
+        let peer = lab.bootstrap(2);
+        Session::open(&peer)
+            .unwrap()
+            .seal(scope, causal(), b"received after writer admission")
+            .unwrap()
+    };
+    let config = lab.paths[0].home.join("config.toml");
+    let next = crate::generation::test_complete_successor(
+        lab._home.path(),
+        &lab.paths[0],
+        &lab.paths[1],
+        &config,
+        Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+    )
+    .unwrap();
+    let bootstrap = Bootstrap::required(&next).unwrap();
+    let directory = crate::catalog::Directory::new(&next, bootstrap.trust());
+    let path = directory.path(scope).unwrap();
+    let mut session =
+        Session::open_until(&bootstrap, Instant::now() + aterm_spec::wait::MUST_HAPPEN).unwrap();
+    // Age any retained admission deadline without sleeping or depending on
+    // replay speed. Once admitted, ordinary storage must use fresh checks.
+    session.generation_deadline = session
+        .generation_deadline
+        .map(|_| Instant::now() - Duration::from_secs(1));
+    let mut store = Store::open(&session, &path, scope)
+        .expect("an admitted successor can replay after the lock-wait deadline");
+    let receipt = store.ingest(&session, &wire).unwrap();
+    assert_eq!(receipt.id, aterm_digest::Sha256::digest(&wire));
+    assert_eq!(store.inventory(&session).unwrap().count(), 2);
+    let retained = std::fs::read(path.join("table.astream")).unwrap();
+
+    // A fresh check still withdraws this admitted successor when its original
+    // sharing policy changes; an elapsed admission budget grants no authority.
+    aterm_secrets::fsx::write_atomic(&config, b"[commons]\nenabled = false\n", 0o600).unwrap();
+    assert!(store.ingest(&session, &wire).is_err());
+    assert_eq!(std::fs::read(path.join("table.astream")).unwrap(), retained);
+    drop(store);
+    drop(session);
+    aterm_secrets::fsx::write_atomic(&config, b"", 0o600).unwrap();
+
+    // Callers explicitly bounding a whole session retain that bound. The
+    // correction must not disable deadline checks in the generation guard.
+    let journal = Journal::open_existing(bootstrap.journal_dir(), bootstrap.trust()).unwrap();
+    let mut bounded = Session::from_admitted_journal_until(
+        &bootstrap,
+        journal,
+        Some(Instant::now() + aterm_spec::wait::MUST_HAPPEN),
+    )
+    .unwrap();
+    bounded.generation_deadline = Some(Instant::now() - Duration::from_secs(1));
+    assert!(Store::open(&bounded, &path, scope).is_err());
+    assert_eq!(std::fs::read(path.join("table.astream")).unwrap(), retained);
+    drop(bounded);
+    assert!(Session::open_until(&bootstrap, Instant::now() - Duration::from_secs(1)).is_err());
+}
+
 fn envelope_transition(
     state: &aterm_spec::interp::State,
     action: &str,
@@ -764,7 +889,12 @@ fn envelope_transition(
             .seal(scope, causal(), b"reader write")
             .is_ok()
     } else {
-        session.authenticate(scope, &wire).is_ok()
+        let accepted = session.authenticate(scope, &wire).is_ok();
+        let batch_accepted = session
+            .with_read_batch(scope, |batch| batch.authenticate(&wire))
+            .is_ok();
+        assert_eq!(batch_accepted, accepted, "{action}");
+        accepted
     };
     let mut next = state.clone();
     next.insert("scenario", scenario);
@@ -796,6 +926,50 @@ fn signed_envelope_conforms_and_reader_forgery_mutant_is_detected() {
     assert!(!model.check_invariant("ExactWriterEvidenceOnly", &forged));
 }
 
+#[test]
+fn read_batches_refuse_membership_or_custody_changes_before_returning() {
+    for changed in ["control", "source.toml", "commons/device.age"] {
+        let lab = Lab::new(&[Role::Writer]);
+        let bootstrap = lab.bootstrap(0);
+        let writer = Session::open(&bootstrap).unwrap();
+        let scope = writer.scope().unwrap();
+        let wire = writer.seal(scope, causal(), b"retained metadata").unwrap();
+        drop(writer);
+        let reader = Session::observe(&bootstrap).unwrap();
+        let admin = client::admin_open(&lab.paths[0]).unwrap();
+        let grant = Grant::recorded(
+            "m1",
+            bootstrap.request().unwrap().binding().clone(),
+            Role::Reader,
+        );
+        let demotion = admin
+            .prepare_commons_rotation(&reader.journal, vec![grant])
+            .unwrap();
+        let result = reader.with_read_batch(scope, |batch| {
+            let record = batch.authenticate(&wire)?;
+            batch.authenticate(&wire)?;
+            if changed == "control" {
+                Journal::open_existing(bootstrap.journal_dir(), bootstrap.trust())
+                    .unwrap()
+                    .ingest(demotion.bytes())
+                    .unwrap();
+            } else {
+                let path = lab.paths[0].dir.join(changed);
+                std::fs::rename(&path, path.with_extension("moved")).unwrap();
+            }
+            // The key is already warm. Its final currency check and the
+            // enclosing source check must still withhold this result.
+            let _ = batch.authenticate(&wire);
+            Ok(record)
+        });
+        assert!(
+            result.is_err(),
+            "batch returned data after {changed} changed"
+        );
+    }
+}
+
+pub(crate) mod frontier;
 mod storage;
 
 #[test]

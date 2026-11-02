@@ -1,0 +1,50 @@
+# grok 1.0.70 · MEASURED 2026-10-29, `aterm ctl text` of a private headless aterm (144x50, aterm 0.146.0) running the real Grok Build, launched by path in the lab's jail with a scratch `HOME` and `GROK_HOME`, the lab's `XAI_API_KEY` and `GROK_XAI_API_BASE_URL`/`GROK_CLI_CHAT_PROXY_BASE_URL=http://127.0.0.1:<port>/v1` (a local stub of xAI's API, crates/aterm-lab) · `grok --resume` (no id: the most recent session) relaunched in the same folder after the clean quit: no picker and no welcome card; the session's history redrawn compactly (each prompt row, the persisted error rows, the 402 turn's upsell kept as `┃  Turn failed in 0.2s: Request failed (402): insufficient_quota: lab stub: out of credits`), the last exchange, and the idle composer · cursor=45,6 (visible, blinking_block) · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+  /p/t/at.lab0/proj                                                                                                   14K / 256K │ [Dashboard]
+
+     ❯ dd a test step                                                                                                                2:01 PM
+
+
+
+     ❯ hit the limit                                                                                                                 2:01 PM
+
+
+  ┃  Retry failed: Some resource has been exhausted: lab stub: too many requests, try again later
+
+
+     ❯ use the free tier                                                                                                             2:04 PM
+
+
+
+     ❯ spend credits                                                                                                                 2:05 PM
+
+
+  ┃  Turn failed in 0.2s: Request failed (402): insufficient_quota: lab stub: out of credits
+
+
+     ❯ spend more credits                                                                                                            2:05 PM
+
+
+  ┃  Retry failed: insufficient_quota: lab stub: out of credits
+
+
+     ❯ with a bad key                                                                                                                2:06 PM
+
+
+  ┃  Authentication required: your session has expired or your credentials were rejected. Run /login to re-authenticate, then resend your
+  ┃  message.
+
+                                                                                                                                               █
+     ❯ echo "grok-exit=$?"                                                                                                           2:06 PM   █
+                                                                                                                                               █
+                                                                                                                                               █
+     Hi! I am the local lab stub, not a model. (reply 38)                                                                            2:06 PM   █
+                                                                                                                                               █
+     Worked for 0.5s                                                                                                                           █
+                                                                                                                                               █
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ ❯                                                                                                                                        │
+  ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── lab-stub ─╯
+
+  Shift+Tab:mode  │  Ctrl+x:shortcuts

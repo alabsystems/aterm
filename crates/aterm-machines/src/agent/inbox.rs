@@ -81,7 +81,10 @@ pub fn put_file(
             "put-file writes as the user whose home it is, never as root",
         );
     }
-    let Ok(mode) = u32::from_str_radix(mode, 8) else {
+    let Some(mode) = (!mode.is_empty() && mode.bytes().all(|b| matches!(b, b'0'..=b'7')))
+        .then(|| u32::from_str_radix(mode, 8).ok())
+        .flatten()
+    else {
         return super::refuse(out, "put-file: the mode is not octal");
     };
     if mode & !0o777 != 0 {
@@ -243,6 +246,17 @@ mod tests {
         assert_eq!(
             fake.written("/Users//admin/.ssh/authorized_keys").unwrap(),
             b"restrict ssh-ed25519 AAAA\n"
+        );
+        let mut out = Vec::new();
+        assert_eq!(
+            put_file(
+                &fake,
+                Path::new("/Users//admin/.ssh/authorized_keys"),
+                "+600",
+                &mut &b"x"[..],
+                &mut out,
+            ),
+            refused()
         );
     }
 

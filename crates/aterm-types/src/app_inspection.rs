@@ -49,6 +49,8 @@ pub enum InspectionProjection {
 pub enum InspectRequest<'a> {
     /// Enumerate windows, tabs, split topology, and every leaf view.
     Tabs,
+    /// Read the retained GUI network projection, without refreshing its producers.
+    Network,
     /// Inspect one stable native app view.
     View {
         /// Stable target view; never inferred from current focus.
@@ -63,6 +65,8 @@ pub enum InspectRequest<'a> {
 pub enum InspectionSubject<'a> {
     /// Window/tab/split topology enumeration.
     Tabs,
+    /// Sanitized metadata from the retained GUI network projection.
+    Network,
     /// One stable view and semantic projection.
     View {
         /// Stable target view.
@@ -88,6 +92,10 @@ impl InspectionEnvelope<'_> {
         match self.subject {
             InspectionSubject::Tabs => format!(
                 "app-inspection version={APP_INSPECTION_V1} revision={} subject=tabs",
+                self.revision
+            ),
+            InspectionSubject::Network => format!(
+                "app-inspection version={APP_INSPECTION_V1} revision={} subject=network",
                 self.revision
             ),
             InspectionSubject::View { view, projection } => format!(
@@ -129,6 +137,8 @@ pub struct ActRequest<'a> {
 /// A parsed `open app ...` request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpenAppRequest<'a> {
+    /// Focus or create the native Mail view.
+    Mail,
     /// Focus or create the dedicated About native view.
     About,
     /// Focus or create the System State native view.
@@ -187,13 +197,14 @@ impl fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
-/// Parse `inspect` arguments (`app/v1 tabs` or `app/v1 view <view-id> <text|controls|tree|audit>`).
+/// Parse `inspect` arguments (`app/v1 tabs`, `app/v1 network`, or a view projection).
 pub fn parse_inspect(rest: &str) -> Result<InspectRequest<'_>, ParseError> {
     reject_line_break(rest, "inspect payload")?;
     let mut input = rest;
     require_version(take_token(&mut input))?;
     match take_token(&mut input) {
         Some("tabs") if remainder(input).is_empty() => Ok(InspectRequest::Tabs),
+        Some("network") if remainder(input).is_empty() => Ok(InspectRequest::Network),
         Some("view") => {
             let raw_view = take_token(&mut input).ok_or(ParseError::Usage(
                 "inspect app/v1 view <view-id> <text|controls|tree|audit>",
@@ -219,7 +230,7 @@ pub fn parse_inspect(rest: &str) -> Result<InspectRequest<'_>, ParseError> {
             Ok(InspectRequest::View { view, projection })
         }
         _ => Err(ParseError::Usage(
-            "inspect app/v1 tabs | inspect app/v1 view <view-id> <text|controls|tree|audit>",
+            "inspect app/v1 tabs | inspect app/v1 network | inspect app/v1 view <view-id> <text|controls|tree|audit>",
         )),
     }
 }
@@ -275,11 +286,12 @@ pub fn parse_open_app(rest: &str) -> Result<OpenAppRequest<'_>, ParseError> {
     let mut input = rest;
     if take_token(&mut input) != Some("app") {
         return Err(ParseError::Usage(
-            "open app <about|system-state|settings [route]|markdown <uri>|editor <uri>>",
+            "open app <mail|about|system-state|settings [route]|markdown <uri>|editor <uri>>",
         ));
     }
     match take_token(&mut input) {
         Some("about") if remainder(input).is_empty() => Ok(OpenAppRequest::About),
+        Some("mail") if remainder(input).is_empty() => Ok(OpenAppRequest::Mail),
         Some("system-state") if remainder(input).is_empty() => Ok(OpenAppRequest::SystemState),
         Some("settings") => {
             let route = remainder(input);
@@ -305,7 +317,7 @@ pub fn parse_open_app(rest: &str) -> Result<OpenAppRequest<'_>, ParseError> {
         }
         Some(_) => Err(ParseError::UnknownApp),
         None => Err(ParseError::Usage(
-            "open app <about|system-state|settings [route]|markdown <uri>|editor <uri>>",
+            "open app <mail|about|system-state|settings [route]|markdown <uri>|editor <uri>>",
         )),
     }
 }
@@ -387,6 +399,15 @@ mod tests {
     #[test]
     fn inspect_version_and_stable_view_are_explicit() {
         assert_eq!(parse_inspect("app/v1 tabs"), Ok(InspectRequest::Tabs));
+        assert_eq!(
+            parse_inspect(" app/v1  network "),
+            Ok(InspectRequest::Network)
+        );
+        assert!(parse_inspect("app/v1 network extra").is_err());
+        assert_eq!(
+            parse_inspect("app/v2 network"),
+            Err(ParseError::UnsupportedVersion)
+        );
         assert_eq!(
             parse_inspect(" app/v1   view view-42 controls "),
             Ok(InspectRequest::View {

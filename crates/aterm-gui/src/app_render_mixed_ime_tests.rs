@@ -59,6 +59,7 @@ fn present(app: &mut App, wid: WindowId, plan: &VisibleLeafPlan) {
         SuccessfulPresentRoute::Heterogeneous,
         crate::VisibleContentRoute::Heterogeneous,
         HostVisualState::default(),
+        None,
         plan,
     );
 }

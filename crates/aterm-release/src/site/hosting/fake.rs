@@ -178,6 +178,7 @@ fn serve(stream: TcpStream, state: &Mutex<State>, origins: &Origins, public: &[u
         let _ = writer.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
     }
     let length = header("content-length")
+        .filter(|l| l.bytes().all(|b| b.is_ascii_digit()))
         .and_then(|l| l.parse::<usize>().ok())
         .unwrap_or(0);
     let mut body = vec![0; length];
@@ -306,10 +307,8 @@ fn route(
             (200, aterm_json::json!({"name": name, "status": "CREATED"}))
         }
         ("POST", "populate") => {
-            let version = path
-                .trim_start_matches("/v1beta1/")
-                .trim_end_matches(":populateFiles")
-                .to_string();
+            let p = path.strip_prefix("/v1beta1/").unwrap_or(path);
+            let version = p.strip_suffix(":populateFiles").unwrap_or(p).to_string();
             if !st.configs.contains_key(&version) {
                 return error(404, "no such version");
             }
@@ -356,7 +355,7 @@ fn route(
             (200, aterm_json::json!({}))
         }
         ("PATCH", "finalize") => {
-            let version = path.trim_start_matches("/v1beta1/").to_string();
+            let version = path.strip_prefix("/v1beta1/").unwrap_or(path).to_string();
             let asked = json
                 .as_ref()
                 .and_then(|j| j.get("status"))
@@ -386,9 +385,8 @@ fn route(
             if !st.configs.contains_key(&version) {
                 return error(400, "no such version");
             }
-            let site = path
-                .trim_start_matches("/v1beta1/sites/")
-                .trim_end_matches("/releases");
+            let p = path.strip_prefix("/v1beta1/sites/").unwrap_or(path);
+            let site = p.strip_suffix("/releases").unwrap_or(p);
             st.live = Some(version.clone());
             (
                 200,

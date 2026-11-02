@@ -216,14 +216,6 @@ impl LongHoldWords {
     }
 }
 
-/// The `[presence]` leaf key View ▸ Show Needs in Windows writes: a registered settings key
-/// (`prefs::NESTED_LEAVES`), so the config lane admits it.
-pub(crate) const PRESENCE_RIM_KEY: &str = crate::prefs::EDIT_PRESENCE_RIM;
-
-/// The human name of the needs switch's leaf ([`PRESENCE_RIM_KEY`]), the not-saved notice's
-/// subject.
-pub(crate) const PRESENCE_RIM_LABEL: &str = "Show Needs in Windows";
-
 /// Which `aterm` command a row reads into a document tab ([`App::run_cli_to_tab`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CliVerb {
@@ -515,48 +507,6 @@ fn cli_status_words(status: &Result<Option<i32>, String>) -> String {
 }
 
 impl App {
-    /// View ▸ Show Needs in Windows (`[presence] rim`) as applied: off, no window draws its
-    /// border or its pill.
-    pub(crate) const fn presence_rim_on(&self) -> bool {
-        self.presence_rim_on
-    }
-
-    /// Adopt `[presence] rim` from the config on load and on every reload: publish the bit for
-    /// the native menu's checkmark and re-project every window when it moved.
-    pub(crate) fn adopt_presence_config(&mut self) {
-        let rim = self.config.presence_rim_enabled();
-        crate::menu::set_needs_in_windows(rim);
-        if rim == self.presence_rim_on {
-            return;
-        }
-        self.presence_rim_on = rim;
-        self.refresh_presence_all_windows();
-    }
-
-    /// Set the needs switch live: publish it, re-project every window, and re-resolve any open
-    /// palette's checkmark.
-    pub(crate) fn set_presence_bit(&mut self, on: bool) {
-        self.presence_rim_on = on;
-        crate::menu::set_needs_in_windows(self.presence_rim_on);
-        self.refresh_presence_all_windows();
-        self.palette_refresh_live();
-    }
-
-    /// View ▸ Show Needs in Windows: flip the border-and-pill bit now and persist it as
-    /// `[presence] rim`.
-    pub(crate) fn user_toggle_needs_in_windows(&mut self) {
-        let desired = !self.presence_rim_on;
-        self.set_presence_bit(desired);
-        if let Err(error) = self.queue_presence_write(PRESENCE_RIM_KEY, desired) {
-            self.post_message(crate::message_reporters::presence_not_saved(
-                PRESENCE_RIM_KEY,
-                PRESENCE_RIM_LABEL,
-                &error.to_string(),
-                false,
-            ));
-        }
-    }
-
     /// Every local need, read off each session's published verdict (never classified here),
     /// with its age and label as the status item's row has them ([`NeedStop`]).
     pub(crate) fn local_needs(&self) -> Vec<NeedStop> {
@@ -716,6 +666,25 @@ impl App {
         })
     }
 
+    /// Read native focus without posting keys, raising a window or publishing input guards.
+    pub(crate) fn native_focus(&self) -> Option<crate::platform::NativeFocus> {
+        self.native_focus_when_windowed(|| {
+            let wid = self.frontmost_window?;
+            let window = self.windows.get(&wid)?.os_window.as_deref()?;
+            crate::platform::appkit_native_focus(window)
+        })
+    }
+
+    fn native_focus_when_windowed(
+        &self,
+        observe: impl FnOnce() -> Option<crate::platform::NativeFocus>,
+    ) -> Option<crate::platform::NativeFocus> {
+        if self.headless {
+            return None;
+        }
+        observe()
+    }
+
     /// `hwkey`'s main-thread hop (`Wake::HwKeyTarget`): the front window's AppKit number (`0`
     /// with none) and whether it is key, or a refusal where a real key event would pass for the
     /// person's press ([`Self::hwkey_front_refusal`]). It also publishes the answer a running
@@ -843,6 +812,7 @@ impl App {
             return Err("a seamless update is committing this tab".to_string());
         }
         if on {
+            crate::control::forget_driven_shell(&ctx.self_id);
             self.agents
                 .held_since
                 .entry(session)
@@ -2548,43 +2518,6 @@ mod tests {
     }
 
     #[test]
-    fn show_needs_in_windows_gates_the_border_and_persists() {
-        let (mut app, wid, sid, ctx) = app_with_stub();
-        ctx.meta.lock().unwrap().attention = Some("deploy?".into());
-        app.refresh_presence_session(sid);
-        let rim = |app: &App| app.presence_view(wid).map(|v| v.rim);
-        assert_eq!(rim(&app), Some(crate::presence::Rim::Decide));
-        assert!(app.presence_overlay(wid).is_some());
-
-        app.user_toggle_needs_in_windows();
-        assert!(!app.presence_rim_on());
-        assert_eq!(rim(&app), Some(crate::presence::Rim::None));
-        assert!(app.presence_pill(wid).is_none());
-        assert!(app.presence_overlay(wid).is_none());
-        assert_eq!(
-            app.presence.slot(sid).map(|s| s.chip()),
-            Some(crate::presence::ChipLevel::Wait),
-            "the tab's mark stays"
-        );
-        assert_eq!(
-            row(&app, wid, MenuAction::ToggleNeedsInWindows).checked,
-            Some(false)
-        );
-        assert!(app.has_live_message("Couldn't save"));
-
-        app.user_toggle_needs_in_windows();
-        assert!(app.presence_rim_on());
-        assert_eq!(rim(&app), Some(crate::presence::Rim::Decide));
-
-        app.config = aterm_toml::from_str::<crate::app_config::Config>("[presence]\nrim = false\n")
-            .expect("parses");
-        app.adopt_presence_config();
-        assert!(!app.presence_rim_on());
-        assert_eq!(rim(&app), Some(crate::presence::Rim::None));
-        assert!(!app.config.presence_rim_enabled());
-    }
-
-    #[test]
     fn the_cli_rows_compose_their_argv_and_run_nothing_headless() {
         let (mut app, wid, _sid, _ctx) = app_with_stub();
         for verb in [
@@ -3058,6 +2991,26 @@ mod tests {
             Ok((0, false)),
             "the terminal tab in front again"
         );
+    }
+
+    #[test]
+    fn native_focus_never_reaches_its_observer_in_a_headless_app() {
+        let (mut app, wid, _sid, _ctx) = app_with_stub();
+        let unavailable = |app: &App| {
+            assert_eq!(app.native_focus(), None);
+            assert_eq!(
+                app.native_focus_when_windowed(|| panic!("headless reached the native observer")),
+                None
+            );
+        };
+        unavailable(&app);
+        app.palette_enter();
+        assert!(app.gateway_card_open(wid));
+        unavailable(&app);
+        app.palette_exit();
+        assert!(app.open_system_state_tab());
+        assert!(app.system_state_active_in(wid));
+        unavailable(&app);
     }
 
     #[test]

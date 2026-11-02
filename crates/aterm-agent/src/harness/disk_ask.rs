@@ -402,8 +402,10 @@ pub struct Ahead<'a> {
     /// cannot say a fill stopped, so another host's projection record stands at it for
     /// [`COLD_HOLD_MS`] after that host ended.
     pub cold: bool,
-    /// This host can start a disk worker ([`worker_step`]): its harness supervises Claude Code and
-    /// its state root is the owner's.
+    /// This host can start a disk worker ([`worker_step`]): its harness supervises Claude Code, its
+    /// state root is the owner's, and no earlier worker of its still runs in the worker folder
+    /// (working, or stalled: stopped at a sign-in or first-run screen, or before Claude Code ran),
+    /// which the next would share or stop beside.
     pub worker_ok: bool,
     /// What this host's task records say of a session's task, for the worker it runs: `None`
     /// where it has no record of it.
@@ -792,6 +794,13 @@ pub struct Entry {
     /// no host can start one, which [`owner_needed`] reads.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub due_ms: Option<i64>,
+    /// The host whose look found the worker due and could not start one ([`Self::due_ms`]). Only
+    /// that host's look, or any look once that host ended, clears `due_ms` for finding no worker
+    /// due: whether one is due rests partly on each host's own reading (its fill, its own pass),
+    /// so another host's look must not keep resetting the clock [`owner_needed`] waits on.
+    /// `None` in a lease an older build wrote: any look clears it, as before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub due_host: Option<HostId>,
 }
 
 impl Entry {
@@ -2530,11 +2539,21 @@ pub fn worker_step(lease: &mut Lease, look: &Look<'_>) -> Option<WorkerSaid> {
         return worker_moves(entry, look);
     }
     if !wants_worker(entry, look) {
-        entry.due_ms = None;
+        let mine = entry
+            .due_host
+            .as_ref()
+            .is_none_or(|due| due == look.host || !(look.alive)(due));
+        if mine {
+            entry.due_ms = None;
+            entry.due_host = None;
+        }
         return None;
     }
     if !look.ahead.worker_ok {
-        entry.due_ms.get_or_insert(look.now_ms);
+        if entry.due_ms.is_none() {
+            entry.due_ms = Some(look.now_ms);
+            entry.due_host = Some(look.host.clone());
+        }
         return None;
     }
     entry.worker = Some(Worker {
@@ -2546,6 +2565,7 @@ pub fn worker_step(lease: &mut Lease, look: &Look<'_>) -> Option<WorkerSaid> {
     });
     entry.last_worker_ms = Some(look.now_ms);
     entry.due_ms = None;
+    entry.due_host = None;
     Some(WorkerSaid::Claimed)
 }
 
@@ -2913,7 +2933,7 @@ pub fn lock_within(dir: &Path, ladder: &[Duration]) -> io::Result<Option<LeaseLo
     {
         use std::os::unix::fs::OpenOptionsExt as _;
         opts.mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
     }
     #[cfg(windows)]
     {
@@ -2921,6 +2941,16 @@ pub fn lock_within(dir: &Path, ladder: &[Duration]) -> io::Result<Option<LeaseLo
         opts.custom_flags(super::win::FILE_FLAG_OPEN_REPARSE_POINT);
     }
     let file = opts.open(dir.join(LOCK_FILE))?;
+    #[cfg(unix)]
+    {
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "lease lock is not a regular file",
+            ));
+        }
+        aterm_uds::keep_out_of_children(&file)?;
+    }
     let mut pauses = ladder.iter();
     loop {
         #[expect(

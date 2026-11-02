@@ -107,9 +107,17 @@ fn open_lock_file(path: &Path) -> io::Result<std::fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        opts.mode(0o600);
+        opts.mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    opts.open(path)
+    let file = opts.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "lock path is not a regular file",
+        ));
+    }
+    Ok(file)
 }
 
 /// `.<name>.tmp-<pid>-<seq>` beside `path`.
@@ -375,5 +383,16 @@ mod tests {
         .err()
         .expect("held");
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_for_update_refuses_symlink_lock_file() {
+        let d = dir("lock-symlink");
+        let dest = d.join("x.toml");
+        let victim = d.join("victim");
+        std::fs::write(&victim, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&victim, d.join("x.toml.lock")).unwrap();
+        assert!(lock_for_update(&dest).is_err());
     }
 }

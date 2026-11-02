@@ -144,9 +144,10 @@ impl Knobs {
     /// The knobs the account's own aterm.toml writes (resolved as its window resolves it, even from a scratch home); the defaults where it is absent or unreadable.
     #[must_use]
     pub fn kept() -> Knobs {
+        const ATERM_TOML_MAX: u64 = 1024 * 1024;
         crate::own_roots()
             .1
-            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|p| crate::read_regular_text(&p, ATERM_TOML_MAX).ok())
             .map_or_else(Knobs::default, |text| Knobs::from_toml(&text))
     }
 }

@@ -105,7 +105,9 @@ const MAX_SESSION_ENV_DIRS: usize = 4096;
 /// `rg` fallback, its `find`/`grep`/`pkill` shadows, `PATH`).
 const CLAUDE_PART: &str = "# Check for rg availability";
 
-/// zsh options (`setopt`) that do not affect non-interactive `zsh -c` command resolution or paths.
+/// zsh options (`setopt`) that do not affect non-interactive `zsh -c` command resolution or paths
+/// (`extendedglob` among them because a proven line under zsh holds none of its operators,
+/// `classify::plain_zsh_line`).
 pub const ZSH_INERT: &[&str] = &[
     "alwayslastprompt",
     "noalwayslastprompt",
@@ -356,22 +358,29 @@ fn shell_relevant(key: &str) -> bool {
     )
 }
 
-/// The shells Claude Code's Bash tool may run for `worker` (2.1.284's `BMn`).
-pub fn tool_kinds(worker: &WorkerEnv) -> Vec<Kind> {
+/// The shells Claude Code's Bash tool may run for `worker` (2.1.284's `BMn`), on
+/// Windows when `windows`: there 2.1.310's start sets `SHELL` to Git for Windows' bash
+/// (`CLAUDE_CODE_GIT_BASH_PATH` names only a bash or an sh) before the Bash tool picks
+/// its shell, so only `CLAUDE_CODE_SHELL` can name zsh.
+pub fn tool_kinds(worker: &WorkerEnv, windows: bool) -> Vec<Kind> {
     let mut out = Vec::new();
     if let Some(k) = worker.var("CLAUDE_CODE_SHELL").and_then(Kind::of) {
         out.push(k);
     }
-    let shell = worker.var("SHELL").unwrap_or("");
-    let fallback = Kind::of(shell).unwrap_or(Kind::Zsh);
+    let fallback = if windows {
+        Kind::Bash
+    } else {
+        Kind::of(worker.var("SHELL").unwrap_or("")).unwrap_or(Kind::Zsh)
+    };
     if !out.contains(&fallback) {
         out.push(fallback);
     }
     out
 }
 
-/// What the worker's Bash tool's shell starts with (module header).
-pub fn read(worker: &WorkerEnv, launch: &Path) -> Result<ShellStartup, String> {
+/// What the worker's Bash tool's shell starts with (module header), for a worker on Windows
+/// when `windows` ([`tool_kinds`]).
+pub fn read(worker: &WorkerEnv, launch: &Path, windows: bool) -> Result<ShellStartup, String> {
     for key in ["CLAUDE_CODE_SHELL_PREFIX", "CLAUDE_ENV_FILE"] {
         if worker.var(key).is_some_and(|v| !v.is_empty()) {
             return Err(format!(
@@ -384,7 +393,7 @@ pub fn read(worker: &WorkerEnv, launch: &Path) -> Result<ShellStartup, String> {
         .claude_dir(launch)
         .map_err(|why| format!("the worker's Claude Code directory is unknown: {why}"))?;
     hook_env_scripts(&claude)?;
-    let kinds = tool_kinds(worker);
+    let kinds = tool_kinds(worker, windows);
     let snapshots = snapshots(&claude, &kinds)?;
     let mut state = ShellStartup {
         zsh: kinds.contains(&Kind::Zsh),
@@ -473,8 +482,10 @@ fn snapshots(claude: &Path, kinds: &[Kind]) -> Result<Vec<(Kind, PathBuf)>, Stri
 /// which Claude Code prepends to every command of that session's Bash tool.
 fn hook_env_scripts(claude: &Path) -> Result<(), String> {
     let root = claude.join("session-env");
-    let Ok(sessions) = std::fs::read_dir(&root) else {
-        return Ok(());
+    let sessions = match std::fs::read_dir(&root) {
+        Ok(sessions) => sessions,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("{} cannot be listed ({e})", root.display())),
     };
     for (n, session) in sessions.filter_map(Result::ok).enumerate() {
         if n >= MAX_SESSION_ENV_DIRS {
@@ -483,8 +494,22 @@ fn hook_env_scripts(claude: &Path) -> Result<(), String> {
                 root.display()
             ));
         }
-        let Ok(files) = std::fs::read_dir(session.path()) else {
-            continue;
+        let files = match std::fs::read_dir(session.path()) {
+            Ok(files) => files,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                continue;
+            }
+            Err(e) => {
+                return Err(format!(
+                    "{} cannot be listed ({e})",
+                    session.path().display()
+                ));
+            }
         };
         for file in files.filter_map(Result::ok) {
             let name = file.file_name();
@@ -568,14 +593,22 @@ pub fn parse_snapshot(
                     _ => return Err(named()),
                 }
             }
-            (_, ["set" | "shopt" | "setopt" | "unsetopt" | "emulate", ..]) => {
-                return Err(unnamed());
-            }
             (_, ["alias", "--", ..]) => {
                 let def = line.strip_prefix("alias -- ").unwrap_or_default();
                 let name = alias_name(def)
                     .ok_or_else(|| format!("{source} has an alias this check cannot name"))?;
                 define(state, name, format!("an alias in {source}"), true)?;
+            }
+            (
+                _,
+                [
+                    "set" | "shopt" | "setopt" | "unsetopt" | "emulate" | "alias" | "function"
+                    | "autoload" | "zmodload" | "hash",
+                    ..,
+                ]
+                | [_, "()", ..],
+            ) => {
+                return Err(unnamed());
             }
             (Kind::Bash, ["eval", ..]) => {
                 let name = line
@@ -620,9 +653,17 @@ fn define(state: &mut ShellStartup, name: String, what: String, alias: bool) -> 
 /// An alias definition's name (`ll='ls -l'`, `'..'='cd ..'`).
 fn alias_name(def: &str) -> Option<String> {
     let name = if let Some(rest) = def.strip_prefix('\'') {
-        rest.split_once('\'')?.0
+        let (name, after) = rest.split_once('\'')?;
+        if !after.starts_with('=') {
+            return None;
+        }
+        name
     } else {
-        def.split_once('=')?.0
+        let name = def.split_once('=')?.0;
+        if name.contains(char::is_whitespace) {
+            return None;
+        }
+        name
     };
     (!name.is_empty()).then(|| name.to_string())
 }
@@ -906,18 +947,26 @@ pub fn zshenv_hazard(text: &str) -> Option<String> {
     for (n, line) in text.lines().enumerate() {
         let comment = line.char_indices().find(|&(at, c)| {
             c == '#'
+                && !line[..at].contains(['\'', '"', '\\', '`'])
                 && line[..at]
                     .chars()
                     .next_back()
                     .is_none_or(|p| p.is_whitespace() || ";&|(".contains(p))
         });
         let code = comment.map_or(line, |(at, _)| &line[..at]);
-        if code.contains("()") {
+        let forms = [
+            code.to_string(),
+            unquote_once(code),
+            code.replace(['\\', '\'', '"'], ""),
+        ];
+        if forms.iter().any(|f| f.contains("()")) {
             return Some(format!("its line {} defines a function", n + 1));
         }
-        for word in code.split(|c: char| c.is_whitespace() || ";&|(){}[]`\"'".contains(c)) {
-            if let Some(word) = ZSHENV_WORDS.iter().find(|w| **w == word) {
-                return Some(format!("its line {} runs `{word}`", n + 1));
+        for form in &forms {
+            for word in form.split(|c: char| c.is_whitespace() || ";&|(){}[]`\"'".contains(c)) {
+                if let Some(word) = ZSHENV_WORDS.iter().find(|w| **w == word) {
+                    return Some(format!("its line {} runs `{word}`", n + 1));
+                }
             }
         }
     }
@@ -929,7 +978,7 @@ pub fn zshenv_hazard(text: &str) -> Option<String> {
 /// whose verdict quotes one of these and nothing else of the line).
 const ZSHENV_WORDS: &[&str] = &[
     "emulate", "setopt", "unsetopt", "options", "set", "source", ".", "eval", "alias", "function",
-    "autoload", "zmodload", "builtin", "exec", "trap",
+    "autoload", "zmodload", "builtin", "exec", "trap", "hash",
 ];
 
 /// `Err` naming a variable of the worker's that makes bash read a file before

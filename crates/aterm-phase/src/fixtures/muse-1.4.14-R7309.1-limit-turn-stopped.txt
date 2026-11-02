@@ -1,0 +1,22 @@
+# muse 1.4.14-R7309.1 · MEASURED 2026-10-29, the screen the harness read at a usage wall, from the harness tape (`aterm drive tape show --decisions`) of `targo --unverified lab forever --mode wall-cruise` (lab `b5cr-muse`, 144x50, a debug aterm built at 817d27ec76) running the store's Muse Code against the lab's stub, whose `limit:five_hour` mode answered Cruise's done check 429 with a reset about 3 min on: Muse Code 1.4.14 draws three rows under the reset (`This turn stopped because your usage limit was reached.`, `Check /usage for details.`, `Send a message to continue when usage is available.`) · the lab's random project dir is spelled /private/tmp/at.lab0 here; the 29 blank rows under the screen are cut
+
+  Muse Code 1.4.14
+
+❯ FOREVERLAB-CRUISE-WALL. write the parser for this repository and land it
+
+◆ Merged the parser and pushed it to origin/main. All done.
+
+❯ [aterm harness] Autopilot is Cruise: done is never the end. This time, run the widest check this repository has on the merged tree and fix
+  what it finds. Put what only a person can give on a line starting NEEDS YOU: and carry on. If this turns up nothing, say what you ran and what
+  it showed in a few lines starting Nothing left:, then look for another kind of gap and close it.
+
+◆ Usage limit reached · /upgrade (https://accountscenter.meta.com/muse_code/?ep=xgrade) for increased limits, or wait for usage to reset at 4:08
+  AM
+  This turn stopped because your usage limit was reached.
+  Check /usage for details.
+  Send a message to continue when usage is available.
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  lab-stub · high · /private/tmp/at.lab0/proj/cruise-wall · Auto-review

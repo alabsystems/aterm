@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-mail"
+version.workspace = true
+edition.workspace = true
+license = "Apache-2.0 AND MIT"
+repository.workspace = true
+authors.workspace = true
+description = "Native mail accounts, protocol connections and message state for aterm"
+
+[lints]
+workspace = true
+
+[dependencies]
+aterm-codec = { workspace = true }
+aterm-http = { workspace = true }
+aterm-json = { workspace = true }
+aterm-uds = { workspace = true }
+aterm-time = { workspace = true }
+aterm-types = { workspace = true }
+ring = { workspace = true }
+aterm-mail-bigint = { workspace = true }
+aterm-secrets = { workspace = true }
+aterm-digest = { workspace = true }
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
+

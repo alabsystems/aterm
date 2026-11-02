@@ -244,22 +244,19 @@ pub fn resolve_local_pool_identity(
                 .ok()
                 .flatten()
                 .map(|mut r| {
-                    if config_host.as_deref().is_some_and(|h| r.is_label_denied(h)) {
+                    if let Some(my_rec) = rec.as_deref()
+                        && let Some(rm) = r.member_by_recipient(my_rec)
+                    {
+                        if r.is_member_denied(rm) {
+                            recipient_denied = true;
+                        }
+                    } else if config_host.as_deref().is_some_and(|h| r.is_label_denied(h)) {
                         recipient_denied = true;
                     }
                     let members = r
                         .members
                         .iter()
-                        .filter(|m| {
-                            let ok = !r.is_label_denied(&m.label)
-                                && !m.aliases.iter().any(|a| r.is_label_denied(a))
-                                && !m.node_id.as_deref().is_some_and(|n| r.is_node_denied(n))
-                                && !m.node_key.as_deref().is_some_and(|k| r.is_node_denied(k));
-                            if !ok && rec.as_deref() == Some(m.recipient.as_str()) {
-                                recipient_denied = true;
-                            }
-                            ok
-                        })
+                        .filter(|m| !r.is_member_denied(m))
                         .map(|m| (m.recipient.clone(), m.label.clone(), m.aliases.clone()))
                         .collect::<Vec<_>>();
                     deny_labels = std::mem::take(&mut r.deny_labels);
@@ -1291,6 +1288,7 @@ warm = ["m3"]
                 ahead: true,
                 rotates: true,
                 takes_canary: false,
+                yields: Some(NOW + crate::harness::claims::RECHECK_S),
             }
         );
 

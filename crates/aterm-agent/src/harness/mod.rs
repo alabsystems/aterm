@@ -13,12 +13,14 @@ pub(crate) use harness_mark;
 
 pub mod account_catalog;
 pub mod account_progress;
+pub mod account_series;
 pub mod account_stats;
 pub mod accounts;
 pub mod accounts_overlay;
 pub mod accounts_pool;
 pub mod accounts_sync;
 pub mod acts;
+pub mod agent_image;
 pub mod agents;
 pub mod agy_quota;
 pub mod agy_quota_store;
@@ -39,23 +41,37 @@ pub mod contract;
 pub mod credit_offers;
 pub mod disk;
 pub mod excerpt;
+pub mod first_exec;
 pub mod flight;
 pub mod footer;
 pub mod goal;
 pub mod grok_signin;
 pub mod headless_fetch;
 pub mod headless_oauth;
+pub mod hold_said;
+pub mod land_receipt;
 pub mod lanes;
 pub mod laps;
 pub mod lights;
 pub mod login_drive;
 pub mod login_latch;
+pub mod mail_recovery;
 pub mod mailbox_routes;
 pub mod muse_usage;
+pub mod native_act;
+pub mod native_keys;
+#[cfg(unix)]
+mod native_launch;
+#[cfg(all(test, target_os = "macos"))]
+mod native_launch_tests;
+pub mod native_observe;
+mod native_restart;
 pub mod netwatch;
 pub mod open_url;
+pub mod outlook;
 pub mod profile;
 pub mod relaunch;
+pub mod remote_renew;
 pub mod repo_work;
 pub mod restart_stamp;
 pub mod result;
@@ -84,6 +100,8 @@ pub mod upgrade_muse;
 pub mod upgrade_muse_live;
 pub mod upgrade_wake;
 pub mod usage;
+pub mod witness;
+pub mod work_record;
 pub mod worker;
 
 /// The longest prefix of `s` that is at most `max` bytes and ends on a character boundary.
@@ -202,7 +220,13 @@ impl Drop for FakeInstanceLease {
     }
 }
 
-/// A test control socket at `sock` standing in for an aterm instance: `token` written where a client reads it, each connection required to open with `AUTH <token>` (acknowledged with nothing, as the server does; any other first line drops it), and every later request answered with `answer`'s reply and logged in order into the returned log.
+/// The reply a [`fake_instance`] answer gives a request it never answers: the request is logged
+/// and nothing is written, as a server that holds it does, until the client closes the
+/// connection or the instance is dropped.
+#[cfg(all(test, unix))]
+pub(crate) const UNANSWERED: &str = "\0unanswered";
+
+/// A test control socket at `sock` standing in for an aterm instance: `token` written where a client reads it, each connection required to open with `AUTH <token>` (acknowledged with nothing, as the server does; any other first line drops it), and every later request answered with `answer`'s reply ([`UNANSWERED`]: none) and logged in order into the returned log.
 #[cfg(all(test, unix))]
 pub(crate) fn fake_instance(
     sock: &std::path::Path,
@@ -214,10 +238,10 @@ pub(crate) fn fake_instance(
     let path = sock.to_string_lossy().into_owned();
     let token_file = aterm_uds::latest::token_path_for_sock(&path).expect("token path");
     std::fs::write(token_file, format!("{token}\n")).expect("token");
-    let listener = std::os::unix::net::UnixListener::bind(sock).expect("bind");
     // The suite spawns children beside every fixture: a scan of one mid-spawn would drain an
-    // inherited copy of these sockets (`aterm_uds::keep_out_of_children`).
-    aterm_uds::keep_out_of_children(&listener).expect("keep the listener out of children");
+    // inherited copy of these sockets (`aterm_uds::kept_out`).
+    let listener =
+        aterm_uds::kept_out(|| std::os::unix::net::UnixListener::bind(sock)).expect("bind");
     listener.set_nonblocking(true).expect("nonblocking accept");
     let (cancelled, cancel) = std::io::pipe().expect("server cancellation");
     let active = std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -254,7 +278,7 @@ pub(crate) fn fake_instance(
             if polled < 0 || ready[1].revents != 0 {
                 break;
             }
-            let conn = match listener.accept() {
+            let conn = match aterm_uds::kept_out(|| listener.accept()) {
                 Ok((conn, _)) => conn,
                 Err(e)
                     if matches!(
@@ -267,11 +291,9 @@ pub(crate) fn fake_instance(
                 Err(_) => break,
             };
             let _ = conn.set_nonblocking(false);
-            let _ = aterm_uds::keep_out_of_children(&conn);
-            let Ok(cut) = conn.try_clone() else {
+            let Ok(cut) = aterm_uds::kept_out(|| conn.try_clone()) else {
                 continue;
             };
-            let _ = aterm_uds::keep_out_of_children(&cut);
             {
                 let mut active = serving.lock().unwrap_or_else(|p| p.into_inner());
                 if ended.load(std::sync::atomic::Ordering::SeqCst) {
@@ -279,11 +301,10 @@ pub(crate) fn fake_instance(
                 }
                 *active = Some(cut);
             }
-            let Ok(mut out) = conn.try_clone() else {
+            let Ok(mut out) = aterm_uds::kept_out(|| conn.try_clone()) else {
                 drop(serving.lock().unwrap_or_else(|p| p.into_inner()).take());
                 continue;
             };
-            let _ = aterm_uds::keep_out_of_children(&out);
             let mut lines = std::io::BufReader::new(conn).lines();
             if !lines.next().is_some_and(|l| l.is_ok_and(|l| l == auth)) {
                 drop(serving.lock().unwrap_or_else(|p| p.into_inner()).take());
@@ -297,6 +318,9 @@ pub(crate) fn fake_instance(
                 let reply = answer(&line);
                 if let Ok(mut log) = log.lock() {
                     log.push(line);
+                }
+                if reply == UNANSWERED {
+                    continue;
                 }
                 if writeln!(out, "{reply}").is_err() {
                     break;
@@ -379,13 +403,15 @@ impl Drop for FakeInstanceServer {
 #[path = "alab_marker_cross_tests.rs"]
 mod alab_marker_cross_tests;
 
-/// How the harness tests spell this host's paths.
-#[cfg(test)]
-pub(crate) mod host_path {
+/// How tests spell this host's paths: the harness's, and other crates' through this seam.
+#[cfg(any(test, debug_assertions))]
+pub mod host_path {
     /// `posix`, a test's absolute POSIX path, as one this host reads as
     /// absolute: itself on Unix, on Windows the same path on drive `C:`
-    /// (`/s/main.1` is `C:/s/main.1`, its separators kept).
-    pub(crate) fn abs(posix: &str) -> String {
+    /// (`/s/main.1` is `C:/s/main.1`, its separators kept), where a path with
+    /// no drive is relative and a roster refuses it.
+    #[must_use]
+    pub fn abs(posix: &str) -> String {
         debug_assert!(
             posix.starts_with('/'),
             "{posix:?} is not a POSIX absolute path"
@@ -397,10 +423,24 @@ pub(crate) mod host_path {
         }
     }
 
+    /// `path` as a TOML basic string, its quotes included, as aterm writes a
+    /// roster's `dir`: a Windows path's backslashes escaped.
+    ///
+    /// # Panics
+    /// When `path` is not UTF-8.
+    #[must_use]
+    pub fn toml(path: &std::path::Path) -> String {
+        aterm_toml::Value::from(path.to_str().expect("a UTF-8 path")).to_string()
+    }
+
     /// `path` as the inside of a JSON string (its quotes not included), as
     /// Claude Code and Codex write a path: a Windows path's backslashes
     /// escaped.
-    pub(crate) fn json(path: &std::path::Path) -> String {
+    ///
+    /// # Panics
+    /// Never: a string always serializes to JSON.
+    #[must_use]
+    pub fn json(path: &std::path::Path) -> String {
         let quoted = aterm_json::to_string(&path.display().to_string()).expect("a string");
         quoted[1..quoted.len() - 1].to_owned()
     }

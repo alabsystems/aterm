@@ -182,9 +182,12 @@ fn write_claim_record(path: &Path, text: &str) -> std::io::Result<()> {
 /// The largest epoch a holder of `sid` recorded for its log under control directory `dir`.
 pub(crate) fn recorded_epoch_in(dir: &Path, sid: &SessionId) -> Option<u32> {
     let text = read_claim_record(&epoch_record_path(dir, sid)?)?;
-    text.trim()
-        .parse()
-        .ok()
+    let trimmed = text.trim();
+    trimmed
+        .bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| trimmed.parse().ok())
+        .flatten()
         .and_then(crate::session_log::told_epoch)
 }
 
@@ -211,7 +214,11 @@ pub(crate) fn record_epoch(sid: &SessionId, ep: u32, create: bool) {
 
 fn marked_successor_in(dir: &Path, sid: &SessionId) -> Option<u32> {
     let text = read_claim_record(&successor_marker_path(dir, sid)?)?;
-    text.strip_prefix("pid ")?.trim().parse().ok()
+    let pid = text.strip_prefix("pid ")?.trim();
+    pid.bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| pid.parse().ok())
+        .flatten()
 }
 
 /// The live successor a handoff marker names for `sid`.
@@ -490,25 +497,43 @@ pub(crate) fn hold_transferred(sid: &SessionId) {
 #[cfg(unix)]
 fn open_claim(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(false)
         .mode(0o600)
-        .open(path)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    aterm_uds::keep_out_of_children(&file)?;
+    Ok(file)
 }
 
 /// Windows: the share mode is the claim. `share_mode(0)` makes a second open
 /// fail outright, and the handle closing on exit releases it.
 #[cfg(windows)]
 fn open_claim(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::windows::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt};
+    let file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(false)
         .share_mode(0)
-        .open(path)
+        .custom_flags(0x0020_0000)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.file_attributes() & 0x0000_0400 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    Ok(file)
 }
 
 /// `flock(LOCK_EX | LOCK_NB)`: `Ok(true)` when the lock is ours, `Ok(false)` when
@@ -634,6 +659,17 @@ mod tests {
             "a dropped claim is free while a copy of its descriptor lives"
         );
         drop(childs_copy);
+
+        let linked_sid = SessionId::generate();
+        let outside = d.path().join("outside.txt");
+        std::fs::write(&outside, b"keep\n").expect("seed outside");
+        let linked_claim = claim_path(d.path(), &linked_sid).expect("claim path");
+        std::os::unix::fs::symlink(&outside, &linked_claim).expect("symlink claim");
+        assert!(
+            matches!(claim_in(d.path(), &linked_sid), ClaimOutcome::Unprovable(_)),
+            "a symlinked claim path must be refused as unprovable"
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), b"keep\n");
     }
 
     #[test]

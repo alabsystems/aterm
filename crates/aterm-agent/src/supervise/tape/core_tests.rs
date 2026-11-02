@@ -606,3 +606,30 @@ fn instant_shaped_note_text_cannot_overflow_the_recorder() {
         "Instant-shaped note text must stay inert: {failed:?}"
     );
 }
+
+#[test]
+fn decide_mark_decode_rejects_unreadable_fields() {
+    let valid = DecideMark {
+        screen: Some(7),
+        seq: 42,
+        generation: Some("g-1".to_string()),
+        rule: Some("continue@v1".to_string()),
+        outcome: "typed".to_string(),
+        facts: None,
+    };
+    let encoded = valid.encode();
+    assert_eq!(DecideMark::decode(&encoded), Some(valid));
+    for bad in [
+        "screen=foo\nseq=42\ngen=-\nrule=-\noutcome=typed\n",
+        "screen=+7\nseq=42\ngen=-\nrule=-\noutcome=typed\n",
+        "screen=7\nseq=+42\ngen=-\nrule=-\noutcome=typed\n",
+        "screen=7\nseq=42\ngen=\\xzz\nrule=-\noutcome=typed\n",
+        "screen=7\nseq=42\ngen=-\nrule=\\xzz\noutcome=typed\n",
+        "screen=7\nseq=42\ngen=-\nrule=-\noutcome=\\xzz\n",
+    ] {
+        assert_eq!(DecideMark::decode(bad), None, "{bad:?}");
+    }
+    assert!(i64::from_tape(b"+7").is_err());
+    assert!(<Option<(i64, i64)>>::from_tape(b"+1 2").is_err());
+    assert!(<Option<(i64, i64)>>::from_tape(b"1 +2").is_err());
+}

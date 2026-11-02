@@ -1,27 +1,11 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-selection: spec recovery from its 146 unit tests
+# aterm-selection: spec recovery from unit tests
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 88 tests it
-> deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
-> were taken before.
-
-> Audit amendment: The 2026-10-16 code audit made scroll/splice's upper bound exclusive, corrected cached-bound advice, and removed the unavailable public custom-rule claim. The dated test inventory and §5 observations below describe the earlier snapshot; the scroll/splice contract rows reflect the fix.
-
-> Status 2026-10-15: this is the crate's migration worklist. Each of the 34 specs below gets
-> proved through Trust/Clean about the compiled Rust function, and then the tests it subsumes are
-> deleted. The 8 tests in §4 sample no spec and can be deleted now.
-
-Source: `crates/aterm-selection` (read only). I read every `#[test]`:
-`src/rules_tests.rs` (39), `src/tests.rs` (30), `src/text_selection/tests.rs` (75) and
-`tests/conformance_text_selection.rs` (2), 146 in all. I also read the code they reach:
-`rules.rs`, `rules_test_accessors.rs` (`cfg(test)` only), `builtin_patterns.rs`,
-`text_selection/mod.rs`, `crates/aterm-types/src/selection.rs` (`selection_contains_linear`,
-`selection_contains_block`, `glyph_cell_span`) and aterm-grapheme's `word.rs` and `grid.rs`.
-Nothing was compiled or run. The claims below come from reading the code.
-
-Result: **34 specs**, covering **138 tests**. **8 tests are not spec samples** (§4).
+The claims the crate's tests sample, stated so that a Trust/Clean proof of the compiled Rust
+function can retire them (§1), and the map from each test to its specs (§2). Nothing here is
+proved. Paths are relative to `crates/aterm-selection`.
 
 ## 0. Notation used in the statements
 
@@ -31,16 +15,17 @@ Smart selection (`rules.rs`, `builtin_patterns.rs`):
   [url, file_path, email, ipv4, ipv6, git_hash, double_quoted, single_quoted, backtick_quoted, uuid,
   semver]. Priorities: High = {url, email, uuid}; Low = {ipv6, semver}; every other rule is Normal.
 - `FI(r,t)` = `r.pattern.find_iter(t)`, the leftmost-first, non-overlapping match sequence of
-  aterm-regex. `Lang(P)` is the language of regex `P`. The pattern specs assume aterm-regex's own
-  spec (find_iter refines leftmost-first backtracking semantics) and cite it (gap 12).
+  aterm-regex. `Lang(P)` is the language of regex `P`. The pattern specs cite aterm-regex's own
+  spec (find_iter refines leftmost-first backtracking semantics; gap 12).
 - `Hit(S,t,p)` = the first `r` in `Rules(S)` with some `m ∈ FI(r,t)` with
   `m.start ≤ p < m.end`, paired with that `m`. It is None if `p > |t|` or no such rule exists.
-  The production function is `rule_match_at`. The test-only `find_at` is a thin view of it.
+  The production function is `rule_match_at`; the test-only `find_at` is a thin view of it.
 - `W_s(c)` = `is_word_char(s,c)`: for `s = None`, `c.is_alphanumeric() ∨ c = '_'`; for
   `s = Some(z)`, `¬z.contains(c)`.
 - `Words(t,f)` = the byte ranges `aterm_grapheme::words(t,f)` yields. Which Unicode characters
   (marks, prepends, joiners, bidi and format controls) join or break a word is aterm-grapheme's
-  spec, not this crate's, and is cited here (gap 12).
+  spec (its `SPECS.md`), cited here (gap 12); the joiner, invisible-character, prepend and
+  script tests mostly sample that spec, not this crate's code.
 - `floor(t,i)` = the largest char boundary `≤ i`.
 - `G_a(t)` = the list `aterm_grapheme::grid_graphemes_with(t,a)` returns, each entry
   `(byte_offset, start_col, end_col)`. `Cols(t)` = the last entry's `end_col` (`str_grid_columns`).
@@ -49,8 +34,8 @@ Text selection (`text_selection/mod.rs`):
 
 - A `TextSelection` `sel` is `(state, type, start, end, truncated)`. An anchor is
   `(row: i32, col: u16, side)` with `Left < Right`.
-- `≤lex` / `<lex` = lexicographic order on `(row, col, side)` (or on `(row, col)` where only two
-  components are given).
+- `≤lex` / `<lex` = lexicographic order on `(row, col, side)`, or on `(row, col)` where only two
+  components are given.
 - `NS`/`NE` = `normalized_start`/`normalized_end`. `SAB(sel)` = `side_adjusted_bounds(sel)`.
 - `⊖`, `⊕` = `i32` saturating sub and add (`⊖u16`, `⊕u16`, `⊖64` for those widths).
 - `Clamp(sel,m)` = the private `clamp_head_to_min_row(m)`, which every eviction entry point shares.
@@ -59,15 +44,11 @@ Text selection (`text_selection/mod.rs`):
 - The lifecycle model is `aterm_models_core::text_selection_lifecycle_model`, with the projection
   `conformance_text_selection::project`.
 
-Gap 0 (the installed seal publishes no Lean-discharged row) is a prerequisite for every spec, so
-every row lists it. A spec is "blocked only by gap 0" when its other gaps are empty. None of the 34
-is: every one needs at least gap 1 (non-scalar carriers) or gap 2 (`&self`/`&mut self` views).
-
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes (primary tests; secondary in §2)`,
-`difficulty (Rust features the proof must handle)`, `blocking gaps` (numbers from
-`docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7).
+`subsumes` names the primary tests a proof retires (secondary ones are in §2). `blocking gaps`
+are rows of the gap list in `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7. Gap 0 (a
+seal that publishes Clean rows) blocks every spec, and every spec also needs gap 1 or 2.
 
 ```tsv
 id	kind	functions	statement	subsumes (primary)	difficulty (Rust features the proof must handle)	blocking gaps (audit §7)
@@ -110,7 +91,6 @@ selection-no-panic	no-panic	text_selection::TextSelection::*, rules::SmartSelect
 ## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
-Paths are relative to `crates/aterm-selection`.
 
 ```tsv
 file	test	primary	also
@@ -174,7 +154,16 @@ tests/conformance_text_selection.rs	real_calls_conform_to_the_lifecycle_model	li
 tests/conformance_text_selection.rs	a_dropped_phase_check_is_rejected	lifecycle-refines-model	
 ```
 
-## 3. Coverage
+Eight tests are missing from the map: `src/rules_tests.rs::builtin_patterns_match_their_tokens`
+and `builtin_patterns_reject_lookalikes` sample the `pat-*` specs;
+`src/rules_tests.rs::basic_word_boundaries_over_scripts` samples
+`basic-word-is-containing-word`; `src/tests.rs::builtin_rules_select_the_token_under_the_cursor`
+samples `rule-precedence` and `builtin-rule-table`;
+`src/text_selection/tests.rs::adjust_for_scroll_shifts_or_clears_at_the_bounds` samples
+`adjust-for-scroll`; `project_range_projects_every_shape` samples `project-range`;
+`a_block_selects_a_wide_glyph_either_of_whose_cells_is_inside` samples
+`contains-cell-glyph-whole`; and `precomputed_bounds_equivalent_to_contains` samples
+`side-adjusted-bounds`'s corollary on fixtures whose side adjustment is the identity.
 
 - 58 live tests mapped in §2 across the 34 specs (0 non-spec tests remain; 146 original tests read in the initial 2026-10-15 audit).
 - One spec, `selection-no-panic`, has no test of its own. Every test above samples it in passing,
@@ -188,11 +177,17 @@ tests/conformance_text_selection.rs	a_dropped_phase_check_is_rejected	lifecycle-
   7 → 15, 10 → 1, 11 → 2, 12 → 17, 13 → 5. Gaps 6, 8, 9 and 14–17 block no spec here directly.
   6, 14, 16 and 17 still apply to every proof, as the audit says.
 
-## 4. Tests that are not spec samples
+6. **`truncate_to_floor` has an unstated precondition.** Its `debug_assert!` that the history
+   floor is not below the live top (`oldest_abs ≤ live_top_abs`) is in no caller contract, and
+   release builds clamp instead. The spec must carry it as `requires`, or the function must
+   make the release clamp the contract and drop the assert.
 
-**Status (2026-10-15): all 8 tests below are deleted, along with the now-dead `cfg(test)` accessors `SelectionRuleKind::name` and `SelectionRule::pattern`.**
+## 6. Proof order
 
-**Status (2026-10-17): their table and their §2 rows are gone.**
+The text-selection specs are the cheapest lane: most need only gaps 1–4 (in-crate structs and
+enums, `&self`/`&mut self` views, straight-line saturating arithmetic, callee composition). The
+smart-selection specs also need loops (7), cross-crate citation (12) and, for the patterns,
+aterm-regex's spec.
 
 No test is a pure regression of a removed bug with no general property. Every regression-shaped
 test (uuid vs git_hash precedence, the bare-relative file path, the zero-floor clear, the

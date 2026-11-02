@@ -27,11 +27,11 @@ use aterm_uds::{CtlListener, CtlStream};
 
 use super::{
     CENSUS_REFRESH_EVERY, FACTS_HEARTBEAT_EVERY, HeartbeatClock, Serving, Wanted, admit_driver_at,
-    denied_under, fleet_event, fleet_slots, grants_of, heartbeat_every, holds_in, level_of,
-    lifetime, lists_driver_at, maybe_refresh_local_census_at, push_facts_to_issuer,
-    receive_pushed_facts_at, refuse_driver, register_member_at, retry, serve_census_request_at,
-    serve_mail_code_request_at, share_book_at, share_units, spawn_member_heartbeat_at,
-    update_denied_nodes_cache,
+    denied_under, fleet_event, fleet_slots, grants_of, heartbeat_every, holds_in,
+    judge_vault_join_at, level_of, lifetime, lists_driver_at, maybe_refresh_local_census_at,
+    push_facts_to_issuer_with_denied, receive_pushed_facts_at, refuse_driver, register_member_at,
+    retry, serve_census_request_at, serve_mail_code_request_at, share_book_at, share_units,
+    spawn_member_heartbeat_at, update_denied_nodes_cache,
 };
 
 const RELAY_PREFIX: &str = "wf-";
@@ -69,8 +69,12 @@ fn run_open_within(
     what: &str,
     within: Duration,
 ) -> Result<(), String> {
-    let out = aterm_uds::deadline::output_until(open, Instant::now() + within)
-        .map_err(|e| format!("{what}: {e}"))?;
+    let now = Instant::now();
+    let deadline = now
+        .checked_add(within)
+        .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365));
+    let out =
+        aterm_uds::deadline::output_until(open, deadline).map_err(|e| format!("{what}: {e}"))?;
     if out.status.success() {
         Ok(())
     } else {
@@ -347,6 +351,7 @@ fn parse_relay_filename(name: &str) -> Option<u32> {
     let pid_str = name
         .strip_prefix(RELAY_PREFIX)?
         .strip_suffix(RELAY_SUFFIX)?;
+    (!pid_str.is_empty() && pid_str.bytes().all(|b| b.is_ascii_digit())).then_some(())?;
     pid_str.parse::<u32>().ok().filter(|&p| p > 0)
 }
 
@@ -420,14 +425,21 @@ fn run_window_fleet_relay() {
 }
 
 /// The node job's `ask` handler: each asking Mac's exchange relayed to the window's members
-/// desk ([`RelayHeader::Ask`], [`aterm_secrets::members::relay`]), refused while no window runs
-/// or while a running one takes no hand-over (then as busy, never as no window).
-fn relay_ask(relay_dir: PathBuf) -> aterm_net::fleet::AskHandler {
+/// desk ([`RelayHeader::Ask`], [`aterm_secrets::members::relay`]). With no window, `automatic`
+/// serves the node's current automatic LAN policy; without one it refuses. A running window
+/// that takes no hand-over is still reported as busy.
+fn relay_ask(
+    relay_dir: PathBuf,
+    automatic: Option<aterm_net::fleet::AskHandler>,
+) -> aterm_net::fleet::AskHandler {
     Arc::new(
         move |stream: &mut dyn aterm_net::fleet::Duplex, peer: SocketAddr| {
             let mut window = match relay_to_window(&relay_dir, &RelayHeader::Ask { peer }) {
                 RelayOpen::Opened(window) => window,
                 RelayOpen::NoWindow => {
+                    if let Some(automatic) = &automatic {
+                        return automatic(stream, peer);
+                    }
                     let _ =
                         aterm_secrets::members::refuse(stream, "this Mac's window is not running");
                     return Ok(());
@@ -472,12 +484,13 @@ where
     sweep_dead_relay_sockets(relay_dir);
     let sock_path = relay_socket_path(relay_dir, pid);
     let _ = std::fs::remove_file(&sock_path);
-    let listener = CtlListener::bind(&sock_path)?;
-    let _ = aterm_uds::keep_out_of_children(&listener);
+    let listener = aterm_uds::kept_out(|| CtlListener::bind(&sock_path))?;
     let _ = std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600));
-    if stop.is_some() {
-        listener.set_nonblocking(true)?;
-    }
+    // An accept holds every spawn of this process back until its connection is marked
+    // (`aterm_uds::kept_out`), so it never waits there: the listener is nonblocking, polled every
+    // 15 ms for a stop flag, and with none to poll the wait for a connection is
+    // `aterm_uds::accept`'s, which holds nothing.
+    listener.set_nonblocking(true)?;
 
     struct UnlinkOnDrop(PathBuf);
     impl Drop for UnlinkOnDrop {
@@ -492,10 +505,14 @@ where
         if stop.is_some_and(|flag| flag.load(Ordering::Acquire)) {
             return Ok(());
         }
-        match listener.accept() {
+        let accepted = if stop.is_some() {
+            aterm_uds::kept_out(|| listener.accept())
+        } else {
+            aterm_uds::accept(&listener)
+        };
+        match accepted {
             Ok((mut stream, _)) => {
                 let _ = stream.set_nonblocking(false);
-                let _ = aterm_uds::keep_out_of_children(&stream);
                 if crate::control_auth::peer_check(&stream).is_err() {
                     aterm_uds::hangup::hang_up(&stream);
                     continue;
@@ -535,11 +552,10 @@ fn handle_relay_accept(stream: &mut CtlStream, attach: &dyn Fn(RelayHeader, CtlS
             return;
         }
     };
-    let Ok(cloned) = stream.try_clone() else {
+    let Ok(cloned) = aterm_uds::kept_out(|| stream.try_clone()) else {
         aterm_uds::hangup::hang_up(stream);
         return;
     };
-    let _ = aterm_uds::keep_out_of_children(&cloned);
     let _ = cloned.set_read_timeout(None);
     let _ = cloned.set_write_timeout(None);
     if !attach(header, cloned) {
@@ -632,11 +648,11 @@ fn relay_to_window(relay_dir: &Path, header: &RelayHeader) -> RelayOpen {
     for (_pid, path) in live_relay_candidates(relay_dir) {
         let mut why = |what: &str| busy = Some(what.to_owned());
         let deadline = Instant::now() + RELAY_CONNECT_TIMEOUT;
+        // Kept out of children from its creation (`aterm_uds::connect::until`).
         let Ok(mut stream) = aterm_uds::connect::until(&path, deadline) else {
             why("its relay socket took no connection");
             continue;
         };
-        let _ = aterm_uds::keep_out_of_children(&stream);
         if crate::control_auth::peer_check(&stream).is_err() {
             aterm_uds::hangup::hang_up(&stream);
             why("its relay socket is not this account's");
@@ -714,6 +730,7 @@ pub(crate) fn query_window_survey_facts(
         .strip_prefix("OK ")?
         .split_ascii_whitespace()
         .next()?;
+    (!count_str.is_empty() && count_str.bytes().all(|b| b.is_ascii_digit())).then_some(())?;
     let count = count_str.parse::<usize>().ok()?.min(64);
     let mut wire = String::with_capacity(head.len() + count * 128);
     wire.push_str(&head);
@@ -739,7 +756,8 @@ pub struct NodeServeConfig {
     pub home_dir: Option<PathBuf>,
     /// Path to `aterm.toml`, if known.
     pub config_path: Option<PathBuf>,
-    /// Vault paths for the `_alab._tcp` advert (`None` disables `dns-sd` ticks).
+    /// Vault paths for the `_alab._tcp` advert and headless automatic admission (`None`
+    /// disables both).
     pub vault_paths: Option<aterm_secrets::client::Paths>,
     /// This Mac's membership log, whose verdict admits a handshake, a join and a drive (`None`:
     /// the book's keyring alone).
@@ -757,6 +775,11 @@ pub struct NodeServeConfig {
     pub stop: Arc<AtomicBool>,
     /// Window launcher seam for windowless `Drive` `spawn` (§7.4).
     pub launcher: Arc<dyn WindowLauncher>,
+    /// Whether this job may use the local network now
+    /// ([`aterm_types::macos_setup::lan_first_use::may_use`]): not while System State's Local
+    /// Network step is still to come, which asks macOS's question first. Until then the job
+    /// advertises, listens and dials nothing on the LAN.
+    pub lan_may_go: fn() -> bool,
 }
 
 /// Foreground entry point for `aterm node serve` (`systems.alab.aterm-node`, C20–C23).
@@ -790,9 +813,14 @@ pub fn run_node_serve() -> ExitCode {
         wake_timeout: DEFAULT_WAKE_TIMEOUT,
         stop: Arc::new(AtomicBool::new(false)),
         launcher: Arc::new(LiveWindowLauncher::default()),
+        lan_may_go: aterm_types::macos_setup::lan_first_use::may_use,
     };
     if !isolated {
         spawn_claims_upkeep(cfg.relay_dir.clone(), Arc::clone(&cfg.stop));
+        arm_claims_off_on_quit(
+            cfg.relay_dir.clone(),
+            crate::harness_host::claims_off_as_the_node_job_stops,
+        );
     }
     run_node_serve_with(cfg)
 }
@@ -808,6 +836,37 @@ fn claims_upkeep(relay_dir: &Path, look: &dyn Fn()) -> bool {
     }
     look();
     true
+}
+
+/// The node job's answer to a terminating signal (launchd's SIGTERM as the person logs out,
+/// restarts or shuts down, or as the job is stopped): `off` where no window's relay is live in
+/// `relay_dir`, and whether it ran (docs/DESIGN-fluid-swarm-2026-10-28.md F19). A window gives up
+/// its own claims as the system's quit ends its run or a terminating signal ends it; with none
+/// open this job's looks were the Mac's only ones, and a home claim it left would stand on every
+/// Mac to its row's `until`, up to a day.
+fn claims_off_on_quit(relay_dir: &Path, off: &dyn Fn()) -> bool {
+    if has_live_window_relay(relay_dir) {
+        return false;
+    }
+    off();
+    true
+}
+
+/// Arm the node job's orderly quit: on SIGTERM (or SIGINT or SIGHUP) [`claims_off_on_quit`] with
+/// `off` (production passes `harness_host::claims_off_as_the_node_job_stops`), then the job dies
+/// of that signal as it did before (`crate::owned_endpoint::arm_orderly_quit`; a second signal
+/// ends it at once).
+fn arm_claims_off_on_quit(relay_dir: PathBuf, off: fn()) {
+    if let Err(err) = crate::owned_endpoint::arm_orderly_quit(move |_sig| {
+        claims_off_on_quit(&relay_dir, &off);
+        crate::owned_endpoint::die_of_quit_signal();
+    }) {
+        aterm_log::warn!(
+            "aterm node serve: a terminating signal ends this job at once: its account claims' \
+             release could not be armed ({err}); with no window open this Mac's claims stand \
+             until their rows lapse"
+        );
+    }
 }
 
 /// Run [`claims_upkeep`] now and every `claims::RECHECK_S` until `stop`.
@@ -862,6 +921,7 @@ pub fn run_node_serve_with(mut cfg: NodeServeConfig) -> ExitCode {
         crate::network_moved::alab_tcp()
     });
     let denied_cache: Arc<Mutex<Option<Arc<[String]>>>> = Arc::new(Mutex::new(None));
+    let mut waits_for_step = false;
 
     while !cfg.stop.load(Ordering::Acquire) {
         if fleet_turned_off_or_swarm_disabled(&cfg) {
@@ -885,6 +945,20 @@ pub fn run_node_serve_with(mut cfg: NodeServeConfig) -> ExitCode {
                 continue;
             }
         };
+        // Asked once a generation is due (the job is wanted and holds the fleet's key), right
+        // before it advertises, listens and dials.
+        if !(cfg.lan_may_go)() {
+            if !std::mem::replace(&mut waits_for_step, true) {
+                aterm_log::info!(
+                    "aterm node serve: waits for System State's Local Network step, which asks \
+                     macOS first, before it advertises, listens or dials on the local network"
+                );
+            }
+            advertiser.stop();
+            port_lock = None;
+            sleep_interruptible(&cfg.stop, cfg.tick_every);
+            continue;
+        }
 
         let (listener, is_prebound) = if let Some(prebound) = cfg.prebound_listener.take() {
             let _ = aterm_uds::keep_out_of_children(&prebound);
@@ -914,11 +988,8 @@ pub fn run_node_serve_with(mut cfg: NodeServeConfig) -> ExitCode {
                     }
                 }
             }
-            match TcpListener::bind(addr) {
-                Ok(listener) => {
-                    let _ = aterm_uds::keep_out_of_children(&listener);
-                    (listener, false)
-                }
+            match aterm_uds::kept_out(|| TcpListener::bind(addr)) {
+                Ok(listener) => (listener, false),
                 Err(err) => {
                     if !keeps_port_after(&err) {
                         port_lock = None;
@@ -964,7 +1035,10 @@ pub fn run_node_serve_with(mut cfg: NodeServeConfig) -> ExitCode {
 }
 
 fn sleep_interruptible(stop: &AtomicBool, total: Duration) {
-    let deadline = Instant::now() + total;
+    let now = Instant::now();
+    let deadline = now
+        .checked_add(total)
+        .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365));
     let step = Duration::from_millis(25).min(total);
     while !stop.load(Ordering::Acquire) {
         let now = Instant::now();
@@ -975,17 +1049,19 @@ fn sleep_interruptible(stop: &AtomicBool, total: Duration) {
     }
 }
 
+/// Whether the node job holds its LAN uses now: this Mac left the fleet, or its `aterm.toml`'s
+/// `[swarm] enabled` does not read on ([`swarm_holds`]).
 fn fleet_turned_off_or_swarm_disabled(cfg: &NodeServeConfig) -> bool {
-    if aterm_agent::node_service::left_the_fleet(&cfg.state_dir) {
-        return true;
-    }
-    if let Some(config_path) = cfg.config_path.as_ref()
-        && let Ok(enabled) = aterm_secrets::swarm::enabled_at(config_path)
-        && !enabled
-    {
-        return true;
-    }
-    false
+    aterm_agent::node_service::left_the_fleet(&cfg.state_dir)
+        || swarm_holds(cfg.config_path.as_deref())
+}
+
+/// Whether `[swarm] enabled` in the `aterm.toml` at `config_path` holds sharing off: unless it
+/// reads on, a file that cannot be read holding it off as a clean `false` does
+/// (`docs/DESIGN-alab-swarm-2026-10-27.md` §9), as every other reader of the switch takes it.
+/// A job told of no file has no switch to read.
+fn swarm_holds(config_path: Option<&Path>) -> bool {
+    config_path.is_some_and(|path| aterm_secrets::swarm::enabled_at(path) != Ok(true))
 }
 
 fn read_config_text(config_path: Option<&Path>) -> Option<String> {
@@ -1081,12 +1157,16 @@ fn wanted_for_node(cfg: &NodeServeConfig) -> Option<Wanted> {
     node_table_in(&text, &fallback)?.filter(|w| level_of(w.allow.as_deref()).is_some())
 }
 
+/// The swarm deny list now, read again only when one of the vault files it reads changed
+/// ([`aterm_secrets::client::swarm_denied_nodes_now`]): the listener asks it for each proved
+/// dialer and its hand-over, and the watch every tick, so an unchanged vault is never decrypted
+/// again. `cache` keeps the last authoritative list through a mid-apply or failed read.
 fn denied_nodes_for(
     vault_paths: Option<&aterm_secrets::client::Paths>,
     cache: &Mutex<Option<Arc<[String]>>>,
 ) -> Arc<[String]> {
     let observed = match vault_paths {
-        Some(paths) => aterm_secrets::client::swarm_denied_nodes(paths),
+        Some(paths) => aterm_secrets::client::swarm_denied_nodes_now(paths),
         None => Ok(None),
     };
     let mut guard = cache.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1098,6 +1178,8 @@ struct NodeOpenEntry {
     content: bool,
     driver: Option<aterm_net::fleet::DriveGrant>,
     line: CtlStream,
+    extra_line: Option<CtlStream>,
+    cut: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -1109,6 +1191,36 @@ struct NodeOpenTable {
 struct NodeOpened {
     table: Arc<NodeOpenTable>,
     id: u64,
+    cut: Arc<AtomicBool>,
+}
+
+impl NodeOpened {
+    fn is_cut(&self) -> bool {
+        self.cut.load(Ordering::Acquire)
+    }
+
+    fn attach_line(&self, line: &CtlStream) -> bool {
+        if self.is_cut() {
+            return false;
+        }
+        let Ok(cloned) = aterm_uds::kept_out(|| line.try_clone()) else {
+            return false;
+        };
+        let mut guard = self
+            .table
+            .entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if self.is_cut() {
+            return false;
+        }
+        if let Some(entry) = guard.iter_mut().find(|entry| entry.id == self.id) {
+            entry.extra_line = Some(cloned);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl Drop for NodeOpened {
@@ -1127,13 +1239,11 @@ impl NodeOpenTable {
         content: bool,
         driver: Option<aterm_net::fleet::DriveGrant>,
         line: &CtlStream,
-        now: impl FnOnce() -> Serving,
-        holds: &dyn Fn(&str, aterm_net::fleet::NodeKey) -> bool,
-        denied_nodes: &[String],
-    ) -> std::io::Result<Option<NodeOpened>> {
+        still_serves: impl FnOnce(bool, Option<&aterm_net::fleet::DriveGrant>) -> bool,
+    ) -> std::io::Result<Option<Arc<NodeOpened>>> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let cloned = line.try_clone()?;
-        let _ = aterm_uds::keep_out_of_children(&cloned);
+        let cloned = aterm_uds::kept_out(|| line.try_clone())?;
+        let cut = Arc::new(AtomicBool::new(false));
         self.entries
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -1142,14 +1252,20 @@ impl NodeOpenTable {
                 content,
                 driver: driver.clone(),
                 line: cloned,
+                extra_line: None,
+                cut: Arc::clone(&cut),
             });
-        let held = NodeOpened {
+        let held = Arc::new(NodeOpened {
             table: Arc::clone(self),
             id,
-        };
-        Ok(now()
-            .serves(content, driver.as_ref(), holds, denied_nodes)
-            .then_some(held))
+            cut: Arc::clone(&cut),
+        });
+        if still_serves(content, driver.as_ref()) && !cut.load(Ordering::Acquire) {
+            Ok(Some(held))
+        } else {
+            cut.store(true, Ordering::Release);
+            Ok(None)
+        }
     }
 
     fn cut_unserved(
@@ -1165,7 +1281,11 @@ impl NodeOpenTable {
             .retain(|open| {
                 let kept = serving.serves(open.content, open.driver.as_ref(), holds, denied_nodes);
                 if !kept {
+                    open.cut.store(true, Ordering::Release);
                     aterm_uds::hangup::hang_up(&open.line);
+                    if let Some(ref extra) = open.extra_line {
+                        aterm_uds::hangup::hang_up(extra);
+                    }
                     cut += 1;
                 }
                 kept
@@ -1195,6 +1315,20 @@ fn serve_one_node_generation(
 ) -> bool {
     let running = Arc::new(AtomicBool::new(true));
     let open_table = Arc::new(NodeOpenTable::default());
+    let automatic_joins = match cfg
+        .vault_paths
+        .clone()
+        .map(aterm_agent::vault_join::AutomaticJoins::start)
+        .transpose()
+    {
+        Ok(joins) => joins,
+        Err(error) => {
+            aterm_log::warn!("node: the automatic admission worker did not start: {error}");
+            sleep_interruptible(&cfg.stop, cfg.tick_every);
+            return false;
+        }
+    };
+    let automatic_handle = automatic_joins.as_ref().map(|joins| joins.handle());
     let node = aterm_net::fleet_member::read_node_identity(&cfg.state_dir)
         .ok()
         .flatten();
@@ -1233,6 +1367,7 @@ fn serve_one_node_generation(
         let adv_watch = Arc::clone(advertiser);
         let members_watch = cfg.members.clone();
         let browse_watch = browse.cloned();
+        let automatic = automatic_handle.clone();
         std::thread::Builder::new()
             .name("aterm-node-watch".to_owned())
             .spawn(move || {
@@ -1242,6 +1377,7 @@ fn serve_one_node_generation(
                 let hb_in_flight = Arc::new(AtomicBool::new(false));
                 let mut heartbeat =
                     HeartbeatClock::new(None, heartbeat_every(), crate::network_moved::watch());
+                let mut admission_network = crate::network_moved::watch_at_once();
 
                 while running.load(Ordering::Acquire) {
                     sleep_interruptible(&stop, tick_every);
@@ -1249,14 +1385,16 @@ fn serve_one_node_generation(
                         running.store(false, Ordering::Release);
                         return;
                     }
+                    if admission_network.take_at(Instant::now()).is_some()
+                        && let Some(automatic) = &automatic
+                    {
+                        automatic.refresh();
+                    }
                     if aterm_agent::node_service::left_the_fleet(&state_dir) {
                         running.store(false, Ordering::Release);
                         return;
                     }
-                    if let Some(cfg_path) = config_path.as_deref()
-                        && let Ok(enabled) = aterm_secrets::swarm::enabled_at(cfg_path)
-                        && !enabled
-                    {
+                    if swarm_holds(config_path.as_deref()) {
                         running.store(false, Ordering::Release);
                         return;
                     }
@@ -1305,6 +1443,7 @@ fn serve_one_node_generation(
                             home_dir.as_deref(),
                             config_path.as_deref(),
                             &secret_watch,
+                            (&denied, log.as_deref()),
                         );
                     }
                     if last_census_refresh.elapsed() >= CENSUS_REFRESH_EVERY {
@@ -1381,23 +1520,33 @@ fn serve_one_node_generation(
     let vault_for_gate = vault_paths.clone();
     let serving_for_offer = serving_fn.clone();
     let open_for_serve = Arc::clone(&open_table);
-    let ask = relay_ask(relay_dir.clone());
+    let automatic: Option<aterm_net::fleet::AskHandler> = automatic_handle.map(|handle| {
+        Arc::new(
+            move |stream: &mut dyn aterm_net::fleet::Duplex, peer: SocketAddr| {
+                if let Err(error) = handle.serve(stream, peer.ip()) {
+                    aterm_log::info!("node: an automatic join from {peer} ended: {error}");
+                }
+                Ok(())
+            },
+        ) as aterm_net::fleet::AskHandler
+    });
+    let ask = relay_ask(relay_dir.clone(), automatic);
 
     aterm_net::fleet::serve_offering_with_ask_within(
         &listener,
         (
             &listening,
-            &move || {
+            Arc::new(move || {
                 let s = serving_for_offer();
                 (s.scope, s.ops())
-            },
-            &move || {
+            }),
+            Arc::new(move || {
                 let log = members_for_gate.as_ref().and_then(|members| members.keys());
                 denied_under(
                     &denied_nodes_for(vault_for_gate.as_ref(), &denied_for_gate),
                     log.as_deref(),
                 )
-            },
+            }),
         ),
         Some(ask),
         &running,
@@ -1462,6 +1611,36 @@ fn serve_one_node_generation(
                     serve_census_request_at(stream, &st, hm.as_deref(), peer)
                 });
             }
+            if op == FleetOp::VaultJoin {
+                let judged = judge_vault_join_at(
+                    &served,
+                    &join_secret,
+                    (&state_dir, &serving_fn().grants),
+                    &denied,
+                    log.as_deref(),
+                    vault_paths.as_ref(),
+                );
+                let vault = vault_paths.clone();
+                return served.answer(|stream| {
+                    stream.set_read_timeout(Some(HANDSHAKE))?;
+                    stream.set_write_timeout(Some(HANDSHAKE))?;
+                    let ended = match (judged, vault) {
+                        (Ok(judged), Some(paths)) => {
+                            let from =
+                                peer.map_or(std::net::Ipv4Addr::UNSPECIFIED.into(), |at| at.ip());
+                            aterm_agent::vault_join::serve(stream, from, &judged, None, &paths)
+                                .map_err(|error| error.to_string())
+                        }
+                        (Err(why), _) => Err(why),
+                        (Ok(_), None) => Err("this node job follows no vault".to_owned()),
+                    };
+                    if let Err(why) = ended {
+                        let _ = aterm_secrets::members::refuse(stream, &why);
+                        aterm_log::info!("members: a vault-join from {peer:?} ended: {why}");
+                    }
+                    Ok(())
+                });
+            }
             if op == FleetOp::Drive {
                 let serving = serving_fn();
                 let (driver, grant) = match admit_driver_at(
@@ -1476,51 +1655,23 @@ fn serve_one_node_generation(
                         return refuse_driver(served, peer, &why, ungranted);
                     }
                 };
-                let keys = aterm_net::fleet_member::Keyring::read(&state_dir);
                 let driver_key = grant.key;
-                let relayed = relay_to_window(
-                    &relay_dir,
-                    &RelayHeader::Drive {
-                        driver: driver.clone(),
-                        key: Some(driver_key),
-                        peer,
-                    },
-                );
-                if let RelayOpen::Busy(why) = relayed {
-                    return answer_busy(served, &why);
-                }
-                if let RelayOpen::Opened(window_stream) = relayed {
-                    let Some(_open) = open_for_serve.admit(
-                        true,
-                        Some(grant),
-                        &window_stream,
-                        &serving_fn,
-                        &|n, key| holds_in(&keys, log.as_deref(), n, key),
-                        &denied,
-                    )?
-                    else {
-                        aterm_uds::hangup::hang_up(&window_stream);
-                        return refuse_driver(
-                            served,
-                            peer,
-                            "[fleet] took its grant back while it was admitted",
-                            true,
-                        );
+                let check_still_serves =
+                    |content: bool, grant_ref: Option<&aterm_net::fleet::DriveGrant>| -> bool {
+                        let now_serving = serving_fn();
+                        let now_keys = aterm_net::fleet_member::Keyring::read(&state_dir);
+                        let now_log = members.as_ref().and_then(|m| m.keys());
+                        let now_denied = denied_nodes_for(vault_paths.as_ref(), &denied_for_serve);
+                        now_serving.serves(
+                            content,
+                            grant_ref,
+                            &|n, key| holds_in(&now_keys, now_log.as_deref(), n, key),
+                            &now_denied,
+                        )
                     };
-                    return served.relay_answers(window_stream);
-                }
-
-                let (near, far) = CtlStream::pair()?;
-                let _ = aterm_uds::keep_out_of_children(&near);
-                let _ = aterm_uds::keep_out_of_children(&far);
-                let Some(_open) = open_for_serve.admit(
-                    true,
-                    Some(grant),
-                    &near,
-                    &serving_fn,
-                    &|n, key| holds_in(&keys, log.as_deref(), n, key),
-                    &denied,
-                )?
+                let (near, far) = aterm_uds::kept_out(CtlStream::pair)?;
+                let Some(open) =
+                    open_for_serve.admit(true, Some(grant), &near, check_still_serves)?
                 else {
                     return refuse_driver(
                         served,
@@ -1529,8 +1680,9 @@ fn serve_one_node_generation(
                         true,
                     );
                 };
-                spawn_windowless_drive(
+                spawn_node_drive(
                     near,
+                    Arc::clone(&open),
                     state_dir.clone(),
                     relay_dir.clone(),
                     (driver, driver_key),
@@ -1564,14 +1716,9 @@ fn serve_one_node_generation(
                 return answer_busy(served, &why);
             }
             if let RelayOpen::Opened(window_stream) = relayed {
-                let Some(_open) = open_for_serve.admit(
-                    content,
-                    None,
-                    &window_stream,
-                    &serving_fn,
-                    &|_, _| false,
-                    &[],
-                )?
+                let Some(_open) = open_for_serve.admit(content, None, &window_stream, |c, d| {
+                    serving_fn().serves(c, d, &|_, _| false, &[])
+                })?
                 else {
                     aterm_uds::hangup::hang_up(&window_stream);
                     return Err(std::io::Error::other(
@@ -1581,11 +1728,10 @@ fn serve_one_node_generation(
                 return served.relay_answers(window_stream);
             }
 
-            let (near, far) = CtlStream::pair()?;
-            let _ = aterm_uds::keep_out_of_children(&near);
-            let _ = aterm_uds::keep_out_of_children(&far);
-            let Some(_open) =
-                open_for_serve.admit(content, None, &near, &serving_fn, &|_, _| false, &[])?
+            let (near, far) = aterm_uds::kept_out(CtlStream::pair)?;
+            let Some(_open) = open_for_serve.admit(content, None, &near, |c, d| {
+                serving_fn().serves(c, d, &|_, _| false, &[])
+            })?
             else {
                 return Err(std::io::Error::other(
                     "[fleet] lowered its level while it was admitted",
@@ -1610,6 +1756,7 @@ fn serve_one_node_generation(
     if let Some(watch) = watch_handle {
         let _ = watch.join();
     }
+    drop(automatic_joins);
     if let Some(vault_paths) = cfg.vault_paths.as_ref()
         && !cfg.stop.load(Ordering::Acquire)
     {
@@ -1629,6 +1776,7 @@ fn push_node_facts_heartbeat(
     home_dir: Option<&Path>,
     config_path: Option<&Path>,
     secret: &aterm_net::fleet::FleetSecret,
+    (denied_nodes, log): (&[String], Option<&aterm_net::fleet_member::MemberKeys>),
 ) {
     let window = has_live_window_relay(relay_dir);
     let node = aterm_net::fleet_member::read_node_id(state_dir)
@@ -1663,7 +1811,9 @@ fn push_node_facts_heartbeat(
     let instances = usize::from(window);
     let payload =
         facts.to_survey_reply(std::process::id(), host.as_deref(), at_ms, instances, false);
-    if let Err(why) = push_facts_to_issuer(state_dir, secret, &payload) {
+    if let Err(why) =
+        push_facts_to_issuer_with_denied(state_dir, secret, (denied_nodes, log), &payload)
+    {
         aterm_log::debug!(
             "node job: survey facts heartbeat push skipped: {}",
             aterm_log::sanitize_record(&why)
@@ -1773,8 +1923,10 @@ fn spawn_windowless_survey(
         .map(|_| ())
 }
 
-fn spawn_windowless_drive(
+#[allow(clippy::too_many_arguments)]
+fn spawn_node_drive(
     mut near: CtlStream,
+    open: Arc<NodeOpened>,
     state_dir: PathBuf,
     relay_dir: PathBuf,
     (driver, driver_key): (crate::fabric::Driver, aterm_net::fleet::NodeKey),
@@ -1783,7 +1935,7 @@ fn spawn_windowless_drive(
     wake_timeout: Duration,
 ) -> std::io::Result<()> {
     std::thread::Builder::new()
-        .name("aterm-node-wake-drive".to_owned())
+        .name("aterm-node-drive".to_owned())
         .spawn(move || {
             let _ = near.set_read_timeout(Some(HANDSHAKE));
             let first_line =
@@ -1808,8 +1960,46 @@ fn spawn_windowless_drive(
                     }
                 };
             let _ = near.set_read_timeout(None);
+            if open.is_cut() {
+                aterm_uds::hangup::hang_up(&near);
+                return;
+            }
             let trimmed = first_line.trim_end_matches(['\r', '\n']).trim_start();
-            let verb = trimmed.split_ascii_whitespace().next().unwrap_or_default();
+            let (verb, rest) = trimmed.split_once(char::is_whitespace)
+                .map_or((trimmed, ""), |(verb, rest)| (verb, rest.trim_start()));
+            // Machine upkeep stays in the node, even while windows open and close.
+            // Forwarding polls to the newest window would lose their request book.
+            if verb == aterm_agent::harness::remote_renew::VERB {
+                let reply = aterm_agent::harness::remote_renew::serve(
+                    &format!("fleet:{}", driver.node), rest,
+                );
+                let _ = near.write_all(reply.as_bytes());
+                let _ = near.flush();
+                aterm_uds::hangup::hang_up(&near);
+                return;
+            }
+            let header = RelayHeader::Drive {
+                driver,
+                key: Some(driver_key),
+                peer,
+            };
+            match relay_to_window(&relay_dir, &header) {
+                RelayOpen::Opened(win) => {
+                    forward_node_drive(near, win, &open, &first_line);
+                    return;
+                }
+                RelayOpen::Busy(why) => {
+                    let reply = format!(
+                        "ERR busy: an aterm window is open on this Mac and took no fleet connection ({}); ask again\n",
+                        aterm_log::sanitize_record(&why),
+                    );
+                    let _ = near.write_all(reply.as_bytes());
+                    let _ = near.flush();
+                    aterm_uds::hangup::hang_up(&near);
+                    return;
+                }
+                RelayOpen::NoWindow => {}
+            }
             if verb != "spawn" {
                 let _ = near.write_all(b"ERR no window open on this Mac\n");
                 let _ = near.flush();
@@ -1835,44 +2025,54 @@ fn spawn_windowless_drive(
                 return;
             }
 
-            let header = RelayHeader::Drive {
-                driver,
-                key: Some(driver_key),
-                peer,
-            };
-            let deadline = Instant::now() + wake_timeout;
+            let now = Instant::now();
+            let deadline = now
+                .checked_add(wake_timeout)
+                .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365));
             let mut window_stream = None;
             while Instant::now() < deadline {
+                if open.is_cut() {
+                    aterm_uds::hangup::hang_up(&near);
+                    return;
+                }
                 if let Some(stream) = open_window_relay(&relay_dir, &header) {
                     window_stream = Some(stream);
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }
-            let Some(mut win) = window_stream else {
+            let Some(win) = window_stream else {
                 let _ = near.write_all(b"ERR timed out waiting for aterm window to open\n");
                 let _ = near.flush();
                 aterm_uds::hangup::hang_up(&near);
                 return;
             };
-            if win.write_all(first_line.as_bytes()).is_err() || win.flush().is_err() {
-                aterm_uds::hangup::hang_up(&win);
-                aterm_uds::hangup::hang_up(&near);
-                return;
-            }
-            pump_bidirectional(near, win);
+            forward_node_drive(near, win, &open, &first_line);
         })
         .map(|_| ())
 }
 
+fn forward_node_drive(near: CtlStream, mut win: CtlStream, open: &NodeOpened, first_line: &str) {
+    if !open.attach_line(&win)
+        || win.write_all(first_line.as_bytes()).is_err()
+        || win.flush().is_err()
+    {
+        aterm_uds::hangup::hang_up(&win);
+        aterm_uds::hangup::hang_up(&near);
+        return;
+    }
+    pump_bidirectional(near, win);
+}
+
 fn pump_bidirectional(mut left: CtlStream, mut right: CtlStream) {
-    let (Ok(mut left_read), Ok(mut right_write)) = (left.try_clone(), right.try_clone()) else {
+    let (Ok(mut left_read), Ok(mut right_write)) = (
+        aterm_uds::kept_out(|| left.try_clone()),
+        aterm_uds::kept_out(|| right.try_clone()),
+    ) else {
         aterm_uds::hangup::hang_up(&left);
         aterm_uds::hangup::hang_up(&right);
         return;
     };
-    let _ = aterm_uds::keep_out_of_children(&left_read);
-    let _ = aterm_uds::keep_out_of_children(&right_write);
     let forward = std::thread::Builder::new()
         .name("aterm-node-pump".to_owned())
         .spawn(move || {

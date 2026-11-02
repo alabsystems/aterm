@@ -79,6 +79,19 @@ pub trait PolicyProbe: Send + Sync + std::fmt::Debug {
 
     /// Where the worker's Bash tool may stand beyond `cwd`.
     fn shell_cwds(&self, worker: &WorkerEnv, cwd: &Path) -> Vec<PathBuf>;
+
+    /// How many looks this thread's probe has refused because the machine did not answer in
+    /// time: a decision during which it moved may have escalated for that alone. A live count no
+    /// tape holds; a probe that never bounds a look says none.
+    fn unanswered(&self) -> u64 {
+        0
+    }
+
+    /// Whether a look this thread's probe left out past its bound has still not ended: until
+    /// it ends, every look on this thread refuses at once.
+    fn look_out(&self) -> bool {
+        false
+    }
 }
 
 /// An absolute path as the disk resolves it for `rm` ([`PolicyProbe::rm_physical`]).
@@ -397,6 +410,16 @@ impl<P: PolicyProbe> PolicyProbe for TapedProbe<P> {
             || self.live.shell_cwds(worker, cwd),
         )
     }
+
+    /// The live arm's count: no door tapes it, so a recording loop that acts on it marks its
+    /// tape unreplayable (`Session::box_left_out`); a replay's arm counts none.
+    fn unanswered(&self) -> u64 {
+        self.live.unanswered()
+    }
+
+    fn look_out(&self) -> bool {
+        self.live.look_out()
+    }
 }
 
 /// The tape's effects, by ordinal, and astream-effects' keyed index of their round trips.
@@ -619,6 +642,12 @@ impl TapeValue for Result<WorkerEnv, String> {
 
     fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
         answer_of(bytes, |(digest, pid): (String, Option<u32>)| {
+            if digest.is_empty() || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(CodecError {
+                    at: 0,
+                    why: "a worker's digest that is not hex",
+                });
+            }
             u64::from_str_radix(&digest, 16)
                 .map(|d| WorkerEnv::recorded(d, pid))
                 .map_err(|_| CodecError {

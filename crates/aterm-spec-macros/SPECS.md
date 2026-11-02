@@ -1,7 +1,7 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-spec-macros: spec recovery from its 9 unit tests
+# aterm-spec-macros: spec recovery from unit tests
 
 > Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 4 tests it
 > deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
@@ -31,25 +31,24 @@ Gap numbers in this file are the rows of the gap table in
   `Expand_U` is the same for `#[spec_unmodeled]`.
 - `Probe(id)`: the statement `::aterm_spec_anchor::xref::note_entered(id);`.
 - `Probeable(F)`: `F` is a fn with a `{ .. }` body and no `const` (`FnItem::fn_with_body` returns
-  `Some(false)`). Before SP.8 this was: `F` parses as `syn::ImplItemFn` or `syn::ItemFn`, and
-  `sig.constness` is `None`.
+  `Some(false)`).
 - `Prepend(F,s)`: `F` with `block.stmts := [s] ++ F.block.stmts`. Attributes (inner `#![..]`
   included), visibility and signature are unchanged.
 - `f`: the name of `F`'s first top-level `fn` (`FnItem::ident`), as a string.
 - `Eid(M,A,f)` = `format!("{M}::{A} @ {f}")` (`entry_id_for`).
-- `W_t = (armed: bool, S: Set<&'static str>)`: the abstract evidence-window state of thread `t`, made of
-  the `ARMED` `Cell<bool>` and the `ENTERED_ANCHORS` `RefCell<BTreeSet>` thread-locals.
+- `W_t = (armed: bool, S: Set<&'static str>)`: the abstract evidence-window state of thread `t`,
+  made of the `ARMED` `Cell<bool>` and the `ENTERED_ANCHORS` `RefCell<BTreeSet>` thread-locals.
 - `Live(t)`: the TLS slots of `t` are not destroyed and no borrow of `ENTERED_ANCHORS` is outstanding.
 - `Sem(F)(args, σ)`: what a call to `F` does that the caller can observe (return value, effects on
   `self` and `&mut` arguments, panic, divergence), leaving `W_t` out.
 - `Reg_T(B)`: the multiset of `T` records (`RefinementAnchor`, `Waiver`) that
-  `registry::iter::<T>()` yields in binary `B`. `Sub_T(B)`: the multiset of `registry::submit!{T => ..}`
-  expansions linked into `B`.
+  `registry::iter::<T>()` yields in binary `B`. `Sub_T(B)`: the multiset of
+  `registry::submit!{T => ..}` expansions linked into `B`.
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes (primary tests; secondary in §2)`,
-`difficulty (Rust features the proof must handle)`, `blocking gaps` (audit §7 numbers).
+Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (primary tests; the others are in §2),
+`difficulty` (the Rust features the proof must handle), `blocking_gaps`.
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
@@ -62,44 +61,10 @@ registry-collects-each-submit-once	invariant	aterm_spec::registry::{submit,iter}
 probe-preserves-semantics	refinement	aterm_spec_macros::refines, aterm_spec::xref::note_entered	∀ fn F that type-checks, ∀ M,A,P, args, caller state σ: Sem(Expand_R(M,A,P,F))(args,σ) = Sem(F)(args,σ). Covers early return, generics, recursion, self by value, &mut self, inner attributes, diverging bodies and n-fold stacking of refines on one fn. Proof sketch: Prepend inserts only Rec, an item with no runtime effect, and Probe(id), and note_entered (a) never panics or diverges, for any W_t and whether or not Live(t), and (b) writes only W_t. For a const fn Expand_R prepends Rec alone, so F stays const-evaluable. This is the semantic half of macro-expansion-shape.	probe_preserves_behaviour_of_every_awkward_fn_shape	VERY HARD: a statement over the semantics of all Rust fns, quantified over syntax (needs a kernel Rust semantics, proven-core SemR); thread_local!, LocalKey::try_with closures, RefCell::try_borrow_mut, BTreeSet::insert, panic-freedom	0, 1, 2, 3, 4, 8, 9, 11, 13
 ```
 
-### Distribution by kind (7)
-
-| kind | count |
-|---|---|
-| contract | 4 |
-| invariant | 2 |
-| refinement | 1 |
-
-### Gap histogram (specs blocked by each audit §7 gap)
-
-| gap | specs |
-|---|---|
-| 0 | 7 |
-| 1 | 7 |
-| 2 | 4 |
-| 3 | 2 |
-| 4 | 3 |
-| 5 | 1 |
-| 8 | 5 |
-| 9 | 4 |
-| 11 | 3 |
-| 13 | 4 |
-
-No spec is blocked by gap 0 alone: every one needs non-scalar carriers (gap 1), because the data
-is `&str`, `String`, token streams or a `BTreeSet`.
-
-### Proof dependency order
-
-`anchor-entry-id` and `macro-expansion-shape` are the macro-side lemmas.
-`evidence-window-state-machine` is the runtime-side lemma. `probed-call-records-its-anchors`
-composes all three. `step-evidence-refuses-nesting` uses `evidence-window-state-machine`.
-`probe-preserves-semantics` uses `macro-expansion-shape` plus the panic-freedom half of
-`evidence-window-state-machine`. `registry-collects-each-submit-once` is independent of the rest.
-
 ## 2. Test → spec map (TSV)
 
-`primary` is the spec that retires the test. `also` lists the other specs the same test samples.
-All paths are under `crates/aterm-spec-macros/`.
+`primary` is the spec that retires the test; `also` lists the other specs it samples. Paths are
+under `crates/aterm-spec-macros/`.
 
 ```tsv
 file	test	primary	also
@@ -115,25 +80,12 @@ tests/anchors/suite.rs	stacked_waivers_are_each_collected	macro-expansion-shape	
 tests/anchors/suite.rs	the_registry_collects_every_record_this_file_submits_exactly_once	registry-collects-each-submit-once	macro-expansion-shape
 ```
 
-## 3. Coverage
-
-- 9 tests read. All 9 map to one of the 7 specs. None is a non-spec check (§4).
-- The spec recovery input reported 10 tests. The file has 9 `#[test]` fns; a plain grep finds a
-  tenth `#[test]` inside the comment at `tests/derive_and_attrs.rs:75`. This table counts 9.
-- `probe-preserves-semantics` has 1 primary test but is the most general spec here: it is the
-  property the stale "unchanged" wording in `src/lib.rs` (§5.2) should name.
-- The test helpers (`early_return`, `generic_identity`, `recursive_sum`, `inner_attr_body`,
-  `open_window`, `anchor_entry_id`) are the annotated fixtures and the harness, not tests.
+`the_registry_collects_every_record_this_file_submits_exactly_once` is in neither table; it
+samples `registry-collects-each-submit-once`.
 
 ## 4. Tests that are not spec samples
 
-None. Every test samples one of the specs above.
-
-| action | count |
-|---|---|
-| delete | 0 |
-| become the spec | 0 |
-| keep | 0 |
+None.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
@@ -143,7 +95,7 @@ None. Every test samples one of the specs above.
 2. **(Fixed 2026-10-28.) Stale "unchanged" wording.** The misleading "left 100% unchanged at
    runtime" comment was removed from `src/lib.rs`; the property is `probe-preserves-semantics`.
 
-## 6. Proof order (easiest, high value first)
+## 6. Proof order
 
 No spec is blocked by gap 0 alone, so the order goes by the fewest and smallest remaining gaps.
 

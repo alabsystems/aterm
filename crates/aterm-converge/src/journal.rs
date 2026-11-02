@@ -160,23 +160,77 @@ impl Journal for FileJournal {
 }
 
 fn make_dir(dir: &Path) -> io::Result<()> {
+    if let Ok(meta) = fs::symlink_metadata(dir)
+        && !meta.is_dir()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a directory",
+        ));
+    }
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-    builder.create(dir)
+    builder.create(dir)?;
+    let meta = fs::symlink_metadata(dir)?;
+    if !meta.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a directory",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if meta.permissions().mode() & 0o7777 != 0o700 {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    Ok(())
 }
 
 struct Held(File);
 
 impl Held {
     fn take(path: &Path, wait: Duration) -> io::Result<Self> {
+        match fs::symlink_metadata(path) {
+            Ok(meta) if !meta.is_file() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "not a regular file",
+                ));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
         #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        {
+            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+            std::os::unix::fs::OpenOptionsExt::custom_flags(
+                &mut options,
+                libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            );
+        }
         let file: std::fs::File = options.open(path)?;
-        let deadline = Instant::now() + wait;
+        let meta = file.metadata()?;
+        if !meta.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a regular file",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            if meta.permissions().mode() & 0o7777 != 0o600 {
+                file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            }
+        }
+        let deadline = Instant::now().checked_add(wait);
         loop {
             #[expect(
                 clippy::disallowed_methods,
@@ -185,7 +239,9 @@ impl Held {
             let taken = file.try_lock();
             match taken {
                 Ok(()) => return Ok(Self(file)),
-                Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                Err(std::fs::TryLockError::WouldBlock)
+                    if deadline.is_none_or(|d| Instant::now() < d) =>
+                {
                     std::thread::sleep(Duration::from_millis(5));
                 }
                 Err(std::fs::TryLockError::WouldBlock) => {
@@ -213,8 +269,29 @@ fn open_append(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.append(true).create(true);
     #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    options.open(path)
+    {
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        std::os::unix::fs::OpenOptionsExt::custom_flags(
+            &mut options,
+            libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        );
+    }
+    let file = options.open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if meta.permissions().mode() & 0o7777 != 0o600 {
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    Ok(file)
 }
 
 #[cfg(test)]
@@ -423,6 +500,77 @@ mod tests {
                 .contains("not a regular file")
         );
         assert_eq!(applies.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        #[cfg(unix)]
+        {
+            let lock_scratch = aterm_tempfile::tempdir().unwrap();
+            let mut lock_journal = FileJournal::under(lock_scratch.path());
+            let lock_dir = lock_scratch.path().join(FileJournal::DIR);
+            fs::create_dir_all(&lock_dir).unwrap();
+            let decoy = lock_scratch.path().join("decoy");
+            std::os::unix::fs::symlink(&decoy, lock_dir.join(FileJournal::LOCK)).unwrap();
+            let item = Scripted::new(vec![change(), ok()], Ok(()));
+            let applies = Arc::clone(&item.applies);
+            let items: Vec<Box<dyn Item>> = vec![Box::new(item)];
+            let rows = run(&items, Mode::Apply, &mut lock_journal).unwrap();
+            assert_eq!(rows[0].outcome, Outcome::Failed);
+            assert!(
+                rows[0]
+                    .why
+                    .as_deref()
+                    .unwrap()
+                    .contains("not a regular file"),
+                "{rows:?}"
+            );
+            assert_eq!(applies.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(
+                !decoy.exists(),
+                "symlinked lock target must never be created"
+            );
+
+            let dir_scratch = aterm_tempfile::tempdir().unwrap();
+            let dir_target = dir_scratch.path().join("elsewhere");
+            fs::create_dir_all(&dir_target).unwrap();
+            std::os::unix::fs::symlink(&dir_target, dir_scratch.path().join(FileJournal::DIR))
+                .unwrap();
+            let mut dir_journal = FileJournal::under(dir_scratch.path());
+            let err = dir_journal
+                .before_change("item.0", "a", "b", None)
+                .unwrap_err();
+            assert!(err.contains("not a directory"), "{err}");
+
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode_scratch = aterm_tempfile::tempdir().unwrap();
+            let mode_dir = mode_scratch.path().join(FileJournal::DIR);
+            fs::create_dir_all(&mode_dir).unwrap();
+            fs::set_permissions(&mode_dir, fs::Permissions::from_mode(0o755)).unwrap();
+            let mode_journal_file = mode_dir.join(FileJournal::FILE);
+            let mode_lock_file = mode_dir.join(FileJournal::LOCK);
+            fs::write(&mode_journal_file, b"").unwrap();
+            fs::write(&mode_lock_file, b"").unwrap();
+            fs::set_permissions(&mode_journal_file, fs::Permissions::from_mode(0o644)).unwrap();
+            fs::set_permissions(&mode_lock_file, fs::Permissions::from_mode(0o644)).unwrap();
+            let mut mode_journal = FileJournal::under(mode_scratch.path());
+            mode_journal
+                .before_change("item.0", "a", "b", None)
+                .unwrap();
+            assert_eq!(
+                fs::symlink_metadata(&mode_dir)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            for f in [&mode_journal_file, &mode_lock_file] {
+                assert_eq!(
+                    fs::symlink_metadata(f).unwrap().permissions().mode() & 0o777,
+                    0o600,
+                    "{}",
+                    f.display()
+                );
+            }
+        }
     }
 
     #[test]

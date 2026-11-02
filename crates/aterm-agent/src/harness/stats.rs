@@ -23,8 +23,8 @@ use crate::supervise::policy::go_ahead::RULE_GO_AHEAD;
 use crate::supervise::policy::question::{CHOSE_FIRST_SAFE, CHOSE_RECOMMENDED, CHOSE_UNMARKED};
 use crate::supervise::policy::reset::KeepWhy;
 use crate::supervise::policy::turn_end::{
-    LAND, LAND_NUDGE, LAND_NUDGE_REMOTE_MAIN_BEFORE, LAND_REMOTE_MAIN_BEFORE, RULE_ANSWER,
-    RULE_LAND, RULE_LAND_ANSWER, is_land_rule,
+    LAND, LAND_CHECK_HEAD, LAND_CONTRADICTED_HEAD, LAND_NUDGE, LAND_NUDGE_REMOTE_MAIN_BEFORE,
+    LAND_REMOTE_MAIN_BEFORE, RULE_ANSWER, RULE_LAND, RULE_LAND_ANSWER, is_land_rule,
 };
 use crate::supervise::run::LINE_CHARS;
 
@@ -47,7 +47,7 @@ pub struct HarnessStats {
     pub answered: u64,
     /// Continuations typed at an ordinary turn end (Cruise).
     pub continued: u64,
-    /// Land's instruction and its nudges typed (`land@v1`, `land-nudge@v1`).
+    /// Land's instruction, its nudges and its land checks typed (`land@v1`, `land-nudge@v1`, `land-check@v1`).
     pub land_prompts: u64,
     /// Land's landings: the journal's `DONE … rule=land@v1` notes, one per landing at its first note's time, never a restatement of it.
     pub landed: u64,
@@ -88,6 +88,25 @@ pub struct HarnessStats {
     /// The folds' memory of what is still open.
     open: Open,
 }
+
+/// FORCED CONTINUES (`docs/DESIGN-harness-autopilot-2026-10-15.md` §14.17 item 2, slice 6c), the
+/// owner's name for the part of WHAT THE HARNESS DID's Kept going row that counts the turns where
+/// the agent said it was done and the harness answered with Cruise's defend-and-find-more prompt
+/// ([`FORCED_CONTINUE_RULES`], [`HarnessStats::forced_continues`]). Settings ▸ Harness draws the
+/// name and [`FORCED_CONTINUES_LINE`] from here, and the forever lab (`aterm-lab`) reads the row by
+/// the same two strings.
+pub const FORCED_CONTINUES: &str = "Forced continues";
+
+/// The one line under [`FORCED_CONTINUES`]'s row: what it counts, in plain words.
+pub const FORCED_CONTINUES_LINE: &str =
+    "The agent said it was done; the harness had it check its work and keep going.";
+
+/// The acts [`FORCED_CONTINUES`] counts: Cruise's done check, and the two challenges older builds
+/// typed at a done claim (retired, still read in a week's ledgers).
+pub const FORCED_CONTINUE_RULES: [&str; 3] = {
+    use crate::supervise::policy::turn_end::{RULE_DONE_CHECK, RULE_OPEN_ITEMS, RULE_UNCOMMITTED};
+    [RULE_DONE_CHECK, RULE_OPEN_ITEMS, RULE_UNCOMMITTED]
+};
 
 /// One session's share of a window ([`HarnessStats::by_session`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -310,6 +329,15 @@ impl HarnessStats {
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.rows == 0
+    }
+
+    /// The window's [`FORCED_CONTINUES`]: its acts of [`FORCED_CONTINUE_RULES`].
+    #[must_use]
+    pub fn forced_continues(&self) -> u64 {
+        FORCED_CONTINUE_RULES
+            .iter()
+            .filter_map(|rule| self.by_rule.get(*rule))
+            .fold(0, |sum, n| sum.saturating_add(*n))
     }
 
     fn tally(&mut self, sid: &str) -> Option<&mut Tally> {
@@ -1317,16 +1345,27 @@ fn land_line(r: &JournalRecord) -> Option<LandLine> {
     }
 }
 
-/// Whether a journal line's `said` opens with Land's words as a line clips them: today's, or FOREVER LAND's before their no-repository sentence, which a journal an older build wrote holds.
-fn opens_with_land_words(said: &str) -> bool {
-    const SAID: [&[u8]; 4] = [
+/// Whether a journal line's `said` opens with Land's words as a line clips them: today's (the land
+/// check and the nudge's contradiction by their heads), the switch's why before them (v6 §14.17
+/// item 3), or FOREVER LAND's before their no-repository sentence, which a journal an older build
+/// wrote holds.
+pub(crate) fn opens_with_land_words(said: &str) -> bool {
+    const SAID: [&[u8]; 6] = [
         clipped(LAND),
         clipped(LAND_NUDGE),
+        clipped(LAND_CONTRADICTED_HEAD),
         clipped(LAND_REMOTE_MAIN_BEFORE),
         clipped(LAND_NUDGE_REMOTE_MAIN_BEFORE),
+        clipped(LAND_CHECK_HEAD),
     ];
+    // Land's instruction as the person's switch over a held tab types it opens with its why
+    // (`turn_end::switch_why`), which a clipped line may cut before the instruction's own words.
+    let switched = said
+        .strip_prefix(crate::harness::harness_mark!())
+        .and_then(|r| r.strip_prefix(' '))
+        .is_some_and(|r| r.starts_with(crate::supervise::policy::turn_end::SWITCH_WHY_HEAD));
     let said = said.as_bytes();
-    SAID.iter().any(|words| said.starts_with(words))
+    switched || SAID.iter().any(|words| said.starts_with(words))
 }
 
 const fn clipped(s: &str) -> &[u8] {

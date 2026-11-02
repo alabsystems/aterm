@@ -921,6 +921,58 @@ mod macos {
         );
     }
 
+    /// Stage 13: a real `NSStatusItem` carrying two landings with their receipts
+    /// ([`crate::status_item::a_landing_with_its_receipt`]), its menu repainted by its own delegate
+    /// as a person's open repaints it, and the tips read back off AppKit (THE LANDING'S RECEIPT,
+    /// §14.9 slice 9c of `docs/DESIGN-harness-autopilot-2026-10-15.md`): the Done for you row's
+    /// `-toolTip` says what aterm checked and what the agent said
+    /// ([`aterm_agent::supervise::mode_words::landed_tip`]), naming the head's 12 digits and
+    /// `origin/main`; the worker's row, one level into its manager's submenu, says what aterm
+    /// checked in a repository with no remote ([`aterm_agent::supervise::mode_words::checked_words`]),
+    /// never "remote main". The item leaves the bar when the stage ends. (An `NSMenuItem` answers
+    /// no `-accessibilityHelp`, so the drive reads none; the chip's screen-reader description is
+    /// held to `mode_words::landed_words` by `the_landed_words_say_what_aterm_checked` and read
+    /// off `chrome`'s `a11y` line in the captures.)
+    fn receipt_on_the_bar(cx: &mut Ctx, proxy: &EventLoopProxy<Wake>) {
+        use aterm_agent::supervise::mode_words;
+        let now_ms = aterm_time::unix_millis().unwrap_or(0);
+        let rows = crate::status_item::a_landing_with_its_receipt(now_ms);
+        let glance = crate::status_item::Glance::build(&rows, &[], None, now_ms, None);
+        let Some(item) = crate::status_item::install(proxy, &glance) else {
+            cx.check(false, "the status bar gave the drive no item".to_owned());
+            return;
+        };
+        let items = crate::status_item::items_on_the_bar(&item);
+        drop(item);
+        let (on_main, no_remote) = crate::status_item::landing_receipts();
+        let done = items
+            .iter()
+            .find(|i| i.title.starts_with("\u{2713} proj-api \u{2014} landed"));
+        let worker = items
+            .iter()
+            .flat_map(|i| i.under.iter())
+            .find(|i| i.title.starts_with("\u{2713} parser \u{2014} landed"));
+        for i in [done, worker].into_iter().flatten() {
+            println!("  --  {:?} tip={:?}", i.title, i.tip);
+        }
+        let want = mode_words::landed_tip(Some(&on_main));
+        let tip = done.and_then(|i| i.tip.clone());
+        cx.check(
+            tip.as_deref() == Some(want.as_str())
+                && want.contains("3f9a1c2e4b7d on origin/main")
+                && !want.contains("remote main"),
+            format!("the Done for you row's -toolTip is {want:?} (got {tip:?})"),
+        );
+        let want = mode_words::checked_words(Some(&no_remote));
+        let tip = worker.and_then(|i| i.tip.clone());
+        cx.check(
+            tip.as_deref() == Some(want.as_str())
+                && want.contains("this repository has no remote")
+                && !want.contains("remote main"),
+            format!("the worker row's -toolTip under its manager is {want:?} (got {tip:?})"),
+        );
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "one linear drive of one window: every stage depends on the \
@@ -2202,6 +2254,7 @@ mod macos {
         }
         let mut m = model(4);
         for kind in [
+            TabIconKind::Codex,
             TabIconKind::About,
             TabIconKind::Settings,
             TabIconKind::Markdown,
@@ -2217,6 +2270,7 @@ mod macos {
             ("busy", 1),
             ("attention", 2),
             ("not-closable", 3),
+            ("plain", 4),
         ] {
             let mut mm = model(4);
             for t in &mut mm.metadata {
@@ -2350,8 +2404,9 @@ mod macos {
                 "icon=Markdown",
                 "icon=Editor",
                 "icon=Recovery",
+                "icon=Codex",
             ],
-            &["dirty", "busy", "attention", "not-closable"],
+            &["dirty", "busy", "plain"],
             &["conn=Outbound", "conn=Inbound", "conn=Both"],
             &["accent=None", "accent=(220,40,60)", "accent=(20,180,90)"],
             &["dark=true", "dark=false"],
@@ -2359,6 +2414,7 @@ mod macos {
             &["plus hover", "plus pressed", "plus idle"],
         ];
         let mut named: Vec<&str> = groups.iter().flat_map(|g| g.iter().copied()).collect();
+        named.extend(["attention", "not-closable"]);
         named.sort_unstable();
         let mut captured: Vec<&str> = matrix.iter().map(|(n, _)| n.as_str()).collect();
         captured.sort_unstable();
@@ -2403,6 +2459,13 @@ mod macos {
                 format!("these states all draw differently: {group:?} -> {hs:02x?}"),
             );
         }
+        // Automatic attention is quiet. Without hover, closability changes interaction,
+        // not the bitmap; the protected-tab press checks above cover that interaction.
+        let plain = hash_of("plain");
+        cx.check(
+            plain.is_some() && hash_of("attention") == plain && hash_of("not-closable") == plain,
+            "automatic attention and an unhovered protected tab draw like the plain tab".to_owned(),
+        );
 
         println!("\n-- stage 10: the four declared classes, off the live objects");
         // SAFETY: `ns_window` is live; the toolbar's delegate is the declared `ATermToolbarDelegate` while the toolbar exists.
@@ -2460,6 +2523,7 @@ mod macos {
             "\n-- stage 12: the menu bar's Needs you, stopped work first, off the real NSMenu"
         );
         stopped_first_on_the_bar(&mut cx, &proxy);
+        receipt_on_the_bar(&mut cx, &proxy);
 
         drop(handle);
         drop(d.window.take());

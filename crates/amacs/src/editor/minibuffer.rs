@@ -200,7 +200,12 @@ impl EditorWorkspace {
         view: &mut EditorBufferView,
         query: &str,
     ) -> Result<Result<Vec<EditorEffect>, String>, EditorError> {
-        let Ok(line) = query.trim().parse::<usize>() else {
+        let trimmed = query.trim();
+        let Ok(line) = trimmed
+            .strip_prefix('+')
+            .map_or(trimmed, |_| "")
+            .parse::<usize>()
+        else {
             return Ok(Err("Line number must be a positive integer".to_string()));
         };
         if line == 0 {
@@ -212,6 +217,7 @@ impl EditorWorkspace {
         view.primary = 0;
         view.viewport_anchor = target;
         view.mark_active = false;
+        self.grid_reveal_caret(store, view);
         let landed = snapshot.text[..target]
             .matches('\n')
             .count()
@@ -618,6 +624,21 @@ mod tests {
             .unwrap();
         assert_eq!(view.primary_selection(), &Selection::caret(4));
         assert!(matches!(view.minibuffer, Minibuffer::Inactive));
+
+        workspace
+            .execute(&mut store, &mut view, EditorCommand::GotoLine)
+            .unwrap();
+        workspace
+            .insert_minibuffer_text(&store, &mut view, "+2")
+            .unwrap();
+        let effects = workspace.submit_minibuffer(&mut store, &mut view).unwrap();
+        assert!(matches!(view.minibuffer, Minibuffer::GotoLine { .. }));
+        assert!(
+            matches!(effects.as_slice(), [EditorEffect::Status(message)] if message.contains("positive integer"))
+        );
+        workspace
+            .handle_chord(&mut store, &mut view, KeyChord::parse("C-g").unwrap())
+            .unwrap();
     }
 
     #[test]

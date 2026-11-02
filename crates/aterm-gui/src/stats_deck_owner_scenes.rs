@@ -702,16 +702,16 @@ fn the_deck_says_more_only_when_the_mac_struggles() {
                             .iter()
                             .any(|s| s.cell.over)
                     }),
-                DeckForm::Folded => {
-                    // Folded's header queries words.over_shown(&plan.blocks[0].strip), which checks
-                    // all non-text rows against block A's multi-scale spec.
+                DeckForm::Folded => form_strips.iter().enumerate().any(|(bi, strip)| {
                     scene.resources[..DECK_RESOURCES.len()]
                         .iter()
                         .enumerate()
+                        .skip(bi * 4)
+                        .take(4)
                         .any(|(ri, v)| {
                             aterm_vitals::words::strip_words(DECK_RESOURCES[ri], &scene).is_none()
                                 && v.heat_multi_scale(
-                                    form_strips[0].spec,
+                                    strip.spec,
                                     AT,
                                     SLOT_COVER_MS,
                                     &scene.time_gaps,
@@ -719,7 +719,7 @@ fn the_deck_says_more_only_when_the_mac_struggles() {
                                 .iter()
                                 .any(|s| s.cell.over)
                         })
-                }
+                }),
             };
             assert_eq!(
                 runs.iter().any(|r| r == "over max"),
@@ -764,6 +764,66 @@ fn the_deck_says_more_only_when_the_mac_struggles() {
                 assert_eq!(nows, dots, "{form:?} {o:?}: a calm deck says now: {runs:?}");
             }
         }
+    }
+}
+
+/// The painted key follows actual marked cells through the words-to-header path, rather than
+/// borrowing another block's strip preference. Both marked blocks share one key; calm has none.
+#[test]
+fn the_folded_key_follows_the_block_whose_cells_draw_over_max() {
+    let m = FaceMetrics::helvetica_neue();
+    let snap = owner_scene(Owner::Light);
+    let input = DeckInput {
+        form: DeckForm::Folded,
+        ..owner_input(&snap)
+    };
+    let plan = plan::plan_folded(OWNER_W, &m);
+    for over in [[true, false], [false, true], [true; 2], [false; 2]] {
+        let mut words = DeckWords::new(&input, &m);
+        for (ri, row) in words.rows.iter_mut().enumerate() {
+            for slots in &mut row.multi_scale {
+                for slot in slots {
+                    slot.cell.over = over[ri / 4]
+                        && slot.cell.gap.is_none()
+                        && slot.cell.heat.is_some_and(|heat| !heat.is_nan());
+                }
+            }
+        }
+        let laid = lay(
+            &owner_geom_at(DeckForm::Folded, OWNER_W, 2.0),
+            &input,
+            &words,
+            &m,
+            true,
+        );
+        let head = laid.head.as_ref().expect("a Folded header");
+        let keys: Vec<_> = laid
+            .boxes
+            .iter()
+            .filter(|b| b.kind == BoxKind::Text && b.text == "over max")
+            .collect();
+        assert_eq!(keys.len(), usize::from(over.contains(&true)), "{over:?}");
+        if over[0] != over[1] {
+            let bi = usize::from(over[1]);
+            let block = plan.blocks[bi];
+            let x = head
+                .key
+                .placed
+                .iter()
+                .find_map(|&(item, x)| (item == KeyItem::Over).then_some(x))
+                .expect("the marked block has a key");
+            assert!(
+                x >= block.at.x && x + KeyItem::Over.width(&m) <= block.at.end(),
+                "{over:?}: key at {x} belongs beside block {bi}"
+            );
+        }
+        assert!(
+            head.key
+                .spans
+                .iter()
+                .any(|s| { s.strip && s.x0 >= plan.blocks[1].strip.x && s.over == over[1] }),
+            "{over:?}: B stays physically a strip even when unmarked"
+        );
     }
 }
 
@@ -988,13 +1048,8 @@ fn owner_laid_at(o: Owner, form: DeckForm, w: f64, m: &FaceMetrics) -> Laid {
 /// this host installs, as [`deck_paint`] lays the PNG, so the table says what the picture shows: a
 /// clause that fits on that face can fall to its short form on the tests' Helvetica Neue advances.
 #[test]
-#[ignore = "writes PNGs for a person to read: set ATERM_DECK_GALLERY to a directory"]
 fn deck_owner_gallery() {
-    let Some(dir) = std::env::var_os("ATERM_DECK_GALLERY") else {
-        return;
-    };
-    let dir = std::path::PathBuf::from(dir);
-    std::fs::create_dir_all(&dir).expect("the gallery directory");
+    let (dir, _gallery) = crate::scripted_redraw_fixture::gallery_directory("ATERM_DECK_GALLERY");
     crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
     // The owner's width in both forms, then narrower ones, where the run gives way to the bar and
     // the bar to its place under the % (`docs/DESIGN-stats-deck-meter-2026-10-26.md` §2).
@@ -1064,13 +1119,8 @@ fn deck_owner_gallery() {
 /// Full and Folded, idle, busy and hot-hard, on Default (the owner's, a green accent), Default
 /// Light and Tokyo Night (a blue accent): the frames a person compares before and after.
 #[test]
-#[ignore = "writes PNGs for a person to read: set ATERM_DECK_GALLERY to a directory"]
 fn deck_owner_compare_gallery() {
-    let Some(dir) = std::env::var_os("ATERM_DECK_GALLERY") else {
-        return;
-    };
-    let dir = std::path::PathBuf::from(dir);
-    std::fs::create_dir_all(&dir).expect("the gallery directory");
+    let (dir, _gallery) = crate::scripted_redraw_fixture::gallery_directory("ATERM_DECK_GALLERY");
     crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
     let mut written = 0;
     for o in [Owner::Idle, Owner::Busy, Owner::HotHard] {
@@ -1229,6 +1279,8 @@ fn only_a_hot_dial_steams_inside_its_slot_and_a_steam_frame_patches_byte_for_byt
                     fp: 1,
                     geom: 1,
                     raster_fingerprint_once: std::sync::OnceLock::new(),
+                    serial: 0,
+                    delta: None,
                     scrim: None,
                 };
                 assert!(patch_live(

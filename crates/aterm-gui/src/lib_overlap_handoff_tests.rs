@@ -1695,10 +1695,13 @@ fn the_access_question_posts_nothing_and_watches_the_probe() {
     access_card_due(&mut app, t0);
     assert_eq!(
         app.messages.on_glass().next().map(|l| l.id),
-        Some(other),
-        "the question is no row: the row that was there is still the top one"
+        None,
+        "neither diagnostic asks for attention"
     );
-    assert_eq!(app.messages.wanted_rows(), 1, "only the row that was there");
+    assert!(
+        app.messages.live(other).is_some(),
+        "the previous diagnostic remains recorded"
+    );
     assert!(
         app.consent_card_host.record.asked_at.is_some(),
         "asking recorded that it was asked"

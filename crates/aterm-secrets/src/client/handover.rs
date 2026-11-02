@@ -114,6 +114,7 @@ fn handover_bundle_until(
     if state.membership != Stored::In
         || state.failed
         || !state.pending.is_empty()
+        || !super::pin_admitted(&config, None)
         || (!source_bound(&config, &state) && !super::log_only_source_bound(&config, &state))
     {
         return Err(none());
@@ -124,6 +125,19 @@ fn handover_bundle_until(
     }
     if let Some(why) = super::admit::roster_keeps_out(paths, None, allowed.binding(), [0; 32]) {
         return Err(Error::new(why));
+    }
+    let joiner_rec = allowed.binding().recipient();
+    let joiner_rec_str = joiner_rec.to_bech32();
+    if super::roster::swarm_roster(paths)
+        .ok()
+        .flatten()
+        .is_some_and(|r| {
+            r.member_by_recipient(&joiner_rec_str).is_none() && r.is_label_denied(allowed.name())
+        })
+    {
+        return Err(Error::new(
+            "the vault removed this Mac, and an Allow does not let a removed Mac back in",
+        ));
     }
     let check_log = |log: &crate::membership_log::Log| -> crate::Result<()> {
         let me = identity.recipient();
@@ -139,10 +153,29 @@ fn handover_bundle_until(
         if let Some(why) = super::admit::kept_out(log, allowed.binding(), false) {
             return Err(Error::new(why));
         }
-        if let Some(already) = log.membership().get(&allowed.binding().actor())
-            && roster
-                .as_ref()
-                .is_some_and(|r| super::log_entries::member_denied_by_roster(r, already))
+        if super::log_entries::recipient_denied_by_roster_or_log(roster.as_ref(), log, &joiner_rec)
+            || log
+                .membership()
+                .get(&allowed.binding().actor())
+                .is_some_and(|already| {
+                    roster
+                        .as_ref()
+                        .is_some_and(|r| super::log_entries::member_denied_by_roster(r, already))
+                })
+            || roster.as_ref().is_some_and(|r| {
+                r.member_by_recipient(&joiner_rec_str).is_none()
+                    && !log
+                        .membership()
+                        .members()
+                        .values()
+                        .any(|m| m.binding.recipient() == joiner_rec)
+                    && !log
+                        .membership()
+                        .unproved()
+                        .iter()
+                        .any(|f| f.recipient == joiner_rec)
+                    && r.is_label_denied(allowed.name())
+            })
         {
             return Err(Error::new(
                 "the vault removed this Mac, and an Allow does not let a removed Mac back in",
@@ -299,6 +332,7 @@ pub fn post_allowed(paths: &Paths, allowed: &Allowed) -> crate::Result<()> {
         code: super::join_code(&recipient),
         time: None,
         lan: false,
+        home: None,
         allowed: Some(allowed.to_text()),
         proof: None,
     }
@@ -360,17 +394,28 @@ pub fn write_from_bundle(paths: &Paths, bundle: &Bundle) -> crate::Result<Report
     }
     let entries = text::parse_locker(files.as_slice())
         .map_err(|error| Error::new(format!("the member's bundle: {error}")))?;
-    if entries
-        .iter()
-        .any(|entry| entry.audience != Audience::Everyone)
-    {
+    if entries.iter().any(|entry| {
+        entry.audience != Audience::Everyone
+            || crate::reserved_name(&entry.name)
+            || text::cli_login(&entry.name).is_some()
+    }) {
         return Err(Error::new(
             "the member's bundle holds more than its [everyone] files",
         ));
     }
+    if !crate::envelope::valid_name(&bundle.vault)
+        || !text::valid_machine_name(bundle.allowed.name())
+    {
+        return Err(Error::new("the member's join bundle is malformed"));
+    }
     let server = bundle
         .servers
         .first()
+        .filter(|url| {
+            (url.starts_with("http://") || url.starts_with("https://"))
+                && url.len() <= 512
+                && url.bytes().all(|b| b.is_ascii_graphic())
+        })
         .cloned()
         .ok_or_else(|| Error::new("the member's bundle names no vault server"))?;
     let config = Config {
@@ -380,13 +425,18 @@ pub fn write_from_bundle(paths: &Paths, bundle: &Bundle) -> crate::Result<Report
         followed: bundle.followed.clone(),
         host: bundle.allowed.name().to_owned(),
     };
+    if !super::pin_admitted(&config, None) {
+        return Err(Error::new(
+            "the member's bundle pins a retired vault signer",
+        ));
+    }
     save_config(paths, &config)?;
     let report = apply_entries(paths, &mut state, &entries)?;
     state.membership = Stored::Pending;
     state.failed = apply_failed(&report);
     state.proof = None;
     state.refused = None;
-    state.source_identity = (!state.failed).then(|| source_identity(&config));
+    state.source_identity = Some(source_identity(&config));
     save_state(paths, &state)?;
     keep_allowed(paths, &bundle.allowed)?;
     Ok(report)
@@ -460,5 +510,81 @@ mod tests {
         assert!(busy.to_string().contains("still holds its state"), "{busy}");
         assert!(!busy.to_string().contains("no applied vault"), "{busy}");
         drop(pass);
+    }
+
+    #[test]
+    fn write_from_bundle_rejects_reserved_entries_cli_logins_and_invalid_server_urls() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let allowed = synthetic_allowed(root.path());
+        let joiner = Paths::for_home(&root.path().join("joiner"));
+
+        // 1. Reserved entry in `Handed::Files` must be rejected before writing config.
+        let reserved_files = text::render_everyone_locker(&[Entry {
+            name: crate::SWARM_ROSTER_ENTRY.to_owned(),
+            value: crate::SecretBytes::from(&b"members = []\n"[..]),
+            audience: Audience::Everyone,
+            if_absent: false,
+            anchor: None,
+        }]);
+        let bad_reserved = Bundle {
+            vault: "test".to_owned(),
+            signer: [9; 32],
+            followed: Vec::new(),
+            servers: vec!["http://127.0.0.1:9000/v1/test".to_owned()],
+            allowed: allowed.clone(),
+            handed: Handed::Files(reserved_files),
+        };
+        assert!(write_from_bundle(&joiner, &bad_reserved).is_err());
+        assert!(config(&joiner).unwrap().is_none());
+
+        // 2. CLI login entry in `Handed::Files` must be rejected before writing config.
+        let cli_files = text::render_everyone_locker(&[Entry {
+            name: "~/.claude/.credentials.json".to_owned(),
+            value: crate::SecretBytes::from(&b"{}"[..]),
+            audience: Audience::Everyone,
+            if_absent: false,
+            anchor: None,
+        }]);
+        let bad_cli = Bundle {
+            vault: "test".to_owned(),
+            signer: [9; 32],
+            followed: Vec::new(),
+            servers: vec!["http://127.0.0.1:9000/v1/test".to_owned()],
+            allowed: allowed.clone(),
+            handed: Handed::Files(cli_files),
+        };
+        assert!(write_from_bundle(&joiner, &bad_cli).is_err());
+        assert!(config(&joiner).unwrap().is_none());
+
+        // 3. Non-http(s) server URL must be rejected.
+        let clean_files = text::render_everyone_locker(&[Entry {
+            name: "api_token".to_owned(),
+            value: crate::SecretBytes::from(&b"secret"[..]),
+            audience: Audience::Everyone,
+            if_absent: false,
+            anchor: None,
+        }]);
+        let bad_url = Bundle {
+            vault: "test".to_owned(),
+            signer: [9; 32],
+            followed: Vec::new(),
+            servers: vec!["file:///tmp/evil".to_owned()],
+            allowed: allowed.clone(),
+            handed: Handed::Files(clean_files.clone()),
+        };
+        assert!(write_from_bundle(&joiner, &bad_url).is_err());
+        assert!(config(&joiner).unwrap().is_none());
+
+        // 4. Positive control: valid `[everyone]` file bundle succeeds.
+        let good = Bundle {
+            vault: "test".to_owned(),
+            signer: [9; 32],
+            followed: Vec::new(),
+            servers: vec!["http://127.0.0.1:9000/v1/test".to_owned()],
+            allowed,
+            handed: Handed::Files(clean_files),
+        };
+        write_from_bundle(&joiner, &good).expect("clean bundle accepted");
+        assert!(config(&joiner).unwrap().is_some());
     }
 }

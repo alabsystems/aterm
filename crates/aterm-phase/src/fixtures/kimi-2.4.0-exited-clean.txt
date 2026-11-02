@@ -1,0 +1,33 @@
+# kimi 2.4.0 · MEASURED 2026-10-29, `aterm ctl text` of a private headless aterm (110x32, aterm 0.146.0) running the real Kimi Code, launched by path with a scratch `HOME` and `KIMI_CODE_HOME` whose `config.toml` names one `openai`-type provider at `http://127.0.0.1:<port>/v1` with a fake key (a local stub of the Chat Completions API, crates/aterm-lab), no login · `/exit` + Enter on an idle composer: `Bye!`, `To resume this session: kimi -r <session id>` above the shell's prompt, and `echo $?` reads 0
+ ❯ lab run a shell command to reject
+
+ ✗ Ran a command · $ echo lab-kimi-reject
+   Tool "Bash" was not run because the user rejected the approval request.
+
+   Rejected: Running: echo lab-kimi-reject
+
+ ● lab after the rejection
+
+ ❯ lab hit the quota
+   Error: [provider.rate_limit] 429 You exceeded your current quota, please check your plan and billing
+ details.
+   If this persists, run `/export-debug-zip` and share the file with us for diagnosis. Please don't share it
+ publicly.
+
+ ❯ lab hit an auth failure
+   Error: [provider.auth_error] 401 Invalid Authentication
+   If this persists, run `/export-debug-zip` and share the file with us for diagnosis. Please don't share it
+ publicly.
+
+ ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │ >                                                                                                        │
+ ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ lab-model  …/tmp/at.NuMm/proj
+ Shutting down… (running shutdown hooks)                                           context: 22% (20.8k/97.7k)
+
+ Bye!
+
+ To resume this session: kimi -r session_dc00ad28-8342-47c5-9e08-09e594e32b91
+lab$ echo "kimi exit=$?"
+kimi exit=0
+lab$

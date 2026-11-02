@@ -4,7 +4,7 @@
 //! The cursor family's frame step.
 
 use aterm_core::terminal::CursorStyle;
-use aterm_render::{GlowQuad, TrailCell};
+use aterm_render::{GlowQuad, RainHalo, TrailCell};
 use aterm_time::Instant;
 
 use crate::aos_momentum::MomentumHost;
@@ -77,6 +77,22 @@ pub struct CursorFx {
     /// negative control of the momentum glow's chosen-colour law alone.
     #[cfg(test)]
     pub(crate) momentum_chosen_unread: bool,
+    /// A test's negative control: a chosen colour's bolt caret keeps the page floor alone, its
+    /// halo unread ([`chosen_bolt_over_halo`], [`Self::set_chosen_bolt_lift`]).
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) chosen_bolt_unlit: bool,
+    /// A test's negative control: a chosen colour's bolt lift stops at its clip, short or not
+    /// ([`chosen_bolt_over_halo`], [`Self::set_chosen_bolt_past_clip`]).
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) chosen_bolt_clip_stop: bool,
+    /// A test's negative control: Laser's bolt in the theme's own colour on paper keeps the page
+    /// floor alone, its halo unread ([`chosen_bolt_over_halo`], [`Self::set_paper_bolt_lift`]).
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) paper_bolt_unlit: bool,
+    /// The frame's under and over streams laid out ([`CursorGlow::under_laid_into`],
+    /// [`CursorGlow::out_laid_into`]) for a bolt's read of the light round it
+    /// ([`chosen_bolt_over_halo`]); reused across frames.
+    pub(crate) bolt_lit_scratch: [Vec<GlowQuad>; 2],
     /// The comet cells this tick produced, projected through load shedding, brightness, and
     /// legibility.
     pub trail_scratch: Vec<TrailCell>,
@@ -157,6 +173,10 @@ pub struct CursorFxFrame {
     /// The caret body this tick resolved through the fill-precedence law and the load-shed
     /// projection.
     pub block_fill: Option<BlockFill>,
+    /// A bar or underline caret's colour lifted in lightness to read against the light of its
+    /// cell (`CursorGlow::thin_caret_fill`), over [`Self::block_fill`]'s; `None` where it
+    /// reads as it is.
+    pub thin_fill: Option<u32>,
     /// The laser bolt owns the block: the caret's shape is `Bolt`.
     pub bolt_cursor: bool,
     /// A body owns a blinking block, and the shape is pinned steady: the rainbow's, and the
@@ -167,13 +187,30 @@ pub struct CursorFxFrame {
     pub momentum_steady: Option<CursorStyle>,
 }
 
+impl CursorFxFrame {
+    /// The colour the host draws the caret's body in this tick: a bar or underline caret's
+    /// lifted colour ([`Self::thin_fill`]) over the block's ([`Self::block_fill`]); `None`
+    /// leaves the theme's cursor colour. Every host (the pipeline's own publish, the windowed
+    /// app's present paths, the Settings preview) reads the caret's colour here, so a fill one
+    /// effect adds reaches all of them.
+    #[inline]
+    #[must_use]
+    pub fn caret_fill(&self) -> Option<u32> {
+        self.thin_fill.or(self.block_fill.map(|owned| owned.fill))
+    }
+}
+
+/// A thin bar's insertion point, as a fraction of its cell across: where a bar caret's lights
+/// sit ([`head_dx_for`]).
+pub const BAR_HEAD_DX: f32 = 0.08;
+
 /// Where the streak's head attaches in its cell: a thin bar's insertion point, else the cell
 /// centre.
 #[inline]
 #[must_use]
 pub const fn head_dx_for(style: CursorStyle) -> f32 {
     if matches!(style, CursorStyle::BlinkingBar | CursorStyle::SteadyBar) {
-        0.08
+        BAR_HEAD_DX
     } else {
         0.5
     }
@@ -393,32 +430,46 @@ pub fn bed_legible_share(color: u32, ground: u32, ink: u32) -> f32 {
     }
     let color = color & 0x00FF_FFFF;
     let ground = ground & 0x00FF_FFFF;
+    if color == ground {
+        return 1.0;
+    }
     let ink = ink & 0x00FF_FFFF;
     let table = crate::color_math::relative_luminance_table();
     let lum_ink = crate::color_math::relative_luminance_with(table, ink);
+    let lum_ink_p = lum_ink + 0.05;
     #[inline]
     const fn contrast_ink(
         table: &crate::color_math::RelativeLuminanceTable,
         lum_ink: f32,
+        lum_ink_p: f32,
         bg: u32,
     ) -> f32 {
         let lb = crate::color_math::relative_luminance_with(table, bg);
-        (lum_ink.max(lb) + 0.05) / (lum_ink.min(lb) + 0.05)
+        if lum_ink >= lb {
+            lum_ink_p / (lb + 0.05)
+        } else {
+            (lb + 0.05) / lum_ink_p
+        }
     }
-    let target = BED_INK_FLOOR.min(contrast_ink(table, lum_ink, ground));
+    let target = BED_INK_FLOOR.min(contrast_ink(table, lum_ink, lum_ink_p, ground));
     #[inline]
     const fn holds_bg(
         table: &crate::color_math::RelativeLuminanceTable,
         lum_ink: f32,
+        lum_ink_p: f32,
         target: f32,
         bg: u32,
     ) -> bool {
         let lb = crate::color_math::relative_luminance_with(table, bg);
-        lum_ink.max(lb) + 0.05 >= target * (lum_ink.min(lb) + 0.05)
+        if lum_ink >= lb {
+            lum_ink_p >= target * (lb + 0.05)
+        } else {
+            lb + 0.05 >= target * lum_ink_p
+        }
     }
     let peak = crate::cursor_trail::BED_PEAK_ALPHA;
     let peak_bg = aterm_render::blend_rgb(ground, color, peak);
-    if holds_bg(table, lum_ink, target, peak_bg) {
+    if holds_bg(table, lum_ink, lum_ink_p, target, peak_bg) {
         return 1.0;
     }
     let (mut lo, mut hi) = (0u8, peak);
@@ -431,7 +482,7 @@ pub fn bed_legible_share(color: u32, ground: u32, ink: u32) -> f32 {
         } else if lo > 0 && mid_bg == lo_bg {
             true
         } else {
-            holds_bg(table, lum_ink, target, mid_bg)
+            holds_bg(table, lum_ink, lum_ink_p, target, mid_bg)
         };
         if ok {
             lo = mid;
@@ -511,6 +562,172 @@ const fn bolt_body(color: u32, blaze: f32, dark: bool, chosen: bool) -> u32 {
         return crate::color_math::light_caret_fill(color, blaze, chosen);
     }
     crate::effect_util::lerp_rgb(color, 0x00FF_FFFF, 0.55 * blaze)
+}
+
+/// The least a chosen colour's bolt caret reads against the halo it sits in
+/// ([`chosen_bolt_over_halo`]): the legibility bar and a guard for the post passes (the bloom and
+/// the crown light the halo round the bolt past what its halos lay).
+pub(crate) const CHOSEN_BOLT_HALO_MIN: f32 = CARET_PAGE_MIN_CONTRAST + 0.6;
+
+/// How far past its clip a chosen colour's bolt may go toward white (dark) or black (paper) to
+/// read [`CHOSEN_BOLT_HALO_MIN`] against its halo ([`chosen_bolt_over_halo`]): half the way, so
+/// it is the pin lit, never white.
+const CHOSEN_BOLT_PAST_CLIP: f32 = 0.5;
+
+/// THE CHOSEN BOLT READS AGAINST ITS OWN HALO (composed r0's judges; O1(a)): Laser's bolt caret in
+/// a colour the user chose sits in that colour's aura, and the page floor alone left it dim
+/// against it: under a slate pin (`#20242c`) a grey `#808287` bolt read 4.96:1 on the page but
+/// 2.60:1 against its halo `#414248`, and the pink pin's 3.93. Its `fill` is moved in lightness
+/// alone (each channel by one amount, toward white on a dark page, toward black on paper, never
+/// past the point where a channel meets its end, so its hue and chroma stay the colour's: a
+/// pinned `#50fa7b` in a bright halo stays green at its lightest rather than going white; where
+/// that end leaves it short, it goes on toward white or black, which keeps its hue, no further
+/// than the bar needs and [`CHOSEN_BOLT_PAST_CLIP`] allows: the pink pin's `#ff76c1` read 4.41:1
+/// against its halo with the post passes on, composed r2) until it reads
+/// [`CHOSEN_BOLT_HALO_MIN`] against the brightest (dark) or darkest (paper) of `page` lit by the
+/// frame's light (its under stream's quads, then its over stream's and its halos, [`light_at`]:
+/// read over the over stream alone, a paper halo under the letters went unseen and Laser's
+/// paper bolt read 3.72:1 against it, composed r2) at every other pixel of the
+/// caret's `cell` (the cell's corners and centre alone missed the light beside the bolt and
+/// left a keystroke's frame at 4.17): light is not colour (the pin ruling). Control: [`CursorFx::chosen_bolt_unlit`].
+#[must_use]
+pub(crate) fn chosen_bolt_over_halo(
+    fill: u32,
+    (under, over, halos): (&[GlowQuad], &[GlowQuad], &[RainHalo]),
+    page: u32,
+    geom: Geom,
+    (row, col): (u16, u16),
+    past_clip: bool,
+) -> u32 {
+    use crate::color_math::contrast_ratio;
+    let fill = fill & 0x00FF_FFFF;
+    let page = page & 0x00FF_FFFF;
+    let dark = aterm_render::theme_is_dark(page);
+    let (cw, ch) = (geom.cw as i32, geom.ch as i32);
+    let x0 = i32::from(geom.origin_x) + i32::from(col) * cw;
+    let y0 = i32::from(geom.origin_y) + i32::from(row) * ch;
+    let mut ground = page;
+    let mut worst = f32::INFINITY;
+    let grid = (1..ch - 1)
+        .step_by(2)
+        .flat_map(|fy| (1..cw - 1).step_by(2).map(move |fx| (fx, fy)));
+    for (fx, fy) in grid {
+        let at = (x0 + fx, y0 + fy);
+        let lit = light_at(light_at(page, (under, &[]), at), (over, halos), at);
+        let c = contrast_ratio(fill, lit);
+        if c < worst {
+            (worst, ground) = (c, lit);
+        }
+    }
+    if worst >= CHOSEN_BOLT_HALO_MIN {
+        return fill;
+    }
+    let shift = |d: f32| -> u32 {
+        let ch = |sh: u32| {
+            let c = ((fill >> sh) & 0xff) as f32;
+            ((if dark { c + d } else { c - d }).round().clamp(0.0, 255.0) as u32) << sh
+        };
+        ch(16) | ch(8) | ch(0)
+    };
+    let meets = |c: u32| contrast_ratio(c, ground) >= CHOSEN_BOLT_HALO_MIN;
+    let channels = [(fill >> 16) & 0xff, (fill >> 8) & 0xff, fill & 0xff];
+    let room = if dark {
+        255 - channels.iter().copied().max().unwrap_or(0)
+    } else {
+        channels.iter().copied().min().unwrap_or(0)
+    } as f32;
+    if !meets(shift(room)) && !past_clip {
+        return shift(room);
+    }
+    if !meets(shift(room)) {
+        // At its clip and still short (a bright halo, its post passes on): on toward white on a
+        // dark page, toward black on paper, which keeps its hue, its chroma given only as far as
+        // the bar needs and never more than [`CHOSEN_BOLT_PAST_CLIP`] of the way (light added to
+        // the pin, as the blaze adds it; a pinned `#50fa7b` stays green).
+        let clipped = shift(room);
+        let end = if dark { 0x00FF_FFFF } else { 0 };
+        let past = |m: f32| crate::effect_util::lerp_rgb(clipped, end, m);
+        if !meets(past(CHOSEN_BOLT_PAST_CLIP)) {
+            return past(CHOSEN_BOLT_PAST_CLIP);
+        }
+        let (mut lo, mut hi) = (0.0f32, CHOSEN_BOLT_PAST_CLIP);
+        while hi - lo > 1.0 / 256.0 {
+            let mid = 0.5 * (lo + hi);
+            if meets(past(mid)) {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        return past(hi);
+    }
+    let (mut lo, mut hi) = (0.0f32, room);
+    while hi - lo > 0.5 {
+        let mid = 0.5 * (lo + hi);
+        if meets(shift(mid)) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    shift(hi)
+}
+
+/// `page` as the renderer lays the frame's light over it at window pixel `(x, y)`: each laid
+/// quad that covers it, by the renderer's own rule (`over_premul`, which adds at alpha 0, of
+/// the quad's colour and opacity where `x` falls across it), then every adding halo (its light
+/// added by its falloff) and every veiling one (laid over at its falloff, no more than its
+/// cap), as the renderer's `draw_radial_add` lays them. (A veil once read at its falloff times
+/// its cap, a halo at a time in the stream's order, read a paper Return flash in the caret's
+/// cell `#b8d4f2` where the renderer laid `#93c4ee`, composed r2.)
+#[must_use]
+pub(crate) fn light_at(
+    page: u32,
+    (quads, halos): (&[GlowQuad], &[RainHalo]),
+    (x, y): (i32, i32),
+) -> u32 {
+    let mut px = page & 0x00FF_FFFF;
+    for q in quads {
+        let (qx, qy, qw) = (i32::from(q.x), i32::from(q.y), i32::from(q.w.max(1)));
+        if x < qx || x >= qx + qw || y < qy || y >= qy + i32::from(q.h) {
+            continue;
+        }
+        let (i, n) = ((x - qx) as u32, qw as u32);
+        let color = aterm_render::glow_lerp_rgb(q.color, q.color2, i, n);
+        let alpha = aterm_render::glow_lerp(u32::from(q.alpha), u32::from(q.alpha2), i, n) as u8;
+        px = aterm_render::over_premul(px, color, alpha) & 0x00FF_FFFF;
+    }
+    // The renderer lays every adding halo, then every veiling one (`draw_radial_add`).
+    for mode in [
+        aterm_core::render::HaloMode::Add,
+        aterm_core::render::HaloMode::Over,
+    ] {
+        for h in halos.iter().filter(|h| h.mode == mode) {
+            let (hx, hy) = (i32::from(h.x), i32::from(h.y));
+            if x < hx || x >= hx + i32::from(h.w) || y < hy || y >= hy + i32::from(h.h) {
+                continue;
+            }
+            let (rx, ry) = (i32::from(h.rx), i32::from(h.ry));
+            let ny = aterm_render::halo_row_ny(y - i32::from(h.cy), ry * ry);
+            if ny >= 256 {
+                continue;
+            }
+            let w = aterm_render::halo_weight(x - i32::from(h.cx), ny, rx * rx);
+            if w <= 0 {
+                continue;
+            }
+            let w = w.min(255) as u8;
+            px = match mode {
+                aterm_core::render::HaloMode::Add => {
+                    aterm_render::add_sat(px, aterm_render::premul_rgb(h.color, w))
+                }
+                aterm_core::render::HaloMode::Over => {
+                    aterm_render::over_rgb(px, h.color, w.min(aterm_render::halo_over_cap(h.color)))
+                }
+            } & 0x00FF_FFFF;
+        }
+    }
+    px
 }
 
 /// Project the resolved effect-owned cursor body through adaptive shedding.
@@ -977,7 +1194,44 @@ const fn is_block(style: CursorStyle) -> bool {
     matches!(style, CursorStyle::BlinkingBlock | CursorStyle::SteadyBlock)
 }
 
+/// A thin caret's shape: `Some(true)` for a bar, `Some(false)` for an underline, `None` for
+/// every other.
+#[inline]
+const fn thin_bar(style: CursorStyle) -> Option<bool> {
+    match style {
+        CursorStyle::BlinkingBar | CursorStyle::SteadyBar => Some(true),
+        CursorStyle::BlinkingUnderline | CursorStyle::SteadyUnderline => Some(false),
+        _ => None,
+    }
+}
+
 impl CursorFx {
+    /// A test's negative control: `on` (as shipped), a chosen colour's bolt caret is lifted to
+    /// read against its own halo ([`chosen_bolt_over_halo`]); off, it keeps the page floor alone.
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_chosen_bolt_lift(&mut self, on: bool) {
+        self.chosen_bolt_unlit = !on;
+    }
+
+    /// A test's negative control: `on` (as shipped), Laser's bolt in the theme's own colour on
+    /// paper is lifted to read against its own halo as a chosen colour's is
+    /// ([`chosen_bolt_over_halo`]); off, it keeps the page floor alone.
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_paper_bolt_lift(&mut self, on: bool) {
+        self.paper_bolt_unlit = !on;
+    }
+
+    /// A test's negative control: `on` (as shipped), a chosen colour's bolt still short of its
+    /// bar at its clip goes on toward white or black ([`chosen_bolt_over_halo`]); off, it stops
+    /// at the clip.
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_chosen_bolt_past_clip(&mut self, on: bool) {
+        self.chosen_bolt_clip_stop = !on;
+    }
+
     /// The light each body engine's config last carried (the rainbow block's, the momentum
     /// glow's, the comet's and the beam rod's): for the host's dark pin (§15.0.3). Debug and test
     /// builds only.
@@ -1154,6 +1408,7 @@ impl CursorFx {
         let glow_fp = self
             .glow
             .tick(cur, now, glow_cfg, geom, &mut self.glow_scratch);
+
         // A glow that is off draws no guarded light, so the frame keeps main's gate.
         self.bloom_spares_letters =
             glow_cfg.enabled && self.glow.bloom_spares_letters(glow_cfg.style);
@@ -1261,6 +1516,7 @@ impl CursorFx {
         );
         let mut shares = OverInkShares::EMPTY;
         let body_to = self.glow_scratch.len();
+
         if body_to > body_from {
             shares.fold(self.glow.admit_over_ink(
                 &mut self.glow_scratch,
@@ -1383,6 +1639,7 @@ impl CursorFx {
             theme_fg: glow_cfg.theme_fg,
             theme_bg: glow_cfg.theme_bg,
             block: is_block(f.cursor_style),
+            bar: glow_cfg.head_dx < 0.5,
             glyph_span: if momentum_enabled && !dark {
                 match cur {
                     Some(cell) => self.glow.caret_row_glyphs(cell),
@@ -1408,6 +1665,7 @@ impl CursorFx {
             self.glow.under_sink(),
         );
         let momentum_to = self.glow_scratch.len();
+
         let held_print = if dark && momentum_to > momentum_from {
             if warm && glow_cfg.enabled && !tinted && matches!(glow_cfg.style, GlowStyle::Fire) {
                 #[cfg(test)]
@@ -1469,6 +1727,7 @@ impl CursorFx {
             self.glow.under_sink(),
         );
         let body_to = self.glow_scratch.len();
+
         if body_to > body_from {
             shares.fold(self.glow.admit_over_ink(
                 &mut self.glow_scratch,
@@ -1493,6 +1752,7 @@ impl CursorFx {
             &mut self.glow_scratch,
         );
         let body_to = self.glow_scratch.len();
+
         if body_to > body_from {
             shares.fold(self.glow.admit_over_ink(
                 &mut self.glow_scratch,
@@ -1536,6 +1796,7 @@ impl CursorFx {
             self.glow.under_sink(),
         );
         let body_to = self.glow_scratch.len();
+
         if body_to > body_from {
             shares.fold(self.glow.admit_over_ink(
                 &mut self.glow_scratch,
@@ -1553,42 +1814,20 @@ impl CursorFx {
         let glow_fp =
             glow_fp ^ shares.0.rotate_left(41) ^ self.glow.over_ink_print().rotate_left(13);
         let glow_fp = glow_fp ^ beamrod_frame.fp.rotate_left(17);
-        // Every light is in: none lies on the caret's letter, and the letter guard has the last
-        // word on every other.
+        // Every light is in. Under a pinned trail colour on a dark page each wears the pin's hue
+        // and chroma at its own light (`CursorGlow::hold_pinned_lights`), before anything
+        // weighs it. None lies on the caret's letter, and the letter guard has the last word on
+        // every other.
+        self.glow
+            .hold_pinned_lights(glow_cfg, &mut self.glow_scratch);
         let punched = self.glow.keep_light_off_caret_letter(
             &mut self.glow_scratch,
             cur,
             geom,
             glow_cfg.style,
         );
-        let guarded = self
-            .glow
-            .guard_letters(&mut self.glow_scratch, cur, geom, glow_cfg.style);
-        let glow_fp = glow_fp ^ guarded.rotate_left(37) ^ punched.rotate_left(7);
-        self.glow
-            .ground_the_frame(glow_cfg, geom, &self.glow_scratch);
-        // The pet's veil is drawn after the pet's tick, by the body it drew
-        // this frame (`EffectsPipeline::veil_pet_letters`).
-        self.glow.note_veil_frame(cur, geom);
-        let bolt_cursor = rainbow_block
-            && glow_cfg.enabled
-            && glow_cfg.intensity > 0.0
-            && matches!(glow_cfg.style, GlowStyle::Laser);
-        let bolt_fill = if bolt_cursor {
-            Some(bolt_body(
-                glow_cfg.color,
-                blaze,
-                dark,
-                chosen(glow_cfg.color),
-            ))
-        } else {
-            None
-        };
-        // Over a letter the bolt stands down to a steady block of its own colour, which the
-        // renderer cuts the letter out of: a bolt is no block, and drawn over the letter it hid
-        // it (looks8 WIDEN move-up: the `!` read 1.00:1).
-        let bolt_down = bolt_cursor && self.glow.caret_bolt_stands_down(cur);
-        let glow_fp = glow_fp ^ u64::from(bolt_fill.unwrap_or(0)).rotate_left(59);
+        // The cursor trail's cells, under every light: the letter guard reads each letter's
+        // ring on the ground the trail fills (it lays its cells before the frame's glow).
         if trail_cfg.enabled {
             crate::cursor_trail::ignite(&mut trail_cfg, energy, warmth);
         }
@@ -1613,6 +1852,103 @@ impl CursorFx {
             trail_cfg.color,
             f.shed_envelope * bed_brightness * legible,
         );
+        // A focused block caret fills its cell; a bar, an underline or an unfocused outline
+        // leaves its cell's ground beside a neighbour's letter.
+        let caret_block = f.focused && is_block(f.cursor_style);
+        let guarded = self.glow.guard_letters(
+            &mut self.glow_scratch,
+            (cur, caret_block),
+            (geom, glow_cfg),
+            (&self.trail_scratch, trail_cfg.color),
+        );
+        let glow_fp = glow_fp ^ guarded.rotate_left(37) ^ punched.rotate_left(7);
+        self.glow
+            .ground_the_frame(glow_cfg, geom, &self.glow_scratch);
+        let bolt_cursor = rainbow_block
+            && glow_cfg.enabled
+            && glow_cfg.intensity > 0.0
+            && matches!(glow_cfg.style, GlowStyle::Laser);
+        #[cfg(any(test, debug_assertions))]
+        let (bolt_unlit, bolt_clip_stop, paper_unlit) = (
+            self.chosen_bolt_unlit,
+            self.chosen_bolt_clip_stop,
+            self.paper_bolt_unlit,
+        );
+        #[cfg(not(any(test, debug_assertions)))]
+        let (bolt_unlit, bolt_clip_stop, paper_unlit) = (false, false, false);
+        let bolt_fill = if bolt_cursor {
+            let fill = bolt_body(glow_cfg.color, blaze, dark, chosen(glow_cfg.color));
+            // THE PAPER BOLT READS AGAINST ITS OWN HALO (composed r1's access judge, O5(a)): in
+            // the theme's own colour on paper Laser's bolt `#7834f9` sat in its lavender halo
+            // `#cab9ec` at 3.72:1 as the steam's Backspaces fed it (the trail gallery's
+            // `laser-light-steam.bs09` read 4.41 on GitHub Light, 4.40 on Default Light). No
+            // ruling excuses it there: it is lifted in lightness alone as a chosen colour's is.
+            // The dark bolt keeps its ruled light.
+            let lift = if chosen(glow_cfg.color) {
+                !bolt_unlit
+            } else {
+                !dark && !paper_unlit
+            };
+            Some(match cur {
+                Some(cell) if lift => {
+                    let [mut under, mut laid] = std::mem::take(&mut self.bolt_lit_scratch);
+                    self.glow.under_laid_into(&mut under);
+                    self.glow.out_laid_into(&self.glow_scratch, &mut laid);
+                    let lifted = chosen_bolt_over_halo(
+                        fill,
+                        (&under, &laid, self.glow.halos()),
+                        f.cursor_cell_bg.unwrap_or(f.default_bg),
+                        geom,
+                        cell,
+                        !bolt_clip_stop,
+                    );
+                    self.bolt_lit_scratch = [under, laid];
+                    lifted
+                }
+                _ => fill,
+            })
+        } else {
+            None
+        };
+        // Over a letter the bolt stands down to a steady block of its own colour, which the
+        // renderer cuts the letter out of: a bolt is no block, and drawn over the letter it hid
+        // it (looks8 WIDEN move-up: the `!` read 1.00:1).
+        let bolt_down = bolt_cursor && self.glow.caret_bolt_stands_down(cur);
+        let glow_fp = glow_fp ^ u64::from(bolt_fill.unwrap_or(0)).rotate_left(59);
+        // A bar or underline caret reads against the light of its own cell (a trail cell's
+        // blend under it, the lights over it): where its colour at its lightest (dark) or
+        // darkest (paper) cannot, that light is held there
+        // (`CursorGlow::hold_light_for_thin_caret`); its colour is lifted below.
+        let thin = match (cur, f.focused, thin_bar(f.cursor_style)) {
+            (Some(cell), true, Some(bar)) => Some(crate::cursor_glow::ThinCaret {
+                cell,
+                bar,
+                page: f.cursor_cell_bg.unwrap_or(f.default_bg) & 0x00FF_FFFF,
+                pin: f.cursor_color_pinned.then_some(f.live_cursor & 0x00FF_FFFF),
+            }),
+            _ => None,
+        };
+        let under = thin.map(|caret| {
+            let (row, col) = (usize::from(caret.cell.0), usize::from(caret.cell.1));
+            match self
+                .trail_scratch
+                .iter()
+                .find(|t| t.row == row && t.col == col)
+            {
+                Some(t) if trail_cfg.enabled => {
+                    aterm_render::blend_rgb(caret.page, trail_cfg.color & 0x00FF_FFFF, t.alpha)
+                        & 0x00FF_FFFF
+                }
+                _ => caret.page,
+            }
+        });
+        let held = self.glow.hold_light_for_thin_caret(
+            &mut self.glow_scratch,
+            thin.zip(under),
+            geom,
+            glow_cfg.style,
+        );
+        let glow_fp = glow_fp ^ held.rotate_left(29);
         let momentum_fill = match (momentum_frame.fill, sparkle_paper_gold) {
             // The gold caret keeps the page bar, deepened in its hue.
             (Some(fill), Some(_)) => Some(crate::color_math::floor_contrast_keeping_hue(
@@ -1673,11 +2009,20 @@ impl CursorFx {
                 .wrapping_add(u64::from(owned.fill) | (1 << 32)),
             None => glow_fp,
         };
+        // The thin caret's colour, lifted in lightness to read against its cell's light.
+        let thin_fill = self
+            .glow
+            .thin_caret_fill(block_fill.map_or(f.live_cursor, |owned| owned.fill));
+        let glow_fp = match thin_fill {
+            Some(fill) => glow_fp.rotate_left(11) ^ (u64::from(fill) | (1 << 33)),
+            None => glow_fp,
+        };
         CursorFxFrame {
             glow_fp,
             trail_fp,
             trail_color: trail_cfg.color,
             block_fill,
+            thin_fill,
             bolt_cursor: bolt_cursor && !bolt_down,
             twinkle_cursor: twinkle_cursor || bolt_down,
             momentum_steady,

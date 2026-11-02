@@ -15,10 +15,29 @@ struct Fixture {
 
 impl Fixture {
     fn new(label: &str) -> Self {
+        // Ordinary placement needs an ordinary workspace even when TMPDIR is a .noindex lane.
+        // The shared-root temporary-directory policy keeps this private scratch under .ubd.
+        #[cfg(target_os = "macos")]
+        let dir = crate::testdir::dir_in(Path::new("/tmp"), label);
+        #[cfg(not(target_os = "macos"))]
         let dir = crate::testdir::dir(label);
         let root = std::fs::canonicalize(&*dir).unwrap();
         let home = root.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        // Private whatever the umask, as macOS makes a home's `Library` and its `Caches`.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(home.join("Library/Caches"))
+                .unwrap();
+        }
+        #[cfg(not(unix))]
         std::fs::create_dir_all(home.join("Library/Caches")).unwrap();
+        // As the shim's observed call lays them before any build makes the shared cache.
+        registered::lay_shared(&home);
         Self {
             _dir: dir,
             root,
@@ -67,7 +86,15 @@ fn rust(
         Some(BuildDir::TrustEnv(dir)) => std::iter::once(format!("env={dir}"))
             .chain(args.iter().cloned())
             .collect(),
-        _ => with_build_dir(args, tool, &m).unwrap_or_else(|| args.to_vec()),
+        _ => match with_build_dir(args, tool, &m) {
+            Some(placed) => loses_config(args, tool)
+                .then(|| directory_from_placed_args(&placed).map(|dir| format!("env={dir}")))
+                .flatten()
+                .into_iter()
+                .chain(placed.iter().cloned())
+                .collect(),
+            None => args.to_vec(),
+        },
     }
 }
 
@@ -78,6 +105,10 @@ enum Want<'a> {
     Cache,
     Target(&'a str),
     Trust(&'a str),
+    /// [`Want::Cache`] for a frontend that loses the `--config` ([`loses_config`]), exported too.
+    CacheHanded,
+    /// [`Want::Target`] for a frontend that loses the `--config`, exported too.
+    TargetHanded(&'a str),
 }
 
 #[cfg(unix)]
@@ -123,11 +154,18 @@ fn sh(
     env: &HashMap<&str, String>,
     args: &[String],
 ) -> Vec<String> {
+    // Each export the block made: any value the variable has that the row's own environment
+    // did not give it.
+    let exported = if env.contains_key(BUILD_DIR_ENV) {
+        ""
+    } else {
+        "[ -z \"${CARGO_BUILD_BUILD_DIR+1}\" ] || printf 'env=%s\\n' \"$CARGO_BUILD_BUILD_DIR\"\n"
+    };
     let mut cmd = aterm_uds::spawnfd::command(shell[0]);
     cmd.args(&shell[1..])
         .arg("-c")
         .arg(format!(
-            "{}[ -z \"$__atb_D\" ] || [ -z \"$__atb_e\" ] || printf 'env=%s\\n' \"$CARGO_BUILD_BUILD_DIR\"\n[ $# -eq 0 ] || printf '%s\\n' \"$@\"",
+            "{}{exported}[ $# -eq 0 ] || printf '%s\\n' \"$@\"",
             block(tool)
         ))
         .arg("sh")
@@ -185,6 +223,16 @@ fn check_tool<'a>(
         Want::Cache => vec!["--config".to_owned(), f.value()],
         Want::Target(dir) => vec!["--config".to_owned(), format!("build.build-dir='{dir}'")],
         Want::Trust(dir) => vec![format!("env={dir}")],
+        Want::CacheHanded => vec![
+            format!("env={}", directory_from_config(&f.value()).unwrap()),
+            "--config".to_owned(),
+            f.value(),
+        ],
+        Want::TargetHanded(dir) => vec![
+            format!("env={dir}"),
+            "--config".to_owned(),
+            format!("build.build-dir='{dir}'"),
+        ],
     };
     let want: Vec<String> = first.into_iter().chain(args.iter().cloned()).collect();
     assert_eq!(
@@ -294,6 +342,103 @@ fn a_test_run_gets_the_quiet_tmpdir_once_it_is_this_users() {
     }
 }
 
+/// THE SHIM RAISES A LOW SOFT DESCRIPTOR LIMIT to the floor its stages need
+/// (4096, capped at the hard limit) and never lowers one: a test binary's
+/// threads pass a stock shell's 256 together, so without this a direct
+/// `targo test` fails `Too many open files` on the caller's limit alone.
+/// NEGATIVE CONTROL: a soft limit already past the floor stands as it was.
+#[cfg(unix)]
+#[test]
+fn the_shim_raises_a_low_soft_descriptor_limit_and_never_lowers_one() {
+    let f = Fixture::new("build-cache-nofile");
+    let ws = f.dir("home/ws");
+    let outside = f.dir("elsewhere/lint");
+    let run = |shell: &[&str],
+               tool: Tool,
+               cwd: &std::path::Path,
+               soft: u64,
+               hard: Option<u64>,
+               verb: &str|
+     -> (String, String, String) {
+        let setup = hard.map_or_else(String::new, |hard| {
+            format!("ulimit -Hn {hard} 2>/dev/null; ")
+        });
+        let out = aterm_uds::spawnfd::command(shell[0])
+            .args(&shell[1..])
+            .arg("-c")
+            .arg(format!(
+                "{setup}ulimit -Sn {soft} 2>/dev/null; __s0=$(ulimit -Sn); {}printf '%s %s %s' \
+                 \"$__s0\" \"$(ulimit -Sn)\" \"$(ulimit -Hn)\"",
+                block(tool)
+            ))
+            .arg("sh")
+            .arg("--unverified")
+            .arg(verb)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &f.home)
+            .env("PWD", cwd)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success() && out.stderr.is_empty(),
+            "{shell:?}: {out:?}"
+        );
+        let words: Vec<String> = String::from_utf8(out.stdout)
+            .unwrap()
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(words.len(), 3, "{shell:?}: {words:?}");
+        (words[0].clone(), words[1].clone(), words[2].clone())
+    };
+    let want = |before: &str, hard: &str| -> Option<u64> {
+        let before: u64 = before.parse().ok()?;
+        let floor = aterm_uds::spawnfd::SOFT_NOFILE_FLOOR.max(before);
+        Some(match hard.parse::<u64>() {
+            Ok(hard) => floor.min(hard),
+            Err(_) => floor,
+        })
+    };
+    let mut asserted = 0;
+    for shell in shells() {
+        // A verb that builds nothing leaves the caller's limit alone (the
+        // read that decides is a fork, paid only by verbs that need room).
+        let (before, after, _) = run(&shell, Tool::Targo, &ws, 256, None, "fmt");
+        assert_eq!(before, after, "{shell:?}: fmt raised {before} -> {after}");
+        // Outside $HOME the verb scan never runs, so a targo verb is unknown
+        // there and the limit stands; the tippy shim knows its own name
+        // without a scan and still raises.
+        let (before, after, _) = run(&shell, Tool::Targo, &outside, 256, None, "test");
+        assert_eq!(
+            before, after,
+            "{shell:?}: unscanned test raised {before} -> {after}"
+        );
+        let (before, after, hard) = run(&shell, Tool::Tippy, &outside, 256, None, "test");
+        if let Some(want) = want(&before, &hard) {
+            assert_eq!(
+                after.parse::<u64>().ok(),
+                Some(want),
+                "{shell:?}: tippy outside home: soft {before} -> {after} (hard {hard})"
+            );
+        }
+        for (soft, hard) in [(256_u64, None), (8192, None), (256, Some(1024))] {
+            let (before, after, hard) = run(&shell, Tool::Targo, &ws, soft, hard, "test");
+            let Some(want) = want(&before, &hard) else {
+                continue;
+            };
+            asserted += 1;
+            assert_eq!(
+                after.parse::<u64>().ok(),
+                Some(want),
+                "{shell:?}: soft {before} -> {after} (hard {hard})"
+            );
+        }
+    }
+    assert!(asserted > 0, "no shell rendered a numeric soft limit");
+}
+
 #[cfg(unix)]
 #[test]
 fn the_shim_and_the_rust_rule_decide_every_case_alike() {
@@ -315,9 +460,11 @@ fn the_shim_and_the_rust_rule_decide_every_case_alike() {
         &["--unverified", "build", "--config", "build.jobs=2"],
         &["--unverified", "build", "--config=build.jobs=2"],
         &["--unverified", "build", "--manifest-path", "sub/Cargo.toml"],
-        &["--unverified", "tippy", "--all-targets"],
     ] {
         check(&f, &ws, &[], args, true);
+    }
+    for args in [&["--unverified", "tippy", "--all-targets"][..], &["clippy"]] {
+        check(&f, &ws, &[], args, Want::CacheHanded);
     }
     let in_home = format!("{home}/ws/Cargo.toml");
     check(
@@ -416,7 +563,7 @@ fn the_shim_and_the_rust_rule_decide_every_case_alike() {
         ],
         &["-p", "x", "--lib"],
     ] {
-        check_tool(&f, Tool::Tippy, &ws, &[], args, true);
+        check_tool(&f, Tool::Tippy, &ws, &[], args, Want::CacheHanded);
     }
     let ws_t = format!("{}/t/build.noindex", ws.display());
     check_tool(
@@ -425,7 +572,7 @@ fn the_shim_and_the_rust_rule_decide_every_case_alike() {
         &ws,
         &[],
         &["--target-dir", "t"],
-        Want::Target(&ws_t),
+        Want::TargetHanded(&ws_t),
     );
     check_tool(
         &f,
@@ -433,7 +580,7 @@ fn the_shim_and_the_rust_rule_decide_every_case_alike() {
         &ws,
         &[("CARGO_TARGET_DIR", "/t")],
         &[],
-        Want::Target("/t/build.noindex"),
+        Want::TargetHanded("/t/build.noindex"),
     );
     check_tool(&f, Tool::Tippy, &f.dir("elsewhere/lint"), &[], &[], false);
 
@@ -544,12 +691,15 @@ fn the_shim_and_the_rust_rule_decide_every_case_alike() {
     f.file(
         "home/aliased/.cargo/config.toml",
         "alias.ship = \"run --profile gate -p aterm-release --\"\n[build]\njobs = 2\n\
-         [alias]\n# lint = \"tippy\"\nverify = \"run -q -p aterm-verify --\"\n\
+         [alias]\n# lint = \"tippy\"\ntip = \"tippy\"\nverify = \"run -q -p aterm-verify --\"\n\
          lab = [\"run\", \"-q\", \"-p\", \"aterm-lab\", \"--\"]\ntree2 = \"tree -d\"\n\
-         [env]\nfake = \"build\"\n",
+         1b = \"build\"\n[env]\nfake = \"build\"\n",
     );
     let aliased = f.dir("home/aliased/sub");
-    for verb in ["verify", "lab", "ship"] {
+    // An alias to the lint, too: cargo hands it on without the `--config`, which is its whole
+    // placement (the limit `loses_config` names). No alias's name exports, a digit-led one
+    // included: cargo runs `1b` itself and would hand the variable to its build scripts.
+    for verb in ["verify", "lab", "ship", "tip", "1b"] {
         check(&f, &aliased, &[], &["--unverified", verb, "x"], true);
     }
     for args in [
@@ -878,6 +1028,471 @@ fn the_rendered_shim_hands_targo_the_config() {
             ws.display()
         )
     );
+}
+
+/// The real shim's config survives as environment when an external dispatcher drops all
+/// global words. Its inner driver goes through another generated shim, which must not place
+/// it a second time. These are owned shell recorders, not a compiler.
+#[cfg(target_os = "macos")]
+#[test]
+fn generated_placement_survives_external_dispatch_and_nested_shims() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let f = Fixture::new("build-cache-external");
+    let ws = f.dir("home/ws");
+    let bin = f.dir("drivers");
+    let checker = bin.join("inner/targo");
+    std::fs::create_dir_all(checker.parent().unwrap()).unwrap();
+    std::fs::write(&checker, "#!/bin/sh\nprintf 'inner-dir=%s\\n' \"${CARGO_BUILD_BUILD_DIR-unset}\"\n[ $# -eq 0 ] || printf 'inner-arg=%s\\n' \"$@\"\n").unwrap();
+    let inner = f.root.join("inner-shim");
+    std::fs::write(
+        &inner,
+        crate::platform::sh_shim_content_routed(&checker, &crate::shim_env::ShimEnv::NONE, None),
+    )
+    .unwrap();
+    let driver = bin.join("targo");
+    std::fs::write(&driver, "#!/bin/sh\nprintf 'outer-dir=%s\\n' \"${CARGO_BUILD_BUILD_DIR-unset}\"\n[ $# -eq 0 ] || printf 'outer-arg=%s\\n' \"$@\"\nwhile [ $# -gt 0 ]; do case $1 in --config) shift; shift ;; --unverified) shift ;; *) break ;; esac; done\ncase ${1-} in tippy|clippy) shift; exec \"$ATPKG_TEST_INNER\" --unverified check \"$@\" ;; *) exec \"$ATPKG_TEST_INNER\" \"$@\" ;; esac\n").unwrap();
+    let direct = bin.join("targo-tippy");
+    std::fs::write(&direct, "#!/bin/sh\nprintf 'outer-dir=%s\\n' \"${CARGO_BUILD_BUILD_DIR-unset}\"\n[ $# -eq 0 ] || printf 'outer-arg=%s\\n' \"$@\"\nexec \"$ATPKG_TEST_INNER\" --unverified check \"$@\"\n").unwrap();
+    for path in [&checker, &inner, &driver, &direct] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let shim = f.root.join("outer-shim");
+    let run = |target: &Path, cwd: &Path, words: &[&str], env: &[(&str, &str)]| {
+        std::fs::write(
+            &shim,
+            crate::platform::sh_shim_content_routed(target, &crate::shim_env::ShimEnv::NONE, None),
+        )
+        .unwrap();
+        let mut command = aterm_uds::spawnfd::command("/bin/sh");
+        command
+            .arg(&shim)
+            .args(words)
+            .env_clear()
+            .env("HOME", &f.home)
+            .env("PWD", cwd)
+            .env("ATPKG_TEST_INNER", &inner)
+            .env("PATH", "/usr/bin:/bin")
+            .current_dir(cwd);
+        for (name, value) in env {
+            command.env(name, value);
+        }
+        let output =
+            aterm_uds::deadline::output_within(&mut command, aterm_spec::wait::MUST_HAPPEN)
+                .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let cache = f.value();
+    let shared = directory_from_config(&cache).unwrap();
+    let output = run(&driver, &ws, &["--unverified", "build"], &[]);
+    assert!(
+        output.contains("outer-dir=unset\n") && output.contains("inner-dir=unset\n"),
+        "a verb cargo runs itself keeps the config words, and a nested cargo inherits nothing: \
+         {output}"
+    );
+    assert!(output.contains(&format!("outer-arg={cache}\n")), "{output}");
+    let cargo_config = ws.join(".cargo");
+    std::fs::create_dir_all(&cargo_config).unwrap();
+    std::fs::write(
+        cargo_config.join("config.toml"),
+        "[alias]\nbo = \"build -q\"\n",
+    )
+    .unwrap();
+    let output = run(&driver, &ws, &["--unverified", "bo"], &[]);
+    assert!(
+        output.contains("outer-dir=unset\n") && output.contains("inner-dir=unset\n"),
+        "cargo expands an alias itself and keeps the config words: {output}"
+    );
+    assert!(output.contains(&format!("outer-arg={cache}\n")), "{output}");
+    std::fs::remove_dir_all(&cargo_config).unwrap();
+    for (target, words) in [
+        (&driver, &["--unverified", "tippy", "-p", "demo"][..]),
+        (&driver, &["clippy", "-p", "demo"][..]),
+        (&direct, &["-p", "demo"][..]),
+    ] {
+        let output = run(target, &ws, words, &[]);
+        assert!(
+            output.contains(&format!("outer-dir={shared}\n")),
+            "{output}"
+        );
+        assert!(
+            output.contains(&format!("inner-dir={shared}\n")),
+            "{output}"
+        );
+        assert!(output.contains(&format!("outer-arg={cache}\n")), "{output}");
+        assert_eq!(
+            output.matches("inner-arg=--config\n").count(),
+            usize::from(target == &direct),
+            "the inner shim must not add placement again: {output}"
+        );
+    }
+    for (target, words, env, expected) in [
+        (
+            &driver,
+            &["--unverified", "tippy", "--target-dir", "custom"][..],
+            vec![],
+            format!("{}/custom/build.noindex", ws.display()),
+        ),
+        (
+            &driver,
+            &["--unverified", "tippy"][..],
+            vec![("CARGO_TARGET_DIR", "custom")],
+            format!("{}/custom/build.noindex", ws.display()),
+        ),
+        (
+            &driver,
+            &["trust", "check"][..],
+            vec![],
+            "{workspace-root}/target/build.noindex".into(),
+        ),
+        (
+            &driver,
+            &["--unverified", "tippy"][..],
+            vec![("CARGO_BUILD_BUILD_DIR", "/explicit")],
+            "/explicit".into(),
+        ),
+        (
+            &driver,
+            &["--unverified", "tippy"][..],
+            vec![("CARGO_BUILD_BUILD_DIR", "")],
+            "".into(),
+        ),
+        (
+            &direct,
+            &["--config", "build.build-dir='user'"][..],
+            vec![],
+            "unset".into(),
+        ),
+        (
+            &driver,
+            &["--unverified", "tippy", "--target-dir", "chosen.noindex"][..],
+            vec![],
+            "unset".into(),
+        ),
+        (&driver, &["metadata"][..], vec![], "unset".into()),
+    ] {
+        let output = run(target, &ws, words, &env);
+        assert!(
+            output.contains(&format!("outer-dir={expected}\n")),
+            "{words:?}: {output}"
+        );
+        assert!(
+            output.contains(&format!("inner-dir={expected}\n")),
+            "{words:?}: {output}"
+        );
+    }
+    let outside = f.dir("outside");
+    let output = run(&driver, &outside, &["--unverified", "tippy"], &[]);
+    assert!(output.contains("inner-dir=unset\n"), "{output}");
+    f.file("home/ws/.cargo/config.toml", "[build]\nbuild-dir='user'\n");
+    let output = run(&driver, &ws, &["--unverified", "tippy"], &[]);
+    assert!(
+        output.contains("outer-dir=unset\n") && output.contains("inner-dir=unset\n"),
+        "{output}"
+    );
+}
+
+/// THE RENDERED HOP (BUILD-ADMIT): a macOS `targo` shim laid beside an atpkg runs its front once
+/// the block has placed the build, handing it the program, the placed words and what the block
+/// did (`config`, `env` for the Trust lane's export, `-` where it placed nothing), and every
+/// reader still reads the shim's target from its one `exec '` line, its last. NEGATIVE CONTROL:
+/// the same shim rendered with no atpkg beside it (none stamped) has no hop, and runs the target
+/// with the placed words itself.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_rendered_hop_hands_its_front_the_placed_call() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let f = Fixture::new("build-cache-hop");
+    let ws = f.dir("home/ws");
+    let bin = f.dir("store/bin");
+    std::os::unix::fs::symlink("/bin/echo", bin.join("targo")).unwrap();
+    let helper = f.dir("pkg").join("atpkg");
+    std::fs::write(
+        &helper,
+        format!(
+            "#!/bin/sh\n[ \"$*\" = '__build_admit --capabilities' ] && {{ echo {}; exit 0; }}\n\
+             printf '%s\\n' \"$@\" \"build-dir=${{CARGO_BUILD_BUILD_DIR-unset}}\"\n",
+            crate::build_admit::HOP_CAPABILITY
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let shim = f.dir("prefix/bin").join("targo");
+    let marker = aterm_json::to_string(helper.to_string_lossy().as_ref()).unwrap();
+    std::fs::write(&shim, format!("# atpkg cache helper {marker}\n")).unwrap();
+    let target = bin.join("targo");
+    let none = crate::shim_env::ShimEnv::NONE;
+    let body = crate::platform::shim_executable_to_env(&shim, &target, &none)
+        .unwrap()
+        .body;
+    let body = String::from_utf8(body).unwrap();
+    std::fs::write(&shim, &body).unwrap();
+    assert_eq!(
+        crate::platform::parse_sh_shim_target(&body).as_deref(),
+        Some(target.as_path())
+    );
+    let execs: Vec<&str> = body
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("exec '"))
+        .collect();
+    assert_eq!(execs.len(), 1, "{body}");
+    assert!(body.ends_with(&format!("{}\n", execs[0])), "{body}");
+    let run = |cwd: &Path, args: &[&str]| {
+        let out = aterm_uds::spawnfd::command("/bin/sh")
+            .arg(&shim)
+            .args(args)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &f.home)
+            .env("PWD", cwd)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let front = |placed: &str, rest: &[&str], dir: &str| {
+        let mut w = vec![
+            "__build_admit".to_owned(),
+            "--shim".to_owned(),
+            "targo".to_owned(),
+            placed.to_owned(),
+            target.display().to_string(),
+        ];
+        w.extend(rest.iter().map(|r| (*r).to_owned()));
+        w.push(format!("build-dir={dir}"));
+        w.join("\n") + "\n"
+    };
+    assert_eq!(
+        run(&ws, &["--unverified", "test", "-q"]),
+        front(
+            "config",
+            &["--config", &f.value(), "--unverified", "test", "-q"],
+            "unset"
+        )
+    );
+    assert_eq!(
+        run(&ws, &["--unverified", "tippy"]),
+        front(
+            "config",
+            &["--config", &f.value(), "--unverified", "tippy"],
+            directory_from_config(&f.value()).unwrap()
+        )
+    );
+    assert_eq!(
+        run(&ws, &["trust", "check"]),
+        front(
+            "env",
+            &["trust", "check"],
+            "{workspace-root}/target/build.noindex"
+        )
+    );
+    let outside = f.dir("elsewhere");
+    assert_eq!(
+        run(&outside, &["--unverified", "test"]),
+        front("-", &["--unverified", "test"], "unset")
+    );
+    let plain = f.dir("plain/bin").join("targo");
+    let body = crate::platform::shim_executable_to_env(&plain, &target, &none)
+        .unwrap()
+        .body;
+    assert!(!String::from_utf8(body).unwrap().contains("__build_admit"));
+}
+
+/// THE FRONT THE RENDERED HOP EXECS IS NAMED BY ITS TARGET: the argv a macOS `targo` shim's hop
+/// hands its helper (`$0` and every word, as exec'd), in each placement, reads through
+/// [`aterm_uds::build_front::front`] as the store's `targo` on the typed words, which every
+/// reader names a front by while it waits. NEGATIVE CONTROL: the helper's own capability
+/// question, which the renderer asked of it, and the same helper's registration call, which a
+/// shim laid for an older helper makes, read as no front.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_rendered_hops_front_is_named_by_its_target() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let f = Fixture::new("build-cache-hop-name");
+    let ws = f.dir("home/ws");
+    let bin = f.dir("store/bin");
+    std::os::unix::fs::symlink("/bin/echo", bin.join("targo")).unwrap();
+    let helper = f.dir("pkg").join("atpkg");
+    let log = f.root.join("argv");
+    std::fs::write(
+        &helper,
+        format!(
+            "#!/bin/sh\nprintf '%s\\0' \"$0\" \"$@\" > {}\n\
+             [ \"$*\" = '__build_admit --capabilities' ] && echo {}\nexit 0\n",
+            crate::platform::sh_quote_str(&log.to_string_lossy()),
+            crate::build_admit::HOP_CAPABILITY
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let shim = f.dir("prefix/bin").join("targo");
+    let marker = aterm_json::to_string(helper.to_string_lossy().as_ref()).unwrap();
+    std::fs::write(&shim, format!("# atpkg cache helper {marker}\n")).unwrap();
+    let target = bin.join("targo");
+    let none = crate::shim_env::ShimEnv::NONE;
+    let argv = || -> Vec<OsString> {
+        std::fs::read(&log)
+            .unwrap()
+            .split(|b| *b == 0)
+            .filter(|w| !w.is_empty())
+            .map(|w| OsString::from(String::from_utf8(w.to_vec()).unwrap()))
+            .collect()
+    };
+    let body = crate::platform::shim_executable_to_env(&shim, &target, &none)
+        .unwrap()
+        .body;
+    let asked = argv();
+    assert_eq!(
+        asked[1..],
+        [
+            OsString::from("__build_admit"),
+            OsString::from("--capabilities")
+        ],
+        "the renderer asked the helper"
+    );
+    assert!(aterm_uds::build_front::front(&asked).is_none());
+    std::fs::write(&shim, &body).unwrap();
+    let outside = f.dir("elsewhere");
+    for (cwd, typed, placed) in [
+        (&ws, &["--unverified", "build", "-p", "x"][..], "config"),
+        (&ws, &["trust", "check"], "env"),
+        (&outside, &["--unverified", "test"], "-"),
+    ] {
+        let out = aterm_uds::spawnfd::command("/bin/sh")
+            .arg(&shim)
+            .args(typed)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &f.home)
+            .env("PWD", cwd)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let words = argv();
+        assert_eq!(
+            words[0].as_os_str(),
+            helper.as_os_str(),
+            "argv[0] is the helper's path"
+        );
+        assert_eq!(words[4], OsString::from(placed), "{words:?}");
+        let front = aterm_uds::build_front::front(&words).expect("a front");
+        assert_eq!(front.target, target.as_os_str());
+        assert_eq!(
+            std::path::Path::new(front.target).file_name(),
+            Some(std::ffi::OsStr::new("targo"))
+        );
+        assert!(
+            front
+                .args
+                .ends_with(&typed.iter().map(OsString::from).collect::<Vec<_>>()),
+            "{words:?}"
+        );
+    }
+    let registration = [
+        helper.clone().into_os_string(),
+        OsString::from(crate::build_cache::registered::REGISTER_VERB),
+        OsString::from("targo"),
+        OsString::from("--unverified"),
+        OsString::from("build"),
+    ];
+    assert!(aterm_uds::build_front::front(&registration).is_none());
+}
+
+/// A HELPER THAT DOES NOT SPEAK THE HOP KEEPS THE REGISTRATION CALL'S FORM: a macOS `targo` shim
+/// whose standing helper advertises the registration capability and the older hop-v1, but
+/// refuses the newer front, is laid with the registration call ahead of its block and no hop.
+/// Its default call runs the target with its words once registration succeeds. NEGATIVE CONTROL:
+/// the hop rendered for that helper anyway, as the renderer laid it before it asked, ends at exit
+/// 2 and never runs the target; and (by hand: `helper_speaks_hop` answering yes for every helper)
+/// the laid shim carries the hop and the test fails.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_helper_that_does_not_speak_the_hop_keeps_the_registration_call() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let f = Fixture::new("build-cache-old-helper");
+    let bin = f.dir("store/bin");
+    std::os::unix::fs::symlink("/bin/echo", bin.join("targo")).unwrap();
+    let helper = f.dir("pkg").join("atpkg");
+    std::fs::write(
+        &helper,
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n\
+             {verb}) [ \"$2\" = --capabilities ] && echo {cap}; exit 0 ;;\n\
+             __build_admit) [ \"$2\" = --capabilities ] && echo 'aterm-build-admit-hop-v1' && exit 0; exit 2 ;;\n\
+             *) echo \"atpkg: unknown verb '$1'\" >&2; exit 2 ;;\n\
+             esac\n",
+            verb = crate::build_cache::registered::REGISTER_VERB,
+            cap = crate::build_cache::registered::REGISTER_CAPABILITY,
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(!crate::build_cache::registered::helper_speaks_hop(&helper));
+    let shim = f.dir("prefix/bin").join("targo");
+    let marker = aterm_json::to_string(helper.to_string_lossy().as_ref()).unwrap();
+    std::fs::write(&shim, format!("# atpkg cache helper {marker}\n")).unwrap();
+    let target = bin.join("targo");
+    let none = crate::shim_env::ShimEnv::NONE;
+    let body = crate::platform::shim_executable_to_env(&shim, &target, &none)
+        .unwrap()
+        .body;
+    let body = String::from_utf8(body).unwrap();
+    assert!(
+        body.contains(crate::build_cache::registered::REGISTER_VERB),
+        "{body}"
+    );
+    assert!(!body.contains("__build_admit"), "{body}");
+    assert_eq!(
+        crate::platform::parse_sh_shim_target(&body).as_deref(),
+        Some(target.as_path())
+    );
+    let run = |body: &str| {
+        std::fs::write(&shim, body).unwrap();
+        aterm_uds::spawnfd::command("/bin/sh")
+            .arg(&shim)
+            .args(["--unverified", "check"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &f.home)
+            .current_dir(&f.home)
+            .output()
+            .unwrap()
+    };
+    let out = run(&body);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "--unverified check\n");
+    let block = crate::build_cache::shim_block("targo").unwrap();
+    let plain = body.replacen(
+        &crate::build_cache::registered::shim_call(&helper, "targo"),
+        "",
+        1,
+    );
+    let at = plain.find(&block).unwrap() + block.len();
+    let mut hopped = plain.clone();
+    hopped.insert_str(
+        at,
+        &crate::build_cache::registered::shim_hop(
+            &helper,
+            "targo",
+            &crate::platform::sh_shim_quote(&target),
+            None,
+        ),
+    );
+    let out = run(&hopped);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert!(out.stdout.is_empty(), "the target never ran: {out:?}");
 }
 
 #[cfg(unix)]
@@ -1249,11 +1864,12 @@ pub(super) const DENY_DELETE: &str = "group:everyone deny delete";
 #[cfg(target_os = "macos")]
 pub(super) fn acl(path: &Path, aces: &[&str]) {
     for ace in aces {
-        let status = aterm_uds::spawnfd::command("/bin/chmod")
-            .args(["-h", "+a", ace])
-            .arg(path)
-            .status()
-            .expect("chmod +a");
+        let status =
+            aterm_uds::spawnfd::command(aterm_uds::deadline::stand_in(Path::new("/bin/chmod")))
+                .args(["-h", "+a", ace])
+                .arg(path)
+                .status()
+                .expect("chmod +a");
         assert!(
             status.success(),
             "chmod +a {ace} {}: {status}",
@@ -1265,7 +1881,7 @@ pub(super) fn acl(path: &Path, aces: &[&str]) {
 /// Whether `path`'s own ACL holds `ace` (`ls -led`).
 #[cfg(target_os = "macos")]
 pub(super) fn holds_ace(path: &Path, ace: &str) -> bool {
-    let out = aterm_uds::spawnfd::command("/bin/ls")
+    let out = aterm_uds::spawnfd::command(aterm_uds::deadline::stand_in(Path::new("/bin/ls")))
         .arg("-led")
         .arg(path)
         .output()
@@ -1296,6 +1912,18 @@ enum Keep {
     Theirs,
     #[cfg(target_os = "macos")]
     Flagged,
+}
+
+#[cfg(unix)]
+impl Keep {
+    /// Why an entry kept so stays ([`remove::Why`]).
+    const fn why(self) -> remove::Why {
+        match self {
+            Self::Theirs => remove::Why::AnotherUser,
+            #[cfg(target_os = "macos")]
+            Self::Flagged => remove::Why::StillRefusing,
+        }
+    }
 }
 
 /// A file a test keeps from going ([`Keep`]), let go when dropped, so a failed test leaves its
@@ -1422,7 +2050,7 @@ fn a_removal_cut_short(keep: Keep) {
     );
     assert_eq!(
         remove::named(&stage, stayed).first,
-        [PathBuf::from("debug/deps/stuck")]
+        [(PathBuf::from("debug/deps/stuck"), keep.why())]
     );
     assert!(
         reclaim(&root, home, SystemTime::now()).is_empty(),
@@ -1586,6 +2214,73 @@ fn a_stage_keeping_another_users_entry_costs_only_itself() {
     a_stuck_stage_costs_only_itself(Keep::Theirs);
 }
 
+/// THE DRY PLAN FORECASTS WHAT OF A STAGE WILL STAY: of two stages an earlier pass left in one
+/// mirror folder, the one holding a file read as another user's (the remover's seam: a removal
+/// leaves it as it is) is planned as unfinished with that file named under it for that reason,
+/// read and never acted on (the file is still there, and the plan asks nothing); the one holding
+/// only this user's entries is planned and worded as an unfinished stage alone, as before the
+/// forecast. NEGATIVE CONTROL: the other user's file is there to be named, a plan without the
+/// forecast saying no more of its stage than of the other.
+#[cfg(unix)]
+#[test]
+fn a_dry_plan_forecasts_what_of_a_stage_will_stay() {
+    let f = Fixture::new("build-cache-forecast");
+    let root = cache_root(&f.home);
+    let leaf = build_dir(&root, &f.root.join("home/ws"));
+    let (stuck, clean) = (
+        leaf.with_file_name(DOOMED),
+        leaf.with_file_name(format!("{DOOMED}-1")),
+    );
+    std::fs::create_dir_all(clean.join("debug/deps")).unwrap();
+    std::fs::write(clean.join("debug/deps/x"), b"x").unwrap();
+    std::fs::create_dir_all(stuck.join("debug/build")).unwrap();
+    std::fs::write(stuck.join("debug/build/spare"), b"s").unwrap();
+    let held = stuck.join("debug/deps/held");
+    let _kept = Kept::lay(&held, Keep::Theirs);
+
+    let planned = plan(&root, Some(&f.home), SystemTime::now(), RECLAIM_GONE, None);
+    assert_eq!(
+        planned.iter().map(|p| (&p.path, p.why)).collect::<Vec<_>>(),
+        [(&stuck, Unused::Unfinished), (&clean, Unused::Unfinished)],
+        "{planned:#?}"
+    );
+    let stays = planned[0].stays.clone().expect("a forecast of the stage");
+    assert_eq!(
+        (stays.count, stays.first, stays.whole),
+        (
+            1,
+            vec![(PathBuf::from("debug/deps/held"), remove::Why::AnotherUser)],
+            true
+        )
+    );
+    assert_eq!(std::fs::read(&held).unwrap(), b"held", "the plan acted");
+    let words = crate::cli::cache_plan_line(&planned[0]);
+    let said = planned[0].stays.as_ref().and_then(|f| f.words(&stuck));
+    assert_eq!(
+        words,
+        format!(
+            "{}; {}",
+            crate::cli::cache_plan_words(Unused::Unfinished),
+            said.clone().unwrap_or_default()
+        )
+    );
+    assert!(
+        said.is_some_and(
+            |w| w.contains("debug/deps/held") && w.contains(&remove::Why::AnotherUser.words(&held))
+        ),
+        "{words}"
+    );
+
+    let none = planned[1].stays.clone().expect("a forecast of the stage");
+    assert_eq!((none.count, none.whole), (0, true), "{none:?}");
+    assert_eq!(none.words(&clean), None);
+    assert_eq!(
+        crate::cli::cache_plan_line(&planned[1]),
+        crate::cli::cache_plan_words(Unused::Unfinished),
+        "a stage with nothing to stay is worded as before"
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn a_stage_keeping_a_flagged_entry_costs_only_itself() {
@@ -1715,11 +2410,13 @@ fn a_leaf_that_will_not_move_is_neither_planned_nor_asked_for() {
         fn drop(&mut self) {
             for at in &self.0 {
                 let _ = crate::platform::set_file_flags(at, 0);
-                let _ = aterm_uds::spawnfd::command("/bin/chmod")
-                    .arg("-N")
-                    .arg(at)
-                    .stderr(aterm_uds::spawnfd::Stdio::null())
-                    .status();
+                let _ = aterm_uds::spawnfd::command(aterm_uds::deadline::stand_in(Path::new(
+                    "/bin/chmod",
+                )))
+                .arg("-N")
+                .arg(at)
+                .stderr(aterm_uds::spawnfd::Stdio::null())
+                .status();
             }
         }
     }
@@ -1759,11 +2456,12 @@ fn a_leaf_that_will_not_move_is_neither_planned_nor_asked_for() {
     }
 
     crate::platform::set_file_flags(&flagged, 0).unwrap();
-    let cleared = aterm_uds::spawnfd::command("/bin/chmod")
-        .arg("-N")
-        .arg(&denied)
-        .status()
-        .unwrap();
+    let cleared =
+        aterm_uds::spawnfd::command(aterm_uds::deadline::stand_in(Path::new("/bin/chmod")))
+            .arg("-N")
+            .arg(&denied)
+            .status()
+            .unwrap();
     assert!(cleared.success());
     let mut planned: Vec<PathBuf> = plan(&root, home, SystemTime::now(), RECLAIM_GONE, None)
         .into_iter()
@@ -1823,6 +2521,286 @@ fn a_leaf_that_cannot_be_staged_is_neither_planned_nor_asked_for() {
         std::slice::from_ref(&leaf)
     );
     assert!(!leaf.exists());
+}
+
+/// A RENAME REFUSED ONCE THE INTENT IS ON RECORD CLOSES THAT INTENT (DISK4's residual): a gone
+/// workspace's build directory passes the check, its intent is asked and put on record, and
+/// only then, before its rename aside ([`seams::on_staging`]), is the rename made to fail: its
+/// folder set to take no new name (0o555, every Unix, not as root), or, on macOS, the leaf
+/// flagged `uchg` (which its owner may set). The pass returns it refused by the rename's error
+/// kind, 0 bytes gone, and it stays whole; [`reclaim`] returns nothing of it; a later pass with
+/// the refusal cleared takes it. NEGATIVE CONTROL: without the outcome, the pass returns nothing
+/// for the intent it put on record.
+#[cfg(unix)]
+#[test]
+fn a_rename_refused_after_its_intent_closes_that_intent_with_nothing_gone() {
+    /// Forgets the call and undoes the refusal when dropped, so a failed test leaves its scratch
+    /// removable.
+    struct Undo(PathBuf, fn(&Path));
+    impl Drop for Undo {
+        fn drop(&mut self) {
+            seams::clear();
+            (self.1)(&self.0);
+        }
+    }
+    type Refuse = (&'static str, fn(&Path), fn(&Path));
+    let mut refusals: Vec<Refuse> = Vec::new();
+    if crate::platform::our_uid() != 0 {
+        refusals.push((
+            "a folder that takes no new name",
+            |leaf| mode(leaf.parent().unwrap(), 0o555),
+            |leaf| {
+                use std::os::unix::fs::PermissionsExt as _;
+                let _ = std::fs::set_permissions(
+                    leaf.parent().unwrap(),
+                    std::fs::Permissions::from_mode(0o755),
+                );
+            },
+        ));
+    }
+    #[cfg(target_os = "macos")]
+    refusals.push((
+        "uchg",
+        |leaf| crate::platform::set_file_flags(leaf, libc::UF_IMMUTABLE).unwrap(),
+        |leaf| {
+            let _ = crate::platform::set_file_flags(leaf, 0);
+        },
+    ));
+    assert!(!refusals.is_empty(), "no refusal this user can set");
+    let f = Fixture::new("build-cache-refused-rename");
+    let root = cache_root(&f.home);
+    let home = Some(f.home.as_path());
+    let refused = Unused::Refused {
+        by: Refusal::Rename(std::io::ErrorKind::PermissionDenied),
+    };
+    for (n, (what, refuse, undo)) in refusals.into_iter().enumerate() {
+        let leaf = lay(&root, &f.root.join(format!("home/removed-{n}")), 2 * DAY);
+        let undone = Undo(leaf.clone(), undo);
+        seams::on_staging(refuse);
+        assert!(
+            reclaim(&root, home, SystemTime::now()).is_empty(),
+            "{what}: nothing went"
+        );
+        undo(&leaf);
+        let mut asked = Vec::new();
+        let went = reclaim_watched(
+            &root,
+            home,
+            SystemTime::now(),
+            RECLAIM_GONE,
+            None,
+            &mut |p, _| {
+                asked.push(p.to_path_buf());
+                true
+            },
+        );
+        assert_eq!(asked, std::slice::from_ref(&leaf), "{what}: its intent");
+        assert_eq!(went, [(leaf.clone(), refused)], "{what}: its outcome");
+        assert!(leaf.join("debug/deps/x").is_file(), "{what}: whole");
+        assert!(
+            stages_in(leaf.parent().unwrap(), OsStr::new(DOOMED)).is_empty(),
+            "{what}: never staged"
+        );
+        drop(undone);
+        assert_eq!(
+            reclaim(&root, home, SystemTime::now()),
+            std::slice::from_ref(&leaf),
+            "{what}: the next pass takes it"
+        );
+        assert!(!leaf.exists(), "{what}");
+    }
+}
+
+/// A REMOVAL STOPPED ONCE ITS ENTRY IS STAGED CLOSES AS ITS STAGE: a gone workspace's build
+/// directory whose rename aside went through, and that a process comes to use once its intent is
+/// on record (the fence reports it in its stage), is returned as that stage with nothing of it
+/// gone ([`Refusal::Staged`]), never as the leaf it was asked for, which no longer holds it; the
+/// stage holds it all. A stage an earlier pass left, stopped the same way after its intent, is
+/// returned as that stage, `Staged`; and the next pass, the process gone, finishes it
+/// ([`Unused::Unfinished`]). NEGATIVE CONTROL: the move not marked on the open intent
+/// ([`Intents::moved`]), the pass returns the gone leaf as [`Refusal::Stopped`].
+#[cfg(unix)]
+#[test]
+fn a_removal_stopped_once_staged_closes_as_its_stage() {
+    let f = Fixture::new("build-cache-stopped-staged");
+    let root = cache_root(&f.home);
+    let leaf = lay(&root, &f.root.join("home/removed"), 2 * DAY);
+    let dir = leaf.parent().unwrap().to_path_buf();
+    let (held, asked) = (std::cell::Cell::new(true), std::cell::Cell::new(false));
+    // A process in a stage of the leaf's folder, from the moment an intent is on record.
+    let processes = |dirs: &[PathBuf], _: &[u32]| {
+        let users = dirs
+            .iter()
+            .filter(|d| {
+                held.get()
+                    && asked.get()
+                    && d.file_name()
+                        .is_some_and(|name| is_stage(name, OsStr::new(DOOMED)))
+            })
+            .map(|stage| aterm_uds::holders::PathUse {
+                pid: 34,
+                how: "cwd",
+                path: stage.join("debug"),
+            })
+            .collect();
+        Ok(aterm_uds::holders::PathScan {
+            users,
+            ..aterm_uds::holders::PathScan::default()
+        })
+    };
+    let fence = fence::Fence::new(&processes);
+    let pass = || {
+        asked.set(false);
+        reclaim_watched_on(
+            &root,
+            Some(&f.home),
+            SystemTime::now(),
+            RECLAIM_GONE,
+            None,
+            &mut |_, _| {
+                asked.set(true);
+                true
+            },
+            &fence,
+        )
+    };
+    let staged = Unused::Refused {
+        by: Refusal::Staged,
+    };
+    let went = pass();
+    let stages = stages_in(&dir, OsStr::new(DOOMED));
+    assert_eq!(stages.len(), 1, "moved aside: {went:?}");
+    let stage = stages[0].clone();
+    assert_eq!(
+        went,
+        [(stage.clone(), staged)],
+        "its stage, nothing of it gone"
+    );
+    assert!(!leaf.exists(), "the leaf no longer holds it");
+    assert!(
+        stage.join("debug/deps/x").is_file(),
+        "the stage holds it all"
+    );
+    assert_eq!(
+        pass(),
+        [(stage.clone(), staged)],
+        "a stage left, stopped after its intent, is that stage"
+    );
+    held.set(false);
+    assert_eq!(
+        pass(),
+        [(stage.clone(), Unused::Unfinished)],
+        "the next pass finishes it"
+    );
+    assert!(!stage.exists());
+}
+
+/// AN IMMUTABLE LEAF IS NEITHER PLANNED NOR ASKED FOR, ON LINUX: a gone workspace's build
+/// directory in a folder that takes new names, whose inode `statx` reads as immutable
+/// (`STATX_ATTR_IMMUTABLE`, set and reported; the stand-in `platform::seams`, since `chattr +i`
+/// needs `CAP_LINUX_IMMUTABLE`), is not listed by the plan, its intent is never asked, and it
+/// stays whole; read with `statx` unanswered (`ENOSYS`), it is read as before, by its folder's
+/// write bit, and is planned and goes. As root, where the scratch's filesystem takes it, the
+/// real `chattr +i` as well, under a guard that clears it. NEGATIVE CONTROL: the attribute read
+/// taken out of `may_take_name`, the immutable leaf is planned.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[test]
+fn an_immutable_leaf_is_neither_planned_nor_asked_for_on_linux() {
+    use crate::platform::seams;
+    struct Clear(Option<PathBuf>);
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            seams::clear();
+            if let Some(leaf) = &self.0 {
+                let _ = aterm_uds::spawnfd::command("chattr")
+                    .arg("-i")
+                    .arg(leaf)
+                    .stderr(aterm_uds::spawnfd::Stdio::null())
+                    .status();
+            }
+        }
+    }
+    let f = Fixture::new("build-cache-immutable");
+    let root = cache_root(&f.home);
+    let home = Some(f.home.as_path());
+    let planned = |root: &Path| -> Vec<PathBuf> {
+        plan(root, home, SystemTime::now(), RECLAIM_GONE, None)
+            .into_iter()
+            .map(|p| p.path)
+            .collect()
+    };
+    let leaf = lay(&root, &f.root.join("home/removed"), 2 * DAY);
+    let mut clear = Clear(None);
+    seams::attributes_of(&leaf, Some(seams::IMMUTABLE));
+    assert!(crate::platform::dir_writable_by_caller(
+        leaf.parent().unwrap()
+    ));
+    assert!(
+        planned(&root).is_empty(),
+        "an immutable leaf is not planned"
+    );
+    let mut asked = Vec::new();
+    let went = reclaim_watched(
+        &root,
+        home,
+        SystemTime::now(),
+        RECLAIM_GONE,
+        None,
+        &mut |p, w| {
+            asked.push((p.to_path_buf(), w));
+            true
+        },
+    );
+    assert!(went.is_empty() && asked.is_empty(), "{went:?} {asked:?}");
+    assert!(leaf.join("debug/deps/x").is_file());
+
+    seams::attributes_of(&leaf, None);
+    assert_eq!(
+        planned(&root),
+        std::slice::from_ref(&leaf),
+        "statx unanswered"
+    );
+    assert_eq!(
+        reclaim(&root, home, SystemTime::now()),
+        std::slice::from_ref(&leaf)
+    );
+    assert!(!leaf.exists());
+    seams::clear();
+
+    if crate::platform::our_uid() != 0 {
+        return;
+    }
+    let leaf = lay(&root, &f.root.join("home/removed-real"), 2 * DAY);
+    clear.0 = Some(leaf.clone());
+    let set = aterm_uds::spawnfd::command("chattr")
+        .arg("+i")
+        .arg(&leaf)
+        .stderr(aterm_uds::spawnfd::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !set {
+        eprintln!("chattr +i not taken here: the real leg is not run");
+        return;
+    }
+    assert!(planned(&root).is_empty(), "chattr +i: not planned");
+    let mut asked = Vec::new();
+    let went = reclaim_watched(
+        &root,
+        home,
+        SystemTime::now(),
+        RECLAIM_GONE,
+        None,
+        &mut |p, _| {
+            asked.push(p.to_path_buf());
+            true
+        },
+    );
+    assert!(went.is_empty() && asked.is_empty(), "{went:?} {asked:?}");
+    drop(clear);
+    assert_eq!(
+        reclaim(&root, home, SystemTime::now()),
+        std::slice::from_ref(&leaf)
+    );
 }
 
 /// EVERY STAGE NAME IS READ AS A STAGE, AND NOTHING ELSE IS: `.cargo-build.removing` and
@@ -1960,13 +2938,12 @@ fn a_stage_led_by_a_folder_denying_its_removal_goes_whole_in_one_pass() {
     );
 }
 
-/// A FOLDER WITHOUT ITS OWNER'S BITS STRANDS NO STAGE: a stage holding `debug/deps` at 0o500 and
-/// in it a folder at 0o000, each holding a file, goes whole in one pass, each folder given its
-/// owner's bits back before it is emptied. NEGATIVE CONTROL: the same stage laid outside the
-/// cache, `std::fs::remove_dir_all` fails and its file stays.
+/// An uninspectable folder keeps the stage without changing its metadata or hidden bytes.
+/// Once the fixture makes that folder readable, normal reclamation completes the same stage.
 #[cfg(unix)]
 #[test]
-fn a_stage_holding_a_folder_without_its_owners_bits_goes_whole() {
+fn a_stage_keeps_an_uninspectable_folder_until_it_is_readable() {
+    use std::os::unix::fs::MetadataExt as _;
     let f = Fixture::new("build-cache-mode-stage");
     let root = cache_root(&f.home);
     let stage = build_dir(&root, &f.root.join("home/gone")).with_file_name(DOOMED);
@@ -1987,6 +2964,8 @@ fn a_stage_holding_a_folder_without_its_owners_bits_goes_whole() {
     );
 
     lay_stage(&stage);
+    let sealed = stage.join("debug/deps/sealed");
+    let before = std::fs::symlink_metadata(&sealed).unwrap();
     let mut asked = Vec::new();
     let went = reclaim_watched(
         &root,
@@ -1999,9 +2978,78 @@ fn a_stage_holding_a_folder_without_its_owners_bits_goes_whole() {
             true
         },
     );
-    assert_eq!(went, [(stage.clone(), Unused::Unfinished)]);
-    assert_eq!(asked, went);
+    assert!(matches!(went.as_slice(), [(path, Unused::Revoked { .. })] if path == &stage));
+    assert_eq!(asked, [(stage.clone(), Unused::Unfinished)]);
+    let after = std::fs::symlink_metadata(&sealed).unwrap();
+    assert_eq!(
+        (after.ino(), after.mode(), after.ctime(), after.ctime_nsec()),
+        (
+            before.ino(),
+            before.mode(),
+            before.ctime(),
+            before.ctime_nsec()
+        )
+    );
+    mode(&sealed, 0o700);
+    assert_eq!(std::fs::read(sealed.join("y")).unwrap(), b"y");
+    let resumed = reclaim_watched(
+        &root,
+        Some(f.home.as_path()),
+        SystemTime::now(),
+        RECLAIM_GONE,
+        None,
+        &mut |_, _| true,
+    );
+    assert_eq!(resumed, [(stage.clone(), Unused::Unfinished)]);
     assert!(!stage.exists());
+}
+
+/// A STAGE WHOSE OWN FOLDER DENIES ITS SEARCH GOES WHOLE: a stage at 0o600 (read, no search),
+/// and on macOS one whose ACL denies `search`, each holding `debug/deps/x`, goes whole in one
+/// pass, asked as unfinished: the pass reads custody by path above the stage alone, and its
+/// removal reads the stage's own through the folder it holds, once it has let its owner search
+/// it. NEGATIVE CONTROL: before the pass, nothing in the stage, its custody marker included, can
+/// be read by its path.
+#[cfg(unix)]
+#[test]
+fn a_stage_whose_own_folder_denies_its_search_goes_whole() {
+    /// How a stage is made to deny its owner search.
+    type Deny = fn(&Path);
+    let denials: &[(&str, Deny)] = &[
+        ("mode", |stage| mode(stage, 0o600)),
+        #[cfg(target_os = "macos")]
+        ("acl", |stage| acl(stage, &["group:everyone deny search"])),
+    ];
+    for &(how, deny) in denials {
+        let f = Fixture::new(&format!("build-cache-unsearched-stage-{how}"));
+        let root = cache_root(&f.home);
+        let stage = build_dir(&root, &f.root.join("home/gone")).with_file_name(DOOMED);
+        std::fs::create_dir_all(stage.join("debug/deps")).unwrap();
+        std::fs::write(stage.join("debug/deps/x"), b"x").unwrap();
+        deny(&stage);
+        assert!(std::fs::symlink_metadata(stage.join("debug")).is_err());
+        assert!(
+            std::fs::symlink_metadata(stage.join(registered::MARKER))
+                .is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound),
+            "{how}"
+        );
+
+        let mut asked = Vec::new();
+        let went = reclaim_watched(
+            &root,
+            Some(f.home.as_path()),
+            SystemTime::now(),
+            RECLAIM_GONE,
+            None,
+            &mut |p, w| {
+                asked.push((p.to_path_buf(), w));
+                true
+            },
+        );
+        assert_eq!(went, [(stage.clone(), Unused::Unfinished)], "{how}");
+        assert_eq!(asked, went, "{how}");
+        assert!(!stage.exists(), "{how}");
+    }
 }
 
 /// A LINK IN A STAGE GOES AS ITSELF: a stage holding, in a folder at 0o500, links to a folder
@@ -2205,9 +3253,10 @@ fn age_tree(dir: &Path, ago: Duration) {
     age_by(dir, ago);
 }
 
-/// A holder appearing during intent recording keeps the original directory. A later probe
-/// can leave only an empty registered stage: the next pass recovers that intent, then retires
-/// the still-identical cache normally. A refused stale intent retains a newly held stage.
+/// A holder appearing during intent recording keeps the original directory, and the intent on
+/// record closes with nothing gone ([`Refusal::Stopped`]). A later probe can leave only an empty
+/// registered stage: the next pass recovers that intent, then retires the still-identical cache
+/// normally. A refused stale intent retains a newly held stage.
 #[cfg(unix)]
 #[test]
 fn a_process_arriving_at_intent_keeps_the_cache_before_staging() {
@@ -2251,7 +3300,16 @@ fn a_process_arriving_at_intent_keeps_the_cache_before_staging() {
         busy.get(),
         "the late holder was introduced by the actual intent callback"
     );
-    assert!(removed.is_empty());
+    assert_eq!(
+        removed,
+        [(
+            leaf.clone(),
+            Unused::Refused {
+                by: Refusal::Stopped
+            }
+        )],
+        "its intent closed, nothing of it gone"
+    );
     assert!(leaf.join("debug/deps/x").is_file());
     assert!(!leaf.parent().unwrap().join(DOOMED).exists());
 
@@ -2292,7 +3350,16 @@ fn a_process_arriving_at_intent_keeps_the_cache_before_staging() {
             &fence::Fence::new(processes),
         )
     };
-    assert!(pass(&late).is_empty());
+    assert_eq!(
+        pass(&late),
+        [(
+            target.clone(),
+            Unused::Refused {
+                by: Refusal::Stopped
+            }
+        )],
+        "its intent closed, nothing of it gone"
+    );
     assert!(
         pending_observed.get(),
         "the holder arrived after the receipt had durable Pending state"
@@ -2362,12 +3429,12 @@ fn a_process_arriving_at_intent_keeps_the_cache_before_staging() {
             ..Default::default()
         })
     };
-    let mut removed = Vec::new();
     let mut intent = |stage: &Path, why| {
         assert!(matches!(why, Unused::Stale { incremental: 1, .. }));
         *staged.borrow_mut() = Some(stage.to_path_buf());
         false
     };
+    let mut intents = Intents::new(&mut intent);
     let mut sweep = Sweep {
         root: &root,
         home: Some(&f.home),
@@ -2376,12 +3443,12 @@ fn a_process_arriving_at_intent_keeps_the_cache_before_staging() {
         placing: None,
         moved: false,
         compiler_store: None,
-        record: &mut intent,
+        intents: &mut intents,
         fence: &fence::Fence::new(&newly_held),
-        removed: &mut removed,
+        permitted: &|| true,
     };
     assert!(!sweep.prune(leaf.parent().unwrap(), &leaf));
-    assert!(removed.is_empty());
+    assert!(intents.finish().is_empty());
     let stage = staged
         .borrow_mut()
         .take()
@@ -2496,6 +3563,439 @@ fn a_target_nothing_builds_in_goes_whole_and_a_held_one_stays() {
         .collect();
     assert!(listed.is_empty(), "nothing beside it: {listed:?}");
     assert!(!remove_unbuilt(&old).unwrap(), "gone already");
+}
+
+/// A RETAINED TARGET NOTHING BUILDS IN STAYS WHERE IT STANDS: verify's old side lane retained by
+/// the keep-only API ([`registered::retain`]) is never set aside: each call keeps it at its own
+/// path, `Ok(false)`, with its marker and what it holds, and nothing stands beside it. With the
+/// folder holding the lanes retained instead, an aside an earlier call left there stays,
+/// untouched and said as one root whose removal's permission the custody marker of the folder
+/// above it revoked, that folder named (never an entry of it as refusing its removal), and the
+/// lane beside it stays where it stands. NEGATIVE CONTROL: each keep withdrawn, the same lane
+/// and aside go whole.
+#[cfg(unix)]
+#[test]
+fn a_retained_target_nothing_builds_in_stays_where_it_stands() {
+    let clear = |_: &[PathBuf], _: &[u32]| Ok(aterm_uds::holders::PathScan::default());
+    let lay = |lane: &Path| {
+        std::fs::create_dir_all(lane.join("debug/deps")).unwrap();
+        std::fs::write(lane.join("debug/deps/x"), b"retained").unwrap();
+        std::fs::write(lane.join("debug/.cargo-lock"), b"").unwrap();
+        mode(lane, 0o700);
+    };
+    let listed = |at: &Path| {
+        let mut names: Vec<String> = std::fs::read_dir(at)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+
+    let f = Fixture::new("build-cache-unbuilt-kept");
+    let lane = f.home.join("target/verify/tippy.noindex");
+    lay(&lane);
+    assert_eq!(registered::retain(&f.home, &lane).unwrap(), lane);
+    let marker = std::fs::read(lane.join(registered::MARKER)).unwrap();
+    for _ in 0..2 {
+        assert!(!remove_unbuilt_with_processes(&lane, &clear).unwrap());
+        assert_eq!(listed(lane.parent().unwrap()), ["tippy.noindex"]);
+        assert_eq!(
+            std::fs::read(lane.join("debug/deps/x")).unwrap(),
+            b"retained"
+        );
+        assert_eq!(
+            std::fs::read(lane.join(registered::MARKER)).unwrap(),
+            marker
+        );
+    }
+    std::fs::remove_file(lane.join(registered::MARKER)).unwrap();
+    assert!(remove_unbuilt_with_processes(&lane, &clear).unwrap());
+    assert!(listed(lane.parent().unwrap()).is_empty());
+
+    let f = Fixture::new("build-cache-unbuilt-kept-above");
+    let verify = f.home.join("target/verify");
+    let lane = verify.join("checkers.noindex");
+    let aside = verify.join("checkers.noindex.removing");
+    lay(&lane);
+    lay(&aside);
+    mode(&verify, 0o700);
+    assert_eq!(registered::retain(&f.home, &verify).unwrap(), verify);
+    let said = remove_unbuilt_with_processes(&lane, &clear)
+        .unwrap_err()
+        .to_string();
+    assert!(said.contains(&*aside.to_string_lossy()), "{said}");
+    assert!(
+        said.contains(&format!(
+            "{} stayed: removal permission revoked; remaining contents not inspected; the \
+             custody marker of {}, a folder above it, keeps it",
+            aside.display(),
+            verify.display()
+        )),
+        "{said}"
+    );
+    assert!(!said.contains("refuses"), "{said}");
+    for at in [&lane, &aside] {
+        assert_eq!(std::fs::read(at.join("debug/deps/x")).unwrap(), b"retained");
+    }
+    assert_eq!(
+        listed(&verify),
+        [
+            registered::MARKER,
+            "checkers.noindex",
+            "checkers.noindex.removing"
+        ]
+    );
+    std::fs::remove_file(verify.join(registered::MARKER)).unwrap();
+    assert!(remove_unbuilt_with_processes(&lane, &clear).unwrap());
+    assert!(listed(&verify).is_empty());
+}
+
+/// Clears this thread's staging hook when dropped, so a failed test leaves none set.
+#[cfg(unix)]
+struct Staged;
+
+#[cfg(unix)]
+impl Drop for Staged {
+    fn drop(&mut self) {
+        staged::clear();
+    }
+}
+
+/// A custody marker that cannot be read, published in `at` the first time `then` is called.
+#[cfg(unix)]
+fn late_keep(at: PathBuf) -> impl FnMut(&Path) + 'static {
+    move |_| {
+        let marker = at.join(registered::MARKER);
+        if !marker.exists() {
+            std::fs::write(&marker, b"keep published now").unwrap();
+        }
+    }
+}
+
+/// A KEEP PUBLISHED AS A TARGET IS SET ASIDE STAYS WHERE IT STANDS: verify's old side lane that
+/// nothing builds in passes its custody read by path and is renamed aside, and at that instant
+/// (the `staged` hook, before custody is read again) a custody marker that cannot be read is
+/// published in it. Custody read again at the aside finds it: the lane is put back at its own
+/// path, never over another entry, with what it holds and the marker, the call returns
+/// `Ok(false)`, and nothing stands aside; a later call keeps it where it stands too. An aside
+/// a keep inside stops is said by the folder holding the keep, its removal's permission revoked,
+/// never the marker as an entry that refuses its removal. NEGATIVE CONTROL: the hook fired with
+/// the aside (the rename happened), and once the marker is withdrawn the same lane goes whole.
+#[cfg(unix)]
+#[test]
+fn a_keep_published_as_a_target_is_set_aside_stays_where_it_stands() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let clear = |_: &[PathBuf], _: &[u32]| Ok(aterm_uds::holders::PathScan::default());
+    let f = Fixture::new("build-cache-unbuilt-late-keep");
+    let verify = f.home.join("target/verify");
+    let lane = verify.join("tippy.noindex");
+    std::fs::create_dir_all(lane.join("debug/deps")).unwrap();
+    std::fs::write(lane.join("debug/deps/x"), b"retained").unwrap();
+    std::fs::write(lane.join("debug/.cargo-lock"), b"").unwrap();
+    mode(&lane, 0o700);
+    let aside = verify.join("tippy.noindex.removing");
+    let marker = lane.join(registered::MARKER);
+    let listed = || {
+        let mut names: Vec<String> = std::fs::read_dir(&verify)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+
+    let _staged = Staged;
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let (saw, mut publish) = (Rc::clone(&seen), late_keep(aside.clone()));
+    staged::on(move |stage| {
+        saw.borrow_mut().push(stage.to_path_buf());
+        publish(stage);
+    });
+    let first = remove_unbuilt_with_processes(&lane, &clear);
+    staged::clear();
+    assert_eq!(
+        *seen.borrow(),
+        std::slice::from_ref(&aside),
+        "never set aside"
+    );
+    for call in 0..2 {
+        assert!(
+            !first.as_ref().unwrap(),
+            "call {call}: the keep went: {first:?}"
+        );
+        assert_eq!(listed(), ["tippy.noindex"], "call {call}");
+        assert_eq!(
+            std::fs::read(lane.join("debug/deps/x")).unwrap(),
+            b"retained"
+        );
+        assert_eq!(std::fs::read(&marker).unwrap(), b"keep published now");
+        assert!(!remove_unbuilt_with_processes(&lane, &clear).unwrap());
+    }
+
+    // An aside an earlier call left that a keep inside stops is named by the keep's folder.
+    std::fs::rename(&lane, &aside).unwrap();
+    std::fs::rename(
+        aside.join(registered::MARKER),
+        aside.join("debug").join(registered::MARKER),
+    )
+    .unwrap();
+    let said = remove_unbuilt_with_processes(&lane, &clear)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        said.contains(&format!(
+            "1 entry of {} stayed: debug (removal permission revoked",
+            aside.display()
+        )),
+        "{said}"
+    );
+    assert!(!said.contains("refuses"), "{said}");
+    assert_eq!(
+        std::fs::read(aside.join("debug/deps/x")).unwrap(),
+        b"retained"
+    );
+
+    std::fs::remove_file(aside.join("debug").join(registered::MARKER)).unwrap();
+    assert!(!remove_unbuilt_with_processes(&lane, &clear).unwrap());
+    assert!(listed().is_empty());
+}
+
+/// A KEEP PUBLISHED AS A BUILD DIRECTORY IS STAGED STAYS WHERE IT STANDS: a gone workspace's
+/// build directory is renamed aside by a pass, and at that instant (the `staged` hook) a custody
+/// marker that cannot be read is published in it. Custody read again at the stage finds it: the
+/// build directory is put back at its own path with what it holds, nothing is staged beside it,
+/// and nothing is returned as gone: the intent its pass put on record closes with nothing of it
+/// gone, at its own path, where it stands again ([`Refusal::Stopped`]), never as the stage it
+/// left. NEGATIVE CONTROLS: the hook fired, and once the marker is withdrawn the next pass takes
+/// the same build directory whole; by hand, the stage counted as moved before custody is read
+/// there again ([`Intents::moved`] ahead of [`stage_unkept`]'s answer) closes the intent as the
+/// empty stage, [`Refusal::Staged`].
+#[cfg(unix)]
+#[test]
+fn a_keep_published_as_a_build_directory_is_staged_stays_where_it_stands() {
+    let f = Fixture::new("build-cache-leaf-late-keep");
+    let root = cache_root(&f.home);
+    let home = Some(f.home.as_path());
+    let leaf = lay(
+        &root,
+        &f.root.join("home/removed"),
+        Duration::from_secs(15 * 60),
+    );
+    let stage = leaf.with_file_name(DOOMED);
+    let _staged = Staged;
+    let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+    let (once, mut publish) = (std::rc::Rc::clone(&fired), late_keep(stage.clone()));
+    staged::on(move |at| {
+        once.set(true);
+        publish(at);
+    });
+    let mut asked = Vec::new();
+    let went = reclaim_watched(
+        &root,
+        home,
+        SystemTime::now(),
+        RECLAIM_GONE_UNDER_PRESSURE,
+        None,
+        &mut |p, _| {
+            asked.push(p.to_path_buf());
+            true
+        },
+    );
+    staged::clear();
+    assert!(fired.get(), "never staged");
+    assert_eq!(asked, std::slice::from_ref(&leaf), "its intent");
+    assert_eq!(
+        went,
+        [(
+            leaf.clone(),
+            Unused::Refused {
+                by: Refusal::Stopped
+            }
+        )],
+        "its outcome"
+    );
+    assert!(!stage.exists(), "staged beside it");
+    assert_eq!(
+        std::fs::read(leaf.join("debug/deps/x")).unwrap(),
+        b"0123456789"
+    );
+    let marker = leaf.join(registered::MARKER);
+    assert_eq!(std::fs::read(&marker).unwrap(), b"keep published now");
+    assert!(pressure(&root, home, &mut |_| true).is_empty());
+    assert!(leaf.join("debug/deps/x").is_file());
+
+    std::fs::remove_file(&marker).unwrap();
+    // Its marker's coming and going wrote the folder: unwritten again, as it was laid.
+    age_tree(&leaf, Duration::from_secs(15 * 60));
+    assert_eq!(
+        pressure(&root, home, &mut |_| true),
+        std::slice::from_ref(&leaf)
+    );
+    assert!(!leaf.exists() && !stage.exists());
+}
+
+/// A KEEP PUBLISHED AS A BUILD DIRECTORY'S STALE PARTS MOVE KEEPS THEM: a live workspace's build
+/// directory holds a crate's incremental folder unwritten for days; a pass moves it into a stage
+/// of its own, and at that instant (the `staged` hook) a custody marker that cannot be read is
+/// published in the build directory. Custody read again there once the parts moved finds it:
+/// every part moves back to where it stood, the stage goes, and nothing is pruned. NEGATIVE
+/// CONTROL: the hook fired with the parts in the stage, and once the marker is withdrawn the
+/// next pass prunes the same folder.
+#[cfg(unix)]
+#[test]
+fn a_keep_published_as_stale_parts_move_keeps_them() {
+    let f = Fixture::new("build-cache-prune-late-keep");
+    let root = cache_root(&f.home);
+    let live = f.dir("home/live");
+    std::fs::write(live.join("Cargo.toml"), "[workspace]\n").unwrap();
+    let leaf = build_dir(&root, &live);
+    let profile = leaf.join("debug");
+    std::fs::create_dir_all(&profile).unwrap();
+    std::fs::write(profile.join(".cargo-build-lock"), b"").unwrap();
+    let stale_crate = profile.join("incremental/ws-1k116trr0a0xf");
+    std::fs::create_dir_all(stale_crate.join("s-hneouhc0uf-1tn8o9j-2awpw")).unwrap();
+    age_tree(&stale_crate, 4 * DAY);
+    let pass = || {
+        reclaim_watched(
+            &root,
+            Some(f.home.as_path()),
+            SystemTime::now(),
+            RECLAIM_GONE,
+            None,
+            &mut |_, _| true,
+        )
+    };
+    let _staged = Staged;
+    let filled = std::rc::Rc::new(std::cell::Cell::new(false));
+    let (held, mut publish) = (std::rc::Rc::clone(&filled), late_keep(leaf.clone()));
+    staged::on(move |stage| {
+        held.set(std::fs::read_dir(stage).unwrap().count() == 1);
+        publish(stage);
+    });
+    let went = pass();
+    staged::clear();
+    assert!(filled.get(), "the part never moved");
+    assert!(
+        !went
+            .iter()
+            .any(|(_, why)| matches!(why, Unused::Stale { .. })),
+        "{went:?}"
+    );
+    assert!(stale_crate.join("s-hneouhc0uf-1tn8o9j-2awpw").is_dir());
+    assert!(!leaf.with_file_name(DOOMED).exists());
+    let marker = leaf.join(registered::MARKER);
+    assert_eq!(std::fs::read(&marker).unwrap(), b"keep published now");
+
+    std::fs::remove_file(&marker).unwrap();
+    let went = pass();
+    assert!(
+        went.iter()
+            .any(|(_, why)| matches!(why, Unused::Stale { incremental: 1, .. })),
+        "{went:?}"
+    );
+    assert!(!stale_crate.exists());
+}
+
+/// A STALE PART WHOSE NAME WAS TAKEN AS IT MOVED IS NEVER PUT BACK OVER WHAT TOOK IT: as above, a
+/// custody marker that cannot be read is published in the build directory at the instant its
+/// stale incremental folder stands in a stage, and at that instant an empty folder (as a build
+/// makes one) is made at the part's own path. The part may not be pruned, and it may not go back
+/// over the folder made there: that folder stands, the part stands in its stage beside the build
+/// directory, and a later pass, which reads custody at the build directory before it finishes a
+/// stage left there, leaves both while the keep stands. NEGATIVE CONTROL: the hook fired with
+/// the part in the stage, and once the marker is withdrawn the next pass finishes the stage.
+#[cfg(unix)]
+#[test]
+fn a_stale_part_whose_name_was_taken_as_it_moved_is_never_put_back_over_it() {
+    use std::os::unix::fs::MetadataExt as _;
+    let f = Fixture::new("build-cache-prune-late-keep-taken");
+    let root = cache_root(&f.home);
+    let live = f.dir("home/live");
+    std::fs::write(live.join("Cargo.toml"), "[workspace]\n").unwrap();
+    let leaf = build_dir(&root, &live);
+    let profile = leaf.join("debug");
+    std::fs::create_dir_all(&profile).unwrap();
+    std::fs::write(profile.join(".cargo-build-lock"), b"").unwrap();
+    let stale_crate = profile.join("incremental/ws-1k116trr0a0xf");
+    let session = "s-hneouhc0uf-1tn8o9j-2awpw";
+    std::fs::create_dir_all(stale_crate.join(session)).unwrap();
+    std::fs::write(stale_crate.join(session).join("query-cache.bin"), b"stale").unwrap();
+    age_tree(&stale_crate, 4 * DAY);
+    let pass = || {
+        reclaim_watched(
+            &root,
+            Some(f.home.as_path()),
+            SystemTime::now(),
+            RECLAIM_GONE,
+            None,
+            &mut |_, _| true,
+        )
+    };
+    let _staged = Staged;
+    let made = std::rc::Rc::new(std::cell::Cell::new(0));
+    let (taken, at, mut publish) = (
+        std::rc::Rc::clone(&made),
+        stale_crate.clone(),
+        late_keep(leaf.clone()),
+    );
+    staged::on(move |stage| {
+        if std::fs::read_dir(stage).unwrap().count() == 1 && taken.get() == 0 {
+            std::fs::create_dir(&at).unwrap();
+            taken.set(std::fs::symlink_metadata(&at).unwrap().ino());
+        }
+        publish(stage);
+    });
+    let went = pass();
+    staged::clear();
+    assert_ne!(made.get(), 0, "the part never moved");
+    assert!(
+        !went
+            .iter()
+            .any(|(_, why)| matches!(why, Unused::Stale { .. })),
+        "{went:?}"
+    );
+    let marker = leaf.join(registered::MARKER);
+    let staged_part = |n: usize| {
+        let stages = stages_in(leaf.parent().unwrap(), OsStr::new(DOOMED));
+        assert_eq!(stages.len(), n, "{stages:?}");
+        stages.first().map(|stage| stage.join("0").join(session))
+    };
+    for again in 0..2 {
+        let now = std::fs::symlink_metadata(&stale_crate).unwrap().ino();
+        assert_eq!(
+            now,
+            made.get(),
+            "pass {again}: the folder made at the part's path"
+        );
+        assert!(!stale_crate.join(session).exists(), "pass {again}");
+        let part = staged_part(1).unwrap();
+        assert_eq!(
+            std::fs::read(part.join("query-cache.bin")).unwrap(),
+            b"stale",
+            "pass {again}"
+        );
+        assert_eq!(std::fs::read(&marker).unwrap(), b"keep published now");
+        let went = pass();
+        assert!(
+            !went
+                .iter()
+                .any(|(_, why)| matches!(why, Unused::Stale { .. } | Unused::Unfinished)),
+            "pass {again}: {went:?}"
+        );
+    }
+
+    std::fs::remove_file(&marker).unwrap();
+    let went = pass();
+    assert!(
+        went.iter()
+            .any(|(_, why)| matches!(why, Unused::Unfinished)),
+        "{went:?}"
+    );
+    assert!(staged_part(0).is_none());
 }
 
 #[cfg(unix)]
@@ -2658,6 +4158,7 @@ fn a_live_build_directory_loses_only_what_no_build_reads_again() {
                 why,
                 paths: doomed.clone(),
                 held,
+                stays: None,
             }]
         );
     };

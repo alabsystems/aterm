@@ -12,6 +12,7 @@ fn reading(marks: Option<&str>, now: u64) -> Pace {
         marks: marks.map(str::to_owned),
         inputs: Some(marks.map_or_else(Inputs::default, |marks| Inputs {
             routes: Some(marks.into()),
+            place: None,
             vault: Some("vault-state".into()),
             execution: Some("execution-state".into()),
             subscriber: Some(false),
@@ -37,14 +38,14 @@ fn materialization() -> MaterializationMark {
 }
 
 #[test]
-fn unknown_first_inputs_keep_retrying_and_the_first_known_fact_reopens() {
+fn unknown_first_inputs_still_cap_and_the_first_known_fact_reopens() {
     let root = aterm_tempfile::tempdir().unwrap();
     let root = root.path();
     failed(root, REVISION, &reading(None, 1_000));
     assert!(paused(root, REVISION, &reading(None, 1_060)).is_none());
     failed(root, REVISION, &reading(None, 1_060));
-    assert!(paused(root, REVISION, &reading(None, 9_000)).is_none());
-    assert_eq!(Attempt::load(root).unwrap().failures, 2);
+    assert!(paused(root, REVISION, &reading(None, 9_000)).is_some());
+    assert_eq!(Attempt::load(root).unwrap().failures, TRIES);
 
     let known = reading(Some("known-network-and-vault"), 9_000);
     assert!(paused(root, REVISION, &known).is_none());
@@ -55,14 +56,14 @@ fn unknown_first_inputs_keep_retrying_and_the_first_known_fact_reopens() {
         REVISION,
         &reading(Some("known-network-and-vault"), 9_060),
     );
-    assert!(paused(root, REVISION, &reading(None, 20_000)).is_none());
+    assert!(paused(root, REVISION, &reading(None, 20_000)).is_some());
     assert!(
         paused(
             root,
             REVISION,
             &reading(Some("known-network-and-vault"), 20_000)
         )
-        .is_none()
+        .is_some()
     );
 }
 
@@ -77,16 +78,16 @@ fn an_unknown_record_preserves_the_same_runs_known_hold() {
     known.now += FIRST_PAUSE.as_secs();
     failed(root, REVISION, &known);
     let unknown = reading(None, 9_000);
-    assert!(paused(root, REVISION, &unknown).is_none());
+    assert!(paused(root, REVISION, &unknown).is_some());
 
     failed(root, REVISION, &unknown);
     let cached = Attempt::load(root).unwrap();
     assert_eq!(cached.marks, known.marks);
     assert_eq!(cached.materialization, known.materialization);
     assert_eq!(cached.network, known.network);
-    assert_eq!(cached.failures, 2 + 1);
+    assert_eq!(cached.failures, TRIES + 1);
     known.now = 20_000;
-    assert!(paused(root, REVISION, &known).is_none());
+    assert!(paused(root, REVISION, &known).is_some());
 
     failed(root, REVISION + 1, &unknown);
     let next = Attempt::load(root).unwrap();
@@ -110,8 +111,8 @@ fn an_unknown_post_read_keeps_the_first_known_failure_in_the_budget() {
     assert!(paused(root, REVISION, &before).is_none());
     failed(root, REVISION, &before);
     before.now = 9_000;
-    assert!(paused(root, REVISION, &before).is_none());
-    assert_eq!(Attempt::load(root).unwrap().failures, 2);
+    assert!(paused(root, REVISION, &before).is_some());
+    assert_eq!(Attempt::load(root).unwrap().failures, TRIES);
 }
 
 #[test]
@@ -142,7 +143,7 @@ fn a_partial_network_change_reopens_without_unknown_materialization_rearming_it(
     changed.now += FIRST_PAUSE.as_secs();
     assert!(paused(root, REVISION, &changed).is_none());
     failed(root, REVISION, &changed);
-    changed.now += 1;
+    changed.now = 20_000;
     changed.materialization = known.materialization;
     assert!(paused(root, REVISION, &changed).is_some());
     changed.materialization = MaterializationMark::from_cache_key(&"02".repeat(32));
@@ -186,22 +187,22 @@ fn legacy_string_marks_and_explicit_unknown_are_distinct_from_invalid_records() 
         "revision": REVISION,
         "builds": [BUILD],
         "marks": marks,
-        "tries": 2,
-        "failures": 2,
+        "tries": TRIES,
+        "failures": TRIES,
         "at": 1_000,
         "rows": [{"name": "Secrets vault", "status": "error", "detail": "start failed"}],
     });
     write_json(&root.join(RECORD), &legacy).unwrap();
     let old = Attempt::load(root).unwrap();
     assert_eq!(old.inputs, None);
-    let mut changed = reading(None, 1_100);
+    let mut changed = reading(None, 9_000);
     changed.inputs.as_mut().unwrap().routes = Some("network-b".into());
     assert!(paused(root, REVISION, &changed).is_some());
     assert_eq!(Attempt::load(root).unwrap(), old);
-    assert!(paused(root, REVISION, &reading(Some(&marks), 1_100)).is_some());
-    assert!(paused(root, REVISION, &reading(None, 1_100)).is_some());
+    assert!(paused(root, REVISION, &reading(Some(&marks), 9_000)).is_some());
+    assert!(paused(root, REVISION, &reading(None, 9_000)).is_some());
     let seeded = Attempt::load(root).unwrap();
-    assert_eq!(seeded.inputs, reading(Some(&marks), 1_100).inputs);
+    assert_eq!(seeded.inputs, reading(Some(&marks), 9_000).inputs);
     assert_eq!(seeded.tries, old.tries);
     assert_eq!(seeded.failures, old.failures);
     assert_eq!(seeded.at, old.at);
@@ -217,8 +218,8 @@ fn legacy_string_marks_and_explicit_unknown_are_distinct_from_invalid_records() 
         .insert("marks".into(), Value::Null);
     write_json(&root.join(RECORD), &unknown).unwrap();
     assert!(Attempt::load(root).is_some());
-    assert!(paused(root, REVISION, &reading(None, 1_100)).is_some());
-    assert!(paused(root, REVISION, &reading(Some(&marks), 1_100)).is_none());
+    assert!(paused(root, REVISION, &reading(None, 9_000)).is_some());
+    assert!(paused(root, REVISION, &reading(Some(&marks), 9_000)).is_none());
 
     let mut missing = legacy.clone();
     missing.as_object_mut().unwrap().remove("marks");

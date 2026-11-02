@@ -6,6 +6,38 @@
 
 use super::*;
 
+#[test]
+fn uniform_runs_are_inline_and_splitting_preserves_the_sequence() {
+    let mut rle = Rle::with_value(7_u8, 8);
+    assert_eq!(rle.heap_bytes(), 0, "a uniform run needs no heap buffer");
+    assert!(rle.set(3, 9));
+    assert!(rle.heap_bytes() >= 3 * std::mem::size_of::<Run<u8>>());
+    assert_eq!(rle.iter().collect::<Vec<_>>(), [7, 7, 7, 9, 7, 7, 7, 7]);
+    rle.set_range(2, 6, 4);
+    rle.resize(6);
+    assert_eq!(rle.iter().collect::<Vec<_>>(), [7, 7, 4, 4, 4, 4]);
+    let mut appended = Rle::new();
+    appended.extend_with(3_u8, 32);
+    appended.extend_with(3, 4);
+    assert_eq!(
+        appended.heap_bytes(),
+        0,
+        "appending to one run stays inline"
+    );
+    assert_eq!(appended.len(), 36);
+    appended.extend_with(4, 8);
+    assert_eq!(appended.heap_bytes(), 0, "two style runs stay inline");
+    assert_eq!(appended.run_count(), 2);
+    assert_eq!(
+        appended.iter().collect::<Vec<_>>(),
+        [vec![3; 36], vec![4; 8]].concat()
+    );
+    appended.push(5);
+    assert!(appended.heap_bytes() >= 3 * std::mem::size_of::<Run<u8>>());
+    assert_eq!(appended.run_count(), 3);
+    assert_eq!(appended.get(44), Some(5));
+}
+
 fn assert_rle_matches_model(rle: &Rle<u8>, model: &[u8], step: usize) {
     assert_eq!(
         rle.len() as usize,

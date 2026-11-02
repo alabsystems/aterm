@@ -103,36 +103,99 @@ pub(super) fn rotation_due(
     user_home: &Path,
     k: &dyn AgyKernel,
 ) -> Option<Rotation> {
-    let (program, running) = if ag::store_build(exe) {
+    rotation_due_at(exe, args, twin, user_home, false, None, k)
+}
+
+/// [`rotation_due`] with `at_wall` (`true` when `agy` is stopped at a quota wall on screen) and
+/// `screen_model` (the live model read from the TUI footer/launch card when `/model` switched it).
+pub(super) fn rotation_due_at(
+    exe: &Path,
+    args: &atpkg::caller_shell::ProcArgs,
+    twin: Option<PathBuf>,
+    user_home: &Path,
+    at_wall: bool,
+    screen_model: Option<&str>,
+    k: &dyn AgyKernel,
+) -> Option<Rotation> {
+    let mv = if ag::store_build(exe) {
         let twin = twin?;
         let target = std::fs::canonicalize(twin_target(&twin)?).ok()?;
         if target != std::fs::canonicalize(exe).ok()? {
-            return None;
+            if !at_wall {
+                return None;
+            }
+            behind(exe, Some(twin)).ok().flatten()?
+        } else {
+            let running = build_record(exe)?;
+            Move {
+                running: running.clone(),
+                target: running,
+                twin,
+            }
         }
-        (twin, build_record(exe)?)
     } else {
-        (
-            exe.to_path_buf(),
-            build_record(exe).unwrap_or_else(|| "-".to_string()),
-        )
+        let running = build_record(exe).unwrap_or_else(|| "-".to_string());
+        Move {
+            running: running.clone(),
+            target: running,
+            twin: exe.to_path_buf(),
+        }
     };
-    let model = ag::argv_model(&args.argv);
+    let argv_model = ag::argv_model(&args.argv);
     let env = ag::relaunch_env(|n| args.env_var(n), user_home);
     let flags = ag::config_flags(&args.argv);
-    let pick = k.quota_pick(model.as_deref(), exe, &env, &flags)?;
+    let mut pick = k.quota_pick_at(argv_model.as_deref(), exe, &env, &flags, at_wall);
+    if at_wall
+        && let Some(sm) = screen_model
+        && !crate::harness::agy_quota::family(sm).is_empty()
+        && pick
+            .as_ref()
+            .and_then(|p| match p {
+                crate::harness::agy_quota::Pick::Keep { model, .. }
+                | crate::harness::agy_quota::Pick::Wait { model, .. }
+                | crate::harness::agy_quota::Pick::Unknown { model } => {
+                    (!model.is_empty()).then_some(model.as_str())
+                }
+                crate::harness::agy_quota::Pick::Rotate { from, .. } => {
+                    (!from.is_empty()).then_some(from.as_str())
+                }
+            })
+            .is_none_or(|cm| {
+                crate::harness::agy_quota::family(sm) != crate::harness::agy_quota::family(cm)
+            })
+        && let Some(override_pick) = k.quota_pick_at(Some(sm), exe, &env, &flags, true)
+        && !matches!(
+            override_pick,
+            crate::harness::agy_quota::Pick::Unknown { .. }
+        )
+    {
+        pick = Some(override_pick);
+    }
+    let pick = pick?;
     let crate::harness::agy_quota::Pick::Rotate { from, to, .. } = &pick else {
         return None;
     };
     Some(Rotation {
-        mv: Move {
-            running: running.clone(),
-            target: running,
-            twin: program,
-        },
+        mv,
         from: from.clone(),
         to: to.clone(),
         why: pick.describe(),
     })
+}
+
+/// The active model on `tab`'s screen (`c`) when `agy` is stopped at a quota wall
+/// (`Some(Some(model))` when the footer or launch card names one, `Some(None)` when at a quota wall
+/// without one, `None` when not at a quota wall).
+pub(in super::super) fn wall_screen_model_on(c: &mut Client, tab: &str) -> Option<Option<String>> {
+    let s = screen(c, tab)?;
+    screen_quota_wall(&s.rows)
+        .then(|| aterm_phase::agy::launch_card(&s.rows).map(|card| card.model))
+}
+
+/// [`wall_screen_model_on`] on a fresh connection for `opts` and `tab`.
+pub(in super::super) fn wall_screen_model(opts: &Opts, tab: &str) -> Option<Option<String>> {
+    let mut c = connect(opts, tab).ok()?;
+    wall_screen_model_on(&mut c, tab)
 }
 
 /// Answers [`super::super::due`] for a tab led by `agy`.
@@ -165,7 +228,23 @@ pub(super) fn upgrade_due_with(
     };
     Some(match behind(&exe, twin.clone()) {
         Ok(Some(_)) => Due::Yes,
-        Ok(None) if rotation_due(&exe, &args, twin, &opts.home, k).is_some() => Due::Yes,
+        Ok(None) if rotation_due(&exe, &args, twin.clone(), &opts.home, k).is_some() => Due::Yes,
+        Ok(None)
+            if wall_screen_model(opts, tab).is_some_and(|screen_model| {
+                rotation_due_at(
+                    &exe,
+                    &args,
+                    twin,
+                    &opts.home,
+                    true,
+                    screen_model.as_deref(),
+                    k,
+                )
+                .is_some()
+            }) =>
+        {
+            Due::Yes
+        }
         Ok(None) => Due::No,
         Err(word) => Due::Unread(word),
     })
@@ -217,15 +296,20 @@ fn generated(config: &Path, conversation: &str) -> PathBuf {
         .join(".system_generated")
 }
 
-/// How much of a transcript the look reads from its end: this process's
-/// start must be in the window (else [`Open::Unproved`]).
-const TRANSCRIPT_BYTES: u64 = 32 << 20;
+/// How much of a transcript [`transcript_look`] streams from its end: up to 1 GiB
+/// line-by-line so long-lived conversations (> 32 MiB) prove without allocating the whole file.
+const TRANSCRIPT_BYTES: u64 = 1 << 30;
+/// Maximum raw byte length of a single JSONL transcript line.
+const TRANSCRIPT_LINE_BYTES: usize = 32 << 20;
 
-/// The transcript's text as read — whole, or its last [`TRANSCRIPT_BYTES`]
-/// with the partial first line dropped (`true`) — or `None` where it cannot
-/// be read.
-fn transcript_tail(path: &Path) -> Option<(String, bool)> {
-    use std::io::{Read, Seek, SeekFrom};
+/// Streams the conversation transcript for process `started_ms` (`G-A2(b)`).
+pub(super) fn transcript_look(
+    config: &Path,
+    conversation: &str,
+    started_ms: u64,
+) -> Result<(), Open> {
+    use std::io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom};
+    let path = generated(config, conversation).join("logs/transcript.jsonl");
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -233,36 +317,44 @@ fn transcript_tail(path: &Path) -> Option<(String, bool)> {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.custom_flags(libc::O_NONBLOCK);
     }
-    let mut f = options.open(path).ok()?;
-    let meta = f.metadata().ok()?;
+    let mut f = options.open(&path).map_err(|_| Open::Unreadable)?;
+    let meta = f.metadata().map_err(|_| Open::Unreadable)?;
     if !meta.is_file() {
-        return None;
+        return Err(Open::Unreadable);
     }
     let len = meta.len();
     let truncated = len > TRANSCRIPT_BYTES;
     if truncated {
-        f.seek(SeekFrom::Start(len - TRANSCRIPT_BYTES)).ok()?;
+        f.seek(SeekFrom::Start(len - TRANSCRIPT_BYTES))
+            .map_err(|_| Open::Unreadable)?;
     }
-    let mut buf = Vec::new();
-    f.take(TRANSCRIPT_BYTES).read_to_end(&mut buf).ok()?;
-    let text = String::from_utf8_lossy(&buf).into_owned();
-    Some(if truncated {
-        let rest = text.split_once('\n').map_or("", |(_, rest)| rest);
-        (rest.to_owned(), true)
-    } else {
-        (text, false)
-    })
+    let mut reader = BufReader::new(f.take(TRANSCRIPT_BYTES));
+    if truncated {
+        let mut discard = Vec::new();
+        let limit = u64::try_from(TRANSCRIPT_LINE_BYTES)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        let n = (&mut reader)
+            .take(limit)
+            .read_until(b'\n', &mut discard)
+            .map_err(|_| Open::Unreadable)?;
+        if n == 0 || discard.last() != Some(&b'\n') {
+            return Err(Open::Unproved);
+        }
+    }
+    live::quiet_transcript_reader(&mut reader, TRANSCRIPT_LINE_BYTES, truncated, started_ms)
 }
 
-/// Reads the conversation transcript tail for process `started_ms` (`G-A2(b)`).
-pub(super) fn transcript_look(
-    config: &Path,
-    conversation: &str,
-    started_ms: u64,
-) -> Result<(), Open> {
+/// How much of a transcript's end a look for what was said since a relaunch reads: it runs from a
+/// relaunch at most a few looks old, and a tail that does not reach it holds the newest prompts.
+const PROMPTS_BYTES: u64 = 32 << 20;
+
+/// The prompts `conversation`'s transcript wrote at or after unix second `since`
+/// ([`live::prompts_since`]), `None` where it cannot be read.
+pub(super) fn prompts_look(config: &Path, conversation: &str, since: u64) -> Option<Vec<String>> {
     let path = generated(config, conversation).join("logs/transcript.jsonl");
-    let (text, truncated) = transcript_tail(&path).ok_or(Open::Unreadable)?;
-    live::quiet_transcript(&text, truncated, started_ms)
+    let text = crate::harness::codex_rollout::tail_of(&path, PROMPTS_BYTES)?;
+    Some(live::prompts_since(&text, since))
 }
 
 /// A file's modification time, unix ms.
@@ -379,6 +471,16 @@ pub(super) fn read_summaries(config: &Path, conversation: &str) -> Result<String
 pub(super) fn screen_idle(rows: &[String]) -> bool {
     aterm_phase::agy::phase(rows) == (aterm_phase::Phase::Idle, true)
         && aterm_phase::agy::wall(rows).is_none()
+}
+
+/// Returns `true` when `rows` show `agy` authoritatively stopped at a usage or model-bucket quota
+/// wall with its composer open.
+#[must_use]
+pub(super) fn screen_quota_wall(rows: &[String]) -> bool {
+    matches!(
+        aterm_phase::agy::phase(rows),
+        (aterm_phase::Phase::Limited { .. }, true)
+    ) && aterm_phase::agy::wall(rows).is_some_and(|w| w.kind.reads_limited())
 }
 
 /// Whether agy's composer on `rows` is empty: its caret row holds nothing (a
@@ -541,11 +643,41 @@ pub(super) fn upgrade_visit(
         return Some(said(r, format!("wait:{}", super::super::UNREAD_PROCESS)));
     };
     let (mv, rotation) = match behind(&exe, twin.clone()) {
-        Ok(Some(mv)) => (mv, None),
-        Ok(None) => match rotation_due(&exe, &args, twin, &opts.home, k) {
-            Some(rot) => (rot.mv.clone(), Some(rot)),
-            None => return Some(said(r, "current")),
-        },
+        Ok(Some(mv)) => {
+            let rot = wall_screen_model(opts, &tab).and_then(|screen_model| {
+                rotation_due_at(
+                    &exe,
+                    &args,
+                    twin,
+                    &opts.home,
+                    true,
+                    screen_model.as_deref(),
+                    k,
+                )
+            });
+            match rot {
+                Some(rot) => (rot.mv.clone(), Some(rot)),
+                None => (mv, None),
+            }
+        }
+        Ok(None) => {
+            let rot = rotation_due(&exe, &args, twin.clone(), &opts.home, k).or_else(|| {
+                let screen_model = wall_screen_model(opts, &tab)?;
+                rotation_due_at(
+                    &exe,
+                    &args,
+                    twin,
+                    &opts.home,
+                    true,
+                    screen_model.as_deref(),
+                    k,
+                )
+            });
+            match rot {
+                Some(rot) => (rot.mv.clone(), Some(rot)),
+                None => return Some(said(r, "current")),
+            }
+        }
         Err(word) => return Some(said(r, format!("wait:{word}"))),
     };
     let r = match &rotation {
@@ -598,7 +730,22 @@ pub(super) fn upgrade_visit(
     let Ok(mut c) = connect(opts, &tab) else {
         return Some(said(r, "wait:no-socket"));
     };
-    let look = |c: &mut Client| look_at(opts, c, &tab, pid, &config, &conversation, started_ms, k);
+    let at_wall =
+        rotation.is_some() && screen(&mut c, &tab).is_some_and(|s| screen_quota_wall(&s.rows));
+    let look = |c: &mut Client| {
+        let mut l = look_at(opts, c, &tab, pid, &config, &conversation, started_ms, k);
+        if rotation.is_some() && screen(c, &tab).is_some_and(|s| screen_quota_wall(&s.rows)) {
+            l.idle = true;
+            if let Ok(Some(s)) = &mut l.summary
+                && s.status != live::STATUS_IDLE
+                && !s.not_fully_idle
+                && s.children_busy == 0
+            {
+                s.status = live::STATUS_IDLE.to_owned();
+            }
+        }
+        l
+    };
     if let Err(why) = live::gate(&look(&mut c)) {
         return Some(said(r, format!("wait:{why}")));
     }
@@ -609,6 +756,7 @@ pub(super) fn upgrade_visit(
     if let Some(rot) = &rotation {
         st.argv = ag::with_model(&st.argv, &rot.to);
         st.cause = format!("{}{}", super::super::super::relaunch::CAUSE_MODEL, rot.to);
+        st.quiet = !at_wall;
     }
     match plan(opts, &st, k) {
         Ok(_) => {}
@@ -622,7 +770,7 @@ pub(super) fn upgrade_visit(
     {
         return Some(said(r, "skip:env-not-carried"));
     }
-    if rotation.is_none()
+    if (rotation.is_none() || mv.running != mv.target)
         && let Err(why) = build_start::proved_named(opts, &r, &mv.twin, &mv.target, SOURCE, now)
     {
         return Some(said(r, format!("wait:{why}")));
@@ -677,6 +825,10 @@ pub(super) fn upgrade_visit(
         }
     }
     let note = match &rotation {
+        Some(rot) if at_wall => format!(
+            "SIGTERM (quota wall: its conversation {} resumed on --model {}: {})",
+            st.thread, rot.to, rot.why
+        ),
         Some(rot) => format!(
             "SIGTERM (idle: nothing asked or typed; its conversation {} resumed on --model {}: {})",
             st.thread, rot.to, rot.why

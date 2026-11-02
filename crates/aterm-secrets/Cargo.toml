@@ -38,6 +38,9 @@ aterm-durable = { workspace = true }
 aterm-http = { workspace = true }
 # source.toml and state.toml, read as a value tree (no derive in this library).
 aterm-toml = { workspace = true }
+# The explicit release capability probe's value-free journal and API receipts.
+aterm-json = { workspace = true }
+serde = { workspace = true }
 # The one rule for a copy of aterm that lasts (`lasting::transient`), which a launchd job may
 # name, shared with atpkg's shims and the window's subscriber mend. std only.
 aterm-toolchain = { workspace = true }
@@ -56,6 +59,11 @@ libc = { workspace = true }
 # Exclusive private edit directories; unfinished drafts are explicitly kept.
 aterm-tempfile = { workspace = true }
 astream-broker = { path = "../../vendor/astream/crates/astream-broker" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Network.framework's path monitor (`home_lan`: a cellular or hotspot path is never the home ALab
+# LAN). Zero dependencies of its own; it opens the framework only at a monitor's first start.
+aterm-objc.workspace = true
 
 [dev-dependencies]
 # The differential oracle for x25519.rs: ring's own X25519 (ephemeral keys from its

@@ -12,9 +12,11 @@ use super::{Clock, Host};
 use crate::memory::{Meter, StageKey as _};
 
 const GIB: u64 = 1 << 30;
+#[cfg(target_os = "macos")]
 const MIB: u64 = 1 << 20;
 
 /// A wait for something that must happen: a hang detector, never a latency budget.
+#[cfg(target_os = "macos")]
 const HANG_DETECTOR: Duration = Duration::from_secs(60);
 
 /// A host whose reads of a group answer `reads` in turn, then nothing.
@@ -154,6 +156,7 @@ fn a_stage_that_started_no_child_keeps_that_it_held_nothing() {
         exclusive: false,
         after_stages: Vec::new(),
         mem: 0,
+        part: None,
     };
     let key = crate::memory::Key::of(
         doctests.id,

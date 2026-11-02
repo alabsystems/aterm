@@ -365,10 +365,12 @@ fn interrupted_debris(
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
             if let Some(build) = crate::store::parse_build_name(name) {
-                if crate::store::build_is_complete(&entry.path()) {
+                // A refused header is no evidence of interruption. Check it before the
+                // complete-inventory reader, which a FIFO or alias must never reach here.
+                if crate::store::build_marks_another_slice(&entry.path()).unwrap_or(true) {
                     continue;
                 }
-                if crate::store::build_marks_another_slice(&entry.path()) {
+                if crate::store::build_is_complete(&entry.path()) {
                     continue;
                 }
                 if claimed.get(&program).is_some_and(|s| s.contains(&build)) {
@@ -1542,6 +1544,33 @@ mod tests {
     }
 
     #[test]
+    fn gc_scratch_removal_observes_its_own_first_exec_mark() {
+        let l = layout("scratch-first-exec");
+        let current = seed(&l, "ay", 19, true);
+        let current_hold = crate::store::hold_first_exec(&current.join("bin/ay")).unwrap();
+        let scratch = seed_scratch(&l, "ay", "20.incoming-4242");
+        let scratch_hold = crate::store::hold_first_exec(&scratch.join("bin/payload")).unwrap();
+        let held = run_with(&l, &|_| None, &|| Some(Vec::new()));
+        assert!(
+            scratch.join("bin/payload").is_file(),
+            "the actual scratch tree is assessed"
+        );
+        assert!(held.swept_scratch.is_empty());
+        scratch_hold.ran();
+        let unheld = run_with(&l, &|_| None, &|| Some(Vec::new()));
+        assert!(!scratch.exists());
+        assert_eq!(
+            unheld.swept_scratch,
+            vec![("ay".to_string(), vec!["20.incoming-4242".to_string()])]
+        );
+        assert!(
+            crate::store::held_unproven(&current),
+            "a different held build stays held"
+        );
+        current_hold.ran();
+    }
+
+    #[test]
     fn only_the_producers_own_scratch_shape_is_sweepable() {
         for ours in [
             "18.incoming-1",
@@ -1682,6 +1711,86 @@ mod tests {
         );
         assert_eq!(report.swept_partial, vec![("ay".to_string(), vec![17u64])]);
         let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    #[test]
+    fn a_large_other_slice_ready_marker_is_never_partial_debris() {
+        let l = layout("large-other-slice");
+        let other = seed(&l, "ay", 18, false);
+        seed(&l, "ay", 19, true);
+        let marker = l.prefix.join("store/ay/18.ready");
+        std::fs::write(&marker, b"ok\nplatform=sparc64-solaris\n").unwrap();
+        assert!(!crate::store::build_is_complete(&other));
+        let report = run_with(&l, &|_| None, &|| Some(Vec::new()));
+        assert!(
+            other.is_dir() && report.swept_partial.is_empty(),
+            "small other-slice control"
+        );
+        let partial = seed_partial(&l, "ay", 17);
+        let report = run_with(&l, &|_| None, &|| Some(Vec::new()));
+        assert!(!partial.exists());
+        assert_eq!(report.swept_partial, [("ay".to_string(), vec![17])]);
+
+        for n in 0..330 {
+            let name = format!("tool-{n:03}-{}", "x".repeat(191));
+            std::fs::write(other.join("bin").join(name), b"inert inventory entry").unwrap();
+        }
+        crate::store::mark_build_ready(&other).unwrap();
+        assert!(
+            crate::store::build_is_complete(&other),
+            "actual producer completes this slice"
+        );
+        let produced = std::fs::read_to_string(&marker).unwrap();
+        assert!(produced.len() > 64 * 1024, "large aggregate inventory");
+        let platform = produced
+            .lines()
+            .find(|line| line.starts_with("platform="))
+            .unwrap();
+        let foreign = produced.replacen(platform, "platform=sparc64-solaris", 1);
+        std::fs::write(&marker, &foreign).unwrap();
+        assert!(
+            !crate::store::build_is_complete(&other),
+            "other slice is not installed for this slice"
+        );
+        let report = run_with(&l, &|_| None, &|| Some(Vec::new()));
+        assert!(
+            other.is_dir(),
+            "a complete other-slice build is not interrupted debris"
+        );
+        assert!(
+            report.swept_partial.is_empty(),
+            "{:?}",
+            report.swept_partial
+        );
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), foreign);
+    }
+
+    #[test]
+    fn unreadable_ready_evidence_never_authorizes_partial_deletion() {
+        for case in ["utf8", "overlong", "directory"] {
+            let l = layout("refused-ready");
+            let kept = seed(&l, "ay", 18, false);
+            seed(&l, "ay", 19, true);
+            let marker = kept.with_file_name("18.ready");
+            std::fs::remove_file(&marker).unwrap();
+            let bytes = match case {
+                "utf8" => vec![0xff],
+                "overlong" => vec![b'x'; 4097],
+                _ => Vec::new(),
+            };
+            if case == "directory" {
+                std::fs::create_dir(&marker).unwrap();
+            } else {
+                std::fs::write(&marker, &bytes).unwrap();
+            }
+            let report = run_with(&l, &|_| None, &|| Some(Vec::new()));
+            assert!(kept.is_dir() && report.swept_partial.is_empty(), "{case}");
+            if case == "directory" {
+                assert!(marker.is_dir());
+            } else {
+                assert_eq!(std::fs::read(&marker).unwrap(), bytes, "{case}");
+            }
+        }
     }
 
     #[test]
@@ -2560,6 +2669,7 @@ mod tests {
         let records = [
             crate::store::VENDOR_SIDECAR_SUFFIX,
             crate::store::EXPOSES_SUFFIX,
+            crate::store::VERSION_SUFFIX,
         ];
         for suffix in records {
             std::fs::write(orphan(29, suffix), b"record").unwrap();

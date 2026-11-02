@@ -12,6 +12,23 @@ use super::upgrade::ArgvRefusal;
 /// Muse Code executable basename.
 pub const PROGRAM: &str = "muse";
 
+/// The model a fresh Muse Code launch aterm makes runs, where none is named
+/// ([`rewrite_argv`], and the Muse Code row of `super::worker::WORKERS`).
+pub const DEFAULT_MODEL: &str = "muse-wonder-full-1.0";
+
+/// The reasoning effort a fresh Muse Code launch aterm makes runs.
+pub const DEFAULT_EFFORT: &str = "xhigh";
+
+/// Flag pairs every fresh Muse Code launch aterm makes carries: contributor
+/// mode off (`--contributor-mode` is per-run, so nothing else keeps it off)
+/// and the default effort.
+pub const DEFAULT_FLAGS: &[&str] = &[
+    "--contributor-mode",
+    "off",
+    "--reasoning-effort",
+    DEFAULT_EFFORT,
+];
+
 /// Environment variable overriding Muse Code's data directory.
 pub const DATA_ENV: &str = "XDG_DATA_HOME";
 
@@ -51,7 +68,7 @@ const FLAGS: &[(&str, Arity, Fate)] = &[
     ("--base-url", Arity::One, Fate::Keep),
     ("-c", Arity::One, Fate::Keep),
     ("--config", Arity::One, Fate::Keep),
-    ("--contributor-mode", Arity::One, Fate::Keep),
+    ("--contributor-mode", Arity::One, Fate::Drop),
     ("--disable-approval", Arity::None, Fate::Drop),
     ("--disable-request-user-input", Arity::None, Fate::Keep),
     ("--disable-sandbox", Arity::None, Fate::Drop),
@@ -141,6 +158,16 @@ fn option_name(tok: &str) -> (&str, bool) {
         return (name, true);
     }
     (tok, false)
+}
+
+/// Whether `tok` is a known value-taking root option without an attached value (`--model`, `-c`).
+#[must_use]
+pub(super) fn takes_value(tok: &str) -> bool {
+    if !maybe_option(tok) || tok == RESUME_LAST {
+        return false;
+    }
+    let (name, attached) = option_name(tok);
+    !attached && matches!(flag(name), Some((Arity::One, _)))
 }
 
 /// One launch's argv, read: the root options it carries (verbatim, in
@@ -251,16 +278,55 @@ pub fn provider_flags(argv: &[String]) -> Result<Vec<String>, ArgvRefusal> {
     Ok(out)
 }
 
+/// Default-route model launches only; explicit profiles, provider settings,
+/// resume operations, tools, and unknown native options keep their own login.
+pub fn shared_key_defaults(args: &[String]) -> bool {
+    let mut i = 0;
+    let mut positional_seen = false;
+    let mut exec = false;
+    while let Some(tok) = args.get(i) {
+        i += 1;
+        if tok == "--" {
+            return true;
+        }
+        if !maybe_option(tok) {
+            if !positional_seen {
+                positional_seen = true;
+                if tok == "exec" {
+                    exec = true;
+                    continue;
+                }
+                if SUBCOMMANDS.contains(&tok.as_str()) {
+                    return false;
+                }
+            }
+            continue;
+        }
+        let (name, attached) = option_name(tok);
+        if PROVIDER_FLAGS.contains(&name) || is_one_shot_flag(name) {
+            return false;
+        }
+        let arity = if exec && name == "--prompt-file" {
+            Arity::One
+        } else if let Some((arity, _)) = flag(name) {
+            arity
+        } else {
+            return false;
+        };
+        if arity == Arity::One && !attached {
+            if args.get(i).is_none() {
+                return false;
+            }
+            i += 1;
+        }
+    }
+    true
+}
+
 /// Whether `argv` launches the interactive Muse Code TUI.
 #[must_use]
 pub fn is_tui_argv(argv: &[String]) -> bool {
-    match read(argv) {
-        Ok(_) => true,
-        Err(ArgvRefusal::UnknownFlag(_)) => !one_shot_or_tool(argv),
-        Err(ArgvRefusal::NotResumable(what)) => {
-            !(SUBCOMMANDS.contains(&what.as_str()) || is_one_shot_flag(&what))
-        }
-    }
+    !one_shot_or_tool(argv)
 }
 
 /// `-h`, `--help`, `-V`, `--version`: a run that prints and exits.
@@ -268,16 +334,54 @@ fn is_one_shot_flag(name: &str) -> bool {
     matches!(name, "-h" | "--help" | "-V" | "--version")
 }
 
-/// A one-shot flag or a subcommand other than `resume` anywhere before `--`,
-/// read without the flag table (an unknown flag may or may not take a value).
+/// A one-shot flag or a subcommand other than `resume` before `--`.
 fn one_shot_or_tool(argv: &[String]) -> bool {
-    argv.iter()
-        .skip(1)
-        .take_while(|t| t.as_str() != "--")
-        .any(|t| {
-            is_one_shot_flag(option_name(t).0)
-                || (SUBCOMMANDS.contains(&t.as_str()) && t != "resume")
-        })
+    let mut positional_seen = false;
+    let mut after_unknown_flag = false;
+    let mut i = 1;
+    while i < argv.len() {
+        let tok = argv[i].as_str();
+        i += 1;
+        if tok == "--" {
+            break;
+        }
+        if !maybe_option(tok) {
+            if !positional_seen {
+                if tok == "resume" {
+                    positional_seen = true;
+                } else if SUBCOMMANDS.contains(&tok) {
+                    return true;
+                } else if !after_unknown_flag {
+                    positional_seen = true;
+                }
+            }
+            after_unknown_flag = false;
+            continue;
+        }
+        after_unknown_flag = false;
+        if tok == RESUME_LAST {
+            continue;
+        }
+        let (name, attached) = option_name(tok);
+        if is_one_shot_flag(name) {
+            return true;
+        }
+        match flag(name) {
+            Some((Arity::One, _)) if !attached => {
+                if argv
+                    .get(i)
+                    .is_some_and(|v| v != "--" && !is_one_shot_flag(option_name(v).0))
+                {
+                    i += 1;
+                }
+            }
+            Some(_) => {}
+            None => {
+                after_unknown_flag = !attached;
+            }
+        }
+    }
+    false
 }
 
 /// Return the `<session-ref>` passed to `muse resume`, if any.
@@ -286,13 +390,46 @@ pub fn resumed_ref(argv: &[String]) -> Option<String> {
     read(argv).ok()?.reference
 }
 
+/// Whether `argv` resumes a conversation (`muse resume`, a reference or `--last`): its first
+/// positional before `--` is `resume`, read past flags a relaunch refuses or [`FLAGS`] does not
+/// know (taken as bare), which [`read`] stops at.
+#[must_use]
+pub fn resumes(argv: &[String]) -> bool {
+    if !is_tui_argv(argv) {
+        return false;
+    }
+    let mut toks = argv.iter().skip(1).take_while(|tok| *tok != "--");
+    while let Some(tok) = toks.next() {
+        if !maybe_option(tok) {
+            return tok == "resume";
+        }
+        let (name, attached) = option_name(tok);
+        if !attached && matches!(flag(name), Some((Arity::One, _))) {
+            toks.next();
+        }
+    }
+    false
+}
+
 /// Rewrite `argv` into relaunch arguments resuming `session` (or starting fresh when `None`).
+/// Every rewrite runs with contributor mode off (the launch's own word on it is
+/// dropped, [`FLAGS`]); a fresh start also runs [`DEFAULT_MODEL`] at
+/// [`DEFAULT_EFFORT`], while a resumed session keeps the model and effort it
+/// already runs, so neither is named for it.
 ///
 /// # Errors
 /// Returns [`ArgvRefusal`] if `argv` has an unknown/non-resumable flag or subcommand, or `session` is not a UUID.
 pub fn rewrite_argv(argv: &[String], session: Option<&str>) -> Result<Vec<String>, ArgvRefusal> {
     let read = read(argv)?;
     let mut out = read.kept;
+    out.push("--contributor-mode".to_string());
+    out.push("off".to_string());
+    if session.is_none() {
+        out.push("--model".to_string());
+        out.push(DEFAULT_MODEL.to_string());
+        out.push("--reasoning-effort".to_string());
+        out.push(DEFAULT_EFFORT.to_string());
+    }
     if let Some(session) = session {
         if !is_session_uuid(session) {
             return Err(ArgvRefusal::NotResumable(format!("session-ref {session}")));
@@ -428,7 +565,7 @@ pub fn log_workspace(log: &str) -> Option<String> {
 pub fn lock_pid(body: &str) -> Option<u32> {
     body.lines()
         .find_map(|l| l.trim().strip_prefix("pid="))
-        .and_then(|p| p.parse().ok())
+        .and_then(crate::parse_uint::<u32>)
         .filter(|&p| p > 0)
 }
 
@@ -533,7 +670,9 @@ pub fn store_build(program: &Path) -> bool {
     matches!(names.as_slice(), [PROGRAM, "bin", build, PROGRAM, "store"] if !build.is_empty())
 }
 
-/// Format the manual `muse resume <session>` hint shown to the user.
+/// Format the manual `muse --contributor-mode off resume <session>` hint shown to the user:
+/// a hand-typed resume runs contributor mode off like every relaunch
+/// ([`rewrite_argv`]), and keeps the session's own model and effort.
 #[must_use]
 pub fn told_line(session: &str, env: &[(String, String)]) -> Option<String> {
     if !is_session_uuid(session) {
@@ -541,7 +680,10 @@ pub fn told_line(session: &str, env: &[(String, String)]) -> Option<String> {
     }
     let mut said = String::new();
     for (name, value) in env {
-        if value.chars().any(char::is_control) {
+        if value
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+        {
             return None;
         }
         let plain = !value.is_empty()
@@ -557,7 +699,9 @@ pub fn told_line(session: &str, env: &[(String, String)]) -> Option<String> {
         }
         said.push(' ');
     }
-    said.push_str(&format!("{PROGRAM} resume {session}"));
+    said.push_str(&format!(
+        "{PROGRAM} --contributor-mode off resume {session}"
+    ));
     Some(said)
 }
 

@@ -208,11 +208,11 @@ impl Priority {
 /// # Errors
 /// The file exists but does not parse — the caller refuses model changes.
 pub fn load_or_seed(path: &Path, now: i64) -> Result<Priority, String> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => {
+    match super::accounts::read_bounded(path, 1024 * 1024) {
+        Ok(Some(text)) => {
             Priority::parse(&text).ok_or_else(|| format!("{} does not parse", path.display()))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        Ok(None) => {
             let p = Priority::seed(now);
             write_atomic_ordered(path, &p.render())
                 .map_err(|e| format!("{}: {e}", path.display()))?;
@@ -506,12 +506,19 @@ pub fn read_evidence(config_dir: &Path, claude_json: &Path) -> Evidence {
                 .filter(|p| p.to_string_lossy().ends_with("-cc.json"))
                 .collect();
             files.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
-            files.last().and_then(|p| std::fs::read_to_string(p).ok())
+            files.last().and_then(|p| {
+                super::accounts::read_bounded(p, 4 * 1024 * 1024)
+                    .ok()
+                    .flatten()
+            })
         })
         .and_then(|t| parse_served(&t));
-    let (denied, disabled_options, announcements) = std::fs::read_to_string(claude_json)
-        .map(|t| parse_claude_json(&t))
-        .unwrap_or_default();
+    let (denied, disabled_options, announcements) =
+        super::accounts::read_bounded(claude_json, 16 * 1024 * 1024)
+            .ok()
+            .flatten()
+            .map(|t| parse_claude_json(&t))
+            .unwrap_or_default();
     Evidence {
         served,
         denied,
@@ -948,8 +955,8 @@ pub fn parse_lstart(s: &str) -> Option<u64> {
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
     let m = MONTHS.iter().position(|x| x == mon)? + 1;
-    let day: u32 = day.parse().ok()?;
-    let year: u32 = year.parse().ok()?;
+    let day: u32 = crate::parse_uint(day)?;
+    let year: u32 = crate::parse_uint(year)?;
     parse_utc(&format!("{year:04}-{m:02}-{day:02}T{hms}Z"))
 }
 

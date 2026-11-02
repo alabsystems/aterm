@@ -142,6 +142,50 @@ fn raw_exec_admission_binds_pid_image_package_and_the_entire_current_producer() 
 }
 
 #[test]
+fn native_default_producer_admission_survives_a_different_inspecting_image() {
+    let fixture = Fixture::new();
+    let helper = fixture.layout.prefix.join("app/aterm");
+    std::fs::create_dir_all(helper.parent().unwrap()).unwrap();
+    std::fs::write(&helper, b"inert producer image").unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let prelude = crate::stub::with_current_exe(&helper, || {
+        crate::platform::twin_prelude(
+            "codex",
+            &fixture.layout.prefix,
+            Some(&helper),
+            crate::selfupdate::verbs_of("codex"),
+            &crate::yolo::policy_of("codex"),
+        )
+    });
+    let body = crate::platform::sh_shim_content_managed(
+        &fixture.target,
+        &crate::shim_env::ShimEnv::NONE,
+        &fixture.entry,
+        &prelude,
+    );
+    assert!(body.contains(crate::native_defaults::VERB));
+    std::fs::write(fixture.layout.bin_dir().join("codex"), &body).unwrap();
+    std::fs::remove_file(&fixture.entry).unwrap();
+    assert!(
+        fixture
+            .hints()
+            .admits(4242, &fixture.target, &fixture.entry)
+    );
+    prepare_resume(&fixture.layout, &fixture.entry).unwrap();
+    assert_eq!(std::fs::read_link(&fixture.entry).unwrap(), fixture.target);
+    std::fs::write(
+        fixture.layout.bin_dir().join("codex"),
+        format!("{body}printf injected\\n"),
+    )
+    .unwrap();
+    assert!(
+        !fixture
+            .hints()
+            .admits(4242, &fixture.target, &fixture.entry)
+    );
+}
+
+#[test]
 fn a_missing_resume_entry_is_repaired_to_current_b_without_rolling_back_raw_a() {
     let fixture = Fixture::new();
     let hints = fixture.hints();

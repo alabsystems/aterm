@@ -43,7 +43,11 @@ pub(super) struct Running {
 /// The `MAJOR.MINOR.PATCH` that `text` starts with: `0.140.0+g1a2b3c` reads as `0.140.0`.
 pub(super) fn version(text: &str) -> Option<Version> {
     let core = text.split(['+', '-']).next()?;
-    let mut parts = core.split('.').map(|part| part.parse::<u64>().ok());
+    let mut parts = core.split('.').map(|part| {
+        (!part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| part.parse::<u64>().ok())
+            .flatten()
+    });
     let version = (parts.next()??, parts.next()??, parts.next()??);
     parts.next().is_none().then_some(version)
 }

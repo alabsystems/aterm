@@ -5,6 +5,7 @@ use super::*;
 use crate::{
     crypto::Causal,
     table::{
+        Scope, Session,
         store::{Store, WITNESS_AT},
         tests::Lab,
     },
@@ -21,6 +22,100 @@ use std::path::PathBuf;
 
 mod closure;
 mod conflict;
+
+#[test]
+fn transient_control_uncertainty_invalidates_a_discarded_metadata_batch() {
+    let fixture = Fixture::new(false, false, false);
+    fixture.recover();
+    let bootstrap = fixture.lab.bootstrap(0);
+    let session = Session::open(&bootstrap).unwrap();
+    let envelope = Envelope::parse(fixture.scope, &fixture.wire).unwrap();
+    let anchor = bootstrap.journal_dir().join("control.anchor");
+    let moved = anchor.with_extension("moved");
+    std::fs::rename(&anchor, &moved).unwrap();
+    assert!(session.discarded_source(&envelope).is_err());
+    std::fs::rename(&moved, &anchor).unwrap();
+    let result = session.with_read_batch(fixture.scope, |batch| {
+        std::fs::rename(&anchor, &moved).unwrap();
+        let classification = batch.discarded_source(&envelope);
+        std::fs::rename(&moved, &anchor).unwrap();
+        // Even a caller that handles the classification failure cannot forget
+        // that this batch observed an unavailable control journal.
+        Ok(classification)
+    });
+    assert!(result.is_err(), "batch forgot its unavailable control view");
+    session
+        .with_read_batch(fixture.scope, |batch| {
+            assert!(batch.discarded_source(&envelope)?);
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn discarded_metadata_batches_withhold_changed_control_or_custody() {
+    for changed in [
+        "control",
+        "control.anchor",
+        "source.toml",
+        "commons/device.age",
+    ] {
+        let fixture = Fixture::new(false, false, false);
+        fixture.recover();
+        let bootstrap = fixture.lab.bootstrap(0);
+        let session = Session::observe(&bootstrap).unwrap();
+        let envelope = Envelope::parse(fixture.scope, &fixture.wire).unwrap();
+        let admin = client::admin_open(&fixture.lab.paths[0]).unwrap();
+        let grants = (0..2)
+            .map(|n| {
+                Grant::recorded(
+                    format!("m{}", n + 1),
+                    fixture
+                        .lab
+                        .bootstrap(n)
+                        .request()
+                        .unwrap()
+                        .binding()
+                        .clone(),
+                    Role::Writer,
+                )
+            })
+            .collect();
+        let update = admin
+            .prepare_commons_rotation(&session.journal, grants)
+            .unwrap();
+        session
+            .with_read_batch(fixture.scope, |batch| {
+                assert!(batch.discarded_source(&envelope)?);
+                assert!(batch.discarded_source(&envelope)?);
+                Ok(())
+            })
+            .unwrap();
+        let result = session.with_read_batch(fixture.scope, |batch| {
+            assert!(batch.discarded_source(&envelope)?);
+            if changed == "control" {
+                Journal::open_existing(bootstrap.journal_dir(), bootstrap.trust())
+                    .unwrap()
+                    .ingest(update.bytes())
+                    .unwrap();
+            } else {
+                let path = if changed == "control.anchor" {
+                    bootstrap.journal_dir().join(changed)
+                } else {
+                    fixture.lab.paths[0].dir.join(changed)
+                };
+                std::fs::rename(&path, path.with_extension("moved")).unwrap();
+            }
+            // No key is opened by this batch. Its final context/custody fence
+            // must reject even this previously valid cached classification.
+            batch.discarded_source(&envelope)
+        });
+        assert!(
+            result.is_err(),
+            "discarded metadata escaped after {changed}"
+        );
+    }
+}
 
 #[test]
 fn a_changed_observation_refuses_reads_until_a_new_witness_is_verified() {
@@ -420,10 +515,18 @@ fn witnessed_quarantine_conforms_and_unwitnessed_promotion_is_detected() {
     f.recover();
     let a = f.lab.bootstrap(0);
     let session = Session::open(&a).unwrap();
-    assert!(restore(&session, f.scope, f.receipt, f.wire.clone(), 0).is_err());
+    assert!(
+        session
+            .with_read_batch(f.scope, |batch| {
+                restore(batch, f.receipt, f.wire.clone(), 0)
+            })
+            .is_err()
+    );
     // Negative control: lying about the verified-prefix boundary promotes the
     // exact same unwitnessed tail. The model must reject that unsafe composition.
-    let promoted = restore(&session, f.scope, f.receipt, f.wire, 1).unwrap();
+    let promoted = session
+        .with_read_batch(f.scope, |batch| restore(batch, f.receipt, f.wire, 1))
+        .unwrap();
     assert!(promoted.quarantine.is_some());
     let mut bad = initial.clone();
     bad.insert("scenario", 4);

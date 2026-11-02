@@ -27,9 +27,11 @@
 //! ([`aterm_toolchain::interrupt`]), with [`Error::Stopped`] and nothing left in the ledger.
 //! While it runs, its own measure of its writes is its claim's progress
 //! ([`aterm_capacity::Meter`]), and what it took is kept for the next run, tagged with the
-//! directories it measured ([`dirs_tag`]): a run tagged with other directories (they were
-//! re-pointed since) is not counted, and one kept before runs were tagged (the build cache's
-//! move among them) counts wherever it was measured until it leaves the record.
+//! directories it measured ([`dirs_tag`]) and what it built there ([`scope_tag`]): a run tagged
+//! with other directories (they were re-pointed since) is not counted, nor one of another scope
+//! (a `-p` run's growth is not what a whole-tree run writes, nor the reverse), and one kept
+//! before runs were tagged (the build cache's move among them) counts wherever it was measured
+//! until it leaves the record, but only for a kind with one scope.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -50,6 +52,10 @@ pub use aterm_capacity::{Admit, Error, Estimate, Footprint, gib, size};
 pub struct Run {
     /// What the run is, as a wait line names it: `verify lint test -p atpkg`.
     pub what: String,
+    /// What it builds, spelled the same way each time it builds the same (its checks and
+    /// packages, sorted): its footprints are kept by it ([`scope_tag`]), so a run claims what the
+    /// last runs of its own scope wrote. Empty for a kind with one scope (a VM's boot).
+    pub scope: String,
     /// The directories it writes: measured for what they hold now, and while it runs.
     pub dirs: Vec<PathBuf>,
     /// Where the footprints of this kind of run are kept.
@@ -59,6 +65,10 @@ pub struct Run {
     pub cold: u64,
     /// Where its writes land: the claim is on the volume holding it.
     pub on: PathBuf,
+    /// Give up its wait once every claim it waits behind is held by a holder that has made no
+    /// progress for this long ([`aterm_capacity::Need::ends_when_stuck`]): [`Error::Stuck`].
+    /// `None`: it waits as long as they hold.
+    pub stuck_ends: Option<Duration>,
 }
 
 /// An admitted run: its claim held, and its writes measured, until [`Self::finish`].
@@ -81,6 +91,14 @@ impl Admitted {
         let _ = kept.save(&self.record);
         run
     }
+
+    /// The run was cut short (an interrupt ended it): let its claim go and return what it took,
+    /// keeping nothing. A run that stopped short of its work wrote less than a run of its scope
+    /// writes; kept, that would be what the next one claims, which would then write the rest
+    /// unclaimed.
+    pub fn abandon(self) -> Footprint {
+        self.meter.finish()
+    }
 }
 
 /// Claim `run`'s disk in this user's ledger on the live machine, relieving a short volume
@@ -89,7 +107,9 @@ impl Admitted {
 /// # Errors
 /// [`Error::Never`]: the need is more than the volume holds above its floor; [`Error::Ledger`]:
 /// no home, or the ledger could not be written (the caller runs without a claim, and says so);
-/// [`Error::Stopped`]: an interrupt ended the wait (the caller ends as NOT RUN).
+/// [`Error::Stopped`]: an interrupt ended the wait (the caller ends as NOT RUN);
+/// [`Error::Stuck`]: the wait gave up behind holders that made no progress
+/// ([`Run::stuck_ends`]).
 pub fn admit(run: Run, mode: Admit, say: &mut dyn FnMut(&str)) -> Result<Admitted, Error> {
     let ledger = Ledger::user().ok_or_else(|| {
         Error::Ledger(std::io::Error::new(
@@ -138,12 +158,14 @@ pub fn admit_on(
         });
     }
     let tag = dirs_tag(&run.dirs);
+    let scope = scope_tag(&run.scope);
     let kept = Footprints::load(&run.record);
-    let estimate = kept.need(holds, run.cold, tag);
+    let estimate = kept.need(holds, run.cold, tag, scope);
     let mut sizing = Sizing {
         relief,
         dirs: &run.dirs,
         tag,
+        scope,
         kept,
         cold: run.cold,
         holds,
@@ -153,7 +175,10 @@ pub fn admit_on(
     let claim = if estimate.bytes == 0 {
         None
     } else {
-        let need = Need::new(run.what.clone()).disk(estimate.bytes, run.on.clone());
+        let mut need = Need::new(run.what.clone()).disk(estimate.bytes, run.on.clone());
+        if let Some(after) = run.stuck_ends {
+            need = need.ends_when_stuck(after);
+        }
         let why = format!("disk: claims {estimate}");
         let mut told = false;
         let admitted = admit_relieved(
@@ -182,7 +207,7 @@ pub fn admit_on(
         .as_ref()
         .map_or(Duration::ZERO, aterm_capacity::Claim::waited);
     Ok(Admitted {
-        meter: Meter::start(run.dirs, tag, holds, claim),
+        meter: Meter::start(run.dirs, tag, scope, holds, claim),
         record: run.record,
         estimate,
         waited,
@@ -210,26 +235,24 @@ pub fn dirs_tag(dirs: &[PathBuf]) -> u64 {
     h.finish()
 }
 
-/// `path` with every link resolved as far as it exists, and the rest appended as written: a
-/// directory a run has yet to make is spelled as it will be once made. The one spelling of a
-/// run's directories: verify's run records name their roots by it too (`aterm_verify::runs`).
+/// THE IDENTITY OF WHAT A RUN BUILDS, kept with each run measured ([`Footprint::scope`]), so a
+/// run of another scope is not counted ([`aterm_capacity::Footprints::need`]): an FNV-1a digest
+/// ([`aterm_hash::Fnv1a64`]) of `scope`, which the caller spells the same each time it builds the
+/// same; stable across builds, as [`dirs_tag`] is. `None` for an empty one: a kind with one
+/// scope, whose runs kept before runs were scoped still count.
 #[must_use]
-pub fn canonical(path: &Path) -> PathBuf {
-    let mut tail = Vec::new();
-    let mut at = path;
-    loop {
-        if let Ok(real) = std::fs::canonicalize(at) {
-            return tail.iter().rev().fold(real, |acc, name| acc.join(name));
-        }
-        match (at.parent(), at.file_name()) {
-            (Some(parent), Some(name)) => {
-                tail.push(name.to_owned());
-                at = parent;
-            }
-            _ => return path.to_path_buf(),
-        }
-    }
+pub fn scope_tag(scope: &str) -> Option<u64> {
+    (!scope.is_empty()).then(|| {
+        let mut h = aterm_hash::Fnv1a64::new();
+        h.write(scope.as_bytes());
+        h.finish()
+    })
 }
+
+/// `path` with every link resolved as far as it exists, and the rest appended as written: the
+/// one spelling of a run's directories, which verify's run records name their roots by too
+/// ([`aterm_uds::runs::canonical`]).
+pub use aterm_uds::runs::canonical;
 
 /// A RUN'S CLAIM, SIZED AGAIN AFTER ITS RELIEF AND AS IT IS ADMITTED: the relief ([`Reclaim`])
 /// can remove what the run's directories held, whatever its own pass keeps (the window's disk
@@ -249,6 +272,8 @@ struct Sizing<'a> {
     dirs: &'a [PathBuf],
     /// Their tag ([`dirs_tag`]): the runs kept that were measured on them are counted.
     tag: u64,
+    /// What the run builds ([`scope_tag`]): the runs kept of that scope are counted.
+    scope: Option<u64>,
     /// What its kind's last runs took.
     kept: Footprints,
     /// What its kind writes into empty directories.
@@ -283,7 +308,7 @@ impl Relief for Sizing<'_> {
             return None;
         }
         self.holds = holds;
-        let estimate = self.kept.need(holds, self.cold, self.tag);
+        let estimate = self.kept.need(holds, self.cold, self.tag, self.scope);
         // A smaller figure (the directories grew meanwhile) leaves the claim, and why it is what
         // it is, as they were: a waiting claim is never made smaller.
         if estimate.bytes < self.estimate.bytes {
@@ -302,17 +327,42 @@ impl Relief for Sizing<'_> {
     }
 }
 
-/// WHAT STAYED OF EACH STAGE a pass could not finish (`Unused::Stayed` among what it
-/// returned), in [`crate::build_cache::remove::stayed_words`]'s words: the notes a relief line
-/// carries after what went.
+/// What a pass retained: counted entries for an ordinary failure, an uncounted remainder
+/// after revocation, or an entry nothing of which went once its intent was on record
+/// ([`crate::build_cache::Unused::Refused`]). These notes accompany the relief line's freed bytes.
 fn stayed_notes(went: &[(PathBuf, crate::build_cache::Unused)]) -> Vec<String> {
     went.iter()
         .filter_map(|(stage, why)| match *why {
             crate::build_cache::Unused::Stayed { stayed, .. } => {
                 Some(crate::build_cache::remove::stayed_words(stage, stayed))
             }
+            crate::build_cache::Unused::Revoked { freed } => Some(format!(
+                "{}: retirement permission revoked; {} went; retained remainder not counted",
+                stage.display(),
+                crate::cost::human_bytes(freed)
+            )),
+            crate::build_cache::Unused::Refused { by } => Some(format!(
+                "{}: kept, nothing of it went ({}): {}",
+                stage.display(),
+                by.word(),
+                by.reason()
+            )),
             _ => None,
         })
+        .collect()
+}
+
+/// The paths a pass's record let go (`asked`) that it removed, or began to: each but those it
+/// returned as nothing of them gone ([`crate::build_cache::Unused::nothing_went`]). Each is
+/// paired with its outcome by their order, not by path: the pass returns one outcome for each
+/// intent it put on record, in their order, and one kept in its stage is returned as the
+/// stage's path ([`crate::build_cache::Refusal::Staged`]), never the path it was asked for.
+fn went_of(asked: Vec<PathBuf>, went: &[(PathBuf, crate::build_cache::Unused)]) -> Vec<PathBuf> {
+    asked
+        .into_iter()
+        .enumerate()
+        .filter(|(n, _)| went.get(*n).is_none_or(|(_, why)| !why.nothing_went()))
+        .map(|(_, path)| path)
         .collect()
 }
 
@@ -390,7 +440,7 @@ impl Reclaim {
                         None,
                         &mut recorder(&keep, halt, &mut removed),
                     );
-                    (removed, stayed_notes(&went))
+                    (went_of(removed, &went), stayed_notes(&went))
                 })
                 .unwrap_or_default();
                 (free_on(mount).saturating_sub(before), removed, stayed)
@@ -581,9 +631,7 @@ fn cache_on(mount: &Path) -> bool {
 fn ask_watch(bytes: u64, mount: &Path, stopped: Stopped<'_>) -> Option<String> {
     std::env::var_os("ATERM_SESSION_ID").filter(|v| !v.is_empty())?;
     let path = std::env::var_os("PATH")?;
-    let aterm = std::env::split_paths(&path)
-        .map(|d| d.join("aterm"))
-        .find(|p| p.is_file())?;
+    let aterm = crate::vendor::first_on_path("aterm", Some(&path))?;
     let mut child = aterm_uds::spawnfd::command(&aterm)
         .args([
             "ctl".to_owned(),
@@ -603,9 +651,10 @@ fn ask_watch(bytes: u64, mount: &Path, stopped: Stopped<'_>) -> Option<String> {
     // stalls it; an ask ended by an interrupt leaves them, which end with its pipes.
     let reader = |pipe: Option<Box<dyn std::io::Read + Send>>| {
         std::thread::spawn(move || {
+            use std::io::Read as _;
             let mut text = String::new();
-            if let Some(mut p) = pipe {
-                let _ = p.read_to_string(&mut text);
+            if let Some(p) = pipe {
+                let _ = p.take(64 * 1024).read_to_string(&mut text);
             }
             text
         })

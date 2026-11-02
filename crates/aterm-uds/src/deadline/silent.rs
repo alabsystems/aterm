@@ -233,6 +233,154 @@ fn prints_judged(
     }
 }
 
+/// A test's run of `cmd` to its end, its output drained and its stdin `/dev/null`, within `hang`, the test's hang detector. That is [`ECHO_HANG`] for one thing that must happen, such as the test binary run again in place (`current_exe`, whose exec macOS assessed when the test binary started), and the run's own detectors added up past that when it waits in turn on several. A copy of the test binary at a new path is a first exec instead, which [`prints`] proves within [`FIRST_EXEC_HANG`](super::FIRST_EXEC_HANG) before its file goes. The run leads a process group of its own; at `hang` it is asked whether macOS's program check holds it, the group is killed, and the run is reaped within [`ECHO_HANG`] (one the kill does not end is handed to [`crate::reaper`]). A run the program check held ends the test COULD NOT RUN ([`held_words`]).
+///
+/// # Panics
+/// When the run does not start, cannot be waited on, or, not held, outlives `hang`: the test's own failure, naming the run and what it wrote by its end.
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(unix)]
+#[track_caller]
+pub fn ends_within(cmd: &mut crate::spawnfd::Command, hang: Duration) -> std::process::Output {
+    ends_within_by(
+        cmd,
+        hang,
+        &Overrun {
+            held: &program_check,
+            kill: super::children::kill_group,
+            reap: ECHO_HANG,
+        },
+    )
+}
+
+/// [`ends_within`] for a test's own `std` launch, one a `pre_exec` step or the signal state it measures keeps off [`crate::spawnfd`]. Past `hang` only the child is killed: it is in the process group `std` left it in, often the test binary's own.
+///
+/// # Panics
+/// As [`ends_within`]'s.
+#[cfg(all(unix, test))]
+#[track_caller]
+pub(crate) fn std_ends_within(
+    cmd: &mut std::process::Command,
+    hang: Duration,
+) -> std::process::Output {
+    std_ends_within_by(
+        cmd,
+        hang,
+        &Overrun {
+            held: &program_check,
+            kill: kill_child,
+            reap: ECHO_HANG,
+        },
+    )
+}
+
+/// [`std_ends_within`], with `how` to end a run past `hang`.
+#[cfg(all(unix, test))]
+#[track_caller]
+fn std_ends_within_by(
+    cmd: &mut std::process::Command,
+    hang: Duration,
+    how: &Overrun<'_, std::process::Child>,
+) -> std::process::Output {
+    let program = cmd.get_program().to_string_lossy().into_owned();
+    let mut child = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("{program} {}", super::RunError::Spawn(e)));
+    let pipes = (child.stdout.take(), child.stderr.take());
+    judged(&program, child, pipes, None, hang, how)
+}
+
+/// `SIGKILL` `child` alone, until it is reaped (`std` signals nothing after).
+#[cfg(all(unix, test))]
+fn kill_child(child: &mut std::process::Child) {
+    let _ = child.kill();
+}
+
+/// [`crate::process::at_program_check`] for a child's pid.
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(unix)]
+fn program_check(pid: u32) -> Option<bool> {
+    crate::process::at_program_check(i32::try_from(pid).unwrap_or(0))
+}
+
+/// How a test's wait ends a run past its hang detector: `held` is asked whether macOS's program
+/// check holds the run's pid while it still runs, `kill` signals it, and its reap is waited on
+/// within `reap`.
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(unix)]
+struct Overrun<'a, C> {
+    held: &'a dyn Fn(u32) -> Option<bool>,
+    kill: fn(&mut C),
+    reap: Duration,
+}
+
+/// [`ends_within`], with `how` to end a run past `hang`.
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(unix)]
+#[track_caller]
+fn ends_within_by(
+    cmd: &mut crate::spawnfd::Command,
+    hang: Duration,
+    how: &Overrun<'_, crate::spawnfd::Child>,
+) -> std::process::Output {
+    let program = cmd.get_program().to_string_lossy().into_owned();
+    let (child, pipes, group) = super::started(cmd, crate::spawnfd::Stdio::null())
+        .unwrap_or_else(|e| panic!("{program} {e}"));
+    judged(&program, child, pipes, group, hang, how)
+}
+
+/// `child`, `program`'s run, started with `pipes` and leading `group` when it leads one, waited on
+/// to its end within `hang` and judged as [`ends_within`] says, `how` ending it past `hang`.
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(unix)]
+#[track_caller]
+fn judged<C: super::Waited>(
+    program: &str,
+    child: C,
+    pipes: super::Pipes,
+    group: Option<u32>,
+    hang: Duration,
+    how: &Overrun<'_, C>,
+) -> std::process::Output {
+    let by = super::saturating_after(std::time::Instant::now(), hang);
+    let mut overran = None;
+    let ended = super::drained_by(
+        child,
+        pipes,
+        group,
+        &mut || by.saturating_duration_since(std::time::Instant::now()),
+        &mut |child| {
+            let pid = child.pid();
+            overran = Some((pid, (how.held)(pid)));
+            (how.kill)(child);
+            super::reap_within(
+                child,
+                None,
+                super::saturating_after(std::time::Instant::now(), how.reap),
+            );
+        },
+    );
+    match ended {
+        Ok(Ok(out)) => out,
+        Ok(Err(late)) => {
+            let (pid, held) = overran.unwrap_or_default();
+            if let Some(words) = held_words(pid, hang, held) {
+                could_not_run(words);
+            }
+            let (stdout, stderr) = late.wrote();
+            panic!(
+                "{program} (pid {pid}) did not finish in time: not within its {hang:?} hang \
+                 detector\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&stdout),
+                String::from_utf8_lossy(&stderr)
+            )
+        }
+        Err(e) => panic!("{program} {e}"),
+    }
+}
+
 /// `child` killed and reaped within the one-minute hang detector ([`super::kill_within`]), its file left.
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg(unix)]
@@ -276,8 +424,9 @@ fn stand_in_cache() -> std::path::PathBuf {
     std::env::temp_dir().join("aterm-ad-hoc-stand-ins")
 }
 
-/// Where the stand-in of this version of `from` is kept in `cache`: its name holds `from`'s
-/// size, modification time and inode, which an OS update that replaces the binary changes.
+/// Where the stand-in of this version of `from` is kept in `cache`: a directory holds
+/// `from`'s size, modification time and inode, while its executable name stays intact.
+/// Programs such as Git choose their behavior from that executable name.
 #[cfg(all(unix, any(target_vendor = "apple", test)))]
 #[track_caller]
 fn kept_at(cache: &std::path::Path, from: &std::path::Path) -> std::path::PathBuf {
@@ -287,13 +436,16 @@ fn kept_at(cache: &std::path::Path, from: &std::path::Path) -> std::path::PathBu
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("stand-in");
-    cache.join(format!(
-        "{name}-{}-{}.{}-{}",
-        meta.len(),
-        meta.mtime(),
-        meta.mtime_nsec(),
-        meta.ino()
-    ))
+    cache
+        .join("named")
+        .join(format!(
+            "{name}-{}-{}.{}-{}",
+            meta.len(),
+            meta.mtime(),
+            meta.mtime_nsec(),
+            meta.ino()
+        ))
+        .join(name)
 }
 
 /// The copy of `from` in `cache` that `sign` signed ([`kept_at`]), made the first time this
@@ -331,6 +483,8 @@ fn signed_stand_in(
     std::fs::copy(from, &fresh)
         .unwrap_or_else(|e| panic!("copy {} to {}: {e}", from.display(), fresh.display()));
     sign(&fresh);
+    let parent = signed.parent().expect("stand-in has a version directory");
+    std::fs::create_dir_all(parent).unwrap_or_else(|e| panic!("create {}: {e}", parent.display()));
     match std::fs::hard_link(&fresh, &signed) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -437,6 +591,11 @@ mod tests {
         };
         let first = super::signed_stand_in(&cache, &binary, &mut sign);
         let again = super::signed_stand_in(&cache, &binary, &mut sign);
+        assert_eq!(
+            first.file_name(),
+            binary.file_name(),
+            "argv[0] keeps the program's name"
+        );
         assert_eq!(first, again, "one stand-in per version");
         assert_eq!(std::fs::read(&first).unwrap(), b"version one signed");
         std::fs::write(&binary, b"version two, longer").expect("the binary changes");
@@ -469,6 +628,7 @@ mod tests {
         let mut placed = None;
         let got = super::signed_stand_in(&cache, &binary, &mut |fresh| {
             std::fs::write(fresh, b"ours").expect("sign ours");
+            std::fs::create_dir_all(kept.parent().unwrap()).unwrap();
             std::fs::write(&kept, b"theirs").expect("another process places its own");
             placed = Some(std::fs::metadata(&kept).expect("theirs").ino());
         });
@@ -663,12 +823,62 @@ mod tests {
         assert_eq!(asked, 1, "the next ask signs");
     }
 
+    /// Whether `pid` is this test's own child and has not exited: a `WNOWAIT` `waitid`, which
+    /// reads alike on every Unix and reaps nothing.
+    fn runs_as_ours(pid: u32) -> bool {
+        // SAFETY: every field of `siginfo_t` is an integer or a pointer, so all-zero is valid.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: a non-blocking `WNOWAIT` `waitid` of one pid into the live local `info`.
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                libc::id_t::from(pid),
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        // SAFETY: `info` was zeroed, then filled by `waitid` or, with no exit to report under
+        // `WNOHANG`, left with `si_pid` 0.
+        rc == 0 && unsafe { info.si_pid() } == 0
+    }
+
+    /// Whether `pid` is no child of this test's any more: reaped, so `waitid` answers `ECHILD`.
+    fn reaped(pid: u32) -> bool {
+        // SAFETY: as in `runs_as_ours`.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: as in `runs_as_ours`.
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                libc::id_t::from(pid),
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
+    }
+
+    /// The pid a run wrote to `mark` (`echo $$ > mark`), once it has written all of it, within
+    /// the one-minute hang detector.
+    fn wrote_pid(mark: &std::path::Path) -> Option<u32> {
+        let by = std::time::Instant::now() + super::ECHO_HANG;
+        loop {
+            let read = std::fs::read_to_string(mark).unwrap_or_default();
+            if let Some(pid) = read.strip_suffix('\n') {
+                return pid.parse().ok();
+            }
+            if std::time::Instant::now() >= by {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     /// A child the program check holds past the hang detector ends the test COULD NOT RUN,
     /// naming it, and is killed and reaped; one that is not held, or unread, is still the
     /// test's own failure. (`sleep` writes nothing, so the 100 ms runs out by construction.)
     /// The reader is asked about the child itself while it still runs: the fake answers only
-    /// for the child's pid while the program check's own reader still reads it, which on
-    /// macOS a killed and reaped child no longer does.
+    /// for the child's pid while it is this test's unexited child (`runs_as_ours`).
     #[test]
     fn a_child_held_at_the_program_check_ends_could_not_run_and_others_still_hang() {
         use crate::spawnfd::{Stdio, command};
@@ -680,15 +890,16 @@ mod tests {
                 .spawn()
                 .expect("spawn");
             let pid = child.id();
-            let runs = |asked: u32| {
-                crate::process::at_program_check(i32::try_from(asked).unwrap_or(0)).is_some()
-            };
             let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 super::prints_judged(
                     &mut child,
                     "ran",
                     std::time::Duration::from_millis(100),
-                    &|asked| (asked == pid && runs(asked)).then_some(held).flatten(),
+                    &|asked| {
+                        (asked == pid && runs_as_ours(asked))
+                            .then_some(held)
+                            .flatten()
+                    },
                 );
             }))
             .expect_err("a silent child ends the test");
@@ -713,6 +924,179 @@ mod tests {
             assert!(
                 why.starts_with(&format!("the copied program (pid {pid}) never wrote")),
                 "{held:?}: {why}"
+            );
+        }
+    }
+
+    /// A run that outlives its hang detector ends the test: COULD NOT RUN, naming it, while the
+    /// program check held it then, and otherwise the test's own failure, naming it with what it
+    /// wrote; either way it is killed and reaped. A run that ends hands back its status and
+    /// output. Both the `spawnfd` run and a test's own `std` launch are judged so. The run
+    /// writes a line, then its pid, then sleeps past the 100 ms by construction. The fake
+    /// reads the pid the run wrote (within the one-minute hang detector) and answers only while
+    /// the pid it was given is this test's unexited child, so it is asked about the run itself,
+    /// while it still runs.
+    #[test]
+    fn a_run_past_its_hang_detector_ends_the_test_and_one_held_could_not_run() {
+        const RUN: &str = "echo ran; echo $$ > \"$0\"; exec /bin/sleep 30";
+        let hang = std::time::Duration::from_millis(100);
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let ends = |held: Option<bool>, by_std: bool| {
+            let mark = dir.path().join(format!("pid-{held:?}-{by_std}"));
+            let asked = std::cell::Cell::new(None);
+            let fake = |pid| {
+                asked.set(Some((pid, wrote_pid(&mark))));
+                runs_as_ours(pid).then_some(held).flatten()
+            };
+            let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if by_std {
+                    let how = super::Overrun {
+                        held: &fake,
+                        kill: super::kill_child,
+                        reap: super::ECHO_HANG,
+                    };
+                    super::std_ends_within_by(
+                        std::process::Command::new("/bin/sh")
+                            .args(["-c", RUN])
+                            .arg(&mark),
+                        hang,
+                        &how,
+                    );
+                } else {
+                    let how = super::Overrun {
+                        held: &fake,
+                        kill: crate::deadline::children::kill_group,
+                        reap: super::ECHO_HANG,
+                    };
+                    super::ends_within_by(
+                        crate::spawnfd::command("/bin/sh")
+                            .args(["-c", RUN])
+                            .arg(&mark),
+                        hang,
+                        &how,
+                    );
+                }
+            }))
+            .expect_err("a run past its hang detector ends the test");
+            let why = refused
+                .downcast_ref::<String>()
+                .expect("the wait panics with its words")
+                .clone();
+            let (pid, its) = asked
+                .get()
+                .expect("the run was asked about at its hang detector");
+            assert_eq!(
+                Some(pid),
+                its,
+                "{held:?}, std {by_std}: the run itself was asked"
+            );
+            assert!(reaped(pid), "{held:?}, std {by_std}: killed and reaped");
+            (pid, why)
+        };
+        for by_std in [false, true] {
+            let (pid, why) = ends(Some(true), by_std);
+            assert!(
+                why.starts_with(crate::host::COULD_NOT_RUN)
+                    && why.contains(&format!("(pid {pid})")),
+                "std {by_std}: expected COULD NOT RUN naming it, got: {why}"
+            );
+            for held in [Some(false), None] {
+                let (pid, why) = ends(held, by_std);
+                assert!(
+                    why.starts_with(&format!("/bin/sh (pid {pid}) did not finish in time"))
+                        && why.contains("\nstdout: ran\n"),
+                    "{held:?}, std {by_std}: {why}"
+                );
+            }
+        }
+        let shell = "echo out; echo err >&2; exit 3";
+        for out in [
+            super::ends_within(
+                crate::spawnfd::command("/bin/sh").args(["-c", shell]),
+                super::ECHO_HANG,
+            ),
+            super::std_ends_within(
+                std::process::Command::new("/bin/sh").args(["-c", shell]),
+                super::ECHO_HANG,
+            ),
+        ] {
+            assert_eq!(
+                (out.status.code(), &out.stdout[..], &out.stderr[..]),
+                (Some(3), &b"out\n"[..], &b"err\n"[..])
+            );
+        }
+    }
+
+    /// A run its kill does not end (whether a program macOS's program check holds takes its
+    /// `SIGKILL` is unmeasured) still ends the test, once its reap has been waited on for its
+    /// bound: the kill here sends nothing, and the outer wait is the one-minute hang detector.
+    /// The run, which nothing signalled, is then killed by its pid: this test's own unexited
+    /// child, which the fake was asked about. NEGATIVE CONTROL: with the reap after the kill
+    /// the unbounded wait it was, the run outlives the hang detector and the test fails.
+    #[test]
+    fn a_run_its_kill_does_not_end_still_ends_the_test_at_its_hang_detector() {
+        let (tell, asked) = std::sync::mpsc::channel();
+        let (tx, ended) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let held = |pid| {
+                let _ = tell.send(pid);
+                runs_as_ours(pid).then_some(true)
+            };
+            let waited = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                super::ends_within_by(
+                    crate::spawnfd::command("/bin/sleep").arg("120"),
+                    std::time::Duration::from_millis(100),
+                    &super::Overrun {
+                        held: &held,
+                        kill: |_| {},
+                        reap: std::time::Duration::from_millis(100),
+                    },
+                );
+            }));
+            let _ = tx.send(waited.map_err(|why| why.downcast_ref::<String>().cloned()));
+        });
+        let pid = asked
+            .recv_timeout(super::ECHO_HANG)
+            .expect("the run was asked about at its hang detector");
+        let waited = ended.recv_timeout(super::ECHO_HANG);
+        if runs_as_ours(pid) {
+            let _ = crate::process::kill_group_until_empty(i32::try_from(pid).expect("a pid"));
+        }
+        let why = waited
+            .expect(
+                "the wait on a run its kill does not end ended within the one-minute hang detector",
+            )
+            .expect_err("a run past its hang detector ends the test")
+            .expect("the wait panics with its words");
+        assert!(
+            why.starts_with(crate::host::COULD_NOT_RUN) && why.contains(&format!("(pid {pid})")),
+            "{why}"
+        );
+    }
+
+    /// A run that cannot start is the test's own failure, naming the program and why, never a
+    /// COULD NOT RUN, for the `spawnfd` run and a test's own `std` launch alike.
+    #[test]
+    fn a_run_that_cannot_start_fails_its_test_naming_it() {
+        const MISSING: &str = "/nonexistent/aterm-uds-no-such-program";
+        let refused = |run: &dyn Fn()| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(run))
+                .expect_err("a run that cannot start ends the test")
+                .downcast_ref::<String>()
+                .expect("the wait panics with its words")
+                .clone()
+        };
+        for why in [
+            refused(&|| {
+                super::ends_within(&mut crate::spawnfd::command(MISSING), super::ECHO_HANG);
+            }),
+            refused(&|| {
+                super::std_ends_within(&mut std::process::Command::new(MISSING), super::ECHO_HANG);
+            }),
+        ] {
+            assert!(
+                why.starts_with(&format!("{MISSING} could not start: ")),
+                "{why}"
             );
         }
     }

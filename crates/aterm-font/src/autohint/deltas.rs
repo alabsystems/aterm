@@ -3,7 +3,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //
 // Derived from skrifa 0.46.2 src/outline/glyf/deltas.rs and modified by the
-// aterm project in 2026.
+// aterm project in 2026: specialized to integer points and 16.16 deltas (the
+// unscaled loader's types), every index checked.
 // See ../../LICENSE-FONTATIONS for the upstream license.
 
 //! Glyph `gvar` deltas at a variation instance, including FreeType IUP interpolation.
@@ -13,6 +14,7 @@ use core::ops::RangeInclusive;
 use super::fixed::{F2Dot14, Fixed, Point};
 use super::glyf::{PHANTOM_POINT_COUNT, PointFlags, PointMarker};
 use super::tuple::{Gvar, ReadError, TupleVariation};
+use crate::work::VariationWork;
 
 /// Computes `gvar` deltas for a composite glyph's component offsets and phantom points.
 pub(crate) fn composite_glyph(
@@ -20,16 +22,24 @@ pub(crate) fn composite_glyph(
     glyph_id: u16,
     coords: &[F2Dot14],
     deltas: &mut [Point<Fixed>],
+    work: &mut VariationWork,
 ) -> Result<(), ReadError> {
-    compute_deltas_for_glyph(gvar, glyph_id, coords, deltas, |scalar, tuple, deltas| {
-        for tuple_delta in tuple.deltas() {
-            let ix = tuple_delta.position as usize;
-            if let Some(delta) = deltas.get_mut(ix) {
-                *delta += tuple_delta.apply_scalar(scalar);
+    compute_deltas_for_glyph(
+        gvar,
+        glyph_id,
+        coords,
+        deltas,
+        work,
+        |scalar, tuple, deltas| {
+            for tuple_delta in tuple.deltas(deltas.len()) {
+                let ix = tuple_delta.position as usize;
+                if let Some(delta) = deltas.get_mut(ix) {
+                    *delta += tuple_delta.apply_scalar(scalar);
+                }
             }
-        }
-        Ok(())
-    })
+            Ok(())
+        },
+    )
 }
 
 /// A simple glyph's points, flags and contour end points.
@@ -47,6 +57,7 @@ pub(crate) fn simple_glyph(
     glyph: SimpleGlyph,
     iup_buffer: &mut [Point<Fixed>],
     deltas: &mut [Point<Fixed>],
+    work: &mut VariationWork,
 ) -> Result<(), ReadError> {
     if iup_buffer.len() < glyph.points.len() || glyph.points.len() < PHANTOM_POINT_COUNT {
         return Err(ReadError);
@@ -59,25 +70,40 @@ pub(crate) fn simple_glyph(
         flags,
         contours,
     } = glyph;
-    compute_deltas_for_glyph(gvar, glyph_id, coords, deltas, |scalar, tuple, deltas| {
-        for ((flag, point), iup_point) in flags.iter_mut().zip(points).zip(&mut iup_buffer[..]) {
-            *iup_point = point.map(Fixed::from_i32);
-            flag.clear_marker(PointMarker::HAS_DELTA);
-        }
-        tuple.accumulate_sparse_deltas(iup_buffer, flags, scalar)?;
-        interpolate_deltas(points, flags, contours, &mut iup_buffer[..]).ok_or(ReadError)?;
-        for ((delta, point), iup_point) in deltas.iter_mut().zip(points).zip(iup_buffer.iter()) {
-            *delta += *iup_point - point.map(Fixed::from_i32);
-        }
-        Ok(())
-    })
+    compute_deltas_for_glyph(
+        gvar,
+        glyph_id,
+        coords,
+        deltas,
+        work,
+        |scalar, tuple, deltas| {
+            for ((flag, point), iup_point) in flags.iter_mut().zip(points).zip(&mut iup_buffer[..])
+            {
+                *iup_point = point.map(Fixed::from_i32);
+                flag.clear_marker(PointMarker::HAS_DELTA);
+            }
+            tuple.accumulate_sparse_deltas(iup_buffer, flags, scalar)?;
+            interpolate_deltas(points, flags, contours, &mut iup_buffer[..]).ok_or(ReadError)?;
+            for ((delta, point), iup_point) in deltas.iter_mut().zip(points).zip(iup_buffer.iter())
+            {
+                *delta += *iup_point - point.map(Fixed::from_i32);
+            }
+            Ok(())
+        },
+    )
 }
 
+/// Sums the deltas of every tuple active at `coords` into `deltas`, charging
+/// `work` before any of it runs: a step per tuple header read to find the
+/// active ones, and for each active tuple a step per point it walks (`deltas`,
+/// phantom points included) or per point number it reads, whichever is more.
+/// Past the budget it stops with an error, and the loader refuses the glyph.
 fn compute_deltas_for_glyph(
     gvar: &Gvar,
     glyph_id: u16,
     coords: &[F2Dot14],
     deltas: &mut [Point<Fixed>],
+    work: &mut VariationWork,
     mut apply_sparse: impl FnMut(Fixed, TupleVariation, &mut [Point<Fixed>]) -> Result<(), ReadError>,
 ) -> Result<(), ReadError> {
     for delta in deltas.iter_mut() {
@@ -86,6 +112,12 @@ fn compute_deltas_for_glyph(
     let Ok(Some(var_data)) = gvar.glyph_variation_data(glyph_id) else {
         return Ok(());
     };
+    work.take(usize::from(var_data.tuple_count()))
+        .ok_or(ReadError)?;
+    for (tuple, _) in var_data.active_tuples_at(coords) {
+        work.take(deltas.len().max(tuple.point_count()))
+            .ok_or(ReadError)?;
+    }
     for (tuple, scalar) in var_data.active_tuples_at(coords) {
         if tuple.has_deltas_for_all_points() {
             tuple.accumulate_dense_deltas(deltas, scalar)?;

@@ -191,7 +191,11 @@ pub(crate) fn settle_session(
 mod tests {
     use super::*;
 
-    const BIN: &str = "/Applications/aterm.app/Contents/MacOS";
+    /// The bundle's binary directory, absolute as this host reads a path (a path with no drive
+    /// is relative on Windows, and `wants_hint` skips a relative entry).
+    fn bin() -> String {
+        crate::test_host::abs("/Applications/aterm.app/Contents/MacOS")
+    }
 
     fn path_of(dirs: &[&str]) -> std::ffi::OsString {
         std::env::join_paths(dirs).expect("a PATH")
@@ -199,7 +203,7 @@ mod tests {
 
     /// `amacs` under the bundle dir, and nowhere else.
     fn laid(path: &std::path::Path) -> bool {
-        path == std::path::Path::new(BIN)
+        path == std::path::Path::new(&bin())
             .join(format!("{EDITOR_WORD}{}", std::env::consts::EXE_SUFFIX))
     }
 
@@ -209,7 +213,7 @@ mod tests {
     /// dir's twin) wants none.
     #[test]
     fn the_hint_is_wanted_only_when_every_condition_holds() {
-        let path = path_of(&["/usr/bin", BIN, "/bin"]);
+        let path = path_of(&["/usr/bin", &bin(), "/bin"]);
         assert!(wants_hint(true, false, false, Some(&path), laid));
         assert!(!wants_hint(false, false, false, Some(&path), laid));
         assert!(!wants_hint(true, true, false, Some(&path), laid));
@@ -219,7 +223,10 @@ mod tests {
         assert!(!wants_hint(true, false, false, None, laid));
         let relative = path_of(&["Applications/aterm.app/Contents/MacOS"]);
         assert!(!wants_hint(true, false, false, Some(&relative), |p| {
-            p.ends_with(format!("Contents/MacOS/{EDITOR_WORD}"))
+            p.ends_with(format!(
+                "Contents/MacOS/{EDITOR_WORD}{}",
+                std::env::consts::EXE_SUFFIX
+            ))
         }));
     }
 
@@ -435,7 +442,7 @@ mod tests {
     /// watcher parses it.
     fn apply(app: &mut crate::App, dir: &std::path::Path, text: &str) {
         let path = dir.join("aterm.toml");
-        std::fs::write(&path, text).expect("write config");
+        crate::test_scratch::write_config(&path, text);
         let observation =
             crate::native_config_service::VersionedConfigService::observe_path(&path, false)
                 .expect("observe");

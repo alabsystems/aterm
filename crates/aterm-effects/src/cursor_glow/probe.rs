@@ -249,33 +249,6 @@ impl CursorGlow {
             i32::MAX
         };
         self.frame_text.pane = Some([r0, r0 + cells.len() as i32, c0, pane_end]);
-        // The rows the pet's body lay on last frame, padded for its flight:
-        // its page veil reads the letters under the body wherever it lies,
-        // not only near the caret (`[vim] NORMAL` printed under the cat five
-        // rows below a caret that moved up went bare, looks8 round 2).
-        const PET_TEXT_PAD: i32 = 3;
-        let pet_rows = match (self.pet_body, self.veil_frame) {
-            (Some((_, _, y0, y1)), Some((_, g))) if g.ch > 0 => {
-                let (oy, ch) = (i32::from(g.origin_y), g.ch as i32);
-                Some((
-                    (y0 - oy).div_euclid(ch) - PET_TEXT_PAD,
-                    (y1 - 1 - oy).div_euclid(ch) + PET_TEXT_PAD,
-                ))
-            }
-            _ => None,
-        };
-        #[inline]
-        const fn clamp_row_span(a: i32, b: i32, r0: i32, len: usize) -> (i32, i32) {
-            let hi = r0 + len as i32 - 1;
-            (if a > r0 { a } else { r0 }, if b < hi { b } else { hi })
-        }
-        match pet_rows {
-            Some((a, b)) => {
-                let (a, b) = clamp_row_span(a, b.min(a + MAX_ROWS - 1), r0, cells.len());
-                read_text(&mut self.pet_text, (cells, marks), (a, b), (c0, r0), now);
-            }
-            None => read_text(&mut self.pet_text, (cells, marks), (1, 0), (c0, r0), now),
-        }
         if lo > hi {
             read_text(&mut self.frame_text, (cells, marks), (1, 0), (c0, r0), now);
             return;
@@ -299,6 +272,7 @@ impl CursorGlow {
     /// coverage; with `None`, as its colour whole (each style's own account of the face).
     #[inline]
     pub fn observe_glyph_ink(&mut self, ink: Option<std::sync::Arc<aterm_render::GlyphInk>>) {
+        self.glyph_frame_available = ink.is_some();
         let same = match (&self.glyph_ink, &ink) {
             (Some(a), Some(b)) => {
                 std::sync::Arc::ptr_eq(a, b) || a.fingerprint() == b.fingerprint() && **a == **b
@@ -309,6 +283,22 @@ impl CursorGlow {
         if !same {
             self.glyph_ink = ink;
         }
+    }
+
+    /// What the host's face lays of each glyph, as last observed ([`Self::observe_glyph_ink`]):
+    /// the host reads the window's page off it (`host::PageFacts::thin_ink`); `None` before the
+    /// first observation.
+    #[inline]
+    #[must_use]
+    pub const fn glyph_ink(&self) -> Option<&std::sync::Arc<aterm_render::GlyphInk>> {
+        self.glyph_ink.as_ref()
+    }
+
+    /// The shared renderer is temporarily unavailable for this frame. Preserve the window's
+    /// existing letter-guard table while refusing its use as current glass evidence.
+    #[inline]
+    pub fn observe_glyph_ink_unavailable(&mut self) {
+        self.glyph_frame_available = false;
     }
 
     /// Host observation.
@@ -521,6 +511,7 @@ fn read_text(
     ft.pairs.clear();
     ft.short.clear();
     ft.glyph.clear();
+    ft.plain.clear();
     ft.cols = 0;
     ft.col0 = c0;
     ft.at = Some(now);
@@ -547,6 +538,7 @@ fn read_text(
     ft.pairs.reserve(n_rows * ft.cols);
     ft.short.reserve(n_rows * ft.cols);
     ft.glyph.reserve(n_rows * ft.cols);
+    ft.plain.reserve(n_rows * ft.cols);
     let mut row = lo;
     while row <= hi {
         let line = cells[(row - r0) as usize].as_slice();
@@ -587,6 +579,17 @@ fn read_text(
             } else {
                 aterm_render::GlyphInk::index(cell.ch, cell.bold)
             });
+            ft.plain.push(
+                is_glyph
+                    && !cell.wide
+                    && !marked
+                    && !cell.italic
+                    && matches!(cell.underline, aterm_core::terminal::UnderlineStyle::None)
+                    && !cell.strikethrough
+                    && !cell.overline
+                    && !cell.emoji_presentation
+                    && matches!(cell.script, aterm_core::terminal::Script::Normal),
+            );
             c += 1;
         }
         if n_cols < ft.cols {
@@ -596,6 +599,7 @@ fn read_text(
                 ft.glyph.len() + (ft.cols - n_cols),
                 aterm_render::GlyphInk::OTHER,
             );
+            ft.plain.resize(ft.plain.len() + (ft.cols - n_cols), false);
         }
         ft.rows.push(first_glyph.map(|first| (first, last_glyph)));
         row += 1;

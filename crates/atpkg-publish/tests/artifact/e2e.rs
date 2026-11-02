@@ -98,6 +98,15 @@ fn a_cc_built_sysroot_ships_one_compiler_under_one_signature() {
     } else {
         "x86_64-apple-darwin"
     };
+    let mut max_deadline = Run::new(aterm_uds::os_path!("true"), Vec::<String>::new());
+    max_deadline.deadline = Some(std::time::Duration::MAX);
+    assert!(
+        HostTools
+            .run(&max_deadline)
+            .expect("Duration::MAX deadline")
+            .success(),
+        "HostTools::run saturates overflowing deadlines instead of panicking"
+    );
     let src = root.join("src");
     put(&src.join("driver.c"), b"int driver(void) { return 42; }\n");
     put(

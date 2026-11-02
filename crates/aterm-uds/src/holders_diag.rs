@@ -1,0 +1,193 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! Linux's listening `AF_UNIX` sockets, read from the kernel's socket dump (`NETLINK_SOCK_DIAG`,
+//! `sock_diag(7)`) and decoded by [`aterm_sysprobe::linux::unix_diag_listeners`]: the thin
+//! reader [`super::scan_listener_holders`] matches with each process's descriptor table.
+
+use std::io;
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+use std::time::Duration;
+
+use aterm_sysprobe::linux::{
+    Dump, DumpFault, UnixDiagListener, unix_diag_listeners, unix_diag_request,
+};
+
+/// The sequence the one request carries, which every message of its answer repeats.
+const SEQ: u32 = 1;
+
+/// One datagram's room: the kernel sizes a dump's datagrams under 32 KiB.
+const DATAGRAM_ROOM: usize = 64 * 1024;
+
+/// The most datagrams one dump may take before it is refused as one that does not end.
+const DATAGRAMS_MAX: usize = 4096;
+
+/// Every listening `AF_UNIX` socket bound at a path in this network namespace, with the file its
+/// bind made, from the kernel's socket dump. The socket is connected to the kernel, so no other
+/// process can send into it, and each receive waits at most `deadline`.
+///
+/// # Errors
+///
+/// The socket, the request or a receive failing (`TimedOut` past `deadline`; the kernel without
+/// `CONFIG_UNIX_DIAG` or a sandbox refusing a netlink socket answers here), a datagram longer
+/// than its room, more than [`DATAGRAMS_MAX`] datagrams, or a [`DumpFault`] (`InvalidData` for a
+/// torn one, the errno for a refusal, `Interrupted` for an interrupted dump). `/proc/net/unix` is
+/// never read: a socket name holding a newline forges its rows.
+pub(super) fn unix_listeners(deadline: Duration) -> io::Result<Vec<UnixDiagListener>> {
+    let socket = connected(deadline)?;
+    send_request(&socket)?;
+    let mut room = vec![0_u8; DATAGRAM_ROOM];
+    let mut listeners = Vec::new();
+    for _ in 0..DATAGRAMS_MAX {
+        let n = receive(&socket, &mut room)?;
+        match unix_diag_listeners(&room[..n], SEQ, &mut listeners) {
+            Ok(Dump::Done) => return Ok(listeners),
+            Ok(Dump::More) => {}
+            Err(fault) => return Err(fault_error(fault)),
+        }
+    }
+    Err(io::Error::other(format!(
+        "the socket dump did not end within {DATAGRAMS_MAX} datagrams"
+    )))
+}
+
+/// The error a [`DumpFault`] is.
+fn fault_error(fault: DumpFault) -> io::Error {
+    match fault {
+        DumpFault::Torn(what) => io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("the socket dump is torn: {what}"),
+        ),
+        DumpFault::Refused(errno) => io::Error::from_raw_os_error(errno),
+        DumpFault::Interrupted => io::Error::new(
+            io::ErrorKind::Interrupted,
+            "the socket table changed while the kernel dumped it",
+        ),
+    }
+}
+
+/// A `NETLINK_SOCK_DIAG` socket connected to the kernel (port 0), each receive bounded by
+/// `deadline`. Once connected, netlink takes no unicast into it from any other port.
+#[cfg_attr(trust_verify, trust::skip)]
+fn connected(deadline: Duration) -> io::Result<OwnedFd> {
+    // SAFETY: `socket` takes plain integers and returns a new descriptor or -1.
+    let raw = unsafe {
+        libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+            libc::NETLINK_SOCK_DIAG,
+        )
+    };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `raw` is the descriptor `socket` just returned, owned by nothing else.
+    let socket = unsafe { OwnedFd::from_raw_fd(raw) };
+    let wait = libc::timeval {
+        tv_sec: libc::time_t::try_from(deadline.as_secs()).unwrap_or(libc::time_t::MAX),
+        tv_usec: libc::suseconds_t::from(deadline.subsec_micros()),
+    };
+    // SAFETY: `wait` is a live `timeval` of the length passed, read during the call only.
+    let set = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            std::ptr::from_ref(&wait).cast(),
+            socklen_of::<libc::timeval>(),
+        )
+    };
+    if set != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `sockaddr_nl` is plain integers, for which all-zero bytes are a valid value.
+    let mut kernel: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+    kernel.nl_family = libc::sa_family_t::try_from(libc::AF_NETLINK)
+        .map_err(|_| io::Error::other("AF_NETLINK does not fit sa_family_t"))?;
+    // SAFETY: `kernel` is a live `sockaddr_nl` of the length passed, read during the call only.
+    let joined = unsafe {
+        libc::connect(
+            socket.as_raw_fd(),
+            std::ptr::from_ref(&kernel).cast(),
+            socklen_of::<libc::sockaddr_nl>(),
+        )
+    };
+    if joined != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(socket)
+}
+
+/// `T`'s size as a `socklen_t`.
+fn socklen_of<T>() -> libc::socklen_t {
+    libc::socklen_t::try_from(std::mem::size_of::<T>()).unwrap_or(libc::socklen_t::MAX)
+}
+
+/// Send the dump's request whole.
+#[cfg_attr(trust_verify, trust::skip)]
+fn send_request(socket: &OwnedFd) -> io::Result<()> {
+    let request = unix_diag_request(SEQ);
+    loop {
+        // SAFETY: `request` is live for the call, and its length is passed.
+        let sent = unsafe {
+            libc::send(
+                socket.as_raw_fd(),
+                request.as_ptr().cast(),
+                request.len(),
+                0,
+            )
+        };
+        match usize::try_from(sent) {
+            Ok(n) if n == request.len() => return Ok(()),
+            Ok(_) => return Err(io::Error::other("the socket dump's request was cut short")),
+            Err(_) => {
+                let e = io::Error::last_os_error();
+                if e.raw_os_error() != Some(libc::EINTR) {
+                    return Err(e);
+                }
+            }
+        }
+    }
+}
+
+/// One datagram into `room`, its length: `TimedOut` once the socket's receive bound passes, and
+/// `InvalidData` for a datagram longer than `room` (`MSG_TRUNC` names its whole length).
+#[cfg_attr(trust_verify, trust::skip)]
+fn receive(socket: &OwnedFd, room: &mut [u8]) -> io::Result<usize> {
+    loop {
+        // SAFETY: `room` is live and writable for the call, and its length is passed.
+        let got = unsafe {
+            libc::recv(
+                socket.as_raw_fd(),
+                room.as_mut_ptr().cast(),
+                room.len(),
+                libc::MSG_TRUNC,
+            )
+        };
+        match usize::try_from(got) {
+            Ok(n) if n <= room.len() => return Ok(n),
+            Ok(n) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "a socket dump datagram of {n} bytes is longer than its {} byte room",
+                        room.len()
+                    ),
+                ));
+            }
+            Err(_) => {
+                let e = io::Error::last_os_error();
+                match e.raw_os_error() {
+                    Some(libc::EINTR) => {}
+                    Some(libc::EAGAIN) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "the kernel's socket dump did not answer in time",
+                        ));
+                    }
+                    _ => return Err(e),
+                }
+            }
+        }
+    }
+}

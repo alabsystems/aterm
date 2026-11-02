@@ -4,6 +4,9 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/util/cookie.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
+// Modified by the aterm project in 2026; see the repository NOTICE. (aterm-x11's Xlib
+// declarations, where upstream used x11-dl's.)
+
 use std::ffi::c_int;
 use std::sync::Arc;
 

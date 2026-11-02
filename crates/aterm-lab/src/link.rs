@@ -39,10 +39,17 @@ impl Settings {
     pub fn from_env(get: impl Fn(&str) -> Option<String>, pid: u32) -> Result<Settings, String> {
         let rtt = match get(ENV_RTT) {
             None => DEFAULT_RTT_MS,
-            Some(v) => v
-                .trim()
-                .parse::<u64>()
-                .map_err(|_| format!("{ENV_RTT}={v:?} is not a whole number of milliseconds"))?,
+            Some(v) => {
+                let trimmed = v.trim();
+                trimmed
+                    .bytes()
+                    .all(|b| b.is_ascii_digit())
+                    .then(|| trimmed.parse::<u64>().ok())
+                    .flatten()
+                    .ok_or_else(|| {
+                        format!("{ENV_RTT}={v:?} is not a whole number of milliseconds")
+                    })?
+            }
         };
         Ok(Settings {
             rtt: Duration::from_millis(rtt),
@@ -71,7 +78,12 @@ pub fn parse_args(args: &[String]) -> Option<(Settings, &[String])> {
     loop {
         match rest {
             [flag, ms, tail @ ..] if flag == "--rtt" => {
-                settings.rtt = Duration::from_millis(ms.parse().ok()?);
+                let rtt = ms
+                    .bytes()
+                    .all(|b| b.is_ascii_digit())
+                    .then(|| ms.parse().ok())
+                    .flatten()?;
+                settings.rtt = Duration::from_millis(rtt);
                 rest = tail;
             }
             [flag, file, tail @ ..] if flag == "--take" => {

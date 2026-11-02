@@ -282,7 +282,7 @@ fn interpolate(
             }
             StrPiece::Interp(ast) => {
                 let (values, status) = stream(ast, input, env);
-                let mut next = Vec::with_capacity(texts.len() * values.len());
+                let mut next = Vec::with_capacity(texts.len().saturating_mul(values.len()));
                 let mut next_error = None;
                 for value in &values {
                     let value = tostring(value);
@@ -535,15 +535,44 @@ const fn rank(value: &Value) -> u8 {
     }
 }
 
+fn compare_int_f64(p: i128, f: f64) -> Ordering {
+    const MIN_I64_F64: f64 = -9_223_372_036_854_775_808.0;
+    const TWO_POW_64: f64 = 18_446_744_073_709_551_616.0;
+    if f.is_nan() || f < MIN_I64_F64 {
+        return Ordering::Greater;
+    }
+    if f >= TWO_POW_64 {
+        return Ordering::Less;
+    }
+    let fi = f.trunc() as i128;
+    p.cmp(&fi).then_with(|| {
+        let frac = f.fract();
+        if frac > 0.0 {
+            Ordering::Less
+        } else if frac < 0.0 {
+            Ordering::Greater
+        } else {
+            Ordering::Equal
+        }
+    })
+}
+
+fn compare_f64(x: f64, y: f64) -> Ordering {
+    match (x.is_nan(), y.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (false, false) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
+    }
+}
+
 fn compare(a: &Value, b: &Value) -> Ordering {
     match (a, b) {
         (Value::Number(x), Value::Number(y)) => match (integer(x), integer(y)) {
             (Some(p), Some(q)) => p.cmp(&q),
-            _ => x
-                .as_f64()
-                .unwrap_or(0.0)
-                .partial_cmp(&y.as_f64().unwrap_or(0.0))
-                .unwrap_or(Ordering::Equal),
+            (Some(p), None) => compare_int_f64(p, y.as_f64().unwrap_or(0.0)),
+            (None, Some(q)) => compare_int_f64(q, x.as_f64().unwrap_or(0.0)).reverse(),
+            (None, None) => compare_f64(x.as_f64().unwrap_or(0.0), y.as_f64().unwrap_or(0.0)),
         },
         (Value::String(x), Value::String(y)) => x.cmp(y),
         (Value::Array(x), Value::Array(y)) => {

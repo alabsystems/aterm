@@ -20,7 +20,8 @@ pub use iopol::{
 };
 pub use list::ListerChoice;
 pub use look::{
-    Marker, Worktree, build_dir_above, link_target, marker_at, markers_at, worktree_above,
+    Marker, Worktree, build_dir_above, directory_identity, link_target, marker_at, markers_at,
+    worktree_above,
 };
 pub use refuse::{Deny, LIBRARY_ALLOW, Refusal, canonical, refuse, refuse_look};
 pub use tree::{DirId, DirRec, HUGE_NOTE, HUGE_WARN, HugeDir, Sums, Tree};

@@ -85,8 +85,7 @@ fn shell_under(claude: i32) -> Option<i32> {
 
 /// Whether `pid` is gone or a zombie its parent has not reaped yet.
 fn gone(pid: i32) -> bool {
-    !crate::procs::alive(pid)
-        || crate::procs::state_of(pid).is_some_and(|state| state.starts_with('Z'))
+    !crate::procs::alive(pid) || crate::procs::zombie(pid)
 }
 
 fn trial(ctx: &mut Ctx) -> Result<Trial, ScnErr> {

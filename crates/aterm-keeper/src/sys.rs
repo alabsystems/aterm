@@ -54,10 +54,15 @@ pub fn reap_if_done(pid: u32) -> bool {
     let Ok(pid) = i32::try_from(pid) else {
         return true;
     };
-    let mut status = 0;
-    // SAFETY: a live out-parameter; WNOHANG never blocks.
-    let rc = unsafe { c_waitpid(pid, &mut status, WNOHANG) };
-    rc != 0
+    loop {
+        let mut status = 0;
+        // SAFETY: a live out-parameter; WNOHANG never blocks.
+        let rc = unsafe { c_waitpid(pid, &mut status, WNOHANG) };
+        if rc < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return rc != 0;
+    }
 }
 
 /// Raise `RLIMIT_NOFILE`'s soft limit to its hard limit, capped at `OPEN_MAX` on Darwin

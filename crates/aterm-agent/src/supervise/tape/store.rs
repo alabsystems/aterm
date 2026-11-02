@@ -66,6 +66,8 @@ mod held {
         /// `file`, a tape just made, held while it is written.
         pub(super) fn hold(file: std::fs::File) -> Self {
             let file: std::fs::File = file;
+            #[cfg(unix)]
+            let _ = aterm_uds::keep_out_of_children(&file);
             #[cfg(any(target_vendor = "apple", target_os = "linux"))]
             let held = {
                 #[expect(

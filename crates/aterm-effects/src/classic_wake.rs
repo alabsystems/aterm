@@ -35,11 +35,23 @@ struct Spark {
 struct Ring {
     row: u16,
     col: u16,
+    /// Its centre's offset from its cell's centre, px: the caret's seat at the landing
+    /// ([`GlowConfig::caret_center`]; a bar's insertion point, `0` on a block).
+    dx: f32,
     born: Instant,
     life: f32,
     caret: (u16, u16),
     /// The one-colour ring's verdict for this landing ([`MonoRing`]).
     mono: MonoRing,
+}
+
+impl Ring {
+    /// Its centre in window pixels: its cell's centre moved by [`Ring::dx`].
+    #[inline]
+    fn center(&self, geom: Geom) -> (f32, f32) {
+        let (x, y) = geom.cell_center(self.row, self.col);
+        (x + self.dx, y)
+    }
 }
 
 /// The one-colour landing ring's whole-or-not verdict, kept for its landing
@@ -133,6 +145,15 @@ pub struct ClassicWake {
     /// (looks10 L12's, in this crate's tests and the render replay's).
     #[cfg(any(test, debug_assertions))]
     pub(crate) ring_cut: bool,
+    /// A negative control's seam: a typed spark lives its tuned life whatever the duration,
+    /// as before access r3 (`CursorGlow::set_typed_life_scaled`).
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) typed_life_unscaled: bool,
+    /// A negative control's seam: the one-colour face's dark bed and rail floor a chosen
+    /// colour's saturation to [`Self::MONO_BED`]'s and the rail's, as before composed O10(a)
+    /// (`EffectsPipeline::set_classic_pin_own_chroma`).
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) mono_pin_floored: bool,
     /// Test-only: judge the one-colour landing ring whole or not afresh
     /// from each frame's text, as looks9 Q4 judged it, not once a landing
     /// ([`MonoRing`], looks9's review's negative control).
@@ -161,6 +182,10 @@ pub struct ClassicWake {
     /// paper darkens to olive, as it did (looks8 K10's negative control).
     #[cfg(test)]
     pub(crate) paper_muddy: bool,
+    /// Test-only: the dark spectrum face's box bloom spans the caret's whole cell behind a
+    /// bar too, as it did (`the_box_bloom_is_the_bar_s_behind_a_bar`'s negative control).
+    #[cfg(test)]
+    pub(crate) crown_cell_wide: bool,
     /// Test-only: the one-colour face's bed under a lit page's letters at its
     /// whole hue, as it was (looks8 round 2's negative control).
     #[cfg(test)]
@@ -242,6 +267,12 @@ pub(crate) struct WakeInk<'a> {
     /// where the one-colour bed's rail may lie in its own row
     /// ([`crate::cursor_glow::BedShape::row_rail`]).
     pub(crate) feet: WakeFeet<'a>,
+    /// The page's lightness without its tint, where the one-colour face lays
+    /// its light on a tinted dark page over a night ground
+    /// ([`crate::cursor_glow::CursorGlow::classic_pin_grounded`]): its bed
+    /// under a lit page's letters mixes toward it, not toward the page
+    /// ([`ClassicWake::MONO_LIT_BED_SHARE`]).
+    pub(crate) bed_ground: Option<u32>,
 }
 
 /// The share of a cell's height over which a paper Enter's tracer fades out
@@ -283,7 +314,7 @@ const TRACER_STEP_PX: f32 = 2.0;
 /// caret's at [`TRACER_UNDER_LETTERS`] of its light ([`up_stretch`]).
 #[inline]
 fn tracer_on_caret_row(
-    (verts, dense): (&mut Vec<BeamVertex>, &mut Vec<BeamVertex>),
+    (verts, dense, shares): (&mut Vec<BeamVertex>, &mut Vec<BeamVertex>, &mut Vec<f32>),
     text: TextView<'_>,
     geom: Geom,
     caret_row: Option<i32>,
@@ -331,7 +362,7 @@ fn tracer_on_caret_row(
         );
         let mut r = row - 1;
         while r <= row + 1 {
-            if Some(r) != caret_row {
+            if Some(r) != caret_row && text.covers_col_range(r, (col - 2, col + 1)) {
                 let y0 = oy + r as f32 * ch;
                 let dy = (y0 - v.y).max(v.y - (y0 + ch)).max(0.0);
                 let dy2 = dy * dy;
@@ -340,9 +371,7 @@ fn tracer_on_caret_row(
                     while c <= col + 1 {
                         let x0 = ox + c as f32 * cw;
                         let dx = (x0 - v.x).max(v.x - (x0 + cw)).max(0.0);
-                        if dx * dx + dy2 < reach2
-                            && (text.covers_cell(r, c) || text.covers_cell(r, c - 1))
-                        {
+                        if dx * dx + dy2 < reach2 && text.covers_col_range(r, (c - 1, c)) {
                             crosses = true;
                             break 'verts;
                         }
@@ -381,7 +410,7 @@ fn tracer_on_caret_row(
         }
     }
     if from_below && up_stretch {
-        self::up_stretch(dense, text, geom, (half, leave), anchored);
+        self::up_stretch((dense, shares), text, geom, (half, leave), anchored);
         std::mem::swap(verts, dense);
         return;
     }
@@ -422,14 +451,13 @@ fn tracer_on_caret_row(
 /// new, anchored to neither (`classic-light-move-up.up`, looks10 L6).
 #[inline]
 fn up_stretch(
-    dense: &mut [BeamVertex],
+    (dense, shares): (&mut [BeamVertex], &mut Vec<f32>),
     text: TextView<'_>,
     geom: Geom,
     (half, leave): (f32, f32),
     anchored: bool,
 ) {
     if anchored {
-        let mut shares = Vec::with_capacity(dense.len());
         through_letters(
             dense.len(),
             |i| (dense[i].x, dense[i].y),
@@ -442,9 +470,9 @@ fn up_stretch(
             },
             geom,
             (half, leave, TRACER_UNDER_LETTERS_PAPER),
-            &mut shares,
+            shares,
         );
-        for (v, k) in dense.iter_mut().zip(&shares) {
+        for (v, k) in dense.iter_mut().zip(&*shares) {
             v.cov = (f32::from(v.cov) * k).round() as u8;
         }
         return;
@@ -461,18 +489,20 @@ fn up_stretch(
         );
         let mut r = row - 1;
         while r <= row + 1 {
-            let y0 = oy + r as f32 * ch;
-            let dy = (y0 - v.y).max(v.y - (y0 + ch)).max(0.0);
-            let dy2 = dy * dy;
-            if dy2 < reach2 {
-                let mut c = col - 1;
-                while c <= col + 1 {
-                    let x0 = ox + c as f32 * cw;
-                    let dx = (x0 - v.x).max(v.x - (x0 + cw)).max(0.0);
-                    if dx * dx + dy2 < reach2 && text.covers_cell(r, c) {
-                        return false;
+            if text.covers_col_range(r, (col - 1, col + 1)) {
+                let y0 = oy + r as f32 * ch;
+                let dy = (y0 - v.y).max(v.y - (y0 + ch)).max(0.0);
+                let dy2 = dy * dy;
+                if dy2 < reach2 {
+                    let mut c = col - 1;
+                    while c <= col + 1 {
+                        let x0 = ox + c as f32 * cw;
+                        let dx = (x0 - v.x).max(v.x - (x0 + cw)).max(0.0);
+                        if dx * dx + dy2 < reach2 && text.covers_cell(r, c) {
+                            return false;
+                        }
+                        c += 1;
                     }
-                    c += 1;
                 }
             }
             r += 1;
@@ -569,6 +599,7 @@ enum Passed {
 /// (the letter guard cannot hold letters it has not read, so light there is
 /// the over-ink budget's, as the dark streak's is: [`TextView::over_text`]),
 /// whole `leave` px along the stroke from every such point, eased between.
+#[inline]
 fn through_letters(
     n: usize,
     at: impl Fn(usize) -> (f32, f32),
@@ -598,20 +629,24 @@ fn through_letters(
         let (row, col) = cell_of((x, y));
         let (mut letter, mut unread) = (false, false);
         for r in row - 1..=row + 1 {
+            let y0 = oy + r as f32 * ch;
+            let dy = (y0 - y).max(y - (y0 + ch)).max(0.0);
+            let dy2 = dy * dy;
+            if dy2 >= reach2 {
+                continue;
+            }
             for c in col - 1..=col + 1 {
                 if (r, c) == caret {
                     continue;
                 }
-                let what = seen(r, c);
-                if what == Passed::Air {
-                    continue;
-                }
-                let (x0, y0) = (ox + c as f32 * cw, oy + r as f32 * ch);
+                let x0 = ox + c as f32 * cw;
                 let dx = (x0 - x).max(x - (x0 + cw)).max(0.0);
-                let dy = (y0 - y).max(y - (y0 + ch)).max(0.0);
-                if dx * dx + dy * dy < reach2 {
-                    letter |= what == Passed::Letter;
-                    unread |= what == Passed::Unread;
+                if dx * dx + dy2 < reach2 {
+                    match seen(r, c) {
+                        Passed::Air => {}
+                        Passed::Letter => letter = true,
+                        Passed::Unread => unread = true,
+                    }
                 }
             }
         }
@@ -669,6 +704,7 @@ fn through_letters(
 /// unstraightened: a point inside a stretch of one share (`shares`, the
 /// piece's own, point for point) on a straight line between its
 /// neighbours. Its light between the points it keeps is the line's.
+#[inline]
 fn thin_exact(piece: &mut Vec<CometSample>, shares: &[f32]) {
     let n = piece.len().min(shares.len());
     if n < 3 {
@@ -689,6 +725,7 @@ fn thin_exact(piece: &mut Vec<CometSample>, shares: &[f32]) {
 }
 
 /// `run` cut to [`TRACER_STEP_PX`] steps, into `dense`.
+#[inline]
 fn dense_samples(run: &[CometSample], dense: &mut Vec<CometSample>) {
     dense.clear();
     for w in run.windows(2) {
@@ -827,7 +864,10 @@ impl ClassicWake {
     /// page: a chosen colour far round the wheel from the page's (`#d03a8c`
     /// on Solarized Dark's teal) laid a maroon smear under the letters at
     /// the page's luminance, and the letters' edges, blended over it, read
-    /// under their bar (`f` at 3.93:1 of its own 4.06, looks8 K10).
+    /// under their bar (`f` at 3.93:1 of its own 4.06, looks8 K10). On a
+    /// tinted dark page the rest is the page's lightness without its tint
+    /// ([`WakeInk::bed_ground`]): mixed toward the teal, the pink pin's bed
+    /// read blue (hue 222, composed r1's O4(b)).
     const MONO_LIT_BED_SHARE: f32 = 0.4;
 
     /// Fresh dormant classic-wake animation state.
@@ -876,6 +916,10 @@ impl ClassicWake {
             ring_flying: false,
             #[cfg(any(test, debug_assertions))]
             ring_cut: false,
+            #[cfg(any(test, debug_assertions))]
+            typed_life_unscaled: false,
+            #[cfg(any(test, debug_assertions))]
+            mono_pin_floored: false,
             #[cfg(test)]
             ring_unlatched: false,
             #[cfg(test)]
@@ -888,6 +932,8 @@ impl ClassicWake {
             tracer_top_only: false,
             #[cfg(test)]
             paper_muddy: false,
+            #[cfg(test)]
+            crown_cell_wide: false,
             #[cfg(test)]
             mono_lit_whole: false,
             #[cfg(test)]
@@ -1109,16 +1155,18 @@ impl ClassicWake {
                 geom,
                 cur,
                 (out, under),
-                ink.text,
+                (ink.text, ink.chosen),
                 ink.ledger,
-                ink.feet,
+                (ink.feet, ink.bed_ground),
             );
             out.keep_laid(Self::MAX_QUADS);
             under.keep_laid(Self::MAX_QUADS);
             let from = halos.len();
             self.emit_mono_crown(now, cfg, geom, cur, halos);
-            ink.ledger
-                .admit_halos_masked(halos, from, InkLedger::HEAD_FLOOR);
+            if halos.len() > from {
+                ink.ledger
+                    .admit_halos_masked(halos, from, InkLedger::HEAD_FLOOR);
+            }
             // THE ONE-COLOUR LANDING RING KEEPS EVERY LETTER'S BAR. It lands
             // on the new prompt, whose `$` its left bar crosses. Drawn over
             // the letters, the frame's bloom and SDR crown (the post passes
@@ -1171,15 +1219,17 @@ impl ClassicWake {
                 let from = out.quads().len();
                 self.emit_light_ring_rim(now, cfg, geom, ink.text, out.quads());
                 let to = out.quads().len();
-                let laid = quads_area(&out.quads()[from..to]);
-                ink.ledger
-                    .admit_masked(out.quads(), from..to, InkLedger::FLYING_FLOOR);
-                #[cfg(any(test, debug_assertions))]
-                let cut = self.ring_cut;
-                #[cfg(not(any(test, debug_assertions)))]
-                let cut = false;
-                if !cut {
-                    keep_whole(out.quads(), from, to, laid);
+                if to > from {
+                    let laid = quads_area(&out.quads()[from..to]);
+                    ink.ledger
+                        .admit_masked(out.quads(), from..to, InkLedger::FLYING_FLOOR);
+                    #[cfg(any(test, debug_assertions))]
+                    let cut = self.ring_cut;
+                    #[cfg(not(any(test, debug_assertions)))]
+                    let cut = false;
+                    if !cut {
+                        keep_whole(out.quads(), from, to, laid);
+                    }
                 }
                 #[cfg(test)]
                 self.ring_seen.replace(
@@ -1302,16 +1352,24 @@ impl ClassicWake {
             f32::MAX
         };
         let boost = if typing { self.typing_boost() } else { 1.0 };
-        let full_life = cfg.duration.as_secs_f32().max(0.001);
         let spark_life = if typing {
+            // The life tuned at the default duration, times the duration's share of it
+            // (`cursor_glow::typed_life_basis`), chained keys too.
+            #[cfg(any(test, debug_assertions))]
+            let unscaled = self.typed_life_unscaled;
+            #[cfg(not(any(test, debug_assertions)))]
+            let unscaled = false;
+            let (tuned, scale) = crate::cursor_glow::typed_life_basis(cfg.duration, unscaled);
+            let full_life = tuned.max(0.001);
             let heat_life = (full_life * 0.38).clamp(0.05, 0.11) * (1.0 + 1.3 * self.heat);
-            if gap <= Self::CHAIN_GAP_MAX {
+            let life = if gap <= Self::CHAIN_GAP_MAX {
                 heat_life.max((gap + Self::CHAIN_MARGIN).min(Self::CHAIN_LIFE_MAX))
             } else {
                 heat_life
-            }
+            };
+            crate::cursor_glow::scaled_typed_life(life, scale)
         } else {
-            full_life
+            cfg.duration.as_secs_f32().max(0.001)
         };
 
         let max_len = cfg.length.clamp(1, Self::MAX_SPARKS);
@@ -1358,6 +1416,7 @@ impl ClassicWake {
             self.ring = Some(Ring {
                 row: cr,
                 col: cc,
+                dx: (cfg.head_dx - 0.5) * geom.cw as f32,
                 born: now,
                 life: 0.18,
                 caret: (cr, cc),
@@ -1522,9 +1581,9 @@ impl ClassicWake {
         geom: Geom,
         cur: Option<(u16, u16)>,
         (out, under): (&mut RampSink<'_>, &mut RampSink<'_>),
-        text: TextView<'_>,
+        (text, chosen): (TextView<'_>, bool),
         ledger: &mut InkLedger,
-        (feet, soles): WakeFeet<'_>,
+        ((feet, soles), bed_ground): (WakeFeet<'_>, Option<u32>),
     ) {
         let live = self.build_runs(now, cfg, geom, cur);
         if live == 0 {
@@ -1532,7 +1591,18 @@ impl ClassicWake {
         }
         let (ink, page) = CursorGlow::bed_pair(cfg);
         let budget = crate::cursor_glow::dark_bed_budget(ink);
-        let shape = Self::MONO_BED;
+        // A colour the user chose keeps its own chroma in the bed and the air's light, as
+        // every other style's pinned bed does (`BedShape::pinned`), and its rail composes on
+        // the page to it ([`Self::pinned_rail_ink`]): floored to the bed's saturation of 0.9
+        // and the rail's of 1.0, Classic laid the pink pin `#d03a8c` (chroma 150) at 196, and
+        // its rail read up to 18% more vivid than the pin (composed r3, O10(a)).
+        #[cfg(any(test, debug_assertions))]
+        let chosen = chosen && !self.mono_pin_floored;
+        let shape = if chosen {
+            Self::MONO_BED.pinned()
+        } else {
+            Self::MONO_BED
+        };
         let air = crate::cursor_glow::AirLight::of(page, budget, shape);
         let chf = geom.ch as f32;
         let lit_page = crate::cursor_glow::page_lit(page, budget);
@@ -1597,16 +1667,21 @@ impl ClassicWake {
                 let (bed_c, rail_c) = match last {
                     Some((prev, was_air, b, r)) if prev == rgb && was_air == in_air => (b, r),
                     _ => {
+                        let (air_sat, bed_sat) = (shape.sat_for(rgb), shape.under_sat_for(rgb));
                         let b = match air {
-                            Some(air) if in_air => air.ink(rgb, page, shape.sat),
+                            Some(air) if in_air => air.ink(rgb, page, air_sat),
                             _ if lit_page && !mono_lit_whole => crate::effect_util::lerp_rgb(
-                                page & 0x00FF_FFFF,
-                                crate::cursor_glow::dark_bed_ink(rgb, page, budget, shape.sat),
+                                bed_ground.unwrap_or(page) & 0x00FF_FFFF,
+                                crate::cursor_glow::dark_bed_ink(rgb, page, budget, bed_sat),
                                 Self::MONO_LIT_BED_SHARE,
                             ),
-                            _ => crate::cursor_glow::dark_bed_ink(rgb, page, budget, shape.sat),
+                            _ => crate::cursor_glow::dark_bed_ink(rgb, page, budget, bed_sat),
                         };
-                        let r = crate::rainbow_kitty::ribbon::rail_ink(rgb & 0x00FF_FFFF);
+                        let r = if shape.pinned {
+                            Self::pinned_rail_ink(rgb & 0x00FF_FFFF, page)
+                        } else {
+                            crate::rainbow_kitty::ribbon::rail_ink(rgb & 0x00FF_FFFF)
+                        };
                         last = Some((rgb, in_air, b, r));
                         (b, r)
                     }
@@ -1874,6 +1949,35 @@ impl ClassicWake {
         }
     }
 
+    /// The light the one-colour rail's core lays over a dark page, of 255
+    /// ([`Self::pinned_rail_ink`]): a fresh cell's bed opacity, which the rail's core rows wear
+    /// ([`crate::cursor_glow::DARK_BED_ALPHA_CAP`]). At 128, the core read 0.37 of OKLCH chroma per
+    /// lightness under the pink pin's 0.337 (10% more vivid) wherever the letter guard left it
+    /// whole, as it does since it reads each letter by the ring round its strokes (round 27):
+    /// cut to about half its light under the letters, as the guard cut every lettered cell's
+    /// box, it had read near the pin.
+    const PIN_RAIL_CORE: f32 = crate::cursor_glow::DARK_BED_ALPHA_CAP;
+
+    /// The one-colour rail's ink for a colour the user chose, `rgb`, over the dark `page`: the
+    /// pin's hue at full value, its saturation raised by the share the page's grey takes of the
+    /// rail's core (`page / PIN_RAIL_CORE`), so the rail composes on the page to the pin's own
+    /// chroma at its lightness. Laid at the pin's saturation itself (`bed_rail_ink`'s pinned
+    /// ink), the page diluted the rail to 0.28-0.31 of OKLCH chroma per lightness under the pink
+    /// pin's 0.337; floored to full saturation, as unpinned, it read up to 0.40 (composed
+    /// O10(a)).
+    #[inline]
+    #[must_use]
+    const fn pinned_rail_ink(rgb: u32, page: u32) -> u32 {
+        let (h, s, _) = crate::color_math::rgb2hsv(rgb);
+        let grey = {
+            let (r, g, b) = ((page >> 16) & 0xff, (page >> 8) & 0xff, page & 0xff);
+            let m = if r > g { r } else { g };
+            (if m > b { m } else { b }) as f32
+        };
+        let raised = s * (1.0 + grey / Self::PIN_RAIL_CORE);
+        crate::color_math::hsv2rgb(h, if raised < 1.0 { raised } else { 1.0 }, 1.0)
+    }
+
     /// The one-colour face's bed on a dark page. Its rail lies in its own
     /// row where the row below is no air ([`BedShape::row_rail`]): laid under
     /// the row into a selection's fill, the frame cut it away, and in the
@@ -1923,6 +2027,7 @@ impl ClassicWake {
             return;
         }
         let mut dense = std::mem::take(&mut self.light_dense);
+        let mut shares = std::mem::take(&mut self.air_shares);
         let (cwf, chf) = (geom.cw as f32, geom.ch as f32);
         #[cfg(test)]
         let leave = self.tracer_leave_px.unwrap_or(chf * TRACER_LEAVE_SHARE);
@@ -2021,7 +2126,7 @@ impl ClassicWake {
                     }
                     if across_rows && kept {
                         tracer_on_caret_row(
-                            (&mut verts, &mut dense),
+                            (&mut verts, &mut dense, &mut shares),
                             text,
                             geom,
                             caret_row,
@@ -2035,6 +2140,7 @@ impl ClassicWake {
         }
         self.light_verts = verts;
         self.light_dense = dense;
+        self.air_shares = shares;
     }
 
     #[inline]
@@ -2048,6 +2154,7 @@ impl ClassicWake {
         if cfg.radius <= 0.0 {
             return None;
         }
+        self.crown_until?;
         let (cr, cc) = cur?;
         if cr as usize >= geom.rows || cc as usize >= geom.cols {
             return None;
@@ -2073,28 +2180,42 @@ impl ClassicWake {
         let Some(((cr, cc), fade)) = self.crown_fade(now, cfg, geom, cur) else {
             return;
         };
+        const K: i32 = 3;
+        const BASE_COV: f32 = 50.0;
+        let boost = self.typing_boost();
+        let cov_scale = BASE_COV * (fade * cfg.intensity * boost / K as f32);
+        if cov_scale * (K as f32) < 1.0 {
+            return;
+        }
         let cw = geom.cw as i32;
         let ch = geom.ch as i32;
         let cx = i32::from(geom.origin_x) + cc as i32 * cw;
         let cy = i32::from(geom.origin_y) + cr as i32 * ch;
+        // The box blooms round the caret's body: the whole cell a block covers, and behind a bar
+        // (`head_dx` 0.08) the bar, twice its insertion point across from the cell's left edge
+        // (composed r1's judges, O4(a): a box sized to a block cell framed a 2 px bar). A block's
+        // box is the cell's, byte for byte (the v0.28 restoration).
+        #[cfg(test)]
+        let barred = cfg.head_dx < 0.5 && !self.crown_cell_wide;
+        #[cfg(not(test))]
+        let barred = cfg.head_dx < 0.5;
+        let bw = if barred {
+            ((2.0 * cfg.head_dx * geom.cw as f32).round() as i32).clamp(2.min(cw), cw)
+        } else {
+            cw
+        };
         let r = (cfg.radius * chf_of(geom)) as i32;
-        let (k, base_cov, color) = (
-            3i32,
-            50.0f32,
-            if cfg.classic_mono {
-                cfg.color
-            } else {
-                hsv2rgb(self.hue, 0.9, 1.0)
-            },
-        );
-        let boost = self.typing_boost();
-        let cov_scale = base_cov * (fade * cfg.intensity * boost / k as f32);
+        let color = if cfg.classic_mono {
+            cfg.color
+        } else {
+            hsv2rgb(self.hue, 0.9, 1.0)
+        };
         let mut layer = 0;
-        while layer < k {
+        while layer < K {
             if out.len() >= Self::MAX_QUADS {
                 return;
             }
-            let grow = r * (k - layer) / k;
+            let grow = r * (K - layer) / K;
             let cov = ((layer as f32 + 1.0) * cov_scale).min(255.0) as u8;
             layer += 1;
             if cov == 0 {
@@ -2106,7 +2227,7 @@ impl ClassicWake {
                 geom,
                 cx - grow,
                 cy - grow,
-                cw + two_grow,
+                bw + two_grow,
                 ch + two_grow,
                 premul_rgb(color, cov),
             );
@@ -2131,7 +2252,7 @@ impl ClassicWake {
         }
         let (cwf, chf) = (geom.cw as f32, geom.ch as f32);
         let r = cfg.radius * chf;
-        let (cx, cy) = geom.cell_center(cr, cc);
+        let (cx, cy) = cfg.caret_center(&geom, cr, cc);
         push_halo_rows(
             halos,
             geom,
@@ -2206,7 +2327,7 @@ impl ClassicWake {
         push_ink_ellipse(
             under,
             geom,
-            geom.cell_center(cr, cc),
+            cfg.caret_center(&geom, cr, cc),
             (reach, reach),
             chf * 0.5,
             body_ink,
@@ -2240,7 +2361,9 @@ impl ClassicWake {
             let from = out.quads().len();
             self.emit_ring(now, cfg, geom, out.quads());
             let to = out.quads().len();
-            ledger.admit_masked(out.quads(), from..to, floor);
+            if to > from {
+                ledger.admit_masked(out.quads(), from..to, floor);
+            }
             #[cfg(test)]
             self.ring_seen.replace(
                 out.quads()
@@ -2365,7 +2488,7 @@ impl ClassicWake {
         };
         let want = ((0.6 + 1.0 * t) * chf) as i32;
         let th = (geom.ch as i32 / 8).max(2);
-        let (cx, cy) = geom.cell_center(ring.row, ring.col);
+        let (cx, cy) = ring.center(geom);
         let (cx, cy) = (cx as i32, cy as i32);
         let (ox, oy) = (i32::from(geom.origin_x), i32::from(geom.origin_y));
         let (cw, ch) = (geom.cw as i32, geom.ch as i32);
@@ -2387,21 +2510,24 @@ impl ClassicWake {
         let bar_cells_clear = |(r0, r1): (i32, i32), (c0, c1): (i32, i32)| {
             let mut r = r0;
             while r <= r1 {
-                let mut c = c0;
-                while c <= c1 {
-                    if (r, c) != own && text.covers_cell(r, c) {
-                        return false;
-                    }
-                    if pane_read
-                        && r >= 0
-                        && r < grid_rows
-                        && c >= 0
-                        && c < grid_cols
-                        && text.past_pane(r, c)
+                if r == own.0 && own.1 >= c0 && own.1 <= c1 {
+                    if text.covers_col_range(r, (c0, own.1 - 1))
+                        || text.covers_col_range(r, (own.1 + 1, c1))
                     {
                         return false;
                     }
-                    c += 1;
+                } else if text.covers_col_range(r, (c0, c1)) {
+                    return false;
+                }
+                if pane_read && r >= 0 && r < grid_rows {
+                    let mut c = c0.max(0);
+                    let c_end = c1.min(grid_cols - 1);
+                    while c <= c_end {
+                        if text.past_pane(r, c) {
+                            return false;
+                        }
+                        c += 1;
+                    }
                 }
                 r += 1;
             }
@@ -2542,7 +2668,7 @@ impl ClassicWake {
         out: &mut Vec<GlowQuad>,
     ) {
         let th = (geom.ch as i32 / 8).max(2);
-        let (cx, cy) = geom.cell_center(ring.row, ring.col);
+        let (cx, cy) = ring.center(geom);
         let (cx, cy) = (cx as i32, cy as i32);
         let (x0, y0) = (cx - hw, cy - hh);
         push_rect(out, geom, x0, y0, 2 * hw, th, premul);
@@ -2559,13 +2685,14 @@ impl ClassicWake {
     #[inline]
     fn row_box_reach(ring: Ring, t: f32, geom: Geom, text: TextView<'_>, s: i32) -> i32 {
         let want = ((0.6 + 1.0 * t) * chf_of(geom)) as i32;
-        let (cx, _) = geom.cell_center(ring.row, ring.col);
+        let (cx, _) = ring.center(geom);
         let cx = cx as i32;
         let (ox, cw) = (i32::from(geom.origin_x), geom.cw as i32);
+        let (fx_l, fx_r) = (geom.fx_left(), geom.fx_right());
         let (row, own) = (i32::from(ring.row), i32::from(ring.col));
         let clear = |x: i32| {
             let c = (x - ox).div_euclid(cw);
-            x >= geom.fx_left() && x < geom.fx_right() && (c == own || !text.covers_cell(row, c))
+            x >= fx_l && x < fx_r && (c == own || !text.covers_cell(row, c))
         };
         let mut hw = s;
         while hw < want {
@@ -2627,7 +2754,7 @@ impl ClassicWake {
                     }
                 };
                 (
-                    geom.cell_center(r, c),
+                    cfg.caret_center(&geom, r, c),
                     (
                         grow.min(CursorGlow::LIGHT_VEIL_REACH_CELLS * cw),
                         (grow * 0.85).min(0.5 * ch),
@@ -2635,11 +2762,7 @@ impl ClassicWake {
                     cap.min(veil_cap),
                 )
             }
-            _ if unbound => (
-                geom.cell_center(ring.row, ring.col),
-                (grow, grow * 0.85),
-                cap,
-            ),
+            _ if unbound => (ring.center(geom), (grow, grow * 0.85), cap),
             _ => return,
         };
         push_soft_veil(halos, geom, centre, radii, veil, cap);
@@ -2853,6 +2976,8 @@ mod tests {
         under_ramps: aterm_render::GlowRamps,
         ledger: InkLedger,
         spans: crate::cursor_glow::TextSpans,
+        /// The ground the one-colour bed mixes toward ([`WakeInk::bed_ground`]).
+        bed_ground: Option<u32>,
     }
 
     impl Rig {
@@ -2871,6 +2996,7 @@ mod tests {
                     ledger: &mut self.ledger,
                     chosen: false,
                     feet: (&[], [None; 2]),
+                    bed_ground: self.bed_ground,
                 },
             )
         }
@@ -3372,6 +3498,95 @@ mod tests {
         }
     }
 
+    /// THE BOX BLOOM IS THE BAR'S BEHIND A BAR (composed r1's judges, O4(a)): the dark spectrum
+    /// face's box bloom (`emit_crown`) spanned the caret's whole cell, so behind a bar caret a box
+    /// sized to a block cell framed the 2 px bar with the bar at its left third. It now blooms
+    /// round the caret's body: the cell under a block, the bar (twice `head_dx` across from the
+    /// cell's left edge) under a bar. The crown's own light (the frame laid with the crown less
+    /// the frame laid without it, `radius` 0) after a keystroke: behind a bar its light-weighted
+    /// centre lies within a pixel of the bar's and none of it reaches past the bar by more than
+    /// the bloom's grow; under a block its centre is the cell's. Negative control
+    /// (`crown_cell_wide` alone): behind the bar the centre is the cell's again.
+    #[test]
+    fn the_box_bloom_is_the_bar_s_behind_a_bar() {
+        let g = geom();
+        let t0 = Instant::now();
+        let crown = |head_dx: f32, wide: bool| -> Vec<u32> {
+            let lay = |radius: f32| -> Vec<u32> {
+                let c = GlowConfig {
+                    head_dx,
+                    radius,
+                    ring: false,
+                    ..cfg()
+                };
+                let mut rig = Rig::default();
+                rig.w.crown_cell_wide = wide;
+                rig.tick(Some((2, 4)), t0, &c, g);
+                rig.tick(Some((2, 5)), ms(t0, 60), &c, g);
+                rig.tick(Some((2, 5)), ms(t0, 76), &c, g);
+                let mut px = vec![0u32; g.win_w as usize * g.win_h as usize];
+                for q in &rig.out {
+                    for y in q.y..q.y + q.h {
+                        for x in q.x..q.x + q.w {
+                            let p = &mut px[usize::from(y) * g.win_w as usize + usize::from(x)];
+                            *p = over_premul(*p, q.color, q.alpha);
+                        }
+                    }
+                }
+                px
+            };
+            let (with, without) = (lay(0.6), lay(0.0));
+            with.iter()
+                .zip(&without)
+                .map(|(&a, &b)| {
+                    [16u32, 8, 0]
+                        .iter()
+                        .map(|&sh| ((a >> sh) & 0xff).saturating_sub((b >> sh) & 0xff))
+                        .sum()
+                })
+                .collect()
+        };
+        let stats = |light: &[u32]| -> (f64, i32) {
+            let (mut sum, mut weight, mut right) = (0.0f64, 0.0f64, i32::MIN);
+            for (i, &v) in light.iter().enumerate() {
+                if v == 0 {
+                    continue;
+                }
+                let x = (i % g.win_w as usize) as i32;
+                sum += f64::from(v) * (f64::from(x) + 0.5);
+                weight += f64::from(v);
+                right = right.max(x);
+            }
+            assert!(weight > 0.0, "fixture: the crown lit");
+            (sum / weight, right)
+        };
+        let (x0, cw) = (5 * g.cw as i32, g.cw as i32);
+        let grow = (0.6 * g.ch as f32) as i32;
+        let bw = 2;
+        let (centre, right) = stats(&crown(0.08, false));
+        assert!(
+            (centre - (f64::from(x0) + f64::from(bw) / 2.0)).abs() <= 1.0,
+            "behind a bar the box blooms at x {centre:.1}, not round the bar at {}",
+            x0 + bw / 2
+        );
+        assert!(
+            right < x0 + bw + grow,
+            "behind a bar the box's light reaches x {right}, past the bar's bloom at {}",
+            x0 + bw + grow
+        );
+        let (centre, _) = stats(&crown(0.5, false));
+        assert!(
+            (centre - f64::from(x0 + cw / 2)).abs() <= 1.0,
+            "under a block the box blooms at x {centre:.1}, not round the cell at {}",
+            x0 + cw / 2
+        );
+        let (centre, _) = stats(&crown(0.08, true));
+        assert!(
+            (centre - f64::from(x0 + cw / 2)).abs() <= 1.0,
+            "negative control: the cell-wide box blooms at x {centre:.1}, not the cell's centre"
+        );
+    }
+
     #[test]
     fn the_landing_ring_stroke_scales_with_the_cell() {
         let t0 = Instant::now();
@@ -3628,12 +3843,18 @@ mod tests {
     }
 
     /// The SPECTRUM wake on dark is v0.28's, byte for byte (the owner's
-    /// ruling). The one-colour wake's fold was re-baked deliberately by
-    /// looks8 K2, whose landing ring lies under the letters, again by looks9
-    /// (Q4's whole ring, Q11's one stroke up a page), and by looks10 (L6: a
-    /// stroke up a page runs from the old caret to the new): with L6's seam
-    /// set back it folds to looks9's value, and with looks9's two set back
-    /// too to looks8's, so each re-bake moves nothing else.
+    /// ruling) at the shipped duration
+    /// (`the_host_resolved_dark_wake_is_byte_identical_to_its_base`). The
+    /// one-colour wake's fold was re-baked deliberately by looks8 K2, whose
+    /// landing ring lies under the letters, again by looks9 (Q4's whole ring,
+    /// Q11's one stroke up a page), and by looks10 (L6: a stroke up a page
+    /// runs from the old caret to the new); and all three folds by access r3
+    /// (composed O12(a)): this fixture's 240 ms is off the default, and a
+    /// typed spark now lives its tuned life times the duration's share of
+    /// the default, chained keys too. With access r3's seam set back the
+    /// three fold to their bases before it, with L6's seam set back too the
+    /// one-colour wake folds to looks9's value, and with looks9's two set
+    /// back too to looks8's, so each re-bake moves nothing else.
     #[test]
     fn the_dark_wake_is_byte_identical_to_its_base() {
         let mono = GlowConfig {
@@ -3659,13 +3880,28 @@ mod tests {
         assert_eq!(
             got,
             [
+                2_703_624_080_531_407_634,
+                5_821_303_035_924_665_918,
+                1_226_402_589_320_791_053,
+            ],
+            "the dark classic wake drifted from its base"
+        );
+        let unscaled = |w: &mut ClassicWake| w.typed_life_unscaled = true;
+        assert_eq!(
+            [
+                dark_session_fold_as(&cfg(), geom(), unscaled),
+                dark_session_fold_as(&mono, geom(), unscaled),
+                dark_session_fold_as(&cfg(), padded, unscaled),
+            ],
+            [
                 11_293_809_440_103_835_944,
                 2_735_246_743_558_469_609,
                 8_579_084_186_203_313_172,
             ],
-            "the dark classic wake drifted from its base"
+            "control: the wake with access r3's seam set back is its base before it"
         );
         let looks9 = dark_session_fold_as(&mono, geom(), |w| {
+            w.typed_life_unscaled = true;
             w.tracer_up_stretch = true;
         });
         assert_eq!(
@@ -3673,6 +3909,7 @@ mod tests {
             "control: the one-colour wake with looks10's seam set back is looks9's"
         );
         let looks8 = dark_session_fold_as(&mono, geom(), |w| {
+            w.typed_life_unscaled = true;
             w.ring_cut = true;
             w.tracer_up_kept = true;
             w.tracer_up_stretch = true;
@@ -3889,6 +4126,86 @@ mod tests {
         );
     }
 
+    /// A CHOSEN COLOUR'S BED KEEPS ITS HUE ON A TINTED PAGE (composed r2, O4(b); the pin
+    /// ruling): under a lit page's letters the one-colour face's bed keeps
+    /// [`ClassicWake::MONO_LIT_BED_SHARE`] of its hue, and the rest was Solarized Dark's teal, so
+    /// the pink pin `#d03a8c` (hue 327) laid its bed blue (hue 222). On a tinted page whose
+    /// light lays a night ground the rest is that ground's ink, the page's neutral
+    /// ([`WakeInk::bed_ground`], [`crate::cursor_glow::GroundRule::NeutralCore`], composed r3):
+    /// every bed mark under the lettered row wears the pin's hue within 25 degrees, at the page's
+    /// luminance within 1.2:1. Negative control (no ground, the page): some mark lies past 60
+    /// degrees off.
+    #[test]
+    fn a_chosen_colour_s_bed_keeps_its_hue_on_a_tinted_page() {
+        let g = geom();
+        let c = GlowConfig {
+            classic_mono: true,
+            color: 0x00D0_3A8C,
+            accent: 0x00D0_3A8C,
+            theme_fg: 0x0083_9496,
+            theme_bg: 0x0000_2B36,
+            ..cfg()
+        };
+        let ground = crate::cursor_glow::night_ground_holding(
+            c.theme_bg,
+            &[c.color, c.accent, 0x00FF_FFFF],
+            crate::cursor_glow::GroundRule::NeutralCore,
+        )
+        .expect("fixture: Solarized Dark solves a ground for the pink pin")
+        .ink;
+        let ch = g.ch as i32;
+        let worst = |bed_ground: Option<u32>| -> (f32, f32) {
+            let t0 = Instant::now();
+            let mut rig = Rig {
+                spans: crate::cursor_glow::TextSpans::of_lines(&[(2, 0, 30)]),
+                bed_ground,
+                ..Rig::default()
+            };
+            rig.tick(Some((2, 2)), t0, &c, g);
+            rig.tick(Some((2, 28)), ms(t0, 16), &c, g);
+            let own = |rgb: u32, a: u8| {
+                let ch = |sh: u32| ((((rgb >> sh) & 0xFF) * 255) / u32::from(a.max(1))).min(255);
+                (ch(16) << 16) | (ch(8) << 8) | ch(0)
+            };
+            let (want, _, _) = crate::color_math::rgb2hsv(c.color);
+            let page = crate::color_math::relative_luminance(c.theme_bg);
+            let marks: Vec<u32> = rig
+                .under
+                .iter()
+                .filter(|q| {
+                    let (y0, y1) = (i32::from(q.y), i32::from(q.y) + i32::from(q.h));
+                    q.alpha > 0 && y0 >= 2 * ch + ch / 4 && y1 <= 3 * ch - ch / 4
+                })
+                .flat_map(|q| [(q.color, q.alpha), (q.color2, q.alpha2)])
+                .filter(|&(_, a)| a >= 64)
+                .map(|(rgb, a)| own(rgb, a))
+                .collect();
+            assert!(
+                !marks.is_empty(),
+                "fixture: a leap lays its bed under the row"
+            );
+            marks.iter().fold((0.0f32, 1.0f32), |(gap, ratio), &m| {
+                let (h, _, _) = crate::color_math::rgb2hsv(m);
+                let d = (h - want).abs();
+                let l = crate::color_math::relative_luminance(m);
+                (
+                    gap.max(d.min(360.0 - d)),
+                    ratio.max((l.max(page) + 0.05) / (l.min(page) + 0.05)),
+                )
+            })
+        };
+        let (gap, ratio) = worst(Some(ground));
+        assert!(
+            gap <= 25.0 && ratio <= 1.2,
+            "the bed under the letters lies {gap:.0} degrees off the pin, {ratio:.2}:1 off the page"
+        );
+        let (gap, _) = worst(None);
+        assert!(
+            gap > 60.0,
+            "control: mixed toward the teal, the bed lies only {gap:.0} degrees off"
+        );
+    }
+
     #[test]
     fn a_light_ground_draws_ink_under_the_letters_and_a_veil_ring_and_no_additive_light() {
         let (g, c) = (geom(), light_cfg());
@@ -3968,6 +4285,7 @@ mod tests {
                         ring: Some(Ring {
                             row: caret.0 - 1,
                             col: caret.1,
+                            dx: 0.0,
                             born,
                             life: 0.4,
                             caret,

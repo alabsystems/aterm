@@ -101,7 +101,9 @@ fn process_birth_platform(pid: libc::pid_t) -> crate::platform::Birth {
 #[cfg(target_os = "linux")]
 fn process_birth_platform(pid: libc::pid_t) -> crate::platform::Birth {
     use crate::platform::Birth;
-    let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+    let stat = match aterm_uds::process::read_proc_text(std::path::Path::new(&format!(
+        "/proc/{pid}/stat"
+    ))) {
         Ok(stat) => stat,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Birth::Gone,
         Err(_) => return Birth::Unreadable,
@@ -114,7 +116,7 @@ fn process_birth_platform(pid: libc::pid_t) -> crate::platform::Birth {
         Some("Z") => Birth::Gone,
         Some(_) => fields
             .nth(18)
-            .and_then(|t| t.parse().ok())
+            .and_then(crate::store::parse_build_name)
             .map_or(Birth::Unreadable, Birth::At),
         None => Birth::Unreadable,
     }
@@ -131,54 +133,10 @@ pub fn account_home() -> Option<PathBuf> {
     aterm_uds::account::home()
 }
 
-/// Mark `dir` as excluded from Time Machine via `com.apple.metadata:com_apple_backup_excludeItem`.
+/// Mark `dir` as excluded from Time Machine ([`aterm_uds::backup`]). Best effort: a store with no
+/// backup mark still works.
 pub fn exclude_from_backup(dir: &Path) {
-    use std::os::unix::ffi::OsStrExt as _;
-    const ATTR: &[u8] = b"com.apple.metadata:com_apple_backup_excludeItem\0";
-    const TRUE_BPLIST: &[u8] = &[
-        0x62, 0x70, 0x6c, 0x69, 0x73, 0x74, 0x30, 0x30, 0x09, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x09,
-    ];
-    let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
-        return;
-    };
-    #[cfg(target_os = "macos")]
-    {
-        let mut have = [0u8; 64];
-        // SAFETY: `path` and `ATTR` are NUL-terminated C strings that outlive the call, and
-        // `have` is a writable buffer of the stated length; `getxattr` writes at most that
-        // many bytes and returns how many it wrote, or -1.
-        let n = unsafe {
-            libc::getxattr(
-                path.as_ptr(),
-                ATTR.as_ptr().cast::<libc::c_char>(),
-                have.as_mut_ptr().cast::<libc::c_void>(),
-                have.len(),
-                0,
-                0,
-            )
-        };
-        if usize::try_from(n).is_ok_and(|n| have.get(..n) == Some(TRUE_BPLIST)) {
-            return;
-        }
-    }
-    // SAFETY: `path` and `ATTR` are valid C strings and the value points at a `'static` slice.
-    #[cfg(target_os = "macos")]
-    unsafe {
-        libc::setxattr(
-            path.as_ptr(),
-            ATTR.as_ptr().cast::<libc::c_char>(),
-            TRUE_BPLIST.as_ptr().cast::<libc::c_void>(),
-            TRUE_BPLIST.len(),
-            0,
-            0,
-        );
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (path, ATTR, TRUE_BPLIST);
-    }
+    let _ = aterm_uds::backup::Backups::SYSTEM.exclude_path(dir);
 }
 
 /// The names of the extended attributes on `path` itself, a link not followed (`listxattr(2)`
@@ -271,7 +229,7 @@ pub fn universal_control_disable() -> bool {
 
 /// Whether Rosetta 2's runtime file is at `runtime` ([`crate::machine::ROSETTA_RUNTIME`]).
 pub fn rosetta_present(runtime: &Path) -> Result<bool, String> {
-    match fs::metadata(runtime) {
+    match fs::symlink_metadata(runtime) {
         Ok(meta) => Ok(meta.is_file()),
         Err(e)
             if matches!(
@@ -396,8 +354,15 @@ pub fn dir_meta_is_system(meta: &Metadata) -> bool {
 /// or remove it), as the kernel authorizes that now. On macOS `access(2)` is asked for
 /// `_DELETE_OK` (`<sys/unistd.h>`; `libc` has no name for it), which weighs what a rename of it
 /// weighs: its own flags and ACL (`uchg`, `schg`, an append-only flag, a `deny delete` entry) and
-/// its folder's (its write bit, a `delete_child` entry, the sticky bit). Elsewhere the folder's
-/// write bit alone ([`dir_writable_by_caller`]); an immutable flag there is not read.
+/// its folder's (its write bit, a `delete_child` entry, the sticky bit). Elsewhere what Linux's
+/// `may_delete` weighs, as far as it can be read: the folder's write bit
+/// ([`dir_writable_by_caller`]); a sticky folder that neither it nor the entry is the caller's
+/// ([`sticky_keeps`]); and, on Linux, the entry's and its folder's immutable or append-only
+/// inode attribute (`chattr +i`, `+a`: `statx`'s `stx_attributes` as `stx_attributes_mask` says
+/// the filesystem reports them, [`binds`]). Where `statx` cannot be asked (`ENOSYS` before Linux
+/// 4.11, a sandbox's refusal, a libc without it such as musl's by default) the attributes are not
+/// read, and a rename one refuses once the intent is on record closes that intent
+/// (`build_cache::Unused::Refused`).
 #[must_use]
 pub fn may_take_name(path: &Path) -> bool {
     #[cfg(target_os = "macos")]
@@ -412,7 +377,126 @@ pub fn may_take_name(path: &Path) -> bool {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        path.parent().is_some_and(dir_writable_by_caller)
+        let Some(folder) = path.parent() else {
+            return false;
+        };
+        if !dir_writable_by_caller(folder) {
+            return false;
+        }
+        let (Ok(entry), Ok(holder)) = (fs::symlink_metadata(path), fs::metadata(folder)) else {
+            return false;
+        };
+        let bound = |at: &Path, follow: bool| attributes(at, follow).is_some_and(binds);
+        !sticky_keeps(holder.mode(), holder.uid(), entry.uid(), our_uid())
+            && !bound(path, false)
+            && !bound(folder, true)
+    }
+}
+
+/// `STATX_ATTR_IMMUTABLE` (`<linux/stat.h>`): nothing may change, rename or remove the inode.
+#[cfg(any(not(target_os = "macos"), test))]
+const ATTR_IMMUTABLE: u64 = 0x10;
+/// `STATX_ATTR_APPEND` (`<linux/stat.h>`): the inode may only be appended to; it, or an entry of
+/// it, is never renamed or removed.
+#[cfg(any(not(target_os = "macos"), test))]
+const ATTR_APPEND: u64 = 0x20;
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const _: () = assert!(
+    ATTR_IMMUTABLE == libc::STATX_ATTR_IMMUTABLE as u64
+        && ATTR_APPEND == libc::STATX_ATTR_APPEND as u64
+);
+
+/// Whether an inode's attributes, `(stx_attributes, stx_attributes_mask)` as `statx` reads them,
+/// keep its name, or the names in it, from being taken: immutable or append-only, among those its
+/// filesystem reports it supports.
+#[cfg(any(not(target_os = "macos"), test))]
+const fn binds((attributes, mask): (u64, u64)) -> bool {
+    attributes & mask & (ATTR_IMMUTABLE | ATTR_APPEND) != 0
+}
+
+/// Whether a sticky folder (`folder_mode` with `S_ISVTX`) keeps the caller `me` from taking the
+/// name of an entry in it: one that neither the folder (`folder_uid`) nor the entry
+/// (`entry_uid`) is the caller's, unless the caller is root (who holds `CAP_FOWNER`).
+#[cfg(any(not(target_os = "macos"), test))]
+const fn sticky_keeps(folder_mode: u32, folder_uid: u32, entry_uid: u32, me: u32) -> bool {
+    /// `S_ISVTX`: the sticky bit.
+    const STICKY: u32 = 0o1000;
+    folder_mode & STICKY != 0 && me != 0 && me != folder_uid && me != entry_uid
+}
+
+/// Linux's inode attributes of `path` (`statx`, the last component followed only when `follow`)
+/// and the ones its filesystem reports it supports: `(stx_attributes, stx_attributes_mask)`;
+/// `None` where `statx` cannot be asked or fails, which reads no attribute.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn attributes(path: &Path, follow: bool) -> Option<(u64, u64)> {
+    #[cfg(test)]
+    if let Some(seamed) = seams::attributes(path) {
+        return seamed;
+    }
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
+    let mut out = std::mem::MaybeUninit::<libc::statx>::zeroed();
+    // SAFETY: `c` is a NUL-terminated C string that outlives the call, which only reads it, and
+    // `out` points at a `statx` the call writes on success.
+    let rc = unsafe {
+        libc::statx(
+            libc::AT_FDCWD,
+            c.as_ptr(),
+            flags,
+            libc::STATX_TYPE,
+            out.as_mut_ptr(),
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    // SAFETY: a zeroed `statx` is a valid one, and the call succeeded, so it filled `out`.
+    let out = unsafe { out.assume_init() };
+    Some((out.stx_attributes, out.stx_attributes_mask))
+}
+
+/// Off Linux's glibc no inode attribute is read ([`may_take_name`]).
+#[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))))]
+const fn attributes(_: &Path, _: bool) -> Option<(u64, u64)> {
+    None
+}
+
+/// THE TESTS' STAND-IN FOR `statx`'s attributes, on the thread that sets it: what
+/// [`attributes`] reads of a path, `None` as an unanswered `statx` (`ENOSYS`). Test builds on
+/// Linux's glibc alone.
+#[cfg(all(test, target_os = "linux", target_env = "gnu"))]
+pub(crate) mod seams {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    type Read = Option<(u64, u64)>;
+
+    thread_local! {
+        static ATTRIBUTES: RefCell<Vec<(PathBuf, Read)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Read `path`'s attributes as `read` on this thread (`None`: `statx` unanswered).
+    pub(crate) fn attributes_of(path: &Path, read: Read) {
+        ATTRIBUTES.with(|a| a.borrow_mut().push((path.to_path_buf(), read)));
+    }
+
+    /// The `(stx_attributes, stx_attributes_mask)` of `STATX_ATTR_IMMUTABLE` set.
+    pub(crate) const IMMUTABLE: (u64, u64) = (super::ATTR_IMMUTABLE, super::ATTR_IMMUTABLE);
+
+    /// Forget every stand-in of this thread.
+    pub(crate) fn clear() {
+        ATTRIBUTES.with(|a| a.borrow_mut().clear());
+    }
+
+    pub(super) fn attributes(path: &Path) -> Option<Read> {
+        ATTRIBUTES.with(|a| {
+            a.borrow()
+                .iter()
+                .rev()
+                .find(|(p, _)| p == path)
+                .map(|(_, read)| *read)
+        })
     }
 }
 
@@ -478,12 +562,26 @@ pub fn set_file_flags(path: &Path, flags: u32) -> io::Result<()> {
 
 /// Open `path` for a fresh (create+truncate) write with initial permission `mode`.
 pub fn open_create_write(path: &Path, mode: u32) -> io::Result<File> {
-    OpenOptions::new()
+    let f = OpenOptions::new()
         .write(true)
         .create(true)
-        .truncate(true)
         .mode(mode)
-        .open(path)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let meta = f.metadata()?;
+    if !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{}: not a regular file", path.display()),
+        ));
+    }
+    if meta.len() != 0 {
+        f.set_len(0)?;
+    }
+    if meta.permissions().mode() & 0o7777 != mode & 0o7777 {
+        f.set_permissions(Permissions::from_mode(mode))?;
+    }
+    Ok(f)
 }
 
 /// Create `path` exclusively (`O_CREAT|O_EXCL`) with mode `mode`, failing [`io::ErrorKind::AlreadyExists`] if it exists.
@@ -559,11 +657,13 @@ pub fn volume_free_bytes(dir: &Path) -> Option<u64> {
 
 /// Atomically point `link` at `target`.
 pub fn atomic_symlink(target: &Path, link: &Path) -> io::Result<()> {
+    static SYMLINK_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let file_name = link
         .file_name()
         .and_then(std::ffi::OsStr::to_str)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "link has no file name"))?;
-    let tmp = link.with_file_name(format!(".{file_name}.tmp-{}", std::process::id()));
+    let seq = SYMLINK_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = link.with_file_name(format!(".{file_name}.tmp-{}-{seq}", std::process::id()));
     let _ = fs::remove_file(&tmp);
     std::os::unix::fs::symlink(target, &tmp)?;
     if let Err(e) = fs::rename(&tmp, link) {
@@ -600,13 +700,37 @@ pub fn shim_executable_to_env(
         let helper = crate::stub::Embedder::this_process()
             .embed(standing.as_deref())
             .or(standing);
-        if let Some(helper) = helper {
-            let call = crate::build_cache::registered::shim_call(&helper, tool);
+        if let Some(helper) = helper.as_deref()
+            && !crate::build_cache::registered::helper_speaks_hop(helper)
+        {
+            let call = crate::build_cache::registered::shim_call(helper, tool);
             body = body.replacen(
                 "# aterm: build intermediates out of Spotlight\n",
                 &format!("{call}# aterm: build intermediates out of Spotlight\n"),
                 1,
             );
+        } else if let Some(helper) = helper
+            && let Some(block) = crate::build_cache::shim_block(tool)
+            && let Some(at) = body.find(&block)
+        {
+            let target_q = super::sh_shim_quote(target);
+            let routed = route.as_deref().and_then(|route| {
+                let root = super::sh_shim_quote(route);
+                let exec = format!("exec {root} \"$@\"");
+                let line = body
+                    .lines()
+                    .find(|l| l.starts_with("[ ") && l.ends_with(&exec))?;
+                Some((line[..line.len() - exec.len()].to_owned(), root))
+            });
+            let hop = crate::build_cache::registered::shim_hop(
+                &helper,
+                tool,
+                &target_q,
+                routed
+                    .as_ref()
+                    .map(|(tests, root)| (tests.as_str(), root.as_str())),
+            );
+            body.insert_str(at + block.len(), &hop);
         }
     }
     Ok(crate::lay::Executable::new(shim, body))
@@ -853,6 +977,45 @@ pub fn exit_code_like(status: std::process::ExitStatus) -> std::process::ExitCod
 #[cfg(test)]
 #[path = "unix_forwarding_tests.rs"]
 mod forwarding_tests;
+
+/// The reading [`may_take_name`] makes off macOS, held to what Linux's `may_delete` refuses, on
+/// every Unix this crate's tests run on.
+#[cfg(test)]
+mod take_name_tests {
+    use super::{ATTR_APPEND, ATTR_IMMUTABLE, binds, sticky_keeps};
+
+    /// AN IMMUTABLE OR APPEND-ONLY INODE KEEPS ITS NAME, as far as its filesystem reports the
+    /// attribute: either bit set and reported binds; a bit the mask does not report, or another
+    /// attribute (compressed 0x4, nodump 0x40), does not. NEGATIVE CONTROLS: the same bits with no
+    /// mask, and no bits with the whole mask.
+    #[test]
+    fn an_immutable_or_append_only_inode_keeps_its_name() {
+        let all = u64::MAX;
+        assert!(binds((ATTR_IMMUTABLE, all)));
+        assert!(binds((ATTR_APPEND, all)));
+        assert!(binds((ATTR_IMMUTABLE | 0x4, ATTR_IMMUTABLE)));
+        assert!(!binds((ATTR_IMMUTABLE | ATTR_APPEND, 0)), "not reported");
+        assert!(
+            !binds((ATTR_IMMUTABLE, ATTR_APPEND)),
+            "another bit reported"
+        );
+        assert!(!binds((0x4 | 0x40, all)), "other attributes");
+        assert!(!binds((0, all)));
+    }
+
+    /// A STICKY FOLDER KEEPS ANOTHER'S NAME: in a sticky folder the caller may take an entry's
+    /// name only when the folder or the entry is theirs, or they are root. NEGATIVE CONTROL: the
+    /// same folder without the sticky bit keeps nothing.
+    #[test]
+    fn a_sticky_folder_keeps_the_name_of_an_entry_neither_it_nor_the_entry_is_the_callers() {
+        let (me, them, other) = (501, 502, 503);
+        assert!(sticky_keeps(0o1777, them, other, me));
+        assert!(!sticky_keeps(0o1777, me, other, me), "the folder is mine");
+        assert!(!sticky_keeps(0o1777, them, me, me), "the entry is mine");
+        assert!(!sticky_keeps(0o1777, them, other, 0), "root");
+        assert!(!sticky_keeps(0o0777, them, other, me), "not sticky");
+    }
+}
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {

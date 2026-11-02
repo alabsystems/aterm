@@ -25,6 +25,14 @@ pub const MAILBOX_ENV: &str = "ATERM_OPEN_URL_MAILBOX";
 /// Environment variable naming the target account email for headless OAuth authorization.
 pub const EMAIL_ENV: &str = "ATERM_OPEN_URL_EMAIL";
 
+/// Private input file for one root-approved mailbox flow. An explicit value
+/// disables ambient mailbox and browser fallback, including on read refusal.
+pub const INPUT_ENV: &str = "ATERM_OPEN_URL_APPROVED_INPUT";
+
+/// Set where a person signs in a row whose page stopped aterm's sign-in: the row's profile opens at
+/// once, with no headless try first, which would only meet that page again.
+pub const NO_HEADLESS_ENV: &str = "ATERM_OPEN_URL_NO_HEADLESS";
+
 /// Default mailbox subdirectory under `<accounts store>` when [`MAILBOX_ENV`] is unset.
 pub const DEFAULT_MAILBOX_DIR: &str = "mailbox";
 
@@ -115,6 +123,13 @@ impl Met {
             .find(|w| w.as_str() == word)?;
         let met = Met::new(word, host);
         (met.host.as_deref() == host).then_some(met)
+    }
+
+    /// Whether the page itself stopped the sign-in, as Cloudflare's bot check or block page does:
+    /// no headless retry passes it, where a stall may clear.
+    #[must_use]
+    pub const fn stopped(&self) -> bool {
+        matches!(self.word, MetWord::BotCheck | MetWord::BlockPage)
     }
 
     /// Its words in a renewal's record: what the page met, naming Cloudflare where it was
@@ -686,9 +701,13 @@ pub(super) fn decode_html_amp(input: &str) -> String {
             } else if let Some(num) = entity.strip_prefix('#') {
                 let code =
                     if let Some(hex) = num.strip_prefix('x').or_else(|| num.strip_prefix('X')) {
-                        u32::from_str_radix(hex, 16).ok()
+                        (!hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+                            .then(|| u32::from_str_radix(hex, 16).ok())
+                            .flatten()
                     } else {
-                        num.parse::<u32>().ok()
+                        (!num.is_empty() && num.bytes().all(|b| b.is_ascii_digit()))
+                            .then(|| num.parse::<u32>().ok())
+                            .flatten()
                     };
                 if let Some(c) = code {
                     if c == 160 {
@@ -2581,12 +2600,13 @@ fn normalize_dot_segments(path_and_query: &str) -> String {
 }
 
 fn resolve_relative_url(base_url: &str, target: &str) -> String {
-    let target = decode_html_amp(target.trim());
+    let decoded = decode_html_amp(target.trim());
+    let target = decoded.split('#').next().unwrap_or(&decoded);
     if target.starts_with("https://") || target.starts_with("http://") {
-        return target;
+        return target.to_owned();
     }
     let Some((scheme, rest)) = base_url.split_once("://") else {
-        return target;
+        return target.to_owned();
     };
     if target.starts_with("//") {
         return format!("{scheme}:{target}");
@@ -2599,7 +2619,6 @@ fn resolve_relative_url(base_url: &str, target: &str) -> String {
     if target.is_empty() {
         return base_url.split('#').next().unwrap_or(base_url).to_owned();
     }
-    let target = target.split('#').next().unwrap_or(&target);
     if target.starts_with('?') {
         return format!("{scheme}://{authority}{effective_path}{target}");
     }
@@ -2796,7 +2815,8 @@ fn parse_json_approval_action(
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|m| !m.is_empty())
-            .map(str::to_ascii_uppercase);
+            .map(str::to_ascii_uppercase)
+            .filter(|m| matches!(m.as_str(), "GET" | "POST"));
         for key in [
             "approve_url",
             "approval_url",
@@ -3191,10 +3211,11 @@ fn try_decode_chunked_body(input: &str) -> Option<String> {
     let mut saw_chunk = false;
     loop {
         let rest = bytes.get(pos..)?;
-        let (line_end, eol_len) = if let Some(idx) = rest.windows(2).position(|w| w == b"\r\n") {
-            (idx, 2usize)
+        let nl = rest.iter().position(|&b| b == b'\n')?;
+        let (line_end, eol_len) = if nl > 0 && rest[nl - 1] == b'\r' {
+            (nl - 1, 2usize)
         } else {
-            (rest.iter().position(|&b| b == b'\n')?, 1usize)
+            (nl, 1usize)
         };
         let size_line = std::str::from_utf8(&rest[..line_end]).ok()?;
         let hex_part = size_line.split(';').next().unwrap_or("").trim();
@@ -3231,14 +3252,16 @@ pub(super) fn parse_raw_http_response(
         let first_line = head.lines().next()?;
         let mut parts = first_line.split_ascii_whitespace();
         let proto = parts.next()?;
+        if !proto.starts_with("HTTP/") {
+            return None;
+        }
         let code_str = parts.next()?;
-        let status: u16 = code_str.parse().ok()?;
-        if proto.starts_with("HTTP/")
-            && ((100..200).contains(&status)
-                || (status == 200
-                    && first_line
-                        .to_ascii_lowercase()
-                        .contains("connection established")))
+        let status: u16 = crate::parse_uint(code_str)?;
+        if ((100..200).contains(&status)
+            || (status == 200
+                && first_line
+                    .to_ascii_lowercase()
+                    .contains("connection established")))
             && rest.starts_with("HTTP/")
         {
             current = rest;
@@ -3300,10 +3323,19 @@ pub(super) fn loopback_http_exchange(
     cookies: &mut BTreeMap<String, String>,
     form_body: Option<&str>,
 ) -> Result<HttpResponse, &'static str> {
+    if !matches!(method, "GET" | "POST") {
+        return Err("loopback client takes GET or POST only");
+    }
     let rest = url
         .strip_prefix("http://")
         .ok_or("loopback client takes http:// only")?;
     let rest = rest.split('#').next().unwrap_or(rest);
+    if rest
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || c == '\\')
+    {
+        return Err("loopback URL contains invalid characters");
+    }
     let (authority, tail) = match rest.find(['/', '?']) {
         Some(idx) => (&rest[..idx], &rest[idx..]),
         None => (rest, "/"),
@@ -3319,9 +3351,7 @@ pub(super) fn loopback_http_exchange(
     if !matches!(host, "127.0.0.1" | "localhost") {
         return Err("loopback URL authority is not localhost or 127.0.0.1");
     }
-    let port: u16 = port_str
-        .parse()
-        .ok()
+    let port: u16 = crate::parse_uint(port_str)
         .filter(|p| *p > 0)
         .ok_or("loopback URL port is invalid")?;
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
@@ -3447,7 +3477,7 @@ fn curl_command(
 /// caller's flags; curl's environment is the caller's [`CHILD_ENV_KEPT`] variables alone.
 /// Callers put `--disable` first to suppress `.curlrc`.
 /// # Errors
-/// A config NUL, child or writer startup failure, failed pipe I/O or wait, or a writer panic.
+/// A config NUL, child or pipe failure, incomplete or oversized output, or a deadline refusal.
 pub(super) fn curl_output(
     args: &[&str],
     options: &[(&'static str, &str)],
@@ -3457,6 +3487,9 @@ pub(super) fn curl_output(
     })
 }
 
+const CURL_MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+const CURL_WAIT_BUDGET: Duration = Duration::from_secs(30);
+
 fn curl_output_with(
     program: impl AsRef<std::ffi::OsStr>,
     args: &[&str],
@@ -3464,32 +3497,10 @@ fn curl_output_with(
     var: &dyn Fn(&str) -> Option<OsString>,
 ) -> std::io::Result<std::process::Output> {
     let (mut cmd, input) = curl_command(program, args, options, var)?;
-    let mut child = cmd.spawn()?;
-    let Some(mut stdin) = child.stdin.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(std::io::Error::other("curl config stdin is unavailable"));
-    };
-    std::thread::scope(|scope| {
-        let writer = std::thread::Builder::new()
-            .name("aterm-curl-config".into())
-            .spawn_scoped(scope, move || stdin.write_all(input.as_bytes()));
-        let writer = match writer {
-            Ok(writer) => writer,
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error);
-            }
-        };
-        // Drain both output pipes while config is written, so a large form and a
-        // diagnostic cannot fill opposite pipes. Close stdin and join before returning.
-        let output = child.wait_with_output();
-        writer
-            .join()
-            .map_err(|_| std::io::Error::other("curl config writer panicked"))??;
-        output
-    })
+    let input = aterm_uds::secret::Secret::from_vec(input.into_bytes());
+    let now = Instant::now();
+    let deadline = now.checked_add(CURL_WAIT_BUDGET).unwrap_or(now);
+    aterm_uds::deadline::output_with_input_until(&mut cmd, input, deadline, CURL_MAX_OUTPUT_BYTES)
 }
 
 fn https_curl_exchange(
@@ -3565,7 +3576,7 @@ fn loopback_parts(url: &str) -> Option<(u16, &str, Option<&str>)> {
         Some(idx) => (&rest[..idx], &rest[idx..]),
         None => (rest, ""),
     };
-    let port = port.parse::<u16>().ok().filter(|port| *port > 0)?;
+    let port = crate::parse_uint::<u16>(port).filter(|port| *port > 0)?;
     let (raw_path, query) = tail
         .split_once('?')
         .map_or((tail, None), |(path, query)| (path, Some(query)));
@@ -3769,7 +3780,10 @@ pub(super) fn poll_mailbox_for_magic_link(
     target_email: Option<&str>,
     timeout: Duration,
 ) -> Result<String, &'static str> {
-    let deadline = Instant::now() + timeout;
+    let now = Instant::now();
+    let deadline = now
+        .checked_add(timeout)
+        .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365));
     let mut tried = BTreeSet::new();
     loop {
         if let Ok(entries) = std::fs::read_dir(mailbox_dir) {
@@ -4223,6 +4237,24 @@ fn discover_store_dir() -> Option<PathBuf> {
     store_dir_of(&|name| std::env::var_os(name), arg0.as_deref())
 }
 
+fn with_approved_mailbox<T>(
+    path: &Path,
+    target: Option<&str>,
+    profile: Option<&str>,
+    run: impl FnOnce(&super::headless_oauth::MailboxConfig, &str, Option<&Path>) -> Result<T, String>,
+) -> Result<T, String> {
+    if profile.is_some_and(|profile| !profile.trim().is_empty()) {
+        return Err("approved mailbox flow cannot enforce a named browser profile".into());
+    }
+    let target = target
+        .filter(|target| !target.trim().is_empty())
+        .ok_or("approved mailbox flow has no explicit target")?;
+    let inputs = super::cli::shared_provider::MailboxInputs::read_staged(path, target)?;
+    // No ambient profile store is passed: the native helper creates a fresh
+    // transient browser profile for this approved input alone.
+    run(&inputs.mailbox(), target, None)
+}
+
 /// Entry point for the `aterm-open-url` argv0 alias.
 #[must_use = "return or inspect the command exit status"]
 pub fn main_entry(args: Vec<OsString>) -> ExitCode {
@@ -4233,7 +4265,6 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
     let profile = std::env::var(PROFILE_ENV).ok();
     let email = std::env::var(EMAIL_ENV).ok();
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let store_dir = discover_store_dir();
     // What the headless sign-in met, for the renewal that named an outcome file.
     let note_outcome = || {
         if let (Some(path), Some(met)) = (
@@ -4243,7 +4274,38 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
             write_outcome(Path::new(&path), &met);
         }
     };
-    if let [url] = args.as_slice() {
+    if let Some(path) = std::env::var_os(INPUT_ENV) {
+        let result = match args.as_slice() {
+            [url] => with_approved_mailbox(
+                Path::new(&path),
+                email.as_deref(),
+                profile.as_deref(),
+                |cfg, target, profile_store| {
+                    authorize_with_mailbox_config(
+                        url,
+                        cfg,
+                        profile_store,
+                        Some(target),
+                        AUTHORIZE_TIMEOUT,
+                    )
+                    .map_err(str::to_owned)
+                },
+            ),
+            _ => Err("approved mailbox flow requires one authorization URL".into()),
+        };
+        return match result {
+            Ok(()) => ExitCode::from(0),
+            Err(why) => {
+                note_outcome();
+                eprintln!("{OPENER}: approved mailbox was not authorized: {why}");
+                ExitCode::from(1)
+            }
+        };
+    }
+    let store_dir = discover_store_dir();
+    if let [url] = args.as_slice()
+        && std::env::var_os(NO_HEADLESS_ENV).is_none()
+    {
         let force_headless = std::env::var(super::headless_oauth::HEADLESS_ENV)
             .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes"));
         let has_mailbox_env = std::env::var_os(MAILBOX_ENV).is_some_and(|v| !v.is_empty());
@@ -4325,3 +4387,7 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
 #[cfg(test)]
 #[path = "open_url_tests.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+#[path = "open_url_approved_tests.rs"]
+mod approved_tests;

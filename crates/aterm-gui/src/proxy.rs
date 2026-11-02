@@ -468,24 +468,33 @@ pub(crate) fn retire_graph_entry(sock_dir: &Path, sid: &SessionId) {
 
 /// Open (create/truncate) a private sidecar file for writing. Unix: mode
 /// `0600`.
-#[cfg(unix)]
 fn open_private(path: &Path) -> std::io::Result<std::fs::File> {
+    open_private_opts(path, true)
+}
+
+/// Open or create a private `0600` sidecar file without truncating before its lock is taken.
+fn open_private_untruncated(path: &Path) -> std::io::Result<std::fs::File> {
+    open_private_opts(path, false)
+}
+
+#[cfg(unix)]
+fn open_private_opts(path: &Path, truncate: bool) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     std::fs::OpenOptions::new()
         .write(true)
         .create(true)
-        .truncate(true)
+        .truncate(truncate)
         .mode(0o600)
         .open(path)
 }
 
-/// Windows twin of [`open_private`] (ACL-inherited; see the Unix docs).
+/// Windows twin of [`open_private_opts`] (ACL-inherited; see the Unix docs).
 #[cfg(windows)]
-fn open_private(path: &Path) -> std::io::Result<std::fs::File> {
+fn open_private_opts(path: &Path, truncate: bool) -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new()
         .write(true)
         .create(true)
-        .truncate(true)
+        .truncate(truncate)
         .open(path)
 }
 
@@ -543,19 +552,21 @@ pub(crate) fn write_edge_tokens(
     write_hex: &str,
     signal_hex: &str,
 ) -> Option<EdgeFile> {
+    let sid = Sid::parse(child_sid.as_str())?;
     let dir = sock_dir.join("edges");
     if crate::control_auth::ensure_private_dir(&dir).is_err() {
         return None;
     }
-    let path = dir.join(child_sid.as_str());
+    let path = dir.join(sid.as_str());
     let body = format!("read {read_hex}\nwrite {write_hex}\nsignal {signal_hex}\n");
-    let f = open_private(&path).ok()?;
-    let Some(lock) = take_owner_lock(f) else {
-        let _ = std::fs::remove_file(&path);
-        return None;
-    };
+    let f = open_private_untruncated(&path).ok()?;
+    let lock = take_owner_lock(f)?;
     let mut secret: &std::fs::File = owner_file(&lock);
-    if secret.write_all(body.as_bytes()).is_err() {
+    if secret
+        .set_len(0)
+        .and_then(|()| secret.write_all(body.as_bytes()))
+        .is_err()
+    {
         let _ = std::fs::remove_file(&path);
         drop(lock);
         return None;
@@ -832,7 +843,10 @@ fn probe_answer(
 fn read_probe_line(host: &CtlStream, within: std::time::Duration) -> std::io::Result<String> {
     use std::io::{Error, ErrorKind};
     const MAX_PROBE_LINE: usize = 4096;
-    let deadline = std::time::Instant::now() + within;
+    let start = std::time::Instant::now();
+    let deadline = start
+        .checked_add(within)
+        .unwrap_or_else(|| start + std::time::Duration::from_secs(365 * 24 * 3600));
     let mut line = Vec::with_capacity(160);
     let mut chunk = [0u8; 1024];
     let not_accepted = || {
@@ -1270,6 +1284,10 @@ mod tests {
             let id = SessionId::new(id);
             write_graph_entry(dir.path(), &id, "/x/aterm-1.sock", &nonce);
             assert_eq!(graph_entry_host_pid(dir.path(), &id), None, "{id:?}");
+            assert!(
+                write_edge_tokens(dir.path(), &id, "aa", "bb", "cc").is_none(),
+                "{id:?}"
+            );
         }
         assert!(!dir.path().join("x").exists(), "`../x` left graph/");
         let mut names: Vec<_> = std::fs::read_dir(dir.path().join("graph"))
@@ -1859,9 +1877,21 @@ mod tests {
         assert_eq!(first, Some((r.clone(), w.clone(), s.clone())), "first read");
         assert_eq!(
             second,
-            Some((r, w, s)),
+            Some((r.clone(), w.clone(), s.clone())),
             "second read still succeeds (persists)"
         );
+        #[cfg(unix)]
+        {
+            assert!(
+                write_edge_tokens(&dir, &sid, "11", "22", "33").is_none(),
+                "a locked edge file cannot be overwritten"
+            );
+            assert_eq!(
+                read_edge_tokens(&path),
+                Some((r, w, s)),
+                "a refused overwrite neither truncates nor unlinks the live owner's file"
+            );
+        }
         drop(ChildProxy::new(None));
         assert!(read_edge_tokens(&path).is_some(), "only its own file");
         drop(ChildProxy::new(Some(file)));

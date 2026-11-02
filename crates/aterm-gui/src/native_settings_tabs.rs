@@ -181,6 +181,8 @@ impl SettingsApp {
             cx.harness(HarnessRequest::Refresh);
             view.feedback = Some("Refreshing computers, sessions, and tabs\u{2026}".to_string());
         } else if let Some(rest) = action.strip_prefix(TABS_SHOW_PREFIX)
+            && !rest.is_empty()
+            && rest.bytes().all(|b| b.is_ascii_digit())
             && let Ok(session) = rest.parse::<u64>()
         {
             cx.harness(HarnessRequest::Show { session });

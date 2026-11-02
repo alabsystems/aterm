@@ -42,7 +42,7 @@ enum Route {
     /// A removed mode, with what does its work ([`gone_to`]).
     Gone(&'static str),
     /// A membership mode the usage names (`init`, `join`, `peers`, `allow`,
-    /// `publish`, `sync`, `census`, `leave`).
+    /// `publish`, `sync`, `census`, `name`, `leave`).
     Membership,
     /// Any other word.
     Unknown,
@@ -51,9 +51,9 @@ enum Route {
 fn route(mode: Option<&str>) -> Route {
     match mode {
         Some("-h" | "--help") | None => Route::Help,
-        Some("init" | "join" | "peers" | "allow" | "publish" | "sync" | "census" | "leave") => {
-            Route::Membership
-        }
+        Some(
+            "init" | "join" | "peers" | "allow" | "publish" | "sync" | "census" | "leave" | "name",
+        ) => Route::Membership,
         Some(mode) => gone_to(mode).map_or(Route::Unknown, Route::Gone),
     }
 }
@@ -84,7 +84,7 @@ fn usage() -> ExitCode {
 mod tests {
     use super::*;
 
-    /// No mode, `-h` and `--help` are help; the seven membership words are
+    /// No mode, `-h` and `--help` are help; the membership words are
     /// membership; each removed mode is refused; any other word is unknown.
     #[test]
     fn every_mode_word_routes_to_its_one_answer() {
@@ -92,7 +92,7 @@ mod tests {
             assert_eq!(route(help), Route::Help, "{help:?}");
         }
         for word in [
-            "init", "join", "peers", "allow", "publish", "sync", "census", "leave",
+            "init", "join", "peers", "allow", "publish", "sync", "census", "name", "leave",
         ] {
             assert_eq!(route(Some(word)), Route::Membership, "{word}");
         }

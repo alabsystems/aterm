@@ -330,7 +330,7 @@ impl Seen {
                 continue;
             };
             let bit = 1u8 << k;
-            if unit_at(cols, self.col) != self.unit {
+            if !unit_at(cols, self.col).eq(self.unit) {
                 self.clear |= bit;
                 self.pending &= !bit;
             } else if at_arm {
@@ -339,10 +339,12 @@ impl Seen {
                 let age = match age_opt {
                     Some(a) => a,
                     None => {
-                        let a = now
-                            .saturating_duration_since(self.born)
-                            .as_millis()
-                            .min(u32::MAX as u128) as u32;
+                        let a_ms = now.saturating_duration_since(self.born).as_millis();
+                        let a = if a_ms > u32::MAX as u128 {
+                            u32::MAX
+                        } else {
+                            a_ms as u32
+                        };
                         age_opt = Some(a);
                         a
                     }
@@ -752,27 +754,34 @@ impl Witness {
             }
             ci += 1;
         }
-        let cohort = best_cell?.1;
-        let mut glyph: Option<u16> = None;
-        let mut cj = 0;
-        while cj < cells.len() {
-            let c = &cells[cj];
-            if !c.leaving()
-                && c.typing
-                && c.row == hand.0
-                && c.cohort == cohort
-                && c.col <= last
-                && !matches!(glyph, Some(g) if c.col <= g)
-                && matches!(
-                    self.find(c.row, c.col, c.born),
-                    Some(i) if !self.seen[i].released
-                )
-            {
-                glyph = Some(c.col);
+        let (best_born, cohort) = best_cell?;
+        let glyph = if matches!(
+            self.find(hand.0, last, best_born),
+            Some(i) if !self.seen[i].released
+        ) {
+            last
+        } else {
+            let mut glyph: Option<u16> = None;
+            let mut cj = 0;
+            while cj < cells.len() {
+                let c = &cells[cj];
+                if !c.leaving()
+                    && c.typing
+                    && c.row == hand.0
+                    && c.cohort == cohort
+                    && c.col < last
+                    && !matches!(glyph, Some(g) if c.col <= g)
+                    && matches!(
+                        self.find(c.row, c.col, c.born),
+                        Some(i) if !self.seen[i].released
+                    )
+                {
+                    glyph = Some(c.col);
+                }
+                cj += 1;
             }
-            cj += 1;
-        }
-        let glyph = glyph?;
+            glyph?
+        };
         let sole = match rode_to {
             Some(to) => SoleArrival::Hand { glyph, to },
             None => SoleArrival::Refused,

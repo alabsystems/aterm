@@ -279,12 +279,8 @@ pub fn block_signatures(extended: &str) -> Vec<String> {
                     .map_or(b.len(), |q| i + q + 2);
             }
             b'@' if b.get(i + 1) == Some(&b'?') && b.get(i + 2) == Some(&b'<') => {
-                let end = angle_end(b, i + 2);
-                let close = if b.get(end.wrapping_sub(1)) == Some(&b'>') {
-                    end - 1
-                } else {
-                    end
-                };
+                let (end, closed) = angle_end(b, i + 2);
+                let close = if closed { end - 1 } else { end };
                 out.push(extended[i + 3..close].to_string());
                 i = end;
             }
@@ -307,7 +303,7 @@ pub fn block_check<P: crate::BlockFn>(signature: &str) -> Result<(), String> {
     }
 }
 
-const fn angle_end(b: &[u8], open: usize) -> usize {
+const fn angle_end(b: &[u8], open: usize) -> (usize, bool) {
     let (mut depth, mut j, mut quoted) = (0_usize, open, false);
     while j < b.len() {
         match b[j] {
@@ -316,14 +312,14 @@ const fn angle_end(b: &[u8], open: usize) -> usize {
             b'>' if !quoted => {
                 depth -= 1;
                 if depth == 0 {
-                    return j + 1;
+                    return (j + 1, true);
                 }
             }
             _ => {}
         }
         j += 1;
     }
-    b.len()
+    (b.len(), false)
 }
 
 fn swift_override_of_the_same_width(class: &str, runtime: &str, ours: &str) -> bool {
@@ -363,7 +359,13 @@ fn sign_blind(t: &str) -> String {
             b'L' => out.push('l'),
             b'I' => out.push('i'),
             b'B' => out.push('c'),
-            c => out.push(char::from(c)),
+            c if c.is_ascii() => out.push(char::from(c)),
+            _ => {
+                let ch = t[i..].chars().next().expect("i < b.len() at char boundary");
+                out.push(ch);
+                i += ch.len_utf8();
+                continue;
+            }
         }
         i += 1;
     }
@@ -379,7 +381,7 @@ fn abi_shape(types: &str) -> Vec<String> {
             i += 1;
             continue;
         }
-        let end = type_end(b, i);
+        let end = type_end(types, i);
         out.push(match b[i] {
             b'@' | b'#' | b':' | b'*' | b'^' => "p".to_string(),
             _ => types[i..end].to_string(),
@@ -389,13 +391,14 @@ fn abi_shape(types: &str) -> Vec<String> {
     out
 }
 
-fn type_end(b: &[u8], i: usize) -> usize {
+fn type_end(types: &str, i: usize) -> usize {
+    let b = types.as_bytes();
     match b.get(i) {
         None => i,
-        Some(b'^') => type_end(b, i + 1),
-        Some(q) if b"rnNoORV".contains(q) => type_end(b, i + 1),
+        Some(b'^') => type_end(types, i + 1),
+        Some(q) if b"rnNoORV".contains(q) => type_end(types, i + 1),
         Some(b'@') => match b.get(i + 1) {
-            Some(b'?') if b.get(i + 2) == Some(&b'<') => angle_end(b, i + 2),
+            Some(b'?') if b.get(i + 2) == Some(&b'<') => angle_end(b, i + 2).0,
             Some(b'?') => i + 2,
             Some(b'"') => b[i + 2..]
                 .iter()
@@ -426,7 +429,7 @@ fn type_end(b: &[u8], i: usize) -> usize {
             }
             b.len()
         }
-        Some(_) => i + 1,
+        Some(_) => i + types[i..].chars().next().map_or(1, char::len_utf8),
     }
 }
 
@@ -1306,7 +1309,8 @@ pub unsafe fn send_v_ptr_usize(recv: Id, sel: Sel, a: *mut core::ffi::c_void, b:
 
 /// `-(id)sel:(NSRect)a styleMask:(NSUInteger)b backing:(NSUInteger)c defer:(BOOL)d`.
 /// # Safety
-/// See the module note; consumes the receiver's +1 from `+alloc` and returns +1 or nil.
+/// See the module note; consumes the receiver's +1 from `+alloc` and returns +1, or nil having
+/// released the receiver.
 #[must_use]
 pub unsafe fn send_id_rect_usize_usize_bool(
     recv: Id,
@@ -1559,9 +1563,19 @@ mod tests {
                 block_check::<fn(i32)>("v@?@"),
             ),
             ("a return", block_check::<fn() -> usize>("v@?")),
+            ("non-ASCII signature bytes", block_check::<fn()>("é")),
+            (
+                "non-ASCII bytes after valid prefix",
+                block_check::<fn()>("v@?é"),
+            ),
         ] {
             assert!(result.is_err(), "{case}");
         }
+        assert_eq!(
+            block_signatures("v24@0:8@?<\"unterminated>"),
+            ["\"unterminated>"],
+            "a '>' inside an unterminated quote is not a closing angle bracket"
+        );
     }
 
     #[test]

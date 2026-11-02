@@ -176,7 +176,7 @@ impl App {
                     held,
                 )
             });
-        let driven = driven.map(Driver::Aterm);
+        let driven = driven.map(|words| self.autopilot_driver(h.local_id, words));
         let is_worker = worker_of.is_some();
         let driver = if person {
             Some(Driver::You)
@@ -641,7 +641,14 @@ impl App {
         {
             self.agents.stop_signals += 1;
         }
-        let reply = crate::control::signal_verb(master, "term", &ctx);
+        // A person's Stop, or a control client's gesture standing in for one: the run it ends
+        // closes `out=signal` by whoever asked.
+        let by = if self.person_gesture_refused() {
+            aterm_slog::Actor::Ctl
+        } else {
+            aterm_slog::Actor::Human
+        };
+        let reply = crate::control::signal_verb(master, "term", &ctx, by);
         let reply = reply.trim_end().to_string();
         match reply.strip_prefix("OK ") {
             Some(ok) => Ok(ok.to_string()),
@@ -1601,7 +1608,7 @@ mod tests {
 
     /// WHO DRIVES A CODEX TAB, on the Overview and the hover alike (`autopilot::carried`): a host
     /// that admits codex drives a plain codex in front of it not at all, and a codex-alab that
-    /// proved its own claim under the session's Autopilot is driven by aterm's Autopilot on both.
+    /// proved its own claim is named as its own native autopilot on both.
     #[test]
     fn a_codex_is_driven_on_the_overview_and_the_hover_only_under_its_proven_claim() {
         use crate::overview::Driver;
@@ -1657,7 +1664,7 @@ mod tests {
         )
         .expect("the proven claim");
         let words = app.driven_by_aterm(0).expect("the hover names the driver");
-        assert_eq!(driver(&app), Some(Driver::Aterm(words)));
+        assert_eq!(driver(&app), Some(Driver::CodexAlab(words)));
         host.shutdown_and_join();
     }
 
@@ -1812,7 +1819,7 @@ mod tests {
             (
                 land.clone(),
                 Some(
-                    "not landed yet: 2 unpushed commits; open work in its report: follow-up \
+                    "not landed yet: 2 unpushed commits; open in its report: follow-up \
                      \u{b7} 3 nudges"
                         .to_string()
                 )
@@ -1943,6 +1950,98 @@ mod tests {
             items, 3,
             "each of the three tabs' chips is hit at its right end"
         );
+    }
+
+    /// The lab's pointer selects an Overview row on a headless window that never drew the card,
+    /// as a person's pointer selects one on glass: `pointer move item=<n>` lays the glass the next
+    /// frame shows, as `pointer move <r> <c>` does, and aims at the centre of that item's row
+    /// (§14.16).
+    #[test]
+    fn the_labs_pointer_selects_an_overview_row_the_window_never_drew() {
+        use crate::app_mouse::PointerAction;
+        let (mut app, wid, _) = app_with_three();
+        // A headless window composes a frame only for a capture: none here.
+        app.windows
+            .get_mut(&wid)
+            .expect("the window")
+            .input_scratch
+            .cells
+            .clear();
+        assert!(app.open_overview().is_ok());
+        let head =
+            |app: &App| app.windows[&wid].overview().expect("open").controls_lines()[0].clone();
+        for item in [2, 0, 1] {
+            app.pointer_cmd(PointerAction::MoveItem(item))
+                .unwrap_or_else(|why| panic!("item {item}: {why}"));
+            assert!(
+                head(&app).contains(&format!(" selected={item} ")),
+                "the pointer over item {item}'s row selects it: {}",
+                head(&app)
+            );
+        }
+        assert_eq!(
+            app.pointer_cmd(PointerAction::MoveItem(3)),
+            Err("item 3 is not a row the card shows".to_string()),
+        );
+        assert!(
+            head(&app).contains(" selected=1 "),
+            "a refused aim moves nothing"
+        );
+    }
+
+    /// `pointer move item=<n>` over an Overview on a Settings page of a Retina window, its frame
+    /// inside a larger window: each aim, read back through the hover's own path, is the centre of
+    /// that item's row and selects it, as on the terminal route (§14.16).
+    #[test]
+    fn an_item_aim_is_the_overview_rows_centre_over_a_retina_settings_page() {
+        let (mut app, wid, _) = app_with_three();
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        app.windows.get_mut(&wid).expect("the window").scale = 2.0;
+        assert!(app.open_overview().is_ok());
+        let (cw, ch) = app.win_cell_size(wid);
+        let (rows, cols) = {
+            let ws = &app.windows[&wid];
+            (
+                usize::from(ws.rows) + usize::from(app.chrome_rows(wid)),
+                usize::from(ws.cols),
+            )
+        };
+        let (pad, top) = (app.win_pad(wid), app.win_pad_top(wid) + app.win_head(wid));
+        app.windows.get_mut(&wid).expect("the window").win_px =
+            Some(aterm_window::dpi::PhysicalSize::new(
+                (cols * cw + 2 * pad + cw - 1) as u32,
+                (rows * ch + top + pad + ch - 1) as u32,
+            ));
+        assert!(
+            app.frame_origin(wid).0 > 0,
+            "the frame sits inside its window"
+        );
+        assert_eq!(
+            app.overlay_coordinate_transform(wid).map(|t| t.scale),
+            Some(2.0),
+            "over a page the card's points are scaled to the window's pixels"
+        );
+        let card = app.windows[&wid].overview().expect("open");
+        let mut items = 0;
+        while let Ok((x, y)) = app.overlay_card_item_px(wid, items) {
+            let (t, lx, ly) = app
+                .overlay_card_point(wid, x, y)
+                .expect("the card's transform");
+            let (cx, cy) = crate::overview::overview_item_centre(card, &t.geom, items)
+                .expect("an item the card shows");
+            assert!(
+                (lx - cx).abs() < 1e-3 && (ly - cy).abs() < 1e-3,
+                "item {items} aims at ({x}, {y}), which the hover reads as card point ({lx}, \
+                 {ly}), not the row's centre ({cx}, {cy})"
+            );
+            assert_eq!(
+                app.overview_item_at_pointer(wid, x, y),
+                Some(items),
+                "item {items}"
+            );
+            items += 1;
+        }
+        assert!(items >= 3, "the card shows {items} items");
     }
 
     #[test]

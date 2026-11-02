@@ -886,6 +886,16 @@ pub(crate) struct DocumentAdmissionKey {
 struct PendingDocumentAdmission {
     ticket: DocumentAdmissionTicket,
     started: std::time::Instant,
+    purpose: DocumentAdmissionPurpose,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DocumentAdmissionPurpose {
+    Open,
+    /// Follow the selected entry's symlinks in the admission worker.
+    DirectoryEntry,
+    /// Refresh an existing listing without opening a tab or moving focus.
+    DirectoryRefresh(DocumentId),
 }
 
 /// Monotonic identity of one admission request.
@@ -2538,6 +2548,49 @@ impl App {
         effect: EditorEffect,
     ) -> Result<(), String> {
         match effect {
+            EditorEffect::OpenPath { uri } => {
+                let wid = self
+                    .windows
+                    .iter()
+                    .find_map(|(wid, window)| {
+                        window
+                            .tab_set
+                            .tabs()
+                            .iter()
+                            .any(|tab| tab.root.contains(source_view))
+                            .then_some(*wid)
+                    })
+                    .ok_or_else(|| "directory window disappeared".to_string())?;
+                self.begin_document_admission_for(
+                    wid,
+                    DocumentAdmissionKey {
+                        uri,
+                        kind: AppKind::Editor,
+                        edit: None,
+                    },
+                    DocumentAdmissionPurpose::DirectoryEntry,
+                )?;
+            }
+            EditorEffect::RefreshDirectory { document } => {
+                let wid = self
+                    .document_native_views(document)
+                    .into_iter()
+                    .find_map(|(wid, _, view)| (view == source_view).then_some(wid))
+                    .ok_or("directory view disappeared")?;
+                let uri = self
+                    .document_store
+                    .canonical_uri(document)
+                    .ok_or("directory disappeared")?;
+                self.begin_document_admission_for(
+                    wid,
+                    DocumentAdmissionKey {
+                        uri: uri.to_string(),
+                        kind: AppKind::Editor,
+                        edit: None,
+                    },
+                    DocumentAdmissionPurpose::DirectoryRefresh(document),
+                )?;
+            }
             EditorEffect::SaveDocument { document, seq: _ } => {
                 self.save_document_checkpoint(document, source_view)?;
             }
@@ -4880,6 +4933,21 @@ impl App {
             .map_err(DocumentOpenFailure)
     }
 
+    fn admit_document_request(
+        key: &DocumentAdmissionKey,
+        purpose: DocumentAdmissionPurpose,
+        options: crate::native_document_host::AdmitOptions,
+    ) -> Result<AdmittedDocument, DocumentOpenFailure> {
+        if purpose == DocumentAdmissionPurpose::DirectoryEntry {
+            let path = crate::native_document_host::file_uri_path(&key.uri)
+                .map_err(DocumentOpenFailure)?;
+            let (_, uri) =
+                crate::native_document_host::open_path(&path).map_err(DocumentOpenFailure)?;
+            return Self::admit_document_with(&uri, options);
+        }
+        Self::admit_document_with(&key.uri, options)
+    }
+
     fn admission_options(
         &self,
         key: &DocumentAdmissionKey,
@@ -4892,37 +4960,139 @@ impl App {
         }
     }
 
+    fn replace_directory_listing(
+        &mut self,
+        document: DocumentId,
+        listing: amacs::store::DirectoryListing,
+    ) -> Result<(), String> {
+        let before = self
+            .document_store
+            .snapshot(document)
+            .ok_or("directory disappeared")?;
+        let deltas = amacs::diff::minimal_edits(&before.text, &listing.text)
+            .into_iter()
+            .map(|edit| crate::document_store::EditDelta {
+                old: edit.range,
+                inserted_len: edit.insert.len(),
+            })
+            .collect::<Vec<_>>();
+        let points = self
+            .document_native_views(document)
+            .into_iter()
+            .map(|(_, _, view)| {
+                let target = match self.native_runtime.view_state(view) {
+                    Some(AppViewState::Editor(state)) => state.buffer.as_ref().and_then(|buffer| {
+                        self.document_store
+                            .directory(document)?
+                            .target_at(buffer.primary_selection().head)
+                    }),
+                    _ => None,
+                };
+                (view, listing.point_for(target))
+            })
+            .collect::<Vec<_>>();
+        self.document_store
+            .set_directory(document, listing)
+            .map_err(|error| format!("directory refresh failed: {error:?}"))?;
+        let snapshot = self
+            .document_store
+            .snapshot(document)
+            .ok_or("directory disappeared")?;
+        for (view, point) in points {
+            if let Some(AppViewState::Editor(state)) = self.native_runtime.view_state_mut(view)
+                && let Some(buffer) = &mut state.buffer
+            {
+                buffer.observe_external(snapshot.seq, &deltas);
+                buffer.selections = vec![crate::native_editor::Selection::caret(point)];
+                buffer.primary = 0;
+                buffer.viewport_anchor = point;
+            }
+        }
+        self.repaint_document_views(document);
+        Ok(())
+    }
+
+    fn finish_directory_refresh(
+        &mut self,
+        document: DocumentId,
+        admitted: AdmittedDocument,
+    ) -> Result<String, String> {
+        if admitted.directory.is_none() {
+            return Err("The path is no longer a directory".into());
+        }
+        if self.document_store.id_for_uri(admitted.canonical_uri()) != Some(document) {
+            return Err("The directory changed while refreshing".into());
+        }
+        let granted = self
+            .native_documents
+            .grants
+            .grant_admitted(admitted, GrantAccess::ReadOnly)
+            .map_err(|error| error.to_string())?;
+        self.replace_directory_listing(
+            document,
+            granted.directory.expect("checked directory admission"),
+        )?;
+        for (_, _, view) in self.document_native_views(document) {
+            self.set_editor_view_status(view, "Directory refreshed");
+        }
+        self.repaint_document_views(document);
+        Ok("Directory refreshed".into())
+    }
+
     fn begin_document_admission(
         &mut self,
         wid: WindowId,
         key: DocumentAdmissionKey,
+    ) -> Result<DocumentAdmission, String> {
+        self.begin_document_admission_for(wid, key, DocumentAdmissionPurpose::Open)
+    }
+
+    fn begin_document_admission_for(
+        &mut self,
+        wid: WindowId,
+        key: DocumentAdmissionKey,
+        purpose: DocumentAdmissionPurpose,
     ) -> Result<DocumentAdmission, String> {
         // Coalescing is per window: a hit is this live window's own read in
         // flight. Another window's read of the file is a separate entry and
         // installs there (or is dropped if that window closed).
         if let Some(pending) = self.native_documents.admissions.get(&(wid, key.clone()))
             && pending.started.elapsed() < DOCUMENT_ADMISSION_STALE_AFTER
+            && pending.purpose == purpose
         {
             return Ok(DocumentAdmission::Coalesced(pending.ticket));
         }
+        self.native_documents.admissions.remove(&(wid, key.clone()));
         let options = self.admission_options(&key);
         let Some(proxy) = self.proxy.clone() else {
-            let admitted = Self::admit_document_with(&key.uri, options);
+            let admitted = Self::admit_document_request(&key, purpose, options);
+            if let DocumentAdmissionPurpose::DirectoryRefresh(document) = purpose {
+                return self
+                    .finish_directory_refresh(document, admitted?)
+                    .map(DocumentAdmission::Opened);
+            }
             if key.edit.is_some() {
                 let reply = self.finish_edit_admission(wid, key, admitted.map(Box::new));
                 return Ok(DocumentAdmission::Opened(reply.unwrap_or_else(|why| why)));
             }
+            let admitted = admitted?;
+            let uri = if purpose == DocumentAdmissionPurpose::DirectoryEntry {
+                admitted.canonical_uri().to_string()
+            } else {
+                key.uri.clone()
+            };
             return self
-                .install_admitted_document(
-                    wid,
-                    key.kind,
-                    &key.uri,
-                    admitted?,
-                    Placement::FocusOrNewTab,
-                )
+                .install_admitted_document(wid, key.kind, &uri, admitted, Placement::FocusOrNewTab)
                 .map(|installed| DocumentAdmission::Opened(installed.line()));
         };
         let ticket = self.mint_document_admission(wid, key.clone());
+        if let Some(pending) = self
+            .native_documents
+            .admissions
+            .get_mut(&(wid, key.clone()))
+        {
+            pending.purpose = purpose;
+        }
         let worker_key = key.clone();
         let spawned = std::thread::Builder::new()
             .name("aterm-document-admit".to_string())
@@ -4939,7 +5109,8 @@ impl App {
                          file will be reported as not downloaded"
                     );
                 }
-                let result = Self::admit_document_with(&worker_key.uri, options).map(Box::new);
+                let result =
+                    Self::admit_document_request(&worker_key, purpose, options).map(Box::new);
                 let _ = proxy.send_event(crate::Wake::DocumentAdmitted(Box::new(
                     DocumentAdmissionOutcome {
                         ticket,
@@ -4972,6 +5143,7 @@ impl App {
             PendingDocumentAdmission {
                 ticket,
                 started: std::time::Instant::now(),
+                purpose: DocumentAdmissionPurpose::Open,
             },
         );
         ticket
@@ -4998,7 +5170,12 @@ impl App {
                 )));
             }
         }
-        self.native_documents.admissions.remove(&slot);
+        let purpose = self
+            .native_documents
+            .admissions
+            .remove(&slot)
+            .map(|pending| pending.purpose)
+            .unwrap_or(DocumentAdmissionPurpose::Open);
         let reveal = self.native_documents.reveals.remove(&slot);
         let (wid, key) = slot;
         if key.edit.is_some() {
@@ -5012,10 +5189,36 @@ impl App {
                 key.uri
             )));
         }
+        if let DocumentAdmissionPurpose::DirectoryRefresh(document) = purpose
+            && (self.document_store.directory(document).is_none()
+                || self.document_store.view_count(document) == Some(0))
+        {
+            return Err(DocumentAdmissionRejected::Dropped(
+                "directory view closed before refresh completed".into(),
+            ));
+        }
+        if let DocumentAdmissionPurpose::DirectoryRefresh(document) = purpose {
+            let refreshed = result
+                .map_err(|failure| failure.to_string())
+                .and_then(|admitted| self.finish_directory_refresh(document, *admitted));
+            return Ok(refreshed.unwrap_or_else(|why| {
+                let status = format!("Directory refresh failed: {why}");
+                for (_, _, view) in self.document_native_views(document) {
+                    self.set_editor_view_status(view, &status);
+                }
+                self.repaint_document_views(document);
+                status
+            }));
+        }
         let admitted =
             *result.map_err(|failure| DocumentAdmissionRejected::Failed(failure.to_string()))?;
+        let uri = if purpose == DocumentAdmissionPurpose::DirectoryEntry {
+            admitted.canonical_uri().to_string()
+        } else {
+            key.uri.clone()
+        };
         let installed = self
-            .install_admitted_document(wid, key.kind, &key.uri, admitted, Placement::FocusOrNewTab)
+            .install_admitted_document(wid, key.kind, &uri, admitted, Placement::FocusOrNewTab)
             .map_err(DocumentAdmissionRejected::Failed)?;
         if let Some(reveal) = reveal {
             self.reveal_document_line(wid, reveal)
@@ -5070,6 +5273,12 @@ impl App {
         admitted: AdmittedDocument,
         placement: Placement,
     ) -> Result<InstalledDocument, String> {
+        let existing = self.document_store.id_for_uri(admitted.canonical_uri());
+        if let Some(document) = existing
+            && self.document_store.directory(document).is_some() != admitted.directory.is_some()
+        {
+            return Err("The path changed between a file and a directory; close its existing buffer before reopening it".into());
+        }
         let access = if kind == AppKind::Editor {
             GrantAccess::ReadWrite
         } else {
@@ -5080,7 +5289,6 @@ impl App {
             .grants
             .grant_admitted(admitted, access)
             .map_err(|error| format!("document open failed: {error}"))?;
-        let existing = self.document_store.id_for_uri(&granted.grant.canonical_uri);
         let mut recovery_notice = None;
         let document = if let Some(document) = existing {
             document
@@ -5143,12 +5351,17 @@ impl App {
             recovery_notice = initialized.notice;
             document
         };
+        if let Some(listing) = granted.directory.clone() {
+            self.replace_directory_listing(document, listing)?;
+        }
         self.native_documents
             .persistence
             .register(document, granted.grant.id, granted.observed, &granted.text)
             .map_err(|error| format!("document persistence failed: {error:?}"))?;
-        self.watch_document_file(document);
-        if existing.is_some() {
+        if granted.directory.is_none() {
+            self.watch_document_file(document);
+        }
+        if existing.is_some() && granted.directory.is_none() {
             let _ = self.refresh_native_document(document)?;
         }
 
@@ -5188,8 +5401,7 @@ impl App {
             .file_name()
             .and_then(|name| name.to_str())
             .filter(|name| !name.is_empty())
-            .unwrap_or("Untitled")
-            .to_string();
+            .map_or_else(|| granted.grant.path.display().to_string(), str::to_string);
         let snapshot = self
             .document_store
             .snapshot(document)
@@ -5205,32 +5417,39 @@ impl App {
         let state = match kind {
             AppKind::Markdown => AppViewState::Markdown(MarkdownViewState::default()),
             AppKind::Editor => AppViewState::Editor(Box::default()),
-            AppKind::About | AppKind::Settings | AppKind::SystemState | AppKind::Recovery => {
+            AppKind::Mail
+            | AppKind::About
+            | AppKind::Settings
+            | AppKind::SystemState
+            | AppKind::Recovery => {
                 return Err("requested app is not a document app".to_string());
             }
         };
-        let install = if let Some(instance) =
-            self.native_runtime.instance_for_document(kind, document)
-        {
-            self.install_native_tab_keeping(wid, instance, state, presentation, keep)
-                .map(|(tab, view)| (instance, tab, view))
-        } else {
-            let app = match kind {
-                AppKind::Markdown => NativeApp::Markdown(MarkdownApp::new_with_uri(
-                    document,
-                    title,
-                    uri.to_string(),
-                    snapshot.text.as_ref(),
-                )),
-                AppKind::Editor => {
-                    NativeApp::Editor(EditorApp::new_with_uri(document, title, uri.to_string()))
-                }
-                AppKind::About | AppKind::Settings | AppKind::SystemState | AppKind::Recovery => {
-                    return Err("requested app is not a document app".to_string());
-                }
+        let install =
+            if let Some(instance) = self.native_runtime.instance_for_document(kind, document) {
+                self.install_native_tab_keeping(wid, instance, state, presentation, keep)
+                    .map(|(tab, view)| (instance, tab, view))
+            } else {
+                let app = match kind {
+                    AppKind::Markdown => NativeApp::Markdown(MarkdownApp::new_with_uri(
+                        document,
+                        title,
+                        uri.to_string(),
+                        snapshot.text.as_ref(),
+                    )),
+                    AppKind::Editor => {
+                        NativeApp::Editor(EditorApp::new_with_uri(document, title, uri.to_string()))
+                    }
+                    AppKind::Mail
+                    | AppKind::About
+                    | AppKind::Settings
+                    | AppKind::SystemState
+                    | AppKind::Recovery => {
+                        return Err("requested app is not a document app".to_string());
+                    }
+                };
+                self.install_new_native_tab_keeping(wid, app, state, presentation, keep)
             };
-            self.install_new_native_tab_keeping(wid, app, state, presentation, keep)
-        };
         let (instance, tab, view) = install.map_err(|error| {
             aterm_log::warn!("could not install native document tab: {error:?}");
             "This document could not be reopened".to_string()
@@ -5239,6 +5458,14 @@ impl App {
         if let Err(error) = self.attach_document_view(kind, document, view) {
             self.rollback_document_tab(wid, tab);
             return Err(error);
+        }
+        if let Some(listing) = self.document_store.directory(document)
+            && let Some(AppViewState::Editor(state)) = self.native_runtime.view_state_mut(view)
+            && let Some(buffer) = &mut state.buffer
+        {
+            buffer.selections = vec![crate::native_editor::Selection::caret(
+                listing.entries.first().map_or(0, |(range, _)| range.start),
+            )];
         }
         if let Some(notice) = recovery_notice {
             let message = match notice {
@@ -5327,6 +5554,7 @@ impl App {
                 let delimiter = self
                     .document_store
                     .canonical_uri(document)
+                    .filter(|_| self.document_store.directory(document).is_none())
                     .zip(self.document_store.snapshot(document))
                     .and_then(|(uri, snapshot)| {
                         amacs::language::Language::detect(
@@ -5350,9 +5578,11 @@ impl App {
                 }
                 Ok(())
             }
-            AppKind::About | AppKind::Settings | AppKind::SystemState | AppKind::Recovery => {
-                Err("requested app is not a document app".to_string())
-            }
+            AppKind::Mail
+            | AppKind::About
+            | AppKind::Settings
+            | AppKind::SystemState
+            | AppKind::Recovery => Err("requested app is not a document app".to_string()),
         }
     }
 
@@ -5749,7 +5979,7 @@ mod tests {
     ) {
         let dir = fresh_dir(name);
         let path = dir.join("aterm.toml");
-        fs::write(&path, source).unwrap();
+        crate::test_scratch::write_config(&path, source);
         let mut app = App::headless_for_test();
         app.ensure_and_open_config_editor_path_in_window(WindowId(0), &path)
             .unwrap();
@@ -6246,6 +6476,308 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn directory_entry_admission_follows_links_without_loosening_normal_opens() {
+        let dir = aterm_tempfile::TempDir::new().unwrap();
+        let path = fs::canonicalize(dir.path()).unwrap();
+        fs::write(path.join("target.txt"), "target contents").unwrap();
+        fs::create_dir(path.join("target-dir")).unwrap();
+        let uri = crate::native_document_host::path_to_file_uri(&path).unwrap();
+        let wid = WindowId(0);
+        let mut app = App::headless_for_test();
+        app.open_document_tab_in_window(wid, AppKind::Editor, &uri)
+            .unwrap();
+        let (_, source) = app.active_native_view(wid).unwrap();
+        let source_document = editor_buffer(&app, source).document;
+        for (link, target) in [("file-link", "target.txt"), ("dir-link", "target-dir")] {
+            std::os::unix::fs::symlink(path.join(target), path.join(link)).unwrap();
+            let link_uri = crate::native_document_host::path_to_file_uri(&path.join(link)).unwrap();
+            let target_uri =
+                crate::native_document_host::path_to_file_uri(&path.join(target)).unwrap();
+            let key = admission_key(&link_uri, AppKind::Editor);
+            let options = app.admission_options(&key);
+            assert!(
+                App::admit_document_request(&key, DocumentAdmissionPurpose::Open, options).is_err()
+            );
+            let admitted = App::admit_document_request(
+                &key,
+                DocumentAdmissionPurpose::DirectoryEntry,
+                options,
+            )
+            .unwrap();
+            assert_eq!(admitted.canonical_uri(), target_uri);
+            app.open_document_tab_in_window(wid, AppKind::Editor, &uri)
+                .unwrap();
+            let point = app
+                .document_store
+                .directory(source_document)
+                .unwrap()
+                .point_for(Some(&link_uri));
+            let Some(AppViewState::Editor(state)) = app.native_runtime.view_state_mut(source)
+            else {
+                panic!("directory view")
+            };
+            state.buffer.as_mut().unwrap().selections =
+                vec![crate::native_editor::Selection::caret(point)];
+            let enter = || {
+                AppEvent::EditorInput(amacs::input::EditorInput::Key {
+                    key: aterm_types::keyboard::Key::Named(aterm_types::keyboard::NamedKey::Enter),
+                    mods: aterm_types::keyboard::Modifiers::empty(),
+                    text: None,
+                })
+            };
+            app.with_controller_mark(true, |app| {
+                app.dispatch_native_view_event(wid, source, enter())
+            })
+            .unwrap();
+            assert!(app.document_store.id_for_uri(&target_uri).is_none());
+            app.dispatch_native_view_event(wid, source, enter())
+                .unwrap();
+            let document = app.document_store.id_for_uri(&target_uri).unwrap();
+            let focus = app.active_native_view(wid).unwrap();
+            assert_eq!(editor_buffer(&app, focus.1).document, document);
+            let ticket = app.mint_document_admission(wid, key.clone());
+            app.native_documents
+                .admissions
+                .get_mut(&(wid, key.clone()))
+                .unwrap()
+                .purpose = DocumentAdmissionPurpose::DirectoryEntry;
+            app.complete_document_admission(DocumentAdmissionOutcome {
+                ticket,
+                wid,
+                key,
+                result: Ok(Box::new(admitted)),
+            })
+            .unwrap();
+            assert_eq!(app.active_native_view(wid).unwrap(), focus);
+        }
+        std::os::unix::fs::symlink(path.join("missing"), path.join("dangling")).unwrap();
+        let dangling =
+            crate::native_document_host::path_to_file_uri(&path.join("dangling")).unwrap();
+        let focus = app.active_native_view(wid).unwrap();
+        assert!(
+            app.execute_editor_effect(source, EditorEffect::OpenPath { uri: dangling })
+                .is_err()
+        );
+        assert_eq!(app.active_native_view(wid).unwrap(), focus);
+    }
+
+    #[test]
+    fn directory_refresh_preserves_selection_and_does_not_steal_focus_or_reopen_a_closed_view() {
+        let dir = aterm_tempfile::TempDir::new().unwrap();
+        let path = fs::canonicalize(dir.path()).unwrap();
+        fs::write(path.join("b.txt"), "b").unwrap();
+        let uri = crate::native_document_host::path_to_file_uri(&path).unwrap();
+        let target = crate::native_document_host::path_to_file_uri(&path.join("b.txt")).unwrap();
+        let wid = WindowId(0);
+        let mut app = App::headless_for_test();
+        app.open_document_tab_in_window(wid, AppKind::Editor, &uri)
+            .unwrap();
+        let document = app.document_store.id_for_uri(&uri).unwrap();
+        let (_, view) = app.active_native_view(wid).unwrap();
+        let point = app
+            .document_store
+            .directory(document)
+            .unwrap()
+            .point_for(Some(&target));
+        let Some(AppViewState::Editor(state)) = app.native_runtime.view_state_mut(view) else {
+            panic!("editor")
+        };
+        state.buffer.as_mut().unwrap().selections =
+            vec![crate::native_editor::Selection::caret(point)];
+
+        fs::write(path.join("a.txt"), "a").unwrap();
+        app.open_document_tab_in_window(wid, AppKind::Editor, &uri)
+            .unwrap();
+        assert_eq!(app.active_native_view(wid).unwrap().1, view);
+        assert!(
+            app.document_store
+                .snapshot(document)
+                .unwrap()
+                .text
+                .contains("a.txt")
+        );
+        assert_eq!(
+            app.document_store
+                .directory(document)
+                .unwrap()
+                .target_at(editor_buffer(&app, view).primary_selection().head),
+            Some(target.as_str())
+        );
+
+        fs::write(path.join("c.txt"), "c").unwrap();
+        let key = admission_key(&uri, AppKind::Editor);
+        let ticket = app.mint_document_admission(wid, key.clone());
+        app.native_documents
+            .admissions
+            .get_mut(&(wid, key.clone()))
+            .unwrap()
+            .purpose = DocumentAdmissionPurpose::DirectoryRefresh(document);
+        let outcome = worker_outcome(ticket, wid, &key);
+        let other = crate::native_document_host::path_to_file_uri(&path.join("b.txt")).unwrap();
+        app.open_document_tab_in_window(wid, AppKind::Editor, &other)
+            .unwrap();
+        let focus = app.active_native_view(wid).unwrap();
+        app.complete_document_admission(outcome).unwrap();
+        assert_eq!(app.active_native_view(wid).unwrap(), focus);
+        assert!(
+            app.document_store
+                .snapshot(document)
+                .unwrap()
+                .text
+                .contains("c.txt")
+        );
+        assert_eq!(
+            app.document_store
+                .directory(document)
+                .unwrap()
+                .target_at(editor_buffer(&app, view).primary_selection().head),
+            Some(target.as_str())
+        );
+        assert_eq!(app.document_store.dirty(document), Some(false));
+
+        let ticket = app.mint_document_admission(wid, key.clone());
+        app.native_documents
+            .admissions
+            .get_mut(&(wid, key.clone()))
+            .unwrap()
+            .purpose = DocumentAdmissionPurpose::DirectoryRefresh(document);
+        let before = app.document_store.snapshot(document).unwrap();
+        let failed = DocumentAdmissionOutcome {
+            ticket,
+            wid,
+            key: key.clone(),
+            result: Err(DocumentOpenFailure(DocumentHostError::NotAFile)),
+        };
+        assert!(app.complete_document_admission(failed).is_ok());
+        assert_eq!(app.active_native_view(wid).unwrap(), focus);
+        assert_eq!(
+            app.document_store.snapshot(document).unwrap().seq,
+            before.seq
+        );
+        let Some(AppViewState::Editor(state)) = app.native_runtime.view_state(view) else {
+            panic!("editor")
+        };
+        assert!(state.status.is_some());
+
+        let origin = app.document_store.snapshot(document).unwrap().text.len();
+        let Some(AppViewState::Editor(state)) = app.native_runtime.view_state_mut(view) else {
+            panic!("editor")
+        };
+        state.buffer.as_mut().unwrap().minibuffer = crate::native_editor::Minibuffer::Search {
+            query: "b.txt".into(),
+            origin,
+        };
+        fs::remove_file(path.join("a.txt")).unwrap();
+        fs::remove_file(path.join("c.txt")).unwrap();
+        app.execute_editor_effect(view, EditorEffect::RefreshDirectory { document })
+            .unwrap();
+        let crate::native_editor::Minibuffer::Search { origin, .. } =
+            &editor_buffer(&app, view).minibuffer
+        else {
+            panic!("search remains open")
+        };
+        let refreshed = app.document_store.snapshot(document).unwrap();
+        assert!(*origin <= refreshed.text.len());
+        assert!(refreshed.text.is_char_boundary(*origin));
+        let Some(AppViewState::Editor(state)) = app.native_runtime.view_state_mut(view) else {
+            panic!("editor")
+        };
+        state.buffer.as_mut().unwrap().clear_minibuffer();
+
+        let ticket = app.mint_document_admission(wid, key.clone());
+        app.native_documents
+            .admissions
+            .get_mut(&(wid, key.clone()))
+            .unwrap()
+            .purpose = DocumentAdmissionPurpose::DirectoryRefresh(document);
+        let superseded = worker_outcome(ticket, wid, &key);
+        app.request_document_tab_in_window(wid, AppKind::Editor, &uri)
+            .unwrap();
+        assert!(matches!(
+            app.complete_document_admission(superseded),
+            Err(DocumentAdmissionRejected::Dropped(_))
+        ));
+        let ticket = app.mint_document_admission(wid, key.clone());
+        app.native_documents
+            .admissions
+            .get_mut(&(wid, key.clone()))
+            .unwrap()
+            .purpose = DocumentAdmissionPurpose::DirectoryRefresh(document);
+        let outcome = DocumentAdmissionOutcome {
+            ticket,
+            wid,
+            key: key.clone(),
+            result: Err(DocumentOpenFailure(DocumentHostError::NotAFile)),
+        };
+        app.close_active_native_tab(wid).unwrap();
+        let focus = app.active_native_view(wid);
+        assert!(matches!(
+            app.complete_document_admission(outcome),
+            Err(DocumentAdmissionRejected::Dropped(_))
+        ));
+        assert_eq!(app.active_native_view(wid), focus);
+    }
+
+    #[test]
+    fn reopening_a_file_replaced_by_a_directory_preserves_its_unsaved_buffer() {
+        let dir = aterm_tempfile::TempDir::new().unwrap();
+        let path = fs::canonicalize(dir.path()).unwrap().join("changing");
+        fs::write(&path, "original").unwrap();
+        let uri = crate::native_document_host::path_to_file_uri(&path).unwrap();
+        let mut app = App::headless_for_test();
+        app.open_document_tab_in_window(WindowId(0), AppKind::Editor, &uri)
+            .unwrap();
+        let document = app.document_store.id_for_uri(&uri).unwrap();
+        let snapshot = app.document_store.snapshot(document).unwrap();
+        assert!(matches!(
+            app.document_store
+                .replace_text(document, snapshot.seq, "unsaved"),
+            crate::document_store::DocumentTxnOutcome::Committed { .. }
+        ));
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(
+            app.open_document_tab_in_window(WindowId(0), AppKind::Editor, &uri)
+                .is_err()
+        );
+        assert_eq!(
+            app.document_store.snapshot(document).unwrap().text.as_ref(),
+            "unsaved"
+        );
+        assert_eq!(app.document_store.dirty(document), Some(true));
+        fs::remove_dir(&path).unwrap();
+        fs::write(&path, "original").unwrap();
+        let grant_id = app.native_documents.persistence.grant(document).unwrap();
+        let restored = app
+            .native_documents
+            .grants
+            .refresh_local(
+                grant_id,
+                crate::native_document_host::DEFAULT_DOCUMENT_LIMIT,
+            )
+            .unwrap();
+        app.native_documents
+            .persistence
+            .accept_overwrite(document, restored.observed)
+            .unwrap();
+        let pending = app
+            .native_documents
+            .persistence
+            .begin(&app.document_store.snapshot(document).unwrap())
+            .unwrap();
+        let saved = crate::native_document_host::execute_granted_save(
+            app.native_documents.grants.get(grant_id).unwrap(),
+            &pending.plan,
+        );
+        assert!(matches!(
+            saved,
+            crate::native_document_io::AtomicSaveResult::Committed(_)
+        ));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "unsaved");
+    }
+
+    #[test]
     fn document_admission_outcome_round_trips_into_an_installed_tab() {
         let (dir, uri) = admission_fixture("round-trip", b"# dropped\n");
         let mut app = App::headless_for_test();
@@ -6436,7 +6968,7 @@ mod tests {
         let source = (0..300)
             .map(|line| format!("# config line {line}\n"))
             .collect::<String>();
-        fs::write(&path, &source).unwrap();
+        crate::test_scratch::write_config(&path, &source);
 
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -6590,7 +7122,7 @@ mod tests {
     fn manual_open_reports_busy_held_journal_lock_and_retries_cleanly() {
         let dir = fresh_dir("aterm-manual-journal-held");
         let config = dir.join("aterm.toml");
-        fs::write(&config, "window_theme = \"dark\"\n").unwrap();
+        crate::test_scratch::write_config(&config, "window_theme = \"dark\"\n");
         let journal_root = dir.join("private-drafts");
         let mut app = App::headless_for_test();
         app.native_documents.journals = JournalSlot::for_test(journal_root.clone());
@@ -6773,7 +7305,7 @@ mod tests {
         let target = dotfiles_dir.join("aterm.toml");
         let logical = config_dir.join("aterm.toml");
         let link_destination = std::path::PathBuf::from("../dotfiles/aterm.toml");
-        fs::write(&target, "theme = \"Default\"\n").unwrap();
+        crate::test_scratch::write_config(&target, "theme = \"Default\"\n");
         symlink(&link_destination, &logical).unwrap();
 
         let mut app = App::headless_for_test();
@@ -6840,7 +7372,7 @@ mod tests {
                 (&second, "theme = \"Dracula\"\n"),
             ] {
                 fs::create_dir_all(path.parent().unwrap()).unwrap();
-                fs::write(path, text).unwrap();
+                crate::test_scratch::write_config(path, text);
             }
             let alias = dir.join(link);
             let logical = dir.join(logical);
@@ -6917,6 +7449,68 @@ mod tests {
         assert_eq!(app.windows[&wid].tab_set.len(), tabs);
         assert_eq!(app.pool.sessions.len(), sessions);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Every `aterm.toml` aterm makes passes the rule every reader of it holds
+    /// (`aterm_types::dirs::aterm_config_refusal`) under a user-private-group login's umask
+    /// `002`, Ubuntu's default, where a file made with `0o666` is `664` and every later read of
+    /// it is refused (the Linux lane found the config editor's first open refused so, unit L1):
+    /// the config editor's first open (`ensure_config_file`), a Settings write that makes a
+    /// missing file (`commit_atomic_bytes`) and `--write-config`'s starter. The umask is
+    /// process-wide, so the body runs alone in a child of this test binary.
+    /// NEGATIVE CONTROLS (scratch): amacs-files' config commit creating its temporary `0o666`
+    /// fails the first two; the starter made by a plain `std::fs::write` fails the third.
+    #[cfg(unix)]
+    #[test]
+    fn every_aterm_toml_aterm_makes_under_an_open_umask_passes_the_config_rule() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if !crate::test_alone::alone() {
+            return;
+        }
+        // SAFETY: `umask(2)` sets this isolated test child's file-creation mask and cannot fail.
+        unsafe { libc::umask(0o002) };
+        let scratch = aterm_tempfile::tempdir().expect("scratch dir");
+        let editor = scratch.path().join("editor/aterm/aterm.toml");
+        ensure_config_file(&editor).expect("the config editor's first open makes it");
+        let settings = scratch.path().join("settings/aterm/aterm.toml");
+        let missing = crate::native_document_host::read_config_atomic_file(
+            &settings,
+            crate::native_document_host::DEFAULT_DOCUMENT_LIMIT,
+            true,
+        )
+        .expect("a missing config reads as missing");
+        assert!(
+            matches!(
+                crate::native_document_host::commit_atomic_bytes(
+                    &missing.baseline,
+                    b"font_px = 14\n"
+                ),
+                crate::native_document_host::AtomicCommitResult::Committed(_)
+            ),
+            "the Settings write makes it"
+        );
+        let starter = scratch.path().join("starter/aterm.toml");
+        fs::create_dir_all(starter.parent().expect("a folder")).expect("its folder");
+        crate::cli::write_starter_config(&starter).expect("the starter");
+        let mut wrong = Vec::new();
+        for path in [&editor, &settings, &starter] {
+            let meta = fs::metadata(path).expect("made");
+            if let Some(why) = aterm_types::dirs::aterm_config_file_refusal(&meta) {
+                wrong.push(format!(
+                    "{} {:o}: {why}",
+                    path.display(),
+                    meta.permissions().mode() & 0o7777
+                ));
+            }
+            if let Err(error) = crate::native_document_host::read_config_atomic_file(
+                path,
+                crate::native_document_host::DEFAULT_DOCUMENT_LIMIT,
+                false,
+            ) {
+                wrong.push(format!("{} read: {error:?}", path.display()));
+            }
+        }
+        assert!(wrong.is_empty(), "made under umask 002: {wrong:#?}");
     }
 
     #[test]
@@ -7083,7 +7677,7 @@ mod tests {
     fn malformed_startup_manual_save_binds_and_recovers_the_config_service() {
         let dir = fresh_dir("aterm-config-editor-malformed-startup");
         let path = dir.join("aterm.toml");
-        fs::write(&path, "theme = [\n").unwrap();
+        crate::test_scratch::write_config(&path, "theme = [\n");
         let mut app = App::headless_for_test();
         assert!(app.native_config_service.bound_logical_path().is_none());
         let wid = WindowId(0);
@@ -7115,7 +7709,7 @@ mod tests {
     fn exact_external_observation_refreshes_clean_manual_and_service_bytes() {
         let dir = fresh_dir("aterm-config-editor-exact-observation");
         let path = dir.join("aterm.toml");
-        fs::write(&path, "font_px = 12.0\n").unwrap();
+        crate::test_scratch::write_config(&path, "font_px = 12.0\n");
         let mut app = App::headless_for_test();
         app.native_config_service =
             crate::native_config_service::VersionedConfigService::load_path(&path).unwrap();
@@ -7125,7 +7719,7 @@ mod tests {
         let document = app.native_runtime.config_editor_document().unwrap();
 
         let external = "# external comment only\nfont_px = 12.0\n";
-        fs::write(&path, external).unwrap();
+        crate::test_scratch::write_config(&path, external);
         let observation =
             crate::native_config_service::VersionedConfigService::observe_path(&path, false)
                 .unwrap();
@@ -7153,7 +7747,7 @@ mod tests {
         let path = dir.join("aterm.toml");
         let replacement = dir.join("replacement.toml");
         let baseline_text = "font_px = 12.0\n";
-        fs::write(&path, baseline_text).unwrap();
+        crate::test_scratch::write_config(&path, baseline_text);
         let mut app = App::headless_for_test();
         app.native_config_service =
             crate::native_config_service::VersionedConfigService::load_path(&path).unwrap();
@@ -7168,7 +7762,7 @@ mod tests {
         let draft = app.document_store.snapshot(document).unwrap();
         assert!(app.document_store.dirty(document).unwrap());
 
-        fs::write(&replacement, baseline_text).unwrap();
+        crate::test_scratch::write_config(&replacement, baseline_text);
         fs::rename(&replacement, &path).unwrap();
         let watch_observation =
             crate::native_config_service::VersionedConfigService::observe_path(&path, false)
@@ -7195,7 +7789,7 @@ mod tests {
         );
         assert!(!app.native_documents.disk_conflicts.contains_key(&document));
 
-        fs::write(&replacement, baseline_text).unwrap();
+        crate::test_scratch::write_config(&replacement, baseline_text);
         fs::rename(&replacement, &path).unwrap();
         let save_observation =
             crate::native_config_service::VersionedConfigService::observe_path(&path, false)
@@ -7254,7 +7848,7 @@ mod tests {
         let logical = dir.join("aterm.toml");
         let old_link = dir.join("aterm.old-link");
         let baseline_text = "font_px = 12.0\n";
-        fs::write(&target, baseline_text).unwrap();
+        crate::test_scratch::write_config(&target, baseline_text);
         symlink("target.toml", &logical).unwrap();
         let mut app = App::headless_for_test();
         app.native_config_service =
@@ -7294,7 +7888,7 @@ mod tests {
         let dir = fresh_dir("aterm-config-editor-malformed-observation");
         let path = dir.join("aterm.toml");
         let initial = "font_px = 12.0\n";
-        fs::write(&path, initial).unwrap();
+        crate::test_scratch::write_config(&path, initial);
         let mut app = App::headless_for_test();
         app.native_config_service =
             crate::native_config_service::VersionedConfigService::load_path(&path).unwrap();
@@ -7306,7 +7900,7 @@ mod tests {
         let document = app.native_runtime.config_editor_document().unwrap();
 
         let malformed = "font_px = [\n";
-        fs::write(&path, malformed).unwrap();
+        crate::test_scratch::write_config(&path, malformed);
         let observation =
             crate::native_config_service::VersionedConfigService::observe_path(&path, false)
                 .unwrap();
@@ -7367,7 +7961,7 @@ mod tests {
         commit(&mut app, wid, "# local draft\n");
         let local = app.document_store.snapshot(document).unwrap().text.clone();
         let dirty_external = "# changed externally again\nfont_px = 16.0\n";
-        fs::write(&path, dirty_external).unwrap();
+        crate::test_scratch::write_config(&path, dirty_external);
         let dirty_observation =
             crate::native_config_service::VersionedConfigService::observe_path(&path, false)
                 .unwrap();
@@ -7940,7 +8534,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("aterm.toml");
         let source = "agents_auto_prime = false\n";
-        fs::write(&path, source).unwrap();
+        crate::test_scratch::write_config(&path, source);
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         for (key, line) in [
@@ -8243,11 +8837,10 @@ mod tests {
     fn a_viewport_change_keeps_the_diagnostic_cycle_in_place() {
         let dir = fresh_dir("aterm-config-editor-cycle-viewport");
         let path = dir.join("aterm.toml");
-        fs::write(
+        crate::test_scratch::write_config(
             &path,
             "future_first_setting = 1\nfuture_second_setting = 2\n",
-        )
-        .unwrap();
+        );
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         app.ensure_and_open_config_editor_path_in_window(wid, &path)
@@ -8293,7 +8886,7 @@ mod tests {
             "# spacer\n".repeat(500),
             long_key
         );
-        fs::write(&path, &source).unwrap();
+        crate::test_scratch::write_config(&path, &source);
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         app.ensure_and_open_config_editor_path_in_window(wid, &path)
@@ -10164,7 +10757,7 @@ mod tests {
         let (dir, path, mut app, views) = open_config("aterm-undo-to-base-under-conflict", base);
         let document = app.native_runtime.document_id(views.0).unwrap();
         commit(&mut app, wid, "gpu");
-        fs::write(&path, external).unwrap();
+        crate::test_scratch::write_config(&path, external);
         let observation =
             crate::native_config_service::VersionedConfigService::observe_path(&path, false)
                 .unwrap();
@@ -10187,14 +10780,14 @@ mod tests {
 
         let dir = fresh_dir("aterm-undo-to-base-under-conflict-editor");
         let path = dir.join("notes.md");
-        fs::write(&path, "disk one\n").unwrap();
+        crate::test_scratch::write_config(&path, "disk one\n");
         let mut app = App::headless_for_test();
         app.open_document_tab(AppKind::Editor, &file_uri(&path))
             .unwrap();
         let views = app.active_native_view(wid).unwrap();
         let document = app.native_runtime.document_id(views.0).unwrap();
         commit(&mut app, wid, "local ");
-        fs::write(&path, "disk two\n").unwrap();
+        crate::test_scratch::write_config(&path, "disk two\n");
         assert!(matches!(
             app.refresh_native_document(document).unwrap(),
             crate::native_document_io::FileWatchReduction::ConflictDirty { .. }
@@ -10248,7 +10841,7 @@ mod tests {
             );
         };
         let reload = |app: &mut App, path: &std::path::Path| {
-            fs::write(path, &external).unwrap();
+            crate::test_scratch::write_config(path, &external);
             let observation =
                 crate::native_config_service::VersionedConfigService::observe_path(path, false)
                     .unwrap();
@@ -10671,7 +11264,7 @@ mod tests {
             let (dir, path, mut app, views) = open_config(name, base);
             commit(&mut app, wid, "gpu");
             commit(&mut app, wid, " = true");
-            fs::write(&path, external).unwrap();
+            crate::test_scratch::write_config(&path, external);
             let observation =
                 crate::native_config_service::VersionedConfigService::observe_path(&path, false)
                     .unwrap();
@@ -10709,7 +11302,7 @@ mod tests {
         );
         assert!(app.native_documents.disk_conflicts.contains_key(&document));
         app.native_documents.inflight.remove(&document);
-        fs::write(&path, base).unwrap();
+        crate::test_scratch::write_config(&path, base);
         assert!(matches!(
             app.refresh_native_document(document).unwrap(),
             crate::native_document_io::FileWatchReduction::Unchanged

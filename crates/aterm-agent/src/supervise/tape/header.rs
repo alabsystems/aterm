@@ -306,9 +306,11 @@ pub(crate) fn unescape(text: &str) -> Result<Vec<u8>, String> {
             Some(b'x') => {
                 let hex = [bytes.next(), bytes.next()];
                 let byte = match hex {
-                    [Some(h), Some(l)] => std::str::from_utf8(&[h, l])
-                        .ok()
-                        .and_then(|h| u8::from_str_radix(h, 16).ok()),
+                    [Some(h), Some(l)] if h.is_ascii_hexdigit() && l.is_ascii_hexdigit() => {
+                        std::str::from_utf8(&[h, l])
+                            .ok()
+                            .and_then(|h| u8::from_str_radix(h, 16).ok())
+                    }
                     _ => None,
                 };
                 out.push(byte.ok_or_else(|| format!("a broken \\x escape in {text:?}"))?);
@@ -516,6 +518,20 @@ impl Reader {
             self.supplied.push(format!("[{}] {key}", self.section));
             Ok(shipped)
         }
+    }
+
+    /// A protocol-optional value. Absence is part of the recorded format, not a
+    /// setting supplied from this build's defaults.
+    pub(crate) fn optional_parsed<T: std::str::FromStr>(
+        &mut self,
+        key: &str,
+    ) -> Result<Option<T>, String> {
+        self.find(key).map(|_| self.parsed::<T>(key)).transpose()
+    }
+
+    /// A protocol-optional duration ([`Self::optional_parsed`]'s kind of absence).
+    pub(crate) fn optional_duration(&mut self, key: &str) -> Result<Option<Duration>, String> {
+        self.find(key).map(|_| self.duration(key)).transpose()
     }
 
     /// A retired duration, if present.
@@ -858,7 +874,7 @@ impl Header {
         let format = first
             .strip_prefix(MAGIC)
             .and_then(|f| f.strip_prefix(' '))
-            .and_then(|f| f.parse::<u32>().ok())
+            .and_then(crate::parse_uint::<u32>)
             .ok_or_else(|| format!("not a tape header: {first:?}"))?;
         if format != FORMAT {
             return Err(format!(

@@ -9,6 +9,63 @@ use std::path::Path;
 
 use crate::platform::ensure_private_dir;
 use crate::store::Layout;
+use crate::zdotdir::ZshDir;
+
+/// The folders an account's rc rows ([`RC_FILES`]) live in: `$HOME`, and the one zsh reads its
+/// `.zshrc` from ([`crate::zdotdir`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RcHome {
+    /// `$HOME`: `~/.aterm`, its ledger, and every row but zsh's.
+    pub home: std::path::PathBuf,
+    /// The folder zsh reads `.zshrc` from.
+    pub zsh: ZshDir,
+}
+
+impl RcHome {
+    /// `home`, where zsh reads `.zshrc` from `home` too.
+    #[must_use]
+    pub fn at(home: &Path) -> Self {
+        Self {
+            home: home.to_path_buf(),
+            zsh: ZshDir::Home,
+        }
+    }
+
+    /// `home` with zsh's folder as this process learns it ([`crate::zdotdir::of_process`]).
+    #[must_use]
+    pub fn of_process(home: &Path) -> Self {
+        Self {
+            home: home.to_path_buf(),
+            zsh: crate::zdotdir::of_process(home),
+        }
+    }
+
+    /// The file row `rc` names: zsh's `.zshrc` in zsh's folder, `None` while that is unknown;
+    /// every other row under `$HOME`.
+    #[must_use]
+    pub fn path(&self, rc: &str) -> Option<std::path::PathBuf> {
+        if rc == ZSHRC {
+            self.zsh.dir(&self.home).map(|dir| dir.join(rc))
+        } else {
+            Some(self.home.join(rc))
+        }
+    }
+
+    /// Row `rc` as a person reads it: `~/…` under `$HOME`, else the whole path.
+    #[must_use]
+    pub fn shown(&self, rc: &str) -> String {
+        match self.path(rc) {
+            Some(path) => match path.strip_prefix(&self.home) {
+                Ok(rest) => format!("~/{}", rest.display()),
+                Err(_) => path.display().to_string(),
+            },
+            None => format!("zsh's {rc}"),
+        }
+    }
+}
+
+/// zsh's row in [`RC_FILES`], the one that lives in zsh's folder rather than `$HOME`.
+pub(crate) const ZSHRC: &str = ".zshrc";
 
 /// The hook file base name (`00-` sorts first).
 pub const HOOK_BASENAME: &str = "00-atpkg";
@@ -433,11 +490,14 @@ pub enum RcOutcome {
     /// even opened (the consent fence in `ensure_rc_sources_hooks`).
     ConsentFenced,
     /// The rc exists but is not something atpkg edits: a dangling link, not a regular
-    /// file, or not UTF-8.
+    /// file, or not UTF-8, or its persisted wiring history cannot be read safely.
     Unreadable,
     /// The rewrite was attempted and failed; the rc is unchanged (the rc or its directory
     /// refused the write, or the temp could not be created exclusively beside it).
     WriteFailed,
+    /// zsh's row: which folder zsh reads `.zshrc` from could not be learned
+    /// ([`ZshDir::Unknown`]), so no file was opened for it.
+    ZshFolderUnknown,
 }
 
 /// Harden `~/.aterm/shell.d`, write hooks, wire rc files, and lay `~/.local/bin` command links.
@@ -467,16 +527,16 @@ pub(crate) enum RcWiring {
 fn refresh_with(
     layout: &Layout,
     wiring: RcWiring,
-    creates: fn(&Path) -> Option<&'static str>,
+    creates: fn(&RcHome) -> Option<&'static str>,
 ) -> HookPass {
     let exe = std::env::current_exe().and_then(|e| e.canonicalize()).ok();
-    let home = aterm_types::dirs::home_dir();
-    let login = home.as_deref().and_then(creates);
+    let rcs = aterm_types::dirs::home_dir().map(|home| RcHome::of_process(&home));
+    let login = rcs.as_ref().and_then(creates);
     refresh_as(
         layout,
         wiring,
         exe.as_deref(),
-        home.as_deref(),
+        rcs.as_ref(),
         HEALS_STORE,
         login,
     )
@@ -506,20 +566,22 @@ pub fn login_shell() -> Option<std::path::PathBuf> {
 
 /// The [`RC_FILES`] entry read by this account's login shell.
 #[must_use]
-pub fn account_login_rc(home: &Path) -> Option<&'static str> {
+pub fn account_login_rc(rcs: &RcHome) -> Option<&'static str> {
     let shell = login_shell()?;
     let xdg_config = std::env::var_os("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
         .filter(|dir| dir.is_absolute());
-    login_rc(&shell.to_string_lossy(), home, xdg_config.as_deref())
+    login_rc(&shell.to_string_lossy(), rcs, xdg_config.as_deref())
 }
 
-/// The [`RC_FILES`] entry read by login shell `shell`.
+/// The [`RC_FILES`] entry read by login shell `shell`: none for zsh while zsh's folder is
+/// unknown.
 #[must_use]
-pub fn login_rc(shell: &str, home: &Path, xdg_config: Option<&Path>) -> Option<&'static str> {
+pub fn login_rc(shell: &str, rcs: &RcHome, xdg_config: Option<&Path>) -> Option<&'static str> {
     #[cfg(unix)]
     {
-        let places = crate::selfsetup::Places::defaults(home, None, xdg_config);
+        let mut places = crate::selfsetup::Places::defaults(&rcs.home, None, xdg_config);
+        places.zdotdir = rcs.zsh.clone();
         let env = crate::selfsetup::ShellEnv {
             shell: Some(shell.to_owned()),
             ..crate::selfsetup::ShellEnv::default()
@@ -528,11 +590,11 @@ pub fn login_rc(shell: &str, home: &Path, xdg_config: Option<&Path>) -> Option<&
         RC_FILES
             .iter()
             .map(|(rc, _)| *rc)
-            .find(|rc| home.join(rc) == target)
+            .find(|rc| rcs.path(rc).as_ref() == Some(&target))
     }
     #[cfg(not(unix))]
     {
-        let _ = (shell, home, xdg_config);
+        let _ = (shell, rcs, xdg_config);
         None
     }
 }
@@ -545,7 +607,7 @@ fn refresh_as(
     layout: &Layout,
     wiring: RcWiring,
     exe: Option<&Path>,
-    home: Option<&Path>,
+    rcs: Option<&RcHome>,
     heals_store: bool,
     login: Option<&'static str>,
 ) -> HookPass {
@@ -555,10 +617,10 @@ fn refresh_as(
     }
     #[cfg(not(unix))]
     let _ = heals_store;
-    let Some(home) = home else {
+    let Some(rcs) = rcs else {
         return HookPass::NotHardened;
     };
-    pass_as(layout, home, wiring, exe, login)
+    pass_as(layout, rcs, wiring, exe, login)
 }
 
 /// Store directory containing `exe` when `exe` is a store install (`~/.local/lib/aterm/bin`).
@@ -598,7 +660,7 @@ pub(crate) fn canonical(path: &Path) -> Option<std::path::PathBuf> {
 
 fn pass_as(
     layout: &Layout,
-    home: &Path,
+    rcs: &RcHome,
     wiring: RcWiring,
     exe: Option<&Path>,
     login: Option<&'static str>,
@@ -606,18 +668,18 @@ fn pass_as(
     if wiring == RcWiring::HonorOptOut && exe.is_some_and(is_non_release_bundle_exe) {
         return HookPass::NotReleaseBundle;
     }
-    pass_at(layout, home, wiring, login)
+    pass_at(layout, rcs, wiring, login)
 }
 
-/// Run a full hook and rc pass against `home` with `wiring`.
+/// Run a full hook and rc pass against `rcs` with `wiring`.
 pub(crate) fn pass_at(
     layout: &Layout,
-    home: &Path,
+    rcs: &RcHome,
     wiring: RcWiring,
     login: Option<&'static str>,
 ) -> HookPass {
     refresh_at(
-        home,
+        rcs,
         &layout.bin_dir(),
         &layout.agents_dir(),
         &layout.reroute_dir(),
@@ -627,13 +689,14 @@ pub(crate) fn pass_at(
 }
 
 fn refresh_at(
-    home: &Path,
+    rcs: &RcHome,
     bin_dir: &Path,
     agents_dir: &Path,
     reroute_dir: &Path,
     wiring: RcWiring,
     login: Option<&'static str>,
 ) -> HookPass {
+    let home = rcs.home.as_path();
     let aterm = home.join(".aterm");
     let shell_d = aterm.join("shell.d");
     if ensure_private_dir(&aterm).is_err() || ensure_private_dir(&shell_d).is_err() {
@@ -642,7 +705,7 @@ fn refresh_at(
     let hooks_written = write_hooks(&shell_d, bin_dir, agents_dir, reroute_dir).is_ok();
     #[cfg(unix)]
     let rc = if hooks_written {
-        ensure_rc_sources_hooks(home, wiring, login)
+        ensure_rc_sources_hooks(rcs, wiring, login)
     } else {
         Vec::new()
     };
@@ -667,8 +730,8 @@ pub(crate) const RC_BEGIN: &str = "# >>> atpkg shell integration >>>";
 #[cfg(unix)]
 pub(crate) const RC_END: &str = "# <<< atpkg shell integration <<<";
 
-/// The rc files atpkg wires: each row is a path relative to `$HOME` and the `shell.d` hook
-/// it sources.
+/// The rc files atpkg wires: each row is a path relative to `$HOME` (zsh's, [`ZSHRC`], relative
+/// to the folder zsh reads it from: [`RcHome::path`]) and the `shell.d` hook it sources.
 #[cfg(unix)]
 pub(crate) const RC_FILES: [(&str, &str); 4] = [
     (".zshrc", "00-atpkg.zsh"),
@@ -681,24 +744,52 @@ pub(crate) const RC_FILES: [(&str, &str); 4] = [
 #[cfg(unix)]
 const RC_LEDGER: &str = "rc-wired";
 
+/// Canonical path records, including newline, admitted by both the reader and writer.
+#[cfg(unix)]
+const RC_HISTORY_LINE_BYTES: usize = 4096;
+
 #[cfg(unix)]
 fn rc_ledger_path(home: &Path) -> std::path::PathBuf {
     home.join(".aterm").join(RC_LEDGER)
 }
 
-/// The recorded rc paths; empty when the ledger is absent or unreadable, which is what a
-/// fresh home is.
+/// The recorded rc paths. Missing is fresh; refused evidence is unknown and holds wiring,
+/// never permission to restore a hook the person may have removed. Record IO is bounded;
+/// the exact set grows with distinct historical paths.
 #[cfg(unix)]
-fn read_rc_ledger(home: &Path) -> std::collections::BTreeSet<String> {
-    fs::read_to_string(rc_ledger_path(home))
-        .map(|body| {
-            body.lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
+fn read_rc_ledger(home: &Path) -> io::Result<std::collections::BTreeSet<String>> {
+    let mut paths = std::collections::BTreeSet::new();
+    match crate::metadata_io::read_regular_lines(
+        &rc_ledger_path(home),
+        RC_HISTORY_LINE_BYTES,
+        |line| {
+            let path = line.trim();
+            if path.len() >= RC_HISTORY_LINE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "rc history path exceeds its record bound",
+                ));
+            }
+            if !path.is_empty() {
+                paths.insert(path.to_owned());
+            }
+            Ok(true)
+        },
+    ) {
+        Ok(()) => Ok(paths),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Default::default()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn rc_history_entry(real: &Path) -> Option<String> {
+    let entry = real.to_string_lossy();
+    (!entry.is_empty()
+        && entry.trim() == entry.as_ref()
+        && !entry.contains(['\n', '\r'])
+        && entry.len() < RC_HISTORY_LINE_BYTES)
+        .then(|| entry.into_owned())
 }
 
 /// Record `real` as wired, best-effort, through the workspace's careful writer
@@ -707,10 +798,9 @@ fn read_rc_ledger(home: &Path) -> std::collections::BTreeSet<String> {
 /// nothing.
 #[cfg(unix)]
 fn record_rc_wired(home: &Path, real: &Path, ledger: &mut std::collections::BTreeSet<String>) {
-    let entry = real.to_string_lossy().into_owned();
-    if entry.contains('\n') {
+    let Some(entry) = rc_history_entry(real) else {
         return;
-    }
+    };
     if !ledger.insert(entry) {
         return;
     }
@@ -721,22 +811,31 @@ fn record_rc_wired(home: &Path, real: &Path, ledger: &mut std::collections::BTre
     let _ = aterm_uds::atomic_file::write(&rc_ledger_path(home), body.as_bytes(), 0o600);
 }
 
-/// Ensure existing rc files under `home` source the `shell.d` hooks.
+/// Ensure the existing rc files of `rcs` source the `shell.d` hooks.
 #[cfg(unix)]
 pub(crate) fn ensure_rc_sources_hooks(
-    home: &Path,
+    rcs: &RcHome,
     wiring: RcWiring,
     login: Option<&'static str>,
 ) -> Vec<(&'static str, RcOutcome)> {
+    let home = rcs.home.as_path();
     let canonical_home = fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
-    let mut ledger = read_rc_ledger(home);
+    let Ok(mut ledger) = read_rc_ledger(home) else {
+        return RC_FILES
+            .iter()
+            .map(|(rc, _)| (*rc, RcOutcome::Unreadable))
+            .collect();
+    };
     let mut outcomes: Vec<(&'static str, RcOutcome)> = Vec::new();
     for (rc, hook) in RC_FILES {
-        let rc_path = home.join(rc);
+        let Some(rc_path) = rcs.path(rc) else {
+            outcomes.push((rc, RcOutcome::ZshFolderUnknown));
+            continue;
+        };
         if fs::symlink_metadata(&rc_path).is_err() {
             if login == Some(rc)
                 && let Some(outcome) =
-                    create_login_rc(home, &canonical_home, rc, hook, wiring, &mut ledger)
+                    create_login_rc(home, &canonical_home, &rc_path, hook, wiring, &mut ledger)
             {
                 outcomes.push((rc, outcome));
             }
@@ -746,6 +845,10 @@ pub(crate) fn ensure_rc_sources_hooks(
             outcomes.push((rc, RcOutcome::Unreadable));
             continue;
         };
+        if rc_history_entry(&real).is_none() {
+            outcomes.push((rc, RcOutcome::Unreadable));
+            continue;
+        }
         if crate::protected::under_protected_root(&canonical_home, &real) {
             outcomes.push((rc, RcOutcome::ConsentFenced));
             continue;
@@ -758,7 +861,7 @@ pub(crate) fn ensure_rc_sources_hooks(
             outcomes.push((rc, RcOutcome::Unreadable));
             continue;
         }
-        let Ok(existing) = fs::read_to_string(&real) else {
+        let Ok(existing) = crate::metadata_io::read_bounded_regular_utf8(&real, 1024 * 1024) else {
             outcomes.push((rc, RcOutcome::Unreadable));
             continue;
         };
@@ -834,29 +937,31 @@ fn rc_block(home: &Path, hook: &str) -> String {
     )
 }
 
-/// Where the absent login rc `rc` would be created: its directory resolved (a `~/.config`
+/// Where the absent login rc at `path` would be created: its directory resolved (a `~/.config`
 /// that is a link counts as its target) and the file name joined on, so the consent fence
 /// and the ledger read the path the file will have.
 #[cfg(unix)]
-fn login_rc_target(home: &Path, rc: &str) -> Option<std::path::PathBuf> {
-    let path = home.join(rc);
+fn login_rc_target(path: &Path) -> Option<std::path::PathBuf> {
     let name = path.file_name()?;
     let dir = fs::canonicalize(path.parent()?).ok()?;
     fs::metadata(&dir).ok()?.is_dir().then(|| dir.join(name))
 }
 
-/// What a pass does about the absent login rc `rc` ([`login_rc`]); `None` when it can be
+/// What a pass does about the absent login rc at `path` ([`login_rc`]); `None` when it can be
 /// neither created nor reported (its directory is missing).
 #[cfg(unix)]
 fn create_login_rc(
     home: &Path,
     canonical_home: &Path,
-    rc: &'static str,
+    path: &Path,
     hook: &str,
     wiring: RcWiring,
     ledger: &mut std::collections::BTreeSet<String>,
 ) -> Option<RcOutcome> {
-    let real = login_rc_target(home, rc)?;
+    let real = login_rc_target(path)?;
+    if rc_history_entry(&real).is_none() {
+        return Some(RcOutcome::Unreadable);
+    }
     if crate::protected::under_protected_root(canonical_home, &real) {
         return Some(RcOutcome::ConsentFenced);
     }
@@ -883,21 +988,25 @@ fn create_login_rc(
     })
 }
 
-/// Report state for an absent login rc file `rc` under `home`.
+/// Report state for the absent login rc file row `rc` of `rcs`.
 #[cfg(unix)]
-pub(crate) fn absent_login_rc(home: &Path, rc: &str) -> Option<RcState> {
-    if fs::symlink_metadata(home.join(rc)).is_ok() {
+pub(crate) fn absent_login_rc(rcs: &RcHome, rc: &str) -> Option<RcState> {
+    let path = rcs.path(rc)?;
+    if fs::symlink_metadata(&path).is_ok() {
         return None;
     }
-    let real = login_rc_target(home, rc)?;
+    let real = login_rc_target(&path)?;
+    let home = rcs.home.as_path();
     let canonical_home = fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
     Some(
         if crate::protected::under_protected_root(&canonical_home, &real) {
             RcState::ConsentFenced
-        } else if read_rc_ledger(home).contains(real.to_string_lossy().as_ref()) {
-            RcState::OptedOut
         } else {
-            RcState::Unwired
+            match read_rc_ledger(home) {
+                Ok(ledger) if ledger.contains(real.to_string_lossy().as_ref()) => RcState::OptedOut,
+                Ok(_) => RcState::Unwired,
+                Err(_) => RcState::HistoryUnreadable,
+            }
         },
     )
 }
@@ -923,9 +1032,14 @@ pub(crate) enum RcState {
     /// The rc exists, no [`RC_LEDGER`] entry records atpkg wiring it, and nothing else
     /// sources `shell.d` from it: no pass has run since it appeared.
     Unwired,
+    /// Persisted history is unreadable; automatic wiring is held without inferring a choice.
+    HistoryUnreadable,
     /// The rc resolves under a folder macOS guards with a consent dialog, so no pass opens it
     /// ([`ensure_rc_sources_hooks`]'s consent fence), and neither does this report.
     ConsentFenced,
+    /// zsh's row, whose folder could not be learned ([`ZshDir::Unknown`]): no pass opens a
+    /// `.zshrc` for it.
+    ZshFolderUnknown,
 }
 
 /// How [`rc_wiring`] resolves one rc: the steps [`ensure_rc_sources_hooks`] takes before it
@@ -945,22 +1059,29 @@ fn read_rc_for_report(canonical_home: &Path, rc_path: &Path) -> Option<RcRead> {
     if crate::protected::under_protected_root(canonical_home, &real) {
         return Some(RcRead::Fenced);
     }
-    if !fs::metadata(&real).ok()?.is_file() {
-        return None;
-    }
-    let body = fs::read_to_string(&real).ok()?;
+    let body = crate::metadata_io::read_bounded_regular_utf8(&real, 1024 * 1024).ok()?;
     Some(RcRead::Body(real, body))
 }
 
-/// Wiring state of every existing rc file under `home` in report order.
+/// Wiring state of every existing rc file of `rcs` in report order, and zsh's row while its
+/// folder is unknown.
 #[cfg(unix)]
-pub(crate) fn rc_wiring(home: &Path) -> Vec<(&'static str, RcState)> {
+pub(crate) fn rc_wiring(rcs: &RcHome) -> Vec<(&'static str, RcState)> {
+    let home = rcs.home.as_path();
     let canonical_home = fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
-    let ledger = read_rc_ledger(home);
+    let Ok(ledger) = read_rc_ledger(home) else {
+        return RC_FILES
+            .iter()
+            .map(|(rc, _)| (*rc, RcState::HistoryUnreadable))
+            .collect();
+    };
     let mut wiring: Vec<(&'static str, RcState)> = RC_FILES
         .iter()
         .filter_map(|(rc, _)| {
-            let state = match read_rc_for_report(&canonical_home, &home.join(rc))? {
+            let Some(path) = rcs.path(rc) else {
+                return Some((*rc, RcState::ZshFolderUnknown));
+            };
+            let state = match read_rc_for_report(&canonical_home, &path)? {
                 RcRead::Fenced => RcState::ConsentFenced,
                 RcRead::Body(real, body) => {
                     if body.contains(RC_BEGIN) {
@@ -988,7 +1109,7 @@ pub(crate) fn rc_wiring(home: &Path) -> Vec<(&'static str, RcState)> {
     wiring
 }
 
-/// Relative paths under `$HOME` inspected by [`rc_wiring`].
+/// The rows [`rc_wiring`] inspects ([`RcHome::path`] places each).
 #[cfg(unix)]
 pub(crate) fn rc_files_read() -> impl Iterator<Item = &'static str> {
     RC_FILES
@@ -1495,7 +1616,7 @@ mod tests {
         let zshrc = home.join(".zshrc");
         std::fs::write(&zshrc, "# pre-existing user content\nexport FOO=1\n").unwrap();
 
-        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut, None);
+        ensure_rc_sources_hooks(&RcHome::at(&home), RcWiring::HonorOptOut, None);
         let once = std::fs::read_to_string(&zshrc).unwrap();
         let ino_once = fs::metadata(&zshrc).unwrap().ino();
         assert!(
@@ -1512,7 +1633,7 @@ mod tests {
         );
         assert!(!home.join(".bashrc").exists(), "no rc was invented");
 
-        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut, None);
+        ensure_rc_sources_hooks(&RcHome::at(&home), RcWiring::HonorOptOut, None);
         let twice = std::fs::read_to_string(&zshrc).unwrap();
         assert_eq!(twice, once, "a second pass must be a no-op");
         assert_eq!(twice.matches(RC_BEGIN).count(), 1, "exactly one block");
@@ -1536,14 +1657,16 @@ mod tests {
         let user = "# pre-existing user content\nexport FOO=1\n";
         fs::write(&zshrc, user).unwrap();
 
-        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut, None);
+        ensure_rc_sources_hooks(&RcHome::at(&home), RcWiring::HonorOptOut, None);
         assert!(
             fs::read_to_string(&zshrc).unwrap().contains(RC_BEGIN),
             "wired on the first pass, as before"
         );
         let real = fs::canonicalize(&zshrc).unwrap();
         assert!(
-            read_rc_ledger(&home).contains(real.to_string_lossy().as_ref()),
+            read_rc_ledger(&home)
+                .unwrap()
+                .contains(real.to_string_lossy().as_ref()),
             "the wiring is recorded: {:?}",
             read_rc_ledger(&home)
         );
@@ -1559,7 +1682,7 @@ mod tests {
 
         fs::write(&zshrc, user).unwrap();
         for pass in 0..3 {
-            ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut, None);
+            ensure_rc_sources_hooks(&RcHome::at(&home), RcWiring::HonorOptOut, None);
             assert_eq!(
                 fs::read_to_string(&zshrc).unwrap(),
                 user,
@@ -1567,14 +1690,14 @@ mod tests {
             );
         }
 
-        ensure_rc_sources_hooks(&home, RcWiring::Rewire, None);
+        ensure_rc_sources_hooks(&RcHome::at(&home), RcWiring::Rewire, None);
         assert!(
             fs::read_to_string(&zshrc).unwrap().contains(RC_BEGIN),
             "repair puts the block back"
         );
 
         fs::write(&zshrc, user).unwrap();
-        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut, None);
+        ensure_rc_sources_hooks(&RcHome::at(&home), RcWiring::HonorOptOut, None);
         assert_eq!(
             fs::read_to_string(&zshrc).unwrap(),
             user,
@@ -1584,6 +1707,110 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_large_rc_history_keeps_a_removed_hook_off_and_preserves_the_ledger() {
+        let home = tmp("large-rc-history");
+        let zshrc = home.join(".zshrc");
+        let user = "# user kept this shell config\nexport MY_SETTING=1\n";
+        fs::write(&zshrc, user).unwrap();
+        ensure_rc_sources_hooks(&RcHome::at(&home), RcWiring::HonorOptOut, None);
+        assert!(
+            fs::read_to_string(&zshrc).unwrap().contains(RC_BEGIN),
+            "ordinary wiring"
+        );
+        let real = fs::canonicalize(&zshrc).unwrap();
+        assert!(
+            read_rc_ledger(&home)
+                .unwrap()
+                .contains(real.to_string_lossy().as_ref())
+        );
+        fs::write(&zshrc, user).unwrap();
+        ensure_rc_sources_hooks(&RcHome::at(&home), RcWiring::HonorOptOut, None);
+        assert_eq!(
+            fs::read_to_string(&zshrc).unwrap(),
+            user,
+            "ordinary removed-block control"
+        );
+
+        let mut history = read_rc_ledger(&home).unwrap();
+        for n in 0..300 {
+            let path = home.join(format!("old-rc-{n:03}-{}", "x".repeat(200)));
+            fs::write(&path, b"inert historical shell config\n").unwrap();
+            let path = fs::canonicalize(path).unwrap();
+            record_rc_wired(&home, &path, &mut history);
+        }
+        let before = fs::read(rc_ledger_path(&home)).unwrap();
+        assert!(
+            before.len() > 64 * 1024,
+            "actual producer's aggregate history"
+        );
+        assert!(history.contains(real.to_string_lossy().as_ref()));
+        let out = ensure_rc_sources_hooks(&RcHome::at(&home), RcWiring::HonorOptOut, None);
+        assert_eq!(
+            fs::read_to_string(&zshrc).unwrap(),
+            user,
+            "an unattended pass must honor the removed block, whatever the history size: {out:?}"
+        );
+        assert_eq!(
+            fs::read(rc_ledger_path(&home)).unwrap(),
+            before,
+            "no forgotten history"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_rc_history_holds_wiring_without_overwriting_any_evidence() {
+        for case in ["utf8", "overlong", "directory"] {
+            let home = tmp("refused-rc-history");
+            let zshrc = home.join(".zshrc");
+            let user = "# the person's shell config\nexport MY_SETTING=1\n";
+            fs::write(&zshrc, user).unwrap();
+            let path = rc_ledger_path(&home);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let bytes = match case {
+                "utf8" => vec![0xff],
+                "overlong" => vec![b'x'; RC_HISTORY_LINE_BYTES + 1],
+                _ => Vec::new(),
+            };
+            if case == "directory" {
+                fs::create_dir(&path).unwrap();
+            } else {
+                fs::write(&path, &bytes).unwrap();
+            }
+            assert!(read_rc_ledger(&home).is_err(), "{case}");
+            let rcs = RcHome::at(&home);
+            for mode in [RcWiring::HonorOptOut, RcWiring::Rewire] {
+                let out = ensure_rc_sources_hooks(&rcs, mode, Some(".bash_profile"));
+                assert!(
+                    out.iter()
+                        .all(|(_, outcome)| *outcome == RcOutcome::Unreadable),
+                    "{case}: {out:?}"
+                );
+                assert_eq!(fs::read_to_string(&zshrc).unwrap(), user, "{case}");
+                assert!(
+                    !home.join(".bash_profile").exists(),
+                    "{case}: no inferred fresh login rc"
+                );
+            }
+            assert!(
+                rc_wiring(&rcs)
+                    .iter()
+                    .all(|(_, state)| *state == RcState::HistoryUnreadable)
+            );
+            assert_eq!(
+                absent_login_rc(&rcs, ".bash_profile"),
+                Some(RcState::HistoryUnreadable)
+            );
+            if case == "directory" {
+                assert!(path.is_dir());
+            } else {
+                assert_eq!(fs::read(&path).unwrap(), bytes, "{case}");
+            }
+        }
+    }
+
     /// The one file a pass creates (design init-system §4.2): the login shell's absent rc,
     /// holding only the block, private, recorded.
     #[cfg(unix)]
@@ -1591,12 +1818,12 @@ mod tests {
     fn the_login_shell_s_absent_rc_is_created_and_no_other_shell_gains_one() {
         let home = tmp("rclogin");
         fs::create_dir_all(home.join(".config/fish")).unwrap();
-        let login = login_rc("/bin/zsh", &home, None);
+        let login = login_rc("/bin/zsh", &RcHome::at(&home), None);
         assert_eq!(login, Some(".zshrc"));
         let zshrc = home.join(".zshrc");
 
         assert_eq!(
-            ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut, login),
+            ensure_rc_sources_hooks(&RcHome::at(&home), RcWiring::HonorOptOut, login),
             [(".zshrc", RcOutcome::Created)]
         );
         let body = fs::read_to_string(&zshrc).unwrap();
@@ -1610,7 +1837,9 @@ mod tests {
         );
         let real = fs::canonicalize(&zshrc).unwrap();
         assert!(
-            read_rc_ledger(&home).contains(real.to_string_lossy().as_ref()),
+            read_rc_ledger(&home)
+                .unwrap()
+                .contains(real.to_string_lossy().as_ref()),
             "recorded like a wired rc"
         );
         for other in [".bashrc", ".bash_profile", ".config/fish/config.fish"] {
@@ -1621,27 +1850,114 @@ mod tests {
         }
 
         assert_eq!(
-            ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut, login),
+            ensure_rc_sources_hooks(&RcHome::at(&home), RcWiring::HonorOptOut, login),
             [(".zshrc", RcOutcome::AlreadyWired)]
         );
         assert_eq!(fs::read_to_string(&zshrc).unwrap(), body);
 
         fs::remove_file(&zshrc).unwrap();
-        assert_eq!(absent_login_rc(&home, ".zshrc"), Some(RcState::OptedOut));
+        assert_eq!(
+            absent_login_rc(&RcHome::at(&home), ".zshrc"),
+            Some(RcState::OptedOut)
+        );
         for pass in 0..2 {
             assert_eq!(
-                ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut, login),
+                ensure_rc_sources_hooks(&RcHome::at(&home), RcWiring::HonorOptOut, login),
                 [(".zshrc", RcOutcome::OptOutKept)],
                 "pass {pass}"
             );
             assert!(fs::symlink_metadata(&zshrc).is_err(), "pass {pass}");
         }
         assert_eq!(
-            ensure_rc_sources_hooks(&home, RcWiring::Rewire, login),
+            ensure_rc_sources_hooks(&RcHome::at(&home), RcWiring::Rewire, login),
             [(".zshrc", RcOutcome::RelaidOverOptOut)]
         );
         assert_eq!(fs::read_to_string(&zshrc).unwrap(), body);
-        assert_eq!(absent_login_rc(&home, ".zshrc"), None, "it stands again");
+        assert_eq!(
+            absent_login_rc(&RcHome::at(&home), ".zshrc"),
+            None,
+            "it stands again"
+        );
+    }
+
+    /// Under a `ZDOTDIR`, zsh's row is `$ZDOTDIR/.zshrc` (round 13: a pass wired `~/.zshrc`,
+    /// which zsh never reads there): it is the login rc a pass creates, the file it wires and
+    /// reports, and a standing `~/.zshrc` is not zsh's, so it is left exactly as it was. The
+    /// control is the same home with zsh's folder at `$HOME`.
+    #[cfg(unix)]
+    #[test]
+    fn a_zdotdir_account_s_zsh_row_is_the_zshrc_zsh_reads() {
+        let home = tmp("rczdot");
+        let zdot = home.join(".config/zsh");
+        fs::create_dir_all(&zdot).unwrap();
+        let user = "# the person's own, from before ZDOTDIR\n";
+        fs::write(home.join(".zshrc"), user).unwrap();
+        let rcs = RcHome {
+            home: home.to_path_buf(),
+            zsh: ZshDir::At(zdot.clone()),
+        };
+        assert_eq!(rcs.shown(".zshrc"), "~/.config/zsh/.zshrc");
+        let login = login_rc("/bin/zsh", &rcs, None);
+        assert_eq!(login, Some(".zshrc"));
+        assert_eq!(absent_login_rc(&rcs, ".zshrc"), Some(RcState::Unwired));
+
+        assert_eq!(
+            ensure_rc_sources_hooks(&rcs, RcWiring::HonorOptOut, login),
+            [(".zshrc", RcOutcome::Created)]
+        );
+        let made = fs::read_to_string(zdot.join(".zshrc")).unwrap();
+        assert!(made.starts_with(RC_BEGIN), "{made:?}");
+        assert!(made.contains(".aterm/shell.d/00-atpkg.zsh"), "{made:?}");
+        assert_eq!(
+            fs::read_to_string(home.join(".zshrc")).unwrap(),
+            user,
+            "~/.zshrc is not zsh's under a ZDOTDIR"
+        );
+        assert_eq!(rc_wiring(&rcs), [(".zshrc", RcState::Wired)]);
+        assert_eq!(
+            ensure_rc_sources_hooks(&rcs, RcWiring::HonorOptOut, login),
+            [(".zshrc", RcOutcome::AlreadyWired)]
+        );
+
+        let control = tmp("rczdotctl");
+        fs::create_dir_all(control.join(".config/zsh")).unwrap();
+        fs::write(control.join(".zshrc"), user).unwrap();
+        assert_eq!(
+            ensure_rc_sources_hooks(&RcHome::at(&control), RcWiring::HonorOptOut, login),
+            [(".zshrc", RcOutcome::Appended)]
+        );
+        assert!(!control.join(".config/zsh/.zshrc").exists());
+    }
+
+    /// While zsh's folder is unknown no `.zshrc` is opened, made or reported as wired: a pass
+    /// says so, the login rc election names none for zsh, and a standing `~/.zshrc` is left as
+    /// it was; the other rows are wired as ever.
+    #[cfg(unix)]
+    #[test]
+    fn an_unknown_zsh_folder_opens_no_zshrc() {
+        let home = tmp("rczunk");
+        let user = "export FOO=1\n";
+        fs::write(home.join(".zshrc"), user).unwrap();
+        fs::write(home.join(".bashrc"), user).unwrap();
+        let rcs = RcHome {
+            home: home.to_path_buf(),
+            zsh: ZshDir::Unknown("zsh hung".to_owned()),
+        };
+        assert_eq!(login_rc("/bin/zsh", &rcs, None), None);
+        assert_eq!(absent_login_rc(&rcs, ".zshrc"), None);
+        assert_eq!(rcs.shown(".zshrc"), "zsh's .zshrc");
+        let outcomes = ensure_rc_sources_hooks(&rcs, RcWiring::Rewire, Some(".zshrc"));
+        assert!(
+            outcomes.contains(&(".zshrc", RcOutcome::ZshFolderUnknown))
+                && outcomes.contains(&(".bashrc", RcOutcome::Appended)),
+            "{outcomes:?}"
+        );
+        assert_eq!(fs::read_to_string(home.join(".zshrc")).unwrap(), user);
+        assert!(
+            rc_wiring(&rcs).contains(&(".zshrc", RcState::ZshFolderUnknown)),
+            "{:?}",
+            rc_wiring(&rcs)
+        );
     }
 
     /// The login rc is selfsetup's `rc_target` election, and only a file atpkg wires: a
@@ -1650,29 +1966,50 @@ mod tests {
     #[test]
     fn the_login_rc_is_the_rc_target_election_s_and_only_a_row() {
         let home = tmp("rcelect");
-        assert_eq!(login_rc("/bin/zsh", &home, None), Some(".zshrc"));
-        assert_eq!(login_rc("zsh", &home, None), Some(".zshrc"));
         assert_eq!(
-            login_rc("/opt/homebrew/bin/fish", &home, None),
+            login_rc("/bin/zsh", &RcHome::at(&home), None),
+            Some(".zshrc")
+        );
+        assert_eq!(login_rc("zsh", &RcHome::at(&home), None), Some(".zshrc"));
+        assert_eq!(
+            login_rc("/opt/homebrew/bin/fish", &RcHome::at(&home), None),
             Some(".config/fish/config.fish")
         );
         assert_eq!(
-            login_rc("/opt/homebrew/bin/fish", &home, Some(&home.join(".config"))),
+            login_rc(
+                "/opt/homebrew/bin/fish",
+                &RcHome::at(&home),
+                Some(&home.join(".config"))
+            ),
             Some(".config/fish/config.fish")
         );
         assert_eq!(
-            login_rc("/opt/homebrew/bin/fish", &home, Some(&home.join("xdg"))),
+            login_rc(
+                "/opt/homebrew/bin/fish",
+                &RcHome::at(&home),
+                Some(&home.join("xdg"))
+            ),
             None
         );
         for unknown in ["/bin/sh", "/bin/dash", "/usr/bin/nu", "/usr/bin/false", ""] {
-            assert_eq!(login_rc(unknown, &home, None), None, "{unknown:?}");
+            assert_eq!(
+                login_rc(unknown, &RcHome::at(&home), None),
+                None,
+                "{unknown:?}"
+            );
         }
         if cfg!(target_os = "macos") {
-            assert_eq!(login_rc("/bin/bash", &home, None), Some(".bash_profile"));
+            assert_eq!(
+                login_rc("/bin/bash", &RcHome::at(&home), None),
+                Some(".bash_profile")
+            );
             fs::write(home.join(".profile"), "").unwrap();
-            assert_eq!(login_rc("/bin/bash", &home, None), None);
+            assert_eq!(login_rc("/bin/bash", &RcHome::at(&home), None), None);
         } else {
-            assert_eq!(login_rc("/bin/bash", &home, None), Some(".bashrc"));
+            assert_eq!(
+                login_rc("/bin/bash", &RcHome::at(&home), None),
+                Some(".bashrc")
+            );
         }
     }
 
@@ -1682,21 +2019,27 @@ mod tests {
     #[test]
     fn a_login_rc_under_a_guarded_folder_or_with_no_directory_is_not_created() {
         let home = tmp("rcloginfence");
-        let login = login_rc("/usr/local/bin/fish", &home, None);
+        let login = login_rc("/usr/local/bin/fish", &RcHome::at(&home), None);
         assert_eq!(login, Some(".config/fish/config.fish"));
-        assert_eq!(ensure_rc_sources_hooks(&home, RcWiring::Rewire, login), []);
+        assert_eq!(
+            ensure_rc_sources_hooks(&RcHome::at(&home), RcWiring::Rewire, login),
+            []
+        );
         assert!(fs::symlink_metadata(home.join(".config")).is_err());
-        assert_eq!(absent_login_rc(&home, ".config/fish/config.fish"), None);
+        assert_eq!(
+            absent_login_rc(&RcHome::at(&home), ".config/fish/config.fish"),
+            None
+        );
 
         fs::create_dir_all(home.join("Documents/dotfiles/fish")).unwrap();
         std::os::unix::fs::symlink(home.join("Documents/dotfiles"), home.join(".config")).unwrap();
         assert_eq!(
-            ensure_rc_sources_hooks(&home, RcWiring::Rewire, login),
+            ensure_rc_sources_hooks(&RcHome::at(&home), RcWiring::Rewire, login),
             [(".config/fish/config.fish", RcOutcome::ConsentFenced)]
         );
         assert!(!home.join("Documents/dotfiles/fish/config.fish").exists());
         assert_eq!(
-            absent_login_rc(&home, ".config/fish/config.fish"),
+            absent_login_rc(&RcHome::at(&home), ".config/fish/config.fish"),
             Some(RcState::ConsentFenced)
         );
     }
@@ -1720,7 +2063,7 @@ mod tests {
             "the pre-2026-09-16 shape: wired, with nothing recorded"
         );
 
-        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut, None);
+        ensure_rc_sources_hooks(&RcHome::at(&home), RcWiring::HonorOptOut, None);
         assert_eq!(
             fs::read_to_string(&bashrc).unwrap(),
             pre,
@@ -1732,7 +2075,7 @@ mod tests {
         );
 
         fs::write(&bashrc, user).unwrap();
-        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut, None);
+        ensure_rc_sources_hooks(&RcHome::at(&home), RcWiring::HonorOptOut, None);
         assert_eq!(
             fs::read_to_string(&bashrc).unwrap(),
             user,
@@ -1779,7 +2122,7 @@ mod tests {
             fs::write(shell_d.join(hook), body).unwrap();
         }
 
-        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut, None);
+        ensure_rc_sources_hooks(&RcHome::at(&home), RcWiring::HonorOptOut, None);
 
         let line_of = |rc: &str| -> String {
             let body = fs::read_to_string(home.join(rc)).unwrap();
@@ -1848,7 +2191,7 @@ mod tests {
             fs::create_dir_all(rc_path.parent().unwrap()).unwrap();
             fs::write(&rc_path, "# pre-existing user content\n").unwrap();
         }
-        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut, None);
+        ensure_rc_sources_hooks(&RcHome::at(&home), RcWiring::HonorOptOut, None);
 
         let line_of = |rc: &str| -> String {
             let body = fs::read_to_string(home.join(rc)).unwrap();
@@ -1913,7 +2256,7 @@ mod tests {
         fs::create_dir_all(&blocked).unwrap();
 
         refresh_at(
-            &home,
+            &RcHome::at(&home),
             Path::new("/opt/atpkg-fixture/bin"),
             Path::new("/opt/atpkg-fixture/agents"),
             Path::new("/opt/atpkg-fixture/reroute"),
@@ -1954,7 +2297,7 @@ mod tests {
         fs::write(&fish, "set -x FOO 1\n").unwrap();
         fs::set_permissions(&fish, fs::Permissions::from_mode(0o600)).unwrap();
 
-        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut, None);
+        ensure_rc_sources_hooks(&RcHome::at(&home), RcWiring::HonorOptOut, None);
         assert!(
             fs::symlink_metadata(&link)
                 .unwrap()
@@ -1989,7 +2332,7 @@ mod tests {
             "a regular 0600 rc must not widen either"
         );
 
-        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut, None);
+        ensure_rc_sources_hooks(&RcHome::at(&home), RcWiring::HonorOptOut, None);
         assert_eq!(
             fs::read_to_string(&target)
                 .unwrap()
@@ -2024,7 +2367,7 @@ mod tests {
         let profile = home.join(".bash_profile");
         fs::write(&profile, "# login-only content\nexport FOO=1").unwrap();
 
-        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut, None);
+        ensure_rc_sources_hooks(&RcHome::at(&home), RcWiring::HonorOptOut, None);
         let wired = fs::read_to_string(&profile).unwrap();
         assert!(
             wired.contains(RC_BEGIN) && wired.contains(RC_END),
@@ -2045,7 +2388,7 @@ mod tests {
 
         let bashrc = home.join(".bashrc");
         fs::write(&bashrc, "export BAR=1\n").unwrap();
-        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut, None);
+        ensure_rc_sources_hooks(&RcHome::at(&home), RcWiring::HonorOptOut, None);
         for rc in [&profile, &bashrc] {
             let body = fs::read_to_string(rc).unwrap();
             assert_eq!(
@@ -2080,7 +2423,7 @@ mod tests {
         fs::write(&bashrc, "export BAR=1\n").unwrap();
         std::os::unix::fs::symlink(&bashrc, home.join(".bashrc")).unwrap();
 
-        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut, None);
+        ensure_rc_sources_hooks(&RcHome::at(&home), RcWiring::HonorOptOut, None);
 
         assert_eq!(
             fs::read_to_string(&zshrc).unwrap(),
@@ -2688,7 +3031,13 @@ mod tests {
         let release = root.join("Applications/aterm.app/Contents/MacOS/aterm");
         let hook = home.join(".aterm/shell.d/00-atpkg.zsh");
 
-        let pass = pass_as(&layout, &home, RcWiring::HonorOptOut, Some(&dev), None);
+        let pass = pass_as(
+            &layout,
+            &RcHome::at(&home),
+            RcWiring::HonorOptOut,
+            Some(&dev),
+            None,
+        );
         assert_eq!(pass, HookPass::NotReleaseBundle);
         assert!(pass.rc().is_empty());
         assert!(
@@ -2696,19 +3045,37 @@ mod tests {
             "the unattended pass from a dev bundle touches nothing under $HOME"
         );
 
-        let pass = pass_as(&layout, &home, RcWiring::HonorOptOut, Some(&release), None);
+        let pass = pass_as(
+            &layout,
+            &RcHome::at(&home),
+            RcWiring::HonorOptOut,
+            Some(&release),
+            None,
+        );
         assert!(matches!(pass, HookPass::Rewritten(_)), "{pass:?}");
         assert!(hook.exists(), "the release bundle lays the hook");
 
         fs::remove_file(&hook).unwrap();
-        let pass = pass_as(&layout, &home, RcWiring::Rewire, Some(&dev), None);
+        let pass = pass_as(
+            &layout,
+            &RcHome::at(&home),
+            RcWiring::Rewire,
+            Some(&dev),
+            None,
+        );
         assert!(matches!(pass, HookPass::Rewritten(_)), "{pass:?}");
         assert!(
             hook.exists(),
             "repair is the asked-for pass and writes from anywhere"
         );
 
-        let pass = pass_as(&layout, &home, RcWiring::HonorOptOut, None, None);
+        let pass = pass_as(
+            &layout,
+            &RcHome::at(&home),
+            RcWiring::HonorOptOut,
+            None,
+            None,
+        );
         assert!(
             matches!(pass, HookPass::Rewritten(_)),
             "an unresolvable executable never stops a pass: {pass:?}"
@@ -3019,7 +3386,7 @@ mod tests {
                 "set -g ATPKG_RC_TEST sourced\n",
             )
             .unwrap();
-            ensure_rc_sources_hooks(&rc_home, RcWiring::HonorOptOut, None);
+            ensure_rc_sources_hooks(&RcHome::at(&rc_home), RcWiring::HonorOptOut, None);
             let written = fs::read_to_string(&rc).unwrap();
             let line = written
                 .lines()
@@ -3051,7 +3418,7 @@ mod tests {
         fs::create_dir_all(rc.parent().unwrap()).unwrap();
         fs::write(&rc, "# pre-existing user content\n").unwrap();
 
-        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut, None);
+        ensure_rc_sources_hooks(&RcHome::at(&home), RcWiring::HonorOptOut, None);
 
         let written = fs::read_to_string(&rc).unwrap();
         let line = written

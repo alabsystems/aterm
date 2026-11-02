@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::supervise::occupancy::{due, rules};
+use crate::supervise::policy::turn_end::RESET_MINUTE;
 use crate::supervise::tape::header::{Reader, Roots, VERBATIM, Writer};
 
 /// The hosted loop's hand-over flag ([`Session::set_handover`]), as a setup holds it.
@@ -38,10 +39,16 @@ fn worker_source(text: &str) -> Result<WorkerSource, String> {
         Some(("fixed-err", why)) => Ok(WorkerSource::Fixed(Err(why.to_string()))),
         Some(("fixed", rest)) => {
             let (digest, pid) = rest.split_once(' ').ok_or_else(bad)?;
+            if digest.is_empty() || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(bad());
+            }
             let digest = u64::from_str_radix(digest, 16).map_err(|_| bad())?;
             let pid = match pid {
                 "-" => None,
-                p => Some(p.parse::<u32>().map_err(|_| bad())?),
+                p if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => {
+                    Some(p.parse::<u32>().map_err(|_| bad())?)
+                }
+                _ => return Err(bad()),
             };
             Ok(WorkerSource::Fixed(Ok(
                 crate::supervise::policy::WorkerEnv::recorded(digest, pid),
@@ -64,6 +71,11 @@ pub struct SessionSetup {
     pub(super) handover: Handover,
     /// The loop types its texts under this process's hand ([`Session::type_under_hand`]): the window's host's loop.
     pub(super) types_under_hand: bool,
+    /// The private host's explicit, recorded per-duty input adapter.
+    pub(super) builtin_duties: bool,
+    /// The window's host confirms the session's agent by its image, and the loop types only while
+    /// it does ([`Session::set_confirms_agent`]).
+    pub(super) confirms_agent: bool,
     /// Where the approval ledger goes ([`Session::set_approval_ledger`]); `None` keeps none — until a hosted loop takes its options' own ([`Session::run_hosted`]).
     pub(super) ledger_path: Option<PathBuf>,
     /// What the approval policy takes from the supervisor's own process (the owner's home, uid and `$TMPDIR`; fixed in tests).
@@ -122,6 +134,8 @@ impl SessionSetup {
             sid,
             holder: claim::default_holder(),
             beside: None,
+            builtin_duties: false,
+            confirms_agent: false,
             handover: Handover::default(),
             types_under_hand: false,
             ledger_path: None,
@@ -202,6 +216,8 @@ impl SessionSetup {
             beside,
             handover,
             types_under_hand,
+            builtin_duties,
+            confirms_agent,
             ledger_path,
             approval_env,
             reconnect,
@@ -234,6 +250,13 @@ impl SessionSetup {
         w.opt_text("beside", beside.as_deref());
         w.shown("handover", handover.0.is_some());
         w.shown("types_under_hand", types_under_hand);
+        // Omitting the default preserves existing tape setup bytes and old replay behavior.
+        if *builtin_duties {
+            w.shown("builtin_duties", true);
+        }
+        if *confirms_agent {
+            w.shown("confirms_agent", true);
+        }
         w.opt_path("ledger", ledger_path.as_deref(), roots);
         w.duration("reconnect", *reconnect);
         w.duration("pause", *pause);
@@ -292,6 +315,7 @@ impl SessionSetup {
             progress,
             reset_grace,
             reset_jitter,
+            reset_minute,
             auto_resume_grace,
             limit_backoff,
             entitlement_backoff,
@@ -319,6 +343,11 @@ impl SessionSetup {
         w.duration("turn_end.credits_bound", *credits_bound);
         w.duration("turn_end.outage_first", *outage_first);
         w.duration("turn_end.outage_cap", *outage_cap);
+        // Only a scaled minute is written: a shipped run's header keeps its bytes, and every tape
+        // without the row ran with resets where their words name them.
+        if *reset_minute != RESET_MINUTE {
+            w.duration("turn_end.reset_minute", *reset_minute);
+        }
         w.opt_duration("person_hold_wait", *person_hold_wait);
         w.duration("beside_idle_min", *beside_idle_min);
         w.duration("occupancy.nudge_after", *occupancy_nudge_after);
@@ -365,6 +394,12 @@ impl SessionSetup {
                 .then(|| Arc::new(AtomicBool::new(false))),
         );
         let types_under_hand = r.or_shipped("types_under_hand", false, Reader::parsed::<bool>)?;
+        let builtin_duties = r
+            .optional_parsed::<bool>("builtin_duties")?
+            .unwrap_or(false);
+        let confirms_agent = r
+            .optional_parsed::<bool>("confirms_agent")?
+            .unwrap_or(false);
         let ledger_path = r.opt_io_path("ledger", roots)?;
         let reconnect = r.duration("reconnect")?;
         let pause = r.duration("pause")?;
@@ -419,6 +454,9 @@ impl SessionSetup {
             progress: r.duration("turn_end.progress")?,
             reset_grace: r.duration("turn_end.reset_grace")?,
             reset_jitter: r.duration("turn_end.reset_jitter")?,
+            reset_minute: r
+                .optional_duration("turn_end.reset_minute")?
+                .unwrap_or(RESET_MINUTE),
             auto_resume_grace: r.duration("turn_end.auto_resume_grace")?,
             limit_backoff: r.durations("turn_end.limit_backoff")?,
             entitlement_backoff: r.durations("turn_end.entitlement_backoff")?,
@@ -471,6 +509,8 @@ impl SessionSetup {
             beside,
             handover,
             types_under_hand,
+            builtin_duties,
+            confirms_agent,
             ledger_path,
             approval_env,
             reconnect,

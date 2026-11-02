@@ -182,17 +182,18 @@ mod tests {
         let uid = unsafe { libc::getuid() };
         let record = super::shell_of(uid).map(|s| s.display().to_string());
         let decoy = "/nonexistent/aterm-uds-decoy-shell";
-        let out = crate::spawnfd::command(std::env::current_exe().expect("the test binary"))
-            .args([
-                "account::tests::a_uid_s_login_shell_comes_from_the_account_record",
-                "--exact",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(LOGIN_SHELL_CHILD_ENV, "1")
-            .env("SHELL", decoy)
-            .output()
-            .expect("run this test binary again as the child");
+        let out = crate::deadline::ends_within(
+            crate::spawnfd::command(std::env::current_exe().expect("the test binary"))
+                .args([
+                    "account::tests::a_uid_s_login_shell_comes_from_the_account_record",
+                    "--exact",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(LOGIN_SHELL_CHILD_ENV, "1")
+                .env("SHELL", decoy),
+            crate::deadline::ECHO_HANG,
+        );
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(out.status.success(), "{out:?}");
         let said = stdout

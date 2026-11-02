@@ -47,14 +47,34 @@ pub struct Snapshot {
     pub operations: Vec<Operation>,
 }
 
+impl Snapshot {
+    /// All locally retained operations have usable membership, ancestry and
+    /// payloads. The store's withheld count includes missing causal parents.
+    /// This makes no claim about operations this replica has not seen.
+    pub fn history_complete(&self) -> bool {
+        self.withheld == 0
+            && self
+                .operations
+                .iter()
+                .all(|op| op.available && op.refusal.is_none())
+    }
+}
+
 pub(crate) struct Log {
     scope: Scope,
     retained: usize,
+    append_bound: usize,
     index: Index,
     records: BTreeMap<Digest, (Operation, Option<Command>)>,
     conflicts: BTreeSet<Digest>,
     opaque_authors: BTreeSet<Actor>,
 }
+
+fn decode_with_merge(payload: &[u8], application: fn(&[u8]) -> Result<Command>) -> Result<Command> {
+    application(payload)
+        .or_else(|error| crate::documents::application::decode_merge(payload).ok_or(error))
+}
+
 impl Log {
     #[cfg_attr(
         any(test, debug_assertions),
@@ -78,15 +98,17 @@ impl Log {
         scope: Scope,
         decode: fn(&[u8]) -> Result<Command>,
     ) -> Result<Self> {
+        let (metadata, append_bound) = store.metadata_with_append_bound(session)?;
         let mut log = Self {
             scope,
             retained: 0,
+            append_bound,
             index: Index::new(crate::database::MAX_RECORDS * 2),
             records: BTreeMap::new(),
             conflicts: BTreeSet::new(),
             opaque_authors: BTreeSet::new(),
         };
-        for evidence in store.metadata_evidence(session)? {
+        for evidence in metadata {
             let header = evidence.header;
             let id = header.id;
             log.index
@@ -94,7 +116,7 @@ impl Log {
                 .map_err(|_| Error::new("invalid proposal causal history"))?;
             let available = evidence.record.is_some();
             let (command, refusal) = match &evidence.record {
-                Some(record) => match decode(record.payload()) {
+                Some(record) => match decode_with_merge(record.payload(), decode) {
                     Ok(command) => (Some(command), None),
                     Err(error) => (None, Some(error.0)),
                 },
@@ -211,18 +233,21 @@ impl Log {
             {
                 continue;
             }
-            crate::documents::apply(
-                &self.index,
-                &mut cells,
-                id,
-                command.changes().unwrap(),
-                true,
-            );
+            if !matches!(command, Command::Merge { .. }) {
+                crate::documents::apply(
+                    &self.index,
+                    &mut cells,
+                    id,
+                    command.changes().unwrap(),
+                    true,
+                );
+            }
             eligible.insert(id);
         }
         (cells, refusals, eligible)
     }
-    /// Every eligible operation with its decoded command, in record-id order. An application
+    /// Every eligible business record with its decoded command, in record-id order.
+    /// Causal-only merges remain in snapshots and dependencies, not this list. An application
     /// whose records are append-only per writer reads these, never the cells, whose causal
     /// replacement would let one writer's record hide another's.
     pub(crate) fn eligible(&self) -> Vec<(Operation, Command)> {
@@ -230,8 +255,9 @@ impl Log {
         self.records
             .iter()
             .filter(|(id, _)| eligible.contains(*id))
-            .filter_map(|(_, (operation, command))| {
-                command.clone().map(|command| (operation.clone(), command))
+            .filter_map(|(_, (operation, command))| match command {
+                Some(Command::Merge { .. }) | None => None,
+                Some(command) => Some((operation.clone(), command.clone())),
             })
             .collect()
     }
@@ -285,6 +311,12 @@ impl Log {
             .count();
         (self.retained, by_actor)
     }
+
+    /// Maximum records the observed local writer needs for one append,
+    /// including causal joins. Re-read after any write before admitting another.
+    pub(crate) fn append_records_bound(&self) -> usize {
+        self.append_bound
+    }
     pub(crate) fn retry(&self, actor: Actor, command: &Command) -> Result<Option<Digest>> {
         let mut first = None;
         for (id, (operation, old)) in &self.records {
@@ -336,7 +368,10 @@ impl Log {
             .get(&target)
             .and_then(|(_, c)| c.as_ref())
             .ok_or_else(|| Error::new("target is not a supported retained proposal"))?;
-        let changes = command.changes().unwrap();
+        let changes = command
+            .changes()
+            .filter(|changes| !changes.is_empty())
+            .ok_or_else(|| Error::new("target proposal has no value changes to revert"))?;
         let current = self.snapshot();
         if !current
             .operations

@@ -123,7 +123,7 @@ pub fn plist_string(plist: &str, key: &str) -> Option<String> {
     let after = plist.find(&key_tag)? + key_tag.len();
     let sstart = after + plist[after..].find("<string>")? + "<string>".len();
     let send = sstart + plist[sstart..].find("</string>")?;
-    if plist[after..sstart - "<string>".len()].contains("<key>") {
+    if !plist[after..sstart - "<string>".len()].trim().is_empty() {
         return None;
     }
     // Decode `&amp;` last so `"&amp;lt;"` decodes to `"&lt;"`.
@@ -133,4 +133,21 @@ pub fn plist_string(plist: &str, key: &str) -> Option<String> {
             .replace("&gt;", ">")
             .replace("&amp;", "&"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plist_string_requires_adjacent_string_tag_after_key() {
+        let plist = "<plist><dict>\n\
+            \t<key>Flag</key>\n\t<false/>\n\
+            \t<key>Items</key>\n\t<array><string>item-zero</string></array>\n\
+            \t<key>Name</key>\n\t<string>a &amp;lt; b</string>\n\
+            </dict></plist>";
+        assert_eq!(plist_string(plist, "Name").as_deref(), Some("a &lt; b"));
+        assert_eq!(plist_string(plist, "Flag"), None);
+        assert_eq!(plist_string(plist, "Items"), None);
+    }
 }

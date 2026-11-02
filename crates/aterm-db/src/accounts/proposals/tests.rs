@@ -15,7 +15,7 @@ use std::{net::TcpListener, thread, time::Duration};
 fn app(lab: &Lab, n: usize) -> Proposals {
     Proposals::at(lab.paths[n].clone())
 }
-fn account(plan: &str) -> Change {
+pub(super) fn account(plan: &str) -> Change {
     Change {
         collection: "accounts".into(),
         key: "one".into(),
@@ -24,6 +24,64 @@ fn account(plan: &str) -> Change {
             "email":"Alias@example.test","auth":[{"kind":"email-link","mailbox":"inbox","requirements":["email-access"]}]}),
         ),
     }
+}
+
+#[test]
+fn guarded_metadata_replacement_retries_exactly_and_preserves_later_edits() {
+    let lab = Lab::new(&[Role::Writer]);
+    let db = app(&lab, 0);
+    let first = db.write([1; 16], vec![account("initial")]).unwrap();
+    let replacement = account("replacement").value.unwrap();
+    let changed = db
+        .replace_if_current([2; 16], "accounts", "one", first.id, replacement.clone())
+        .unwrap();
+    let retry = db
+        .replace_if_current([2; 16], "accounts", "one", first.id, replacement.clone())
+        .unwrap();
+    assert_eq!(changed.id, retry.id);
+    db.write([3; 16], vec![account("later")]).unwrap();
+    let before = db.snapshot().unwrap();
+    assert!(
+        db.replace_if_current([4; 16], "accounts", "one", changed.id, replacement)
+            .is_err()
+    );
+    let after = db.snapshot().unwrap();
+    assert_eq!(before.cells, after.cells);
+    assert_eq!(before.retained, after.retained);
+}
+
+#[test]
+fn metadata_create_only_keeps_retry_identity_and_refuses_rows_or_tombstones() {
+    let lab = Lab::new(&[Role::Writer]);
+    let db = app(&lab, 0);
+    db.initialize().unwrap();
+    let value = account("initial").value.unwrap();
+    let first = db
+        .create_if_absent([1; 16], "accounts", "one", value.clone())
+        .unwrap();
+    assert_eq!(
+        db.create_if_absent([1; 16], "accounts", "one", value.clone())
+            .unwrap()
+            .id,
+        first.id
+    );
+    assert!(
+        db.create_if_absent([2; 16], "accounts", "one", value.clone())
+            .is_err()
+    );
+    db.write(
+        [3; 16],
+        vec![Change {
+            collection: "accounts".into(),
+            key: "one".into(),
+            value: None,
+        }],
+    )
+    .unwrap();
+    assert!(
+        db.create_if_absent([4; 16], "accounts", "one", value)
+            .is_err()
+    );
 }
 
 #[test]
@@ -168,6 +226,123 @@ fn raw(lab: &Lab, n: usize, payload: &[u8]) -> Receipt {
     )
     .unwrap();
     store.commit_catalog(&session, payload).unwrap()
+}
+
+pub(super) fn retained_wire(lab: &Lab, n: usize, id: &[u8; 32]) -> Vec<u8> {
+    let bootstrap = lab.bootstrap(n);
+    let session = Session::open(&bootstrap).unwrap();
+    let descriptor = descriptor(&bootstrap).unwrap();
+    let directory = Directory::new(&lab.paths[n], bootstrap.trust());
+    let store = Store::open(
+        &session,
+        &directory.path(descriptor.scope).unwrap(),
+        descriptor.scope,
+    )
+    .unwrap();
+    store.wire(&session, id).unwrap().unwrap().to_vec()
+}
+
+pub(super) fn retain_wire(lab: &Lab, n: usize, wire: &[u8]) {
+    let bootstrap = lab.bootstrap(n);
+    let session = Session::open(&bootstrap).unwrap();
+    let descriptor = descriptor(&bootstrap).unwrap();
+    let directory = Directory::new(&lab.paths[n], bootstrap.trust());
+    let mut store = Store::open(
+        &session,
+        &directory.path(descriptor.scope).unwrap(),
+        descriptor.scope,
+    )
+    .unwrap();
+    store.ingest(&session, wire).unwrap();
+}
+
+pub(super) fn causal_gap_fixture() -> (Lab, Vec<u8>, [u8; 32]) {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    app(&lab, 0)
+        .write(
+            [70; 16],
+            vec![
+                account("local"),
+                Change {
+                    collection: "mailboxes".into(),
+                    key: "inbox".into(),
+                    value: Some(json!({"name":"inbox"})),
+                },
+            ],
+        )
+        .unwrap();
+    app(&lab, 1).initialize().unwrap();
+    let mut other = account("remote");
+    other.key = "unrelated".into();
+    let parent = app(&lab, 1).write([71; 16], vec![other.clone()]).unwrap();
+    let child = app(&lab, 1).write([72; 16], vec![other]).unwrap();
+    retain_wire(&lab, 0, &retained_wire(&lab, 1, &child.id));
+    let parent_wire = retained_wire(&lab, 1, &parent.id);
+    (lab, parent_wire, child.id)
+}
+
+pub(crate) fn pending_snapshot() -> Snapshot {
+    let (lab, _, _) = causal_gap_fixture();
+    app(&lab, 0).snapshot().unwrap()
+}
+
+#[test]
+fn known_missing_ancestry_withholds_plans_but_valid_duplicate_receipts_remain_complete() {
+    let (lab, parent, child) = causal_gap_fixture();
+    let a = app(&lab, 0);
+    let pending = a.snapshot().unwrap();
+    assert_eq!(pending.withheld, 1);
+    assert!(
+        pending
+            .operations
+            .iter()
+            .all(|op| op.available && op.refusal.is_none())
+    );
+    assert!(
+        !pending
+            .operations
+            .iter()
+            .find(|op| op.header.id == child)
+            .unwrap()
+            .catalog_eligible
+    );
+    assert!(!pending.history_complete());
+    let plan = a.plan("one").unwrap();
+    assert_eq!(plan["complete"], json!(false));
+    assert!(plan["configuration_digest"].is_null());
+    assert!(
+        plan["blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str() == Some("incomplete-observed-history"))
+    );
+    retain_wire(&lab, 0, &parent);
+    assert!(a.snapshot().unwrap().history_complete());
+    assert_eq!(a.plan("one").unwrap()["complete"], json!(true));
+    let mut other = account("remote");
+    other.key = "unrelated".into();
+    let duplicate = raw(
+        &lab,
+        1,
+        &encode(&Command::Write {
+            request: [71; 16],
+            changes: vec![other],
+        })
+        .unwrap(),
+    );
+    retain_wire(&lab, 0, &retained_wire(&lab, 1, &duplicate.id));
+    let complete = a.snapshot().unwrap();
+    let receipt = complete
+        .operations
+        .iter()
+        .find(|op| op.header.id == duplicate.id)
+        .unwrap();
+    assert!(receipt.duplicate_of.is_some());
+    assert!(!receipt.eligible);
+    assert!(receipt.catalog_eligible);
+    assert!(complete.history_complete());
+    assert_eq!(a.plan("one").unwrap()["complete"], json!(true));
 }
 
 #[test]
@@ -819,10 +994,9 @@ fn retained_request_evidence_conforms_through_withdrawal_and_quarantine() {
     let model = aterm_models_db::proposal_evidence_model();
     assert!(aterm_spec::interp::prove_and_catch(&model) > 1);
     // Each action is its own two-machine lab: run them side by side.
-    let observed =
-        aterm_spec::check::each_on(aterm_spec::fs_lane::PLACES, &model.actions, |action| {
-            evidence_transition(&model.init_state(), action.name)
-        });
+    let observed = aterm_spec::fs_lane::each(&model.actions, |action| {
+        evidence_transition(&model.init_state(), action.name)
+    });
     for (action, next) in model.actions.iter().zip(observed) {
         assert!(
             model

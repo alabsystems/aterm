@@ -242,6 +242,7 @@ fn every_admitted_tick_pushes_within_its_budget_and_never_reallocates() {
             intensity: 0.02 + rng.unit() * 0.98,
             hue: rng.next() as u32,
             block: rng.below(2) == 0,
+            bar: false,
             glyph_span: (rng.below(3) != 0).then_some((first, end)),
             ..config(dark, rng.next() as u32 & 0x00FF_FFFF)
         };

@@ -60,10 +60,12 @@ pub(crate) fn take_frame() -> Option<Vec<u8>> {
 
 /// The bytes `len=<v>` announces, or the reply to a length the server will not read.
 pub(crate) fn frame_len(v: &str, agent: &str) -> Result<usize, String> {
+    if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(crate::control::control_media::spawn_usage());
+    }
     match v.parse::<usize>() {
         Ok(n) if n <= TASK_MAX => Ok(n),
-        _ if !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) => Err(too_large(v, agent)),
-        _ => Err(crate::control::control_media::spawn_usage()),
+        _ => Err(too_large(v, agent)),
     }
 }
 
@@ -163,22 +165,42 @@ impl TaskOrder {
 }
 
 /// The ONE LINE OF FACT a worker's task gains (design §2.1; never an order — the primer's rule).
-pub(crate) fn fact_line(from: &str, autopilot: Autopilot, agent: &str) -> String {
+/// Under Land it names the land check only where aterm types one ([`land_check_answered`]).
+pub(crate) fn fact_line(from: &str, autopilot: Autopilot, agent: aterm_phase::Program) -> String {
     let end = match autopilot {
         Autopilot::Cruise => format!(
             "under Autopilot Cruise: no report ends the work, and `{from}` reads its progress \
              from this session"
         ),
-        Autopilot::Land | Autopilot::Off => format!(
-            "under Autopilot Land: the work ends once all of it is on the remote main branch \
-             and a reply defends that in a few lines starting `Nothing left:`, and that report \
-             is returned verbatim to `{from}` as your result"
-        ),
+        Autopilot::Land | Autopilot::Off => {
+            let defends = "a reply defends that in a few lines starting `Nothing left:`";
+            let ends = match land_check_answered(agent) {
+                Some(answer) => format!("{defends} and the agent {answer}"),
+                None => defends.to_owned(),
+            };
+            format!(
+                "under Autopilot Land: the work ends once all of it is on the remote main branch, \
+                 {ends}, and that defense is returned verbatim to `{from}` as your result"
+            )
+        }
     };
     format!(
-        "(Started by `{from}` with `spawn agent={agent}`, {end}. A line starting `NEEDS YOU:` \
-         reaches `{from}` and the person while the work goes on.)"
+        "(Started by `{from}` with `spawn agent={}`, {end}. A line starting `NEEDS YOU:` \
+         reaches `{from}` and the person while the work goes on.)",
+        agent.name()
     )
+}
+
+/// WHETHER ATERM TYPES `agent` THE LAND CHECK, the answer its Land then ends on
+/// ([`aterm_primer::LAND_CHECK_ANSWER`]): only aterm's own loop types it (v6 §14.17.13), into the
+/// programs it carries. codex-alab supervises itself, its own Land reading the defense, and the
+/// loop types nothing into it; no loop carries the others (the post-landing review, 2026-11-01).
+const fn land_check_answered(agent: aterm_phase::Program) -> Option<&'static str> {
+    use aterm_phase::Program;
+    match agent {
+        Program::Claude | Program::Agy | Program::Muse => Some(aterm_primer::LAND_CHECK_ANSWER),
+        Program::Codex | Program::Grok | Program::Kimi | Program::Generic => None,
+    }
 }
 
 /// What a worker's task file holds: the task as given (less its blank lines for a worker whose
@@ -204,7 +226,7 @@ pub(crate) fn task_text(
         if blank_lines {
             text.push(b'\n');
         }
-        text.extend_from_slice(fact_line(from, autopilot, agent.name()).as_bytes());
+        text.extend_from_slice(fact_line(from, autopilot, agent).as_bytes());
         text.push(b'\n');
     }
     text
@@ -565,16 +587,11 @@ fn pool_opening(
     accounts_pool::launch_opening(seat, pool, Some(&starter.exe))
 }
 
-/// [`pooled_starter`] through [`pool_attempts`] for `work`: a hold is noted on its launch record
-/// and marks its session as its launcher's still ([`InstallingMark`]) until the launch starts or
-/// stalls, so the startup deadline does not judge a worker whose line is not typed yet; each wait
-/// ends early where the session ends.
-fn pooled_starter_held(
-    work: &Launch,
-    starter: aterm_agent::harness::worker::Starter,
-    cli: &aterm_agent::harness::worker::WorkerCli,
-) -> Result<aterm_agent::harness::worker::Starter, String> {
-    let alive = || {
+fn pool_wait_for<'a>(
+    work: &'a Launch,
+    held_because: &'static str,
+) -> impl FnMut(&PoolWait) -> bool + 'a {
+    let alive = move || {
         work.store
             .read()
             .unwrap_or_else(|p| p.into_inner())
@@ -584,45 +601,58 @@ fn pooled_starter_held(
     let mut mark = None;
     let mut noted = None;
     let mut sub = None;
+    move |next| match next {
+        PoolWait::Retry(pause) => {
+            std::thread::sleep(*pause);
+            alive()
+        }
+        PoolWait::Hold { until, why, look } => {
+            if noted != Some(*until) {
+                noted = Some(*until);
+                note_launch(
+                    &work.ctx,
+                    format!(
+                        "held until {} ({why}): {held_because}",
+                        aterm_types::rfc3339::format_rfc3339(u64::try_from(*until).unwrap_or(0))
+                    ),
+                );
+            }
+            mark.get_or_insert_with(|| InstallingMark::of(&work.ctx));
+            let sub = sub.get_or_insert_with(|| {
+                crate::session_watch::Subscription::single(&work.ctx.watchers)
+            });
+            let now = Instant::now();
+            let end = now
+                .checked_add(*look)
+                .unwrap_or_else(|| now + std::time::Duration::from_secs(365 * 24 * 3600));
+            loop {
+                if !alive() {
+                    return false;
+                }
+                let left = end.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return true;
+                }
+                let _ = sub.wait(left);
+            }
+        }
+    }
+}
+
+/// [`pooled_starter`] through [`pool_attempts`] for `work`: a hold is noted on its launch record
+/// and marks its session as its launcher's still ([`InstallingMark`]) until the launch starts or
+/// stalls, so the startup deadline does not judge a worker whose line is not typed yet; each wait
+/// ends early where the session ends.
+fn pooled_starter_held(
+    work: &Launch,
+    starter: aterm_agent::harness::worker::Starter,
+    cli: &aterm_agent::harness::worker::WorkerCli,
+) -> Result<aterm_agent::harness::worker::Starter, String> {
     pool_attempts(
         || pooled_starter(starter.clone(), cli, work.local),
         || pool_opening(&PoolSeat::here()?.seat(), &starter, cli),
         PoolSeat::unix_now,
-        |next| match next {
-            PoolWait::Retry(pause) => {
-                std::thread::sleep(*pause);
-                alive()
-            }
-            PoolWait::Hold { until, why, look } => {
-                if noted != Some(*until) {
-                    noted = Some(*until);
-                    note_launch(
-                        &work.ctx,
-                        format!(
-                            "held until {} ({why}): no account of its pool can take it now",
-                            aterm_types::rfc3339::format_rfc3339(
-                                u64::try_from(*until).unwrap_or(0)
-                            )
-                        ),
-                    );
-                }
-                mark.get_or_insert_with(|| InstallingMark::of(&work.ctx));
-                let sub = sub.get_or_insert_with(|| {
-                    crate::session_watch::Subscription::single(&work.ctx.watchers)
-                });
-                let end = Instant::now() + *look;
-                loop {
-                    if !alive() {
-                        return false;
-                    }
-                    let left = end.saturating_duration_since(Instant::now());
-                    if left.is_zero() {
-                        return true;
-                    }
-                    let _ = sub.wait(left);
-                }
-            }
-        },
+        pool_wait_for(work, "no account of its pool can take it now"),
     )
 }
 
@@ -696,6 +726,19 @@ fn run_worker_launch(work: &Launch) {
         }
     };
     let caller = admitted.starter();
+    let rotated = match agy_rotation_held(work, caller) {
+        Ok(rotated) => {
+            if let Some(pick) = &rotated {
+                note_launch(&work.ctx, format!("agy quota: {}", pick.describe()));
+            }
+            rotated
+        }
+        Err(why) => {
+            note_launch(&work.ctx, format!("agy quota: {why}"));
+            stall(work, &why);
+            return;
+        }
+    };
     let prompt = match await_first_prompt(work) {
         Ok(prompt) => prompt,
         Err(why) => {
@@ -708,14 +751,6 @@ fn run_worker_launch(work: &Launch) {
         work.trusted_cwd.as_deref(),
         || shell_cwd(&work.store, &work.ctx),
     );
-    let rotated = agy_rotation(work, caller);
-    if let Some(pick) = &rotated {
-        note_launch(&work.ctx, format!("agy quota: {}", pick.describe()));
-        if pick.model().is_none() {
-            stall(work, &pick.describe());
-            return;
-        }
-    }
     let model = match &rotated {
         Some(aterm_agent::harness::agy_quota::Pick::Rotate { to, .. }) => Some(to.as_str()),
         _ => work.model.as_deref(),
@@ -727,7 +762,9 @@ fn run_worker_launch(work: &Launch) {
         .trusted_cwd
         .as_deref()
         .is_some_and(|cwd| aterm_agent::harness::disk::fence::is_worker_folder(Path::new(cwd)));
-    let fresh = worker_fresh(model, here, disk_worker, work.chrome);
+    let config = crate::app_config::config_path();
+    let mut fresh = worker_fresh(model, here, disk_worker, work.chrome);
+    fresh.config = config.as_deref();
     let line = aterm_agent::harness::worker::line(cli, work.dialect, &admitted, &fresh);
     match line {
         Ok(line) => {
@@ -795,6 +832,7 @@ pub(crate) fn worker_fresh(
     chrome: bool,
 ) -> aterm_agent::harness::worker::Fresh<'_> {
     aterm_agent::harness::worker::Fresh {
+        config: None,
         model,
         trusted_here: here,
         permission_mode: (disk_worker || chrome).then_some("default"),
@@ -896,10 +934,20 @@ pub(crate) fn held_in(
     if cfg.exclude().iter().any(|e| e == program) {
         return Some("`[packages] exclude` in aterm.toml names it".to_string());
     }
-    if layout.is_some_and(|layout| layout.removed_programs().contains(program)) {
-        return Some(format!(
-            "a person removed it (`aterm pkg install {program}` brings it back)"
-        ));
+    if let Some(layout) = layout {
+        match layout.removed_programs() {
+            Ok(removed) if removed.contains(program) => {
+                return Some(format!(
+                    "a person removed it (`aterm pkg install {program}` brings it back)"
+                ));
+            }
+            Err(error) => {
+                return Some(format!(
+                    "removal decisions are unreadable: {error}; installation is held"
+                ));
+            }
+            Ok(_) => {}
+        }
     }
     if let Some(off) =
         layout.and_then(|layout| atpkg::adoption::unattended_install_off(layout, cfg))
@@ -1145,12 +1193,39 @@ pub(crate) fn task_moved_on(ctx: &SessionCtx) -> Option<String> {
     }
 }
 
-/// An agy worker's model after quota rotation ([`aterm_agent::harness::agy_quota_store::rotate_worker`]):
-/// `None` for another agent, with rotation off, or when agy's quota could not be read.
-fn agy_rotation(
+/// Choose an agy worker's model through [`pool_attempts`]: a [`aterm_agent::harness::agy_quota::Pick::Wait`]
+/// with a known refill (`opening` returns `Some(until)`) holds the launch until that refill (or an
+/// earlier pool change), then reads again; a wait with no refill (`opening` is `None`) retries and
+/// returns its refusal.
+pub(crate) fn agy_pick_attempts(
+    mut rotate: impl FnMut(i64) -> Option<aterm_agent::harness::agy_quota::Pick>,
+    mut opening: impl FnMut(i64) -> Option<i64>,
+    now: impl Fn() -> Option<i64>,
+    wait: impl FnMut(&PoolWait) -> bool,
+) -> Result<Option<aterm_agent::harness::agy_quota::Pick>, String> {
+    pool_attempts(
+        || {
+            let pick = rotate(now().unwrap_or(0));
+            if let Some(aterm_agent::harness::agy_quota::Pick::Wait { .. }) = &pick {
+                return Err(pick
+                    .as_ref()
+                    .map_or_else(String::new, aterm_agent::harness::agy_quota::Pick::describe));
+            }
+            Ok(pick)
+        },
+        || opening(now().unwrap_or(0)),
+        &now,
+        wait,
+    )
+}
+
+/// An agy worker's model after quota rotation ([`aterm_agent::harness::agy_quota_store::rotate_worker`]),
+/// held through [`agy_pick_attempts`] while every agy model pool is spent: `Ok(None)` for another
+/// agent, with rotation off, or when agy's quota could not be read.
+fn agy_rotation_held(
     work: &Launch,
     caller: &aterm_agent::harness::worker::Starter,
-) -> Option<aterm_agent::harness::agy_quota::Pick> {
+) -> Result<Option<aterm_agent::harness::agy_quota::Pick>, String> {
     use aterm_phase::Program;
     match work.agent {
         Program::Agy => {}
@@ -1160,19 +1235,32 @@ fn agy_rotation(
         | Program::Kimi
         | Program::Muse
         | Program::Generic => {
-            return None;
+            return Ok(None);
         }
     }
     let flags = caller.args.clone().unwrap_or_default();
-    let now = aterm_agent::supervise::limit::unix_now();
-    aterm_agent::harness::agy_quota_store::rotate_worker(
-        work.model.as_deref(),
-        &caller.exe,
-        &caller.env,
-        &flags,
-        now,
+    agy_pick_attempts(
+        |now| {
+            aterm_agent::harness::agy_quota_store::rotate_worker(
+                work.model.as_deref(),
+                &caller.exe,
+                &caller.env,
+                &flags,
+                now,
+            )
+            .map(|l| l.pick)
+        },
+        |now| {
+            aterm_agent::harness::agy_quota_store::worker_opening(
+                work.model.as_deref(),
+                &caller.env,
+                &flags,
+                now,
+            )
+        },
+        PoolSeat::unix_now,
+        pool_wait_for(work, "every agy model pool is spent"),
     )
-    .map(|l| l.pick)
 }
 
 fn stall(work: &Launch, why: &str) {
@@ -1318,27 +1406,106 @@ fn worker_starter_of(
 /// which would run a row of its own on the default home's login, the pool picks only the row on
 /// that login ([`aterm_agent::harness::accounts_pool::launch_env_for`]) and says from that row's
 /// own condition why it cannot serve where it cannot, and a bound row of its own the starter
-/// carried is refused. Claude Code's workers keep the starter's login, which the host's own flow
-/// moves.
+/// carried is refused. A Claude Code worker starts on the row of the Claude roster the host would
+/// move its starter's tab to ([`claude_starter_in`]).
 fn pooled_starter(
     starter: aterm_agent::harness::worker::Starter,
     cli: &aterm_agent::harness::worker::WorkerCli,
     local: u64,
 ) -> Result<aterm_agent::harness::worker::Starter, String> {
     use aterm_agent::harness::{accounts, accounts_pool};
-    let Some(pool) = accounts::Cli::of(cli.agent).filter(|c| *c != accounts::Cli::Claude) else {
+    let Some(pool) = accounts::Cli::of(cli.agent) else {
         return Ok(starter);
     };
     let Some(parts) = PoolSeat::here() else {
         return Ok(starter);
     };
-    pooled_starter_in(
-        starter,
-        pool,
-        &parts.seat(),
-        &accounts_pool::LiveUsage,
-        local,
-    )
+    let seat = parts.seat();
+    if pool == accounts::Cli::Claude {
+        return Ok(claude_starter_in(starter, &seat, local));
+    }
+    pooled_starter_in(starter, pool, &seat, &accounts_pool::LiveUsage, local)
+}
+
+/// A Claude Code worker's `starter` onto the row of the Claude roster the host would move the
+/// starter's tab to at its next point ([`aterm_agent::harness::accounts::worker_row`], under
+/// `[harness] accounts` as Claude Code's pool reads it): `active` where it is another row and
+/// fresh, or pinned and still running; else, where the starter's row is walled (or, under
+/// `"early"`, low and to be left early), the row a wall would move it to, so a worker spawned
+/// from a Limited tab does not start on its wall. The starter is kept as it is where the host
+/// would keep the tab (a canary or a spent rotation bound holding it, a row that still runs
+/// under `"wall"`), its login is no roster row's (a non-default home, an unbound login), the
+/// roster lists one row, rotation is off for Claude Code, or a read fails (logged: a launch
+/// never fails on the accounts' records). The host's own flow moves the worker later, as any tab.
+pub(crate) fn claude_starter_in(
+    starter: aterm_agent::harness::worker::Starter,
+    seat: &aterm_agent::harness::accounts_pool::Seat<'_>,
+    local: u64,
+) -> aterm_agent::harness::worker::Starter {
+    let pick = match claude_pick(&starter, seat) {
+        Ok(Some(pick)) => pick,
+        Ok(None) => return starter,
+        Err(why) => {
+            aterm_log::info!(
+                "worker session {local}: keeps its starter's Claude Code login: the accounts \
+                 could not be read: {why}"
+            );
+            return starter;
+        }
+    };
+    let cli = aterm_agent::harness::accounts::Cli::Claude;
+    match pool_onto(starter.clone(), cli, &pick.1, seat.home) {
+        Ok(onto) => {
+            aterm_log::info!(
+                "worker session {local}: starts under Claude Code account {}, where the host \
+                 would move its starter's {}",
+                pick.1.label,
+                pick.0
+            );
+            onto
+        }
+        Err(why) => {
+            aterm_log::info!(
+                "worker session {local}: keeps its starter's Claude Code login: {why}"
+            );
+            starter
+        }
+    }
+}
+
+/// The starter's row and the login [`claude_starter_in`] moves a worker to, or `None` where it
+/// keeps the starter's.
+fn claude_pick(
+    starter: &aterm_agent::harness::worker::Starter,
+    seat: &aterm_agent::harness::accounts_pool::Seat<'_>,
+) -> Result<Option<(String, aterm_agent::harness::accounts_pool::LoginEnv)>, String> {
+    use aterm_agent::harness::{accounts, accounts_pool};
+    let cli = accounts::Cli::Claude;
+    let mode = seat.mode_for(cli);
+    if mode == accounts::Mode::Off {
+        return Ok(None);
+    }
+    let who = accounts::ProcessLogin::of_env_for(
+        cli,
+        starter.env.iter().map(|(n, v)| (n.as_str(), v.as_str())),
+    );
+    if !who.default_home || !who.stored_login {
+        return Ok(None);
+    }
+    let roster = seat.bound_roster(cli)?;
+    if roster.rows.len() < 2 {
+        return Ok(None);
+    }
+    let Some(from) = accounts::judged_label(&roster, &who) else {
+        return Ok(None);
+    };
+    let (state, _) = seat.store(cli).load(seat.now)?;
+    let enrolled = accounts::enrolled_for(cli, &roster);
+    let Some(row) = accounts::worker_row(&roster, &state, &enrolled, from, mode, seat.now) else {
+        return Ok(None);
+    };
+    let env = accounts_pool::login_env(cli, row, seat.home).map_err(|why| why.to_string())?;
+    Ok(Some((from.to_owned(), env)))
 }
 
 pub(crate) fn pooled_starter_in(
@@ -1434,7 +1601,7 @@ fn codex_row_runs(
             &why,
             label,
             &default,
-            seat.mode() == accounts::Mode::Off && !seat.keyring_held(pool)
+            seat.mode_for(pool) == accounts::Mode::Off && !seat.keyring_held(pool)
         )
     ))
 }

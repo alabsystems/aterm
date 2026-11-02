@@ -118,7 +118,10 @@ fn mainscreen_waiting(
         }
         _ => {}
     }
-    let deadline = Instant::now() + wait;
+    let now = Instant::now();
+    let deadline = now
+        .checked_add(wait)
+        .unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 3600));
     loop {
         if !crate::term_lock(term).is_alternate_screen() {
             return Some("OK left=1\n".to_string());

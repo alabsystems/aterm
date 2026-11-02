@@ -1020,7 +1020,7 @@ fn a_cmd_runs_detail_waits_for_its_program_and_an_unheard_word_is_never_written(
     }
     assert!(
         log.window()
-            .any(|r| r.is_bus_class() && r.op == aterm_slog::Op::Amend),
+            .any(|r| r.is_mirrored() && r.op == aterm_slog::Op::Amend),
         "the amend is mirrored like the open it refines"
     );
 }
@@ -2763,7 +2763,7 @@ fn a_program_never_closes_after_the_command_that_ran_it() {
         time_order_holds(&got).unwrap_or_else(|e| panic!("d_first={d_first}: {e}: {got:?}"));
         let at_d = got.iter().any(|l| {
             l.contains(&format!(
-                " close r2 prog out=unknown dur_ms=780 src=status conf=strong t={}",
+                " close r2 prog out=ok dur_ms=780 src=status conf=strong t={}",
                 WALL0 + 800
             ))
         }) && got.iter().any(|l| {
@@ -2774,12 +2774,24 @@ fn a_program_never_closes_after_the_command_that_ran_it() {
         });
         assert_eq!(at_d, d_first, "d_first={d_first}: {got:?}");
         if !d_first {
-            assert!(
-                got.iter().any(|l| l.contains(&format!(
-                    " close r1 cmd out=ok dur_ms=995 code=0 src=shell conf=exact t={}",
-                    WALL0 + 1_000
-                ))),
-                "lifted to its child's close: {got:?}"
+            assert_eq!(
+                got[3..],
+                [
+                    format!(
+                        "4 close r2 prog out=unknown dur_ms=980 src=status conf=strong t={}",
+                        WALL0 + 1_000
+                    ),
+                    format!(
+                        "5 amend r2 prog out=ok src=shell conf=strong t={}",
+                        WALL0 + 1_000
+                    ),
+                    format!(
+                        "6 close r1 cmd out=ok dur_ms=995 code=0 src=shell conf=exact t={}",
+                        WALL0 + 1_000
+                    ),
+                ],
+                "it left the front first, so it closed unknown and its command's end amends it; \
+                 the command is lifted to its child's close: {got:?}"
             );
         }
     }
@@ -2952,7 +2964,7 @@ fn a_program_named_after_the_d_keeps_the_runs_in_time_order() {
     let blk2 = cmd_of(&got, 2);
     assert!(
         has(&got, &format!(" open r4 prog par={blk2} prog=ls "), 1_010)
-            && has(&got, " close r4 prog out=unknown dur_ms=10 ", 1_020)
+            && has(&got, " close r4 prog out=ok dur_ms=10 ", 1_020)
             && has(&got, &format!(" close {blk2} cmd out=ok "), 1_020),
         "ls's run closes at ls's D, with its command: {got:?}"
     );
@@ -3195,11 +3207,10 @@ fn an_agent_run_opened_past_a_cut_closes_at_its_commands_d() {
         time_order_holds(&got).unwrap_or_else(|e| panic!("ls_done={ls_done}: {e}: {got:?}"));
         let agent = opened_node(&got, " agent par=- prog=claude ");
         assert!(
-            got.iter().any(
-                |l| l.contains(&format!(" close {agent} agent out=unknown "))
-                    && l.ends_with(&t(2_000))
-            ),
-            "ls_done={ls_done}: the agent run closes at its command's D: {got:?}"
+            got.iter()
+                .any(|l| l.contains(&format!(" close {agent} agent out=ok "))
+                    && l.ends_with(&t(2_000))),
+            "ls_done={ls_done}: the agent run closes at its command's D, with its end: {got:?}"
         );
         let ls = cmd_of(&got, 71);
         assert!(

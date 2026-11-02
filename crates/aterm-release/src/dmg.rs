@@ -4,7 +4,8 @@
 //! Bundle packaging into the release DMG (`aterm-<v>.dmg`) and the updater zip (`aterm-<v>-mac.zip`).
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+
+use aterm_uds::spawnfd::{Command, command};
 
 /// `ditto` switches for a PKZip archive without resource forks, extended attributes, ACLs, or quarantine.
 pub const ARCHIVE_NO_METADATA: [&str; 4] = ["--norsrc", "--noextattr", "--noacl", "--noqtn"];
@@ -87,7 +88,7 @@ pub fn create_zip(app: &Path, out_dir: &Path, short_version: &str) -> Result<Pac
 #[cfg(unix)]
 fn archive_app(app: &Path, zip: &Path) -> Result<(), String> {
     run_quiet(
-        Command::new("/usr/bin/ditto")
+        command("/usr/bin/ditto")
             .args(["-c", "-k"])
             .args(ARCHIVE_NO_METADATA)
             .arg("--keepParent")
@@ -100,7 +101,7 @@ fn archive_app(app: &Path, zip: &Path) -> Result<(), String> {
 /// Refuses a zip containing `__MACOSX/` or `._` AppleDouble metadata entries.
 #[cfg(unix)]
 pub fn assert_zip_has_no_metadata(zip: &Path) -> Result<(), String> {
-    let out = Command::new("/usr/bin/zipinfo")
+    let out = command("/usr/bin/zipinfo")
         .arg("-1")
         .arg(zip)
         .output()
@@ -155,7 +156,7 @@ fn archive_app(_app: &Path, _zip: &Path) -> Result<(), String> {
 #[cfg(unix)]
 fn copy_into_stage(app: &Path, stage: &Path) -> Result<(), String> {
     run_quiet(
-        Command::new("/bin/cp").arg("-RX").arg(app).arg(stage),
+        command("/bin/cp").arg("-RX").arg(app).arg(stage),
         "cp -RX app into DMG stage",
     )
 }
@@ -168,7 +169,7 @@ fn build_in_stage(app: &Path, stage: &Path, volname: &str, dmg: &Path) -> Result
 
     println!("==> hdiutil create {} (UDZO)", dmg.display());
     run_quiet(
-        Command::new(aterm_uds::os_path!("hdiutil"))
+        command(aterm_uds::os_path!("hdiutil"))
             .arg("create")
             .args(["-volname", volname])
             .arg("-srcfolder")
@@ -216,10 +217,9 @@ fn run_quiet(cmd: &mut Command, what: &str) -> Result<(), String> {
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
-    use super::{archive_app, assert_zip_has_no_metadata, copy_into_stage};
+    use super::{archive_app, assert_zip_has_no_metadata, command, copy_into_stage};
     use std::collections::BTreeSet;
     use std::path::Path;
-    use std::process::Command;
 
     fn tagged_app(root: &Path) -> std::path::PathBuf {
         let app = root.join("aterm.app");
@@ -228,7 +228,7 @@ mod tests {
         std::os::unix::fs::symlink("aterm", app.join("Contents/MacOS/aterm-ctl")).unwrap();
         std::fs::write(app.join("Contents/Info.plist"), b"<plist/>").unwrap();
         for file in ["Contents/MacOS/aterm", "Contents/Info.plist"] {
-            let out = Command::new("/usr/bin/xattr")
+            let out = command("/usr/bin/xattr")
                 .args(["-w", "user.t", "x"])
                 .arg(app.join(file))
                 .output()
@@ -243,7 +243,7 @@ mod tests {
     }
 
     fn attributes(path: &Path) -> String {
-        let out = Command::new("/usr/bin/xattr")
+        let out = command("/usr/bin/xattr")
             .arg("-lr")
             .arg(path)
             .output()
@@ -252,7 +252,7 @@ mod tests {
     }
 
     fn attribute_names(path: &Path) -> BTreeSet<String> {
-        let out = Command::new("/usr/bin/xattr")
+        let out = command("/usr/bin/xattr")
             .arg("-r")
             .arg(path)
             .output()
@@ -297,7 +297,7 @@ mod tests {
         );
 
         let sequestered = dir.path().join("sequestered.zip");
-        let out = Command::new("/usr/bin/ditto")
+        let out = command("/usr/bin/ditto")
             .args(["-c", "-k", "--sequesterRsrc", "--keepParent"])
             .arg(&app)
             .arg(&sequestered)
@@ -307,7 +307,7 @@ mod tests {
         let err = assert_zip_has_no_metadata(&sequestered).unwrap_err();
         assert!(err.contains("__MACOSX/"), "{err}");
         let doubled = dir.path().join("doubled.zip");
-        let out = Command::new("/usr/bin/ditto")
+        let out = command("/usr/bin/ditto")
             .args(["-c", "-k", "--keepParent"])
             .arg(&app)
             .arg(&doubled)

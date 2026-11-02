@@ -1583,6 +1583,7 @@ fn the_disk_row_with_the_harness_off() {
     let loc = Locale {
         platform: Platform::MacOs,
         utc_offset_s: 0,
+        utc_offset_at: None,
     };
     let said: Vec<String> = words::details(Resource::Disk, &snap, &loc)
         .into_iter()
@@ -2042,6 +2043,129 @@ fn with_no_window_the_disk_look_reads_once_and_the_board_names_the_hung_call() {
     assert_eq!(asked(&rx), 0, "nothing more within the tick");
 }
 
+/// A focused window that rests reads as one in the background: a reading every five seconds.
+/// Its own frame stirs nothing; a key in it wakes it, and the next reading is due at once, at the
+/// focused cadence.
+#[cfg(unix)]
+#[test]
+fn a_resting_focused_window_reads_every_five_seconds_and_a_stir_asks_at_once() {
+    static BOARD: JobsBoard = JobsBoard::new();
+    let _bars = crate::stats_deck::tests::attach_stats();
+    let mut app = crate::App::headless_for_test();
+    let rx = with_reader(&mut app, &BOARD);
+    // Rest is for a window on screen: a headless instance's never rests. It is off unless set.
+    app.headless = false;
+    app.config.idle_rest_secs = Some(30.0);
+    let wid = crate::WindowId(0);
+    app.windows.get_mut(&wid).expect("the window").focused = true;
+    let t0 = Instant::now();
+    assert_eq!(app.vitals_audience(), Audience::Shown);
+    app.service_vitals(t0);
+    assert_eq!(read_req(&rx, "read at once").cadence_ms, 1000);
+
+    let rest_at = t0 + Duration::from_secs(31);
+    app.settle_rest(rest_at);
+    assert_eq!(app.vitals_audience(), Audience::Background);
+    app.service_vitals(rest_at);
+    assert_eq!(read_req(&rx, "the resting reading").cadence_ms, 5000);
+    assert_eq!(app.vitals_deadline(), Some(rest_at + BACKGROUND_PERIOD));
+
+    let stirred = rest_at + Duration::from_secs(2);
+    app.note_rest_event(
+        wid,
+        &aterm_window::event::WindowEvent::RedrawRequested,
+        stirred,
+    );
+    assert!(
+        app.windows[&wid].rest.resting(),
+        "its own frame stirs nothing"
+    );
+    assert_eq!(app.vitals_deadline(), Some(rest_at + BACKGROUND_PERIOD));
+    app.note_rest_event(wid, &crate::window_rest::tests::key(), stirred);
+    assert!(!app.windows[&wid].rest.resting(), "a key wakes it");
+    assert_eq!(app.vitals_audience(), Audience::Shown);
+    assert_eq!(
+        app.vitals_deadline(),
+        Some(stirred),
+        "the woken window's reading is due at once"
+    );
+    app.service_vitals(stirred);
+    assert_eq!(read_req(&rx, "the woken reading").cadence_ms, 1000);
+    assert_eq!(app.vitals_deadline(), Some(stirred + FOCUSED_PERIOD));
+}
+
+/// A woken window asks a reading only where its wake changes the readings' cadence: an unfocused
+/// window that a key or its tab's output wakes asks none, and one that its focus or its tab's
+/// output wakes while focused asks one at once.
+#[cfg(unix)]
+#[test]
+fn only_a_focused_window_that_wakes_asks_a_reading() {
+    static BOARD: JobsBoard = JobsBoard::new();
+    let _bars = crate::stats_deck::tests::attach_stats();
+    let mut app = crate::App::headless_for_test();
+    let _rx = with_reader(&mut app, &BOARD);
+    // Rest is for a window on screen: a headless instance's never rests. It is off unless set.
+    app.headless = false;
+    app.config.idle_rest_secs = Some(30.0);
+    let wid = crate::WindowId(0);
+    app.windows.get_mut(&wid).expect("the window").focused = false;
+    // Window 0's tab shows session 0.
+    let session = 0;
+    let mut at = Instant::now() + Duration::from_secs(31);
+    let rest = |app: &mut crate::App, at: Instant| {
+        app.settle_rest(at);
+        assert!(app.windows[&wid].rest.resting());
+        app.service_vitals(at);
+        assert_eq!(app.vitals_deadline(), Some(at + BACKGROUND_PERIOD));
+    };
+    rest(&mut app, at);
+    at += Duration::from_secs(2);
+    app.note_rest_event(wid, &crate::window_rest::tests::key(), at);
+    assert!(!app.windows[&wid].rest.resting(), "a key wakes it");
+    assert_eq!(
+        app.vitals_deadline(),
+        Some(at - Duration::from_secs(2) + BACKGROUND_PERIOD),
+        "an unfocused window's wake asks no reading"
+    );
+
+    at += Duration::from_secs(31);
+    rest(&mut app, at);
+    at += Duration::from_secs(2);
+    assert!(app.admit_output_redraws(session, at));
+    assert!(
+        !app.windows[&wid].rest.resting(),
+        "its tab's output wakes it"
+    );
+    assert_eq!(
+        app.vitals_deadline(),
+        Some(at - Duration::from_secs(2) + BACKGROUND_PERIOD),
+        "an unfocused window's output wake asks no reading"
+    );
+
+    at += Duration::from_secs(31);
+    rest(&mut app, at);
+    at += Duration::from_secs(2);
+    app.note_rest_event(wid, &aterm_window::event::WindowEvent::Focused(true), at);
+    assert!(!app.windows[&wid].rest.resting(), "its focus wakes it");
+    assert_eq!(
+        app.vitals_deadline(),
+        Some(at),
+        "the focus that wakes it asks a reading at once"
+    );
+
+    app.windows.get_mut(&wid).expect("the window").focused = true;
+    at += Duration::from_secs(31);
+    rest(&mut app, at);
+    at += Duration::from_secs(2);
+    assert!(app.admit_output_redraws(session, at));
+    assert!(!app.windows[&wid].rest.resting());
+    assert_eq!(
+        app.vitals_deadline(),
+        Some(at),
+        "a focused window's output wake asks a reading at once"
+    );
+}
+
 /// With a window showing the bars, their cadence reads at once and then a period on; the disk
 /// watch's look asks nothing, and a jobs view whose engine is fast moves no deadline.
 #[cfg(unix)]
@@ -2156,6 +2280,94 @@ fn a_hidden_deck_reads_the_machine_and_the_engine_reads_whole() {
     assert_eq!(kinds(&rx), [false], "the engine's demand reads whole");
 }
 
+/// A session's close asks one whole reading at once, whatever the pacing, so the leftover pass
+/// reads the closed tab's horizon at the exit edge; the next service asks nothing more.
+/// NEGATIVE CONTROL: drop the close's pull, and the close is read only at the next edge.
+#[test]
+fn the_close_asks_for_a_reading_at_once() {
+    static BOARD: JobsBoard = JobsBoard::new();
+    let mut app = crate::App::headless_for_test();
+    let rx = with_reader(&mut app, &BOARD);
+    let t0 = Instant::now();
+    app.service_vitals(t0);
+    assert_eq!(asked(&rx), 0, "nothing to read");
+    app.retire_session_registration(4242);
+    app.service_vitals(t0);
+    let req = read_req(&rx, "the close's reading");
+    assert!(
+        req.jobs_now && !req.machine_only,
+        "a whole reading the engine looks at"
+    );
+    app.service_vitals(t0);
+    assert_eq!(asked(&rx), 0, "one reading for the close");
+}
+
+/// A close's reading stays owed while the thread's queue is full: the next service, once there
+/// is room, asks it. NEGATIVE CONTROL: forget the close once its ask was tried, and the drained
+/// queue gets no reading for it.
+#[test]
+fn a_close_asked_while_the_queue_is_full_is_asked_again() {
+    static BOARD: JobsBoard = JobsBoard::new();
+    let mut app = crate::App::headless_for_test();
+    let rx = with_reader(&mut app, &BOARD);
+    let tx = app.vitals.tx.clone().expect("the thread's queue");
+    tx.try_send(Msg::Pull).expect("room for a pull");
+    tx.try_send(Msg::Pull).expect("room for a second pull");
+    let t0 = Instant::now();
+    app.retire_session_registration(4242);
+    app.service_vitals(t0);
+    assert_eq!(
+        rx.try_iter().count(),
+        2,
+        "a full queue: the two pulls alone"
+    );
+    app.service_vitals(t0);
+    let req = read_req(&rx, "the close's reading, once there is room");
+    assert!(
+        req.jobs_now && !req.machine_only,
+        "a whole reading the engine looks at"
+    );
+}
+
+/// One drain's later ask never drops what an earlier one asked: a close's whole reading the
+/// engine looks at stays so beside a hidden window's machine-only ask, and a layout's facts ask
+/// no reading of their own. NEGATIVE CONTROL: let the later ask replace the earlier one whole,
+/// and the close's reading is machine-only.
+#[test]
+fn a_later_ask_in_one_drain_keeps_an_earlier_whole_reading() {
+    let mut asked = Asked::default();
+    let mut req = Request::default();
+    asked.take(
+        Msg::Read(Box::new(Request {
+            jobs_now: true,
+            ..Request::default()
+        })),
+        &mut req,
+    );
+    asked.take(
+        Msg::Read(Box::new(Request {
+            machine_only: true,
+            ..Request::default()
+        })),
+        &mut req,
+    );
+    assert!(req.jobs_now && !req.machine_only, "{req:?}");
+    asked.take(Msg::Facts(Box::default()), &mut req);
+    assert!(req.jobs_now && !req.machine_only, "facts ask nothing");
+    let mut next = Asked::default();
+    next.take(
+        Msg::Read(Box::new(Request {
+            machine_only: true,
+            ..Request::default()
+        })),
+        &mut req,
+    );
+    assert!(
+        !req.jobs_now && req.machine_only,
+        "a later drain's ask is its own"
+    );
+}
+
 #[test]
 fn output_with_no_window_reads_and_never_faster_than_the_floor() {
     static BOARD: JobsBoard = JobsBoard::new();
@@ -2183,10 +2395,20 @@ fn output_with_no_window_reads_and_never_faster_than_the_floor() {
     assert_eq!(asked(&rx), 1, "output reads");
 }
 
+/// AN IDLE ATERM WAKES ZERO TIMES WHILE A JOB RUNS (the owner's bar; `system_vitals` is the loop's
+/// fold of [`crate::App::vitals_deadline`]). With no window showing the bars, the reading a typed
+/// command's output asks lands a view whose live job runs (`Demand::Fast`, as a `sleep` in front
+/// reads) or waits in a legitimate wait (`Demand::Slow`): nothing is armed and a minute of the
+/// loop's turns with no edge reads nothing, though `status` still speaks for the job. Its end is
+/// read at the edge it makes (the shell's prompt), and the reading that sees it records the end on
+/// the session's timeline and arms nothing. A view that holds a wait is still read again within
+/// 30 s, since a start raises no edge. NEGATIVE CONTROL: `held_wait_after` arming the engine's
+/// own demand again while a row lives (main's rule from 745a566000 to this fix) arms a reading
+/// 2 s after the adoption, and the first assertion fails.
 #[test]
-fn a_job_with_no_window_is_read_until_it_ends_and_its_end_is_announced() {
+fn an_idle_host_arms_no_system_vitals_deadline_while_a_job_runs_and_reads_its_end_at_its_edge() {
     use aterm_vitals::events::{Event, EventKind};
-    use aterm_vitals::jobs::{Class, Verdict};
+    use aterm_vitals::jobs::{Class, Findings, Verdict};
     static BOARD: JobsBoard = JobsBoard::new();
     let mut app = crate::App::headless_for_test();
     let rx = with_reader(&mut app, &BOARD);
@@ -2199,43 +2421,49 @@ fn a_job_with_no_window_is_read_until_it_ends_and_its_end_is_announced() {
         class,
         ..crate::stats_paint::tests::job_row("j41", verdict, None, Some(1_000))
     };
-    land(
-        &app,
-        1,
-        vec![job(Verdict::Fine, Class::Running)],
-        Demand::Fast,
-    );
-    app.on_vitals_wake();
-    assert!(
-        app.status_job_fields(0)
-            .starts_with("job=fine job_quiet_ms="),
-        "{}",
-        app.status_job_fields(0)
-    );
-    assert!(
-        app.status_job_fields(0).ends_with(NONE_HELD),
-        "{}",
-        app.status_job_fields(0)
-    );
-    let adopted = app.vitals.adopted_at.expect("adopted");
-    assert_eq!(
-        app.vitals_deadline(),
-        Some(adopted + Duration::from_secs(2)),
-        "a running job is read at the engine's cadence"
-    );
-    app.service_vitals(adopted + Duration::from_secs(1));
-    assert_eq!(asked(&rx), 0, "not before its deadline");
-    app.service_vitals(adopted + Duration::from_secs(2));
-    assert_eq!(asked(&rx), 1, "no output, no pull: the job demand reads");
+    for (seq, demand) in [(1, Demand::Fast), (2, Demand::Slow)] {
+        land(&app, seq, vec![job(Verdict::Fine, Class::Running)], demand);
+        app.on_vitals_wake();
+        assert_eq!(
+            app.vitals_deadline(),
+            None,
+            "a live job's {demand:?} demand arms nothing with no window"
+        );
+        let adopted = app.vitals.adopted_at.expect("adopted");
+        for s in 1..=60 {
+            let at = adopted + Duration::from_secs(s);
+            app.service_vitals(at);
+            assert_eq!(
+                asked(&rx),
+                0,
+                "{demand:?}, {s} s on: no edge, no pull, nothing read"
+            );
+            assert_eq!(
+                app.vitals_deadline(),
+                None,
+                "{demand:?}, {s} s on: nothing armed"
+            );
+        }
+        assert!(
+            app.status_job_fields(0)
+                .starts_with("job=fine job_quiet_ms="),
+            "{}",
+            app.status_job_fields(0)
+        );
+    }
 
+    let end = t0 + Duration::from_secs(120);
+    app.vitals.note_edge();
+    app.service_vitals(end);
+    assert_eq!(asked(&rx), 1, "the job's end: its shell's prompt reads");
     land(
         &app,
-        2,
+        3,
         vec![job(Verdict::Exited, Class::Exited)],
         Demand::Idle,
     );
     app.vitals.latest.lock().unwrap().job_events.push(Event {
-        seq: 2,
+        seq: 3,
         at_ns: 0,
         kind: EventKind::Job {
             tab: 0,
@@ -2264,6 +2492,34 @@ fn a_job_with_no_window_is_read_until_it_ends_and_its_end_is_announced() {
     };
     assert_eq!(recorded, ["exited job=j41 class=exited rev=1 code=0"]);
     assert_eq!(app.vitals_deadline(), None, "nothing live: nothing due");
+
+    app.vitals.latest.lock().unwrap().snap = Some(Arc::new(Snapshot {
+        seq: 4,
+        jobs: Some(Arc::new(JobsView {
+            rows: vec![job(Verdict::Fine, Class::Running)],
+            demand: Demand::Fast,
+            findings: Findings {
+                not_started: vec![aterm_vitals::jobs::Named {
+                    pid: 25311,
+                    exec_version: None,
+                    name: "gh".into(),
+                    tab: Some(0),
+                    job: None,
+                    for_ms: 1_000,
+                }],
+                ..Findings::default()
+            },
+            ..JobsView::default()
+        })),
+        ..Snapshot::default()
+    }));
+    app.on_vitals_wake();
+    let adopted = app.vitals.adopted_at.expect("adopted");
+    assert_eq!(
+        app.vitals_deadline(),
+        Some(adopted + Duration::from_secs(30)),
+        "a program that has not started: read again within 30 s"
+    );
 }
 
 /// `status`'s `program_check=` with no program held: `0` on macOS, `-` elsewhere.
@@ -2283,8 +2539,10 @@ fn status_counts_the_programs_held_in_its_sessions_tab() {
     let _rx = with_reader(&mut app, &BOARD);
     let held = |pid, tab| Named {
         pid,
+        exec_version: None,
         name: "git-remote-https".into(),
         tab: Some(tab),
+        job: None,
         for_ms: 1_140_000,
     };
     app.vitals.latest.lock().unwrap().snap = Some(Arc::new(Snapshot {
@@ -2979,7 +3237,9 @@ fn held_wait(app: &crate::App) -> (Option<aterm_vitals::jobs::WaitName>, Demand)
 }
 
 /// With no window, a raw program at its prompt is named `tty-raw` from the loop's terminal word,
-/// read once at the edge and not again in the 20 s (design §6.1, "What arms nothing").
+/// read once at the edge and not again in the 20 s (design §6.1, "What arms nothing"). Without the
+/// word the engine names no wait and its demand is `Fast` (a window's bars read it every 2 s), yet
+/// with no window a live job's demand arms nothing either, so it too is read only at its edge.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_raw_program_at_its_prompt_is_read_once_and_then_arms_nothing() {
@@ -3000,9 +3260,10 @@ fn a_raw_program_at_its_prompt_is_read_once_and_then_arms_nothing() {
     let asked = readings_at_rest(&mut app, &rx, false);
     assert_eq!(held_wait(&app), (Some(WaitName::Unnamed), Demand::Fast));
     assert!(
-        asked.len() >= 10 && asked.last().is_some_and(|ms| *ms >= 18_000),
-        "no word: read every 2 s to the end: {asked:?}"
+        !asked.is_empty() && asked.iter().all(|ms| *ms < 5_000),
+        "no word: read at the edge, then nothing with no window: {asked:?}"
     );
+    assert_eq!(app.vitals_deadline(), None, "nothing armed");
 }
 
 /// With no window, a parked raw program that redraws each second is read at most once a floor,
@@ -3546,13 +3807,14 @@ fn a_park_is_named_from_its_own_tabs_word() {
     );
 }
 
-/// The word silences only a person's own wait: a job that keeps the
-/// terminal canonical with echo (`sleep` typed at a prompt) names no tty
-/// wait from it, stays suspect (unnamed, §11.5), and is read every 2 s with
-/// no window, word or no word (§6.1 kind 3).
+/// The word silences only a person's own wait: a job that keeps the terminal canonical with echo
+/// (`sleep` typed at a prompt) names no tty wait from it and stays suspect (unnamed, §11.5), so a
+/// window's bars read it every 2 s; with no window its demand arms nothing, and it is read at its
+/// edge alone (an idle aterm wakes zero times). NEGATIVE CONTROL: `held_wait_after` arming the
+/// engine's demand while a row lives reads it every 2 s to the end of the 20 s, and this fails.
 #[cfg(target_os = "macos")]
 #[test]
-fn a_canonical_job_at_rest_is_still_read_at_the_engines_cadence() {
+fn a_canonical_job_at_rest_is_read_at_its_edge_and_arms_nothing_with_no_window() {
     use aterm_vitals::jobs::WaitName;
     static BOARD: JobsBoard = JobsBoard::new();
     let job = JobAtRest::new(false);
@@ -3560,9 +3822,10 @@ fn a_canonical_job_at_rest_is_still_read_at_the_engines_cadence() {
     let asked = readings_at_rest(&mut app, &rx, true);
     assert_eq!(held_wait(&app), (Some(WaitName::Unnamed), Demand::Fast));
     assert!(
-        asked.len() >= 10 && asked.last().is_some_and(|ms| *ms >= 18_000),
-        "a suspect job is read to the end: {asked:?}"
+        !asked.is_empty() && asked.iter().all(|ms| *ms < 5_000),
+        "a `sleep` in front, no window: read at its edge, then nothing in 20 s: {asked:?}"
     );
+    assert_eq!(app.vitals_deadline(), None, "nothing armed at rest");
 }
 
 /// Read through the sink, the word is stamped newer than every output until the session's next
@@ -3982,6 +4245,81 @@ fn a_request_the_thread_keeps_never_holds_a_closed_sessions_master_open() {
     assert_eq!(unsafe { libc::close(slave) }, 0);
 }
 
+/// The word the loop reads for a tab ([`TtySource::read`]), through the session's own sink on a
+/// real terminal, on each kernel whose unread count the sink reads
+/// ([`aterm_session::sink::SinkWriter::unread_input`]; Linux's from the slave `TIOCGPTPEER`
+/// opens): a key typed ahead that the tab's program has not read holds the word back, and the
+/// word is back once the program reads it (§6.6, §14.16).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_key_typed_ahead_holds_the_tabs_word_until_its_program_reads_it() {
+    use std::os::fd::FromRawFd as _;
+    let (master, slave) = aterm_pty::open_pty_pair().expect("a pty");
+    // SAFETY: `slave` is this test's own fresh descriptor and `modes` a local termios it fills.
+    unsafe {
+        let mut modes: libc::termios = std::mem::zeroed();
+        assert_eq!(
+            libc::tcgetattr(slave, &raw mut modes),
+            0,
+            "the slave's modes"
+        );
+        libc::cfmakeraw(&raw mut modes);
+        assert_eq!(
+            libc::tcsetattr(slave, libc::TCSANOW, &raw const modes),
+            0,
+            "a raw program"
+        );
+    }
+    // SAFETY: `master` is the pair's fresh master and the sink below its only owner.
+    let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(master) };
+    let sink = Arc::new(aterm_session::sink::SinkWriter::new_owned(owned));
+    let mut session = crate::stub_session_with_sink(1, Arc::clone(&sink));
+    session.pid = i32::try_from(std::process::id()).expect("pid");
+    let mut app = crate::App::headless_for_test();
+    crate::App::register_session(&app.store, &session, None);
+    app.pool.insert(session);
+    let req = app.vitals_request(Duration::from_secs(2), false);
+    let source = req
+        .tty_sources
+        .iter()
+        .find(|s| s.key == 1)
+        .expect("the session's source");
+    let word = || source.read().map(|w| (w.canonical, w.echo));
+    assert_eq!(
+        sink.unread_input(),
+        Some(0),
+        "nothing typed, and the sink can tell"
+    );
+    assert_eq!(
+        word(),
+        Some((false, false)),
+        "nothing unread: the raw program's word"
+    );
+
+    // SAFETY: Writes one byte of a local buffer to this test's master.
+    let n = unsafe { libc::write(master, b"x".as_ptr().cast(), 1) };
+    assert_eq!(n, 1, "typed");
+    // Linux hands a write to the slave from a work queue, so the key may count a moment later.
+    aterm_spec::wait::within(
+        aterm_spec::wait::MUST_HAPPEN,
+        Duration::from_millis(5),
+        || sink.unread_input().filter(|n| *n > 0),
+    )
+    .expect("the key waits unread");
+    assert_eq!(word(), None, "a key typed ahead and unread: no word");
+
+    let mut byte = [0u8; 1];
+    // SAFETY: Reads one byte from this test's own slave into a local buffer.
+    let got = unsafe { libc::read(slave, byte.as_mut_ptr().cast(), 1) };
+    assert_eq!((got, byte), (1, *b"x"), "the program reads the key");
+    assert_eq!(sink.unread_input(), Some(0), "read: nothing unread");
+    assert_eq!(word(), Some((false, false)), "the key read: the word again");
+    drop(req);
+    drop(app);
+    // SAFETY: `slave` is this test's own descriptor, closed once.
+    assert_eq!(unsafe { libc::close(slave) }, 0);
+}
+
 /// Output landing between the word's stamps and its `tcgetattr` leaves the word its mode but
 /// stamps it before all output, so it names no wait (§6.6).
 #[cfg(target_os = "macos")]
@@ -4101,6 +4439,107 @@ fn the_hand_over_keeps_job_events_for_the_loop_and_says_when_one_moved() {
         (v.next_job_rev(1), v.next_job_rev(1), v.next_job_rev(2)),
         (1, 2, 1)
     );
+}
+
+/// A pull keeps the engine's cadence unless a `sys jobs` waiting on it arms the engine, and
+/// then its last reading alone looks: a cold pull's warm reading keeps the cadence, so the
+/// engine never takes two passes half a second apart. NEGATIVE CONTROL: a pull that never asks
+/// the engine to look leaves an armed `sys jobs` the carried view.
+#[test]
+fn a_pull_looks_at_jobs_only_when_a_sys_jobs_arms_it() {
+    struct Looks {
+        vitals: aterm_vitals::Vitals,
+        armed: bool,
+        looked: Vec<bool>,
+    }
+    impl Source for Looks {
+        fn reading(&mut self, req: &Request) -> Snapshot {
+            self.looked.push(req.jobs_now);
+            Snapshot::default()
+        }
+        fn model(&mut self) -> &mut aterm_vitals::Vitals {
+            &mut self.vitals
+        }
+        fn jobs_armed(&self) -> bool {
+            self.armed
+        }
+    }
+    let looked = |armed: bool, last_whole: Option<Instant>| {
+        let mut source = Looks {
+            vitals: aterm_vitals::Vitals::new(),
+            armed,
+            looked: Vec::new(),
+        };
+        let mut req = Request {
+            jobs_now: true,
+            ..Request::default()
+        };
+        let _ = pull(&mut source, &mut req, last_whole);
+        source.looked
+    };
+    let warm = Some(Instant::now());
+    assert_eq!(
+        looked(false, warm),
+        [false],
+        "unarmed: the engine's cadence"
+    );
+    assert_eq!(looked(true, warm), [true], "armed: the engine looks");
+    assert_eq!(looked(false, None), [false, false], "cold, unarmed");
+    assert_eq!(
+        looked(true, None),
+        [false, true],
+        "cold, armed: its last reading"
+    );
+}
+
+/// A reading the engine did not run on carries the last pass's view and says how old it is on
+/// the pass's own clock, which the view's `at_ms` was stamped on; one the engine ran on says 0.
+/// NEGATIVE CONTROL: leave the age 0 on the carried view, and `sys jobs` reads a view 1.5 s old
+/// as the snapshot's own.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_reading_says_how_old_the_jobs_view_it_carries_is() {
+    // A second past the reader's zero: the pass's clock reads at least 1 ms.
+    thread_local! {
+        static AHEAD: std::cell::Cell<(Option<Instant>, u64)> =
+            const { std::cell::Cell::new((None, 1_000)) };
+    }
+    fn stepped() -> Instant {
+        AHEAD.with(|c| {
+            let (zero, ahead) = c.get();
+            let zero = zero.unwrap_or_else(Instant::now);
+            c.set((Some(zero), ahead));
+            zero + Duration::from_millis(ahead)
+        })
+    }
+    let step = |ms: u64| AHEAD.with(|c| c.set((c.get().0, c.get().1 + ms)));
+    let mut reader = Reader::new(Arc::default());
+    reader.clock = stepped;
+    let mut req = Request {
+        self_pid: std::process::id(),
+        jobs_now: true,
+        ..Request::default()
+    };
+    let made = reader.read(&req);
+    let view = made.jobs.clone().expect("a jobs view");
+    assert_eq!(made.jobs_age_ms, 0, "its own pass");
+    assert_eq!(
+        view.at_ms,
+        pass_ms(reader.epoch, stepped()),
+        "the view is stamped on the pass's clock"
+    );
+    step(1_500);
+    req.jobs_now = false;
+    let carried = reader.read(&req);
+    assert!(
+        carried.jobs.as_ref().is_some_and(|v| Arc::ptr_eq(v, &view)),
+        "inside the engine's cadence the view is carried"
+    );
+    assert_eq!(carried.jobs_age_ms, 1_500);
+    req.jobs_now = true;
+    let looked = reader.read(&req);
+    assert!(!looked.jobs.as_ref().is_some_and(|v| Arc::ptr_eq(v, &view)));
+    assert_eq!(looked.jobs_age_ms, 0, "a new pass");
 }
 
 #[test]
@@ -4252,8 +4691,9 @@ fn the_oss_exact_thermal_state_wins_over_the_counters_estimate() {
 }
 
 /// With no window, an idle view holding a program at macOS's program check, or a backed-up
-/// episode still owing its closing reading, is read again after 30 s; a live job's faster cadence
-/// stands beside it, and with neither nothing is due before the disk watch's next look.
+/// episode still owing its closing reading, or a leftover view offering a closed tab's row, is read
+/// again after 30 s, whatever a live job's own cadence (which arms nothing with no window); with
+/// none of them nothing is due before the next edge or the disk watch's next look.
 #[test]
 fn a_held_finding_keeps_the_windowless_reading_going() {
     use aterm_vitals::jobs::{Findings, HeldEpisode, Named};
@@ -4266,20 +4706,22 @@ fn a_held_finding_keeps_the_windowless_reading_going() {
     let held = Findings {
         program_check: vec![Named {
             pid: 25311,
+            exec_version: None,
             name: "gh".into(),
             tab: None,
+            job: None,
             for_ms: 35_940_000,
         }],
         ..Findings::default()
     };
     assert_eq!(
-        job_demand_after(&view(Demand::Idle, Vec::new(), held.clone())),
+        held_wait_after(&view(Demand::Idle, Vec::new(), held.clone()), None),
         Some(Duration::from_secs(30))
     );
     assert_eq!(
-        job_demand_after(&view(Demand::Fast, vec![hung_call()], held)),
-        Some(Duration::from_secs(2)),
-        "a live job's own cadence"
+        held_wait_after(&view(Demand::Fast, vec![hung_call()], held), None),
+        Some(Duration::from_secs(30)),
+        "a live job's own cadence arms nothing: the held program's 30 s"
     );
     let closing = Findings {
         program_check_episode: Some(HeldEpisode {
@@ -4291,13 +4733,22 @@ fn a_held_finding_keeps_the_windowless_reading_going() {
         ..Findings::default()
     };
     assert_eq!(
-        job_demand_after(&view(Demand::Idle, Vec::new(), closing)),
+        held_wait_after(&view(Demand::Idle, Vec::new(), closing), None),
         Some(Duration::from_secs(30)),
         "the episode's closing reading"
     );
     assert_eq!(
-        job_demand_after(&view(Demand::Idle, Vec::new(), Findings::default())),
+        held_wait_after(&view(Demand::Idle, Vec::new(), Findings::default()), None),
         None
+    );
+    let offered = crate::vitals_jobs::tests::offered_left();
+    assert_eq!(
+        held_wait_after(
+            &view(Demand::Fast, vec![hung_call()], Findings::default()),
+            Some(&offered)
+        ),
+        Some(Duration::from_secs(30)),
+        "a closed tab's offered row is read again within 30 s, whatever a live job's own cadence"
     );
 }
 
@@ -4345,7 +4796,8 @@ fn an_episode_edge_is_read_against_the_view_before() {
 
 /// A translating row's first reading is one `program-check.not-started` record ("translating
 /// (Rosetta)") and the next view's none; a row on a volume not proven local, new later, is one
-/// more. No record gives an age, an Entry or a Now (leftover-processes design §6.5).
+/// more, and so is one that reads stopped and traced, with what it read, told once whatever its
+/// bits read next. No record gives an age, an Entry or a Now (leftover-processes design §6.5).
 #[test]
 fn a_program_first_named_as_not_started_is_recorded_once() {
     use crate::message_reporters as mr;
@@ -4354,12 +4806,22 @@ fn a_program_first_named_as_not_started_is_recorded_once() {
     let row = |pid, name: &str, wait| HeldProc {
         pid,
         exec: u64::from(pid),
+        exec_version: Some(u64::from(pid)),
         name: name.into(),
         aterm: true,
         wait,
+        tab: None,
+        started_ms: None,
     };
     let x86 = row(7010, "x86tool", StartWait::Translating);
     let nfs = row(7011, "nfsprog", StartWait::NotStarted);
+    let debuggee = |stopped, traced| {
+        row(
+            7013,
+            "debuggee",
+            StartWait::StoppedUnstarted { stopped, traced },
+        )
+    };
     let mut engine = Jobs::new();
     let mut adopt = |app: &mut crate::App, seq, held: &[HeldProc]| {
         let at_ms = seq * 2_000;
@@ -4381,7 +4843,13 @@ fn a_program_first_named_as_not_started_is_recorded_once() {
     app.vitals.board = &BOARD;
     adopt(&mut app, 1, std::slice::from_ref(&x86));
     adopt(&mut app, 2, std::slice::from_ref(&x86));
-    adopt(&mut app, 3, &[x86.clone(), nfs]);
+    adopt(&mut app, 3, &[x86.clone(), nfs.clone()]);
+    adopt(
+        &mut app,
+        4,
+        &[x86.clone(), nfs.clone(), debuggee(true, true)],
+    );
+    adopt(&mut app, 5, &[x86.clone(), nfs, debuggee(true, false)]);
     let records: Vec<(String, Vec<String>)> = app
         .messages
         .log()
@@ -4406,6 +4874,7 @@ fn a_program_first_named_as_not_started_is_recorded_once() {
                 "pid 7011 nfsprog: it has not started, and its program is on a volume aterm \
                  cannot prove local, so nothing read says why"
             ),
+            one("pid 7013 debuggee: it has not started, and it reads stopped and traced"),
         ],
         "each program once, when a view first names it"
     );
@@ -4438,8 +4907,10 @@ fn a_held_episode_is_recorded_at_its_edges_and_raises_nothing() {
     let held = |aterm: (u32, u64)| Findings {
         program_check: vec![Named {
             pid: 25311,
+            exec_version: None,
             name: "gh".into(),
             tab: None,
+            job: None,
             for_ms: 35_940_000,
         }],
         program_check_aterm: aterm,
@@ -4563,6 +5034,306 @@ fn the_verdict_refresh_waits_out_a_backed_up_episode() {
     );
     adopt(&mut app, 4, Findings::default());
     assert_eq!(app.devtools_helper.refreshes_started(), 1, "once");
+}
+
+/// Waits for the devtools lane's refresh worker to end: a one-minute hang detector.
+fn until_refreshed(app: &crate::App) {
+    let by = Instant::now() + Duration::from_secs(60);
+    while app.devtools_helper.refresh_out() {
+        assert!(Instant::now() < by, "the refresh worker never ended");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Adopts a jobs view whose findings are `findings` as snapshot `seq`.
+fn adopt_findings(app: &mut crate::App, seq: u64, findings: aterm_vitals::jobs::Findings) {
+    app.vitals.latest.lock().unwrap().snap = Some(Arc::new(Snapshot {
+        seq,
+        jobs: Some(Arc::new(JobsView {
+            findings,
+            ..JobsView::default()
+        })),
+        ..Snapshot::default()
+    }));
+    app.on_vitals_wake();
+}
+
+/// Findings that stand in a backed-up episode of macOS's program check.
+fn backed_up_findings() -> aterm_vitals::jobs::Findings {
+    aterm_vitals::jobs::Findings {
+        program_check_episode: Some(aterm_vitals::jobs::HeldEpisode {
+            opened_ms: 60_000,
+            for_ms: 30_000,
+            peak: 3,
+            oldest_ms: 50_000,
+        }),
+        ..aterm_vitals::jobs::Findings::default()
+    }
+}
+
+/// Holds a refresh worker until `gate` opens: a one-minute hang detector.
+fn hold_until(gate: &std::sync::atomic::AtomicBool) {
+    let by = Instant::now() + Duration::from_secs(60);
+    while !gate.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(Instant::now() < by, "the refresh was never let go");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Switches aterm on in the devtools watch, which asks macOS about aterm again.
+fn switch_devtools_on(app: &mut crate::App) {
+    use aterm_containment::DevToolGrant;
+    let _ = app.devtools_watch.observe(DevToolGrant::NotGranted, true);
+    let step = app.devtools_watch.observe(DevToolGrant::Granted, true);
+    let _ = app.apply_devtools_step(step);
+}
+
+/// A verdict refresh that did not settle (macOS's queue was backed up) is asked again: held while
+/// the adopted view stands in an episode and started at the first view that stands in none. One
+/// that did not settle again is not asked again (leftover-processes design §5.1).
+#[test]
+fn a_prime_that_did_not_settle_is_asked_again_once_the_queue_drains() {
+    use crate::devtools_helper::test_arms;
+    use aterm_vitals::jobs::Findings;
+    static BOARD: JobsBoard = JobsBoard::new();
+    let mut app = crate::App::headless_for_test();
+    app.vitals.board = &BOARD;
+    test_arms::stand_in(&mut app, test_arms::not_settling());
+    adopt_findings(&mut app, 1, Findings::default());
+    switch_devtools_on(&mut app);
+    assert_eq!(app.devtools_helper.refreshes_started(), 1, "switched on");
+    until_refreshed(&app);
+    adopt_findings(&mut app, 2, backed_up_findings());
+    assert_eq!(
+        app.devtools_helper.refreshes_started(),
+        1,
+        "it did not settle and the queue is backed up: held"
+    );
+    adopt_findings(&mut app, 3, backed_up_findings());
+    assert_eq!(
+        app.devtools_helper.refreshes_started(),
+        1,
+        "still backed up"
+    );
+    adopt_findings(&mut app, 4, Findings::default());
+    assert_eq!(
+        app.devtools_helper.refreshes_started(),
+        2,
+        "the first view in no episode asks macOS again"
+    );
+    assert_eq!(
+        app.devtools_helper.took_at(),
+        None,
+        "a refresh that did not settle sets no grant time"
+    );
+    until_refreshed(&app);
+    for (seq, findings) in [
+        (5, Findings::default()),
+        (6, backed_up_findings()),
+        (7, Findings::default()),
+    ] {
+        adopt_findings(&mut app, seq, findings);
+    }
+    assert_eq!(
+        app.devtools_helper.refreshes_started(),
+        2,
+        "it did not settle again: the queue stays backed up, so it is not asked a third time"
+    );
+}
+
+/// A prime that did not settle after an episode opened and drained while it ran is asked again at
+/// the first view after its end that stands in no episode: that view is evidence enough, so no
+/// later view is waited for.
+#[test]
+fn a_prime_that_did_not_settle_after_an_episode_drained_is_asked_at_the_next_view() {
+    use crate::devtools_helper::test_arms;
+    use aterm_vitals::jobs::Findings;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static BOARD: JobsBoard = JobsBoard::new();
+    static LET_GO: AtomicBool = AtomicBool::new(false);
+    let mut app = crate::App::headless_for_test();
+    app.vitals.board = &BOARD;
+    test_arms::stand_in(
+        &mut app,
+        test_arms::refreshing_by(|| {
+            hold_until(&LET_GO);
+            Err(atpkg::devtools::RefreshFailed::NotSettled(None))
+        }),
+    );
+    adopt_findings(&mut app, 1, Findings::default());
+    switch_devtools_on(&mut app);
+    assert_eq!(app.devtools_helper.refreshes_started(), 1, "switched on");
+    adopt_findings(&mut app, 2, backed_up_findings());
+    adopt_findings(&mut app, 3, Findings::default());
+    assert_eq!(
+        app.devtools_helper.refreshes_started(),
+        1,
+        "the episode opened and drained while the prime ran"
+    );
+    LET_GO.store(true, Ordering::SeqCst);
+    until_refreshed(&app);
+    adopt_findings(&mut app, 4, Findings::default());
+    assert_eq!(
+        app.devtools_helper.refreshes_started(),
+        2,
+        "the first view after it did not settle stands in no episode: asked again there"
+    );
+}
+
+/// A refresh held for an episode that drains while an earlier refresh is still out is not lost:
+/// it stays held, and the first view in no episode after that refresh ended starts it.
+#[test]
+fn a_held_refresh_waits_out_one_still_running() {
+    use crate::devtools_helper::test_arms;
+    use aterm_vitals::jobs::Findings;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static BOARD: JobsBoard = JobsBoard::new();
+    static LET_GO: AtomicBool = AtomicBool::new(false);
+    let mut app = crate::App::headless_for_test();
+    app.vitals.board = &BOARD;
+    test_arms::stand_in(
+        &mut app,
+        test_arms::refreshing_by(|| {
+            hold_until(&LET_GO);
+            Ok(())
+        }),
+    );
+    adopt_findings(&mut app, 1, Findings::default());
+    switch_devtools_on(&mut app);
+    assert_eq!(app.devtools_helper.refreshes_started(), 1, "switched on");
+    adopt_findings(&mut app, 2, backed_up_findings());
+    app.refresh_devtools_verdict();
+    adopt_findings(&mut app, 3, Findings::default());
+    assert_eq!(
+        app.devtools_helper.refreshes_started(),
+        1,
+        "the first refresh is still out: the held one waits"
+    );
+    LET_GO.store(true, Ordering::SeqCst);
+    until_refreshed(&app);
+    adopt_findings(&mut app, 4, Findings::default());
+    assert_eq!(
+        app.devtools_helper.refreshes_started(),
+        2,
+        "the held refresh starts once the first ended"
+    );
+}
+
+/// Programs aterm started after its Developer Tools grant took that macOS's program check holds
+/// are one `program-check.after-grant` record when a view first names them, none while they
+/// stand, and one more once a later view names them again after none; never an Entry or a Now
+/// (leftover-processes design §5.1, §6.5).
+#[test]
+fn a_granted_aterm_whose_new_programs_wait_is_recorded_once_and_raises_nothing() {
+    use crate::message_reporters as mr;
+    use aterm_vitals::jobs::Findings;
+    static BOARD: JobsBoard = JobsBoard::new();
+    let adopt = |app: &mut crate::App, seq, after_grant: u32| {
+        app.vitals.latest.lock().unwrap().snap = Some(Arc::new(Snapshot {
+            seq,
+            jobs: Some(Arc::new(JobsView {
+                findings: Findings {
+                    program_check_after_grant: after_grant,
+                    ..Findings::default()
+                },
+                ..JobsView::default()
+            })),
+            ..Snapshot::default()
+        }));
+        app.on_vitals_wake();
+    };
+    let records = |app: &crate::App| -> Vec<(String, Vec<String>)> {
+        app.messages
+            .log()
+            .records()
+            .filter(|r| r.key.as_deref() == Some(mr::PROGRAM_CHECK_AFTER_GRANT_KEY))
+            .map(|r| (r.title.clone(), r.detail.clone()))
+            .collect()
+    };
+    let told = |n| {
+        let m = mr::program_check_after_grant(n);
+        (m.title, m.detail)
+    };
+    let mut app = crate::App::headless_for_test();
+    app.vitals.board = &BOARD;
+    adopt(&mut app, 1, 0);
+    assert!(records(&app).is_empty(), "none held");
+    adopt(&mut app, 2, 2);
+    adopt(&mut app, 3, 3);
+    assert_eq!(records(&app), [told(2)], "once while they stand");
+    assert_eq!(
+        told(2),
+        (
+            "macOS's program check is holding 2 programs aterm started after its Developer Tools \
+             grant took"
+                .to_owned(),
+            vec![
+                "so macOS still checks the programs aterm starts: look at aterm's row in the \
+                 Developer Tools list"
+                    .to_owned()
+            ]
+        )
+    );
+    adopt(&mut app, 4, 0);
+    adopt(&mut app, 5, 1);
+    assert_eq!(records(&app), [told(2), told(1)], "again after none");
+    assert!(
+        app.messages
+            .digest()
+            .entries
+            .iter()
+            .all(|e| !e.key.starts_with("program-check") && !e.key.contains("devtools")),
+        "a record only"
+    );
+}
+
+/// The vitals request names the grant's effect time only while the devtools lane reads aterm
+/// granted and a refresh took, and the sessions another aterm process handed over.
+#[test]
+fn the_vitals_request_names_the_grant_time_only_while_granted_and_the_handed_over_sessions() {
+    use crate::devtools_helper::test_arms;
+    use aterm_containment::DevToolGrant;
+    let mut app = crate::App::headless_for_test();
+    let s1 = app.next_session_id;
+    let _ = app.insert_logical_window(crate::stub_session(s1), 24, 80);
+    for (id, pooled) in &mut app.pool.sessions {
+        pooled.session.pid = 40_000 + i32::try_from(*id).expect("a session id");
+    }
+    app.pool
+        .sessions
+        .get_mut(&s1)
+        .expect("the second session")
+        .session
+        .handoff_local_id = Some(0);
+    test_arms::stand_in(&mut app, test_arms::opening());
+    let req = app.vitals_request(FOCUSED_PERIOD, false);
+    assert_eq!(req.grant.adopted, [s1], "only the handed-over session");
+    assert_eq!(req.grant.grant_ms, None, "not granted, and no refresh took");
+    let before = aterm_time::unix_millis().expect("a clock");
+    assert!(app.devtools_helper.refresh_verdict());
+    until_refreshed(&app);
+    let took = app.devtools_helper.took_at().expect("the refresh took");
+    assert!(took >= before);
+    assert_eq!(
+        app.vitals_request(FOCUSED_PERIOD, false).grant.grant_ms,
+        None,
+        "the lane still reads aterm not granted"
+    );
+    let granted = |app: &mut crate::App, grant| {
+        app.devtools_helper
+            .note_reading(test_arms::reading(grant, test_arms::on()), Instant::now());
+    };
+    granted(&mut app, DevToolGrant::Granted);
+    assert_eq!(
+        app.vitals_request(FOCUSED_PERIOD, false).grant.grant_ms,
+        Some(took)
+    );
+    granted(&mut app, DevToolGrant::Unknown);
+    assert_eq!(
+        app.vitals_request(FOCUSED_PERIOD, false).grant.grant_ms,
+        None,
+        "unknown: no grant time"
+    );
 }
 
 #[test]

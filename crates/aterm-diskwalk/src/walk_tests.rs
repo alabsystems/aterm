@@ -336,6 +336,35 @@ fn a_full_size_answers_a_tree_and_a_file() {
         file.sums.alloc_fair > 0,
         "a file root reads its allocation, never 0"
     );
+    assert_eq!(file.links, None);
+
+    let mut link_policy = policy.clone();
+    link_policy.links_out = true;
+    link_policy.private = true;
+    let linked_file = diskwalk_size_full(
+        &RootSpec::new(root.join("a/d/four.bin")),
+        &link_policy,
+        Duration::from_secs(60),
+        &mut clock,
+    )
+    .expect("linked file");
+    let flinks = linked_file.links.expect("links_out on file root");
+    assert_eq!(flinks.linked_inodes, 1);
+    assert_eq!(flinks.shared_out, flinks.alloc_first_seen);
+    assert_eq!(flinks.frees_at_most, 0);
+    assert!(linked_file.sums.private.is_some());
+
+    let single_file = diskwalk_size_full(
+        &RootSpec::new(root.join("top.bin")),
+        &link_policy,
+        Duration::from_secs(60),
+        &mut clock,
+    )
+    .expect("single file");
+    let slinks = single_file.links.expect("links_out on single-link file");
+    assert_eq!(slinks.linked_inodes, 0);
+    assert_eq!(slinks.shared_out, 0);
+    assert_eq!(slinks.frees_at_most, slinks.alloc_first_seen);
     let mut slow = tick_clock(Duration::from_millis(1));
     let part = diskwalk_size_full(
         &RootSpec::new(&root),
@@ -508,6 +537,28 @@ fn marker_looks_find_worktrees_and_links_and_refuse_what_the_deny_set_holds() {
         marker_at(Path::new("relative"), ".git", &policy),
         Err(Refusal::Relative)
     );
+    assert_eq!(
+        marker_at(&home, "Documents", &policy),
+        Err(Refusal::Protected),
+        "protected child named inside home must be refused before opening"
+    );
+    assert_eq!(
+        link_target(&home, "Documents", &policy),
+        Err(Refusal::Protected),
+        "link_target on a protected child must be refused before opening"
+    );
+    for bad in ["", ".", "..", "repo/.git", "a\0b"] {
+        assert_eq!(
+            marker_at(&home.join("repo"), bad, &policy),
+            Err(Refusal::Relative),
+            "marker_at {bad:?}"
+        );
+        assert_eq!(
+            link_target(&home.join("repo"), bad, &policy),
+            Err(Refusal::Relative),
+            "link_target {bad:?}"
+        );
+    }
 }
 
 #[test]
@@ -620,4 +671,36 @@ fn statx_major_and_minor_read_as_makedev_encodes_them() {
     assert_eq!(crate::list::dev_of_parts(259, 2), 0x1_0302);
     assert_eq!(crate::list::dev_of_parts(8, 1), 0x801);
     assert_eq!(crate::list::dev_of_parts(0, 300), 44 | (256 << 12));
+}
+
+#[test]
+fn directory_identity_keeps_the_walkers_path_and_privacy_fences() {
+    let (_tmp, root, _outside) = scratch();
+    let mut policy = scratch_policy(ListerChoice::Native);
+    let walk = walk_all(&root, &policy);
+    assert_eq!(
+        crate::directory_identity(&root, &policy),
+        Ok((walk.root_dev(), walk.tree().root().ino))
+    );
+    assert_eq!(
+        crate::directory_identity(&root.join("missing"), &policy),
+        Err(Refusal::Gone)
+    );
+    assert_eq!(
+        crate::directory_identity(&root.join("top.bin"), &policy),
+        Err(Refusal::NotDirectory)
+    );
+    assert_eq!(
+        crate::directory_identity(&root.join("e/to-outside"), &policy),
+        Err(Refusal::Link)
+    );
+    policy.deny = Deny::for_home(
+        root.parent().expect("scratch home"),
+        &[root.display().to_string()],
+        &[],
+    );
+    assert_eq!(
+        crate::directory_identity(&root, &policy),
+        Err(Refusal::Protected)
+    );
 }

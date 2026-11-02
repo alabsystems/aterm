@@ -22,8 +22,8 @@ pub enum Method {
     Password,
     /// An admin explicitly approved this recipient.
     Manual,
-    /// Automatic default-LAN admission or ordinary open-vault approval. The admitting
-    /// authority records the decision, including when no legacy open flag is present.
+    /// Ordinary open-vault approval: the admin chose to let in every machine that
+    /// asks, and that choice admits it to Commons like any other (owner, 2026-10-26).
     Open,
 }
 

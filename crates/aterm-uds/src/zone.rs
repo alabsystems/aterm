@@ -28,10 +28,12 @@ pub fn local_offset_now() -> Option<i64> {
 pub fn plain_zone_name(zone: &str) -> bool {
     !zone.is_empty()
         && !zone.contains("..")
-        && !zone.starts_with('/')
-        && zone
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '+'))
+        && zone.split('/').all(|seg| {
+            !seg.is_empty()
+                && seg
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+'))
+        })
 }
 
 /// The named zone's offset from UTC at `unix`, in seconds east of UTC, from [`ZONEINFO`].
@@ -46,10 +48,17 @@ pub fn zone_offset_in(root: &Path, zone: &str, unix: i64) -> Option<i64> {
     if !plain_zone_name(zone) {
         return None;
     }
-    const MOST: u64 = 1 << 20;
+    const MOST: usize = 1 << 20;
     let file = std::fs::File::open(root.join(zone)).ok()?;
     let mut bytes = Vec::new();
-    std::io::Read::read_to_end(&mut std::io::Read::take(file, MOST), &mut bytes).ok()?;
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(file, (MOST + 1) as u64),
+        &mut bytes,
+    )
+    .ok()?;
+    if bytes.len() > MOST {
+        return None;
+    }
     tzif_offset_at(&bytes, unix)
 }
 
@@ -58,7 +67,7 @@ pub fn zone_offset_in(root: &Path, zone: &str, unix: i64) -> Option<i64> {
 pub fn tzif_offset_at(bytes: &[u8], unix: i64) -> Option<i64> {
     let first = Header::read(bytes)?;
     let (block, header, wide) = if first.version >= b'2' {
-        let second = bytes.get(HEADER + first.block_len(4)?..)?;
+        let second = bytes.get(HEADER.checked_add(first.block_len(4)?)?..)?;
         (second, Header::read(second)?, true)
     } else {
         (bytes, first, false)
@@ -86,7 +95,7 @@ pub fn tzif_offset_at(bytes: &[u8], unix: i64) -> Option<i64> {
         })
     };
     let footer = if wide {
-        let after = HEADER + header.block_len(8)?;
+        let after = HEADER.checked_add(header.block_len(8)?)?;
         footer_of(block.get(after..)?)
     } else {
         None
@@ -198,9 +207,9 @@ pub fn posix_offset_at(tz: &str, unix: i64) -> Option<i64> {
     if !p.rest.is_empty() {
         return None;
     }
-    let (year, _, _) = civil_from_days((unix + std_off).div_euclid(86_400));
-    let starts = start.local_seconds(year)? - std_off;
-    let ends = end.local_seconds(year)? - dst_off;
+    let (year, _, _) = civil_from_days(unix.checked_add(std_off)?.div_euclid(86_400));
+    let starts = start.local_seconds(year)?.checked_sub(std_off)?;
+    let ends = end.local_seconds(year)?.checked_sub(dst_off)?;
     let daylight = if starts < ends {
         starts <= unix && unix < ends
     } else {
@@ -261,8 +270,13 @@ impl Posix<'_> {
     fn name(&mut self) -> Option<()> {
         if let Some(rest) = self.rest.strip_prefix(b"<") {
             let end = rest.iter().position(|b| *b == b'>')?;
+            let quoted = rest.get(..end)?;
             self.rest = rest.get(end + 1..)?;
-            return (end >= 3).then_some(());
+            return (end >= 3
+                && quoted
+                    .iter()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-')))
+            .then_some(());
         }
         let len = self
             .rest

@@ -23,7 +23,8 @@ fn shipped() -> PathBuf {
 }
 
 fn is_static_elf(elf: &[u8]) -> bool {
-    let at = |offset: usize, len: usize| elf.get(offset..offset + len);
+    let at =
+        |offset: usize, len: usize| offset.checked_add(len).and_then(|end| elf.get(offset..end));
     let n = |offset: usize, len: usize| {
         at(offset, len).map(|bytes| {
             bytes
@@ -39,7 +40,11 @@ fn is_static_elf(elf: &[u8]) -> bool {
         return false;
     };
     (0..phnum).all(|i| {
-        let entry = usize::try_from(phoff + i * phentsize).unwrap_or(usize::MAX);
+        let entry = i
+            .checked_mul(phentsize)
+            .and_then(|off| phoff.checked_add(off))
+            .and_then(|pos| usize::try_from(pos).ok())
+            .unwrap_or(usize::MAX);
         n(entry, 4).is_some_and(|kind| kind != 3)
     })
 }
@@ -113,5 +118,10 @@ fn the_static_elf_reader_finds_an_interpreter() {
     );
     dynamic[64..68].copy_from_slice(&3u32.to_le_bytes());
     assert!(!is_static_elf(&dynamic), "a PT_INTERP");
+    let mut overflowing_phoff = chain::elf("x86_64");
+    overflowing_phoff[32..40].copy_from_slice(&u64::MAX.to_le_bytes());
+    overflowing_phoff[54..56].copy_from_slice(&56u16.to_le_bytes());
+    overflowing_phoff[56..58].copy_from_slice(&2u16.to_le_bytes());
+    assert!(!is_static_elf(&overflowing_phoff), "overflowing e_phoff");
     assert!(!is_static_elf(b"#!/bin/sh\n"), "not an ELF");
 }

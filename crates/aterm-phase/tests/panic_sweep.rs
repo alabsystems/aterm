@@ -96,9 +96,12 @@ fn read_all(w: &[String]) {
         let _ = aterm_phase::continuation_suggestion(w, col);
     }
     for program in Program::ALL {
-        if let Some(p) = program.reader().read(w, Some(0)).prompt {
+        let reader = program.reader();
+        if let Some(p) = reader.read(w, Some(0)).prompt {
             read_box(&p);
         }
+        let _ = reader.transcript_end(w);
+        let _ = reader.busy_zone_start(w);
     }
     let _ = aterm_phase::parse_prompt(w);
     if let Some(p) = aterm_phase::parse_prompt_v2(w) {

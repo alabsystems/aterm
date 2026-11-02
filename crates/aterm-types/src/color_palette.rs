@@ -251,8 +251,8 @@ impl ColorPalette {
 
             Some(Rgb::new(r, g, b))
         } else if let Some(rest) = spec.strip_prefix('#') {
-            // Non-ASCII is refused: the arms below count one byte per digit.
-            if !rest.is_ascii() {
+            // Non-hex bytes are refused: the arms below count one hex digit per byte.
+            if !rest.bytes().all(|b| b.is_ascii_hexdigit()) {
                 return None;
             }
             match rest.len() {
@@ -296,7 +296,7 @@ impl ColorPalette {
     /// Parse a hex component with 1-4 digits, scaling to 8-bit.
     #[cfg_attr(trust_verify, trust::skip)]
     fn parse_hex_component(s: &str) -> Option<u8> {
-        if s.is_empty() || s.len() > 4 {
+        if s.is_empty() || s.len() > 4 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
             return None;
         }
 
@@ -316,6 +316,9 @@ impl ColorPalette {
     /// Parse a floating-point color component, clamped to \[0.0, 1.0\] and rounded to 8 bits.
     #[cfg_attr(trust_verify, trust::skip)]
     fn parse_float_component(s: &str) -> Option<u8> {
+        if s.starts_with('+') {
+            return None;
+        }
         let value: f64 = s.parse().ok()?;
         let clamped = value.clamp(0.0, 1.0);
         Some((clamped * 255.0 + 0.5) as u8)
@@ -535,6 +538,10 @@ mod tests {
             "rgbi:1.0/0.5/0.0/0.5",
             "#你好",
             "#你",
+            "#+f+0+8",
+            "#ffX00Y88Z",
+            "#ffXX00YY80ZZ",
+            "rgb:+f/00/80",
         ] {
             assert_eq!(ColorPalette::parse_color_spec(spec), None, "{spec:?}");
         }
@@ -628,5 +635,6 @@ mod tests {
 
         p.reset();
         assert_coherent(&p, "after reset", 0);
+        assert_eq!(ColorPalette::parse_color_spec("rgbi:+0.5/0.5/0.5"), None);
     }
 }

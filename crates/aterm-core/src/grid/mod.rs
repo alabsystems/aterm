@@ -67,6 +67,7 @@ pub use row::{LineSize, Row, RowFlags};
 pub use aterm_grid::{CurrentStyle, Cursor, SavedCursor, SavedCursorState};
 
 pub use aterm_grid::is_default_tab_stop;
+pub use aterm_grid::observe_history_effects;
 pub use aterm_grid::{MAX_GRID_COLS, MAX_GRID_ROWS};
 
 pub(crate) use aterm_grid::row_u16;

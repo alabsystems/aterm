@@ -159,7 +159,7 @@ impl From<ProcessBirth> for Birth {
 /// ([`signal_by_handle`]), so a pid reused after that read is never signalled unless the kernel
 /// refuses the pidfd; elsewhere such a reuse is not excluded. No kernel excludes an exec after
 /// the last read: a pidfd names the process, not its program.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Identity {
     /// The pid.
     pub pid: i32,
@@ -169,6 +169,9 @@ pub struct Identity {
     pub idversion: Option<i32>,
 }
 
+/// Whether this kernel keeps a pid version, so a token names one ([`Identity::idversion`]).
+pub const KEEPS_PID_VERSIONS: bool = cfg!(target_vendor = "apple");
+
 impl Identity {
     /// Formats the wire token `<pid>@<birth>:<idversion>`, or `<pid>@<birth>` with no version.
     #[must_use]
@@ -177,6 +180,38 @@ impl Identity {
             Some(version) => format!("{}@{}:{version}", self.pid, self.birth.0),
             None => format!("{}@{}", self.pid, self.birth.0),
         }
+    }
+
+    /// Reads a token [`Self::token`] wrote, in this kernel's shape ([`KEEPS_PID_VERSIONS`]).
+    #[must_use]
+    pub fn parse(token: &str) -> Option<Self> {
+        Self::parse_shaped(token, KEEPS_PID_VERSIONS)
+    }
+
+    /// Reads `token` in one shape: `<pid>@<birth>:<idversion>` where `versioned`, else
+    /// `<pid>@<birth>`. Only the exact text [`Self::token`] writes reads back: digits only (no
+    /// sign, space or leading zero), a pid above 1, every number within its type, and no field
+    /// more or fewer. A bare pid, a pattern or a word is no token.
+    #[must_use]
+    pub fn parse_shaped(token: &str, versioned: bool) -> Option<Self> {
+        fn number<T: std::str::FromStr>(text: &str) -> Option<T> {
+            (!text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| text.parse().ok())
+                .flatten()
+        }
+        let (pid, rest) = token.split_once('@')?;
+        let (birth, idversion) = if versioned {
+            let (birth, version) = rest.split_once(':')?;
+            (birth, Some(number::<i32>(version)?))
+        } else {
+            (rest, None)
+        };
+        let parsed = Self {
+            pid: number::<i32>(pid).filter(|&pid| pid > 1)?,
+            birth: Birth(number(birth)?),
+            idversion,
+        };
+        (parsed.token() == token).then_some(parsed)
     }
 }
 
@@ -296,7 +331,7 @@ fn moved_within(
     token: Identity,
     grace: std::time::Duration,
 ) -> Option<Option<Identity>> {
-    let deadline = std::time::Instant::now() + grace;
+    let deadline = crate::deadline::saturating_after(std::time::Instant::now(), grace);
     loop {
         let now = control.identity(token.pid);
         if now != Some(token) {
@@ -464,7 +499,7 @@ pub use kin::{
     GroupMembers, HeldNow, Lineage, MARKER_VARS, MAX_GROUP_PIDS, Markers, TRUST_CHECK_VAR,
     VERIFY_RUN_VAR, at_program_check, boot_id, group_listing_can_be_whole, group_members, held_age,
     held_programs, launchd_idversion, launched_before, pid_namespace, process_serial,
-    read_identity, read_lineage, read_process_markers, thread_ran,
+    read_identity, read_lineage, read_process_markers, stripped_from_child, thread_ran,
 };
 
 #[cfg(target_vendor = "apple")]
@@ -513,6 +548,38 @@ pub fn read_process_parent(pid: i32) -> Option<u32> {
 #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
 #[must_use]
 pub fn read_process_parent(_pid: i32) -> Option<u32> {
+    None
+}
+
+/// Whether `pid` has run an exec since it was forked (`None` on the terms of
+/// [`read_process_birth`], or a record that does not read). A forked child maps its parent's
+/// image until it execs, so a reader that takes a process's image as a program it ran waits
+/// for `Some(true)` first: a shell's child between its fork and its exec is the shell's copy,
+/// and one whose command was not found never execs. Apple: the BSD info's `PROC_FLAG_EXEC`,
+/// which a fork clears and an exec or a `posix_spawn` sets.
+#[cfg(target_vendor = "apple")]
+#[must_use]
+pub fn read_process_execd(pid: i32) -> Option<bool> {
+    const PROC_FLAG_EXEC: u32 = 0x4000;
+    read_bsdinfo(pid).map(|info| info.flags & PROC_FLAG_EXEC != 0)
+}
+
+/// See the Apple twin. Linux: `/proc/<pid>/stat`'s flags without `PF_FORKNOEXEC`
+/// ([`procfs::execd_row`]), for a process of any user.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[must_use]
+pub fn read_process_execd(pid: i32) -> Option<bool> {
+    if pid <= 1 {
+        return None;
+    }
+    let stat = read_proc_text(std::path::Path::new(&format!("/proc/{pid}/stat"))).ok()?;
+    procfs::execd_row(&stat, pid)
+}
+
+/// See the Apple twin.
+#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+#[must_use]
+pub fn read_process_execd(_pid: i32) -> Option<bool> {
     None
 }
 
@@ -684,14 +751,166 @@ mod short_info_tests {
     }
 }
 
-/// See the Apple twin, whose contract this keeps.
+/// See the Apple twin, whose contract this keeps: the program `pid` runs ([`program_in`] over
+/// `/proc`), read between two reads of its start.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[must_use]
 pub fn read_process_path(pid: i32) -> Option<std::path::PathBuf> {
     let start = read_process_start(pid)?;
-    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
-    let exe = procfs::live_exe(exe)?;
+    let exe = program_in(std::path::Path::new("/proc"), pid)?;
     (read_process_start(pid)? == start).then_some(exe)
+}
+
+/// The program `pid` runs, read off the `/proc` at `proc` through `pid`'s own directory there
+/// ([`ProcDir`]): its `exe`, or `None` once the kernel marks that ` (deleted)`, unless its
+/// `auxv` names a descriptor ([`procfs::exec_fd`]). Only `binfmt_misc` puts one there, under
+/// its `O` flag, on which it hands the interpreter it starts the program to run; the kernel
+/// then names that interpreter (Rosetta's translator, in an aarch64 VM) as the executable,
+/// where macOS names a Rosetta 2 process's own program, so this reads the program on that
+/// descriptor ([`translated_program`]), or `None`. An `auxv` that names none, or does not read,
+/// leaves `exe`: a registered interpreter run natively reads as itself, and so does a
+/// translator registered with no `O` flag, which opens its program by path.
+#[cfg(any(target_os = "linux", target_os = "android", all(test, unix)))]
+fn program_in(proc: &std::path::Path, pid: i32) -> Option<std::path::PathBuf> {
+    let dir = ProcDir::of(proc, pid)?;
+    match dir.read(c"auxv").as_deref().and_then(procfs::exec_fd) {
+        Some(fd) => translated_program(&dir, fd),
+        None => procfs::live_exe(dir.link(c"exe")?),
+    }
+}
+
+/// The program `binfmt_misc` handed the interpreter `dir`'s process runs, on its descriptor
+/// `fd`: the live absolute path that descriptor names, while its `fdinfo` says it holds the
+/// kernel's exec open ([`procfs::exec_opened`]) of the file at that path (its `ino:`,
+/// [`procfs::open_inode`], is that file's) and the process maps that path executable
+/// ([`procfs::maps_executable`]). A descriptor the program closed and reused names nothing: a
+/// library `dlopen` holds there for a moment carries no exec mark, an exec open put there in
+/// place of the file the link named is another inode, and one the process inherited names a
+/// file it does not map. A process exec'd a moment ago reads `None` until its translator has
+/// mapped its program, as does any on a kernel whose `fdinfo` prints no `ino:` (before 5.14).
+#[cfg(any(target_os = "linux", target_os = "android", all(test, unix)))]
+fn translated_program(dir: &ProcDir, fd: i32) -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+    let program = dir.link(&std::ffi::CString::new(format!("fd/{fd}")).ok()?)?;
+    let program = procfs::live_exe(program).filter(|path| path.is_absolute())?;
+    let fdinfo = dir.read(&std::ffi::CString::new(format!("fdinfo/{fd}")).ok()?)?;
+    let fdinfo = String::from_utf8_lossy(&fdinfo);
+    let inode = std::fs::metadata(&program).ok()?.ino();
+    let held = procfs::exec_opened(&fdinfo) && procfs::open_inode(&fdinfo) == Some(inode);
+    let maps = std::io::BufReader::new(dir.open(c"maps")?);
+    (held && procfs::maps_executable(maps, program.as_os_str().as_bytes())).then_some(program)
+}
+
+/// A process's `/proc/<pid>` directory, held open: each read goes through its descriptor, never
+/// a path, so all are of the process the directory named when it opened (one that has exited
+/// reads nothing), and a translated process's read of itself is a peer's, where Rosetta answers
+/// a path read of its own `/proc/<pid>/exe` itself (`docs/measured/linux-rosetta-2026-10-17.md`).
+#[cfg(any(target_os = "linux", target_os = "android", all(test, unix)))]
+struct ProcDir(std::fs::File);
+
+#[cfg(any(target_os = "linux", target_os = "android", all(test, unix)))]
+impl ProcDir {
+    /// The most [`ProcDir::read`] takes: far past any `auxv`, and a regular file's `fdinfo`.
+    const READ_MAX: usize = 64 << 10;
+
+    /// `pid`'s directory under `proc`.
+    fn of(proc: &std::path::Path, pid: i32) -> Option<Self> {
+        std::fs::File::open(proc.join(pid.to_string()))
+            .ok()
+            .map(Self)
+    }
+
+    /// The file `name` names under the directory, opened to read.
+    fn open(&self, name: &std::ffi::CStr) -> Option<std::fs::File> {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+        // SAFETY: the directory is open for the call and `name` is NUL-terminated.
+        let fd = unsafe {
+            libc::openat(
+                self.0.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return None;
+        }
+        // SAFETY: `openat` just returned `fd`, which nothing else owns.
+        Some(std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+    }
+
+    /// The bytes of the file `name` names, `None` past [`ProcDir::READ_MAX`].
+    fn read(&self, name: &std::ffi::CStr) -> Option<Vec<u8>> {
+        use std::io::Read as _;
+        let mut bytes = Vec::new();
+        self.open(name)?
+            .take(Self::READ_MAX as u64 + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        (bytes.len() <= Self::READ_MAX).then_some(bytes)
+    }
+
+    /// The link `name` names under the directory, `None` past 4095 bytes.
+    fn link(&self, name: &std::ffi::CStr) -> Option<std::path::PathBuf> {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::ffi::OsStringExt as _;
+        let mut buf = [0u8; 4096];
+        // SAFETY: the directory is open, `name` is NUL-terminated, and `readlinkat` writes at
+        // most `buf.len()` bytes.
+        let n = unsafe {
+            libc::readlinkat(
+                self.0.as_raw_fd(),
+                name.as_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+            )
+        };
+        let len = usize::try_from(n).ok().filter(|&len| len < buf.len())?;
+        Some(std::ffi::OsString::from_vec(buf[..len].to_vec()).into())
+    }
+}
+
+/// Whether the kernel handed this process's translator the program it runs on a descriptor and
+/// this process maps the file on it executable, as under Rosetta's `binfmt_misc` registration
+/// (its `O` flag): read off this process's `auxv`, that descriptor's link and `maps` with the
+/// pure readers ([`procfs::exec_fd`], [`procfs::maps_executable`]), never through
+/// [`read_process_path`], so a test that is not run without it is never skipped by a broken
+/// read. Under a translator that opens its program by path, or maps it only readable, the
+/// kernel records no translated program, and a translated process reads as its translator. A
+/// test seam.
+#[cfg(all(
+    any(test, debug_assertions),
+    any(target_os = "linux", target_os = "android")
+))]
+#[must_use]
+pub fn translator_holds_its_program() -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+    let me = i32::try_from(std::process::id()).unwrap_or(0);
+    let Some(dir) = ProcDir::of(std::path::Path::new("/proc"), me) else {
+        return false;
+    };
+    let handed = dir.read(c"auxv").as_deref().and_then(procfs::exec_fd);
+    let program = handed
+        .and_then(|fd| std::ffi::CString::new(format!("fd/{fd}")).ok())
+        .and_then(|link| dir.link(&link));
+    program.is_some_and(|program| {
+        dir.open(c"maps").is_some_and(|maps| {
+            procfs::maps_executable(
+                std::io::BufReader::new(maps),
+                program.as_os_str().as_bytes(),
+            )
+        })
+    })
+}
+
+/// See the Linux twin: `binfmt_misc` is Linux's, so no translator here is handed a program.
+#[cfg(all(
+    any(test, debug_assertions),
+    not(any(target_os = "linux", target_os = "android"))
+))]
+#[must_use]
+pub const fn translator_holds_its_program() -> bool {
+    false
 }
 
 /// See the Apple twin.
@@ -705,6 +924,8 @@ pub fn read_process_path(_pid: i32) -> Option<std::path::PathBuf> {
 struct BsdInfo {
     birth: ProcessBirth,
     parent: u32,
+    /// `pbi_flags` (`PROC_FLAG_*`).
+    flags: u32,
 }
 
 #[cfg(target_vendor = "apple")]
@@ -712,6 +933,7 @@ struct BsdInfo {
 fn read_bsdinfo(pid: i32) -> Option<BsdInfo> {
     const PROC_PIDTBSDINFO: i32 = 3;
     const SIZE: usize = 136;
+    const FLAGS: usize = 0;
     const STATUS: usize = 4;
     const PID: usize = 12;
     const PPID: usize = 16;
@@ -767,6 +989,7 @@ fn read_bsdinfo(pid: i32) -> Option<BsdInfo> {
             microseconds: u64_at(START_USEC)?,
         },
         parent: u32_at(PPID)?,
+        flags: u32_at(FLAGS)?,
     })
 }
 
@@ -1248,6 +1471,30 @@ pub fn read_process_start(pid: i32) -> Option<ProcessStart> {
     Some(ProcessStart { boot, wall: None })
 }
 
+/// How far [`read_process_start`]'s `boot` can precede a process's real start on Linux, in
+/// nanoseconds: one tick of `/proc/<pid>/stat`'s start time, `AT_CLKTCK` a second (10 ms at
+/// 100), rounded up ([`procfs::tick_span`]).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[must_use]
+pub fn proc_start_tick_ns() -> Option<u64> {
+    linux_reader().and_then(|(_, per_second)| procfs::tick_span(per_second))
+}
+
+/// See the Linux twin: no `/proc` start record is read here.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[must_use]
+pub const fn proc_start_tick_ns() -> Option<u64> {
+    None
+}
+
+/// How many ticks a second `/proc/<pid>/stat`'s start time counts (`AT_CLKTCK`), on Linux: what
+/// [`procfs::tick_start`] reads a start at.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[must_use]
+pub fn stat_ticks_per_second() -> Option<u64> {
+    linux_reader().map(|(_, per_second)| per_second)
+}
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[cfg_attr(trust_verify, trust::skip)]
 #[cfg_attr(
@@ -1270,9 +1517,12 @@ fn linux_reader() -> Option<(u32, u64)> {
 
 /// A `/proc` text file, its bytes decoded lossily. The kernel writes a command name as raw
 /// bytes cut at 15 (a UTF-8 letter may be cut, and `prctl(PR_SET_NAME)` sets any bytes), so
-/// `stat` and `status` need hold no UTF-8; every field a reader here parses is ASCII.
-#[cfg(any(target_os = "linux", target_os = "android", all(test, unix)))]
-pub(crate) fn read_proc_text(path: &std::path::Path) -> std::io::Result<String> {
+/// `stat`, `status` and `comm` need hold no UTF-8; a command name is words only, and every
+/// field a reader here parses is ASCII. Every OS has it, for a reader that finds `/proc` there.
+///
+/// # Errors
+/// The file's read error.
+pub fn read_proc_text(path: &std::path::Path) -> std::io::Result<String> {
     std::fs::read(path).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
 }
 
@@ -1299,12 +1549,12 @@ fn stat_row(path: &std::path::Path) -> procfs::StatRead {
     stat_read(read_proc_text(path))
 }
 
-/// A `/proc/<pid>/stat` read as a group listing takes it: its text, gone (`ENOENT`, `ESRCH`),
-/// or unreadable (any other error). Under a `hidepid=1` mount another user's `/proc/<pid>` is
-/// listed and its files answer `EPERM`, so such a row is unreadable and no listing there is
-/// whole; under `hidepid=2` the kernel lists no such directory at all.
+/// A `/proc/<pid>/stat` read as a group listing and a descriptor table take it: its text, gone
+/// (`ENOENT`, `ESRCH`), or unreadable (any other error). Under a `hidepid=1` mount another
+/// user's `/proc/<pid>` is listed and its files answer `EPERM`, so such a row is unreadable and
+/// no listing there is whole; under `hidepid=2` the kernel lists no such directory at all.
 #[cfg(any(target_os = "linux", target_os = "android", all(test, unix)))]
-fn stat_read(read: std::io::Result<String>) -> procfs::StatRead {
+pub(crate) fn stat_read(read: std::io::Result<String>) -> procfs::StatRead {
     match read {
         Ok(text) => procfs::StatRead::Text(text),
         Err(why)
@@ -1334,7 +1584,8 @@ pub mod procfs {
     #[must_use]
     pub fn stat_start(stat: &str, pid: i32) -> Option<(char, u64)> {
         let open = stat.find(" (")?;
-        if stat[..open].trim().parse::<i32>().ok()? != pid {
+        let p = stat[..open].trim();
+        if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) || p.parse::<i32>().ok()? != pid {
             return None;
         }
         let close = stat.rfind(')')?;
@@ -1343,19 +1594,21 @@ pub mod procfs {
         }
         let mut fields = stat[close + 1..].split_ascii_whitespace();
         let state = fields.next()?.chars().next()?;
-        let start = fields.nth(18)?.parse().ok()?;
+        let start = fields
+            .nth(18)
+            .filter(|s| s.bytes().all(|b| b.is_ascii_digit()))?
+            .parse()
+            .ok()?;
         Some((state, start))
     }
 
     /// The parent pid in a `/proc/<pid>/status` text.
     #[must_use]
     pub fn parent(status: &str) -> Option<u32> {
-        status
-            .lines()
-            .find_map(|l| l.strip_prefix("PPid:"))?
-            .trim()
-            .parse()
-            .ok()
+        let p = status.lines().find_map(|l| l.strip_prefix("PPid:"))?.trim();
+        (!p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| p.parse().ok())
+            .flatten()
     }
 
     /// Returns `link` unless the kernel marks it ` (deleted)`.
@@ -1364,13 +1617,106 @@ pub mod procfs {
         (!link.as_os_str().as_encoded_bytes().ends_with(b" (deleted)")).then_some(link)
     }
 
+    /// The descriptor `AT_EXECFD` names in a `/proc/<pid>/auxv`, the kernel's native-endian
+    /// 64-bit `(type, value)` pairs up to `AT_NULL`: the program `binfmt_misc` opened and
+    /// handed the interpreter it started (its `O` flag), at its start.
+    #[must_use]
+    pub fn exec_fd(auxv: &[u8]) -> Option<i32> {
+        const AT_NULL: u64 = 0;
+        const AT_EXECFD: u64 = 2;
+        for pair in auxv.as_chunks::<16>().0 {
+            let (kind, value) = pair.split_at(8);
+            match u64::from_ne_bytes(kind.try_into().ok()?) {
+                AT_NULL => return None,
+                AT_EXECFD => return i32::try_from(u64::from_ne_bytes(value.try_into().ok()?)).ok(),
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Whether a `/proc/<pid>/fdinfo/<fd>` text says the kernel opened the file to exec it: its
+    /// `flags:`, octal digits only, carry `__FMODE_EXEC` (`0o40`), which no program's `open`
+    /// can set.
+    #[must_use]
+    pub fn exec_opened(fdinfo: &str) -> bool {
+        const FMODE_EXEC: u32 = 0o40;
+        fdinfo
+            .lines()
+            .find_map(|line| line.strip_prefix("flags:"))
+            .map(str::trim)
+            .filter(|flags| !flags.is_empty() && flags.bytes().all(|b| matches!(b, b'0'..=b'7')))
+            .and_then(|flags| u32::from_str_radix(flags, 8).ok())
+            .is_some_and(|flags| flags & FMODE_EXEC != 0)
+    }
+
+    /// The inode a `/proc/<pid>/fdinfo/<fd>` text says the descriptor's file is: its `ino:`,
+    /// decimal digits only, which the kernel prints from Linux 5.14 on.
+    #[must_use]
+    pub fn open_inode(fdinfo: &str) -> Option<u64> {
+        fdinfo
+            .lines()
+            .find_map(|line| line.strip_prefix("ino:"))
+            .map(str::trim)
+            .filter(|ino| !ino.is_empty() && ino.bytes().all(|b| b.is_ascii_digit()))?
+            .parse()
+            .ok()
+    }
+
+    /// Whether the `/proc/<pid>/maps` rows `maps` reads map `path`, which is not empty,
+    /// executable: a row whose permissions (its second field) grant `x` and whose path (all
+    /// after its fifth) is `path` as `maps` prints it, which writes a newline as `\012`. It
+    /// reads a row at a time up to the first such row, and a read that fails finds none.
+    #[must_use]
+    pub fn maps_executable(mut maps: impl std::io::BufRead, path: &[u8]) -> bool {
+        if path.is_empty() {
+            return false;
+        }
+        let mut shown = Vec::with_capacity(path.len());
+        for &byte in path {
+            if byte == b'\n' {
+                shown.extend_from_slice(b"\\012");
+            } else {
+                shown.push(byte);
+            }
+        }
+        let mut row = Vec::new();
+        loop {
+            row.clear();
+            if maps
+                .read_until(b'\n', &mut row)
+                .map_or(true, |read| read == 0)
+            {
+                return false;
+            }
+            let mut rest = row.strip_suffix(b"\n").unwrap_or(&row);
+            let mut perms: &[u8] = &[];
+            for field in 0..5 {
+                rest = rest.trim_ascii_start();
+                let end = rest
+                    .iter()
+                    .position(u8::is_ascii_whitespace)
+                    .unwrap_or(rest.len());
+                let (word, after) = rest.split_at(end);
+                if field == 1 {
+                    perms = word;
+                }
+                rest = after;
+            }
+            if perms.get(2) == Some(&b'x') && rest.trim_ascii_start() == shown {
+                return true;
+            }
+        }
+    }
+
     /// The effective uid in a `/proc/<pid>/status` text.
     #[must_use]
     pub fn effective_uid(status: &str) -> Option<u32> {
         let line = status.lines().find(|l| l.starts_with("Uid:"))?;
         line["Uid:".len()..]
             .split_ascii_whitespace()
-            .nth(1)?
+            .nth(1)
+            .filter(|s| s.bytes().all(|b| b.is_ascii_digit()))?
             .parse()
             .ok()
     }
@@ -1385,12 +1731,22 @@ pub mod procfs {
         u64::try_from(nanos).ok().map(BootClock)
     }
 
+    /// How far a start [`tick_start`] reads at `per_second` ticks a second can precede the real
+    /// one, in nanoseconds: Linux counts a start in whole ticks, so the real start lies within
+    /// one tick after the first instant of its tick; a tick, rounded up (`None` at 0 a second).
+    #[must_use]
+    pub fn tick_span(per_second: u64) -> Option<u64> {
+        (per_second > 0).then(|| 1_000_000_000_u64.div_ceil(per_second))
+    }
+
     /// `pid`'s `/proc/<pid>/stat` line, whole, when it names `pid` itself
     /// ([`aterm_sysprobe::jobs::linux::parse_stat`], whose command name runs to the last `)`).
     #[cfg(any(unix, windows))]
-    fn stat_line(stat: &str, pid: i32) -> Option<aterm_sysprobe::jobs::linux::StatLine> {
+    #[must_use]
+    pub fn stat_line(stat: &str, pid: i32) -> Option<aterm_sysprobe::jobs::linux::StatLine> {
         let open = stat.find(" (")?;
-        if stat[..open].trim().parse::<i32>().ok()? != pid {
+        let p = stat[..open].trim();
+        if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) || p.parse::<i32>().ok()? != pid {
             return None;
         }
         aterm_sysprobe::jobs::linux::parse_stat(stat)
@@ -1413,15 +1769,26 @@ pub mod procfs {
         stat_line(stat, pid).is_some_and(|line| exited(&line))
     }
 
+    /// `PF_FORKNOEXEC`, the task flag the kernel sets on a forked task and clears at its exec.
+    #[cfg(any(unix, windows))]
+    const PF_FORKNOEXEC: u64 = 0x40;
+
+    /// Whether `stat`, `pid`'s `/proc/<pid>/stat`, shows a process that has run an exec since
+    /// its fork: its flags (field 9) without [`PF_FORKNOEXEC`]. `None`: another pid's line, or
+    /// one cut short.
+    #[cfg(any(unix, windows))]
+    #[must_use]
+    pub fn execd_row(stat: &str, pid: i32) -> Option<bool> {
+        stat_line(stat, pid).map(|line| line.flags & PF_FORKNOEXEC == 0)
+    }
+
     /// The thread-group id in a `/proc/<pid>/status` text: its `Tgid:` line.
     #[must_use]
     pub fn thread_group(status: &str) -> Option<i32> {
-        status
-            .lines()
-            .find_map(|l| l.strip_prefix("Tgid:"))?
-            .trim()
-            .parse()
-            .ok()
+        let t = status.lines().find_map(|l| l.strip_prefix("Tgid:"))?.trim();
+        (!t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| t.parse().ok())
+            .flatten()
     }
 
     /// `pid`'s [`super::Lineage`] from its `stat`, its `status` and `stat` read again after
@@ -2249,6 +2616,115 @@ mod start_tests {
         assert_eq!(birth_of_filetime(EPOCH - 1), None);
     }
 
+    /// What Linux says of a process Rosetta translates, as measured in the lane's guest
+    /// (`docs/measured/linux-rosetta-exe-2026-10-30.md`): `auxv` names the descriptor
+    /// `binfmt_misc` handed the translator (`AT_EXECFD`, 3, after `AT_PLATFORM`), whose `fdinfo`
+    /// carries the exec open's mark and the program's inode, and `maps` maps the program
+    /// executable, a newline in its path as `maps` prints one (`\012`). NEGATIVE CONTROLS: a
+    /// native process's `auxv`, and an `AT_EXECFD` past `AT_NULL`, name no descriptor;
+    /// `/dev/null` put on it is no exec open; an `fdinfo` with no `ino:` (before Linux 5.14) or
+    /// a signed one names no inode; a file mapped only readable (libc's row, and the program's
+    /// once its `r-xp` row is gone) is not mapped executable, and neither is a path that only
+    /// begins like the program's or runs past it, nor no path.
+    #[test]
+    fn a_translated_program_reads_off_the_descriptor_the_kernel_handed_its_translator() {
+        let auxv = |pairs: &[(u64, u64)]| -> Vec<u8> {
+            pairs
+                .iter()
+                .flat_map(|&(kind, value)| [kind.to_ne_bytes(), value.to_ne_bytes()])
+                .flatten()
+                .collect()
+        };
+        let translated = [
+            (33, 275_810_927_144_960),
+            (6, 4096),
+            (3, 140_737_488_355_392),
+            (9, 140_737_488_515_072),
+            (31, 281_474_101_522_403),
+            (15, 281_474_101_517_848),
+            (2, 3),
+            (27, 28),
+            (28, 32),
+            (0, 0),
+        ];
+        assert_eq!(procfs::exec_fd(&auxv(&translated)), Some(3));
+        let native = [
+            (6, 4096),
+            (3, 215_624_163_786_816),
+            (9, 215_624_163_789_760),
+            (0, 0),
+        ];
+        assert_eq!(procfs::exec_fd(&auxv(&native)), None, "a native process");
+        assert_eq!(
+            procfs::exec_fd(&auxv(&[(6, 4096), (0, 0), (2, 3)])),
+            None,
+            "past AT_NULL"
+        );
+
+        assert!(procfs::exec_opened(
+            "pos:\t64\nflags:\t0400040\nmnt_id:\t32\nino:\t797962\n"
+        ));
+        assert!(
+            !procfs::exec_opened("pos:\t0\nflags:\t0400000\nmnt_id:\t25\nino:\t5\n"),
+            "/dev/null put on the descriptor"
+        );
+        assert!(!procfs::exec_opened("pos:\t0\nmnt_id:\t25\n"), "no flags");
+        assert!(
+            !procfs::exec_opened("flags:\t+0400040\n"),
+            "a sign is no octal digit"
+        );
+        assert_eq!(
+            procfs::open_inode("pos:\t64\nflags:\t0400040\nmnt_id:\t32\nino:\t797962\n"),
+            Some(797_962)
+        );
+        assert_eq!(
+            procfs::open_inode("pos:\t64\nflags:\t0400040\nmnt_id:\t32\n"),
+            None,
+            "before 5.14"
+        );
+        assert_eq!(procfs::open_inode("ino:\t+797962\n"), None, "a sign");
+
+        const MAPS: &[u8] = b"\
+555555554000-555555555000 r--p 00000000 fd:01 797962                     /tmp/rp.OR2FwC/probe
+555555555000-555555556000 r-xp 00001000 fd:01 797962                     /tmp/rp.OR2FwC/probe
+555555558000-555555559000 rw-p 00003000 fd:01 797962                     /tmp/rp.OR2FwC/probe
+55555555a000-55555555b000 r-xp 00001000 fd:01 262170                     /var/cache/rosettad/5e6b.aotcache
+55555555b000-555555563000 r-xp 00000000 00:00 0
+7fffff326000-7fffff34e000 r--p 00000000 fd:01 525283                     /usr/lib/x86_64-linux-gnu/libc.so.6
+";
+        assert!(procfs::maps_executable(MAPS, b"/tmp/rp.OR2FwC/probe"));
+        assert!(!procfs::maps_executable(
+            MAPS,
+            b"/usr/lib/x86_64-linux-gnu/libc.so.6"
+        ));
+        assert!(
+            !procfs::maps_executable(MAPS, b"/tmp/rp.OR2FwC/prob"),
+            "a prefix"
+        );
+        assert!(
+            !procfs::maps_executable(MAPS, b"/tmp/rp.OR2FwC/probe2"),
+            "a longer name"
+        );
+        assert!(
+            !procfs::maps_executable(MAPS, b""),
+            "no path, though an anonymous row is executable"
+        );
+        let odd = b"555555555000-555555556000 r-xp 00001000 fd:01 797963   /tmp/a\\012b/probe\n";
+        assert!(
+            procfs::maps_executable(&odd[..], b"/tmp/a\nb/probe"),
+            "maps prints a newline as \\012"
+        );
+        let read_only: Vec<u8> = MAPS
+            .split(|&b| b == b'\n')
+            .filter(|row| !row.windows(4).any(|w| w == b"r-xp"))
+            .flat_map(|row| [row, b"\n"].concat())
+            .collect();
+        assert!(!procfs::maps_executable(
+            read_only.as_slice(),
+            b"/tmp/rp.OR2FwC/probe"
+        ));
+    }
+
     const TRICKY: &str = "7 (a) b (c) S 1 1 1 0 -1 4194368 63 0 0 0 0 0 0 0 20 0 1 0 51832760 \
          7032832 463 18446744073709551615 205458244435968 205458248030472 281474793899808 0 0 0 \
          0 128 0 1 0 0 17 0 0 0 0 0 0 205458248044264 205458248115556 205458772447232 \
@@ -2335,6 +2811,110 @@ mod start_tests {
             Some(BootClock(518_318_710_000_000))
         );
         assert_eq!(procfs::tick_start(7, 3), Some(BootClock(2_333_333_333)));
+    }
+
+    /// A start Linux records in ticks precedes the real one by less than [`procfs::tick_span`]:
+    /// every tick's first instant ([`procfs::tick_start`]) lies within one span of the next, at
+    /// rates that divide a second (100, 250, 1000) and ones that do not (3, 1024, 7 million),
+    /// and no rate is no span. NEGATIVE CONTROL (scratch): a span rounded down fails at 3 a
+    /// second, whose tick 2 spans 333 333 334 ns, one past it.
+    #[test]
+    fn a_linux_start_tick_spans_every_tick_rounded_up() {
+        assert_eq!(procfs::tick_span(100), Some(10_000_000));
+        assert_eq!(procfs::tick_span(0), None);
+        for per_second in [3, 100, 250, 1000, 1024, 7_000_000] {
+            let span = procfs::tick_span(per_second).expect("a span");
+            for ticks in [0, 1, 2, 3, 1023, 51_831_871] {
+                let first = procfs::tick_start(ticks, per_second).expect("this tick").0;
+                let next = procfs::tick_start(ticks + 1, per_second)
+                    .expect("the next")
+                    .0;
+                assert!(
+                    next - first <= span,
+                    "{per_second}/s: tick {ticks} spans {} > {span}",
+                    next - first
+                );
+            }
+        }
+    }
+
+    /// Whether a process has exec'd since its fork, off `/proc/<pid>/stat` as Linux writes it:
+    /// the flags, field 9 of the line (the 7th after the command name's last `)`), without
+    /// `PF_FORKNOEXEC` (0x40). TRICKY's 4194368 is `PF_RANDOMIZE | PF_FORKNOEXEC`, a fork that
+    /// has not exec'd; CAT's 4194304 has exec'd; another pid's line or one cut short reads
+    /// nothing. NEGATIVE CONTROL (scratch): test `PF_RANDOMIZE` (0x400000) instead, and CAT reads
+    /// as not exec'd.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_linux_exec_since_the_fork_is_read_off_the_stat_flags() {
+        assert_eq!(procfs::execd_row(CAT, 13), Some(true), "exec'd");
+        assert_eq!(procfs::execd_row(TRICKY, 7), Some(false), "forked, no exec");
+        assert_eq!(
+            procfs::execd_row(&CAT.replacen(" 4194304 ", " 4194368 ", 1), 13),
+            Some(false),
+            "the same line forked"
+        );
+        assert_eq!(procfs::execd_row(CAT, 14), None, "another pid's line");
+        assert_eq!(
+            procfs::execd_row("13 (cat) R 1 1 1 0 -1 4194304 43 0 0", 13),
+            None,
+            "cut short"
+        );
+    }
+
+    /// The kernel's own record: a forked child parked before any exec reads `Some(false)`, and a
+    /// spawned child (an exec) and this test process read `Some(true)`, on macOS (the BSD info's
+    /// `PROC_FLAG_EXEC`) and Linux (`/proc/<pid>/stat`). NEGATIVE CONTROL (scratch): a reader
+    /// that answers `Some(true)` for every live process fails "a fork that has not exec'd".
+    #[cfg(unix)]
+    #[test]
+    fn a_forked_child_reads_as_not_execd_until_it_execs() {
+        use std::os::fd::AsRawFd as _;
+        let own = i32::try_from(std::process::id()).unwrap();
+        let wired = cfg!(any(target_vendor = "apple", target_os = "linux"));
+        if !wired {
+            assert_eq!(super::read_process_execd(own), None);
+            return;
+        }
+        assert_eq!(super::read_process_execd(own), Some(true), "this process");
+        let mut spawned = crate::spawnfd::command("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn /bin/sleep");
+        let spawned_pid = i32::try_from(spawned.id()).unwrap();
+        let spawned_execd = super::read_process_execd(spawned_pid);
+        let _ = spawned.kill();
+        let _ = spawned.wait();
+        assert_eq!(spawned_execd, Some(true), "a spawned child");
+        let (go_r, go_w) = std::io::pipe().expect("pipe");
+        let (go_fd, go_w_fd) = (go_r.as_raw_fd(), go_w.as_raw_fd());
+        // SAFETY: the child calls only async-signal-safe functions (`close`, `read`, `_exit`)
+        // on descriptors opened before `fork`, then exits without unwinding.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            let mut b = 0u8;
+            // SAFETY: as above.
+            unsafe {
+                libc::close(go_w_fd);
+                loop {
+                    let n = libc::read(go_fd, (&raw mut b).cast(), 1);
+                    if n >= 0
+                        || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+                    {
+                        break;
+                    }
+                }
+                libc::_exit(0);
+            }
+        }
+        drop(go_r);
+        let forked = super::read_process_execd(pid);
+        drop(go_w);
+        let mut status = 0;
+        // SAFETY: `pid` is this test's own child, reaped once here.
+        let _ = unsafe { libc::waitpid(pid, &raw mut status, 0) };
+        assert_eq!(forked, Some(false), "a fork that has not exec'd");
     }
 
     /// A status whose thread group is `pid`, with effective uid 502.
@@ -2499,6 +3079,12 @@ mod start_tests {
         let full = procfs::group_of(many, 500, true);
         assert_eq!(full.pids.len(), super::MAX_GROUP_PIDS);
         assert!(!full.complete, "past the bound");
+        assert_eq!(procfs::parent("PPid:\t+12\n"), None);
+        assert_eq!(
+            procfs::effective_uid("Uid:\t1000\t+1000\t1000\t1000\n"),
+            None
+        );
+        assert_eq!(procfs::thread_group("Tgid:\t+500\n"), None);
     }
 
     /// `/proc` lists every process only under a `proc` mount at `/proc` with no `hidepid`, or
@@ -2754,7 +3340,7 @@ mod start_tests {
 #[cfg(all(test, unix))]
 mod kill_self_tests {
     use std::os::unix::process::ExitStatusExt;
-    use std::process::{Command, Stdio};
+    use std::process::Command;
 
     const CHILD_ENV: &str = "ATERM_UDS_TEST_KILL_SELF_CHILD";
 
@@ -2763,16 +3349,15 @@ mod kill_self_tests {
         if std::env::var_os(CHILD_ENV).is_some() {
             super::kill_self_now();
         }
-        let status = Command::new(std::env::current_exe().expect("the test binary"))
-            .arg("process::kill_self_tests::kill_self_now_dies_by_sigkill")
-            .arg("--exact")
-            .arg("--test-threads=1")
-            .env(CHILD_ENV, "1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .expect("re-exec this test binary as the child");
+        let status = crate::deadline::std_ends_within(
+            Command::new(std::env::current_exe().expect("the test binary"))
+                .arg("process::kill_self_tests::kill_self_now_dies_by_sigkill")
+                .arg("--exact")
+                .arg("--test-threads=1")
+                .env(CHILD_ENV, "1"),
+            crate::deadline::ECHO_HANG,
+        )
+        .status;
         assert_eq!(status.signal(), Some(9), "the child's end: {status}");
     }
 }
@@ -2829,7 +3414,10 @@ mod presence_tests {
 
 #[cfg(test)]
 mod end_proven_tests {
-    use super::{Birth, EndControl, EndRefusal, Ended, Identity, end_proven, signal_by_handle};
+    use super::{
+        Birth, EndControl, EndRefusal, Ended, Identity, KEEPS_PID_VERSIONS, end_proven,
+        signal_by_handle,
+    };
     use std::time::Duration;
 
     fn ident(pid: i32, idversion: i32) -> Identity {
@@ -3074,6 +3662,86 @@ mod end_proven_tests {
         assert_eq!(linux.token(), "4242@51832760");
     }
 
+    #[test]
+    fn a_token_round_trips_its_identity() {
+        let apple = ident(63452, 331_207);
+        assert_eq!(Identity::parse_shaped(&apple.token(), true), Some(apple));
+        let linux = Identity {
+            pid: 4242,
+            birth: Birth(51_832_760),
+            idversion: None,
+        };
+        assert_eq!(Identity::parse_shaped(&linux.token(), false), Some(linux));
+        let here = if KEEPS_PID_VERSIONS { apple } else { linux };
+        assert_eq!(Identity::parse(&here.token()), Some(here));
+    }
+
+    #[test]
+    fn a_bare_pid_a_pattern_or_a_word_is_no_token() {
+        for versioned in [true, false] {
+            for bad in [
+                "",
+                "4242",
+                "all",
+                "*",
+                "4242@*",
+                "42*@1792000000000042:7",
+                "aterm@1792000000000042:7",
+                "1@1792000000000042:7",
+                "0@1792000000000042:7",
+                "-4242@1792000000000042:7",
+                "+4242@1792000000000042:7",
+                "4242@+1792000000000042:7",
+                "4242@1792000000000042:-7",
+                "4242@1792000000000042:+7",
+                " 4242@1792000000000042:7",
+                "4242@1792000000000042:7 ",
+                "4242 @1792000000000042:7",
+                "04242@1792000000000042:7",
+                "4242@01792000000000042:7",
+                "4242@1792000000000042:07",
+                "99999999999@1792000000000042:7",
+                "4242@99999999999999999999999:7",
+                "4242@1792000000000042:99999999999",
+                "4242@1792000000000042:7:8",
+                "4242@1792000000000042:7@9",
+                "4242@1792000000000042@9",
+                "4242@",
+                "@1792000000000042:7",
+                "4242@1792000000000042:",
+                "4242@51832760:",
+            ] {
+                assert_eq!(Identity::parse_shaped(bad, versioned), None, "{bad:?}");
+            }
+        }
+    }
+
+    /// Negative control: let the versioned shape take a token with no `:<version>`, and the
+    /// Linux-shaped token reads as an Apple one.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn a_versionless_token_is_refused_where_the_kernel_keeps_versions() {
+        assert_eq!(Identity::parse("4242@51832760"), None);
+        assert_eq!(
+            Identity::parse("4242@1792000000000042:7"),
+            Some(ident(4242, 7))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_versioned_token_is_refused_where_the_kernel_keeps_none() {
+        assert_eq!(Identity::parse("4242@1792000000000042:7"), None);
+        assert_eq!(
+            Identity::parse("4242@51832760"),
+            Some(Identity {
+                pid: 4242,
+                birth: Birth(51_832_760),
+                idversion: None,
+            })
+        );
+    }
+
     /// What [`signal_by_handle`] did, in order, with what it passed: the pid opened and read,
     /// the handle and signal sent, the pid and signal killed.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3238,6 +3906,227 @@ mod tests {
     }
 }
 
+/// What a process's own `/proc` directory says it runs, judged on a made `/proc`, so the
+/// Linux read's composition holds on every platform.
+#[cfg(all(test, unix))]
+mod program_tests {
+    use super::program_in;
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+    use std::path::{Path, PathBuf};
+
+    const ROSETTA: &[u8] = b"/mnt/lima-rosetta/rosetta";
+    /// A translated process's `auxv` pairs, as measured: `AT_EXECFD` (2) names descriptor 3.
+    const TRANSLATED: &[(u64, u64)] = &[(33, 275_810_927_144_960), (6, 4096), (2, 3), (0, 0)];
+    /// A native process's: no `AT_EXECFD`.
+    const NATIVE: &[(u64, u64)] = &[(33, 281_474_842_492_928), (6, 4096), (0, 0)];
+
+    /// `auxv` as the kernel writes it: native-endian 64-bit `(type, value)` pairs.
+    fn auxv(pairs: &[(u64, u64)]) -> Vec<u8> {
+        pairs
+            .iter()
+            .flat_map(|&(kind, value)| [kind.to_ne_bytes(), value.to_ne_bytes()])
+            .flatten()
+            .collect()
+    }
+
+    /// Writes `pid`'s directory under `proc`: its `exe` link, its `auxv` (none at all for
+    /// `None`), descriptor 3's link and `fdinfo` when it holds one, and its `maps`.
+    fn process(
+        proc: &Path,
+        pid: i32,
+        exe: &[u8],
+        pairs: Option<&[(u64, u64)]>,
+        handed: Option<(&[u8], &str)>,
+        maps: &[u8],
+    ) {
+        let dir = proc.join(pid.to_string());
+        std::fs::create_dir_all(dir.join("fd")).expect("its fd directory");
+        std::fs::create_dir_all(dir.join("fdinfo")).expect("its fdinfo directory");
+        std::os::unix::fs::symlink(OsStr::from_bytes(exe), dir.join("exe")).expect("its exe");
+        if let Some(pairs) = pairs {
+            std::fs::write(dir.join("auxv"), auxv(pairs)).expect("its auxv");
+        }
+        if let Some((link, info)) = handed {
+            std::os::unix::fs::symlink(OsStr::from_bytes(link), dir.join("fd/3"))
+                .expect("its descriptor 3");
+            std::fs::write(dir.join("fdinfo/3"), info).expect("its fdinfo");
+        }
+        std::fs::write(dir.join("maps"), maps).expect("its maps");
+    }
+
+    /// `maps` rows of the file `shown` (the path as `maps` prints it, a newline as `\012`) with
+    /// inode `ino`, its `r-xp` row only when `executable`, then the translator's own.
+    fn rows(shown: &[u8], ino: u64, executable: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (range, perms) in [
+            ("555555554000-555555555000", "r--p"),
+            ("555555555000-555555556000", "r-xp"),
+            ("555555558000-555555559000", "rw-p"),
+        ] {
+            if perms == "r-xp" && !executable {
+                continue;
+            }
+            out.extend_from_slice(
+                format!("{range} {perms} 00001000 fd:01 {ino}                     ").as_bytes(),
+            );
+            out.extend_from_slice(shown);
+            out.push(b'\n');
+        }
+        out.extend_from_slice(
+            b"7fffff326000-7fffff34e000 r-xp 00000000 fd:01 525283                     \
+              /mnt/lima-rosetta/rosetta\n",
+        );
+        out
+    }
+
+    /// An `fdinfo` of the kernel's exec open of inode `ino`, as measured.
+    fn exec_open(ino: u64) -> String {
+        format!("pos:\t64\nflags:\t0400040\nmnt_id:\t32\nino:\t{ino}\n")
+    }
+
+    /// A translated process (Rosetta's exe, `AT_EXECFD` 3 holding the kernel's exec open of a
+    /// program it maps `r-xp`) reads as that program, under `binfmt_misc`'s `O` flag whatever
+    /// path the registration names its interpreter by (Debian's qemu one names a link), and so
+    /// does one whose path holds a newline, which `maps` prints as `\012`. A process the kernel
+    /// handed no descriptor reads as its `exe`, a registered interpreter run natively
+    /// (`python3.12` under `binfmt-support`) and a translator registered with no `O` flag
+    /// included, as does one whose `auxv` does not read. NEGATIVE CONTROLS, one per conjunct,
+    /// each `None`: an `exe` the kernel marks ` (deleted)`; descriptor 3 gone; a program only
+    /// mapped readable; a descriptor link the kernel marks ` (deleted)`, though `maps` marks
+    /// its rows alike; a descriptor without the exec mark; an exec open of another file than the
+    /// one the link names (a library's descriptor swapped between the reads); a link that is
+    /// no path (`pipe:[…]`), though `maps` shows it, nor a relative one, though it names a file
+    /// from the directory the tests run in.
+    #[test]
+    fn a_process_reads_as_the_program_its_own_proc_directory_names() {
+        let root = aterm_tempfile::tempdir().expect("scratch");
+        let proc = root.path().join("proc");
+        let registered = proc.join("sys/fs/binfmt_misc");
+        std::fs::create_dir_all(&registered).expect("binfmt_misc");
+        for (name, text) in [
+            ("status", "enabled\n"),
+            (
+                "rosetta",
+                "enabled\ninterpreter /mnt/lima-rosetta/rosetta\nflags: OCF\noffset 0\n",
+            ),
+            (
+                "python3.12",
+                "enabled\ninterpreter /usr/bin/python3.12\nflags: \noffset 0\n",
+            ),
+            (
+                "qemu-x86_64",
+                "enabled\ninterpreter /usr/libexec/qemu-binfmt/x86_64-binfmt-P\nflags: POCF\n",
+            ),
+        ] {
+            std::fs::write(registered.join(name), text).expect("a registration");
+        }
+        let program = |dir: &str| -> (PathBuf, u64) {
+            let dir = root.path().join(dir);
+            std::fs::create_dir_all(&dir).expect("a program's directory");
+            let file = dir.join("probe");
+            std::fs::write(&file, b"\x7fELF").expect("a program");
+            let ino = std::fs::metadata(&file).expect("its inode").ino();
+            (file, ino)
+        };
+        let (probe, ino) = program("bin");
+        let (_library, library_ino) = program("lib");
+        let (odd, odd_ino) = program("a\nb");
+        let probe_bytes = probe.as_os_str().as_bytes();
+        let open = exec_open(ino);
+        let mapped = rows(probe_bytes, ino, true);
+        let translated = |pid, exe: &[u8], link: &[u8], info: &str, maps: &[u8]| {
+            process(&proc, pid, exe, Some(TRANSLATED), Some((link, info)), maps);
+        };
+        let native =
+            |pid, exe: &[u8]| process(&proc, pid, exe, Some(NATIVE), None, &rows(exe, 7, true));
+        let mut wrong = Vec::new();
+        let mut read = |pid, want: Option<&[u8]>, what: &str| {
+            let (got, want) = (
+                program_in(&proc, pid),
+                want.map(|w| PathBuf::from(OsStr::from_bytes(w))),
+            );
+            if got != want {
+                wrong.push(format!("{what} (pid {pid}): {got:?}, not {want:?}"));
+            }
+        };
+
+        translated(10, ROSETTA, probe_bytes, &open, &mapped);
+        read(10, Some(probe_bytes), "a translated program");
+        let qemu: &[u8] = b"/usr/bin/qemu-x86_64-static";
+        translated(11, qemu, probe_bytes, &open, &mapped);
+        read(11, Some(probe_bytes), "an O registration by a link");
+        let odd_bytes = odd.as_os_str().as_bytes();
+        let shown = [root.path().as_os_str().as_bytes(), b"/a\\012b/probe"].concat();
+        translated(
+            12,
+            ROSETTA,
+            odd_bytes,
+            &exec_open(odd_ino),
+            &rows(&shown, odd_ino, true),
+        );
+        read(12, Some(odd_bytes), "a newline in the program's path");
+
+        let python: &[u8] = b"/usr/bin/python3.12";
+        native(20, python);
+        read(20, Some(python), "native python");
+        native(21, qemu);
+        read(21, Some(qemu), "no O flag");
+        process(
+            &proc,
+            22,
+            ROSETTA,
+            None,
+            Some((probe_bytes, open.as_str())),
+            &mapped,
+        );
+        read(22, Some(ROSETTA), "no auxv");
+
+        native(30, b"/usr/bin/sleep (deleted)");
+        read(30, None, "a deleted exe");
+        process(&proc, 31, ROSETTA, Some(TRANSLATED), None, &mapped);
+        read(31, None, "descriptor 3 gone");
+        translated(
+            32,
+            ROSETTA,
+            probe_bytes,
+            &open,
+            &rows(probe_bytes, ino, false),
+        );
+        read(32, None, "a program mapped only readable");
+        let gone = [probe_bytes, b" (deleted)"].concat();
+        translated(33, ROSETTA, &gone, &open, &rows(&gone, ino, true));
+        read(33, None, "a deleted program");
+        let plain = format!("pos:\t0\nflags:\t0400000\nmnt_id:\t32\nino:\t{ino}\n");
+        translated(34, ROSETTA, probe_bytes, &plain, &mapped);
+        read(34, None, "no exec mark");
+        translated(35, ROSETTA, probe_bytes, &exec_open(library_ino), &mapped);
+        read(35, None, "another file's exec open");
+        translated(
+            36,
+            ROSETTA,
+            b"pipe:[4026]",
+            &open,
+            &rows(b"pipe:[4026]", ino, true),
+        );
+        read(36, None, "no path");
+        let near = b"Cargo.toml";
+        let near_ino = std::fs::metadata(OsStr::from_bytes(near))
+            .expect("this crate's manifest, beside the tests")
+            .ino();
+        translated(
+            37,
+            ROSETTA,
+            near,
+            &exec_open(near_ino),
+            &rows(near, near_ino, true),
+        );
+        read(37, None, "a relative path");
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+}
+
 #[cfg(all(test, any(target_vendor = "apple", target_os = "linux")))]
 mod parent_and_path_tests {
     use super::{read_process_parent, read_process_path};
@@ -3255,6 +4144,103 @@ mod parent_and_path_tests {
             path.canonicalize().expect("path exists"),
             exe.canonicalize().expect("exe exists")
         );
+    }
+
+    /// A child reads as the program it runs, translated or not: under a binary translator the
+    /// kernel names the translator, and the read takes the program the kernel handed it
+    /// (`AT_EXECFD`). A translated child reads `None` from its exec until its translator has
+    /// mapped its program, so the first read is waited for. It is not run under a translator the
+    /// kernel hands no program it maps executable (`translator_holds_its_program`), where a
+    /// translated process reads as its translator. NEGATIVE CONTROL, under a translator: once
+    /// the child holds its program, which it opened itself, on that descriptor in place of the
+    /// kernel's exec open, it reads `None`, to this process and to itself alike: a file a
+    /// process holds open is no proof it runs it, mapped or not, and Rosetta's own answer to a
+    /// translated process's path read of its `exe` is no record of the kernel's.
+    #[test]
+    fn a_child_reads_as_the_program_it_runs() {
+        use std::io::Write as _;
+        use std::path::{Path, PathBuf};
+        const NAME: &str = "process::parent_and_path_tests::a_child_reads_as_the_program_it_runs";
+        const PARK_ENV: &str = "ATERM_UDS_TEST_PATH_PARK";
+        const ITSELF: &str = "it reads itself as None";
+        if std::env::var_os(PARK_ENV).is_some() {
+            let mut line = String::new();
+            let _ = std::io::stdin().read_line(&mut line);
+            #[cfg(target_os = "linux")]
+            if let Ok(fd) = line.trim().parse::<i32>() {
+                use std::os::fd::AsRawFd as _;
+                let own = std::fs::File::open(std::env::current_exe().expect("the program"))
+                    .expect("the program, opened");
+                // SAFETY: `own` is open for the call; `dup2` closes what `fd` held and puts a
+                // copy of `own` there, and nothing in this process owns `fd` as a `File`.
+                unsafe { libc::dup2(own.as_raw_fd(), fd) };
+                let me = i32::try_from(std::process::id()).expect("a pid");
+                println!("it reads itself as {:?}", read_process_path(me));
+                let _ = std::io::stdin().read_line(&mut line);
+            }
+            return;
+        }
+        if let Some(translator) = super::translator()
+            && !super::translator_holds_its_program()
+        {
+            println!(
+                "NOT RUN under {translator}: {NAME}: the kernel hands this translator no program \
+                 it maps executable, so a translated process reads as the translator"
+            );
+            return;
+        }
+        let exe = std::env::current_exe().expect("the test binary");
+        let mut child = crate::spawnfd::command(&exe)
+            .args([
+                "--exact",
+                NAME,
+                "--nocapture",
+                "--quiet",
+                "--test-threads=1",
+            ])
+            .env(PARK_ENV, "1")
+            .stdin(crate::spawnfd::Stdio::piped())
+            .stdout(crate::spawnfd::Stdio::piped())
+            .stderr(crate::spawnfd::Stdio::null())
+            .spawn()
+            .expect("the parked copy");
+        let pid = i32::try_from(child.id()).expect("a pid");
+        let program = exe.canonicalize().expect("the test binary, canonical");
+        let is_program = |read: &Option<PathBuf>| {
+            read.as_deref().and_then(|path| path.canonicalize().ok()) == Some(program.clone())
+        };
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut read = read_process_path(pid);
+        while !is_program(&read) && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            read = read_process_path(pid);
+        }
+        let mut covered = None;
+        if super::translator().is_some() {
+            let auxv = std::fs::read(format!("/proc/{pid}/auxv")).expect("the child's auxv");
+            let fd = super::procfs::exec_fd(&auxv).expect("the descriptor it was handed");
+            let stdin = child.stdin.as_mut().expect("the child's stdin");
+            writeln!(stdin, "{fd}").expect("the descriptor, sent");
+            crate::deadline::prints(&mut child, ITSELF, crate::deadline::ECHO_HANG);
+            let swapped = is_program(&std::fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok())
+                && super::read_proc_text(Path::new(&format!("/proc/{pid}/fdinfo/{fd}")))
+                    .is_ok_and(|info| !super::procfs::exec_opened(&info));
+            covered = Some((swapped, read_process_path(pid)));
+        }
+        drop(child.stdin.take());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            is_program(&read),
+            "the parked copy's program: {read:?}, not {exe:?}"
+        );
+        if let Some((swapped, read)) = covered {
+            assert!(
+                swapped,
+                "the handed descriptor holds the program the child opened"
+            );
+            assert_eq!(read, None, "a program the child opened itself is no proof");
+        }
     }
 
     #[cfg(target_os = "linux")]

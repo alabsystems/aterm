@@ -14,8 +14,8 @@ Result: **1 spec** (discharged at compile time), **0 runtime `#[test]` fns**. **
 
 ## 0. Notation used in the statements
 
-- `PF` := `windows_sys::Win32::System::Threading::PF_ARM_V8_CRYPTO_INSTRUCTIONS_AVAILABLE`. It is declared in
-  `src/lib.rs` as `pub const PF: PROCESSOR_FEATURE_ID = 30u32`, where `PROCESSOR_FEATURE_ID = u32`.
+- `PF` := `windows_sys::Win32::System::Threading::PF_ARM_V8_CRYPTO_INSTRUCTIONS_AVAILABLE`, declared in
+  `src/lib.rs` as a `PROCESSOR_FEATURE_ID` (`= u32`) with the value `30u32`.
 - `RECORDED` := the answers windows-sys 0.52.0 gave the oracle (`tests/oracle/PROVENANCE.md`;
   `targo --unverified run -p aterm-win32-oracle -- oracle-052` runs it; x86_64- and
   aarch64-pc-windows-msvc, recorded 2026-10-15).
@@ -26,8 +26,8 @@ Result: **1 spec** (discharged at compile time), **0 runtime `#[test]` fns**. **
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes`,
-`difficulty (Rust features the proof must handle)`, `blocking gaps (audit §7)`.
+`difficulty` is the Rust features a proof must handle; `blocking gaps` are rows of
+`docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7.
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking gaps
@@ -44,7 +44,7 @@ WSYS052-PF-VALUE	table-property	windows_sys::Win32::System::Threading::PF_ARM_V8
 file	test	primary	also
 ```
 
-## 3. Coverage
+## 5. Open finding
 
 - 0 runtime `#[test]` fns remain (1 original test converted to CTFE; 0 non-spec samples).
 - All four recorded declarations, including `WSYS052-PF-VALUE`, are checked by the compiler on

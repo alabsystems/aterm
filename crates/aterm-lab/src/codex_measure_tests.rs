@@ -223,8 +223,36 @@ fn a_reduction_that_is_no_fixed_point_refuses_fixed_point() {
     );
 }
 
+/// STEP 4's privacy check, which each run's legs pass (`reduce_legs`): a first pass that keeps
+/// text of its rollout refuses TEXT, naming the leg; the reducer's own keeps none.
 #[test]
-fn a_key_or_record_no_build_showed_refuses_new_key() {
+fn a_leg_whose_first_pass_keeps_rollout_text_refuses_text() {
+    let begin = r#"{"timestamp":"2000-01-01T00:00:01.000Z","type":"event_msg","payload":{"type":"exec_command_begin","call_id":"call_abc","command":["bash","-lc","cat quokkaledger-plan.md"],"parsed_cmd":[{"type":"read","cmd":"cat quokkaledger-plan.md","name":"quokkaledger-plan.md","path":"/private/tmp/x/quokkaledger-plan.md"}]}}"#;
+    let source = format!("{}\n{begin}\n", meta(B));
+    let first = reduce::reduce(&source, Program::Codex).expect("pass 1");
+    assert!(!first.text.contains("quokka"), "{}", first.text);
+    text_kept("second", &source, &first).expect("the reducer keeps no text");
+    let kept = reduce::Reduction {
+        text: first
+            .text
+            .replacen("\"cmd\":\"\"", "\"cmd\":\"cat quokkaledger-plan.md\"", 1),
+        ..first.clone()
+    };
+    assert!(
+        kept.text.contains("quokkaledger"),
+        "the command planted back"
+    );
+    let r = text_kept("second", &source, &kept).expect_err("the oracle finds the command");
+    assert_eq!(r.class, Class::Text, "{}", r.why);
+    assert!(r.why.starts_with("second: "), "{}", r.why);
+}
+
+/// THE JUDGE'S RULE on rollouts, where no row kind is inert: a new key no build showed, and a new
+/// record kind, wait on run 2, which admits each by its leg's row carrying it or refuses it as
+/// one no run exercised; a new key the fold reads refuses at step 5; and the reducer's key names
+/// are no new key.
+#[test]
+fn a_new_rollout_key_waits_on_run_2_and_a_new_one_the_fold_reads_refuses() {
     let old = format!(
         "{}\n{}\n{}\n",
         header(B),
@@ -242,27 +270,62 @@ fn a_key_or_record_no_build_showed_refuses_new_key() {
         (j.builds, j.prev.as_deref()),
         (1, Some("0.165.0-dev.13580+gaaaaaaaaa"))
     );
-    let key = vec![(
+    assert!(j.pending.is_empty() && j.noted.is_empty(), "{j:?}");
+    let new = vec![(
         "first",
         format!(
-            "{old}{}\n",
-            r#"{"type":"event_msg","payload":{"type":"task_complete","brand_new_key":1}}"#
-        ),
-    )];
-    let r = judge(&CODEX, B, &key, &committed).expect_err("a key no build showed");
-    assert_eq!(r.class, Class::NewKey, "{}", r.why);
-    assert!(r.why.contains("key \"brand_new_key\""), "{}", r.why);
-    let kind = vec![(
-        "first",
-        format!(
-            "{old}{}\n",
+            "{old}{}\n{}\n",
+            r#"{"type":"event_msg","payload":{"type":"task_complete","brand_new_key":1}}"#,
             r#"{"type":"event_msg","payload":{"type":"brand_new_event"}}"#
         ),
     )];
-    let r = judge(&CODEX, B, &kind, &committed).expect_err("a record no build showed");
+    let j = judge(&CODEX, B, &new, &committed).expect("left to run 2");
+    let said: Vec<String> = j
+        .pending
+        .iter()
+        .map(crate::measure::Pending::said)
+        .collect();
+    assert_eq!(
+        said,
+        [
+            "first: key \"brand_new_key\" on event_msg/task_complete",
+            "first: record event_msg/brand_new_event"
+        ]
+    );
+    let admitted = exercised(&CODEX, B, &j.pending, RUN2, &new, &|_, _, row| {
+        format!("row {row}")
+    })
+    .expect("run 2 carries both");
+    assert_eq!(
+        admitted,
+        [
+            "first: key \"brand_new_key\" on event_msg/task_complete: run 2 (expecting `bound`), row 3 (row 2)",
+            "first: record event_msg/brand_new_event: run 2 (expecting `bound`), row 4 (row 3)"
+        ]
+    );
+    let r = exercised(&CODEX, B, &j.pending, RUN2, &same, &|_, _, _| String::new())
+        .expect_err("run 2 carries neither");
     assert_eq!(r.class, Class::NewKey, "{}", r.why);
     assert!(
-        r.why.contains("record event_msg/brand_new_event"),
+        r.why
+            .contains("first: key \"brand_new_key\" on event_msg/task_complete")
+            && r.why.contains("first: record event_msg/brand_new_event")
+            && r.why.contains("no run exercised it"),
+        "{}",
+        r.why
+    );
+    let read = vec![(
+        "first",
+        format!(
+            "{old}{}\n",
+            r#"{"type":"response_item","payload":{"type":"function_call","call_id":"c"}}"#
+        ),
+    )];
+    let r = judge(&CODEX, B, &read, &committed).expect_err("a key the fold reads");
+    assert_eq!(r.class, Class::NewKey, "{}", r.why);
+    assert!(
+        r.why
+            .contains("key \"call_id\" on response_item/function_call, a key the fold reads"),
         "{}",
         r.why
     );
@@ -275,7 +338,8 @@ fn a_key_or_record_no_build_showed_refuses_new_key() {
             r#"{"type":"event_msg","payload":{"type":"task_complete","k9":{"k10":1}}}"#
         ),
     )];
-    judge(&CODEX, B, &renamed, &committed).expect("the reducer's key names are no new key");
+    let j = judge(&CODEX, B, &renamed, &committed).expect("the reducer's key names are no new key");
+    assert!(j.pending.is_empty(), "{:?}", j.pending);
 }
 
 #[test]
@@ -378,6 +442,7 @@ fn the_committed_builds_read_as_measured_with_nothing_the_verb_would_refuse() {
     assert_eq!(j.prev.as_deref(), Some("0.164.0-dev.13172+g32a73bca2"));
     assert_eq!(j.builds, 4);
     assert!(j.noted.is_empty(), "{:?}", j.noted);
+    assert!(j.pending.is_empty(), "{:?}", j.pending);
     assert_eq!(
         step_shapes(Program::Codex, &legs[2].1),
         [

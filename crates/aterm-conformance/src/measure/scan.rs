@@ -327,6 +327,9 @@ pub fn max_circular_hue_distance_degrees(angles: &[f64]) -> f64 {
 /// The four-connected components of a saturated pixel map, in ascending order of their first pixel.
 #[must_use]
 pub fn ink_objects(w: usize, h: usize, sat: &SatMap) -> Vec<Vec<usize>> {
+    if w == 0 || h == 0 {
+        return Vec::new();
+    }
     let mut seen = BTreeSet::new();
     let mut objects = Vec::new();
     for &start in sat.keys() {
@@ -340,9 +343,13 @@ pub fn ink_objects(w: usize, h: usize, sat: &SatMap) -> Vec<Vec<usize>> {
             let (x, y) = (p % w, p / w);
             let neighbours = [
                 (x > 0).then(|| p - 1),
-                (x + 1 < w).then(|| p + 1),
+                x.checked_add(1)
+                    .filter(|&nx| nx < w)
+                    .and_then(|_| p.checked_add(1)),
                 (y > 0).then(|| p - w),
-                (y + 1 < h).then(|| p + w),
+                y.checked_add(1)
+                    .filter(|&ny| ny < h)
+                    .and_then(|_| p.checked_add(w)),
             ];
             for q in neighbours.into_iter().flatten() {
                 if sat.contains_key(&q) && seen.insert(q) {
@@ -377,7 +384,10 @@ pub fn band_ink_partition(
     cell_h: usize,
     exclude: &[PixelBox],
 ) -> (usize, HueSet, usize) {
-    let cap = cell_h + BAND_OBJECT_ABOVE_CELL_MAX_PX;
+    if w == 0 || h == 0 {
+        return (0, HueSet::default(), 0);
+    }
+    let cap = cell_h.saturating_add(BAND_OBJECT_ABOVE_CELL_MAX_PX);
     let mut band_ink = 0;
     let mut band_hues = HueSet::default();
     let mut animal_ink = 0;
@@ -444,12 +454,14 @@ pub const REACH_MIN_CELLS: usize = 18;
 /// off the frame.
 #[must_use]
 pub fn band_top(w: usize, tinted: &BTreeSet<usize>, row: TypedRow, cell: Cell) -> Option<usize> {
-    if w == 0 {
+    if w == 0 || row.bottom == 0 {
         return None;
     }
-    let top = row.bottom.checked_sub(REACH_WINDOW_CELLS * cell.h)?;
-    let below = row.bottom + cell.h;
-    if row.bottom == 0 || below > row.frame_h {
+    let top = row
+        .bottom
+        .checked_sub(REACH_WINDOW_CELLS.checked_mul(cell.h)?)?;
+    let below = row.bottom.checked_add(cell.h)?;
+    if below > row.frame_h {
         return None;
     }
     let mut counts = vec![0_usize; below - top];
@@ -460,10 +472,11 @@ pub fn band_top(w: usize, tinted: &BTreeSet<usize>, row: TypedRow, cell: Cell) -
         }
     }
     let width = counts[row.bottom - 1 - top..].iter().copied().max()?;
-    if width < REACH_MIN_CELLS * cell.w {
+    if (width as u128) < (REACH_MIN_CELLS as u128) * (cell.w as u128) {
         return None;
     }
-    let floor = (width * REACH_ROW_NUM).div_ceil(REACH_ROW_DEN);
+    let floor =
+        ((width as u128) * (REACH_ROW_NUM as u128)).div_ceil(REACH_ROW_DEN as u128) as usize;
     let band_rows = counts[..row.bottom - top]
         .iter()
         .rev()
@@ -499,7 +512,7 @@ fn count_band_object(
         .map(|p| p / w)
         .fold((usize::MAX, 0), |(lo, hi), y| (lo.min(y), hi.max(y)));
     let trimmed: Vec<usize>;
-    let members = if ymax - ymin + 1 > cap {
+    let members = if ymax - ymin >= cap {
         let mut rows: BTreeMap<usize, usize> = BTreeMap::new();
         for &p in members {
             *rows.entry(p / w).or_default() += 1;
@@ -512,7 +525,7 @@ fn count_band_object(
             .map(|(&y, _)| y)
             .collect();
         let (first, last) = (band_rows.first()?, band_rows.last()?);
-        if last - first + 1 > cap {
+        if last - first >= cap {
             return None;
         }
         trimmed = members
@@ -543,6 +556,9 @@ fn count_band_object(
 /// The peak hue separation between samples sharing a raster row and one object.
 #[must_use]
 pub fn object_row_hue_separation(w: usize, h: usize, sat: &SatMap) -> f64 {
+    if w == 0 || h == 0 {
+        return 0.0;
+    }
     let mut best = 0.0_f64;
     for members in ink_objects(w, h, sat) {
         let mut rows: BTreeMap<usize, Vec<f64>> = BTreeMap::new();
@@ -559,6 +575,9 @@ pub fn object_row_hue_separation(w: usize, h: usize, sat: &SatMap) -> f64 {
 /// The peak hue span across one raster row's flat slab runs: the quantized, seam-split band's diagnostic.
 #[must_use]
 pub fn banded_row_span(w: usize, sat: &SatMap) -> f64 {
+    if w == 0 {
+        return 0.0;
+    }
     let mut columns: BTreeMap<usize, usize> = BTreeMap::new();
     for &p in sat.keys() {
         *columns.entry(p % w).or_default() += 1;
@@ -1231,9 +1250,13 @@ pub fn driven_window_darkness(
     if ordered.len() < 2 {
         return DrivenWindow::NOT_MEASURED;
     }
-    let mut deltas: Vec<i64> = ordered.windows(2).map(|w| w[1].0 - w[0].0).collect();
+    let mut deltas: Vec<i128> = ordered
+        .windows(2)
+        .map(|w| i128::from(w[1].0) - i128::from(w[0].0))
+        .collect();
     deltas.sort_unstable();
     let nominal = deltas[deltas.len() / 2];
+    let clamp_i64 = |v: i128| v.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
     let lit_by_name: BTreeMap<&str, bool> = names
         .iter()
         .map(String::as_str)
@@ -1244,12 +1267,15 @@ pub fn driven_window_darkness(
         .map(String::as_str)
         .zip(duplicates.iter().copied())
         .collect();
-    let anchor = index.covered_from.unwrap_or(ordered[0].0);
-    let low = anchor + lo_ms * 1000;
-    let high = anchor + hi_ms * 1000 + DRIVEN_GRACE_US;
+    let anchor = i128::from(index.covered_from.unwrap_or(ordered[0].0));
+    let low = anchor + i128::from(lo_ms) * 1000;
+    let high = anchor + i128::from(hi_ms) * 1000 + i128::from(DRIVEN_GRACE_US);
     let window: Vec<(i64, &str)> = ordered
         .into_iter()
-        .filter(|&(t, _)| low <= t && t <= high)
+        .filter(|&(t, _)| {
+            let t128 = i128::from(t);
+            low <= t128 && t128 <= high
+        })
         .collect();
     if window.len() < 2 {
         return DrivenWindow::NOT_MEASURED;
@@ -1277,29 +1303,29 @@ pub fn driven_window_darkness(
         .find(|pair| pair[0].1 && pair[1].1)
         .map(|pair| pair[0].0);
     let charge_from = onset.unwrap_or(window_start);
-    let mature_lead = charge_from - window_start;
-    let mut worst = 0_i64;
+    let mature_lead = clamp_i64(i128::from(charge_from) - i128::from(window_start));
+    let mut worst = 0_i128;
     let mut run: Vec<i64> = Vec::new();
     for &(t, lit, _) in &resolved {
         if t < charge_from {
             continue;
         }
         if lit {
-            if let (Some(first), Some(last)) = (run.first(), run.last()) {
-                worst = worst.max(last - first + nominal);
+            if let (Some(&first), Some(&last)) = (run.first(), run.last()) {
+                worst = worst.max(i128::from(last) - i128::from(first) + nominal);
             }
             run.clear();
         } else {
             run.push(t);
         }
     }
-    if let (Some(first), Some(last)) = (run.first(), run.last()) {
+    if let (Some(&first), Some(&last)) = (run.first(), run.last()) {
         let allowance = if onset.is_some() {
-            EXHALE_CLOSE_ALLOWANCE_US
+            i128::from(EXHALE_CLOSE_ALLOWANCE_US)
         } else {
             0
         };
-        worst = worst.max((last - first + nominal - allowance).max(0));
+        worst = worst.max((i128::from(last) - i128::from(first) + nominal - allowance).max(0));
     }
     let window_end = window[window.len() - 1].0;
     let samples: BTreeSet<i64> = window
@@ -1314,12 +1340,16 @@ pub fn driven_window_darkness(
         )
         .collect();
     let samples: Vec<i64> = samples.into_iter().collect();
-    let hole = samples.windows(2).map(|w| w[1] - w[0]).max().unwrap_or(0);
+    let hole = samples
+        .windows(2)
+        .map(|w| i128::from(w[1]) - i128::from(w[0]))
+        .max()
+        .unwrap_or(0);
     DrivenWindow {
-        dark_us: worst,
+        dark_us: clamp_i64(worst),
         frames: window.len(),
-        sampling_hole_us: hole,
-        nominal_dt_us: nominal,
+        sampling_hole_us: clamp_i64(hole),
+        nominal_dt_us: clamp_i64(nominal),
         mature_lead_us: mature_lead,
     }
 }
@@ -1327,8 +1357,15 @@ pub fn driven_window_darkness(
 /// The strongest thin ribbon component over the saturated set: 8-connected, bridging one-pixel seams along the row (never vertically, which would merge separate glyph bodies).
 #[must_use]
 pub fn thin_ribbon_component(w: usize, h: usize, dynamic: &BTreeSet<usize>, cell: Cell) -> Shape {
-    let min_width = RIBBON_COMPONENT_MIN_WIDTH_FLOOR.max((3 * cell.w).div_ceil(4));
-    let min_pixels = RIBBON_COMPONENT_MIN_PIXELS_FLOOR.max(min_width + 2);
+    if w == 0 || h == 0 {
+        return Shape::NONE;
+    }
+    let min_width = RIBBON_COMPONENT_MIN_WIDTH_FLOOR.max(
+        (3_u128 * (cell.w as u128))
+            .div_ceil(4)
+            .min(usize::MAX as u128) as usize,
+    );
+    let min_pixels = RIBBON_COMPONENT_MIN_PIXELS_FLOOR.max(min_width.saturating_add(2));
     let mut unseen = dynamic.clone();
     let mut best = Shape::NONE;
     while let Some(seed) = unseen.pop_first() {
@@ -1343,24 +1380,29 @@ pub fn thin_ribbon_component(w: usize, h: usize, dynamic: &BTreeSet<usize>, cell
             x1 = x1.max(x);
             y0 = y0.min(y);
             y1 = y1.max(y);
-            for ny in y.saturating_sub(1)..(y + 2).min(h) {
-                for nx in x.saturating_sub(1)..(x + 2).min(w) {
-                    let n = ny * w + nx;
-                    if unseen.remove(&n) {
+            for ny in y.saturating_sub(1)..y.saturating_add(2).min(h) {
+                for nx in x.saturating_sub(1)..x.saturating_add(2).min(w) {
+                    if let Some(n) = ny.checked_mul(w).and_then(|r| r.checked_add(nx))
+                        && unseen.remove(&n)
+                    {
                         stack.push(n);
                     }
                 }
             }
-            for nx in [x.checked_sub(2), Some(x + 2)].into_iter().flatten() {
-                if nx < w {
-                    let n = y * w + nx;
-                    if unseen.remove(&n) {
-                        stack.push(n);
-                    }
+            for nx in [x.checked_sub(2), x.checked_add(2)].into_iter().flatten() {
+                if nx < w
+                    && let Some(n) = y.checked_mul(w).and_then(|r| r.checked_add(nx))
+                    && unseen.remove(&n)
+                {
+                    stack.push(n);
                 }
             }
         }
-        let candidate = Shape::new(pixels, x1 - x0 + 1, y1 - y0 + 1);
+        let candidate = Shape::new(
+            pixels,
+            (x1 - x0).saturating_add(1),
+            (y1 - y0).saturating_add(1),
+        );
         if candidate.pixels >= min_pixels
             && candidate.width >= min_width
             && candidate.height <= RIBBON_COMPONENT_MAX_HEIGHT
@@ -1381,6 +1423,9 @@ pub fn attached_ribbon_run(
     changed: &BTreeSet<usize>,
     cell: Cell,
 ) -> RibbonRun {
+    if w == 0 || h == 0 {
+        return RibbonRun::NONE;
+    }
     let by_row = |points: &BTreeSet<usize>| {
         let mut rows: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
         for &p in points {
@@ -1392,7 +1437,7 @@ pub fn attached_ribbon_run(
     let changed_by_row = by_row(changed);
     let empty = BTreeSet::new();
     let mut cursor_spans: BTreeMap<usize, Vec<(usize, usize)>> = BTreeMap::new();
-    for top in 0..(h + 1).saturating_sub(cell.h) {
+    for top in 0..h.saturating_add(1).saturating_sub(cell.h) {
         let mut common = changed_by_row.get(&top).unwrap_or(&empty).clone();
         if common.len() < cell.w {
             continue;
@@ -1411,11 +1456,11 @@ pub fn attached_ribbon_run(
         let ordered: Vec<usize> = common.into_iter().collect();
         let (mut start, mut previous) = (ordered[0], ordered[0]);
         for x in ordered[1..].iter().copied().map(Some).chain([None]) {
-            if x == Some(previous + 1) {
+            if x == previous.checked_add(1) {
                 previous += 1;
                 continue;
             }
-            if previous - start + 1 >= cell.w {
+            if (previous - start).saturating_add(1) >= cell.w {
                 cursor_spans
                     .entry(bottom)
                     .or_default()
@@ -1427,7 +1472,7 @@ pub fn attached_ribbon_run(
             }
         }
     }
-    let min_width = ATTACHED_RIBBON_MIN_CELLS * cell.w;
+    let min_width = ATTACHED_RIBBON_MIN_CELLS.saturating_mul(cell.w);
     let mut best = RibbonRun::NONE;
     for (&y, spans) in &cursor_spans {
         let xs: Vec<usize> = points_by_row
@@ -1441,13 +1486,14 @@ pub fn attached_ribbon_run(
             }
             let pixels = end - start;
             let (lo, hi) = (xs[start], xs[end - 1]);
-            let width = hi - lo + 1;
-            let attached = spans
-                .iter()
-                .any(|&(left, right)| lo <= right + 2 && hi + 2 >= left);
+            let width = (hi - lo).saturating_add(1);
+            let attached = spans.iter().any(|&(left, right)| {
+                lo <= right.saturating_add(2) && hi.saturating_add(2) >= left
+            });
             if attached
                 && width >= min_width
-                && ATTACHED_RIBBON_DENSITY_DEN * pixels >= ATTACHED_RIBBON_DENSITY_NUM * width
+                && (ATTACHED_RIBBON_DENSITY_DEN as u128) * (pixels as u128)
+                    >= (ATTACHED_RIBBON_DENSITY_NUM as u128) * (width as u128)
                 && (width, pixels) > (best.width, best.pixels)
             {
                 best = RibbonRun::new(pixels, width, y);
@@ -1824,7 +1870,7 @@ pub fn scan_frames(
     let mut frames = frames;
     let base = frames.next().ok_or(ScanError::NoFrames(PathBuf::new()))??;
     let background = frame_background(&base);
-    let alone_max_w = COMPANION_ALONE_MAX_WIDTH_CELL_HEIGHTS * cell.h;
+    let alone_max_w = COMPANION_ALONE_MAX_WIDTH_CELL_HEIGHTS.saturating_mul(cell.h);
 
     let mut r = ScanReport {
         frames: n,
@@ -2011,7 +2057,7 @@ pub fn scan_frames(
         let frame_i = i64::try_from(frame_no).unwrap_or(i64::MAX);
         if statuses.is_some() && bands >= 4 {
             r.ribbon_claimed += 1;
-            if frame_i > driven_last - RIBBON_CLOSE_GUARD_FRAMES {
+            if frame_i > driven_last.saturating_sub(RIBBON_CLOSE_GUARD_FRAMES) {
                 dark_candidates.push(false);
                 notes.push(FrameNote::RibbonExhale { bands });
             } else {

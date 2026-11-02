@@ -1,0 +1,222 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# Every dark scheme (foreach-scheme dark: the built-ins and the pack themes) at scale 2, a 12 pt
+# window on a Retina display, whose face the light glass draws under (docs/design/PRISM-GLASS.md
+# §15.8 amendment 53), with a live band (keys landing every 90 ms) under DECSCNM held from 1420 ms
+# to 10100 ms: the reversed page is a light pair no table ships, so a latch that admitted the
+# dark scheme would solve it in counted units (about 420 frames) and then draw a glass arm, which
+# trail-diff reports as an arm on a dark ground. The run lasts 11.1 s, past that
+# solve.
+
+foreach-scheme dark {
+  scale 2
+  grid 10 60
+  style rainbow kitty
+  hz 60
+
+  at 0 pty "\e[6;1H$ "
+  at 700 key g
+  at 702 pty "g"
+  at 790 key i
+  at 792 pty "i"
+  at 880 key t
+  at 882 pty "t"
+  at 970 key space
+  at 972 pty " "
+  at 1060 key l
+  at 1062 pty "l"
+  at 1150 key o
+  at 1152 pty "o"
+  at 1240 key g
+  at 1242 pty "g"
+  at 1330 key space
+  at 1332 pty " "
+  at 1420 pty "\e[?5h"
+  at 1420 key -
+  at 1422 pty "-"
+  at 1510 key -
+  at 1512 pty "-"
+  at 1600 key o
+  at 1602 pty "o"
+  at 1690 key n
+  at 1692 pty "n"
+  at 1780 key e
+  at 1782 pty "e"
+  at 1870 key l
+  at 1872 pty "l"
+  at 1960 key i
+  at 1962 pty "i"
+  at 2050 key n
+  at 2052 pty "n"
+  at 2140 key e
+  at 2142 pty "e"
+  at 2230 key space
+  at 2232 pty " "
+  at 2320 key -
+  at 2322 pty "-"
+  at 2410 key -
+  at 2412 pty "-"
+  at 2500 key g
+  at 2502 pty "g"
+  at 2590 key r
+  at 2592 pty "r"
+  at 2680 key a
+  at 2682 pty "a"
+  at 2770 key p
+  at 2772 pty "p"
+  at 2860 key h
+  at 2862 pty "h"
+  at 2950 key space
+  at 2952 pty " "
+  at 3040 key -
+  at 3042 pty "-"
+  at 3130 key -
+  at 3132 pty "-"
+  at 3220 key d
+  at 3222 pty "d"
+  at 3310 key e
+  at 3312 pty "e"
+  at 3400 key c
+  at 3402 pty "c"
+  at 3490 key o
+  at 3492 pty "o"
+  at 3580 key r
+  at 3582 pty "r"
+  at 3670 key a
+  at 3672 pty "a"
+  at 3760 key t
+  at 3762 pty "t"
+  at 3850 key e
+  at 3852 pty "e"
+  at 3940 key space
+  at 3942 pty " "
+  at 4030 key -
+  at 4032 pty "-"
+  at 4120 key -
+  at 4122 pty "-"
+  at 4210 key a
+  at 4212 pty "a"
+  at 4300 key l
+  at 4302 pty "l"
+  at 4390 key l
+  at 4392 pty "l"
+  at 4480 key space
+  at 4482 pty " "
+  at 4570 key -
+  at 4572 pty "-"
+  at 4660 key -
+  at 4662 pty "-"
+  at 4750 key space
+  at 4752 pty " "
+  at 4840 key c
+  at 4842 pty "c"
+  at 4930 key r
+  at 4932 pty "r"
+  at 5020 key a
+  at 5022 pty "a"
+  at 5110 key t
+  at 5112 pty "t"
+  at 5200 key e
+  at 5202 pty "e"
+  at 5290 key s
+  at 5292 pty "s"
+  at 5380 key space
+  at 5382 pty " "
+  at 5470 key a
+  at 5472 pty "a"
+  at 5560 key t
+  at 5562 pty "t"
+  at 5650 key e
+  at 5652 pty "e"
+  at 5740 key r
+  at 5742 pty "r"
+  at 5830 key m
+  at 5832 pty "m"
+  at 5920 key space
+  at 5922 pty " "
+  at 6010 key e
+  at 6012 pty "e"
+  at 6100 key f
+  at 6102 pty "f"
+  at 6190 key f
+  at 6192 pty "f"
+  at 6280 key e
+  at 6282 pty "e"
+  at 6370 key c
+  at 6372 pty "c"
+  at 6460 key t
+  at 6462 pty "t"
+  at 6550 key s
+  at 6552 pty "s"
+  at 6640 key space
+  at 6642 pty " "
+  at 6730 key r
+  at 6732 pty "r"
+  at 6820 key a
+  at 6822 pty "a"
+  at 6910 key i
+  at 6912 pty "i"
+  at 7000 key n
+  at 7002 pty "n"
+  at 7090 key b
+  at 7092 pty "b"
+  at 7180 key o
+  at 7182 pty "o"
+  at 7270 key w
+  at 7272 pty "w"
+  at 7360 key space
+  at 7362 pty " "
+  at 7450 key k
+  at 7452 pty "k"
+  at 7540 key i
+  at 7542 pty "i"
+  at 7630 key t
+  at 7632 pty "t"
+  at 7720 key t
+  at 7722 pty "t"
+  at 7810 key y
+  at 7812 pty "y"
+  at 7900 key space
+  at 7902 pty " "
+  at 7990 key a
+  at 7992 pty "a"
+  at 8080 key n
+  at 8082 pty "n"
+  at 8170 key d
+  at 8172 pty "d"
+  at 8260 key space
+  at 8262 pty " "
+  at 8350 key t
+  at 8352 pty "t"
+  at 8440 key h
+  at 8442 pty "h"
+  at 8530 key e
+  at 8532 pty "e"
+  at 8620 key space
+  at 8622 pty " "
+  at 8710 key p
+  at 8712 pty "p"
+  at 8800 key r
+  at 8802 pty "r"
+  at 8890 key i
+  at 8892 pty "i"
+  at 8980 key s
+  at 8982 pty "s"
+  at 9070 key m
+  at 9072 pty "m"
+  at 9160 key space
+  at 9162 pty " "
+  at 9250 key g
+  at 9252 pty "g"
+  at 9340 key l
+  at 9342 pty "l"
+  at 9430 key a
+  at 9432 pty "a"
+  at 9520 key s
+  at 9522 pty "s"
+  at 9610 key s
+  at 9612 pty "s"
+  at 10100 pty "\e[?5l"
+  run 11100
+}

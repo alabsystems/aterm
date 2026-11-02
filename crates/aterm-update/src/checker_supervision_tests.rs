@@ -581,15 +581,19 @@ fn an_unanswered_settings_query_is_logged_on_its_edges_and_not_every_miss() {
     }
 }
 
+/// A cycle's panic is on record in aterm.log by its kind and length, never its message: a
+/// message can quote what the cycle held, and the panic hook keeps it on stderr and in the crash
+/// report (DESIGN-session-log §3.6).
 #[test]
 fn a_panic_in_a_cycle_is_logged_and_the_loop_goes_round_again() {
+    const MESSAGE: &str = "injected checker panic over QZP7E7N1";
     static WATCH: CheckerWatch = CheckerWatch::new();
     let generation = WATCH.register(1_000);
     let calls = Arc::new(AtomicU64::new(0));
     let counted = Arc::clone(&calls);
     let provider: crate::SourceProvider = Arc::new(move || {
         if counted.fetch_add(1, Ordering::SeqCst) == 0 {
-            panic!("injected checker panic");
+            std::panic::panic_any(MESSAGE.to_string());
         }
         WATCH.supersede(generation);
         None
@@ -613,11 +617,21 @@ fn a_panic_in_a_cycle_is_logged_and_the_loop_goes_round_again() {
         "the cycle after the panic ran"
     );
     assert!(
+        !lines.iter().any(|(_, line)| line.contains("QZP7E7N")),
+        "aterm.log keeps the panic's message: {} line(s)",
+        lines.len()
+    );
+    // CONTROL: the line is still written, naming the panic's kind and the message's length.
+    let named = format!(
+        "an update check cycle panicked (other panic ({}B)); the checker carries on",
+        MESSAGE.len()
+    );
+    assert!(
         lines
             .iter()
-            .any(|(level, line)| *level == aterm_log::Level::Warn
-                && line.contains("injected checker panic")),
-        "the panic is on record with its message: {lines:?}"
+            .any(|(level, line)| *level == aterm_log::Level::Warn && line.starts_with(&named)),
+        "the panic is on record by its kind and length: {} line(s)",
+        lines.len()
     );
 }
 

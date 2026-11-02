@@ -185,6 +185,12 @@ fn the_tracker_ends_a_session_only_on_every_targets_exited_frame() {
     let mut t = FrameTracker::new("subscribe @s-a events\n");
     t.feed(b"sub 1 s-a\nEVENT 1 exited\nDELTA 1 seq=1 screen x\n");
     assert!(!t.session_over());
+    let mut t = FrameTracker::new("subscribe @s-a events\n");
+    t.feed(b"sub 1 s-a\nEVENT 1 exited\nDELTA 1 seq=1 screen +2\n");
+    assert!(!t.session_over());
+    let mut t = FrameTracker::new("subscribe @s-a events\n");
+    t.feed(b"sub 1 s-a\nEVENT 1 exited\nBYTES 1 +2\n");
+    assert!(!t.session_over());
 }
 
 #[test]

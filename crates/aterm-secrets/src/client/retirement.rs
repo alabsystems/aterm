@@ -365,9 +365,11 @@ impl Admin {
                         }
                     }
                 }
-                crate::membership_log::Body::Admit { entrant, .. } => {
+                crate::membership_log::Body::Admit { entrant, .. }
+                    if rec.actor() != &entrant.member() =>
+                {
                     let b = entrant.request.binding();
-                    if log.has_historical_seat(b) {
+                    if log.has_historical_seat(b) || membership.removed().contains_key(&b.actor()) {
                         known.insert(b.recipient());
                         if targets.contains(&b.recipient()) {
                             actors.insert(b.actor());
@@ -1160,31 +1162,91 @@ fn apply_swarm_revoke_cascade(
         || alab_vault(&admin.config);
 
     let mut revoked_labels = std::collections::BTreeSet::new();
+    let mut surviving_labels = std::collections::BTreeSet::new();
     let mut revoked_nodes = std::collections::BTreeSet::new();
     let mut display_label = crate::swarm_roster::leading_m_label(host)
         .map_or_else(|| host.to_owned(), |(_, canon)| canon);
     if let Some((_, canon)) = crate::swarm_roster::leading_m_label(host) {
         revoked_labels.insert(canon);
     }
+    let mut loaded_roster = if swarm_enabled {
+        let log_lbls = roster::log_labels(paths);
+        Some(roster::load_or_seed_swarm_roster_with_log(
+            admin, doc, &log_lbls,
+        )?)
+    } else {
+        None
+    };
+    let rostered_recipients: std::collections::BTreeSet<String> = loaded_roster
+        .as_ref()
+        .map(|r| {
+            r.members
+                .iter()
+                .filter(|m| m.recipient != recipient_str && m.vault_name != host)
+                .map(|m| m.recipient.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    for machine in doc.machines() {
+        if machine.recipient != recipient_str
+            && machine.name != host
+            && !rostered_recipients.contains(&machine.recipient)
+            && let Some((_, canon)) = crate::swarm_roster::leading_m_label(&machine.name)
+        {
+            surviving_labels.insert(canon);
+        }
+    }
+    let mut log_surviving_nodes = std::collections::BTreeSet::new();
     if let Ok(Some(log)) = log_entries::trusted_local_log(paths, &admin.config) {
         let membership = log.membership();
         let mut target_actors = std::collections::BTreeSet::new();
-        for (actor, member) in membership
-            .members()
-            .iter()
-            .filter(|(_, m)| m.binding.recipient() == *recipient)
-        {
-            target_actors.insert(*actor);
-            if let Some((_, canon)) = crate::swarm_roster::leading_m_label(&member.label) {
-                if crate::swarm_roster::leading_m_label(&display_label).is_none() {
-                    display_label = canon.clone();
+        for (actor, member) in membership.members() {
+            let rec = member.binding.recipient();
+            if rec == *recipient {
+                target_actors.insert(*actor);
+                if crate::membership_log::is_label(&member.label) {
+                    if crate::swarm_roster::leading_m_label(&display_label).is_none() {
+                        display_label = member.label.clone();
+                    }
+                    revoked_labels.insert(member.label.clone());
                 }
-                revoked_labels.insert(canon);
-            }
-            if let Some(nk) = member.node_key
-                && nk != [0; 32]
-            {
-                revoked_nodes.insert(aterm_codec::hex::encode_lower(&nk));
+                if let Some(nk) = member.node_key
+                    && nk != [0; 32]
+                {
+                    revoked_nodes.insert(aterm_codec::hex::encode_lower(&nk));
+                }
+            } else {
+                let node_removed = member.node_key.is_some_and(|nk| {
+                    nk != [0; 32]
+                        && matches!(
+                            membership.nodes().get(&nk),
+                            Some(crate::membership_log::NodeStanding::Removed(_))
+                        )
+                });
+                let rec_str = rec.to_bech32();
+                let roster_denied = loaded_roster
+                    .as_ref()
+                    .and_then(|r| r.member_by_recipient(&rec_str).map(|m| (r, m)))
+                    .is_some_and(|(r, m)| r.is_member_denied(m));
+                if !log.recipient_is_removed(&rec)
+                    && !log
+                        .audience_left_out(&crate::membership_log::EpochAudience::Everyone, actor)
+                    && !log.audience_left_out_recipient(
+                        &crate::membership_log::EpochAudience::Everyone,
+                        &rec,
+                    )
+                    && !node_removed
+                    && !roster_denied
+                {
+                    if let Some((_, canon)) = crate::swarm_roster::leading_m_label(&member.label)
+                        .or_else(|| crate::swarm_roster::leading_m_label(&member.name))
+                    {
+                        surviving_labels.insert(canon);
+                    }
+                    if let Some(nk) = member.node_key.filter(|k| *k != [0; 32]) {
+                        log_surviving_nodes.insert(aterm_codec::hex::encode_lower(&nk));
+                    }
+                }
             }
         }
         for (nk, standing) in membership.nodes() {
@@ -1200,37 +1262,69 @@ fn apply_swarm_revoke_cascade(
                 revoked_nodes.insert(aterm_codec::hex::encode_lower(nk));
             }
         }
-        for founder in membership
-            .unproved()
-            .iter()
-            .filter(|f| f.recipient == *recipient)
-        {
-            if let Some((_, canon)) = crate::swarm_roster::leading_m_label(&founder.label) {
-                if crate::swarm_roster::leading_m_label(&display_label).is_none() {
-                    display_label = canon.clone();
+        for founder in membership.unproved() {
+            if founder.recipient == *recipient {
+                if let Some((_, canon)) = crate::swarm_roster::leading_m_label(&founder.label)
+                    .filter(|(_, c)| c == &founder.label)
+                {
+                    if crate::swarm_roster::leading_m_label(&display_label).is_none() {
+                        display_label = canon.clone();
+                    }
+                    revoked_labels.insert(canon);
                 }
-                revoked_labels.insert(canon);
-            }
-            if let Some(nk) = founder.node_key
-                && nk != [0; 32]
-            {
-                revoked_nodes.insert(aterm_codec::hex::encode_lower(&nk));
+                if let Some(nk) = founder.node_key
+                    && nk != [0; 32]
+                {
+                    revoked_nodes.insert(aterm_codec::hex::encode_lower(&nk));
+                }
+            } else {
+                let node_removed = founder.node_key.is_some_and(|nk| {
+                    nk != [0; 32]
+                        && matches!(
+                            membership.nodes().get(&nk),
+                            Some(crate::membership_log::NodeStanding::Removed(_))
+                        )
+                });
+                let rec_str = founder.recipient.to_bech32();
+                let roster_denied = loaded_roster
+                    .as_ref()
+                    .and_then(|r| r.member_by_recipient(&rec_str).map(|m| (r, m)))
+                    .is_some_and(|(r, m)| r.is_member_denied(m));
+                if !log.recipient_is_removed(&founder.recipient)
+                    && !log.audience_left_out_recipient(
+                        &crate::membership_log::EpochAudience::Everyone,
+                        &founder.recipient,
+                    )
+                    && !node_removed
+                    && !roster_denied
+                {
+                    if let Some((_, canon)) = crate::swarm_roster::leading_m_label(&founder.label)
+                        .or_else(|| crate::swarm_roster::leading_m_label(&founder.name))
+                    {
+                        surviving_labels.insert(canon);
+                    }
+                    if let Some(nk) = founder.node_key.filter(|k| *k != [0; 32]) {
+                        log_surviving_nodes.insert(aterm_codec::hex::encode_lower(&nk));
+                    }
+                }
             }
         }
     }
 
-    if swarm_enabled {
-        let log_lbls = roster::log_labels(paths);
-        let mut roster = roster::load_or_seed_swarm_roster_with_log(admin, doc, &log_lbls)?;
+    if let Some(mut roster) = loaded_roster.take() {
         let mut kept = Vec::with_capacity(roster.members.len());
-        for member in roster.members {
+        let mut surviving_nodes = log_surviving_nodes;
+        for member in std::mem::take(&mut roster.members) {
             if member.recipient == recipient_str || member.vault_name == host {
                 display_label = member.label.clone();
                 revoked_labels.insert(member.label);
                 for alias in member.aliases {
                     revoked_labels.insert(alias);
                 }
-                if let Some(claimed) = member.claimed_label {
+                if let Some(claimed) = member
+                    .claimed_label
+                    .filter(|c| crate::membership_log::is_label(c))
+                {
                     revoked_labels.insert(claimed);
                 }
                 if let Some(node_id) = member.node_id {
@@ -1240,9 +1334,38 @@ fn apply_swarm_revoke_cascade(
                     revoked_nodes.insert(node_key);
                 }
             } else {
+                if !roster.is_member_denied(&member) {
+                    surviving_labels.insert(member.label.clone());
+                    if let Some((_, canon)) = crate::swarm_roster::leading_m_label(&member.label) {
+                        surviving_labels.insert(canon);
+                    }
+                    for alias in &member.aliases {
+                        surviving_labels.insert(alias.clone());
+                        if let Some((_, canon)) = crate::swarm_roster::leading_m_label(alias) {
+                            surviving_labels.insert(canon);
+                        }
+                    }
+                    if let Some((_, canon)) =
+                        crate::swarm_roster::leading_m_label(&member.vault_name)
+                    {
+                        surviving_labels.insert(canon);
+                    }
+                    if let Some(node_id) = &member.node_id {
+                        surviving_nodes.insert(node_id.trim().to_ascii_lowercase());
+                    }
+                    if let Some(node_key) = &member.node_key {
+                        surviving_nodes.insert(node_key.trim().to_ascii_lowercase());
+                    }
+                }
                 kept.push(member);
             }
         }
+        revoked_labels.retain(|lbl| {
+            !surviving_labels.contains(lbl)
+                && crate::swarm_roster::leading_m_label(lbl)
+                    .is_none_or(|(_, canon)| !surviving_labels.contains(&canon))
+        });
+        revoked_nodes.retain(|n| !surviving_nodes.contains(&n.trim().to_ascii_lowercase()));
         roster.members = kept;
         roster.deny_labels.extend(revoked_labels.iter().cloned());
         roster.deny_nodes.extend(revoked_nodes);
@@ -1253,6 +1376,12 @@ fn apply_swarm_revoke_cascade(
             roster.to_toml().as_bytes(),
         )
         .map_err(|e| Error::new(e.to_string()))?;
+    } else {
+        revoked_labels.retain(|lbl| {
+            !surviving_labels.contains(lbl)
+                && crate::swarm_roster::leading_m_label(lbl)
+                    .is_none_or(|(_, canon)| !surviving_labels.contains(&canon))
+        });
     }
 
     let mut warm_accounts = Vec::new();
@@ -1295,14 +1424,18 @@ fn apply_swarm_revoke_cascade(
 pub(super) struct MemberCascade {
     /// `provider:email` of each account that held a warm slot, lease or `last_heard` of the Mac.
     pub(super) warm_accounts: Vec<String>,
-    /// `aterm-fleet-code` was rotated (`--stolen`).
+    /// `aterm-fleet-code` was rotated: on every removal that reseals it (a plain one too, since
+    /// 0.148).
     pub(super) fleet_code_rotated: bool,
 }
 
 /// The revoke cascade of §7.6 (`DESIGN-alab-swarm`), as any member writes it into the `[everyone]`
 /// entries its removal reseals (F16): the removed Mac's `aterm-swarm-roster` row is dropped and
-/// its `ai-pool.toml` slots are freed. On `--stolen` its labels, aliases, claim and node id also
-/// go to the roster's deny-lists and the fleet code rotates. A plain removal denies nothing: an
+/// its `ai-pool.toml` slots are freed, and the fleet code rotates: the removed Mac's copy of it
+/// then proves nothing, so neither the fleet nor a vault re-admission by the fleet's key
+/// (`client::readmit`) lets it back (until 0.148 a plain removal kept the code, and a removed Mac
+/// still held the fleet's key). On `--stolen` its labels, aliases, claim and node id also go to
+/// the roster's deny-lists. A plain removal denies nothing: an
 /// "Allow again" restores it, and the readers that hold the log overlay its removals onto the
 /// roster as they read it (`roster::overlay_log_membership`), which a restoring `Admit` lifts,
 /// while a deny-list row would keep the restored Mac out of the roster for good. A member seeds
@@ -1334,25 +1467,66 @@ pub(super) fn cascade_member_removal(
         })?;
         let mut roster = crate::swarm_roster::SwarmRoster::from_toml(text)?;
         let mut kept = Vec::with_capacity(roster.members.len());
-        for member in roster.members {
+        let mut surviving_labels = std::collections::BTreeSet::new();
+        let mut surviving_nodes = std::collections::BTreeSet::new();
+        let mut pending_deny_nodes = Vec::new();
+        for member in std::mem::take(&mut roster.members) {
             if member.recipient == recipient_str {
                 revoked_labels.insert(member.label);
                 revoked_labels.extend(member.aliases);
-                revoked_labels.extend(member.claimed_label);
+                if let Some(claimed) = member
+                    .claimed_label
+                    .filter(|c| crate::membership_log::is_label(c))
+                {
+                    revoked_labels.insert(claimed);
+                }
                 if stolen {
                     if let Some(node_id) = member.node_id {
-                        roster.deny_nodes.push(node_id);
+                        pending_deny_nodes.push(node_id);
                     }
                     if let Some(node_key) = member.node_key {
-                        roster.deny_nodes.push(node_key);
+                        pending_deny_nodes.push(node_key);
                     }
                 }
             } else {
+                if !roster.is_member_denied(&member) {
+                    surviving_labels.insert(member.label.clone());
+                    if let Some((_, canon)) = crate::swarm_roster::leading_m_label(&member.label) {
+                        surviving_labels.insert(canon);
+                    }
+                    for alias in &member.aliases {
+                        surviving_labels.insert(alias.clone());
+                        if let Some((_, canon)) = crate::swarm_roster::leading_m_label(alias) {
+                            surviving_labels.insert(canon);
+                        }
+                    }
+                    if let Some((_, canon)) =
+                        crate::swarm_roster::leading_m_label(&member.vault_name)
+                    {
+                        surviving_labels.insert(canon);
+                    }
+                    if let Some(node_id) = &member.node_id {
+                        surviving_nodes.insert(node_id.trim().to_ascii_lowercase());
+                    }
+                    if let Some(node_key) = &member.node_key {
+                        surviving_nodes.insert(node_key.trim().to_ascii_lowercase());
+                    }
+                }
                 kept.push(member);
             }
         }
+        revoked_labels.retain(|lbl| {
+            !surviving_labels.contains(lbl)
+                && crate::swarm_roster::leading_m_label(lbl)
+                    .is_none_or(|(_, canon)| !surviving_labels.contains(&canon))
+        });
         roster.members = kept;
         if stolen {
+            for node in pending_deny_nodes {
+                if !surviving_nodes.contains(&node.trim().to_ascii_lowercase()) {
+                    roster.deny_nodes.push(node);
+                }
+            }
             roster.deny_labels.extend(
                 revoked_labels
                     .iter()
@@ -1363,7 +1537,10 @@ pub(super) fn cascade_member_removal(
             roster.deny_nodes.extend(
                 node_keys
                     .iter()
-                    .filter(|nk| !roster.deny_nodes.contains(nk))
+                    .filter(|nk| {
+                        !roster.deny_nodes.contains(nk)
+                            && !surviving_nodes.contains(&nk.trim().to_ascii_lowercase())
+                    })
                     .cloned()
                     .collect::<Vec<_>>(),
             );
@@ -1398,7 +1575,7 @@ pub(super) fn cascade_member_removal(
         }
     }
     let mut fleet_code_rotated = false;
-    if stolen && let Some(entry) = entries.get_mut(fleet::FLEET_CODE_ENTRY) {
+    if let Some(entry) = entries.get_mut(fleet::FLEET_CODE_ENTRY) {
         let existing = std::str::from_utf8(entry.value.as_slice())
             .map_err(|_| Error::new(format!("{} is not UTF-8", fleet::FLEET_CODE_ENTRY)))?;
         entry.value = SecretBytes::from(rotate_fleet_code_text(existing)?);
@@ -1590,11 +1767,15 @@ pub(super) fn repair_half_done_revokes_with_log(
     let mut roster_changed = false;
 
     let mut log_removed_labels = std::collections::BTreeSet::new();
+    let mut log_active_labels = std::collections::BTreeSet::new();
     let mut log_removed_nodes = std::collections::BTreeSet::new();
+    let mut log_active_nodes = std::collections::BTreeSet::new();
     if let Some(log) = log {
         let membership = log.membership();
         for label in membership.removed_labels() {
-            if let Some((_, canon)) = crate::swarm_roster::leading_m_label(label) {
+            if let Some((_, canon)) =
+                crate::swarm_roster::leading_m_label(label).filter(|(_, c)| c == label)
+            {
                 log_removed_labels.insert(canon);
             }
         }
@@ -1605,32 +1786,74 @@ pub(super) fn repair_half_done_revokes_with_log(
             }
         }
         for (actor, member) in membership.members() {
-            if log.audience_left_out(&crate::membership_log::EpochAudience::Everyone, actor) {
+            let node_removed = membership.member_node_removed(member);
+            if log.recipient_is_removed(&member.binding.recipient())
+                || log.audience_left_out(&crate::membership_log::EpochAudience::Everyone, actor)
+                || log.audience_left_out_recipient(
+                    &crate::membership_log::EpochAudience::Everyone,
+                    &member.binding.recipient(),
+                )
+                || node_removed
+            {
                 if let Some((_, canon)) = crate::swarm_roster::leading_m_label(&member.label)
-                    .or_else(|| crate::swarm_roster::leading_m_label(&member.name))
+                    .filter(|(_, c)| c == &member.label)
+                    .or_else(|| {
+                        crate::swarm_roster::leading_m_label(&member.name)
+                            .filter(|(_, c)| c == &member.name)
+                    })
                 {
                     log_removed_labels.insert(canon);
                 }
                 if let Some(nk) = member.node_key.filter(|k| *k != [0; 32]) {
                     log_removed_nodes.insert(aterm_codec::hex::encode_lower(&nk));
                 }
+            } else {
+                if let Some((_, canon)) = crate::swarm_roster::leading_m_label(&member.label)
+                    .or_else(|| crate::swarm_roster::leading_m_label(&member.name))
+                {
+                    log_active_labels.insert(canon);
+                }
+                if let Some(nk) = member.node_key.filter(|k| *k != [0; 32]) {
+                    log_active_nodes.insert(aterm_codec::hex::encode_lower(&nk));
+                }
             }
         }
         for founder in membership.unproved() {
-            if log.audience_left_out_recipient(
-                &crate::membership_log::EpochAudience::Everyone,
-                &founder.recipient,
-            ) {
+            let node_removed = founder.node_key.is_some_and(|nk| {
+                nk != [0; 32] && log_removed_nodes.contains(&aterm_codec::hex::encode_lower(&nk))
+            });
+            if log.recipient_is_removed(&founder.recipient)
+                || log.audience_left_out_recipient(
+                    &crate::membership_log::EpochAudience::Everyone,
+                    &founder.recipient,
+                )
+                || node_removed
+            {
                 if let Some((_, canon)) = crate::swarm_roster::leading_m_label(&founder.label)
-                    .or_else(|| crate::swarm_roster::leading_m_label(&founder.name))
+                    .filter(|(_, c)| c == &founder.label)
+                    .or_else(|| {
+                        crate::swarm_roster::leading_m_label(&founder.name)
+                            .filter(|(_, c)| c == &founder.name)
+                    })
                 {
                     log_removed_labels.insert(canon);
                 }
                 if let Some(nk) = founder.node_key.filter(|k| *k != [0; 32]) {
                     log_removed_nodes.insert(aterm_codec::hex::encode_lower(&nk));
                 }
+            } else {
+                if let Some((_, canon)) = crate::swarm_roster::leading_m_label(&founder.label)
+                    .or_else(|| crate::swarm_roster::leading_m_label(&founder.name))
+                {
+                    log_active_labels.insert(canon);
+                }
+                if let Some(nk) = founder.node_key.filter(|k| *k != [0; 32]) {
+                    log_active_nodes.insert(aterm_codec::hex::encode_lower(&nk));
+                }
             }
         }
+        log_removed_labels.retain(|canon| !log_active_labels.contains(canon));
+        log_removed_nodes.retain(|node| !log_active_nodes.contains(node));
     }
 
     let mut lifted = Vec::new();
@@ -1650,9 +1873,15 @@ pub(super) fn repair_half_done_revokes_with_log(
         let existing_deny_labels = roster.deny_labels.clone();
         let existing_deny_nodes = roster.deny_nodes.clone();
         let is_label_denied = |lbl: &str| {
+            let trimmed = lbl.trim();
             existing_deny_labels
                 .iter()
-                .any(|d| d.eq_ignore_ascii_case(lbl.trim()))
+                .any(|d| d.eq_ignore_ascii_case(trimmed))
+                || crate::swarm_roster::leading_m_label(trimmed).is_some_and(|(_, canon)| {
+                    existing_deny_labels
+                        .iter()
+                        .any(|d| d.eq_ignore_ascii_case(&canon))
+                })
         };
         let is_node_denied = |n: &str| {
             let trimmed = n.trim();
@@ -1664,11 +1893,19 @@ pub(super) fn repair_half_done_revokes_with_log(
                     .any(|d| d.eq_ignore_ascii_case(trimmed))
         };
         let mut kept = Vec::with_capacity(roster.members.len());
-        for member in roster.members {
+        let mut stale_recipients = std::collections::BTreeSet::new();
+        let mut stale_labels: Vec<String> = Vec::new();
+        let mut stale_nodes: Vec<String> = Vec::new();
+        for member in std::mem::take(&mut roster.members) {
             let stale = !active_recipients.contains(&member.recipient)
                 || code_only.contains(&member.recipient)
                 || is_label_denied(&member.label)
                 || member.aliases.iter().any(|a| is_label_denied(a))
+                || member
+                    .claimed_label
+                    .as_deref()
+                    .filter(|c| crate::membership_log::is_label(c))
+                    .is_some_and(&is_label_denied)
                 || member.node_id.as_deref().is_some_and(&is_node_denied)
                 || member.node_key.as_deref().is_some_and(&is_node_denied)
                 || log.is_some_and(|l| {
@@ -1689,7 +1926,13 @@ pub(super) fn repair_half_done_revokes_with_log(
                                     m.node_key.is_some_and(|nk| {
                                         nk != [0; 32]
                                             && is_node_denied(&aterm_codec::hex::encode_lower(&nk))
-                                    })
+                                    }) || is_node_denied(&aterm_codec::hex::encode_lower(
+                                        m.binding.writer(),
+                                    )) || is_node_denied(&aterm_codec::hex::encode_lower(
+                                        m.binding.incarnation(),
+                                    )) || is_node_denied(&aterm_codec::hex::encode_lower(
+                                        m.binding.machine(),
+                                    ))
                                 })
                             || l.membership().unproved().iter().any(|f| {
                                 f.recipient == rec
@@ -1702,33 +1945,100 @@ pub(super) fn repair_half_done_revokes_with_log(
                 });
             if stale {
                 roster_changed = true;
+                stale_recipients.insert(member.recipient);
                 removed_members.push(member.label.clone());
-                denied_labels.insert(member.label.clone());
-                roster.deny_labels.push(member.label);
-                for alias in member.aliases {
-                    denied_labels.insert(alias.clone());
-                    roster.deny_labels.push(alias);
-                }
-                if let Some(claimed) = member.claimed_label {
-                    denied_labels.insert(claimed.clone());
-                    roster.deny_labels.push(claimed);
+                stale_labels.push(member.label);
+                stale_labels.extend(member.aliases);
+                if let Some(claimed) = member
+                    .claimed_label
+                    .filter(|c| crate::membership_log::is_label(c))
+                {
+                    stale_labels.push(claimed);
                 }
                 if let Some(node_id) = member.node_id {
-                    roster.deny_nodes.push(node_id);
+                    stale_nodes.push(node_id);
                 }
                 if let Some(node_key) = member.node_key {
-                    roster.deny_nodes.push(node_key);
+                    stale_nodes.push(node_key);
                 }
             } else {
                 kept.push(member);
             }
         }
-        let surviving_labels: std::collections::BTreeSet<String> = kept
+        let mut surviving_nodes: std::collections::BTreeSet<String> = kept
             .iter()
-            .flat_map(|m| std::iter::once(m.label.clone()).chain(m.aliases.iter().cloned()))
+            .flat_map(|m| m.node_id.iter().chain(m.node_key.iter()))
+            .map(|n| n.trim().to_ascii_lowercase())
             .collect();
+        surviving_nodes.extend(log_active_nodes.iter().cloned());
+        for node in stale_nodes {
+            if !surviving_nodes.contains(&node.trim().to_ascii_lowercase()) {
+                roster.deny_nodes.push(node);
+            }
+        }
+        let kept_recipients: std::collections::BTreeSet<String> =
+            kept.iter().map(|m| m.recipient.clone()).collect();
+        let mut surviving_labels: std::collections::BTreeSet<String> = kept
+            .iter()
+            .flat_map(|m| {
+                let mut out = vec![m.label.clone()];
+                if let Some((_, canon)) = crate::swarm_roster::leading_m_label(&m.label) {
+                    out.push(canon);
+                }
+                for alias in &m.aliases {
+                    out.push(alias.clone());
+                    if let Some((_, canon)) = crate::swarm_roster::leading_m_label(alias) {
+                        out.push(canon);
+                    }
+                }
+                if let Some((_, canon)) = crate::swarm_roster::leading_m_label(&m.vault_name) {
+                    out.push(canon);
+                }
+                out
+            })
+            .collect();
+        for machine in doc.machines() {
+            if !code_only.contains(&machine.recipient)
+                && !stale_recipients.contains(&machine.recipient)
+                && !kept_recipients.contains(&machine.recipient)
+                && log.is_none_or(|l| {
+                    Recipient::parse(&machine.recipient).is_ok_and(|rec| {
+                        !l.recipient_is_removed(&rec)
+                            && !l.audience_left_out_recipient(
+                                &crate::membership_log::EpochAudience::Everyone,
+                                &rec,
+                            )
+                            && !super::log_entries::recipient_denied_by_roster_or_log(
+                                Some(&roster),
+                                l,
+                                &rec,
+                            )
+                    })
+                })
+                && let Some((_, canon)) = crate::swarm_roster::leading_m_label(&machine.name)
+            {
+                surviving_labels.insert(canon);
+            }
+        }
+        for lbl in stale_labels {
+            let canon_survives =
+                crate::swarm_roster::leading_m_label(&lbl).is_some_and(|(_, canon)| {
+                    surviving_labels.contains(&canon) || log_active_labels.contains(&canon)
+                });
+            if !surviving_labels.contains(&lbl)
+                && !log_active_labels.contains(&lbl)
+                && !canon_survives
+            {
+                if let Some((_, canon)) = crate::swarm_roster::leading_m_label(&lbl) {
+                    denied_labels.insert(canon);
+                } else {
+                    denied_labels.insert(lbl.clone());
+                }
+                roster.deny_labels.push(lbl);
+            }
+        }
         for canon in &log_removed_labels {
-            if !surviving_labels.contains(canon) {
+            if !surviving_labels.contains(canon) && !log_active_labels.contains(canon) {
                 if denied_labels.insert(canon.clone()) {
                     removed_members.push(canon.clone());
                 }
@@ -1739,7 +2049,7 @@ pub(super) fn repair_half_done_revokes_with_log(
             }
         }
         for node_hex in &log_removed_nodes {
-            if !roster.deny_nodes.contains(node_hex) {
+            if !surviving_nodes.contains(node_hex) && !roster.deny_nodes.contains(node_hex) {
                 roster.deny_nodes.push(node_hex.clone());
                 roster_changed = true;
             }

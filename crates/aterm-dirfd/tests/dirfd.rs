@@ -649,6 +649,13 @@ fn a_removed_directory_reads_as_empty() {
         direct.is_empty(),
         "a direct stream over a removed directory must read as empty: {direct:?}"
     );
+    let mut rewound = mine::Dir::read_from(&fd).expect("read_from on removed directory");
+    assert!(rewound.next().is_none());
+    rewound.rewind();
+    assert!(
+        rewound.next().is_none(),
+        "rewinding a removed directory stream must keep reading as empty"
+    );
 }
 
 /// Reading a directory must not consume the caller's descriptor.

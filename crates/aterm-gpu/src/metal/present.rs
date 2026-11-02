@@ -413,6 +413,18 @@ pub(crate) struct TrayPass<'a> {
     pub(crate) uniform_slot: usize,
 }
 
+/// A window's tray stack folded into its stack card before the tray pass draws that card
+/// (`shaders/tray_prims.metal`'s `fs_tray_layer`, design §3.3): the card cleared, then each card
+/// of the stack, bottom first, by the CPU fold's law.
+pub(crate) struct TrayStackPass<'a> {
+    pub(crate) target: &'a SealedTexture,
+    pub(crate) pso: &'a Obj,
+    /// The composite law at [`crate::pipeline_table::TRAY_LAYER`]'s `fragment_buffers[1]`.
+    pub(crate) law: &'a Obj,
+    /// Each card's texture and `TrayLayerUniform`, bottom first.
+    pub(crate) cards: Vec<(&'a Obj, &'a crate::tray_prims::TrayLayerUniform)>,
+}
+
 /// Scissored instanced glow crown pass drawn during blit.
 pub(crate) struct CrownPass<'a> {
     pub(crate) pso: &'a Obj,
@@ -448,6 +460,8 @@ pub(crate) struct PresentSequence<'a> {
     /// The incoming row over the strip the translate exposed (requires
     /// `band_shift`'s present copy; refused likewise).
     pub(crate) apron: Option<ApronStripPass<'a>>,
+    /// The tray stack's fold, before [`Self::tray`] draws the stack card.
+    pub(crate) stack: Option<TrayStackPass<'a>>,
     pub(crate) tray: Option<TrayPass<'a>>,
     /// The letterbox blit (row 16) onto the drawable: POST_FS binds; the
     /// clear is the live terminal background.
@@ -624,6 +638,36 @@ pub(crate) fn encode_present_sequence(
         let rows = ap.rows.min(ap.tex.height());
         if w > 0 && rows > 0 {
             cb.copy_texture_sub_rect(ap.tex, (0, 0), composed, (0, ap.dst_y), w, rows)?;
+        }
+    }
+
+    if let Some(stack) = &seq.stack {
+        let binds = crate::pipeline_table::TRAY_LAYER.binds;
+        let pass = cb.render_pass(&RenderPassDesc {
+            target: stack.target,
+            load: LoadAction::Clear(ClearColor {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.0,
+            }),
+            store: StoreAction::Store,
+            viewport: None,
+            scissor: None,
+        })?;
+        pass.set_pipeline(stack.pso);
+        pass.set_fragment_buffer(stack.law, binds.fragment_buffers[1] as usize);
+        for (tex, uniform) in &stack.cards {
+            let bytes = aterm_bits::bytes_of(*uniform);
+            pass.set_vertex_bytes(
+                bytes,
+                binds
+                    .vertex_uniform
+                    .expect("the tray layer row binds a vertex uniform") as usize,
+            )?;
+            pass.set_fragment_bytes(bytes, binds.fragment_buffers[0] as usize);
+            pass.set_fragment_texture(tex, binds.fragment_textures[0] as usize);
+            pass.draw_strip_quad()?;
         }
     }
 

@@ -176,6 +176,9 @@ pub(crate) struct WarmLatch {
 /// The process's one first-frame warm, which the first window awaits.
 pub(crate) static FIRST_FRAME: WarmLatch = WarmLatch::new(DEADLINE);
 
+/// Offscreen callers never wait on or start the windowed warm's device selection.
+pub(crate) static HEADLESS_FIRST_FRAME: WarmLatch = WarmLatch::new(DEADLINE);
+
 impl WarmLatch {
     /// A latch whose window waits at most `deadline` after the warm began: [`DEADLINE`] in the
     /// process, a hang detector in a test that holds the warm and so must not race the
@@ -194,6 +197,13 @@ impl WarmLatch {
     /// Claim this latch's one warm: `None` once one has begun, so a launch that warms its
     /// config twice (`warm_config_moved`) compiles once.
     pub(crate) fn begin(&'static self) -> Option<FirstFrameWarm> {
+        self.begin_with_policy(crate::DevicePolicy::Windowed)
+    }
+
+    pub(crate) fn begin_with_policy(
+        &'static self,
+        device_policy: crate::DevicePolicy,
+    ) -> Option<FirstFrameWarm> {
         let mut phase = self.phase.lock().unwrap_or_else(PoisonError::into_inner);
         if *phase != Phase::Idle {
             return None;
@@ -203,7 +213,10 @@ impl WarmLatch {
             in_flight: [Some(WarmItem::Library(ShaderLibrary::Cell)), None],
             owed: ((1 << OWED.len()) - 1) | OWED_PROBE,
         };
-        Some(FirstFrameWarm { latch: self })
+        Some(FirstFrameWarm {
+            latch: self,
+            device_policy,
+        })
     }
 
     /// The warm's `lane` has `item` under way now.
@@ -325,9 +338,10 @@ impl WarmLatch {
     }
 }
 
-/// The right to run the process's first-frame warm, from [`crate::begin_first_frame_warm`].
+/// The right to run a first-frame warm, retaining its windowed or headless device policy.
 pub struct FirstFrameWarm {
     latch: &'static WarmLatch,
+    device_policy: crate::DevicePolicy,
 }
 
 impl FirstFrameWarm {
@@ -337,8 +351,8 @@ impl FirstFrameWarm {
     /// No Metal device, or the first compile or build that failed.
     pub fn run(mut self, knobs: FirstFrameKnobs) -> Result<(), String> {
         let _pool = AutoreleasePool::new();
-        let dev =
-            Device::preferred().ok_or_else(|| "no Metal device on this machine".to_owned())?;
+        let dev = Device::for_policy(self.device_policy)
+            .ok_or_else(|| "no Metal device admitted by the warm's selection policy".to_owned())?;
         self.run_on(&dev, knobs, pipelines::compile_library)
     }
 
@@ -363,6 +377,7 @@ impl FirstFrameWarm {
         compile: impl Fn(&Device, ShaderLibrary) -> Result<Library, String> + Sync,
     ) -> Result<(), String> {
         let latch = self.latch;
+        let present_device = WorkerDevice(dev.clone_ref());
         let present: Vec<(Pipeline, PixelFormat)> = first_frame_rows(knobs, false)
             .into_iter()
             .filter(|(row, _)| Lane::of(row.spec().library) == Lane::Present)
@@ -370,10 +385,9 @@ impl FirstFrameWarm {
         std::thread::scope(|scope| {
             let compile = &compile;
             let present = scope.spawn(move || {
+                let dev = present_device.into_inner();
                 latch.run_lane(|| {
                     let _pool = AutoreleasePool::new();
-                    let dev = Device::preferred()
-                        .ok_or_else(|| "no Metal device on this machine".to_owned())?;
                     walk_lane(latch, Lane::Present, &dev, &present, compile)
                 })
             });
@@ -719,12 +733,12 @@ pub fn first_frame_bench_warm(
     aurora: bool,
 ) -> Result<impl FnOnce() -> Result<Duration, String> + Send + 'static, String> {
     let mut warm = BENCH_LATCH
-        .begin()
+        .begin_with_policy(crate::DevicePolicy::Headless)
         .ok_or_else(|| "one warm per process".to_owned())?;
     Ok(move || {
         let _pool = AutoreleasePool::new();
         let began = Instant::now();
-        let dev = Device::preferred().ok_or_else(|| "no Metal device".to_owned())?;
+        let dev = Device::preferred_listed().ok_or_else(|| "no listed Metal device".to_owned())?;
         let knobs = if aurora {
             BENCH_KNOBS
         } else {
@@ -748,7 +762,7 @@ pub fn first_frame_bench_main(nonce: u128) -> Result<[Duration; 5], String> {
     let arrived = Instant::now();
     BENCH_LATCH.await_item(WarmItem::Library(ShaderLibrary::Cell));
     let waited = arrived.elapsed();
-    let dev = Device::preferred().ok_or_else(|| "no Metal device".to_owned())?;
+    let dev = Device::preferred_listed().ok_or_else(|| "no listed Metal device".to_owned())?;
     let cell = compile(&dev, ShaderLibrary::Cell)?;
     let lib = arrived.elapsed();
     for (row, present) in first_frame_rows(FirstFrameKnobs::default(), false)
@@ -785,6 +799,28 @@ pub fn first_frame_bench_main(nonce: u128) -> Result<[Duration; 5], String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_headless_warm_keeps_its_policy_separate_from_a_windowed_warm() {
+        static HEADLESS: WarmLatch = WarmLatch::new(DEADLINE);
+        static WINDOWED: WarmLatch = WarmLatch::new(DEADLINE);
+        let headless = HEADLESS
+            .begin_with_policy(crate::DevicePolicy::Headless)
+            .unwrap();
+        let windowed = WINDOWED.begin().unwrap();
+        assert_eq!(headless.device_policy, crate::DevicePolicy::Headless);
+        assert_eq!(windowed.device_policy, crate::DevicePolicy::Windowed);
+        assert!(
+            HEADLESS
+                .begin_with_policy(crate::DevicePolicy::Headless)
+                .is_none()
+        );
+        drop(headless);
+        assert_eq!(HEADLESS.current_phase(), Phase::Settled);
+        assert_ne!(WINDOWED.current_phase(), Phase::Settled);
+        drop(windowed);
+        assert_eq!(WINDOWED.current_phase(), Phase::Settled);
+    }
     use crate::metal::test_support::device;
     use std::sync::mpsc;
 
@@ -903,7 +939,7 @@ mod tests {
         let mut warm = LATCH.begin().expect("the latch's first warm");
         let worker = std::thread::spawn(move || {
             let _pool = AutoreleasePool::new();
-            let dev = Device::preferred().expect("the device the test found");
+            let dev = Device::preferred_listed().expect("the listed device the test found");
             warm.run_on(&dev, FirstFrameKnobs::default(), |dev, lib| {
                 let held = |rx: &Mutex<mpsc::Receiver<()>>, what: &str| {
                     rx.lock()

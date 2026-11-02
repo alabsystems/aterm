@@ -132,11 +132,63 @@ pub fn store_build_of(prefix: &Path, target: &Path) -> Option<(String, u64)> {
     Some((program, build))
 }
 
+/// A command in an already selected build: its directories are real and at most 16 final
+/// aliases resolve to a regular file inside that build's resolved root. A link's text is
+/// normalized and fenced before its target is looked up. This admits Artifact.links without
+/// traversing a foreign, escaping or nonregular target or a symlinked target ancestor.
+/// Return the logical bin path so argv0 and the build's environment keep their usual spelling.
+/// This is a point-in-time filesystem observation, not fresh package authentication.
+pub(crate) fn tool_in_build(build_dir: &Path, tool: &ToolName) -> Option<PathBuf> {
+    let bin = build_dir.join("bin");
+    if !std::fs::symlink_metadata(&bin)
+        .is_ok_and(|meta| meta.is_dir() && !crate::platform::is_reparse(&meta))
+    {
+        return None;
+    }
+    let root = std::fs::canonicalize(build_dir).ok()?;
+    let logical = bin.join(tool.exe_file());
+    let mut target = root.join("bin").join(tool.exe_file());
+    for followed in 0..=16 {
+        let next_target = {
+            let mut components = target.strip_prefix(&root).ok()?.components().peekable();
+            let mut at = root.clone();
+            let mut next_target = None;
+            while let Some(component) = components.next() {
+                let std::path::Component::Normal(name) = component else {
+                    return None;
+                };
+                at.push(name);
+                let meta = std::fs::symlink_metadata(&at).ok()?;
+                if components.peek().is_some() {
+                    if !meta.is_dir() || crate::platform::is_reparse(&meta) {
+                        return None;
+                    }
+                } else if meta.is_file() && !crate::platform::is_reparse(&meta) {
+                    return Some(logical);
+                } else if meta.file_type().is_symlink() && followed < 16 {
+                    let raw = std::fs::read_link(&at).ok()?;
+                    let next = crate::seam::absolute_target(&raw, &at);
+                    if !next.starts_with(&root) {
+                        return None;
+                    }
+                    next_target = Some(next);
+                    break;
+                } else {
+                    return None;
+                }
+            }
+            next_target
+        };
+        target = next_target?;
+    }
+    None
+}
+
 /// The build a path into the store names by its directory: `<build>`, or `<build>.noindex`,
 /// the folder a build laid aside lives in ([`aterm_toolchain::layout`]), which a canonical
 /// path (a running image, a compiler's sysroot) names.
 fn build_in_path(name: &std::ffi::OsStr) -> Option<u64> {
-    build_dir_name(name)?.parse::<u64>().ok()
+    crate::store::parse_build_name(build_dir_name(name)?)
 }
 
 /// The build name a store build's directory `name` spells, `<build>` or the laid-aside
@@ -294,6 +346,7 @@ pub fn uninstall(layout: &Layout, program: &str) -> io::Result<()> {
     uninstall_name_shape(program)?;
 
     let prog_store = layout.prefix.join("store").join(program);
+    let _first_exec = crate::store::first_exec_program_removal(&prog_store)?;
     if let Some(held) = crate::store::held_build_in(&prog_store) {
         return Err(io::Error::other(format!(
             "{} stays in place: a resolve check's child in it never exited on its own, and \
@@ -448,9 +501,17 @@ mod tests {
             program_build_of_target(canonical),
             Some(("trust".to_string(), 18))
         );
-        for name in [".noindex", "18.noindex.noindex", "18.noindexx"] {
+        for name in [
+            ".noindex",
+            "18.noindex.noindex",
+            "18.noindexx",
+            "+18",
+            "018",
+            "+18.noindex",
+        ] {
             let path = Path::new("/p/store/trust").join(name);
             assert_eq!(store_build_of(prefix, &path), None, "{name}");
+            assert_eq!(program_build_of_target(&path), None, "{name}");
         }
     }
 

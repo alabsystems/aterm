@@ -112,15 +112,6 @@ fn unsplice_and_refill(
     term.cell_frame_damage_scoped_into(&mut ws.input_scratch, rows, cols)
 }
 
-/// One presented frame of the single-pane window with the message band up and no tab strip, in shipping order.
-fn band_frame(app: &mut App, wid: WindowId, rows: usize, cols: usize) -> FrameRefill {
-    let refill = unsplice_and_refill(app, wid, rows, cols, 1, true);
-    app.tab_strip_rows = 0;
-    app.message_band_rows = 1;
-    app.splice_tab_strip_with(wid, 0);
-    refill
-}
-
 /// Reference: a full re-extract.
 fn reference(app: &mut App, wid: WindowId, rows: usize, cols: usize) -> RenderInput {
     let terminal = app
@@ -869,92 +860,4 @@ fn any_host_cell_write_before_the_prepend_disowns_the_lane() {
         !ws.input_scratch.undo_host_row_prepend(rows, &mut pool, 1),
         "the un-splice accepted an unblessed prepend"
     );
-}
-
-#[test]
-fn a_scrolled_back_band_window_refills_only_what_changed() {
-    use aterm_messages::{Message, Severity, WallStamp, tags};
-    const STAMP: WallStamp = WallStamp {
-        unix_ms: 1_790_000_000_000,
-    };
-    const UNCHANGED: FrameRefill = FrameRefill::Scoped { rows_refilled: 0 };
-    let (mut app, wid, rows, cols) = fixture();
-    let terminal = app
-        .front_terminal(wid)
-        .expect("front terminal")
-        .term
-        .clone();
-    let now = std::time::Instant::now();
-    let first = app.messages.post(
-        Message::new(tags::CONFIG, Severity::Warn, "Disk nearly full"),
-        STAMP,
-        now,
-    );
-    let _ = app.settle_messages(now);
-    {
-        let mut t = term_lock(&terminal);
-        for i in 0..40 {
-            t.process(format!("history line {i}\r\n").as_bytes());
-        }
-        t.grid_mut().scroll_display(3);
-    }
-    let frame = |app: &mut App, what: &str| {
-        let reference_frame = reference(app, wid, rows, cols);
-        let refill = band_frame(app, wid, rows, cols);
-        let composed = &app.windows[&wid].input_scratch;
-        assert_ne!(composed.display_offset, 0, "{what}: parked in history");
-        assert_engine_band_matches(composed, &reference_frame, rows, 1, what);
-        let band = &app.windows[&wid].cached_band_rows;
-        assert_eq!(band.len(), 1, "{what}: one band row");
-        let text = |row: &[aterm_core::terminal::RenderCell]| -> String {
-            row.iter().map(|c| c.ch).collect()
-        };
-        assert_eq!(
-            text(&composed.cells[0]),
-            text(&band[0]),
-            "{what}: the top row is the band this frame painted"
-        );
-        (refill, text(&band[0]))
-    };
-
-    let (_, warned) = frame(&mut app, "band raised in history");
-    for i in 0..4 {
-        assert_eq!(
-            frame(&mut app, &format!("unchanged frame {i}")).0,
-            UNCHANGED,
-            "an unchanged scrolled-back frame under the band keeps its rows (frame {i})"
-        );
-    }
-    assert!(app.messages.dismiss(first.id, now));
-    let _ = app.messages.post(
-        Message::new(tags::CONFIG, Severity::Warn, "Update ready to install"),
-        STAMP,
-        now,
-    );
-    let _ = app.settle_messages(now);
-    let (refill, restated) = frame(&mut app, "band text change");
-    assert_ne!(restated, warned, "precondition: the band's text changed");
-    assert_eq!(
-        refill, UNCHANGED,
-        "the band is the host's row, painted afresh over engine rows that did not move"
-    );
-    term_lock(&terminal).process(b"streamed while parked\r\n");
-    assert!(
-        matches!(
-            frame(&mut app, "output while parked").0,
-            FrameRefill::Full { .. }
-        ),
-        "output under a parked viewport re-extracts"
-    );
-    assert_eq!(frame(&mut app, "after the output").0, UNCHANGED);
-    term_lock(&terminal).set_default_background(aterm_core::terminal::Rgb {
-        r: 0x10,
-        g: 0x20,
-        b: 0x30,
-    });
-    assert!(
-        matches!(frame(&mut app, "theme").0, FrameRefill::Full { .. }),
-        "a theme change re-extracts"
-    );
-    assert_eq!(frame(&mut app, "after the theme").0, UNCHANGED);
 }

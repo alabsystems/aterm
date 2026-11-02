@@ -4,6 +4,7 @@
 //! AI CLI account roster admission, usage/wall tracking, rotation advice, and state store: Claude
 //! Code's pool, and one per pooled CLI ([`Cli`]) through the same parser, store and advice.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -26,7 +27,7 @@ use sync_commit::usage_target;
 
 #[path = "accounts_directory.rs"]
 mod directory;
-pub(super) use directory::retained_directory_owner;
+pub(super) use directory::{retained_directory_owner, shared_staging_retained};
 
 #[cfg_attr(
     any(test, debug_assertions),
@@ -71,6 +72,9 @@ pub const MAX_STATE_BYTES: u64 = 1024 * 1024;
 
 /// The state file's schema.
 pub const SCHEMA: u64 = 1;
+/// A state carrying preparation-only execution holds cannot be written by an
+/// older reader which would discard those holds as unknown fields.
+pub const PREPARED_STATE_SCHEMA: u64 = 2;
 
 /// The most walls kept per account (the vendor names six limit types).
 pub const MAX_WALLS: usize = 8;
@@ -387,6 +391,18 @@ impl Row {
     #[must_use]
     pub fn expected_identity_email(&self) -> Option<&str> {
         self.identity_email.as_deref().or(self.email.as_deref())
+    }
+
+    /// Whether `self` matches `email` by either its login `email` or its `identity_email`.
+    #[must_use]
+    pub fn matches_email(&self, email: &str) -> bool {
+        self.email
+            .as_deref()
+            .is_some_and(|e| email_matches(e, email))
+            || self
+                .identity_email
+                .as_deref()
+                .is_some_and(|e| email_matches(e, email))
     }
 
     /// The sign-in flow of this `cli` row: its own `flow`, else the CLI's default, `None` for a
@@ -1867,6 +1883,58 @@ pub(super) fn read_renewal_checkpoint_for(
         .then_some(checkpoint)
 }
 
+/// Whether the captured parent and later authentication facts still permit recovery.
+/// A temporary quota wall defers publication without invalidating this completion.
+pub(super) fn checkpoint_current(
+    row: &Row,
+    state: &State,
+    logins: &Logins,
+    proof: &RenewalCheckpoint,
+) -> bool {
+    let account = state.accounts.get(&row.label);
+    proof.parent.matches(logins, &row.label)
+        && !account.is_some_and(|a| a.auth_at.is_some_and(|at| at >= proof.checked_at))
+        && !logins.labels.get(&row.label).is_some_and(|binding| {
+            binding.renewed_at.iter().chain(binding.ended_at.iter())
+                .chain(binding.wrong_at.iter()).chain(binding.served_at.iter())
+                .any(|at| *at >= proof.checked_at)
+                // An old checkpoint must not clear an undated login-end notice.
+                || binding.notice_end.is_some()
+        })
+}
+
+pub(super) fn checkpoint_identity_matches(cli: Cli, row: &Row, proof: &RenewalCheckpoint) -> bool {
+    let expected = if matches!(cli, Cli::Claude | Cli::Codex) {
+        row.expected_identity_email()
+    } else {
+        row.email.as_deref()
+    };
+    row.vendor.region == proof.region
+        && (cli != Cli::Codex || proof.proved_by == Some(Proof::Status))
+        && expected.is_some_and(|email| email_matches(email, &proof.email))
+}
+
+pub(super) fn checkpoint_unreferenced(
+    roster: &Roster,
+    logins: &Logins,
+    dir: &Path,
+    actual: &Path,
+) -> bool {
+    !roster
+        .rows
+        .iter()
+        .flat_map(|row| row.dir.iter().chain(row.was.iter().flatten()))
+        .chain(
+            logins
+                .labels
+                .values()
+                .flat_map(|entry| entry.dir.iter().chain(entry.was.iter().flatten())),
+        )
+        .any(|held| {
+            Path::new(held) == dir || std::fs::canonicalize(held).is_ok_and(|path| path == actual)
+        })
+}
+
 /// Machine-local login binding and learned renewal lifetime for one roster account.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Binding {
@@ -1878,6 +1946,10 @@ pub struct Binding {
     /// Unlike `renewed_at`, this distinguishes replacements even when the clock does not advance.
     /// It is not a provider identity, and zero also admits a legacy binding.
     pub renewal_generation: u64,
+    /// Generation of the last committed renewal of this binding. Zero means no
+    /// retained publication evidence. Other identity changes invalidate it; this
+    /// is a local observation marker, not proof that credentials still work.
+    pub last_success_generation: u64,
     /// The lifetime a renewal is forecast by, as learned ([`Binding::lifetime`],
     /// [`LIFETIME_MIN_S`], [`LIFETIME_MAX_S`]).
     pub lifetime_s: i64,
@@ -1916,6 +1988,10 @@ pub enum AttemptOutcome {
     NoRoute,
     /// A route ran and did not bind a login.
     Failed,
+    /// A route ran and its page stopped it (Cloudflare's bot check or block page,
+    /// [`super::open_url::Met::stopped`]), which aterm never tries to pass: the row needs a
+    /// person's own sign-in, in a browser that clears it.
+    Blocked,
     /// A route signed the row in and its login was bound.
     SignedIn,
 }
@@ -1927,12 +2003,13 @@ impl AttemptOutcome {
         match self {
             Self::NoRoute => "no-route",
             Self::Failed => "failed",
+            Self::Blocked => "blocked",
             Self::SignedIn => "signed-in",
         }
     }
 
     fn parse(word: &str) -> Option<Self> {
-        [Self::NoRoute, Self::Failed, Self::SignedIn]
+        [Self::NoRoute, Self::Failed, Self::Blocked, Self::SignedIn]
             .into_iter()
             .find(|outcome| outcome.as_str() == word)
     }
@@ -1940,8 +2017,18 @@ impl AttemptOutcome {
     /// Whether the row is still without a login it can be run on.
     #[must_use]
     pub const fn failing(self) -> bool {
-        matches!(self, Self::NoRoute | Self::Failed)
+        matches!(self, Self::NoRoute | Self::Failed | Self::Blocked)
     }
+}
+
+/// Whether `label`'s last automatic sign-in was stopped by its page
+/// ([`AttemptOutcome::Blocked`]).
+#[must_use]
+pub fn sign_in_blocked(logins: &Logins, label: &str) -> bool {
+    logins
+        .get(label)
+        .and_then(|binding| binding.sign_in_attempt.as_ref())
+        .is_some_and(|attempt| attempt.outcome == AttemptOutcome::Blocked)
 }
 
 /// A row's last automatic sign-in: how it ended, the routes its ladder tried (one bounded line
@@ -2049,6 +2136,7 @@ impl Default for Binding {
             dir: None,
             renewed_at: None,
             renewal_generation: 0,
+            last_success_generation: 0,
             lifetime_s: LIFETIME_START_S,
             notice_end: None,
             ended_at: None,
@@ -2136,6 +2224,15 @@ pub struct Logins {
     /// Last allocated renewal generation. Retained even when labels move or disappear;
     /// only the store transaction allocates from this machine-local counter.
     pub generation_clock: u64,
+    /// Last allocated in-place sign-in receipt, independent of credential fences.
+    pub sign_in_clock: u64,
+    /// Successful in-place sign-ins by label, including unbound default logins.
+    /// The transaction owns these receipts; identity edits invalidate them.
+    pub sign_in_receipts: BTreeMap<String, u64>,
+    /// Transaction-local receipt revocations, consumed before serialization.
+    /// Forgetting and reusing a label in one transaction must still revoke it.
+    #[doc(hidden)]
+    pub pending_sign_in_invalidations: BTreeSet<String>,
     /// The bindings, by label.
     pub labels: BTreeMap<String, Binding>,
     /// Retained shared authority and consumed preparation generations. Ordinary
@@ -2178,6 +2275,18 @@ impl Logins {
             "generation_clock".to_owned(),
             Value::from(self.generation_clock),
         );
+        if self.sign_in_clock != 0 {
+            o.insert("sign_in_clock".into(), Value::from(self.sign_in_clock));
+            o.insert(
+                "sign_in_receipts".into(),
+                Value::Object(
+                    self.sign_in_receipts
+                        .iter()
+                        .map(|(label, receipt)| (label.clone(), Value::from(*receipt)))
+                        .collect(),
+                ),
+            );
+        }
         let labels = self
             .labels
             .iter()
@@ -2189,6 +2298,12 @@ impl Logins {
                     "renewal_generation".to_owned(),
                     Value::from(b.renewal_generation),
                 );
+                if b.last_success_generation != 0 {
+                    m.insert(
+                        "last_success_generation".to_owned(),
+                        Value::from(b.last_success_generation),
+                    );
+                }
                 m.insert("lifetime_s".to_owned(), Value::from(b.lifetime_s));
                 m.insert("notice_end".to_owned(), Value::from(b.notice_end));
                 m.insert("ended_at".to_owned(), Value::from(b.ended_at));
@@ -2340,6 +2455,14 @@ impl Logins {
                         ))
                     })?,
                 },
+                last_success_generation: match v.get("last_success_generation") {
+                    None => 0,
+                    Some(value) => value.as_u64().ok_or_else(|| {
+                        Unread::NotOurs(format!(
+                            "binding `{label}` has an invalid successful publication generation"
+                        ))
+                    })?,
+                },
                 lifetime_s: int(v.get("lifetime_s"))
                     .unwrap_or(LIFETIME_START_S)
                     .clamp(LIFETIME_MIN_S, LIFETIME_MAX_S),
@@ -2366,6 +2489,11 @@ impl Logins {
                 sign_in_task,
                 sign_in_attempt,
             };
+            if binding.last_success_generation > binding.renewal_generation {
+                return Err(Unread::NotOurs(format!(
+                    "binding `{label}` successful publication exceeds its generation"
+                )));
+            }
             labels.insert(label.clone(), binding);
         }
         let highest = labels
@@ -2385,9 +2513,33 @@ impl Logins {
                 "shared preparation exceeds its retained generation clock".into(),
             ));
         }
+        let sign_in_clock = match doc.get("sign_in_clock") {
+            None => 0,
+            Some(value) => value
+                .as_u64()
+                .ok_or_else(|| Unread::NotOurs("invalid sign-in receipt clock".into()))?,
+        };
+        let mut sign_in_receipts = BTreeMap::new();
+        if let Some(value) = doc.get("sign_in_receipts") {
+            let entries = value
+                .as_object()
+                .filter(|entries| entries.len() <= MAX_ACCOUNTS)
+                .ok_or_else(|| Unread::NotOurs("invalid sign-in receipts".into()))?;
+            for (label, value) in entries {
+                let receipt = value
+                    .as_u64()
+                    .filter(|receipt| *receipt != 0 && *receipt <= sign_in_clock)
+                    .filter(|_| admissible_label(label))
+                    .ok_or_else(|| Unread::NotOurs("invalid sign-in receipt".into()))?;
+                sign_in_receipts.insert(label.clone(), receipt);
+            }
+        }
         Ok(Logins {
             labels,
             generation_clock,
+            sign_in_clock,
+            sign_in_receipts,
+            pending_sign_in_invalidations: BTreeSet::new(),
             shared,
         })
     }
@@ -2415,11 +2567,19 @@ fn advance_renewal_generations(
             "account edit would erase shared custody or consumed preparation history".into(),
         );
     }
-    let mut changed: BTreeSet<_> = events
+    let renewed: BTreeSet<_> = events
         .iter()
         .filter(|event| event.kind == Kind::Renewed)
         .map(|event| event.account.clone())
         .collect();
+    // Publication evidence is derived here, never supplied by an ordinary edit.
+    for (label, binding) in &mut after.labels {
+        binding.last_success_generation = before
+            .labels
+            .get(label)
+            .map_or(0, |old| old.last_success_generation);
+    }
+    let mut changed = renewed.clone();
     for label in &changed {
         if !after
             .labels
@@ -2465,17 +2625,37 @@ fn advance_renewal_generations(
             )
             .cloned(),
     );
+    // Forgetting or relabelling an account revokes in-flight observations even
+    // when no binding exists, or its directory and identity stayed unchanged.
+    changed.extend(after.pending_sign_in_invalidations.iter().cloned());
     let mut clock = before.generation_clock;
+    after.sign_in_receipts = before.sign_in_receipts.clone();
     for label in changed {
+        // Usage can first create an empty binding for an existing default
+        // login. That adds a credential fence but does not replace the login
+        // whose successful sign-back the receipt describes.
+        let default_metadata = !before.labels.contains_key(&label)
+            && after.labels.get(&label).is_some_and(|binding| {
+                binding.dir.is_none()
+                    && binding.proved_by.is_none()
+                    && binding.proved_email.is_none()
+                    && binding.proved_dir.is_none()
+                    && binding.renewal_generation == 0
+            });
         let next = clock.checked_add(1).ok_or_else(|| {
             format!("account `{label}` renewal generation is exhausted; account records unchanged")
         })?;
         if let Some(binding) = after.labels.get_mut(&label) {
             binding.renewal_generation = next;
+            binding.last_success_generation = if renewed.contains(&label) { next } else { 0 };
+        }
+        if !default_metadata {
+            after.sign_in_receipts.remove(&label);
         }
         clock = next;
     }
     after.generation_clock = clock;
+    after.sign_in_clock = before.sign_in_clock;
     after
         .shared
         .fence_new_attempts(&before.shared, &after.labels)?;
@@ -2483,6 +2663,62 @@ fn advance_renewal_generations(
         || !after.shared.published_into(&before.shared, &after.labels)
     {
         return Err("shared preparation does not match the committed binding generation".into());
+    }
+    Ok(())
+}
+
+/// Derive in-place receipts after credential fences have been normalized. Prune
+/// evicted or removed account records before checking space for new successes.
+fn advance_sign_in_receipts(
+    before: &Logins,
+    after: &mut Logins,
+    state: &State,
+    events: &[Event],
+) -> Result<(), String> {
+    let invalidated = std::mem::take(&mut after.pending_sign_in_invalidations);
+    for label in &invalidated {
+        if let Some(binding) = after.labels.get_mut(label) {
+            binding.last_success_generation = 0;
+        }
+    }
+    after
+        .sign_in_receipts
+        .retain(|label, _| state.accounts.contains_key(label) && !invalidated.contains(label));
+    let signed_in: BTreeSet<_> = events
+        .iter()
+        .filter(|event| event.kind == Kind::SignedIn)
+        .filter(|event| state.accounts.contains_key(&event.account))
+        .filter(|event| !invalidated.contains(&event.account))
+        // A result for the old login cannot certify a replacement made by
+        // another edit in this transaction. A first empty metadata binding
+        // still describes the same unbound default login.
+        .filter(
+            |event| match (before.get(&event.account), after.get(&event.account)) {
+                (None, None) => true,
+                (None, Some(binding)) => {
+                    binding.dir.is_none()
+                        && binding.proved_by.is_none()
+                        && binding.proved_email.is_none()
+                        && binding.proved_dir.is_none()
+                }
+                (Some(old), Some(new)) => old.renewal_generation == new.renewal_generation,
+                (Some(_), None) => false,
+            },
+        )
+        .map(|event| event.account.clone())
+        .collect();
+    for label in signed_in {
+        if !admissible_label(&label)
+            || (!after.sign_in_receipts.contains_key(&label)
+                && after.sign_in_receipts.len() >= MAX_ACCOUNTS)
+        {
+            return Err("sign-in receipt exceeds local account capacity".into());
+        }
+        after.sign_in_clock = after
+            .sign_in_clock
+            .checked_add(1)
+            .ok_or("sign-in receipt clock is exhausted; account records unchanged")?;
+        after.sign_in_receipts.insert(label, after.sign_in_clock);
     }
     Ok(())
 }
@@ -2702,12 +2938,13 @@ pub fn note_sign_in_attempt(
 /// ([`failing_sign_ins`]); one of a row whose login works and is not due is not.
 #[must_use]
 pub fn needs_sign_in(row: &Row, state: &State, logins: &Logins, enrolled: bool, now: i64) -> bool {
-    matches!(
-        condition(row, state, enrolled, now),
-        Condition::NotEnrolled | Condition::SignedOut
-    ) || (row.email.is_some()
-        && enrolled
-        && matches!(login_state(row, logins, state, now), LoginState::Due { .. }))
+    row.held_by.is_none()
+        && (matches!(
+            condition(row, state, enrolled, now),
+            Condition::NotEnrolled | Condition::SignedOut
+        ) || (row.email.is_some()
+            && enrolled
+            && matches!(login_state(row, logins, state, now), LoginState::Due { .. })))
 }
 
 /// The rows of `roster` whose last automatic sign-in failed and which still need one
@@ -2788,6 +3025,7 @@ pub fn note_served_login(logins: &mut Logins, label: &str, at: i64) -> bool {
 }
 
 /// Records that `label`'s bound login served a turn at `at` after being marked signed out.
+/// Return its events from the enclosing transaction so the success receipt is committed.
 pub fn note_signed_back(
     state: &mut State,
     logins: &mut Logins,
@@ -2801,16 +3039,41 @@ pub fn note_signed_back(
     {
         return Vec::new();
     }
-    let out = note_auth(state, label, Auth::Ok, at);
-    if out.is_empty() {
+    note_checked_sign_in(state, logins, label, at)
+}
+
+/// Record a verified sign-in, including refreshed metadata on an existing binding.
+/// A future authentication observation keeps its authority until time catches up.
+/// Return these events from the account transaction to advance its success receipt.
+pub(super) fn note_checked_sign_in(
+    state: &mut State,
+    logins: &mut Logins,
+    label: &str,
+    at: i64,
+) -> Vec<Event> {
+    if state
+        .accounts
+        .get(label)
+        .is_some_and(|account| account.auth_at.is_some_and(|held| held > at))
+    {
+        return Vec::new();
+    }
+    let mut out = note_auth(state, label, Auth::Ok, at);
+    if state
+        .accounts
+        .get(label)
+        .is_none_or(|account| account.auth != Auth::Ok)
+    {
         return out;
     }
     if let Some(binding) = logins.labels.get_mut(label) {
         binding.renewed_at = Some(at);
         binding.notice_end = None;
         binding.served_at = Some(binding.served_at.map_or(at, |held| held.max(at)));
+        binding.sign_in_task = None;
         binding.clear_failed_sign_in();
     }
+    out.push(Event::new(at, Kind::SignedIn, label));
     out
 }
 
@@ -2978,6 +3241,13 @@ pub fn note_default_login_made(
     at: i64,
 ) -> Vec<Event> {
     let mut out = note_auth(state, label, Auth::Ok, at);
+    if !state
+        .accounts
+        .get(label)
+        .is_some_and(|account| account.auth == Auth::Ok && account.auth_at == Some(at))
+    {
+        return out;
+    }
     if let Some(binding) = logins.entry(label) {
         binding.served_at = Some(binding.served_at.map_or(at, |held| held.max(at)));
         binding.ended_at = None;
@@ -2988,6 +3258,7 @@ pub fn note_default_login_made(
     if let Some(was) = was {
         out.extend(move_default_sessions(state, label, was, at));
     }
+    out.push(Event::new(at, Kind::SignedIn, label));
     out
 }
 
@@ -3024,6 +3295,12 @@ pub fn move_account(
             "cannot move `{from}` to `{to}`: the destination retains local login or account state; choose an unused label; nothing was written"
         ));
     }
+    for label in [from, to] {
+        logins.sign_in_receipts.remove(label);
+        logins
+            .pending_sign_in_invalidations
+            .insert(label.to_owned());
+    }
     if let Some(record) = state.accounts.remove(from) {
         state.accounts.insert(to.to_owned(), record);
     }
@@ -3032,6 +3309,9 @@ pub fn move_account(
     }
     if state.home_accounts.remove(from) {
         state.home_accounts.insert(to.to_owned());
+    }
+    if state.prepared_accounts.remove(from) {
+        state.prepared_accounts.insert(to.to_owned());
     }
     if let Some(binding) = logins.labels.remove(from) {
         logins.labels.insert(to.to_owned(), binding);
@@ -3066,7 +3346,9 @@ pub fn move_account(
 
 fn label_is_retained(state: &State, logins: &Logins, label: &str) -> bool {
     logins.labels.contains_key(label)
+        || logins.sign_in_receipts.contains_key(label)
         || state.accounts.contains_key(label)
+        || state.prepared_accounts.contains(label)
         || state.active.as_deref() == Some(label)
         || state.previous.as_deref() == Some(label)
         || state
@@ -3095,6 +3377,10 @@ fn label_is_retained(state: &State, logins: &Logins, label: &str) -> bool {
 /// another account: its observations (walls, samples, auth word) and its binding's turns served.
 /// The login directory the label is bound to is kept: what it holds is checked where it is run.
 pub fn forget_account(state: &mut State, logins: &mut Logins, label: &str) {
+    logins.sign_in_receipts.remove(label);
+    logins
+        .pending_sign_in_invalidations
+        .insert(label.to_owned());
     state.accounts.remove(label);
     state.leases.remove(label);
     state.home_accounts.remove(label);
@@ -3853,6 +4139,9 @@ pub struct State {
     pub leases: BTreeMap<String, AccountLease>,
     /// Account labels for which this Mac is the home Mac (`warm[0]` in `ai-pool.toml`).
     pub home_accounts: BTreeSet<String>,
+    /// Verified local credentials whose root grant authorized preparation only.
+    /// They cannot dispatch until a separate execution policy releases them.
+    pub prepared_accounts: BTreeSet<String>,
     /// Canonical `m<N>` swarm label resolved for this Mac, when known.
     pub swarm_label: Option<String>,
     /// Legacy `m<N>` aliases resolved for this Mac from `aterm-swarm-roster`.
@@ -3887,6 +4176,7 @@ impl Default for State {
             reset: None,
             leases: BTreeMap::new(),
             home_accounts: BTreeSet::new(),
+            prepared_accounts: BTreeSet::new(),
             swarm_label: None,
             swarm_aliases: Vec::new(),
             unrecorded: false,
@@ -4262,7 +4552,16 @@ impl State {
     #[must_use]
     pub fn to_json(&self) -> String {
         let mut o = Map::new();
-        o.insert("schema".to_owned(), Value::from(self.schema));
+        o.insert(
+            "schema".to_owned(),
+            Value::from(
+                if self.schema == SCHEMA && !self.prepared_accounts.is_empty() {
+                    PREPARED_STATE_SCHEMA
+                } else {
+                    self.schema
+                },
+            ),
+        );
         o.insert("machine".to_owned(), Value::from(self.machine.as_str()));
         o.insert(
             "accounts".to_owned(),
@@ -4367,6 +4666,17 @@ impl State {
                 ),
             );
         }
+        if !self.prepared_accounts.is_empty() {
+            o.insert(
+                "prepared_accounts".into(),
+                Value::Array(
+                    self.prepared_accounts
+                        .iter()
+                        .map(|label| Value::from(label.as_str()))
+                        .collect(),
+                ),
+            );
+        }
         if let Some(swarm_label) = &self.swarm_label {
             o.insert("swarm_label".to_owned(), Value::from(swarm_label.as_str()));
         }
@@ -4403,18 +4713,19 @@ impl State {
     ///
     /// [`Unread::Torn`]: not JSON, including a file cut short.
     /// [`Unread::NotOurs`]: JSON but not an object, or naming no schema or one other than
-    /// [`SCHEMA`]: a file this build must not guess at or write over.
+    /// [`SCHEMA`] or [`PREPARED_STATE_SCHEMA`]: a file this build must not guess at or write over.
     pub fn from_json(text: &str, now: i64) -> Result<State, Unread> {
         let doc: Value = aterm_json::from_str(text)
             .map_err(|e| Unread::Torn(format!("not JSON ({})", shown(&e.to_string()))))?;
         if !doc.is_object() {
             return Err(Unread::NotOurs("not a JSON object".to_string()));
         }
-        match doc.get("schema").and_then(Value::as_u64) {
-            Some(SCHEMA) => {}
+        let stored_schema = doc.get("schema").and_then(Value::as_u64);
+        match stored_schema {
+            Some(SCHEMA | PREPARED_STATE_SCHEMA) => {}
             Some(other) => {
                 return Err(Unread::NotOurs(format!(
-                    "schema {other}; this build reads schema {SCHEMA}"
+                    "schema {other}; this build reads schemas {SCHEMA} and {PREPARED_STATE_SCHEMA}"
                 )));
             }
             None => return Err(Unread::NotOurs("names no schema".to_string())),
@@ -4516,6 +4827,29 @@ impl State {
             .map(str::to_owned)
             .collect();
         let swarm_label = word(doc.get("swarm_label"), WORD_MAX);
+        let mut prepared_accounts = BTreeSet::new();
+        if let Some(value) = doc.get("prepared_accounts") {
+            let labels = value
+                .as_array()
+                .filter(|labels| labels.len() <= MAX_ACCOUNTS)
+                .ok_or_else(|| {
+                    Unread::NotOurs("invalid prepared-account execution holds".into())
+                })?;
+            for value in labels {
+                let label = value
+                    .as_str()
+                    .filter(|label| admissible_label(label))
+                    .ok_or_else(|| Unread::NotOurs("invalid prepared-account label".into()))?;
+                if !prepared_accounts.insert(label.to_owned()) {
+                    return Err(Unread::NotOurs("duplicate prepared-account hold".into()));
+                }
+            }
+        }
+        if (!prepared_accounts.is_empty()) != (stored_schema == Some(PREPARED_STATE_SCHEMA)) {
+            return Err(Unread::NotOurs(
+                "prepared-account holds require their guarded state schema".into(),
+            ));
+        }
         let mut swarm_aliases: Vec<String> = doc
             .get("swarm_aliases")
             .and_then(Value::as_array)
@@ -4572,6 +4906,7 @@ impl State {
             reset,
             leases,
             home_accounts,
+            prepared_accounts,
             swarm_label,
             swarm_aliases,
             unrecorded,
@@ -4607,15 +4942,30 @@ impl State {
                 .any(|a| trimmed.eq_ignore_ascii_case(a))
     }
 
+    /// Checks the preparation-only execution hold on `label`.
+    /// Other admission rules, including leases, are evaluated separately.
+    ///
+    /// # Errors
+    ///
+    /// [`WhyNot::PreparationOnly`] when the credential is still held for preparation only.
+    pub fn execution_verdict(&self, label: &str) -> Result<(), WhyNot> {
+        if self.prepared_accounts.contains(label) {
+            return Err(WhyNot::PreparationOnly);
+        }
+        Ok(())
+    }
+
     /// Evaluates whether this Mac may use `label` at `now`, as the account claims settle it
     /// (`docs/DESIGN-fluid-swarm-2026-10-28.md` F19).
     ///
     /// # Errors
     ///
+    /// - [`WhyNot::PreparationOnly`] when a shared credential has no separate execution grant.
     /// - [`WhyNot::LeasedElsewhere`] when another Mac's live claim on `label` is the senior one.
     /// - [`WhyNot::Unclaimed`] when this Mac cannot record its claims (`self.unrecorded`) and
     ///   neither holds a live claim on `label` nor is `label`'s home Mac (`warm[0]`).
     pub fn lease_verdict(&self, label: &str, now: i64) -> Result<(), WhyNot> {
+        self.execution_verdict(label)?;
         if let Some(lease) = self.leases.get(label)
             && lease.until > now
         {
@@ -4783,7 +5133,8 @@ pub fn signed_out(
         .rows
         .iter()
         .filter(|row| {
-            row.email.is_none()
+            row.held_by.is_none()
+                && row.email.is_none()
                 && condition(row, state, is_enrolled(row, enrolled), now) == Condition::SignedOut
         })
         .map(|row| row.label.clone())
@@ -4803,7 +5154,11 @@ pub fn sign_in_next(
     roster
         .rows
         .iter()
-        .filter(|row| me != Some(row.label.as_str()))
+        .filter(|row| {
+            row.held_by.is_none()
+                && state.execution_verdict(&row.label).is_ok()
+                && me != Some(row.label.as_str())
+        })
         .find(|row| {
             matches!(
                 condition(row, state, is_enrolled(row, enrolled), now),
@@ -4827,7 +5182,9 @@ pub fn renew_next(
     now: i64,
 ) -> Option<String> {
     for class in [Class::Dedicated, Class::Shared] {
-        for row in roster.rows.iter().filter(|r| r.class == class) {
+        for row in roster.rows.iter().filter(|r| {
+            r.held_by.is_none() && state.execution_verdict(&r.label).is_ok() && r.class == class
+        }) {
             if me == Some(row.label.as_str()) || row.email.is_none() {
                 continue;
             }
@@ -5011,6 +5368,10 @@ pub enum Advice {
         /// `active` has not served a response and the session that moved onto it has been silent
         /// for [`CANARY_HOLD_S`] ([`take_canary`]).
         takes_canary: bool,
+        /// The session yields its own account by this move, another Mac's senior live claim
+        /// holding it (`docs/DESIGN-fluid-swarm-2026-10-28.md` F19): until when a turn end that
+        /// does not make the move holds, as one with no row to move to does ([`Advice::Wait`]).
+        yields: Option<i64>,
     },
     /// No account is usable before this instant: at a wall, the session's own is walled; at a
     /// turn end, another Mac's senior live claim holds it (`docs/DESIGN-fluid-swarm-2026-10-28.md`
@@ -5066,6 +5427,8 @@ impl Rank {
 /// Reason a roster row is excluded from candidate rotation targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WhyNot {
+    /// Its credential is prepared, but no separate execution policy admits use.
+    PreparationOnly,
     /// It is the session's own account.
     Me,
     /// Assigned only to other Macs' warm sets in `ai-pool.toml` (`Row::held_by`).
@@ -5101,6 +5464,7 @@ impl WhyNot {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            WhyNot::PreparationOnly => "prepared: awaiting execution authority",
             WhyNot::Me => "this session's own",
             WhyNot::HeldElsewhere => "held-elsewhere",
             WhyNot::NotEnrolled => "not-enrolled",
@@ -5135,6 +5499,35 @@ fn effective_usable_at(row: &Row, state: &State, cond: Condition, now: i64) -> O
         Ok(()) => Some(base),
         Err(WhyNot::LeasedElsewhere { until }) => Some(base.max(until)),
         Err(_) => None,
+    }
+}
+
+fn row_available_here(row: &Row, state: &State, now: i64) -> bool {
+    row.held_by.is_none() && state.lease_verdict(&row.label, now).is_ok()
+}
+
+/// The trigger used to rank replacements for this session. A turn end that must
+/// yield its current account admits low-budget replacements as a wall does.
+#[must_use]
+pub fn effective_ranking_point<'a>(
+    roster: &Roster,
+    state: &State,
+    me: &Me<'_>,
+    point: &'a Point,
+    now: i64,
+) -> Cow<'a, Point> {
+    if *point == Point::TurnEnd
+        && me.default_home
+        && me.stored_login
+        && let Some(mine) = me.label().and_then(|label| roster.row(label))
+        && !row_available_here(mine, state, now)
+    {
+        Cow::Owned(Point::Wall {
+            window: String::new(),
+            at: None,
+        })
+    } else {
+        Cow::Borrowed(point)
     }
 }
 
@@ -5366,7 +5759,7 @@ pub fn advise(
 /// Computes the advice for `cli`'s pool: [`advise`]'s for Claude Code, else [`advise_past_probe`]'s
 /// (another CLI has no `/usage` probe). A move between the logins of a CLI whose seam no lab pass
 /// has measured ([`crate::ai::connector::Accounts::measured`]) becomes [`StayWhy::Unmeasured`],
-/// since a relaunch onto an unmeasured seam can lose the session it moves.
+/// or a wait when the session must yield, since an unmeasured relaunch can lose the session.
 #[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn advise_for(
@@ -5387,9 +5780,13 @@ pub fn advise_for(
     held_unless_measured(advice, cli.accounts().measured)
 }
 
-/// `advice`, a move in it held as [`StayWhy::Unmeasured`] where the seam is not `measured`.
+/// Hold an unmeasured move, retaining a wait when its session cannot keep executing.
 fn held_unless_measured(advice: Advice, measured: bool) -> Advice {
     match advice {
+        Advice::Move {
+            yields: Some(until),
+            ..
+        } if !measured => Advice::Wait { until },
         Advice::Move { .. } if !measured => Advice::Stay(StayWhy::Unmeasured),
         advice => advice,
     }
@@ -5426,6 +5823,10 @@ pub fn advise_session(
         return Advice::Stay(StayWhy::OtherSupervisor);
     }
     match advise_for(cli, roster, state, enrolled, me, point, mode, now) {
+        Advice::Move {
+            yields: Some(until),
+            ..
+        } if cli.accounts().walls_measured_on.is_none() => Advice::Wait { until },
         Advice::Move { .. } if cli.accounts().walls_measured_on.is_none() => {
             Advice::Stay(StayWhy::Unmeasured)
         }
@@ -5445,8 +5846,7 @@ pub fn launch_row<'a>(
     enrolled: &BTreeSet<String>,
     now: i64,
 ) -> Option<&'a Row> {
-    let available_here =
-        |row: &Row| row.held_by.is_none() && state.lease_verdict(&row.label, now).is_ok();
+    let available_here = |row: &Row| row_available_here(row, state, now);
     let active = state.active.as_deref().and_then(|label| roster.row(label));
     if let Some(row) = active
         && available_here(row)
@@ -5471,6 +5871,51 @@ pub fn launch_row<'a>(
                 available_here(row) && condition(row, state, is_enrolled(row, enrolled), now).runs()
             })
         })
+}
+
+/// The row a Claude Code worker spawned from a tab on the row `from` starts under, where that is
+/// another row: the one the host would move that tab to at its next point, by the host's own
+/// rule ([`advise_past_probe`] under `mode`), at a wall where `from` cannot run now (walled,
+/// signed out, not enrolled here) and at a turn end where it can. So the worker follows `active`
+/// where it is another row and fresh, or pinned and still running; a canary holds it where the
+/// host would hold the tab; a spent rotation bound keeps it; under [`Mode::Wall`] a row that
+/// still runs keeps it, and under [`Mode::Early`] a low row it should leave early moves it.
+/// `None` keeps the worker on `from`: a stay, a wait, a resume, `from` no row of `roster`, or
+/// a move that takes the canary, which is the host's to take with the worker's own session.
+/// A launch records nothing: the move is the host's to record, as for any launch
+/// ([`launch_row`]).
+#[must_use]
+pub fn worker_row<'a>(
+    roster: &'a Roster,
+    state: &State,
+    enrolled: &BTreeSet<String>,
+    from: &str,
+    mode: Mode,
+    now: i64,
+) -> Option<&'a Row> {
+    let mine = roster.row(from)?;
+    let point = if condition(mine, state, is_enrolled(mine, enrolled), now).runs() {
+        Point::TurnEnd
+    } else {
+        Point::Wall {
+            window: String::new(),
+            at: None,
+        }
+    };
+    let me = Me {
+        account: Some(from),
+        left: None,
+        default_home: true,
+        stored_login: true,
+    };
+    match advise_past_probe(roster, state, enrolled, &me, &point, mode, now) {
+        Advice::Move {
+            to,
+            takes_canary: false,
+            ..
+        } if to != from => roster.row(&to),
+        _ => None,
+    }
 }
 
 /// Computes [`advise`] with the `/usage` probe arm skipped.
@@ -5501,7 +5946,12 @@ fn advise_with(
 ) -> Advice {
     let login_point =
         *point == Point::LoginEnded || (me.left.is_some() && !matches!(point, Point::Wall { .. }));
-    if mode == Mode::Off && !login_point {
+    if mode == Mode::Off
+        && !login_point
+        && me
+            .label()
+            .is_none_or(|label| state.execution_verdict(label).is_ok())
+    {
         return Advice::Stay(StayWhy::Off);
     }
     if roster.rows.is_empty() {
@@ -5521,18 +5971,82 @@ fn advise_with(
         Point::Wall { .. } | Point::LostLogin { .. } | Point::LoginEnded
     );
     let cond = |row: &Row| condition(row, state, is_enrolled(row, enrolled), now);
-    if login_point {
+    let available_here = |row: &Row| row_available_here(row, state, now);
+    if *point == Point::LoginEnded {
+        return if available_here(mine) {
+            login_follow(mine, me, point, cond(mine))
+        } else {
+            Advice::Stay(StayWhy::NoCandidate)
+        };
+    }
+    if login_point && available_here(mine) {
         return login_follow(mine, me, point, cond(mine));
     }
+    let unavailable = !available_here(mine);
+    let retry = now.saturating_add(super::claims::RECHECK_S);
+    if mode == Mode::Off {
+        return if !at_wall && state.execution_verdict(&mine.label).is_err() {
+            Advice::Wait { until: retry }
+        } else {
+            Advice::Stay(StayWhy::Off)
+        };
+    }
+    // A session without execution authority yields at its next turn end. Preparation holds,
+    // senior claims and unrecordable non-home claims all forbid continuing on the credential.
+    // Rank replacements as at a wall, including low-budget accounts.
+    let ranked_at = effective_ranking_point(roster, state, me, point, now);
+    let yielding = ranked_at.as_ref() != point;
+    // Where it yields, a turn end no move takes it from holds until a row opens, the breaker has
+    // room, the `active`'s canary hold ends, or the claims are read again, whichever comes first:
+    // so too one that does not make its move ([`Advice::Move`]'s `yields`).
+    let yields = yielding.then(|| {
+        let opening = wait_instant(roster, state, enrolled, Instants::Ahead, now);
+        [
+            opening,
+            breaker_until(state, roster, now),
+            state.canary_until(now),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|at| *at > now)
+        .fold(retry, i64::min)
+    });
+    let admitted = |to: &str| {
+        // Use the same wall reducer as the recorder: a new wall retires its pin, but a
+        // stale observation of a cleared wall must preserve it.
+        let mut current = state.clone();
+        if let Point::Wall { window, at } = point {
+            note_wall(
+                &mut current,
+                &mine.label,
+                window,
+                None,
+                at.unwrap_or(now),
+                now,
+            );
+        }
+        let mover = Mover {
+            sid: "advice-admission",
+            account: &mine.label,
+        };
+        begin_rotation(
+            &mut current,
+            roster,
+            enrolled,
+            state.active.as_deref(),
+            mover,
+            to,
+            now,
+        )
+        .is_ok()
+    };
     let onto_active = |active: &Row, takes_canary: bool| Advice::Move {
         to: active.label.clone(),
         ahead: !at_wall,
         rotates: false,
         takes_canary,
+        yields,
     };
-
-    let available_here =
-        |row: &Row| row.held_by.is_none() && state.lease_verdict(&row.label, now).is_ok();
     let mut low_active = None;
     if let Some(active) = state.active.as_deref().and_then(|l| roster.row(l))
         && active.label != mine.label
@@ -5540,17 +6054,16 @@ fn advise_with(
     {
         let theirs = cond(active);
         if theirs.runs() && !state.proven {
-            let take = !state.canary_holds(now) && (at_wall || theirs.fresh());
-            return if take {
-                onto_active(active, true)
-            } else {
-                Advice::Stay(StayWhy::Canary)
-            };
-        }
-        if theirs.fresh() || (theirs.runs() && state.pinned) {
+            let walled = at_wall || yielding;
+            if !state.canary_holds(now) && (walled || theirs.fresh()) {
+                return onto_active(active, true);
+            }
+            if !yielding {
+                return Advice::Stay(StayWhy::Canary);
+            }
+        } else if theirs.fresh() || (theirs.runs() && state.pinned) {
             return onto_active(active, false);
-        }
-        if theirs.runs() {
+        } else if theirs.runs() {
             low_active = Some(active);
         }
     }
@@ -5594,24 +6107,19 @@ fn advise_with(
             ahead: false,
             rotates: false,
             takes_canary: unanswered,
+            yields: None,
         };
     }
 
     let breaker = breaker_until(state, roster, now);
-    // A session whose own account another Mac's senior live claim holds yields at this turn end
-    // in every mode that rotates (docs/DESIGN-fluid-swarm-2026-10-28.md F19, §3.5.3): its own
-    // row is as good as walled, so the rows rank as at a wall, a low one included.
-    let claimed_elsewhere = !at_wall
-        && matches!(
-            state.lease_verdict(&mine.label, now),
-            Err(WhyNot::LeasedElsewhere { .. })
-        );
-    let wall = Point::Wall {
-        window: String::new(),
-        at: None,
-    };
-    let ranked_at = if claimed_elsewhere { &wall } else { point };
-    let listed = candidates(roster, state, enrolled, Some(&mine.label), ranked_at, now);
+    let listed = candidates(
+        roster,
+        state,
+        enrolled,
+        Some(&mine.label),
+        ranked_at.as_ref(),
+        now,
+    );
     let low_active =
         low_active.filter(|a| listed.iter().any(|(l, rank)| *l == a.label && rank.is_ok()));
     let next = listed
@@ -5624,35 +6132,29 @@ fn advise_with(
                 onto_active(active, false)
             }
             (Some(_), _, Some(until)) => Advice::Stay(StayWhy::Breaker { until }),
-            (Some((to, _)), _, None) => Advice::Move {
+            (Some((to, _)), _, None) if admitted(&to) => Advice::Move {
                 to,
                 ahead: false,
                 rotates: true,
                 takes_canary: false,
+                yields: None,
             },
             (None, ..) => {
                 let walled = Instants::WalledOn(&mine.label);
                 match wait_instant(roster, state, enrolled, walled, now) {
                     Some(until) if until > now => Advice::Wait { until },
+                    _ if unavailable => Advice::Wait { until: retry },
                     _ => Advice::Stay(StayWhy::NoCandidate),
                 }
             }
+            (Some(_), _, None) => Advice::Wait { until: retry },
         };
     }
 
-    if claimed_elsewhere {
-        // A move goes only where its rotation would be admitted ([`begin_rotation`]: not off an
-        // unanswered or pinned `active` that still runs); else the turn end waits, so the session
-        // stops using the account, until a row opens, the breaker has room, or the claims are
-        // read again, whichever comes first.
-        let admitted = |to: &str| {
-            let mover = Mover {
-                sid: "claim-yield",
-                account: &mine.label,
-            };
-            let active = state.active.as_deref();
-            begin_rotation(&mut state.clone(), roster, enrolled, active, mover, to, now).is_ok()
-        };
+    if let Some(until) = yields {
+        // A move goes only where its rotation would be admitted ([`begin_rotation`]: not off a
+        // pinned `active` that still runs, or an unanswered one this Mac may use); else the turn
+        // end waits, so the session stops using the account, until the yield's instant.
         return match (next, low_active, breaker) {
             (Some((_, rank)), Some(active), spent) if rank.low || spent.is_some() => {
                 onto_active(active, false)
@@ -5662,17 +6164,9 @@ fn advise_with(
                 ahead: true,
                 rotates: true,
                 takes_canary: false,
+                yields,
             },
-            _ => {
-                let look = now.saturating_add(super::claims::RECHECK_S);
-                let opening = wait_instant(roster, state, enrolled, Instants::Ahead, now);
-                let until = [opening, breaker]
-                    .into_iter()
-                    .flatten()
-                    .filter(|at| *at > now)
-                    .fold(look, i64::min);
-                Advice::Wait { until }
-            }
+            _ => Advice::Wait { until },
         };
     }
 
@@ -5715,12 +6209,14 @@ fn advise_with(
         (None, _) => Advice::Stay(StayWhy::NoFresh),
         (Some(_), _) if unanswered => Advice::Stay(StayWhy::Canary),
         (Some(_), Some(until)) => Advice::Stay(StayWhy::Breaker { until }),
-        (Some((to, _)), None) => Advice::Move {
+        (Some((to, _)), None) if admitted(&to) => Advice::Move {
             to,
             ahead: true,
             rotates: true,
             takes_canary: false,
+            yields: None,
         },
+        (Some(_), None) => Advice::Wait { until: retry },
     }
 }
 
@@ -5733,6 +6229,7 @@ fn login_follow(mine: &Row, me: &Me<'_>, point: &Point, cond: Condition) -> Advi
             ahead: !at_wall,
             rotates: false,
             takes_canary: false,
+            yields: None,
         };
     }
     Advice::Stay(if at_wall {
@@ -5780,6 +6277,8 @@ pub enum Kind {
     Warned,
     /// A login was renewed ([`note_renewed`]).
     Renewed,
+    /// An in-place login succeeded ([`note_signed_back`], [`note_default_login_made`]).
+    SignedIn,
     /// A bound login was seen ended, at a login wall in a session on it ([`note_login_end`]).
     LoginEnded,
     /// A renewal's check answered another account than the row's ([`note_wrong_account`]).
@@ -5800,7 +6299,7 @@ pub enum Kind {
 
 impl Kind {
     /// Every kind.
-    pub const ALL: [Kind; 23] = [
+    pub const ALL: [Kind; 24] = [
         Kind::Wall,
         Kind::Sample,
         Kind::Rotate,
@@ -5818,6 +6317,7 @@ impl Kind {
         Kind::Credits,
         Kind::Warned,
         Kind::Renewed,
+        Kind::SignedIn,
         Kind::LoginEnded,
         Kind::WrongAccount,
         Kind::Reset,
@@ -5847,6 +6347,7 @@ impl Kind {
             Kind::Credits => "credits",
             Kind::Warned => "warned",
             Kind::Renewed => "renewed",
+            Kind::SignedIn => "signed-in",
             Kind::LoginEnded => "login-ended",
             Kind::WrongAccount => "wrong-account",
             Kind::Reset => "reset",
@@ -5926,7 +6427,8 @@ impl Event {
             | Kind::ResetUsed
             | Kind::ResetKept
             | Kind::ResetFailed
-            | Kind::Renewed => true,
+            | Kind::Renewed
+            | Kind::SignedIn => true,
             Kind::Auth => self.why == Auth::Ok.as_str(),
             Kind::Wall
             | Kind::Sample
@@ -6117,9 +6619,13 @@ pub fn note_sample(state: &mut State, account: &str, sample: Sample, now: i64) -
     {
         return Vec::new();
     }
-    let shown = |pct: Option<u32>| pct.map_or_else(|| "?".to_string(), |p| p.to_string());
+    // A row the panel lacked leads with `–` and says so, never a bare `?`: a narrow pane may cut
+    // a row, so it is not Claude Code reporting no window ([`tap_shown`]).
+    let shown = |pct: Option<u32>| {
+        pct.map_or_else(|| "– (not on the panel)".to_owned(), |p| format!("{p}%"))
+    };
     let event = Event::new(sample.at, Kind::Sample, account).because(&format!(
-        "session {}% week {}%",
+        "session {} week {}",
         shown(sample.session_pct),
         shown(sample.week_pct)
     ));
@@ -6211,6 +6717,23 @@ pub fn note_panel_window(
 
 fn fig_news(f: Option<&WindowFig>) -> Option<(u32, i64, Option<i64>)> {
     f.map(|f| (f.pct_x10, f.reset, f.epoch_at))
+}
+
+/// A window's figure in a usage tap's ledger row (`tap: session 42% week 1%`): the figure the
+/// record holds after the reading (`held`, its percentage and reset) while its window is open at
+/// `now`, else, never a bare `?` and never a closed window's figure, why there is none. The
+/// reading did not carry the window (`carried`), as Claude Code 2.1.316's statusLine leaves out a
+/// window the API reply did not report, and nothing open is held from another session or a panel;
+/// or what it carried was held back or cut as read before an in-window reset
+/// ([`WindowFig::cut`]), or its window has closed. The figure then leads with `–`, so no reader
+/// takes a number off it.
+fn tap_shown(held: Option<(u32, i64)>, carried: bool, now: i64) -> String {
+    match held {
+        Some((pct, reset)) if reset > now => format!("{pct}%"),
+        _ if !carried => "– (not reported by Claude Code)".to_owned(),
+        Some(_) => "– (window reset)".to_owned(),
+        None => "– (read before a reset)".to_owned(),
+    }
 }
 
 /// Records a fresh usage-tap [`TapRead`] for `account` at `now`.
@@ -6342,11 +6865,10 @@ pub fn note_reading_held(
             .map(|f| (f.whole(), f.reset))
     };
     let (session, week) = (live(&figures[0]), live(&figures[1]));
-    let shown = |w: Option<(u32, i64)>| w.map_or_else(|| "?".to_string(), |(p, _)| p.to_string());
     events.push(Event::new(now, Kind::Sample, account).because(&format!(
-        "tap: session {}% week {}%",
-        shown(session),
-        shown(week)
+        "tap: session {} week {}",
+        tap_shown(session, reads[0].1.is_some(), now),
+        tap_shown(week, reads[1].1.is_some(), now)
     )));
     // A heartbeat publishes now, but does not observe the held windows again. Keep a
     // newer matching panel observation too: equal values do not make it a heartbeat.
@@ -6843,7 +7365,8 @@ pub enum Lost {
         /// What `active` is.
         active: Option<String>,
     },
-    /// `active` as read can be run on and is not rotated past.
+    /// `active` as read can be run on, this Mac may use it or the owner pinned it, and it is not
+    /// rotated past.
     Held {
         /// That account.
         active: String,
@@ -6894,11 +7417,18 @@ pub fn begin_rotation(
     let cond = |label: &str| {
         roster
             .row(label)
+            .filter(|r| r.held_by.is_none())
             .map(|r| condition(r, state, is_enrolled(r, enrolled), now))
     };
     let runs = |label: &str| cond(label).is_some_and(Condition::runs);
     let fresh = |label: &str| cond(label).is_some_and(Condition::fresh);
-    let active_runs = expect_active.is_some_and(runs);
+    // An `active` this Mac may not use (another Mac's senior claim, one it cannot record) holds
+    // nothing, as [`advise`] moves no session onto it; where another Mac holds it, every session
+    // here on it yields, so none answers its canary. A pin holds whatever the claim: only
+    // `accounts use --auto` ends it, and a rotation would clear it unannounced.
+    let active_runs = expect_active.is_some_and(|active| {
+        runs(active) && (state.pinned || state.lease_verdict(active, now).is_ok())
+    });
     if let Some(active) = expect_active
         && active_runs
     {
@@ -6919,7 +7449,7 @@ pub fn begin_rotation(
             return held;
         }
     }
-    if to == me || expect_active == Some(to) || !runs(to) {
+    if to == me || expect_active == Some(to) || !runs(to) || state.execution_verdict(to).is_err() {
         return Err(Lost::NotACandidate);
     }
     if rotations_spent(state, roster, now) {
@@ -7083,6 +7613,7 @@ pub fn strike(state: &mut State, account: &str, sid: &str, why: &Strike, now: i6
 #[derive(Clone, Copy)]
 enum PinRefusal {
     NotListed,
+    PreparationOnly,
     NotEnrolled,
     SignedOut,
 }
@@ -7091,6 +7622,9 @@ impl PinRefusal {
     fn message(self, label: &str) -> String {
         match self {
             Self::NotListed => format!("`{}` is not in the roster", shown(label)),
+            Self::PreparationOnly => {
+                format!("`{label}` is prepared but has no execution authority")
+            }
             Self::NotEnrolled => format!(
                 "`{label}` is not-enrolled: no login was made for it on this machine (its login \
                  directory is missing or empty)"
@@ -7109,6 +7643,9 @@ fn pin_refusal(
     let Some(row) = roster.row(label) else {
         return Some(PinRefusal::NotListed);
     };
+    if state.execution_verdict(label).is_err() {
+        return Some(PinRefusal::PreparationOnly);
+    }
     if !is_enrolled(row, enrolled) {
         return Some(PinRefusal::NotEnrolled);
     }
@@ -7132,7 +7669,7 @@ pub enum PinSelection {
 /// # Errors
 ///
 /// By name: a label the roster does not list, one not enrolled on this
-/// machine, one known signed out. Nothing is changed.
+/// machine, one known signed out, or one held for preparation only. Nothing is changed.
 pub fn pin(
     state: &mut State,
     roster: &Roster,
@@ -7454,6 +7991,8 @@ fn open_retained_file(path: &Path, kind: &str) -> io::Result<std::fs::File> {
             return Err(not_regular());
         }
     }
+    #[cfg(any(unix, windows))]
+    aterm_uds::keep_out_of_children(&file)?;
     Ok(file)
 }
 
@@ -8430,16 +8969,67 @@ impl Store {
         self.tail_with(max, || {})
     }
 
+    /// Reads the newest `max` ledger rows only when each is a recognized event.
+    /// Admission readers cannot ignore an invalid row that may supersede earlier evidence.
+    /// # Errors
+    /// As [`Self::tail`], or a row in the bounded tail is malformed or unrecognized.
+    pub(crate) fn tail_validated(&self, max: usize) -> io::Result<Vec<Event>> {
+        self.read_tail_with(
+            max,
+            || {},
+            |lines| {
+                lines
+                    .iter()
+                    .map(|line| {
+                        let invalid = || {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "account ledger contains an invalid event",
+                            )
+                        };
+                        let event = Event::of_json_line(line).ok_or_else(invalid)?;
+                        let doc: Value = aterm_json::from_str(line).map_err(|_| invalid())?;
+                        for (key, max) in [
+                            ("account", LABEL_MAX),
+                            ("to", LABEL_MAX),
+                            ("sid", WORD_MAX),
+                            ("why", LEDGER_WHY_MAX),
+                        ] {
+                            match doc.get(key) {
+                                None | Some(Value::Null) if key != "account" && key != "why" => {}
+                                None if key == "why" => {}
+                                Some(Value::String(word)) if *word == one_line(word, max) => {}
+                                _ => return Err(invalid()),
+                            }
+                        }
+                        Ok(event)
+                    })
+                    .collect()
+            },
+        )
+    }
+
     fn tail_with(&self, max: usize, after_read: impl FnOnce()) -> io::Result<Vec<Event>> {
+        self.read_tail_with(max, after_read, |lines| {
+            Ok(lines
+                .iter()
+                .filter_map(|line| Event::of_json_line(line))
+                .collect())
+        })
+    }
+
+    fn read_tail_with<T>(
+        &self,
+        max: usize,
+        after_read: impl FnOnce(),
+        decode: impl FnOnce(Vec<String>) -> io::Result<T>,
+    ) -> io::Result<T> {
         let receipt = self.sync_read_receipt().map_err(io::Error::other)?;
-        let events = super::cli::tail_lines(&self.ledger_path(), max)?
-            .iter()
-            .filter_map(|line| Event::of_json_line(line))
-            .collect();
+        let decoded = decode(super::cli::tail_lines(&self.ledger_path(), max)?);
         after_read();
         self.check_sync_read_receipt(&receipt)
             .map_err(io::Error::other)?;
-        Ok(events)
+        decoded
     }
 
     /// Serializes a read-modify-write transaction on `state.json` and `ledger.jsonl` under
@@ -8577,7 +9167,9 @@ impl Store {
                 let enrolled = self.enrolled_here(&roster);
                 match pin_refusal(state, &roster, &enrolled, label) {
                     None => pin(state, &roster, &enrolled, label, now).map(|event| vec![event]),
-                    Some(why @ PinRefusal::NotListed) => Err(why.message(label)),
+                    Some(why @ (PinRefusal::NotListed | PinRefusal::PreparationOnly)) => {
+                        Err(why.message(label))
+                    }
                     Some(why @ (PinRefusal::NotEnrolled | PinRefusal::SignedOut)) => {
                         if let Some(row) = roster.row(label)
                             && logins.shared.required(row)?.is_some()
@@ -8709,7 +9301,8 @@ impl Store {
     /// a generation. Multiple changes to one label consume it once per transaction.
     /// # Errors
     /// As [`Store::transact`], for either file, or a renewed binding is missing or its
-    /// generation is exhausted. Interrupted local publication recovers before the edit;
+    /// generation is exhausted, or a sign-in receipt exceeds its capacity or clock.
+    /// Interrupted local publication recovers before the edit;
     /// a pending roster-bound publication needs its caller-supplied path. The edit's own
     /// external effects are not rolled back.
     pub fn transact_logins(

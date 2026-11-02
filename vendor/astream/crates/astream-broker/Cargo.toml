@@ -21,8 +21,9 @@ cap = ["dep:astream-cap"]
 # Off by default: an XChaCha20-Poly1305-sealed TCP transport (serve_tcp_sealed /
 # Client::connect_tcp_sealed). Pulls astream-aead and its cipher (ring's
 # ChaCha20-Poly1305; astream-aead derives the XChaCha20 subkey itself), so the default
-# broker stays zero-third-party.
-aead = ["dep:astream-aead"]
+# broker stays zero-third-party. Names astream-aead's `stream` (SealedStream, the record
+# layer the wire speaks), which astream-aead compiles only when asked.
+aead = ["dep:astream-aead", "astream-aead/stream"]
 # Off by default: the Rung-7 forward-secret handshake (serve_tcp_handshake /
 # Client::connect_tcp_handshake) — ephemeral X25519 authenticated by the PSK.
 # Implies aead and enables astream-aead's handshake (pulls the vetted curve).
@@ -32,9 +33,15 @@ handshake = ["aead", "astream-aead/handshake"]
 # secret. Implies handshake and enables astream-aead's identity (pulls Ed25519).
 identity = ["handshake", "astream-aead/identity"]
 # Off by default: encrypt-at-rest for the durable log (Broker::open_encrypted /
-# BrokerLog::open_encrypted). Seals each record's payload on disk with the AEAD
-# (reuses astream-aead via `aead`); the default broker writes plaintext frames.
-at-rest = ["aead"]
+# BrokerLog::open_encrypted, and BrokerLog::seal_plaintext, the offline seal of a
+# plaintext log). Seals each record's payload and the .state/.held sidecars on disk
+# with astream-aead's seal/open. It pulls astream-aead ALONE, never the `aead`
+# feature nor astream-aead's `stream`: no sealed-transport code compiles under at-rest,
+# neither the broker's entry points (serve_tcp_sealed, connect_tcp_sealed, seal_tcp)
+# nor astream-aead's SealedStream and its hello handshake, so an embedder that keeps its
+# bus on one machine seals its log without the wire. The default broker writes plaintext
+# frames.
+at-rest = ["dep:astream-aead"]
 # Off by default: anti-rollback for the encrypted log (Broker::open_encrypted_verified).
 # Maintains an authenticated monotonic head watermark (a `<log>.hw` sidecar) so a
 # write-capable attacker cannot silently truncate/roll back the log. Implies at-rest.

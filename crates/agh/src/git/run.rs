@@ -27,8 +27,9 @@ pub enum GitOp {
         depth: Option<u32>,
     },
     /// `git -C <dir> fetch --quiet --tags --force --recurse-submodules=no <url>
-    /// +refs/heads/*:refs/remotes/origin/*`: atpkg-publish's `fetch_repo`, by URL, never by
-    /// the remote's name. `--recurse-submodules=no` overrides the clone's own
+    /// +refs/heads/*:refs/remotes/origin/*`: atpkg-publish's `fetch_repo`, by URL. git reads
+    /// a `remote.<URL>.*` section as that URL's remote, so the runner's config screen refuses
+    /// a clone section named by a URL. `--recurse-submodules=no` overrides the clone's own
     /// `submodule.recurse` and `fetch.recurseSubmodules`, so no submodule is fetched over a
     /// URL or a transport the runner did not choose while `AGH_GIT_GRANT` is set.
     Fetch {

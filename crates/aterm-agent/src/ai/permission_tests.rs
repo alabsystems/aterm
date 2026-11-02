@@ -266,6 +266,120 @@ fn unknown_launch_grammar_and_implicit_defaults_prove_no_permission() {
     );
 }
 
+/// THE DEFAULT WORDS ON EVERY MUSE CODE LAUNCH ATERM MAKES KEEP ITS LEVEL
+/// (`crate::harness::upgrade_muse::DEFAULT_FLAGS` and its default model): a
+/// worker's line and a relaunch carry them whatever the level is, so they
+/// prove nothing and hide nothing. CONTROL: beside no level word at all,
+/// they still prove no level.
+#[test]
+fn the_default_words_keep_a_muses_level() {
+    let defaults = [
+        "--contributor-mode",
+        "off",
+        "--reasoning-effort",
+        "xhigh",
+        "--model",
+        "muse-wonder-full-1.0",
+    ];
+    let mut planned = defaults.to_vec();
+    planned.extend(["--disable-write", "--disable-shell"]);
+    assert_eq!(
+        level_of("muse", &argv(&planned), None),
+        Some(Level::Plan),
+        "{planned:?}"
+    );
+    let mut yolo = defaults.to_vec();
+    yolo.push("--yolo");
+    assert_eq!(
+        level_of("muse", &argv(&yolo), None),
+        Some(Level::Yolo),
+        "{yolo:?}"
+    );
+    assert_eq!(
+        level_of(
+            "muse",
+            &argv(&["--contributor-mode=off", "--effort=xhigh", "--yolo"]),
+            None
+        ),
+        Some(Level::Yolo),
+        "the attached spellings"
+    );
+    assert_eq!(level_of("muse", &argv(&defaults), None), None);
+}
+
+#[test]
+fn relaunched_codex_agy_and_muse_keep_their_levels() {
+    let sid = "65ef503b-62b3-44e1-9e3c-7f76b56c0008";
+    let codex_plan = crate::harness::codex_alab::rewrite_argv(
+        &argv(&["codex", "-s", "read-only", "-m", "gpt-5"]),
+        Some(sid),
+    )
+    .expect("resumable codex argv");
+    assert_eq!(level_of("codex", &codex_plan, None), Some(Level::Plan));
+    let codex_yolo =
+        crate::harness::codex_alab::rewrite_argv(&argv(&["codex", "--yolo"]), Some(sid))
+            .expect("resumable codex yolo argv");
+    assert_eq!(level_of("codex", &codex_yolo, None), Some(Level::Yolo));
+    assert_eq!(
+        level_of("codex", &argv(&["resume", sid]), None),
+        None,
+        "resume without an explicit mode proves no level"
+    );
+    assert_eq!(
+        level_of("codex", &argv(&[sid, "--yolo"]), None),
+        None,
+        "a positional UUID without resume is not a resume target"
+    );
+
+    let agy_plan = crate::harness::upgrade_agy::rewrite_argv(
+        &argv(&[
+            "agy",
+            "--mode",
+            "plan",
+            "--effort",
+            "high",
+            "--gemini_dir",
+            "/tmp/g",
+        ]),
+        Some(sid),
+    )
+    .expect("resumable agy argv");
+    assert_eq!(level_of("agy", &agy_plan, None), Some(Level::Plan));
+    let agy_yolo = crate::harness::upgrade_agy::rewrite_argv(
+        &argv(&["agy", "--dangerously-skip-permissions"]),
+        Some(sid),
+    )
+    .expect("resumable agy yolo argv");
+    assert_eq!(level_of("agy", &agy_yolo, None), Some(Level::Yolo));
+
+    let muse_plan = crate::harness::upgrade_muse::rewrite_argv(
+        &argv(&[
+            "muse",
+            "--disable-write",
+            "--disable-shell",
+            "--trust-workspace",
+        ]),
+        Some(sid),
+    )
+    .expect("resumable muse argv");
+    assert_eq!(level_of("muse", &muse_plan, None), Some(Level::Plan));
+    assert_eq!(
+        level_of(
+            "muse",
+            &argv(&[
+                "--trust-workspace",
+                "--contributor-mode",
+                "off",
+                "resume",
+                sid,
+                "--yolo"
+            ]),
+            None
+        ),
+        Some(Level::Yolo)
+    );
+}
+
 /// A CLAUDE CODE THAT ATERM RELAUNCHED KEEPS ITS LEVEL: the relaunch line adds the usage tap's
 /// `--settings`, and before this every review it asked for read the asker as unknown (seen
 /// 2026-10-26 on a `--dangerously-skip-permissions` session the live upgrade had moved: its argv
@@ -412,6 +526,26 @@ fn a_sandbox_without_approval_bypass_does_not_prove_yolo() {
         level_of(
             "codex",
             &argv(&["--dangerously-bypass-approvals-and-sandbox"]),
+            None
+        ),
+        Some(Level::Yolo)
+    );
+    for (id, words) in [
+        ("claude", vec!["--model=", "--dangerously-skip-permissions"]),
+        (
+            "claude",
+            vec!["--model", "", "--dangerously-skip-permissions"],
+        ),
+        ("codex", vec!["--cd=", "--yolo"]),
+        ("agy", vec!["--effort=", "--dangerously-skip-permissions"]),
+        ("muse", vec!["--model=", "--yolo"]),
+    ] {
+        assert_eq!(level_of(id, &argv(&words), None), None, "{id} {words:?}");
+    }
+    assert_eq!(
+        level_of(
+            "claude",
+            &argv(&["--system-prompt=", "--dangerously-skip-permissions"]),
             None
         ),
         Some(Level::Yolo)

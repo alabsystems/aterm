@@ -3,12 +3,13 @@
 
 //! A RUN'S DISK FOOTPRINT (`docs/DESIGN-adaptive-build-2026-10-24.md`, DISK-ADMIT): what one
 //! kind of run writes, measured on its own directories while it runs ([`Meter`]) and kept beside
-//! them ([`Footprints`]), each run tagged with the directories it measured ([`Footprint::dirs`]),
-//! so the next run of that kind on those directories claims what the last ones there wrote
-//! ([`Footprints::need`]). A kind never measured here claims its cold budget, less what its
-//! directories already hold, and no run claims more than that budget for writing again what its
-//! directories held at a peak: a peak further above what they hold now held more than one run
-//! writes.
+//! them ([`Footprints`]), each run tagged with the directories it measured ([`Footprint::dirs`])
+//! and with what it built there ([`Footprint::scope`]), so the next run of that scope on those
+//! directories claims what the last ones of it there wrote ([`Footprints::need`]): a `-p` run's
+//! small growth is never what a whole-tree run claims, nor a whole-tree run's what a `-p` run
+//! claims. A scope never measured here claims its kind's cold budget, less what its directories
+//! already hold, and no run claims more than that budget for writing again what its directories
+//! held at a peak: a peak further above what they hold now held more than one run writes.
 
 use std::fmt;
 use std::io::{self, Write as _};
@@ -22,8 +23,13 @@ use aterm_json::{Map, Value};
 
 use crate::admit::{Claim, gib};
 
-/// The runs [`Footprints`] keeps, newest last: a light run never hides the heavy one before it.
+/// The runs [`Footprints`] keeps of each scope ([`Footprint::scope`]), newest last: a light run
+/// never hides the heavy one before it.
 pub const KEPT: usize = 8;
+
+/// The scopes [`Footprints`] keeps runs of: those run most recently. A scope let go claims, the
+/// next time it runs, as one never measured.
+pub const SCOPES: usize = 16;
 
 /// How often a [`Meter`] measures: the pace of a wait line, so a waiter reads a holder's writes
 /// as fresh as it says them.
@@ -93,6 +99,13 @@ pub struct Footprint {
     /// move). `None` for a run kept before runs were tagged, which counts wherever it was
     /// measured.
     pub dirs: Option<u64>,
+    /// What it built there, by its tag (a stable digest of the scope's canonical spelling,
+    /// `atpkg::admit_disk::scope_tag`): its building checks and packages for verify, its `-p` set
+    /// for a trust run. [`Footprints::need`] counts only runs of the next run's scope, so a narrow
+    /// run's growth sets no wider run's claim, nor a wide run's a narrower one's. `None` for a
+    /// kind with one scope (a VM's boot), and for a run kept before runs were scoped, which
+    /// therefore counts only for such a kind.
+    pub scope: Option<u64>,
 }
 
 impl Footprint {
@@ -100,6 +113,12 @@ impl Footprint {
     #[must_use]
     pub fn measured_on(&self, dirs: u64) -> bool {
         self.dirs.is_none_or(|d| d == dirs)
+    }
+
+    /// Whether this run built the scope tagged `scope` ([`Footprint::scope`]).
+    #[must_use]
+    pub fn of_scope(&self, scope: Option<u64>) -> bool {
+        self.scope == scope
     }
 }
 
@@ -172,11 +191,15 @@ pub fn size(bytes: u64) -> String {
     }
 }
 
-/// The runs of one kind measured here, newest last, at most [`KEPT`].
+/// The runs of one kind measured here, newest last: at most [`KEPT`] of each scope, and of the
+/// [`SCOPES`] run most recently.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Footprints {
     runs: Vec<Footprint>,
 }
+
+/// The most bytes [`Footprints::load`] reads from a footprint history file.
+const FOOTPRINT_FILE_MAX: u64 = 1024 * 1024;
 
 impl Footprints {
     /// The runs measured.
@@ -185,17 +208,37 @@ impl Footprints {
         &self.runs
     }
 
-    /// Keep `run`, the oldest let go past [`KEPT`].
+    /// Keep `run`: the oldest of its scope let go past [`KEPT`], and every run of a scope let go
+    /// once [`SCOPES`] others have run since it last did.
     pub fn push(&mut self, run: Footprint) {
         self.runs.push(run);
-        let over = self.runs.len().saturating_sub(KEPT);
-        self.runs.drain(..over);
+        let mut over = self
+            .runs
+            .iter()
+            .filter(|r| r.of_scope(run.scope))
+            .count()
+            .saturating_sub(KEPT);
+        self.runs.retain(|r| {
+            let gone = over > 0 && r.of_scope(run.scope);
+            over -= usize::from(gone);
+            !gone
+        });
+        let mut recent: Vec<Option<u64>> = Vec::new();
+        for r in self.runs.iter().rev() {
+            if !recent.contains(&r.scope) {
+                recent.push(r.scope);
+            }
+        }
+        recent.truncate(SCOPES);
+        self.runs.retain(|r| recent.contains(&r.scope));
     }
 
     /// What the next run claims when its directories, tagged `dirs` ([`Footprint::dirs`]), hold
-    /// `holds` bytes: for each run kept that was measured on them ([`Footprint::measured_on`]: a
-    /// run tagged with other directories was not measured here, and one kept untagged counts as it
-    /// always did), what it grew them by, or what they held at its peak less what they hold now (a
+    /// `holds` bytes and it builds the scope tagged `scope` ([`Footprint::scope`]): for each run
+    /// kept of that scope ([`Footprint::of_scope`]: a run of another scope, narrower or wider,
+    /// wrote what that scope writes) that was measured on them ([`Footprint::measured_on`]: a
+    /// run tagged with other directories was not measured here, and one kept untagged counts as
+    /// it always did), what it grew them by, or what they held at its peak less what they hold now (a
     /// build directory reclaimed since is written again whole) but no more than `cold`, and the
     /// most of those. `cold` is what a run writes into EMPTY directories, so it is the most one
     /// writes again into directories emptied since: a peak further above what they hold now
@@ -209,10 +252,15 @@ impl Footprints {
     /// growth from emptied directories corrects a `cold` too low. Where none is kept, `cold` less
     /// what they hold already: nothing where they hold it all (a warm build directory, a VM already
     /// on disk), and that first run then measures what it really writes for the next. So where
-    /// every run kept was measured on other directories, it claims as where none is kept.
+    /// every run kept was measured on other directories, or built another scope, it claims as
+    /// where none is kept.
     #[must_use]
-    pub fn need(&self, holds: u64, cold: u64, dirs: u64) -> Estimate {
-        let here = || self.runs.iter().filter(|r| r.measured_on(dirs));
+    pub fn need(&self, holds: u64, cold: u64, dirs: u64, scope: Option<u64>) -> Estimate {
+        let here = || {
+            self.runs
+                .iter()
+                .filter(|r| r.measured_on(dirs) && r.of_scope(scope))
+        };
         let rewrite = |r: &Footprint| r.peak.saturating_sub(holds);
         let bytes = here()
             .map(|r| r.grew.max(rewrite(r).min(cold)))
@@ -227,8 +275,8 @@ impl Footprints {
         }
     }
 
-    /// The runs as the file holds them: schema 1, each run's `dirs` key only where it is tagged,
-    /// which a build that does not know the key ignores.
+    /// The runs as the file holds them: schema 1, each run's `dirs` and `scope` keys only where
+    /// it is tagged, which a build that does not know them ignores.
     #[must_use]
     pub fn encode(&self) -> String {
         let runs = self
@@ -242,6 +290,9 @@ impl Footprints {
                 if let Some(dirs) = r.dirs {
                     o.insert("dirs".to_owned(), Value::from(dirs));
                 }
+                if let Some(scope) = r.scope {
+                    o.insert("scope".to_owned(), Value::from(scope));
+                }
                 Value::Object(o)
             })
             .collect();
@@ -252,7 +303,8 @@ impl Footprints {
     }
 
     /// The runs `text` holds; none for text that is not [`Self::encode`]'s. A run without a
-    /// `dirs` key is untagged ([`Footprint::dirs`] `None`); keys it does not know are ignored.
+    /// `dirs` key is untagged ([`Footprint::dirs`] `None`), and one without a `scope` key
+    /// unscoped ([`Footprint::scope`] `None`); keys it does not know are ignored.
     #[must_use]
     pub fn decode(text: &str) -> Footprints {
         let Ok(v) = aterm_json::from_str::<Value>(text) else {
@@ -276,6 +328,7 @@ impl Footprints {
                     grew,
                     at_ms,
                     dirs: num("dirs"),
+                    scope: num("scope"),
                 });
             }
         }
@@ -285,7 +338,7 @@ impl Footprints {
     /// The runs kept in `path`; none where it is absent or unreadable.
     #[must_use]
     pub fn load(path: &Path) -> Footprints {
-        std::fs::read_to_string(path)
+        crate::read_regular_text(path, FOOTPRINT_FILE_MAX)
             .map(|t| Footprints::decode(&t))
             .unwrap_or_default()
     }
@@ -302,7 +355,21 @@ impl Footprints {
             .prefix(".footprint-")
             .tempdir_in(dir)?;
         let staged = stage.path().join("data");
-        std::fs::File::create(&staged)?.write_all(self.encode().as_bytes())?;
+        let mut open = std::fs::OpenOptions::new();
+        open.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            open.mode(0o600).custom_flags(libc::O_CLOEXEC);
+        }
+        let mut file = open.open(&staged)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        file.write_all(self.encode().as_bytes())?;
+        drop(file);
         std::fs::rename(&staged, path)
     }
 }
@@ -321,6 +388,8 @@ pub struct Meter {
     start: u64,
     /// The tag of the directories it measures ([`Footprint::dirs`]).
     dirs: Option<u64>,
+    /// The tag of what its run builds ([`Footprint::scope`]).
+    scope: Option<u64>,
     shared: Arc<Mutex<Shared>>,
     stop: Option<mpsc::Sender<()>>,
     thread: Option<JoinHandle<u64>>,
@@ -331,6 +400,7 @@ impl fmt::Debug for Meter {
         f.debug_struct("Meter")
             .field("start", &self.start)
             .field("dirs", &self.dirs)
+            .field("scope", &self.scope)
             .finish()
     }
 }
@@ -338,16 +408,23 @@ impl fmt::Debug for Meter {
 impl Meter {
     /// Measure `dirs` ([`allocated`]) every [`EVERY`] from `start`, the bytes they held when the
     /// run began, holding `claim` for the run; `tag` names them in the run's [`Footprint`]
-    /// ([`Footprint::dirs`]).
+    /// ([`Footprint::dirs`]), and `scope` what it builds there ([`Footprint::scope`]).
     #[must_use]
-    pub fn start(dirs: Vec<PathBuf>, tag: u64, start: u64, claim: Option<Claim>) -> Meter {
+    pub fn start(
+        dirs: Vec<PathBuf>,
+        tag: u64,
+        scope: Option<u64>,
+        start: u64,
+        claim: Option<Claim>,
+    ) -> Meter {
         let mut meter = Meter::start_with(start, Box::new(move || allocated(&dirs)), claim, EVERY);
         meter.dirs = Some(tag);
+        meter.scope = scope;
         meter
     }
 
-    /// [`Self::start`] with its measure and its pace given, and no tag: its run is kept
-    /// untagged.
+    /// [`Self::start`] with its measure and its pace given, and no tags: its run is kept
+    /// untagged and unscoped.
     #[must_use]
     pub fn start_with(
         start: u64,
@@ -383,6 +460,7 @@ impl Meter {
         Meter {
             start,
             dirs: None,
+            scope: None,
             shared,
             stop: Some(stop),
             thread,
@@ -396,7 +474,7 @@ impl Meter {
     }
 
     /// End the run: measure once more, let its claim go, and return what it took, tagged with
-    /// the directories it measured.
+    /// the directories it measured and what it built there.
     #[must_use]
     pub fn finish(mut self) -> Footprint {
         let peak = self.halt();
@@ -405,6 +483,7 @@ impl Meter {
             grew: peak.saturating_sub(self.start),
             at_ms: aterm_time::unix_millis().unwrap_or(0),
             dirs: self.dirs,
+            scope: self.scope,
         }
     }
 

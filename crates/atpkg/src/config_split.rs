@@ -1,0 +1,249 @@
+// Copyright 2026 Andrew Yates
+// SPDX-License-Identifier: Apache-2.0
+
+//! Which `aterm.toml` a shell's aterm and the app read, when they are not the same file.
+//!
+//! On macOS an app opened from Finder, the Dock or `open` runs in launchd's environment, which
+//! has no `XDG_CONFIG_HOME` unless someone ran `launchctl setenv`. A shell that exports one makes
+//! every aterm it starts (the CLI, `aterm pkg`, `aterm update`, a terminal session, a window
+//! opened as `aterm --window`) read `$XDG_CONFIG_HOME/aterm/aterm.toml`, while the app reads
+//! `~/.config/aterm/aterm.toml`, and Settings writes that one (round 13 of the install audits:
+//! `[update] enabled = false` set in Settings left the shell's `aterm update status` saying
+//! nothing of it, and the reverse). Nothing here moves or rewrites either file. The split is
+//! said where a person looks (`aterm explain-config`, `aterm doctor`), with the one step that
+//! makes the two one folder while one side does not exist yet: a symlink, undone by removing
+//! it, which the person runs.
+
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
+
+/// The two aterm config folders, when they differ.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Split {
+    /// The folder this process reads (`$XDG_CONFIG_HOME/aterm`).
+    pub here: PathBuf,
+    /// The folder the app launchd starts reads.
+    pub app: PathBuf,
+    /// launchd's `XDG_CONFIG_HOME`, when it has one.
+    pub app_xdg: Option<PathBuf>,
+    /// The keys whose values differ between the two `aterm.toml` files, dotted
+    /// (`update.enabled`), when both exist and parse.
+    pub differs: Vec<String>,
+    /// Whether both `aterm.toml` files exist and parse, so [`Split::differs`] compared them.
+    pub compared: bool,
+    /// The symlink that makes the two one folder, as `(link, target)`: offered only while
+    /// `link` does not exist, so it replaces nothing.
+    pub unify: Option<(PathBuf, PathBuf)>,
+}
+
+/// The aterm config folder under `xdg` (`XDG_CONFIG_HOME`) and `home`, as
+/// [`aterm_types::dirs::resolve_aterm_config_dir`] picks it.
+fn folder(xdg: Option<&OsStr>, home: &Path) -> Option<PathBuf> {
+    aterm_types::dirs::resolve_aterm_config_dir(xdg, None, Some(home.as_os_str()))
+}
+
+/// Whether `a` and `b` are one folder: the same path, or the same folder once links resolve.
+fn same_folder(a: &Path, b: &Path) -> bool {
+    a == b
+        || std::fs::canonicalize(a)
+            .ok()
+            .zip(std::fs::canonicalize(b).ok())
+            .is_some_and(|(a, b)| a == b)
+}
+
+/// The split between this process's `XDG_CONFIG_HOME` (`here_xdg`) and launchd's (`app_xdg`)
+/// under `home`, or `None` when both read one folder.
+#[must_use]
+pub fn split(here_xdg: Option<&OsStr>, app_xdg: Option<&OsStr>, home: &Path) -> Option<Split> {
+    let here = folder(here_xdg, home)?;
+    let app = folder(app_xdg, home)?;
+    if same_folder(&here, &app) {
+        return None;
+    }
+    let exists = |dir: &Path| std::fs::symlink_metadata(dir).is_ok();
+    let unify = match (exists(&here), exists(&app)) {
+        (true, true) => None,
+        (_, false) => Some((app.clone(), here.clone())),
+        (false, true) => Some((here.clone(), app.clone())),
+    };
+    let differs = differing_keys(&here.join("aterm.toml"), &app.join("aterm.toml"));
+    Some(Split {
+        here,
+        app,
+        app_xdg: app_xdg.filter(|xdg| !xdg.is_empty()).map(PathBuf::from),
+        compared: differs.is_some(),
+        differs: differs.unwrap_or_default(),
+        unify,
+    })
+}
+
+/// The dotted keys whose values differ between two `aterm.toml` files; `None` unless both
+/// exist and parse.
+fn differing_keys(a: &Path, b: &Path) -> Option<Vec<String>> {
+    let read = |path: &Path| -> Option<aterm_toml::Table> {
+        let text = crate::metadata_io::read_bounded_regular_utf8_follow_final_links(
+            path,
+            crate::config::MAX_PACKAGES_CONFIG_BYTES,
+        )
+        .ok()?;
+        aterm_toml::from_str(&text).ok()
+    };
+    let (a, b) = (read(a)?, read(b)?);
+    let mut keys = Vec::new();
+    diff_tables("", &a, &b, &mut keys);
+    keys.sort();
+    Some(keys)
+}
+
+fn diff_tables(prefix: &str, a: &aterm_toml::Table, b: &aterm_toml::Table, out: &mut Vec<String>) {
+    let mut names: Vec<&String> = a.keys().chain(b.keys()).collect();
+    names.sort();
+    names.dedup();
+    for name in names {
+        let key = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}.{name}")
+        };
+        match (a.get(name), b.get(name)) {
+            (Some(aterm_toml::Value::Table(a)), Some(aterm_toml::Value::Table(b))) => {
+                diff_tables(&key, a, b, out);
+            }
+            (a, b) if a != b => out.push(key),
+            _ => {}
+        }
+    }
+}
+
+/// How long `launchctl getenv` gets to answer.
+#[cfg(target_os = "macos")]
+const LAUNCHCTL_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// launchd's `XDG_CONFIG_HOME` for this account, the one an app opened from Finder inherits;
+/// `None` when it has none or `launchctl` did not answer.
+#[cfg(target_os = "macos")]
+fn launchd_xdg_config_home() -> Option<std::ffi::OsString> {
+    use std::os::unix::ffi::OsStringExt as _;
+    let mut cmd = aterm_uds::spawnfd::command("/bin/launchctl");
+    cmd.args(["getenv", "XDG_CONFIG_HOME"]);
+    let out = aterm_uds::deadline::output_within(&mut cmd, LAUNCHCTL_BUDGET).ok()?;
+    let mut value = out.stdout;
+    while value.last().is_some_and(|b| *b == b'\n') {
+        value.pop();
+    }
+    (out.status.success() && !value.is_empty()).then(|| std::ffi::OsString::from_vec(value))
+}
+
+/// The split for this process on macOS: its `XDG_CONFIG_HOME` against launchd's. Elsewhere,
+/// and in a test binary ([`aterm_types::dirs::test_root`]), `None`: a desktop session there
+/// starts apps with the session's environment, and a test never asks the host's launchd.
+#[must_use]
+pub fn of_process() -> Option<Split> {
+    #[cfg(target_os = "macos")]
+    {
+        if aterm_types::dirs::test_root().is_some() {
+            return None;
+        }
+        let home = aterm_types::dirs::home_dir()?;
+        let here = std::env::var_os("XDG_CONFIG_HOME");
+        split(here.as_deref(), launchd_xdg_config_home().as_deref(), &home)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+impl Split {
+    /// `path` as a person reads it under `home`: `~/…`, else whole.
+    fn shown(path: &Path, home: &Path) -> String {
+        path.strip_prefix(home).map_or_else(
+            |_| path.display().to_string(),
+            |rest| format!("~/{}", rest.display()),
+        )
+    }
+
+    /// The paragraph a person reads: where each reads, what differs, and the step that makes
+    /// them one (or that only a merge by hand does).
+    #[must_use]
+    pub fn said(&self, home: &Path) -> String {
+        let here = Self::shown(&self.here.join("aterm.toml"), home);
+        let app = Self::shown(&self.app.join("aterm.toml"), home);
+        let why = match &self.app_xdg {
+            Some(xdg) => format!(
+                "launchd gives apps XDG_CONFIG_HOME={}",
+                Self::shown(xdg, home)
+            ),
+            None => "launchd gives apps no XDG_CONFIG_HOME".to_owned(),
+        };
+        let mut said = format!(
+            "this aterm reads {here}, but the app opened from Finder, the Dock or `open` reads \
+             {app} ({why}), and Settings writes that one: a setting in either file is not seen \
+             by the aterm that reads the other"
+        );
+        if self.compared && self.differs.is_empty() {
+            said.push_str("; the two say the same today");
+        } else if !self.differs.is_empty() {
+            let shown: Vec<&str> = self.differs.iter().take(8).map(String::as_str).collect();
+            let more = self.differs.len().saturating_sub(shown.len());
+            said.push_str(&format!(
+                "; they differ in {}{}",
+                shown.join(", "),
+                if more > 0 {
+                    format!(" and {more} more")
+                } else {
+                    String::new()
+                }
+            ));
+        }
+        match (&self.unify, self.unify_command()) {
+            (Some((link, _)), Some(command)) => said.push_str(&format!(
+                ". To make them one folder: {command} (undo: rm {})",
+                shell_word(link),
+            )),
+            _ => said.push_str(&format!(
+                ". Both exist, so nothing links them: merge what you keep into one file, then \
+                 link the other's folder to it ({} and {})",
+                Self::shown(&self.here, home),
+                Self::shown(&self.app, home)
+            )),
+        }
+        said
+    }
+
+    /// The command that makes the two one folder: the target and the link's parent made when
+    /// they are missing, then the link.
+    #[must_use]
+    pub fn unify_command(&self) -> Option<String> {
+        let (link, target) = self.unify.as_ref()?;
+        let parent = link.parent()?;
+        let mut steps = Vec::new();
+        if !target.is_dir() {
+            steps.push(format!("mkdir -p {}", shell_word(target)));
+        }
+        if !parent.is_dir() {
+            steps.push(format!("mkdir -p {}", shell_word(parent)));
+        }
+        steps.push(format!("ln -s {} {}", shell_word(target), shell_word(link)));
+        Some(steps.join(" && "))
+    }
+}
+
+/// `path` as one shell word: bare when it holds only characters no shell treats specially,
+/// else single-quoted.
+fn shell_word(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._-+,@%".contains(c))
+    {
+        text.into_owned()
+    } else {
+        crate::platform::sh_quote_str(&text)
+    }
+}
+
+#[cfg(test)]
+#[path = "config_split_tests.rs"]
+mod tests;

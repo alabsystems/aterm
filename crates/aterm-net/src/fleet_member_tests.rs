@@ -4,7 +4,7 @@
 //! Tests for fleet membership join codes, peer book persistence, and loopback join/reach flows.
 
 use super::*;
-use crate::fleet::{FleetEvent, Listening, read_key_file, serve_with_handshake};
+use crate::fleet::{FleetEvent, Listening, read_key_file, serve, serve_with_handshake};
 use std::net::{Ipv4Addr, TcpListener};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
@@ -12,6 +12,73 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 const HANG: Duration = Duration::from_secs(60);
+
+#[test]
+fn signed_primary_names_keep_temporary_aliases_and_reject_tampering() {
+    let node = "0123456789abcdef0123456789abcdef";
+    let me = NodeIdentity::from_seed(node, &[7; 32]).unwrap();
+    let peer =
+        Peer::own(&me, ("192.168.1.2", 7100, "0.148.0"), 10).with_primary_name(&me, Some("m62"));
+    let parsed = Peer::parse(&peer.line()).unwrap();
+    assert_eq!(parsed.primary_name(), Some("m62"));
+    assert!(parsed.answers_to(&temporary_name(node)));
+    assert!(is_node_word(&temporary_name(node)));
+    assert!(parsed.answers_to("m62"));
+    let tampered = Peer::parse(&peer.line().replace("name=m62", "name=m63")).unwrap();
+    assert!(!tampered.signature_holds());
+    assert_eq!(tampered.primary_name(), None);
+    let legacy = peer.line().split(" name=").next().unwrap().to_owned();
+    assert!(Peer::parse(&legacy).unwrap().signature_holds());
+    let renamed =
+        Peer::own(&me, ("192.168.1.2", 7100, "0.148.0"), 11).with_primary_name(&me, Some("studio"));
+    assert!(renamed.answers_to(&temporary_name(node)));
+    assert!(renamed.answers_to("studio"));
+    assert!(!renamed.answers_to("m62"));
+}
+
+#[test]
+fn conflicting_primary_names_refuse_ambiguous_resolution() {
+    let a = NodeIdentity::from_seed("0123456789abcdef0123456789abcdef", &[7; 32]).unwrap();
+    let b = NodeIdentity::from_seed("abcdef0123456789abcdef0123456789", &[8; 32]).unwrap();
+    let peers = [
+        Peer::own(&a, ("192.168.1.2", 7100, "0.148.0"), 10).with_primary_name(&a, Some("studio")),
+        Peer::own(&b, ("192.168.1.3", 7100, "0.148.0"), 10).with_primary_name(&b, Some("studio")),
+    ];
+    assert!(find(&peers, "studio").is_err());
+    assert_eq!(find(&peers, &temporary_name(a.node())).unwrap(), Some(0));
+    let shadow = Peer::own(&b, (&temporary_name(a.node()), 7100, "0.148.0"), 11);
+    assert_eq!(
+        find(&[peers[0].clone(), shadow], &temporary_name(a.node())).unwrap(),
+        Some(0)
+    );
+}
+
+#[test]
+fn a_full_book_with_maximum_signed_names_round_trips() {
+    let state = State::new("maximum-signed-names");
+    let host = "a".repeat(253);
+    let version = "+".repeat(64);
+    let name = "n".repeat(63);
+    let peers: Vec<_> = (0..PEERS_MAX)
+        .map(|index| {
+            let node = format!("{index:032x}");
+            let me = NodeIdentity::from_seed(&node, &[7; 32]).unwrap();
+            let mut peer = Peer::own(&me, (&host, u16::MAX, &version), u64::MAX)
+                .with_primary_name(&me, Some(&name));
+            peer.addr = Some("fe80:ffff:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap());
+            peer.seen_ms = Some(u64::MAX);
+            peer
+        })
+        .collect();
+    let encoded = book_text(&peers);
+    assert!(encoded.len() <= PEERS_FILE_MAX);
+    write_private(state.dir(), PEERS_FILE, encoded.as_bytes()).unwrap();
+    assert_eq!(read_peers(state.dir()).unwrap(), peers);
+    let server = Issuing::start(secret(5), state.dir(), issuer(0x11));
+    let target = target_of(&issuer_entry(0x11, server.port));
+    let book = fetch_book(&target, (&secret(5), None), (Instant::now() + HANG, HANG)).unwrap();
+    assert_eq!(book.peers, peers);
+}
 
 fn waiting<R>(
     wait: Duration,
@@ -306,6 +373,86 @@ fn the_key_and_the_node_id_are_written_as_their_readers_read_them() {
     assert!(
         node_id(state.dir()).is_err(),
         "a broken node file is refused, not re-minted"
+    );
+}
+
+/// A thread at a background class holds the book's lock at the default class and is put back as
+/// it lets the lock go; one at a higher class keeps its own, and a hold let go on another thread
+/// leaves that thread's class as it is: a holder a loaded Mac starves of a core keeps a person's
+/// verb waiting past its wait.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_holder_at_a_background_class_holds_the_books_lock_at_the_default_class() {
+    use libc::qos_class_t::{
+        QOS_CLASS_BACKGROUND, QOS_CLASS_DEFAULT, QOS_CLASS_USER_INTERACTIVE, QOS_CLASS_UTILITY,
+    };
+    let ask = |asked: libc::qos_class_t| {
+        // SAFETY: sets this thread's own class; takes no pointers and mutates no shared state.
+        let rc = unsafe { libc::pthread_set_qos_class_self_np(asked, 0) };
+        assert_eq!(rc, 0, "{asked:?}");
+    };
+    let class = || aterm_uds::qos::requested_class_of_self().map(|(class, _)| class);
+    let at = |class: libc::qos_class_t| Some(class as libc::c_uint);
+    let state = State::new("lift");
+    let (seen, other) = std::thread::scope(|scope| {
+        let seen = scope
+            .spawn(|| {
+                [
+                    QOS_CLASS_UTILITY,
+                    QOS_CLASS_BACKGROUND,
+                    QOS_CLASS_USER_INTERACTIVE,
+                ]
+                .map(|asked| {
+                    ask(asked);
+                    let before = class();
+                    let held = {
+                        let _book = hold_book(state.dir()).unwrap();
+                        class()
+                    };
+                    (before, held, class())
+                })
+            })
+            .join()
+            .unwrap();
+        let book = scope
+            .spawn(|| {
+                ask(QOS_CLASS_UTILITY);
+                hold_book(state.dir()).unwrap()
+            })
+            .join()
+            .unwrap();
+        let other = scope.spawn(move || {
+            ask(QOS_CLASS_USER_INTERACTIVE);
+            drop(book);
+            class()
+        });
+        (seen, other.join().unwrap())
+    });
+    assert_eq!(
+        seen,
+        [
+            (
+                at(QOS_CLASS_UTILITY),
+                at(QOS_CLASS_DEFAULT),
+                at(QOS_CLASS_UTILITY)
+            ),
+            (
+                at(QOS_CLASS_BACKGROUND),
+                at(QOS_CLASS_DEFAULT),
+                at(QOS_CLASS_BACKGROUND)
+            ),
+            (
+                at(QOS_CLASS_USER_INTERACTIVE),
+                at(QOS_CLASS_USER_INTERACTIVE),
+                at(QOS_CLASS_USER_INTERACTIVE)
+            ),
+        ],
+        "(asked, while holding, after): a background holder runs at the default class"
+    );
+    assert_eq!(
+        other,
+        at(QOS_CLASS_USER_INTERACTIVE),
+        "a hold let go on another thread leaves that thread's class"
     );
 }
 
@@ -3783,6 +3930,53 @@ fn an_answer_proven_by_a_key_the_book_no_longer_binds_is_not_that_node() {
     );
 }
 
+/// A dial that reads another dial's exchange at an address follows how that one ended, while its
+/// own deadline is still to come: passed over at a stalled handshake, it passes on without another
+/// try at that address; ended by that dial's own deadline, it makes its own.
+#[test]
+fn a_dial_reading_a_stalled_address_passes_on_without_dialing_it_again() {
+    for (passed, dials) in [(true, 0), (false, 1)] {
+        let to = SocketAddr::from((Ipv4Addr::LOCALHOST, 7));
+        let (held, dialed) = (HeldAddrs::default(), AtomicUsize::new(0));
+        let why = Unreached::Deadline(Stage::Handshake, Duration::from_secs(3));
+        let opened = held.enter(to).ok().expect("the first dial's own exchange");
+        let exchange = Arc::clone(&opened.exchange);
+        std::thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                held.ask(
+                    to,
+                    (Instant::now() + HANG, HANG),
+                    || {
+                        dialed.fetch_add(1, Ordering::SeqCst);
+                        AtAddr::Passed(Unreached::Deadline(Stage::Connect, Duration::from_secs(1)))
+                    },
+                    |_| Ok(None),
+                    |_| Ok(Vec::new()),
+                )
+            });
+            // The reader holds the exchange: the list's, `opened`'s, this one's and its own.
+            aterm_spec::wait::until_within(
+                HANG,
+                "the second dial reads the first's exchange",
+                || (Arc::strong_count(&exchange) >= 4).then_some(()),
+            );
+            let first = |_: &mut TlsTransport<ClientConnection>| Ok(Vec::new());
+            let reached = if passed {
+                AtAddr::Passed(why)
+            } else {
+                AtAddr::Ended(why)
+            };
+            let _ = opened.ask(to, reached, |_| Ok(None), first);
+            let read = reader.join().expect("the reader");
+            assert!(
+                matches!(read, AtAddr::Passed(_)),
+                "passed {passed}: its address is passed over"
+            );
+        });
+        assert_eq!(dialed.load(Ordering::SeqCst), dials, "passed {passed}");
+    }
+}
+
 #[test]
 fn a_read_holds_one_connection_to_an_address_at_a_time() {
     let (in_flight, most) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
@@ -5730,6 +5924,14 @@ fn node_listener(
     serves: &'static [FleetOp],
 ) -> (u16, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    node_listener_on(listener, me, serves)
+}
+
+fn node_listener_on(
+    listener: TcpListener,
+    me: NodeIdentity,
+    serves: &'static [FleetOp],
+) -> (u16, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
     let port = listener.local_addr().unwrap().port();
     let running = Arc::new(AtomicBool::new(true));
     let listening = Listening {
@@ -5767,6 +5969,60 @@ fn node_listener(
         }
     });
     (port, running, serving)
+}
+
+#[test]
+fn a_silent_recorded_address_gives_way_to_a_name_without_losing_the_bound_key() {
+    let host = identity(&node_of(0xd7), 4);
+    let me = identity(&node_of(0x3a), 8);
+    for genuine in [true, false] {
+        let (v6, v4, port) = twin_listeners();
+        let silent = HeldSilent::at(v4.local_addr().unwrap());
+        let named = if genuine {
+            host.clone()
+        } else {
+            identity(host.node(), 5)
+        };
+        let (_, running, serving) = node_listener_on(v6, named, &[FleetOp::Drive]);
+        let target = Target {
+            host: "::1".to_owned(),
+            addr: Some(Ipv4Addr::LOCALHOST.into()),
+            port,
+            node: Some(host.node().to_owned()),
+            key: Some(host.key()),
+        };
+        let observed = match drive(
+            &target,
+            &Keyring::default(),
+            (&secret(6), &me),
+            (Instant::now() + HANG, HANG),
+        ) {
+            Ok(mut driven) => {
+                driven.write_all(b"s-1 status\n").unwrap();
+                let mut answer = String::new();
+                io::BufRead::read_line(&mut io::BufReader::new(&mut driven), &mut answer).unwrap();
+                Ok((driven.node.clone(), driven.addr, answer))
+            }
+            Err(why) => Err(why),
+        };
+        running.store(false, Ordering::Release);
+        serving.join().unwrap();
+        assert!(
+            silent.overrode().is_some(),
+            "the recorded address was tried"
+        );
+        if genuine {
+            let (node, address, answer) = observed.expect("the name still reaches the bound node");
+            assert_eq!(node, host.node());
+            assert!(address.is_ipv6());
+            assert_eq!(answer, "OK drive s-1 status\n");
+        } else {
+            assert!(
+                matches!(observed, Err(Unreached::Impostor { node, .. }) if node == host.node()),
+                "an alternate address must still prove the bound key"
+            );
+        }
+    }
 }
 
 #[test]
@@ -6129,8 +6385,9 @@ fn resolver_work_keeps_its_process_budget_until_it_retires() {
 /// Resolving `_alab._tcp` advert hints stays within `within` and looks places up concurrently: a
 /// hanging lookup on the first advert neither holds up the round past `within` nor starves a
 /// responsive advert after it, and the loopback guard skips off-loopback lookups and addresses.
-/// NEGATIVE CONTROL: resolve sequentially with no timeout (`to_socket_addrs` in a loop): the first
-/// advert blocks for the full hang duration and starves the second when the budget expires.
+/// NEGATIVE CONTROL: wait on each lookup with no deadline (`rx.recv()` for
+/// `rx.recv_timeout(left)`): the round returns only when the hanging lookup gives up at the hang
+/// detector, so the check that it was still held fails.
 #[test]
 fn resolving_advert_hints_stays_within_its_budget_and_keeps_places_after_a_hanging_lookup() {
     static RELEASE_HANG: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>> =
@@ -6142,13 +6399,17 @@ fn resolving_advert_hints_stays_within_its_budget_and_keeps_places_after_a_hangi
         Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
     > = std::sync::Mutex::new(None);
     *RECV_HANG.lock().unwrap() = Some((ready_tx, rx));
+    // Set once the hanging lookup is let go: still clear when resolution returns, the round ended
+    // on its budget, not on that lookup.
+    static HANG_ENDED: AtomicBool = AtomicBool::new(false);
 
     let resolver: Resolver = |name, port| match name {
         "hanging.local" => {
             let pair = RECV_HANG.lock().unwrap().take();
             if let Some((ready, rx)) = pair {
                 let _ = ready.send(());
-                let _ = rx.recv_timeout(Duration::from_secs(5));
+                let _ = rx.recv_timeout(HANG);
+                HANG_ENDED.store(true, Ordering::Release);
             }
             vec![SocketAddr::from(([10, 0, 0, 99], port))]
         }
@@ -6160,17 +6421,20 @@ fn resolving_advert_hints_stays_within_its_budget_and_keeps_places_after_a_hangi
         ("m22.local".to_owned(), 7101),
         ("10.0.0.8".to_owned(), 7102),
     ];
-    let started = Instant::now();
     let resolved = crate::loopback::forced(false, || {
         resolve_ipv4_hints_with(&places, Duration::from_millis(120), resolver)
     });
-    let elapsed = started.elapsed();
+    let lookup_still_held = !HANG_ENDED.load(Ordering::Acquire);
     ready_rx
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(HANG)
         .expect("hanging resolver started");
     if let Some(tx) = RELEASE_HANG.lock().unwrap().take() {
         let _ = tx.send(());
     }
+    assert!(
+        lookup_still_held,
+        "hint resolution returned only once the hanging lookup was let go, not on its budget"
+    );
     assert_eq!(
         resolved,
         vec![
@@ -6178,10 +6442,6 @@ fn resolving_advert_hints_stays_within_its_budget_and_keeps_places_after_a_hangi
             SocketAddr::from(([10, 0, 0, 8], 7102)),
         ],
         "responsive advert after a hanging one still resolves within the budget"
-    );
-    assert!(
-        elapsed < Duration::from_secs(2),
-        "hint resolution must stay bounded by its budget, took {elapsed:?}"
     );
 
     let guarded = crate::loopback::forced(true, || {
@@ -6590,8 +6850,8 @@ fn c19_denied_node_and_unproved_peer_refused_with_valid_fleet_secret() {
                 &tcp_listener,
                 (
                     &listening,
-                    &|| (FleetScope::Content, EVERY_OP),
-                    &move || Arc::clone(&deny),
+                    Arc::new(|| (FleetScope::Content, EVERY_OP)),
+                    Arc::new(move || Arc::clone(&deny)),
                 ),
                 None,
                 &running,
@@ -7538,6 +7798,212 @@ fn unreached_at_capacity_classifies_slot_drops_and_busy_without_retrying_refused
     }
 }
 
+/// A heartbeat round keeps no copy of the issuer's book over one another read kept while the round
+/// was out: that read can be newer than the book the round fetched. The next round reads the
+/// issuer again and keeps its book.
+#[test]
+fn a_heartbeat_round_leaves_a_copy_another_read_kept_meanwhile() {
+    let secret_bytes = [0x59; SECRET_LEN];
+    let secret = FleetSecret::new(&secret_bytes).unwrap();
+    let (a_state, b_state) = (State::new("hb-kept-a"), State::new("hb-kept-b"));
+    for state in [&a_state, &b_state] {
+        write_key(state.dir(), &secret_bytes).unwrap();
+    }
+    let a = identity(&node_of(0x41), 0x41);
+    let b = identity(&node_of(0x42), 0x42);
+    let served = identity(&node_of(0x43), 0x43);
+    let kept = identity(&node_of(0x44), 0x44);
+    let log: MemberKeys = [&a, &b, &served, &kept]
+        .into_iter()
+        .map(|id| (id.key(), Standing::Member))
+        .collect();
+    write_book(
+        a_state.dir(),
+        &[Peer::own(
+            &served,
+            ("127.0.0.1", 7411, "0.147.0"),
+            1_760_000_000_001,
+        )],
+    );
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let a_port = listener.local_addr().unwrap().port();
+    let named = Issuer {
+        node: a.node().to_owned(),
+        host: "127.0.0.1".to_owned(),
+        port: a_port,
+        version: "0.147.0".to_owned(),
+    };
+    let _a_at = Issuing::gated(
+        listener,
+        (secret.clone(), Some(a.clone())),
+        a_state.dir(),
+        named,
+        None,
+    );
+    write_book(
+        b_state.dir(),
+        &[Peer {
+            node: Some(a.node().to_owned()),
+            host: "127.0.0.1".to_owned(),
+            via: Via::Issuer,
+            seen_ms: Some(1_760_000_000_000),
+            ..keyed(0, a.key(), [127, 0, 0, 1], a_port)
+        }],
+    );
+    let reg = Registration {
+        node: b.node().to_owned(),
+        host: "127.0.0.1".to_owned(),
+        port: 7412,
+        version: "0.147.0".to_owned(),
+        key: None,
+        signed: None,
+    };
+    let kept_copy = Peer {
+        via: Via::IssuerBook,
+        ..Peer::own(&kept, ("127.0.0.1", 7413, "0.147.0"), 1_760_000_000_002)
+    };
+    let names = |copies: &[Peer]| {
+        copies
+            .iter()
+            .filter_map(|peer| peer.node.clone())
+            .collect::<Vec<_>>()
+    };
+    // The adverts are read after the issuer answered: a `peers` read keeps its copy then.
+    let answered = heartbeat_members_with_denied(
+        b_state.dir(),
+        (&secret, &b),
+        &reg,
+        HANG,
+        (Some(&log), &[], &|| {
+            keep_copy(b_state.dir(), a.node(), std::slice::from_ref(&kept_copy)).unwrap();
+            Vec::new()
+        }),
+    )
+    .expect("heartbeat succeeds");
+    assert_eq!(
+        answered
+            .iter()
+            .map(|done| done.node.as_str())
+            .collect::<Vec<_>>(),
+        [a.node()]
+    );
+    assert_eq!(
+        names(&read_issuer_book(b_state.dir(), a.node())),
+        [kept.node()],
+        "the copy kept while the round was out stays"
+    );
+    heartbeat_members_with_denied(
+        b_state.dir(),
+        (&secret, &b),
+        &reg,
+        HANG,
+        (Some(&log), &[], &Vec::new),
+    )
+    .expect("heartbeat succeeds");
+    assert_eq!(
+        names(&read_issuer_book(b_state.dir(), a.node())),
+        [served.node()],
+        "a round no other read overlapped keeps the issuer's book"
+    );
+}
+
+/// A member this Mac's book dropped while a heartbeat round was out (`aterm fleet peers rm`) is not
+/// merged back from the book that round fetched; a round that began after the removal merges what
+/// the issuer still lists.
+#[test]
+fn a_heartbeat_round_merges_back_no_member_dropped_meanwhile() {
+    let secret_bytes = [0x5a; SECRET_LEN];
+    let secret = FleetSecret::new(&secret_bytes).unwrap();
+    let (a_state, b_state) = (State::new("hb-drop-a"), State::new("hb-drop-b"));
+    for state in [&a_state, &b_state] {
+        write_key(state.dir(), &secret_bytes).unwrap();
+    }
+    let a = identity(&node_of(0x51), 0x51);
+    let b = identity(&node_of(0x52), 0x52);
+    let listed = identity(&node_of(0x53), 0x53);
+    let log: MemberKeys = [&a, &b, &listed]
+        .into_iter()
+        .map(|id| (id.key(), Standing::Member))
+        .collect();
+    write_book(
+        a_state.dir(),
+        &[Peer::own(
+            &listed,
+            ("127.0.0.1", 7421, "0.147.0"),
+            1_760_000_000_001,
+        )],
+    );
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let a_port = listener.local_addr().unwrap().port();
+    let named = Issuer {
+        node: a.node().to_owned(),
+        host: "127.0.0.1".to_owned(),
+        port: a_port,
+        version: "0.147.0".to_owned(),
+    };
+    let _a_at = Issuing::gated(
+        listener,
+        (secret.clone(), Some(a.clone())),
+        a_state.dir(),
+        named,
+        None,
+    );
+    write_book(
+        b_state.dir(),
+        &[Peer {
+            node: Some(a.node().to_owned()),
+            host: "127.0.0.1".to_owned(),
+            via: Via::Issuer,
+            seen_ms: Some(1_760_000_000_000),
+            ..keyed(0, a.key(), [127, 0, 0, 1], a_port)
+        }],
+    );
+    let reg = Registration {
+        node: b.node().to_owned(),
+        host: "127.0.0.1".to_owned(),
+        port: 7422,
+        version: "0.147.0".to_owned(),
+        key: None,
+        signed: None,
+    };
+    let holds_listed = || {
+        read_peers(b_state.dir())
+            .unwrap()
+            .iter()
+            .any(|peer| peer.node.as_deref() == Some(listed.node()))
+    };
+    let round = |hints: &dyn Fn() -> Vec<SocketAddr>| {
+        heartbeat_members_with_denied(
+            b_state.dir(),
+            (&secret, &b),
+            &reg,
+            HANG,
+            (Some(&log), &[], hints),
+        )
+        .expect("heartbeat succeeds")
+    };
+    round(&Vec::new);
+    assert!(holds_listed(), "a round merges what the issuer lists");
+    // The adverts are read after the issuer answered: a `peers rm` lands then.
+    round(&|| {
+        update_peers(b_state.dir(), |book| {
+            book.retain(|peer| peer.node.as_deref() != Some(listed.node()));
+            Ok(())
+        })
+        .unwrap();
+        Vec::new()
+    });
+    assert!(
+        !holds_listed(),
+        "a member dropped while the round was out stays dropped"
+    );
+    round(&Vec::new);
+    assert!(
+        holds_listed(),
+        "a round that began after the removal merges what the issuer still lists"
+    );
+}
+
 /// A Mac's heartbeat (`heartbeat_members_with_denied`) and book share (`serve_book_with_log`)
 /// keep out both the vault's deny-listed nodes and the node keys the membership log holds out:
 /// a denied or removed Mac is not dialled on heartbeat, is pruned from the local book, is not
@@ -7703,5 +8169,1508 @@ fn heartbeat_and_book_sharing_omit_denied_and_log_held_out_members() {
             .iter()
             .any(|p| p.node.as_deref() == Some(removed_peer.node())),
         "removed_peer omitted from B's copy of A's book: {b_copies:?}"
+    );
+
+    // 3. `store_pushed_facts` / `read_pushed_facts` enforce owner-private files and reject symlinks
+    // and world-readable files; `serve_facts` rejects an unterminated final line; and peer RPCs
+    // clamp `Duration::MAX` deadlines while rejecting unterminated `OK` lines.
+    store_pushed_facts(b_state.dir(), good_peer.node(), "OK 1\nv=1\n").unwrap();
+    assert_eq!(
+        read_pushed_facts(b_state.dir()),
+        vec![(good_peer.node().to_owned(), "OK 1\nv=1\n".to_owned())]
+    );
+    let facts_dir = b_state.dir().join(SWARM_FACTS_DIR);
+    let open_path = facts_dir.join(format!("{}.txt", a.node()));
+    std::fs::write(&open_path, "OK 1\nv=1\n").unwrap();
+    mode(&open_path, 0o644);
+    let outside = b_state.dir().join("outside-facts.txt");
+    std::fs::write(&outside, "OK 1\nv=1\n").unwrap();
+    mode(&outside, 0o600);
+    std::os::unix::fs::symlink(&outside, facts_dir.join(format!("{}.txt", b.node()))).unwrap();
+    assert_eq!(
+        read_pushed_facts(b_state.dir()),
+        vec![(good_peer.node().to_owned(), "OK 1\nv=1\n".to_owned())],
+        "open-mode and symlinked swarm-facts entries must be ignored"
+    );
+
+    let proof = NodeProof {
+        node: good_peer.node().to_owned(),
+        key: good_peer.key(),
+    };
+    let mut unterminated_wire = io::Cursor::new(b"OK 1\nv=1 without newline".to_vec());
+    let served_unterminated =
+        serve_facts(&mut unterminated_wire, Some(&proof), b_state.dir(), |_| {
+            Ok(Some(good_peer.node().to_owned()))
+        })
+        .unwrap();
+    assert!(
+        served_unterminated.is_err(),
+        "unterminated facts line must be rejected: {served_unterminated:?}"
+    );
+
+    let trunc_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let trunc_port = trunc_listener.local_addr().unwrap().port();
+    let trunc_issuer = Issuer {
+        node: a.node().to_owned(),
+        host: "127.0.0.1".to_owned(),
+        port: trunc_port,
+        version: "0.147.0".to_owned(),
+    };
+    let _trunc_at = Issuing::hooked(
+        trunc_listener,
+        secret.clone(),
+        a_state.dir(),
+        trunc_issuer,
+        &[FleetOp::Census, FleetOp::Facts],
+        Arc::new(|op| match op {
+            FleetOp::Census => Some("OK {\"partial\":1"),
+            FleetOp::Facts => Some("OK"),
+            _ => None,
+        }),
+    );
+    let census_err = request_census_from_peer(
+        "127.0.0.1",
+        Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        trunc_port,
+        (&secret, Some(&b)),
+        Duration::MAX,
+    )
+    .expect_err("unterminated census reply must fail");
+    assert!(census_err.contains("unterminated"), "{census_err}");
+    let facts_err = push_facts_to_peer(
+        "127.0.0.1",
+        Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        trunc_port,
+        (&secret, Some(&b)),
+        "OK 1\nv=1\n",
+        Duration::MAX,
+    )
+    .expect_err("unterminated facts push reply must fail");
+    assert!(facts_err.contains("unterminated"), "{facts_err}");
+}
+
+#[test]
+fn facts_mail_code_and_census_enforce_framing_bounds_and_clamp_max_deadlines() {
+    struct Duplex {
+        input: io::Cursor<Vec<u8>>,
+        output: Vec<u8>,
+    }
+    impl Read for Duplex {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.input.read(buf)
+        }
+    }
+    impl Write for Duplex {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.output.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let state = State::new("framing-bounds");
+    let peer_id = identity(&node_of(0x41), 0x41);
+    let proof = NodeProof {
+        node: peer_id.node().to_owned(),
+        key: peer_id.key(),
+    };
+
+    // `serve_facts_with_denied` rejects unterminated head and unterminated body lines.
+    let mut bad_head = Duplex {
+        input: io::Cursor::new(b"OK 1".to_vec()),
+        output: Vec::new(),
+    };
+    let res = serve_facts_with_denied(
+        &mut bad_head,
+        Some(&proof),
+        state.dir(),
+        (&[], None),
+        |_| Ok(Some(proof.node.clone())),
+    )
+    .unwrap();
+    assert_eq!(res.unwrap_err(), "invalid facts head");
+
+    let mut bad_body = Duplex {
+        input: io::Cursor::new(format!("OK 1\nnode={}", proof.node).into_bytes()),
+        output: Vec::new(),
+    };
+    let res = serve_facts_with_denied(
+        &mut bad_body,
+        Some(&proof),
+        state.dir(),
+        (&[], None),
+        |_| Ok(Some(proof.node.clone())),
+    )
+    .unwrap();
+    assert_eq!(res.unwrap_err(), "truncated facts push");
+
+    let mut good_body = Duplex {
+        input: io::Cursor::new(format!("OK 1\nnode={}\n", proof.node).into_bytes()),
+        output: Vec::new(),
+    };
+    let res = serve_facts_with_denied(
+        &mut good_body,
+        Some(&proof),
+        state.dir(),
+        (&[], None),
+        |_| Ok(Some(proof.node.clone())),
+    )
+    .unwrap();
+    assert_eq!(res.unwrap(), proof.node);
+
+    // Peer dialers reject unframed/oversize replies and clamp `Duration::MAX` without panicking.
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let running = Arc::new(AtomicBool::new(true));
+    let next_reply: Arc<std::sync::Mutex<Vec<u8>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let listening = Listening {
+        secret: secret(9),
+        scope: FleetScope::Content,
+        node: Some(identity(&node_of(0x42), 0x42)),
+        serves: &[FleetOp::Facts, FleetOp::MailCode, FleetOp::Census],
+        slots: 8,
+        per_source: 8,
+        lifetime: HANG,
+    };
+    let server = std::thread::spawn({
+        let running = Arc::clone(&running);
+        let next_reply = Arc::clone(&next_reply);
+        move || {
+            serve(
+                &listener,
+                &listening,
+                &running,
+                move |served, op| {
+                    let bytes = next_reply.lock().unwrap().clone();
+                    served.answer(|stream| {
+                        stream.set_read_timeout(Some(HANG))?;
+                        if matches!(op, FleetOp::Facts | FleetOp::MailCode) {
+                            let mut reader = io::BufReader::new(Read::by_ref(stream).take(512));
+                            let mut line = String::new();
+                            let _ = reader.read_line(&mut line)?;
+                        }
+                        stream.write_all(&bytes)?;
+                        stream.flush()
+                    })
+                },
+                |_| {},
+            );
+        }
+    });
+
+    let sec = secret(9);
+    let ip = Some(IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+    *next_reply.lock().unwrap() = b"OK {\"truncated\":1".to_vec();
+    assert!(request_census_from_peer("127.0.0.1", ip, port, (&sec, None), Duration::MAX).is_err());
+
+    *next_reply.lock().unwrap() = format!("OK {}\n", "x".repeat(MAX_CENSUS_REPLY + 1)).into_bytes();
+    assert!(request_census_from_peer("127.0.0.1", ip, port, (&sec, None), HANG).is_err());
+
+    *next_reply.lock().unwrap() = b"OK {\"ok\":true}\n".to_vec();
+    assert_eq!(
+        request_census_from_peer("127.0.0.1", ip, port, (&sec, None), Duration::MAX).unwrap(),
+        Ok("{\"ok\":true}".to_owned())
+    );
+
+    *next_reply.lock().unwrap() = b"OK".to_vec();
+    assert!(
+        push_facts_to_peer(
+            "127.0.0.1",
+            ip,
+            port,
+            (&sec, Some(&peer_id)),
+            "OK 0\n",
+            Duration::MAX,
+        )
+        .is_err()
+    );
+
+    *next_reply.lock().unwrap() = b"OK\n".to_vec();
+    push_facts_to_peer(
+        "127.0.0.1",
+        ip,
+        port,
+        (&sec, Some(&peer_id)),
+        "OK 0\n",
+        Duration::MAX,
+    )
+    .unwrap();
+
+    *next_reply.lock().unwrap() = b"OK sealed".to_vec();
+    assert!(
+        request_mail_code_from_peer(
+            "127.0.0.1",
+            ip,
+            port,
+            (&sec, Some(&peer_id)),
+            "mail-code a@example.com",
+            Duration::MAX,
+        )
+        .is_err()
+    );
+
+    let max_sealed = "s".repeat(MAX_MAIL_CODE_REPLY as usize);
+    *next_reply.lock().unwrap() = format!("OK {max_sealed}\r\n").into_bytes();
+    assert_eq!(
+        request_mail_code_from_peer(
+            "127.0.0.1",
+            ip,
+            port,
+            (&sec, Some(&peer_id)),
+            "mail-code a@example.com",
+            Duration::MAX,
+        )
+        .unwrap(),
+        Ok(max_sealed)
+    );
+
+    *next_reply.lock().unwrap() =
+        format!("OK {}\n", "s".repeat(MAX_MAIL_CODE_REPLY as usize + 1)).into_bytes();
+    assert!(
+        request_mail_code_from_peer(
+            "127.0.0.1",
+            ip,
+            port,
+            (&sec, Some(&peer_id)),
+            "mail-code a@example.com",
+            HANG,
+        )
+        .is_err()
+    );
+
+    running.store(false, Ordering::Release);
+    let _ = TcpStream::connect((Ipv4Addr::LOCALHOST, port));
+    let _ = server.join();
+}
+
+#[test]
+fn store_pushed_facts_never_acknowledges_an_unbound_publication() {
+    let state = State::new("facts-write-key-refusal");
+    let node = "33".repeat(16);
+    let key = NodeIdentity::from_seed(&node, &[0x33; 32]).unwrap().key();
+    let before = "previous survey facts\n";
+    store_pushed_facts(state.dir(), &node, before).unwrap();
+    let dir = state.dir().join(SWARM_FACTS_DIR);
+    std::fs::create_dir(dir.join(format!("{node}.key"))).unwrap();
+
+    let result = store_pushed_facts_with_key(state.dir(), &node, Some(key), "new survey facts\n");
+    prune_pushed_facts(state.dir(), &[], &[key.hex()], None);
+    let after = read_pushed_facts(state.dir());
+    match result {
+        Ok(()) => assert!(
+            after.is_empty(),
+            "acknowledged facts must carry the proved key that authorizes their eviction: {after:?}"
+        ),
+        Err(_) => assert_eq!(after, [(node, before.to_owned())]),
+    }
+}
+
+/// Existing binaries wrote these raw files, with no versioned-record interpretation.
+fn legacy_pushed_facts(state: &Path, node: &str, key: Option<NodeKey>, payload: &str) {
+    let dir = state.join(SWARM_FACTS_DIR);
+    ensure_private_dir(&dir).unwrap();
+    write_private(&dir, &format!("{node}.txt"), payload.as_bytes()).unwrap();
+    if let Some(key) = key {
+        write_private(
+            &dir,
+            &format!("{node}.key"),
+            format!("{}\n", key.hex()).as_bytes(),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn pushed_facts_records_keep_payload_binding_and_legacy_fallback_distinct() {
+    let state = State::new("facts-record-binding");
+    let node = "33".repeat(16);
+    let old = NodeIdentity::from_seed(&node, &[0x11; 32]).unwrap().key();
+    let new = NodeIdentity::from_seed(&node, &[0x22; 32]).unwrap().key();
+    legacy_pushed_facts(state.dir(), &node, Some(old), "legacy bytes\n");
+    store_pushed_facts_with_key(state.dir(), &node, Some(new), "new\nwire\0bytes\n").unwrap();
+    // An old binary can still write legacy files; it cannot silently replace this record.
+    legacy_pushed_facts(state.dir(), &node, Some(old), "later legacy writer\n");
+    assert_eq!(
+        read_pushed_facts(state.dir()),
+        [(node.clone(), "new\nwire\0bytes\n".to_owned())]
+    );
+    prune_pushed_facts(state.dir(), &[], &[old.hex()], None);
+    assert_eq!(
+        read_pushed_facts(state.dir()),
+        [(node.clone(), "new\nwire\0bytes\n".to_owned())]
+    );
+    prune_pushed_facts(state.dir(), &[], &[new.hex()], None);
+    assert!(read_pushed_facts(state.dir()).is_empty());
+
+    // A current unproved publication inherits no proved legacy sidecar. The established
+    // keyring, when present, still decides its standing.
+    legacy_pushed_facts(state.dir(), &node, Some(old), "legacy again\n");
+    store_pushed_facts(state.dir(), &node, "unproved current\n").unwrap();
+    prune_pushed_facts(state.dir(), &[], &[old.hex()], None);
+    assert_eq!(
+        read_pushed_facts(state.dir()),
+        [(node.clone(), "unproved current\n".to_owned())]
+    );
+    write_book(state.dir(), &[keyed(0x33, new, [10, 0, 0, 1], 7100)]);
+    assert!(read_admitted_pushed_facts(state.dir(), &[], &[new.hex()], None).is_empty());
+    prune_pushed_facts(state.dir(), &[], &[new.hex()], None);
+    assert!(read_pushed_facts(state.dir()).is_empty());
+}
+
+#[test]
+fn pushed_facts_records_reject_unsafe_or_corrupt_current_without_legacy_fallback() {
+    let node = "33".repeat(16);
+    for kind in [
+        "private",
+        "limit",
+        "symlink",
+        "hardlink",
+        "open",
+        "open-directory",
+        "oversize",
+        "payload-overflow",
+        "directory",
+        "missing",
+        "invalid-utf8",
+        "magic",
+        "version",
+        "key",
+    ] {
+        let state = State::new("facts-record-kinds");
+        let dir = state.dir().join(SWARM_FACTS_DIR);
+        legacy_pushed_facts(state.dir(), &node, None, "legacy fallback\n");
+        let payload = if kind == "limit" {
+            "x".repeat(REPLY_MAX)
+        } else {
+            "current wire\n".to_owned()
+        };
+        store_pushed_facts(state.dir(), &node, &payload).unwrap();
+        let name = format!("{node}.facts");
+        let path = dir.join(&name);
+        write_private(state.dir(), "outside", b"outside sentinel\n").unwrap();
+        let outside = state.dir().join("outside");
+        match kind {
+            "private" | "limit" => {}
+            "symlink" | "hardlink" => {
+                std::fs::remove_file(&path).unwrap();
+                if kind == "symlink" {
+                    std::os::unix::fs::symlink(&outside, &path).unwrap();
+                } else {
+                    std::fs::hard_link(&outside, &path).unwrap();
+                }
+            }
+            "open" => mode(&path, 0o644),
+            "open-directory" => mode(&dir, 0o755),
+            "oversize" => std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len((PUSHED_FACTS_MAX + 1) as u64)
+                .unwrap(),
+            "payload-overflow" => write_private(
+                &dir,
+                &name,
+                format!("{PUSHED_FACTS_MAGIC}-\n{}", "x".repeat(REPLY_MAX + 1)).as_bytes(),
+            )
+            .unwrap(),
+            "directory" | "missing" => {
+                std::fs::remove_file(&path).unwrap();
+                if kind == "directory" {
+                    std::fs::create_dir(&path).unwrap();
+                }
+            }
+            "invalid-utf8" => write_private(&dir, &name, &[0xff]).unwrap(),
+            "magic" => write_private(
+                &dir,
+                &name,
+                b"raw legacy bytes are not a versioned record\n",
+            )
+            .unwrap(),
+            "version" => {
+                write_private(&dir, &name, b"aterm-pushed-facts-v2\n-\nfuture record\n").unwrap()
+            }
+            "key" => write_private(
+                &dir,
+                &name,
+                format!("{PUSHED_FACTS_MAGIC}not-a-key\nwire\n").as_bytes(),
+            )
+            .unwrap(),
+            _ => unreachable!(),
+        }
+        let got = read_pushed_facts(state.dir());
+        let expected = match kind {
+            "private" | "limit" => vec![(node.clone(), payload)],
+            "missing" => vec![(node.clone(), "legacy fallback\n".to_owned())],
+            _ => Vec::new(),
+        };
+        assert_eq!(got, expected, "{kind}");
+        assert_eq!(
+            std::fs::read(&outside).unwrap(),
+            b"outside sentinel\n",
+            "{kind}"
+        );
+    }
+}
+
+#[test]
+fn pushed_facts_write_failure_keeps_the_previous_record_and_a_later_writer_wins() {
+    use std::sync::mpsc;
+    let state = State::new("facts-record-concurrent");
+    let node = "33".repeat(16);
+    let old = NodeIdentity::from_seed(&node, &[0x11; 32]).unwrap().key();
+    let failed = NodeIdentity::from_seed(&node, &[0x22; 32]).unwrap().key();
+    let winner = NodeIdentity::from_seed(&node, &[0x33; 32]).unwrap().key();
+    store_pushed_facts_with_key(state.dir(), &node, Some(old), "previous\n").unwrap();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let first = std::thread::spawn({
+        let state = state.dir().to_path_buf();
+        let node = node.clone();
+        move || {
+            store_pushed_facts_using(
+                &state,
+                &node,
+                Some(failed),
+                "refused\n",
+                HANG,
+                || {},
+                |dir, name, bytes| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(HANG).unwrap();
+                    mode(dir, 0o500);
+                    let result = write_private(dir, name, bytes);
+                    mode(dir, 0o700);
+                    assert!(result.is_err(), "actual directory write refusal");
+                    assert_eq!(
+                        read_pushed_facts(&state),
+                        [(node.clone(), "previous\n".to_owned())]
+                    );
+                    result
+                },
+            )
+        }
+    });
+    entered_rx.recv_timeout(HANG).unwrap();
+    let (waiting_tx, waiting_rx) = mpsc::channel();
+    let second = std::thread::spawn({
+        let state = state.dir().to_path_buf();
+        let node = node.clone();
+        move || {
+            store_pushed_facts_using(
+                &state,
+                &node,
+                Some(winner),
+                "winner\n",
+                HANG,
+                || {
+                    let _ = waiting_tx.send(());
+                },
+                write_private,
+            )
+        }
+    });
+    waiting_rx.recv_timeout(HANG).unwrap();
+    assert_eq!(
+        read_pushed_facts(state.dir()),
+        [(node.clone(), "previous\n".to_owned())]
+    );
+    release_tx.send(()).unwrap();
+    assert!(first.join().unwrap().is_err());
+    second.join().unwrap().unwrap();
+    prune_pushed_facts(state.dir(), &[], &[old.hex(), failed.hex()], None);
+    assert_eq!(
+        read_pushed_facts(state.dir()),
+        [(node.clone(), "winner\n".to_owned())]
+    );
+    prune_pushed_facts(state.dir(), &[], &[winner.hex()], None);
+    assert!(read_pushed_facts(state.dir()).is_empty());
+}
+
+#[test]
+fn pushed_facts_pruning_waits_then_judges_the_winning_publication() {
+    use std::sync::mpsc;
+    let state = State::new("facts-record-prune-race");
+    let node = "33".repeat(16);
+    let old = NodeIdentity::from_seed(&node, &[0x11; 32]).unwrap().key();
+    let winner = NodeIdentity::from_seed(&node, &[0x33; 32]).unwrap().key();
+    store_pushed_facts_with_key(state.dir(), &node, Some(old), "previous\n").unwrap();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let writer = std::thread::spawn({
+        let state = state.dir().to_path_buf();
+        let node = node.clone();
+        move || {
+            store_pushed_facts_using(
+                &state,
+                &node,
+                Some(winner),
+                "winner\n",
+                HANG,
+                || {},
+                |dir, name, bytes| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(HANG).unwrap();
+                    write_private(dir, name, bytes)
+                },
+            )
+        }
+    });
+    entered_rx.recv_timeout(HANG).unwrap();
+    let (waiting_tx, waiting_rx) = mpsc::channel();
+    let pruning = std::thread::spawn({
+        let state = state.dir().to_path_buf();
+        move || {
+            prune_pushed_facts_using(&state, &[], &[old.hex()], None, HANG, || {
+                let _ = waiting_tx.send(());
+            })
+        }
+    });
+    waiting_rx.recv_timeout(HANG).unwrap();
+    release_tx.send(()).unwrap();
+    writer.join().unwrap().unwrap();
+    pruning.join().unwrap();
+    assert_eq!(
+        read_pushed_facts(state.dir()),
+        [(node, "winner\n".to_owned())]
+    );
+}
+
+#[test]
+fn pushed_facts_admission_refuses_denied_bindings_when_pruning_is_busy() {
+    let state = State::new("facts-admission-busy");
+    let node = "33".repeat(16);
+    let revoked = NodeIdentity::from_seed(&node, &[0x11; 32]).unwrap().key();
+    let other = "44".repeat(16);
+    let allowed = NodeIdentity::from_seed(&other, &[0x22; 32]).unwrap().key();
+    store_pushed_facts_with_key(state.dir(), &node, Some(revoked), "revoked\n").unwrap();
+    store_pushed_facts_with_key(state.dir(), &other, Some(allowed), "allowed\n").unwrap();
+    let dir = state.dir().join(SWARM_FACTS_DIR);
+    let _held = pushed_facts_lock(&dir, HANG, || {}).unwrap();
+    // A zero deadline still attempts the lock once. Its actual contention refuses cleanup;
+    // it is no elapsed-time assertion and no wait for an event that must happen.
+    prune_pushed_facts_using(
+        state.dir(),
+        &[],
+        &[revoked.hex()],
+        None,
+        Duration::ZERO,
+        || {},
+    );
+    assert_eq!(read_pushed_facts(state.dir()).len(), 2);
+    for (denied, log) in [
+        (vec![node.clone()], None),
+        (vec![revoked.hex()], None),
+        (
+            Vec::new(),
+            Some(MemberKeys::from_iter([(
+                revoked,
+                Standing::Out("removed".to_owned()),
+            )])),
+        ),
+    ] {
+        let admitted = read_admitted_pushed_facts(state.dir(), &[], &denied, log.as_ref());
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].node, other);
+        assert_eq!(admitted[0].payload, "allowed\n");
+    }
+}
+
+#[test]
+fn pushed_facts_receive_time_belongs_to_the_authoritative_payload() {
+    let state = State::new("facts-received-at");
+    let node = "33".repeat(16);
+    let dir = state.dir().join(SWARM_FACTS_DIR);
+    let legacy_time = std::time::UNIX_EPOCH + Duration::from_secs(1234);
+    let record_time = std::time::UNIX_EPOCH + Duration::from_secs(5678);
+    legacy_pushed_facts(state.dir(), &node, None, "legacy\n");
+    std::fs::File::options()
+        .write(true)
+        .open(dir.join(format!("{node}.txt")))
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(legacy_time))
+        .unwrap();
+    store_pushed_facts(state.dir(), &node, "current\n").unwrap();
+    let path = dir.join(format!("{node}.facts"));
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(record_time))
+        .unwrap();
+    let current = read_admitted_pushed_facts(state.dir(), &[], &[], None);
+    assert_eq!(current[0].payload, "current\n");
+    assert_eq!(current[0].received_at, Some(record_time));
+    std::fs::remove_file(path).unwrap();
+    let legacy = read_admitted_pushed_facts(state.dir(), &[], &[], None);
+    assert_eq!(legacy[0].payload, "legacy\n");
+    assert_eq!(legacy[0].received_at, Some(legacy_time));
+}
+
+#[test]
+fn pushed_facts_capacity_counts_nodes_once_across_formats_without_following_entries() {
+    let state = State::new("facts-mixed-capacity");
+    let dir = state.dir().join(SWARM_FACTS_DIR);
+    let old = format!("{:032x}", 0);
+    let winner = format!("{:032x}", MAX_PUSHED_FACTS_FILES);
+    // Construct actual legacy records cheaply; only the duplicate node has a new record.
+    for n in 0..MAX_PUSHED_FACTS_FILES {
+        legacy_pushed_facts(state.dir(), &format!("{n:032x}"), None, "legacy\n");
+    }
+    store_pushed_facts(state.dir(), &old, "duplicate current\n").unwrap();
+    assert_eq!(
+        pushed_facts_nodes(&dir).unwrap().len(),
+        MAX_PUSHED_FACTS_FILES
+    );
+    let outside = state.dir().join("outside");
+    write_private(state.dir(), "outside", b"outside sentinel\n").unwrap();
+    let hostile = format!("{:032x}", 1);
+    std::fs::remove_file(dir.join(format!("{hostile}.txt"))).unwrap();
+    std::os::unix::fs::symlink(&outside, dir.join(format!("{hostile}.txt"))).unwrap();
+    // A poisoned new-record name hides its legacy entry but is never followed for age.
+    std::os::unix::fs::symlink(&outside, dir.join(format!("{hostile}.facts"))).unwrap();
+    store_pushed_facts(state.dir(), &winner, "winner\n").unwrap();
+    assert_eq!(
+        pushed_facts_nodes(&dir).unwrap().len(),
+        MAX_PUSHED_FACTS_FILES
+    );
+    assert!(read_pushed_facts(state.dir()).contains(&(winner, "winner\n".to_owned())));
+    assert_eq!(std::fs::read(outside).unwrap(), b"outside sentinel\n");
+
+    // Cleanup never recurses into an unexpected directory, so hostile entries can exceed
+    // the retention target. A successful writer still leaves its own record readable.
+    let hostile_dir = dir.join(format!("{:032x}.facts", MAX_PUSHED_FACTS_FILES + 1));
+    ensure_private_dir(&hostile_dir).unwrap();
+    write_private(&hostile_dir, "sentinel", b"keep directory contents\n").unwrap();
+    std::fs::File::open(&hostile_dir)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
+        .unwrap();
+    let winner = format!("{:032x}", MAX_PUSHED_FACTS_FILES);
+    store_pushed_facts(state.dir(), &winner, "winner again\n").unwrap();
+    assert_eq!(
+        pushed_facts_nodes(&dir).unwrap().len(),
+        MAX_PUSHED_FACTS_FILES + 1
+    );
+    assert_eq!(
+        read_private(&hostile_dir, "sentinel", 128).unwrap(),
+        b"keep directory contents\n"
+    );
+    assert!(read_pushed_facts(state.dir()).contains(&(winner, "winner again\n".to_owned())));
+}
+
+#[test]
+fn pushed_facts_refused_inputs_preserve_the_previous_publication() {
+    let state = State::new("facts-write-input-limit");
+    let node = "33".repeat(16);
+    store_pushed_facts(state.dir(), &node, "previous\n").unwrap();
+    assert!(store_pushed_facts(state.dir(), &node, &"x".repeat(REPLY_MAX + 1)).is_err());
+    assert!(store_pushed_facts(state.dir(), "../outside", "refused\n").is_err());
+    assert_eq!(
+        read_pushed_facts(state.dir()),
+        [(node, "previous\n".to_owned())]
+    );
+}
+
+#[test]
+fn pushed_facts_cleanup_never_resurrects_the_older_legacy_payload() {
+    let state = State::new("facts-cleanup-snapshot");
+    let node = "33".repeat(16);
+    legacy_pushed_facts(state.dir(), &node, None, "older legacy\n");
+    store_pushed_facts(state.dir(), &node, "current\n").unwrap();
+    let dir = state.dir().join(SWARM_FACTS_DIR);
+    let lock = pushed_facts_lock(&dir, HANG, || {}).unwrap();
+    remove_pushed_facts_using(&dir, &node, |_| {
+        let observed = read_pushed_facts(state.dir());
+        assert!(
+            observed.is_empty() || observed == [(node.clone(), "current\n".to_owned())],
+            "cleanup exposed old legacy bytes: {observed:?}"
+        );
+    });
+    assert!(read_pushed_facts(state.dir()).is_empty());
+    drop(lock);
+
+    let legacy_dir = dir.join(format!("{node}.txt"));
+    ensure_private_dir(&legacy_dir).unwrap();
+    write_private(&legacy_dir, "sentinel", b"preserve this directory\n").unwrap();
+    let key = NodeIdentity::from_seed(&node, &[0x11; 32]).unwrap().key();
+    store_pushed_facts_with_key(state.dir(), &node, Some(key), "current retained\n").unwrap();
+    let _lock = pushed_facts_lock(&dir, HANG, || {}).unwrap();
+    remove_pushed_facts(&dir, &node);
+    assert_eq!(
+        read_pushed_facts(state.dir()),
+        [(node, "current retained\n".to_owned())]
+    );
+    assert!(read_admitted_pushed_facts(state.dir(), &[], &[key.hex()], None).is_empty());
+    assert_eq!(
+        read_private(&legacy_dir, "sentinel", 128).unwrap(),
+        b"preserve this directory\n"
+    );
+}
+
+#[test]
+fn prune_pushed_facts_evicts_log_removed_peer_via_recorded_key_sidecar_without_peers_entry() {
+    let state = State::new("facts-prune-sidecar");
+    let good = NodeIdentity::from_seed(&"11".repeat(16), &[0x11; 32]).unwrap();
+    let revoked = NodeIdentity::from_seed(&"22".repeat(16), &[0x22; 32]).unwrap();
+    let good_proof = NodeProof {
+        node: good.node().to_owned(),
+        key: good.key(),
+    };
+    let revoked_proof = NodeProof {
+        node: revoked.node().to_owned(),
+        key: revoked.key(),
+    };
+    for proof in [&good_proof, &revoked_proof] {
+        let payload = format!("OK 2\naterm 0.147.0\nsurvey facts node={}\n", proof.node);
+        let mut cursor = io::Cursor::new(payload.into_bytes());
+        let res =
+            serve_facts_with_denied(&mut cursor, Some(proof), state.dir(), (&[], None), |_| {
+                Ok(Some(proof.node.clone()))
+            })
+            .expect("io");
+        assert_eq!(res, Ok(proof.node.clone()));
+    }
+    assert_eq!(read_pushed_facts(state.dir()).len(), 2);
+
+    // Even with an empty `peers` slice, `prune_pushed_facts` uses `<node>.key` to evict the
+    // log-held-out peer while keeping the admitted peer (negative control).
+    let log = MemberKeys::from_iter([
+        (good.key(), Standing::Member),
+        (revoked.key(), Standing::Out("removed".to_owned())),
+    ]);
+    prune_pushed_facts(state.dir(), &[], &[], Some(&log));
+    let remaining = read_pushed_facts(state.dir());
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].0, good.node());
+    assert!(
+        !state
+            .dir()
+            .join(SWARM_FACTS_DIR)
+            .join(format!("{}.key", revoked.node()))
+            .exists()
+    );
+}
+
+#[test]
+fn prune_pushed_facts_uses_only_private_bounded_key_sidecars() {
+    let denied = NodeIdentity::from_seed(&"11".repeat(16), &[0x11; 32])
+        .unwrap()
+        .key();
+    let allowed = NodeIdentity::from_seed(&"22".repeat(16), &[0x22; 32])
+        .unwrap()
+        .key();
+    let node = "33".repeat(16);
+    for kind in [
+        "private",
+        "allowed",
+        "symlink",
+        "hardlink",
+        "long",
+        "open",
+        "directory",
+        "missing",
+    ] {
+        let state = State::new("facts-prune-key-kinds");
+        legacy_pushed_facts(state.dir(), &node, None, "scratch survey facts\n");
+        let dir = state.dir().join(SWARM_FACTS_DIR);
+        let name = format!("{node}.key");
+        let sidecar = dir.join(&name);
+        let outside = state.dir().join("outside-key");
+        let denied_text = format!("{}\n", denied.hex());
+        aterm_uds::private_file::write_private(state.dir(), "outside-key", denied_text.as_bytes())
+            .unwrap();
+        match kind {
+            "private" | "open" => {
+                aterm_uds::private_file::write_private(&dir, &name, denied_text.as_bytes())
+                    .unwrap();
+                if kind == "open" {
+                    mode(&sidecar, 0o644);
+                }
+            }
+            "allowed" => aterm_uds::private_file::write_private(
+                &dir,
+                &name,
+                format!("{}\n", allowed.hex()).as_bytes(),
+            )
+            .unwrap(),
+            "symlink" => std::os::unix::fs::symlink(&outside, &sidecar).unwrap(),
+            "hardlink" => std::fs::hard_link(&outside, &sidecar).unwrap(),
+            "long" => aterm_uds::private_file::write_private(
+                &dir,
+                &name,
+                format!("{}{}", denied.hex(), " ".repeat(4096)).as_bytes(),
+            )
+            .unwrap(),
+            "directory" => std::fs::create_dir(&sidecar).unwrap(),
+            "missing" => {}
+            _ => unreachable!(),
+        }
+        prune_pushed_facts(state.dir(), &[], &[denied.hex()], None);
+        assert_eq!(
+            dir.join(format!("{node}.txt")).exists(),
+            kind != "private",
+            "{kind}: only a valid private denied binding authorizes this eviction"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            denied_text,
+            "{kind}"
+        );
+    }
+}
+
+/// A FIFO can offer syntactically valid denied-key bytes, but it is never a binding file.
+/// The producer uses nonblocking open so a reader that rejects it leaves no blocked writer.
+#[test]
+fn prune_pushed_facts_never_reads_a_fifo_key_sidecar() {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::{FileTypeExt as _, OpenOptionsExt as _};
+
+    let state = State::new("facts-prune-key-fifo");
+    let node = "44".repeat(16);
+    let denied = NodeIdentity::from_seed(&"11".repeat(16), &[0x11; 32])
+        .unwrap()
+        .key();
+    legacy_pushed_facts(state.dir(), &node, None, "scratch survey facts\n");
+    let dir = state.dir().join(SWARM_FACTS_DIR);
+    let sidecar = dir.join(format!("{node}.key"));
+    let path = std::ffi::CString::new(sidecar.as_os_str().as_bytes()).unwrap();
+    // SAFETY: a valid NUL-terminated scratch path; mkfifo retains no pointer.
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+
+    let reading = Arc::new(AtomicBool::new(true));
+    let writer = std::thread::spawn({
+        let reading = reading.clone();
+        let sidecar = sidecar.clone();
+        let text = format!("{}\n", denied.hex());
+        move || {
+            let until = Instant::now() + HANG;
+            while reading.load(Ordering::Acquire) {
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&sidecar)
+                {
+                    Ok(mut file) => {
+                        // A rejecting nonblocking reader may close before this write.
+                        let _ = file.write_all(text.as_bytes());
+                        return;
+                    }
+                    Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                        assert!(Instant::now() < until, "FIFO producer hang detector");
+                        std::thread::yield_now();
+                    }
+                    Err(error) => panic!("scratch FIFO writer: {error}"),
+                }
+            }
+        }
+    });
+    prune_pushed_facts(state.dir(), &[], &[denied.hex()], None);
+    reading.store(false, Ordering::Release);
+    writer.join().unwrap();
+    assert!(
+        dir.join(format!("{node}.txt")).exists(),
+        "a FIFO's offered bytes are no private regular binding"
+    );
+    assert!(
+        std::fs::symlink_metadata(sidecar)
+            .unwrap()
+            .file_type()
+            .is_fifo()
+    );
+}
+
+#[test]
+fn read_pushed_facts_accepts_only_private_bounded_payloads() {
+    let node = "33".repeat(16);
+    let key = NodeIdentity::from_seed(&node, &[0x33; 32]).unwrap().key();
+    let mut mismatches = Vec::new();
+    for kind in [
+        "private",
+        "keyed",
+        "keyring",
+        "limit",
+        "symlink",
+        "hardlink",
+        "open",
+        "open-directory",
+        "oversize",
+        "directory",
+        "missing",
+        "invalid-utf8",
+    ] {
+        let state = State::new("facts-payload-kinds");
+        let payload = if kind == "limit" {
+            "x".repeat(REPLY_MAX)
+        } else {
+            "aterm 0.147.0\nsurvey facts source=payload-reader\n".to_owned()
+        };
+        legacy_pushed_facts(
+            state.dir(),
+            &node,
+            (kind == "keyed").then_some(key),
+            &payload,
+        );
+        let dir = state.dir().join(SWARM_FACTS_DIR);
+        let name = format!("{node}.txt");
+        let target = dir.join(&name);
+        let outside = state.dir().join("outside-facts");
+        let sentinel = "outside facts sentinel\n";
+        write_private(state.dir(), "outside-facts", sentinel.as_bytes()).unwrap();
+        match kind {
+            "private" | "keyed" | "limit" => {}
+            "keyring" => write_book(state.dir(), &[keyed(0x33, key, [10, 0, 0, 1], 7100)]),
+            "symlink" | "hardlink" => {
+                std::fs::remove_file(&target).unwrap();
+                if kind == "symlink" {
+                    std::os::unix::fs::symlink(&outside, &target).unwrap();
+                } else {
+                    std::fs::hard_link(&outside, &target).unwrap();
+                }
+            }
+            "open" => mode(&target, 0o644),
+            "open-directory" => mode(&dir, 0o755),
+            "oversize" => std::fs::OpenOptions::new()
+                .write(true)
+                .open(&target)
+                .unwrap()
+                .set_len((REPLY_MAX as u64) + 1)
+                .unwrap(),
+            "directory" | "missing" => {
+                std::fs::remove_file(&target).unwrap();
+                if kind == "directory" {
+                    std::fs::create_dir(&target).unwrap();
+                }
+            }
+            "invalid-utf8" => write_private(&dir, &name, &[0xff]).unwrap(),
+            _ => unreachable!(),
+        }
+        let got = read_pushed_facts(state.dir());
+        let expected = if matches!(kind, "private" | "keyed" | "keyring" | "limit") {
+            vec![(node.clone(), payload)]
+        } else {
+            Vec::new()
+        };
+        if got != expected {
+            mismatches.push((kind, got));
+        }
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            sentinel,
+            "{kind}"
+        );
+        if kind == "keyed" {
+            assert_eq!(
+                read_private(&dir, &format!("{node}.key"), 128).unwrap(),
+                format!("{}\n", key.hex()).as_bytes()
+            );
+        } else if kind == "private" || kind == "keyring" {
+            assert!(!dir.join(format!("{node}.key")).exists());
+        }
+        if kind == "keyring" {
+            assert_eq!(Keyring::read(state.dir()).bound(&node), Some(key));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "unsafe payloads accepted: {mismatches:?}"
+    );
+}
+
+/// A producer offers finite bytes to the actual payload API, without ever blocking its open.
+/// Reading those bytes from a FIFO is a policy failure, not a wall-clock latency assertion.
+#[test]
+fn read_pushed_facts_never_accepts_an_offered_fifo_payload() {
+    for extension in ["txt", "facts"] {
+        pushed_facts_fifo_payload(extension);
+    }
+}
+
+fn pushed_facts_fifo_payload(extension: &str) {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::{FileTypeExt as _, OpenOptionsExt as _};
+    let state = State::new("facts-payload-fifo");
+    let dir = state.dir().join(SWARM_FACTS_DIR);
+    ensure_private_dir(&dir).unwrap();
+    let target = dir.join(format!("{}.{extension}", "44".repeat(16)));
+    let path = std::ffi::CString::new(target.as_os_str().as_bytes()).unwrap();
+    // SAFETY: one valid NUL-terminated scratch path; mkfifo retains no pointer.
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    let reading = Arc::new(AtomicBool::new(true));
+    let writer = std::thread::spawn({
+        let reading = Arc::clone(&reading);
+        let target = target.clone();
+        move || {
+            let until = Instant::now() + HANG;
+            while reading.load(Ordering::Acquire) {
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&target)
+                {
+                    Ok(mut file) => {
+                        let _ = file.write_all(b"offered FIFO facts\n");
+                        return;
+                    }
+                    Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                        assert!(Instant::now() < until, "FIFO producer hang detector");
+                        std::thread::yield_now();
+                    }
+                    Err(error) => panic!("scratch FIFO writer: {error}"),
+                }
+            }
+        }
+    });
+    let got = read_pushed_facts(state.dir());
+    reading.store(false, Ordering::Release);
+    writer.join().unwrap();
+    assert!(got.is_empty(), "FIFO bytes accepted as facts: {got:?}");
+    assert!(
+        std::fs::symlink_metadata(target)
+            .unwrap()
+            .file_type()
+            .is_fifo()
+    );
+}
+
+#[test]
+fn serve_join_book_and_facts_enforce_denied_keys_and_proof_bindings() {
+    let state = State::new("join-denied-proof");
+    issue(state.dir());
+    let from = IpAddr::from(Ipv4Addr::LOCALHOST);
+    let old = identity(&node_of(0xa1), 0x61);
+    let new = identity(&node_of(0xa1), 0x62);
+    let other = identity(&node_of(0xa2), 0x63);
+
+    // 1. Keyless registration cannot bypass `denied_nodes` or `log.holds_out` or spoof `reg.node`
+    //    when the connection's TLS handshake proved `proof`.
+    let keyless_reg = Registration {
+        node: old.node().to_owned(),
+        host: "m1.local".to_owned(),
+        port: 7100,
+        version: "0.147.0".to_owned(),
+        key: None,
+        signed: None,
+    };
+    let serve_with = |reg: &Registration,
+                      proved: Option<&NodeProof>,
+                      denied: &[String],
+                      log: Option<&MemberKeys>| {
+        let mut stream = Duplex {
+            input: std::io::Cursor::new(reg.line().into_bytes()),
+            output: Vec::new(),
+        };
+        serve_join_with_denied(
+            &mut stream,
+            (from, proved),
+            (state.dir(), &secret(5)),
+            || Ok(issuer(0x11)),
+            1_760_000_000_000,
+            (denied, log),
+        )
+        .expect("stream io")
+    };
+
+    let denied_old_key = vec![old.key().hex()];
+    let err = serve_with(
+        &keyless_reg,
+        Some(&proof(old.node(), old.key())),
+        &denied_old_key,
+        None,
+    )
+    .expect_err("denied proved key must be refused even when reg.key is None");
+    assert!(err.contains("deny-list"), "{err}");
+
+    let log_out: MemberKeys = [(old.key(), Standing::Out("retired".to_owned()))]
+        .into_iter()
+        .collect();
+    let err = serve_with(
+        &keyless_reg,
+        Some(&proof(old.node(), old.key())),
+        &[],
+        Some(&log_out),
+    )
+    .expect_err("log-held-out proved key must be refused even when reg.key is None");
+    assert!(err.contains(NOT_ADMITTED), "{err}");
+
+    let err = serve_with(
+        &keyless_reg,
+        Some(&proof(other.node(), other.key())),
+        &[],
+        None,
+    )
+    .expect_err("mismatched proved node must be refused even when reg.key is None");
+    assert!(err.contains("did not prove"), "{err}");
+
+    // 2. When `Via::Issuer` and `.fleet-issuer-peers` bind `old.node()` to `old.key()`, which is in
+    //    `denied_nodes`, a join or `merge_signed` under `new.key()` succeeds and preserves `Via::Issuer`.
+    let issuer_node = node_of(0x11);
+    write_book(
+        state.dir(),
+        &[
+            Peer {
+                key: Some(old.key()),
+                ..issuer_entry(0xa1, 7100)
+            },
+            Peer {
+                node: Some(issuer_node.clone()),
+                ..issuer_entry(0x11, 7100)
+            },
+        ],
+    );
+    keep_issuer_book(
+        state.dir(),
+        &secret(5),
+        Some((
+            old.node(),
+            &[Peer {
+                node: Some(old.node().to_owned()),
+                key: Some(old.key()),
+                key_from: None,
+                host: "m1.local".to_owned(),
+                addr: None,
+                port: 7100,
+                version: Some("0.146.0".to_owned()),
+                seen_ms: Some(1_760_000_000_000),
+                via: Via::IssuerBook,
+                fleet: None,
+                signed: None,
+            }],
+        )),
+    )
+    .unwrap();
+
+    let new_reg = keyless_reg.clone().signed_by(&new, 1_760_000_000_010);
+    let joined = serve_with(
+        &new_reg,
+        Some(&proof(new.node(), new.key())),
+        &denied_old_key,
+        None,
+    )
+    .expect("new key replaces denied old key across book and issuer-book copy");
+    assert_eq!(joined.0, Recorded::Updated);
+    let book = read_peers(state.dir()).unwrap();
+    assert_eq!(
+        book.iter()
+            .find(|p| p.node.as_deref() == Some(new.node()))
+            .map(|p| (p.via, p.key)),
+        Some((Via::Issuer, Some(new.key()))),
+    );
+
+    // 3. `serve_book_with_log` omits `own` when `own` is denied or held out by `log`.
+    let own_entry = Peer::own(&old, ("m1.local", 7100, "0.147.0"), 1_760_000_000_020);
+    let mut book_out = Vec::new();
+    let shared = serve_book_with_log(
+        &mut book_out,
+        state.dir(),
+        || Ok(old.node().to_owned()),
+        Some(1_760_000_000_020),
+        (&denied_old_key, None, Some(&own_entry)),
+    )
+    .unwrap()
+    .unwrap();
+    let book_text = String::from_utf8(book_out).unwrap();
+    assert!(
+        !book_text.contains(&old.key().hex()),
+        "denied own entry must not be shared in book: {book_text} (shared={shared})"
+    );
+
+    // 4. `serve_facts_with_denied` accepts `new` when `old` is in `denied_nodes` and `log` admits `new`.
+    write_book(
+        state.dir(),
+        &[Peer {
+            key: Some(old.key()),
+            ..keyed(0xa1, old.key(), [10, 0, 0, 1], 7100)
+        }],
+    );
+    let log_admits_new: MemberKeys = [(new.key(), Standing::Member)].into_iter().collect();
+    let facts_payload = format!("OK 1\ninstance pid=1 node={}\n", new.node());
+    let mut facts_stream = Duplex {
+        input: std::io::Cursor::new(facts_payload.clone().into_bytes()),
+        output: Vec::new(),
+    };
+    let served_facts = serve_facts_with_denied(
+        &mut facts_stream,
+        Some(&proof(new.node(), new.key())),
+        state.dir(),
+        (&denied_old_key, Some(&log_admits_new)),
+        |_| Ok(Some(new.node().to_owned())),
+    )
+    .unwrap();
+    assert_eq!(served_facts, Ok(new.node().to_owned()));
+}
+
+#[test]
+fn driver_and_heartbeat_hints_refuse_impostor_claiming_bound_or_own_node_id() {
+    let secret_bytes = [0x67; SECRET_LEN];
+    let secret = FleetSecret::new(&secret_bytes).unwrap();
+    let (member, impostor_state) = (
+        State::new("impostor-bound-member"),
+        State::new("impostor-bound-hint"),
+    );
+    for st in [&member, &impostor_state] {
+        write_key(st.dir(), &secret_bytes).unwrap();
+    }
+
+    let me = node_identity(member.dir()).unwrap();
+    let founder = identity(&issuer(0x11).node, 9);
+    let impostor_for_founder = identity(founder.node(), 7);
+    let impostor_for_me = identity(me.node(), 8);
+    let rotated_old = identity(&node_of(0xd4), 4);
+    let rotated_new = identity(rotated_old.node(), 5);
+
+    let closed = closed_port();
+    let founder_peer = Peer {
+        key: Some(founder.key()),
+        ..issuer_entry(0x11, closed)
+    };
+    let rotated_peer = keyed(0xd4, rotated_old.key(), [127, 0, 0, 1], closed);
+    write_book(member.dir(), &[founder_peer.clone(), rotated_peer]);
+
+    let all = [DriveGrant::from_word(crate::fleet::ALL_MEMBERS).expect("all parses")];
+    let log: MemberKeys = [
+        (impostor_for_founder.key(), Standing::Member),
+        (impostor_for_me.key(), Standing::Member),
+        (
+            rotated_old.key(),
+            Standing::Out("retired old key".to_owned()),
+        ),
+        (rotated_new.key(), Standing::Member),
+    ]
+    .into_iter()
+    .collect();
+
+    // 1a. `driver_as_of` refuses a log-admitted member claiming the founder's node id when the
+    // founder's key is bound in the book and not held out by `log`.
+    assert_eq!(
+        driver_as_of(
+            Some(&proof(
+                impostor_for_founder.node(),
+                impostor_for_founder.key()
+            )),
+            (member.dir(), &all),
+            Some(&log),
+        ),
+        Err(Undriven::Unproven(Unproven::OtherKey(
+            founder.node().to_owned()
+        ))),
+    );
+
+    // 1b. `driver_as_of` refuses a log-admitted member claiming this Mac's own node id under
+    // another key, while admitting this Mac's own key if it is in the log.
+    assert_eq!(
+        driver_as_of(
+            Some(&proof(impostor_for_me.node(), impostor_for_me.key())),
+            (member.dir(), &all),
+            Some(&log),
+        ),
+        Err(Undriven::Unproven(Unproven::OtherKey(me.node().to_owned()))),
+    );
+
+    // 1c. `driver_as_of` admits `rotated_new` when `rotated_old` is explicitly held out by `log`.
+    assert_eq!(
+        driver_as_of(
+            Some(&proof(rotated_new.node(), rotated_new.key())),
+            (member.dir(), &all),
+            Some(&log),
+        ),
+        Ok(rotated_new.node().to_owned()),
+    );
+
+    // 2. `heartbeat_members_with_denied` refuses a hint (`_alab._tcp` advert) responder whose key
+    // is in `log` when it claims `founder.node()`, which `member`'s book binds to `founder.key()`.
+    let poisoned_member = identity(&node_of(0xe9), 12);
+    write_book(
+        impostor_state.dir(),
+        &[Peer::own(
+            &poisoned_member,
+            ("127.0.0.1", 7399, "0.147.0"),
+            1_760_000_000_050,
+        )],
+    );
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let hint_port = listener.local_addr().unwrap().port();
+    let named = Issuer {
+        node: impostor_for_founder.node().to_owned(),
+        host: "impostor.local".to_owned(),
+        port: hint_port,
+        version: "0.147.0".to_owned(),
+    };
+    let _impostor_srv = Issuing::gated(
+        listener,
+        (secret.clone(), Some(impostor_for_founder.clone())),
+        impostor_state.dir(),
+        named,
+        None,
+    );
+    let reg = Registration {
+        node: me.node().to_owned(),
+        host: "127.0.0.1".to_owned(),
+        port: 7390,
+        version: "0.147.0".to_owned(),
+        key: None,
+        signed: None,
+    };
+    let hint_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), hint_port);
+    let reached = dial(
+        "127.0.0.1",
+        Some(hint_addr.ip()),
+        hint_port,
+        (&secret, Some(&me)),
+        FleetOp::Join,
+        HANG,
+    )
+    .expect("the hint responder is reachable and proves its claimed identity");
+    assert_eq!(
+        reached.peer,
+        Some(proof(
+            impostor_for_founder.node(),
+            impostor_for_founder.key()
+        )),
+    );
+    drop(reached);
+    let hints_asked = AtomicBool::new(false);
+    let answered = heartbeat_members_with_denied(
+        member.dir(),
+        (&secret, &me),
+        &reg,
+        HANG,
+        (Some(&log), &[], &|| {
+            hints_asked.store(true, Ordering::Release);
+            vec![hint_addr]
+        }),
+    )
+    .expect("heartbeat round completes");
+    assert!(
+        hints_asked.load(Ordering::Acquire),
+        "the round asks its hints"
+    );
+    assert!(
+        answered.is_empty(),
+        "impostor hint claiming founder's bound node id must not be admitted: {answered:?}"
+    );
+    let book_after = read_peers(member.dir()).unwrap();
+    let founder_after = book_after
+        .iter()
+        .find(|p| p.node.as_deref() == Some(founder.node()))
+        .expect("founder entry retained");
+    assert_eq!(
+        founder_after.port, closed,
+        "founder port must not be hijacked"
+    );
+    assert_eq!(
+        founder_after.host, founder_peer.host,
+        "founder host must not be hijacked"
+    );
+    assert!(
+        !book_after
+            .iter()
+            .any(|p| p.node.as_deref() == Some(poisoned_member.node())),
+        "impostor's book must not be merged"
+    );
+}
+
+#[test]
+fn unsigned_wire_parsers_reject_signed_numbers_and_ports() {
+    assert!(parse_host_port("lab-mini:+7100", None).is_err());
+    assert!(parse_host_port("[::1]:+7100", None).is_err());
+
+    let me = identity(&node_of(0xab), 1);
+    let signed_peer = Peer::own(&me, ("m7.local", 7100, "0.146.0"), 30);
+    let peer_line = signed_peer.line();
+    assert_eq!(
+        Peer::parse(&peer_line.replace("port=7100", "port=+7100")),
+        None
+    );
+    assert_eq!(
+        Peer::parse(&peer_line.replace("seen_ms=30", "seen_ms=+1000")),
+        None
+    );
+    assert_eq!(Peer::parse(&peer_line.replace("seq=30", "seq=+30")), None);
+
+    assert_eq!(
+        stamp_line(
+            ANSWERED,
+            &format!("answered node={} ms=+1000", node_of(0xab))
+        ),
+        None
+    );
+
+    let reg = Registration {
+        node: me.node().to_owned(),
+        host: "lab-mini".to_owned(),
+        port: 7100,
+        version: "0.146.0".to_owned(),
+        key: Some(me.key()),
+        signed: None,
+    }
+    .signed_by(&me, 30);
+    let reg_line = reg.line();
+    assert!(Registration::parse(&reg_line.replace("port=7100", "port=+7100")).is_err());
+    assert!(Registration::parse(&reg_line.replace("seq=30", "seq=+30")).is_err());
+
+    let join_ok = format!(
+        "OK node={} host=m7.local port=7100 version=0.146.0 peers=2",
+        node_of(0xab)
+    );
+    assert!(joined_of(&join_ok).is_ok());
+    assert!(joined_of(&join_ok.replace("port=7100", "port=+7100")).is_err());
+    assert!(joined_of(&join_ok.replace("peers=2", "peers=+2")).is_err());
+
+    assert_eq!(book_head("OK 3"), Ok(3));
+    assert!(book_head("OK +3").is_err());
+    assert_eq!(reply_head("OK 5"), Ok(5));
+    assert!(reply_head("OK +5").is_err());
+
+    let state = State::new("signed-facts-head");
+    let proof = NodeProof {
+        node: me.node().to_owned(),
+        key: me.key(),
+    };
+    let mut signed_head = Duplex {
+        input: io::Cursor::new(format!("OK +1\nnode={}\n", proof.node).into_bytes()),
+        output: Vec::new(),
+    };
+    let res = serve_facts_with_denied(
+        &mut signed_head,
+        Some(&proof),
+        state.dir(),
+        (&[], None),
+        |_| Ok(Some(proof.node.clone())),
+    )
+    .unwrap();
+    assert_eq!(res.unwrap_err(), "invalid facts head");
+}
+
+/// The dev seam raises the per-address allowance and never lowers it: a lab whose Macs share one
+/// loopback address names a larger count, and anything else (none, a word, a count under four or
+/// past the book's size) leaves the four.
+/// NEGATIVE CONTROL: take any whole number (drop the range filter): "assertion `left == right`
+/// failed: \"2\" left: 2 right: 4".
+#[test]
+fn the_per_address_seam_raises_the_allowance_and_never_lowers_it() {
+    use std::ffi::OsStr;
+    assert_eq!(joined_per_address_from(None), JOINED_PER_ADDRESS);
+    assert_eq!(joined_per_address_from(Some(OsStr::new("16"))), 16);
+    assert_eq!(joined_per_address_from(Some(OsStr::new(" 16\n"))), 16);
+    assert_eq!(
+        joined_per_address_from(Some(OsStr::new(&PEERS_MAX.to_string()))),
+        PEERS_MAX
+    );
+    let past = (PEERS_MAX + 1).to_string();
+    for word in ["2", "0", "x", "", "-5", past.as_str()] {
+        assert_eq!(
+            joined_per_address_from(Some(OsStr::new(word))),
+            JOINED_PER_ADDRESS,
+            "{word:?}"
+        );
+    }
+    assert_eq!(
+        joined_per_address(),
+        JOINED_PER_ADDRESS,
+        "tests read no seam"
     );
 }

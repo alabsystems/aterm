@@ -10,11 +10,13 @@ use aterm_core::render::{
     DecoGlyph, FxBlend, FxContent, FxInk, FxItem, FxLayer, FxRect, FxSlot, FxSpace, InkCell,
     PxRect, WordDecoration,
 };
+use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::{Rgb, Terminal};
 use aterm_effects::cursor_fx::{
     CursorFxInput, GlowKnobs, GlowSpelling, TrailColor, follow_live_cursor, head_dx_for,
     resolve_glow_config,
 };
+use aterm_effects::cursor_glow::glass_yield::{GlassLaid, GlassYield};
 use aterm_effects::cursor_glow::{
     CURSOR_WITNESS_ROWS, CursorGlow, Geom, GlowConfig, GlowStyle, ProbeTrust,
 };
@@ -23,7 +25,8 @@ use aterm_effects::harness_card::{
     CardFrame, CardFrames, CardPalette, CardScene, EPISODE_MS, FRAME_MS, HarnessCard, LineAt,
     card_layer_id, dark_ground, line_star,
 };
-use aterm_effects::host::motion_print_anchor;
+use aterm_effects::host::light_latch::LatchKey;
+use aterm_effects::host::{PageFacts, TrailGround, motion_print_anchor};
 use aterm_effects::pipeline::{CursorStep, EffectsPipeline, RowProbe};
 use aterm_effects::sound_policy::fold_window_audibility;
 use aterm_gpu::gpu_time::{self, Settled};
@@ -445,6 +448,8 @@ impl Win {
 
 struct Rig {
     cpu: Renderer,
+    /// Untimed body-glass witnesses never warm either measured presenter's caches.
+    glass_witness: Renderer,
     gpu: GpuRenderer,
     clock: &'static str,
     counter: &'static str,
@@ -589,7 +594,8 @@ impl Rig {
         );
         let scheme = rig_scheme();
         let theme = Theme::from(&scheme);
-        let ctx = GpuContext::new().unwrap_or_else(|e| skip(format!("no GPU: {e}")));
+        let ctx =
+            GpuContext::new_headless().unwrap_or_else(|e| skip(format!("no headless GPU: {e}")));
         let raster = |what: &str| {
             let mut r = Renderer::from_system_with_family(Some(font), FONT_PX, theme)
                 .unwrap_or_else(|| fail(format!("{font} does not load for the {what}")));
@@ -598,6 +604,17 @@ impl Rig {
             r
         };
         let cpu = raster("CPU presenter");
+        let mut glass_witness = cpu
+            .fork_semantic_surface(FONT_PX, theme)
+            .unwrap_or_else(|| fail("the glass witness could not retain the presenter's font"));
+        let _ = glass_witness.seal_admitted_font_sources();
+        glass_witness.set_pad(cpu.pad());
+        if glass_witness.cell_size() != cpu.cell_size()
+            || glass_witness.grid_top() != cpu.grid_top()
+            || glass_witness.frame_size(ROWS, COLS) != cpu.frame_size(ROWS, COLS)
+        {
+            fail("the sealed glass witness disagrees with the presenter's geometry");
+        }
         let mut gpu =
             GpuRenderer::from_parts(ctx, raster("GPU presenter"), Some(font.into()), theme)
                 .unwrap_or_else(|e| fail(format!("the GPU renderer did not assemble: {e}")));
@@ -630,6 +647,7 @@ impl Rig {
             frame_w,
             frame_h,
             cpu,
+            glass_witness,
             gpu,
             clock,
             counter,
@@ -1037,12 +1055,49 @@ impl CardHost {
     }
 }
 
+/// The release benchmark uses the same public record/yield operation as the debug-only
+/// body-glass twin, without enabling a dependency's test seam. Restore all selection state
+/// before rendering; only recorded body glass is forced out of this pre-yield publication.
+fn without_body_glass(input: &RenderInput, glass: &GlassLaid) -> RenderInput {
+    let mut twin = input.clone();
+    let saved = (
+        std::mem::take(&mut twin.selection),
+        twin.selection_clip.take(),
+        twin.selection_bg,
+        twin.selection_fg,
+        std::mem::take(&mut twin.selections),
+    );
+    twin.selection
+        .start_selection(i32::MIN, 0, SelectionSide::Left, SelectionType::Simple);
+    twin.selection
+        .update_selection(i32::MAX, u16::MAX, SelectionSide::Right);
+    twin.selection.complete_selection();
+    assert!(
+        twin.cells.iter().enumerate().all(|(row, cells)| {
+            (0..cells.len().max(twin.cols))
+                .all(|col| twin.selection_hit(row, col, false, false).is_some())
+        }),
+        "the benchmark ablation selects every possible body-glass cell"
+    );
+    let _ = GlassYield::default().apply(&mut twin, glass, &[]);
+    (
+        twin.selection,
+        twin.selection_clip,
+        twin.selection_bg,
+        twin.selection_fg,
+        twin.selections,
+    ) = saved;
+    twin
+}
+
 /// The cursor family as a window presents it: [`EffectsPipeline::cursor_step`]
 /// on the frame's cells, so every pass the shipped path runs (the letter guard
 /// among them) is priced.
 struct GlowHost {
     fx: EffectsPipeline,
     cfg: GlowConfig,
+    /// The window's ground: the light its latch admits on the frame's page.
+    ground: TrailGround,
     geom: Geom,
     row: Vec<char>,
     witness: Vec<char>,
@@ -1091,6 +1146,7 @@ impl GlowHost {
         let mut host = Self {
             fx: EffectsPipeline::for_window(),
             cfg,
+            ground: TrailGround::default(),
             geom: rig.glow_geom(),
             row: Vec::new(),
             witness: Vec::new(),
@@ -1111,13 +1167,41 @@ impl GlowHost {
     fn emit(
         &mut self,
         term: &Terminal,
+        renderer: &mut Renderer,
         input: &RenderInput,
         caret: (u16, u16),
         now: Instant,
     ) -> (u64, Spent) {
         // What a window reads off its terminal each frame before the step (aterm-gui's
-        // `App::cursor_frame`): the cursor colour it presents, which the automatic glow
-        // colour and accent follow, the cursor's shape and the ground under it.
+        // `App::cursor_frame`): the frame's page and the light its latch admits there on the
+        // terminal's configured pair (`TrailGround::ground`, so a light theme draws what a
+        // window draws at the live level), the cursor colour it presents, which the automatic
+        // glow colour and accent follow, the cursor's shape and the ground under it.
+        let rgb = |c: Rgb| aterm_render::rgb_to_u32([c.r, c.g, c.b]);
+        let (scheme_fg, scheme_bg) = term.configured_colors();
+        let watch = Stopwatch::start();
+        let observed = renderer.glyph_ink_for(input);
+        let thin_ink = observed.thin_share(
+            aterm_render::linear_luminance(rgb(term.default_foreground())),
+            aterm_render::linear_luminance(rgb(term.default_background())),
+        );
+        self.ground.ground(
+            &mut self.cfg,
+            (
+                rgb(term.default_foreground()),
+                rgb(term.default_background()),
+            ),
+            LatchKey {
+                session: 1,
+                fg: rgb(scheme_fg),
+                bg: rgb(scheme_bg),
+            },
+            PageFacts {
+                thin_ink,
+                ..PageFacts::OPAQUE
+            },
+            now,
+        );
         let ink = term
             .cursor_color()
             .unwrap_or_else(|| term.default_foreground());
@@ -1147,7 +1231,21 @@ impl GlowHost {
             .get(usize::from(row))
             .and_then(|cells| cells.get(usize::from(col)))
             .map(|cell| aterm_render::rgb_to_u32(cell.bg));
-        let watch = Stopwatch::start();
+        if self.cfg.light.glass() {
+            let frame = observed
+                .for_frame(input, renderer.cell_size())
+                .unwrap_or_else(|| fail("a glass benchmark needs current glyph evidence"));
+            if !input.cells.iter().enumerate().any(|(row, cells)| {
+                cells.iter().enumerate().any(|(col, _)| {
+                    frame
+                        .coverage(row, col)
+                        .is_some_and(|(_, coverage)| coverage.max > 0)
+                })
+            }) {
+                fail("a glass benchmark observed no actual glyph rasters");
+            }
+        }
+        self.glow().observe_glyph_ink(Some(observed));
         let below_row = usize::from(row) + 1 < ROWS;
         term.row_cols_into(usize::from(row), &mut self.row);
         if row > 0 {
@@ -1215,8 +1313,93 @@ impl GlowHost {
         let started = Instant::now();
         clear_streams(input);
         self.fx.publish_cursor(input);
+        self.fx.yield_glass_unworded(input);
         input.refresh_cursor_effect_damage();
         elapsed_ns(started)
+    }
+
+    /// Capture before `publish_cursor` transfers its owned streams, outside the splice timer.
+    fn bodyless_before_publish(&self, input: &RenderInput, now: Instant) -> Option<RenderInput> {
+        let glow = &self.fx.cursor().glow;
+        let glass = glow.glass_laid();
+        if glass.at() != Some(now) || glass.is_empty() {
+            return None;
+        }
+        let mut published = input.clone();
+        published.glow_under = glow.under_quads().to_vec();
+        published.glow_under_ramps = glow.under_ramps().clone();
+        Some(without_body_glass(&published, glass))
+    }
+
+    /// An untimed scene premise from the SAME observation and final yielded stream. Only
+    /// removing recorded body glass may change RGB beneath a genuinely covered glyph.
+    fn retains_glass_under_observed_text(
+        &self,
+        input: &RenderInput,
+        bodyless: RenderInput,
+        renderer: &mut Renderer,
+    ) -> bool {
+        let Some(ink) = self.fx.cursor().glow.glyph_ink() else {
+            return false;
+        };
+        let Some(frame) = ink.for_frame(input, (self.geom.cw, self.geom.ch)) else {
+            return false;
+        };
+        // Keep every final published channel except the body-owned part of the under stream.
+        let mut twin = input.clone();
+        twin.glow_under = bodyless.glow_under;
+        twin.glow_under_ramps = bodyless.glow_under_ramps;
+        let actual = renderer.render_input(input);
+        let absent = renderer.render_input(&twin);
+        if (actual.width, actual.height) != (absent.width, absent.height)
+            || (actual.width, actual.height) != renderer.frame_size(input.rows, input.cols)
+        {
+            fail("the body-glass twin changed the frame geometry");
+        }
+        let mut quads = Vec::new();
+        input
+            .glow_under_ramps
+            .expand_into(&input.glow_under, &mut quads);
+        input.cells.iter().enumerate().any(|(row, cells)| {
+            cells
+                .iter()
+                .take(input.cols)
+                .enumerate()
+                .any(|(col, cell)| {
+                    cell.ch.is_ascii_alphabetic()
+                        && frame
+                            .coverage(row, col)
+                            .is_some_and(|(_, coverage)| coverage.max > 0)
+                        && quads.iter().any(|q| {
+                            if usize::from(q.row) >= input.rows {
+                                return false;
+                            }
+                            let x0 = usize::from(self.geom.origin_x) + col * self.geom.cw;
+                            let y0 = usize::from(self.geom.origin_y) + row * self.geom.ch;
+                            let lo = x0.max(usize::from(q.x));
+                            let hi = (x0 + self.geom.cw)
+                                .min(usize::from(q.x) + usize::from(q.w))
+                                .min(actual.width);
+                            let top = y0.max(usize::from(q.y));
+                            let bottom = (y0 + self.geom.ch)
+                                .min(usize::from(q.y) + usize::from(q.h))
+                                .min(actual.height);
+                            (lo..hi).any(|x| {
+                                aterm_render::glow_lerp(
+                                    u32::from(q.alpha),
+                                    u32::from(q.alpha2),
+                                    (x - usize::from(q.x)) as u32,
+                                    u32::from(q.w),
+                                ) > 0
+                                    && (top..bottom).any(|y| {
+                                        let i = y * actual.width + x;
+                                        actual.pixels[i] & 0x00ff_ffff
+                                            != absent.pixels[i] & 0x00ff_ffff
+                                    })
+                            })
+                        })
+                })
+        })
     }
 }
 
@@ -1492,6 +1675,7 @@ fn typing_scene(rig: &mut Rig, style: GlowStyle, page: Page, script: Script) -> 
     rig.refs.clear();
 
     let mut host = GlowHost::new(rig, style);
+    let (mut glass_frames, mut retained_text, mut expected_glass) = (0, false, false);
     let period = Duration::from_secs(1) / TYPING_HZ;
     let t0 = Instant::now();
     let mut samples = Vec::new();
@@ -1517,16 +1701,39 @@ fn typing_scene(rig: &mut Rig, style: GlowStyle, page: Page, script: Script) -> 
             u16::try_from(input.cursor_row).unwrap_or(u16::MAX),
             u16::try_from(input.cursor_col).unwrap_or(u16::MAX),
         );
-        let (fp, emit) = host.emit(&term, &input, caret, now);
+        let (fp, emit) = host.emit(&term, &mut rig.cpu, &input, caret, now);
+        expected_glass |=
+            style == GlowStyle::RainbowKitty && !host.cfg.dark_theme && host.cfg.light.glass();
         if event.is_none() && fp == host.last_fp {
             continue;
         }
         host.last_fp = fp;
+        let bodyless = if retained_text {
+            None
+        } else {
+            host.bodyless_before_publish(&input, now)
+        };
         let splice_ns = host.splice(&mut input);
+        let glass = host.fx.light_arms().iter().any(|(arm, _)| arm == "glass");
+        if glass {
+            glass_frames += 1;
+        }
         samples.push(rig.present(&mut win, &input, emit, splice_ns));
+        if glass && let Some(bodyless) = bodyless {
+            retained_text =
+                host.retains_glass_under_observed_text(&input, bodyless, &mut rig.glass_witness);
+        }
     }
     if samples.iter().all(|s| s.fx_quads == 0) {
         fail("the cursor glow drew nothing under the typist");
+    }
+    if expected_glass && glass_frames == 0 {
+        fail("the admitted light-page Rainbow Kitty benchmark emitted no glass");
+    }
+    if glass_frames > 0 && !retained_text {
+        fail(
+            "glass drew only away from observed ink: no final glass beneath a real supported word",
+        );
     }
     rig.take_run(samples)
 }

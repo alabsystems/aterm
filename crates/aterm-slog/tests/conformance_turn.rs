@@ -136,7 +136,16 @@ pub struct Rig {
     /// Ghosts (the model's `gn`, `ab`, `ga`).
     pub bound_next: bool,
     pub bound_twice: bool,
+    /// A close said `approved`, `declined` or `answered` that neither an act an input it observed
+    /// said (a proven sender's, bound to the step and dismissing it) nor the screen backs: the
+    /// screen backs only `declined` on an approval its next verdict closed after it reported the
+    /// person's interrupt ([`Self::interrupt_fed`]).
     pub approved_unseen: bool,
+    /// The screen reported the interrupt with a turn open and no verdict published since (the
+    /// tracker's own `interrupt_fresh`): the approval the next verdict closes was declined.
+    pub interrupt_fed: bool,
+    /// The verdict being judged came after such a report.
+    see_declines: bool,
     /// Who sent the input the open step is bound to, as the rig fed it (the model's `bs`, 6A-5), and who sent the act accepted on the lead.
     pub bound_sender: Option<Actor>,
     pub lead_sender: Option<Actor>,
@@ -177,6 +186,8 @@ impl Rig {
             bound_next: false,
             bound_twice: false,
             approved_unseen: false,
+            interrupt_fed: false,
+            see_declines: false,
             bound_sender: None,
             lead_sender: None,
             limits,
@@ -197,9 +208,17 @@ impl Rig {
     pub fn observe_with(&mut self, v: Verdict, detail: Option<&str>) -> Option<u64> {
         let before = self.before();
         let stamp = self.stamp();
+        self.see_declines = std::mem::take(&mut self.interrupt_fed);
         let next = self.tracker.observe(&mut self.log, v, detail, stamp);
         self.judge(before, Call::See);
+        self.see_declines = false;
         next
+    }
+
+    /// The screen reports the turn interrupted (a person's Esc) now.
+    pub fn interrupted(&mut self) {
+        self.tracker.note_interrupted();
+        self.interrupt_fed = self.tracker.turn().is_some();
     }
 
     /// A `ctl turn` from `by` now, with the next ledger id.
@@ -336,7 +355,11 @@ impl Rig {
                 let seen = held.is_some_and(|(_, by, act, acc)| {
                     by.is_proven() && act.is_some() && dismisses(acc, now)
                 });
-                self.approved_unseen |= !seen;
+                let screen = matches!(call, Call::See)
+                    && self.see_declines
+                    && r.k == Kind::Approval
+                    && r.out() == Some("declined");
+                self.approved_unseen |= !(seen || screen);
             }
         }
     }
@@ -924,7 +947,7 @@ fn apply_step(m: &Model, rig: &mut Rig, step: Step) {
             admitted(m, rig, &[], &prev, &project(rig, None), before);
         }
         Step::Interrupted => {
-            rig.tracker.note_interrupted();
+            rig.interrupted();
             admitted(m, rig, &[], &prev, &project(rig, None), before);
         }
         Step::Admit(by, act) => {

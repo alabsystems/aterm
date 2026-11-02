@@ -151,6 +151,9 @@ fn an_edge_far_right_of_the_grid_terminates() {
     escape_case("far right, crossing out", |r| {
         r.draw_line(point(1.0, 0.5), point(3.0e2, 7.5));
     });
+    escape_case("row > 0 span past i32::MAX", |r| {
+        r.draw_line(point(-2.0, 4.0), point(1.0e15, 5.0));
+    });
 }
 
 #[test]
@@ -189,6 +192,7 @@ fn non_finite_coordinates_terminate_without_panicking() {
             "infinite endpoint",
             Box::new(|r: &mut Rasterizer| {
                 r.draw_line(point(f32::INFINITY, 0.0), point(1.0, 8.0));
+                r.draw_line(point(-2.0, 4.0), point(f32::INFINITY, 5.0));
             }) as Box<dyn FnOnce(&mut Rasterizer)>,
         ),
         (

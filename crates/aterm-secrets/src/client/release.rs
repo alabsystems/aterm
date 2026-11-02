@@ -22,7 +22,10 @@ use std::ffi::OsString;
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
+pub mod probe;
 mod signing;
+#[cfg(any(test, debug_assertions))]
+pub use signing::test_signing_observation;
 pub use signing::{SigningStatus, effective_signing_identity, signing_status, sync_signing};
 
 /// The vault entry this reads.
@@ -36,6 +39,9 @@ const APPLIED: &str = "release-notary.applied";
 /// the 0.145 `~/.aterm/` location while an older vault has not yet rotated its path).
 const RELEASE_PROFILE: &str = ".aterm/release-ring/release-credentials.toml";
 const LEGACY_RELEASE_PROFILE: &str = ".aterm/release-credentials.toml";
+
+/// The direct certificate/key leaves the shared signing reader may authenticate.
+pub(super) const APPLE_PREFIX: &str = "~/.aterm/apple/devid-";
 
 /// Where the vault puts the release roster, under the home: read when the profile names none,
 /// or names one that is not there.
@@ -68,7 +74,7 @@ pub(super) struct Notary {
     password: Zeroizing<String>,
 }
 
-fn parse_notary(bytes: &[u8]) -> crate::Result<Notary> {
+pub(super) fn parse_notary(bytes: &[u8]) -> crate::Result<Notary> {
     let text =
         std::str::from_utf8(bytes).map_err(|_| Error::new("release-notary entry is not UTF-8"))?;
     let mut apple_id = None;
@@ -357,7 +363,12 @@ fn authorized_ring_check(paths: &Paths, anchors: &[&str], now: i64, advance: boo
     };
     let floor_path = paths.dir.join("release-ring-roster-floor");
     let floor = match fsx::read_private(&floor_path, 32) {
-        Ok(Some(bytes)) => match bytes.as_str().and_then(|s| s.trim().parse::<u64>().ok()) {
+        Ok(Some(bytes)) => match bytes
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|s| s.parse::<u64>().ok())
+        {
             Some(floor) => floor,
             None => return false,
         },

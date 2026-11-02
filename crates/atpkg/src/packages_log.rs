@@ -819,8 +819,14 @@ pub fn parse_record(line: &str) -> Option<Entry> {
     let mut fields = Vec::new();
     for part in parts {
         let (key, value) = part.split_once('=')?;
+        if key.is_empty() {
+            return None;
+        }
         if key == "pid" {
-            pid = value.parse().ok();
+            if pid.is_some() || value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            pid = Some(value.parse().ok()?);
         } else {
             fields.push((key.to_string(), value.to_string()));
         }
@@ -879,34 +885,20 @@ pub fn tail_of(max: usize, keep: impl Fn(&Entry) -> bool) -> Vec<Entry> {
 /// `path` exists but is not a regular file, or opening, seeking or reading it failed.
 #[cfg(test)]
 pub(crate) fn read_records(path: &Path, read_bytes: u64) -> io::Result<Vec<Entry>> {
-    match std::fs::symlink_metadata(path) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e),
-        Ok(meta) if !meta.file_type().is_file() => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "not a regular file",
-            ));
-        }
-        Ok(_) => {}
+    match read_tail_lines(path, read_bytes) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e),
+        Ok(lines) => Ok(lines.iter().filter_map(|line| parse_record(line)).collect()),
     }
-    Ok(read_tail_lines(path, read_bytes)?
-        .iter()
-        .filter_map(|line| parse_record(line))
-        .collect())
 }
 
 fn tail_lines(path: &Path, read_bytes: u64) -> Vec<String> {
-    let regular = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file());
-    if !regular {
-        return Vec::new();
-    }
     read_tail_lines(path, read_bytes).unwrap_or_default()
 }
 
 fn read_tail_lines(path: &Path, read_bytes: u64) -> io::Result<Vec<String>> {
     use std::io::{Read as _, Seek as _, SeekFrom};
-    let mut file = std::fs::File::open(path)?;
+    let mut file = crate::metadata_io::open_regular(path)?;
     let len = file.metadata()?.len();
     let start = len.saturating_sub(read_bytes);
     file.seek(SeekFrom::Start(start))?;
@@ -1040,6 +1032,9 @@ mod tests {
             "2026-09-21T14:13:20Z\tsomething\tpid=1",
             "2026-09-21T14:13:20Z\tprogram",
             "2026-09-21T14:13:20Z\tprogram\tpid=1\tno-equals",
+            "2026-09-21T14:13:20Z\tprogram\tpid=1\tpid=2",
+            "2026-09-21T14:13:20Z\tprogram\tpid=1\tpid=bad",
+            "2026-09-21T14:13:20Z\tprogram\tpid=1\t=val",
             "2026-09-21 14:13:20\tprogram\tpid=1",
         ] {
             assert_eq!(parse_line(foreign), None, "{foreign:?}");

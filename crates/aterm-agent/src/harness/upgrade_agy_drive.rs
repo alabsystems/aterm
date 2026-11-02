@@ -8,18 +8,19 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::super::relaunch::{
-    ExitCause, NO_SHELL, NO_SHELL_DETAIL, WAIT_HAND_LIFTS, exit_clock, first_idle, hand_waits_out,
+    Continued, ExitCause, NO_SHELL, NO_SHELL_DETAIL, WAIT_HAND_LIFTS, exit_clock, first_idle,
+    hand_waits_out,
 };
 use super::super::upgrade_agy::{self as ag, ExitKind};
 use super::upgrade::{Agent, Dialect, Phase};
 use super::{
-    Client, Hand, Kernel, Live, LiveTab, NoPlan, Opts, Plan, PromptLook, RelaunchLineError, Report,
-    STALE_S, St, TURN_WAIT, TabLife, Typed, alive, connect, cwd_of, descendants_in, exe_of,
-    exit_status, file_holders, held, ids, is_generation, ledger, line_status, load,
-    managed_agent_twin, now_s, open_files, pause, registry_graph, registry_life, roster,
+    Client, Hand, Kernel, Live, LiveTab, NoPlan, NoSocket, Opts, Plan, PromptLook,
+    RelaunchLineError, Report, STALE_S, St, TURN_WAIT, TabLife, Typed, alive, connect, cwd_of,
+    descendants_in, exe_of, exit_status, file_holders, ids, is_generation, ledger, line_status,
+    load, managed_agent_twin, now_s, open_files, pause, registry_graph, registry_life, roster,
     running_block, said, save, screen, shell_dialect_of, squash, started_ms, state_dir,
     store_version, table, turn_takes_gen, turn_verdict, twin_version, type_relaunch_line_with,
-    under_hand, upgrade, wait_now, wait_until,
+    under_hand, unheld_hour, upgrade, wait_now, wait_until,
 };
 
 /// The process facts the agy lane rests on, each read when asked: the Claude lane's [`Kernel`] plus agy's needs.
@@ -58,6 +59,11 @@ pub(super) trait AgyKernel: Kernel {
     fn summaries(&self, config: &Path, conversation: &str) -> Result<String, ()> {
         live::read_summaries(config, conversation)
     }
+    /// What the conversation `st` relaunches was told at or after unix second `since`, by its own
+    /// transcript ([`live::prompts_look`]); `None` where that cannot be read.
+    fn prompts_since(&self, st: &St, since: u64) -> Option<Vec<String>> {
+        live::prompts_look(Path::new(&st.agy_config), &st.thread, since)
+    }
     /// What agy's quota rotation makes of a launch on `model` (its `--model`; `None`: agy's
     /// default) as `exe` under the relaunch's `env` and config `flags`
     /// ([`crate::harness::agy_quota_store::rotate_worker`]); `None` in a kernel that reads no quota.
@@ -69,6 +75,19 @@ pub(super) trait AgyKernel: Kernel {
         _flags: &[String],
     ) -> Option<crate::harness::agy_quota::Pick> {
         None
+    }
+
+    /// [`Self::quota_pick`] with `at_wall` (`true` when `agy` is stopped at a quota wall on
+    /// screen: [`crate::harness::agy_quota_store::rotate_worker_at`]).
+    fn quota_pick_at(
+        &self,
+        model: Option<&str>,
+        exe: &Path,
+        env: &[(String, String)],
+        flags: &[String],
+        _at_wall: bool,
+    ) -> Option<crate::harness::agy_quota::Pick> {
+        self.quota_pick(model, exe, env, flags)
     }
 }
 
@@ -84,12 +103,24 @@ impl AgyKernel for Live {
         env: &[(String, String)],
         flags: &[String],
     ) -> Option<crate::harness::agy_quota::Pick> {
-        crate::harness::agy_quota_store::rotate_worker(
+        self.quota_pick_at(model, exe, env, flags, false)
+    }
+
+    fn quota_pick_at(
+        &self,
+        model: Option<&str>,
+        exe: &Path,
+        env: &[(String, String)],
+        flags: &[String],
+        at_wall: bool,
+    ) -> Option<crate::harness::agy_quota::Pick> {
+        crate::harness::agy_quota_store::rotate_worker_at(
             model,
             exe,
             env,
             flags,
             crate::supervise::limit::unix_now(),
+            at_wall,
         )
         .map(|l| l.pick)
     }
@@ -390,14 +421,25 @@ pub(super) fn snapshot(
     })
 }
 
-/// The word the exit of `snap`'s agy left ([`ag::exit_kind`]), or `None` while no status is drawn.
-fn shell_word(opts: &Opts, snap: &super::super::relaunch::Snapshot) -> Option<ExitKind> {
-    let run = snap.agy()?;
-    let status = connect(opts, &snap.tab)
-        .ok()
-        .and_then(|mut c| exit_status(&mut c, &snap.tab, run.block))?;
+/// The word the exit of `snap`'s agy left ([`ag::exit_kind`]), or `None` while no status is drawn;
+/// [`NoSocket`] where the window left the read unanswered.
+fn shell_word(
+    opts: &Opts,
+    snap: &super::super::relaunch::Snapshot,
+) -> Result<Option<ExitKind>, NoSocket> {
+    let Some(run) = snap.agy() else {
+        return Ok(None);
+    };
+    let mut c = connect(opts, &snap.tab).map_err(|_| NoSocket)?;
+    let Some(status) = exit_status(&mut c, &snap.tab, run.block) else {
+        return if c.reply_unread() {
+            Err(NoSocket)
+        } else {
+            Ok(None)
+        };
+    };
     let left = crash_left(&run.config, snap.pid, run.crash.as_deref(), run.started_ms);
-    Some(ag::exit_kind(status, left))
+    Ok(Some(ag::exit_kind(status, left)))
 }
 
 /// One look at an agy that left its tab ([`super::super::relaunch::exit_record`]).
@@ -411,7 +453,7 @@ pub(super) fn look_at_exit(
     let word = if running {
         None
     } else {
-        shell_word(opts, snap)
+        shell_word(opts, snap).ok().flatten()
     };
     super::super::relaunch::ExitLook {
         running,
@@ -559,7 +601,10 @@ pub(super) fn after_exit_onto(
             if relaunched_before {
                 Some(ExitKind::Crashed)
             } else {
-                shell_word(opts, snap)
+                match shell_word(opts, snap) {
+                    Ok(word) => word,
+                    Err(NoSocket) => return said(r, "wait:no-socket"),
+                }
             }
         }
         ExitRecord::Unread | ExitRecord::Survived(_) => None,
@@ -676,12 +721,27 @@ fn expired(st: &St, now: u64, k: &dyn AgyKernel) -> Option<(&'static str, String
             "shell-gone",
             "the shell that ran agy is gone: there is no prompt to relaunch at".to_owned(),
         )),
-        Phase::Relaunched { at_s } if now.saturating_sub(at_s) > STALE_S => Some((
-            "no-resume",
-            "the relaunched agy never came up in the tab".to_owned(),
-        )),
+        // A carry-on an agy that is up has not taken yet stays owed however long what holds it
+        // stands (a draft, Off, a box): this bound is of one that never came up.
+        Phase::Relaunched { at_s }
+            if now.saturating_sub(at_s) > STALE_S && !relaunch_present(st, k) =>
+        {
+            Some((
+                "no-resume",
+                "the relaunched agy never came up in the tab".to_owned(),
+            ))
+        }
         _ => None,
     }
+}
+
+/// Whether the agy the relaunch line started is up: found already and alive, or a child of the
+/// line's shell no look has found yet.
+fn relaunch_present(st: &St, k: &dyn AgyKernel) -> bool {
+    relaunched_lives(st, k)
+        || k.agy_children(st.shell)
+            .into_iter()
+            .any(|(pid, argv)| k.alive(pid) && relaunched_by_us(pid, &argv, st, k))
 }
 
 /// The presence lock of the conversation `st` relaunches, under the config it
@@ -744,6 +804,7 @@ pub(super) fn plan(opts: &Opts, st: &St, k: &dyn AgyKernel) -> Result<Plan, NoPl
         detail: e,
     })?;
     Ok(Plan {
+        command: None,
         shell: st.shell,
         dialect,
         line,
@@ -824,8 +885,9 @@ fn relaunch_held(
         || free(k),
         |c, pid, tab| k.in_tab(c, pid, tab),
     );
+    let unanswered = typed == Err(RelaunchLineError::Unanswered);
     match typed {
-        Ok(()) => st.prompt = None,
+        Ok(()) | Err(RelaunchLineError::Unanswered) => st.prompt = None,
         Err(RelaunchLineError::Wait(why)) => {
             st.note_wait(why, now_s());
             return said(r, format!("wait:{why}"));
@@ -853,6 +915,10 @@ fn relaunch_held(
         &format!("{} (resume)", st.line),
     );
     save(opts, &key(&tab), st);
+    if unanswered {
+        // The line may have run: the next step, on a new connection, reads what it started.
+        return said(r, "wait:unanswered");
+    }
     await_held(opts, r, st, c, hand, k)
 }
 
@@ -1195,11 +1261,27 @@ fn type_text(c: &mut Client, tab: &str, text: &str, generation: Option<&str>) ->
         .request_counted(&format!(
             "@{tab} turn {fence}submit=guarded:{guard} idle=600 {TURN_WAIT} {text}"
         ))
-        .map_err(|e| Typed::Refused(format!("{e}")))?;
+        .map_err(|e| Typed::of_io(&e))?;
     turn_verdict(&head)
 }
 
-/// Carry on with the relaunched TUI `new` once its composer is drawn and it holds its conversation's lock.
+/// The outcome line of a relaunch agy's quota moved onto another model.
+fn rotated_outcome(st: &St, tail: &str) -> Option<String> {
+    st.cause
+        .strip_prefix(super::super::relaunch::CAUSE_MODEL)
+        .filter(|m| !m.is_empty())
+        .map(|model| {
+            format!(
+                "agy moved onto {model} by its quota (on {}) · the same conversation resumed{tail}",
+                st.to
+            )
+        })
+}
+
+/// Carry the relaunched TUI `new`, or record a quiet upgrade without typing. Under Cruise and Land
+/// alike the prompt goes once the current composer, custody, settling, person-hold, foreground and
+/// who-spoke-first checks pass, with Cruise's done check under Cruise alone; a reply that defends
+/// its work leaves the point to Land's loop ([`super::super::relaunch::landing`]).
 #[allow(clippy::too_many_arguments)]
 fn carry_on(
     opts: &Opts,
@@ -1213,68 +1295,159 @@ fn carry_on(
     found(st, new, k);
     r.pid = new;
     let tab = st.tab.clone();
+    let land = !st.quiet && super::super::relaunch::carries_under_land(opts, c, &tab);
     let up = wait_until(opts.timings.agy_up, || {
         if let Some(h) = hand.as_deref_mut() {
             h.keep(c);
         }
-        screen(c, &tab).is_some_and(|s| aterm_phase::agy::composer(&s.rows).is_some())
-    });
+        c.reply_unread()
+            || screen(c, &tab).is_some_and(|s| aterm_phase::agy::composer(&s.rows).is_some())
+    }) && !c.reply_unread();
+    // A live agy whose composer is not drawn owes the carry-on under Cruise as under Land: a box
+    // there stands as a draft does, and a boot ends. Cruise gives it up only for an agy that is gone.
+    if !up && !st.quiet && (land || (k.alive(new) && !c.reply_unread())) {
+        return said(
+            r,
+            if c.reply_unread() {
+                "wait:no-socket"
+            } else if !k.alive(new) {
+                "wait:resume"
+            } else if matches!(typing_fence(c, &tab), Err("box")) {
+                "wait:box"
+            } else {
+                "wait:composer"
+            },
+        );
+    }
     let mut typed = false;
     let mut holds = false;
+    let mut claim = (false, false);
     if up {
         holds = takes_lock(opts, st, c, new, k, hand.as_deref_mut());
-        if !holds && k.alive(new) {
+        if c.reply_unread() {
+            return said(r, "wait:no-socket");
+        }
+        if !holds && k.alive(new) && (!land || st.resumed_pid != new) {
             return started_fresh(opts, r, st, new);
         }
+        if land && !holds {
+            return said(
+                r,
+                if k.alive(new) {
+                    "wait:session-lock"
+                } else {
+                    "wait:resume"
+                },
+            );
+        }
+        // Nothing is typed over unsent input, and the carry-on is not given up for it: what stands
+        // in the composer keeps it owed ([`super::super::relaunch::settled_for_carry`]).
         let settled = !st.quiet
-            && wait_until(opts.timings.carry_settle, || {
-                if let Some(h) = hand.as_deref_mut() {
-                    h.keep(c);
-                }
-                typing_fence(c, &tab).is_ok()
-            });
-        if settled && held(c, &tab, opts.human_grace_s) {
-            return said(r, "wait:held");
+            && match super::super::relaunch::settled_for_carry(
+                opts.timings.carry_settle,
+                c,
+                |c| typing_fence(c, &tab),
+                |c| {
+                    if let Some(h) = hand.as_deref_mut() {
+                        h.keep(c);
+                    }
+                },
+            ) {
+                Ok(settled) => settled,
+                Err(word) => return said(r, word),
+            };
+        if !st.quiet && !settled && !c.reply_unread() {
+            return said(r, "wait:unsettled");
+        }
+        if settled && super::super::relaunch::tab_off(c, &tab) {
+            return said(r, "wait:off");
+        }
+        // The person's hour, read off the same `status` as the hold, cuts the go-ahead's
+        // sentence from a carried done check ([`super::super::relaunch::carried_text`]).
+        let hour = match settled.then(|| unheld_hour(c, &tab, opts.human_grace_s)) {
+            Some(None) => return said(r, "wait:held"),
+            Some(Some(hour)) => hour,
+            None => true,
+        };
+        let since = super::super::relaunch::prompts_from(st);
+        if settled
+            && let Some(prompts) = k.prompts_since(st, since)
+            && let Some(r) = super::super::relaunch::reached_first(opts, &r, st, new, &prompts)
+        {
+            return r;
         }
         if settled && k.in_tab(c, new, &tab) {
-            let text =
-                super::super::relaunch::resumed_prompt_as(Agent::Agy.product(), &st.to, &st.cause);
+            let rows = screen(c, &tab).map(|s| s.rows);
+            let program = aterm_phase::Program::Agy;
+            if land
+                && rows
+                    .as_deref()
+                    .is_some_and(|rows| super::super::relaunch::defended_on_screen(program, rows))
+            {
+                return super::super::relaunch::landing(opts, r, st, new);
+            }
+            // Under Land the restart's facts are typed without Cruise's done check.
+            claim = if land {
+                (false, false)
+            } else {
+                rows.as_deref().map_or((false, false), |rows| {
+                    super::super::relaunch::said_on_screen(program, rows)
+                })
+            };
+            let text = super::super::relaunch::carried_text(
+                super::super::relaunch::resumed_prompt_as(Agent::Agy.product(), &st.to, &st.cause),
+                claim,
+                hour,
+            );
             let tries = under_hand(c, &tab, hand, |c| {
-                for _ in 0..3 {
-                    let Ok(generation) = typing_fence(c, &tab) else {
-                        break;
-                    };
-                    match type_text(c, &tab, &text, generation.as_deref()) {
-                        Ok(()) => {
-                            typed = true;
-                            break;
-                        }
-                        Err(Typed::Changed | Typed::Yielded) => {
-                            pause(Duration::from_millis(400));
-                        }
-                        Err(Typed::Cut(_) | Typed::Refused(_)) => break,
-                    }
-                }
+                super::super::relaunch::type_carry(
+                    c,
+                    |c| typing_fence(c, &tab),
+                    |c, generation| type_text(c, &tab, &text, generation),
+                    Duration::from_millis(400),
+                )
             });
-            if tries.is_none() {
-                return said(r, "wait:held");
+            match tries {
+                None => return said(r, "wait:held"),
+                Some(Continued::Typed) => typed = true,
+                Some(Continued::Not) => {}
+                Some(Continued::Stands(word)) => return said(r, word),
+                // A line unanswered is read for what it did before it is typed again; a later look
+                // reads it the same way ([`super::super::relaunch::reached_first`]).
+                Some(Continued::Unanswered) => {
+                    if !wait_until(opts.timings.first_idle, || {
+                        k.prompts_since(st, since).is_some_and(|prompts| {
+                            prompts
+                                .iter()
+                                .any(|p| super::super::relaunch::harness_prompt(p))
+                        })
+                    }) {
+                        return said(r, "wait:unanswered");
+                    }
+                    typed = true;
+                }
             }
         }
+    }
+    // A carry that typed nothing because the socket left a reply unread is asked again at the
+    // next step, on a new connection.
+    if !typed && c.reply_unread() {
+        return said(r, "wait:no-socket");
+    }
+    if land && !typed {
+        return said(r, "wait:resume");
     }
     st.phase = Phase::Done;
     st.resumed_pid = new;
     st.resumed_on.clone_from(&st.to);
     st.done_at = now_s();
-    let rotated = st
-        .cause
-        .strip_prefix(super::super::relaunch::CAUSE_MODEL)
-        .filter(|m| !m.is_empty());
-    st.outcome = if let Some(model) = rotated {
-        format!(
-            "agy moved onto {model} by its quota (on {}) · the same conversation resumed, \
-             nothing typed",
-            st.to
-        )
+    let rotated_tail = if st.quiet && !typed {
+        ", nothing typed"
+    } else {
+        ""
+    };
+    st.outcome = if let Some(rotated) = rotated_outcome(st, rotated_tail) {
+        rotated
     } else if st.quiet {
         format!(
             "agy upgraded to {} (from {}) · the same conversation resumed, nothing typed",
@@ -1286,7 +1459,7 @@ fn carry_on(
     let step = if !up {
         "done:unconfirmed"
     } else if typed {
-        "continued"
+        super::super::relaunch::continued_word(claim.0)
     } else if st.quiet && holds {
         "done:resumed"
     } else if st.quiet {

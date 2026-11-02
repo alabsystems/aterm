@@ -5,8 +5,9 @@
 
 use super::{MACOS_HOSTS, Pin, Provider, Tool, When};
 
-/// A program macOS (or, for a Linux or Windows lane, that OS) ships: spawned by absolute
-/// path where the code has one.
+/// A program macOS (or, for a Linux lane, Linux) ships: spawned by absolute path where the
+/// code has one. Windows ships none of these: a Windows path in `at` is where its usual
+/// third-party copy lives.
 const fn os(name: &'static str, at: &'static [&'static str], why: &'static str) -> Tool {
     Tool {
         name,
@@ -15,6 +16,20 @@ const fn os(name: &'static str, at: &'static [&'static str], why: &'static str) 
         missing: None,
         pin: None,
         provider: Provider::Os,
+        in_guest: false,
+    }
+}
+
+/// A program Windows ships, found on `PATH` there.
+const fn windows(name: &'static str, why: &'static str) -> Tool {
+    Tool {
+        name,
+        why,
+        at: &[],
+        missing: None,
+        pin: None,
+        provider: Provider::Windows,
+        in_guest: false,
     }
 }
 
@@ -27,6 +42,7 @@ const fn clt(name: &'static str, at: &'static [&'static str], why: &'static str)
         missing: None,
         pin: None,
         provider: Provider::Clt,
+        in_guest: false,
     }
 }
 
@@ -39,6 +55,7 @@ const fn toolset(name: &'static str, program: &'static str, why: &'static str) -
         missing: None,
         pin: None,
         provider: Provider::Toolset { program },
+        in_guest: false,
     }
 }
 
@@ -58,6 +75,7 @@ const fn workspace(
         missing: None,
         pin,
         provider: Provider::Workspace { when },
+        in_guest: false,
     }
 }
 
@@ -70,6 +88,7 @@ const fn release_host(name: &'static str, at: &'static [&'static str], why: &'st
         missing: None,
         pin: None,
         provider: Provider::ReleaseHost,
+        in_guest: false,
     }
 }
 
@@ -82,6 +101,7 @@ const fn guest(name: &'static str, at: &'static [&'static str], why: &'static st
         missing: None,
         pin: None,
         provider: Provider::Guest,
+        in_guest: false,
     }
 }
 
@@ -100,6 +120,16 @@ const fn unprovided(
         missing: None,
         pin: None,
         provider: Provider::Unprovided { because },
+        in_guest: false,
+    }
+}
+
+/// `tool`, a [`Provider::Workspace`] row whose pin the Linux guest's provisioning builds too, at
+/// the first of its `at` (`aterm-lab`'s `linux_guest::provision_plan`).
+const fn in_guest(tool: Tool) -> Tool {
+    Tool {
+        in_guest: true,
+        ..tool
     }
 }
 
@@ -120,6 +150,7 @@ const fn hardware(name: &'static str, what: &'static str, why: &'static str) -> 
         missing: None,
         pin: None,
         provider: Provider::Hardware(what),
+        in_guest: false,
     }
 }
 
@@ -140,7 +171,7 @@ pub const TOOLS: &[Tool] = &[
         "a shell aterm integrates: macOS's 3.2 is what people run, so the bash integration's tests \
          run it; on Windows, Git for Windows' bash, the one Claude Code's Bash tool runs",
     ),
-    workspace(
+    in_guest(workspace(
         "bash-5.3",
         When::Always,
         Some(Pin {
@@ -150,12 +181,13 @@ pub const TOOLS: &[Tool] = &[
             built: true,
             hosts: MACOS_HOSTS,
         }),
-        &[],
+        &["/usr/local/bin/bash-5.3"],
         "the bash integration's 5.3 paths (the `${ ...; }` reads, PS0's file-free hook) run only \
          on a bash 5.3 or later, the bash people install beside macOS's 3.2, which never takes \
          them: only a 5.3 can judge them. On macOS `verify provision` builds GNU's 5.3 with its \
-         official patches from source",
-    ),
+         official patches from source (`aterm_uds::host::bash`), and the Linux guest builds the \
+         same as /usr/local/bin/bash-5.3",
+    )),
     guest(
         "bash-3.2",
         &["/usr/local/bin/bash-3.2", "/bin/bash"],
@@ -170,8 +202,12 @@ pub const TOOLS: &[Tool] = &[
             "/usr/bin/zsh",
             "/usr/local/bin/zsh",
             "/opt/homebrew/bin/zsh",
+            r"C:\Program Files\Git\usr\bin\zsh.exe",
+            r"C:\msys64\usr\bin\zsh.exe",
         ],
-        "macOS's login shell, which aterm integrates; the zsh integration and the live headless tests run it",
+        "macOS's login shell, which aterm integrates; the zsh integration and the live headless \
+         tests run it. On Windows, MSYS2's zsh, unpacked into Git for Windows or in MSYS2's own \
+         tree: Claude Code's Bash tool runs it there only when CLAUDE_CODE_SHELL names it",
     ),
     workspace(
         "fish",
@@ -441,8 +477,10 @@ pub const TOOLS: &[Tool] = &[
     ),
     os(
         "web2",
-        &["/usr/share/dict/web2"],
-        "a word list, the fixture of the text and search tests (row 5)",
+        &["/usr/share/dict/web2", r"C:\usr\share\dict\web2"],
+        "Webster's Second, the word list aterm-lexicon's dictionary gates are curated against, so \
+         another list decides nothing; macOS ships it, and the Linux and Windows lanes lay the \
+         Mac's copy (row 5)",
     ),
     os(
         "curl",
@@ -697,34 +735,28 @@ pub const TOOLS: &[Tool] = &[
         &["/usr/bin/systemd-analyze"],
         "the Linux publishing lane checks its units",
     ),
-    os(
+    windows(
         "cmd",
-        &[],
         "Windows' shell, for the Windows spawn and shell-integration tests",
     ),
-    os(
+    windows(
         "wsl.exe",
-        &[],
         "the WSL bridge of the Windows shell-integration tests",
     ),
-    os(
+    windows(
         "notepad.exe",
-        &[],
         "opens a file for the person on Windows (the messages host)",
     ),
-    os(
+    windows(
         "reg",
-        &[],
         "the perf trend's machine id on Windows (MachineGuid)",
     ),
-    os(
+    windows(
         "certutil",
-        &[],
         "a file's sha256 on Windows (`certutil -hashfile`)",
     ),
-    os(
+    windows(
         "ping",
-        &[],
         "a child that runs until it is stopped, for the quit-safety and settings tests",
     ),
     clt(
@@ -940,18 +972,30 @@ pub const TOOLS: &[Tool] = &[
         "zstd",
         &["/opt/homebrew/bin/zstd", "/usr/local/bin/zstd"],
         "it is the outside reference the tests judge aterm-zstd's encoder by, so aterm builds no \
-         copy; nothing packs or ships with it (row 18)",
+         copy; the publication engine also uses it to scan compressed files (row 18)",
         "the oracle aterm-zstd's encoder is held to: its -t and -d of the encoder's frames, and \
          its -19 sizes, which level 19 stays within 3% of (tests/encode_cli.rs); and the one \
-         producer test that decodes a pack with it; no lane or publish host runs it (row 18)",
+         producer test that decodes a pack with it; the publication engine decodes compressed \
+         files before scanning their plaintext (row 18)",
     ),
-    unprovided(
+    workspace(
         "gitleaks",
+        When::Always,
+        Some(Pin {
+            package: "gitleaks",
+            version: "8.30.1",
+            exe: "gitleaks",
+            built: false,
+            hosts: &[
+                "macos-aarch64",
+                "macos-x86_64",
+                "linux-aarch64",
+                "linux-x86_64",
+            ],
+        }),
         &[],
-        "it is the publication engine's own dependency, put on the PATH `pub stage` runs with \
-         (row 19)",
-        "the publication engine's own guard in `pub stage` and `ship check --export`; aterm never \
-         runs it (row 19)",
+        "the publication engine's required secret scanner in `pub stage` and `ship check --export` \
+         (row 19); developer init provisions the pinned binary",
     ),
     release_host(
         "pub",

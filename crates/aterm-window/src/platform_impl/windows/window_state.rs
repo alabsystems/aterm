@@ -28,6 +28,12 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 pub(crate) struct WindowState {
     pub mouse: MouseProperties,
 
+    /// LOCAL PATCH (aterm): the least client area (`Window::set_min_inner_size`), which
+    /// `WM_GETMINMAXINFO` answers at the window's DPI ([`crate::min_track`]).
+    pub min_size: Option<Size>,
+    /// LOCAL PATCH (aterm): a scale change (`WM_DPICHANGED`) is being applied: the client area is
+    /// still the old scale's until its new rectangle is set ([`crate::min_track::Standing`]).
+    pub rescaling: bool,
     pub resize_increments: Option<Size>,
 
     pub window_icon: Option<Icon>,
@@ -125,6 +131,8 @@ impl WindowState {
                 last_position: None,
             },
 
+            min_size: attributes.min_inner_size,
+            rescaling: false,
             resize_increments: None,
 
             window_icon: attributes.window_icon.clone(),
@@ -370,6 +378,16 @@ impl WindowFlags {
         let outer_y = (rect.top - rect.bottom).abs();
 
         PhysicalSize::new(outer_x as _, outer_y as _)
+    }
+
+    /// LOCAL PATCH (aterm): the width and height the window's frame and caption add around its
+    /// client area at its DPI: an empty client rectangle adjusted (none where that fails), so a
+    /// client size past a rectangle's reach is never cast into one ([`crate::min_track`]).
+    pub fn frame_size(self, hwnd: HWND) -> PhysicalSize<u32> {
+        let empty = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        let rect = self.adjust_rect(hwnd, empty).unwrap_or(empty);
+        let side = |near: i32, far: i32| u32::try_from(far.saturating_sub(near)).unwrap_or(0);
+        PhysicalSize::new(side(rect.left, rect.right), side(rect.top, rect.bottom))
     }
 
     pub fn set_size(self, hwnd: HWND, size: PhysicalSize<u32>) {

@@ -13,7 +13,7 @@ use crate::wall::{Placement, Wall, WallKind, classify_wall};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 6, "0.6");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 7, "0.7");
 
 /// The worker's phase.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +65,23 @@ fn is_spinner_glyph(g: char) -> bool {
             && !g.is_alphanumeric())
 }
 
+/// Claude Code's window title says its REPL is busy: one of the two frames it flips while busy
+/// (`title.running`), a blank, then the title. At rest the title leads with `title.rest` (`✳`).
+/// This is the one reading of a running turn that a status line leaves: with one set, the footer
+/// drops `esc to interrupt`, and the spinner row goes once the reply's first line is drawn.
+/// Claude Code writes no title where its title is off (`CLAUDE_CODE_DISABLE_TERMINAL_TITLE`),
+/// leads it with no glyph where its status goes to the terminal's tab instead
+/// (`showStatusInTerminalTab`, or a terminal that answers its OSC 7501 program-status probe), and
+/// holds it at `title.rest` under a terminal multiplexer: there no title says it runs.
+#[must_use]
+pub fn title_runs(title: &str) -> bool {
+    let mut chars = title.chars();
+    chars
+        .next()
+        .is_some_and(|c| const { crate::anchor!("title.running") }.contains(c))
+        && chars.next() == Some(' ')
+}
+
 /// A box-drawing character (U+2500–U+257F: `│`, `─`, `╌`, `╭` …), the layout's own strokes.
 #[inline]
 const fn is_box_drawing(g: char) -> bool {
@@ -107,7 +124,7 @@ pub fn worker_phase(rows: &[String]) -> Phase {
     if let Some((message, reset)) = limit_notice(rows) {
         return Phase::Limited { message, reset };
     }
-    if last_said_row(rows).is_some_and(|r| crate::text::trim_end(r).ends_with('?')) {
+    if asked_in_prose(rows) {
         return Phase::Question;
     }
     if let Some(b) = busy.filter(|b| b.soft)
@@ -297,11 +314,22 @@ pub fn status_unseen(rows: &[String]) -> bool {
 
 /// A done row that says work is `still running` under any label.
 fn left_running(row: &str) -> bool {
-    row.split(" · ").skip(1).any(|item| {
+    done_items(row).any(|item| {
         crate::text::trim_end(item)
             .strip_suffix(" still running")
             .is_some_and(|label| !crate::text::trim(label).is_empty())
     })
+}
+
+/// A done row's ` · ` items after the first, read up to the side panel's rule: Claude Code 2.1.310
+/// and later pad each row of the live zone out to a `│` and draw the panel's own text after it
+/// (`claude-2.1.316-waiting-agents-and-workflows-turn-over-panel.txt`), and no done row's own
+/// words hold one.
+fn done_items(row: &str) -> impl Iterator<Item = &str> {
+    row.split_once('│')
+        .map_or(row, |(live, _)| live)
+        .split(" · ")
+        .skip(1)
 }
 
 /// A footer row whose pill counts background work under any label.
@@ -350,6 +378,17 @@ fn background_wall(rows: &[String], busy: Busy) -> Option<Wall> {
     Some(crate::wall::memory_wall(rows).unwrap_or(wall))
 }
 
+/// Claude Code's done row (`✻ Brewed for 6s · done 3:32 PM`) stands between its reply and the
+/// composer: the turn's end, drawn on the screen. Claude Code draws it once the turn is over, in
+/// the frame that draws the reply's last line or a later one (2.1.311 lab `mr`: the last line,
+/// held back while the reply streamed, and the done row came in one frame, 23 ms after the
+/// title rested). A turn can end with none, as where `showTurnDuration` is off or where it was
+/// interrupted.
+#[must_use]
+pub fn done_row_drawn(rows: &[String]) -> bool {
+    turn_over(rows)
+}
+
 /// The status row above the composer is a done row.
 fn turn_over(rows: &[String]) -> bool {
     composer_frame(rows).is_some_and(|f| {
@@ -374,6 +413,57 @@ pub fn background_only(rows: &[String]) -> bool {
         && busy_signal(rows).is_some_and(|b| BACKGROUND_RULES.contains(&b.rule))
         && no_live_turn(rows)
         && !turn_just_begun(rows)
+}
+
+/// THE TURN OVER UNDER THE AGENT'S OWN BACKGROUND WORK: the phase a screen [`worker_phase`] reads
+/// busy rests at when that busy is the agent's own background work alone ([`background_only`]: a
+/// dynamic workflow, a background agent, a shell or a monitor it left running, under a composer
+/// that takes the next message, no live turn on the screen): a question it asked (its last words
+/// end in `?`), or idle. `None` for every other screen, a live turn's among them.
+///
+/// Measured on Claude Code 2.1.310 (the cruise stall of 2026-10-24..27): its transcript writes a
+/// `turn_duration` row with `pendingWorkflowCount` where the reply stops over such work, and each
+/// later wake (`<task-notification>`) runs a turn of its own with its own `turn_duration` row.
+/// That stop is a turn's end, though no done row is drawn until nothing is pending (`turn_over`,
+/// whose done row times the whole chain from the person's message).
+///
+/// Two screens give no rest, as measured on Claude Code 2.1.283:
+/// - a notice under the composer or in a banner over a status row that is no done row: the vendor
+///   draws it while the turn wraps up, and the turn ends later (`background_wall` declines it
+///   for the same reason; `claude-2.1.283-wall-session-wrapup-waiting-measured.txt`);
+/// - `◎ /goal active` ([`crate::goal_active`]), opening its row or as the rightmost item of
+///   another (run into 2.1.283's update hint, at the right end of 2.1.311's footer): Claude Code's
+///   goal runs on through the wait by its own check-ins, its done row timing it whole
+///   (`claude-2.1.283-wall-session-goal-checkin-shell-measured.txt`).
+///
+/// The phase stays [`Phase::Busy`] there, because the work runs on and wakes the agent when it
+/// ends, and the supervisor's background breaks read it so; this is what the turn's end was, for
+/// the published `agent=` word and the turns of the session log, which close at it.
+#[must_use]
+pub fn background_rest(rows: &[String]) -> Option<Phase> {
+    if worker_phase(rows) != Phase::Busy
+        || !background_only(rows)
+        || crate::turn::goal_active(rows)
+        || notice(rows).is_some()
+    {
+        return None;
+    }
+    Some(if asked_in_prose(rows) {
+        Phase::Question
+    } else {
+        Phase::Idle
+    })
+}
+
+/// Whether the worker asked in prose: the last row it said ([`last_said_row`]) ends in `?`, and
+/// is not Claude Code's notice that a person stopped the turn with Esc
+/// ([`crate::turn::interrupt_notice`]). That notice ends in the vendor's question to the person
+/// (`What should Claude do instead?`), and the turn it ends is the person's (fix J2-4, measured
+/// on 2.1.316 after a declined approval box: `claude-2.1.316-box-bash-declined-esc.txt`).
+fn asked_in_prose(rows: &[String]) -> bool {
+    last_said_row(rows).is_some_and(|r| {
+        crate::text::trim_end(r).ends_with('?') && !crate::turn::interrupt_notice(r)
+    })
 }
 
 /// How many background shells Claude Code's screen counts.
@@ -437,6 +527,68 @@ pub fn background_wait(rows: &[String]) -> Option<&'static str> {
     }
     let busy = busy_signal(rows)?;
     BACKGROUND_RULES.contains(&busy.rule).then_some(busy.rule)
+}
+
+/// The [`BACKGROUND_RULES`] of work Claude Code runs in its own process (a dynamic workflow, a
+/// background agent, other work it waits for), which its status row names only while that work
+/// is pending: `Waiting for …`, the wait it carries above its own wake ([`carried_wait`]) and a
+/// done row's `… still running`. A footer's progress row or count is not one: measured on
+/// 2.1.304, a workflow's progress row stays drawn at its full bar after the workflow ended
+/// (`claude-2.1.304-agents-panel-workflow-done-3m20s-120col.txt`).
+pub const IN_PROCESS_RULES: [&str; 4] = [
+    "waiting for a dynamic workflow",
+    "waiting for a background agent",
+    "waiting for background work",
+    "background work still running",
+];
+
+/// THE WORK CLAUDE CODE RUNS IN ITS OWN PROCESS, PENDING: the [`IN_PROCESS_RULES`] rule its status
+/// row's own words read (its `Waiting for …`, the wait it carries above its own wake with no
+/// status row drawn, a done row's `… still running` naming more than shells and monitors), read
+/// whatever rule [`busy_signal`] reads first. That reader stops at its first rule, and a footer's
+/// (a workflow's progress row, a shell count) comes ahead of the carried wait and the done row,
+/// as the status row's own shell rule comes ahead of the agents a done row lists with a shell:
+/// its one rule can hide this work, which a restart would end and no process row names. `None`
+/// with no composer frame or a message submitted under the status row ([`background_wait`]'s
+/// bounds).
+#[must_use]
+pub fn in_process_work(rows: &[String]) -> Option<&'static str> {
+    let frame = composer_frame(rows)?;
+    if turn_just_begun(rows) {
+        return None;
+    }
+    let Some(line) = status_block(rows, frame.top).line(rows) else {
+        return carried_wait(rows, frame.top).then_some(CARRIED.rule);
+    };
+    status_busy(&line)
+        .filter(|rule| IN_PROCESS_RULES.contains(rule))
+        .or_else(|| {
+            (is_done_row(&line) && left_in_process(&line))
+                .then_some("background work still running")
+        })
+}
+
+/// A done row that says work other than shells and monitors (the process table's) is `still
+/// running`: some ` · ` item's label ([`done_items`]) is more than `N shell(s)` and `N
+/// monitor(s)` parts.
+fn left_in_process(row: &str) -> bool {
+    let process_work = |part: &str| {
+        crate::text::trim(part)
+            .split_once(' ')
+            .is_some_and(|(count, noun)| {
+                !count.is_empty()
+                    && count.bytes().all(|b| b.is_ascii_digit())
+                    && matches!(noun, "shell" | "shells" | "monitor" | "monitors")
+            })
+    };
+    done_items(row).any(|item| {
+        crate::text::trim_end(item)
+            .strip_suffix(" still running")
+            .is_some_and(|label| {
+                let label = crate::text::trim(label);
+                !label.is_empty() && !label.split(", ").all(process_work)
+            })
+    })
 }
 
 /// The [`BACKGROUND_RULES`] of a SHELL or a monitor the turn left running.
@@ -3123,6 +3275,60 @@ mod tests {
         assert_eq!(worker_phase(&r), Phase::Prompt);
     }
 
+    /// A person's Esc is no question: after a declined approval box (2.1.316) and on the vendor's
+    /// retry row (2.1.301), Claude Code writes `⎿  Interrupted · What should Claude do instead?`
+    /// under what it cut short and returns to an idle composer. The last row said ends in `?`,
+    /// but the question is the vendor's to the person: the worker is idle, and a turn a person
+    /// stopped over its own background shells rests idle. An agent's own `?` still reads
+    /// `question`.
+    #[test]
+    fn a_persons_esc_is_no_question() {
+        for (name, text) in [
+            (
+                "claude-2.1.316-box-bash-declined-esc.txt",
+                crate::prompt::fixtures::BOX_BASH_DECLINED_ESC_2_1_316,
+            ),
+            (
+                "claude-2.1.301-wall-watchdog-midturn-esc.txt",
+                crate::prompt::fixtures::WALL_WATCHDOG_MIDTURN_ESC_2_1_301,
+            ),
+        ] {
+            let rows = crate::prompt::fixtures::screen(text);
+            assert!(
+                last_said_row(&rows).is_some_and(crate::turn::interrupt_notice),
+                "{name}: the last row said is the vendor's notice"
+            );
+            assert!(crate::turn::interrupted(&rows), "{name}: interrupted");
+            assert_eq!(worker_phase(&rows), Phase::Idle, "{name}");
+        }
+        let asked = screen(
+            &[
+                "⏺ Should I delete the old logs?",
+                "",
+                "✻ Brewed for 0s · done 10:46 AM",
+                "",
+            ],
+            "  ⏸ manual mode on · ? for shortcuts",
+        );
+        assert_eq!(worker_phase(&asked), Phase::Question, "the agent's own ask");
+        let shells = crate::prompt::fixtures::screen(crate::prompt::fixtures::IDLE_SHELLS_2_1_271);
+        let said = shells
+            .iter()
+            .position(|x| x.ends_with("when they notify."))
+            .expect("the last said row");
+        let mut stopped = shells.clone();
+        stopped.insert(
+            said + 1,
+            "  ⎿  Interrupted · What should Claude do instead?".to_string(),
+        );
+        assert!(
+            last_said_row(&stopped).is_some_and(crate::turn::interrupt_notice),
+            "the notice is the last row said"
+        );
+        assert_eq!(worker_phase(&stopped), Phase::Busy, "its shells run on");
+        assert_eq!(background_rest(&stopped), Some(Phase::Idle));
+    }
+
     #[test]
     fn question_reads_the_last_said_row_only() {
         let earlier = screen(
@@ -3831,6 +4037,225 @@ mod tests {
             assert_eq!(reader.phase(&bare), Phase::Idle);
             assert_eq!(reader.background_wait(&bare), None);
         }
+    }
+
+    /// The screen of a live Claude Code 2.1.310 session whose turn ended (its transcript wrote
+    /// `turn_duration` with `pendingWorkflowCount: 3`) while three dynamic workflows it started run
+    /// on, captured read-only from the tab the cruise stall of 2026-10-24..27 was measured on: the
+    /// phase stays busy (the work runs on and wakes the agent), and the turn's end rests idle.
+    #[test]
+    fn claude_2_1_310_turn_over_under_its_workflows_rests_idle() {
+        use crate::prompt::fixtures::WAITING_WORKFLOWS_2_1_310 as TEXT;
+        use crate::reader::{Program, identify};
+        let r = crate::prompt::fixtures::screen(TEXT);
+        let waiting = "✻ Waiting for 3 dynamic workflows to finish";
+        let at = r
+            .iter()
+            .position(|x| x.starts_with(waiting))
+            .expect("the waiting row");
+        assert_eq!(worker_phase(&r), Phase::Busy);
+        assert_eq!(
+            signal(&r).as_deref(),
+            Some("status row: waiting for a dynamic workflow")
+        );
+        assert!(background_only(&r));
+        assert_eq!(background_rest(&r), Some(Phase::Idle));
+        for reader in [identify(Some("claude"), &r), identify(Some("node"), &r)] {
+            assert_eq!(reader.program(), Program::Claude);
+            assert_eq!(reader.phase(&r), Phase::Busy, "the supervisor's break");
+            assert_eq!(reader.background_rest(&r), Some(Phase::Idle));
+        }
+
+        // NEGATIVE CONTROLS: the same screen with a live turn on it is no turn end, whatever
+        // background work its pills count.
+        let row = |text: &str| {
+            let mut s = r.clone();
+            let (head, panel) = r[at].split_once('│').expect("the panel's rule");
+            s[at] = format!("{text:<w$}│{panel}", w = head.chars().count());
+            s
+        };
+        for live in [
+            "· Wibbling… (4m 36s · ↓ 16.4k tokens)",
+            "✢ Running… (12s · esc to interrupt)",
+        ] {
+            let busy = row(live);
+            assert_eq!(worker_phase(&busy), Phase::Busy, "{live}");
+            assert!(!background_only(&busy), "{live}");
+            assert_eq!(background_rest(&busy), None, "{live}: a live turn");
+            assert_eq!(identify(Some("claude"), &busy).background_rest(&busy), None);
+        }
+        // A message submitted under the wait opens the next turn.
+        let top = composer_frame(&r).expect("the frame").top;
+        let mut submitted = r.clone();
+        submitted.insert(top, "❯ keep going".to_string());
+        submitted.remove(0);
+        assert_eq!(worker_phase(&submitted), Phase::Busy);
+        assert_eq!(background_rest(&submitted), None, "the next turn has begun");
+        // No other reader reads Claude Code's turn end.
+        for program in [
+            Program::Codex,
+            Program::Agy,
+            Program::Muse,
+            Program::Generic,
+        ] {
+            assert_eq!(program.reader().background_rest(&r), None, "{program:?}");
+        }
+    }
+
+    /// Two screens of the same live Claude Code 2.1.316 session, captured read-only on
+    /// 2026-10-31 while aterm 0.147.0 published `agent=busy` over both: its turn over while two
+    /// background agents and three dynamic workflows run on (Claude Code's agents panel drawn
+    /// under the footer) rests idle, and the live turn it ran 17 minutes earlier over its own
+    /// shells and agents (a spinner row) gives no rest.
+    #[test]
+    fn claude_2_1_316_turn_over_under_agents_and_workflows_rests_idle_and_its_live_turn_does_not() {
+        use crate::prompt::fixtures::{
+            INFERRING_OVER_BACKGROUND_2_1_316, WAITING_AGENTS_WORKFLOWS_2_1_316, screen,
+        };
+        use crate::reader::{Program, identify};
+        let rest = screen(WAITING_AGENTS_WORKFLOWS_2_1_316);
+        assert_eq!(
+            rest.iter()
+                .rposition(|x| x.starts_with('❯')
+                    && x.ends_with("keep going, don't let yourself be blocked"))
+                .expect("the composer's row"),
+            47,
+            "the cursor's row as captured"
+        );
+        assert_eq!(worker_phase(&rest), Phase::Busy);
+        assert!(background_only(&rest));
+        assert_eq!(background_rest(&rest), Some(Phase::Idle));
+        let reader = identify(Some("claude"), &rest);
+        assert_eq!(reader.program(), Program::Claude);
+        assert_eq!(reader.phase(&rest), Phase::Busy, "the supervisor's break");
+        assert_eq!(reader.background_rest(&rest), Some(Phase::Idle));
+
+        // NEGATIVE CONTROL: the same session's live turn over its own background work.
+        let live = screen(INFERRING_OVER_BACKGROUND_2_1_316);
+        assert!(
+            live.iter().any(|x| x.starts_with("✻ Inferring… (1m 35s")),
+            "the spinner row"
+        );
+        assert_eq!(worker_phase(&live), Phase::Busy);
+        assert!(!background_only(&live), "a live turn");
+        assert_eq!(background_rest(&live), None);
+        assert_eq!(identify(Some("claude"), &live).background_rest(&live), None);
+    }
+
+    /// The incident shape of a turn ended over two background shells it left running: its end
+    /// rests idle, and a live turn over the same shells does not.
+    #[test]
+    fn a_turn_over_its_own_shells_rests_idle_and_a_live_one_does_not() {
+        use crate::prompt::fixtures::IDLE_SHELLS_2_1_271 as TEXT;
+        let r = crate::prompt::fixtures::screen(TEXT);
+        assert_eq!(worker_phase(&r), Phase::Busy);
+        assert_eq!(background_rest(&r), Some(Phase::Idle));
+        let done = "✻ Cogitated for 3m 12s · done 9:29 PM · 2 shells still running";
+        let at = r.iter().position(|x| x == done).expect("the done row");
+        let mut footer_only = r.clone();
+        footer_only[at] = "✻ Cogitated for 3m 12s · done 9:29 PM".to_string();
+        assert_eq!(background_rest(&footer_only), Some(Phase::Idle));
+        // Its last words a question: the turn ended asking.
+        let said = r
+            .iter()
+            .position(|x| x.ends_with("when they notify."))
+            .expect("the last said row");
+        let mut asked = r.clone();
+        asked[said] = asked[said].replace("when they notify.", "when they notify?");
+        assert_eq!(worker_phase(&asked), Phase::Busy);
+        assert_eq!(background_rest(&asked), Some(Phase::Question));
+        let mut live = r.clone();
+        live[at] = "✶ Pondering… (2m 5s · esc to interrupt)".to_string();
+        assert_eq!(worker_phase(&live), Phase::Busy);
+        assert_eq!(background_rest(&live), None, "a live turn over the shells");
+        const BARE: &str = "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents";
+        let mut bare = with_footer(footer_only, BARE);
+        assert_eq!(worker_phase(&bare), Phase::Idle);
+        assert_eq!(
+            background_rest(&bare),
+            None,
+            "idle already: nothing to rest"
+        );
+        bare.clear();
+        assert_eq!(background_rest(&bare), None, "no screen");
+    }
+
+    /// Two background waits that are no turn end, as measured on Claude Code 2.1.283: a limit's
+    /// notice drawn under the composer while the turn wraps up (it ended 41 minutes later), and a
+    /// `/goal` that runs on through the wait by its own check-ins, its mark alone on its row or
+    /// run into the update hint's (`✔ Update installed · Restart to update◎ /goal active (1d)`).
+    /// Each rests once its marks are gone, so the marks are what decline it.
+    #[test]
+    fn a_turn_wrapping_up_or_a_goal_running_on_is_no_rest() {
+        use crate::prompt::fixtures::{GOAL_ACTIVE_SUGGESTION, WRAPUP_WAITING_2_1_283, screen};
+        let wrapup = screen(WRAPUP_WAITING_2_1_283);
+        assert_eq!(worker_phase(&wrapup), Phase::Busy);
+        assert!(background_only(&wrapup));
+        assert!(
+            limit_notice(&wrapup).is_some(),
+            "the footer's notice is read"
+        );
+        assert!(
+            crate::turn::goal_active(&wrapup),
+            "its goal mark ends the update hint's row"
+        );
+        assert_eq!(background_rest(&wrapup), None, "a notice while it wraps up");
+        let unnoticed: Vec<String> = wrapup
+            .iter()
+            .filter(|r| !r.contains("Usage limit reached"))
+            .cloned()
+            .collect();
+        assert_eq!(worker_phase(&unnoticed), Phase::Busy);
+        assert_eq!(background_rest(&unnoticed), None, "the goal declines it");
+        let hint = "✔ Update installed · Restart to update";
+        let unmarked = |rows: &[String]| -> Vec<String> {
+            rows.iter()
+                .map(|r| match r.split_once(hint) {
+                    Some((lead, _)) => format!("{lead}{hint}"),
+                    None => r.clone(),
+                })
+                .collect()
+        };
+        let goalless = unmarked(&wrapup);
+        assert!(
+            goalless.iter().any(|r| r.ends_with(hint)),
+            "the update hint stays"
+        );
+        assert!(
+            !crate::turn::goal_active(&goalless),
+            "the update hint alone"
+        );
+        assert_eq!(background_rest(&goalless), None, "the notice declines it");
+        assert_eq!(
+            background_rest(&unmarked(&unnoticed)),
+            Some(Phase::Idle),
+            "CONTROL: the notice and the goal are what decline it"
+        );
+
+        let goal = screen(GOAL_ACTIVE_SUGGESTION);
+        assert_eq!(worker_phase(&goal), Phase::Busy);
+        assert!(background_only(&goal) && crate::turn::goal_active(&goal));
+        assert_eq!(
+            background_rest(&goal),
+            None,
+            "a goal runs on through its wait"
+        );
+        let goalless: Vec<String> = goal
+            .iter()
+            .map(|r| {
+                if r.contains("◎ /goal active") {
+                    String::new()
+                } else {
+                    r.clone()
+                }
+            })
+            .collect();
+        assert_eq!(worker_phase(&goalless), Phase::Busy);
+        assert_eq!(
+            background_rest(&goalless),
+            Some(Phase::Idle),
+            "CONTROL: the goal is what declines it"
+        );
     }
 
     #[test]
@@ -4942,6 +5367,169 @@ mod tests {
         assert_eq!(worker_phase(&bare), Phase::Idle);
         assert!(status_unseen(&bare));
         assert!(!status_unseen(&drawn));
+    }
+
+    /// [`in_process_work`] reads the work Claude Code runs in its own process off its status
+    /// row's own words, whatever rule [`busy_signal`] reads first: a workflow's progress row and
+    /// a shell count under the footer come ahead of the wait carried above a wake and of a done
+    /// row's `… still running`. Shells and monitors (the process table's), a progress row alone,
+    /// a message submitted under the wait and a screen with no composer are none.
+    #[test]
+    fn in_process_work_is_read_whatever_rule_comes_first() {
+        const RUNNING: &str = "  ◯ review-pass  ▰▰▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱  1/2 · 3m02s · ↓ 12.4k tokens";
+        const SHELL: &str = "  ⏵⏵ bypass permissions on · 1 shell · ← for agents · ↓ to manage";
+        const BARE: &str = "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents";
+        const LEFT: &str = "background work still running";
+        let row = |mut r: Vec<String>| {
+            r.push(RUNNING.to_string());
+            r
+        };
+        let carried = |footer: &str| {
+            screen(
+                &[
+                    "✻ Waiting for 1 dynamic workflow to finish",
+                    "",
+                    "⏺ Monitor event: \"lander\"",
+                    "",
+                    "⏺ Restarted it.",
+                    "",
+                ],
+                footer,
+            )
+        };
+        let done = |status: &str, footer: &str| screen(&["⏺ Done.", "", status, ""], footer);
+        let agents = "✻ Brewed for 6m 7s · done 10:07 AM · 2 agents still running";
+        let mixed = "✻ Brewed for 6m 7s · done 10:07 AM · 2 agents, 1 shell still running";
+        for (name, r, first) in [
+            ("carried", carried(BARE), LEFT),
+            (
+                "carried, workflow row",
+                row(carried(BARE)),
+                "a workflow running",
+            ),
+            ("carried, shell count", carried(SHELL), "a shell running"),
+            ("done", done(agents, BARE), LEFT),
+            (
+                "done, workflow row",
+                row(done(agents, BARE)),
+                "a workflow running",
+            ),
+            ("done, shell count", done(agents, SHELL), "a shell running"),
+            (
+                "done, a shell with them",
+                done(mixed, BARE),
+                "a shell still running",
+            ),
+        ] {
+            assert_eq!(background_wait(&r), Some(first), "{name}");
+            assert_eq!(in_process_work(&r), Some(LEFT), "{name}");
+        }
+        let waiting = row(done("✻ Waiting for 1 dynamic workflow to finish", SHELL));
+        assert_eq!(
+            in_process_work(&waiting),
+            Some("waiting for a dynamic workflow"),
+            "the status row's own wait"
+        );
+        for status in [
+            "✻ Brewed for 6m 7s · done 10:07 AM · 2 shells still running",
+            "✻ Brewed for 6m 7s · done 10:07 AM · 1 shell, 1 monitor still running",
+            "✻ Brewed for 6m 7s · done 10:07 AM · 2 agents done",
+            "✻ Brewed for 6m 7s · done 10:07 AM",
+        ] {
+            let r = row(done(status, SHELL));
+            assert!(background_wait(&r).is_some(), "{status}");
+            assert_eq!(in_process_work(&r), None, "{status}");
+        }
+        let bg = waiter_capture(include_str!("fixtures/wait_bg.out"));
+        assert_eq!(in_process_work(&bg), Some("waiting for a dynamic workflow"));
+        let top = composer_frame(&bg).expect("the frame").top;
+        let mut typed = bg.clone();
+        typed.insert(top, "❯ keep going".to_string());
+        typed.remove(0);
+        assert_eq!(
+            in_process_work(&typed),
+            None,
+            "a message submitted under it"
+        );
+        let bare = rows(&["✻ Waiting for 1 dynamic workflow to finish", "$ "]);
+        assert_eq!(in_process_work(&bare), None, "no composer");
+    }
+
+    /// Claude Code 2.1.310 and later draw a side panel to the right of the live zone: each row is
+    /// padded out to the panel's rule `│`, and the panel's own text follows it (the measured
+    /// 2.1.316 screen, whose diff panel heads its column with `1 file changed`). A done row's
+    /// `… still running` is read up to that rule, by [`busy_signal`]'s soft rule and by
+    /// [`in_process_work`] alike, and the panel's text is no item of the done row.
+    #[test]
+    fn a_done_row_beside_the_side_panel_is_read_up_to_its_rule() {
+        use crate::prompt::fixtures::{WAITING_AGENTS_WORKFLOWS_2_1_316, screen as captured};
+        const LEFT: &str = "background work still running";
+        const QUIET: &str = "  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        const DIFF: &str = "1 file changed                                source: Current ▾";
+        let panel = captured(WAITING_AGENTS_WORKFLOWS_2_1_316);
+        let at = panel
+            .iter()
+            .rposition(|x| x.starts_with("✻ Waiting for 2 background agents"))
+            .expect("the waiting row");
+        let bottom = composer_frame(&panel).expect("the frame").bottom;
+        let (head, side) = panel[at].split_once('│').expect("the panel's rule");
+        assert_eq!(side, "", "the waiting row's panel text as captured");
+        let width = head.chars().count();
+        // The status row drawn beside the panel, `side` after the rule; `quiet` swaps the
+        // captured footer (its agents panel's workflow rows, a rule of their own that reads
+        // first) for a bare one, so the status row is all that reads.
+        let beside = |text: &str, side: &str, quiet: bool| {
+            let mut s = panel.clone();
+            s[at] = format!("{text:<width$}│{side}");
+            if quiet {
+                s.truncate(bottom + 1);
+                s.extend([String::new(), QUIET.to_string()]);
+            }
+            s
+        };
+        assert_eq!(
+            in_process_work(&beside(
+                "✻ Waiting for 2 background agents to finish",
+                "",
+                false
+            )),
+            Some("waiting for a background agent"),
+            "the status row's own wait, beside the panel"
+        );
+        let agents = "✻ Brewed for 6m 7s · done 10:07 AM · 2 agents still running";
+        let mixed = "✻ Brewed for 6m 7s · done 10:07 AM · 2 agents, 1 shell still running";
+        for side in ["", DIFF] {
+            for (status, full_first, quiet_first) in [
+                (agents, "a workflow running", LEFT),
+                (mixed, "a shell still running", "a shell still running"),
+            ] {
+                let full = beside(status, side, false);
+                assert_eq!(background_wait(&full), Some(full_first), "{status} │{side}");
+                assert_eq!(in_process_work(&full), Some(LEFT), "{status} │{side}");
+                let quiet = beside(status, side, true);
+                assert_eq!(
+                    background_wait(&quiet),
+                    Some(quiet_first),
+                    "{status} │{side}"
+                );
+                assert_eq!(worker_phase(&quiet), Phase::Busy, "{status} │{side}");
+                assert_eq!(in_process_work(&quiet), Some(LEFT), "{status} │{side}");
+            }
+        }
+        // CONTROLS: shells alone are the process table's, a done row with nothing left running
+        // rests, and the panel's text is never the done row's, whatever it says.
+        let shells = beside(
+            "✻ Brewed for 6m 7s · done 10:07 AM · 2 shells still running",
+            "",
+            false,
+        );
+        assert_eq!(in_process_work(&shells), None, "shells alone");
+        for side in ["", DIFF, " · 2 agents still running"] {
+            let done = beside("✻ Brewed for 6m 7s · done 10:07 AM", side, true);
+            assert_eq!(background_wait(&done), None, "│{side}");
+            assert_eq!(worker_phase(&done), Phase::Idle, "│{side}");
+            assert_eq!(in_process_work(&done), None, "│{side}");
+        }
     }
 
     #[test]

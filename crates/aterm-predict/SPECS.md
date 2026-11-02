@@ -3,9 +3,11 @@
 
 # aterm-predict: spec recovery from its unit tests
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 6 tests it
-> deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
-> were taken before.
+§1 states the contracts of `crates/aterm-predict` that its tests sample, each precise enough to prove
+through Trust/Clean about the compiled function. §2 maps the tests of `src/lib.rs`,
+`tests/conformance_visibility.rs` and `tests/editing_win.rs` to the spec whose proof would retire it.
+§0 defines the notation the statements share, §5 holds the open findings and the counterexamples the
+rows cite, and §6 orders the proofs.
 
 > Status 2026-10-15: this is the crate's migration worklist. Each spec below is proved
 > through Trust/Clean about the compiled Rust function, and then the tests it subsumes are
@@ -292,21 +294,21 @@ lists it on every row. No spec here is blocked by gap 0 alone.
 
 - Test ids are crate-relative: `src/lib.rs::name`, `tests/conformance_visibility.rs::name` and
   `tests/editing_win.rs::name`.
-- `P` is a `Predictor`. Its fields are as in `src/lib.rs`: `mode`, `preds` (a `VecDeque<Prediction>`
-  with the oldest at the front), `srtt`, `expiry_backoff`, `slow_samples`, `fast_samples`,
-  `adaptive_slow`, `confirmed_epoch`, `proof_cell`, `proof_echo`, `proof_line_end`, `epoch`,
-  `grid_cols`, `deferred_wrap`, `anchor_lost`, `grandfathered_epoch`, `coords`, `owed_at`,
-  `declined_tail`, `next_seq`, `cancelled_at`, `cancelled_pair`, `glyph_owes`, `tail`, `tail_cells`, `tail_line_end`,
-  `line_end_at`, `moved_tail_at`, `line` (the known line: `row`, `lo`, `epoch`, `text`, `cursor`,
-  `vacated`, `end_known`, `fresh`, with `hi = lo + |text|`), `chain`, `proven`, `carried_proven`, `carried_proof`, `editing_off`, `edit_capable`
-  `run_stale`, `run_inside`, `run_witness`, `prompt_gate`, `bindings` and `proof_opaque`. A guess `g` has `row`, `col`, `ch`, `born`, `epoch`, `owed`, `seq`, `op` (Insert,
-  Left, Right, Erase, LineStart(k), LineEnd(k) or Delete, k a learned key), `class` (Glyph, Motion, InsertShift, EraseShift, LineEdge
-  or DeleteFwd), `stale`, `ghost` (Typed for every
-  pending op; a chain's overlay cell is Typed, `Moved { from }` or Vacated, edit-overlay) and `probe` (learned-bindings). `Engaged(P) ⇔ chain ∧
-  preds ≠ []` (a state chain is in flight; `fn engaged`).
-- `Void(P)`: `confirmed_epoch := false`, `proof_cell := None`, `proof_echo := None`,
-  `proof_line_end := false` (the private `fn void_proof`; the four move together), `proven := 0`
-  (`Rule::ProofsEndWithTheEpoch`), and `line := None` unless `Engaged(P)` (edit-line-lifetime).
+- `Rule::X` is a fix the debug-only `Predictor::disable_rule_for_test` switches off; `off: …` says what
+  the code does without it.
+- `R-ROW`, `R-OPAQUE`, `R-VACATE`, `R-CAP`, `R-END`, `R-KITTY`, `R-OWED` and `R-WITNESS` label the edit
+  lane's placement requirements; the rows that use them state each.
+- `P` is a `Predictor`, with the field names of `src/lib.rs`. `preds` is a `VecDeque<Prediction>`,
+  oldest at the front. `line` is the known line (`row`, `lo`, `epoch`, `text`, `cursor`, `vacated`,
+  `end_known`, `fresh`), with `hi = lo + |text|`. A guess `g` has `row`, `col`, `ch`, `born`, `epoch`,
+  `owed`, `seq`, `op` (Insert, Left, Right, Erase, LineStart(k), LineEnd(k) or Delete, k a learned key),
+  `class` (Glyph, Motion, InsertShift, EraseShift, LineEdge or DeleteFwd), `stale`, `ghost` (Typed for
+  every pending op; a chain's overlay cell is Typed, `Moved { from }` or Vacated, edit-overlay) and
+  `probe` (learned-bindings). `Engaged(P) ⇔ chain ∧ preds ≠ []`: a state chain is in flight
+  (`fn engaged`).
+- `Void(P)` (`fn void_proof`): `confirmed_epoch := false`, `proof_cell := None`, `proof_echo := None`,
+  `proof_line_end := false` and `proof_opaque := false`, which move together; `proven := 0`
+  (`Rule::ProofsEndWithTheEpoch`); and `line := None` unless `Engaged(P)` (edit-line-lifetime).
 - `After(P,g) = (g.row, if g.col+1 ≥ grid_cols then g.col else g.col+1)`, the cell an echo of `g`
   leaves the cursor in (`fn cell_after`).
 - `Past(P,cur,g)` (`fn echoed_past`): `cur = Some((r,c))` with `r = g.row ∧ c > g.col ∧ Reach(r,c)`; or
@@ -315,78 +317,81 @@ lists it on every row. No spec here is blocked by gap 0 alone.
   with `g` or a guess of `preds` on `g.row` in the last column. `Reach(r,c)` (`fn within_reach`,
   `Rule::CursorReach`; off: true): `c ≤ After(h).col` for some `h ∈ preds` on row `r`, or for the
   `cancelled_pair`'s cell on row `r` (its glyph's echo lands before its erase's).
-- `predict_char*` means both `predict_char` and `predict_char_in_grid`.
+- `predict_char*` means both `predict_char` and `predict_char_in_grid`; `note_line_submit*` means both
+  `note_line_submit` and `note_line_submit_at`.
 - `Reach(m)`: the predictors reachable from `Predictor::new(m)` by any sequence of public calls with
-  non-decreasing `now` arguments. The public calls are `set_mode`, `predict_char*`,
-  `predict_backspace`, `note_line_submit`, `note_unmodelled_input`, `reconcile` with any `observe`
-  closure, `reconcile_seen`, `predict_glyph`, `predict_edit`, `set_editing`, `overlay`,
-  `overlay_cursor`, `expire_due`, `reset`, `reset_session`, `take_link_estimate`, and
+  non-decreasing `now` arguments. The public calls are `set_mode`, `set_ambiguous_width_double`,
+  `predict_char*`, `predict_backspace`, `note_line_submit*`, `note_unmodelled_input`, `reconcile` with
+  any `observe` closure, `reconcile_seen`, `predict_glyph`, `predict_edit`, `set_editing`, `overlay`,
+  `overlay_frame`, `overlay_cursor`, `expire_due`, `reset`, `reset_session`, `take_link_estimate`, and
   `restore_link_estimate(e)` where `e` came from `take_link_estimate` or `LinkEstimate::default()`.
 - `Mono(P)`: `g.born` does not decrease along `preds`. Every `P ∈ Reach` satisfies it, because `now`
   is non-decreasing.
 - `Link(P) = (srtt, slow_samples, fast_samples, adaptive_slow, expiry_backoff, owed_at, bindings)`, the
-  fields that `LinkEstimate` carries. `Screen(P)` is every other field.
-- `Flush(P)`: `owe(max of g.born over preds and of the typed owes' born)` when either is non-empty,
-  then `preds := []`, `glyph_owes := []`, `Void(P)`, `anchor_lost := false`,
-  `grandfathered_epoch := None`, `declined_tail := 0`, `cancelled_at := None`, `cancelled_pair := None`, `line_end_at := None`,
-  `chain := false` (so `Void` drops `line`), `carried_proven := 0`, `ghost_cursor := None`, with every other field kept. This
-  is the private `fn flush`. The newest `born` counts every op, edit ops included (`Rule::EditOpsOwe`;
-  off: only the Inserts).
-- `EndEpoch(P)`: if `confirmed_epoch` then `grandfathered_epoch := Some(epoch)` and
-  `carried_proven := proven`; then
-  `epoch := epoch.wrapping_add(1)`, `Void(P)`, `anchor_lost := false`, `cancelled_at := None`,
-  `cancelled_pair := None`, `line_end_at := None`. This is the private `fn end_epoch`.
-- `CancelCursor(P,cur,now)`: when `preds=[]` and `cancelled_at=Some((r,c))`, keep the cell only if
-  `cur=Some((r,c))`, or `c+1<grid_cols` and `cur=Some((r,c+1))`, or `c=0`, `grid_cols>0`, `r>0` and
-  `cur=Some((r−1,grid_cols−1))`; otherwise `owe(now)` then `Flush(P)`. With guesses still pending or
-  no cancelled cell it changes nothing. This is `observe_cancelled_cursor`; it rejects unknown or
-  incompatible geometry, and does not prove attribution for unrelated output at a compatible cell.
+  fields `LinkEstimate` carries. `Screen(P)` is every other field.
+- `Flush(P)` (`fn flush`): `owe(max of g.born over preds and of the typed owes' born)` when either is
+  non-empty, then `preds := []`, `glyph_owes := []`, `chain := false`, `Void(P)` (which therefore drops
+  `line`), `last_credit := None`, `seen := []`, `ghost_cursor := None`, `anchor_lost := false`,
+  `grandfathered_epoch := None`, `carried_proven := 0`, `carried_proof := None`, `declined_tail := 0`,
+  `cancelled_at := None`, `line_end_at := None` and `cancelled_pair := None`, every other field kept.
+  The newest `born` counts every op, edit ops included (`Rule::EditOpsOwe`; off: only the Inserts).
+- `EndEpoch(P)` (`fn end_epoch`): if `confirmed_epoch` then `grandfathered_epoch := Some(epoch)`,
+  `carried_proven := proven` and
+  `carried_proof := proof_echo.map(|h| (h, proof_line_end, proof_opaque))`; then
+  `epoch := epoch.wrapping_add(1)`, `last_credit := None`, `Void(P)`, `anchor_lost := false`,
+  `cancelled_at := None`, `line_end_at := None` and `cancelled_pair := None`.
+- `CancelCursor(P,cur,now)` (`fn observe_cancelled_cursor`): when `preds=[]` and
+  `cancelled_at=Some((r,c))`, keep the cell only if `cur=Some((r,c))`, or `c+1<grid_cols` and
+  `cur=Some((r,c+1))`, or `c=0`, `grid_cols>0`, `r>0` and `cur=Some((r−1,grid_cols−1))`; otherwise
+  `owe(now)` then `Flush(P)`. With guesses pending or no cancelled cell it changes nothing. It rejects
+  unknown or incompatible geometry, and proves no attribution for unrelated output at a compatible cell.
 - `W(P) = glitch_window(P)`. `Exp(P,now,g) ⇔ now.saturating_duration_since(g.born) > W(P)`.
-- `owe(t)`: `owed_at := max(owed_at, t)`. Flush owes the newest `born` it drops; `note_line_submit(now)`,
-  `note_unmodelled_input(now)`, a declined `predict_char*` and a `predict_backspace` that pops nothing
-  owe `now` (one that pops our own guess owes no echo of any key, but the popped glyph's own TYPED and
-  dated by the Backspace, `now`, `Rule::CancelOwes`: backspace-pops-own); a guess retired without credit owes its `born`, typed when
-  it was an append (`Appended`, tail-guard), else as any echo (typed-owes); an expired guess owes its
-  `born` (expiry-contract).
-  `reset_session` sets `owed_at := None`; `take_link_estimate` carries `max(owed_at, max g.born, max
-  typed-owe born)` out and `restore_link_estimate(e)` installs `e`'s. Each armed guess takes
-  `g.owed := owed_at` and `g.seq := next_seq`, then `next_seq += 1`.
-  `Owed(P,now) ⇔ owed_at=Some(t) ∧ now.saturating_duration_since(t) ≤ W(P)` (the predictor's newest
-  owe of any echo, which the model's `owed` projects; typed owes project to nothing). `Attr(P,now,h) ⇔
-  ¬(h.owed=Some(t) ∧ now.saturating_duration_since(t) ≤ W(P)) ∧ ¬∃ (seq,ch,t) ∈ glyph_owes: seq < h.seq ∧
-  ch = h.ch ∧ now.saturating_duration_since(t) ≤ W(P)` ∧ (h.stale ⇒ ¬Owed(P,now) ∧ ¬∃ pending Insert
-  g' with g'.seq > h.seq ∧ g'.ch = h.ch ∧ ¬∃ (seq,ch,t) ∈ glyph_owes: seq > h.seq ∧ ch = h.ch ∧ t inside
-  W(P)) ∧ (h.op ≠ Insert ⇒ ¬(owed_at=Some(t) ∧ t inside W(P) ∧ (h.owed=None ∨ t > h.owed)))`, for a guess
-  of any epoch: only an owe from before `h`, a typed one only for the same glyph, for a STALE ANCHOR
-  (stale-anchor) the keys after it too, pending or cancelled, and for an edit op (`Rule::EditOwedAfter`)
-  any key after it still echoing, whose echo can make its cursor and blanks by itself.
-- `Vis(P) = visible_count(P)`: `Off → 0`; `Always →` the length of the leading run of `preds` with `¬probe`; `Adaptive ∧ ¬adaptive_slow → 0`;
-  otherwise the length of the leading run of `preds` with `op_visible` (edit-class-proof): of the current
-  epoch with `confirmed_epoch`, or of `grandfathered_epoch`, and in either case with its class proven
-  there. With every op of the glyph class this is the earlier `confirmed_epoch → |preds|`, else the
-  carried run.
-  In every mode, then, with `text_wait = Some(s)` and the guess of seq `s` pending at index `i`,
-  `min(·, i)` (DARK OVER TEXT, visibility-gate).
+  `live(t) ⇔ now.saturating_duration_since(t) ≤ W(P)`.
+- `owe(t)`: `owed_at := max(owed_at, t)`. Flush owes the newest `born` it drops; `note_line_submit*`,
+  `note_unmodelled_input`, a declined `predict_char*` and a `predict_backspace` that pops nothing owe
+  `now`. A Backspace that pops our own guess owes no echo of any key, but the popped glyph's own,
+  typed and dated by the Backspace (`Rule::CancelOwes`, backspace-pops-own). A guess retired without
+  credit owes its `born`, typed when it was an append (`Appended`, tail-guard), else as any echo
+  (typed-owes); an expired guess owes its `born` (expiry-contract). `reset_session` sets
+  `owed_at := None`; `take_link_estimate` carries `max(owed_at, max g.born, max typed-owe born)` out and
+  `restore_link_estimate(e)` installs `e`'s. Each armed guess takes `g.owed := owed_at` and
+  `g.seq := next_seq`, then `next_seq += 1`.
+- `Owed(P,now) ⇔ owed_at=Some(t) ∧ live(t)`: the predictor's newest owe of any echo, which the model's
+  `owed` projects (typed owes project to nothing).
+- `Attr(P,now,h)` (`fn attributable`), for a guess of any epoch, is the conjunction of:
+  `¬(h.owed=Some(t) ∧ live(t))`; `¬∃ (seq,ch,t) ∈ glyph_owes: seq < h.seq ∧ ch = h.ch ∧ live(t)`; if
+  `h.stale` (stale-anchor), `¬Owed(P,now)`, no pending Insert `g′` with `g′.seq > h.seq ∧ g′.ch = h.ch`,
+  and `¬∃ (seq,ch,t) ∈ glyph_owes: seq > h.seq ∧ ch = h.ch ∧ live(t)`; and if `h.op ≠ Insert`
+  (`Rule::EditOwedAfter`), `¬(owed_at=Some(t) ∧ live(t) ∧ (h.owed=None ∨ t > h.owed))`. So a guess is
+  credited only with no live owe from before it, no live typed owe of its own glyph from before it, for a
+  STALE ANCHOR none from the keys after it either, pending or cancelled, and for an edit op no later key
+  still echoing, whose echo can make its cursor and blanks by itself.
+- `Vis(P) = visible_count(P)`: `Off → 0`; `Always →` the length of the leading run of `preds` with
+  `¬probe`; `Adaptive ∧ ¬adaptive_slow → 0`; otherwise the length of the leading run of `preds` with
+  `op_visible` (edit-class-proof): of the current epoch with `confirmed_epoch`, or of
+  `grandfathered_epoch`, and in either case with its class proven there, cut to `min(·, i+1)` when
+  `held_wait = Some(s)` and the guess of seq `s` is at index `i` (DARK BEHIND A WAIT, visibility-gate).
+  Then, in every mode, with `text_wait = Some(s)` and the guess of seq `s` at index `i`, `min(·, i)`
+  (DARK OVER TEXT, visibility-gate).
 - `ms(d) = d.as_secs_f32() * 1000`.
 - Turn sample: in one `reconcile` call, the latency `now − born` of the FIRST guess that call confirms.
 - Epoch boundary `B` is any one of:
-  - `note_line_submit` or `note_unmodelled_input`;
+  - `note_line_submit*` or `note_unmodelled_input`;
   - `predict_backspace` when the back guess is not of the current epoch;
-  - a declined `predict_char*`;
+  - a declined `predict_char*`, or an arrow `predict_edit` declines;
   - a `coords` value that differs from `P.coords`, passed to `predict_char*` or `reconcile`;
   - a `predict_char*` with no current-epoch anchor and `cursor ≠ proof_cell`;
   - `reset`, `reset_session`, `take_link_estimate` or `restore_link_estimate`;
   - `set_mode` to a different mode;
   - `reconcile` with `alt_screen`;
   - a divergence or cursor-inconsistency flush inside `reconcile`.
-- `Instant` is `aterm_time::Instant` (`std::time::Instant` on native) and `Duration` is std's.
-  Every spec that reasons about time needs a model of `saturating_duration_since`,
-  `Instant + Duration`, `Duration::from_millis` and `as_secs_f32`. `aterm_time` is a separate crate,
-  so citing that model is gap 12.
-- **Missing gap row (f32):** `glitch-window`, `rtt-only-from-echo`, `echo-regime-latch` and
-  `reconcile-contract` (through `record_rtt`) need an `f32` model: casts, `min`, `clamp`, comparisons
-  and the EWMA. The audit's §7 table has no row for floats. The column below writes it as `f32`
-  next to the numbered gaps. It does not count in the histogram.
+- `Instant` is `aterm_time::Instant` (`std::time::Instant` on native) and `Duration` is std's. A spec
+  that reasons about time needs a model of `saturating_duration_since`, `Instant + Duration`,
+  `Duration::from_millis` and `as_secs_f32`; `aterm_time` is another crate, so citing that model is
+  gap 12.
+- `f32` in `blocking_gaps` is a gap the audit's table has no row for: a float model (casts, `min`,
+  `clamp`, comparisons and the EWMA) that the rows listing it need through `glitch_window` and
+  `record_rtt`.
 
 ## 1. Specs (TSV)
 
@@ -435,19 +440,12 @@ line-edge-witness	contract	Predictor::{predict_edit,predict_line_edge,witnessed,
 learned-bindings	contract	Predictor::{observe_context,credit_binding,contradict_head,retire_chain,reconcile_chain,expire,op_visible,visible_count,take_link_estimate,restore_link_estimate,reset_session}, EditorContext::new	bindings = (context: Option<EditorContext>, per learned key k: seen ≤ 2, contradictions ≤ 2); Learned(k) ⇔ seen ≥ 2; Banned(k) ⇔ contradictions ≥ 2. observe_context(c), at each learned key's press: bindings.context = Some(c) ⇒ nothing; else, with a pending op of a learned key, Flush (its echo is the old editor's answer), then bindings := (Some(c), every key zero). A chain's retirement (edit-reconcile) that credits its ops and is not left Other by the in-place worlds (shift-ops) credits each credited op of a learned key k once: ¬Banned(k) ∧ ¬Learned(k) ⇒ seen+1, bindings_learned+1 on reaching 2. An Engaged chain's divergence (edit-reconcile: no state matches and no transit) and its expiry (edit-expiry) CONTRADICT the head's learned key, if any: seen := 0, contradictions := min(contradictions+1, 2), bindings_unlearned+1. Display: op_visible of class LineEdge or DeleteFwd ⇔ ¬g.probe, with the epoch and glyph-proof terms (edit-class-proof), and Vis in Always stops at the first probe (visibility-gate), so nothing after a probe shows in any mode. EditorContext::new(session, nonce, DECCKM, escaped_chords) compares the four, the nonce as its FNV-1a digest (no capability held, none printed); escaped_chords is the host's KeySample::escaped_chords (aterm-core's control_chords_escaped: a Kitty mode that reports functional keys, or modifyOtherKeys level 2). Link carries bindings (link-estimate-swap): reset keeps them, reset_session clears them. Why: no binding is assumed (zsh without its integration leaves Home unbound and inserts `~` for Delete, zsh's vi insert mode inserts Ctrl-A); a probe is armed only where its canonical effect changes the state, so a key bound to nothing waits out its window and one bound to a glyph diverges, each a contradiction, and two agreeing credited echoes, each a whole state the screen matched at the smallest match, are the evidence the binding is canonical in this context. A keymap switched inside one context (a `bindkey -v` typed at the shell) shows a learned key wrong for at most one window, until its contradiction (residual 4).	src/lib.rs::an_unlearned_key_is_a_dark_probe_until_two_echoes_teach_it, src/lib.rs::nothing_after_a_probe_is_shown_even_in_always, src/lib.rs::a_contradicted_binding_is_unlearned_and_a_second_bans_it, src/lib.rs::bindings_hold_for_their_editor_context_and_travel_with_the_session, src/lib.rs::a_new_editor_context_flushes_the_old_one_s_ops, src/lib.rs::a_divergence_a_learned_key_heads_unlearns_it	&mut self, fixed array of small Copy structs, Option<struct> equality, u64 wrapping_mul fold, saturating u8	0,1,2,13
 ```
 
-Merge notes:
-- `glitch-window` gained gaps 1 and 2 here. It is a `&self` method (gap 2) that reads `srtt: Option<f32>`
-  (gap 1). The chunk had listed only 3, 6, 12 and 13.
-- `every_epoch_boundary_is_the_models_submit` appeared in the subsumes list of both
-  `no-unechoed-flash` and `visibility-model-refinement`. It is a conformance test of the model, so its
-  primary is `visibility-model-refinement`. `no-unechoed-flash` is its secondary (§2).
-- No two specs stated the same property, so nothing was merged away. The building blocks `Flush`,
-  `EndEpoch`, `W` and `Vis` are defined once, in §0, and every spec cites them from there.
-
 ## 2. Test → spec map (TSV)
 
-`primary` is the spec that retires the test. `also` lists other specs the same test samples. The
-`also` column comes from what each statement names as a consequence, so it is a reading, not a census.
+`primary` is the spec that retires the test; `also` lists other specs the same test samples, read from
+what each statement names as a consequence (a reading, not a census).
+`tests/editing_win.rs::the_corpus_is_the_region_probe_s` is unmapped: it pins the measurement's corpus
+to the region design's probe and samples no spec of the crate.
 
 ```tsv
 file	test	primary	also
@@ -628,7 +626,7 @@ tests/reconciled_view_safety.rs	the_chain_painter_paints_all_or_none	edit-overla
 tests/reconciled_view_safety.rs	each_named_case_holds_and_catches_its_mutant	edit-fold	reconcile-contract, edit-reconcile, tail-guard, standing-tail
 ```
 
-## 3. Coverage
+## 5. Open findings, and the counterexamples the rows cite
 
 - 179 live tests: 175 mapped across the 38 specs in §2, and 4 harness/oracle self-checks documented in §4
   (the 2026-10-15 recovery: 59 read, 58 mapped to 19 specs, 1 deleted as §4 says).
@@ -1061,32 +1059,28 @@ tests/reconciled_view_safety.rs	each_named_case_holds_and_catches_its_mutant	edi
 
 ## 6. Proof order (easiest high-value first)
 
-No spec is blocked by gap 0 alone. Every one also needs at least gap 1 (struct, `Option` or
-`VecDeque` carriers), and all but two need gap 2 (`&mut self`/`&self` views). So the order puts the
-smallest gap sets first and, within those, the specs that retire the most tests or supply lemmas for
-later ones.
+Every row needs gap 1 (struct, `Option` or `VecDeque` carriers) beside gap 0, and most need gap 2
+(`&mut self`/`&self` views). The order takes the smallest gap sets first and, among those, the specs
+that supply lemmas for later ones.
 
-1. **`link-estimate-swap`** (gaps 0, 1, 2, 4). This is field assignment on a `Copy` struct plus the
-   composition take → reset_session → reset → flush, with no arithmetic and no loops. It retires
-   7 tests. Its `Flush` and `reset` lemmas are reused by almost every spec after it.
-2. **`submit-carries-proven-guesses`** (gaps 0, 1, 2). It has the smallest gap set in the crate: one
-   `wrapping_add` and `Option` assignments. It proves `EndEpoch`, the lemma that clauses (c) and (d)
-   of `no-unechoed-flash` are built on.
-3. **`off-mode-inert`, then `backspace-pops-own`** (gaps 0–3, plus 13 for `is_some_and`). These are
-   early returns and one `pop_back`. With `Flush` already proved, `unmodelled-input-retires` (4 tests)
-   follows at the same cost.
-4. **`glitch-window`** (gaps 0–3, 6, 12, 13, f32). It has no loops, only bounded shift, cast and clamp
-   arithmetic, so once a float model exists the bounds are an interval proof. It is the lemma that
-   `expiry-contract` (4 tests) and the link specs cite for `W`.
-5. **`echo-regime-latch`** (7 tests). `record_echo_regime` is straight-line saturating `u8` with `f32`
-   comparisons. Its `reconcile` half (one call per turn, on the first sample) has to wait for
+1. **`link-estimate-swap`** (gaps 0, 1, 2, 4): field assignment on the `Copy` struct `LinkEstimate`
+   plus the composition take → reset_session → reset → flush, with no arithmetic and no loops. Its
+   `Flush` and `reset` lemmas serve almost every spec after it.
+2. **`submit-carries-proven-guesses`** (gaps 0, 1, 2): one `wrapping_add` and `Option` assignments. It
+   proves `EndEpoch`, on which clauses (c) and (d) of `no-unechoed-flash` rest.
+3. **`off-mode-inert`** (gaps 0–3), then **`unmodelled-input-retires`** and **`backspace-pops-own`**
+   (gaps 0–3 and 13), on the `Flush` lemma.
+4. **`glitch-window`** (gaps 0–3, 6, 12, 13, f32): no loops, only bounded shift, cast and clamp
+   arithmetic, so once a float model exists the bounds are an interval proof. It is the `W` lemma that
+   `expiry-contract` and the link specs cite.
+5. **`echo-regime-latch`**: `record_echo_regime` is straight-line saturating `u8` with `f32`
+   comparisons. Its `reconcile` half (one call per turn, on the first sample) waits for
    `reconcile-contract`.
 
-After these: `expiry-contract` and `visibility-gate` (loop gap 7), `predict-placement` and
-`predict-accept-decline`, then `reconcile-contract` (the higher-order `obs` closure, gaps 11 and 13).
-Next is `no-unechoed-flash`. It is the password guarantee and the crate's most valuable spec, but it
-needs ghost history state over a whole trace, so it comes after the per-method contracts it is
-assembled from. `visibility-model-refinement` comes last: it needs gap 10 and the model fix in §5.5.
-`mode-parse` and `is-line-submit` are independent pure functions. They become cheap once gap 1 gives
-`&str`/`&[u8]` content models with a Unicode `is_control`/whitespace table, and they can be done at
-any point after that.
+Then `expiry-contract` and `visibility-gate` (loop gap 7), `predict-placement` and
+`predict-accept-decline`, and `reconcile-contract` (the higher-order `observe` closure, gaps 11 and 13).
+`no-unechoed-flash`, the password guarantee and the crate's most valuable spec, needs ghost history over
+a whole trace, so it follows the per-method contracts it is built from. `visibility-model-refinement`
+comes last: it needs gap 10 and the model fix of §5.5. `mode-parse` and `is-line-submit` are independent
+pure functions, cheap once gap 1 gives `&str`/`&[u8]` content models with a Unicode
+`is_control`/whitespace table.

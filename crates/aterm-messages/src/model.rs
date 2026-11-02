@@ -694,12 +694,16 @@ impl Intent {
     /// The inverse of [`Intent::encode`].
     #[must_use]
     pub fn decode(s: &str) -> Option<Intent> {
-        let (kind, payload) = s.split_once(':').unwrap_or((s, ""));
+        let Some((kind, payload)) = s.split_once(':') else {
+            return match s {
+                "details" => Some(Self::Details),
+                "new-window" => Some(Self::NewWindow),
+                "end-recovered" => Some(Self::EndRecovered),
+                "review-vault-sync" => Some(Self::ReviewVaultSync),
+                _ => None,
+            };
+        };
         match kind {
-            "details" if payload.is_empty() => Some(Self::Details),
-            "new-window" if payload.is_empty() => Some(Self::NewWindow),
-            "end-recovered" if payload.is_empty() => Some(Self::EndRecovered),
-            "review-vault-sync" if payload.is_empty() => Some(Self::ReviewVaultSync),
             "open-settings" => Some(Self::OpenSettings {
                 route: unescape_payload(payload),
             }),
@@ -707,7 +711,7 @@ impl Intent {
                 let line = if payload == "-" {
                     None
                 } else {
-                    Some(payload.parse::<u32>().ok()?)
+                    Some(uint(payload)?)
                 };
                 Some(Self::OpenConfigEditor { line })
             }
@@ -723,16 +727,16 @@ impl Intent {
                 Some(Self::OpenLink { url })
             }
             "apply-update" => Some(Self::ApplyUpdate {
-                build: payload.parse().ok()?,
+                build: uint(payload)?,
             }),
             "stop-paste" => Some(Self::StopPaste {
-                session: payload.parse().ok()?,
+                session: uint(payload)?,
             }),
             "show-tab" => {
                 let (tab, window) = payload.split_once(':')?;
                 Some(Self::ShowTab {
-                    tab: tab.parse().ok().filter(|t| *t > 0)?,
-                    window: window.parse().ok()?,
+                    tab: uint(tab).filter(|t| *t > 0)?,
+                    window: uint(window)?,
                 })
             }
             "show-session" => {
@@ -743,17 +747,14 @@ impl Intent {
                     return None;
                 }
                 Some(Self::ShowSession {
-                    tab: tab.parse().ok().filter(|t| *t > 0)?,
-                    window: window.parse().ok()?,
+                    tab: uint(tab).filter(|t| *t > 0)?,
+                    window: uint(window)?,
                     session,
                 })
             }
-            "not-now" => match payload.split_once(':').unwrap_or((payload, "")) {
-                ("file-access", "") => Some(Self::NotNow {
-                    decision: Decision::FileAccess,
-                }),
-                _ => None,
-            },
+            "not-now" => (payload == "file-access").then_some(Self::NotNow {
+                decision: Decision::FileAccess,
+            }),
             "approve-join" => {
                 let recipient = unescape_payload(payload);
                 (recipient.starts_with("age1")
@@ -761,13 +762,13 @@ impl Intent {
                 .then_some(Self::ApproveJoin { recipient })
             }
             "allow-join" => Some(Self::AllowJoin {
-                request: payload.parse().ok()?,
+                request: uint(payload)?,
             }),
             "ignore-join" => Some(Self::IgnoreJoin {
-                request: payload.parse().ok()?,
+                request: uint(payload)?,
             }),
             "allow-join-again" => Some(Self::AllowJoinAgain {
-                request: payload.parse().ok()?,
+                request: uint(payload)?,
             }),
             "undo-removals" => {
                 let remover = unescape_payload(payload);
@@ -791,6 +792,12 @@ impl Intent {
             _ => None,
         }
     }
+}
+
+fn uint<T: std::str::FromStr>(s: &str) -> Option<T> {
+    (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| s.parse().ok())
+        .flatten()
 }
 
 /// Whether `name` can be a service's name an [`Intent::RestartService`] carries: a process's
@@ -1024,12 +1031,20 @@ impl Hold {
     /// The inverse of [`Hold::encode`].
     #[must_use]
     pub(crate) fn decode(s: &str) -> Option<Self> {
-        let (kind, secs) = s.split_once(':').unwrap_or((s, ""));
-        let dur = || secs.parse::<u64>().ok().map(Duration::from_secs);
+        let Some((kind, secs)) = s.split_once(':') else {
+            return match s {
+                "default" => Some(Self::Default),
+                "standing" => Some(Self::Standing(Persist::mint())),
+                "log-only" => Some(Self::LogOnly),
+                _ => None,
+            };
+        };
+        let dur = || {
+            (!secs.is_empty() && secs.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| secs.parse::<u64>().ok().map(Duration::from_secs))
+                .flatten()
+        };
         match kind {
-            "default" if secs.is_empty() => Some(Self::Default),
-            "standing" if secs.is_empty() => Some(Self::Standing(Persist::mint())),
-            "log-only" if secs.is_empty() => Some(Self::LogOnly),
             "for" => dur().map(Self::For),
             "live" => dur().map(|stale_after| Self::Live { stale_after }),
             "ask" => dur().map(|for_| Self::Ask {
@@ -1153,7 +1168,7 @@ fn count_span(stats: &str) -> Option<(u16, u16)> {
         let (n, t) = (u128::from(n.min(total)), u128::from(total));
         u16::try_from((n * 1000 + t / 2) / t).unwrap_or(1000)
     };
-    Some((at(done), at(done + 1)))
+    Some((at(done), at(done.saturating_add(1))))
 }
 
 fn count_of(stats: &str) -> Option<(u64, u64)> {
@@ -1975,6 +1990,14 @@ mod tests {
             "restart-service:a b",
             "restart-service:../x",
             "restart-service:seventeen-letters",
+            "details:",
+            "new-window:",
+            "end-recovered:",
+            "review-vault-sync:",
+            "open-settings",
+            "open-path",
+            "open-system-pane",
+            "not-now:file-access:",
         ] {
             assert_eq!(Intent::decode(junk), None, "{junk:?}");
         }
@@ -2019,6 +2042,19 @@ mod tests {
         }
         assert_eq!(Hold::decode("forever"), None);
         assert_eq!(Hold::decode("for:x"), None);
+        assert_eq!(Hold::decode("default:"), None);
+        assert_eq!(Hold::decode("standing:"), None);
+        assert_eq!(Hold::decode("log-only:"), None);
+        assert_eq!(
+            Meter {
+                fill_permille: Some(1000),
+                stats: format!("{0} of {0} items", u64::MAX),
+                ..Meter::default()
+            }
+            .normalized()
+            .fill_permille,
+            Some(1000)
+        );
     }
 
     #[test]

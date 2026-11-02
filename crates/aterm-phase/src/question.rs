@@ -1022,7 +1022,6 @@ pub(crate) fn review(rows: &[String]) -> Option<QShape> {
 
 /// The first row of the auto-deny countdown block whose last row is `at`, if those rows are one.
 fn countdown_head(rows: &[String], at: usize) -> Option<usize> {
-    let words = const { crate::anchor!("box.auto_deny") };
     let mut i = at;
     loop {
         let r = &rows[i];
@@ -1036,7 +1035,9 @@ fn countdown_head(rows: &[String], at: usize) -> Option<usize> {
                 .filter(|t| !t.is_empty())
                 .collect::<Vec<_>>()
                 .join(" ");
-            return text.starts_with(words).then_some(i);
+            return crate::prompt::after_countdown_head(&text)
+                .is_some()
+                .then_some(i);
         }
         i = i.checked_sub(1)?;
     }

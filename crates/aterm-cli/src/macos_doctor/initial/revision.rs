@@ -98,7 +98,12 @@ fn rebuilt(root: &Path) -> u64 {
         .into_iter()
         .flat_map(|text| {
             text.lines()
-                .filter_map(|line| line.split_whitespace().next()?.parse::<u64>().ok())
+                .filter_map(|line| {
+                    let s = line.split_whitespace().next()?;
+                    (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                        .then(|| s.parse::<u64>().ok())
+                        .flatten()
+                })
                 .collect::<Vec<_>>()
         });
     records

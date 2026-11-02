@@ -5,7 +5,12 @@
 //! must discover its issuer, obtain membership and repair application data.
 
 use super::{auto_sync_tests::Attachment, *};
-use crate::{accounts::proposals::Proposals, database::Change};
+use crate::{
+    accounts::proposals::Proposals,
+    catalog::{Descriptor, Directory},
+    database::Change,
+    table::{Session, store::Store},
+};
 use aterm_net::lan::{Multicast, Scope as LinkScope};
 use aterm_secrets::commons::roster::Role;
 use std::net::Ipv4Addr;
@@ -107,6 +112,138 @@ fn automatic_runtime_enrolls_a_vault_approved_device_then_discovers_its_first_ta
     assert_eq!(cell.candidates.len(), 1);
     assert_eq!(cell.candidates[0].operation, receipt.id);
     assert_eq!(cell.candidates[0].value, value);
+}
+
+#[test]
+fn running_newly_enrolled_device_discovers_a_later_generic_table_and_can_write_back() {
+    let lab = crate::control::enrollment::tests::Lab::new(true);
+    assert!(
+        !lab.bootstrap(1)
+            .access()
+            .is_ok_and(|access| access.is_some())
+    );
+    let observers = aterm_tempfile::Builder::new()
+        .prefix("commons-hot-enroll-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let reservation = Multicast::bind(
+        Ipv4Addr::LOCALHOST,
+        Ipv4Addr::new(239, 255, 31, 84),
+        0,
+        LinkScope::Loopback,
+    )
+    .unwrap();
+    let port = reservation.port();
+    let (issuer, issuer_progress) = start(&lab.paths[0], observers.path(), 0, port);
+    let recipient_progress = Attachment::new(port);
+    let recipient_observer = observers.path().join("1");
+    aterm_secrets::fsx::ensure_private_dir(&recipient_observer).unwrap();
+    let (round_tx, round_rx) = std::sync::mpsc::channel();
+    let recipient = Runtime::start_on_with_reports(
+        lab.paths[1].clone(),
+        recipient_observer.join("aterm.toml"),
+        |_| {},
+        Network {
+            isolated: Some(recipient_progress.clone()),
+            ..Network::default()
+        },
+        move |round| {
+            let _ = round_tx.send(round);
+        },
+    )
+    .unwrap();
+
+    // Complete enrollment and an application scan before publishing anything,
+    // so the new table must be found after an already completed empty round.
+    let until = Instant::now() + Duration::from_secs(60);
+    loop {
+        let round = round_rx
+            .recv_timeout(until.saturating_duration_since(Instant::now()))
+            .expect("newly enrolled runtime completed its first application scan");
+        if round.control.is_ok()
+            && round.actor.is_some()
+            && !round.cancelled
+            && round.application.is_some()
+            && round.application_error.is_none()
+        {
+            break;
+        }
+    }
+    assert!(lab.bootstrap(1).access().unwrap().is_some());
+    let descriptor =
+        Descriptor::application(lab.bootstrap(0).trust(), "after-enrollment", "items", 1).unwrap();
+    let first = br#"{"key":"from-issuer","quantity":7}"#;
+    let first_id = {
+        let bootstrap = lab.bootstrap(0);
+        let session = Session::open(&bootstrap).unwrap();
+        let directory = Directory::new(&lab.paths[0], bootstrap.trust());
+        directory.publish(&session, &descriptor).unwrap();
+        Store::open(
+            &session,
+            &directory.path(descriptor.scope).unwrap(),
+            descriptor.scope,
+        )
+        .unwrap()
+        .commit_catalog(&session, first)
+        .unwrap()
+        .id
+    };
+    recipient_progress.wait_for(
+        descriptor.scope.digest(),
+        1,
+        "table published after enrollment",
+    );
+
+    let second = br#"{"key":"from-recipient","quantity":9}"#;
+    let second_id = {
+        let bootstrap = lab.bootstrap(1);
+        let session = Session::open(&bootstrap).unwrap();
+        let directory = Directory::new(&lab.paths[1], bootstrap.trust());
+        let path = directory.path(descriptor.scope).unwrap();
+        let retained = Store::observe(&session, &path, descriptor.scope)
+            .unwrap()
+            .catalog(&session)
+            .unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].header().id, first_id);
+        assert_eq!(retained[0].payload(), first);
+        Store::open(&session, &path, descriptor.scope)
+            .unwrap()
+            .commit_catalog(&session, second)
+            .unwrap()
+            .id
+    };
+    issuer_progress.wait_for(
+        descriptor.scope.digest(),
+        2,
+        "newly enrolled writer's reply",
+    );
+    recipient.stop();
+    issuer.stop();
+
+    let expected = std::collections::BTreeMap::from([
+        (first_id, first.to_vec()),
+        (second_id, second.to_vec()),
+    ]);
+    for paths in &lab.paths {
+        let bootstrap = Bootstrap::required(paths).unwrap();
+        let session = Session::observe(&bootstrap).unwrap();
+        let directory = Directory::new(paths, bootstrap.trust());
+        let store = Store::observe(
+            &session,
+            &directory.path(descriptor.scope).unwrap(),
+            descriptor.scope,
+        )
+        .unwrap();
+        let actual: std::collections::BTreeMap<_, _> = store
+            .catalog(&session)
+            .unwrap()
+            .iter()
+            .map(|record| (record.header().id, record.payload().to_vec()))
+            .collect();
+        assert_eq!(actual, expected);
+        assert_eq!(store.inventory(&session).unwrap().count(), 2);
+    }
 }
 
 #[test]

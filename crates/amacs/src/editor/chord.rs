@@ -17,30 +17,31 @@ impl KeyChord {
     pub fn parse(source: &str) -> Option<Self> {
         // A chord names one key; whitespace only ever separates the chords of
         // a sequence, so `"C-x u"` is not a chord (with key `x u`).
-        if source.contains(char::is_whitespace) {
+        if source.is_empty() || source.contains(char::is_whitespace) {
             return None;
         }
         let mut control = false;
         let mut meta = false;
         let mut shift = false;
-        let mut parts = source.split('-').peekable();
-        while let Some(part) = parts.next() {
-            if parts.peek().is_none() {
-                return (!part.is_empty()).then(|| Self {
-                    control,
-                    meta,
-                    shift,
-                    key: part.to_ascii_lowercase(),
-                });
+        let mut rest = source;
+        while let Some((prefix, after)) = rest.split_once('-') {
+            if after.is_empty() {
+                break;
             }
-            match part {
-                "C" => control = true,
-                "M" => meta = true,
-                "S" => shift = true,
+            match prefix {
+                "C" if !control => control = true,
+                "M" if !meta => meta = true,
+                "S" if !shift => shift = true,
                 _ => return None,
             }
+            rest = after;
         }
-        None
+        (!rest.is_empty() && (rest == "-" || !rest.contains('-'))).then(|| Self {
+            control,
+            meta,
+            shift,
+            key: rest.to_ascii_lowercase(),
+        })
     }
 
     /// Convert a key press and modifiers into a key chord.
@@ -116,6 +117,13 @@ mod tests {
             (Key::Character('a'), Modifiers::SUPER, Some("a")),
             (Key::Character('a'), Modifiers::HYPER, Some("a")),
             (Key::Character('/'), Modifiers::CTRL, Some("C-/")),
+            (Key::Character('-'), Modifiers::empty(), Some("-")),
+            (Key::Character('-'), Modifiers::CTRL, Some("C--")),
+            (
+                Key::Character('-'),
+                Modifiers::CTRL | Modifiers::ALT,
+                Some("C-M--"),
+            ),
             (named(NamedKey::Space), Modifiers::CTRL, Some("C-space")),
             (
                 named(NamedKey::Backspace),
@@ -154,5 +162,8 @@ mod tests {
         }
         assert!(KeyChord::parse("escape").unwrap().is_escape());
         assert!(!KeyChord::parse("M-escape").unwrap().is_escape());
+        for bad in ["", "C-", "--", "C---", "C-C-x", "M-M-f", "S-S-a", "C-x-y"] {
+            assert_eq!(KeyChord::parse(bad), None, "{bad:?}");
+        }
     }
 }

@@ -1167,9 +1167,16 @@ pub(crate) fn health_entry_delay(body: &str, now_unix: i64) -> Duration {
 fn health_excerpt_since(line: &str, now_unix: i64) -> Option<i64> {
     let (month, day) = line.strip_prefix("since ")?.split_once(' ')?;
     let month = MONTHS.iter().position(|m| *m == month)? + 1;
+    if !day.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
     let day: u32 = day.parse().ok()?;
     let now = aterm_types::rfc3339::format_rfc3339(u64::try_from(now_unix).ok()?);
-    let year: i64 = now.get(..4)?.parse().ok()?;
+    let year_str = now.get(..4)?;
+    if !year_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let year: i64 = year_str.parse().ok()?;
     [year, year - 1].into_iter().find_map(|year| {
         let end =
             aterm_types::rfc3339::parse_utc(&format!("{year:04}-{month:02}-{day:02}T23:59:59Z"))?;
@@ -1290,40 +1297,6 @@ pub(crate) fn health_recovered(said_title: &str, said_line0: &str) -> Message {
         .hold(Hold::LogOnly)
 }
 
-/// The OS notification's body for the same warning.
-#[cfg(any(target_os = "macos", test))]
-pub(crate) fn health_notification_body(
-    body: &str,
-    remedy: crate::update_apply_trouble::PersonRemedy,
-) -> String {
-    let todo = remedy.row_tail();
-    match health_since(body) {
-        Some(since) => {
-            format!("Since {since}: {todo}. Details: aterm Settings \u{25b8} Software Update.")
-        }
-        None => {
-            let mut chars = todo.chars();
-            let first = chars.next().map(|c| c.to_uppercase().collect::<String>());
-            format!(
-                "{}{}. Details: aterm Settings \u{25b8} Software Update.",
-                first.unwrap_or_default(),
-                chars.as_str()
-            )
-        }
-    }
-}
-
-/// The OS notification's title for the same warning.
-#[cfg(any(target_os = "macos", test))]
-pub(crate) fn health_notification_title(title: &str) -> String {
-    let mut chars = title.chars();
-    let lowered: String = chars
-        .next()
-        .map(|first| first.to_lowercase().chain(chars).collect())
-        .unwrap_or_default();
-    format!("aterm \u{00b7} {lowered}")
-}
-
 const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
@@ -1331,8 +1304,13 @@ const MONTHS: [&str; 12] = [
 /// "Sep 14": the day the updater's sentence dates the failure from ([`aterm_update::health_notice_since`]), or `None` without a readable one.
 pub(crate) fn health_since(body: &str) -> Option<String> {
     let stamp = aterm_update::health_notice_since(body)?;
-    let month: usize = stamp.get(5..7)?.parse().ok()?;
-    let day: u32 = stamp.get(8..10)?.parse().ok()?;
+    let m_str = stamp.get(5..7)?;
+    let d_str = stamp.get(8..10)?;
+    if !m_str.bytes().all(|b| b.is_ascii_digit()) || !d_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let month: usize = m_str.parse().ok()?;
+    let day: u32 = d_str.parse().ok()?;
     Some(format!("{} {day}", MONTHS.get(month.checked_sub(1)?)?))
 }
 
@@ -2960,24 +2938,6 @@ mod tests {
             "no date here",
         );
         assert_eq!(undated.detail, vec!["no date here"]);
-        {
-            use crate::update_apply_trouble::PersonRemedy;
-            let dated = health_notification_body(body, PersonRemedy::InstallSignedRelease);
-            assert!(dated.starts_with("Since Sep 14"), "{dated}");
-            assert_ne!(
-                dated,
-                health_notification_body(body, PersonRemedy::MoveOrAskAdmin),
-                "each remedy its own words"
-            );
-            let undated = health_notification_body("no date", PersonRemedy::InstallSignedRelease);
-            assert!(!undated.contains("Since"), "{undated}");
-        }
-        for title in [
-            aterm_update::health_failing_title("apply"),
-            CHECKER_STALLED_TITLE,
-        ] {
-            assert!(health_notification_title(title).starts_with("aterm"));
-        }
         let healed = health_recovered("Couldn't install updates", "since Sep 14");
         assert_eq!(
             healed.detail,

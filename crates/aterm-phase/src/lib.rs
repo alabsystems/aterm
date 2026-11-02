@@ -7,6 +7,7 @@ pub mod agents_panel;
 pub mod agy;
 pub mod anchors;
 pub mod announcement;
+pub mod answered;
 pub mod auto_mode;
 pub mod autocompact;
 pub mod codex;
@@ -24,6 +25,7 @@ pub mod prompt;
 pub mod question;
 pub mod reader;
 pub mod reset;
+pub mod retry_after;
 pub mod survey;
 mod text;
 pub mod turn;
@@ -56,9 +58,9 @@ pub use panel::{
     PanelRenderer, SettingsPanel, panel_tail, settings_panel, usage_tab_mark, usage_unsettled,
 };
 pub use phase::{
-    ApiRetryRow, Phase, RetryCause, api_retry_row, background_only, busy_signal, busy_zone_start,
-    context_left, limit_notice, notice_reset, opened_by_own_wake, shells_running, transcript_end,
-    turn_over_background, worker_phase,
+    ApiRetryRow, Phase, RetryCause, api_retry_row, background_only, background_rest, busy_signal,
+    busy_zone_start, context_left, limit_notice, notice_reset, opened_by_own_wake, shells_running,
+    transcript_end, turn_over_background, worker_phase,
 };
 pub use prompt::{
     Opt, Origin, PromptKind, PromptV2, Role, footer_keys, parse_prompt, parse_prompt_v2,
@@ -79,6 +81,7 @@ pub use reset::{
     reset_limit_name, reset_limit_names, reset_line, reset_pending, reset_row, reset_title,
     spends_reset, uses_a_reset,
 };
+pub use retry_after::retry_after;
 pub use survey::{SurveyBlock, SurveyKind, survey_block};
 pub use turn::{
     BannerBuild, CardPlace, CardWords, LaunchCard, LaunchCardRead, WAND_FLARE_DARK,

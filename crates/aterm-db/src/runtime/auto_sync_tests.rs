@@ -10,7 +10,10 @@ use astream_wire::sync::Digest;
 use aterm_net::lan::{Multicast, Scope as LinkScope};
 use aterm_secrets::commons::roster::Role;
 use aterm_types::network_state::NetworkObservation;
-use std::{collections::BTreeMap, net::Ipv4Addr};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::Ipv4Addr,
+};
 
 #[derive(Clone)]
 pub(super) struct Attachment {
@@ -90,6 +93,361 @@ fn start(
     )
     .unwrap();
     (runtime, attachment)
+}
+
+#[test]
+fn a_later_runtime_discovers_the_request_and_the_custodian_takes_a_holders_value_automatically() {
+    use crate::credentials;
+    use aterm_secrets::{
+        fsx,
+        need::{self, Purpose, Want},
+        text::Audience,
+    };
+    let lab = crate::table::tests::Lab::new(&[Role::Writer, Role::Writer, Role::Writer]);
+    for paths in &lab.paths {
+        need::test_alab_policy(paths);
+    }
+    let observers = aterm_tempfile::tempdir().unwrap();
+    let reservation = Multicast::bind(
+        Ipv4Addr::LOCALHOST,
+        Ipv4Addr::new(239, 255, 31, 84),
+        0,
+        LinkScope::Loopback,
+    )
+    .unwrap();
+    let port = reservation.port();
+    let (custodian, _) = start(&lab, observers.path(), 0, port);
+    let (holder, holder_attachment) = start(&lab, observers.path(), 1, port);
+
+    let requester_paths = &lab.paths[2];
+    need::raise(
+        requester_paths,
+        Want::Mailbox("automatic".into()),
+        Purpose::ByHand,
+    )
+    .unwrap();
+    credentials::pass(requester_paths).unwrap();
+    let scope = crate::catalog::Descriptor::application(
+        lab.bootstrap(2).trust(),
+        "credentials",
+        "requests",
+        1,
+    )
+    .unwrap()
+    .scope
+    .digest();
+    // The requester joins the running owners through discovery; no endpoint/address is supplied.
+    let (requester, requester_attachment) = start(&lab, observers.path(), 2, port);
+    holder_attachment.wait_for(scope, 1, "a new runtime's request reaches a running holder");
+    let source = lab.paths[1].home.join(".secrets");
+    fsx::ensure_private_dir(&source).unwrap();
+    fsx::write_atomic(
+        &source.join("automatic_password"),
+        b"automatic-scratch-password",
+        0o600,
+    )
+    .unwrap();
+    // This is sync.requests' local holder work. It does not open a connection.
+    assert_eq!(credentials::pass(&lab.paths[1]).unwrap().offered, 1);
+    requester_attachment.wait_for(
+        scope,
+        4,
+        "an automatic runtime handoff retains Published on the requester",
+    );
+    requester.stop();
+    holder.stop();
+    custodian.stop();
+    let book = credentials::observe(requester_paths).unwrap().book;
+    assert!(book.threads.values().any(
+        |thread| thread.want == Want::Mailbox("automatic".into()) && thread.published.is_some()
+    ));
+    let admin = client::admin_cached(&lab.paths[0]).unwrap();
+    assert_eq!(
+        admin
+            .doc
+            .entry(&Audience::Hosts(vec!["m3".into()]), "automatic_password")
+            .unwrap()
+            .value
+            .as_slice(),
+        b"automatic-scratch-password"
+    );
+    for host in ["m1", "m2"] {
+        assert!(
+            admin
+                .doc
+                .entry(&Audience::Hosts(vec![host.into()]), "automatic_password")
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn a_request_retirement_reaches_the_holder_and_cleans_its_private_give_without_a_custodian() {
+    use crate::credentials;
+    use aterm_secrets::{
+        SecretBytes,
+        need::{self, Purpose, Want},
+    };
+    let lab = crate::table::tests::Lab::new(&[Role::Writer, Role::Writer, Role::Writer]);
+    for paths in &lab.paths {
+        need::test_alab_policy(paths);
+    }
+    let observers = aterm_tempfile::tempdir().unwrap();
+    let reservation = Multicast::bind(
+        Ipv4Addr::LOCALHOST,
+        Ipv4Addr::new(239, 255, 31, 84),
+        0,
+        LinkScope::Loopback,
+    )
+    .unwrap();
+    let requester_paths = &lab.paths[2];
+    need::raise(
+        requester_paths,
+        Want::Mailbox("withdrawn".into()),
+        Purpose::ByHand,
+    )
+    .unwrap();
+    credentials::pass(requester_paths).unwrap();
+    let scope = crate::catalog::Descriptor::application(
+        lab.bootstrap(2).trust(),
+        "credentials",
+        "requests",
+        1,
+    )
+    .unwrap()
+    .scope
+    .digest();
+    // The custodian is offline: only the two non-admin runtimes participate.
+    let (holder, holder_attachment) = start(&lab, observers.path(), 1, reservation.port());
+    let (requester, requester_attachment) = start(&lab, observers.path(), 2, reservation.port());
+    holder_attachment.wait_for(scope, 1, "the holder retained the request");
+    credentials::give_from(&lab.paths[1], "mailbox:withdrawn", || {
+        Ok(SecretBytes::from(b"scratch-withdrawn-password".as_slice()))
+    })
+    .unwrap();
+    requester_attachment.wait_for(scope, 2, "the requester retained the holder's Offer");
+    need::retire(
+        requester_paths,
+        "mailbox:withdrawn",
+        false,
+        "scratch request ended",
+    )
+    .unwrap();
+    credentials::pass(requester_paths).unwrap();
+    holder_attachment.wait_for(scope, 3, "the holder retained the requester's retirement");
+    requester.stop();
+    holder.stop();
+    let retained = credentials::observe(&lab.paths[1]).unwrap();
+    assert_eq!(retained.book.threads.len(), 1, "{retained:?}");
+    assert!(
+        retained.book.threads.values().all(|thread| thread.ended()),
+        "{retained:?}"
+    );
+    credentials::pass(&lab.paths[1]).unwrap();
+    assert!(std::fs::read_dir(&lab.paths[1].dir).unwrap().all(|file| {
+        !file
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("credential-give-")
+    }));
+}
+
+#[test]
+fn damaged_catalog_recovers_peer_data_automatically_without_resuming_its_writer() {
+    for (healthy_primary, retained_recovery) in [(false, false), (true, false), (true, true)] {
+        damaged_catalog_recovery(healthy_primary, retained_recovery);
+    }
+}
+
+fn damaged_catalog_recovery(healthy_primary: bool, retained_recovery: bool) {
+    use crate::{
+        catalog::Directory,
+        table::{Session, store::Store},
+    };
+    let roles = vec![Role::Writer; if retained_recovery { 3 } else { 2 }];
+    let lab = crate::table::tests::Lab::new(&roles);
+    let source_bootstrap = lab.bootstrap(0);
+    let source_session = Session::open(&source_bootstrap).unwrap();
+    let source_directory = Directory::new(&lab.paths[0], source_bootstrap.trust());
+    let scope = source_directory
+        .open_application(&source_session, "recovery-probe", "records", 1)
+        .unwrap();
+    let mut source_store = Store::open(
+        &source_session,
+        &source_directory.path(scope).unwrap(),
+        scope,
+    )
+    .unwrap();
+    let marker = source_store
+        .commit_catalog(&source_session, b"peer-data-after-catalog-loss")
+        .unwrap();
+    drop((source_store, source_session));
+
+    let receiver_bootstrap = lab.bootstrap(1);
+    let receiver_session = Session::open(&receiver_bootstrap).unwrap();
+    let receiver_directory = Directory::new(&lab.paths[1], receiver_bootstrap.trust());
+    receiver_directory.snapshot(&receiver_session).unwrap();
+    let local_marker = healthy_primary.then(|| {
+        assert_eq!(
+            receiver_directory
+                .open_application(&receiver_session, "recovery-probe", "records", 1)
+                .unwrap(),
+            scope
+        );
+        receiver_directory
+            .open_store(&receiver_session, scope)
+            .unwrap()
+            .commit_catalog(
+                &receiver_session,
+                b"retained-only-on-the-recovering-machine",
+            )
+            .unwrap()
+    });
+    let recovered_marker = retained_recovery.then(|| {
+        let offline = lab.bootstrap(2);
+        let session = Session::open(&offline).unwrap();
+        let directory = Directory::new(&lab.paths[2], offline.trust());
+        assert_eq!(
+            directory
+                .open_application(&session, "recovery-probe", "records", 1)
+                .unwrap(),
+            scope
+        );
+        let mut store = directory.open_store(&session, scope).unwrap();
+        let receipt = store
+            .commit_catalog(&session, b"retained-from-an-offline-third-peer")
+            .unwrap();
+        let wire = store.wire(&session, &receipt.id).unwrap().unwrap().to_vec();
+        Store::join_recovery(
+            &receiver_session,
+            &receiver_directory.recovery().path(scope).unwrap(),
+            scope,
+        )
+        .unwrap()
+        .ingest(&receiver_session, &wire)
+        .unwrap();
+        receipt
+    });
+    let catalog_scope = receiver_directory.catalog_scope();
+    let original_directory = receiver_directory.path(catalog_scope).unwrap();
+    let original_claim_path = crate::table::store::claim_dir(&receiver_session)
+        .unwrap()
+        .join(crate::table::store::claim_name(catalog_scope));
+    let original_claim = std::fs::read(&original_claim_path).unwrap();
+    let displaced = lab._home.path().join("preserved-original-catalog");
+    std::fs::rename(&original_directory, &displaced).unwrap();
+    let original_log = std::fs::read(displaced.join("table.astream")).unwrap();
+    assert!(
+        receiver_directory
+            .snapshot_existing(&receiver_session)
+            .is_err()
+    );
+    drop(receiver_session);
+
+    let observers = aterm_tempfile::tempdir().unwrap();
+    let reservation = Multicast::bind(
+        Ipv4Addr::LOCALHOST,
+        Ipv4Addr::new(239, 255, 31, 84),
+        0,
+        LinkScope::Loopback,
+    )
+    .unwrap();
+    let (source, source_attachment) = start(&lab, observers.path(), 0, reservation.port());
+    let (receiver, attachment) = start(&lab, observers.path(), 1, reservation.port());
+    attachment.wait_for(
+        scope.digest(),
+        1,
+        "a recovery replica retained peer data automatically",
+    );
+    receiver.stop();
+    let session = Session::observe(&receiver_bootstrap).unwrap();
+    let store = receiver_directory.observe_table(&session, scope).unwrap();
+    assert!(
+        store
+            .inventory(&session)
+            .unwrap()
+            .any(|id| *id == marker.id),
+        "ordinary readers must see the newly received peer row beside healthy primary data"
+    );
+    drop((store, session));
+    if healthy_primary {
+        source_attachment.wait_for(
+            scope.digest(),
+            2 + usize::from(retained_recovery),
+            "a healthy primary row is relayed while its catalog recovers",
+        );
+    }
+    let source_session = Session::open(&source_bootstrap).unwrap();
+    let mut source_store = Store::open(
+        &source_session,
+        &source_directory.path(scope).unwrap(),
+        scope,
+    )
+    .unwrap();
+    let next = source_store
+        .commit_catalog(&source_session, b"after-recovery-restart")
+        .unwrap();
+    drop((source_store, source_session));
+    let (receiver, attachment) = start(&lab, observers.path(), 1, reservation.port());
+    attachment.wait_for(
+        scope.digest(),
+        2 + usize::from(healthy_primary) + usize::from(retained_recovery),
+        "the restarted recovery replica caught up automatically",
+    );
+    receiver.stop();
+    source.stop();
+
+    let bootstrap = lab.bootstrap(1);
+    let session = Session::observe(&bootstrap).unwrap();
+    let observed = receiver_directory.snapshot_existing(&session).unwrap();
+    assert!(observed.recovery);
+    assert!(observed.entries.contains_key(&scope.digest()));
+    let store = receiver_directory.observe_table(&session, scope).unwrap();
+    assert_eq!(store.is_recovery(), !healthy_primary || retained_recovery);
+    let records = store.catalog(&session).unwrap();
+    let expected: BTreeSet<_> = [marker.id, next.id]
+        .into_iter()
+        .chain(local_marker.map(|receipt| receipt.id))
+        .chain(recovered_marker.map(|receipt| receipt.id))
+        .collect();
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record.header().id)
+            .collect::<BTreeSet<_>>(),
+        expected
+    );
+    assert_eq!(std::fs::read(&original_claim_path).unwrap(), original_claim);
+    assert_eq!(
+        std::fs::read(displaced.join("table.astream")).unwrap(),
+        original_log
+    );
+    assert!(
+        !original_directory.exists(),
+        "recovery cannot recreate the original writer directory"
+    );
+    drop((store, session));
+    let session = Session::open(&bootstrap).unwrap();
+    assert!(
+        receiver_directory
+            .open_application(&session, "recovery-probe", "records", 1)
+            .is_err()
+    );
+    let recovery_directory = receiver_directory.recovery();
+    let fenced_scope = if healthy_primary {
+        catalog_scope
+    } else {
+        scope
+    };
+    let mut store = recovery_directory
+        .open_store(&session, fenced_scope)
+        .unwrap();
+    assert!(
+        store
+            .commit_catalog(&session, b"never-resume-the-old-sequence")
+            .is_err()
+    );
 }
 
 pub(super) fn wait_network(
@@ -345,6 +703,8 @@ fn automatic_runtime_discovers_tables_catches_up_late_devices_and_transfers_loca
 
 #[test]
 fn windowless_background_runtime_replicates_yields_to_window_and_resumes_with_negative_control() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     let lab = crate::table::tests::Lab::new(&[Role::Writer; 2]);
     let observers = aterm_tempfile::Builder::new()
         .prefix("commons-bg-")
@@ -398,19 +758,49 @@ fn windowless_background_runtime_replicates_yields_to_window_and_resumes_with_ne
         state.via_local_process.is_none() && state.visibility == Visibility::Active
     });
 
-    // Opening an interactive window claims WindowClaim; background runtime yields within one
-    // tick and the window takes the transport lease and local observation.
+    // A new window waiting for its LAN step leaves the working background owner in place.
     let win_progress = Attachment::new(port);
+    let window_ready = Arc::new(AtomicBool::new(false));
+    let ready = window_ready.clone();
+    let (win_tx, win_rx) = std::sync::mpsc::channel();
     let win_runtime = Runtime::start_on(
         lab.paths[1].clone(),
         config_1.clone(),
-        |_| {},
+        move |status| {
+            let _ = win_tx.send(status);
+        },
         Network {
+            lan: LanGate::asking(move || {
+                if ready.load(Ordering::Acquire) {
+                    LanTurn::Open("the window is ready")
+                } else {
+                    LanTurn::Held("the window waits for its LAN step")
+                }
+            }),
             isolated: Some(win_progress.clone()),
             ..Network::default()
         },
     )
     .unwrap();
+    assert_eq!(
+        win_rx.recv_timeout(Duration::from_secs(60)).unwrap(),
+        Status::LanHeld
+    );
+    assert!(
+        !owner::window_claimed(&crate::network_state::directory(&config_1)),
+        "a held window must not make the working background owner yield"
+    );
+    source
+        .write([34; 16], vec![proposal("while-window-waits")])
+        .unwrap();
+    bg_progress.wait_for(
+        table.digest(),
+        2,
+        "background repairs while the window waits",
+    );
+
+    // Once ready, the window claims priority and takes the transport and observation.
+    window_ready.store(true, Ordering::Release);
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let status = bg_rx
@@ -429,7 +819,7 @@ fn windowless_background_runtime_replicates_yields_to_window_and_resumes_with_ne
         .unwrap();
     win_progress.wait_for(
         table.digest(),
-        2,
+        3,
         "window runtime replicated write while holding lease",
     );
 
@@ -441,8 +831,8 @@ fn windowless_background_runtime_replicates_yields_to_window_and_resumes_with_ne
         .unwrap();
     bg_progress.wait_for(
         table.digest(),
-        3,
-        "background runtime resumed after window exit and replicated third write",
+        4,
+        "background runtime resumed after window exit and replicated fourth write",
     );
 
     bg_runtime.stop();
@@ -450,8 +840,78 @@ fn windowless_background_runtime_replicates_yields_to_window_and_resumes_with_ne
 
     let expected = source.snapshot().unwrap();
     let actual = Proposals::at(lab.paths[1].clone()).snapshot().unwrap();
-    assert_eq!(expected.operations.len(), 3);
+    assert_eq!(expected.operations.len(), 4);
     assert_eq!(actual.cells, expected.cells);
+}
+
+/// A push hands a claims row on now: once the owner's push says a peer took it, the peer reads the
+/// row's new revision, though its rounds take turns with another table. A runtime that serves no
+/// repair says so at once.
+///
+/// NEGATIVE CONTROL: drop `board.take()` from `serve_mode`'s loop (the owner never takes the ask),
+/// and the push waits out its one-minute deadline: `TimedOut`, not `Reached`.
+#[test]
+fn a_pushed_claims_row_reaches_a_peer_before_the_push_returns() {
+    use crate::accounts::claims;
+    let lab = crate::table::tests::Lab::new(&[Role::Writer; 2]);
+    let observers = aterm_tempfile::Builder::new()
+        .prefix("commons-push-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let source = Proposals::at(lab.paths[0].clone());
+    let table = source.initialize().unwrap();
+    source.write([41; 16], vec![proposal("push")]).unwrap();
+    let row = |counter: u64| {
+        let now = aterm_time::unix_millis().unwrap() / 1000;
+        aterm_json::json!({"counter": counter, "until": now + 3600, "claims": []})
+    };
+    claims::write(&lab.paths[0], &row(1)).unwrap();
+    let me = claims::read(&lab.paths[0]).unwrap().me;
+    let counter = |n: usize| {
+        claims::read(&lab.paths[n]).ok().and_then(|read| {
+            read.rows
+                .iter()
+                .find(|(machine, _)| *machine == me)
+                .and_then(|(_, body)| body["counter"].as_u64())
+        })
+    };
+    assert_eq!(
+        claims::push(
+            &lab.paths[0],
+            &Pusher::default(),
+            Instant::now() + Duration::from_secs(60)
+        )
+        .unwrap(),
+        Pushed::NotServing
+    );
+
+    let group = Ipv4Addr::new(239, 255, 31, 84);
+    let reservation = Multicast::bind(Ipv4Addr::LOCALHOST, group, 0, LinkScope::Loopback).unwrap();
+    let port = reservation.port();
+    let (owner, _) = start(&lab, observers.path(), 0, port);
+    let (peer, progress) = start(&lab, observers.path(), 1, port);
+    progress.wait_for(table.digest(), 1, "the peer took the other table");
+    let until = Instant::now() + Duration::from_secs(60);
+    while counter(1) != Some(1) {
+        assert!(Instant::now() < until, "the peer never took the first row");
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    claims::write(&lab.paths[0], &row(2)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let pushed = loop {
+        // The owner knows its peer once a round it began with it succeeded.
+        match claims::push(&lab.paths[0], &owner.pusher(), deadline).unwrap() {
+            Pushed::NoPeers if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(10))
+            }
+            pushed => break pushed,
+        }
+    };
+    assert_eq!(pushed, Pushed::Reached);
+    assert_eq!(counter(1), Some(2), "the peer holds the pushed revision");
+    peer.stop();
+    owner.stop();
 }
 
 #[test]

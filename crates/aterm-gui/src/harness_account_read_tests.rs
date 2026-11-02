@@ -180,6 +180,7 @@ fn exercise(reader: i64, shape: i64, fault: i64) -> [bool; 4] {
                 ..snap("s-read")
             };
             let agent = WalledAgent {
+                screen_wall: None,
                 snap: &snap,
                 session: "unused",
                 own: true,

@@ -25,13 +25,18 @@ const VER_LINE: &str = "pub const HARNESS_VER: crate::HarnessVersion = crate::Ha
 /// (`HARNESS_VERSION_MAJOR`, `HARNESS_VERSION_MINOR` and `HARNESS_VERSION`).
 #[must_use]
 pub fn declared(text: &str) -> Option<(u16, u16)> {
+    let uint = |s: &str| {
+        (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| s.parse::<u16>().ok())
+            .flatten()
+    };
     let at = text.find(VER_LINE)?;
     let args = text[at + VER_LINE.len()..].split(");").next()?;
     let text_arg = args.split('"').nth(1);
     let numbers: Vec<u16> = args
         .split(',')
         .take(2)
-        .filter_map(|a| a.trim().parse().ok())
+        .filter_map(|a| uint(a.trim()))
         .collect();
     if let ([major, minor], Some(spelled)) = (numbers.as_slice(), text_arg) {
         return (aterm_phase::HarnessVersion::parse_major_minor(spelled) == Some((*major, *minor)))
@@ -44,8 +49,8 @@ pub fn declared(text: &str) -> Option<(u16, u16)> {
     };
     let spelled = constant("HARNESS_VERSION")?.trim_matches('"');
     let parsed = aterm_phase::HarnessVersion::parse_major_minor(spelled)?;
-    let major: u16 = constant("HARNESS_VERSION_MAJOR")?.parse().ok()?;
-    let minor: u16 = constant("HARNESS_VERSION_MINOR")?.parse().ok()?;
+    let major = uint(constant("HARNESS_VERSION_MAJOR")?)?;
+    let minor = uint(constant("HARNESS_VERSION_MINOR")?)?;
     (parsed == (major, minor)).then_some(parsed)
 }
 
@@ -450,6 +455,11 @@ fn read() {}
         assert_eq!(declared(&lying), None, "the text must be the numbers");
         let third = one(4).replace("\"0.4\"", "\"0.4.0\"");
         assert_eq!(declared(&third), None, "never a third part");
+        assert_eq!(declared(&one(4).replace("0, 4,", "+0, 4,")), None);
+        assert_eq!(
+            declared(&THREE.replace("MAJOR: u16 = 0;", "MAJOR: u16 = +0;")),
+            None
+        );
         for harness in CliHarness::ALL {
             let real = std::fs::read_to_string(
                 Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -636,7 +646,10 @@ fn read() {}
         }
         let log = std::fs::read_to_string(tmp.path().join("CHANGELOG.md")).unwrap();
         assert!(log.contains("`alab claude harness 0.2`"), "{log}");
-        assert!(log.contains("`alab codex harness 0.2`"), "{log}");
+        assert!(
+            !log.contains("codex harness"),
+            "Codex versions its own binary: {log}"
+        );
         let again = bump(tmp.path(), &git, ("0.1.0", &released)).unwrap();
         assert!(again.is_empty(), "a second run owes nothing");
         let run = |args: &[&str]| {

@@ -36,6 +36,8 @@ pub enum Reach {
     Selection,
     /// The whole tree, whatever the selection: cheap enough, or not per-crate.
     WholeTree,
+    /// The whole tree unless `-p` names crates: no cone or `--all` narrows it.
+    TreeOrPackages,
 }
 
 /// A check's definition.
@@ -126,12 +128,12 @@ pub const CHECKS: [Spec; 19] = [
         check: Check::Cells,
         name: "cells",
         stages: &[StageId::ForeignCells],
-        reach: Reach::WholeTree,
+        reach: Reach::TreeOrPackages,
         needs: &["rustup"],
         also: "stable's foreign stds and clippy",
-        runs: "every forge cell but this machine's own (or each --cell), linted for its own triple; with \
-               a Windows cell, both windows-sys oracles (aterm-win32-oracle's oracle and oracle-052) \
-               (STOCK EXCEPTION)",
+        runs: "every forge cell but this machine's own (or each --cell), its whole graph linted for its \
+               own triple (-p: those crates alone); with a Windows cell and no -p ruling them out, both \
+               windows-sys oracles (aterm-win32-oracle's oracle and oracle-052) (STOCK EXCEPTION)",
     },
     Spec {
         check: Check::WasmSmoke,
@@ -159,8 +161,8 @@ pub const CHECKS: [Spec; 19] = [
         stages: &[StageId::BrowserLane],
         reach: Reach::WholeTree,
         needs: &["chrome-headless-shell", "firefox", "rustup"],
-        also: "stable's wasm32; on macOS Playwright's WebKit (`verify provision`), whose rows keep windows",
-        runs: "both web modules (dev) in headless Chromium, WebGL2 on ANGLE Metal (macOS) and SwiftShader, in headless Firefox, and in Playwright's WebKit (it keeps a window: a named skip under --no-windows); the GPU module on the page and in a worker (init_offscreen): a WebGL2 boot, GPU vs CPU pixels, GPU vs the recorded wgpu-WebGL frames (STOCK EXCEPTION)",
+        also: "stable's wasm32; on macOS Playwright's WebKit (`verify provision`), whose rows keep windows, and the system Safari, whose `safaridriver` an administrator enables once (`sudo safaridriver --enable`)",
+        runs: "both web modules (dev) in headless Chromium, WebGL2 on ANGLE Metal (macOS) and SwiftShader, in headless Firefox, in Playwright's WebKit (it keeps a window: a named skip under --no-windows), and on macOS in the system Safari over safaridriver (its window takes the desk: it holds the quiet machine, and is a named skip under --no-windows); the GPU module on the page and in a worker (init_offscreen): a WebGL2 boot, GPU vs CPU pixels, GPU vs the recorded wgpu-WebGL frames (STOCK EXCEPTION)",
     },
     Spec {
         check: Check::Libc,
@@ -206,7 +208,8 @@ pub const CHECKS: [Spec; 19] = [
         reach: Reach::WholeTree,
         needs: &["desktop"],
         also: "macOS",
-        runs: "the redraw harness and the objc drives, built in the main target (windows)",
+        runs: "the redraw harness and the objc drives (live-class audit, IME, toolbar, window, event, frame clock), \
+               built in the main target (windows)",
     },
     Spec {
         check: Check::Export,
@@ -298,6 +301,16 @@ impl Check {
     pub fn narrows(self) -> bool {
         self.spec().reach == Reach::Selection
     }
+
+    /// Does this check read `scope`, given how the run selected it?
+    #[must_use]
+    pub fn reads(self, scope: &crate::scope::Scope) -> bool {
+        match self.spec().reach {
+            Reach::Selection => true,
+            Reach::WholeTree => false,
+            Reach::TreeOrPackages => matches!(scope, crate::scope::Scope::Packages(_)),
+        }
+    }
 }
 
 /// A word on the command line.
@@ -382,8 +395,9 @@ pub fn with_pulled(wanted: &[Check], release: bool, holds: impl Fn(&str) -> bool
 /// `cfg`s, the test helpers only its targets compile) are linted on that OS's triple alone, so
 /// a change this machine's lint and tests pass can still break those builds, as the cells
 /// fixes 78f54c26c7, 266437995c and 333be891e9 each repaired on main. The pulled run checks one
-/// cell per other OS, each only where its graph holds a selected crate
-/// ([`crate::cells::pulled_cells`]); `verify cells` checks every cell.
+/// cell per other OS, each only where its graph holds a selected crate, and of that graph `-p`'s
+/// crates, or the cone and its dependents there ([`crate::cells::pulled_cells`],
+/// [`crate::cells::narrows`]); `verify cells` checks every cell's whole graph.
 #[must_use]
 pub fn pulls_cells(wanted: &[Check], release: bool, compiles: bool) -> bool {
     !release && compiles && wanted.contains(&Check::Lint) && !wanted.contains(&Check::Cells)
@@ -498,6 +512,7 @@ pub fn list_table() -> String {
             let over = match s.reach {
                 Reach::Selection => "selection",
                 Reach::WholeTree => "tree",
+                Reach::TreeOrPackages => "tree or -p",
             };
             [
                 s.name.to_string(),

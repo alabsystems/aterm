@@ -174,7 +174,16 @@ fn exercise(cli: Cli, operation: i64, fault: i64) -> [bool; 6] {
     let before = fixture.records();
     let mut expected_state = fixture.store.load(NOW).unwrap().0;
     let mut expected_logins = fixture.store.load_logins(NOW).unwrap().0;
+    let expected_before = expected_logins.clone();
     let expected_events = apply(operation, &mut expected_state, &mut expected_logins);
+    advance_renewal_generations(&expected_before, &mut expected_logins, &expected_events).unwrap();
+    advance_sign_in_receipts(
+        &expected_before,
+        &mut expected_logins,
+        &expected_state,
+        &expected_events,
+    )
+    .unwrap();
     let wakes = expected_events.iter().any(Event::wakes);
     let obstruction = match fault {
         1 => None,

@@ -18,7 +18,7 @@ use crate::artifact::lineage_switch::{self, Switch};
 use crate::artifact::{pkgdoc, upload};
 use crate::ctx::Ctx;
 use crate::error::{Error, Result};
-use crate::host::{Replace, Slug};
+use crate::host::Slug;
 use crate::programs::{self, ProgramDef, Shape};
 use crate::quad::{self, VerifiedQuad};
 use crate::triple::{Os, Triple};
@@ -888,7 +888,7 @@ impl Run<'_> {
                     Error::refused(format!(
                         "the follow-up index {} did not publish ({e}) — {ceremony} carries the \
                          ceremony",
-                        n + 1,
+                        n.saturating_add(1),
                     ))
                 })?;
             self.tx.say(format!(
@@ -927,7 +927,7 @@ impl Run<'_> {
                 self.tx.say(format!(
                     "atpkg-index-{} unpublished: an earlier run signed and uploaded {} — its step \
                      is in {ceremony}",
-                    n + 1,
+                    n.saturating_add(1),
                     signed_earlier
                         .iter()
                         .map(|p| p.name.as_str())
@@ -1360,14 +1360,21 @@ impl Run<'_> {
                 Owner::Staging => &ctx.hosts.staging,
                 Owner::Public => &ctx.hosts.channel,
             };
-            host.upload(&slug, &tag, &files, Replace::Clobber)
-                .map_err(|e| {
-                    Error::refused(format!(
-                        "{name}@{build}: the upload to {slug} {tag} failed ({e}) — {} carries the \
+            upload::publish_pack_to(
+                host.as_ref(),
+                &slug,
+                &tag,
+                &staged,
+                &files,
+                "signed Linux target extension",
+            )
+            .map_err(|e| {
+                Error::refused(format!(
+                    "{name}@{build}: the upload to {slug} {tag} failed ({e}) — {} carries the \
                          ceremony",
-                        ctx.shown(&staged_dir.join("READY.md"))
-                    ))
-                })?;
+                    ctx.shown(&staged_dir.join("READY.md"))
+                ))
+            })?;
         }
         self.tx.say(format!(
             "[{name}@{build}] signed + uploaded {} to both owners",
@@ -1422,15 +1429,20 @@ impl Run<'_> {
         files.push(staged.clone());
         files.push(sig);
         let tag = upload::tag(name, build);
-        ctx.hosts
-            .channel
-            .upload(&slug, &tag, &files, Replace::Clobber)
-            .map_err(|e| {
-                Error::refused(format!(
-                    "{name}@{build}: the public upload an earlier run owed {slug} {tag} failed \
+        upload::publish_pack_to(
+            ctx.hosts.channel.as_ref(),
+            &slug,
+            &tag,
+            &staged,
+            &files,
+            "resume signed Linux target extension",
+        )
+        .map_err(|e| {
+            Error::refused(format!(
+                "{name}@{build}: the public upload an earlier run owed {slug} {tag} failed \
                      ({e}) — nothing indexed"
-                ))
-            })?;
+            ))
+        })?;
         self.tx.say(format!(
             "[{name}@{build}] {slug} lacked the manifest an earlier run signed — uploaded it there"
         ));
@@ -1625,7 +1637,7 @@ impl Ready<'_> {
     /// `READY.md` says what is true when it is read.
     fn render(&self, phase: Phase) -> String {
         let ctx = self.ctx;
-        let (n, next) = (self.n, self.n + 1);
+        let (n, next) = (self.n, self.n.saturating_add(1));
         let key = ctx.shown(&ctx.identity.key);
         let token = ctx.shown(&ctx.tokens.channel);
         let ready = list(self.ready.iter().map(|(p, _)| p.name.as_str()));
@@ -1728,10 +1740,11 @@ impl Ready<'_> {
             return s;
         }
         s.push_str(&format!(
-            "\nThe ceremony, from THIS directory on a rostered machine (do not reformat any \
-             staged file — the signature covers exact bytes; `sign` uses the machine key at \
-             {key}, `upload staging` the staging token and `upload public` the channel token \
-             at {token}):\n\n```sh\n"
+            "\nThe ceremony: resume the updated installed Linux lane on its rostered builder, \
+             with the machine key at {key} and owner tokens including {token}. Keep the staged \
+             files byte-for-byte; the lane verifies their signatures and that each target \
+             addition extends the published manifest, then reserves the exact version on both \
+             owners before uploading. Generic raw public upload cannot perform that repair.\n\n"
         ));
         for (p, new) in self.ready {
             let (name, build) = (&p.name, p.build);
@@ -1739,26 +1752,17 @@ impl Ready<'_> {
             let manifest = rows::local(&staged_manifest(self.staged_dir, name, build)).ok();
             let tarballs: String = new
                 .iter()
-                .filter_map(|t| manifest.as_ref()?.artifact_for(t.as_str()))
-                .map(|a| format!(" {}", dir.join(&a.asset).display()))
+                .filter_map(|target| manifest.as_ref()?.artifact_for(target.as_str()))
+                .map(|artifact| format!(" `{}`", dir.join(&artifact.asset).display()))
                 .collect();
             let pkg = dir.join(pkgdoc::manifest_name(name, build));
             let sig = dir.join(pkgdoc::sig_name(name, build));
-            let tag = upload::tag(name, build);
             s.push_str(&format!(
-                "# --- {name}@{build} ({}) ---\n\
-                 atpkg-publish sign {}\n\
-                 atpkg-publish upload staging {} {tag}{tarballs} {} {}\n\
-                 atpkg-publish upload public {} {tag}{tarballs} {} {}\n",
+                "- {name}@{build} ({}): `{}`, signature `{}`; archives:{tarballs}\n",
                 new.iter()
                     .map(|t| t.as_str())
                     .collect::<Vec<_>>()
                     .join(", "),
-                pkg.display(),
-                p.repo,
-                pkg.display(),
-                sig.display(),
-                p.repo,
                 pkg.display(),
                 sig.display(),
             ));
@@ -1767,15 +1771,13 @@ impl Ready<'_> {
             s.push('\n');
         }
         s.push_str(&format!(
-            "# --- follow-up index {next} (pins unchanged; index_build ratchets so clients \
-             re-plan) ---\natpkg-publish index --upload\n```\n"
+            "```sh\natpkg-publish lane run linux --sha256 <installed-snapshot-sha256>\n```\n\n\
+             Use the SHA recorded by `atpkg-publish lane install linux` for the installed \
+             updated snapshot. The lane resumes a partial same-version publication and then \
+             publishes follow-up index {next}; its pins stay unchanged and clients re-plan. \
+             `atpkg-publish index --upload` also mirrors genuinely new or identical public \
+             packs, but cannot authorize a changed public target extension on its own.\n"
         ));
-        if !self.ready.is_empty() {
-            s.push_str(
-                "\nThe public uploads above are what keep the indexer's pack mirror green: both\n\
-                 owners must carry the SAME replaced manifest bytes, or it refuses the pack.\n",
-            );
-        }
         s
     }
 }

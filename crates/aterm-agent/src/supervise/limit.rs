@@ -67,10 +67,16 @@ pub fn parse_reset(text: &str) -> Option<ResetSpec> {
         [ymd, time @ ..] if iso_month_day(ymd).is_some() => (iso_month_day(ymd), time),
         [month, day, time @ ..] if month_of(month).is_some() => {
             let m = month_of(month)?;
-            let d: u32 = day
-                .trim_end_matches(['s', 't', 'n', 'd', 'r', 'h'])
-                .parse()
-                .ok()?;
+            let day = day
+                .strip_suffix("st")
+                .or_else(|| day.strip_suffix("nd"))
+                .or_else(|| day.strip_suffix("rd"))
+                .or_else(|| day.strip_suffix("th"))
+                .unwrap_or(day);
+            if day.is_empty() || !day.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let d: u32 = day.parse().ok()?;
             if !(1..=31).contains(&d) {
                 return None;
             }
@@ -176,6 +182,9 @@ fn parse_span(s: &str) -> Option<Duration> {
             continue;
         }
         if num.is_empty() {
+            if !c.is_ascii_alphabetic() && !c.is_whitespace() {
+                return None;
+            }
             continue;
         }
         let unit = c.to_ascii_lowercase();
@@ -184,14 +193,15 @@ fn parse_span(s: &str) -> Option<Duration> {
         }
         let n: u64 = num.parse().ok()?;
         num.clear();
-        secs += match unit {
-            'w' => n * 7 * 86_400,
-            'd' => n * 86_400,
-            'h' => n * 3600,
-            'm' => n * 60,
-            's' => n,
+        let unit_secs: u64 = match unit {
+            'w' => 7 * 86_400,
+            'd' => 86_400,
+            'h' => 3600,
+            'm' => 60,
+            's' => 1,
             _ => return None,
         };
+        secs = secs.checked_add(n.checked_mul(unit_secs)?)?;
         any = true;
     }
     (any && num.is_empty()).then(|| Duration::from_secs(secs))
@@ -208,8 +218,22 @@ fn parse_clock(s: &str) -> Option<(u32, u32)> {
         (s.as_str(), None)
     };
     let (h, m) = match digits.split_once(':') {
-        Some((h, m)) => (h.parse::<u32>().ok()?, m.parse::<u32>().ok()?),
-        None => (digits.parse::<u32>().ok()?, 0),
+        Some((h, m)) => {
+            if h.is_empty()
+                || m.len() != 2
+                || !h.bytes().chain(m.bytes()).all(|b| b.is_ascii_digit())
+            {
+                return None;
+            }
+            (h.parse::<u32>().ok()?, m.parse::<u32>().ok()?)
+        }
+        None => {
+            meridian?;
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            (digits.parse::<u32>().ok()?, 0)
+        }
     };
     if m > 59 {
         return None;
@@ -238,11 +262,22 @@ fn month_of(word: &str) -> Option<u32> {
         return None;
     }
     const MONTHS: [&str; 12] = [
-        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+        "january",
+        "february",
+        "march",
+        "april",
+        "may",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
     ];
     MONTHS
         .iter()
-        .position(|m| w.starts_with(m))
+        .position(|m| m.starts_with(&w))
         .map(|i| u32::try_from(i + 1).unwrap_or(1))
 }
 
@@ -250,12 +285,23 @@ fn month_of(word: &str) -> Option<u32> {
 fn iso_month_day(word: &str) -> Option<(u32, u32)> {
     let mut parts = word.split('-');
     let year = parts.next()?;
-    if year.len() != 4 || !year.bytes().all(|b| b.is_ascii_digit()) {
+    let month = parts.next()?;
+    let day = parts.next()?;
+    if parts.next().is_some()
+        || year.len() != 4
+        || month.len() != 2
+        || day.len() != 2
+        || !year
+            .bytes()
+            .chain(month.bytes())
+            .chain(day.bytes())
+            .all(|b| b.is_ascii_digit())
+    {
         return None;
     }
-    let m: u32 = parts.next()?.parse().ok()?;
-    let d: u32 = parts.next()?.parse().ok()?;
-    if parts.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+    let m: u32 = month.parse().ok()?;
+    let d: u32 = day.parse().ok()?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
         return None;
     }
     Some((m, d))
@@ -271,6 +317,58 @@ fn tz_abbrev_zone(tz: &str) -> Option<&'static str> {
         "MDT" | "MST" => Some("America/Denver"),
         _ => None,
     }
+}
+
+/// The offset in seconds a trailing timezone abbreviation names. Claude Code's `%Z` prints the
+/// zone's en-US short name, so Phoenix's row says `MST` in July: the name, not [`tz_abbrev_zone`]'s
+/// zone, tells the offset.
+fn tz_abbrev_offset_s(tz: &str) -> Option<i64> {
+    let hours = match tz.to_ascii_uppercase().as_str() {
+        "UTC" | "GMT" => 0,
+        "ADT" => -3,
+        "AST" | "EDT" => -4,
+        "EST" | "CDT" => -5,
+        "CST" | "MDT" => -6,
+        "MST" | "PDT" => -7,
+        "PST" | "AKDT" => -8,
+        "AKST" | "HADT" => -9,
+        "HST" | "HAST" => -10,
+        _ => return None,
+    };
+    Some(hours * 3600)
+}
+
+/// A done row's clock, less any offset its end names: the `24-hour-utc` format's `16:31Z`, en-US's
+/// `12:31 AM GMT+8` for a zone with no short name, or an abbreviation ([`tz_abbrev_offset_s`]),
+/// which [`parse_reset`] reads past itself. Those last two may sit in parentheses or carry
+/// punctuation; an end naming no offset this knows, `(GMT+0800)`, names none.
+fn row_clock_and_offset(text: &str) -> (&str, Option<i64>) {
+    if let Some(clock) = text
+        .strip_suffix(['Z', 'z'])
+        .filter(|clock| clock.ends_with(|c: char| c.is_ascii_digit()))
+    {
+        return (clock, Some(0));
+    }
+    let tail = text.trim_end_matches([')', '.', ',']);
+    let (clock, end) = tail.split_at(tail.rfind([' ', '(']).map_or(0, |at| at + 1));
+    if let Some(offset) = end.strip_prefix("GMT").and_then(signed_offset_s) {
+        return (clock.trim_end_matches([' ', '(']), Some(offset));
+    }
+    (text, tz_abbrev_offset_s(end))
+}
+
+/// The seconds in `+8`, `-3` or `+5:30`.
+fn signed_offset_s(offset: &str) -> Option<i64> {
+    let (sign, offset) = match offset.split_at_checked(1)? {
+        ("+", rest) => (1, rest),
+        ("-", rest) => (-1, rest),
+        _ => return None,
+    };
+    let (hours, minutes) = offset.split_once(':').unwrap_or((offset, "0"));
+    let hours: u8 = hours.parse().ok()?;
+    let minutes: u8 = minutes.parse().ok()?;
+    (hours <= 14 && minutes < 60)
+        .then(|| sign * (i64::from(hours) * 3600 + i64::from(minutes) * 60))
 }
 
 /// Resolve the reset time in `message` to a Unix timestamp using a fixed `zone_offset` lookup.
@@ -290,14 +388,25 @@ pub fn reset_at_with(
     local_offset_s: i64,
     zone_offset_at: &dyn Fn(&str, i64) -> Option<i64>,
 ) -> i64 {
-    let offset_at = offset_in(spec, local_offset_s, zone_offset_at);
+    reset_at_local(spec, now, &|_| Some(local_offset_s), zone_offset_at)
+}
+
+/// [`reset_at_with`], reading the local zone at the candidate instant as well (`local_at`).
+pub fn reset_at_local(
+    spec: &ResetSpec,
+    now: i64,
+    local_at: &dyn Fn(i64) -> Option<i64>,
+    zone_offset_at: &dyn Fn(&str, i64) -> Option<i64>,
+) -> i64 {
+    let offset_at = offset_in(spec, local_at, zone_offset_at);
     reset_in_zone(spec, now, SESSION_AHEAD_MAX, &offset_at).unwrap_or(now)
 }
 
-/// The offset of the zone `spec` names at an instant, else the local one's.
+/// The offset of the zone `spec` names at an instant, else the local one's. A span names no clock
+/// and a zone known here is not the local one, so neither reads `local_at`.
 fn offset_in<'a>(
     spec: &'a ResetSpec,
-    local_offset_s: i64,
+    local_at: &'a dyn Fn(i64) -> Option<i64>,
     zone_offset_at: &'a dyn Fn(&str, i64) -> Option<i64>,
 ) -> impl Fn(i64) -> Option<i64> + 'a {
     let zone = match spec {
@@ -305,10 +414,8 @@ fn offset_in<'a>(
         ResetSpec::In(_) => None,
     };
     move |unix| {
-        Some(
-            zone.and_then(|z| zone_offset_at(z, unix))
-                .unwrap_or(local_offset_s),
-        )
+        zone.and_then(|z| zone_offset_at(z, unix))
+            .or_else(|| local_at(unix))
     }
 }
 
@@ -329,17 +436,17 @@ pub fn reset_in_zone(
     };
     let clock = i64::from(*hour) * 3600 + i64::from(*minute) * 60;
     let now_offset = offset_at(now)?;
-    let (y, m, d) = civil((now + now_offset).div_euclid(86_400));
+    let (y, m, d) = civil(now.saturating_add(now_offset).div_euclid(86_400));
     let place = |day: i64| -> Option<i64> {
-        let local = day * 86_400 + clock;
-        Some(local - offset_at(local - now_offset)?)
+        let local = day.checked_mul(86_400)?.checked_add(clock)?;
+        local.checked_sub(offset_at(local.saturating_sub(now_offset))?)
     };
     match date {
         Some((month, day)) => {
             let mut best: Option<i64> = None;
-            for year in [y - 1, y, y + 1] {
+            for year in [y.saturating_sub(1), y, y.saturating_add(1)] {
                 let at = place(days_from_civil(year, *month, *day))?;
-                if best.is_none_or(|b| (at - now).abs() < (b - now).abs()) {
+                if best.is_none_or(|b| at.abs_diff(now) < b.abs_diff(now)) {
                     best = Some(at);
                 }
             }
@@ -351,8 +458,8 @@ pub fn reset_in_zone(
             if today > now {
                 return Some(today);
             }
-            let tomorrow = place(today_day + 1)?;
-            Some(if tomorrow - now < ahead_max {
+            let tomorrow = place(today_day.saturating_add(1))?;
+            Some(if tomorrow.saturating_sub(now) < ahead_max {
                 tomorrow
             } else {
                 today
@@ -369,14 +476,58 @@ pub const CLOCK_SLACK_S: i64 = 6 * 60;
 
 /// Fold a bare session-limit clock time back by one day when `at` exceeds `now + SESSION_AHEAD_MAX`.
 #[must_use]
-pub const fn within_a_session_window(spec: &ResetSpec, at: i64, now: i64) -> i64 {
-    if matches!(spec, ResetSpec::At { date: None, .. })
-        && at.saturating_sub(now) > SESSION_AHEAD_MAX
+pub fn within_a_session_window(spec: &ResetSpec, at: i64, now: i64) -> i64 {
+    within_a_session_window_local(spec, at, now, &|_| Some(0), &|_, _| None)
+}
+
+/// [`within_a_session_window`] by the calendar: the same clock a day before, whichever side of a
+/// daylight change that is. A clock that day skips stays 24 hours before `at`.
+#[must_use]
+pub fn within_a_session_window_local(
+    spec: &ResetSpec,
+    at: i64,
+    now: i64,
+    local_at: &dyn Fn(i64) -> Option<i64>,
+    zone_offset_at: &dyn Fn(&str, i64) -> Option<i64>,
+) -> i64 {
+    if !matches!(spec, ResetSpec::At { date: None, .. })
+        || at.saturating_sub(now) <= SESSION_AHEAD_MAX
     {
-        at - 86_400
-    } else {
-        at
+        return at;
     }
+    let offset = offset_in(spec, local_at, zone_offset_at);
+    let flat = at.saturating_sub(86_400);
+    let same_clock = || {
+        let there = offset(flat)?;
+        let folded = flat.checked_add(offset(at)?)?.checked_sub(there)?;
+        (offset(folded)? == there).then_some(folded)
+    };
+    same_clock().unwrap_or(flat)
+}
+
+/// Whether `at` shows, a whole number of days later, the clock `named` showed in `spec`'s zone
+/// (within a minute). A day across a daylight change is 23 or 25 hours, and a flat 24 hours across
+/// it is another clock.
+#[must_use]
+pub fn is_a_later_day_of(
+    spec: &ResetSpec,
+    at: i64,
+    named: i64,
+    local_at: &dyn Fn(i64) -> Option<i64>,
+    zone_offset_at: &dyn Fn(&str, i64) -> Option<i64>,
+) -> bool {
+    if at.saturating_sub(named) < 43_200 {
+        return false;
+    }
+    let offset = offset_in(spec, local_at, zone_offset_at);
+    let (Some(then), Some(there)) = (offset(at), offset(named)) else {
+        return false;
+    };
+    let before = at
+        .saturating_add(then)
+        .saturating_sub(named.saturating_add(there));
+    let days = before.saturating_add(43_200).div_euclid(86_400);
+    days >= 1 && (before - days * 86_400).abs() < 60
 }
 
 /// Whether `message` names a 5-hour/session limit window.
@@ -394,19 +545,110 @@ pub fn printed_by_the_screen(
     local_offset_s: i64,
     live: bool,
 ) -> Option<i64> {
-    done_row_ended(rows, now, local_offset_s)
-        .or(live.then_some(now - PRINT_LAG_S))
-        .map(|p| p - CLOCK_SLACK_S)
+    printed_from(done_row_ended(rows, now, local_offset_s), now, live)
+}
+
+/// [`printed_by_the_screen`], from the done row's `ended`.
+#[must_use]
+pub fn printed_from(ended: Option<i64>, now: i64, live: bool) -> Option<i64> {
+    ended
+        .or(live.then_some(now.saturating_sub(PRINT_LAG_S)))
+        .map(|p| p.saturating_sub(CLOCK_SLACK_S))
 }
 
 /// Parse the turn completion Unix timestamp from a `done HH:MM` row in `rows`.
 #[must_use]
 pub fn done_row_ended(rows: &[String], now: i64, local_offset_s: i64) -> Option<i64> {
-    let earliest = now - 86_400 + 60;
-    super::policy::turn_end::done_row_clock(rows)
-        .and_then(|c| parse_reset(&c))
-        .and_then(|d| reset_in_zone(&d, earliest, i64::MAX, &|_| Some(local_offset_s)))
-        .filter(|d| *d <= now)
+    done_row_ended_local(rows, now, &|_| Some(local_offset_s))
+}
+
+/// [`done_row_ended`], reading the local zone at each instant (`local_at`): the row was printed
+/// under the offset of its own time, which a daylight change since has moved. The row is the turn
+/// just past, so its clock is the newest instant at or before `now` that shows it: a day of 23
+/// hours can hold one clock twice within the reach, and one of 25 hours can repeat it. A row ending
+/// in an offset ([`row_clock_and_offset`]) names it outright, whichever zone printed it, so that
+/// offset settles the instant. A row naming its date (`2026-11-01 01:30`) is that date in its nearest year,
+/// older than the reach or none while still to come.
+#[must_use]
+pub fn done_row_ended_local(
+    rows: &[String],
+    now: i64,
+    local_at: &dyn Fn(i64) -> Option<i64>,
+) -> Option<i64> {
+    let earliest = now.saturating_sub(86_400).saturating_add(60);
+    let text = super::policy::turn_end::done_row_clock(rows)?;
+    let (clock, named) = row_clock_and_offset(&text);
+    let spec = parse_reset(clock)?;
+    let ResetSpec::At {
+        date, hour, minute, ..
+    } = &spec
+    else {
+        return reset_in_zone(&spec, earliest, i64::MAX, local_at).filter(|d| *d <= now);
+    };
+    let clock = i64::from(*hour) * 3600 + i64::from(*minute) * 60;
+    let offset = |unix: i64| named.or_else(|| local_at(unix));
+    match date {
+        None => newest_instant_of_clock(clock, earliest, now, &offset),
+        Some((month, day)) => {
+            let today = now.checked_add(offset(now)?)?.div_euclid(86_400);
+            let (year, ..) = civil(today);
+            let named = [year.saturating_sub(1), year, year.saturating_add(1)]
+                .map(|year| days_from_civil(year, *month, *day))
+                .into_iter()
+                .min_by_key(|named| named.abs_diff(today))?;
+            newest_instant_on_day(named, clock, i64::MIN, now, &offset)
+        }
+    }
+}
+
+/// The newest instant after `earliest` and at or before `now` at which the local clock reads
+/// `clock` seconds into its day. The reach is under 24 hours but can need three local days: a
+/// change that skips a day's last hour, as Nuuk's does, leaves that clock on neither the day read
+/// nor the one before.
+fn newest_instant_of_clock(
+    clock: i64,
+    earliest: i64,
+    now: i64,
+    local_at: &dyn Fn(i64) -> Option<i64>,
+) -> Option<i64> {
+    let today = now.checked_add(local_at(now)?)?.div_euclid(86_400);
+    [today, today.saturating_sub(1), today.saturating_sub(2)]
+        .into_iter()
+        .find_map(|day| newest_instant_on_day(day, clock, earliest, now, local_at))
+}
+
+/// [`instants_of_clock`], the newest of them after `earliest` and at or before `now`.
+fn newest_instant_on_day(
+    day: i64,
+    clock: i64,
+    earliest: i64,
+    now: i64,
+    local_at: &dyn Fn(i64) -> Option<i64>,
+) -> Option<i64> {
+    instants_of_clock(day, clock, local_at)
+        .into_iter()
+        .flatten()
+        .filter(|at| *at > earliest && *at <= now)
+        .max()
+}
+
+/// The instants at which the local clock reads `clock` seconds into `day`: the offset a day either
+/// side of it, where that offset does hold at the instant it gives. Two for a clock a change
+/// repeats, none for one a change skips, otherwise the one instant: from both sides far from a
+/// change, from one side, the other `None`, on a change's day and the days beside it.
+fn instants_of_clock(
+    day: i64,
+    clock: i64,
+    local_at: &dyn Fn(i64) -> Option<i64>,
+) -> [Option<i64>; 2] {
+    let local = day.checked_mul(86_400).and_then(|d| d.checked_add(clock));
+    let at_offset_near = |side: i64| {
+        let local = local?;
+        let offset = local_at(local.saturating_add(side))?;
+        let at = local.checked_sub(offset)?;
+        (local_at(at)? == offset).then_some(at)
+    };
+    [at_offset_near(-86_400), at_offset_near(86_400)]
 }
 
 /// Resolve a wall's reset Unix timestamp from `message`, `rows`, and `arrived_at`.
@@ -437,16 +679,37 @@ pub fn place_reset_with(
     local_offset_s: i64,
     zone_offset_at: &dyn Fn(&str, i64) -> Option<i64>,
 ) -> i64 {
+    place_reset_local(
+        spec,
+        session_window,
+        now,
+        printed,
+        &|_| Some(local_offset_s),
+        zone_offset_at,
+    )
+}
+
+/// [`place_reset_with`], reading the local zone at the candidate instant as well (`local_at`).
+pub fn place_reset_local(
+    spec: &ResetSpec,
+    session_window: bool,
+    now: i64,
+    printed: Option<i64>,
+    local_at: &dyn Fn(i64) -> Option<i64>,
+    zone_offset_at: &dyn Fn(&str, i64) -> Option<i64>,
+) -> i64 {
     match (spec, printed) {
         (ResetSpec::At { date: None, .. }, Some(printed)) => {
-            let offset_at = offset_in(spec, local_offset_s, zone_offset_at);
+            let offset_at = offset_in(spec, local_at, zone_offset_at);
             match reset_in_zone(spec, printed, i64::MAX, &offset_at) {
-                Some(at) if !session_window || at - printed <= SESSION_AHEAD_MAX => at,
-                Some(_) => reset_at_with(spec, now, local_offset_s, zone_offset_at),
+                Some(at) if !session_window || at.saturating_sub(printed) <= SESSION_AHEAD_MAX => {
+                    at
+                }
+                Some(_) => reset_at_local(spec, now, local_at, zone_offset_at),
                 None => now,
             }
         }
-        _ => reset_at_with(spec, now, local_offset_s, zone_offset_at),
+        _ => reset_at_local(spec, now, local_at, zone_offset_at),
     }
 }
 
@@ -549,6 +812,199 @@ mod tests {
 
     fn at(text: &str) -> i64 {
         reset_at(&parse_reset(text).expect(text), NOW, PDT, zones)
+    }
+
+    /// Los Angeles over 2026-11-01's change and 2027-03-14's.
+    fn la_either_change(unix: i64) -> Option<i64> {
+        Some(if (1_793_523_600..1_805_018_400).contains(&unix) {
+            -8 * 3600
+        } else {
+            -7 * 3600
+        })
+    }
+
+    /// What the wall read at `unix`, seconds into its day.
+    fn clock_at(unix: i64) -> i64 {
+        (unix + la_either_change(unix).unwrap()).rem_euclid(86_400)
+    }
+
+    /// Every clock of the day, read every 23 minutes with seconds on the clock for two days either
+    /// side of a change, against walking the minutes of the reach: the newest minute that showed
+    /// it, or none where no minute did. Los Angeles' two changes, Nuuk's through midnight and a
+    /// half-hour one.
+    /// NEGATIVE CONTROL: dropping the reach's bound, asking two days not three, or answering
+    /// `now` for a clock no minute showed fails.
+    #[test]
+    fn every_clock_of_the_day_is_its_newest_minute_in_the_reach() {
+        fn nuuk(unix: i64) -> Option<i64> {
+            Some(if unix < 1_806_195_600 { -7200 } else { -3600 })
+        }
+        const HALF: i64 = 1_790_000_100;
+        fn half_hour(unix: i64) -> Option<i64> {
+            Some(if unix < HALF { 37_800 } else { 39_600 })
+        }
+        let walk = |change: i64, offset: &dyn Fn(i64) -> Option<i64>| {
+            let mut now = change - 52 * 3600 + 37;
+            while now <= change + 52 * 3600 {
+                let earliest = now - 86_400 + 60;
+                let mut want = vec![None; 1440];
+                let mut minute = now.div_euclid(60) * 60;
+                while minute > earliest {
+                    let clock = (minute + offset(minute).unwrap()).rem_euclid(86_400) / 60;
+                    want[usize::try_from(clock).unwrap()].get_or_insert(minute);
+                    minute -= 60;
+                }
+                for (clock, want) in (0_i64..).zip(want) {
+                    assert_eq!(
+                        newest_instant_of_clock(clock * 60, earliest, now, offset),
+                        want,
+                        "{clock} minutes into the day, read at {now}"
+                    );
+                }
+                now += 23 * 60;
+            }
+        };
+        walk(1_793_523_600, &la_either_change);
+        walk(1_805_018_400, &la_either_change);
+        walk(1_806_195_600, &nuuk);
+        walk(HALF, &half_hour);
+    }
+
+    /// Every minute for a day and a half either side of each change, against walking the minutes
+    /// themselves: a done row's clock, read from zero to 23 hours after it was printed, is the
+    /// newest minute in the reach that showed it.
+    /// NEGATIVE CONTROL: `reset_in_zone`'s first instant past the reach, or a constant offset,
+    /// fails around the change.
+    #[test]
+    fn a_done_rows_clock_is_the_newest_minute_that_showed_it() {
+        for change in [1_793_523_600, 1_805_018_400_i64] {
+            let mut printed = change - 36 * 3600;
+            while printed <= change + 36 * 3600 {
+                for after in [
+                    0,
+                    60,
+                    1800,
+                    3540,
+                    3660,
+                    7200,
+                    5 * 3600,
+                    12 * 3600,
+                    23 * 3600,
+                ] {
+                    let now = printed + after;
+                    let earliest = now - 86_400 + 60;
+                    let clock = clock_at(printed);
+                    let want = (0..=1440)
+                        .map(|m| now - now.rem_euclid(60) - m * 60)
+                        .find(|&at| at > earliest && clock_at(at) == clock);
+                    assert_eq!(
+                        newest_instant_of_clock(clock, earliest, now, &la_either_change),
+                        want,
+                        "printed {printed}, read {after} s after"
+                    );
+                }
+                printed += 60;
+            }
+        }
+    }
+
+    /// Every 10 minutes for two days either side of each change, for clocks every 15 minutes,
+    /// against walking the minutes: a clock within a session's reach is the first coming minute that
+    /// shows it. A clock the change repeats, read from an hour before the change to an hour after
+    /// it, is left out, and a clock it skips has no minute to compare (ATERM-KI-1101-1).
+    /// NEGATIVE CONTROL: placing it by the offset as of now fails around either change.
+    #[test]
+    fn a_zoneless_clock_within_reach_is_the_first_minute_that_shows_it() {
+        let no_zone = |_: &str, _: i64| None;
+        for change in [1_793_523_600, 1_805_018_400_i64] {
+            let mut now = change - 48 * 3600;
+            while now <= change + 48 * 3600 {
+                for clock in (0..86_400).step_by(900) {
+                    let spec = ResetSpec::At {
+                        date: None,
+                        hour: u32::try_from(clock / 3600).unwrap(),
+                        minute: u32::try_from(clock % 3600 / 60).unwrap(),
+                        zone: None,
+                    };
+                    let want = (1..5 * 60)
+                        .map(|m| now + m * 60)
+                        .find(|&at| clock_at(at) == clock);
+                    let repeated = change == 1_793_523_600
+                        && clock / 3600 == 1
+                        && (change - 3600..change + 3600).contains(&now);
+                    if let Some(want) = want.filter(|_| !repeated) {
+                        assert_eq!(
+                            reset_at_local(&spec, now, &la_either_change, &no_zone),
+                            want,
+                            "{clock} s into the day, read at {now}"
+                        );
+                    }
+                }
+                now += 600;
+            }
+        }
+    }
+
+    /// A clock named before either change, read one or two days on, is that clock's later day
+    /// however many hours passed, and a flat 24 hours across a change is another clock.
+    /// NEGATIVE CONTROL: comparing the instants, not the clocks, fails.
+    #[test]
+    fn a_later_day_of_a_clock_is_told_by_the_wall() {
+        let no_zone = |_: &str, _: i64| None;
+        let spec = ResetSpec::At {
+            date: None,
+            hour: 0,
+            minute: 0,
+            zone: None,
+        };
+        let later = |at, named| is_a_later_day_of(&spec, at, named, &la_either_change, &no_zone);
+        // 2026-10-31 23:00 PDT, and the wall's next 23:00: 2026-11-01 23:00 PST, 25 hours on.
+        let named = 1_793_512_800;
+        assert!(later(named + 25 * 3600, named));
+        assert!(later(named + 25 * 3600 + 59, named), "within a minute");
+        assert!(!later(named + 25 * 3600 + 60, named), "past the minute");
+        assert!(later(named + 49 * 3600, named), "two days on");
+        assert!(!later(named + 24 * 3600, named), "22:00, another clock");
+        // 2027-03-13 12:00 PST, and 2027-03-14 12:00 PDT, 23 hours on.
+        let named = 1_805_054_400 - 86_400;
+        assert!(later(named + 23 * 3600, named));
+        assert!(!later(named + 24 * 3600, named), "13:00, another clock");
+        // A day with no change is 24 hours, and the same instant is no later day.
+        let named = 1_781_000_000;
+        assert!(later(named + 86_400, named));
+        assert!(!later(named + 86_400 - 3600, named), "an hour off");
+        assert!(!later(named, named), "the same instant");
+        assert!(!later(named - 86_400, named), "the day before");
+    }
+
+    /// Fold a clock back across either change and it is the same clock a day before: 23 or 25 hours,
+    /// and a flat 24 only where no change lies between. A clock the day skips stays a flat 24.
+    /// NEGATIVE CONTROL: folding a flat 86,400 s fails.
+    #[test]
+    fn a_clock_folded_across_a_change_keeps_its_clock() {
+        let no_zone = |_: &str, _: i64| None;
+        let spec = ResetSpec::At {
+            date: None,
+            hour: 0,
+            minute: 0,
+            zone: None,
+        };
+        let fold =
+            |at, now| within_a_session_window_local(&spec, at, now, &la_either_change, &no_zone);
+        // 2026-11-02 00:30 PST folds to 2026-11-01 00:30 PDT, 25 hours before.
+        let at = 1_793_523_600 + 23 * 3600 + 30 * 60;
+        assert_eq!(fold(at, at - 20 * 3600), at - 25 * 3600);
+        // 2027-03-15 01:30 PDT folds to 2027-03-14 01:30 PST, 23 hours before...
+        let on = 1_805_018_400;
+        let at = on + 22 * 3600 + 30 * 60;
+        assert_eq!(fold(at, at - 20 * 3600), at - 23 * 3600, "01:30 PST");
+        // ...and 2027-03-15 02:30 PDT has no 02:30 the day before.
+        let at = at + 3600;
+        assert_eq!(fold(at, at - 20 * 3600), at - 86_400, "skipped");
+        // No change between, and a clock within the window stays.
+        let at = 1_781_000_000;
+        assert_eq!(fold(at, at - 20 * 3600), at - 86_400);
+        assert_eq!(fold(at, at - 3600), at);
     }
 
     /// A RESET READS AS ITS NOTICE SAID IT, less the zone: the date and the
@@ -680,10 +1136,22 @@ mod tests {
             "soon",
             "in",
             "in h",
+            "in -3h",
+            "in +3h",
+            "15",
+            "+7pm",
+            "7:5pm",
+            "7:+30pm",
             "25pm",
             "13pm",
             "Sep 40 at 1am",
+            "Sep +19 at 11am",
+            "Sep 19h at 11am",
+            "Sep 19stth at 11am",
+            "Maybe 19 at 11am",
             "2026-13-29 09:31 PDT",
+            "2026-+1-29 09:31 PDT",
+            "2026-1-2 09:31 PDT",
             "7:60pm",
         ] {
             assert_eq!(parse_reset(bad), None, "{bad:?}");
@@ -1022,6 +1490,19 @@ mod tests {
         assert_eq!(
             place_reset(&span, false, day0, Some(day0 - 86_400), local, zone),
             day0 + 3 * 3600
+        );
+        assert!(parse_reset("resets in 9999999999999999999w").is_none());
+        assert!(parse_reset("resets in 18446744073709551615h").is_none());
+        let _ = printed_by_the_screen(&[], i64::MIN, 0, true);
+        let _ = within_a_session_window(
+            &ResetSpec::At {
+                date: None,
+                hour: 0,
+                minute: 0,
+                zone: None,
+            },
+            i64::MIN,
+            i64::MIN,
         );
     }
 }

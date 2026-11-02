@@ -25,6 +25,55 @@ pub const CURSOR_WITNESS_ROWS: usize = RIBBON_LIST_ROWS + 1;
 
 const RIBBON_LIST_ROWS: usize = rk::witness::WITNESS_ROWS + rk::witness::ARMING_ROWS;
 
+/// The duration every typed light's life was tuned at: `cursor_trail_ms`'s default.
+pub const TRAIL_DURATION_DEFAULT: Duration = Duration::from_millis(260);
+
+/// The longest a typed light grows to under a longer `cursor_trail_ms` ([`scaled_typed_life`]),
+/// unless the life it was tuned to is longer already.
+pub const TYPED_LIFE_CEIL_S: f32 = 4.0;
+
+/// How much longer a typed light lives at `duration` than at [`TRAIL_DURATION_DEFAULT`]: their
+/// ratio, exactly 1 at the default, so the default draws what it was tuned to. A chained key's
+/// light lives as long as the key gap needs to meet the next key's, and that gap, not the
+/// duration, set its life: so the Duration knob changed nothing a typist saw in Lumen, Phaser
+/// or Sparkle (access r3, r14 PV7). Every typed life is now its tuned life times this.
+#[must_use]
+#[inline]
+pub const fn typed_life_scale(duration: Duration) -> f32 {
+    (duration.as_nanos() as f64 / TRAIL_DURATION_DEFAULT.as_nanos() as f64) as f32
+}
+
+/// The duration a typed light's life is tuned at and the scale it then lives by: the default
+/// and [`typed_life_scale`] as shipped; `duration` itself and exactly 1 when `unscaled` (the
+/// negative control of [`CursorGlow::set_typed_life_scaled`], the lives before access r3).
+#[must_use]
+#[inline]
+pub const fn typed_life_basis(duration: Duration, unscaled: bool) -> (f32, f32) {
+    if unscaled {
+        (duration.as_secs_f32(), 1.0)
+    } else {
+        (
+            TRAIL_DURATION_DEFAULT.as_secs_f32(),
+            typed_life_scale(duration),
+        )
+    }
+}
+
+/// A typed light's `life`, tuned at [`TRAIL_DURATION_DEFAULT`], at `scale`
+/// ([`typed_life_scale`]): no longer than [`TYPED_LIFE_CEIL_S`] where its tuned life was
+/// shorter, and exactly `life` at a scale of 1.
+#[must_use]
+#[inline]
+pub const fn scaled_typed_life(life: f32, scale: f32) -> f32 {
+    let scaled = life * scale;
+    let ceil = if life > TYPED_LIFE_CEIL_S {
+        life
+    } else {
+        TYPED_LIFE_CEIL_S
+    };
+    if scaled > ceil { ceil } else { scaled }
+}
+
 use crate::effect_util::{
     STAR_ARM_FINE, STAR_ARM_INK, STAR_ARM_STD, STAR_CORE, STAR_GLINT, STAR_GLINT_COV,
     TWINKLE_FLASH_BOUND_HZ, dust_r, fire_ramp, lerp_rgb, push_fx_quad, push_fx_rect as push_rect,
@@ -43,6 +92,7 @@ pub mod glass_yield;
 mod icon_shade;
 mod ink_ledger;
 mod light_body;
+mod pin_hold;
 mod probe;
 mod raster;
 mod scroll;
@@ -56,8 +106,9 @@ mod status;
 mod style;
 mod thermal;
 pub(crate) use bed::{
-    AirLight, BedScratch, BedShape, air_lit, clip_quads_to, clip_stream_to, dark_bed_budget,
-    dark_bed_ink, lay_dark_bed, lit_rail_drop, night_rgb, page_lit, page_lit_ink, split_air_runs,
+    AirLight, BedScratch, BedShape, DARK_BED_ALPHA_CAP, air_lit, clip_quads_to, clip_stream_to,
+    dark_bed_budget, dark_bed_ink, lay_dark_bed, lit_rail_drop, night_rgb, page_lit, page_lit_ink,
+    split_air_runs,
 };
 #[cfg(any(test, debug_assertions))]
 pub use caret_letter::CaretLetterLaw;
@@ -68,7 +119,9 @@ pub(crate) use emit::drop_cut_particle;
 use ink_ledger::BandLifts;
 pub(crate) use ink_ledger::InkLedger;
 pub use ink_ledger::OverInkTier;
-pub(crate) use ink_ledger::{LETTER_GUARD_RING, LetterGuard, RIM_SHOWN_SHARE, RIM_UNDER_LETTERS};
+pub(crate) use ink_ledger::{
+    LETTER_GUARD_RING, LetterGuard, RIM_SHOWN_SHARE, RIM_UNDER_LETTERS, ThinCaret,
+};
 pub(crate) use light_body::*;
 pub use probe::*;
 pub use raster::*;
@@ -135,7 +188,7 @@ impl Particle {
     /// ([`CursorGlow::set_edge_cut_by_origin`]).
     #[cfg(any(test, debug_assertions))]
     #[inline]
-    fn origin(&self) -> (Instant, u32, u32) {
+    const fn origin(&self) -> (Instant, u32, u32) {
         (self.born, self.x0.to_bits(), self.y0.to_bits())
     }
 }
@@ -344,6 +397,21 @@ struct OutgoingFade {
     level0: f32,
 }
 
+/// The caret's row's air, column by column, that a dense row seats in
+/// ([`CursorGlow::DENSE_SEAT_HOLD_S`]).
+#[derive(Default)]
+struct SeatAir {
+    /// The row it reads and when it last read it.
+    row: Option<(i32, Instant)>,
+    /// Since when each column of that row has been blank and inside the
+    /// pane; `None` while text lies on it.
+    since: Vec<Option<Instant>>,
+}
+
+/// What a night ground is solved for ([`CursorGlow::night_ground`]): the page, the style, the
+/// colour (a pinned palette's bit beside it) and the accent.
+type NightKey = (u32, GlowStyle, u32, u32);
+
 /// Per-window aurora animation state.
 #[derive(Default)]
 pub struct CursorGlow {
@@ -458,6 +526,7 @@ pub struct CursorGlow {
     last_licensed_row: Option<(u16, Instant)>,
     hand_row: Option<HandRow>,
     unowned_caret: Option<UnownedCaret>,
+    boundary_seq: u64,
     composer_insert_frame: bool,
     composer_entry_at: Option<Instant>,
     composer_boundary: Option<Instant>,
@@ -806,7 +875,17 @@ pub struct CursorGlow {
     fire_cores_ungrounded: bool,
     /// The page, style and colour [`night_ground`] was last solved for, and
     /// its answer.
-    night_memo: Option<((u32, GlowStyle, u32), Option<NightGround>)>,
+    night_memo: Option<(NightKey, Option<NightGround>)>,
+    /// Debug and test seam: Classic's one-colour face lays no night ground and
+    /// its bed mixes toward the page (`EffectsPipeline::set_classic_pin_ground`,
+    /// composed r2's O4(b) negative control).
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) classic_pin_ground_off: bool,
+    /// Debug and test seam: Classic's one-colour face solves its night ground toward its
+    /// lights' own hue, as composed r2's did (`EffectsPipeline::set_classic_ground_neutral`,
+    /// [`GroundRule::OwnHue`]).
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) classic_ground_own_hue: bool,
     #[cfg(test)]
     fire_row_unheld: bool,
     #[cfg(test)]
@@ -855,6 +934,16 @@ pub struct CursorGlow {
     /// them (looks10 L2's negative control, [`Self::DENSE_SEAT_CELLS`]).
     #[cfg(test)]
     dense_seats_off: bool,
+    /// Test-only: Sparkle's paper marks keep the glyph band of the typed
+    /// line behind the caret, among its letters, as composed r2 let them
+    /// (the negative control of the paper card's false `:`).
+    #[cfg(test)]
+    sparkle_typed_band_open: bool,
+    /// Test-only (and debug builds, for aterm-render's replay): paper
+    /// Lumen's sparks live as briefly as the dark face's, as composed r2
+    /// laid them ([`Self::LUMEN_PAPER_CHAIN_KEYS`]'s negative control).
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) lumen_paper_brief: bool,
     /// Test-only: a dense row's seat read every frame at the caret's column
     /// rather than at each particle's birth, as looks10 round 3 read it: a
     /// caret stepping past a gap in the rows beside it unseated, then
@@ -888,6 +977,15 @@ pub struct CursorGlow {
     /// negative control, [`Self::COMET_SEAT_TAIL_HALF`]).
     #[cfg(test)]
     comet_seat_pinned: bool,
+    /// The air a dense row seats in (Comet's head, Sparkle's and Fire's
+    /// seated particles), column by column: a seat lights only once its
+    /// cells have held clear ([`Self::DENSE_SEAT_HOLD_S`]).
+    seat_air: SeatAir,
+    /// Test-only: a dense row's seats light the frame the air past the
+    /// caret turns clear, at full light, as round 3 laid them (E2's negative
+    /// control, [`Self::DENSE_SEAT_HOLD_S`]).
+    #[cfg(test)]
+    dense_seat_unheld: bool,
     #[cfg(test)]
     fire_meteor_joined: bool,
     #[cfg(test)]
@@ -909,8 +1007,53 @@ pub struct CursorGlow {
     /// reads a letter's ink as its raster lays it, not as its colour whole. `None` (no host
     /// said): every glyph's ink is judged solid.
     glyph_ink: Option<std::sync::Arc<aterm_render::GlyphInk>>,
+    /// The host's observation is available; the carrier separately checks the exact input.
+    glyph_frame_available: bool,
     #[cfg(test)]
     light_body_unsolved: bool,
+    /// A test's negative control: the light ground reads no colour as one the user chose
+    /// ([`LightGround::chosen`]), so a pinned colour's paper ink is its hue's vivid ink
+    /// ([`Self::set_chosen_ink`]).
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) chosen_ink_unread: bool,
+    /// A test's negative control: Comet's dark dust stays the tail's ice under a pinned trail
+    /// colour ([`Self::set_comet_pin_dust`]).
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) comet_pin_dust_iced: bool,
+    /// A test's negative control: under a pinned trail colour, Comet still lays its icy
+    /// nucleus and dense-row seat ([`Self::set_comet_pin_head`]).
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) comet_pin_head_iced: bool,
+    /// A test's negative control: a typed light's life is the one tuned at the default
+    /// duration whatever `cursor_trail_ms` says ([`Self::set_typed_life_scaled`]).
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) typed_life_unscaled: bool,
+    /// A test's negative control: the Rainbow Kitty's band under the caret crosses the whole
+    /// cell behind a bar too ([`Self::set_ribbon_bar_band`]).
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) ribbon_band_cell_wide: bool,
+    /// A test's negative control: a pinned trail's lights on a dark page keep the hue and
+    /// chroma each body laid them in, not the pin's ([`Self::set_pin_chroma`]).
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) pin_chroma_free: bool,
+    /// A test's negative control: the pinned lights' hold cuts every light to the pin's share
+    /// at its luminance, as composed r2's did ([`Self::set_pin_hold_two_sided`]).
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) pin_one_sided: bool,
+    /// A test's negative control: a thin caret is drawn in its own colour on whatever light
+    /// its cell holds ([`Self::set_thin_caret_read`]).
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) thin_caret_free: bool,
+    /// The thin caret this frame read and the ground it is read against
+    /// ([`Self::hold_light_for_thin_caret`], [`Self::thin_caret_fill`]).
+    pub(crate) thin_caret_read: Option<(ThinCaret, u32)>,
+    /// The frame's lights over a thin caret's cell, laid out, under the text and over it
+    /// ([`Self::hold_light_for_thin_caret`]).
+    pub(crate) thin_caret_laid: [Vec<GlowQuad>; 2],
+    /// The light over a thin caret's cell, pixel by pixel, row-major.
+    pub(crate) thin_caret_px: Vec<u32>,
+    /// The channels of the light over a thin caret's cell, sampled for their medians.
+    pub(crate) thin_caret_chans: [Vec<u8>; 3],
     #[cfg(test)]
     fire_light_squat: bool,
     /// Test-only: lay a paper tongue's root in the flame's 2 px slabs over a 3 px ease, the
@@ -959,13 +1102,6 @@ pub struct CursorGlow {
     /// The flying head's drawn body box this frame, grid pixels
     /// `(x0, x1, y0, y1)` ([`Self::note_head_body`]).
     head_body: Option<(i32, i32, i32, i32)>,
-    /// A test's negative control: no page veil under the pet's letters.
-    #[cfg(any(test, debug_assertions))]
-    pet_veil_off: bool,
-    /// A test's negative control: the veil reads the trail's text about the
-    /// caret, not the body's rows ([`Self::set_pet_veil_caret_rows`]).
-    #[cfg(any(test, debug_assertions))]
-    pet_veil_caret_rows: bool,
     /// A test's cost for the beams' runs in place of the measured one
     /// ([`Self::set_glow_ramps`], [`Self::set_ramp_cost`]).
     #[cfg(any(test, debug_assertions, feature = "dev-seams"))]
@@ -974,32 +1110,6 @@ pub struct CursorGlow {
     /// ([`Self::fold_glow_ramps`]; unset, this crate's unit tests fold).
     #[cfg(any(test, debug_assertions))]
     fold_rows: Option<bool>,
-    /// The caret and geometry the frame's step drew by, which the pet's veil,
-    /// drawn after the pet's tick, lays its runs by ([`Self::veil_pet_letters`]).
-    veil_frame: Option<(Option<(u16, u16)>, Geom)>,
-    /// The frame's text on the rows the pet's body lay on last frame, padded
-    /// ([`Self::observe_frame_text_at`]), which its page veil reads: the
-    /// trail's own read keeps to the caret's rows.
-    pet_text: FrameText,
-    /// The veil the last [`Self::veil_pet_letters`] laid, which a host that
-    /// projects the trail's streams again without a pet tick (a split
-    /// pane's cursor-only frame) lays again ([`Self::pet_veil`]).
-    pet_veil: Vec<GlowQuad>,
-    /// A test's negative control: the veil over the body's box, not its silhouette.
-    #[cfg(any(test, debug_assertions))]
-    pet_veil_boxed: bool,
-    /// A test's negative control: the veil laid over every light, not
-    /// beneath them ([`Self::set_pet_veil_beneath`]).
-    #[cfg(any(test, debug_assertions))]
-    pet_veil_over: bool,
-    /// A test's negative control: the veil cut at its row's edges, with no
-    /// rise ([`Self::set_pet_veil_risen`]).
-    #[cfg(any(test, debug_assertions))]
-    pet_veil_sliced: bool,
-    /// A test's negative control: the rise feathered its whole height
-    /// however shallow the coat's cut ([`Self::set_pet_veil_feather_deep`]).
-    #[cfg(any(test, debug_assertions))]
-    pet_veil_deep: bool,
     /// A test's negative control: a word gap's bed keeps its own knot's ink
     /// ([`bed::bridge_word_gaps`]).
     #[cfg(any(test, debug_assertions))]
@@ -1525,6 +1635,8 @@ impl CursorGlow {
     const FIRE_DARK_SPACING: f32 = 0.85;
     const FIRE_DARK_HALF_W: f32 = 0.70;
     const FIRE_DARK_TONGUE_SHAPE: f32 = 1.43;
+    /// Where under a letter with no descender a kept flame's hold eases off, a share of a cell
+    /// from the row's top (its baseline), and the judge's ring past it ([`Self::fire_low_top`]).
     const FIRE_DARK_LOW_BAND: f32 = 0.80;
     const FIRE_DARK_AIR_FIELD_REACH: f32 = 1.8;
     const FIRE_DARK_CORE_REACH: f32 = 0.70;
@@ -1841,6 +1953,24 @@ impl CursorGlow {
     /// shares of the head's radius: broad where it leaves the caret,
     /// narrowing into the head.
     const COMET_SEAT_TAIL_HALF: (f32, f32) = (1.2, 0.85);
+    /// A DENSE ROW'S SEATS HOLD BEFORE THEY LIGHT (composed E2): Comet's
+    /// head ([`Self::COMET_SEAT_CELLS`]) and Sparkle's and Fire's seated
+    /// particles ([`Self::DENSE_SEAT_CELLS`]) lie in the air past the caret,
+    /// where a shell's ghost text (fish's autosuggestion, a prompt's hint)
+    /// lands a frame or two after the keystroke's echo. Lit the frame that
+    /// air turned clear, a seat flashed for that frame and was gone under
+    /// the hint on every key. A seat lights only once the air has stayed
+    /// clear this long, s, and rises to its full light over
+    /// [`Self::DENSE_SEAT_RISE_S`]; text landing on it puts it out at once
+    /// (the letters win).
+    pub(super) const DENSE_SEAT_HOLD_S: f32 = 0.06;
+    /// How long, s, a held seat takes to rise to its full light
+    /// ([`Self::DENSE_SEAT_HOLD_S`]).
+    const DENSE_SEAT_RISE_S: f32 = 0.09;
+    /// The caret's row's air ([`SeatAir`]) not read for longer than this, s
+    /// (no frame ran), is read afresh, so a clear it did not see hold never
+    /// lights a seat at once ([`Self::DENSE_SEAT_HOLD_S`]).
+    const DENSE_SEAT_SEEN_S: f32 = 0.1;
     const WATER_SWELL: (f32, f32) = (0.08, 0.12);
     const WATER_KNOTS: usize = 4;
     const LIGHT_WATER_DROP_INKS: (u32, u32) = (0x0010_6EB4, 0x0036_A8E2);
@@ -1858,6 +1988,20 @@ impl CursorGlow {
     /// Distance in cells from the path's head at which the laser aura fades to zero.
     pub(super) const LASER_AURA_REACH_CELLS: f32 = 2.0;
     const CRACKLE_TRAIL_CELLS: usize = 12;
+    /// Lumen's paper tracer: each typing spark lives as long as this many
+    /// keys take at the hand's pace (and [`Self::CHAIN_MARGIN`]), so the
+    /// tracer reaches back over the last few letters and lingers a moment
+    /// after the last key. With the dark face's brief life (about one key
+    /// and a tenth of a second) the paper tracer was two cells long and gone
+    /// 120 ms after the last key, and at rest paper Lumen was Off (composed
+    /// r2's judges, O9(b)).
+    const LUMEN_PAPER_CHAIN_KEYS: f32 = 7.0;
+    /// The longest a paper Lumen spark lives ([`Self::LUMEN_PAPER_CHAIN_KEYS`]).
+    const LUMEN_PAPER_LIFE_MAX: f32 = 0.9;
+    /// Paper Lumen's tracer: its spine's drop below the row's centre and its
+    /// soft reach either side, as shares of the cell height, a glow along
+    /// the foot of the letters just typed.
+    pub(super) const LUMEN_PAPER_TRACER: (f32, f32) = (0.30, 0.20);
     const BEAM_CHAIN_KEYS: f32 = 3.5;
     const BEAM_CHAIN_GAP_MAX: f32 = 0.75;
     const BEAM_CHAIN_LIFE_MAX: f32 = 1.2;
@@ -1924,6 +2068,143 @@ impl CursorGlow {
     #[inline]
     pub const fn set_colour_pins(&mut self, pins: ColourPins) {
         self.colour_pins = pins;
+    }
+
+    /// A test's negative control: `on` (as shipped), a pinned trail colour's light-ground inks
+    /// keep its chroma ([`LightGround::chosen`]); off, they are its hue's vivid ink.
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_chosen_ink(&mut self, on: bool) {
+        self.chosen_ink_unread = !on;
+    }
+
+    /// A test's negative control: `on` (as shipped), Comet's dark dust wears a pinned trail
+    /// colour; off, it stays the tail's ice.
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_comet_pin_dust(&mut self, on: bool) {
+        self.comet_pin_dust_iced = !on;
+    }
+
+    /// A test's negative control: `on` (as shipped), a pinned trail colour lays no icy head
+    /// (Comet's nucleus and its dense row's seat); off, it lays them as the unpinned comet does.
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_comet_pin_head(&mut self, on: bool) {
+        self.comet_pin_head_iced = !on;
+    }
+
+    /// A test's negative control: `on` (as shipped), the Rainbow Kitty's band under the caret
+    /// ends just past a bar (`rk::Config::head_dx`); off, it crosses the bar's whole cell as it
+    /// did under a block.
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_ribbon_bar_band(&mut self, on: bool) {
+        self.ribbon_band_cell_wide = !on;
+    }
+
+    /// A test's negative control: `on` (as shipped), every light of a pinned trail on a dark
+    /// page is worn in the pin's hue and chroma at the light it lays
+    /// ([`Self::hold_pinned_lights`]); off, each keeps the hue and chroma its body laid it in
+    /// (a lift that scaled the pin's channels toward full, a style's own tints).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_pin_chroma(&mut self, on: bool) {
+        self.pin_chroma_free = !on;
+    }
+
+    /// A test's negative control: `on` (as shipped), a typed light lives
+    /// [`typed_life_scale`] times the life tuned at the default duration, in every style's
+    /// sparks, Classic's wake and the Rainbow Kitty's ribbon; off, it lives the tuned life
+    /// whatever `cursor_trail_ms` says, as before access r3 (a chained key's life came from
+    /// the key gap alone, so the Duration knob changed nothing a typist saw).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_typed_life_scaled(&mut self, on: bool) {
+        self.typed_life_unscaled = !on;
+        self.classic.typed_life_unscaled = !on;
+    }
+
+    /// A test's negative control: `on` (as shipped), Classic's one-colour face lays a chosen
+    /// colour's dark bed and rail at its own chroma; off, at the bed's and rail's saturation
+    /// floors, as before composed O10(a).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_classic_pin_own_chroma(&mut self, on: bool) {
+        self.classic.mono_pin_floored = !on;
+    }
+
+    /// Whether a typed light lives its tuned life whatever the duration
+    /// ([`Self::set_typed_life_scaled`]'s negative control): `false` as shipped.
+    #[inline]
+    pub(crate) const fn typed_life_unscaled(&self) -> bool {
+        #[cfg(any(test, debug_assertions))]
+        {
+            self.typed_life_unscaled
+        }
+        #[cfg(not(any(test, debug_assertions)))]
+        {
+            false
+        }
+    }
+
+    /// A test's negative control: `on` (as shipped), the pinned lights' hold keeps a light's own
+    /// chroma up to the pin's where it is bright enough not to stack past it
+    /// ([`pin_hold`]'s `kept_chroma`); off, every light is cut to the pin's share at its
+    /// luminance, as composed r2's hold did.
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_pin_hold_two_sided(&mut self, on: bool) {
+        self.pin_one_sided = !on;
+    }
+
+    /// Whether a test made the pinned lights' hold one-sided
+    /// ([`Self::set_pin_hold_two_sided`]).
+    #[inline]
+    pub(crate) const fn pin_one_sided(&self) -> bool {
+        #[cfg(any(test, debug_assertions))]
+        {
+            self.pin_one_sided
+        }
+        #[cfg(not(any(test, debug_assertions)))]
+        {
+            false
+        }
+    }
+
+    /// Whether a test gave paper Lumen the dark face's brief sparks
+    /// ([`Self::LUMEN_PAPER_CHAIN_KEYS`]'s negative control).
+    #[inline]
+    pub(crate) const fn lumen_paper_brief(&self) -> bool {
+        #[cfg(any(test, debug_assertions))]
+        {
+            self.lumen_paper_brief
+        }
+        #[cfg(not(any(test, debug_assertions)))]
+        {
+            false
+        }
+    }
+
+    /// Whether a test turned the pinned lights' hold off ([`Self::set_pin_chroma`]).
+    #[inline]
+    pub(crate) const fn pin_chroma_free(&self) -> bool {
+        #[cfg(any(test, debug_assertions))]
+        {
+            self.pin_chroma_free
+        }
+        #[cfg(not(any(test, debug_assertions)))]
+        {
+            false
+        }
+    }
+
+    /// Whether the trail wears a colour the user pinned: the bed lays its pinned shape
+    /// ([`bed::BedShape::pinned`]) and Comet its dust in the pin
+    /// ([`Self::set_comet_pin_dust`]) and no icy head ([`Self::set_comet_pin_head`]).
+    #[inline]
+    pub(super) const fn trail_pinned(&self, cfg: &GlowConfig) -> bool {
+        self.colour_pins.trail && cfg.style.draws_trail_color()
     }
 
     /// Sets the reduced-motion flag and forwards it to Rainbow Kitty when engaged.
@@ -2078,7 +2359,7 @@ impl CursorGlow {
             (Some(a), None) => Some(a),
             (None, b) => b,
         };
-        if let Some(p) = self.held_park {
+        if let Some(p) = &self.held_park {
             let park_expiry = p.at + p.patience() + rk::ARM_MIN;
             let expiry = if p.cross_row {
                 let credit_at = match self.type_press_ring.newest_unpaid(now) {
@@ -2095,7 +2376,7 @@ impl CursorGlow {
                 None => d,
             });
         }
-        if let Some(l) = self.torn_lay {
+        if let Some(l) = &self.torn_lay {
             let d = (l.moved_at + TORN_REST_DUR + rk::ARM_MIN).max(now + rk::ARM_MIN);
             earliest = Some(match earliest {
                 Some(e) => e.min(d),
@@ -2315,13 +2596,8 @@ impl CursorGlow {
             self.frame_text.pairs.clear();
             self.frame_text.short.clear();
             self.frame_text.glyph.clear();
+            self.frame_text.plain.clear();
             self.frame_text.pane = None;
-        }
-        if self.pet_text.at != Some(now) {
-            self.pet_text.rows.clear();
-            self.pet_text.pairs.clear();
-            self.pet_text.short.clear();
-            self.pet_text.glyph.clear();
         }
         self.momentum_pulse = None;
         let valid_canvas =
@@ -2459,6 +2735,11 @@ impl CursorGlow {
                     bed::carve_cell(&mut feet, geom, (i32::from(r), i32::from(c)));
                 }
             }
+            let bed_ground = if self.night_grounded(cfg) && self.classic_pin_grounded(cfg) {
+                self.night_ground(cfg).map(|ng| ng.ink)
+            } else {
+                None
+            };
             let fp = self.classic.tick(
                 cur,
                 now,
@@ -2472,6 +2753,7 @@ impl CursorGlow {
                     ledger: &mut self.ink_ledger,
                     chosen: self.colour_pins.trail && cfg.style.draws_trail_color(),
                     feet: (feet.as_slice(), soles),
+                    bed_ground,
                 },
             );
             self.bed_scratch.feet = feet;
@@ -2812,15 +3094,11 @@ impl CursorGlow {
             ));
         }
         let mut halos = std::mem::take(&mut self.halo_out);
-        let mut patches = std::mem::take(&mut self.patch_out);
         let mut under = std::mem::take(&mut self.under_out);
         let mut under_ramps = std::mem::take(&mut self.under_ramps);
         let mut out_ramps = std::mem::take(&mut self.out_ramps);
-        let mut charred = std::mem::take(&mut self.char_out);
-        let mut halo_cells = std::mem::take(&mut self.fire_halo_out);
-        let mut engulf = std::mem::take(&mut self.engulf_scratch);
-        let mut bolt_verts = std::mem::take(&mut self.bolt_verts);
         if matches!(cfg.style, GlowStyle::Laser) && !self.bolts.is_empty() {
+            let mut bolt_verts = std::mem::take(&mut self.bolt_verts);
             let mut bolt_channel = std::mem::take(&mut self.bolt_channel);
             let mut bolt_out = if cfg.dark_theme {
                 self.ramp_sink(out, &mut out_ramps)
@@ -2836,6 +3114,7 @@ impl CursorGlow {
                 &mut bolt_channel,
             );
             drop(bolt_out);
+            self.bolt_verts = bolt_verts;
             self.bolt_channel = bolt_channel;
         }
         self.begin_ink_ledger(cfg, geom, cur);
@@ -2852,23 +3131,36 @@ impl CursorGlow {
         );
         out_sink.keep_laid(Self::MAX_QUADS);
         drop((out_sink, under_sink));
-        let mut ledger = std::mem::take(&mut self.ink_ledger);
-        let mut night = std::mem::take(&mut self.night_out);
-        night.clear();
-        self.night_ground(cfg);
-        self.emit_flames(
-            now,
-            cfg,
-            geom,
-            &mut patches,
-            &mut charred,
-            &mut halo_cells,
-            &mut engulf,
-            &mut under,
-            &mut night,
-            &mut ledger,
-        );
-        self.ink_ledger = ledger;
+        self.night_out.clear();
+        if matches!(cfg.style, GlowStyle::Fire) && !self.sparks.is_empty() {
+            let mut patches = std::mem::take(&mut self.patch_out);
+            let mut charred = std::mem::take(&mut self.char_out);
+            let mut halo_cells = std::mem::take(&mut self.fire_halo_out);
+            let mut engulf = std::mem::take(&mut self.engulf_scratch);
+            let mut night = std::mem::take(&mut self.night_out);
+            let mut ledger = std::mem::take(&mut self.ink_ledger);
+            self.night_ground(cfg);
+            self.emit_flames(
+                now,
+                cfg,
+                geom,
+                &mut patches,
+                &mut charred,
+                &mut halo_cells,
+                &mut engulf,
+                &mut under,
+                &mut night,
+                &mut ledger,
+            );
+            self.patch_out = patches;
+            self.char_out = charred;
+            self.fire_halo_out = halo_cells;
+            self.engulf_scratch = engulf;
+            self.night_out = night;
+            self.ink_ledger = ledger;
+        } else {
+            self.engulf_scratch.clear();
+        }
         if matches!(cfg.style, GlowStyle::Fire) && !self.fire_meteors.is_empty() {
             if cfg.dark_theme {
                 if out_ramps.laid(out.len()) < Self::MAX_QUADS {
@@ -2880,7 +3172,11 @@ impl CursorGlow {
                 self.emit_fire_meteors(now, cfg, geom, &mut under_sink);
             }
         }
-        if under_ramps.laid(under.len()) < Self::MAX_QUADS {
+        self.water_samples.clear();
+        if matches!(cfg.style, GlowStyle::Water)
+            && !self.sparks.is_empty()
+            && under_ramps.laid(under.len()) < Self::MAX_QUADS
+        {
             self.emit_water(now, cfg, geom, cur, (&mut under, &mut under_ramps));
         }
         if self.v2.engaged() {
@@ -2891,6 +3187,16 @@ impl CursorGlow {
             if self.v2_cues.capacity() < Self::V2_CUE_SCRATCH {
                 self.v2_cues.reserve(Self::V2_CUE_SCRATCH);
             }
+            #[cfg(any(test, debug_assertions))]
+            let v2_cfg = if self.ribbon_band_cell_wide {
+                rk::Config {
+                    head_dx: 0.5,
+                    ..rk::Config::from_glow(cfg, self.reduced_motion)
+                }
+            } else {
+                rk::Config::from_glow(cfg, self.reduced_motion)
+            };
+            #[cfg(not(any(test, debug_assertions)))]
             let v2_cfg = rk::Config::from_glow(cfg, self.reduced_motion);
             #[cfg(any(test, debug_assertions))]
             {
@@ -2908,7 +3214,7 @@ impl CursorGlow {
             };
             if witness_n > 0 {
                 self.v2.carry_caret(caret_carry);
-                let pair = match self.held_park {
+                let pair = match &self.held_park {
                     Some(p) if !p.cross_row && p.fresh(now) => {
                         Some(((p.row, p.origin), (p.landing_row, p.landing)))
                     }
@@ -3092,15 +3398,10 @@ impl CursorGlow {
         if matches!(cfg.style, GlowStyle::Fire) && cfg.dark_theme && !halos.is_empty() {
             self.hold_halos_off_filled(&mut halos, cur, geom, cfg.theme_bg);
         }
-        self.bolt_verts = bolt_verts;
         Self::cap_and_clear_v2_streams(&mut halos);
         self.halo_out = halos;
-        self.patch_out = patches;
         self.under_out = under;
         self.under_ramps = under_ramps;
-        self.char_out = charred;
-        self.fire_halo_out = halo_cells;
-        self.engulf_scratch = engulf;
 
         self.tick_fades(now, geom, (out, &mut out_ramps));
         // The flames' night grounds lie under every other mark under the
@@ -3119,35 +3420,40 @@ impl CursorGlow {
         // the flame beside the trail gallery's ` aterm ` bar darkened the
         // cyan round its `m` to a local 2.75:1 on Solarized Dark (looks10
         // round 2).
-        #[cfg(test)]
-        let (guarded, bars_unguarded) =
-            (self.flame_grounds_guarded, self.flame_bar_grounds_unguarded);
-        #[cfg(not(test))]
-        let (guarded, bars_unguarded) = (false, false);
         self.flame_night.clear();
-        if !guarded {
-            let (frame_text, page, held) = (&self.frame_text, cfg.theme_bg, &mut self.flame_night);
-            night.retain(|q| {
-                let past = bars_unguarded || emit::ground_lies_on_page(frame_text, geom, page, q);
-                if past {
-                    held.push(*q);
-                }
-                !past
-            });
-        }
-        if !night.is_empty() {
-            let moved = night.len().min(u32::MAX as usize) as u32;
-            let items = self.under_ramps.items.as_mut_slice();
-            let mut ri = 0;
-            while ri < items.len() {
-                items[ri].at = items[ri].at.saturating_add(moved);
-                ri += 1;
+        if !self.night_out.is_empty() {
+            let mut night = std::mem::take(&mut self.night_out);
+            #[cfg(test)]
+            let (guarded, bars_unguarded) =
+                (self.flame_grounds_guarded, self.flame_bar_grounds_unguarded);
+            #[cfg(not(test))]
+            let (guarded, bars_unguarded) = (false, false);
+            if !guarded {
+                let (frame_text, page, held) =
+                    (&self.frame_text, cfg.theme_bg, &mut self.flame_night);
+                night.retain(|q| {
+                    let past =
+                        bars_unguarded || emit::ground_lies_on_page(frame_text, geom, page, q);
+                    if past {
+                        held.push(*q);
+                    }
+                    !past
+                });
             }
-            night.extend_from_slice(&self.under_out);
-            std::mem::swap(&mut self.under_out, &mut night);
+            if !night.is_empty() {
+                let moved = night.len().min(u32::MAX as usize) as u32;
+                let items = self.under_ramps.items.as_mut_slice();
+                let mut ri = 0;
+                while ri < items.len() {
+                    items[ri].at = items[ri].at.saturating_add(moved);
+                    ri += 1;
+                }
+                night.extend_from_slice(&self.under_out);
+                std::mem::swap(&mut self.under_out, &mut night);
+                night.clear();
+            }
+            self.night_out = night;
         }
-        night.clear();
-        self.night_out = night;
 
         out_ramps.truncate_laid(out, Self::MAX_QUADS);
         self.under_ramps

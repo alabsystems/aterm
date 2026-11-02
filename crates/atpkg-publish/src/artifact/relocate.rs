@@ -433,22 +433,13 @@ fn relink_aliases(stage: &Path, obj: &Path, aliases: &[PathBuf]) -> Result<(), S
         if hard_link_key(obj).is_some() && hard_link_key(obj) == hard_link_key(alias) {
             continue;
         }
-        let name = alias
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let tmp = alias.with_file_name(format!(".{name}.atpkg-relink"));
-        let _ = std::fs::remove_file(&tmp);
-        std::fs::hard_link(obj, &tmp)
-            .and_then(|()| std::fs::rename(&tmp, alias))
-            .map_err(|e| {
-                let _ = std::fs::remove_file(&tmp);
-                format!(
-                    "re-link {} onto the rewritten {}: {e}",
-                    rel_display(stage, alias),
-                    rel_display(stage, obj)
-                )
-            })?;
+        super::relink::replace(obj, alias).map_err(|e| {
+            format!(
+                "re-link {} onto the rewritten {}: {e}",
+                rel_display(stage, alias),
+                rel_display(stage, obj)
+            )
+        })?;
     }
     Ok(())
 }
@@ -1331,5 +1322,23 @@ mod tests {
             "re-link scratch left behind: {leftovers:?}"
         );
         let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relinking_never_consumes_a_hidden_primary_as_scratch() {
+        super::super::relink_tests::preserves_payload(
+            super::super::relink_tests::Collision::Primary,
+            relink_aliases,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relinking_preserves_an_unrelated_occupied_legacy_name() {
+        super::super::relink_tests::preserves_payload(
+            super::super::relink_tests::Collision::Payload,
+            relink_aliases,
+        );
     }
 }

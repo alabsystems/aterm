@@ -199,4 +199,25 @@ fn a_quarantine_older_than_an_hour_is_swept_and_a_fresh_one_kept() {
         quarantines(&repo),
         vec!["atpkg-lineage-fetch.concurrent".to_string()]
     );
+
+    #[cfg(unix)]
+    {
+        let external = tmp.path().join("external-dir");
+        std::fs::create_dir_all(&external).expect("mkdir external");
+        std::fs::write(external.join("keep"), b"keep").expect("write keep");
+        std::fs::File::open(&external)
+            .expect("open external")
+            .set_modified(SystemTime::now() - Duration::from_secs(2 * 3600))
+            .expect("age external");
+        let link = objects(&repo).join("atpkg-lineage-fetch.symlink");
+        std::os::unix::fs::symlink(&external, &link).expect("symlink quarantine");
+        let second = tmp.path().join("second");
+        std::fs::create_dir_all(&second).expect("mkdir second");
+        push_from_elsewhere(&bare, &second, Some(MINTED_LEDGER));
+        assert_eq!(read(tmp.path(), &repo), Switch::Live);
+        assert!(
+            external.join("keep").is_file(),
+            "sweep_quarantines must never follow a symlink into an external directory"
+        );
+    }
 }

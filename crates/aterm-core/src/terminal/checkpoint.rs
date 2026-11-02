@@ -14,7 +14,7 @@ use super::checkpoint_output::OutputStateRepr;
 use super::checkpoint_state::{ColorRepr, ShellRepr, TitleRepr};
 use super::types::{CurrentStyle, TerminalModes};
 use crate::grid::{CellFlags, Cursor, Grid, PackedColor, SavedCursorState};
-use crate::scrollback::{Scrollback, deserialize_lines, serialize_lines};
+use crate::scrollback::{Scrollback, deserialize_lines, serialize_line_views};
 
 /// Per-grid cursor + region + wrap + tab-stop projection, captured for the main grid and (when present) the alt grid.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1419,6 +1419,7 @@ fn apply_kitty_carry(
             frames.push(KittyFrame {
                 image: img,
                 gap_ms: fc.gap_ms,
+                undecodable: false,
             });
         }
         let shown_idx = usize::from(entry.shown_frame).min(frames.len() - 1);
@@ -2155,14 +2156,14 @@ impl Terminal {
         let cols = self.grid.cols();
         let parser = self.carried_parser();
         let (grid_bytes, history_lines) = if grids {
-            let grid_lines = self.grid.checkpoint_lines_bounded(max_history);
+            let grid_lines = self.grid.checkpoint_line_views_bounded(max_history);
             let history_lines = u32::try_from(
                 grid_lines
                     .len()
                     .saturating_sub(usize::from(self.grid.rows())),
             )
             .unwrap_or(u32::MAX);
-            (serialize_lines(&grid_lines), history_lines)
+            (serialize_line_views(&grid_lines), history_lines)
         } else {
             (Vec::new(), 0)
         };
@@ -2186,7 +2187,9 @@ impl Terminal {
         let (alt_grid, alt_cursor) = match &self.alt_grid {
             Some(inactive) => (
                 Some(if grids {
-                    serialize_lines(&inactive.checkpoint_lines_bounded(inactive_max_history))
+                    serialize_line_views(
+                        &inactive.checkpoint_line_views_bounded(inactive_max_history),
+                    )
                 } else {
                     Vec::new()
                 }),
@@ -3161,9 +3164,8 @@ fn restore_grid(
     is_alt: bool,
     store_lines: Option<usize>,
 ) -> Grid {
-    let lines = deserialize_lines(bytes);
-    let visible_start = lines.len().saturating_sub(rows as usize);
-    let (scrollback_lines, visible_lines) = lines.split_at(visible_start);
+    let mut lines = deserialize_lines(bytes);
+    let mut visible_start = lines.len().saturating_sub(rows as usize);
 
     let mut grid = if is_alt {
         // The alternate screen keeps no scrollback (as `enter_alternate_screen`): a
@@ -3171,19 +3173,22 @@ fn restore_grid(
         Grid::with_scrollback(rows, cols, 0)
     } else {
         const RING_CAP: usize = 1000;
-        let in_ring = scrollback_lines.len().min(RING_CAP);
-        let (to_store, to_ring) = scrollback_lines.split_at(scrollback_lines.len() - in_ring);
+        let in_ring = visible_start.min(RING_CAP);
+        let to_store = visible_start - in_ring;
         let mut scrollback = Scrollback::with_defaults();
         scrollback.set_line_limit(store_lines);
-        for line in to_store {
+        // These decoded lines already belong to the restored store; moving them
+        // avoids cloning their text and attributes before dropping the originals.
+        for line in lines.drain(..to_store) {
             // push_line is infallible for the in-memory tier.
-            scrollback.push_line(line.clone());
+            scrollback.push_line(line);
         }
+        visible_start = in_ring;
         let mut grid = Grid::with_tiered_scrollback(rows, cols, RING_CAP, scrollback);
-        grid.scroll_in_history(to_ring);
+        grid.scroll_in_history(&lines[..visible_start]);
         grid
     };
-    grid.restore_visible_from_lines(visible_lines);
+    grid.restore_visible_from_lines(&lines[visible_start..]);
     grid.damage_mut().mark_full();
     cursor.apply(&mut grid);
     grid
@@ -3192,6 +3197,141 @@ fn restore_grid(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scrollback::serialize_lines;
+
+    #[test]
+    fn borrowed_checkpoint_projection_preserves_main_and_alt_wire_bytes() {
+        let mut source = Terminal::new(4, 96);
+        for row in 0..1208 {
+            source.process(
+                format!(
+                    "\x1b[1;38;5;{}m\x1b]8;;https://example.test/{row}\x07\
+                     row-{row:04} é界e\u{301} abcdefghijklmnopqrstuvwxyz\
+                     \x1b]8;;\x07\x1b[m\r\n",
+                    row % 6 + 1
+                )
+                .as_bytes(),
+            );
+        }
+        for on_alt in [false, true] {
+            if on_alt {
+                source.process(b"\x1b[?1049halt-one\r\nalt-two");
+            }
+            for bound in [0, 1, 1000, 2048, usize::MAX] {
+                let checkpoint = source
+                    .checkpoint_continuing_bounded(bound)
+                    .expect("complete parser input");
+                assert_eq!(
+                    checkpoint.grid,
+                    serialize_lines(&source.grid.checkpoint_lines_bounded(bound)),
+                    "active grid: alt={on_alt}, bound={bound}"
+                );
+                assert_eq!(
+                    checkpoint.alt_grid,
+                    source
+                        .alt_grid
+                        .as_ref()
+                        .map(|grid| { serialize_lines(&grid.checkpoint_lines_bounded(bound)) }),
+                    "inactive grid: alt={on_alt}, bound={bound}"
+                );
+                assert_eq!(
+                    checkpoint.history_lines as usize,
+                    source.grid.scrollback_lines().min(bound)
+                );
+                let restored = Terminal::from_checkpoint(&checkpoint);
+                assert_eq!(source.visible_content(), restored.visible_content());
+            }
+        }
+    }
+
+    #[test]
+    fn restoring_deep_history_preserves_store_ring_visible_and_counter_boundaries() {
+        const ROWS: u16 = 4;
+        const COLS: u16 = 96;
+        let mut source = Terminal::new(ROWS, COLS);
+        for row in 0..1208 {
+            source.process(
+                format!(
+                    "\x1b[1;38;5;{}m\x1b]8;;https://example.com/{row}\x07\
+                     row-{row:04} é界 abcdefghijklmnopqrstuvwxyz\
+                     \x1b]8;;\x07\x1b[m\r\n",
+                    row % 6 + 1
+                )
+                .as_bytes(),
+            );
+        }
+        for on_alt in [false, true] {
+            if on_alt {
+                source.process(b"\x1b[?1049halt-one\r\nalt-two");
+            }
+            let checkpoint = source.checkpoint();
+            let primary = if on_alt {
+                checkpoint.alt_grid.as_ref().expect("saved main grid")
+            } else {
+                &checkpoint.grid
+            };
+            let primary_lines = deserialize_lines(primary);
+            let history = primary_lines.len() - usize::from(ROWS);
+            assert!(history > 1000, "both the store and ring are populated");
+
+            for limit in [None, Some(0), Some(7)] {
+                let restored = match limit {
+                    None => Terminal::replay_from_checkpoint(&checkpoint),
+                    Some(limit) => Terminal::replay_from_checkpoint_bounded(&checkpoint, limit),
+                };
+                let again = restored.checkpoint();
+                let kept = limit.map_or(history, |limit| history.min(1000 + limit));
+                let expected = serialize_lines(&primary_lines[history - kept..]);
+                if on_alt {
+                    assert_eq!(again.alt_grid.as_ref(), Some(&expected), "limit {limit:?}");
+                    assert_eq!(again.grid, checkpoint.grid, "the alternate screen");
+                    assert_eq!(restored.grid().scrollback_lines(), 0);
+                } else {
+                    assert_eq!(again.grid, expected, "limit {limit:?}");
+                }
+                assert_eq!(again.cursor, checkpoint.cursor);
+                assert_eq!(again.alt_cursor, checkpoint.alt_cursor);
+                assert_eq!(again.absolute_row_counter, checkpoint.absolute_row_counter);
+                assert_eq!(
+                    again.alt_absolute_row_counter,
+                    checkpoint.alt_absolute_row_counter
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn restoring_short_and_alternate_grids_keeps_the_visible_rows() {
+        use crate::scrollback::Line;
+
+        let cursor = GridCursorRepr::capture(Terminal::new(4, 20).grid());
+        for count in [0usize, 1, 3, 6] {
+            let lines: Vec<Line> = (0..count)
+                .map(|row| Line::from(format!("row-{row}").as_str()))
+                .collect();
+            let bytes = serialize_lines(&lines);
+            let first_visible = count.saturating_sub(4);
+            for is_alt in [false, true] {
+                let restored = restore_grid(4, 20, &bytes, &cursor, is_alt, None);
+                let visible = restored.checkpoint_visible_lines();
+                for (row, actual) in visible.iter().enumerate() {
+                    let expected = lines
+                        .get(first_visible + row)
+                        .map_or_else(String::new, ToString::to_string);
+                    assert_eq!(
+                        actual.to_string(),
+                        expected,
+                        "count {count}, alternate {is_alt}"
+                    );
+                }
+                assert_eq!(
+                    restored.scrollback_lines(),
+                    if is_alt { 0 } else { first_visible }
+                );
+                assert_eq!(GridCursorRepr::capture(&restored), cursor);
+            }
+        }
+    }
 
     /// `lift_screen` moves the screen's top lines into its history (on the alternate screen, a history of just those; under a history limit too small for them, one that holds them) and the cursor up with its line, hidden once its line is history.
     #[test]

@@ -49,6 +49,35 @@ pub struct Program {
     pub build: bool,
     /// The kernel says its executable's file was unlinked since it started.
     pub deleted: bool,
+    /// A link broker launchd adopted that is not the one process found serving the fabric's
+    /// socket: no supervisor keeps it ([`supervise`]).
+    pub unsupervised: bool,
+    /// The token `aterm ctl end` takes for it, where a witness proves it the leftover of a run
+    /// ([`supervise`]).
+    pub token: Option<String>,
+}
+
+/// The census's name of the fabric's link broker: an aterm image running `link broker`.
+pub const BROKER: &str = "aterm link broker";
+
+/// Marks each link broker of `census` that launchd adopted and that is not `serving` (the one
+/// process the `fabric:` row's probe found holding the fabric's listener; `None` when the fabric
+/// is off, since a probe that found no one holder says nothing and is never asked here)
+/// unsupervised, with the token `offered` gives its pid: the `end=` token the leftover view
+/// offers where a witness proves it, `None` otherwise.
+pub fn supervise(
+    census: &mut Census,
+    serving: Option<u32>,
+    offered: &dyn Fn(u32) -> Option<String>,
+) {
+    for program in census
+        .programs
+        .iter_mut()
+        .filter(|p| p.adopted && p.name == BROKER && Some(p.pid) != serving)
+    {
+        program.unsupervised = true;
+        program.token = offered(program.pid);
+    }
 }
 
 /// Instance count, unreached instances, and other aterm programs.
@@ -143,8 +172,8 @@ pub(crate) trait Kernel {
     fn listed(&self) -> Option<Vec<Listed>>;
     /// `pid`'s executable image ([`image_of`]).
     fn exe(&self, pid: u32) -> Option<Image>;
-    /// Whether `pid` is held at macOS's program check ([`aterm_uds::process::at_program_check`]).
-    fn held(&self, pid: u32) -> Option<bool>;
+    /// Whether `pid`'s one thread has run ([`aterm_uds::process::thread_ran`]).
+    fn ran(&self, pid: u32) -> Option<bool>;
     /// `pid`'s argument words ([`aterm_uds::process::read_process_argv`]).
     fn argv(&self, pid: u32) -> Option<Vec<OsString>>;
     /// `pid`'s lineage ([`aterm_uds::process::read_lineage`]), asked only when its parent is 1.
@@ -207,8 +236,8 @@ impl Kernel for LiveKernel {
         image_of(pid)
     }
 
-    fn held(&self, pid: u32) -> Option<bool> {
-        aterm_uds::process::at_program_check(i32::try_from(pid).ok()?)
+    fn ran(&self, pid: u32) -> Option<bool> {
+        aterm_uds::process::thread_ran(i32::try_from(pid).ok()?)
     }
 
     fn argv(&self, pid: u32) -> Option<Vec<OsString>> {
@@ -327,39 +356,31 @@ pub(crate) fn census_of(
     let mut unreached: Vec<(u64, Unreached)> = Vec::new();
     let mut programs: Vec<(u64, Program)> = Vec::new();
     for row in listed.iter().filter(|row| row.pid != own_pid) {
-        let Some(image) = k.exe(row.pid) else {
+        let Some((image, words)) = aterm_words(k, row.pid) else {
             continue;
         };
         let exe = image.path.as_path();
-        if !is_aterm(exe) {
-            continue;
-        }
-        let words: Option<Vec<String>> = (k.held(row.pid) != Some(true))
-            .then(|| k.argv(row.pid))
-            .flatten()
-            .map(|argv| {
-                argv.iter()
-                    .map(|w| w.to_string_lossy().into_owned())
-                    .collect()
-            });
         let age = row.age_s.map_or_else(|| "?".to_string(), age_words);
         // A tether's watcher (`aterm_uds::tether`) is launchd's by design, for as long as the
-        // helper it watches runs, and no window under any name: not an orphan to report.
-        if words
+        // helper it watches runs, and so is a build's claim holder (`aterm_uds::build_front`),
+        // for as long as the build it holds memory for, or what that build left running, runs:
+        // no window under any name, and not an orphan to report.
+        let by_design = words
             .as_deref()
             .and_then(|words| words.get(1))
-            .map(String::as_str)
-            == Some(aterm_uds::tether::VERB)
-        {
+            .and_then(|verb| aterm_uds::left::by_design(verb));
+        if let Some(name) = by_design {
             programs.push((
                 row.age_s.unwrap_or(0),
                 Program {
                     pid: row.pid,
-                    name: "aterm tether".to_string(),
+                    name: name.to_string(),
                     age,
                     adopted: false,
                     build: in_build_dir(exe),
                     deleted: image.deleted,
+                    unsupervised: false,
+                    token: None,
                 },
             ));
             continue;
@@ -400,6 +421,8 @@ pub(crate) fn census_of(
                 adopted: parent == Parent::Adopted,
                 build: in_build_dir(exe),
                 deleted: image.deleted,
+                unsupervised: false,
+                token: None,
             },
         ));
     }
@@ -413,6 +436,95 @@ pub(crate) fn census_of(
     })
 }
 
+/// `pid`'s image and argument words when its executable is an aterm one ([`is_aterm`]): the
+/// words (decoded lossily) are read only then, and only once its one thread has run
+/// ([`Kernel::ran`]: a read of a program's arguments at its first instruction can hang, M29).
+/// They are kept only while the kernel names the same image after the read, so an exec
+/// between the two reads leaves no other program's words; such a process is no aterm. No read
+/// is atomic with an exec, so one into a held program after the `ran` read can still hang the
+/// argument read, which nothing here bounds. `None` for any other process, or one whose
+/// executable the kernel no longer names; the words are `None` when its thread has not run, or
+/// is unread, or they are unread.
+fn aterm_words(k: &impl Kernel, pid: u32) -> Option<(Image, Option<Vec<String>>)> {
+    let image = k.exe(pid).filter(|image| is_aterm(&image.path))?;
+    let Some(argv) = (k.ran(pid) == Some(true)).then(|| k.argv(pid)).flatten() else {
+        return Some((image, None));
+    };
+    if k.exe(pid)?.path != image.path {
+        return None;
+    }
+    let words = argv
+        .iter()
+        .map(|w| w.to_string_lossy().into_owned())
+        .collect();
+    Some((image, Some(words)))
+}
+
+/// One aterm child of a process, as the census knows aterm: by its executable, its argument
+/// words read only then and only once its thread has run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Child {
+    /// The process id.
+    pub pid: u32,
+    /// Its argument words, `None` when they were not read (its thread had not run, or they are
+    /// unread).
+    pub words: Option<Vec<String>>,
+}
+
+/// This user's processes and their parents, as the census lists them, read once: no `ps`, and
+/// no process's arguments.
+pub struct Listing(Vec<Listed>);
+
+impl Listing {
+    /// The process table, now.
+    ///
+    /// # Errors
+    /// The table cannot be read (and off macOS and Linux, always).
+    pub fn read() -> Result<Self, String> {
+        #[cfg(unix)]
+        {
+            LiveKernel
+                .listed()
+                .map(Self)
+                .ok_or_else(|| "the process table could not be read".to_string())
+        }
+        #[cfg(not(unix))]
+        {
+            Err("macOS and Linux only".to_string())
+        }
+    }
+
+    /// The aterm processes whose parent is `parent` ([`Child`]), in table order.
+    #[must_use]
+    pub fn aterm_children(&self, parent: u32) -> Vec<Child> {
+        #[cfg(unix)]
+        {
+            children_in(&LiveKernel, &self.0, parent)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = parent;
+            Vec::new()
+        }
+    }
+}
+
+/// The rows of `listed` whose parent is `parent` (no child of pid 0 or of launchd) that `k`
+/// proves aterm ([`aterm_words`]), in table order.
+pub(crate) fn children_in(k: &impl Kernel, listed: &[Listed], parent: u32) -> Vec<Child> {
+    listed
+        .iter()
+        .filter(|row| parent > 1 && row.ppid == Some(parent))
+        .filter_map(|row| {
+            let (_, words) = aterm_words(k, row.pid)?;
+            Some(Child {
+                pid: row.pid,
+                words,
+            })
+        })
+        .collect()
+}
+
 /// The file name of `path`, when it is UTF-8.
 fn file_name(path: &Path) -> Option<&str> {
     path.file_name()?.to_str()
@@ -420,7 +532,7 @@ fn file_name(path: &Path) -> Option<&str> {
 
 /// Whether `exe` is an aterm executable.
 pub(crate) fn is_aterm(exe: &Path) -> bool {
-    file_name(exe).is_some_and(|name| name == "aterm" || name.starts_with("aterm-"))
+    aterm_uds::left::is_aterm_image(exe)
 }
 
 /// Whether `exe` sits under a build's target directory.
@@ -444,11 +556,16 @@ fn alias_of<'a>(exe: &'a Path, argv: &'a [String], door: FrontDoor<'_>) -> Optio
     .find_map(|name| Some((name, (door.alias)(name, first)?)))
 }
 
-/// What a program is called: an alias by its own name, or `aterm <verb>` for an `aterm-<verb>`
+/// What a program is called: a build's front waiting for its claim (`atpkg __build_admit`,
+/// which becomes its build once claimed) `atpkg build-admit`; an alias by its own name, or
+/// `aterm <verb>` for an `aterm-<verb>`
 /// alias whose verb the front door's table names; under the front door's own names,
 /// `aterm <verb>` when the table names `argv[1]`; else its executable's file name. A verb is
 /// followed by the next argument when that is a word too.
 fn program_name(exe: &Path, argv: &[String], door: FrontDoor<'_>) -> String {
+    if aterm_uds::build_front::front(argv).is_some() {
+        return "atpkg build-admit".to_string();
+    }
     let (verb, rest) = match alias_of(exe, argv, door) {
         Some((name, _)) => match name
             .strip_prefix("aterm-")
@@ -589,7 +706,9 @@ mod tests {
         exe: Option<Image>,
         argv: Option<Vec<String>>,
         lineage: Option<Lineage>,
-        held: bool,
+        ran: Option<bool>,
+        /// The image the kernel names once its words were read: an exec while they were.
+        execs_to: Option<&'static str>,
         stdin_terminal: Option<bool>,
     }
 
@@ -623,10 +742,17 @@ mod tests {
             (!self.unreadable).then(|| self.rows.iter().map(|r| r.listed).collect())
         }
         fn exe(&self, pid: u32) -> Option<Image> {
-            self.row(pid)?.exe.clone()
+            let row = self.row(pid)?;
+            match row.execs_to {
+                Some(path) if self.argv_asked.borrow().contains(&pid) => Some(Image {
+                    path: PathBuf::from(path),
+                    deleted: false,
+                }),
+                _ => row.exe.clone(),
+            }
         }
-        fn held(&self, pid: u32) -> Option<bool> {
-            self.row(pid).map(|r| r.held)
+        fn ran(&self, pid: u32) -> Option<bool> {
+            self.row(pid)?.ran
         }
         fn argv(&self, pid: u32) -> Option<Vec<OsString>> {
             self.argv_asked.borrow_mut().insert(pid);
@@ -664,7 +790,8 @@ mod tests {
             }),
             argv: Some(argv.iter().map(ToString::to_string).collect()),
             lineage: None,
-            held: false,
+            ran: Some(true),
+            execs_to: None,
             stdin_terminal: Some(true),
         }
     }
@@ -830,7 +957,7 @@ mod tests {
     #[test]
     fn a_held_program_s_arguments_are_never_read() {
         let mut held = proc(900, 50, 30, ATERM, &["aterm", "--headless"]);
-        held.held = true;
+        held.ran = Some(false);
         let k = Fake::with(vec![
             proc(100, 50, 60, ATERM, &[ATERM, "doctor"]),
             held,
@@ -848,6 +975,113 @@ mod tests {
             .map(|p| (p.pid, p.name.as_str()))
             .collect();
         assert_eq!(names, [(900, "aterm")], "{c:?}");
+    }
+
+    /// An instance's children are its child processes the census proves aterm by executable,
+    /// each with its words, read only for those and never for a held one: a child running
+    /// another program with an aterm's words, another process's aterm child and a child whose
+    /// executable is unnamed are not its, and no row is a child of pid 0 or of launchd.
+    /// NEGATIVE CONTROL: take any aterm row whatever its parent, and the other process's child
+    /// joins; drop the `parent > 1` guard, and launchd's aterm child is one.
+    #[test]
+    fn an_instance_s_children_are_its_aterm_programs() {
+        let serve = ["aterm", "link", "serve", "--fleet", "f"];
+        let mut held = proc(4003, 4000, 10, ATERM, &serve);
+        held.ran = Some(false);
+        let mut unnamed = proc(4005, 4000, 10, ATERM, &serve);
+        unnamed.exe = None;
+        let k = Fake::with(vec![
+            proc(4000, 50, 60, ATERM, &[ATERM, "--headless"]),
+            proc(4001, 4000, 10, ATERM, &serve),
+            proc(4002, 4000, 10, "/bin/bash", &serve),
+            held,
+            proc(4004, 77, 10, ATERM, &serve),
+            unnamed,
+            proc(4006, 1, 10, ATERM, &serve),
+            proc(4007, 0, 10, ATERM, &serve),
+        ]);
+        let listed = k.listed().expect("the table");
+        assert_eq!(
+            children_in(&k, &listed, 4000),
+            [
+                Child {
+                    pid: 4001,
+                    words: Some(serve.map(String::from).to_vec()),
+                },
+                Child {
+                    pid: 4003,
+                    words: None,
+                },
+            ]
+        );
+        assert_eq!(
+            *k.argv_asked.borrow(),
+            BTreeSet::from([4001]),
+            "only an unheld aterm child's arguments are read"
+        );
+        assert!(
+            children_in(&k, &listed, 1).is_empty(),
+            "no child of launchd"
+        );
+        assert!(children_in(&k, &listed, 0).is_empty(), "no child of pid 0");
+    }
+
+    /// An aterm's words are read only once its one thread has run (`thread_ran`, the guard of
+    /// every read of another process's arguments, since such a read of a program at its first
+    /// instruction can hang): one at its first instruction for less than the held judgment's
+    /// 20 s, and one whose thread list does not read, keep their words unread and are aterm
+    /// programs named by their executable. NEGATIVE CONTROL: guard the read with the held
+    /// judgment instead, and both have their words read.
+    #[test]
+    fn an_aterm_s_words_are_read_only_once_its_thread_ran() {
+        let mut starting = proc(900, 50, 5, ATERM, &["aterm", "--headless"]);
+        starting.ran = Some(false);
+        let mut unread = proc(902, 50, 5, ATERM, &["aterm", "--headless"]);
+        unread.ran = None;
+        let k = Fake::with(vec![
+            proc(100, 50, 60, ATERM, &[ATERM, "doctor"]),
+            starting,
+            proc(901, 50, 30, ATERM, &["aterm", "--headless"]),
+            unread,
+        ]);
+        let c = census(&k, &[]);
+        assert_eq!(
+            *k.argv_asked.borrow(),
+            BTreeSet::from([901]),
+            "only a program whose thread ran has its words read: {c:?}"
+        );
+        assert_eq!(c.instances, 1, "{c:?}");
+        let names: Vec<(u32, &str)> = c
+            .programs
+            .iter()
+            .map(|p| (p.pid, p.name.as_str()))
+            .collect();
+        assert_eq!(names, [(900, "aterm"), (902, "aterm")], "{c:?}");
+    }
+
+    /// A process proven aterm that execs another program while its words are read is no aterm:
+    /// the words are kept only while the kernel names the same image after the read, so another
+    /// program's words neither name a row nor make a child. NEGATIVE CONTROL: keep the words
+    /// without reading the image again, and the shell is an aterm program and the instance's
+    /// child.
+    #[test]
+    fn a_process_that_execs_another_program_as_its_words_are_read_is_no_aterm() {
+        let table = || {
+            let mut execs = proc(4001, 4000, 10, ATERM, &["-zsh"]);
+            execs.execs_to = Some("/bin/zsh");
+            Fake::with(vec![
+                proc(100, 50, 60, ATERM, &[ATERM, "doctor"]),
+                proc(4000, 50, 60, ATERM, &[ATERM, "--headless"]),
+                execs,
+            ])
+        };
+        let k = table();
+        let listed = k.listed().expect("the table");
+        let children = children_in(&k, &listed, 4000);
+        assert!(children.is_empty(), "{children:?}");
+        let c = census(&table(), &[]);
+        assert_eq!(c.instances, 1, "{c:?}");
+        assert!(c.programs.is_empty(), "{c:?}");
     }
 
     #[test]
@@ -988,15 +1222,20 @@ mod tests {
             by_pid[&704].adopted && by_pid[&704].name == "aterm pkg update",
             "{c:?}"
         );
-        let watcher = |pid, exe| {
-            let argv = [exe, "__tether", "500", "/usr/bin/log", "log", "stream"];
+        // A watcher runs under the tether's own name; one an earlier build left, under its path.
+        let watcher = |pid, exe, arg0| {
+            let argv = [arg0, "__tether", "500", "/usr/bin/log", "log", "stream"];
             under_launchd(proc(pid, 4_000, 20, exe, &argv), Some(31))
         };
         let c = census(
             &Fake::with(vec![
                 proc(100, 50, 60, ATERM, &[ATERM, "doctor"]),
-                watcher(706, BUNDLE),
-                watcher(707, "/w/target/debug/aterm-gui"),
+                watcher(706, BUNDLE, aterm_uds::tether::NAME),
+                watcher(
+                    707,
+                    "/w/target/debug/aterm-gui",
+                    "/w/target/debug/aterm-gui",
+                ),
             ]),
             &[],
         );
@@ -1008,6 +1247,40 @@ mod tests {
                 && c.programs.len() == 2,
             "a tether's watcher is launchd's by design: {c:?}"
         );
+        let holder = |pid, verb| {
+            let argv = [BUNDLE, verb, "500", "77", "/l/1-500-0.claim", "{}", "-"];
+            under_launchd(proc(pid, 4_000, 20, BUNDLE, &argv), Some(31))
+        };
+        let c = census(
+            &Fake::with(vec![
+                proc(100, 50, 60, ATERM, &[ATERM, "doctor"]),
+                holder(708, "__build_hold"),
+                holder(709, "__build_holder"),
+                proc(
+                    710,
+                    50,
+                    20,
+                    BUNDLE,
+                    &[
+                        "atpkg",
+                        "__build_admit",
+                        "--shim",
+                        "targo",
+                        "-",
+                        "/s/targo",
+                        "test",
+                    ],
+                ),
+            ]),
+            &[],
+        );
+        let by_pid: BTreeMap<u32, &Program> = c.programs.iter().map(|p| (p.pid, p)).collect();
+        assert!(
+            by_pid[&708].name == "aterm build hold" && !by_pid[&708].adopted,
+            "a build's claim holder is launchd's by design: {c:?}"
+        );
+        assert!(by_pid[&709].adopted, "another verb is an orphan: {c:?}");
+        assert_eq!(by_pid[&710].name, "atpkg build-admit", "{c:?}");
         let mut unread = Fake::with(vec![
             proc(100, 50, 60, ATERM, &[ATERM, "doctor"]),
             under_launchd(broker(700), Some(31)),
@@ -1342,6 +1615,73 @@ mod tests {
         assert_eq!(ages, [Some(1), Some(0)], "{rows:?}");
     }
 
+    /// Of the link brokers launchd adopted, the one serving the fabric's socket is supervised;
+    /// any other is unsupervised and takes the token the leftover view offers it. A broker whose
+    /// launcher lives, and an adopted program that is no broker, are neither. NEGATIVE CONTROL:
+    /// drop the serving pid's check, and the fabric's own broker reads unsupervised.
+    #[test]
+    fn the_supervised_broker_is_not_unsupervised() {
+        let program = |pid: u32, name: &str, adopted: bool| Program {
+            pid,
+            name: name.to_string(),
+            age: "3h 05m".to_string(),
+            adopted,
+            build: false,
+            deleted: false,
+            unsupervised: false,
+            token: None,
+        };
+        let mut c = Census {
+            dir: "/run/aterm".to_string(),
+            instances: 1,
+            unreached: Vec::new(),
+            programs: vec![
+                program(600, BROKER, true),
+                program(601, BROKER, true),
+                program(602, BROKER, false),
+                program(603, "aterm link serve", true),
+            ],
+        };
+        let asked = RefCell::new(Vec::new());
+        supervise(&mut c, Some(600), &|pid| {
+            asked.borrow_mut().push(pid);
+            Some(format!("{pid}@1792098840004410:331"))
+        });
+        let marked: Vec<(u32, bool, Option<&str>)> = c
+            .programs
+            .iter()
+            .map(|p| (p.pid, p.unsupervised, p.token.as_deref()))
+            .collect();
+        assert_eq!(
+            marked,
+            [
+                (600, false, None),
+                (601, true, Some("601@1792098840004410:331")),
+                (602, false, None),
+                (603, false, None),
+            ]
+        );
+        assert_eq!(
+            *asked.borrow(),
+            [601],
+            "only an unsupervised broker is read"
+        );
+
+        for p in &mut c.programs {
+            p.unsupervised = false;
+            p.token = None;
+        }
+        supervise(&mut c, None, &|_| None);
+        let unsupervised: Vec<u32> = c
+            .programs
+            .iter()
+            .filter(|p| p.unsupervised)
+            .map(|p| p.pid)
+            .collect();
+        assert_eq!(unsupervised, [600, 601], "no broker serves the fabric");
+        assert!(c.programs.iter().all(|p| p.token.is_none()));
+    }
+
     /// Live: the shipped table lists this process with its real parent, and the kernel names
     /// its executable, a test binary that is not aterm.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1364,6 +1704,6 @@ mod tests {
             .expect("this process's executable is named");
         assert!(!image.deleted, "{image:?}");
         assert!(!is_aterm(&image.path), "{}", image.path.display());
-        assert_eq!(LiveKernel.held(me), Some(false), "this process runs");
+        assert_eq!(LiveKernel.ran(me), Some(true), "this process runs");
     }
 }

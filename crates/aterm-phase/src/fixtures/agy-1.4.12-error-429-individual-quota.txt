@@ -1,0 +1,19 @@
+# agy 1.4.12 · RECONSTRUCTED 2026-10-31, not a screen capture: the error block of agy 1.4.0's measured 429 screens (fixtures/agy-1.4.0-lab-error-429-per-day.txt) carrying the failure agy 1.4.12 logged on m15 at 2026-10-29 15:39:06 PDT for a signed-in Google account (`~/.gemini/antigravity-cli/log`, `agent executor error: generating and executing: RESOURCE_EXHAUSTED (code 429): Individual quota reached. …`); the harness read it as no wall, so two Cruise prompts held the session for two days past its reset
+
+      ▄▀▀▄        Antigravity CLI 1.4.12
+     ▀▀▀▀▀▀       andrew@example.com
+    ▀▀▀▀▀▀▀▀      Gemini 4 Argon (High)
+   ▄▀▀    ▀▀▄     ~/aterm
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────
+> [aterm harness] Autopilot is Cruise: your turn ended while your own background work runs.
+
+⚠ agent executor error: generating and executing: RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to
+increase your limits. Resets in 4h29m33s.
+Error ID: 6f2a1c0e-3b7d-4e9a-8c55-1d2e3f4a5b6c-1
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+? for shortcuts                                                                                                           Gemini 4 Argon · high

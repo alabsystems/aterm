@@ -525,11 +525,15 @@ fn color_picker_beside(
 ) -> Option<(UiNode, f32)> {
     let side = room.clamp(floor, natural_wheel(width));
     let column_width = text_width - side - SIDE_GAP;
+    // A column too narrow, or a wheel taller than the room, refuses before its rows are laid out.
+    if column_width < SIDE_COLUMN_FLOOR || side > room {
+        return None;
+    }
     let rows = controls(column, column_width);
     let column_height = rows.iter().map(|(_, height)| height).sum::<f32>()
         + rows.len().saturating_sub(1) as f32 * 4.0;
     let height = side.max(column_height);
-    if column_width < SIDE_COLUMN_FLOOR || side.max(column_height + reserve) > room {
+    if column_height + reserve > room {
         return None;
     }
     let id = subject.target.id();
@@ -921,7 +925,12 @@ fn add_color_chooser(
             .height(Length::Fill),
     );
     if width == SettingsWidth::Compact && !inline {
-        let plain = crate::native_ui::plain_placeholder(&field.placeholder);
+        // Weighed by the words the field shows at rest, so Choose… stands where it stood
+        // whatever is written: weighed by the value written, it went beside the field once a
+        // colour was written and every row under it moved (Selection foreground at 200pt:
+        // "Automatic" with Choose… under it, then "#808080" beside it, 48pt shorter).
+        let rest = unset_field_words(state, field).unwrap_or_else(|| field.placeholder.clone());
+        let plain = crate::native_ui::plain_placeholder(&rest);
         let widest = plain
             .split_whitespace()
             .map(|word| crate::native_ui::text_field_width_for(word, true))

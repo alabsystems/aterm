@@ -10,9 +10,7 @@ use aterm_core::terminal::{BlockState, OutputBlock};
 
 use crate::companion::CompanionRung;
 use crate::kitty_pet::PetArrival;
-use crate::kitty_registry::{
-    KittyLook, SHELL_APP_ID, app_basename_slice, canonical_app_id, is_shell_basename,
-};
+use crate::kitty_registry::{KittyLook, SHELL_APP_ID, app_basename_slice, is_shell_basename};
 
 /// How long a program must hold the focused pane, unbroken, before its cat takes the cursor, so quick commands finish first.
 pub const TENURE: Duration = Duration::from_secs(5);
@@ -97,16 +95,12 @@ fn derive_identity(block: &OutputBlock) -> Option<AppIdentity> {
         BlockState::Executing => {
             let cmd = block.commandline.as_deref()?;
             let raw_base = app_basename_slice(cmd)?;
-            if is_shell_basename(raw_base) {
+            if is_shell_basename(raw_base) || raw_base.eq_ignore_ascii_case(SHELL_APP_ID) {
                 return None;
             }
             let basename = raw_base.to_ascii_lowercase();
-            let id = canonical_app_id(&basename);
-            if id == SHELL_APP_ID {
-                return None;
-            }
-            let look = KittyLook::for_app(id);
-            let id = id.to_owned();
+            let look = KittyLook::for_app(&basename);
+            let id = basename.clone();
             Some(AppIdentity { id, basename, look })
         }
         _ => None,

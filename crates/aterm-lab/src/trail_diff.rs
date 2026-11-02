@@ -95,8 +95,11 @@ frame by frame:
            drawn frame where no arm touched glow_under or glow_under_ramps
   dark     no light arm on a dark ground: a frame where an arm drew in a build whose own light= bits are 0 there,
            or in a script under a dark folder, fails whatever its streams say
+  declared no light arm in a script that says `# expect: no-arms` on a line of its own (a light page whose
+           light is sheer, main's paper arm): a frame where an arm drew there, in either build, fails
 The light words are never compared. It prints the first difference of each script that has one, the frames where
-an arm drew, then scripts= frames= differing_compared= arm_frames= state_differing= dark_arms=.
+an arm drew, then scripts= frames= differing_compared= arm_frames= state_differing= dark_arms=
+unexpected_arms=.
 
   --base REF         the base commit: HEAD~1 (the commit's parent) by default; merge-base is where HEAD left
                      origin/main, so a whole stack compares
@@ -114,7 +117,7 @@ support/**, crates/aterm-gui/src/trail_rig.rs, crates/aterm-gui/src/trail_frame_
 [profile.trail-diff]) differs between the base and the head: a closure change lands alone and is proved by both
 controls (section 15.0.6).
 
-exit: 0 the dumps agree; 1 a difference or an arm on a dark ground; 2 usage; 3 not run (the reason named). Under
+exit: 0 the dumps agree; 1 a difference, an arm on a dark ground or one a script declared none of; 2 usage; 3 not run (the reason named). Under
 --control the exit says whether the control held: 0 it did (same: no difference; plant: the plant reported;
 dark-arm: the planted arm reported on a dark ground), 1 it did not.
 ";
@@ -171,11 +174,16 @@ pub fn parse_args(args: &[String]) -> Result<Args, Fail> {
     };
     let jobs = take_value(&mut a, "--jobs")?
         .map(|v| {
-            v.parse::<usize>().ok().filter(|n| *n > 0).ok_or_else(|| {
-                Fail::usage(format!(
-                    "trail-diff: --jobs takes a positive count, not '{v}'"
-                ))
-            })
+            v.bytes()
+                .all(|b| b.is_ascii_digit())
+                .then(|| v.parse::<usize>().ok())
+                .flatten()
+                .filter(|n| *n > 0)
+                .ok_or_else(|| {
+                    Fail::usage(format!(
+                        "trail-diff: --jobs takes a positive count, not '{v}'"
+                    ))
+                })
         })
         .transpose()?;
     let keep = take_flag(&mut a, "--keep");
@@ -699,6 +707,9 @@ pub struct Report {
     /// Frames where a light arm drew on a dark ground: in a build whose own `light=` bits are 0
     /// there, or in a script under a `dark` folder ([`dark_script`]).
     pub dark_arms: usize,
+    /// Frames where a light arm drew, in either build, in a script that declares none
+    /// ([`EXPECT_NO_ARMS`]).
+    pub unexpected_arms: usize,
     /// The first difference of each script that has one.
     pub firsts: Vec<String>,
     /// Each run's frames where an arm drew, grouped by the arms.
@@ -709,7 +720,10 @@ impl Report {
     /// Whether the dumps differ anywhere compared.
     #[must_use]
     pub const fn differs(&self) -> bool {
-        self.differing_compared > 0 || self.state_differing > 0 || self.dark_arms > 0
+        self.differing_compared > 0
+            || self.state_differing > 0
+            || self.dark_arms > 0
+            || self.unexpected_arms > 0
     }
 
     /// The totals line.
@@ -717,13 +731,14 @@ impl Report {
     pub fn totals(&self) -> String {
         format!(
             "scripts={} frames={} differing_compared={} arm_frames={} state_differing={} \
-             dark_arms={}",
+             dark_arms={} unexpected_arms={}",
             self.scripts,
             self.frames,
             self.differing_compared,
             self.arm_frames,
             self.state_differing,
-            self.dark_arms
+            self.dark_arms,
+            self.unexpected_arms
         )
     }
 
@@ -741,10 +756,27 @@ impl Report {
     }
 }
 
+/// The line a script declares, on a line of its own, that no frame of it draws a light arm: a
+/// light page whose light is sheer (a 1x window's face, `host::PageFacts::glass`), which draws
+/// main's paper arm byte for byte.
+pub const EXPECT_NO_ARMS: &str = "# expect: no-arms";
+
+/// Whether a script's text declares [`EXPECT_NO_ARMS`].
+#[must_use]
+pub fn declares_no_arms(text: &str) -> bool {
+    text.lines().any(|l| l.trim_end() == EXPECT_NO_ARMS)
+}
+
 /// Compare the head's dump with the base's: scripts, runs and frames in order. A script or a run
 /// one side lacks or names differently, and a frame one side lacks, differ as the frame's shape.
+/// Each script named by `no_arms` declares [`EXPECT_NO_ARMS`]: a frame where an arm drew there,
+/// in either build, counts in [`Report::unexpected_arms`] and differs.
 #[must_use]
-pub fn compare(head: &[Script], base: &[Script]) -> Report {
+pub fn compare_declared(
+    head: &[Script],
+    base: &[Script],
+    no_arms: &dyn Fn(&str) -> bool,
+) -> Report {
     let mut r = Report {
         scripts: head.len().max(base.len()),
         ..Report::default()
@@ -755,7 +787,7 @@ pub fn compare(head: &[Script], base: &[Script]) -> Report {
         let mut first: Option<String> = None;
         match (h, b) {
             (Some(h), Some(b)) if h.name == b.name => {
-                compare_runs(&mut r, &mut first, name, &h.runs, &b.runs);
+                compare_runs(&mut r, &mut first, (name, no_arms(name)), &h.runs, &b.runs);
             }
             _ => {
                 let frames = |s: Option<&Script>| {
@@ -776,11 +808,11 @@ pub fn compare(head: &[Script], base: &[Script]) -> Report {
     r
 }
 
-/// [`compare`] of one script's runs.
+/// [`compare_declared`] of one script's runs; `quiet`, the script declares [`EXPECT_NO_ARMS`].
 fn compare_runs(
     r: &mut Report,
     first: &mut Option<String>,
-    name: &str,
+    (name, quiet): (&str, bool),
     head: &[Run],
     base: &[Run],
 ) {
@@ -849,6 +881,21 @@ fn compare_runs(
                     base: said(bf),
                 });
             }
+            let armed_frame = |f: &Frame| !f.held && !f.arms.is_empty();
+            if quiet && (hf.is_some_and(armed_frame) || bf.is_some_and(armed_frame)) {
+                r.unexpected_arms += 1;
+                let said = |f: Option<&Frame>| {
+                    f.map_or_else(
+                        || "-".into(),
+                        |f| format!("light={} arms={}", f.light, arms_said(&f.arms)),
+                    )
+                };
+                diffs.push(Diff {
+                    what: "arms in a script that expects none".into(),
+                    head: said(hf),
+                    base: said(bf),
+                });
+            }
             note(first, name, &format!("S {label} F{n} t={t}"), &diffs);
         }
         for (said, frames) in armed {
@@ -903,7 +950,12 @@ pub fn ranges(frames: &[String]) -> String {
         });
     };
     for f in frames {
-        let Ok(n) = f.parse::<u64>() else {
+        let Some(n) = f
+            .bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| f.parse::<u64>().ok())
+            .flatten()
+        else {
             if let Some(r) = run.take() {
                 flush(&mut out, r);
             }
@@ -926,7 +978,8 @@ pub fn ranges(frames: &[String]) -> String {
 }
 
 /// The run's exit and, under a control, the line that says whether it held: without one, 0 when
-/// the dumps agree and 1 when they differ (an arm on a dark ground among the differences); under
+/// the dumps agree and 1 when they differ (an arm on a dark ground, or in a script that declares
+/// none, among the differences); under
 /// `--control same`, 0 when they agree; under `--control plant`, 0 when they differ; under
 /// `--control dark-arm`, 0 when an arm on a dark ground is reported.
 #[must_use]
@@ -1423,7 +1476,15 @@ pub fn cmd_trail_diff(args: &[String]) -> Res {
     let parsed = |side: &str, text: &str| {
         parse_dump(text).map_err(|e| not_run(format!("the {side} dump does not parse: {e}")))
     };
-    let report = compare(&parsed("head", &head_dump)?, &parsed("base", &base_dump)?);
+    let declared: Vec<&String> = scripts
+        .iter()
+        .filter(|s| std::fs::read_to_string(head.join(s)).is_ok_and(|t| declares_no_arms(&t)))
+        .collect();
+    let report = compare_declared(
+        &parsed("head", &head_dump)?,
+        &parsed("base", &base_dump)?,
+        &|name| declared.iter().any(|d| d.as_str() == name),
+    );
     print!("{}", report.render());
     let (code, said) = verdict(&report, a.control);
     if let Some(said) = said {

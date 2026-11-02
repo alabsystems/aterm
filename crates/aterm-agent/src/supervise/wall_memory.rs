@@ -196,14 +196,16 @@ impl<C: Ctl> Session<'_, C> {
         let unasked = self.turn_end.fallback_unasked();
         let land = self.turn_end.land_episode().0;
         self.turn_end.observe(reading, now);
+        self.book_go_ahead_hour(seq);
         if reading.login_moved && self.turn_end.login_resume_owed() {
             self.login_taken(seq);
         }
-        // The limit's login lasts as its wait does, or its owed resume: a point
-        // with neither (a served turn that ended the limit) reads no profile.
+        // The limit's login lasts as its wait does, or its owed resume, and as its tap clock does
+        // (a usage limit the tap may yet time): a point with none of them (a served turn that
+        // ended the limit) reads no profile.
         let limit_stands =
             self.turn_end.waits_on_named_reset() || self.turn_end.login_resume_owed();
-        if reading.wall.is_none() && !limit_stands {
+        if reading.wall.is_none() && !(limit_stands || self.tap_tracked()) {
             self.wall_login = None;
         }
         self.land_over(land, seq);
@@ -424,7 +426,7 @@ impl<C: Ctl> Session<'_, C> {
         else {
             return;
         };
-        let key = format!("{}|{}", kind.name(), open.reset.as_deref().unwrap_or("-"));
+        let key = approvals::wall_reset_key(kind, open.reset.as_deref());
         self.wall_reset = Some((key.clone(), open.reset_unix));
         if let Some(at) = open.tap_unix {
             self.seed_tap(key, kind, &open.message, at, now);

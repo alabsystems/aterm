@@ -12,8 +12,7 @@ use std::time::Duration;
 use aterm_dbus::{Connection, Kind, Message, Value};
 use aterm_uds::CtlStream;
 
-use super::{DeliveryPolicy, NotifyMsg, admit_delivery, delivers, freedesktop, post_admitted};
-use crate::consent_observer::{AttentionEvent, AttentionGate, ObserverMode};
+use super::{DeliveryPolicy, NotifyMsg, admit_delivery, freedesktop, post_admitted};
 
 const HANG: Duration = Duration::from_secs(60);
 const BARRIER: &str = "delivery-policy barrier";
@@ -121,17 +120,7 @@ fn queued_case(change: Change) -> Vec<Message> {
     };
     assert_eq!(*policy.suppress.lock().unwrap(), HashSet::from([2]));
     assert!(!policy.silent.load(std::sync::atomic::Ordering::Acquire));
-    let mut gate = AttentionGate::new();
-    let notice = matches!(change, Change::DesktopOff).then(|| {
-        gate.note(AttentionEvent::ProtectedEperm { session: None })
-            .for_mode(ObserverMode::Full)
-            .notice
-            .expect("the actual unattributed denial producer")
-    });
-    let a = notice.as_ref().map_or_else(
-        || NotifyMsg::program(0, Some("policy A".into()), "program event".into()),
-        NotifyMsg::consent,
-    );
+    let a = NotifyMsg::program(0, Some("policy A".into()), "program event".into());
     let admitted = admit_delivery(a, &policy).expect("A is initially admitted");
     let (client, server) = CtlStream::pair().unwrap();
     let served = std::thread::spawn(move || serve(server));
@@ -167,12 +156,6 @@ fn queued_case(change: Change) -> Vec<Message> {
             app.config.desktop_alerts = Some(false);
             app.apply_desktop_alerts(false);
             assert!(!policy.own_alerts.load(std::sync::atomic::Ordering::Acquire));
-            assert!(gate.has_denials(), "the FDA condition remains standing");
-            assert!(delivers(
-                &NotifyMsg::consent(notice.as_ref().unwrap()),
-                &HashSet::new(),
-                true,
-            ));
         }
         Change::Serious => {
             app.apply_serious_mode(true);
@@ -214,7 +197,8 @@ fn delayed_unix_delivery_obeys_the_current_focus_alert_and_sound_policy() {
     for change in [Change::Focus, Change::DesktopOff, Change::Serious] {
         let seen = queued_case(change);
         let valid = match change {
-            Change::Focus | Change::DesktopOff => seen.len() == 1,
+            Change::Focus => seen.len() == 1,
+            Change::DesktopOff => seen.len() == 2,
             Change::Serious => seen.len() == 2 && quiet(&seen[0]),
             Change::Unchanged => unreachable!(),
         };

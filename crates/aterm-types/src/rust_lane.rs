@@ -338,6 +338,30 @@ pub fn channel_in(text: &str) -> Option<String> {
     bare.then(|| legacy.to_string())
 }
 
+/// Upper bound on a `rust-toolchain` or `rust-toolchain.toml` file read from disk.
+const MAX_TOOLCHAIN_FILE_BYTES: u64 = 64 * 1024;
+
+fn read_toolchain_file(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_TOOLCHAIN_FILE_BYTES {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let open_meta = file.metadata().ok()?;
+    if !open_meta.is_file() || open_meta.len() > MAX_TOOLCHAIN_FILE_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_TOOLCHAIN_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_TOOLCHAIN_FILE_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
 /// The toolchain file rustup would read for `start`, and the channel it names.
 #[must_use]
 pub fn find_pin(start: &Path) -> Option<(PathBuf, String)> {
@@ -346,7 +370,7 @@ pub fn find_pin(start: &Path) -> Option<(PathBuf, String)> {
         for name in ["rust-toolchain", "rust-toolchain.toml"] {
             let file = d.join(name);
             if file.is_file() {
-                let text = std::fs::read_to_string(&file).ok()?;
+                let text = read_toolchain_file(&file)?;
                 return channel_in(&text).map(|ch| (file, ch));
             }
         }

@@ -167,12 +167,21 @@ fn serve_one(stream: &TcpStream, origin: FakeOrigin, state: &Mutex<State>) {
     let chunked =
         header("transfer-encoding").is_some_and(|v| v.to_ascii_lowercase().contains("chunked"));
     let mut body = Vec::new();
+    let (mut cut, mut over) = (false, false);
+    // What is left to drop once answered: the rest of a body over the bound, so its 413
+    // reaches a client that writes the whole body before it reads; `BODY_MAX` otherwise.
+    let mut left = BODY_MAX;
     if !chunked && !head.malformed {
-        let length = header("content-length")
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0)
-            .min(BODY_MAX);
-        let _ = (&mut reader).take(length).read_to_end(&mut body);
+        let declared = header("content-length")
+            .and_then(crate::parse_uint::<u64>)
+            .unwrap_or(0);
+        let bound = declared.min(BODY_MAX);
+        let _ = (&mut reader).take(bound).read_to_end(&mut body);
+        cut = u64::try_from(body.len()).unwrap_or(u64::MAX) < bound;
+        over = !cut && declared > BODY_MAX;
+        if over {
+            left = declared.saturating_sub(bound);
+        }
     }
     let req = Request {
         origin,
@@ -182,6 +191,8 @@ fn serve_one(stream: &TcpStream, origin: FakeOrigin, state: &Mutex<State>) {
         body,
         chunked,
         malformed: head.malformed,
+        cut,
+        over,
     };
     let outcome = routes::handle(
         &mut state.lock().unwrap_or_else(PoisonError::into_inner),
@@ -197,7 +208,7 @@ fn serve_one(stream: &TcpStream, origin: FakeOrigin, state: &Mutex<State>) {
         Outcome::Truncate(answer, at) => write(stream, &req, &answer, Some(at)),
     }
     let _ = stream.shutdown(Shutdown::Write);
-    drain(&mut reader);
+    drain(&mut reader, left);
 }
 
 /// Hold the connection `wait`, reading and dropping what the client sends, until the client
@@ -237,10 +248,10 @@ fn hold(
 /// How often a held connection looks whether its hang was ended.
 const HANG_LOOK: Duration = Duration::from_millis(20);
 
-/// Read and drop what the client sends, until it hangs up, a read times out, or
-/// `BODY_MAX` bytes have come.
-fn drain(reader: &mut BufReader<&TcpStream>) {
-    let _ = reader.by_ref().take(BODY_MAX).read_to_end(&mut Vec::new());
+/// Read and drop what the client sends, keeping none of it, until it hangs up, a read times
+/// out, or `left` bytes have come.
+fn drain(reader: &mut BufReader<&TcpStream>, left: u64) {
+    let _ = std::io::copy(&mut reader.by_ref().take(left), &mut std::io::sink());
 }
 
 /// Write `answer`: no body on a HEAD or a 304, and no `Content-Length` on a 304; with `cut`,
@@ -276,7 +287,7 @@ fn write(stream: &TcpStream, req: &Request, answer: &Answer, cut: Option<usize>)
 }
 
 /// A status's reason phrase.
-const fn reason(status: u16) -> &'static str {
+pub(crate) const fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
         201 => "Created",
@@ -289,11 +300,15 @@ const fn reason(status: u16) -> &'static str {
         401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
+        405 => "Method Not Allowed",
+        413 => "Content Too Large",
         422 => "Unprocessable Entity",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
+        501 => "Not Implemented",
         502 => "Bad Gateway",
         503 => "Service Unavailable",
+        504 => "Gateway Timeout",
         _ => "Status",
     }
 }

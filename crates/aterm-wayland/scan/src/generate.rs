@@ -91,11 +91,15 @@ fn summary(e: &Element) -> String {
 }
 
 fn number(s: &str) -> Result<u32, String> {
-    match s.strip_prefix("0x") {
-        Some(hex) => u32::from_str_radix(hex, 16),
-        None => s.parse(),
-    }
-    .map_err(|e| format!("{s:?}: {e}"))
+    let ok = match s.strip_prefix("0x") {
+        Some(hex) if hex.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            u32::from_str_radix(hex, 16).ok()
+        }
+        Some(_) => None,
+        None if s.bytes().all(|b| b.is_ascii_digit()) => s.parse().ok(),
+        None => None,
+    };
+    ok.ok_or_else(|| format!("{s:?}: not an unsigned integer"))
 }
 
 fn read_msg(e: &Element) -> Result<Msg, String> {

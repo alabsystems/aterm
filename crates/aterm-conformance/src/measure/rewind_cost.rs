@@ -158,25 +158,7 @@ struct Settled {
 /// is the resident size.
 #[cfg(target_os = "macos")]
 fn app_bytes(pid: u32) -> Result<u64, CouldNotRun> {
-    let id = libc::c_int::try_from(pid)
-        .map_err(|_| CouldNotRun::Refused(format!("pid {pid} is out of range")))?;
-    let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
-    // SAFETY: `info` is a zeroed `rusage_info_v4`, the struct `RUSAGE_INFO_V4` fills; the
-    // kernel writes at most its size, and it is read only on success.
-    let rc = unsafe {
-        libc::proc_pid_rusage(
-            id,
-            libc::RUSAGE_INFO_V4,
-            info.as_mut_ptr().cast::<libc::rusage_info_t>(),
-        )
-    };
-    if rc != 0 {
-        return Err(CouldNotRun::Refused(format!(
-            "proc_pid_rusage named no footprint for {pid}"
-        )));
-    }
-    // SAFETY: zeroed is a valid `rusage_info_v4` (plain integers), and the kernel filled it.
-    Ok(unsafe { info.assume_init() }.ri_phys_footprint)
+    super::usage(pid).map(|usage| usage.footprint)
 }
 
 /// The resident size, where the platform names no footprint.
@@ -196,7 +178,7 @@ fn rss_bytes(pid: u32) -> Result<u64, CouldNotRun> {
     String::from_utf8_lossy(&out.stdout)
         .trim()
         .parse::<u64>()
-        .map(|kib| kib * 1024)
+        .map(|kib| kib.saturating_mul(1024))
         .map_err(|_| CouldNotRun::Refused(format!("ps named no resident size for {pid}")))
 }
 

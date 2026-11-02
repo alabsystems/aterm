@@ -2792,11 +2792,6 @@ impl TrailSynth {
             );
         }
 
-        let ring_gain = if ev.shifted {
-            gain * CAP_RING_LEVEL.max(FLOW_ECHO_LEVEL * flow)
-        } else {
-            gain * FLOW_ECHO_LEVEL * flow
-        };
         let struck = step_touch && !plan.mallet_only;
         let ring_deg = deg + FLOW_ECHO_OCTAVE_DEG + CAP_RING_LIFT_DEG;
         let ring_hz = if hammer.ring {
@@ -2814,6 +2809,11 @@ impl TrailSynth {
         }
         let echoes = flow > 0.0 && plan.lit && !plucked && !ev.shifted;
         if (echoes || rings) && struck {
+            let ring_gain = if ev.shifted {
+                gain * CAP_RING_LEVEL.max(FLOW_ECHO_LEVEL * flow)
+            } else {
+                gain * FLOW_ECHO_LEVEL * flow
+            };
             let echo_hz = if rings {
                 ring_hz
             } else {
@@ -2831,9 +2831,8 @@ impl TrailSynth {
                 echo.attack = BLOOM_ATTACK_S;
                 echo.delay = FLOW_ECHO_DELAY_S;
                 echo.lane = LANE_BLOOM;
-                let echo_gain = ring_gain;
                 let ph0 = self.v2_flow_echo_phase(echo.p[0].f0, FLOW_ECHO_DELAY_S);
-                self.v2_spawn_ph0(echo, echo_gain, pan, ph0);
+                self.v2_spawn_ph0(echo, ring_gain, pan, ph0);
             }
         }
 
@@ -2982,7 +2981,7 @@ impl TrailSynth {
         } else {
             0.0
         };
-        let cps = 1.0 / (self.v2.ioi_ms * 0.001);
+        let cps = 1000.0 / self.v2.ioi_ms;
         roof_hz(cps, true, ev.heat, arc, Touch::Step)
     }
 

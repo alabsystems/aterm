@@ -75,7 +75,11 @@ pub(crate) fn read_kept(folder: &Path) -> Result<Kept, String> {
             return Err(format!("the index row `{row}` names nothing"));
         };
         let octal = |m: &str| {
-            u32::from_str_radix(m, 8).map_err(|_| format!("the index row `{row}` has no mode"))
+            m.bytes()
+                .all(|b| matches!(b, b'0'..=b'7'))
+                .then(|| u32::from_str_radix(m, 8).ok())
+                .flatten()
+                .ok_or_else(|| format!("the index row `{row}` has no mode"))
         };
         match word {
             "dir" => {

@@ -247,10 +247,10 @@ pub struct EffectsPipeline {
     /// word pass but names none of its icons ([`Self::note_word_icons`]).
     #[cfg(test)]
     word_icons_unnamed: bool,
-    /// A test's negative control: the pet's veil drawn in the trail's step,
-    /// by the body the pet drew a frame before ([`Self::veil_pet_letters`]).
-    #[cfg(test)]
-    pet_veil_stale: bool,
+    /// A test's negative control: every caret-seated light sits at the block's centre whatever
+    /// the caret's shape (`head_dx` pinned to `0.5`, [`Self::set_bar_anchor`]).
+    #[cfg(any(test, debug_assertions))]
+    bar_unanchored: bool,
     /// The opaque comet's own colour, where `set_cursor_trail` gave one.
     trail_body_color: Option<u32>,
     /// Keystrokes noted since the last [`Self::advance`], replayed evenly across its `dt`.
@@ -402,8 +402,8 @@ impl EffectsPipeline {
             word_icons_unshaded: false,
             #[cfg(test)]
             word_icons_unnamed: false,
-            #[cfg(test)]
-            pet_veil_stale: false,
+            #[cfg(any(test, debug_assertions))]
+            bar_unanchored: false,
             pending_keys: 0,
             row_probe_scratch: Vec::new(),
             flying_sky_row: None,
@@ -503,17 +503,32 @@ impl EffectsPipeline {
             return;
         }
         let prev = self.clock;
-        self.clock += Duration::from_secs_f64(dt_ms / 1000.0);
-        debug_assert!(self.clock > prev, "the injected clock is monotonic");
+        let delta = Duration::try_from_secs_f64(dt_ms / 1000.0).unwrap_or(Duration::MAX);
+        if delta.is_zero() {
+            return;
+        }
+        let candidate = prev.saturating_add(delta);
+        self.clock = if self.t0.checked_add(candidate).is_some() {
+            candidate
+        } else {
+            let ceiling = crate::effect_util::saturating_add_duration(self.t0, Duration::MAX);
+            ceiling.saturating_duration_since(self.t0)
+        };
+        if self.clock <= prev {
+            return;
+        }
         let n = self.pending_keys;
         if n > 0 {
             self.pending_keys = 0;
             let dt = self.clock - prev;
-            let mut newest = self.t0 + self.clock;
+            let mut newest = crate::effect_util::saturating_add_duration(self.t0, self.clock);
             let inv_n = 1.0 / f64::from(n);
             let mut i = 1;
             while i <= n {
-                let at = self.t0 + prev + dt.mul_f64(f64::from(i) * inv_n);
+                let at = crate::effect_util::saturating_add_duration(
+                    self.t0,
+                    prev.saturating_add(dt.mul_f64(f64::from(i) * inv_n)),
+                );
                 self.cursor.cadence.on_keystroke(at);
                 self.cursor.momentum.on_key(at, MOMENTUM_GLOW_TAU_S);
                 self.cursor.glow.note_typed_cells(at, 1);
@@ -523,7 +538,7 @@ impl EffectsPipeline {
             self.cursor.trail.note_typed_batch(newest, n);
         }
         if let Some(rain) = self.rain.as_deref_mut() {
-            let total = self.clock.as_millis() as u64;
+            let total = u64::try_from(self.clock.as_millis()).unwrap_or(u64::MAX);
             rain.advance_ms(total.saturating_sub(self.rain_clock_ms));
             self.rain_clock_ms = total;
         }
@@ -533,7 +548,7 @@ impl EffectsPipeline {
     #[inline]
     #[must_use]
     pub fn now(&self) -> Instant {
-        self.t0 + self.clock
+        crate::effect_util::saturating_add_duration(self.t0, self.clock)
     }
 
     /// `true` while any effect is animating.
@@ -545,11 +560,11 @@ impl EffectsPipeline {
             || self.cursor.glow.is_active()
             || self.cursor.bodies_active()
             || self.cursor.bodies_settling()
-            || self.decos.is_active(now)
             || self.companion.needs_frames()
-            || self.companion.next_change_deadline(now).is_some()
             || matches!(self.rain.as_ref(), Some(r) if r.is_active())
             || matches!(self.streak.as_ref(), Some(s) if s.is_active())
+            || self.decos.is_active(now)
+            || self.companion.next_change_deadline(now).is_some()
     }
 
     /// Milliseconds until the next scheduled engine wake.
@@ -620,7 +635,14 @@ impl EffectsPipeline {
     #[cfg(test)]
     pub fn wake(&mut self) -> Wake {
         match self.next_deadline_ms() {
-            Some(ms) => Wake::At(self.now() + Duration::from_secs_f64(ms / 1000.0)),
+            Some(ms) => {
+                let dur = if ms.is_finite() && ms > 0.0 {
+                    Duration::try_from_secs_f64(ms / 1000.0).unwrap_or(Duration::MAX)
+                } else {
+                    Duration::ZERO
+                };
+                Wake::At(crate::effect_util::saturating_add_duration(self.now(), dur))
+            }
             None if self.is_active() => Wake::Frames,
             None => Wake::Idle,
         }
@@ -929,6 +951,146 @@ impl EffectsPipeline {
         }
     }
 
+    /// A test's negative control: a pinned trail colour's paper inks are its hue's vivid ink
+    /// (`CursorGlow::set_chosen_ink`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_chosen_ink(&mut self, on: bool) {
+        self.cursor.glow.set_chosen_ink(on);
+    }
+
+    /// A test's negative control: a typed light lives its tuned life whatever the duration
+    /// (`CursorGlow::set_typed_life_scaled`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_typed_life_scaled(&mut self, on: bool) {
+        self.cursor.glow.set_typed_life_scaled(on);
+    }
+
+    /// A test's negative control: Comet's dark dust stays ice under a pinned trail colour
+    /// (`CursorGlow::set_comet_pin_dust`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_comet_pin_dust(&mut self, on: bool) {
+        self.cursor.glow.set_comet_pin_dust(on);
+    }
+
+    /// A test's negative control: Comet lays its icy nucleus and dense-row seat under a
+    /// pinned trail colour (`CursorGlow::set_comet_pin_head`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_comet_pin_head(&mut self, on: bool) {
+        self.cursor.glow.set_comet_pin_head(on);
+    }
+
+    /// A test's negative control: the Rainbow Kitty's band under the caret crosses the bar's
+    /// whole cell (`CursorGlow::set_ribbon_bar_band`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_ribbon_bar_band(&mut self, on: bool) {
+        self.cursor.glow.set_ribbon_bar_band(on);
+    }
+
+    /// A test's negative control: a pinned trail's lights on a dark page keep the hue and
+    /// chroma each body laid them in, not the pin's (`CursorGlow::set_pin_chroma`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_pin_chroma(&mut self, on: bool) {
+        self.cursor.glow.set_pin_chroma(on);
+    }
+
+    /// A test's negative control: the pinned lights' hold cuts every light to the pin's share
+    /// at its luminance, as composed r2's did (`CursorGlow::set_pin_hold_two_sided`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_pin_hold_two_sided(&mut self, on: bool) {
+        self.cursor.glow.set_pin_hold_two_sided(on);
+    }
+
+    /// A test's negative control: `on` (as shipped), paper Lumen's sparks live several keys so
+    /// its tracer reaches back over the letters just typed and lingers; off, they live as
+    /// briefly as the dark face's, as composed r2's did (paper Lumen at rest was Off).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_lumen_paper_tracer(&mut self, on: bool) {
+        self.cursor.glow.lumen_paper_brief = !on;
+    }
+
+    /// A test's negative control: `on` (as shipped), Classic's one-colour face lays the page's
+    /// neutral as its night ground on a tinted dark page; off, it solves the ground toward its
+    /// lights' own hue, as composed r2's did (a maroon disc round the caret on Solarized Dark).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_classic_ground_neutral(&mut self, on: bool) {
+        self.cursor.glow.classic_ground_own_hue = !on;
+        self.cursor.glow.forget_night_ground();
+    }
+
+    /// A test's negative control: `on` (as shipped), Classic's one-colour face lays a chosen
+    /// colour's dark bed and rail at its own chroma; off, it floors their saturation to the
+    /// bed's 0.9 and the rail's 1.0, as before composed O10(a).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_classic_pin_own_chroma(&mut self, on: bool) {
+        self.cursor.glow.set_classic_pin_own_chroma(on);
+    }
+
+    /// A test's negative control: Classic's one-colour face adds its light straight onto a
+    /// tinted dark page and mixes its bed toward the page (`CursorGlow::classic_pin_grounded`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_classic_pin_ground(&mut self, on: bool) {
+        self.cursor.glow.classic_pin_ground_off = !on;
+    }
+
+    /// A test's negative control: a bar or underline caret is drawn in its own colour on
+    /// whatever light its cell holds (`CursorGlow::set_thin_caret_read`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_thin_caret_read(&mut self, on: bool) {
+        self.cursor.glow.set_thin_caret_read(on);
+    }
+
+    /// The ground the last frame read its bar or underline caret against, after any hold
+    /// (`CursorGlow::hold_light_for_thin_caret`). Debug and test builds only.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn thin_caret_ground(&self) -> Option<u32> {
+        self.cursor.glow.thin_caret_read.map(|(_, ground)| ground)
+    }
+
+    /// A test's negative control: `on == false` pins the frame's `head_dx` to `0.5`, so every
+    /// light the caret seats sits at the block's centre behind a bar too.
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_bar_anchor(&mut self, on: bool) {
+        self.bar_unanchored = !on;
+    }
+
+    /// A test's negative control: a chosen colour's bolt caret keeps the page floor alone
+    /// (`CursorFx::set_chosen_bolt_lift`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_chosen_bolt_lift(&mut self, on: bool) {
+        self.cursor.set_chosen_bolt_lift(on);
+    }
+
+    /// A test's negative control: a chosen colour's bolt short of its bar at its clip stops
+    /// there (`CursorFx::set_chosen_bolt_past_clip`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_chosen_bolt_past_clip(&mut self, on: bool) {
+        self.cursor.set_chosen_bolt_past_clip(on);
+    }
+
+    /// A test's negative control: Laser's bolt in the theme's own colour on paper keeps the page
+    /// floor alone (`CursorFx::set_paper_bolt_lift`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_paper_bolt_lift(&mut self, on: bool) {
+        self.cursor.set_paper_bolt_lift(on);
+    }
+
     /// A test's negative control: no bed's rail lies in its own row's foot
     /// band (`CursorGlow::set_bed_row_rails`).
     #[cfg(any(test, debug_assertions))]
@@ -1004,14 +1166,6 @@ impl EffectsPipeline {
         self.cursor.glow.set_classic_faint_shade(on);
     }
 
-    /// A test's negative control: the guard on, but no page veil under the
-    /// letters the pet lies beneath (`CursorGlow::set_pet_veil`).
-    #[cfg(any(test, debug_assertions))]
-    #[inline]
-    pub const fn set_pet_veil(&mut self, on: bool) {
-        self.cursor.glow.set_pet_veil(on);
-    }
-
     /// A test's negative control: the letter guard cuts each cell alone, with
     /// no ramp along the row (`CursorGlow::set_letter_guard_ramp`).
     #[cfg(any(test, debug_assertions))]
@@ -1020,28 +1174,29 @@ impl EffectsPipeline {
         self.cursor.glow.set_letter_guard_ramp(on);
     }
 
-    /// A test's negative control: a word gap climbs the letter guard's ramp
-    /// from each of its letters (`CursorGlow::set_letter_guard_word_gaps`).
+    /// A test's negative control: every letter read by its solid ink against its grounds' least
+    /// and greatest luminance, none by its glyph's own pixels
+    /// (`CursorGlow::set_letter_guard_ring`).
     #[cfg(any(test, debug_assertions))]
     #[inline]
-    pub const fn set_letter_guard_word_gaps(&mut self, on: bool) {
-        self.cursor.glow.set_letter_guard_word_gaps(on);
+    pub const fn set_letter_guard_ring(&mut self, on: bool) {
+        self.cursor.glow.set_letter_guard_ring(on);
     }
 
-    /// A test's negative control: a dim letter's bar at its bare share, the
-    /// letter guard keeping no room over it (`CursorGlow::set_letter_guard_room`).
+    /// A test's negative control: the letter guard blind to the cursor trail's fill
+    /// (`CursorGlow::set_letter_guard_trail`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_letter_guard_trail(&mut self, on: bool) {
+        self.cursor.glow.set_letter_guard_trail(on);
+    }
+
+    /// A test's negative control: a letter the guard reads by its solid ink keeps its bare
+    /// share, no room over it (`CursorGlow::set_letter_guard_room`).
     #[cfg(any(test, debug_assertions))]
     #[inline]
     pub const fn set_letter_guard_room(&mut self, on: bool) {
         self.cursor.glow.set_letter_guard_room(on);
-    }
-
-    /// A test's negative control: the pet's veil laid over every light, not
-    /// beneath them (`CursorGlow::set_pet_veil_beneath`).
-    #[cfg(any(test, debug_assertions))]
-    #[inline]
-    pub const fn set_pet_veil_beneath(&mut self, on: bool) {
-        self.cursor.glow.set_pet_veil_beneath(on);
     }
 
     /// A test's negative control: one law that keeps the letter under the
@@ -1054,14 +1209,6 @@ impl EffectsPipeline {
         on: bool,
     ) {
         self.cursor.glow.set_caret_letter_law(law, on);
-    }
-
-    /// A test's negative control: the letter guard's cut pieces rounded to
-    /// the nearest byte (`CursorGlow::set_letter_guard_cuts_rounded`).
-    #[cfg(any(test, debug_assertions))]
-    #[inline]
-    pub const fn set_letter_guard_cuts_rounded(&mut self, on: bool) {
-        self.cursor.glow.set_letter_guard_cuts_rounded(on);
     }
 
     /// A test's negative control: the letter guard feathers its cuts into a
@@ -1812,6 +1959,10 @@ impl EffectsPipeline {
         let configured_head_dx = self.glow_cfg.head_dx;
         self.glow_cfg.intensity *= motion_amp;
         self.glow_cfg.head_dx = crate::cursor_fx::head_dx_for(input.cursor_style);
+        #[cfg(any(test, debug_assertions))]
+        if self.bar_unanchored {
+            self.glow_cfg.head_dx = 0.5;
+        }
         let default_bg = if input.default_bg == aterm_core::render::COLOR_UNSET {
             COLD_THEME_BG
         } else {
@@ -1877,13 +2028,6 @@ impl EffectsPipeline {
         let trail_fp = fx.trail_fp;
         let glow_fp = fx.glow_fp;
         self.publish_cursor(input);
-        #[cfg(test)]
-        if self.pet_veil_stale {
-            let _ = self
-                .cursor
-                .glow
-                .veil_pet_letters((&mut input.glow_under, &mut input.glow_under_ramps), &[]);
-        }
         if self.trail_cfg.enabled {
             input.cursor_trail_color = fx.trail_color;
         }
@@ -1891,7 +2035,7 @@ impl EffectsPipeline {
         {
             self.block_fill = fx.block_fill;
         }
-        input.cursor_fill_override = fx.block_fill.map(|owned| owned.fill);
+        input.cursor_fill_override = fx.caret_fill();
         input.cursor_effect_style_override =
             compose_caret_style_override(fx.bolt_cursor, fx.twinkle_cursor, fx.momentum_steady);
 
@@ -2077,7 +2221,6 @@ impl EffectsPipeline {
         self.sprite_layers
             .publish(&self.free_scratch, &mut input.fx_layers);
         self.shade_word_icons(input);
-        self.veil_pet_letters(input);
         let streak_fp = if let Some(streak) = self.streak.as_deref_mut() {
             let mut cfg = self.streak_cfg;
             if self.streak_reduced_motion {
@@ -5365,89 +5508,6 @@ mod tests {
         );
     }
 
-    /// THE PET'S VEIL LIES UNDER THE BODY ITS FRAME DREW (looks7 M10): the
-    /// page veil a dim theme's letters take over the pet is drawn after the
-    /// pet's tick, by the body that tick drew. Drawn in the trail's step it
-    /// read the body of the frame before, so a moving pet's veil lay a frame
-    /// behind it: page over letters the body had left, the letters it had
-    /// reached bare over its coat. A line typed on a dim page under the pet
-    /// as it runs on with the caret: every frame's veil runs (the page's
-    /// colour at a veil's opacity in the under stream) keep to the box the
-    /// frame's body drew. Negative control: drawn in the step, runs stray
-    /// outside it.
-    #[test]
-    fn the_pet_s_veil_lies_under_the_body_its_frame_drew() {
-        // (frames with a veil, frames with a run outside the frame's body).
-        let run = |stale: bool| -> (usize, usize) {
-            let mut p = pet_pipeline(0x5EED);
-            p.pet_veil_stale = stale;
-            let (mut term, mut input) = glass(8, 40);
-            let rgb =
-                |c: u32| aterm_core::terminal::Rgb::new((c >> 16) as u8, (c >> 8) as u8, c as u8);
-            let page = 0x0011_1318;
-            term.set_default_foreground(rgb(0x0085_8585));
-            term.set_default_background(rgb(page));
-            stamp_effective_terminal_background(&term, &mut input);
-            idle(&mut p, &mut term, &mut input, 90, 16.0);
-            let pad = 3 + 3;
-            let (mut veiled, mut astray) = (0, 0);
-            let mut look = |p: &EffectsPipeline, input: &RenderInput| {
-                let veil: Vec<&GlowQuad> = input
-                    .glow_under
-                    .iter()
-                    .filter(|q| {
-                        q.alpha.max(q.alpha2) >= 32
-                            && q.color & 0x00FF_FFFF
-                                == aterm_render::premul_rgb(page, q.alpha) & 0x00FF_FFFF
-                            && q.color2 & 0x00FF_FFFF
-                                == aterm_render::premul_rgb(page, q.alpha2) & 0x00FF_FFFF
-                    })
-                    .collect();
-                if veil.is_empty() {
-                    return;
-                }
-                veiled += 1;
-                let Some((x0, x1, y0, y1)) = p.cursor.glow.pet_body_box() else {
-                    astray += 1;
-                    return;
-                };
-                astray += usize::from(veil.iter().any(|q| {
-                    let (qx0, qy0) = (i32::from(q.x), i32::from(q.y));
-                    let (qx1, qy1) = (qx0 + i32::from(q.w), qy0 + i32::from(q.h));
-                    qx0 < x0 - pad || qx1 > x1 + pad || qy0 < y0 - pad || qy1 > y1 + pad
-                }));
-            };
-            for b in b"the quick brown fox jumps over the lazy".iter() {
-                p.note_console_input(PetInputKind::Text);
-                let _ = commit_ascii(&mut p, &mut term, &mut input, &[*b], 16.0);
-                look(&p, &input);
-                for _ in 0..2 {
-                    let _ = idle(&mut p, &mut term, &mut input, 1, 16.0);
-                    look(&p, &input);
-                }
-            }
-            for _ in 0..90 {
-                let _ = idle(&mut p, &mut term, &mut input, 1, 16.0);
-                look(&p, &input);
-            }
-            (veiled, astray)
-        };
-        let (veiled, astray) = run(false);
-        let (control_veiled, control_astray) = run(true);
-        assert!(
-            veiled >= 3,
-            "fixture: the pet crossed the dim letters in {veiled} frames"
-        );
-        assert_eq!(
-            astray, 0,
-            "{astray} of {veiled} frames veil letters off the body"
-        );
-        assert!(
-            control_astray > 0,
-            "control: drawn by the frame before, no veil strayed ({control_veiled} veiled)"
-        );
-    }
-
     #[test]
     fn the_page_samples_a_peeking_cats_palette_over_its_footprint() {
         let mut p = EffectsPipeline::new();
@@ -6293,5 +6353,9 @@ mod tests {
             None,
             "control: a head at no opacity names no body"
         );
+        p.advance(1e-300);
+        p.advance(1e300);
+        let _ = p.now();
+        let _ = p.wake();
     }
 }

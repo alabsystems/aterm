@@ -57,6 +57,8 @@ pub(crate) mod clone;
 /// Per-build exec roots (`<prefix>/compat/trust/<build>`) and `bin/` shim routing for Trust bundles.
 pub mod compat;
 pub mod config;
+/// Which `aterm.toml` a shell's aterm and the app read, when they are not the same file.
+pub mod config_split;
 /// `aterm pkg doctor`'s checks as converge items.
 pub mod converge;
 /// Stale copies of aterm beside the installed release (macOS).
@@ -94,6 +96,9 @@ pub mod lease;
 /// Which compiler built a toolchain, decided by content.
 pub mod lineage;
 pub mod linkmode;
+/// Explicit local harness receipt admission and store-only current selection (no signed authority).
+#[cfg(unix)]
+pub mod local_harness;
 pub mod lock;
 pub mod machine;
 /// The Mach-O files of a staged tree, found by magic, for the Developer ID stage gate.
@@ -104,6 +109,7 @@ mod metadata_io;
 /// The one-line progress meter under a person's typed verb, and the printing every line
 /// takes around it.
 mod meter;
+mod native_defaults;
 pub mod net;
 /// Where atpkg's unasked notices go.
 pub mod notice;
@@ -168,6 +174,8 @@ pub mod verify;
 pub mod warm;
 /// Yolo by default on every managed agent name, and the `--yolo` alias for it.
 pub mod yolo;
+/// The folder zsh reads its `.zshrc` from, learned with or without a shell's environment.
+pub mod zdotdir;
 
 pub use activate::{Aliases, activate_build, atomic_symlink, install_shims};
 pub use adoption::{Adoption, adoption_consented, session_bin_dir};

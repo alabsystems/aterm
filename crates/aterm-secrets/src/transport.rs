@@ -25,10 +25,92 @@ pub enum Source {
 pub enum Fetched {
     /// The bytes at the source.
     Body(Vec<u8>),
-    /// A long-poll that ended with nothing newer (`204`).
+    /// A long-poll with no newer version: an HTTP 204, or a sent request held past its deadline.
     NoNewer(Option<u64>),
     /// Nothing there: a `404`, or no file at the path.
     Missing,
+}
+
+/// A completed HTTP 204 response, distinct from a held request's synthetic no-news result.
+/// Its constructor stays at the actual response boundary; no URL or headers leave it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(unix, test))]
+pub(crate) struct NoContentReply {
+    request: [u8; 32],
+    responded_at_ms: u64,
+}
+
+#[cfg(any(unix, test))]
+impl NoContentReply {
+    pub(crate) const fn responded_at_ms(self) -> u64 {
+        self.responded_at_ms
+    }
+
+    pub(crate) fn matches_binding(self, binding: [u8; 32]) -> bool {
+        self.request == binding
+    }
+}
+
+/// The exact URL and caller-supplied request context, without retaining their text.
+#[cfg(any(unix, test))]
+pub(crate) fn request_binding(url: &str, after: Option<u64>, subscriber: Option<&str>) -> [u8; 32] {
+    let mut digest = aterm_digest::Sha256::new();
+    digest.update(b"aterm vault HTTP204 request/1\0");
+    digest.update((url.len() as u64).to_be_bytes());
+    digest.update(url.as_bytes());
+    match after {
+        Some(after) => {
+            digest.update([1]);
+            digest.update(after.to_be_bytes());
+        }
+        None => digest.update([0]),
+    }
+    match subscriber {
+        Some(subscriber) => {
+            digest.update([1]);
+            digest.update((subscriber.len() as u64).to_be_bytes());
+            digest.update(subscriber.as_bytes());
+        }
+        None => digest.update([0]),
+    }
+    digest.finalize()
+}
+
+#[derive(Debug)]
+pub(crate) struct ObservedFetch {
+    pub(crate) fetched: Fetched,
+    #[cfg(any(unix, test))]
+    pub(crate) http204: Option<NoContentReply>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ObservedAnswer {
+    answer: Answer,
+    #[cfg(any(unix, test))]
+    http204: Option<NoContentReply>,
+}
+
+impl From<Answer> for ObservedAnswer {
+    fn from(answer: Answer) -> Self {
+        Self {
+            answer,
+            #[cfg(any(unix, test))]
+            http204: None,
+        }
+    }
+}
+
+impl ObservedAnswer {
+    pub(crate) fn fetched(self) -> crate::Result<ObservedFetch> {
+        match self.answer {
+            Answer::Fetched(fetched) => Ok(ObservedFetch {
+                fetched,
+                #[cfg(any(unix, test))]
+                http204: self.http204,
+            }),
+            Answer::Foreign(why) => Err(Error::new(why)),
+        }
+    }
 }
 
 /// What [`fetch`] adds to `wait` for the request's own deadline.
@@ -39,7 +121,7 @@ pub const FETCH_MARGIN: Duration = Duration::from_secs(5);
 /// that ends at its total never waits it.
 #[cfg(test)]
 pub const FETCH_MARGIN: Duration = aterm_spec::wait::MUST_HAPPEN.saturating_mul(2);
-/// The DNS lookup, connect and TLS handshake of each of a look's tries ([`get_bounded`]):
+/// The DNS lookup, connect and TLS handshake of each of a look's tries ([`look_bounded`]):
 /// a vault's name answers in milliseconds once macOS lets it, and mDNS says a `.local` name
 /// nobody has is not there after about five seconds, which this outlasts so that answer is
 /// heard as one.
@@ -335,6 +417,32 @@ impl aterm_http::Connect for LanNoting {
     }
 }
 
+/// [`LanNoting`] that also keeps the address of the server its last connect reached, so a reader
+/// can say which server answered it ([`wait_joins_from`]).
+#[derive(Debug, Default)]
+struct PeerNoting(std::sync::Mutex<Option<SocketAddr>>);
+
+impl PeerNoting {
+    fn reached(&self) -> Option<IpAddr> {
+        use aterm_types::MutexExt as _;
+        self.0.lock_or_recover().map(|addr| addr.ip())
+    }
+}
+
+impl aterm_http::Connect for PeerNoting {
+    fn connect(
+        &self,
+        host: &str,
+        port: u16,
+        deadline: aterm_http::Deadline,
+    ) -> std::io::Result<std::net::TcpStream> {
+        use aterm_types::MutexExt as _;
+        let stream = aterm_http::Connect::connect(&LanNoting, host, port, deadline)?;
+        *self.0.lock_or_recover() = stream.peer_addr().ok();
+        Ok(stream)
+    }
+}
+
 /// A connect that found no route to a LAN address: the error, and where it went.
 #[derive(Debug)]
 struct NoRoute {
@@ -466,6 +574,10 @@ fn no_route_to_lan(error: &aterm_http::Error) -> bool {
 /// The header a subscriber's GET sends so the server records when it was last heard (`age1…`).
 pub const SUBSCRIBER_HEADER: &str = "X-Aterm-Subscriber";
 
+/// Advisory purpose of a non-consuming server probe or sealed replica pull. This grants no
+/// authority; ordinary unknown consumers remain anonymous unless they identify themselves.
+pub const OBSERVER_HEADER: &str = "X-Aterm-Observer";
+
 /// Header asking a `>= 0.146` server's `?after=<seq>` GET to answer `204` at once instead of
 /// holding a long-poll when `held.seq <= seq` (`DESIGN-fluid-swarm` §4.1 F6).
 pub const NO_WAIT_HEADER: &str = "X-Aterm-No-Wait";
@@ -486,22 +598,31 @@ pub fn fetch_as(
     wait: Duration,
     subscriber: Option<&str>,
 ) -> crate::Result<Fetched> {
+    fetch_as_observed(source, after, wait, subscriber).map(|observed| observed.fetched)
+}
+
+pub(crate) fn fetch_as_observed(
+    source: &Source,
+    after: Option<u64>,
+    wait: Duration,
+    subscriber: Option<&str>,
+) -> crate::Result<ObservedFetch> {
     match source {
-        Source::Url(url) => {
-            match get_via(
-                &client(wait.saturating_add(FETCH_MARGIN)),
-                url,
-                after,
-                None,
-                subscriber,
-            )
-            .map_err(|unheard| unheard.why)?
-            {
-                Answer::Fetched(fetched) => Ok(fetched),
-                Answer::Foreign(why) => Err(Error::new(why)),
-            }
-        }
-        Source::Path(path) => Ok(read_path(path)?.map_or(Fetched::Missing, Fetched::Body)),
+        Source::Url(url) => get_observed_via_with(
+            &client(wait.saturating_add(FETCH_MARGIN)),
+            url,
+            after,
+            None,
+            subscriber,
+            false,
+        )
+        .map_err(|unheard| unheard.why)?
+        .fetched(),
+        Source::Path(path) => Ok(ObservedFetch {
+            fetched: read_path(path)?.map_or(Fetched::Missing, Fetched::Body),
+            #[cfg(any(unix, test))]
+            http204: None,
+        }),
     }
 }
 
@@ -519,12 +640,18 @@ pub fn fetch_within_as(
     total: Duration,
     subscriber: Option<&str>,
 ) -> crate::Result<Fetched> {
-    match get_via_with(&client(total), url, after, None, subscriber, false)
+    fetch_within_as_observed(url, after, total, subscriber).map(|observed| observed.fetched)
+}
+
+pub(crate) fn fetch_within_as_observed(
+    url: &str,
+    after: Option<u64>,
+    total: Duration,
+    subscriber: Option<&str>,
+) -> crate::Result<ObservedFetch> {
+    get_observed_via_with(&client(total), url, after, None, subscriber, false)
         .map_err(|unheard| unheard.why)?
-    {
-        Answer::Fetched(fetched) => Ok(fetched),
-        Answer::Foreign(why) => Err(Error::new(why)),
-    }
+        .fetched()
 }
 
 /// [`fetch_within`] for server-to-server pull (`DESIGN-fluid-swarm` §4.1 F6): sends `?after=<seq>`
@@ -545,6 +672,94 @@ pub fn fetch_after_nowait(
         true,
     )
     .map_err(|unheard| unheard.why)?
+    {
+        Answer::Fetched(fetched) => Ok(fetched),
+        Answer::Foreign(why) => Err(Error::new(why)),
+    }
+}
+
+/// A non-consuming server probe or sealed replica pull. Generic fetches deliberately do not
+/// send this purpose marker, even when they ask not to wait.
+#[cfg(any(unix, test))]
+pub(crate) fn observe_after_nowait(
+    url: &str,
+    after: Option<u64>,
+    total: Duration,
+) -> crate::Result<Fetched> {
+    match get_via_purpose(
+        &client(total),
+        url,
+        after,
+        Some(PROBE_CONNECT.min(total)),
+        None,
+        true,
+        true,
+    )
+    .map(|observed| observed.answer)
+    .map_err(|unheard| unheard.why)?
+    {
+        Answer::Fetched(fetched) => Ok(fetched),
+        Answer::Foreign(why) => Err(Error::new(why)),
+    }
+}
+
+/// What [`observe_after_nowait_within`] heard.
+#[cfg(any(unix, test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Pulled {
+    /// What [`observe_after_nowait`] returns for it.
+    Fetched(Fetched),
+    /// An answer, of any status, whose body is longer than the limit given: no more of it than
+    /// that was read (none, when the answer declares its length).
+    Larger,
+}
+
+/// [`observe_after_nowait`], reading a body of at most `limit` bytes (and never more than
+/// [`MAX_ENVELOPE`]): a longer one is [`Pulled::Larger`], where [`observe_after_nowait`] takes it
+/// for an answer no vault server gives. A server pulling from all its peers at once reads each
+/// one's answer so, under a small limit, and reads a longer one whole only under a slot of a few
+/// (`crate::server`'s envelope pulls).
+#[cfg(any(unix, test))]
+pub(crate) fn observe_after_nowait_within(
+    url: &str,
+    after: Option<u64>,
+    total: Duration,
+    limit: usize,
+) -> crate::Result<Pulled> {
+    let sent = get_request(
+        &client(total),
+        url,
+        after,
+        Some(PROBE_CONNECT.min(total)),
+        None,
+        true,
+        true,
+    )
+    .limit(limit.min(MAX_ENVELOPE))
+    .send_phased(&[]);
+    if let Err(aterm_http::SendError {
+        error: aterm_http::Error::TooLarge { .. },
+        ..
+    }) = &sent
+    {
+        return Ok(Pulled::Larger);
+    }
+    match classify_get_response(sent, url, after, None)
+        .map(|observed| observed.answer)
+        .map_err(|unheard| unheard.why)?
+    {
+        Answer::Fetched(fetched) => Ok(Pulled::Fetched(fetched)),
+        Answer::Foreign(why) => Err(Error::new(why)),
+    }
+}
+
+/// [`fetch_within`] as a non-consuming probe ([`OBSERVER_HEADER`]): the server answers it as any
+/// GET but keeps no heard record of it, so it never counts as a reader of the vault (F20).
+#[cfg(unix)]
+pub(crate) fn observe_within(url: &str, total: Duration) -> crate::Result<Fetched> {
+    match get_via_purpose(&client(total), url, None, None, None, false, true)
+        .map(|observed| observed.answer)
+        .map_err(|unheard| unheard.why)?
     {
         Answer::Fetched(fetched) => Ok(fetched),
         Answer::Foreign(why) => Err(Error::new(why)),
@@ -595,16 +810,57 @@ pub fn get_bounded(
     )
 }
 
+/// [`get_bounded`] of the whole vault as a look: a server keeps no heard record of it
+/// ([`get_within`]).
+pub fn look_bounded(
+    url: &str,
+    wait: Duration,
+    connect: Option<Duration>,
+) -> Result<Answer, Unheard> {
+    get_via_purpose(
+        &client(wait.saturating_add(FETCH_MARGIN)),
+        url,
+        None,
+        connect,
+        None,
+        false,
+        true,
+    )
+    .map(|observed| observed.answer)
+}
+
 /// One GET of the vault at `url` as a look, never a long-poll: all of it within `total`, with
 /// no [`FETCH_MARGIN`], its lookup and connect within [`PROBE_CONNECT`] (or `total`, if
-/// shorter).
+/// shorter). A server keeps no heard record of a look ([`OBSERVER_HEADER`]): it is never a plain
+/// read a `0.145` Mac may have made (F20). A join that takes the envelope a look read names itself
+/// at its first sync.
 pub fn get_within(url: &str, total: Duration) -> crate::Result<Answer> {
-    get_via(
+    get_via_purpose(
         &client(total),
         url,
         None,
         Some(PROBE_CONNECT.min(total)),
         None,
+        false,
+        true,
+    )
+    .map(|observed| observed.answer)
+    .map_err(|unheard| unheard.why)
+}
+
+/// [`get_within`] for an identified consumer, preserving the same connect and total budgets.
+#[cfg(unix)]
+pub(crate) fn get_within_as(
+    url: &str,
+    total: Duration,
+    subscriber: Option<&str>,
+) -> crate::Result<Answer> {
+    get_via(
+        &client(total),
+        url,
+        None,
+        Some(PROBE_CONNECT.min(total)),
+        subscriber,
     )
     .map_err(|unheard| unheard.why)
 }
@@ -628,33 +884,102 @@ fn get_via_with(
     subscriber: Option<&str>,
     no_wait: bool,
 ) -> Result<Answer, Unheard> {
+    get_observed_via_with(client, url, after, connect, subscriber, no_wait)
+        .map(|observed| observed.answer)
+}
+
+fn get_observed_via_with(
+    client: &Client,
+    url: &str,
+    after: Option<u64>,
+    connect: Option<Duration>,
+    subscriber: Option<&str>,
+    no_wait: bool,
+) -> Result<ObservedAnswer, Unheard> {
+    get_via_purpose(client, url, after, connect, subscriber, no_wait, false)
+}
+
+fn get_via_purpose(
+    client: &Client,
+    url: &str,
+    after: Option<u64>,
+    connect: Option<Duration>,
+    subscriber: Option<&str>,
+    no_wait: bool,
+    observer: bool,
+) -> Result<ObservedAnswer, Unheard> {
+    let sent = get_request(client, url, after, connect, subscriber, no_wait, observer)
+        .limit(MAX_ENVELOPE)
+        .send_phased(&[]);
+    classify_get_response(
+        sent,
+        url,
+        after,
+        #[cfg(any(unix, test))]
+        subscriber,
+    )
+}
+
+/// One GET of the vault at `url` through `client`, as [`get_via_purpose`] asks it, with its
+/// body limit left for the caller to set.
+fn get_request<'c>(
+    client: &'c Client,
+    url: &str,
+    after: Option<u64>,
+    connect: Option<Duration>,
+    subscriber: Option<&str>,
+    no_wait: bool,
+    observer: bool,
+) -> aterm_http::RequestBuilder<'c> {
     let target = match after {
         Some(seq) => with_query(url, &format!("after={seq}")),
         None => base(url).to_owned(),
     };
-    let request = client.get(&target).limit(MAX_ENVELOPE);
+    let request = client.get(&target);
     let request = match subscriber {
         Some(subscriber) => request.header(SUBSCRIBER_HEADER, subscriber),
         None => request,
+    };
+    let request = if observer {
+        request.header(OBSERVER_HEADER, "1")
+    } else {
+        request
     };
     let request = if no_wait {
         request.header(NO_WAIT_HEADER, "1")
     } else {
         request
     };
-    let request = match connect {
+    match connect {
         Some(connect) => request.connect_within(connect),
         None => request,
-    };
-    let response = match request.send_phased(&[]) {
+    }
+}
+
+/// Shared response classifier: only its successful actual 204 branch can mint a reply token.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbVaultHttp204",
+        action = "Receive",
+        project = "aterm_secrets::client::http204_observation::conformance_tests::http204_transition"
+    )
+)]
+fn classify_get_response(
+    response: Result<aterm_http::Response, aterm_http::SendError>,
+    url: &str,
+    after: Option<u64>,
+    #[cfg(any(unix, test))] subscriber: Option<&str>,
+) -> Result<ObservedAnswer, Unheard> {
+    let response = match response {
         Ok(response) => response,
         // A long-poll the server still held at the request's deadline (one held longer than
         // the asker waits, by an older server): nothing newer was heard.
         Err(failed) if after.is_some() && held_past_deadline(&failed) => {
-            return Ok(Answer::Fetched(Fetched::NoNewer(None)));
+            return Ok(Answer::Fetched(Fetched::NoNewer(None)).into());
         }
         Err(aterm_http::SendError { error, .. }) if foreign_reply(&error) => {
-            return Ok(Answer::Foreign(transport_error("fetching", url, &error).0));
+            return Ok(Answer::Foreign(transport_error("fetching", url, &error).0).into());
         }
         Err(aterm_http::SendError { error, .. }) => {
             return Err(Unheard {
@@ -663,19 +988,48 @@ fn get_via_with(
             });
         }
     };
-    let failed = |status| Unheard {
-        why: refused("fetching", url, status, response.body()),
-        held: false,
+    // Sample only a completed response, never a request start, synthetic timeout or later read.
+    #[cfg(any(unix, test))]
+    let http204 = if response.status() == 204 {
+        aterm_time::unix_millis()
+            .filter(|at| *at > 0 && *at <= i64::MAX as u64)
+            .map(|responded_at_ms| NoContentReply {
+                request: request_binding(url, after, subscriber),
+                responded_at_ms,
+            })
+    } else {
+        None
     };
-    match response.status() {
-        200 => Ok(Answer::Fetched(Fetched::Body(response.body().to_vec()))),
-        204 => Ok(Answer::Fetched(Fetched::NoNewer(
-            response.header("etag").and_then(etag_seq),
-        ))),
-        404 => Ok(Answer::Fetched(Fetched::Missing)),
-        status if foreign_status(status) => Ok(Answer::Foreign(failed(status).why.0)),
-        status => Err(failed(status)),
-    }
+    let answer = match response.status() {
+        200 => Answer::Fetched(Fetched::Body(response.into_body())),
+        204 => Answer::Fetched(Fetched::NoNewer(response.header("etag").and_then(etag_seq))),
+        404 => Answer::Fetched(Fetched::Missing),
+        status if foreign_status(status) => {
+            Answer::Foreign(refused("fetching", url, status, response.body()).0)
+        }
+        status => {
+            return Err(Unheard {
+                why: refused("fetching", url, status, response.body()),
+                held: false,
+            });
+        }
+    };
+    Ok(ObservedAnswer {
+        answer,
+        #[cfg(any(unix, test))]
+        http204,
+    })
+}
+
+/// Exercise the production classifier's failure branches without constructing reply tokens.
+#[cfg(all(test, unix))]
+pub(crate) fn test_classify_get_response(
+    response: Result<aterm_http::Response, aterm_http::SendError>,
+    url: &str,
+    after: Option<u64>,
+    subscriber: Option<&str>,
+) -> Result<ObservedAnswer, Unheard> {
+    classify_get_response(response, url, after, subscriber)
 }
 
 /// Whether `failed` is a request the server took and never answered by its deadline: the
@@ -807,6 +1161,129 @@ pub(crate) fn fetch_records_sync(
     }
 }
 
+/// What `GET <url>/heard` names a subscriber by: lowercase hex of SHA-256 over a domain tag and
+/// its recipient's 32 bytes. A Mac that holds a recipient can tell whether it was heard; one that
+/// holds none learns no key from the list.
+#[must_use]
+pub fn heard_tag(recipient: &crate::age::Recipient) -> String {
+    let mut bytes = Vec::with_capacity(HEARD_TAG_DOMAIN.len() + 32);
+    bytes.extend_from_slice(HEARD_TAG_DOMAIN);
+    bytes.extend_from_slice(&recipient.0);
+    aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(&bytes))
+}
+
+const HEARD_TAG_DOMAIN: &[u8] = b"aterm-secrets heard v1\0";
+pub(crate) const HEARD_COVERAGE_SECS: u64 = 14 * 24 * 60 * 60;
+/// The most subscriber last-heard records a server keeps per vault (`<name>.heard`), so the most
+/// rows a heard history carries ([`fetch_heard`]). Here rather than in the Unix-only server, as
+/// `fetch_heard` is built on every platform.
+pub const MAX_HEARD: usize = 512;
+
+/// A complete server history, with timestamps in that server's clock domain.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Heard {
+    /// The server's clock when it answered. Compare ages against this clock, not another Mac's.
+    pub as_of: u64,
+    /// Each subscriber's hashed tag and latest observed timestamp.
+    pub subscribers: std::collections::BTreeMap<String, u64>,
+    /// Latest legacy-style envelope read with no subscriber identity or observer purpose.
+    pub anonymous: Option<u64>,
+}
+
+/// The subscribers the server at `url` heard for its vault within its heard window
+/// (`GET <url>/heard`): each one's [`heard_tag`] and last time heard, in unix seconds. `Ok(None)`
+/// where the server answers `404`, as one older than the route does, so a caller reads that as
+/// unknown. A versioned coverage header must attest the full legacy window; prototype empty
+/// replies and malformed answers are not evidence that no subscriber was heard.
+///
+/// # Errors
+/// Transport fails, the server refuses with another status, or its coverage header, row count,
+/// UTF-8 or a nonempty row is invalid.
+pub fn fetch_heard(url: &str) -> crate::Result<Option<Heard>> {
+    let base_url = base(url);
+    let target = match base_url.split_once('?') {
+        Some((path, query)) => format!("{path}/heard?{query}"),
+        None => format!("{base_url}/heard"),
+    };
+    let response = client(EXCHANGE)
+        .get(&target)
+        .limit(256 * 1024)
+        .connect_within(PROBE_CONNECT)
+        .send_phased(&[])
+        .map_err(|failed| transport_error("reading who was heard from", url, &failed.error))?;
+    match response.status() {
+        200 => {}
+        404 => return Ok(None),
+        status => {
+            return Err(refused(
+                "reading who was heard from",
+                url,
+                status,
+                response.body(),
+            ));
+        }
+    }
+    let mut heard = std::collections::BTreeMap::new();
+    let text = std::str::from_utf8(response.body())
+        .map_err(|_| Error::new("the server's heard history is not UTF-8"))?;
+    let (head, rows) = text
+        .split_once('\n')
+        .ok_or_else(|| Error::new("the server's heard history has no coverage header"))?;
+    let header: Vec<_> = head.split_ascii_whitespace().collect();
+    let ["aterm-heard-v2", since, as_of, count, anonymous] = header.as_slice() else {
+        return Err(Error::new(
+            "the server's heard history has an unknown coverage header",
+        ));
+    };
+    let since = since
+        .parse::<u64>()
+        .map_err(|_| Error::new("invalid heard coverage start"))?;
+    let as_of = as_of
+        .parse::<u64>()
+        .map_err(|_| Error::new("invalid heard coverage time"))?;
+    let count = count
+        .parse::<usize>()
+        .map_err(|_| Error::new("invalid heard coverage count"))?;
+    let anonymous = if *anonymous == "-" {
+        None
+    } else {
+        Some(
+            anonymous
+                .parse::<u64>()
+                .map_err(|_| Error::new("invalid anonymous heard time"))?,
+        )
+    };
+    if since == 0 || as_of.saturating_sub(since) < HEARD_COVERAGE_SECS || count > MAX_HEARD {
+        return Err(Error::new(
+            "the server's heard history does not cover the legacy window",
+        ));
+    }
+    let mut seen = 0;
+    for line in rows.lines().filter(|line| !line.trim().is_empty()) {
+        let mut words = line.split_ascii_whitespace();
+        let (Some(tag), Some(at), None) = (words.next(), words.next(), words.next()) else {
+            return Err(Error::new("the server's heard history has a malformed row"));
+        };
+        let Ok(at) = at.parse::<u64>() else {
+            return Err(Error::new("the server's heard history has an invalid time"));
+        };
+        if tag.len() != 64 || !tag.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(Error::new("the server's heard history has an invalid tag"));
+        }
+        let last = heard.entry(tag.to_ascii_lowercase()).or_insert(0);
+        *last = (*last).max(at);
+        seen += 1;
+    }
+    if seen != count {
+        return Err(Error::new("the server's heard history is incomplete"));
+    }
+    Ok(Some(Heard {
+        as_of,
+        subscribers: heard,
+        anonymous,
+    }))
+}
+
 /// Post a self-delimiting stream of signed membership records (`POST <url>/records`).
 ///
 /// # Errors
@@ -854,6 +1331,24 @@ pub(crate) fn post_records_answered(url: &str, records: &[u8]) -> crate::Result<
 
 /// Publish an envelope (`PUT <url>`).
 pub fn publish(source: &Source, envelope: &[u8]) -> crate::Result<()> {
+    publish_until(source, envelope, None)
+}
+
+pub(crate) fn publish_until(
+    source: &Source,
+    envelope: &[u8],
+    deadline: Option<std::time::Instant>,
+) -> crate::Result<()> {
+    let wait = match deadline {
+        Some(deadline) => {
+            let wait = deadline.saturating_duration_since(std::time::Instant::now());
+            if wait.is_zero() {
+                return Err(Error::new("vault publication deadline expired"));
+            }
+            wait
+        }
+        None => EXCHANGE,
+    };
     if envelope.len() > MAX_ENVELOPE {
         return Err(Error::new(format!(
             "the envelope is larger than {MAX_ENVELOPE} bytes"
@@ -861,7 +1356,7 @@ pub fn publish(source: &Source, envelope: &[u8]) -> crate::Result<()> {
     }
     match source {
         Source::Url(url) => {
-            let response = client(EXCHANGE)
+            let response = client(wait)
                 .put(base(url))
                 .header("Content-Type", "text/plain; charset=utf-8")
                 .limit(REASON_BODY)
@@ -1090,10 +1585,13 @@ fn remove_dead(lock: &std::path::Path) -> bool {
                 ]
                 .iter()
                 .any(|name| name.as_deref() == Some(host));
-            let gone = pid.parse::<i32>().is_ok_and(|pid| {
-                aterm_uds::process::process_presence(pid)
-                    == aterm_uds::process::ProcessPresence::Absent
-            });
+            let gone = !pid.is_empty()
+                && pid.bytes().all(|b| b.is_ascii_digit())
+                && pid.parse::<i32>().is_ok_and(|pid| {
+                    pid > 0
+                        && aterm_uds::process::process_presence(pid)
+                            == aterm_uds::process::ProcessPresence::Absent
+                });
             ours && (gone || before_boot)
         }
         None => line.trim().is_empty() && before_boot,
@@ -1203,12 +1701,38 @@ pub(crate) fn post_join_pausing(
     line: &str,
     pause: &dyn Fn(Duration),
 ) -> crate::Result<()> {
+    post_join_bounded(url, line, pause, None)
+}
+
+/// Post a join request and honor at most one short Retry-After, sharing `deadline` across both.
+#[cfg(any(unix, test))]
+pub(crate) fn post_join_until(
+    url: &str,
+    line: &str,
+    deadline: std::time::Instant,
+) -> crate::Result<()> {
+    post_join_bounded(url, line, &std::thread::sleep, Some(deadline))
+}
+
+fn post_join_bounded(
+    url: &str,
+    line: &str,
+    pause: &dyn Fn(Duration),
+    deadline: Option<std::time::Instant>,
+) -> crate::Result<()> {
+    let remaining = || match deadline {
+        Some(deadline) => deadline
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| Error::of_kind(ErrorKind::TimedOut, "join request deadline elapsed")),
+        None => Ok(EXCHANGE),
+    };
     let line = line.trim_end_matches('\n');
     parse_join_line(line)?;
     let target = join_url(url);
     let mut retried = false;
     loop {
-        let response = client(EXCHANGE)
+        let response = client(remaining()?.min(EXCHANGE))
             .post(&target)
             .header("Content-Type", "text/plain; charset=utf-8")
             .limit(REASON_BODY)
@@ -1219,6 +1743,12 @@ pub(crate) fn post_join_pausing(
         }
         match retry_after(&response) {
             Some(wait) if response.status() == 429 && !retried && wait <= JOIN_RETRY_MOST => {
+                if deadline.is_some() && wait >= remaining()? {
+                    return Err(Error::of_kind(
+                        ErrorKind::TimedOut,
+                        "join retry would outlast the request deadline",
+                    ));
+                }
                 retried = true;
                 pause(wait);
             }
@@ -1245,9 +1775,14 @@ fn retry_after(response: &aterm_http::Response) -> Option<Duration> {
 
 /// `GET <url>/join`: the pending request lines ([`parse_join_line`]).
 pub fn list_joins(url: &str) -> crate::Result<Vec<String>> {
-    match wait_joins(url, None, EXCHANGE)? {
-        Joins::Listed(lines, _) => Ok(lines),
-        Joins::Unchanged => Ok(Vec::new()),
+    list_joins_from(url).map(|(lines, _)| lines)
+}
+
+/// [`list_joins`], and the address of the server that answered (`None`: not known).
+pub fn list_joins_from(url: &str) -> crate::Result<(Vec<String>, Option<IpAddr>)> {
+    match wait_joins_from(url, None, EXCHANGE)? {
+        (Joins::Listed(lines, _), from) => Ok((lines, from)),
+        (Joins::Unchanged, from) => Ok((Vec::new(), from)),
     }
 }
 
@@ -1266,18 +1801,34 @@ pub enum Joins {
 /// until a request is queued or changed past version `n` or the vault takes a new version, or
 /// its hold runs out, the whole request within `wait` and [`FETCH_MARGIN`].
 pub fn wait_joins(url: &str, after: Option<u64>, wait: Duration) -> crate::Result<Joins> {
+    wait_joins_from(url, after, wait).map(|(joins, _)| joins)
+}
+
+/// [`wait_joins`], and the address of the server that answered (`None`: not known), which an
+/// approver needs to judge the listing's `home=` words ([`crate::home_lan::Place::serving`]).
+pub fn wait_joins_from(
+    url: &str,
+    after: Option<u64>,
+    wait: Duration,
+) -> crate::Result<(Joins, Option<IpAddr>)> {
     let target = match after {
         Some(after) => with_query(&join_url(url), &format!("after={after}")),
         None => join_url(url),
     };
-    let response = match client(wait.saturating_add(FETCH_MARGIN))
-        .get(&target)
-        .limit(JOINS_BODY)
-        .send_phased(&[])
+    let noting = Arc::new(PeerNoting::default());
+    let response = match Client::new(
+        Trust::PlatformVerifier,
+        ProxyMode::Direct,
+        wait.saturating_add(FETCH_MARGIN),
+    )
+    .with_connector(Arc::clone(&noting) as Arc<dyn aterm_http::Connect>)
+    .get(&target)
+    .limit(JOINS_BODY)
+    .send_phased(&[])
     {
         Ok(response) => response,
         Err(failed) if after.is_some() && held_past_deadline(&failed) => {
-            return Ok(Joins::Unchanged);
+            return Ok((Joins::Unchanged, noting.reached()));
         }
         Err(failed) => {
             return Err(transport_error(
@@ -1289,7 +1840,7 @@ pub fn wait_joins(url: &str, after: Option<u64>, wait: Duration) -> crate::Resul
     };
     match response.status() {
         200 => {}
-        204 if after.is_some() => return Ok(Joins::Unchanged),
+        204 if after.is_some() => return Ok((Joins::Unchanged, noting.reached())),
         status => {
             return Err(refused(
                 "listing join requests at",
@@ -1301,12 +1852,15 @@ pub fn wait_joins(url: &str, after: Option<u64>, wait: Duration) -> crate::Resul
     }
     let text = std::str::from_utf8(response.body())
         .map_err(|_| Error::new("the join queue is not UTF-8 text"))?;
-    Ok(Joins::Listed(
-        text.lines()
-            .filter(|line| !line.is_empty())
-            .map(str::to_owned)
-            .collect(),
-        response.header("etag").and_then(etag_seq),
+    Ok((
+        Joins::Listed(
+            text.lines()
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned)
+                .collect(),
+            response.header("etag").and_then(etag_seq),
+        ),
+        noting.reached(),
     ))
 }
 
@@ -1388,8 +1942,14 @@ pub struct JoinRequest {
     pub code: String,
     /// Unix seconds when the server queued it (listings only).
     pub time: Option<u64>,
-    /// The serving vault observed this request from a LAN address (listings only).
+    /// An older server's marker that it observed this request from any private address
+    /// (listings only). A server since the home ALab LAN rule never lists it, and no approver
+    /// admits by it: a phone hotspot or a café numbers its hosts privately too.
     pub lan: bool,
+    /// The home ALab LAN the serving vault observed this request on, while that server is still
+    /// on it (listings only, [`crate::home_lan`]).
+    #[cfg(unix)]
+    pub home: Option<crate::home_lan::HomeTag>,
     /// A member's signed Allow of it (`crate::members::Allowed`), padded base64.
     pub allowed: Option<String>,
     /// The join-password proof it carried (`crate::join`), padded base64.
@@ -1411,8 +1971,9 @@ impl JoinRequest {
         line
     }
 
-    /// The line a server lists: `age1… <host> <code> <time>`, then ` allowed=<b64>` and
-    /// ` proof=<b64>`.
+    /// The line a server lists: `age1… <host> <code> <time>`, then ` home=<tag>`,
+    /// ` allowed=<b64>` and ` proof=<b64>`. An older parser reads ` home=` as a fifth field and
+    /// skips the line, so an older approver never admits such a request automatically.
     pub fn listed(&self) -> String {
         let mut line = format!(
             "{} {} {} {}",
@@ -1423,6 +1984,11 @@ impl JoinRequest {
         );
         if self.lan {
             line.push_str(" lan=1");
+        }
+        #[cfg(unix)]
+        if let Some(home) = &self.home {
+            line.push_str(" home=");
+            line.push_str(home.as_str());
         }
         if let Some(allowed) = &self.allowed {
             line.push_str(" allowed=");
@@ -1465,6 +2031,14 @@ pub fn parse_join_line(line: &str) -> crate::Result<JoinRequest> {
         }
         None => (line, None),
     };
+    #[cfg(unix)]
+    let (line, home) = match line.rsplit_once(" home=") {
+        Some((rest, tag)) => match crate::home_lan::HomeTag::parse(tag) {
+            Some(tag) => (rest, Some(tag)),
+            None => return Err(Error::new("a join request's home LAN marker is invalid")),
+        },
+        None => (line, None),
+    };
     let (line, lan) = match line.rsplit_once(" lan=") {
         Some((rest, "1")) => (rest, true),
         Some(_) => return Err(Error::new("a join request's LAN marker is invalid")),
@@ -1502,7 +2076,11 @@ pub fn parse_join_line(line: &str) -> crate::Result<JoinRequest> {
                 .ok_or_else(|| Error::new("a join request's time is not unix seconds"))?,
         ),
     };
-    if lan && time.is_none() {
+    #[cfg(unix)]
+    let marked = lan || home.is_some();
+    #[cfg(not(unix))]
+    let marked = lan;
+    if marked && time.is_none() {
         return Err(Error::new("only a server listing carries a LAN marker"));
     }
     Ok(JoinRequest {
@@ -1511,6 +2089,8 @@ pub fn parse_join_line(line: &str) -> crate::Result<JoinRequest> {
         code: code.to_owned(),
         time,
         lan,
+        #[cfg(unix)]
+        home,
         allowed,
         proof,
     })
@@ -1854,6 +2434,16 @@ mod tests {
             b"m22.local 4242\n\x1b[2J"
         );
         std::fs::remove_file(&lock).expect("released");
+        if let Some(host) = aterm_uds::process::host_name() {
+            for bad_pid in ["-1", "+99999999", "0"] {
+                std::fs::write(&lock, format!("{host} {bad_pid}\n")).expect("malformed pid lock");
+                assert!(
+                    !remove_dead(&lock),
+                    "signed or zero pid {bad_pid:?} must not be cleared as a gone process"
+                );
+                std::fs::remove_file(&lock).expect("cleanup");
+            }
+        }
         assert!(publish(&source, &version(40, b"older")).is_err());
         assert!(!lock.exists(), "a refused publish leaves no lock behind");
         publish(&source, &version(42, b"on top")).expect("newer");
@@ -1910,11 +2500,160 @@ mod tests {
         (url, server)
     }
 
+    #[test]
+    fn a_malformed_heard_answer_is_not_an_empty_history() {
+        let tag = "ab".repeat(32);
+        let good = format!("{tag} 123\n");
+        let as_of = 100 + HEARD_COVERAGE_SECS;
+        for body in [
+            Vec::new(), // A prototype 200-empty route has no coverage contract.
+            format!("aterm-heard-v1 100 {as_of} 0\n").into_bytes(), // Prototype had no anonymous coverage.
+            format!("aterm-heard-v2 100 {as_of} 1 -\nbad-row\n").into_bytes(),
+            format!("aterm-heard-v2 100 {as_of} 2 -\n{good}{tag} not-a-time\n").into_bytes(),
+            format!("aterm-heard-v2 100 {as_of} 2 -\n{good}bad-tag 124\n").into_bytes(),
+            format!("aterm-heard-v2 100 {as_of} 2 -\n{good}").into_bytes(), // Truncated at a whole row.
+            format!("aterm-heard-v2 101 {as_of} 0 -\n").into_bytes(),       // One second short.
+            format!("aterm-heard-v2 100 {as_of} 0 not-a-time\n").into_bytes(),
+            vec![0xff],
+        ] {
+            let mut response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            response.extend_from_slice(&body);
+            let (url, server) = stub(response);
+            assert!(
+                fetch_heard(&url).is_err(),
+                "malformed history became complete"
+            );
+            assert!(
+                server
+                    .join()
+                    .expect("stub")
+                    .starts_with("GET /v1/alab/heard ")
+            );
+        }
+
+        let body = format!(
+            "aterm-heard-v2 100 {as_of} 3 126\n{good}{} 125\n{tag} 124\n",
+            tag.to_ascii_uppercase()
+        );
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (url, server) = stub(response.into_bytes());
+        assert_eq!(
+            fetch_heard(&url).expect("valid history"),
+            Some(Heard {
+                as_of,
+                subscribers: std::collections::BTreeMap::from([(tag, 125)]),
+                anonymous: Some(126),
+            })
+        );
+        server.join().expect("stub");
+    }
+
+    #[test]
+    fn only_an_explicit_non_consuming_observer_sends_observer_purpose() {
+        let response =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
+        let (url, server) = stub_each(vec![response.clone(), response.clone(), response]);
+        fetch_within(&url, None, HANG_DETECTOR).unwrap();
+        fetch_after_nowait(&url, None, HANG_DETECTOR).unwrap();
+        observe_after_nowait(&url, None, HANG_DETECTOR).unwrap();
+        let heads = server.join().unwrap();
+        for head in &heads[..2] {
+            let head = head.to_ascii_lowercase();
+            assert!(!head.contains("x-aterm-observer:"));
+            assert!(!head.contains("x-aterm-subscriber:"));
+        }
+        assert!(heads[1].to_ascii_lowercase().contains("x-aterm-no-wait: 1"));
+        assert!(
+            heads[2]
+                .to_ascii_lowercase()
+                .contains("x-aterm-observer: 1")
+        );
+    }
+
+    /// [`observe_after_nowait_within`] reads at most its limit of any answer, as a server's
+    /// non-consuming pull: one that declares a longer length, or a chunked one that runs
+    /// longer, is [`Pulled::Larger`], whatever its status; one within the limit is read whole.
+    #[test]
+    fn a_bounded_pull_reads_at_most_its_limit_of_any_answer() {
+        let answer = |status: &str, body: &[u8]| {
+            let mut answer = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            answer.extend_from_slice(body);
+            answer
+        };
+        let chunked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n\
+            10\r\n0123456789abcdef\r\n10\r\n0123456789abcdef\r\n0\r\n\r\n"
+            .to_vec();
+        let (url, server) = stub_each(vec![
+            answer("200 OK", &[7; 64]),
+            chunked,
+            answer("404 Not Found", &[b'x'; 64]),
+            answer("200 OK", &[7; 16]),
+        ]);
+        for why in [
+            "a declared length over the limit",
+            "a chunked body over the limit",
+            "a 404 page over the limit",
+        ] {
+            assert_eq!(
+                observe_after_nowait_within(&url, Some(3), HANG_DETECTOR, 16).expect(why),
+                Pulled::Larger,
+                "{why}"
+            );
+        }
+        assert_eq!(
+            observe_after_nowait_within(&url, Some(3), HANG_DETECTOR, 16).expect("within"),
+            Pulled::Fetched(Fetched::Body(vec![7; 16])),
+            "a body within the limit is read whole"
+        );
+        for head in server.join().expect("stub") {
+            assert!(head.starts_with("GET /v1/alab?after=3 "), "{head}");
+            let head = head.to_ascii_lowercase();
+            assert!(head.contains("x-aterm-no-wait: 1"), "{head}");
+            assert!(head.contains("x-aterm-observer: 1"), "{head}");
+        }
+    }
+
     fn too_many(retry_after: Option<u64>) -> Vec<u8> {
         let header =
             retry_after.map_or_else(String::new, |secs| format!("Retry-After: {secs}\r\n"));
         format!("HTTP/1.1 429 Too Many Requests\r\n{header}Content-Length: 9\r\n\r\nslow down")
             .into_bytes()
+    }
+
+    #[test]
+    fn bounded_join_stops_before_a_retry_that_outlasts_its_deadline() {
+        let line = format!("{} m22 abcd-ef23-ghij-k234", recipient());
+        let (url, server) = stub_each(vec![too_many(Some(10))]);
+        let pauses = std::cell::RefCell::new(Vec::new());
+        let error = post_join_bounded(
+            &url,
+            &line,
+            &|wait| pauses.borrow_mut().push(wait),
+            Some(std::time::Instant::now() + Duration::from_secs(5)),
+        )
+        .expect_err("retry cannot finish before deadline");
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
+        assert!(pauses.borrow().is_empty());
+        assert_eq!(server.join().expect("stub").len(), 1);
+
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}/v1/alab", silent.local_addr().unwrap());
+        let started = std::time::Instant::now();
+        let error = post_join_until(&url, &line, started + Duration::from_millis(200))
+            .expect_err("silent peer ends at deadline");
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
+        assert!(started.elapsed() < HANG_DETECTOR);
     }
 
     #[test]
@@ -2125,8 +2864,19 @@ mod tests {
     #[test]
     fn a_long_poll_asks_after_the_seq_and_reads_no_newer() {
         let (url, server) = stub(b"HTTP/1.1 204 No Content\r\nETag: \"40\"\r\n\r\n".to_vec());
-        let fetched = fetch(&Source::Url(url), Some(41), HANG_DETECTOR).expect("fetched");
-        assert_eq!(fetched, Fetched::NoNewer(Some(40)));
+        let fetched = fetch_as_observed(&Source::Url(url.clone()), Some(41), HANG_DETECTOR, None)
+            .expect("fetched");
+        assert_eq!(fetched.fetched, Fetched::NoNewer(Some(40)));
+        let reply = fetched.http204.expect("actual completed204");
+        assert!(reply.responded_at_ms() > 0);
+        assert!(reply.matches_binding(request_binding(&url, Some(41), None)));
+        assert!(!reply.matches_binding(request_binding(&url, Some(40), None)));
+        assert!(!reply.matches_binding(request_binding(&url, Some(41), Some("other-subscriber"))));
+        assert!(!reply.matches_binding(request_binding(
+            "http://127.0.0.1:1/v1/other",
+            Some(41),
+            None
+        )));
         let head = server.join().expect("stub");
         assert!(
             head.starts_with("GET /v1/alab?after=41 HTTP/1.1\r\n"),
@@ -2138,8 +2888,13 @@ mod tests {
         );
         for etag in ["", "ETag: 40\r\n", "ETag: \"\"\r\n", "ETag: \"+40\"\r\n"] {
             let (url, server) = stub(format!("HTTP/1.1 204 No Content\r\n{etag}\r\n").into_bytes());
-            let fetched = fetch(&Source::Url(url), Some(41), HANG_DETECTOR).expect("fetched");
-            assert_eq!(fetched, Fetched::NoNewer(None), "{etag:?}");
+            let fetched = fetch_as_observed(&Source::Url(url), Some(41), HANG_DETECTOR, None)
+                .expect("fetched");
+            assert_eq!(fetched.fetched, Fetched::NoNewer(None), "{etag:?}");
+            assert!(
+                fetched.http204.is_some(),
+                "no validETag is needed to observe a response"
+            );
             server.join().expect("stub");
         }
     }
@@ -2299,9 +3054,14 @@ mod tests {
         let url = format!("http://{}/v1/alab", silent.local_addr().expect("addr"));
         let total = Duration::from_millis(200);
         let started = std::time::Instant::now();
-        let held = fetch_within(&url, Some(3), total).expect("a held long-poll is no news");
+        let held = fetch_within_as_observed(&url, Some(3), total, None)
+            .expect("a held long-poll is no news");
         let took = started.elapsed();
-        assert_eq!(held, Fetched::NoNewer(None));
+        assert_eq!(held.fetched, Fetched::NoNewer(None));
+        assert!(
+            held.http204.is_none(),
+            "a sent request timeout is no response"
+        );
         assert!(
             took < HANG_DETECTOR,
             "the try waited the fetch margin past its total: {took:?}"

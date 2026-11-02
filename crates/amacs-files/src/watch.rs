@@ -135,7 +135,14 @@ impl Debounce {
     pub fn deadline(&self) -> Option<Instant> {
         self.pending
             .values()
-            .map(|(first, latest)| (*latest + QUIET).min(*first + SETTLE_CAP))
+            .filter_map(|(first, latest)| {
+                match (latest.checked_add(QUIET), first.checked_add(SETTLE_CAP)) {
+                    (Some(quiet), Some(cap)) => Some(quiet.min(cap)),
+                    (Some(quiet), None) => Some(quiet),
+                    (None, Some(cap)) => Some(cap),
+                    (None, None) => None,
+                }
+            })
             .min()
     }
 }
@@ -642,13 +649,15 @@ fn inotify_touched(buffer: &[u8], keys: &BTreeMap<u64, (i32, Vec<u8>)>, touched:
             .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
             .map_or(0, u32::from_ne_bytes)
     };
-    let mut at = 0;
-    while at + INOTIFY_HEAD <= buffer.len() {
+    let mut at = 0usize;
+    while let Some(payload_at) = at.checked_add(INOTIFY_HEAD)
+        && payload_at <= buffer.len()
+    {
         let wd = i32::from_ne_bytes(word(at).to_ne_bytes());
         let mask = word(at + 4);
-        let len = usize::try_from(word(at + 12)).unwrap_or(0);
-        let end = (at + INOTIFY_HEAD + len).min(buffer.len());
-        let name = &buffer[at + INOTIFY_HEAD..end];
+        let len = usize::try_from(word(at + 12)).unwrap_or(usize::MAX);
+        let end = payload_at.saturating_add(len).min(buffer.len());
+        let name = &buffer[payload_at..end];
         let name = &name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())];
         if mask & IN_Q_OVERFLOW != 0 {
             touched.extend(keys.keys());
@@ -777,7 +786,13 @@ mod inotify {
             if wd < 0 {
                 return Err(io::Error::last_os_error());
             }
-            self.keys.insert(key, (wd, name.as_bytes().to_vec()));
+            if let Some((old_wd, _)) = self.keys.insert(key, (wd, name.as_bytes().to_vec()))
+                && old_wd != wd
+                && !self.keys.values().any(|(other, _)| *other == old_wd)
+            {
+                // SAFETY: a live inotify descriptor and a watch it returned.
+                unsafe { libc::inotify_rm_watch(self.fd.as_raw_fd(), old_wd) };
+            }
             Ok(())
         }
 

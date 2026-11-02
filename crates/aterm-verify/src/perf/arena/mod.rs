@@ -593,16 +593,22 @@ pub(crate) fn target_dir() -> Result<PathBuf, String> {
     crate::perf::driver::target_dir()
 }
 
-/// Strip every inherited `ATERM_*` override from a terminal under test: a
-/// caller's terminal-specific settings must not change the run.
+/// Strip every inherited `ATERM_*` override but the verify run's mark from a
+/// terminal under test ([`aterm_uds::process::stripped_from_child`]): a caller's
+/// terminal-specific settings must not change the run.
 pub(crate) fn without_aterm_env(cmd: &mut Command) -> &mut Command {
     for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if name.starts_with("ATERM_") && name != aterm_uds::process::VERIFY_RUN_VAR {
+        if aterm_uds::process::stripped_from_child(&key) {
             cmd.env_remove(key);
         }
     }
     cmd
+}
+
+fn deadline_after(wait: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(wait)
+        .unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 3600))
 }
 
 /// Wait for a launched instance's control socket: `Ok` once the path exists,
@@ -612,7 +618,7 @@ pub(crate) fn await_socket(
     sock: &Path,
     timeout: Duration,
 ) -> Result<(), String> {
-    let deadline = Instant::now() + timeout;
+    let deadline = deadline_after(timeout);
     loop {
         if let Some(status) = group.exited() {
             return Err(format!(
@@ -653,7 +659,7 @@ fn verb_timeout(verb: &[&str]) -> Duration {
 
 /// Run one `ctl` verb and return its stdout, or the failure.
 pub(crate) fn ctl_out(bin: &Path, sock: &Path, verb: &[&str]) -> Result<String, String> {
-    let deadline = Instant::now() + verb_timeout(verb) + CTL_HUNG;
+    let deadline = deadline_after(verb_timeout(verb).saturating_add(CTL_HUNG));
     let out = aterm_uds::deadline::output_until(ctl(bin, sock).args(verb), deadline)
         .map_err(|e| format!("ctl {}: {e}", verb.join(" ")))?;
     if out.status.success() {
@@ -686,7 +692,7 @@ impl Inbox {
         std::thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
                 let mut text = String::new();
-                let _ = stream.read_to_string(&mut text);
+                let _ = (&mut stream).take(1 << 20).read_to_string(&mut text);
                 let _ = tx.send(text);
             }
         });

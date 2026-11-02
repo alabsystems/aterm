@@ -35,10 +35,10 @@ impl Lease {
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error.into()),
         }
-        let (file, metadata) =
+        let (file, metadata) = aterm_uds::kept_out(|| {
             aterm_uds::private_file::open_private(&paths.dir, "creation.lock")
-                .map_err(|e| Error::new(format!("creation lease is not private: {e}")))?;
-        aterm_uds::keep_out_of_children(&file)?;
+        })
+        .map_err(|e| Error::new(format!("creation lease is not private: {e}")))?;
         #[expect(
             clippy::disallowed_methods,
             reason = "creation lease is CLOEXEC/CLOFORK, explicitly unlocks, and never blocks readers"

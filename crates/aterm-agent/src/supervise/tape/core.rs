@@ -24,7 +24,7 @@ use crate::supervise::policy::sleeps::{Boot, SleepStamp};
 /// A note's kind: a turn-end decision's fold and reading, as `Debug`.
 pub(crate) const NOTE_TURN_END: &str = "turn_end";
 
-/// A note's kind: something happened that no replay of the tape can make (an older build's mail delivery received under a recorder), said once; this build writes none, and refuses to replay a tape that holds one.
+/// A note's kind: something happened that no replay of the tape can make (an older build's mail delivery received under a recorder; a box escalated for a look at the disk that did not answer, decided again when that look ends), said once; a replay refuses a tape that holds one.
 pub(crate) const NOTE_UNREPLAYABLE: &str = "unreplayable";
 
 /// A note's kind: the run UNWOUND INSIDE A DOOR'S LIVE CALL — a probe's body or the transport panicked between the request and its value, so the round trip has no record (there is no value to tape).
@@ -154,7 +154,7 @@ impl TapeValue for i64 {
     fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
         std::str::from_utf8(bytes)
             .ok()
-            .and_then(|t| t.parse().ok())
+            .and_then(crate::parse_int)
             .ok_or(CodecError {
                 at: 0,
                 why: "a number that does not read",
@@ -205,7 +205,7 @@ impl TapeValue for Option<SleepStamp> {
             Some((ms, boot)) => (ms, Boot::of(boot)),
             None => (text, None),
         };
-        let ms: u64 = ms.parse().map_err(|_| bad)?;
+        let ms: u64 = crate::parse_uint(ms).ok_or(bad)?;
         Ok(Some(SleepStamp {
             asleep: Duration::from_millis(ms),
             boot,
@@ -227,7 +227,7 @@ impl TapeValue for Option<(i64, i64)> {
         std::str::from_utf8(bytes)
             .ok()
             .and_then(|t| t.split_once(' '))
-            .and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)))
+            .and_then(|(a, b)| Some((crate::parse_int(a)?, crate::parse_int(b)?)))
             .map(Some)
             .ok_or(CodecError {
                 at: 0,
@@ -911,13 +911,32 @@ impl DecideMark {
         };
         for line in text.lines() {
             let (key, value) = line.split_once('=')?;
-            let opt = || (value != "-").then(|| text_of(value)).flatten();
+            let opt = || {
+                if value == "-" {
+                    Some(None)
+                } else {
+                    text_of(value).map(Some)
+                }
+            };
             match key {
-                "screen" => screen = Some((value != "-").then(|| value.parse().ok()).flatten()),
-                "seq" => seq = value.parse().ok(),
-                "gen" => generation = Some(opt()),
-                "rule" => rule = Some(opt()),
-                "outcome" => outcome = text_of(value),
+                "screen" => {
+                    screen = Some(if value == "-" {
+                        None
+                    } else if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+                        Some(value.parse().ok()?)
+                    } else {
+                        return None;
+                    });
+                }
+                "seq" => {
+                    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                        return None;
+                    }
+                    seq = Some(value.parse().ok()?);
+                }
+                "gen" => generation = Some(opt()?),
+                "rule" => rule = Some(opt()?),
+                "outcome" => outcome = Some(text_of(value)?),
                 "facts" => facts = Some(text_of(value)?),
                 _ => {}
             }

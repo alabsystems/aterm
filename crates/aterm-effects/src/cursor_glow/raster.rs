@@ -120,6 +120,29 @@ pub(super) const fn light_ink_bold(rgb: u32) -> u32 {
     (ch(v, s, pr) << 16) | (ch(v, s, pg) << 8) | ch(v, s, pb)
 }
 
+/// [`light_ink_bold`]'s twin for a colour the user CHOSE (a pinned trail colour): the colour
+/// itself, brought down to the bold ink's luma ([`LIGHT_INK_BOLD_MAX_LUMA`]) where it is
+/// brighter by scaling its channels together, so its hue and saturation stay the colour's, its
+/// chroma only falls, and a grey stays grey. The bold ink takes a colour's hue to the most
+/// saturation its weight allows, which on a near-neutral pin is noise made vivid: `#e8ecf0`
+/// (chroma 8) inked Lumen's tracer, Comet's tail, Beam's tube and Laser's crackle on paper in
+/// blues to chroma 145 (composed r0's judges; the pin ruling: never recolour a chosen colour).
+#[inline]
+#[must_use]
+pub(crate) const fn light_chosen_ink(rgb: u32) -> u32 {
+    #[inline]
+    const fn ch(full: u32, k: f32, sh: u32) -> u32 {
+        ((((full >> sh) & 0xff) as f32 * k) + 0.5) as u32
+    }
+    let rgb = rgb & 0x00FF_FFFF;
+    let y = luma709(rgb);
+    if y <= LIGHT_INK_BOLD_MAX_LUMA {
+        return rgb;
+    }
+    let k = LIGHT_INK_BOLD_MAX_LUMA / y;
+    (ch(rgb, k, 16) << 16) | (ch(rgb, k, 8) << 8) | ch(rgb, k, 0)
+}
+
 /// Light-theme ink: `rgb` scaled uniformly (hue and saturation intact) until it satisfies both [`LIGHT_INK_MAX_LUMA`] and [`LIGHT_INK_MAX_CHANNEL`].
 #[inline]
 pub(super) const fn light_ink(rgb: u32) -> u32 {

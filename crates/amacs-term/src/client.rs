@@ -31,6 +31,11 @@ opens. That makes it an $EDITOR for `git commit`, `crontab -e` or an agent's
 editor key: close the tab when done, and the file on disk is the answer. A
 FILE that does not exist yet is created by its first save.
 
+A directory opens as a read-only listing, with directories first, including
+hidden entries. RET or f opens the entry at point, n/p or the arrows move, ^
+opens the parent, g refreshes, and q closes. These keys work in both
+the Editor tab and the terminal editor.
+
 OPTIONS:
     +LINE[:COL]   put the caret on LINE (and column COL) of the next FILE
     --wait        in an aterm tab, use the Editor tab and wait even when stdin
@@ -77,7 +82,7 @@ EXIT STATUS:
     130  interrupted (C-c) while waiting; the Editor tab stays open
 ";
 
-/// File to edit and its initial caret position.
+/// File or directory to open and its initial caret position.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Target {
     pub path: PathBuf,

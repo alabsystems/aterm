@@ -546,11 +546,10 @@ mod tests {
 
     /// Prints [`HELVETICA_NEUE`] from the face the macOS chrome draws in and
     /// checks the embedded table against it: run it by name with
-    /// `--ignored --nocapture` after a macOS font update, and paste the
+    /// `--nocapture` after a macOS font update, and paste the
     /// array it prints over the table.
     #[cfg(target_os = "macos")]
     #[test]
-    #[ignore = "reads the system Helvetica Neue to print the embedded table"]
     fn print_the_helvetica_neue_table() {
         crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
         let regular = crate::tray_raster::ui_font_of(TextFace::Ui).expect("the chrome's UI face");

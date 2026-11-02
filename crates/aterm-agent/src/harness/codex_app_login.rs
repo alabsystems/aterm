@@ -23,6 +23,9 @@ use ring::rand::{SecureRandom as _, SystemRandom};
 use super::login_drive::{Approval, Approver, Drove, Handoff, Outcome, https_host, pinned};
 use crate::ai::connector::Completion;
 
+#[path = "codex_shared_login.rs"]
+pub mod shared;
+
 /// Per-account credential file inside a Codex login directory (`CODEX_AUTH_PATH`).
 pub const AUTH_FILE: &str = "auth.json";
 
@@ -234,7 +237,7 @@ fn token_user(id_token: Option<&str>, access_token: &str) -> TokenUser {
     token_user_claims(id_claims.as_ref(), access_claims.as_ref())
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct StoredAuth {
     doc: Value,
     id_token: Option<String>,
@@ -244,12 +247,6 @@ struct StoredAuth {
     last_refresh_secs: Option<i64>,
     id_claims: Option<JwtClaims>,
     access_claims: Option<JwtClaims>,
-}
-
-impl std::fmt::Debug for StoredAuth {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StoredAuth").finish_non_exhaustive()
-    }
 }
 
 /// Path to `auth.json` inside `home` (or `home` itself when `home` names a `.json` file).
@@ -472,13 +469,16 @@ const MIN_REFRESH_BUDGET: Duration = Duration::from_secs(3);
 
 /// How long a read that found its login refused looks for another program's rotation of it
 /// before it says the login is signed out ([`confirmed_signed_out`]). `codex-alab` (`b09caa8d7`,
-/// `codex_alab_core::auth_lock`) takes [`AuthLock`] across its refresh and save, while a vendor
-/// `codex` binary (or a refresh that proceeded after its lock wait expired) takes no lock on
-/// `auth.json`: where such a writer spent the refresh token first, aterm's refresh is refused as
-/// reused, and the other writer writes the rotated login as soon as it has read the provider's
-/// answer, an answer that left the provider before aterm's refusal did. The gap is one network
-/// jitter and one file write, well under a second on a link that answered at all; two seconds
-/// holds twice that.
+/// `codex_alab_core::auth_lock`) takes the same `flock` on `auth.json.lock` as [`AuthLock`] and
+/// keeps it through its request and the write of the answer, so an aterm refresh that waited for
+/// it reads the rotation it wrote and sends nothing. The pause is for a refresh made without the
+/// lock: a vendor `codex` binary's, or a `codex-alab` one that went on without it (the lock still
+/// held after its 30 s `auth_lock::WAIT`, or refused). Where such a writer spent the refresh token
+/// first, aterm's refresh is refused as reused, and the other writer writes the rotated login as
+/// soon as it has read the provider's answer, an answer that left the provider before aterm's
+/// refusal did. The gap is one network jitter and one file write, well under a second on a link
+/// that answered at all; two seconds holds twice that. A refresh token spent by a refresh whose
+/// answer was lost (`docs/KNOWN_ISSUES.md` ATERM-KI-1027-12) is refused with no rotation to find.
 const SIGNED_OUT_CONFIRM: Duration = Duration::from_secs(2);
 
 /// `auth.json`'s name in `home` with `suffix` after it, in the same directory.
@@ -513,13 +513,31 @@ impl AuthLock {
                 .mode(0o600)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            options.custom_flags(0x0020_0000);
+        }
         let file = options.open(lock_path(auth_file))?;
-        if !file.metadata()?.is_file() {
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "the login's lock file is no regular file",
             ));
         }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt as _;
+            if metadata.file_attributes() & 0x0000_0400 != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "the login's lock file is no regular file",
+                ));
+            }
+        }
+        #[cfg(any(unix, windows))]
+        aterm_uds::keep_out_of_children(&file)?;
         Ok(file)
     }
 
@@ -580,19 +598,13 @@ impl Drop for AuthLock {
 }
 
 /// The tokens a refresh response named, and what its publication adds beside them.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RefreshedTokens {
     access_token: String,
     id_token: Option<String>,
     refresh_token: Option<String>,
     account_id: Option<String>,
     last_refresh: String,
-}
-
-impl std::fmt::Debug for RefreshedTokens {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RefreshedTokens").finish_non_exhaustive()
-    }
 }
 
 impl RefreshedTokens {
@@ -621,15 +633,41 @@ impl RefreshedTokens {
     }
 }
 
-/// A refresh response kept in a private `auth.json.refreshed` (`0600`) beside the login before
-/// anything can fail to publish it: the provider has spent the old refresh token once it
-/// answers, so a failed re-read or write of `auth.json` must not lose the new one. `base` names
-/// the authentication it was refreshed from ([`authentication_digest`]); the next read publishes
-/// it onto `auth.json` while the file still holds that authentication ([`recover_journal`]).
+/// A private `auth.json.refreshed` (`0600`) records the token digest before sending a refresh.
+/// An uncertain attempt cannot send that token again, even after metadata changes or a reload.
+/// A usable response replaces the attempt and is recovered onto its original authentication.
+/// Credentials in `auth.json` remain available while the result is uncertain. Other programs
+/// must honor this journal too if they share the login.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RefreshJournal {
-    base: String,
-    tokens: RefreshedTokens,
+enum RefreshJournal {
+    Attempted {
+        token: String,
+    },
+    Rejected {
+        token: String,
+    },
+    Response {
+        base: String,
+        /// Absent only in journals written before attempts were recorded.
+        token: Option<String>,
+        tokens: RefreshedTokens,
+    },
+}
+
+fn refresh_token_digest(token: &str) -> String {
+    let mut hash = aterm_digest::Sha256::new();
+    hash.update(b"aterm-codex-refresh-token-v1");
+    hash.update(token.as_bytes());
+    aterm_codec::hex::encode_lower(&hash.finalize())
+}
+
+fn flush_auth_directory(home: &Path) -> std::io::Result<()> {
+    let path = auth_path_in_home(home);
+    let parent = path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    aterm_durable::Flush::Durable.dir(parent)
 }
 
 /// A digest of `doc`'s `auth_mode` and `tokens`, the authentication [`same_authentication`]
@@ -649,20 +687,30 @@ fn authentication_digest(doc: &Value) -> Option<String> {
 
 impl RefreshJournal {
     fn to_value(&self) -> Value {
-        let t = &self.tokens;
-        json!({
-            "aterm_codex_refresh": 1,
-            "base": self.base,
-            "access_token": t.access_token,
-            "id_token": t.id_token,
-            "refresh_token": t.refresh_token,
-            "account_id": t.account_id,
-            "last_refresh": t.last_refresh,
-        })
+        match self {
+            Self::Attempted { token } | Self::Rejected { token } => json!({
+                "aterm_codex_refresh": 2,
+                "state": if matches!(self, Self::Rejected { .. }) { "rejected" } else { "attempted" },
+                "refresh_token_digest": token,
+            }),
+            Self::Response {
+                base,
+                token,
+                tokens: t,
+            } => json!({
+                "aterm_codex_refresh": 1,
+                "base": base,
+                "refresh_token_digest": token,
+                "access_token": t.access_token,
+                "id_token": t.id_token,
+                "refresh_token": t.refresh_token,
+                "account_id": t.account_id,
+                "last_refresh": t.last_refresh,
+            }),
+        }
     }
 
     fn of_value(value: &Value) -> Option<RefreshJournal> {
-        (value.get("aterm_codex_refresh")?.as_u64()? == 1).then_some(())?;
         let text = |key: &str| {
             value
                 .get(key)
@@ -670,8 +718,32 @@ impl RefreshJournal {
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned)
         };
-        Some(RefreshJournal {
+        let token = match value.get("refresh_token_digest") {
+            None | Some(Value::Null) => None,
+            Some(value) => {
+                let token = value.as_str()?;
+                (token.len() == 64
+                    && token
+                        .bytes()
+                        .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)))
+                .then_some(())?;
+                Some(token.to_owned())
+            }
+        };
+        match value.get("aterm_codex_refresh")?.as_u64()? {
+            2 => {
+                return match value.get("state")?.as_str()? {
+                    "attempted" => Some(Self::Attempted { token: token? }),
+                    "rejected" => Some(Self::Rejected { token: token? }),
+                    _ => None,
+                };
+            }
+            1 => {}
+            _ => return None,
+        }
+        Some(Self::Response {
             base: text("base")?,
+            token,
             tokens: RefreshedTokens {
                 access_token: text("access_token")?,
                 id_token: text("id_token"),
@@ -682,17 +754,33 @@ impl RefreshJournal {
         })
     }
 
-    /// Kept durably beside `home`'s login (`0600`, renamed into place).
+    /// Kept durably beside `home`'s login (`0600`, with the rename flushed too).
     fn write(&self, home: &Path) -> std::io::Result<()> {
         let mut rendered = aterm_json::to_string(&self.to_value())
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         rendered.push('\n');
-        super::upgrade_models::write_atomic(&beside_auth(home, JOURNAL_SUFFIX), &rendered)
+        super::upgrade_models::write_atomic(&beside_auth(home, JOURNAL_SUFFIX), &rendered)?;
+        flush_auth_directory(home)
     }
 
-    /// The journal beside `home`'s login: `None` where there is none or it is a link or no
-    /// regular file; `Some(None)` where it does not read as one.
-    fn read(home: &Path) -> Option<Option<RefreshJournal>> {
+    /// Only absence allows a new attempt. Unreadable, malformed, linked or non-regular
+    /// journals could hold evidence of a spent token, so they are errors, never discarded.
+    fn read(home: &Path) -> std::io::Result<Option<RefreshJournal>> {
+        let invalid = || {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid Codex refresh journal",
+            )
+        };
+        let path = beside_auth(home, JOURNAL_SUFFIX);
+        match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+            Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
+                return Err(invalid());
+            }
+            Ok(_) => {}
+        }
         let mut options = std::fs::OpenOptions::new();
         options.read(true);
         #[cfg(unix)]
@@ -700,59 +788,89 @@ impl RefreshJournal {
             use std::os::unix::fs::OpenOptionsExt as _;
             options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
         }
-        let file = options.open(beside_auth(home, JOURNAL_SUFFIX)).ok()?;
-        if !file.metadata().ok()?.is_file() {
-            return None;
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            options.custom_flags(0x0020_0000);
+        }
+        let file = options.open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(invalid());
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt as _;
+            if metadata.file_attributes() & 0x0000_0400 != 0 {
+                return Err(invalid());
+            }
         }
         let mut bytes = Vec::new();
         let limit = AUTH_FILE_MAX as u64;
-        if file
-            .take(limit.saturating_add(1))
-            .read_to_end(&mut bytes)
-            .is_err()
-            || bytes.len() as u64 > limit
-        {
-            return Some(None);
+        file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > limit {
+            return Err(invalid());
         }
-        Some(
-            aterm_json::from_slice::<Value>(&bytes)
-                .ok()
-                .as_ref()
-                .and_then(RefreshJournal::of_value),
-        )
+        aterm_json::from_slice::<Value>(&bytes)
+            .ok()
+            .as_ref()
+            .and_then(Self::of_value)
+            .map(Some)
+            .ok_or_else(invalid)
     }
 
-    fn discard(home: &Path) {
-        let _ = std::fs::remove_file(beside_auth(home, JOURNAL_SUFFIX));
+    fn discard(home: &Path) -> std::io::Result<()> {
+        match std::fs::remove_file(beside_auth(home, JOURNAL_SUFFIX)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            result => result,
+        }
     }
 }
 
-/// Publishes a journaled refresh response ([`RefreshJournal`]) onto `home`'s `auth.json` while the
-/// file still holds the authentication it was refreshed from, whose refresh token is spent, then
-/// drops the journal; drops it unpublished where another login now stands in the file (a newer
-/// rotation or sign-in, which a publication would overwrite), and keeps it where the file cannot
-/// be read now, for a later read. The caller holds [`AuthLock`].
-fn recover_journal_held(home: &Path) {
-    let Some(journal) = RefreshJournal::read(home) else {
-        return;
+/// Recover a usable response before allowing another request. An attempted or rejected token
+/// stays blocked until the token changes; unrelated metadata edits do not clear it. A response
+/// is published only over its original authentication, and retained if that authentication
+/// changed but still carries the spent token. Legacy responses have only the base binding.
+/// The caller holds [`AuthLock`].
+fn recover_journal_held(home: &Path) -> Result<(), Refreshed> {
+    let Some(journal) = RefreshJournal::read(home).map_err(|_| Refreshed::Failed)? else {
+        return Ok(());
     };
-    let Some(journal) = journal else {
-        RefreshJournal::discard(home);
-        return;
-    };
-    let Some(current) = load_stored_auth(home) else {
-        return;
-    };
-    if authentication_digest(&current.doc).as_deref() != Some(journal.base.as_str()) {
-        RefreshJournal::discard(home);
-        return;
+    let current = load_stored_auth(home).ok_or(Refreshed::Failed)?;
+    let current_token = current.refresh_token.as_deref().map(refresh_token_digest);
+    match journal {
+        RefreshJournal::Attempted { token } if current_token.as_ref() == Some(&token) => {
+            return Err(Refreshed::Failed);
+        }
+        RefreshJournal::Rejected { token } if current_token.as_ref() == Some(&token) => {
+            return Err(Refreshed::Rejected);
+        }
+        RefreshJournal::Response {
+            base,
+            token,
+            tokens,
+        } => {
+            if authentication_digest(&current.doc).as_deref() == Some(base.as_str()) {
+                let doc = tokens.merged_into(current.doc).ok_or(Refreshed::Failed)?;
+                stored_auth_from_doc(doc.clone()).ok_or(Refreshed::Failed)?;
+                write_auth_doc(home, &doc).map_err(|_| Refreshed::Failed)?;
+                flush_auth_directory(home).map_err(|_| Refreshed::Failed)?;
+            } else if token.is_some() && token == current_token {
+                // The login rename may have landed before its directory flush failed. When
+                // the provider kept the same refresh token, recognize its applied response
+                // without writing over metadata or treating it as an uncertain attempt.
+                let applied = tokens
+                    .merged_into(current.doc.clone())
+                    .and_then(stored_auth_from_doc)
+                    .is_some_and(|candidate| same_authentication(&current, &candidate));
+                if !applied {
+                    return Err(Refreshed::Failed);
+                }
+            }
+        }
+        _ => {}
     }
-    if let Some(doc) = journal.tokens.merged_into(current.doc)
-        && stored_auth_from_doc(doc.clone()).is_some()
-        && write_auth_doc(home, &doc).is_ok()
-    {
-        RefreshJournal::discard(home);
-    }
+    RefreshJournal::discard(home).map_err(|_| Refreshed::Failed)
 }
 
 /// [`recover_journal_held`] under [`AuthLock`], waited for until `deadline`, where a journal
@@ -762,7 +880,7 @@ fn recover_journal(home: &Path, deadline: Instant) {
         return;
     }
     if let Some(_held) = AuthLock::within(home, deadline) {
-        recover_journal_held(home);
+        let _ = recover_journal_held(home);
     }
 }
 
@@ -1184,10 +1302,11 @@ fn refresh_outcome(
 }
 
 /// One refresh of `stored`, `home`'s login, within `wait`: under [`AuthLock`] from the read
-/// before its request to its publication, a journaled response ([`RefreshJournal`]) published
-/// first, and a response `admit` takes journaled before the file is read again, so a failed
-/// re-read or write keeps the rotated refresh token for the next read. `publish` writes the
-/// refreshed login (`write_auth_doc`; a conformance fixture passes its own).
+/// before its request to its publication. A prior response is recovered first, and an attempt
+/// recorded before sending. Only a transport failure known to have sent no bytes can retry the
+/// same token. A response `admit` takes is journaled before the file is read again, so a failed
+/// re-read or write keeps the rotated token. `publish` writes the refreshed login
+/// (`write_auth_doc`; a conformance fixture passes its own).
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -1215,7 +1334,9 @@ fn refresh_admitted(
     let Some(_held) = AuthLock::within(home, deadline) else {
         return Refreshed::Failed;
     };
-    recover_journal_held(home);
+    if let Err(blocked) = recover_journal_held(home) {
+        return blocked;
+    }
     let Some(before_request) = load_stored_auth(home) else {
         return Refreshed::Failed;
     };
@@ -1244,7 +1365,23 @@ fn refresh_admitted(
     if left < MIN_REFRESH_BUDGET {
         return Refreshed::Failed;
     }
-    let Ok(resp) = http_client(token_url, left)
+    let token = refresh_token_digest(refresh_token);
+    if (RefreshJournal::Attempted {
+        token: token.clone(),
+    })
+    .write(home)
+    .is_err()
+    {
+        // Nothing was sent, so removing our failed preparation cannot hide a spent token.
+        let _ = RefreshJournal::discard(home);
+        return Refreshed::Failed;
+    }
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left < MIN_REFRESH_BUDGET {
+        let _ = RefreshJournal::discard(home);
+        return Refreshed::Failed;
+    }
+    let response = http_client(token_url, left)
         .request(Method::Post, token_url)
         .header("Content-Type", "application/json")
         .header("Accept", "application/json")
@@ -1252,12 +1389,19 @@ fn refresh_admitted(
         .header("originator", ORIGINATOR)
         .limit(MESSAGE_MAX)
         .backstop(left)
-        .send(body.as_bytes())
-    else {
-        return Refreshed::Failed;
+        .send_phased(body.as_bytes());
+    let resp = match response {
+        Ok(response) => response,
+        Err(failed) => {
+            if failed.phase == aterm_http::Phase::NotSent {
+                let _ = RefreshJournal::discard(home);
+            }
+            return Refreshed::Failed;
+        }
     };
     if resp.status() != 200 {
         return if refresh_refused(resp.status(), resp.body()) {
+            let _ = (RefreshJournal::Rejected { token }).write(home);
             Refreshed::Rejected
         } else {
             Refreshed::Failed
@@ -1303,29 +1447,40 @@ fn refresh_admitted(
     }
     // The provider has spent the old refresh token: keep its answer before anything below can
     // fail. A journal that cannot be written leaves the publication below as the only copy.
-    let journal = RefreshJournal { base, tokens };
+    let journal = RefreshJournal::Response {
+        base,
+        token: Some(token.clone()),
+        tokens: tokens.clone(),
+    };
     let _ = journal.write(home);
     let Some(current) = load_stored_auth(home) else {
         return Refreshed::Failed;
     };
     if !same_authentication(stored, &current) {
-        RefreshJournal::discard(home);
+        if current
+            .refresh_token
+            .as_deref()
+            .map(refresh_token_digest)
+            .as_deref()
+            != Some(token.as_str())
+        {
+            let _ = RefreshJournal::discard(home);
+        }
         return updated_disk_auth(stored, current)
             .map_or(Refreshed::Failed, |login| Refreshed::Done(Box::new(login)));
     }
     // Preserve independent metadata changes without discarding the response's
     // rotated refresh token when the complete authentication record is unchanged.
-    let Some(candidate) = journal
-        .tokens
+    let Some(candidate) = tokens
         .merged_into(current.doc)
         .and_then(stored_auth_from_doc)
     else {
         return Refreshed::Failed;
     };
-    if publish(home, &candidate.doc).is_err() {
+    if publish(home, &candidate.doc).is_err() || flush_auth_directory(home).is_err() {
         return Refreshed::Failed;
     }
-    RefreshJournal::discard(home);
+    let _ = RefreshJournal::discard(home);
     // The completed write owns this result. A later file replacement belongs
     // to another operation and must not change this refresh's identity.
     Refreshed::Done(Box::new(candidate))
@@ -1358,7 +1513,9 @@ pub fn resolve_usage_url(home: &Path, user_home: &Path) -> String {
 }
 
 fn has_origin_host_prefix(url: &str, origin: &str) -> bool {
-    url.strip_prefix(origin)
+    url.get(..origin.len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case(origin))
+        .and_then(|_| url.get(origin.len()..))
         .is_some_and(|rest| rest.is_empty() || rest.starts_with(['/', ':']))
 }
 
@@ -1587,8 +1744,8 @@ pub enum Reading {
     Usage(Usage),
     /// The provider refused the login itself: `/wham/usage` refused its access token (`401`)
     /// and the refresh token was refused for good, or there was none to refresh it with, and a
-    /// second ask after a look for another writer's rotation was refused too
-    /// (`SIGNED_OUT_CONFIRM`). It stays signed out until it signs in again.
+    /// look for another writer's rotation (`SIGNED_OUT_CONFIRM`) found none and a second ask was
+    /// refused too. It stays signed out until it signs in again.
     SignedOut,
     /// Nothing was learned: no login file, no reader for the CLI, a login that names another
     /// user than its row expects, the network, a timeout (a refusal with no time left to
@@ -1761,9 +1918,10 @@ fn usage_reading(status: u16, body: &[u8], now: i64) -> Reading {
 
 /// `home`'s login `stored`, which the provider refused once ([`read_login_with`]), read again
 /// before anything says it is signed out, since one refusal can be a race lost to another
-/// program's refresh ([`SIGNED_OUT_CONFIRM`]). Within that pause, a rotation another writer
-/// lands in the file is the login: its usage is read. With none, the usage is asked once more
-/// with the refused access token (no refresh is sent again: its token is spent), and a second
+/// program's refresh made without the login's lock ([`AuthLock`], [`SIGNED_OUT_CONFIRM`]).
+/// Within that pause, a rotation another writer lands in the file is the login: its usage is
+/// read. With none, the usage is asked once more with the refused access token (no refresh is
+/// sent again: the provider refused its refresh token for good, or it has none), and a second
 /// `401` is [`Reading::SignedOut`]. Unread where the read's `deadline` comes first, or the second
 /// ask says nothing.
 fn confirmed_signed_out(
@@ -2038,7 +2196,7 @@ fn is_loopback_host_header(value: &str, port: u16) -> bool {
         return rest.is_empty()
             || rest
                 .strip_prefix(':')
-                .and_then(|p| p.parse::<u16>().ok())
+                .and_then(crate::parse_uint::<u16>)
                 .is_some_and(|p| p == port);
     }
     let (name, port_part) = match host.split_once(':') {
@@ -2048,7 +2206,7 @@ fn is_loopback_host_header(value: &str, port: u16) -> bool {
     if !(name == "127.0.0.1" || name.eq_ignore_ascii_case("localhost")) {
         return false;
     }
-    port_part.is_none_or(|p| p.parse::<u16>().ok() == Some(port))
+    port_part.is_none_or(|p| crate::parse_uint::<u16>(p) == Some(port))
 }
 
 fn read_request_target(stream: &mut TcpStream, port: u16) -> Option<String> {
@@ -2094,7 +2252,12 @@ fn parse_callback_request_target(buf: &[u8], port: u16) -> Option<String> {
     let method = words.next()?;
     let target = words.next()?;
     let version = words.next()?;
-    if method != "GET" || !version.starts_with("HTTP/1.") || words.next().is_some() {
+    if method != "GET"
+        || !matches!(version, "HTTP/1.0" | "HTTP/1.1")
+        || !target.starts_with('/')
+        || target.starts_with("//")
+        || words.next().is_some()
+    {
         return None;
     }
     let raw_headers = head

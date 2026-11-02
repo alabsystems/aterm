@@ -3,9 +3,13 @@
 
 //! THE LIVE PROBE.
 
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use aterm_types::domain::ENV_PARENT_SESSION_ID;
 
@@ -21,15 +25,26 @@ impl PolicyProbe for LiveProbe {
         comps: &[String],
         home: Option<&Path>,
     ) -> Result<Option<String>, String> {
-        hidden_twin_within(comps, HIDDEN_TWIN_ENTRIES, home, &folder_names)
+        let (comps, home) = (comps.to_vec(), home.map(Path::to_path_buf));
+        bounded(
+            "a Read's folders",
+            move || hidden_twin_within(&comps, HIDDEN_TWIN_ENTRIES, home.as_deref(), &folder_names),
+            Err,
+        )
     }
 
     fn real_components(&self, comps: &[String]) -> Option<Vec<String>> {
-        real_components(comps)
+        let comps = comps.to_vec();
+        bounded(
+            "a Read's symbolic links",
+            move || real_components(&comps),
+            |_| None,
+        )
     }
 
     fn rm_physical(&self, comps: &[String]) -> Result<OnDisk, String> {
-        physical(comps)
+        let comps = comps.to_vec();
+        bounded("an rm's path on the disk", move || physical(&comps), Err)
     }
 
     /// The process leading `group`, read through the kernel
@@ -53,29 +68,80 @@ impl PolicyProbe for LiveProbe {
         dir: &Path,
         writes: &WorkerWrites<'_>,
     ) -> Result<GitView, String> {
-        let resolved = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-        worker
-            .raw_git_view(dir, &|d| writes.holds(d, &resolved))
-            .map(|view| view.project())
+        let (worker, dir) = (worker.clone(), dir.to_path_buf());
+        let (cwd, shell_cwds, scratch_roots) = (
+            writes.cwd.to_path_buf(),
+            writes.shell_cwds.to_vec(),
+            writes.scratch_roots.to_vec(),
+        );
+        bounded(
+            "a git read's configuration",
+            move || {
+                let writes = WorkerWrites {
+                    cwd: &cwd,
+                    shell_cwds: &shell_cwds,
+                    scratch_roots: &scratch_roots,
+                };
+                let resolved =
+                    |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+                worker
+                    .raw_git_view(&dir, &|d| writes.holds(d, &resolved))
+                    .map(|view| view.project())
+            },
+            Err,
+        )
     }
 
     fn settings_env(&self, worker: &WorkerEnv, launch: &Path) -> Result<(), String> {
-        worker.git_settings_env(launch)
+        let (worker, launch) = (worker.clone(), launch.to_path_buf());
+        bounded(
+            "the agent's settings",
+            move || worker.git_settings_env(&launch),
+            Err,
+        )
     }
 
     fn shell_startup(&self, worker: &WorkerEnv, launch: &Path) -> Result<ShellStartup, String> {
-        super::shell_startup::read(worker, launch)
+        let (worker, launch) = (worker.clone(), launch.to_path_buf());
+        bounded(
+            "the shell's startup",
+            move || super::shell_startup::read(&worker, &launch, cfg!(windows)),
+            Err,
+        )
     }
 
     fn owner_asks(&self, worker: &WorkerEnv, launch: &Path) -> Result<Vec<OwnerAsk>, String> {
-        super::claude_settings::owner_asks(worker, launch)
+        let (worker, launch) = (worker.clone(), launch.to_path_buf());
+        bounded(
+            "the agent's own ask rules",
+            move || super::claude_settings::owner_asks(&worker, &launch),
+            Err,
+        )
     }
 
+    /// Where the transcripts say the worker's Bash tool stands; a look that does not answer
+    /// says anywhere (`/`), so every place counts as the worker's to write and nothing it could
+    /// not read is approved.
     fn shell_cwds(&self, worker: &WorkerEnv, cwd: &Path) -> Vec<PathBuf> {
-        worker
-            .claude_dir(cwd)
-            .map(|claude| crate::harness::footer::shell_cwds(&claude, cwd))
-            .unwrap_or_default()
+        let (worker, cwd) = (worker.clone(), cwd.to_path_buf());
+        bounded(
+            "where the worker's shell stands",
+            move || {
+                worker
+                    .claude_dir(&cwd)
+                    .map(|claude| crate::harness::footer::shell_cwds(&claude, &cwd))
+                    .unwrap_or_default()
+            },
+            |_| vec![PathBuf::from("/")],
+        )
+    }
+
+    fn unanswered(&self) -> u64 {
+        UNANSWERED.with(Cell::get)
+    }
+
+    fn look_out(&self) -> bool {
+        out_on_this_thread()
     }
 }
 
@@ -91,6 +157,98 @@ pub(crate) fn bound_to(worker: WorkerEnv, group: u32, sid: &str) -> Result<Worke
             "{sid}'s foreground process {group} names no session \
              ({ENV_PARENT_SESSION_ID} unset, or its environment hidden)"
         )),
+    }
+}
+
+/// How long the approval policy waits for one look at the disk before it refuses what the look
+/// would have proved: a hang guard, not a latency budget. No look itself has been timed under
+/// load; the slowest harness step measured under load is an idle step whose relaunch snapshot
+/// read took up to 57 s (control-socket round trips, process-table walks and argv reads, none
+/// timed apart: `docs/measured/idle-look-under-load-2026-10-23.md`), and one look is a small part
+/// of such work. A look still out past every step measured is taken for a volume that does not
+/// answer (a dead network mount, an automount that never mounts), and a slow one that answers
+/// after it has its box decided again ([`PolicyProbe::look_out`]).
+pub(crate) const LOOK_BOUND: Duration = Duration::from_secs(60);
+
+/// The helper threads the live probe's looks run on.
+static LOOKS: aterm_uds::deadline::Gate = aterm_uds::deadline::Gate::new("aterm-policy-look");
+
+thread_local! {
+    /// Whether the look this thread (one session's loop) left out past its bound has ended.
+    static LEFT_OUT: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
+    /// How many looks this thread refused unanswered ([`PolicyProbe::unanswered`]).
+    static UNANSWERED: Cell<u64> = const { Cell::new(0) };
+}
+
+/// One more look refused unanswered on this thread.
+fn count_unanswered() {
+    UNANSWERED.with(|n| n.set(n.get().wrapping_add(1)));
+}
+
+/// Whether a look this thread asked is still out past its bound.
+fn out_on_this_thread() -> bool {
+    LEFT_OUT.with(|out| {
+        let mut out = out.borrow_mut();
+        if out
+            .as_ref()
+            .is_some_and(|ended| ended.load(Ordering::Acquire))
+        {
+            *out = None;
+        }
+        out.is_some()
+    })
+}
+
+/// `look` at the machine on a helper thread, waited for [`LOOK_BOUND`] at most: its answer, or
+/// `refuse` with why there is none, so a look that cannot finish never approves. While a look
+/// this loop left out has not ended, every other refuses at once and starts none: one volume
+/// that does not answer costs the loop one bound, not one per look, and other sessions' loops
+/// not even that. A late answer lands nowhere.
+fn bounded<T: Send + 'static>(
+    what: &str,
+    look: impl FnOnce() -> T + Send + 'static,
+    refuse: impl FnOnce(String) -> T,
+) -> T {
+    if out_on_this_thread() {
+        count_unanswered();
+        return refuse(format!(
+            "{what}: an earlier look at the disk has not answered yet"
+        ));
+    }
+    #[cfg(test)]
+    let (bound, gate) = (
+        tests::bound_of_this_thread().unwrap_or(LOOK_BOUND),
+        tests::gate_of_this_thread(),
+    );
+    #[cfg(not(test))]
+    let bound = LOOK_BOUND;
+    let ended = Arc::new(AtomicBool::new(false));
+    let ends = Arc::clone(&ended);
+    // No helper is ever suspect: one session's look left out must not refuse another session's.
+    let started = LOOKS.start(Duration::MAX, move || {
+        /// The look is over as its thread returns or unwinds.
+        struct Ends(Arc<AtomicBool>);
+        impl Drop for Ends {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let _ends = Ends(ends);
+        #[cfg(test)]
+        gate();
+        look()
+    });
+    match started.map(|pending| pending.wait(bound)) {
+        Ok(Ok(Ok(answer))) => answer,
+        Ok(Err(_late)) => {
+            LEFT_OUT.with(|out| *out.borrow_mut() = Some(ended));
+            count_unanswered();
+            refuse(format!(
+                "{what}: the disk did not answer within {} s",
+                bound.as_secs_f64()
+            ))
+        }
+        Ok(Ok(Err(why))) | Err(why) => refuse(format!("{what}: the look failed ({why:?})")),
     }
 }
 
@@ -297,3 +455,7 @@ fn owned_by_root(m: &std::fs::Metadata) -> bool {
 fn owned_by_root(_: &std::fs::Metadata) -> bool {
     false
 }
+
+#[cfg(test)]
+#[path = "probe_live_tests.rs"]
+pub(crate) mod tests;

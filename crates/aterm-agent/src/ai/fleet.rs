@@ -178,6 +178,46 @@ pub fn held_state(ai_dir: &Path) -> Option<Held> {
         .and_then(|t| Held::of_json(&t))
 }
 
+/// Reads up to [`SIG_MAX`] bytes from a regular signature file without blocking on a FIFO;
+/// when `refuse_symlink` is set, a symbolic link at `path` is refused too.
+pub(crate) fn read_sig_file(path: &Path, refuse_symlink: bool) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    #[cfg(not(unix))]
+    if refuse_symlink && std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "signature path is a symbolic link",
+        ));
+    }
+    let mut open = std::fs::OpenOptions::new();
+    open.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut flags = libc::O_CLOEXEC | libc::O_NONBLOCK;
+        if refuse_symlink {
+            flags |= libc::O_NOFOLLOW;
+        }
+        open.custom_flags(flags);
+    }
+    let file = open.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    let mut raw = Vec::new();
+    file.take(SIG_MAX + 1).read_to_end(&mut raw)?;
+    if raw.len() as u64 > SIG_MAX {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            "signature exceeds bound",
+        ));
+    }
+    Ok(raw)
+}
+
 /// The held document of `url` under `key`, verified again and within its `valid_until`.
 /// # Errors
 /// Why there is none to use: not fetched yet, tampered with, or expired.
@@ -190,7 +230,7 @@ pub fn held(ai_dir: &Path, url: &str, key: &str, now: i64) -> Result<String, Str
         .ok()
         .flatten()
         .ok_or("its held copy is gone")?;
-    let sig = std::fs::read(dir.join(SIG_FILE)).map_err(|_| "its held signature is gone")?;
+    let sig = read_sig_file(&dir.join(SIG_FILE), true).map_err(|_| "its held signature is gone")?;
     verify(doc.as_bytes(), &sig, key).map_err(|why| format!("its held copy: {why}"))?;
     let (_, valid_until) = meta(&doc).map_err(|why| format!("its held copy: {why}"))?;
     let _ = state;

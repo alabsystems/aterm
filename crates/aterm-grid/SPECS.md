@@ -1,51 +1,13 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-grid: spec recovery from its 1805 unit tests
+# aterm-grid: spec recovery from unit tests
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 1011 tests
-> it deleted and 3 specs whose functions it deleted are gone. On 2026-10-17 two more specs whose
-> functions it deleted went (`buffer-access-lines` with vi copy-mode's `BufferAccess`,
-> `ring-watermark-level` with the ring byte watermark), with the §2 rows of the tests §4 deleted;
-> the kind table and the gap histogram in §1 count the 201 specs left, and §4 lists only the 5 of
-> its tests still in the tree. Counts elsewhere in this file were taken before.
-
-> 2026-10-20: `el-span` states that EL 0 keeps the row's length over a marked blank left of the span
-> (`Grid::keep_len_over_marks`), with its test mapped in §2; the counts predate it.
-
-> Status 2026-10-15: this is the crate's migration worklist. Each spec in §1 is proved through
-> Trust/Clean about the compiled Rust function, and then the tests it subsumes (§2) are deleted.
-> The 244 tests in §4 sample no spec; the 240 marked **delete** can go now.
->
-> **Tried 2026-10-19 on seal `150efe4a`: `row-u16-saturating` is blocked (gap 3), not proved.** No
-> code or test was changed. PM-1 did not refuse the crate; the strict run compiled and published a
-> `report.json`. `row_u16` with `ensures result == (if idx > 65535 { 65535 } else { idx as u16 })`
-> and a `∀ idx : USize` Clean theorem over `trust_import_aterm_grid__row_u16` hit two refusals:
-> - **No E6 import for the body**: `Clean island declaration rejected: AutoBoundHeadOverApplied { name:
->   "trust_import_aterm_grid__row_u16", … remaining_args: 1 }`. The fn's row is 0/3 proved, all
->   `unknown`, `Inconclusive`. One of the three is `UnmodeledThreadSpawnEffect` via
->   `Result::<u16, TryFromIntError>::unwrap_or → core::panicking::panic_in_cleanup → …`.
-> - **The clause has no `if` or `as`**: `unsupported contract predicate expression
->   \`result == (if idx > 65535 { 65535 } else { idx as u16 })\`` (`SpecEnsuresUnparseable`).
->
-> A standalone probe crate (`$HOME/trust-land/probe-rowu16`) shows the refusal is in the narrowing cast,
-> not only in the `try_into`/`unwrap_or` calls. The call-free body `if idx > 65535 { u16::MAX } else
-> { idx as u16 }`, and even `fn(idx: u32) -> u16 { idx as u16 }`, get the same
-> `AutoBoundHeadOverApplied`. A `usize` parameter does get an import: `usize -> bool` `idx > 65535` is
-> minted, though its `65535` must be written `(65535 : USize)`. An `if` with constant arms,
-> `u64 -> u16`, is kernel-checked too. A `u16` taken from a wider integer needs a cast, so this spec
-> waits on E6 (or proven-core) covering integer `as` casts, and on contract predicates that allow
-> `if`/`as`, or a min-style form.
-
-Source: `crates/aterm-grid` (read only). Six recovery passes read every `#[test]` (the manifest
-counted 1806 because `tests/grid_suite.rs` has the string `#[test]` in a doc comment; the real
-count is 1805) and the code each one reaches. Nothing was compiled or run. The claims below come
-from reading the code. This file merges the six passes: specs that were the same property seen
-from different files are one row here, and the notation is unified in §0.
-
-Result: **206 specs**, covering **1561 tests**. **244 tests are not spec samples** (§4). 201 of
-the specs are left (§1).
-Every path below is repo-relative.
+Each row of §1 is a property of the crate's compiled Rust functions that a group of its unit tests
+samples. Once a row is proved through Trust/Clean, the tests §2 maps to it can be deleted. §0
+defines the notation of the statements; §4 lists the mapped tests that sample no spec, and §5 the
+places where an implied spec and the code disagree. The claims come from reading the code. §2
+paths are repo-relative; `src/` and `tests/` paths in the prose are relative to `crates/aterm-grid`.
 
 ## 0. Notation used in the statements
 
@@ -58,7 +20,7 @@ Cells and colours
 - `CacheInv(s)` for `s: CurrentStyle`: `cached_colors = Cell::convert_colors(fg,bg)` ∧
   `cached_has_style_extras = (flags & 0x3800 ≠ 0) ∨ fg.is_rgb() ∨ bg.is_rgb()` ∧
   `cached_is_default = fg.is_default() ∧ bg.is_default() ∧ flags.is_empty() ∧ ¬protected`.
-  `FullEq(s,t)`: equality on every field, caches included (a spec-level relation; no `PartialEq` is derived).
+  `FullEq(s,t)`: equality on every field, caches included (`CurrentStyle` derives no `PartialEq`).
 
 Damage and selection
 - `M = Full | Partial(R,B)`, `B: [0,R) → Option<(left,right)>`: the abstraction of
@@ -91,19 +53,19 @@ Grid
   unscroll, limit and budget setters, the offload calls, scroll_display / scroll_to_*). States made by poking
   fields (`storage.cursor_state.scroll_region`, `any_double_width`, `storage.rows[i]`) are outside Reach; a spec
   that covers them says so.
-- `Inv(g)`: the conjunction in `src/grid/invariants.rs::assert_invariants` (CursorInBounds, WideCharConsistent,
-  WideCharNotAtEnd, ExtrasClaimed, ScrollRegionValid, DisplayOffsetValid, RingBufferValid, KeysCoverRetained,
-  the ring_extras/lazy_buffer running sums); RingBufferValid includes RingExtrasAligned:
-  `|ring_extras| = ring_buffer_scrollback()`.
+- `Inv(g)`: the conjunction `Grid::assert_invariants` (`src/grid/invariants.rs`) checks: CursorInBounds,
+  WideCharConsistent, WideCharNotAtEnd, ExtrasClaimed, ScrollRegionValid, DisplayOffsetValid, the ring buffer
+  checks (RingExtrasAligned: `|ring_extras| = ring_buffer_scrollback()`), KeysCoverRetained, and the
+  ring_extras/lazy_buffer running sums.
 - Screen-op shorthand: `R` = visible_rows, `C` = cols, cursor `(r,c)`, `pw` = pending_wrap, `[top,bot]` (or `[t,b]`)
   = scroll region, `[L,Rm]` = horizontal margins (`L=0, Rm=C-1` when unset), `m` = the `left_right_margin_mode`
-  argument. `EC(r)` = `effective_cols_for_row(r)`; `MC(r)` = `EC(r)-1`. `Ch(i,j)` = resolved char (`' '` for
-  empty), `Cell(i,j)`, `Prot(i,j)` = `Row::is_cell_protected` (neighbour-aware), `Wr(i)` = row i's WRAPPED flag
-  (row i continues row i-1), `LS(i)` = line size, `Len(i)` = row len. `B` = `cursor_template` (the BCE blank),
-  `B_rgb` = its ring bytes. `-sat`/`+sat` = saturating ops.
-- `Scr(g)[i]` = `Rows(g)[i]`: visible row i read at display_offset 0 (cells with extras, wrapped flag).
-  `H(g) = h_0..h_{N-1}`: history oldest first as `get_history_line(i)` returns it across the store, lazy buffer
-  and ring (`N = scrollback_lines()`). `Transcript(g) = H(g) ++ Rows(g)`. The tiers are invisible to these.
+  argument. `EC(r)` = `effective_cols_for_row(r)`; `MC(r)` = `EC(r)-1`. `Cell(i,j)` = the cell at row i,
+  column j; `Prot(i,j)` = `Row::is_cell_protected` (neighbour-aware); `Wr(i)` = row i's WRAPPED flag (row i
+  continues row i-1); `LS(i)` = line size. `B` = `cursor_template` (the BCE blank), `B_rgb` = its ring bytes. `-sat`/`+sat` =
+  saturating ops.
+- `H(g) = h_0..h_{N-1}`: history oldest first as `get_history_line(i)` returns it across the store, lazy buffer
+  and ring (`N = scrollback_lines()`). `Transcript(g)` = `H(g)` followed by the visible rows read at
+  display_offset 0 (cells with extras, wrapped flag). The tiers are invisible to both.
 - `Logical(g)`: Transcript grouped into logical lines (a row with `is_wrapped()` continues the previous one; a
   non-final member contributes its full content width; an early-wrap hole contributes nothing; the final member
   contributes `cells[..len]`; DECDWL/DECDHL rows are units of their own).
@@ -112,14 +74,14 @@ Grid
   continuation and extras are dropped; chunk 0 keeps the head row's wrapped flag, later chunks are wrapped. The
   code-level definition is `chunk-cells-to-rows`.
 - `Snapshot(g) = [(text.trim_end(), wrapped) | e ∈ Transcript(g)]`; `Tr(g)` (zero-share specs) = numbered history
-  lines oldest first, then screen rows `0..=cursor_row`, blank rows skipped (`zero_store_share.rs::transcript`).
+  lines oldest first, then screen rows `0..=cursor_row`, blank rows skipped (`src/grid/tests/zero_store_share.rs::transcript`).
 - `V_r = visible_row_view(r)`; `CellText(view,c)` = base char (or complex string) then its combining marks.
   `Obs(row)` = per column (char, visual flags, wide/continuation, complex string, combining marks, hyperlink,
   fg/bg RGB) plus the wrapped flag. `Picture(g)` = (Screen, cursor, pw, saved cursor, scroll region, margins).
   `RGB(g,r,c) = (fg_rgb_at, bg_rgb_at)` (dense ring or map).
 - Absolute keys: `visible_to_absolute(v) = absolute_row_counter - rows + v`; `oldest_absolute_row() =
   counter - rows - scrollback_lines()` (saturating); transcript index i has key `oldest + i`; `base_y = counter - R`.
-- Line round trip: `X(R) = extract_row_extras(R, extras, r)`, `L(R) = row_to_line_with_stored_extras(R, X(R))`,
+- Line round trip: `L(R) = row_to_line_with_stored_extras(R, extract_row_extras(R, extras, r))`,
   `Mat(L,c)` = `materialize_from_line(L,c)` cells plus extras; `WF(R)`: R satisfies WideCharConsistent and
   ExtrasClaimed and every wide head carries the WIDE bit its writer set. `Units(text)`: the segmentation by
   repeated `advance_grapheme_unit_wide`.
@@ -127,12 +89,11 @@ Grid
 - Offload window: from `resize_offloading_scrollback(..) = Some(job)` to the matching
   `reattach_reflowed_scrollback[_or_redetach]` or `abort_reflow_offload`; `p` = display_offset at detach;
   `W` = lines scrolled off during the window; `CAP = Grid::DETACHED_LAZY_CAP` (50 000).
-- Cost (`kind = cost`): the production `count_*` increments in `src/test_counters.rs` (only the `take_*` readers
-  are `cfg(test)`; `count_scrollback_reflow_sync_lines` is itself `cfg(any(test, feature="testing"))`), treated as
-  ghost state. A cost spec states the counter delta across one call. Once proved, the counters become ghost
-  variables and the instrumentation is deleted, as the parser pilot did with `PARSER_LOOP_ITERATIONS`.
-- `Refines(G, Model, proj)`: `proj(init) = Model.Init` and every public op maps to a `Model.Next` successor
-  (`Buggy=0`); this is what `ty trace validate` checks per transition in the conformance tests, stated over all states.
+- `cost` rows state the delta of a `count_*` counter of `src/test_counters.rs` (compiled in test and debug
+  builds) across one call, treating the counters as ghost state.
+- `refinement` rows over a model: the projection of the initial state is the model's `Init`, and every public op
+  maps to a `Next` successor at `Buggy=0`. The conformance tests check this per transition
+  (`aterm_spec::verify`); the row states it over all states.
 
 `#[cfg(test)]`-only APIs (no production caller) seen across the crate include `Grid::{write_char_wrap,
 write_ascii_run_styled, write_wide_char_at_cursor_packed, write_emoji_run_autowrap, scroll_down, backspace,
@@ -142,10 +103,10 @@ function such a wrapper delegates to; a test whose code has no production twin i
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `primary tests` (count; the names are in §2),
-`difficulty (Rust features the proof must handle)`, `blocking gaps` (numbers from
-the historical development audit `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7;
-gap 0, the seal that publishes Clean rows, blocks every spec and is listed on every row).
+Columns: `id`; `kind`; `functions`; `statement`; `primary tests` (how many tests the spec subsumed at
+recovery; §2 maps those in the tree); `difficulty` (the Rust features the proof must handle); `blocking gaps`
+(numbers in the gap table of `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7; gap 0, the seal that
+publishes Clean rows, is on every row).
 
 ```tsv
 id	kind	functions	statement	primary tests	difficulty	blocking gaps
@@ -412,8 +373,8 @@ widening (most often 1, non-scalar carriers; 2, certified `&self`/`&mut self`; 3
    `orphan-fixup-primitives` → `row-set`, `row-narrow-write`, `row-wide-write`, `fill-cell-run`,
    `cells-mut-with-fixup`, `clear-range-with-orphan`, `ech-erase-chars-with`, `ich-insert-chars-fill`,
    `dch-delete-chars-fill`, `bounded-ich-dch`, `selective-erase-decsca`, `fixup-wide-boundary`, `row-resize`,
-   `row-line-size`, `row-copy-from`, `row-clear-erase-reset`, `row-wrapped-flag`, `row-display` → the frame
-   corollaries `bit10-locality`, `early-wrap-hole-lifecycle` → `row-unsafe-ub-free`.
+   `row-line-size`, `row-copy-from`, `row-clear-erase-reset`, `row-wrapped-flag`, `row-display` →
+   `bit10-locality`, `early-wrap-hole-lifecycle` → `row-unsafe-ub-free`.
 7. Grid screen ops over the row lemmas: `grid-construct`, `row-access-bounds`, `ring-row-shift-permutation`,
    `write-char-denotation`, `autowrap-deferred`, `run-writers-refine-write-char-wrap`, `writes-replace-extras`,
    `wide-autowrap-tail-bce`, `has-extras-iff-entry`, then `line-feed`, `reverse-line-feed`, `scroll-region-shift`,
@@ -422,7 +383,7 @@ widening (most often 1, non-scalar carriers; 2, certified `&self`/`&mut self`; 3
    `rect-fill-erase`, `decsera`, `deccara-decrara`, `deccra-copy`), line ops (`ich-dch-shift`, `ech-erase-chars`,
    `il-dl`, `il-dl-margined`, `decic-decdc`), `row-band-moves-denote-ops`, `content-damage-and-generation`,
    `viewport-scroll-damage`, `display-offset-navigation`, `grid-cell-text-reads`, `row-metadata-accessors`,
-   `grid-type-invariant` (it frames every mutator, so it comes after them).
+   and last `grid-type-invariant`, which frames every mutator.
 8. History and lines: `history-line-order`, `history-read-errors`, `history-walk-refines-get`,
    `deferred-line-equals-eager`, `lazy-buffer-pool-and-sums`, `extract-row-extras-*`, `row-to-line-colour-resolution`,
    `materialize-from-line-denotation`, `grapheme-unit-segmentation`, `grapheme-ascii-fast-path`,
@@ -430,7 +391,7 @@ widening (most often 1, non-scalar carriers; 2, certified `&self`/`&mut self`; 3
    `scroll-up-appends-transcript`, `top-anchored-region-archive`, `unscroll-denotation`,
    `viewport-memo-*`, `checkpoint-*`, `retention-limit`, `ed3-erase-scrollback`, `absolute-row-numbering`,
    `history-fence-*`, `reserve-older-history-keys`, `older-history-build`, `attach-older-history`,
-   flood/lazy specs, `history-link-budget`, `grid-memory-accounting`.
+   the flood and lazy-buffer specs, `history-link-budget`, `grid-memory-accounting`.
 9. Resize and reflow: `copy-cells-to-row`, `remap-copied-extra`, `source-coords-for-row` → `chunk-cells-to-rows`
    → `reflow-rewrap-layout`, `reflow-cursor-tracking`, `reflow-extras-follow-cells`, `double-size-rows-resize-in-place`,
    `scrollback-rewrap-denotation` → `reflow-history-rewrap`, `reflow-viewport-placement`, `width-change-seam-policy`,
@@ -442,13 +403,21 @@ widening (most often 1, non-scalar carriers; 2, certified `&self`/`&mut self`; 3
     `offload-refines-plain-resize`, `offload-window-refinement`, `unified-retention-limit-refinement`,
     `top-anchored-scroll-refinement`, `resize-row-reuse-refines-model`, `restore-tab-stops-admission`,
     `zero-share-tiered-is-ring-only`, `history-contiguous-suffix`.
-11. Cost specs last (they need ghost state): `hyperlink-walk-cost`, `extras-op-cost`, `rgb-harvest-cost`,
+11. Cost specs, which need ghost state: `hyperlink-walk-cost`, `extras-op-cost`, `rgb-harvest-cost`,
     `rows-only-resize-cost`, `reflow-cost`, `scroll-off-is-lazy`, `width-resize-sync-cost`.
+
+The cheapest starts are in step 1. The `CellFlags` trio (`cell-flags-layout`, `wide-continuation-of`,
+`cell-flags-bit-algebra`) is `u16` bit algebra with no loops, heap or panics, decidable by evaluation, and every
+row, write, erase and reflow spec rests on it. `cursor-in-chunk` and `adjust-chunk-boundary` are pure scalar
+kernels; `adjust-chunk-boundary`'s progress clause is the decreases measure `chunk-cells-to-rows` needs.
+`display-offset-damage` is the arithmetic core of `viewport-scroll-damage` and a first case for gap 4 through
+`apply_display_offset_damage`. `row-u16-saturating` is blocked on gap 3: E6 imports no body with a narrowing
+integer `as` cast (not even `fn(u32) -> u16 { idx as u16 }`), and contract predicates admit neither `if` nor `as`.
 
 ## 2. Test → spec map (TSV)
 
-`primary` is the spec that retires the test. `also` lists the other specs the same test samples. Tests
-that sample no spec carry `nonspec:<action>` (§4).
+`primary` is the spec that retires the test; `also` lists the other specs the same test samples. A test that
+samples no spec carries `nonspec:<action>` (§4). Not every test in the crate is mapped.
 
 ```tsv
 file	test	primary	also
@@ -964,6 +933,8 @@ crates/aterm-grid/src/grid/tests/tab_stops.rs	cbt_clamps_to_the_left_margin_unde
 crates/aterm-grid/src/grid/tests/tab_stops.rs	cbt_ignores_the_left_margin_without_origin_mode	cbt-prev-stop	
 crates/aterm-grid/src/grid/tests/tab_stops.rs	cbt_left_of_the_left_margin_never_moves_the_cursor	cbt-prev-stop	
 crates/aterm-grid/src/grid/tests/tab_stops.rs	cbt_without_declrmm_is_the_plain_back_tab_in_either_mode	cbt-prev-stop	
+crates/aterm-grid/src/grid/tests/tab_stops.rs	cht_and_cbt_by_n_land_where_n_single_steps_do	ht-next-stop	cbt-prev-stop
+crates/aterm-grid/src/grid/tests/tab_stops.rs	cht_and_cbt_stop_stepping_once_the_cursor_stops_moving	ht-next-stop	cbt-prev-stop
 crates/aterm-grid/src/grid/tests/tab_stops.rs	cht_right_of_the_right_margin_never_moves_the_cursor_backward	ht-next-stop	
 crates/aterm-grid/src/grid/tests/tab_stops.rs	grid_back_tab_n	cbt-prev-stop	
 crates/aterm-grid/src/grid/tests/tab_stops.rs	grid_back_tab_with_default_stops	cbt-prev-stop	
@@ -1185,8 +1156,7 @@ Totals by action: delete 2, becomes-spec-after-fix 2.
      (0.5..2.0, 1.5..3.0, < 3.0). `extras-op-cost` and `reflow-cost` state the exact counts.
    - **Resolved:** `scrollback_offload.rs::stepping_interleaved_with_window_output_keeps_history_and_order` now asserts exact `history_seq` and `screen_rows` equality against a synchronous `plain` `resize` twin.
    - **Resolved:** `scroll_fill.rs` was deleted, removing its 10 duplicate scroll tests.
-   - `scroll_region/unscroll.rs::grid_unscroll_preserves_wrapped_flag` hand-sets a continuation flag on
-     row 0.
+   - **Resolved:** `scroll_region/unscroll.rs::grid_unscroll_preserves_wrapped_flag` now drives genuine autowrap via `write_char_wrap` onto continuation row 1 instead of hand-setting `set_wrapped(true)` on row 0, and `grid_unscroll_preserves_attributes` asserts both `fg_color() == Some(fg)` and `CellFlags::BOLD` on every cell of `"STYLED"`.
    - **Resolved:** `reflow/cost_bound.rs::offload_window_lazy_buffer_is_bounded` now asserts exact line conservation (`dropped == held_at_detach + window_writes - (DETACHED_LAZY_CAP + ring_cap)`, `after == reflowed_len + DETACHED_LAZY_CAP + ring_cap`) and exact oldest/newest retained `W` lines.
    - Files and headers named for something they do not hold:
      - `style_perf.rs` holds no performance tests.
@@ -1204,29 +1174,43 @@ Totals by action: delete 2, becomes-spec-after-fix 2.
    - `tests/conformance_offload.rs` models the detach window synchronously, but production may step the
      job on a worker. That is why `offload-window-refinement` lists gap 13.
 
-## 6. The three specs I would prove first (easiest, high value)
+Weak, mislabelled or vacuous tests:
+- `src/grid/checkpoint_lines.rs::visible_checkpoint_cost_does_not_scale_with_scrollback` asserts the copy's
+  length, not a cost.
+- `src/grid/erase.rs::erase_line_within_margins_gives_the_wide_orphan_the_bce_background_and_ring` describes a
+  margin-bounded EL 2, but EL 2 erases the whole row, so the orphan rule it names is never sampled.
+- `src/grid/erase.rs::test_el1_el2_and_el0_on_the_continuation_keep_the_link` ends with an EL 0 and no assertion.
+- `src/grid/scroll.rs::a_drained_flood_backlog_gives_its_spine_back` asserts `spine_capacity() ≤ 4000`, a bound
+  std leaves unspecified for `VecDeque::shrink_to`; `lazy-spine-slack-bound` states only the call.
+- `src/grid/scroll.rs::a_marker_shrinks_as_the_window_slides_past_its_hole` and
+  `a_window_that_slides_past_the_whole_hole_takes_the_marker` rig the cut by writing fields. Production reaches
+  that state only through `bound_detached_lazy_buffer`, which the spec's precondition should name.
+- `src/grid/reflow.rs::last_resize_shape_in_the_trim_demote_and_bottom_push_regimes` samples three specs at
+  once, and its retention-0 halves duplicate `src/grid/resize_undo.rs`.
+- `src/grid/tests/deferred_line_equivalence.rs::assert_lines_equivalent` passes a byte offset from
+  `char_indices()` to `Line::get_attr`, which takes a char index, so on non-ASCII rows it compares attrs at the
+  wrong positions. `deferred-line-equals-eager` compares by char index.
+- `src/grid/tests/algorithm_boundary/resize_and_invariants.rs::reflow_grow_cursor_in_trailing_blank_of_continuation_row`
+  checks the cursor column only against the width (CursorInBounds), not its reflowed position.
+- The ratio tests of `src/grid/tests/extras_performance.rs` check deterministic counters against loose windows
+  (0.5..2.0, 1.5..3.0, < 3.0); `extras-op-cost` and `reflow-cost` state the exact counts.
+- `src/grid/scrollback_offload.rs::stepping_interleaved_with_window_output_keeps_history_and_order` checks
+  conservation with `+ 8` slack; `offload-refines-plain-resize` states equality.
+- `src/grid/tests/scroll_region/unscroll.rs::grid_unscroll_preserves_wrapped_flag` hand-sets a continuation flag
+  on row 0, and `grid_unscroll_with_scroll_region` asserts with `||`, which does not fix which lines land where.
+- `src/grid/tests/reflow/cost_bound.rs::offload_window_lazy_buffer_is_bounded`'s 45k..52k window hides the exact
+  law (the newest CAP kept, every drop counted).
+- `src/grid/tests/style_perf.rs` holds no performance tests, and
+  `src/grid/tests/style_perf_complexity.rs::row_to_line_extracts_hyperlinks` is no complexity test and goes
+  through the `#[cfg(test)]` `row_to_line_with_hyperlinks`.
+- `src/state/presentation.rs::union_is_order_independent_past_the_arity_bound` never exceeds the 8-band bound it
+  is named for. Past the bound order independence does not hold: `from_merged` absorbs pairs order-dependently.
+- `src/page_tests/pointer_correctness.rs::alloc_zero_length_slice_is_stable_and_non_consuming` claims a len-0
+  alloc never advances the offset, but the alloc aligns it; the claim holds only for two `u32` allocations.
 
-1. **The `CellFlags` trio**: `cell-flags-bit-algebra`, `wide-continuation-of` and `cell-flags-layout`.
-   - Each is a `u16` `#[repr(transparent)]` newtype with `&`, `|`, `!` and consts, with no loops, heap or
-     panics.
-   - The quantified clauses are over `u16`, so they are decidable by evaluation. The only real widening
-     is gap 3 (bitwise ops in E6 bodies).
-   - It retires 13 tests. Every row, write, erase and reflow spec cites `bit10`/`WIDE`/`COMPLEX` through
-     these facts, so it is the base of the whole cell layer.
-2. **The reflow chunk kernels**: `cursor-in-chunk` and `adjust-chunk-boundary`.
-   - Both are pure scalar functions over `usize`/`u16` and one `&[Cell]` read. `adjust-chunk-boundary`
-     carries a progress clause (result > o) that is the decreases measure `chunk-cells-to-rows` needs.
-   - They retire 15 tests.
-   - They are the lemmas `reflow-rewrap-layout` (29 primary tests), `reflow-cursor-tracking` (10) and
-     `width-roundtrip-restores-topology` (8) are built on.
-3. **`display-offset-damage`**.
-   - It is usize/u16 subtraction and comparison returning an enum, plus a no-panic obligation: both
-     `u16::try_from(..).expect()` calls are unreachable.
-   - It retires 6 tests, including the exhaustive delta × size sweep.
-   - It is the arithmetic core of `viewport-scroll-damage` (11 tests). It is also the cleanest first case
-     for gap 4 (callee-ensures composition) through `apply_display_offset_damage`.
-
-Runner-up: the cursor-motion family. `cursor-set-clamp`, `cursor-vertical-margins`,
-`cursor-horizontal-margins`, `carriage-return` and `cursor-in-bounds` retire 47 tests with scalar u16
-arithmetic, and the two pending-wrap tables (`pending-wrap-motion-table`, `erase-pending-wrap-table`) retire 30 more. They wait only on
-gap 2 (certified `&mut self` views), so they are the biggest cheap collapse once that gap lands.
+Negative controls and model checks are not specs:
+- `tests/conformance_retention.rs::resurrected_pre_unification_split_is_rejected` and the forged-observation
+  halves of the conformance tests move into their spec's proof as its negative control. The
+  `*_spec_model_checked_in_trust` tests become verify-model obligations.
+- `tests/conformance_offload.rs` steps the detach window synchronously, while production may step the job on a
+  worker; hence gap 13 on `offload-window-refinement`.

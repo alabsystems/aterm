@@ -327,7 +327,7 @@ pub fn parse_offscreen(reply: &CtlReply) -> Result<Offscreen, OffscreenError> {
     let field = |key: &str| -> Result<u64, OffscreenError> {
         fields
             .iter()
-            .find(|(k, _)| *k == key)
+            .rfind(|(k, _)| *k == key)
             .and_then(|(_, v)| decimal(v))
             .ok_or_else(|| bad(format!("no {key}= in the header")))
     };
@@ -336,6 +336,13 @@ pub fn parse_offscreen(reply: &CtlReply) -> Result<Offscreen, OffscreenError> {
             field(key)
         } else {
             Ok(0)
+        }
+    };
+    let flag = |key: &str, v: u64| -> Result<bool, OffscreenError> {
+        match v {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(bad(format!("{key}={v} is not 0 or 1"))),
         }
     };
     if payload.len() != n {
@@ -354,6 +361,11 @@ pub fn parse_offscreen(reply: &CtlReply) -> Result<Offscreen, OffscreenError> {
     let Some(split) = n.checked_sub(screen_rows) else {
         return Err(bad(format!("screen_rows={screen_rows} is more than {n}")));
     };
+    let enabled = if fields.iter().any(|(k, _)| *k == "enabled") {
+        flag("enabled", field("enabled")?)?
+    } else {
+        true
+    };
     Ok(Offscreen {
         first: field("first")?,
         last: field("last")?,
@@ -363,10 +375,13 @@ pub fn parse_offscreen(reply: &CtlReply) -> Result<Offscreen, OffscreenError> {
         back_at: optional("back_at")?,
         pin: usize::try_from(optional("pin")?).unwrap_or(usize::MAX),
         origin: field("origin")?,
-        enabled: fields.iter().all(|(k, v)| *k != "enabled" || *v != "0"),
-        alt: field("alt")? == 1,
-        more: optional("more")? == 1,
-        frame_open: fields.iter().any(|(k, v)| *k == "frame" && *v == "open"),
+        enabled,
+        alt: flag("alt", field("alt")?)?,
+        more: flag("more", optional("more")?)?,
+        frame_open: fields
+            .iter()
+            .rfind(|(k, _)| *k == "frame")
+            .is_some_and(|(_, v)| *v == "open"),
         archived: payload[..split].iter().map(|r| r.to_string()).collect(),
         screen: payload[split..].iter().map(|r| r.to_string()).collect(),
     })

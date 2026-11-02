@@ -97,25 +97,48 @@ fn cron_of(content: &str) -> Option<(String, String)> {
 /// The id a `manage_task` kill's result row names cancelled (`Task "<id>"
 /// cancelled.`).
 fn cancelled_task(content: &str) -> Option<&str> {
-    let rest = content.split_once("Task \"")?.1;
+    let rest = content
+        .lines()
+        .take(4)
+        .find_map(|l| l.trim().strip_prefix("Task \""))?;
     let (id, tail) = rest.split_once('"')?;
     tail.trim_start().starts_with("cancelled").then_some(id)
 }
 
-/// The sender a `SYSTEM_MESSAGE` row names (`… sender=<id> priority=…`).
-fn sender(content: &str) -> Option<&str> {
-    content
-        .split_once("sender=")?
-        .1
-        .split(char::is_whitespace)
-        .next()
+/// The first message's sender and first content line in a system envelope. Message bodies
+/// are unescaped: later `[Message]` lines can be tool output, so they cannot retire other work.
+fn message_header(content: &str) -> Option<(&str, &str)> {
+    let messages = content.strip_prefix("<SYSTEM_MESSAGE>\n").or_else(|| {
+        content
+            .split_once("\n<SYSTEM_MESSAGE>\n")
+            .map(|(_, rest)| rest)
+    })?;
+    let first = messages
+        .lines()
+        .next()?
+        .strip_prefix("[Message] timestamp=")?;
+    let (fields, body) = first.split_once(" content=")?;
+    let (timestamp, rest) = fields.split_once(" sender=")?;
+    let (sender, priority) = rest.split_once(" priority=")?;
+    if timestamp.is_empty()
+        || sender.is_empty()
+        || sender.contains(char::is_whitespace)
+        || priority.is_empty()
+        || priority.contains(char::is_whitespace)
+    {
+        return None;
+    }
+    Some((sender, body))
 }
 
-/// The subagent a `SYSTEM_MESSAGE` row says went idle (`Subagent <id> has gone
-/// idle`).
-fn gone_idle(content: &str) -> Option<String> {
-    let (head, _) = content.split_once(" has gone idle")?;
-    let id = head.rsplit("Subagent ").next()?;
+/// The system sender's own idle notice, before any multiline payload.
+fn gone_idle(sender: &str, body: &str) -> Option<String> {
+    if sender != "system" {
+        return None;
+    }
+    let (id, _) = body
+        .strip_prefix("Subagent ")?
+        .split_once(" has gone idle")?;
     super::codex_rollout::is_thread_id(id).then(|| id.to_owned())
 }
 
@@ -135,21 +158,24 @@ enum Kill {
     These(Vec<String>),
 }
 
-/// Check that no background task or subagent remains open in `text` at or after `from_s`.
-pub fn open_work(text: &str, from_s: u64) -> Result<(), Open> {
-    let mut tasks: BTreeMap<String, Task> = BTreeMap::new();
-    let mut subagents: BTreeSet<String> = BTreeSet::new();
-    let mut schedules: Vec<(String, String, Option<u64>)> = Vec::new();
-    let mut kill: Option<Kill> = None;
-    for line in text.lines().filter(|l| !l.trim().is_empty()) {
-        let row: Value = aterm_json::from_str(line.trim()).map_err(|_| Open::Unreadable)?;
+#[derive(Default)]
+struct OpenWorkFold {
+    tasks: BTreeMap<String, Task>,
+    subagents: BTreeSet<String>,
+    schedules: Vec<(String, String, Option<u64>)>,
+    kill: Option<Kill>,
+}
+
+impl OpenWorkFold {
+    fn step(&mut self, trimmed: &str, from_s: u64) -> Result<(), Open> {
+        let row: Value = aterm_json::from_str(trimmed).map_err(|_| Open::Unreadable)?;
         let created = row
             .get("created_at")
             .and_then(Value::as_str)
             .and_then(super::upgrade_models::parse_utc)
             .ok_or(Open::Unreadable)?;
         if created < from_s {
-            continue;
+            return Ok(());
         }
         let kind = row.get("type").and_then(Value::as_str).unwrap_or_default();
         let content = row
@@ -158,12 +184,9 @@ pub fn open_work(text: &str, from_s: u64) -> Result<(), Open> {
             .unwrap_or_default();
         match kind {
             "PLANNER_RESPONSE" => {
-                for call in row
-                    .get("tool_calls")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                {
+                self.kill = None;
+                let calls = row.get("tool_calls").and_then(Value::as_array);
+                for call in calls.into_iter().flatten() {
                     match call.get("name").and_then(Value::as_str) {
                         Some("schedule") => {
                             let text_arg =
@@ -172,12 +195,14 @@ pub fn open_work(text: &str, from_s: u64) -> Result<(), Open> {
                                 (text_arg("CronExpression"), text_arg("Prompt"))
                             {
                                 let max = arg(call, "MaxIterations").and_then(|v| v.as_u64());
-                                schedules.push((expr, prompt, max));
+                                self.schedules.push((expr, prompt, max));
                             }
                         }
-                        Some("manage_subagents") => {
+                        // Generic result rows carry no call identity. Only one tool call can
+                        // be paired with its next result; a batch stays open until idle notices.
+                        Some("manage_subagents") if calls.is_some_and(|calls| calls.len() == 1) => {
                             let action = arg(call, "Action");
-                            kill = match action.as_ref().and_then(Value::as_str) {
+                            self.kill = match action.as_ref().and_then(Value::as_str) {
                                 Some("kill_all") => Some(Kill::All),
                                 Some("kill") => Some(Kill::These(
                                     arg(call, "ConversationIds")
@@ -186,7 +211,7 @@ pub fn open_work(text: &str, from_s: u64) -> Result<(), Open> {
                                         })
                                         .unwrap_or_default(),
                                 )),
-                                _ => kill,
+                                _ => None,
                             };
                         }
                         _ => {}
@@ -194,19 +219,26 @@ pub fn open_work(text: &str, from_s: u64) -> Result<(), Open> {
                 }
             }
             "GENERIC" => {
+                // A failed result spends the pending call too: a later unrelated success
+                // cannot answer it. RUNNING rows have not supplied a terminal result yet.
+                let pending = if row.get("status").and_then(Value::as_str) == Some("RUNNING") {
+                    None
+                } else {
+                    self.kill.take()
+                };
                 if row.get("status").and_then(Value::as_str) == Some("RUNNING")
                     && let Some(id) = started_task(content)
                 {
                     let cron = cron_of(content).map(|(expr, prompt)| {
-                        schedules
+                        self.schedules
                             .iter()
                             .position(|(e, p, _)| *e == expr && *p == prompt)
-                            .and_then(|at| schedules.remove(at).2)
+                            .and_then(|at| self.schedules.remove(at).2)
                     });
-                    tasks.insert(id.to_owned(), Task { cron, fired: 0 });
+                    self.tasks.insert(id.to_owned(), Task { cron, fired: 0 });
                 }
                 if let Some(id) = cancelled_task(content) {
-                    tasks.remove(id);
+                    self.tasks.remove(id);
                 }
                 if let Some(head) = content
                     .lines()
@@ -215,7 +247,7 @@ pub fn open_work(text: &str, from_s: u64) -> Result<(), Open> {
                     .find(|l| SUBAGENTS_CREATED.contains(l))
                     && let Some((_, spawned)) = content.split_once(head)
                 {
-                    subagents.extend(
+                    self.subagents.extend(
                         spawned
                             .lines()
                             .filter(|l| l.contains("\"conversationId\""))
@@ -227,11 +259,11 @@ pub fn open_work(text: &str, from_s: u64) -> Result<(), Open> {
                     .take(4)
                     .any(|l| l.starts_with(SUBAGENTS_KILLED))
                 {
-                    match kill.take() {
-                        Some(Kill::All) => subagents.clear(),
+                    match pending {
+                        Some(Kill::All) => self.subagents.clear(),
                         Some(Kill::These(ids)) => {
                             for id in ids {
-                                subagents.remove(&id);
+                                self.subagents.remove(&id);
                             }
                         }
                         None => {}
@@ -239,57 +271,140 @@ pub fn open_work(text: &str, from_s: u64) -> Result<(), Open> {
                 }
             }
             "SYSTEM_MESSAGE" => {
-                if let Some(from) = sender(content)
-                    && let Some(task) = tasks.get_mut(from)
-                {
-                    let ended = match task.cron {
-                        None => true,
-                        Some(max) => {
-                            task.fired += 1;
-                            max.is_some_and(|m| task.fired >= m)
+                if let Some((from, body)) = message_header(content) {
+                    if let Some(task) = self.tasks.get_mut(from) {
+                        let ended = match task.cron {
+                            None => true,
+                            Some(max) => {
+                                task.fired += 1;
+                                max.is_some_and(|m| task.fired >= m)
+                            }
+                        };
+                        if ended {
+                            self.tasks.remove(from);
                         }
-                    };
-                    if ended {
-                        tasks.remove(from);
                     }
-                }
-                if let Some(id) = gone_idle(content) {
-                    subagents.remove(&id);
+                    if let Some(id) = gone_idle(from, body) {
+                        self.subagents.remove(&id);
+                    }
                 }
             }
             _ => {}
         }
+        Ok(())
     }
-    if !tasks.is_empty() {
-        return Err(Open::Task);
+
+    fn finish(self) -> Result<(), Open> {
+        if !self.tasks.is_empty() {
+            return Err(Open::Task);
+        }
+        if !self.subagents.is_empty() {
+            return Err(Open::Subagent);
+        }
+        Ok(())
     }
-    if !subagents.is_empty() {
-        return Err(Open::Subagent);
+}
+
+/// THE PROMPTS `text`, A TRANSCRIPT OR ITS TAIL, WROTE AT OR AFTER `from_s`, oldest first: what was
+/// said to the conversation since, in the words it was said (`<USER_REQUEST>`'s), a line of the
+/// harness's among them, as the excerpt's reader drops it. A torn line says nothing.
+#[must_use]
+pub fn prompts_since(text: &str, from_s: u64) -> Vec<String> {
+    use super::excerpt::{agy_user_request, clean_prompt_words};
+    use super::upgrade::{HARNESS_MARK, typed_words};
+    text.lines()
+        .filter(|line| line.contains("USER_INPUT"))
+        .filter_map(|line| aterm_json::from_str::<Value>(line.trim()).ok())
+        .filter_map(|row| {
+            let at = super::upgrade_models::parse_utc(row.get("created_at")?.as_str()?)?;
+            if at < from_s
+                || row.get("type")?.as_str()? != "USER_INPUT"
+                || row.get("source")?.as_str()? != "USER_EXPLICIT"
+            {
+                return None;
+            }
+            let request = agy_user_request(row.get("content")?.as_str()?).trim();
+            if typed_words(request).starts_with(HARNESS_MARK) {
+                Some(typed_words(request).to_owned())
+            } else {
+                clean_prompt_words(request)
+            }
+        })
+        .collect()
+}
+
+/// Check that no background task or subagent remains open in `text` at or after `from_s`.
+pub fn open_work(text: &str, from_s: u64) -> Result<(), Open> {
+    let mut fold = OpenWorkFold::default();
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        fold.step(line, from_s)?;
     }
-    Ok(())
+    fold.finish()
 }
 
 /// Evaluate transcript quietness over `text` (full or `truncated` tail) for a process started at `started_ms`.
 pub fn quiet_transcript(text: &str, truncated: bool, started_ms: u64) -> Result<(), Open> {
+    quiet_transcript_reader(
+        std::io::Cursor::new(text.as_bytes()),
+        usize::MAX,
+        truncated,
+        started_ms,
+    )
+}
+
+/// Evaluate transcript quietness by streaming lines from `reader` (full or `truncated` tail, with
+/// each raw line bounded to `max_line_bytes`) for a process started at `started_ms`.
+pub fn quiet_transcript_reader<R: std::io::BufRead>(
+    mut reader: R,
+    max_line_bytes: usize,
+    truncated: bool,
+    started_ms: u64,
+) -> Result<(), Open> {
+    use std::io::{BufRead as _, Read as _};
     if started_ms == 0 {
         return Err(Open::Unproved);
     }
     let from_s = (started_ms / 1000).saturating_sub(START_SLACK_S);
-    if truncated {
-        let first = text
-            .lines()
-            .find(|l| !l.trim().is_empty())
-            .and_then(|l| aterm_json::from_str::<Value>(l.trim()).ok())
-            .and_then(|row| {
+    let mut fold = OpenWorkFold::default();
+    let mut checked_first = !truncated;
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        let limit = u64::try_from(max_line_bytes)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        let n = (&mut reader)
+            .take(limit)
+            .read_until(b'\n', &mut buf)
+            .map_err(|_| Open::Unreadable)?;
+        if n == 0 {
+            break;
+        }
+        if buf.len() > max_line_bytes && buf.last() != Some(&b'\n') {
+            return Err(Open::Unreadable);
+        }
+        let line = String::from_utf8_lossy(&buf);
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !checked_first {
+            let first = aterm_json::from_str::<Value>(trimmed).ok().and_then(|row| {
                 row.get("created_at")
                     .and_then(Value::as_str)
                     .and_then(super::upgrade_models::parse_utc)
             });
-        if first.is_none_or(|at| at >= from_s) {
-            return Err(Open::Unproved);
+            if first.is_none_or(|at| at >= from_s) {
+                return Err(Open::Unproved);
+            }
+            checked_first = true;
         }
+        fold.step(trimmed, from_s)?;
     }
-    open_work(text, from_s)
+    if !checked_first {
+        return Err(Open::Unproved);
+    }
+    fold.finish()
 }
 
 /// Summary row status value when a conversation is idle between turns.
@@ -579,13 +694,15 @@ pub fn inline_env(cmdline: &str) -> Option<String> {
         let mut set: Option<String> = None;
         let mut under_env = false;
         for word in &words {
-            if let Some(name) = assigned_name(word) {
+            let bare = unquoted(word);
+            if let Some(name) =
+                assigned_name(word).or_else(|| under_env.then(|| assigned_name(&bare)).flatten())
+            {
                 if name != super::upgrade_agy::HOME_ENV && set.is_none() {
                     set = Some(name.to_owned());
                 }
                 continue;
             }
-            let bare = unquoted(word);
             let base = bare.rsplit('/').next().unwrap_or(&bare);
             if base == super::upgrade_agy::PROGRAM {
                 if set.is_some() {

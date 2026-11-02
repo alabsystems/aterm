@@ -558,6 +558,8 @@ pub(super) fn palette_blocks(
                         focusable: false,
                         focused: false,
                         focus_visible: false,
+                        progress: None,
+                        motion: None,
                     }),
                 )
                 .layout(Layout::default().width(Length::Fill).height(Length::Fill))
@@ -612,6 +614,10 @@ pub(super) fn palette_blocks(
             swatch,
             swatch.is_none(),
         ));
+        #[cfg(test)]
+        let caps = !RESET_COLOR_UNCAPPED.with(Cell::get);
+        #[cfg(not(test))]
+        let caps = true;
         controls.push(button(
             PALETTE_SLOT_RESET,
             &format!(
@@ -621,8 +627,8 @@ pub(super) fn palette_blocks(
             "Reset color",
             StyleRef::Quiet,
             ControlState::default(),
-            // Focused, it is no wider than the column: cut at a side, it is not whole (R2).
-            Some(if focused(state, PALETTE_SLOT_RESET) {
+            // Focused, it is no wider than the column: one cut at a side breaks R2 and Clip.
+            Some(if caps && focused(state, PALETTE_SLOT_RESET) {
                 hug_width("Reset color").min(column_width)
             } else {
                 hug_width("Reset color")
@@ -1008,7 +1014,7 @@ fn colour_picker_room() -> f32 {
 pub(super) fn sheet_list_least(state: &SettingsViewState, column_width: f32) -> f32 {
     weighed(
         |bars| &mut bars.sheet,
-        column_width.to_bits(),
+        (column_width.to_bits(), large_text_rows_stack()),
         || sheet_list_least_laid(state, column_width),
     )
 }

@@ -224,7 +224,27 @@ impl PartialBake {
         )
     )]
     pub fn seal(self) -> Result<PathBuf, Error> {
+        #[cfg(unix)]
+        let file = {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+                .open(&self.partial)
+                .map_err(|e| io("open", &self.partial, &e))?
+        };
+        #[cfg(not(unix))]
         let file = std::fs::File::open(&self.partial).map_err(|e| io("open", &self.partial, &e))?;
+        if !file
+            .metadata()
+            .map_err(|e| io("open", &self.partial, &e))?
+            .is_file()
+        {
+            return Err(Error::Io(format!(
+                "could not open {}: not a regular file",
+                self.partial.display()
+            )));
+        }
         aterm_durable::durable(&file).map_err(|e| io("flush", &self.partial, &e))?;
         drop(file);
         crate::read_only(&self.partial)?;
@@ -371,7 +391,7 @@ impl Layers {
         self.floor(host)?;
         let live = self.live_disk();
         let record = self.record();
-        let reclone = match (&record, live.is_file()) {
+        let reclone = match (&record, crate::is_regular_file(&live)) {
             (_, false) => Some(Reclone::NoLiveDisk),
             (None, true) => Some(Reclone::NoRecord),
             (Some(r), true) if r.base_sha256 != base.sha256 => Some(Reclone::Base {
@@ -386,7 +406,7 @@ impl Layers {
             },
             Some(why) => {
                 let baked = self.baked_dir().join(&want);
-                if baked.is_file() {
+                if crate::is_regular_file(&baked) {
                     self.clone_live(host, &baked, base, seed)?;
                     say(&format!(
                         "cloned {} from {}: {why}",
@@ -413,13 +433,13 @@ impl Layers {
     fn planted(&self, host: &dyn Host, base: &Base, seed: &str) -> Result<Option<Prepared>, Error> {
         use crate::fault::{Fault, armed};
         let live = self.live_disk();
-        if live.is_file() {
+        if crate::is_regular_file(&live) {
             return Ok(None);
         }
         let want = baked_name(&base.sha256, seed);
         let stem = want.strip_suffix(".img").unwrap_or(&want);
         let partial = self.baked_dir().join(format!("{stem}{PARTIAL}"));
-        if armed(Fault::ClonePartial) && partial.is_file() {
+        if armed(Fault::ClonePartial) && crate::is_regular_file(&partial) {
             self.clone_live(host, &partial, base, seed)?;
             return Ok(Some(Prepared::Live {
                 disk: live,
@@ -427,7 +447,7 @@ impl Layers {
             }));
         }
         let baked = self.baked_dir().join(&want);
-        if armed(Fault::AttachBaked) && baked.is_file() {
+        if armed(Fault::AttachBaked) && crate::is_regular_file(&baked) {
             return Ok(Some(Prepared::Live {
                 disk: baked,
                 cloned: None,
@@ -467,9 +487,15 @@ impl Layers {
     /// Clone `base` to `baked/<want minus .img>.partial.img`, writable, grown sparse to the
     /// disk size.
     fn begin_bake(&self, host: &dyn Host, base: &Base, want: &str) -> Result<PartialBake, Error> {
-        let len = std::fs::metadata(&base.path)
-            .map_err(|e| Error::Input(format!("{}: {e}", base.path.display())))?
-            .len();
+        let meta = std::fs::symlink_metadata(&base.path)
+            .map_err(|e| Error::Input(format!("{}: {e}", base.path.display())))?;
+        if !meta.is_file() {
+            return Err(Error::Input(format!(
+                "{}: not a regular file",
+                base.path.display()
+            )));
+        }
+        let len = meta.len();
         if len > self.disk_bytes {
             return Err(Error::Input(format!(
                 "{} is {len} bytes, more than the {}-byte disk it would grow to",
@@ -482,10 +508,17 @@ impl Layers {
         host.clone_file(&base.path, &partial)
             .map_err(|e| io("clone the base to", &partial, &e))?;
         crate::writable(&partial)?;
-        std::fs::File::options()
-            .write(true)
-            .open(&partial)
-            .and_then(|f| f.set_len(self.disk_bytes))
+        #[cfg(unix)]
+        let file = {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+                .open(&partial)
+        };
+        #[cfg(not(unix))]
+        let file = std::fs::File::options().write(true).open(&partial);
+        file.and_then(|f| f.set_len(self.disk_bytes))
             .map_err(|e| io("grow", &partial, &e))?;
         Ok(PartialBake {
             partial,
@@ -531,7 +564,7 @@ impl Layers {
         std::fs::create_dir_all(&dir).map_err(|e| io("create", &dir, &e))?;
         let name = format!("{}.iso", seed.fingerprint());
         let iso = dir.join(&name);
-        if !iso.is_file() {
+        if !crate::is_regular_file(&iso) {
             let scratch = aterm_tempfile::Builder::new()
                 .prefix(".partial-")
                 .tempdir_in(&dir)
@@ -572,13 +605,14 @@ fn write_durably(path: &Path, text: &str) -> Result<(), Error> {
     aterm_durable::durable(&file).map_err(|e| io("flush", path, &e))
 }
 
-/// The regular files in `dir` whose names `keep` takes, sorted; none where it cannot be read.
+/// The regular files and symlinks in `dir` whose names `keep` takes, sorted; none where it
+/// cannot be read.
 fn files(dir: &Path, keep: impl Fn(&str) -> bool) -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
         .into_iter()
         .flatten()
         .flatten()
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file() || t.is_symlink()))
         .filter(|e| e.file_name().to_str().is_some_and(&keep))
         .map(|e| e.path())
         .collect();

@@ -190,7 +190,7 @@ impl CursorPhaser {
             0.0
         };
         self.last = Some(now);
-        if active {
+        if active && dt > 0.0 {
             self.pulse = (self.pulse + dt * PULSE_HZ).fract();
         }
         let breath = if self.pulse == 0.0 {
@@ -278,6 +278,11 @@ impl CursorPhaser {
         }
         let cell_l = i32::from(geom.origin_x) + cc as i32 * geom.cw as i32;
         let cell_r = cell_l + geom.cw as i32;
+        let draw_left = cell_l > geom.fx_left();
+        let draw_right = cell_r < geom.fx_right();
+        if !draw_left && !draw_right {
+            return;
+        }
         let cy = f32::from(geom.origin_y) + (cr as f32 + 0.5) * ch;
 
         let slab = ((ch * 0.125) as i32).max(2);
@@ -294,8 +299,14 @@ impl CursorPhaser {
             if cov == 0 {
                 continue;
             }
-            let left_premul = premul_rgb(hsv2rgb(hue - fringe, 0.95, 1.0), cov);
-            let right_premul = if fringe == 0.0 {
+            let left_premul = if draw_left || fringe == 0.0 {
+                premul_rgb(hsv2rgb(hue - fringe, 0.95, 1.0), cov)
+            } else {
+                0
+            };
+            let right_premul = if !draw_right {
+                0
+            } else if fringe == 0.0 {
                 left_premul
             } else {
                 premul_rgb(hsv2rgb(hue + fringe, 0.95, 1.0), cov)
@@ -310,8 +321,12 @@ impl CursorPhaser {
                 let hw = (r * crate::color_math::sqrt_f32((1.0 - ym * ym).max(0.0))) as i32;
                 if hw >= 1 {
                     let y = cy_i32 + dy;
-                    push_rect(out, geom, cell_l - hw, y, hw, h, left_premul);
-                    push_rect(out, geom, cell_r, y, hw, h, right_premul);
+                    if draw_left {
+                        push_rect(out, geom, cell_l - hw, y, hw, h, left_premul);
+                    }
+                    if draw_right {
+                        push_rect(out, geom, cell_r, y, hw, h, right_premul);
+                    }
                 }
                 dy += h;
             }

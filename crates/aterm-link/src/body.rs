@@ -108,11 +108,11 @@ impl Body {
                 continue;
             };
             match k {
-                "v" => body.v = val.parse().unwrap_or(0),
-                "t" => body.t = val.parse().unwrap_or(0),
+                "v" => body.v = crate::parse_uint(val).unwrap_or(0),
+                "t" => body.t = crate::parse_uint(val).unwrap_or(0),
                 "from" => body.from = Some(val.to_string()),
-                "re" => body.re = val.parse().ok(),
-                "dl" => body.dl = val.parse().ok(),
+                "re" => body.re = crate::parse_uint(val),
+                "dl" => body.dl = crate::parse_uint(val),
                 "verdict" if is_verdict(val) => body.verdict = Some(val.to_string()),
                 "epoch" => body.epoch = Some(val.to_string()),
                 "gen" => body.gen = Some(val.to_string()),
@@ -121,7 +121,7 @@ impl Body {
                     body.kind = Some(val.to_string());
                 }
                 "text" => body.text = crate::pct::decode(val),
-                "len" => declared_len = val.parse().ok(),
+                "len" => declared_len = crate::parse_uint(val),
                 _ => {
                     body.unknown.insert(k.to_string(), val.to_string());
                 }

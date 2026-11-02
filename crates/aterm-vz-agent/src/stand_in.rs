@@ -13,6 +13,9 @@ use std::process::ExitCode;
 /// a test that fails before its kill strands no stand-in. It watches that pid, not its parent,
 /// so a group kill that misses a grandchild leaves it running for the test to see.
 fn park(test: &str) -> ExitCode {
+    if test.starts_with('+') {
+        return ExitCode::from(2);
+    }
     let Ok(test) = test.parse::<u32>() else {
         return ExitCode::from(2);
     };
@@ -34,7 +37,12 @@ pub fn run(args: &[OsString]) -> ExitCode {
     let mut err = std::io::stderr();
     match arg(0) {
         // Exit with this code.
-        "exit" => ExitCode::from(arg(1).parse::<u8>().unwrap_or(2)),
+        "exit" => ExitCode::from(
+            Some(arg(1))
+                .filter(|s| !s.starts_with('+'))
+                .and_then(|s| s.parse::<u8>().ok())
+                .unwrap_or(2),
+        ),
         // Copy stdin to stdout until its EOF.
         "echo" => {
             let mut all = Vec::new();
@@ -44,7 +52,11 @@ pub fn run(args: &[OsString]) -> ExitCode {
         }
         // `out i` on stdout and `err i` on stderr, alternately, each flushed.
         "interleave" => {
-            for i in 0..arg(1).parse::<u32>().unwrap_or(0) {
+            let count = Some(arg(1))
+                .filter(|s| !s.starts_with('+'))
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(0);
+            for i in 0..count {
                 let _ = writeln!(out, "out {i}");
                 let _ = out.flush();
                 let _ = writeln!(err, "err {i}");

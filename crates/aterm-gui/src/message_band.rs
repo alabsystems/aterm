@@ -25,9 +25,6 @@ use crate::{App, WindowId};
 
 pub(crate) use aterm_messages::paint::{Geometry as BandGeometry, Hover as BandHover, HoverTarget};
 
-#[cfg(test)]
-pub(crate) use aterm_messages::paint::band_fp;
-
 pub(crate) use aterm_messages::ink::RowRaster;
 #[cfg(test)]
 pub(crate) use aterm_messages::ink::{
@@ -188,38 +185,6 @@ pub(crate) fn paint_rows_on(
     let c = palette.into().colors();
     let hc = chrome_band::forced_chrome().is_some();
     aterm_render::band::rows(ink::paint_band(p, hover, geom, motion, hc, &c))
-}
-
-/// How strongly the divider between stacked band rows shows the seam's ink over the band (`aterm_render::band`).
-#[cfg(test)]
-pub(crate) use aterm_render::band::DIVIDER_ALPHA;
-
-/// The ink of the closing line on composed row `row` of `frame` (`aterm_render::band::compose_band`).
-#[cfg(test)]
-pub(crate) fn closing_line(frame: &aterm_render::RenderInput, row: usize) -> Option<[u8; 3]> {
-    use aterm_core::terminal::UnderlineStyle;
-    let cells = frame.cells.get(row)?;
-    let first = cells.first()?;
-    if first.underline == UnderlineStyle::Single {
-        return cells
-            .iter()
-            .all(|c| {
-                c.underline == UnderlineStyle::Single && c.underline_color == first.underline_color
-            })
-            .then_some(first.underline_color)
-            .flatten();
-    }
-    let at = u16::try_from(row).ok()?;
-    let raster = frame
-        .chrome_rasters
-        .iter()
-        .find(|m| m.row == at && m.clear_rail && m.rail_h == 1)?;
-    let px = *raster.rail.first()?;
-    raster
-        .rail
-        .iter()
-        .all(|&p| p == px && p != aterm_render::ChromeRaster::KEEP)
-        .then_some([(px >> 16) as u8, (px >> 8) as u8, px as u8])
 }
 
 /// The renderer's drawn icon for the engine's (one set in two tables, held together by `band_icon_ids_match_the_renderers`).
@@ -753,114 +718,6 @@ mod tests {
         assert_eq!(
             band_target_for_pixel(0, top, lattice(0), 0, top, 0, 1),
             Some(BandTarget { row: 0, col: 0 })
-        );
-    }
-
-    /// The App's own hit test through the window's real cell lattice: every pixel of a painted
-    /// capsule hits, acts and lights that chip; the body acts and lights `Details ›`; the
-    /// overflow row is one link; the rows above and below are not the band.
-    #[test]
-    fn band_capsules_are_hit_at_the_pixels_they_are_painted_at() {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        app.tab_strip_rows = 1;
-        let id = app.post_message(
-            Message::new(tags::TOOLCHAIN, Severity::Info, "Installing ALab tools")
-                .line("trust — extracting")
-                .action(Intent::OpenSettings {
-                    route: "/packages".into(),
-                })
-                .hold(Hold::Live {
-                    stale_after: aterm_messages::STALE_TAILED,
-                }),
-        );
-        assert_eq!(app.message_band_rows, 1);
-        let cols = usize::from(app.windows[&wid].cols);
-        let layout = app.band_presentation(cols).rows[0].clone();
-        assert!(matches!(layout.kind, RowKind::Message(m) if m == id));
-        let (cw, ch) = app.win_cell_size(wid);
-        let pad = app.win_pad(wid) as f64;
-        let top = (app.win_pad_top(wid) + app.win_head(wid)) as f64
-            + f64::from(app.tab_strip_rows) * ch as f64;
-        let at = |col: usize| (pad + (col as f64 + 0.5) * cw as f64, top + ch as f64 * 0.5);
-        assert_eq!(layout.capsules.len(), 2, "Packages, then Details \u{203a}");
-        for cap in &layout.capsules {
-            let lit = HoverTarget::Capsule(cap.action);
-            for col in cap.col..cap.col + cap.width {
-                let (x, y) = at(col);
-                let target = BandTarget { row: 0, col };
-                assert_eq!(app.band_hit_at(wid, x, y), Some(target), "col {col}");
-                assert!(app.band_press_acts(wid, target), "col {col}");
-                assert_eq!(
-                    app.band_hover_for(wid, target),
-                    Some(BandHover {
-                        row: 0,
-                        target: lit
-                    }),
-                    "col {col}"
-                );
-            }
-        }
-        let (tx, ty) = at(layout.title.0);
-        let body = BandTarget {
-            row: 0,
-            col: layout.title.0,
-        };
-        assert_eq!(app.band_hit_at(wid, tx, ty), Some(body));
-        assert!(app.band_press_acts(wid, body));
-        assert_eq!(
-            app.band_hover_for(wid, body),
-            Some(BandHover {
-                row: 0,
-                target: HoverTarget::Body
-            }),
-            "the body's press is the Details press, so its Details \u{203a} is the lit chip"
-        );
-        assert_eq!(app.band_hit_at(wid, tx, ty - ch as f64), None);
-        assert_eq!(app.band_hit_at(wid, tx, ty + ch as f64), None);
-        app.clear_messages_for_test();
-        app.post_message(
-            Message::new(tags::UPDATE, Severity::Info, "aterm update v0.48.0")
-                .line("downloading…")
-                .hold(Hold::Live {
-                    stale_after: aterm_messages::STALE_UPDATE,
-                }),
-        );
-        let layout = app.band_presentation(cols).rows[0].clone();
-        assert_eq!(layout.capsules.len(), 1, "its Details \u{203a} alone");
-        let body = BandTarget {
-            row: 0,
-            col: layout.title.0,
-        };
-        assert!(app.band_press_acts(wid, body));
-        assert_eq!(
-            app.band_hover_for(wid, body),
-            Some(BandHover {
-                row: 0,
-                target: HoverTarget::Body
-            })
-        );
-        for i in 0..4 {
-            app.post_message(Message::new(tags::CONFIG, Severity::Warn, format!("w{i}")));
-        }
-        assert_eq!(app.message_band_rows, aterm_messages::MAX_ROWS);
-        let overflow = BandTarget { row: 2, col: 4 };
-        assert!(app.band_press_acts(wid, overflow));
-        assert_eq!(
-            app.band_hover_for(wid, overflow),
-            Some(BandHover {
-                row: 2,
-                target: HoverTarget::Body
-            }),
-            "the overflow row's link lights from anywhere on it"
-        );
-        let (ox, oy) = (tx, ty + 2.0 * ch as f64);
-        assert_eq!(
-            app.band_hit_at(wid, ox, oy),
-            Some(BandTarget {
-                row: 2,
-                col: layout.title.0
-            })
         );
     }
 

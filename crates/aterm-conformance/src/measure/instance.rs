@@ -82,10 +82,14 @@ impl Budget {
     /// A budget of `secs` seconds, starting now.
     #[must_use]
     pub fn from_now(secs: u64) -> Self {
-        Self {
-            ends: Instant::now() + Duration::from_secs(secs),
-            secs,
-        }
+        let now = Instant::now();
+        let ends = now
+            .checked_add(Duration::from_secs(secs))
+            .unwrap_or_else(|| {
+                now.checked_add(Duration::from_secs(100 * 365 * 86_400))
+                    .unwrap_or(now)
+            });
+        Self { ends, secs }
     }
 
     /// The time left, or `None` once the budget is spent.
@@ -113,7 +117,9 @@ impl Budget {
         what: &str,
         mut probe: impl FnMut() -> Option<T>,
     ) -> Result<T, CouldNotRun> {
-        let deadline = (Instant::now() + MUST_HAPPEN).min(self.ends);
+        let deadline = Instant::now()
+            .checked_add(MUST_HAPPEN)
+            .map_or(self.ends, |d| d.min(self.ends));
         loop {
             if let Some(v) = probe() {
                 return Ok(v);
@@ -787,6 +793,7 @@ mod tests {
         assert!(client(60).ok(&["status"]).is_ok());
         assert_eq!(client(0).call(&["status"]).code, None);
         assert!(client(0).ok(&["status"]).is_err());
+        assert!(Budget::from_now(u64::MAX).left().is_some());
     }
 
     #[test]

@@ -678,7 +678,7 @@ fn a_roster_writer_recovers_state_then_composes_with_legacy_login_edits() {
             logins.labels.insert(
                 "main".into(),
                 Binding {
-                    dir: Some("/retained/login".into()),
+                    dir: Some(at!("/retained/login").into()),
                     ..Binding::default()
                 },
             );
@@ -691,7 +691,7 @@ fn a_roster_writer_recovers_state_then_composes_with_legacy_login_edits() {
             assert_eq!(logins.generation_clock, 1);
             assert_eq!(
                 logins.get("main").unwrap().dir.as_deref(),
-                Some("/retained/login")
+                Some(at!("/retained/login"))
             );
             Ok(vec![Event::new(NOW + 3, Kind::Use, "main")])
         })

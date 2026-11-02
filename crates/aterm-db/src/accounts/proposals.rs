@@ -17,8 +17,8 @@ use crate::{
 use astream_wire::sync::Digest;
 use aterm_secrets::{client::Paths, commons::bootstrap::Bootstrap};
 
-use crate::documents::log::Log;
 pub use crate::documents::log::{Operation, Snapshot};
+use crate::documents::{application, log::Log};
 pub(crate) mod command;
 
 const MAX_PAYLOAD: usize = 64 * 1024;
@@ -32,10 +32,21 @@ fn descriptor(bootstrap: &Bootstrap) -> Result<Descriptor> {
 /// read a verified committed prefix beside writers. No handle or secret is held across network I/O.
 pub struct Proposals {
     paths: Paths,
+    deadline: Option<std::time::Instant>,
 }
 impl Proposals {
     pub fn at(paths: Paths) -> Self {
-        Self { paths }
+        Self {
+            paths,
+            deadline: None,
+        }
+    }
+    /// Keep every nested observation inside one caller-owned pass budget.
+    pub fn at_until(paths: Paths, deadline: std::time::Instant) -> Self {
+        Self {
+            paths,
+            deadline: Some(deadline),
+        }
     }
     /// Publish the deterministic table once. Independent offline opens coalesce.
     pub fn initialize(&self) -> Result<Scope> {
@@ -44,11 +55,17 @@ impl Proposals {
     /// Read current eligible metadata and signed/local provenance. A missing or
     /// damaged established store is never silently replaced.
     pub fn snapshot(&self) -> Result<Snapshot> {
-        crate::documents::application::observe_store(
-            &self.paths,
-            descriptor,
-            |session, store, _| Self::snapshot_from_store(session, store),
-        )
+        let read =
+            |session: &Session<'_>, store: &Store, _| Self::snapshot_from_store(session, store);
+        match self.deadline {
+            Some(deadline) => crate::documents::application::observe_store_until(
+                &self.paths,
+                descriptor,
+                deadline,
+                read,
+            ),
+            None => crate::documents::application::observe_store(&self.paths, descriptor, read),
+        }
     }
     /// Project an already opened proposal store without reopening or enrolling
     /// its catalog. The caller keeps the authenticated session alive.
@@ -103,7 +120,130 @@ impl Proposals {
             if let Some(id) = log.retry(session.actor(), &command)? {
                 return receipt(session, store, &id);
             }
-            store.commit_catalog(session, &payload)
+            application::append(session, store, &payload)
+        })
+    }
+
+    /// Replace one ordinary metadata value only while its sole observed
+    /// candidate is unchanged and retained history is complete. This confers no
+    /// account or credential authority.
+    /// Exact retries return the first receipt even after that write supersedes
+    /// the expected candidate; unrelated later edits are never overwritten.
+    pub fn replace_if_current(
+        &self,
+        request: [u8; 16],
+        collection: &str,
+        key: &str,
+        expected: Digest,
+        value: aterm_json::Value,
+    ) -> Result<Receipt> {
+        self.write_if_current(request, collection, key, Some(expected), value)
+    }
+    /// Create an ordinary metadata row only if its key has never been occupied.
+    /// Exact retries return their first receipt; conflicting rows and tombstones
+    /// cannot be overwritten by an import or credential intake. New writes need
+    /// complete retained history.
+    pub fn create_if_absent(
+        &self,
+        request: [u8; 16],
+        collection: &str,
+        key: &str,
+        value: aterm_json::Value,
+    ) -> Result<Receipt> {
+        self.write_if_current(request, collection, key, None, value)
+    }
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbProposalConditional",
+            action = "FreshCreate",
+            project = "aterm_db::accounts::proposals::conditional_tests::transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbProposalConditional",
+            action = "FreshReplace",
+            project = "aterm_db::accounts::proposals::conditional_tests::transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbProposalConditional",
+            action = "GapCreate",
+            project = "aterm_db::accounts::proposals::conditional_tests::transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbProposalConditional",
+            action = "GapReplace",
+            project = "aterm_db::accounts::proposals::conditional_tests::transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbProposalConditional",
+            action = "RetryGap",
+            project = "aterm_db::accounts::proposals::conditional_tests::transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbProposalConditional",
+            action = "HealCreate",
+            project = "aterm_db::accounts::proposals::conditional_tests::transition"
+        )
+    )]
+    fn write_if_current(
+        &self,
+        request: [u8; 16],
+        collection: &str,
+        key: &str,
+        expected: Option<Digest>,
+        value: aterm_json::Value,
+    ) -> Result<Receipt> {
+        let command = Command::Write {
+            request,
+            changes: vec![Change {
+                collection: collection.into(),
+                key: key.into(),
+                value: Some(value),
+            }],
+        };
+        let payload = encode(&command)?;
+        self.with_store(false, |session, store, scope| {
+            session.writer()?;
+            let log = Log::read_with(session, store, scope, decode)?;
+            log.writable(session.actor())?;
+            if let Some(id) = log.retry(session.actor(), &command)? {
+                return receipt(session, store, &id);
+            }
+            let snapshot = log.snapshot();
+            if !snapshot.history_complete() {
+                return Err(Error::new(
+                    "conditional proposal write needs complete retained history",
+                ));
+            }
+            let cell = snapshot.cells.get(&(collection.into(), key.into()));
+            let matches = match (cell, expected) {
+                (None, None) => true,
+                (Some(cell), Some(expected)) => {
+                    !cell.stopped
+                        && cell.candidates.len() == 1
+                        && cell.candidates[0].operation == expected
+                }
+                _ => false,
+            };
+            if !matches {
+                return Err(Error::new("metadata candidate changed before replacement"));
+            }
+            application::append(session, store, &payload)
         })
     }
     /// Append an exact compensating edit while every affected key still has the
@@ -118,7 +258,7 @@ impl Proposals {
                 return receipt(session, store, &id);
             }
             let command = log.compensate(request, operation)?;
-            store.commit_catalog(session, &encode(&command)?)
+            application::append(session, store, &encode(&command)?)
         })
     }
     fn with_store<T>(
@@ -126,7 +266,18 @@ impl Proposals {
         create: bool,
         action: impl FnOnce(&Session<'_>, &mut Store, Scope) -> Result<T>,
     ) -> Result<T> {
-        crate::documents::application::with_store(&self.paths, create, descriptor, action)
+        match self.deadline {
+            Some(deadline) => crate::documents::application::with_store_until(
+                &self.paths,
+                create,
+                descriptor,
+                deadline,
+                action,
+            ),
+            None => {
+                crate::documents::application::with_store(&self.paths, create, descriptor, action)
+            }
+        }
     }
 }
 
@@ -152,6 +303,9 @@ fn decode(payload: &[u8]) -> Result<Command> {
     if command.encode()? != payload {
         return Err(Error::new("account proposal encoding is not canonical"));
     }
+    if matches!(command, Command::Merge { .. }) {
+        return Ok(command);
+    }
     let changes = command
         .changes()
         .ok_or_else(|| Error::new("account proposals cannot authorize resources or membership"))?;
@@ -170,4 +324,11 @@ fn decode(payload: &[u8]) -> Result<Command> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
+
+#[cfg(test)]
+mod frontier_tests;
+
+#[cfg(test)]
+#[path = "proposals/conditional_tests.rs"]
+mod conditional_tests;

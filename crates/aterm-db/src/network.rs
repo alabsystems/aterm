@@ -89,7 +89,7 @@ impl Repair {
 type Repairs = Mutex<BTreeMap<Actor, Repair>>;
 
 pub(crate) struct Deadline {
-    done: mpsc::Sender<()>,
+    done: mpsc::Sender<Instant>,
     join: Option<thread::JoinHandle<()>>,
 }
 impl Deadline {
@@ -99,13 +99,28 @@ impl Deadline {
 
     /// [`Self::arm`] with its own deadline.
     pub(crate) fn arm_within(tcp: &TcpStream, within: Duration) -> Result<Self> {
-        let socket = tcp.try_clone()?;
-        aterm_uds::keep_out_of_children(&socket)?;
-        let (done, wait) = mpsc::channel();
+        Self::arm_with_clock(tcp, within, Instant::now)
+    }
+
+    fn arm_with_clock(
+        tcp: &TcpStream,
+        within: Duration,
+        now: impl Fn() -> Instant + Send + 'static,
+    ) -> Result<Self> {
+        // Socket preparation and thread scheduling consume the original budget.
+        let started = now();
+        let socket = aterm_uds::kept_out(|| tcp.try_clone())?;
+        let (done, wait) = mpsc::channel::<Instant>();
         let join = thread::Builder::new()
             .name("db-exchange-deadline".into())
             .spawn(move || {
-                if wait.recv_timeout(within).is_err() {
+                let remaining = within.saturating_sub(now().saturating_duration_since(started));
+                // A queued cancellation keeps its own completion time: a late
+                // worker must honor an early finish, but not a late one.
+                let finished = wait
+                    .recv_timeout(remaining)
+                    .is_ok_and(|completed| completed.saturating_duration_since(started) < within);
+                if !finished {
                     let _ = socket.shutdown(Shutdown::Both);
                 }
             })?;
@@ -117,7 +132,7 @@ impl Deadline {
 }
 impl Drop for Deadline {
     fn drop(&mut self) {
-        let _ = self.done.send(());
+        let _ = self.done.send(Instant::now());
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
@@ -125,9 +140,13 @@ impl Drop for Deadline {
 }
 
 fn transport(credentials: &Credentials) -> Result<(FleetSecret, NodeIdentity)> {
-    let prk = aterm_digest::hkdf_extract(b"aterm-db/transport/1", &credentials.key);
-    let key = aterm_digest::hkdf_expand_32(&prk, &credentials.manifest.id);
-    let secret = FleetSecret::new(&key).map_err(|_| Error::new("invalid dataset transport key"))?;
+    let prk = zeroize::Zeroizing::new(aterm_digest::hkdf_extract(
+        b"aterm-db/transport/1",
+        &credentials.key,
+    ));
+    let key = zeroize::Zeroizing::new(aterm_digest::hkdf_expand_32(&prk, &credentials.manifest.id));
+    let secret =
+        FleetSecret::new(key.as_ref()).map_err(|_| Error::new("invalid dataset transport key"))?;
     let node = aterm_codec::hex::encode_lower(&credentials.capability.actor[32..]);
     let identity = NodeIdentity::from_seed(&node, &credentials.seed)
         .ok_or_else(|| Error::new("invalid database channel identity"))?;
@@ -155,7 +174,7 @@ fn authenticate(
     }
     Ok(capability.actor)
 }
-fn send_frame(stream: &mut impl Write, bytes: &[u8]) -> Result<()> {
+pub(crate) fn send_frame(stream: &mut impl Write, bytes: &[u8]) -> Result<()> {
     if bytes.len() > MAX_OPERATION {
         return Err(Error::new("outgoing database frame too large"));
     }
@@ -164,7 +183,7 @@ fn send_frame(stream: &mut impl Write, bytes: &[u8]) -> Result<()> {
     stream.flush()?;
     Ok(())
 }
-fn receive_frame(stream: &mut impl Read, max: usize) -> Result<Vec<u8>> {
+pub(crate) fn receive_frame(stream: &mut impl Read, max: usize) -> Result<Vec<u8>> {
     let n = read_u32(stream)? as usize;
     if n > max {
         return Err(Error::new("peer database frame exceeds bound"));
@@ -507,6 +526,83 @@ mod tests {
     use crate::database::{Change, Command};
     use aterm_json::json;
     use std::net::TcpListener;
+
+    #[test]
+    fn deadline_worker_does_not_restart_an_expired_exchange() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let tcp = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_peer, _) = listener.accept().unwrap();
+        tcp.set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
+            .unwrap();
+        let creator = thread::current().id();
+        let started = Instant::now();
+        let budget = aterm_spec::wait::MUST_HAPPEN * 10;
+        let deadline = Deadline::arm_with_clock(&tcp, budget, move || {
+            if thread::current().id() == creator {
+                started
+            } else {
+                started + budget * 2
+            }
+        })
+        .unwrap();
+        let mut byte = [0];
+        let read = (&tcp).read(&mut byte);
+        assert!(
+            matches!(&read, Ok(0))
+                || read.as_ref().is_err_and(|error| !matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                )),
+            "an expired exchange must close without a new timeout: {read:?}"
+        );
+        drop(deadline);
+    }
+
+    #[test]
+    fn deadline_worker_judges_queued_completion_at_the_original_deadline() {
+        let budget = aterm_spec::wait::MUST_HAPPEN * 10;
+        for completed_after in [budget - Duration::from_nanos(1), budget] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let tcp = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (mut peer, _) = listener.accept().unwrap();
+            tcp.set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
+                .unwrap();
+            let creator = thread::current().id();
+            let started = Instant::now();
+            let (release_worker, released) = mpsc::channel::<()>();
+            let deadline = Deadline::arm_with_clock(&tcp, budget, move || {
+                if thread::current().id() == creator {
+                    started
+                } else {
+                    released
+                        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                        .expect("the queued completion releases its deadline worker");
+                    started + budget * 2
+                }
+            })
+            .unwrap();
+            // Queue the completion before the delayed worker can read it.
+            deadline.done.send(started + completed_after).unwrap();
+            release_worker.send(()).unwrap();
+            drop(deadline);
+            let mut byte = [0];
+            if completed_after < budget {
+                peer.write_all(b"x").unwrap();
+                assert_eq!((&tcp).read(&mut byte).unwrap(), 1);
+                assert_eq!(byte, [b'x']);
+            } else {
+                let read = (&tcp).read(&mut byte);
+                assert!(
+                    matches!(&read, Ok(0))
+                        || read.as_ref().is_err_and(|error| !matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        )),
+                    "completion at the deadline must not cancel expiry: {read:?}"
+                );
+            }
+        }
+    }
 
     struct DeferredPeer {
         answers: std::io::Cursor<Vec<u8>>,

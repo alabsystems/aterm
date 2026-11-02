@@ -24,8 +24,10 @@ pub const USAGE: &str =
   post-promote  `ship site`; its promote-time run (PUB_STAGING_COMMIT set, no --latest)
                 does nothing
   transforms    rewrite the export at EXPORT by CAPTURED_COMMIT's own rules (default
-                HEAD; ROOT: the repository); exit 0 done, 1 refused or failed (named);
-                any other code is that commit's cutter's own, as above";
+                HEAD; ROOT: the repository): by this cutter when it is that commit's
+                (ATERM_RELEASE_CUTTER naming it: when it is that commit's build), else
+                by one built in a throwaway worktree of it; exit 0 done, 1 refused or
+                failed (named); any other code is that commit's cutter's own, as above";
 
 /// `ship hook …`: the hook's exit code.
 #[must_use]
@@ -151,7 +153,7 @@ pub enum Asked<'a> {
 pub type Check<'a> = dyn FnMut(Asked<'_>, &str) -> Result<i32, String> + 'a;
 
 /// A finished child's exit code, a signal's as a shell reports it (128 + the signal).
-fn exit_code(
+pub(crate) fn exit_code(
     status: std::io::Result<std::process::ExitStatus>,
     what: &Path,
 ) -> Result<i32, String> {
@@ -216,7 +218,9 @@ fn own_cutter(
     )
 }
 
-/// [`own_cutter`]'s command, run as from the operator's shell.
+/// [`own_cutter`]'s command, run as from the operator's shell; the cutter it builds is never
+/// told it was handed to the engine (`ATERM_RELEASE_CUTTER`), nor the moment a handed cutter was
+/// judged from (`ATERM_RELEASE_CUTTER_SINCE`).
 #[must_use]
 pub fn cutter_command(
     targo: &Path,
@@ -233,7 +237,10 @@ pub fn cutter_command(
         .env("CARGO_TARGET_DIR", target)
         .stdin(Stdio::null());
     for name in inherited {
-        if crate::release_steps::launcher_env(&name) {
+        if crate::release_steps::launcher_env(&name)
+            || name == crate::release_steps::RELEASE_CUTTER_ENV
+            || name == crate::release_steps::RELEASE_CUTTER_SINCE_ENV
+        {
             cmd.env_remove(name);
         }
     }
@@ -462,6 +469,11 @@ pub struct Transforms {
     pub target: Option<PathBuf>,
     /// [`DELEGATED`], when a delegating run set it.
     pub delegated: Option<String>,
+    /// Set when the caller handed this cutter to the engine rather than `targo` building it for
+    /// this run, as `ATERM_RELEASE_CUTTER` names this very executable ([`handed`]): the commit
+    /// it is the build of, judged when it started ([`crate::cutter::running`]), or why it is
+    /// none.
+    pub handed: Option<Result<String, String>>,
     /// Environment for every git child (a test isolates git from this machine's).
     pub git_env: Vec<(String, String)>,
 }
@@ -477,9 +489,35 @@ impl Transforms {
             source: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
             target: var("CARGO_TARGET_DIR").map(PathBuf::from),
             delegated: var(DELEGATED),
+            handed: handed(
+                var(crate::release_steps::RELEASE_CUTTER_ENV)
+                    .as_deref()
+                    .map(Path::new),
+                std::env::current_exe().ok().as_deref(),
+                || {
+                    crate::cutter::running()
+                        .map(str::to_string)
+                        .map_err(|not| not.why.clone())
+                },
+            ),
             git_env: Vec::new(),
         })
     }
+}
+
+/// [`Transforms::handed`] of a cutter whose executable is `exe` and whose `ATERM_RELEASE_CUTTER`
+/// is `named`: its start-time stamp, `judged`, when `named` is that executable, both resolved
+/// (so a link to it counts); else `None`, as for a cutter `targo` built that inherited the
+/// variable from its caller's shell.
+#[must_use]
+pub fn handed(
+    named: Option<&Path>,
+    exe: Option<&Path>,
+    judged: impl FnOnce() -> Result<String, String>,
+) -> Option<Result<String, String>> {
+    let resolved = |path: &Path| std::fs::canonicalize(path).ok();
+    let this = resolved(exe?)?;
+    (resolved(named?)? == this).then(judged)
 }
 
 /// Why the checkout at `source` is not `full`'s source.
@@ -572,8 +610,9 @@ pub type There<'a> = dyn FnMut(&Path, &str, &Path) -> Result<i32, String> + 'a;
 /// The rewrites over a commit's export, run here.
 pub type Here<'a> = dyn FnMut(&crate::transforms::Inputs) -> Result<Vec<String>, String> + 'a;
 
-/// Rewrite the export by the captured commit's own rules: `here` when this cutter's
-/// source is that commit, else `there`, that commit's own cutter in a worktree of it.
+/// Rewrite the export by the captured commit's own rules: `here` when this cutter is that
+/// commit's (a handed cutter by its build, [`Transforms::handed`]; one `targo` built by its
+/// checkout's whole source), else `there`, that commit's own cutter in a worktree of it.
 pub fn transforms(
     facts: &Transforms,
     here: &mut Here<'_>,
@@ -596,7 +635,27 @@ pub fn transforms(
         ));
     };
     let short = &full[..full.len().min(12)];
-    let Some(why) = source_differs(&facts.source, env, &full) else {
+    // A handed cutter is the binary of a checkout that need not hold only `full`'s files,
+    // and `targo` did not just build it from that checkout: its build stamp decides.
+    let differs = match &facts.handed {
+        Some(Ok(built)) if *built == full => None,
+        Some(Ok(built)) => Some(format!(
+            "the cutter handed to the engine is the build of {}, not {short}",
+            &built[..built.len().min(12)]
+        )),
+        Some(Err(why)) => Some(format!(
+            "the cutter handed to the engine is no commit's build ({why})"
+        )),
+        None => source_differs(&facts.source, env, &full),
+    };
+    let Some(why) = differs else {
+        if facts.handed.is_some() {
+            let _ = writeln!(
+                out,
+                "== transforms: by the cutter handed to the engine, the build of {short} itself \
+                 (nothing built)"
+            );
+        }
         let inputs = crate::transforms::Inputs {
             captured: full.clone(),
             ..facts.inputs.clone()

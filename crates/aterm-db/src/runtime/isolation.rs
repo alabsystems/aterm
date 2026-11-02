@@ -19,6 +19,7 @@ fn parse(value: Option<&OsStr>, guard: Option<&OsStr>) -> crate::Result<Option<u
     };
     let port = value
         .to_str()
+        .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
         .and_then(|s| s.parse::<u16>().ok())
         .filter(|port| *port != 0);
     match (port, guard) {
@@ -37,7 +38,7 @@ mod tests {
 
     #[test]
     fn an_invalid_or_unguarded_private_attachment_never_falls_back_to_the_lan() {
-        for value in ["", "0", "65536", "private", "-1"] {
+        for value in ["", "0", "65536", "private", "-1", "+1"] {
             assert!(parse(Some(OsStr::new(value)), Some(OsStr::new("1"))).is_err());
         }
         for guard in [None, Some(OsStr::new("0")), Some(OsStr::new(""))] {

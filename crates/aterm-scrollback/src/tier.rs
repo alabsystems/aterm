@@ -196,13 +196,6 @@ impl WarmBlock {
         let lines = self.decompress()?;
         Ok(lines.into_iter().nth(idx))
     }
-
-    /// Convert to cold-codec-compressed data for cold tier storage.
-    pub(crate) fn to_cold_compressed(&self) -> Result<(Vec<u8>, usize), super::ScrollbackError> {
-        let serialized = self.decompress_serialized_page()?;
-        let cold_compressed = super::encode_cold_block(&serialized)?;
-        Ok((cold_compressed, self.line_count))
-    }
 }
 
 /// Warm tier: LZ4 compressed blocks in RAM.

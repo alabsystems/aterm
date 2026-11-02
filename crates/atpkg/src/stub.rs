@@ -334,6 +334,16 @@ fn running_exe() -> io::Result<PathBuf> {
     std::env::current_exe()
 }
 
+/// The image recorded at process entry, while its device/inode still stand. A running
+/// producer whose executable was replaced cannot lend a new verb to the replacement.
+pub(crate) fn unchanged_running_exe() -> Option<PathBuf> {
+    #[cfg(all(test, unix))]
+    if let Some(exe) = CURRENT_EXE.with(|e| e.borrow().clone()) {
+        return Some(exe);
+    }
+    aterm_uds::tether::executable().map(Path::to_path_buf)
+}
+
 #[cfg(all(test, unix))]
 thread_local! {
     static CURRENT_EXE: std::cell::RefCell<Option<PathBuf>> =
@@ -569,7 +579,8 @@ fn pending_stub_at(
 }
 
 fn stub_is_current(shim: &Path, body: &str) -> bool {
-    std::fs::read(shim).is_ok_and(|have| have == body.as_bytes())
+    crate::metadata_io::read_bounded_regular(shim, 64 * 1024)
+        .is_ok_and(|have| have == body.as_bytes())
 }
 
 /// Remove `program`'s stub and its commands'.
@@ -610,7 +621,9 @@ pub fn remove_all_stubs(layout: &Layout) {
 /// Lay the compiled roster stubs at adoption time before any network activity.
 pub fn lay_adoption_stubs(layout: &Layout, cfg: &crate::config::PackagesConfig) {
     let installed = crate::ops::active_builds(layout);
-    let removed = layout.removed_programs();
+    let Ok(removed) = layout.removed_programs() else {
+        return;
+    };
     let triple = crate::cli::current_triple();
     let mut files = Vec::new();
     let mut commands = BTreeSet::new();

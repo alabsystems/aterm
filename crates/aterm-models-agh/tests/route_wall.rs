@@ -12,7 +12,7 @@ use aterm_models_agh::agh_route_wall_model;
 use aterm_spec::interp;
 use aterm_spec::walk::walk;
 
-const ROUTER_AND_WORLD: [&str; 9] = [
+const ROUTER_AND_WORLD: [&str; 12] = [
     "Decide",
     "Hop",
     "NextOp",
@@ -20,19 +20,24 @@ const ROUTER_AND_WORLD: [&str; 9] = [
     "Reset",
     "ToggleAmbient",
     "ToggleDev",
+    "ToggleGranted",
+    "ToggleIdent",
     "ToggleNamed",
     "ToggleRel",
+    "ToggleRelRead",
 ];
-const MUTANTS: [&str; 9] = [
+const MUTANTS: [&str; 11] = [
     "BuggyAnonymousCarries",
-    "BuggyDecideAlias",
     "BuggyDecideAmbient",
     "BuggyDecideAnonWrite",
     "BuggyDecideFallback",
     "BuggyDecideReleaseAbroad",
+    "BuggyDecideUngranted",
     "BuggyHopKeepsAuth",
     "BuggyHopOnWrite",
+    "BuggyIdentityDefault",
     "BuggyRefuseButSend",
+    "BuggyRelReadAbroad",
 ];
 
 /// A walk: the actions fired in order from the initial state.
@@ -40,8 +45,8 @@ type Walk = &'static [&'static str];
 /// The values a walk must end with: (variable, value).
 type Values = [(&'static str, i64); 2];
 
-/// At `Buggy = 0` exactly the nine world and router actions fire, at `Buggy = 1` all
-/// eighteen do, and the model is proved at 0 and caught at 1.
+/// At `Buggy = 0` exactly the twelve world and router actions fire, and at `Buggy = 1` all
+/// twenty-three do.
 #[test]
 fn route_wall_fires_every_action_and_every_mutant() {
     let model = agh_route_wall_model();
@@ -49,14 +54,14 @@ fn route_wall_fires_every_action_and_every_mutant() {
     assert_eq!(interp::fired_actions(&model), lawful);
     let every: BTreeSet<&str> = ROUTER_AND_WORLD.into_iter().chain(MUTANTS).collect();
     assert_eq!(interp::fired_actions(&interp::with_buggy(&model, 1)), every);
-    assert_eq!(model.actions.len(), 18);
+    assert_eq!(model.actions.len(), 23);
 }
 
 /// Each mutant, fired from a lawful state, breaks the laws design §17.1 pairs it with.
 #[test]
 fn each_mutant_breaks_its_law() {
     let buggy = interp::with_buggy(&agh_route_wall_model(), 1);
-    let rows: [(&[&str], &[&str]); 10] = [
+    let rows: [(&[&str], &[&str]); 13] = [
         (
             &["NextTier", "NextOp", "BuggyDecideFallback"],
             &["TierWall"],
@@ -67,7 +72,7 @@ fn each_mutant_breaks_its_law() {
                 "NextOp",
                 "NextOp",
                 "ToggleRel",
-                "BuggyDecideAlias",
+                "BuggyDecideUngranted",
             ],
             &["NamedDestination"],
         ),
@@ -111,6 +116,21 @@ fn each_mutant_breaks_its_law() {
             &["NextOp", "NextOp", "Decide", "BuggyHopOnWrite"],
             &["NoWriteHop"],
         ),
+        (
+            &[
+                "NextTier",
+                "NextTier",
+                "ToggleRel",
+                "ToggleRelRead",
+                "BuggyRelReadAbroad",
+            ],
+            &["ReleaseTokenStaysHome"],
+        ),
+        (&["ToggleIdent", "BuggyIdentityDefault"], &["IdentityNamed"]),
+        (
+            &["ToggleIdent", "ToggleDev", "BuggyDecideAmbient"],
+            &["NoAmbient", "SendCarriesIdentity", "IdentityNamed"],
+        ),
     ];
     for (path, laws) in rows {
         let state = walk(&buggy, path);
@@ -127,8 +147,48 @@ fn each_mutant_breaks_its_law() {
 #[test]
 fn the_decision_table_at_buggy_zero() {
     let model = agh_route_wall_model();
-    let rows: [(Walk, Values); 8] = [
+    let rows: [(Walk, Values); 15] = [
         (&["Decide"], [("phase", 1), ("used", 1)]),
+        (
+            &[
+                "NextTier",
+                "NextOp",
+                "NextOp",
+                "ToggleRel",
+                "ToggleGranted",
+                "Decide",
+            ],
+            [("phase", 1), ("used", 2)],
+        ),
+        (
+            &[
+                "NextTier",
+                "NextTier",
+                "NextOp",
+                "NextOp",
+                "ToggleRel",
+                "ToggleGranted",
+                "Decide",
+            ],
+            [("phase", 3), ("used", 0)],
+        ),
+        (
+            &["NextTier", "ToggleRel", "ToggleRelRead", "Decide"],
+            [("phase", 1), ("used", 2)],
+        ),
+        (
+            &["NextTier", "ToggleRelRead", "Decide"],
+            [("phase", 1), ("used", 1)],
+        ),
+        (
+            &["ToggleIdent", "ToggleNamed", "Decide"],
+            [("phase", 1), ("used", 1)],
+        ),
+        (&["ToggleIdent", "Decide"], [("phase", 3), ("used", 0)]),
+        (
+            &["ToggleIdent", "ToggleNamed", "NextOp", "Decide"],
+            [("phase", 3), ("used", 0)],
+        ),
         (
             &["NextTier", "ToggleDev", "Decide"],
             [("phase", 2), ("used", 0)],

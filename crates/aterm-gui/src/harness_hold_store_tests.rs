@@ -81,8 +81,7 @@ impl Desk {
         world.set(&[(sid.as_str(), Program::Claude)]);
         world.word(&sid, Some(Autopilot::Land));
         let mut h = hooks(&world, body);
-        let store = app.store.clone();
-        h.hold = Arc::new(move |sid, held| store_land_held(&store, sid, held));
+        h.hold = store_hooks(&app.store).hold;
         let (fact_tx, facts) = mpsc::channel();
         let fact_tx = Mutex::new(fact_tx);
         let mine = sid;

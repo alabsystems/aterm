@@ -1,32 +1,13 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-zstd: spec recovery from 18 of its 61 unit tests
+# aterm-zstd: spec recovery from unit tests
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 6 tests it
-> deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
-> were taken before.
-
-> Status 2026-10-17: the rows naming `a_wrong_seed_or_length_is_caught` and the six
-> `libzstd` tests are gone too. Their test file left with the `zstd` dev-dependency;
-> its two raw-frame cases are cited in `tests/decode_frames.rs`, where they now run on aterm's
-> decoder.
-
-> Status 2026-10-16: this is the crate's migration worklist for the frame writer and XXH64.
-> Each of the 7 specs below is proved through Trust/Clean, and then the tests it subsumes
-> are deleted. The 4 checks in §4 sample no spec and can be deleted now. The 43 decoder
-> tests (`src/decode/*`, `tests/cli_decode.rs`, `tests/sweep.rs`, and `tests/decode_frames.rs`
-> but for its two raw-frame tests in §2) are not covered here. They need a separate recovery
-> pass, which this file will gain as its own sections.
-
-Source: `crates/aterm-zstd` (read only). I read all 18 `#[test]` fns in scope:
-`src/frame.rs` 4, `src/xxh64.rs` 4, `tests/cli_frames.rs` 1, the since-deleted `libzstd` tests 6 and
-`tests/xxh64_recorded.rs` 3. I also read the code they reach: `frame::{write_raw,
-ContentSize::{of,flag,write}, block_header}`, `xxh64::{xxh64, Xxh64::{new,update,digest,consume},
-round, merge}` and `tests/support::sanity`. Nothing was compiled or run. The claims below come
-from reading the code.
-
-Result: **7 specs**, covering **14 tests**. **4 tests are not spec samples** (§4).
+The claims the tests of the frame writer and XXH64 (§1, §2) and of the encoder (§7) sample,
+stated so that a Trust/Clean proof can retire those tests. Nothing here is proved. The
+decoder's tests (`src/decode/*`, `tests/cli_decode.rs`, `tests/sweep.rs` and the rest of
+`tests/decode_frames.rs`) need a recovery pass of their own. Paths are relative to
+`crates/aterm-zstd`.
 
 ## 0. Notation used in the statements
 
@@ -36,12 +17,11 @@ Result: **7 specs**, covering **14 tests**. **4 tests are not spec samples** (§
     `[seed+P1+P2, seed+P2, seed, seed-P1]`, with `round(acc, lane) = rotl31(acc + lane*P2) * P1`.
   - If `len ≥ 32`, it converges the accumulators (the sum of `rotl 1/7/12/18`, then a merge
     with each of the four). Otherwise it starts from `seed+P5`.
-  - It adds `len mod 2^64`. It then consumes the tail as 8-byte words, then at most one 4-byte
-    word, then single bytes.
+  - It adds `len mod 2^64` (so `Inv` holds past 2^64 fed bytes). It then consumes the tail as
+    8-byte words, then at most one 4-byte word, then single bytes.
   - It finishes with the avalanche (`>>33, *P2, >>29, *P3, >>32`).
 - `sanity(n)` is xxhsum's sanity buffer: byte `i` is the top byte of
-  `2654435761 * 11400714785074694797^i mod 2^64`. The Lean model has exactly one definition
-  (see §5.3).
+  `2654435761 * 11400714785074694797^i mod 2^64` (§5.2).
 - `le16/le24/le32(x)` are the little-endian byte lists of `x`, and `low32(x) = x mod 2^32`.
 - `cs ∈ {Omitted, Xxh64}` is `frame::Checksum`.
 - `RawFrame(c, cs)`, with `n = |c|`, is the byte list
@@ -56,10 +36,10 @@ Result: **7 specs**, covering **14 tests**. **4 tests are not spec samples** (§
   `b` to an abstract byte log and returns `Ok`, or fails after appending some prefix of `b`.
   `Vec<u8>` and the test-only `Count` sink are infallible instances. The log also records
   calls, so a spec can say that no call was made.
-- `Rfc8878` is a Lean model of the RFC 8878 §3.1.1 frame grammar and its decoding semantics.
-  At minimum it covers single-segment frames with raw and RLE blocks. It provides
-  `decodeFrame : bytes → Result (content, declaredContentSize, consumed)` and `decodeStream`
-  (frames back to back).
+- `Rfc8878` is a Lean model of the RFC 8878 §3.1.1 frame grammar and its decoding semantics,
+  with `decodeFrame : bytes → Result (content, declaredContentSize, consumed)` and
+  `decodeStream` (frames back to back). §1 needs only single-segment frames with raw and RLE
+  blocks.
 - `Inv(h, seed, fed)` for `h : Xxh64`, where `fed` is a ghost list of every byte passed to
   `update` since `new(seed)`:
   - `h.seed = seed`;
@@ -68,16 +48,16 @@ Result: **7 specs**, covering **14 tests**. **4 tests are not spec samples** (§
   - `h.acc` is the four-lane round fold over the `floor(|fed|/32)` full stripes of `fed`,
     starting from the initial accumulators for `seed`;
   - `h.total = |fed| mod 2^64`.
-- **Recorded vectors.** These are the 577 TSV rows, the 14 xxhsum sanity vectors, the 6
-  literal inputs and the CLI frames. They are the only evidence that `XXH64Spec` and
-  `RawFrame` match the reference C code and the zstd 1.5.7 CLI. They are kept as Lean
-  table-properties on the models, closed by evaluation, and not as Rust tests.
+- The recorded vectors (`tests/recorded/xxh64-libzstd-1.5.7.tsv` and the CLI frame hashes in
+  `tests/cli_frames.rs`) are the only evidence that `XXH64Spec` and `RawFrame` match the
+  reference C code and the zstd 1.5.7 CLI. A proof keeps them as Lean table-properties on the
+  models, closed by evaluation.
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes`, `difficulty (Rust features the
-proof must handle)` and `blocking gaps`. The gaps are the numbers in the table in
-`AUDIT-trust-for-test-migration-2026-10-15.md` §7 (historical internal audit).
+`subsumes` names the tests a proof retires, `difficulty` the Rust features it must handle,
+and `blocking gaps` rows of the gap list in `docs/AUDIT-trust-for-test-migration-2026-10-15.md`
+§7.
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking gaps
@@ -89,24 +69,6 @@ write-raw-layout	contract	frame::{write_raw, ContentSize::of, ContentSize::flag,
 write-raw-refuses-oversize	contract	frame::{write_raw, ContentSize::of}	∀ content with |content| > WINDOW_MAX, ∀ cs, out: write_raw(out, content, cs) = Err(e) with e.kind() = InvalidInput, and it makes no call on out, so the log is unchanged. Scalar core: ContentSize::of(n) = Err(InvalidInput) ⇔ n > WINDOW_MAX, and for n ≤ WINDOW_MAX it returns the narrowest variant per FCS(n). On either branch write_raw reads no content byte when cs = Omitted: content is only split and handed to write_all.	frame.rs::content_past_the_window_cap_is_refused (its in-range half with write-raw-layout)	EASY for the ContentSize::of core (a range match on usize, which seal 150efe4a admits for u8). MEDIUM for write_raw: io::Error::new with a format!-built message (the message is opaque to the spec; only the kind is observed), the ? before any write, and a call-log writer model.	0, 1, 3, 8, 11
 raw-frame-rfc8878-conformance	round-trip	RawFrame (Lean), Rfc8878.decodeFrame / decodeStream (Lean), frame::write_raw (through write-raw-layout)	∀ content with |content| ≤ WINDOW_MAX, ∀ cs: Rfc8878.decodeFrame(RawFrame(content, cs)) = Ok(content, declaredContentSize = |content|, consumed = |RawFrame(content, cs)|). When cs = Xxh64, the trailing field equals the RFC's Content_Checksum, which the RFC defines as le32(low32(XXH64(0, content))). ∀ a, b, ca, cb: Rfc8878.decodeStream(RawFrame(a, ca) ++ RawFrame(b, cb)) = a ++ b. With write-raw-layout this gives: any RFC-conforming decoder returns exactly the content write_raw was given. An optional refinement leg is shared with the decoder specs: aterm_zstd::Decoder::new(RawFrame(c, cs)).read_to_end = c.	decode_frames::every_raw_frame_decodes_to_its_content, decode_frames::concatenated_raw_frames_decode_as_one_stream (through the Decoder leg)	MEDIUM on the Lean side: list append/split lemmas over the block chunking, and an inductive model of the frame grammar. The optional Decoder leg is HARD: it pulls in the whole decode core (the Read adapter, Vec, loops, &mut self and the window buffer).	0, 1, 5, 7, 10, 14
 ```
-
-### Distribution by kind (7)
-
-| kind | count | ids |
-|---|---|---|
-| contract | 2 | write-raw-layout, write-raw-refuses-oversize |
-| refinement | 1 | xxh64-oneshot-refines-model |
-| invariant | 1 | xxh64-streaming-refines-oneshot |
-| table-property | 1 | xxh64-model-reference-vectors |
-| no-panic/bounds | 1 | xxh64-update-no-panic |
-| round-trip | 1 | raw-frame-rfc8878-conformance |
-
-### Proof dependency order
-
-`xxh64-model-reference-vectors` (Lean only) and the `ContentSize::of`/`block_header` scalar
-lemmas → `xxh64-update-no-panic` → `xxh64-oneshot-refines-model` → `xxh64-streaming-refines-oneshot`
-→ `write-raw-refuses-oversize` and `write-raw-layout` (each cites `xxh64`'s ensures) →
-`raw-frame-rfc8878-conformance` (Lean over `RawFrame`, lifted to the Rust fn through `write-raw-layout`).
 
 ## 2. Test → spec map (TSV)
 
@@ -124,23 +86,33 @@ tests/decode_frames.rs	every_raw_frame_decodes_to_its_content	raw-frame-rfc8878-
 tests/decode_frames.rs	concatenated_raw_frames_decode_as_one_stream	raw-frame-rfc8878-conformance	write-raw-layout
 ```
 
-## 3. Coverage
+## 5. Notes on the tests
 
-- 18 tests read. 14 map to one of the 7 specs. 4 are not spec samples (§4).
-- The biggest collapses are `write-raw-layout` (4 primary), `xxh64-oneshot-refines-model`
-  (3 primary, 577 + 14 + 6 recorded answers) and `xxh64-streaming-refines-oneshot`
-  (3 primary).
-- `xxh64-oneshot-refines-model` and `xxh64-model-reference-vectors` are two legs of one
-  claim. The Rust fn equals the model, and the model equals the reference answers. The
-  vector tests go only when both legs are proved.
+1. `digest_then_continue`'s claim that a digest leaves the hasher usable holds by typing:
+   `digest` takes `&self`. What it adds, that updates after a digest stay correct, is
+   `xxh64-streaming-refines-oneshot`'s.
+2. `sanity()` is defined twice, in `src/xxh64.rs`'s test module and `tests/support/mod.rs`.
+   The Lean model needs one definition.
 
-## 4. Tests that are not spec samples
+## 6. Proof order
 
-Status (2026-10-16): `xxh64_recorded::a_wrong_seed_or_length_is_caught` is deleted. The two `libzstd::` entries were not found: their test file no longer exists on this branch.
+Every §1 spec that touches a Rust fn needs gaps 1 (slices and byte lists) and 3 (calls, casts,
+shifts and loops in reflected bodies) beyond gap 0.
 
-Status (2026-10-17): all four are gone, and so is their table. The three `libzstd::` tests went with their test file when the `zstd` dev-dependency left; its raw-frame cases now run on aterm's decoder in `tests/decode_frames.rs`. Two were negative controls on a checksum comparison, and two tested libzstd itself, not aterm code. The `WINDOW_MAX` doc in `src/frame.rs` names libzstd's `ZSTD_WINDOWLOG_LIMIT_DEFAULT` (2^27) and its streaming decoder's `frameParameter_windowTooLarge` cap (2^27 + 1), so the comments no longer disagree.
+1. `xxh64-model-reference-vectors`: Lean only, the evidence base for every XXH64 spec. It
+   retires nothing alone.
+2. The scalar core of `write-raw-refuses-oversize` (`ContentSize::of`, `flag`,
+   `block_header`): a range `match` on `usize`, casts the arms make exact, and shifts, the
+   nearest widening of the `u8` range match seal `150efe4a` admits. These are the lemmas
+   `write-raw-layout` builds on. `write_raw` itself waits on the writer model (gaps 8, 11).
+3. `xxh64-update-no-panic`: `usize` bounds arithmetic from `buffered < 32` alone,
+   `omega`-class once slices and `&mut self` are carried, and the first conjunct of `Inv`.
+4. `xxh64-oneshot-refines-model`, then `xxh64-streaming-refines-oneshot` from the same
+   stripe-fold lemma plus `Inv`. With items 1 and 3 they retire every XXH64 test.
+5. `write-raw-layout`, then `raw-frame-rfc8878-conformance`, which needs the `Rfc8878` model
+   and the model-to-code surface (gap 10).
 
-## 5. Implied specs that look wrong, or disagree with the code
+## 7. The encoder (`src/encode`)
 
 1. **Resolved: `digest_then_continue` carries no redundant ownership doc.** It tests only that
    updates after `digest(&self)` produce the streaming digest (`xxh64-streaming-refines-oneshot`).
@@ -205,7 +177,7 @@ Notation, beyond §0:
   and `flush()` calls, then `finish()`, against a `LogWriter` whose calls all succeed.
   `fed(ops)` is the concatenation of every `b` written.
 - `Rfc8878` (§0) is needed here in full: compressed blocks (§3.1.1.3), Huffman literals
-  (§4.2), FSE sequences (§4.1) and repeat offsets (§3.1.1.5), not only raw and RLE blocks.
+  (§4.2), FSE sequences (§4.1) and repeat offsets (§3.1.1.5).
 - `block_max(o) = min(128 KiB, 2^wlog)` (§3.1.1.2.4), and `cap(o) = 2·2^wlog + 2·block_max(o)`.
 
 ```tsv

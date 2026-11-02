@@ -209,7 +209,7 @@ pub(crate) fn tape_holds(read: &Recovered, secret: &str) -> bool {
 /// `git <args>` in `dir`, hermetic, asserted ok.
 fn git(dir: &Path, args: &[&str]) {
     let out = aterm_uds::deadline::output_until(
-        aterm_uds::spawnfd::command(aterm_uds::os_path!("git"))
+        aterm_uds::spawnfd::command(crate::test_program::git())
             .args(args)
             .current_dir(dir)
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -356,6 +356,9 @@ fn what_the_shells_startup_and_the_settings_hold_never_reaches_the_tape() {
     let worker = WorkerEnv::from_env(vec![
         format!("HOME={}", home.display()),
         "SHELL=/bin/zsh".to_string(),
+        // On Windows Claude Code's start names Git Bash whatever SHELL says
+        // (`shell_startup::tool_kinds`), so the tool's zsh is named on every host.
+        "CLAUDE_CODE_SHELL=/bin/zsh".to_string(),
         format!("CLAUDE_CONFIG_DIR={}", claude.display()),
     ]);
     let tape = MemoryTape::over(&Fx::os());

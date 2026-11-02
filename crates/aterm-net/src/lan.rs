@@ -104,8 +104,7 @@ impl Connection {
     }
     /// Interrupt this exact connection without exposing another reader/writer.
     pub fn cancellation(&self) -> io::Result<Cancellation> {
-        let stream = self.stream.try_clone()?;
-        aterm_uds::keep_out_of_children(&stream)?;
+        let stream = aterm_uds::kept_out(|| self.stream.try_clone())?;
         Ok(Cancellation(stream))
     }
     /// Inspect an accepted or already connected socket without sending bytes.
@@ -174,8 +173,7 @@ impl Connection {
         }
         native::socket_policy(stream, bound, scope == Scope::Lan)?;
         let observation = observe(local, peer, scope, bound, until)?;
-        let witness = stream.try_clone()?;
-        aterm_uds::keep_out_of_children(&witness)?;
+        let witness = aterm_uds::kept_out(|| stream.try_clone())?;
         Ok(Proof {
             witness,
             scope,
@@ -233,12 +231,7 @@ impl Connection {
             }
             Scope::Loopback => {}
         }
-        Self::connected(
-            crate::tcp_connect::connect_timeout_kept(peer, within)?,
-            scope,
-            None,
-            until,
-        )
+        Self::connected(aterm_uds::connect_tcp(&peer, within)?, scope, None, until)
     }
 
     /// Transfer the socket to TLS and keep its bound observation for repeated
@@ -380,11 +373,33 @@ fn local_attachments(
     local: Option<SocketAddr>,
     selected: Option<u32>,
 ) -> io::Result<Vec<Attachment>> {
+    local_attachments_from(
+        aterm_uds::network::interfaces()?,
+        local,
+        selected,
+        native::index,
+        native::physical,
+    )
+}
+
+fn local_attachments_from(
+    interfaces: impl IntoIterator<Item = aterm_uds::network::InterfaceAddress>,
+    local: Option<SocketAddr>,
+    selected: Option<u32>,
+    mut interface_index: impl FnMut(&str) -> io::Result<u32>,
+    mut interface_physical: impl FnMut(&str) -> io::Result<bool>,
+) -> io::Result<Vec<Attachment>> {
     let mut candidates = Vec::new();
-    for entry in aterm_uds::network::interfaces()? {
+    for entry in interfaces {
+        // An explicit IPv4 source cannot match any other raw address. Skip
+        // those before an index lookup, which can enumerate interfaces again.
+        // IPv6 still needs the index to validate and remove an embedded zone.
+        if local.is_some_and(|local| local.is_ipv4() && entry.address != local.ip()) {
+            continue;
+        }
         // An unrelated interface can disappear during enumeration. If it was
         // the selected attachment, the candidate set remains empty and refuses.
-        let Ok(index) = native::index(&entry.name) else {
+        let Ok(index) = interface_index(&entry.name) else {
             continue;
         };
         if selected.is_some_and(|selected| index != selected) {
@@ -394,7 +409,7 @@ fn local_attachments(
         if local.is_some_and(|local| address != local.ip()) {
             continue;
         }
-        let physical = native::physical(&entry.name)?;
+        let physical = interface_physical(&entry.name)?;
         // Preserve unknown masks as ineligible evidence. A listener must still
         // detect another interface using its address, even when that interface
         // has no usable prefix. Connected-route filtering rejects a zero mask.

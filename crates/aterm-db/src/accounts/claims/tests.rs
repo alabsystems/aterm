@@ -1284,3 +1284,95 @@ fn an_unrewritable_ring_state_is_moved_aside_and_claims_go_on() {
     );
     assert!(std::fs::symlink_metadata(&state).unwrap().is_file());
 }
+
+#[test]
+fn roster_denied_binding_cannot_write_or_project_claim_rows() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let caps = Caps::default();
+    let now = at(D, 60);
+    write_at(&lab.paths[0], &row(1, now), now, caps).unwrap();
+    // Mac 1 writes a claim row with a spoofed label ("m1") to try to evade label-only filtering.
+    let spoofed = json!({"counter": 1, "until": now + DAY, "label": "m1", "claims": ["stolen@example.invalid"]});
+    write_at(&lab.paths[1], &spoofed, now, caps).unwrap();
+    repair_commons_at(&lab, 6, &[now, now]);
+
+    let m1_machine = read_at(&lab.paths[0], now, caps).unwrap().me;
+    let m2_machine = read_at(&lab.paths[1], now, caps).unwrap().me;
+    assert_eq!(
+        counter(&read_at(&lab.paths[0], now, caps).unwrap(), &m2_machine),
+        Some(1),
+        "CONTROL: Mac 1's row is visible before roster denial"
+    );
+
+    let m2_binding = lab.bootstrap(1).request().unwrap().binding().clone();
+    let publish_roster = |roster_toml: &str| {
+        let admin = aterm_secrets::client::admin_open(&lab.paths[0]).unwrap();
+        let mut doc = admin.doc.clone();
+        doc.set_entry(
+            &aterm_secrets::text::Audience::Everyone,
+            aterm_secrets::SWARM_ROSTER_ENTRY,
+            roster_toml.as_bytes(),
+        )
+        .unwrap();
+        aterm_secrets::client::admin_publish(&lab.paths[0], &admin, &doc).unwrap();
+        aterm_secrets::client::sync(&lab.paths[1], None).unwrap();
+    };
+
+    // 1. Deny Mac 1 by recipient/label in aterm-swarm-roster.
+    let m1_rec = aterm_secrets::client::machine_identity(&lab.paths[0])
+        .unwrap()
+        .recipient()
+        .to_bech32();
+    let m2_rec = aterm_secrets::client::machine_identity(&lab.paths[1])
+        .unwrap()
+        .recipient()
+        .to_bech32();
+    publish_roster(&format!(
+        "deny_labels = [\"m2\"]\n\n[[member]]\nlabel = \"m1\"\nvault_name = \"m1\"\nrecipient = \"{m1_rec}\"\n\n[[member]]\nlabel = \"m2\"\nvault_name = \"m2\"\nrecipient = \"{m2_rec}\"\n"
+    ));
+    let read0 = read_at(&lab.paths[0], now, caps).unwrap();
+    assert_eq!(counter(&read0, &m1_machine), Some(1));
+    assert_eq!(
+        counter(&read0, &m2_machine),
+        None,
+        "denied recipient's row must be excluded even with spoofed body label"
+    );
+    assert!(
+        read_at(&lab.paths[1], now, caps)
+            .ok()
+            .is_none_or(|read1| read1.writable.is_err()),
+        "denied Mac must refuse read or report writable = Err"
+    );
+    assert!(
+        write_at(&lab.paths[1], &row(2, now + 10), now + 10, caps).is_err(),
+        "denied Mac must not write new claim rows"
+    );
+
+    // 2. Deny Mac 1 by writer key, incarnation, or machine id in deny_nodes (even when its
+    // recipient is omitted from [[member]]).
+    for denied_hex in [
+        aterm_codec::hex::encode_lower(m2_binding.writer()),
+        aterm_codec::hex::encode_lower(m2_binding.incarnation()),
+        aterm_codec::hex::encode_lower(m2_binding.machine()),
+    ] {
+        publish_roster(&format!(
+            "deny_nodes = [\"{denied_hex}\"]\n\n[[member]]\nlabel = \"m1\"\nvault_name = \"m1\"\nrecipient = \"{m1_rec}\"\n"
+        ));
+        let read0 = read_at(&lab.paths[0], now, caps).unwrap();
+        assert_eq!(
+            counter(&read0, &m2_machine),
+            None,
+            "row signed by binding with denied {denied_hex} must be excluded"
+        );
+        assert!(
+            read_at(&lab.paths[1], now, caps)
+                .ok()
+                .is_none_or(|read1| read1.writable.is_err()),
+            "local Mac with denied {denied_hex} must refuse read or report writable = Err"
+        );
+        assert!(
+            write_at(&lab.paths[1], &row(2, now + 10), now + 10, caps).is_err(),
+            "local Mac with denied {denied_hex} must not write claim rows"
+        );
+    }
+}

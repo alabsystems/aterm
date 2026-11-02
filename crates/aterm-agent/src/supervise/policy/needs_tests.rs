@@ -588,7 +588,7 @@ fn misread_by(by: &NoneWords<'_>) -> Vec<String> {
 }
 
 fn misread(row: &NeedsRow, report: &str, by: &NoneWords<'_>) -> Option<String> {
-    let named: Vec<String> = needs_lines_by(report, by)
+    let named: Vec<String> = needs_lines_by(report, by, wrap_join)
         .needs
         .iter()
         .map(|n| sanitized(n))
@@ -732,4 +732,116 @@ fn a_hyphenated_needs_you_head_is_a_head() {
             "{line:?}"
         );
     }
+}
+
+/// THE GUARD'S CUT TAKES NO GO-AHEAD JOIN (the merge of 2026-10-29 with main's [`apart`]): the
+/// irreversible guard reads [`without_needs`], whose walk ([`needs_lines`]) joins a need's
+/// wrapped rows by [`wrap_join`] alone; only [`go_ahead_view`] passes [`go_ahead_wrap`]. For
+/// every text of the go-ahead's corpus (every table row at every width, every repro, every echo)
+/// the guard's walk books no row only the go-ahead's join takes, and on every pair of rows
+/// [`wraps`] is main's veto ([`apart`]) and the base's lowercase rule (246d1ddc2f: a row that
+/// opens lowercase or with a digit), computed here from those two alone, with no quote mark
+/// passed over and no mid-clause stop read. The go-ahead's join only adds to it: where the rule
+/// joins, it joins as the guard does. The control: the go-ahead's view takes rows the guard's
+/// does not in some text, so the walk the guard reads is not that view.
+#[test]
+fn the_guards_cut_takes_no_go_ahead_join() {
+    use crate::supervise::policy::go_ahead::tests::guard_corpus;
+    let base_rule = |need: &str, next: &str| {
+        !apart(need, next)
+            && unquoted(next)
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_lowercase() || c.is_ascii_digit())
+    };
+    let mut wrong = Vec::new();
+    let mut viewed = 0;
+    for text in guard_corpus() {
+        if !needs_lines(&text).moved.is_empty() {
+            wrong.push(format!("the guard's walk took a go-ahead row: {text:?}"));
+        }
+        let rows: Vec<&str> = text.lines().collect();
+        for pair in rows.windows(2) {
+            let base = base_rule(pair[0], pair[1]);
+            if wraps(pair[0], pair[1]) != base {
+                wrong.push(format!("wraps is not the base rule: {pair:?}"));
+            }
+            if base && go_ahead_wrap(pair[0], pair[1]) != Some(false) {
+                wrong.push(format!(
+                    "the go-ahead's join reads a wrap otherwise: {pair:?}"
+                ));
+            }
+        }
+        viewed += usize::from(!go_ahead_view(&text).moved.is_empty());
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    assert!(
+        viewed > 0,
+        "control: no text's need took a row in the go-ahead's view alone"
+    );
+}
+
+/// THE TURN'S LAST WORD ON NEEDS, READ OVER ITS EARLIER MESSAGES BY PARAGRAPH (the second review,
+/// 2026-11-01): the readers join a turn's messages with a blank line, so a paragraph that says no
+/// need stands retracts every need named before it, wherever it sits; a need said after it stands;
+/// one paragraph that names both keeps its need; a last message that says none retracts them all.
+/// The go-ahead reader's cut keeps the retracted part's prose without its needs.
+/// Negative control: [`standing_before`] reading the last message alone (the first round's rule)
+/// keeps the need an earlier paragraph retracted.
+#[test]
+fn the_turns_last_word_on_needs_reads_its_earlier_messages_by_paragraph() {
+    let need = "./check.sh fails on main. NEEDS YOU: decide whether to delete tests/test_clock.sh.";
+    let none = "The flake was mine: fixed it and pushed. NEEDS YOU: nothing";
+    let named = |before: &str, last: &str| {
+        standing_before(Some(before), last).map_or_else(Vec::new, needs_you)
+    };
+    let retracted = format!("{need}\n\n{none}");
+    assert_eq!(named(&retracted, "LANDED"), Vec::<String>::new());
+    assert_eq!(
+        standing_before(Some(&retracted), "LANDED"),
+        Some(none),
+        "the none is read, so a need an earlier point raised comes down"
+    );
+    assert!(says_no_needs(
+        standing_before(Some(&retracted), "LANDED").unwrap_or_default()
+    ));
+    assert_eq!(
+        named(
+            &format!("{retracted}\n\nNEEDS YOU: rotate the deploy key"),
+            "LANDED"
+        ),
+        ["rotate the deploy key"],
+        "a need after the retraction stands"
+    );
+    assert_eq!(
+        named(&format!("{need}\nNEEDS YOU: nothing"), "LANDED"),
+        ["decide whether to delete tests/test_clock.sh."],
+        "one paragraph that names both keeps its need"
+    );
+    assert_eq!(
+        named(need, "LANDED"),
+        ["decide whether to delete tests/test_clock.sh."]
+    );
+    assert_eq!(
+        standing_before(Some(need), "NEEDS YOU: nothing\nLANDED"),
+        None
+    );
+    assert_eq!(standing_before(None, "LANDED"), None);
+    // The go-ahead reader's view: the prose kept, the retracted need cut.
+    let cut = retracted_cut(&retracted, "LANDED");
+    assert!(
+        cut.contains("./check.sh fails on main.") && cut.contains("fixed it"),
+        "{cut}"
+    );
+    assert!(needs_you(&cut).is_empty(), "{cut}");
+    assert_eq!(
+        retracted_cut(need, "LANDED"),
+        need,
+        "nothing retracted, nothing cut"
+    );
+    let all = retracted_cut(need, "NEEDS YOU: nothing");
+    assert!(
+        all.contains("./check.sh fails on main.") && needs_you(&all).is_empty(),
+        "{all}"
+    );
 }

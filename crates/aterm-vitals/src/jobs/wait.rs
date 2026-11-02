@@ -7,7 +7,8 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use super::{
-    Fd, FdKind, JobProc, Knote, KnoteFilter, LanesSeen, Standing, TcpState, TtyMode, Wait, WaitName,
+    Fd, FdKind, JobProc, Knote, KnoteFilter, LanesSeen, Standing, StartWait, TcpState, TtyMode,
+    Wait, WaitName,
 };
 
 /// Darwin `PIPE_WANTR`: a reader sleeps on this end.
@@ -67,20 +68,21 @@ impl TierB {
 #[must_use]
 pub const fn rank(name: WaitName) -> u8 {
     match name {
-        WaitName::ProgramCheck => 0,
-        WaitName::TtyPassword => 1,
-        WaitName::TtyBuiltinRead => 2,
-        WaitName::TtyRaw => 3,
-        WaitName::Serves => 4,
-        WaitName::Pipe => 5,
-        WaitName::PipeFull => 6,
-        WaitName::Tcp => 7,
-        WaitName::Follow => 8,
-        WaitName::Listen => 9,
-        WaitName::Timer => 10,
-        WaitName::EventLoop => 11,
-        WaitName::Kernel => 12,
-        _ => 13,
+        WaitName::ProgramCheck | WaitName::Translating => 0,
+        WaitName::Memory => 1,
+        WaitName::TtyPassword => 2,
+        WaitName::TtyBuiltinRead => 3,
+        WaitName::TtyRaw => 4,
+        WaitName::Serves => 5,
+        WaitName::Pipe => 6,
+        WaitName::PipeFull => 7,
+        WaitName::Tcp => 8,
+        WaitName::Follow => 9,
+        WaitName::Listen => 10,
+        WaitName::Timer => 11,
+        WaitName::EventLoop => 12,
+        WaitName::Kernel => 13,
+        _ => 14,
     }
 }
 
@@ -89,6 +91,8 @@ pub const fn rank(name: WaitName) -> u8 {
 pub const fn standing_of(name: WaitName) -> Standing {
     match name {
         WaitName::ProgramCheck
+        | WaitName::Translating
+        | WaitName::Memory
         | WaitName::TtyPassword
         | WaitName::TtyBuiltinRead
         | WaitName::TtyRaw
@@ -113,7 +117,9 @@ pub struct Scene<'a> {
     pub d_age: &'a HashMap<u32, u64>,
     /// How a process outside this job counts (its job's standing).
     pub elsewhere: &'a HashMap<u32, Standing>,
-    /// Whether macOS program-check holds are reported as [`WaitName::ProgramCheck`].
+    /// Whether a leaf that has not started for a named reason reads its start wait: macOS's
+    /// program check holding it as [`WaitName::ProgramCheck`], Rosetta translating it as
+    /// [`WaitName::Translating`].
     pub program_check: bool,
 }
 
@@ -163,8 +169,14 @@ pub fn name_job(
             best = Some(w);
         }
     }
-    if let Some(w) = best.as_ref().filter(|w| w.name == WaitName::ProgramCheck) {
-        // A held leaf is not reading the terminal, whatever mode its program left it in.
+    if let Some(w) = best.as_ref().filter(|w| {
+        matches!(
+            w.name,
+            WaitName::ProgramCheck | WaitName::Translating | WaitName::Memory
+        )
+    }) {
+        // A held or translating leaf, and a front waiting for its claim, is not reading the
+        // terminal, whatever mode its program left it in.
         return w.clone();
     }
     if job.behind {
@@ -247,8 +259,31 @@ fn leaf_wait(
     let wchan = p.wchan.as_deref().unwrap_or("");
     let fds: &[Fd] = p.fds.as_deref().unwrap_or(&[]);
     let mk = |n: WaitName| Wait::bare(n, standing_of(n), pid, name);
-    if scene.program_check && p.program_check {
-        return Some(mk(WaitName::ProgramCheck));
+    match p.start_wait {
+        Some(StartWait::ProgramCheck) if scene.program_check => {
+            return Some(mk(WaitName::ProgramCheck));
+        }
+        // Rosetta translates it before its first instruction, as the program check holds one:
+        // work in line, whatever its descriptors say.
+        Some(StartWait::Translating) if scene.program_check => {
+            return Some(mk(WaitName::Translating));
+        }
+        _ => {}
+    }
+    // A build's front that runs no child waits for its claim, whatever its descriptors say (its
+    // look at the ledger is a timer's; what it inherited is its caller's), unless the kernel holds
+    // it.
+    if let Some(ahead) = &p.claims_ahead {
+        if scene
+            .d_age
+            .get(&pid)
+            .is_some_and(|&ms| ms >= super::KERNEL_WAIT_MS)
+        {
+            return Some(mk(WaitName::Kernel));
+        }
+        let mut w = mk(WaitName::Memory);
+        w.standing = memory_standing(scene, ahead);
+        return Some(w);
     }
 
     // Linux names no pipe's waiter: the wait channel says the process sleeps on a pipe, and the
@@ -393,6 +428,27 @@ fn leaf_wait(
         return Some(mk(WaitName::Kernel));
     }
     None
+}
+
+/// How a wait for memory behind the claims of `ahead` counts, as a wait on a lock counts by its
+/// holder: legitimate with none ahead (memory no claim holds), or while any claim ahead is held
+/// by a process no other job holds (a build outside every tab, a claim whose build is gone but
+/// its holder keeps), or by one whose job counts as legitimate (running, waiting on something
+/// legitimate itself, or parked by the person); else as the best of their jobs' standings (a
+/// holder stopped outside job control, or one stuck itself), so a front behind them can be
+/// stuck too.
+fn memory_standing(scene: &Scene<'_>, ahead: &[u32]) -> Standing {
+    let mut best: Option<Standing> = None;
+    for pid in ahead {
+        match scene.elsewhere.get(pid) {
+            None | Some(Standing::Legit) => return Standing::Legit,
+            Some(Standing::Capable) => best = Some(Standing::Capable),
+            Some(Standing::Capped) => {
+                best.get_or_insert(Standing::Capped);
+            }
+        }
+    }
+    best.unwrap_or(Standing::Legit)
 }
 
 /// The processes holding the far end of the pipe a `pipe` or `pipe-full` wait sleeps on: its

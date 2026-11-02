@@ -2366,6 +2366,26 @@ fn a_need_told_is_counted_apart_from_escalations_and_waits() {
     );
 }
 
+/// Land's instruction as the person's switch over a held tab types it opens with its why (v6
+/// §14.17 item 3): a journal line reads it as Land's act, clipped inside the why or not.
+#[test]
+fn the_switchs_ask_opens_with_lands_words_clipped_or_whole() {
+    use crate::supervise::policy::turn_end::{LAND, switch_why};
+    let mark = crate::harness::harness_mark!();
+    let ask = format!(
+        "{mark} {}{}",
+        switch_why("All done."),
+        LAND.strip_prefix(mark).unwrap_or(LAND)
+    );
+    assert!(super::opens_with_land_words(&ask), "{ask}");
+    let clipped: String = ask.chars().take(40).collect();
+    assert!(super::opens_with_land_words(&clipped), "{clipped}");
+    assert!(
+        !super::opens_with_land_words(&format!("{mark} You stopped. Keep going.")),
+        "no why, no Land"
+    );
+}
+
 fn land_note(t: i64, sid: &str, why: &str, ended: Option<i64>) -> JournalRecord {
     let mut r = JournalRecord::of_line(
         t,
@@ -2764,7 +2784,7 @@ fn the_task_doors_rows_count_no_line() {
 /// words, which quote the agent's own park.
 #[test]
 fn a_go_ahead_decision_says_the_owners_standing_go_ahead() {
-    let typed = "[aterm harness] Proceed now with your own work: build, test, commit…";
+    let typed = crate::supervise::policy::go_ahead::GO_AHEAD_ANSWER;
     assert_eq!(&*prose_answer_words(RULE_GO_AHEAD, typed), GO_AHEAD_DID);
     assert_eq!(
         crate::harness::acts::self_claim_act(RULE_GO_AHEAD).map(|(word, _)| word),

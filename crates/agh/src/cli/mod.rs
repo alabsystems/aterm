@@ -6,14 +6,19 @@
 
 pub mod args;
 mod cmd_api;
+mod cmd_asset;
 mod cmd_auth;
 mod cmd_can;
 mod cmd_content;
+mod cmd_credential;
 mod cmd_git;
+mod cmd_intent;
 mod cmd_meta;
 mod cmd_policy;
 mod cmd_rate;
+mod cmd_ref;
 mod cmd_release;
+mod cmd_release_write;
 mod cmd_repo;
 mod cmd_wait;
 mod cmd_whoami;
@@ -25,6 +30,7 @@ pub mod project;
 pub mod schema;
 mod taping;
 pub mod verbs;
+pub mod write_out;
 
 use std::io::IsTerminal;
 use std::sync::Arc;
@@ -37,13 +43,18 @@ use crate::client::{Github, GithubBuilder, Meter};
 use crate::config::{self, Dirs, Validated};
 use crate::download::DigestCheck;
 use crate::error::{Error, IdentityRef, Replay, Result, Sub};
-use crate::fx::Fx;
 use crate::fx::tape::TapeHeader;
+use crate::fx::{Fx, Mode};
+#[cfg(any(test, debug_assertions))]
+use crate::git::HelperCommand;
 #[cfg(any(test, debug_assertions))]
 use crate::identity::MapEnv;
 use crate::identity::vault::{self, Adoption};
 use crate::identity::{EnvSource, ProcessEnv};
 use crate::model::Sha256Digest;
+#[cfg(any(test, debug_assertions))]
+use crate::notify::NoNotifier;
+use crate::notify::{Notifier, SessionNotifier};
 use crate::page::{Consistency, End};
 use crate::policy::Router;
 use crate::rate::{RateBook, RateSnapshot};
@@ -203,6 +214,19 @@ pub struct Ctx {
     pub retry: RetryPolicy,
     /// `--timeout`, which `run` sets before the verb runs.
     pub timeout: Option<std::time::Duration>,
+    /// Where `--notify` posts go: `SessionNotifier::from_env` in production, `NoNotifier` under
+    /// `for_tests`.
+    pub notifier: Arc<dyn Notifier>,
+    /// Tests: the helper command the git runner mounts (`with_git_helper`). `None`, and every
+    /// release build, which has no such field, mount `HelperCommand::current()`. Test-only
+    /// because the builder setter it feeds, `GithubBuilder::git_helper_for_tests`, is.
+    #[cfg(any(test, debug_assertions))]
+    pub git_helper: Option<HelperCommand>,
+    /// Tests: the git remotes `with_git_remote` mapped, slug → local repository, in the order
+    /// given. `Ctx::github()` hands each to `GithubBuilder::git_remote_for_tests`. Private, like
+    /// M1's `github` field, so no literal outside agh can build a `Ctx`.
+    #[cfg(any(test, debug_assertions))]
+    git_remotes: Vec<(String, std::path::PathBuf)>,
     github: Option<Github>,
     /// What vault adoption found for this command line, once the client was built with no
     /// agh.toml (design §6.10).
@@ -273,6 +297,11 @@ impl Ctx {
             redactor: Redactor::new(),
             retry: RetryPolicy::STANDARD,
             timeout: None,
+            notifier: Arc::new(SessionNotifier::from_env(&ProcessEnv)),
+            #[cfg(any(test, debug_assertions))]
+            git_helper: None,
+            #[cfg(any(test, debug_assertions))]
+            git_remotes: Vec::new(),
             github: None,
             adoption: None,
             anonymous: false,
@@ -305,6 +334,9 @@ impl Ctx {
             redactor: Redactor::new(),
             retry: RetryPolicy::NONE,
             timeout: None,
+            notifier: Arc::new(NoNotifier),
+            git_helper: None,
+            git_remotes: Vec::new(),
             github: None,
             adoption: None,
             anonymous: false,
@@ -334,6 +366,31 @@ impl Ctx {
     #[must_use]
     pub const fn with_stdin_terminal(mut self, stdin: bool) -> Ctx {
         self.stdin_is_terminal = stdin;
+        self
+    }
+
+    /// The same context with `notifier`.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn with_notifier(mut self, notifier: Arc<dyn Notifier>) -> Ctx {
+        self.notifier = notifier;
+        self
+    }
+
+    /// The same context mounting `helper` (tests: `CARGO_BIN_EXE_agh`).
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn with_git_helper(mut self, helper: HelperCommand) -> Ctx {
+        self.git_helper = Some(helper);
+        self
+    }
+
+    /// The same context mapping `slug` to the local repository at `path` for git (§4.6.13).
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn with_git_remote(mut self, slug: &str, path: &std::path::Path) -> Ctx {
+        self.git_remotes
+            .push((slug.to_string(), path.to_path_buf()));
         self
     }
 
@@ -428,12 +485,18 @@ impl Ctx {
         self.client(Router::empty())
     }
 
-    /// The client this context configures, over `router`.
+    /// The client this context configures, over `router`: the write journal's directories when
+    /// there are any, the notifier, and (test and debug builds only) the git helper and remotes
+    /// a test set. Under a tape the rate book is none whatever `dirs` is: it is not on the tape.
     fn client(&self, router: Router) -> Github {
-        let rate_book = self
-            .dirs
-            .as_ref()
-            .map_or_else(RateBook::none, |dirs| RateBook::at(dirs.rate()));
+        let taped = matches!(
+            self.fx.mode(),
+            Mode::Recording | Mode::Replaying | Mode::Rerecording
+        );
+        let rate_book = match &self.dirs {
+            Some(dirs) if !taped => RateBook::at(dirs.rate()),
+            _ => RateBook::none(),
+        };
         let mut builder = GithubBuilder::new(router)
             .endpoints(self.endpoints.clone())
             .env(self.env.clone())
@@ -442,9 +505,21 @@ impl Ctx {
             .caller(&self.caller)
             .retry(self.retry)
             .redactor(self.redactor.clone())
-            .backstop(self.timeout);
+            .backstop(self.timeout)
+            .notifier(self.notifier.clone());
+        if let Some(dirs) = &self.dirs {
+            builder = builder.journal(dirs.clone());
+        }
         if let Some(transport) = &self.transport {
             builder = builder.transport(transport.clone());
+        }
+        #[cfg(any(test, debug_assertions))]
+        if let Some(helper) = &self.git_helper {
+            builder = builder.git_helper_for_tests(helper.clone());
+        }
+        #[cfg(any(test, debug_assertions))]
+        for (slug, path) in &self.git_remotes {
+            builder = builder.git_remote_for_tests(slug, path);
         }
         builder.build()
     }
@@ -681,6 +756,9 @@ impl Receipt {
         if let Some((old, new)) = &meter.moved {
             self.notes.push(("moved".into(), format!("{old}->{new}")));
             self.must_print = true;
+        }
+        if let Some(notify) = &meter.notify {
+            self.notes.push(("notify".into(), notify.clone()));
         }
         let low = meter
             .rate

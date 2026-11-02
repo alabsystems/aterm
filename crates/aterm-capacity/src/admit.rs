@@ -4,8 +4,10 @@
 //! ADMISSION: a [`Waiter`] enters the ledger, and each [`Waiter::poll`] reads the machine and
 //! the claims ahead of it and either admits it (a [`Claim`]) or names what it is short of
 //! ([`Shortfall`]). [`admit_with`] polls until it is admitted, saying once a minute what it
-//! waits for; it never gives up. Memory, cores and the quiet machine come back as the claims
-//! ahead end, so a need of them fits once its holders end. Disk does not: what a claim wrote
+//! waits for; it never gives up, unless its need asks to end behind holders that make no
+//! progress ([`Need::ends_when_stuck`], [`Error::Stuck`]). Memory, cores and the quiet machine
+//! come back as the claims ahead end, so a need of them fits once its holders end. Disk does
+//! not: what a claim wrote
 //! stays on its volume once it ends (a build's caches), so a claim's end gives back only the
 //! part of its reservation it never wrote, and only space freed (the build cache's relief, the
 //! window's disk watch, a person) raises what is free. A waiter whose disk need is more than its
@@ -47,6 +49,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::floor::GIB;
@@ -116,6 +119,30 @@ pub fn span(d: Duration) -> String {
 /// Now, unix ms (0 before the epoch).
 fn now_ms() -> u64 {
     aterm_time::unix_millis().unwrap_or(0)
+}
+
+/// TEST SEAM: append timestamp, pid and admission phase to this debug-only trace file.
+#[cfg(debug_assertions)]
+pub const TRACE_ENV: &str = "ATERM_CAPACITY_TRACE";
+
+fn trace(phase: &str) {
+    #[cfg(debug_assertions)]
+    {
+        use std::io::Write as _;
+        let Some(path) = std::env::var_os(TRACE_ENV).filter(|path| !path.is_empty()) else {
+            return;
+        };
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let line = format!("{} {} {phase}\n", now_ms(), std::process::id());
+            let _ = file.write_all(line.as_bytes());
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = phase;
 }
 
 /// Why `need` can never be admitted on the machine `reading` reads: all the memory that can ever be available there or more, its margin included ([`Reading::reachable`]: physical memory less what is wired, which what is available never reaches), unless it asks to be admitted alone ([`Need::alone`]), which takes all the machine has; or more disk than its volume holds above the floor. `None` when it can.
@@ -394,6 +421,13 @@ pub struct Holder {
     pub quiet: bool,
     /// Which claim it is: its place in the queue ([`Record::order`]).
     pub order: (u64, u32, u64),
+    /// How long its holder's process tree, with the processes it is credited with
+    /// ([`Self::credit`]), has made no progress, once that reached the waiter's bound
+    /// ([`aterm_toolchain::stall`]): read by the waiter, of a held claim only.
+    pub stalled: Option<Duration>,
+    /// The processes it is credited with ([`Record::credit`]: a VM's, outside its holder's tree),
+    /// whose work is its holder's.
+    pub credit: Vec<u32>,
 }
 
 impl fmt::Display for Holder {
@@ -433,6 +467,9 @@ impl fmt::Display for Holder {
         )?;
         if !self.checkout.is_empty() {
             write!(f, " in {}", self.checkout)?;
+        }
+        if let Some(span) = self.stalled {
+            write!(f, ", {}", aterm_toolchain::stall::no_progress(span))?;
         }
         Ok(())
     }
@@ -649,23 +686,33 @@ pub(crate) fn covered(pid: u32, records: &[&Record], procs: Option<&Procs>) -> b
 
 /// The claim among `records` that covers the builds of the process `pid` ([`covered_memory`]):
 /// the first held one of memory that asked to cover its tree ([`Need::covers`]) whose holder is
-/// `pid` or one of its ancestors in `procs`.
+/// `pid` or one of its ancestors in `procs`, or that credits `pid` or one of them ([`credits`]).
 fn covering_of<'r>(pid: u32, records: &[&'r Record], procs: Option<&Procs>) -> Option<&'r Record> {
     let ancestors = std::cell::OnceCell::new();
+    let line = || ancestors.get_or_init(|| procs.map(|p| p.ancestors(pid)).unwrap_or_default());
     records.iter().copied().find(|r| {
         r.held.is_some()
             && r.need.mem > 0
             && r.need.covers
-            && (r.pid == pid
-                || ancestors
-                    .get_or_init(|| procs.map(|p| p.ancestors(pid)).unwrap_or_default())
-                    .contains(&r.pid))
+            && (r.pid == pid || line().contains(&r.pid) || credits(r, pid, line()))
     })
+}
+
+/// CREDIT IS KINSHIP: whether the held claim `r` credits `pid` or one of `ancestors` (`pid`'s,
+/// parent first) with its use ([`Record::credit`]), so `pid` runs that claim's work as its
+/// holder's own tree would. A build's claim kept by a holder past the build's end credits what
+/// the build left running (BUILD-ADMIT): a nested build or claim under one of those is the
+/// claimed work going on, covered by that claim and never held to it, as under the claim's own
+/// holder; uncovered, it would claim again, and beside a claim admitted alone wait for the claim
+/// that waits for it.
+fn credits(r: &Record, pid: u32, ancestors: &[u32]) -> bool {
+    r.held.is_some() && r.credit.iter().any(|c| *c == pid || ancestors.contains(c))
 }
 
 /// Whether a held claim covers the builds of the process `pid` (BUILD-ADMIT): `pid` itself, or
 /// one of its ancestors in `procs`, holds a claim of memory that asked to cover its tree's builds
-/// ([`Need::covers`]). Modelled on [`covered`], which does this for quiet claims. Required, not a
+/// ([`Need::covers`]), or is credited by one ([`Record::credit`]: what a build that claim was kept
+/// for left running). Modelled on [`covered`], which does this for quiet claims. Required, not a
 /// nicety: [`counted`] keeps a nested claim from waiting on its ancestors, but every third party
 /// still counts both its reservation and its ancestor's, since [`Procs::trees`] credits each
 /// process to its nearest claimant, so the ancestor's stays near its whole need. A claim that
@@ -718,7 +765,7 @@ pub fn covering(
 }
 
 /// The claims a waiter of the process `pid` is held to: every other claim but those its
-/// ancestors hold or wait for. A waiter whose ancestor holds a claim is that admitted work going
+/// ancestors hold or wait for, and the held ones that credit it or an ancestor ([`credits`]). A waiter whose ancestor holds a claim is that admitted work going
 /// on (verify's run starting the lab's VM boot, which claims the VM's disk for itself), so it is
 /// held only to the other HELD claims: never to its ancestors', which end only once it has run,
 /// nor to any waiter, which waits for that work in turn. Held to either, it would wait for what
@@ -732,12 +779,11 @@ pub(crate) fn counted<'r>(
     procs: Option<&crate::Procs>,
 ) -> Vec<&'r Record> {
     let ancestors = procs.map(|p| p.ancestors(pid)).unwrap_or_default();
-    let inside = records
-        .iter()
-        .any(|r| r.held.is_some() && ancestors.contains(&r.pid));
+    let kin = |r: &Record| ancestors.contains(&r.pid) || credits(r, pid, &ancestors);
+    let inside = records.iter().any(|r| r.held.is_some() && kin(r));
     records
         .into_iter()
-        .filter(|r| !ancestors.contains(&r.pid) && (!inside || r.held.is_some()))
+        .filter(|r| !kin(r) && (!inside || r.held.is_some()))
         .collect()
 }
 
@@ -931,6 +977,8 @@ pub(crate) fn decide(
                 disk: r.disk.unwrap_or(0),
                 quiet: o.record.need.quiet.is_some(),
                 order: o.record.order(),
+                stalled: None,
+                credit: o.record.credit.clone(),
             })
             .collect();
         return Err(Shortfall { shorts, holders });
@@ -1112,6 +1160,49 @@ impl Claim {
         Ok(())
     }
 
+    /// A close-on-exec copy of its file's descriptor, which shares its lock: what a holder that
+    /// keeps the claim for another process is handed ([`Self::hand_off`], [`Self::adopt`]).
+    ///
+    /// # Errors
+    /// The `dup`'s.
+    #[cfg(unix)]
+    pub fn descriptor(&self) -> io::Result<std::os::fd::OwnedFd> {
+        self.laid.descriptor()
+    }
+
+    /// HAND IT OFF to the holder a copy of its descriptor was given ([`Self::descriptor`]): this
+    /// process forgets it, neither letting its lock go nor removing its file, so the claim is
+    /// held for as long as the holder holds that copy and ends when the holder lets it go or
+    /// dies. Its own descriptor closes at this process's exec or exit (it is close-on-exec),
+    /// which lets nothing go. Dropping a claim instead lets the lock go for every copy.
+    #[cfg(unix)]
+    pub fn hand_off(self) {
+        self.laid.hand_off();
+    }
+
+    /// ADOPT the claim at `path` whose descriptor `fd` is a copy of ([`Self::descriptor`], handed
+    /// on by [`Self::hand_off`]'s process): `fd` must open the file at `path`, a fresh open of it
+    /// must find its lock held, and `fd` must take that lock, so the holder is `fd`'s description
+    /// ([`Ledger`]'s proofs), before its record is read; a refusal lets nothing go. The claim is
+    /// then this process's: dropping it lets the lock go and removes the file, as its maker's
+    /// drop would have. It records no measured writes and no admission's details.
+    ///
+    /// # Errors
+    /// A proof that fails, or its record unread.
+    #[cfg(unix)]
+    pub fn adopt(fd: std::os::fd::OwnedFd, path: &Path) -> io::Result<Claim> {
+        let (record, laid) = Laid::adopt(fd, path)?;
+        Ok(Claim {
+            laid,
+            record,
+            waited: Duration::ZERO,
+            wrote_at: None,
+            quiet: None,
+            alone: None,
+            short: None,
+        })
+    }
+
     /// Say that its work has written `bytes` toward its disk need since it was admitted, as its
     /// holder measured them (the growth of the directories it writes): the volume's free space
     /// has lost them already, so a waiter counts only the rest of the need as reserved.
@@ -1132,11 +1223,21 @@ pub enum Polled {
     Admitted(Claim),
     /// Still waiting, short of what the shortfall names.
     Waiting(Waiter, Shortfall),
+    /// Its claim file was removed while it waited (the ledger's directory cleaned): it is in no
+    /// other session's queue and can never be admitted, so the wait is over. The error names
+    /// the file.
+    Gone(io::Error),
 }
 
 /// A claim in the queue, not yet admitted. It leaves the ledger when dropped. Until it is
 /// admitted its wait is marked where a ceiling over this process's tree reads it
 /// ([`aterm_toolchain::waits`]), saying at each look what it is short of and who holds that.
+/// Each look reads the process tree of every held claim it waits behind, with the processes
+/// that claim is credited with ([`aterm_toolchain::stall`], what it read shared by this process's
+/// waiters), and names a holder whose tree has made no progress for its bound
+/// ([`Holder::stalled`]); once every claim it waits behind is held by one, its mark says so
+/// ([`aterm_toolchain::waits::Stuck`]), and one whose need asks to ([`Need::ends_when_stuck`])
+/// ends its wait on the second such look in a row. Nobody signals the holder.
 #[derive(Debug)]
 pub struct Waiter {
     ledger: Ledger,
@@ -1146,7 +1247,29 @@ pub struct Waiter {
     at: Option<PathBuf>,
     since: Instant,
     mark: Option<aterm_toolchain::waits::Mark>,
+    /// How long a holder's tree may make no progress before it is called stuck: the need's
+    /// [`Need::stuck_ends`], else [`aterm_toolchain::stall::STALLED_AFTER`].
+    stalled_after: Duration,
+    /// How many of its looks in a row that read the holders, the last included, found its wait
+    /// stuck behind them ([`stuck`]): a look that only met the ledger's lock, or could not read
+    /// the ledger, read none and changes nothing.
+    stuck_looks: u32,
+    /// What the last look that read them found.
+    stuck: Option<aterm_toolchain::waits::Stuck>,
 }
+
+/// WHAT THIS PROCESS'S WAITERS HAVE READ OF THE HOLDERS THEY WAIT BEHIND, by ledger and holder
+/// pid ([`Waiter::read_holders`]): a process's CPU time and the bytes it wrote only grow, so a tree
+/// read alike twice did nothing between the reads, and a waiter that comes later counts a holder's
+/// stall from the first read of it that found its work as it is now, not from its own first look
+/// (a verify run's later stage behind the holder its earlier stage waited behind). An entry no
+/// waiter has read for [`STALL_KEPT`] goes.
+static STALLS: Mutex<
+    std::collections::BTreeMap<(PathBuf, u32), (aterm_toolchain::stall::Stall, Instant)>,
+> = Mutex::new(std::collections::BTreeMap::new());
+
+/// How long [`STALLS`] keeps what a waiter read of a holder that no waiter has read since.
+const STALL_KEPT: Duration = Duration::from_secs(3600);
 
 impl Waiter {
     /// Enter `ledger`'s queue for `need`, read on `machine` (its disk need is placed on the volume it reads).
@@ -1159,6 +1282,9 @@ impl Waiter {
             .then(|| machine.read(at.as_deref()).volume.map(|v| v.mount))
             .flatten();
         let mark = aterm_toolchain::waits::Mark::begin(&format!("capacity: {} waits", need.what));
+        let stalled_after = need
+            .stuck_ends
+            .unwrap_or(aterm_toolchain::stall::STALLED_AFTER);
         let (record, laid) = ledger.lay(&need, now_ms())?;
         Ok(Waiter {
             ledger: ledger.clone(),
@@ -1167,7 +1293,18 @@ impl Waiter {
             at,
             since: Instant::now(),
             mark,
+            stalled_after,
+            stuck_looks: 0,
+            stuck: None,
         })
+    }
+
+    /// The holders its wait is stuck behind, and for how long, once two looks in a row that read
+    /// them found every claim it waits behind held by one that has made no progress for its
+    /// bound; `None` before that, or once one works again.
+    #[must_use]
+    pub fn stuck(&self) -> Option<&aterm_toolchain::waits::Stuck> {
+        self.stuck.as_ref().filter(|_| self.stuck_looks >= 2)
     }
 
     /// Its record, as other sessions read it.
@@ -1177,8 +1314,19 @@ impl Waiter {
     }
 
     /// Look once: admitted if the need fits beside every claim ahead, else what it is short of. A dead holder's file is removed on the way.
+    /// A waiter whose own claim file is gone is [`Polled::Gone`], whoever polls it: its grant
+    /// could never be written, so a wait that went on would go on for ever.
     #[must_use]
     pub fn poll(self, machine: &dyn Machine) -> Polled {
+        if matches!(self.laid.path().try_exists(), Ok(false)) {
+            return Polled::Gone(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "its claim file {} was removed while it waited",
+                    self.laid.path().display()
+                ),
+            ));
+        }
         let turn = match self.ledger.try_turn() {
             Ok(Ok(turn)) => turn,
             Ok(Err(holder)) => {
@@ -1198,11 +1346,18 @@ impl Waiter {
         }
         let polled = match found.decided {
             Ok((granted, quiet)) => waiter.grant(granted, quiet),
-            Err(short) => {
+            Err(mut short) => {
+                let stuck = waiter.read_holders(&mut short, found.procs.as_ref());
+                waiter.stuck_looks = if stuck.is_some() {
+                    waiter.stuck_looks.saturating_add(1)
+                } else {
+                    0
+                };
                 let line = waiter.line(&short);
                 if let Some(mark) = &mut waiter.mark {
-                    mark.say(&line);
+                    mark.say_stuck(&line, stuck.as_ref());
                 }
+                waiter.stuck = stuck;
                 Polled::Waiting(waiter, short)
             }
         };
@@ -1210,14 +1365,50 @@ impl Waiter {
         polled
     }
 
+    /// Read in `procs` the process tree of each held claim's holder `short` names, with the
+    /// processes that claim is credited with ([`Holder::credit`]), book it in [`STALLS`], and name
+    /// on it how long that has made no progress once it reaches [`Waiter::stalled_after`]; then
+    /// whether the wait is [`stuck`] behind them.
+    fn read_holders(
+        &self,
+        short: &mut Shortfall,
+        procs: Option<&Procs>,
+    ) -> Option<aterm_toolchain::waits::Stuck> {
+        let now = Instant::now();
+        let dir = self.ledger.dir().to_path_buf();
+        let mut stalls = STALLS.lock().unwrap_or_else(PoisonError::into_inner);
+        for h in short.holders.iter_mut().filter(|h| h.held) {
+            let work = procs.and_then(|p| p.work(h.pid, &h.credit));
+            let (stall, read) = stalls
+                .entry((dir.clone(), h.pid))
+                .or_insert_with(|| (aterm_toolchain::stall::Stall::default(), now));
+            *read = now;
+            h.stalled = stall.stuck(h.pid, work, now, self.stalled_after);
+        }
+        stalls.retain(|_, (_, read)| now.saturating_duration_since(*read) < STALL_KEPT);
+        drop(stalls);
+        stuck(&short.holders)
+    }
+
     /// Read the machine and the ledger, and decide.
     fn look(&self, machine: &dyn Machine) -> io::Result<Found> {
         let now = now_ms();
+        trace("look.read.begin");
         let reading = machine.read(self.at.as_deref());
+        trace("look.read.end");
+        trace("look.scan.begin");
         let records = self.ledger.scan(true)?;
+        trace("look.scan.end");
         let mine = self.record.order();
         let records: Vec<&Record> = records.iter().filter(|r| r.order() != mine).collect();
-        let procs = (!records.is_empty()).then(|| machine.procs()).flatten();
+        let procs = (!records.is_empty())
+            .then(|| {
+                trace("look.procs.begin");
+                let procs = machine.procs();
+                trace("look.procs.end");
+                procs
+            })
+            .flatten();
         // Coverage reads the claims before `counted` leaves out the ancestors': an ancestor's held
         // quiet claim is what covers this one.
         let mut need = self.record.need.clone();
@@ -1271,6 +1462,8 @@ impl Waiter {
                 disk: 0,
                 quiet: true,
                 order: r.order(),
+                stalled: None,
+                credit: r.credit.clone(),
             };
             decided = match decided {
                 Ok(_) => Err(Shortfall {
@@ -1310,12 +1503,18 @@ impl Waiter {
             });
             (granted, quiet)
         });
-        Ok(Found { decided, next, now })
+        Ok(Found {
+            decided,
+            next,
+            now,
+            procs,
+        })
     }
 
     /// Mark it admitted with `granted` (its cores, and whether its memory runs alone), a quiet
     /// claim having started as `quiet` says.
     fn grant(self, granted: Grant, quiet: Option<QuietStart>) -> Polled {
+        trace("grant.begin");
         let Waiter {
             ledger,
             mut record,
@@ -1323,13 +1522,16 @@ impl Waiter {
             at,
             since,
             mark,
+            stalled_after,
+            stuck_looks,
+            stuck,
         } = self;
         let held = Held {
             admitted_ms: now_ms(),
             cores: granted.cores,
             alone: granted.alone.is_some(),
         };
-        match ledger.admit(&mut laid, &mut record, held) {
+        let polled = match ledger.admit(&mut laid, &mut record, held) {
             Ok(()) => Polled::Admitted(Claim {
                 laid,
                 record,
@@ -1347,10 +1549,15 @@ impl Waiter {
                     at,
                     since,
                     mark,
+                    stalled_after,
+                    stuck_looks,
+                    stuck,
                 },
                 Shortfall::only(Short::Ledger(e.to_string())),
             ),
-        }
+        };
+        trace("grant.end");
+        polled
     }
 
     /// Admit it at once, room or not (`--admit now`), with what it would have waited for.
@@ -1373,6 +1580,7 @@ impl Waiter {
         match polled {
             Polled::Admitted(claim) => Ok((claim, would)),
             Polled::Waiting(_, short) => Err(io::Error::other(short.to_string())),
+            Polled::Gone(e) => Err(e),
         }
     }
 
@@ -1413,6 +1621,25 @@ impl Waiter {
     }
 }
 
+/// Whether a wait behind `holders` is stuck: when it names any, and every one is a held claim
+/// whose holder has made no progress for the waiter's bound ([`Holder::stalled`]), how long the
+/// last of them to work has made none. A claim that waits ahead looks again every few seconds, so
+/// it works, and a short that no claim holds has no holder to be stuck.
+pub(crate) fn stuck(holders: &[Holder]) -> Option<aterm_toolchain::waits::Stuck> {
+    let spans: Option<Vec<Duration>> = holders
+        .iter()
+        .map(|h| h.stalled.filter(|_| h.held))
+        .collect();
+    let span = spans?.into_iter().min()?;
+    let mut pids: Vec<u32> = holders.iter().map(|h| h.pid).collect();
+    pids.sort_unstable();
+    pids.dedup();
+    Some(aterm_toolchain::waits::Stuck {
+        holders: pids,
+        span,
+    })
+}
+
 /// What one look found ([`Waiter::look`]): admitted with what it is granted ([`Grant`]) and, for
 /// a quiet claim, how it started; or what it is short of.
 struct Found {
@@ -1421,6 +1648,8 @@ struct Found {
     next: bool,
     /// When it looked, unix ms.
     now: u64,
+    /// The processes it read: `None` where it read none (no claim ahead, or no sweep).
+    procs: Option<Procs>,
 }
 
 /// Why [`admit`] admitted nothing.
@@ -1437,6 +1666,16 @@ pub enum Error {
         signal: Option<i32>,
         /// What it was short of at its last look; `None` when it never looked.
         short: Option<Shortfall>,
+    },
+    /// Every claim the wait was behind was held by a holder that had made no progress for the
+    /// need's bound, on two looks in a row ([`Need::ends_when_stuck`]). The claim has left the
+    /// queue; nobody signalled the holders.
+    Stuck {
+        /// The holders, and how long the last of them to work has made none.
+        stuck: aterm_toolchain::waits::Stuck,
+        /// What it was short of at its last look, each holder named with how long it has made
+        /// no progress ([`Holder::stalled`]).
+        short: Shortfall,
     },
 }
 
@@ -1459,6 +1698,12 @@ impl fmt::Display for Error {
                     None => f.write_str(", before its first look"),
                 }
             }
+            Error::Stuck { stuck, short } => write!(
+                f,
+                "gave up its wait: every claim it waited behind is held by a holder that has made \
+                 no progress for {} (none was signalled): {short}",
+                span(stuck.span)
+            ),
         }
     }
 }
@@ -1474,7 +1719,7 @@ impl std::error::Error for Error {}
 /// start another that claims for itself.
 ///
 /// # Errors
-/// [`Error::Never`] for a need that can never fit; [`Error::Ledger`] when there is no home, the ledger cannot be written, or the claim's file is removed while it waits.
+/// [`Error::Never`] for a need that can never fit; [`Error::Ledger`] when there is no home, the ledger cannot be written, or the claim's file is removed while it waits; [`Error::Stuck`] for a need that asks to end its wait behind holders that make no progress ([`Need::ends_when_stuck`]) once it is.
 pub fn admit(need: Need, mode: Admit) -> Result<Claim, Error> {
     let ledger = crate::Ledger::user().ok_or_else(|| {
         Error::Ledger(io::Error::new(
@@ -1617,7 +1862,9 @@ pub fn admit_until(
 /// The one admission [`admit_with`], [`admit_relieved`] and [`admit_until`] run: `relief` asked
 /// at the first look that waits, and an interrupt or `stopped` looked for through every nap
 /// ([`aterm_toolchain::interrupt::Watch`]): the wait ends within [`aterm_toolchain::interrupt::NAP`]
-/// of one, and one that came during the look that admitted it ends it all the same.
+/// of one, and one that came during the look that admitted it ends it all the same. A need that
+/// asks to ([`Need::ends_when_stuck`]) ends at the look its waiter believes stuck
+/// ([`Waiter::stuck`]), whatever that look is short of.
 #[expect(
     clippy::too_many_arguments,
     reason = "admission's six, the relief that frees room and the interrupt that ends its wait"
@@ -1725,14 +1972,20 @@ fn admit_waiting(
         }
         // A claim file removed while it waits (the ledger's directory cleaned) is in no other
         // session's queue and can never be named a claim: the wait ends, saying so.
-        if matches!(waiter.laid.path().try_exists(), Ok(false)) {
-            let gone = format!(
-                "its claim file {} was removed while it waited",
-                waiter.laid.path().display()
-            );
-            return Err(Error::Ledger(io::Error::new(io::ErrorKind::NotFound, gone)));
+        let polled = waiter.poll(machine);
+        if let Polled::Waiting(w, short) = &polled
+            && entered.stuck_ends.is_some()
+            && let Some(stuck) = w.stuck()
+        {
+            let stuck = Error::Stuck {
+                stuck: stuck.clone(),
+                short: short.clone(),
+            };
+            drop(polled);
+            return Err(stuck);
         }
-        match waiter.poll(machine) {
+        match polled {
+            Polled::Gone(e) => return Err(Error::Ledger(e)),
             Polled::Admitted(mut claim) => {
                 claim.short = last
                     .clone()

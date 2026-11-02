@@ -13,6 +13,48 @@ const TRUST: Trust = Trust {
     genesis: [3; 32],
 };
 
+/// A request from this member's home ALab LAN on the default ALab vault files no entry: the
+/// vault's own admission takes it, and `aterm members requests` reads it as joining. One heard
+/// from another network keeps its entry, however private its address (D1).
+///
+/// NEGATIVE CONTROLS: `join_entries::desk_askers` without its `row.automatic` filter keeps the
+/// entry once the row is automatic ("files no entry"); `Local::automatically_admits` ignoring the
+/// member's home network ends the entry of `10.0.0.9` while the member's home is
+/// `192.168.1.0/24` ("another network still needs a person").
+#[test]
+fn automatic_lan_admission_files_no_entry() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let (desk, request) = heard(root.path(), true);
+    let now = aterm_time::Instant::now();
+    let mut app = app_with(Arc::clone(&desk));
+    let key = entry_of(&app, request).key;
+    let member = || {
+        Local::with(device(root.path(), "m1"), TRUST, true, "m1")
+            .unwrap()
+            .with_automatic_lan([])
+    };
+    desk.lock().unwrap().refresh(member());
+    app.refresh_member_rows();
+    assert_eq!(
+        join_keys(&app),
+        std::slice::from_ref(&key),
+        "another network still needs a person"
+    );
+    let home = aterm_secrets::home_lan::HomeNet::at(
+        std::net::Ipv4Addr::new(10, 0, 0, 20),
+        std::net::Ipv4Addr::new(255, 255, 255, 0),
+    );
+    desk.lock().unwrap().refresh(member().with_home(Some(home)));
+    app.refresh_member_rows();
+    assert_eq!(desk.lock().unwrap().rows(now).len(), 1);
+    assert!(
+        join_keys(&app).is_empty(),
+        "files no entry: {:?}",
+        join_keys(&app)
+    );
+    assert!(app.take_members(&Asked::Requests).contains("state=joining"));
+}
+
 fn device(root: &std::path::Path, name: &str) -> Device {
     let paths = Paths::for_home(&root.join(name));
     client::machine_identity(&paths).expect("identity");
@@ -82,11 +124,50 @@ fn app_with(desk: Shared) -> App {
     app
 }
 
-fn row_of(app: &App, request: u64) -> aterm_messages::MessageId {
+/// The digest entry of the desk row `request` (its join code's).
+fn entry_of(app: &App, request: u64) -> aterm_messages::DigestEntry {
+    let code = app
+        .members
+        .desk()
+        .and_then(|desk| {
+            desk.lock_or_recover()
+                .rows(aterm_time::Instant::now())
+                .into_iter()
+                .find(|row| row.id == request)
+                .map(|row| row.code)
+        })
+        .expect("the desk holds the row");
+    let key = format!("members.join.{code}.asking");
     app.messages
-        .live_by_key(&format!("{KEY_PREFIX}{request}"))
-        .expect("the row shows")
-        .id
+        .digest()
+        .entries
+        .into_iter()
+        .find(|entry| entry.key == key)
+        .expect("the entry shows")
+}
+
+fn row_of(app: &App, request: u64) -> aterm_messages::MessageId {
+    entry_of(app, request).id
+}
+
+/// The keys of the asking Macs' entries in the digest.
+fn join_keys(app: &App) -> Vec<String> {
+    app.messages
+        .digest()
+        .entries
+        .into_iter()
+        .map(|entry| entry.key)
+        .filter(|key| key.starts_with("members.join."))
+        .collect()
+}
+
+/// Whether any row on screen is an alert (a standing ask that needs the owner now).
+fn alerts(app: &App) -> Vec<String> {
+    app.messages
+        .live_rows()
+        .filter(|live| matches!(live.msg.need(), aterm_messages::need::Need::Now(_)))
+        .map(|live| live.msg.title.clone())
+        .collect()
 }
 
 /// Every word of every message the window holds, as `aterm ctl messages` reads them.
@@ -95,42 +176,31 @@ fn messages_read(app: &App) -> String {
     app.read_messages(&query).join("\n")
 }
 
-/// The Allow row takes only a person's own press: `notice act` (how a script, a fleet drive's
-/// `ctl --host … notice act` and a harness answer reach a band row) and a control client's
-/// gesture are refused, and no phrase shows; the person's own press shows it.
+/// The Allow entry takes only a person's own press: `notice act` (how a script, a fleet drive's
+/// `ctl --host … notice act` and a harness answer reach a band row, which the entry is not) and
+/// a control client's gesture are refused, and no phrase shows; the person's own press shows
+/// it. The entry is Info, for later, and nothing is on screen.
 #[test]
 fn the_allow_row_refuses_a_press_through_ctl_a_fleet_drive_or_a_harness_answer() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let (desk, request) = heard(root.path(), true);
     let mut app = app_with(Arc::clone(&desk));
-    let id = row_of(&app, request);
-    let live = app.messages.live(id).expect("live").msg.clone();
-    assert_eq!(
-        live.actions,
-        [
-            Intent::AllowJoin { request },
-            Intent::IgnoreJoin { request }
-        ]
-    );
-    assert_eq!(live.title, "j wants to join ALab (Mac15,3, 10.0.0.9)");
+    let entry = entry_of(&app, request);
+    let id = entry.id;
+    assert_eq!(entry.actions, [Intent::AllowJoin { request }]);
+    assert_eq!(entry.title, "New Mac calling itself j");
+    assert_eq!(entry.severity, aterm_messages::Severity::Info);
+    assert!(entry.actions.iter().all(Intent::never_default));
     assert!(
-        live.actions
-            .iter()
-            .filter(|a| a.never_default())
-            .eq([&live.actions[0]])
-    );
-    assert!(
-        matches!(live.need(), aterm_messages::need::Need::Now(ask) if ask.fault().is_none()),
-        "a band row, not a question: {:?}",
-        live.need()
+        alerts(&app).is_empty(),
+        "nothing on screen: {:?}",
+        alerts(&app)
     );
 
+    // The entry is in the digest, not a band row `notice act` presses: refused.
     let acted =
         app.take_notice(wire::NoticeRequest::parse(&format!("act {id} Allow")).expect("act"));
-    assert!(
-        acted.starts_with("ERR notice: Allow on message") && acted.contains("person's own press"),
-        "{acted}"
-    );
+    assert!(acted.starts_with("ERR notice:"), "{acted}");
     let wid = crate::WindowId(0);
     let driven = app.with_gesture_source(true, |app| {
         app.perform_intent(wid, id, Intent::AllowJoin { request })
@@ -214,28 +284,22 @@ fn members_allow_in_a_driven_terminal_never_prints_the_phrase() {
     // A member with no roster binding shows the row without Allow, and allows nothing.
     let (unbound, request) = heard(root.path(), false);
     let mut app = app_with(unbound);
-    let live = app
-        .messages
-        .live(row_of(&app, request))
-        .expect("live")
-        .msg
-        .clone();
-    assert_eq!(live.actions, [Intent::IgnoreJoin { request }]);
+    let entry = entry_of(&app, request);
+    assert!(entry.actions.is_empty(), "{:?}", entry.actions);
     assert!(
-        live.detail
-            .iter()
-            .any(|line| line.contains("no Commons binding")),
-        "{:?}",
-        live.detail
+        entry.then.contains("a member that can allow"),
+        "{}",
+        entry.then
     );
     let refused = app.take_members(&Asked::parse("allow j").expect("allow"));
     assert!(refused.contains("no Commons binding"), "{refused}");
     assert!(app.members.recorded().is_empty());
 }
 
-/// Ignore ends the row on this Mac; the many-Macs row stands in for ten or more.
+/// Ignore (`aterm members ignore`) ends the row and its entry on this Mac at once; one entry
+/// stands in for `join_entries::MANY_AT` or more asking Macs.
 #[test]
-fn ignore_ends_the_row_and_ten_asking_macs_are_one_row() {
+fn ignore_ends_the_entry_and_four_asking_macs_are_one_entry() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let (desk, request) = heard(root.path(), true);
     let mut app = app_with(Arc::clone(&desk));
@@ -249,14 +313,10 @@ fn ignore_ends_the_row_and_ten_asking_macs_are_one_row() {
         app.members.shown.is_none(),
         "ignoring a row closes its phrase sheet"
     );
-    assert!(
-        app.messages
-            .live_by_key(&format!("{KEY_PREFIX}{request}"))
-            .is_none()
-    );
+    assert!(join_keys(&app).is_empty(), "{:?}", join_keys(&app));
 
     let now = aterm_time::Instant::now();
-    for n in 0..COLLAPSE_AT {
+    for n in 0..crate::join_entries::MANY_AT {
         let asker = device(root.path(), &format!("k{n}"));
         let request = asker
             .request(TRUST.network, TRUST.authority)
@@ -268,19 +328,71 @@ fn ignore_ends_the_row_and_ten_asking_macs_are_one_row() {
         held.hear(&asked.asking(), from.into(), now).expect("heard");
     }
     app.refresh_member_rows();
-    let keys: Vec<String> = app
+    assert_eq!(join_keys(&app), ["members.join.many"]);
+    let many = app
         .messages
-        .live_rows()
-        .filter_map(|live| live.msg.key.clone())
-        .filter(|key| key.starts_with(KEY_PREFIX))
-        .collect();
-    assert_eq!(keys, [MANY_KEY]);
-    let many = app.messages.live_by_key(MANY_KEY).expect("many");
+        .digest()
+        .entries
+        .into_iter()
+        .find(|entry| entry.key == "members.join.many")
+        .expect("many");
     assert_eq!(
-        many.msg.title,
-        format!("{COLLAPSE_AT} Macs want to join ALab")
+        many.title,
+        format!("{} Macs ask to join ALab", crate::join_entries::MANY_AT)
     );
-    assert!(many.msg.actions.is_empty(), "no Allow without a name");
+    assert!(many.actions.is_empty(), "no Allow without a name");
+}
+
+/// No join is an alert on screen (D3): a member desk's asking Mac and an admin approver's are
+/// each an Info entry in the digest, with the press that lets it in beside it, and an entry ends
+/// at once when its Mac no longer asks, not a family pass's ten minutes later.
+/// NEGATIVE CONTROLS: posting the old standing notice beside the entry (`Message::now`) puts it
+/// on screen ("nothing on screen: [\"j wants to join ALab\"]"); dropping the pass's
+/// `except_end` of entries no longer named keeps m31's entry ("m31's entry ended at once").
+#[test]
+fn a_join_files_info_entries_and_puts_nothing_on_screen() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let (desk, request) = heard(root.path(), true);
+    let mut app = App::headless_for_test();
+    app.members = Members::for_test(desk);
+    let m31 = aterm_secrets::client::Asking {
+        code: "WXYZ-WXYZ-WXYZ-WXYZ".to_owned(),
+        recipient: "age1m31".to_owned(),
+        host: "m31".to_owned(),
+    };
+    app.members.set_approver(vec![m31]);
+    app.refresh_member_rows();
+    assert!(
+        alerts(&app).is_empty(),
+        "nothing on screen: {:?}",
+        alerts(&app)
+    );
+    let desk_entry = entry_of(&app, request);
+    assert_eq!(desk_entry.actions, [Intent::AllowJoin { request }]);
+    let keys = join_keys(&app);
+    assert_eq!(keys.len(), 2, "{keys:?}");
+    let approver = app
+        .messages
+        .digest()
+        .entries
+        .into_iter()
+        .find(|entry| entry.key == "members.join.WXYZ-WXYZ-WXYZ-WXYZ.asking")
+        .expect("the approver's entry");
+    assert_eq!(
+        approver.actions,
+        [Intent::ApproveJoin {
+            recipient: "age1m31".to_owned()
+        }]
+    );
+    assert_eq!(approver.severity, aterm_messages::Severity::Info);
+
+    app.members.set_approver(Vec::new());
+    app.refresh_member_rows();
+    assert_eq!(
+        join_keys(&app),
+        std::slice::from_ref(&desk_entry.key),
+        "m31's entry ended at once"
+    );
 }
 
 /// A phrase whose sheet did not open is burned at once, Allow's and invite's alike: nobody saw
@@ -338,13 +450,8 @@ fn a_mac_that_left_the_vault_drops_its_desk_and_allows_nothing() {
     app.refresh_member_rows();
     app.close_spent_phrase_sheet();
 
-    let rows: Vec<String> = app
-        .messages
-        .live_rows()
-        .filter_map(|live| live.msg.key.clone())
-        .filter(|key| key.starts_with(KEY_PREFIX))
-        .collect();
-    assert!(rows.is_empty(), "the rows ended: {rows:?}");
+    let rows = join_keys(&app);
+    assert!(rows.is_empty(), "the entries ended: {rows:?}");
     assert!(app.members.shown.is_none(), "the phrase sheet closed");
     let not_member = "this Mac is not an ALab member yet";
     assert_eq!(
@@ -380,8 +487,9 @@ fn a_mac_that_left_the_vault_drops_its_desk_and_allows_nothing() {
 /// run to restore it; `aterm ctl members requests` says `state=removed by=m7`. A Mac a quorum
 /// removed gets no Allow at all.
 ///
-/// NEGATIVE CONTROL: in `notice`, drop the `row.removed` branch: the row reads "j wants to join
-/// ALab" with a plain Allow (the ghost returns), and the title assert fails.
+/// NEGATIVE CONTROL: in `join_entries::desk_askers`, drop the `row.removed` arms: the entry
+/// reads "New Mac calling itself j" with a plain Allow (the ghost returns), and the title assert
+/// fails.
 #[test]
 fn a_removed_mac_shows_as_removed_and_allow_again_is_a_persons_press() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -412,19 +520,22 @@ fn a_removed_mac_shows_as_removed_and_allow_again_is_a_persons_press() {
 
     let (desk, request_id) = desk_for(false);
     let mut app = app_with(Arc::clone(&desk));
-    let id = row_of(&app, request_id);
-    let live = app.messages.live(id).expect("live").msg.clone();
-    assert_eq!(live.title, "m12 was removed by m7 on Oct 30. Allow again?");
+    let entry = entry_of(&app, request_id);
+    let id = entry.id;
+    assert_eq!(entry.title, "Removed Mac calling itself j");
+    assert!(
+        entry
+            .detail
+            .iter()
+            .any(|line| line == "m12 was removed by m7 on Oct 30. Allow again?"),
+        "{:?}",
+        entry.detail
+    );
     assert_eq!(
-        live.actions,
-        [
-            Intent::AllowJoinAgain {
-                request: request_id
-            },
-            Intent::IgnoreJoin {
-                request: request_id
-            }
-        ]
+        entry.actions,
+        [Intent::AllowJoinAgain {
+            request: request_id
+        }]
     );
     let requests = app.take_members(&Asked::parse("requests").expect("requests"));
     assert!(requests.contains("state=removed by=m7"), "{requests}");
@@ -436,7 +547,7 @@ fn a_removed_mac_shows_as_removed_and_allow_again_is_a_persons_press() {
 
     let acted =
         app.take_notice(wire::NoticeRequest::parse(&format!("act {id} Allow again")).expect("act"));
-    assert!(acted.contains("person's own press"), "{acted}");
+    assert!(acted.starts_with("ERR notice:"), "{acted}");
     let wid = crate::WindowId(0);
     assert!(!app.with_gesture_source(true, |app| {
         app.perform_intent(
@@ -463,24 +574,16 @@ fn a_removed_mac_shows_as_removed_and_allow_again_is_a_persons_press() {
 
     let (desk, request_id) = desk_for(true);
     let app = app_with(desk);
-    let live = app
-        .messages
-        .live(row_of(&app, request_id))
-        .expect("live")
-        .msg
-        .clone();
+    let entry = entry_of(&app, request_id);
     assert!(
-        live.title.starts_with("m12 was removed by a quorum of m7"),
-        "{}",
-        live.title
+        entry
+            .detail
+            .iter()
+            .any(|line| line.starts_with("m12 was removed by a quorum of m7")),
+        "{:?}",
+        entry.detail
     );
-    assert_eq!(
-        live.actions,
-        [Intent::IgnoreJoin {
-            request: request_id
-        }],
-        "no Allow for a quorum's removal"
-    );
+    assert!(entry.actions.is_empty(), "no Allow for a quorum's removal");
 }
 
 /// F16: the "Undo m7's removals?" row a removed Mac shows offers [Undo removals] until it signed

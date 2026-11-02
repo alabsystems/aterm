@@ -14,18 +14,22 @@ use std::path::Path;
 pub fn sha256_file(path: &Path) -> Result<String, String> {
     #[cfg(target_os = "linux")]
     {
-        let file = std::fs::File::open(path).map_err(|e| format!("open SHA-256 input: {e}"))?;
+        let file = open_sha256_input(path)?;
         sha256_stream(file)
     }
 
     #[cfg(all(unix, not(target_os = "linux")))]
     {
-        let file = std::fs::File::open(path).map_err(|e| format!("open SHA-256 input: {e}"))?;
+        let file = open_sha256_input(path)?;
         hardware_sha256_stream(file)
     }
 
     #[cfg(windows)]
     {
+        let meta = std::fs::metadata(path).map_err(|e| format!("open SHA-256 input: {e}"))?;
+        if !meta.is_file() {
+            return Err("open SHA-256 input: not a regular file".to_string());
+        }
         let out = aterm_uds::spawnfd::command("certutil")
             .arg("-hashfile")
             .arg(path)
@@ -49,6 +53,24 @@ pub fn sha256_file(path: &Path) -> Result<String, String> {
             .find(|l| aterm_codec::hex::is_hex(l, 64))
             .ok_or_else(|| "certutil produced no digest".to_string())
     }
+}
+
+#[cfg(unix)]
+#[cfg_attr(trust_verify, trust::skip)]
+fn open_sha256_input(path: &Path) -> Result<std::fs::File, String> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|e| format!("open SHA-256 input: {e}"))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("open SHA-256 input: {e}"))?;
+    if !meta.is_file() {
+        return Err("open SHA-256 input: not a regular file".to_string());
+    }
+    Ok(file)
 }
 
 // Skip: format over the read error, the class `sha256_file` skips.
@@ -231,6 +253,15 @@ mod tests {
         );
         assert!(sha256_file(&dir.join("absent")).is_err());
         assert!(sha256_file(&dir).is_err());
+        let fifo = dir.join("input.fifo");
+        let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `c_fifo` is a valid NUL-terminated path inside the private temp directory.
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+        let fifo_err = sha256_file(&fifo).unwrap_err();
+        assert!(
+            fifo_err.contains("not a regular file"),
+            "a FIFO at the SHA-256 input path must be refused without blocking: {fifo_err}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

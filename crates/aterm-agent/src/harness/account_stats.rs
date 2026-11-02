@@ -64,6 +64,11 @@ pub enum Missing {
     TapOtherHome,
     /// The tap is on and has recorded nothing of the window.
     NoReading,
+    /// The five-hour window only: the usage tap's newest sample of the account carried the week
+    /// and no five-hour window. Claude Code hands a window only while the API reports it
+    /// (2.1.316's statusLine `rate_limits`), so the vendor reports none for this login now
+    /// ([`not_reported`]).
+    NotReported,
     /// The window's reset passed with no reading.
     WindowReset,
     /// A limit reset was used inside the window, with no reading since.
@@ -86,12 +91,31 @@ impl Missing {
             Missing::UsageTapOff => "usage-tap-off",
             Missing::TapOtherHome => "tap-not-this-home",
             Missing::NoReading => "no-reading",
+            Missing::NotReported => "not-reported",
             Missing::WindowReset => "window-reset",
             Missing::ResetUsed => "reset-used",
             Missing::NoUsageSeen => "no-usage-seen",
             Missing::NoRow => "no-row",
             Missing::Profile(why) => why.word(),
             Missing::StateUnread => "state-unread",
+        }
+    }
+
+    /// The reason in a few words, for a one-line figure that has none (`week – (no reading
+    /// yet)`): never a bare `?`.
+    #[must_use]
+    pub const fn phrase(self) -> &'static str {
+        match self {
+            Missing::UsageTapOff => "usage tap off",
+            Missing::TapOtherHome => "no tap reading of this home",
+            Missing::NoReading => "no reading yet",
+            Missing::NotReported => "not reported by Claude Code",
+            Missing::WindowReset => "window reset, no reading since",
+            Missing::ResetUsed => "a limit reset since, no reading since",
+            Missing::NoUsageSeen => "no /usage seen on this home",
+            Missing::NoRow => "no row in the /usage seen",
+            Missing::Profile(_) => "the profile could not be read",
+            Missing::StateUnread => "the accounts state could not be read",
         }
     }
 }
@@ -289,6 +313,29 @@ fn said_refill(said: Option<&WindowSaid>) -> Option<i64> {
         .map(|s| s.at)
 }
 
+/// WHETHER CLAUDE CODE REPORTS NO FIVE-HOUR FIGURE FOR `account` NOW ([`Missing::NotReported`];
+/// `id` is [`SESSION_LIMIT`], any other window is never said so): its newest sample, published
+/// after the five-hour window's held figure `held` reset (where one is held), carried the week and
+/// no five-hour window, and that week is the usage tap's own reading
+/// (`windows["seven_day"]`, observed no earlier than the sample's week). A tap reading writes a
+/// sample only where it carried a window, holding each window it carried merged with what the
+/// record held live ([`accounts::note_reading`]), so the statusLine that brought the week brought
+/// no five-hour window and none was held. A `/usage` panel's sample is not taken for this: a row
+/// it lacks may be one a narrow pane cut.
+fn not_reported(account: Option<&Account>, id: &str, held: Option<&WindowFig>) -> bool {
+    let Some((account, sample)) = account.and_then(|a| Some((a, a.sample.as_ref()?))) else {
+        return false;
+    };
+    let tapped_week = account.windows.get(WEEK_LIMIT).is_some_and(|week| {
+        week.source == accounts::SOURCE_TAP && week.at >= sample.week_read_at.unwrap_or(sample.at)
+    });
+    id == SESSION_LIMIT
+        && sample.session_pct.is_none()
+        && sample.week_pct.is_some()
+        && tapped_week
+        && held.is_none_or(|f| sample.at >= f.reset)
+}
+
 /// The view of `look` (module docs).
 #[must_use]
 pub fn view(look: &Look<'_>) -> View {
@@ -380,12 +427,20 @@ pub fn view(look: &Look<'_>) -> View {
             .chain(cached_figs(bucket, None))
             .chain(said.and_then(|s| said_fig(s, here)));
         let f = one_figure(sources, said_refill(said), length_s, now);
+        let missing = match state_of(&f, tap_missing()) {
+            Some(Missing::NoReading | Missing::WindowReset)
+                if not_reported(account, id, f.as_ref()) =>
+            {
+                Some(Missing::NotReported)
+            }
+            other => other,
+        };
         windows.push(Win {
             id,
             kind: id,
             name: None,
             length_s,
-            missing: state_of(&f, tap_missing()),
+            missing,
             fig: f,
         });
     }
@@ -441,13 +496,36 @@ pub fn held_windows(
     now: i64,
 ) -> View {
     let none = Err(NoProfile::NoHome);
+    home_windows(
+        Some(account).filter(|a| !a.of_another(key)),
+        &none,
+        machine,
+        tap,
+        now,
+    )
+}
+
+/// THE TWO WINDOWS aterm HOLDS OF `account` ON A HOME WHOSE PROFILE READ IS `profile`: the
+/// accounts state's figures (every tapped session's on its login, its newest sample, a standing
+/// wall, Claude Code's warning) and the home's cached `/usage` body, merged as `accounts stats`
+/// merges them ([`view`]), each with why it says nothing where it does not ([`Missing`]). The
+/// record is dropped where it is another account's than the one the profile names
+/// ([`Account::of_another`]).
+#[must_use]
+pub fn home_windows(
+    account: Option<&Account>,
+    profile: &Result<Profile, NoProfile>,
+    machine: Option<&str>,
+    tap: Tap,
+    now: i64,
+) -> View {
     let look = Look {
         now,
         tz_s: 0,
         machine,
         label: "",
-        profile: &none,
-        account: Some(account).filter(|a| !a.of_another(key)),
+        profile,
+        account,
         state_unread: false,
         several: false,
         api_key_seen: false,
@@ -568,13 +646,14 @@ fn hm(t: i64, tz_s: i64) -> String {
 
 /// An instant on the local clock: `18:05` on the local day of `now`, else
 /// `Sun Oct 18 20:50`.
-fn clock(t: i64, now: i64, tz_s: i64) -> String {
+fn clock_local(t: i64, now: i64, tz_at: &dyn Fn(i64) -> i64) -> String {
+    let (t_tz, now_tz) = (tz_at(t), tz_at(now));
     let same =
-        t.saturating_add(tz_s).div_euclid(86_400) == now.saturating_add(tz_s).div_euclid(86_400);
+        t.saturating_add(t_tz).div_euclid(86_400) == now.saturating_add(now_tz).div_euclid(86_400);
     if same {
-        hm(t, tz_s)
+        hm(t, t_tz)
     } else {
-        format!("{} {}", day_of(t, tz_s), hm(t, tz_s))
+        format!("{} {}", day_of(t, t_tz), hm(t, t_tz))
     }
 }
 
@@ -640,8 +719,8 @@ fn row_label(win: &Win) -> String {
 }
 
 /// Why a window says nothing, as the text says it.
-fn missing_text(win: &Win, look: &Look<'_>) -> String {
-    let at = |t: i64| clock(t, look.now, look.tz_s);
+fn missing_text(win: &Win, look: &Look<'_>, tz_at: &dyn Fn(i64) -> i64) -> String {
+    let at = |t: i64| clock_local(t, look.now, tz_at);
     match (win.missing, win.fig.as_ref()) {
         (Some(Missing::WindowReset), Some(f)) => {
             format!("window reset {}, no reading since", at(f.reset))
@@ -664,6 +743,17 @@ fn missing_text(win: &Win, look: &Look<'_>) -> String {
                 .to_owned()
         }
         (Some(Missing::NoReading), _) => "no reading yet".to_owned(),
+        (Some(Missing::NotReported), _) => {
+            let age = look
+                .record()
+                .and_then(|a| a.sample.as_ref())
+                .map_or_else(String::new, |s| {
+                    format!(" (as of {})", span(look.now.saturating_sub(s.at)))
+                });
+            format!(
+                "not reported: Claude Code reports the week but no 5h window for this login{age}"
+            )
+        }
         (Some(Missing::NoUsageSeen), _) => "no /usage seen on this home".to_owned(),
         (Some(Missing::NoRow), _) => "the /usage seen on this home has no row for it".to_owned(),
         (Some(Missing::StateUnread), _) => "the accounts state could not be read".to_owned(),
@@ -674,18 +764,26 @@ fn missing_text(win: &Win, look: &Look<'_>) -> String {
 }
 
 /// The plan's answer on Fable, as the text says it.
-fn fable_plan_text(p: &Profile, tz_s: i64) -> String {
+fn fable_plan_text(p: &Profile, tz_at: &dyn Fn(i64) -> i64) -> String {
     match &p.fable {
         profile::FablePlan::Included => "Fable included".to_owned(),
         profile::FablePlan::CreditsOnly => "credits only".to_owned(),
-        profile::FablePlan::LimitsEnd(Some(at)) => format!("limits end {}", day_of(*at, tz_s)),
+        profile::FablePlan::LimitsEnd(Some(at)) => {
+            format!("limits end {}", day_of(*at, tz_at(*at)))
+        }
         profile::FablePlan::LimitsEnd(None) => "limits end (date unread)".to_owned(),
         profile::FablePlan::Unknown => "unknown".to_owned(),
     }
 }
 
 /// One window's row.
-fn window_row(look: &Look<'_>, view: &View, win: &Win, p: Option<&Profile>) -> String {
+fn window_row(
+    look: &Look<'_>,
+    view: &View,
+    win: &Win,
+    p: Option<&Profile>,
+    tz_at: &dyn Fn(i64) -> i64,
+) -> String {
     let now = look.now;
     let label = row_label(win);
     let mut row = match win.current(now) {
@@ -695,7 +793,7 @@ fn window_row(look: &Look<'_>, view: &View, win: &Win, p: Option<&Profile>) -> S
                 "{} used{DOT}{} left{DOT}resets {} (in {})",
                 percent(f.pct_x10, view.tenths),
                 percent(left, view.tenths),
-                clock(f.reset, now, look.tz_s),
+                clock_local(f.reset, now, tz_at),
                 span(f.reset.saturating_sub(now)),
             );
             let _ = write!(
@@ -707,12 +805,12 @@ fn window_row(look: &Look<'_>, view: &View, win: &Win, p: Option<&Profile>) -> S
             );
             row
         }
-        None => format!("{DASH}  {}", missing_text(win, look)),
+        None => format!("{DASH}  {}", missing_text(win, look, tz_at)),
     };
     if win.id == Bucket::Fable.id()
         && let Some(p) = p
     {
-        let _ = write!(row, "{DOT}plan: {}", fable_plan_text(p, look.tz_s));
+        let _ = write!(row, "{DOT}plan: {}", fable_plan_text(p, tz_at));
     }
     format!("  {label:<6} {row}\n")
 }
@@ -753,11 +851,20 @@ fn dollars_part(name: &str, figure: &spend::Figure, whose: spend::Attribution) -
 /// Render the plain-text view of `look`.
 #[must_use]
 pub fn text(look: &Look<'_>, view: &View) -> String {
+    text_local(look, view, &|_| look.tz_s)
+}
+
+/// Render the plain-text view of `look`, placing each wall-clock instant on
+/// `tz_at(unix)` so a reset, a login renewal or a Fable end date across a
+/// daylight-saving change carries its own UTC offset.
+#[must_use]
+pub fn text_local(look: &Look<'_>, view: &View, tz_at: &dyn Fn(i64) -> i64) -> String {
     let now = look.now;
+    let now_tz = tz_at(now);
     let mut out = format!(
         "accounts at {} {}{DOT}this machine only{DOT}prices {} (list)\n\n",
-        day_of(now, look.tz_s),
-        hm(now, look.tz_s),
+        day_of(now, now_tz),
+        hm(now, now_tz),
         look.prices_as_of.unwrap_or(DASH)
     );
     let p = look.profile.as_ref().ok();
@@ -793,7 +900,7 @@ pub fn text(look: &Look<'_>, view: &View) -> String {
     }
     out.push('\n');
     for win in &view.windows {
-        out.push_str(&window_row(look, view, win, p));
+        out.push_str(&window_row(look, view, win, p, tz_at));
     }
     match look.spend {
         Some(s) => {
@@ -852,7 +959,7 @@ pub fn text(look: &Look<'_>, view: &View) -> String {
     if let Some(login) = look.login {
         let _ = write!(out, "{DOT}login: here {}", login.state);
         if let Some(by) = login.renew_by {
-            let _ = write!(out, ", renew by {}", clock(by, now, look.tz_s));
+            let _ = write!(out, ", renew by {}", clock_local(by, now, tz_at));
         }
     }
     out.push('\n');

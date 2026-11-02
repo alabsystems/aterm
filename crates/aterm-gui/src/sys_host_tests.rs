@@ -318,8 +318,10 @@ fn privacys_count_pulls_a_reading_when_none_speaks_for_now() {
                     findings: Findings {
                         program_check: vec![Named {
                             pid: 25311,
+                            exec_version: None,
                             name: "gh".into(),
                             tab: None,
+                            job: None,
                             for_ms: 35_940_000,
                         }],
                         ..Findings::default()
@@ -452,7 +454,7 @@ fn a_why_arms_the_split_while_it_waits() {
         };
         shared.publish_for_test(with_split(7300, Some(1)), Vec::new());
         let q = SysQuery::parse(text).expect("query");
-        let (held, state) = shared.fresh_for(&q, &ARMED);
+        let (held, state) = shared.fresh_for(&q, &ARMED, &Arming::new());
         assert_eq!(
             (held.map(|h| h.snap.seq), state),
             (Some(7301), Freshness::Fresh),
@@ -462,6 +464,107 @@ fn a_why_arms_the_split_while_it_waits() {
         shared.lock().tx = None;
         assert_eq!(probe.join().unwrap(), [armed], "{text}");
     }
+}
+
+/// A snapshot carrying a jobs view the engine's pass made `age_ms` before its reading.
+fn with_jobs_aged(seq: u64, age_ms: u64) -> Snapshot {
+    let mut s = synthetic(seq, 0.1);
+    s.jobs = Some(Arc::new(aterm_vitals::jobs::JobsView::default()));
+    s.jobs_age_ms = age_ms;
+    s
+}
+
+/// `sys jobs` is as fresh as its jobs view, not as the snapshot that carries it: a snapshot that
+/// just landed with the 25 s old view of the engine's last pass is past the default 2 s, so the
+/// reply pulls with the engine armed, and answers from the reading whose own pass made a view;
+/// a pull whose reading still carries the old view times out to `state=stale`. Every other view
+/// reads the same snapshot as fresh, arming nothing. NEGATIVE CONTROL: judge `sys jobs` by the
+/// snapshot's landing, and it answers the carried view at once, fresh, with no pull.
+#[test]
+fn sys_jobs_is_as_fresh_as_its_jobs_view_and_arms_the_engine_while_it_waits() {
+    static JOBS: Arming = Arming::new();
+    let run = |text: &str, wait: Duration, makes: bool| {
+        let shared = Arc::new(Shared::paced(Duration::from_secs(3600), wait));
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        shared.install(tx);
+        let probe = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                let mut seen = Vec::new();
+                while let Ok(msg) = rx.recv() {
+                    assert!(matches!(msg, Msg::Pull));
+                    seen.push(JOBS.armed());
+                    let age = if makes { 0 } else { 25_100 };
+                    shared.publish_for_test(with_jobs_aged(7301, age), Vec::new());
+                }
+                seen
+            })
+        };
+        shared.publish_for_test(with_jobs_aged(7300, 25_000), Vec::new());
+        let q = SysQuery::parse(text).expect("query");
+        let (held, state) = shared.fresh_for(&q, &Arming::new(), &JOBS);
+        assert!(!JOBS.armed(), "{text}: disarmed once answered");
+        shared.lock().tx = None;
+        (held.map(|h| h.snap.seq), state, probe.join().unwrap())
+    };
+    let hang = Duration::from_secs(60);
+    assert_eq!(
+        run("jobs", hang, true),
+        (Some(7301), Freshness::Fresh, vec![true]),
+        "the default 2 s: pulled, the engine armed"
+    );
+    assert_eq!(
+        run("jobs fresh=0", hang, true),
+        (Some(7301), Freshness::Fresh, vec![true]),
+        "forced"
+    );
+    assert_eq!(
+        run("jobs fresh=60000", hang, true),
+        (Some(7300), Freshness::Fresh, vec![]),
+        "a 25 s view is within a minute"
+    );
+    assert_eq!(
+        run("global", hang, true),
+        (Some(7300), Freshness::Fresh, vec![]),
+        "the snapshot itself just landed"
+    );
+    let (seq, state, seen) = run("jobs", Duration::from_millis(200), false);
+    assert_eq!(
+        (state, seen),
+        (Freshness::Stale, vec![true]),
+        "the pull's reading carried the old view: {seq:?}"
+    );
+}
+
+/// `privacy`'s count tells a held program's age on from the pass that made the jobs view, not
+/// from the snapshot that carries it. NEGATIVE CONTROL: age the view from the snapshot's
+/// landing, and a program held 2 s at a pass 25 s ago reads 2 s.
+#[test]
+fn privacys_count_ages_a_carried_view_from_its_pass() {
+    use aterm_vitals::jobs::{Findings, JobsView, Named};
+    let shared = Shared::new();
+    let mut snap = synthetic(2, 0.1);
+    snap.jobs = Some(Arc::new(JobsView {
+        findings: Findings {
+            program_check: vec![Named {
+                pid: 25311,
+                exec_version: None,
+                name: "gh".into(),
+                tab: None,
+                job: None,
+                for_ms: 2_000,
+            }],
+            ..Findings::default()
+        },
+        ..JobsView::default()
+    }));
+    snap.jobs_age_ms = 25_000;
+    shared.publish_for_test(snap, Vec::new());
+    let (count, oldest) = shared
+        .program_check_now()
+        .expect("a view that speaks for now");
+    assert_eq!(count, 1);
+    assert!(oldest >= 27_000, "{oldest}");
 }
 
 #[test]
@@ -581,6 +684,7 @@ fn jobs_view(rows: Vec<aterm_vitals::jobs::JobRow>) -> Arc<aterm_vitals::jobs::J
         demand: aterm_vitals::jobs::Demand::Fast,
         lanes_off: Vec::new(),
         parked_tabs: Vec::new(),
+        at_ms: 0,
     })
 }
 
@@ -1273,22 +1377,101 @@ fn the_jobs_line_lands_before_the_trailer_and_the_header_counts_it() {
     assert_eq!(splice_brief_line(one, "jobs 1 job", 5), one);
 }
 
+/// A jobs view older than a minute says nothing of now when no window's reading is due again for it
+/// on a timer that has not come (a suspect agent call, a program that has not started, its
+/// snapshot's leftover view offering a closed tab's row): its reader stopped delivering. One read
+/// again only on an edge, the disk watch's look or a pull (a parked tab, or a live job's own
+/// demand, which arms nothing with no window) speaks while its reader runs. NEGATIVE CONTROLS: the
+/// rule before the idle-wake fix (only a parked view speaks past a minute) leaves the running job's
+/// old view unspoken, and the third block fails; `fresh_jobs` handing `speaks_for_now` no leftover
+/// view lets the offered snapshot's old view speak, and the last block fails.
 #[test]
-fn a_jobs_view_older_than_a_minute_says_nothing_of_now_unless_parked() {
-    let view = Arc::new(aterm_vitals::jobs::JobsView {
-        demand: aterm_vitals::jobs::Demand::Fast,
-        ..aterm_vitals::jobs::JobsView::default()
-    });
+fn a_jobs_view_older_than_a_minute_says_nothing_of_now_unless_read_only_at_edges() {
+    use aterm_vitals::jobs::{Demand, Findings, JobsView, Named, Standing};
+    let snap = |jobs: &Arc<JobsView>| {
+        Arc::new(Snapshot {
+            jobs: Some(Arc::clone(jobs)),
+            ..Snapshot::default()
+        })
+    };
+    let timed = |rows, findings| {
+        Arc::new(JobsView {
+            demand: Demand::Fast,
+            rows,
+            findings,
+            ..JobsView::default()
+        })
+    };
+    let suspect = aterm_vitals::jobs::JobRow {
+        standing: Some(Standing::Capped),
+        ..crate::vitals_jobs::tests::call_row(
+            0,
+            aterm_vitals::jobs::Consumer::AgentBg,
+            true,
+            31,
+            27098,
+            "python3",
+        )
+    };
+    let not_started = Findings {
+        not_started: vec![Named {
+            pid: 25311,
+            exec_version: None,
+            name: "gh".into(),
+            tab: Some(0),
+            job: None,
+            for_ms: 1_000,
+        }],
+        ..Findings::default()
+    };
     let now = Instant::now();
-    assert!(fresh_jobs(Some((Arc::clone(&view), now)), now, true).is_some());
     let old = now
         .checked_sub(crate::vitals_jobs::JOBS_FRESH + Duration::from_secs(1))
         .expect("a clock past a minute");
-    assert!(fresh_jobs(Some((view, old)), now, true).is_none());
+    for view in [
+        timed(vec![suspect], Findings::default()),
+        timed(Vec::new(), not_started),
+    ] {
+        assert!(fresh_jobs(Some((snap(&view), now)), now, true).is_some());
+        assert!(fresh_jobs(Some((snap(&view), old)), now, true).is_none());
+    }
     assert!(fresh_jobs(None, now, true).is_none());
-    let parked = Arc::new(aterm_vitals::jobs::JobsView::default());
-    assert!(fresh_jobs(Some((Arc::clone(&parked), old)), now, true).is_some());
-    assert!(fresh_jobs(Some((parked, old)), now, false).is_none());
+    assert!(
+        fresh_jobs(Some((Arc::new(Snapshot::default()), now)), now, true).is_none(),
+        "no jobs view"
+    );
+    let parked = Arc::new(JobsView::default());
+    assert!(fresh_jobs(Some((snap(&parked), old)), now, true).is_some());
+    assert!(fresh_jobs(Some((snap(&parked), old)), now, false).is_none());
+    let running = timed(
+        vec![aterm_vitals::jobs::JobRow {
+            tab: 0,
+            ..crate::stats_paint::tests::job_row(
+                "j41",
+                aterm_vitals::jobs::Verdict::Fine,
+                None,
+                Some(1_000),
+            )
+        }],
+        Findings::default(),
+    );
+    assert!(
+        fresh_jobs(Some((snap(&running), old)), now, true).is_some(),
+        "a running job's view, read again only at its edges: it speaks while its reader runs"
+    );
+    assert!(fresh_jobs(Some((snap(&running), old)), now, false).is_none());
+    for view in [parked, running] {
+        let offered = Arc::new(Snapshot {
+            jobs: Some(Arc::clone(&view)),
+            left: Some(Arc::new(crate::vitals_jobs::tests::offered_left())),
+            ..Snapshot::default()
+        });
+        assert!(fresh_jobs(Some((Arc::clone(&offered), now)), now, true).is_some());
+        assert!(
+            fresh_jobs(Some((offered, old)), now, true).is_none(),
+            "a leftover offer is read again within 30 s: this old view's reader stopped: {view:?}"
+        );
+    }
 }
 
 /// A `sys why` that may be of memory reads macOS's services on their own while the split by
@@ -1348,4 +1531,30 @@ fn a_why_with_the_split_cold_reads_the_services_on_their_own() {
     };
     assert!(!read_for("why mem", warm()));
     assert_eq!(filed_for("why", warm()), ["537-1790000000"]);
+}
+
+/// A `sys left` that names no `@` target sees every session's rows: Owner's alone, read as
+/// `scope=aterm` when it names no scope. A targeted one, and every other view, is read as
+/// written. NEGATIVE CONTROL: read an untargeted `left` as the front tab's, and an edge reads
+/// it.
+#[test]
+fn a_request_with_no_selector_needs_owner() {
+    use super::untargeted_left;
+    assert_eq!(untargeted_left("sys", "left", false), Err(()));
+    assert_eq!(
+        untargeted_left("sys", "left scope=tab --json", false),
+        Err(())
+    );
+    assert_eq!(
+        untargeted_left("sys", "left", true),
+        Ok(Some("left scope=aterm".to_owned()))
+    );
+    assert_eq!(untargeted_left("sys", "left scope=pane", true), Ok(None));
+    assert_eq!(untargeted_left("sys", "jobs", false), Ok(None));
+    assert_eq!(
+        untargeted_left("sys", "left scope=moon", false),
+        Ok(None),
+        "usage"
+    );
+    assert_eq!(untargeted_left("status", "left", false), Ok(None));
 }

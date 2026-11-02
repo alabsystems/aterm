@@ -105,20 +105,22 @@ impl<'a> BitReader<'a> {
                         self.ended = true;
                         0
                     }
-                    Some(&0xFF) => match self.data.get(self.pos + 1) {
-                        Some(&0x00) => {
-                            self.pos += 2;
-                            0xFF
+                    Some(&0xFF) => {
+                        match self.pos.checked_add(1).and_then(|next| self.data.get(next)) {
+                            Some(&0x00) => {
+                                self.pos += 2;
+                                0xFF
+                            }
+                            Some(&0xFF) => {
+                                self.pos += 1;
+                                continue;
+                            }
+                            _ => {
+                                self.ended = true;
+                                0
+                            }
                         }
-                        Some(&0xFF) => {
-                            self.pos += 1;
-                            continue;
-                        }
-                        _ => {
-                            self.ended = true;
-                            0
-                        }
-                    },
+                    }
                     Some(&byte) => {
                         self.pos += 1;
                         byte
@@ -201,7 +203,10 @@ impl<'a> BitReader<'a> {
         self.bits = 0;
         let mut at = self.pos;
         loop {
-            match (self.data.get(at), self.data.get(at + 1)) {
+            match (
+                self.data.get(at),
+                at.checked_add(1).and_then(|next| self.data.get(next)),
+            ) {
                 (Some(&0xFF), Some(&marker)) if (0xD0..=0xD7).contains(&marker) => {
                     self.pos = at + 2;
                     self.ended = false;
@@ -212,7 +217,7 @@ impl<'a> BitReader<'a> {
                     self.ended = true;
                     return false;
                 }
-                (Some(_), _) => at += 1,
+                (Some(_), _) => at = at.saturating_add(1),
                 (None, _) => {
                     self.pos = at;
                     self.ended = true;

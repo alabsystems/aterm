@@ -1,18 +1,12 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-winres: spec recovery from its 6 unit tests
+# aterm-winres: spec recovery from unit tests
 
-> Status: migration worklist. Each of the 6 specs below is proved through Trust/Clean about the
-> compiled Rust function, and then the tests it subsumes are deleted.
-
-Source: `crates/aterm-winres/src/lib.rs` (all 6 `#[test]` fns in `mod tests` and the functions they
-reach).
-
-Result: **6 specs**, covering **all 6 tests**. **0 tests are not spec samples** (§4).
-
-None of the functions the tests reach has effects. `compile`, `locate_compiler`, `find_on_path`
-and `host_sdk_arch` (env, fs, process) have no tests, so this worklist does not cover them.
+Each row states a property of a pure function in `crates/aterm-winres/src/lib.rs`, recovered from
+the tests in its `mod tests`. A test is deleted once Trust/Clean proves its primary spec and every
+`also` spec. Functions no test reaches, among them the effectful `compile`, `locate_compiler`,
+`find_on_path` and `host_sdk_arch`, have no row.
 
 ## 0. Notation used in the statements
 
@@ -29,15 +23,13 @@ and `host_sdk_arch` (env, fs, process) have no tests, so this worklist does not 
   - `LlvmRc` ⇒ `["/I", I, "/FO", O, R]`
   - `Windres` ⇒ `["-I", I, "-i", R, "-o", O, "-O", "coff"]`
 - `EXT(d)`: `Rc | LlvmRc` ⇒ `"res"`; `Windres` ⇒ `"o"`.
-- Gap numbers are the rows of §7 of
-  `AUDIT-trust-for-test-migration-2026-10-15.md` (historical internal audit).
-  Gap 0 (the installed seal publishes no Lean-discharged row) is a prerequisite for every row,
-  so it is listed on each spec.
+- `blocking_gaps`: rows of §7 of `docs/AUDIT-trust-for-test-migration-2026-10-15.md`. Gap 0 (the
+  installed seal publishes no Lean-discharged row) is on every row.
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes (primary tests; secondary in §2)`,
-`difficulty (Rust features the proof must handle)`, `blocking gaps (audit §7)`.
+Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (primary tests; the others are in §2),
+`difficulty` (the Rust features the proof must handle), `blocking_gaps`.
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
@@ -49,41 +41,9 @@ WR5	contract	Outcome::is_linked	∀ o: Outcome, o.is_linked() = matches!(o, Link
 WR6	contract	<Outcome as Display>::fmt	∀ o: Outcome, o.to_string() = match o { Linked(p) ⇒ "linked " ++ disp(p), NotWindows ⇒ "target is not Windows; no resources apply", NoCompiler(w) ⇒ "no resource compiler found: " ++ w, Failed(w) ⇒ "resource compiler failed: " ++ w }, and fmt returns Ok whenever the sink does. The load-bearing content is payload preservation (the NoCompiler/Failed message ends with exactly the carried string, so where-it-looked and stderr reach the build warning) and that the four variant prefixes are pairwise distinct. The exact wording is not itself a spec.	lib.rs::outcome_display_names_the_state (Display half)	MEDIUM-HARD: Display impl, &mut fmt::Formatter over a dyn Write sink, write!/format_args, String concatenation model, Path::display.	0,1,2,3,6,8
 ```
 
-### Distribution by kind (6)
-
-| kind | count | ids |
-|---|---|---|
-| contract | 4 | WR1, WR2, WR5, WR6 |
-| table-property | 2 | WR3, WR4 |
-
-### Gap histogram (specs blocked by each audit §7 gap)
-
-| gap | specs | ids |
-|---|---|---|
-| 0 | 6 | all |
-| 1 | 6 | all |
-| 2 | 2 | WR5, WR6 |
-| 3 | 6 | all |
-| 5 | 2 | WR1, WR2 |
-| 6 | 6 | all |
-| 7 | 1 | WR1 |
-| 8 | 1 | WR6 (the Formatter's `dyn Write` sink is an opaque effect boundary) |
-| 11 | 1 | WR1 |
-| 13 | 1 | WR1 |
-
-No spec is blocked by gap 0 alone. Every spec needs gap 1 (enum or string carriers), gap 3
-(enum `match` in an E6 body) and gap 6 (publishing a plain-Rust `ensures`).
-
-### Proof dependency order
-
-The specs are independent. The only shared lemma is the `disp` model, which WR3 and WR6 both
-use and which can stay an uninterpreted function of the path. WR4 and WR3 together give the
-companion invariant in WR4.
-
 ## 2. Test → spec map (TSV)
 
-`primary` is the spec that retires the test. `also` lists the other specs the same test
-samples. A test is deleted only when its primary and every `also` spec are proved.
+`primary` is the spec that retires the test; `also` lists the other specs it samples.
 
 ```tsv
 file	test	primary	also
@@ -95,20 +55,9 @@ src/lib.rs	artifact_extension_matches_what_the_linker_accepts	WR4
 src/lib.rs	outcome_display_names_the_state	WR6	WR5
 ```
 
-## 3. Coverage
-
-- 6 original tests read. All 6 map to one of the 6 specs, and none is left over.
-- The only collapse is `WR1`, which takes 2 tests. `outcome_display_names_the_state` is the
-  reverse case: one test samples two specs (WR5 and WR6) and is retired only when both are proved.
-
 ## 4. Tests that are not spec samples
 
-None. Every test samples a general property of a production function. No test exercises
-test-only code, checks a tautology or measures timing.
-
-| test | why | recommendation |
-|---|---|---|
-| (none) | | |
+None.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
@@ -127,24 +76,16 @@ test-only code, checks a tautology or measures timing.
 4. **Resolved — `arguments()` doc comment no longer cites the unit test.** `arguments()` is documented
    as `"The argument vector for one dialect."`.
 
-## 6. Proof order (easiest, high value first)
+## 6. Proof order
 
-No spec is blocked by gap 0 alone, so every one also waits on gaps 1, 3 and 6. Among them:
+The specs are independent; WR3 and WR6 share only `disp`, which can stay an uninterpreted function
+of the path. Every spec needs gaps 1, 3 and 6.
 
-1. **WR4** (`Dialect::artifact_extension`). A three-arm match on a `Copy` enum with literal
-   results, decidable by case split. It is the smallest test bed for enum carriers (gap 1) and
-   `&'static str` results, and it backs the linker-facing half of WR3's companion invariant.
-2. **WR5** (`Outcome::is_linked`). A `matches!` on `&self`, with payloads never read. It adds
-   only gap 2 (a certified `&self` view) to WR4's needs.
-3. **WR2** (`dialect_of`). Pure, with a short body, but it needs a string content model,
-   `to_ascii_lowercase`, substring search and a quantified clause (gap 5). It is high value because
-   `locate_compiler`'s gnu-target refusal depends on its precedence and default.
-4. **WR3** (`arguments`). A fixed `vec!` per arm. The proof is easy once `Vec<String>` contents
-   are modelled (gap 1) and `disp` is opaque. It also lets the companion invariant in WR4 be proved.
-5. **WR6** (`Display for Outcome`). Needs the `Formatter`/`write!` model (gaps 2 and 8) on top of
-   string concatenation. Prove the payload-preservation suffix property first. The full string
-   equality follows from the same model.
-6. **WR1** (`sdk_versions_newest_first`). The hardest: closures, a generic `IntoIterator`,
-   `collect` into `Result`, a stable sort and a sorted-permutation postcondition (gaps 5, 7, 11, 13).
-   It retires 2 tests, the most of any spec here, but it should wait until gaps 7 and 13 have
-   been closed on a crate that needs them more.
+1. **WR4**: a three-arm match with literal results, the smallest test of enum carriers.
+2. **WR5**: a `matches!` on `&self`; adds gap 2.
+3. **WR2**: needs a string content model, `to_ascii_lowercase`, substring search and gap 5.
+4. **WR3**: a fixed `vec!` per arm, once `Vec<String>` contents are modelled; with WR4 it gives
+   WR4's companion invariant.
+5. **WR6**: the `Formatter`/`write!` model (gaps 2, 8); prove the payload suffix first.
+6. **WR1**: a loop, a generic `IntoIterator`, a sort and a sorted-permutation postcondition (gaps 5,
+   7, 11), stated with §5.1's tie order.

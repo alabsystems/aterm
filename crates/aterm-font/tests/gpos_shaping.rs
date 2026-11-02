@@ -48,7 +48,7 @@ fn anchor_format1(x: i16, y: i16) -> [u8; 6] {
 }
 
 /// Minimal `cmap` format 4 mapping sorted `(codepoint <= 0xFFFE, glyph_id)` pairs.
-fn cmap_format4(entries: &[(u16, u16)]) -> Vec<u8> {
+pub(crate) fn cmap_format4(entries: &[(u16, u16)]) -> Vec<u8> {
     let seg_count = entries.len() + 1;
     let seg_count_x2 = (seg_count * 2) as u16;
     let search_range = 2 * (1u16 << seg_count.ilog2());
@@ -1564,4 +1564,233 @@ fn skippy_iter_skips_cgj_and_zwnj_across_gpos_pair_pos() {
         shape_positions(&bytes, &[], "A\u{200C}V")[0].1.x_advance,
         520
     );
+}
+
+#[test]
+fn deep_cursive_attachment_chains_reverse_and_propagate_without_stack_overflow() {
+    // Lookup 0 (`curs`, LTR `lookupFlag = 0`): glyph 1 ('a') attaches backward (`child = curr`, `parent = prev`)
+    // with `entry = (10, 20)` and `exit = (490, 50)` => `y_offset = 30`, `chain = -1`.
+    let mut ltr_curs = Vec::new();
+    ltr_curs.extend(be16(1));
+    ltr_curs.extend(be16(10));
+    ltr_curs.extend(be16(1));
+    ltr_curs.extend(be16(16));
+    ltr_curs.extend(be16(22));
+    ltr_curs.extend(coverage_format1(&[1]));
+    ltr_curs.extend(anchor_format1(10, 20));
+    ltr_curs.extend(anchor_format1(490, 50));
+
+    // Lookup 1 (`curs`, `RIGHT_TO_LEFT` `lookupFlag = 0x0001`): glyph 1 ('a') has only `exit = (490, 50)`
+    // and glyph 2 ('b') has only `entry = (10, 20)`. Matching the final `('a', 'b')` pair reverses the
+    // entire preceding 19,998-hop `'a'` chain and then propagates 19,999 hops forward.
+    let mut rtl_curs = Vec::new();
+    rtl_curs.extend(be16(1));
+    rtl_curs.extend(be16(14));
+    rtl_curs.extend(be16(2));
+    rtl_curs.extend(be16(0));
+    rtl_curs.extend(be16(22));
+    rtl_curs.extend(be16(28));
+    rtl_curs.extend(be16(0));
+    rtl_curs.extend(coverage_format1(&[1, 2]));
+    rtl_curs.extend(anchor_format1(490, 50));
+    rtl_curs.extend(anchor_format1(10, 20));
+
+    let gpos = layout_table(
+        b"DFLT",
+        &[(b"curs", &[0, 1])],
+        &[(3, 0x0000, ltr_curs), (3, 0x0001, rtl_curs)],
+    );
+    let bytes = font_with_tables(
+        &[(b'a' as u16, 1), (b'b' as u16, 2)],
+        &[500, 500, 500],
+        &[(b"GPOS", &gpos)],
+    );
+
+    let positions = std::thread::Builder::new()
+        .stack_size(512 * 1024)
+        .spawn(move || {
+            let mut text = "a".repeat(19_999);
+            text.push('b');
+            shape_positions(&bytes, &[], &text)
+        })
+        .expect("spawn small-stack shaper thread")
+        .join()
+        .expect("cursive chain shapes without stack overflow");
+
+    assert_eq!(positions.len(), 20_000);
+    assert_eq!(positions[0].1.y_offset, -30 * 19_999);
+    assert_eq!(positions[19_998].1.y_offset, -30);
+    assert_eq!(positions[19_999].1.y_offset, 0);
+}
+
+#[test]
+fn a_run_of_marks_on_one_base_propagates_in_linear_work() {
+    // Glyph 1 ('a', U+05D0) is a base of advance 600 and glyph 2 (U+0301, U+05B8) a mark that
+    // `mark` attaches at (300, 500) - (50, 100) from the base's origin. However far after the
+    // base a mark sits, it lands at the same place once the advances between are taken back:
+    // left to right the base's, right to left none (the marks' are zeroed).
+    let mut gdef = Vec::new();
+    gdef.extend(be32(0x0001_0000));
+    gdef.extend(be16(12));
+    gdef.extend([0; 6]);
+    gdef.extend(class_def_format1(1, &[1, 3]));
+    let mark_cov = coverage_format1(&[2]);
+    let base_cov = coverage_format1(&[1]);
+    let mut m2b = Vec::new();
+    m2b.extend(be16(1));
+    m2b.extend(be16(12));
+    m2b.extend(be16((12 + mark_cov.len()) as u16));
+    m2b.extend(be16(1));
+    m2b.extend(be16((12 + mark_cov.len() + base_cov.len()) as u16));
+    m2b.extend(be16((12 + mark_cov.len() + base_cov.len() + 12) as u16));
+    m2b.extend(mark_cov);
+    m2b.extend(base_cov);
+    m2b.extend([0, 1, 0, 0, 0, 6]);
+    m2b.extend(anchor_format1(50, 100));
+    m2b.extend([0, 1, 0, 4]);
+    m2b.extend(anchor_format1(300, 500));
+
+    for (script, base, mark, x_offset) in [
+        (b"DFLT", 'a', '\u{0301}', 250 - 600),
+        (b"hebr", '\u{05D0}', '\u{05B8}', 250),
+    ] {
+        let gpos = layout_table(script, &[(b"mark", &[0])], &[(4, 0, m2b.clone())]);
+        let mut cmap = [(base as u16, 1), (mark as u16, 2)];
+        cmap.sort_unstable();
+        let bytes = font_with_tables(
+            &cmap,
+            &[500, 600, 200],
+            &[(b"GDEF", &gdef), (b"GPOS", &gpos)],
+        );
+        let face = ShapeFace::new(Face::parse(&bytes, 0).expect("synthetic face parses"));
+        let mut buf = UnicodeBuffer::new();
+        buf.add(base, 0);
+        (1..=3_000).for_each(|i| buf.add(mark, i));
+        buf.guess_segment_properties();
+        let _ = aterm_font::take_spent();
+        let out = shape(&face, &[], buf);
+        let steps = aterm_font::take_spent().attachment_steps;
+        let marks: Vec<_> = out
+            .glyph_infos()
+            .iter()
+            .zip(out.glyph_positions())
+            .filter(|(info, _)| info.glyph_id == 2)
+            .map(|(_, pos)| (pos.x_offset, pos.y_offset))
+            .collect();
+        assert_eq!(
+            marks,
+            [(x_offset, 400); 3_000],
+            "{base:?}: every mark sits on the base"
+        );
+        // Adding up the advances between each mark and the base takes 4.5M steps.
+        assert!(
+            steps < 4 * 3_001,
+            "{base:?}: propagation took {steps} steps"
+        );
+    }
+}
+
+#[test]
+fn fallback_mark_positioning_handles_i32_min_base_y_bearing_without_overflow() {
+    let u24be = |v: u32| -> [u8; 3] {
+        let [_, b1, b2, b3] = v.to_be_bytes();
+        [b1, b2, b3]
+    };
+
+    // Glyph 1 ('a'): simple rectangle [0, -300, 100, -200]; scaled by two nested `d = 4096.0`
+    // COLR v1 `PaintTransform`s so `y_max = -200 * 4096 * 4096 = -3_355_443_200.0`, which
+    // saturates `as i32` to `i32::MIN`!
+    let mut g1 = Vec::new();
+    g1.extend(i16be(1));
+    for v in [0i16, -300, 100, -200] {
+        g1.extend(i16be(v));
+    }
+    g1.extend(be16(3));
+    g1.extend(be16(0));
+    g1.extend([0x01u8; 4]);
+    for dx in [0i16, 100, 0, -100] {
+        g1.extend(i16be(dx));
+    }
+    for dy in [-300i16, 0, 100, -100] {
+        g1.extend(i16be(dy));
+    }
+
+    let mut glyf = Vec::new();
+    let mut loca = Vec::new();
+    for g in [&[][..], g1.as_slice(), &[][..]] {
+        loca.extend(be16((glyf.len() / 2) as u16));
+        glyf.extend_from_slice(g);
+    }
+    loca.extend(be16((glyf.len() / 2) as u16));
+
+    let mut cpal = Vec::new();
+    cpal.extend(be16(0));
+    cpal.extend(be16(1));
+    cpal.extend(be16(1));
+    cpal.extend(be16(1));
+    cpal.extend(be32(14));
+    cpal.extend(be16(0));
+    cpal.extend([0u8, 0, 0, 255]);
+
+    let mut colr = Vec::new();
+    colr.extend(be16(1));
+    colr.extend(be16(0));
+    colr.extend(be32(34));
+    colr.extend(be32(34));
+    colr.extend(be16(0));
+    colr.extend(be32(34)); // base_glyph_paints_offset
+    colr.extend(be32(0)); // layer_list_offset
+    colr.extend(be32(93)); // clip_list_offset
+    colr.extend(be32(0));
+    colr.extend(be32(0));
+    // BaseGlyphList at 34: 1 record for glyph 1 -> paint at 34 + 10 = 44.
+    colr.extend(be32(1));
+    colr.extend(be16(1));
+    colr.extend(be32(10));
+    // PaintTransform #1 at 44 (child at +7 = 51, Affine2x3 at +25 = 69).
+    colr.push(12);
+    colr.extend(u24be(7));
+    colr.extend(u24be(25));
+    // PaintTransform #2 at 51 (child at +7 = 58, Affine2x3 at +18 = 69).
+    colr.push(12);
+    colr.extend(u24be(7));
+    colr.extend(u24be(18));
+    // PaintGlyph at 58 (child PaintSolid at +6 = 64, glyph_id = 1).
+    colr.push(10);
+    colr.extend(u24be(6));
+    colr.extend(be16(1));
+    // PaintSolid at 64 (palette_index = 0xFFFF foreground, alpha = 1.0).
+    colr.push(2);
+    colr.extend(be16(0xFFFF));
+    colr.extend(be16(0x4000));
+    // Affine2x3 at 69 (24 bytes): a = 1.0, d = 4096.0 (0x1000_0000).
+    for fixed in [0x0001_0000u32, 0, 0, 0x1000_0000, 0, 0] {
+        colr.extend(be32(fixed));
+    }
+    assert_eq!(colr.len(), 93);
+    // ClipList at 93: glyph 2 (U+031B, `AttachedAboveRight`) has empty 0x0 ClipBox at +12.
+    colr.push(1);
+    colr.extend(be32(1));
+    colr.extend(be16(2));
+    colr.extend(be16(2));
+    colr.extend(u24be(12));
+    colr.push(1);
+    for _ in 0..4 {
+        colr.extend(i16be(0));
+    }
+
+    let bytes = font_with_tables(
+        &[(b'a' as u16, 1), (0x031B, 2)],
+        &[500, 500, 0],
+        &[
+            (b"CPAL", &cpal),
+            (b"COLR", &colr),
+            (b"glyf", &glyf),
+            (b"loca", &loca),
+        ],
+    );
+
+    let shaped = shape_positions(&bytes, &[], "a\u{031B}");
+    assert_eq!(shaped.len(), 2);
+    assert_eq!(shaped[1].1.y_offset, -(1 << 30));
 }

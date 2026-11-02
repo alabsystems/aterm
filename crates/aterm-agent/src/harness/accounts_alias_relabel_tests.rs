@@ -119,7 +119,9 @@ pub(crate) fn alias_transition(
         return next;
     }
     let (old, fleet, hint) = fixture(state["case"]);
-    let store = accounts::Store::at(Path::new("/tmp/aterm-alias-model"));
+    let store = accounts::Store::at(Path::new(&crate::harness::host_path::abs(
+        "/tmp/aterm-alias-model",
+    )));
     let built = build_machine_roster(&fleet, "m1", &store, old.as_ref(), hint);
     Roster::parse(&format_roster_toml(&built).unwrap()).unwrap();
     if action == "ChangedDefault" {

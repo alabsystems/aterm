@@ -143,6 +143,8 @@ fn only_the_interactive_tui_is_snapshotted() {
         &[STORE, "--brand-new"],
         &[STORE, "-i", "start here"],
         &[STORE, "--"],
+        &[STORE, "--model", "models", "--brand-new"],
+        &[STORE, "--settings", "models"],
     ] {
         assert!(is_tui_argv(&argv(words)), "{words:?}");
     }
@@ -159,9 +161,16 @@ fn only_the_interactive_tui_is_snapshotted() {
         &[STORE, "--", "hello"],
         &[STORE, "--brand-new", "x", "models"],
         &[STORE, "--brand-new", "--version"],
+        &[STORE, "--brand-new", "--", "hello"],
+        &[STORE, "--remote-control", "-p", "hi"],
+        &[STORE, "--disable-slash-commands", "--help"],
+        &[STORE, "--settings", "{}", "models"],
     ] {
         assert!(!is_tui_argv(&argv(words)), "{words:?}");
     }
+    assert!(resumes(&argv(&[STORE, "--continue"])));
+    assert!(!resumes(&argv(&[STORE, "--continue", "--help"])));
+    assert!(!resumes(&argv(&[STORE, "--continue", "models"])));
 }
 
 /// Ctrl-Z's status (`128 + SIGTSTP`).
@@ -484,4 +493,61 @@ fn the_model_flag_is_read_and_replaced_in_every_spelling() {
         "the relaunch carries the new model"
     );
     assert!(with_model(&[], "b").is_empty());
+    assert_eq!(
+        argv_model(&w("agy -i --model=evil")).as_deref(),
+        None,
+        "an interactive prompt argument is not read as --model"
+    );
+    assert_eq!(
+        with_model(&w("agy -i --model"), "b"),
+        w("agy --model=b -i --model"),
+        "with_model preserves the value of another flag"
+    );
+    assert_eq!(
+        config_flags(&w("agy -i --gemini_dir=/evil -gemini_dir")),
+        Vec::<String>::new(),
+        "config_flags ignores other flags' values and dangling config flags"
+    );
+    assert!(!shared_key_defaults(&w("---gemini_dir=/local")));
+    assert!(!shared_key_defaults(&w("--sandbox=maybe")));
+    assert_eq!(
+        rewrite_argv(&argv(&[STORE, "--sandbox=maybe"]), Some(C1)),
+        Err(ArgvRefusal::UnknownFlag("sandbox".to_string()))
+    );
+    assert_eq!(
+        told_line(
+            C1,
+            &[("HOME".into(), "/h\u{2028}x".into())],
+            &argv(&[STORE])
+        ),
+        None
+    );
+}
+
+#[test]
+fn settings_override_and_optional_fallback_follow_go_flag_rules() {
+    let w = |s: &str| -> Vec<String> { s.split_whitespace().map(str::to_owned).collect() };
+    assert!(!has_settings_override(&w("agy --effort high")));
+    assert!(has_settings_override(&w(
+        "agy --settings {\"modelProvider\":\"gemini\"}"
+    )));
+    assert!(has_settings_override(&w("agy -settings=/tmp/s.json")));
+    assert!(has_settings_override(&w("agy --settings")));
+    assert!(
+        !has_settings_override(&w("agy --model --settings")),
+        "the value of --model is not --settings"
+    );
+    assert!(
+        !has_settings_override(&w("agy -- --settings /tmp/s.json")),
+        "nothing past -- is a flag"
+    );
+    assert_eq!(config_dir_or(&w("agy"), None, None), None);
+    assert_eq!(
+        config_dir_or(&w("agy"), Some("rel"), Some(Path::new("rel"))),
+        None
+    );
+    assert_eq!(
+        config_dir_or(&w("agy --gemini_dir=/g"), None, None),
+        Some(PathBuf::from("/g/antigravity-cli"))
+    );
 }

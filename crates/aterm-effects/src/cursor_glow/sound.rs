@@ -145,7 +145,7 @@ impl CursorGlow {
         true
     }
 
-    /// Host paste seam (`docs/design/RAINBOW-KITTY-V2.md` §28): a paste landed, cue its one up-strum ([`crate::trail_sound::SoundKind::Strum`]), for a human's Cmd-V and an agent's `paste` / `turn` alike.
+    /// Host paste seam (`docs/design/RAINBOW-KITTY-V2.md` §16 row 13): a paste landed, cue its one up-strum ([`crate::trail_sound::SoundKind::Strum`]), for a human's Cmd-V and an agent's `paste` / `turn` alike.
     #[inline]
     pub fn cue_paste(&mut self, now: Instant) -> bool {
         if !self.v2.engaged() {

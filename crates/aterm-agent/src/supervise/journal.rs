@@ -65,6 +65,12 @@ pub const ATTENTION_KEPT: &str = "kept";
 /// The line a stall's hold writes (`stall.rs`'s `hold_for_stall`).
 pub const FROZEN: &str = "FROZEN";
 
+/// The words of the `NOTE seq=<n> rule=<r> … input=<w> input_bytes=<n> input_wait_ms=<ms>` a typed
+/// act journals once where its screen has not moved `REACTION_WAIT` after the write
+/// (`turn_end_loop.rs`'s `note_text_held`): the program has not shown the text, and the `status`
+/// fields after it say whether it has read it.
+pub const TEXT_HELD: &str = "the program has drawn nothing of the text written to it";
+
 /// How the line of a turn the Mac slept through in the vendor's API retry, Escaped once the API
 /// was back, begins (`supervise::run::woken_turn`).
 pub const UNSTUCK: &str = "UNSTUCK";
@@ -256,11 +262,12 @@ pub enum Noted {
     Abandoned,
     RepoUnread,
     Unstuck,
+    Receipt,
 }
 
 impl Noted {
     /// Every word, in declaration order.
-    pub const ALL: [Self; 34] = [
+    pub const ALL: [Self; 35] = [
         Self::Done,
         Self::Left,
         Self::Parked,
@@ -295,6 +302,7 @@ impl Noted {
         Self::Abandoned,
         Self::RepoUnread,
         Self::Unstuck,
+        Self::Receipt,
     ];
 
     /// How a line of this word begins (`NOT ESCALATED` is two words).
@@ -335,6 +343,7 @@ impl Noted {
             Self::Abandoned => "ABANDONED",
             Self::RepoUnread => "REPO UNREAD",
             Self::Unstuck => UNSTUCK,
+            Self::Receipt => crate::harness::land_receipt::RECEIPT,
         }
     }
 
@@ -376,6 +385,7 @@ impl Noted {
             Self::Abandoned => "abandoned",
             Self::RepoUnread => "repo-unread",
             Self::Unstuck => "unstuck",
+            Self::Receipt => "receipt",
         }
     }
 
@@ -602,8 +612,15 @@ impl JournalRecord {
             line: s("line").ok_or("no \"line\"")?,
             turn: n("turn"),
             report: n("report"),
-            mark: s("mark").and_then(|h| u64::from_str_radix(&h, 16).ok()),
-            ended: n("ended").and_then(|e| i64::try_from(e).ok()),
+            mark: s("mark").and_then(|h| {
+                (!h.is_empty() && h.bytes().all(|b| b.is_ascii_hexdigit()))
+                    .then(|| u64::from_str_radix(&h, 16).ok())
+                    .flatten()
+            }),
+            ended: match v.get("ended") {
+                Some(Json::Number(n)) => n.parse::<i64>().ok(),
+                _ => None,
+            },
         })
     }
 }
@@ -832,7 +849,17 @@ impl Journal {
 
 /// Every record in a journal file, and how many of its non-blank lines are not one.
 pub fn read_journal(path: &Path) -> Result<(Vec<JournalRecord>, usize), String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let text = match crate::harness::accounts::read_bounded(path, 64 * 1024 * 1024) {
+        Ok(Some(text)) => text,
+        Ok(None) => {
+            return Err(format!(
+                "{}: {}",
+                path.display(),
+                std::io::Error::from(std::io::ErrorKind::NotFound)
+            ));
+        }
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
     let mut out = Vec::new();
     let mut bad = 0;
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
@@ -1262,7 +1289,9 @@ mod tests {
             json.ends_with(",\"report\":null,\"ended\":1792458186177}"),
             "{json}"
         );
-        assert_eq!(JournalRecord::from_json(&json), Ok(r));
+        assert_eq!(JournalRecord::from_json(&json), Ok(r.clone()));
+        r.ended = Some(-42);
+        assert_eq!(JournalRecord::from_json(&r.to_json()), Ok(r));
         assert_eq!(old.ended, None);
         assert!(JournalRecord::from_json("{\"kind\":\"event\"}").is_err());
         assert!(JournalRecord::from_json("{\"t\":1,\"kind\":\"event\",\"line\":").is_err());

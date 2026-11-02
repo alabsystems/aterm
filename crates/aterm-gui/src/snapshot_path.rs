@@ -103,6 +103,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A file symlink, which an unelevated process may make only where Developer Mode is on
+    /// (a developer's usual Windows; the Windows lane turns it on).
     #[cfg(windows)]
     #[test]
     fn write_private_refuses_symlinked_target() {
@@ -111,15 +113,50 @@ mod tests {
         let victim = dir.join("victim.txt");
         std::fs::write(&victim, b"original").unwrap();
         let link = dir.join("evil.png");
-        if std::os::windows::fs::symlink_file(&victim, &link).is_err() {
+        if let Err(e) = std::os::windows::fs::symlink_file(&victim, &link) {
             let _ = std::fs::remove_dir_all(&dir);
-            aterm_spec::host::could_not_run("no symlink privilege here (Developer Mode is off)");
+            aterm_spec::host::could_not_run(format!(
+                "this process may not make a symlink ({e}): Developer Mode is off and it is not \
+                 elevated, so no unelevated process can plant one here either"
+            ));
         }
         assert!(
             write_private(&link, b"attack").is_err(),
             "writing through a reparse point must be refused",
         );
         assert_eq!(std::fs::read(&victim).unwrap(), b"original");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The reparse point every Windows user can make: a junction, which needs no privilege
+    /// and no Developer Mode, as a parent of the snapshot redirects the write into its target
+    /// unless the writer refuses it.
+    #[cfg(windows)]
+    #[test]
+    fn write_private_refuses_a_junction_in_its_path() {
+        let dir =
+            std::env::temp_dir().join(format!("aterm-snap-win-junction-{}", std::process::id()));
+        ensure_private_dir(&dir).unwrap();
+        let outside = dir.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let victim = outside.join("evil.png");
+        std::fs::write(&victim, b"original").unwrap();
+        let link = dir.join("link");
+        crate::pinned_dir::windows_tests::junction(&link, &outside);
+        assert!(
+            write_private(&link.join("evil.png"), b"attack").is_err(),
+            "writing through a junction must be refused",
+        );
+        assert!(
+            write_private(&link.join("planted.png"), b"attack").is_err(),
+            "so must creating a file through one",
+        );
+        assert_eq!(std::fs::read(&victim).unwrap(), b"original");
+        assert!(
+            !outside.join("planted.png").exists(),
+            "nothing was made in the junction's target"
+        );
+        let _ = std::fs::remove_dir(&link);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

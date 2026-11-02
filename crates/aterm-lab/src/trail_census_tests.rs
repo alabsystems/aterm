@@ -17,6 +17,12 @@ const LIP: Rgb = [0x36, 0x04, 0xff];
 const OLIVE: Rgb = [0x77, 0x76, 0x40];
 /// A clean but deep periwinkle (L .646, C .193): 3.97:1 under the ink.
 const DEEP: Rgb = [0x7a, 0x7a, 0xff];
+/// The glass fading into the page through its pale yellow-green (L .950, C .050, h 119.6), as at the yield's edge
+/// (§15.8 amendment 59): mud by the spec rule's C < .12 alone, so the glass's rule admits it.
+const FADE: Rgb = [0xea, 0xf4, 0xcf];
+/// A gold on the olive band's line (L .781, C .150, h 100.2): mud by the spec rule's hue band, which the glass's rule
+/// keeps, and clean by the broad rule.
+const GOLD: Rgb = [0xce, 0xb9, 0x2d];
 const CARET: Rgb = [0x93, 0x02, 0xff];
 const WHITE: Rgb = [0xff, 0xff, 0xff];
 const SELECT: Rgb = [0xcf, 0xe0, 0xff];
@@ -222,6 +228,34 @@ fn the_mud_rules_are_the_specs_numbers() {
     );
     let (l, c, _) = lch(WHITE);
     assert!((l - 1.0).abs() < 1e-3 && c < 1e-3, "white is L 1, C 0");
+
+    // The glass's rule (amendment 29): the spec rule's hue bands and the broad rule, never the spec rule's C < .12.
+    for mud in [OLIVE, [0x9a; 3], [0x8b, 0x70, 0x40], GOLD] {
+        assert!(mud_glass(lch(mud)), "{} is the glass's mud", hex(mud));
+    }
+    for clean in [GLASS, LIP, CARET, DEEP, FADE, PAGE] {
+        assert!(!mud_glass(lch(clean)), "{} is clean glass", hex(clean));
+    }
+    assert!(
+        mud_spec(lch(FADE)) && !mud_broad(lch(FADE)),
+        "the fade is the spec rule's"
+    );
+    assert!(
+        mud_spec(lch(GOLD)) && !mud_broad(lch(GOLD)),
+        "the gold is the spec rule's"
+    );
+    assert!(!mud_glass((0.95, 0.03, 200.0)) && mud_spec((0.95, 0.03, 200.0)));
+    assert!(
+        mud_glass((0.81, 0.2, 100.0))
+            && !mud_glass((0.83, 0.2, 100.0))
+            && !mud_glass((0.81, 0.2, 130.0))
+    );
+    assert!(
+        mud_glass((0.61, 0.2, 50.0))
+            && !mud_glass((0.63, 0.2, 50.0))
+            && !mud_glass((0.61, 0.2, 30.0))
+    );
+    assert!(mud_glass((0.74, 0.09, 200.0)) && !mud_glass((0.76, 0.09, 200.0)));
 }
 
 #[test]
@@ -792,6 +826,102 @@ fn the_report_reads_the_sidecars_writes_the_pixels_and_judges_its_thresholds() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A glass frame: the typed line under a glass band on row 1 whose last two cells (6 and 7) fade to the page through
+/// `edge`, as the glass does at the yield's edge, with `lip` hanging 3 px under the row.
+fn glass_frame(edge: Rgb, lip: Rgb) -> (Canvas, Canvas) {
+    let clean = typed_line();
+    let mut frame = clean.clone();
+    band(&mut frame, &clean, 1, 0..6, 2, GLASS);
+    band(&mut frame, &clean, 1, 6..8, 2, edge);
+    stroke(&mut frame, &clean, 1, 0..8, 0, 3, lip);
+    (frame, clean)
+}
+
+/// The report of `frame` under `--mud-max 0` and `more`, and the failures it names.
+fn gated(dir: &Path, (frame, clean): &(Canvas, Canvas), more: &[&str]) -> (J, Vec<String>) {
+    let png = gallery_files(dir, frame, clean)
+        .to_string_lossy()
+        .into_owned();
+    let mut words = vec![png.as_str(), "--mud-max", "0"];
+    words.extend_from_slice(more);
+    let r = report(&parse_args(&args(&words)).unwrap()).unwrap();
+    let failures = r
+        .get("failures")
+        .and_then(J::as_arr)
+        .unwrap()
+        .iter()
+        .map(|f| f.as_str().unwrap().to_string())
+        .collect();
+    (r, failures)
+}
+
+#[test]
+fn a_glass_frame_judges_its_band_by_the_glass_rule_and_its_lip_by_both() {
+    let dir = scratch("glass");
+    let both = J::Arr(vec![J::s("mud_spec"), J::s("mud_broad")]);
+    let gate = |r: &J, layer: &str| r.get("mud_gate").and_then(|g| g.get(layer)).cloned();
+
+    // The glass's pale edge is the spec rule's mud alone, so a frame not named a glass frame fails on it...
+    let fade = glass_frame(FADE, LIP);
+    let (r, failures) = gated(&dir, &fade, &[]);
+    let spec = num(&r, &["layers", "band", "core", "mud_spec"]);
+    assert!(spec > 0, "the fade lies in the band's core: {}", r.py());
+    assert_eq!(num(&r, &["layers", "band", "core", "mud_broad"]), 0);
+    assert_eq!(num(&r, &["layers", "band", "core", "mud_glass"]), 0);
+    assert_eq!(num(&r, &["layers", "rail_lip", "core", "mud_spec"]), 0);
+    assert_eq!(
+        failures,
+        vec![format!("band core: {spec} px of mud_spec over 0")]
+    );
+    assert_eq!(gate(&r, "band"), Some(both.clone()));
+    assert_eq!(gate(&r, "rail_lip"), Some(both.clone()));
+    // ...and a glass frame holds it: the glass's own pixels are judged by the glass's rule (amendment 60).
+    let tsv = dir.join("glass.tsv");
+    let (r, failures) = gated(
+        &dir,
+        &fade,
+        &["--glass", "--pixels", &tsv.to_string_lossy()],
+    );
+    assert_eq!(failures, Vec::<String>::new(), "{}", r.py());
+    assert_eq!(num(&r, &["layers", "band", "core", "mud_spec"]), spec);
+    assert_eq!(gate(&r, "band"), Some(J::Arr(vec![J::s("mud_glass")])));
+    assert_eq!(gate(&r, "rail_lip"), Some(both));
+    let text = std::fs::read_to_string(&tsv).unwrap();
+    let mut lines = text.lines();
+    assert!(
+        lines
+            .next()
+            .unwrap()
+            .ends_with("\tmud_spec\tmud_broad\tmud_glass")
+    );
+    let faded: Vec<&str> = lines.filter(|l| l.contains(&hex(FADE))).collect();
+    assert!(!faded.is_empty());
+    assert!(
+        faded.iter().all(|l| l.ends_with("\t1\t0\t0")),
+        "the fade is mud_spec alone"
+    );
+
+    // Negative controls: a glass frame's band still fails on what the glass's rule names (a gold on the olive band's
+    // line, which the broad rule passes)...
+    let (r, failures) = gated(&dir, &glass_frame(GOLD, LIP), &["--glass"]);
+    let gold = num(&r, &["layers", "band", "core", "mud_glass"]);
+    assert!(gold > 0, "{}", r.py());
+    assert_eq!(num(&r, &["layers", "band", "core", "mud_broad"]), 0);
+    assert_eq!(
+        failures,
+        vec![format!("band core: {gold} px of mud_glass over 0")]
+    );
+    // ...and its lip keeps both of the census's rules: a pale lip fails by the spec rule's C < .12.
+    let (r, failures) = gated(&dir, &glass_frame(GLASS, FADE), &["--glass"]);
+    let lip = num(&r, &["layers", "rail_lip", "core", "mud_spec"]);
+    assert!(lip > 0, "{}", r.py());
+    assert_eq!(
+        failures,
+        vec![format!("rail_lip core: {lip} px of mud_spec over 0")]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn arguments_parse_and_a_bad_one_is_a_usage_error() {
     let a = parse_args(&args(&[
@@ -808,7 +938,8 @@ fn arguments_parse_and_a_bad_one_is_a_usage_error() {
     .unwrap();
     assert_eq!(a.png, "f.png");
     assert_eq!(a.pets, vec!["1,2,3,4", "5,6,7,8"]);
-    assert_eq!((a.caret_pad, a.mud_max), (2, Some(0)));
+    assert_eq!((a.caret_pad, a.mud_max, a.glass), (2, Some(0), false));
+    assert!(parse_args(&args(&["f.png", "--glass"])).unwrap().glass);
     assert_eq!(parse_box("1,2,3,4"), Ok(bx(1, 2, 3, 4)));
     assert!(parse_box("3,2,1,4").is_err());
     assert!(parse_box("1,2,3").is_err());

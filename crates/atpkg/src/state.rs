@@ -109,7 +109,7 @@ pub fn is_alab_kept(state: &str) -> bool {
         .strip_prefix(MANAGED_PREFIX)
         .and_then(|rest| rest.split_once(" — "))
         .is_some_and(|(build, why)| {
-            build.parse().is_ok_and(crate::alab::in_store_window)
+            crate::store::parse_build_name(build).is_some_and(crate::alab::in_store_window)
                 && why.starts_with(ALAB_BUILD_WORDS)
         })
 }
@@ -397,7 +397,10 @@ pub fn system_retired(state: &str) -> Option<&str> {
 pub fn managed_pin(state: &str) -> Option<(u64, u64)> {
     let rest = state.strip_prefix(MANAGED_PREFIX)?;
     let (build, tail) = rest.split_once(" — pinned by index ")?;
-    Some((build.parse().ok()?, tail.parse().ok()?))
+    Some((
+        crate::store::parse_build_name(build)?,
+        crate::store::parse_build_name(tail)?,
+    ))
 }
 
 /// `Some((build, path))` for a `managed <build> — SHADOWED by <path>` state; a version in the build's place (a vendor-direct build, [`shadowed`]) reads back as its store id.
@@ -405,9 +408,9 @@ pub fn managed_pin(state: &str) -> Option<(u64, u64)> {
 pub fn shadowed_by(state: &str) -> Option<(u64, &str)> {
     let rest = state.strip_prefix(MANAGED_PREFIX)?;
     let (build, path) = rest.split_once(" — SHADOWED by ")?;
-    let build = match build.parse() {
-        Ok(b) => b,
-        Err(_) => crate::vendor_direct::Version::parse(build)?.build_id(),
+    let build = match crate::store::parse_build_name(build) {
+        Some(b) => b,
+        None => crate::vendor_direct::Version::parse(build)?.build_id(),
     };
     Some((build, path))
 }
@@ -780,11 +783,16 @@ mod tests {
         let odd = system(Path::new("/x — not managed by aterm/gh"), None);
         assert_eq!(system_path(&odd), Some("/x"));
         assert_eq!(managed_pin(&managed(6808, 41)), Some((6808, 41)));
+        assert_eq!(managed_pin("managed +6808 — pinned by index 41"), None);
+        assert_eq!(managed_pin("managed 06808 — pinned by index 41"), None);
+        assert_eq!(managed_pin("managed 6808 — pinned by index +41"), None);
         assert_eq!(managed_pin(&shadowed(6808, Path::new("/x/trust"))), None);
         assert_eq!(
             shadowed_by(&shadowed(6808, Path::new("/x/trust"))),
             Some((6808, "/x/trust"))
         );
+        assert_eq!(shadowed_by("managed +6808 — SHADOWED by /x/trust"), None);
+        assert_eq!(shadowed_by("managed 06808 — SHADOWED by /x/trust"), None);
         assert_eq!(shadowed_by(&managed(6808, 41)), None);
         assert!(is_managed(&managed(1, 1)) && is_managed(&shadowed(1, Path::new("/p"))));
         for other in [

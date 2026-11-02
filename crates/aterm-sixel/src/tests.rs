@@ -91,6 +91,95 @@ fn tall_raster_width_growth_stays_amortized_near_the_pixel_cap() {
     );
 }
 
+/// `growth-amortized` (f): the pixels one image's re-strides copy, summed.
+const RESTRIDE_WORK_BOUND: usize = 32 * SIXEL_MAX_PIXELS;
+
+/// Feeds `body` a byte at a time, adding the raster's size at each stride change.
+fn restride_work(body: &[u8]) -> (usize, Option<SixelImage>) {
+    let mut d = SixelDecoder::new();
+    d.hook();
+    let (mut work, mut stride) = (0usize, 0usize);
+    for &b in body {
+        d.put(b);
+        if d.alloc_width != stride {
+            stride = d.alloc_width;
+            work += d.raster.len();
+            assert!(
+                work <= RESTRIDE_WORK_BOUND,
+                "re-strides copied {work} pixels by byte {b:?}"
+            );
+        }
+    }
+    (work, d.unhook())
+}
+
+#[test]
+fn growth_past_an_over_wide_stride_copies_the_raster_a_bounded_number_of_times() {
+    // A second colour one column wider doubles the stride to 2000, so from row 2098 on
+    // the raster must re-stride to grow; it grows one band per 2 bytes after that.
+    let mut tall = b"#1;2;100;0;0#1!1000~$!1001~".to_vec();
+    for _ in 0..682 {
+        tall.extend_from_slice(b"-~");
+    }
+    let (_, img) = restride_work(&tall);
+    let img = img.expect("1001x4096 fits under SIXEL_MAX_PIXELS");
+    assert_eq!((img.width(), img.height()), (1001, 4096));
+    let px = img.pixels();
+    assert!(px[..1001].iter().all(|&p| p == 0xFFFF_0000));
+    assert!(px.iter().step_by(1001).all(|&p| p == 0xFFFF_0000));
+
+    // Each band one column wider than every band above it, alternating width and
+    // height growth: 460 bands stay under the cap.
+    let mut widening = b"#1;2;100;0;0#1!1000~$!1001~".to_vec();
+    for k in 0..460 {
+        widening.extend_from_slice(format!("-!{}?~", 1001 + k).as_bytes());
+    }
+    let (_, img) = restride_work(&widening);
+    let img = img.expect("1461x2766 fits under SIXEL_MAX_PIXELS");
+    assert_eq!((img.width(), img.height()), (1461, 2766));
+    assert_eq!(img.pixels()[2765 * 1461 + 1460], 0xFFFF_0000);
+
+    // Each step makes the cheaper of the two growths that force a re-stride: one column
+    // past the stride, or one row past the height the stride holds.
+    let mut d = SixelDecoder::new();
+    d.hook();
+    let (mut w, mut h, mut work) = (1usize, 1usize, 0usize);
+    d.ensure_capacity(0, 0);
+    d.max_x = 1;
+    loop {
+        let aw = d.alloc_width;
+        let wider = (aw + 1, h);
+        let taller = (w, (SIXEL_MAX_PIXELS / aw).max(h) + 1);
+        let Some((nw, nh)) = [wider, taller]
+            .into_iter()
+            .filter(|&(x, y)| {
+                x <= SIXEL_MAX_DIMENSION && y <= SIXEL_MAX_DIMENSION && x * y <= SIXEL_MAX_PIXELS
+            })
+            .min_by_key(|&(x, y)| x * y)
+        else {
+            break;
+        };
+        (w, h) = (nw, nh);
+        d.ensure_capacity(w - 1, h - 1);
+        d.max_x = w;
+        assert!(
+            d.alloc_width >= w && d.alloc_height >= h,
+            "{w}x{h} fits under the cap, so it must be granted"
+        );
+        if d.alloc_width != aw {
+            work += d.raster.len();
+            assert!(
+                work <= RESTRIDE_WORK_BOUND,
+                "re-strides copied {work} pixels by {w}x{h}"
+            );
+        }
+    }
+    assert!(
+        w * h > SIXEL_MAX_PIXELS / 2,
+        "the walk reaches the cap: {w}x{h}"
+    );
+}
+
 #[test]
 fn small_bodies_decode_to_their_geometry_in_the_defined_colour() {
     for (body, width, height) in [
@@ -126,6 +215,24 @@ fn oversized_raster_declaration_is_refused_without_allocating() {
         d.unhook().is_none(),
         "an over-cap image must be dropped, not composed"
     );
+
+    // An undeclared multi-band paint whose combined painted box exceeds `SIXEL_MAX_PIXELS`
+    // (`2000 * 3606 > 4,194,304`) must also return `None` rather than silently truncating to band 0.
+    let mut undeclared = vec![b'~'];
+    undeclared.extend(core::iter::repeat_n(b'-', 600));
+    undeclared.extend_from_slice(b"!2000~");
+    assert!(
+        decode(&undeclared).is_none(),
+        "undeclared over-cap multi-band paint must yield None"
+    );
+
+    let mut declared_small_then_overcap = b"\"1;1;10;10".to_vec();
+    declared_small_then_overcap.extend(core::iter::repeat_n(b'-', 600));
+    declared_small_then_overcap.extend_from_slice(b"!2000~");
+    assert!(
+        decode(&declared_small_then_overcap).is_none(),
+        "over-cap paint past a small DECGRA declaration must yield None"
+    );
 }
 
 #[test]
@@ -153,6 +260,25 @@ fn partial_last_band_at_pixel_cap_decodes_without_band_rounding_refusal() {
     let last_row = &img.pixels()[4087 * 1026..4088 * 1026];
     assert!(last_row.iter().all(|&px| px == 0xFFFF_0000));
     assert!(img.pixels()[..4087 * 1026].iter().all(|&px| px == 0));
+
+    // Geometric width doubling (`1024 -> 2048` on column 1025) must compact back within
+    // `SIXEL_MAX_PIXELS / new_h` when height later grows to 4088 (`1025 * 4088 <= SIXEL_MAX_PIXELS`).
+    let mut over_strided = b"#1;2;100;0;0#1!1024~~".to_vec();
+    over_strided.extend(core::iter::repeat_n(b'-', 681));
+    over_strided.extend_from_slice(b"!1025A");
+    let compacted = decode(&over_strided)
+        .expect("1025x4088 fits under SIXEL_MAX_PIXELS even after geometric stride doubling");
+    assert_eq!((compacted.width(), compacted.height()), (1025, 4088));
+    assert!(
+        compacted.pixels()[..1025]
+            .iter()
+            .all(|&px| px == 0xFFFF_0000)
+    );
+    assert!(
+        compacted.pixels()[4087 * 1025..4088 * 1025]
+            .iter()
+            .all(|&px| px == 0xFFFF_0000)
+    );
 }
 
 #[test]

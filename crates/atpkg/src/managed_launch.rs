@@ -186,12 +186,13 @@ fn producer_target(layout: &Layout, entry: &Path) -> Option<PathBuf> {
             if atpkg.as_deref().is_some_and(|p| !normalized(p)) {
                 return None;
             }
-            crate::platform::twin_prelude(
+            crate::platform::twin_prelude_with_launcher(
                 "codex",
                 &layout.prefix,
                 atpkg.as_deref(),
                 crate::selfupdate::verbs_of("codex"),
                 &crate::yolo::policy_of("codex"),
+                crate::native_defaults::Launcher::recorded(&body).as_ref(),
             )
         }
         Origin::DevLink => String::new(),

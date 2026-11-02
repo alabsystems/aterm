@@ -1,0 +1,33 @@
+# kimi 2.4.0 · MEASURED 2026-10-29, `aterm ctl text` of a private headless aterm (110x32, aterm 0.146.0) running the real Kimi Code, launched by path with a scratch `HOME` and `KIMI_CODE_HOME` whose `config.toml` names one `openai`-type provider at `http://127.0.0.1:<port>/v1` with a fake key (a local stub of the Chat Completions API, crates/aterm-lab), no login · the stub asks for `Bash` `echo lab-kimi-tool` (mode askbash): the `▶ Run this command?` approval box in place of the composer, `Approve once` selected
+ ❯ lab streaming turn
+
+ ● tick 1 tick 2 tick 3 tick 4 tick 5 tick 6 tick 7 tick 8 tick 9 tick 10 tick 11 tick 12 tick 13 tick 14
+   tick 15 tick 16 tick 17 tick 18 tick 19 tick 20 tick 21 tick 22 tick 23 tick 24 tick 25 tick 26 tick 27
+   tick 28 tick 29 tick 30
+
+ ❯ lab interrupt with ctrl-c
+   Interrupted by user
+
+ ❯ lab interrupt with esc
+   Interrupted by user
+
+ ❯ lab run a shell command
+
+ ● Running a command · $ echo lab-kimi-tool
+   Press Ctrl+B to run in background
+ ────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   ▶ Run this command?
+
+   cwd: /private/tmp/at.H2aa/proj
+   $ echo lab-kimi-tool
+     print a lab marker
+
+   ▶ 1. Approve once
+     2. Approve for this session
+     3. Reject
+     4. Reject with feedback
+
+   ↑/↓ select · 1/2/3/4 choose · ↵ confirm
+ ────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ lab-model  …/tmp/at.H2aa/proj                                       ctrl+o expand | ! to run a shell command
+                                                                                     context: 22% (21k/97.7k)

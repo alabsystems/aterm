@@ -276,6 +276,46 @@ fn a_successor_paces_by_the_lines_typed_at_a_break_alone() {
     );
 }
 
+/// A HELD FACT TYPED AT A BREAK PACES THE NEXT LINE ([`break_lines_in`]): this session's
+/// `fact-program-check@v1` row typed at `door=break` is a line that went, as a stuck line's is,
+/// and the same fact riding a prompt (`door=turn-end`) or left unsent is none.
+#[test]
+fn a_held_fact_typed_at_a_break_paces_the_next_line() {
+    let held = EpisodeKey {
+        kind: FactKind::ProgramCheck,
+        id: 1_760_000_000_000,
+    };
+    let rule = FactKind::ProgramCheck.rule();
+    let body = [
+        row(
+            SID,
+            1,
+            rule,
+            Outcome::Typed,
+            &fact_outcome_reason(held, FactDoor::TurnEnd, Told::Typed),
+        ),
+        row(
+            SID,
+            2,
+            rule,
+            Outcome::Skipped,
+            &fact_outcome_reason(held, FactDoor::Break, Told::Skipped("not-submitted")),
+        ),
+        row(
+            SID,
+            3,
+            rule,
+            Outcome::Typed,
+            &fact_outcome_reason(held, FactDoor::Break, Told::Typed),
+        ),
+    ]
+    .join("\n");
+    assert_eq!(
+        break_lines_in(&body, Some(SID)),
+        [(3, FactKind::ProgramCheck)]
+    );
+}
+
 /// THE WAKE DOOR'S ROWS READ BACK BY THEIR EPISODE: a successor seeds a wake's intent
 /// (`kind=wake`), its `typed` and `skipped` outcomes and an answer told by its await as the
 /// wake's own episode; it paces by the line typed at a break, and seeds the door's books from it

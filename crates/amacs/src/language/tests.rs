@@ -967,6 +967,25 @@ fn commit_editmsg_detects_fills_at_72_and_flags_a_51_character_summary() {
 }
 
 #[test]
+fn rust_raw_string_stops_at_its_closing_hashes_and_git_trailer_requires_alphanumeric_ends() {
+    assert_eq!(
+        render(Language::Rust, "r\"a\"#[derive(Debug)]"),
+        "S«r\"a\"» M«#[derive» P«(» P«)]»"
+    );
+    assert_eq!(
+        render(Language::Rust, "r#\"a\"##[derive(Debug)]"),
+        "S«r#\"a\"#» M«#[derive» P«(» P«)]»"
+    );
+    assert_eq!(
+        render(
+            Language::GitCommit,
+            "summary\n\nSigned-off-by: A\n-: not a trailer\nfoo-: not a trailer"
+        ),
+        "H«summary»\n\nK«Signed-off-by:»\n\n"
+    );
+}
+
+#[test]
 fn contracted_scalar_core_matches_the_std_forms() {
     for byte in 0..=u8::MAX {
         assert_eq!(line_space(byte), b" \t\r".contains(&byte), "{byte:#04x}");

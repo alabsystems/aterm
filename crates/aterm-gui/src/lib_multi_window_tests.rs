@@ -193,58 +193,6 @@ fn on_resize_never_yields_a_degenerate_or_wedged_grid() {
     }
 }
 
-fn compose_band_for_test(app: &mut App) {
-    let wid = WindowId(0);
-    let terminal = app
-        .front_terminal(wid)
-        .expect("front terminal")
-        .term
-        .clone();
-    {
-        let ws = app.windows.get_mut(&wid).expect("window 0");
-        let mut term = crate::term_lock(&terminal);
-        term.cell_frame_into(&mut ws.input_scratch, 24, 80);
-    }
-    app.splice_message_band(wid, aterm_render::Theme::default());
-}
-
-#[test]
-fn the_composed_band_is_sealed_on_the_row_that_meets_the_terminal() {
-    use aterm_messages::{Message, Severity, tags};
-    let ink = crate::chrome_band::band_colors(aterm_render::Theme::default()).label;
-    let line = |app: &App, row: usize| {
-        crate::message_band::closing_line(&app.windows[&WindowId(0)].input_scratch, row)
-    };
-
-    let mut app = App::headless_for_test();
-    app.post_message(Message::new(tags::SESSION, Severity::Info, "first"));
-    let second = app.post_message(Message::new(tags::SESSION, Severity::Info, "second"));
-    assert_eq!(app.message_band_rows, 2, "two rows committed");
-    app.messages.dismiss(second, std::time::Instant::now());
-    app.sync_messages();
-    assert_eq!(
-        app.message_band_rows, 2,
-        "the count lags the dismissal, so the splice PADS — the case under test"
-    );
-    compose_band_for_test(&mut app);
-    let colors = crate::chrome_band::band_colors(aterm_render::Theme::default());
-    let divider = crate::chrome_band::mix3(
-        colors.bar_bg,
-        colors.label,
-        crate::message_band::DIVIDER_ALPHA,
-    );
-    assert_eq!(
-        line(&app, 0),
-        Some(divider),
-        "the seam must leave the row above"
-    );
-    assert_eq!(
-        line(&app, 1),
-        Some(ink),
-        "the padded row meets the terminal, so it carries the seam"
-    );
-}
-
 #[test]
 fn native_tab_install_and_close_are_atomic_without_a_pty_mirror() {
     let mut app = App::headless_for_test();

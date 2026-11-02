@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! The mode light as the mode's one home where the glass rewrites Claude Code's mode row
-//! (`yolo`, `nag mode`), under the footer's gate.
+//! (`yolo`, `manual mode`), under the footer's gate.
 
 use std::time::{Duration, Instant};
 
@@ -76,7 +76,7 @@ fn mode_glass(app: &App, wid: WindowId) -> String {
 }
 
 /// THE MODE LIGHT IS THE MODE'S ONE HOME: where the glass rewrites the mode row (the pill and
-/// the key hints dropped, no job to keep: a blank row) the light names manual mode `nag mode`
+/// the key hints dropped, no job to keep: a blank row) the light names manual mode `manual mode`
 /// in one run of cells, at every width the whole row is drawn, pushing neither Autopilot nor
 /// the model off, and its last cell is still the click that asks for the next mode. Bypass, an
 /// expected mode no light shows at rest on Claude's own row, reads `yolo` alone there. A row
@@ -98,7 +98,7 @@ fn the_mode_light_is_the_modes_one_home_on_a_rewritten_row() {
                 "{what}: the gate's witness, the mode row: {row:?}"
             );
             let word = if rewrite {
-                "\u{23F8} nag mode"
+                "\u{23F8} manual mode"
             } else {
                 "\u{23F8} manual"
             };
@@ -143,15 +143,15 @@ fn the_mode_light_is_the_modes_one_home_on_a_rewritten_row() {
     }
     let jobs = "  \u{23F8} manual mode on \u{00B7} 2 monitors \u{00B7} 1 shell";
     for (mode, rewritten) in [(MANUAL, true), (jobs, false)] {
-        let (mut app, wid, session, _reader, _host) = claude_app(33, true);
-        let cut = mode_row_in(mode, 33);
+        let (mut app, wid, session, _reader, _host) = claude_app(36, true);
+        let cut = mode_row_in(mode, 36);
         assert!(cut.ends_with('\u{2026}'), "Claude's own cut: {cut:?}");
         draw_claude(&app, session, &cut);
         frame(&mut app, wid);
         let glass = mode_glass(&app, wid);
         if rewritten {
             assert!(glass.trim().is_empty(), "a cut key hint goes: {glass:?}");
-            assert_eq!(light_cells(&app, wid).1, "\u{23F8} nag mode", "{cut:?}");
+            assert_eq!(light_cells(&app, wid).1, "\u{23F8} manual mode", "{cut:?}");
         } else {
             assert_eq!(glass.trim_end(), cut, "a cut row stands");
             assert_eq!(light_cells(&app, wid).1, "\u{23F8} manual", "{cut:?}");
@@ -160,13 +160,13 @@ fn the_mode_light_is_the_modes_one_home_on_a_rewritten_row() {
 }
 
 /// THE MODE LIGHT'S TITLES NAME BYPASS AND MANUAL AS THE LIGHT DOES: where the row is rewritten
-/// the hover says `click for yolo or auto`, a stop says `stopped in nag mode`, and the arrival
+/// the hover says `click for yolo or auto`, a stop says `stopped in manual mode`, and the arrival
 /// reads `yolo`; on Claude's own row they say `bypass` and `manual mode`.
 #[test]
 fn the_mode_lights_titles_name_bypass_and_manual_as_the_light_does() {
     for rewrite in [true, false] {
         let (on, off, stopped, arrived) = if rewrite {
-            ("yolo", "nag mode", "stopped in nag mode", "yolo")
+            ("yolo", "manual mode", "stopped in manual mode", "yolo")
         } else {
             (
                 "bypass",
@@ -237,7 +237,7 @@ fn the_mode_lights_titles_name_bypass_and_manual_as_the_light_does() {
 
 /// THE MODE LIGHT'S WORD FOLLOWS THE REWRITE THE GLASS TAKES: with the cursor on the mode row
 /// the row stands as Claude drew it and the light says `manual`; the cursor back at the caret,
-/// the row is rewritten and the light says `nag mode`.
+/// the row is rewritten and the light says `manual mode`.
 #[test]
 fn the_mode_lights_word_follows_the_rewrite_the_glass_takes() {
     let (mut app, wid, session, _reader, _host) = claude_app(120, true);
@@ -256,5 +256,5 @@ fn the_mode_lights_word_follows_the_rewrite_the_glass_takes() {
     let row = mode_glass(&app, wid);
     assert!(row.trim().is_empty(), "{row:?}");
     let (_, text) = light_cells(&app, wid);
-    assert_eq!(text, "\u{23F8} nag mode");
+    assert_eq!(text, "\u{23F8} manual mode");
 }

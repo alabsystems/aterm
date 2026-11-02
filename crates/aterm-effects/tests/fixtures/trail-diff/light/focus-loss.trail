@@ -7,6 +7,7 @@
 # and loses it again.
 
 foreach-scheme light {
+  scale 2
   grid 16 80
   style rainbow kitty
   hz 60

@@ -394,6 +394,7 @@ pub fn decode_line(line: &[u8]) -> Result<Frame, LineError> {
     let (subj, body) = (fields[1], fields[2]);
     let num = |k: &str| -> Result<u64, LineError> {
         kv.get(k)
+            .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
             .and_then(|v| v.parse().ok())
             .ok_or(LineError::Field)
     };
@@ -637,6 +638,7 @@ pub fn segment_version(first_line: &[u8]) -> Option<u32> {
     let rest = first_line.strip_prefix(b"s1\t*\t#seg\t")?;
     rest.split(|&b| b == b'\t')
         .find_map(|f| f.strip_prefix(b"v="))
+        .filter(|v| !v.is_empty() && v.iter().all(u8::is_ascii_digit))
         .and_then(|v| std::str::from_utf8(v).ok())
         .and_then(|v| v.parse().ok())
 }

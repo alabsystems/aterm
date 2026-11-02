@@ -1,21 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The motion layer (design §10.4.6).
+//! The motion layer (design §10.4).
 
 #![allow(
     clippy::many_single_char_names,
-    reason = "the recipes use the design's own symbols — x, e, g, h, t, u, q — so each line reads against §10.4.6"
+    reason = "the recipes use short math symbols — x, e, g, h, t, u, q — so each line reads as a formula"
 )]
 
 use crate::center::{Echo, EchoKind};
 use crate::glass::Fnv;
 use crate::{
     COMET_HEAD_LIFT, COMET_LEAD_PERMILLE, COMET_PERIOD, COMET_PERMILLE, Duration, ECHO_DRAIN,
-    ECHO_FADE, ECHO_FAULT_CROSS, ECHO_FAULT_FLASH, ECHO_SWEEP, ECHO_SWEEP_PERMILLE, FILL_GLIDE,
-    FILL_GLIDE_MAX, FILL_GLIDE_PER_POINT, GLINT_DELAY, GLINT_MIN_HALF_CELLS, GLINT_PEAK,
-    GLINT_PERIOD, GLINT_RADIUS_PERMILLE, GLINT_TRAVEL, Instant,
+    ECHO_FADE, ECHO_FAULT_CROSS, ECHO_FAULT_FLASH, ECHO_SWEEP, ECHO_SWEEP_PERMILLE, GLINT_DELAY,
+    GLINT_MIN_HALF_CELLS, GLINT_PEAK, GLINT_PERIOD, GLINT_RADIUS_PERMILLE, GLINT_TRAVEL, Instant,
 };
+// The easings and the glide live in the shared motion vocabulary (`aterm_scene::motion`); the
+// band draws with them as it always has, and keeps their old paths here.
+#[cfg(test)]
+pub(crate) use aterm_scene::motion::ease_out_cubic;
+pub(crate) use aterm_scene::motion::glide;
+pub use aterm_scene::motion::{ease_out_quad, glide_span};
+use aterm_scene::motion::{frac, frac_fine};
 
 /// The whole row as a fraction.
 pub const ROW: u32 = 65_536;
@@ -217,7 +223,8 @@ impl Surface {
                 (true, false) if x1 > x0 => 0,
                 (false, true) if x1 > x0 => ROW - 1,
                 _ => {
-                    let mid = (x0 + x1) * u64::from(ROW) / (2 * w);
+                    let mid =
+                        (u128::from(x0) + u128::from(x1)) * u128::from(ROW) / (2 * u128::from(w));
                     u32::try_from(mid.saturating_sub(1)).unwrap_or(ROW)
                 }
             };
@@ -462,31 +469,6 @@ pub(crate) fn breath(p: u32) -> u32 {
     u32::try_from(v).unwrap_or(u32::MAX)
 }
 
-/// Ease-out cubic.
-#[inline]
-#[must_use]
-#[cfg(test)]
-pub(crate) fn ease_out_cubic(u: u32) -> u32 {
-    let v = ONE - u64::from(u).min(ONE);
-    u32::try_from(ONE - ((((v * v) >> 16) * v) >> 16)).unwrap_or(u32::MAX)
-}
-
-/// Ease-out quadratic.
-#[inline]
-#[must_use]
-pub fn ease_out_quad(u: u32) -> u32 {
-    let v = ONE - u64::from(u).min(ONE);
-    u32::try_from(ONE - ((v * v) >> 16)).unwrap_or(u32::MAX)
-}
-
-/// `t` as a Q16 fraction of `span`, clamped to [0, 1].
-#[inline]
-fn frac(t: Duration, span: Duration) -> u32 {
-    let span = span.as_millis().max(1);
-    let t = t.as_millis().min(span);
-    u32::try_from(t * u128::from(ONE) / span).unwrap_or(u32::MAX)
-}
-
 #[inline]
 fn ms32(d: Duration) -> u32 {
     u32::try_from(d.as_millis()).unwrap_or(u32::MAX)
@@ -502,32 +484,6 @@ fn scale(q: u8, f: u32) -> u8 {
 #[inline]
 const fn permille_q16(p: u32) -> i64 {
     (if p < 1000 { p } else { 1000 }) as i64 * (ROW as i64) / 1000
-}
-
-/// How long a glide from `from` to `to` (permille) takes.
-#[must_use]
-pub fn glide_span(from: u16, to: u16) -> Duration {
-    let points_x10 = u64::from(from.abs_diff(to));
-    let per = u64::try_from(FILL_GLIDE_PER_POINT.as_micros()).unwrap_or(u64::MAX);
-    let extra = Duration::from_micros(per.saturating_mul(points_x10) / 10);
-    (FILL_GLIDE + extra).min(FILL_GLIDE_MAX)
-}
-
-/// The shown fill of a data jump from `from` to `to`, `t` into its [`glide_span`].
-#[must_use]
-pub(crate) fn glide(from: u16, to: u16, t: Duration) -> u16 {
-    let u = u64::from(ease_out_quad(frac_fine(t, glide_span(from, to))));
-    let (from, to) = (i64::from(from), i64::from(to));
-    let v = from + ((to - from) * i64::try_from(u).unwrap_or(0)) / 65_536;
-    u16::try_from(v.clamp(0, 1000)).unwrap_or(1000)
-}
-
-/// [`frac`] to the microsecond: a glide is read on the display's own
-/// cadence, whose period is not a whole number of milliseconds.
-fn frac_fine(t: Duration, span: Duration) -> u32 {
-    let span = span.as_micros().max(1);
-    let t = t.as_micros().min(span);
-    u32::try_from(t * u128::from(ONE) / span).unwrap_or(u32::MAX)
 }
 
 /// The comet's head, Q16 of the row, `age` into its crossing.
@@ -875,6 +831,7 @@ pub(crate) fn anim_ms(d: Duration) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{FILL_GLIDE, FILL_GLIDE_MAX};
 
     #[test]
     fn easings_hit_their_ends() {
@@ -952,6 +909,9 @@ mod tests {
             bar_in(permille_q16(620), None, true, Tone::FULL, 0)
         );
         assert!(!bar_glints(10) && bar_glints(15));
+        let mut flat = s.clone();
+        flat.flat = true;
+        let _ = flat.span(u64::MAX / 2, u64::MAX / 2, u64::MAX);
     }
 
     /// Every echo covers the whole row: a Complete's wipe ends at the window's

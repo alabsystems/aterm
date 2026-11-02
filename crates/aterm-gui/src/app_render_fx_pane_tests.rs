@@ -101,7 +101,6 @@ fn project(dst: &mut RenderInput, clip: Option<ComposedCursorEffectClip>, layers
             active_cursor_fill: None,
             fx_layers: layers,
             bloom_gate: aterm_core::render::BloomGate::Open,
-            pet_veil: &[],
         },
         clip,
         None,

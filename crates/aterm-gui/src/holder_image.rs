@@ -362,13 +362,15 @@ impl HolderImage {
     }
 }
 
-fn kept_exe(exe: &Path) -> &Path {
+pub(crate) fn kept_exe(exe: &Path) -> &Path {
     #[cfg(target_os = "linux")]
     let exe = atpkg::image::strip_deleted(exe);
     exe
 }
 
-fn is_script_shell(exe: &Path) -> bool {
+/// Whether `exe` is a script shell's image ([`atpkg::image::SCRIPT_SHELLS`]), whose script is
+/// its `argv[1]`.
+pub(crate) fn is_script_shell(exe: &Path) -> bool {
     exe.file_name()
         .and_then(|n| n.to_str())
         .is_some_and(|n| atpkg::image::SCRIPT_SHELLS.contains(&n))
@@ -432,7 +434,7 @@ pub(crate) fn read(pgid: i32, last: Option<&HolderImage>) -> HolderImage {
 
 /// `pgid`'s leader's start in microseconds, or `None` (gone, another user's).
 #[cfg(target_vendor = "apple")]
-fn start_us_of(pgid: i32) -> Option<u64> {
+pub(crate) fn start_us_of(pgid: i32) -> Option<u64> {
     let birth = aterm_uds::process::read_process_birth(pgid)?;
     birth
         .seconds
@@ -442,13 +444,13 @@ fn start_us_of(pgid: i32) -> Option<u64> {
 
 /// `pgid`'s leader's start in microseconds, or `None` (gone, another user's).
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn start_us_of(pgid: i32) -> Option<u64> {
+pub(crate) fn start_us_of(pgid: i32) -> Option<u64> {
     aterm_uds::process::read_process_start(pgid).map(|s| s.boot.0 / 1_000)
 }
 
 /// No start record wired here: every image is untracked.
 #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
-fn start_us_of(_pgid: i32) -> Option<u64> {
+pub(crate) fn start_us_of(_pgid: i32) -> Option<u64> {
     None
 }
 

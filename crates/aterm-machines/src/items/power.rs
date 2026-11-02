@@ -295,7 +295,7 @@ impl Power {
                 ),
             });
         };
-        value.parse().map_err(|_| Probe::Unusable {
+        crate::parse_uint(value).ok_or_else(|| Probe::Unusable {
             why: format!(
                 "`pmset -g custom` gave {} {value:?}, not a number",
                 self.setting.key

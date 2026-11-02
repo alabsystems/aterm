@@ -194,15 +194,22 @@ struct ColorRamp {
 
 impl ColorRamp {
     fn sample(&self, t: f32) -> RgbaColor {
-        let first = self.stops[0];
-        let last = self.stops[self.stops.len() - 1];
+        let (Some(&first), Some(&last)) = (self.stops.first(), self.stops.last()) else {
+            return RgbaColor::new(0, 0, 0, 0);
+        };
         if t.is_nan() {
             return first.1;
         }
         let (lo, hi) = (first.0, last.0);
         let span = hi - lo;
-        if span <= 0.0 {
+        if !span.is_finite() || span <= 0.0 {
             return last.1;
+        }
+        if !t.is_finite() {
+            return match self.extend {
+                GradientExtend::Pad if t.is_sign_positive() => last.1,
+                _ => first.1,
+            };
         }
         let t = match self.extend {
             GradientExtend::Pad => t.clamp(lo, hi),
@@ -212,7 +219,7 @@ impl ColorRamp {
                 lo + span * if m > 1.0 { 2.0 - m } else { m }
             }
         };
-        if t <= first.0 {
+        if !t.is_finite() || t <= first.0 {
             return first.1;
         }
         if t >= last.0 {
@@ -223,9 +230,11 @@ impl ColorRamp {
             i += 1;
         }
         let (o0, c0) = self.stops[i];
-        let (o1, c1) = self.stops[i + 1];
+        let Some(&(o1, c1)) = self.stops.get(i + 1) else {
+            return last.1;
+        };
         let d = o1 - o0;
-        if d <= 0.0 {
+        if !d.is_finite() || d <= 0.0 {
             return c1;
         }
         lerp_premul(c0, c1, (t - o0) / d)
@@ -401,7 +410,12 @@ impl ColrCanvas<'_> {
             for i in 0..n {
                 let (x0, y0) = contour[i];
                 let (x1, y1) = contour[(i + 1) % n];
-                if y0 == y1 {
+                if !x0.is_finite()
+                    || !y0.is_finite()
+                    || !x1.is_finite()
+                    || !y1.is_finite()
+                    || y0 == y1
+                {
                     continue;
                 }
                 edges.push((x0, y0, x1, y1));
@@ -723,13 +737,17 @@ pub(crate) fn rasterize_colr_run(
     {
         return None;
     }
+    let buf_len = w.checked_mul(h)?.checked_mul(4)?;
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(buf_len).ok()?;
+    buf.resize(buf_len, 0);
     let base = colr_fit(face, glyphs, w, h)?;
     let fg = RgbaColor::new(0, 0, 0, 255);
     let mut canvas = ColrCanvas {
         face,
         w,
         h,
-        buf: vec![0u8; w * h * 4],
+        buf,
         stack: Vec::new(),
         cur: base,
         palette: 0,
@@ -768,6 +786,9 @@ fn unpremultiply_straight(buf: &mut [u8]) {
 }
 
 fn add_span(cov: &mut [f32], x0: f32, x1: f32, amount: f32) {
+    if x0.is_nan() || x1.is_nan() {
+        return;
+    }
     let (x0, x1) = (x0.max(0.0), x1.min(cov.len() as f32));
     if x1 <= x0 {
         return;
@@ -889,6 +910,9 @@ mod tests {
         let mut cov = vec![0.0f32; 5];
         add_span(&mut cov, 1.5, 2.5, 1.0);
         assert!((cov[1] - 0.5).abs() < 1e-6 && (cov[2] - 0.5).abs() < 1e-6);
+        let mut cov_nan = vec![0.0f32; 5];
+        add_span(&mut cov_nan, f32::NAN, f32::NAN, 1.0);
+        assert_eq!(cov_nan, vec![0.0; 5]);
     }
 
     #[test]
@@ -1033,6 +1057,13 @@ mod tests {
             two(GradientExtend::Reflect).sample(1.25).red,
             p.sample(0.75).red
         );
+        assert_eq!(
+            ramp(GradientExtend::Repeat, &[(f32::INFINITY, (90, 0, 0, 255))])
+                .sample(0.5)
+                .red,
+            90
+        );
+        assert_eq!(two(GradientExtend::Repeat).sample(f32::INFINITY).alpha, 255);
     }
 
     #[test]

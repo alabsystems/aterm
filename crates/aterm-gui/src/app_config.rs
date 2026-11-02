@@ -70,6 +70,14 @@ pub(crate) const DEFAULT_SCROLLBAR: bool = cfg!(windows);
 /// Whether new tabs keep Rewind's screen history when `temporal_recording` is unset.
 pub(crate) const DEFAULT_TEMPORAL_RECORDING: bool = true;
 
+/// Seconds untouched before a window rests when `idle_rest_secs` is unset: 0, so no window rests
+/// unless the person sets it. 30 is the measured candidate: a resting window's footprint fell by
+/// about 195 MiB, but over 212 rested and 210 awake first keys the rested key's p95 measured 1.64
+/// ms over an awake window's, past the 1 ms the rest's design allows, in the first submit after
+/// the GPU goes quiet. It stays 0 until a warm-up at the wake meets that bar (ATERM-KI-1027-4,
+/// `docs/measured/idle-memory-rest-2026-10-29.md`).
+pub(crate) const DEFAULT_IDLE_REST_SECS: f32 = 0.0;
+
 /// `mb` mebibytes in bytes.
 const fn mib(mb: u32) -> usize {
     (mb as usize) * 1024 * 1024
@@ -85,6 +93,8 @@ pub(crate) struct Config {
     pub(crate) scrollback_lines: Option<usize>,
     pub(crate) cursor_style: Option<String>,
     pub(crate) cursor_blink: Option<bool>,
+    /// Seconds untouched before a window rests (`idle_rest_secs`, [`Config::idle_rest_or_default`]).
+    pub(crate) idle_rest_secs: Option<f32>,
     pub(crate) foreground: Option<String>,
     pub(crate) background: Option<String>,
     pub(crate) cursor_color: Option<String>,
@@ -214,7 +224,6 @@ pub(crate) struct Config {
     pub(crate) update: Option<UpdateConfig>,
     pub(crate) sparkle_words: Option<SparkleWordsConfig>,
     pub(crate) matrix_rain: Option<MatrixRainConfig>,
-    pub(crate) presence: Option<PresenceConfig>,
     pub(crate) claude_footer: Option<ClaudeFooterConfig>,
     pub(crate) render: Option<RenderConfig>,
     pub(crate) output_streak: Option<OutputStreakConfig>,
@@ -1574,14 +1583,6 @@ pub(crate) struct MatrixRainConfig {
     pub(crate) seed: Option<u64>,
 }
 
-/// The `[presence]` table.
-#[derive(Default, Clone, PartialEq, serde::Deserialize)]
-#[cfg_attr(test, derive(Debug))]
-#[serde(default)]
-pub(crate) struct PresenceConfig {
-    pub(crate) rim: Option<bool>,
-}
-
 /// The `[claude_footer]` table.
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
 #[cfg_attr(test, derive(Debug))]
@@ -2462,9 +2463,9 @@ impl Config {
         self.trail_sound_riff.unwrap_or(true)
     }
 
-    /// Audible bell on/off (`bell_sound`, default on).
+    /// Audible bell on/off (`bell_sound`, default off).
     pub(crate) fn bell_sound_or_default(&self) -> bool {
-        self.bell_sound.unwrap_or(true)
+        self.bell_sound.unwrap_or(false)
     }
 
     /// Parsed `trail_sound_style` voice (default `"auto"`, follow the trail style), via [`aterm_effects::trail_sound::SoundVoice::parse`] (case-insensitive, aliases included) without allocating.
@@ -2535,6 +2536,16 @@ impl Config {
             crate::motion::MotionMode::Auto,
             crate::motion::MotionMode::parse,
         )
+    }
+
+    /// How long a window stays untouched, with no visible output, before it rests
+    /// ([`crate::window_rest`]): `idle_rest_secs`, [`DEFAULT_IDLE_REST_SECS`] when absent, clamped
+    /// into 2..=3600 s. Zero, a negative, NaN or an infinity is `None`: the window never rests,
+    /// as before the setting.
+    pub(crate) fn idle_rest_or_default(&self) -> Option<std::time::Duration> {
+        let secs = self.idle_rest_secs.unwrap_or(DEFAULT_IDLE_REST_SECS);
+        (secs.is_finite() && secs > 0.0)
+            .then(|| std::time::Duration::from_secs_f64(f64::from(secs.clamp(2.0, 3600.0))))
     }
 
     /// Whether load-adaptive shedding may force the reduced state for decorative effects under sustained render overload.
@@ -3294,11 +3305,6 @@ impl Config {
             })
     }
 
-    /// The `[presence] rim` resolved bit (default true).
-    pub(crate) fn presence_rim_enabled(&self) -> bool {
-        self.presence.as_ref().and_then(|p| p.rim).unwrap_or(true)
-    }
-
     /// The `[claude_footer] usage` bit (default on).
     pub(crate) fn claude_footer_usage(&self) -> bool {
         self.claude_footer
@@ -3650,7 +3656,7 @@ impl Config {
     /// Bloom radius (half-res blur texels) for every style except the rainbow kitty.
     pub(crate) const CURSOR_TRAIL_BLOOM_RADIUS_DEFAULT: f32 = 2.2;
 
-    /// The rainbow kitty's bloom radius (`RAINBOW-KITTY-V2.md` §21 row 14).
+    /// The rainbow kitty's bloom radius (`RAINBOW-KITTY-V2.md` §6.5 layer 14).
     pub(crate) const RAINBOW_KITTY_BLOOM_RADIUS: f32 = 1.8;
 
     /// The unset bloom radius for a resolved trail style.
@@ -6546,7 +6552,6 @@ impl App {
     fn regrid_for_chrome_rows_inner(&mut self, settling: Option<WindowId>) {
         #[cfg(test)]
         {
-            crate::resize_ledger::note_chrome_regrid_site_for_test();
             let windows: Vec<WindowId> = self
                 .windows
                 .keys()
@@ -6573,9 +6578,8 @@ impl App {
             } else {
                 self.on_resize(wid, size);
             }
+            self.push_least_window_size(wid);
             if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
-                #[cfg(target_os = "linux")]
-                w.set_min_inner_size(Some(self.whole_cell_min_size(wid)));
                 w.request_redraw();
             }
         }
@@ -6597,26 +6601,89 @@ impl App {
         (rows, cols)
     }
 
-    /// Minimum inner size that aligns the resize-increment lattice with the whole-cell frame lattice for window `wid`.
-    #[cfg(any(test, target_os = "linux"))]
-    pub(crate) fn whole_cell_min_size(&self, wid: WindowId) -> PhysicalSize<u32> {
+    /// THE LEAST INNER SIZE OF WINDOW `wid`: on the whole-cell frame lattice (so the resize
+    /// increments line up with the frame), at least 164x98 points, and, while the window holds a
+    /// Settings tab, giving it at least the view Settings takes at the text scale
+    /// ([`native_settings::least_view`]). A window holding Settings at its least shows every
+    /// control whole with a line of its name, and a press's status on a line of its own, at every
+    /// text scale; with only the fixed 164x98, 2x text squeezed Settings into a 164x96 view that
+    /// held no control with its name and its status. A terminal's window keeps the 164x98.
+    pub(crate) fn least_window_size(&self, wid: WindowId) -> PhysicalSize<u32> {
         let (cw, ch) = self.win_cell_size(wid);
         let (cw, ch) = (cw.max(1), ch.max(1));
         let pad = self.win_pad(wid);
         let scale = self.windows.get(&wid).map_or(1.0, |ws| ws.scale);
-        let floor_w = (164.0 * scale).round().max(0.0) as usize;
-        let floor_h = (98.0 * scale).round().max(0.0) as usize;
+        let px = |points: f32| (f64::from(points) * scale).ceil().max(0.0) as usize;
+        let (view_w, view_h) = if self.window_holds_settings(wid) {
+            crate::native_settings::least_view(crate::native_settings::settings_text_scale())
+        } else {
+            (0.0, 0.0)
+        };
+        // Above the native view: the head, the top pad and the chrome rows
+        // ([`App::native_content_origin_y`]); the view itself is its rows and the bottom pad, and
+        // as wide as the window ([`App::native_ui_full_viewport`]).
+        let over =
+            self.win_head(wid) + self.win_pad_top(wid) + usize::from(self.chrome_rows(wid)) * ch;
+        let floor_w = px(164.0).max(px(view_w));
+        let floor_h = px(98.0).max(over + px(view_h));
         let base_w = 2 * pad + cw;
         let min_w = base_w + floor_w.saturating_sub(base_w).div_ceil(cw) * cw;
-        let base_h = self.win_head(wid)
-            + self.win_pad_top(wid)
-            + pad
-            + (1 + usize::from(self.chrome_rows(wid))) * ch;
+        let base_h = over + pad + ch;
         let min_h = base_h + floor_h.saturating_sub(base_h).div_ceil(ch) * ch;
         PhysicalSize::new(
             u32::try_from(min_w).unwrap_or(u32::MAX),
             u32::try_from(min_h).unwrap_or(u32::MAX),
         )
+    }
+
+    /// Window `wid`'s platform window is told its least size ([`Self::least_window_size`]) where
+    /// that moved since it was last told: up as a Settings tab comes, down as the last goes.
+    pub(crate) fn push_least_window_size(&mut self, wid: WindowId) {
+        let least = self.least_window_size(wid);
+        if let Some(ws) = self.windows.get_mut(&wid)
+            && ws.least_held != Some(least)
+            && let Some(w) = ws.os_window.as_ref()
+        {
+            tell_least_inner_size(w, least);
+            ws.least_held = Some(least);
+        }
+    }
+
+    /// Window `wid` keeps its least size ([`Self::push_least_window_size`]), and one holding
+    /// Settings smaller than it, a platform's or a headless one, grows to it.
+    pub(crate) fn hold_least_window_size(&mut self, wid: WindowId) {
+        self.push_least_window_size(wid);
+        if !self.window_holds_settings(wid) {
+            return;
+        }
+        let least = self.least_window_size(wid);
+        let Some(ws) = self.windows.get(&wid) else {
+            return;
+        };
+        let now = match ws.os_window.as_ref() {
+            Some(w) => w.inner_size(),
+            None => self.window_frame_px_for(wid, ws.rows, ws.cols),
+        };
+        if now.width < least.width || now.height < least.height {
+            let _ = self.resize_window_to_px(
+                wid,
+                PhysicalSize::new(now.width.max(least.width), now.height.max(least.height)),
+            );
+        }
+    }
+
+    /// Every window keeps the least size the text scale now asks for, where the scale moved
+    /// since the windows were last held to it ([`Self::hold_least_window_size`]).
+    pub(crate) fn follow_least_window_scale(&mut self) {
+        let scale = crate::native_settings::settings_text_scale();
+        if self.least_window_scale == Some(scale) {
+            return;
+        }
+        self.least_window_scale = Some(scale);
+        let windows: Vec<WindowId> = self.windows.keys().copied().collect();
+        for wid in windows {
+            self.hold_least_window_size(wid);
+        }
     }
 
     fn resize_changes_columns(&self, wid: WindowId, size: PhysicalSize<u32>) -> bool {
@@ -6773,18 +6840,15 @@ impl App {
             .collect();
         for (wid, size) in sized {
             let (cw, ch) = self.win_cell_size(wid);
-            #[cfg(target_os = "linux")]
-            let min_size = self.whole_cell_min_size(wid);
             if let Some(ws) = self.windows.get_mut(&wid) {
                 if size.width > 0 && size.height > 0 {
                     ws.win_px = Some(size);
                 }
                 if let Some(w) = ws.os_window.as_ref() {
                     w.set_resize_increments(Some(PhysicalSize::new(cw as u32, ch as u32)));
-                    #[cfg(target_os = "linux")]
-                    w.set_min_inner_size(Some(min_size));
                 }
             }
+            self.push_least_window_size(wid);
             self.on_resize(wid, size);
             if let Some(ws) = self.windows.get_mut(&wid) {
                 ws.rearm_present(true);
@@ -6991,9 +7055,8 @@ impl App {
         let (cw, ch) = self.win_cell_size(wid);
         if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
             w.set_resize_increments(Some(PhysicalSize::new(cw as u32, ch as u32)));
-            #[cfg(target_os = "linux")]
-            w.set_min_inner_size(Some(self.whole_cell_min_size(wid)));
         }
+        self.push_least_window_size(wid);
     }
 
     /// Re-tune the shared backend's font size and pad to window `wid`'s scale before it composes (top of `redraw_window`), giving per-window DPI on one renderer.
@@ -7572,7 +7635,6 @@ impl App {
         self.kitty_cursor_enabled_cache = None;
         self.sparkle_dirty = true;
         self.rain_dirty = true;
-        self.adopt_presence_config();
         self.palette_refresh_live();
         self.publish_native_packages_state();
         if sparkle_feed_changed {
@@ -8366,32 +8428,6 @@ mod config_policy_tests {
         );
     }
 
-    #[test]
-    fn a_config_that_still_sets_the_band_or_the_chime_loads_and_is_told_once() {
-        let others = "theme = \"Nord\"\n[presence]\nrim = false\n";
-        let source =
-            "choice_sound = false\ntheme = \"Nord\"\n[presence]\nband = false\nrim = false\n";
-        let loaded = Config::parse(source).expect("retired keys never fail the file");
-        let baseline = Config::parse(others).expect("the other settings parse alone");
-        assert!(
-            loaded == baseline,
-            "every other setting loads as without them"
-        );
-        assert!(
-            !loaded.presence_rim_enabled(),
-            "the needs switch beside them stands"
-        );
-        let warnings = crate::native_config_language::key_warnings(source);
-        assert!(warnings.ignored.is_empty(), "{:?}", warnings.ignored);
-        assert_eq!(warnings.retired.len(), 2, "{:?}", warnings.retired);
-        assert!(
-            super::unaccepted_value_notices(source, &[]).is_empty(),
-            "a retired key's value is never a value its reader rejects"
-        );
-    }
-
-    /// 0.135.0 shipped `[sys] stats_deck_style` (hidden, for the rejected merged deck): a file
-    /// that still sets it loads as without it and is told once that the key does nothing.
     #[test]
     fn a_config_that_still_sets_the_deck_style_loads_and_is_told_once() {
         let others = "[sys]\nstats_bars = \"deck\"\nstats_deck_size = \"full\"\n";
@@ -10291,6 +10327,41 @@ mod output_streak_cfg_tests {
         }
     }
 
+    /// `idle_rest_secs`: unset never rests ([`DEFAULT_IDLE_REST_SECS`]); a value is clamped into
+    /// 2..=3600 s; zero, a negative, NaN or an infinity never rests (today's behaviour), never at
+    /// once.
+    #[test]
+    fn idle_rest_resolves_clamps_and_fails_toward_never() {
+        use std::time::{Duration, Instant};
+        assert_eq!(Config::default().idle_rest_or_default(), None);
+        for (value, expected) in [
+            ("45", Some(Duration::from_secs(45))),
+            ("2.5", Some(Duration::from_millis(2500))),
+            ("1", Some(Duration::from_secs(2))),
+            ("0.01", Some(Duration::from_secs(2))),
+            ("1e9", Some(Duration::from_secs(3600))),
+            ("0", None),
+            ("-1", None),
+            ("nan", None),
+            ("inf", None),
+            ("-inf", None),
+        ] {
+            assert_eq!(
+                cfg(&format!("idle_rest_secs = {value}")).idle_rest_or_default(),
+                expected,
+                "idle_rest_secs = {value}"
+            );
+        }
+        // A reload to `0` wakes a window that rested under the old setting.
+        let t0 = Instant::now();
+        let mut rest = crate::window_rest::Rest::new(t0);
+        let later = t0 + Duration::from_secs(60);
+        assert!(rest.settle(later, cfg("idle_rest_secs = 30").idle_rest_or_default()));
+        assert!(rest.resting());
+        assert!(rest.settle(later, cfg("idle_rest_secs = 0").idle_rest_or_default()));
+        assert!(!rest.resting());
+    }
+
     #[test]
     fn the_streak_warning_names_only_the_silently_unreachable_pip() {
         assert!(Config::default().output_streak_warning().is_none());
@@ -10386,7 +10457,7 @@ mod output_streak_cfg_tests {
         );
         assert_eq!(
             read("[harness]\nautopilot = \"land\"\n[harness.codex]\nenabled = false\n").words(),
-            "Automatic, limited by Default autopilot set to Land; Watch codex-alab sessions set \
+            "Automatic, limited by Default autopilot set to Land; Enable codex-alab Autopilot set \
              to Off"
         );
         assert_eq!(
@@ -11258,14 +11329,114 @@ mod reload_dedupe_tests {
     }
 }
 
+/// Tell platform window `w` its least inner size ([`App::least_window_size`]): the window manager
+/// (AppKit's content minimum, X11's and Wayland's size hints, Windows' least track size) holds a
+/// drag to it.
+pub(crate) fn tell_least_inner_size(w: &aterm_window::window::Window, least: PhysicalSize<u32>) {
+    w.set_min_inner_size(Some(least));
+}
+
 #[cfg(test)]
-mod whole_cell_min_size_tests {
+mod least_window_size_tests {
+    use crate::native_appearance::{
+        AppearancePreferences, current_preferences, install_preferences,
+    };
+    use crate::native_settings::{SettingsRoute, least_view};
+    use aterm_window::dpi::PhysicalSize;
+
+    fn at_text_scale(scale: f32) {
+        install_preferences(AppearancePreferences {
+            text_scale: scale,
+            ..current_preferences()
+        });
+    }
+
+    /// Window `wid` asked for one pixel, past the live-resize throttle: it stands at its least.
+    fn shrink(app: &mut crate::App, wid: crate::WindowId) {
+        app.windows
+            .get_mut(&wid)
+            .expect("the window")
+            .last_resize_at = None;
+        let _ = app.resize_window_to_px(wid, PhysicalSize::new(1, 1));
+    }
+
+    /// The view window `wid` gives a native tab, as wide and as tall.
+    fn view(app: &crate::App, wid: crate::WindowId) -> (f32, f32) {
+        let view = app.native_ui_full_viewport(wid).expect("the window's view");
+        (view.width, view.height)
+    }
+
+    /// A WINDOW HOLDING SETTINGS IS NEVER SMALLER THAN SETTINGS' LEAST VIEW, AT EVERY TEXT SCALE:
+    /// at 1×, 1.25×, 1.5×, 1.75× and 2× text, a headless window holding Settings, asked for one
+    /// pixel as a window manager is asked for less than a window's least, stands at its least,
+    /// whose view holds the least view Settings takes at that scale; a terminal's window keeps
+    /// the 164x98 least at every scale. The least was a fixed 164x98 window: 2× text had a 164x96
+    /// view, where a control and a line of its name shared no screen.
+    #[test]
+    fn a_window_holding_settings_gives_it_its_least_view_at_every_text_scale() {
+        for scale in [1.0_f32, 1.25, 1.5, 1.75, 2.0] {
+            let mut app = crate::App::headless_for_test();
+            let wid = crate::WindowId(0);
+            at_text_scale(1.0);
+            let terminal = app.least_window_size(wid);
+            at_text_scale(scale);
+            assert_eq!(
+                app.least_window_size(wid),
+                terminal,
+                "{scale}x: a terminal's window keeps its least"
+            );
+            assert!(app.open_settings_tab_in_window(wid, SettingsRoute::Home));
+            shrink(&mut app, wid);
+            let (width, height) = view(&app, wid);
+            let (least_w, least_h) = least_view(scale);
+            assert!(
+                width + 0.01 >= least_w && height + 0.01 >= least_h,
+                "{scale}x: a {width}x{height} view under Settings' least {least_w}x{least_h}"
+            );
+        }
+    }
+
+    /// A TEXT SCALE THAT GROWS GROWS A WINDOW HOLDING SETTINGS TO ITS NEW LEAST: a window at its
+    /// least for 1× text holds Settings' least view for 2× once the text goes to 2×, and keeps it
+    /// when asked for less. It kept the view it had, Settings squeezed into the 1× least.
+    #[test]
+    fn a_text_scale_that_grows_grows_a_window_holding_settings_to_its_new_least() {
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        at_text_scale(1.0);
+        assert!(app.open_settings_tab_in_window(wid, SettingsRoute::Home));
+        app.follow_least_window_scale();
+        shrink(&mut app, wid);
+        let before = view(&app, wid);
+        let (least_w, least_h) = least_view(2.0);
+        assert!(
+            before.0 < least_w || before.1 < least_h,
+            "precondition: the 1x least {before:?} is under the 2x least view"
+        );
+        at_text_scale(2.0);
+        app.windows
+            .get_mut(&wid)
+            .expect("the window")
+            .last_resize_at = None;
+        app.follow_least_window_scale();
+        let (width, height) = view(&app, wid);
+        assert!(
+            width + 0.01 >= least_w && height + 0.01 >= least_h,
+            "the window grew to {width}x{height}, under the 2x least view {least_w}x{least_h}"
+        );
+        shrink(&mut app, wid);
+        let (width, height) = view(&app, wid);
+        assert!(
+            width + 0.01 >= least_w && height + 0.01 >= least_h,
+            "asked for less, it keeps {width}x{height} over {least_w}x{least_h}"
+        );
+    }
 
     #[test]
     fn min_size_sits_on_the_whole_cell_frame_lattice() {
         let app = crate::App::headless_for_test();
         let wid = crate::WindowId(0);
-        let min = app.whole_cell_min_size(wid);
+        let min = app.least_window_size(wid);
         let (cw, ch) = app.win_cell_size(wid);
         let pad = app.win_pad(wid);
         let base_h =
@@ -11961,13 +12132,24 @@ mod trail_style_resolution_tests {
 
     #[test]
     fn the_default_glow_config_is_the_shipped_resolve() {
-        let app = crate::App::headless_for_test();
+        // A window whose trail is drawn by default: where decorative effects are off by default
+        // (Windows) a window with no config draws none, and it takes the drawn default by name,
+        // as `trail_drawn` writes it.
+        let drawn = || {
+            let mut app = crate::App::headless_for_test();
+            if !DEFAULT_DECORATIVE_EFFECTS {
+                app.config.cursor_trail_style =
+                    Some(crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE.to_string());
+            }
+            app
+        };
+        let app = drawn();
         assert_eq!(
             app.glow_config(),
             GlowConfig::default(),
             "a test's ..Default::default() takes what a window with no config resolves"
         );
-        let mut tinted = crate::App::headless_for_test();
+        let mut tinted = drawn();
         tinted.config.cursor_trail_color = Some("#d03a8c".to_string());
         assert_ne!(
             tinted.glow_config(),

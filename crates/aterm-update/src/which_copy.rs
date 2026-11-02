@@ -258,7 +258,10 @@ fn caskroom_bundles(caskroom: &Path) -> Vec<PathBuf> {
     };
     let mut versions: Vec<PathBuf> = entries
         .flatten()
-        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
+        .filter(|entry| {
+            !entry.file_name().as_encoded_bytes().starts_with(b".")
+                && entry.file_type().is_ok_and(|t| t.is_dir())
+        })
         .map(|entry| entry.path())
         .collect();
     versions.sort();
@@ -467,6 +470,7 @@ mod tests {
             std::os::unix::fs::symlink(&caskroom, &linked_caskroom).unwrap();
             assert!(caskroom_bundles(&linked_caskroom).is_empty());
             let crowded = root.join("crowded");
+            std::fs::create_dir_all(crowded.join(".metadata")).unwrap();
             for i in 0..(MAX_CASKROOM_ENTRIES + 4) {
                 make_bundle(&crowded.join(format!("1.{i:03}.0")).join("aterm.app"), None);
             }

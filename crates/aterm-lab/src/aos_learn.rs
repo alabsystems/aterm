@@ -272,13 +272,29 @@ impl LabLog {
     /// and the file must name `parent`.
     fn need_runner_of(root: &Path, parent: u32) -> Result<(), String> {
         let path = root.join("runner.lock");
-        let f = match File::open(&path) {
+        let mut open = File::options();
+        open.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            open.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let f = match open.open(&path) {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 return Err(format!("no runner has run under {}", root.display()));
             }
             Err(e) => return Err(format!("cannot open {}: {e}", path.display())),
         };
+        if !f
+            .metadata()
+            .map_err(|e| format!("cannot stat {}: {e}", path.display()))?
+            .is_file()
+        {
+            return Err(format!("{} is not a regular file", path.display()));
+        }
+        aterm_uds::keep_out_of_children(&f)
+            .map_err(|e| format!("cannot configure {}: {e}", path.display()))?;
         #[expect(
             clippy::disallowed_methods,
             reason = "the guard's own take: its Drop releases by LOCK_UN"
@@ -385,11 +401,26 @@ pub(crate) fn lock_within(
     if let Some(parent) = path.parent() {
         make_dirs(parent).map_err(|e| format!("cannot make {}: {e}", parent.display()))?;
     }
-    let f = File::options()
-        .create(true)
-        .append(true)
+    let mut open = File::options();
+    open.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open.mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let f = open
         .open(path)
         .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    if !f
+        .metadata()
+        .map_err(|e| format!("cannot stat {}: {e}", path.display()))?
+        .is_file()
+    {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    aterm_uds::keep_out_of_children(&f)
+        .map_err(|e| format!("cannot configure {}: {e}", path.display()))?;
     let start = Instant::now();
     loop {
         #[expect(

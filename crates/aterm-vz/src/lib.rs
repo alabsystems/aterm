@@ -151,42 +151,71 @@ pub(crate) fn read_small_text(path: &std::path::Path, max_bytes: usize) -> Optio
     String::from_utf8(bytes).ok()
 }
 
+/// Whether `path` is a regular file without following a terminal symlink.
+pub(crate) fn is_regular_file(path: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file())
+}
+
+#[cfg(unix)]
+fn chmod_regular(path: &std::path::Path, mode: u32, what: &str) -> Result<(), Error> {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| io(what, path, &e))?;
+    if !file.metadata().map_err(|e| io(what, path, &e))?.is_file() {
+        return Err(Error::Io(format!(
+            "could not {what} {}: not a regular file",
+            path.display()
+        )));
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(mode))
+        .map_err(|e| io(what, path, &e))
+}
+
 /// Make `path` read-only to everyone (0444), as a sealed disk and the kernel files are.
 pub(crate) fn read_only(path: &std::path::Path) -> Result<(), Error> {
     #[cfg(unix)]
-    let permissions = {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::Permissions::from_mode(0o444)
-    };
+    {
+        chmod_regular(path, 0o444, "make read-only")
+    }
     #[cfg(not(unix))]
-    let permissions = {
-        let mut p = std::fs::metadata(path)
-            .map_err(|e| io("read", path, &e))?
-            .permissions();
+    {
+        let meta = std::fs::symlink_metadata(path).map_err(|e| io("read", path, &e))?;
+        if !meta.is_file() {
+            return Err(Error::Io(format!(
+                "could not make read-only {}: not a regular file",
+                path.display()
+            )));
+        }
+        let mut p = meta.permissions();
         p.set_readonly(true);
-        p
-    };
-    std::fs::set_permissions(path, permissions).map_err(|e| io("make read-only", path, &e))
+        std::fs::set_permissions(path, p).map_err(|e| io("make read-only", path, &e))
+    }
 }
 
 /// Make the clone `path` writable by its owner (0644): a clone carries its source's 0444.
 pub(crate) fn writable(path: &std::path::Path) -> Result<(), Error> {
     #[cfg(unix)]
-    let permissions = {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::Permissions::from_mode(0o644)
-    };
+    {
+        chmod_regular(path, 0o644, "make writable")
+    }
     #[cfg(not(unix))]
-    let permissions = {
-        let mut p = std::fs::metadata(path)
-            .map_err(|e| io("read", path, &e))?
-            .permissions();
+    {
+        let meta = std::fs::symlink_metadata(path).map_err(|e| io("read", path, &e))?;
+        if !meta.is_file() {
+            return Err(Error::Io(format!(
+                "could not make writable {}: not a regular file",
+                path.display()
+            )));
+        }
+        let mut p = meta.permissions();
         #[expect(
             clippy::permissions_set_readonly_false,
             reason = "off Unix the read-only bit is the only permission a clone carries"
         )]
         p.set_readonly(false);
-        p
-    };
-    std::fs::set_permissions(path, permissions).map_err(|e| io("make writable", path, &e))
+        std::fs::set_permissions(path, p).map_err(|e| io("make writable", path, &e))
+    }
 }

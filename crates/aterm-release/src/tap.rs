@@ -119,33 +119,68 @@ pub fn keep_live(source: &str, live: &str) -> Result<String, String> {
     Ok(out)
 }
 
-fn files_under(dir: &Path, out: &mut Vec<PathBuf>) {
-    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+fn files_under(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    let why = |error| format!("cannot inspect {}: {error}", dir.display());
+    if !std::fs::symlink_metadata(dir).map_err(why)?.is_dir() {
+        return Err(format!("{} is not a plain directory", dir.display()));
+    }
+    for entry in std::fs::read_dir(dir).map_err(why)? {
+        let entry = entry.map_err(why)?;
+        let ft = entry.file_type().map_err(why)?;
         let path = entry.path();
-        if entry.file_type().is_ok_and(|t| t.is_dir()) {
-            files_under(&path, out);
-        } else {
+        if ft.is_dir() {
+            files_under(&path, out)?;
+        } else if ft.is_file() {
             out.push(path);
+        } else {
+            return Err(format!(
+                "{} is not a regular file or directory",
+                path.display()
+            ));
         }
     }
+    Ok(())
 }
+
+/// Maximum size of any tap document or cask file read during planning (16 MiB).
+const MAX_TAP_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// THE PLAN: the tap's files as `src` says them, each against what `tap` holds.
 /// # Errors
 /// A source with a `.github/` or internal-only wording, a document or cask that cannot be read, a
 /// source with no cask, or a live cask with nothing to keep.
 pub fn plan(src: &Path, tap: &Path) -> Result<Vec<Planned>, String> {
-    if src.join(".github").exists() {
+    if crate::bundle::exists_or_symlink(&src.join(".github")) {
         return Err(format!(
             "{} has a .github/ directory — the tap carries no workflow (cask bumps are `pub tap \
              --bump`)",
             src.display()
         ));
     }
+    let tap_casks = tap.join("Casks");
+    match std::fs::symlink_metadata(&tap_casks) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("{}: {e}", tap_casks.display())),
+        Ok(meta) if meta.file_type().is_dir() => {}
+        Ok(_) => return Err(format!("{} is not a plain directory", tap_casks.display())),
+    }
     let mut all = Vec::new();
-    files_under(src, &mut all);
+    files_under(src, &mut all)?;
+    let read = |p: &Path| {
+        crate::durable::read_regular_bytes(p, MAX_TAP_SOURCE_BYTES)
+            .map_err(|e| format!("{}: {e}", p.display()))
+    };
+    let read_optional_tap = |rel: &str| -> Result<Option<Vec<u8>>, String> {
+        let p = tap.join(rel);
+        match std::fs::symlink_metadata(&p) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("{}: {e}", p.display())),
+            Ok(meta) if meta.file_type().is_file() => read(&p).map(Some),
+            Ok(_) => Err(format!("{} is not a regular file", p.display())),
+        }
+    };
     for path in &all {
-        let text = std::fs::read_to_string(path)
+        let text = String::from_utf8(read(path)?)
             .unwrap_or_default()
             .to_lowercase();
         if let Some(w) = INTERNAL_WORDING.iter().find(|w| text.contains(*w)) {
@@ -155,23 +190,22 @@ pub fn plan(src: &Path, tap: &Path) -> Result<Vec<Planned>, String> {
             ));
         }
     }
-    let read = |p: &Path| std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()));
-    let against = |path: String, bytes: Vec<u8>, seed: bool| {
-        let change = match std::fs::read(tap.join(&path)) {
-            Ok(now) if now == bytes => Change::Same,
-            Ok(_) => Change::Update,
-            Err(_) if seed => Change::Seed,
-            Err(_) => Change::Update,
+    let against = |path: String, bytes: Vec<u8>, seed: bool| -> Result<Planned, String> {
+        let change = match read_optional_tap(&path)? {
+            Some(now) if now == bytes => Change::Same,
+            Some(_) => Change::Update,
+            None if seed => Change::Seed,
+            None => Change::Update,
         };
-        Planned {
+        Ok(Planned {
             path,
             bytes,
             change,
-        }
+        })
     };
     let mut out = Vec::new();
     for doc in DOCS {
-        out.push(against(doc.to_string(), read(&src.join(doc))?, false));
+        out.push(against(doc.to_string(), read(&src.join(doc))?, false)?);
     }
     let mut casks: Vec<PathBuf> = std::fs::read_dir(src.join("Casks"))
         .map_err(|e| format!("{}: {e}", src.join("Casks").display()))?
@@ -191,11 +225,15 @@ pub fn plan(src: &Path, tap: &Path) -> Result<Vec<Planned>, String> {
         let rel = format!("Casks/{name}");
         let source = String::from_utf8(read(&cask)?)
             .map_err(|_| format!("{} is not UTF-8", cask.display()))?;
-        let bytes = match std::fs::read_to_string(tap.join(&rel)) {
-            Ok(live) => keep_live(&source, &live).map_err(|e| format!("{rel} in the tap: {e}"))?,
-            Err(_) => source,
+        let bytes = match read_optional_tap(&rel)? {
+            Some(live_bytes) => {
+                let live = String::from_utf8(live_bytes)
+                    .map_err(|_| format!("{} is not UTF-8", tap.join(&rel).display()))?;
+                keep_live(&source, &live).map_err(|e| format!("{rel} in the tap: {e}"))?
+            }
+            None => source,
         };
-        out.push(against(rel, bytes.into_bytes(), true));
+        out.push(against(rel, bytes.into_bytes(), true)?);
     }
     Ok(out)
 }
@@ -257,7 +295,7 @@ pub fn deploy(
         let path = tap.join(&p.path);
         path.parent()
             .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|()| std::fs::write(&path, &p.bytes))
+            .and_then(|()| crate::durable::write_atomic_durable(&path, &p.bytes, 0o644))
             .map_err(|e| format!("{}: {e}", path.display()))?;
     }
     let paths: Vec<&str> = planned.iter().map(|p| p.path.as_str()).collect();
@@ -550,5 +588,63 @@ mod tests {
         assert!(p(&["deploy", "/a", "/b"]).is_err());
         assert!(p(&["push", "/a"]).is_err());
         assert!(p(&["deploy", "/a", "--force"]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tap_planning_refuses_aliases_in_every_published_source() {
+        for rel in ["Casks/aterm.rb", "README.md", "MAINTENANCE.md", "Casks"] {
+            let dir = scratch("file-admission");
+            let src = source(dir.path());
+            let destination = dir.path().join("empty-tap");
+            std::fs::create_dir(&destination).unwrap();
+            assert_eq!(plan(&src, &destination).unwrap().len(), 4);
+
+            let cask = src.join("Casks/aterm.rb");
+            let public = std::fs::read(&cask).unwrap();
+            let internal = b"# private dev repo\ncask \"aterm\" do\nend\n";
+            std::fs::write(&cask, internal).unwrap();
+            assert!(
+                plan(&src, &destination).is_err(),
+                "regular internal wording is refused"
+            );
+            std::fs::write(&cask, &public).unwrap();
+
+            let selected = src.join(rel);
+            let outside = dir.path().join("outside-source");
+            std::fs::rename(&selected, &outside).unwrap();
+            let private = if rel == "Casks" {
+                outside.join("aterm.rb")
+            } else {
+                outside.clone()
+            };
+            std::fs::write(&private, internal).unwrap();
+            std::os::unix::fs::symlink(&outside, &selected).unwrap();
+            assert!(
+                plan(&src, &destination).is_err(),
+                "unadmitted source {rel} must not enter a publication plan"
+            );
+            assert_eq!(std::fs::read(&private).unwrap(), internal);
+            assert!(std::fs::read_dir(&destination).unwrap().next().is_none());
+
+            // Restore valid source and verify that symlinks in the destination tap are also refused.
+            std::fs::remove_file(&selected).unwrap();
+            std::fs::rename(&outside, &selected).unwrap();
+            std::fs::write(&cask, &public).unwrap();
+            let tap_dir = tap(dir.path());
+            let tap_target = tap_dir.join(rel);
+            let outside_tap = dir.path().join("outside-tap");
+            if tap_target.is_dir() {
+                std::fs::rename(&tap_target, &outside_tap).unwrap();
+            } else {
+                let _ = std::fs::remove_file(&tap_target);
+                std::fs::write(&outside_tap, "outside\n").unwrap();
+            }
+            std::os::unix::fs::symlink(&outside_tap, &tap_target).unwrap();
+            assert!(
+                plan(&src, &tap_dir).is_err(),
+                "symlink at destination {rel} must be refused"
+            );
+        }
     }
 }

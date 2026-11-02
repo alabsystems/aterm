@@ -40,8 +40,6 @@ pub(crate) enum StatusAction {
     Overview,
     /// Read This Mac: `aterm ctl survey` into a document tab.
     ReadThisMac,
-    /// Notify Me When I'm Needed: flip `desktop_alerts`.
-    ToggleNotify,
     /// Hand Back All: lift every person hold.
     HandBackAll,
     /// Open Settings ▸ Messages at one digest entry (payload: its log id) — what a click on a "To look at" line does.
@@ -96,7 +94,6 @@ impl StatusAction {
             Self::DismissExceptions => 5,
             Self::Overview => 6,
             Self::ReadThisMac => 7,
-            Self::ToggleNotify => 8,
             Self::HandBackAll => 9,
             Self::ReadFleet => 10,
             Self::ReadFleetNow => 11,
@@ -123,7 +120,6 @@ impl StatusAction {
             5 => Some(Self::DismissExceptions),
             6 => Some(Self::Overview),
             7 => Some(Self::ReadThisMac),
-            8 => Some(Self::ToggleNotify),
             9 => Some(Self::HandBackAll),
             10 => Some(Self::ReadFleet),
             11 => Some(Self::ReadFleetNow),
@@ -194,6 +190,8 @@ pub(crate) struct SessionRow {
     pub landing: bool,
     /// What holds the landing, where a land act's yield did not land or nudges were typed, led by the stop where whoever drives it stopped typing into it in any mode (aterm, or a codex-alab under its own proven claim: `App::shown_stop`): its worker row's tip, in the hold's and the stop's words with no clock (`stopped typing: the same reply twice, no work · not landed yet: 2 unpushed commits · 3 nudges`, `ShownStop::words`' and `ShownHold::words`' tip forms; a codex-alab's stop in its name, `codex-alab stopped typing: …`, and its hold too where no stop named it first, `codex-alab: not landed yet: …`; a stopped Cruise tab's is the stop alone) — the menu keeps ages, composed at paint, and never a clock that would go stale.
     pub landing_tip: Option<String>,
+    /// What aterm checked at its landing (`docs/DESIGN-harness-autopilot-2026-10-15.md` §14.9, slice 9c), as its loop told it, read under the timeline's lock beside a landed face only (`SessionTimeline::land_receipt`): its Done for you row's tip and its worker row's say it (`mode_words::landed_tip`, `mode_words::checked_words`); none for a landing with no receipt (codex-alab's own), whose landed rows' tips say aterm checked nothing.
+    pub receipt: Option<std::sync::Arc<aterm_agent::harness::acts::LandReceipt>>,
     /// Its need is all that holds its landing (`docs/DESIGN-harness-autopilot-2026-10-15.md` §14.7): it is [`Self::landing`], its hold's yield was read, and the hold's one leg is its needs (`HoldLeg::Needs`, [`crate::harness_glass::HeldGlass::need_alone`]) — no repository work, no open words, no missing defense, no cut. Its report row's tip then says `<Program>'s landing waits on this alone` where any other says `<Program> carries on meanwhile`.
     pub need_alone: bool,
     /// Where its tab is (`in tab 3`, `in tab 3, left pane`; `App::session_place`), filled by the glance's first pass only where another row shares its label: every row that names the session says it after the label ([`Self::named`]).
@@ -562,8 +560,12 @@ impl StatusCarry {
 
     /// Read a carried row back.
     pub(crate) fn parse(row: &str) -> Self {
+        let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
         let stamped = |value: &str| {
             let (word, at) = value.split_once('@')?;
+            if !digits(at) {
+                return None;
+            }
             Some((word.to_string(), at.parse::<i64>().ok()?))
         };
         let mut carry = Self::default();
@@ -579,7 +581,7 @@ impl StatusCarry {
                     carry.held =
                         stamped(value).and_then(|(w, at)| Some((HoldWord::parse(&w)?, at)));
                 }
-                "done" => carry.done = value.parse().ok(),
+                "done" => carry.done = digits(value).then(|| value.parse().ok()).flatten(),
                 "box" => {
                     carry.box_receipt = (!box_seen)
                         .then(|| crate::box_banner::Receipt::parse(value))
@@ -1207,7 +1209,7 @@ pub(crate) struct WorkerRow {
     pub read: Option<u16>,
     /// Its session is landing ([`SessionRow::landing`]): Land's instruction was typed to it and a hold stands.
     pub landing: bool,
-    /// Its row's tip while it is landing or stopped ([`SessionRow::landing_tip`]).
+    /// Its row's tip while it is landing or stopped ([`SessionRow::landing_tip`]); once it landed (`done why=landed`, its chip's face landed), what aterm checked there (`mode_words::checked_words`, §14.9 slice 9c).
     pub tip: Option<String>,
 }
 
@@ -1261,6 +1263,8 @@ pub(crate) struct DoneRow {
     pub at: DoneAt,
     /// A landing (`landed`), seen or not: a supervised agent's end, or a worker whose record reads `done why=landed` or whose end or face is a landing; else an older build's `done`.
     pub landed: bool,
+    /// A landing's tip (§14.9, slice 9c) while its chip's face is landed ([`SessionRow::landed`]): what aterm checked there and what the agent said (`mode_words::landed_tip`); `None` for an older build's `done` and once the face moved off the landing, when no receipt is read.
+    pub tip: Option<String>,
 }
 
 /// One Waiting cause: every tab aterm waits out for the same reason.
@@ -1397,10 +1401,6 @@ pub(crate) struct Glance {
     pub held_there: Vec<HeldThereRow>,
     /// The digest's entries — what needs a look, not now — `(log id, subject)` per entry, worst first.
     pub exceptions: Vec<(u64, String)>,
-    /// `desktop_alerts`: the Notify Me checkmark.
-    pub alerts: bool,
-    /// Whose banner those notices arrive as here (`notify::own_voice`): the Notify Me row's hover.
-    pub voice: Option<NoticeVoice>,
     /// The sessions a [`StatusAction::Go`] goes to.
     pub go: Vec<u64>,
     /// The results a [`StatusAction::ReadResult`] reads.
@@ -1428,58 +1428,6 @@ pub(crate) struct SystemStateLine {
     pub note: Option<String>,
 }
 
-/// Whose banner aterm's own notices arrive as on this Mac (`notify::own_voice`, macOS): what the Notify Me row's hover says.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct NoticeVoice {
-    /// What macOS has said about aterm posting as itself (`notice_center`): granted, a notice is aterm's own and a click goes to the tab it is about; otherwise a bundle posts none.
-    pub center: crate::notice_center::Center,
-    /// What a notice is where there is no center to post through (`center` is `Absent`): none from a bundle, a subprocess's banner from a bare binary.
-    pub fallback: NoticeFallback,
-}
-
-/// What a notice is where there is no center to post through (`notify::route`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum NoticeFallback {
-    /// None: aterm runs from an app bundle, which posts only as itself, and it has no center.
-    #[cfg_attr(
-        all(not(target_os = "macos"), not(test)),
-        expect(dead_code, reason = "UNUserNotificationCenter is macOS's")
-    )]
-    Withheld {
-        /// Whether the running bundle's id was read.
-        named: bool,
-    },
-    /// `osascript`: Script Editor's banner, and a click opens Script Editor — a bare binary's.
-    ScriptEditor,
-}
-
-fn slot<T>(table: &mut Vec<T>, item: T) -> Option<u16> {
-    let at = u16::try_from(table.len()).ok()?;
-    table.push(item);
-    Some(at)
-}
-
-/// THE NEEDS YOU ORDER (`docs/DESIGN-owner-surfaces-2026-10-16.md` §3, amended by
-/// `docs/DESIGN-harness-autopilot-2026-10-15.md` §14.7): a counted need before one from an old
-/// read; stuck before decide; within a severity, a need that has stopped its agent (an approval
-/// box no harness presses, a question, a frozen or stalled agent, another owner's ask) before a
-/// harness's `NEEDS YOU:` report its agent carries on past ([`NeedRow::carries_on`], this
-/// aterm's, a sibling's or a fleet peer's); then local before sibling before fleet, oldest first
-/// (unknown age last), then by label.
-fn need_order(n: &NeedRow) -> (bool, Severity, bool, Origin, i64, &str) {
-    (
-        !n.counted,
-        n.word.severity(),
-        n.carries_on,
-        n.origin,
-        n.since_unix.unwrap_or(i64::MAX),
-        &n.label,
-    )
-}
-
-/// A `NEEDS YOU:` report row's tip (§14.7): its program carries on meanwhile, or, where the
-/// report is all that holds its session's landing ([`NeedRow::alone`]), its landing waits on it
-/// alone ([`aterm_agent::supervise::mode_words::report_words`]); `None` for any other need.
 #[cfg_attr(
     all(not(target_os = "macos"), not(test)),
     expect(dead_code, reason = "the menu-bar status item is macOS's")
@@ -1491,6 +1439,24 @@ fn report_tip(need: &NeedRow) -> Option<String> {
         ask.program.product(),
         need.alone,
     ))
+}
+
+/// Sort diagnostics by severity, stalled work, origin and age.
+fn need_order(n: &NeedRow) -> (bool, Severity, bool, Origin, i64, &str) {
+    (
+        !n.counted,
+        n.word.severity(),
+        n.carries_on,
+        n.origin,
+        n.since_unix.unwrap_or(i64::MAX),
+        &n.label,
+    )
+}
+
+fn slot<T>(table: &mut Vec<T>, item: T) -> Option<u16> {
+    let at = u16::try_from(table.len()).ok()?;
+    table.push(item);
+    Some(at)
 }
 
 impl Glance {
@@ -1630,6 +1596,9 @@ impl Glance {
                         },
                     )
                 });
+            let landed_task = row.landed
+                && task.state == TaskState::Done
+                && task.why == Some(crate::task_record::WHY_LANDED);
             let worker = WorkerRow {
                 label: row.named(),
                 state: task.state,
@@ -1639,7 +1608,11 @@ impl Glance {
                 go: worker_go,
                 read,
                 landing: row.landing,
-                tip: row.landing_tip.clone(),
+                tip: row.landing_tip.clone().or_else(|| {
+                    landed_task.then(|| {
+                        aterm_agent::supervise::mode_words::checked_words(row.receipt.as_deref())
+                    })
+                }),
             };
             match managers.iter_mut().find(|(sid, _)| *sid == task.from) {
                 Some((_, manager)) => manager.workers.push(worker),
@@ -1705,14 +1678,17 @@ impl Glance {
                     None => continue,
                 },
             };
+            let landed =
+                task.why == Some(crate::task_record::WHY_LANDED) || row.end.is_some() || row.landed;
             done.push(DoneRow {
                 label: row.named(),
                 since_unix_ms: task.since_unix_ms,
                 result_bytes: task.result_bytes,
                 at,
-                landed: task.why == Some(crate::task_record::WHY_LANDED)
-                    || row.end.is_some()
-                    || row.landed,
+                landed,
+                tip: (landed && row.landed).then(|| {
+                    aterm_agent::supervise::mode_words::landed_tip(row.receipt.as_deref())
+                }),
             });
             listed.push(row.id);
         }
@@ -1738,6 +1714,9 @@ impl Glance {
                 result_bytes: 0,
                 at: DoneAt::Go(at),
                 landed: true,
+                tip: row.landed.then(|| {
+                    aterm_agent::supervise::mode_words::landed_tip(row.receipt.as_deref())
+                }),
             });
         }
         done.sort_by_key(|d| std::cmp::Reverse(d.since_unix_ms));
@@ -1883,11 +1862,8 @@ impl Glance {
         self.needs.iter().filter(|n| n.counted).count()
     }
 
-    /// Whether any counted need is stuck: the title is red.
-    #[cfg_attr(
-        all(not(target_os = "macos"), not(test)),
-        expect(dead_code, reason = "the menu-bar status item is macOS's")
-    )]
+    /// Whether any recorded need is stuck.
+    #[cfg(test)]
     pub(crate) fn stuck(&self) -> bool {
         self.stuck_count() > 0
     }
@@ -1909,78 +1885,18 @@ impl Glance {
         matches!(self.fleet, FleetLine::InFleet { .. })
     }
 
-    /// Nag mode's mascot on the bar button ([`NAG_STAGES`]): `None` while nothing nags, else her stage, 1 for one counted need and one more for each further need and each stuck one, so the more is asked of the owner the crazier she screams.
+    /// The menu-bar button is a stable entry to diagnostics, never an alert badge.
+    pub(crate) fn button_title(&self) -> String {
+        "\u{276f}".into()
+    }
+
+    /// The button opens diagnostics on demand; it never asks the person to intervene.
     #[cfg_attr(
         all(not(target_os = "macos"), not(test)),
         expect(dead_code, reason = "the menu-bar status item is macOS's")
     )]
-    pub(crate) fn nag_stage(&self) -> Option<u8> {
-        let asked = self.need_count();
-        let stage = (asked + self.stuck_count()).min(NAG_STAGES.len());
-        (asked > 0).then(|| u8::try_from(stage).unwrap_or(u8::MAX))
-    }
-
-    /// The menu-bar button title: `❯N` while N needs stand, else `❯•` while the digest holds entries or a row stands under Done for you (a worker's done, a supervised agent's end nobody has looked at), else `❯`.
-    pub(crate) fn button_title(&self) -> String {
-        match self.need_count() {
-            0 if !self.exceptions.is_empty() || !self.done.is_empty() => "\u{276f}\u{2022}".into(),
-            0 => "\u{276f}".into(),
-            n => format!("\u{276f}{n}"),
-        }
-    }
-
-    /// The button's hover: how many need you and where, or that nothing does, and how much of the fleet the last read reached.
-    #[cfg_attr(
-        not(target_os = "macos"),
-        expect(dead_code, reason = "the menu-bar status item is macOS's")
-    )]
     pub(crate) fn tooltip(&self) -> String {
-        let count = |origin: fn(&Origin) -> bool| {
-            self.needs
-                .iter()
-                .filter(|n| n.counted && origin(&n.origin))
-                .count()
-        };
-        let here = count(|o| *o == Origin::Local);
-        let sibling = count(|o| matches!(o, Origin::Sibling(_)));
-        let fleet = count(|o| *o == Origin::Fleet);
-        let mut fleet_macs: Vec<&str> = self
-            .needs
-            .iter()
-            .filter(|n| n.counted)
-            .filter_map(|n| match n.at {
-                NeedAt::Peer(at) => self.peers.get(usize::from(at)).map(|p| p.name.as_str()),
-                NeedAt::Go(_) | NeedAt::Raise(_) => None,
-            })
-            .collect();
-        fleet_macs.sort_unstable();
-        fleet_macs.dedup();
-        let on_fleet = match fleet_macs.as_slice() {
-            [mac] => format!("on {mac}"),
-            _ => "on the fleet".to_string(),
-        };
-        let parts: Vec<String> = [
-            (here, "here"),
-            (sibling, "in another aterm"),
-            (fleet, on_fleet.as_str()),
-        ]
-        .into_iter()
-        .filter(|(n, _)| *n > 0)
-        .map(|(n, place)| format!("{n} {place}"))
-        .collect();
-        let mut tip = match self.need_count() {
-            0 => "Nothing needs you".to_string(),
-            1 => format!("1 needs you: {}", parts.join(", ")),
-            n => format!("{n} need you: {}", parts.join(", ")),
-        };
-        if let FleetLine::InFleet {
-            read: Some((answered, asked, _, _)),
-            ..
-        } = &self.fleet
-        {
-            tip.push_str(&format!(" \u{b7} fleet: {answered} of {asked} answered"));
-        }
-        tip
+        "aterm".into()
     }
 
     /// The local sessions needing the owner, in the order the menu lists them: what a test reads off a real App.
@@ -2098,7 +2014,14 @@ pub(crate) fn bytes_words(bytes: u64) -> String {
 
 /// `HH:MM` of `unix` on this Mac's clock, where its zone is known.
 pub(crate) fn clock_words(unix: i64) -> Option<String> {
-    let offset = crate::presence::local_offset_s()?;
+    clock_words_local(unix, &crate::presence::local_offset_at)
+}
+
+pub(crate) fn clock_words_local(
+    unix: i64,
+    offset_at: &dyn Fn(i64) -> Option<i64>,
+) -> Option<String> {
+    let offset = offset_at(unix)?;
     let local = (unix + offset).rem_euclid(86_400);
     Some(format!("{:02}:{:02}", local / 3600, (local % 3600) / 60))
 }
@@ -2281,6 +2204,81 @@ pub(crate) fn a_land_desk_at_rest() -> Vec<SessionRow> {
         ..idle(id, "zsh")
     }));
     rows
+}
+
+/// A LANDING'S RECEIPT ON THE BAR (`docs/DESIGN-harness-autopilot-2026-10-15.md` §14.9, slice
+/// 9c), at `now_ms`: `proj-api`, a worker started from `ctl` that landed three minutes ago with
+/// `3f9a1c2e4b7d` on `origin/main` (its Done for you row), and `parser`, a worker of `lead` that
+/// landed a minute ago in a repository with no remote (its row under its manager). Its receipts
+/// are [`landing_receipts`]'. `objc_toolbar_drive` puts them on a real status item and reads both
+/// rows' tips back off AppKit; the unit tests read the same rows.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn a_landing_with_its_receipt(now_ms: u64) -> Vec<SessionRow> {
+    let (on_main, no_remote) = landing_receipts();
+    let landed = |from: &str, ago_ms: u64| TaskRow {
+        state: TaskState::Done,
+        why: Some(crate::task_record::WHY_LANDED),
+        from: from.to_string(),
+        entered: 3,
+        since_unix_ms: now_ms.saturating_sub(ago_ms),
+        result_bytes: 2100,
+        result_path: None,
+        seen: false,
+    };
+    let row = |id: u64, title: &str| SessionRow {
+        id,
+        sid: format!("s-{id:020}"),
+        title: title.to_string(),
+        agent: "idle",
+        ..SessionRow::default()
+    };
+    let lead = row(1, "lead");
+    let lead_sid = lead.sid.clone();
+    vec![
+        lead,
+        SessionRow {
+            task: Some(landed(crate::task_record::FROM_CTL, 180_000)),
+            landed: true,
+            receipt: Some(std::sync::Arc::new(on_main)),
+            ..row(2, "proj-api")
+        },
+        SessionRow {
+            task: Some(landed(&lead_sid, 60_000)),
+            landed: true,
+            receipt: Some(std::sync::Arc::new(no_remote)),
+            ..row(3, "parser")
+        },
+    ]
+}
+
+/// [`a_landing_with_its_receipt`]'s two receipts: `3f9a1c2e4b7d` on `origin/main` in
+/// `/Users//me/src/proj-api` on `main`, and `0c4d2e9f1a7b` committed in `/Users//me/src/parser`,
+/// which has no remote.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn landing_receipts() -> (
+    aterm_agent::harness::acts::LandReceipt,
+    aterm_agent::harness::acts::LandReceipt,
+) {
+    use aterm_agent::harness::acts::{LandReceipt, ReceiptLeg};
+    (
+        LandReceipt {
+            head: "3f9a1c2e4b7d".to_string(),
+            main_ref: "origin/main".to_string(),
+            repo: "/Users//me/src/proj-api".to_string(),
+            branch: "main".to_string(),
+            leg: ReceiptLeg::OnMain,
+            check: false,
+            said: "Nothing left: the parser is committed and pushed to origin/main.".to_string(),
+            at_ms: 0,
+        },
+        LandReceipt {
+            head: "0c4d2e9f1a7b".to_string(),
+            repo: "/Users//me/src/parser".to_string(),
+            leg: ReceiptLeg::NoRemote,
+            said: "Nothing left: committed here; this folder has no remote.".to_string(),
+            ..LandReceipt::default()
+        },
+    )
 }
 
 /// A box beside an older report (`docs/DESIGN-harness-autopilot-2026-10-15.md` §14.7), at `now_unix`: tab 3's three-hour-old `NEEDS YOU:` report of Claude Code's (`proj-api`), which its agent carries on past, and tab 5's two-minute-old approval box (`build`), which has stopped its agent. Both are decide, both `◇`, and the box lists first. `objc_toolbar_drive` puts them on a real status item and reads the rows and their tips back off AppKit; the unit tests read the same rows.
@@ -2543,55 +2541,6 @@ fn act(label: impl Into<String>, action: StatusAction) -> StatusRow {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
-fn notify_tip(voice: Option<NoticeVoice>, on: bool) -> String {
-    use crate::notice_center::Center;
-    let what = "One notice when something needs you, never for a wait";
-    let Some(voice) = voice else {
-        return format!("{what}.");
-    };
-    let elsewhere = "the menu bar, the message band and messages.log still say what needs you";
-    match (voice.center, on) {
-        (Center::Granted, _) => format!(
-            "{what}. They are aterm's own: a click on one about a tab on this Mac goes to that \
-             tab, and any other brings aterm forward."
-        ),
-        (Center::Unasked | Center::Provisional, false) => format!(
-            "{what}. Turning this on asks macOS to let aterm show them as its own, and a click \
-             on one about a tab here then goes to that tab; if macOS says no, none reach the \
-             desktop."
-        ),
-        (Center::Unasked | Center::Provisional, true) => format!(
-            "{what}. macOS has not said yet whether aterm may show them as its own, so none \
-             reach the desktop until it does: the first one asks macOS (turning this off and on \
-             asks again), and after macOS's yes a click on one about a tab here goes to that tab."
-        ),
-        (Center::Refused, _) => format!(
-            "{what}. aterm's notifications are off in System Settings \u{25B8} Notifications, \
-             so none reach the desktop until aterm is allowed there; {elsewhere}."
-        ),
-        (Center::Absent, _) => match voice.fallback {
-            NoticeFallback::Withheld { named: false } => format!(
-                "{what}. aterm does not read this aterm.app's identity where it sits (in \
-                 Desktop, Documents, Downloads or another folder macOS guards) or when it is \
-                 started through a link, so it has none to show them as and none reach the \
-                 desktop: move aterm.app to /Applications (or ~/Applications) and open it from \
-                 there, and they are aterm's own once macOS allows it; {elsewhere}."
-            ),
-            NoticeFallback::Withheld { named: true } => format!(
-                "{what}. macOS gave this aterm.app no notification center (aterm.log says why), \
-                 and aterm shows them only as its own, so none reach the desktop; aterm's next \
-                 start tries again, and {elsewhere}."
-            ),
-            NoticeFallback::ScriptEditor => format!(
-                "{what}. This aterm is not running from aterm.app, so macOS shows them as Script \
-                 Editor's banners, and a click opens Script Editor; run from aterm.app, they are \
-                 aterm's own once macOS allows it."
-            ),
-        },
-    }
-}
-
 /// Compose the whole status menu from a glance, its ages as of `now_unix` — pure, deterministic, and unit-testable off macOS.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn compose_status_menu(g: &Glance, now_unix: i64) -> Vec<StatusRow> {
@@ -2716,7 +2665,11 @@ pub(crate) fn compose_status_menu(g: &Glance, now_unix: i64) -> Vec<StatusRow> {
                 DoneAt::Read(at) => StatusAction::ReadResult(pick(at)),
                 DoneAt::Go(at) => StatusAction::Go(pick(at)),
             };
-            rows.push(act(done_line(done, now_unix), action));
+            let mut row = act(done_line(done, now_unix), action);
+            if let StatusRow::Action { tip, .. } = &mut row {
+                tip.clone_from(&done.tip);
+            }
+            rows.push(row);
         }
     }
     if !g.waiting.is_empty() {
@@ -2824,14 +2777,7 @@ pub(crate) fn compose_status_menu(g: &Glance, now_unix: i64) -> Vec<StatusRow> {
     } else {
         act("Read This Mac", StatusAction::ReadThisMac)
     });
-    rows.push(StatusRow::Action {
-        label: "Notify Me When I\u{2019}m Needed".to_string(),
-        action: StatusAction::ToggleNotify,
-        enabled: true,
-        checked: g.alerts,
-        tip: Some(notify_tip(g.voice, g.alerts)),
-        indent: 0,
-    });
+
     rows
 }
 
@@ -3340,21 +3286,10 @@ pub(crate) fn menu_lines(rows: &[StatusRow], fleet: &[StatusRow]) -> Vec<String>
     lines
 }
 
-/// Nag mode's mascot, the rules lady who nags the owner for a permission or a chore, by stage ([`Glance::nag_stage`]): a tsk and a wagging finger, `NAG!`, head thrown back screaming `NAG NAG!`, and crazed `NAGG NAGG!!!!`.
-pub(crate) const NAG_STAGES: [&[u8]; 4] = [
-    include_bytes!("../assets/brand/nag-1.svg"),
-    include_bytes!("../assets/brand/nag-2.svg"),
-    include_bytes!("../assets/brand/nag-3.svg"),
-    include_bytes!("../assets/brand/nag-4.svg"),
-];
-
-/// The bar button's face — its title, and whether it is drawn red — to set for `glance`, or `None` when the button already shows it.
+/// The stable bar title to set for `glance`, or `None` when it is already shown.
 #[cfg(any(target_os = "macos", test))]
-pub(crate) fn button_face_change(
-    shown: Option<&(String, bool)>,
-    glance: &Glance,
-) -> Option<(String, bool)> {
-    let next = (glance.button_title(), glance.stuck());
+pub(crate) fn button_face_change(shown: Option<&String>, glance: &Glance) -> Option<String> {
+    let next = glance.button_title();
     (shown != Some(&next)).then_some(next)
 }
 
@@ -3387,10 +3322,8 @@ mod macos {
     pub(crate) struct StatusItemHandle {
         target: Retained<StatusTarget>,
         item: Obj,
-        shown_face: RefCell<Option<(String, bool)>>,
+        shown_face: RefCell<Option<String>>,
         shown_tip: RefCell<Option<String>>,
-        /// The nag stage the button's image shows ([`super::Glance::nag_stage`]), `None` before the first.
-        shown_nag: Cell<Option<Option<u8>>>,
     }
 
     pub(crate) struct StatusIvars {
@@ -3513,11 +3446,9 @@ mod macos {
                 item,
                 shown_face: RefCell::new(None),
                 shown_tip: RefCell::new(None),
-                shown_nag: Cell::new(None),
             })
         })?;
-        show_face(&handle, (glance.button_title(), glance.stuck()));
-        show_nag(&handle, glance.nag_stage());
+        show_face(&handle, glance.button_title());
         show_tip(&handle, glance.tooltip());
         Some(handle)
     }
@@ -3529,10 +3460,6 @@ mod macos {
         let change = super::button_face_change(handle.shown_face.borrow().as_ref(), &glance);
         if let Some(face) = change {
             show_face(handle, face);
-        }
-        let nag = glance.nag_stage();
-        if handle.shown_nag.get() != Some(nag) {
-            show_nag(handle, nag);
         }
         let tip = glance.tooltip();
         if handle.shown_tip.borrow().as_deref() != Some(tip.as_str()) {
@@ -3566,67 +3493,7 @@ mod macos {
         autoreleasepool(|_| paint_menu(menu, target, rows));
     }
 
-    fn attribute_keys() -> (Id, Id) {
-        #[link(name = "AppKit", kind = "framework")]
-        unsafe extern "C" {
-            static NSForegroundColorAttributeName: *mut std::ffi::c_void;
-            static NSFontAttributeName: *mut std::ffi::c_void;
-        }
-        // SAFETY: immortal `NSString *` constants AppKit exports; reading a symbol is a load.
-        unsafe {
-            (
-                Id::from_ptr(NSForegroundColorAttributeName),
-                Id::from_ptr(NSFontAttributeName),
-            )
-        }
-    }
-
-    fn red_title(title: &str, font: Id) -> Option<Obj> {
-        let text = appkit::nsstring(title)?;
-        // SAFETY: `+systemRedColor` is `-(NSColor *)`, an autoreleased shared colour;
-        // `+menuBarFontOfSize:` is `-(NSFont *)(CGFloat)`, 0 meaning the menu bar's own size;
-        // `+dictionaryWithObjects:forKeys:count:` is `-(id)(const id *, const id *, NSUInteger)`,
-        // which copies the two arrays (live on this frame) and retains their elements;
-        // `-initWithString:attributes:` is NSAttributedString's `-(id)(NSString *, NSDictionary *)`
-        // initializer, consuming the +1 `+alloc`. Every argument is live for the call, inside the
-        // caller's pool.
-        unsafe {
-            let red = appkit::send_id(class(c"NSColor").as_id(), sel!(systemRedColor));
-            let font = if font.is_null() {
-                appkit::send_id_f64(class(c"NSFont").as_id(), sel!(menuBarFontOfSize:), 0.0)
-            } else {
-                font
-            };
-            if red.is_null() || font.is_null() {
-                return None;
-            }
-            let (color_key, font_key) = attribute_keys();
-            let values = [red, font];
-            let keys = [color_key, font_key];
-            let dict: unsafe extern "C-unwind" fn(Id, Sel, *const Id, *const Id, usize) -> Id =
-                aterm_objc::checked_msg();
-            let attrs = dict(
-                class(c"NSDictionary").as_id(),
-                sel!(dictionaryWithObjects:forKeys:count:),
-                values.as_ptr(),
-                keys.as_ptr(),
-                values.len(),
-            );
-            if attrs.is_null() {
-                return None;
-            }
-            let init: unsafe extern "C-unwind" fn(Id, Sel, Id, Id) -> Id =
-                aterm_objc::checked_msg();
-            Obj::from_owned(init(
-                appkit::alloc(class(c"NSAttributedString")),
-                sel!(initWithString:attributes:),
-                text.id(),
-                attrs,
-            ))
-        }
-    }
-
-    fn show_face(handle: &StatusItemHandle, face: (String, bool)) {
+    fn show_face(handle: &StatusItemHandle, face: String) {
         let set = autoreleasepool(|_| {
             // SAFETY: plain AppKit sends on live receivers, on the main thread
             // (both callers checked `MainThread::new()`). `-button` is `-(id)`
@@ -3638,107 +3505,15 @@ mod macos {
                 if button.is_null() {
                     return false;
                 }
-                if face.1 {
-                    let font = appkit::send_id(button, sel!(font));
-                    let Some(text) = red_title(&face.0, font) else {
-                        return false;
-                    };
-                    appkit::send_v_id(button, sel!(setAttributedTitle:), text.id());
-                } else {
-                    let Some(text) = appkit::nsstring(&face.0) else {
-                        return false;
-                    };
-                    appkit::send_v_id(button, sel!(setTitle:), text.id());
-                }
+                let Some(text) = appkit::nsstring(&face) else {
+                    return false;
+                };
+                appkit::send_v_id(button, sel!(setTitle:), text.id());
                 true
             }
         });
         if set {
             *handle.shown_face.borrow_mut() = Some(face);
-        }
-    }
-
-    /// The bar button's height for nag mode's mascot, in points: the menu bar's icon size.
-    const NAG_POINTS: f64 = 18.0;
-    /// `NSCell.h` — `NSImageLeft = 2` (`NSCellImagePosition`): the mascot before the title.
-    const NS_IMAGE_LEFT: usize = 2;
-
-    /// Nag mode's mascot from one of [`super::NAG_STAGES`]' SVGs, sized for the bar button, or
-    /// `None` for bytes AppKit cannot read. Called inside an autorelease pool.
-    fn nag_image(svg: &[u8]) -> Option<Obj> {
-        // SAFETY: plain sends on live receivers; NSData and a fresh NSImage are made on any
-        // thread. `+dataWithBytes:length:` is `-(id)(const void *, NSUInteger)` and copies the
-        // bytes into an NSData the caller's pool owns; `+alloc` then `-initWithData:`
-        // (`-(id)(NSData *)`) gives a +1 NSImage, adopted by `Obj`, or nil for bytes it cannot
-        // read; `-setSize:` is `-(void)(NSSize)`.
-        unsafe {
-            let data_with: unsafe extern "C-unwind" fn(
-                Id,
-                Sel,
-                *const std::ffi::c_void,
-                usize,
-            ) -> Id = aterm_objc::checked_msg();
-            let data = data_with(
-                class(c"NSData").as_id(),
-                sel!(dataWithBytes:length:),
-                svg.as_ptr().cast(),
-                svg.len(),
-            );
-            if data.is_null() {
-                return None;
-            }
-            let image = Obj::from_owned(appkit::send_id_id(
-                appkit::alloc(class(c"NSImage")),
-                sel!(initWithData:),
-                data,
-            ))?;
-            appkit::send_v_size(
-                image.id(),
-                sel!(setSize:),
-                aterm_objc::CGSize {
-                    width: NAG_POINTS,
-                    height: NAG_POINTS,
-                },
-            );
-            Some(image)
-        }
-    }
-
-    /// Puts nag mode's mascot at `stage` on the bar button before its title, or takes her off for `None` ([`super::NAG_STAGES`]).
-    fn show_nag(handle: &StatusItemHandle, stage: Option<u8>) {
-        let svg = stage.and_then(|s| super::NAG_STAGES.get(usize::from(s).checked_sub(1)?));
-        let set = autoreleasepool(|_| {
-            // SAFETY: plain AppKit sends on live receivers, on the main thread (both callers
-            // checked `MainThread::new()`). `-setImage:` is `-(void)(NSImage *)`, nil taking the
-            // image off, and the button retains it; `-setImagePosition:` is
-            // `-(void)(NSCellImagePosition)`.
-            unsafe {
-                let button = appkit::send_id(handle.item.id(), sel!(button));
-                if button.is_null() {
-                    return false;
-                }
-                let image = match svg {
-                    Some(bytes) => {
-                        let Some(image) = nag_image(bytes) else {
-                            return false;
-                        };
-                        Some(image)
-                    }
-                    None => None,
-                };
-                let shown = image.as_ref().map_or(Id::NIL, Obj::id);
-                appkit::send_v_id(button, sel!(setImage:), shown);
-                let position = if image.is_some() {
-                    NS_IMAGE_LEFT
-                } else {
-                    crate::appkit::consts::NS_NO_IMAGE
-                };
-                appkit::send_v_usize(button, sel!(setImagePosition:), position);
-                true
-            }
-        });
-        if set {
-            handle.shown_nag.set(Some(stage));
         }
     }
 
@@ -3917,6 +3692,8 @@ mod macos {
         pub(crate) enabled: bool,
         /// `-toolTip`, `None` where it is nil.
         pub(crate) tip: Option<String>,
+        /// Its `-submenu`'s items, in order; empty where it has none.
+        pub(crate) under: Vec<BarItem>,
     }
 
     /// What the menu bar's real item holds as a person opens it: the live `NSStatusItem`'s `-menu`,
@@ -3945,24 +3722,31 @@ mod macos {
         })
     }
 
-    /// Each item of the live `menu`, in order: its `-title`, `-isEnabled` and `-toolTip`.
+    /// Each item of the live `menu`, in order: its `-title`, `-isEnabled`, `-toolTip` and its
+    /// `-submenu`'s items.
     fn items_of(menu: Id) -> Vec<BarItem> {
         // SAFETY: `menu` is a live NSMenu; `-numberOfItems` is `-(NSInteger)`, `-itemAtIndex:`
-        // `-(NSMenuItem *)(NSInteger)` within its count, `-title` and `-toolTip` `-(NSString *)`
-        // (the tip nil where none was set) and `-isEnabled` `-(BOOL)`, all without side effects on
-        // the menu and its items.
+        // `-(NSMenuItem *)(NSInteger)` within its count, `-title` and `-toolTip`
+        // `-(NSString *)` (nil where none was set), `-submenu` `-(NSMenu *)` (nil where none)
+        // and `-isEnabled` `-(BOOL)`, all without side effects on the menu and its items.
         unsafe {
             let count = appkit::send_isize(menu, sel!(numberOfItems));
             let item_at: unsafe extern "C-unwind" fn(Id, Sel, isize) -> Id =
                 aterm_objc::checked_msg();
+            let string = |s: Id| (!s.is_null()).then(|| appkit::nsstring_to_rust(s));
             (0..count)
                 .map(|i| {
                     let item = item_at(menu, sel!(itemAtIndex:), i);
-                    let tip = appkit::send_id(item, sel!(toolTip));
+                    let sub = appkit::send_id(item, sel!(submenu));
                     BarItem {
                         title: appkit::nsstring_to_rust(appkit::send_id(item, sel!(title))),
                         enabled: appkit::send_bool(item, sel!(isEnabled)),
-                        tip: (!tip.is_null()).then(|| appkit::nsstring_to_rust(tip)),
+                        tip: string(appkit::send_id(item, sel!(toolTip))),
+                        under: if sub.is_null() {
+                            Vec::new()
+                        } else {
+                            items_of(sub)
+                        },
                     }
                 })
                 .collect()
@@ -3983,39 +3767,8 @@ mod macos {
     mod tests {
         use aterm_objc::{ClassType, Sel, autoreleasepool, class, class_name, method_types, sel};
 
-        use super::{NAG_POINTS, StatusTarget, nag_image, new_item};
+        use super::{StatusTarget, new_item};
         use crate::appkit;
-
-        #[test]
-        fn every_nag_stage_reads_as_an_icon_for_the_bar() {
-            autoreleasepool(|_| {
-                for (stage, svg) in crate::status_item::NAG_STAGES.iter().enumerate() {
-                    let stage = stage + 1;
-                    let image = nag_image(svg).unwrap_or_else(|| panic!("nag stage {stage} reads"));
-                    // SAFETY: `-size` is `-(NSSize)` and `-representations` `-(NSArray *)` on a
-                    // live NSImage; `-count` is `-(NSUInteger)` on the live array.
-                    unsafe {
-                        assert_eq!(
-                            appkit::send_size(image.id(), sel!(size)),
-                            aterm_objc::CGSize {
-                                width: NAG_POINTS,
-                                height: NAG_POINTS,
-                            },
-                            "nag stage {stage} is sized for the bar"
-                        );
-                        let reps = appkit::send_id(image.id(), sel!(representations));
-                        assert!(
-                            !reps.is_null() && appkit::send_usize(reps, sel!(count)) > 0,
-                            "nag stage {stage} decodes to a drawable picture"
-                        );
-                    }
-                }
-                assert!(
-                    nag_image(b"no picture").is_none(),
-                    "AppKit refuses bytes it cannot read"
-                );
-            });
-        }
 
         #[test]
         fn the_registered_class_is_what_the_runtime_reports() {
@@ -5111,13 +4864,6 @@ mod tests {
             }
         }
         assert!(
-            lines.contains(&format!(
-                "statusmenu \"Notify Me When I\u{2019}m Needed\" enabled=yes checked=no tip={:?}",
-                notify_tip(None, false)
-            )),
-            "{lines:#?}"
-        );
-        assert!(
             lines.contains(
                 &"statusmenu   \"Take Over on lab-mini\" enabled=yes checked=no".to_string()
             ),
@@ -5317,12 +5063,11 @@ mod tests {
         }
     }
 
-    fn acts() -> [Shape; 4] {
+    fn acts() -> [Shape; 3] {
         [
             Shape::Sep,
             Shape::Act(StatusAction::Overview),
             Shape::Act(StatusAction::ReadThisMac),
-            Shape::Act(StatusAction::ToggleNotify),
         ]
     }
 
@@ -5358,7 +5103,7 @@ mod tests {
         );
         assert_eq!(g.local_need_sessions(), vec![1, 4, 3, 5]);
         assert_eq!(g.need_count(), 4);
-        assert_eq!(g.button_title(), "\u{276f}4");
+        assert_eq!(g.button_title(), "\u{276f}");
         assert!(g.stuck(), "the wall is stuck");
         let menu = compose_status_menu(&g, 1000);
         let go = |session: u64| {
@@ -5378,7 +5123,7 @@ mod tests {
     }
 
     #[test]
-    fn the_badge_counts_local_and_sibling_needs_and_is_red_only_when_stuck() {
+    fn local_and_sibling_diagnostics_keep_the_bar_quiet() {
         let sibling = SiblingInstance {
             pid: 900,
             sock: "/tmp/aterm-900.sock".to_string(),
@@ -5401,7 +5146,7 @@ mod tests {
             1000,
             None,
         );
-        assert_eq!(both.button_title(), "\u{276f}2");
+        assert_eq!(both.button_title(), "\u{276f}");
         assert!(both.stuck(), "the sibling's frozen agent is stuck");
         assert_eq!(both.stuck_count(), 1);
         assert_eq!(both.needs[0].origin, Origin::Sibling(900));
@@ -5459,7 +5204,7 @@ mod tests {
         let mut g = local_glance(&[], &[], 0, None);
         assert_eq!(g.button_title(), "\u{276f}");
         g.exceptions = vec![(11, "macOS keeps asking for access".into())];
-        assert_eq!(g.button_title(), "\u{276f}\u{2022}");
+        assert_eq!(g.button_title(), "\u{276f}");
         let done = local_glance(
             &[worker(
                 2,
@@ -5472,10 +5217,10 @@ mod tests {
             0,
             None,
         );
-        assert_eq!(done.button_title(), "\u{276f}\u{2022}", "a result for you");
+        assert_eq!(done.button_title(), "\u{276f}", "a result for you");
         let mut asked = local_glance(&[row(3, "zsh", Some("look"))], &[], 0, None);
         asked.exceptions = g.exceptions.clone();
-        assert_eq!(asked.button_title(), "\u{276f}1", "a need wins the title");
+        assert_eq!(asked.button_title(), "\u{276f}", "a need wins the title");
     }
 
     #[test]
@@ -5851,7 +5596,7 @@ mod tests {
                 "statusmenu \"\u{2713} Calc.py small tested module \u{2014} landed 41m\" enabled=yes checked=no",
             ]
         );
-        assert_eq!(g.button_title(), "\u{276f}\u{2022}");
+        assert_eq!(g.button_title(), "\u{276f}");
         let mut unseen = rows.clone();
         unseen[2].end.as_mut().expect("an end").seen = false;
         assert_eq!(local_glance(&unseen, &[], now, None).done.len(), 3);
@@ -5975,7 +5720,7 @@ mod tests {
     }
 
     #[test]
-    fn the_title_lights_for_an_end_row_while_nothing_needs_you() {
+    fn finished_work_keeps_the_bar_quiet() {
         let now = 1_000_000;
         let end = ended(1, "proj-api refactor", now - 60, false);
         let g = local_glance(
@@ -5984,7 +5729,7 @@ mod tests {
             now,
             None,
         );
-        assert_eq!(g.button_title(), "\u{276f}\u{2022}");
+        assert_eq!(g.button_title(), "\u{276f}");
         assert_eq!(g.need_count(), 0);
         let g = local_glance(
             &[end.clone(), agent_row(2, "rm", "prompt", 1)],
@@ -5992,7 +5737,7 @@ mod tests {
             now,
             None,
         );
-        assert_eq!(g.button_title(), "\u{276f}1", "a need wins the title");
+        assert_eq!(g.button_title(), "\u{276f}", "a need wins the title");
         let mut seen = end;
         seen.end.as_mut().expect("an end").seen = true;
         let g = local_glance(&[seen, agent_row(2, "busy", "busy", 1)], &[], now, None);
@@ -6101,7 +5846,6 @@ mod tests {
             StatusAction::DismissExceptions,
             StatusAction::Overview,
             StatusAction::ReadThisMac,
-            StatusAction::ToggleNotify,
             StatusAction::HandBackAll,
             StatusAction::ShowException(41),
             StatusAction::Go(p),
@@ -6172,58 +5916,18 @@ mod tests {
     }
 
     #[test]
-    fn the_bar_button_is_refaced_only_when_its_face_changes() {
+    fn diagnostics_do_not_change_the_menu_bar_face() {
         let calm = local_glance(&[row(1, "zsh", None)], &[], 0, None);
-        let asked = local_glance(&[row(1, "zsh", Some("look"))], &[], 0, None);
-        let asked_more = local_glance(&[row(1, "zsh", Some("look again"))], &[], 0, None);
-        assert_ne!(asked.fingerprint(), asked_more.fingerprint());
-        let face = |g: &Glance| (g.button_title(), g.stuck());
-        assert_eq!(button_face_change(None, &calm), Some(face(&calm)));
-        assert_eq!(button_face_change(Some(&face(&calm)), &calm), None);
-        assert_eq!(
-            button_face_change(Some(&face(&calm)), &asked),
-            Some(face(&asked))
-        );
-        assert_eq!(button_face_change(Some(&face(&asked)), &asked_more), None);
-        let stuck = local_glance(&[agent_row(1, "w", "wall:auth", 1)], &[], 0, None);
-        assert_eq!(stuck.button_title(), asked.button_title(), "one need each");
-        assert_eq!(
-            button_face_change(Some(&face(&asked)), &stuck),
-            Some(face(&stuck)),
-            "the colour alone re-faces it"
-        );
-    }
-
-    #[test]
-    fn the_nag_screams_crazier_with_each_need_and_each_stuck_one() {
-        let calm = local_glance(&[row(1, "zsh", None)], &[], 0, None);
-        assert_eq!(calm.nag_stage(), None, "nothing nags");
-        let one = local_glance(&[row(1, "zsh", Some("look"))], &[], 0, None);
-        assert_eq!(one.nag_stage(), Some(1));
-        let two = local_glance(
-            &[row(1, "zsh", Some("look")), row(2, "zsh", Some("and here"))],
-            &[],
-            0,
-            None,
-        );
-        assert_eq!(two.nag_stage(), Some(2));
-        let stuck = local_glance(&[agent_row(1, "w", "wall:auth", 1)], &[], 0, None);
-        assert_eq!(stuck.need_count(), 1, "fixture: one need");
-        assert_eq!(
-            stuck.nag_stage(),
-            Some(2),
-            "a stuck need nags a stage harder"
-        );
-        let many: Vec<_> = (1..=6).map(|id| row(id, "zsh", Some("look"))).collect();
-        let many = local_glance(&many, &[], 0, None);
-        assert_eq!(
-            many.nag_stage(),
-            Some(u8::try_from(NAG_STAGES.len()).unwrap()),
-            "she tops out crazed"
-        );
-        for svg in NAG_STAGES {
-            let svg = std::str::from_utf8(svg).expect("an SVG is text");
-            assert!(svg.contains("<svg ") && svg.trim_end().ends_with("</svg>"));
+        let face = calm.button_title();
+        assert_eq!(button_face_change(None, &calm), Some(face.clone()));
+        for rows in [
+            vec![row(1, "zsh", Some("look"))],
+            vec![agent_row(1, "w", "wall:auth", 1)],
+        ] {
+            let mut diagnostic = local_glance(&rows, &[], 0, None);
+            diagnostic.exceptions.push((11, "recorded error".into()));
+            assert_eq!(button_face_change(Some(&face), &diagnostic), None);
+            assert_eq!(diagnostic.tooltip(), "aterm");
         }
     }
 
@@ -6510,123 +6214,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn notify_me_says_whose_banner_a_notice_is() {
-        use crate::notice_center::Center;
-        let tip = |voice: Option<NoticeVoice>, on: bool| {
-            let mut g = local_glance(&[], &[], 0, None);
-            g.voice = voice;
-            g.alerts = on;
-            let menu = compose_status_menu(&g, 0);
-            assert_eq!(
-                menu.iter()
-                    .filter(|r| matches!(r, StatusRow::Action { tip: Some(_), .. }))
-                    .count(),
-                1
-            );
-            menu.into_iter()
-                .find_map(|r| match r {
-                    StatusRow::Action {
-                        action: StatusAction::ToggleNotify,
-                        tip,
-                        ..
-                    } => tip,
-                    _ => None,
-                })
-                .expect("a hover")
-        };
-        let voice = |center, fallback| Some(NoticeVoice { center, fallback });
-        let fallbacks = [
-            NoticeFallback::Withheld { named: true },
-            NoticeFallback::Withheld { named: false },
-            NoticeFallback::ScriptEditor,
-        ];
-        let mut cases = vec![(None, false)];
-        for fallback in fallbacks {
-            cases.push((voice(Center::Absent, fallback), false));
-        }
-        let bare = tip(voice(Center::Absent, NoticeFallback::ScriptEditor), false);
-        assert!(bare.contains("Script Editor's banners"), "{bare}");
-        assert!(bare.contains("not running from aterm.app"), "{bare}");
-        assert!(!bare.contains("terminal-notifier"), "{bare}");
-        let unread = tip(
-            voice(Center::Absent, NoticeFallback::Withheld { named: false }),
-            false,
-        );
-        assert!(unread.contains("none reach the desktop"), "{unread}");
-        assert!(
-            unread.contains("move aterm.app to /Applications (or ~/Applications)"),
-            "{unread}"
-        );
-        assert!(unread.contains("they are aterm's own"), "{unread}");
-        let unopened = tip(
-            voice(Center::Absent, NoticeFallback::Withheld { named: true }),
-            true,
-        );
-        assert!(unopened.contains("none reach the desktop"), "{unopened}");
-        assert!(unopened.contains("aterm.log says why"), "{unopened}");
-        let bundled = NoticeFallback::Withheld { named: true };
-        cases.push((voice(Center::Unasked, bundled), true));
-        cases.push((voice(Center::Unasked, bundled), false));
-        cases.push((voice(Center::Refused, bundled), false));
-        cases.push((voice(Center::Granted, bundled), false));
-        let tips: std::collections::HashSet<String> =
-            cases.iter().map(|&(v, on)| tip(v, on)).collect();
-        assert_eq!(tips.len(), cases.len(), "{tips:#?}");
-        let granted = tip(voice(Center::Granted, bundled), true);
-        assert!(
-            granted.contains("about a tab on this Mac goes to that tab"),
-            "{granted}"
-        );
-        assert!(
-            granted.contains("any other brings aterm forward"),
-            "{granted}"
-        );
-        let unasked = tip(voice(Center::Unasked, bundled), false);
-        assert!(unasked.contains("Turning this on asks macOS"), "{unasked}");
-        assert!(
-            unasked.contains("if macOS says no, none reach the desktop"),
-            "{unasked}"
-        );
-        let asking = tip(voice(Center::Unasked, bundled), true);
-        assert!(asking.contains("the first one asks macOS"), "{asking}");
-        assert!(asking.contains("none reach the desktop"), "{asking}");
-        let refused = tip(voice(Center::Refused, bundled), false);
-        assert!(refused.contains("none reach the desktop"), "{refused}");
-        for fallback in fallbacks {
-            for on in [true, false] {
-                assert_eq!(granted, tip(voice(Center::Granted, fallback), on));
-                assert_eq!(refused, tip(voice(Center::Refused, fallback), on));
-            }
-            assert_eq!(unasked, tip(voice(Center::Unasked, fallback), false));
-            assert_eq!(asking, tip(voice(Center::Unasked, fallback), true));
-        }
-        for bundled in [&granted, &refused, &unasked, &asking, &unread, &unopened] {
-            for banner in ["Script Editor", "terminal-notifier"] {
-                assert!(!bundled.contains(banner), "{bundled}");
-            }
-        }
-    }
-
-    #[test]
-    fn notify_me_is_checked_with_desktop_alerts() {
-        for alerts in [true, false] {
-            let mut g = local_glance(&[], &[], 0, None);
-            g.alerts = alerts;
-            let checked = compose_status_menu(&g, 0).iter().any(|r| {
-                matches!(
-                    r,
-                    StatusRow::Action {
-                        action: StatusAction::ToggleNotify,
-                        checked: true,
-                        ..
-                    }
-                )
-            });
-            assert_eq!(checked, alerts);
-        }
-    }
-
     fn fleet_slot(
         macs: Vec<crate::fleet_glance::FleetMac>,
         read_at_ms: u64,
@@ -6774,7 +6361,7 @@ mod tests {
         let g = Glance::build(&[], &[], Some(&slot), unix_ms(now), None);
         assert_eq!(g.needs.len(), 1);
         assert_eq!((g.need_count(), g.stuck()), (1, true));
-        assert_eq!(g.button_title(), "\u{276f}1");
+        assert_eq!(g.button_title(), "\u{276f}");
         assert!(g.in_fleet());
         let stale = fleet_slot(vec![mac("mac-17", 1, 0, false)], read_ms(301));
         let g_stale = Glance::build(&[], &[], Some(&stale), unix_ms(now), None);
@@ -7791,5 +7378,55 @@ mod tests {
         );
         assert_eq!(menu.get(2), Some(&StatusRow::Separator));
         assert_eq!(menu.get(3), Some(&StatusRow::Info(here_line(&g.here))));
+    }
+
+    /// Every clickable row's label and tip in `menu`, a submenu's rows after its own.
+    fn tips_of(menu: &[StatusRow]) -> Vec<(String, Option<String>)> {
+        menu.iter()
+            .flat_map(|row| match row {
+                StatusRow::Action { label, tip, .. } => vec![(label.clone(), tip.clone())],
+                StatusRow::Submenu { rows, .. } => tips_of(rows),
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    /// A LANDING'S ROWS SAY WHAT ATERM CHECKED (`docs/DESIGN-harness-autopilot-2026-10-15.md`
+    /// §14.9, slice 9c): over [`a_landing_with_its_receipt`], the Done for you row's tip says what
+    /// aterm checked and what the agent said, naming the head and `origin/main`; the worker's row
+    /// under its manager what aterm checked in a repository with no remote. A landing with no
+    /// receipt (codex-alab's own) says aterm checked nothing; a done its face moved off says
+    /// nothing. NEGATIVE CONTROL (run by hand): `DoneRow::tip` left `None` fails the first.
+    #[test]
+    fn a_landings_rows_say_what_aterm_checked() {
+        use aterm_agent::supervise::mode_words::{NO_RECORD, checked_words, landed_tip};
+        let now = 1_800_000_000;
+        let mut rows = a_landing_with_its_receipt(unix_ms(now));
+        let (on_main, no_remote) = landing_receipts();
+        let tip = |rows: &[SessionRow], lead: &str| {
+            let menu = compose_status_menu(&local_glance(rows, &[], now, None), now);
+            let found: Vec<_> = tips_of(&menu)
+                .into_iter()
+                .filter(|(label, _)| label.starts_with(lead))
+                .collect();
+            let [(_, tip)] = found.as_slice() else {
+                panic!("one row {lead:?}: {menu:#?}");
+            };
+            tip.clone()
+        };
+        let done = "\u{2713} proj-api \u{2014} landed";
+        let worker = "\u{2713} parser \u{2014} landed";
+        let on_tip = tip(&rows, done).expect("the Done for you row's tip");
+        assert_eq!(on_tip, landed_tip(Some(&on_main)));
+        assert!(on_tip.contains("3f9a1c2e4b7d on origin/main"), "{on_tip}");
+        assert_eq!(tip(&rows, worker), Some(checked_words(Some(&no_remote))));
+        rows[1].receipt = None;
+        rows[2].receipt = None;
+        assert_eq!(tip(&rows, done).as_deref(), Some(NO_RECORD));
+        assert_eq!(tip(&rows, worker).as_deref(), Some(NO_RECORD));
+        rows[1].landed = false;
+        rows[2].landed = false;
+        assert_eq!(tip(&rows, done), None, "the face moved off");
+        assert_eq!(tip(&rows, worker), None, "the face moved off");
     }
 }

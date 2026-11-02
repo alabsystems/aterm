@@ -356,6 +356,14 @@ mod dev {
                     }
                 }
                 if fds[0].revents != 0 {
+                    if buf.is_empty() {
+                        if (fds[0].revents & libc::POLLHUP) != 0
+                            && (fds[0].revents & libc::POLLIN) == 0
+                        {
+                            return Ok(Readiness::Closed);
+                        }
+                        return Ok(Readiness::Bytes(0));
+                    }
                     // SAFETY: `buf` is a live, writable buffer of `buf.len()` bytes.
                     let n = unsafe { libc::read(self.fd(), buf.as_mut_ptr().cast(), buf.len()) };
                     if n > 0 {
@@ -512,7 +520,10 @@ mod mem {
 
         fn schedule(&self, after: Duration, item: Scripted) {
             let mut state = self.state();
-            let at = state.last + after;
+            let at = match state.last.checked_add(after) {
+                Some(at) => at,
+                None => state.last,
+            };
             state.last = at;
             state.script.push_back((at, item));
         }
@@ -704,6 +715,7 @@ mod tests {
             },
         );
         let mut buf = [0u8; 3];
+        assert_eq!(tty.read(&mut [], None).unwrap(), Readiness::Bytes(0));
         assert_eq!(tty.read(&mut buf, None).unwrap(), Readiness::Bytes(2));
         assert_eq!(&buf[..2], b"ab");
         let deadline = start + Duration::from_millis(100);
@@ -727,6 +739,8 @@ mod tests {
         );
         assert_eq!(tty.read(&mut buf, None).unwrap(), Readiness::Closed);
         assert!(peer.script_done());
+        peer.send_after(Duration::MAX, b"z");
+        assert_eq!(tty.read(&mut buf, None).unwrap(), Readiness::Bytes(1));
     }
 
     #[test]

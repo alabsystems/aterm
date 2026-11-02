@@ -99,16 +99,168 @@ pub(crate) fn gate(config: &Path, host: Host) -> aterm_db::runtime::LanGate {
     }
 }
 
-/// Hold this window's other first LAN uses (System State's Secrets stage's vault probe and join,
-/// Tab Control's Bonjour sweep, the network signal's `_alab._tcp` Bonjour browse) by the rule its
-/// Commons runtime's gate for `config` waits on:
-/// they wait while System State's Local Network step is still to come and has not asked
-/// ([`aterm_types::macos_setup::lan_first_use::may_use`]). It installs the reader of that rule,
-/// in a window that runs first-run setup only (`first_lan_uses_wait_for_the_step`), since
-/// another runs no step; off a Mac no question guards the LAN, so nothing waits there.
+/// How often a process whose Commons runtime `[swarm] enabled = false` holds looks at the switch
+/// again ([`when_sharing_on`]): one `stat` ([`aterm_secrets::swarm::Switch`]).
+pub(crate) const SHARING_LOOK: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Run `start` (this process's Commons runtime) once `home`'s `[swarm] enabled` leaves sharing on:
+/// at once where it does now, else on a thread of its own that looks at the switch each `look`
+/// until a person turns it on. `docs/DESIGN-alab-swarm-2026-10-27.md` §9: the switch sets
+/// `[commons] enabled = false` among the rest, so no Commons runtime runs while it is off, and
+/// none holds its gate ([`gate`]), nor the macOS dialog slot that gate may take, for a LAN use it
+/// would never make. A switch that cannot be read holds it as an off one does, as Commons' own
+/// policy read refuses it. Whether `start` ran at once.
+pub(crate) fn when_sharing_on(
+    home: &Path,
+    look: std::time::Duration,
+    start: impl FnOnce() + Send + 'static,
+) -> bool {
+    let mut switch = aterm_secrets::swarm::Switch::new(home);
+    let said = |line: &str| aterm_log::warn!("Commons: {line}");
+    if switch.enabled_saying(&said) == Ok(true) {
+        start();
+        return true;
+    }
+    let waits = std::thread::Builder::new()
+        .name("commons-sharing-off".into())
+        .spawn(move || {
+            while switch.enabled_saying(&said) != Ok(true) {
+                std::thread::sleep(look);
+            }
+            start();
+        });
+    if let Err(error) = waits {
+        aterm_log::warn!(
+            "Commons waits for [swarm] enabled, and its wait could not start ({error}): it starts \
+             at aterm's next launch with sharing on"
+        );
+    }
+    false
+}
+
+/// Hold `host`'s other first LAN uses (in a window, System State's Secrets stage's vault probe
+/// and join, Tab Control's Bonjour sweep; in a window and in `aterm node serve`, the network
+/// signal's `_alab._tcp` Bonjour browse, the fleet heartbeat and facts push, the fleet glance's
+/// reads, and the node job's advert and listener) by the rule its Commons runtime's gate for
+/// `config` waits on: they wait while System State's Local Network step is still to come for
+/// `host` and has not asked ([`aterm_types::macos_setup::lan_first_use::may_use`]). It installs
+/// the reader of that rule in a window that runs first-run setup (`first_lan_uses_wait_for_the_step`;
+/// another runs no step) and in the node job, whose gate waits for a window's step at the console;
+/// off a Mac no question guards the LAN, so nothing waits there. A window also installs the door
+/// its uses go through once they waited for the step
+/// ([`aterm_types::macos_setup::lan_first_use::install_door`]): only time with a person at this
+/// Mac counts toward the wait, and past it a use goes only with a person there, the window's keys
+/// at rest and its dialog slot free. The node job has no window, so it installs no door: its wait
+/// counts the wall clock, and past it its uses go, as its Commons gate asks by itself under its
+/// own slot.
+/// A window also reads, as a use already asked, that this Mac's and app's vault subscriber used
+/// the local network ([`subscriber_asked_here`]): macOS asks each app once, so its System State
+/// step reads that question as asked and raises no second hold.
 #[cfg(target_os = "macos")]
-pub(crate) fn hold_first_uses_for_the_step(config: &Path) {
-    macos::install_step_to_come(config.to_owned());
+pub(crate) fn hold_first_uses_for_the_step(config: &Path, host: Host) {
+    install_door(host);
+    if matches!(host, Host::Window { .. }) {
+        let config = config.to_owned();
+        aterm_types::macos_setup::lan_first_use::install_asked_elsewhere(move || {
+            subscriber_asked_here(&config)
+        });
+    }
+    macos::install_step_to_come(config.to_owned(), host);
+}
+
+/// The file in Commons' record directory that keeps, one line per Mac and app, that its vault
+/// subscriber (the background job, which has no window) used the local network
+/// ([`keep_subscriber_asked_here`]).
+#[cfg(target_os = "macos")]
+const SUBSCRIBER_ASKED_HERE: &str = "subscriber-asked-here";
+
+/// Keep, for this Mac and app ([`here`]), that the vault subscriber made its first Local Network
+/// use (its `_alab-vault._tcp` browse), which puts macOS's Local Network question to aterm here
+/// if nothing did before. A window's System State step then reads that question as asked
+/// ([`subscriber_asked_here`]). Keyed to this Mac and app, as [`ASKED_HERE`] is, so a home
+/// restored or synced from another Mac carries none of this one's. Registered with the vault
+/// subscriber (`aterm_secrets::client::on_lan_first_use`).
+#[cfg(target_os = "macos")]
+pub(crate) fn keep_subscriber_asked_here() {
+    let (Some(config), Some(here)) = (aterm_types::dirs::aterm_config_path(), here()) else {
+        return;
+    };
+    let record = aterm_db::network_state::directory(&config);
+    if let Err(error) = keep_here(&record, SUBSCRIBER_ASKED_HERE, &here) {
+        aterm_log::warn!(
+            "vault subscriber: could not keep that it used the local network ({error}); a \
+             window's System State asks macOS's Local Network question itself"
+        );
+    }
+}
+
+/// Whether this Mac's and app's vault subscriber used the local network, as `config`'s Commons
+/// record keeps it ([`keep_subscriber_asked_here`]).
+#[cfg(target_os = "macos")]
+fn subscriber_asked_here(config: &Path) -> bool {
+    here()
+        .is_some_and(|here| subscriber_asked_in(&aterm_db::network_state::directory(config), &here))
+}
+
+/// Whether `record` keeps that the vault subscriber of the app `here` names, on the Mac it names,
+/// used the local network ([`SUBSCRIBER_ASKED_HERE`]).
+#[cfg(target_os = "macos")]
+fn subscriber_asked_in(record: &Path, here: &str) -> bool {
+    here_lines(record, SUBSCRIBER_ASKED_HERE)
+        .iter()
+        .any(|line| line == here)
+}
+
+/// A door's two readers ([`door_for`]): whether a person is at this Mac, and whether this is
+/// the quiet moment a key rests.
+#[cfg(target_os = "macos")]
+type Door = (fn() -> bool, fn() -> bool);
+
+/// The readers of the door `host`'s first LAN uses go through past their wait for a window's
+/// Local Network step ([`aterm_types::macos_setup::lan_first_use::install_door`]): a person at
+/// this Mac, and the quiet moment that keeps a key on its way out of macOS's question. A window
+/// reads its own keys at rest; a terminal session lane, which has no window, macOS's idle time
+/// (no keyboard or pointer input for the steps' key rest), as its Commons gate asks under a
+/// person's typing otherwise. The node job installs none: nobody types into it, and past its
+/// wait its uses go.
+#[cfg(target_os = "macos")]
+fn door_for(host: Host) -> Option<Door> {
+    match host {
+        Host::Window { .. } => Some((
+            aterm_gui::person_at_this_screen as fn() -> bool,
+            aterm_gui::keys_at_rest as fn() -> bool,
+        )),
+        Host::SessionLane => Some((
+            aterm_gui::person_at_this_screen as fn() -> bool,
+            aterm_gui::input_at_rest as fn() -> bool,
+        )),
+        Host::NodeServe => None,
+    }
+}
+
+/// Install `host`'s door ([`door_for`]), where it has one.
+#[cfg(target_os = "macos")]
+pub(crate) fn install_door(host: Host) {
+    if let Some((present, quiet)) = door_for(host) {
+        aterm_types::macos_setup::lan_first_use::install_door(present, quiet);
+    }
+}
+
+/// Install this process's reader of `home`'s `[swarm] enabled` for its automatic LAN uses
+/// ([`aterm_types::macos_setup::lan_first_use::install_sharing`]): while it reads off, or the
+/// file cannot be read (said in aterm.log once per change), no Secrets probe or join, Tab Control
+/// sweep, `_alab._tcp` browse, fleet heartbeat or glance read, or node advert goes by itself
+/// (`docs/DESIGN-alab-swarm-2026-10-27.md` §9). One `stat` a read
+/// ([`aterm_secrets::swarm::Switch`]).
+pub(crate) fn install_sharing(home: &Path) {
+    let switch = std::sync::Mutex::new(aterm_secrets::swarm::Switch::new(home));
+    aterm_types::macos_setup::lan_first_use::install_sharing(move || {
+        switch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .enabled_saying(&|line| aterm_log::warn!("local network uses: {line}"))
+            == Ok(true)
+    });
 }
 
 /// What reads, for `host`'s runtime, whether macOS refused it the local network: in a window,
@@ -165,13 +317,15 @@ mod macos {
             || MacosDialog::when_none_up(Duration::ZERO),
             Reads {
                 handed: || {
-                    let revision = lan_first_use::handed()?;
-                    let _ = aterm_log::wait_for_logger(crate::EARLY_LOG_WAIT);
-                    aterm_log::info!(
-                        "Commons: System State's Local Network step handed over the local network \
-                         (revision {revision})"
-                    );
-                    Some(())
+                    if let Some(revision) = lan_first_use::handed() {
+                        let _ = aterm_log::wait_for_logger(crate::EARLY_LOG_WAIT);
+                        aterm_log::info!(
+                            "Commons: System State's Local Network step handed over the local \
+                             network (revision {revision})"
+                        );
+                        return Some(super::STEP_ASKED);
+                    }
+                    lan_first_use::asked().then_some(super::USE_ASKED)
                 },
                 look: move || {
                     look(
@@ -180,12 +334,18 @@ mod macos {
                         here.get_or_init(super::here).as_deref(),
                         host,
                     )
+                    .bounded(lan_first_use::waits_for_step)
                 },
                 has_lan,
             },
             move |why| {
                 if let Some(why) = why {
                     opened(why);
+                }
+                // Asked by itself past the wait, as a use through the door asks: the window's
+                // other uses follow its answer.
+                if why == Some(super::STEP_WAITED_OUT) {
+                    lan_first_use::note_asked();
                 }
                 keep.as_ref().is_none_or(|keep| keep())
             },
@@ -207,8 +367,10 @@ mod macos {
 
     /// What each look of the gate reads ([`wired`]).
     pub(super) struct Reads<H, L, N> {
-        /// Whether System State's Local Network step handed the runtime the LAN: its trigger asked
-        /// macOS, and the step holds the dialog slot for its own hold.
+        /// Why the runtime may follow a question already put to this process, if it may: System
+        /// State's Local Network step handed it the LAN (its trigger asked macOS, and the step
+        /// holds the dialog slot for its own hold), or another first LAN use asked through the
+        /// door ([`lan_first_use::asked`]), which holds the slot for the question.
         pub(super) handed: H,
         /// aterm's records, Commons' own and this process, read at most every [`LOOK_AGAIN`]
         /// while the gate holds.
@@ -226,15 +388,15 @@ mod macos {
     /// take the slot again (the gate's went with no use made) reads the look again first and waits
     /// for System State's step where the look now waits for it ([`super::Look::waits_for_step`])
     /// and the step has not handed the LAN over, since the gate's decision may be stale (it opened
-    /// on a network the step could not name, and the Mac moved to one it can). A use that reached
-    /// the LAN starts the question's hold from it ([`FirstUse::made`]) and runs `keep` with why
-    /// the gate opened, the first time; one that reached none lets the slot go
+    /// while a switch kept the step from running, and the person turned it back on). A use that
+    /// reached the LAN starts the question's hold from it ([`FirstUse::made`]) and runs `keep`
+    /// with why the gate opened, the first time; one that reached none lets the slot go
     /// ([`FirstUse::missed`]).
     pub(super) fn wired<G: Send + 'static>(
         first: Arc<FirstUse<G>>,
         slot: impl Fn() -> Option<G> + Send + Sync + 'static,
         reads: Reads<
-            impl Fn() -> Option<()> + Send + 'static,
+            impl Fn() -> Option<&'static str> + Send + 'static,
             impl FnMut() -> super::Look + Send + 'static,
             impl Fn() -> bool + Send + 'static,
         >,
@@ -256,9 +418,9 @@ mod macos {
         let mut last: Option<(Instant, LanTurn)> = None;
         LanGate::asking(move || {
             let handed_now = (handed.lock().unwrap_or_else(PoisonError::into_inner))();
-            let turn = if handed_now.is_some() {
+            let turn = if let Some(why) = handed_now {
                 super::hold((), turning.hold, turning.lived_through());
-                LanTurn::Open("System State's Local Network step asked macOS")
+                LanTurn::Open(why)
             } else {
                 let now = Instant::now();
                 match last {
@@ -296,36 +458,37 @@ mod macos {
     }
 
     /// What the gate of the Commons runtime of `config` in `host` reads at one look, `record`
-    /// being Commons' own directory and `here` this Mac and app ([`super::here`]).
+    /// being Commons' own directory and `here` this Mac and app ([`super::here`]), before the wait
+    /// for System State's step is bounded ([`super::Look::bounded`]).
     fn look(config: &Path, record: &Path, here: Option<&str>, host: Host) -> super::Look {
+        let (first, used_before) = super::records_for(
+            host,
+            aterm_cli::macos_doctor::local_network_first_use(aterm_gui::local_network_step_off()),
+            aterm_db::network_state::lan_used(config),
+            here.is_some_and(|here| super::used_here(record, here)),
+        );
         super::Look {
-            first: aterm_cli::macos_doctor::local_network_first_use(
-                aterm_gui::local_network_step_off(),
-            ),
+            first,
             asked_here: here.is_some_and(|here| super::asked_here(record, here)),
-            used_before: super::used_before(config, record, here),
+            used_before,
             no_window: host.no_window(
                 !matches!(host, Host::Window { .. }) && aterm_machines::console::remote_here(),
             ),
+            waited_out: false,
         }
     }
 
-    /// Install, for this window's process, the reader of whether System State's Local Network
-    /// step is still to come ([`lan_first_use::install_step_to_come`]): a look of a window's
-    /// Commons gate for `config` that would wait for the step ([`super::Look::waits_for_step`]).
-    /// Its other LAN uses wait on that through [`lan_first_use::may_use`].
-    pub(super) fn install_step_to_come(config: PathBuf) {
+    /// Install, for this process, the reader of whether System State's Local Network step is
+    /// still to come ([`lan_first_use::install_step_to_come`]): a look of `host`'s Commons gate
+    /// for `config` that would wait for the step ([`super::Look::step_to_come`]). Its other LAN
+    /// uses wait on that through [`lan_first_use::may_use`], which bounds the wait as the gate's
+    /// own look does ([`lan_first_use::STEP_WAIT`]).
+    pub(super) fn install_step_to_come(config: PathBuf, host: Host) {
         let record = aterm_db::network_state::directory(&config);
         let here = OnceLock::new();
         lan_first_use::install_step_to_come(move || {
             let here = here.get_or_init(super::here);
-            look(
-                &config,
-                &record,
-                here.as_deref(),
-                Host::Window { runs_setup: true },
-            )
-            .waits_for_step()
+            look(&config, &record, here.as_deref(), host).step_to_come()
         });
     }
 
@@ -365,21 +528,44 @@ struct Look {
     used_before: bool,
     /// Why no System State window can ask macOS for this process ([`Host::no_window`]).
     no_window: Option<&'static str>,
+    /// This process's uses waited [`aterm_types::macos_setup::lan_first_use::STEP_WAIT`] for
+    /// System State's step still to come ([`Look::bounded`]): the step asks only while System
+    /// State is in front, so past that the runtime asks by itself.
+    waited_out: bool,
 }
 
 #[cfg(target_os = "macos")]
 impl Look {
-    /// Whether this look waits for System State's Local Network step to ask macOS first (pure):
-    /// the step is still to come for this process (a window here runs it), on a Mac where no
-    /// earlier aterm used the LAN ([`used_before`]) and no window of this app lived through the
-    /// question ([`asked_here`]). [`turn`] holds for the step exactly there.
-    const fn waits_for_step(self) -> bool {
+    /// Whether System State's Local Network step is still to come for this look and is meant to
+    /// ask macOS first (pure): the step is still to come for this process (a window here runs
+    /// it), on a Mac where no earlier aterm used the LAN ([`used_before`]) and no window of this
+    /// app lived through the question ([`asked_here`]).
+    const fn step_to_come(self) -> bool {
         matches!(
             self.first,
             aterm_cli::macos_doctor::LocalNetworkFirstUse::StepToCome
         ) && !self.asked_here
             && self.no_window.is_none()
             && !self.used_before
+    }
+
+    /// Whether this look waits for System State's Local Network step to ask macOS first (pure):
+    /// the step is still to come ([`Self::step_to_come`]) and the wait for it has not run out
+    /// ([`Self::bounded`]). [`turn`] holds for the step exactly there.
+    const fn waits_for_step(self) -> bool {
+        self.step_to_come() && !self.waited_out
+    }
+
+    /// This look with the wait for System State's step bounded by `waits`
+    /// ([`aterm_types::macos_setup::lan_first_use::waits_for_step`], asked only where the step is
+    /// still to come): no use waits more than
+    /// [`aterm_types::macos_setup::lan_first_use::STEP_WAIT`] past the first wait, whatever window
+    /// is in front.
+    fn bounded(self, waits: impl FnOnce(bool) -> bool) -> Self {
+        Self {
+            waited_out: self.step_to_come() && !waits(true),
+            ..self
+        }
     }
 }
 
@@ -415,6 +601,7 @@ fn turn<G>(
         LocalNetworkFirstUse::Asked => {
             "macOS asked aterm about Local Network before, with no answer heard here since"
         }
+        LocalNetworkFirstUse::StepToCome if look.waited_out => STEP_WAITED_OUT,
         LocalNetworkFirstUse::StepToCome => look
             .no_window
             .unwrap_or("an earlier aterm used the local network on this Mac"),
@@ -442,6 +629,24 @@ const QUESTION_UP: &str = "Waits for another macOS question of aterm's to end";
 /// ([`Look::waits_for_step`]).
 #[cfg(target_os = "macos")]
 const STEP_FIRST: &str = "Waits for System State to ask macOS for Local Network access";
+
+/// Why the gate opens once System State's Local Network step handed the LAN over.
+#[cfg(target_os = "macos")]
+const STEP_ASKED: &str = "System State's Local Network step asked macOS";
+
+/// Why the gate opens once another first LAN use of this process asked macOS through the door
+/// past the wait for the step ([`aterm_types::macos_setup::lan_first_use::asked`]): macOS asks
+/// each app once, so Commons follows that answer.
+#[cfg(target_os = "macos")]
+const USE_ASKED: &str = "another local network use of this window asked macOS, under its \
+    dialog slot, once System State's Local Network step had not asked in a minute";
+
+/// Why the gate asks by itself once this process's uses waited
+/// [`aterm_types::macos_setup::lan_first_use::STEP_WAIT`] for System State's step still to come
+/// ([`Look::bounded`]).
+#[cfg(target_os = "macos")]
+const STEP_WAITED_OUT: &str = "System State's Local Network step has not asked macOS in a \
+    minute (it asks only while System State is in front), so aterm asks by itself";
 
 /// Hold this process's dialog `slot` for `bound` from a thread of its own, so the owner goes on:
 /// macOS says neither when the Local Network alert closes nor how it was answered, so the next
@@ -754,14 +959,37 @@ fn used_here(record: &Path, here: &str) -> bool {
         .any(|line| line == here)
 }
 
-/// Whether an earlier aterm used the LAN here, as a look reads it: an aterm with no gate (0.145.0)
-/// left its observation history with `config`'s home ([`aterm_db::network_state::lan_used`]), or
-/// a window of the app `here` names, on its Mac, used it ([`USED_HERE`] in `record`). Another
-/// host's use counts for nothing: a terminal session lane's or `aterm node serve`'s keeps no line
-/// ([`use_keeper`]), and another Mac's or another app's line is not this one's.
+/// What `host`'s look reads of aterm's records (pure): `first`, what they say of macOS's Local
+/// Network question ([`aterm_cli::macos_doctor::local_network_first_use`]), and whether an earlier
+/// aterm used the LAN here, by `lan_used` (an aterm with no gate, 0.145.0, left its observation
+/// history with the home, [`aterm_db::network_state::lan_used`]) or `used_here` (a window of this
+/// app on this Mac used it, [`USED_HERE`]). Another host's use counts for nothing: a terminal
+/// session lane's or `aterm node serve`'s keeps no line ([`use_keeper`]), and another Mac's or
+/// another app's line is not this one's. The node job reads only what is keyed to this Mac and
+/// app: a home restored or synced from another Mac carries that Mac's answer, question and LAN
+/// history, which say nothing of what macOS asked aterm here, so for the node job they leave a
+/// window's step to come, and its wait for it (bounded,
+/// [`aterm_types::macos_setup::lan_first_use::STEP_WAIT`]) runs.
 #[cfg(target_os = "macos")]
-fn used_before(config: &Path, record: &Path, here: Option<&str>) -> bool {
-    aterm_db::network_state::lan_used(config) || here.is_some_and(|here| used_here(record, here))
+fn records_for(
+    host: Host,
+    first: aterm_cli::macos_doctor::LocalNetworkFirstUse,
+    lan_used: bool,
+    used_here: bool,
+) -> (aterm_cli::macos_doctor::LocalNetworkFirstUse, bool) {
+    use aterm_cli::macos_doctor::LocalNetworkFirstUse;
+    match host {
+        Host::NodeServe => (
+            match first {
+                LocalNetworkFirstUse::Answered | LocalNetworkFirstUse::Asked => {
+                    LocalNetworkFirstUse::StepToCome
+                }
+                kept => kept,
+            },
+            used_here,
+        ),
+        Host::Window { .. } | Host::SessionLane => (first, lan_used || used_here),
+    }
 }
 
 /// Keep, in [`ASKED_HERE`] in `record`, that a window of the app `here` names lived through
@@ -825,6 +1053,38 @@ mod tests {
     use std::cell::Cell;
     use std::time::Duration;
 
+    /// `[swarm] enabled = false` starts no Commons runtime, and a person turning it on starts
+    /// one; with the switch on, it starts at once.
+    #[test]
+    fn swarm_off_starts_no_commons_runtime_until_it_is_on() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let home = scratch.path();
+        let config =
+            aterm_types::dirs::resolve_aterm_config_path(None, None, Some(home.as_os_str()))
+                .unwrap();
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(&config, "[swarm]\nenabled = false\n").unwrap();
+        let (started, heard) = std::sync::mpsc::channel();
+        let at_once = super::when_sharing_on(home, Duration::from_millis(10), move || {
+            let _ = started.send(());
+        });
+        assert!(!at_once, "swarm off: no Commons runtime now");
+        assert!(heard.try_recv().is_err(), "nor started by the wait");
+        std::fs::write(&config, "[swarm]\nenabled = true\n").unwrap();
+        heard
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("turned on: the runtime starts");
+        let (started, heard) = std::sync::mpsc::channel();
+        assert!(super::when_sharing_on(
+            home,
+            Duration::from_millis(10),
+            move || {
+                let _ = started.send(());
+            }
+        ));
+        assert!(heard.try_recv().is_ok(), "swarm on: at once");
+    }
+
     /// The dialog slot a look may take, as a token the test counts.
     struct Slot;
 
@@ -850,6 +1110,7 @@ mod tests {
             asked_here: false,
             used_before,
             no_window: None,
+            waited_out: false,
         }
     }
 
@@ -953,12 +1214,43 @@ mod tests {
         assert_eq!(look(legacy, false, true), (NO_LAN, 0, 0));
     }
 
+    /// A window's System State left behind a terminal tab never asks, so the gate holds for its
+    /// step only until this process's uses waited
+    /// [`aterm_types::macos_setup::lan_first_use::STEP_WAIT`] for it: past that it asks by itself,
+    /// under the slot and only with a LAN to ask about, as where no step runs. A look with no step
+    /// to come reads no wait.
+    #[test]
+    fn a_gate_that_waited_out_the_step_asks_by_itself_under_its_slot() {
+        let fresh = looking(LocalNetworkFirstUse::StepToCome, false);
+        assert_eq!(
+            look(fresh.bounded(|to_come| to_come), true, true),
+            (STEP, 0, 0),
+            "inside the wait, the step asks first"
+        );
+        let waited = fresh.bounded(|_| false);
+        assert!(!waited.waits_for_step(), "the wait ran out");
+        assert_eq!(
+            look(waited, true, true),
+            (LanTurn::Open(super::STEP_WAITED_OUT), 1, 1),
+            "it asks by itself under the slot"
+        );
+        assert_eq!(look(waited, true, false), (BUSY, 1, 0));
+        assert_eq!(look(waited, false, true), (NO_LAN, 0, 0));
+        let read = Cell::new(false);
+        let answered = looking(LocalNetworkFirstUse::Answered, false).bounded(|_| {
+            read.set(true);
+            false
+        });
+        assert!(!read.get(), "no step to come: no wait read");
+        assert!(!answered.waited_out);
+    }
+
     /// A window's other first LAN uses (the Secrets stage's vault probe and join, Tab Control's
     /// sweep) wait for System State's Local Network step exactly where the window's Commons gate
     /// holds for it: the step still to come, on a Mac where no earlier aterm used the LAN, with no
     /// window here that lived through the question and a window to run the step. A recorded
-    /// answer or ask, a `[privacy]` or `[swarm]` switch off, Permissions out or a network the step
-    /// cannot name, an earlier use here and a process no window serves each let them go.
+    /// answer or ask, a `[privacy]` or `[swarm]` switch off, Permissions out, an earlier use here
+    /// and a process no window serves each let them go.
     #[test]
     fn a_windows_other_lan_uses_wait_where_its_gate_holds_for_the_step() {
         const AWAY: &str = "this terminal session runs away from this Mac's console";
@@ -1401,7 +1693,7 @@ mod tests {
                         }
                     },
                     super::macos::Reads {
-                        handed: move || handed.then_some(()),
+                        handed: move || handed.then_some(super::STEP_ASKED),
                         look: || looking(LocalNetworkFirstUse::Answered, false),
                         has_lan: || true,
                     },
@@ -1538,11 +1830,11 @@ mod tests {
 
     /// A first LAN use that must take the dialog slot again (the gate's went with no use made)
     /// reads the look again first: where System State's Local Network step has come to be due
-    /// since the gate opened (it opened on a network the step could not name, the try reached no
-    /// LAN socket, and the Mac moved to one the step can name), the use waits for the step and
-    /// takes no slot; once the step handed the LAN over, or the look waits for nothing, it takes
-    /// the slot as before. A slot the gate still holds for the use goes with no such read, so a
-    /// use the gate holds a slot for is never deferred.
+    /// since the gate opened (it opened while a `[privacy]` switch kept the step from running,
+    /// the try reached no LAN socket, and the person turned the switch back on), the use waits
+    /// for the step and takes no slot; once the step handed the LAN over, or the look waits for
+    /// nothing, it takes the slot as before. A slot the gate still holds for the use goes with no
+    /// such read, so a use the gate holds a slot for is never deferred.
     #[test]
     fn a_use_that_takes_the_slot_again_waits_for_a_step_now_due() {
         use super::FirstUse;
@@ -1550,7 +1842,7 @@ mod tests {
         use std::sync::{Arc, Mutex};
         const HANG: Duration = Duration::from_secs(60);
         const STEP_WHY: &str = "Waits for System State to ask macOS for Local Network access";
-        const NO_LAN_WHY: &str = "this Mac's network has no private or link-local IPv4 subnet";
+        const STEP_OFF_WHY: &str = "a [privacy] switch is off";
 
         let held = Arc::new(FirstUse::new(HANG, Duration::ZERO, None));
         let (slot, _gone) = token();
@@ -1575,7 +1867,7 @@ mod tests {
 
         let first = super::macos::first_use::<Token>(None);
         let reads = Arc::new(Mutex::new(looking(
-            LocalNetworkFirstUse::NoStep(NO_LAN_WHY),
+            LocalNetworkFirstUse::NoStep(STEP_OFF_WHY),
             false,
         )));
         let handed = Arc::new(AtomicBool::new(false));
@@ -1592,7 +1884,7 @@ mod tests {
             super::macos::Reads {
                 handed: {
                     let handed = handed.clone();
-                    move || handed.load(Ordering::SeqCst).then_some(())
+                    move || handed.load(Ordering::SeqCst).then_some(super::STEP_ASKED)
                 },
                 look: {
                     let reads = reads.clone();
@@ -1604,8 +1896,8 @@ mod tests {
         );
         assert_eq!(
             gate.look_now(),
-            Some(LanTurn::Open(NO_LAN_WHY)),
-            "a network the step cannot name: the gate asks by itself"
+            Some(LanTurn::Open(STEP_OFF_WHY)),
+            "no step to run: the gate asks by itself"
         );
         assert_eq!(taken.load(Ordering::SeqCst), 1);
         assert_eq!(
@@ -1617,7 +1909,7 @@ mod tests {
         assert_eq!(
             gate.use_now(true),
             Err(STEP_WHY),
-            "on a network the step can name, the use waits for it"
+            "with the step due again, the use waits for it"
         );
         assert_eq!(taken.load(Ordering::SeqCst), 1, "no slot taken");
         handed.store(true, Ordering::SeqCst);
@@ -1684,7 +1976,13 @@ mod tests {
                 assert!(keep(), "{host:?}: kept");
             }
             let window = Look {
-                used_before: super::used_before(&config, &record, Some(HERE)),
+                used_before: super::records_for(
+                    WINDOW,
+                    LocalNetworkFirstUse::StepToCome,
+                    aterm_db::network_state::lan_used(&config),
+                    super::used_here(&record, HERE),
+                )
+                .1,
                 ..looking(LocalNetworkFirstUse::StepToCome, false)
             };
             if host == WINDOW {
@@ -1715,7 +2013,7 @@ mod tests {
         ] {
             super::keep_here(&record, super::USED_HERE, other).unwrap();
             assert!(
-                !super::used_before(&config, &record, Some(HERE)),
+                !super::used_here(&record, HERE),
                 "{other}: not this Mac's app"
             );
         }
@@ -1726,5 +2024,75 @@ mod tests {
             "no name for here: nothing to keep"
         );
         assert!(!record.exists());
+    }
+
+    /// On a Mac restored or synced from another, aterm's per-home records carry that Mac's
+    /// answer to macOS's Local Network question, its ask and its LAN history. The node job reads
+    /// only what is keyed to this Mac and app, so those leave a window's step to come for it and
+    /// its wait (bounded) runs before it asks by itself; a use a window of this app made here
+    /// still counts. A window and a session lane read the records as before. NEGATIVE CONTROL:
+    /// the window, whose own step reads the same records.
+    #[test]
+    fn the_node_job_reads_only_records_keyed_to_this_mac() {
+        for first in [LocalNetworkFirstUse::Answered, LocalNetworkFirstUse::Asked] {
+            assert_eq!(
+                super::records_for(Host::NodeServe, first, true, false),
+                (LocalNetworkFirstUse::StepToCome, false),
+                "{first:?} and a LAN history copied from another Mac"
+            );
+            assert_eq!(
+                super::records_for(Host::NodeServe, first, true, true),
+                (LocalNetworkFirstUse::StepToCome, true),
+                "a window of this app used the LAN here"
+            );
+            for host in [WINDOW, Host::SessionLane] {
+                assert_eq!(
+                    super::records_for(host, first, true, false),
+                    (first, true),
+                    "{host:?}"
+                );
+            }
+        }
+        let off = LocalNetworkFirstUse::NoStep("sharing is off");
+        assert_eq!(
+            super::records_for(Host::NodeServe, off, false, false),
+            (off, false),
+            "no step will run: the node job does not wait for one"
+        );
+    }
+
+    /// A terminal session lane's Commons gate asks macOS past its wait for a window's step only
+    /// through a door, as a window's first LAN uses do: a person at this Mac with their hands at
+    /// rest, so the question never comes up under their typing. The node job has none.
+    #[test]
+    fn a_session_lane_asks_through_a_door_and_the_node_job_through_none() {
+        assert!(super::door_for(WINDOW).is_some());
+        assert!(super::door_for(Host::SessionLane).is_some());
+        assert!(super::door_for(Host::NodeServe).is_none());
+    }
+
+    /// The vault subscriber (a background job with no window) used the local network on this
+    /// Mac: the line it keeps is this Mac's and app's, which a window reads as macOS's question
+    /// already put to aterm. Another Mac's or another app's line, on a home restored or synced
+    /// from it, is not this one's.
+    #[test]
+    fn a_subscribers_lan_use_is_kept_for_this_mac_and_app_alone() {
+        const HERE: &str = "C3396674-FCD3-52E5-A1C1-BD5B9E8F5C43 /Applications/aterm.app";
+        let root = aterm_tempfile::tempdir().unwrap();
+        let record = root.path().join("network-state");
+        assert!(!super::subscriber_asked_in(&record, HERE), "nothing kept");
+        for other in [
+            "0E2C5A41-8D7B-4F0E-9A63-2B5D7C1E4F90 /Applications/aterm.app",
+            "C3396674-FCD3-52E5-A1C1-BD5B9E8F5C43 /Applications/aterm (dev).app",
+        ] {
+            super::keep_here(&record, super::SUBSCRIBER_ASKED_HERE, other).unwrap();
+            assert!(!super::subscriber_asked_in(&record, HERE), "{other}");
+        }
+        super::keep_here(&record, super::SUBSCRIBER_ASKED_HERE, HERE).unwrap();
+        assert!(super::subscriber_asked_in(&record, HERE));
+        assert!(
+            !super::asked_here(&record, HERE),
+            "the subscriber's use is no window's life through the question"
+        );
     }
 }

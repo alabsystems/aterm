@@ -703,6 +703,7 @@ impl Grid {
         let mut remaining = ascii;
         let scan_stale = !self.storage.extras.is_empty();
 
+        let mut wrapped_without_write = false;
         while !remaining.is_empty() {
             self.resolve_pending_wrap();
 
@@ -744,9 +745,12 @@ impl Grid {
             let to_write = remaining.len().min(available);
 
             if to_write == 0 {
-                self.advance_autowrap_line();
+                if !self.wrap_for_room(&mut wrapped_without_write) {
+                    break;
+                }
                 continue;
             }
+            wrapped_without_write = false;
 
             let to_write_u16 = u16::try_from(to_write).unwrap_or(u16::MAX);
 

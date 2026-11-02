@@ -40,7 +40,10 @@ pub(crate) fn decompose(scroll_px: i64, cell_h: i64) -> (i64, i64) {
 #[must_use]
 pub(crate) fn nearest_row_px(scroll_px: i64, cell_h: i64) -> i64 {
     debug_assert!(cell_h >= 1, "cell height must be positive");
-    (scroll_px + cell_h / 2).div_euclid(cell_h) * cell_h
+    scroll_px
+        .saturating_add(cell_h / 2)
+        .div_euclid(cell_h)
+        .saturating_mul(cell_h)
 }
 
 /// The eased glide position at `elapsed_ms` of a `dur_ms` ease-out-cubic from `start_px` to `target_px`.
@@ -117,7 +120,7 @@ impl Glide {
             0.0
         };
         self.park(clamped, cell_h, now);
-        want_px - clamped
+        want_px.saturating_sub(clamped)
     }
 
     /// Gesture end: start the rest-settle now.
@@ -146,8 +149,8 @@ impl Glide {
 
     /// Shift start and target by `delta_px` without touching the clock.
     pub(crate) const fn shift(&mut self, delta_px: i64) {
-        self.start_px += delta_px;
-        self.target_px += delta_px;
+        self.start_px = self.start_px.saturating_add(delta_px);
+        self.target_px = self.target_px.saturating_add(delta_px);
     }
 
     /// The eased position at `now`, and whether the glide is done.
@@ -396,6 +399,8 @@ mod tests {
         }
         assert_eq!(decompose(17, 8), (2, 1));
         assert_eq!(decompose(-1, 8), (-1, 7), "negative px borrows a full row");
+        assert!(nearest_row_px(i64::MAX, 34) > 0);
+        assert!(nearest_row_px(i64::MIN, 34) < 0);
     }
 
     /// (2) Position law: exact start and target, monotone, no overstep, over start/target

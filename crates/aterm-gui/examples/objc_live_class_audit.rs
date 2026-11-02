@@ -222,17 +222,31 @@ mod macos {
               26,318 classes loaded with AppKit)",
     }];
 
-    const VIEW_UNCHECKED: &[Unchecked] = &[Unchecked {
-        sel: "frameDidChange:",
-        why: "not an AppKit method at all — it is this fork's own \
-              NSNotificationCenter selector, registered by `WinitView::new` \
-              with -addObserver:selector:name:object: and named by nothing in \
-              the runtime. A notification callback's shape is a convention \
-              (void return, one NSNotification argument) that no header states \
-              in a form the runtime can be asked for",
-        rust: "fn frame_did_change(&self, _note: Id)",
-        expected: || aterm_objc::method_encoding!(() ; Id),
-    }];
+    const VIEW_UNCHECKED: &[Unchecked] = &[
+        Unchecked {
+            sel: "frameDidChange:",
+            why: "not an AppKit method at all — it is this fork's own \
+                  NSNotificationCenter selector, registered by `WinitView::new` \
+                  with -addObserver:selector:name:object: and named by nothing in \
+                  the runtime. A notification callback's shape is a convention \
+                  (void return, one NSNotification argument) that no header states \
+                  in a form the runtime can be asked for",
+            rust: "fn frame_did_change(&self, _note: Id)",
+            expected: || aterm_objc::method_encoding!(() ; Id),
+        },
+        Unchecked {
+            sel: "atermFrameTick:",
+            why: "not an AppKit method at all — it is this fork's own display \
+                  link action (`frame_clock.rs`), the selector `make_link` hands \
+                  -[NSView displayLinkWithTarget:selector:], which the link sends \
+                  each vsync with itself as the argument. An action's shape (void \
+                  return, the CADisplayLink as one object argument) is a convention \
+                  the CADisplayLink documentation states, and no protocol declares \
+                  it in a form the runtime can be asked for",
+            rust: "fn aterm_frame_tick(&self, link: Id)",
+            expected: || aterm_objc::method_encoding!(() ; Id),
+        },
+    ];
 
     const NS_NOT_FOUND: usize = isize::MAX as usize;
 

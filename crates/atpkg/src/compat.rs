@@ -271,15 +271,11 @@ pub fn needs_root(build_dir: &Path) -> io::Result<Option<u64>> {
 #[cfg(unix)]
 fn differing_bytes(a: &Path, a_len: u64, b: &Path, b_len: u64) -> io::Result<u64> {
     use std::io::Read as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
     const CHUNK: usize = 64 * 1024;
-    let open = |p: &Path| {
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(p)
-    };
-    let (mut fa, mut fb) = (open(a)?, open(b)?);
+    let (mut fa, mut fb) = (
+        crate::metadata_io::open_regular(a)?,
+        crate::metadata_io::open_regular(b)?,
+    );
     let common = a_len.min(b_len);
     let mut differing = a_len.max(b_len) - common;
     let (mut ba, mut bb) = (vec![0u8; CHUNK], vec![0u8; CHUNK]);

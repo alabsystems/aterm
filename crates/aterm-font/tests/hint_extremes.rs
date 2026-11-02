@@ -272,3 +272,26 @@ fn outlines_at_the_edge_of_the_range_fit_up_to_the_bound() {
     assert!(fitted > tried / 2, "{fitted} of {tried} fitted");
     assert!(drawn > u64::from(fitted), "{drawn} path elements");
 }
+
+#[test]
+fn cjk_subpixel_zero_scale_with_negative_blue_zones_never_overflows() {
+    for bottom_y in [-120, -1, -32740] {
+        let rect = vec![vec![
+            (0, bottom_y),
+            (600, bottom_y),
+            (600, 0),
+            (600, 800),
+            (0, 800),
+        ]];
+        let bytes = face(1000, &rect, Some('\u{4E00}'));
+        for px in [0.001f32, 0.01, f32::MIN_POSITIVE] {
+            for target in TARGETS {
+                let drawn = fit(&bytes, px, target);
+                assert!(
+                    drawn.is_some_and(|n| n > 0),
+                    "bottom_y={bottom_y} px={px} {target:?} must fit without overflow"
+                );
+            }
+        }
+    }
+}

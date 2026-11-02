@@ -37,7 +37,7 @@ use crate::{Error, Result};
 use aterm_digest::Sha256;
 use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 pub mod admission;
 pub mod entries;
@@ -176,7 +176,10 @@ impl Kind {
 pub enum Evidence {
     /// A person pressed Allow and typed the phrase the member showed (§3.3.4).
     Phrase,
-    /// A person ran `aterm secrets approve <code>` on the member.
+    /// No phrase: the admitting member decided by itself. A person's `aterm secrets approve
+    /// <code>` on the member, or (since 0.148) the Mac proved to the member, on a fresh
+    /// challenge, the fleet node key the log binds to its seat or the fleet's current key
+    /// (`client::readmit`). 0.147 readers know this code, so no new evidence was needed.
     Manual,
     /// No person: the genesis lists the Mac's recipient with no binding, under the label the
     /// `Admit` carries, and the Mac proved its device key to the member by the possession
@@ -1239,6 +1242,10 @@ pub struct Log {
     held: BTreeMap<RecordId, usize>,
     waiting: BTreeMap<RecordId, Record>,
     enforce_seats: bool,
+    // Clones hold the same immutable prefix until `hold` extends one of them.
+    // Its pure evaluation is shared too; no disk observation or grant is cached.
+    membership: Arc<OnceLock<Membership>>,
+    effective: Arc<OnceLock<eval::Effective>>,
 }
 
 impl Log {
@@ -1256,6 +1263,8 @@ impl Log {
             held,
             waiting: BTreeMap::new(),
             enforce_seats: false,
+            membership: Arc::default(),
+            effective: Arc::default(),
         })
     }
 
@@ -1536,7 +1545,14 @@ impl Log {
         )
     )]
     pub fn membership(&self) -> Membership {
-        eval::evaluate(&self.order)
+        self.membership
+            .get_or_init(|| eval::evaluate(&self.order))
+            .clone()
+    }
+
+    fn effective(&self) -> &eval::Effective {
+        self.effective
+            .get_or_init(|| eval::effective_records(&self.order))
     }
 
     /// The cutoff of the quorum `Remove` of `actor` that F16's "Undo <actor>'s removals" row
@@ -1613,6 +1629,13 @@ impl Log {
     #[must_use]
     pub fn has_historical_seat(&self, binding: &Binding) -> bool {
         eval::has_historical_seat(&self.order, binding)
+    }
+
+    /// Whether `actor` holds a founding or non-void, authorized, non-cut-off admitted seat in
+    /// this log (including actors later retired by an ordinary or quorum `Remove`).
+    #[must_use]
+    pub fn has_known_actor(&self, actor: &MemberId) -> bool {
+        eval::has_known_actor(&self.order, actor)
     }
 
     /// Historical Commons writer bindings eligible to authenticate table records sealed under
@@ -1807,6 +1830,8 @@ impl Log {
     fn hold(&mut self, record: Record) {
         self.held.insert(record.id, self.order.len());
         self.order.push(record);
+        self.membership = Arc::default();
+        self.effective = Arc::default();
     }
 
     /// Hold every waiting record whose parents have all arrived, until none is left to land.

@@ -246,7 +246,9 @@ const BIDI_ALIASES: &[&str] = &["on", "off"];
 const AMBIGUOUS_WIDTH_ALIASES: &[&str] = &["single", "double"];
 const PREDICTIVE_ECHO_ALIASES: &[&str] = &["auto", "on", "true", "force"];
 const TEXT_BLENDING_ALIASES: &[&str] = &["linear_corrected"];
-const MOTION_ALIASES: &[&str] = &["reduce"];
+/// The spellings `MotionMode::parse` reads as Reduced besides `reduced` itself (`none` and
+/// `off` ask for no motion), so a config that writes one is no error.
+const MOTION_ALIASES: &[&str] = &["reduce", "none", "off"];
 const WINDOW_COLORSPACE_ALIASES: &[&str] = &["displayp3", "p3"];
 const BACKGROUND_MATERIAL_ALIASES: &[&str] = &["underwindow", "under_window", ""];
 const CUSTOM_INK_COLORWAYS: &[&str] = &["rainbow", "twotone:#RRGGBB,#RRGGBB"];
@@ -595,7 +597,9 @@ fn parse_config_completion_action(action: &str) -> Option<ParsedCompletionAction
     let mut parts = action
         .strip_prefix(CONFIG_COMPLETION_ACTION_PREFIX)?
         .split('/');
-    let index = parts.next()?.parse::<usize>().ok()?;
+    let index_str = parts.next()?;
+    (!index_str.is_empty() && index_str.bytes().all(|b| b.is_ascii_digit())).then_some(())?;
+    let index = index_str.parse::<usize>().ok()?;
     let identity_hex = parts.next()?;
     if parts.next().is_some()
         || index >= MAX_COMPLETIONS
@@ -1510,7 +1514,7 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
     ),
     manual(
         "harness.facts",
-        "Tell the agent of its hung background calls",
+        "Tell the agent of its hung or held background calls",
         ConfigSchemaKind::Scalar(EditKind::Bool),
         &[
             "supervisor",
@@ -1518,13 +1522,14 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
             "background",
             "stuck",
             "hung",
+            "held",
             "prompt",
         ],
         true,
     ),
     manual(
         "harness.stuck_break_note",
-        "Type a hung call's fact at a stuck break",
+        "Type a hung or held call's fact at a stuck break",
         ConfigSchemaKind::Scalar(EditKind::Bool),
         &[
             "supervisor",
@@ -1532,6 +1537,7 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
             "background",
             "stuck",
             "hung",
+            "held",
             "break",
         ],
         true,
@@ -1920,6 +1926,15 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         "Output streak idle drain",
         ConfigSchemaKind::Scalar(EditKind::Float),
         &["streak", "prism", "idle", "drain"],
+        true,
+    ),
+    manual(
+        "idle_rest_secs",
+        "Rest an idle window after (s; 0 never)",
+        ConfigSchemaKind::Scalar(EditKind::Float),
+        &[
+            "idle", "rest", "blink", "deck", "memory", "battery", "timeout", "cursor",
+        ],
         true,
     ),
     manual(
@@ -2348,6 +2363,10 @@ fn manual_default_shown(key: &str) -> Option<String> {
         "output_streak.tail" => config.output_streak_tail_or_default().to_string(),
         "output_streak.max_streaks" => config.output_streak_max_streaks_or_default().to_string(),
         "output_streak.idle_secs" => config.output_streak_idle_secs_or_default().to_string(),
+        "idle_rest_secs" => config
+            .idle_rest_or_default()
+            .map_or(0.0, |rest| rest.as_secs_f64())
+            .to_string(),
         "ai.review_count" => aterm_agent::ai::config::REVIEW_COUNT_DEFAULT.to_string(),
         "ai.review_timeout_s" => aterm_agent::ai::config::TIMEOUT_DEFAULT_S.to_string(),
         _ => return None,
@@ -3272,6 +3291,7 @@ fn reader_value_range(value: &aterm_toml::edit::Value, path: &str) -> Option<Ran
 
 fn reader_index(path: &str) -> Option<(usize, &str)> {
     let (index, rest) = path.strip_prefix('[')?.split_once(']')?;
+    (!index.is_empty() && index.bytes().all(|b| b.is_ascii_digit())).then_some(())?;
     Some((index.parse().ok()?, rest))
 }
 
@@ -3789,6 +3809,7 @@ fn semantic_numeric_bounds(key: &str) -> Option<(f64, f64)> {
         crate::prefs::EDIT_COLUMNS => Some((20.0, 500.0)),
         crate::prefs::EDIT_LINES => Some((5.0, 300.0)),
         "sparkle_words.custom.burst.chance" => Some((0.0, 100.0)),
+        "idle_rest_secs" => Some((2.0, 3600.0)),
         _ => crate::prefs::range_of(key).map(|range| (range.min, range.max)),
     }
 }
@@ -3800,6 +3821,8 @@ fn runtime_semantics_owns_numeric_clamp(
 ) -> bool {
     match key {
         crate::prefs::EDIT_FONT_PX => true,
+        // Zero or less, NaN and an infinity mean never: no clamp happens.
+        "idle_rest_secs" => !number.is_finite() || number <= 0.0,
         "sparkle_words.ink.sweep_ms" => {
             number < 600.0
                 && dotted_item(document, "sparkle_words.ink.loop")
@@ -4006,7 +4029,9 @@ fn dynamic_map_semantic_warning_range(
 fn indexed_warning_index(message: &str, key: &str) -> Option<usize> {
     let suffix = message.strip_prefix(key)?.strip_prefix('[')?;
     let end = suffix.find(']')?;
-    suffix[..end].parse().ok()
+    let index = &suffix[..end];
+    (!index.is_empty() && index.bytes().all(|b| b.is_ascii_digit())).then_some(())?;
+    index.parse().ok()
 }
 
 fn structured_warning_record(message: &str, record_path: &str) -> Option<usize> {
@@ -5600,9 +5625,6 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
         crate::prefs::EDIT_ALLOW_NOTIFICATIONS => {
             " · desktop delivery is implemented on macOS and Windows; parsed but inert on other platforms"
         }
-        crate::prefs::EDIT_DESKTOP_ALERTS => {
-            " · aterm's OWN alerts (the menu bar's escalations, macOS permissions, update health) as system notifications — macOS, run from the app, only as aterm itself: once macOS allows it (turning Notify Me on asks, as does the first notice while this is on), none until then or once it says no, none from one in your Desktop, Documents or Downloads folder (where aterm does not read its name) until it moves to Applications, and none from one started through a link to it (such as ~/.local/bin/aterm, where aterm does not read its identity either) until aterm.app itself is opened; not run from the app, through osascript (shown as Script Editor); Windows a notification-area balloon (not update health); none on other platforms · off keeps them in the message band, the menu bar and messages.log · program notifications (OSC 9/99/777) are allow_notifications'"
-        }
         crate::prefs::EDIT_ALLOW_OSC52_QUERY => {
             if cfg!(target_os = "linux") {
                 " · the OSC 52 clipboard query · an authorized query reads back only the clipboard selections aterm itself owns (a foreign app's X11 selection is not readable today); rate/budget gates still apply"
@@ -5694,10 +5716,10 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · auto, off or a number of GiB · the agent is restarted only when the Mac is short of memory and it holds the most"
         }
         "harness.facts" => {
-            " · once each time a call stops making progress, on a prompt aterm types anyway, only when it fits whole · off: none"
+            " · once each time a call stops making progress, and once while macOS's program check holds programs of its calls, on a prompt aterm types anyway, only when it fits whole · off: none"
         }
         "harness.stuck_break_note" => {
-            " · off by default · on: one line of aterm's own at a break of the agent's background work, once each time a call stops making progress"
+            " · off by default · on: one line of aterm's own at a break of the agent's background work, once each time a call stops making progress, and once while macOS's program check holds programs of its calls"
         }
         "harness.upgrade_ask" => {
             " · asks the agent to reach a stopping point and answer READY first · off: a session moves only when it is idle"
@@ -5739,7 +5761,7 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · host[:port] or [IPv6]:port, the port 7100 when none is written; listed and checked by `aterm fleet peers`"
         }
         "session_log.journal" => {
-            " · on (the default): a record of what each session did under the logs folder's `session-log/`: each command's program name (`detail=`: the wrapper's own name when the wrapper's flags are not known, and for a listed tool one known subcommand word; a secret typed at a prompt and run is kept as that name too) and the foreground program's name (`prog=`), outcomes and durations, agent turns and their tools' names, the session's folder (`cwd=`), its meta values (an attention text only as a fingerprint), mail's sender, recipient and offsets; never a command's other arguments, an OSC title, a mail's body or an agent's transcript text · files 0600 in a 0700 folder, the oldest deleted first to keep its own near 64 MiB and 2048 files (files a running instance still writes can hold it above that), so `aterm ctl @<sid> log` and `aterm ctl @<sid> brief` answer for a session from an earlier run or a crash · off: aterm keeps no journal, creates no file and deletes nothing · read at launch; follows restore_session; a window's only · macOS and Linux"
+            " · on (the default): a record of what each session did under the logs folder's `session-log/`: each command's program name (`detail=`: the wrapper's own name when the wrapper's flags are not known, and for a listed tool one known subcommand word; only a program that ran or a shell builtin is named, so a word that ran nothing, such as a secret typed at a prompt, is never kept) and the foreground program's name (`prog=`), outcomes and durations, agent turns and their tools' names, the session's folder (`cwd=`), its meta values (an attention text only as a fingerprint), mail's sender, recipient and offsets; never a command's other arguments, an OSC title, a mail's body or an agent's transcript text · files 0600 in a 0700 folder, the oldest deleted first to keep its own near 64 MiB and 2048 files (files a running instance still writes can hold it above that), so `aterm ctl @<sid> log` and `aterm ctl @<sid> brief` answer for a session from an earlier run or a crash · off: aterm keeps no journal, creates no file and deletes nothing · read at launch; follows restore_session; a window's only · macOS and Linux"
         }
         "sys.stats_bars" => {
             " · default deck: a table under the titlebar with one row per resource, CPU, GPU, memory, disk, network and processes, plus the cores: each row's multi-scale heat strip, the widest thing on the row (blocks of 1 s, 10 s, 1 min, 10 min and 1 h, up to 6 h where the strip has the room, 4 h, 6 min or 1 min on a narrower one, cold to hot, 0 to 100% of that resource's max, the live now cell at the left in the strip's own colours, older and wider cells to its right, hollow cells where nothing was read, plus gap and crash/sleep markers), its % now, a Global ⊇ aterm ⊇ Tab bar on its capacity keyed once over the bars, and at the bar's end, where it fits, this Mac's amount in the row's unit with the row's maximum, else the machine's maxima in the key (aterm's and the tab's amounts are in the close-up); Folded, or Full where `stats_deck_size` says so · sill: thin lanes in the window's bottom padding, which takes no terminal row (needs 8 pt of padding) · off: no bars, and the terminal gets the Deck's rows back · rest the pointer on a row, or press ⌘I, for the close-up · View ▸ Stats Bars picks one · read live"

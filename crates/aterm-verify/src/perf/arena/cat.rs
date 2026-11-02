@@ -227,7 +227,8 @@ pub(crate) fn parse_drain(report: &str) -> Result<f64, String> {
 }
 
 const DRAIN_CEILING: Duration = Duration::from_secs(450);
-const CORPUS_MB: u64 = 150;
+/// Each D1 corpus's size, MB: the `cat` lane's and the `vte-engine` lane's.
+pub(crate) const CORPUS_MB: u64 = 150;
 
 /// The `cat` lane.
 pub(crate) fn run(args: &Args) -> LaneRun {

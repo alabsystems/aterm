@@ -19,12 +19,18 @@ use super::fixture::{
     ran, scratch, toolchain as fixture_toolchain,
 };
 
+#[cfg(unix)]
+#[path = "build_local_harness.rs"]
+mod harness;
+
 const HOST: &str = "x86_64-unknown-linux-gnu";
 
 struct World {
     _tmp: aterm_tempfile::TempDir,
     root: PathBuf,
     ctx: Ctx,
+    #[cfg(unix)]
+    host: Arc<FakeHost>,
     checkout: PathBuf,
     bin: PathBuf,
 }
@@ -32,7 +38,8 @@ struct World {
 fn world(label: &str) -> World {
     let tmp = scratch(label);
     let root = std::fs::canonicalize(tmp.path()).expect("root");
-    let ctx = Keys::mint("m3", &[]).ctx(&root.join("home"), Arc::new(FakeHost::new()));
+    let host = Arc::new(FakeHost::new());
+    let ctx = Keys::mint("m3", &[]).ctx(&root.join("home"), host.clone());
     let bin = fixture_toolchain(&root.join("toolchains/trust-7d5533b2"));
     put_exe(&bin.join("cargo"), &elf(EM_X86_64, 2, 1));
     put_exe(&bin.join("trustdoc"), &elf(EM_X86_64, 2, 1));
@@ -42,6 +49,8 @@ fn world(label: &str) -> World {
         _tmp: tmp,
         root,
         ctx,
+        #[cfg(unix)]
+        host,
         checkout,
         bin,
     }
@@ -201,6 +210,22 @@ fn each_policy_plans_its_lane_with_the_seals_own_compiler() {
         plan.command.argv()[..5],
         ["--unverified", "build", "--locked", "--profile", "dev"]
     );
+}
+
+#[test]
+fn ordinary_local_builds_keep_their_existing_compiler_metadata_contract() {
+    let w = world("local-ordinary-compiler");
+    let t = tools(&w, metadata(&["trust-ir"], &[], false), vec![], &[]);
+    t.version(
+        &w.bin.join("trustc"),
+        &format!("binary: trustc\ncommit-hash: unknown\nhost: {HOST}\n"),
+    );
+    let req = w.request();
+    let plan = build_local::plan(&w.ctx, &req, &t).unwrap();
+    assert_eq!(plan.compiler, "unknown");
+    assert!(plan.harness.is_none());
+    assert!(t.runs_of("build").is_empty());
+    assert!(!req.out.unwrap().exists());
 }
 
 #[test]

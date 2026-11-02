@@ -663,13 +663,16 @@ fn a_lock_refused_for_another_reason_is_not_waited_on() {
         return;
     }
     let scratch = Scratch::new("denied");
-    let out = crate::spawnfd::command("/usr/bin/sandbox-exec")
-        .args(["-p", "(version 1)(allow default)(deny file-lock)"])
-        .arg(std::env::current_exe().expect("the test binary"))
-        .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
-        .env(STAGE_ENV, &scratch.0)
-        .output()
-        .expect("run this test binary under sandbox-exec");
+    // The hang detector is past the stage's own one-minute lock wait, a second minute covering
+    // its start and its end.
+    let out = crate::deadline::ends_within(
+        crate::spawnfd::command("/usr/bin/sandbox-exec")
+            .args(["-p", "(version 1)(allow default)(deny file-lock)"])
+            .arg(std::env::current_exe().expect("the test binary"))
+            .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+            .env(STAGE_ENV, &scratch.0),
+        2 * crate::deadline::ECHO_HANG,
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success() && stdout.contains("STAGED denied ok"),

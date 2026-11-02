@@ -1,0 +1,50 @@
+# grok 1.0.70 · MEASURED 2026-10-29, `aterm ctl text` of a private headless aterm (144x50, aterm 0.146.0) running the real Grok Build, launched by path in the lab's jail with a scratch `HOME` and `GROK_HOME`, the lab's `XAI_API_KEY` and `GROK_XAI_API_BASE_URL`/`GROK_CLI_CHAT_PROXY_BASE_URL=http://127.0.0.1:<port>/v1` (a local stub of xAI's API, crates/aterm-lab) · the queued continuation's own turn ended (the slow mode again): the first turn ended and the queued `and then the next step` ran at once, with no idle composer between them; the view scrolled so the newest prompt row sits under the header, the reply's 30 ticks wrapped, `Worked for 30s`, and the composer back with the side request's suggestion `❯ Lab stub session` and `Tab/→:accept suggestion` · cursor=45,6 (visible, blinking_block) · in this run the stub answered every side request, the prompt predictor's among them, `Lab stub session`, so that is the suggestion · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+  /p/t/at.lab0/proj                                                                                                   11K / 256K │ [Dashboard]
+
+
+     ❯ and then the next step                                                                                                        1:54 PM
+
+
+     tick 1 tick 2 tick 3 tick 4 tick 5 tick 6 tick 7 tick 8 tick 9 tick 10 tick 11 tick 12 tick 13 tick 14 tick 15 tick 16 tick     1:54 PM
+     17 tick 18 tick 19 tick 20 tick 21 tick 22 tick 23 tick 24 tick 25 tick 26 tick 27 tick 28 tick 29 tick 30
+
+     Worked for 30s
+
+
+
+
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ ❯ Lab stub session                                                                                                                       │
+  ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── lab-stub ─╯
+
+  Tab/→:accept suggestion  │  Shift+Tab:mode  │  Ctrl+x:shortcuts

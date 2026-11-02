@@ -204,10 +204,16 @@ impl QuadSink<'_> {
     /// point both backends then add.
     #[inline]
     fn chord(&mut self, x0: f32, x1: f32, y0: i32, y1: i32, color: u32, cov: f32) {
+        if y1 <= y0 || self.budget == 0 {
+            return;
+        }
         let xi0 = x0.floor() as i32;
         let xi1 = (x1.ceil() as i32).max(xi0 + 1);
         let frac = ((x1 - x0) / (xi1 - xi0) as f32).clamp(0.0, 1.0);
         let a = (255.0 * cov.clamp(0.0, 1.0) * frac).round() as u8;
+        if a == 0 {
+            return;
+        }
         self.push(xi0, y0, xi1 - xi0, y1 - y0, premul_rgb(color, a));
     }
 }
@@ -521,18 +527,21 @@ fn emit_rays(
 
 #[inline]
 fn emit_crown(sink: &mut QuadSink<'_>, env: &NovaEnv, t_ms: u64) {
+    if env.intensity <= 0.0 {
+        return;
+    }
     const INV_FLASH_SPAN_MS: f32 = 1.0 / (FLASH_END_MS - DIP_MS) as f32;
     const SEG_SPANS: [(f32, f32); 2] = [(0.0, 0.45), (0.45, 1.0)];
     let e = (t_ms.saturating_sub(DIP_MS)) as f32 * INV_FLASH_SPAN_MS;
     let envl = crate::supernova::sin_cos_f32(std::f32::consts::PI * e.clamp(0.0, 1.0)).0;
-    let ch = env.cell_h as f32;
-    let (cxf, cyf) = (env.cx as f32, env.cy as f32);
-    let r = 1.3 * ch;
-    let beam = 0.30 * ch;
     let env_int = envl * env.intensity;
     if env_int <= 0.0 {
         return;
     }
+    let ch = env.cell_h as f32;
+    let (cxf, cyf) = (env.cx as f32, env.cy as f32);
+    let r = 1.3 * ch;
+    let beam = 0.30 * ch;
     let r_minus_beam = r - beam;
     let mut si = 0;
     while si < SEG_SPANS.len() {

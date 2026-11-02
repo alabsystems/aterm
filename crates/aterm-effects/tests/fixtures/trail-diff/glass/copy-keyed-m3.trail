@@ -6,6 +6,7 @@
 # commit's trail-diff compares glass frames: a copy 3 rows above the typed line, not a move.
 
 foreach-scheme light {
+  scale 2
   grid 24 80
   style rainbow kitty
   hz 60

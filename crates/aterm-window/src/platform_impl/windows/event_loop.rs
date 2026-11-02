@@ -53,7 +53,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos,
     GetMenu, KillTimer, LoadCursorW, MsgWaitForMultipleObjectsEx, PeekMessageW, PostMessageW,
     RegisterClassExW, RegisterWindowMessageA, SetCursor, SetTimer, SetWindowPos, TranslateMessage,
-    CREATESTRUCTW, GWL_STYLE, GWL_USERDATA, HTCAPTION, HTCLIENT, MNC_CLOSE, MSG,
+    CREATESTRUCTW, GWL_STYLE, GWL_USERDATA, HTCAPTION, HTCLIENT, MINMAXINFO, MNC_CLOSE, MSG,
     MWMO_INPUTAVAILABLE, PM_REMOVE, PT_PEN, PT_TOUCH, QS_ALLINPUT, SC_MINIMIZE, SC_RESTORE,
     SIZE_MAXIMIZED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, USER_TIMER_MINIMUM,
     WHEEL_DELTA, WINDOWPOS, WMSZ_BOTTOM, WMSZ_BOTTOMLEFT, WMSZ_BOTTOMRIGHT, WMSZ_LEFT, WMSZ_RIGHT,
@@ -74,6 +74,7 @@ use crate::error::EventLoopError;
 use crate::event::{Event, Force, Ime, InnerSizeWriter, Touch, TouchPhase, WindowEvent};
 use crate::event_loop::{ActiveEventLoop as RootAEL, ControlFlow, EventLoopClosed};
 use crate::keyboard::ModifiersState;
+use crate::min_track;
 use crate::platform::pump_events::PumpStatus;
 use crate::platform_impl::platform::dark_mode::try_theme;
 use crate::platform_impl::platform::dpi::{become_dpi_aware, dpi_to_scale_factor};
@@ -1071,7 +1072,11 @@ unsafe fn public_window_callback_inner(
                 }
             }
 
-            result = ProcResult::Value(0);
+            // LOCAL PATCH (aterm): `DefWindowProc` holds the size to the window's track sizes
+            // (`WM_GETMINMAXINFO`), so no `SetWindowPos` (a restore from maximized, a DPI change's
+            // new rectangle, a requested size) takes a window under its least. Upstream answered
+            // the message handled (0), which left every `SetWindowPos` unchecked.
+            result = ProcResult::DefWindowProc(wparam);
         },
 
         WM_WINDOWPOSCHANGED => {
@@ -1119,17 +1124,18 @@ unsafe fn public_window_callback_inner(
         },
 
         WM_SIZING => {
-            fn snap_to_nearest_increment_delta(value: i32, increment: i32) -> i32 {
-                let half_one = increment / 2;
-                let half_two = increment - half_one;
-                half_one - (value - half_two) % increment
-            }
-
-            let scale_factor = userdata.window_state_lock().scale_factor;
+            let (scale_factor, least_size) = {
+                let window_state = userdata.window_state_lock();
+                let scale_factor = window_state.scale_factor;
+                let fullscreen = window_state.fullscreen.is_some();
+                let least = min_track::track_least(window_state.min_size, scale_factor, fullscreen)
+                    .unwrap_or(PhysicalSize::new(0, 0));
+                (scale_factor, least)
+            };
             let Some(inc) = userdata
                 .window_state_lock()
                 .resize_increments
-                .map(|inc| inc.to_physical(scale_factor))
+                .map(|inc| inc.to_physical::<i32>(scale_factor))
                 .filter(|inc| inc.width > 0 && inc.height > 0)
             else {
                 result = ProcResult::Value(0);
@@ -1150,11 +1156,13 @@ unsafe fn public_window_callback_inner(
             let width = rect.right - rect.left - deco_width;
             let height = rect.bottom - rect.top - deco_height;
 
-            let width_delta = snap_to_nearest_increment_delta(width, inc.width);
-            let height_delta = snap_to_nearest_increment_delta(height, inc.height);
-
-            // LOCAL PATCH (aterm): no minimum or maximum size to keep the snapped size within (no
-            // aterm crate sets either on Windows).
+            // LOCAL PATCH (aterm): the increments are based at the least, so a drag lands on
+            // `least + k * increment`, never under the least ([`crate::min_track::snapped`]); with
+            // no least, on whole increments as upstream snapped. No aterm crate sets a maximum.
+            let least = |least: u32| i32::try_from(least).unwrap_or(i32::MAX);
+            let (least_width, least_height) = (least(least_size.width), least(least_size.height));
+            let width_delta = min_track::snapped(width, inc.width, least_width) - width;
+            let height_delta = min_track::snapped(height, inc.height, least_height) - height;
 
             match side {
                 WMSZ_LEFT | WMSZ_BOTTOMLEFT | WMSZ_TOPLEFT => {
@@ -1757,10 +1765,26 @@ unsafe fn public_window_callback_inner(
             }
         },
 
-        // LOCAL PATCH (aterm): no aterm crate sets a minimum or maximum size on Windows, so the
-        // track sizes Windows proposes stand, and the message is answered handled, as upstream
-        // answered it with neither set.
+        // LOCAL PATCH (aterm): the least window size (`Window::set_min_inner_size`) as the least
+        // outer size: the least client area at the window's DPI with its frame around it, where
+        // that is over the least Windows proposed; none in full screen ([`crate::min_track`]).
+        // Upstream converted a physical least's sides with `as i32`, which wraps a side past
+        // `i32::MAX` negative. No aterm crate sets a maximum size, so the maximum track size
+        // Windows proposes stands.
         WM_GETMINMAXINFO => {
+            let least = {
+                let window_state = userdata.window_state_lock();
+                let fullscreen = window_state.fullscreen.is_some();
+                min_track::track_least(window_state.min_size, window_state.scale_factor, fullscreen)
+                    .map(|least| (least, window_state.window_flags))
+            };
+            if let Some((least, window_flags)) = least {
+                let frame = window_flags.frame_size(window);
+                let info = unsafe { &mut *(lparam as *mut MINMAXINFO) };
+                let proposed = (info.ptMinTrackSize.x, info.ptMinTrackSize.y);
+                let (x, y) = min_track::min_track_size(least, frame, proposed);
+                info.ptMinTrackSize = POINT { x, y };
+            }
             result = ProcResult::Value(0);
         },
 
@@ -1780,6 +1804,16 @@ unsafe fn public_window_callback_inner(
                     result = ProcResult::Value(0);
                     return;
                 }
+                // LOCAL PATCH (aterm): a physical least follows the window to its new scale
+                // until the app gives one for it ([`crate::min_track::rescaled`]), so the new
+                // rectangle below is held to a least of the new scale.
+                window_state.min_size = window_state
+                    .min_size
+                    .map(|min| min_track::rescaled(min, old_scale_factor, new_scale_factor));
+                // LOCAL PATCH (aterm): until the new rectangle is set below, a least the app
+                // gives for the new scale does not grow the old scale's client area
+                // ([`crate::min_track::Standing::Rescaling`]); that rectangle is held to it.
+                window_state.rescaling = true;
 
                 let allow_resize = window_state.fullscreen.is_none()
                     && !window_state.window_flags().contains(WindowFlags::MAXIMIZED);
@@ -1942,6 +1976,7 @@ unsafe fn public_window_callback_inner(
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 )
             };
+            userdata.window_state_lock().rescaling = false;
 
             result = ProcResult::Value(0);
         },

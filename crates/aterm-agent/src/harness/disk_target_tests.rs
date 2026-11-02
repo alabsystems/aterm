@@ -32,6 +32,447 @@ fn assessed(path: &Path, now: i64) -> TargetDir {
     assess(path, now, STALE, WalkBudget::SHIPPED).expect("a directory")
 }
 
+#[test]
+fn registered_custody_cannot_fall_back_to_an_ordinary_cargo_target() {
+    for contents in [
+        br#"{"schema":3}"#.as_slice(),
+        b"unknown future policy".as_slice(),
+    ] {
+        let tmp = Tmp::new("managed-target");
+        let target = synthetic_target(&tmp, "target");
+        let now = now_after_write(STALE + 1);
+        assert!(assessed(&target, now).fences().is_ok());
+        std::fs::write(
+            target.join(atpkg::build_cache::registered::MARKER),
+            contents,
+        )
+        .unwrap();
+        let observed = assessed(&target, now);
+        assert!(observed.holds_source.is_none());
+        assert!(observed.fences().is_err());
+        reclaim(&target, &judge(now)).expect_err("registered authority is required");
+        assert!(target.join("debug/incremental").exists());
+    }
+    let tmp = Tmp::new("unreadable-managed-marker");
+    let target = synthetic_target(&tmp, "target");
+    std::fs::create_dir(target.join(atpkg::build_cache::registered::MARKER)).unwrap();
+    reclaim(&target, &judge(now_after_write(STALE + 1)))
+        .expect_err("a nonregular policy is uncertainty, not ordinary authority");
+    assert!(target.join("debug/incremental").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn supported_retention_revokes_ordinary_paths_and_keeps_unretained_siblings_eligible() {
+    for method in 0..4 {
+        let tmp = Tmp::new("supported-cache-retention");
+        let home = tmp.path().canonicalize().unwrap();
+        let target = synthetic_target(&tmp, "target").canonicalize().unwrap();
+        let sibling = synthetic_target(&tmp, "sibling").canonicalize().unwrap();
+        let now = now_after_write(STALE + 1);
+        let debug = target.join("debug");
+        let seen = assessed(&target, now).profiles[0].last_used.unwrap();
+        let mut called = false;
+        let mut retain = |stage, _: &Path| {
+            if stage == Stage::Deleting && !called {
+                called = true;
+                atpkg::build_cache::registered::retain(&home, &target).unwrap();
+            }
+        };
+        let result = match method {
+            0 => reclaim_with(&target, &judge(now), &mut retain),
+            1 => reclaim_lru_with(&target, &debug, &judge(now), seen, &mut retain),
+            2 => reclaim_whole_with(&target, &judge(now), seen, DAY, &mut || Ok(()), &mut retain),
+            _ => reclaim_profiles_with(
+                &target,
+                &judge(now),
+                seen,
+                DAY,
+                &mut || Ok(()),
+                &mut || Ok(()),
+                &mut retain,
+            ),
+        };
+        assert!(called && result.is_err());
+        assert!(target.join("debug/incremental").exists());
+        assert!(assessed(&target, now).fences().is_err());
+        let unretained = reclaim(&sibling, &judge(now)).unwrap();
+        assert!(!unretained.units.is_empty());
+    }
+}
+
+#[test]
+fn a_late_registered_marker_revokes_each_ordinary_removal_path() {
+    for method in 0..4 {
+        for when in [Stage::Locked, Stage::Deleting] {
+            let tmp = Tmp::new("late-managed-target");
+            let target = synthetic_target(&tmp, "target");
+            let now = now_after_write(STALE + 1);
+            let debug = target.join("debug");
+            let seen = assessed(&target, now).profiles[0].last_used.unwrap();
+            let mut called = false;
+            let mut marker = |stage, _: &Path| {
+                if stage == when {
+                    called = true;
+                    std::fs::write(
+                        target.join(atpkg::build_cache::registered::MARKER),
+                        br#"{"schema":3}"#,
+                    )
+                    .unwrap();
+                }
+            };
+            let result = match method {
+                0 => reclaim_with(&target, &judge(now), &mut marker),
+                1 => reclaim_lru_with(&target, &debug, &judge(now), seen, &mut marker),
+                2 => {
+                    reclaim_whole_with(&target, &judge(now), seen, DAY, &mut || Ok(()), &mut marker)
+                }
+                _ => reclaim_profiles_with(
+                    &target,
+                    &judge(now),
+                    seen,
+                    DAY,
+                    &mut || Ok(()),
+                    &mut || Ok(()),
+                    &mut marker,
+                ),
+            };
+            assert!(called, "method {method}, stage {when:?}");
+            assert!(result.is_err(), "method {method}, stage {when:?}");
+            assert!(debug.join(INCREMENTAL).exists());
+            assert!(target.join(atpkg::build_cache::registered::MARKER).exists());
+        }
+    }
+}
+
+#[test]
+fn custody_revoked_before_removal_stops_later_profiles_until_a_fresh_pass() {
+    for custody_marker in atpkg::build_cache::registered::CUSTODY_MARKERS {
+        let tmp = Tmp::new("predelete-managed-target");
+        let target = synthetic_target(&tmp, "target");
+        lay_profile(&target.join("release"));
+        let before = snapshot(&target, &|_| false);
+        let now = now_after_write(STALE + 1);
+        let marker = target.join(custody_marker);
+        let mut deleting = 0;
+        let mut released = 0;
+        let mut removing = 0;
+        let error = reclaim_with(&target, &judge(now), &mut |stage, _| match stage {
+            Stage::Deleting => {
+                deleting += 1;
+                if deleting == 1 {
+                    std::fs::write(&marker, b"held").unwrap();
+                } else if marker.exists() {
+                    std::fs::remove_file(&marker).unwrap();
+                }
+            }
+            Stage::Released => {
+                released += 1;
+                // Clearing custody between profiles cannot revive this pass's permission.
+                if marker.exists() {
+                    std::fs::remove_file(&marker).unwrap();
+                }
+            }
+            Stage::Removing => removing += 1,
+            Stage::Locked => {}
+        })
+        .expect_err("a pre-removal custody refusal stops the whole pass");
+        assert!(error.to_string().contains(MANAGED_CACHE), "{error}");
+        assert_eq!(deleting, 1, "the next profile never reaches deletion");
+        assert_eq!(released, 1, "the refused profile releases its locks");
+        assert_eq!(removing, 0, "no removal boundary was entered");
+        assert!(!marker.exists());
+        assert_eq!(
+            snapshot(&target, &|_| false),
+            before,
+            "no payload was removed"
+        );
+
+        let done = reclaim(&target, &judge(now)).expect("a fresh pass may reclaim both profiles");
+        assert_eq!(done.units.len(), 2);
+        assert!(done.trouble.is_empty(), "{done:?}");
+        for profile in ["debug", "release"] {
+            assert!(done.units.contains(&target.join(profile).join(INCREMENTAL)));
+            assert!(!target.join(profile).join(INCREMENTAL).exists());
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_renamed_pinned_target_keeps_its_registered_custody() {
+    let tmp = Tmp::new("renamed-managed-target");
+    let target = synthetic_target(&tmp, "target");
+    let moved = tmp.path().join("moved");
+    let now = now_after_write(STALE + 1);
+    let mut called = false;
+    reclaim_with(&target, &judge(now), &mut |stage, _| {
+        if stage == Stage::Deleting {
+            called = true;
+            std::fs::rename(&target, &moved).unwrap();
+            std::fs::create_dir(&target).unwrap();
+            std::fs::write(moved.join(atpkg::build_cache::registered::MARKER), b"held").unwrap();
+        }
+    })
+    .expect_err("the pinned original retains its policy after a rename");
+    assert!(called);
+    assert!(moved.join("debug/incremental").exists());
+}
+
+fn ordinary_method(
+    method: usize,
+    target: &Path,
+    now: i64,
+    seen: i64,
+    hook: &mut dyn FnMut(Stage, &Path),
+) -> io::Result<Removed> {
+    match method {
+        0 => reclaim_with(target, &judge(now), hook),
+        1 => reclaim_lru_with(target, &target.join("debug"), &judge(now), seen, hook),
+        2 => reclaim_whole_with(target, &judge(now), seen, DAY, &mut || Ok(()), hook),
+        _ => reclaim_profiles_with(
+            target,
+            &judge(now),
+            seen,
+            DAY,
+            &mut || Ok(()),
+            &mut || Ok(()),
+            hook,
+        ),
+    }
+}
+
+#[test]
+fn a_managed_ancestor_keeps_an_explicitly_named_nested_target() {
+    for method in 0..4 {
+        let tmp = Tmp::new("nested-managed-target");
+        let target = synthetic_target(&tmp, "generation/nested-target");
+        let now = now_after_write(STALE + 1);
+        let observed = assessed(&target, now);
+        let seen = observed.profiles[0].last_used.unwrap();
+        assert!(observed.fences().is_ok());
+        let before = snapshot(&target, &|_| false);
+        std::fs::write(
+            target
+                .parent()
+                .unwrap()
+                .join(atpkg::build_cache::registered::MARKER),
+            br#"{"schema":3}"#,
+        )
+        .unwrap();
+        assert!(assessed(&target, now).fences().is_err());
+        ordinary_method(method, &target, now, seen, &mut |_, _| {})
+            .expect_err("an explicit nested target cannot escape its ancestor's custody");
+        assert_eq!(snapshot(&target, &|_| false), before, "method {method}");
+    }
+}
+
+#[test]
+fn an_ordinary_target_cannot_remove_a_managed_descendant() {
+    for method in 0..4 {
+        let tmp = Tmp::new("managed-descendant");
+        let target = synthetic_target(&tmp, "target");
+        let nested = lay_target(&target.join("debug/incremental/managed"));
+        std::fs::write(nested.join(atpkg::build_cache::registered::MARKER), b"held").unwrap();
+        let before = snapshot(&nested, &|_| false);
+        let now = now_after_write(STALE + 1);
+        let observed = assessed(&target, now);
+        assert!(observed.fences().is_ok());
+        let seen = observed.profiles[0].last_used.unwrap();
+        let why = match ordinary_method(method, &target, now, seen, &mut |_, _| {}) {
+            Ok(done) => done.trouble.join("; "),
+            Err(error) => error.to_string(),
+        };
+        assert!(why.contains(MANAGED_CACHE), "method {method}: {why}");
+        assert_eq!(snapshot(&nested, &|_| false), before, "method {method}");
+    }
+}
+
+#[test]
+fn a_custody_scan_never_follows_a_nested_directory_link() {
+    let tmp = Tmp::new("custody-scan-link");
+    let target = synthetic_target(&tmp, "target");
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(
+        outside.join(atpkg::build_cache::registered::MARKER),
+        b"held",
+    )
+    .unwrap();
+    std::fs::write(outside.join("precious"), b"not a cache descendant").unwrap();
+    let before = snapshot(&outside, &|_| false);
+    let link = target.join("linked");
+    link_dir(&outside, &link);
+    unmanaged_custody(&target, WalkBudget::SHIPPED)
+        .expect("a link's protected target is not traversed");
+    assert!(unmanaged_custody(&link, WalkBudget::SHIPPED).is_err());
+    assert_eq!(snapshot(&outside, &|_| false), before);
+    let nested = target.join("real-child");
+    std::fs::create_dir(&nested).unwrap();
+    std::fs::write(nested.join(atpkg::build_cache::registered::MARKER), b"held").unwrap();
+    assert!(
+        unmanaged_custody(&target, WalkBudget::SHIPPED).is_err(),
+        "CONTROL: a reachable real directory's custody is inspected"
+    );
+}
+
+#[test]
+fn a_custody_scan_refuses_incomplete_bounds_and_checks_a_files_ancestors() {
+    let tmp = Tmp::new("custody-scan-bounds");
+    let target = synthetic_target(&tmp, "target");
+    for budget in [
+        WalkBudget {
+            entries: 0,
+            ..WalkBudget::SHIPPED
+        },
+        WalkBudget {
+            depth: 0,
+            ..WalkBudget::SHIPPED
+        },
+        WalkBudget {
+            wall: Duration::ZERO,
+            ..WalkBudget::SHIPPED
+        },
+    ] {
+        assert!(unmanaged_custody(&target, budget).is_err());
+    }
+    let file = target.join("CACHEDIR.TAG");
+    unmanaged_custody(&file, WalkBudget::SHIPPED).expect("unmarked ordinary file");
+    std::fs::write(
+        target.join(atpkg::build_cache::registered::package::COORDINATOR),
+        b"held",
+    )
+    .unwrap();
+    assert!(unmanaged_custody(&file, WalkBudget::SHIPPED).is_err());
+}
+
+fn mid_walk_custody(ancestor: bool, rename: bool, custody_marker: &str) {
+    for method in 0..4 {
+        let tmp = Tmp::new("mid-walk-managed-target");
+        let target = synthetic_target(&tmp, "generation/target");
+        let moved = target.with_file_name("moved");
+        lay_profile(&target.join("release"));
+        let payloads = [
+            PathBuf::from("debug/incremental/lay-1x2y3z/s-abc-def/query-cache.bin"),
+            PathBuf::from("debug/incremental/remaining/session/query-cache.bin"),
+            PathBuf::from("release/incremental/lay-1x2y3z/s-abc-def/query-cache.bin"),
+            PathBuf::from("release/incremental/remaining/session/query-cache.bin"),
+        ];
+        for rel in [&payloads[1], &payloads[3]] {
+            let second = target.join(rel);
+            std::fs::create_dir_all(second.parent().unwrap()).unwrap();
+            std::fs::write(&second, vec![17u8; 8192]).unwrap();
+        }
+        let allocated: Vec<_> = snapshot(&target, &|_| false)
+            .into_iter()
+            .filter(|(_, kind, _)| kind == "file")
+            .map(|(rel, _, _)| {
+                let bytes = blocks(&target.join(&rel));
+                (rel, bytes)
+            })
+            .collect();
+        let now = now_after_write(STALE + 1);
+        let seen = assessed(&target, now)
+            .profiles
+            .iter()
+            .filter_map(|profile| profile.last_used)
+            .max()
+            .unwrap();
+        let mut injected = false;
+        let mut remaining = Vec::new();
+        let mut marker: Option<PathBuf> = None;
+        let done = ordinary_method(method, &target, now, seen, &mut |stage, _| {
+            // Removing the policy after this profile returns must not let the same pass resume.
+            if stage == Stage::Released
+                && matches!(method, 0 | 3)
+                && let Some(policy) = &marker
+            {
+                std::fs::remove_file(policy).unwrap();
+            }
+            if stage != Stage::Removing || injected {
+                return;
+            }
+            let alive: Vec<_> = payloads
+                .iter()
+                .filter(|p| target.join(p).exists())
+                .collect();
+            if alive.len() != payloads.len() - 1 {
+                return;
+            }
+            injected = true;
+            remaining = alive.into_iter().cloned().collect();
+            #[cfg(unix)]
+            if rename {
+                std::fs::rename(&target, &moved).unwrap();
+                std::fs::create_dir(&target).unwrap();
+            }
+            let active = if rename { &moved } else { &target };
+            let owner = if ancestor {
+                active.parent().unwrap()
+            } else {
+                active
+            };
+            let policy = owner.join(custody_marker);
+            std::fs::write(&policy, br#"{"schema":3}"#).unwrap();
+            marker = Some(policy);
+        })
+        .expect("the files deleted before revocation are reported");
+        assert!(
+            injected,
+            "method {method}: mutation must already have started"
+        );
+        let active = if rename { &moved } else { &target };
+        assert!(
+            remaining.iter().all(|rel| active.join(rel).exists()),
+            "method {method}: remaining payloads"
+        );
+        let freed: u64 = allocated
+            .iter()
+            .filter(|(rel, _)| !active.join(rel).exists())
+            .map(|(_, bytes)| bytes)
+            .sum();
+        assert!(freed > 0, "method {method}: actual partial deletion");
+        assert_eq!(
+            done.bytes, freed,
+            "method {method}: only actual released bytes"
+        );
+        assert!(
+            done.trouble.iter().any(|why| why.contains(MANAGED_CACHE)),
+            "{done:?}"
+        );
+        assert_eq!(marker.unwrap().exists(), !matches!(method, 0 | 3));
+    }
+}
+
+#[test]
+fn mid_walk_registered_custody_stops_each_ordinary_removal_path() {
+    mid_walk_custody(false, false, atpkg::build_cache::registered::MARKER);
+    mid_walk_custody(true, false, atpkg::build_cache::registered::MARKER);
+}
+
+#[test]
+fn mid_walk_package_coordination_stops_each_ordinary_removal_path() {
+    mid_walk_custody(
+        false,
+        false,
+        atpkg::build_cache::registered::package::COORDINATOR,
+    );
+    mid_walk_custody(
+        true,
+        false,
+        atpkg::build_cache::registered::package::COORDINATOR,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn mid_walk_custody_follows_a_renamed_root_and_its_ancestors() {
+    for marker in atpkg::build_cache::registered::CUSTODY_MARKERS {
+        mid_walk_custody(false, true, marker);
+        mid_walk_custody(true, true, marker);
+    }
+}
+
 /// Join `/`-separated `rel` under `base` one component at a time (safe under verbatim `\\?\`).
 fn at(base: &Path, rel: &str) -> PathBuf {
     rel.split('/').fold(base.to_path_buf(), |p, c| p.join(c))
@@ -723,6 +1164,9 @@ fn every_lock_is_held_for_the_whole_delete_and_released_after() {
     let now = now_after_write(STALE + 1);
     let mut seen = Vec::new();
     reclaim_with(&t, &judge(now), &mut |stage, _| {
+        if stage == Stage::Removing {
+            return;
+        }
         let all = CARGO_LOCKS.iter().all(|l| held(&debug.join(l)));
         let inc = debug.join(INCREMENTAL).exists();
         seen.push((stage, all, inc));
@@ -749,6 +1193,9 @@ fn a_lock_is_released_while_a_child_forked_under_it_has_yet_to_exec() {
     let mut child: Option<Parked> = None;
     let mut seen = Vec::new();
     reclaim_with(&t, &judge(now), &mut |stage, _| {
+        if stage == Stage::Removing {
+            return;
+        }
         if stage == Stage::Locked {
             child = Some(Parked::fork());
         }
@@ -1317,6 +1764,9 @@ fn reclaim_lru_takes_only_the_named_profile_under_every_lock() {
 
     let mut seen = Vec::new();
     let done = reclaim_lru_with(&t, &debug, &judge(now), now - 3 * 3_600, &mut |stage, p| {
+        if stage == Stage::Removing {
+            return;
+        }
         let all = CARGO_LOCKS.iter().all(|l| held(&p.join(l)));
         seen.push((stage, all));
     })
@@ -1448,6 +1898,68 @@ fn a_whole_removal_takes_no_profile_it_did_not_lock_and_deletes_through_its_hand
     .expect_err("the check refuses");
     assert!(err.to_string().contains("its session resumed"), "{err}");
     assert!(at(&t, "debug/deps/liblay.rlib").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn whole_reclaim_keeps_freed_bytes_when_its_final_name_cannot_be_inspected() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    struct RestoreSearch<'a>(&'a Path);
+    impl Drop for RestoreSearch<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    let tmp = Tmp::new("whole-final-name-error");
+    let t = std::fs::canonicalize(lay_target(&tmp.path().join("target"))).expect("canonical");
+    let _restore = RestoreSearch(&t);
+    let moved = tmp.path().join("target.emptied");
+    let payload = at(&t, "debug/deps/liblay.rlib");
+    let allocated = blocks(&payload);
+    assert!(allocated > 0, "the removed file has counted allocation");
+    let now = now_after_write(2);
+    let replacement = b"the replacement is not a build directory";
+    let mut swapped = false;
+    let mut released = false;
+    let done = reclaim_whole_with(
+        &t,
+        &judge(now),
+        now,
+        DAY,
+        &mut || Ok(()),
+        &mut |stage, at| {
+            if stage == Stage::Removing && at == t {
+                assert!(std::fs::read_dir(&t).unwrap().next().is_none());
+                std::fs::rename(&t, &moved).expect("move the emptied directory");
+                std::fs::create_dir(&t).expect("replace its name with a directory");
+                std::fs::write(t.join("keep.txt"), replacement).expect("the replacement payload");
+                std::fs::set_permissions(&t, std::fs::Permissions::from_mode(0o000))
+                    .expect("deny the final directory open");
+                std::fs::read_dir(&t).expect_err("the replacement cannot be opened by this user");
+                swapped = true;
+            }
+            if stage == Stage::Released {
+                released = true;
+            }
+        },
+    )
+    .expect("a final name lookup error retains the already-counted removal");
+    assert!(
+        swapped && released,
+        "the final boundary and release were observed"
+    );
+    assert!(done.bytes >= allocated, "{done:?}");
+    assert!(done.units.is_empty(), "the named root did not go: {done:?}");
+    assert!(
+        !done.trouble.is_empty(),
+        "the retained root is reported: {done:?}"
+    );
+    std::fs::set_permissions(&t, std::fs::Permissions::from_mode(0o700))
+        .expect("restore the replacement for inspection and cleanup");
+    assert_eq!(std::fs::read(t.join("keep.txt")).unwrap(), replacement);
+    assert!(std::fs::read_dir(&moved).unwrap().next().is_none());
 }
 
 /// [`unhashed_twin`] matches only the unhashed stem (`-` as `_`) with the same extension.

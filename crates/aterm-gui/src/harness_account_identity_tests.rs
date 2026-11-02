@@ -82,6 +82,29 @@ fn setup(case: Case) -> (Arc<Accts>, WorkerIdle, String, PathBuf) {
     (a, idle, to.into(), path)
 }
 
+fn setup_progress(case: Case) -> (Arc<Accts>, WorkerIdle, String, PathBuf) {
+    let (a, idle, target, path) = setup(case);
+    let pid = std::process::id();
+    let start = aterm_agent::harness::restart_stamp::kernel_start(pid).unwrap();
+    let now = aterm_time::unix_secs()
+        .and_then(|at| i64::try_from(at).ok())
+        .unwrap();
+    a.now.store(now, Ordering::SeqCst);
+    let mut snapshot = idle.kept.lock().unwrap().snapshot.clone().unwrap();
+    let env = a.procs.lock().unwrap().remove(&snapshot.pid).unwrap();
+    snapshot.pid = pid;
+    snapshot.start = start;
+    assert!(snapshot.current_start_seconds().is_some());
+    a.procs.lock().unwrap().insert(pid, env);
+    a.tabs
+        .lock()
+        .unwrap()
+        .insert(snapshot.tab.clone(), snapshot.clone());
+    idle.kept.lock().unwrap().snapshot = Some(snapshot);
+    a.wall_of(ACCT_TALK_A, now, Some("five_hour"), Some(now + 3600));
+    (a, idle, target, path)
+}
+
 fn selected(advice: &Option<AccountAdvice>, target: &str) -> i64 {
     match moves(advice) {
         Some(label) if label == target => 1,
@@ -100,6 +123,180 @@ fn advice_case(case: Case) -> i64 {
     assert_eq!(a.state().account(&target).auth, auth);
     assert_eq!(std::fs::read(path).unwrap(), bytes);
     result
+}
+
+fn observed_progress(idle: &WorkerIdle) -> aterm_agent::harness::account_progress::AccountProgress {
+    idle.kept
+        .lock()
+        .unwrap()
+        .account
+        .progress
+        .as_ref()
+        .unwrap()
+        .value
+        .clone()
+}
+
+fn assert_progress_projection(
+    progress: &aterm_agent::harness::account_progress::AccountProgress,
+    eligible: Option<usize>,
+) {
+    use aterm_agent::harness::footer::{FactsOwner, FooterFacts};
+    assert_eq!(progress.eligible, eligible);
+    let footer = aterm_agent::harness::footer::account_progress_text(progress, false);
+    if let Some(eligible) = eligible {
+        assert!(footer.contains(&format!("{eligible} eligible")));
+    } else {
+        assert!(footer.contains("Eligibility unknown"));
+    }
+    let app = crate::App::headless_for_test();
+    let local = app.focused_session_id(crate::WindowId(0)).unwrap();
+    let ctx = app.pool.get(local).unwrap().ctx.clone();
+    {
+        let mut timeline = ctx.timeline.lock().unwrap();
+        timeline.note_foreground_group(4242);
+        timeline.set_program(4242, Some("node".into()));
+        timeline.set_agent_reader_program_for_test(Some(Program::Claude));
+        timeline.set_claude_footer(
+            4242,
+            Some(100),
+            Some(FooterFacts {
+                owner: Some(FactsOwner {
+                    floor: Some(100),
+                    session_id: ACCT_TALK_A.into(),
+                }),
+                account_progress: Some(progress.clone()),
+                ..FooterFacts::default()
+            }),
+        );
+    }
+    let lab = app.lab_state(&app.harness_state().sessions);
+    let session = lab
+        .sessions
+        .iter()
+        .find(|session| session.local_id == local)
+        .unwrap();
+    let expected = eligible.map_or_else(|| "Unknown".into(), |n| n.to_string());
+    assert!(
+        session
+            .facts
+            .contains(&("Eligible alternatives".into(), expected))
+    );
+}
+
+#[test]
+fn recovery_counts_share_the_identity_checks_that_select_the_alternate() {
+    for default in [false, true] {
+        for (initial, backup, selected_target, eligible) in [
+            (2, false, 0, 0),
+            (1, false, 1, 1),
+            (2, true, 2, 1),
+            (0, false, 1, 1),
+        ] {
+            let (a, idle, target, path) = setup_progress(Case {
+                default,
+                expected: 1,
+                initial,
+                current: initial,
+                backup,
+                legacy: false,
+            });
+            let auth = a.state().account(&target).auth;
+            let bytes = std::fs::read(&path).unwrap();
+            let advice = idle.account(usage_wall());
+            assert_eq!(selected(&advice, &target), selected_target);
+            let progress = observed_progress(&idle);
+            assert_progress_projection(&progress, Some(eligible));
+            assert_eq!(progress.known, Some(3));
+            assert_eq!(a.state().account(&target).auth, auth);
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+            assert_eq!(a.asked("restart:"), 0);
+            if initial == 2 {
+                assert!(progress.details.iter().any(|detail| {
+                    detail.starts_with(&format!("{target}:"))
+                        && detail.contains("expected identity")
+                }));
+            }
+        }
+    }
+}
+
+#[test]
+fn recovery_counts_keep_the_identity_verdict_of_the_actual_decision() {
+    let (a, idle, target, path) = setup_progress(Case {
+        default: false,
+        expected: 1,
+        initial: 1,
+        current: 2,
+        backup: false,
+        legacy: false,
+    });
+    let request = AdviceTurn::begin(&idle.kept).capture(&idle.kept).unwrap();
+    let mut judged = None;
+    let advice = idle.account_advice(usage_wall(), false, &mut judged);
+    assert_eq!(selected(&advice, &target), 1);
+    let auth = a.state().account(&target).auth;
+    let bytes = write_profile(&path, 2);
+    let progress = idle
+        .read_account_progress(&request, usage_wall(), advice.as_ref(), judged.as_mut())
+        .unwrap()
+        .value;
+    assert_progress_projection(&progress, Some(1));
+    let advice = idle.account(usage_wall());
+    assert_eq!(selected(&advice, &target), 0);
+    assert_progress_projection(&observed_progress(&idle), Some(0));
+    assert_eq!(a.state().account(&target).auth, auth);
+    assert_eq!(std::fs::read(path).unwrap(), bytes);
+    assert_eq!(a.asked("restart:"), 0);
+}
+
+#[test]
+fn recovery_counts_decline_a_judgment_after_same_label_binding_changes() {
+    for change_directory in [false, true] {
+        let (a, idle, target, _) = setup_progress(Case {
+            default: false,
+            expected: 1,
+            initial: 1,
+            current: 1,
+            backup: false,
+            legacy: false,
+        });
+        let request = AdviceTurn::begin(&idle.kept).capture(&idle.kept).unwrap();
+        let mut judged = None;
+        let advice = idle.account_advice(usage_wall(), false, &mut judged);
+        assert_eq!(selected(&advice, &target), 1);
+        let mut roster = accounts::Roster::load(&a.roster_path()).unwrap();
+        let row = roster
+            .rows
+            .iter_mut()
+            .find(|row| row.label == target)
+            .unwrap();
+        if change_directory {
+            let dir = a.tmp.path().join("rebound-login");
+            write_profile(&dir.join(".claude.json"), 2);
+            std::fs::write(dir.join("a-login-file"), "{}").unwrap();
+            row.dir = Some(dir.display().to_string());
+        } else {
+            row.identity_email = Some(email(2).into());
+        }
+        std::fs::write(
+            a.roster_path(),
+            accounts::append_rows_for(accounts::Cli::Claude, "", &roster.rows).unwrap(),
+        )
+        .unwrap();
+        let auth = a.state().account(&target).auth;
+        let progress = idle
+            .read_account_progress(&request, usage_wall(), advice.as_ref(), judged.as_mut())
+            .unwrap()
+            .value;
+        assert_progress_projection(&progress, None);
+        assert_eq!(progress.known, Some(3));
+        let advice = idle.account(usage_wall());
+        assert_eq!(selected(&advice, &target), 0);
+        assert_progress_projection(&observed_progress(&idle), Some(0));
+        assert_eq!(a.state().account(&target).auth, auth);
+        assert_eq!(a.asked("restart:"), 0);
+    }
 }
 
 fn act_case(case: Case, hold: i64) -> [(&'static str, i64); 6] {
@@ -305,12 +502,11 @@ fn default_target_identity_uses_the_captured_process_home() {
     let other = other_home.join(".claude.json");
     let bytes = write_profile(&other, 2);
     let pid = idle.kept.lock().unwrap().snapshot.as_ref().unwrap().pid;
-    a.procs
-        .lock()
-        .unwrap()
-        .get_mut(&pid)
-        .unwrap()
-        .push(format!("HOME={}", other_home.display()));
+    a.procs.lock().unwrap().get_mut(&pid).unwrap().push(format!(
+        "{}={}",
+        aterm_agent::harness::accounts::HOMEDIR_ENV,
+        other_home.display()
+    ));
     assert_eq!(selected(&idle.account(usage_wall()), &target), 2);
     assert_eq!(std::fs::read(other).unwrap(), bytes);
     assert_eq!(std::fs::read(path).unwrap(), before);

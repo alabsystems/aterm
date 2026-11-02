@@ -13,6 +13,7 @@ pub mod hardware;
 pub mod history;
 pub mod ink;
 pub mod jobs;
+pub mod left;
 pub mod model;
 pub mod peaks;
 pub mod program_check;

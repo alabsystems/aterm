@@ -687,6 +687,24 @@ fn a_lapsed_head_is_re_signed_with_a_new_horizon_and_never_carried() {
             .index_build,
         22
     );
+
+    let mut ancient_ctx = rig.ctx.clone();
+    ancient_ctx.now_unix = i64::MIN / 2;
+    let mut ancient_log = Rig::log();
+    let ancient_req = IndexRequest {
+        baseline: Baseline::Dir(rig.path("held-21")),
+        delta: fresh(),
+        out: rig.path("from-disk-ancient"),
+        upload: false,
+        pack_dir: None,
+    };
+    assert_eq!(
+        atpkg_publish::channel::index::publish_with(&ancient_ctx, &ancient_req, &mut ancient_log)
+            .expect("synthetic negative now_unix does not overflow horizon warning")
+            .published
+            .index_build,
+        22
+    );
 }
 
 #[test]

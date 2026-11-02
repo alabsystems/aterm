@@ -429,7 +429,8 @@ fn a_gather_with_no_watch_notes_each_sampled_holder_image_and_never_the_shells()
     let feed = RanFeed::reading(std::sync::Arc::clone(&ran), SH, scripted_names);
     set_image(tool(JOB));
     set_image(shell(SH));
-    let image = crate::spawn::sampled_edge_image(scripted_read, &feed, JOB, 0).expect("an edge");
+    let image = crate::spawn::sampled_edge_image(scripted_read, |_| Some(7), &feed, JOB, 0)
+        .expect("an edge");
     assert_eq!(image.pgid, JOB);
     let heard = || -> Vec<(i32, Option<String>)> {
         ran.within(Some(Window { from: 0, to: None }))
@@ -446,9 +447,9 @@ fn a_gather_with_no_watch_notes_each_sampled_holder_image_and_never_the_shells()
         [(JOB, file.clone())],
         "the in-front image, by its file"
     );
-    let _ = crate::spawn::sampled_edge_image(scripted_read, &feed, SH, 0);
+    let _ = crate::spawn::sampled_edge_image(scripted_read, |_| Some(7), &feed, SH, 0);
     assert!(
-        crate::spawn::sampled_edge_image(scripted_read, &feed, 0, 0).is_none(),
+        crate::spawn::sampled_edge_image(scripted_read, |_| Some(7), &feed, 0, 0).is_none(),
         "no edge, no read"
     );
     assert_eq!(
@@ -456,6 +457,40 @@ fn a_gather_with_no_watch_notes_each_sampled_holder_image_and_never_the_shells()
         [(JOB, file)],
         "the shell's image is never a command's"
     );
+}
+
+/// H3's landing: a sampled edge whose leader has not exec'd since its fork (a shell's child
+/// between its fork and its exec, or one whose command was not found and never execs) maps the
+/// shell's image, which no command ran: the edge still reads the image, and the ran log hears
+/// nothing of it, nor of a leader whose flag cannot be read; once the leader has exec'd, its
+/// image is heard. NEGATIVE CONTROL (scratch): `sampled_edge_image` hearing every image whatever
+/// the flag fails "heard as nothing".
+#[test]
+fn a_sampled_edge_whose_leader_has_not_execd_is_heard_as_nothing() {
+    const SH: i32 = 63_100;
+    const FORK: i32 = 63_101;
+    let ran = std::sync::Arc::new(Ran::default());
+    let feed = RanFeed::reading(std::sync::Arc::clone(&ran), SH, scripted_names);
+    set_image(shell(FORK));
+    let heard = || {
+        ran.within(Some(Window { from: 0, to: None }))
+            .into_iter()
+            .filter(|e| e.pgid == FORK)
+            .count()
+    };
+    let image =
+        crate::spawn::sampled_edge_image(scripted_read, |_| None, &feed, FORK, 0).expect("an edge");
+    assert_eq!(image.pgid, FORK, "the edge reads its image");
+    assert_eq!(heard(), 0, "a fork that has not exec'd is heard as nothing");
+    let _ = crate::spawn::sampled_edge_image(scripted_read, |_| Some(6), &feed, FORK, 0);
+    assert_eq!(
+        heard(),
+        0,
+        "another birth's affirmative exec flag cannot name this fork"
+    );
+    set_image(tool(FORK));
+    let _ = crate::spawn::sampled_edge_image(scripted_read, |_| Some(7), &feed, FORK, 0);
+    assert_eq!(heard(), 1, "once it has exec'd, its image");
 }
 
 /// H2 PLACEMENT: the PTY's unread bytes are read once a drain has heard an exec, before the
@@ -549,4 +584,102 @@ fn an_exec_is_placed_by_the_queue_read_while_its_group_holds_the_foreground() {
         Some(During::Window),
         "no queue to read: by its stamp"
     );
+}
+
+/// What a gather is wired with, and what `status` then says (unit L2): a process watch hears
+/// alone; with no watch and no sampler nothing hears; with the sampler, the proc connector's
+/// route stands beside it where the seam opens one (`exec_watch=sampler` while its listener
+/// proves itself or after it closed, `exec_watch=connector` once it is live, its reason word
+/// beside), and the seam says why none does. NEGATIVE CONTROLS (scratch, `L2_NC=watchroute`,
+/// `L2_NC=claim`): a route made beside a process watch fails "a watch hears alone"; `connector`
+/// claimed before the listener is live fails "proving".
+#[test]
+fn a_gather_is_wired_with_one_watch_and_status_names_how_the_connector_stands() {
+    use super::{ConnectorSeam, wire_connector};
+    use aterm_uds::proc_connector::{Closed, Route, State};
+    static SCRIPTS: Mutex<Vec<aterm_uds::proc_connector::RouteScript>> = Mutex::new(Vec::new());
+    fn open(shell: i32) -> Option<Route> {
+        let (route, script) = Route::scripted(shell)?;
+        script.set_state(State::Proving);
+        SCRIPTS.lock().unwrap().push(script);
+        Some(route)
+    }
+    let words = |(_, w): &(Option<Route>, crate::command_ran::Watching)| w.words();
+    let watched = wire_connector(ConnectorSeam::Open(open), true, true, 90_000);
+    assert!(watched.0.is_none(), "a watch hears alone");
+    assert_eq!(words(&watched), ("kqueue", "-"));
+    assert_eq!(
+        words(&wire_connector(
+            ConnectorSeam::Open(open),
+            false,
+            false,
+            90_000
+        )),
+        ("none", "-")
+    );
+    for (seam, why) in [
+        (ConnectorSeam::NotHere, "-"),
+        (ConnectorSeam::Off, "off"),
+        (ConnectorSeam::Open(|_| None), "no-route"),
+    ] {
+        let wired = wire_connector(seam, false, true, 90_000);
+        assert!(wired.0.is_none());
+        assert_eq!(words(&wired), ("sampler", why));
+    }
+    let routed = wire_connector(ConnectorSeam::Open(open), false, true, 90_001);
+    assert_eq!(routed.0.as_ref().map(Route::shell), Some(90_001));
+    assert_eq!(words(&routed), ("sampler", "proving"));
+    let script = SCRIPTS.lock().unwrap().pop().expect("its script");
+    script.set_state(State::Live { masked: true });
+    assert_eq!(words(&routed), ("connector", "live"));
+    script.set_state(State::Live { masked: false });
+    assert_eq!(words(&routed), ("connector", "live-unmasked"));
+    script.set_state(State::Closed(Closed::NoAck));
+    assert_eq!(words(&routed), ("sampler", "no-ack"));
+}
+
+/// `help status` names exactly the words `exec_watch=` and `exec_watch_why=` can print: each
+/// is generated from its producer's enum ([`crate::command_ran::ExecWatch::ALL`],
+/// [`crate::command_ran::Connector::words`], which takes the listener's from
+/// [`aterm_uds::proc_connector::State::ALL`]), so no word reaches `status` unnamed (unit L2).
+/// NEGATIVE CONTROL (scratch, `L2_NC=help`): a word aterm writes that the help leaves out fails
+/// it.
+#[test]
+fn help_status_names_exactly_the_exec_watch_words_aterm_writes() {
+    use std::collections::BTreeSet;
+    let help = aterm_types::control_verbs::spec("status")
+        .expect("the status verb")
+        .help_line();
+    let named = |key: &str| -> BTreeSet<String> {
+        let lists: Vec<&str> = help.split(&format!(" {key}=<")).skip(1).collect();
+        assert_eq!(lists.len(), 1, "help status names one {key}= vocabulary");
+        lists[0]
+            .split_once('>')
+            .expect("the vocabulary closes")
+            .0
+            .split('|')
+            .map(str::to_string)
+            .collect()
+    };
+    for (key, written) in [
+        (
+            "exec_watch",
+            crate::command_ran::ExecWatch::ALL
+                .iter()
+                .map(|w| w.word().to_string())
+                .collect::<BTreeSet<_>>(),
+        ),
+        (
+            "exec_watch_why",
+            crate::command_ran::Connector::words()
+                .map(str::to_string)
+                .collect(),
+        ),
+    ] {
+        let named = named(key);
+        assert_eq!(
+            named, written,
+            "help status {key}= against what aterm writes"
+        );
+    }
 }

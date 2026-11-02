@@ -734,14 +734,15 @@ fn the_owners_open_settings_brings_the_panel() {
 
 /// `aterm ctl devtools hand-over now`, the permission walk with Developer Tools first, never
 /// takes the window's own Full Disk Access panel away (nor, with it, the folder warm-up that
-/// follows a Not now): its page waits for that panel to go, for at most the ten minutes a panel
-/// stays up.
+/// follows a Not now): its page waits for that panel to go, for at most ten minutes of the
+/// person's time at the Mac.
 #[test]
 fn a_control_verbs_now_walk_waits_behind_full_disk_access() {
     use crate::devtools_helper::{Page, test_arms};
     use crate::permission_walk::{Started, Subject};
     let now = Instant::now();
     let mut app = launched(now);
+    app.user_input_recent = |_| true;
     app.devtools_helper.note_reading(
         test_arms::reading(
             aterm_containment::DevToolGrant::NotGranted,
@@ -763,7 +764,7 @@ fn a_control_verbs_now_walk_waits_behind_full_disk_access() {
     app.drive_permission_walk(asked + crate::devtools_helper::PANEL_FOR);
     assert!(
         !app.permission_walk.active(),
-        "a page held off for ten minutes ends the walk"
+        "a page held off for ten minutes of the person's time ends the walk"
     );
     assert_eq!(
         app.devtools_helper.panel().map(|panel| panel.page()),
@@ -1386,6 +1387,17 @@ fn page_up(_app: &App) -> crate::debugger_access::StepMoment {
     }
 }
 
+/// [`page_up`] as the live moment reads it to a person (`App::debugger_step_moment`, through
+/// `App::system_state_front_with_a_person`): the page counts only with a person at this Mac's
+/// screen ([`App::person_at_this_screen`]).
+fn page_up_to_a_person(app: &App) -> crate::debugger_access::StepMoment {
+    let moment = page_up(app);
+    crate::debugger_access::StepMoment {
+        page: moment.page.filter(|_| app.person_at_this_screen()),
+        ..moment
+    }
+}
+
 /// The same page, with no frame presented since the last look.
 fn page_still(_app: &App) -> crate::debugger_access::StepMoment {
     crate::debugger_access::StepMoment {
@@ -1462,11 +1474,11 @@ fn plan(revision: u64) -> Option<crate::InitialSetupPermissionPolicy> {
     })
 }
 
-/// The window's own admission of setup revision `revision`, as the page's automatic answer to the
-/// startup offer takes it.
+/// The person's explicit admission of setup revision `revision`.
 fn window_admits(app: &mut App, revision: u64) {
     app.hold_initial_setup_permissions();
-    app.note_system_state_apply(crate::system_state::Admission::Automatic);
+    app.note_system_state_touch();
+    app.note_system_state_apply(crate::system_state::Admission::Person);
     app.accepted_initial_setup_apply();
     app.observe_initial_setup_permissions(plan(revision));
     assert!(app.admitted_access().is_some(), "the standing yes");
@@ -1499,14 +1511,16 @@ fn window_resumes(app: &mut App, revision: u64) -> bool {
         app.access_revision().is_some(),
         "the run's access steps go on while the offer waits"
     );
-    app.native_runtime.tick_system_state(true, false, &[]);
+    app.native_runtime.tick_system_state();
     app.drain_system_state_actions();
     let Ok(mut answer) = receive.try_recv() else {
         return false;
     };
     assert_eq!(
         answer.decision,
-        WorkstationSetupDecision::Begin(Plan::from(Selection::all())),
+        WorkstationSetupDecision::Begin(crate::workstation_setup::automatic_plan_for_test(
+            Plan::from(Selection::all())
+        )),
         "the plan as offered"
     );
     assert!(!answer.chosen && !answer.vault_typed && answer.changed.is_none());
@@ -1544,6 +1558,8 @@ fn queue_debugger_step(app: &mut App, dir: &std::path::Path, host: fn() -> Optio
         DebuggerStepQueue::queued_for_test(host).recording_in(Some(dir.to_path_buf()));
     app.consent_gestures =
         crate::native_settings::ConsentGestures::for_test_with(alert_says_yes, worker_started);
+    // The person is at the Mac, its keyboard at rest: macOS's password dialog waits for them.
+    app.user_input_recent = |_| true;
 }
 
 /// A new Mac where both launch pages are over (Full Disk Access not offered, the
@@ -2151,7 +2167,7 @@ fn a_new_revision_while_the_change_runs_takes_its_outcome() {
 fn the_debugger_step_waits_behind_every_page_panel_and_moment() {
     use crate::consent_launch::FdaLaunch;
     use crate::devtools_helper::Origin;
-    let blockers: [AppCase; 11] = [
+    let blockers: [AppCase; 13] = [
         ("full disk access undecided", |app| {
             app.consent_launch.set_fda(FdaLaunch::Undecided);
         }),
@@ -2186,6 +2202,10 @@ fn the_debugger_step_waits_behind_every_page_panel_and_moment() {
         ("another macOS dialog up", |_| {}),
         ("the Local Network step still to run", |_| {}),
         ("System Settings asking something", |_| {}),
+        ("nobody at the Mac for a minute", |app| {
+            app.user_input_recent = |within| within >= Duration::from_secs(61);
+        }),
+        ("the screen locked", |app| app.screen_away = || true),
     ];
     for (name, block) in blockers {
         let root = crate::test_scratch::outlived_dir("aterm-access-");
@@ -2197,6 +2217,7 @@ fn the_debugger_step_waits_behind_every_page_panel_and_moment() {
             "another macOS dialog up" => other_dialog,
             "the Local Network step still to run" => behind_local_network,
             "System Settings asking something" => settings_asking,
+            "nobody at the Mac for a minute" | "the screen locked" => page_up_to_a_person,
             _ => page_up,
         };
         let before = workers();
@@ -2225,6 +2246,91 @@ fn the_debugger_step_waits_behind_every_page_panel_and_moment() {
     two_looks(&mut app, &mut t);
     assert_eq!(workers(), before + 1, "unblocked: started");
     assert!(debugger_alerts().is_empty());
+}
+
+/// macOS's administrator password dialog (SamplingTools', which never times out) comes only to a
+/// person at the Mac with its keyboard at rest: not an hour after the last touch of keyboard or
+/// pointer, nor with its screen locked (the step's moment opens only to a person:
+/// [`page_up_to_a_person`]), nor while keys are typed into aterm (`StepWait::KeysTyped`). Once
+/// the person is back and the keys rest, the page names the dialog and the change starts.
+#[test]
+fn the_debugger_step_waits_for_a_person_and_a_key_rest() {
+    let held: [AppCase; 3] = [
+        ("an hour since the last touch", |app| {
+            app.user_input_recent = |within| within >= Duration::from_secs(3600);
+        }),
+        ("the screen locked", |app| app.screen_away = || true),
+        ("keys typed into aterm", |_| {}),
+    ];
+    for (name, hold) in held {
+        let root = crate::test_scratch::outlived_dir("aterm-access-");
+        let mut t = Instant::now();
+        let mut app = ready_to_start(root.path());
+        hold(&mut app);
+        let before = workers();
+        for _ in 0..3 {
+            let at = later(&mut t);
+            if name == "keys typed into aterm" {
+                app.last_keystroke_at = Some(at);
+            }
+            app.look_for_debugger_moment(at, page_up_to_a_person);
+            assert_ne!(
+                app.system_state_access_step(),
+                Some(aterm_types::macos_setup::Access::Debugger),
+                "{name}: the page does not name macOS's dialog"
+            );
+        }
+        assert_eq!(
+            workers(),
+            before,
+            "{name}: macOS's administrator dialog started"
+        );
+        assert!(app.debugger_launch.queued(), "{name}: still to come");
+        assert!(
+            !crate::debugger_access::read_asked(&root.path().join("aterm.toml"), "READY-MAC"),
+            "{name}: nothing recorded"
+        );
+        // Back at the Mac, the keys at rest.
+        app.user_input_recent = |_| true;
+        app.screen_away = || false;
+        t += crate::devtools_helper::QUIET_FOR;
+        two_looks(&mut app, &mut t);
+        assert_eq!(
+            workers(),
+            before + 1,
+            "{name}: once the person is back, it starts"
+        );
+    }
+}
+
+/// A key typed into aterm (a vault password, a first command) between the look that names
+/// macOS's administrator dialog and the one that starts the change holds the change: the step
+/// waits out the key rest again, so no key lands in macOS's password field.
+#[test]
+fn the_debugger_step_waits_out_keys_being_typed() {
+    let root = crate::test_scratch::outlived_dir("aterm-access-");
+    let mut t = Instant::now();
+    let mut app = ready_to_start(root.path());
+    let before = workers();
+    app.look_for_debugger_moment(later(&mut t), page_up);
+    assert_eq!(
+        app.system_state_access_step(),
+        Some(aterm_types::macos_setup::Access::Debugger),
+        "the page names macOS's dialog"
+    );
+    for _ in 0..3 {
+        let at = later(&mut t);
+        app.last_keystroke_at = Some(at);
+        app.look_for_debugger_moment(at, page_up);
+        assert_eq!(
+            workers(),
+            before,
+            "a key typed into aterm this instant: macOS's administrator dialog started"
+        );
+    }
+    t += crate::devtools_helper::QUIET_FOR;
+    two_looks(&mut app, &mut t);
+    assert_eq!(workers(), before + 1, "the keys at rest: it starts");
 }
 
 /// The owner's own Open Settings for Full Disk Access, over a grant that reads held,
@@ -3671,11 +3777,7 @@ fn rule_read_held(
     rule_reads_off(gate)
 }
 
-/// A launch the person started that resumes a run an earlier process admitted (Quit & Reopen's
-/// relaunch mid-setup) parks the debugger's step for want of this window's own admission, until
-/// its page answers the offer of the admitted plan by itself: then the step is admitted and asks,
-/// with nobody's press. Negative control: an offer of the plan nobody answers (no person at this
-/// Mac) leaves it parked.
+/// Automatic resume leaves permission acquisition deferred; an explicit choice authorizes it.
 #[test]
 fn a_resumed_launchs_own_answer_admits_the_debugger_step() {
     use aterm_types::macos_setup::AccessOutcome;
@@ -3700,9 +3802,16 @@ fn a_resumed_launchs_own_answer_admits_the_debugger_step() {
     assert_eq!(workers(), 0);
 
     assert!(window_resumes(&mut app, REVISION), "the page answered");
-    let yes = app.admitted_access().expect("the window's own admission");
+    assert!(
+        app.admitted_access().is_none(),
+        "automatic resume cannot acquire permission"
+    );
+    two_looks(&mut app, &mut t);
+    assert_eq!(workers(), 0);
+    window_admits(&mut app, REVISION);
+    let yes = app.admitted_access().expect("explicit permission choice");
     assert_eq!(yes.revision(), REVISION);
-    assert_eq!(yes.by(), crate::workstation_setup::AdmittedBy::Window);
+    assert_eq!(yes.by(), crate::workstation_setup::AdmittedBy::Person);
     assert!(
         app.debugger_launch.queued() && !app.debugger_launch.parked(),
         "unparked"
@@ -3716,23 +3825,27 @@ fn a_resumed_launchs_own_answer_admits_the_debugger_step() {
     );
     assert!(debugger_alerts().is_empty());
 
-    // Nobody at this Mac: the offer waits unanswered, and the step stays parked.
+    // Nobody at this Mac: the page answers at once, and the step waits for a person at its live
+    // moment, so nothing more starts.
     let root = crate::test_scratch::outlived_dir("aterm-access-");
     let mut app = new_mac();
     queue_debugger_step(&mut app, root.path(), || Some("AWAY-MAC"));
+    app.user_input_recent = |within| within >= Duration::from_secs(10 * 60);
     debugger_reads_off(&mut app);
-    app.observe_initial_setup_permissions(plan(REVISION));
-    let (send, receive) = std::sync::mpsc::channel();
-    app.offer_system_state(crate::workstation_setup::Request::resume(
-        aterm_types::macos_setup::Selection::all(),
-        send,
-    ));
-    app.native_runtime.tick_system_state(false, false, &[]);
-    app.drain_system_state_actions();
-    assert!(receive.try_recv().is_err(), "unanswered");
-    assert!(app.admitted_access().is_none());
-    two_looks(&mut app, &mut t);
-    assert!(app.debugger_launch.parked());
+    assert!(
+        window_resumes(&mut app, REVISION),
+        "answered with nobody here"
+    );
+    assert!(
+        app.admitted_access().is_none(),
+        "the window's own admission"
+    );
+    assert!(
+        app.debugger_step_moment().page.is_none(),
+        "nobody at this Mac"
+    );
+    app.look_for_debugger_moment(later(&mut t), App::debugger_step_moment);
+    app.look_for_debugger_moment(later(&mut t), App::debugger_step_moment);
     assert_eq!(workers(), 1, "nothing more started");
 }
 
@@ -3745,11 +3858,7 @@ fn page_up_after_local_network(app: &App) -> crate::debugger_access::StepMoment 
     }
 }
 
-/// A relaunch that resumes an admitted run before its Local Network step ran (the step waiting
-/// for its quiet moment when Quit & Reopen came), on a Mac whose Full Disk Access reads granted
-/// and whose Developer Tools list holds aterm: the window's own answer to the resumed plan admits
-/// the debugger's step, which still waits for the Local Network step, first in the run, and asks
-/// only once that step ran.
+/// After explicit permission admission, Local Network still precedes the debugger step.
 #[test]
 fn a_resumed_admission_waits_for_the_local_network_step() {
     use crate::debugger_access::StepWait;
@@ -3770,7 +3879,8 @@ fn a_resumed_admission_waits_for_the_local_network_step() {
     debugger_reads_off(&mut app);
     let before = workers();
     assert!(window_resumes(&mut app, REVISION), "the page answered");
-    assert!(app.admitted_access().is_some());
+    assert!(app.admitted_access().is_none());
+    window_admits(&mut app, REVISION);
     assert!(
         app.local_network_pending(),
         "the Local Network step is to come"
@@ -3798,9 +3908,7 @@ fn a_resumed_admission_waits_for_the_local_network_step() {
     );
 }
 
-/// The debugger question is asked once per Mac: a launch that resumes a run after the debugger
-/// asked (its dialog answered, cancelled or turned off) is admitted by its page's own answer and
-/// asks nothing.
+/// A resumed process preserves the recorded result without asking again.
 #[test]
 fn a_resumed_launch_on_a_mac_that_was_asked_asks_nothing() {
     use aterm_containment::consent::DebuggerChange;
@@ -3826,7 +3934,8 @@ fn a_resumed_launch_on_a_mac_that_was_asked_asks_nothing() {
     queue_debugger_step(&mut next, root.path(), || Some("READY-MAC"));
     debugger_reads_off(&mut next);
     assert!(window_resumes(&mut next, REVISION + 1), "the page answered");
-    assert!(next.admitted_access().is_some());
+    assert!(next.admitted_access().is_none());
+    window_admits(&mut next, REVISION + 1);
     two_looks(&mut next, &mut t);
     assert_eq!(workers(), 1, "no second dialog on this Mac");
     assert!(!next.debugger_launch.queued() && !next.debugger_launch.parked());
@@ -3858,6 +3967,7 @@ fn a_resumed_launch_on_a_mac_that_was_asked_asks_nothing() {
     queue_debugger_step(&mut again, root.path(), || Some("READY-MAC"));
     debugger_reads_off(&mut again);
     assert!(window_resumes(&mut again, REVISION), "the page answered");
+    window_admits(&mut again, REVISION);
     two_looks(&mut again, &mut t);
     assert_eq!(workers(), 2, "no second dialog on this Mac");
     assert!(!again.debugger_launch.queued());

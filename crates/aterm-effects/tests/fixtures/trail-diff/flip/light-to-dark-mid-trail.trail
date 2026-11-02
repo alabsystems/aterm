@@ -5,6 +5,7 @@
 # #2b2d33 #f6f7f9) and the configured colours switched to Default's (#d0d0d0 #111318) half way, as
 # a config reload or an OS appearance flip lays them; main's state must be equal from the flip on.
 
+scale 2
 grid 24 100
 style rainbow kitty
 hz 60

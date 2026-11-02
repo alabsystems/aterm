@@ -513,3 +513,36 @@ fn the_layers_live_in_aterms_cache_beside_the_tooling_that_holds_base() {
         Path::new("/Users//someone/Library/Caches/aterm/vz.noindex/live/aterm-linux.img")
     );
 }
+
+#[test]
+fn symlinked_disks_and_partials_are_refused_or_replaced_without_touching_targets() {
+    let s = scratch();
+    let host = Fake::new();
+    let outside = s._dir.path().join("outside-target");
+    std::fs::write(&outside, b"untouched").unwrap();
+    std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    // A symlinked partial is refused by `seal` without modifying `outside`'s mode.
+    let bake = match s.layers.prepare(&host, &s.base, SEED, &mut |_| {}).unwrap() {
+        Prepared::Bake(bake) => bake,
+        other => panic!("{other:?}"),
+    };
+    let partial_path = bake.path().to_path_buf();
+    std::fs::remove_file(&partial_path).unwrap();
+    std::os::unix::fs::symlink(&outside, &partial_path).unwrap();
+    assert!(bake.seal().is_err());
+    assert_eq!(mode(&outside), 0o600, "symlink target mode untouched");
+
+    // Next `prepare` removes the symlinked partial and begins a clean bake.
+    let bake = match s.layers.prepare(&host, &s.base, SEED, &mut |_| {}).unwrap() {
+        Prepared::Bake(bake) => bake,
+        other => panic!("{other:?}"),
+    };
+    assert!(
+        std::fs::symlink_metadata(bake.path()).unwrap().is_file(),
+        "symlink partial replaced by regular file"
+    );
+    let sealed = bake.seal().unwrap();
+    assert!(std::fs::symlink_metadata(&sealed).unwrap().is_file());
+    assert_eq!(std::fs::read(&outside).unwrap(), b"untouched");
+}

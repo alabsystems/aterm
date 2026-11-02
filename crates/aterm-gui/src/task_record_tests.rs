@@ -134,6 +134,7 @@ fn a_mark_parses_every_fact_and_names_what_it_refuses() {
             state: TaskState::Done,
             from: Some(SID.to_string()),
             why: Some("landed"),
+            checked: None,
             exit: Some(0),
             result_bytes: 12,
             result_path: Some(path),
@@ -285,6 +286,7 @@ fn the_carried_row_round_trips_and_a_bad_row_is_none() {
         state: TaskState::Exited,
         from: SID.to_string(),
         why: Some("exit"),
+        checked: None,
         exit: Some(-2),
         result_bytes: 9,
         result_path: Some(tasks().join("r 1.txt")),
@@ -415,6 +417,7 @@ fn the_reply_event_and_status_spellings() {
         state: TaskState::Done,
         from: "ctl".into(),
         why: Some("landed"),
+        checked: None,
         exit: None,
         result_bytes: 120,
         result_path: None,
@@ -829,6 +832,35 @@ fn the_task_verb_reads_marks_and_refuses_an_edge_the_mark() {
         ),
         "{read}"
     );
+}
+
+/// ONLY ATERM'S OWN LOOP WRITES `checked=` (the post-landing review, 2026-11-01): a hand mark
+/// from the owner socket (the instance token, [`Principal::Instance`]) naming it is refused and
+/// marks nothing; the same mark from the harness's connection ([`Principal::Harness`]) keeps it.
+/// CONTROL: the hand mark without `checked=` marks done.
+#[test]
+fn only_the_harness_writes_checked_and_a_hand_mark_naming_it_is_refused() {
+    use crate::control::{Principal, ServingPrincipal};
+    let handle = crate::session_store::test_handle(7);
+    let ctx = &handle.ctx;
+    let on = "3f9a1c2e4b7d@origin/main";
+    let hand = format!("mark done why=landed checked={on}");
+    {
+        let _hand = ServingPrincipal::enter(Principal::Instance);
+        assert_eq!(cmd_task(ctx, 7, Scope::Owner, &hand), CHECKED_BY_HAND);
+        assert!(
+            ctx.timeline.lock().unwrap().task().is_none(),
+            "the refused mark marked nothing"
+        );
+        let plain = cmd_task(ctx, 7, Scope::Owner, "mark done why=landed");
+        assert!(
+            plain.contains(" state=done ") && !plain.contains("checked="),
+            "CONTROL: {plain}"
+        );
+    }
+    let _harness = ServingPrincipal::enter(Principal::Harness);
+    let checked = cmd_task(ctx, 7, Scope::Owner, &hand);
+    assert!(checked.contains(&format!(" checked={on}")), "{checked}");
 }
 
 #[test]
@@ -1475,6 +1507,7 @@ fn the_carry_holds_the_fact_word_and_its_rev_and_reads_them_leniently() {
         state: TaskState::Working,
         from: "ctl".into(),
         why: None,
+        checked: None,
         exit: None,
         result_bytes: 0,
         result_path: None,
@@ -1879,4 +1912,184 @@ fn a_task_fact_clear_refuses_mode_withdrawn_while_fenced() {
 fn a_task_fact_write_keeps_live_prompt_authority_after_the_fence() {
     task_fact_after_fenced_mode_change(true, false);
     task_fact_after_fenced_mode_change(true, true);
+}
+
+/// A DONE MARKS WHAT ATERM CHECKED (§14.9, slice 9c): `task mark done checked=<word>` keeps the
+/// word on the record, which `task` (its wire fields), a seamless update's carry row and an
+/// `await task` row say after `why=`, and a carry row reads it back; the next mark (someone
+/// else's turn reopening it) clears it. Each receipt's word is taken (`<head>@<ref>` and every
+/// other leg's), and nothing else: not on a mark that is not done, not a head that is no 12
+/// lowercase digits, not the on-main leg's bare word; a carry row holding a word no mark takes is
+/// no row. NEGATIVE CONTROL (run by hand): `push_optional` without the word fails the round trip.
+#[test]
+fn a_done_marks_what_aterm_checked_and_the_record_carries_it() {
+    let t0 = Instant::now();
+    let on = "3f9a1c2e4b7d@origin/main";
+    let mark = parse(&format!("done why=landed checked={on} result_bytes=12")).expect("a mark");
+    assert_eq!(mark.checked.as_deref(), Some(on));
+    let working = TaskMark::new(TaskState::Working)
+        .apply(None, false, t0, 9_000)
+        .0;
+    let (record, moved) = mark.apply(Some(&working), false, t0, 10_000);
+    assert!(moved);
+    assert_eq!(record.checked.as_deref(), Some(on));
+    let wire = record.wire_fields();
+    assert!(
+        wire.contains(&format!(" why=landed checked={on}")),
+        "{wire}"
+    );
+    let row = record.carry_row();
+    assert!(row.contains(&format!(" why=landed checked={on}")), "{row}");
+    let back = TaskRecord::from_carry_row(&row, Some(&tasks()), t0, 10_000).expect("reads");
+    assert_eq!(back.carry_row(), row);
+    assert_eq!(back.checked.as_deref(), Some(on));
+    assert!(
+        await_row(SID, Some(&record), "idle", "-", "-", false).contains(&format!(" checked={on}")),
+        "{}",
+        await_row(SID, Some(&record), "idle", "-", "-", false)
+    );
+    let (again, _) = mark.apply(Some(&record), false, t0, 11_000);
+    assert_eq!(again.rev, record.rev, "the same mark again moves nothing");
+    let (reopened, _) =
+        parse("working why=turn")
+            .expect("a reopening")
+            .apply(Some(&record), false, t0, 12_000);
+    assert_eq!(reopened.checked, None, "{reopened:?}");
+    assert!(!reopened.wire_fields().contains("checked="));
+    for word in [
+        "pushed",
+        "no-remote",
+        "no-repo",
+        "gone",
+        "0c4d2e9f1a7b@up%20stream/main",
+    ] {
+        assert_eq!(
+            parse(&format!("done checked={word}")).map(|m| m.checked),
+            Ok(Some(word.to_string())),
+            "{word}"
+        );
+    }
+    for bad in [
+        "on-main",
+        "landed",
+        "3F9A1C2E4B7D@origin/main",
+        "3f9a1c2e4b7@origin/main",
+        "3f9a1c2e4b7d@",
+        "3f9a1c2e4b7dorigin/main",
+    ] {
+        assert!(parse(&format!("done checked={bad}")).is_err(), "{bad}");
+        assert_eq!(
+            TaskRecord::from_carry_row(&row.replace(on, bad), Some(&tasks()), t0, 10_000),
+            None,
+            "{bad}"
+        );
+    }
+    assert_eq!(
+        parse("working checked=no-repo").map(|m| m.checked),
+        Err("ERR task mark: checked= marks a done task\n".to_string())
+    );
+}
+
+#[test]
+fn unicode_receipts_mark_done_and_roundtrip_through_records_and_result_sidecars() {
+    use aterm_agent::harness::acts::{LandReceipt, ReceiptLeg};
+    use aterm_agent::harness::land_receipt::{CHECKED_WORD_BYTES, HEAD_DIGITS};
+    use aterm_agent::harness::result::{self, DoneBy};
+
+    let scratch = aterm_tempfile::tempdir().expect("private data-only result fixture");
+    let now = Instant::now();
+    for (index, reference) in [
+        format!("origin/{}", "日本語".repeat(5)),
+        format!("origin/{}/{}", "🚀".repeat(32), "🚀".repeat(32)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let receipt = LandReceipt {
+            head: "3f9a1c2e4b7d".to_string(),
+            main_ref: reference.clone(),
+            leg: ReceiptLeg::OnMain,
+            ..LandReceipt::default()
+        };
+        let word = receipt.checked_word();
+        assert!(word.len() > 128 && word.len() <= CHECKED_WORD_BYTES);
+        assert_eq!(
+            aterm_codec::pct::decode(word.split_once('@').unwrap().1),
+            reference
+        );
+        let snapshot = result::snapshot_screen(
+            scratch.path(),
+            &format!("s-ab12-{}", index + 1),
+            "claude",
+            "Nothing left: the Unicode branch is landed.",
+            DoneBy::Turn,
+        )
+        .expect("snapshot");
+        let mark = TaskMark::parse(
+            &format!(
+                "done why=landed checked={word} result_bytes={} result_path={}",
+                snapshot.bytes,
+                aterm_codec::pct::encode(&snapshot.path.to_string_lossy()),
+            ),
+            Some(scratch.path()),
+        )
+        .expect("the receipt's token is a valid done mark");
+        let working = TaskMark::new(TaskState::Working)
+            .apply(None, false, now, 9_000)
+            .0;
+        let (record, changed) = mark.apply(Some(&working), false, now, 10_000);
+        assert!(changed && record.state == TaskState::Done);
+        assert_eq!(record.checked.as_deref(), Some(word.as_str()));
+        let row = record.carry_row();
+        let restored = TaskRecord::from_carry_row(&row, Some(scratch.path()), now, 10_000)
+            .expect("the same Unicode token survives record restoration");
+        assert_eq!(restored.checked, record.checked);
+        assert!(
+            await_row(SID, Some(&record), "idle", "-", "-", false)
+                .contains(&format!(" checked={word}"))
+        );
+
+        result::note_checked(&snapshot.path, &word).expect("the sidecar takes the same token");
+        assert_eq!(
+            result::checked_of(&snapshot.path).as_deref(),
+            Some(word.as_str())
+        );
+        let answer = result::answer(&snapshot.path, false);
+        assert!(
+            answer
+                .lines()
+                .next()
+                .is_some_and(|header| header.starts_with("OK ")
+                    && header.ends_with(&format!(" checked={word}"))),
+            "{answer}"
+        );
+        let sidecar = std::fs::read(result::sidecar_of(&snapshot.path)).expect("sidecar");
+        for invalid in [
+            "3f9a1c2e4b7d@%".to_string(),
+            "3f9a1c2e4b7d@%FF".to_string(),
+            "3f9a1c2e4b7d@%00".to_string(),
+            format!(
+                "3f9a1c2e4b7d@{}",
+                "x".repeat(CHECKED_WORD_BYTES - HEAD_DIGITS)
+            ),
+        ] {
+            assert!(
+                TaskMark::parse(&format!("done checked={invalid}"), Some(scratch.path())).is_err()
+            );
+            assert!(
+                TaskRecord::from_carry_row(
+                    &row.replace(&word, &invalid),
+                    Some(scratch.path()),
+                    now,
+                    10_000
+                )
+                .is_none()
+            );
+            assert!(result::note_checked(&snapshot.path, &invalid).is_err());
+        }
+        assert_eq!(
+            std::fs::read(result::sidecar_of(&snapshot.path)).unwrap(),
+            sidecar
+        );
+    }
 }

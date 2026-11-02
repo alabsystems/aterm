@@ -74,12 +74,12 @@ pub struct Probed {
 /// The write's or a read's OS error, or setting the terminal raw again after a SIGCONT.
 pub fn probe<T: Tty + ?Sized>(tty: &mut T, decoder: &mut Decoder) -> io::Result<Probed> {
     tty.write_all(QUERY)?;
-    let deadline = tty.now() + PROBE_TIMEOUT;
+    let deadline = tty.now().checked_add(PROBE_TIMEOUT);
     let mut probed = Probed::default();
     let mut done = false;
     let mut buf = [0u8; 4096];
     while !done {
-        match tty.read(&mut buf, Some(deadline))? {
+        match tty.read(&mut buf, deadline)? {
             Readiness::Bytes(n) => {
                 let read = buf.get(..n).unwrap_or(&buf);
                 for event in decoder.feed(read, tty.now()) {
@@ -88,7 +88,9 @@ pub fn probe<T: Tty + ?Sized>(tty: &mut T, decoder: &mut Decoder) -> io::Result<
                         other => probed.events.push(other),
                     }
                 }
-                done |= tty.now() >= deadline;
+                if let Some(deadline) = deadline {
+                    done |= tty.now() >= deadline;
+                }
             }
             Readiness::Signal => probed.signals = probed.signals.union(tty.take_signals()?),
             Readiness::Timeout | Readiness::Closed => done = true,

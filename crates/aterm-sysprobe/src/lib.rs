@@ -85,6 +85,19 @@ pub const PATH_CAP: usize = 4096;
 /// Every file read (`/proc`) stops here: 4 KiB.
 pub const READ_CAP: usize = 4096;
 
+pub(crate) fn parse_uint<T: std::str::FromStr>(s: &str) -> Option<T> {
+    (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| s.parse().ok())
+        .flatten()
+}
+
+pub(crate) fn parse_int<T: std::str::FromStr>(s: &str) -> Option<T> {
+    let digits = s.strip_prefix('-').unwrap_or(s);
+    (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| s.parse().ok())
+        .flatten()
+}
+
 /// The kernel's memory-pressure level (macOS `kern.memorystatus_vm_pressure_level`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum MemoryLevel {

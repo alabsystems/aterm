@@ -20,34 +20,76 @@ pub const PERSON_WAIT: Duration = Duration::from_secs(60);
 
 const LOOK: Duration = Duration::from_secs(5);
 
-struct Row<'a> {
+/// One process of the watch's [`table`].
+#[derive(Debug, PartialEq, Eq)]
+struct Row {
     pid: i32,
     ppid: i32,
-    args: &'a str,
+    /// Its argument words joined by spaces; empty where they were not read.
+    args: String,
 }
 
-fn rows(listing: &str) -> Vec<Row<'_>> {
-    listing
-        .lines()
-        .filter_map(|line| {
-            let mut rest = line.trim_start();
-            let mut num = || -> Option<i32> {
-                let end = rest.find(char::is_whitespace)?;
-                let n = rest[..end].parse().ok()?;
-                rest = rest[end..].trim_start();
-                Some(n)
-            };
-            let (pid, ppid) = (num()?, num()?);
-            Some(Row {
-                pid,
-                ppid,
-                args: rest.trim_end(),
-            })
+/// The process table one look reads, in this process: every process's pid and parent
+/// ([`crate::interrupt::listing`]), and the arguments ([`args_of`]) of only the processes below
+/// `root` and those in `also`. No program runs and no other process's arguments are read: a
+/// `ps` that reads every process's hung by the thousand in a program-check wedge
+/// (`docs/DESIGN-leftover-processes-2026-10-16.md` M29). `None` when the table cannot be read.
+fn table(root: i32, also: &[i32]) -> Option<Vec<Row>> {
+    let procs = crate::interrupt::listing()?;
+    Some(table_of(
+        procs.into_iter().map(|p| (p.pid, p.parent)),
+        root,
+        also,
+        args_of,
+    ))
+}
+
+/// [`table`] over `procs`' `(pid, parent)` pairs, reading the arguments of the rows below
+/// `root` and in `also` with `read`, and of no other row.
+fn table_of(
+    procs: impl IntoIterator<Item = (i32, i32)>,
+    root: i32,
+    also: &[i32],
+    mut read: impl FnMut(i32) -> String,
+) -> Vec<Row> {
+    let mut rows: Vec<Row> = procs
+        .into_iter()
+        .map(|(pid, ppid)| Row {
+            pid,
+            ppid,
+            args: String::new(),
         })
-        .collect()
+        .collect();
+    let tree = below(&rows, root);
+    for row in &mut rows {
+        if tree.contains(&row.pid) || also.contains(&row.pid) {
+            row.args = read(row.pid);
+        }
+    }
+    rows
 }
 
-fn below(rows: &[Row<'_>], top: i32) -> BTreeSet<i32> {
+/// `pid`'s argument words joined by spaces, read in this process only once its one thread has
+/// run ([`aterm_uds::process::thread_ran`]: a program macOS's program check still holds can hang
+/// the read) and only while the same process holds the pid across the read
+/// ([`aterm_uds::process::read_process_argv`]). Empty when unread: another user's process, one
+/// not yet started, one gone, a zombie. No read is atomic with an exec: one into a held program
+/// after the check can still hang the argument read that follows, which nothing here bounds
+/// (§6.4 of `docs/DESIGN-leftover-processes-2026-10-16.md`).
+fn args_of(pid: i32) -> String {
+    if aterm_uds::process::thread_ran(pid) != Some(true) {
+        return String::new();
+    }
+    aterm_uds::process::read_process_argv(pid).map_or_else(String::new, |words| {
+        words
+            .iter()
+            .map(|word| word.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ")
+    })
+}
+
+fn below(rows: &[Row], top: i32) -> BTreeSet<i32> {
     let mut tree = BTreeSet::from([top]);
     loop {
         let before = tree.len();
@@ -62,19 +104,18 @@ fn below(rows: &[Row<'_>], top: i32) -> BTreeSet<i32> {
     }
 }
 
-/// The git credential helpers running under `root` in a `ps -A -o pid=,ppid=,args=` listing.
+/// The git credential helpers running under `root` in `rows`.
 #[must_use]
-pub fn helpers(listing: &str, root: i32) -> Vec<(i32, String)> {
-    let rows = rows(listing);
-    let tree = below(&rows, root);
-    let named: Vec<(&Row<'_>, &str)> = rows
+fn helpers(rows: &[Row], root: i32) -> Vec<(i32, String)> {
+    let tree = below(rows, root);
+    let named: Vec<(&Row, &str)> = rows
         .iter()
         .filter(|row| tree.contains(&row.pid))
-        .filter_map(|row| helper_name(row.args).map(|name| (row, name)))
+        .filter_map(|row| helper_name(&row.args).map(|name| (row, name)))
         .collect();
     let is_helper = |pid: i32| named.iter().any(|(row, _)| row.pid == pid);
     let parent = |pid: i32| rows.iter().find(|row| row.pid == pid).map(|row| row.ppid);
-    let under_a_helper = |row: &Row<'_>| {
+    let under_a_helper = |row: &Row| {
         let mut at = row.ppid;
         for _ in 0..rows.len() {
             if is_helper(at) {
@@ -94,14 +135,13 @@ pub fn helpers(listing: &str, root: i32) -> Vec<(i32, String)> {
         .collect()
 }
 
-/// `top` and every process below it in a `ps -A -o pid=,ppid=,args=` listing.
+/// `top` and every process below it in `rows`.
 #[must_use]
-pub fn subtree(listing: &str, top: i32) -> Vec<(i32, String)> {
-    let rows = rows(listing);
-    let tree = below(&rows, top);
+fn subtree(rows: &[Row], top: i32) -> Vec<(i32, String)> {
+    let tree = below(rows, top);
     rows.iter()
         .filter(|row| tree.contains(&row.pid))
-        .map(|row| (row.pid, row.args.to_string()))
+        .map(|row| (row.pid, row.args.clone()))
         .collect()
 }
 
@@ -249,16 +289,15 @@ fn watch(root: Identity, wait: Duration, look: Duration, stopped: &mpsc::Receive
         if !root.current() && ended.is_empty() {
             return;
         }
-        let Some(listing) = listing() else {
+        let also: Vec<i32> = ended.iter().map(|(process, _)| process.pid).collect();
+        let Some(rows) = table(root.pid, &also) else {
             continue;
         };
-        escalate(&mut ended, &listing, read_process_start, |pid| {
-            end(pid, true)
-        });
+        escalate(&mut ended, &rows, read_process_start, |pid| end(pid, true));
         if !root.current() {
             continue;
         }
-        let running = helpers(&listing, root.pid)
+        let running = helpers(&rows, root.pid)
             .into_iter()
             .filter_map(|(pid, name)| Identity::read(pid).map(|process| (process, name)))
             .collect();
@@ -266,7 +305,7 @@ fn watch(root: Identity, wait: Duration, look: Duration, stopped: &mpsc::Receive
             if ended.iter().any(|(p, _)| *p == helper) {
                 continue;
             }
-            let reached: Vec<_> = subtree(&listing, helper.pid)
+            let reached: Vec<_> = subtree(&rows, helper.pid)
                 .into_iter()
                 .filter_map(|(pid, args)| Identity::read(pid).map(|process| (process, args)))
                 .collect();
@@ -294,35 +333,31 @@ fn watch(root: Identity, wait: Duration, look: Duration, stopped: &mpsc::Receive
     }
 }
 
+/// Keeps each of `ended` that is still the process it was (its pid in `present` with the same
+/// arguments, and the same start) and signals each kept one. One whose arguments were unread when
+/// it was ended (its thread had not run: [`args_of`]) takes the words `present` reads for it now,
+/// its start alone naming it, so a process that ignores the first signal is still killed once it
+/// runs.
 fn escalate(
     ended: &mut Vec<(Identity, String)>,
-    listing: &str,
+    present: &[Row],
     mut start: impl FnMut(i32) -> Option<ProcessStart>,
     mut signal: impl FnMut(i32),
 ) {
-    let present = rows(listing);
-    ended.retain(|(process, args)| {
-        present
-            .iter()
-            .any(|row| row.pid == process.pid && row.args == args)
-            && process.matches(start(process.pid))
+    ended.retain_mut(|(process, args)| {
+        let Some(row) = present.iter().find(|row| row.pid == process.pid) else {
+            return false;
+        };
+        if args.is_empty() {
+            args.clone_from(&row.args);
+        }
+        row.args == *args && process.matches(start(process.pid))
     });
     for (process, _) in ended {
         if process.matches(start(process.pid)) {
             signal(process.pid);
         }
     }
-}
-
-fn listing() -> Option<String> {
-    aterm_uds::spawnfd::command("/bin/ps")
-        .args(["-A", "-o", "pid=,ppid=,args="])
-        .stdin(aterm_uds::spawnfd::Stdio::null())
-        .stderr(aterm_uds::spawnfd::Stdio::null())
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
 }
 
 fn end(pid: i32, hard: bool) {
@@ -369,20 +404,75 @@ mod tests {
         pids.iter().map(|(p, n)| (*p, (*n).to_string())).collect()
     }
 
+    /// `pid ppid args` lines as [`Row`]s; a line that does not start with two numbers is skipped.
+    fn rows(listing: &str) -> Vec<Row> {
+        listing
+            .lines()
+            .filter_map(|line| {
+                let mut words = line.split_whitespace();
+                let pid = words.next()?.parse().ok()?;
+                let ppid = words.next()?.parse().ok()?;
+                Some(Row {
+                    pid,
+                    ppid,
+                    args: words.collect::<Vec<_>>().join(" "),
+                })
+            })
+            .collect()
+    }
+
+    /// One look reads the arguments of the processes below the root and of those it ended, and
+    /// of no other process.
+    #[test]
+    fn a_look_reads_only_the_arguments_of_the_roots_tree_and_what_it_ended() {
+        let procs = [
+            (1, 0),
+            (500, 1),
+            (501, 500),
+            (502, 501),
+            (600, 1),
+            (601, 600),
+            (509, 1),
+        ];
+        let mut read = Vec::new();
+        let rows = table_of(procs, 500, &[509], |pid| {
+            read.push(pid);
+            format!("words of {pid}")
+        });
+        read.sort_unstable();
+        assert_eq!(read, [500, 501, 502, 509]);
+        assert_eq!(rows.len(), procs.len(), "every process keeps its row");
+        for row in &rows {
+            let wanted = [500, 501, 502, 509].contains(&row.pid);
+            assert_eq!(row.args.is_empty(), !wanted, "{row:?}");
+        }
+    }
+
+    /// This process's own arguments read in-process, as `ps -o args=` prints them for a plain
+    /// argument vector; a pid no process holds reads as none.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_live_processes_arguments_read_in_process() {
+        let me = i32::try_from(std::process::id()).expect("own pid");
+        let words: Vec<String> = std::env::args().collect();
+        assert_eq!(args_of(me), words.join(" "));
+        assert_eq!(args_of(i32::MAX), "");
+    }
+
     #[test]
     fn a_helper_is_the_topmost_git_credential_process_under_the_root() {
         assert_eq!(
-            helpers(LISTING, 500),
+            helpers(&rows(LISTING), 500),
             named(&[(502, "osxkeychain"), (508, "x"), (510, "netrc"), (511, "y")])
         );
-        assert_eq!(helpers(LISTING, 600), named(&[(600, "store")]));
-        assert!(helpers(LISTING, 999).is_empty());
+        assert_eq!(helpers(&rows(LISTING), 600), named(&[(600, "store")]));
+        assert!(helpers(&rows(LISTING), 999).is_empty());
     }
 
     #[test]
     fn ending_a_helper_reaches_everything_it_started() {
         assert_eq!(
-            subtree(LISTING, 502),
+            subtree(&rows(LISTING), 502),
             named(&[
                 (502, "git credential-osxkeychain get"),
                 (
@@ -392,7 +482,7 @@ mod tests {
             ])
         );
         assert_eq!(
-            subtree(LISTING, 508),
+            subtree(&rows(LISTING), 508),
             named(&[
                 (508, "/bin/sh /abs/git-credential-x get"),
                 (509, "sleep 120")
@@ -439,7 +529,7 @@ mod tests {
         let mut signaled = Vec::new();
         escalate(
             &mut ended,
-            "503 999 sleep 120\n509 1 sleep 120\n510 1 sleep 120\n",
+            &rows("503 999 sleep 120\n509 1 sleep 120\n510 1 sleep 120\n"),
             |pid| match pid {
                 503 => Some(process(pid, 20).start),
                 509 => Some(process(pid, 10).start),
@@ -450,6 +540,39 @@ mod tests {
         );
         assert_eq!(signaled, [509]);
         assert_eq!(ended, [(process(509, 10), "sleep 120".to_string())]);
+    }
+
+    /// A process ended while its arguments were unread (its thread had not run) is still killed
+    /// once they read, its start alone naming it then, and dropped if it execs after that.
+    /// NEGATIVE CONTROL: compare the unread words with those read, and it is dropped unsignalled.
+    #[test]
+    fn a_process_ended_unread_is_still_killed_once_its_arguments_read() {
+        let start = ProcessStart {
+            boot: aterm_uds::process::BootClock(10),
+            wall: None,
+        };
+        let process = Identity { pid: 503, start };
+        let mut ended = vec![(process, String::new())];
+        let mut signaled = Vec::new();
+        escalate(
+            &mut ended,
+            &rows("503 1 security find-generic-password -w\n"),
+            |_| Some(start),
+            |pid| signaled.push(pid),
+        );
+        assert_eq!(signaled, [503], "killed once it runs");
+        assert_eq!(
+            ended,
+            [(process, "security find-generic-password -w".to_string())]
+        );
+        escalate(
+            &mut ended,
+            &rows("503 1 /bin/zsh\n"),
+            |_| Some(start),
+            |pid| signaled.push(pid),
+        );
+        assert_eq!(signaled, [503], "an exec after its words were read is left");
+        assert!(ended.is_empty());
     }
 
     #[test]

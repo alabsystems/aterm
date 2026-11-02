@@ -74,12 +74,10 @@ pub(crate) fn summary_folder() -> Option<std::path::PathBuf> {
 /// [`summary_folder`] under the state root `state`, created owner-only.
 fn summary_folder_under(state: &std::path::Path) -> Option<std::path::PathBuf> {
     let dir = state.join(SUMMARY_FOLDER);
-    std::fs::create_dir_all(&dir).ok()?;
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).ok()?;
-    }
+    crate::control_auth::ensure_private_dir(&dir).ok()?;
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
 }
 
@@ -155,8 +153,7 @@ impl StartBlock {
             }
             Self::Worker(WorkerBlock::Unseen(why)) => format!("({why})"),
             Self::Worker(WorkerBlock::NoIntegration) => {
-                "(needs shell integration \u{2014} off with -e or --no-shell-integration)"
-                    .to_string()
+                "(needs shell integration \u{2014} off with --no-shell-integration)".to_string()
             }
             Self::Worker(WorkerBlock::Shell(name)) => {
                 format!("(needs zsh, bash or fish as the shell, not {name})")
@@ -506,7 +503,8 @@ mod tests {
             crate::harness_host::session_repo_work_under(
                 &folder,
                 Some(home.path()),
-                Some(state.path())
+                Some(state.path()),
+                &aterm_agent::harness::repo_work::Used::default(),
             ),
             aterm_agent::harness::repo_work::RepoRead::Clean
         );
@@ -517,6 +515,7 @@ mod tests {
             elsewhere.path(),
             Some(home.path()),
             Some(state.path()),
+            &aterm_agent::harness::repo_work::Used::default(),
         );
         assert!(found.found().is_some_and(|w| w.untracked == 1));
     }

@@ -32,23 +32,55 @@ pub(crate) struct Scoped {
     pub(crate) claim: Claim,
 }
 
+/// The `supervisor_version=` and `supervisor_vendor=` words of `status` and `sessions`: the
+/// versions a proven contract v3 claim announced
+/// ([`crate::session_timeline::SessionMeta::live_scoped`],
+/// `docs/DESIGN-harness-repos-2026-10-24.md` §5, §11 D48), percent-encoded; `-` for a word the
+/// claim did not name, and for both under any other claim or none.
+#[must_use]
+pub(crate) fn wire_versions(scoped: Option<&Scoped>) -> (String, String) {
+    let word = |v: Option<&str>| v.map_or_else(|| "-".to_string(), aterm_control::wire::pct_encode);
+    match scoped {
+        Some(s) => (
+            word(s.claim.version.as_ref().map(|v| v.text.as_str())),
+            word(s.claim.vendor.as_deref()),
+        ),
+        None => ("-".to_string(), "-".to_string()),
+    }
+}
+
 /// Return the claimed pid if `facts` prove rostered `holder`'s contract 3 claim: the kernel's
 /// peer is the pid the holder names, which leads the session's foreground group, and its image is
 /// a build of the row's program (`facts.alab_image`, read by [`runs_harness_build`]).
 #[must_use]
+#[cfg(test)]
 pub(crate) fn proves(holder: &str, facts: crate::self_claim::Facts) -> Option<u32> {
-    let (_, pid) = aterm_agent::harness::contract::holder(holder)?;
+    proves_in(aterm_agent::harness::contract::ROSTER, holder, facts)
+}
+
+fn proves_in(rows: &'static [Row], holder: &str, facts: crate::self_claim::Facts) -> Option<u32> {
+    let (_, pid) = aterm_agent::harness::contract::holder_in(rows, holder)?;
     let leads = i64::from(facts.foreground) == i64::from(pid);
     (facts.peer == Some(pid) && leads && facts.alab_image).then_some(pid)
 }
 
 /// Prove rostered `holder`'s claim on `facts` ([`proves`]) and capture its kernel start.
 #[must_use]
+#[cfg(test)]
 pub(crate) fn prove(
     holder: &str,
     facts: crate::self_claim::Facts,
 ) -> Option<crate::self_claim::Proven> {
-    let pid = proves(holder, facts)?;
+    prove_in(aterm_agent::harness::contract::ROSTER, holder, facts)
+}
+
+/// The same kernel proof and birth capture under the session's explicit catalog.
+pub(crate) fn prove_in(
+    rows: &'static [Row],
+    holder: &str,
+    facts: crate::self_claim::Facts,
+) -> Option<crate::self_claim::Proven> {
+    let pid = proves_in(rows, holder, facts)?;
     let start = aterm_agent::harness::restart_stamp::kernel_start(pid)?;
     Some(crate::self_claim::Proven { pid, start })
 }

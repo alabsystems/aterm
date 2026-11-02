@@ -8,7 +8,10 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use aterm_uds::process::EndControl;
+use aterm_uds::process::{
+    Birth, EndControl, GroupMembers, HeldNow, Lineage, Markers, ProcessPresence, end_proven,
+    process_presence,
+};
 
 const SIGTERM: i32 = 15;
 const SIGKILL: i32 = 9;
@@ -288,9 +291,31 @@ fn records(files: &[(&str, &str)]) -> aterm_tempfile::TempDir {
 
 /// The start pass over `dir` and `k`, with its lines.
 fn start_pass(dir: &Path, k: &FakeKernel) -> (usize, Vec<String>) {
+    start_pass_telling(dir, k, &Inert)
+}
+
+/// The start pass over `dir` and `k`, telling `poster` what it ends, with its lines.
+fn start_pass_telling(dir: &Path, k: &FakeKernel, poster: &dyn Poster) -> (usize, Vec<String>) {
     let mut lines = Vec::new();
-    let ended = end_dead_runs(dir, "B", ME, k, &mut |l| lines.push(l.to_owned()));
+    let ended = end_dead_runs(dir, "B", ME, k, &mut |l| lines.push(l.to_owned()), poster);
     (ended, lines)
+}
+
+/// A poster that keeps what each post told.
+#[derive(Debug, Default)]
+struct Recording(Mutex<Vec<Vec<String>>>);
+
+impl Poster for Recording {
+    fn post(&self, lines: &[String]) {
+        self.0.lock().expect("the recording").push(lines.to_vec());
+    }
+}
+
+impl Recording {
+    /// Every post's lines, in order.
+    fn told(&self) -> Vec<Vec<String>> {
+        self.0.lock().expect("the recording").clone()
+    }
 }
 
 #[test]
@@ -301,6 +326,9 @@ fn a_run_id_round_trips() {
     };
     assert_eq!(RunId::parse(&id.text()), Some(id));
     assert_eq!(RunId::parse("nope"), None);
+    assert_eq!(RunId::parse("+41983-100"), None);
+    assert_eq!(RunId::parse("41983-+100"), None);
+    assert_eq!(RunId::parse("-41983-100"), None);
 }
 
 #[test]
@@ -406,7 +434,7 @@ fn each_condition_of_the_dead_run_pass_names_what_it_cannot_prove() {
         Want,
         fn(&mut FakeKernel, &mut Lineage) -> Option<String>,
     );
-    let cases: [Case; 16] = [
+    let cases: [Case; 17] = [
         ("proven", Want::Ended, |_, _| None),
         ("exe outside the roots", Want::Named, |k, _| {
             k.exes
@@ -470,6 +498,11 @@ fn each_condition_of_the_dead_run_pass_names_what_it_cannot_prove() {
         ("its tty's holders unreadable", Want::Named, |k, m| {
             m.tty = Some(77);
             k.ttys.insert(77, None);
+            None
+        }),
+        ("its tty's master closed", Want::Ended, |k, m| {
+            m.tty = Some(77);
+            k.ttys.insert(77, Some(false));
             None
         }),
         (
@@ -575,7 +608,13 @@ fn a_zombie_holds_nothing_and_its_end_counts_ended() {
     k.groups.insert(500, vec![500, 501, 502]);
     k.presence.insert(501, ProcessPresence::Exited);
     k.presence.insert(502, ProcessPresence::Exited);
-    let report = sweep_group(&k, 500, "test -p aterm-link", &[PathBuf::from("/wt-a")]);
+    let report = sweep_group(
+        &k,
+        500,
+        "test -p aterm-link",
+        &[PathBuf::from("/wt-a")],
+        &Inert,
+    );
     assert_eq!(k.termed(), [501]);
     assert_eq!(report.ended, ["aterm"], "{report:?}");
     assert!(report.named.is_empty() && report.closed(), "{report:?}");
@@ -687,6 +726,20 @@ fn a_dead_runs_record_stays_while_it_names_a_member() {
     let (ended, _) = start_pass(dir.path(), &k);
     assert_eq!(ended, 1);
     assert!(!path.exists(), "nothing of it left named");
+
+    #[cfg(unix)]
+    {
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, "untouched\n").expect("victim");
+        let link = dir.path().join("link.run");
+        std::os::unix::fs::symlink(&victim, &link).expect("symlink");
+        append(&link, "dead_seen uniqueid=9 at=9");
+        assert!(open_regular_write(&link, false).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("victim"),
+            "untouched\n"
+        );
+    }
 }
 
 /// The pass never ends this process or its ancestors, and a failed uid listing ends nothing and keeps every record.
@@ -807,7 +860,7 @@ fn the_stage_sweep_ends_under_roots_and_names_the_rest() {
     k.put(lin(76, 305, 500, 500), "/wt-a/target/debug/aterm");
     k.stubborn.insert(76);
     k.groups.insert(500, vec![500, 71, 72, 73, 74, 75, 76]);
-    let report = sweep_group(&k, 500, "test -p aterm-link", &roots);
+    let report = sweep_group(&k, 500, "test -p aterm-link", &roots, &Inert);
     assert_eq!(report.ended, ["aterm", "aterm"], "{report:?}");
     assert_eq!(report.named, ["ssh-agent", "aterm", "aterm"], "{report:?}");
     assert_eq!(k.termed(), [71, 76]);
@@ -821,11 +874,11 @@ fn the_stage_sweep_ends_under_roots_and_names_the_rest() {
     let mut k = FakeKernel::default();
     k.put(lin(71, 300, 500, 500), "/wt-a/target/debug/aterm");
     k.groups.insert(500, vec![500, 71]);
-    let report = sweep_group(&k, 500, "s", &roots);
+    let report = sweep_group(&k, 500, "s", &roots, &Inert);
     assert!(report.closed(), "{report:?}");
     let mut k = FakeKernel::default();
     k.groups.insert(500, vec![500]);
-    let report = sweep_group(&k, 500, "s", &roots);
+    let report = sweep_group(&k, 500, "s", &roots, &Inert);
     assert!(report.closed() && report.line().is_none(), "{report:?}");
 }
 
@@ -834,13 +887,13 @@ fn the_stage_sweep_ends_under_roots_and_names_the_rest() {
 fn a_group_the_sweep_cannot_prove_empty_stays_open() {
     let roots = vec![PathBuf::from("/wt-a")];
     let k = FakeKernel::default();
-    let report = sweep_group(&k, 500, "s", &roots);
+    let report = sweep_group(&k, 500, "s", &roots, &Inert);
     assert!(!report.closed() && report.line().is_none(), "{report:?}");
 
     let mut k = FakeKernel::default();
     k.groups.insert(500, vec![500]);
     k.partial.insert(500);
-    let report = sweep_group(&k, 500, "s", &roots);
+    let report = sweep_group(&k, 500, "s", &roots, &Inert);
     assert!(!report.closed(), "{report:?}");
     assert_eq!(
         report.line().as_deref(),
@@ -854,7 +907,7 @@ fn a_group_the_sweep_cannot_prove_empty_stays_open() {
     k.put(lin(71, 300, 500, 500), "/wt-a/target/debug/aterm");
     k.refused.insert(71);
     k.groups.insert(500, vec![500, 71]);
-    let report = sweep_group(&k, 500, "s", &roots);
+    let report = sweep_group(&k, 500, "s", &roots, &Inert);
     assert_eq!(report.named, ["aterm"], "{report:?}");
     assert!(!report.closed());
 
@@ -862,7 +915,7 @@ fn a_group_the_sweep_cannot_prove_empty_stays_open() {
     k.put(lin(71, 300, 500, 500), "/wt-a/target/debug/aterm");
     k.moves.borrow_mut().insert(71, lin(71, 300, 71, 500));
     k.groups.insert(500, vec![500, 71]);
-    let report = sweep_group(&k, 500, "s", &roots);
+    let report = sweep_group(&k, 500, "s", &roots, &Inert);
     assert_eq!(
         (report.named.len(), k.termed()),
         (1, Vec::new()),
@@ -873,39 +926,34 @@ fn a_group_the_sweep_cannot_prove_empty_stays_open() {
 /// Run roots include the worktree first and every target or build directory cargo reports.
 #[test]
 fn the_roots_are_where_the_build_put_its_executables() {
-    let cache = "/cache/cargo-build.noindex/wt-a/.cargo-build";
+    let json_path = |p: &Path| p.display().to_string().replace('\\', "\\\\");
+    let wt_a = std::path::absolute("/wt-a").expect("absolute");
+    let shared_target = std::path::absolute("/shared/target").expect("absolute");
+    let cache = std::path::absolute("/cache/cargo-build.noindex/wt-a/.cargo-build").expect("abs");
     let metadata = format!(
-        "{{\"packages\":[],\"workspace_root\":\"/wt-a\",\
-         \"target_directory\":\"/shared/target\",\"build_directory\":\"{cache}\",\
-         \"version\":1}}"
+        "{{\"packages\":[],\"workspace_root\":\"{}\",\
+         \"target_directory\":\"{}\",\"build_directory\":\"{}\",\
+         \"version\":1}}",
+        json_path(&wt_a),
+        json_path(&shared_target),
+        json_path(&cache)
     );
     let built = parse_build_dirs(&format!("targo: a lane banner\n{metadata}\n"));
-    assert_eq!(
-        built,
-        [PathBuf::from("/shared/target"), PathBuf::from(cache)]
-    );
-    let roots = run_roots(
-        Path::new("/wt-a"),
-        Path::new("/tmp/atv.scratch"),
-        Path::new("/shared/target"),
-        &built,
-    );
-    assert_eq!(
-        roots[0],
-        PathBuf::from("/wt-a"),
-        "the worktree first: {roots:?}"
-    );
+    assert_eq!(built, [shared_target.clone(), cache.clone()]);
+    let roots = run_roots(&wt_a, Path::new("/tmp/atv.scratch"), &shared_target, &built);
+    assert_eq!(roots[0], canonical(&wt_a), "the worktree first: {roots:?}");
 
     let mut k = FakeKernel::default();
+    let agent_exe = cache.join("debug/deps/aterm_agent-336f0d9f2ce88bd5");
+    k.put(lin(71, 300, 500, 500), &agent_exe.display().to_string());
     k.put(
-        lin(71, 300, 500, 500),
-        &format!("{cache}/debug/deps/aterm_agent-336f0d9f2ce88bd5"),
+        lin(72, 301, 500, 500),
+        &shared_target.join("debug/aterm").display().to_string(),
     );
-    k.put(lin(72, 301, 500, 500), "/shared/target/debug/aterm");
     k.put(lin(73, 302, 500, 500), "/usr/bin/ssh-agent");
     k.groups.insert(500, vec![500, 71, 72, 73]);
-    let label = format!("{cache}/debug/deps/aterm_agent-336f0d9f2ce88bd5");
-    let report = sweep_group(&k, 500, &label, &roots);
+    let label = agent_exe.display().to_string();
+    let report = sweep_group(&k, 500, &label, &roots, &Inert);
     assert_eq!(
         report.ended,
         ["aterm_agent-336f0d9f2ce88bd5", "aterm"],
@@ -920,23 +968,28 @@ fn the_roots_are_where_the_build_put_its_executables() {
             birth: Birth(1),
         }),
         roots: run_roots(
-            Path::new("/wt-a"),
+            &wt_a,
             Path::new("/tmp/s"),
-            Path::new("/wt-a/target"),
+            &wt_a.join("target"),
             &[PathBuf::from(
                 "/Library/Caches/aterm/cargo-build.noindex/wt-a",
             )],
         ),
         ..Record::default()
     };
+    let want_head = format!("({})", canonical(&wt_a).display());
     assert!(
-        dead_run_line(&rec, &Left::default()).contains("(/wt-a)"),
+        dead_run_line(&rec, &Left::default()).contains(&want_head),
         "{rec:?}"
     );
 
+    let w_target = std::path::absolute("/w/target").expect("absolute");
     assert_eq!(
-        parse_build_dirs("{\"target_directory\":\"/w/target\"}"),
-        [PathBuf::from("/w/target")]
+        parse_build_dirs(&format!(
+            "{{\"target_directory\":\"{}\"}}",
+            json_path(&w_target)
+        )),
+        [w_target]
     );
     assert!(parse_build_dirs("warning: not json").is_empty());
 }
@@ -1191,8 +1244,11 @@ fn the_run_end_sweep_ends_this_runs_own_orphans() {
         },
         uniqueid: 100,
         roots: vec![PathBuf::from("/wt-a")],
+        swept: Mutex::new(Vec::new()),
+        made: Mutex::new(BTreeMap::new()),
         said: Mutex::new(Vec::new()),
         may_forget: AtomicBool::new(false),
+        poster: Box::new(Inert),
     };
     let mut k = FakeKernel::default();
     let mut verify = lin(41983, 100, 41983, 1);
@@ -1227,6 +1283,7 @@ fn the_run_end_sweep_ends_this_runs_own_orphans() {
             listed: Some(true),
             ..GroupReport::default()
         },
+        true,
     );
     runs.settle_group(
         501,
@@ -1235,6 +1292,7 @@ fn the_run_end_sweep_ends_this_runs_own_orphans() {
             listed: Some(true),
             ..GroupReport::default()
         },
+        true,
     );
     let unknown = dir.path().join("7000-8000.run");
     let partial: &[u8] = b"run v=1 boot=B id=7000-8";
@@ -1334,8 +1392,11 @@ fn only_a_group_proven_empty_is_recorded_closed() {
         },
         uniqueid: 1,
         roots: Vec::new(),
+        swept: Mutex::new(Vec::new()),
+        made: Mutex::new(BTreeMap::new()),
         said: Mutex::new(Vec::new()),
         may_forget: AtomicBool::new(false),
+        poster: Box::new(Inert),
     };
     for (pgid, listed, named) in [
         (500, Some(true), vec![]),
@@ -1351,6 +1412,7 @@ fn only_a_group_proven_empty_is_recorded_closed() {
                 listed,
                 ..GroupReport::default()
             },
+            true,
         );
     }
     let rec = Record::parse(&std::fs::read_to_string(&path).expect("read"));
@@ -1447,7 +1509,7 @@ fn a_member_the_sweep_cannot_read_keeps_its_group_open() {
     k.put(lin(71, 300, 500, 500), "/wt-a/target/debug/aterm");
     k.unreadable.insert(71);
     k.groups.insert(500, vec![500, 71]);
-    let report = sweep_group(&k, 500, "s", &roots);
+    let report = sweep_group(&k, 500, "s", &roots, &Inert);
     assert_eq!(
         (report.named.len(), k.termed()),
         (1, Vec::new()),
@@ -1458,7 +1520,7 @@ fn a_member_the_sweep_cannot_read_keeps_its_group_open() {
     k.birth_unreadable.insert(71);
     for presence in [ProcessPresence::Present, ProcessPresence::Unknown] {
         k.presence.insert(71, presence);
-        let report = sweep_group(&k, 500, "s", &roots);
+        let report = sweep_group(&k, 500, "s", &roots, &Inert);
         assert_eq!(
             (report.named.len(), k.termed()),
             (1, Vec::new()),
@@ -1468,7 +1530,7 @@ fn a_member_the_sweep_cannot_read_keeps_its_group_open() {
 
         k.unreadable.remove(&71);
         k.refused.insert(71);
-        let report = sweep_group(&k, 500, "s", &roots);
+        let report = sweep_group(&k, 500, "s", &roots, &Inert);
         assert_eq!(report.named, ["aterm"], "{presence:?}: {report:?}");
         assert!(report.ended.is_empty() && !report.closed(), "{report:?}");
         k.unreadable.insert(71);
@@ -1476,7 +1538,7 @@ fn a_member_the_sweep_cannot_read_keeps_its_group_open() {
 
     k.lineages.borrow_mut().remove(&71);
     k.presence.remove(&71);
-    let report = sweep_group(&k, 500, "s", &roots);
+    let report = sweep_group(&k, 500, "s", &roots, &Inert);
     assert!(report.closed() && report.named.is_empty(), "{report:?}");
 }
 
@@ -1489,7 +1551,7 @@ fn a_member_that_exits_on_its_own_mid_read_is_gone() {
     k.put(lin(72, 301, 500, 500), "/wt-a/target/debug/aterm");
     k.exiting.get_mut().extend([(71, 1), (72, 1)]);
     k.groups.insert(500, vec![500, 71, 72]);
-    let report = sweep_group(&k, 500, "s", &roots);
+    let report = sweep_group(&k, 500, "s", &roots, &Inert);
     assert!(
         report.named.is_empty() && report.ended.is_empty() && report.closed(),
         "{report:?}"
@@ -1516,7 +1578,7 @@ fn a_survivor_still_there_after_its_sigkill_is_named() {
     k.stubborn.insert(71);
     k.wedged.insert(71);
     k.groups.insert(500, vec![500, 71]);
-    let report = sweep_group(&k, 500, "s", &roots);
+    let report = sweep_group(&k, 500, "s", &roots, &Inert);
     assert!(k.signals.borrow().contains(&(71, SIGKILL)), "{report:?}");
     assert_eq!(report.named, ["aterm"], "{report:?}");
     assert!(report.ended.is_empty() && !report.closed(), "{report:?}");
@@ -1530,7 +1592,7 @@ fn a_survivor_gone_as_its_signal_lands_is_gone() {
     k.put(lin(71, 300, 500, 500), "/wt-a/target/debug/aterm");
     k.vanish.insert(71);
     k.groups.insert(500, vec![500, 71]);
-    let report = sweep_group(&k, 500, "s", &roots);
+    let report = sweep_group(&k, 500, "s", &roots, &Inert);
     assert!(
         report.ended.is_empty() && report.named.is_empty() && report.closed(),
         "{report:?}"
@@ -1541,15 +1603,18 @@ fn a_survivor_gone_as_its_signal_lands_is_gone() {
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]
 #[test]
 fn a_runs_record_roots_are_the_dirs_its_build_names() {
+    let json_path = |p: &Path| p.display().to_string().replace('\\', "\\\\");
     let dir = aterm_tempfile::tempdir().expect("tempdir");
-    let cache = "/cache/cargo-build.noindex/wt-a/.cargo-build";
+    let wt_a = std::path::absolute("/wt-a").expect("absolute");
+    let shared_target = std::path::absolute("/shared/target").expect("absolute");
+    let cache = std::path::absolute("/cache/cargo-build.noindex/wt-a/.cargo-build").expect("abs");
     let mut ctx = Ctx::new(
-        PathBuf::from("/wt-a"),
+        wt_a.clone(),
         crate::Scope::workspace(),
         crate::EnvSnapshot::default(),
         PathBuf::from("/tmp/atv-s"),
     );
-    ctx.main_build_dir = Some(format!("build.build-dir=\"{cache}\""));
+    ctx.main_build_dir = Some(format!("build.build-dir=\"{}\"", json_path(&cache)));
     let want_cmd = metadata_ask(&ctx);
     let want_env = ctx.child_env_add.clone();
     let mut asked = 0;
@@ -1564,8 +1629,10 @@ fn a_runs_record_roots_are_the_dirs_its_build_names() {
         crate::exec::Run {
             ok: true,
             output: format!(
-                "targo: a lane banner\n{{\"target_directory\":\"/shared/target\",\
-                 \"build_directory\":\"{cache}\",\"version\":1}}\n"
+                "targo: a lane banner\n{{\"target_directory\":\"{}\",\
+                 \"build_directory\":\"{}\",\"version\":1}}\n",
+                json_path(&shared_target),
+                json_path(&cache)
             ),
             code: Some(0),
             spawn_error: None,
@@ -1574,13 +1641,170 @@ fn a_runs_record_roots_are_the_dirs_its_build_names() {
     .expect("a record");
     assert_eq!(asked, 1);
     let rec = Record::parse(&std::fs::read_to_string(&runs.path).expect("the record"));
-    assert_eq!(rec.roots[0], canonical(Path::new("/wt-a")), "{rec:?}");
-    for root in [cache, "/shared/target"] {
+    assert_eq!(rec.roots[0], canonical(&wt_a), "{rec:?}");
+    for root in [&cache, &shared_target] {
         assert!(
-            rec.roots.contains(&canonical(Path::new(root))),
-            "{root} is a root: {rec:?}"
+            rec.roots.contains(&canonical(root)),
+            "{} is a root: {rec:?}",
+            root.display()
         );
     }
+}
+
+/// A stage's label keeps whole arguments within [`crate::exec::LABEL_MAX`] bytes: a short argv,
+/// and one exactly that long, are their label unchanged; one byte more leaves its last argument
+/// out (` …+1 arg`, one argument named singular), as does an argument after an exact fit; a
+/// `test` with 100 `-p` pairs is labelled by its first arguments and a count of the rest; and a
+/// program longer than the bound is kept whole. NEGATIVE CONTROL: label a stage by its whole
+/// argv joined, and the 100 pairs' label is 1823 bytes.
+#[test]
+fn a_stage_label_keeps_whole_arguments_within_its_bound() {
+    use crate::exec::{LABEL_MAX, stage_label};
+    let words = |s: &str| s.split(' ').map(str::to_owned).collect::<Vec<_>>();
+    assert_eq!(
+        stage_label(&words("test -p aterm-link")),
+        "test -p aterm-link"
+    );
+    let exact = format!("targo {}", "x".repeat(LABEL_MAX - "targo ".len()));
+    assert_eq!(stage_label(&words(&exact)), exact);
+    let over = format!("targo {}", "x".repeat(LABEL_MAX + 1 - "targo ".len()));
+    assert_eq!(stage_label(&words(&over)), "targo …+1 arg", "one byte over");
+    assert_eq!(
+        stage_label(&words(&format!("{exact} y"))),
+        format!("{exact} …+1 arg"),
+        "an argument after an exact fit"
+    );
+
+    let mut argv = words("targo --unverified test");
+    for n in 0..100 {
+        argv.extend(["-p".to_owned(), format!("aterm-crate-{n:02}")]);
+    }
+    let label = stage_label(&argv);
+    let tail = " …+185 args";
+    assert!(
+        label.len() <= LABEL_MAX + tail.len(),
+        "{} bytes: {label}",
+        label.len()
+    );
+    let kept = label.strip_suffix(tail).expect("a count of the rest");
+    assert_eq!(argv.len() - words(kept).len(), 185, "{label}");
+    assert!(argv.join(" ").starts_with(kept), "{label}");
+
+    let program = format!("/{}", "w".repeat(300));
+    assert_eq!(
+        stage_label(&[program.clone(), "test".to_owned()]),
+        format!("{program} …+1 arg"),
+        "a program longer than the bound"
+    );
+}
+
+/// A stage's `group` line stays a few hundred bytes whatever label its group is made with: a
+/// label whose encoding passes `STAGE_FIELD_MAX` (a 300-byte program, then spaces, `=` and
+/// non-ASCII, each encoded to three bytes) is cut at a whole character and ends `…`, and the
+/// record still reads back whole, cleanup's check of each field included; a label that fits
+/// reads back as it was. NEGATIVE CONTROL: write the label pct-encoded whole, and its line is
+/// 2.2 KB.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+#[test]
+fn a_stage_groups_line_is_bounded_whatever_its_label() {
+    use crate::exec::StageGroupEnd as _;
+    let dir = aterm_tempfile::tempdir().expect("tempdir");
+    let ctx = Ctx::new(
+        PathBuf::from("/wt-a"),
+        crate::Scope::workspace(),
+        crate::EnvSnapshot::default(),
+        PathBuf::from("/tmp/atv-s"),
+    );
+    let runs = Runs::open(&ctx, dir.path(), |_, _| crate::exec::Run {
+        ok: false,
+        output: String::new(),
+        code: None,
+        spawn_error: None,
+    })
+    .expect("a record");
+    let fits = "targo --unverified test -p aterm-uds -p aterm-verify …+3 args";
+    let long = format!("/{} a=b {}", "w".repeat(300), "\u{e9} ".repeat(200));
+    runs.group_made(std::process::id(), fits);
+    runs.group_made(std::process::id(), &long);
+    let text = std::fs::read_to_string(&runs.path).expect("the record");
+    let groups: Vec<&str> = text.lines().filter(|l| l.starts_with("group ")).collect();
+    assert_eq!(groups.len(), 2, "{text}");
+    for group in &groups {
+        let (_, field) = group.split_once(" stage=").expect("a stage field");
+        assert!(
+            field.len() <= STAGE_FIELD_MAX,
+            "{} bytes: {group}",
+            field.len()
+        );
+        assert!(group.len() < 600, "{} bytes: {group}", group.len());
+    }
+    let read = read_records(dir.path()).expect("the record reads back whole");
+    assert_eq!(read.len(), 1, "{text}");
+    assert_eq!(read[0].1.groups[0].stage, fits, "{text}");
+    let cut = &read[0].1.groups[1].stage;
+    let kept = cut.strip_suffix('…').expect("a cut label ends …");
+    assert!(
+        long.starts_with(kept) && kept.len() > 300,
+        "{} bytes kept: {cut}",
+        kept.len()
+    );
+}
+
+/// What group custody names a stage's group by is its label ([`crate::exec::stage_label`]),
+/// not its whole argv.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+#[derive(Debug, Default)]
+struct LabelProbe(Mutex<Vec<String>>);
+
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+impl crate::exec::StageGroupEnd for LabelProbe {
+    fn group_made(&self, _pgid: u32, label: &str) {
+        self.0
+            .lock()
+            .expect("the probe's labels")
+            .push(label.to_owned());
+    }
+    fn group_ended(&self, _pgid: u32, _label: &str) {}
+    fn group_reaped(&self, _pgid: u32, _label: &str) {}
+}
+
+/// A real stage whose argv is 200 arguments long makes its group under its label, cut at a
+/// whole argument, which is what the run record's `group` line carries. NEGATIVE CONTROL: name
+/// the group by its argv joined, and the label is its whole 2617 bytes.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+#[test]
+fn a_real_stage_makes_its_group_under_its_label() {
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let probe = LabelProbe::default();
+    let cmd = crate::exec::Cmd::new("/bin/sh")
+        .arg("-c")
+        .arg("exit 0")
+        .args((0..200).map(|n| format!("argument-{n:03}")))
+        .capture(crate::exec::Capture::Silent);
+    let env = crate::exec::ExecEnv {
+        cwd: dir.path(),
+        path: std::ffi::OsStr::new("/usr/bin:/bin"),
+        scratch: dir.path(),
+        child_ceiling: Some(HANG_DETECTOR),
+        remove_env: &[],
+        add_env: &[],
+        stage_groups: Some(&probe),
+        host: &crate::exec::LIVE_HOST,
+    };
+    let run = crate::exec::run(&cmd, env);
+    assert!(run.ok, "the stage: {}", run.output);
+    let labels = probe.0.into_inner().expect("the probe's labels");
+    assert_eq!(
+        labels,
+        [crate::exec::stage_label(&cmd.argv())],
+        "{labels:?}"
+    );
+    assert!(
+        labels[0].ends_with(" args") && labels[0].len() < 200,
+        "{} bytes: {}",
+        labels[0].len(),
+        labels[0]
+    );
 }
 
 /// A dead run's record as Linux writes it: every birth and unique id is a start tick. The run
@@ -1630,22 +1854,34 @@ fn a_linux_dead_run_ends_its_members_by_start_ticks() {
     );
 }
 
-/// Linux reads no terminal's holders (A7), so a member with a controlling terminal is named,
-/// never ended. NEGATIVE CONTROL: read an unread terminal scan as free (`!= Some(true)` for
-/// `== Some(false)`), and it is ended.
+/// A Linux member on a terminal is named, never ended, while its master reads held (Linux reads
+/// every PTY a live process still has held) or unknown (a terminal that is no PTY's), and is
+/// ended where it reads closed. NEGATIVE CONTROL: read an unknown master as free
+/// (`!= Some(true)` for `== Some(false)`), and the unknown one is ended; ask only whether it has
+/// a terminal (`lin.tty.is_none()`), and the closed one is named.
 #[test]
-fn a_linux_member_with_a_terminal_is_named() {
-    let mut k = FakeKernel::default();
-    with_me(&mut k, 5_000);
-    let mut member = lin_linux(71, 310, 71, 1);
-    member.tty = Some(34817);
-    k.put(member, "/wt-a/target/debug/aterm");
-    k.markers.insert(71, verify_run(LINUX_DEAD_ID));
-    k.ttys.insert(34817, None);
-    let dir = records(&[("41983-200.run", &linux_dead_record())]);
-    let (ended, lines) = start_pass(dir.path(), &k);
-    assert_eq!((ended, k.termed()), (0, Vec::new()), "{lines:?}");
-    assert!(lines[0].contains("named aterm"), "{lines:?}");
+fn a_linux_member_with_a_terminal_is_named_while_its_master_is_not_read_closed() {
+    for (master, ends) in [(Some(true), false), (None, false), (Some(false), true)] {
+        let mut k = FakeKernel::default();
+        with_me(&mut k, 5_000);
+        let mut member = lin_linux(71, 310, 71, 1);
+        member.tty = Some(34817);
+        k.put(member, "/wt-a/target/debug/aterm");
+        k.markers.insert(71, verify_run(LINUX_DEAD_ID));
+        k.ttys.insert(34817, master);
+        let dir = records(&[("41983-200.run", &linux_dead_record())]);
+        let (ended, lines) = start_pass(dir.path(), &k);
+        if ends {
+            assert_eq!((ended, k.termed()), (1, vec![71]), "{master:?}: {lines:?}");
+        } else {
+            assert_eq!(
+                (ended, k.termed()),
+                (0, Vec::new()),
+                "{master:?}: {lines:?}"
+            );
+            assert!(lines[0].contains("named aterm"), "{master:?}: {lines:?}");
+        }
+    }
 }
 
 /// With no pid version, an exec under the same pid and start is the same identity, so only the
@@ -1706,8 +1942,14 @@ struct SweepProbe {
 impl crate::exec::StageGroupEnd for SweepProbe {
     fn group_made(&self, _pgid: u32, _label: &str) {}
     fn group_ended(&self, pgid: u32, label: &str) {
-        let report = sweep_group(&LiveKernel, pgid, label, &self.roots);
+        let report = sweep_group(&LiveKernel, pgid, label, &self.roots, &Inert);
         *self.report.lock().expect("the probe's report") = Some(report);
+    }
+    fn group_reaped(&self, pgid: u32, _label: &str) {
+        let mut report = self.report.lock().expect("the probe's report");
+        *report = report
+            .take()
+            .map(|r| r.reaped(|| crate::exec::group::empty(pgid)));
     }
 }
 
@@ -1715,19 +1957,26 @@ impl crate::exec::StageGroupEnd for SweepProbe {
 /// survivor stand-in and exits once the survivor wrote its pid. At the stage's end the leader is
 /// exited and unreaped, the group is listed off the kernel, and the survivor, running from the
 /// roots, is ended through `end_proven` and the kernel's own reads, and the group reads closed
-/// where a listing can be whole (on a `/proc` mounted with `hidepid` it never is); under roots
-/// it does not run from, it is named and left, and leaves on its own. Under a binary translator
-/// the kernel names the translator as the survivor's executable, so it runs from no root and the
-/// test says it is not run. NEGATIVE CONTROL: make `sweep_group`'s held conjunct
-/// `== Some(true)`, and the survivor is named, not ended.
+/// where a listing can be whole (on a `/proc` mounted with `hidepid` only the kernel's answer
+/// once the leader is reaped can close it, and the survivor just ended may still be in the group
+/// then, a zombie its new parent has not reaped); under roots it does not run from, it is named
+/// and left, and leaves on its own. Under a binary translator
+/// the kernel names the translator as the survivor's executable, and the survivor still reads
+/// as the program the kernel handed the translator, so it is ended there too; under one the
+/// kernel hands no program it maps executable (`translator_holds_its_program`), the survivor
+/// reads as the translator, under no root, and the test says it is not run. NEGATIVE CONTROL:
+/// make `sweep_group`'s held conjunct `== Some(true)`, and the survivor is named, not ended.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn a_stage_survivor_running_from_the_roots_is_ended_at_its_stage_end() {
-    if let Some(translator) = aterm_uds::process::translator() {
+    if let Some(translator) = aterm_uds::process::translator()
+        && !aterm_uds::process::translator_holds_its_program()
+    {
         println!(
             "NOT RUN under {translator}: runs::tests::\
-             a_stage_survivor_running_from_the_roots_is_ended_at_its_stage_end: the kernel names \
-             the translator as the survivor's executable, so it runs from no root and is named"
+             a_stage_survivor_running_from_the_roots_is_ended_at_its_stage_end: the kernel hands \
+             this translator no program it maps executable, so the survivor reads as the \
+             translator, under no root, and is named"
         );
         return;
     }
@@ -1796,10 +2045,9 @@ fn a_stage_survivor_running_from_the_roots_is_ended_at_its_stage_end() {
     let (report, pid, birth) = stage(dir.path(), roots);
     std::fs::write(dir.path().join("stop"), "").expect("stop");
     assert_eq!(report.ended, std::slice::from_ref(&word), "{report:?}");
-    assert_eq!(
-        report.closed(),
-        aterm_uds::process::group_listing_can_be_whole(),
-        "closed exactly where a listing can be whole: {report:?}"
+    assert!(
+        report.closed() || !aterm_uds::process::group_listing_can_be_whole(),
+        "closed where a listing can be whole: {report:?}"
     );
     gone(pid, birth);
 
@@ -1810,6 +2058,472 @@ fn a_stage_survivor_running_from_the_roots_is_ended_at_its_stage_end() {
     assert_eq!(report.named, [word], "{report:?}");
     assert!(report.ended.is_empty() && !report.closed(), "{report:?}");
     gone(pid, birth);
+}
+
+/// A group listed only in part whose sweep named nothing is closed once its leader is reaped and
+/// the kernel finds no process in the group; it stays open, its partial line said, when the
+/// kernel finds one or does not answer; a group with a survivor named stays open whatever the
+/// kernel would say, which is not asked; and a group never listed stays as it was. NEGATIVE
+/// CONTROL: let `GroupReport::reaped` return the report unchanged, and the empty group stays
+/// open with its partial line.
+#[test]
+fn a_partly_listed_group_the_kernel_finds_empty_once_reaped_is_closed() {
+    let roots = vec![PathBuf::from("/wt-a")];
+    let partial = || {
+        let mut k = FakeKernel::default();
+        k.groups.insert(500, vec![500]);
+        k.partial.insert(500);
+        sweep_group(&k, 500, "s", &roots, &Inert)
+    };
+    let closed = partial().reaped(|| Some(true));
+    assert!(closed.closed() && closed.line().is_none(), "{closed:?}");
+    for answer in [Some(false), None] {
+        let open = partial().reaped(|| answer);
+        assert!(!open.closed(), "{answer:?}: {open:?}");
+        assert_eq!(
+            open.line().as_deref(),
+            Some(
+                "stage s: its group's listing was partial, so it may have left processes not \
+                 named here"
+            ),
+            "{answer:?}"
+        );
+    }
+
+    let mut k = FakeKernel::default();
+    k.put(lin(72, 301, 500, 500), "/usr/bin/ssh-agent");
+    k.groups.insert(500, vec![500, 72]);
+    k.partial.insert(500);
+    let asked = std::cell::Cell::new(false);
+    let named = sweep_group(&k, 500, "s", &roots, &Inert).reaped(|| {
+        asked.set(true);
+        Some(true)
+    });
+    assert!(
+        !named.closed() && named.named == ["ssh-agent"] && !asked.get(),
+        "{named:?}"
+    );
+    let never = sweep_group(&FakeKernel::default(), 500, "s", &roots, &Inert).reaped(|| Some(true));
+    assert!(!never.closed() && never.listed.is_none(), "{never:?}");
+}
+
+/// The run's record of its stage groups, live: a real stage that leaves nothing is written
+/// `closed` once its leader is reaped, with no line for the receipt, on every mount of `/proc`
+/// (under `hidepid` its listing is partial, and the kernel's answer about the reaped group closes
+/// it); a group listed in part that still has a member (this test's own) keeps its partial line
+/// and is not closed; and a group whose leader's reap never came is said as its sweep found it
+/// at the run's end. NEGATIVE CONTROL: answer `None` in `crate::exec::group::empty`, and under
+/// `hidepid` the real stage's group stays open with its partial line.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_real_stage_that_leaves_nothing_is_recorded_closed() {
+    use crate::exec::StageGroupEnd as _;
+    let dir = aterm_tempfile::tempdir().expect("tempdir");
+    let ctx = Ctx::new(
+        PathBuf::from("/wt-a"),
+        crate::Scope::workspace(),
+        crate::EnvSnapshot::default(),
+        PathBuf::from("/tmp/atv-s"),
+    );
+    let runs = Runs::open(&ctx, dir.path(), |_, _| crate::exec::Run {
+        ok: false,
+        output: String::new(),
+        code: None,
+        spawn_error: None,
+    })
+    .expect("a record");
+    let cmd = crate::exec::Cmd::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .capture(crate::exec::Capture::Silent);
+    let env = crate::exec::ExecEnv {
+        cwd: dir.path(),
+        path: std::ffi::OsStr::new("/usr/bin:/bin"),
+        scratch: dir.path(),
+        child_ceiling: Some(HANG_DETECTOR),
+        remove_env: &[],
+        add_env: &[],
+        stage_groups: Some(&runs),
+        host: &crate::exec::LIVE_HOST,
+    };
+    let run = crate::exec::run(&cmd, env);
+    assert!(run.ok, "the stage: {}", run.output);
+    let rec = Record::parse(&std::fs::read_to_string(&runs.path).expect("the record"));
+    assert!(
+        rec.groups.len() == 1 && rec.groups[0].closed,
+        "the stage's group is closed: {rec:?}"
+    );
+    assert!(runs.said.lock().expect("said").is_empty());
+
+    // SAFETY: `getpgid(0)` reads this process's group; it signals nothing.
+    let own = u32::try_from(unsafe { libc::getpgid(0) }).expect("this process's group");
+    let partial = |stage: &str| GroupReport {
+        stage: stage.to_owned(),
+        listed: Some(false),
+        ..GroupReport::default()
+    };
+    runs.swept
+        .lock()
+        .expect("swept")
+        .extend([(own, 0, partial("led")), (u32::MAX, 0, partial("unreaped"))]);
+    runs.group_reaped(own, "led");
+    let said = runs.end_of_run(&FakeKernel::default());
+    let text = std::fs::read_to_string(&runs.path).expect("the record");
+    assert_eq!(
+        text.lines().filter(|l| l.starts_with("closed ")).count(),
+        1,
+        "only the stage's group is closed: {text}"
+    );
+    for stage in ["led", "unreaped"] {
+        assert!(
+            said.iter()
+                .any(|l| l.starts_with(&format!("stage {stage}: its group's listing was partial"))),
+            "{stage}: {said:?}"
+        );
+    }
+}
+
+/// A `closed` line, live, through the run's own hooks, on every host: a group listed only in
+/// part whose sweep named nothing is written `closed` once its leader is reaped and the kernel
+/// finds no process in it (each leader here a child of this test's, in a session of its own,
+/// exited and reaped), with no line for the receipt; and a `closed` line never lands on a group
+/// made under the same id after the sweep: one the sweep listed whole is written at once, while
+/// its leader is unreaped, and one listed in part is written after the reap only while no newer
+/// `group` line names the id, so the newer group stays open. NEGATIVE CONTROLS: drop
+/// `GroupReport::reaped` from `Runs::group_reaped`, or answer `None` in
+/// `crate::exec::group::empty`, and the partly listed group stays open, its partial line said;
+/// keep every report for the reap, or write its line whatever the record says since, and the
+/// newer group reads closed.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_closed_line_lands_on_the_group_its_sweep_proved_empty() {
+    use crate::exec::StageGroupEnd as _;
+    let dir = aterm_tempfile::tempdir().expect("tempdir");
+    let ctx = Ctx::new(
+        PathBuf::from("/wt-a"),
+        crate::Scope::workspace(),
+        crate::EnvSnapshot::default(),
+        PathBuf::from("/tmp/atv-s"),
+    );
+    let runs = Runs::open(&ctx, dir.path(), |_, _| crate::exec::Run {
+        ok: false,
+        output: String::new(),
+        code: None,
+        spawn_error: None,
+    })
+    .expect("a record");
+    let reaped_leader = || -> u32 {
+        let mut leader = aterm_uds::spawnfd::command("/bin/sh");
+        leader
+            .args(["-c", "exit 0"])
+            .setsid(true)
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .stdout(aterm_uds::spawnfd::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::null());
+        let mut leader = leader.spawn().expect("a leader");
+        leader.wait().expect("the leader, reaped");
+        leader.id()
+    };
+    // What the sweep keeps of a group it could list only in part (a `/proc` mounted with
+    // `hidepid`), as `group_ended` keeps it.
+    let swept_in_part = |pgid: u32, stage: &str| {
+        let lines = runs
+            .made
+            .lock()
+            .expect("made")
+            .get(&pgid)
+            .copied()
+            .unwrap_or(0);
+        let report = GroupReport {
+            stage: stage.to_owned(),
+            listed: Some(false),
+            ..GroupReport::default()
+        };
+        runs.swept
+            .lock()
+            .expect("swept")
+            .push((pgid, lines, report));
+    };
+
+    let alone = reaped_leader();
+    runs.group_made(alone, "alone");
+    swept_in_part(alone, "alone");
+    runs.group_reaped(alone, "alone");
+
+    let reused = reaped_leader();
+    runs.group_made(reused, "first");
+    swept_in_part(reused, "first");
+    runs.group_made(reused, "second");
+    runs.group_reaped(reused, "first");
+
+    let whole = reaped_leader();
+    runs.group_made(whole, "whole");
+    runs.group_ended(whole, "whole");
+    runs.group_made(whole, "after");
+    runs.group_reaped(whole, "whole");
+
+    let rec = Record::parse(&std::fs::read_to_string(&runs.path).expect("the record"));
+    let closed = |stage: &str| {
+        rec.groups
+            .iter()
+            .find(|g| g.stage == stage)
+            .unwrap_or_else(|| panic!("no group {stage}: {rec:?}"))
+            .closed
+    };
+    assert!(closed("alone"), "{rec:?}");
+    assert!(!closed("first") && !closed("second"), "{rec:?}");
+    assert!(!closed("after"), "{rec:?}");
+    // Under `hidepid` the whole group's own listing is partial too, and the newer line keeps it
+    // open.
+    assert_eq!(
+        closed("whole"),
+        aterm_uds::process::group_listing_can_be_whole(),
+        "{rec:?}"
+    );
+    let said = runs.said.lock().expect("said").clone();
+    assert!(
+        !said.iter().any(|l| l.starts_with("stage alone:")),
+        "{said:?}"
+    );
+}
+
+/// Selects the dead run's launcher stand-in: set, this test binary is a verify run's launcher,
+/// and its value is the scratch directory whose `records` it writes its run's record into.
+const LAUNCHER_ENV: &str = "ATERM_VERIFY_LAUNCHER_CHILD";
+
+/// A verify run's launcher, as far as a later run's start pass reads one: it writes its run's
+/// record (its id, boot and unique id read off the kernel, this test binary as its one root, no
+/// stage group), starts two [`a_stage_survivor_stand_in`]s from this binary, `marked` carrying
+/// the run's id in `ATERM_VERIFY_RUN` as a stage child does and `unmarked` with none, and waits
+/// to be killed, or for the hang detector. Without [`LAUNCHER_ENV`] it returns at once.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_dead_runs_launcher_stand_in() {
+    let Some(dir) = std::env::var_os(LAUNCHER_ENV).map(PathBuf::from) else {
+        return;
+    };
+    let me = i32::try_from(std::process::id()).expect("a pid");
+    let id = RunId {
+        pid: me,
+        birth: read_birth(me).expect("this process reads its birth"),
+    };
+    let uniqueid = read_lineage(me).expect("this process's lineage").uniqueid;
+    let exe = std::env::current_exe().expect("this test binary");
+    let header = header_text(
+        &boot_id().expect("a boot id"),
+        id,
+        uniqueid,
+        aterm_time::unix_millis().unwrap_or(0),
+        None,
+        &[canonical(&exe)],
+    );
+    std::fs::write(
+        dir.join("records").join(format!("{}.run", id.text())),
+        header,
+    )
+    .expect("the run's record");
+    let survivor = |name: &str, marked: bool| {
+        let at = dir.join(name);
+        std::fs::create_dir(&at).expect("the survivor's directory");
+        let mut cmd = aterm_uds::spawnfd::command(&exe);
+        cmd.args([
+            "--exact",
+            "runs::tests::a_stage_survivor_stand_in",
+            "--nocapture",
+        ])
+        .env(SURVIVOR_ENV, &at)
+        .env_remove(LAUNCHER_ENV)
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .stdout(aterm_uds::spawnfd::Stdio::null())
+        .stderr(aterm_uds::spawnfd::Stdio::null());
+        if marked {
+            cmd.env(VERIFY_RUN_ENV, id.text());
+        } else {
+            cmd.env_remove(VERIFY_RUN_ENV);
+        }
+        cmd.spawn().expect("a survivor")
+    };
+    let _survivors = [survivor("marked", true), survivor("unmarked", false)];
+    std::thread::sleep(HANG_DETECTOR);
+}
+
+/// The live kernel with its listing of this user's processes narrowed to `only`: every read and
+/// every signal is the live kernel's.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+struct Listing {
+    only: Vec<i32>,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl Kernel for Listing {
+    fn birth(&self, pid: i32) -> Option<Birth> {
+        LiveKernel.birth(pid)
+    }
+    fn presence(&self, pid: i32) -> ProcessPresence {
+        LiveKernel.presence(pid)
+    }
+    fn lineage(&self, pid: i32) -> Option<Lineage> {
+        LiveKernel.lineage(pid)
+    }
+    fn members(&self, pgid: u32) -> Option<GroupMembers> {
+        LiveKernel.members(pgid)
+    }
+    fn exe(&self, pid: i32) -> Option<PathBuf> {
+        LiveKernel.exe(pid)
+    }
+    fn markers(&self, pid: i32) -> Option<Markers> {
+        LiveKernel.markers(pid)
+    }
+    fn held(&self, pid: i32) -> Option<bool> {
+        LiveKernel.held(pid)
+    }
+    fn held_now(&self) -> Option<HeldNow> {
+        LiveKernel.held_now()
+    }
+    fn launchd_version(&self) -> Option<i32> {
+        LiveKernel.launchd_version()
+    }
+    fn tty_master_held(&self, dev: u32) -> Option<bool> {
+        LiveKernel.tty_master_held(dev)
+    }
+    fn uid_pids(&self) -> Option<Vec<i32>> {
+        let live = LiveKernel.uid_pids()?;
+        Some(live.into_iter().filter(|p| self.only.contains(p)).collect())
+    }
+    fn now_ms(&self) -> u64 {
+        LiveKernel.now_ms()
+    }
+    fn end(&self, token: Identity, still: &dyn Fn(&Identity) -> bool) -> Result<Ended, EndRefusal> {
+        LiveKernel.end(token, still)
+    }
+}
+
+/// A dead run's launcher stand-in, `SIGKILL`ed and reaped when dropped unless the test reaped it,
+/// so a test that fails first leaves none behind (its survivors end as the test's scratch goes).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+struct Launcher(aterm_uds::spawnfd::Child);
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl Drop for Launcher {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// A verify run really SIGKILLed: its launcher ([`a_dead_runs_launcher_stand_in`], in a session
+/// of its own, so no terminal's master holds its children) wrote its record and started two
+/// survivors from its root, then got `SIGKILL`, and launchd or init adopted them. The next run's
+/// start pass on the live kernel reads the launcher dead and ends the survivor that carries the
+/// run's id (W-run, C-tree, orphaned, its thread ran), through `end_proven`; it leaves the one
+/// that carries no id running, unsignalled, as no member of the run's; and with nothing named or
+/// unjudged it removes the record. The pass lists only the two survivors ([`Listing`]): the dead
+/// run's root is this test binary, and a copy another test of this binary starts in the run's
+/// window, its first thread not yet run as the pass reads it, is held at macOS's program check,
+/// so it would be counted unjudged and the record kept. NEGATIVE CONTROLS: make
+/// `Judge::judge`'s `w_run` false, and the marked survivor is left too: nothing is ended; list
+/// every process of this user while another test's copy of this binary is held, and the pass
+/// says `1 held at macOS's program check, not judged`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_sigkilled_runs_marked_orphan_is_ended_by_the_next_runs_start_pass() {
+    if let Some(translator) = aterm_uds::process::translator()
+        && !aterm_uds::process::translator_holds_its_program()
+    {
+        println!(
+            "NOT RUN under {translator}: runs::tests::\
+             a_sigkilled_runs_marked_orphan_is_ended_by_the_next_runs_start_pass: the kernel \
+             hands this translator no program it maps executable, so the survivor reads as the \
+             translator, under no root, and is not the run's"
+        );
+        return;
+    }
+    let until = |what: &str, done: &mut dyn FnMut() -> bool| {
+        let deadline = std::time::Instant::now() + HANG_DETECTOR;
+        while !done() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what}: past the hang detector"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let exe = std::env::current_exe().expect("this test binary");
+    let word = exe_word(&exe).expect("a test binary's word");
+    let scratch = aterm_tempfile::tempdir().expect("scratch");
+    let records = scratch.path().join("records");
+    std::fs::create_dir(&records).expect("the records directory");
+    let mut launcher = aterm_uds::spawnfd::command(&exe);
+    launcher
+        .args([
+            "--exact",
+            "runs::tests::a_dead_runs_launcher_stand_in",
+            "--nocapture",
+        ])
+        .env(LAUNCHER_ENV, scratch.path())
+        .setsid(true)
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .stdout(aterm_uds::spawnfd::Stdio::null())
+        .stderr(aterm_uds::spawnfd::Stdio::null());
+    let mut launcher = Launcher(launcher.spawn().expect("the launcher"));
+    let launcher_pid = launcher.0.id();
+    let survivor = |name: &str| -> (i32, Birth) {
+        let file = scratch.path().join(name).join("pid");
+        until(&format!("the {name} survivor's pid"), &mut || {
+            file.is_file()
+        });
+        let written = std::fs::read_to_string(&file).expect("the survivor's pid");
+        written
+            .split_once(' ')
+            .and_then(|(pid, birth)| Some((pid.parse().ok()?, Birth(birth.trim().parse().ok()?))))
+            .unwrap_or_else(|| panic!("`<pid> <birth>`: {written:?}"))
+    };
+    // Each survivor wrote its pid, so both ran, and the launcher had written its record first.
+    let (marked, unmarked) = (survivor("marked"), survivor("unmarked"));
+    launcher.0.kill().expect("SIGKILL to the launcher");
+    launcher.0.wait().expect("the launcher, reaped");
+    for (pid, _) in [marked, unmarked] {
+        until(&format!("pid {pid}'s adoption"), &mut || {
+            read_lineage(pid).is_some_and(|l| l.parent != launcher_pid)
+        });
+    }
+    let root = canonical(&exe);
+    let mut lines = Vec::new();
+    let ended = end_dead_runs(
+        &records,
+        &boot_id().expect("a boot id"),
+        i32::try_from(std::process::id()).expect("a pid"),
+        &Listing {
+            only: vec![marked.0, unmarked.0],
+        },
+        &mut |l| lines.push(l.to_owned()),
+        &Inert,
+    );
+    let left = |(pid, birth): (i32, Birth)| match read_birth(pid) {
+        Some(now) => now != birth,
+        None => process_presence(pid) != ProcessPresence::Present,
+    };
+    assert!(
+        !left(unmarked),
+        "the unmarked survivor was ended: {lines:?}"
+    );
+    assert_eq!(ended, 1, "{lines:?}");
+    assert_eq!(
+        lines,
+        [format!(
+            "the verify run of pid {launcher_pid} ({}) left 1 processes: ended {word} \u{d7}1",
+            root.display()
+        )]
+    );
+    assert!(left(marked), "the marked survivor outlived its end");
+    assert!(
+        std::fs::read_dir(&records)
+            .expect("the records directory")
+            .next()
+            .is_none(),
+        "the dead run's record is removed"
+    );
+    std::fs::write(scratch.path().join("unmarked").join("stop"), "").expect("stop");
+    until("the unmarked survivor's own end", &mut || left(unmarked));
 }
 
 /// THE RUN-START LINE COUNTS WHAT MACOS'S PROGRAM CHECK HOLDS: this user's programs the one
@@ -1868,4 +2582,223 @@ fn the_run_start_line_counts_held_programs_and_reads_the_listing_only_then() {
             "macOS's program check: 1 program waiting, the oldest started 20 s ago (aterm listed: yes)"
         )
     );
+}
+
+/// A dead run's start pass lays out: its stage leader 500, orphaned and running its build
+/// (W-group, C-tree), and pid 71, out of every group but carrying the run's id (W-run, C-tree),
+/// which outlives its `SIGTERM`.
+fn two_dead_members(k: &mut FakeKernel) {
+    with_me(k, 5_000);
+    k.put(lin(500, 300, 500, 1), "/wt-a/target/debug/aterm");
+    k.put(lin(71, 310, 71, 1), "/wt-a/target/debug/deps/aterm_x-1");
+    k.markers.insert(71, verify_run(DEAD_ID));
+    k.stubborn.insert(71);
+}
+
+/// What a dead run's start pass ends unasked is told once, after the pass: one line per process
+/// with the witness that made it the run's (its stage group, or its run id) and C-tree, its
+/// signals and that it is gone. The receipt's lines and the count are what the pass makes with
+/// nobody told. NEGATIVE CONTROL: drop the post from `end_dead_runs`, and nothing is told.
+#[test]
+fn a_dead_runs_ended_member_posts_one_auto_end_record_with_its_proof() {
+    let mut quiet = FakeKernel::default();
+    two_dead_members(&mut quiet);
+    let dir = records(&[("41983-999.run", &dead_record())]);
+    let unheard = start_pass(dir.path(), &quiet);
+
+    let mut k = FakeKernel::default();
+    two_dead_members(&mut k);
+    let dir = records(&[("41983-999.run", &dead_record())]);
+    let poster = Recording::default();
+    let heard = start_pass_telling(dir.path(), &k, &poster);
+    assert_eq!(k.termed(), [500, 71], "{heard:?}");
+    assert_eq!(heard, unheard, "telling changes no verdict and no line");
+    assert_eq!(heard.0, 2);
+    assert_eq!(
+        poster.told(),
+        [vec![
+            "verify ended aterm (pid 500), left by the verify run of pid 41983 (/wt-a): proof \
+             group,tree; SIGTERM; gone"
+                .to_owned(),
+            "verify ended aterm_x-1 (pid 71), left by the verify run of pid 41983 (/wt-a): \
+             proof run,tree; SIGTERM, then SIGKILL; gone"
+                .to_owned(),
+        ]]
+    );
+}
+
+/// A stage's sweep tells each member it ended, by its stage group, and nothing of the members
+/// it named.
+#[test]
+fn a_stage_sweep_tells_each_member_it_ended() {
+    let roots = vec![PathBuf::from("/wt-a")];
+    let mut k = FakeKernel::default();
+    k.put(lin(71, 300, 500, 500), "/wt-a/target/debug/aterm");
+    k.put(lin(72, 301, 500, 500), "/usr/bin/ssh-agent");
+    k.groups.insert(500, vec![500, 71, 72]);
+    let poster = Recording::default();
+    let report = sweep_group(&k, 500, "test -p aterm-link", &roots, &poster);
+    assert_eq!(report.ended, ["aterm"], "{report:?}");
+    assert_eq!(report.named, ["ssh-agent"], "{report:?}");
+    assert_eq!(
+        poster.told(),
+        [vec![
+            "verify ended aterm (pid 71), left in stage `test -p aterm-link`'s group: proof \
+             group,tree; SIGTERM; gone"
+                .to_owned()
+        ]]
+    );
+}
+
+/// With no instance to tell (no session, or no instance hosting it, or one whose socket answers
+/// nothing), the pass ends what it ends, says what it says, and returns.
+#[test]
+fn a_run_with_no_instance_posts_nothing_and_its_verdict_stands() {
+    let mut quiet = FakeKernel::default();
+    two_dead_members(&mut quiet);
+    let dir = records(&[("41983-999.run", &dead_record())]);
+    let unheard = start_pass(dir.path(), &quiet);
+
+    let rendezvous = aterm_tempfile::tempdir().expect("tempdir");
+    let graph = rendezvous.path().join("graph");
+    std::fs::create_dir(&graph).expect("graph");
+    let sock = rendezvous.path().join("gone.sock");
+    std::fs::write(graph.join("s-dead"), format!("sock {}\n", sock.display())).expect("entry");
+    for poster in [
+        ToInstance::default(),
+        ToInstance {
+            sid: Some("s-0b0d1e5".to_owned()),
+            dir: Some(rendezvous.path().to_path_buf()),
+        },
+        ToInstance {
+            sid: Some("s-dead".to_owned()),
+            dir: Some(rendezvous.path().to_path_buf()),
+        },
+    ] {
+        let mut k = FakeKernel::default();
+        two_dead_members(&mut k);
+        let dir = records(&[("41983-999.run", &dead_record())]);
+        assert_eq!(
+            start_pass_telling(dir.path(), &k, &poster),
+            unheard,
+            "{poster:?}"
+        );
+        assert!(!dir.path().join("41983-999.run").exists(), "{poster:?}");
+    }
+}
+
+/// The instance hosting the run's session, as its graph entry names it, is told each line as
+/// one `appnotice proc` after the instance token's `AUTH`, on one connection.
+#[cfg(unix)]
+#[test]
+fn the_hosting_instance_is_told_each_line_as_an_appnotice_proc() {
+    use std::io::{BufRead as _, Write as _};
+    let rendezvous = aterm_tempfile::tempdir().expect("tempdir");
+    let graph = rendezvous.path().join("graph");
+    std::fs::create_dir(&graph).expect("graph");
+    let sock = rendezvous.path().join("fake.sock");
+    std::fs::write(graph.join("s-5e55"), format!("sock {}\n", sock.display())).expect("entry");
+    let token = rendezvous
+        .path()
+        .join(aterm_types::control_socket::token_name_for_sock(
+            "fake.sock",
+        ));
+    std::fs::write(&token, "cafef00d\n").expect("token");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let instance = std::thread::spawn(move || {
+        let must = aterm_spec::wait::MUST_HAPPEN;
+        let (conn, _) = aterm_spec::wait::until_within(must, "the post's connection", || {
+            listener.accept().ok()
+        });
+        conn.set_nonblocking(false).expect("blocking");
+        conn.set_read_timeout(Some(must)).expect("a hang detector");
+        let mut reader = std::io::BufReader::new(conn.try_clone().expect("clone"));
+        let mut heard = Vec::new();
+        for _ in 0..3 {
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("a request line");
+            if line.starts_with("appnotice ") {
+                (&conn).write_all(b"OK recorded\n").expect("reply");
+            }
+            heard.push(line);
+        }
+        heard
+    });
+    ToInstance {
+        sid: Some("s-5e55".to_owned()),
+        dir: Some(rendezvous.path().to_path_buf()),
+    }
+    .post(&["verify ended aterm (pid 71)".to_owned(), "a\nb".to_owned()]);
+    assert_eq!(
+        instance.join().expect("the instance"),
+        [
+            "AUTH cafef00d\n",
+            "appnotice proc verify ended aterm (pid 71)\n",
+            "appnotice proc a b\n",
+        ]
+    );
+}
+
+/// A post that never ends (a connect the kernel blocks, an instance that stopped mid-reply) holds
+/// its own thread, never the pass that posts: `within` returns once its bound is up. NEGATIVE
+/// CONTROL: run the post on the pass's own thread, and the pass never returns (the one-minute
+/// hang detector trips).
+#[test]
+fn a_post_that_never_ends_holds_no_pass() {
+    let (release, blocked) = std::sync::mpsc::channel::<()>();
+    let (returned, back) = std::sync::mpsc::channel();
+    let pass = std::thread::spawn(move || {
+        within(Duration::from_millis(10), move || {
+            let _ = blocked.recv();
+        });
+        let _ = returned.send(());
+    });
+    assert!(
+        back.recv_timeout(aterm_spec::wait::MUST_HAPPEN).is_ok(),
+        "the pass waited on a post that never ends"
+    );
+    drop(release);
+    pass.join().expect("the pass");
+}
+
+/// Each line is cut within the bytes an `appnotice` carries at a character boundary, so a line
+/// of multibyte characters (a run's root named in CJK or emoji) is told cut, never dropped by the
+/// instance for being over its 512 bytes; control characters read as spaces. NEGATIVE CONTROL:
+/// cut at 400 characters, and 400 two-byte characters are 800 bytes.
+#[test]
+fn a_notice_line_is_cut_by_bytes_at_a_character_boundary() {
+    let wide = notice_text(&"é".repeat(400));
+    assert!(wide.len() <= NOTICE_TEXT_BYTES, "{} bytes", wide.len());
+    assert_eq!(wide, "é".repeat(NOTICE_TEXT_BYTES / 2));
+    let emoji = notice_text(&format!("a{}", "🦀".repeat(200)));
+    assert!(emoji.len() <= NOTICE_TEXT_BYTES, "{} bytes", emoji.len());
+    assert!(emoji.starts_with("a🦀"), "{emoji}");
+    assert_eq!(notice_text(&"x".repeat(500)).len(), NOTICE_TEXT_BYTES);
+    assert_eq!(notice_text("a\nb\tc"), "a b c");
+}
+
+/// A run's record tells nobody until verify's own entry hands it a poster
+/// ([`Runs::telling`]), so no test's sweep reaches an instance.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+#[test]
+fn the_default_poster_is_inert() {
+    let dir = aterm_tempfile::tempdir().expect("tempdir");
+    let ctx = Ctx::new(
+        PathBuf::from("/wt-a"),
+        crate::Scope::workspace(),
+        crate::EnvSnapshot::default(),
+        PathBuf::from("/tmp/atv-s"),
+    );
+    let runs = Runs::open(&ctx, dir.path(), |_, _| crate::exec::Run {
+        ok: false,
+        output: String::new(),
+        code: None,
+        spawn_error: None,
+    })
+    .expect("a record");
+    assert_eq!(format!("{:?}", runs.poster), format!("{Inert:?}"));
+    let told = Recording::default();
+    let runs = runs.telling(Box::new(told));
+    assert!(format!("{:?}", runs.poster).starts_with("Recording"));
 }

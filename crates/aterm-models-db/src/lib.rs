@@ -7,6 +7,8 @@ use aterm_spec::derive::Model;
 
 mod account_plan;
 pub use account_plan::account_plan_model;
+mod proposal_conditional;
+pub use proposal_conditional::proposal_conditional_model;
 mod account_activation;
 pub use account_activation::account_activation_model;
 mod verified_entry;
@@ -14,20 +16,66 @@ pub use verified_entry::verified_entry_model;
 
 mod dispatch;
 pub use dispatch::resource_dispatch_model;
+mod bound_request;
+pub use bound_request::bound_request_model;
+mod billing;
+pub use billing::billing_model;
+mod metered_dispatch;
+pub use metered_dispatch::metered_dispatch_model;
+mod broker_capability;
+pub use broker_capability::broker_capability_model;
+mod broker_transport;
+pub use broker_transport::broker_transport_model;
+mod broker_host;
+pub use broker_host::broker_host_model;
+mod broker_preparation;
+pub use broker_preparation::broker_preparation_model;
+mod broker_selection;
+pub use broker_selection::broker_selection_model;
+mod broker_refresh;
+pub use broker_refresh::broker_refresh_model;
+mod entry_version;
+pub use entry_version::entry_version_model;
 mod resource_retirement;
 pub use resource_retirement::resource_retirement_model;
+mod resource_recovery;
+pub use resource_recovery::resource_recovery_model;
 mod discovery;
 pub use discovery::discovery_replacement_model;
 mod enrollment_gate;
 pub use enrollment_gate::enrollment_gate_model;
 mod repair_policy;
 pub use repair_policy::repair_policy_model;
+mod account_exchange;
+pub use account_exchange::{account_exchange_admission_model, account_exchange_retention_model};
+mod relay_history;
+pub use relay_history::relay_history_model;
+mod vault_network_materialization;
+pub use vault_network_materialization::{
+    vault_network_materialization_admission_model, vault_network_materialization_projection_model,
+};
+mod vault_http204;
+pub use vault_http204::vault_http204_model;
+mod vault_network_refresh;
+pub use vault_network_refresh::vault_network_refresh_model;
+mod table_recovery;
+pub use table_recovery::table_recovery_model;
+mod recovery_decision;
+pub use recovery_decision::recovery_decision_model;
+mod recovery_dispatch;
+pub use recovery_dispatch::recovery_dispatch_model;
+mod recovery_cooldown;
+pub use recovery_cooldown::recovery_cooldown_model;
 mod credential_request;
 pub use credential_request::{credential_request_liveness, credential_request_model};
+mod credential_delivery;
+pub use credential_delivery::credential_delivery_model;
 mod claim_publication;
 pub use claim_publication::claim_publication_model;
 mod claim_ring;
 pub use claim_ring::claim_ring_model;
+mod import_comparison;
+pub use import_comparison::import_comparison_model;
 
 /// Bounded executions of the durable fixed-share reservation API. Initial pins
 /// are assumed coherent across consumers; this model grants no provider access.
@@ -538,7 +586,8 @@ pub fn authority_custody_model() -> Model {
 }
 
 /// A Commons source document is published atomically and retried exactly.
-/// Both import backends reject ambiguous source headers before writing records.
+/// Both import backends reject ambiguous source headers before writing records;
+/// previewing a candidate publishes no table and writes no operation.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn import_atomic_model() -> Model {
@@ -557,11 +606,17 @@ pub fn import_atomic_model() -> Model {
                 phase = 3; effects = if Buggy == 3 { 2 } else { 1 };
                 stable = if Buggy == 4 { 0 } else { 1 };
             }
+            action Preview when (phase == 0) {
+                phase = 4; published = if Buggy == 6 { 1 } else { 0 };
+                effects = if Buggy == 7 { 1 } else { 0 };
+            }
             invariant RejectBeforePublication: phase == 0 || phase > 1 || published == 0;
             invariant RejectBeforeWrites: phase == 0 || phase > 1 || effects == 0;
-            invariant AtomicSource: phase <= 1 || effects > 0;
+            invariant AtomicSource: phase <= 1 || phase == 4 || effects > 0;
             invariant OneEffect: effects <= 1;
             invariant OriginalReceipt: stable == 1;
+            invariant PreviewBeforePublication: 4 > phase || published == 0;
+            invariant PreviewBeforeWrites: 4 > phase || effects == 0;
         }
     }
 }

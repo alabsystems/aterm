@@ -128,7 +128,16 @@ pub(crate) struct Inert {
     founded: Mutex<Result<String, String>>,
     accounts: Mutex<AccountsRead>,
     release: Mutex<ReleaseRead>,
+    github: Mutex<GithubRead>,
+    /// What `sync.clone` reads ([`Ports::owed_clone`]).
+    owed: Mutex<crate::init::OwedClone>,
     fabric: Mutex<FabricRead>,
+    /// `sync.awake`'s read: right by default, so the other kinds' tests count none of it.
+    awake: Mutex<AwakeRead>,
+    /// What `sync.awake`'s apply answers; an `Ok` makes the read right.
+    awake_done: Mutex<Result<String, String>>,
+    /// Whether the person turned aCaffiene's Enable at Startup off ([`Ports::awake_startup_off`]).
+    awake_startup_off: AtomicBool,
     /// What a renewal of the broker ends in ([`Ports::renew_broker`]).
     renewed: Mutex<Result<String, String>>,
     peers: Mutex<PeersRead>,
@@ -146,6 +155,9 @@ pub(crate) struct Inert {
     pub(crate) ran_elsewhere: Mutex<Vec<(PathBuf, Vec<String>)>>,
     pub(crate) elsewhere_exit: Mutex<Result<Option<i32>, String>>,
     refreshed_subscribers: AtomicU32,
+    /// Why System State holds the vault out ([`Ports::vault_held`]), and how often it was read.
+    held: Mutex<Option<String>>,
+    held_reads: AtomicU32,
     /// At each sync kind's read, whether another take of the pass's lock found it held.
     locked_at_reads: Mutex<Vec<bool>>,
     sleeps: Mutex<Vec<Duration>>,
@@ -166,6 +178,8 @@ impl Inert {
             released_at_first_read: Mutex::new(None),
             backgrounds: AtomicU32::new(0),
             refreshed_subscribers: AtomicU32::new(0),
+            held: Mutex::new(None),
+            held_reads: AtomicU32::new(0),
             build: Mutex::new("0.145.0+gabc".to_owned()),
             routes: Mutex::new(vec!["192.0.2.7".to_owned(), "-".to_owned()]),
             now: AtomicU64::new(1_000_000_000),
@@ -175,6 +189,10 @@ impl Inert {
             released: Arc::new(AtomicU32::new(0)),
             applies: Mutex::new(Vec::new()),
             vault: Mutex::new(VaultRead::Runs("runs (pid 7)".to_owned())),
+            github: Mutex::new(GithubRead::NotApplicable("no vault helper".into())),
+            owed: Mutex::new(crate::init::OwedClone::Nothing(
+                "aterm init owes no clone".into(),
+            )),
             identity: Mutex::new(IdentityRead::Current(
                 "label m15 in [ai] and [fleet] machine".to_owned(),
             )),
@@ -198,6 +216,9 @@ impl Inert {
             fabric: Mutex::new(FabricRead::Due(
                 "the broker runs a replaced build".to_owned(),
             )),
+            awake: Mutex::new(AwakeRead::Current("the mug (pid 9) holds".to_owned())),
+            awake_done: Mutex::new(Ok("launchd was asked to start the mug".to_owned())),
+            awake_startup_off: AtomicBool::new(false),
             renewed: Mutex::new(Ok("renewed".to_owned())),
             peers: Mutex::new(PeersRead::Joined("in vault alab".to_owned())),
             peer_looks: Mutex::new(Vec::new()),
@@ -295,6 +316,10 @@ impl Ports for Inert {
     }
     fn window_runs(&self) -> bool {
         self.window
+    }
+    fn vault_held(&self) -> Option<String> {
+        self.held_reads.fetch_add(1, Ordering::SeqCst);
+        self.held.lock().unwrap().clone()
     }
     fn swarm_enabled(&self) -> Result<bool, String> {
         self.swarm.lock().unwrap().clone()
@@ -425,6 +450,29 @@ impl Ports for Inert {
         *self.release.lock().unwrap() = ReleaseRead::Current("unattended signature proved".into());
         Ok("unattended signature proved".into())
     }
+    fn github(&self) -> Result<GithubRead, String> {
+        self.read(&self.github)
+    }
+    fn sync_github(&self) -> Result<String, String> {
+        self.applied("github");
+        *self.github.lock().unwrap() = GithubRead::Current("vault helper verified".into());
+        Ok("vault helper verified".into())
+    }
+    fn owed_clone(&self) -> Result<crate::init::OwedClone, String> {
+        self.read(&self.owed)
+    }
+    fn clone_owed(&self) -> Result<String, String> {
+        self.applied("clone");
+        *self.owed.lock().unwrap() =
+            crate::init::OwedClone::Nothing("aterm init owes no clone".into());
+        Ok("cloned".into())
+    }
+    fn forget_owed_clone(&self) -> Result<(), String> {
+        self.applied("forget clone");
+        *self.owed.lock().unwrap() =
+            crate::init::OwedClone::Nothing("aterm init owes no clone".into());
+        Ok(())
+    }
     fn fabric(&self) -> Result<FabricRead, String> {
         self.read(&self.fabric)
     }
@@ -440,6 +488,20 @@ impl Ports for Inert {
         self.applied("fabric-on");
         *self.fabric.lock().unwrap() = FabricRead::Current("the broker runs this build".into());
         Ok("turned on".to_owned())
+    }
+    fn awake(&self) -> Result<AwakeRead, String> {
+        self.read(&self.awake)
+    }
+    fn awake_startup_off(&self) -> bool {
+        self.awake_startup_off.load(Ordering::SeqCst)
+    }
+    fn keep_awake(&self) -> Result<String, String> {
+        self.applied("awake");
+        let done = self.awake_done.lock().unwrap().clone();
+        if done.is_ok() {
+            *self.awake.lock().unwrap() = AwakeRead::Current("the mug (pid 9) holds".to_owned());
+        }
+        done
     }
     fn peers(&self, look: bool) -> Result<PeersRead, String> {
         self.peer_looks.lock().unwrap().push(look);
@@ -672,6 +734,55 @@ fn signing_files_stay_pending_until_the_automatic_pass_proves_a_signature() {
     assert_eq!(row(&checked.rows, RELEASE).outcome, Outcome::Ok);
 }
 
+/// The clone an `aterm init` owes waits for the vault's GitHub token, then runs in the
+/// subscriber's pass once, and never again; a plan only plans it.
+#[test]
+fn the_subscribers_pass_runs_the_clone_init_owes_once_its_token_lands() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let ports = Inert::new(scratch.path());
+    let clones = |ports: &Inert| {
+        ports
+            .applies()
+            .iter()
+            .filter(|kind| **kind == "clone")
+            .count()
+    };
+    *ports.owed.lock().unwrap() = crate::init::OwedClone::Waiting("no token yet".into());
+    let waiting = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
+    assert_eq!(row(&waiting.rows, CLONE).outcome, Outcome::Deferred);
+    *ports.owed.lock().unwrap() = crate::init::OwedClone::Due("the token landed".into());
+    let planned = ran(ports.pass(Trigger::Init, Mode::Plan));
+    assert_eq!(row(&planned.rows, CLONE).outcome, Outcome::Planned);
+    assert_eq!(clones(&ports), 0);
+    let applied = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
+    assert_eq!(row(&applied.rows, CLONE).outcome, Outcome::Changed);
+    let again = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
+    assert_eq!(row(&again.rows, CLONE).outcome, Outcome::Ok);
+    assert_eq!(clones(&ports), 1, "once");
+}
+
+#[test]
+fn subscriber_repairs_the_git_helper_and_a_swarm_off_never_does() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let ports = Inert::new(scratch.path());
+    *ports.github.lock().unwrap() = GithubRead::Due("managed override shadows vault helper".into());
+    let planned = ran(ports.pass(Trigger::Init, Mode::Plan));
+    assert_eq!(row(&planned.rows, GITHUB).outcome, Outcome::Planned);
+    assert!(!ports.applies().contains(&"github"));
+    *ports.swarm.lock().unwrap() = Ok(false);
+    let off = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
+    assert_eq!(row(&off.rows, GITHUB).outcome, Outcome::NotApplicable);
+    assert!(!ports.applies().contains(&"github"));
+    *ports.swarm.lock().unwrap() = Ok(true);
+    let applied = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
+    assert_eq!(row(&applied.rows, GITHUB).outcome, Outcome::Changed);
+    assert!(ports.applies().contains(&"github"));
+    assert_eq!(
+        row(&ran(ports.pass(Trigger::Init, Mode::Plan)).rows, GITHUB).outcome,
+        Outcome::Ok
+    );
+}
+
 /// A person's off switch leaves its kind as it is: the row reads `NotApplicable`, naming it, and
 /// nothing of that kind is applied.
 #[test]
@@ -689,6 +800,8 @@ fn each_off_switch_reads_not_applicable_and_applies_nothing() {
     *ports.shared.lock().unwrap() = SharedRead::Off;
     *ports.accounts.lock().unwrap() = AccountsRead::Off;
     *ports.fabric.lock().unwrap() = FabricRead::NotApplicable("the fabric is off".to_owned());
+    *ports.awake.lock().unwrap() =
+        AwakeRead::NotApplicable("aCaffiene is off by your choice".to_owned());
     let pass = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
     for (id, says) in [
         (VAULT, "agent on"),
@@ -698,6 +811,7 @@ fn each_off_switch_reads_not_applicable_and_applies_nothing() {
         (SHARED_DATA, "[commons] enabled = false"),
         (ACCOUNTS, "[harness] accounts = \"off\""),
         (FABRIC, "the fabric is off"),
+        (AWAKE, "off by your choice"),
     ] {
         let left = row(&pass.rows, id);
         assert_eq!(left.outcome, Outcome::NotApplicable, "{left:?}");
@@ -1445,6 +1559,69 @@ fn outside_the_accounts_own_login_a_pass_refuses_and_reads_nothing() {
     assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 0);
 }
 
+/// The subscriber's pass, which runs with no window (after a restart, say), starts the mug when
+/// none runs, and reads it back held; a mug that runs and asks
+/// macOS again itself is left to it, a failed start fails the row for the next pass, and the
+/// window's own passes leave it to the window's watch.
+/// NEGATIVE CONTROL: with `Kind::Awake` out of `sync_items`, no `sync.awake` row is found.
+#[test]
+fn the_subscribers_pass_keeps_this_mac_awake() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let ports = Inert::new(scratch.path());
+    *ports.awake.lock().unwrap() = AwakeRead::Due("no aCaffiene mug runs".to_owned());
+    let pass = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
+    let kept = row(&pass.rows, AWAKE);
+    assert_eq!(kept.outcome, Outcome::Changed, "{kept:?}");
+    assert!(ports.applies().contains(&"awake"));
+
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let ports = Inert::new(scratch.path());
+    *ports.awake.lock().unwrap() = AwakeRead::Due("no aCaffiene mug runs".to_owned());
+    *ports.awake_done.lock().unwrap() = Err("launchctl bootstrap: 5".to_owned());
+    let pass = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
+    assert_eq!(row(&pass.rows, AWAKE).outcome, Outcome::Failed);
+
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let ports = Inert::new(scratch.path());
+    *ports.awake.lock().unwrap() =
+        AwakeRead::Asking("macOS refused the keep-awake activity".to_owned());
+    let pass = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
+    assert_eq!(row(&pass.rows, AWAKE).outcome, Outcome::Deferred);
+    assert!(!ports.applies().contains(&"awake"));
+
+    for trigger in [Trigger::Window, Trigger::Setup] {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let ports = Inert::new(scratch.path());
+        *ports.awake.lock().unwrap() = AwakeRead::Due("no aCaffiene mug runs".to_owned());
+        let pass = ran(ports.pass(trigger, Mode::Apply));
+        assert_eq!(row(&pass.rows, AWAKE).outcome, Outcome::NotApplicable);
+        assert!(!ports.applies().contains(&"awake"), "{trigger:?}");
+    }
+}
+
+/// A person who turned aCaffiene's Enable at Startup off chose no mug at login: the subscriber's
+/// pass, which runs at login with no window, starts none, while a person's `aterm init
+/// --converge` still does (and an aterm window's watch, which no pass is).
+#[test]
+fn the_subscribers_pass_keeps_a_persons_startup_off() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let ports = Inert::new(scratch.path());
+    *ports.awake.lock().unwrap() = AwakeRead::Due("no aCaffiene mug runs".to_owned());
+    ports.awake_startup_off.store(true, Ordering::SeqCst);
+    let pass = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
+    let left = row(&pass.rows, AWAKE);
+    assert_eq!(left.outcome, Outcome::NotApplicable, "{left:?}");
+    assert!(!ports.applies().contains(&"awake"));
+
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let ports = Inert::new(scratch.path());
+    *ports.awake.lock().unwrap() = AwakeRead::Due("no aCaffiene mug runs".to_owned());
+    ports.awake_startup_off.store(true, Ordering::SeqCst);
+    let pass = ran(ports.pass(Trigger::Init, Mode::Apply));
+    assert_eq!(row(&pass.rows, AWAKE).outcome, Outcome::Changed);
+    assert!(ports.applies().contains(&"awake"));
+}
+
 #[test]
 fn the_ledger_line_names_the_build_the_trigger_a_tally_and_what_is_left() {
     let scratch = aterm_tempfile::tempdir().unwrap();
@@ -1606,6 +1783,7 @@ fn swarm_enabled_false_marks_every_sync_item_not_applicable_and_reads_nothing() 
     *ports.peers.lock().unwrap() = PeersRead::Joinable("open vault alab".to_owned());
     *ports.shared.lock().unwrap() =
         SharedRead::Foundable("vault alab has no Commons control".to_owned());
+    *ports.awake.lock().unwrap() = AwakeRead::Due("no aCaffiene mug runs".to_owned());
     *ports.swarm.lock().unwrap() = Ok(false);
 
     for trigger in [
@@ -1624,6 +1802,7 @@ fn swarm_enabled_false_marks_every_sync_item_not_applicable_and_reads_nothing() 
             SHARED_DATA,
             ACCOUNTS,
             FABRIC,
+            AWAKE,
         ] {
             let left = row(&pass.rows, id);
             assert_eq!(
@@ -1656,6 +1835,7 @@ fn swarm_enabled_false_marks_every_sync_item_not_applicable_and_reads_nothing() 
         SHARED_DATA,
         ACCOUNTS,
         FABRIC,
+        AWAKE,
     ] {
         let failed = row(&broken.rows, id);
         assert_eq!(failed.outcome, Outcome::Unknown, "{id}: {failed:?}");
@@ -1951,6 +2131,15 @@ fn thirty_five_joins_against_sixteen_connections_all_land_within_ten_minutes() {
                 fn renew_broker(&self) -> Result<String, String> {
                     Ok("current".to_owned())
                 }
+                fn awake(&self) -> Result<AwakeRead, String> {
+                    Ok(AwakeRead::NotApplicable("not macOS".to_owned()))
+                }
+                fn keep_awake(&self) -> Result<String, String> {
+                    Ok("kept".to_owned())
+                }
+                fn awake_startup_off(&self) -> bool {
+                    false
+                }
                 fn turn_on_fabric(&self) -> Result<String, String> {
                     Err("the fabric is off here".to_owned())
                 }
@@ -2121,4 +2310,722 @@ fn sync_node_runs_after_fleet_and_respects_not_applicable() {
     let off_pass = ran(off_ports.pass(Trigger::Subscriber, Mode::Apply));
     assert_eq!(row(&off_pass.rows, NODE).outcome, Outcome::NotApplicable);
     assert!(!off_ports.applies().contains(&"node"));
+}
+
+/// Design §8.5 and principle 4: the Sync rows ride the Secrets switch, so while System State's
+/// plan holds the vault out (the Secrets vault turned off, or a Stop holding setup) no pass acts
+/// on the vault: every row that rides it reads Off with the plan's reason, read as the row
+/// starts, and the subscriber's repair waits; the fabric, provisioned on this Mac alone, still
+/// turns on. The same Mac with nothing holding the vault applies its due rows and repairs its
+/// subscriber.
+#[test]
+fn no_sync_row_acts_on_the_vault_while_system_state_holds_it_out() {
+    const HELD: &str = "System State's plan leaves the Secrets vault out, or a Stop holds it";
+    for (trigger, mode) in [
+        (Trigger::Window, Mode::Apply),
+        (Trigger::Subscriber, Mode::Apply),
+        (Trigger::Init, Mode::Apply),
+        (Trigger::Init, Mode::Plan),
+    ] {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let ports = Inert::new(scratch.path());
+        *ports.held.lock().unwrap() = Some(HELD.to_owned());
+        *ports.peers.lock().unwrap() =
+            PeersRead::Joinable("the open ALab vault answers".to_owned());
+        *ports.identity.lock().unwrap() = IdentityRead::Due {
+            from: "[ai] machine = unset".to_owned(),
+            to: "label m112".to_owned(),
+        };
+        let pass = ran(ports.pass(trigger, mode));
+        assert!(ports.held_reads.load(Ordering::SeqCst) > 0, "read");
+        let rode_the_vault: Vec<&str> = ports
+            .applies()
+            .into_iter()
+            .filter(|kind| !kind.starts_with("fabric"))
+            .collect();
+        assert!(
+            rode_the_vault.is_empty(),
+            "{trigger:?} {mode:?}: the vault held out, yet the pass applied {rode_the_vault:?}"
+        );
+        assert_eq!(ports.refreshed_subscribers.load(Ordering::SeqCst), 0);
+        for id in [PEERS, VAULT, IDENTITY, FLEET, NODE, SHARED_DATA, ACCOUNTS] {
+            let held = row(&pass.rows, id);
+            assert_eq!(held.outcome, Outcome::NotApplicable, "{held:?}");
+            assert_eq!(held.why.as_deref(), Some(HELD), "{held:?}");
+        }
+        assert_ne!(row(&pass.rows, FABRIC).why.as_deref(), Some(HELD));
+        assert_ne!(row(&pass.rows, AWAKE).why.as_deref(), Some(HELD));
+        if mode == Mode::Apply {
+            assert!(ports.applies().contains(&"fabric"), "{:?}", ports.applies());
+        }
+    }
+    // NEGATIVE CONTROL: nothing holds the vault, so the same pass joins, labels and syncs.
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let ports = Inert::new(scratch.path());
+    *ports.peers.lock().unwrap() = PeersRead::Joinable("the open ALab vault answers".to_owned());
+    ran(ports.pass(Trigger::Window, Mode::Apply));
+    let applied = ports.applies();
+    assert!(
+        applied.contains(&"peers") && applied.contains(&"fleet"),
+        "{applied:?}"
+    );
+    assert_eq!(ports.refreshed_subscribers.load(Ordering::SeqCst), 1);
+}
+
+/// `sync.clone` and System State's holds: a Stop or a turned-off step holds the pass from the row
+/// it reaches on, and nothing loops on a step only a person can finish.
+pub(crate) mod owed_clone {
+    use super::*;
+    use crate::init::OwedClone;
+
+    /// Ports that run as [`Inert`] does, with `sync.clone`'s read, apply and forgetting and
+    /// System State's hold on the vault each from a hook.
+    pub(crate) struct Hooked<'a> {
+        pub(crate) inner: Inert,
+        pub(crate) held: &'a (dyn Fn() -> Option<String> + Sync),
+        pub(crate) owed: &'a (dyn Fn() -> Result<OwedClone, String> + Sync),
+        pub(crate) clone: &'a (dyn Fn() -> Result<String, String> + Sync),
+        pub(crate) forget: &'a (dyn Fn() -> Result<(), String> + Sync),
+    }
+
+    impl Ports for Hooked<'_> {
+        fn background(&self) {
+            self.inner.background();
+        }
+        fn own_account(&self) -> bool {
+            self.inner.own_account()
+        }
+        fn at_console(&self) -> Result<bool, String> {
+            self.inner.at_console()
+        }
+        fn state_dir(&self) -> Option<PathBuf> {
+            self.inner.state_dir()
+        }
+        fn build(&self) -> String {
+            self.inner.build()
+        }
+        fn routes(&self) -> Vec<String> {
+            self.inner.routes()
+        }
+        fn now_ms(&self) -> u64 {
+            self.inner.now_ms()
+        }
+        fn random_wait(&self, max: Duration) -> Duration {
+            self.inner.random_wait(max)
+        }
+        fn sleep(&self, duration: Duration) {
+            self.inner.sleep(duration);
+        }
+        fn installed_release(&self) -> bool {
+            self.inner.installed_release()
+        }
+        fn refresh_vault_subscriber(&self) -> Result<Option<String>, String> {
+            self.inner.refresh_vault_subscriber()
+        }
+        fn window_runs(&self) -> bool {
+            self.inner.window_runs()
+        }
+        fn vault_held(&self) -> Option<String> {
+            (self.held)()
+        }
+        fn swarm_enabled(&self) -> Result<bool, String> {
+            self.inner.swarm_enabled()
+        }
+        fn base(&self, lock: BaseLock) -> Base {
+            self.inner.base(lock)
+        }
+        fn vault(&self) -> Result<VaultRead, String> {
+            self.inner.vault()
+        }
+        fn identity(&self) -> Result<IdentityRead, String> {
+            self.inner.identity()
+        }
+        fn sync_identity(&self) -> Result<String, String> {
+            self.inner.sync_identity()
+        }
+        fn fleet(&self) -> Result<FleetRead, String> {
+            self.inner.fleet()
+        }
+        fn sync_fleet(&self) -> Result<FleetDone, String> {
+            self.inner.sync_fleet()
+        }
+        fn node(&self) -> Result<NodeRead, String> {
+            self.inner.node()
+        }
+        fn ensure_node(&self) -> Result<String, String> {
+            self.inner.ensure_node()
+        }
+        fn shared_data(&self, by: Publisher) -> Result<SharedRead, String> {
+            self.inner.shared_data(by)
+        }
+        fn requests(&self) -> Result<RequestsRead, String> {
+            self.inner.requests()
+        }
+        fn pass_requests(&self) -> Result<String, String> {
+            self.inner.pass_requests()
+        }
+        fn found_commons(&self) -> Result<String, String> {
+            self.inner.found_commons()
+        }
+        fn accounts(&self) -> Result<AccountsRead, String> {
+            self.inner.accounts()
+        }
+        fn resync_accounts(&self) -> Result<String, String> {
+            self.inner.resync_accounts()
+        }
+        fn owed_clone(&self) -> Result<OwedClone, String> {
+            (self.owed)()
+        }
+        fn clone_owed(&self) -> Result<String, String> {
+            (self.clone)()
+        }
+        fn forget_owed_clone(&self) -> Result<(), String> {
+            (self.forget)()
+        }
+        fn fabric(&self) -> Result<FabricRead, String> {
+            self.inner.fabric()
+        }
+        fn renew_broker(&self) -> Result<String, String> {
+            self.inner.renew_broker()
+        }
+        fn turn_on_fabric(&self) -> Result<String, String> {
+            self.inner.turn_on_fabric()
+        }
+        fn awake(&self) -> Result<AwakeRead, String> {
+            self.inner.awake()
+        }
+        fn keep_awake(&self) -> Result<String, String> {
+            self.inner.keep_awake()
+        }
+        fn awake_startup_off(&self) -> bool {
+            self.inner.awake_startup_off()
+        }
+        fn peers(&self, look: bool) -> Result<PeersRead, String> {
+            self.inner.peers(look)
+        }
+        fn join_peers(&self) -> Result<PeersDone, String> {
+            self.inner.join_peers()
+        }
+        fn log(&self, line: &str) {
+            self.inner.log(line);
+        }
+        fn installed_release_elsewhere(&self) -> Option<PathBuf> {
+            self.inner.installed_release_elsewhere()
+        }
+        fn run_elsewhere(&self, program: &Path, args: &[String]) -> Result<Option<i32>, String> {
+            self.inner.run_elsewhere(program, args)
+        }
+    }
+
+    /// No Sync row acts on the vault while System State holds it (design §8.5, principle 4): a
+    /// person who presses Stop while the subscriber's pass clones what `aterm init` owed (a
+    /// clone may take half an hour) holds every row after it, each reading the hold as it
+    /// starts, so the pass neither joins the fleet nor resyncs the AI accounts from the vault.
+    #[test]
+    fn a_stop_pressed_mid_pass_holds_every_row_after_it() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let stopped = AtomicBool::new(false);
+        let held = || {
+            stopped
+                .load(Ordering::SeqCst)
+                .then(|| "a Stop holds it".to_owned())
+        };
+        let owed = || Ok(OwedClone::Due("the GitHub token is here".to_owned()));
+        let clone = || {
+            // The person presses Stop while this clone runs.
+            stopped.store(true, Ordering::SeqCst);
+            Ok("cloned".to_owned())
+        };
+        let ports = Hooked {
+            inner: Inert::new(scratch.path()),
+            held: &held,
+            owed: &owed,
+            clone: &clone,
+            forget: &|| Ok(()),
+        };
+        let pass = ran(converge(
+            &ports,
+            Trigger::Subscriber,
+            Mode::Apply,
+            &mut |_| {},
+        ));
+        assert!(
+            stopped.load(Ordering::SeqCst),
+            "the clone ran: {:?}",
+            pass.rows
+        );
+        for id in [IDENTITY, FLEET, ACCOUNTS] {
+            let held = row(&pass.rows, id);
+            assert_eq!(
+                (held.outcome, held.why.as_deref()),
+                (Outcome::NotApplicable, Some("a Stop holds it")),
+                "{held:?}"
+            );
+        }
+        let after_the_stop: Vec<&str> = ports
+            .inner
+            .applies()
+            .into_iter()
+            .filter(|kind| !kind.starts_with("fabric"))
+            .collect();
+        assert!(
+            after_the_stop.is_empty(),
+            "after the person's Stop the pass still applied {after_the_stop:?} on the vault"
+        );
+    }
+
+    /// GitHub repositories the person left as they are in System State after `aterm init` owed
+    /// their clone hold `sync.clone` as they hold `aterm init` (principle 4: a group turned off
+    /// stays off on every path), with the Secrets vault on: once the vault's token lands, the
+    /// pass clones nothing, says why, and forgets the clone `aterm init` owed, so turning the
+    /// group on later clones nothing by itself. A plan only says so.
+    #[test]
+    fn sync_clone_honours_the_developer_switch() {
+        const LEFT: &str = "left as you set them in System State: GitHub repositories";
+        for mode in [Mode::Apply, Mode::Plan] {
+            let scratch = aterm_tempfile::tempdir().unwrap();
+            let ports = Inert::new(scratch.path());
+            *ports.owed.lock().unwrap() = OwedClone::Held(LEFT.to_owned());
+            let pass = ran(ports.pass(Trigger::Subscriber, mode));
+            assert!(
+                !ports.applies().contains(&"clone"),
+                "{mode:?}: the pass cloned with GitHub repositories at Leave as is: {:?}",
+                ports.applies()
+            );
+            let clone = row(&pass.rows, CLONE);
+            assert_eq!(clone.outcome, Outcome::NotApplicable, "{clone:?}");
+            assert!(
+                clone
+                    .why
+                    .as_deref()
+                    .is_some_and(|why| why.starts_with(LEFT)),
+                "{clone:?}"
+            );
+            assert_eq!(
+                ports.applies().contains(&"forget clone"),
+                mode == Mode::Apply,
+                "{mode:?}: {:?}",
+                ports.applies()
+            );
+        }
+    }
+
+    /// alice's account on a Fake Mac whose console she owns, as `aterm init`'s context reads it.
+    pub(crate) fn alice() -> (crate::port::Fake, crate::model::User) {
+        alice_with(true)
+    }
+
+    /// [`alice`], with Apple's git (`git`) or none.
+    fn alice_with(git: bool) -> (crate::port::Fake, crate::model::User) {
+        let mut sys = crate::port::Fake::root();
+        sys.euid = 501;
+        let alice = crate::items::defaults::tests::user("alice", 501);
+        sys.logged_in(&alice);
+        sys.stat_of(
+            "/dev/console",
+            crate::port::Stat {
+                uid: 501,
+                gid: 20,
+                mode: 0o600,
+                dir: false,
+                symlink: false,
+                len: 0,
+            },
+        );
+        sys.on(
+            &crate::facts::hidutil_keyboards().display(),
+            crate::port::Ran::ok("Services:\n\nDevices:\n"),
+        );
+        if git {
+            sys.file(crate::items::github::CLT_GIT, b"synthetic git");
+        }
+        sys.stat_of(
+            &alice.home,
+            crate::port::Stat {
+                uid: 501,
+                gid: 20,
+                mode: 0o700,
+                dir: true,
+                symlink: false,
+                len: 0,
+            },
+        );
+        (sys, alice)
+    }
+
+    /// The record `aterm init` leaves when its GitHub step waits for the vault.
+    fn owe_a_clone(state: &Path) {
+        let dir = state.join(FileJournal::DIR);
+        aterm_uds::private_file::ensure_private_dir(&dir).unwrap();
+        aterm_uds::private_file::write_private(&dir, "clone-owed", b"owed\n").unwrap();
+    }
+
+    /// Nothing loops: the vault's token landed, but GitHub refuses it, which only a person (a
+    /// vault admin) can fix, and the native step's rule is that its row needs them and no pass
+    /// retries it. The first pass runs the step once and records that it waits for a person;
+    /// later passes say what to do and run nothing until the token or init.toml changes.
+    #[test]
+    fn a_clone_only_a_person_can_finish_is_not_rerun_every_pass() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let (sys, alice) = alice();
+        let token = "/Users//alice/.secrets/gh_access_token";
+        sys.file(token, b"fixture_token_only").stat_of(
+            token,
+            crate::port::Stat {
+                uid: 501,
+                gid: 20,
+                mode: 0o600,
+                dir: false,
+                symlink: false,
+                len: 18,
+            },
+        );
+        sys.fail_github_api(&alice, "/user", crate::port::GithubFailure::Unauthenticated);
+        owe_a_clone(scratch.path());
+        let state = scratch.path().to_path_buf();
+        let held = || None;
+        let owed = || crate::init::owed_clone(&sys, &state, &crate::init::Holds::NONE);
+        let clone = || crate::init::clone_owed(&sys, &state);
+        let ports = Hooked {
+            inner: Inert::new(scratch.path()),
+            held: &held,
+            owed: &owed,
+            clone: &clone,
+            forget: &|| crate::init::forget_owed_clone(&state),
+        };
+        let mut said = Vec::new();
+        for _ in 0..3 {
+            let pass = ran(converge(
+                &ports,
+                Trigger::Subscriber,
+                Mode::Apply,
+                &mut |_| {},
+            ));
+            let clone_row = row(&pass.rows, CLONE);
+            said.push((clone_row.outcome, clone_row.why.clone()));
+        }
+        let asked = sys
+            .calls()
+            .iter()
+            .filter(|call| call.contains("agh GET /user"))
+            .count();
+        assert_eq!(
+            asked, 1,
+            "three passes each re-ran the GitHub step a person must finish: {said:?}"
+        );
+        let (outcome, why) = &said[2];
+        assert_eq!(*outcome, Outcome::Person, "{said:?}");
+        assert!(
+            why.as_deref()
+                .is_some_and(|why| why.contains("Only you can fix this")
+                    && why.contains("aterm init --only github")),
+            "{said:?}"
+        );
+        // A new token from the vault is a new chance: the next pass runs the step again.
+        sys.file(token, b"fixture_token_next");
+        ran(converge(
+            &ports,
+            Trigger::Subscriber,
+            Mode::Apply,
+            &mut |_| {},
+        ));
+        let asked = sys
+            .calls()
+            .iter()
+            .filter(|call| call.contains("agh GET /user"))
+            .count();
+        assert_eq!(asked, 2, "a new token runs the step again");
+    }
+
+    /// A turned-off step is no time bomb: init.toml's `[github] enabled = false` after `aterm
+    /// init` owed a clone makes `sync.clone` read off and forget it, so the day the person
+    /// removes that line the pass clones nothing by itself.
+    #[test]
+    fn an_owed_clone_turned_off_is_forgotten() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let (sys, _alice) = alice();
+        let config = "/Users//alice/.config/aterm/init.toml";
+        let off = b"[github]\nenabled = false\n";
+        sys.file(config, off).stat_of(
+            config,
+            crate::port::Stat {
+                uid: 501,
+                gid: 20,
+                mode: 0o600,
+                dir: false,
+                symlink: false,
+                len: off.len() as u64,
+            },
+        );
+        owe_a_clone(scratch.path());
+        let state = scratch.path().to_path_buf();
+        let read = crate::init::owed_clone(&sys, &state, &crate::init::Holds::NONE).unwrap();
+        assert!(matches!(read, OwedClone::Off(_)), "{read:?}");
+        let held = || None;
+        let owed = || crate::init::owed_clone(&sys, &state, &crate::init::Holds::NONE);
+        let clone = || crate::init::clone_owed(&sys, &state);
+        let ports = Hooked {
+            inner: Inert::new(scratch.path()),
+            held: &held,
+            owed: &owed,
+            clone: &clone,
+            forget: &|| crate::init::forget_owed_clone(&state),
+        };
+        ran(converge(
+            &ports,
+            Trigger::Subscriber,
+            Mode::Apply,
+            &mut |_| {},
+        ));
+        assert!(
+            !scratch
+                .path()
+                .join(FileJournal::DIR)
+                .join("clone-owed")
+                .exists(),
+            "the owed clone outlives its off switch, and fires when the step comes back on"
+        );
+    }
+
+    /// `aterm init --only github` names GitHub repositories over the person's Leave as is (the
+    /// held line's way back, `init::naming`), and its step waits for the vault; init says the
+    /// clone runs by itself once this Mac is let in (`init::OWED`). The vault's pass keeps that
+    /// promise: the record is stamped with the hold the person's own command went past, so the
+    /// pass clones once the token lands. A Stop pressed after that run began holds the clone and
+    /// keeps it owed (Set up now goes on); the group left as is after a run that did not go past
+    /// that hold is a later choice, and the pass forgets the clone, saying why.
+    #[test]
+    fn an_owed_clone_the_person_named_over_the_hold_is_kept() {
+        use aterm_types::macos_setup::{Selection, Setting};
+        let mut off = Selection::none();
+        off.set(Setting::Repositories, true);
+        let left = crate::init::Holds {
+            off,
+            ..crate::init::Holds::NONE
+        };
+        let stopped = crate::init::Holds {
+            stopped: Some("you stopped setup in System State".to_owned()),
+            ..left.clone()
+        };
+        // (the hold the run went past, the holds now, cloned, the record kept)
+        for (start, now, cloned_now, kept) in [
+            (left.clone(), left.clone(), true, true),
+            (left.clone(), stopped, false, true),
+            (crate::init::Holds::NONE, left.clone(), false, false),
+        ] {
+            let scratch = aterm_tempfile::tempdir().unwrap();
+            let (sys, _alice) = alice();
+            let token = "/Users//alice/.secrets/gh_access_token";
+            sys.file(token, b"fixture_token_only").stat_of(
+                token,
+                crate::port::Stat {
+                    uid: 501,
+                    gid: 20,
+                    mode: 0o600,
+                    dir: false,
+                    symlink: false,
+                    len: 18,
+                },
+            );
+            crate::init::owe_clone(scratch.path(), &start).unwrap();
+            let state = scratch.path().to_path_buf();
+            let cloned = AtomicBool::new(false);
+            let held = || None;
+            let owed = || crate::init::owed_clone(&sys, &state, &now);
+            let clone = || {
+                cloned.store(true, Ordering::SeqCst);
+                Ok("cloned".to_owned())
+            };
+            let ports = Hooked {
+                inner: Inert::new(scratch.path()),
+                held: &held,
+                owed: &owed,
+                clone: &clone,
+                forget: &|| crate::init::forget_owed_clone(&state),
+            };
+            let pass = ran(converge(
+                &ports,
+                Trigger::Subscriber,
+                Mode::Apply,
+                &mut |_| {},
+            ));
+            let row = row(&pass.rows, CLONE);
+            let record = scratch.path().join(FileJournal::DIR).join("clone-owed");
+            assert_eq!(
+                (cloned.load(Ordering::SeqCst), record.exists()),
+                (cloned_now, kept),
+                "held now as {now:?}: the pass cloned {} and kept the record {}: {row:?}",
+                cloned.load(Ordering::SeqCst),
+                record.exists()
+            );
+            if now.stopped.is_some() {
+                assert!(
+                    row.why.as_deref().is_some_and(
+                        |why| why.contains("because you stopped setup in System State")
+                    ),
+                    "{row:?}"
+                );
+            }
+            if !kept {
+                assert!(
+                    row.why.as_deref().is_some_and(|why| why
+                        .starts_with("left as you set them in System State")
+                        && why.ends_with("the clone aterm init owed is forgotten")),
+                    "{row:?}"
+                );
+            }
+        }
+    }
+
+    /// The token file the vault lands for alice, here now.
+    fn token_landed(sys: &crate::port::Fake) {
+        let token = "/Users//alice/.secrets/gh_access_token";
+        sys.file(token, b"fixture_token_only").stat_of(
+            token,
+            crate::port::Stat {
+                uid: 501,
+                gid: 20,
+                mode: 0o600,
+                dir: false,
+                symlink: false,
+                len: 18,
+            },
+        );
+    }
+
+    /// Every clone runs Apple's git, which aterm installs by itself (`base.clt`): a clone owed
+    /// while the Command Line Tools are missing waits for them as for the token, and is no
+    /// person's step; the pass after they arrive runs it.
+    #[test]
+    fn the_owed_clone_runs_once_the_command_line_tools_arrive() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let state = scratch.path().to_path_buf();
+        crate::init::owe_clone(&state, &crate::init::Holds::NONE).unwrap();
+        let (sys, _alice) = alice_with(false);
+        token_landed(&sys);
+        let held = || None;
+        let owed = || crate::init::owed_clone(&sys, &state, &crate::init::Holds::NONE);
+        let clone = || crate::init::clone_owed(&sys, &state);
+        let forget = || crate::init::forget_owed_clone(&state);
+        let ports = Hooked {
+            inner: Inert::new(&state),
+            held: &held,
+            owed: &owed,
+            clone: &clone,
+            forget: &forget,
+        };
+        let first = ran(converge(
+            &ports,
+            Trigger::Subscriber,
+            Mode::Apply,
+            &mut |_| {},
+        ));
+        let waiting = row(&first.rows, CLONE);
+        assert_eq!(waiting.outcome, Outcome::Deferred, "{waiting:?}");
+        assert!(
+            waiting
+                .why
+                .as_deref()
+                .is_some_and(|why| why.contains("Command Line Tools")),
+            "{waiting:?}"
+        );
+        let asked = || {
+            sys.calls()
+                .iter()
+                .filter(|call| call.contains("agh GET /user"))
+                .count()
+        };
+        assert_eq!(asked(), 0, "no clone runs without git");
+        // The tools arrive (aterm's own install); the token and init.toml are as they were.
+        sys.file(crate::items::github::CLT_GIT, b"synthetic git");
+        let _second = converge(&ports, Trigger::Subscriber, Mode::Apply, &mut |_| {});
+        assert!(
+            asked() > 0,
+            "the tools arrived, yet the owed clone never ran"
+        );
+    }
+
+    /// A token file that is on this Mac but that aterm may not use (here readable by others)
+    /// leaves the owed clone waiting with what is wrong with that file, never as if no token had
+    /// landed. CONTROL: the same file readable by its owner alone is due.
+    #[test]
+    fn a_token_file_aterm_cannot_use_says_what_is_wrong() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let state = scratch.path().to_path_buf();
+        crate::init::owe_clone(&state, &crate::init::Holds::NONE).unwrap();
+        let (sys, _alice) = alice_with(true);
+        let token = "/Users//alice/.secrets/gh_access_token";
+        let stat = |mode| crate::port::Stat {
+            uid: 501,
+            gid: 20,
+            mode,
+            dir: false,
+            symlink: false,
+            len: 18,
+        };
+        sys.file(token, b"fixture_token_only")
+            .stat_of(token, stat(0o644));
+        let read = crate::init::owed_clone(&sys, &state, &crate::init::Holds::NONE).unwrap();
+        assert!(
+            matches!(&read, crate::init::OwedClone::Waiting(why)
+                if why.contains(token) && why.contains("cannot be used")),
+            "{read:?}"
+        );
+        sys.stat_of(token, stat(0o600));
+        let read = crate::init::owed_clone(&sys, &state, &crate::init::Holds::NONE).unwrap();
+        assert!(matches!(read, crate::init::OwedClone::Due(_)), "{read:?}");
+    }
+
+    /// A Stop pressed once `sync.clone` has read what is owed (its clone may take half an hour)
+    /// holds the clone, as System State's own Repositories stage reads the person's choice
+    /// before each clone: the apply reads the hold again as it begins.
+    #[test]
+    fn a_stop_pressed_as_sync_clone_starts_holds_its_clone() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let state = scratch.path().to_path_buf();
+        let stopped = AtomicBool::new(false);
+        let cloned = AtomicBool::new(false);
+        let held = || {
+            stopped
+                .load(Ordering::SeqCst)
+                .then(|| "you stopped setup in System State".to_owned())
+        };
+        let owed = || {
+            // The person presses Stop while the row reads what is owed.
+            stopped.store(true, Ordering::SeqCst);
+            Ok(OwedClone::Due(
+                "the vault's GitHub token is here now".to_owned(),
+            ))
+        };
+        let clone = || {
+            cloned.store(true, Ordering::SeqCst);
+            Ok("cloned".to_owned())
+        };
+        let ports = Hooked {
+            inner: Inert::new(&state),
+            held: &held,
+            owed: &owed,
+            clone: &clone,
+            forget: &|| Ok(()),
+        };
+        let pass = ran(converge(
+            &ports,
+            Trigger::Subscriber,
+            Mode::Apply,
+            &mut |_| {},
+        ));
+        assert!(
+            !cloned.load(Ordering::SeqCst),
+            "a Stop pressed before sync.clone's clone began did not hold it"
+        );
+        let held_row = row(&pass.rows, CLONE);
+        assert!(
+            held_row.outcome != Outcome::Changed
+                && held_row
+                    .why
+                    .as_deref()
+                    .is_some_and(|why| why.contains("you stopped setup in System State")),
+            "{held_row:?}"
+        );
+    }
 }

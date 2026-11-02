@@ -19,6 +19,7 @@
 pub mod catalog;
 pub mod custody;
 mod ledger;
+pub mod transfer;
 
 pub use catalog::{Class, GhProfile, Purpose, Want};
 pub use ledger::{
@@ -958,7 +959,7 @@ pub fn act(need: &Need, facts: &Facts, act: &Act) -> Option<Need> {
                     state: State::Local,
                     wait: local_wait(&need.want, facts),
                     retired: None,
-                    raises: need.raises + 1,
+                    raises: need.raises.saturating_add(1),
                     raised_again_on_change: Some(changed(retirement, facts)),
                     asking: false,
                     ask: None,
@@ -1088,20 +1089,11 @@ pub fn decided(need: &Need, facts: &Facts, decision: &Decision) -> Option<Need> 
     match decision {
         Decision::Offered => {
             (need.state == State::Open && facts.policy.allows(&need.want)).then(|| {
-                // The handoff that takes a holder's copy is step 4's: until it lands, the one
-                // route that moves an offered want is the hand route, so the line names it.
-                let host = facts
-                    .sight
-                    .as_ref()
-                    .map_or("<host>", |sight| sight.host.as_str());
-                let route = hand_route(&need.want, host).map_or_else(String::new, |route| {
-                    format!("; meanwhile a person with that Mac's copy runs {route}")
-                });
                 Need {
                     state: State::Offered,
                     wait: Wait::Custodian,
                     line: format!(
-                        "offered: a Mac that holds {} offered it, and the vault admin's aterm takes an offer only over the handoff from a holder, which this aterm version lacks{route}",
+                        "offered: a Mac that holds {} offered it; the vault custodian's running aterm takes its copy over the authenticated LAN connection",
                         need.want.title()
                     ),
                     updated: now,
@@ -1514,7 +1506,7 @@ fn alab_for_tests(paths: &crate::client::Paths) -> bool {
     aterm_spec_anchor::spec_unmodeled(
         machine = "DbCredentialRequest",
         action = "OfferLost",
-        reason = "A delivery lost between holder and custodian is step 4's handoff exchange, which this build does not have."
+        reason = "A failed runtime handoff leaves the request unpublished and advances to another Offer; credentials::handoff tests exercise the wire and the retained source."
     )
 )]
 #[cfg_attr(
@@ -1522,7 +1514,7 @@ fn alab_for_tests(paths: &crate::client::Paths) -> bool {
     aterm_spec_anchor::spec_unmodeled(
         machine = "DbCredentialRequest",
         action = "Publish",
-        reason = "A custodian's publication of a holder's accepted delivery is step 4's handoff, which this build does not have; the copy from vault text is Widen."
+        reason = "A custodian's publication of a holder's delivery is aterm_db::credentials::handoff; this ledger consumes its attested Published record, while the copy from vault text is Widen."
     )
 )]
 #[cfg_attr(
@@ -1562,7 +1554,7 @@ fn alab_for_tests(paths: &crate::client::Paths) -> bool {
     aterm_spec_anchor::spec_unmodeled(
         machine = "DbCredentialRequest",
         action = "LateOffer",
-        reason = "A holder's offer on a request awaiting a person takes the ask down only once step 4's handoff can deliver it, which this build does not have."
+        reason = "A request awaiting a person keeps its ask until the runtime accepts and publishes the late holder's delivery; this ledger consumes that Published record."
     )
 )]
 #[cfg_attr(

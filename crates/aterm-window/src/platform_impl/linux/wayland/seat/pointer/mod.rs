@@ -403,7 +403,11 @@ impl WinitPointer {
 /// `scale`, as sctk's `ThemeSpec::System` loaded it.
 fn load_theme(scale: i32, shm: Proxy) -> Option<Theme> {
     let name = std::env::var("XCURSOR_THEME").ok().unwrap_or_else(|| "default".into());
-    let size: u32 = std::env::var("XCURSOR_SIZE").ok().and_then(|s| s.parse().ok()).unwrap_or(24);
+    let size: u32 = std::env::var("XCURSOR_SIZE")
+        .ok()
+        .filter(|s| s.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(24);
     let name = CString::new(name).ok()?;
     let size = size.saturating_mul(u32::try_from(scale).unwrap_or(1));
     // SAFETY: the pointer retains the backend's `wl_shm` owner through this call and

@@ -22,14 +22,26 @@ pub(super) fn ensure_private_dir_as(dir: &Path, owner: u32) -> std::io::Result<(
     if already_private(dir, owner) {
         return Ok(());
     }
-    aterm_types::fs_restricted::create_dir_all_unshared(dir, 0o700)?;
+    match aterm_types::fs_restricted::create_dir_all_unshared(dir, 0o700) {
+        Ok(()) => {}
+        Err(error)
+            if error.kind() == std::io::ErrorKind::AlreadyExists
+                && std::fs::symlink_metadata(dir).is_ok_and(|meta| !meta.file_type().is_dir()) =>
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("{}: must be a real directory, not a link", dir.display()),
+            ));
+        }
+        Err(error) => return Err(error),
+    }
     tighten_and_verify(dir, owner)
 }
 
 fn already_private(dir: &Path, owner: u32) -> bool {
     use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(dir).is_ok_and(|meta| {
-        meta.is_dir()
+    std::fs::symlink_metadata(dir).is_ok_and(|meta| {
+        meta.file_type().is_dir()
             && meta.mode() & 0o7777 == 0o700
             && aterm_types::fs_restricted::dir_safe_for_private_write(
                 owner,
@@ -41,24 +53,34 @@ fn already_private(dir: &Path, owner: u32) -> bool {
 
 fn tighten_and_verify(dir: &Path, owner: u32) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
-    if !std::fs::metadata(dir).is_ok_and(|m| m.mode() & 0o7777 == 0o700) {
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-    }
-    let meta = std::fs::metadata(dir)?;
-    let safe =
-        aterm_types::fs_restricted::dir_safe_for_private_write(owner, meta.uid(), meta.mode());
-    if safe {
-        Ok(())
-    } else {
-        Err(std::io::Error::new(
+    let refused = || {
+        std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             format!(
                 "{}: control directory must be owned by uid {} and not group/other-writable",
                 dir.display(),
                 owner
             ),
-        ))
+        )
+    };
+    let before = std::fs::symlink_metadata(dir)?;
+    if !before.file_type().is_dir() || before.uid() != owner {
+        return Err(refused());
     }
+    if before.mode() & 0o7777 != 0o700 {
+        let dir_fd = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(dir)?;
+        if dir_fd.metadata()?.uid() != owner {
+            return Err(refused());
+        }
+        dir_fd.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+    }
+    let meta = std::fs::symlink_metadata(dir)?;
+    let safe = meta.file_type().is_dir()
+        && aterm_types::fs_restricted::dir_safe_for_private_write(owner, meta.uid(), meta.mode());
+    if safe { Ok(()) } else { Err(refused()) }
 }
 
 /// Pid liveness: a pid that cannot be real (0, or wider than `pid_t`) is dead; otherwise
@@ -161,6 +183,20 @@ mod ctime_tests {
         std::fs::remove_dir(&dir).unwrap();
         ensure_private_dir(&dir).unwrap();
         assert_eq!(stamp().2, 0o700, "a removed directory is made again");
+        let outside = std::env::temp_dir().join(format!("agui-outside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = std::env::temp_dir().join(format!("agui-link-{}", std::process::id()));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        assert!(ensure_private_dir(&link).is_err());
+        assert_eq!(
+            std::fs::metadata(&outside).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&outside);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

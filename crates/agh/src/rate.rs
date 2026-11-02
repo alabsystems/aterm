@@ -30,7 +30,7 @@ impl RateSnapshot {
     #[must_use]
     pub fn from_headers(headers: &[(String, String)]) -> Option<RateSnapshot> {
         let get = |name: &str| crate::wire::header_in(headers, name).map(str::trim);
-        let number = |name: &str| get(name).and_then(|v| v.parse::<u64>().ok());
+        let number = |name: &str| get(name).and_then(crate::path::digits::<u64>);
         let limit = number("x-ratelimit-limit")?;
         let remaining = number("x-ratelimit-remaining")?;
         let reset = number("x-ratelimit-reset")?;
@@ -189,11 +189,12 @@ impl RateBook {
         if !usable_key(key) {
             return None;
         }
-        let parent = dir.parent()?;
-        if let Some(grand) = parent.parent() {
-            std::fs::create_dir_all(grand).ok()?;
+        if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+            if let Some(grand) = parent.parent().filter(|p| !p.as_os_str().is_empty()) {
+                std::fs::create_dir_all(grand).ok()?;
+            }
+            create_private_dir(parent).ok()?;
         }
-        create_private_dir(parent).ok()?;
         create_private_dir(dir).ok()?;
         let mut held = self.read(key);
         held.retain(|s| s.resource != snapshot.resource);
@@ -242,5 +243,35 @@ impl RateBook {
             .collect();
         held.sort_by(|a, b| a.resource.cmp(&b.resource));
         Some(held)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rate_headers_and_cli_flags_reject_signed_numbers() {
+        let headers = vec![
+            ("x-ratelimit-limit".to_string(), "+5000".to_string()),
+            ("x-ratelimit-remaining".to_string(), "4999".to_string()),
+            ("x-ratelimit-reset".to_string(), "1700000000".to_string()),
+        ];
+        assert!(RateSnapshot::from_headers(&headers).is_none());
+        let ok_headers = vec![
+            ("x-ratelimit-limit".to_string(), "5000".to_string()),
+            ("x-ratelimit-remaining".to_string(), "4999".to_string()),
+            ("x-ratelimit-reset".to_string(), "1700000000".to_string()),
+            ("x-ratelimit-used".to_string(), "+1".to_string()),
+        ];
+        let snap = RateSnapshot::from_headers(&ok_headers).expect("valid rate headers");
+        assert_eq!(snap.used, 1);
+
+        assert!(
+            crate::cli::args::parse(&["ls", "o/r", "--limit", "+5"].map(String::from)).is_err()
+        );
+        assert!(
+            crate::cli::args::parse(&["ls", "o/r", "--max-pages", "+5"].map(String::from)).is_err()
+        );
     }
 }

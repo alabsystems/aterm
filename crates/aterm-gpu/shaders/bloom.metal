@@ -23,7 +23,62 @@ struct BloomU {
     float radius;        // the white part's radius, half-res texels
     float chroma_radius; // the chroma's, always the shorter of the two
     float _pad[3];
+    float2 screen;       // the frame, px: a fragment lies at `uv * screen`
+    // The frame's letter mask (aterm_render::bloom::LetterMask): the cells the bloom keeps off.
+    float2 origin;       // the grid's top-left, px
+    float2 cell;         // a cell, px
+    float2 grow;         // kept off entirely this far past a kept cell's box, px
+    float2 feather;      // easing back to whole over this far past that, px
+    float mask_on;       // 0: the bloom is laid whole
+    float _pad2;
+    uint4 window;        // the cells the bits cover: first column, first row, columns, rows
+    uint4 bits[256];     // one bit a cell, row-major: bit i & 31 of word i >> 5
 };
+
+// Whether cell (c, r) is kept off (`LetterMask::kept`).
+static inline bool kept_cell(constant BloomU& bu, int c, int r) {
+    int lc = c - int(bu.window.x);
+    int lr = r - int(bu.window.y);
+    if (lc < 0 || lr < 0 || lc >= int(bu.window.z) || lr >= int(bu.window.w)) {
+        return false;
+    }
+    uint i = uint(lr) * bu.window.z + uint(lc);
+    uint word = bu.bits[i >> 7u][(i >> 5u) & 3u];
+    return ((word >> (i & 31u)) & 1u) != 0u;
+}
+
+// The share of the bloom laid at frame point p (`LetterMask::weight`, its twin): 0 within a
+// kept cell's box grown by `grow`, rising to 1 over `feather` past it.
+static inline float letter_mask(constant BloomU& bu, float2 p) {
+    if (bu.mask_on == 0.0) {
+        return 1.0;
+    }
+    int c = int(floor((p.x - bu.origin.x) / bu.cell.x));
+    int r = int(floor((p.y - bu.origin.y) / bu.cell.y));
+    float m = 1.0;
+    for (int dr = -2; dr <= 2; dr = dr + 1) {
+        for (int dc = -1; dc <= 1; dc = dc + 1) {
+            int cc = c + dc;
+            int rr = r + dr;
+            if (!kept_cell(bu, cc, rr)) {
+                continue;
+            }
+            float bx0 = bu.origin.x + float(cc) * bu.cell.x - bu.grow.x;
+            float by0 = bu.origin.y + float(rr) * bu.cell.y - bu.grow.y;
+            float bx1 = bx0 + bu.cell.x + 2.0 * bu.grow.x;
+            float by1 = by0 + bu.cell.y + 2.0 * bu.grow.y;
+            float dx = max(max(bx0 - p.x, p.x - bx1), 0.0) / bu.feather.x;
+            float dy = max(max(by0 - p.y, p.y - by1), 0.0) / bu.feather.y;
+            float e2 = dx * dx + dy * dy;
+            if (e2 >= 1.0) {
+                continue;
+            }
+            float e = sqrt(e2);
+            m = min(m, e * e * (3.0 - 2.0 * e));
+        }
+    }
+    return m;
+}
 
 // Twin of `hdr_glow.metal`'s `white_part`: the smallest channel is the white light
 // in a premultiplied colour, the rest is its chroma.
@@ -55,5 +110,6 @@ fragment float4 fs_bloom(VsOut in [[stage_in]],
         }
     }
     float3 sum = float3(white) + chroma;
-    return float4(sum / wsum * bu.strength, 1.0);
+    float kept = letter_mask(bu, in.uv * bu.screen);
+    return float4(sum / wsum * bu.strength * kept, 1.0);
 }

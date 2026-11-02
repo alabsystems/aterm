@@ -236,8 +236,6 @@ pub(crate) enum MenuAction {
     ToggleSeriousMode,
     /// Focus or create the process-singleton Settings tab.
     ToggleSettings,
-    /// View ▸ Show Needs in Windows.
-    ToggleNeedsInWindows,
     /// View ▸ Stats Bars: Deck.
     StatsBarsDeck,
     /// View ▸ Stats Bars: Sill.
@@ -268,6 +266,8 @@ pub(crate) enum MenuAction {
     Messages,
     /// Aterm ▸ System State…: focus or create the System State tab in the front window.
     SystemState,
+    /// Open the native email client.
+    Mail,
     /// Toggle the command palette overlay (`App::toggle_palette`).
     OpenPalette,
     /// View ▸ Choose Theme….
@@ -382,7 +382,6 @@ impl MenuAction {
             MenuAction::FabricOn => 64,
             MenuAction::FabricOff => 65,
             MenuAction::SetRole => 66,
-            MenuAction::ToggleNeedsInWindows => 68,
             MenuAction::Messages => 69,
             MenuAction::ResetTerminal => 73,
             MenuAction::HarnessSettings => 74,
@@ -407,6 +406,7 @@ impl MenuAction {
             MenuAction::DeckSizeFolded => 90,
             MenuAction::Save => 91,
             MenuAction::SystemState => 92,
+            MenuAction::Mail => 98,
             MenuAction::ChooseTabTheme => 77,
             MenuAction::ClearTabTheme => 78,
         }
@@ -468,7 +468,6 @@ impl MenuAction {
             64 => MenuAction::FabricOn,
             65 => MenuAction::FabricOff,
             66 => MenuAction::SetRole,
-            68 => MenuAction::ToggleNeedsInWindows,
             69 => MenuAction::Messages,
             73 => MenuAction::ResetTerminal,
             74 => MenuAction::HarnessSettings,
@@ -491,6 +490,7 @@ impl MenuAction {
             90 => MenuAction::DeckSizeFolded,
             91 => MenuAction::Save,
             92 => MenuAction::SystemState,
+            98 => MenuAction::Mail,
             93 => MenuAction::RewindPane,
             94 => MenuAction::ExportPaneHistory,
             96 => MenuAction::ForgetPaneHistory,
@@ -508,7 +508,6 @@ pub(crate) fn canonical_invoke_name(name: &str) -> &str {
         "LiftHold" => "HandBack",
         "OpenLedger" | "LedgerForSession" => "HarnessLog",
         "ShowConnectionMap" | "Fleet" | "ShowFleet" => "Overview",
-        "TogglePresenceRim" => "ToggleNeedsInWindows",
         other => other,
     }
 }
@@ -527,10 +526,10 @@ pub(crate) fn retired_invoke_name(name: &str) -> Option<&'static str> {
         | "NewControllerTab" => Some(
             "every in-session client already holds Owner; start workers with spawn agent=claude",
         ),
-        "TogglePresenceBand" => Some(
-            "the presence band is gone; the needs border and its pill replace it \
-             (ToggleNeedsInWindows)",
-        ),
+
+        "TogglePresenceBand" | "TogglePresenceRim" | "ToggleNeedsInWindows" => {
+            Some("automatic attention UI was removed")
+        }
         "ShowIdentity" | "NewWindowWithIdentity" | "NewTabWithIdentity" => {
             Some("named session identities were removed")
         }
@@ -649,16 +648,6 @@ pub(crate) fn set_front_remote_hold(held: bool) {
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn front_remote_hold() -> bool {
     FRONT_REMOTE_HOLD.published(|bit| bit.load(std::sync::atomic::Ordering::Relaxed))
-}
-
-menu_static! {
-    static NEEDS_IN_WINDOWS: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(true);
-}
-
-/// Publish View ▸ Show Needs in Windows' checkmark.
-pub(crate) fn set_needs_in_windows(on: bool) {
-    NEEDS_IN_WINDOWS.published(|bit| bit.store(on, std::sync::atomic::Ordering::Relaxed));
 }
 
 menu_static! {
@@ -918,9 +907,6 @@ pub(crate) fn menu_live() -> MenuLive {
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn native_menu_checked(action: MenuAction) -> Option<bool> {
     match action {
-        MenuAction::ToggleNeedsInWindows => {
-            Some(NEEDS_IN_WINDOWS.published(|bit| bit.load(std::sync::atomic::Ordering::Relaxed)))
-        }
         MenuAction::StatsBarsDeck | MenuAction::StatsBarsSill | MenuAction::StatsBarsOff => {
             Some(action.stats_bars_form() == Some(stats_bars_form()))
         }
@@ -1043,7 +1029,7 @@ impl MenuAction {
             | MenuAction::BrowseThemes
             | MenuAction::Messages
             | MenuAction::ToggleSeriousMode => ConfigWrite,
-            MenuAction::SystemState => ConfigWrite,
+            MenuAction::SystemState | MenuAction::Mail => ConfigWrite,
             MenuAction::OpenPalette | MenuAction::SoftwareUpdate | MenuAction::ApplyUpdate => {
                 OwnerOnly
             }
@@ -1058,7 +1044,6 @@ impl MenuAction {
             | MenuAction::FabricOn
             | MenuAction::FabricOff => OwnerOnly,
             MenuAction::TakeOver | MenuAction::HandBack => PersonOnly,
-            MenuAction::ToggleNeedsInWindows => ConfigWrite,
             MenuAction::StatsBarsDeck | MenuAction::StatsBarsSill | MenuAction::StatsBarsOff => {
                 ConfigWrite
             }
@@ -1160,11 +1145,11 @@ impl MenuAction {
             | MenuAction::NextKitty
             | MenuAction::ToggleSeriousMode
             | MenuAction::ToggleSettings
-            | MenuAction::ToggleNeedsInWindows
             | MenuAction::Packages
             | MenuAction::HarnessSettings
             | MenuAction::Messages
             | MenuAction::SystemState
+            | MenuAction::Mail
             | MenuAction::OpenPalette
             | MenuAction::ChooseTheme
             | MenuAction::BrowseThemes
@@ -1250,6 +1235,7 @@ impl MenuAction {
             MenuAction::SystemState => {
                 "Open System State: this Mac's setup and secrets vault, and what each step needs."
             }
+            MenuAction::Mail => "Open Mail: accounts, folders, messages and drafts.",
             MenuAction::HarnessSettings => {
                 "Open Settings at Harness: the coding agent harness and its Autopilot."
             }
@@ -1315,10 +1301,6 @@ impl MenuAction {
             MenuAction::Zoom => "Zoom this window.",
             MenuAction::NextTab => "Show the next tab.",
             MenuAction::PrevTab => "Show the previous tab.",
-            MenuAction::ToggleNeedsInWindows => {
-                "Show or hide the border and the titlebar pill that say a window's tab needs \
-                 you; saved in aterm.toml."
-            }
             MenuAction::StatsBarsDeck => {
                 "Show the Global, aterm and Tab bars at full size under the titlebar; saved in \
                  aterm.toml."
@@ -1414,6 +1396,7 @@ impl MenuAction {
             "Packages" => Some(MenuAction::Packages),
             "Messages" => Some(MenuAction::Messages),
             "SystemState" => Some(MenuAction::SystemState),
+            "Mail" => Some(MenuAction::Mail),
             "HarnessSettings" => Some(MenuAction::HarnessSettings),
             "RenameSession" => Some(MenuAction::RenameSession),
             "OpenPalette" => Some(MenuAction::OpenPalette),
@@ -1439,7 +1422,6 @@ impl MenuAction {
             "FabricOn" => Some(MenuAction::FabricOn),
             "FabricOff" => Some(MenuAction::FabricOff),
             "SetRole" => Some(MenuAction::SetRole),
-            "ToggleNeedsInWindows" => Some(MenuAction::ToggleNeedsInWindows),
             "StatsBarsDeck" => Some(MenuAction::StatsBarsDeck),
             "StatsBarsSill" => Some(MenuAction::StatsBarsSill),
             "StatsBarsOff" => Some(MenuAction::StatsBarsOff),
@@ -1559,6 +1541,12 @@ const APP_MENU: &[MenuEntry] = &[
     Item {
         label: "System State…",
         action: MenuAction::SystemState,
+        key: "",
+        mods: MenuMods::None,
+    },
+    Item {
+        label: "Mail…",
+        action: MenuAction::Mail,
         key: "",
         mods: MenuMods::None,
     },
@@ -1805,12 +1793,6 @@ const VIEW_MENU: &[MenuEntry] = &[
         mods: MenuMods::CommandControl,
     },
     Separator,
-    Item {
-        label: "Show Needs in Windows",
-        action: MenuAction::ToggleNeedsInWindows,
-        key: "",
-        mods: MenuMods::None,
-    },
     Separator,
     Item {
         label: "Stats Bars: Deck",
@@ -2300,7 +2282,7 @@ fn chrome_lines_for(
 #[cfg(target_os = "macos")]
 pub(crate) use macos::{
     MenuHandle, choose_local_file, choose_local_image, choose_save_path, confirm, confirm_owner,
-    defer_quit_for_terminate, install, notify, ok_alert, open_file_in_workspace, open_help_url,
+    defer_quit_for_terminate, install, open_file_in_workspace, open_help_url,
     order_front_regardless, reveal_file_in_workspace, show_handoff_target_version,
     update_version_menu,
 };
@@ -2419,21 +2401,10 @@ pub(crate) fn local_file_picker_available() -> bool {
     false
 }
 
-/// Windows: a real modal alert.
-#[cfg(windows)]
+/// Record an operational error without opening a modal or desktop notification.
 pub(crate) fn notify(title: &str, body: &str) {
-    crate::win_alert_ok(title, body);
+    aterm_log::warn!("{title}: {body}");
 }
-
-/// Linux: a desktop notification (`org.freedesktop.Notifications`), sent before this returns.
-#[cfg(target_os = "linux")]
-pub(crate) fn notify(title: &str, body: &str) {
-    crate::notify::deliver_now(title, body);
-}
-
-/// Elsewhere off macOS and Windows no alert is wired.
-#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
-pub(crate) fn notify(_title: &str, _body: &str) {}
 
 /// Help, off macOS: the project page in the default browser.
 #[cfg(not(target_os = "macos"))]
@@ -3165,44 +3136,6 @@ mod macos {
         }
     }
 
-    /// Show an informational alert (one OK button) and block until it is dismissed.
-    pub(crate) fn notify(title: &str, body: &str) {
-        if super::os_ui_refused(title) || MainThread::new().is_none() {
-            return;
-        }
-        let _park = crate::watchdog::park_modal();
-        autoreleasepool(|_| {
-            let Some(alert) = ok_alert(title, body) else {
-                return;
-            };
-            // SAFETY: main thread (checked above); `-runModal` is
-            // `-(NSModalResponse)` on the live alert.
-            let _ = unsafe { appkit::send_isize(alert.id(), sel!(runModal)) };
-        });
-    }
-
-    /// [`notify`]'s alert, built and not yet run.
-    pub(crate) fn ok_alert(title: &str, body: &str) -> Option<Obj> {
-        let (Some(title), Some(body), Some(ok)) = (
-            appkit::nsstring(title),
-            appkit::nsstring(body),
-            appkit::nsstring("OK"),
-        ) else {
-            return None;
-        };
-        let alert = crate::app_icon::alert(MainThread::new()?)?;
-        // SAFETY: `NSAlert` setters on the main thread (the witness above).
-        // `-setMessageText:`/`-setInformativeText:` are `-(void)(NSString *)`;
-        // `-addButtonWithTitle:` is `-(id)` returning a BORROWED button this
-        // caller does not keep.
-        unsafe {
-            appkit::send_v_id(alert.id(), sel!(setMessageText:), title.id());
-            appkit::send_v_id(alert.id(), sel!(setInformativeText:), body.id());
-            let _ = appkit::send_id_id(alert.id(), sel!(addButtonWithTitle:), ok.id());
-            Some(alert)
-        }
-    }
-
     /// Who asked for the `terminate:` AppKit is deciding, by the sender and the quit reason of
     /// the Apple event it answers ([`crate::system_quit::asker_of`]); with no event, a person.
     fn terminate_asker() -> crate::system_quit::Asker {
@@ -3768,7 +3701,6 @@ mod tests {
             ("ShowConnectionMap", MenuAction::Overview),
             ("Fleet", MenuAction::Overview),
             ("ShowFleet", MenuAction::Overview),
-            ("TogglePresenceRim", MenuAction::ToggleNeedsInWindows),
         ] {
             assert_eq!(MenuAction::from_invoke_name(old), Some(new), "{old}");
         }
@@ -3949,33 +3881,6 @@ mod tests {
             Some(super::summarize_title(false))
         );
         set_agents_live(AgentsLive::UNPUBLISHED);
-    }
-
-    #[test]
-    fn the_needs_row_is_checkable_from_the_live_state() {
-        super::set_needs_in_windows(false);
-        assert_eq!(
-            super::native_menu_checked(MenuAction::ToggleNeedsInWindows),
-            Some(false)
-        );
-        super::set_needs_in_windows(true);
-        assert_eq!(
-            super::native_menu_checked(MenuAction::ToggleNeedsInWindows),
-            Some(true)
-        );
-        assert_eq!(super::native_menu_checked(MenuAction::Overview), None);
-        assert_eq!(
-            MenuAction::ToggleNeedsInWindows.invoke_authority(),
-            super::InvokeAuthority::ConfigWrite,
-            "the toggle writes aterm.toml"
-        );
-        let view = MENU_MODEL.iter().find(|s| s.title == "View").unwrap();
-        assert!(
-            view.entries
-                .iter()
-                .flat_map(MenuEntry::items)
-                .any(|(_, a, _, _)| a == MenuAction::ToggleNeedsInWindows)
-        );
     }
 
     #[test]

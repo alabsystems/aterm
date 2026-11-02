@@ -9,6 +9,76 @@ use std::time::Duration;
 
 const HANG: Duration = Duration::from_secs(60);
 
+#[cfg(unix)]
+#[test]
+fn dispatch_witness_distinguishes_spawn_from_post_spawn_reader_failure() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let started = std::cell::Cell::new(false);
+    let mut missing = crate::spawnfd::command(dir.path().join("absent"));
+    let error = output_until_complete_stdout_observed(&mut missing, Instant::now() + HANG, || {
+        started.set(true)
+    })
+    .expect_err("no executable can be dispatched");
+    assert!(matches!(
+        error,
+        CompleteOutputError::Run(RunError::Spawn(_))
+    ));
+    assert!(!started.get());
+
+    let mut echo =
+        crate::spawnfd::command(crate::deadline::stand_in(std::path::Path::new("/bin/echo")));
+    echo.arg("owned dispatch witness");
+    let error = capture(
+        &mut echo,
+        Stdio::null(),
+        Instant::now() + HANG,
+        || started.set(true),
+        |pipe, stream| {
+            assert!(
+                started.get(),
+                "the process-start witness precedes output readers"
+            );
+            let bytes = drain_stdout(pipe, stream)?
+                .collect(&Grace::at(Instant::now() + HANG))
+                .map_err(io::Error::other)?;
+            assert_eq!(
+                bytes, b"owned dispatch witness\n",
+                "the child actually executed"
+            );
+            Err(io::Error::other("injected reader-thread spawn failure"))
+        },
+    )
+    .expect_err("post-spawn reader failure is reported");
+    assert!(matches!(
+        error,
+        CompleteOutputError::Run(RunError::Spawn(_))
+    ));
+    assert!(
+        started.get(),
+        "a reader failure cannot erase possible child effects"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_observer_unwind_terminates_and_reaps_its_owned_child() {
+    let mut child = crate::spawnfd::command(crate::deadline::stand_in(std::path::Path::new(
+        "/bin/sleep",
+    )))
+    .arg("30")
+    .process_group(0)
+    .spawn()
+    .unwrap();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        observe_started(&mut child, || panic!("injected observer unwind"));
+    }));
+    assert!(result.is_err());
+    assert!(
+        child.try_wait().unwrap().is_some(),
+        "owned child was reaped"
+    );
+}
+
 fn collect(stream: impl Read + Send + 'static) -> Result<Vec<u8>, CompleteOutputError> {
     drain_stdout(None, stream)
         .expect("the pure reader starts")

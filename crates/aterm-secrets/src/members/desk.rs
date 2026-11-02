@@ -4,15 +4,26 @@
 //! A member's desk (§3.3.1, §3.3.4): the requests it heard, the phrases it shows, and the
 //! member's side of the `ask` exchange ([`serve`]).
 //!
-//! A request is heard on `ask` and shows as a row until it expires ([`REQUEST_LIFETIME`]),
-//! is ignored, or is closed: by this member's run that let it in, or by the new Mac's `done`
-//! after another member's did. A closed request that asks again shows again: the new Mac lost
-//! the bundle it was handed. Allow on a row shows a phrase bound to that request's `CI`
+//! A request is heard on `ask` and shows as a row while its Mac asks: it lapses
+//! [`STILL_ASKING`] after the last ask (a row whose phrase can still admit stays until the phrase
+//! ends), goes when this Mac moves to another network ([`Desk::on_network`]), is ignored, or is
+//! closed: by this member's run that let it in, by the new Mac's `done` after another member's
+//! did, or by any admission this Mac reads (an `Admit` in the membership log, or the Commons
+//! roster binding its key, [`Desk::refresh`]). A closed request that asks again shows again: the
+//! new Mac lost the bundle it was handed. A row's handle is its request's digest, so a Mac that
+//! asks again after its row lapsed shows under the same handle. Allow on a row shows a phrase bound to that request's `CI`
 //! ([`Phrases::allow`]); invite shows one for whichever Mac uses it first. A run is CPace over
 //! that phrase, then the possession challenge (step 8: `T_M` is checked by the new Mac before
 //! it answers, and this member checks the answer before it signs anything), then the bundle
 //! (step 9) under the run's bundle key. Runs are limited to [`RUNS_PER_MINUTE`] per source
 //! address, counted when they start.
+//!
+//! On the pinned default ALab vault, a verified request from another host on this member's home
+//! ALab LAN ([`Local::automatically_admits`]) is forwarded to the vault's join queue
+//! ([`forward_automatic_requests`]), where the vault's own admission takes it; the vault's server
+//! observes this member, not the asking Mac, so a request from any other network, however
+//! private its address, is never forwarded and waits for a person's Allow
+//! (`docs/DESIGN-automatic-lan-admission-2026-11-02.md`).
 
 use super::wire::{self, Line};
 use super::{Allowed, PhraseState};
@@ -30,8 +41,6 @@ use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::Duration;
 
-/// How long a heard request shows (§3.3.4 "Limits on phrases").
-pub const REQUEST_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
 /// How many requests a desk holds. Past it the oldest settled one (ignored, let in, or allowed
 /// with a phrase that can no longer admit) goes, else an asking one of the sources that hold the
 /// most asking rows ([`Desk::victim`] among them): a flood's, while it holds more rows from each
@@ -43,17 +52,16 @@ pub const MAX_HEARD: usize = 64;
 /// pushes another Mac's row out.
 pub const PER_SOURCE: usize = 4;
 /// How long after its first ask a request that asks again counts as a waiting Mac's. A Mac
-/// waiting to be let in asks each member again (its subscriber once a minute, `aterm members
-/// join` every few seconds), and its row goes only once no row that is not a waiting Mac's is
-/// left among those that may go ([`Desk::victim`]).
+/// waiting to be let in asks each member again (its subscriber 1, 2, 4 and 8 minutes after its
+/// first ask and then every 15, `aterm members join` every few seconds), and its row goes only
+/// once no row that is not a waiting Mac's is left among those that may go ([`Desk::victim`]).
+/// However often it asks, it shows one row.
 pub const ASKED_AGAIN_AFTER: Duration = Duration::from_secs(30);
-/// How long a row that asked again stays a waiting Mac's without asking once more: past twice
-/// the subscriber's minute, so one ask lost on the LAN keeps it, while a Mac that stopped asking
-/// (or a host that asked its own requests again once) holds no row ahead of a fresh one for the
-/// rest of [`REQUEST_LIFETIME`].
-pub const STILL_ASKING: Duration = Duration::from_secs(3 * 60);
-/// From this many asking rows on, the band shows them as one row.
-pub const COLLAPSE_AT: usize = 10;
+/// How long a row shows after its Mac's last ask: past twice the subscriber's longest pause
+/// between asks (15 minutes), so one ask lost on the LAN keeps it, while a Mac that stopped
+/// asking (or a host that asked its own requests again once) holds no row at all past it. A row
+/// whose phrase can still admit stays until that phrase ends.
+pub const STILL_ASKING: Duration = Duration::from_secs(32 * 60);
 /// The CPace runs one source address may start a minute.
 pub const RUNS_PER_MINUTE: usize = 3;
 pub(super) const DONE_DOMAIN: &[u8] = b"aterm/alab/join-done/1\0";
@@ -99,6 +107,30 @@ pub(crate) fn ask_message(
     out
 }
 
+pub(super) const PROVE_DOMAIN: &[u8] = b"aterm/alab/join-prove/1\0";
+/// The record domain a Mac's fleet node key signs a proof under: the joiner signs with
+/// `NodeIdentity::sign_record(PROVE_RECORD, &prove_message(..))`, which prefixes
+/// [`PROVE_RECORD_PREFIX`].
+pub const PROVE_RECORD: &str = "membership prove";
+/// `aterm-fleet/v3 record ` (aterm-net's `RECORD_LABEL`), [`PROVE_RECORD`] and a NUL: what a
+/// node key's record signature starts with, so a proof never meets a `Node` record's or a
+/// channel's.
+pub(super) const PROVE_RECORD_PREFIX: &[u8] = b"aterm-fleet/v3 record membership prove\0";
+
+/// What a Mac that proves itself (`prove`) signs, with its request's writer key and with its
+/// fleet node key: this member's key, the challenge its greeting carried on this connection,
+/// the node key and the request. A proof taken from one connection proves nothing on another,
+/// and a host that copied a request or a node key's public half signs neither.
+#[must_use]
+pub fn prove_message(
+    member: &[u8; 32],
+    challenge: &[u8; CHALLENGE_LEN],
+    node: &[u8; 32],
+    request: &[u8],
+) -> Vec<u8> {
+    [PROVE_DOMAIN, member, challenge, node, request].concat()
+}
+
 /// The source a request is counted under ([`PER_SOURCE`]): an IPv4 address (a mapped one
 /// too), or an IPv6 address's /64, which one host can fill.
 fn source_of(from: IpAddr) -> IpAddr {
@@ -123,6 +155,17 @@ pub struct Local {
     name: String,
     removed: client::RemovedNotes,
     admitted: std::collections::BTreeSet<crate::membership_log::MemberId>,
+    /// The writer keys the current Commons roster binds: a Mac an approver enrolled from an
+    /// `Allowed` (F10) is bound here once let in.
+    bound: std::collections::BTreeSet<[u8; 32]>,
+    /// The pinned default ALab vault served at a URL: requests from this member's home ALab LAN
+    /// are forwarded to its join queue ([`Local::automatically_admits`]).
+    automatic_lan: bool,
+    /// The recipients the vault's signed swarm roster names (on the default ALab vault only).
+    admitted_recipients: std::collections::BTreeSet<String>,
+    /// This member's home ALab LAN when it read its place (`crate::home_lan::home_net`): only a
+    /// host on it is forwarded.
+    home: Option<crate::home_lan::HomeNet>,
 }
 
 impl Local {
@@ -142,16 +185,45 @@ impl Local {
         let Some(device) = Device::open(paths)? else {
             return Ok(None);
         };
-        let can_allow = matches!(bootstrap.access(), Ok(Some(_))) || client::admits_by_log(paths);
+        let access = bootstrap.access();
+        let bound = match &access {
+            Ok(Some(access)) => access
+                .members()
+                .iter()
+                .map(|member| *member.binding().writer())
+                .collect(),
+            _ => std::collections::BTreeSet::new(),
+        };
+        let can_allow = matches!(access, Ok(Some(_))) || client::admits_by_log(paths);
         let admitted = client::log_admitted_actors(paths);
         let trust = bootstrap.trust();
         let request = device.request(trust.network, trust.authority)?;
-        let name = client::config(paths)?
-            .map(|config| config.host)
-            .unwrap_or_default();
+        let config = client::config(paths)?;
+        let automatic_lan = config.as_ref().is_some_and(|config| {
+            client::alab_vault(config) && matches!(&config.source, crate::transport::Source::Url(_))
+        });
+        let name = config.map(|config| config.host).unwrap_or_default();
         // A removed Mac that asks again shows as removed, not new (F16): from the log this Mac
         // holds, read without the state lock (the records file is written whole).
         let removed = client::removed_notes(paths).unwrap_or_default();
+        let admitted_recipients = if automatic_lan {
+            client::swarm_roster(paths)?.map_or_else(Default::default, |roster| {
+                roster
+                    .members
+                    .iter()
+                    .filter(|member| !roster.is_member_denied(member))
+                    .map(|member| member.recipient.clone())
+                    .collect()
+            })
+        } else {
+            Default::default()
+        };
+        // Read here, on the desk's lane or a connection thread, never a window's main thread.
+        let home = if automatic_lan {
+            crate::home_lan::home_net(paths)
+        } else {
+            None
+        };
         Ok(Some(Self {
             device,
             request,
@@ -160,6 +232,10 @@ impl Local {
             name,
             removed,
             admitted,
+            bound,
+            automatic_lan,
+            admitted_recipients,
+            home,
         }))
     }
 
@@ -179,7 +255,19 @@ impl Local {
             name: name.to_owned(),
             removed: client::RemovedNotes::default(),
             admitted: std::collections::BTreeSet::new(),
+            bound: std::collections::BTreeSet::new(),
+            automatic_lan: false,
+            admitted_recipients: Default::default(),
+            home: None,
         })
+    }
+
+    /// This member with `bound` as the writer keys its Commons roster binds: the seam a test
+    /// lets a desk read an approver's enrollment with.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn with_bound(self, bound: std::collections::BTreeSet<[u8; 32]>) -> Self {
+        Self { bound, ..self }
     }
 
     /// This member with `removed` as the Macs its log removed: the seam a test gives a desk
@@ -188,6 +276,44 @@ impl Local {
     #[must_use]
     pub fn with_removed(self, removed: client::RemovedNotes) -> Self {
         Self { removed, ..self }
+    }
+
+    /// Supply authenticated LAN policy and admitted recipients in an isolated fixture, this member
+    /// on the test home network ([`crate::home_lan::HomeNet::test`], `192.168.1.0/24`).
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn with_automatic_lan(self, admitted_recipients: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            automatic_lan: true,
+            admitted_recipients: admitted_recipients.into_iter().collect(),
+            home: Some(crate::home_lan::HomeNet::test()),
+            ..self
+        }
+    }
+
+    /// This member on the home ALab LAN `home`, or on none: the seam a test moves it with.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn with_home(self, home: Option<crate::home_lan::HomeNet>) -> Self {
+        Self { home, ..self }
+    }
+
+    /// Whether a request from `from` is covered by the default ALab LAN admission policy: this
+    /// member serves the pinned default ALab vault, it was on its home ALab LAN when it last read
+    /// its place, and `from` is another host on that network ([`crate::home_lan::HomeNet::holds`]).
+    /// A private address alone is no home: a phone hotspot, a café, a VM bridge or Internet
+    /// Sharing number their hosts privately too, and the vault's server observes the forwarding
+    /// member, not the asking Mac, so the member judges the asking Mac's network here.
+    #[must_use]
+    pub fn automatically_admits(&self, from: IpAddr) -> bool {
+        self.automatic_lan && self.home.is_some_and(|home| home.holds(from))
+    }
+
+    fn knows_recipient(&self, request: &Request) -> bool {
+        self.automatic_lan
+            && self
+                .admitted_recipients
+                .contains(&request.binding().recipient().to_bech32())
     }
 
     /// The writer key this member's greeting names and its `CI` binds.
@@ -219,7 +345,7 @@ impl Local {
 /// What a heard request is doing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RowState {
-    /// Waiting for a person on some member.
+    /// Waiting for admission through the automatic or manual path.
     Asking,
     /// Allowed here; its phrase is on this Mac's screen.
     Allowed(PhraseId),
@@ -249,9 +375,12 @@ pub struct Row {
     pub removed: Option<client::RemovedNote>,
     /// A person pressed "Allow again": the run restores the Mac a plain removal took out.
     pub restore: bool,
+    /// The default ALab policy forwards this LAN request without a person's approval.
+    pub automatic: bool,
 }
 
 struct Heard {
+    /// [`row_id`] of its request.
     id: u64,
     request: Request,
     node: [u8; 32],
@@ -265,6 +394,19 @@ struct Heard {
     last: Instant,
     state: RowState,
     restore: bool,
+    /// When the default ALab policy may forward it next ([`Desk::take_automatic_requests`]).
+    forward_after: Instant,
+    /// The network this Mac was on when it last heard the request ([`Desk::on_network`]).
+    network: Option<String>,
+}
+
+/// A row's handle: the first eight bytes of its request's SHA-256, so a Mac whose row lapsed
+/// shows under the same handle when it asks again.
+fn row_id(request: &Request) -> u64 {
+    let digest = ring::digest::digest(&ring::digest::SHA256, request.bytes());
+    let mut id = [0u8; 8];
+    id.copy_from_slice(&digest.as_ref()[..8]);
+    u64::from_be_bytes(id)
 }
 
 /// One `ask` line's fields, as [`Desk::hear`] checks them.
@@ -318,7 +460,8 @@ pub struct Desk {
     phrases: Phrases,
     invites: Vec<PhraseId>,
     runs: Vec<(IpAddr, Instant)>,
-    next: u64,
+    /// This Mac's network as [`Desk::on_network`] was last told it.
+    network: Option<String>,
 }
 
 /// The fields of a `run` line, as [`Desk::begin`] checks them.
@@ -328,6 +471,14 @@ struct RunLine {
     name: String,
     nonce: Nonce,
     signature: [u8; 64],
+}
+
+/// The fields of a `prove` line, as [`Desk::begin_proof`] checks them.
+struct ProveLine {
+    wire: Vec<u8>,
+    node: [u8; 32],
+    signature: [u8; 64],
+    node_signature: [u8; 64],
 }
 
 /// A run between [`Desk::begin`] and its end.
@@ -350,7 +501,7 @@ impl Desk {
             phrases: Phrases::new(),
             invites: Vec::new(),
             runs: Vec::new(),
-            next: 1,
+            network: None,
         }
     }
 
@@ -360,11 +511,15 @@ impl Desk {
     }
 
     /// Replace the member (its roster binding, log admissions or name changed), keeping what it
-    /// heard on the same network and closing rows whose Mac an `Admit` in the membership log has
-    /// now let in (§3.3.1 step 6).
+    /// heard on the same network and closing rows whose Mac is now let in: an `Admit` in the
+    /// membership log (§3.3.1 step 6), the Commons roster binding its writer key (an approver
+    /// enrolled it from a member's `Allowed`), or, on the default ALab vault, its signed swarm
+    /// roster naming its recipient.
     pub fn refresh(&mut self, local: Local) {
         if self.local.trust != local.trust {
+            let network = self.network.take();
             *self = Self::new(local);
+            self.network = network;
             return;
         }
         if !local.can_allow || self.local.key() != local.key() {
@@ -375,16 +530,39 @@ impl Desk {
                 if let RowState::Allowed(phrase) = heard.state {
                     self.phrases.cancel(phrase);
                     heard.state = RowState::Asking;
+                    heard.restore = false;
                 }
             }
         }
         for heard in &mut self.heard {
-            let actor = heard.request.binding().actor();
-            if local.admitted.contains(&actor) && !self.local.admitted.contains(&actor) {
+            let binding = heard.request.binding();
+            let actor = binding.actor();
+            let admitted = local.admitted.contains(&actor) && !self.local.admitted.contains(&actor);
+            let bound = local.bound.contains(binding.writer())
+                && !self.local.bound.contains(binding.writer());
+            let rostered = local.knows_recipient(&heard.request)
+                && local
+                    .removed
+                    .of_with_node(&binding.recipient(), binding.writer(), &heard.node)
+                    .is_none();
+            if admitted || bound || rostered {
                 if let RowState::Allowed(phrase) = heard.state {
                     self.phrases.cancel(phrase);
                 }
                 heard.state = RowState::Closed;
+                heard.restore = false;
+                continue;
+            }
+            if let RowState::Allowed(phrase) = heard.state
+                && let Some(note) =
+                    local
+                        .removed
+                        .of_with_node(&binding.recipient(), binding.writer(), &heard.node)
+                && (!heard.restore || note.quorum)
+            {
+                self.phrases.cancel(phrase);
+                heard.state = RowState::Asking;
+                heard.restore = false;
             }
         }
         self.local = local;
@@ -404,15 +582,15 @@ impl Desk {
         Ok(request)
     }
 
+    /// Drop the rows that lapsed ([`Desk::lapsed`]).
     fn expire(&mut self, now: Instant) {
-        let phrases = &mut self.phrases;
-        self.heard.retain(|heard| {
-            let keep = now.saturating_duration_since(heard.first) < REQUEST_LIFETIME;
-            if let (false, RowState::Allowed(phrase)) = (keep, heard.state) {
-                phrases.cancel(phrase);
+        let mut at = self.heard.len();
+        while at > 0 {
+            at -= 1;
+            if self.lapsed(&self.heard[at], now) {
+                self.drop_row(at);
             }
-            keep
-        });
+        }
         self.runs
             .retain(|(_, at)| now.saturating_duration_since(*at) < Duration::from_secs(60));
     }
@@ -431,19 +609,57 @@ impl Desk {
         }
     }
 
+    /// Whether row `heard` holds a phrase that can still admit: live or mid-run, unexpired.
+    fn admits(&self, heard: &Heard, now: Instant) -> bool {
+        match heard.state {
+            RowState::Allowed(phrase) => {
+                matches!(
+                    self.phrases.state(phrase),
+                    Some(PhraseState::Live | PhraseState::Running)
+                ) && self.phrases.expires(phrase).is_some_and(|end| now < end)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether row `heard` lapsed at `now`: its Mac last asked [`STILL_ASKING`] or more ago,
+    /// and it holds no phrase that can still admit.
+    fn lapsed(&self, heard: &Heard, now: Instant) -> bool {
+        now.saturating_duration_since(heard.last) >= STILL_ASKING && !self.admits(heard, now)
+    }
+
     /// Whether row `heard` is settled: ignored, let in, or allowed with a phrase that can no
     /// longer admit (spent, expired, or gone from the book).
     fn settled(&self, heard: &Heard, now: Instant) -> bool {
         match heard.state {
             RowState::Ignored | RowState::Closed => true,
             RowState::Asking => false,
-            RowState::Allowed(phrase) => {
-                !matches!(
-                    self.phrases.state(phrase),
-                    Some(PhraseState::Live | PhraseState::Running)
-                ) || self.phrases.expires(phrase).is_none_or(|end| now >= end)
+            RowState::Allowed(_) => !self.admits(heard, now),
+        }
+    }
+
+    /// This Mac's network is now `network` ([`crate::heard::network_key`]): every row heard on
+    /// another one goes, its phrase cancelled, since a Mac that asked there is not here to be let
+    /// in (a row heard before this desk was told any network goes too). `None`, no network to
+    /// name for now, changes nothing. How many rows went.
+    pub fn on_network(&mut self, network: Option<String>) -> usize {
+        let Some(network) = network else {
+            return 0;
+        };
+        if self.network.as_deref() == Some(network.as_str()) {
+            return 0;
+        }
+        let mut gone = 0;
+        let mut at = self.heard.len();
+        while at > 0 {
+            at -= 1;
+            if self.heard[at].network.as_deref() != Some(network.as_str()) {
+                self.drop_row(at);
+                gone += 1;
             }
         }
+        self.network = Some(network);
+        gone
     }
 
     /// Drop row `at`, cancelling its phrase if one still shows.
@@ -536,7 +752,10 @@ impl Desk {
         if !crate::text::valid_machine_name(name) {
             return Err(Error::new("that Mac asks under no machine name"));
         }
-        if model.is_empty() || !model.bytes().all(|b| b == b' ' || b.is_ascii_graphic()) {
+        if model.is_empty()
+            || model.len() > super::wire::MAX_TEXT
+            || !model.bytes().all(|b| b == b' ' || b.is_ascii_graphic())
+        {
             return Err(Error::new("that Mac names no model"));
         }
         let message = ask_message(self.local.key(), &node, name, model, request.bytes());
@@ -544,12 +763,27 @@ impl Desk {
             .verify(&message, signature)
             .map_err(|_| Error::new("that ask is not signed by the Mac whose request it names"))?;
         self.expire(now);
+        if self.local.knows_recipient(&request)
+            && self
+                .local
+                .removed
+                .of_with_node(
+                    &request.binding().recipient(),
+                    request.binding().writer(),
+                    &node,
+                )
+                .is_none()
+        {
+            self.close(&request);
+            return Ok(Answer::Closed);
+        }
         if let Some(at) = self.find(&request) {
             let heard = &mut self.heard[at];
             if now.saturating_duration_since(heard.first) >= ASKED_AGAIN_AFTER {
                 heard.again = true;
             }
             heard.last = heard.last.max(now);
+            heard.network.clone_from(&self.network);
             // A Mac let in holds its bundle and asks no member again (`aterm members join` and
             // its subscriber stop at the Allowed it keeps), so a closed request that asks lost
             // its bundle between this member's send and its write: it asks anew, and an Allow
@@ -557,14 +791,13 @@ impl Desk {
             // needs the request's keys.
             if self.heard[at].state == RowState::Closed {
                 self.heard[at].state = RowState::Asking;
+                self.heard[at].restore = false;
             }
             return Ok(self.answer(at, now));
         }
         self.make_room(from, now)?;
-        let id = self.next;
-        self.next += 1;
         self.heard.push(Heard {
-            id,
+            id: row_id(&request),
             request,
             node,
             name: name.to_owned(),
@@ -575,16 +808,71 @@ impl Desk {
             last: now,
             state: RowState::Asking,
             restore: false,
+            network: self.network.clone(),
+            forward_after: now,
         });
         Ok(Answer::Asking)
     }
 
-    /// The rows the band shows, oldest first.
+    /// Verified requests from this member's home ALab LAN due for forwarding to the default
+    /// vault's automatic approver, at most eight: none whose Mac stopped asking
+    /// ([`STILL_ASKING`]), was let go, or asked from another network. This grants no access; the
+    /// vault's server observes the forwarding member, and its approver applies its signed policy.
+    fn take_automatic_requests(&mut self, now: Instant) -> Vec<crate::transport::JoinRequest> {
+        self.expire(now);
+        let mut requests = Vec::new();
+        for heard in &mut self.heard {
+            if requests.len() == 8 {
+                break;
+            }
+            if !Self::wants_automatic(&self.local, heard, now) || now < heard.forward_after {
+                continue;
+            }
+            let binding = heard.request.binding();
+            heard.forward_after = now + Duration::from_secs(30);
+            requests.push(crate::transport::JoinRequest {
+                recipient: binding.recipient().to_bech32(),
+                host: heard.name.clone(),
+                code: client::join_code(&binding.recipient()),
+                time: None,
+                lan: false,
+                home: None,
+                allowed: None,
+                proof: None,
+            });
+        }
+        requests
+    }
+
+    /// When the next eligible LAN request can be forwarded, including the desk's retry
+    /// backoff. A time at or before `now` is ready; none means no live request needs a post.
+    /// This does not consume requests, so a worker can wait without another Mac asking again.
+    #[must_use]
+    pub fn next_automatic_request(&self, now: Instant) -> Option<Instant> {
+        self.heard
+            .iter()
+            .filter(|heard| Self::wants_automatic(&self.local, heard, now))
+            .map(|heard| heard.forward_after)
+            .min()
+    }
+
+    fn wants_automatic(local: &Local, heard: &Heard, now: Instant) -> bool {
+        let binding = heard.request.binding();
+        local.automatically_admits(heard.from)
+            && matches!(heard.state, RowState::Asking | RowState::Allowed(_))
+            && now.saturating_duration_since(heard.last) < STILL_ASKING
+            && local
+                .removed
+                .of_with_node(&binding.recipient(), binding.writer(), &heard.node)
+                .is_none()
+    }
+
+    /// The rows the band shows, oldest first: none that lapsed ([`Desk::lapsed`]).
     #[must_use]
     pub fn rows(&self, now: Instant) -> Vec<Row> {
         self.heard
             .iter()
-            .filter(|heard| now.saturating_duration_since(heard.first) < REQUEST_LIFETIME)
+            .filter(|heard| !self.lapsed(heard, now))
             .map(|heard| Row {
                 id: heard.id,
                 name: heard.name.clone(),
@@ -592,18 +880,20 @@ impl Desk {
                 from: heard.from,
                 code: client::join_code(&heard.request.binding().recipient()),
                 state: heard.state,
-                removed: self.removed_note(&heard.request).cloned(),
+                removed: self.removed_note(heard).cloned(),
                 restore: heard.restore,
+                automatic: self.local.automatically_admits(heard.from)
+                    && self.removed_note(heard).is_none(),
             })
             .collect()
     }
 
-    /// Why this Mac's log keeps out the Mac `request` binds, where it does.
-    fn removed_note(&self, request: &Request) -> Option<&client::RemovedNote> {
-        let binding = request.binding();
+    /// Why this Mac's log keeps out the Mac `heard` binds, where it does.
+    fn removed_note(&self, heard: &Heard) -> Option<&client::RemovedNote> {
+        let binding = heard.request.binding();
         self.local
             .removed
-            .of(&binding.recipient(), binding.writer())
+            .of_with_node(&binding.recipient(), binding.writer(), &heard.node)
     }
 
     fn row_mut(&mut self, id: u64) -> Result<&mut Heard> {
@@ -650,11 +940,12 @@ impl Desk {
                 .iter()
                 .find(|heard| heard.id == id)
                 .ok_or_else(|| Error::new("no such request on this Mac"))?;
-            match (self.removed_note(&heard.request), restore) {
+            match (self.removed_note(heard), restore) {
                 (Some(note), false) => {
+                    let title = note.title();
                     return Err(Error::new(format!(
                         "{}; \"Allow again\" restores it",
-                        note.title().trim_end_matches(". Allow again?")
+                        title.strip_suffix(". Allow again?").unwrap_or(&title)
                     )));
                 }
                 (Some(note), true) if note.quorum => {
@@ -726,7 +1017,9 @@ impl Desk {
         if let Some(prev) = prev {
             self.phrases.cancel(prev);
         }
-        self.row_mut(id)?.state = RowState::Ignored;
+        let heard = self.row_mut(id)?;
+        heard.state = RowState::Ignored;
+        heard.restore = false;
         Ok(())
     }
 
@@ -739,6 +1032,7 @@ impl Desk {
         for heard in &mut self.heard {
             if heard.state == RowState::Allowed(phrase) {
                 heard.state = RowState::Asking;
+                heard.restore = false;
             }
         }
     }
@@ -791,12 +1085,13 @@ impl Desk {
         let (node, name) = (*node, name.as_str());
         self.expire(now);
         self.may_allow()?;
-        if self.runs.iter().filter(|(at, _)| *at == from).count() >= RUNS_PER_MINUTE {
+        let source = source_of(from);
+        if self.runs.iter().filter(|(at, _)| *at == source).count() >= RUNS_PER_MINUTE {
             return Err(Error::new(
                 "too many join runs from that address; wait a minute",
             ));
         }
-        self.runs.push((from, now));
+        self.runs.push((source, now));
         let request = self.checked(wire)?;
         let message = run_message(self.local.key(), challenge, nonce, &node, request.bytes());
         UnparsedPublicKey::new(&ED25519, request.binding().writer())
@@ -833,6 +1128,25 @@ impl Desk {
         let (phrase, name, restore) = allowed
             .or_else(invited)
             .ok_or_else(|| Error::new("no join phrase is shown on this Mac for that Mac"))?;
+        if let Some(note) = self.local.removed.of_with_node(
+            &request.binding().recipient(),
+            request.binding().writer(),
+            &node,
+        ) {
+            if note.quorum {
+                return Err(Error::new(format!(
+                    "a quorum of members removed {}, and one person's Allow does not bring it back",
+                    note.label
+                )));
+            }
+            if !restore {
+                let title = note.title();
+                return Err(Error::new(format!(
+                    "{}; \"Allow again\" restores it",
+                    title.strip_suffix(". Allow again?").unwrap_or(&title)
+                )));
+            }
+        }
         let (run, nonce) = self.phrases.begin(phrase, &ci, nonce, now)?;
         Ok((
             Running {
@@ -846,6 +1160,48 @@ impl Desk {
             run,
             nonce,
         ))
+    }
+
+    /// Check a `prove` line from `from` before anything else runs for it: within the runs one
+    /// source may start a minute, a request of this network that is not this Mac's own, signed
+    /// over this connection's `challenge` ([`prove_message`]) by its writer key and by the node
+    /// key it names; where `fleet` names the node key the fleet's channel proved, that one.
+    fn begin_proof(
+        &mut self,
+        from: IpAddr,
+        line: &ProveLine,
+        challenge: &[u8; CHALLENGE_LEN],
+        fleet: Option<&[u8; 32]>,
+        now: Instant,
+    ) -> Result<Request> {
+        self.expire(now);
+        self.may_allow()?;
+        let source = source_of(from);
+        if self.runs.iter().filter(|(at, _)| *at == source).count() >= RUNS_PER_MINUTE {
+            return Err(Error::new(
+                "too many join runs from that address; wait a minute",
+            ));
+        }
+        self.runs.push((source, now));
+        let request = self.checked(&line.wire)?;
+        if fleet.is_some_and(|proven| *proven != line.node) {
+            return Err(Error::new(
+                "that proof names another node key than the fleet's channel proved",
+            ));
+        }
+        let message = prove_message(self.local.key(), challenge, &line.node, request.bytes());
+        UnparsedPublicKey::new(&ED25519, request.binding().writer())
+            .verify(&message, &line.signature)
+            .map_err(|_| {
+                Error::new("that proof is not signed by the Mac whose request it names")
+            })?;
+        UnparsedPublicKey::new(&ED25519, &line.node)
+            .verify(
+                &[PROVE_RECORD_PREFIX, &message].concat(),
+                &line.node_signature,
+            )
+            .map_err(|_| Error::new("that proof is not signed by the node key it names"))?;
+        Ok(request)
     }
 
     /// The new Mac's own word that it was let in (`done`), signed by its writer key over this
@@ -928,6 +1284,95 @@ pub struct Handout {
 /// How a desk's caller builds a run's bundle ([`serve`]).
 pub type Hand<'a> = &'a dyn Fn(&Handing<'_>) -> Result<Handout>;
 
+/// Forward verified LAN asks to the default vault's queues, including verified mirrors.
+/// The receiver does not grant membership or read a manual approval phrase.
+/// # Errors
+/// The configured vault cannot be read, or a bounded queue submission fails.
+pub fn forward_automatic_requests(desk: &Mutex<Desk>, paths: &client::Paths) -> Result<usize> {
+    forward_automatic_requests_if(desk, paths, &|| true)
+}
+
+/// Forward automatic requests while their owning service still considers this desk current.
+/// The check runs before taking requests and before each post, without the desk lock. A post
+/// already in flight can finish; cancellation prevents starting another one in the batch.
+///
+/// # Errors
+/// The configured vault cannot be read, or a bounded queue submission fails.
+pub fn forward_automatic_requests_if(
+    desk: &Mutex<Desk>,
+    paths: &client::Paths,
+    current: &dyn Fn() -> bool,
+) -> Result<usize> {
+    if !current() {
+        return Ok(0);
+    }
+    let requests = desk
+        .lock_or_recover()
+        .take_automatic_requests(Instant::now());
+    if requests.is_empty() {
+        return Ok(0);
+    }
+    let Some(config) = client::config(paths)?.filter(client::alab_vault) else {
+        return Ok(0);
+    };
+    if !matches!(&config.source, crate::transport::Source::Url(_)) {
+        return Ok(0);
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    forward_selected(desk, requests, current, |request| {
+        client::join_routing::post(paths, &config, &request.line(), Some(deadline))
+    })
+}
+
+/// Forward due requests with a supplied clock and post operation: an isolated worker test's
+/// transport, sharing the production desk's queue, eligibility checks and backoff.
+///
+/// # Errors
+/// A supplied post failed.
+#[cfg(any(test, debug_assertions))]
+pub fn forward_automatic_with(
+    desk: &Mutex<Desk>,
+    now: Instant,
+    post: impl FnMut(&crate::transport::JoinRequest) -> Result<()>,
+) -> Result<usize> {
+    let requests = desk.lock_or_recover().take_automatic_requests(now);
+    forward_selected(desk, requests, &|| true, post)
+}
+
+fn forward_selected(
+    desk: &Mutex<Desk>,
+    requests: Vec<crate::transport::JoinRequest>,
+    current: &dyn Fn() -> bool,
+    mut post: impl FnMut(&crate::transport::JoinRequest) -> Result<()>,
+) -> Result<usize> {
+    let mut count = 0;
+    let mut failure = None;
+    for request in requests {
+        if !current() {
+            break;
+        }
+        let still_allowed = {
+            let held = desk.lock_or_recover();
+            held.heard.iter().any(|heard| {
+                held.local.automatically_admits(heard.from)
+                    && matches!(heard.state, RowState::Asking | RowState::Allowed(_))
+                    && heard.name == request.host
+                    && heard.request.binding().recipient().to_bech32() == request.recipient
+                    && held.removed_note(heard).is_none()
+            })
+        };
+        if !still_allowed {
+            continue;
+        }
+        match post(&request) {
+            Ok(()) => count += 1,
+            Err(error) if failure.is_none() => failure = Some(error),
+            Err(_) => {}
+        }
+    }
+    failure.map_or(Ok(count), Err)
+}
+
 /// Serve one `ask` connection from `from`: greet, then answer one `ask`, `done`, or a whole
 /// run. `bundle` makes the bundle for a run ([`Handing`]); the run's phrase burns on any end
 /// but a sent bundle. A run that sent its bundle returns the Allowed it signed, for the caller
@@ -941,6 +1386,50 @@ pub fn serve<S: Read + Write + ?Sized>(
     stream: &mut S,
     from: IpAddr,
     bundle: Hand<'_>,
+) -> Result<Option<Let>> {
+    serve_with(desk, stream, from, bundle, None)
+}
+
+/// What a desk's caller decides of a Mac that proved itself (`prove`): the log bundle it hands
+/// (`client::admit_by_proof`), or why not, which the Mac reads.
+pub type Prove<'a> = &'a dyn Fn(&Proving<'_>) -> Result<SecretBytes>;
+
+/// A Mac that proved itself on one connection ([`Prove`]).
+pub struct Proving<'a> {
+    /// Its self-signed request: the possession challenge proved its age identity and writer key.
+    pub request: &'a Request,
+    /// Its fleet node key, which signed this connection's fresh challenge.
+    pub node: [u8; 32],
+    /// The machine name it asks under.
+    pub name: &'a str,
+    /// The fleet's channel proved the fleet's current key and this node key, and the caller's
+    /// drive admission took it ([`Proof::fleet`]).
+    pub fleet: bool,
+}
+
+/// How a desk's caller serves `prove` on one connection ([`serve_with`]).
+#[derive(Clone, Copy)]
+pub struct Proof<'a> {
+    /// Decides and hands the bundle; called with no lock of the desk held.
+    pub decide: Prove<'a>,
+    /// The node key the fleet's channel proved on this connection, where it came over the fleet
+    /// (`vault-join`): the proof must name it, and [`Proving::fleet`] is set.
+    pub fleet: Option<[u8; 32]>,
+}
+
+/// [`serve`], also taking a `prove` line where `proof` is given: the Mac signs this
+/// connection's challenge with its writer key and its fleet node key, proves its age identity by
+/// the possession challenge, and `proof.decide` hands the log bundle with nobody's Allow, sealed
+/// to that age identity. A `prove` with no `proof` is refused.
+///
+/// # Errors
+/// As [`serve`].
+pub fn serve_with<S: Read + Write + ?Sized>(
+    desk: &Mutex<Desk>,
+    stream: &mut S,
+    from: IpAddr,
+    bundle: Hand<'_>,
+    proof: Option<Proof<'_>>,
 ) -> Result<Option<Let>> {
     let mut challenge = [0u8; CHALLENGE_LEN];
     if let Err(why) = aterm_uds::rand::fill(&mut challenge) {
@@ -956,7 +1445,9 @@ pub fn serve<S: Read + Write + ?Sized>(
         "ask" => ask(desk, &parsed, from),
         "done" => done(desk, &parsed).map(|()| Answer::Closed),
         "run" => return run(desk, stream, &parsed, from, &challenge, bundle),
-        "lan" => return run_lan(desk, stream, &parsed, from, &challenge, bundle),
+        "prove" if let Some(proof) = proof => {
+            return prove(desk, stream, &parsed, from, &challenge, proof).map(|()| None);
+        }
         _ => Err(Error::new(
             "the other Mac asked for something this Mac does not serve",
         )),
@@ -971,57 +1462,6 @@ pub fn serve<S: Read + Write + ?Sized>(
             Err(error)
         }
     }
-}
-
-/// LAN presence admits the request; the existing encrypted exchange carries its bundle.
-/// The one-use exchange words are delivered over this connection, never through a UI.
-fn run_lan<S: Read + Write + ?Sized>(
-    desk: &Mutex<Desk>,
-    stream: &mut S,
-    line: &Line<'_>,
-    from: IpAddr,
-    challenge: &[u8; CHALLENGE_LEN],
-    bundle: Hand<'_>,
-) -> Result<Option<Let>> {
-    let prepare = || {
-        if !crate::server::lan_join_peer(from) {
-            return Err(Error::new("automatic admission requires a LAN connection"));
-        }
-        ask(desk, line, from)?;
-        let wire = line.b64("request")?;
-        let mut desk = desk.lock_or_recover();
-        let request = desk.checked(&wire)?;
-        let at = desk
-            .find(&request)
-            .ok_or_else(|| Error::new("LAN request disappeared"))?;
-        let id = desk.heard[at].id;
-        let now = Instant::now();
-        let phrase = desk.allow(id, now)?;
-        let words = desk
-            .words(phrase, now)
-            .ok_or_else(|| Error::new("LAN exchange expired"))?;
-        Ok((phrase, words.join(" ")))
-    };
-    let (phrase, words) = match prepare() {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            let _ = wire::write_line(stream, &wire::refusal(&error.to_string()));
-            return Err(error);
-        }
-    };
-    let result = (|| {
-        wire::write_line(stream, &format!("OK exchange={}", wire::escape(&words)))?;
-        let next = wire::read_line(stream)?;
-        let parsed = Line::parse(&next);
-        if parsed.verb != "run" {
-            return Err(Error::new("LAN admission expected its bundle exchange"));
-        }
-        run(desk, stream, &parsed, from, challenge, bundle)
-    })();
-    if result.is_err() {
-        desk.lock_or_recover().withdraw(phrase);
-    }
-    result
 }
 
 fn ask(desk: &Mutex<Desk>, line: &Line<'_>, from: IpAddr) -> Result<Answer> {
@@ -1163,6 +1603,61 @@ fn steps<S: Read + Write + ?Sized>(
     })
 }
 
+fn prove<S: Read + Write + ?Sized>(
+    desk: &Mutex<Desk>,
+    stream: &mut S,
+    first: &Line<'_>,
+    from: IpAddr,
+    challenge: &[u8; CHALLENGE_LEN],
+    proof: Proof<'_>,
+) -> Result<()> {
+    let ended = (|| {
+        let asked = ProveLine {
+            wire: first.b64("request")?,
+            node: first.hex::<32>("node")?,
+            signature: first.hex::<64>("sig")?,
+            node_signature: first.hex::<64>("nodesig")?,
+        };
+        let name = allowed_name(&first.text("name")?);
+        let (request, trust) = {
+            let mut held = desk.lock_or_recover();
+            let request = held.begin_proof(
+                from,
+                &asked,
+                challenge,
+                proof.fleet.as_ref(),
+                Instant::now(),
+            )?;
+            (request, held.local.trust)
+        };
+        // The possession challenge, under the network this member pins.
+        let (mut pending, possess) = Pending::issue(&request, trust.network, trust.authority)?;
+        wire::write_line(stream, &format!("OK challenge={}", wire::b64(&possess)))?;
+        let line = wire::read_line(stream)?;
+        let response = expect(&line, "possess")?.b64("response")?;
+        if pending.verify(&response)?.binding() != request.binding() {
+            return Err(Error::new("the possession proof names another Mac"));
+        }
+        // The desk's lock is not held here: the decision reads and writes the vault's state.
+        let bundle = (proof.decide)(&Proving {
+            request: &request,
+            node: asked.node,
+            name: &name,
+            fleet: proof.fleet.is_some(),
+        })?;
+        let sealed = crate::age::encrypt(&[request.binding().recipient()], bundle.as_slice())?;
+        wire::write_line(stream, &format!("OK bundle={}", sealed.len()))?;
+        stream.write_all(&sealed)?;
+        stream.flush()?;
+        desk.lock_or_recover().close(&request);
+        Ok(())
+    })();
+    if let Err(error) = &ended {
+        let _ = wire::write_line(stream, &wire::refusal(&error.to_string()));
+    }
+    ended
+}
+
 fn expect<'a>(line: &'a str, verb: &str) -> Result<Line<'a>> {
     let parsed = Line::parse(line);
     if parsed.verb == verb {
@@ -1172,5 +1667,451 @@ fn expect<'a>(line: &'a str, verb: &str) -> Result<Line<'a>> {
             "the other Mac sent {} where this Mac waited for {verb}",
             parsed.verb
         )))
+    }
+}
+
+#[cfg(test)]
+mod automatic_tests {
+    use super::*;
+
+    const TRUST: Trust = Trust {
+        network: [1; 16],
+        authority: [2; 32],
+        genesis: [3; 32],
+    };
+
+    fn device(root: &std::path::Path, name: &str) -> Device {
+        let paths = client::Paths::for_home(&root.join(name));
+        client::machine_identity(&paths).unwrap();
+        Device::open(&paths).unwrap().unwrap()
+    }
+
+    fn ask(desk: &mut Desk, device: &Device, name: &str, from: IpAddr, now: Instant) -> Request {
+        let request = device.request(TRUST.network, TRUST.authority).unwrap();
+        let node = [7; 32];
+        let signature = super::super::joiner::ask_signature(
+            device,
+            desk.local.key(),
+            &node,
+            name,
+            "Mac",
+            request.bytes(),
+        )
+        .unwrap();
+        desk.hear(
+            &Asking {
+                wire: request.bytes(),
+                node,
+                name,
+                model: "Mac",
+                signature: &signature,
+            },
+            from,
+            now,
+        )
+        .unwrap();
+        request
+    }
+
+    /// Forward through the real client configuration and independent server queues. A member's
+    /// desk must use the same verified mirror route as a joining Mac, whether its configured
+    /// queue accepts the request or has stopped before the next Mac asks.
+    #[test]
+    fn a_members_automatic_requests_reach_the_verified_mirror_of_its_configured_queue() {
+        use crate::transport::{self, Fetched, Source};
+
+        fn server(root: &std::path::Path) -> crate::server::Running {
+            crate::server::start_at_home(
+                std::net::TcpListener::bind("127.0.0.1:0").unwrap(),
+                &crate::server::Options {
+                    listen: "127.0.0.1:0".parse().unwrap(),
+                    store: root.to_owned(),
+                    advertise: None,
+                    pins: Vec::new(),
+                    hold: Duration::from_millis(200),
+                    keep_awake: false,
+                },
+                Duration::ZERO,
+            )
+            .unwrap()
+        }
+
+        struct RestorePin(Option<crate::envelope::Retired>);
+        impl Drop for RestorePin {
+            fn drop(&mut self) {
+                crate::envelope::TEST_RETIRED.with(|cell| *cell.borrow_mut() = self.0.take());
+            }
+        }
+
+        let root = aterm_tempfile::tempdir().unwrap();
+        let mut primary = Some(server(&root.path().join("primary")));
+        let mirror = server(&root.path().join("mirror"));
+        let primary_url = format!("http://{}/v1/team", primary.as_ref().unwrap().addr);
+        let mirror_url = format!("http://{}/v1/team", mirror.addr);
+        let paths = Paths::for_home(&root.path().join("admin"));
+        client::create(&paths, &primary_url, None, Some("member")).unwrap();
+        let admin = client::admin_open(&paths).unwrap();
+        let mut document = admin.doc.clone();
+        let policy = crate::swarm_roster::SwarmPolicy {
+            servers: vec![mirror_url.clone()],
+            ..Default::default()
+        };
+        document
+            .set_entry(
+                &crate::text::Audience::Everyone,
+                crate::SWARM_POLICY_ENTRY,
+                policy.to_toml().as_bytes(),
+            )
+            .unwrap();
+        client::admin_publish(&paths, &admin, &document).unwrap();
+        let Fetched::Body(envelope) =
+            transport::fetch(&admin.config.source, None, Duration::ZERO).unwrap()
+        else {
+            panic!("the configured server must hold the signed vault");
+        };
+        transport::publish(&Source::Url(mirror_url.clone()), &envelope).unwrap();
+        // Only this test thread treats the scratch authority as the compiled ALab pin.
+        let _restore = RestorePin(crate::envelope::TEST_RETIRED.with(|cell| {
+            cell.replace(Some(crate::envelope::Retired {
+                keys: Vec::new(),
+                current: admin.config.signer,
+            }))
+        }));
+        assert!(client::alab_vault(&admin.config));
+
+        for (name, stop_primary) in [("first", false), ("second", true)] {
+            if stop_primary {
+                primary.take().unwrap().stop();
+            }
+            let local = Local::with(device(root.path(), "member"), TRUST, true, "member")
+                .unwrap()
+                .with_automatic_lan([]);
+            let desk = Mutex::new(Desk::new(local));
+            let request = ask(
+                &mut desk.lock_or_recover(),
+                &device(root.path(), name),
+                name,
+                "192.168.1.45".parse().unwrap(),
+                Instant::now(),
+            );
+            assert_eq!(forward_automatic_requests(&desk, &paths).unwrap(), 1);
+            let recipient = request.binding().recipient().to_bech32();
+            assert!(
+                transport::list_joins(&mirror_url)
+                    .unwrap()
+                    .iter()
+                    .any(|line| line.starts_with(&recipient)),
+                "{name} must reach the mirror while its configured server is {}",
+                if stop_primary { "offline" } else { "online" }
+            );
+        }
+        mirror.stop();
+    }
+
+    #[test]
+    fn automatic_lan_requests_reach_the_vault_queue_without_a_manual_allow() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let local = Local::with(device(root.path(), "member"), TRUST, true, "member")
+            .unwrap()
+            .with_automatic_lan([]);
+        let mut desk = Desk::new(local);
+        let now = Instant::now();
+        let joining = device(root.path(), "new");
+        let request = ask(
+            &mut desk,
+            &joining,
+            "m110",
+            "192.168.1.45".parse().unwrap(),
+            now,
+        );
+        assert!(
+            desk.hear(
+                &Asking {
+                    wire: request.bytes(),
+                    node: [7; 32],
+                    name: "forged",
+                    model: "Mac",
+                    signature: &[0; 64],
+                },
+                "192.168.1.46".parse().unwrap(),
+                now
+            )
+            .is_err()
+        );
+        ask(
+            &mut desk,
+            &device(root.path(), "public"),
+            "public",
+            "8.8.8.8".parse().unwrap(),
+            now,
+        );
+        let desk = Mutex::new(desk);
+        assert_eq!(
+            desk.lock_or_recover().next_automatic_request(now),
+            Some(now)
+        );
+        let mut posted = Vec::new();
+        assert_eq!(
+            forward_automatic_with(&desk, now, |request| {
+                posted.push(request.clone());
+                Ok(())
+            })
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            posted[0].recipient,
+            request.binding().recipient().to_bech32()
+        );
+        assert_eq!(posted[0].host, "m110");
+        assert!(posted[0].allowed.is_none() && posted[0].proof.is_none());
+        assert_eq!(
+            desk.lock_or_recover().next_automatic_request(now),
+            Some(now + Duration::from_secs(30))
+        );
+        assert_eq!(
+            forward_automatic_with(&desk, now, |_| panic!("already queued")).unwrap(),
+            0
+        );
+        assert_eq!(
+            forward_automatic_with(&desk, now + Duration::from_secs(30), |_| Ok(())).unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_stopped_owner_cancels_the_rest_of_an_automatic_batch() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let local = Local::with(device(root.path(), "member"), TRUST, true, "member")
+            .unwrap()
+            .with_automatic_lan([]);
+        let mut desk = Desk::new(local);
+        let now = Instant::now();
+        for name in ["one", "two"] {
+            ask(
+                &mut desk,
+                &device(root.path(), name),
+                name,
+                "192.168.1.45".parse().unwrap(),
+                now,
+            );
+        }
+        let requests = desk.take_automatic_requests(now);
+        assert_eq!(requests.len(), 2);
+        let current = std::cell::Cell::new(true);
+        let mut posted = Vec::new();
+        assert_eq!(
+            forward_selected(&Mutex::new(desk), requests, &|| current.get(), |request| {
+                posted.push(request.host.clone());
+                current.set(false);
+                Ok(())
+            })
+            .unwrap(),
+            1
+        );
+        assert_eq!(posted, ["one"]);
+    }
+
+    /// Only an ask from another host on this member's home ALab LAN is forwarded (D1): one from
+    /// another private network the member also reaches (a second interface, a VM bridge,
+    /// Internet Sharing, a phone hotspot's `172.20.10.0/28`) is not, though the vault's server
+    /// would observe it under the member's own home address, and a member that is on no home
+    /// ALab LAN forwards nothing, even from an address its old home held.
+    ///
+    /// NEGATIVE CONTROL: `Local::automatically_admits` taking every private source, as before the
+    /// home check (`self.automatic_lan && matches!(from, IpAddr::V4(ip) if ip.is_private())`),
+    /// forwards all three asks (left `3`, right `1`).
+    #[test]
+    fn only_an_ask_from_the_members_home_lan_is_forwarded() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let local = || {
+            Local::with(device(root.path(), "member"), TRUST, true, "member")
+                .unwrap()
+                .with_automatic_lan([])
+        };
+        let mut desk = Desk::new(local());
+        let now = Instant::now();
+        for (name, from) in [
+            ("home", "192.168.1.45"),
+            ("bridge", "192.168.64.3"),
+            ("hotspot", "172.20.10.5"),
+        ] {
+            ask(
+                &mut desk,
+                &device(root.path(), name),
+                name,
+                from.parse().unwrap(),
+                now,
+            );
+        }
+        let desk = Mutex::new(desk);
+        let mut posted = Vec::new();
+        assert_eq!(
+            forward_automatic_with(&desk, now, |request| {
+                posted.push(request.host.clone());
+                Ok(())
+            })
+            .unwrap(),
+            1
+        );
+        assert_eq!(posted, ["home"]);
+        let rows = desk.lock_or_recover().rows(now);
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.name.as_str(), row.automatic))
+                .collect::<Vec<_>>(),
+            [("home", true), ("bridge", false), ("hotspot", false)]
+        );
+
+        desk.lock_or_recover().refresh(local().with_home(None));
+        let later = now + Duration::from_secs(31);
+        assert_eq!(
+            forward_automatic_with(&desk, later, |request| panic!(
+                "{} forwarded from no home",
+                request.host
+            ))
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn confirmed_admission_closes_existing_and_repeated_approval_rows() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let local = || Local::with(device(root.path(), "member"), TRUST, true, "member").unwrap();
+        let mut desk = Desk::new(local().with_automatic_lan([]));
+        let now = Instant::now();
+        let joining = device(root.path(), "new");
+        let request = ask(
+            &mut desk,
+            &joining,
+            "m110",
+            "192.168.1.45".parse().unwrap(),
+            now,
+        );
+        desk.refresh(local().with_automatic_lan([request.binding().recipient().to_bech32()]));
+        assert_eq!(desk.rows(now)[0].state, RowState::Closed);
+        ask(
+            &mut desk,
+            &joining,
+            "m110",
+            "192.168.1.45".parse().unwrap(),
+            now,
+        );
+        assert_eq!(desk.rows(now)[0].state, RowState::Closed);
+        assert!(desk.take_automatic_requests(now).is_empty());
+    }
+
+    #[test]
+    fn automatic_queue_preserves_ignores_and_removals() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let mut desk = Desk::new(
+            Local::with(device(root.path(), "member"), TRUST, true, "member")
+                .unwrap()
+                .with_automatic_lan([]),
+        );
+        let now = Instant::now();
+        let removed = ask(
+            &mut desk,
+            &device(root.path(), "removed"),
+            "removed",
+            "192.168.1.45".parse().unwrap(),
+            now,
+        );
+        let removed_recipient = removed.binding().recipient().to_bech32();
+        desk.local.removed.by_recipient.insert(
+            removed_recipient,
+            client::RemovedNote {
+                label: "m9".into(),
+                by: vec!["m1".into()],
+                on_ms: 1,
+                quorum: false,
+            },
+        );
+        ask(
+            &mut desk,
+            &device(root.path(), "ignored"),
+            "ignored",
+            "192.168.1.46".parse().unwrap(),
+            now,
+        );
+        desk.ignore(desk.rows(now)[1].id).unwrap();
+        assert!(desk.take_automatic_requests(now).is_empty());
+    }
+
+    #[test]
+    fn a_personal_vault_keeps_its_existing_manual_admission_policy() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let mut desk =
+            Desk::new(Local::with(device(root.path(), "member"), TRUST, true, "member").unwrap());
+        let now = Instant::now();
+        ask(
+            &mut desk,
+            &device(root.path(), "new"),
+            "new",
+            "192.168.1.45".parse().unwrap(),
+            now,
+        );
+        assert!(desk.take_automatic_requests(now).is_empty());
+    }
+
+    #[test]
+    fn one_refused_request_does_not_hold_back_the_other_waiting_machines() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let mut desk = Desk::new(
+            Local::with(device(root.path(), "member"), TRUST, true, "member")
+                .unwrap()
+                .with_automatic_lan([]),
+        );
+        let now = Instant::now();
+        for name in ["first", "second"] {
+            ask(
+                &mut desk,
+                &device(root.path(), name),
+                name,
+                "192.168.1.45".parse().unwrap(),
+                now,
+            );
+        }
+        let mut attempted = Vec::new();
+        assert!(
+            forward_automatic_with(&Mutex::new(desk), now, |request| {
+                attempted.push(request.host.clone());
+                if request.host == "first" {
+                    Err(Error::new("refused"))
+                } else {
+                    Ok(())
+                }
+            })
+            .is_err()
+        );
+        assert_eq!(attempted, ["first", "second"]);
+    }
+
+    #[test]
+    fn an_ignore_before_dispatch_cancels_a_selected_request() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let mut desk = Desk::new(
+            Local::with(device(root.path(), "member"), TRUST, true, "member")
+                .unwrap()
+                .with_automatic_lan([]),
+        );
+        let now = Instant::now();
+        ask(
+            &mut desk,
+            &device(root.path(), "new"),
+            "new",
+            "192.168.1.45".parse().unwrap(),
+            now,
+        );
+        let requests = desk.take_automatic_requests(now);
+        desk.ignore(desk.rows(now)[0].id).unwrap();
+        assert_eq!(
+            forward_selected(&Mutex::new(desk), requests, &|| true, |_| panic!(
+                "ignored request was sent"
+            ))
+            .unwrap(),
+            0
+        );
     }
 }

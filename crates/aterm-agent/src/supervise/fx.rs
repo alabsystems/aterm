@@ -792,6 +792,10 @@ struct Script {
     stamps_fixed: bool,
     /// The wake the power manager says ([`ScriptedClock::set_full_wake`]).
     full_wake: Option<bool>,
+    /// How far each wall read moves the fixed clock on ([`ScriptedClock::set_tick_ms`]).
+    tick_ms: i64,
+    /// What the reads have moved it on so far.
+    ticked_ms: i64,
 }
 
 /// The boot a counting test clock counts on unless the test names another.
@@ -835,6 +839,11 @@ impl ScriptedClock {
         let mut s = self.script();
         s.fixed = Some(now_ms.div_euclid(1000));
         s.phase_ms = now_ms.rem_euclid(1000);
+    }
+
+    /// Each wall read from now moves the fixed clock `ms` on after it, so no two reads agree.
+    pub(crate) fn set_tick_ms(&self, ms: i64) {
+        self.script().tick_ms = ms;
     }
 
     /// The fixed clock jumps `jump` seconds ahead after its next read.
@@ -971,7 +980,11 @@ impl ScriptedClock {
             s.seen = skew;
             skew
         };
-        Some((fixed + skew) * 1000 + s.phase_ms + run)
+        let ticked = s.ticked_ms;
+        if !peek {
+            s.ticked_ms = s.ticked_ms.saturating_add(s.tick_ms);
+        }
+        Some((fixed + skew) * 1000 + s.phase_ms + run + ticked)
     }
 
     /// The loop's wall clock, Unix milliseconds.

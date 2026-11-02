@@ -76,7 +76,9 @@ fn create_table_ddl_extracts_columns_and_rowid_alias() {
             "default" INT REFERENCES parent(id) ON DELETE SET DEFAULT,
             retries INT DEFAULT (-7) NOT NULL,
             enabled BOOLEAN DEFAULT TRUE,
-            ratio REAL DEFAULT 1.5
+            ratio REAL DEFAULT 1.5,
+            mask INT DEFAULT (0xfe-- trailing comment after hex 'e'
+            ) NOT NULL
         )"#,
     )
     .expect("fk and defaults");
@@ -87,6 +89,7 @@ fn create_table_ddl_extracts_columns_and_rowid_alias() {
             SqlValue::Int(-7),
             SqlValue::Int(1),
             SqlValue::Float(1.5),
+            SqlValue::Int(254),
         ]
     );
 
@@ -582,5 +585,55 @@ mod live_sqlite {
         })
         .expect("scan multi-page sqlite_schema");
         assert_eq!(deep, vec!["Deep schema B-tree".to_owned()]);
+
+        // Short record omitting a trailing `INTEGER PRIMARY KEY DEFAULT 5` column still aliases
+        // rowid, and over-wide records are truncated to `schema.columns.len()`.
+        let schema = super::parse_create_table(
+            "CREATE TABLE t (body TEXT, id INTEGER PRIMARY KEY DEFAULT 5)",
+        )
+        .expect("schema");
+        assert_eq!(schema.rowid_alias_col, Some(1));
+        let mut disk_buf = Vec::new();
+        let mut row_buf = Vec::new();
+        // Record header len=2, col0 serial=15 (1-byte text 'a'), omitting col1 (`id`):
+        assert_eq!(
+            super::materialize_row(
+                Some(42),
+                &[0x02, 0x0f, b'a'],
+                super::TextEncoding::Utf8,
+                &schema,
+                &mut disk_buf,
+                &mut row_buf,
+            ),
+            Some(())
+        );
+        assert_eq!(
+            row_buf,
+            vec![
+                SqlValue::Text(std::borrow::Cow::Borrowed("a")),
+                SqlValue::Int(42)
+            ],
+            "short record omitting trailing INTEGER PRIMARY KEY DEFAULT 5 must alias rowid"
+        );
+        // Record header len=4, col0='a', col1=NULL (aliases rowid 99), col2=extra int 7:
+        assert_eq!(
+            super::materialize_row(
+                Some(99),
+                &[0x04, 0x0f, 0x00, 0x01, b'a', 0x07],
+                super::TextEncoding::Utf8,
+                &schema,
+                &mut disk_buf,
+                &mut row_buf,
+            ),
+            Some(())
+        );
+        assert_eq!(
+            row_buf,
+            vec![
+                SqlValue::Text(std::borrow::Cow::Borrowed("a")),
+                SqlValue::Int(99)
+            ],
+            "over-wide record must truncate to schema.columns.len()"
+        );
     }
 }

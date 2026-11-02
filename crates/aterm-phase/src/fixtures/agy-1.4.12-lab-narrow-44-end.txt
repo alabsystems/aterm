@@ -1,0 +1,30 @@
+# agy 1.4.12 · MEASURED 2026-11-01, `aterm ctl text` of a private headless aterm (44x50, aterm 0.148.0) running the real Antigravity CLI, launched by path with a scratch `HOME` whose settings name the Gemini API provider, its Google hosts black-holed, a fake `GEMINI_API_KEY` and `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:<port>` (a local stub of the Gemini API, crates/aterm-lab) · the pane at 44 columns: the end of a turn whose reply is 14 short rows (the stub's reply.txt), idle
+
+      ▄▀▀▄        Antigravity CLI 1.4.12
+     ▀▀▀▀▀▀       Gemini API key
+    ▀▀▀▀▀▀▀▀      Gemini 3.1 Pro (Low)
+   ▄▀▀    ▀▀▄     /private/tmp/at.AnkM/proj
+  ▄▀▀      ▀▀▄
+
+─────────────────────────────────────────
+> carry on with the task
+
+  Stub reply row 1 of 14.
+  Stub reply row 2 of 14.
+  Stub reply row 3 of 14.
+  Stub reply row 4 of 14.
+  Stub reply row 5 of 14.
+  Stub reply row 6 of 14.
+  Stub reply row 7 of 14.
+  Stub reply row 8 of 14.
+  Stub reply row 9 of 14.
+  Stub reply row 10 of 14.
+  Stub reply row 11 of 14.
+  Stub reply row 12 of 14.
+  Stub reply row 13 of 14.
+  Stub reply row 14 of 14.
+
+────────────────────────────────────────────
+>
+────────────────────────────────────────────
+? for shortcuts         Gemini 3.1 Pro · low

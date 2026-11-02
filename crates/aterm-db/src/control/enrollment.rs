@@ -34,9 +34,15 @@ pub(super) fn client(
         return Err(Error::new("pending device custody changed"));
     }
     send_frame(stream, &endpoint.hello)?;
-    let hello = receive_frame(stream, MAX_ACX2_HELLO)?;
-    let actor = authenticate(endpoint.trust, endpoint.actor, proof, &hello)?;
-    verify_peer_against_local_log(endpoint.paths.as_ref(), endpoint.trust, actor, &hello)?;
+    let hello = repair.receive_answer(stream, Side::Initiator)?;
+    let (actor, peer_log) = authenticate(endpoint.trust, endpoint.actor, proof, &hello)?;
+    verify_peer_against_local_log(
+        endpoint.paths.as_ref(),
+        endpoint.trust,
+        actor,
+        &hello,
+        peer_log.as_deref(),
+    )?;
     let authenticated_at = Instant::now();
     let challenge = receive_frame(stream, MAX_CHALLENGE)?;
     let response = bootstrap

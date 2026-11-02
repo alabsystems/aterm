@@ -424,12 +424,14 @@ pub fn lookup(prefix: &Prefix, full: &str) -> Option<Formula> {
         let path = tap_path(prefix, &user, &repo).ok()?;
         let tap = Tap { user, repo, path };
         let file = formula_file(&tap, name)?;
-        let text = std::fs::read_to_string(file).ok()?;
+        let canon = file.canonicalize().ok()?;
+        let text = crate::metadata_io::read_bounded_regular_utf8(&canon, 1024 * 1024).ok()?;
         return Some(parse_rb_as_data(&text, full));
     }
     for tap in list(prefix) {
         if let Some(file) = formula_file(&tap, full)
-            && let Ok(text) = std::fs::read_to_string(file)
+            && let Ok(canon) = file.canonicalize()
+            && let Ok(text) = crate::metadata_io::read_bounded_regular_utf8(&canon, 1024 * 1024)
         {
             return Some(parse_rb_as_data(&text, &format!("{}/{full}", tap.name())));
         }

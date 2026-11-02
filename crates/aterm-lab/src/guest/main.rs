@@ -38,14 +38,17 @@
 //! - `member HOME LISTEN OUT [--allow NAME]`: the Allowing member of the `vault-phrase` row, F10's
 //!   members desk on the vault custody under HOME behind an `ask`-only listener on loopback,
 //!   which presses Allow for the first Mac that asks and writes the phrase to OUT ([`member`]).
+//! - `captures EXE DIR OUT SOURCE=FILE...`, `capture EXE DIR OUT KEY [WORDS...]`: the app's
+//!   window through its own `aterm ctl image` at each milestone the lane's records name, and at
+//!   the lane's own ([`captures`]).
 //! - `browse SECS DIR SERVICE...`, `dns-sd SECS OUT ARG...`, `arrivals SEED JOINER FILE...`,
 //!   `enrol HOME AUTHORITY`: the guest steps that are more than one command ([`steps`]); each
 //!   ends by itself.
 //!
-//! The first five write a record: every line starts with its kind and the guest's clock in epoch
-//! ms, and is flushed as written; the lane reads them (`mac_nux::read_census`, `read_person`,
-//! `read_watch`, `read_procs`, `mac_nux::phrase::read_desk`). Each of the five runs until it is
-//! killed.
+//! The first five and `captures` write a record: every line starts with its kind and the guest's
+//! clock in epoch ms, and is flushed as written; the lane reads them (`mac_nux::read_census`,
+//! `read_person`, `read_watch`, `read_procs`, `mac_nux::phrase::read_desk`,
+//! `mac_nux::capture::read_shots`). Each of them runs until it is killed.
 
 #![deny(unsafe_code)]
 
@@ -53,6 +56,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod captures;
 mod member;
 mod steps;
 
@@ -106,7 +110,7 @@ fn main() {
 }
 
 fn run(args: &[String]) -> Result<(), String> {
-    let usage = "usage: aterm-lab-guest census OUT | person OUT [--password PW] [--admin NAME:PW] [--sheet reopen|later] [--app EXE] | watch FILE OUT [--kill PID --when-running MASK] | procs EXE OUT | member HOME LISTEN OUT [--allow NAME] | browse SECS DIR SERVICE... | dns-sd SECS OUT ARG... | arrivals SEED JOINER FILE... | enrol HOME AUTHORITY";
+    let usage = "usage: aterm-lab-guest census OUT | person OUT [--password PW] [--admin NAME:PW] [--sheet reopen|later] [--app EXE] | watch FILE OUT [--kill PID --when-running MASK] | procs EXE OUT | captures EXE DIR OUT SOURCE=FILE... | capture EXE DIR OUT KEY [WORDS...] | member HOME LISTEN OUT [--allow NAME] | browse SECS DIR SERVICE... | dns-sd SECS OUT ARG... | arrivals SEED JOINER FILE... | enrol HOME AUTHORITY";
     match args.first().map(String::as_str) {
         Some("census") => census(&Out::open(args.get(1).ok_or(usage)?)?),
         Some("person") => {
@@ -150,6 +154,8 @@ fn run(args: &[String]) -> Result<(), String> {
             let exe = args.get(1).ok_or(usage)?;
             procs(exe, &Out::open(args.get(2).ok_or(usage)?)?)
         }
+        Some("captures") => captures::captures(&args[1..]),
+        Some("capture") => captures::capture(&args[1..]),
         Some("member") => member::member(&member::Ask::parse(&args[1..])?),
         Some("browse") => steps::browse(&args[1..]),
         Some("dns-sd") => steps::dns_sd(&args[1..]),

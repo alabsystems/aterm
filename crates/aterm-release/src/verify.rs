@@ -5,7 +5,6 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use aterm_update_core::Manifest;
 
@@ -211,6 +210,7 @@ fn captured_identity_rows(page: &str, wanted: &std::collections::BTreeSet<u64>) 
         .filter(|line| {
             line.split('\t')
                 .next()
+                .filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
                 .and_then(|id| id.parse::<u64>().ok())
                 .is_some_and(|id| wanted.contains(&id))
         })
@@ -240,12 +240,15 @@ fn parse_release_metadata(listing: &str) -> Result<Vec<ReleaseMetadata<'_>>> {
         .map(|(index, line)| {
             let fields: Vec<&str> = line.split('\t').collect();
             let parse_id = |id: &str| {
-                id.parse::<u64>().map_err(|_| {
-                    Error::new(format!(
-                        "malformed release metadata row {}: invalid release ID {id:?}",
-                        index + 1
-                    ))
-                })
+                (!id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+                    .then(|| id.parse::<u64>().ok())
+                    .flatten()
+                    .ok_or_else(|| {
+                        Error::new(format!(
+                            "malformed release metadata row {}: invalid release ID {id:?}",
+                            index + 1
+                        ))
+                    })
             };
             let (release_id, tag, draft, prerelease, exact_count) = match fields.as_slice() {
                 [tag, draft, exact] => (None, *tag, *draft, "false", *exact),
@@ -272,12 +275,15 @@ fn parse_release_metadata(listing: &str) -> Result<Vec<ReleaseMetadata<'_>>> {
             let draft = flag(draft, "draft")?;
             let prerelease = flag(prerelease, "prerelease")?;
             let parse_count = |value: &str, field: &str| {
-                value.parse::<usize>().map_err(|_| {
-                    Error::new(format!(
-                        "malformed release metadata row {}: invalid {field} {value:?}",
-                        index + 1
-                    ))
-                })
+                (!value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
+                    .then(|| value.parse::<usize>().ok())
+                    .flatten()
+                    .ok_or_else(|| {
+                        Error::new(format!(
+                            "malformed release metadata row {}: invalid {field} {value:?}",
+                            index + 1
+                        ))
+                    })
             };
             Ok(ReleaseMetadata {
                 release_id,
@@ -707,7 +713,7 @@ pub fn post_publish(
 }
 
 fn head_status(url: &str) -> Result<String> {
-    let out = Command::new(aterm_uds::os_path!("curl"))
+    let out = aterm_uds::spawnfd::command(aterm_uds::os_path!("curl"))
         .args(["-sS", "-o", "/dev/null", "-I", "-L", "-w", "%{http_code}"])
         .arg(url)
         .output()
@@ -736,7 +742,7 @@ pub fn run_verify(repo: &Path, version: Option<String>) -> Result<()> {
                     manifest_out::MANIFEST_ASSET
                 ))
             })?;
-            best.tag.trim_start_matches('v').to_string()
+            best.tag.strip_prefix('v').unwrap_or(&best.tag).to_string()
         }
     };
     let local = repo.join("dist").join(manifest_out::MANIFEST_ASSET);

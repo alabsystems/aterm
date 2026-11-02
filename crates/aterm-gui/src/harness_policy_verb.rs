@@ -3,6 +3,7 @@
 
 //! `@<sid> harness policy` control verb for one session's `[harness]` policy.
 
+use aterm_agent::supervise::policy::land_check::land_check_text;
 use aterm_agent::supervise::policy::needs::{NEEDS_ACK, NEEDS_HINT};
 use aterm_agent::supervise::policy::turn_end::{
     DONE_ANGLES, DONE_TAIL, continuation_text, done_check_text, land_answer_text, land_nudge_text,
@@ -75,10 +76,10 @@ pub(crate) fn questions(cfg: &SupervisorConfig, session: Option<&str>) -> String
 }
 
 /// The additive text keys after `questions=`, in their wire order. `done_check_angles` and
-/// `done_check_tail` came with v6's 5a, after the rest: a reader keys on names, and one that
-/// meets a reply without them keeps `done_check_text` whole (the tests' `done_checks_of`, the
-/// downgrade parse such a reader writes).
-pub(crate) const ACT_TEXT_KEYS: [&str; 8] = [
+/// `done_check_tail` came with v6's 5a, after the rest, and `land_check_text` with 13a, after
+/// them: a reader keys on names, and one that meets a reply without them keeps `done_check_text`
+/// whole (the tests' `done_checks_of`, the downgrade parse such a reader writes).
+pub(crate) const ACT_TEXT_KEYS: [&str; 9] = [
     "done_check_text",
     "land_text",
     "land_nudge_text",
@@ -87,16 +88,28 @@ pub(crate) const ACT_TEXT_KEYS: [&str; 8] = [
     "needs_ack_text",
     "done_check_angles",
     "done_check_tail",
+    "land_check_text",
 ];
 
 /// Autopilot Cruise / Land's fixed words as aterm's own loop types them for a session whose
 /// standing rules read `rules`, keyed by [`ACT_TEXT_KEYS`]: the four whole acts through the
 /// turn-end policy's own composers (the rules after the words; the done check is its first
 /// angle's whole act), the two suffixes bare, then Cruise's six angles in order, one to a line,
-/// and the words that follow each, bare.
+/// and the words that follow each, bare; last the land check, a whole act in its plain form
+/// (the hinted one needs aterm's reader of the report).
 #[must_use]
-pub(crate) fn act_texts(rules: Option<&str>) -> [(&'static str, String); 8] {
-    let [done_check, land, nudge, answer, hint, ack, angles, tail] = ACT_TEXT_KEYS;
+pub(crate) fn act_texts(rules: Option<&str>) -> [(&'static str, String); 9] {
+    let [
+        done_check,
+        land,
+        nudge,
+        answer,
+        hint,
+        ack,
+        angles,
+        tail,
+        check,
+    ] = ACT_TEXT_KEYS;
     [
         (done_check, done_check_text(rules, false)),
         (land, land_text(rules)),
@@ -106,6 +119,7 @@ pub(crate) fn act_texts(rules: Option<&str>) -> [(&'static str, String); 8] {
         (ack, NEEDS_ACK.to_string()),
         (angles, DONE_ANGLES.join("\n")),
         (tail, DONE_TAIL.to_string()),
+        (check, land_check_text(None, false, rules)),
     ]
 }
 
@@ -158,13 +172,57 @@ pub(crate) fn reply(facts: &PolicyFacts, rules: Option<&str>, owner: bool) -> St
 /// ([`crate::harness_host::agent_of`]), else the agent a rostered harness runs (Grok Build under
 /// grok-alab, contract v3 §8.1 item 7: its `agent-off` follows the row's program, which no table
 /// switches off), else Codex, the agent that asks for itself.
+#[cfg(test)]
 fn policy_agent(publication: &crate::session_timeline::AgentPublication) -> Program {
+    policy_agent_in(aterm_agent::harness::contract::ROSTER, publication)
+}
+
+fn policy_agent_in(
+    rows: &[aterm_agent::harness::contract::Row],
+    publication: &crate::session_timeline::AgentPublication,
+) -> Program {
     crate::harness_host::agent_of(publication)
         .or_else(|| {
             crate::harness_host::identified_agent(publication)
-                .filter(|p| aterm_agent::harness::contract::row_for(*p).is_some())
+                .filter(|p| rows.iter().any(|row| row.program == *p))
         })
         .unwrap_or(Program::Codex)
+}
+
+/// Resolve configured policy through the same session posture in App and the explicit
+/// display-free fixture. The session's hold and Autopilot are always read from its own state.
+pub(crate) fn configured_facts(
+    ctx: &crate::SessionCtx,
+    policy: &SupervisorConfig,
+    generation: u64,
+    hosted: bool,
+    headless: bool,
+    suspended: bool,
+) -> PolicyFacts {
+    let (session_questions, autopilot_word) = {
+        let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+        (meta.questions.clone(), meta.autopilot_word())
+    };
+    let agent = {
+        let timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        policy_agent_in(ctx.native_policy.rows(), timeline.agent())
+    };
+    PolicyFacts {
+        generation,
+        policy: policy.clone(),
+        session_questions,
+        effective: effective(
+            policy,
+            Posture {
+                hosted,
+                headless,
+                agent,
+                suspended,
+                held: ctx.fabric.hold().is_some(),
+                autopilot_word,
+            },
+        ),
+    }
 }
 
 /// The verb's control-thread half: `harness policy` (any other form is its usage line), the facts fetched by `fetch`, the rules file read here.
@@ -194,32 +252,16 @@ impl crate::App {
             return Err(format!("no such session {session}"));
         };
         let ctx = &pooled.ctx;
-        let policy = self.harness_policy.get().policy.clone();
-        let (session_questions, autopilot_word) = {
-            let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
-            (meta.questions.clone(), meta.autopilot_word())
-        };
-        let agent = {
-            let timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
-            policy_agent(timeline.agent())
-        };
-        let posture = Posture {
-            hosted: self.harness.is_some(),
-            headless: self.headless,
-            agent,
-            suspended: self
-                .harness
+        Ok(configured_facts(
+            ctx,
+            &self.harness_policy.get().policy,
+            self.harness_policy.generation(),
+            self.harness.is_some(),
+            self.headless,
+            self.harness
                 .as_ref()
                 .is_some_and(crate::harness_host::HostHandle::suspended),
-            held: ctx.fabric.hold().is_some(),
-            autopilot_word,
-        };
-        Ok(PolicyFacts {
-            generation: self.harness_policy.generation(),
-            effective: effective(&policy, posture),
-            policy,
-            session_questions,
-        })
+        ))
     }
 
     /// The policy cell moved: every session's `subscribe @<sid>` stream gets `EVENT <local> harness-policy gen=<n>`, so an agent that answers for itself re-reads `harness policy` on it rather than on a clock.
@@ -520,7 +562,7 @@ mod tests {
     #[test]
     fn the_texts_are_the_loops_own_words_composed_as_it_composes_them() {
         use aterm_agent::supervise::policy::turn_end::{
-            LAND, LAND_ANSWER, LAND_NUDGE, done_check_words,
+            LAND, LAND_ANSWER, LAND_CHECK, LAND_NUDGE, done_check_words,
         };
         let cfg = SupervisorConfig::default();
         let bare = act_texts_of(&reply(&facts(cfg.clone()), None, true));
@@ -535,6 +577,7 @@ mod tests {
                 ("needs_ack_text", NEEDS_ACK.to_string()),
                 ("done_check_angles", DONE_ANGLES.join("\n")),
                 ("done_check_tail", DONE_TAIL.to_string()),
+                ("land_check_text", LAND_CHECK.to_string()),
             ]
         );
         let rules = "never force-push";
@@ -544,6 +587,7 @@ mod tests {
         assert_eq!(ruled[1].1, land_text(Some(rules)));
         assert_eq!(ruled[2].1, land_nudge_text(Some(rules)));
         assert_eq!(ruled[3].1, land_answer_text(Some(rules)));
+        assert_eq!(ruled[8].1, land_check_text(None, false, Some(rules)));
         for ((key, with), (_, without)) in ruled.iter().zip(&bare) {
             let suffix = matches!(
                 *key,
@@ -562,6 +606,33 @@ mod tests {
             ACT_TEXT_KEYS.iter().all(|k| field(&edge, k).is_none()),
             "{edge}"
         );
+    }
+
+    /// THE LAND CHECK IS SERVED to a package that carries its own Land (codex-alab): its plain
+    /// form with the session's rules, as aterm's own loop composes it, never the hinted form
+    /// (that needs aterm's reader of the report).
+    #[test]
+    fn land_check_text_is_served_by_harness_policy() {
+        use aterm_agent::supervise::policy::land_check::{
+            LAND_CHECK, LAND_CHECK_HEAD, LAND_CHECK_HINT_OPEN,
+        };
+        let rules = "never force-push";
+        for (rules, want) in [
+            (None, LAND_CHECK.to_string()),
+            (Some(rules), land_check_text(None, false, Some(rules))),
+        ] {
+            let served = act_texts_of(&reply(&facts(SupervisorConfig::default()), rules, true));
+            let (_, check) = served
+                .iter()
+                .find(|(key, _)| *key == "land_check_text")
+                .expect("served");
+            assert_eq!(*check, want, "{rules:?}");
+            assert!(check.starts_with(LAND_CHECK_HEAD), "{check}");
+            assert!(
+                !check.contains(LAND_CHECK_HINT_OPEN),
+                "the plain form: {check}"
+            );
+        }
     }
 
     /// THE ANGLES ROUND-TRIP: a reader of the reply rebuilds each of the six done checks the loop

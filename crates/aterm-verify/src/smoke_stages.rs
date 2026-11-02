@@ -40,6 +40,9 @@ pub fn cursor_effect_arms(reply: &str) -> Option<(u64, u64)> {
             continue;
         }
         let (arms, past) = counts.split_once('/')?;
+        if !arms.bytes().all(|b| b.is_ascii_digit()) || !past.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
         return Some((arms.parse().ok()?, past.parse().ok()?));
     }
     Some((0, 0))
@@ -143,15 +146,22 @@ impl Sandbox {
         self.rundir.join("aterm/aterm.sock")
     }
 
-    /// End the instance with its group ([`SmokeChild::retire`]); `groups` sweeps and records the
-    /// group before its leader is reaped.
+    /// End the instance with its group ([`SmokeChild::retire`]); `groups` sweeps the group
+    /// before its leader is reaped and records it once it is.
     fn teardown(&mut self, r: &mut Report, groups: Option<&dyn StageGroupEnd>) {
         if let Some(child) = self.child.take() {
-            let ok = child.retire(|pgid| {
-                if let Some(groups) = groups {
-                    groups.group_ended(pgid, GROUP_LABEL);
-                }
-            });
+            let ok = child.retire(
+                |pgid| {
+                    if let Some(groups) = groups {
+                        groups.group_ended(pgid, GROUP_LABEL);
+                    }
+                },
+                |pgid| {
+                    if let Some(groups) = groups {
+                        groups.group_reaped(pgid, GROUP_LABEL);
+                    }
+                },
+            );
             if !ok {
                 r.fail("smoke: child cleanup/reap failed");
             }
@@ -513,7 +523,13 @@ fn settings_hardware_key_step(
     let Some(view) = tabs
         .lines()
         .find(|line| line.contains("app=settings"))
-        .and_then(|line| reply_field(line, "view").parse::<u64>().ok())
+        .and_then(|line| {
+            let v = reply_field(line, "view");
+            v.bytes()
+                .all(|b| b.is_ascii_digit())
+                .then(|| v.parse::<u64>().ok())
+                .flatten()
+        })
     else {
         r.fail(format!("{tag}: no Settings view in {}", or_no_reply(&tabs)));
         return;
@@ -611,9 +627,12 @@ fn reply_field<'a>(reply: &'a str, name: &str) -> &'a str {
 }
 
 /// WHAT A REPORTED p99 IS, and why these four bars read `>` and not `>=`.
+/// Native-clock availability counters are required, including from older subjects. Both must
+/// be zero: dispatch-time fallback samples cannot establish latency including OS queue residence.
+/// The measured hardware-write floor is unchanged.
 /// # Errors
-/// A reply that cannot be parsed, a sampled slice without its maximum, a burst under a floor, or
-/// any gated reading at or over its ceiling.
+/// A reply that cannot be parsed, unavailable native clocks, a sampled slice without its maximum,
+/// a burst under a floor, or any gated reading at or over its ceiling.
 pub fn hardware_key_verdict(posted: u64, summary: &str, reply: &str) -> Result<String, String> {
     let whole = |name: &str| metric_ms_whole(reply, name);
     let (
@@ -665,12 +684,30 @@ pub fn hardware_key_verdict(posted: u64, summary: &str, reply: &str) -> Result<S
         })
     };
     let bar = |ms: u64| f64::from(u32::try_from(ms).unwrap_or(u32::MAX));
+    let (Some(queue_unavailable), Some(write_unavailable)) = (
+        metric_u64(reply, "key_queue_unavailable"),
+        metric_u64(reply, "key_write_unavailable"),
+    ) else {
+        return Err(format!(
+            "gui smoke: hardware clock availability is unreported or invalid; the subject \
+             must publish key_queue_unavailable and key_write_unavailable to validate \
+             hardware latency [{reply}]"
+        ));
+    };
+    if queue_unavailable != 0 || write_unavailable != 0 {
+        return Err(format!(
+            "gui smoke: hardware latency is unconfirmed because native clock samples are \
+             unavailable; input_clock=unconfirmed key_queue_unavailable={queue_unavailable} \
+             key_write_unavailable={write_unavailable} n_key_write={n_key_write} \
+             posted={posted} n_input={n_input} [{reply}]"
+        ));
+    }
     if n_key_write < HW_KEY_WRITE_FLOOR {
         return Err(format!(
-            "gui smoke: hardware keys never reached the KeyboardInput arm — \
-             n_key_write={n_key_write} of posted={posted} (< {HW_KEY_WRITE_FLOOR}), so \
-             key→write, the queue-age backdate and the press lock wait measured nothing \
-             [{reply}]"
+            "gui smoke: insufficient measured hardware key→write samples — \
+             n_key_write={n_key_write} of posted={posted} (< {HW_KEY_WRITE_FLOOR}); \
+             native queue age unavailable for {queue_unavailable} presses and \
+             {write_unavailable} write completions; n_input={n_input} [{reply}]"
         ));
     }
     if n_input < HW_INPUT_FLOOR {
@@ -734,7 +771,7 @@ pub fn hardware_key_verdict(posted: u64, summary: &str, reply: &str) -> Result<S
     if input > INPUT_PRESENT_CEILING_MS {
         return Err(format!(
             "gui smoke: hardware input→present — p99 {input}ms (> {INPUT_PRESENT_CEILING_MS}), \
-             OS queue residence included [{reply}]"
+             input_clock=native [{reply}]"
         ));
     }
     if retries != 0 || drops != 0 {
@@ -753,7 +790,8 @@ pub fn hardware_key_verdict(posted: u64, summary: &str, reply: &str) -> Result<S
         "gui smoke: frames={frames} max_input_present={max_input}ms, no present retries, \
          drops or sync timeouts; hardware keys n_key_write={n_key_write}/{posted} \
          key_write_p99={}ms max_term_wait_press={}ms acquire_p99={}ms (n={n_acquire}) \
-         input_p99={}ms (n={n_input}) present_glass_p99={}ms (n={n_present_glass}, {} \
+         input_p99={}ms (n={n_input}) input_clock=native key_queue_unavailable={queue_unavailable} \
+         key_write_unavailable={write_unavailable} present_glass_p99={}ms (n={n_present_glass}, {} \
          never shown); echo_p99={}ms is the child's round trip (reported, not gated)",
         f("key_write_p99_ms"),
         f("max_term_wait_press_ms"),
@@ -805,6 +843,7 @@ mod tests {
             "OK n_input=30 input_p50_ms=9.11 input_p95_ms=12.30 input_p99_ms={input} \
              n_present=31 present_p50_ms=8.20 present_p95_ms=10.10 present_p99_ms=11.40 \
              n_key_write={n_key_write} key_write_p50_ms=1.10 key_write_p95_ms=2.30 \
+             key_queue_unavailable=0 key_write_unavailable=0 \
              key_write_p99_ms={key_write} n_pre_present=31 pre_present_p50_ms=0.90 \
              n_acquire=31 acquire_p50_ms=0.02 acquire_p95_ms=1.10 acquire_p99_ms={acquire} \
              last_acquire_wait_ms=0.02 max_acquire_wait_ms=4.80 \
@@ -905,9 +944,54 @@ mod tests {
     }
 
     #[test]
-    fn a_burst_that_never_reached_the_keyboard_arm_is_a_failure_not_a_pass() {
+    fn a_burst_without_measured_hardware_writes_is_a_failure_not_a_pass() {
         let controller_shaped = percentiles(0, "0.00", "0.00", "0.02", "9.00");
         assert!(hv(&controller_shaped).is_err());
+        let unavailable = controller_shaped
+            .replace("key_queue_unavailable=0", "key_queue_unavailable=30")
+            .replace("key_write_unavailable=0", "key_write_unavailable=30");
+        assert!(hv(&unavailable).is_err());
+    }
+
+    #[test]
+    fn native_clock_quality_requires_every_observed_press_and_write() {
+        let measured = percentiles(30, "6.00", "0.10", "1.00", "10.00");
+        let known = hv(&measured).expect("all measured clocks pass");
+        assert_eq!(reply_field(&known, "input_clock"), "native");
+        let floor = measured.replace("n_key_write=30", "n_key_write=15");
+        hv(&floor).expect("the measured-write floor remains sufficient for known clocks");
+        for (queue, write) in [(1, 0), (0, 1), (1, 1), (15, 15)] {
+            let mixed = floor
+                .replace(
+                    "key_queue_unavailable=0",
+                    &format!("key_queue_unavailable={queue}"),
+                )
+                .replace(
+                    "key_write_unavailable=0",
+                    &format!("key_write_unavailable={write}"),
+                );
+            let fallback =
+                hv(&mixed).expect_err("partial clocks cannot confirm whole-burst latency");
+            assert_eq!(reply_field(&fallback, "input_clock"), "unconfirmed");
+            assert_eq!(
+                reply_field(&fallback, "key_queue_unavailable"),
+                queue.to_string()
+            );
+            assert_eq!(
+                reply_field(&fallback, "key_write_unavailable"),
+                write.to_string()
+            );
+        }
+        let legacy = measured
+            .replace("key_queue_unavailable=0 ", "")
+            .replace("key_write_unavailable=0 ", "");
+        assert!(hv(&legacy).is_err());
+        for field in ["key_queue_unavailable", "key_write_unavailable"] {
+            for replacement in [String::new(), format!("{field}=unknown ")] {
+                let unsupported = measured.replace(&format!("{field}=0 "), &replacement);
+                assert!(hv(&unsupported).is_err(), "{unsupported}");
+            }
+        }
     }
 
     #[test]

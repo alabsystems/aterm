@@ -650,9 +650,9 @@ impl ReplayCore {
         };
         let mut st = self.lock();
         st.last_exchange = at;
-        if door == doors::CTL || door == doors::TELLER {
-            let words = codec::ctl_args(request).unwrap_or_default();
-            if door == doors::CTL {
+        if super::ctl::is_control_door(door) {
+            let words = super::ctl::reported_args(door, request).unwrap_or_default();
+            if door != doors::TELLER {
                 st.requests.push(words);
             } else {
                 st.told.push(words);
@@ -934,8 +934,8 @@ fn acts_divergence(
 
 /// An act (or any round trip) as a report names it.
 fn act_side(at: Option<u64>, door: &str, request: &[u8]) -> ActSide {
-    let words = if door == doors::CTL || door == doors::TELLER {
-        codec::ctl_args(request).map_or_else(
+    let words = if super::ctl::is_control_door(door) {
+        super::ctl::reported_args(door, request).map_or_else(
             |_| String::from_utf8_lossy(request).into_owned(),
             |w| w.join(" "),
         )
@@ -974,7 +974,10 @@ fn is_output(door: &str) -> bool {
 fn class_of(asked: &Asked<'_>, found: Option<&EffectRecord>, door: Option<&str>) -> Class {
     let lane = |d: &str| d == doors::CTL || d == doors::TELLER;
     let act = |door: &str, request: &[u8]| {
-        (lane(door) && is_act_request(request)) || doors::is_host_act(door)
+        (lane(door) && is_act_request(request))
+            || doors::is_host_act(door)
+            || (door == doors::CTL_DUTY
+                && super::acts::act_class(door, request) == super::acts::ActClass::Act)
     };
     let act_asked = matches!(asked, Asked::Exchange { door, request } if act(door, request));
     let found_door = match found {

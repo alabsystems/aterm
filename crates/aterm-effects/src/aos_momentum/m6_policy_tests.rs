@@ -18,6 +18,7 @@ use super::m6_policy::{
 };
 use super::plan::{MAX_GAP_US, MAX_PERIOD_US, MIN_PERIOD_US, SchedulePlan, Split, Wake};
 use super::policy::{self, AcceptancePolicy, GRID_V1, M4_POLICY_V1_DIGEST};
+use super::test_fixtures::pinned_here;
 
 fn plan(split: Split, wake: Wake) -> SchedulePlan {
     SchedulePlan::new(split, wake).expect("a plan in range")
@@ -133,10 +134,25 @@ fn the_sets_are_pinned() {
     );
 }
 
-/// [`RankerPolicy::pinned`] returns v1 on this tree.
+/// [`RankerPolicy::pinned`] returns v1 on this tree. Off [`GOLDEN_TRACE_TARGET`]
+/// ([`pinned_here`]) M4's v1 is another policy (its numeric profile names this target's libm),
+/// and the pin refuses it by name.
+///
+/// [`GOLDEN_TRACE_TARGET`]: super::corpus::GOLDEN_TRACE_TARGET
 #[test]
 fn the_pinned_policy_builds() {
-    assert_eq!(RankerPolicy::pinned(), Ok(RankerPolicy::v1()));
+    let pinned = RankerPolicy::pinned();
+    if pinned_here() {
+        assert_eq!(pinned, Ok(RankerPolicy::v1()));
+    } else {
+        assert_eq!(
+            pinned,
+            Err(RankerRefusal::AcceptanceMoved {
+                bound: M4_POLICY_V1_DIGEST,
+                found: AcceptancePolicy::v1().id().digest,
+            })
+        );
+    }
 }
 
 /// Changing any term changes the digest, and the pin refuses it as mutated.
@@ -161,10 +177,15 @@ fn every_term_is_bound() {
     }
 }
 
-/// The descriptor binds M4's pinned digest, and a moved M4 policy is refused by name.
+/// The descriptor binds M4's pinned digest, and a moved M4 policy is refused by name (on
+/// [`GOLDEN_TRACE_TARGET`], M4's v1 is that digest: `the_policy_is_pinned`).
+///
+/// [`GOLDEN_TRACE_TARGET`]: super::corpus::GOLDEN_TRACE_TARGET
 #[test]
 fn a_moved_m4_policy_is_refused() {
-    assert_eq!(AcceptancePolicy::v1().id().digest, M4_POLICY_V1_DIGEST);
+    if pinned_here() {
+        assert_eq!(AcceptancePolicy::v1().id().digest, M4_POLICY_V1_DIGEST);
+    }
     let moved = AcceptancePolicy::mutated(policy::Field::MaxGap).id().digest;
     assert_ne!(moved, M4_POLICY_V1_DIGEST);
     assert_eq!(

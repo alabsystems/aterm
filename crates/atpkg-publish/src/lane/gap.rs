@@ -133,6 +133,7 @@ fn known(clone: &Path, pin_commit: Option<PinCommit>) -> Reading {
             let count = |range: String| {
                 git::run(clone, &["rev-list", "--count", &range])
                     .ok()
+                    .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
                     .and_then(|n| n.parse::<u64>().ok())
             };
             match (

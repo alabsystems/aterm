@@ -45,10 +45,15 @@ pub struct Args {
 }
 
 impl Args {
-    /// Does any selected check read the selection (the cone, `-p`, `--all`)?
+    /// Does any selected check read the selection (the cone, `-p`, `--all`)? `cells` reads `-p`
+    /// alone: named with no `-p`, it judges every cell's whole graph.
     #[must_use]
     pub fn narrows(&self) -> bool {
-        self.checks.iter().any(|c| c.narrows())
+        self.checks.iter().any(|c| {
+            c.narrows()
+                || (!self.packages.is_empty()
+                    && c.spec().reach == crate::checks::Reach::TreeOrPackages)
+        })
     }
 }
 
@@ -275,11 +280,11 @@ Run aterm's checks in place, alone or in any combination.
                                   fetched or built into this user's cache
   verify browser-site DIR         the browser check's first half: both web
                                   modules built and the site laid in DIR
-  verify browser-drive SITE OUT [--engine metal|swiftshader|firefox|webkit]...
+  verify browser-drive SITE OUT [--engine metal|swiftshader|firefox|webkit|safari]...
                                   its second half: the sessions run on a laid
                                   site, frames in OUT (no targo: the Linux
-                                  lane's guest); webkit, whose pages keep
-                                  windows, only when named
+                                  lane's guest); webkit and safari, whose pages
+                                  keep windows, only when named
 
 Sets:
   dev      fmt census lint test doc (the default); its lint brings cells,
@@ -290,7 +295,7 @@ Checks:
 {checks}
 
 Options:
-  -p, --package <crate>   narrow lint/test/doc to a crate (repeatable)
+  -p, --package <crate>   narrow lint/test/doc/cells to a crate (repeatable)
       --all               the whole workspace (default: the change cone)
       --base <ref>        the cone's base (origin/main, else main; no fetch)
       --app <APP>         the release bundle `measure` judges

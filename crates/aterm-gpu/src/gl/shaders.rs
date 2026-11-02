@@ -15,6 +15,10 @@ pub(crate) const fn source(library: ShaderLibrary) -> &'static str {
         ShaderLibrary::Tray => include_str!("../../shaders/tray.glsl"),
         ShaderLibrary::Bloom => include_str!("../../shaders/bloom.glsl"),
         ShaderLibrary::Shimmer => include_str!("../../shaders/shimmer.glsl"),
+        // Metal's alone (`pipeline_table::TRAY_PRIMS`): this module compiles on macOS for its
+        // binding check, which reads the shared rows, never this library.
+        #[cfg(target_os = "macos")]
+        ShaderLibrary::TrayPrims => "",
     }
 }
 
@@ -200,7 +204,11 @@ mod tests {
 
     /// The `n` of a resource name `<prefix><n>`.
     fn slot(name: &str, prefix: &str) -> Option<u32> {
-        name.strip_prefix(prefix)?.parse().ok()
+        let s = name.strip_prefix(prefix)?;
+        s.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| s.parse().ok())
+            .flatten()
     }
 
     /// One stage's source as declarations.

@@ -311,6 +311,9 @@ const MIRROR_MEMBER_MAX: u64 = 16 + 10 + 3 * 20 + 3 + 1;
 /// The `log_mirror` member read back (`<ep>:<seq>:<ms>:<head>`), or none.
 fn read_mirror_member(raw: &str) -> Option<aterm_slog::Prior> {
     let (cursor, head) = raw.rsplit_once(':')?;
+    if !head.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
     Some(aterm_slog::Prior {
         landed: aterm_slog::BusCursor::parse(cursor)?,
         ms_head: head.parse().ok()?,
@@ -1330,7 +1333,7 @@ pub(crate) fn stamp_matches(stamp: &str, bytes: &[u8]) -> bool {
 /// The length a stamp names (`None` for a malformed stamp).
 pub(crate) fn stamp_len(stamp: &str) -> Option<u64> {
     let (len, h) = stamp.split_once(' ')?;
-    if !aterm_codec::hex::is_lower(h, 64) {
+    if !aterm_codec::hex::is_lower(h, 64) || !len.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     len.parse().ok()

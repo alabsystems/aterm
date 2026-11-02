@@ -20,13 +20,17 @@ use super::upgrade_drive::{
     live_background, load, model_and_mark, native_root, note_stuck, now_s, owned_by_aterm,
     process_in_tab, record_asked, restart_models, restore, roster, said, save, save_checked,
     screen, since, squash, state_dir, sweep_lock, table, tail_to_end, take_back_ask, terminate,
-    turn, turn_fenced, type_line, typing_fence, under_hand, unique_tab_for_group,
+    turn_fenced, type_line, typing_fence, under_hand, unique_tab_for_group,
 };
 use crate::supervise::approvals;
 use crate::supervise::limit::one_line;
 pub use crate::supervise::policy::turn_end::Restart;
 use crate::supervise::policy::turn_end::TurnEndReading;
 use crate::supervise::screen::HumanInput;
+
+#[cfg(all(test, unix))]
+#[path = "relaunch_native_gate_tests.rs"]
+mod native_gate_tests;
 
 /// A relaunch planned from the live process.
 pub(super) struct Plan {
@@ -41,6 +45,44 @@ pub(super) struct Plan {
     /// `cd`, or no directory was read). The record keeps it ([`St::line_dir`]), and the line typed
     /// once the shell stands elsewhere carries a `cd` back to it ([`line_at_shell`]).
     pub(super) line_dir: Option<String>,
+    /// The exact flags/environment selected while rendering `line`, before native admission.
+    pub(super) command: Option<PlannedCommand>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct PlannedCommand {
+    pub(super) dialect: Dialect,
+    pub(super) heal: Option<PathBuf>,
+    pub(super) cwd: Option<String>,
+    pub(super) target: PathBuf,
+    pub(super) argv: Vec<String>,
+    pub(super) env: Vec<(String, String)>,
+    pub(super) unset: Option<Vec<String>>,
+}
+
+impl PlannedCommand {
+    pub(super) fn capture(&self) -> Option<super::native_act::RestartCommand> {
+        Some(super::native_act::RestartCommand {
+            image: super::native_act::Image::at(&self.target)?,
+            program: self.target.to_str()?.to_string(),
+            argv: self.argv.clone(),
+            env: self.env.clone(),
+            unset: self.unset.clone(),
+            cwd: self.cwd.clone(),
+            heal: match &self.heal {
+                None => None,
+                Some(path) => Some(path.to_str()?.to_string()),
+            },
+            dialect: self.dialect,
+        })
+    }
+}
+
+struct SelectedCommand {
+    line: String,
+    argv: Vec<String>,
+    env: Vec<(String, String)>,
+    tap_dropped: Option<String>,
 }
 
 /// Why a session has no relaunch plan.
@@ -201,7 +243,7 @@ pub(super) fn plan(
             .map(|(name, value)| (*name, value.as_str()))
             .collect()
     });
-    let (line, tap_dropped) = line_tap_kept(
+    let selected = line_tap_selected(
         dialect,
         heal.as_deref(),
         cd.as_deref(),
@@ -221,9 +263,18 @@ pub(super) fn plan(
     Ok(Plan {
         shell,
         dialect,
-        line,
-        tap_dropped,
+        line: selected.line,
+        tap_dropped: selected.tap_dropped,
         line_dir: (cd.is_none() && !want.is_empty()).then_some(want),
+        command: Some(PlannedCommand {
+            dialect,
+            heal,
+            cwd: cd,
+            target: launch.exe.to_path_buf(),
+            argv: selected.argv,
+            env: selected.env,
+            unset: exact.map(|env| env.unset.iter().map(|name| (*name).to_string()).collect()),
+        }),
     })
 }
 
@@ -352,6 +403,26 @@ pub(super) fn line_tap_kept(
     unset: Option<&[&str]>,
     tap: Option<&str>,
 ) -> Result<(String, Option<String>), NoPlan> {
+    line_tap_selected(
+        dialect, heal, cd, exe, argv, session, model, mode, required, unset, tap,
+    )
+    .map(|selected| (selected.line, selected.tap_dropped))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn line_tap_selected(
+    dialect: Dialect,
+    heal: Option<&Path>,
+    cd: Option<&str>,
+    exe: &Path,
+    argv: &[String],
+    session: Option<&str>,
+    model: Option<&str>,
+    mode: Option<&str>,
+    required: &[(&str, &str)],
+    unset: Option<&[&str]>,
+    tap: Option<&str>,
+) -> Result<SelectedCommand, NoPlan> {
     let mut flags =
         upgrade::rewrite_argv(argv, session.unwrap_or("-")).map_err(|e| NoPlan::Refused {
             why: format!("argv:{e}"),
@@ -364,27 +435,34 @@ pub(super) fn line_tap_kept(
     let flags = with_permission_mode(with_model(flags, model), mode);
     let both: Vec<(&str, &str)> = required.iter().copied().chain(CLAUDE_LAUNCH_ENV).collect();
     let tapped = tap.map(|value| with_tap(flags.clone(), value));
-    let line = |env: &[(&str, &str)], flags: &[String]| match unset {
-        Some(unset) => upgrade::relaunch_line_env_clear(dialect, heal, cd, env, unset, exe, flags),
-        None => upgrade::relaunch_line_env(dialect, heal, cd, env, exe, flags),
+    let line = |env: &[(&str, &str)], flags: &[String]| {
+        upgrade::relaunch_line_selected(dialect, heal, cd, env, unset, exe, flags).map(|selected| {
+            SelectedCommand {
+                line: selected.line,
+                argv: flags.to_vec(),
+                env: selected.env,
+                tap_dropped: None,
+            }
+        })
     };
     let dropped = match tapped.as_deref() {
         None => None,
         Some(t) => match line(&both, t).or_else(|_| line(required, t)) {
-            Ok(tapped) => return Ok((tapped, None)),
+            Ok(tapped) => return Ok(tapped),
             Err(why) => Some(why),
         },
     };
     line(&both, &flags)
         .or_else(|_| line(required, &flags))
-        .map(|plain| {
+        .map(|mut plain| {
             let dropped = dropped.map(|why| {
                 format!(
                     "the usage tap left this relaunch line: with it, {why}; without it, {} bytes",
-                    plain.len()
+                    plain.line.len()
                 )
             });
-            (plain, dropped)
+            plain.tap_dropped = dropped;
+            plain
         })
         .map_err(|e| NoPlan::Refused {
             why: format!("line:{e}"),
@@ -406,13 +484,24 @@ pub(super) fn note_tap_dropped(opts: &Opts, r: &Report, dropped: Option<&str>) {
 }
 
 /// `flags` with the usage tap's pair, `--settings <value>`, before the trailing `--resume` pair (at the end of a fresh start's flags).
-pub(crate) fn with_tap(mut flags: Vec<String>, value: &str) -> Vec<String> {
-    let at = flags
+pub(crate) fn with_tap(flags: Vec<String>, value: &str) -> Vec<String> {
+    let spans = upgrade::parse_flag_spans(&flags);
+    let resume_at = spans
         .iter()
-        .rposition(|f| f == "--resume")
-        .unwrap_or(flags.len());
-    flags.splice(at..at, ["--settings".to_string(), value.to_string()]);
-    flags
+        .rposition(|(name, _)| *name == Some("--resume"));
+    let mut out = Vec::with_capacity(flags.len() + 2);
+    for (idx, (_, tokens)) in spans.into_iter().enumerate() {
+        if Some(idx) == resume_at {
+            out.push("--settings".to_string());
+            out.push(value.to_string());
+        }
+        out.extend(tokens);
+    }
+    if resume_at.is_none() {
+        out.push("--settings".to_string());
+        out.push(value.to_string());
+    }
+    out
 }
 
 /// The Claude Code a manager runs, as a worker it starts must run it (`spawn agent=claude`).
@@ -512,18 +601,19 @@ pub(super) fn with_model(flags: Vec<String>, model: Option<&str>) -> Vec<String>
     let Some(model) = model else {
         return flags;
     };
+    let spans = upgrade::parse_flag_spans(&flags);
     let mut out = Vec::with_capacity(flags.len() + 2);
-    let mut it = flags.into_iter().peekable();
     let mut tail = Vec::new();
-    while let Some(f) = it.next() {
-        if f == "--model" {
-            let _ = it.next();
-        } else if f.starts_with("--model=") {
-        } else if f == "--resume" {
-            tail.push(f);
-            tail.extend(it.by_ref());
+    let mut in_tail = false;
+    for (name, tokens) in spans {
+        if in_tail {
+            tail.extend(tokens);
+        } else if name == Some("--model") {
+        } else if name == Some("--resume") {
+            in_tail = true;
+            tail.extend(tokens);
         } else {
-            out.push(f);
+            out.extend(tokens);
         }
     }
     if !model.is_empty() {
@@ -602,26 +692,32 @@ pub(crate) fn with_permission_mode(flags: Vec<String>, mode: Option<&str>) -> Ve
         return flags;
     };
     let mode = if mode == "manual" { "default" } else { mode };
+    let spans = upgrade::parse_flag_spans(&flags);
     let mut out = Vec::with_capacity(flags.len() + 3);
     let mut tail = Vec::new();
+    let mut in_tail = false;
     let mut bypass_in_cycle = false;
-    let mut it = flags.into_iter();
-    while let Some(f) = it.next() {
-        match f.as_str() {
-            "--dangerously-skip-permissions" | "--allow-dangerously-skip-permissions" => {
+    for (name, tokens) in spans {
+        if in_tail {
+            tail.extend(tokens);
+            continue;
+        }
+        match name {
+            Some("--dangerously-skip-permissions" | "--allow-dangerously-skip-permissions") => {
                 bypass_in_cycle = true;
             }
-            "--permission-mode" => {
-                bypass_in_cycle |= it.next().is_some_and(|m| m == "bypassPermissions");
+            Some("--permission-mode") => {
+                bypass_in_cycle |= match tokens.as_slice() {
+                    [one] => one == "--permission-mode=bypassPermissions",
+                    [_, m] => m == "bypassPermissions",
+                    _ => false,
+                };
             }
-            a if a.starts_with("--permission-mode=") => {
-                bypass_in_cycle |= a == "--permission-mode=bypassPermissions";
+            Some("--resume") => {
+                in_tail = true;
+                tail.extend(tokens);
             }
-            "--resume" => {
-                tail.push(f);
-                tail.extend(it.by_ref());
-            }
-            _ => out.push(f),
+            _ => out.extend(tokens),
         }
     }
     if bypass_in_cycle {
@@ -954,7 +1050,74 @@ fn relaunch_held(
     session: &str,
     k: &dyn Kernel,
 ) -> Report {
+    let has_private_constructor = match st.agent {
+        upgrade::Agent::Claude => true,
+        upgrade::Agent::Codex | upgrade::Agent::Agy | upgrade::Agent::Muse => false,
+    };
+    if (super::native_restart::coordinated(st) || opts.token.is_some() && has_private_constructor)
+        && st.native.is_none()
+        && st.native_prepare.is_empty()
+    {
+        // An old or already completed native act is never an untyped launch grant. A new
+        // crash needs its own retained live/death observation and a newly admitted plan.
+        match super::native_restart::begin_completed_rollback(opts, c, st, session) {
+            Ok(super::native_restart::Recovery::Admitted) => {}
+            Ok(super::native_restart::Recovery::Completed) => {
+                return await_held(opts, r, st, c, hand, session, k);
+            }
+            Ok(super::native_restart::Recovery::Retired) => {
+                return said(r, "failed:native-cohort-retired");
+            }
+            Ok(super::native_restart::Recovery::Legacy) => {}
+            Ok(super::native_restart::Recovery::Cancelled) => {
+                return said(r, "wait:native-crash-observation");
+            }
+            Err(why) => return said(r, format!("wait:{why}")),
+        }
+    }
     let old = st.pid;
+    if !st.native_prepare.is_empty() {
+        let tab = st.tab.clone();
+        match super::native_restart::recover(c, &tab, st) {
+            Ok(super::native_restart::Recovery::Completed) => {
+                save(opts, session, st);
+                return await_held(opts, r, st, c, hand, session, k);
+            }
+            Ok(super::native_restart::Recovery::Cancelled) => {
+                st.stop("native-cancelled-before-mutation", now_s());
+                save(opts, session, st);
+                return said(r, "wait:native-cancelled-before-mutation");
+            }
+            Ok(super::native_restart::Recovery::Retired) => {
+                save(opts, session, st);
+                return said(r, "failed:native-cohort-retired");
+            }
+            Ok(
+                super::native_restart::Recovery::Admitted | super::native_restart::Recovery::Legacy,
+            ) => {}
+            Err(_) => return said(r, "wait:native-recovery"),
+        }
+        save(opts, session, st);
+    }
+    if st.native.is_some() && super::native_restart::resume_observed(c, &st.tab, st) {
+        // The client may have ended after the server submitted the fixed line but before its
+        // local typed record landed. Kernel proof of that same operation resumes observation;
+        // the old line is never sent again while waiting for the shell to return.
+        st.relaunched(now_s());
+        save(opts, session, st);
+        return await_held(opts, r, st, c, hand, session, k);
+    }
+    if !st.native_prepare.is_empty() && alive(old) {
+        let tab = st.tab.clone();
+        // A prepare/signal reply may have been lost before mutation. Prove an explicit
+        // pre-mutation abort before returning to a fresh at-rest constructor; never signal
+        // later from this recovery/observation lane using an old screen observation.
+        if super::native_restart::abort(c, &tab, st) {
+            st.stop("native-aborted-before-signal", now_s());
+            save(opts, session, st);
+            return said(r, "wait:native-aborted-before-signal");
+        }
+    }
     if !super::upgrade_wake::wait_exit(old, opts.timings.exited) {
         return said(r, "wait:exiting");
     }
@@ -981,7 +1144,15 @@ fn relaunch_held(
     };
     let asked = record_asked(opts, session, &st.model_list);
     let block = line_block(c, &tab);
-    let typed = type_relaunch_line(
+    if st.native.is_some() && line != st.line {
+        return said(r, "wait:native-continuation-changed");
+    }
+    let native = st.native.clone();
+    if native.is_none() && super::native_restart::coordinated(st) {
+        return said(r, "wait:native-recovery");
+    }
+    let native_phase = super::native_restart::phase(st);
+    let typed = type_relaunch_line_admitted(
         opts,
         &st.agent_records(&opts.home),
         c,
@@ -992,14 +1163,21 @@ fn relaunch_held(
         dialect,
         PromptLook::of(st),
         |c, pid, tab| process_in_tab(c, pid, tab, None, None),
+        native.as_ref().map(|binding| (binding, native_phase)),
     );
-    if typed.is_err() {
+    if typed
+        .as_ref()
+        .is_err_and(|e| *e != RelaunchLineError::Unanswered)
+    {
         take_back_ask(opts, session, asked);
     }
     match typed {
         Ok(()) => {
             st.prompt = None;
             st.line = line;
+        }
+        Err(RelaunchLineError::Unanswered) => {
+            return line_unanswered(opts, r, st, session, block, line);
         }
         Err(RelaunchLineError::Wait(why)) => {
             st.note_wait(why, now_s());
@@ -1024,6 +1202,25 @@ fn relaunch_held(
     await_held(opts, r, st, c, hand, session, k)
 }
 
+/// A relaunch line whose request went unanswered ([`RelaunchLineError::Unanswered`]) may have
+/// run: it is recorded as typed (its ask kept), and the next step, on a new connection, reads the
+/// agent it started or the shell's prompt back ([`await_held`]).
+pub(super) fn line_unanswered(
+    opts: &Opts,
+    r: Report,
+    st: &mut St,
+    session: &str,
+    block: Option<u64>,
+    line: String,
+) -> Report {
+    st.prompt = None;
+    st.line = line;
+    typed_recorded(opts, st, session, block, |st| {
+        ledger(opts, &said(r.clone(), "relaunched"), &st.line);
+    });
+    said(r, "wait:unanswered")
+}
+
 fn typed_recorded(
     opts: &Opts,
     st: &mut St,
@@ -1044,9 +1241,12 @@ pub(super) enum RelaunchLineError {
     /// A hand the line waits on stands on the tab ([`hand_on_tab`]: a hold, another driver's lease, a turn).
     Hand,
     Turn(String),
+    /// The line's request went unanswered within its wait ([`Typed::Unanswered`]): it may have run.
+    Unanswered,
 }
 
-/// Type the relaunch line.
+/// Type the relaunch line. Only `upgrade_drive`'s tests call it, and they run on unix.
+#[cfg(all(test, unix))]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn type_relaunch_line(
     opts: &Opts,
@@ -1060,7 +1260,26 @@ pub(super) fn type_relaunch_line(
     look: PromptLook<'_>,
     tab_probe: impl FnMut(&mut Client, u32, &str) -> bool,
 ) -> Result<(), RelaunchLineError> {
-    type_relaunch_line_with(
+    type_relaunch_line_admitted(
+        opts, records, c, shell, tab, session, line, dialect, look, tab_probe, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn type_relaunch_line_admitted(
+    opts: &Opts,
+    records: &Records,
+    c: &mut Client,
+    shell: u32,
+    tab: &str,
+    session: &str,
+    line: &str,
+    dialect: Option<Dialect>,
+    look: PromptLook<'_>,
+    tab_probe: impl FnMut(&mut Client, u32, &str) -> bool,
+    native: Option<(&super::native_act::Binding, super::native_act::ImagePhase)>,
+) -> Result<(), RelaunchLineError> {
+    type_relaunch_line_admitted_with(
         opts,
         c,
         shell,
@@ -1074,6 +1293,7 @@ pub(super) fn type_relaunch_line(
                 .is_some_and(|files| !conversation_live(&files, session))
         },
         tab_probe,
+        native,
     )
 }
 
@@ -1129,7 +1349,34 @@ pub(super) fn type_relaunch_line_with(
     dialect: Option<Dialect>,
     look: PromptLook<'_>,
     owner_clear: impl FnOnce() -> bool,
+    tab_probe: impl FnMut(&mut Client, u32, &str) -> bool,
+) -> Result<(), RelaunchLineError> {
+    type_relaunch_line_admitted_with(
+        opts,
+        c,
+        shell,
+        tab,
+        line,
+        dialect,
+        look,
+        owner_clear,
+        tab_probe,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn type_relaunch_line_admitted_with(
+    opts: &Opts,
+    c: &mut Client,
+    shell: u32,
+    tab: &str,
+    line: &str,
+    dialect: Option<Dialect>,
+    look: PromptLook<'_>,
+    owner_clear: impl FnOnce() -> bool,
     mut tab_probe: impl FnMut(&mut Client, u32, &str) -> bool,
+    native: Option<(&super::native_act::Binding, super::native_act::ImagePhase)>,
 ) -> Result<(), RelaunchLineError> {
     let PromptLook {
         mark,
@@ -1146,19 +1393,34 @@ pub(super) fn type_relaunch_line_with(
     if !tab_probe(c, shell, tab) {
         return Err(RelaunchLineError::Wait("tab-ownership-changed"));
     }
+    let checked_status = super::upgrade_drive::status_line(c, tab);
     if let Some(held) = line_held_by_status(
-        super::upgrade_drive::status_line(c, tab).as_deref(),
+        checked_status.as_deref(),
         line_grace(opts.human_grace_s, ended_at_s, line_grace_s),
         &super::upgrade_drive::hand_name(),
     ) {
         return Err(held);
     }
+    let native = match native {
+        None => None,
+        Some((binding, phase)) => Some((
+            binding,
+            phase,
+            checked_status
+                .as_deref()
+                .and_then(super::native_restart::human_seq)
+                .ok_or(RelaunchLineError::Wait("native-person-unread"))?,
+        )),
+    };
     if mark.is_none()
         && let Some(scr) = screen(c, tab)
     {
         *mark = first_mark(c, tab, &scr, ended_at_s, held_since_s)?;
     }
-    let healed = dialect.and_then(|d| healed_line(c, tab, shell, d, line));
+    let healed = native
+        .is_none()
+        .then(|| dialect.and_then(|d| healed_line(c, tab, shell, d, line)))
+        .flatten();
     let typed = type_at_prompt(
         c,
         shell,
@@ -1167,6 +1429,7 @@ pub(super) fn type_relaunch_line_with(
         mark,
         &mut tab_probe,
         opts.timings.fence_every,
+        native,
     );
     if typed.is_err() && healed.is_some() {
         withdraw_rekey(c, tab);
@@ -1220,6 +1483,7 @@ fn refused_line(e: String) -> RelaunchLineError {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn type_at_prompt(
     c: &mut Client,
     shell: u32,
@@ -1228,7 +1492,27 @@ fn type_at_prompt(
     mark: &mut Option<PromptMark>,
     tab_probe: &mut impl FnMut(&mut Client, u32, &str) -> bool,
     fence_every: Duration,
+    native: Option<(
+        &super::native_act::Binding,
+        super::native_act::ImagePhase,
+        u64,
+    )>,
 ) -> Result<(), RelaunchLineError> {
+    if let Some((binding, phase, human_seq)) = native {
+        let scr = screen(c, tab);
+        at_mark(mark, scr.as_ref())?;
+        if !tab_probe(c, shell, tab) {
+            return Err(RelaunchLineError::Wait("tab-ownership-changed"));
+        }
+        let generation = scr
+            .and_then(|s| s.generation)
+            .ok_or(RelaunchLineError::Wait("native-screen-unread"))?;
+        return super::native_restart::resume(c, tab, binding, phase, &generation, human_seq)
+            .map_err(|error| match error {
+                Typed::Unanswered => RelaunchLineError::Unanswered,
+                _ => RelaunchLineError::Wait("native-continuation"),
+            });
+    }
     let bash = atpkg::caller_shell::process_args(shell)
         .and_then(|a| Dialect::from_exe_name(&a.exec_path))
         == Some(Dialect::Bash);
@@ -1248,6 +1532,7 @@ fn type_at_prompt(
                 Err(Typed::Yielded) => return Err(RelaunchLineError::Wait("yield")),
                 Err(Typed::Cut(_)) => return Err(RelaunchLineError::Wait("cut")),
                 Err(Typed::Refused(e)) => return Err(refused_line(e)),
+                Err(Typed::Unanswered) => return Err(RelaunchLineError::Unanswered),
             }
         }
     }
@@ -1255,14 +1540,17 @@ fn type_at_prompt(
     if !tab_probe(c, shell, tab) {
         return Err(RelaunchLineError::Wait("tab-ownership-changed"));
     }
-    if bash {
-        return type_line(c, tab, line).map_err(refused_line);
-    }
-    match turn_fenced(c, tab, line, None) {
+    let typed = if bash {
+        type_line(c, tab, line)
+    } else {
+        turn_fenced(c, tab, line, None)
+    };
+    match typed {
         Ok(()) => Ok(()),
         Err(Typed::Yielded | Typed::Changed) => Err(RelaunchLineError::Wait("yield")),
         Err(Typed::Cut(_)) => Err(RelaunchLineError::Wait("cut")),
         Err(Typed::Refused(e)) => Err(refused_line(e)),
+        Err(Typed::Unanswered) => Err(RelaunchLineError::Unanswered),
     }
 }
 
@@ -1466,11 +1754,11 @@ impl PromptMark {
     pub(super) fn parse(word: &str) -> Option<PromptMark> {
         let mut parts = word.strip_prefix("v2,")?.splitn(4, ',');
         Some(PromptMark {
-            row: parts.next()?.parse().ok()?,
-            col: parts.next()?.parse().ok()?,
+            row: crate::parse_uint(parts.next()?)?,
+            col: crate::parse_uint(parts.next()?)?,
             right: match parts.next()? {
                 "-" => None,
-                r => Some(r.parse().ok()?),
+                r => Some(crate::parse_uint(r)?),
             },
             left: parts.next()?.to_string(),
         })
@@ -1516,6 +1804,10 @@ fn await_held(
     let limit = held_wait(&opts.timings, &st.cause);
     wait_every(limit, poll_gap(limit).min(opts.timings.shell_look), || {
         hand.keep(c);
+        if st.native.is_some() && super::native_restart::resume_observed(c, &tab, st) {
+            let _completed = super::native_restart::complete(c, &tab, st);
+            save(opts, session, st);
+        }
         new = roster.files(&records, wait_now()).and_then(|files| {
             files
                 .iter()
@@ -1542,6 +1834,10 @@ fn await_held(
                 .is_some_and(|sf| sf.status == "idle")
         });
     }
+    if new.is_some() && !super::native_restart::complete(c, &st.tab.clone(), st) {
+        save(opts, session, st);
+        return said(r, "wait:native-outcome");
+    }
     match new {
         Some(sf) if fresh => {
             st.phase = upgrade::Phase::Done;
@@ -1562,17 +1858,22 @@ fn await_held(
             if st.relaunched_pid == sf.pid {
                 return r;
             }
-            st.relaunched_pid = sf.pid;
             let tab = st.tab.clone();
-            let promise = Adopted::of(
-                st,
-                || {
-                    let ours = conversation_typed_by(opts, &tab, session, st);
-                    let written = WhereWritten::new(opts, &records, session, &ours);
-                    nothing_owed(opts, &written, &tab, st).map(|(_, why)| why)
-                },
-                || opts.land || tab_under_land(c, &tab),
-            );
+            let none_owed = if resumes_quietly(st) {
+                None
+            } else {
+                let ours = match conversation_typed_by(opts, &tab, session, st) {
+                    Ok(ours) => ours,
+                    Err(_) => return said(r, WAIT_LEDGER_EVIDENCE),
+                };
+                let written = WhereWritten::new(opts, &records, session, &ours);
+                match nothing_owed(opts, &written, &tab, st) {
+                    Ok(nothing) => nothing.map(|(_, why)| why),
+                    Err(_) => return said(r, WAIT_LEDGER_EVIDENCE),
+                }
+            };
+            st.relaunched_pid = sf.pid;
+            let promise = Adopted::of(st, || none_owed);
             ledger(opts, &r, &promise.detail());
             save(opts, session, st);
             r
@@ -1597,6 +1898,10 @@ fn await_held(
             relaunch_held(opts, r, st, c, hand, session, k)
         }
         None if ended => {
+            if st.native.is_some() && !super::native_restart::retire(c, &tab, st) {
+                save(opts, session, st);
+                return said(r, "wait:native-retirement");
+            }
             st.stop("no-resume", now_s());
             let r = said(r, "failed:no-resume");
             ledger(
@@ -1633,25 +1938,17 @@ pub(super) enum Adopted {
     Quiet,
     /// The conversation's own records owe nothing, for the why [`nothing_owed`] names.
     NothingOwed(&'static str),
-    /// Under Autopilot Land ([`Opts::land`], or the tab's own) no continuation is typed.
-    Land,
-    /// Any other move owes the continuation, which the tab's supervisor types at the agent's
-    /// first idle point.
+    /// Any other move owes the continuation, under Cruise and under Land alike, which the tab's
+    /// supervisor types at the agent's first idle point.
     Owed,
 }
 
 impl Adopted {
-    fn of(
-        st: &St,
-        none_owed: impl FnOnce() -> Option<&'static str>,
-        land: impl FnOnce() -> bool,
-    ) -> Self {
+    fn of(st: &St, none_owed: impl FnOnce() -> Option<&'static str>) -> Self {
         if resumes_quietly(st) {
             Self::Quiet
         } else if let Some(why) = none_owed() {
             Self::NothingOwed(why)
-        } else if land() {
-            Self::Land
         } else {
             Self::Owed
         }
@@ -1667,13 +1964,216 @@ impl Adopted {
             Self::NothingOwed(why) => format!(
                 "the relaunched agent holds the conversation; no continuation is owed: {why}"
             ),
-            Self::Land => "the relaunched agent holds the conversation; under Land no \
-                           continuation is typed: its loop decides its point"
-                .to_string(),
             Self::Owed => "the relaunched agent holds the conversation; its supervisor types \
                            the continuation at its first idle point"
                 .to_string(),
         }
+    }
+}
+
+/// Whether the session's Autopilot is Land (the host's [`Opts::land`], or tab `tab`'s status): a
+/// relaunch is carried on there too, with the restart's facts and no done check of Cruise's, the
+/// loop's own Land acts deciding every turn end after it.
+pub(super) fn carries_under_land(opts: &Opts, c: &mut Client, tab: &str) -> bool {
+    opts.land || tab_under_land(c, tab)
+}
+
+/// Whether tab `tab`'s own status says its Autopilot is off: nothing is typed there, and a relaunch
+/// stays owed in case the person turns it on again (`wait:off`).
+pub(super) fn tab_off(c: &mut Client, tab: &str) -> bool {
+    super::upgrade_drive::status_line(c, tab)
+        .is_some_and(|line| autopilot_by_status(&line) == Some("off"))
+}
+
+/// The unix second from which a prompt in the relaunched agent's own log reached it first: the
+/// relaunch line's ([`reached_first`]).
+pub(super) fn prompts_from(st: &St) -> u64 {
+    relaunched_line_at(st)
+}
+
+/// Whether `prompt`, as a relaunched agent's own log wrote it, is one of the harness's own lines.
+pub(super) fn harness_prompt(prompt: &str) -> bool {
+    prompt
+        .trim_start()
+        .starts_with(crate::harness::upgrade::HARNESS_MARK)
+}
+
+/// A relaunch whose agent's own log shows `prompts` written since its line, settled on `new` with
+/// nothing typed, or `None` where nobody has spoken to it and the carry-on still goes: a person's
+/// own message wins ([`PERSON_FIRST`]), and a line of the harness's that landed (the loop's act past
+/// the hold, or the carry-on's own, late answered) has already told it to go on ([`HARNESS_FIRST`]).
+/// The reading of a lane with no transcript of Claude Code's to read ([`nothing_owed`]): a key alone
+/// is no message, so a click, a scroll or a cleared draft ends nothing here.
+pub(super) fn reached_first(
+    opts: &Opts,
+    r: &Report,
+    st: &mut St,
+    new: u32,
+    prompts: &[String],
+) -> Option<Report> {
+    let (word, why) = if prompts.iter().any(|p| !harness_prompt(p)) {
+        ("done:left", PERSON_FIRST)
+    } else if prompts.is_empty() {
+        return None;
+    } else {
+        ("done:carried", HARNESS_FIRST)
+    };
+    st.resumed_pid = new;
+    st.resumed_on.clone_from(&st.to);
+    Some(settled_with_nothing(opts, r.clone(), st, word, why))
+}
+
+/// A relaunch settled with nothing typed, on `word` for the reason `why`; the caller saves `st`.
+pub(super) fn settled_with_nothing(
+    opts: &Opts,
+    r: Report,
+    st: &mut St,
+    word: &str,
+    why: &str,
+) -> Report {
+    st.phase = upgrade::Phase::Done;
+    st.done_at = now_s();
+    st.outcome = nothing_typed(st.agent, &st.to, &format!("nothing typed: {why}"));
+    let r = said(r, word);
+    ledger(opts, &r, &st.outcome);
+    r
+}
+
+/// The word of a relaunch under Land whose agent's last reply defends the work: nothing is typed,
+/// and the loop's land check at this point reads the defense ([`DEFENDED`]).
+pub const LANDING: &str = "done:landing";
+
+/// Why [`LANDING`] types nothing.
+pub const DEFENDED: &str =
+    "its last reply defends its work as landed, and the tab's loop checks it";
+
+/// Whether the last reply on the screen `rows` draws for `program` is a clean defense of the work
+/// (`Nothing left:`), the reading a relaunch under Land with no transcript of Claude Code's has.
+pub(super) fn defended_on_screen(program: aterm_phase::Program, rows: &[String]) -> bool {
+    crate::supervise::policy::turn_end::clean_defense(program.reader().said_tail(rows).as_deref())
+}
+
+/// [`LANDING`] for a lane that reads the screen ([`defended_on_screen`]); the caller saves `st`.
+pub(super) fn landing(opts: &Opts, r: Report, st: &mut St, new: u32) -> Report {
+    st.resumed_pid = new;
+    st.resumed_on.clone_from(&st.to);
+    settled_with_nothing(opts, r, st, LANDING, DEFENDED)
+}
+
+/// How many looks in a row at a draft or a box in the composer end a relaunch's wait for its
+/// composer: a person's draft stands for as long as they keep it, and a look later is all the
+/// carry-on needs ([`settled_for_carry`]).
+pub(super) const DRAFT_LOOKS: u32 = 3;
+
+/// Whether the screen settled for a carry-on within `within` by the lane's own `fence`, keeping the
+/// harness's hand with `keep`: `Err` with the word of what stands in the composer, which keeps the
+/// carry-on owed and looks again; never a reason to give it up, as nothing may be typed over unsent
+/// input.
+pub(super) fn settled_for_carry(
+    within: Duration,
+    c: &mut Client,
+    mut fence: impl FnMut(&mut Client) -> Result<Option<String>, &'static str>,
+    mut keep: impl FnMut(&mut Client),
+) -> Result<bool, &'static str> {
+    let (mut stood, mut word) = (0, "wait:draft");
+    let settled = wait_until(within, || {
+        keep(c);
+        if c.reply_unread() {
+            return true;
+        }
+        match fence(c) {
+            Ok(_) => {
+                stood = 0;
+                true
+            }
+            Err(held @ ("draft" | "box")) => {
+                word = if held == "box" {
+                    "wait:box"
+                } else {
+                    "wait:draft"
+                };
+                stood += 1;
+                stood >= DRAFT_LOOKS
+            }
+            Err(_) => {
+                stood = 0;
+                false
+            }
+        }
+    });
+    if stood >= DRAFT_LOOKS {
+        return Err(word);
+    }
+    Ok(settled && !c.reply_unread())
+}
+
+fn nothing_typed(agent: upgrade::Agent, version: &str, why: &str) -> String {
+    let version = one_line(version);
+    match agent {
+        upgrade::Agent::Claude => format!("claude restarted on {version} · {why}"),
+        upgrade::Agent::Codex => {
+            format!("codex on {version} · the same conversation resumed; {why}")
+        }
+        upgrade::Agent::Muse => format!("muse on {version} · the same conversation resumed; {why}"),
+        upgrade::Agent::Agy => format!("agy on {version} · the same conversation resumed; {why}"),
+    }
+}
+
+/// What the last reply `program` draws on `rows` claims ([`upgrade::done_said`]): a resumed agent
+/// whose transcript is its screen (Muse Code, agy) is read there.
+pub(super) fn said_on_screen(program: aterm_phase::Program, rows: &[String]) -> (bool, bool) {
+    program
+        .reader()
+        .said_tail(rows)
+        .map_or((false, false), |words| upgrade::done_said(&words))
+}
+
+/// The relaunch's prompt `text`, its carry-on swapped for Cruise's done check where the agent's
+/// last words claim the work done (`said`, [`upgrade::checking`]), the check's sentence that the
+/// go-ahead is no need cut where the person's hour `held` it ([`go_ahead_held_by_status`]).
+pub(super) fn carried_text(
+    text: String,
+    (said_done, irreversible): (bool, bool),
+    held: bool,
+) -> String {
+    if said_done {
+        upgrade::checking(&text, irreversible, held)
+    } else {
+        text
+    }
+}
+
+/// Whether one `status` reply says the person's last key holds the go-ahead now, as the loop's
+/// hour does ([`crate::supervise::policy::turn_end::GO_AHEAD_HELD`]): their typing
+/// (`human_typed_ms=`, else `human_ms=` from a window that reports no typing apart) within the
+/// hour. A reply with no readable key holds it, so a check typed after a restart says no go-ahead
+/// word where the hour cannot be read; `-` (no typing since the host began serving the tab) holds
+/// nothing. The loop's hour also runs from the end of the turn the key came in, which one reply
+/// does not show.
+#[must_use]
+pub fn go_ahead_held_by_status(status: &str) -> bool {
+    let Some(line) = status.lines().find(|l| crate::is_ok_reply(l)) else {
+        return true;
+    };
+    let field = |name: &str| {
+        line.split_whitespace()
+            .find_map(|w| w.strip_prefix(name)?.strip_prefix('='))
+    };
+    match field("human_typed_ms").or_else(|| field("human_ms")) {
+        Some("-") => false,
+        Some(ms) => crate::parse_uint::<u64>(ms).is_none_or(|ms| {
+            Duration::from_millis(ms) < crate::supervise::policy::turn_end::GO_AHEAD_HELD
+        }),
+        None => true,
+    }
+}
+
+/// The word of a carry-on typed: the done check's where the agent's last words claimed the work done.
+pub(super) const fn continued_word(said_done: bool) -> &'static str {
+    if said_done {
+        "continued:check"
+    } else {
+        "continued"
     }
 }
 
@@ -1844,8 +2344,11 @@ fn newest_block(c: &mut Client, tab: &str) -> Option<Value> {
     v.get("blocks")?.as_array()?.last().cloned()
 }
 
-/// Wait at most `within` for the relaunched agent's first idle, renewing the harness's `hand`
-/// first; an opening box is the supervisor's to answer once the step returns.
+/// Wait at most `within` for the relaunched agent's first rest, renewing the harness's `hand`
+/// first: its idle, or a screen no idle will come to until someone answers it. A resume onto a
+/// last reply that asked something reads as a `question`; an opening box (`prompt`) and a `wall`
+/// are the supervisor's to answer once the step returns, so waiting on past them only holds the
+/// tab for `within`.
 pub(super) fn first_idle(
     c: &mut Client,
     hand: &mut Hand,
@@ -1855,7 +2358,7 @@ pub(super) fn first_idle(
 ) {
     hand.keep(c);
     let awaited = c.request_line(&format!(
-        "@{tab} await agent idle timeout={}",
+        "@{tab} await agent idle,question,prompt,wall timeout={}",
         within.as_millis()
     ));
     if !awaited.is_ok_and(|reply| crate::is_ok_reply(&reply)) {
@@ -1930,10 +2433,15 @@ fn carry_on_once(
     let records = st.agent_records(&opts.home);
     let mut conversation_changed = false;
     let mut tail_available = true;
+    let mut draft_looks = 0;
     let settled = wait_until(opts.timings.carry_settle, || {
         // This wait (up to 120 s) outlasts the hand's 60 s lease: renew it throughout.
         if let Some(h) = hand.as_deref_mut() {
             h.keep(c);
+        }
+        // A reply left unread ends the wait: the connection asks nothing more.
+        if c.reply_unread() {
+            return true;
         }
         let Some(sf) = records.session_file(new.pid) else {
             return false;
@@ -1942,8 +2450,18 @@ fn carry_on_once(
             conversation_changed = true;
             return true;
         }
-        sf.status == "idle" && continuation_composer_empty(c, tab, &mut tail_available)
-    });
+        if sf.status != "idle" {
+            draft_looks = 0;
+            return false;
+        }
+        if continuation_composer_empty(c, tab, &mut tail_available) {
+            draft_looks = 0;
+            return true;
+        }
+        draft_looks += 1;
+        draft_looks >= DRAFT_LOOKS
+    }) && !c.reply_unread()
+        && draft_looks < DRAFT_LOOKS;
     if conversation_changed {
         return said(r, "wait:conversation-changed");
     }
@@ -1952,6 +2470,14 @@ fn carry_on_once(
     };
     if resumes_quietly(st) {
         return done_quietly(opts, r, st, key, &current.version, new.pid);
+    }
+    // NOTHING IS TYPED OVER UNSENT INPUT, AND THE CARRY-ON IS NOT GIVEN UP FOR IT: a person's draft
+    // keeps it owed for a later look, as an agent still busy past the wait does.
+    if draft_looks >= DRAFT_LOOKS {
+        return said(r, "wait:draft");
+    }
+    if !settled && !c.reply_unread() {
+        return said(r, "wait:unsettled");
     }
     let from = Version::parse(&st.from);
     if settled
@@ -1974,32 +2500,42 @@ fn carry_on_once(
     if let Err(why) = records.unique_owner(&latest) {
         return said(r, format!("wait:{why}"));
     }
-    let ours = conversation_typed_by(opts, tab, key, st);
+    let ours = match conversation_typed_by(opts, tab, key, st) {
+        Ok(ours) => ours,
+        Err(_) => return said(r, WAIT_LEDGER_EVIDENCE),
+    };
     let written = WhereWritten::new(opts, &records, key, &ours);
-    if settled && let Some((word, why)) = nothing_owed(opts, &written, tab, st) {
-        return done_with_nothing(opts, r, st, key, word, why, &latest.version, new.pid);
+    if settled {
+        match nothing_owed(opts, &written, tab, st) {
+            Ok(Some((word, why))) => {
+                return done_with_nothing(opts, r, st, key, word, why, &latest.version, new.pid);
+            }
+            Ok(None) => {}
+            Err(_) => return said(r, WAIT_LEDGER_EVIDENCE),
+        }
     }
-    if opts.land || tab_under_land(c, tab) {
-        st.phase = upgrade::Phase::Done;
-        r.from.clone_from(&st.from);
-        r.to = format!("{}({})", latest.version, st.source);
-        let r = said(r, "done:landing");
-        st.outcome = format!(
-            "claude restarted on {} · nothing typed: Autopilot is Land, and the tab's loop \
-             decides its point",
-            one_line(&latest.version)
+    // UNDER LAND THE RESTART'S FACTS ARE TYPED AS UNDER CRUISE, without Cruise's done check: a task
+    // Land finished stopped at `nothing_owed` above, a reply that defends its work stops here for
+    // the loop's land check at this point, and every later turn end is its loop's.
+    let under_land = settled && carries_under_land(opts, c, tab);
+    if under_land && written.defended() == Some(true) {
+        return done_with_nothing(
+            opts,
+            r,
+            st,
+            key,
+            LANDING,
+            DEFENDED,
+            &latest.version,
+            new.pid,
         );
-        st.done_at = now_s();
-        look_after_nothing(st, &r.step, &latest.version, new.pid);
-        ledger(opts, &r, &st.outcome);
-        save(opts, key, st);
-        return r;
     }
-    let (said_done, irreversible) = if settled {
+    let claim = if settled && !under_land {
         written.said_done().unwrap_or_default()
     } else {
         (false, false)
     };
+    let said_done = claim.0;
     let to = Version::parse(&latest.version);
     let before = (!st.model_before.is_empty()).then(|| st.model_before.clone());
     let text = if relaunch_cause(&st.cause) {
@@ -2009,31 +2545,44 @@ fn carry_on_once(
             upgrade::continue_prompt_with_model(f, t, before.as_deref(), recorded(&st.model_list))
         })
     };
-    let text = text.map(|text| {
-        if said_done {
-            upgrade::checking(&text, irreversible)
-        } else {
-            text
-        }
-    });
     let typed = settled
         && match text {
             Some(text) => {
                 if !tab_probe(c, new.pid, tab) {
                     return said(r, "wait:tab-ownership-changed");
                 }
-                if super::upgrade_drive::held(c, tab, opts.human_grace_s) {
-                    return said(r, "wait:held");
+                if tab_off(c, tab) {
+                    return said(r, "wait:off");
                 }
+                let Some(hour) = super::upgrade_drive::unheld_hour(c, tab, opts.human_grace_s)
+                else {
+                    return said(r, "wait:held");
+                };
+                let text = carried_text(text, claim, hour);
                 let Some(typed) = under_hand(c, tab, hand, |c| {
                     type_continuation(c, tab, &text, opts.timings.fence_every)
                 }) else {
                     return said(r, "wait:held");
                 };
-                typed
+                match typed {
+                    Continued::Typed => true,
+                    Continued::Not => false,
+                    Continued::Stands(word) => return said(r, word),
+                    Continued::Unanswered
+                        if took_it(&records, &latest, opts.timings.first_idle) =>
+                    {
+                        true
+                    }
+                    Continued::Unanswered => return said(r, "wait:unanswered"),
+                }
             }
             None => false,
         };
+    // A carry that typed nothing because the socket left a reply unread is asked again at the
+    // next step, on a new connection: the silence is never the carry's end.
+    if !typed && c.reply_unread() {
+        return said(r, "wait:no-socket");
+    }
     st.phase = upgrade::Phase::Done;
     r.from.clone_from(&st.from);
     r.to = format!("{}({})", latest.version, st.source);
@@ -2050,14 +2599,7 @@ fn carry_on_once(
     st.resumed_pid = new.pid;
     st.confirm_by = now_s().saturating_add(confirm_within.as_secs());
     save(opts, key, st);
-    let r = said(
-        r,
-        if said_done {
-            "continued:check"
-        } else {
-            "continued"
-        },
-    );
+    let r = said(r, continued_word(said_done));
     ledger(
         opts,
         &r,
@@ -2101,26 +2643,44 @@ pub(super) const NOBODY_ASKED: &str = "nobody has asked this conversation anythi
 pub const RECORD_LANDED: &str = "its record says it defended its task as landed and nobody has asked \
                                  anything since (the tab's loop checks the repository)";
 
+/// An external continuation remains owed while its books cannot distinguish standing holds,
+/// already typed acts and the person's own turns from an empty ledger.
+pub const WAIT_LEDGER_EVIDENCE: &str = "wait:ledger-evidence-unreadable";
+
+/// Why a relaunch a person's own message reached first is carried on with nothing: the message
+/// wins, and the turn end after it is the loop's to decide.
+pub const PERSON_FIRST: &str = "a person's own message reached it first";
+
+/// Why a relaunch a line of the harness's reached first is carried on with nothing more
+/// ([`reached_first`]).
+pub const HARNESS_FIRST: &str = "a line of the harness's reached it first";
+
 fn nothing_owed(
     opts: &Opts,
     written: &WhereWritten<'_>,
     tab: &str,
     st: &St,
-) -> Option<(&'static str, &'static str)> {
+) -> std::io::Result<Option<(&'static str, &'static str)>> {
     let (records, key, ours) = (written.records(), written.session(), written.ours());
     if records.tasked(key, ours) == Some(false) {
-        return Some(("done:taskless", NOBODY_ASKED));
+        return Ok(Some(("done:taskless", NOBODY_ASKED)));
     }
     if written.finished() == Some(true) {
-        return Some(("done:finished", RECORD_LANDED));
+        return Ok(Some(("done:finished", RECORD_LANDED)));
     }
-    if left_to_person(opts, records, tab, key, st) {
-        return Some(("done:left", "its last turn was a person's own exchange"));
+    if left_to_person(opts, records, tab, key, st)? {
+        return Ok(Some((
+            "done:left",
+            "its last turn was a person's own exchange",
+        )));
     }
-    if loop_typed_since(opts, tab, relaunched_line_at(st)) {
-        return Some(("done:carried", "the tab's loop resumed it first"));
+    if written.asked_since(relaunched_line_at(st)) == Some(true) {
+        return Ok(Some(("done:left", PERSON_FIRST)));
     }
-    None
+    if loop_typed_since(opts, tab, relaunched_line_at(st))? {
+        return Ok(Some(("done:carried", "the tab's loop resumed it first")));
+    }
+    Ok(None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2156,24 +2716,36 @@ fn relaunched_line_at(st: &St) -> u64 {
     }
 }
 
-fn loop_typed_since(opts: &Opts, tab: &str, since: u64) -> bool {
+fn loop_typed_since(opts: &Opts, tab: &str, since: u64) -> std::io::Result<bool> {
     let Some(root) = opts.aterm_state.as_deref() else {
-        return false;
+        return Ok(false);
     };
     let Ok(since) = i64::try_from(since) else {
-        return false;
+        return Ok(false);
     };
-    since != 0
-        && approvals::typed_texts(&approvals::ledger_under(root, Some(tab)), Some(tab))
+    Ok(since != 0
+        && approvals::read_typed_texts(&approvals::ledger_under(root, Some(tab)), Some(tab))?
             .iter()
             .any(|t| {
                 t.at_ms.div_euclid(1000) > since
                     && !t.text.starts_with("relaunch ")
                     && t.text != super::usage::USAGE_COMMAND
-            })
+            }))
 }
 
-fn type_continuation(c: &mut Client, tab: &str, text: &str, fence_every: Duration) -> bool {
+/// What [`type_continuation`] did, or a lane's [`type_carry`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Continued {
+    Typed,
+    Not,
+    /// A person's draft or a box stands in the composer, or the screen moved under every try, by
+    /// this word: nothing is typed over it, and the carry-on stays owed.
+    Stands(&'static str),
+    /// Its turn went unanswered within its wait ([`Typed::Unanswered`]): it may have landed.
+    Unanswered,
+}
+
+fn type_continuation(c: &mut Client, tab: &str, text: &str, fence_every: Duration) -> Continued {
     for _ in 0..CONTINUE_FENCE_TRIES {
         let generation = match typing_fence(c, tab) {
             Ok(generation) => generation,
@@ -2181,15 +2753,62 @@ fn type_continuation(c: &mut Client, tab: &str, text: &str, fence_every: Duratio
                 pause(fence_every);
                 continue;
             }
-            Err(_) => return false,
+            Err("draft") => return Continued::Stands("wait:draft"),
+            Err("box") => return Continued::Stands("wait:box"),
+            Err(_) => return Continued::Not,
         };
         match turn_fenced(c, tab, text, generation.as_deref()) {
-            Ok(()) => return true,
+            Ok(()) => return Continued::Typed,
             Err(Typed::Changed | Typed::Yielded) => pause(fence_every),
-            Err(Typed::Cut(_) | Typed::Refused(_)) => return false,
+            Err(Typed::Cut(_) | Typed::Refused(_)) => return Continued::Not,
+            Err(Typed::Unanswered) => return Continued::Unanswered,
         }
     }
-    composer_clear(c, tab) && turn(c, tab, text).is_ok()
+    if !composer_clear(c, tab) {
+        return Continued::Stands("wait:draft");
+    }
+    match turn_fenced(c, tab, text, None) {
+        Ok(()) => Continued::Typed,
+        Err(Typed::Unanswered) => Continued::Unanswered,
+        Err(_) => Continued::Not,
+    }
+}
+
+/// [`type_continuation`] for a lane with its own `fence` and `type_text` (Muse Code, agy): what
+/// stands at the fence keeps the carry-on owed by its word, as the screen moving under every try
+/// does, and a line unanswered is read for what it did before it is typed again. Only a refusal or
+/// a cut gives it up, as on Claude Code's lane.
+pub(super) fn type_carry(
+    c: &mut Client,
+    mut fence: impl FnMut(&mut Client) -> Result<Option<String>, &'static str>,
+    mut type_text: impl FnMut(&mut Client, Option<&str>) -> Result<(), Typed>,
+    fence_every: Duration,
+) -> Continued {
+    for _ in 0..CONTINUE_FENCE_TRIES {
+        let generation = match fence(c) {
+            Ok(generation) => generation,
+            Err("draft") => return Continued::Stands("wait:draft"),
+            Err("box") => return Continued::Stands("wait:box"),
+            Err(_) => return Continued::Stands("wait:unsettled"),
+        };
+        match type_text(c, generation.as_deref()) {
+            Ok(()) => return Continued::Typed,
+            Err(Typed::Changed | Typed::Yielded) => pause(fence_every),
+            Err(Typed::Cut(_) | Typed::Refused(_)) => return Continued::Not,
+            Err(Typed::Unanswered) => return Continued::Unanswered,
+        }
+    }
+    Continued::Stands("wait:unsettled")
+}
+
+/// Whether the agent `before` was read as, within `within`, shows it took a continuation whose
+/// turn went unanswered: its own record leaves idle, or says its status moved since.
+fn took_it(records: &Records, before: &SessionFile, within: Duration) -> bool {
+    wait_until(within, || {
+        records.session_file(before.pid).is_some_and(|sf| {
+            sf.status != "idle" || sf.status_updated_at_ms > before.status_updated_at_ms
+        })
+    })
 }
 
 /// How many fenced tries the continuation gets ([`type_continuation`]).
@@ -2231,14 +2850,19 @@ pub(super) const RESTORE_LOOK: Duration = Duration::from_secs(15);
 
 const RESTORE_TYPE_WITHIN_S: u64 = STALE_S;
 
-fn told_nothing(opts: &Opts, records: &Records, key: &str, st: &St) -> Option<&'static str> {
-    let ours = conversation_typed_by(opts, &st.tab, key, st);
+fn told_nothing(
+    opts: &Opts,
+    records: &Records,
+    key: &str,
+    st: &St,
+) -> std::io::Result<Option<&'static str>> {
+    let ours = conversation_typed_by(opts, &st.tab, key, st)?;
     if finished_where_written(opts, records, key, &ours) == Some(true) {
-        Some("its worker finished its task")
+        Ok(Some("its worker finished its task"))
     } else if records.tasked(key, &ours) == Some(false) {
-        Some("nobody has asked it anything")
+        Ok(Some("nobody has asked it anything"))
     } else {
-        None
+        Ok(None)
     }
 }
 
@@ -2288,7 +2912,10 @@ pub(super) fn restore_look(
         save(opts, key, st);
         return Some(said(r.clone(), word));
     }
-    let quiet = told_nothing(opts, &records, key, st);
+    let quiet = match told_nothing(opts, &records, key, st) {
+        Ok(quiet) => quiet,
+        Err(_) => return Some(said(r.clone(), WAIT_LEDGER_EVIDENCE)),
+    };
     let late = now >= st.confirm_by.saturating_add(RESTORE_TYPE_WITHIN_S);
     let Some(tab) = tab else {
         if late {
@@ -2345,13 +2972,13 @@ fn restore_line(
     tab: &str,
     tab_probe: &mut impl FnMut(&mut Client, u32, &str) -> bool,
 ) -> Result<Report, &'static str> {
-    let idle = continuation_session(records, st.resumed_pid, key).is_some_and(|sf| {
+    let idle = continuation_session(records, st.resumed_pid, key).filter(|sf| {
         sf.status == "idle"
             && kernel_start(sf.pid).as_deref() == Some(squash(&sf.proc_start).as_str())
     });
-    if !idle {
+    let Some(idle) = idle else {
         return Err("wait:changed");
-    }
+    };
     if !tab_probe(c, st.resumed_pid, tab) {
         return Err("wait:tab-ownership-changed");
     }
@@ -2359,30 +2986,36 @@ fn restore_line(
         return Err("wait:held");
     }
     let text = upgrade::restore_prompt(Version::parse(&st.resumed_on).as_ref(), st.is_upgrade());
-    match under_hand(c, tab, None, |c| {
+    let typed = match under_hand(c, tab, None, |c| {
         type_continuation(c, tab, &text, opts.timings.fence_every)
     }) {
-        None => Err("wait:held"),
-        Some(false) => Ok(restore_lost(
+        None => return Err("wait:held"),
+        Some(Continued::Typed) => true,
+        Some(Continued::Stands(word)) => return Err(word),
+        Some(Continued::Unanswered) if took_it(records, &idle, opts.timings.first_idle) => true,
+        Some(Continued::Unanswered) => return Err("wait:unanswered"),
+        Some(Continued::Not) if c.reply_unread() => return Err("wait:no-socket"),
+        Some(Continued::Not) => false,
+    };
+    if !typed {
+        return Ok(restore_lost(
             opts,
             r,
             st,
             key,
             "its line could not be typed",
-        )),
-        Some(true) => {
-            st.confirm_by = 0;
-            st.look_word.clear();
-            st.outcome = format!(
-                "{} · {RESTORE_LOST}; told it to restore what it relies on",
-                st.outcome
-            );
-            let r = said(r.clone(), "continued:restore");
-            ledger(opts, &r, &st.outcome);
-            save(opts, key, st);
-            Ok(r)
-        }
+        ));
     }
+    st.confirm_by = 0;
+    st.look_word.clear();
+    st.outcome = format!(
+        "{} · {RESTORE_LOST}; told it to restore what it relies on",
+        st.outcome
+    );
+    let r = said(r.clone(), "continued:restore");
+    ledger(opts, &r, &st.outcome);
+    save(opts, key, st);
+    Ok(r)
 }
 
 fn look_warned(records: &Records, key: &str, st: &St) -> bool {
@@ -2917,9 +3550,11 @@ pub fn grok_leader_socket(home: &Path, label: &str, login: &str) -> Result<PathB
             .is_some_and(|p| p.len() + LEADER_DAEMON_SUFFIX.len() <= MAX_SUN_PATH)
     };
     let tag = aterm_hash::fnv1a_64(login.as_bytes()) >> 32;
-    let named = home.join(format!("leader-{label}-{tag:08x}.sock"));
-    if fits(&named) {
-        return Ok(named);
+    if accounts::admissible_label(label) {
+        let named = home.join(format!("leader-{label}-{tag:08x}.sock"));
+        if fits(&named) {
+            return Ok(named);
+        }
     }
     let both = aterm_hash::fnv1a_64_extend(aterm_hash::fnv1a_64(label.as_bytes()), b"\0");
     let both = aterm_hash::fnv1a_64_extend(both, login.as_bytes());
@@ -2989,9 +3624,14 @@ pub fn pool_args(
     }
     let drops = |path: &str| env.value.is_some() || names_row_socket(path, home);
     let mut kept = Vec::with_capacity(flags.len() + 2);
+    let mut after_dashdash = Vec::new();
     let mut it = flags.iter();
     while let Some(flag) = it.next() {
-        if flag == LEADER_SOCKET_FLAG {
+        if flag == "--" {
+            after_dashdash.push(flag.clone());
+            after_dashdash.extend(it.cloned());
+            break;
+        } else if flag == LEADER_SOCKET_FLAG {
             if let Some(path) = it.next()
                 && !drops(path)
             {
@@ -3021,6 +3661,7 @@ pub fn pool_args(
         kept.push(socket.to_string_lossy().into_owned());
         unset.push(LEADER_SOCKET_ENV);
     }
+    kept.extend(after_dashdash);
     Ok(PoolArgs { unset, flags: kept })
 }
 
@@ -3259,6 +3900,7 @@ pub(super) fn restart_as(
         line,
         tap_dropped,
         line_dir,
+        command,
         ..
     } = match planned {
         Ok(p) => p,
@@ -3322,9 +3964,57 @@ pub(super) fn restart_as(
             break 'signal Some(said(r.clone(), "wait:claim-unwritten"));
         }
         super::upgrade_drive::note_moved_writes(opts, &snap, &session, &sf.cwd);
-        match terminate(&mut c, &tab, pid, opts.human_grace_s) {
+        let admission = super::native_restart::begin(
+            opts,
+            &mut c,
+            &mut st,
+            &session,
+            super::contract::Scope::Relaunch,
+            std::path::Path::new(&snap.program),
+            command.as_ref(),
+            None,
+        );
+        if matches!(admission, Ok(super::native_restart::Recovery::Completed)) {
+            break 'signal Some(said(r.clone(), "wait:native-completed"));
+        }
+        if matches!(admission, Ok(super::native_restart::Recovery::Retired)) {
+            break 'signal Some(said(r.clone(), "failed:native-cohort-retired"));
+        }
+        if let Err(why) = admission {
+            if st.native_prepare.is_empty() || super::native_restart::abort(&mut c, &tab, &mut st) {
+                restore(opts, &session, prior.as_ref());
+            } else {
+                save(opts, &session, &st);
+            }
+            break 'signal Some(said(r.clone(), format!("wait:{why}")));
+        }
+        if st.native.is_some()
+            && (selected.is_some_and(|s| !s.is_current())
+                || foreground_shell(k.job(snap.pid)) != Ok(shell)
+                || !screen(&mut c, &tab).is_some_and(|scr| at_rest_for(why, &mut c, &tab, &scr))
+                || !live_background(snap.pid).is_empty()
+                || held(&mut c, &tab, opts.human_grace_s)
+                || records.unique_owner(&sf).is_err())
+        {
+            if super::native_restart::abort(&mut c, &tab, &mut st) {
+                restore(opts, &session, prior.as_ref());
+            } else {
+                save(opts, &session, &st);
+            }
+            break 'signal Some(said(r.clone(), "wait:changed-after-native-admission"));
+        }
+        let signal = if let Some(binding) = st.native.as_ref() {
+            super::native_restart::signal(&mut c, &tab, binding)
+        } else {
+            terminate(&mut c, &tab, pid, opts.human_grace_s)
+        };
+        match signal {
             Terminated::Sent => None,
             Terminated::Refused(no) => {
+                if st.native.is_some() {
+                    save(opts, &session, &st);
+                    break 'signal Some(said(r.clone(), format!("wait:signal-{no}")));
+                }
                 restore(opts, &session, prior.as_ref());
                 Some(said(r.clone(), format!("wait:signal-{no}")))
             }
@@ -3659,10 +4349,15 @@ pub fn exit_line(user_home: &Path, snap: &Snapshot) -> Option<String> {
         .session
         .as_deref()
         .filter(|s| upgrade::is_session_id(s))?;
-    if upgrade::one_shot(&snap.argv) || snap.cwd.chars().any(char::is_control) {
+    if upgrade::one_shot(&snap.argv)
+        || snap
+            .cwd
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+    {
         return None;
     }
-    home_carried(
+    let homedir = home_carried(
         user_home,
         snap.home.as_deref(),
         &snap.cwd,
@@ -3678,7 +4373,11 @@ pub fn exit_line(user_home: &Path, snap: &Snapshot) -> Option<String> {
         Some(session),
         None,
         None,
-        &required_env(snap.home.as_deref(), None, snap.login.as_deref()),
+        &required_env(
+            snap.home.as_deref(),
+            homedir.as_deref(),
+            snap.login.as_deref(),
+        ),
     )
     .ok()
 }
@@ -3693,7 +4392,7 @@ const TAP_ROOM_MODE: &str = "acceptEdits";
 
 /// WHETHER THE RELAUNCH LINE aterm would type for `snap`'s Claude Code HAS ROOM FOR THE USAGE TAP
 /// `tap`, as far as a live read can tell: the one judgment the Claude Code footer's promise
-/// (`weekly ? · until relaunch`) makes beside its settings' ([`super::upgrade_drive::tap_settings_admit`]),
+/// (`weekly – · until relaunch`) makes beside its settings' ([`super::upgrade_drive::tap_settings_admit`]),
 /// so it never promises a tap the line would drop ([`line_tap_kept`]). The line is the one
 /// [`plan`] builds: the shell's dialect, atpkg's heal hook under `user_home`, a `cd` unless the
 /// shell is read standing in the agent's directory, its program, argv, conversation, home and
@@ -3723,7 +4422,10 @@ pub fn tap_room(user_home: &Path, snap: &Snapshot, tap: &str) -> bool {
     };
     let heal = atpkg::hooks::hook_file(user_home, dialect.hook_ext()).map(|(p, _)| p);
     let cd = (!snap.cwd.is_empty()
-        && super::upgrade_drive::cwd_of(snap.shell).as_deref() != Some(snap.cwd.as_str()))
+        && !same_dir(
+            super::upgrade_drive::cwd_of(snap.shell).as_deref(),
+            &snap.cwd,
+        ))
     .then_some(snap.cwd.as_str());
     let model = "m".repeat(TAP_ROOM_MODEL);
     line_tap_kept(
@@ -3806,7 +4508,16 @@ pub fn launched(
         return Some((script.to_path_buf(), out));
     }
     let image = image.filter(|p| p.is_absolute())?;
-    if !(is_claude(image) || image.starts_with(native) || registered) {
+    let places = super::agent_image::Places {
+        claude_versions: Some(native),
+        roots: None,
+    };
+    let laid = super::agent_image::in_vendor_layout(
+        aterm_phase::Program::Claude,
+        &super::agent_image::Image::at(image),
+        &places,
+    );
+    if !(is_claude(image) || laid || registered) {
         return None;
     }
     let mut out = vec![image.to_string_lossy().into_owned()];
@@ -3828,7 +4539,9 @@ pub fn snapshot_with_claim(
     opts: &Opts,
     claim: Option<&super::self_claimed::Copy>,
 ) -> Result<Snapshot, &'static str> {
-    snapshot_with_claimed(opts, &Live, claim)
+    let snap = snapshot_with_claimed(opts, &Live, claim)?;
+    super::native_restart::observe_live(opts, &snap);
+    Ok(snap)
 }
 
 /// The lane that reads a tab's foreground agent ([`snapshot_with`]).
@@ -3855,7 +4568,15 @@ pub(super) fn snapshot_lane(image: Option<&Path>) -> SnapshotLane {
         return SnapshotLane::None;
     }
     match name.and_then(aterm_phase::program_of) {
-        Some(aterm_phase::Program::Codex) if image.is_some_and(super::codex_alab::alab_bytes) => {
+        Some(aterm_phase::Program::Codex)
+            if image.is_some_and(|exe| {
+                super::agent_image::in_vendor_layout(
+                    aterm_phase::Program::Codex,
+                    &super::agent_image::Image::at(exe),
+                    &super::agent_image::Places::default(),
+                )
+            }) =>
+        {
             SnapshotLane::CodexAlab
         }
         Some(aterm_phase::Program::Muse) => SnapshotLane::Muse,
@@ -4535,7 +5256,7 @@ fn after_exit_as(
     let running = version.as_deref().and_then(Version::parse);
     let candidates = if upgrade {
         let native = native_root(&opts.home);
-        Targets::read(&opts.home).for_session(snap.program.starts_with(&native))
+        Targets::read(opts).for_session(snap.program.starts_with(&native))
     } else {
         Vec::new()
     };
@@ -4652,13 +5373,7 @@ fn after_exit_as(
             };
             plan(opts, &launch, snap.shell, &table())
         });
-    let Plan {
-        shell,
-        line,
-        tap_dropped,
-        line_dir,
-        ..
-    } = match planned {
+    let plan = match planned {
         Ok(p) => p,
         Err(no) => return unplanned(opts, r, &mut st, no),
     };
@@ -4678,12 +5393,57 @@ fn after_exit_as(
     if !roster(&mut c).contains(&snap.tab) {
         return said(r, "wait:tab-not-live");
     }
+    launch_after_exit(opts, snap, cause, r, st, plan, c)
+}
+
+/// The real exit lane's already-selected immutable plan, current connection and state. The
+/// caller has performed record/target/roster selection; the held relaunch retains every
+/// person, shell and process-exit guard before any legacy or typed continuation.
+fn launch_after_exit(
+    opts: &Opts,
+    snap: &Snapshot,
+    cause: ExitCause,
+    r: Report,
+    mut st: St,
+    plan: Plan,
+    mut c: Client,
+) -> Report {
+    let Plan {
+        shell,
+        line,
+        tap_dropped,
+        line_dir,
+        command,
+        ..
+    } = plan;
+    let session = r.session.clone();
     st.pid = snap.pid;
     st.shell = shell;
     st.tab.clone_from(&snap.tab);
     st.line = line;
     st.line_dir = line_dir.unwrap_or_default();
     st.phase = upgrade::Phase::Exiting { at_s: now_s() };
+    if opts.token.is_some() || super::native_restart::coordinated(&st) {
+        match super::native_restart::begin_crash(
+            opts,
+            &mut c,
+            &mut st,
+            &session,
+            snap,
+            command.as_ref(),
+        ) {
+            Ok(super::native_restart::Recovery::Admitted) => {}
+            Ok(super::native_restart::Recovery::Completed) => return said(r, "wait:relaunched"),
+            Ok(super::native_restart::Recovery::Retired) => {
+                return said(r, "failed:native-cohort-retired");
+            }
+            Ok(super::native_restart::Recovery::Legacy) => {}
+            Ok(super::native_restart::Recovery::Cancelled) => {
+                return said(r, "wait:native-crash-observation");
+            }
+            Err(why) => return said(r, format!("wait:{why}")),
+        }
+    }
     save(opts, &session, &st);
     consume_stamp(opts, snap, cause);
     ledger(opts, &said(r.clone(), "exited"), &st.line);
@@ -5108,6 +5868,31 @@ pub fn owed_of(opts: &Opts, only: Option<upgrade::Agent>) -> bool {
     owed_record(opts, only).is_some()
 }
 
+/// Whether a relaunch's carry-on still stands to be typed in tab `opts.only_sid`, `only`'s record
+/// alone where it names an agent: its relaunch is in flight and speaks. Narrower than [`owed_of`],
+/// whose confirmation looks come after the carry-on and hold nothing of the loop's.
+#[must_use]
+pub fn carry_owed_of(opts: &Opts, only: Option<upgrade::Agent>) -> bool {
+    let Some(tab) = opts.only_sid.as_deref() else {
+        return false;
+    };
+    record_where(opts, |st| {
+        st.tab == tab
+            && matches!(st.phase, upgrade::Phase::Relaunched { .. })
+            && !resumes_quietly(st)
+            && only.is_none_or(|agent| st.agent == agent)
+    })
+    .is_some()
+}
+
+/// Whether a carry-on's `step` waits on what a person or their switch holds (a draft or a box in
+/// the composer, their grace, Off): the loop holds for the same, so the hold that keeps its act
+/// from overtaking the carry-on runs on from this look.
+#[must_use]
+pub fn carry_stands(step: &str) -> bool {
+    matches!(step, "wait:draft" | "wait:box" | "wait:held" | "wait:off")
+}
+
 fn owed_record(opts: &Opts, only: Option<upgrade::Agent>) -> Option<(String, St)> {
     let tab = opts.only_sid.as_deref()?;
     let dir = std::fs::read_dir(state_dir(opts)).ok()?;
@@ -5125,6 +5910,22 @@ fn owed_record(opts: &Opts, only: Option<upgrade::Agent>) -> Option<(String, St)
         let its = only.is_none_or(|agent| st.agent == agent);
         (st.tab == tab && due && its).then_some((session, st))
     })
+}
+
+/// Whether the foreground agent `snap` resumes a conversation: its own arguments resume one,
+/// whoever ran it, or aterm's relaunch resumed it ([`agent_resumed`], read with `opts`).
+#[must_use]
+pub fn resumes_conversation(opts: Option<&Opts>, snap: &Snapshot) -> bool {
+    launch_resumes(snap) || opts.is_some_and(|o| agent_resumed(o, snap))
+}
+
+fn launch_resumes(snap: &Snapshot) -> bool {
+    match snap.agent() {
+        upgrade::Agent::Claude => upgrade::launch_resume(&snap.argv).is_some(),
+        upgrade::Agent::Codex => super::codex_alab::resumed_thread(&snap.argv).is_some(),
+        upgrade::Agent::Muse => super::upgrade_muse::resumes(&snap.argv),
+        upgrade::Agent::Agy => super::upgrade_agy::resumes(&snap.argv),
+    }
 }
 
 /// Whether `snap` is a foreground agent that aterm's own relaunch resumed on its conversation in
@@ -5240,6 +6041,34 @@ pub fn resume(opts: &Opts) -> Report {
 /// [`resume`] at a point the loop read as a task landed under land (`done_under_land`, `crate::supervise::IdlePoint::done_under_land`).
 #[must_use]
 pub fn resume_as(opts: &Opts, done_under_land: bool, only: Option<upgrade::Agent>) -> Report {
+    resume_adopting(opts, done_under_land.then_some(END_LANDED), only).0
+}
+
+/// [`resume`] at a point where the stop for replies that repeat with no work holds the loop's
+/// typing (`crate::supervise::IdlePoint::replies_held`): the relaunch is settled with nothing typed.
+#[must_use]
+pub fn resume_held(opts: &Opts, only: Option<upgrade::Agent>) -> Report {
+    resume_adopting(opts, Some(END_HELD), only).0
+}
+
+/// What a relaunch settles on with nothing typed: its step's word and why ([`carried_done`]).
+type Ending = (&'static str, &'static str);
+
+const END_LANDED: Ending = (CARRIED_DONE, "nothing typed: under Land, its task landed");
+
+const END_HELD: Ending = (
+    CARRIED_HELD,
+    "nothing typed: Cruise stopped for replies that repeat with no work",
+);
+
+/// [`resume_as`], and the kind of the row owed to an agent it adopted that no step had adopted
+/// ([`unadopted`]): `upgrade` for an upgrade, else `carry-on`; `None` when it adopted no such
+/// agent. Under an `ended` the report is then that [`Ending`]'s, the adoption under it.
+fn resume_adopting(
+    opts: &Opts,
+    ended: Option<Ending>,
+    only: Option<upgrade::Agent>,
+) -> (Report, Option<&'static str>) {
     let tab = opts.only_sid.clone().unwrap_or_else(|| "-".to_string());
     let r = Report {
         pid: 0,
@@ -5251,10 +6080,10 @@ pub fn resume_as(opts: &Opts, done_under_land: bool, only: Option<upgrade::Agent
     };
     let _held = match sweep_lock(opts) {
         Ok(lock) => lock,
-        Err(why) => return said(r, format!("busy:{why}")),
+        Err(why) => return (said(r, format!("busy:{why}")), None),
     };
     let Some((session, mut st)) = owed_record(opts, only) else {
-        return said(r, "current");
+        return (said(r, "current"), None);
     };
     let mut r = Report {
         session: session.clone(),
@@ -5266,7 +6095,7 @@ pub fn resume_as(opts: &Opts, done_under_land: bool, only: Option<upgrade::Agent
         r.pid = st.resumed_pid;
         r.to = format!("{}({})", st.resumed_on, st.source);
         if looks_back(&st) {
-            return restore_look(
+            let looked = restore_look(
                 opts,
                 &r,
                 &mut st,
@@ -5276,15 +6105,18 @@ pub fn resume_as(opts: &Opts, done_under_land: bool, only: Option<upgrade::Agent
                 |c, pid, tab| process_in_tab(c, pid, tab, None, None),
             )
             .unwrap_or_else(|| said(r, "wait:restore"));
+            return (looked, None);
         }
-        return confirm(opts, &r, &mut st, &session, now_s())
-            .unwrap_or_else(|| said(r, "wait:model"));
+        let confirmed =
+            confirm(opts, &r, &mut st, &session, now_s()).unwrap_or_else(|| said(r, "wait:model"));
+        return (confirmed, None);
     }
-    let carry = Opts {
-        hand_back: done_under_land,
-        background: false,
-        ..opts.clone()
-    };
+    let owed = unadopted(&st).then_some(if st.is_upgrade() {
+        "upgrade"
+    } else {
+        "carry-on"
+    });
+    let carry = at_point(opts, &st, ended.is_some());
     let r = match st.agent {
         upgrade::Agent::Codex => {
             super::upgrade_drive::codex_carry_in_flight(&carry, r, st, &session)
@@ -5293,8 +6125,84 @@ pub fn resume_as(opts: &Opts, done_under_land: bool, only: Option<upgrade::Agent
         upgrade::Agent::Muse => super::upgrade_drive::muse_carry_in_flight(&carry, r, st, &session),
         upgrade::Agent::Agy => super::upgrade_drive::agy_carry_in_flight(&carry, r, st, &session),
     };
-    if done_under_land && r.step == "adopted" {
-        return carried_done(opts, r, &session);
+    let adopted = owed.filter(|_| r.step == "adopted");
+    if let Some(end) = ended
+        && r.step == "adopted"
+    {
+        return (carried_done(opts, r, &session, end), adopted);
+    }
+    (r, adopted)
+}
+
+/// The options [`resume_as`] carries `st` on with at the tab's loop's idle point. It hands the
+/// agent back (adopts it and types nothing) where the relaunch `ends` with nothing typed (a task
+/// done under Land, the stop), and for a relaunch no step adopted ([`unadopted`]): its own
+/// step (`wait:resume`, `wait:unanswered`, …) ended before the agent registered the conversation,
+/// so this idle point is the first step to see that agent, and it adopts it as that step would
+/// have ([`resume_at_point`] carries on at once).
+pub(in crate::harness) fn at_point(opts: &Opts, st: &St, ends: bool) -> Opts {
+    Opts {
+        hand_back: ends || unadopted(st),
+        background: false,
+        ..opts.clone()
+    }
+}
+
+/// Whether `st` is a relaunch in flight of a lane carried here ([`carried_here`]: Claude Code's)
+/// whose agent no step adopted yet: its line was typed ([`typed_recorded`] zeroes
+/// `relaunched_pid`), only an adoption sets it ([`await_held`]), and the step that typed it ended
+/// before the agent registered the conversation.
+fn unadopted(st: &St) -> bool {
+    carried_here(st.agent)
+        && matches!(st.phase, upgrade::Phase::Relaunched { .. })
+        && st.relaunched_pid == 0
+}
+
+/// [`resume_as`] at the tab's loop's idle point, each act's row said by `row` under its kind. A
+/// relaunch it adopts there ([`unadopted`]) gets the row its own step would have written (kind
+/// `upgrade` for an upgrade, else `carry-on`): an `adopted` row, which lifts the failure the
+/// relaunch followed and labels the restart. It is then carried on at once, at the same point,
+/// under kind `carry-on`, whose step is the one returned; at a task done under Land, that carry-on
+/// is the adoption's own [`CARRIED_DONE`], said after it.
+pub fn resume_at_point(
+    opts: &Opts,
+    done_under_land: bool,
+    only: Option<upgrade::Agent>,
+    row: impl FnMut(&str, &Report),
+) -> Report {
+    resume_ending_at_point(opts, done_under_land.then_some(END_LANDED), only, row)
+}
+
+/// [`resume_at_point`] where the stop holds the loop's typing ([`resume_held`]).
+pub fn resume_held_at_point(
+    opts: &Opts,
+    only: Option<upgrade::Agent>,
+    row: impl FnMut(&str, &Report),
+) -> Report {
+    resume_ending_at_point(opts, Some(END_HELD), only, row)
+}
+
+fn resume_ending_at_point(
+    opts: &Opts,
+    ended: Option<Ending>,
+    only: Option<upgrade::Agent>,
+    mut row: impl FnMut(&str, &Report),
+) -> Report {
+    let (r, adopted) = resume_adopting(opts, ended, only);
+    let Some(kind) = adopted else {
+        if r.is_act() {
+            row("carry-on", &r);
+        }
+        return r;
+    };
+    row(kind, &said(r.clone(), "adopted"));
+    let r = if ended.is_some() {
+        r
+    } else {
+        resume_as(opts, false, only)
+    };
+    if r.is_act() && r.step != "adopted" {
+        row("carry-on", &r);
     }
     r
 }
@@ -5302,7 +6210,10 @@ pub fn resume_as(opts: &Opts, done_under_land: bool, only: Option<upgrade::Agent
 /// The word of a relaunch carried on with nothing because its task landed under Land ([`resume_as`]).
 pub const CARRIED_DONE: &str = "done:said-done";
 
-fn carried_done(opts: &Opts, r: Report, session: &str) -> Report {
+/// The word of a relaunch carried on with nothing because the stop holds ([`resume_held`]).
+pub const CARRIED_HELD: &str = "done:replies-held";
+
+fn carried_done(opts: &Opts, r: Report, session: &str, (word, why): (&str, &str)) -> Report {
     let Some(mut st) =
         load(opts, session).filter(|st| matches!(st.phase, upgrade::Phase::Relaunched { .. }))
     else {
@@ -5310,25 +6221,8 @@ fn carried_done(opts: &Opts, r: Report, session: &str) -> Report {
     };
     st.phase = upgrade::Phase::Done;
     st.done_at = now_s();
-    let why = "nothing typed: under Land, its task landed";
-    st.outcome = match st.agent {
-        upgrade::Agent::Claude => {
-            format!("claude restarted on {} · {why}", one_line(&st.to))
-        }
-        upgrade::Agent::Codex => format!(
-            "codex on {} · the same conversation resumed; {why}",
-            one_line(&st.to)
-        ),
-        upgrade::Agent::Muse => format!(
-            "muse on {} · the same conversation resumed; {why}",
-            one_line(&st.to)
-        ),
-        upgrade::Agent::Agy => format!(
-            "agy on {} · the same conversation resumed; {why}",
-            one_line(&st.to)
-        ),
-    };
-    let r = said(r, CARRIED_DONE);
+    st.outcome = nothing_typed(st.agent, &st.to, why);
+    let r = said(r, word);
     ledger(opts, &r, &st.outcome);
     save(opts, session, &st);
     r
@@ -5390,10 +6284,15 @@ pub fn settle(opts: &Opts) -> Report {
     let r = if resumes_quietly(&st) {
         done_quietly(opts, r, &mut st, &session, &sf.version, sf.pid)
     } else {
-        let ours = conversation_typed_by(opts, &tab, &session, &st);
+        let ours = match conversation_typed_by(opts, &tab, &session, &st) {
+            Ok(ours) => ours,
+            Err(_) => return said(r, WAIT_LEDGER_EVIDENCE),
+        };
         let written = WhereWritten::new(opts, &records, &session, &ours);
-        let Some((word, why)) = nothing_owed(opts, &written, &tab, &st) else {
-            return said(r, "wait:owed");
+        let (word, why) = match nothing_owed(opts, &written, &tab, &st) {
+            Ok(Some(nothing)) => nothing,
+            Ok(None) => return said(r, "wait:owed"),
+            Err(_) => return said(r, WAIT_LEDGER_EVIDENCE),
         };
         done_with_nothing(opts, r, &mut st, &session, word, why, &sf.version, sf.pid)
     };
@@ -5419,8 +6318,9 @@ pub(super) fn settle_look(
     let records = st.agent_records(&opts.home);
     if alive(st.resumed_pid) && look_warned(&records, key, st) {
         return Some(match told_nothing(opts, &records, key, st) {
-            Some(why) => restore_lost(opts, r, st, key, why),
-            None => said(r.clone(), "wait:owed"),
+            Ok(Some(why)) => restore_lost(opts, r, st, key, why),
+            Ok(None) => said(r.clone(), "wait:owed"),
+            Err(_) => said(r.clone(), WAIT_LEDGER_EVIDENCE),
         });
     }
     restore_look(opts, r, st, key, now, None, |_, _, _| false)
@@ -5644,6 +6544,26 @@ pub fn driver_hand(status: &str) -> bool {
                 || hand
                     .strip_prefix("turn:")
                     .is_some_and(|turn| turn.contains(':'))
+        })
+    })
+}
+
+/// Whether one `status` reply names a hand [`driver_hand`] counts whose holder (percent-decoded) is
+/// no window host's ([`super::upgrade_drive::is_host_holder`]): a person's drive or another
+/// program's, which another `aterm harness` process's own lease (`aterm harness upgrade`'s) is not.
+#[must_use]
+pub fn outside_hand(status: &str) -> bool {
+    status.split_whitespace().any(|t| {
+        t.strip_prefix("hand=").is_some_and(|hand| {
+            hand.strip_prefix("lease:")
+                .or_else(|| {
+                    hand.strip_prefix("turn:")
+                        .and_then(|turn| turn.split_once(':'))
+                        .map(|(_, holder)| holder)
+                })
+                .is_some_and(|holder| {
+                    !super::upgrade_drive::is_host_holder(&aterm_codec::pct::decode(holder))
+                })
         })
     })
 }

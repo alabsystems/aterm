@@ -5,6 +5,7 @@
 # paper arm: Sparkle Words reaching the supernova.
 
 foreach-scheme light {
+  scale 2
   grid 16 90
   style rainbow kitty
   hz 60

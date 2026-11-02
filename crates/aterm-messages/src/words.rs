@@ -46,11 +46,25 @@ pub fn stamp_words(at_unix_ms: u64) -> String {
 /// When `at` was on the reader's local clock ([`day_heading`], [`stamp_words`]).
 #[must_use]
 pub fn local_words(now_unix_ms: u64, at_unix_ms: u64, offset_s: i64) -> String {
-    let local = |ms: u64| {
+    local_words_at(now_unix_ms, offset_s, at_unix_ms, offset_s)
+}
+
+/// [`local_words`], with `now_unix_ms` at `now_offset_s` and `at_unix_ms` at `at_offset_s`.
+#[must_use]
+pub fn local_words_at(
+    now_unix_ms: u64,
+    now_offset_s: i64,
+    at_unix_ms: u64,
+    at_offset_s: i64,
+) -> String {
+    let local = |ms: u64, offset_s: i64| {
         u64::try_from((i64::try_from(ms / 1000).unwrap_or(i64::MAX)).saturating_add(offset_s))
             .unwrap_or(0)
     };
-    let (at, now) = (local(at_unix_ms), local(now_unix_ms));
+    let (at, now) = (
+        local(at_unix_ms, at_offset_s),
+        local(now_unix_ms, now_offset_s),
+    );
     let (at_day, now_day) = (at / 86_400, now / 86_400);
     let clock = twelve_hour(at % 86_400, true);
     let day = match now_day.checked_sub(at_day) {
@@ -93,6 +107,17 @@ pub fn spoken_relative_words(now_unix_ms: u64, at_unix_ms: u64) -> String {
 /// [`day_heading`]).
 #[must_use]
 pub fn words_change_after(now_unix_ms: u64, at_unix_ms: u64, offset_s: i64) -> u64 {
+    words_change_after_at(now_unix_ms, offset_s, at_unix_ms, offset_s)
+}
+
+/// [`words_change_after`], with `now_unix_ms` at `now_offset_s` and `at_unix_ms` at `at_offset_s`.
+#[must_use]
+pub fn words_change_after_at(
+    now_unix_ms: u64,
+    now_offset_s: i64,
+    at_unix_ms: u64,
+    at_offset_s: i64,
+) -> u64 {
     let ago = now_unix_ms.saturating_sub(at_unix_ms);
     let next =
         |unit: u64| at_unix_ms.saturating_add((ago / unit).saturating_add(1).saturating_mul(unit));
@@ -104,8 +129,8 @@ pub fn words_change_after(now_unix_ms: u64, at_unix_ms: u64, offset_s: i64) -> u
         next(MS_PER_DAY)
     };
     let (day, today) = (
-        local_day(at_unix_ms, offset_s),
-        local_day(now_unix_ms, offset_s),
+        local_day(at_unix_ms, at_offset_s),
+        local_day(now_unix_ms, now_offset_s),
     );
     let turn = match today.saturating_sub(day) {
         i64::MIN..=0 => Some(today.max(day).saturating_add(1)),
@@ -121,7 +146,7 @@ pub fn words_change_after(now_unix_ms: u64, at_unix_ms: u64, offset_s: i64) -> u
         }
     };
     let midnight = turn.map_or(u64::MAX, |turn| {
-        let secs = turn.saturating_mul(86_400).saturating_sub(offset_s);
+        let secs = turn.saturating_mul(86_400).saturating_sub(now_offset_s);
         u64::try_from(secs).unwrap_or(0).saturating_mul(1000)
     });
     age_words.min(midnight)
@@ -219,7 +244,7 @@ fn weekday(day: i64) -> &'static str {
         "Saturday",
         "Sunday",
     ];
-    WEEKDAYS[usize::try_from((day + 3).rem_euclid(7)).unwrap_or(0)]
+    WEEKDAYS[usize::try_from((day.rem_euclid(7) + 3) % 7).unwrap_or(0)]
 }
 
 /// The words a past local day `day` may take, read on local day `today`, where no header names
@@ -266,7 +291,7 @@ pub(crate) fn date_words(at_unix_ms: u64) -> String {
 /// Days since 1970-01-01 → proleptic-Gregorian `(year, month, day)`.
 #[inline]
 const fn civil_from_days(days: u64) -> (u64, u64, u64) {
-    let z = days + 719_468;
+    let z = days.saturating_add(719_468);
     let era = z / 146_097;
     let doe = z - era * 146_097;
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
@@ -290,10 +315,16 @@ const fn days_from_civil(year: u64, month: u64, day: u64) -> u64 {
     };
     let era = y / 400;
     let yoe = y - era * 400;
-    let mp = if month > 2 { month - 3 } else { month + 9 };
-    let doy = (153 * mp + 2) / 5 + day - 1;
+    let mp = if month > 2 {
+        month - 3
+    } else {
+        month.saturating_add(9)
+    };
+    let doy = (153u64.saturating_mul(mp).saturating_add(2)) / 5 + day.saturating_sub(1);
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    (era * 146_097 + doe).saturating_sub(719_468)
+    era.saturating_mul(146_097)
+        .saturating_add(doe)
+        .saturating_sub(719_468)
 }
 
 /// `v` in decimal, zero-padded to at least `width` digits.
@@ -581,6 +612,9 @@ mod tests {
         assert_eq!(clock_words(noon, 0), "12:00 PM");
         assert_eq!(clock_words(noon, -12 * 3600 - 60), "11:59 PM");
         assert_eq!(clock_words(noon + 9 * 60_000, 9 * 3600), "9:09 PM");
+        assert_eq!(day_heading(i64::MAX, i64::MAX, false), "Today");
+        assert!(!day_heading(i64::MAX, i64::MAX - 2, false).is_empty());
+        assert!(!day_forms(i64::MAX, i64::MAX - 3).is_empty());
     }
 
     #[test]

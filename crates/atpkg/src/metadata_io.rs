@@ -128,6 +128,64 @@ pub(crate) fn read_head(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
     Ok(head)
 }
 
+/// Reduce a regular file one bounded UTF-8 line at a time. The admitted handle's initial
+/// length bounds total IO; growth, truncation and overlong records refuse instead of returning
+/// a partial answer. `visit` returns false once its leading evidence is complete. The caller
+/// owns any accumulated output, whose size may be proportional to the number of records.
+pub(crate) fn read_regular_lines(
+    path: &Path,
+    line_bytes: usize,
+    mut visit: impl FnMut(&str) -> io::Result<bool>,
+) -> io::Result<()> {
+    use std::io::BufRead as _;
+    let file = open_regular(path)?;
+    let before = file.metadata()?;
+    let budget = before
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| too_large(usize::MAX))?;
+    let line_budget = u64::try_from(line_bytes)
+        .unwrap_or(u64::MAX)
+        .checked_add(1)
+        .ok_or_else(|| too_large(line_bytes))?;
+    let mut reader = std::io::BufReader::new(file.take(budget));
+    let mut seen = 0_u64;
+    let mut eof = false;
+    loop {
+        let mut bytes = Vec::new();
+        let count = std::io::Read::by_ref(&mut reader)
+            .take(line_budget)
+            .read_until(b'\n', &mut bytes)?;
+        seen = seen
+            .checked_add(u64::try_from(count).unwrap_or(u64::MAX))
+            .ok_or_else(|| too_large(line_bytes))?;
+        if count > line_bytes || seen > before.len() {
+            return Err(too_large(line_bytes));
+        }
+        if count == 0 {
+            eof = true;
+            break;
+        }
+        let line = std::str::from_utf8(&bytes)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if !visit(line)? {
+            break;
+        }
+    }
+    let file = reader.into_inner().into_inner();
+    let after = file.metadata()?;
+    if after.len() != before.len()
+        || (eof && seen != before.len())
+        || after.modified().ok() != before.modified().ok()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "package metadata changed while it was read",
+        ));
+    }
+    Ok(())
+}
+
 /// Read one admitted metadata file and require complete UTF-8.
 pub(crate) fn read_bounded_regular_utf8(path: &Path, limit: usize) -> io::Result<String> {
     String::from_utf8(read_bounded_regular(path, limit)?).map_err(|error| {
@@ -192,6 +250,32 @@ mod tests {
         let error = read_bounded_regular(&over, 8).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn line_reduction_bounds_records_and_detects_changes_after_partial_observation() {
+        let root = fixture("line-reduction");
+        let path = root.join("records");
+        std::fs::write(&path, b"one\ntwo\n").unwrap();
+        let mut names = Vec::new();
+        read_regular_lines(&path, 4, |line| {
+            names.push(line.trim().to_string());
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(names, ["one", "two"]);
+        assert!(read_regular_lines(&path, 3, |_| Ok(true)).is_err());
+        std::fs::write(&path, [b'o', b'k', b'\n', 0xff]).unwrap();
+        assert!(read_regular_lines(&path, 4, |_| Ok(true)).is_err());
+        std::fs::write(&path, b"one\ntwo\n").unwrap();
+        assert!(
+            read_regular_lines(&path, 4, |_| {
+                std::fs::write(&path, b"replacement is larger\n")?;
+                Ok(false)
+            })
+            .is_err(),
+            "even a completed prefix is refused if its admitted file changes"
+        );
     }
 
     #[cfg(unix)]

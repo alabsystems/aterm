@@ -373,6 +373,47 @@ fn a_host_that_cannot_start_one_claims_none_and_the_owner_is_needed_spawn_ms_aft
 }
 
 #[test]
+fn only_the_host_that_found_a_worker_due_or_its_end_clears_the_clock_the_owner_waits_on() {
+    let (h1, h2) = (host(1), host(2));
+    let mut lease = Lease::default();
+    let mut unable = At::short(&h1);
+    unable.worker_ok = false;
+    let (due_at, _) = out(&mut lease, &unable);
+    assert_eq!(entry(&lease).due_ms, Some(due_at));
+    let mut unpassed = At::short(&h2);
+    unpassed.done = None;
+    unpassed.worker_ok = false;
+    let later = due_at + 60_000;
+    assert_eq!(unpassed.look(&mut lease, later).1, None);
+    assert_eq!(
+        entry(&lease).due_ms,
+        Some(due_at),
+        "a host whose own pass is not done wants no worker, and keeps the other's clock"
+    );
+    assert!(
+        unable.needed(&lease, due_at + SPAWN_MS),
+        "the clock ran on through the other host's looks"
+    );
+    unpassed.dead.push(h1.pid);
+    assert_eq!(unpassed.look(&mut lease, later + 60_000).1, None);
+    assert_eq!(
+        (entry(&lease).due_ms, entry(&lease).due_host.as_ref()),
+        (None, None),
+        "the host that found it due ended: any look clears it"
+    );
+    let (mut fresh, mut unable) = (Lease::default(), At::short(&h1));
+    unable.worker_ok = false;
+    let (due_at, _) = out(&mut fresh, &unable);
+    unable.done = None;
+    assert_eq!(unable.look(&mut fresh, due_at + 60_000).1, None);
+    assert_eq!(
+        entry(&fresh).due_ms,
+        None,
+        "the host that found it due clears it when its own reading wants none"
+    );
+}
+
+#[test]
 fn rounds_wait_while_the_worker_works_and_elect_again_once_it_is_over() {
     let h = host(1);
     let mut lease = Lease::default();

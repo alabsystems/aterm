@@ -1,7 +1,7 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-core: spec recovery from its 1364 unit tests
+# aterm-core: spec recovery from unit tests
 
 > Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 405 tests
 > it deleted and the 10 vi copy-mode specs whose functions it deleted are gone. The §1 kind and gap
@@ -10,6 +10,17 @@
 
 > 2026-10-27: `terminal-host-adapter` is gone with the `aterm_types::terminal_host` traits it described
 > (no crate called them); the kind and gap tables drop it, so they count 292.
+
+> 2026-10-30, input review (DECDWL x DECSLRM autowrap hang): `decslrm-run-wraps-at-the-right-margin` now says where a
+> wrap lands on a double-width row, min(L, cols/2 − 1) as a line feed would, where it used to skip a row whose half ends
+> left of L, and that a run from right of R goes on at L (the row said column 0, which the code never did). The three
+> tests of `tests/double_width_margin_wrap.rs` are mapped in §2; the counts in §3 predate them.
+
+> 2026-10-30, decoder review IMG-INFLATE: `kitty-frames` says a compose checks its arguments before it decodes
+> a frame, and a PNG frame a compose or a frame load reads is decoded once and stored as RGBA8 with its pixels,
+> placements and animation clock unchanged (one that does not decode keeps its bytes and is refused without a
+> second decode); `kitty-store-budget` charges the decoded frame. Four tests are mapped in §2. The counts in these
+> headers predate them.
 
 > 2026-10-29, ATERM-KI-1029-1: `program-state-turn-edges` (`ProgramStateReport::turn_edges`, the newest four turns
 > the OSC 7501 reports drew, each edge dated at its parse batch's injected wall clock) is added with its three tests
@@ -102,73 +113,70 @@ or listed in §4.
 
 ## 0. Notation used in the statements
 
-- Paths. Test ids in §2 and §4 are relative to `crates/aterm-core/` (`src/...`, `tests/...`,
-  `test_support/...`); every path is spelled out.
+- Test ids: `file`, relative to `crates/aterm-core/`, and `test`, with any module prefix.
 - `Reach`: the Terminals reachable from `Terminal::new(r,c)` (r,c ≥ 1), `Terminal::with_scrollback`,
   `TerminalBuilder::build`, `from_checkpoint` or `restore_checkpoint` by any sequence of public calls:
   `process`, `process_at`, `resize`, `resize_with_policy`, `resize_offloading_scrollback` +
   `finish_resize_offload`, `scroll_display`, `apply_config`, `apply_policy_engine`, the host setters
   (`set_default_*`, `set_palette_*`, `authorize_*`, `revoke_*`, `set_*_callback`,
-  `set_console_host_posture`, `set_kitty_keyboard_enabled`), `leave_alternate_screen`, `reset`,
-  `take_damage`, `take_response`, `cell_frame*`, `search*`, `watch*`. A statement written "∀ T" ranges
-  over `Reach`.
-- Feeding bytes. `process(T,x)`, `feed(T,x)` and `step(T,x)` are the same thing. `process_at(T,x,c)`
-  (also written `Batch(T,x,c)`) takes an injected `ClockReading c`; `process(x) = process_at(x, now)`.
-- `Resp(T)` = `T.take_response()`. `DECRQM(T,m)` = `Resp(process(T, CSI ? m $ p))`.
+  `set_console_host_posture`, `set_win32_input_enabled`, `set_kitty_keyboard_enabled`),
+  `leave_alternate_screen`, `reset`, `take_damage`, `take_response`, `cell_frame*`, `search*`, `watch*`.
+- `feed(T,x)` = `process(T,x)` = `process_at(T,x,now)`; `process_at(T,x,c)` takes an injected
+  `ClockReading c`. `DECRQM(T,m)` = `take_response()` after `process(T, CSI ? m $ p)`.
 - `Inv(T)`: rows, cols > 0, cursor.row < rows, cursor.col ≤ cols (col = cols is the pending-wrap
-  column), and the aterm-grid checks `assert_structural_invariants` (cursor, scroll region, ring,
-  KeysCoverRetained), `assert_wide_char_consistent` and `assert_extras_claimed`.
+  column), and aterm-grid's `assert_structural_invariants`, `assert_wide_char_consistent` and
+  `assert_extras_claimed` pass.
 - `ObsFull(T)` = `checkpoint(T)`, every visible cell's packed bits and resolved extras (combining,
   cluster, link, underline colour, image layers, resolved fg/bg), every row's len and text, the cursor,
-  pending wrap, title, the alt archive read, and the concatenated replies. `Obs(T)` is the visible grid
-  + cursor + modes + keyboard and mouse state + both scrollbacks + title/icon/cwd. `ObsH` (handoff) is
-  defined in `checkpoint-carry-continues`.
+  pending wrap, title, the alt archive read, and the concatenated replies. `checkpoint-carry-continues`
+  defines `ObsH`.
 - `Abs(T,r)`: the content of absolute row key `r` (history from `oldest_absolute_row()`, then the
-  viewport). `H(T)` = `scrollback_lines()`, `R`/`C` = rows/cols, `d` = `display_offset()`.
+  viewport).
 - `LL(T)`: the logical lines (history oldest first, then the screen, wrapped rows joined). A recorded
   early-wrap hole is dropped; any other cell, a printed blank included, is kept.
-- `HP(T)`: the host-policy modes `reset_modes` copies (osc52 query/set, window ops, notifications,
-  palette reconfigure, require nonce, kitty keyboard enabled, win32 input enabled, ambiguous width,
-  colour scheme).
+- `HP(T)`: the host-policy modes `reset_modes` carries over.
 - `Carry(T,n)` = `checkpoint_carry(T,n)` or the first half of `checkpoint_carry_abandoning_partial`;
   `Adopt(S,cp)` = `restore_checkpoint(S,cp)` or `from_checkpoint(cp)`.
-- `ConsoleHost(T)` ⇔ the ConPty resize posture (`win32_input_enabled`). `REPORTED` = the domain on which
-  `handle_decrqm` answers 1 or 2 (read from the function, not from a hand-kept list).
+- `ConsoleHost(T)` ⇔ `modes.win32_input_enabled`, which only the host sets (`set_console_host_posture`
+  with `ResizePolicy::ConPty`, or `set_win32_input_enabled`); a program's `?9001h` does not.
+  `REPORTED`: the modes `handle_decrqm` answers 1 or 2 for, read from the function.
 - Character classes: C0 = U+0000..001F, C1 = U+0080..009F, BIDI9 = U+202A..202E and U+2066..2069.
-- `FullRender(T)` = `T.cell_frame(rows, cols)` compared by RenderInput's content-only `PartialEq`.
-  `Content(f)` is the field tuple that `PartialEq` names; frame rows are ragged (only the written prefix).
-- Content-scroll signals: `CSS` = `ContentScrollState{uniform_up_rows, invalidation_epoch, band_batches,
-  band_seq, bands[16]}`; `U, δ, F, B` = the grid's drained selection update, scroll delta, coordinates
+- `FullRender(T)` = `T.cell_frame(rows, cols)`, compared by RenderInput's content-only `PartialEq`;
+  frame rows are ragged (only the written prefix).
+- Content-scroll signals: `U, δ, F, B` = the grid's drained selection update, scroll delta, coordinates
   flag and row band moves; `ΔX` = the change of field X across one batch.
-- Alt-archive scroll model: a transcript T of rows shown through a viewport of height t at top v_k,
+- Alt-archive scroll model: a transcript T of rows shown through a viewport of height t at top v_k, with
   optional fixed header rows above and chrome rows below. Steps are appends, scroll-backs and -forwards,
-  jumps, in-place edits, resizes, blank screens, leave and enter. An anchor row has ≥ MIN_ANCHOR_CHARS
-  visible chars and is distinct in the transcript.
+  jumps, in-place edits, resizes, blank screens, leave and enter. An anchor row has ≥ `MIN_ANCHOR_CHARS`
+  visible chars, not all rule or box art, and is distinct in the transcript.
 - `KittyModel`: images id → (first-sent seq, frames, gaps, animation state, loops), placements
   (image, placement id) → (anchor | virtual | relative(parent, dx, dy), layout, z, seq), number → id, the
-  pending chunk and the byte total. Kitty specs are refinements of it.
+  pending chunk and the byte total.
 - `Conhost(T, r', c')`: a model of conhost's resize (the old viewport kept row-0-anchored, rewrapped at
-  c', conhost's demotion rule, conhost's CUP). It must be authored with `ty_model!`.
-- Repaint nudge: `NudgeRun` = `arm`/`step`/`let_go` over Facts with nondecreasing `now_ms`; the host
-  applies Hold as pty := (engine.rows−1, cols) and Release as pty := engine.
+  c', conhost's demotion rule, conhost's CUP). It is not written yet; it is to be a `ty_model!`.
+- Repaint nudge: the host applies `Hold` as pty := (engine.rows−1, cols) and `Release` as pty := engine.
 - "refines M": the stated projection of every reachable real state is a state of the `ty_model!` model M
   (`aterm_spec::derive`), each real step is admitted as the named action, and M's `Buggy` members are
   rejected (the negative control).
 - Kinds: contract (requires/ensures), invariant (type or trace invariant over Reach), equivalence (two
   functions or two paths agree), refinement (code refines a model), round-trip, table-property (decidable
-  by evaluating a finite table), no-panic, other (cost, call-graph, purity, cross-crate composition).
-- Gaps: numbers are the rows of §7 in the historical development audit
-  `docs/AUDIT-trust-for-test-migration-2026-10-15.md`.
-  Gap 0 (a seal that publishes Clean rows) blocks every spec and is not repeated per row. Floating-point
-  specs have no row of their own; they are filed under 3 and 6.
-- Six specs (`gr-*`, `sx-*`, `width-table-ucd`, parts of `key-encoding-composition`) are about code in
-  aterm-grapheme, aterm-sixel or aterm-types that aterm-core's tests exercise. They are listed here
-  because the tests live here; their proofs belong to those crates.
+  by evaluating a finite table), no-panic, other (cost, call graph, purity, cache-key soundness,
+  cross-crate composition).
+- Gaps: the rows of §7 of `docs/AUDIT-trust-for-test-migration-2026-10-15.md`. 1 non-scalar carriers and
+  content models, 2 certified `&self`/`&mut self` views and two-state, 3 E6 body widening,
+  4 callee-ensures composition, 5 quantified clauses, 6 plain-Rust clause publication, 7 loops, 8 effects,
+  9 proc-macro boundary, 10 model→code refinement surface, 11 generics, 12 cross-crate theorem citation,
+  13 threads, async and closures, 16 soundness. Gap 0 (a seal that publishes Clean rows) blocks every
+  spec and is not listed. Floating-point specs are filed under 3 and 6.
+- Ownership: `gr-*`, `sx-*`, `width-table-ucd` and parts of `key-encoding-composition` are about
+  aterm-grapheme, aterm-sixel and aterm-types code, and their proofs belong to those crates. No test in
+  §2 samples `gr-*` or `sx-*`; aterm-grapheme and aterm-sixel own those tests.
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `blocking_gaps` (audit §7; gap 0 implied), `tests`
-(primary / total that sample it; the list is in §2), `difficulty` (Rust features the proof must handle).
+Columns: `id`, `kind`, `functions`, `statement`, `blocking_gaps` (§0; gap 0 implied), `tests` (primary /
+total that sample it, counted when the row was written; §2 is the current list), `difficulty` (Rust
+features the proof must handle).
 
 ```tsv
 id	kind	functions	statement	blocking_gaps	tests	difficulty
@@ -285,12 +293,12 @@ kitty-delete-semantics	contract	delete_kitty_placements (handler_actions.rs), ki
 kitty-chunked-load-lifecycle	contract	kitty APC handler: chunked load state (m=1/m=0), OSC 133/633 A and C	A first chunk with m=1 opens a load iff kitty would hold it in flight (an accepted direct-medium transmit, query or frame load; not a frame for an absent image, a query with no i=, both i= and I=, raw pixels with no area, or a side over the limit); any other m=1 command runs at once and opens nothing. An open load assembles across unrelated output and final chunks repeating the first chunk's keys. It ends at an OSC 133/633 A or C, at a delete (which runs), and at a command on another medium (which is answered). A put mid-load is drawn and the load goes on. A command refused before routing is answered and leaves the load in flight. The final answer honours the q= of its chunks. Without an ending event, the next complete command is taken as the final chunk and draws nothing.	1,2,3,5,7	8/8	Option<PendingLoad> state machine with Vec<u8>, key parsing, base64
 kitty-payload-source	contract	kitty data load (medium, o=z inflate, raw length check), Terminal::{set_kitty_file_resolver,host_io_ordinal}	data = (t=d) the base64 payload | (t ∈ {f,t,s} ∧ a resolver installed) resolver(medium, path) | otherwise refused with no host read. If o=z the data must zlib-inflate, else refused. Raw f=24/32 must have length s·v·bpp, else refused. f=100 is read as PNG. A refused transmit places and stores nothing and leaves host_io_ordinal() unmoved; a non-direct load that builds an image (and an answered OSC 52 ; ? query or non-empty WindowCallback response) advances host_io_ordinal(), which RIS preserves.	1,2,4,12,13	6/6	boxed FnMut resolver, AtomicU64 loaded counter, zlib inflate (aterm_codec), Result
 kitty-reply-protocol	contract	kitty reply writer, Terminal::take_response	The reply to a Kitty command is None if it names neither i= nor I=, or q=2, or (q=1 ∧ OK), or a=d, or (a=a ∧ the image exists). Otherwise it is ESC _ G i=<id>[,I=<n>][,p=<pid>][,r=<frame>] ; <OK | ECODE:msg> ESC \, where id is assigned by the terminal for an I= transmit, r= is echoed only when given (the new frame's number for a=f), and ECODE ∈ {ENOENT, EINVAL, ENOSPC, ENOPARENT, ECYCLE, ETOODEEP, EBADPNG, ENOTSUPPORTED} is the model's refusal reason. a=q answers OK for t=d, and for t ∈ {f,t,s} OK iff a resolver is installed else ENOTSUPPORTED; a transmit over a disabled medium gets the probe's verdict; i= with I= is EINVAL.	1,2,3,4,5	6/6	String formatting into the response Vec, enum outcomes
-kitty-store-budget	invariant	kitty store insert/delete, RIS, put variant cache	kitty_total_bytes = Σ payload bytes over stored images, every frame and every live put variant (a base transmit charges two slots, a frame one), and ≤ MAX_KITTY_STORE_BYTES. A transmit that would exceed the cap is refused with store and counter unchanged; deleting frees exactly the freed slots; d=A and RIS empty the store, frames and pending chunk and zero the counter. Put variants per id ≤ MAX_KITTY_VARIANTS; an unshown variant is recycled; a new one with MAX_KITTY_VARIANTS shown is ENOSPC.	1,2,5,7	5/5	type invariant over HashMaps of Arc<Image> and Vec frames
+kitty-store-budget	invariant	kitty store insert/delete, RIS, put variant cache	kitty_total_bytes = Σ payload bytes over stored images, every frame and every live put variant (a base transmit charges two slots, a frame one), and ≤ MAX_KITTY_STORE_BYTES. A transmit that would exceed the cap is refused with store and counter unchanged; a PNG frame stored decoded for a compose or a frame load is charged w·h·4 in each slot that holds it, and the command answers ENOSPC, decoding nothing, when that would not fit; deleting frees exactly the freed slots; d=A and RIS empty the store, frames and pending chunk and zero the counter. Put variants per id ≤ MAX_KITTY_VARIANTS; an unshown variant is recycled; a new one with MAX_KITTY_VARIANTS shown is ENOSPC.	1,2,5,7	5/5	type invariant over HashMaps of Arc<Image> and Vec frames
 kitty-placement-layout	contract	kitty placement layout (footprint, scaling, offsets, crop), cursor policy after placement	For raster (w,h), cell (cw,ch) and keys c,r,X,Y,x,y,w',h': the source is the crop if given (a crop missing the raster is EINVAL). Neither c nor r: footprint = (⌈(src_w+X')/cw⌉, ⌈(src_h+Y')/ch⌉), scaling PixelExact; both: (c,r), Fit; one: the other follows the aspect ratio as kitty computes it. c=0/r=0 are unset; X' = min(X,cw−1), Y' = min(Y,ch−1); sums saturate and clamp to the grid. A virtual placement (U=1) gets no offset and stamps no cell. A put's own keys lay out the image; a key-less put shows the stored Arc; an identical put reuses its variant. Cursor: C=1 or U=1 leaves it; otherwise (row+rows−1, col+cols), or the next line's column 0 when past the right margin.	1,2,3,5,12	7/7	u32 saturating ceil-div, Option keys, Arc::ptr_eq reuse
 kitty-layer-order	invariant	kitty layer stacking in cell extras, Terminal::{images_row,cell_frame}	The Kitty layers covering a cell, bottom first, are sorted by (z, image first-sent seq, placement seq). A put equal to an existing unnamed placement of the same image (same cell, footprint and layout; only the crop corner may differ) replaces it and its relatives follow; a differing put stacks. A non-Kitty image takes the cell whole. Floating placements ≤ MAX_KITTY_FLOATING (ENOSPC past it). A frame carries each cell's top MAX_IMAGE_LAYERS layers. The order survives scrolling into history and back.	1,2,5,7,12	4/4	sorted Vec insert in a CellExtra, capped Vec
 kitty-relative-placements	contract	kitty relative placement (P=/Q=/H=/V=), kitty_floating, kitty_relations	A put with P=p,Q=q is placed at anchor(p,q) + (V,H) and leaves the cursor; for a virtual parent the anchor is the (top row, leftmost column) of its placeholders on screen, recomputed each frame (none on screen: kept but drawn nowhere). Moving the parent moves its descendants; deleting it deletes them, freeing images left with no placement. Refusals change nothing: missing parent ENOPARENT, a cycle ECYCLE, a relative virtual placement EINVAL, depth > MAX_KITTY_RELATIVE_DEPTH ETOODEEP.	1,2,5,7,10	3/3	relation graph (HashMap), bounded chain walk, placeholder scan
 kitty-placeholder-resolution	contract	kitty_placeholder::decode_cell, render_cells::images_row_into	decode_cell = None unless the cell's char is U+10EEEE. Otherwise image_id = (dv(mark2)&0xFF)<<24 | fg_id (RGB fg packs r<<16|g<<8|b, indexed fg is its index, default 0), placement_id = the underline colour index, else its RGB id, else 0, and (row,col) = (dv(mark0), dv(mark1)) with missing or unknown marks 0. At render the placeholder draws tile (row,col) of that virtual placement; placement_id = 0 picks the newest; an unknown placement or image draws nothing; the tile uses that placement's own box.	1,3,4,12	3/3	&Grid reads, Option chaining, u32 bit ops
-kitty-frames	refinement	kitty a=f / a=a / a=c / d=f, compose_rgba	Frames refine KittyModel.frames. a=f with r absent (or past the end) appends; r=k edits frame k in place (r=1 is the root). Data is composed at (x,y) over transparent black, frame c, or the Y= background, X=1 overwriting instead of blending; the frame takes the root's layout; the reply names r=. a=a c=k shows frame k in every placement, each keeping its layout, and damages every placeholder row naming the image. a=c copies rect (x,y,w,h) of frame r onto frame c (out of bounds or self-overlap EINVAL, missing frame ENOENT). PNG frames are decoded to RGBA. d=f r=k (absent → 1, past end → last) removes frame k, renumbers, refunds its bytes; the shown frame stays if it survives, else the frame now at its number (or the last); a lone frame is kept by d=f and d=F deletes the image. A refused a=f adds no frame.	1,2,4,5,7,10,12	7/7	Vec<Frame> remove/insert, Arc<Image> rebuild, PNG decode (aterm_png), damage marks
+kitty-frames	refinement	kitty a=f / a=a / a=c / d=f, compose_rgba	Frames refine KittyModel.frames. a=f with r absent (or past the end) appends; r=k edits frame k in place (r=1 is the root). Data is composed at (x,y) over transparent black, frame c, or the Y= background, X=1 overwriting instead of blending; the frame takes the root's layout; the reply names r=. a=a c=k shows frame k in every placement, each keeping its layout, and damages every placeholder row naming the image. a=c copies rect (x,y,w,h) of frame r onto frame c (out of bounds or self-overlap EINVAL, missing frame ENOENT), every argument checked against the frames' PNG headers before any frame is decoded. A PNG frame a compose or a frame load reads is decoded at most once per command and then stored as RGBA8, its pixels, its placements' pictures and the animation's clock unchanged; one that does not decode keeps its PNG bytes and every later read answers EBADPNG without decoding it again (until a restore, which forgets that). d=f r=k (absent → 1, past end → last) removes frame k, renumbers, refunds its bytes; the shown frame stays if it survives, else the frame now at its number (or the last); a lone frame is kept by d=f and d=F deletes the image. A refused a=f adds no frame.	1,2,4,5,7,10,12	7/7	Vec<Frame> remove/insert, Arc<Image> rebuild, PNG decode (aterm_png), damage marks
 kitty-animation-scheduler	contract	Terminal::{advance_kitty_animations,process_at}, HostOp::AdvanceKittyAnimations, kitty a=a s=/v=/z=	advance_kitty_animations(now) returns KittyAnimationStep::default() when no animation runs or every running one is drawn nowhere (including through a virtual parent). Otherwise for each running animation with frame f shown since t0: advanced ⇔ now ≥ t0+gap(f), then the next frame with a nonzero gap (wrapping to the root); next_frame_at = its shown-since + gap, and any call that advances a frame or increments a finite-loop counter appends HostOp::AdvanceKittyAnimations at ClockReading { monotonic: now, wall_ms: None } to the host journal. s=1 stops and holds, s=3 runs, s=2 rests on the last frame until a new one arrives, v=n bounds loops to n−1 passes, a new s= restarts the count, s=0 changes nothing. A drawn frame held by a renderer does not stop the store recycling a copy nothing shows.	1,2,5,7,8	5/5	Instant/Duration as inputs, HashMap iteration
 live-image-budget	invariant	image placement (Kitty, iTerm2, sixel) live-byte accounting per screen, place_sixel_image	For each screen (main, alt; parked or active), Σ payload bytes of the distinct Arc<Image> layers it shows ≤ MAX_LIVE_IMAGE_BYTES + the image just placed, and the image just placed is never evicted, including images the store does not keep or has freed or replaced behind a parked screen. An image larger than MAX_IMAGE_BYTES (e.g. a DECGRA-only sixel declaring 2100×2100) places no cells.	1,2,5,7	6/6	per-grid counters, Arc dedup, HashSet, main/alt swap, eviction loop
 kitty-command-parse	contract	kitty_graphics::{parse_kitty_command,KittyAction::from_char,nonzero}	parse_kitty_command(apc) = None ⇔ apc is empty or apc[0] ≠ 'G' or the control half (before the first ';') is not UTF-8. Otherwise the control is split on ',' into k=v pairs; each known key (a,f,t,i,I,p,s,v,c,r,x,y,w,h,X,Y,P,Q,H,V,z,m,o,q,C,U) takes its last value and others are ignored. Defaults: Transmit, Rgba, Direct, quiet 0, more false, compressed false. i,I,p,P,Q = 0 map to None, and P=0/Q=0 also drop H/V/X. payload = base64-decode(the rest), or [] if absent or undecodable.	1,3,5,7,12	12/12	from_utf8, split iterators, str::parse, ~30 Option fields, base64
@@ -304,7 +312,7 @@ image-retention-horizon	contract	Terminal::{scrollback_image_rows_dropped,scroll
 history-image-payload-shared	contract	Terminal::cell_frame, ImageRef, history materialization of image extras	All materialized tiles of one inline image scrolled into history and shown again have Arc::ptr_eq ImageRef.image; no tile copies the bytes.	1,2,3,12	1/1	Arc identity
 sixel-dcs-never-leaks-glyphs	contract	DCS q sixel hook (feature sixel) / DcsType::Unknown consume, Terminal::{images_row,visible_content}, DA1	For every DCS sixel string, well-formed or not, its payload bytes never become glyphs. With the sixel feature (DA1 advertises 4) a well-formed image is decoded and placed at the cursor row; without it the string is only consumed. The adversarial corpus is a sample of terminal-wf-invariant.	1,2,3,5,7,12	1/1	cfg(feature) branches, sixel decoder, DA1 bytes
 decslrm-validity	contract	DECSLRM (CSI Pl;Pr s under DECLRMM)	With DECLRMM set, defaults Pl=1, Pr=cols, l = Pl−1, r = min(Pr,cols)−1: if l < r the margins become (l,r) and the cursor goes home; otherwise margins and cursor are unchanged.	2,3,4,12	2/2	grid margins, u16 arithmetic
-decslrm-run-wraps-at-the-right-margin	contract	print writers (blast, styled, extras, splat, REP, print_unicode_bulk), DECSLRM/DECLRMM	With DECLRMM and margins [L,R], a run printed from column c ≤ R wraps at R and continues at L on the next row, on every writer; from c > R it wraps at the last column back to column 0. On a double-width row the limit is min(R, cols/2 − 1), and a glyph printed from a column past it (SU/SD scroll such a row under the cursor) wraps first, on every writer. So rows after the first hold no text right of R, the first ends exactly at R when c ≤ R, and DSR's cursor column is identical across writers and chunkings.	1,2,3,5,7	1/1	per-glyph vs per-run row limit, u16 arithmetic
+decslrm-run-wraps-at-the-right-margin	contract	print writers (blast, styled, extras, splat, REP, print_unicode_bulk), DECSLRM/DECLRMM, aterm_grid::Grid::advance_autowrap_line	With DECLRMM and margins [L,R], a run printed from column c ≤ R wraps at R, and one from c > R at the row's last column; either way it continues at L on the next row, on every writer. A wrap lands on a column its row has, as a line feed onto that row does: on a double-width row, with MC = cols/2 − 1, the limit is min(R, MC) and the landing column min(L, MC), so where the row's half ends left of L the next glyph prints on the row's last column, at any row, and the run goes on at L on the row after it (on such a row at the region bottom the cursor then sits left of the margins, where a wrap neither scrolls nor moves, so the run's later glyphs land on that column too). A wrap never leaves the cursor past a double-width row's half; a glyph printed from there (SU/SD scroll such a row under the cursor) wraps first, on every writer. So rows after the first hold no text right of R, the first ends exactly at R when c ≤ R, every writer finishes its run, and DSR's cursor column is identical across writers and chunkings.	1,2,3,5,7	1/1	per-glyph vs per-run row limit, landing clamp, u16 arithmetic
 damage-scope	contract	DECTCEM, DECSCUSR, mode 12, DECSCNM, 47/1047/1049 exit, handle_osc_10_11_12, handle_osc_19, Grid damage	A real cursor-appearance transition (DECTCEM, DECSCUSR, ?12) leaves non-empty, non-full damage containing the cursor's row and no other row, with damage_epoch + 1; a no-op transition adds none. A whole-screen change (DECSCNM, any alt-screen exit, an OSC dynamic-colour set or reset such as 11/19/119) marks full damage with damage_epoch + 1.	1,2,4,5,12	5/5	damage rows in aterm_grid, u64 epoch
 decrqm-mode-agreement	invariant	handle_decrqm, query_dec_mode, DECSET/DECRST handlers, DECRQSS ?m	For every m in REPORTED: DECRQM(T,m) = CSI ? m ; (state(T,m) ? 1 : 2) $ y, where state is the mode's observable effect (?67 ⇔ BACKARROW_SENDS_BS, ?12 ⇔ a blinking cursor style, ?2031/?2048/?1035/?1036/?1039/?1045/?9001 their flags). CSI ? m h/l sets or resets state subject to its precondition (3 needs 40; 9001 needs ConsoleHost). A permanently reset mode (2027) answers 4 and ?m h changes nothing; ?9001 without a console host answers 0. DECRQSS ?m answers 1$r?m(h|l) consistently.	1,2,3,4,5	6/6	match over u16 mode numbers, ~40 bools, response formatting
 xtsave-restore-roundtrip	equivalence	XTSAVE (CSI ? m s), XTRESTORE (CSI ? m r), query_dec_mode	For every m in REPORTED and every mode changes w that do not touch the save slot: DECRQM(feed(T, CSI?m s · w · CSI?m r), m) = DECRQM(T, m). The XTSAVE table covers exactly the DECRQM-reportable domain (stated over handle_decrqm's domain, not a hand-kept list).	1,2,4,5	2/2	save-slot map over modes, match over u16
@@ -371,7 +379,7 @@ watcher-seq-latch	refinement	Terminal::{watch,watch_poll,process_at,observe_at},
 watcher-idle-deadline	contract	Terminal::{watch,watch_expire,watch_next_deadline,process_at}	An IdleFor{dur} watcher armed at a has deadline D = max(a, the monotonic instant of the last later batch that changed key) + dur. Alt-screen output counts; content-less batches and arming other watchers do not (watch_next_deadline is unchanged by them). watch_expire(now) latches it iff now ≥ D, with Satisfaction.at = D, so a live wake and a lazy replay are byte-identical; never before D.	1,2,3,7,12	5/5	Instant/Duration values, max
 watcher-row-match	contract	Terminal::{watch_rows,watch_poll}, RowMatch::verdict	A row watcher latches at the first batch after arming that changes key and leaves some visible in-range row whose text p.verdict holds (the live screen's row, independent of the display offset), on either grid, including after an alt switch that restarts content_seq below the main watermark and an equal-seq re-entry in one batch or two.	1,2,3,5,7,12,13	2/2	Arc<dyn RowMatch>, row text extraction
 pb-bridge-decision-tree	contract	policy_bridge::{engine_decision,engine_decision_deny_by_default_capability,engine_decision_with_wildcard_execute_fallback,is_universal_wildcard_rule}	decision(None, s, o, w) = Fallback. Otherwise d = e.evaluate(s, o): no matched rule ⇒ Fallback; Execute ⇒ Fallback when w ∧ is_universal_wildcard_rule(the rule's sequence), else Allow; any other response ⇒ Deny. engine_decision uses w = false, the deny-by-default variant w = true. is_universal_wildcard_rule(x) ⇔ trim(x) = "*" ∨ its ASCII-whitespace tokens are [response, any] case-insensitively. Profile samples also need aterm_policy's evaluate spec and profile data.	1,3,4,12	9/9	Option<&PolicyEngine>, cross-crate evaluate, trim/split_ascii_whitespace
-pb-resolve-table	table-property	policy_bridge::BridgeDecision::resolve	resolve(Allow, b) = true, resolve(Deny, b) = false, resolve(Fallback, b) = b.	1,3	3/3	match on a fieldless Copy enum; fragment: `terminal::policy_bridge::BridgeDecision::resolve` F1+D2b (VF5 first target, docs/PLAN-tests-to-specs-2026-10-15.md "F1-ready specs").
+pb-resolve-table	table-property	policy_bridge::BridgeDecision::resolve	resolve(Allow, b) = true, resolve(Deny, b) = false, resolve(Fallback, b) = b.	1,3	3/3	match on a fieldless Copy enum; fragment: `terminal::policy_bridge::BridgeDecision::resolve` F1+D2b (VF5 first target, docs/PLAN-tests-to-specs-2026-10-15.md "F1-ready specs", row 39). Proved via mirror: Clean R213 row `bridge_decision_resolve` (`RowProvedB3` over a verbatim copy, with a false-clause control); not yet credited: Trust's compiler mints no calculus row until it pins a VF5 base (E4.7).
 pb-response-sink-gate	contract	TerminalHandler::{send_response,send_report}, handler::program_response_admitted, Terminal::reconcile_color_scheme_after_output, PolicyState::gates, PolicyGates::response_sink, Terminal::take_response	The bytes a batch appends that the program's output provoked are exactly the replies the handlers produced through send_response, the DEC 2048 reports it provoked through send_report (an enable, or a held report the alt-screen enter releases), and the end-of-batch DEC 2031 push (reconcile_color_scheme_after_output); each appends only if program_response_admitted admits it (gates().response_sink().resolve(true) and the reply rate limit at the batch clock) and MAX_RESPONSE_BUFFER_SIZE has room. So with an engine whose rule matches the response-sink probe from Pty with a non-Execute response, take_response() = None after any batch (DA1, the Kitty a=q probe, CPR, ?2048h …); with no engine, DA1 or a Kitty a=q,i=1 query get a non-empty reply. Reports from host calls (a resize, a new cell box, a scheme change) are outside this row. A 2031 push the gate refused stays owed (the latch holds) while 2031 stays on: each later batch's epilogue asks program_response_admitted again, so it goes out at the first epilogue the gate admits (the rate limit refilled, or a policy installed since that admits replies), or as a host colour call's report (a theme, an appearance flip, a restore), which passes no gate. A batch that ends with 2031 off (?2031l, RIS, the prompt that proves an alternate-screen app dead), or Terminal::reset, drops it first.	1,2,3,4,5,7	4/4	full pipeline, frame invariant (every program-provoked byte passes program_response_admitted; send_response and send_report enforced by ResponseCapability, the 2031 push at the batch epilogue with no token)
 pg-compiled-equals-live	equivalence	policy_gates::{PolicyGates::compile,PolicyState::xtwinops_gate,PolicyState::shell_integration_gate,compile_xtwinops,compile_shell,shell_slot,xtwinops_verdict,shell_verdict}, shell_integration_auth::probe_subcommand, response_capability::probe_for	compile(e).response_sink = engine_decision(e, probe_for(response_sink()), Pty); osc52_set and osc52_query = the deny-by-default decision on their probes. xtwinops_gate(ps) = xtwinops_verdict(engine, ps) for every ps: u16. shell_integration_gate(c, p) = shell_verdict(engine, c, probe_subcommand(p)), probe_subcommand(p) = utf8(p[1]) if present and valid, else "A". shell_slot(c, sub) = Some((i, sub[0]−'A')) iff c = SHELL_MAJORS[i] ∧ sub is one ASCII uppercase byte. compile(None) = all Fallback, and the compiled sink's resolve(true) equals mint_for_dispatch_with_engine(e, Pty, response_sink()).is_some().	1,3,4,5,7,12,13	10/10	array::from_fn with closures, try_from, encode_utf8; core lemma: purity of PolicyEngine::evaluate
 pg-state-sync-invariant	invariant	policy_gates::PolicyState::{new,install}, Terminal::apply_policy_engine	For every PolicyState reachable by new and install: gates = compile(engine), xtwinops = compile_xtwinops(engine), shell = compile_shell(engine), response_limit = engine.map_or(UNDECLARED, |e| e.rate_limit_slot("response")). So every gate outcome of a dispatch is a function of the currently installed engine and the legacy bits only, never of the install/replace history.	1,2,4,5,12,13	8/8	struct type invariant, Option<PolicyEngine> move
@@ -523,8 +531,8 @@ selection park, budgeted search) last.
 
 ## 2. Test → spec map (TSV)
 
-`primary` is the spec whose proof retires the test; `also` lists other specs the test samples.
-Tests in §4 appear with `primary` = `(§4: <action>)`.
+`primary` is the spec whose proof retires the test; `also` lists other specs the test samples. A §4 test
+has `primary` = `(§4: <action>)`.
 
 ```tsv
 file	test	primary	also
@@ -790,6 +798,8 @@ src/terminal/foreground_handback_tests.rs	manual_handback_is_idempotent_and_repl
 src/terminal/foreground_handback_tests.rs	manual_handback_reaches_what_the_evidence_gate_cannot	manual-handback-post	
 src/terminal/handler.rs	invalidation_drops_only_coordinate_bearing_shell_events	absolute-row-update-remap	
 src/terminal/handler.rs	splice_preserves_exclusive_end_boundaries_and_remaps_all_anchor_families	absolute-row-update-remap	
+src/terminal/handler_actions.rs	a_png_frame_is_decoded_once_however_many_commands_read_it	kitty-frames	kitty-store-budget
+src/terminal/handler_actions.rs	a_png_frame_that_does_not_decode_is_kept_and_refused_without_a_second_decode	kitty-frames	checkpoint-canonical-encoding
 src/terminal/handler_actions.rs	a_redraw_in_place_replaces_the_placement_it_covers	kitty-layer-order	
 src/terminal/handler_actions.rs	a_running_animation_steps_its_frames_on_their_gaps	kitty-animation-scheduler	
 src/terminal/handler_actions.rs	a_selected_frame_shows_in_every_placement_and_repaints_placeholders	kitty-frames	
@@ -800,6 +810,7 @@ src/terminal/handler_actions.rs	an_animation_plays_through_while_its_drawn_frame
 src/terminal/handler_actions.rs	animation_frame_keys_place_the_data_and_keep_the_root_layout	kitty-frames	
 src/terminal/handler_actions.rs	armed_alloc_fault_aborts_chunked_transfer_fail_closed	alloc-fault-fail-closed	
 src/terminal/handler_actions.rs	compose_copies_a_rectangle_between_frames	kitty-frames	
+src/terminal/handler_actions.rs	compose_refuses_its_arguments_before_it_decodes_and_decodes_a_frame_once	kitty-frames	
 src/terminal/handler_actions.rs	dcs_put_bulk_sixel_parity	dcs-put-bulk-refines-per-byte	
 src/terminal/handler_actions.rs	deletes_are_never_answered	kitty-reply-protocol	
 src/terminal/handler_actions.rs	deletes_reach_virtual_placements_by_id_only	kitty-store-lifecycle	
@@ -823,6 +834,7 @@ src/terminal/handler_actions.rs	put_lays_the_image_out_by_its_own_keys	kitty-pla
 src/terminal/handler_actions.rs	put_offsets_start_the_image_inside_its_first_cell	kitty-placement-layout	
 src/terminal/handler_actions.rs	put_variants_are_budgeted_recycled_and_capped	kitty-store-budget	
 src/terminal/handler_actions.rs	query_answers_per_medium_availability	kitty-reply-protocol	
+src/terminal/handler_actions.rs	reading_the_shown_png_frame_keeps_the_animation_clock	kitty-frames	kitty-animation-scheduler
 src/terminal/handler_actions.rs	relative_chains_are_bounded	kitty-relative-placements	
 src/terminal/handler_actions.rs	relative_placements_follow_their_parent	kitty-relative-placements	
 src/terminal/handler_actions.rs	retransmitting_an_id_removes_its_old_placements	kitty-store-lifecycle	
@@ -1397,6 +1409,9 @@ tests/control_string_cancel.rs	a_canceled_kitty_command_draws_nothing	can-sub-ca
 tests/control_string_cancel.rs	a_canceled_osc_52_writes_no_clipboard	can-sub-cancels-every-string-consumer	
 tests/control_string_cancel.rs	a_canceled_query_is_not_answered	can-sub-cancels-every-string-consumer	
 tests/control_string_cancel.rs	a_canceled_title_is_not_set	can-sub-cancels-every-string-consumer	
+tests/double_width_margin_wrap.rs	a_run_wrapping_onto_a_double_width_row_left_of_the_margin_goes_on_at_its_last_column	decslrm-run-wraps-at-the-right-margin	process-chunk-invariance
+tests/double_width_margin_wrap.rs	bulk_writes_past_a_double_width_row_finish_and_match_the_per_character_path	decslrm-run-wraps-at-the-right-margin	process-chunk-invariance
+tests/double_width_margin_wrap.rs	generated_line_size_and_margin_mixes_finish_and_match_the_per_character_path	process-chunk-invariance	decslrm-run-wraps-at-the-right-margin
 tests/empty_param_default.rs	a_trailing_empty_sgr_parameter_resets	empty-trailing-param-is-default	
 tests/empty_param_default.rs	count_dependent_handlers_read_a_trailing_empty_parameter_as_the_default	empty-trailing-param-is-default	
 tests/fuzz_alt_screen.rs	alt_screen_1049_roundtrip_preserves_main_and_cursor	alt-1049-roundtrip	
@@ -1647,9 +1662,9 @@ tests/unicode_content_generation.rs	unicode_bulk_and_fragmented_writes_advance_c
 
 | test | action | why |
 |---|---|---|
-| `tests/mem_budget.rs::engine_retained_heap_within_budget` | move-to-bench | Retained-heap ceiling via a counting allocator; a resource budget with calibration constants. |
-| `tests/perf_scaling.rs::engine_steady_state_processing_is_allocation_free` | move-to-bench | Allocation count and a 2x-input ratio; its correctness checks are sampled by history-render-parity. |
-| `tests/scrolled_back_frame_materialize_count.rs::a_stationary_scrolled_back_repaint_materializes_no_history_rows` | move-to-bench | Exact materialization count; correctness is viewport-memo-coherent. |
+| `tests/mem_budget.rs::engine_retained_heap_within_budget` | move-to-bench | A retained-heap ceiling measured with a counting allocator: a resource budget with calibration constants. |
+| `tests/perf_scaling.rs::engine_steady_state_processing_is_allocation_free` | move-to-bench | An allocation count and a 2x-input ratio; history-render-parity samples its correctness checks. |
+| `tests/scrolled_back_frame_materialize_count.rs::a_stationary_scrolled_back_repaint_materializes_no_history_rows` | move-to-bench | An exact materialization count; the correctness half is viewport-memo-coherent. |
 | `tests/scrolled_back_frame_materialize_count.rs::a_wheel_notch_pays_only_for_the_rows_that_scrolled_in` | move-to-bench | Exact rows materialized per notch: a cost bound. |
 
 ## 5. Implied specs that look wrong, or disagree with the code
@@ -1684,10 +1699,7 @@ tests/unicode_content_generation.rs	unicode_bulk_and_fragmented_writes_advance_c
 
 ## 6. Proof order (easiest high-value first)
 
-No spec here is blocked by gap 0 alone: every one also needs at least one of gaps 2, 3 or 6. So the order
-below starts with the specs whose only other blockers are the smallest Trust widenings (certified
-`&mut self` field views, gap 2; E6 body widening, gap 3), and climbs from there. Each tier lists the
-tests it retires.
+Smallest Trust widenings first, the Terminal-level properties last.
 
 **Tier A: scalar, gap 2 or 3 only (land right after gap 0).**
 

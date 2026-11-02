@@ -10,6 +10,8 @@ use aterm_core::terminal::RenderCell;
 pub(crate) const LABEL: &str = "aterm terminal";
 
 /// Appends one grid row to `text` up to `cols`, trimming trailing spaces and ending with `'\n'`.
+/// Each cell contributes its base character alone, so the combining marks and joined
+/// characters of a multi-scalar cluster are left out.
 pub(crate) fn push_visible_row<'a>(
     text: &mut String,
     cells: impl IntoIterator<Item = &'a RenderCell>,

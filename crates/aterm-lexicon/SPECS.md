@@ -1,7 +1,7 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-lexicon: spec recovery from its 131 unit tests
+# aterm-lexicon: spec recovery from unit tests
 
 > Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 19 tests it
 > deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
@@ -40,10 +40,10 @@ Characters and fold (`src/fold.rs`):
 
 - `C(s)` = `s.chars()` as a list. `lower(c)` = `char::to_lowercase(c)`, std's Unicode
   lowercase table. The proofs need a model of that table.
-- `Strip(c)`, `Kept(c)`, `NoSpace(c)`: `c as u32` lies in the range lists of
-  `is_strippable_mark`, `is_kept_mark`, `is_no_space_script`.
+- `Strip(c)`, `Kept(c)`, `NoSpace(c)`: `c as u32` lies in `R_strip`, `R_kept`, `R_ns`, the range
+  lists of `is_strippable_mark`, `is_kept_mark`, `is_no_space_script`.
 - `P16` = `{ / \ : = @ # + ~ $ % | < > * & ^ }`, the set of `is_code_adjacent_punct`.
-- `J` = `{ ' , U+2019, - }`, the set of `is_interior_joiner`.
+- `J` = {`'`, `’` (U+2019), `-`}, the set of `is_interior_joiner`.
 - `Tok(c)` = `is_token_char(c)` = `¬NoSpace(c) ∧ (alnum(c) ∨ c='_' ∨ Strip(c) ∨ Kept(c))`.
 - `base(c)` = `fold::base_letter(c)`, and `dom(base)` is its table of accented letters.
 - The per-char fold `f(c)`:
@@ -61,7 +61,7 @@ Lexicon views (`lx: Lexicon`):
 - `Sp(lx)`: folded key → `Hit{class, langs, form_id, ambiguous, species, marks_required}` (the field `spaced`).
 - `Cj(lx)`: raw no-space key → `Hit` (`cjk_forms`). `Ex(lx)`: `cjk_exceptions`.
 - `Heads(lx)`: `cjk_heads`. `maxcjk(lx)`: `max_cjk`. `U(lx)`: `user_surfaces`.
-- `Conf(lx)`: `conflicts`. `Langs(lx)`: `langs`. `Species(lx)`: `species`.
+- `Conf(lx)`: `conflicts`. `Langs(lx)`: `langs`.
 - `Builtin(L)` = `Lexicon::with_languages(L)`, and `Lexicon::builtin()` = `Builtin(["en"])`.
 
 Build input:
@@ -74,9 +74,8 @@ Build input:
   - `¬e.ambiguous ∨ "all" ∈ L ∨ e.lang ∈ L`.
 - `Surf(e)` = `(mode = "suffix" ? [st ++ sf | st ← stems, sf ← (suffixes, or [""] if empty)] : []) ++ forms`.
   Each part is kept only within the global cap `MAX_TOTAL_SURFACES`.
-- `Key(e, s)` = `trim(s)` if `e.cjk`, else `Fold(trim(s))`.
-- `Claims(k)` = the loaded `(e, s)` with `Key(e, s) = k` that pass validation, in TOML order.
-  Each claim carries:
+- `Claims(k)` = the loaded `(e, s)` whose key (`trim(s)` if `e.cjk`, else `Fold(trim(s))`) is `k`
+  and that pass validation, in TOML order. Each claim carries:
   - `class`;
   - `langs = {intern(e.lang)}`;
   - `ambiguous`;
@@ -103,25 +102,15 @@ Trick views (`tl: TrickLexicon`, `src/tricks.rs`):
 - `collapse(cs, k)` replaces every maximal run of ≥3 identical chars with `k` copies and
   leaves shorter runs alone. `elongated(cs)` ⇔ some run has length ≥ 3.
 
-Blocking gaps are the row numbers of the gap table in
-`AUDIT-trust-for-test-migration-2026-10-15.md` (historical internal audit) §7.
-**Gap 0 (a seal that publishes Clean rows) blocks every spec**, so the column leaves it out.
-Seal `150efe4a` closes it locally (see the plan), and admitting that seal to the machine
-channel is owner-gated.
-
 ## 1. Specs (TSV)
 
-Columns:
+Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (primary tests; §2 lists every test),
+`rust_features` (what the proof must handle), and `blocking_gaps` (rows of the gap table in
+`docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7). Gap 0, an installed seal that publishes
+no Clean row, blocks every spec, so the column leaves it out.
 
-- `id`
-- `kind`
-- `functions`
-- `statement`
-- `subsumes` (primary tests; §2 lists every test)
-- `rust_features` (what the proof must handle)
-- `blocking_gaps` (audit §7 numbers)
-
-Test paths in `subsumes` are relative to `crates/aterm-lexicon`.
+Test paths in `subsumes` are relative to `crates/aterm-lexicon`. A bare test name is in the file
+named before it in its `;`-separated group; `fold-denotation`'s are in `src/fold.rs`.
 
 ```tsv
 id	kind	functions	statement	subsumes	rust_features	blocking_gaps
@@ -198,8 +187,9 @@ over the embedded constants, and they need `toml-schema-decoding` (gap 9) for th
 
 ## 2. Test → spec map (TSV)
 
-`primary` is the spec that retires the test. `also` lists the other specs the same test samples.
-Paths are relative to `crates/aterm-lexicon`.
+`primary` is the spec that retires the test, or `NON-SPEC` for a §4 test. `also` lists the other
+specs the same test samples; a parenthesized note points at a §5 finding. Paths are relative to
+`crates/aterm-lexicon`.
 
 ```tsv
 file	test	primary	also
@@ -323,7 +313,7 @@ tests/tricks_alloc.rs	a_warmed_classify_is_allocation_free_on_every_lane	warm-pa
 tests/tricks_alloc.rs	compiling_the_embedded_vocabulary_peaks_under_2_mib	builtin-tricks-compile-peak	
 ```
 
-## 3. Coverage
+## 3. Proof order
 
 - 131 tests read. 128 map to one of the 41 specs, and 3 are not spec samples (§4).
 - The biggest collapses are:
@@ -342,9 +332,7 @@ tests/tricks_alloc.rs	compiling_the_embedded_vocabulary_peaks_under_2_mib	builti
 
 ## 4. Tests that are not spec samples
 
-Status 2026-10-16: deleted `tests/corpus.rs::cat_command_not_decorated_by_default` and `src/lib.rs::embedded_lexicon_parses_and_has_no_conflicts`.
-
-Status 2026-10-17: those two duplicates' rows are gone from this table and from §2.
+Both check test-only code, so they go.
 
 Status 2026-10-28: deleted `tests/tricks.rs::the_dictionary_gate_catches_an_ungated_foreign_english_word_and_clears_a_gated_one` (and its §2 row).
 
@@ -353,9 +341,9 @@ Status 2026-10-28: deleted `tests/tricks.rs::the_dictionary_gate_catches_an_unga
 | tests/lexicon_alloc.rs::the_counter_sees_this_threads_allocations_and_no_other_threads | It tests the test binary's own `CountingAllocator` and thread-local counter, which is test-only code with no production caller. It is a harness self-check that matters only while the allocation pins exist. | **delete** (with the allocator harness, once `warm-path-allocation-free` is a proof) |
 | tests/lexicon_alloc.rs::the_peak_is_the_most_this_thread_held_at_once | The same harness's live-byte high-water mark, checked against one known allocation. Test-only code, no production caller. | **delete** (with the allocator harness, once `builtin-tricks-compile-peak` is a proof) |
 
-Action counts: delete 2, keep 0, rewrite 0.
+## 5. Open findings
 
-## 5. Implied specs that look wrong, or disagree with the code
+Numbered as §1 and §2 cite them.
 
 1. **Resolved: `a_marked_surface_needs_marked_typing_unless_the_bare_spelling_is_listed` now exercises stroked-letter ASCII folding alongside non-ASCII vowel hooks.**
    - Previously, an older comment claimed Vietnamese `nhảy` folded to ASCII `nhay` (in fact `ả` is outside `fold::base_letter`, so `fold("nhảy") == "nhảy"`).
@@ -369,11 +357,11 @@ Action counts: delete 2, keep 0, rewrite 0.
    - `possessive_and_punctuation` only probes `the cat's toy` with `allow_bare_cat` on, so this is untested and may be unintended.
    - Decide whether the guard should measure the stem. The spec `scan-policy-guards` states the code as it is.
 4. **The dictionary tests depend on the host's word list.**
-   - These read the host's Webster's Second (`/usr/share/dict/web2`, which macOS's `/usr/share/dict/words` names), the list their allowlists are curated against:
+   - These read the host's Webster's Second, the list their allowlists are curated against, at the first place aterm_uds's `web2` row names that reads (`/usr/share/dict/web2`, which macOS's `/usr/share/dict/words` names, then `C:\usr\share\dict\web2`); a word list, not a program, so it is read where it lies, not resolved as a runnable tool:
      - `english_fold_collisions::no_unambiguous_surface_is_an_ordinary_english_word`;
      - `english_fold_collisions::no_english_word_transits_an_unambiguous_profanity_prefix`;
      - `tricks::no_ungated_non_english_surface_is_an_english_dictionary_word`.
-   - On a host without it, which includes most Linux machines (Debian's `words` is `wamerican`, with possessives and inflections web2 lacks), they end COULD NOT RUN. Until 2026-10-16 they read `/usr/share/dict/words`, passed silently without one and failed against Debian's list. They become a spec only once the word list is vendored.
+   - On a host without it, which includes most Linux machines (Debian's `words` is `wamerican`, with possessives and inflections web2 lacks) and every Windows one, they end COULD NOT RUN. The Linux and Windows lanes lay the Mac's copy at those paths. Until 2026-10-16 they read `/usr/share/dict/words`, passed silently without one and failed against Debian's list. They become a spec only once the word list is vendored.
 5. **`ascii-early-out-equivalence` is checked at compile time.**
    - It is a 128-value evaluation. A `const` check in `fold.rs` evaluates the tables over every ASCII scalar, so a table that names one fails the build.
    - No scan of `fold.rs` for `0x` literals stands in for it; such a scan counts hex inside comments and breaks on a rename or a reformat.
@@ -395,41 +383,32 @@ Action counts: delete 2, keep 0, rewrite 0.
     - Each recorded answer embeds conflict-message text and the `Debug` output of `TrickRow`, so rewording a message fails it with no decode change.
     - `toml-schema-decoding` is the law; the recorded equality is only its instance on the corpus.
 
-## 6. Proof order (easiest high-value first)
+**5.2 Precomposed and decomposed text fold alike only on `dom(base)`.** A precomposed letter
+outside `base_letter`'s table (every Vietnamese ả ạ ố ồ ẽ ị …) folds to itself, while its NFD form
+folds to the bare base, so NFD-emitted Vietnamese never matches a precomposed lexicon or tricks
+surface, nor the reverse. No test covers it. `fold-decomposition-invariant` carries the domain
+restriction; the alternative is to widen the table to Latin Extended Additional.
 
 No spec here is blocked only by gap 0. Every one needs at least non-scalar carriers (gap 1), E6 body
 widening (gap 3), quantified clauses (gap 5), or build-script codegen (gap 9). So the order goes by
 the smallest set of gaps beyond 0.
 
-1. **`ascii-early-out-equivalence`** (gaps 3, 5).
-   - It is a 128-case evaluation over `u32` range matches, with no strings and no loops.
-   - It retires the source-text-scanning test (§5.5).
-   - It makes every later fold proof safe to state without the early-outs.
-2. **`langset-finite-set`** (gaps 3, 5, 7, 13).
-   - It is pure `u64` bit arithmetic (`|`, `&`, shifts, `count_ones`, `trailing_zeros`), which is `bv_decide`/`omega`-class work.
-   - Only `iter()` needs the loop/closure lanes. The other six clauses are blocked by gaps 3 and 5 alone, so prove those first and add `iter` later.
-3. **`trick-code-bijection`** and **`trick-blurb-table`** (gaps 1, 3, 7).
-   - Each is a 17-case evaluation of an enum `match` returning `&'static str`.
-   - They are the first specs that need `&str` carriers (gap 1), but they need only constant strings.
-   - This makes them a good first customer for gap 1.
-4. **`char-class-tables`** (gaps 1, 3, 5).
-   - It is range-table predicates on `char`. The `is_no_space_surface` clause brings in `Iterator::all`.
-   - It is the base fact under `tokenization-whole-word` and `code-context-guard`.
-5. **`trick-elongation-fold`** (gaps 1, 3, 5, 7).
-   - It works on a fixed `[char;64]` window with `saturating_add` loops, and has obvious variants.
-   - It is self-contained and retires its test outright.
-6. **`fold-denotation`** → **`fold-idempotent`**. These are the highest-value core: the next 20+ specs are stated through `Fold`.
-   - They need a Clean model of std's lowercase table (gap 1).
-   - The idempotence lemma is an exhaustive scalar evaluation (gap 14 for elaborator performance).
-7. **`cjk-prefilter-sound`** and **`build-surface-bounds`**. These are loop invariants over the build with saturating `usize` arithmetic.
-   - They are invariant-shaped (gap 7) rather than content-shaped.
-   - They retire 3 tests, including the 2^20 cap regression.
+**5.4 The dictionary tests need the host's word list.**
+`english_fold_collisions::no_unambiguous_surface_is_an_ordinary_english_word`,
+`english_fold_collisions::no_english_word_transits_an_unambiguous_profanity_prefix` and
+`tricks::no_ungated_non_english_surface_is_an_english_dictionary_word` read Webster's Second
+(`/usr/share/dict/web2`), the list their allowlists are curated against, and end COULD NOT RUN
+where it is absent, as on most Linux hosts. They become a spec once the list is vendored.
 
-The scan-level contracts (`tokenization-whole-word`, `classify-token-fallbacks`, `scan-policy-guards`,
-`cjk-maximal-munch`) come after these. They need `&self`/`&mut` scratch views (gap 2) and the
-`Vec<char>` content model (gap 1).
+**5.6 A weak assertion.** `src/fold.rs::keeps_indic_marks` asserts
+`folded.contains('\u{093F}') || folded.chars().count() >= 4`, which passes even if the matras were
+stripped and other characters remained. It should assert `fold("बिल्ली") = "बिल्ली"`.
 
-### Gap histogram (specs blocked by each audit §7 gap)
+**5.7 Lang trimming is inconsistent.** `intern_lang` trims the lang code, but ambiguous gating
+(`Langs::enabled(&e.lang)`) and the data-language set `Langs::note_unknown` checks use the raw
+string. An entry with lang `" ro "` interns as `ro` but is never un-gated by `languages = ["ro"]`,
+and `["ro"]` is then reported as naming nothing. No test covers it. Trimming once at decode would
+make `ambiguous-gating` and `lang-interning` speak of the same string.
 
 | gap | specs |
 |---|---|

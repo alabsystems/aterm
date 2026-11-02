@@ -163,9 +163,14 @@ fn parse_offline(tail: &[String]) -> io::Result<Option<Offline>> {
             "file" => file = Some(value),
             "screen" => screen = Some(value),
             "until" => {
-                until = Some(value.parse::<f64>().map_err(|_| {
-                    usage("cast drift: --until takes seconds on the cast's timeline")
-                })?);
+                let secs = (!value.starts_with('+'))
+                    .then(|| value.parse::<f64>().ok())
+                    .flatten()
+                    .filter(|v| v.is_finite() && *v >= 0.0)
+                    .ok_or_else(|| {
+                        usage("cast drift: --until takes seconds on the cast's timeline")
+                    })?;
+                until = Some(secs);
             }
             _ => {
                 return Err(usage(
@@ -382,7 +387,10 @@ fn stamp(status: &str) -> Option<(String, String)> {
 /// `cursor`'s `OK <row> <col> <visible> <style>`.
 fn parse_cursor(status: &str) -> Option<(u16, u16)> {
     let mut it = status.split_whitespace().skip(1);
-    Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+    Some((
+        super::parse_uint(it.next()?)?,
+        super::parse_uint(it.next()?)?,
+    ))
 }
 
 /// `modes`' `alt_screen=<bool>` row.
@@ -616,6 +624,10 @@ mod tests {
             &["--screen", "s.txt"][..],
             &["--file"][..],
             &["--file", "a", "--until", "soon"][..],
+            &["--file", "a", "--until", "+1.0"][..],
+            &["--file", "a", "--until", "-1.0"][..],
+            &["--file", "a", "--until", "NaN"][..],
+            &["--file", "a", "--until", "inf"][..],
             &["--file", "a", "--json"][..],
         ] {
             assert!(parse_offline(&strings(bad)).is_err(), "{bad:?}");
@@ -643,6 +655,8 @@ mod tests {
             assert_eq!(stamp(unstamped), None, "{unstamped}");
         }
         assert_eq!(parse_cursor("OK 58 2 1 blinking_block"), Some((58, 2)));
+        assert_eq!(parse_cursor("OK +58 2 1 blinking_block"), None);
+        assert_eq!(parse_cursor("OK 58 +2 1 blinking_block"), None);
         assert_eq!(screen_rows("one\r\ntwo\n"), strings(&["one", "two"]));
         assert_eq!(
             parse_alt(&strings(&["cursor_visible=true", "alt_screen=true"])),

@@ -556,8 +556,8 @@ fn a_returning_server_leaves_the_name_to_a_holder_that_answers() {
     );
 }
 
-/// When two islands heal and both servers hold `alab-secrets`, deterministic TXT ordering
-/// (`seq` descending, then natural label order `m3 < m5 < m19 < m22`) settles on exactly one
+/// When two islands heal and both servers hold `alab-secrets`, verified envelope sequence
+/// ordering (then natural label order `m3 < m5 < m19 < m22`) settles on exactly one
 /// holder (`docs/DESIGN-fluid-swarm-2026-10-28.md` F7).
 /// NEGATIVE CONTROL: without the tie-break, symmetric holders either both keep or both drop.
 #[test]
@@ -617,7 +617,15 @@ fn two_holders_at_a_heal_settle_on_one() {
     // 2. Higher `seq` beats lower label: `m19` at `seq = 9` keeps the name over `m3` at `seq = 8`.
     let mut w_m3_lagging = make_holding("m3", 8);
     let mut w_m19_ahead = make_holding("m19", 9);
-    let diff_seq_holders = [alab_holder_hint(8, "m3"), alab_holder_hint(9, "m19")];
+    let mut diff_seq_holders = [alab_holder_hint(8, "m3"), alab_holder_hint(9, "m19")];
+    diff_seq_holders[0].url = "http://m3.local:7484/v1/alab".to_owned();
+    diff_seq_holders[1].url = "http://m19.local:7484/v1/alab".to_owned();
+    let verified_seq = |url: &str| {
+        diff_seq_holders
+            .iter()
+            .enumerate()
+            .find_map(|(index, holder)| (holder.url == url).then_some([8, 9][index]))
+    };
     let m3_keeps = w_m3_lagging.decide(
         &AlabNameInput {
             own_label: "m3",
@@ -625,7 +633,7 @@ fn two_holders_at_a_heal_settle_on_one() {
             holders: &diff_seq_holders,
             now: start + Duration::from_secs(100),
         },
-        |_| Some(9),
+        verified_seq,
     );
     let m19_ahead_keeps = w_m19_ahead.decide(
         &AlabNameInput {
@@ -634,7 +642,7 @@ fn two_holders_at_a_heal_settle_on_one() {
             holders: &diff_seq_holders,
             now: start + Duration::from_secs(100),
         },
-        |_| Some(9),
+        verified_seq,
     );
     assert!(
         !m3_keeps && m19_ahead_keeps,
@@ -647,6 +655,76 @@ fn two_holders_at_a_heal_settle_on_one() {
     let no_tiebreak_keep_if_gt = |a_seq: u64, b_seq: u64| (a_seq > b_seq, b_seq > a_seq);
     assert_eq!(no_tiebreak_keep_if_ge(7, 7), (true, true));
     assert_eq!(no_tiebreak_keep_if_gt(7, 7), (false, false));
+}
+
+#[test]
+fn holder_txt_cannot_substitute_for_a_current_verified_envelope() {
+    let start = Instant::now();
+    let own_seq = 10;
+    let mut forged = [alab_holder_hint(u64::MAX, "m1")];
+    forged[0].url = "http://m1.local:7484/v1/alab".to_owned();
+    for response in [None, Some(9)] {
+        // A non-holder must finish the unchanged grace period despite a forged maximum TXT
+        // or a correctly signed old replay. The old holder_answers rule never reached it.
+        let mut watcher = AlabNameWatcher::new();
+        for (seconds, expected) in [(0, false), (89, false), (90, true)] {
+            assert_eq!(
+                watcher.decide(
+                    &AlabNameInput {
+                        own_label: "m19",
+                        own_seq: Some(own_seq),
+                        holders: &forged,
+                        now: start + Duration::from_secs(seconds),
+                    },
+                    |_| response
+                ),
+                expected
+            );
+        }
+        // Once holding, unsigned TXT alone must not make it yield either.
+        assert!(watcher.decide(
+            &AlabNameInput {
+                own_label: "m19",
+                own_seq: Some(own_seq),
+                holders: &forged,
+                now: start + Duration::from_secs(91),
+            },
+            |_| response
+        ));
+        // A verified equal sequence still wins the existing lower-label tie.
+        assert!(!watcher.decide(
+            &AlabNameInput {
+                own_label: "m19",
+                own_seq: Some(own_seq),
+                holders: &forged,
+                now: start + Duration::from_secs(92),
+            },
+            |_| Some(own_seq)
+        ));
+    }
+    // Even a TXT claiming an old sequence cannot hide a newer verified response.
+    let newer = [alab_holder_hint(1, "m22")];
+    let mut watcher = AlabNameWatcher::new();
+    for seconds in [0, 90] {
+        watcher.decide(
+            &AlabNameInput {
+                own_label: "m19",
+                own_seq: Some(own_seq),
+                holders: &[],
+                now: start + Duration::from_secs(seconds),
+            },
+            |_| None,
+        );
+    }
+    assert!(!watcher.decide(
+        &AlabNameInput {
+            own_label: "m19",
+            own_seq: Some(own_seq),
+            holders: &newer,
+            now: start + Duration::from_secs(91),
+        },
+        |_| Some(11)
+    ));
 }
 
 /// A `>= 0.146` server yields `alab-secrets` to a `0.145` holder (`txt: None`, no watcher) that
@@ -1100,6 +1178,7 @@ struct StandIn {
     addr: std::net::SocketAddr,
     stop: std::sync::Arc<AtomicBool>,
     asked: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    reply: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -1114,6 +1193,8 @@ impl StandIn {
         let addr = listener.local_addr().expect("addr");
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reply = std::sync::Arc::new(std::sync::Mutex::new(reply));
+        let answering = std::sync::Arc::clone(&reply);
         let (stopping, counting) = (std::sync::Arc::clone(&stop), std::sync::Arc::clone(&asked));
         let thread = std::thread::spawn(move || {
             for stream in listener.incoming() {
@@ -1121,6 +1202,12 @@ impl StandIn {
                     return;
                 }
                 let Ok(mut stream) = stream else { continue };
+                stream
+                    .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
+                    .expect("stand-in read deadline");
+                stream
+                    .set_write_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
+                    .expect("stand-in write deadline");
                 let mut request = Vec::new();
                 let mut chunk = [0_u8; 1024];
                 while !request.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -1131,8 +1218,9 @@ impl StandIn {
                 }
                 counting.fetch_add(1, Ordering::SeqCst);
                 std::thread::sleep(delay);
-                if let Some(reply) = &reply {
-                    let _ = stream.write_all(reply);
+                let reply = answering.lock().expect("reply slot").clone();
+                if let Some(reply) = reply {
+                    let _ = stream.write_all(&reply);
                 }
             }
         });
@@ -1140,6 +1228,7 @@ impl StandIn {
             addr,
             stop,
             asked,
+            reply,
             thread: Some(thread),
         }
     }
@@ -1147,6 +1236,11 @@ impl StandIn {
     /// How many requests it read.
     fn asked(&self) -> usize {
         self.asked.load(Ordering::SeqCst)
+    }
+
+    /// Subsequent requests receive this reply without rebinding the listener.
+    fn answer_with(&self, reply: Option<Vec<u8>>) {
+        *self.reply.lock().expect("reply slot") = reply;
     }
 }
 
@@ -1183,6 +1277,40 @@ fn served(url: &str) -> Vec<u8> {
     }
 }
 
+#[test]
+fn unused_peer_selection_does_not_skip_envelope_failover() {
+    let _answering = ServersAnswering::set();
+    let at = dead_source();
+    let fresh = served(&at.fresh.url);
+    let primary = StandIn::at(&at.url_primary, Duration::ZERO, Some(ok_with(&fresh)));
+    let origin = at.rogue.url.split_once("/v1/").expect("vault URL").0;
+    let mut candidates = vec![at.fresh.clone()];
+    for n in 1..2 * crate::discover::MAX_CANDIDATES {
+        candidates.push(crate::discover::DiscoveredVault {
+            url: format!("{origin}/absent-{n}/v1/team"),
+            txt: None,
+        });
+    }
+    let found = |_: &Config| candidates.clone();
+    let found = PeerDiscovery::supplied(&found);
+    let said = std::cell::Cell::new(SourceSaid::AtOnce);
+    let first = sync_found(&at.member, None, &found, &said)
+        .expect("the primary serves a newer verified envelope");
+    primary.answer_with(Some(
+        b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+    ));
+    let recovered = sync_found(&at.member, None, &found, &said);
+    drop(primary);
+    for server in at.servers {
+        server.stop();
+    }
+    assert!(matches!(first, SyncOutcome::Applied { seq: 3, .. }));
+    assert!(
+        matches!(recovered, Ok(SyncOutcome::Unchanged { seq: 3 })),
+        "the first actual peer probe must still include the usable peer: {recovered:?}"
+    );
+}
+
 /// A source that answers with a body claiming a newer seq that does not verify (a host that
 /// took the source's name or address while its server is away) does not stop the failover: the
 /// pass still reads the servers its browse found and applies the highest verified seq.
@@ -1206,6 +1334,7 @@ fn a_forged_newer_seq_at_the_source_does_not_stop_the_failover() {
     let source = StandIn::at(&at.url_primary, Duration::ZERO, Some(ok_with(&forged)));
     let browsed = [at.fresh.clone()];
     let found = |_: &Config| browsed.to_vec();
+    let found = PeerDiscovery::supplied(&found);
     let (_, outcome) =
         subscriber_pass(&at.member, &mut None, &found).expect("fails over past the forger");
     assert!(
@@ -1238,6 +1367,7 @@ fn a_failover_pass_with_nothing_new_is_not_followed_at_once() {
     let at = dead_source();
     let browsed = [at.fresh.clone()];
     let found = |_: &Config| browsed.to_vec();
+    let found = PeerDiscovery::supplied(&found);
     let (_, caught_up) = subscriber_pass(&at.member, &mut None, &found).expect("fails over");
     assert!(
         matches!(caught_up, SyncOutcome::Applied { seq: 3, .. }),
@@ -1280,9 +1410,10 @@ fn a_dead_source_fails_over_to_a_browsed_server_with_a_newer_seq() {
     let _answering = ServersAnswering::set();
     let at = dead_source();
     // CONTROL: with nothing browsed, the pass has only its gone source.
-    assert!(subscriber_pass(&at.member, &mut None, &found_none).is_err());
+    assert!(subscriber_pass(&at.member, &mut None, &FOUND_NONE).is_err());
     let browsed = [at.fresh.clone()];
     let found = |_: &Config| browsed.to_vec();
+    let found = PeerDiscovery::supplied(&found);
     let (config, outcome) =
         subscriber_pass(&at.member, &mut None, &found).expect("fails over to the browsed server");
     assert!(
@@ -1316,6 +1447,7 @@ fn a_forged_higher_seq_on_a_browsed_server_is_ignored() {
     let at = dead_source();
     let alone = [at.rogue.clone()];
     let forger_alone = |_: &Config| alone.to_vec();
+    let forger_alone = PeerDiscovery::supplied(&forger_alone);
     assert!(
         subscriber_pass(&at.member, &mut None, &forger_alone).is_err(),
         "the forger alone is no vault"
@@ -1323,6 +1455,7 @@ fn a_forged_higher_seq_on_a_browsed_server_is_ignored() {
     assert_eq!(load_state(&at.member).unwrap().seq, 2);
     let both = [at.rogue.clone(), at.fresh.clone()];
     let found = |_: &Config| both.to_vec();
+    let found = PeerDiscovery::supplied(&found);
     let (_, outcome) =
         subscriber_pass(&at.member, &mut None, &found).expect("the verified server serves");
     assert!(
@@ -1509,6 +1642,43 @@ fn sync_auto_reconciles_diverged_policy_servers_for_admin_and_keeps_member_stead
         matches!(p2, SyncOutcome::Unchanged { seq: 4 }),
         "expected Unchanged seq 4 while split awaits steward merge, got {p2:?}"
     );
+
+    // A bounded reader with a silent primary keeps the exact held sibling even when
+    // the other equal-sequence sibling wins the digest tie-break among discovered peers.
+    let bounded = Paths::for_home(&root.path().join("bounded-split"));
+    fsx::ensure_private_dir(&bounded.dir).unwrap();
+    fsx::write_atomic(
+        &bounded.identity_file(),
+        &std::fs::read(member.identity_file()).unwrap(),
+        0o600,
+    )
+    .unwrap();
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut bounded_config = config(&member).unwrap().unwrap();
+    bounded_config.source = Source::Url(format!("http://{}/v1/team", silent.local_addr().unwrap()));
+    save_config(&bounded, &bounded_config).unwrap();
+    let held_url = if s1_env.digest() < s2_env.digest() {
+        &url1
+    } else {
+        &url2
+    };
+    let Fetched::Body(held_bytes) = transport::fetch(
+        &Source::Url(held_url.clone()),
+        None,
+        aterm_spec::wait::MUST_HAPPEN,
+    )
+    .unwrap() else {
+        panic!("held peer's envelope")
+    };
+    super::super::sync_with(&bounded, held_bytes).unwrap();
+    let held_digest = load_state(&bounded).unwrap().digest;
+    super::super::bounded::sync_reader_with_candidates_until(
+        &bounded,
+        Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+        &[url1.clone(), url2.clone()],
+    )
+    .expect("exact held peer remains readable through an equal-sequence split");
+    assert_eq!(load_state(&bounded).unwrap().digest, held_digest);
 
     // 2. Admin `st2`'s plain `sync(&st2, None)` (with NO extra_urls — reading `policy.servers`
     //    from the admin locker automatically!) reconciles the split into `seq = 5`!
@@ -2057,6 +2227,7 @@ fn a_publish_reaches_every_candidate_server() {
         txt: None,
     }];
     let found = |_: &Config| browsed_s3.to_vec();
+    let found = PeerDiscovery::supplied(&found);
     {
         let opened = admin_open(&admin_paths).expect("open seq 1");
         let mut doc = opened.doc.clone();
@@ -2190,6 +2361,7 @@ fn a_publish_puts_to_every_server_at_once() {
         let admin_paths = admin_paths.clone();
         move || {
             let found = move |_: &Config| browsed.clone();
+            let found = PeerDiscovery::supplied(&found);
             let opened = admin_open(&admin_paths).expect("open seq 1");
             let mut doc = opened.doc.clone();
             doc.set_entry(&Audience::Everyone, "token", b"t-seq2")
@@ -2256,6 +2428,7 @@ fn a_publish_leaves_the_state_lock_while_a_silent_server_holds_its_put() {
         let admin_paths = admin_paths.clone();
         move || {
             let found = move |_: &Config| browsed.clone();
+            let found = PeerDiscovery::supplied(&found);
             let opened = admin_open(&admin_paths).expect("open seq 1");
             let mut doc = opened.doc.clone();
             doc.set_entry(&Audience::Everyone, "token", b"t-seq2")
@@ -2818,8 +2991,17 @@ fn a_held_0_145_server_job_moves_once_the_new_build_serves_its_store() {
 
 /// A moved server counts as serving (`steward::serves_alab`) only once what it answers is the
 /// ALab vault this build names: one server, one envelope, and only the build's ALab key differs.
+/// Its looks are probes: the server's heard history books none of them as a plain read.
+/// NEGATIVE CONTROL: look with a plain `transport::fetch_within`: the history's anonymous read
+/// is the server's start time.
 #[test]
 fn a_moved_server_serves_only_once_it_answers_with_the_alab_vault() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    const START: u64 = 1_830_000_000;
+    static CLOCK: AtomicU64 = AtomicU64::new(START);
+    fn clock() -> u64 {
+        CLOCK.load(Ordering::SeqCst)
+    }
     struct RetiredGuard;
     impl Drop for RetiredGuard {
         fn drop(&mut self) {
@@ -2847,7 +3029,20 @@ fn a_moved_server_serves_only_once_it_answers_with_the_alab_vault() {
     )
     .expect("signed");
     std::fs::write(store.join("alab.vault"), signed).unwrap();
-    let server = start_loopback_server(&store);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let server = crate::server::start_with_clock(
+        listener,
+        &ServerOptions {
+            listen: "127.0.0.1:0".parse().expect("addr"),
+            store: store.clone(),
+            advertise: None,
+            pins: Vec::new(),
+            hold: Duration::from_millis(100),
+            keep_awake: false,
+        },
+        clock,
+    )
+    .expect("start server");
     let url = format!("http://{}/v1/alab", server.addr);
 
     // This build names another key for the ALab vault: what the server answers is not it.
@@ -2868,6 +3063,81 @@ fn a_moved_server_serves_only_once_it_answers_with_the_alab_vault() {
     });
     // A one-minute hang detector: the server answers at once.
     steward::serves_alab(&url, Duration::from_secs(60)).expect("serves the ALab vault");
+    CLOCK.store(START + transport::HEARD_COVERAGE_SECS, Ordering::SeqCst);
+    let heard = transport::fetch_heard(&url)
+        .expect("the history covers its window")
+        .expect("the route answers");
+    assert_eq!(heard.anonymous, None, "a look booked a plain read");
+    server.stop();
+}
+
+/// A look for a vault, `look`'s and `probe`'s alike: the server answers it and its heard history
+/// books no plain read, which would keep F20's mirror on for 14 days. NEGATIVE
+/// CONTROL: either look as a plain GET again: `left: Some(1840000000)`, the server's start time.
+#[test]
+fn a_look_for_a_vault_books_no_plain_read() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    const START: u64 = 1_840_000_000;
+    static CLOCK: AtomicU64 = AtomicU64::new(START);
+    fn clock() -> u64 {
+        CLOCK.load(Ordering::SeqCst)
+    }
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let store = root.path().join("served");
+    std::fs::create_dir_all(&store).unwrap();
+    let seed = [7; 32];
+    let signed = envelope::sign(
+        &envelope::Unsigned {
+            name: "looked".to_owned(),
+            seq: 3,
+            time: 1_792_530_003,
+            handoff: Vec::new(),
+            parents: Vec::new(),
+            lockers: vec![envelope::Locker {
+                label: "admin".to_owned(),
+                armored: envelope::test_armor(&[3; 40]),
+            }],
+        },
+        &seed,
+    )
+    .expect("signed");
+    std::fs::write(store.join("looked.vault"), signed).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let server = crate::server::start_with_clock(
+        listener,
+        &ServerOptions {
+            listen: "127.0.0.1:0".parse().expect("addr"),
+            store,
+            advertise: None,
+            pins: Vec::new(),
+            hold: Duration::from_millis(100),
+            keep_awake: false,
+        },
+        clock,
+    )
+    .expect("start server");
+    let url = format!("http://{}/v1/looked", server.addr);
+
+    // A one-minute hang detector each: the server answers at once.
+    assert_eq!(
+        look(
+            &Source::Url(url.clone()),
+            Duration::from_secs(60),
+            Duration::ZERO,
+            &|_| {},
+        ),
+        Look::Answers
+    );
+    let pin = envelope::signer_public(&seed).expect("public");
+    assert!(matches!(
+        probe(&url, &pin, Duration::from_secs(60)).expect("answered"),
+        ProbeOutcome::Found(_)
+    ));
+    CLOCK.store(START + transport::HEARD_COVERAGE_SECS, Ordering::SeqCst);
+    let heard = transport::fetch_heard(&url)
+        .expect("the history covers its window")
+        .expect("the route answers");
+    assert_eq!(heard.anonymous, None, "a look booked a plain read");
     server.stop();
 }
 
@@ -2876,8 +3146,14 @@ fn a_moved_server_serves_only_once_it_answers_with_the_alab_vault() {
 /// ALab vault this build verifies, handing the move the address its arguments serve, so
 /// `mend_held` counts it moved only once that answers with the vault
 /// (`service::move_held_serving`). One whose store holds another key's vault is not this move.
+/// The move names its reason (`HeldMoved`): `FluidServer` for a pre-0.146 server, also under a
+/// 0.147 install where the managed-release rule would move it too, and `ManagedRelease` for a
+/// 0.146 or 0.147 one under 0.147.
 /// NEGATIVE CONTROLS: the store-directory rule moves the other key's store; a mend that hands
-/// over no address moves the job unwatched.
+/// over no address moves the job unwatched; a server branch that always says `ManagedRelease`
+/// fails the 0.146-install assertion (`left: Moved("moved", ManagedRelease)`, `right:
+/// Moved("moved", FluidServer)`), and one that asks the managed-release rule first fails the
+/// 0.145-under-0.147 case the same way.
 #[test]
 fn the_windows_mend_moves_a_held_alab_server_only_watching_it_serve() {
     use crate::service::{Held, Job};
@@ -2955,7 +3231,10 @@ fn the_windows_mend_moves_a_held_alab_server_only_watching_it_serve() {
         )
         .expect("judged")
     };
-    assert_eq!(mend(), HeldMend::Moved("moved".to_owned()));
+    assert_eq!(
+        mend(),
+        HeldMend::Moved("moved".to_owned(), HeldMoved::FluidServer)
+    );
     assert_eq!(
         *watched.borrow(),
         [Some("http://127.0.0.1:7999/v1/alab".to_owned())],
@@ -2966,7 +3245,13 @@ fn the_windows_mend_moves_a_held_alab_server_only_watching_it_serve() {
         version: (0, 147, 0),
         ..release.clone()
     };
-    for version in [(0, 146, 0), (0, 147, 0)] {
+    // Under 0.147 a pre-0.146 server is due both ways; the log names the reason that says
+    // more (it neither pulls nor hands the name on), not only that ALab follows the release.
+    for (version, why) in [
+        ((0, 145, 0), HeldMoved::FluidServer),
+        ((0, 146, 0), HeldMoved::ManagedRelease),
+        ((0, 147, 0), HeldMoved::ManagedRelease),
+    ] {
         let moved = mend_held_with(
             &m22,
             &installed,
@@ -2985,7 +3270,7 @@ fn the_windows_mend_moves_a_held_alab_server_only_watching_it_serve() {
             },
         )
         .unwrap();
-        assert_eq!(moved, HeldMend::Moved("moved".into()));
+        assert_eq!(moved, HeldMend::Moved("moved".into(), why), "{version:?}");
         assert!(
             steward::held_server_move_due(
                 &m22,
@@ -3701,4 +3986,229 @@ fn a_member_re_posts_held_records_when_a_server_lacks_its_frontier() {
     assert!(load_records(&member).unwrap().contains(admit_two.id()));
 
     s1.stop();
+}
+
+#[test]
+fn merge_diverged_heads_cascades_cross_branch_revoke_to_deny_lists_pool_and_lease() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let s1 = start_loopback_server(&root.path().join("s1"));
+    let s2 = start_loopback_server(&root.path().join("s2"));
+    let url1 = format!("http://{}/v1/{}", s1.addr, crate::ALAB_VAULT);
+    let url2 = format!("http://{}/v1/{}", s2.addr, crate::ALAB_VAULT);
+
+    let st1 = Paths::for_home(&root.path().join("st1"));
+    let st2 = Paths::for_home(&root.path().join("st2"));
+    test_create_unbound(&st1, &url1, None, Some("m1")).expect("create alab vault");
+    let st1_rec = machine_identity(&st1).unwrap().recipient().to_bech32();
+    let st2_rec = machine_identity(&st2).unwrap().recipient().to_bech32();
+    let r2 = crate::age::Identity::generate()
+        .unwrap()
+        .recipient()
+        .to_bech32();
+    let r_denied = crate::age::Identity::generate()
+        .unwrap()
+        .recipient()
+        .to_bech32();
+    let nk2 = "bb".repeat(32);
+    let nk_denied = "cc".repeat(32);
+
+    {
+        let opened = admin_open(&st1).unwrap();
+        let mut doc = opened.doc.clone();
+        doc.add_machine("m2", &st2_rec).unwrap();
+        doc.add_admin("m2").unwrap();
+        doc.add_machine("m3", &r2).unwrap();
+        let roster = crate::swarm_roster::SwarmRoster {
+            members: vec![
+                crate::swarm_roster::SwarmMember {
+                    label: "m1".to_owned(),
+                    vault_name: "m1".to_owned(),
+                    recipient: st1_rec.clone(),
+                    node_id: None,
+                    node_key: None,
+                    hint: None,
+                    admitted_ms: 1_000,
+                    aliases: Vec::new(),
+                    claimed_label: None,
+                    claimed_at_ms: None,
+                },
+                crate::swarm_roster::SwarmMember {
+                    label: "m2".to_owned(),
+                    vault_name: "m2".to_owned(),
+                    recipient: st2_rec.clone(),
+                    node_id: None,
+                    node_key: None,
+                    hint: None,
+                    admitted_ms: 1_000,
+                    aliases: Vec::new(),
+                    claimed_label: None,
+                    claimed_at_ms: None,
+                },
+                crate::swarm_roster::SwarmMember {
+                    label: "m3".to_owned(),
+                    vault_name: "m3".to_owned(),
+                    recipient: r2.clone(),
+                    node_id: None,
+                    node_key: None,
+                    hint: None,
+                    admitted_ms: 1_000,
+                    aliases: vec!["m30".to_owned()],
+                    claimed_label: None,
+                    claimed_at_ms: None,
+                },
+            ],
+            deny_labels: Vec::new(),
+            deny_nodes: Vec::new(),
+        };
+        doc.set_entry(
+            &Audience::Everyone,
+            crate::SWARM_ROSTER_ENTRY,
+            roster.to_toml().as_bytes(),
+        )
+        .unwrap();
+        admin_publish(&st1, &opened, &doc).unwrap();
+    }
+    let pre_split = std::fs::read(st1.cache_file()).unwrap();
+    transport::publish(&Source::Url(url2.clone()), &pre_split).unwrap();
+    let pin = config(&st1).unwrap().unwrap().signer.unwrap();
+    join_host(
+        &st2,
+        &format!("{url2}#{}", crate::b64::encode_padded(&pin)),
+        "m2",
+    );
+
+    // Island 1 (s1, higher seq): m3 registers `nk2`, gets a warm slot in `ai-pool.toml`, and holds
+    // the steward lease; also `"m4"` / `nk_denied` is on `deny_labels` / `deny_nodes`.
+    for _ in 0..2 {
+        let a1 = admin_open(&st1).unwrap();
+        let mut d1 = a1.doc.clone();
+        let mut r1 = crate::swarm_roster::SwarmRoster::from_document(&d1)
+            .unwrap()
+            .unwrap();
+        if let Some(m1) = r1.members.iter_mut().find(|m| m.label == "m1") {
+            m1.node_id = Some("00000000000000000000000000000011".to_owned());
+        }
+        if let Some(m3) = r1.members.iter_mut().find(|m| m.label == "m3") {
+            m3.node_id = Some("00000000000000000000000000000011".to_owned());
+            m3.node_key = Some(nk2.clone());
+            m3.claimed_label = Some("m1-3fa2".to_owned());
+        }
+        r1.deny_labels.push("m4".to_owned());
+        r1.deny_nodes.push(nk_denied.clone());
+        d1.set_entry(
+            &Audience::Everyone,
+            crate::SWARM_ROSTER_ENTRY,
+            r1.to_toml().as_bytes(),
+        )
+        .unwrap();
+        let pool_toml = "version = 1\n\n[[account]]\nprovider = \"claude\"\nemail = \"a@example.test\"\nwarm = [\"m3\", \"m1\"]\n";
+        d1.set_entry(&Audience::Everyone, "ai-pool.toml", pool_toml.as_bytes())
+            .unwrap();
+        let lease = SwarmLease {
+            holder: "m3".to_owned(),
+            epoch: 7,
+            until: 1_900_000_000,
+        };
+        let admins = d1.admins();
+        d1.set_entry(
+            &Audience::Hosts(admins),
+            crate::SWARM_LEASE_ENTRY,
+            lease.to_toml().as_bytes(),
+        )
+        .unwrap();
+        admin_publish(&st1, &a1, &d1).unwrap();
+    }
+
+    // Island 2 (s2, lower seq): revokes `r2` via `code-only` (before knowing `nk2` or putting
+    // `"m3"` in `deny_labels`), and admits `r_denied` under vault_name `"laptop"` with roster
+    // label `"m4"` (which is denied on Island 1).
+    {
+        let a2 = admin_open(&st2).unwrap();
+        let mut d2 = a2.doc.clone();
+        d2.remove_machine("m3", true).unwrap();
+        d2.add_code_only(&r2).unwrap();
+        d2.add_machine("laptop", &r_denied).unwrap();
+        let mut r2_ros = crate::swarm_roster::SwarmRoster::from_document(&d2)
+            .unwrap()
+            .unwrap();
+        r2_ros.members.push(crate::swarm_roster::SwarmMember {
+            label: "m4".to_owned(),
+            vault_name: "laptop".to_owned(),
+            recipient: r_denied.clone(),
+            node_id: None,
+            node_key: Some(nk_denied.clone()),
+            hint: None,
+            admitted_ms: 2_000,
+            aliases: Vec::new(),
+            claimed_label: None,
+            claimed_at_ms: None,
+        });
+        d2.set_entry(
+            &Audience::Everyone,
+            crate::SWARM_ROSTER_ENTRY,
+            r2_ros.to_toml().as_bytes(),
+        )
+        .unwrap();
+        admin_publish(&st2, &a2, &d2).unwrap();
+    }
+
+    let heads = read_server_heads(&st1, &[url1, url2]).unwrap();
+    assert_eq!(heads.len(), 2);
+    let merged = merge_diverged_heads(&heads).unwrap();
+    let merged_roster = crate::swarm_roster::SwarmRoster::from_document(&merged.doc)
+        .unwrap()
+        .unwrap();
+
+    // 1. `m3` is removed, its label `"m3"` and alias `"m30"` are in `deny_labels`, and its `nk2`
+    //    from Island 1 is in `deny_nodes`.
+    assert!(merged_roster.member_by_recipient(&r2).is_none());
+    assert!(merged_roster.is_label_denied("m3"));
+    assert!(merged_roster.is_label_denied("m30"));
+    assert!(merged_roster.is_node_denied(&nk2));
+    assert!(
+        !merged_roster.is_label_denied("m1"),
+        "surviving m1 must not be collateral-denied by revoked m3's suffixed claimed_label m1-3fa2: {:?}",
+        merged_roster.deny_labels
+    );
+    assert!(
+        !merged_roster.is_node_denied("00000000000000000000000000000011"),
+        "surviving m1's node_id must not be denied when revoked m3 shared it: {:?}",
+        merged_roster.deny_nodes
+    );
+    assert!(
+        !merged_roster.is_member_denied(merged_roster.member_by_recipient(&st1_rec).unwrap()),
+        "surviving m1 must remain un-denied after merge"
+    );
+
+    // 2. `r_denied` (whose roster row `"m4"` / `nk_denied` is denied by Island 1) is NOT
+    //    re-admitted under a new label via `newly_admitted`.
+    assert!(
+        merged_roster.member_by_recipient(&r_denied).is_none(),
+        "denied roster recipient must not be re-admitted as a newcomer: {:?}",
+        merged_roster.members
+    );
+
+    // 3. `m3`'s warm slot in `ai-pool.toml` is released and `m3`'s steward lease is expired.
+    let pool_after = std::str::from_utf8(
+        merged
+            .doc
+            .entry(&Audience::Everyone, "ai-pool.toml")
+            .unwrap()
+            .value
+            .as_slice(),
+    )
+    .unwrap();
+    assert!(
+        !pool_after.contains("\"m3\""),
+        "m3 warm slot must be stripped after cross-branch revoke: {pool_after}"
+    );
+    let lease_after = SwarmLease::from_document(&merged.doc).unwrap().unwrap();
+    assert_eq!(lease_after.epoch, 7);
+    assert_eq!(
+        lease_after.until, 0,
+        "revoked holder's lease must be expired across branch merge"
+    );
+
+    s1.stop();
+    s2.stop();
 }

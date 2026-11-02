@@ -212,6 +212,32 @@ fn corrupted_raw_deflate_never_panics() {
     }
 }
 
+struct PanicAfterPrefix<'a> {
+    data: &'a [u8],
+    at: usize,
+}
+
+impl<'a> PanicAfterPrefix<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, at: 0 }
+    }
+}
+
+impl Read for PanicAfterPrefix<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        assert!(
+            self.at < self.data.len(),
+            "reader demanded more bytes after an uncompletable header prefix (len {})",
+            self.data.len()
+        );
+        let end = self.data.len().min(self.at + buf.len());
+        let src = &self.data[self.at..end];
+        buf[..src.len()].copy_from_slice(src);
+        self.at = end;
+        Ok(src.len())
+    }
+}
+
 #[test]
 fn optional_header_fields_are_skipped_and_reserved_bits_refused() {
     let payload = b"header field coverage".to_vec();
@@ -244,6 +270,42 @@ fn optional_header_fields_are_skipped_and_reserved_bits_refused() {
             );
         }
     }
+
+    for bad_prefix in [
+        &[0x3cu8][..],
+        &[0x1f, 0x00][..],
+        &[0x1f, 0x8b, 9][..],
+        &[0x1f, 0x8b, 8, 0x20][..],
+        &[0x1f, 0x8b, 8, 0x0c, 0, 0, 0, 0, 0, 3, 0xf4, 0xff][..],
+        &[0x1f, 0x8b, 8, 0x06, 0, 0, 0, 0, 0, 3, 0xf3, 0xff][..],
+    ] {
+        let mut out = [0u8; 8];
+        assert!(
+            GzipReader::new(PanicAfterPrefix::new(bad_prefix))
+                .read(&mut out)
+                .is_err(),
+            "bad prefix {bad_prefix:02x?} was not refused immediately"
+        );
+    }
+
+    let mut uncompletable_name = vec![0x1f, 0x8b, 8, 0x08, 0, 0, 0, 0, 0, 3];
+    uncompletable_name.resize(65_536, b'a');
+    let mut out = [0u8; 8];
+    assert!(
+        GzipReader::new(PanicAfterPrefix::new(&uncompletable_name))
+            .read(&mut out)
+            .is_err(),
+        "64 KiB FNAME prefix without NUL cannot complete within MAX_GZIP_HEADER"
+    );
+
+    let mut exact_cap_header = vec![0x1f, 0x8b, 8, 0x08, 0, 0, 0, 0, 0, 3];
+    exact_cap_header.resize(65_535, b'a');
+    exact_cap_header.push(0);
+    let exact_stream = gzip_member(&exact_cap_header, &body, &payload);
+    assert_eq!(
+        read_all_chunked(GzipReader::new(&exact_stream[..]), 64).expect("exact 64 KiB header"),
+        payload
+    );
 }
 
 #[test]
@@ -251,9 +313,20 @@ fn a_wrong_header_checksum_is_refused() {
     let payload = b"fhcrc".to_vec();
     let mut header: Vec<u8> = vec![0x1f, 0x8b, 8, 0x02, 0, 0, 0, 0, 0, 3];
     let crc16 = (crc32_of(&header) & 0xFFFF) as u16;
+    let [want_lo, _] = crc16.to_le_bytes();
     header.extend_from_slice(&crc16.wrapping_add(1).to_le_bytes());
     let stream = gzip_member(&header, &stored(&payload), &payload);
     assert!(read_all_chunked(GzipReader::new(&stream[..]), 64).is_err());
+
+    let mut bad_lo = vec![0x1f, 0x8b, 8, 0x02, 0, 0, 0, 0, 0, 3];
+    bad_lo.push(want_lo ^ 1);
+    let mut out = [0u8; 8];
+    assert!(
+        GzipReader::new(PanicAfterPrefix::new(&bad_lo))
+            .read(&mut out)
+            .is_err(),
+        "wrong low FHCRC byte cannot complete to a valid header"
+    );
 }
 
 #[test]

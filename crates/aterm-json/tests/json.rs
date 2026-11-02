@@ -1097,6 +1097,12 @@ fn deny_unknown_fields_denies() {
     ] {
         assert_eq!(aterm_json::from_str::<Strict>(input).is_ok(), ok, "{input}");
     }
+    let stream = format!("{}{}1{}", "{".repeat(130), "[".repeat(127), "]".repeat(127));
+    let mut de = aterm_json::Deserializer::from_slice(stream.as_bytes());
+    for _ in 0..130 {
+        assert!(Phase::deserialize(&mut de).is_err());
+    }
+    assert!(aterm_json::Value::deserialize(&mut de).is_ok());
 }
 
 #[test]

@@ -183,7 +183,7 @@ fn run_with_production_deps(
                     "the alab lane packs Apple rows and runs on macOS only",
                 ));
             }
-            let notifier = report::Osascript;
+            let notifier = report::Journal(tx);
             let deps = alab::Deps {
                 packer: &packer,
                 indexer: &indexer,

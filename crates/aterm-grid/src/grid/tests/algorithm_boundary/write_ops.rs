@@ -84,3 +84,66 @@ fn char_ops_carry_extras_with_their_cells() {
         assert_eq!(got, after, "{name}");
     }
 }
+
+/// A wrap onto a double-width row whose DECSLRM left margin lies past the row's `cols / 2`
+/// columns lands on the row's last column, so each bulk writer finds room after it. At the
+/// region bottom the margined scroll keeps the row double-width, and the writers used to wrap
+/// there for ever: no room at column `left`, wrap, back to column `left` (input review
+/// 2026-10-30).
+#[test]
+fn bulk_writers_finish_after_a_wrap_past_a_double_width_row() {
+    type Writer = fn(&mut Grid, &[u8]) -> usize;
+    const COLORS: PackedColors = PackedColors::DEFAULT;
+    let writers: [(&str, Writer); 4] = [
+        ("write_ascii_blast", |g, b| g.write_ascii_blast(b)),
+        ("write_cell_run", |g, b| {
+            g.write_cell_run(b[0], b.len(), COLORS, CellFlags::empty(), &mut None)
+        }),
+        ("write_ascii_run_styled_packed", |g, b| {
+            g.write_ascii_run_styled_packed(b, COLORS, CellFlags::BOLD, &mut None)
+        }),
+        ("write_ascii_run_with_extras", |g, b| {
+            let rgb = Some([1, 2, 3]);
+            g.write_ascii_run_with_extras(
+                b,
+                COLORS,
+                CellFlags::empty(),
+                rgb,
+                None,
+                None,
+                0,
+                None,
+                None,
+                &mut None,
+            )
+        }),
+    ];
+    for (name, write) in writers {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // The saved crasher's state: the bottom row double-width (40 columns of 80), the
+            // left margin at 45, and a wrap pending from column 39, left of the margin.
+            let mut grid = Grid::new(24, 80);
+            grid.set_horizontal_margins(45, 79);
+            grid.set_cursor(23, 39);
+            grid.set_row_line_size(23, crate::LineSize::DoubleWidth);
+            grid.set_pending_wrap(true);
+            let written = write(&mut grid, b"zzzz");
+            let _ = tx.send((written, grid.cursor(), grid.cell(23, 39).map(Cell::char)));
+        });
+        let (written, cursor, last) = rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap_or_else(|_| panic!("{name} returned (a minute without a return is a hang)"));
+        assert_eq!(written, 4, "{name} writes the whole run");
+        assert_eq!(
+            (cursor.row, cursor.col),
+            (23, 39),
+            "{name}: on the row's last column"
+        );
+        assert_eq!(
+            last,
+            Some('z'),
+            "{name}: the run lands on the row's last column"
+        );
+    }
+}

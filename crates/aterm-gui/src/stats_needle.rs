@@ -20,11 +20,11 @@
 //!   ([`Needle::snapped`]).
 //! - **Frames.** A window draws the spring rounded to whole device pixels of tip travel from the
 //!   target (and the soak to whole [`SOAK_STEP`]s), as of its last frame. Its next frame is the
-//!   first moment that rounding changes, never sooner than the window's effect present interval
-//!   after its last ([`Needle::next_after`]), and there is none once it rests on the target. So
-//!   every frame moves the tip a whole pixel at least (or the bezel a whole soak step), a large
-//!   swing runs at the effect present interval (two display periods on an Apple-silicon Mac), a
-//!   small one takes a few frames, and a settled needle asks for nothing.
+//!   first moment that rounding changes, never sooner than the window's needle interval
+//!   ([`View::interval`]) after its last ([`Needle::next_after`]), and there is none once it
+//!   rests on the target. So every frame moves the tip a whole pixel at least (or the bezel a
+//!   whole soak step), a large swing runs at the interval, a small one takes a few frames, and a
+//!   settled needle asks for nothing.
 //! - **Never back.** Each window walks its frames on from the one it last drew ([`Drawn`],
 //!   [`Needle::follow`]), so an interval that changes mid-sweep (a display of another rate, a
 //!   parked effect lane) moves the needle on from where it stands, never back to a frame of the
@@ -226,7 +226,10 @@ pub(crate) struct View {
     /// Device px the tip travels per degree in this window
     /// ([`crate::stats_gauge::tip_px_per_deg`]).
     pub(crate) px_per_deg: f64,
-    /// The shortest time between two of its needle frames: the window's effect present interval.
+    /// The shortest time between two of its needle frames (`App::deck_frame_interval`): one
+    /// period of its deck clock where that is a display link a GPU present follows or the
+    /// headless synthetic panel (two once a frame of the run parked, or in Low Power Mode), else
+    /// the window's effect present interval.
     pub(crate) interval: Duration,
 }
 
@@ -443,13 +446,14 @@ impl Needle {
     }
 
     /// The frames this episode asks of a window after its first, to rest, in `view`: each a
-    /// `stats_needle` deadline (the first is drawn with the reading's own frame), walked from the
-    /// first a window that last drew the needle at `last` draws ([`Self::first`]). 0 where it
-    /// rests on its target at once (the first reading, the dead-band, no window animating a
-    /// dial). A reading that lands sooner cuts the episode short, and a window drawn late walks
-    /// over the frames it missed, so a window's needle deadlines in the episode are at most this
-    /// while its effect interval comes no shorter than `view`'s (a window moved to a faster
-    /// display mid-episode draws more).
+    /// frame of the window's deck clock (the first is drawn with the reading's own frame), walked
+    /// from the first a window that last drew the needle at `last` draws ([`Self::first`]). 0
+    /// where it rests on its target at once (the first reading, the dead-band, no window
+    /// animating a dial). A reading that lands sooner cuts the episode short, and a window drawn
+    /// late walks over the frames it missed, so a window's needle frames in the episode, and its
+    /// clock's `deck_clock` deadlines for them, are at most this while its deck frame interval
+    /// comes no shorter than `view`'s (a window moved to a faster display mid-episode draws
+    /// more).
     pub(crate) fn frames_owed(&self, view: View, last: Option<(f64, f64)>) -> u64 {
         let mut f = self.first(view, last);
         let mut owed = 0;

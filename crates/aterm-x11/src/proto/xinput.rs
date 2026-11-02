@@ -70,14 +70,14 @@ pub fn xi_query_pointer(
 
 /// XISelectEvents (46).
 pub fn xi_select_events(major: u8, window: Window, masks: &[EventMask]) -> Request<Void> {
+    let num_masks = u16::try_from(masks.len()).unwrap_or(u16::MAX);
+    let masks = &masks[..usize::from(num_masks)];
     let mut w = Writer::new(major, 46);
-    w.u32(window)
-        .u16(u16::try_from(masks.len()).unwrap_or(u16::MAX))
-        .pad(2);
+    w.u32(window).u16(num_masks).pad(2);
     for m in masks {
-        w.u16(m.deviceid)
-            .u16(u16::try_from(m.mask.len()).unwrap_or(u16::MAX));
-        for &word in &m.mask {
+        let mask_len = u16::try_from(m.mask.len()).unwrap_or(u16::MAX);
+        w.u16(m.deviceid).u16(mask_len);
+        for &word in &m.mask[..usize::from(mask_len)] {
             w.u32(word);
         }
     }
@@ -183,5 +183,23 @@ impl Reply for XIQueryPointerReply {
             group,
             buttons: r.u32s(usize::from(buttons_len))?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xi_select_events_slices_mask_words_to_u16_header_count() {
+        let mask = EventMask {
+            deviceid: 2,
+            mask: vec![0xaa55_aa55; usize::from(u16::MAX) + 5],
+        };
+        let req = xi_select_events(131, 9, &[mask]);
+        let b = req.bytes();
+        let mask_len = u16::from_ne_bytes([b[14], b[15]]);
+        assert_eq!(mask_len, u16::MAX);
+        assert_eq!(b.len(), 16 + usize::from(u16::MAX) * 4);
     }
 }

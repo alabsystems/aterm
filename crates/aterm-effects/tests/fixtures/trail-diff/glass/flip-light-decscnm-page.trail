@@ -5,6 +5,7 @@
 # compares the glass's frames on each side of the flip. A light scheme's DECSCNM page: Default
 # Light's colours, the screen reversed for 2 s mid-trail while typing goes on.
 
+scale 2
 grid 24 100
 style rainbow kitty
 hz 60

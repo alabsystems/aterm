@@ -169,6 +169,140 @@ fn with_the_tap_off_every_empty_figure_names_its_reason() {
     }
 }
 
+/// The store after one tap reading that carried the week alone (Claude Code 2.1.316 on a login
+/// whose replies report no five-hour window), at `at`.
+fn week_only(week: u32, at: i64) -> State {
+    let mut state = State {
+        machine: MACHINE.to_string(),
+        ..State::default()
+    };
+    let read = TapRead {
+        five_hour: None,
+        seven_day: Some(WindowRead {
+            pct_x10: week,
+            reset: WEEK_END,
+            refilled: None,
+        }),
+        at,
+        seen_before: true,
+        born: None,
+        key: None,
+    };
+    accounts::note_reading(&mut state, "main", &read, at);
+    state
+}
+
+/// A WINDOW THE VENDOR DOES NOT REPORT IS SAID SO, NOT "NO READING YET": where the account's
+/// newest sample carried the week and no five-hour window, the five-hour row says `not reported`
+/// with the sample's age, and `--json` says `not-reported`; with no sample it stays `no reading
+/// yet`, and a void five-hour figure the sample came after reads `not reported` too, where one it
+/// came before still reads `window reset … no reading since`.
+#[test]
+fn a_window_the_vendor_does_not_report_is_said_so() {
+    let state = week_only(10, NOW - 4 * MIN);
+    let p = profile(None);
+    let l = look(state.accounts.get("main"), &p, Tap::On);
+    let v = view(&l);
+    assert_eq!(win(&v, SESSION_LIMIT).missing, Some(Missing::NotReported));
+    assert_eq!(win(&v, SESSION_LIMIT).fig, None, "no figure is invented");
+    assert_eq!(win(&v, WEEK_LIMIT).missing, None);
+    let shown = text(&l, &v);
+    assert!(
+        shown.contains(
+            "  5h     \u{2014}  not reported: Claude Code reports the week but no 5h window for \
+             this login (as of 4m)\n"
+        ),
+        "{shown}"
+    );
+    assert_eq!(
+        doc(&l)["accounts"][0]["windows"][0]["missing"]["reason"],
+        Value::from("not-reported")
+    );
+    let none = look(None, &p, Tap::On);
+    assert_eq!(
+        win(&view(&none), SESSION_LIMIT).missing,
+        Some(Missing::NoReading)
+    );
+    let mut panel = State {
+        machine: MACHINE.to_string(),
+        ..State::default()
+    };
+    accounts::note_sample(
+        &mut panel,
+        "main",
+        accounts::Sample {
+            week_pct: Some(1),
+            week_reset: Some(WEEK_END),
+            at: NOW - MIN,
+            ..accounts::Sample::default()
+        },
+        NOW,
+    );
+    let l = look(panel.accounts.get("main"), &p, Tap::On);
+    assert_eq!(
+        win(&view(&l), SESSION_LIMIT).missing,
+        Some(Missing::NoReading),
+        "a /usage panel's sample is not taken for it: a narrow pane may have cut the row"
+    );
+    let mut five_only = State {
+        machine: MACHINE.to_string(),
+        ..State::default()
+    };
+    let read = TapRead {
+        five_hour: Some(WindowRead {
+            pct_x10: 400,
+            reset: NOW + HOUR,
+            refilled: None,
+        }),
+        seven_day: None,
+        at: NOW - MIN,
+        seen_before: true,
+        born: None,
+        key: None,
+    };
+    accounts::note_reading(&mut five_only, "main", &read, NOW - MIN);
+    let l = look(five_only.accounts.get("main"), &p, Tap::On);
+    assert_eq!(
+        win(&view(&l), WEEK_LIMIT).missing,
+        Some(Missing::NoReading),
+        "the week is never said unreported"
+    );
+
+    let mut after = week_only(10, NOW - 4 * MIN);
+    let old = accounts::WindowFig {
+        pct_x10: 300,
+        reset: NOW - HOUR,
+        at: NOW - 3 * HOUR,
+        by: MACHINE.to_string(),
+        source: accounts::SOURCE_TAP.to_string(),
+        epoch_at: None,
+    };
+    let held = after.accounts.get_mut("main").expect("held");
+    held.windows.insert(SESSION_LIMIT.to_string(), old.clone());
+    let l = look(after.accounts.get("main"), &p, Tap::On);
+    assert_eq!(
+        win(&view(&l), SESSION_LIMIT).missing,
+        Some(Missing::NotReported),
+        "the sample came after the window reset"
+    );
+    let held = after.accounts.get_mut("main").expect("held");
+    held.windows.insert(
+        SESSION_LIMIT.to_string(),
+        accounts::WindowFig {
+            reset: NOW - MIN,
+            ..old
+        },
+    );
+    let l = look(after.accounts.get("main"), &p, Tap::On);
+    assert_eq!(
+        win(&view(&l), SESSION_LIMIT).missing,
+        Some(Missing::WindowReset),
+        "the sample came before the window reset"
+    );
+    let held = held_windows(&after.accounts["main"], None, Some(MACHINE), Tap::On, NOW);
+    assert_eq!(held.windows.len(), 2, "the two windows, no per-model week");
+}
+
 #[test]
 fn a_tap_figure_is_current_to_a_tenth_and_void_after_its_reset() {
     let state = tapped(425, 710, NOW - MIN);
@@ -220,6 +354,58 @@ fn a_tap_figure_is_current_to_a_tenth_and_void_after_its_reset() {
     assert_eq!(
         doc(&before)["accounts"][0]["windows"][0]["state"],
         Value::from("current")
+    );
+
+    // Across the 2026-11-01 fall-back (09:00Z, -7h PDT -> -8h PST), `text_local`
+    // places a post-change reset and login renewal on PST rather than `now`'s PDT.
+    let dst_now = 1_793_498_400; // 2026-10-31T19:00:00-07:00
+    let dst_week_reset = 1_793_556_000; // 2026-11-01T10:00:00-08:00 (11:00 under -7h)
+    let dst_renew_by = 1_793_559_600; // 2026-11-01T11:00:00-08:00 (12:00 under -7h)
+    let mut dst_state = State {
+        machine: MACHINE.to_string(),
+        ..State::default()
+    };
+    accounts::note_reading(
+        &mut dst_state,
+        "main",
+        &TapRead {
+            seven_day: Some(WindowRead {
+                pct_x10: 500,
+                reset: dst_week_reset,
+                refilled: None,
+            }),
+            at: dst_now - MIN,
+            seen_before: true,
+            ..TapRead::default()
+        },
+        dst_now - MIN,
+    );
+    let dst_look = Look {
+        now: dst_now,
+        tz_s: -7 * HOUR,
+        account: dst_state.accounts.get("main"),
+        login: Some(Login {
+            state: "ok",
+            renew_by: Some(dst_renew_by),
+        }),
+        ..look(None, &p, Tap::On)
+    };
+    let tz_at = |t: i64| {
+        if t < 1_793_523_600 {
+            -7 * HOUR
+        } else {
+            -8 * HOUR
+        }
+    };
+    let dst_shown = text_local(&dst_look, &view(&dst_look), &tz_at);
+    assert!(
+        dst_shown.starts_with("accounts at Sat Oct 31 19:00 "),
+        "{dst_shown}"
+    );
+    assert!(dst_shown.contains("resets Sun Nov 1 10:00 "), "{dst_shown}");
+    assert!(
+        dst_shown.contains("renew by Sun Nov 1 11:00\n"),
+        "{dst_shown}"
     );
 }
 
@@ -942,12 +1128,22 @@ fn the_texts_spans_instants_and_dollars() {
     assert_eq!(span(85 * MIN), "1h25m");
     assert_eq!(span(2 * HOUR), "2h");
     assert_eq!(span(3 * DAY + 4 * HOUR + 10), "3d4h");
-    assert_eq!(clock(NOW + 85 * MIN, NOW, 0), "18:05");
-    assert_eq!(clock(WEEK_END, NOW, 0), "Sun Oct 18 20:50");
+    assert_eq!(clock_local(NOW + 85 * MIN, NOW, &|_| 0), "18:05");
+    assert_eq!(clock_local(WEEK_END, NOW, &|_| 0), "Sun Oct 18 20:50");
     assert_eq!(
-        clock(NOW + 85 * MIN, NOW, -7 * HOUR),
+        clock_local(NOW + 85 * MIN, NOW, &|_| -7 * HOUR),
         "11:05",
         "the local clock"
+    );
+    let dst_seam = 1_772_964_000; // 2026-03-08T10:00:00Z (02:00 PST -> 03:00 PDT)
+    assert_eq!(
+        clock_local(
+            dst_seam + 30 * MIN,
+            dst_seam - 30 * MIN,
+            &|s| if s < dst_seam { -8 * HOUR } else { -7 * HOUR },
+        ),
+        "03:30",
+        "DST spring-forward evaluates each instant's own offset"
     );
     assert_eq!(usd(4.214), "$4.21");
     assert_eq!(usd(1890.2), "$1,890");

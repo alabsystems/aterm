@@ -7,9 +7,7 @@ use std::ffi::{CStr, c_int, c_void};
 use std::sync::OnceLock;
 
 use crate::iflist::{self, IfReqFunctional};
-use crate::iokit::{
-    self, CFTypeRef, MAIN_PORT_DEFAULT, io_object_t, io_registry_entry_t, io_service_t,
-};
+use crate::iokit::{self, CFTypeRef, MAIN_PORT_DEFAULT, io_object_t, io_registry_entry_t};
 use crate::machine::{DtCpu, Level, VmPages};
 use crate::{
     CoreTicks, CpuLayout, GpuClients, GpuDriver, GpuReading, LinkReading, MAX_GPU_CLIENTS,
@@ -924,46 +922,37 @@ pub(crate) fn memory_detail() -> Option<MemoryDetail> {
 
 /// The keys of `PerformanceStatistics` and of the user clients' properties, made once.
 struct GpuKeys {
-    stats: CFTypeRef,
-    device: CFTypeRef,
-    renderer: CFTypeRef,
-    tiler: CFTypeRef,
-    in_use: CFTypeRef,
-    alloc: CFTypeRef,
-    recoveries: CFTypeRef,
-    app_usage: CFTypeRef,
-    creator: CFTypeRef,
-    gpu_time: CFTypeRef,
+    stats: Cf,
+    device: Cf,
+    renderer: Cf,
+    tiler: Cf,
+    in_use: Cf,
+    alloc: Cf,
+    recoveries: Cf,
+    app_usage: Cf,
+    creator: Cf,
+    gpu_time: Cf,
 }
 
 /// The first `IOAccelerator`, matched once per process, with what never changes about it.
 struct Accel {
-    service: io_service_t,
+    service: Io,
     keys: GpuKeys,
     name: Option<String>,
     cores: Option<u16>,
 }
 
 // SAFETY: The service is a Mach port name and the keys immutable CFStrings,
-// all kept for the process (never released) and usable from any thread;
-// Rust dereferences none of them.
+// all kept for the process in `OnceLock` and usable from any thread; Rust
+// dereferences none of them.
 unsafe impl Send for Accel {}
 // SAFETY: As for `Send`.
 unsafe impl Sync for Accel {}
 
-/// A process-lifetime CFString: the +1 is deliberately kept.
-fn kept_string(text: &CStr) -> Option<CFTypeRef> {
-    Cf::string(text).map(|s| {
-        let raw = s.0;
-        std::mem::forget(s);
-        raw
-    })
-}
-
 /// The power manager's root domain and its `System Capabilities` key, kept for the process.
 struct RootDomain {
-    service: io_service_t,
-    key: CFTypeRef,
+    service: Io,
+    key: Cf,
 }
 
 // SAFETY: `service` is a Mach port name and `key` an immutable CFString the process keeps; IOKit
@@ -991,14 +980,73 @@ pub(crate) fn system_capabilities() -> Option<u32> {
             if service == 0 {
                 return None;
             }
+            let service = Io(service);
             Some(RootDomain {
                 service,
-                key: kept_string(c"System Capabilities")?,
+                key: Cf::string(c"System Capabilities")?,
             })
         })
         .as_ref()?;
-    let value = Cf::property(root.service, root.key)?;
+    let value = Cf::property(root.service.0, root.key.0)?;
     cf_u64(value.0).and_then(|n| u32::try_from(n).ok())
+}
+
+/// [`crate::power::assertions_of`] on macOS: the power assertions `pid` holds now, as the power
+/// manager lists them (`IOPMCopyAssertionsByProcess`, public IOPMLib.h), each its `AssertType`
+/// and `AssertName`.
+pub(crate) fn assertions_of(pid: u32) -> Result<Vec<crate::power::Assertion>, String> {
+    let mut by_pid: iokit::CFDictionaryRef = std::ptr::null();
+    // SAFETY: A writable dictionary out-pointer; on success the dictionary is +1 (the Copy rule)
+    // and adopted below, released once.
+    let rc = unsafe { iokit::IOPMCopyAssertionsByProcess(&raw mut by_pid) };
+    if rc != 0 {
+        return Err(format!("IOPMCopyAssertionsByProcess returned {rc:#x}"));
+    }
+    let Some(by_pid) = Cf::adopt(by_pid.cast()) else {
+        return Ok(Vec::new());
+    };
+    let (Some(kind_key), Some(name_key)) = (Cf::string(c"AssertType"), Cf::string(c"AssertName"))
+    else {
+        return Err("CoreFoundation made no key string".to_owned());
+    };
+    let mut held = Vec::new();
+    // SAFETY: `by_pid` is a live +1 object; its type is checked before it is read as a
+    // dictionary, `keys` and `values` have room for the count it reports, and every pointer
+    // they receive, and each array and dictionary under them, is borrowed while `by_pid` lives
+    // and has its type checked before it is read.
+    unsafe {
+        if iokit::CFGetTypeID(by_pid.0) != iokit::CFDictionaryGetTypeID() {
+            return Err("IOPMCopyAssertionsByProcess answered no dictionary".to_owned());
+        }
+        let count = usize::try_from(iokit::CFDictionaryGetCount(by_pid.0.cast())).unwrap_or(0);
+        let mut keys = vec![std::ptr::null::<c_void>(); count];
+        let mut values = vec![std::ptr::null::<c_void>(); count];
+        iokit::CFDictionaryGetKeysAndValues(
+            by_pid.0.cast(),
+            keys.as_mut_ptr(),
+            values.as_mut_ptr(),
+        );
+        for (key, list) in keys.into_iter().zip(values) {
+            if cf_u64(key) != Some(u64::from(pid))
+                || list.is_null()
+                || iokit::CFGetTypeID(list) != iokit::CFArrayGetTypeID()
+            {
+                continue;
+            }
+            for i in 0..iokit::CFArrayGetCount(list.cast()).max(0) {
+                let item = iokit::CFArrayGetValueAtIndex(list.cast(), i);
+                if item.is_null() || iokit::CFGetTypeID(item) != iokit::CFDictionaryGetTypeID() {
+                    continue;
+                }
+                let kind = cf_text(iokit::CFDictionaryGetValue(item.cast(), kind_key.0));
+                let name = cf_text(iokit::CFDictionaryGetValue(item.cast(), name_key.0));
+                if let Some(kind) = kind {
+                    held.push(crate::power::Assertion { kind, name });
+                }
+            }
+        }
+    }
+    Ok(held)
 }
 
 fn accel() -> Option<&'static Accel> {
@@ -1018,32 +1066,33 @@ fn accel() -> Option<&'static Accel> {
             if service == 0 {
                 return None;
             }
+            let service = Io(service);
             let keys = GpuKeys {
-                stats: kept_string(c"PerformanceStatistics")?,
-                device: kept_string(c"Device Utilization %")?,
-                renderer: kept_string(c"Renderer Utilization %")?,
-                tiler: kept_string(c"Tiler Utilization %")?,
-                in_use: kept_string(c"In use system memory")?,
-                alloc: kept_string(c"Alloc system memory")?,
-                recoveries: kept_string(c"recoveryCount")?,
-                app_usage: kept_string(c"AppUsage")?,
-                creator: kept_string(c"IOUserClientCreator")?,
-                gpu_time: kept_string(c"accumulatedGPUTime")?,
+                stats: Cf::string(c"PerformanceStatistics")?,
+                device: Cf::string(c"Device Utilization %")?,
+                renderer: Cf::string(c"Renderer Utilization %")?,
+                tiler: Cf::string(c"Tiler Utilization %")?,
+                in_use: Cf::string(c"In use system memory")?,
+                alloc: Cf::string(c"Alloc system memory")?,
+                recoveries: Cf::string(c"recoveryCount")?,
+                app_usage: Cf::string(c"AppUsage")?,
+                creator: Cf::string(c"IOUserClientCreator")?,
+                gpu_time: Cf::string(c"accumulatedGPUTime")?,
             };
             let name = Cf::string(c"model")
-                .and_then(|k| Cf::property(service, k.0))
+                .and_then(|k| Cf::property(service.0, k.0))
                 .and_then(|v| cf_text(v.0))
                 .or_else(|| {
                     let mut class = [0 as libc::c_char; 128];
                     // SAFETY: `service` is live and `class` is a 128-byte `io_name_t`.
-                    let kr = unsafe { iokit::IOObjectGetClass(service, class.as_mut_ptr()) };
+                    let kr = unsafe { iokit::IOObjectGetClass(service.0, class.as_mut_ptr()) };
                     // SAFETY: On success `class` holds a NUL-terminated name.
                     let text = (kr == 0)
                         .then(|| unsafe { CStr::from_ptr(class.as_ptr()) }.to_string_lossy());
                     text.map(|t| t.into_owned()).filter(|t| !t.is_empty())
                 });
             let cores = Cf::string(c"gpu-core-count")
-                .and_then(|k| Cf::property(service, k.0))
+                .and_then(|k| Cf::property(service.0, k.0))
                 .and_then(|v| cf_u64(v.0))
                 .and_then(|n| u16::try_from(n).ok());
             Some(Accel {
@@ -1064,7 +1113,7 @@ pub(crate) fn gpu() -> Option<GpuReading> {
         name: a.name.clone(),
         ..GpuReading::default()
     };
-    let Some(stats) = Cf::property(a.service, a.keys.stats) else {
+    let Some(stats) = Cf::property(a.service.0, a.keys.stats.0) else {
         return Some(reading);
     };
     // SAFETY: `stats` is live; its type is checked before it is read as a
@@ -1074,12 +1123,12 @@ pub(crate) fn gpu() -> Option<GpuReading> {
     };
     // SAFETY: `stats` is a live CF object.
     if unsafe { iokit::CFGetTypeID(stats.0) == iokit::CFDictionaryGetTypeID() } {
-        reading.device_pct = value(a.keys.device).and_then(crate::machine::percent_of);
-        reading.renderer_pct = value(a.keys.renderer).and_then(crate::machine::percent_of);
-        reading.tiler_pct = value(a.keys.tiler).and_then(crate::machine::percent_of);
-        reading.in_use_bytes = value(a.keys.in_use).and_then(|v| u64::try_from(v).ok());
-        reading.alloc_bytes = value(a.keys.alloc).and_then(|v| u64::try_from(v).ok());
-        reading.recoveries = value(a.keys.recoveries).and_then(|v| u64::try_from(v).ok());
+        reading.device_pct = value(a.keys.device.0).and_then(crate::machine::percent_of);
+        reading.renderer_pct = value(a.keys.renderer.0).and_then(crate::machine::percent_of);
+        reading.tiler_pct = value(a.keys.tiler.0).and_then(crate::machine::percent_of);
+        reading.in_use_bytes = value(a.keys.in_use.0).and_then(|v| u64::try_from(v).ok());
+        reading.alloc_bytes = value(a.keys.alloc.0).and_then(|v| u64::try_from(v).ok());
+        reading.recoveries = value(a.keys.recoveries.0).and_then(|v| u64::try_from(v).ok());
     }
     if reading.device_pct.is_none() {
         reading.unread = Some(crate::Why::Unsupported);
@@ -1092,7 +1141,7 @@ pub(crate) fn gpu_driver() -> Option<GpuDriver> {
     let a = accel()?;
     let text = |key: &CStr| {
         Cf::string(key)
-            .and_then(|k| Cf::property(a.service, k.0))
+            .and_then(|k| Cf::property(a.service.0, k.0))
             .and_then(|v| cf_text(v.0))
             .filter(|t| !t.is_empty())
     };
@@ -1118,7 +1167,7 @@ pub(crate) fn gpu_clients() -> Option<GpuClients> {
     // SAFETY: `a.service` is a live entry kept for the process, the plane
     // name NUL-terminated, `iter` writable; on success the iterator is +1.
     let kr = unsafe {
-        iokit::IORegistryEntryGetChildIterator(a.service, c"IOService".as_ptr(), &raw mut iter)
+        iokit::IORegistryEntryGetChildIterator(a.service.0, c"IOService".as_ptr(), &raw mut iter)
     };
     if kr != 0 || iter == 0 {
         return None;
@@ -1145,11 +1194,11 @@ pub(crate) fn gpu_clients() -> Option<GpuClients> {
             identified = false;
             continue;
         }
-        let creator = Cf::property(child.0, a.keys.creator).and_then(|v| cf_text(v.0));
-        let usage = Cf::property(child.0, a.keys.app_usage);
+        let creator = Cf::property(child.0, a.keys.creator.0).and_then(|v| cf_text(v.0));
+        let usage = Cf::property(child.0, a.keys.app_usage.0);
         let usage = usage
             .as_ref()
-            .and_then(|u| app_usage(u.0, a.keys.gpu_time, &mut times));
+            .and_then(|u| app_usage(u.0, a.keys.gpu_time.0, &mut times));
         out.record(entry, creator.as_deref(), usage);
     }
     // SAFETY: `iter` is a live iterator.

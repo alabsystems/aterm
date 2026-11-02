@@ -87,9 +87,7 @@ pub unsafe fn adopt_inherited_socket(fd: RawFd) -> io::Result<OwnedFd> {
     }
     // SAFETY: the caller admitted exclusive, stable ownership; the checks above only diagnose type/flags. This is the number's one owner, dropped immediately after its close-on-exec copy is made.
     let inherited = unsafe { OwnedFd::from_raw_fd(fd) };
-    let adopted = inherited.try_clone()?;
-    crate::keep_out_of_children(&adopted)?;
-    Ok(adopted)
+    crate::kept_out(|| inherited.try_clone())
 }
 
 /// What descriptor `fd` refers to, read from the descriptor itself.
@@ -297,6 +295,9 @@ impl Drop for LaneChild {
 }
 
 /// Spawn `cmd` with `first` and `second` inherited at [`BRIDGE_VERB_FD`] and [`BRIDGE_PUSH_FD`], and nothing else above stdio.
+///
+/// A lane (or a stdio descriptor) made through [`crate::kept_out`] reaches this child all the
+/// same: the spawn unmarks it for its own child alone, with no other spawn in flight.
 pub fn spawn_with_two_fds(
     cmd: LaneCommand,
     first: OwnedFd,
@@ -306,12 +307,33 @@ pub fn spawn_with_two_fds(
     launch(cmd, &lanes)
 }
 
+/// Spawn `cmd` DETACHED, holding `first` and `second` at [`BRIDGE_VERB_FD`] and [`BRIDGE_PUSH_FD`]
+/// and nothing else above stdio, as [`spawn_with_two_fds`] does, in a session of its own
+/// (`setsid`), so it leads a process group no terminal's job holds and no job's signal reaches:
+/// a process meant to outlive the job that started it (a build's claim holder,
+/// [`crate::build_front::HOLD_VERB`]). Its parent is still this process until it forks away.
+///
+/// # Errors
+/// The spawn's; on Linux, `Unsupported` (the Linux lane spawn places stdio and lanes only).
+pub fn detached_with_two_fds(
+    cmd: LaneCommand,
+    first: OwnedFd,
+    second: OwnedFd,
+) -> io::Result<LaneChild> {
+    let lanes = [off_the_targets(first)?, off_the_targets(second)?];
+    launch_placed(cmd, &lanes, true)
+}
+
 /// Spawn `cmd` holding its stdio and nothing else.
 pub fn spawn(cmd: LaneCommand) -> io::Result<LaneChild> {
     launch(cmd, &[])
 }
 
 fn launch(cmd: LaneCommand, lanes: &[OwnedFd]) -> io::Result<LaneChild> {
+    launch_placed(cmd, lanes, false)
+}
+
+fn launch_placed(cmd: LaneCommand, lanes: &[OwnedFd], setsid: bool) -> io::Result<LaneChild> {
     let LaneCommand {
         program,
         args,
@@ -328,6 +350,7 @@ fn launch(cmd: LaneCommand, lanes: &[OwnedFd]) -> io::Result<LaneChild> {
         &Placement {
             stdio: [stdio[0].source(), stdio[1].source(), stdio[2].source()],
             lanes,
+            setsid,
             ..Placement::default()
         },
     )?;
@@ -369,6 +392,8 @@ struct Placement<'a> {
     replace: bool,
     long_entry_ends: bool,
     inherit_all: bool,
+    #[cfg(target_vendor = "apple")]
+    native_image: bool,
     disclaim: Option<&'a std::ffi::CStr>,
     suspended: bool,
 }
@@ -385,6 +410,8 @@ impl Default for Placement<'_> {
             replace: false,
             long_entry_ends: false,
             inherit_all: false,
+            #[cfg(target_vendor = "apple")]
+            native_image: false,
             disclaim: None,
             suspended: false,
         }
@@ -408,14 +435,19 @@ fn off_stdio(fd: OwnedFd) -> io::Result<OwnedFd> {
     placeable_copy(fd.as_raw_fd())
 }
 
+/// A copy of `fd` above every number a spawn places, kept out of children from its creation
+/// (a copy never carries its source's mark): the spawn it is made for hands it to its own child
+/// alone (`spawn_lock::handing`).
 fn placeable_copy(fd: RawFd) -> io::Result<OwnedFd> {
-    // SAFETY: `F_DUPFD_CLOEXEC` reads one descriptor number and returns a fresh descriptor or -1; it touches no memory.
-    let copy = unsafe { fcntl(fd, F_DUPFD_CLOEXEC, FIRST_FREE) };
-    if copy < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: `copy` was just created here and nothing else owns it.
-    let copy = unsafe { OwnedFd::from_raw_fd(copy) };
+    let copy = crate::kept_out(|| {
+        // SAFETY: `F_DUPFD_CLOEXEC` reads one descriptor number and returns a fresh descriptor or -1; it touches no memory.
+        let copy = unsafe { fcntl(fd, F_DUPFD_CLOEXEC, FIRST_FREE) };
+        if copy < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `copy` was just created here and nothing else owns it.
+        Ok(unsafe { OwnedFd::from_raw_fd(copy) })
+    })?;
     if !placeable(copy.as_raw_fd()) {
         return Err(io::Error::from_raw_os_error(EMFILE));
     }
@@ -427,6 +459,68 @@ struct Image {
     argv: Vec<CString>,
     envp: Vec<CString>,
     search: Option<OsString>,
+}
+
+/// Strings and pointer arrays whose addresses remain stable when the owner is moved.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+struct ExecImage {
+    _image: Image,
+    path: CString,
+    argv: Vec<*const core::ffi::c_char>,
+    envp: Vec<*const core::ffi::c_char>,
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+impl ExecImage {
+    fn new(image: Image, path: CString) -> Self {
+        let argv = Image::pointers(&image.argv);
+        let envp = Image::pointers(&image.envp);
+        Self {
+            _image: image,
+            path,
+            argv,
+            envp,
+        }
+    }
+}
+
+/// Read the same absolute microsecond clock the native-operation contract transmits.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+fn exec_now_us() -> io::Result<u64> {
+    let mut now = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    // SAFETY: the successful call initializes one writable timespec.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, now.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: clock_gettime succeeded and initialized the complete value.
+    let now = unsafe { now.assume_init() };
+    let valid = u64::try_from(now.tv_sec)
+        .ok()
+        .and_then(|seconds| seconds.checked_mul(1_000_000))
+        .zip(
+            u64::try_from(now.tv_nsec)
+                .ok()
+                .filter(|&ns| ns < 1_000_000_000),
+        )
+        .and_then(|(seconds, nanos)| seconds.checked_add(nanos / 1000));
+    valid.ok_or_else(|| io::Error::other("invalid native exec clock"))
+}
+
+/// Enter the actual dispatch gate before checking the original deadline. Nothing between a
+/// successful check and `dispatch` allocates, resolves paths, or waits for another lock.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+fn exec_dispatch<G>(
+    enter: impl FnOnce() -> G,
+    deadline_us: u64,
+    now: impl FnOnce() -> io::Result<u64>,
+    dispatch: impl FnOnce() -> io::Error,
+) -> io::Error {
+    let _gate = enter();
+    match now() {
+        Ok(now) if now < deadline_us => dispatch(),
+        Ok(_) => io::Error::new(io::ErrorKind::TimedOut, "native exec deadline elapsed"),
+        Err(error) => error,
+    }
 }
 
 const BSHELL: &core::ffi::CStr = c"/bin/sh";
@@ -522,12 +616,16 @@ fn resolve(program: &OsStr, path_var: Option<&OsStr>) -> io::Result<CString> {
 
 #[cfg(target_vendor = "apple")]
 mod platform {
-    use super::{BSHELL, ENOEXEC, F_GETFD, Image, Placement, Source, c_string, fcntl};
+    use super::{
+        BSHELL, ENOEXEC, ExecImage, F_GETFD, Image, Placement, Source, X_OK, access, c_string,
+        exec_dispatch, exec_now_us, fcntl,
+    };
     use core::ffi::{CStr, c_char, c_void};
     use std::ffi::{CString, OsStr};
     use std::io;
     use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
 
     type Attr = *mut c_void;
     type Actions = *mut c_void;
@@ -589,6 +687,9 @@ mod platform {
     struct Objects {
         attr: Attr,
         actions: Actions,
+        /// Each descriptor a `dup2` action hands the child, which the spawn unmarks for it alone
+        /// (`crate::spawn_lock::handing`).
+        handed: Vec<i32>,
     }
 
     impl Objects {
@@ -603,10 +704,25 @@ mod platform {
                 unsafe { posix_spawnattr_destroy(&mut attr) };
                 return Err(e);
             }
-            Ok(Self { attr, actions })
+            Ok(Self {
+                attr,
+                actions,
+                handed: Vec::new(),
+            })
         }
 
         fn spawn(
+            &self,
+            path: &CStr,
+            argv: &[*const c_char],
+            envp: &[*const c_char],
+        ) -> Result<i32, i32> {
+            let _spawning = crate::spawn_lock::handing(&self.handed);
+            self.spawn_unguarded(path, argv, envp)
+        }
+
+        /// The caller holds the spawn lock through the raw native dispatch.
+        fn spawn_unguarded(
             &self,
             path: &CStr,
             argv: &[*const c_char],
@@ -643,6 +759,90 @@ mod platform {
             Ok(())
         } else {
             Err(io::Error::from_raw_os_error(rc))
+        }
+    }
+
+    pub(super) struct PreparedExec {
+        image: ExecImage,
+        objects: Objects,
+    }
+
+    impl PreparedExec {
+        pub(super) fn new(image: Image) -> io::Result<Self> {
+            if image.program.as_bytes().is_empty() {
+                return Err(io::Error::from_raw_os_error(ENOENT));
+            }
+            let path = if image.program.as_bytes().contains(&b'/') {
+                image.program.clone()
+            } else {
+                let mut denied = false;
+                let mut found = None;
+                for candidate in candidates(
+                    image.program.as_bytes(),
+                    image.search.as_deref(),
+                    None,
+                    true,
+                ) {
+                    let candidate = candidate?;
+                    if !exists(&candidate) {
+                        continue;
+                    }
+                    match runnable(&candidate) {
+                        Ok(()) => {
+                            found = Some(candidate);
+                            break;
+                        }
+                        Err(error) => denied |= error.raw_os_error() == Some(EACCES),
+                    }
+                }
+                found.ok_or_else(|| {
+                    io::Error::from_raw_os_error(if denied { EACCES } else { ENOENT })
+                })?
+            };
+            let mut objects = Objects::new()?;
+            let defaults = SIGPIPE_BIT;
+            // SAFETY: initialized, exclusively owned attributes; the setters copy their
+            // scalar arguments. There are no descriptor actions or signal-mask changes.
+            unsafe {
+                check(posix_spawnattr_setflags(
+                    &mut objects.attr,
+                    POSIX_SPAWN_SETEXEC | POSIX_SPAWN_SETSIGDEF,
+                ))?;
+                check(posix_spawnattr_setsigdefault(&mut objects.attr, &defaults))?;
+            }
+            Ok(Self {
+                image: ExecImage::new(image, path),
+                objects,
+            })
+        }
+
+        pub(super) fn exec_until(self, deadline_us: u64) -> io::Error {
+            self.exec_with(deadline_us, exec_now_us, |prepared| {
+                let image = &prepared.image;
+                match prepared
+                    .objects
+                    .spawn_unguarded(&image.path, &image.argv, &image.envp)
+                {
+                    Ok(_) => io::Error::other("the in-place exec returned a child"),
+                    Err(error) => io::Error::from_raw_os_error(error),
+                }
+            })
+        }
+
+        pub(super) fn exec_with(
+            self,
+            deadline_us: u64,
+            now: impl FnOnce() -> io::Result<u64>,
+            dispatch: impl FnOnce(&Self) -> io::Error,
+        ) -> io::Error {
+            exec_dispatch(crate::spawn_lock::spawning, deadline_us, now, || {
+                dispatch(&self)
+            })
+        }
+
+        #[cfg(test)]
+        pub(super) fn captured(&self) -> (&Image, &CStr) {
+            (&self.image._image, &self.image.path)
         }
     }
 
@@ -723,11 +923,13 @@ mod platform {
                     }
                     Source::Inherit => open_null(&mut objects.actions),
                     Source::Fd(fd) => {
+                        objects.handed.push(fd);
                         posix_spawn_file_actions_adddup2(&mut objects.actions, fd, target)
                     }
                 })?;
             }
             for (target, lane) in (super::BRIDGE_VERB_FD..).zip(place.lanes) {
+                objects.handed.push(lane.as_raw_fd());
                 check(posix_spawn_file_actions_adddup2(
                     &mut objects.actions,
                     lane.as_raw_fd(),
@@ -760,35 +962,24 @@ mod platform {
         };
         let program = image.program.as_bytes();
         if program.contains(&b'/') {
-            let path = rebase(program, place)?;
+            let path = rebase(program, place.base)?;
             return match objects.spawn(&path, argv, envp) {
                 Ok(pid) => Ok(pid),
-                Err(ENOEXEC) => as_script(&path),
+                Err(ENOEXEC) if !place.native_image => as_script(&path),
                 Err(rc) => Err(io::Error::from_raw_os_error(rc)),
             };
         }
         if program.is_empty() {
             return Err(io::Error::from_raw_os_error(ENOENT));
         }
-        let search = image
-            .search
-            .as_deref()
-            .map_or(&b"/usr/bin:/bin"[..], OsStr::as_bytes);
-        let exists = |path: &CString| std::fs::metadata(OsStr::from_bytes(path.as_bytes())).is_ok();
         let mut eacces = false;
-        for dir in search.split(|&b| b == b':') {
-            let dir: &[u8] = if dir.is_empty() { b"." } else { dir };
-            if dir.len() + program.len() + 2 > PATH_MAX {
-                if place.long_entry_ends {
-                    return Err(io::Error::from_raw_os_error(ENAMETOOLONG));
-                }
-                continue;
-            }
-            let mut full = Vec::with_capacity(dir.len() + program.len() + 1);
-            full.extend_from_slice(dir);
-            full.push(b'/');
-            full.extend_from_slice(program);
-            let candidate = rebase(&full, place)?;
+        for candidate in candidates(
+            program,
+            image.search.as_deref(),
+            place.base,
+            place.long_entry_ends,
+        ) {
+            let candidate = candidate?;
             if !exists(&candidate) {
                 continue;
             }
@@ -798,7 +989,7 @@ mod platform {
             };
             match rc {
                 ELOOP | ENAMETOOLONG | ENOENT | ENOTDIR => {}
-                ENOEXEC => return as_script(&candidate),
+                ENOEXEC if !place.native_image => return as_script(&candidate),
                 E2BIG | ENOMEM | ETXTBSY => return Err(io::Error::from_raw_os_error(rc)),
                 _ if !exists(&candidate) => {}
                 EACCES => eacces = true,
@@ -812,8 +1003,93 @@ mod platform {
         }))
     }
 
-    fn rebase(path: &[u8], place: &Placement<'_>) -> io::Result<CString> {
-        match place.base {
+    /// Whether [`spawnp`] would find `program` something to run, judged before the spawn of
+    /// another program that runs it later (a tethered child's tether, [`crate::tether`]): the
+    /// same search over the same candidates, each one runnable when `access(X_OK)` passes and it
+    /// is no directory.
+    ///
+    /// # Errors
+    /// What that spawn would answer when no candidate is runnable: `access`'s error for a
+    /// `program` that names a path, else `ENOENT`, `EACCES` when a candidate that exists may not
+    /// be run, or `ENAMETOOLONG` for an entry the search ends at. An image the exec refuses
+    /// although `access` passes it fails later, in the program that runs it.
+    pub(super) fn findable(
+        program: &[u8],
+        search: Option<&OsStr>,
+        base: Option<&Path>,
+        long_entry_ends: bool,
+    ) -> io::Result<()> {
+        if program.contains(&b'/') {
+            return runnable(&rebase(program, base)?);
+        }
+        if program.is_empty() {
+            return Err(io::Error::from_raw_os_error(ENOENT));
+        }
+        let mut eacces = false;
+        for candidate in candidates(program, search, base, long_entry_ends) {
+            let candidate = candidate?;
+            if !exists(&candidate) {
+                continue;
+            }
+            match runnable(&candidate) {
+                Ok(()) => return Ok(()),
+                Err(e) => eacces |= e.raw_os_error() == Some(EACCES),
+            }
+        }
+        Err(io::Error::from_raw_os_error(if eacces {
+            EACCES
+        } else {
+            ENOENT
+        }))
+    }
+
+    /// The paths a search for the bare name `program` tries, in order: each entry of `search`
+    /// (the child's `PATH`, else `/usr/bin:/bin`; an empty entry is `.`) joined to it and rebased
+    /// on `base`. An entry too long to join ends the search with `ENAMETOOLONG` when
+    /// `long_entry_ends` (posix_spawnp's rule for this process's own `PATH`), and is passed over
+    /// otherwise.
+    fn candidates<'a>(
+        program: &'a [u8],
+        search: Option<&'a OsStr>,
+        base: Option<&'a Path>,
+        long_entry_ends: bool,
+    ) -> impl Iterator<Item = io::Result<CString>> + 'a {
+        search
+            .map_or(&b"/usr/bin:/bin"[..], OsStr::as_bytes)
+            .split(|&b| b == b':')
+            .filter_map(move |dir| {
+                let dir: &[u8] = if dir.is_empty() { b"." } else { dir };
+                if dir.len() + program.len() + 2 > PATH_MAX {
+                    return long_entry_ends
+                        .then(|| Err(io::Error::from_raw_os_error(ENAMETOOLONG)));
+                }
+                let mut full = Vec::with_capacity(dir.len() + program.len() + 1);
+                full.extend_from_slice(dir);
+                full.push(b'/');
+                full.extend_from_slice(program);
+                Some(rebase(&full, base))
+            })
+    }
+
+    /// Whether something is at `path`, a link followed.
+    fn exists(path: &CStr) -> bool {
+        std::fs::metadata(OsStr::from_bytes(path.to_bytes())).is_ok()
+    }
+
+    /// Whether the exec could run the file at `path`: `access(X_OK)`, and no directory.
+    fn runnable(path: &CStr) -> io::Result<()> {
+        // SAFETY: a NUL-terminated path; `access` reads it and retains nothing.
+        if unsafe { access(path.as_ptr(), X_OK) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if std::fs::metadata(OsStr::from_bytes(path.to_bytes()))?.is_dir() {
+            return Err(io::Error::from_raw_os_error(EACCES));
+        }
+        Ok(())
+    }
+
+    fn rebase(path: &[u8], base: Option<&Path>) -> io::Result<CString> {
+        match base {
             Some(base) if path.first() != Some(&b'/') => {
                 let base = base.as_os_str().as_bytes();
                 let mut full = Vec::with_capacity(base.len() + path.len() + 1);
@@ -830,8 +1106,8 @@ mod platform {
 #[cfg(target_os = "linux")]
 mod platform {
     use super::{
-        F_GETFD, F_SETFD, Image, InheritStrip, Placement, Source, fcntl, off_the_targets, resolve,
-        waitpid,
+        ExecImage, F_GETFD, F_SETFD, Image, InheritStrip, Placement, Source, exec_dispatch,
+        exec_now_us, fcntl, off_the_targets, resolve, waitpid,
     };
     use core::ffi::{c_char, c_void};
     use std::io;
@@ -860,6 +1136,98 @@ mod platform {
         fn sigprocmask(how: i32, set: *const u64, old: *mut u64) -> i32;
         fn signal(sig: i32, handler: usize) -> usize;
         fn _exit(code: i32) -> !;
+    }
+
+    pub(super) struct PreparedExec {
+        image: ExecImage,
+    }
+
+    impl PreparedExec {
+        pub(super) fn new(image: Image) -> io::Result<Self> {
+            let path = resolve(
+                std::ffi::OsStr::from_bytes(image.program.as_bytes()),
+                image.search.as_deref(),
+            )?;
+            Ok(Self {
+                image: ExecImage::new(image, path),
+            })
+        }
+
+        pub(super) fn exec_until(self, deadline_us: u64) -> io::Error {
+            self.exec_with(deadline_us, exec_now_us, |prepared| {
+                let image = &prepared.image;
+                // SAFETY: preparation owns every C string and null-terminated pointer array
+                // through this native dispatch; the kernel retains none on a returned error.
+                unsafe {
+                    execve(
+                        image.path.as_ptr(),
+                        image.argv.as_ptr(),
+                        image.envp.as_ptr(),
+                    )
+                };
+                io::Error::last_os_error()
+            })
+        }
+
+        pub(super) fn exec_with(
+            self,
+            deadline_us: u64,
+            now: impl FnOnce() -> io::Result<u64>,
+            dispatch: impl FnOnce(&Self) -> io::Error,
+        ) -> io::Error {
+            with_default_sigpipe(|| exec_dispatch(|| (), deadline_us, now, || dispatch(&self)))
+        }
+
+        #[cfg(test)]
+        pub(super) fn captured(&self) -> (&Image, &std::ffi::CStr) {
+            (&self.image._image, &self.image.path)
+        }
+    }
+
+    /// An in-place transparent exec: no fork, descriptor strip, mask clear or process-group
+    /// change. Prepare every allocation before changing SIGPIPE, and restore the complete
+    /// action if the exact native exec fails. The calling constructor is single-threaded.
+    pub(super) fn exec(image: &Image) -> io::Error {
+        let path = match resolve(
+            std::ffi::OsStr::from_bytes(image.program.as_bytes()),
+            image.search.as_deref(),
+        ) {
+            Ok(path) => path,
+            Err(error) => return error,
+        };
+        let argv = Image::pointers(&image.argv);
+        let envp = Image::pointers(&image.envp);
+        with_default_sigpipe(|| {
+            // SAFETY: all C strings and pointer vectors remain owned by `image`/locals through
+            // the call. No FD, mask, cwd, group or environment is modified before exec.
+            unsafe { execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
+            io::Error::last_os_error()
+        })
+    }
+
+    /// Set only SIGPIPE's action for dispatch, restoring the full prior action on every
+    /// returned outcome, including deadline/clock refusals before the native call.
+    fn with_default_sigpipe(dispatch: impl FnOnce() -> io::Error) -> io::Error {
+        // SAFETY: zero initializes plain signal-action storage and an empty signal set.
+        let mut defaults: libc::sigaction = unsafe { std::mem::zeroed() };
+        defaults.sa_sigaction = libc::SIG_DFL;
+        let mut old = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+        // SAFETY: one valid action and one writable old-action slot; neither pointer escapes.
+        if unsafe { libc::sigaction(libc::SIGPIPE, &defaults, old.as_mut_ptr()) } != 0 {
+            return io::Error::last_os_error();
+        }
+        // SAFETY: sigaction succeeded and initialized the entire old action.
+        let old = unsafe { old.assume_init() };
+        let refused = dispatch();
+        // SAFETY: the exact successfully captured old action is still live. A constructor
+        // treats a failed restore as terminal rather than resuming work with altered state.
+        if unsafe { libc::sigaction(libc::SIGPIPE, &old, std::ptr::null_mut()) } != 0 {
+            return io::Error::other(format!(
+                "exec failed ({refused}); restoring SIGPIPE failed ({})",
+                io::Error::last_os_error()
+            ));
+        }
+        refused
     }
 
     /// Fork, strip, place, exec, the child calling only async-signal-safe functions on memory prepared here.
@@ -1054,6 +1422,21 @@ mod platform {
             "spawnfd's spawn is built for Darwin and Linux",
         ))
     }
+
+    pub(super) struct PreparedExec;
+
+    impl PreparedExec {
+        pub(super) fn new(_image: Image) -> io::Result<Self> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "in-place exec is unavailable",
+            ))
+        }
+
+        pub(super) fn exec_until(self, _deadline_us: u64) -> io::Error {
+            io::Error::new(io::ErrorKind::Unsupported, "in-place exec is unavailable")
+        }
+    }
 }
 
 /// The strip, for a spawn that must fork.
@@ -1097,6 +1480,71 @@ impl InheritStrip {
     }
 }
 
+/// One descriptor a forked child gets at a fixed number: the same open file as the parent's
+/// `from`, at `at`, open across the exec. Made in the parent; [`PassAt::apply`] runs in the child.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PassAt {
+    from: RawFd,
+    at: RawFd,
+}
+
+impl PassAt {
+    /// `from` at number `at` in the child.
+    ///
+    /// # Errors
+    /// `InvalidInput` when either number is 0, 1 or 2: by the time the pass runs those are the
+    /// child's own stdio, so neither can be passed from or onto.
+    pub fn new(from: std::os::fd::BorrowedFd<'_>, at: RawFd) -> io::Result<Self> {
+        let from = from.as_raw_fd();
+        if from <= 2 || at <= 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "a descriptor is passed from and onto a number above 2 (from {from}, at {at}): \
+                     0, 1 and 2 are the child's stdio"
+                ),
+            ));
+        }
+        Ok(Self { from, at })
+    }
+
+    /// The number the child holds the descriptor at.
+    #[must_use]
+    pub const fn at(self) -> RawFd {
+        self.at
+    }
+
+    /// Put the descriptor at its number, open across the exec: `dup2` from `from` onto `at`
+    /// (the copy is not close-on-exec), or, when `from` already is `at`, clear its close-on-exec
+    /// flag (a `dup2` onto itself changes nothing, and the exec would close it). `from` itself
+    /// stays as it is. Async-signal-safe: `fcntl` and `dup2` over two integers, no allocation,
+    /// no lock. Answers whether `at` now holds the descriptor.
+    ///
+    /// # Safety
+    /// Only in a forked child before its exec (or a process about to exec), with `from` open, and
+    /// after any [`InheritStrip::apply`], which marks `at` close-on-exec again. The `dup2` closes
+    /// whatever `at` held, so nothing there may be needed past this call.
+    #[must_use]
+    pub unsafe fn apply(self) -> bool {
+        if self.from == self.at {
+            // SAFETY: `F_GETFD` and `F_SETFD` take integers and touch no memory.
+            unsafe {
+                let flags = fcntl(self.at, F_GETFD);
+                return flags >= 0 && fcntl(self.at, F_SETFD, flags & !FD_CLOEXEC) == 0;
+            }
+        }
+        loop {
+            // SAFETY: `dup2` takes two integers; the caller vouches nothing at `at` is needed.
+            if unsafe { dup2(self.from, self.at) } == self.at {
+                return true;
+            }
+            if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                return false;
+            }
+        }
+    }
+}
+
 /// A `std::process::Command` whose child inherits nothing of this process above stdio.
 pub trait InheritNothing {
     /// Install the strip.
@@ -1122,6 +1570,102 @@ impl InheritNothing for StdCommand {
             })
         }
     }
+}
+
+/// A `std::process::Command` whose child gets one descriptor at a fixed number ([`PassAt`]).
+pub trait PassDescriptor {
+    /// Give the child `fd` at number `at`, the same open file, open across the exec. The command
+    /// holds it at `at` in this process from this call until it is dropped (a close-on-exec copy
+    /// made there when `fd` sits elsewhere, and `fd` closed), so nothing this process opens
+    /// meanwhile takes that number: not `std`'s exec-error pipe either, whose write end a `dup2`
+    /// onto it in the child would replace, telling a failed exec as a started child. The child
+    /// only clears the number's close-on-exec flag; a hook that fails fails the spawn.
+    ///
+    /// Call it after [`InheritNothing::inherit_nothing`]: hooks run in the order they were added,
+    /// so a strip added after the pass marks `at` close-on-exec again and the exec closes it.
+    /// Added after the strip, the child holds `at` and nothing else above stdio.
+    /// On Apple, neither the input nor the retained descriptor may be close-on-fork: the fork
+    /// removes a marked descriptor before any hook runs. This adapter refuses a marked input
+    /// before copying it, so no unmarked copy can expose it to other forks, and never clears
+    /// that flag.
+    ///
+    /// # Errors
+    /// [`PassAt::new`]'s, when `fd` or `at` is 0, 1 or 2; `ResourceBusy` when something else of
+    /// this process holds `at`; `Unsupported` on Apple when the input or retained descriptor is
+    /// close-on-fork; `fcntl`'s, when no copy can be made there (`at` at or past the descriptor
+    /// limit) or its flags cannot be read. A refusal installs no pass hook.
+    fn pass_at(&mut self, fd: OwnedFd, at: RawFd) -> io::Result<&mut Self>;
+}
+
+impl PassDescriptor for StdCommand {
+    fn pass_at(&mut self, fd: OwnedFd, at: RawFd) -> io::Result<&mut Self> {
+        use std::os::fd::AsFd as _;
+        use std::os::unix::process::CommandExt as _;
+        let at = PassAt::new(fd.as_fd(), at)?.at();
+        #[cfg(target_vendor = "apple")]
+        std_pass_forkable(&fd)?;
+        let held = if fd.as_raw_fd() == at {
+            fd
+        } else {
+            held_at(&fd, at)?
+        };
+        #[cfg(target_vendor = "apple")]
+        std_pass_forkable(&held)?;
+        // SAFETY: the hook runs between fork and exec, after any strip added before it, and calls only `PassAt::apply` (`fcntl` over integers) and reads `errno`; no allocation, no lock. The closure owns `held`, open at `at` whenever the command spawns, so the pass is in place and only its close-on-exec flag is cleared.
+        Ok(unsafe {
+            self.pre_exec(move || {
+                let pass = PassAt {
+                    from: held.as_raw_fd(),
+                    at,
+                };
+                if pass.apply() {
+                    Ok(())
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            })
+        })
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+fn std_pass_forkable(fd: &OwnedFd) -> io::Result<()> {
+    // SAFETY: `fd` owns this live descriptor; `F_GETFD` only reads its flags and touches no
+    // memory. No close-on-fork flag is cleared while Command lives.
+    let flags = unsafe { fcntl(fd.as_raw_fd(), F_GETFD) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if flags & FD_CLOFORK != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "std Command cannot pass close-on-fork descriptor {}: fork removes it before \
+                 pre_exec",
+                fd.as_raw_fd()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// A close-on-exec copy of `fd` at exactly `at`, or `ResourceBusy` when something else of this
+/// process holds that number.
+fn held_at(fd: &OwnedFd, at: RawFd) -> io::Result<OwnedFd> {
+    // SAFETY: `F_DUPFD_CLOEXEC` reads one descriptor number and returns a fresh descriptor (the lowest free at or above `at`) or -1; it touches no memory.
+    let copy = unsafe { fcntl(fd.as_raw_fd(), F_DUPFD_CLOEXEC, at) };
+    if copy < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `copy` was just created here and nothing else owns it.
+    let copy = unsafe { OwnedFd::from_raw_fd(copy) };
+    if copy.as_raw_fd() != at {
+        return Err(io::Error::new(
+            io::ErrorKind::ResourceBusy,
+            format!("a pass at {at} needs that number free, and this process holds it elsewhere"),
+        ));
+    }
+    Ok(copy)
 }
 
 #[cfg(not(target_vendor = "apple"))]
@@ -1189,12 +1733,16 @@ pub fn command(program: impl AsRef<OsStr>) -> Command {
     Command::new(program)
 }
 
-/// A child that ends when this process dies, killed outright or crashed included
-/// ([`crate::tether`]): for a helper whose end this process enforces (a read it stops or bounds by
-/// its own clock, a stream that never ends by itself), which would otherwise run on, adopted, for
-/// as long as it can. On Linux the tie is to the spawning THREAD (`PR_SET_PDEATHSIG`), so spawn
-/// from a thread that outlives the child. On Darwin the spawn runs through this executable
-/// ([`crate::tether::executable`]), and in a process whose `main` never called
+/// Request a parent-death tie ([`crate::tether`]), killed outright or crashed included, for a
+/// helper this process stops or bounds by its own clock (a read or a stream that never ends by
+/// itself), which would otherwise run on, adopted, for as long as it can. The first signal is
+/// `SIGTERM`, subject to the platform's conditions. On Linux the tie is to the spawning THREAD
+/// (`PR_SET_PDEATHSIG`), so spawn from a thread that outlives the child, and a child that ignores
+/// `SIGTERM` runs on. On Darwin the spawn runs through this executable
+/// ([`crate::tether::executable`]), whose watcher sends `SIGKILL`
+/// [`END_GRACE`](crate::process::END_GRACE) after the `SIGTERM` to the same process only
+/// ([`crate::tether::end_watched`]); an unreadable identity or a thread that has not run gets no
+/// signal and the watcher exits, so the child can run on. In a process whose `main` never called
 /// [`crate::tether::entry`] the child starts untethered. Neither an exec nor a suspended start
 /// can be tethered.
 pub trait Tether {
@@ -1204,7 +1752,7 @@ pub trait Tether {
 
 #[path = "spawnfd_transparent.rs"]
 mod pass_through;
-pub use pass_through::{TransparentChild, TransparentCommand, transparent};
+pub use pass_through::{PreparedExec, TransparentChild, TransparentCommand, transparent};
 
 #[cfg(target_vendor = "apple")]
 mod darwin_strip {
@@ -1324,6 +1872,32 @@ pub fn descriptor_bound() -> RawFd {
     #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
     {
         FALLBACK
+    }
+}
+
+pub use crate::{SOFT_NOFILE_FLOOR, raised_soft_nofile_target};
+
+/// Raise this process's soft `RLIMIT_NOFILE` to [`raised_soft_nofile_target`]'s
+/// answer, best effort: children inherit the raised limit (their descriptors
+/// are still closed past the standard three by the spawn posture), and a
+/// refusal leaves the limit exactly as it was.
+pub fn raise_soft_nofile() {
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    {
+        let mut limit = Rlimit { cur: 0, max: 0 };
+        // SAFETY: `limit` is a live `struct rlimit` of the platform's layout, which `getrlimit` fills and does not retain.
+        if unsafe { getrlimit(RLIMIT_NOFILE, &mut limit) } != 0 {
+            return;
+        }
+        let Some(target) = raised_soft_nofile_target(limit.cur, limit.max) else {
+            return;
+        };
+        let raised = Rlimit {
+            cur: target,
+            max: limit.max,
+        };
+        // SAFETY: `raised` keeps the hard limit the kernel just reported, so the call can only raise the soft limit toward it.
+        let _ = unsafe { setrlimit(RLIMIT_NOFILE, &raised) };
     }
 }
 
@@ -1450,9 +2024,9 @@ mod linux_strip {
 
 unsafe extern "C" {
     fn fcntl(fd: RawFd, cmd: i32, ...) -> i32;
+    fn dup2(old: RawFd, new: RawFd) -> RawFd;
     fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
     fn kill(pid: i32, sig: i32) -> i32;
-    #[cfg(not(target_vendor = "apple"))]
     fn access(path: *const core::ffi::c_char, mode: i32) -> i32;
     #[cfg(target_vendor = "apple")]
     fn sysctlbyname(
@@ -1464,16 +2038,20 @@ unsafe extern "C" {
     ) -> i32;
     #[cfg(target_vendor = "apple")]
     fn notify_is_valid_token(token: i32) -> bool;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
     fn getrlimit(resource: i32, limit: *mut Rlimit) -> i32;
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    fn setrlimit(resource: i32, limit: *const Rlimit) -> i32;
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
 #[repr(C)]
 struct Rlimit {
     cur: u64,
     max: u64,
 }
+#[cfg(target_vendor = "apple")]
+const RLIMIT_NOFILE: i32 = 8;
 #[cfg(target_os = "linux")]
 const RLIMIT_NOFILE: i32 = 7;
 
@@ -1482,6 +2060,9 @@ const F_SETFD: i32 = 2;
 const F_GETFL: i32 = 3;
 const F_SETFL: i32 = 4;
 const FD_CLOEXEC: i32 = 1;
+/// Apple's close-on-fork descriptor flag, which its libc bindings do not name.
+#[cfg(target_vendor = "apple")]
+const FD_CLOFORK: i32 = 2;
 #[cfg(target_vendor = "apple")]
 const F_DUPFD_CLOEXEC: i32 = 67;
 #[cfg(not(target_vendor = "apple"))]
@@ -1497,7 +2078,6 @@ const ENOENT: i32 = 2;
 #[cfg(any(test, not(target_vendor = "apple")))]
 const EACCES: i32 = 13;
 const EMFILE: i32 = 24;
-#[cfg(not(target_vendor = "apple"))]
 const X_OK: i32 = 1;
 
 /// `spawnfd`'s tests; [`tests::translator`] is every test's in the crate.

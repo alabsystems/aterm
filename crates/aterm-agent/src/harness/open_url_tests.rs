@@ -20,6 +20,125 @@ const LOCAL_STATE: &str = r#"{
 
 const URL: &str = "https://claude.ai/oauth/authorize?login_hint=a%40example.com&state=s";
 
+/// A direct curl exit does not leave its caller waiting on a descendant's inherited pipes.
+#[cfg(unix)]
+#[test]
+fn curl_finishes_after_direct_exit_with_a_witnessed_descendant_holding_its_pipes() {
+    const HANG: Duration = Duration::from_secs(60);
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let home = dir.path().to_path_buf();
+    let curl = home.join("curl");
+    super::super::stand_in::proven(
+        &curl,
+        "printf '%s\\n' \"$$\" > \"$HOME/parent\"\n\
+         /bin/sh -c 'printf \"holder-out\\n\"; printf \"holder-err\\n\" >&2; \
+         printf \"%s\\n\" \"$$\" > \"$HOME/holder\"; exec /bin/sleep 600' &\n\
+         while [ ! -s \"$HOME/holder\" ]; do /bin/sleep 0.01; done\n\
+         /bin/cat > /dev/null\nexit 67",
+    );
+    let (send, receive) = std::sync::mpsc::sync_channel(1);
+    let child_home = home.clone();
+    let worker = std::thread::spawn(move || {
+        let result = curl_output_with(
+            &curl,
+            &["run"],
+            &[("url", "https://example.test/")],
+            &|key| match key {
+                "HOME" => Some(child_home.clone().into_os_string()),
+                "PATH" => Some(OsString::from("/usr/bin:/bin")),
+                _ => None,
+            },
+        );
+        let _ = send.send(result);
+    });
+    let pid = |name| {
+        std::fs::read_to_string(home.join(name))
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+    };
+    let since = Instant::now();
+    let seen = loop {
+        if let (Some(parent), Some(holder)) = (pid("parent"), pid("holder")) {
+            break Some((parent, holder));
+        }
+        if since.elapsed() >= HANG {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let direct_exited = seen.is_some_and(|(parent, _)| {
+        let since = Instant::now();
+        while aterm_uds::process::pid_alive(parent) && since.elapsed() < HANG {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        !aterm_uds::process::pid_alive(parent)
+    });
+    eprintln!("curl pipe barrier: witnesses={seen:?}, direct_exited={direct_exited}");
+    let result = receive.recv_timeout(HANG);
+    let retired = seen.is_some_and(|(_, holder)| {
+        matches!(
+            aterm_uds::process::process_presence(i32::try_from(holder).expect("holder pid")),
+            aterm_uds::process::ProcessPresence::Absent
+                | aterm_uds::process::ProcessPresence::Exited
+        )
+    });
+    // Cleanup precedes assertions, including the old-production hang detector. The holder
+    // wrote its own identity after writing both pipes, and is a member of this private group.
+    if let Some((parent, holder)) = seen {
+        use aterm_uds::process::EndControl as _;
+        let since = Instant::now();
+        let mut control = aterm_uds::process::EndControlLive;
+        while let Some(token) = control.identity(i32::try_from(holder).expect("holder pid")) {
+            let _ = aterm_uds::process::end_proven(token, Duration::ZERO, &mut control, |now| {
+                // SAFETY: this only observes the witnessed holder, whose birth is re-proven
+                // by end_proven around this check; no signal names the reaped parent's group.
+                (unsafe { libc::getpgid(now.pid) }) == i32::try_from(parent).expect("parent pid")
+            });
+            if since.elapsed() >= HANG {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    let helper_retired = if result.is_ok() {
+        true
+    } else {
+        // Retiring the witnessed holder releases old production's blocking joins too.
+        receive.recv_timeout(HANG).is_ok()
+    };
+    if helper_retired {
+        worker.join().expect("curl helper thread");
+    } else {
+        drop(worker);
+    }
+    assert!(
+        seen.is_some(),
+        "the stand-in never witnessed its pipe holder"
+    );
+    assert!(
+        direct_exited,
+        "the direct child did not exit after config EOF"
+    );
+    assert!(
+        helper_retired,
+        "the curl helper did not retire after owned cleanup"
+    );
+    let out = result
+        .expect("a directly exited curl kept waiting on its descendant's pipes")
+        .expect("curl result");
+    assert_eq!(
+        out.status.code(),
+        Some(67),
+        "the direct exit status survives"
+    );
+    assert!(
+        retired,
+        "curl left its pipe holder running after the direct exit"
+    );
+    assert_eq!(out.stdout, b"holder-out\n");
+    assert_eq!(out.stderr, b"holder-err\n");
+}
+
 #[test]
 fn curl_keeps_credential_options_and_urls_off_its_command_line() {
     let args = [
@@ -2010,8 +2129,12 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
             "778899".to_owned()
         ))
     );
-    let cur_msg = std_maildir.join("cur").join("1700000000.123_1.host:2,S");
-    std::fs::rename(&new_msg, &cur_msg).expect("move new to cur with :2,S flag");
+    // Maildir's info delimiter is `:`, which no Windows file name may hold: `;` there.
+    let info = if cfg!(windows) { ";2,S" } else { ":2,S" };
+    let cur_msg = std_maildir
+        .join("cur")
+        .join(format!("1700000000.123_1.host{info}"));
+    std::fs::rename(&new_msg, &cur_msg).expect("move new to cur with the S flag");
     assert_eq!(
         super::super::headless_oauth::poll_mailbox_config_for_credential(
             &std_maildir_cfg,
@@ -4188,6 +4311,9 @@ fn oauth_dot_segments_preserve_empty_path_segments_and_query_data() {
             "/a//b/../c?token=x//../y&code=%2e%2e",
             "/a//c?token=x//../y&code=%2e%2e",
         ),
+        ("https://claude.ai/a/approve?x=1#frag", "/a/approve?x=1"),
+        ("//claude.ai/a/approve?x=1#frag", "/a/approve?x=1"),
+        ("#section", "/base/page"),
     ] {
         assert_eq!(
             resolve_relative_url(base, target),
@@ -4202,6 +4328,10 @@ fn oauth_dot_segments_preserve_empty_path_segments_and_query_data() {
                 "https://claude.ai/a//approve?token=s//../q",
                 Some(""),
             ),
+        ),
+        (
+            r#"<form method="GET" action="https://claude.ai/oauth/approve#top"><input type="hidden" name="code" value="ok"><button>Allow</button></form>"#,
+            ("GET", "https://claude.ai/oauth/approve?code=ok", None),
         ),
         (
             r#"{"approval_url":"/a//../approve?token=s//../q"}"#,
@@ -4657,6 +4787,20 @@ fn tracked_magic_urls_chunked_http_and_email_input_detection() {
     assert_eq!(
         parsed_curl.body,
         "{\"approve_url\":\"/oauth/approve?ok=curl\"}"
+    );
+    let lf_size_crlf_body =
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\nhello\r\n0\r\n\r\n";
+    let parsed_lf =
+        super::parse_raw_http_response(lf_size_crlf_body, &mut cookies).expect("lf chunk");
+    assert_eq!(parsed_lf.body, "hello");
+    assert!(super::parse_raw_http_response("NOTHTTP 200 OK\r\n\r\nbody", &mut cookies).is_none());
+    assert!(
+        super::loopback_http_exchange("DELETE", "http://127.0.0.1:8080/cb", &mut cookies, None)
+            .is_err()
+    );
+    assert!(
+        super::loopback_http_exchange("GET", "http://127.0.0.1:8080/cb bad", &mut cookies, None)
+            .is_err()
     );
 
     assert!(!super::page_needs_browser_before_email(
@@ -5427,5 +5571,22 @@ fn the_outcome_file_holds_one_closed_word_and_a_host() {
             "write_outcome refuses symlinks"
         );
         assert_eq!(read_outcome(&link), None, "read_outcome refuses symlinks");
+
+        let big_body = "x".repeat(512 * 1024);
+        let early_exit = curl_output_with(
+            aterm_uds::os_path!("sh"),
+            &["-c", "exit 67", "--"],
+            &[("data-raw", &big_body)],
+            &|name| (name == "PATH").then(|| OsString::from("/usr/bin:/bin")),
+        )
+        .expect("early curl exit with large stdin config preserves exit status");
+        assert_eq!(early_exit.status.code(), Some(67));
     }
+}
+
+#[test]
+fn only_cloudflares_pages_stop_a_sign_in() {
+    assert!(Met::new(MetWord::BotCheck, Some("claude.ai")).stopped());
+    assert!(Met::new(MetWord::BlockPage, None).stopped());
+    assert!(!Met::new(MetWord::Stall, Some("claude.ai")).stopped());
 }

@@ -333,9 +333,9 @@ impl Record {
         let mut record = Record::default();
         for word in text.split_whitespace() {
             if let Some(v) = word.strip_prefix("gen=") {
-                record.generation = v.parse().unwrap_or(0);
+                record.generation = crate::parse_uint(v).unwrap_or(0);
             } else if let Some(v) = word.strip_prefix("t=") {
-                record.t = v.parse().unwrap_or(0);
+                record.t = crate::parse_int(v).unwrap_or(0);
             } else if let Some(v) = word.strip_prefix("outcome=") {
                 record.outcome = v
                     .chars()
@@ -353,7 +353,9 @@ impl Record {
 /// The record in `state` ([`RECORD_FILE`]); the default where there is none.
 #[must_use]
 pub fn read_record(state: &Path) -> Record {
-    std::fs::read_to_string(state.join(RECORD_FILE))
+    super::accounts::read_bounded(&state.join(RECORD_FILE), 64 * 1024)
+        .ok()
+        .flatten()
         .map(|t| Record::parse(&t))
         .unwrap_or_default()
 }
@@ -1131,9 +1133,19 @@ fn lock_file(state: &Path) -> io::Result<std::fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        open.mode(0o600);
+        open.mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    open.open(state.join(LOCK_FILE))
+    let file = open.open(state.join(LOCK_FILE))?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "grok sign-in lock is not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    aterm_uds::keep_out_of_children(&file)?;
+    Ok(file)
 }
 
 /// A held [`LOCK_FILE`], released when it drops.
@@ -1199,17 +1211,17 @@ impl Drop for Leading {
 /// process is gone, or another one under its pid with a different start.
 #[must_use]
 pub fn running(state: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(state.join(RUNNING_FILE)) else {
+    let Ok(Some(text)) = super::accounts::read_bounded(&state.join(RUNNING_FILE), 64 * 1024) else {
         return false;
     };
     let (mut pid, mut birth, mut t) = (None, None, None);
     for word in text.split_whitespace() {
         if let Some(v) = word.strip_prefix("pid=") {
-            pid = v.parse::<u32>().ok();
+            pid = crate::parse_uint::<u32>(v);
         } else if let Some(v) = word.strip_prefix("birth=") {
             birth = Some(v.to_owned());
         } else if let Some(v) = word.strip_prefix("t=") {
-            t = v.parse::<i64>().ok();
+            t = crate::parse_int::<i64>(v);
         }
     }
     let (Some(pid), Some(birth), Some(t)) = (pid, birth, t) else {
@@ -1899,13 +1911,31 @@ fn lead_with(
 /// # Errors
 /// The staging login is missing, empty, too large or not text, or it cannot be written.
 fn place(staged: &Path, target: &Path) -> Result<(), String> {
-    let meta = std::fs::metadata(staged)
-        .map_err(|_| "grok said it signed in but left no login file".to_owned())?;
+    use std::io::Read as _;
+    let file = match astream_sys::open_nonblocking(staged, astream_sys::Links::Refuse) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Err("grok said it signed in but left no login file".to_owned());
+        }
+        Err(_) => {
+            return Err("grok's login file is empty, too large or not a file".to_owned());
+        }
+    };
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("grok's login file cannot be read: {e}"))?;
     if !meta.is_file() || meta.len() == 0 || meta.len() > LOGIN_MAX {
         return Err("grok's login file is empty, too large or not a file".to_owned());
     }
-    let text = std::fs::read_to_string(staged)
+    let mut bytes = Vec::new();
+    file.take(LOGIN_MAX.saturating_add(1))
+        .read_to_end(&mut bytes)
         .map_err(|e| format!("grok's login file cannot be read: {e}"))?;
+    if bytes.is_empty() || bytes.len() as u64 > LOGIN_MAX {
+        return Err("grok's login file is empty, too large or not a file".to_owned());
+    }
+    let text =
+        String::from_utf8(bytes).map_err(|e| format!("grok's login file cannot be read: {e}"))?;
     if counts(target) {
         return Ok(());
     }

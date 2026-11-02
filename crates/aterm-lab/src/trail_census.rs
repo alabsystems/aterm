@@ -27,12 +27,22 @@
 //! below) counts as band; a star drawn on the band counts as band; a lip that touches the next row's glass with no
 //! seam, where that glass is the more chromatic, counts as that row's band; and a sliver of band that glyph ink cuts
 //! off from the rest counts as a mark.
+//!
+//! The mud gate (`--mud-max`) judges the band's and the rail/lip's core under the census's two rules, [`mud_spec`] and
+//! [`mud_broad`], but for one case, ruled by the lead on 2026-10-30 (docs/design/PRISM-GLASS.md §15.8 amendment 60):
+//! on a glass frame (`--glass`) the band is the glass's own pixels, its body and the soft edges it fades into the page
+//! by (the yield's edge among them), and its core is judged by the glass's rule, [`mud_glass`] (amendment 29), alone.
+//! The rail/lip, and the band of a frame not named a glass frame (main's paper bed and wash), keep both rules. The
+//! census cannot tell which arm drew a frame (a lip-forward page's window is lit at the glass level and draws main's
+//! arm), so a glass frame is the caller's word. Nor can it tell a star drawn on the band from the band (above), so on
+//! a glass frame such a star is judged with the glass, by the glass's rule, though the ruling leaves every pixel the
+//! glass does not own to the spec rule: the stars are main's until Phase 3 (amendment 40).
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use crate::instance::{take_value, take_values};
+use crate::instance::{take_flag, take_value, take_values};
 use crate::paths::from_caller;
 use crate::pyjson::J;
 use crate::trail_contrast::{
@@ -101,7 +111,7 @@ pub const MUD_LISTED: usize = 5;
 pub const HELP: &str = "\
 usage: targo --unverified lab trail-census <png> [--dims FILE | --origin X,Y --cell WxH] [--clean PNG]
          [--cursor FILE | --caret ROW,COL] [--caret-pad PX] [--pet X0,Y0,X1,Y1]... [--selection RRGGBB]
-         [--page RRGGBB] [--pixels FILE] [--mud-max N] [--glyph-min X]
+         [--page RRGGBB] [--pixels FILE] [--mud-max N] [--glass] [--glyph-min X]
 
 The Prism Glass census of a trail frame (docs/design/PRISM-GLASS.md section 15.1 P0.13), as JSON. It reads the frame
 against its clean twin (<stem>.<frame>.clean.png or <stem>.clean.png, `image clean`; required) on the grid of its dims
@@ -113,7 +123,8 @@ module's documentation states the heuristic. It reports:
              band, rail/lip and caret pixels, each layer on its own, all of them and their core (band: 2 px inside its
              column and 3 px from glyph ink; rail/lip: each column's most chromatic pixel; caret: 2 px inside it).
              mud_spec: C < .12, or h 85-125 at L < .82, or h 40-85 at L < .62; mud_broad: C < .10 at L < .75, or
-             h 60-115 at L < .75
+             h 60-115 at L < .75; mud_glass, the glass's rule (section 15.8 amendment 29): mud_spec's two hue
+             bands, or mud_broad, but not mud_spec's C < .12
   glyphs     the solid ink of every glyph cell the band or rail/lip touches, each pixel against its local ground as
              trail-contrast judges it: min, p1, median
   top/tail   the band's top edge (the first pixel at half its column's peak change) per column clear of ink: the
@@ -130,10 +141,19 @@ module's documentation states the heuristic. It reports:
              9 px or less above it)
   caret      its fill, keyline and cut-out (the glyph under it) against the fill
   selection  filled cells (--selection's colour, else every cell ground off the page) and their pixels the trail drew
---pixels FILE writes every sorted pixel as TSV (x, y, layer, row, colour, L, C, h, core, mud_spec, mud_broad).
+--pixels FILE writes every sorted pixel as TSV (x, y, layer, row, colour, L, C, h, core, mud_spec, mud_broad,
+mud_glass).
+--glass names a glass frame: its window drew Prism Glass's glass, so its band is the glass's own pixels, its body and
+the soft edges it fades into the page by, the yield's edge among them. --mud-max then judges the band's core by
+mud_glass alone (section 15.8 amendment 60, ruled by the lead 2026-10-30); the rail/lip keeps both mud_spec and
+mud_broad. Without it every layer keeps both. The census cannot tell which arm drew a frame (a lip-forward page's
+window is lit at the glass level and draws main's arm), so a glass frame is the caller's word. A star drawn on the
+band counts as band (the census cannot tell them apart), so on a glass frame it is judged by mud_glass with the glass.
+`mud_gate` reports the rules each layer was judged by.
 
-exit: 0; 1 a threshold failed (--mud-max: band or rail/lip core mud under either rule over N; --glyph-min: the glyph
-minimum under X; each named in `failures`); 2 a usage, file or decoding error
+exit: 0; 1 a threshold failed (--mud-max: band or rail/lip core mud over N under either of mud_spec and mud_broad,
+or, with --glass, the band's under mud_glass; --glyph-min: the glyph minimum under X; each named in `failures`); 2 a
+usage, file or decoding error
 ";
 
 /// What a pixel of the frame is to the census.
@@ -179,18 +199,29 @@ pub fn lch(rgb: Rgb) -> (f64, f64, f64) {
     (l, a.hypot(b), b.atan2(a).to_degrees().rem_euclid(360.0))
 }
 
+/// The spec rule's two hue bands: h 85-125 at L < .82 (olive), or h 40-85 at L < .62 (brown).
+fn mud_hue_bands(l: f64, h: f64) -> bool {
+    ((85.0..=125.0).contains(&h) && l < 0.82) || ((40.0..=85.0).contains(&h) && l < 0.62)
+}
+
 /// The spec's mud rule (§1): C < .12, or h 85-125 at L < .82 (olive), or h 40-85 at L < .62 (brown).
 #[must_use]
 pub fn mud_spec((l, c, h): (f64, f64, f64)) -> bool {
-    c < 0.12
-        || ((85.0..=125.0).contains(&h) && l < 0.82)
-        || ((40.0..=85.0).contains(&h) && l < 0.62)
+    c < 0.12 || mud_hue_bands(l, h)
 }
 
 /// The broad rule: C < .10 at L < .75, or h 60-115 at L < .75.
 #[must_use]
 pub fn mud_broad((l, c, h): (f64, f64, f64)) -> bool {
     l < 0.75 && (c < 0.10 || (60.0..=115.0).contains(&h))
+}
+
+/// The glass's rule (PRISM-GLASS.md §15.8 amendment 29): the spec rule's two hue bands, or the broad rule, but not the
+/// spec rule's C < .12, which for the glass is the headroom gate's test, read at the page's anchors. Under amendment
+/// 60 it judges a glass frame's band, the glass's body and the soft edges it fades into the page by.
+#[must_use]
+pub fn mud_glass((l, c, h): (f64, f64, f64)) -> bool {
+    mud_hue_bands(l, h) || mud_broad((l, c, h))
 }
 
 /// How well `over`, drawn over `under` at some coverage, explains `p`: the coverage (0 to 1) that brings it nearest
@@ -1342,8 +1373,9 @@ impl<'a> Scene<'a> {
 
     /// Every sorted pixel, as TSV.
     fn pixels(&self, core: &[bool]) -> String {
-        let mut out =
-            String::from("x\ty\tlayer\trow\tcolour\tL\tC\th\tcore\tmud_spec\tmud_broad\n");
+        let mut out = String::from(
+            "x\ty\tlayer\trow\tcolour\tL\tC\th\tcore\tmud_spec\tmud_broad\tmud_glass\n",
+        );
         for y in 0..self.h {
             for x in 0..self.w {
                 let i = self.at(x, y);
@@ -1354,7 +1386,7 @@ impl<'a> Scene<'a> {
                 let v = lch(p);
                 let _ = writeln!(
                     out,
-                    "{x}\t{y}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.1}\t{}\t{}\t{}",
+                    "{x}\t{y}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.1}\t{}\t{}\t{}\t{}",
                     self.layer[i].name(),
                     self.owner[i],
                     hex(p),
@@ -1364,6 +1396,7 @@ impl<'a> Scene<'a> {
                     u8::from(core[i]),
                     u8::from(mud_spec(v)),
                     u8::from(mud_broad(v)),
+                    u8::from(mud_glass(v)),
                 );
             }
         }
@@ -1384,6 +1417,7 @@ struct Tally {
     hues: [i64; 12],
     spec: i64,
     broad: i64,
+    glass: i64,
     mud: HashMap<Rgb, i64>,
 }
 
@@ -1398,6 +1432,7 @@ impl Tally {
         let (s, b) = (mud_spec(v), mud_broad(v));
         self.spec += i64::from(s);
         self.broad += i64::from(b);
+        self.glass += i64::from(mud_glass(v));
         if s || b {
             *self.mud.entry(rgb).or_default() += 1;
         }
@@ -1432,6 +1467,7 @@ impl Tally {
                 ("C", J::Float(round_to(v.1, 3))),
                 ("h", J::Float(round_to(v.2, 1))),
                 ("rule", J::s(rule)),
+                ("glass", J::Bool(mud_glass(v))),
             ])
         });
         J::obj([
@@ -1444,6 +1480,7 @@ impl Tally {
             ),
             ("mud_spec", J::Int(self.spec)),
             ("mud_broad", J::Int(self.broad)),
+            ("mud_glass", J::Int(self.glass)),
             ("mud_colours", J::Arr(listed.collect())),
         ])
     }
@@ -1465,6 +1502,8 @@ pub struct Args {
     pub page: Option<String>,
     pub pixels: Option<String>,
     pub mud_max: Option<i64>,
+    /// `--glass`: a glass frame, whose band core the mud gate judges by [`mud_glass`] alone.
+    pub glass: bool,
     pub glyph_min: Option<f64>,
 }
 
@@ -1497,6 +1536,7 @@ pub fn parse_args(args: &[String]) -> Result<Args, Fail> {
         mud_max: take_value(&mut a, "--mud-max")?
             .map(|v| number("--mud-max", &v, "a count"))
             .transpose()?,
+        glass: take_flag(&mut a, "--glass"),
         glyph_min: take_value(&mut a, "--glyph-min")?
             .map(|v| number("--glyph-min", &v, "a ratio"))
             .transpose()?,
@@ -1544,6 +1584,19 @@ fn parse_box(text: &str) -> Result<PxBox, String> {
             "--pet wants X0,Y0,X1,Y1 with X0 < X1 and Y0 < Y1, got {}",
             crate::util::py_repr(text)
         )),
+    }
+}
+
+/// The layers the mud gate judges, by their core.
+const GATED: [&str; 2] = ["band", "rail_lip"];
+
+/// The mud rules the gate judges `layer`'s core by: a glass frame's band by the glass's rule alone (§15.8 amendment
+/// 60); the rail/lip, and the band of any other frame, by both of the census's rules.
+fn gate_rules(glass: bool, layer: &str) -> &'static [&'static str] {
+    if glass && layer == "band" {
+        &["mud_glass"]
+    } else {
+        &["mud_spec", "mud_broad"]
     }
 }
 
@@ -1622,8 +1675,8 @@ pub fn report(a: &Args) -> Result<J, String> {
 
     let mut failures = Vec::new();
     if let Some(max) = a.mud_max {
-        for layer in ["band", "rail_lip"] {
-            for rule in ["mud_spec", "mud_broad"] {
+        for layer in GATED {
+            for &rule in gate_rules(a.glass, layer) {
                 let n = layers
                     .get(layer)
                     .and_then(|l| l.get("core"))
@@ -1658,6 +1711,13 @@ pub fn report(a: &Args) -> Result<J, String> {
         (
             "band_rows",
             J::Arr(scene.band_rows().into_iter().map(J::Int).collect()),
+        ),
+        (
+            "mud_gate",
+            J::obj(GATED.map(|layer| {
+                let rules = gate_rules(a.glass, layer).iter().map(|r| J::s(*r));
+                (layer, J::Arr(rules.collect()))
+            })),
         ),
     ]);
     out.set("layers", layers);

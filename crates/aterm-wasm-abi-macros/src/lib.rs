@@ -190,6 +190,10 @@ fn export_method(args: TokenStream, item: TokenStream) -> Result<TokenStream, Er
                 let mut keep = 0;
                 while matches!(inner.get(keep), Some(TokenTree::Punct(p)) if p.as_char() == '#')
                     && matches!(inner.get(keep + 1), Some(TokenTree::Punct(p)) if p.as_char() == '!')
+                    && matches!(
+                        inner.get(keep + 2),
+                        Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Bracket
+                    )
                 {
                     keep += 3;
                 }

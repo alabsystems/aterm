@@ -169,7 +169,9 @@ fn look_at(st: &mut St, sf: &SessionFile, scr: &Screen, status: &str, t: u64) ->
         status: Some(status),
         dim: false,
     };
-    look_facts(&opts(), sf, st, TAB, &read, &[], t).0
+    look_facts(&opts(), sf, st, TAB, &read, &[], t)
+        .expect("readable ledger evidence")
+        .0
 }
 
 fn facts_of(s: &State, h: History) -> (Facts, bool) {
@@ -365,6 +367,247 @@ fn the_still_run_counts_claude_looks_at_the_same_words_and_not_repaints() {
         ),
         0
     );
+}
+
+/// THE STALL'S OWN SCREEN NEVER RESTARTS OVER THE WORK IT SHOWS: Claude Code 2.1.310's turn over
+/// while three dynamic workflows it started run on in its own process (captured read-only
+/// 2026-10-27 from the tab whose upgrade read `overdue:background` for 19 hours). The server
+/// publishes that turn's rest (`agent=idle`), and Claude Code's session file may say `idle`; no
+/// shell runs under it. The look counts the published rest as no quiet and the screen's workflows
+/// as the agent's own work, so the restart waits on them at every rung, Land's included, where a
+/// restart would end them. With the workflows gone the same look restarts.
+/// The look [`look_facts`] takes of a Claude Code 2.1.310 session `behind` seconds behind its
+/// upgrade, whose server publishes the rest (`agent=idle`) over `rows`, the cursor on the
+/// composer's `❯` row, its words dim, and no process under the agent.
+fn rest_look(rows: &[String], behind: u64) -> Facts {
+    let rest = "OK schema=1 agent=idle agent_since_ms=600000 hold=0 hand=-";
+    let file = SessionFile {
+        pid: PID,
+        session_id: "01a0dc36-1dc1-7ee2-be91-11bc323e377c".to_string(),
+        cwd: "/".to_string(),
+        version: "2.1.310".to_string(),
+        status: "idle".to_string(),
+        status_updated_at_ms: (NOW - 600) * 1_000,
+        proc_start: String::new(),
+        kind: "interactive".to_string(),
+        entrypoint: "cli".to_string(),
+        claude_dir: None,
+        profile: None,
+    };
+    let caret = rows
+        .iter()
+        .rposition(|r| r.starts_with('❯'))
+        .expect("the composer");
+    let scr = Screen {
+        rows: rows.to_vec(),
+        cursor: Some((caret, 2)),
+        seq: 7,
+        first: 0,
+        generation: None,
+        human: HumanInput::Ago(600_000),
+        title: None,
+    };
+    let mut st = St {
+        pending_since: NOW - behind,
+        ..St::default()
+    };
+    let _ = quiet_s(Some(rest), &mut st, 7, NOW - 2 * upgrade::QUIET_S);
+    let read = TabRead {
+        scr: &scr,
+        status: Some(rest),
+        dim: true,
+    };
+    look_facts(&opts(), &file, &mut st, TAB, &read, &[], NOW)
+        .expect("readable ledger evidence")
+        .0
+}
+
+#[test]
+fn the_stall_screens_upgrade_never_restarts_over_the_work_it_shows() {
+    use aterm_phase::prompt::fixtures::{WAITING_WORKFLOWS_2_1_310, screen};
+    let look = rest_look;
+    let captured = screen(WAITING_WORKFLOWS_2_1_310);
+    for behind in [60, upgrade::RUNG_LAND_S] {
+        let f = look(&captured, behind);
+        assert!(f.composer_empty, "its dim `keep going` is no draft");
+        assert!(!f.approval_box && !f.busy_footer, "{f:?}");
+        assert_eq!(f.quiet_s, 0, "its published rest is no quiet");
+        assert_eq!(
+            f.background,
+            ["screen:waiting-for-a-dynamic-workflow"],
+            "its workflows are its own work"
+        );
+        assert_eq!(
+            upgrade::next_step(&Phase::Pending, &f, false, NOW),
+            upgrade::Step::Wait("background"),
+            "behind {behind}s: {f:?}"
+        );
+    }
+    // CONTROL: the workflows ended, the same turn's end restarts.
+    let wait = captured
+        .iter()
+        .position(|r| r.starts_with("✻ Waiting for 3 dynamic workflows"))
+        .expect("the waiting row");
+    let (head, panel) = captured[wait].split_once('│').expect("the panel's rule");
+    let mut ended = captured.clone();
+    ended[wait] = format!(
+        "{:<w$}│{panel}",
+        "✻ Brewed for 6m 7s · done 10:07 AM",
+        w = head.chars().count()
+    );
+    ended.retain(|r| !r.trim_start().starts_with('◯'));
+    let f = look(&ended, 60);
+    assert!(
+        f.background.is_empty() && f.quiet_s >= upgrade::QUIET_S,
+        "{f:?}"
+    );
+    assert_eq!(
+        upgrade::next_step(&Phase::Pending, &f, false, NOW),
+        upgrade::Step::Terminate,
+        "{f:?}"
+    );
+    // A workflow's progress row left at its full bar after the workflow ended (measured on
+    // 2.1.304) is no running work of the agent's: it holds no restart.
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+        "../aterm-phase/src/fixtures/claude-2.1.304-agents-panel-workflow-done-3m20s-120col.txt",
+    );
+    let done = screen(&std::fs::read_to_string(path).expect("the fixture"));
+    assert_eq!(
+        aterm_phase::phase::background_wait(&done),
+        Some("a workflow running"),
+        "the reader still reads its row"
+    );
+    assert!(look(&done, 60).background.is_empty());
+}
+
+/// A Claude Code screen over its own work, CONSTRUCTED in the shape of `aterm_phase`'s
+/// `a_wait_claude_code_hid_under_its_own_wake_still_stands`: `status` the row its turn stopped on,
+/// `body` the rows drawn under that row above the composer (a wake and its reply carry the wait
+/// up, so no status row stands over the composer), `under` the rows under the footer.
+fn own_work_screen(status: &str, body: &[&str], under: &[&str]) -> Vec<String> {
+    let rule = "─".repeat(100);
+    let mut rows = vec![
+        "⏺ The review runs as a workflow; it reports when it ends.".to_string(),
+        String::new(),
+        status.to_string(),
+        String::new(),
+    ];
+    rows.extend(body.iter().map(|r| (*r).to_string()));
+    rows.extend([
+        rule.clone(),
+        "❯ keep going".to_string(),
+        rule,
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents".to_string(),
+        String::new(),
+    ]);
+    rows.extend(under.iter().map(|r| (*r).to_string()));
+    rows
+}
+
+/// THE AGENT'S OWN WORK HOLDS THE RESTART WHATEVER RULE THE READER READS FIRST: a workflow's
+/// progress row under the footer (`◯ name ▰▰▱ 1/2`) reads `a workflow running` ahead of the wait
+/// Claude Code carries above its own wake, and ahead of a done row's `… still running`. Each of
+/// those is work the agent runs in its own process, which no process row names, so the restart
+/// waits for it at every rung, LAND's too.
+/// The restart's signal, which re-reads the screen, goes only where none of it is pending
+/// ([`turn_over_shown`]).
+/// NEGATIVE CONTROL: the same screens once that work is over (the workflow's completion and a
+/// done row with nothing left running, its progress row left at its full bar as 2.1.304 leaves
+/// it) restart at LAND.
+#[test]
+fn the_agents_own_work_holds_the_restart_under_any_footer_rule() {
+    const RUNNING: &str = "  ◯ review-pass  ▰▰▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱  1/2 · 3m02s · ↓ 12.4k tokens";
+    const FULL: &str = "  ◯ review-pass  ▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰  2/2 · 3m20s · ↓ 20.1k tokens";
+    let wake = [
+        "⏺ Monitor event: \"lander\"",
+        "",
+        "⏺ Still in its crates-tests lane. I restarted the watch.",
+        "",
+    ];
+    let carried = own_work_screen(
+        "✻ Waiting for 1 dynamic workflow to finish",
+        &wake,
+        &[RUNNING],
+    );
+    let left = own_work_screen(
+        "✻ Brewed for 6m 7s · done 10:07 AM · 2 agents still running",
+        &[],
+        &[RUNNING],
+    );
+    // The same done row as 2.1.310 and later draw it beside their side panel: padded out to the
+    // panel's rule (`claude-2.1.316-waiting-agents-and-workflows-turn-over-panel.txt`).
+    let beside = own_work_screen(
+        &format!(
+            "{:<81}│",
+            "✻ Brewed for 6m 7s · done 10:07 AM · 2 agents still running"
+        ),
+        &[],
+        &[RUNNING],
+    );
+    for (name, rows, work) in [
+        ("carried", &carried, "screen:background-work-still-running"),
+        (
+            "left-running",
+            &left,
+            "screen:background-work-still-running",
+        ),
+        (
+            "left-running beside the panel",
+            &beside,
+            "screen:background-work-still-running",
+        ),
+    ] {
+        assert_eq!(
+            aterm_phase::phase::background_wait(rows),
+            Some("a workflow running"),
+            "{name}: the reader reads the footer's rule first"
+        );
+        for behind in [60, upgrade::RUNG_LAND_S] {
+            let f = rest_look(rows, behind);
+            assert!(
+                f.composer_empty && !f.approval_box && !f.busy_footer,
+                "{name}: {f:?}"
+            );
+            assert_eq!(f.background, [work], "{name}: its own work");
+            assert_eq!(
+                upgrade::next_step(&Phase::Pending, &f, false, NOW),
+                upgrade::Step::Wait("background"),
+                "{name}, behind {behind}s: {f:?}"
+            );
+        }
+        let signal = read(rows.clone(), 7, HumanInput::Ago(600_000));
+        assert!(!turn_over_shown(&signal, false), "{name}: the signal waits");
+    }
+    // CONTROL: the work is over and its progress row stays drawn at its full bar.
+    let completed = own_work_screen(
+        "✻ Waiting for 1 dynamic workflow to finish",
+        &[
+            "⏺ Dynamic workflow \"review-pass\" completed · 3m 20s",
+            "",
+            "⏺ The review is in; nothing to fix.",
+            "",
+            "✻ Cooked for 9m 0s · done 10:11 AM",
+            "",
+        ],
+        &[FULL],
+    );
+    let done = own_work_screen("✻ Brewed for 6m 7s · done 10:07 AM", &[], &[FULL]);
+    for (name, rows) in [("completed", &completed), ("done", &done)] {
+        assert_eq!(
+            aterm_phase::phase::background_wait(rows),
+            Some("a workflow running"),
+            "{name}: the reader still reads its row"
+        );
+        let f = rest_look(rows, upgrade::RUNG_LAND_S);
+        assert!(f.background.is_empty(), "{name}: {f:?}");
+        assert_eq!(
+            upgrade::next_step(&Phase::Pending, &f, false, NOW),
+            upgrade::Step::Terminate,
+            "{name}: {f:?}"
+        );
+        let signal = read(rows.clone(), 7, HumanInput::Ago(600_000));
+        assert!(turn_over_shown(&signal, false), "{name}: the signal goes");
+    }
 }
 
 /// A Claude Code screen under a command status line (aterm's usage tap is one), CONSTRUCTED in the

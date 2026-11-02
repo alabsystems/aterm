@@ -48,6 +48,7 @@ impl RunDir {
     /// # Errors
     /// It exists already, or the write failed.
     pub fn write(&self, name: &str, text: &str) -> io::Result<PathBuf> {
+        valid_entry_name(name)?;
         let path = self.path.join(name);
         let mut open = std::fs::OpenOptions::new();
         open.write(true).create_new(true);
@@ -66,6 +67,7 @@ impl RunDir {
     /// # Errors
     /// It exists already, or it could not be made.
     pub fn subdir(&self, name: &str) -> io::Result<PathBuf> {
+        valid_entry_name(name)?;
         let path = self.path.join(name);
         #[cfg(unix)]
         {
@@ -76,6 +78,16 @@ impl RunDir {
         std::fs::DirBuilder::new().create(&path)?;
         Ok(path)
     }
+}
+
+fn valid_entry_name(name: &str) -> io::Result<()> {
+    if name.is_empty() || matches!(name, "." | "..") || name.contains(['/', '\\', '\0']) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "run entry must be a single file name",
+        ));
+    }
+    Ok(())
 }
 
 impl Drop for RunDir {
@@ -89,8 +101,11 @@ fn sweep(root: &Path) {
         return;
     };
     for e in entries.flatten() {
+        if !e.file_type().is_ok_and(|ft| ft.is_dir()) {
+            continue;
+        }
         let name = e.file_name().to_string_lossy().into_owned();
-        let pid = name.split('-').next().and_then(|p| p.parse::<u32>().ok());
+        let pid = name.split('-').next().and_then(crate::parse_uint::<u32>);
         if pid.is_some_and(|p| p != std::process::id() && !aterm_uds::process::pid_alive(p)) {
             let _ = std::fs::remove_dir_all(e.path());
         }

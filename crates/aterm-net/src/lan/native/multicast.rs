@@ -3,7 +3,8 @@
 
 //! Preparation of IPv4 multicast discovery; never an authenticated data path.
 
-use super::{Socket, bind_interface, option, set_option, socket_policy, tcp::Address};
+use super::{Socket, bind_interface, option, set_option, socket_policy};
+use aterm_uds::connect::Inet;
 use std::{
     io,
     net::{Ipv4Addr, SocketAddr, UdpSocket},
@@ -36,7 +37,7 @@ pub(in crate::lan) fn bind(
         MULTICAST_IF,
         u32::from_ne_bytes(source.octets()),
     )?;
-    let address = Address::new(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)));
+    let address = Inet::new(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)));
     let (pointer, length) = address.parts();
     // SAFETY: address owns the initialized sockaddr for this complete call.
     if unsafe { libc::bind(socket.as_raw_fd(), pointer, length) } != 0 {

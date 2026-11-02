@@ -25,8 +25,8 @@ use windows_sys::Win32::UI::HiDpi::{
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow;
 use windows_sys::Win32::UI::Input::Pointer::{POINTER_INFO, POINTER_PEN_INFO, POINTER_TOUCH_INFO};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    ClipCursor, GetClientRect, GetClipCursor, GetSystemMetrics, GetWindowRect, IsIconic, IDC_ARROW,
-    IDC_HAND, IDC_IBEAM, IDC_SIZEALL, IDC_SIZENS, IDC_SIZEWE, SM_CXVIRTUALSCREEN,
+    ClipCursor, GetClientRect, GetClipCursor, GetSystemMetrics, GetWindowRect, IsIconic, IsZoomed,
+    IDC_ARROW, IDC_HAND, IDC_IBEAM, IDC_SIZEALL, IDC_SIZENS, IDC_SIZEWE, SM_CXVIRTUALSCREEN,
     SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 
@@ -114,6 +114,11 @@ pub fn is_focused(window: HWND) -> bool {
 
 pub fn is_minimized(window: HWND) -> bool {
     unsafe { IsIconic(window) != false.into() }
+}
+
+/// LOCAL PATCH (aterm): whether `window` is maximized (`IsZoomed`).
+pub fn is_maximized(window: HWND) -> bool {
+    unsafe { IsZoomed(window) != false.into() }
 }
 
 pub fn get_instance_handle() -> HMODULE {

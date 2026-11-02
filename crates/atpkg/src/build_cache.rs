@@ -25,6 +25,51 @@ pub mod remove;
 #[path = "build_cache_fence.rs"]
 mod fence;
 
+/// THE TESTS' CALL INTO A PASS between an entry's intent on record and its rename aside (the
+/// leaf's in [`Sweep::walk`], a tooling entry's in [`tooling::reclaim`]), with the entry's path:
+/// where a test sets what refuses that rename after the check. Unix test builds alone: only this
+/// crate's Unix tests call it.
+#[cfg(all(test, unix))]
+pub(crate) mod seams {
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    type Hook = Box<dyn FnMut(&Path)>;
+
+    thread_local! {
+        static STAGING: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// Call `then` with the entry's path each time a pass on this thread is about to rename an
+    /// entry aside, its intent on record.
+    pub(crate) fn on_staging(then: impl FnMut(&Path) + 'static) {
+        STAGING.with(|h| *h.borrow_mut() = Some(Box::new(then)));
+    }
+
+    /// Forget the call of this thread.
+    pub(crate) fn clear() {
+        STAGING.with(|h| *h.borrow_mut() = None);
+    }
+
+    pub(super) fn staging(entry: &Path) {
+        let call = STAGING.with(|h| h.borrow_mut().take());
+        if let Some(mut call) = call {
+            call(entry);
+            STAGING.with(|h| {
+                let mut slot = h.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(call);
+                }
+            });
+        }
+    }
+}
+
+#[cfg(not(all(test, unix)))]
+mod seams {
+    pub(super) const fn staging(_: &std::path::Path) {}
+}
+
 pub use stale::RECLAIM_STALE;
 
 /// When a workspace is gone: the rule the window's disk watch uses too.
@@ -88,6 +133,61 @@ fn stage_aside(from: &Path, holder: &Path, base: &OsStr) -> std::io::Result<Path
     take_stage_name(holder, base, &mut |to| rename_noreplace(from, to))
 }
 
+/// STAGE `from` ASIDE WHILE ITS CUSTODY ALLOWS: renamed aside in `holder` ([`stage_aside`]),
+/// then custody read again by path at the stage and at every folder above it
+/// ([`registered::retention::allows_tree`]). A rename acts by name, so a keep published at `from`
+/// (or a marker there that cannot be read) after the custody read that let it be staged, and
+/// before the rename acted, moved with it: it is put back at `from`, never over another entry,
+/// and `None` returned, so it stands where it stood. Where something took `from` meanwhile, the
+/// stage is returned all the same, and the removal that takes it reads its custody before
+/// anything of it goes ([`remove::tree_while`]).
+fn stage_unkept(from: &Path, holder: &Path, base: &OsStr) -> std::io::Result<Option<PathBuf>> {
+    let stage = stage_aside(from, holder, base)?;
+    staged::at(&stage);
+    if !registered::retention::allows_tree(&stage) && rename_noreplace(&stage, from).is_ok() {
+        return Ok(None);
+    }
+    Ok(Some(stage))
+}
+
+/// THE TESTS' HOOK just after entries were renamed into a stage ([`stage_unkept`], a prune's
+/// parts), before custody is read again: a test publishes a keep at that instant, on this
+/// thread. Unix test builds alone: only this crate's Unix tests set it.
+#[cfg(all(test, unix))]
+pub(crate) mod staged {
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    type Hook = Box<dyn FnMut(&Path)>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// Call `then` with each stage just filled on this thread, until [`clear`].
+    pub(crate) fn on(then: impl FnMut(&Path) + 'static) {
+        HOOK.with(|hook| *hook.borrow_mut() = Some(Box::new(then)));
+    }
+
+    /// No hook on this thread.
+    pub(crate) fn clear() {
+        HOOK.with(|hook| *hook.borrow_mut() = None);
+    }
+
+    pub(super) fn at(stage: &Path) {
+        HOOK.with(|hook| {
+            if let Some(then) = hook.borrow_mut().as_mut() {
+                then(stage);
+            }
+        });
+    }
+}
+
+#[cfg(not(all(test, unix)))]
+mod staged {
+    pub(super) const fn at(_: &std::path::Path) {}
+}
+
 /// A NEW EMPTY STAGE in `holder`, made where nothing stands under the lowest stage name from
 /// `base` that is free ([`take_stage_name`]; a folder is never made over another entry).
 fn new_stage(holder: &Path, base: &OsStr) -> std::io::Result<PathBuf> {
@@ -117,8 +217,13 @@ fn free_stage(holder: &Path, base: &OsStr) -> Option<PathBuf> {
 /// name ([`free_stage`]), while `entry` itself can be renamed: it is no link, it is on
 /// `holder`'s volume (a volume mounted at it never moves), and this user may take its name out of
 /// `holder` (`platform::may_take_name`: on macOS its own flags and ACL and its folder's, as the
-/// rename itself is authorized). A leaf or tooling entry is planned, and its intent asked, only
-/// while it is `Some`, so no plan lists, and no pass records, a removal no rename can start.
+/// rename itself is authorized; on Linux its folder's write bit, its own and its folder's
+/// immutable and append-only attributes, and a sticky folder's owners). A leaf or tooling entry
+/// is planned, and its intent asked, only while it is `Some`, so no plan lists, and no pass
+/// records, a removal no rename can start. What changes after this reading (a flag, an ACL entry
+/// or a folder mode set since, a volume mounted there, or an attribute no reading here sees) can
+/// still refuse the rename once the intent is on record: that intent closes with
+/// [`Unused::Refused`] ([`Intents`]), the entry left as it was.
 fn stage_for(entry: &Path, holder: &Path, base: &OsStr) -> Option<PathBuf> {
     let stage = free_stage(holder, base)?;
     let meta = std::fs::symlink_metadata(entry).ok()?;
@@ -204,7 +309,7 @@ pub const MOVED_AFTER: Duration = Duration::from_secs(60 * 60);
 const SH_BLOCK: &str = r#"# aterm: build intermediates out of Spotlight
 __atb_t=
 __atb_c=${HOME-}/Library/Caches/aterm/.ubd/cargo-build.noindex
-__atb= __atb_k= __atb_e= __atb_T= __atb_tf= __atb_tn= __atb_D= __atb_al= __atb_ab= __atb_q= __atb_v=
+__atb= __atb_k= __atb_e= __atb_T= __atb_tf= __atb_tn= __atb_D= __atb_al= __atb_ab= __atb_q= __atb_v= __atb_r=
 case ${HOME-} in /?*) case ${PWD-} in "$HOME"/*) __atb=1 ;; esac ;; esac
 case ${HOME-} in *[\'[:cntrl:]]*) __atb= ;; esac
 case ${HOME-}${PWD-} in *[{}]*) __atb= ;; esac
@@ -323,20 +428,69 @@ elif [ -n "$__atb" ]; then
   [ -n "$__atb_k" ] || __atb_D='{workspace-root}/target/build.noindex'
 fi
 if [ -z "$__atb" ]; then __atb_D=
-elif [ -z "$__atb_D" ]; then set -- --config "build.build-dir='$__atb_c{workspace-root}/.cargo-build'" "$@"
-elif [ -z "$__atb_e" ]; then set -- --config "build.build-dir='$__atb_D'" "$@"
 else
-  CARGO_BUILD_BUILD_DIR=$__atb_D
-  export CARGO_BUILD_BUILD_DIR
+  [ -n "$__atb_D" ] || __atb_D=$__atb_c'{workspace-root}/.cargo-build'
+  [ -n "$__atb_e" ] || set -- --config "build.build-dir='$__atb_D'" "$@"
+  # Only an external frontend loses those words, and the trust lane reads only the variable.
+  # Anything else keeps them, aliases included, and the variable would reach its build scripts,
+  # where a nested cargo on this workspace would wait forever on the lock this build holds. The
+  # verb alone is matched, never joined to a flag, so no alias's name can fall into an arm.
+  case $__atb_v in
+    tippy | clippy | trust)
+      CARGO_BUILD_BUILD_DIR=$__atb_D
+      export CARGO_BUILD_BUILD_DIR
+      ;;
+  esac
+fi
+# aterm: descriptors past a stock shell's soft limit: a test binary's threads pass
+# 256 together, so a run would fail `Too many open files` on the caller's limit
+# alone. Raise only the soft limit, toward the floor, and only for a verb that
+# builds or runs code (the scan above classified it, aliases included): reading
+# a limit is a fork on this shell, so fmt/metadata/help invocations skip it. The
+# kernel refuses a raise past the hard limit, and only then is the hard limit
+# read. Digit strings are normalized and length-checked before any arithmetic:
+# a shell's own rendering of an unlimited value need not fit its signed integers.
+# The tippy shim needs no scan to know it builds: its name is baked in above.
+case $__atb_t in tippy) __atb_r=1 ;; esac
+case $__atb_v in
+  build | b | check | c | test | t | run | r | bench | doc | d | rustc | rustdoc | fix | clippy | tippy | trust) __atb_r=1 ;;
+  *) [ -n "$__atb_ab" ] && __atb_r=1 ;;
+esac
+if [ -n "$__atb_r" ]; then
+  __atb_z=$(ulimit -Sn 2>/dev/null) || __atb_z=
+  case $__atb_z in
+    '' | *[!0-9]*) ;;
+    *)
+      while [ "${#__atb_z}" -gt 1 ]; do case $__atb_z in 0*) __atb_z=${__atb_z#0} ;; *) break ;; esac; done
+      if [ "${#__atb_z}" -le 15 ] && [ "$__atb_z" -lt @ATB_NOFILE_FLOOR@ ] && ! ulimit -Sn @ATB_NOFILE_FLOOR@ 2>/dev/null; then
+        __atb_y=$(ulimit -Hn 2>/dev/null) || __atb_y=
+        case $__atb_y in
+          '' | *[!0-9]*) ;;
+          *)
+            while [ "${#__atb_y}" -gt 1 ]; do case $__atb_y in 0*) __atb_y=${__atb_y#0} ;; *) break ;; esac; done
+            if [ "${#__atb_y}" -le 15 ] && [ "$__atb_z" -lt "$__atb_y" ]; then ulimit -Sn "$__atb_y" 2>/dev/null || :; fi
+            ;;
+        esac
+      fi
+      ;;
+  esac
 fi
 "#;
 
 /// The block a shim forwarding to the store file `name` carries: `targo`'s, or `targo-tippy`'s, which names no subcommand (it is the lint).
 #[must_use]
 pub fn shim_block(name: &str) -> Option<String> {
+    // The one descriptor floor, spelled into the block from its owning const
+    // (`aterm_uds::spawnfd::SOFT_NOFILE_FLOOR`) so the script and the Rust
+    // raises can never drift apart.
+    let floor = aterm_uds::spawnfd::SOFT_NOFILE_FLOOR.to_string();
     match name {
-        "targo" => Some(SH_BLOCK.to_owned()),
-        "targo-tippy" => Some(SH_BLOCK.replacen("\n__atb_t=\n", "\n__atb_t=tippy\n", 1)),
+        "targo" => Some(SH_BLOCK.replace("@ATB_NOFILE_FLOOR@", &floor)),
+        "targo-tippy" => Some(
+            SH_BLOCK
+                .replacen("\n__atb_t=\n", "\n__atb_t=tippy\n", 1)
+                .replace("@ATB_NOFILE_FLOOR@", &floor),
+        ),
         _ => None,
     }
 }
@@ -433,7 +587,7 @@ pub fn release_reads_build_dir(release: &str) -> bool {
     }
 }
 
-/// WHY A BUILD DIRECTORY GOES ([`reclaim`], [`reclaim_watched`]): what its intent row, its removal row and the watch's account of it say — each rule [`reclaim`] takes one by, with the figures it was taken on.
+/// WHY A BUILD DIRECTORY GOES ([`reclaim`], [`reclaim_watched`]): what its intent row, its removal row and the watch's account of it say — each rule [`reclaim`] takes one by, with the figures it was taken on; and, returned after an intent, what became of it when it did not go whole ([`Unused::Stayed`], [`Unused::Revoked`], [`Unused::Refused`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unused {
     /// Its workspace is seen gone ([`checkout::gone_placed`]) and nothing wrote it for `idle`, at least the pass's window `after` ([`RECLAIM_GONE`], or [`RECLAIM_GONE_UNDER_PRESSURE`] below the disk watch's floor).
@@ -442,7 +596,8 @@ pub enum Unused {
     Idle { idle: Duration },
     /// It is under the root the cache moved from ([`moved_from`]), which no build of this version writes, and nothing wrote it for `idle`, at least `after` ([`MOVED_AFTER`]): it goes whatever its workspace's state.
     Moved { idle: Duration, after: Duration },
-    /// What an earlier pass renamed aside and did not finish removing.
+    /// What an earlier pass renamed aside and did not finish removing. A dry plan forecasts what
+    /// of it will stay, and why ([`Planned::stays`]).
     Unfinished,
     /// A different compiler target is waiting; this settled disposable generation must
     /// retire whole before another target can be created in the same package cache.
@@ -457,10 +612,25 @@ pub enum Unused {
     },
     /// NOT A REMOVAL WHOLE: what a removal ([`remove::tree`]) left of the stage it is returned
     /// beside, a build directory renamed aside or a stage of its parts — `stayed` entries of it
-    /// would not go even once made removable (another user's, on another volume, or still
-    /// refusing), and `freed` bytes of it went. It stays staged: the next pass records it
-    /// ([`Unused::Unfinished`]) and tries what is left; [`remove::stayed_words`] names it.
+    /// would not go even once made removable (another user's, on another volume, one whose
+    /// attributes cannot be read, a file named outside it too, or still refusing:
+    /// [`remove::Why`]), and `freed` bytes of it went. It stays staged: the next pass records it
+    /// ([`Unused::Unfinished`]) and tries what is left; [`remove::stayed_words`] names what
+    /// stayed, each with its reason. Only a removal returns it: a dry plan's forecast of what
+    /// will stay is [`Planned::stays`].
     Stayed { stayed: usize, freed: u64 },
+    /// Permission was revoked during removal. The retained remainder was not counted;
+    /// only the exact allocated bytes already freed are known.
+    Revoked { freed: u64 },
+    /// NOT A REMOVAL AT ALL: an entry whose intent was on record and nothing of which went, `by`
+    /// what refused it after the check that let its intent be asked ([`Refusal`]): its rename
+    /// aside failed, or the pass stopped before its move, or, moved into a stage already, before
+    /// its removal. It is the outcome that closes that intent, 0 bytes freed (every intent a pass
+    /// records closes, [`Intents`]), returned beside the path that holds it now: the entry, which
+    /// stays where it was and the next pass judges again, or its stage ([`Refusal::Staged`]),
+    /// which stays staged and the next pass finishes. [`reclaim`] never returns it, and nothing
+    /// counts it as gone ([`Unused::nothing_went`]).
+    Refused { by: Refusal },
     /// A completed pinned tool of the tooling cache nothing ran for `idle`, at least `after` ([`RECLAIM_IDLE`]).
     Tooling { idle: Duration, after: Duration },
     /// A tooling scratch carrying both its give-up exec stamp and a regular run-proof file ([`aterm_uds::deadline::RAN`]); elapsed time and a reboot never replace that proof.
@@ -473,6 +643,163 @@ pub enum Unused {
     },
 }
 
+impl Unused {
+    /// Whether it is returned for an entry nothing of which went ([`Unused::Refused`]): an
+    /// outcome that closes its intent and that no count of what went or was freed takes in.
+    #[must_use]
+    pub const fn nothing_went(self) -> bool {
+        matches!(self, Self::Refused { .. })
+    }
+}
+
+/// WHAT REFUSED AN ENTRY whose intent was on record, before anything of it went
+/// ([`Unused::Refused`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// Its rename aside failed, with this error kind: a flag, an ACL entry or a folder mode set
+    /// after the check (`PermissionDenied`), a volume mounted there (`CrossesDevices`,
+    /// `ResourceBusy`), or an attribute the check does not read. It stays where it was.
+    Rename(std::io::ErrorKind),
+    /// The pass stopped before its move: a check made again once its intent was on record
+    /// refused it (a process came to use it, or its locks or its registered receipt changed), or
+    /// a step its move needs failed (a registered cache's stage or receipt not written). It
+    /// stays where it was.
+    Stopped,
+    /// The pass stopped once it was in a stage (moved aside by this pass, or a stage an earlier
+    /// pass left), before its removal: a check made again refused it, as for
+    /// [`Refusal::Stopped`]. It stays staged, returned as its stage's path, and the next pass
+    /// finishes that stage.
+    Staged,
+}
+
+impl Refusal {
+    /// The one word a ledger row or a printer says it by: the rename's error kind as `std::io`
+    /// names it (`PermissionDenied`, `CrossesDevices`, …), `Stopped` or `Staged`; never a path
+    /// or an error's message.
+    #[must_use]
+    pub fn word(self) -> String {
+        match self {
+            Self::Rename(kind) => format!("{kind:?}"),
+            Self::Stopped => "Stopped".to_owned(),
+            Self::Staged => "Staged".to_owned(),
+        }
+    }
+
+    /// What it says of the entry and of what the next pass does with it, in the words
+    /// `aterm pkg machine cache`, the disk ledger and a run's relief line say it by.
+    #[must_use]
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::Rename(_) => {
+                "its rename aside was refused after its check (a flag, an ACL entry or a folder \
+                 mode set since, or a volume mounted there); it stays where it was, and the next \
+                 pass judges it again"
+            }
+            Self::Stopped => {
+                "the pass stopped before its move (a process came to use it, or what it was \
+                 judged by changed, once its intent was on record); it stays where it was, and \
+                 the next pass judges it again"
+            }
+            Self::Staged => {
+                "the pass stopped once it was moved aside, before its removal (a process came to \
+                 use it, or what it was judged by changed, once its intent was on record); it \
+                 stays in its stage, and the next pass finishes the stage"
+            }
+        }
+    }
+}
+
+/// A PASS'S INTENTS AND THEIR OUTCOMES: `record` asked before each removal ([`Intents::ask`]),
+/// and what is returned for each intent it put on record: what went, what stayed of it, or,
+/// when nothing of it went, [`Unused::Refused`]. An intent on record always closes with an
+/// outcome: a pass asks for and finishes one entry at a time (every outcome follows its own
+/// intent, before the next is asked), so an intent still open when the next is asked, or when
+/// the pass ends, is closed with nothing gone ([`Intents::stop`]); a step that knows why
+/// closes it so ([`Intents::refused`]). Where the entry is matters to that outcome: once it is
+/// in a stage ([`Intents::ask_staged`], [`Intents::moved`]), a stop returns the stage's path
+/// ([`Refusal::Staged`]), never the entry's, which no longer holds it.
+struct Intents<'r> {
+    record: &'r mut dyn FnMut(&Path, Unused) -> bool,
+    /// The intent on record whose outcome is not in yet: the path it was asked for, and the
+    /// stage that holds it once it is staged.
+    open: Option<(PathBuf, Option<PathBuf>)>,
+    out: Vec<(PathBuf, Unused)>,
+}
+
+impl<'r> Intents<'r> {
+    fn new(record: &'r mut dyn FnMut(&Path, Unused) -> bool) -> Self {
+        Self {
+            record,
+            open: None,
+            out: Vec::new(),
+        }
+    }
+
+    /// Ask `record` for `path`'s removal for `why`, any intent still open closed first: `true`
+    /// puts it on record, open until its outcome is in.
+    fn ask(&mut self, path: &Path, why: Unused) -> bool {
+        self.stop();
+        let on = (self.record)(path, why);
+        if on {
+            self.open = Some((path.to_path_buf(), None));
+        }
+        on
+    }
+
+    /// [`Intents::ask`] for a stage, an entry already moved aside (by an earlier pass, or by
+    /// this one before its intent): on record, a stop closes it as [`Refusal::Staged`].
+    fn ask_staged(&mut self, stage: &Path, why: Unused) -> bool {
+        let on = self.ask(stage, why);
+        self.moved(stage);
+        on
+    }
+
+    /// The entry of the intent on record is now in `stage`: a stop from here closes it as
+    /// staged, at `stage`.
+    fn moved(&mut self, stage: &Path) {
+        if let Some((_, staged)) = self.open.as_mut() {
+            *staged = Some(stage.to_path_buf());
+        }
+    }
+
+    /// The outcome of the intent on record: `path` (the entry, or the stage of it that stayed)
+    /// returned for `why`.
+    fn outcome(&mut self, path: PathBuf, why: Unused) {
+        self.open = None;
+        self.out.push((path, why));
+    }
+
+    /// Close the intent on record, if one is open, with nothing of it gone, refused `by`, at
+    /// the path that holds it now (its stage once staged).
+    fn refused(&mut self, by: Refusal) {
+        if let Some((path, staged)) = self.open.take() {
+            self.out
+                .push((staged.unwrap_or(path), Unused::Refused { by }));
+        }
+    }
+
+    /// The pass stopped before the intent on record went: closed with nothing of it gone, as
+    /// [`Refusal::Staged`] at its stage once it is staged, as [`Refusal::Stopped`] where it was
+    /// before.
+    fn stop(&mut self) {
+        let staged = self
+            .open
+            .as_ref()
+            .is_some_and(|(_, staged)| staged.is_some());
+        self.refused(if staged {
+            Refusal::Staged
+        } else {
+            Refusal::Stopped
+        });
+    }
+
+    /// Every outcome, in the order their intents were recorded, the last intent closed.
+    fn finish(mut self) -> Vec<(PathBuf, Unused)> {
+        self.stop();
+        self.out
+    }
+}
+
 /// Removes the build directories under the cache `root` that nobody builds into or uses any
 /// more, and returns those removed whole: one unwritten for [`RECLAIM_GONE`] whose workspace is
 /// seen gone ([`checkout::gone`], `home` naming the folders it never looks into), and any
@@ -480,12 +807,14 @@ pub enum Unused {
 pub fn reclaim(root: &Path, home: Option<&Path>, now: SystemTime) -> Vec<PathBuf> {
     reclaim_watched(root, home, now, RECLAIM_GONE, None, &mut |_, _| true)
         .into_iter()
-        .filter(|(_, why)| !matches!(why, Unused::Stayed { .. }))
+        .filter(|(_, why)| {
+            !why.nothing_went() && !matches!(why, Unused::Stayed { .. } | Unused::Revoked { .. })
+        })
         .map(|(path, _)| path)
         .collect()
 }
 
-/// [`reclaim`] as the window's disk watch runs it, each directory returned with why it went ([`Unused`]), and each stage a removal could not finish with what stayed of it ([`Unused::Stayed`]): a gone workspace's build directory goes once unwritten for `gone_after` ([`RECLAIM_GONE`] while the volume is only low, [`RECLAIM_GONE_UNDER_PRESSURE`] below the floor); and with `placing` (the home volume's device and a complete mount table), a workspace nested in a removed checkout is gone too ([`checkout::gone_placed`]).
+/// [`reclaim`] as the window's disk watch runs it, `record` asked before each removal (`false` keeps it), each directory returned with why it went ([`Unused`]), each stage a removal could not finish with what stayed of it ([`Unused::Stayed`]), and each entry whose intent `record` put on record and nothing of which went (its rename aside refused after the check, or the pass stopped before its move, or, moved aside, before its removal, returned as its stage: [`Refusal`]) with [`Unused::Refused`], so every intent on record closes with an outcome ([`Intents`]): a gone workspace's build directory goes once unwritten for `gone_after` ([`RECLAIM_GONE`] while the volume is only low, [`RECLAIM_GONE_UNDER_PRESSURE`] below the floor); and with `placing` (the home volume's device and a complete mount table), a workspace nested in a removed checkout is gone too ([`checkout::gone_placed`]).
 pub fn reclaim_watched(
     root: &Path,
     home: Option<&Path>,
@@ -536,7 +865,7 @@ fn reclaim_watched_on(
     record: &mut dyn FnMut(&Path, Unused) -> bool,
     fence: &fence::Fence<'_>,
 ) -> Vec<(PathBuf, Unused)> {
-    let mut removed = Vec::new();
+    let mut intents = Intents::new(record);
     if std::fs::symlink_metadata(root).is_ok_and(|m| m.is_dir()) {
         let mut sweep = Sweep {
             root,
@@ -546,23 +875,23 @@ fn reclaim_watched_on(
             placing,
             moved: false,
             compiler_store: compiler_store(home),
-            record,
+            intents: &mut intents,
             fence,
-            removed: &mut removed,
+            permitted: &|| true,
         };
         sweep.walk(root, 0);
     }
-    removed
+    intents.finish()
 }
 
-/// THE ROOT THE CACHE MOVED FROM, emptied ([`MOVED_AFTER`]): each build directory under `root` that nothing wrote for [`MOVED_AFTER`] goes whole, its locks held as [`reclaim_watched`] holds them ([`Unused::Moved`]), whatever its workspace's state; nothing is pruned in part, and a build directory a build holds or wrote within the hour stays for a later pass. The root itself goes once nothing is left in it and it is as quiet, or this pass emptied it. `record` is asked before each removal, and a stage a removal could not finish is returned with what stayed of it ([`Unused::Stayed`]).
+/// THE ROOT THE CACHE MOVED FROM, emptied ([`MOVED_AFTER`]): each build directory under `root` that nothing wrote for [`MOVED_AFTER`] goes whole, its locks held as [`reclaim_watched`] holds them ([`Unused::Moved`]), whatever its workspace's state; nothing is pruned in part, and a build directory a build holds or wrote within the hour stays for a later pass. The root itself goes once nothing is left in it and it is as quiet, or this pass emptied it. `record` is asked before each removal, a stage a removal could not finish is returned with what stayed of it ([`Unused::Stayed`]), and an entry whose intent is on record and nothing of which went with [`Unused::Refused`].
 pub fn reclaim_moved(
     root: &Path,
     now: SystemTime,
     record: &mut dyn FnMut(&Path, Unused) -> bool,
 ) -> Vec<(PathBuf, Unused)> {
     let fence = fence::Fence::default();
-    let mut removed = Vec::new();
+    let mut intents = Intents::new(record);
     if std::fs::symlink_metadata(root).is_ok_and(|m| m.is_dir()) {
         let quiet = last_written(root).is_some_and(|t| age(now, t) >= MOVED_AFTER);
         let mut sweep = Sweep {
@@ -573,20 +902,20 @@ pub fn reclaim_moved(
             placing: None,
             moved: true,
             compiler_store: None,
-            record,
+            intents: &mut intents,
             fence: &fence,
-            removed: &mut removed,
+            permitted: &|| true,
         };
         let any = sweep.walk(root, 0);
         if quiet || any {
             let _ = std::fs::remove_dir(root);
         }
     }
-    removed
+    intents.finish()
 }
 
 /// One [`reclaim`] pass: where, when, and what went.
-struct Sweep<'a> {
+struct Sweep<'a, 'r> {
     root: &'a Path,
     home: Option<&'a Path>,
     now: SystemTime,
@@ -598,10 +927,12 @@ struct Sweep<'a> {
     moved: bool,
     /// Independently admitted actual store; unknown keeps compiler-classified units.
     compiler_store: Option<PathBuf>,
-    /// Asked before each removal, its locks held: `false` keeps it.
-    record: &'a mut dyn FnMut(&Path, Unused) -> bool,
+    /// Its `record`, asked before each removal, its locks held (`false` keeps it), and the
+    /// outcome that closes each intent it put on record.
+    intents: &'a mut Intents<'r>,
     fence: &'a fence::Fence<'a>,
-    removed: &'a mut Vec<(PathBuf, Unused)>,
+    /// Additional authority checked at every deletion boundary for registered roots.
+    permitted: &'a dyn Fn() -> bool,
 }
 
 /// How deep [`reclaim`] walks the mirror of the filesystem.
@@ -610,14 +941,14 @@ const MAX_DEPTH: usize = 64;
 /// One mirror folder `dir` under `root`: judge its `.cargo-build`, finish a removal an
 /// earlier pass left, walk its other children, then remove `dir` itself if it ended empty
 /// and is not brand new.
-impl Sweep<'_> {
+impl Sweep<'_, '_> {
     /// Whether the stage at `path` may be cleared: a folder stands there and its intent is on
     /// record (staged bytes need one, even after a crash); its intent refused, or no folder,
     /// keeps it as it is.
     fn stage_recorded(&mut self, path: &Path, original: &Path) -> bool {
         std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())
             && self.fence.clear(original, path)
-            && (self.record)(path, Unused::Unfinished)
+            && self.intents.ask_staged(path, Unused::Unfinished)
     }
 
     /// FINISH A STAGE an earlier pass left, once a pass, its intent on record
@@ -630,25 +961,57 @@ impl Sweep<'_> {
         self.take(stage, stage.to_path_buf(), Unused::Unfinished, original)
     }
 
-    /// REMOVE THE STAGE `stage` ([`remove::tree`], every removal a pass makes): removed whole,
-    /// `went` is returned as gone for `why`, and `true`; one some entry of which stayed is
-    /// returned as [`Unused::Stayed`] (what stayed, and the bytes that went) and stays staged for
-    /// the next pass, and `false`.
+    /// REMOVE THE STAGE `stage` ([`remove::tree`], every removal a pass makes), its intent on
+    /// record: removed whole, `went` is returned as gone for `why`, and `true`; one some entry
+    /// of which stayed is returned as [`Unused::Stayed`] (what stayed, and the bytes that went)
+    /// and stays staged for the next pass, and `false`. Custody is read by path above the stage,
+    /// and in the stage by the walk itself, through the folder it holds
+    /// ([`registered::retention::allows_walk`]). A search denial is lifted only after a complete
+    /// fresh name scan proves that no custody marker is hidden there; hidden or unreadable
+    /// custody leaves the folder unchanged. A stage whose walk is stopped once begun (by a keep
+    /// the walk reads in the stage, by one a read by path finds at `original` or above the stage
+    /// at a boundary of the walk, or by the pass's authority withdrawn there) is returned as
+    /// [`Unused::Revoked`] with the bytes that went. One refused before its walk (by a keep a
+    /// read by path finds at `original` or above the stage, or by the pass's authority or fence,
+    /// a process come to use it since its intent) closes its intent with nothing of it gone, at
+    /// `stage` ([`Refusal::Staged`]), and `false`: it stays staged as it stood, for the next pass
+    /// to finish.
     fn take(&mut self, stage: &Path, went: PathBuf, why: Unused, original: &Path) -> bool {
-        if !self.fence.clear(original, stage) {
+        if !(self.permitted)()
+            || !registered::retention::allows_tree(original)
+            || !registered::retention::allows_walk(stage)
+            || !self.fence.clear(original, stage)
+        {
+            self.intents.stop();
             return false;
         }
-        let left = remove::tree(stage);
+        let permitted = || {
+            (self.permitted)()
+                && registered::retention::allows_tree(original)
+                && registered::retention::allows_walk(stage)
+        };
+        let left = match remove::tree_while(stage, &permitted) {
+            Ok(left) => left,
+            Err(revoked) => {
+                self.intents.outcome(
+                    stage.to_path_buf(),
+                    Unused::Revoked {
+                        freed: revoked.freed,
+                    },
+                );
+                return false;
+            }
+        };
         if left.whole() {
-            self.removed.push((went, why));
+            self.intents.outcome(went, why);
         } else {
-            self.removed.push((
+            self.intents.outcome(
                 stage.to_path_buf(),
                 Unused::Stayed {
                     stayed: left.stayed,
                     freed: left.freed,
                 },
-            ));
+            );
         }
         left.whole()
     }
@@ -658,9 +1021,15 @@ impl Sweep<'_> {
     /// it all this pass), and the decision made again from a fresh survey under those locks;
     /// moved under the locks into a new stage of its own in `dir` ([`new_stage`] from
     /// [`DOOMED`], beside any stage an earlier pass left, which the walk finishes as a stage of
-    /// its own), recorded as that stage ([`Unused::Stale`]; refused, every entry moves back),
+    /// its own), while custody read by path at `leaf` and above allows it, read again once they
+    /// moved, recorded as that stage ([`Unused::Stale`]; refused, or kept by custody read again,
+    /// every entry moves back, never over another entry, and one whose path was taken meanwhile
+    /// stays staged for a later pass, which finishes it only while custody at `leaf` allows),
     /// and removed with the locks let go.
     fn prune(&mut self, dir: &Path, leaf: &Path) -> bool {
+        if !(self.permitted)() || !registered::retention::allows_tree(leaf) {
+            return false;
+        }
         let Some(seen) = look(leaf) else {
             return false;
         };
@@ -707,10 +1076,13 @@ impl Sweep<'_> {
         let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
         let (mut incremental, mut units) = (0, 0);
         for one in &doomed {
+            if !(self.permitted)() || !registered::retention::allows_tree(leaf) {
+                break;
+            }
             let before = moved.len();
             for path in &one.paths {
                 let to = stage.join(moved.len().to_string());
-                if std::fs::rename(path, &to).is_ok() {
+                if rename_noreplace(path, &to).is_ok() {
                     moved.push((path.clone(), to));
                 }
             }
@@ -726,15 +1098,23 @@ impl Sweep<'_> {
             units,
             after: RECLAIM_STALE,
         };
-        if moved.is_empty() || !(self.record)(&stage, why) {
+        // A rename acts by name: a keep published at the leaf as its parts moved would lose
+        // them, so custody is read there again once they moved, and one it keeps moves back.
+        staged::at(&stage);
+        if moved.is_empty()
+            || !registered::retention::allows_tree(leaf)
+            || !self.intents.ask_staged(&stage, why)
+        {
             // A new process may have started from a staged image while the intent was
             // refused. Keep that stage for a later recorded pass rather than move its image.
             if !self.fence.clear(leaf, &stage) {
                 drop(held);
                 return false;
             }
+            // Never over another entry: a part whose path something took meanwhile stays in
+            // the stage, which a later pass finishes only while custody at `leaf` allows.
             for (from, to) in moved.iter().rev() {
-                let _ = std::fs::rename(to, from);
+                let _ = rename_noreplace(to, from);
             }
             let _ = std::fs::remove_dir(&stage);
             drop(held);
@@ -748,7 +1128,12 @@ impl Sweep<'_> {
     /// ONE MIRROR FOLDER `dir`, its children as one listing read them: its [`LEAF`] judged
     /// (taken whole, under a stage of its own, or pruned), each stage an earlier pass left
     /// ([`is_stage`]) finished once, every other folder walked; the stages this pass makes are not
-    /// in that listing, so no stage is visited twice in a pass.
+    /// in that listing, so no stage is visited twice in a pass. A leaf whose rename aside is
+    /// refused once its intent is on record (a flag, an ACL entry or a folder mode set since the
+    /// check, a volume mounted there) is returned as [`Unused::Refused`] with the rename's error
+    /// kind, whole where it was; one put back where it stood because a keep was published at it
+    /// as it moved ([`stage_unkept`]), as [`Refusal::Stopped`]; one moved aside that a process
+    /// came to use before its removal, as its stage ([`Refusal::Staged`]).
     fn walk(&mut self, dir: &Path, depth: usize) -> bool {
         let (root, home, now) = (self.root, self.home, self.now);
         let quiet = last_written(dir).is_some_and(|t| age(now, t) >= RECLAIM_GONE);
@@ -779,22 +1164,35 @@ impl Sweep<'_> {
                     }
                     continue;
                 };
-                if stage_for(&child, dir, OsStr::new(DOOMED)).is_none()
+                if !(self.permitted)()
+                    || !registered::retention::allows_tree(&child)
+                    || stage_for(&child, dir, OsStr::new(DOOMED)).is_none()
                     || !self.fence.clear(&child, &child)
-                    || !(self.record)(&child, why)
+                    || !self.intents.ask(&child, why)
                 {
                     drop(held);
                     continue;
                 }
-                if !self.fence.clear(&child, &child) {
+                if !(self.permitted)()
+                    || !registered::retention::allows_tree(&child)
+                    || !self.fence.clear(&child, &child)
+                {
                     drop(held);
+                    self.intents.stop();
                     continue;
                 }
-                let staged = stage_aside(&child, dir, OsStr::new(DOOMED));
+                seams::staging(&child);
+                let staged = stage_unkept(&child, dir, OsStr::new(DOOMED));
                 drop(held);
-                if let Ok(stage) = staged {
-                    any = true;
-                    self.take(&stage, child.clone(), why, &child);
+                match staged {
+                    Ok(Some(stage)) => {
+                        any = true;
+                        self.intents.moved(&stage);
+                        self.take(&stage, child.clone(), why, &child);
+                    }
+                    // Put back where it stood: a keep was published at it as it moved.
+                    Ok(None) => self.intents.stop(),
+                    Err(e) => self.intents.refused(Refusal::Rename(e.kind())),
                 }
             } else if is_stage(name, OsStr::new(DOOMED)) {
                 let original = dir.join(LEAF);
@@ -875,12 +1273,7 @@ fn whole(
 fn hold(locks: &[PathBuf]) -> Option<Vec<crate::lock::Flock>> {
     locks
         .iter()
-        .map(|lock| {
-            if !std::fs::symlink_metadata(lock).is_ok_and(|m| m.is_file()) {
-                return None;
-            }
-            crate::lock::Flock::try_lock(std::fs::File::open(lock).ok()?).ok()
-        })
+        .map(|lock| crate::lock::Flock::try_lock(crate::metadata_io::open_regular(lock).ok()?).ok())
         .collect()
 }
 
@@ -897,17 +1290,26 @@ const UNBUILT_DEPTH: usize = 5;
 /// get a fresh directory. Each folder an earlier call left aside (every stage name from
 /// `<dir>.removing`, the one fixed name an older aterm used included) is removed first, each on
 /// its own: one that keeps an entry costs only itself, and `dir` is judged and removed all the
-/// same. Each removal is [`remove::tree`]'s, which no one entry stops. A caller whose `dir` is
-/// gone calls it all the same to finish what earlier calls left aside. `Ok(true)`: `dir` went
-/// whole, and nothing aside stayed. `Ok(false)`: nothing aside stayed, and `dir` is no directory
-/// or a build holds a lock (or one is no regular file, or one came meanwhile), or a process uses
-/// it or cannot be ruled out, and it stays.
+/// same. Each removal is [`remove::tree_while`]'s, which no one entry stops. Custody is read
+/// first, as a sweep reads a stage's: `dir` is renamed only while a custody read by its path
+/// allows it at `dir` and at every folder above it, and that read is made again at the aside
+/// just after the rename ([`stage_unkept`]), so a keep there (or a marker that cannot be read),
+/// even one published as the rename acted, stays where it stands; an aside is removed only while
+/// every folder above it allows, its own custody and what it holds read by the walk, and one a
+/// keep stops stays. A caller whose `dir` is gone calls it all the same to finish what earlier
+/// calls left aside. `Ok(true)`: `dir` went whole, and nothing aside stayed. `Ok(false)`: no
+/// entry of an aside stayed, and either `dir` did not go (it is no directory, a build holds a
+/// lock (or one is no regular file, or one came meanwhile), a process uses it or cannot be ruled
+/// out, or custody keeps it, and it stays), or an aside, this call's or an earlier one's, is kept
+/// untouched because a process uses it or cannot be ruled out.
 ///
 /// # Errors
 /// A directory scan, an entry's metadata or the rename failed; or some entry of an aside stayed,
 /// the earlier calls' or the one `dir` was renamed to, whether or not `dir` itself went: the
-/// error names each such aside ([`remove::stayed_words`], joined by `; `), the rest of it went,
-/// and the next call tries it again.
+/// error names each such aside ([`remove::stayed_words`], joined by `; `; one a keep above it
+/// stopped as its removal's permission revoked by that folder's custody marker:
+/// [`revoked_words`]), the rest of it went (all a walk took before a keep stopped it, where one
+/// did), and the next call tries it again.
 pub fn remove_unbuilt(dir: &Path) -> std::io::Result<bool> {
     remove_unbuilt_on(dir, &fence::Fence::default())
 }
@@ -941,11 +1343,18 @@ fn remove_unbuilt_on(dir: &Path, fence: &fence::Fence<'_>) -> std::io::Result<bo
             held_by_process = true;
             return false;
         }
-        let left = remove::tree(aside);
-        if !left.whole() {
-            stayed.push(remove::stayed_words(aside, left.stayed));
+        match remove::tree_while(aside, &|| registered::retention::allows_walk(aside)) {
+            Ok(left) if left.whole() => true,
+            Ok(left) => {
+                stayed.push(remove::stayed_words(aside, left.stayed));
+                false
+            }
+            // A walk a keep stopped leaves the aside standing, what it did not walk with it.
+            Err(_) => {
+                stayed.push(revoked_words(aside));
+                false
+            }
         }
-        left.whole()
     };
     for aside in stages_in(holder, &base) {
         gone(&aside);
@@ -961,10 +1370,15 @@ fn remove_unbuilt_on(dir: &Path, fence: &fence::Fence<'_>) -> std::io::Result<bo
         let Some(held) = hold(&locks) else {
             break 'went false;
         };
-        if locks_under(dir)? != locks || !fence.clear(dir, dir) {
+        if locks_under(dir)? != locks
+            || !fence.clear(dir, dir)
+            || !registered::retention::allows_tree(dir)
+        {
             break 'went false;
         }
-        let aside = stage_aside(dir, holder, &base)?;
+        let Some(aside) = stage_unkept(dir, holder, &base)? else {
+            break 'went false;
+        };
         let whole = gone(&aside);
         drop(held);
         whole
@@ -973,6 +1387,24 @@ fn remove_unbuilt_on(dir: &Path, fence: &fence::Fence<'_>) -> std::io::Result<bo
         Ok(went && !held_by_process)
     } else {
         Err(std::io::Error::other(stayed.join("; ")))
+    }
+}
+
+/// What [`remove_unbuilt`]'s readers are told of `aside`, whose removal custody stopped. Where a
+/// folder above it keeps it (its custody read by its path: [`registered::retention::kept_by`]),
+/// the walk's custody check above `aside` stopped it, so `aside` is said as one opaque root
+/// whose removal's permission that folder's custody marker revoked
+/// ([`remove::Why::PermissionRevoked`]), never an entry of it as refusing its removal; else what
+/// stands of it, as a removal's readers name it ([`remove::stayed_words`]).
+fn revoked_words(aside: &Path) -> String {
+    match aside.parent().and_then(registered::retention::kept_by) {
+        Some(at) => format!(
+            "{} stayed: {}; the custody marker of {}, a folder above it, keeps it",
+            aside.display(),
+            remove::Why::PermissionRevoked.words(aside),
+            at.display()
+        ),
+        None => remove::stayed_words(aside, 1),
     }
 }
 
@@ -1166,11 +1598,40 @@ pub struct Planned {
     /// Cargo locks could not all be taken when checked. False does not rule out active
     /// process use or unknown ownership; stages and tooling do not probe Cargo locks here.
     pub held: bool,
+    /// For a stage an earlier pass left ([`Unused::Unfinished`]), what of it the removal will
+    /// leave and why, read and never acted on ([`remove::forecast`], the first [`remove::NAMED`]
+    /// named); `None` for anything else.
+    pub stays: Option<remove::Forecast>,
+}
+
+impl Planned {
+    /// A stage an earlier pass left, removed in place by the next pass ([`Unused::Unfinished`]),
+    /// with the forecast of what of it will stay ([`Planned::stays`], [`remove::forecast`]).
+    #[must_use]
+    pub fn stage(stage: PathBuf) -> Self {
+        let stays = remove::forecast(&stage, remove::NAMED);
+        Self::staged(stage, stays)
+    }
+
+    /// A stage an earlier pass left, with `stays`, the forecast of what of it will stay by the
+    /// rules of the removal that takes it (a registered pending stage's, for one).
+    #[must_use]
+    pub fn staged(stage: PathBuf, stays: remove::Forecast) -> Self {
+        Self {
+            path: stage.clone(),
+            why: Unused::Unfinished,
+            paths: vec![stage],
+            held: false,
+            stays: Some(stays),
+        }
+    }
 }
 
 /// Advisory cleanup candidates in `root` at `now`, including observed Cargo lock failures.
 /// Process ownership is not probed here. [`reclaim_watched`] rechecks eligibility and active
-/// use before removal. Nothing is moved or removed and no stage is finished by this read.
+/// use before removal. Nothing is moved or removed and no stage is finished by this read. Each
+/// stage an earlier pass left is listed with the forecast of what of it the removal will leave
+/// and why ([`Planned::stays`], [`remove::forecast`]), read without changing it.
 #[must_use]
 pub fn plan(
     root: &Path,
@@ -1239,9 +1700,9 @@ type PlanPass<'a> = (
 );
 
 /// [`plan`]'s walk of the mirror folder `dir`, as [`Sweep::walk`] walks it: each stage an
-/// earlier pass left listed once, its leaf nominated whole only while it can be staged
-/// ([`stage_for`]), and its stale parts only while a stage can be made beside it
-/// ([`free_stage`]).
+/// earlier pass left listed once with the forecast of what of it will stay ([`Planned::stage`]),
+/// its leaf nominated whole only while it can be staged ([`stage_for`]), and its stale parts only
+/// while a stage can be made beside it ([`free_stage`]).
 fn plan_walk(pass: PlanPass<'_>, dir: &Path, depth: usize, planned: &mut Vec<Planned>) {
     let (root, home, now, gone_after, placing, store, was_moved) = pass;
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -1276,6 +1737,7 @@ fn plan_walk(pass: PlanPass<'_>, dir: &Path, depth: usize, planned: &mut Vec<Pla
                         why,
                         paths: vec![child],
                         held,
+                        stays: None,
                     });
                 }
                 continue;
@@ -1298,14 +1760,10 @@ fn plan_walk(pass: PlanPass<'_>, dir: &Path, depth: usize, planned: &mut Vec<Pla
                 },
                 paths: doomed.into_iter().flat_map(|d| d.paths).collect(),
                 held,
+                stays: None,
             });
         } else if is_stage(name, OsStr::new(DOOMED)) {
-            planned.push(Planned {
-                path: child.clone(),
-                why: Unused::Unfinished,
-                paths: vec![child],
-                held: false,
-            });
+            planned.push(Planned::stage(child));
         } else if depth < MAX_DEPTH {
             plan_walk(pass, &child, depth + 1, planned);
         }

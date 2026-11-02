@@ -73,16 +73,21 @@ pub(crate) mod memory {
     }
 
     impl Files {
+        /// The host's answer: Windows opens a directory as a file to `ERROR_ACCESS_DENIED`.
         pub(super) fn read(&self, rel: &Path) -> io::Result<String> {
             match self.held.get(rel) {
                 Some(text) => Ok(text.clone()),
+                None if self.is_dir(rel) && cfg!(windows) => {
+                    Err(io::ErrorKind::PermissionDenied.into())
+                }
                 None if self.is_dir(rel) => Err(io::ErrorKind::IsADirectory.into()),
                 None => Err(self.missing(rel)),
             }
         }
 
+        /// A path under a file is `ENOTDIR` on Unix and `ERROR_PATH_NOT_FOUND` on Windows.
         fn missing(&self, rel: &Path) -> io::Error {
-            if rel.ancestors().skip(1).any(|up| self.held.contains_key(up)) {
+            if !cfg!(windows) && rel.ancestors().skip(1).any(|up| self.held.contains_key(up)) {
                 io::ErrorKind::NotADirectory.into()
             } else {
                 io::ErrorKind::NotFound.into()
@@ -233,7 +238,12 @@ pub(crate) mod memory {
             let rel = |p: &PathBuf| p.strip_prefix(root).map(Path::to_path_buf);
             rels.iter()
                 .map(|r| {
-                    let path = root.join(r);
+                    // The root itself: Windows opens `dir\` (a join of "") to `NotFound`.
+                    let path = if r.is_empty() {
+                        root.to_path_buf()
+                    } else {
+                        root.join(r)
+                    };
                     let listing = crate::tree::read_dir(&path)
                         .and_then(|entries| {
                             entries.into_iter().collect::<std::io::Result<Vec<_>>>()
@@ -292,7 +302,12 @@ pub(crate) mod memory {
             let on_disk = answers(&disk, &queries);
             assert_eq!(answers(&tree, &queries), on_disk);
             assert!(on_disk.iter().any(|a| a.contains("Ok(\"// a\\n\")")));
-            assert!(on_disk.iter().any(|a| a.contains("IsADirectory")));
+            let directory = if cfg!(windows) {
+                "PermissionDenied"
+            } else {
+                "IsADirectory"
+            };
+            assert!(on_disk.iter().any(|a| a.contains(directory)));
             assert!(on_disk.iter().any(|a| a.contains("NotADirectory")));
             assert!(on_disk.iter().any(|a| a.contains("NotFound")));
 

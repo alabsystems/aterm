@@ -121,11 +121,15 @@ fn quoted(cur: &mut Cursor<'_>, start: usize, out: &mut Spans) -> Mode {
 
 /// The rest of a raw string closing on `"` and `hashes` `#`, from `start`.
 fn raw_quoted(cur: &mut Cursor<'_>, start: usize, hashes: u8, out: &mut Spans) -> Mode {
+    let needed = usize::from(hashes);
     while let Some(byte) = cur.peek() {
         cur.bump();
         if byte == b'"' {
-            let closing = cur.eat_while(|next| next == b'#');
-            if closing >= usize::from(hashes) {
+            let mut closing = 0usize;
+            while closing < needed && cur.eat(b'#') {
+                closing += 1;
+            }
+            if closing == needed {
                 out.push(start, cur.pos(), SyntaxClass::String);
                 return Mode::Code;
             }

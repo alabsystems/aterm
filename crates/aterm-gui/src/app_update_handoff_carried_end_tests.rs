@@ -124,11 +124,19 @@ fn local_day(unix_ms: i64) -> i64 {
     (at + offset).div_euclid(86_400)
 }
 
-fn yesterday_1742() -> i64 {
-    let day = local_day(crate::harness_screen::unix_ms_now()) - 1;
+fn local_1742_ms(day: i64, now_offset: i64, local_at: &dyn Fn(i64) -> Option<i64>) -> i64 {
     let local = day * 86_400 + 17 * 3_600 + 42 * 60;
-    let offset = crate::presence::local_offset_at(local).expect("the zone reads");
+    let approx = local - now_offset;
+    let offset = local_at(approx).expect("the zone reads");
+    let offset = local_at(local - offset).unwrap_or(offset);
     (local - offset) * 1000 + 37_123
+}
+
+fn yesterday_1742() -> i64 {
+    let now_s = crate::harness_screen::unix_ms_now().div_euclid(1000);
+    let now_offset = crate::presence::local_offset_at(now_s).expect("the zone reads");
+    let day = (now_s + now_offset).div_euclid(86_400) - 1;
+    local_1742_ms(day, now_offset, &crate::presence::local_offset_at)
 }
 
 fn chip_title(app: &App, session: u64) -> String {
@@ -1095,4 +1103,24 @@ fn only_a_shown_or_carried_open_face_reopens_a_landed_task() {
             "CONTROL: the carried open face is the claim's turn"
         );
     });
+}
+
+#[test]
+fn local_1742_reads_yesterdays_offset_across_sydneys_daylight_change() {
+    // 2026-04-04 (day 20_547) 17:42:37.123 AEDT (UTC+11) = 2026-04-04T06:42:37.123Z;
+    // Sydney falls back to AEST (UTC+10) at 2026-04-04T16:00:00Z, before local digits 17:42 read as UTC.
+    const SAT_DAY: i64 = 20_547;
+    const AEDT: i64 = 11 * 3_600;
+    const AEST: i64 = 10 * 3_600;
+    const CHANGE_UTC: i64 = SAT_DAY * 86_400 + 16 * 3_600;
+    let sydney = |unix: i64| Some(if unix < CHANGE_UTC { AEDT } else { AEST });
+    let local = SAT_DAY * 86_400 + 17 * 3_600 + 42 * 60;
+    let want_ms = (local - AEDT) * 1_000 + 37_123;
+    assert_eq!(local_1742_ms(SAT_DAY, AEST, &sydney), want_ms);
+    let naive_ms = (local - sydney(local).unwrap()) * 1_000 + 37_123;
+    assert_eq!(
+        naive_ms - want_ms,
+        3_600_000,
+        "CONTROL: reading local digits as UTC lands after the change and is an hour off"
+    );
 }

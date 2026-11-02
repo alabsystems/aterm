@@ -308,6 +308,23 @@ fn program_row_end_advance_never_consumes_a_typed_stamp() {
         status_row_spends, 0,
         "a program row's end-advance must never consume a banked typed stamp"
     );
+    assert_eq!(
+        glow.admission_log().last().unwrap().program_row_refusal,
+        Some(ProgramRowRefusal::AnchorContested {
+            tainted: true,
+            spoken_for: true,
+        }),
+        "both the old brand and the other row's recent echo are retained"
+    );
+    let line = glow.admission_log().last().unwrap().line(at(336));
+    let fields: std::collections::BTreeMap<_, _> = line
+        .split_ascii_whitespace()
+        .filter_map(|field| field.split_once('='))
+        .collect();
+    assert_eq!(fields.get("program_row"), Some(&"anchor-contested"));
+    assert_eq!(fields.get("tainted"), Some(&"1"));
+    assert_eq!(fields.get("spoken_for"), Some(&"1"));
+    assert!(!fields.contains_key("foreign_glyph"));
     glow.observe_print_anchor(Some((11, 4, 6)));
     glow.tick(None, at(340), &c, g, &mut out);
     let input_row_echoes = glow.admission_log().filter(|r| r.origin.0 == 11).count();
@@ -348,6 +365,14 @@ fn a_program_rows_first_advance_mid_burst_cannot_steal_the_echo() {
     assert_eq!(
         crossing_spends, 0,
         "a program row's first advance mid-burst must not steal the echo"
+    );
+    assert_eq!(
+        glow.admission_log().last().unwrap().program_row_refusal,
+        Some(ProgramRowRefusal::AnchorContested {
+            tainted: false,
+            spoken_for: true,
+        }),
+        "the first contested advance is not an inherited program-row brand"
     );
     glow.observe_print_anchor(Some((12, 4, 6)));
     glow.tick(None, at(340), &c, g, &mut out);
@@ -491,6 +516,8 @@ struct FooterTick {
     dark: Vec<u16>,
     /// The footer advance's verdict.
     verdict: Option<&'static str>,
+    /// The immutable footer verdict, including guards captured before credit cleanup.
+    record: Option<AdmissionRecord>,
 }
 
 /// What the hand presses between `s`'s echo and `i` in [`footer_tick_in_a_hesitated_keys_window`].
@@ -600,7 +627,7 @@ fn status_tick_in_a_hesitated_keys_window(
     let verdict = glow
         .admission_log()
         .find(|r| r.origin == (footer, 15) && r.target == (footer, 35))
-        .map(|r| r.reason);
+        .copied();
     frame(&mut glow, Some((composer, 4, 'i')), (composer, 4), 1350);
     for ms in (1366..=1450).step_by(16) {
         frame(&mut glow, None, (composer, 4), ms);
@@ -614,7 +641,8 @@ fn status_tick_in_a_hesitated_keys_window(
         forgotten: glow.in_flight_tally().forgotten,
         refused,
         dark: dark_in(&glow, composer, 2..4),
-        verdict,
+        verdict: verdict.map(|r| r.reason),
+        record: verdict,
     }
 }
 
@@ -628,6 +656,24 @@ fn a_status_tick_below_the_caret_forgets_no_press_while_the_hand_types() {
             "PRECONDITION (scroll {scroll:?}): the footer's advance was refused inside `i`'s window"
         );
         assert_eq!(
+            m.record.and_then(|r| r.program_row_refusal),
+            Some(ProgramRowRefusal::ParkedAnchor {
+                foreign_glyph: true,
+                hand_at_caret: true,
+            }),
+            "the foreign footer glyph and the caret's hand are separate guards"
+        );
+        let record = m.record.unwrap();
+        let line = record.line(record.at);
+        let fields: std::collections::BTreeMap<_, _> = line
+            .split_ascii_whitespace()
+            .filter_map(|field| field.split_once('='))
+            .collect();
+        assert_eq!(fields.get("program_row"), Some(&"parked-anchor"));
+        assert_eq!(fields.get("foreign_glyph"), Some(&"1"));
+        assert_eq!(fields.get("hand_at_caret"), Some(&"1"));
+        assert!(!fields.contains_key("tainted"));
+        assert_eq!(
             (m.forgotten, m.refused, m.dark),
             (0, Vec::new(), Vec::new()),
             "scroll {scroll:?}: (forgotten presses, refused composer echoes, dark typed columns)"
@@ -635,6 +681,14 @@ fn a_status_tick_below_the_caret_forgets_no_press_while_the_hand_types() {
     }
     let m = footer_tick_in_a_hesitated_keys_window(BeforeI::CtrlR, ScrollBeforeI::None);
     assert_eq!(m.verdict, Some(CursorGlow::DECLINE_PROGRAM_ROW));
+    assert_eq!(
+        m.record.and_then(|r| r.program_row_refusal),
+        Some(ProgramRowRefusal::ParkedAnchor {
+            foreign_glyph: true,
+            hand_at_caret: false,
+        }),
+        "credit cleanup does not replace the original foreign-glyph verdict"
+    );
     assert_eq!(
         m.forgotten, 1,
         "after a different-class press, a refused run below the caret is the minibuffer's echo"

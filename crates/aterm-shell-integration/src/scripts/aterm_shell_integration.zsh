@@ -246,6 +246,77 @@ __aterm_managed_agents_listing() {
     fi
     __aterm_managed_agents_now="${(j.:.)__aterm_ls}"
 }
+# While aterm installs Apple's Command Line Tools, `$ATERM_CLT_SHIM` names the
+# directory whose `git`, `cc` and kin say the tools are on their way instead of
+# raising Apple's install dialog, and its `.wanted` mark is there. A login
+# shell's `/etc/zprofile` (`path_helper`) puts `/usr/bin` back in front of it,
+# so it moves to just ahead of the first `/usr/bin` (else `/bin`): never ahead
+# of a person's own earlier entry. A PATH that already has it there is not
+# assigned, which would flush the command hash. Without the mark nothing
+# installs them: the shim is put back nowhere.
+__aterm_clt_shim_place() {
+    emulate -L zsh
+    __aterm_clt_bash_env "${ATERM_CLT_SHIM:-}"
+    [[ -n "${ATERM_CLT_SHIM:-}" && -f "${ATERM_CLT_SHIM%/}.wanted" && -d "$ATERM_CLT_SHIM" ]] || return 0
+    local -a __aterm_rest
+    __aterm_rest=("${(@)path:#$ATERM_CLT_SHIM}")
+    local -i __aterm_at=${__aterm_rest[(ie)/usr/bin]}
+    (( __aterm_at <= $#__aterm_rest )) || __aterm_at=${__aterm_rest[(ie)/bin]}
+    (( __aterm_at <= $#__aterm_rest )) || return 0
+    local -a __aterm_new
+    __aterm_new=("${(@)__aterm_rest[1,__aterm_at-1]}" "$ATERM_CLT_SHIM" "${(@)__aterm_rest[__aterm_at,-1]}")
+    [[ "${(j.:.)__aterm_new}" == "${(j.:.)path}" ]] || path=("${(@)__aterm_new}")
+}
+# A bash started inside the tab (`bash -lc`, an agent's own shell) runs its
+# login profile and loads no integration, so while the shim at `$1` is wanted
+# `BASH_ENV` names aterm's `bash/clt_env`, which that bash reads after its
+# profile to put the shim back; the person's own `BASH_ENV` waits in
+# `ATERM_CLT_BASH_ENV_BEFORE` and runs first. Its exact owner is recorded in
+# `ATERM_CLT_BASH_ENV_HOOK`, so another script set preserves the predecessor;
+# an older hook's `ATERM_CLT_BASH_ENV` stays its context. Once the shim is not wanted, the
+# person's own comes back (`__aterm_clt_env_on` has each prompt look). A zsh
+# started inside the tab (`zsh -lc`) has no such hook: only `ZDOTDIR` would
+# reach it, and that would send the person's own startup-file writes to aterm.
+typeset -gi __aterm_clt_env_on=${__aterm_clt_env_on:-0}
+__aterm_clt_bash_env() {
+    emulate -L zsh
+    local __aterm_si="${ATERM_SHELL_INTEGRATION_DIR:-}"
+    local __aterm_hook="$__aterm_si/bash/clt_env"
+    local __aterm_before="${BASH_ENV-}"
+    if (( ${+ATERM_CLT_BASH_ENV_HOOK} )) && [[ "${BASH_ENV-}" == "$ATERM_CLT_BASH_ENV_HOOK" ]]; then
+        __aterm_before="${ATERM_CLT_BASH_ENV_BEFORE-}"
+    fi
+    # Keep an old hook from sourcing itself when this parent restores it.
+    if [[ -n "$__aterm_before" && "${ATERM_CLT_BASH_ENV-}" == "$__aterm_before" ]]; then
+        unset ATERM_CLT_BASH_ENV
+    fi
+    if [[ -n "$1" && -n "$__aterm_si" && -f "${1%/}.wanted" && -f "$__aterm_hook" ]]; then
+        if [[ "${BASH_ENV-}" != "$__aterm_hook" ]]; then
+            if (( ! ${+ATERM_CLT_BASH_ENV_HOOK} )) || [[ "${BASH_ENV-}" != "$ATERM_CLT_BASH_ENV_HOOK" ]]; then
+                if (( ${+BASH_ENV} )); then
+                    export ATERM_CLT_BASH_ENV_BEFORE="$BASH_ENV"
+                else
+                    unset ATERM_CLT_BASH_ENV_BEFORE
+                fi
+            fi
+            export BASH_ENV="$__aterm_hook"
+        fi
+        export ATERM_CLT_BASH_ENV_HOOK="$__aterm_hook"
+        __aterm_clt_env_on=1
+        return 0
+    fi
+    if (( ${+ATERM_CLT_BASH_ENV_HOOK} )); then
+        if [[ "${BASH_ENV-}" == "$ATERM_CLT_BASH_ENV_HOOK" ]]; then
+            if (( ${+ATERM_CLT_BASH_ENV_BEFORE} )); then
+                export BASH_ENV="$ATERM_CLT_BASH_ENV_BEFORE"
+            else
+                unset BASH_ENV
+            fi
+        fi
+        unset ATERM_CLT_BASH_ENV_BEFORE ATERM_CLT_BASH_ENV_HOOK
+    fi
+    __aterm_clt_env_on=0
+}
 typeset -ga __aterm_managed_want
 typeset -gi __aterm_managed_bin_on=0
 typeset -gi __aterm_managed_agents_on=0
@@ -276,6 +347,7 @@ __aterm_reroute_path_front() {
         __aterm_managed_want=("$ATERM_REROUTE_DIR" "${__aterm_managed_want[@]}")
         __aterm_managed_reroute_on=1
     fi
+    __aterm_clt_shim_place
 }
 __aterm_reroute_path_front
 
@@ -344,6 +416,10 @@ fi
 __aterm_managed_path_live() {
     emulate -L zsh
     (( __aterm_managed_live )) || return 0
+    # Give the person's own `BASH_ENV` back once nothing wants the shim.
+    if (( __aterm_clt_env_on )) && [[ -z "${ATERM_CLT_SHIM:-}" || ! -f "${ATERM_CLT_SHIM%/}.wanted" ]]; then
+        __aterm_clt_bash_env ""
+    fi
     if (( __aterm_have_zstat )); then
         __aterm_atpkg_hook_stamp
     fi
@@ -1011,12 +1087,25 @@ __aterm_start_mark() {
     return 0
 }
 
-# Hold a warm spare at its first precmd until released via `go` on
-# `$__aterm_spare_fifo`, keeping `SAVEHIST=0` while held and recording whether
-# `$HISTFILE` changed during the wait.
+# Hold a warm spare at its first precmd until released via `go` on fd 10, the
+# end its host handed it (`$__aterm_spare_fifo` is only the mark), keeping
+# `SAVEHIST=0` while held and recording whether `$HISTFILE` changed during the
+# wait. A spare whose startup files closed or replaced fd 10 has no hold left:
+# it signs `cold` and goes on as the cold shell it now is. Once the host is gone
+# each read is end-of-file and the shell exits, never refused for a job the
+# startup files left (`no_check_jobs`, local to the hold); the retries are for
+# a read a signal fails. Released, it closes fd 10 so nothing it starts from
+# then on holds the end (zsh redirections take one digit: hence the variable).
 __aterm_spare_hold() {
     : ${${(M)${(t)options}:#*special}:+${options[xtrace]::=off}}
     emulate -L zsh
+    if [[ ! -p /dev/fd/10 ]]; then
+        unset __aterm_spare_mode __aterm_spare_fifo
+        typeset -ga __aterm_spare_hooks
+        __aterm_start_mark cold
+        return 0
+    fi
+    setopt no_check_jobs
     local __aterm_rc=$SECONDS __aterm_hs0="" __aterm_go="" __aterm_ss=${SAVEHIST-}
     local -i __aterm_n=0 __aterm_ss_set=${+SAVEHIST}
     [[ ${(t)SAVEHIST} != *readonly* ]] || __aterm_ss_set=2
@@ -1029,12 +1118,14 @@ __aterm_spare_hold() {
     (( __aterm_ss_set == 2 )) || SAVEHIST=0
     __aterm_start_mark spare
     while :; do
-        if IFS= read -r __aterm_go < "$__aterm_spare_fifo"; then
+        if IFS= read -r -u 10 __aterm_go; then
             [[ $__aterm_go == go ]] && break
-        elif (( ++__aterm_n >= 50 )) || [[ ! -p $__aterm_spare_fifo ]]; then
+        elif (( ++__aterm_n >= 50 )); then
             exit 0
         fi
     done 2>/dev/null
+    __aterm_n=10
+    exec {__aterm_n}<&-
     unset __aterm_spare_mode __aterm_spare_fifo
     case $__aterm_ss_set in
         1) SAVEHIST=$__aterm_ss ;;

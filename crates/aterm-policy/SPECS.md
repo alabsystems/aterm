@@ -3,9 +3,10 @@
 
 # aterm-policy: specs recovered from its unit tests
 
-This is the crate's migration worklist. Each of the 19 specs below is to be proved through
-Trust/Clean about the compiled Rust function, and the tests it subsumes then deleted. None is
-proved yet.
+The crate's migration worklist: each spec is to be proved through Trust/Clean about the compiled
+Rust function, and the tests it subsumes then deleted. The specs restate what the `#[test]`s
+sample, read against the code they reach; the claims come from reading the code, not running it.
+`crates/aterm-core/src/terminal/policy_bridge.rs` consumes the decisions.
 
 The specs restate what the crate's 28 `#[test]`s sample (`src/engine.rs` 4, `src/limits.rs` 12,
 `src/selector.rs` 3, `src/tests.rs` 8, `tests/serde_corpus.rs` 1), read against the code they
@@ -21,16 +22,15 @@ Lean-discharged row) blocks every spec, so it is listed on every row.
 
 ## 0. Notation used in the statements
 
-- `rank(o)` = `OriginTag::trust_rank(o)`. In declaration order: Host 0, ConfigFile 1, User 2,
-  UserTyped 3, Ai 4, PtySafe 5, Pty 6, NetworkUntrusted 7.
-- `strict(r)`: the response strictness order Drop 4, Warn 3, Rewrite 2, Ask 1, Execute 0.
-  It exists only as the `#[cfg(test)]` `profiles::refinement::response_rank`.
-  **Recommendation:** make it a spec-only fn, because `profile-refinement` is stated with it.
-- `Sel(s)` = `SequenceSelector::parse(s)`. `M(sel,seq)` = `sel.matches(seq)`.
+- `rank(o)` = `OriginTag::trust_rank(o)`: Host 0, ConfigFile 1, User 2, UserTyped 3, Ai 4,
+  PtySafe 5, Pty 6, NetworkUntrusted 7.
+- `strict(r)`: Drop 4, Warn 3, Rewrite 2, Ask 1, Execute 0. Today it is only the `#[cfg(test)]`
+  `profiles::refinement::response_rank`; `profile-refinement` needs it as a spec-level fn.
+- `Sel(s)` = `SequenceSelector::parse(s)`, `M(sel,seq)` = `sel.matches(seq)`,
   `pm(p,a)` = `SelectorParam::matches(p,a)`.
-- `E_P` = `PolicyEngine::new(P)`. `Eval_P(seq,o)` = `E_P.evaluate(&seq,o)`. `Eval_X` with
-  X in {Perm, Std, Hard} uses `profiles::{permissive,standard,hardened}()`.
-- `tier(i)` for a rule whose selector parses to `s_i`: 0 if `s_i.function ≠ Wildcard` and
+- `Eval_X(seq,o)` = `PolicyEngine::new(X).evaluate(&seq,o)`, for X ∈ {Perm, Std, Hard} the
+  policies `profiles::{permissive,standard,hardened}()`.
+- `tier(i)`, for a rule whose selector parses to `s_i`: 0 if `s_i.function ≠ Wildcard` and
   `s_i.major = Some(_)`; 1 if `s_i.function ≠ Wildcard` and `s_i.major = None`; 2 if
   `s_i.function = Wildcard`.
 - Sequence classes, over `seq = {function, major, suffix, params}`:
@@ -40,9 +40,8 @@ Lean-discharged row) blocks every spec, so it is listed on every row.
   - `S4q`, `S4set`: the same two predicates with `major = Some(4)`.
   - `Ct(seq)`: `function = Csi` and `suffix = Some("t")`.
   - `N(seq)`: Osc with `major ∈ {Some(9), Some(99), Some(777)}`.
-- Token bucket state `TB = (tokens: f64, last: Option<Instant>)`, with config
-  `(C, R, M) = (capacity_bytes, refill_per_second, per_sequence_max)`, widened to u64.
-  `from_config(cfg) = (C as f64, None)`. Clocks: every `T: TimeSource`; `now = clock.now()`,
+- Token bucket: state `(tokens: f64, last)` (`last` is the `last_refill: Option<Instant>`
+  field); config `(C, R, M) = (capacity_bytes, refill_per_second, per_sequence_max)` as u64;
   `Δ = now.saturating_duration_since(last)`.
 - `RateLimiterSet` view: `(buckets: Vec<TB>, slots: Map<String, usize>)`. The accessors
   `get`, `len`, `tokens` and `is_declared` are observation views only.
@@ -57,12 +56,12 @@ Lean-discharged row) blocks every spec, so it is listed on every row.
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes (primary tests; secondary in §2)`,
-`difficulty (Rust features the proof must handle)`, `blocking_gaps (audit §7)`.
+`subsumes` lists the primary tests (secondary ones are in §2); `difficulty` names the Rust
+features the proof must handle; `blocking_gaps` are audit §7 rows.
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
-origin-rank-table	table-property	OriginTag::trust_rank	∀ o: trust_rank(o) is o's declaration index (Host 0 … NetworkUntrusted 7). Hence trust_rank is a bijection from OriginTag onto {0..7}: injective, image exactly 0..8.	tests.rs::trust_rank_is_a_bijection_onto_0_through_7	EASY: const fn match over an 8-variant #[non_exhaustive] Copy enum returning u8; the quantifier is over a finite enum and is decidable by enumeration.	0,1,3,5; fragment: `OriginTag::trust_rank` F1+D2b (VF5 first target, docs/PLAN-tests-to-specs-2026-10-15.md "F1-ready specs").
+origin-rank-table	table-property	OriginTag::trust_rank	∀ o: trust_rank(o) is o's declaration index (Host 0 … NetworkUntrusted 7). Hence trust_rank is a bijection from OriginTag onto {0..7}: injective, image exactly 0..8.	tests.rs::trust_rank_is_a_bijection_onto_0_through_7	EASY: const fn match over an 8-variant #[non_exhaustive] Copy enum returning u8; the quantifier is over a finite enum and is decidable by enumeration.	0,1,3,5; fragment: `OriginTag::trust_rank` F1+D2b (VF5 first target, docs/PLAN-tests-to-specs-2026-10-15.md "F1-ready specs", row 55). Proved via mirror: Clean R213 row `origin_trust_rank` (`RowProvedB3` over a verbatim copy, with a false-clause control); not yet credited: Trust's compiler mints no calculus row until it pins a VF5 base (E4.7).
 origin-dominates-order	contract	OriginTag::{dominates,trust_rank}	∀ a,b: a.dominates(b) ⇔ rank(a) ≤ rank(b). Corollaries: dominates is reflexive, antisymmetric, transitive and total; it is the chain Host > ConfigFile > User > UserTyped > Ai > PtySafe > Pty > NetworkUntrusted; Host dominates every o and every o dominates NetworkUntrusted; Pty dominates NetworkUntrusted, not conversely.	tests.rs::host_is_the_top_and_networkuntrusted_is_the_bottom	EASY given origin-rank-table: const fn calling a const fn and a u8 comparison; enum carriers; quantifiers with 2 and 3 binders.	0,1,3,4,5
 selector-param-matches	contract	SelectorParam::matches	∀ p, a:&str: pm(Wildcard,a) ⇔ a ≠ ""; pm(Literal(l),a) ⇔ l = a (bytes); pm(Query,a) ⇔ a = "?"; pm(NotQuery,a) ⇔ a ≠ "?" ∧ a ≠ "".	selector.rs::not_query_param_rejects_empty_and_question	EASY: &self on an enum with a String payload; &str equality and is_empty.	0,1,2,3
 bucket-key-projection	contract	SequenceSelector::{bucket_key,catch_all}	∀ sel: sel.bucket_key() = BucketKey{function: sel.function, major: sel.major}. catch_all() = {Wildcard, None, None, []}, so its key is (Wildcard, None).	-	TRIVIAL: &self field projection; Copy enum and Option<u32>; empty Vec constructor.	0,1,2
@@ -123,7 +122,7 @@ emit schema-fitting text.
 
 ## 2. Test → spec map (TSV)
 
-`primary` is the spec that retires the test. `also` lists the other specs the same test samples.
+`primary` is the spec that retires the test; `also` lists the other specs it samples.
 
 ```tsv
 file	test	primary	also
@@ -157,7 +156,7 @@ src/tests.rs	refinement_holds_over_all_sequences_and_origins	profile-refinement	
 tests/serde_corpus.rs	policy_documents_answer_as_recorded	policy-decode-schema	policy-toml-roundtrip
 ```
 
-## 3. Coverage
+## 3. Findings
 
 - All 28 tests have a primary spec. 16 specs retire at least one test; `bucket-key-projection`,
   `selector-alias-expansion` and `policy-toml-roundtrip` retire none.
@@ -166,7 +165,7 @@ tests/serde_corpus.rs	policy_documents_answer_as_recorded	policy-decode-schema	p
 - Proving `engine-evaluate-first-match` makes `builtin-profile-denotation` a finite case split,
   and `profile-refinement` then follows at once.
 
-## 4. Implied specs that look wrong, or disagree with the code
+## 4. Proof order (easiest, high value first)
 
 1. **`Standard`'s `origin_min = Host` Drop rules fall through to `response any`** (`src/profiles.rs`).
    The stale doc comment claiming `"Clipboard query: Drop"` / `"Drop from Pty"` / `"defers to the host"`
@@ -204,26 +203,18 @@ tests/serde_corpus.rs	policy_documents_answer_as_recorded	policy-decode-schema	p
     `Profile::Hardened` simply as `"Maximum restriction."`, while `hardened_rules_only_admit_host_configfile_or_user`
     and `builtin-profiles-wellformed` state the admitted origin set.
 
-## 5. Proof order (easiest, high value first)
-
-No spec is blocked by gap 0 alone. Every one also needs gap 1 (non-scalar carriers), because
-even `trust_rank` is stated over an enum. For the first step, gap 1 means only finite Copy enums,
-which a scalar encoding (the discriminant) may cover before full content models land. So the order prefers the specs whose remaining gaps
-are the cheapest (finite enums, scalar fields, no loops, no generics, no other crate).
-
-1. **`origin-rank-table`** then **`origin-dominates-order`**. Const fns over an 8-variant
-   enum and u8 comparison; the quantifiers are finite and decidable by enumeration. They retire
-   2 tests and are the origin-gate lemma `engine-evaluate-first-match` needs.
-2. **`bucket-key-projection`** and **`selector-param-matches`**. Field projection and
-   four-arm `&str` equality, no loops. They retire 1 test and are the leaves of the matcher.
-3. **`token-bucket-guards`**. u64 comparisons with an unchanged-state frame and an unread
-   clock. It retires 4 tests; only gap 11 (the generic clock) stands beyond the shared ones.
-4. **`builtin-profiles-wellformed`**. Evaluating three constant constructors; decidable once
-   content models exist. Retires 3 tests.
-5. `selector-matches-denotation`, `token-bucket-refill-debit`, `limiter-set-from-policy`,
-   `limiter-set-consume-slot`, `limiter-slot-resolution` (loops, f64, frames).
-6. `selector-parse-denotation` → `selector-alias-expansion` → `engine-evaluate-first-match`
-   → `builtin-profile-denotation` → `profile-refinement`. The highest value chain (7 tests),
-   but string parsing and the bucket invariant make it the hardest.
-7. `token-bucket-rate-safety` (trace induction under f64).
-8. `policy-toml-roundtrip`, `policy-decode-schema` last: they wait on gaps 9 and 12.
+1. `origin-rank-table`, then `origin-dominates-order`: const fns over an 8-variant enum,
+   decidable by enumeration, and the origin-gate lemma `engine-evaluate-first-match` needs.
+2. `bucket-key-projection` and `selector-param-matches`: the matcher's leaves, with no loops.
+3. `token-bucket-guards`: u64 comparisons with an unchanged-state frame and an unread clock.
+4. `builtin-profiles-wellformed`: evaluation of three constant constructors.
+5. `selector-matches-denotation`, `token-bucket-refill-debit`, `limiter-set-from-policy`, then
+   `limiter-set-consume-slot` and `limiter-slot-resolution` (loops, f64, frames).
+6. `selector-parse-denotation` → `selector-alias-expansion` → `engine-evaluate-first-match` →
+   `builtin-profile-denotation` → `profile-refinement`: the highest-value chain, and the hardest
+   (string parsing, and the bucket invariant `PolicyEngine::new` establishes). Once
+   `engine-evaluate-first-match` holds, `builtin-profile-denotation` is a finite case split and
+   `profile-refinement` follows at once.
+7. `token-bucket-rate-safety`: trace induction under f64 over the two bucket step lemmas.
+8. `policy-decode-schema`, then `policy-toml-roundtrip`, which it implies once `to_toml` is
+   shown to emit schema-fitting text. Both wait on gaps 9 and 12.

@@ -683,7 +683,8 @@ fn off_report_of_claude_code_moves_no_session() {
 /// `wall`, `next: work` for Claude Code (whose session on this machine's own login, `main`,
 /// rotates off it), and `next: main` for a Codex that keeps `CODEX_AUTH_PATH`'s login (no row is
 /// active, so a launch takes the first usable row) and for one that keeps none; the text byte for
-/// byte, the JSON's `next` too (and, under
+/// byte up to Claude Code's outlook (which replays the rotation under the mode it names, so
+/// `wall`'s says `rotation wall`), the JSON's `next` too (and, under
 /// `early`, the default, all of the JSON); no `rotation off:` line, and the JSON's `next` holds
 /// the keys it held before rotation off had words (`to`, `wait_until` with its RFC 3339 twin,
 /// `not`, and on a Codex that keeps no row's login its own `only_default` and `none`), no `off`.
@@ -730,7 +731,17 @@ fn rotation_on_reports_as_before() {
                 &["not", "to", "wait_until", "wait_until_rfc3339"]
             };
             assert_eq!(keys, want_keys, "{at}: {doc}");
-            assert_eq!(text, plain_text, "{at}");
+            // The outlook replays under the mode it names (the outlook's design, §9).
+            let rows = |text: &str| {
+                text.split("\noutlook (")
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned()
+            };
+            assert_eq!(rows(&text), rows(&plain_text), "{at}");
+            if mode == "early" {
+                assert_eq!(text, plain_text, "{at}");
+            }
             assert_eq!(doc["next"], plain_doc["next"], "{at}");
             if mode == "early" {
                 assert_eq!(doc, plain_doc, "{at}");
@@ -788,7 +799,11 @@ fn the_rotation_off_line_names_what_turns_rotation_off() {
     ] {
         let pool = Pool::new("off-by");
         pool.config(toml);
-        assert_eq!(pool.seat().mode(), accounts::Mode::Off, "{toml}");
+        assert_eq!(
+            pool.seat().mode_for(pool.cli),
+            accounts::Mode::Off,
+            "{toml}"
+        );
         let (text, doc) = pool.report(None);
         let off = off_line(&text).unwrap_or_else(|| panic!("{toml}: {text}"));
         assert!(off.contains(named), "{toml}: {off}");
@@ -818,7 +833,11 @@ fn a_rotation_off_line_says_an_invalid_aterm_toml_is_not_valid_toml() {
     ] {
         let pool = Pool::new("off-invalid");
         pool.config(toml);
-        assert_eq!(pool.seat().mode(), accounts::Mode::Off, "{toml}");
+        assert_eq!(
+            pool.seat().mode_for(pool.cli),
+            accounts::Mode::Off,
+            "{toml}"
+        );
         let why = crate::supervise::config::SupervisorConfig::accounts_off_by(toml)
             .expect_err("not valid TOML");
         let (text, doc) = pool.report(None);

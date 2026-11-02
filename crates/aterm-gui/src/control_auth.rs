@@ -1549,7 +1549,11 @@ fn ensure_canonical_direct_child(parent: &Path, name: &str) -> std::io::Result<P
 }
 
 fn instance_pid(instance: &str) -> Option<u32> {
-    instance.strip_prefix('p')?.split_once('-')?.0.parse().ok()
+    let pid = instance.strip_prefix('p')?.split_once('-')?.0;
+    pid.bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| pid.parse().ok())
+        .flatten()
 }
 
 const INSTANCE_LEASE_FILE: &str = ".instance.lease";
@@ -2595,7 +2599,11 @@ pub(crate) fn confine_automatic_image_path_with_admission(
 
 fn automatic_capture_sequence(name: &std::ffi::OsStr) -> Option<u64> {
     let name = name.to_str()?.strip_suffix(".png")?;
-    name.rsplit_once('-')?.1.parse().ok()
+    let seq = name.rsplit_once('-')?.1;
+    seq.bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| seq.parse().ok())
+        .flatten()
 }
 
 /// Run the automatic-image retention sweep synchronously for tests.

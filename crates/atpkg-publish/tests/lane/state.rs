@@ -181,23 +181,44 @@ fn a_held_lock_is_busy_and_a_holder_past_twelve_hours_has_stalled() {
 }
 
 #[test]
-fn a_notice_is_shown_once_a_utc_day() {
+fn a_notice_is_recorded_once_a_utc_day() {
     let tmp = scratch("state-notify");
     let seen = Recorded::default();
     let day = 86_400;
-    report::notify_once(&seen, "t", tmp.path(), NOW, false, "a cut is owed");
-    report::notify_once(&seen, "t", tmp.path(), NOW + 3600, false, "a cut is owed");
-    report::notify_once(&seen, "t", tmp.path(), NOW, false, "something else");
-    report::notify_once(&seen, "t", tmp.path(), NOW, true, "a dry run says nothing");
-    assert_eq!(seen.shown(), ["a cut is owed", "something else"]);
-    report::notify_once(&seen, "t", tmp.path(), NOW + day, false, "a cut is owed");
-    assert_eq!(seen.shown().len(), 3, "the next day, again");
+    report::record_once(&seen, "t", tmp.path(), NOW, false, "a cut is owed");
+    report::record_once(&seen, "t", tmp.path(), NOW + 3600, false, "a cut is owed");
+    report::record_once(&seen, "t", tmp.path(), NOW, false, "something else");
+    report::record_once(&seen, "t", tmp.path(), NOW, true, "a dry run says nothing");
+    assert_eq!(seen.entries(), ["a cut is owed", "something else"]);
+    report::record_once(&seen, "t", tmp.path(), NOW + day, false, "a cut is owed");
+    assert_eq!(seen.entries().len(), 3, "the next day, again");
     let files: Vec<String> = std::fs::read_dir(tmp.path())
         .expect("dir")
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
     assert_eq!(files, [format!("notified-{}", report::utc_day(NOW + day))]);
+
+    let transcript = Transcript::memory("publication");
+    report::record_once(
+        &report::Journal(&transcript),
+        "lane",
+        &tmp.path().join("journal"),
+        NOW,
+        false,
+        "deferred work",
+    );
+    assert!(transcript.text().contains("lane: deferred work"));
+    let blocking_dir = tmp.path().join("dir-target");
+    std::fs::create_dir(&blocking_dir).expect("mkdir blocking_dir");
+    assert!(report::write_atomic(&blocking_dir, "body").is_err());
+    let leftovers: Vec<String> = std::fs::read_dir(tmp.path())
+        .expect("dir")
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
 }
 
 #[test]

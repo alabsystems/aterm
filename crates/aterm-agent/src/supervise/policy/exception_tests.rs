@@ -39,8 +39,9 @@ fn walled(kind: WallKind, message: &str) -> TurnEndReading {
         said_cut: false,
         opens_cut: false,
         turn_said: None,
+        said_lines: None,
+        turn_lines: None,
         opened_by: None,
-        opened_words: None,
         message_drawn: false,
         submits: None,
         inputs_before: None,
@@ -60,7 +61,9 @@ fn walled(kind: WallKind, message: &str) -> TurnEndReading {
         left_record: false,
         left_work: None,
         person: None,
+        key: None,
         reach: Default::default(),
+        witness: None,
         login_back: false,
         auto_continue: None,
         since_limit: None,
@@ -75,6 +78,7 @@ fn walled(kind: WallKind, message: &str) -> TurnEndReading {
         account: None,
         autopilot: crate::supervise::Autopilot::Cruise,
         login_label: None,
+        autopilot_by_person: false,
         login_superseded: false,
         login_notice: None,
         wall_remembered: false,
@@ -144,6 +148,7 @@ fn a_lost_logins_notice_is_what_the_point_decides() {
     assert_eq!(e, None, "aterm is at it");
     let typing = TurnEndReading {
         person: Some(Duration::from_secs(1)),
+        key: Some(Duration::from_secs(1)),
         worked: None,
         ..wall.clone()
     };
@@ -253,18 +258,21 @@ fn the_sign_in_is_told_where_it_is_the_owners() {
     let (a, e) = point(&mut typed_login(t), &rostered, &cfg(), t + MIN);
     assert_eq!(e, None, "{a:?}");
     assert!(matches!(a, TurnEndAction::Cancel { .. }), "{a:?}");
+    // aterm's own picker is the person's whether the login's method is known or not: its pick
+    // opens the sign-in in the browser, which aterm never brings forward.
     let picker = dialog(LOGIN_PICKER);
-    assert_eq!(at(&mut typed_login(t), &picker, t + MIN), None);
     let unknown = TurnEndReading {
         login_method: None,
         ..picker.clone()
     };
-    let e = at(&mut typed_login(t), &unknown, t + MIN);
-    assert_eq!(
-        notice_id(e.as_ref()),
-        Some(notice::LOGIN_CHOOSE.id),
-        "{e:?}"
-    );
+    for screen in [&picker, &unknown] {
+        let e = at(&mut typed_login(t), screen, t + MIN);
+        assert_eq!(
+            notice_id(e.as_ref()),
+            Some(notice::LOGIN_CHOOSE.id),
+            "{e:?}"
+        );
+    }
     let e = at(&mut typed_login(t), &dialog(LOGIN_CONSOLE_MENU), t + MIN);
     assert_eq!(
         notice_id(e.as_ref()),
@@ -1085,6 +1093,22 @@ fn an_outage_walls_same_answers_raise_nothing_however_long_it_stands() {
     };
     let (_, told) = point(&mut st, &left, &cfg(), now + MIN);
     assert_eq!(told, None, "its notice left the screen");
+}
+
+/// THE REFUSED GO-AHEAD'S WORDS FIT THE DIGEST (the judge panel, 2026-10-29): its reason is one
+/// clause of at most `REASON_CAP` characters that says why a person is needed, and its action
+/// one step of at most `STEP_CAP`, as `aterm_messages` holds a standing ask to them.
+#[test]
+fn a_refused_go_aheads_words_fit_the_digest() {
+    use aterm_messages::need::{REASON_CAP, Reason, STEP_CAP, Step};
+    let words = Exception::refuses_go_ahead();
+    assert!(
+        words.why.chars().count() <= REASON_CAP
+            && Reason::new(&words.why).fault().is_none()
+            && words.action.chars().count() <= STEP_CAP
+            && Step::new(&words.action).fault().is_none(),
+        "the digest's words: {words:?}"
+    );
 }
 
 /// A REFUSED GO-AHEAD STANDS THROUGH THE AGENT'S BACKGROUND BREAKS (2026-10-29 review 2): the

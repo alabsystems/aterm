@@ -14,7 +14,7 @@ use std::{
     time::Instant,
 };
 
-const CAPACITY: usize = 64;
+pub(super) const CAPACITY: usize = 64;
 
 #[derive(Default)]
 struct Pool {
@@ -22,7 +22,7 @@ struct Pool {
     idle: VecDeque<(Actor, Repair)>,
 }
 
-/// One endpoint, hence one pinned trust context. Oldest idle hints are evicted
+/// One local writer in one pinned trust context. Oldest idle hints are evicted
 /// at capacity; a live lease is never evicted or shared by competing rounds.
 #[derive(Default)]
 pub(super) struct Cache(Mutex<Pool>, Condvar);

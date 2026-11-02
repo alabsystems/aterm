@@ -1259,11 +1259,11 @@ pub(crate) struct HeaderText<'a> {
     /// The machine's noun (`"this Mac"` or `"this computer"`): the legend's word for the bar's
     /// grey.
     pub(crate) machine: &'a str,
-    /// Whether a strip on screen draws an over mark. Where the deck says the glance (Full wide
-    /// and mid, and Folded) the header keys "over max" only then, and keys nothing else (the
-    /// refined deck, 2026-10-24: a legend learned once need not stay); Full narrow and slim key
-    /// all three marks by rule K.
-    pub(crate) over: bool,
+    /// Whether a strip on screen draws an over mark, by table: Full reads the first entry;
+    /// Folded reads block A then block B and prefers a key beside a block that draws the mark.
+    /// The glance (Full wide and mid, and Folded) keys "over max" only then; Full narrow and
+    /// slim key all three marks by rule K.
+    pub(crate) over: [bool; 2],
     /// The machine's totals, longest first (`18 cores · 128 GiB · 2 TB`, `18c · 128G · 2T`): the
     /// legend says them after the machine's noun where no row's run says its maximum.
     pub(crate) totals: &'a [String],
@@ -1319,6 +1319,9 @@ pub(crate) struct KeySpan {
     pub(crate) x1: f64,
     /// Whether this span lies above a heat strip.
     pub(crate) strip: bool,
+    /// Whether "over max" prefers this strip: in Folded, its block draws an over mark.
+    /// Separate from `strip`, which also keeps scope legends off heat strips.
+    pub(crate) over: bool,
 }
 
 /// Placement of legend key items across free header spans.
@@ -1387,7 +1390,11 @@ pub(crate) fn place_key(mut spans: Vec<KeySpan>, items: &[KeyItem], m: &FaceMetr
                 return None;
             }
             score.weight += item.weight();
-            score.over_strips += u32::from(span.strip);
+            score.over_strips += u32::from(if item == KeyItem::Over {
+                span.over
+            } else {
+                span.strip
+            });
             score.x_sum += span.x0;
         }
         Some(score)
@@ -1551,6 +1558,8 @@ struct Header<'m> {
     spans: Vec<KeySpan>,
     /// The strip whose header carries the time label and the scale.
     time: Option<Strip>,
+    /// Whether the time strip's block draws an over mark (Full retains strip preference).
+    time_over: bool,
     /// Where the time strip's header is free from, pt: past the now marker's room, or past a
     /// state standing at the strip's left ([`Self::state`]).
     lead: f64,
@@ -1590,6 +1599,7 @@ impl<'m> Header<'m> {
             labels: Vec::new(),
             spans: Vec::new(),
             time: None,
+            time_over: true,
             lead: 0.0,
             keys: &KeyItem::SEARCH,
             dotless: None,
@@ -1611,7 +1621,21 @@ impl<'m> Header<'m> {
     }
 
     fn span(&mut self, x0: f64, x1: f64, strip: bool) {
-        self.spans.push(KeySpan { x0, x1, strip });
+        self.spans.push(KeySpan {
+            x0,
+            x1,
+            strip,
+            over: strip,
+        });
+    }
+
+    fn strip_span(&mut self, x0: f64, x1: f64, over: bool) {
+        self.spans.push(KeySpan {
+            x0,
+            x1,
+            strip: true,
+            over,
+        });
     }
 
     fn time(&mut self, strip: Strip) {
@@ -1829,6 +1853,7 @@ impl<'m> Header<'m> {
                 x0,
                 x1: tick.left - KEY_GAP,
                 strip: true,
+                over: self.time_over,
             });
             x0 = tick.left + self.words(&tick.text) + KEY_GAP;
         }
@@ -1836,6 +1861,7 @@ impl<'m> Header<'m> {
             x0,
             x1: room.1,
             strip: true,
+            over: self.time_over,
         });
         spans.retain(|s| s.x1 > s.x0);
         spans
@@ -2078,7 +2104,7 @@ pub(crate) fn header_full(
     // mark only while a strip draws one.
     let long = matches!(plan.kind, FullKind::Wide | FullKind::Mid);
     if long {
-        head.keys = if text.over { &[KeyItem::Over] } else { &[] };
+        head.keys = if text.over[0] { &[KeyItem::Over] } else { &[] };
     }
     let state = state.filter(|_| plan.details.is_none());
     // A state at the strip's left leaves the time label room in its long form, which the scale
@@ -2156,7 +2182,9 @@ pub(crate) fn header_full(
 /// Lays out the header line and key for a `Folded` deck plan. Folded says the glance (§6.8) at
 /// every tier, so its header does as Full wide and mid's: "now" over each %, "this Mac" for
 /// Global, no "Details", and a key for the over mark only while a strip draws one. `states` are
-/// each block's worst that no row of it says (the painter measures its runs' cells).
+/// each block's worst that no row of it says (the painter measures its runs' cells). A strip
+/// span is preferred for "over max" only when its block draws the mark; otherwise the key takes
+/// the leftmost room, without changing which spans physically lie over strips.
 ///
 /// Where the blocks lay a bar column (`docs/DESIGN-stats-deck-meter-2026-10-26.md` §4), block A's
 /// strip carries the time label and the scale, and block B's header ends with the legend, once
@@ -2184,7 +2212,11 @@ pub(crate) fn header_folded(
     }
     let [a, b] = plan.blocks;
     let mut head = Header::new(m);
-    head.keys = if text.over { &[KeyItem::Over] } else { &[] };
+    head.keys = if text.over.contains(&true) {
+        &[KeyItem::Over]
+    } else {
+        &[]
+    };
     let (Some(_), Some(b_end)) = (a.meter.bar, b.meter.end()) else {
         return header_folded_under(head, plan, text, states);
     };
@@ -2229,13 +2261,14 @@ pub(crate) fn header_folded(
     }
     let tail = a.meter.run.is_none();
     match head.legend((b_lead, legend_hi), &text, tail, true) {
-        Some((x0, _)) => head.span(b_lead, x0 - KEY_GAP, true),
+        Some((x0, _)) => head.strip_span(b_lead, x0 - KEY_GAP, text.over[1]),
         None => {
-            head.span(b_lead, legend_hi, true);
+            head.strip_span(b_lead, legend_hi, text.over[1]);
             head.under_key = Some((text.machine.to_owned(), text.tab.to_owned()));
         }
     }
     head.time(a.strip);
+    head.time_over = text.over[0];
     head.finish()
 }
 
@@ -2303,6 +2336,7 @@ fn header_folded_under(
     match spilled {
         None => {
             head.time(a);
+            head.time_over = text.over[0];
             let lo = b.x + MARKER_ROOM;
             let at = if under {
                 head.legend((lo, b.end()), &text, true, true)
@@ -2310,10 +2344,16 @@ fn header_folded_under(
                 None
             };
             legend = at.is_some();
-            head.span(lo, at.map_or(b.end(), |(x0, _)| x0 - KEY_GAP), true);
+            head.strip_span(lo, at.map_or(b.end(), |(x0, _)| x0 - KEY_GAP), text.over[1]);
         }
-        Some(0) => head.time(b),
-        Some(_) => head.time(a),
+        Some(0) => {
+            head.time(b);
+            head.time_over = text.over[1];
+        }
+        Some(_) => {
+            head.time(a);
+            head.time_over = text.over[0];
+        }
     }
     if under && !legend {
         head.under_key = Some((text.machine.to_owned(), text.tab.to_owned()));
@@ -2329,7 +2369,7 @@ mod tests {
     const TEXT: HeaderText<'static> = HeaderText {
         tab: "Tab 2",
         machine: "this Mac",
-        over: true,
+        over: [true; 2],
         totals: &[],
     };
 
@@ -3034,7 +3074,12 @@ mod tests {
                     totals: &totals,
                     ..TEXT
                 },
-            ] {
+            ]
+            .into_iter()
+            .flat_map(|text| {
+                [[true, false], [false, true], [true; 2], [false; 2]]
+                    .map(|over| HeaderText { over, ..text })
+            }) {
                 let head = header_folded(&plan, text, [None, None], &m);
                 let said = heads(&head, &m);
                 laid += usize::from(said.len() == 3);
@@ -3491,7 +3536,7 @@ mod tests {
         let calm = header_full(
             &plan,
             HeaderText {
-                over: false,
+                over: [false; 2],
                 ..TEXT
             },
             None,
@@ -3539,9 +3584,9 @@ mod tests {
             Some(true)
         );
 
-        // Folded says the glance: "over max" alone, over block B's strip past its now marker
-        // (block A's carries the time label, right-aligned over its old end, and the scale), and
-        // only while a strip draws an over mark.
+        // With marks in both blocks, Folded keys "over max" over block B's strip past its now
+        // marker (block A's carries the time label, right-aligned over its old end, and the
+        // scale). A single marked block is covered below.
         let plan = plan_folded(1119.0, &m);
         let head = header_folded(&plan, TEXT, [None, None], &m);
         let [a, b] = plan.blocks;
@@ -3575,7 +3620,7 @@ mod tests {
             (None, None)
         );
         let calm = HeaderText {
-            over: false,
+            over: [false; 2],
             ..TEXT
         };
         assert!(
@@ -3817,5 +3862,55 @@ mod tests {
                 check(&head, m, both, &format!("Folded W {w}"));
             }
         });
+    }
+
+    /// Mark preference never makes an unmarked strip into a scope-legend span. State words
+    /// may occupy a block's names or strip header; the key still uses the free room it has.
+    #[test]
+    fn folded_over_keys_follow_the_marked_blocks_with_occupied_headers() {
+        let state = StateLabel {
+            full: "Disk emergency, out of file slots +3",
+            bare: "Disk emergency, out of file slots",
+        };
+        for m in [hn(), FaceMetrics::test_stack()] {
+            for w in [1119.0, 1039.0, 940.0, 750.0, 550.0, 350.0] {
+                let plan = plan_folded(w, &m);
+                for over in [[true, false], [false, true], [true; 2], [false; 2]] {
+                    for states in [
+                        [None, None],
+                        [Some(state), None],
+                        [None, Some(state)],
+                        [Some(state), Some(state)],
+                    ] {
+                        let head = header_folded(&plan, HeaderText { over, ..TEXT }, states, &m);
+                        let at = format!("W {w}, marks {over:?}, states {states:?}");
+                        let width = KeyItem::Over.width(&m);
+                        let x = placed(&head, KeyItem::Over);
+                        let fits = head.key.spans.iter().any(|s| s.x1 - s.x0 >= width);
+                        assert_eq!(x.is_some(), over.contains(&true) && fits, "{at}");
+                        for span in &head.key.spans {
+                            assert!(!span.over || span.strip, "{at}: {span:?}");
+                            if span.strip {
+                                let bi = usize::from(span.x0 >= plan.divider);
+                                assert_eq!(span.over, over[bi], "{at}: {span:?}");
+                            }
+                        }
+                        let marked_room = head
+                            .key
+                            .spans
+                            .iter()
+                            .any(|s| s.over && s.x1 - s.x0 >= width);
+                        if let Some(x) = x {
+                            assert!(
+                                head.key.spans.iter().any(|s| {
+                                    x >= s.x0 && x + width <= s.x1 && (!marked_room || s.over)
+                                }),
+                                "{at}: over max at {x}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }

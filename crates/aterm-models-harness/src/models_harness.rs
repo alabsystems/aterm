@@ -805,7 +805,7 @@ pub fn harness_upgrade_work_end_model() -> Model {
 
 /// The login wall (`aterm_agent::harness::upgrade`: `gate_announce`, `next_step`, `announce_asks`, `transcript_login`, `clock_held` and the driver's `login_facts`; `aterm_agent::supervise::policy::turn_end`: `decide_turn_end`'s auth arm, its login hold and `login_wall_waits`; both over `aterm_phase`'s wall reader).
 ///
-/// A roster row's lost login (`rostered`) is signed in by aterm itself (`Renew`, the sign-in ladder; the owner, 2026-10-24: sign-in is autonomous, and no person is asked): the tab types no `/login`, whose browser sign-in only a person could finish, and is relaunched onto the login the renewal made. `RenewAtLogin` is the roster learning, and the ladder renewing, the row of a login whose `/login` aterm typed before the row was known (the dialog it opened still up), which the relaunch then follows; its guard leaves out the states a mutant already broke a law in (`relooped`, `overrode`), which keeps Buggy=4's space inside the interpreter's budget. `EnrolAtLogin` is the roster learning that row alone, the ladder's renewal still to come. Over such a row the dialog of that `/login` asks no person either, and its picker is not answered: aterm backs out of it (`BackOut`, the dialog's own Esc, pressed again while the dialog stays drawn, the roster's row named before the dialog was decided or after) and the tab waits on the row's sign-in, so `NoRosterRowSignedInByAPerson` forbids both a `/login` typed over a roster row and a person told to sign one in at aterm's `/login` (`TellNow` at `track` 1; the `SignInAsRow` knob tells them); a person's own `/login` left over the row (`track` 0) is theirs, told as before. The dialog of aterm's `/login` over a login back in another tab (`elsewhere` 2) is backed out of by aterm the same way, and the tab continues its turn: `NoPersonClosesAtermsDialog` forbids telling a person to close that dialog (`TellClose`, which Buggy=8 and the `AskToClose` knob enable; a person may still close it, `Dismiss`). The model's dialog is aterm's picker, browser hand-off or message: it draws no Console menu, which only a person's pick at aterm's picker opens and where that person is still told the sign-in can be closed.
+/// A roster row's lost login (`rostered`) is signed in by aterm itself (`Renew`, the sign-in ladder; the owner, 2026-10-24: sign-in is autonomous, and no person is asked): the tab types no `/login`, whose browser sign-in only a person could finish, and is relaunched onto the login the renewal made. `RenewAtLogin` is the roster learning, and the ladder renewing, the row of a login whose `/login` aterm typed before the row was known (the dialog it opened still up), which the relaunch then follows; its guard leaves out the states a mutant already broke a law in (`relooped`, `overrode`), which keeps Buggy=4's space inside the interpreter's budget. `EnrolAtLogin` is the roster learning that row alone, the ladder's renewal still to come. Over such a row the dialog of that `/login` asks no person either, and its picker is not answered: aterm backs out of it (`BackOut`, the dialog's own Esc, pressed again while the dialog stays drawn, the roster's row named before the dialog was decided or after) and the tab waits on the row's sign-in, so `NoRosterRowSignedInByAPerson` forbids both a `/login` typed over a roster row and a person told to sign one in at aterm's `/login` (`TellNow` at `track` 1; the `SignInAsRow` knob tells them); a person's own `/login` left over the row (`track` 0) is theirs, told as before. The dialog of aterm's `/login` over a login back in another tab (`elsewhere` 2) is backed out of by aterm the same way, and the tab continues its turn: `NoPersonClosesAtermsDialog` forbids telling a person to close that dialog (`TellClose`, which Buggy=8 and the `AskToClose` knob enable; a person may still close it, `Dismiss`). The model's dialog is aterm's picker, browser hand-off or message: it draws no Console menu, which only a person's pick at aterm's picker opens and where that person is still told the sign-in can be closed. aterm's picker is never answered by aterm (v6 §14.17, rule 1: every pick opens a sign-in only a person finishes, the subscription's bringing the browser forward over the person's work), so `NoBrowserOpenedByAterm` forbids `PickMethod` at it, which `Buggy=9` and the `OpenBrowser` knob enable (the rule before 2026-11-01: the session's known method picked); the person picks there (`PersonPicksAtAterms`), and the hand-off is theirs.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn harness_login_wall_model() -> Model {
@@ -834,6 +834,7 @@ pub fn harness_login_wall_model() -> Model {
             const SignInOverRenewed = 0;
             const SignInAsRow = 0;
             const AskToClose = 0;
+            const OpenBrowser = 0;
             const MaxAsks = 2;
             var login = 1;
             var wall = 0;
@@ -873,6 +874,7 @@ pub fn harness_login_wall_model() -> Model {
             var reasked = 0;
             var asked = 0;
             var closer = 0;
+            var opened = 0;
 
             action Expire when (login == 1 && picker <= 1 && elsewhere == 0) {
                 login = 0;
@@ -915,6 +917,11 @@ pub fn harness_login_wall_model() -> Model {
                 picker = 2;
             }
             action PersonPicked when (picker == 2) {
+                picker = 0;
+            }
+            action PersonPicksAtAterms when (
+                picker == 1 && elsewhere <= 1 && renewed == 0 && rostered == 0
+            ) {
                 picker = 0;
             }
             action PersonLeft when (wall == 1 && track == 0 && left == 0 && login == 0) {
@@ -1040,9 +1047,12 @@ pub fn harness_login_wall_model() -> Model {
             action PickMethod when (
                 (picker == 1 &&
                     ((elsewhere <= 1 && renewed == 0 && rostered == 0) || PickAfterBack == 1) &&
-                    (known == 1 || Buggy == 5 || GuessMethod == 1)) ||
+                    (known == 1 || Buggy == 5 || GuessMethod == 1) &&
+                    (OpenBrowser == 1 || Buggy == 9 || Buggy == 5 || GuessMethod == 1 ||
+                        PickAfterBack == 1)) ||
                 (picker == 2 && (Buggy == 5 || PickAnyPicker == 1))
             ) {
+                opened = if (picker == 1) { 1 } else { opened };
                 doubled = if (picker == 1 && (elsewhere == 2 || renewed == 1)) {
                     1
                 } else {
@@ -1188,6 +1198,7 @@ pub fn harness_login_wall_model() -> Model {
             invariant NoSignInAskedOverARenewal: reasked == 0;
             invariant NoRosterRowSignedInByAPerson: asked == 0;
             invariant NoPersonClosesAtermsDialog: closer == 0;
+            invariant NoBrowserOpenedByAterm: opened == 0;
         }
     }
 }

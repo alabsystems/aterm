@@ -77,6 +77,7 @@ pub(super) fn fixture() -> HarnessState {
                 ],
                 store_note: None,
                 held: None,
+                harness_packages: Vec::new(),
             }),
             unavailable: None,
         },

@@ -49,7 +49,12 @@ fn fill_file(lines: u64) -> Result<PathBuf, String> {
 
 /// `scroll`'s bare report, `OK <offset> <max>`: the scrollback depth.
 pub(crate) fn depth(report: &str) -> Option<u64> {
-    report.split_whitespace().nth(2)?.parse().ok()
+    report
+        .split_whitespace()
+        .nth(2)
+        .filter(|s| s.bytes().all(|b| b.is_ascii_digit()))?
+        .parse()
+        .ok()
 }
 
 fn json(text: &str) -> Result<Value, String> {

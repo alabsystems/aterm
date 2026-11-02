@@ -5,6 +5,10 @@
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
 //! Touch handling.
+//!
+//! Modified by the aterm project in 2026; see the repository NOTICE. (The touch events come
+//! decoded from first-party `aterm_wayland::seat`, where upstream had smithay-client-toolkit's
+//! `TouchHandler`: docs/AUDIT-third-party-2026-10-15.md, LW.7.)
 
 use aterm_wayland::seat::TouchEvent;
 use tracing::warn;

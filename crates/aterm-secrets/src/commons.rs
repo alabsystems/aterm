@@ -223,6 +223,8 @@ pub(crate) fn observe_until_with(
         if remaining.is_zero() {
             return Ok(observation);
         }
+        #[cfg(test)]
+        bootstrap::tests::admission_held();
         held();
         std::thread::sleep(backoff.min(remaining));
         backoff = (backoff * 2).min(std::time::Duration::from_millis(50));

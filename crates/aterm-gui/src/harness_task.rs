@@ -113,13 +113,22 @@ impl App {
         };
         let now_ms = crate::harness_screen::unix_ms_now();
         let stamp_ms = noted_ms.map_or(now_ms, |noted| noted.min(now_ms));
-        let (was, at_ms) = {
+        let (was, at_ms, receipt) = {
             let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             let was = timeline.task_face().map(|(f, _)| f);
             if !timeline.set_task_face(face, stamp_ms) {
                 return;
             }
-            (was, timeline.task_face().map_or(stamp_ms, |(_, at)| at))
+            // What aterm checked at a landing (§14.9, slice 9c), told before the face and read
+            // under the lock the face's move takes: the record names it.
+            let receipt = (face == Some(TaskFace::Landed))
+                .then(|| timeline.land_receipt().cloned())
+                .flatten();
+            (
+                was,
+                timeline.task_face().map_or(stamp_ms, |(_, at)| at),
+                receipt,
+            )
         };
         let hover_was = self.driven_by_aterm(session);
         let landed_was = self.chip_face_landed(session);
@@ -135,7 +144,7 @@ impl App {
         self.note_harness_arm(session);
         let unseen_before_end = self.end_unseen(session);
         let was = was.or(floor);
-        self.harness_task_moved(session, was, face);
+        self.harness_task_moved(session, was, face, receipt.as_deref());
         self.reconcile_self_claim_task(session);
         let end_restamped = cleared || (self.end_unseen(session) && !unseen_before_end);
         if moved && !end_restamped {
@@ -241,12 +250,13 @@ impl App {
         }
     }
 
-    /// Session `session`'s task face MOVED from `was` to `face` (`None`: unknown) — the timeline holds it already, and the footer is posted by the caller (`App::apply_harness_fact`), which has read the A/B book's calendar and the session's mode (`App::note_harness_arm`).
+    /// Session `session`'s task face MOVED from `was` to `face` (`None`: unknown) — the timeline holds it already, and the footer is posted by the caller (`App::apply_harness_fact`), which has read the A/B book's calendar and the session's mode (`App::note_harness_arm`); `receipt`, what aterm checked at a landing (§14.9, slice 9c), as the timeline held it beside the landed face.
     pub(crate) fn harness_task_moved(
         &mut self,
         session: u64,
         was: Option<TaskFace>,
         face: Option<TaskFace>,
+        receipt: Option<&aterm_agent::harness::acts::LandReceipt>,
     ) {
         self.note_harness_end(session, was, face);
         let end = face
@@ -273,7 +283,7 @@ impl App {
         };
         let place = self.upgrade_place(&sid);
         let line_place = self.session_place(&sid);
-        if let Some(record) = task_record(&sid, &place, &line_place, face) {
+        if let Some(record) = task_record(&sid, &place, &line_place, face, receipt) {
             self.record_message(record);
         }
     }
@@ -472,30 +482,50 @@ pub(crate) const fn is_an_end(was: Option<TaskFace>, face: TaskFace) -> bool {
     }
 }
 
-/// THE RECORD OF A LANDING'S END for session `sid` in its tab `place` (`in tab 3`, `in window 2, tab 3`, `in its tab`; `App::upgrade_place`) — its line led by `line_place`, which names its pane too where the tab holds two agents (`in tab 3, left pane`; `App::session_place`) — a `harness`-tagged RECORD, never a row, keyed `harness.landing.<sid>` (one session's landings, as the log filters them; the log never replaces a record by its key, so a repeat is kept out by [`is_an_end`]) — for [`TaskFace::Landed`] (`Autopilot landed in tab 3`) alone; `None` for every other face.
+/// THE RECORD OF A LANDING'S END for session `sid` in its tab `place` (`in tab 3`, `in window 2, tab 3`, `in its tab`; `App::upgrade_place`) — its line led by `line_place`, which names its pane too where the tab holds two agents (`in tab 3, left pane`; `App::session_place`) — a `harness`-tagged RECORD, never a row, keyed `harness.landing.<sid>` (one session's landings, as the log filters them; the log never replaces a record by its key, so a repeat is kept out by [`is_an_end`]) — for [`TaskFace::Landed`] (`Autopilot landed in tab 3`) alone; `None` for every other face. Its first line says what aterm checked at the landing (`receipt`, §14.9 slice 9c: `Tab 3: aterm checked 3f9a1c2e4b7d on origin/main in …; nothing uncommitted, untracked or unpushed, and no stash on main`, each leg in `mode_words::checked_words`' words), its second what the agent said (`It said “Nothing left: …”`, or where the receipt says the land check was answered, §14.17 item 5 slice 13a, `It answered the land check that nothing is left, after it said “…”`; `mode_words::said_within` the line's cap, so a long quote is cut before its closing mark); with no receipt (codex-alab's own landing, or a landing a loop before the receipt restates), one line, `mode_words::landed_words`' for none. No alert, no sound and no `NEEDS YOU:` line on any leg (§14.17 item 4): a record waits in Messages for when the person looks.
 #[must_use]
 pub(crate) fn task_record(
     sid: &str,
     place: &str,
     line_place: &str,
     face: TaskFace,
+    receipt: Option<&aterm_agent::harness::acts::LandReceipt>,
 ) -> Option<Message> {
-    let (head, what) = match face {
-        TaskFace::Landed => (
-            "Autopilot landed",
-            aterm_agent::supervise::mode_words::LANDED_WORDS,
-        ),
+    use aterm_agent::supervise::mode_words;
+    let head = match face {
+        TaskFace::Landed => "Autopilot landed",
         TaskFace::Open | TaskFace::Theirs => return None,
     };
+    let line =
+        |text: &str| atpkg::progress::sanitize_for_tty(text, aterm_messages::DETAIL_LINE_CAP);
+    let message = Message::new(tags::HARNESS, Severity::Info, placed(head, place));
+    let message = match receipt {
+        Some(receipt) => {
+            // Cut to the line's cap here, so a long quote keeps its closing mark.
+            let said = mode_words::said_within(receipt, aterm_messages::DETAIL_LINE_CAP);
+            message
+                .line(line(&tab_led(
+                    line_place,
+                    &mode_words::checked_words(Some(receipt)),
+                )))
+                .line(line(&capitalized(&said)))
+        }
+        None => message.line(line(&tab_led(line_place, &mode_words::landed_words(None)))),
+    };
     Some(
-        Message::new(tags::HARNESS, Severity::Info, placed(head, place))
-            .line(atpkg::progress::sanitize_for_tty(
-                &tab_led(line_place, what),
-                aterm_messages::DETAIL_LINE_CAP,
-            ))
+        message
             .record()
             .key(format!("harness.landing.{sid}").as_str()),
     )
+}
+
+/// `text` with its first letter capitalized (`It said “…”`).
+fn capitalized(text: &str) -> String {
+    let mut chars = text.chars();
+    chars
+        .next()
+        .map(|c| c.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
 }
 
 /// `{head} {place}` (`Autopilot landed in tab 3`), or where that breaks the
@@ -513,7 +543,7 @@ fn placed(head: &str, place: &str) -> String {
     }
 }
 
-/// `{Place}: {text}` (`Tab 3: it said nothing is left, …`), or `text` alone for a
+/// `{Place}: {text}` (`Tab 3: aterm checked 3f9a1c2e4b7d on …`), or `text` alone for a
 /// session no tab shows: the line leads with the tab it is about.
 fn tab_led(place: &str, text: &str) -> String {
     match place.strip_prefix("in ") {

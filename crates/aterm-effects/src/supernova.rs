@@ -547,9 +547,7 @@ fn peak_additive_channel(quads: &[GlowQuad]) -> u32 {
                 continue;
             }
             row.sort_unstable_by_key(|q| q.x);
-            by_end.clear();
-            by_end.extend_from_slice(row);
-            by_end.sort_unstable_by_key(|q| u32::from(q.x) + u32::from(q.w));
+            let mut by_end_ready = false;
             let row = &*row;
             let mut yi = 0;
             while yi < row.len() {
@@ -585,6 +583,12 @@ fn peak_additive_channel(quads: &[GlowQuad]) -> u32 {
                 }
                 if py_sum[0].max(py_sum[1]).max(py_sum[2]) <= peak {
                     continue;
+                }
+                if !by_end_ready {
+                    by_end.clear();
+                    by_end.extend_from_slice(row);
+                    by_end.sort_unstable_by_key(|q| u32::from(q.x) + u32::from(q.w));
+                    by_end_ready = true;
                 }
                 let mut sum = [0u32; 3];
                 let (mut i, mut j) = (0, 0);
@@ -850,31 +854,33 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
         let p = t_ms as f32 * INV_CHARGE_END_MS;
         let cov = env.intensity * (0.25 + 0.75 * p);
         let alpha = (255.0 * cov.min(1.0)) as u8;
-        let half_cw = env.cell_w / 2;
-        let half_ch = env.cell_h / 2;
-        let mut k = 0;
-        while k < CHARGE_MOTES {
-            if out.len() >= cap {
-                break;
+        if alpha > 0 {
+            let half_cw = env.cell_w / 2;
+            let half_ch = env.cell_h / 2;
+            let mut k = 0;
+            while k < CHARGE_MOTES {
+                if out.len() >= cap {
+                    break;
+                }
+                let (x, y) = charge_mote_pos(env, k, p);
+                let k_f32 = k as f32;
+                k += 1;
+                if x < 0 || y < 0 || x >= env.grid_w || y >= env.grid_h {
+                    continue;
+                }
+                let hue = env.base_hue + k_f32 * 30.0;
+                let (row, col) = (y / ch, x / cw);
+                out.push(WordDecoration {
+                    row: row as u16,
+                    col: col as u16,
+                    dx: ((x - col * cw) - half_cw).clamp(-6, 6) as i8,
+                    dy: ((y - row * ch) - half_ch).clamp(-6, 6) as i8,
+                    glyph: DecoGlyph::Dot,
+                    blend: DecoBlend::Over,
+                    color: hsv2rgb(hue, 1.0, 0.62),
+                    alpha,
+                });
             }
-            let (x, y) = charge_mote_pos(env, k, p);
-            let k_f32 = k as f32;
-            k += 1;
-            if x < 0 || y < 0 || x >= env.grid_w || y >= env.grid_h {
-                continue;
-            }
-            let hue = env.base_hue + k_f32 * 30.0;
-            let (row, col) = (y / ch, x / cw);
-            out.push(WordDecoration {
-                row: row as u16,
-                col: col as u16,
-                dx: ((x - col * cw) - half_cw).clamp(-6, 6) as i8,
-                dy: ((y - row * ch) - half_ch).clamp(-6, 6) as i8,
-                glyph: DecoGlyph::Dot,
-                blend: DecoBlend::Over,
-                color: hsv2rgb(hue, 1.0, 0.62),
-                alpha,
-            });
         }
     }
     if env.light && (CHARGE_END_MS..DETONATION_END_MS).contains(&t_ms) {
@@ -957,33 +963,68 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
                 }
             }
         }
-        let mut crown_segs = [(0.0f32, 0u8); 3];
-        let mut i = 0;
-        while i < crown_segs.len() {
-            let seg = (i + 1) as f32;
-            crown_segs[i] = (
-                env.r_max * 0.3 * seg,
-                (230.0 * env_a * (1.0 - 0.2 * seg)) as u8,
-            );
-            i += 1;
-        }
-        let dirs = crown_dirs();
-        let mut di = 0;
-        while di < dirs.len() {
-            if out.len() >= cap {
-                break;
+        if env_a > 0.0 {
+            let mut crown_segs = [(0.0f32, 0u8); 3];
+            let mut i = 0;
+            while i < crown_segs.len() {
+                let seg = (i + 1) as f32;
+                crown_segs[i] = (
+                    env.r_max * 0.3 * seg,
+                    (230.0 * env_a * (1.0 - 0.2 * seg)) as u8,
+                );
+                i += 1;
             }
-            let (sin_a, cos_a) = dirs[di];
-            di += 1;
-            let mut si = 0;
-            while si < crown_segs.len() {
+            let dirs = crown_dirs();
+            let mut di = 0;
+            while di < dirs.len() {
                 if out.len() >= cap {
                     break;
                 }
-                let (d, alpha) = crown_segs[si];
-                si += 1;
-                let x = env.cx + (cos_a * d) as i32;
-                let y = env.cy + (sin_a * d * 0.75) as i32;
+                let (sin_a, cos_a) = dirs[di];
+                di += 1;
+                let mut si = 0;
+                while si < crown_segs.len() {
+                    if out.len() >= cap {
+                        break;
+                    }
+                    let (d, alpha) = crown_segs[si];
+                    si += 1;
+                    let x = env.cx + (cos_a * d) as i32;
+                    let y = env.cy + (sin_a * d * 0.75) as i32;
+                    if x < 0 || y < 0 || x >= env.grid_w || y >= env.grid_h {
+                        continue;
+                    }
+                    let (row, col) = (y / ch, x / cw);
+                    out.push(WordDecoration {
+                        row: row as u16,
+                        col: col as u16,
+                        dx: 0,
+                        dy: 0,
+                        glyph: DecoGlyph::Shade,
+                        blend: DecoBlend::Over,
+                        color: VEIL_TONE,
+                        alpha,
+                    });
+                }
+            }
+        }
+    }
+    if env.light && (DETONATION_END_MS..SHOCK_END_MS).contains(&t_ms) {
+        let q = (t_ms - DETONATION_END_MS) as f32 * INV_SHOCK_SPAN_MS;
+        let fade = 1.0 - q;
+        let alpha = (170.0 * fade * env.intensity) as u8;
+        if alpha > 0 {
+            let r = env.r_max * ease_out(q);
+            let dirs = shock_dirs();
+            let mut di = 0;
+            while di < dirs.len() {
+                if out.len() >= cap {
+                    break;
+                }
+                let (sin_a, cos_a) = dirs[di];
+                di += 1;
+                let x = env.cx + (cos_a * r) as i32;
+                let y = env.cy + (sin_a * r * 0.75) as i32;
                 if x < 0 || y < 0 || x >= env.grid_w || y >= env.grid_h {
                     continue;
                 }
@@ -1001,95 +1042,66 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
             }
         }
     }
-    if env.light && (DETONATION_END_MS..SHOCK_END_MS).contains(&t_ms) {
-        let q = (t_ms - DETONATION_END_MS) as f32 * INV_SHOCK_SPAN_MS;
-        let r = env.r_max * ease_out(q);
-        let fade = 1.0 - q;
-        let alpha = (170.0 * fade * env.intensity) as u8;
-        let dirs = shock_dirs();
-        let mut di = 0;
-        while di < dirs.len() {
-            if out.len() >= cap {
-                break;
-            }
-            let (sin_a, cos_a) = dirs[di];
-            di += 1;
-            let x = env.cx + (cos_a * r) as i32;
-            let y = env.cy + (sin_a * r * 0.75) as i32;
-            if x < 0 || y < 0 || x >= env.grid_w || y >= env.grid_h {
-                continue;
-            }
-            let (row, col) = (y / ch, x / cw);
-            out.push(WordDecoration {
-                row: row as u16,
-                col: col as u16,
-                dx: 0,
-                dy: 0,
-                glyph: DecoGlyph::Shade,
-                blend: DecoBlend::Over,
-                color: VEIL_TONE,
-                alpha,
-            });
-        }
-    }
     if (DEBRIS_START_MS..SUPER_TOTAL_MS).contains(&t_ms) {
         const ANG_SCALE: f32 = core::f32::consts::TAU / 4096.0;
         const INV_255: f32 = 1.0 / 255.0;
-        let n = 24 + (env.seed % 17) as usize;
         let p = (t_ms - DEBRIS_START_MS) as f32 * INV_DEBRIS_SPAN_MS;
-        let base_r = env.r_max * (0.3 + 1.1 * p);
-        let grav_y = (p * p * env.cell_h as f32) as i32;
-        let grid_tick = t_ms / crate::nova::TWINKLE_GRID_MS;
         let fade_p = 1.0 - p * p;
-        let hue_step = 360.0 / n as f32;
-        let (sat, val, blend) = if env.light {
-            (1.0, 0.62, DecoBlend::Over)
-        } else {
-            (0.85, 1.0, DecoBlend::Add)
-        };
         let alphas = [
             (255.0 * env.intensity * 1.0 * fade_p) as u8,
             (255.0 * env.intensity * crate::effect_util::TWINKLE_FLOOR * fade_p) as u8,
         ];
-        let half_cw = env.cell_w / 2;
-        let half_ch = env.cell_h / 2;
-        let base_hue_drift = env.base_hue + p * 90.0;
-        let mut k = 0;
-        while k < n {
-            if out.len() >= cap {
-                break;
+        if alphas[0] > 0 || alphas[1] > 0 {
+            let n = 24 + (env.seed % 17) as usize;
+            let base_r = env.r_max * (0.3 + 1.1 * p);
+            let grav_y = (p * p * env.cell_h as f32) as i32;
+            let grid_tick = t_ms / crate::nova::TWINKLE_GRID_MS;
+            let hue_step = 360.0 / n as f32;
+            let (sat, val, blend) = if env.light {
+                (1.0, 0.62, DecoBlend::Over)
+            } else {
+                (0.85, 1.0, DecoBlend::Add)
+            };
+            let half_cw = env.cell_w / 2;
+            let half_ch = env.cell_h / 2;
+            let base_hue_drift = env.base_hue + p * 90.0;
+            let mut k = 0;
+            while k < n {
+                if out.len() >= cap {
+                    break;
+                }
+                let k_u64 = k as u64;
+                let k_f32 = k as f32;
+                k += 1;
+                let s = crate::genome::mix(env.seed ^ k_u64.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                let ang = (s & 4095) as f32 * ANG_SCALE;
+                let speed = 0.5 + (s >> 13 & 0xff) as f32 * INV_255;
+                let r = base_r * speed;
+                let (sin_a, cos_a) = sin_cos_f32(ang);
+                let x = env.cx + (cos_a * r) as i32;
+                let y = env.cy + (sin_a * r * 0.7) as i32 + grav_y;
+                if x < 0 || y < 0 || x >= env.grid_w || y >= env.grid_h {
+                    continue;
+                }
+                let (row, col) = (y / ch, x / cw);
+                let hue = base_hue_drift + k_f32 * hue_step;
+                let tone = hsv2rgb(hue, sat, val);
+                let grid_phase = ((grid_tick + k_u64) & 1) as usize;
+                out.push(WordDecoration {
+                    row: row as u16,
+                    col: col as u16,
+                    dx: ((x - col * cw) - half_cw).clamp(-6, 6) as i8,
+                    dy: ((y - row * ch) - half_ch).clamp(-6, 6) as i8,
+                    glyph: if s & 1 == 0 {
+                        DecoGlyph::Star4
+                    } else {
+                        DecoGlyph::Dot
+                    },
+                    blend,
+                    color: tone,
+                    alpha: alphas[grid_phase],
+                });
             }
-            let k_u64 = k as u64;
-            let k_f32 = k as f32;
-            k += 1;
-            let s = crate::genome::mix(env.seed ^ k_u64.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-            let ang = (s & 4095) as f32 * ANG_SCALE;
-            let speed = 0.5 + (s >> 13 & 0xff) as f32 * INV_255;
-            let r = base_r * speed;
-            let (sin_a, cos_a) = sin_cos_f32(ang);
-            let x = env.cx + (cos_a * r) as i32;
-            let y = env.cy + (sin_a * r * 0.7) as i32 + grav_y;
-            if x < 0 || y < 0 || x >= env.grid_w || y >= env.grid_h {
-                continue;
-            }
-            let (row, col) = (y / ch, x / cw);
-            let hue = base_hue_drift + k_f32 * hue_step;
-            let tone = hsv2rgb(hue, sat, val);
-            let grid_phase = ((grid_tick + k_u64) & 1) as usize;
-            out.push(WordDecoration {
-                row: row as u16,
-                col: col as u16,
-                dx: ((x - col * cw) - half_cw).clamp(-6, 6) as i8,
-                dy: ((y - row * ch) - half_ch).clamp(-6, 6) as i8,
-                glyph: if s & 1 == 0 {
-                    DecoGlyph::Star4
-                } else {
-                    DecoGlyph::Dot
-                },
-                blend,
-                color: tone,
-                alpha: alphas[grid_phase],
-            });
         }
     }
     if env.light && (CHARGE_END_MS..SHOCK_END_MS).contains(&t_ms) {

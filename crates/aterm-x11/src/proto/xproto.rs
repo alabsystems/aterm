@@ -221,11 +221,10 @@ pub fn unmap_window(window: Window) -> Request<Void> {
 
 /// ConfigureWindow (12).
 pub fn configure_window(window: Window, values: &ValueList) -> Request<Void> {
+    let mask = u16::try_from(values.mask() & 0xffff).unwrap_or(0);
     let mut w = Writer::new(12, 0);
-    w.u32(window)
-        .u16(u16::try_from(values.mask() & 0xffff).unwrap_or(0))
-        .pad(2);
-    values.write(&mut w);
+    w.u32(window).u16(mask).pad(2);
+    values.write_masked(u32::from(mask), &mut w);
     w.finish()
 }
 
@@ -264,16 +263,22 @@ pub fn change_property(
     format: u8,
     data: &[u8],
 ) -> Request<Void> {
-    let unit = usize::from(format / 8).max(1);
-    let items = data.len() / unit;
-    let data = &data[..items * unit];
+    let (items, data): (u32, &[u8]) = match format {
+        8 | 16 | 32 => {
+            let unit = usize::from(format / 8);
+            let items = (data.len() / unit).min(u32::MAX as usize);
+            let count = u32::try_from(items).unwrap_or(u32::MAX);
+            (count, &data[..items * unit])
+        }
+        _ => (0, &[]),
+    };
     Writer::new(18, mode as u8)
         .u32(window)
         .u32(property)
         .u32(type_)
         .u8(format)
         .pad(3)
-        .u32(u32::try_from(items).unwrap_or(u32::MAX))
+        .u32(items)
         .bytes(data)
         .finish()
 }
@@ -1141,4 +1146,29 @@ fn parse_screen(r: &mut Reader<'_>) -> Result<Screen, ParseError> {
         root_depth,
         allowed_depths,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configure_window_omits_words_above_u16_mask() {
+        let values = ValueList::new().set(1, 100).set(2, 200).set(1 << 17, 999);
+        let req = configure_window(42, &values);
+        let b = req.bytes();
+        let word_len = u16::from_ne_bytes([b[2], b[3]]);
+        let mask = u16::from_ne_bytes([b[8], b[9]]);
+        assert_eq!(mask, 0b11);
+        assert_eq!(usize::from(word_len), 3 + mask.count_ones() as usize);
+        assert_eq!(b.len(), usize::from(word_len) * 4);
+    }
+
+    #[test]
+    fn change_property_invalid_format_keeps_wire_framing_consistent() {
+        let req = change_property(PropMode::Replace, 1, 2, 3, 0, &[1, 2, 3, 4]);
+        let b = req.bytes();
+        assert_eq!(b.len(), 24);
+        assert_eq!(u32::from_ne_bytes([b[20], b[21], b[22], b[23]]), 0);
+    }
 }

@@ -129,7 +129,7 @@ impl Conflict {
                         "table restriction lacks a matching signed recovery",
                     ));
                 }
-                active = session.discarded_source(&envelope);
+                active = session.discarded_source(&envelope)?;
                 discarded = Some(Discarded {
                     header: envelope.header.clone(),
                     roster: envelope.roster,
@@ -140,12 +140,7 @@ impl Conflict {
             }
             _ => return Err(Error::new("unknown table conflict certificate")),
         };
-        session
-            .journal
-            .constraints()
-            .map_err(super::failure)?
-            .check_known_actor(&headers[0].actor)
-            .map_err(super::failure)?;
+        session.check_known_actor(&headers[0].actor)?;
         Ok(Self {
             wire: wire.into(),
             headers,

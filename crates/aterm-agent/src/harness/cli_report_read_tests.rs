@@ -241,7 +241,13 @@ pub(crate) fn attribution_transition(
     let roster = |many: bool| {
         let one = accounts::append_row("", "main", Class::Dedicated, None).unwrap();
         Roster::parse(&if many {
-            accounts::append_row(&one, "second", Class::Dedicated, Some("/second")).unwrap()
+            accounts::append_row(
+                &one,
+                "second",
+                Class::Dedicated,
+                Some(&crate::harness::host_path::abs("/second")),
+            )
+            .unwrap()
         } else {
             one
         })

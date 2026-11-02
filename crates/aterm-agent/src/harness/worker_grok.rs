@@ -193,9 +193,11 @@ pub fn config_flags(argv: &[String]) -> Result<Vec<String>, String> {
             (Arity::None, Some(_)) => return Err(tok.to_string()),
             (Arity::None, None) | (Arity::One | Arity::Optional, Some(_)) => None,
             (Arity::One, None) => {
-                let value = argv.get(i).cloned();
+                let Some(value) = argv.get(i).filter(|v| v.as_str() != "--").cloned() else {
+                    return Err(tok.to_string());
+                };
                 i += 1;
-                value
+                Some(value)
             }
             (Arity::Optional, None) => match argv.get(i) {
                 Some(v) if !v.starts_with('-') => {
@@ -267,7 +269,8 @@ pub fn store_build(program: &Path) -> bool {
 pub fn auth_file(env: &[(String, String)], user: Option<&Path>) -> Option<std::path::PathBuf> {
     let var = |name: &str| {
         env.iter()
-            .find(|(n, v)| n == name && !v.is_empty())
+            .rfind(|(n, _)| n == name)
+            .filter(|(_, v)| !v.is_empty())
             .map(|(_, v)| Path::new(v))
     };
     let file = match var(AUTH_PATH_ENV) {

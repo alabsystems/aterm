@@ -866,6 +866,7 @@ impl Gen {
                 Some(GrokSignin::Running),
                 Some(GrokSignin::SignedIn),
                 Some(GrokSignin::Idle),
+                Some(GrokSignin::Reading),
             ]),
         }
     }
@@ -958,11 +959,7 @@ fn every_reader_says_the_published_verdict() {
             usize::from(verdict.need.is_some()),
             "case {case}"
         );
-        assert_eq!(
-            glance.button_title() == "\u{276f}1",
-            verdict.need.is_some(),
-            "case {case}"
-        );
+        assert_eq!(glance.button_title(), "\u{276f}", "case {case}");
         let sensed = Desk::sense(&app, 0).expect("session 0 is pooled");
         Desk::table_mut(&mut app).absorb(0, sensed, std::time::Instant::now());
         drive::refresh_window(&mut app, crate::WindowId(0));
@@ -977,11 +974,7 @@ fn every_reader_says_the_published_verdict() {
             .presence_view(crate::WindowId(0))
             .map(|view| view.rim)
             .expect("window 0");
-        assert_eq!(
-            rim,
-            severity.map_or(crate::presence::Rim::None, crate::presence::Rim::of),
-            "case {case}: {facts:?}"
-        );
+        assert_eq!(rim, crate::presence::Rim::None, "case {case}: {facts:?}");
         let chip = app.presence.slot(0).map(|slot| slot.chip());
         let agrees = matches!(
             (severity, chip),
@@ -1563,17 +1556,38 @@ fn need_words_takes_the_frame_off_a_harness_entry() {
             first: "the release credential to sign 0.48.0",
             more: 0,
             program: Program::Claude,
+            tail: NeedTail::CarryingOn,
         })
     );
     let tail = " \u{2014} carrying on";
     for (at, _) in tail.char_indices().skip(1) {
         let cut = format!("agy needs you: sign it (+1 more){}", &tail[..at]);
         assert_eq!(
-            need_words(&cut).map(|w| (w.first, w.more, w.program)),
-            Some(("sign it", 1, Program::Agy)),
+            need_words(&cut).map(|w| (w.first, w.more, w.program, w.tail)),
+            Some(("sign it", 1, Program::Agy, NeedTail::CarryingOn)),
             "{cut:?}"
         );
     }
+    // Where Land rests on the need or the work landed beside it, the tail says the work waits
+    // on the person; cut short past its dash, it is still read as that tail.
+    let waits = " \u{2014} waits on you";
+    for (at, _) in waits.char_indices().skip(1) {
+        let cut = format!("agy needs you: sign it (+1 more){}", &waits[..at]);
+        let read = if at > " \u{2014} ".len() {
+            NeedTail::WaitsOnYou
+        } else {
+            NeedTail::CarryingOn
+        };
+        assert_eq!(
+            need_words(&cut).map(|w| (w.first, w.more, w.tail)),
+            Some(("sign it", 1, read)),
+            "{cut:?}"
+        );
+    }
+    assert_eq!(
+        need_words(&format!("muse needs you: sign it{waits}")).map(|w| (w.first, w.tail)),
+        Some(("sign it", NeedTail::WaitsOnYou))
+    );
     let three = harness_entry("muse", &cut64(NEED_A), 3);
     let read = need_words(&three).expect("a counted entry");
     assert_eq!(
@@ -2205,13 +2219,19 @@ fn two_grok_auth_walls_give_one_need() {
         "{}",
         a.what
     );
-    // A sign-in runs: no need on either walled session, a wait in Grok's words.
-    for rev in [7, 9] {
-        let verdict = of(&walled(rev, Some(GrokSignin::Running)));
-        assert_eq!(verdict.need, None);
-        let wait = verdict.waiting.expect("waits on the machine's sign-in");
-        assert_eq!(wait.word, WaitWord::Login);
-        assert_eq!(wait_words(&wait, true), GROK_SIGNIN_WAIT);
+    // A sign-in runs: no need on either walled session, a wait in Grok's words. Before the
+    // first look at the sign-in answers, the same: a wait on that look, no need.
+    for (signin, words) in [
+        (GrokSignin::Running, GROK_SIGNIN_WAIT),
+        (GrokSignin::Reading, crate::needs::GROK_SIGNIN_READING),
+    ] {
+        for rev in [7, 9] {
+            let verdict = of(&walled(rev, Some(signin)));
+            assert_eq!(verdict.need, None);
+            let wait = verdict.waiting.expect("waits on the machine's sign-in");
+            assert_eq!(wait.word, WaitWord::Login);
+            assert_eq!(wait_words(&wait, true), words);
+        }
     }
     // ... while the leader's own session carries the one need: the once-ever setup first where
     // there is one, and still the code within the row, for every setup of the label

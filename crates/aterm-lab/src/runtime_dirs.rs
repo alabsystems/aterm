@@ -163,7 +163,9 @@ pub fn held_below(held: &[(i32, String)], root: &str) -> Vec<(i32, String)> {
 /// or kqueue of theirs: each file one holds open through a descriptor
 /// ([`aterm_uds::holders::open_files`]), and each socket directly below `root` whose listener
 /// one bound, by the kernel's table of unix-domain listeners
-/// ([`aterm_uds::holders::scan_listener_holders`]). A table that does not read adds nothing.
+/// ([`aterm_uds::holders::scan_listener_holders`]). A scan that does not answer (a table that
+/// does not read, a connection that does not answer in time) adds nothing: the record keeps only
+/// what is known held.
 fn held_by(pids: &[i32], root: &str) -> Vec<(i32, String)> {
     use std::os::unix::fs::FileTypeExt as _;
     let mut held = Vec::new();
@@ -254,7 +256,10 @@ pub fn claims(held: &[Held], roots: &[String], uid: u32, since: i64, fs: &dyn Vi
             Some((root, rel, Shape::Lease))
                 if same(h, Kind::File) && names(h, "pid", J::Int(i64::from(h.pid))) =>
             {
-                sockets.push((format!("{root}/{}", rel.trim_end_matches(".lease")), h.pid));
+                sockets.push((
+                    format!("{root}/{}", rel.strip_suffix(".lease").unwrap_or(rel)),
+                    h.pid,
+                ));
                 out.push(h.clone());
             }
             Some((_, _, Shape::Session))

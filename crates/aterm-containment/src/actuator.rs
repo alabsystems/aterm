@@ -953,6 +953,14 @@ mod tests {
         let second = generate();
         let zshrc_second = sandboxed_append_ok(&second, &zshrc);
         let agents_second = sandboxed_sh_ok(&second, &format!("mkdir -p {}", q(&agents)));
+
+        let _ = std::fs::remove_file(&hist);
+        std::fs::write(&hist, ": 0:0;ls\n").unwrap();
+        std::fs::hard_link(&zshrc, &hist_new).unwrap();
+        let third = generate();
+        let hist_new_third = sandboxed_sh_ok(&third, &format!("echo PLANTED >> {}", q(&hist_new)));
+        let _ = std::fs::remove_file(&hist_new);
+
         let control = sandboxed_append_ok(crate::sbpl::BASE_PROFILE, &zshrc);
         let zshrc_after = std::fs::read_to_string(&zshrc).unwrap_or_default();
         let _ = std::fs::remove_dir_all(&home);
@@ -973,6 +981,10 @@ mod tests {
             (
                 through_symlink,
                 "wrote ~/.zshrc through a symlink at a history name",
+            ),
+            (
+                hist_new_third,
+                "wrote ~/.zshrc through a pre-existing hard link at ~/.zsh_history.new",
             ),
         ] {
             assert!(

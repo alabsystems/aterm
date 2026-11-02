@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use super::LaneKind;
 use super::gap::{self, MainGap, PinCommit};
 use super::hold::Holds;
-use super::report::{self, Notifier, Transcript};
+use super::report::{self, NoticeSink, Transcript};
 use super::rows::{self, Fetched};
 use super::state::{LaneState, Lock};
 use crate::api::{Baseline, Build, Delta, IndexRequest, Indexer, PackRequest, Packer, Signing};
@@ -70,8 +70,8 @@ pub struct Deps<'a> {
     pub packer: &'a dyn Packer,
     /// Publishes the index.
     pub indexer: &'a dyn Indexer,
-    /// Tells a person.
-    pub notifier: &'a dyn Notifier,
+    /// Appends notices to the journal.
+    pub notifier: &'a dyn NoticeSink,
     /// The pin's commit, as its installed compiler reports it ([`installed_pin_commit`]).
     pub pin_commit: &'a dyn Fn(&Ctx, &str, Build) -> Option<PinCommit>,
 }
@@ -407,7 +407,7 @@ pub fn run(ctx: &Ctx, opts: &Options, deps: &Deps<'_>, tx: &Transcript) -> Resul
 }
 
 fn notice(ctx: &Ctx, opts: &Options, deps: &Deps<'_>, state: &LaneState, message: &str) {
-    report::notify_once(
+    report::record_once(
         deps.notifier,
         TITLE,
         &state.dir,
@@ -596,7 +596,7 @@ fn locked(
             "DRY_RUN — would pack: {}; would publish index {} pinning: {}; packed but HELD: {}; \
              bundle lane: {}; no clone/build/sign/upload/state change",
             list(candidates.iter().map(|r| r.program.name)),
-            n + 1,
+            n.saturating_add(1),
             list(pin_now.iter().copied()),
             list(held.iter().copied()),
             list(bundles.iter().map(|r| r.program.name)),
@@ -728,7 +728,7 @@ fn locked(
     }
     tx.say(format!(
         "publishing atpkg-index-{} (baseline index-{n}) to {slug}",
-        n + 1
+        n.saturating_add(1)
     ));
     let published = deps
         .indexer
@@ -746,7 +746,7 @@ fn locked(
             Error::refused(format!(
                 "index {} did not publish ({e}) — the packed builds are on staging and the next \
                  run resumes at the index step",
-                n + 1
+                n.saturating_add(1)
             ))
         })?;
     state.record(published.index_build, TARGETS, &moved)?;
@@ -1024,11 +1024,13 @@ pub fn newest_signed_tag(releases: &[Release]) -> Option<String> {
 
 fn semver(tag: &str) -> Option<(u64, u64, u64)> {
     let mut parts = tag.strip_prefix('v')?.split('.');
-    let v = (
-        parts.next()?.parse().ok()?,
-        parts.next()?.parse().ok()?,
-        parts.next()?.parse().ok()?,
-    );
+    let mut next = || {
+        let s = parts.next()?;
+        (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| s.parse().ok())
+            .flatten()
+    };
+    let v = (next()?, next()?, next()?);
     parts.next().is_none().then_some(v)
 }
 

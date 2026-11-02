@@ -14,8 +14,8 @@
 //! or a later table of its own, never earlier than the day before the one its `until` falls in, so
 //! every row of a table lapses before the day after next begins; each Mac deletes a day's table
 //! then, on its own clock. Of two rows from one Mac the one in the later table wins, then the
-//! higher counter. A day table takes [`Caps`] rows, then the next day's. Revision and retry checks
-//! cover every table read, under one writer.
+//! higher counter. A day table takes [`Caps`] records, then the next day's.
+//! Revision and retry checks cover every table read, under one writer.
 //!
 //! An F19 build from before the ring wrote `accounts/claims/1`, rolling to `claims.2` through
 //! `claims.6`. A ring Mac that finds that declaration declares the same table at version 2, once
@@ -54,8 +54,9 @@ const LEGACY_GENERATIONS: u32 = 6;
 const COLLECTION: &str = "row";
 const COMMAND_DOMAIN: &[u8] = b"aterm/accounts/claims/command/1\0";
 
-/// How many rows one day table takes, in all and from one writer, before a write spills into the
-/// next day's: below the store's 8192 records, so the two sides of a split each fill no more than
+/// How many retained records one day table takes, in all and from one writer,
+/// before a write spills into the next day's: below the store's 8192 records,
+/// so the two sides of a split each fill no more than
 /// a heal can merge in most of it.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Caps {
@@ -199,6 +200,8 @@ fn machines(session: &Session<'_>) -> BTreeMap<Actor, [u8; 16]> {
         .map(|binding| (binding.actor(), *binding.machine()))
         .collect()
 }
+
+use crate::table::binding_denied_in_roster;
 
 /// A writer's latest row and the table it was read from.
 struct Latest {
@@ -344,12 +347,15 @@ fn legacy_logs(
 
 /// Whether this writer has no room left in the day table `epoch` of `logs`.
 fn full(logs: &[(Source, Log)], epoch: u64, actor: Actor, caps: Caps) -> bool {
-    logs.iter()
+    let (records, writer_records, needed) = logs
+        .iter()
         .find(|(source, _)| *source == Source::Ring(epoch))
-        .is_some_and(|(_, log)| {
+        .map_or((0, 0, 1), |(_, log)| {
             let (records, writer_records) = log.retained_counts(actor);
-            records >= caps.records || writer_records >= caps.writer_records
-        })
+            (records, writer_records, log.append_records_bound())
+        });
+    needed > caps.records.saturating_sub(records)
+        || needed > caps.writer_records.saturating_sub(writer_records)
 }
 
 /// The day table a row that lapses at `until` goes into, by the clock `now` and this Mac's ring
@@ -370,7 +376,7 @@ fn full(logs: &[(Source, Log)], epoch: u64, actor: Actor, caps: Caps) -> bool {
 ///
 /// # Errors
 /// The clock is behind the floor, the row lapses beyond the window's last day, or both its tables
-/// are full.
+/// lack room for the complete append, including its causal joins.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -417,6 +423,8 @@ pub fn read(paths: &Paths) -> Result<Read> {
 }
 
 fn read_at(paths: &Paths, now: u64, caps: Caps) -> Result<Read> {
+    let selected = crate::generation::selected(paths)?;
+    let paths = &selected;
     let deadline = Instant::now() + Duration::from_secs(2);
     let bootstrap = Bootstrap::required_until(paths, deadline).map_err(crate::table::failure)?;
     let session = Session::observe(&bootstrap)?;
@@ -427,30 +435,86 @@ fn read_at(paths: &Paths, now: u64, caps: Caps) -> Result<Read> {
     logs.extend(legacy_logs(&session, &directory, &bootstrap, now));
     let machines = machines(&session);
     let latest = latest(&logs, &machines);
-    let writable = session
-        .may_write()
-        .and_then(|()| {
-            for (_, log) in &logs[..ring] {
-                log.writable(session.actor())?;
-            }
-            target(
-                &state,
-                now,
-                own_epoch(latest.get(&session.actor())),
-                0,
-                |epoch| full(&logs[..ring], epoch, session.actor(), caps),
-            )
-            .map(drop)
-        })
-        .map_err(|why| why.to_string());
+    let roster = aterm_secrets::client::swarm_roster(paths).ok().flatten();
+    let local_denied = aterm_secrets::client::local_recipient_denied_in_roster(paths)
+        || roster.as_ref().is_some_and(|r| {
+            session
+                .members()
+                .iter()
+                .find(|b| b.actor() == session.actor())
+                .is_some_and(|b| binding_denied_in_roster(r, b))
+        });
+    let writable = if local_denied {
+        Err("this Mac is denied in the swarm roster".to_owned())
+    } else {
+        session
+            .may_write()
+            .and_then(|()| {
+                for (_, log) in &logs[..ring] {
+                    log.writable(session.actor())?;
+                }
+                target(
+                    &state,
+                    now,
+                    own_epoch(latest.get(&session.actor())),
+                    0,
+                    |epoch| full(&logs[..ring], epoch, session.actor(), caps),
+                )
+                .map(drop)
+            })
+            .map_err(|why| why.to_string())
+    };
+    let denied_actors: std::collections::BTreeSet<Actor> = match &roster {
+        Some(r) => session
+            .members()
+            .iter()
+            .filter(|b| b.actor() != session.actor() && binding_denied_in_roster(r, b))
+            .map(aterm_secrets::commons::binding::Binding::actor)
+            .collect(),
+        None => std::collections::BTreeSet::new(),
+    };
     Ok(Read {
         me: me(&session, &machines)?,
         rows: latest
-            .into_values()
-            .map(|latest| (latest.machine, latest.body))
+            .into_iter()
+            .filter(|(actor, _)| !denied_actors.contains(actor))
+            .map(|(_, latest)| (latest.machine, latest.body))
             .collect(),
         writable,
     })
+}
+
+/// Hand this Mac's latest row to its peers now through `pusher`, this process's Commons runtime
+/// ([`crate::runtime::Pusher::push_until`]): each round the runtime begins repairs the day table
+/// that holds the row first, until a round that began after the ask caught a peer up on it, or
+/// `deadline`.
+/// What a Mac does as it goes to sleep or stops, when no later round of its own may come.
+///
+/// # Errors
+/// This Mac has no Commons or is not a member, a day table it holds cannot be read, or no ring
+/// table holds a row of its.
+pub fn push(
+    paths: &Paths,
+    pusher: &crate::runtime::Pusher,
+    deadline: Instant,
+) -> Result<crate::runtime::Pushed> {
+    let table = own_table(paths, now()?, deadline)?;
+    Ok(pusher.push_until(table, deadline))
+}
+
+/// The day table that holds this writer's latest ring row (its scope digest), read without the
+/// table's writer lock or enrolling any table.
+fn own_table(paths: &Paths, now: u64, deadline: Instant) -> Result<astream_wire::sync::Digest> {
+    let admission = deadline.min(Instant::now() + Duration::from_secs(2));
+    let bootstrap = Bootstrap::required_until(paths, admission).map_err(crate::table::failure)?;
+    let session = Session::observe(&bootstrap)?;
+    let directory = Directory::new(paths, bootstrap.trust());
+    let state = directory.ring_view(&session, &CLAIMS);
+    let logs = ring_logs(&session, &directory, &state, now)?;
+    let latest = latest(&logs, &machines(&session));
+    let epoch = own_epoch(latest.get(&session.actor()))
+        .ok_or_else(|| Error::new("no claims table holds this Mac's row"))?;
+    Ok(CLAIMS.scope(directory.trust(), epoch)?.digest())
 }
 
 /// The day of this writer's latest ring row.
@@ -522,11 +586,27 @@ pub fn write(paths: &Paths, body: &Value) -> Result<()> {
     )
 )]
 fn write_at(paths: &Paths, body: &Value, now: u64, caps: Caps) -> Result<()> {
+    let selected = crate::generation::selected(paths)?;
+    let paths = &selected;
     let deadline = Instant::now() + Duration::from_secs(2);
     let (bootstrap, journal) =
         Bootstrap::required_with_journal_until(paths, deadline).map_err(crate::table::failure)?;
     let session = Session::from_admitted_journal(&bootstrap, journal)?;
     session.writer()?;
+    if aterm_secrets::client::local_recipient_denied_in_roster(paths)
+        || aterm_secrets::client::swarm_roster(paths)
+            .ok()
+            .flatten()
+            .is_some_and(|r| {
+                session
+                    .members()
+                    .iter()
+                    .find(|b| b.actor() == session.actor())
+                    .is_some_and(|b| binding_denied_in_roster(&r, b))
+            })
+    {
+        return Err(Error::new("this Mac is denied in the swarm roster"));
+    }
     let machines = machines(&session);
     let machine = me(&session, &machines)?;
     let command = command(&machine, body)?;
@@ -578,7 +658,7 @@ fn write_at(paths: &Paths, body: &Value, now: u64, caps: Caps) -> Result<()> {
         full(&logs[..ring], epoch, session.actor(), caps)
     })?;
     let mut store = directory.enroll_ring(&session, &CLAIMS, epoch, now)?;
-    store.commit_catalog(&session, &encoded)?;
+    crate::documents::application::append(&session, &mut store, &encoded)?;
     Ok(())
 }
 
@@ -623,3 +703,6 @@ pub fn db_claim_ring_environment() {}
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod frontier_tests;

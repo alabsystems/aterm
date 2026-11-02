@@ -167,7 +167,20 @@ fn segment_heads_must_be_known_reads() {
     assert!(ro("for f in *; do ls $f; done"));
     assert!(ro("VAR=1 OTHER=2 ls"));
     assert!(ro("timeout 5 ls; timeout -k 1 5 git status"));
+    assert!(ro(
+        "timeout -s TERM 5 ls; timeout --signal=TERM 5 ls; timeout --signal TERM 5 ls"
+    ));
+    assert!(!ro("timeout -s ls 5 rm -rf /"));
+    assert!(!ro("timeout 5 10s ls"));
+    assert!(!ro("timeout 5 1.sh ls"));
+    assert!(!ro("timeout 5 .sh ls"));
+    assert!(!ro("timeout 5 . ls"));
     assert!(ro("git -C ~/x --no-pager log -1"));
+    assert!(ro("git --namespace ns status"));
+    assert!(!ro("git --namespace status push --force"));
+    assert!(!ro("git --super-prefix status push --force"));
+    assert!(!ro("git --attr-source status push --force"));
+    assert!(!ro("git --attr-source=HEAD status"));
     assert!(!ro("git --git-dir=.git status"));
     assert!(ro("git worktree list; git stash list"));
     assert!(!ro("git worktree"));
@@ -244,6 +257,14 @@ fn a_wrapper_cannot_launder_the_program_it_runs() {
     assert!(ro("env -uSOME ls"));
     assert!(!ro("env -iS 'rm x'"));
     assert!(!ro("env --split-string='rm x'"));
+    assert!(!ro("env --split='rm x'"));
+    assert!(!ro("env -a ls rm -rf /"));
+    assert!(!ro("env --argv0 ls rm -rf /"));
+    assert!(!ro("env --argv0=ls rm -rf /"));
+    assert!(!ro("ls | xargs -0I ls rm -rf /"));
+    assert!(!ro("ls | xargs --max-args 1 rm -rf /"));
+    assert!(!ro("ls | xargs 2>/dev/null -n 1 ./deploy.sh"));
+    assert!(!ro("env 2>/dev/null -u FOO ./deploy.sh"));
 }
 
 #[test]
@@ -2548,7 +2569,7 @@ fn a_plain_line_expands_nothing() {
         "x > /dev/null",
         "2>/dev/null ls; </dev/null ls for; < f cat",
         "# $(rm -rf /) is a comment\nls",
-        "ls a#b",
+        "ls 'a#b' \"a^b\"",
         "find . -name '*.rs' -type f",
         "sort -t= -k2 f --key=1",
         "grep -rn \"TODO: fix {x}!\" src",
@@ -2604,6 +2625,9 @@ fn a_plain_line_expands_nothing() {
         "ls \u{1b}[2J",
         "ls 'open",
         "ls \"open",
+        "ls a#b",
+        "ls ^x",
+        "git show HEAD^",
     ] {
         assert!(plain_zsh_line(line).is_err(), "{line:?} must not be plain");
     }

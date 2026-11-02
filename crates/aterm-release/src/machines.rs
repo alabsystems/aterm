@@ -25,11 +25,11 @@ pub struct MachineIdentity {
 impl MachineIdentity {
     /// Read the identity from `path`.
     pub fn read(path: &Path) -> Result<Option<Self>> {
-        if !path.exists() {
-            return Ok(None);
-        }
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| Error::new(format!("read {}: {e}", path.display())))?;
+        let text = match crate::durable::read_regular_text(path, 64 * 1024) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(Error::new(format!("read {}: {e}", path.display()))),
+        };
         let identity: Self = aterm_toml::from_str(&text)
             .map_err(|e| Error::new(format!("parse {}: {e}", path.display())))?;
         if identity.id.is_empty() || identity.pubkey.is_empty() {
@@ -89,20 +89,21 @@ impl RosterDocument {
     /// Read both halves, naming whichever is missing.
     pub fn read(roster: &Path) -> Result<Self> {
         let signature_path = Self::signature_path(roster);
-        let bytes = std::fs::read(roster).map_err(|e| {
+        let bytes = crate::durable::read_regular_bytes(roster, 65_536).map_err(|e| {
             Error::new(format!(
                 "read the machine roster {}: {e} — `machine_roster` in the \
                  release-credentials profile names it, so the cut cannot proceed without it",
                 roster.display()
             ))
         })?;
-        let signature = std::fs::read(&signature_path).map_err(|e| {
-            Error::new(format!(
-                "read the machine roster's master signature {}: {e} — it must sit beside \
+        let signature =
+            crate::durable::read_regular_bytes(&signature_path, 4_096).map_err(|e| {
+                Error::new(format!(
+                    "read the machine roster's master signature {}: {e} — it must sit beside \
                  the roster (`atpkg-keys setup`/`join` writes both)",
-                signature_path.display()
-            ))
-        })?;
+                    signature_path.display()
+                ))
+            })?;
         Ok(Self { bytes, signature })
     }
 }
@@ -157,7 +158,7 @@ pub(crate) fn roster_lineage_agrees(
 /// signature): a floor read never accepts more than the fleet would.
 fn anonymous_fetch(url: &str, cap: usize) -> std::result::Result<Vec<u8>, String> {
     let cap_s = cap.to_string();
-    let out = std::process::Command::new(aterm_uds::os_path!("curl"))
+    let out = aterm_uds::spawnfd::command(aterm_uds::os_path!("curl"))
         .args([
             "-fsSL",
             "--proto",
@@ -463,5 +464,22 @@ mod tests {
             "release-ring/machine.toml wins over ~/.aterm/machine.toml"
         );
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn machine_identity_and_roster_refuse_symlinks() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.toml");
+        std::fs::write(&real, "id = \"m3\"\npubkey = \"abc\"\n").unwrap();
+        let link = dir.path().join("machine.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(MachineIdentity::read(&link).is_err());
+
+        let roster = dir.path().join("aterm-machines.toml");
+        let sig = super::RosterDocument::signature_path(&roster);
+        std::fs::write(&sig, b"sig").unwrap();
+        std::os::unix::fs::symlink(&real, &roster).unwrap();
+        assert!(super::RosterDocument::read(&roster).is_err());
     }
 }

@@ -3,64 +3,43 @@
 
 # aterm-tty: Trust specs
 
-> Status 2026-10-20 (amacs slice TR1). aterm-tty is on the Trust lane with a committed floor
-> (`crates/aterm-release/trust/floors.tsv`: `aterm-tty 208 696`). Ten contracts on the decoder's
-> byte classes are proved, each by a Clean theorem about the compiled function, and each one's
-> negative control was run. §3 lists the properties that are not provable today, with the exact
-> refusal for each, and §4 lists every obligation the lane leaves open in the crate's own code.
+What the Trust lane proves, refuses and leaves open in this crate: §1 the decoder's proved
+byte-class contracts, §2 their negative controls, §3 the properties not provable today with the
+exact refusal for each, and §4 every obligation the lane leaves open in the crate's own code. The
+contracts and islands are in `src/decode.rs`, the macros in `src/lib.rs`, and the crate's floor is
+its row in `crates/aterm-release/trust/floors.tsv`.
 
-Source: `crates/aterm-tty/src/decode.rs` holds the contracts and islands, and the macros are in
-`src/lib.rs`. Every number and quoted refusal below was measured, never inferred. The prover is
-the lane's, `/Users//example/toolchains/trust-41d79979/bin`, which prints itself as
-`targo 1.99.0-dev (41d799797 2026-10-16) (targo 0.10.0+g41d799797)`. The texts come from three
-kinds of run:
+Verdicts and refusals are quoted as prover `41d79979` printed them (`targo 1.99.0-dev (41d799797
+2026-10-16)`) unless a row names another:
 
-- **Lane runs.** §1, §2, §4 and the §3 rows that name a lane obligation come from lane runs. Re-measure
-  them with `targo --unverified ship trust run -p aterm-tty --obligations`.
-- **Standalone copies.** The E6, clause and tactic refusals in §3 come from compiling a standalone
-  copy of each candidate (`blk::…`, `t::…`, `e2`) with the same prover's `trustc` under
-  verification. Every such candidate was refused, so the crate carries no contract in its refused
-  form (`utf8_len` returning `usize` became the `u8` contract of §1).
-- **The dev seal.** The `dev-seal-theorem` row was measured by compiling a standalone copy of
-  three contracts as crate `aterm_tty` with the seal on `PATH` (`321aaeda7`), and the same copy
-  with the lane's `trustc`.
+- §1, §2, §4 and the §3 rows that name a lane obligation come from lane runs;
+  `targo --unverified ship trust run -p aterm-tty --obligations` re-measures them.
+- The other §3 refusals (E6 admission of `blk::…`, clause and tactic refusals) come from
+  standalone copies of each candidate, compiled with the same prover's `trustc` under
+  verification. The crate carries none of them in its refused form.
+- `dev-seal-theorem` comes from a standalone copy of three contracts compiled as crate
+  `aterm_tty` by the seal on `PATH` (`321aaeda7`).
 
 ## 0. How a contract is written
 
-- **The contract.** A contracted fn goes through `trust_contract_fn!`, the idiom of `aterm-log`.
-  Under Trust's verifying session (`cfg(trust_verify)`), the fn carries
-  `ensures result == SPEC by THEOREM`. Every other compiler gets the plain fn: stock rustc in the
-  foreign cells, and Trust with verification off.
-- **The specs.** The specs are Clean `def`s in a `spec_island!`, which compiles under
-  `cfg(clean_islands)`. `build.rs` sets that cfg whenever the compiler is Trust, so the specs are
-  kernel-checked at every Trust build. They are transcriptions of the standards' tables and name
-  no import. The lemma `ite_and_split`, which `utf8_len`'s proof uses, is in the same island.
-- **The theorems.** The theorems are in `verify_island!`s, which compile under `cfg(trust_verify)`
-  only. Each is stated over `trust_import_aterm_tty__decode__<fn>`, the kernel definition Trust
-  mints from the compiled body, and Trust mints it only while it verifies. There is one island per
-  theorem, so a refusal names its own theorem.
-- **Why the lemma's proof reduces instances.** `ite_and_split` is proved by
-  `cases dp <;> cases dq <;> rfl`, which the seal on `PATH` (`321aaeda7`) and the lane's prover
-  (`41d79979`) both check. The seal refused the earlier proof,
-  `by_cases hp : P <;> by_cases hq : Q <;> simp only […]`, with
-  `` `ite_and_split` did not elaborate: Tactic failed: simp: no progress made ``, which kept the
-  lemma out of the spec island until this proof replaced it.
-- **The `u8` return.** `utf8_len` returns `u8` rather than `usize` so that its clause types at
-  the parameter's carrier (§3, `usize-result-carrier`). The callers widen the result with
-  `usize::from`.
+- `trust_contract_fn!` (as in `aterm-log`) gives the fn `ensures result == SPEC by THEOREM` under
+  Trust's verifying session (`cfg(trust_verify)`), and the plain fn under every other compiler.
+- The three `u8` classes' specs are Clean `def`s in a `spec_island!`, compiled under
+  `cfg(clean_islands)`, which `build.rs` sets whenever the compiler is Trust, so every Trust build
+  kernel-checks them. They transcribe the standards' tables and import nothing. The lemma
+  `ite_and_split`, which `utf8_len`'s proof uses, is in the same island. The bool classes state
+  their range inline in the clause.
+- Each theorem is in its own `verify_island!` (compiled under `cfg(trust_verify)` only), so a
+  refusal names its theorem. It is stated over `trust_import_aterm_tty__decode__<fn>`, the kernel
+  definition Trust mints from the compiled body while it verifies.
+- `utf8_len` returns `u8`, not `usize`, so its clause types at the parameter's carrier (§3
+  `usize-result-carrier`); callers widen it with `usize::from`.
 
 ## 1. Proved specs (TSV)
 
-Columns:
-
-- `id`
-- `statement`, the property proved for every input
-- `fn`, the contracted function in `src/decode.rs`
-- `theorem`, the cited Clean theorem
-- `verdict`, as the lane printed it
-- `prover`
-- `negative control`, the mutation, then the lane's refusal with the file restored byte for byte
-  afterwards (§2)
+`statement` is the property proved for every input, `fn` the contracted function in
+`src/decode.rs`, `theorem` the cited Clean theorem, `verdict` the lane's line, and
+`negative control` the mutation and the lane's refusal of it (§2).
 
 ```tsv
 id	statement	fn	theorem	verdict	prover	negative control
@@ -76,65 +55,35 @@ csi-final	∀ b: u8, is_csi_final(b) ⇔ 40 ≤ b ≤ 7E (ECMA-48 §5.4: 04/00-0
 string-control	∀ b: u8, is_string_control(b) ⇔ b ≤ 1F ∨ b = 7F (C0 or DEL, which inside a DCS/OSC string means the string was typed keys)	is_string_control	string_control_is_c0_or_del	[VERIFIED] (6 obligations: 6 proved, 0 runtime-checked, 0 failed, 0 unknown); postcondition PROVED (clean-kernel-citation, CONSTRUCTIVE (certified; validation=kernel-rechecked, closure=empty, coverage=unbounded, execution=unmonitored, reflection=unrecorded))	41d79979	0x00..=0x1F | 0x7F → 0x00..=0x1F: `string_control_is_c0_or_del` rejected (UnsolvedGoals after `simp`), is_string_control [VIOLATIONS]
 ```
 
-Lane totals on prover 41d79979, as the lane printed them:
+The decoder tests bytes through these classes, so a proof about a class covers the byte the
+decoder tests:
 
-- **Baseline** (origin/main `3eda2d3d76`, before this slice): `aterm-tty NO-FLOOR 174/751`.
-- **First floor** (`57fe49ee50`, eight contracts): `aterm-tty FLOOR-RECORDED 199/686`.
-- **Final** (`02d4360577`, `--obligations --update-ratchet`): `aterm-tty open 208 696` and
-  `TOTAL: 208/696 proved`, exit 0. The floor row is `aterm-tty 208 696`.
-
-From the baseline to the first floor the total fell, because the checked and saturating rewrites
-(§4 lists what stays open) remove obligations outright. A `split_at` becomes a
-`split_at_checked`, and an `a + b` becomes a `saturating_add`, so neither has a panic left to
-prove. From the first floor to the final count:
-
-- The two parameter classes add 8 proved postconditions.
-- `Screen::new`'s `unbounded_allocation` obligation is now proved. At `57fe49ee50` it failed with
-  `count = 268435456`, because the solver loses the product of the two clamped sides. `Screen::new`
-  now checks the product against `MAX_CELLS` (`MAX_SIDE` squared, which the product never
-  exceeds) before it allocates, so the bound stands where the obligation is checked.
-
-The decoder reads the two standards through these classes at these sites:
-
-- `utf8_lead` takes its sequence length and its second-byte bounds from `utf8_len`,
-  `utf8_second_min` and `utf8_second_max`, where before it held a second copy of Table 3-7.
-- The byte after a lead must fall in that range (the `Utf8` state). Every byte after it must pass
-  `is_utf8_continuation` (the `Utf8Tail` state), where before the state held 80 and BF as
-  literals.
-- `trim_partial_char` uses `is_utf8_continuation` and `utf8_len`, and `first_char` uses
-  `utf8_len`.
+- `utf8_lead` takes its sequence length and second-byte bounds from `utf8_len`,
+  `utf8_second_min` and `utf8_second_max`. The `Utf8` state holds the second byte to those
+  bounds, and the `Utf8Tail` state tests every later byte with `is_utf8_continuation`.
+- `trim_partial_char` uses `is_utf8_continuation` and `utf8_len`; `first_char` uses `utf8_len`.
 - `csi` splits a body into its private marker, parameters and intermediates with
   `is_csi_private_marker`, `is_csi_parameter` and `is_csi_intermediate`.
 - `step` uses `is_csi_body` and `is_csi_final` in the CSI, SS3 and DCS states, and
   `is_string_control` inside DCS and OSC strings.
 
-At those sites a proof about a class is a proof about the byte the decoder tests. Three byte sets
-are still literals, because no class of the two standards is theirs:
-
-- SS3's parameters, `0`-`9` and `;`. They are an xterm extension, and ECMA-48 gives SS3 no
-  parameters.
-- An OSC number: `is_ascii_digit`, then `;`.
-- The letters that follow ESC: `[`, `O`, `P` and `]`.
+Three byte sets stay literals, since neither standard has a class for them: SS3's parameters
+`0`-`9` and `;` (an xterm extension; ECMA-48 gives SS3 none), an OSC number (`is_ascii_digit`,
+then `;`), and the letters after ESC (`[`, `O`, `P`, `]`).
 
 ## 2. Negative controls
 
-For each contract, one lane run (`targo --unverified ship trust run -p aterm-tty --obligations`)
-was made on a `decode.rs` with that one mutation. The file was then copied back, and `cmp` against
-the saved original and `git diff --quiet HEAD` both passed before the next run. The table quotes
-each run's refusal of the theorem and the verdict line of the fn.
+Each row is one lane run (`targo --unverified ship trust run -p aterm-tty --obligations`) on a
+`decode.rs` carrying that one mutation, restored byte for byte before the next run. It quotes the
+theorem's refusal and the fn's verdict line.
 
-- **One rejection per run.** In every run, the mutated theorem's island was the only island
-  rejected. The fill script asserted this by counting the `Clean island declaration rejected`
-  lines. The rejection taints the crate's Clean environment, so each run then reports every
-  citation as `cannot be validated … tainted`. That is why each run's proved count is 11 to 14
-  below the unmutated 199 on `a6bb4b6a2c`, and 13 to 14 below the unmutated 208 on `02d4360577`.
-- **The bool classes fail twice.** For the five bool classes, the full verifier also refutes the
-  postcondition on its own, with a verified counterexample.
-- **The trees.** Eight runs were made on `a6bb4b6a2c`, before the floor was recorded, so their
-  lane verdicts read `NO-FLOOR`. Their fns and theorems are unchanged since then, and the line
-  numbers they quote are that tree's. Three runs were made on `02d4360577`, after the floor of
-  199 was recorded, so theirs read `RATCHET-REGRESSION(<199)`. Those three are the two new
-  contracts and `utf8_len`, whose lemma's proof changed.
+- The mutated theorem's island is the only one rejected, but the rejection taints the crate's
+  Clean environment, so every citation in that run then reads `cannot be validated … tainted`.
+- For the bool classes the full verifier also refutes the postcondition on its own, with a
+  verified counterexample (`[VIOLATIONS]`).
+- `tree` is the commit measured, and line numbers are that tree's. Runs on `a6bb4b6a2c` predate
+  the floor (`NO-FLOOR`); runs on `02d4360577` were held to an earlier floor of 199
+  (`RATCHET-REGRESSION(<199)`).
 
 ```tsv
 fn	tree	mutation	theorem refusal	fn verdict	lane verdict
@@ -153,8 +102,7 @@ is_string_control	a6bb4b6a2c	0x00..=0x1F | 0x7F → 0x00..=0x1F	`string_control_
 
 ## 3. Not provable today (TSV)
 
-Columns: `id`, `property`, `where`, `refusal or gap (exact text, prover 41d79979 unless noted)`
-and `what would make it provable`.
+`refusal or gap` quotes the prover's text exactly.
 
 ```tsv
 id	property	where	refusal or gap	what would make it provable
@@ -171,22 +119,13 @@ probe-deadline	probe's `tty.now() + PROBE_TIMEOUT` never overflows	probe.rs:94	[
 ffi-rows	raw-mode termios, signal and fd calls are sound	raw.rs, signals.rs, tty.rs (DevTty::read, size_of_fd)	hardened_unsafe_operation failed and hardened_ffi_boundary/hardened_panic_boundary unknown on every `unsafe` libc call (tcgetattr/tcsetattr, sigaction, pipe, read/write, ioctl, kill, errno)	Trust contracts for the libc functions themselves; nothing in this crate can discharge them
 ```
 
-`Screen::new`'s allocation bound, a row here at `57fe49ee50`, is proved since `02d4360577` (§1).
-
 ## 4. Every obligation left open in the crate's own code (TSV)
 
-This section is the worklist for the next prover. It covers all 488 obligations of the final lane
-run (`02d4360577`) that are not proved: 696 total less 208 proved, which is 234 unknown, 194
-runtime-checked, 52 failed and 8 design requirements. They are grouped by the lane's reason, and
-each group gives:
-
-- the count, split by status and kind;
-- up to two distinct texts, exactly as the lane printed them;
-- where the rows are: `file:line`, or the count per file for a group of more than 16 sites;
-- what the rows are.
-
-The full per-row list is `target-trust.noindex/logs/aterm-tty@<version>.log.oblig.tsv` after
-`targo --unverified ship trust run -p aterm-tty --obligations`.
+The worklist for the next prover: every obligation of the lane run on `02d4360577` that is not
+proved, grouped by the lane's reason. `reason` quotes up to two distinct texts exactly; `where`
+gives `file:line` on that tree, or rows per file for a group of more than 16 sites. The per-row
+list is `target-trust.noindex/logs/aterm-tty@<version>.log.oblig.tsv` after a lane run with
+`--obligations`.
 
 ```tsv
 id	rows	status and kind	reason (exact lane text)	where	reading
@@ -229,19 +168,17 @@ raw-path	1	1 unknown hardened_raw_path_api	hardened boundary (raw_path_api): std
 
 Two groups index on an invariant the lane cannot state (`cells.len() = rows·cols`): `slice-bounds`
 (§3 `screen-at-get-bounds`) and `slice-range`. `callee-return`, `owned-vec-slice` and `index` are
-in range by their own code. The rest are `unsafe` and FFI sites Trust has no model for, calls whose
-bodies are not in the lowered bundle, std's and rustc's own checks, and deliberate fallbacks.
+in range by their own code. The rest are `unsafe` and FFI sites Trust has no model for, calls
+whose bodies are not in the lowered bundle, std's and rustc's own checks, and deliberate
+fallbacks.
 
 ## 5. Tests
 
-No test is deleted. The proved classes are each a few bytes of a table, and no existing test
-samples a class on its own. The decoder's tests (`tests/decode_differential.rs`) are
-whole-decoder round trips through aterm's encoders, the writer's (`tests/screen_oracle.rs`) are
-differential checks against aterm's grid, and the proofs do not subsume them. Two tests were
-added:
-
-- `screen::tests::a_frame_is_clamped_to_the_grid_size_limit` pins the `MAX_SIDE` clamp, the one
-  behaviour this slice changed (frames past 4096 rows or columns).
-- `decode_differential::a_broken_character_reads_as_from_utf8_lossy_reads_it` pins the
-  `Utf8`/`Utf8Tail` split. A second byte outside its lead's range, and a third or fourth byte
-  that is not a trailing byte, decode exactly as `String::from_utf8_lossy` reads them.
+No test is subsumed: each proved class is a few bytes of a table, and no test samples a class on
+its own. The decoder's tests (`tests/decode_differential.rs`) are whole-decoder round trips
+through aterm's encoders, and the writer's (`tests/screen_oracle.rs`) are differential checks
+against aterm's grid. `screen::tests::a_frame_is_clamped_to_the_grid_size_limit` pins the
+`MAX_SIDE` clamp (4096 rows or columns), and
+`decode_differential::a_broken_character_reads_as_from_utf8_lossy_reads_it` pins the
+`Utf8`/`Utf8Tail` split: a second byte outside its lead's range, or a later byte that is not a
+trailing byte, decodes as `String::from_utf8_lossy` reads it.

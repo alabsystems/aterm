@@ -220,6 +220,15 @@ pub fn read_bounded(path: &Path) -> Result<Vec<u8>, String> {
         ));
     }
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let open_meta = file.metadata().map_err(|e| e.to_string())?;
+    if !open_meta.is_file() {
+        return Err("not a regular file".to_string());
+    }
+    if open_meta.len() > MAX_IMPORT_BYTES as u64 {
+        return Err(too_large(
+            usize::try_from(open_meta.len()).unwrap_or(usize::MAX),
+        ));
+    }
     let mut bytes = Vec::new();
     file.take(MAX_IMPORT_BYTES as u64 + 1)
         .read_to_end(&mut bytes)

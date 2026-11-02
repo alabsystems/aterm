@@ -1,54 +1,43 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-hash: spec recovery from its 6 unit tests
+# aterm-hash: spec recovery from its unit tests
 
-> Status: migration worklist (`crates/aterm-release/trust/floors.tsv` tracks the obligation floor).
-> Each of the 6 specs below is to be proved through Trust/Clean about the compiled Rust functions;
-> then the tests it subsumes are deleted. `fnv1a_64_extend` delegates to `astream_wire::hash::fnv1a_64_update`,
-> `FNV64_OFFSET` is `astream_wire::hash::FNV1A_64_INIT` and `FNV64_PRIME` is
-> `astream_wire::hash::FNV1A_64_PRIME`. `fnv_mix_u64` computes astream-wire's `fnv1a_64_mix_u64`
-> here rather than calling it. `HASH-FNV-1` and `HASH-FNV-2` cite a refinement
-> `ensures` on `fnv1a_64_update` (`fnv1a_64_update(h, bs) = fnvRef(h, bs)`). astream-wire has the
-> fold's Clean theorems (`Astream.Wire.TlaSlicingCrc32`: `fnv1a_64_fold`, `fnv1a_64_fold_append`,
-> `fnv1a_64_update_init_eq_model`), but a direct `#[ensures]` on that slice function is still open
-> on the toolchain side (`vendor/astream/docs/ROADMAP.md`, "Functional contracts aterm cites"); once
-> it lands, it connects here through gap 12.
+Each row of §1 is a spec to prove through Trust/Clean about the compiled Rust functions of
+`crates/aterm-hash` (`src/fnv.rs`, `src/lib.rs`); the tests it subsumes are then deleted. The
+FNV-1a/64 loop is astream-wire's `fnv1a_64_update`, so HASH-FNV-1 and HASH-FNV-2 wait on its
+refinement `#[ensures]`, which is open on the toolchain side (`vendor/astream/docs/ROADMAP.md`,
+"Functional contracts aterm cites").
 
-Source: `crates/aterm-hash` (`src/fnv.rs` and `src/lib.rs`).
+## 0. Notation
 
-Result: **6 specs**, covering all **6 tests**.
-
-## 0. Notation used in the statements
-
-- All `u64` arithmetic is mod 2^64. `^` is XOR, `lo64(x) = x as u64` and `hi64(x) = (x >> 64) as u64`
-  for a `u128` x.
-- A byte slice `bs: &[u8]` is modelled as the Lean `List UInt8` `bs.toList`. `++` is list append.
-- **FNV-1a/64.** `P = FNV64_PRIME = 0x100000001b3` (= 2^40 + 0x1b3), `O = FNV64_OFFSET = 0xcbf29ce484222325`.
-  The reference fold is `fnvRef(h, bs) = List.foldl (fun h b => (h ^ b.toUInt64) * P) h bs`.
+- `u64` arithmetic is mod 2^64 and `^` is XOR. For a `u128` x, `lo64(x) = x as u64` and
+  `hi64(x) = (x >> 64) as u64`.
+- A slice `bs: &[u8]` is the Lean `List UInt8` `bs.toList`; `++` is list append.
+- **FNV-1a/64.** `P = FNV64_PRIME = 0x100000001b3` (2^40 + 0x1b3), `O = FNV64_OFFSET =
+  0xcbf29ce484222325`, and `fnvRef(h, bs) = List.foldl (fun h b => (h ^ b.toUInt64) * P) h bs`.
 - **Fx (rustc-hash 2.1), 64-bit target.** `K = 0xf1357aea2e62a9c5`, `add(h, w) = (h + w) * K`,
-  `fin(h) = rotl(h, 26)`. On the 32-bit arm (`cfg(target_pointer_width = "32")`) the same statements
-  hold with `K32 = 0x93d765dd`, `ROT = 15` and every `u64` split into two `usize` words.
-- `le64(bs, i) = Σ_{j<8} bs[i+j] · 2^(8j)` (that is, `u64::from_le_bytes(bs[i..i+8])`). `le32` is the
-  same over 4 bytes.
+  `fin(h) = rotl(h, 26)`. The 32-bit arm (`cfg(target_pointer_width = "32")`) uses
+  `K32 = 0x93d765dd`, rotation 15, and two `usize` words per `u64`.
+- `le64(bs, i)` = `u64::from_le_bytes(bs[i..i+8])`; `le32` is the same over 4 bytes.
 - `mm(x, y) = lo64(x·y) ^ hi64(x·y)` over the full 128-bit product.
-- `hbRef(bs)` is the rustc-hash 2.1 `hash_bytes` reference, written as a Lean function over
-  `List UInt8`. It starts from `s0 = SEED1`, `s1 = SEED2`.
-  - `len ≤ 16`, `len ≥ 8`: `s0 ^= le64(bs, 0)`, `s1 ^= le64(bs, len-8)`.
-  - `len ≤ 16`, `4 ≤ len < 8`: the same with `le32`.
+- `hbRef(bs)` is rustc-hash 2.1's `hash_bytes` as a Lean function over `List UInt8`, from
+  `s0 = SEED1`, `s1 = SEED2` (`PTZC` is `PREVENT_TRIVIAL_ZERO_COLLAPSE`):
+  - `8 ≤ len ≤ 16`: `s0 ^= le64(bs, 0)`, `s1 ^= le64(bs, len-8)`.
+  - `4 ≤ len < 8`: the same with `le32`.
   - `0 < len < 4`: `s0 ^= bs[0]`, `s1 ^= (bs[len-1] << 8) | bs[len/2]`.
-  - `len > 16`: one round per 16-byte block at each `off < len-16`, `off ≡ 0 (mod 16)`. A round
-    computes `t = mm(s0 ^ le64(bs, off), PTZC ^ le64(bs, off+8))` and then sets `(s0, s1) := (s1, t)`.
-    After the rounds, `s0 ^= le64(bs, len-16)` and `s1 ^= le64(bs, len-8)`.
+  - `len > 16`: for each `off < len-16` with `off ≡ 0 (mod 16)`,
+    `t = mm(s0 ^ le64(bs, off), PTZC ^ le64(bs, off+8))` and `(s0, s1) := (s1, t)`; then
+    `s0 ^= le64(bs, len-16)` and `s1 ^= le64(bs, len-8)`.
   - The result is `mm(s0, s1) ^ len`.
-- `hashOneFx(x)` = `fin` of the `FxHasher` state after std's `Hash::hash` for the primitive type of x,
-  starting from state 0. This is what `FxBuildHasher.hash_one(x)` returns.
+- `hashOneFx(x)` = `FxBuildHasher.hash_one(x)`: `fin` of the `FxHasher` state after std's
+  `Hash::hash` for x's primitive type, from state 0.
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes (primary tests; secondary in §2)`,
-`difficulty (Rust features the proof must handle)`, `blocking gaps (audit §7 numbers)`. Gap numbers
-are the rows of `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7.
+`subsumes` names the primary tests (the rest are in §2), `difficulty` the Rust features the
+proof must handle, and `blocking gaps` rows of the gap table in
+`docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7.
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking gaps
@@ -60,43 +49,10 @@ HASH-FX-2	equivalence	read_u32_le, read_u64_le, multiply_mix	∀ b: &[u8]: read_
 HASH-FX-3	refinement	hash_bytes, FxHasher::write	∀ bs: &[u8]: hash_bytes(bs) = hbRef(bs), and hash_bytes never panics (every range is in bounds: the loop runs only while off < len − 16, so off + 16 < len; the tail ranges need len > 16). FxHasher::write(bs) = write_u64(hash_bytes(bs)), so hash' = add(h, hash_bytes(bs) as usize) on 64-bit (32-bit adds both halves). Hence for a byte slice b that a Hash impl writes alone, hash_one returns fin(hash_bytes(b)·K). Loop invariant: off ≡ 0 (mod 16), off < len (equivalently off ≤ 16·⌈(len−16)/16⌉), and (s0, s1) equal the reference state after off/16 rounds; decreases len − off.	lib::test_fxhasher_bytes_match_rustc_hash	MEDIUM: while loop with stride 16 (invariant, decreases), slice ranges and slice patterns ([], [a], [a,b], [a,b,c], _), u64 XOR, len casts, composition with read_u64_le/read_u32_le/multiply_mix, &mut self	0,1,2,3,4,5,7
 ```
 
-### Distribution by kind (6)
-
-| kind | count | ids |
-|---|---|---|
-| refinement | 3 | HASH-FNV-1, HASH-FX-1, HASH-FX-3 |
-| equivalence | 1 | HASH-FX-2 |
-| invariant | 1 | HASH-FNV-3 |
-| other | 1 | HASH-FNV-2 (homomorphism) |
-
-### Gap histogram (audit §7)
-
-| gap | specs blocked |
-|---|---|
-| 0 seal publishes Clean rows | 6 |
-| 1 non-scalar carriers (slices as `List UInt8`) | 6 |
-| 3 E6 body widening (casts, shifts, bitwise, calls, loops) | 6 |
-| 5 quantified clauses | 6 |
-| 4 callee-ensures composition | 4 |
-| 2 `&self`/`&mut self` views, two-state | 3 |
-| 7 loops (HASH-FX-3; HASH-FNV-1's loop is astream-wire's) | 1 |
-| 11 generics (std's generic `Hash` impls) | 1 |
-| 12 cross-crate theorem citation (astream-wire's `fnv1a_64_update`: its fold theorems are in `Astream.Wire.TlaSlicingCrc32`, and its direct `#[ensures]` is still open on the toolchain side) | 2 |
-| 14 Clean elaborator (`native_decide` corollaries) | 1 |
-
-No spec is blocked by gap 0 alone. The closest are two scalar clauses: `fnv_mix_u64` (in HASH-FNV-1)
-and `multiply_mix` (in HASH-FX-2). Each needs gap 0 plus the XOR/cast/shift part of gap 3, and a
-two-binder quantifier (gap 5).
-
-### Proof dependency order
-
-HASH-FX-2 (`multiply_mix`, then the read helpers) → HASH-FX-3. HASH-FX-1 depends on HASH-FX-2
-only through its u128 path. HASH-FX-1 and HASH-FX-3 compose for `FxHasher::write`. On the FNV side,
-HASH-FNV-1 → HASH-FNV-2 → HASH-FNV-3.
-
 ## 2. Test → spec map (TSV)
 
-`primary` is the spec that retires the test. `also` lists the other specs the same test samples.
+`primary` is the spec that retires the test; `also` lists the other specs it samples. A test
+goes once its primary and every `also` spec are proved.
 
 ```tsv
 file	test	primary	also
@@ -109,7 +65,7 @@ src/lib.rs	test_fxhasher_bytes_match_rustc_hash	HASH-FX-3	HASH-FX-2, HASH-FX-1 (
 src/lib.rs	test_fxhasher_str_includes_terminator_byte	HASH-FX-3	HASH-FX-1 (write_u8(0xff), finish)
 ```
 
-## 3. Coverage
+## 3. Open findings
 
 - Each of the 7 tests maps to one of the 6 specs (§2).
 - Retiring `test_fxhasher_bytes_match_rustc_hash` and `test_fxhasher_str_includes_terminator_byte`
@@ -119,9 +75,9 @@ src/lib.rs	test_fxhasher_str_includes_terminator_byte	HASH-FX-3	HASH-FX-1 (write
   algorithm over all inputs, and the published vectors survive as `decide` corollaries that act as
   negative controls.
 
-## 4. Tests that are not spec samples
+## 4. Proof order
 
-None.
+No spec is blocked by gap 0 alone.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 

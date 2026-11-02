@@ -110,7 +110,7 @@ fn settled(pid: i32, exited: bool, limit: Duration) -> bool {
 /// so under load one read of [`alive`] can take a SIGKILLed child of ours for
 /// alive (`a_wait_that_runs_out_leaves_the_child_to_a_later_one`).
 fn ended_within(pid: i32, limit: Duration) -> bool {
-    let deadline = std::time::Instant::now() + limit;
+    let deadline = crate::stop::deadline_after(limit);
     loop {
         if !alive(pid) {
             return true;
@@ -126,21 +126,23 @@ fn ended_within(pid: i32, limit: Duration) -> bool {
     }
 }
 
-/// Returns `(pid, ppid)` pairs from a `ps` snapshot.
+/// `pid`'s kernel record ([`aterm_sysprobe::kproc::record`]); `None` for pid 0 or 1, a pid
+/// that is gone, or one whose record does not read.
+fn record(pid: i32) -> Option<aterm_sysprobe::kproc::Record> {
+    u32::try_from(pid)
+        .ok()
+        .filter(|p| *p > 1)
+        .and_then(aterm_sysprobe::kproc::record)
+}
+
+/// Every process's `(pid, ppid)`, from one read of the kernel's process table
+/// ([`aterm_sysprobe::kproc::records`]) with no program run; empty when it cannot be read.
 #[must_use]
 pub fn table() -> Vec<(i32, i32)> {
-    let Ok(out) = aterm_uds::spawnfd::command("/bin/ps")
-        .args(["-axo", "pid=,ppid="])
-        .output()
-    else {
-        return Vec::new();
-    };
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| {
-            let mut it = l.split_whitespace();
-            Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
-        })
+    aterm_sysprobe::kproc::records()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|r| Some((i32::try_from(r.pid).ok()?, i32::try_from(r.ppid).ok()?)))
         .collect()
 }
 
@@ -183,14 +185,43 @@ pub fn descendants(root: i32) -> Vec<i32> {
     descendants_in(&table(), root)
 }
 
-/// Returns `ps -o command= -p <pid>`, or an empty string.
+/// `r`'s command line as `ps -ww -o command=` prints it ([`aterm_sysprobe::kproc::ps_args`]),
+/// read in this process. Empty while its one thread has not run, and when that cannot be told
+/// (another user's process, one gone: [`aterm_uds::process::thread_ran`] is `None`), since an
+/// argument read of a program macOS's program check holds can hang
+/// (`docs/DESIGN-leftover-processes-2026-10-16.md` M29). A zombie reads as `<defunct>` with
+/// nothing read.
+fn command_of(r: &aterm_sysprobe::kproc::Record) -> String {
+    let ran = i32::try_from(r.pid)
+        .ok()
+        .and_then(aterm_uds::process::thread_ran);
+    if !r.zombie && ran != Some(true) {
+        return String::new();
+    }
+    aterm_sysprobe::kproc::ps_args(r, aterm_sysprobe::kproc::Locale::Utf8)
+}
+
+/// `pid`'s command line ([`command_of`]), or an empty string when it is gone or unread.
 #[must_use]
 pub fn command_line(pid: i32) -> String {
-    aterm_uds::spawnfd::command("/bin/ps")
-        .args(["-o", "command=", "-p", &pid.to_string()])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim_end().to_string())
+    record(pid).map(|r| command_of(&r)).unwrap_or_default()
+}
+
+/// Every process's `(pid, ppid, command line)` ([`command_of`]) from one read of the process
+/// table; empty when it cannot be read.
+#[must_use]
+pub fn commands() -> Vec<(i32, i32, String)> {
+    aterm_sysprobe::kproc::records()
         .unwrap_or_default()
+        .into_iter()
+        .filter_map(|r| {
+            Some((
+                i32::try_from(r.pid).ok()?,
+                i32::try_from(r.ppid).ok()?,
+                command_of(&r),
+            ))
+        })
+        .collect()
 }
 
 /// Returns `ps -o stat= -p <pid>`, or `None` if the process is gone.
@@ -204,27 +235,47 @@ pub fn state_of(pid: i32) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Returns the controlling TTY of `pid` (`??` if none).
+/// Whether `pid` is an unreaped zombie.
+#[must_use]
+pub fn zombie(pid: i32) -> bool {
+    record(pid).is_some_and(|r| r.zombie)
+}
+
+/// `pid`'s controlling terminal as [`crate::sys::tty_name`] names it (`ttys003` for a
+/// pseudo-terminal, `dev<major>.<minor>` for any other terminal, or `??` with none),
+/// read in this process; empty when it is gone.
 #[must_use]
 pub fn tty_of(pid: i32) -> String {
-    aterm_uds::spawnfd::command("/bin/ps")
-        .args(["-o", "tty=", "-p", &pid.to_string()])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    record(pid).map_or_else(String::new, |r| crate::sys::tty_name(r.tty))
+}
+
+/// When `pid` started, as a token that names that one process: the kernel record's start, in
+/// seconds and microseconds. Empty for pid 0 or 1 and when it is gone or unread, so a caller
+/// that compares two reads signals nothing on an unread one.
+#[must_use]
+pub fn start_time(pid: i32) -> String {
+    record(pid)
+        .map(|r| format!("{}.{:06}", r.start_s, r.start_us))
         .unwrap_or_default()
 }
 
-/// Returns `ps -o lstart= -p <pid>`.
+/// Rows of `pid ppid comm` for `pids` (`ps -o pid=,ppid=,comm=`, `comm` as
+/// [`aterm_sysprobe::kproc::ps_comm`] reads it, empty while the thread has not run), read in
+/// this process; a pid that is gone is left out.
 #[must_use]
-pub fn start_time(pid: i32) -> String {
-    if pid <= 1 {
-        return String::new();
-    }
-    aterm_uds::spawnfd::command("/bin/ps")
-        .args(["-o", "lstart=", "-p", &pid.to_string()])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default()
+pub fn rows_of(pids: &[i32]) -> Vec<(i32, i32, String)> {
+    pids.iter()
+        .filter_map(|&pid| {
+            let r = record(pid)?;
+            let ran = r.zombie || aterm_uds::process::thread_ran(pid) == Some(true);
+            let comm = if ran {
+                aterm_sysprobe::kproc::ps_comm(&r, aterm_sysprobe::kproc::Locale::Utf8)
+            } else {
+                String::new()
+            };
+            Some((pid, i32::try_from(r.ppid).ok()?, comm))
+        })
+        .collect()
 }
 
 /// A composite path read, retaining named paths even when another component was unreadable.
@@ -304,17 +355,34 @@ pub fn keep_jailed(run_dir: &Path, child: std::process::Child) -> i32 {
     pid
 }
 
-/// Reads jailed root PIDs from [`jailed_file`] (`all` includes exited PIDs).
+/// Reads jailed root PIDs from [`jailed_file`]. Unless `all`, each requires a canonical start
+/// token matching the current kernel record. `all` includes unproven and exited PIDs as
+/// historical evidence; that list does not authorize signals.
 #[must_use]
 pub fn jailed_roots(run_dir: &Path, all: bool) -> Vec<i32> {
     let text = std::fs::read_to_string(jailed_file(run_dir)).unwrap_or_default();
+    jailed_roots_with(&text, all, start_time)
+}
+
+fn jailed_roots_with(text: &str, all: bool, mut start_of: impl FnMut(i32) -> String) -> Vec<i32> {
     text.lines()
         .filter_map(|l| {
             let (pid, start) = l.split_once('\t').unwrap_or((l, ""));
             let pid: i32 = pid.trim().parse().ok()?;
-            (pid > 1 && (all || (!start.is_empty() && start_time(pid) == start))).then_some(pid)
+            (pid > 1 && (all || matching_start(start, || start_of(pid)))).then_some(pid)
         })
         .collect()
+}
+
+/// A stored start authorizes a root only when it has this build's format and matches a fresh
+/// kernel read. Legacy `ps -o lstart=` and malformed tokens remain historical evidence, never
+/// proof that a live process with the same PID belongs to this run.
+fn matching_start(start: &str, current: impl FnOnce() -> String) -> bool {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    match start.split_once('.') {
+        Some((s, us)) if digits(s) && digits(us) && us.len() == 6 => current() == start,
+        _ => false,
+    }
 }
 
 /// Returns all live PIDs currently inside the lab's jail.
@@ -370,6 +438,10 @@ pub fn lab_pids_ever(run: &crate::run::Run) -> Vec<i32> {
 
 /// Verifies that the lab's egress witness is still running.
 ///
+/// A sampler macOS's program check still holds at its first exec has words nobody may read
+/// yet ([`command_of`]), so this waits for its thread to run, at most
+/// [`aterm_uds::deadline::FIRST_EXEC_HANG`], before reading them.
+///
 /// # Errors
 /// Returns an error if the witness process is missing or exited.
 pub fn need_witness(run: &crate::run::Run) -> Result<(), String> {
@@ -378,7 +450,13 @@ pub fn need_witness(run: &crate::run::Run) -> Result<(), String> {
         run.run.join("bin/aterm-lab").display(),
         run.run.display()
     );
-    if alive(run.sampler_pid) && command_line(run.sampler_pid).contains(&line) {
+    let pause = || std::thread::sleep(Duration::from_millis(5));
+    if runs_with(
+        run.sampler_pid,
+        ("aterm-lab", &line),
+        aterm_uds::deadline::FIRST_EXEC_HANG,
+        pause,
+    ) {
         return Ok(());
     }
     Err(format!(
@@ -391,6 +469,28 @@ pub fn need_witness(run: &crate::run::Run) -> Result<(), String> {
         },
         crate::LAB
     ))
+}
+
+/// Whether `pid` lives with `line` in its command line ([`command_line`]), read once its thread
+/// has run. While it has not, and the kernel names it `comm` (its record's name, read with no
+/// argument read), this waits, at most `within`, calling `pause` between looks, since its words
+/// read as empty until then. A pid named otherwise is another program by now (the witness's pid
+/// freed and taken), so it is read at once, never waited on.
+fn runs_with(
+    pid: i32,
+    (comm, line): (&str, &str),
+    within: Duration,
+    mut pause: impl FnMut(),
+) -> bool {
+    let end = std::time::Instant::now() + within;
+    while alive(pid)
+        && record(pid).is_some_and(|r| r.comm == comm)
+        && aterm_uds::process::thread_ran(pid) == Some(false)
+        && std::time::Instant::now() < end
+    {
+        pause();
+    }
+    alive(pid) && command_line(pid).contains(line)
 }
 
 /// Output handling mode for [`jailed`].
@@ -422,6 +522,33 @@ pub fn jailed(
     Ok((o.status.code().unwrap_or(1), text))
 }
 
+/// The argument vector for a program in this lab's jail, with a clean environment and an
+/// optional working directory bound by `env -C`. Without that binding the launcher chooses its
+/// working directory. Each variable and program argument stays one argument, with no shell
+/// interpretation. This only constructs the command; a launcher checks its witness.
+#[must_use]
+pub fn jailed_argv(
+    run: &crate::run::Run,
+    cwd: Option<&Path>,
+    vars: &[(&str, &str)],
+    argv: &[&str],
+) -> Vec<String> {
+    let mut words = vec![
+        "/usr/bin/sandbox-exec".into(),
+        "-f".into(),
+        run.run.join("jail.sb").to_string_lossy().into_owned(),
+        "/usr/bin/env".into(),
+        "-i".into(),
+    ];
+    if let Some(dir) = cwd {
+        words.extend(["-C".into(), dir.to_string_lossy().into_owned()]);
+    }
+    words.extend(["PATH=/usr/bin:/bin".into(), "xcrun_nocache=1".into()]);
+    words.extend(vars.iter().map(|(k, v)| format!("{k}={v}")));
+    words.extend(argv.iter().map(|arg| (*arg).to_owned()));
+    words
+}
+
 /// [`jailed`]'s run, its status and its two streams apart (a mint's capability on stdout, its
 /// refusal on stderr: [`crate::bus::lay`]).
 ///
@@ -436,17 +563,10 @@ pub fn jailed_output(
     out: JailOut,
 ) -> Result<std::process::Output, String> {
     need_witness(run)?;
-    let mut cmd = aterm_uds::spawnfd::command("/usr/bin/sandbox-exec");
-    cmd.arg("-f").arg(run.run.join("jail.sb")).args([
-        "/usr/bin/env",
-        "-i",
-        "PATH=/usr/bin:/bin",
-        "xcrun_nocache=1",
-    ]);
-    for (k, v) in vars {
-        cmd.arg(format!("{k}={v}"));
-    }
-    cmd.args(argv)
+    let words = jailed_argv(run, None, vars, argv);
+    let (program, args) = words.split_first().ok_or("empty jail command")?;
+    let mut cmd = aterm_uds::spawnfd::command(program);
+    cmd.args(args)
         .current_dir(dir)
         .setsid(true)
         .stdin(aterm_uds::spawnfd::Stdio::null());
@@ -474,6 +594,232 @@ pub fn jailed_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The same command vector works outside a jailed parent: its cwd and literal values are
+    /// preserved, and a variable supplied only to its parent is absent after `env -i`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_jailed_argv_preserves_literal_values_and_chooses_its_own_directory() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let dir = root.path().join("cwd with spaces ; $literal");
+        std::fs::create_dir(&dir).unwrap();
+        let dir = std::fs::canonicalize(dir).unwrap();
+        let run = crate::run::Run {
+            run: root.path().to_path_buf(),
+            ..Default::default()
+        };
+        std::fs::write(run.run.join("jail.sb"), "(version 1)(allow default)").unwrap();
+        let literal = r#"space ; $(printf expanded) `printf expanded` "$HOME" \ end"#;
+        let argument = "argument with spaces ; $HOME $(printf expanded)";
+        let words = jailed_argv(
+            &run,
+            Some(&dir),
+            &[("ATERM_JAIL_LITERAL", literal)],
+            &[
+                "/bin/sh",
+                "-c",
+                "printf '%s\\n' \"$ATERM_JAIL_LITERAL\" \"$1\" \"${ATERM_JAIL_PARENT_ONLY-unset}\"; /bin/pwd -P",
+                "jail-test",
+                argument,
+            ],
+        );
+        let mut cmd = aterm_uds::spawnfd::command(&words[0]);
+        cmd.args(&words[1..])
+            .env("ATERM_JAIL_PARENT_ONLY", "must not reach the program")
+            .current_dir(root.path());
+        let out = aterm_uds::deadline::output_until(
+            &mut cmd,
+            std::time::Instant::now() + Duration::from_secs(60),
+        )
+        .expect("the synthetic jail answers within a minute");
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap(),
+            format!("{literal}\n{argument}\nunset\n{}\n", dir.display())
+        );
+    }
+
+    /// A child whose launcher already chose a relative cwd must not apply that path twice.
+    /// CONTROL: also binding the same relative path with `env -C` cannot start the program.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_jailed_argv_leaves_an_existing_relative_working_directory_alone() {
+        let cwd = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        let parent = cwd.join("target.noindex/.ubd");
+        std::fs::create_dir_all(&parent).unwrap();
+        let root = aterm_tempfile::Builder::new()
+            .prefix("relative-jail-")
+            .suffix(".noindex")
+            .tempdir_in(&parent)
+            .unwrap();
+        let absolute = std::fs::canonicalize(root.path()).unwrap();
+        let relative = absolute.strip_prefix(&cwd).unwrap();
+        let run = crate::run::Run {
+            run: absolute.clone(),
+            ..Default::default()
+        };
+        std::fs::write(run.run.join("jail.sb"), "(version 1)(allow default)").unwrap();
+        for binding in [None, Some(relative)] {
+            let words = jailed_argv(&run, binding, &[], &["/bin/pwd", "-P"]);
+            let mut cmd = aterm_uds::spawnfd::command(&words[0]);
+            cmd.args(&words[1..]).current_dir(relative);
+            let out = aterm_uds::deadline::output_until(
+                &mut cmd,
+                std::time::Instant::now() + Duration::from_secs(60),
+            )
+            .expect("the relative-cwd control answers within a minute");
+            if binding.is_none() {
+                assert!(out.status.success(), "{out:?}");
+                assert_eq!(
+                    String::from_utf8(out.stdout).unwrap(),
+                    format!("{}\n", absolute.display())
+                );
+            } else {
+                assert!(
+                    !out.status.success(),
+                    "applying the relative cwd twice must fail"
+                );
+            }
+        }
+    }
+
+    /// What `/bin/ps -o <column> -p <pid>` prints, trimmed: the oracle the in-process readers
+    /// are held to, waited for as a one-minute hang detector.
+    fn ps(column: &str, pid: i32) -> String {
+        let mut cmd = aterm_uds::spawnfd::command("/bin/ps");
+        cmd.args(["-ww", "-o", column, "-p", &pid.to_string()]);
+        let out = aterm_uds::deadline::output_until(
+            &mut cmd,
+            std::time::Instant::now() + Duration::from_secs(60),
+        )
+        .expect("/bin/ps answers within a minute");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A sleeping child of this process in a session of its own (no controlling terminal, so
+    /// its terminal reads `??` with no device name looked up), ended and reaped when dropped.
+    struct Sleeper(i32);
+
+    impl Sleeper {
+        fn start() -> Self {
+            // Owned before the wait, so its hang detector's panic ends it too.
+            let sleep = Self(
+                spawn_kept(
+                    aterm_uds::spawnfd::command("/bin/sleep")
+                        .arg("600")
+                        .setsid(true),
+                )
+                .expect("spawn a sleep"),
+            );
+            let bound = std::time::Instant::now() + Duration::from_secs(60);
+            while aterm_uds::process::thread_ran(sleep.0) != Some(true) {
+                assert!(std::time::Instant::now() < bound, "the sleep never ran");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            sleep
+        }
+    }
+
+    impl Drop for Sleeper {
+        fn drop(&mut self) {
+            let _ = crate::sys::kill(self.0, libc::SIGKILL);
+            let _ = wait_gone(self.0, Duration::from_secs(60));
+        }
+    }
+
+    /// The table, a command line, a terminal, a `comm` and a resident set read in this process
+    /// say what `/bin/ps` says of the same live process.
+    #[test]
+    fn the_in_process_readers_say_what_ps_says() {
+        let me = i32::try_from(std::process::id()).expect("own pid");
+        let parent = i32::try_from(std::os::unix::process::parent_id()).expect("parent pid");
+        assert!(
+            table().contains(&(me, parent)),
+            "this process and its parent"
+        );
+        let sleep = Sleeper::start();
+        assert!(
+            table().contains(&(sleep.0, me)),
+            "the child, under this process"
+        );
+        assert_eq!(command_line(sleep.0), "/bin/sleep 600");
+        assert_eq!(command_line(sleep.0), ps("command=", sleep.0));
+        assert_eq!(command_line(me), ps("command=", me));
+        assert!(
+            commands().contains(&(sleep.0, me, "/bin/sleep 600".to_string())),
+            "one read of every process names the child"
+        );
+        assert_eq!(tty_of(sleep.0), "??", "a child in a session of its own");
+        assert_eq!(tty_of(sleep.0), ps("tty=", sleep.0));
+        assert_eq!(
+            rows_of(&[sleep.0, -1]),
+            [(sleep.0, me, ps("comm=", sleep.0))],
+            "a pid that is no process is left out"
+        );
+        let kib = || crate::sys::resident_size(sleep.0).expect("resident size") / 1024;
+        let before = kib();
+        let rss = ps("rss=", sleep.0)
+            .parse::<u64>()
+            .expect("ps prints a resident set");
+        let after = kib();
+        assert!(
+            before.min(after) <= rss && rss <= before.max(after),
+            "ps's resident set ({rss} KiB) lies between two read in this process ({before}, {after})"
+        );
+    }
+
+    /// A start token names one process: the same for two reads of it, another for another
+    /// process, and empty for pid 1, for no pid, and once the process is gone.
+    #[test]
+    fn a_start_names_one_process_and_none_once_it_is_gone() {
+        let me = i32::try_from(std::process::id()).expect("own pid");
+        let sleep = Sleeper::start();
+        let start = start_time(sleep.0);
+        assert!(!start.is_empty(), "the child's start reads");
+        assert_eq!(start_time(sleep.0), start);
+        assert_ne!(start_time(me), start);
+        assert_eq!(start_time(1), "");
+        assert_eq!(start_time(0), "");
+        let pid = sleep.0;
+        drop(sleep);
+        assert_eq!(start_time(pid), "", "a reaped child has no start");
+    }
+
+    /// A child that exited and is not yet reaped reads as a zombie, `<defunct>` with nothing
+    /// read; once reaped it is neither a zombie nor anything else.
+    #[test]
+    fn an_unreaped_child_is_a_zombie_until_it_is_reaped() {
+        let mut child = aterm_uds::spawnfd::command("/usr/bin/true")
+            .spawn()
+            .expect("spawn true");
+        let pid = i32::try_from(child.id()).expect("pid");
+        let bound = std::time::Instant::now() + Duration::from_secs(60);
+        while !zombie(pid) {
+            assert!(std::time::Instant::now() < bound, "true never exited");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(command_line(pid), aterm_sysprobe::kproc::DEFUNCT);
+        child.wait().expect("reap it");
+        assert!(!zombie(pid));
+        assert_eq!(command_line(pid), "");
+    }
+
+    /// A child whose one thread has not run (started suspended, as macOS's program check holds
+    /// one) keeps its arguments unread: an empty command line and `comm`, and none in the table
+    /// of every process, which still lists it.
+    #[test]
+    fn a_process_whose_thread_has_not_run_has_its_arguments_left_unread() {
+        let me = i32::try_from(std::process::id()).expect("own pid");
+        let held =
+            aterm_uds::deadline::Held::start(aterm_uds::spawnfd::command("/bin/sleep").arg("600"))
+                .expect("a start-suspended sleep");
+        let pid = i32::try_from(held.id()).expect("pid");
+        assert_eq!(aterm_uds::process::thread_ran(pid), Some(false));
+        assert_eq!(command_line(pid), "");
+        assert!(commands().contains(&(pid, me, String::new())));
+        assert_eq!(rows_of(&[pid]), [(pid, me, String::new())]);
+        drop(held);
+    }
 
     #[test]
     fn descendants_come_children_first_and_never_for_init() {
@@ -553,6 +899,87 @@ mod tests {
         assert!(
             !jail_members(&run).contains(&pid),
             "an ended root is no member"
+        );
+    }
+
+    /// A witness whose thread has not run is waited for, not read as empty and so missing: with
+    /// no time left it is not seen, a held process the kernel names otherwise is not waited on,
+    /// and a wait that lets it run (here, its first pause resumes it) sees it once it runs.
+    #[test]
+    fn a_witness_still_held_at_its_exec_is_waited_for() {
+        let line = ("sleep", "/bin/sleep 600");
+        let mut child = aterm_uds::spawnfd::command("/bin/sleep")
+            .arg("600")
+            .start_suspended(true)
+            .spawn()
+            .expect("a start-suspended sleep");
+        let pid = i32::try_from(child.id()).unwrap_or(0);
+        let unwaited = runs_with(pid, line, Duration::ZERO, || {});
+        let mut paused = false;
+        let other = runs_with(pid, ("aterm-lab", line.1), Duration::from_secs(60), || {
+            paused = true;
+        });
+        let mut resumed = None;
+        let waited = runs_with(pid, line, Duration::from_secs(60), || {
+            if resumed.is_none() {
+                resumed = Some(child.resume().is_ok());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        });
+        // Ended and reaped before any verdict: a held child left behind keeps this test's
+        // output pipe open.
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(!unwaited, "unread while held");
+        assert!(
+            !other && !paused,
+            "another program's held pid is read at once"
+        );
+        assert_eq!(resumed, Some(true), "it was held when the wait began");
+        assert!(waited, "seen once it runs");
+    }
+
+    /// A borrowed PID is not this run's root merely because it lives. Only the exact canonical
+    /// start qualifies; a different current start, an unread record, legacy text and malformed
+    /// tokens remain visible in historical evidence without admitting them or their children.
+    #[test]
+    fn jailed_signal_candidates_require_their_own_canonical_start() {
+        let records = [
+            "70\tSat Nov  1 10:23:45 2026",
+            "72\t1793550000.12345",
+            "74\t1793550000.123456",
+            "76\t1793550000.123456",
+            "78\t",
+            "80\t1793550001.654321",
+            "82",
+            "1\t1793550001.654321",
+        ];
+        let text = records.join("\n");
+        let mut read = Vec::new();
+        let roots = jailed_roots_with(&text, false, |pid| {
+            read.push(pid);
+            match pid {
+                74 => "1793551000.123456".into(), // Same PID, another process.
+                80 => "1793550001.654321".into(),
+                _ => String::new(),
+            }
+        });
+        assert_eq!(roots, [80], "only the exact current process is admitted");
+        assert_eq!(read, [74, 76, 80], "unproven formats grant no PID lookup");
+        let table = [(70, 1), (71, 70), (72, 1), (73, 72), (80, 1), (81, 80)];
+        let mut candidates = roots.clone();
+        for root in roots {
+            candidates.extend(descendants_in(&table, root));
+        }
+        assert_eq!(
+            candidates,
+            [80, 81],
+            "no borrowed root or child is selected"
+        );
+        assert_eq!(
+            jailed_roots_with(&text, true, |_| panic!("history needs no process proof")),
+            [70, 72, 74, 76, 78, 80, 82],
+            "all stored evidence stays available without becoming signal authority"
         );
     }
 

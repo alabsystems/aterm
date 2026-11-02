@@ -30,6 +30,82 @@ pub(crate) fn watch_wanted() -> bool {
     !aterm_types::dev_seam!("ATERM_DEV_NO_PROCWATCH").is_some_and(|v| v == "1")
 }
 
+/// `SessionFactory::proc_connector`: whether a gather with no process watch, its sampler
+/// running, asks Linux's proc connector for its session's `exec`s ([`wire_connector`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ConnectorSeam {
+    /// None serves here: off Linux, and the test App's inert arm.
+    NotHere,
+    /// Turned off ([`shipping_connector`]).
+    Off,
+    /// Routes each session through this (`aterm_uds::proc_connector::route`, a test's own).
+    Open(fn(i32) -> Option<aterm_uds::proc_connector::Route>),
+}
+
+/// `SessionFactory::proc_connector` as shipped: on Linux, this process's one listener
+/// (`aterm_uds::proc_connector::route`), but `ATERM_DEV_NO_PROCCONN=1` in a dev-seams build
+/// turns it off ([`aterm_types::dev_seam!`]), the control its cost is measured against
+/// (`docs/DESIGN-session-log-2026-10-15.md` §10, unit L2); elsewhere none.
+pub(crate) fn shipping_connector() -> ConnectorSeam {
+    if !cfg!(target_os = "linux") {
+        ConnectorSeam::NotHere
+    } else if aterm_types::dev_seam!("ATERM_DEV_NO_PROCCONN").is_some_and(|v| v == "1") {
+        ConnectorSeam::Off
+    } else {
+        ConnectorSeam::Open(aterm_uds::proc_connector::route)
+    }
+}
+
+/// What hears the `exec`s of the session `shell` leads, given whether its gather has a process
+/// watch and a sampler: the watch alone where it has one; else the sampler, with a route from
+/// `seam` beside it (the sampler places what the route hands it,
+/// `crate::fg_sample::FgSampler::connected`); else nothing. Returns the route and the
+/// session's status words ([`crate::command_ran::Ran::watched_by`]).
+pub(crate) fn wire_connector(
+    seam: ConnectorSeam,
+    watch: bool,
+    sampler: bool,
+    shell: i32,
+) -> (
+    Option<aterm_uds::proc_connector::Route>,
+    crate::command_ran::Watching,
+) {
+    use crate::command_ran::{Connector, ExecWatch, Watching};
+    let only = |watch| {
+        (
+            None,
+            Watching {
+                watch,
+                connector: Connector::NotHere,
+            },
+        )
+    };
+    if watch {
+        return only(ExecWatch::Kqueue);
+    }
+    if !sampler {
+        return only(ExecWatch::None);
+    }
+    let (route, connector) = match seam {
+        ConnectorSeam::NotHere => (None, Connector::NotHere),
+        ConnectorSeam::Off => (None, Connector::Off),
+        ConnectorSeam::Open(open) => match open(shell) {
+            Some(route) => {
+                let reader = route.state_reader();
+                (Some(route), Connector::Routed(reader))
+            }
+            None => (None, Connector::NoRoute),
+        },
+    };
+    (
+        route,
+        Watching {
+            watch: ExecWatch::Sampler,
+            connector,
+        },
+    )
+}
+
 /// One reader's process watch and what its gather knows of the holder's image.
 #[derive(Debug)]
 pub(crate) struct ExecEdges {

@@ -39,7 +39,23 @@ const HANG: std::time::Duration = std::time::Duration::from_secs(60);
 /// person's startup file (its name in the home, its text) when given.
 #[track_caller]
 fn boot(tag: &str, shell: &str, harness: Option<&str>, rc: Option<(&str, &str)>) -> Instance {
-    headless_boot::boot_with(
+    boot_with_launch(tag, shell, harness, rc, &[])
+}
+
+/// A command-only or explicitly unintegrated boot cannot run the fixture's normal
+/// name-resolution probe in session zero. Its stand-ins are laid after boot; a worker's
+/// own rc must verify its resolution before drawing the prompt the launcher types at.
+fn boot_with_launch(
+    tag: &str,
+    shell: &str,
+    harness: Option<&str>,
+    rc: Option<(&str, &str)>,
+    extra: &[&str],
+) -> Instance {
+    let deferred = extra
+        .iter()
+        .any(|arg| matches!(*arg, "-e" | "--no-shell-integration"));
+    let inst = headless_boot::boot_with(
         &format!("atws{tag}"),
         |tmp, cmd| {
             if let Some((name, text)) = rc {
@@ -54,8 +70,13 @@ fn boot(tag: &str, shell: &str, harness: Option<&str>, rc: Option<(&str, &str)>)
                     .expect("write the config");
             }
             let bin = tmp.join("bin");
-            for word in ["claude", "codex", "agy", "muse"] {
-                headless_boot::standin(&bin.join(word), STANDIN);
+            if !deferred {
+                for word in ["claude", "codex", "agy", "muse"] {
+                    headless_boot::standin(&bin.join(word), STANDIN);
+                }
+            } else {
+                cmd.env("ATERM_SHELL_INTEGRATION_INSTALLED", "inherited")
+                    .env("ATERM_EXPECTED_CLAUDE", bin.join("claude"));
             }
             std::fs::create_dir_all(tmp.join("work")).expect("the worker's folder");
             cmd.env("SHELL", shell)
@@ -65,10 +86,17 @@ fn boot(tag: &str, shell: &str, harness: Option<&str>, rc: Option<(&str, &str)>)
                 )
                 .env("ATERM_STATE_HOME", tmp.join("state"))
                 .env("ATERM_LOG", "info")
-                .args(["--lines", "24", "--columns", "100"]);
+                .args(["--lines", "24", "--columns", "100"])
+                .args(extra);
         },
         |_| true,
-    )
+    );
+    if deferred {
+        for word in ["claude", "codex", "agy", "muse"] {
+            headless_boot::standin(&inst.tmp.join("bin").join(word), STANDIN);
+        }
+    }
+    inst
 }
 
 /// `aterm ctl @self <args…>` as the session `manager` runs it (its
@@ -140,6 +168,13 @@ fn until(inst: &Instance, worker: &str, what: &str, mut probe: impl FnMut() -> b
 
 /// The `[harness]` table of an instance whose workers run the stand-in.
 const SUPERVISED: &str = "relaunch = false\nupgrade = false\n";
+
+/// Never let the worker launcher type a vendor command unless this worker's own shell
+/// resolves it to the fixture. The marker proves that guarded shell reached its rc.
+const WORKER_RESOLUTION: &str = "if [ -n \"$ATERM_TASK_FILE\" ]; then\n\
+    [ \"$(command -v claude)\" = \"$ATERM_EXPECTED_CLAUDE\" ] || exit 86\n\
+    printf 'worker shell resolved fixture\\n' > \"$HOME/worker-resolved\"\n\
+    fi\n";
 
 /// The worker's sid out of a spawn's `OK <sid>`.
 fn sid_of(stdout: &str) -> String {
@@ -274,7 +309,8 @@ fn run_agent_worker(tag: &str, shell: &str, model: Option<&str>, word: &str) {
     if word == "muse" {
         want.push(b"--trust-workspace");
     }
-    if let Some(m) = model {
+    want.extend(cli.default_flags.iter().map(|f| f.as_bytes()));
+    if let Some(m) = model.or(cli.default_model) {
         want.extend([b"--model".as_slice(), m.as_bytes()]);
     }
     let session = argv
@@ -365,6 +401,119 @@ fn a_codex_worker_runs_its_task_after_the_end_of_options() {
 #[test]
 fn a_muse_worker_runs_its_task_after_the_end_of_options() {
     run_agent_worker("m", headless_boot::need_zsh(), Some("m-1"), "muse");
+}
+
+#[test]
+fn a_command_only_instance_spawns_a_worker_without_typing_into_its_command() {
+    let inst = boot_with_launch(
+        "cmd",
+        "/bin/bash",
+        Some(SUPERVISED),
+        Some((".bash_profile", WORKER_RESOLUTION)),
+        &[
+            "-e",
+            "/bin/sh",
+            "-c",
+            "printf 'parent-guard=%s\\n' \"$ATERM_SHELL_INTEGRATION_INSTALLED\"; exec /bin/cat",
+        ],
+    );
+    let (_, original) = boot_session(&inst);
+    let cat_pid = || {
+        let tree = headless_boot::process_tree(&inst);
+        tree.lines()
+            .find(|line| line.split_whitespace().nth(5) == Some("/bin/cat"))
+            .and_then(|line| line.split_whitespace().next())
+            .map(str::to_owned)
+    };
+    let original_pid = aterm_spec::wait::until_within(HANG, "the direct command's cat", cat_pid);
+    let before = aterm_spec::wait::until_within(HANG, "the direct command's environment", || {
+        let text = ctl_ok(&inst, &[&format!("@{original}"), "text", "trim"]);
+        text.contains("parent-guard=inherited").then_some(text)
+    });
+    let work = inst.tmp.join("work");
+    let cwd = format!("cwd={}", work.display());
+    let (ok, stdout, stderr) = spawn_as(
+        &inst,
+        &original,
+        &work,
+        &["spawn", "agent=claude", &cwd, "raise=false", "-"],
+        b"a task for the new worker only",
+    );
+    assert!(ok, "spawn from a command-only instance: {stdout} {stderr}");
+    let worker = sid_of(&stdout);
+    until(
+        &inst,
+        &worker,
+        "the fixture ran from the worker's shell",
+        || inst.tmp.join("home/argv.bin").exists(),
+    );
+    assert!(inst.tmp.join("home/worker-resolved").exists());
+    let worker_status = headless_boot::status(&inst, &worker);
+    assert_eq!(
+        field(&worker_status, "integration"),
+        Some("on"),
+        "{worker_status}"
+    );
+    let original_status = headless_boot::status(&inst, &original);
+    assert_eq!(
+        field(&original_status, "integration"),
+        Some("off"),
+        "{original_status}"
+    );
+    assert_eq!(
+        cat_pid(),
+        Some(original_pid),
+        "the original command was not replaced"
+    );
+    assert_eq!(
+        ctl_ok(&inst, &[&format!("@{original}"), "text", "trim"]),
+        before,
+        "no task or shell command was typed into cat"
+    );
+    let roster = aterm_spec::wait::until_within(HANG, "the original tab's placement", || {
+        let roster = ctl_ok(&inst, &["sessions"]);
+        let placed = roster
+            .lines()
+            .find(|line| line.split_whitespace().nth(1) == Some(original.as_str()))
+            .and_then(|row| field(row, "active"))
+            .is_some_and(|active| active != "-");
+        placed.then_some(roster)
+    });
+    let original_row = roster
+        .lines()
+        .find(|line| line.split_whitespace().nth(1) == Some(original.as_str()))
+        .expect("the original session remains");
+    assert_eq!(field(original_row, "active"), Some("1"), "{roster}");
+}
+
+#[test]
+fn an_explicit_integration_opt_out_refuses_workers_even_with_a_command() {
+    for (tag, extra) in [
+        ("off", &["--no-shell-integration"][..]),
+        ("cmdoff", &["--no-shell-integration", "-e", "/bin/cat"][..]),
+    ] {
+        let inst = boot_with_launch(tag, "/bin/bash", Some(SUPERVISED), None, extra);
+        let (_, original) = boot_session(&inst);
+        let before = ctl_ok(&inst, &["sessions"]).lines().count();
+        let (ok, stdout, stderr) = spawn_as(
+            &inst,
+            &original,
+            &inst.tmp.join("work"),
+            &["spawn", "agent=claude", "raise=false", "-"],
+            b"must not start",
+        );
+        assert!(
+            !ok && stderr.contains("shell integration is off"),
+            "{stdout} {stderr}"
+        );
+        assert_eq!(ctl_ok(&inst, &["sessions"]).lines().count(), before);
+        assert!(!inst.tmp.join("home/argv.bin").exists());
+        assert!(
+            std::fs::read_dir(inst.tmp.join("state/tasks"))
+                .map_or(true, |mut entries| entries.next().is_none()),
+            "no task was booked"
+        );
+    }
 }
 
 /// The retired Gemini CLI (`agent=gemini`, `agent=gemini-cli`) is refused by

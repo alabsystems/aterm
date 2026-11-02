@@ -1,0 +1,26 @@
+# kimi 2.4.0 · MEASURED 2026-10-29, `aterm ctl text` of a private headless aterm (110x32, aterm 0.146.0) running the real Kimi Code, launched by path with a scratch `HOME` and `KIMI_CODE_HOME` whose `config.toml` names one `openai`-type provider at `http://127.0.0.1:<port>/v1` with a fake key (a local stub of the Chat Completions API, crates/aterm-lab), no login · `lab cr check` and its CR fed in one write (`aterm ctl feed`), then 6 s with nothing pressed: the CR stands as a newline in a two-row draft and the stub received no request
+
+ ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │                                                                                                          │
+ │  ▐█▛█▛█▌  Welcome to Kimi Code!                                                                          │
+ │  ▐█████▌  Send /help for help information.                                                               │
+ │                                                                                                          │
+ │  Directory: /private/tmp/at.NuMm/proj                                                                    │
+ │  Session:   session_dc00ad28-8342-47c5-9e08-09e594e32b91                                                 │
+ │  Model:     lab-model                                                                                    │
+ │  Version:   2.4.0                                                                                        │
+ │                                                                                                          │
+ ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+   No session yet — one will be created on your first message.
+
+ ❯ lab first turn
+
+ ● Hi! I am the local lab stub, not a model. (reply 1)
+
+ ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │ > lab cr check                                                                                           │
+ │                                                                                                          │
+ ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ lab-model  …/tmp/at.NuMm/proj                            ask Kimi to schedule tasks, e.g. "remind me at 5pm"
+                                                                                   context: 22% (20.6k/97.7k)

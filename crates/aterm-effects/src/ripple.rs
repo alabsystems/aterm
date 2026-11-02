@@ -87,6 +87,9 @@ const fn front(ms: u64) -> f32 {
 /// `v` on the field's levels.
 #[inline]
 const fn quantise(v: f32) -> f32 {
+    if v == 0.0 {
+        return 0.0;
+    }
     const INV_LEVELS: f32 = 1.0 / GLINT_LEVELS;
     (v * GLINT_LEVELS).round() * INV_LEVELS
 }
@@ -134,6 +137,9 @@ const fn train(x: f32) -> f32 {
 #[inline]
 pub const fn glint(d_cells: f32, ms: u64) -> f32 {
     let x = front(ms) - d_cells;
+    if x >= 5.0 + GLINT_ECHO_CELLS {
+        return 0.0;
+    }
     let main = train(x);
     let level = if main >= GLINT_ECHO_GAIN {
         main

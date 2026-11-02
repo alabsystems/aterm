@@ -92,6 +92,10 @@ fn every_host_answer_reads_back_as_written() {
             unpushed: 3,
             unlanded: 4,
             main_ref: "origin/main".to_string(),
+            sub_unpushed: 5,
+            subs: vec!["vendor/lib".to_string()],
+            parked: 6,
+            parked_on: vec!["feat".to_string(), "wt-feat".to_string()],
             paths: vec!["src/a.rs".to_string(), "notes/".to_string()],
             state: Some(u64::MAX),
         },
@@ -121,6 +125,7 @@ fn every_host_answer_reads_back_as_written() {
                 head: "3f9a1c2e4b7d".repeat(4)[..40].to_string(),
                 main_ref: main_ref.to_string(),
                 remote,
+                branch: if remote { "main" } else { "" }.to_string(),
             });
         let bytes = checked.to_tape();
         assert!(
@@ -131,6 +136,28 @@ fn every_host_answer_reads_back_as_written() {
         same(Some(checked.clone()));
         same(checked);
     }
+    // Slice 9c: a gone folder is taped under `gone`, and a checked reading taped before the
+    // branch was read reads back naming none.
+    let gone = crate::harness::repo_work::RepoRead::Gone("/Users//a/Developer/gone".to_string());
+    assert_eq!(
+        gone.to_tape(),
+        br#"{"gone":"/Users//a/Developer/gone"}"#.to_vec()
+    );
+    same(Some(gone.clone()));
+    same(gone);
+    let before =
+        br#"{"at":{"repo":"/r","head":"3f9a1c2e4b7d","main_ref":"origin/main","remote":true}}"#;
+    assert_eq!(
+        <crate::harness::repo_work::RepoRead as TapeValue>::from_tape(before)
+            .expect("a 9b tape's checked reading"),
+        crate::harness::repo_work::RepoRead::Checked(crate::harness::repo_work::CleanAt {
+            repo: "/r".to_string(),
+            head: "3f9a1c2e4b7d".to_string(),
+            main_ref: "origin/main".to_string(),
+            remote: true,
+            branch: String::new(),
+        })
+    );
     same(None::<crate::harness::repo_work::RepoRead>);
     same(Some(crate::harness::repo_work::RepoRead::Unread));
     for (old, read) in [
@@ -225,13 +252,71 @@ fn every_host_answer_reads_back_as_written() {
         same(Some(crate::supervise::FactsReading {
             as_of_ms: i64::MIN,
             no_progress: vec![call(task, wait, birth), call(None, None, Some(1))],
+            held: None,
         }));
     }
     same(None::<crate::supervise::FactsReading>);
     same(Some(crate::supervise::FactsReading {
         as_of_ms: 1_760_000_000_000,
         no_progress: Vec::new(),
+        held: None,
     }));
+    for programs in [
+        Vec::new(),
+        vec![
+            crate::supervise::HeldCall {
+                pid: u32::MAX,
+                exec_version: Some(u64::MAX),
+                held_ms: u64::MAX,
+            },
+            crate::supervise::HeldCall {
+                pid: 72955,
+                exec_version: None,
+                held_ms: 1_200_000,
+            },
+        ],
+    ] {
+        same(Some(crate::supervise::FactsReading {
+            as_of_ms: 1_760_000_000_000,
+            no_progress: vec![call(None, None, Some(1))],
+            held: Some(crate::supervise::HeldReading {
+                as_of_ms: i64::MIN,
+                programs,
+            }),
+        }));
+    }
+    let before_held = br#"{"as-of-ms":5,"no-progress":[]}"#;
+    assert_eq!(
+        <Option<crate::supervise::FactsReading> as HostReply>::take(before_held, Instant::now())
+            .ok(),
+        Some(Some(crate::supervise::FactsReading {
+            as_of_ms: 5,
+            no_progress: Vec::new(),
+            held: None,
+        })),
+        "a tape from before the held programs were read reads back without them"
+    );
+    let before_exec_version = br#"{"as-of-ms":5,"no-progress":[],"held":{"as-of-ms":4,"programs":[{"pid":601,"held-ms":1140000}]}}"#;
+    assert_eq!(
+        <Option<crate::supervise::FactsReading> as HostReply>::take(
+            before_exec_version,
+            Instant::now()
+        )
+        .ok(),
+        Some(Some(crate::supervise::FactsReading {
+            as_of_ms: 5,
+            no_progress: Vec::new(),
+            held: Some(crate::supervise::HeldReading {
+                as_of_ms: 4,
+                programs: vec![crate::supervise::HeldCall {
+                    pid: 601,
+                    exec_version: None,
+                    held_ms: 1_140_000,
+                }],
+            }),
+        })),
+        "a historical answer keeps its wait without inventing an actual exec version"
+    );
     let before_birth =
         br#"{"no-progress":{"pid":1,"pgid":2,"exe":"x","task":null,"quiet_ms":3,"wait":null}}"#;
     assert_eq!(
@@ -300,6 +385,7 @@ fn every_host_answer_reads_back_as_written() {
     same(None::<AccountAdvice>);
     same(Some(AccountAdvice::Move {
         to: "work".to_string(),
+        yields: None,
     }));
     same(Some(AccountAdvice::Resume {
         cleared_at: 1_789_660_500,
@@ -308,6 +394,7 @@ fn every_host_answer_reads_back_as_written() {
     same(Some(AccountAdvice::Probe {
         otherwise: Some(Box::new(AccountAdvice::Move {
             to: "home".to_string(),
+            yields: None,
         })),
     }));
     same(None::<Instant>);
@@ -365,6 +452,23 @@ fn ready(label: &str) -> Option<Ready> {
     Some(Ready {
         label: label.to_string(),
     })
+}
+
+/// A move an earlier build taped, which knew no yield, reads back as one nobody yields by, and
+/// such a move is taped as it was then.
+#[test]
+fn a_move_an_earlier_build_taped_reads_back_yielding_nothing() {
+    let origin = Instant::now();
+    let earlier = b"{\"move\":{\"to\":\"work\"}}";
+    let plain = Some(AccountAdvice::Move {
+        to: "work".to_string(),
+        yields: None,
+    });
+    assert_eq!(
+        <Option<AccountAdvice> as HostReply>::take(earlier, origin).ok(),
+        Some(plain.clone())
+    );
+    assert_eq!(plain.put(origin), earlier);
 }
 
 #[test]
@@ -440,6 +544,13 @@ fn an_answers_instant_keeps_its_span_from_the_origin() {
             moved(&wait, from, to),
             Some(AccountAdvice::Wait { until: to + span })
         );
+        let yields = |until| {
+            Some(AccountAdvice::Move {
+                to: "work".to_string(),
+                yields: Some(until),
+            })
+        };
+        assert_eq!(moved(&yields(later), from, to), yields(to + span));
         let probed = Some(AccountAdvice::Probe {
             otherwise: Some(Box::new(AccountAdvice::Wait { until: later })),
         });
@@ -537,6 +648,7 @@ fn a_request_names_each_argument() {
         done_under_land: true,
         held: None,
         theirs: None,
+        ..IdlePoint::default()
     };
     let text = "a \"quoted\"\nline";
     assert_eq!(
@@ -561,6 +673,25 @@ fn a_request_names_each_argument() {
         String::from_utf8(request(&[("point", &theirs)])).expect("utf-8"),
         "point=IdlePoint { done_under_land: true, held: Exchange, theirs: Exchange }"
     );
+}
+
+/// AN ACT'S REQUEST IS THE ACT ALONE (the second review of the post-landing fixes, 2026-11-01):
+/// whether aterm typed it at the prompt rides to the live host beside it, and a tape recorded
+/// before compares as it was. Negative control: `TakenAct`'s request spelled by its `Debug`
+/// names `opens_turn`.
+#[test]
+fn an_acts_request_keeps_the_act_alone() {
+    use crate::harness::acts::{Act, TakenAct};
+    use crate::supervise::approvals::Outcome;
+    for (outcome, opens_turn) in [(Outcome::Typed, true), (Outcome::Approved, false)] {
+        let taken = TakenAct::of(Act::Answered, outcome);
+        assert_eq!(taken.opens_turn, opens_turn, "{outcome:?}");
+        assert_eq!(
+            request(&[("act", &taken)]),
+            request(&[("act", &Act::Answered)]),
+            "{outcome:?}"
+        );
+    }
 }
 
 /// The notification keeps its original six-field request, while its live
@@ -883,6 +1014,8 @@ fn a_full_hold() -> crate::harness::acts::LandHeld {
         stashes: 3,
         unpushed: 4,
         unlanded: u16::MAX,
+        sub_unpushed: 5,
+        parked: 6,
     }
 }
 
@@ -1007,6 +1140,107 @@ fn land_held_is_a_taped_notification() {
     assert!(told.is_err(), "the replay halts at the divergence");
     let d = core.diverged().expect("latched");
     assert_eq!(d.door.as_deref(), Some("host.land_held"), "{d:?}");
+}
+
+/// A host that keeps every receipt it is told.
+#[derive(Debug, Default)]
+struct HearsReceipt {
+    told: std::sync::Mutex<Vec<Option<crate::harness::acts::LandReceipt>>>,
+}
+
+impl crate::supervise::IdleHost for HearsReceipt {
+    fn wants(&self) -> bool {
+        false
+    }
+    fn at_idle(&self) -> Option<crate::supervise::run::HostStep> {
+        None
+    }
+    fn owns_turn_end(&self) -> bool {
+        false
+    }
+    fn land_receipt(&self, receipt: Option<&crate::harness::acts::LandReceipt>) {
+        self.told.lock().expect("told").push(receipt.cloned());
+    }
+}
+
+/// THE RECEIPT IS A TAPED NOTIFICATION (§14.9, slice 9b): the taped host tells the window's host
+/// each receipt and tapes it as an output at `host.land_receipt`; a replay matches each on the
+/// tape, and one that differs (another head) halts at that door.
+#[test]
+fn land_receipt_is_a_taped_notification() {
+    use astream_effects::EffectRecord;
+
+    use crate::harness::acts::{LandReceipt, ReceiptLeg};
+    use crate::supervise::IdleHost;
+    use crate::supervise::fx::ClockSource;
+    use crate::supervise::tape::header::VERBATIM;
+    use crate::supervise::tape::replay::ReplayCore;
+    use crate::supervise::tape::testing::{MemoryTape, TAPE_ID};
+
+    let receipt = LandReceipt {
+        head: "3f9a1c2e4b7d".into(),
+        main_ref: "origin/main".into(),
+        repo: "/Users//a/src/parser".into(),
+        branch: "main".into(),
+        leg: ReceiptLeg::OnMain,
+        check: true,
+        said: "Nothing left: pushed.".into(),
+        at_ms: 1_771_000_000_000,
+    };
+    let tape = MemoryTape::over(&Fx::over(ClockSource::Scripted(Arc::default())));
+    let inner = Arc::new(HearsReceipt::default());
+    let host = TapedHost::new(Arc::clone(&inner) as Arc<dyn IdleHost>, tape.fx.clone());
+    IdleHost::land_receipt(&host, Some(&receipt));
+    IdleHost::land_receipt(&host, None);
+    assert_eq!(
+        *inner.told.lock().expect("told"),
+        [Some(receipt.clone()), None],
+        "the window's host told each"
+    );
+    let read = tape.finish("done");
+    let records: Vec<EffectRecord> = read
+        .items
+        .iter()
+        .filter_map(|i| i.record().cloned())
+        .collect();
+    let told: Vec<(String, String)> = records
+        .iter()
+        .map(|r| match r {
+            EffectRecord::Emit { door, bytes } => {
+                (door.clone(), String::from_utf8_lossy(bytes).into_owned())
+            }
+            other => panic!("a notification is an output: {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        told,
+        [
+            (
+                "host.land_receipt".to_string(),
+                format!("receipt={:?}", Some(&receipt))
+            ),
+            ("host.land_receipt".to_string(), "receipt=None".to_string()),
+        ]
+    );
+    let core = ReplayCore::start(records.clone(), VERBATIM, VERBATIM, TAPE_ID, None);
+    let replay = ReplayHost::new(Fx::replay(Arc::clone(&core)));
+    IdleHost::land_receipt(&replay, Some(&receipt));
+    IdleHost::land_receipt(&replay, None);
+    assert_eq!(core.left(), 0, "every tell matched on the tape");
+    assert!(core.diverged().is_none());
+
+    let core = ReplayCore::start(records, VERBATIM, VERBATIM, TAPE_ID, None);
+    let replay = ReplayHost::new(Fx::replay(Arc::clone(&core)));
+    let other = LandReceipt {
+        head: "b0b0b0b0b0b0".into(),
+        ..receipt
+    };
+    let told = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        IdleHost::land_receipt(&replay, Some(&other));
+    }));
+    assert!(told.is_err(), "the replay halts at the divergence");
+    let d = core.diverged().expect("latched");
+    assert_eq!(d.door.as_deref(), Some("host.land_receipt"), "{d:?}");
 }
 
 /// A host whose board reads the reading it holds.
@@ -1801,4 +2035,100 @@ fn agent_resumed_door_round_trips_and_answers_none_on_older_tapes() {
     let asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| replay.agent_resumed()));
     assert!(asked.is_err(), "the replay halts: the tape never asked");
     assert!(core.diverged().is_some());
+}
+
+/// A window's host that hears the hold's own words
+/// ([`crate::supervise::IdleHost::land_said`]) and keeps each tell.
+#[derive(Debug, Default)]
+struct HearsSaid {
+    told: std::sync::Mutex<Vec<Option<crate::harness::hold_said::HoldSaid>>>,
+}
+
+impl crate::supervise::IdleHost for HearsSaid {
+    fn wants(&self) -> bool {
+        false
+    }
+    fn at_idle(&self) -> Option<crate::supervise::run::HostStep> {
+        None
+    }
+    fn owns_turn_end(&self) -> bool {
+        false
+    }
+    fn land_said(&self, said: Option<&crate::harness::hold_said::HoldSaid>) {
+        self.told.lock().expect("told").push(said.cloned());
+    }
+}
+
+/// THE HOLD'S WORDS ARE A TAPED NOTIFICATION (slice 4b): each tell reaches the window's host and
+/// the tape, a replay matches it, and an item reworded on replay diverges at its door.
+/// Negative control: the door left out of the taped host's list fails the record.
+#[test]
+fn land_said_is_a_taped_notification() {
+    use astream_effects::EffectRecord;
+
+    use crate::harness::hold_said::HoldSaid;
+    use crate::supervise::IdleHost;
+    use crate::supervise::fx::ClockSource;
+    use crate::supervise::tape::header::VERBATIM;
+    use crate::supervise::tape::replay::ReplayCore;
+    use crate::supervise::tape::testing::{MemoryTape, TAPE_ID};
+
+    let said = HoldSaid::of(
+        Some("The docs PR is still open."),
+        &["wip-notes.txt".to_string()],
+    );
+    let tape = MemoryTape::over(&Fx::over(ClockSource::Scripted(Arc::default())));
+    let inner = Arc::new(HearsSaid::default());
+    let host = TapedHost::new(Arc::clone(&inner) as Arc<dyn IdleHost>, tape.fx.clone());
+    IdleHost::land_said(&host, Some(&said));
+    IdleHost::land_said(&host, None);
+    assert_eq!(
+        *inner.told.lock().expect("told"),
+        [Some(said.clone()), None],
+        "the window's host told each"
+    );
+    let read = tape.finish("done");
+    let records: Vec<EffectRecord> = read
+        .items
+        .iter()
+        .filter_map(|i| i.record().cloned())
+        .collect();
+    let told: Vec<(String, String)> = records
+        .iter()
+        .map(|r| match r {
+            EffectRecord::Emit { door, bytes } => {
+                (door.clone(), String::from_utf8_lossy(bytes).into_owned())
+            }
+            other => panic!("a notification is an output: {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        told,
+        [
+            (
+                "host.land_said".to_string(),
+                format!("said={:?}", Some(&said))
+            ),
+            ("host.land_said".to_string(), "said=None".to_string()),
+        ]
+    );
+    let core = ReplayCore::start(records.clone(), VERBATIM, VERBATIM, TAPE_ID, None);
+    let replay = ReplayHost::new(Fx::replay(Arc::clone(&core)));
+    IdleHost::land_said(&replay, Some(&said));
+    IdleHost::land_said(&replay, None);
+    assert_eq!(core.left(), 0, "every tell matched on the tape");
+    assert!(core.diverged().is_none());
+
+    let core = ReplayCore::start(records, VERBATIM, VERBATIM, TAPE_ID, None);
+    let replay = ReplayHost::new(Fx::replay(Arc::clone(&core)));
+    let reworded = HoldSaid::of(
+        Some("The pull request for the docs is still open."),
+        &["wip-notes.txt".to_string()],
+    );
+    let told = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        IdleHost::land_said(&replay, Some(&reworded));
+    }));
+    assert!(told.is_err(), "the replay halts at the divergence");
+    let d = core.diverged().expect("latched");
+    assert_eq!(d.door.as_deref(), Some("host.land_said"), "{d:?}");
 }

@@ -192,6 +192,166 @@ fn independent_stores_preserve_activity_and_seniority_then_release_at_expiry() {
 }
 
 #[test]
+fn a_preparation_hold_refuses_claims_without_poisoning_an_authorized_store() {
+    let lab = Lab::new();
+    lab.state("prepared")
+        .transact(NOW, &mut None, |state| {
+            state.prepared_accounts.insert("alpha".into());
+            Ok(Vec::new())
+        })
+        .unwrap();
+    assert_eq!(
+        lab.touch("prepared", Act::Claim("alpha"), NOW),
+        Touched::PreparationOnly
+    );
+    assert!(lab.table.row("aa01").is_none());
+    assert!(
+        lab.state("prepared")
+            .load(NOW)
+            .unwrap()
+            .0
+            .claimed_at
+            .is_empty()
+    );
+    let held = Held::take(lab.root.path()).unwrap();
+    assert!(!held.live(&key(), NOW));
+    drop(held);
+    assert_eq!(
+        lab.touch("authorized", Act::Claim("alpha"), NOW + 1),
+        Touched::Claimed
+    );
+}
+
+#[test]
+fn preparation_holds_stop_refreshing_prior_claim_evidence() {
+    let lab = Lab::new();
+    let store = lab.state("first");
+    store
+        .transact(NOW, &mut None, |state| {
+            Ok(accounts::note_session(state, "s-first", "alpha", None, NOW))
+        })
+        .unwrap();
+    assert_eq!(
+        lab.touch("first", Act::Claim("alpha"), NOW),
+        Touched::Claimed
+    );
+    store
+        .transact(NOW + 1, &mut None, |state| {
+            state.prepared_accounts.insert("alpha".into());
+            Ok(Vec::new())
+        })
+        .unwrap();
+    assert_eq!(lab.touch("first", Act::Look, NOW + 2), Touched::Looked);
+    let held = Held::take(lab.root.path()).unwrap();
+    assert_eq!(
+        held.book.as_ref().unwrap().entries[&key()],
+        NOW + SESSION_FRESH_S
+    );
+    drop(held);
+    // A quiet where this Mac has a row reads `Quieted`, so its row is pushed to the peers.
+    assert_eq!(
+        lab.touch("first", Act::Quiet, NOW + SESSION_FRESH_S),
+        Touched::Quieted
+    );
+    assert!(lab.row().claims.is_empty());
+}
+
+#[test]
+fn a_home_accounts_preparation_refusal_survives_unreadable_activity() {
+    let lab = Lab::new();
+    lab.state("prepared")
+        .transact(NOW, &mut None, |state| {
+            state.prepared_accounts.insert("alpha".into());
+            state.home_accounts.insert("alpha".into());
+            Ok(Vec::new())
+        })
+        .unwrap();
+    drop(Held::take(lab.root.path()).unwrap());
+    private_file::write_private(
+        &lab.root.path().join(".aterm/claim-activity"),
+        FILE,
+        b"bad json",
+    )
+    .unwrap();
+    assert_eq!(
+        lab.touch("prepared", Act::Claim("alpha"), NOW),
+        Touched::PreparationOnly
+    );
+    assert!(lab.table.row("aa01").is_none());
+    assert!(
+        lab.state("prepared")
+            .load(NOW)
+            .unwrap()
+            .0
+            .claimed_at
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_home_accounts_preparation_refusal_survives_a_rejected_roster() {
+    let lab = Lab::new();
+    lab.state("prepared")
+        .transact(NOW, &mut None, |state| {
+            state.prepared_accounts.insert("alpha".into());
+            state.home_accounts.insert("alpha".into());
+            Ok(Vec::new())
+        })
+        .unwrap();
+    std::fs::write(&lab.roster, "[[account").unwrap();
+    assert_eq!(
+        lab.touch("prepared", Act::Claim("alpha"), NOW),
+        Touched::PreparationOnly
+    );
+    assert!(lab.table.row("aa01").is_none());
+    assert!(
+        lab.state("prepared")
+            .load(NOW)
+            .unwrap()
+            .0
+            .claimed_at
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_senior_peer_refusal_survives_failure_to_save_the_observation() {
+    use super::super::{Table, Tabled};
+    let lab = Lab::new();
+    peer_claim(&lab, NOW + super::super::HORIZON_S);
+    struct FailingSave<'a> {
+        table: &'a Replica,
+        state: PathBuf,
+    }
+    impl Table for FailingSave<'_> {
+        fn read(&self, home: &Path) -> Result<Tabled, String> {
+            let read = self.table.read(home)?;
+            std::fs::create_dir(&self.state).unwrap();
+            Ok(read)
+        }
+        fn write(&self, _: &Path, _: &Row) -> Result<(), String> {
+            panic!("a peer refusal must not publish a claim");
+        }
+    }
+    let table = FailingSave {
+        table: &lab.table,
+        state: lab.state("first").state_file(),
+    };
+    let result = touch_on(
+        &table,
+        lab.root.path(),
+        &lab.root.path().join("first"),
+        Some(&lab.roster),
+        Cli::Claude,
+        Act::Claim("alpha"),
+        NOW,
+    );
+    assert!(matches!(result, Touched::HeldElsewhere(_)), "{result:?}");
+    assert!(table.state.is_dir(), "the state save was obstructed");
+    assert!(lab.table.row("aa01").is_none());
+}
+
+#[test]
 fn negative_control_without_shared_evidence_drops_the_other_stores_live_claim() {
     use super::super::touch_with;
     let lab = Lab::new();
@@ -271,7 +431,7 @@ fn sleep_preserves_other_stores_live_claims_and_wake_renews_the_whole_row() {
         lab.touch("second", Act::Claim("beta"), NOW),
         Touched::Claimed
     );
-    assert_eq!(lab.touch("second", Act::Quiet, NOW + 1), Touched::Looked);
+    assert_eq!(lab.touch("second", Act::Quiet, NOW + 1), Touched::Quieted);
     assert_eq!(lab.row().claims.len(), 2);
     assert_eq!(lab.row().until, NOW + 1 + SESSION_FRESH_S);
     assert_eq!(
@@ -281,6 +441,223 @@ fn sleep_preserves_other_stores_live_claims_and_wake_renews_the_whole_row() {
     assert_eq!(lab.row().claims.len(), 2);
     assert_eq!(lab.row().claim(&key()).unwrap().since, NOW);
     assert_eq!(lab.row().until, NOW + 2 + super::super::HORIZON_S);
+}
+
+/// A claims table whose push hands its rows to `peer`, as a peer's next repair round would, unless
+/// `fail` says no peer took it.
+struct Pushing<'a> {
+    table: &'a Replica,
+    peer: &'a Replica,
+    pushes: std::sync::atomic::AtomicUsize,
+    fail: std::sync::atomic::AtomicBool,
+}
+
+impl<'a> Pushing<'a> {
+    fn new(table: &'a Replica, peer: &'a Replica) -> Self {
+        Self {
+            table,
+            peer,
+            pushes: std::sync::atomic::AtomicUsize::new(0),
+            fail: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn pushes(&self) -> usize {
+        self.pushes.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// `act` as the Mac goes quiet or down, on `store` (`touch_pushing`'s work).
+    fn down(&self, lab: &Lab, store: &str, act: Act<'_>, now: i64) -> super::super::Pushed {
+        super::super::push_on(
+            self,
+            lab.root.path(),
+            &lab.root.path().join(store),
+            Some(&lab.roster),
+            Cli::Claude,
+            act,
+            now,
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        )
+    }
+}
+
+impl super::super::Table for Pushing<'_> {
+    fn read(&self, home: &Path) -> Result<super::super::Tabled, String> {
+        self.table.read(home)
+    }
+
+    fn write(&self, home: &Path, row: &Row) -> Result<(), String> {
+        self.table.write(home, row)
+    }
+
+    fn push(&self, _: &Path, _: std::time::Instant) -> Result<(), String> {
+        use std::sync::atomic::Ordering;
+        self.pushes.fetch_add(1, Ordering::SeqCst);
+        if self.fail.load(Ordering::SeqCst) {
+            return Err("no peer took it".to_owned());
+        }
+        self.peer.merge(self.table);
+        Ok(())
+    }
+}
+
+/// Whether `peer` reads account `alpha` free.
+fn free_on(peer: &Replica, now: i64) -> bool {
+    let view = super::super::View {
+        me: "bb02".into(),
+        presence: None,
+    };
+    let book = super::super::Book::of(peer.row("aa01"));
+    book.senior(&key(), &view, now).is_none()
+}
+
+/// A quiet or off row goes to the peers at once ([`super::super::Table::push`]): the peer's replica
+/// holds it as the touch returns, the claim kept there shortened, then given up and free. An off
+/// with nothing left to give up writes nothing and still pushes the row.
+///
+/// NEGATIVE CONTROL: make `push_on` skip the push. With `pushed = None` the quiet returns
+/// `(Quieted, None)`; with the skipped push still reported as `Some(Ok(()))`, the peer holds the
+/// row from before the quiet: the claim stands there to its old `until`.
+#[test]
+fn a_quiet_or_off_row_is_pushed_to_the_peers_at_once() {
+    use super::super::HORIZON_S;
+
+    let lab = Lab::new();
+    let peer = Replica::new("bb02");
+    let pushing = Pushing::new(&lab.table, &peer);
+    assert_eq!(
+        lab.touch("first", Act::Claim("alpha"), NOW),
+        Touched::Claimed
+    );
+    peer.merge(&lab.table);
+    assert_eq!(peer.row("aa01").map(|row| row.until), Some(NOW + HORIZON_S));
+
+    // Asleep, the claim in use is kept, two hours at most, on the peer too.
+    assert_eq!(
+        pushing.down(&lab, "first", Act::Quiet, NOW + 1),
+        (Touched::Quieted, Some(Ok(())))
+    );
+    assert_eq!(
+        peer.row("aa01").map(|row| row.until),
+        Some(NOW + 1 + SESSION_FRESH_S)
+    );
+
+    // Down, every claim goes, on the peer too.
+    assert_eq!(
+        pushing.down(&lab, "first", Act::Off, NOW + 2),
+        (Touched::Quieted, Some(Ok(())))
+    );
+    let row = peer.row("aa01").expect("the pushed row");
+    assert!(row.claims.is_empty(), "{row:?}");
+    assert!(free_on(&peer, NOW + 2));
+
+    // Nothing left to give up: nothing written, the row pushed again.
+    assert_eq!(
+        pushing.down(&lab, "first", Act::Off, NOW + 3),
+        (Touched::Quieted, Some(Ok(())))
+    );
+    assert_eq!(lab.row().counter, row.counter);
+    assert_eq!(pushing.pushes(), 3);
+}
+
+/// An off whose push reached no peer is not the row's last chance: the next quiet or off (the node
+/// job's, after the window's) finds nothing left to give up and pushes the row all the same, so
+/// the peer reads the account free. A Mac with no row pushes nothing.
+///
+/// NEGATIVE CONTROL: push only where the touch wrote (`quiet`'s outcome `Quieted` only for
+/// `row.is_some()`), and the second off is `(Looked, None)`: the peer holds the home claim to its
+/// row's `until`.
+#[test]
+fn an_off_whose_push_failed_is_pushed_by_the_next_quiet_or_off() {
+    use std::sync::atomic::Ordering;
+
+    let lab = Lab::new();
+    let peer = Replica::new("bb02");
+    let pushing = Pushing::new(&lab.table, &peer);
+    assert_eq!(
+        pushing.down(&lab, "first", Act::Off, NOW),
+        (Touched::Looked, None),
+        "no row, nothing to push"
+    );
+    assert_eq!(
+        lab.touch("first", Act::Claim("alpha"), NOW),
+        Touched::Claimed
+    );
+    peer.merge(&lab.table);
+    assert!(!free_on(&peer, NOW));
+
+    pushing.fail.store(true, Ordering::SeqCst);
+    assert_eq!(
+        pushing.down(&lab, "first", Act::Off, NOW + 1),
+        (Touched::Quieted, Some(Err("no peer took it".to_owned())))
+    );
+    assert!(!free_on(&peer, NOW + 1), "the failed push reached nobody");
+
+    pushing.fail.store(false, Ordering::SeqCst);
+    assert_eq!(
+        pushing.down(&lab, "first", Act::Off, NOW + 2),
+        (Touched::Quieted, Some(Ok(())))
+    );
+    assert!(free_on(&peer, NOW + 2));
+    assert_eq!(pushing.pushes(), 2);
+}
+
+/// An off gives up every claim though a record a look or a claim needs cannot be read: the
+/// activity lock busy, the activity book corrupt or unsavable, the roster malformed, the logins
+/// unreadable. Each of those refuses a claim (and a look), but no record keeps a claim through an
+/// off, so none refuses it, and the claim does not stand to the row's `until`.
+///
+/// NEGATIVE CONTROL: drop the `Err(_) if off` arms in `touch_reading` and the `Act::Off`
+/// exception in `touch_using`'s write, and every case is `Unrecorded` with the claim standing.
+#[test]
+fn an_off_gives_up_every_claim_whatever_record_cannot_be_read() {
+    let cases = ["busy", "corrupt", "unsavable", "roster", "logins"];
+    let outcomes = cases.map(|case| {
+        let lab = Lab::new();
+        assert_eq!(
+            lab.touch("first", Act::Claim("alpha"), NOW),
+            Touched::Claimed,
+            "{case}"
+        );
+        let mut held = None;
+        match case {
+            "busy" => held = Some(Held::take(lab.root.path()).unwrap()),
+            "corrupt" => std::fs::write(
+                lab.root.path().join(".aterm/claim-activity").join(FILE),
+                b"{",
+            )
+            .unwrap(),
+            "unsavable" => {
+                let active = Held::take(lab.root.path()).unwrap();
+                // A directory at the output path forces the atomic rename to fail.
+                std::fs::remove_file(active.dir.join(FILE)).unwrap();
+                std::fs::create_dir(active.dir.join(FILE)).unwrap();
+                held = Some(active);
+            }
+            "roster" => std::fs::write(&lab.roster, "[[account").unwrap(),
+            _ => {
+                std::fs::write(lab.state("first").logins_file(), "retained invalid record").unwrap()
+            }
+        }
+        let touched = if let Some(active) = held.as_mut().filter(|_| case == "unsavable") {
+            let mut state = lab.state("first").load(NOW).unwrap().0;
+            touch_using(
+                &lab.table,
+                lab.root.path(),
+                None,
+                &mut state,
+                Cli::Claude,
+                &[("alpha".into(), key())],
+                Act::Off,
+                NOW + 1,
+                Ok(Some(active)),
+            )
+        } else {
+            lab.touch("first", Act::Off, NOW + 1)
+        };
+        (case, touched, lab.row().claims.is_empty())
+    });
+    assert_eq!(outcomes, cases.map(|case| (case, Touched::Quieted, true)));
 }
 
 #[test]
@@ -739,6 +1116,9 @@ pub(crate) fn observation_transition(
     use super::super::{Claim, HORIZON_S, MAX_CLAIMS, Table, Tabled};
     let mut output = state.clone();
     match action {
+        "Prepare" => {
+            output.insert("prepared", 1);
+        }
         "Fault" => {
             output.insert("fault", state["fault"] + 1);
         }
@@ -844,6 +1224,9 @@ pub(crate) fn observation_transition(
                 writable: state["fault"] != 3,
             };
             let mut local = accounts::State::default();
+            if state["prepared"] == 1 {
+                local.prepared_accounts.insert("alpha".into());
+            }
             let result = touch_using(
                 &table,
                 lab.root.path(),
@@ -855,14 +1238,15 @@ pub(crate) fn observation_transition(
                 NOW,
                 activity,
             );
+            if state["prepared"] == 1 {
+                assert_eq!(result, Touched::PreparationOnly);
+            }
             output.insert("phase", 1);
-            output.insert(
-                "observed",
-                i64::from(matches!(
-                    local.lease_verdict("alpha", NOW),
-                    Err(accounts::WhyNot::LeasedElsewhere { .. })
-                )),
-            );
+            let peer_leased = local
+                .leases
+                .get("alpha")
+                .is_some_and(|lease| lease.until > NOW && !local.owns_swarm_label(&lease.holder));
+            output.insert("observed", i64::from(peer_leased));
             output.insert("accepted", i64::from(matches!(result, Touched::Claimed)));
             output.insert("intent", i64::from(local.claimed_at.contains_key("alpha")));
         }
@@ -899,4 +1283,20 @@ fn failed_publications_preserve_peer_observations_and_conform() {
     revived.insert("intent", 1);
     assert!(!model.check_invariant("PeerBlocksNewGrant", &revived));
     assert!(!model.successors("Touch", &expired).contains(&revived));
+    let held = observation_transition(&model.init_state(), "Prepare");
+    let mut forbidden = observation_transition(&held, "Touch");
+    forbidden.insert("accepted", 1);
+    forbidden.insert("intent", 1);
+    assert!(!model.check_invariant("PreparedCannotClaim", &forbidden));
+    assert!(!model.successors("Touch", &held).contains(&forbidden));
+    let held_peer = observation_transition(&held, "Peer");
+    let observed = observation_transition(&held_peer, "Touch");
+    assert_eq!(
+        (
+            observed["observed"],
+            observed["accepted"],
+            observed["intent"]
+        ),
+        (1, 0, 0)
+    );
 }

@@ -93,6 +93,11 @@ fn note(sig: libc::c_int) {
     }
 }
 
+#[cfg(test)]
+pub(super) fn note_for_test(sig: libc::c_int) {
+    note(sig);
+}
+
 /// The handler of [`PASSED_ON`]'s signals.
 extern "C" fn pass_on(sig: libc::c_int) {
     note(sig);
@@ -182,6 +187,8 @@ fn pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
             return Err(std::io::Error::last_os_error());
         }
     }
+    let _ = aterm_uds::keep_out_of_children(&read);
+    let _ = aterm_uds::keep_out_of_children(&write);
     // SAFETY: as above.
     if unsafe { libc::fcntl(write.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) } != 0 {
         return Err(std::io::Error::last_os_error());
@@ -265,7 +272,17 @@ impl Front {
             .spawn(move || forward(read, &theirs))
             .ok()?;
         NOTE_TO.store(write.as_raw_fd(), Ordering::SeqCst);
-        let terminal = std::fs::File::open("/dev/tty").ok();
+        let terminal = {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK)
+                .open("/dev/tty")
+                .ok()
+        };
+        if let Some(tty) = &terminal {
+            let _ = aterm_uds::keep_out_of_children(tty);
+        }
         TERMINAL.store(
             terminal
                 .as_ref()
@@ -364,8 +381,8 @@ impl Front {
 
     /// DISARM: put back every disposition [`Self::arm`] and [`Self::aim`] replaced, let every
     /// noted signal be sent, and end the forwarding thread; then a signal that arrived for a build
-    /// that never started ends this process, with its default action (none of [`PASSED_ON`] dumps
-    /// a core).
+    /// that never started ends this process. Signals with no core use their default action;
+    /// core signals use the shell-style exit code `128 + signal`, as [`super::end_like`] does.
     pub fn disarm(mut self) {
         self.end();
     }
@@ -404,16 +421,11 @@ impl Front {
             .unwrap_or_else(PoisonError::into_inner)
             .take();
         if let Some(sig) = unsent {
-            // SAFETY: `signal` with the default action for one of PASSED_ON's signals, none of
-            // which dumps a core; `raise` delivers it to this thread.
-            unsafe {
-                libc::signal(sig, libc::SIG_DFL);
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "re-raises a signal that dumps no core (PASSED_ON) held for a build that never started"
-                )]
-                libc::raise(sig);
-            }
+            use std::os::unix::process::ExitStatusExt as _;
+            super::raise_like(&std::process::ExitStatus::from_raw(sig));
+            // A core signal is represented by its exit code, never raised. A failed noncore
+            // raise must not turn the queued signal into an unrelated return either.
+            std::process::exit(128 + sig);
         }
     }
 }

@@ -126,6 +126,29 @@ fn boot(root: &Path, tag: &str, lab: bool) -> Proc {
     proc
 }
 
+/// `status`'s `log_journal=` and `log_journal_why=`, `<none>` for a key it leaves out (fix
+/// unit E5).
+fn journal_words(sock: &str) -> (String, String) {
+    let line = Ctl::connect(sock).status();
+    let fields = crate::live_ctl::fields(&line);
+    let word = |key: &str| fields.get(key).map_or("<none>", |v| v).to_string();
+    (word("log_journal"), word("log_journal_why"))
+}
+
+/// Waits until `status` says `journal`/`why`, a hang detector: the writer's thread
+/// publishes `on` after it starts, so `armed` can show first.
+fn await_journal_words(sock: &str, journal: &str, why: &str) {
+    let mut last = (String::new(), String::new());
+    let said = aterm_spec::wait::within(HANG, Duration::from_millis(25), || {
+        last = journal_words(sock);
+        (last.0 == journal && last.1 == why).then_some(())
+    });
+    assert!(
+        said.is_some(),
+        "status says log_journal={journal} log_journal_why={why}, not {last:?}"
+    );
+}
+
 /// The boot session's sid (`sessions`: `<local> <sid> …`).
 fn boot_sid(ctl: &mut Ctl) -> String {
     let (_, rows) = ctl.counted("sessions");
@@ -194,12 +217,14 @@ fn a_then_b(root: &Path) -> (String, String, Vec<String>, Proc) {
 }
 
 /// B answers `log @<A's sid>` from A's journal; a plain headless instance and
-/// `[session_log] journal = false` keep no journal.
+/// `[session_log] journal = false` keep no journal; `status log_journal=` and
+/// `log_journal_why=` say which (fix unit E5).
 #[test]
 fn the_journal_is_on_by_default_and_answers_for_an_earlier_process() {
     use std::os::unix::fs::PermissionsExt as _;
     let world = scratch_world("on", "");
     let (sid, header, lines, b) = a_then_b(world.path());
+    await_journal_words(&b.sock, "on", "-");
     let journal = journal_dir(world.path());
     let mode = |p: &Path| {
         std::fs::metadata(p)
@@ -265,6 +290,11 @@ fn the_journal_is_on_by_default_and_answers_for_an_earlier_process() {
     drop(b);
     let plain = scratch_world("plain", "");
     let mut c = boot(plain.path(), "c", false);
+    assert_eq!(
+        journal_words(&c.sock),
+        ("off".to_string(), "no-desk".to_string()),
+        "a plain headless instance says why it keeps no journal"
+    );
     quit(&mut c);
     drop(c);
     assert!(
@@ -273,6 +303,11 @@ fn the_journal_is_on_by_default_and_answers_for_an_earlier_process() {
     );
     let off = scratch_world("off", "[session_log]\njournal = false\n");
     let (sid, header, _, b) = a_then_b(off.path());
+    assert_eq!(
+        journal_words(&b.sock),
+        ("off".to_string(), "disabled".to_string()),
+        "`journal = false` says so"
+    );
     assert!(
         !journal_dir(off.path()).exists(),
         "`journal = false` creates nothing"

@@ -28,21 +28,21 @@ USAGE:
     start      Put the mug in the menu bar as a launchd job of this login
                (acaffiene=started), or name the one there (acaffiene=running
                pid=<n>). The default.
-    on [span]  Keep the Mac awake for the span, then forever (forever by
-               default; a span is at most a year), and put the mug in the
-               menu bar. acaffiene=requested until=… (the span's end) says
-               the request is saved, not that the mug took it.
+    on [span]  Keep the Mac awake for the span (forever by default; at most a
+               year), then let it sleep, and put the mug in the menu bar.
+               acaffiene=requested until=… says the request is saved, not that
+               the mug took it.
     off        Stop keeping it awake; the mug stays, empty (acaffiene=off).
-    status     acaffiene=on|off (the saved mode while a mug runs; a mug whose
-               activity was refused saves off), until=<unix seconds>|forever|-
-               (a span's end, after which it reads forever), menu=running and
-               pid=<n>, or menu=stopped, then the running mug's job (else this
-               build's): startup=on|off|blocked|disabled and label=<launchd
-               label>. It reads what was saved; `pmset -g assertions` shows
-               whether the activity is held.
+    status     acaffiene=on|off (the saved mode while a mug runs),
+               until=<unix seconds>|forever|-, menu=running and pid=<n>, or
+               menu=stopped, then the running mug's job (else this build's):
+               startup=on|off|blocked|disabled and label=<launchd label>. It
+               reads what was saved; `aterm doctor`'s awake: row reads whether
+               macOS holds the mug's assertion.
     startup    Say whether this build's mug starts at every login; `on` or `off`
                sets it (a plist in ~/Library/LaunchAgents; `off` also removes
                any whose build is gone) and leaves the running mug as it is.
+               An `off` is kept: no aterm launch turns it back on.
                `blocked`: aterm's switch under Background App Activity (System
                Settings > General > Login Items & Extensions) is off, so no
                login starts it, and `on` exits 1 until that switch is on.
@@ -52,21 +52,31 @@ USAGE:
                acaffiene=stopped when none ran). `own`: only this build's mug and
                job; another build's is left as it is, on or off.
     serve      Run the mug in this process (what its launchd job runs). It
-               exits 0 even when it refuses, so launchd does not restart it,
-               and, as that job, 75 when an update replaces its aterm, so
-               launchd starts the new one, or when a mode set on while it
-               quits overtakes the Quit, so launchd starts it again.
+               exits 0 when it does not run here (another mug runs, or this is
+               not the login's process) and when it cannot keep the Mac awake
+               for a reason no start again cures (a refused menu bar, a lock
+               path that is a directory), which it records for `aterm doctor`;
+               69 when the reason can clear up (a full disk, a lock another
+               process holds a moment), so launchd starts it again about a
+               minute later, from the copy of the app it ran from; and, as that
+               job, 75 when an update replaces its aterm, so launchd starts the
+               new one, or when a mode set on while it quits overtakes the
+               Quit, so launchd starts it again.
     bridge     Keep the Mac awake while the mug restarts onto an aterm update,
                until the new mug takes over or keep-awake ends, at most 21 min
                (what a restarting mug runs).
 
-Every ordinary aterm window launch starts the mug and keeps the Mac awake forever;
-headless, diagnostic and private-control launches do not, and a window that an
-update or a launch-record renewal restarts keeps the mode as saved. Quit ends it
-until the next aterm launch, which turns it back on. Enable at Startup separately
-starts it at every login. Missing state, a reboot and an expired span return to
-forever.
-Exit status: 1 when a command fails, 2 for a refused command line. macOS only.
+Unless you turned it off, every ordinary aterm window (at launch and every five
+minutes) and the vault subscriber's converge pass make sure the mug runs and turn
+the installed app's Enable at Startup on (in /Applications or ~/Applications), so
+a restart keeps the Mac awake with no window open; headless, diagnostic and
+private-control launches do nothing. An off you choose (a click, off, quit, Quit,
+or the end of a span) lasts, through a restart too, until you turn it on again;
+so does turning Enable at Startup off, after which the subscriber's pass leaves
+the mug to a window. A quit from outside the menu (a SIGTERM, Activity Monitor)
+stops the mug and keeps its mode: the next window, pass or login starts it again.
+With no saved state it keeps the Mac awake forever. Exit status: 1 when a command
+fails, 2 for a refused command line. macOS only.
 ";
 
 /// One parsed `aterm acaffiene` command line.
@@ -261,27 +271,217 @@ fn run(command: Command, version: &str) -> ExitCode {
     }
 }
 
-/// How an ordinary aterm window came to start, as [`autostart`] takes it.
-#[cfg(target_os = "macos")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Launch {
-    /// A launch: the mug is set to forever and started.
-    Fresh,
-    /// A running window's successor, an update's or a launch-record renewal's, which can come
-    /// while the person is away: the mug is started only when the mode saved restores on, and
-    /// nothing is saved, so their Off or Quit carries over it as over the mug's own restart onto
-    /// an update.
-    Successor,
+/// What keeping this Mac awake found or did ([`keep_awake`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Kept {
+    /// This process is not the login's (a private state root, another home, not macOS): why.
+    /// Nothing was read or started.
+    NotHere(String),
+    /// The person turned keep-awake off: nothing was started.
+    Off,
+    /// A mug runs (its pid), or launchd was asked to start one (`None`).
+    Running(Option<u32>),
+    /// The mug could not be started, or the installed app did not say whether it can serve
+    /// one: why (a start that failed is recorded, [`crate::trouble`]).
+    Failed(String),
 }
 
-/// Start the mug for an ordinary aterm window ([`Launch`]), without writing to its standard
-/// output.
-#[cfg(target_os = "macos")]
-pub fn autostart(launch: Launch) {
-    mac::autostart(launch);
+impl Kept {
+    /// What it says, in one line.
+    #[must_use]
+    pub fn line(&self) -> String {
+        match self {
+            Self::NotHere(why) => format!("not this login's to keep awake: {why}"),
+            Self::Off => "off by your choice (`aterm acaffiene on` turns it on)".to_string(),
+            Self::Running(Some(pid)) => format!("the mug (pid {pid}) keeps this Mac awake"),
+            Self::Running(None) => "launchd was asked to start the mug".to_string(),
+            Self::Failed(why) => format!("the mug did not start: {why}"),
+        }
+    }
+}
+
+/// What keeping this Mac awake does, given what was read ([`keep_awake`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeepPlan {
+    /// Start the mug.
+    pub start: bool,
+    /// Turn Enable at Startup on.
+    pub turn_startup_on: bool,
+}
+
+/// The plan for a saved mode that is `on` now, for an installed app's mug when `installed` (in
+/// `/Applications` or `~/Applications`, [`crate::launchd::is_installed`]), whose Enable at
+/// Startup is `startup_on`, and which the person turned off when `startup_turned_off`. A
+/// person's off, of the mode or of Enable at Startup, is never undone: nothing here writes the
+/// mode, and only an installed app's job is put at every login.
+#[must_use]
+pub const fn keep_plan(
+    on: bool,
+    installed: bool,
+    startup_on: bool,
+    startup_turned_off: bool,
+) -> KeepPlan {
+    KeepPlan {
+        start: on,
+        turn_startup_on: on && installed && !startup_on && !startup_turned_off,
+    }
+}
+
+/// The trouble the window raises now ([`crate::trouble`]): its why once it has lasted
+/// [`crate::trouble::LASTING_SECS`] at `now` (Unix seconds), unless the person turned keep-awake
+/// off or this process is not the login's.
+#[must_use]
+pub fn lasting_trouble(
+    kept: &Kept,
+    trouble: Option<&crate::trouble::Trouble>,
+    now: u64,
+) -> Option<String> {
+    match kept {
+        Kept::NotHere(_) | Kept::Off => None,
+        Kept::Running(_) | Kept::Failed(_) => trouble
+            .filter(|trouble| trouble.lasting(now))
+            .map(|trouble| trouble.why.clone()),
+    }
+}
+
+/// Make sure this build's mug keeps this Mac awake, unless the person turned it off: what the
+/// old `aterm caffeine` name left tidied once a process ([`crate::legacy::tidy`]), the installed
+/// app's Enable at Startup turned on unless the person turned it off, and the mug started.
+/// Nothing is written to standard output: an ordinary window's launch and its watch run it.
+#[must_use]
+pub fn keep_awake() -> Kept {
+    #[cfg(target_os = "macos")]
+    {
+        mac::keep_awake()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Kept::NotHere("aCaffiene is macOS only".to_string())
+    }
+}
+
+/// [`keep_awake`] for the installed app's mug, whichever aterm runs it: the converge pass, whose
+/// runner may be a build or a held copy of the app. It first retires the old `aterm caffeine`
+/// name's login jobs no aterm will run again ([`crate::legacy::retire_jobs`], which takes no lock
+/// and touches no copy), whatever the app or the mode, so a pass that starts the mug on a Mac
+/// where no window opens after a restart stops them too. The app is the first in
+/// `/Applications` or `~/Applications` that has the `acaffiene` verb ([`installed_app`]); with
+/// none, nothing is started ([`Kept::NotHere`]), and one that did not answer is
+/// [`Kept::Failed`].
+#[must_use]
+pub fn keep_installed_awake() -> Kept {
+    #[cfg(target_os = "macos")]
+    {
+        mac::keep_installed_awake()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Kept::NotHere("aCaffiene is macOS only".to_string())
+    }
+}
+
+/// What the window's keep-awake watch does with its exceptions entry after a pass
+/// ([`EntryWatch::step`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EntryWord {
+    /// Raise it, saying why.
+    Raise(String),
+    /// Clear it, whichever process raised it.
+    Clear,
+}
+
+/// The window's memory of the exceptions entry its keep-awake watch raised.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EntryWatch {
+    /// The why this process raised, until it cleared it.
+    raised: Option<String>,
+}
+
+impl EntryWatch {
+    /// What to do with the entry after a pass that found `kept` and `lasting`
+    /// ([`lasting_trouble`]): a lasting trouble is raised once for each why; with none, the entry
+    /// is cleared on every pass that read the mug, because the messages log keeps an entry an
+    /// earlier process raised (before a quit or an update's relaunch), which this process never
+    /// raised and must clear all the same, and a clear by key that finds nothing ends nothing.
+    /// A process that is not the login's reads nothing and says nothing.
+    pub fn step(&mut self, kept: &Kept, lasting: Option<String>) -> Option<EntryWord> {
+        match lasting {
+            Some(why) if self.raised.as_deref() == Some(why.as_str()) => None,
+            Some(why) => {
+                self.raised = Some(why.clone());
+                Some(EntryWord::Raise(why))
+            }
+            None if matches!(kept, Kept::NotHere(_)) => None,
+            None => {
+                self.raised = None;
+                Some(EntryWord::Clear)
+            }
+        }
+    }
+
+    /// Whether this process raised the entry and has not cleared it.
+    #[must_use]
+    pub const fn raised(&self) -> bool {
+        self.raised.is_some()
+    }
+}
+
+/// [`keep_awake`], and the trouble the window raises now ([`lasting_trouble`]).
+#[must_use]
+pub fn keep_awake_watch() -> (Kept, Option<String>) {
+    let kept = keep_awake();
+    #[cfg(target_os = "macos")]
+    let trouble = mac::login_paths()
+        .ok()
+        .and_then(|paths| crate::trouble::read(&paths));
+    #[cfg(not(target_os = "macos"))]
+    let trouble = None;
+    let now = aterm_time::unix_secs().unwrap_or_default();
+    let lasting = lasting_trouble(&kept, trouble.as_ref(), now);
+    (kept, lasting)
+}
+
+/// The installed app whose mug a pass with no window keeps: the first in `/Applications` or
+/// `~/Applications` with the `acaffiene` verb ([`crate::launchd::serving_install`]).
+#[must_use]
+pub fn installed_app() -> crate::launchd::Installed {
+    #[cfg(target_os = "macos")]
+    {
+        match mac::login_paths() {
+            Ok(paths) => mac::installed(&paths),
+            Err(why) => crate::launchd::Installed::Absent(why),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        crate::launchd::Installed::Absent("aCaffiene is macOS only".to_string())
+    }
+}
+
+/// Whether the person turned an installed app's Enable at Startup off
+/// ([`crate::launchd::choose_startup`]): the subscriber's pass, which runs at login with no
+/// window, then leaves the mug to a window.
+#[must_use]
+pub fn installed_startup_turned_off() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        mac::login_paths().is_ok_and(|paths| {
+            crate::launchd::installed_executables(&paths.home)
+                .iter()
+                .any(|exe| {
+                    crate::launchd::startup_turned_off(&paths, &crate::launchd::label_for(exe))
+                })
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
 }
 
 /// The mug's files, when this process has the login's own roots ([`mac::login_paths`]).
+/// # Errors
+/// Why this process is not the login's.
 #[cfg(target_os = "macos")]
 pub(crate) fn login_paths() -> Result<crate::paths::Paths, String> {
     mac::login_paths()
@@ -303,12 +503,13 @@ mod mac {
     use std::process::ExitCode;
     use std::time::{Duration, Instant};
 
+    use super::Kept;
     use crate::code;
     use crate::instance::{self, Instance};
     use crate::launchd::{self, JobState, Started};
     use crate::model::{Clocks, Mode};
     use crate::paths::Paths;
-    use crate::state;
+    use crate::{state, trouble};
 
     /// The verb's name, as its answers and errors say it.
     const VERB: &str = "aterm acaffiene";
@@ -332,10 +533,10 @@ mod mac {
     }
 
     /// Where a verb acts: the mug's files, this executable (canonical), and its job's label.
-    struct Here {
-        paths: Paths,
-        origin: PathBuf,
-        label: String,
+    pub(super) struct Here {
+        pub paths: Paths,
+        pub origin: PathBuf,
+        pub label: String,
     }
 
     /// The mug's files, when this process has the login's own roots. The mug is a launchd job of
@@ -405,7 +606,7 @@ mod mac {
     }
 
     /// Whether a mug runs now, or how it was started.
-    #[derive(Debug, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(super) enum Running {
         /// One runs, with this pid.
         Already(u32),
@@ -431,9 +632,14 @@ mod mac {
     /// Make sure a mug runs: the one holding the lock, else this build's job, started
     /// ([`ensure_with`]).
     fn ensure(here: &Here) -> Result<Running, String> {
+        ensure_at(&here.paths, &here.label, &here.origin)
+    }
+
+    /// [`ensure`] for the job `label` running `origin` ([`ensure_with`]).
+    fn ensure_at(paths: &Paths, label: &str, origin: &Path) -> Result<Running, String> {
         ensure_with(
-            || running_mug(&here.paths),
-            || launchd::ensure_running(&here.paths, &here.label, &here.origin),
+            || running_mug(paths),
+            || launchd::ensure_running(paths, label, origin),
             Instant::now() + SETTLE,
             || std::thread::sleep(SETTLE_POLL),
         )
@@ -485,16 +691,17 @@ mod mac {
     /// How often a change waiting for another's looks again.
     const CHANGE_POLL: Duration = Duration::from_millis(20);
 
-    /// Take this login's turn to change the mode and start or end the mug on it: a window's
-    /// start, `on` and [`quit`] each hold it from the read or save of the mode to the start or
-    /// end of the mug, and a job's mug ending after the person's Quit from before it removes its
-    /// copy, its lock still held, over its let-go of the lock, its read of the mode and its naming
-    /// of the job again, so none runs inside another. A `quit` run between a window's
-    /// save of forever and its start would otherwise save off, find no mug to end and answer
-    /// `stopped`, and the window would then start a mug that reads off. The turn is a `flock` on
-    /// the session plists' folder ([`Paths::session_dir`]), made if missing, which no save of the
-    /// mode locks ([`state::Held`]); `None`, with why passed to `said`, when it is not taken
-    /// within [`CHANGE_WAIT`] or cannot be, and the change goes on without it.
+    /// Take this login's turn to change the mode and start or end the mug on it: a keep-awake
+    /// pass ([`keep_awake_at`], a window's or the converge pass's), `on` and [`quit`] each hold it
+    /// from the read or save of the mode to the start or end of the mug, and a job's mug ending
+    /// after the person's Quit from before it removes its copy, its lock still held, over its
+    /// let-go of the lock, its read of the mode and its naming of the job again, so none runs
+    /// inside another. A `quit` run between a window's read of an on mode and its start would
+    /// otherwise save off, find no mug to end and answer `stopped`, and the window would then
+    /// start a mug that reads off. The turn is a `flock` on the session plists' folder
+    /// ([`Paths::session_dir`]), made if missing, which no save of the mode locks
+    /// ([`state::Held`]); `None`, with why passed to `said`, when it is not taken within
+    /// [`CHANGE_WAIT`] or cannot be, and the change goes on without it.
     pub(super) fn change(paths: &Paths, said: impl FnOnce(String)) -> Option<state::Held> {
         match change_in(&paths.session_dir(), CHANGE_WAIT) {
             Ok(held) => Some(held),
@@ -522,6 +729,25 @@ mod mac {
         }
     }
 
+    /// What [`keep_awake_at`] reaches beyond the mug's files (launchd), so a test runs it over a
+    /// scratch root with nothing started.
+    #[derive(Clone, Copy)]
+    pub(super) struct KeepDoors {
+        /// [`launchd::prune_orphans`].
+        pub prune_orphans: fn(&Paths),
+        /// [`launchd::set_startup`].
+        pub set_startup: fn(&Paths, &str, &Path, bool) -> std::io::Result<()>,
+        /// Make sure a mug runs ([`ensure_at`]).
+        pub ensure: fn(&Paths, &str, &Path) -> Result<Running, String>,
+    }
+
+    /// The live doors.
+    const LIVE_KEEP: KeepDoors = KeepDoors {
+        prune_orphans: launchd::prune_orphans,
+        set_startup: launchd::set_startup,
+        ensure: ensure_at,
+    };
+
     pub(super) fn start() -> ExitCode {
         let here = match here() {
             Ok(here) => here,
@@ -535,86 +761,163 @@ mod mac {
         }
     }
 
-    pub(super) fn autostart(launch: super::Launch) {
+    /// [`super::keep_awake`] for this executable's mug. The first pass of a process also retires
+    /// what the old `aterm caffeine` name left ([`crate::legacy::tidy`]) and removes the
+    /// temporaries that cut-short writes left beside the state files ([`state::sweep_temps`]) and
+    /// the job plists ([`launchd::sweep_plist_temps`]), once for each window launch, as the
+    /// autostart did before the watch.
+    pub(super) fn keep_awake() -> Kept {
+        static TIDY: std::sync::Once = std::sync::Once::new();
         let here = match here() {
             Ok(here) => here,
-            Err(why) => {
-                aterm_log::warn!("acaffiene: could not start with aterm: {why}");
-                return;
-            }
+            Err(why) => return Kept::NotHere(why),
         };
-        launchd::prune_orphans(&here.paths);
-        for line in crate::legacy::tidy(&here.paths, &here.origin) {
+        TIDY.call_once(|| {
+            for line in crate::legacy::tidy(&here.paths, &here.origin) {
+                aterm_log::warn!("acaffiene: what `aterm caffeine` left: {line}");
+            }
+            let beside = state::sweep_temps(&here.paths);
+            let plists = launchd::sweep_plist_temps(&here.paths);
+            for (file, swept) in beside.into_iter().chain(plists) {
+                match swept {
+                    Ok(0) => {}
+                    Ok(gone) => {
+                        let noun = if gone == 1 {
+                            "temporary"
+                        } else {
+                            "temporaries"
+                        };
+                        aterm_log::info!(
+                            "acaffiene: removed {gone} {noun} of {} that writes cut short left",
+                            file.display()
+                        );
+                    }
+                    Err(e) => {
+                        aterm_log::warn!("acaffiene: temporaries of {}: {e}", file.display());
+                    }
+                }
+            }
+        });
+        match now() {
+            Ok(now) => keep_awake_at(&here, now, &LIVE_KEEP),
+            Err(why) => Kept::Failed(why),
+        }
+    }
+
+    /// The installed app whose mug a pass with no window keeps ([`launchd::serving_install`]):
+    /// this process's own executable needs no asking.
+    pub(super) fn installed(paths: &Paths) -> launchd::Installed {
+        let own = std::env::current_exe().and_then(std::fs::canonicalize).ok();
+        launchd::serving_install(
+            &launchd::installed_present(&paths.home),
+            own.as_deref(),
+            code::serves_acaffiene,
+        )
+    }
+
+    /// [`super::keep_installed_awake`]: the installed app's mug (in `/Applications` or
+    /// `~/Applications`), when one installed there has the `acaffiene` verb ([`installed`]); an
+    /// older aterm there is never started as the job, which would fail every ten seconds.
+    pub(super) fn keep_installed_awake() -> Kept {
+        match login_paths() {
+            Ok(paths) => keep_installed_awake_with(paths, &LIVE_INSTALLED),
+            Err(why) => Kept::NotHere(why),
+        }
+    }
+
+    /// What [`keep_installed_awake_with`] reaches beyond the login's files, so a test runs it over
+    /// a scratch root with nothing asked, retired or started.
+    #[derive(Clone, Copy)]
+    pub(super) struct InstalledDoors {
+        /// Retire the old name's login jobs no aterm will run again ([`retire_old_jobs`]).
+        pub retire_old: fn(&Paths) -> Vec<String>,
+        /// The installed app whose mug is kept ([`installed`]).
+        pub installed: fn(&Paths) -> launchd::Installed,
+        /// Both clocks ([`now`]).
+        pub now: fn() -> Result<Clocks, String>,
+        /// [`keep_awake_at`]'s doors.
+        pub keep: KeepDoors,
+    }
+
+    /// The live doors.
+    const LIVE_INSTALLED: InstalledDoors = InstalledDoors {
+        retire_old: retire_old_jobs,
+        installed,
+        now,
+        keep: LIVE_KEEP,
+    };
+
+    /// [`keep_installed_awake`] under the login's `paths`: the old name's login jobs no aterm will
+    /// run again retired first, whatever the installed app or the mode, then the installed app's
+    /// mug kept ([`keep_awake_at`]).
+    pub(super) fn keep_installed_awake_with(paths: Paths, doors: &InstalledDoors) -> Kept {
+        for line in (doors.retire_old)(&paths) {
             aterm_log::warn!("acaffiene: what `aterm caffeine` left: {line}");
         }
-        let beside = state::sweep_temps(&here.paths);
-        let plists = launchd::sweep_plist_temps(&here.paths);
-        for (file, swept) in beside.into_iter().chain(plists) {
-            match swept {
-                Ok(0) => {}
-                Ok(gone) => {
-                    let noun = if gone == 1 {
-                        "temporary"
-                    } else {
-                        "temporaries"
-                    };
-                    aterm_log::info!(
-                        "acaffiene: removed {gone} {noun} of {} that writes cut short left",
-                        file.display()
-                    );
-                }
-                Err(e) => aterm_log::warn!("acaffiene: temporaries of {}: {e}", file.display()),
-            }
+        let origin = match (doors.installed)(&paths) {
+            launchd::Installed::At(origin) => origin,
+            launchd::Installed::Absent(why) => return Kept::NotHere(why),
+            launchd::Installed::Unanswered(why) => return Kept::Failed(why),
+        };
+        let now = match (doors.now)() {
+            Ok(now) => now,
+            Err(why) => return Kept::Failed(why),
+        };
+        let here = Here {
+            label: launchd::label_for(&origin),
+            paths,
+            origin,
+        };
+        keep_awake_at(&here, now, &doors.keep)
+    }
+
+    /// Retire the old name's login jobs no aterm will run again for this executable
+    /// ([`crate::legacy::retire_jobs`]): the part of [`crate::legacy::tidy`] that takes no lock
+    /// and touches no copy. What could not be removed, one line each.
+    fn retire_old_jobs(paths: &Paths) -> Vec<String> {
+        match std::env::current_exe().and_then(std::fs::canonicalize) {
+            Ok(exe) => crate::legacy::retire_jobs(paths, &exe),
+            Err(e) => vec![format!("this executable's path cannot be read: {e}")],
         }
+    }
+
+    /// Keep this Mac awake with `here`'s mug unless the person turned keep-awake off: an
+    /// installed app's Enable at Startup ([`launchd::is_installed`]) turned on unless the person
+    /// turned it off, then the mug started. Nothing here writes the mode: with no saved state the
+    /// mug keeps the Mac awake forever, and a person's off is theirs. The read of the mode and
+    /// the start of the mug are one [`change`], so a `quit` waits for the start rather than end
+    /// nothing and leave a mug starting to read its off. A start that fails is recorded
+    /// ([`trouble::note`]).
+    pub(super) fn keep_awake_at(here: &Here, now: Clocks, doors: &KeepDoors) -> Kept {
         let _turn = change(&here.paths, |why| aterm_log::warn!("acaffiene: {why}"));
-        match plan(launch, &here.paths.state_file(), now().ok()) {
-            Plan::Forever => {
-                if let Err(why) = set_mode(&here.paths, Mode::Forever) {
-                    aterm_log::warn!(
-                        "acaffiene: did not start with aterm to keep this Mac awake: saving \
-                         forever failed: {why}"
-                    );
-                    return;
-                }
-            }
-            Plan::Start => {}
-            Plan::Leave => {
-                aterm_log::info!(
-                    "acaffiene: not started with this window, which takes over a running one: \
-                     the mode saved is off"
-                );
-                return;
+        let wanted = state::load(&here.paths.state_file(), now).is_on(now);
+        (doors.prune_orphans)(&here.paths);
+        let plan = super::keep_plan(
+            wanted,
+            launchd::is_installed(&here.origin, &here.paths.home),
+            launchd::startup_enabled(&here.paths, &here.label),
+            launchd::startup_turned_off(&here.paths, &here.label),
+        );
+        if !plan.start {
+            trouble::clear(&here.paths);
+            return Kept::Off;
+        }
+        if plan.turn_startup_on {
+            match (doors.set_startup)(&here.paths, &here.label, &here.origin, true) {
+                Ok(()) => aterm_log::info!(
+                    "acaffiene: Enable at Startup is on, as aterm installs it ({})",
+                    here.paths.startup_plist(&here.label).display()
+                ),
+                Err(e) => aterm_log::warn!("acaffiene: could not turn on Enable at Startup: {e}"),
             }
         }
-        if let Err(why) = ensure(&here) {
-            aterm_log::warn!("acaffiene: could not start with aterm: {why}");
-        }
-    }
-
-    /// What [`autostart`] does with the mug.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(super) enum Plan {
-        /// Save forever, then make sure the mug runs.
-        Forever,
-        /// Make sure the mug runs, saving nothing.
-        Start,
-        /// Leave the mug and its mode as they are.
-        Leave,
-    }
-
-    /// What [`autostart`] does for `launch` with the mode saved in `file`, at `now` (`None`: the
-    /// clocks could not be read). A launch saves forever; a successor starts the mug only when
-    /// that mode restores on ([`state::load`]), as with no file, for a build that has not run
-    /// the mug yet, and leaves it otherwise, as it does when the clocks cannot be read.
-    pub(super) fn plan(launch: super::Launch, file: &Path, now: Option<Clocks>) -> Plan {
-        match launch {
-            super::Launch::Fresh => Plan::Forever,
-            super::Launch::Successor
-                if now.is_some_and(|now| state::load(file, now).is_on(now)) =>
-            {
-                Plan::Start
+        match (doors.ensure)(&here.paths, &here.label, &here.origin) {
+            Ok(Running::Already(pid)) => Kept::Running(Some(pid)),
+            Ok(Running::Started) => Kept::Running(None),
+            Err(why) => {
+                trouble::note(&here.paths, &format!("the mug did not start: {why}"));
+                Kept::Failed(why)
             }
-            super::Launch::Successor => Plan::Leave,
         }
     }
 
@@ -623,6 +926,9 @@ mod mac {
         let file = paths.state_file();
         state::save(&file, mode).map_err(|e| format!("{}: {e}", file.display()))?;
         crate::notify::post_changed();
+        if mode == Mode::Off {
+            turned_off(paths);
+        }
         Ok(())
     }
 
@@ -657,6 +963,12 @@ mod mac {
         }
     }
 
+    /// The person's off is saved: nothing keeps the Mac awake for them now, so no trouble keeping
+    /// it awake is theirs to hear of.
+    fn turned_off(paths: &Paths) {
+        trouble::clear(paths);
+    }
+
     pub(super) fn status() -> ExitCode {
         let (here, now) = match here_now() {
             Ok(both) => both,
@@ -680,14 +992,14 @@ mod mac {
 
     /// Enable at Startup for this build's job: the plist it writes runs this executable.
     /// On also lifts launchd's disable of the job; one Login Items' switch blocks fails,
-    /// naming that switch.
+    /// naming that switch. Off is the person's, kept ([`launchd::choose_startup`]).
     pub(super) fn startup(set: Option<bool>) -> ExitCode {
         let here = match here() {
             Ok(here) => here,
             Err(why) => return fail(why),
         };
         if let Some(on) = set
-            && let Err(e) = launchd::set_startup(&here.paths, &here.label, &here.origin, on)
+            && let Err(e) = launchd::choose_startup(&here.paths, &here.label, &here.origin, on)
         {
             return fail(format!(
                 "{}: {e}",
@@ -707,24 +1019,6 @@ mod mac {
             return aterm_uds::stdout::answer_exit(VERB, &super::startup_line(startup), 1);
         }
         answer(&super::startup_line(startup))
-    }
-
-    /// Send `pid` SIGTERM (never pid 0 or 1, nor a negative group).
-    fn terminate(pid: u32) -> Result<(), String> {
-        let pid = libc::pid_t::try_from(pid)
-            .ok()
-            .filter(|pid| *pid > 1)
-            .ok_or_else(|| format!("{pid} is not a mug's pid"))?;
-        // SAFETY: two integers; `pid` is positive and not launchd's, so this signals one process.
-        if unsafe { libc::kill(pid, libc::SIGTERM) } == 0 {
-            return Ok(());
-        }
-        let e = std::io::Error::last_os_error();
-        if e.raw_os_error() == Some(libc::ESRCH) {
-            Ok(())
-        } else {
-            Err(format!("kill {pid}: {e}"))
-        }
     }
 
     /// How long [`quit`] waits for the mug it ended to let go of the lock: launchd's SIGTERM
@@ -790,7 +1084,7 @@ mod mac {
             .map(|holder| holder.pid)
             .filter(|pid| !ended.contains(pid))
         {
-            if let Err(why) = terminate(pid) {
+            if let Err(why) = instance::terminate(pid) {
                 return fail(why);
             }
             ended.push(pid);
@@ -843,13 +1137,66 @@ mod mac {
         drop(held);
     }
 
-    /// The one stderr line of a `serve` that will not run, and exit 0: launchd's KeepAlive starts the job again on any other status, and none of these refusals cures itself, so it would only refuse again every throttle interval (a transient one waits for the next start).
+    /// The one stderr line of a `serve` that does not run here, and exit 0, which launchd's
+    /// KeepAlive does not start again: this process is not the login's ([`login_paths`]), which
+    /// no start again cures.
     pub(super) fn refuse(paths: Option<&Paths>, why: impl std::fmt::Display) -> ExitCode {
         if let Some(paths) = paths {
             crate::macos::release_bridge(paths);
         }
         eprintln!("{VERB}: serve: {why}");
         ExitCode::SUCCESS
+    }
+
+    /// The one stderr line of a `serve` that could not keep the Mac awake for a reason that can
+    /// clear up, recorded as the mug's trouble ([`trouble::note`]), and
+    /// [`launchd::EXIT_RETRY`], which launchd's KeepAlive starts again, about a minute later as
+    /// the job ([`launchd::pause_before_retry`]), from the copy of the app it ran from
+    /// ([`code::prepare_copy`]). A bridge an update restart left holds on meanwhile.
+    pub(super) fn retry(paths: &Paths, why: impl std::fmt::Display) -> ExitCode {
+        let why = why.to_string();
+        eprintln!("{VERB}: serve: {why}; launchd starts it again");
+        trouble::note(paths, &why);
+        launchd::pause_before_retry();
+        ExitCode::from(launchd::EXIT_RETRY)
+    }
+
+    /// The one stderr line of a `serve` that cannot keep the Mac awake for a reason no start again
+    /// cures, recorded as the mug's trouble ([`trouble::note`]) for the window's watch, `aterm
+    /// doctor`'s `awake:` row and the converge pass to report, and exit 0, which launchd's
+    /// KeepAlive does not start again: a start a minute would cure nothing. A window's watch or a
+    /// converge pass starts the job again, which tries once more. A bridge an update restart left
+    /// holds on, to its own end.
+    pub(super) fn stall(paths: &Paths, why: impl std::fmt::Display) -> ExitCode {
+        let why = why.to_string();
+        eprintln!("{VERB}: serve: {why}; a window or a converge pass starts it again");
+        trouble::note(paths, &why);
+        ExitCode::SUCCESS
+    }
+
+    /// [`retry`] for an error that can clear up, else [`stall`] ([`lasts`]).
+    fn retry_or_stall(paths: &Paths, e: &std::io::Error, why: impl std::fmt::Display) -> ExitCode {
+        if lasts(e) {
+            stall(paths, why)
+        } else {
+            retry(paths, why)
+        }
+    }
+
+    /// Whether a file error is one no start again cures: a path that is not what it must be (a
+    /// directory, a FIFO, a link, another user's file, which [`Instance::try_hold`] and
+    /// [`code::prepare_copy`] refuse as invalid input), a permission refused, or an operation the
+    /// file system does not have. A full disk, a file gone and a passing shortage clear up.
+    pub(super) fn lasts(e: &std::io::Error) -> bool {
+        use std::io::ErrorKind;
+        matches!(
+            e.kind(),
+            ErrorKind::InvalidInput
+                | ErrorKind::PermissionDenied
+                | ErrorKind::IsADirectory
+                | ErrorKind::NotADirectory
+                | ErrorKind::Unsupported
+        ) || matches!(e.raw_os_error(), Some(libc::ELOOP | libc::ENOTSUP))
     }
 
     /// A bridge, refused as the mug is ([`login_paths`]): a mug that passed starts one in its
@@ -884,8 +1231,8 @@ mod mac {
         let (origin, instance) = if code::runs_from_copy(&code_dir) {
             code::mark_ran(&code_dir);
             let Some(origin) = code::origin_exe(&code_dir) else {
-                return refuse(
-                    Some(&paths),
+                return retry(
+                    &paths,
                     format!(
                         "running from a copy in {}, but {} names no executable it was started as",
                         code_dir.display(),
@@ -896,8 +1243,8 @@ mod mac {
             let mut instance = match Instance::adopt(&lock) {
                 Some(instance) => instance,
                 None => match hold(&paths) {
-                    Some(instance) => instance,
-                    None => return ExitCode::SUCCESS,
+                    Ok(instance) => instance,
+                    Err(code) => return code,
                 },
             };
             name_job(&mut instance, &launchd::label_for(&origin), &lock);
@@ -906,14 +1253,15 @@ mod mac {
             let origin = match std::env::current_exe().and_then(std::fs::canonicalize) {
                 Ok(origin) => origin,
                 Err(e) => {
-                    return refuse(
-                        Some(&paths),
+                    return retry(
+                        &paths,
                         format!("this executable's path cannot be read: {e}"),
                     );
                 }
             };
-            let Some(mut instance) = hold(&paths) else {
-                return ExitCode::SUCCESS;
+            let mut instance = match hold(&paths) {
+                Ok(instance) => instance,
+                Err(code) => return code,
             };
             let label = launchd::label_for(&origin);
             name_job(&mut instance, &label, &lock);
@@ -921,15 +1269,17 @@ mod mac {
             match code::prepare_copy(&origin, &code_dir, &label) {
                 Ok(Some(copy)) => {
                     let e = code::reexec_holding(&copy, &origin, &instance);
-                    return refuse(
-                        Some(&paths),
+                    return retry_or_stall(
+                        &paths,
+                        &e,
                         format!("re-running from {}: {e}; not starting", copy.display()),
                     );
                 }
                 Ok(None) => (origin, instance),
                 Err(e) => {
-                    return refuse(
-                        Some(&paths),
+                    return retry_or_stall(
+                        &paths,
+                        &e,
                         format!(
                             "cannot make its own copy of {} in {}: {e}; not starting (running \
                          from the bundle would take every open of the app)",
@@ -964,9 +1314,12 @@ mod mac {
     /// How long [`hold`] waits out a lock held by something other than a running mug.
     const HOLD_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
 
-    /// Take the one-mug lock; `None` (said on stderr) when another mug holds it, or it cannot be
-    /// taken (a FIFO, a directory or a link at its name: [`refuse`]'s case).
-    fn hold(paths: &Paths) -> Option<Instance> {
+    /// Take the one-mug lock. Another mug holding it ends this `serve` with 0 (said on stderr):
+    /// that mug keeps the Mac awake. A lock something else still holds after [`HOLD_PATIENCE`] (a
+    /// `quit` discarding the copy, a mug a moment from its end), or one not taken for a reason
+    /// that can clear up (a full disk), is [`retry`]'s; a name that cannot hold the lock at all (a
+    /// directory, a FIFO, a link, another user's file) is [`stall`]'s ([`lasts`]).
+    pub(super) fn hold(paths: &Paths) -> Result<Instance, ExitCode> {
         let lock = paths.lock_file();
         let code_dir = paths.code_dir();
         let start = std::time::Instant::now();
@@ -979,20 +1332,30 @@ mod mac {
             taken = Instance::try_hold(&lock);
         }
         match taken {
-            Ok(Some(instance)) => Some(instance),
-            Ok(None) => {
-                let pid = instance::running_pid(&lock)
-                    .map_or_else(String::new, |pid| format!(" (pid {pid})"));
-                eprintln!("{VERB}: serve: already running{pid}");
-                None
-            }
-            Err(e) => {
-                let _ = refuse(
-                    Some(paths),
-                    format!("{}: {e}; not starting", lock.display()),
-                );
-                None
-            }
+            Ok(Some(instance)) => Ok(instance),
+            Ok(None) => match instance::running_mug(&lock, &code_dir) {
+                Some(mug) => {
+                    eprintln!("{VERB}: serve: already running (pid {})", mug.pid);
+                    Err(ExitCode::SUCCESS)
+                }
+                None => {
+                    let by = instance::running_pid(&lock)
+                        .map_or_else(String::new, |pid| format!(" by pid {pid}"));
+                    Err(retry(
+                        paths,
+                        format!(
+                            "{} is held{by}, which is no mug, {} s on; not starting",
+                            lock.display(),
+                            HOLD_PATIENCE.as_secs()
+                        ),
+                    ))
+                }
+            },
+            Err(e) => Err(retry_or_stall(
+                paths,
+                &e,
+                format!("{}: {e}; not starting", lock.display()),
+            )),
         }
     }
 }
@@ -1046,47 +1409,6 @@ mod tests {
         );
         let why = mac::login_paths().expect_err("a test binary's private root");
         assert!(why.contains("ATERM_STATE_HOME"), "{why}");
-    }
-
-    /// A launch saves forever whatever the file says; a running window's successor starts the
-    /// mug only for a mode saved on, read as a restore reads it ([`mac::plan`]): no file, as for
-    /// a build new to the mug, and a saved on do; the person's off and unreadable clocks do not.
-    /// Planning saves nothing.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_windows_successor_starts_the_mug_only_for_a_mode_saved_on() {
-        use mac::{Plan, plan};
-        let dir = aterm_tempfile::tempdir().expect("tempdir");
-        let file = dir.path().join("acaffiene.state");
-        let now = crate::state::clocks();
-        assert!(now.is_some(), "the clocks read");
-        assert_eq!(plan(Launch::Fresh, &file, now), Plan::Forever);
-        assert_eq!(
-            plan(Launch::Successor, &file, now),
-            Plan::Start,
-            "no file: a build new to the mug"
-        );
-        assert!(!file.exists(), "nothing saved");
-        crate::state::save(&file, Mode::Off).expect("save off");
-        let off = std::fs::read(&file).expect("off");
-        assert_eq!(
-            plan(Launch::Successor, &file, now),
-            Plan::Leave,
-            "the person's off"
-        );
-        assert_eq!(plan(Launch::Fresh, &file, now), Plan::Forever);
-        assert_eq!(
-            std::fs::read(&file).expect("read again"),
-            off,
-            "nothing saved"
-        );
-        crate::state::save(&file, Mode::Forever).expect("save forever");
-        assert_eq!(plan(Launch::Successor, &file, now), Plan::Start);
-        assert_eq!(
-            plan(Launch::Successor, &file, None),
-            Plan::Leave,
-            "no clocks"
-        );
     }
 
     /// A start finds the mug holding the lock; else, while this build's job runs a process that
@@ -1263,6 +1585,406 @@ mod tests {
             ExitCode::SUCCESS
         );
         assert!(!paths.bridge_file().exists(), "the bridge was left holding");
+    }
+
+    #[cfg(target_os = "macos")]
+    fn scratch(dir: &std::path::Path) -> crate::paths::Paths {
+        crate::paths::Paths {
+            state_dir: dir.join("state"),
+            home: dir.join("home"),
+            logs_dir: dir.join("logs"),
+        }
+    }
+
+    /// `serve`'s lock: one something that is no mug still holds is started again by launchd
+    /// (69), with why recorded and a bridge an update restart left holding on; a name that
+    /// cannot hold a lock at all (a directory, a link, a FIFO) ends 0 with why recorded, so
+    /// launchd does not start it every minute to the same refusal, copying the app each time.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_serve_that_cannot_take_the_lock_retries_only_what_can_clear_up() {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let paths = scratch(dir.path());
+        std::fs::create_dir_all(&paths.state_dir).expect("state dir");
+        std::fs::write(paths.bridge_file(), "4242\n").expect("bridge file");
+        let held = crate::instance::Instance::try_hold(&paths.lock_file())
+            .expect("hold")
+            .expect("free");
+        let code = mac::hold(&paths).expect_err("held by this test, which is no mug");
+        assert_eq!(code, ExitCode::from(crate::launchd::EXIT_RETRY));
+        let why = crate::trouble::read(&paths).expect("recorded").why;
+        assert!(why.contains("which is no mug"), "{why}");
+        assert!(paths.bridge_file().exists(), "the bridge holds on");
+        drop(held);
+        assert!(mac::hold(&paths).is_ok(), "a free lock is taken");
+
+        type Plant = fn(&std::path::Path);
+        let plants: [(&str, Plant); 3] = [
+            ("a directory", |lock| {
+                std::fs::create_dir(lock).expect("dir")
+            }),
+            ("a link", |lock| {
+                let target = lock.with_extension("target");
+                std::fs::write(&target, b"").expect("target");
+                std::os::unix::fs::symlink(&target, lock).expect("link");
+            }),
+            ("a FIFO", |lock| {
+                use std::os::unix::ffi::OsStrExt as _;
+                let name = std::ffi::CString::new(lock.as_os_str().as_bytes()).expect("no NUL");
+                // SAFETY: a NUL-terminated path the call reads and does not retain.
+                assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0, "mkfifo");
+            }),
+        ];
+        for (name, plant) in plants {
+            let dir = aterm_tempfile::tempdir().expect("tempdir");
+            let paths = scratch(dir.path());
+            std::fs::create_dir_all(&paths.state_dir).expect("state dir");
+            plant(&paths.lock_file());
+            let code = mac::hold(&paths).expect_err(name);
+            assert_eq!(
+                code,
+                ExitCode::SUCCESS,
+                "{name}: never started again by launchd"
+            );
+            let why = crate::trouble::read(&paths).map(|trouble| trouble.why);
+            assert!(why.is_some(), "{name}: recorded for doctor and the window");
+        }
+    }
+
+    /// The copy refusals no start again cures (a FIFO in the bundle, a link at the code
+    /// directory) are told from a full disk and a passing shortage, which launchd retries.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_copy_refusal_that_lasts_is_told_from_one_that_clears_up() {
+        use std::io::{Error, ErrorKind};
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let app = dir.path().join("X.app");
+        let exe = app.join("Contents/MacOS/aterm");
+        std::fs::create_dir_all(exe.parent().expect("MacOS")).expect("bundle");
+        std::fs::write(&exe, b"exe").expect("exe");
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).expect("elsewhere");
+        let link = dir.path().join("code-link");
+        std::os::unix::fs::symlink(&elsewhere, &link).expect("link");
+        let refused = crate::code::prepare_copy(&exe, &link, "l").expect_err("a link");
+        assert!(mac::lasts(&refused), "{refused}");
+        let fifo = app.join("Contents/pipe");
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("no NUL");
+            // SAFETY: a NUL-terminated path the call reads and does not retain.
+            assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0, "mkfifo");
+        }
+        let refused = crate::code::prepare_copy(&exe, &dir.path().join("code"), "l")
+            .expect_err("a FIFO in the bundle");
+        assert!(mac::lasts(&refused), "{refused}");
+        for clears in [
+            Error::from(ErrorKind::StorageFull),
+            Error::from_raw_os_error(libc::ENOSPC),
+            Error::from_raw_os_error(libc::ENOENT),
+            Error::from_raw_os_error(libc::ENOMEM),
+        ] {
+            assert!(!mac::lasts(&clears), "{clears}");
+        }
+    }
+
+    /// Keeping this Mac awake (the window's watch, the converge pass) never undoes a person's
+    /// off: over a saved off it starts nothing, writes no mode and turns no Enable at Startup on.
+    /// With nothing saved it starts the mug and puts an installed app's job (here a
+    /// `~/Applications` install's) at every login; an Enable at Startup the person turned off
+    /// stays off; a dev build's is left as it is. 0.145's launch, which saved forever, fails it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn keeping_awake_over_a_persons_off_starts_and_writes_nothing() {
+        use std::cell::{Cell, RefCell};
+        thread_local! {
+            static STARTED: Cell<u32> = const { Cell::new(0) };
+            static STARTUP: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+        }
+        let doors = mac::KeepDoors {
+            prune_orphans: |_| {},
+            set_startup: |paths, label, origin, on| {
+                STARTUP.with_borrow_mut(|calls| calls.push(on));
+                crate::launchd::set_startup(paths, label, origin, on)
+            },
+            ensure: |_, _, _| {
+                STARTED.set(STARTED.get() + 1);
+                Ok(mac::Running::Started)
+            },
+        };
+        let at = |dir: &std::path::Path, installed: bool| {
+            let paths = scratch(dir);
+            let origin = if installed {
+                paths
+                    .home
+                    .join("Applications/aterm.app/Contents/MacOS/aterm")
+            } else {
+                dir.join("worktree/target/debug/aterm")
+            };
+            std::fs::create_dir_all(origin.parent().expect("a directory")).expect("mkdir");
+            std::fs::write(&origin, b"exe").expect("exe");
+            mac::Here {
+                label: crate::launchd::label_for(&origin),
+                paths,
+                origin,
+            }
+        };
+        let calls = || (STARTED.get(), STARTUP.with_borrow(Clone::clone));
+        let reset = || {
+            STARTED.set(0);
+            STARTUP.set(Vec::new());
+        };
+
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let here = at(dir.path(), true);
+        let file = here.paths.state_file();
+        crate::state::save(&file, Mode::Off).expect("the person's off");
+        let saved = std::fs::read(&file).expect("saved");
+        reset();
+        assert_eq!(mac::keep_awake_at(&here, NOW, &doors), Kept::Off);
+        assert_eq!(
+            calls(),
+            (0, Vec::new()),
+            "nothing started, no startup turned on"
+        );
+        assert_eq!(
+            std::fs::read(&file).expect("kept"),
+            saved,
+            "no mode written"
+        );
+        assert!(!here.paths.startup_plist(&here.label).exists());
+
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let here = at(dir.path(), true);
+        reset();
+        assert_eq!(mac::keep_awake_at(&here, NOW, &doors), Kept::Running(None));
+        assert_eq!(calls(), (1, vec![true]), "started, and put at every login");
+        assert!(here.paths.startup_plist(&here.label).is_file());
+        assert!(!here.paths.state_file().exists(), "no mode written");
+
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let here = at(dir.path(), true);
+        crate::launchd::choose_startup(&here.paths, &here.label, &here.origin, false)
+            .expect("the person's startup off");
+        reset();
+        assert_eq!(mac::keep_awake_at(&here, NOW, &doors), Kept::Running(None));
+        assert_eq!(
+            calls(),
+            (1, Vec::new()),
+            "the person's startup off stays off"
+        );
+
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let here = at(dir.path(), false);
+        reset();
+        assert_eq!(mac::keep_awake_at(&here, NOW, &doors), Kept::Running(None));
+        assert_eq!(
+            calls(),
+            (1, Vec::new()),
+            "a dev build's job is not put at login"
+        );
+    }
+
+    /// The converge pass's keep-awake retires the old `aterm caffeine` name's login jobs no aterm
+    /// will run again (here one whose aterm is gone and one whose aterm says it has no old verb)
+    /// before anything else, whatever the installed app or the mode, so a pass that starts the mug
+    /// on a Mac where no window opens after a restart stops them too; then it keeps the installed
+    /// app's mug as before.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_converge_pass_retires_the_old_names_jobs_whatever_it_keeps() {
+        use std::cell::Cell;
+        thread_local! {
+            static STARTED: Cell<u32> = const { Cell::new(0) };
+        }
+        let keep = mac::KeepDoors {
+            prune_orphans: |_| {},
+            set_startup: |_, _, _, _| Ok(()),
+            ensure: |_, _, _| {
+                STARTED.set(STARTED.get() + 1);
+                Ok(mac::Running::Started)
+            },
+        };
+        let doors = mac::InstalledDoors {
+            retire_old: |paths| {
+                crate::legacy::retire_jobs_with(
+                    paths,
+                    std::path::Path::new("/nonexistent/this-aterm"),
+                    |_| Some(false),
+                    |_| {},
+                )
+            },
+            installed: |paths| {
+                crate::launchd::Installed::At(
+                    paths
+                        .home
+                        .join("Applications/aterm.app/Contents/MacOS/aterm"),
+                )
+            },
+            now: || Ok(NOW),
+            keep,
+        };
+        let absent = mac::InstalledDoors {
+            installed: |_| crate::launchd::Installed::Absent("not installed".to_string()),
+            ..doors
+        };
+        let old_jobs = |dir: &std::path::Path| {
+            let paths = scratch(dir);
+            std::fs::create_dir_all(paths.launch_agents()).expect("agents");
+            let other = dir.join("0.145.0/aterm");
+            std::fs::create_dir_all(other.parent().expect("a folder")).expect("mkdir");
+            std::fs::write(&other, b"exe").expect("exe");
+            let plists = [
+                ("com.aterm.aterm.caffeine", other),
+                (
+                    "com.aterm.aterm.caffeine.dev.0000000a",
+                    dir.join("gone/aterm"),
+                ),
+            ]
+            .map(|(label, program)| {
+                let text = crate::launchd::plist_text(label, &program, &paths.log_file(), None)
+                    .replace("<string>acaffiene</string>", "<string>caffeine</string>");
+                let plist = paths.startup_plist(label);
+                std::fs::write(&plist, text).expect("plist");
+                plist
+            });
+            (paths, plists)
+        };
+        let retired = |plists: &[std::path::PathBuf]| plists.iter().all(|p| !p.exists());
+
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let (paths, plists) = old_jobs(dir.path());
+        STARTED.set(0);
+        assert_eq!(
+            mac::keep_installed_awake_with(paths, &absent),
+            Kept::NotHere("not installed".to_string())
+        );
+        assert!(retired(&plists), "retired with no installed app");
+        assert_eq!(STARTED.get(), 0);
+
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let (paths, plists) = old_jobs(dir.path());
+        crate::state::save(&paths.state_file(), Mode::Off).expect("the person's off");
+        STARTED.set(0);
+        assert_eq!(mac::keep_installed_awake_with(paths, &doors), Kept::Off);
+        assert!(retired(&plists), "retired over the person's off");
+        assert_eq!(STARTED.get(), 0);
+
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let (paths, plists) = old_jobs(dir.path());
+        STARTED.set(0);
+        assert_eq!(
+            mac::keep_installed_awake_with(paths, &doors),
+            Kept::Running(None)
+        );
+        assert!(retired(&plists), "retired, and the mug started");
+        assert_eq!(STARTED.get(), 1);
+    }
+
+    /// An exceptions entry an earlier process raised (before a quit, or an update's relaunch) is
+    /// cleared by the next process's watch once the trouble is gone, though that process never
+    /// raised it; a lasting trouble is raised once for each why; a process that is not the
+    /// login's says nothing.
+    #[test]
+    fn the_entry_an_earlier_process_raised_is_cleared_after_a_relaunch() {
+        let why = "the menu bar refused the mug".to_string();
+        let mut before = EntryWatch::default();
+        let running = Kept::Running(Some(7));
+        assert_eq!(
+            before.step(&running, Some(why.clone())),
+            Some(EntryWord::Raise(why.clone()))
+        );
+        assert!(before.raised());
+        assert_eq!(before.step(&running, Some(why)), None, "raised once");
+        assert_eq!(
+            before.step(&running, Some("the disk is full".to_string())),
+            Some(EntryWord::Raise("the disk is full".to_string())),
+            "a new why replaces it"
+        );
+        drop(before);
+        for kept in [
+            Kept::Running(Some(8)),
+            Kept::Running(None),
+            Kept::Off,
+            Kept::Failed("launchctl bootstrap: 5".to_string()),
+        ] {
+            let mut relaunched = EntryWatch::default();
+            assert_eq!(
+                relaunched.step(&kept, None),
+                Some(EntryWord::Clear),
+                "{kept:?}"
+            );
+            assert!(!relaunched.raised());
+        }
+        let mut elsewhere = EntryWatch::default();
+        assert_eq!(
+            elsewhere.step(&Kept::NotHere("a private root".to_string()), None),
+            None
+        );
+    }
+
+    /// An ordinary launch never undoes a person's off: a saved off starts nothing and turns
+    /// nothing on, an Enable at Startup the person turned off stays off, and only the installed
+    /// app's job is put at every login.
+    #[test]
+    fn a_launch_keeps_a_persons_off() {
+        let plan = |on, installed, startup_on, turned_off| {
+            let plan = keep_plan(on, installed, startup_on, turned_off);
+            (plan.start, plan.turn_startup_on)
+        };
+        assert_eq!(
+            plan(true, true, false, false),
+            (true, true),
+            "installed, nothing chosen"
+        );
+        assert_eq!(plan(true, true, true, false), (true, false), "on already");
+        assert_eq!(
+            plan(true, true, false, true),
+            (true, false),
+            "the person's startup off"
+        );
+        assert_eq!(
+            plan(true, false, false, false),
+            (true, false),
+            "a dev build's job"
+        );
+        for installed in [true, false] {
+            assert_eq!(
+                plan(false, installed, false, false),
+                (false, false),
+                "the person's off"
+            );
+        }
+    }
+
+    /// The window raises a trouble once it has lasted, and never one of a person's off or of a
+    /// process that is not the login's.
+    #[test]
+    fn only_a_lasting_trouble_of_a_kept_mug_is_raised() {
+        let trouble = crate::trouble::Trouble {
+            since: 1_000,
+            why: "the menu bar refused the mug".to_string(),
+        };
+        let lasted = 1_000 + crate::trouble::LASTING_SECS;
+        for kept in [
+            Kept::Running(Some(7)),
+            Kept::Failed("launchctl".to_string()),
+        ] {
+            assert_eq!(
+                lasting_trouble(&kept, Some(&trouble), lasted),
+                Some(trouble.why.clone()),
+                "{kept:?}"
+            );
+            assert_eq!(lasting_trouble(&kept, Some(&trouble), lasted - 1), None);
+            assert_eq!(lasting_trouble(&kept, None, lasted), None);
+        }
+        for kept in [Kept::Off, Kept::NotHere("a private root".to_string())] {
+            assert_eq!(
+                lasting_trouble(&kept, Some(&trouble), lasted),
+                None,
+                "{kept:?}"
+            );
+        }
     }
 
     #[test]

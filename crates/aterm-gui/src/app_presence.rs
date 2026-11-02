@@ -54,10 +54,6 @@ impl ChromeRegridBatch {
     pub(crate) const fn all(&mut self) {
         *self = Self::All;
     }
-
-    const fn covers(&self, _wid: WindowId) -> bool {
-        matches!(self, Self::All)
-    }
 }
 
 #[cfg(test)]
@@ -314,7 +310,8 @@ impl App {
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .live_supervisor(now_us)
-                    .is_some_and(|holder| holder == crate::harness_host::holder()) =>
+                    .is_some_and(|holder| holder == crate::harness_host::holder())
+                    && !crate::agent_act::observed(ctx.self_id.as_str(), front_group) =>
             {
                 let program = {
                     let timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
@@ -449,10 +446,27 @@ impl App {
             )
         };
         let told = crate::needs::told_of(ctx, now_us);
-        // Read only for a Grok session on a sign-in wall: a record read and a file stat.
-        let grok_signin = grok_walled.map(grok_signin_now);
+        // A Grok session on a sign-in wall shows the last look's answer: nothing is read here.
+        let grok_signin = match grok_walled {
+            Some(pgid) => {
+                let (proxy, session) = (self.proxy.clone(), h.local_id);
+                Some(self.grok_looks.ask(session, pgid, move || {
+                    if let Some(proxy) = &proxy {
+                        let _ = proxy.send_event(crate::Wake::GrokSigninLooked { session });
+                    }
+                }))
+            }
+            None => {
+                self.grok_looks.forget(h.local_id);
+                None
+            }
+        };
         let host_supervises =
             crate::harness_host::admitted_as(ctx, admit.0, admit.1).is_some_and(hosted);
+        // An agent the host observes only (its image unconfirmed, `supervisor_act=observe`) gets
+        // nothing typed, so the host answers none of its boxes or walls: they stay the person's.
+        let host_answers =
+            host_supervises && !crate::agent_act::observed(h.ctx.self_id.as_str(), admit.1);
         let holds = ctx.fabric.holds();
         let hold = holds.word();
         let stall = stall.map(|(fact, program, after)| {
@@ -500,7 +514,7 @@ impl App {
             agent,
             program_blocked,
             self_claimed,
-            supervised: host_supervises || other_supervisor,
+            supervised: host_answers || other_supervisor,
             other_supervisor,
             claim_live: supervisor.is_some(),
             wall_answer,
@@ -540,6 +554,9 @@ impl App {
         };
         let facts = (!matches!(h.state, crate::session_store::SessionState::Exited))
             .then(|| self.need_facts(&h, &hosting, now_us, now_unix));
+        if facts.is_none() {
+            self.grok_looks.forget(session);
+        }
         let ctx = h.ctx;
         let verdict = facts.as_ref().map(crate::needs::of).unwrap_or_default();
         self.note_api_outage(
@@ -579,6 +596,7 @@ impl App {
 
     fn forget_need(&mut self, session: u64, now_unix: i64) {
         self.need_rechecks.remove(&session);
+        self.grok_looks.forget(session);
         self.note_api_outage(session, false, now_unix);
     }
 
@@ -598,9 +616,8 @@ impl App {
         let entries: Vec<aterm_messages::exceptions::Entry> = match self.api_outage.values().min() {
             None => Vec::new(),
             Some(since) => {
-                let hhmm = crate::presence::local_offset_s().map(|offset| {
-                    let local = (since + offset).rem_euclid(86_400);
-                    format!("{:02}:{:02}", local / 3600, (local % 3600) / 60)
+                let hhmm = crate::status_item::clock_words_local(*since, &|unix| {
+                    self.messages_wall.offset_at(unix)
                 });
                 vec![crate::message_reporters::api_outage_entry(
                     self.api_outage.len(),
@@ -706,7 +723,7 @@ impl App {
             return;
         };
         match fact {
-            crate::HarnessFact::Act(act) => crate::harness_glass::on_act(self, session, act),
+            crate::HarnessFact::Act(taken) => crate::harness_glass::on_taken(self, session, taken),
             crate::HarnessFact::Task(face) => {
                 // Nor is its face in the gap of the self-claim's own re-exec
                 // (`upgrade@v1`, then the claim given back and taken again):
@@ -807,6 +824,12 @@ impl App {
                     self.harness_screen_moved();
                 }
             }
+            // Only Settings ▸ Harness's state line and `status land_asked=` say it.
+            crate::HarnessFact::SwitchAsked(asked) => {
+                if crate::harness_glass::on_switch_asked(self, session, asked) {
+                    self.harness_screen_moved();
+                }
+            }
             crate::HarnessFact::Needs => {
                 let was = self
                     .presence
@@ -829,25 +852,27 @@ impl App {
                 let Some(entry) = self.pool.get(session) else {
                     return;
                 };
-                let held = entry
-                    .ctx
-                    .timeline
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .land_held();
-                self.show_land_held(session, held);
+                let (held, said) = {
+                    let timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+                    (timeline.land_held(), timeline.land_said().cloned())
+                };
+                self.show_land_held(session, held, said);
             }
         }
     }
 
-    /// LAND'S HOLD OF SESSION `session` MOVED TO `held` on its glass.
+    /// LAND'S HOLD OF SESSION `session` MOVED TO `held` on its glass, or its own words to
+    /// `said` (§14.17 item 1, slice 4b: a reworded item moves the words under an equal hold).
     pub(crate) fn show_land_held(
         &mut self,
         session: u64,
         held: Option<aterm_agent::harness::acts::LandHeld>,
+        said: Option<std::sync::Arc<aterm_agent::harness::hold_said::HoldSaid>>,
     ) {
         let hover_was = self.driven_by_aterm(session);
-        if !crate::harness_glass::on_land_held(self, session, held) {
+        let said = said.filter(|_| held.is_some());
+        let words = crate::harness_glass::on_land_said(self, session, said);
+        if !(crate::harness_glass::on_land_held(self, session, held) | words) {
             return;
         }
         self.redraw_autopilot_title_readers(session);
@@ -860,15 +885,18 @@ impl App {
     }
 
     /// ATERM STOPPED TYPING INTO SESSION `session`, or no longer does (§14.3): `stopped` on its
-    /// glass ([`crate::harness_glass::on_stopped`]), and every surface that says it read again —
-    /// the chip's title where it is hovered, Settings ▸ Harness, the hover and the status item.
+    /// glass ([`crate::harness_glass::on_stopped`]), with whether the person's switch to Land
+    /// would ask once more over it (`switch`, v6 §14.17 item 3), and every surface that says it
+    /// read again — the chip's title where it is hovered, Settings ▸ Harness, the hover and the
+    /// status item.
     pub(crate) fn show_stopped(
         &mut self,
         session: u64,
         stopped: Option<aterm_agent::harness::acts::HeldBy>,
+        switch: bool,
     ) {
         let hover_was = self.driven_by_aterm(session);
-        if !crate::harness_glass::on_stopped(self, session, stopped) {
+        if !crate::harness_glass::on_stopped(self, session, stopped, switch) {
             return;
         }
         self.redraw_autopilot_title_readers(session);
@@ -883,14 +911,11 @@ impl App {
     /// A STALE HOLD GOES (§12.3.3 item 3).
     pub(crate) fn clear_land_held(&mut self, session: u64) {
         if let Some(entry) = self.pool.get(session) {
-            entry
-                .ctx
-                .timeline
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .set_land_held(None);
+            let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+            timeline.set_land_said(None);
+            timeline.set_land_held(None);
         }
-        self.show_land_held(session, None);
+        self.show_land_held(session, None, None);
     }
 
     fn self_claim_may_land(&self, session: u64) -> bool {
@@ -923,6 +948,7 @@ impl App {
     }
 
     /// Every window: a restore, a successor's commit, a handoff's release and a config adopt.
+    #[cfg(any(unix, test))]
     pub(crate) fn refresh_presence_all_windows(&mut self) {
         self.rebuild_teams();
         drive::refresh_all(self);
@@ -932,6 +958,33 @@ impl App {
     #[cfg(test)]
     pub(crate) fn note_human_acted(&mut self, wid: WindowId) {
         drive::human_acted(self, wid);
+    }
+
+    /// Keep activity pacing for every key or input-method callback, but known controller input
+    /// establishes no person's presence. `posted` is the provenance captured at the native source.
+    pub(crate) fn note_window_input_arrival(
+        &mut self,
+        event: &aterm_window::event::WindowEvent,
+        posted: bool,
+    ) {
+        use aterm_window::event::WindowEvent;
+        if matches!(
+            event,
+            WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(_)
+        ) {
+            let now = Instant::now();
+            self.last_keystroke_at = Some(now);
+            crate::note_key_rest(None, true, now);
+        }
+        if crate::is_person_input(event)
+            && !(posted
+                && matches!(
+                    event,
+                    WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(_)
+                ))
+        {
+            self.last_person_input_at = Some(Instant::now());
+        }
     }
 
     /// One key from the winit `KeyboardInput` arm. A key an `hwkey` burst posted (`posted`, as
@@ -946,6 +999,22 @@ impl App {
         posted: bool,
     ) {
         self.with_controller_mark(posted, |app| app.dispatch_key_event(wid, event));
+    }
+
+    /// An input method's callback through the same controller mark as its causal native key.
+    /// Composed text still follows the existing recipient and delivery paths.
+    pub(crate) fn dispatch_ime_event(
+        &mut self,
+        wid: WindowId,
+        ime: aterm_window::event::Ime,
+        posted: bool,
+    ) {
+        use aterm_window::event::Ime;
+        self.with_controller_mark(posted, |app| match ime {
+            Ime::Preedit(text, cursor) => app.on_ime_preedit(wid, text, cursor),
+            Ime::Commit(text) => app.on_ime_commit(wid, text),
+            Ime::Enabled | Ime::Disabled => app.on_ime_enablement_changed(wid),
+        });
     }
 
     /// [`Self::dispatch_hw_key`] under whatever mark it set.
@@ -1154,7 +1223,7 @@ impl App {
         (news > self.turn_end_seen.get(&session).copied().unwrap_or(0)).then_some(news)
     }
 
-    /// THE LOOK (§14.11 of `docs/DESIGN-harness-autopilot-2026-10-15.md`): window `wid` is the frontmost window, the OS made it its key window (aterm is the active app and this its key window: `WindowState::os_key`, which a controller's `focus in|out` never writes), and it is on screen — or, in a development build, the `person look` stand-in looks at it in place of a headless window. A window left frontmost while he works in another app looks at nothing: what lands in its front tab then stands until he comes back to it.
+    /// THE LOOK (§14.11 of `docs/DESIGN-harness-autopilot-2026-10-15.md`): window `wid` is the frontmost window, the OS made it its key window (aterm is the active app and this its key window: `WindowState::os_key`, which a controller's `focus in|out` never writes), and it is on screen — or, in a development build, the `person look` stand-in looks at it in place of a headless window. A window left frontmost while the person works in another app looks at nothing: what lands in its front tab then stands until they come back to it.
     fn window_looked_at(&self, wid: WindowId) -> bool {
         #[cfg(any(test, debug_assertions))]
         let stood_in = self.person_look == Some(wid)
@@ -1326,6 +1395,14 @@ impl App {
         )
     }
 
+    pub(crate) fn autopilot_driver(&self, session: u64, words: String) -> crate::overview::Driver {
+        if self.beside_proven_self_claim(session) || self.in_self_claim_reexec(session) {
+            crate::overview::Driver::CodexAlab(words)
+        } else {
+            crate::overview::Driver::Aterm(words)
+        }
+    }
+
     /// WHO DRIVES (owner surfaces §5, S9).
     pub(crate) fn rebuild_teams(&mut self) {
         let handles: Vec<(u64, String, std::sync::Arc<crate::SessionCtx>)> = self
@@ -1494,7 +1571,7 @@ impl App {
             }
         }
         if let Some(words) = self.driven_by_aterm(session) {
-            parts.push(format!("driven by aterm ({words})"));
+            parts.push(self.autopilot_driver(session, words).words());
         }
         (!parts.is_empty()).then(|| parts.join(crate::native_ui::FACT_SEPARATOR))
     }
@@ -1551,7 +1628,12 @@ impl App {
                 let spawned = std::thread::Builder::new()
                     .name("aterm-pill-restart".into())
                     .spawn(move || {
-                        let reply = crate::restart_act::restart(master, "if-stalled", &ctx);
+                        let reply = crate::restart_act::restart(
+                            master,
+                            "if-stalled",
+                            &ctx,
+                            aterm_slog::Actor::Human,
+                        );
                         aterm_log::info!("pill restart {session}: {}", reply.trim_end());
                     });
                 if let Err(e) = spawned {
@@ -1684,33 +1766,6 @@ impl App {
         out.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
     }
 
-    /// The terminal rows window `wid` measures a chrome commit against, and whether it has glass.
-    pub(crate) fn chrome_commit_grid_rows(&self, wid: WindowId) -> Option<(u16, bool)> {
-        let ws = self.windows.get(&wid)?;
-        let size = self
-            .chrome_regrid_batch
-            .as_ref()
-            .is_some_and(|batch| batch.covers(wid))
-            .then(|| ws.os_window.as_ref().map(|w| w.inner_size()))
-            .flatten();
-        Some((
-            self.chrome_commit_grid_rows_at(wid, ws.rows, size),
-            chrome_regrids_grid(ws),
-        ))
-    }
-
-    fn chrome_commit_grid_rows_at(
-        &self,
-        wid: WindowId,
-        rows: u16,
-        size: Option<aterm_window::dpi::PhysicalSize<u32>>,
-    ) -> u16 {
-        match (&self.chrome_regrid_batch, size) {
-            (Some(batch), Some(size)) if batch.covers(wid) => self.grid_dims_for(wid, size).0,
-            _ => rows,
-        }
-    }
-
     /// Lift an update handoff's park (`Wake::UpdateHandoffFinished`).
     #[cfg(unix)]
     pub(crate) fn release_update_handoff_park(&mut self, finish: impl FnOnce(&mut Self)) {
@@ -1746,15 +1801,6 @@ impl App {
         for ws in self.windows.values_mut() {
             ws.regrow_floor.rose(now);
         }
-    }
-
-    /// Window `wid`'s chrome regrow floor (`RegrowFloor::floor`).
-    #[cfg(test)]
-    pub(crate) fn chrome_regrow_floor(&self, wid: WindowId) -> Option<Instant> {
-        self.windows
-            .get(&wid)
-            .filter(|ws| chrome_regrids_grid(ws))
-            .and_then(|ws| ws.regrow_floor.floor())
     }
 
     /// The floor the band's quiet shrink and the tab strip's fall wait.
@@ -1884,7 +1930,7 @@ impl Desk for App {
     }
 
     fn needs_shown(&self) -> bool {
-        self.presence_rim_on()
+        false
     }
 
     fn label_of(&self, session: u64) -> String {
@@ -1976,7 +2022,7 @@ impl Desk for App {
             return;
         };
         let now_us = crate::metrics::us_at(Desk::clock(self));
-        if crate::session_timeline::lapse_supervisor(&ctx, now_us) {
+        if crate::session_timeline::publish_lapse_supervisor(&ctx, now_us).published() {
             self.redraw_claude_footer(session);
             self.note_harness_arm(session);
             self.harness_screen_moved();
@@ -2076,7 +2122,7 @@ pub(crate) fn resume_if_stopped(master: i32, ctx: &crate::SessionCtx) -> String 
     if !crate::input_stall::fg_stopped(master) {
         return "ERR not-stopped\n".to_string();
     }
-    crate::control::signal_verb(master, "cont", ctx)
+    crate::control::signal_verb(master, "cont", ctx, aterm_slog::Actor::Human)
 }
 
 fn opened_at(started_ms: u64) -> Option<std::time::Instant> {
@@ -2087,19 +2133,204 @@ fn opened_at(started_ms: u64) -> Option<std::time::Instant> {
     now.checked_sub(std::time::Duration::from_millis(ago))
 }
 
+/// THE GROK SIGN-IN LOOKS, off the event loop: a look ([`grok_signin_now`]) reads a record and a
+/// login file and may write the refused mark durably, which a network home that stopped answering
+/// holds for as long as it is silent (`docs/DESIGN-hung-network-volumes-2026-10-20.md`). For each
+/// session on a Grok sign-in wall it keeps the last answer for its walled program, one look at a
+/// time on a thread of its own: a need publication shows the kept answer and reads nothing
+/// ([`Self::ask`]), a look whose answer moves what is shown wakes the session's presence (its
+/// waker: `Wake::GrokSigninLooked`), and an answer for a program the session no longer runs, or
+/// for a session forgotten, lands nowhere.
+pub(crate) struct GrokLooks {
+    kept: std::sync::Arc<std::sync::Mutex<KeptLooks>>,
+    look: std::sync::Arc<GrokLook>,
+}
+
+/// One look at the sign-in: [`grok_signin_now`]'s inputs and answer.
+type GrokLook = dyn Fn(Option<&std::path::Path>, Option<&std::path::Path>, i32) -> crate::needs::GrokSignin
+    + Send
+    + Sync;
+
+impl Default for GrokLooks {
+    fn default() -> Self {
+        Self {
+            kept: std::sync::Arc::default(),
+            look: std::sync::Arc::new(grok_signin_now),
+        }
+    }
+}
+
+#[derive(Default)]
+struct KeptLooks {
+    /// The last entry's epoch: a look lands only in the entry it was started for.
+    next: u64,
+    by_session: std::collections::HashMap<u64, KeptLook>,
+    /// How many looks have ended and been taken in or dropped, each counted after its wake.
+    #[cfg(test)]
+    settled: u64,
+}
+
+struct KeptLook {
+    epoch: u64,
+    /// The walled program's group leader the answer is for.
+    pgid: i32,
+    /// The last answer for it; none until its first look ends.
+    answer: Option<crate::needs::GrokSignin>,
+    /// A look is out.
+    out: bool,
+    /// Asked while a look was out: it looks once more as it ends.
+    again: bool,
+}
+
+impl GrokLooks {
+    /// Looks made by `look` instead of [`grok_signin_now`].
+    #[cfg(all(test, unix))]
+    pub(crate) fn with_look(
+        look: impl Fn(
+            Option<&std::path::Path>,
+            Option<&std::path::Path>,
+            i32,
+        ) -> crate::needs::GrokSignin
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self {
+            kept: std::sync::Arc::default(),
+            look: std::sync::Arc::new(look),
+        }
+    }
+
+    /// How many looks have ended and been taken in or dropped.
+    #[cfg(all(test, unix))]
+    pub(crate) fn settled(&self) -> u64 {
+        self.kept.lock().unwrap_or_else(|p| p.into_inner()).settled
+    }
+
+    /// What session `session`'s wall shows for its walled program `pgid`: the kept answer, or
+    /// [`crate::needs::GrokSignin::Reading`] until the first look for that program ends. A look
+    /// starts (or the one out owes another), and `wake` runs where its answer moves what is shown.
+    pub(crate) fn ask(
+        &self,
+        session: u64,
+        pgid: i32,
+        wake: impl Fn() + Send + 'static,
+    ) -> crate::needs::GrokSignin {
+        use crate::needs::GrokSignin;
+        let (epoch, shown) = {
+            let mut kept = self.kept.lock().unwrap_or_else(|p| p.into_inner());
+            let KeptLooks {
+                next, by_session, ..
+            } = &mut *kept;
+            let entry = by_session.entry(session).or_insert_with(|| {
+                *next += 1;
+                KeptLook {
+                    epoch: *next,
+                    pgid,
+                    answer: None,
+                    out: false,
+                    again: false,
+                }
+            });
+            if entry.pgid != pgid {
+                entry.pgid = pgid;
+                entry.answer = None;
+            }
+            let shown = entry.answer.unwrap_or(GrokSignin::Reading);
+            if entry.out {
+                entry.again = true;
+                return shown;
+            }
+            entry.out = true;
+            (entry.epoch, shown)
+        };
+        let (kept, look) = (
+            std::sync::Arc::clone(&self.kept),
+            std::sync::Arc::clone(&self.look),
+        );
+        // Named on the asking thread: a test's harness state is that thread's.
+        let state = crate::harness_host::harness_state();
+        let home = aterm_types::dirs::home_dir();
+        let spawned = crate::qos::spawn_lane_thread(
+            "aterm-grok-signin-look",
+            crate::qos::Role::Background,
+            move || {
+                let mut pgid = pgid;
+                loop {
+                    let answer = look(state.as_deref(), home.as_deref(), pgid);
+                    let (moved, again) = {
+                        let mut map = kept.lock().unwrap_or_else(|p| p.into_inner());
+                        match map
+                            .by_session
+                            .get_mut(&session)
+                            .filter(|entry| entry.epoch == epoch)
+                        {
+                            None => (false, false),
+                            Some(entry) => {
+                                let current = entry.pgid == pgid;
+                                let moved = current && entry.answer != Some(answer);
+                                if current {
+                                    entry.answer = Some(answer);
+                                }
+                                let again = std::mem::take(&mut entry.again) || !current;
+                                pgid = entry.pgid;
+                                entry.out = again;
+                                (moved, again)
+                            }
+                        }
+                    };
+                    if moved {
+                        wake();
+                    }
+                    #[cfg(test)]
+                    {
+                        kept.lock().unwrap_or_else(|p| p.into_inner()).settled += 1;
+                    }
+                    if !again {
+                        return;
+                    }
+                }
+            },
+        );
+        if let Err(error) = spawned {
+            aterm_log::warn!("grok sign-in look for session {session}: no thread ({error})");
+            let mut kept = self.kept.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(entry) = kept.by_session.get_mut(&session) {
+                entry.out = false;
+                entry.again = false;
+            }
+        }
+        shown
+    }
+
+    /// Session `session` is on no Grok sign-in wall (or gone): its answer goes, and a look still
+    /// out for it lands nowhere.
+    pub(crate) fn forget(&self, session: u64) {
+        self.kept
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .by_session
+            .remove(&session);
+    }
+}
+
 /// Where this machine's one Grok Build sign-in stands for a Grok session on its sign-in wall
-/// whose program group leader is `pgid` ([`crate::needs::GrokSignin`]): a sign-in runs (its
-/// leader's record under the harness state), else a login the walled grok may not have read
-/// (written after it started) says restart it, else signed out. A login written before that grok
-/// started was read and refused by it: it is marked refused
+/// whose program group leader is `pgid` ([`crate::needs::GrokSignin`]), read from the harness
+/// state `state` and the home `home` (blocking file I/O: a look's thread only, [`GrokLooks`]): a
+/// sign-in runs (its leader's record under the harness state), else a login the walled grok may
+/// not have read (written after it started) says restart it, else signed out. A login written
+/// before that grok started was read and refused by it: it is marked refused
 /// ([`aterm_agent::harness::grok_signin::mark_refused`]), so the next launch is signed in through
 /// the one sandboxed sign-in instead of a grok that opens its own page.
-fn grok_signin_now(pgid: i32) -> crate::needs::GrokSignin {
+fn grok_signin_now(
+    state: Option<&std::path::Path>,
+    home: Option<&std::path::Path>,
+    pgid: i32,
+) -> crate::needs::GrokSignin {
     use aterm_agent::harness::grok_signin::{self, WallLogin};
-    if crate::harness_host::harness_state().is_some_and(|state| grok_signin::running(&state)) {
+    if state.is_some_and(grok_signin::running) {
         return crate::needs::GrokSignin::Running;
     }
-    let home = aterm_types::dirs::home_dir();
     let started = (pgid > 0)
         .then(|| aterm_uds::process::read_process_birth(pgid))
         .flatten()
@@ -2108,7 +2339,7 @@ fn grok_signin_now(pgid: i32) -> crate::needs::GrokSignin {
                 + std::time::Duration::from_secs(b.seconds)
                 + std::time::Duration::from_micros(b.microseconds)
         });
-    match grok_signin::wall_login(&|name| std::env::var_os(name), home.as_deref(), started) {
+    match grok_signin::wall_login(&|name| std::env::var_os(name), home, started) {
         WallLogin::SignedIn(_) => crate::needs::GrokSignin::SignedIn,
         WallLogin::Refused(file) => {
             let _ = grok_signin::mark_refused(&file);
@@ -2122,7 +2353,7 @@ fn grok_signin_now(pgid: i32) -> crate::needs::GrokSignin {
 mod tests {
 
     use super::*;
-    use crate::presence::{ChipLevel, PillHit, PillKind, Rim};
+    use crate::presence::{ChipLevel, Rim};
     use crate::task_record::{TaskMark, TaskState, mark_session_task};
     use crate::{App, WindowId};
     use std::sync::Arc;
@@ -2165,110 +2396,20 @@ mod tests {
     }
 
     #[test]
-    fn the_published_need_lights_the_border_and_its_pill() {
+    fn recorded_needs_keep_the_window_quiet() {
         let (mut app, wid, sid, ctx) = app_with_stub();
-        app.refresh_presence_session(sid);
-        assert_eq!(view(&app, wid).rim, Rim::None);
-        ask(&ctx, Some("deploy to prod?"));
-        app.refresh_presence_session(sid);
-        assert_eq!(view(&app, wid).rim, Rim::Decide);
-        let pill = app.presence_pill(wid).expect("lit: the pill");
-        assert_eq!(
-            pill.kind,
-            PillKind::Need(crate::presence::NeedSeverity::Decide)
-        );
-        assert_eq!(pill.session, sid);
-        assert!(
-            pill.words.label.is_empty(),
-            "the front tab is named already"
-        );
-        let line = app.presence_chrome_line();
-        assert!(line.contains("rim=decide"), "{line}");
-        assert!(
-            line.contains(&format!("pressing=@{}", ctx.self_id.as_str())),
-            "{line}"
-        );
+        for text in ["deploy to prod?", "NEEDS YOU: a routine decision"] {
+            ask(&ctx, Some(text));
+            app.refresh_presence_session(sid);
+            assert!(ctx.timeline.lock().unwrap().need().need.is_some());
+            assert_eq!(view(&app, wid).rim, Rim::None);
+            assert!(app.presence_overlay(wid).is_none());
+            assert!(app.presence_pill(wid).is_none());
+        }
         task(&ctx, sid, TaskState::Stalled);
         app.refresh_presence_session(sid);
-        assert_eq!(view(&app, wid).rim, Rim::Stuck, "stuck outranks decide");
-        ask(&ctx, None);
-        task(&ctx, sid, TaskState::Working);
-        app.refresh_presence_session(sid);
         assert_eq!(view(&app, wid).rim, Rim::None);
-        assert!(app.presence_pill(wid).is_none());
-        assert!(
-            app.presence_chrome_line()
-                .contains("rim=none pressing=- pill=\"\"")
-        );
-    }
-
-    /// A WAIT LIGHTS NOTHING: a `kind=wait` entry, aterm's harness waiting out a limit
-    /// (`supervisor`) or codex-alab waiting out a reset or an outage by itself
-    /// (`codex-alab-wait`), stands with no border, no pill and the chip off. NEGATIVE CONTROL: the
-    /// same entry as an ask lights the border at Decide, the pill and the chip.
-    #[test]
-    fn a_kind_wait_entry_lights_no_border_and_a_kind_ask_does() {
-        use aterm_types::needs::AttentionKind;
-        for owner in [aterm_agent::supervise::ATTENTION_OWNER, "codex-alab-wait"] {
-            let (mut app, wid, sid, ctx) = app_with_stub();
-            let entry = |app: &mut App, kind: AttentionKind| {
-                ctx.meta
-                    .lock()
-                    .unwrap()
-                    .set_attention_kind(owner, Some("limited: resets 7pm".to_string()), Some(kind))
-                    .expect("room for the entry");
-                app.on_meta_changed(sid);
-                (
-                    view(app, wid).rim,
-                    app.presence_pill(wid).is_some(),
-                    app.presence.slot(sid).map(|s| s.chip()),
-                    app.presence_chrome_line(),
-                )
-            };
-            let (rim, pill, chip, line) = entry(&mut app, AttentionKind::Wait);
-            assert!(
-                ctx.meta.lock().unwrap().attention.is_some(),
-                "{owner}: it stands"
-            );
-            assert!(
-                ctx.timeline.lock().unwrap().need().need.is_none(),
-                "{owner}"
-            );
-            assert_eq!(
-                (rim, pill, chip),
-                (Rim::None, false, Some(ChipLevel::Off)),
-                "{owner}"
-            );
-            assert!(line.contains("rim=none"), "{owner}: {line}");
-            let (rim, pill, chip, line) = entry(&mut app, AttentionKind::Ask);
-            assert_eq!(
-                (rim, pill, chip),
-                (Rim::Decide, true, Some(ChipLevel::Wait)),
-                "{owner}"
-            );
-            assert!(line.contains("rim=decide"), "{owner}: {line}");
-        }
-    }
-
-    #[test]
-    fn a_background_tabs_need_lights_its_window_and_names_the_tab() {
-        let (mut app, wid, first, first_ctx) = app_with_stub();
-        let (second, second_ctx) = second_tab(&mut app, wid);
-        assert_eq!(app.focused_session_id(wid), Some(second), "tab 2 in front");
-        first_ctx.meta.lock().unwrap().role = Some("fmt".into());
-        ask(&first_ctx, Some("which branch?"));
-        app.refresh_presence_session(first);
-        assert_eq!(view(&app, wid).rim, Rim::Decide);
-        assert_eq!(view(&app, wid).pressing, Some(first));
-        let pill = app.presence_pill(wid).expect("lit");
-        assert!(pill.words.label.contains("fmt"), "{:?}", pill.words);
-        let tab = app.windows[&wid].tab_set.tabs().len() - 1;
-        assert_eq!(view(&app, wid).pill.as_ref().and_then(|p| p.tab), Some(tab));
-        ask(&second_ctx, Some("run the tests?"));
-        app.refresh_presence_session(second);
-        assert_eq!(view(&app, wid).pressing, Some(second));
-        assert_eq!(view(&app, wid).pill.as_ref().map(|p| p.more), Some(1));
-        let _ = first;
+        assert!(app.presence_overlay(wid).is_none());
     }
 
     #[test]
@@ -2283,7 +2424,7 @@ mod tests {
             app.refresh_presence_session(first);
             lit += usize::from(view(&app, wid).rim == Rim::Decide);
         }
-        assert_eq!(lit, 50, "every flip reached the border");
+        assert_eq!(lit, 0, "diagnostic changes never light a border");
         assert!(
             take_chrome_regrids_applied().is_empty(),
             "no flip re-gridded a pane"
@@ -2296,119 +2437,6 @@ mod tests {
                 .any(|(w, r)| *w == wid && *r == rows + 1),
             "the strip's new row is a re-grid the probe records"
         );
-    }
-
-    #[test]
-    fn a_headless_pill_arms_no_timer() {
-        let (mut app, wid, sid, ctx) = app_with_stub();
-        let _ = second_tab(&mut app, wid);
-        ask(&ctx, Some("approve?"));
-        app.refresh_presence_session(sid);
-        assert!(
-            view(&app, wid).pill.as_ref().and_then(|p| p.tab).is_some(),
-            "PRECONDITION: a background tab's pill, which carries an age"
-        );
-        let now = Instant::now();
-        assert_eq!(
-            app.presence_deadline(now),
-            None,
-            "headless: nobody reads the pill's age"
-        );
-        app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
-        assert!(
-            app.presence_deadline(now).is_some(),
-            "CONTROL: an on-screen background pill arms its age timer"
-        );
-    }
-
-    #[test]
-    fn presence_fp_stays_zero_while_status_revisions_replay() {
-        use crate::session_status::{ActivitySample, Evidence};
-        crate::fabric::with_link_reset(|| {
-            let (mut app, wid, sid, _ctx) = app_with_stub();
-            app.refresh_presence_session(sid);
-            app.refresh_presence_all_windows();
-            let t0 = Instant::now();
-            let mut ev = Evidence {
-                shell: None,
-                completed_block: None,
-                lifecycle: None,
-                foreground_job: Some(true),
-                activity: ActivitySample {
-                    alt_screen: false,
-                    content_seq: 1,
-                    last_output: Some(t0),
-                },
-            };
-            let quiet = |app: &mut App, t: Instant, frame: u64| {
-                assert_eq!(
-                    app.presence_fp(wid),
-                    0,
-                    "frame {frame}: {}",
-                    app.presence_chrome_line()
-                );
-                assert!(app.presence_overlay(wid).is_none(), "frame {frame}");
-                assert!(app.presence_tick(t).is_empty(), "frame {frame}");
-                assert!(
-                    app.presence_deadline(t).is_none(),
-                    "frame {frame}: no timer"
-                );
-            };
-            let mut revisions = 0u64;
-            let mut last = app.session_status.revision(sid);
-            for i in 0..1000u64 {
-                let t = t0 + Duration::from_millis(i * 700);
-                ev.activity.content_seq += 1;
-                ev.activity.last_output = if i % 6 < 3 { Some(t) } else { None };
-                ev.foreground_job = Some(i % 6 < 3);
-                app.session_status.observe(sid, &ev, t);
-                let r = app.session_status.revision(sid);
-                if r != last {
-                    revisions += 1;
-                    last = r;
-                    app.refresh_presence_session(sid);
-                }
-                quiet(&mut app, t, i);
-            }
-            assert!(revisions > 0, "the replay moved no revision ({revisions})");
-            let other = app
-                .open_active_session_in_new_window_logical()
-                .expect("a second window");
-            let (needy, needy_ctx) = second_tab(&mut app, other);
-            ask(&needy_ctx, Some("deploy to prod?"));
-            app.refresh_presence_session(needy);
-            assert_ne!(app.presence_fp(other), 0, "the needy window is lit");
-            assert!(app.presence_overlay(other).is_some());
-            quiet(&mut app, Instant::now(), 1000);
-        });
-    }
-
-    #[cfg(a11y_tree)]
-    #[test]
-    fn the_spoken_pill_never_ticks_with_its_age() {
-        let (mut app, wid, first, first_ctx) = app_with_stub();
-        let _ = second_tab(&mut app, wid);
-        let t0 = Instant::now();
-        set_presence_clock_for_test(Some(t0));
-        ask(&first_ctx, Some("which branch?"));
-        app.refresh_presence_session(first);
-        let at = |app: &App, t: Instant| {
-            set_presence_clock_for_test(Some(t));
-            app.presence_a11y_message(wid).expect("lit")
-        };
-        let early = at(&app, t0 + Duration::from_secs(5));
-        let later = at(&app, t0 + Duration::from_secs(65));
-        set_presence_clock_for_test(None);
-        assert_eq!(early.text, later.text, "the spoken sentence held still");
-        assert!(
-            early.detail.is_some(),
-            "a background pill's age is described"
-        );
-        assert_ne!(early.detail, later.detail, "CONTROL: the age moved");
-        ask(&first_ctx, Some("run the tests?"));
-        app.refresh_presence_session(first);
-        let moved = app.presence_a11y_message(wid).expect("lit");
-        assert_ne!(moved.text, early.text, "CONTROL: a new need is spoken");
     }
 
     #[test]
@@ -2655,36 +2683,6 @@ mod tests {
     }
 
     #[test]
-    fn an_in_window_role_renames_the_pill_and_the_team() {
-        use crate::claude_lights::TeamFace;
-        let (mut app, wid, manager, manager_ctx) = app_with_stub();
-        let (worker, worker_ctx) = second_tab(&mut app, wid);
-        let mark = TaskMark {
-            from: Some(manager_ctx.self_id.as_str().to_string()),
-            ..TaskMark::new(TaskState::Working)
-        };
-        mark_session_task(&worker_ctx, worker, &mark).expect("unfenced");
-        app.on_task_changed(worker);
-        ask(&manager_ctx, Some("approve?"));
-        app.refresh_presence_session(manager);
-        let named = |app: &App| {
-            let pill = app.presence_pill(wid).expect("lit").words.label;
-            let Some(TeamFace::Worker { label, .. }) = app.team_face(worker) else {
-                panic!("a worker's face");
-            };
-            (pill.contains("lab-sweep"), label.contains("lab-sweep"))
-        };
-        assert_eq!(named(&app), (false, false), "CONTROL: the old name");
-        app.write_session_meta_field(
-            manager,
-            crate::session_timeline::MetaField::Role,
-            "lab-sweep",
-        )
-        .expect("stored");
-        assert_eq!(named(&app), (true, true), "renamed on both");
-    }
-
-    #[test]
     fn a_team_chip_lands_in_the_window_clicked() {
         let shared = |via_chip: bool| {
             let (mut app, w0, manager, manager_ctx) = app_with_stub();
@@ -2754,186 +2752,6 @@ mod tests {
         let local = held(&mut app, "local");
         let bridge = held(&mut app, "fleet");
         assert_ne!(local, bridge, "each origin says its own");
-    }
-
-    #[test]
-    fn a_harness_need_stays_in_the_hover_without_a_tab_bar_pill() {
-        let (mut app, wid, sid, ctx) = app_with_stub();
-        ctx.meta
-            .lock()
-            .unwrap()
-            .set_attention_kind(
-                crate::harness_host::NEEDS_ATTENTION_OWNER,
-                Some("claude needs you: sign 0.48.0 (+1 more) \u{2014} carrying on".into()),
-                Some(aterm_types::needs::AttentionKind::Ask),
-            )
-            .expect("a slot");
-        app.refresh_presence_session(sid);
-        assert!(app.presence_pill(wid).is_none());
-        assert!(app.presence_pill_key(wid).is_none());
-        #[cfg(a11y_tree)]
-        assert!(app.presence_a11y_message(wid).is_none());
-        let hover = app.presence_hover(sid, None).expect("the need is said");
-        let lines: Vec<&str> = hover.lines().collect();
-        assert_eq!(
-            lines[..2],
-            [
-                "Needs you: sign 0.48.0 (+1 more)",
-                "Claude Code carries on meanwhile"
-            ],
-            "{hover}"
-        );
-        assert!(!hover.contains("Needs attention"), "{hover}");
-        ctx.meta
-            .lock()
-            .unwrap()
-            .set_attention_kind(crate::harness_host::NEEDS_ATTENTION_OWNER, None, None)
-            .expect("cleared");
-        ask(&ctx, Some("please look"));
-        app.refresh_presence_session(sid);
-        assert!(
-            app.presence_pill(wid).is_some(),
-            "an interactive ask keeps its pill"
-        );
-        assert!(app.presence_pill_key(wid).is_some());
-        let hover = app.presence_hover(sid, None).expect("the ask is said");
-        assert_eq!(
-            hover.lines().next(),
-            Some("Needs attention: please look"),
-            "{hover}"
-        );
-        assert!(!hover.contains("carries on"), "CONTROL: {hover}");
-    }
-
-    #[test]
-    fn a_failed_command_is_a_note_and_never_a_need_mark() {
-        let (mut app, wid, first, first_ctx) = app_with_stub();
-        let _ = second_tab(&mut app, wid);
-        let tab = app.windows[&wid].tab_set.tabs().len() - 2;
-        app.windows
-            .get_mut(&wid)
-            .and_then(|ws| ws.tab_set.tab_at_mut(tab))
-            .expect("the stub's tab")
-            .presentation
-            .indicators
-            .status_attention = true;
-        app.refresh_presence_session(first);
-        let stamp = |app: &App| {
-            let ws = &app.windows[&wid];
-            let mut metadata: Vec<crate::tab_bar::TabStripMetadata> = ws
-                .tab_set
-                .tabs()
-                .iter()
-                .map(|t| crate::tab_bar::TabStripMetadata::from_presentation(&t.presentation))
-                .collect();
-            app.stamp_presence_chips(wid, &mut metadata);
-            metadata[tab]
-        };
-        let item = stamp(&app);
-        assert_eq!(item.attention, ChipLevel::Note);
-        assert_eq!(view(&app, wid).rim, Rim::None, "no border");
-        assert!(app.presence_pill(wid).is_none(), "no pill");
-        let ink = [1, 2, 3];
-        let drawn = crate::tab_bar::status_mark_ink_for_test(item, ink);
-        assert_eq!(drawn, ink, "the label's ink, no presence tone");
-        ask(&first_ctx, Some("approve?"));
-        app.refresh_presence_session(first);
-        let item = stamp(&app);
-        assert_eq!(item.attention, ChipLevel::Wait);
-        assert_ne!(crate::tab_bar::status_mark_ink_for_test(item, ink), ink);
-    }
-
-    #[test]
-    fn a_stale_pill_click_acts_on_nothing() {
-        let (mut app, wid, first, first_ctx) = app_with_stub();
-        let (second, _) = second_tab(&mut app, wid);
-        ask(&first_ctx, Some("approve?"));
-        app.refresh_presence_session(first);
-        assert_eq!(app.focused_session_id(wid), Some(second));
-        app.on_pill_act(wid, second, PillHit::Go);
-        assert_eq!(app.focused_session_id(wid), Some(second), "stale: nothing");
-        app.on_pill_act(wid, first, PillHit::Act(crate::presence::PillAct::Restart));
-        assert_eq!(app.focused_session_id(wid), Some(second), "not offered");
-        app.on_pill_act(wid, first, PillHit::Go);
-        assert_eq!(
-            app.focused_session_id(wid),
-            Some(first),
-            "the body goes there"
-        );
-    }
-
-    #[test]
-    fn the_pills_hand_back_lifts_the_persons_hold() {
-        let (mut app, wid, sid, ctx) = app_with_stub();
-        app.take_over_session(sid).expect("the person takes it");
-        app.refresh_presence_session(sid);
-        let pill = view(&app, wid).pill.as_ref().expect("yours is a pill");
-        assert_eq!(
-            (pill.session, pill.act),
-            (sid, Some(crate::presence::PillAct::HandBack))
-        );
-        let hand_back = PillHit::Act(crate::presence::PillAct::HandBack);
-        app.with_gesture_source(true, |app| app.on_pill_act(wid, sid, hand_back));
-        assert!(
-            ctx.fabric.holds().person().is_some(),
-            "a control client's click lifts nothing"
-        );
-        app.on_pill_act(wid, sid, hand_back);
-        assert!(ctx.fabric.holds().person().is_none(), "handed back");
-    }
-
-    #[test]
-    fn take_over_lights_every_yours_and_the_chips_hand_back_lifts_it() {
-        use crate::claude_lights::{Chip, TeamFace};
-        use aterm_types::needs::HoldWord;
-        let (mut app, wid, sid, ctx) = app_with_stub();
-        let yours = |app: &App| {
-            (
-                view(app, wid).rim,
-                app.presence.slot(sid).map(|s| s.chip()),
-                app.team_face(sid),
-                app.status_glance()
-                    .held
-                    .iter()
-                    .map(|h| h.hold)
-                    .collect::<Vec<_>>(),
-            )
-        };
-        app.refresh_presence_session(sid);
-        assert_eq!(
-            yours(&app),
-            (Rim::None, Some(ChipLevel::Off), None, Vec::new()),
-            "control: nothing is yours"
-        );
-        app.take_over_session(sid).expect("the person takes it");
-        assert_eq!(
-            yours(&app),
-            (
-                Rim::Yours,
-                Some(ChipLevel::Yours),
-                Some(TeamFace::Yours),
-                vec![HoldWord::Person]
-            )
-        );
-        assert!(
-            app.presence_chrome_line().contains("rim=yours"),
-            "{}",
-            app.presence_chrome_line()
-        );
-        app.note_claude_team(wid, sid);
-        app.with_gesture_source(true, |app| {
-            app.press_claude_chip(wid, sid, Chip::Team, std::time::Instant::now());
-        });
-        assert!(
-            ctx.fabric.holds().person().is_some(),
-            "a control client's press lifts nothing"
-        );
-        app.press_claude_chip(wid, sid, Chip::Team, std::time::Instant::now());
-        assert!(ctx.fabric.holds().person().is_none(), "handed back");
-        assert_eq!(
-            yours(&app),
-            (Rim::None, Some(ChipLevel::Off), None, Vec::new())
-        );
     }
 
     #[test]
@@ -3045,226 +2863,6 @@ mod tests {
     }
 
     #[test]
-    fn a_shared_sessions_pill_lands_in_the_window_clicked() {
-        let shared = |via_pill: bool| {
-            let (mut app, w0, first, first_ctx) = app_with_stub();
-            app.frontmost_window = Some(w0);
-            let w1 = app
-                .open_active_session_in_new_window_logical()
-                .expect("the share");
-            let (other, _) = second_tab(&mut app, w1);
-            assert!(w0 < w1, "PRECONDITION: the first window showing it is w0");
-            assert_eq!(app.focused_session_id(w1), Some(other));
-            ask(&first_ctx, Some("approve?"));
-            app.refresh_presence_session(first);
-            let pill = view(&app, w1).pill.clone().expect("w1 is lit");
-            assert_eq!((pill.session, pill.tab), (first, Some(1)));
-            if via_pill {
-                app.on_pill_act(w1, first, PillHit::Go);
-            } else {
-                let _ = app.focus_session_window(first);
-            }
-            (first, app.focused_session_id(w1))
-        };
-        let (first, focused) = shared(true);
-        assert_eq!(focused, Some(first), "the tab clicked comes to the front");
-        let (first, focused) = shared(false);
-        assert_ne!(focused, Some(first), "control: w1 stays where it was");
-    }
-
-    #[test]
-    fn the_pills_body_goes_to_the_pane_that_needs_you() {
-        let (mut app, wid, first, first_ctx) = app_with_stub();
-        first_ctx.meta.lock().unwrap().role = Some("fmt".into());
-        let other = app.split_active_stub_tab(wid);
-        assert_eq!(app.focused_session_id(wid), Some(other), "the new pane");
-        ask(&first_ctx, Some("approve?"));
-        app.refresh_presence_session(first);
-        let pill = app.presence_pill(wid).expect("lit");
-        assert_eq!(pill.session, first);
-        assert!(pill.words.label.contains("fmt"), "{:?}", pill.words);
-        app.on_pill_act(wid, first, PillHit::Go);
-        assert_eq!(app.focused_session_id(wid), Some(first), "the pane");
-        let pill = app.presence_pill(wid).expect("still lit");
-        assert!(pill.words.label.is_empty(), "{:?}", pill.words);
-    }
-
-    #[test]
-    fn a_pill_naming_another_pane_names_it_with_nothing_else_to_go_on() {
-        let (mut app, wid, first, first_ctx) = app_with_stub();
-        let other = app.split_active_stub_tab(wid);
-        assert_eq!(app.focused_session_id(wid), Some(other), "the new pane");
-        ask(&first_ctx, Some("approve?"));
-        app.refresh_presence_session(first);
-        let pill = app.presence_pill(wid).expect("lit");
-        assert_eq!(pill.session, first);
-        assert!(!pill.words.label.is_empty(), "{:?}", pill.words);
-        assert_eq!(pill.words.label, app.tab_label_of_session(first));
-        app.on_pill_act(wid, first, PillHit::Go);
-        let pill = app.presence_pill(wid).expect("still lit");
-        assert!(pill.words.label.is_empty(), "{:?}", pill.words);
-    }
-
-    #[test]
-    fn a_background_worker_has_one_name_on_every_surface() {
-        let (mut app, wid, _front, _) = app_with_stub();
-        let (worker, worker_ctx) = second_tab(&mut app, wid);
-        app.switch_tab_in(wid, 0);
-        crate::term_lock(&app.pool.get(worker).expect("pooled").term)
-            .process("\x1b]2;\u{2733} bench\x07".as_bytes());
-        ask(&worker_ctx, Some("approve?"));
-        app.refresh_presence_session(worker);
-
-        let glance = app.status_glance();
-        assert_eq!(glance.local_need_sessions(), vec![worker]);
-        assert_eq!(glance.needs[0].label, "bench", "❯'s need row");
-        let handle = app
-            .store
-            .read()
-            .unwrap()
-            .by_local(worker)
-            .cloned()
-            .expect("registered");
-        let notice = crate::status_item::escalation(&app.status_session_row(&handle))
-            .expect("a need's notice");
-        assert!(notice.body.starts_with("bench"), "{}", notice.body);
-        let pill = app
-            .presence_view(wid)
-            .and_then(|v| v.pill.as_ref())
-            .map(|p| p.label.clone())
-            .expect("lit");
-        assert_eq!(pill, "bench", "the pill");
-        app.open_overview().expect("the card opens");
-        let card = app
-            .windows
-            .get_mut(&wid)
-            .and_then(|ws| ws.overview_mut())
-            .expect("open");
-        assert!(card.select_session(worker, false), "the worker's chip");
-        assert_eq!(
-            card.selected_chip().map(|chip| chip.label.as_str()),
-            Some("bench"),
-            "the Overview"
-        );
-        let registry = crate::status_item::tab_name(None, None, &handle.title)
-            .unwrap_or_else(|| presence::short_sid(handle.sid.as_str()));
-        assert_eq!(
-            registry,
-            presence::short_sid(handle.sid.as_str()),
-            "{:?}",
-            handle.title
-        );
-    }
-
-    #[test]
-    fn the_pill_names_a_background_tab_by_the_title_its_strip_shows() {
-        let (mut app, wid, first, first_ctx) = app_with_stub();
-        let _ = second_tab(&mut app, wid);
-        let tab = app.windows[&wid].tab_set.tabs().len() - 2;
-        let retitle = |app: &App, title: &str| {
-            crate::term_lock(&app.pool.get(first).expect("pooled").term)
-                .process(format!("\x1b]0;{title}\x07").as_bytes());
-        };
-        retitle(&app, "\u{2733} review");
-        ask(&first_ctx, Some("approve?"));
-        app.refresh_presence_session(first);
-        let label = |app: &App| {
-            app.presence_view(wid)
-                .and_then(|v| v.pill.as_ref())
-                .map(|p| p.label.clone())
-                .expect("lit")
-        };
-        let strip = app.tab_titles(wid)[tab].clone();
-        assert_eq!(
-            label(&app),
-            crate::app_take_over::title_without_agent_glyph(&strip),
-            "{strip:?}"
-        );
-        assert!(!label(&app).contains('\u{2733}'));
-        retitle(&app, "deploy");
-        assert!(app.flush_title_drift(first, Instant::now()));
-        assert_eq!(label(&app), app.tab_titles(wid)[tab]);
-        first_ctx.meta.lock().unwrap().user_title = Some("mytab".into());
-        app.on_meta_changed(first);
-        assert_eq!(label(&app), "mytab");
-    }
-
-    #[test]
-    fn more_opens_the_overview_at_the_windows_next_need() {
-        let (mut app, wid, first, first_ctx) = app_with_stub();
-        let (second, second_ctx) = second_tab(&mut app, wid);
-        let (front, _) = second_tab(&mut app, wid);
-        let t0 = Instant::now();
-        set_presence_clock_for_test(Some(t0));
-        ask(&first_ctx, Some("one?"));
-        app.refresh_presence_session(first);
-        let _ = crate::app_tabs::take_raised_windows();
-        assert_eq!(view(&app, wid).pill.as_ref().map(|p| p.more), Some(0));
-        app.on_pill_act(wid, first, PillHit::More);
-        assert!(app.windows[&wid].overview().is_none(), "control: no card");
-        assert_eq!(crate::app_tabs::take_raised_windows(), Vec::new());
-
-        set_presence_clock_for_test(Some(t0 + Duration::from_secs(1)));
-        ask(&second_ctx, Some("two?"));
-        app.refresh_presence_session(second);
-        let named = view(&app, wid).pill.as_ref().map(|p| (p.session, p.more));
-        assert_eq!(named, Some((first, 1)), "the older need, and one more");
-        app.on_pill_act(wid, second, PillHit::More);
-        assert!(app.windows[&wid].overview().is_none(), "stale: no card");
-        app.on_pill_act(wid, first, PillHit::More);
-        let card = app.windows[&wid].overview().expect("the card is open");
-        assert_eq!(
-            card.selected_chip().map(|c| c.local_id),
-            Some(second),
-            "at the next need"
-        );
-        assert_eq!(crate::app_tabs::take_raised_windows(), vec![wid]);
-        assert_eq!(app.focused_session_id(wid), Some(front), "no tab moved");
-        set_presence_clock_for_test(None);
-    }
-
-    #[test]
-    fn the_in_grid_strip_carries_the_pill_and_its_press_goes_to_the_tab() {
-        use crate::tab_bar::TabHit;
-        let (mut app, wid, first, first_ctx) = app_with_stub();
-        let (second, _) = second_tab(&mut app, wid);
-        app.tab_strip_rows = 1;
-        assert!(
-            app.strip_carries_pill(wid),
-            "a headless window has no titlebar strip"
-        );
-        app.splice_tab_strip(wid);
-        let body = |app: &App| {
-            app.windows[&wid]
-                .tab_segments
-                .iter()
-                .find(|s| s.kind == TabHit::Pill(PillHit::Go))
-                .map(|s| s.start_col + 1)
-        };
-        assert_eq!(body(&app), None, "no need, no pill");
-        ask(&first_ctx, Some("approve?"));
-        app.refresh_presence_session(first);
-        app.splice_tab_strip(wid);
-        let col = body(&app).expect("the pill's body is laid out");
-        assert_eq!(app.windows[&wid].strip_pill_session, Some(first));
-        app.windows.get_mut(&wid).unwrap().strip_pill_session = Some(second);
-        app.handle_tab_strip_click(wid, col, std::time::Instant::now());
-        assert_eq!(app.focused_session_id(wid), Some(second), "stale: nothing");
-        app.windows.get_mut(&wid).unwrap().strip_pill_session = Some(first);
-        app.handle_tab_strip_click(wid, col, std::time::Instant::now());
-        assert_eq!(
-            app.focused_session_id(wid),
-            Some(first),
-            "the body goes there"
-        );
-        ask(&first_ctx, None);
-        app.refresh_presence_session(first);
-        app.splice_tab_strip(wid);
-        assert_eq!(body(&app), None, "the need cleared, the pill went");
-        assert_eq!(app.windows[&wid].strip_pill_session, None);
-    }
-
-    #[test]
     fn workers_name_their_manager_on_the_chip_the_strip_and_the_press() {
         use crate::claude_lights::TeamFace;
         let (mut app, wid, manager, manager_ctx) = app_with_stub();
@@ -3368,35 +2966,6 @@ mod tests {
     }
 
     #[test]
-    fn a_chrome_commit_inside_a_batch_measures_the_pending_regrid() {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        let size = aterm_window::dpi::PhysicalSize::new(1600, 1200);
-        let gridded = app.grid_dims_for(wid, size).0;
-        assert!(gridded > 2, "a window with rows to spare");
-        app.message_band_rows += 1;
-        assert_eq!(
-            app.chrome_commit_grid_rows_at(wid, gridded, Some(size)),
-            gridded,
-            "outside a batch the grid re-grids at once, so it is current"
-        );
-        app.chrome_regrid_batch = Some(ChromeRegridBatch::default());
-        app.regrid_for_chrome_rows();
-        assert_eq!(
-            app.chrome_commit_grid_rows_at(wid, gridded, Some(size)),
-            gridded - 1,
-            "the pending re-grid gives a row fewer"
-        );
-        assert_eq!(
-            app.chrome_commit_grid_rows_at(wid, gridded, None),
-            gridded,
-            "a headless window never re-grids for chrome"
-        );
-        app.chrome_regrid_batch = None;
-        let _ = take_chrome_regrids_applied();
-    }
-
-    #[test]
     fn a_calm_key_reads_the_story_on_the_wire() {
         let (mut app, wid, sid, _ctx) = app_with_stub();
         app.refresh_presence_session(sid);
@@ -3405,6 +2974,47 @@ mod tests {
         assert_eq!(app.presence_session_level(sid), presence::Level::Story);
         app.note_human_acted(wid);
         assert_eq!(app.presence_session_level(sid), presence::Level::Quiet);
+    }
+
+    #[test]
+    fn posted_window_keys_keep_activity_without_refreshing_person_presence() {
+        use aterm_window::event::{DeviceId, ElementState, KeyEvent, WindowEvent};
+        use aterm_window::keyboard::{Key, KeyCode, KeyLocation, PhysicalKey, SmolStr};
+        let mut app = App::headless_for_test();
+        app.user_input_readable = || false;
+        let event = WindowEvent::KeyboardInput {
+            device_id: DeviceId::dummy(),
+            event: KeyEvent::synthetic_for_test(
+                PhysicalKey::Code(KeyCode::KeyX),
+                Key::Character("x".into()),
+                Some(SmolStr::new("x")),
+                KeyLocation::Standard,
+                ElementState::Pressed,
+                false,
+            ),
+            is_synthetic: false,
+        };
+        assert!(app.last_person_input_at.is_none());
+        app.note_window_input_arrival(&event, true);
+        assert!(
+            app.last_keystroke_at.is_some(),
+            "automation still counts as input activity"
+        );
+        assert!(app.last_person_input_at.is_none());
+        assert!(!app.person_present_within(Duration::from_secs(60), Instant::now()));
+        app.last_keystroke_at = None;
+        app.note_window_input_arrival(&event, false);
+        assert!(app.last_keystroke_at.is_some());
+        let person = app
+            .last_person_input_at
+            .expect("a physical key establishes presence");
+        assert!(app.person_present_within(Duration::from_secs(60), Instant::now()));
+        app.note_window_input_arrival(&event, true);
+        assert_eq!(
+            app.last_person_input_at,
+            Some(person),
+            "a later posted key preserves the actual person's stamp"
+        );
     }
 
     /// A CONTROL CLIENT'S PRESS READS NO STORY: the story watermark records what the person
@@ -3906,3 +3516,7 @@ mod person_stand_in_tests;
 #[cfg(test)]
 #[path = "look_needs_focus_tests.rs"]
 mod look_needs_focus_tests;
+
+#[cfg(all(test, unix))]
+#[path = "grok_signin_look_tests.rs"]
+mod grok_signin_look_tests;

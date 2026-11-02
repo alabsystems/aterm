@@ -206,7 +206,7 @@ fn position_mark(
                 .y_bearing
                 .wrapping_sub(mark_extents.y_bearing.wrapping_add(mark_extents.height));
             if (y_gap > 0) != (pos.y_offset > 0) {
-                let correction = (-pos.y_offset) / 2;
+                let correction = -(pos.y_offset / 2);
                 base_extents.y_bearing = base_extents.y_bearing.wrapping_add(correction);
                 base_extents.height = base_extents.height.wrapping_sub(correction);
                 pos.y_offset = pos.y_offset.wrapping_add(correction);

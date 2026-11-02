@@ -21,7 +21,7 @@ mod process;
 #[path = "retirement_tests.rs"]
 mod retirement_tests;
 
-fn allocation(lab: &Lab, shares: &[u64]) -> Allocation {
+pub(super) fn allocation(lab: &Lab, shares: &[u64]) -> Allocation {
     let bootstrap = lab.bootstrap(0);
     let terms = Terms {
         resource: [41; 32],
@@ -42,10 +42,10 @@ fn allocation(lab: &Lab, shares: &[u64]) -> Allocation {
     let proposed = Proposal::prepare(bootstrap.trust(), terms).unwrap();
     Allocation::verify(proposed.bytes(), proposed.fingerprint(), bootstrap.trust()).unwrap()
 }
-fn resources(lab: &Lab, n: usize, allocation: &Allocation) -> Resources {
+pub(super) fn resources(lab: &Lab, n: usize, allocation: &Allocation) -> Resources {
     Resources::at(lab.paths[n].clone(), allocation.clone())
 }
-fn rounds(lab: &Lab) {
+pub(super) fn rounds(lab: &Lab) {
     let endpoints: Vec<_> = (0..2)
         .map(|n| {
             Endpoint::from_bootstrap(&lab.bootstrap(n))
@@ -189,6 +189,230 @@ fn two_machines_spend_only_disjoint_shares_then_converge_over_existing_repair() 
     assert_eq!(a.snapshot().unwrap(), b.snapshot().unwrap());
     assert_eq!(a.snapshot().unwrap().used.values().sum::<u64>(), 5);
     assert!(!b.reserve([1; 16], 3).unwrap().fresh);
+}
+
+fn restored_peer_debit(invalid: bool) -> (Lab, Allocation) {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let allocation = allocation(&lab, &[2, 2]);
+    let a = resources(&lab, 0, &allocation);
+    let b = resources(&lab, 1, &allocation);
+    let scope = a.initialize().unwrap();
+    b.initialize().unwrap();
+    b.reserve([1; 16], 1).unwrap();
+    if invalid {
+        raw(
+            &lab,
+            &allocation,
+            ledger::Debit {
+                allocation: allocation.id(),
+                request: [2; 16],
+                cost: 3,
+                cumulative: 3,
+            },
+        );
+    } else {
+        a.reserve([2; 16], 1).unwrap();
+    }
+    let bootstrap = lab.bootstrap(1);
+    let session = Session::open(&bootstrap).unwrap();
+    let directory = Directory::new(&lab.paths[1], bootstrap.trust());
+    let original = directory.path(scope).unwrap();
+    let displaced = lab._home.path().join("preserved-resource-primary");
+    std::fs::rename(&original, &displaced).unwrap();
+    let mut recovery =
+        Store::join_recovery(&session, &directory.recovery().path(scope).unwrap(), scope).unwrap();
+    let peer = lab.bootstrap(0);
+    let peer_session = Session::observe(&peer).unwrap();
+    let source = Store::observe(
+        &peer_session,
+        &Directory::new(&lab.paths[0], peer.trust())
+            .path(scope)
+            .unwrap(),
+        scope,
+    )
+    .unwrap();
+    for id in source.inventory(&peer_session).unwrap() {
+        recovery
+            .ingest(&session, source.wire(&peer_session, id).unwrap().unwrap())
+            .unwrap();
+    }
+    drop((source, peer_session, recovery, session));
+    std::fs::rename(&displaced, &original).unwrap();
+    (lab, allocation)
+}
+
+#[test]
+fn restored_primary_cannot_spend_past_invalid_recovery_liability() {
+    let (lab, allocation) = restored_peer_debit(true);
+    let b = resources(&lab, 1, &allocation);
+    assert!(
+        b.reserve([3; 16], 1).is_err(),
+        "recovery liability was ignored"
+    );
+    let mut invoked = false;
+    assert!(
+        b.dispatch_once([4; 16], 1, [5; 32], || {
+            invoked = true;
+            None
+        })
+        .is_err()
+    );
+    assert!(!invoked);
+    assert!(b.snapshot().is_err());
+}
+
+#[test]
+fn restored_primary_reconciles_valid_recovery_without_rebinding_custody() {
+    let (lab, allocation) = restored_peer_debit(false);
+    let b = resources(&lab, 1, &allocation);
+    let before = b.snapshot().unwrap();
+    assert_eq!(before.used.values().sum::<u64>(), 2);
+    b.reserve([3; 16], 1).unwrap();
+    assert_eq!(b.snapshot().unwrap().used.values().sum::<u64>(), 3);
+    assert!(!b.reserve([3; 16], 1).unwrap().fresh);
+}
+
+pub(crate) fn resource_recovery_transition(
+    state: &aterm_spec::interp::State,
+    action: &str,
+) -> aterm_spec::interp::State {
+    let invalid = matches!(action, "InvalidReserve" | "InvalidDispatch");
+    let (lab, allocation) = restored_peer_debit(invalid);
+    let b = resources(&lab, 1, &allocation);
+    let mut next = state.clone();
+    let scenario = match action {
+        "Observe" => {
+            if let Ok(snapshot) = b.snapshot() {
+                next.insert("observed", 1);
+                next.insert("used", snapshot.used.values().sum::<u64>() as i64);
+            }
+            1
+        }
+        "Reserve" | "InvalidReserve" => {
+            next.insert("accepted", i64::from(b.reserve([3; 16], 1).is_ok()));
+            if !invalid {
+                next.insert(
+                    "used",
+                    b.snapshot().unwrap().used.values().sum::<u64>() as i64,
+                );
+            }
+            if invalid { 3 } else { 2 }
+        }
+        "InvalidDispatch" => {
+            let mut invoked = false;
+            let result = b.dispatch_once([4; 16], 1, [5; 32], || {
+                invoked = true;
+                None
+            });
+            assert!(result.is_err());
+            next.insert("invoked", i64::from(invoked));
+            4
+        }
+        _ => panic!("unknown resource recovery action"),
+    };
+    next.insert("scenario", scenario);
+    next
+}
+
+#[test]
+fn resource_recovery_conforms_and_ignoring_retained_evidence_is_detected() {
+    let model = aterm_models_db::resource_recovery_model();
+    assert!(aterm_spec::interp::prove_and_catch(&model) > 1);
+    for state in aterm_spec::interp::reachable_states(&model) {
+        for action in &model.actions {
+            if model.action_enabled(action.name, &state) {
+                let next = resource_recovery_transition(&state, action.name);
+                assert!(
+                    model.successors(action.name, &state).contains(&next),
+                    "{}: {state:?} -> {next:?}",
+                    action.name,
+                );
+            }
+        }
+    }
+    let (lab, allocation) = restored_peer_debit(true);
+    let b = resources(&lab, 1, &allocation);
+    // Reproduce the old primary-only admission instead of bypassing the model
+    // by inventing a successful result. The invalid signed debit remains in
+    // recovery while the original table has enough local share to append.
+    let accepted = crate::documents::application::with_store(
+        &lab.paths[1],
+        false,
+        |bootstrap| descriptor(bootstrap, &allocation),
+        |session, store, _| {
+            b.pin(session, store, false)?;
+            let ledger = ledger::Ledger::read(&allocation, session, store)?;
+            let debit = b.new_debit(session, &ledger, [3; 16], 1)?;
+            store.commit_liability(session, &debit.encode())
+        },
+    )
+    .is_ok();
+    assert!(
+        accepted,
+        "negative control did not reproduce the old admission"
+    );
+    let mut unsafe_state = model.init_state();
+    unsafe_state.insert("scenario", 3);
+    unsafe_state.insert("accepted", i64::from(accepted));
+    assert!(!model.check_invariant("InvalidLiabilityRefuses", &unsafe_state));
+}
+
+#[test]
+fn recovered_catalog_keeps_an_intact_resource_table_after_creator_retirement() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let allocation = allocation(&lab, &[3, 3]);
+    let a = resources(&lab, 0, &allocation);
+    let b = resources(&lab, 1, &allocation);
+    a.initialize().unwrap();
+    rounds(&lab);
+    b.initialize().unwrap();
+    b.reserve([1; 16], 1).unwrap();
+    let bootstrap = lab.bootstrap(1);
+    let session = Session::open(&bootstrap).unwrap();
+    let directory = Directory::new(&lab.paths[1], bootstrap.trust());
+    let catalog = directory.catalog_scope();
+    std::fs::rename(
+        directory.path(catalog).unwrap(),
+        lab._home.path().join("preserved-resource-catalog"),
+    )
+    .unwrap();
+    let mut recovery = Store::join_recovery(
+        &session,
+        &directory.recovery().path(catalog).unwrap(),
+        catalog,
+    )
+    .unwrap();
+    let peer = lab.bootstrap(0);
+    let peer_session = Session::observe(&peer).unwrap();
+    let source = Store::observe(
+        &peer_session,
+        &Directory::new(&lab.paths[0], peer.trust())
+            .path(catalog)
+            .unwrap(),
+        catalog,
+    )
+    .unwrap();
+    for id in source.inventory(&peer_session).unwrap() {
+        recovery
+            .ingest(&session, source.wire(&peer_session, id).unwrap().unwrap())
+            .unwrap();
+    }
+    drop((source, peer_session, recovery, session));
+    lab.rotate(&[Role::Reader, Role::Writer]);
+    assert_eq!(b.snapshot().unwrap().used.values().sum::<u64>(), 1);
+    b.reserve([2; 16], 1).unwrap();
+    let attempt = b
+        .dispatch_once([3; 16], 1, [7; 32], || {
+            Some(Observation::new(Outcome::Completed, [8; 32]).unwrap())
+        })
+        .unwrap();
+    assert!(attempt.observation.confirmed().is_some());
+    assert!(
+        !b.dispatch_once([3; 16], 1, [7; 32], || panic!("duplicate entry"))
+            .unwrap()
+            .invoked
+    );
+    assert_eq!(b.snapshot().unwrap().used.values().sum::<u64>(), 3);
 }
 
 #[test]
@@ -582,16 +806,15 @@ fn resource_reservations_conform_and_unsafe_receipts_are_detected() {
                 .collect::<Vec<_>>()
         })
         .collect();
-    // Each step builds its own Lab in its own temporary home: every core.
-    let reached =
-        aterm_spec::check::each_on(aterm_spec::fs_lane::PLACES, &steps, |(state, action)| {
-            let next = reservation_transition(state, action);
-            assert!(
-                model.successors(action, state).contains(&next),
-                "{action}: {next:?}"
-            );
-            next
-        });
+    // Each step builds its own Lab in its own temporary home, on the lane's places.
+    let reached = aterm_spec::fs_lane::each(&steps, |(state, action)| {
+        let next = reservation_transition(state, action);
+        assert!(
+            model.successors(action, state).contains(&next),
+            "{action}: {next:?}"
+        );
+        next
+    });
     let mut unsafe_retry = steps
         .iter()
         .zip(&reached)

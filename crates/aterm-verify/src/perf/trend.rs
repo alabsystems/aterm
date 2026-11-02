@@ -420,7 +420,7 @@ pub(crate) fn trend_ledger_rows_counted(ledger: &str) -> (Vec<TrendRow<'_>>, Vec
             ));
             continue;
         }
-        let Ok(value) = cols[4].parse::<f64>() else {
+        let Some(value) = cols[4].parse::<f64>().ok().filter(|v| v.is_finite()) else {
             dropped.push(format!(
                 "line {}: value column `{}` does not parse as a number",
                 n + 1,
@@ -1523,5 +1523,16 @@ mod tests {
         );
         assert_eq!(civil_date(0), "1970-01-01");
         assert_eq!(civil_date(47_482), "2100-01-01");
+    }
+
+    #[test]
+    fn non_finite_ledger_values_are_discarded_and_counted() {
+        let ledger = "2026-07-22\tabc\tboxA\tthroughput/median_mbps\tinf\ttrust\tTest-Chip-8c\n\
+                      2026-07-22\tabc\tboxA\tthroughput/median_mbps\tNaN\ttrust\tTest-Chip-8c\n\
+                      2026-07-22\tabc\tboxA\tthroughput/median_mbps\t500.0\ttrust\tTest-Chip-8c\n";
+        let (rows, dropped) = trend_ledger_rows_counted(ledger);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].value, 500.0);
+        assert_eq!(dropped.len(), 2);
     }
 }

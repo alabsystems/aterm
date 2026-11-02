@@ -23,11 +23,47 @@ use crate::opentype_layout::{
 };
 use crate::parser::LazyArray16;
 use aterm_grapheme::GeneralCategory;
+use core::cell::Cell;
 
 /// Match positions for one rule as indices into the buffer, including the first glyph.
 pub(crate) type MatchPositions = [usize; MAX_CONTEXT_LENGTH];
 
 pub(crate) type MatchFn<'a> = dyn Fn(GlyphId, u16) -> bool + 'a;
+
+/// The `GSUB`/`GPOS` work one shaping call may still do, which `Buffer::enter` scales by the
+/// input length as HarfBuzz scales its `max_ops`. One unit is a glyph a lookup is tried at; a
+/// subtable, rule or sequence record tried; a glyph a match takes or skips; a glyph a rule
+/// copies to move between its positions; a glyph passed walking a ligature's marks; a glyph a
+/// base search passes; a link of a cursive chain turned; or a nested lookup. Once it is spent
+/// matching fails and no further lookup applies, so the glyphs keep what the lookups before
+/// did to them.
+pub(crate) struct Budget(Cell<i64>);
+
+impl Budget {
+    /// Charges one unit; false once the budget is spent.
+    #[inline]
+    pub(crate) fn charge(&self) -> bool {
+        self.charge_n(1)
+    }
+
+    /// Charges `n` units; false once the budget cannot cover them.
+    #[inline]
+    pub(crate) fn charge_n(&self, n: usize) -> bool {
+        #[cfg(all(any(test, debug_assertions), not(trust_verify)))]
+        crate::work::note(|s| s.layout_ops += n as u64);
+        let left = self
+            .0
+            .get()
+            .saturating_sub(i64::try_from(n).unwrap_or(i64::MAX));
+        self.0.set(left);
+        left >= 0
+    }
+
+    #[inline]
+    pub(crate) fn spent(&self) -> bool {
+        self.0.get() <= 0
+    }
+}
 
 pub(crate) struct ApplyContext<'a, 'f> {
     table_index: usize,
@@ -45,6 +81,14 @@ pub(crate) struct ApplyContext<'a, 'f> {
     pub(crate) last_base_until: u32,
     /// The glyphs the buffer may hold (grown as substitutions add glyphs).
     pub(crate) digest: Digest,
+    /// `buffer.max_layout_ops` while the context lives, handed back when it drops.
+    pub(crate) budget: Budget,
+}
+
+impl Drop for ApplyContext<'_, '_> {
+    fn drop(&mut self) {
+        self.buffer.max_layout_ops = self.budget.0.get();
+    }
 }
 
 impl<'a, 'f> ApplyContext<'a, 'f> {
@@ -55,6 +99,7 @@ impl<'a, 'f> ApplyContext<'a, 'f> {
         buffer: &'a mut Buffer,
         digest: Digest,
     ) -> Self {
+        let budget = Budget(Cell::new(buffer.max_layout_ops));
         ApplyContext {
             table_index,
             face,
@@ -70,6 +115,7 @@ impl<'a, 'f> ApplyContext<'a, 'f> {
             last_base: -1,
             last_base_until: 0,
             digest,
+            budget,
         }
     }
 
@@ -93,11 +139,7 @@ impl<'a, 'f> ApplyContext<'a, 'f> {
 
     /// Applies nested lookup `index` at the current position.
     pub(crate) fn recurse(&mut self, index: LookupIndex) -> Option<()> {
-        if self.nesting_level_left == 0 {
-            return None;
-        }
-        self.buffer.max_ops -= 1;
-        if self.buffer.max_ops < 0 {
+        if self.nesting_level_left == 0 || !self.budget.charge() {
             return None;
         }
         self.nesting_level_left -= 1;
@@ -268,6 +310,24 @@ impl<'a, 'b, 'f> SkippyIter<'a, 'b, 'f> {
         self.buf_idx
     }
 
+    /// Ends the walk with `Some(matched)` or skips on with `None`, charging a glyph taken or
+    /// skipped. The glyph that fails a match is free: a walk meets one at most, and the rule
+    /// or subtable that began the walk paid for it.
+    #[inline]
+    fn step(&mut self, outcome: Outcome) -> Option<bool> {
+        if outcome == Outcome::NoMatch {
+            return Some(false);
+        }
+        if !self.ctx.budget.charge() {
+            return Some(false);
+        }
+        if outcome == Outcome::Skip {
+            return None;
+        }
+        self.glyph_data = self.glyph_data.wrapping_add(1);
+        Some(true)
+    }
+
     #[inline]
     pub(crate) fn next(&mut self) -> bool {
         while self.buf_idx + 1 < self.buf_len {
@@ -275,13 +335,9 @@ impl<'a, 'b, 'f> SkippyIter<'a, 'b, 'f> {
             let Some(info) = self.ctx.buffer.info.get(self.buf_idx) else {
                 return false;
             };
-            match self.match_(info) {
-                Outcome::Match => {
-                    self.glyph_data = self.glyph_data.wrapping_add(1);
-                    return true;
-                }
-                Outcome::NoMatch => return false,
-                Outcome::Skip => continue,
+            let outcome = self.match_(info);
+            if let Some(matched) = self.step(outcome) {
+                return matched;
             }
         }
         false
@@ -294,13 +350,9 @@ impl<'a, 'b, 'f> SkippyIter<'a, 'b, 'f> {
             let Some(info) = self.ctx.buffer.out_info().get(self.buf_idx) else {
                 return false;
             };
-            match self.match_(info) {
-                Outcome::Match => {
-                    self.glyph_data = self.glyph_data.wrapping_add(1);
-                    return true;
-                }
-                Outcome::NoMatch => return false,
-                Outcome::Skip => continue,
+            let outcome = self.match_(info);
+            if let Some(matched) = self.step(outcome) {
+                return matched;
             }
         }
         false
@@ -375,7 +427,12 @@ pub(crate) fn match_input(
         MaySkip,
     }
     let count = usize::from(input_len) + 1;
-    if count > MAX_CONTEXT_LENGTH {
+    // Each matched glyph is a different glyph after the current one, so a rule that needs more
+    // than remain fails without stepping (HarfBuzz's `num_items` stop).
+    if !ctx.budget.charge()
+        || count > MAX_CONTEXT_LENGTH
+        || count > ctx.buffer.len.saturating_sub(ctx.buffer.idx)
+    {
         return None;
     }
     let mut iter = SkippyIter::new(ctx, ctx.buffer.idx, false);
@@ -402,7 +459,14 @@ pub(crate) fn match_input(
                     let out = ctx.buffer.out_info();
                     let mut j = ctx.buffer.out_len;
                     let mut found = false;
+                    // Back over the ligature's marks to the ligature: a rule can ask this at
+                    // the last of a long run of them again and again, so each glyph is charged.
                     while j > 0 && lig_id(&out[j - 1]) == first_lig_id {
+                        #[cfg(all(any(test, debug_assertions), not(trust_verify)))]
+                        crate::work::note(|s| s.marks_walked += 1);
+                        if !ctx.budget.charge() {
+                            return None;
+                        }
                         if lig_comp(&out[j - 1]) == 0 {
                             j -= 1;
                             found = true;
@@ -439,6 +503,9 @@ pub(crate) fn match_backtrack(
     backtrack_len: u16,
     match_func: &MatchFn,
 ) -> bool {
+    if usize::from(backtrack_len) > ctx.buffer.backtrack_len() {
+        return false;
+    }
     let mut iter = SkippyIter::new(ctx, ctx.buffer.backtrack_len(), true);
     iter.enable_matching(match_func);
     (0..backtrack_len).all(|_| iter.prev())
@@ -454,6 +521,9 @@ pub(crate) fn match_lookahead(
     let Some(start) = start_index.checked_sub(1) else {
         return false;
     };
+    if usize::from(lookahead_len) > ctx.buffer.len.saturating_sub(start_index) {
+        return false;
+    }
     let mut iter = SkippyIter::new(ctx, start, true);
     iter.enable_matching(match_func);
     (0..lookahead_len).all(|_| iter.next())
@@ -681,7 +751,7 @@ fn apply_lookup(
     let mut end: isize = backtrack_len + match_end as isize - ctx.buffer.idx as isize;
 
     for record in lookups {
-        if !ctx.buffer.successful {
+        if !ctx.buffer.successful || !ctx.budget.charge() {
             break;
         }
         let idx = usize::from(record.sequence_index);
@@ -692,10 +762,12 @@ fn apply_lookup(
         if positions[idx] >= orig_len {
             continue;
         }
-        if !ctx.buffer.move_to(positions[idx]) {
-            break;
-        }
-        if ctx.buffer.max_ops <= 0 {
+        // Records may alternate between glyphs a match paired across any number of skipped
+        // ones, and a rewind can shift the rest of the input, so each move pays for what it
+        // copies.
+        if !ctx.budget.charge_n(ctx.buffer.move_cost(positions[idx]))
+            || !ctx.buffer.move_to(positions[idx])
+        {
             break;
         }
         if ctx.recurse(record.lookup_list_index).is_none() {
@@ -736,6 +808,9 @@ fn apply_lookup(
         }
     }
     if let Ok(end) = usize::try_from(end) {
+        // The closing move runs past the budget too, so the buffer is left whole; a nested
+        // lookup may have taken the buffer past `end`, making it a rewind, so it is charged.
+        ctx.budget.charge_n(ctx.buffer.move_cost(end));
         ctx.buffer.move_to(end);
     }
 }
@@ -809,6 +884,13 @@ pub(crate) fn ligate_input(
     }
     if !is_mark_ligature && last_lig_id != 0 {
         for i in buffer.idx..buffer.len {
+            // The marks after the last component move to the new ligature. A rule can ligate
+            // onto a long run of them again and again, so each is charged; past the budget the
+            // walk still finishes, leaving the marks in step with the ligature, and no further
+            // match starts.
+            #[cfg(all(any(test, debug_assertions), not(trust_verify)))]
+            crate::work::note(|s| s.marks_walked += 1);
+            ctx.budget.charge();
             let info = &mut buffer.info[i];
             if last_lig_id != lig_id(info) {
                 break;

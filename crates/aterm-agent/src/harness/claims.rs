@@ -38,7 +38,11 @@
 //!   recorded deadline; a closed session may therefore keep its claim until then. Any other
 //!   claim goes at the Mac's next write or look. The window looks every [`RECHECK_S`] (the node
 //!   job, while no window runs). Before the Mac sleeps the window keeps what it still uses at
-//!   most [`SESSION_FRESH_S`] more ([`quieted`]), so peers read its accounts free then.
+//!   most [`SESSION_FRESH_S`] more ([`quieted`]), so peers read its accounts free then; as it
+//!   shuts down, restarts or logs out it gives up every claim ([`Act::Off`]): the window once the
+//!   system's quit went ahead or as a terminating signal ends it, the node job as it stops with no
+//!   window open. Either row goes to the peers at once ([`touch_pushing`]), since a Mac about to
+//!   sleep or stop may run no later repair round to carry it.
 //! - **Claude Code's accounts.** Only Claude Code's rows are claimed, as only they were leased:
 //!   Claude Code alone has a usage tap to renew a claim, so another CLI's rows stay unclaimed.
 
@@ -548,7 +552,7 @@ const fn realms(cli: Cli) -> &'static [&'static str] {
 /// it: this Mac claimed one of `keys`' rows for it within [`IDLE_S`] (`State::claimed_at`: a
 /// launch, or a running session's usage tap), or a session here was noted on that row within
 /// [`SESSION_FRESH_S`]. This store records no use of a claim in another CLI's realm, so that one
-/// lasts [`IDLE_S`] from its `since`.
+/// lasts [`IDLE_S`] from its `since`. Preparation-only rows supply no execution evidence.
 #[must_use]
 pub fn in_use(
     cli: Cli,
@@ -563,6 +567,7 @@ pub fn in_use(
     }
     keys.iter().any(|(label, key)| {
         key == &claim.key
+            && state.execution_verdict(label).is_ok()
             && (state
                 .claimed_at
                 .get(label)
@@ -580,7 +585,7 @@ pub fn keys(cli: Cli, roster: &Roster) -> Vec<(String, LeaseKey)> {
         .rows
         .iter()
         .filter_map(|row| {
-            let email = row.email.as_deref()?;
+            let email = row.expected_identity_email()?;
             LeaseKey::for_cli(cli, row.vendor.region, email)
                 .ok()
                 .map(|key| (row.label.clone(), key))
@@ -637,6 +642,18 @@ pub trait Table: Send + Sync {
     /// The row was not written: this Mac is no Commons writer, today's tables are full, or its
     /// writer lock was busy.
     fn write(&self, home: &std::path::Path, row: &Row) -> Result<(), String>;
+
+    /// Hand this Mac's row in the table under `home` to its peers now, waiting until `deadline` at
+    /// most for one to take it: the push a Mac makes as it goes quiet or down
+    /// ([`touch_pushing`]), when no later repair round of its own may come.
+    ///
+    /// # Errors
+    /// No peer took the row: this process serves no Commons repair, knows no peer, or the
+    /// deadline came first. A table that hands nothing on says so.
+    fn push(&self, home: &std::path::Path, deadline: std::time::Instant) -> Result<(), String> {
+        let _ = (home, deadline);
+        Err("this claims table hands nothing to peers".to_owned())
+    }
 }
 
 /// What a [`Table`] read gives.
@@ -658,6 +675,12 @@ pub enum Act<'a> {
     /// This Mac goes quiet (it is about to sleep): [`Act::Look`], and the claims it keeps last at
     /// most [`SESSION_FRESH_S`] more ([`quieted`]).
     Quiet,
+    /// This Mac goes down (it shuts down, restarts or logs out, its window dies of a terminating
+    /// signal, or its node job stops with no window open): every claim given up ([`released`]),
+    /// so peers read its accounts free at once, not at its row's `until` up to a day away. No
+    /// record keeps a claim then, so a roster, logins or activity record that cannot be read
+    /// refuses none of it.
+    Off,
     /// Claim this row's account (a launch, or a session using it).
     Claim(&'a str),
 }
@@ -673,8 +696,15 @@ pub enum Touched {
     Held,
     /// This Mac wrote its row with the claim.
     Claimed,
+    /// This Mac's row stands as it goes quiet or down ([`Act::Quiet`], [`Act::Off`]): written
+    /// now, its claims given up or kept a shorter while, or already so (an earlier quiet, off or
+    /// look wrote it, and its push may have reached no peer). The row [`touch_pushing`] hands to
+    /// the peers.
+    Quieted,
     /// Another Mac's senior live claim holds the account; this Mac claimed nothing.
     HeldElsewhere(Holder),
+    /// The credential is held for preparation and cannot acquire execution claims.
+    PreparationOnly,
     /// This Mac could not read its account records or read/write its claim row; it keeps to
     /// its home accounts and the claims it holds.
     Unrecorded(String),
@@ -703,6 +733,14 @@ pub fn touch_with(
 #[expect(
     clippy::too_many_arguments,
     reason = "the claim operation plus optional durable machine-wide activity"
+)]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountClaimObservation",
+        action = "Prepare",
+        reason = "Select a preparation-only credential before observing claims."
+    )
 )]
 #[cfg_attr(
     all(unix, any(test, debug_assertions)),
@@ -759,7 +797,12 @@ fn touch_using(
         Ok(read) => read,
         Err(why) => {
             state.unrecorded = true;
-            return Touched::Unrecorded(why);
+            return match act {
+                Act::Claim(label) if state.execution_verdict(label).is_err() => {
+                    Touched::PreparationOnly
+                }
+                _ => Touched::Unrecorded(why),
+            };
         }
     };
     let view = View {
@@ -802,15 +845,26 @@ fn touch_using(
             .is_some_and(|active| active.live(&claim.key, now))
             || in_use(cli, state, keys, claim, now)
     };
+    // A quiet or off goes to the peers wherever this Mac has a row, written now or not: the
+    // row an earlier quiet, off or look wrote may never have reached them.
+    let quiet = |row: Option<Row>| {
+        let outcome = if row.is_some() || mine_now.is_some() {
+            Touched::Quieted
+        } else {
+            Touched::Looked
+        };
+        (outcome, row)
+    };
     let (outcome, row) = match act {
         Act::Look => (
             Touched::Looked,
             released(mine_now.as_ref(), |c| !used(c), now),
         ),
-        Act::Quiet => (
-            Touched::Looked,
-            quieted(mine_now.as_ref(), |c| !used(c), now),
-        ),
+        Act::Quiet => quiet(quieted(mine_now.as_ref(), |c| !used(c), now)),
+        Act::Off => quiet(released(mine_now.as_ref(), |_| true, now)),
+        Act::Claim(label) if state.execution_verdict(label).is_err() => {
+            (Touched::PreparationOnly, None)
+        }
         Act::Claim(label) => match key_of(label) {
             None => (Touched::NotApplicable, None),
             Some(key) => {
@@ -846,10 +900,12 @@ fn touch_using(
         },
     };
     let record_claim = if let Act::Claim(label) = act {
-        !matches!(outcome, Touched::NotApplicable | Touched::HeldElsewhere(_))
-            && (state.home_accounts.contains(label)
-                || matches!(outcome, Touched::Held)
-                || (matches!(outcome, Touched::Claimed) && read.writable.is_ok()))
+        !matches!(
+            outcome,
+            Touched::NotApplicable | Touched::HeldElsewhere(_) | Touched::PreparationOnly
+        ) && (state.home_accounts.contains(label)
+            || matches!(outcome, Touched::Held)
+            || (matches!(outcome, Touched::Claimed) && read.writable.is_ok()))
     } else {
         false
     };
@@ -872,10 +928,19 @@ fn touch_using(
         }
     }
     let outcome = match (refused.as_ref(), row) {
-        (Some(_), _) if matches!(outcome, Touched::HeldElsewhere(_)) => outcome,
-        (Some(why), _) => Touched::Unrecorded(why.clone()),
-        (None, None) => outcome,
-        (None, Some(row)) => match read.writable.clone().and_then(|()| table.write(home, &row)) {
+        (Some(_), _)
+            if matches!(
+                outcome,
+                Touched::HeldElsewhere(_) | Touched::PreparationOnly
+            ) =>
+        {
+            outcome
+        }
+        // An off's row gives up every claim and so depends on no evidence: a refused record
+        // keeps nothing then.
+        (Some(why), _) if !matches!(act, Act::Off) => Touched::Unrecorded(why.clone()),
+        (_, None) => outcome,
+        (_, Some(row)) => match read.writable.clone().and_then(|()| table.write(home, &row)) {
             Ok(()) => {
                 read.book.insert(row);
                 outcome
@@ -994,16 +1059,63 @@ pub fn touch(
     act: Act<'_>,
     now: i64,
 ) -> Touched {
-    if cli != Cli::Claude
-        || !home
-            .join(".secrets")
-            .join(super::ai_pool::AI_POOL_FILE)
-            .is_file()
-    {
+    if !applies(home, cli) {
         return Touched::NotApplicable;
     }
     on_table(|table| touch_on(table, home, state_dir, roster_path, cli, act, now))
         .unwrap_or(Touched::NotApplicable)
+}
+
+/// Whether claims apply to `cli` under `home`: Claude Code's, where `ai-pool.toml` is present.
+fn applies(home: &std::path::Path, cli: Cli) -> bool {
+    cli == Cli::Claude
+        && home
+            .join(".secrets")
+            .join(super::ai_pool::AI_POOL_FILE)
+            .is_file()
+}
+
+/// What [`touch_pushing`] did: the touch, and the push where its row went to the peers
+/// ([`Table::push`]).
+pub type Pushed = (Touched, Option<Result<(), String>>);
+
+/// [`touch`] as this Mac goes quiet or down (`act` is [`Act::Quiet`] or [`Act::Off`]), then, where
+/// it has a row ([`Touched::Quieted`]: written now or already so), hand the row to its peers now
+/// ([`Table::push`]), waiting until `deadline` at most. Its Commons would otherwise carry the row
+/// at its next repair round with a peer, which a Mac about to sleep or stop may never run.
+pub fn touch_pushing(
+    home: &std::path::Path,
+    state_dir: &std::path::Path,
+    roster_path: Option<&std::path::Path>,
+    cli: Cli,
+    act: Act<'_>,
+    now: i64,
+    deadline: std::time::Instant,
+) -> Pushed {
+    if !applies(home, cli) {
+        return (Touched::NotApplicable, None);
+    }
+    on_table(|table| push_on(table, home, state_dir, roster_path, cli, act, now, deadline))
+        .unwrap_or((Touched::NotApplicable, None))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the table, then touch_pushing's own arguments"
+)]
+fn push_on(
+    table: &dyn Table,
+    home: &std::path::Path,
+    state_dir: &std::path::Path,
+    roster_path: Option<&std::path::Path>,
+    cli: Cli,
+    act: Act<'_>,
+    now: i64,
+    deadline: std::time::Instant,
+) -> Pushed {
+    let touched = touch_on(table, home, state_dir, roster_path, cli, act, now);
+    let pushed = (touched == Touched::Quieted).then(|| table.push(home, deadline));
+    (touched, pushed)
 }
 
 fn touch_on(
@@ -1038,22 +1150,46 @@ fn touch_reading(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let presence = presence_now();
+    let off = matches!(act, Act::Off);
     let mut outcome = Touched::NotApplicable;
     if let Err(why) = store.transact(now, &mut None, |state| {
+        if let Act::Claim(label) = act
+            && state.execution_verdict(label).is_err()
+        {
+            // A later read or commit failure cannot replace a known execution refusal.
+            outcome = Touched::PreparationOnly;
+        }
         // The roster and bindings belong to this state transaction. A managed edit
         // cannot replace a label's identity while its old key is being claimed.
-        let raw = read_roster()?;
-        let (logins, _) = store.load_logins(now)?;
-        let keys = keys(cli, &accounts::bound(&raw, &logins));
+        let read = read_roster().and_then(|raw| {
+            let (logins, _) = store.load_logins(now)?;
+            Ok(keys(cli, &accounts::bound(&raw, &logins)))
+        });
+        // An off keeps no claim, so no record it cannot read refuses it: neither the roster and
+        // logins nor the activity (busy, corrupt). A stopping Mac's claims never stand to their
+        // row's `until` for want of evidence an off does not use.
+        let keys = match read {
+            Ok(keys) => keys,
+            Err(_) if off => Vec::new(),
+            Err(why) => return Err(why),
+        };
         let mut active = activity::Held::take(home);
-        let activity = active
-            .as_mut()
-            .map(|held| Some(&mut *held))
-            .map_err(|why| why.clone());
+        let activity = match active.as_mut() {
+            Ok(held) => Ok(Some(held)),
+            Err(_) if off => Ok(None),
+            Err(why) => Err(why.clone()),
+        };
         outcome = touch_using(table, home, presence, state, cli, &keys, act, now, activity);
         Ok(Vec::new())
     }) {
-        return Touched::Unrecorded(why);
+        return if matches!(
+            outcome,
+            Touched::PreparationOnly | Touched::HeldElsewhere(_)
+        ) {
+            outcome
+        } else {
+            Touched::Unrecorded(why)
+        };
     }
     outcome
 }

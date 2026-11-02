@@ -580,14 +580,20 @@ fn file_root(root: &RootSpec, policy: &Policy) -> Result<SizeFull, Refusal> {
     let name = canon.file_name().ok_or(Refusal::Relative)?;
     #[cfg(unix)]
     {
-        let _ = policy;
-        let pfd = imp::open_chain(parent)?;
+        let pfd = imp::open_checked(parent)?;
         use std::os::fd::AsFd as _;
         use std::os::unix::ffi::OsStrExt as _;
         let e = crate::list::portable::stat_at(pfd.as_fd(), name.as_bytes());
         if let Some(errno) = e.error {
             return Err(errno_refusal(errno));
         }
+        if e.kind == crate::list::Kind::Link {
+            return Err(Refusal::Link);
+        }
+        if e.kind == crate::list::Kind::Dir {
+            return Err(Refusal::NotDirectory);
+        }
+        let nlink = u64::from(e.nlink.max(1));
         let mut sums = Sums {
             files: 1,
             logical: e.logical,
@@ -597,16 +603,42 @@ fn file_root(root: &RootSpec, policy: &Policy) -> Result<SizeFull, Refusal> {
         if e.dataless {
             sums.dataless_logical = e.logical;
         } else {
-            sums.alloc_fair = e.alloc / u64::from(e.nlink.max(1));
-            if e.nlink <= 1 {
+            sums.alloc_fair = e.alloc / nlink;
+            if nlink <= 1 {
                 sums.released_floor = e.alloc;
             }
         }
+        if policy.private {
+            sums.private = Some(if e.dataless {
+                0
+            } else {
+                e.private.unwrap_or(e.alloc) / nlink
+            });
+        }
+        let links = policy.links_out.then(|| {
+            if e.dataless {
+                LinkTotals::default()
+            } else if nlink > 1 {
+                LinkTotals {
+                    alloc_first_seen: e.alloc,
+                    shared_out: e.alloc,
+                    frees_at_most: 0,
+                    linked_inodes: 1,
+                }
+            } else {
+                LinkTotals {
+                    alloc_first_seen: e.alloc,
+                    shared_out: 0,
+                    frees_at_most: e.alloc,
+                    linked_inodes: 0,
+                }
+            }
+        });
         Ok(SizeFull {
             sums,
             complete: true,
             walked: 1,
-            links: None,
+            links,
         })
     }
     #[cfg(not(unix))]
@@ -891,6 +923,15 @@ pub(crate) mod imp {
         ))
     }
 
+    pub(crate) fn directory_identity(path: &Path) -> Result<(u64, u64), Refusal> {
+        let fd = open_checked(path)?;
+        let (dev, ino, _, flags) = fstat_of(&fd)?;
+        if dataless(flags) {
+            return Err(Refusal::Dataless);
+        }
+        Ok((dev, ino))
+    }
+
     /// Whether `st_flags` mark a cloud placeholder (`SF_DATALESS`), which only
     /// Apple's file systems have.
     #[cfg(target_vendor = "apple")]
@@ -1136,7 +1177,13 @@ pub(crate) mod imp {
             } else if let Some((name, child)) = pending.pop() {
                 let name = OsStr::from_bytes(&name);
                 let opened = open_child(fd, name).and_then(|cfd| {
-                    let (dev, ..) = fstat_of(&cfd)?;
+                    if let Some(why) = volume_refusal_of(&cfd) {
+                        return Err(why);
+                    }
+                    let (dev, _, _, flags) = fstat_of(&cfd)?;
+                    if dataless(flags) {
+                        return Err(Refusal::Dataless);
+                    }
                     Ok((cfd, dev))
                 });
                 let next = match opened {
@@ -1203,7 +1250,10 @@ pub(crate) mod imp {
         if let Some(why) = volume_refusal_of(&fd) {
             return Err(why);
         }
-        let (root_dev, ..) = fstat_of(&fd)?;
+        let (root_dev, _, _, flags) = fstat_of(&fd)?;
+        if dataless(flags) {
+            return Err(Refusal::Dataless);
+        }
         let skip = unsafe_mounts_in(canon, &policy.mounts, policy.deny.fold_case());
         let dir = aterm_dirfd::Dir::read_from(&fd).map_err(|e| errno_refusal(e.raw_os_error()))?;
         let mut rows = Vec::new();
@@ -1284,6 +1334,10 @@ pub(crate) mod imp {
         let fd = open_chain(canon)?;
         if let Some(why) = volume_refusal_of(&fd) {
             return Err(why);
+        }
+        let (_, _, _, flags) = fstat_of(&fd)?;
+        if dataless(flags) {
+            return Err(Refusal::Dataless);
         }
         #[cfg(target_vendor = "apple")]
         {

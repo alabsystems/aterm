@@ -89,13 +89,17 @@ pub(crate) struct PerfReport {
 
 /// A [`PerfReport`] from the harness line or a baseline.
 pub(crate) fn parse_report(json: &Value) -> Option<PerfReport> {
+    let u64_field = |key: &str| {
+        let v = number(json, key)?;
+        (v >= 0.0 && v <= u64::MAX as f64 && v.fract() == 0.0).then_some(v as u64)
+    };
     Some(PerfReport {
         median_mbps: number(json, "median_mbps")?,
         min_mbps: number(json, "min_mbps")?,
         max_mbps: number(json, "max_mbps")?,
-        workload_bytes: number(json, "workload_bytes")? as u64,
-        n: number(json, "n")? as u64,
-        warmup: number(json, "warmup")? as u64,
+        workload_bytes: u64_field("workload_bytes").filter(|&b| b > 0)?,
+        n: u64_field("n").filter(|&n| n > 0)?,
+        warmup: u64_field("warmup")?,
     })
 }
 
@@ -145,14 +149,26 @@ pub(crate) fn gate_throughput(record: bool) -> LaneRun {
     }];
     let path = baseline_path();
     let mut run = if record {
-        let previous = std::fs::read_to_string(&path).ok().and_then(|t| object(&t));
-        let (comment, _) = carried_comment(previous.as_ref(), THROUGHPUT_COMMENT, &utc_date());
-        write_baseline(&path, &baseline_json(&report, PASS_RATIO, &comment))
+        record_throughput(&path, &report)
     } else {
         compare_against_baseline(&path, &report)
     };
     run.samples = samples;
     run
+}
+
+fn record_throughput(path: &Path, report: &PerfReport) -> LaneRun {
+    if !(report.median_mbps.is_finite() && report.median_mbps > 0.0) {
+        return LaneRun::fail(format!(
+            "REFUSING to record — median_mbps measured {}; a non-positive floor judges nothing. \
+             {} left untouched.",
+            report.median_mbps,
+            path.display()
+        ));
+    }
+    let previous = std::fs::read_to_string(path).ok().and_then(|t| object(&t));
+    let (comment, _) = carried_comment(previous.as_ref(), THROUGHPUT_COMMENT, &utc_date());
+    write_baseline(path, &baseline_json(report, PASS_RATIO, &comment))
 }
 
 /// Read the baseline at `path` (if any) and apply the floor.
@@ -490,8 +506,9 @@ pub(crate) const TRAIL_LIGHT_COMPOSER: EffectsLane = composer_lane(
     "perf-baseline-trail-light-composer.json",
     "aterm TRAIL-LIGHT-COMPOSER baseline (docs/design/PRISM-GLASS.md §15.1 P0.12): \
      trail-dark-composer's scene on Default Light (effects_harness --light), the glow's \
-     dark_theme read off that ground as a window reads it (theme_is_dark), so the trail draws \
-     main's light (paper) arm: the GPU time as a reference full-repaint frame's p50 over the \
+     page and light grounded as a window grounds them (TrailGround::ground on the terminal's \
+     configured pair), so the trail draws the light arm a window draws at the live level \
+     (prism_glass::LIVE): the GPU time as a reference full-repaint frame's p50 over the \
      scene's (composer_gpu_rel), and the CPU work of the producer, the CPU raster and the GPU \
      encode as frames per 10^9 instructions retired (_per_ginsn). BIGGER-IS-BETTER. Re-record \
      with targo --unverified verify perf --record trail-light-composer.",
@@ -578,7 +595,7 @@ pub(crate) fn measure_example(example: &str) -> Result<Value, String> {
 
 /// [`measure_example`] with `aterm-bench` features on (a harness that needs a dev seam), handed
 /// `harness_args` (the scenes a harness runs, and on what).
-fn measure_example_with(
+pub(crate) fn measure_example_with(
     example: &str,
     features: &[&str],
     harness_args: &[&str],
@@ -1606,5 +1623,28 @@ mod tests {
                 assert!(matches!(chosen(lane, &unknown, true), Err(Status::Fail(_))));
             }
         }
+    }
+
+    #[test]
+    fn throughput_rejects_invalid_counts_and_refuses_to_record_non_positive_median() {
+        let bad_n = aterm_json::from_str::<Value>(
+            r#"{"median_mbps":100.0,"min_mbps":90.0,"max_mbps":110.0,"workload_bytes":1024,"n":0,"warmup":1}"#,
+        )
+        .unwrap();
+        assert!(parse_report(&bad_n).is_none());
+
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("perf-baseline.json");
+        let zero_report = PerfReport {
+            median_mbps: 0.0,
+            min_mbps: 0.0,
+            max_mbps: 0.0,
+            workload_bytes: 1024,
+            n: 5,
+            warmup: 1,
+        };
+        let run = record_throughput(&path, &zero_report);
+        assert!(run.failed());
+        assert!(!path.exists());
     }
 }

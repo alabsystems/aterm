@@ -329,9 +329,11 @@ fn unpack(archive: &[u8], top: &str, into: &Path) -> Result<usize, String> {
     std::fs::create_dir(into).map_err(|e| format!("could not create {}: {e}", into.display()))?;
     let mut tar = GzipReader::new(archive);
     let mut members = 0usize;
+    let mut extensions = 0usize;
     let mut written = 0u64;
     let mut long_name: Option<String> = None;
     let mut pax = Pax::default();
+    let mut pending_ext = false;
     let mut header = [0u8; BLOCK];
     while read_block(&mut tar, &mut header)? {
         if header.iter().all(|b| *b == 0) {
@@ -341,6 +343,10 @@ fn unpack(archive: &[u8], top: &str, into: &Path) -> Result<usize, String> {
         let kind = header[156];
         let field_size = octal(&header[124..136])?;
         if matches!(kind, b'L' | b'x' | b'g') {
+            extensions += 1;
+            if extensions > MEMBER_LIMIT {
+                return Err(format!("more than {MEMBER_LIMIT} extension headers"));
+            }
             if field_size > EXTENSION_LIMIT {
                 return Err(format!(
                     "an extension header of {field_size} bytes, over the {EXTENSION_LIMIT} read"
@@ -353,8 +359,12 @@ fn unpack(archive: &[u8], top: &str, into: &Path) -> Result<usize, String> {
                 b'L' => {
                     let name = body.split(|b| *b == 0).next().unwrap_or_default();
                     long_name = Some(utf8(name)?);
+                    pending_ext = true;
                 }
-                b'x' => pax = parse_pax(&body)?,
+                b'x' => {
+                    pax = parse_pax(&body)?;
+                    pending_ext = true;
+                }
                 b'g' => {
                     let global = parse_pax(&body)?;
                     if global.path.is_some() || global.size.is_some() {
@@ -365,6 +375,7 @@ fn unpack(archive: &[u8], top: &str, into: &Path) -> Result<usize, String> {
             }
             continue;
         }
+        pending_ext = false;
         let size = pax.size.take().unwrap_or(field_size);
         let path = match long_name.take().or_else(|| pax.path.take()) {
             Some(path) => path,
@@ -418,6 +429,9 @@ fn unpack(archive: &[u8], top: &str, into: &Path) -> Result<usize, String> {
                 ));
             }
         }
+    }
+    if pending_ext {
+        return Err("an extension header has no member after it".to_string());
     }
     // Read to the end of the gzip stream, so its CRC-32 and length are checked.
     io::copy(&mut (&mut tar).take(UNPACKED_LIMIT), &mut io::sink())
@@ -538,6 +552,7 @@ fn parse_pax(body: &[u8]) -> Result<Pax, String> {
         let space = rest.iter().position(|b| *b == b' ').ok_or_else(bad)?;
         let len: usize = std::str::from_utf8(&rest[..space])
             .ok()
+            .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
             .and_then(|s| s.parse().ok())
             .ok_or_else(bad)?;
         if len <= space + 1 || len > rest.len() {
@@ -552,8 +567,19 @@ fn parse_pax(body: &[u8]) -> Result<Pax, String> {
                 pax.size = Some(
                     std::str::from_utf8(value)
                         .ok()
+                        .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
                         .and_then(|s| s.parse().ok())
                         .ok_or_else(bad)?,
+                );
+            }
+            b"linkpath" => {
+                return Err(
+                    "a PAX linkpath record, which a published crate does not hold".to_string(),
+                );
+            }
+            k if k.starts_with(b"GNU.sparse.") => {
+                return Err(
+                    "a PAX sparse record, which a published crate does not hold".to_string()
                 );
             }
             _ => {}
@@ -811,6 +837,35 @@ pub(crate) mod tests {
             panic!("a global PAX path override unpacked");
         };
         assert!(why.contains("global PAX header"), "{why}");
+
+        let sparse_pax_record = b"22 GNU.sparse.major=1\n";
+        let mut sparse_pax = Vec::new();
+        sparse_pax.extend_from_slice(&header("PaxHeader", sparse_pax_record.len(), b'x'));
+        sparse_pax.extend_from_slice(sparse_pax_record);
+        sparse_pax.resize(2 * BLOCK, 0);
+        sparse_pax.extend_from_slice(&header("upstream-1.2.3/ok.rs", 3, b'0'));
+        sparse_pax.extend_from_slice(b"ok\n");
+        sparse_pax.resize(sparse_pax.len().div_ceil(BLOCK) * BLOCK + 2 * BLOCK, 0);
+        let cache = aterm_tempfile::tempdir().unwrap();
+        let served = Served::honest("upstream", "1.2.3", gzip_stored(&sparse_pax));
+        let Err(why) = pristine(cache.path(), served).copy("upstream", "1.2.3") else {
+            panic!("a PAX sparse record unpacked");
+        };
+        assert!(why.contains("PAX sparse record"), "{why}");
+
+        let mut dangling_ext = Vec::new();
+        dangling_ext.extend_from_slice(&header("././@LongLink", 18, b'L'));
+        dangling_ext.extend_from_slice(b"upstream-1.2.3/ok\0");
+        dangling_ext.resize(4 * BLOCK, 0);
+        let cache = aterm_tempfile::tempdir().unwrap();
+        let served = Served::honest("upstream", "1.2.3", gzip_stored(&dangling_ext));
+        let Err(why) = pristine(cache.path(), served).copy("upstream", "1.2.3") else {
+            panic!("a dangling extension header unpacked");
+        };
+        assert!(
+            why.contains("extension header has no member after it"),
+            "{why}"
+        );
     }
 
     #[test]

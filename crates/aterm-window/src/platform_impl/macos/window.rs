@@ -72,6 +72,20 @@ impl Window {
         self.delegate.get_on_main(|delegate| f(delegate))
     }
 
+    /// LOCAL PATCH (aterm): `platform::macos::frame_clock_link`, a debug seam; `None` off the main
+    /// thread.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn frame_clock_link(&self) -> Option<aterm_objc::WeakObj> {
+        MainThread::new().and_then(|mtm| self.delegate.get(mtm).frame_clock_link())
+    }
+
+    /// LOCAL PATCH (aterm): `platform::macos::frame_clock_links`, a debug seam; empty off the main
+    /// thread.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn frame_clock_links(&self) -> Vec<aterm_objc::WeakObj> {
+        MainThread::new().map_or_else(Vec::new, |mtm| self.delegate.get(mtm).frame_clock_links())
+    }
+
     /// LOCAL PATCH (aterm): the content view behind `aterm_objc::HasNsView` (`platform/macos.rs`); nil off the main thread.
     #[inline]
     pub(crate) fn ns_view(&self) -> Id {

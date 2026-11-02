@@ -246,6 +246,11 @@ pub(crate) enum Mutant {
     /// F4 (`Bridge::post_landed`): a bridge killed before the table is written again leaves
     /// the next one no deadline to sweep, and the ask never expires.
     RetireOverAnUnwrittenDeadline,
+    /// A post's deadline is armed again over the settle the asks journal remembers, as before
+    /// item C04 (`Bridge::note_deadline`): a held ask's retry, by the bridge that held it or by
+    /// the next after a kill, arms the deadline its answer or `expired` settled while it was
+    /// held, and a sweep expires it again once retention gave that record up.
+    ArmOverASettle,
     /// The broadcast face's gap notice is only logged, as before item F4 (`Bridge::on_gap`):
     /// the face reads on past it, and the cursors at its frontier go past what retention gave
     /// up with its next record, telling no follower.
@@ -723,6 +728,77 @@ impl Face {
     }
 }
 
+/// ONE RECORD OF THE MODEL BROKER'S LOG AS THE ORACLE READS IT ([`World::log`]): its bytes, and
+/// each decoding of them made at most once while the log keeps the record. The laws read the
+/// whole log at every step; copying it and decoding each record again at each of them was most
+/// of what those reads cost.
+struct Seen {
+    subject: String,
+    body: Vec<u8>,
+    key: Option<(u64, u64)>,
+    /// Not a record a reader is handed ([`bus::Broker::records`] leaves it out).
+    hidden: bool,
+    fabric: std::cell::OnceCell<Body>,
+    slog: std::cell::OnceCell<Option<aterm_slog::BusRec>>,
+}
+
+impl Seen {
+    fn of(rec: &bus::Rec) -> Self {
+        Self {
+            subject: rec.subject.clone(),
+            body: rec.body.clone(),
+            key: rec.key,
+            hidden: rec.hidden(),
+            fabric: std::cell::OnceCell::new(),
+            slog: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// Whether the log holds this record still at its offset: one a power loss took may be
+    /// another record there now.
+    fn is(&self, rec: &bus::Rec) -> bool {
+        self.key == rec.key
+            && self.hidden == rec.hidden()
+            && self.subject == rec.subject
+            && self.body == rec.body
+    }
+
+    /// The body as a fabric reader decodes it ([`Body::decode`]).
+    fn fabric(&self) -> &Body {
+        self.fabric.get_or_init(|| Body::decode(&self.body).0)
+    }
+
+    /// The body as a session-log record, where it decodes as one ([`aterm_slog::decode_bus`]).
+    fn slog(&self) -> Option<&aterm_slog::BusRec> {
+        self.slog
+            .get_or_init(|| aterm_slog::decode_bus(&String::from_utf8_lossy(&self.body)).ok())
+            .as_ref()
+    }
+}
+
+/// THE MODEL BROKER'S LOG AS IT STANDS, by offset, hidden records included, through `seen`
+/// (the world's [`Seen`] of it): a record is read again only where the log no longer holds the
+/// one read last ([`Seen::is`]), so each is decoded once while the log keeps it. A caller drops
+/// what this returns before it reads the log again.
+fn log_of<'a>(
+    core: &Core,
+    seen: &'a std::cell::RefCell<Vec<Seen>>,
+) -> std::cell::Ref<'a, Vec<Seen>> {
+    {
+        let s = lock(&core.broker.state);
+        let mut seen = seen.borrow_mut();
+        seen.truncate(s.log.len());
+        for (i, rec) in s.log.iter().enumerate() {
+            match seen.get_mut(i) {
+                Some(was) if was.is(rec) => {}
+                Some(was) => *was = Seen::of(rec),
+                None => seen.push(Seen::of(rec)),
+            }
+        }
+    }
+    seen.borrow()
+}
+
 /// One bridge process, running.
 struct Live {
     bridge: Bridge,
@@ -800,6 +876,8 @@ struct World {
     says: BTreeMap<String, String>,
     /// Every follow a session made.
     follows: Vec<Follow>,
+    /// The model broker's log as the laws last read it ([`World::log`]).
+    seen: std::cell::RefCell<Vec<Seen>>,
 }
 
 /// The prefix of every subject of session `sid`'s mail on this node: the filter a fetch of
@@ -969,6 +1047,7 @@ impl World {
             say_rng: Rng::new(seed ^ 0x05a7_7091_c5f4_0b0b),
             says: BTreeMap::new(),
             follows: Vec::new(),
+            seen: std::cell::RefCell::new(Vec::new()),
         };
         // The first open's tick, asked for at once when its rules are set.
         w.tick_now();
@@ -1215,9 +1294,7 @@ impl World {
         let pid = self.next_pid;
         self.next_pid += 1;
         let process = Process::new(Arc::clone(&self.core), pid);
-        let (near, far) = std::os::unix::net::UnixStream::pair().expect("a socket pair");
-        self.ep.serve(far);
-        let ctl = Ctl::from_stream(near).expect("the verb lane");
+        let ctl = Ctl::simulated(self.ep.lane());
         self.note(format!("launch pid={pid} boot={}", self.boot));
         let fx = Fx::sim(Arc::clone(&process));
         let built = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -1545,36 +1622,42 @@ impl World {
             let off = r
                 .split_whitespace()
                 .find_map(|t| t.strip_prefix("off="))
-                .and_then(|n| n.parse::<u64>().ok());
+                .and_then(crate::parse_uint::<u64>);
             match off {
                 Some(off) if !r.contains("dup=1") => ask.landed = Some((off, wall, pid)),
                 _ => ask.unnoted = true,
             }
         }
-        let records = self.core.broker.records();
+        let log = log_of(&self.core, &self.seen);
+        let records = || {
+            log.iter()
+                .enumerate()
+                .filter(|(_, rec)| !rec.hidden)
+                .map(|(off, rec)| (off as u64, rec))
+        };
         let mut bad = Vec::new();
-        for (e, subject, body, _) in &records {
-            if self.expiries_judged.contains(e) {
+        for (e, rec) in records() {
+            if self.expiries_judged.contains(&e) {
                 continue;
             }
-            let Some((asker, src, "expired")) = in_lane(subject) else {
+            let Some((asker, src, "expired")) = in_lane(&rec.subject) else {
                 continue;
             };
-            self.expiries_judged.insert(*e);
+            self.expiries_judged.insert(e);
             if src != NODE {
                 continue;
             }
-            let Some(re) = Body::decode(body).0.re else {
+            let Some(re) = rec.fabric().re else {
                 bad.push(format!(
                     "deadline: @{e} on {asker}'s lane expired no record"
                 ));
                 continue;
             };
-            let ask = records.iter().find(|r| r.0 == re).and_then(|(_, s, b, _)| {
-                let (target, src, kind) = in_lane(s)?;
-                let (b, _) = Body::decode(b);
-                (sender(src, &b) == asker && WAITING.contains(&kind) && b.dl.is_some())
-                    .then(|| (target.to_string(), b.text))
+            let ask = records().find(|r| r.0 == re).and_then(|(_, r)| {
+                let (target, src, kind) = in_lane(&r.subject)?;
+                let b = r.fabric();
+                (sender(src, b) == asker && WAITING.contains(&kind) && b.dl.is_some())
+                    .then(|| (target.to_string(), b.text.clone()))
             });
             let Some((target, marker)) = ask else {
                 bad.push(format!(
@@ -1591,25 +1674,25 @@ impl World {
             {
                 self.stats.expired_across_incarnations += 1;
             }
-            for (a, s, b, _) in records.iter().filter(|r| r.0 < *e) {
-                let Some((sid, src, kind)) = in_lane(s) else {
+            for (a, r) in records().filter(|r| r.0 < e) {
+                let Some((sid, src, kind)) = in_lane(&r.subject) else {
                     continue;
                 };
-                let (b, _) = Body::decode(b);
+                let b = r.fabric();
                 if sid != asker
-                    || sender(src, &b) != target
+                    || sender(src, b) != target
                     || !ANSWER_KINDS.contains(&kind)
                     || b.re != Some(re)
                 {
                     continue;
                 }
-                if self.core.broker.holds(*a) {
+                if self.core.broker.holds(a) {
                     bad.push(format!(
                         "deadline: @{e} expired @{re} ({marker}), answered by {target} at @{a}, \
                          which the broker holds"
                     ));
                 } else {
-                    self.expired_over_given_up.push((asker.to_string(), *a, *e));
+                    self.expired_over_given_up.push((asker.to_string(), a, e));
                 }
             }
             let s = lock(&self.ep.state);
@@ -1621,7 +1704,7 @@ impl World {
                 .flat_map(|x| x.rows.iter())
                 .find(|row| {
                     row.on_log
-                        && row.off < *e
+                        && row.off < e
                         && row.re == Some(re)
                         && ANSWER_KINDS.contains(&row.kind.as_str())
                 })
@@ -1647,10 +1730,13 @@ impl World {
     fn expired_once(&self) -> Vec<String> {
         let gone = self.core.broker.gone();
         let mut copies: BTreeMap<(String, u64), Vec<u64>> = BTreeMap::new();
-        for (off, subject, body, _) in self.core.broker.records() {
-            if let Some((asker, src, "expired")) = in_lane(&subject) {
-                if let Some(re) = Body::decode(&body).0.re.filter(|_| src == NODE) {
-                    copies.entry((asker.to_string(), re)).or_default().push(off);
+        for (off, rec) in self.log().iter().enumerate().filter(|(_, rec)| !rec.hidden) {
+            if let Some((asker, src, "expired")) = in_lane(&rec.subject) {
+                if let Some(re) = rec.fabric().re.filter(|_| src == NODE) {
+                    copies
+                        .entry((asker.to_string(), re))
+                        .or_default()
+                        .push(off as u64);
                 }
             }
         }
@@ -1685,7 +1771,13 @@ impl World {
     /// answer is its target's on the asker's lane and an `expired` this node's there, each
     /// counted wherever it lies, held or given up.
     fn asks_standing(&self) -> Vec<(String, Ask, bool, bool)> {
-        let records = self.core.broker.records();
+        let log = self.log();
+        let records = || {
+            log.iter()
+                .enumerate()
+                .filter(|(_, rec)| !rec.hidden)
+                .map(|(off, rec)| (off as u64, rec))
+        };
         let hosted: BTreeSet<String> = lock(&self.ep.state)
             .sessions
             .values()
@@ -1696,11 +1788,11 @@ impl World {
             .filter(|(_, a)| hosted.contains(&a.asker))
             .filter_map(|(marker, a)| {
                 let (off, _, _) = a.landed?;
-                let on_bus = records.iter().any(|(o, s, b, _)| {
-                    let (b, _) = Body::decode(b);
-                    *o == off
-                        && in_lane(s).is_some_and(|(to, src, kind)| {
-                            to == a.target && sender(src, &b) == a.asker && kind == "ask"
+                let on_bus = records().any(|(o, r)| {
+                    let b = r.fabric();
+                    o == off
+                        && in_lane(&r.subject).is_some_and(|(to, src, kind)| {
+                            to == a.target && sender(src, b) == a.asker && kind == "ask"
                         })
                         && b.text == *marker
                 });
@@ -1708,15 +1800,15 @@ impl World {
                     return None;
                 }
                 let (mut answered, mut expired) = (false, false);
-                for (_, s, b, _) in &records {
-                    let Some((sid, src, kind)) = in_lane(s) else {
+                for (_, r) in records() {
+                    let Some((sid, src, kind)) = in_lane(&r.subject) else {
                         continue;
                     };
-                    let (b, _) = Body::decode(b);
+                    let b = r.fabric();
                     if sid != a.asker || b.re != Some(off) {
                         continue;
                     }
-                    answered |= sender(src, &b) == a.target && ANSWER_KINDS.contains(&kind);
+                    answered |= sender(src, b) == a.target && ANSWER_KINDS.contains(&kind);
                     expired |= src == NODE && kind == "expired";
                 }
                 Some((marker.clone(), a.clone(), answered, expired))
@@ -2510,19 +2602,23 @@ impl World {
         ));
     }
 
+    /// The model broker's log as it stands ([`log_of`]).
+    fn log(&self) -> std::cell::Ref<'_, Vec<Seen>> {
+        log_of(&self.core, &self.seen)
+    }
+
     /// The text markers of the bus's records on this node's and the person's
-    /// lanes: `marker -> [(offset, subject, body)]`.
-    fn bus_markers(&self) -> BTreeMap<String, Vec<(u64, String, Body)>> {
-        let mut out: BTreeMap<String, Vec<(u64, String, Body)>> = BTreeMap::new();
-        for (off, subject, body, _) in self.core.broker.records() {
-            if !subject.starts_with(&format!("/f/{FLEET}/in/")) {
+    /// lanes: `marker -> [offset]`.
+    fn bus_markers(&self) -> BTreeMap<String, Vec<u64>> {
+        let lanes = format!("/f/{FLEET}/in/");
+        let mut out: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+        for (off, rec) in self.log().iter().enumerate() {
+            if rec.hidden || !rec.subject.starts_with(&lanes) {
                 continue;
             }
-            let (body, _) = Body::decode(&body);
-            if is_marker(&body.text) {
-                out.entry(body.text.clone())
-                    .or_default()
-                    .push((off, subject, body));
+            let text = &rec.fabric().text;
+            if is_marker(text) {
+                out.entry(text.clone()).or_default().push(off as u64);
             }
         }
         out
@@ -2531,23 +2627,21 @@ impl World {
     /// What the model's tap reads of the world now ([`conform::View`]).
     fn view(&self) -> conform::View {
         let lane = format!("/f/{FLEET}/in/{NODE}/");
-        let (records, ident) = {
+        let records = self
+            .log()
+            .iter()
+            .map(|r| {
+                let rest = r.subject.strip_prefix(lane.as_str())?;
+                let sid = rest.split('/').next()?;
+                Some((sid.to_string(), r.fabric().text.clone()))
+            })
+            .collect();
+        let ident = {
             let s = lock(&self.core.broker.state);
-            let records = s
-                .log
-                .iter()
-                .map(|r| {
-                    let rest = r.subject.strip_prefix(lane.as_str())?;
-                    let sid = rest.split('/').next()?;
-                    let (body, _) = Body::decode(&r.body);
-                    Some((sid.to_string(), body.text))
-                })
-                .collect();
-            let ident = astream_broker::LogIdentity {
+            astream_broker::LogIdentity {
                 id: s.id,
                 generation: s.generation,
-            };
-            (records, ident)
+            }
         };
         let group = crate::subject::inbox_group(FLEET, NODE);
         let sessions = lock(&self.ep.state)
@@ -2586,17 +2680,18 @@ impl World {
     fn presence_rows(&self) -> BTreeMap<String, (String, Option<u64>, Option<String>)> {
         let prefix = format!("/f/{FLEET}/pub/{NODE}/");
         let mut out = BTreeMap::new();
-        for (_, subject, body, _) in self.core.broker.records() {
-            let Some(sid) = subject
+        for rec in self.log().iter().filter(|rec| !rec.hidden) {
+            let Some(sid) = rec
+                .subject
                 .strip_prefix(prefix.as_str())
                 .and_then(|rest| rest.strip_suffix("/presence"))
                 .filter(|sid| *sid != "node" && !sid.contains('/'))
             else {
                 continue;
             };
-            let (b, _) = Body::decode(&body);
+            let b = rec.fabric();
             let state = b.unknown.get("state").cloned().unwrap_or_default();
-            let inc = b.unknown.get("inc").and_then(|i| i.parse().ok());
+            let inc = b.unknown.get("inc").and_then(|i| crate::parse_uint(i));
             let mark = b.unknown.get(crate::state::PRESENCE_MARK).cloned();
             out.insert(sid.to_string(), (state, inc, mark));
         }
@@ -2610,6 +2705,7 @@ impl World {
         let owner = self
             .mark
             .as_deref()
+            .filter(|m| m.bytes().all(|b| b.is_ascii_hexdigit()))
             .and_then(|mark| u64::from_str_radix(mark, 16).ok())?;
         let (state, me, _) = rows
             .iter()
@@ -2635,18 +2731,17 @@ impl World {
     /// inc=)`.
     fn node_rows(&self) -> Vec<(String, Option<u64>, Option<u64>)> {
         let face = crate::subject::node_face(FLEET, NODE, "presence");
-        self.core
-            .broker
-            .records()
-            .into_iter()
-            .filter(|(_, subject, _, _)| *subject == face)
-            .map(|(_, _, body, _)| {
-                let (b, _) = Body::decode(&body);
+        self.log()
+            .iter()
+            .filter(|rec| !rec.hidden && rec.subject == face)
+            .map(|rec| {
+                let b = rec.fabric();
                 let state = b.unknown.get("state").cloned().unwrap_or_default();
-                let inc = b.unknown.get("inc").and_then(|i| i.parse().ok());
+                let inc = b.unknown.get("inc").and_then(|i| crate::parse_uint(i));
                 let mark = b
                     .unknown
                     .get(crate::state::PRESENCE_MARK)
+                    .filter(|m| m.bytes().all(|b| b.is_ascii_hexdigit()))
                     .and_then(|mark| u64::from_str_radix(mark, 16).ok());
                 (state, inc, mark)
             })
@@ -2665,11 +2760,13 @@ impl World {
             let owner = self
                 .sibling_mark
                 .strip_prefix(" statedir=")
+                .filter(|m| m.bytes().all(|b| b.is_ascii_hexdigit()))
                 .and_then(|mark| u64::from_str_radix(mark, 16).ok());
             let node = self.node_rows();
             let own_mark = self
                 .mark
                 .as_deref()
+                .filter(|m| m.bytes().all(|b| b.is_ascii_hexdigit()))
                 .and_then(|mark| u64::from_str_radix(mark, 16).ok());
             let ours = node
                 .iter()
@@ -2718,6 +2815,7 @@ impl World {
                     (inc <= me && self.mark.is_some() && mark == &self.mark)
                         || mark
                             .as_deref()
+                            .filter(|m| m.bytes().all(|b| b.is_ascii_hexdigit()))
                             .and_then(|mark| u64::from_str_radix(mark, 16).ok())
                             .is_some_and(|mark| witnessed == Some((inc, mark)))
                 })
@@ -2740,15 +2838,16 @@ impl World {
     fn mirror_faces(&self) -> BTreeMap<String, Face> {
         let prefix = format!("/f/{FLEET}/pub/{NODE}/");
         let mut out: BTreeMap<String, Face> = BTreeMap::new();
-        for (_, subject, body, _) in self.core.broker.records() {
-            let Some(sid) = subject
+        for rec in self.log().iter().filter(|rec| !rec.hidden) {
+            let Some(sid) = rec
+                .subject
                 .strip_prefix(prefix.as_str())
                 .and_then(|rest| rest.strip_suffix("/ev"))
                 .filter(|sid| *sid != "node" && !sid.contains('/'))
             else {
                 continue;
             };
-            let Ok(b) = aterm_slog::decode_bus(&String::from_utf8_lossy(&body)) else {
+            let Some(b) = rec.slog() else {
                 continue;
             };
             let Some(ms) = b.ms else { continue };
@@ -2868,15 +2967,17 @@ impl World {
         let prefix = format!("/f/{FLEET}/pub/{NODE}/");
         // Each copy's producer key, of each record (sid, ep, seq) of a session log on its face.
         let mut copies: BTreeMap<(String, u32, u64), Keys> = BTreeMap::new();
-        for (_, subject, body, key) in self.core.broker.records() {
-            let Some(sid) = subject
+        for rec in self.log().iter().filter(|rec| !rec.hidden) {
+            let key = rec.key;
+            let Some(sid) = rec
+                .subject
                 .strip_prefix(prefix.as_str())
                 .and_then(|rest| rest.strip_suffix("/ev"))
                 .filter(|sid| *sid != "node" && !sid.contains('/'))
             else {
                 continue;
             };
-            let Ok(b) = aterm_slog::decode_bus(&String::from_utf8_lossy(&body)) else {
+            let Some(b) = rec.slog() else {
                 continue;
             };
             if b.ms.is_none()
@@ -2933,22 +3034,25 @@ impl World {
         }
         let unretained = lock(&self.core.broker.state).ret.unretained.clone();
         let prefix = format!("/f/{FLEET}/pub/{NODE}/");
-        self.core
-            .broker
-            .records()
-            .into_iter()
-            .filter(|(off, subject, body, _)| {
+        self.log()
+            .iter()
+            .enumerate()
+            .filter(|(off, rec)| {
                 // A record of a session's log (the bridge's own events on the face are not).
-                unretained.contains(off)
-                    && subject
+                !rec.hidden
+                    && unretained.contains(&(*off as u64))
+                    && rec
+                        .subject
                         .strip_prefix(prefix.as_str())
                         .and_then(|rest| rest.strip_suffix("/ev"))
                         .is_some_and(|sid| sid != "node" && !sid.contains('/'))
-                    && aterm_slog::decode_bus(&String::from_utf8_lossy(body))
-                        .is_ok_and(|b| b.ms.is_some())
+                    && rec.slog().is_some_and(|b| b.ms.is_some())
             })
-            .map(|(off, subject, _, _)| {
-                format!("mirror: an auto mirror wrote {subject} @{off} onto a broker that retains nothing")
+            .map(|(off, rec)| {
+                format!(
+                    "mirror: an auto mirror wrote {} @{off} onto a broker that retains nothing",
+                    rec.subject
+                )
             })
             .collect()
     }
@@ -3021,14 +3125,13 @@ impl World {
             // stands) publishes the one copy a reader is handed. The rows' law is `dup delivery`.
             let once_read = records
                 .split_last()
-                .is_some_and(|(_, older)| older.iter().all(|r| gone.contains(&r.0)));
+                .is_some_and(|(_, older)| older.iter().all(|r| gone.contains(r)));
             if self.sent.get(&marker).is_some_and(|s| s.post.is_some())
                 && records.len() > 1
                 && !once_read
             {
-                let offs: Vec<u64> = records.iter().map(|r| r.0).collect();
                 bad.push(format!(
-                    "dup post: {marker} is on the bus {} times {offs:?}",
+                    "dup post: {marker} is on the bus {} times {records:?}",
                     records.len()
                 ));
             }
@@ -3133,7 +3236,7 @@ impl World {
                 // session had it is no loss, once the bridge told aterm a range holding it
                 // that aterm tells that session (`link gap`: from astream's gap notice to the
                 // inbox group, every session's; or, B12, `sid=` this session's own lane's).
-                let offs: Vec<u64> = markers[marker].iter().map(|r| r.0).collect();
+                let offs = &markers[marker];
                 if offs.iter().all(|off| gone.contains(off)) {
                     if !offs
                         .iter()
@@ -3176,17 +3279,15 @@ impl World {
                         let off: Option<u64> = r
                             .split_whitespace()
                             .find_map(|t| t.strip_prefix("off="))
-                            .and_then(|n| n.parse().ok());
+                            .and_then(crate::parse_uint);
                         let on_bus = markers.get(&marker);
                         match (off, on_bus) {
-                            (Some(off), Some(records)) if records.iter().any(|x| x.0 == off) => {}
+                            (Some(off), Some(records)) if records.contains(&off) => {}
                             (Some(_), None) => {}
                             (Some(off), Some(_)) if self.lost_floor.is_some_and(|f| off >= f) => {}
                             _ => bad.push(format!(
                                 "post {} #{} {marker} retired `{r}` but the bus has it at {:?}",
-                                session.sid,
-                                p.id,
-                                on_bus.map(|v| v.iter().map(|x| x.0).collect::<Vec<_>>())
+                                session.sid, p.id, on_bus
                             )),
                         }
                     }
@@ -3211,7 +3312,7 @@ impl World {
                     by_sender
                         .entry(from.as_str())
                         .or_default()
-                        .push((first.0, *id));
+                        .push((*first, *id));
                 }
             }
         }

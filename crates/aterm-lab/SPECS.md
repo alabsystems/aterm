@@ -1,7 +1,7 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-lab: spec recovery from its 76 unit tests
+# aterm-lab: spec recovery from its unit tests
 
 > Status 2026-10-16: this is the crate's migration worklist. Each of the 69 specs below is
 > proved through Trust/Clean about the compiled Rust function, and then the tests it subsumes
@@ -26,37 +26,37 @@ about effects (fs, processes, sandbox profiles, sockets, local time) and wait on
 
 ## 0. Notation used in the statements
 
-- Every test id is `crates/aterm-lab/src/<file>::<test>`; functions are named `module::fn`.
-- `lines(s)` = `str::lines(s)`; `words(s)` = `split_whitespace(s)`; `trim`/`trim_end`/`trim_start`
-  as in std; `chars(s)` = the char sequence; `|x|` = length (chars unless marked `_bytes`);
-  `take(n, s)` = the first n chars; `++` = concatenation.
-- `kv(t)` = `[(k,v) | w ∈ words(t), w = k ++ "=" ++ v at the FIRST '=']` in order (`screen::kv`).
-  `field(t,k)` = the first `v` with `(k,v) ∈ kv(t)`.
+- `subsumes` names tests as `<file>::<test>` under `crates/aterm-lab/src`; §13 and §14 give the
+  path from the crate root (`src/…`, `tests/…`), and §14 groups one file's tests as
+  `file::{a,b}`. Functions are `module::fn`. `Uses X` and `Composes X` cite spec X as a lemma.
+- `lines(s)` = `str::lines(s)`; `words(s)` = `split_whitespace(s)`; `trim`, `trim_end` and
+  `trim_start` as in std; `chars(s)` = the char sequence; `|x|` = length (chars unless marked
+  `_bytes`); `take(n, s)` = the first n chars; `++` = concatenation.
+- `kv(t)` = the words `k=v` of t, split at the first `=`, in order (`screen::kv`).
+- `Regex(p)` = the regex `aterm_regex` compiles from p.
 - `Sh(s)` = the POSIX shell value of one word `s` (single quotes literal; double quotes with
-  `\`-escapes; bare backslash escapes; bash `$'…'` ANSI-C quoting). **Shell model** = a Lean/`ty`
-  model of POSIX word expansion with no `$`-expansion except the literal `$PATH`.
-- `PyJSON(v, style)` = Python's `json.dumps(v, indent, separators, ensure_ascii)` as a reference
-  model; `PyRepr(s)` = Python `repr(str)`; `PyFloatRepr(f)` = Python `repr(float)`.
-- `J` = `crate::pyjson::J` (`Null|Bool|Int|Float|Str|Arr|Obj`, `Obj` an ordered association list).
-  `J::parse` reaches `aterm_json` (cross-crate).
-- `RFC7396(t, p)` = JSON Merge Patch.
+  `\`-escapes; bare backslash escapes; bash `$'…'`). **Shell model** = a Lean/`ty` model of POSIX
+  word expansion with no `$`-expansion except the literal `$PATH`.
+- Reference models: `PyJSON(v, style)` = Python's `json.dumps(v, indent, separators,
+  ensure_ascii)`; `PyRepr(s)` = Python `repr(str)`; `PyFloatRepr(f)` = Python `repr(float)`;
+  `RFC7396(t, p)` = JSON Merge Patch.
+- `J` = `crate::pyjson::J` (`Null|Bool|Int|Float|Str|Arr|Obj`, `Obj` an ordered association
+  list); `J::parse` reaches `aterm_json`.
 - `Prot(home, cc)` = `protected::protected_paths(home, cc)`, a list of
   `(Kind ∈ {Prefix, Subpath, Literal}, path)`. `R(x)` = `fs::canonicalize(x)`.
-- **Fs model** = an abstract file-system state (inodes, link kinds, nlink, uid, mode, mtime), as
-  gap 8 needs. **Process model** = a kernel process table with exit events and reaping.
-- Gap numbers are the rows of `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7:
-  1 non-scalar carriers (`String`/`&str`/`Vec`/`Option`/enums/structs), 2 `&self`/`&mut` views,
-  3 E6 body widening (calls, matches, casts), 5 quantified clauses, 6 plain-Rust clause
-  publication, 7 loops/iterators, 8 effects (fs, process, FFI, unsafe), 10 model refinement,
-  11 generics, 12 cross-crate citation (`aterm_regex`, `aterm_phase`, `aterm_json`, `aterm_http`,
-  `aterm_uds`), 13 threads/closures/higher-order, 14 Clean elaborator. **Gap 0 (the seal) blocks
-  every row and is not repeated in the column.** Gap 14 applies to every Lean-written reference
-  model (Shell, PyJSON, PyRepr, civil calendar) and is likewise not repeated.
+- **Fs model** = an abstract file system (inodes, link kinds, nlink, uid, mode, mtime).
+  **Process model** = a kernel process table with exit events and reaping.
+- `blocking_gaps` are rows of `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7:
+  1 non-scalar carriers, 2 `&self`/`&mut` views, 3 E6 body widening, 5 quantified clauses,
+  6 plain-Rust clause publication, 7 loops/iterators, 8 effects, 10 model refinement, 11 generics,
+  12 cross-crate citation, 13 threads/closures/higher-order. Gap 0 (the seal) blocks every row; the
+  tables before §12 leave it out. Gap 14 (the Clean elaborator) applies to every Lean-written
+  reference model and is not listed.
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes (primary tests; secondary in §2)`,
-`difficulty (Rust features the proof must handle)`, `blocking_gaps (audit §7; 0 implied)`.
+`subsumes` lists the tests the spec retires as their primary spec (secondary ones are in §2);
+`difficulty` is the Rust the proof must handle.
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
@@ -82,7 +82,7 @@ nudge-parse-resizes	contract	nudge::parse_resizes, nudge::hget, screen::kv	∀ s
 nudge-configured-nudge	contract	nudge::configured_nudge	∀ toml: configured_nudge(toml) = Some(lowercase(trim(v))) for the FIRST line l inside the `[render]` table with trim_start(l) = "repaint_nudge" ++ ws* ++ "=" ++ ws* ++ '"' ++ v ++ '"' ++ … (v up to the next quote); None when `[render]` has no line of that shape.	nudge.rs::the_configured_nudge_is_the_render_tables_word	lines loop, table-header tracking, strip_prefix chain, to_lowercase	1,5,7
 nudge-judge-verdict	contract	nudge::judge, nudge::differing	∀ expect ∈ {on, off}, m: Trial: judge(expect, &mut m) sets m.shot_rows = max(|differing(shot,before)|, max{n | (_,h,n) ∈ frame_rows, h = rows}), m.end_rows = differing(after,fresh), m.reference_rows = differing(fresh,before), and returns ("INCONCLUSIVE", [why]) with exactly one reason for the FIRST failing gate in the order: error set; |reference_rows| > SLACK; epoch None; epoch class ≠ agent; shift = 0 ∧ pushed = 0; ¬(verdict = desync-risk ∨ by = nudge); shot_rows ≤ SLACK; status_render = "-". Otherwise ("PASS", []) iff every check of the expect-mode list holds (on: healed by=nudge, render ok on both reads, exactly one nudge/hold/healed line, the told sizes; off: the nudge never acted, …), else ("FAIL", bad) with bad = the failed checks in order, non-empty.	nudge.rs::a_healed_trial_passes_on_and_fails_off, nudge.rs::a_trial_that_never_displaced_is_inconclusive	&mut struct with Vec<String> fields, Option<Epoch> clone, closures capturing &mut Vec, iterator chains, format!	1,2,3,5,7,13
 nudge-log-line	contract	nudge::nudge_log_line	∀ l: let a = the suffix after the first "aterm_gui::app_nudge: " (or l), a' = a without a leading "repaint nudge ". nudge_log_line(l) = join(" ", [w ∈ split(a', ' ') | ¬∃ p ∈ {session=, reason=, epoch=}: w = p ++ x ∧ x ∈ [A-Za-z0-9_]*]).	nudge.rs::a_nudge_log_line_is_shown_without_its_prefix_and_ids	find + slicing, split/filter/collect/join, closures	1,5,7
-paths-forgotten	contract	paths::forgotten	∀ key: forgotten(key) ⇔ key ∈ {AI_AGENT, CLAUDECODE, CURL_HOME} ∨ (key = h ++ "_" ++ t at the first '_' with h ≠ "" ASCII-alphabetic and t ASCII-case-insensitively = "proxy") ∨ ∃ p ∈ FORGET_PREFIXES: key = p ++ r ∧ r ∈ [A-Za-z0-9_]*.	paths.rs::forgets_agent_and_aterm_variables_and_keeps_the_rest	split_once, chars().all, eq_ignore_ascii_case, iteration over a const slice	1,5,7
+paths-forgotten	contract	paths::forgotten	∀ key: forgotten(key) ⇔ key ≠ aterm_toolchain::waits::VAR ∧ (key ∈ {AI_AGENT, CLAUDECODE, CURL_HOME} ∨ (key = h ++ "_" ++ t at the first '_' with h ≠ "" ASCII-alphabetic and t ASCII-case-insensitively = "proxy") ∨ ∃ p ∈ FORGET_PREFIXES: key = p ++ r ∧ r ∈ [A-Za-z0-9_]*).	paths.rs::forgets_agent_and_aterm_variables_and_keeps_the_rest	split_once, chars().all, eq_ignore_ascii_case, iteration over a const slice	1,5,7
 paths-physical	contract	paths::physical	∀ path, Fs: let h be the longest prefix of path (by components) such that canonicalize(h) succeeds and is a directory. physical(path) = canonicalize(h) joined with the remaining components of path, unchanged; = path itself when no non-empty, non-'.' prefix qualifies. physical creates nothing (Fs unchanged).	paths.rs::physical_resolves_the_existing_head_and_keeps_the_rest	PathBuf pop/push, OsString, loop, fs::canonicalize and is_dir (effects)	1,7,8
 probe-op-codec-roundtrip	round-trip	probe::Op::encode, probe::Op::decode, probe::plan	∀ op: Op whose string fields hold no '\t' (and no '\n' for the line channel) and which is not Serve(Some("")): Op::decode(op.encode()) = Some(op). ∀ w, decoy, dirs: every Check c ∈ plan(w, decoy, dirs) has an op meeting that precondition (so every planned operation crosses into the jail unchanged).	probe.rs::every_operation_crosses_into_the_jail_unchanged	enum with String/bool/enum payloads, match, split('\t') into Vec, Option ?, format!	1,3,5,7
 probe-replica-plan-coverage	contract	probe::plan, protected::protected_paths	∀ w with w.replica: let P = plan(w, decoy, dirs). #{c ∈ P : c.op ∈ {Reach, Write}, c.label starts with "<replica>"} ≥ 2·|Prot(w.home, w.cc)|; #{c : c.op = Mach(_)} = |MACH_DENY| + |MACH_DENY_OPEN|; for every n ∈ SCRATCH_DIRS a check labelled "move scratch/<n> (the lab writes and reads through it)"; a Denied list check of <replica>/Library/Application Support/aterm; and a metadata-only stat check of every store directory above the Codex build (…/pkg/store/codex).	probe.rs::the_replica_plan_covers_every_protected_path_and_every_mach_service	Vec<Check> building, matches!, format! labels	1,3,5,7
@@ -119,14 +119,14 @@ stub-analyse-responses	contract	stub::analyse_responses	∀ body: analyse_respon
 stub-schema-answer	contract	stub::schema_answer	∀ schema: schema_answer(schema) = PyJSON(Obj[(k, take(m(v), "lab stub")) | (k, v) ∈ schema.properties in order, v.type = "string"]) with m(v) = v.maxLength if a positive integer else 8; "{}" when there are no properties. The answer validates against any schema whose string properties carry only type/maxLength constraints.	(secondary only; see §2)	J object iteration, i64→usize try_from, chars take	1,3,5,7
 stub-usage-limit-and-flat-headers	contract	stub::usage_limit_body, stub::usage_limit_headers, stub::flat_headers	∀ claim, reset, plan: usage_limit_body = {error: {type: usage_limit_reached, message, resets_at: reset, limit_window_minutes: 300 iff claim = five_hour, 10080 iff seven_day, absent otherwise, plan_type: plan iff Some}}; usage_limit_headers(claim, reset) = [x-codex-<slot>-used-percent=100, -window-minutes, -reset-at=reset] for five_hour (primary, 300) and seven_day (secondary, 10080), [] otherwise. ∀ spec, now: flat_headers(spec, now) = [] unless spec is an object; else for each (k, v) in order with v scalar (not null/object/array) and k ∈ [A-Za-z0-9-]{1,80}: the entry (lowercase(k), t) with t = value_text(v), every well-formed @NOW+N@ replaced by now + N left to right and control chars mapped to ' '; a later key equal after lowercasing overwrites the value in place. Obligation: now + N does not overflow (§5.11).	(secondary only; see §2)	J building, while-let string rewriting, char map, Vec find/iter_mut, i64 addition (overflow obligation)	1,3,5,7
 stub-served-refines-handlers	refinement	stub::start, stub::Stub::handle, stub::Stub::messages, stub::Stub::responses, stub::Stub::control, stub::Stub::black_hole, stub::control, stub::read_request	For every request sequence sent to start(args)'s listener, each HTTP response (status, headers, body/SSE) equals the pure Answer(mode', headers_file contents at request time, modes_dir, served-200 count, request) built from analyse/analyse_responses, rate_headers, flat_headers, usage_limit_*, auth_label and split_deltas: ok mode streams message_start..message_stop (or response.created..response.completed) whose text deltas concatenate to the canned reply; overloaded ⇒ 529 (Anthropic) / 503 (Codex); limit:C:R with R in the future ⇒ 429 with the representative claim and on429 headers, R past ⇒ ok and "limit lifted" logged; a mode file that changes wins; unknown paths ⇒ 404; /__mode sets and persists the mode; for POST /v1/messages alone, mode' = auth_mode(the --auth-modes-file's JSON at request time, auth_label(request)) where that is Some, else the stub's own mode (each credential meets its own mode), and its rate headers are rate_headers_for(headers_file, auth_label(request), served); every other route answers in the stub's own mode; a custom mode with auth answers only the named credential; the proxy port answers every CONNECT with 502; every request appends one log line naming kind and auth label (a `/v1/messages` line carries ` auth=` ++ its label right after its `last_user="…"`, before the rate headers' summary and the reply's tail: `limit lifted (reset passed)`, ` sse=N deltas`, a limit's ` limit:C resets in Ns`), and no token value is ever logged.	stub/tests.rs::served_on_loopback_it_answers_as_the_modes_say_and_logs_each_request, stub/tests.rs::served_on_loopback_it_answers_codex_as_the_modes_say	TcpListener/TcpStream, threads, Arc<Mutex<State>>, file I/O, HTTP framing, SSE chunking, cross-crate aterm_http client	1,2,7,8,10,12,13
-sys-put-no-follow	contract	sys::put, sys::open_dir_at	∀ path, mode, src, Fs: put(path, mode, src) = Err if path is relative, if any directory component on the way is a symlink, or if src = File(p) where p is not a regular single-name file reached through no link (the scratch_file rules); in every Err case no file outside path's own directory chain is created or changed (a link's target is untouched). On Ok: path names a fresh regular file (never a symlink; a link standing at the name is replaced and its target untouched) with contents = the src bytes (or p's contents) and permission bits = mode & 0o777; missing directories on the way are created 0755; the replacement is atomic (by rename).	sys.rs::put_writes_by_a_rename_and_never_through_a_link	unsafe libc openat/mkdirat/renameat/fchmod FFI, RawFd ownership, CString, Path components loop	1,7,8
+sys-put-no-follow	contract	sys::put, sys::open_dir_at	∀ path, mode, src, Fs: put(path, mode, src) = Err if path is relative, if any directory component on the way is a symlink, or if src = File(p) where p is not a regular file reached through no link; in every Err case no file outside path's own directory chain is created or changed (a link's target is untouched). On Ok: path names a fresh regular file (never a symlink; a link standing at the name is replaced and its target untouched) with contents = the src bytes (or p's contents) and permission bits = mode & 0o777; missing directories on the way are created 0755; the replacement is atomic (by rename).	sys.rs::put_writes_by_a_rename_and_never_through_a_link	unsafe libc openat/mkdirat/renameat/fchmod FFI, RawFd ownership, CString, Path components loop	1,7,8
 sys-scratch-read	contract	sys::scratch_read, sys::scratch_file	∀ path, Fs: scratch_read(path) = Ok(None) iff the final name is missing; Ok(Some(contents)) iff every component is reached through no symlink and the file is a regular file owned by the current uid with nlink = 1; Err otherwise (a link at the name or on the way, a second hard link, a directory, a FIFO or other non-regular file). The call never blocks on a FIFO (it opens non-blocking).	sys.rs::scratch_read_takes_only_the_users_regular_file_with_one_name	unsafe libc open with O_NOFOLLOW|O_NONBLOCK, fstat, OwnedFd, read_to_end	1,7,8
 tripwire-argv	contract	tripwire::parse_argv, tripwire::answer, tripwire::quoted_after	∀ args: parse_argv(args) = (args[0] or "", acct, svc) where, scanning args[1..] left to right, "-a" X sets acct = X, "-s" X sets svc = X ("" when X is missing), every flag in {-X,-p,-j,-l,-D,-C,-T,-c,-r,-G,-t,-y,-k} consumes its value unread, and acct/svc default to "-". Hence no value following a secret-bearing flag appears in the result unless it is also the value of -a/-s. answer(cmd) = 44 for the listed find-*/delete-* password/certificate/identity sub-commands, 0 for show-keychain-info and add-*-password, 1 otherwise. ∀ line, flag: quoted_after(line, flag) = the text between " " ++ flag ++ " \"" at its LAST occurrence and the next '"'; "-" when there is no occurrence or no closing quote.	tripwire.rs::logs_the_account_and_service_and_never_a_secret_value, tripwire.rs::interactive_lines_name_their_last_account_and_service	while loop with index skipping, match on &str, rfind, slicing	1,3,5,7
 util-keep-tree	contract	util::keep_tree, util::keep_file, sys::scratch_file, sys::put	∀ from, to, Fs: after keep_tree(from, to): if from is not a real directory (symlink or missing) nothing happens; else for every entry reached from from through directories only (no symlink followed, at any depth): a real directory is recreated under to and recursed into; a regular file that scratch_file accepts (single name, this user's, no link on its path) is copied to the corresponding path with the same bytes, permission mode and modification time; symlinks and second-name files are not copied. keep_file(src, dst) copies nothing when src's path holds a link anywhere. Nothing outside to is written and no source is changed. Uses sys-put-no-follow and sys-scratch-read.	util.rs::archived_scratch_files_keep_times_but_refuse_other_names	recursive fs walk, read_dir, symlink_metadata, File::set_modified, effects throughout	1,7,8
 util-utc-stamp	refinement	util::utc_stamp	∀ secs: i64 with |secs| bounded so the arithmetic does not overflow: utc_stamp(secs) = sprintf("%04d-%02d-%02dT%02d:%02d:%02d.000000Z", civil(secs)), civil = the proleptic Gregorian UTC date-time of the unix second; equivalently days_from_civil(y, m, d)·86400 + h·3600 + mi·60 + s = secs with 1 ≤ m ≤ 12, 1 ≤ d ≤ days_in_month(y, m), 0 ≤ h < 24, 0 ≤ mi, s < 60.	util.rs::utc_stamps_are_the_calendar_day	i64 div_euclid/rem_euclid, Hinnant civil_from_days arithmetic, format! padding	1,3,5
-util-b64url-roundtrip	round-trip	util::b64url, util::b64url_decode	∀ bytes: b64url_decode(b64url(bytes)) = Some(bytes); b64url(bytes) uses only [A-Za-z0-9_-] (no '=') and has length ⌈4·|bytes|/3⌉ (RFC 4648 §5 without padding). ∀ text: b64url_decode(text) = None iff trim_end('=', text) contains a char outside the alphabet. One direction only (§5.7).	util.rs::base64url_round_trips_without_padding	chunks(3) with u32 shifts, position lookup in a const table, u8 try_from, Vec<u8>	1,3,5,7
+util-b64url-roundtrip	round-trip	util::b64url, util::b64url_decode	∀ bytes: b64url_decode(b64url(bytes)) = Some(bytes); b64url(bytes) uses only [A-Za-z0-9_-] (no '=') and has length ⌈4·|bytes|/3⌉ (RFC 4648 §5 without padding). ∀ text: b64url_decode(text) = Some(bytes) ⇔ text is a canonical RFC 4648 §5 base64url string (with optional '=' padding up to a multiple of 4, body length ≢ 1 mod 4, and zero trailing pad bits), and then b64url(bytes) = trim_end('=', text).	util.rs::base64url_round_trips_without_padding	chunks(3) with u32 shifts, position lookup in a const table, u8 try_from, Vec<u8>	1,3,5,7
 util-one-line	contract	util::one_line	∀ s, n: let t = trim(s with every maximal run of control chars (< 0x20 or 0x7f) replaced by one ' '). one_line(s, n) = t if |chars(t)| ≤ n, else take(n - 1, chars(t)) ++ "~" (saturating at n = 0, giving "~"). The output holds no control char and has at most max(n, 1) chars.	util.rs::one_line_folds_control_runs_and_cuts_long_text	chars loop with a bool state, trim, count/take, saturating_sub	1,5,7
-util-py-repr	refinement	util::py_repr	∀ s whose chars are all Python-printable or among \\, \n, \r, \t, other C0 controls and DEL: py_repr(s) = PyRepr(s): the delimiter is '"' iff s contains ' and no ", else '; backslash, \n, \r, \t are escaped; the delimiter is escaped; other C0/DEL as \xNN. Restricted to that domain (§5.5).	util.rs::py_repr_picks_the_quote_python_picks	chars loop with match guards, format!("{:02x}")	1,5,7,10
+util-py-repr	refinement	util::py_repr	∀ s whose chars are all Python-printable or among \\, \n, \r, \t, C0/DEL/C1/NBSP (≤ 0x1f or 0x7f..=0xa0) and U+2028/U+2029: py_repr(s) = PyRepr(s): the delimiter is '"' iff s contains ' and no ", else '; backslash, \n, \r, \t are escaped; the delimiter is escaped; other C0/DEL/C1/NBSP as \xNN and U+2028/U+2029 as \uNNNN (§5.5).	util.rs::py_repr_picks_the_quote_python_picks	chars loop with match guards, format!("{:02x}")	1,5,7,10
 verbs-harness-set	contract	verbs::harness_set	∀ text, kvs: let T' = harness_set(text, kvs). If text has no line equal (after trim_end) to "[harness]", T' = text's lines ++ ["", "[harness]"] and then the keys are applied; for each (k, v) in order, within the [harness] table (from its header to the next line starting with '['): every line l = k ++ ws* ++ "=" … is replaced by "k = v"; if there is none, "k = v" is inserted after the table's last non-blank line. Every other line is unchanged and in order; the trailing newline is kept iff text ended with one (or was empty). Idempotent: harness_set(harness_set(t, kvs), kvs) = harness_set(t, kvs).	verbs.rs::harness_keys_are_set_in_their_table_and_replaced_when_there	Vec<String> insert/position/slicing, &mut iteration, closures capturing k	1,2,5,7
 verbs-journal-line	contract	verbs::journal_line, util::hms	∀ line: J::parse(line) fails ⇒ journal_line(line) = trim_end(line). Else with t = r.t (number, default 0) / 1000: journal_line(line) = hms(floor t) ++ "." ++ pad3((t·1000 truncated) mod 1000) ++ " " ++ padR(10, kind or "?") ++ " " ++ padR(12, phase or "-") ++ " " ++ (line field or ""). hms is the local wall-clock h:m:s, an environment input.	verbs.rs::a_journal_record_prints_as_one_aligned_line	JSON parse, f64 floor and casts, rem_euclid, format! with width, local-time FFI in hms	1,3,6,8,12
 verbs-version-order	contract	verbs::version_key, verbs::semver_like	∀ v: version_key(v) takes the longest prefix of take(3, split(v, '.')) whose leading ASCII-digit prefix parses as u64; for v, w both a.b.c([-+]…)? with a, b, c decimal u64: version_key(v) < version_key(w) (lexicographic Vec order) ⇔ (a, b, c)_v < (a, b, c)_w numerically, and a non-numeric leading component yields []. semver_like(v) ⇔ splitn(3, v, '.') = (major, minor, rest) with major and minor non-empty ASCII-digit runs and rest starting with a non-empty ASCII-digit patch followed either by "" or by '-'/'+' and a non-empty [A-Za-z0-9.+-]+ tail.	verbs.rs::versions_order_by_their_numbers	split/take/map_while/collect, Vec<u64> Ord, u64 parse	1,5,7
@@ -183,8 +183,7 @@ readers) → composites (`codex-auth-json-lab-jwt` needs b64url, pyjson, utc_sta
 
 ## 2. Test → spec map (TSV)
 
-`primary` is the spec that retires the test. `also` lists the other specs the same test samples;
-the test is deleted only when all of them are Certified.
+`primary` is the spec that retires the test. `also` lists the other specs the same test samples.
 
 ```tsv
 file	test	primary	also
@@ -274,27 +273,12 @@ src/verbs.rs	a_journal_record_prints_as_one_aligned_line	verbs-journal-line
 src/verbs.rs	versions_order_by_their_numbers	verbs-version-order	
 ```
 
-## 3. Coverage
-
-- 76 tests read. 75 map to one of the 69 specs. 1 is not a spec sample (§4).
-- Five specs have no primary test of their own and are reached only through `also`:
-  `stub-auth-label`, `lab-parse-launch`, `restore-since`, `stub-schema-answer` and
-  `stub-usage-limit-and-flat-headers`. They are still worth proving separately: each is the lemma
-  a composite needs.
-- The biggest collapses: `jail-render-rules` (3 primary), and two primary tests each for
-  `launcher-argv`, `nudge-judge-verdict`, `procs-reap-liveness`, `screen-composer`,
-  `stub-tool-turn`, `stub-served-refines-handlers`, `tripwire-argv`, `lexical-validators` and
-  `util-shell-quote-unquote-roundtrip`.
-- The tests here are already mostly one-per-property, so the gain is generality (∀ inputs) rather
-  than a large drop in test count.
-
 ## 4. Tests that are not spec samples
 
-| test | why | action |
-|---|---|---|
-| sys.rs::the_user_temp_dir_is_named_and_this_process_is_in_no_jail | An environment probe, not a property of the code. It passes only when the test process runs on macOS outside every sandbox (`jail_pids` returns Err inside one, e.g. under a sandboxed agent) and when `confstr` reports a temp dir. The one contract it touches (`jail_pids(m) = Ok(pids denied m and not m.none)`) needs a kernel model and is better checked as a lab self-test on a real host. | **move-to-bench** (a lab self-test on a real host) |
-
-No test is a pure regression of a removed bug with no general property.
+`sys.rs::the_user_temp_dir_is_named_and_this_process_is_in_no_jail` probes the environment: it
+passes only on macOS outside every sandbox (`jail_pids` errs inside one) and where `confstr` names
+a temp dir. The contract it touches is `jail-members` (§13), which needs a kernel model; it belongs
+in a lab self-test on a real host.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
@@ -314,15 +298,14 @@ No test is a pure regression of a removed bug with no general property.
    takes `chars.next()` and `chars.as_str()`, so untrusted `lsof` lines starting with multi-byte
    UTF-8 or empty lines never panic. A listener on `0.0.0.0` or `[::]` remains conservatively
    labelled EXTERNAL.
-5. **`util.rs::py_repr_picks_the_quote_python_picks`.** `py_repr` is documented as Python's
-   `repr`, but it leaves non-printable non-ASCII chars unescaped (U+00A0, U+0080..U+009F, U+2028),
-   while Python writes them as `\xNN`/`\uNNNN`. `scn::frame_line` runs `py_repr` over screen rows,
-   and Claude Code puts NBSP after the `❯` marker, so FRAME lines can differ from the Python
-   harness's output. The spec is limited to printable text.
+5. **Resolved — `util.rs::py_repr_picks_the_quote_python_picks`.** `py_repr` now escapes C1 controls
+   and NBSP (`0x7f..=0xa0`) as `\xNN` and `U+2028`/`U+2029` as `\uNNNN` alongside C0 controls, so
+   Claude Code screen rows with NBSP after `❯` match Python's `repr`.
 6. **Resolved — `version_key` reads leading digits with `map_while` and `semver_like` validates full numeric components.** `verbs.rs::version_key` now parses the leading ASCII-digit run of up to three components via `map_while` (so `"2.1.300-rc.1"` yields `[2, 1, 300]` and `"x.99.0"` yields `[]`), and `semver_like` rejects `"2.1.3x"`, `"2.1.3-"`, `"2.1.3+"`, and `"2.1a.3"`.
-7. **`util.rs::base64url_round_trips_without_padding`.** Only `decode(encode(b)) = b` holds.
-   `b64url_decode` also accepts non-canonical text (length ≡ 1 mod 4, nonzero trailing bits), so
-   `encode(decode(t)) ≠ t` can happen. Harmless for JWT labels; the spec states one direction.
+7. **Resolved — `util.rs::base64url_round_trips_without_padding`.** `b64url_decode` now rejects
+   non-canonical base64url strings (`body.len() % 4 == 1`, malformed `'='` padding, and non-zero
+   trailing pad bits), so `b64url(&b64url_decode(t)?) == t.trim_end_matches('=')` holds in both
+   directions.
 8. **Resolved — all launchers quote `PATH`, `run.proxy` and `run.port`.** `codex::launcher`,
    `lab::launcher`, `agy::launcher`, `muse::launcher` and `claude_login_proof::launcher` now format
    `<run>/shim:$PATH` via `util::shell_prepend_path` and pass proxy and port URLs through
@@ -339,30 +322,47 @@ No test is a pure regression of a removed bug with no general property.
 12. **Resolved — `configured_nudge` scopes `repaint_nudge` to `[render]`.** `nudge.rs::configured_nudge`
     now tracks TOML table headers and reads `repaint_nudge` only inside `[render]`.
 
-## 6. Proof order: the specs I would prove first (easiest, high value)
+Rows that lag the code:
 
-No spec is blocked by gap 0 alone; gap 1 (string/slice/Option carriers) is the floor for 68 of
-69. So the order picks the fewest extra gaps, then value.
+- `lab-parse-launch` also takes `--debug-log` and `--by-name`, and refuses `-e` for a sleep-clock
+  variable (`clock::is_clock_var`). In `launcher-argv`'s Claude Code line the lab clock's
+  variables (`clock::vars`) come before `l.envs`, `l.by_name` runs `claude` by name instead of by
+  path, and `l.debug_log` adds `--debug-file`.
+- `gemini-parse-launch`: agy also takes `--setting KEY=VALUE`.
+- `run-env-sh-roundtrip`: `fixture_prefix` also names gemini, agy and muse by their own versions;
+  any other agent reads as claude.
+- `screen-composer-gemini-agy`: `composer_row` hands gemini, agy and muse to
+  `aterm_phase::{gemini,agy,muse}::composer_draft`, so the row states a reader the lab no longer
+  has. The first test it names is gone, and these `screen.rs` tests are in no map:
+  `gemini_cli_s_composer_is_the_band_its_reader_finds`,
+  `agy_s_composer_over_its_background_panel_is_its_caret_row` and
+  `muse_code_s_composer_is_the_caret_row_of_its_frame`.
+- `screen-composer`'s `rule` omits the labelled rule `is_rule` also takes; `composer-labelled-rule`
+  (§10) states `is_rule` as it is.
+- `aos-search-distributed-verify` names `aos_search::verify`; the function is `verify_bundle`.
 
-1. **`restore-since`** (gaps 3, 6). The only spec without gap 1: `i64` subtraction, one cast and a
-   precision format. It needs a model of `{:.1}` float formatting, which `pyjson-py-float` and
-   `stub-rate-headers` reuse.
-2. **`probe-judge-table`** (gaps 1, 3). A finite decision table over enums and `Option<&str>`,
-   with no loops: the sandbox probe's verdict logic, so a wrong cell would hide a jail leak.
-3. **`relay-parse-args`** (gaps 1, 3). Slice patterns returning a borrowed tail; the first test of
-   slice carriers and lifetimes on a function every relayed launch runs.
-4. **`lab-managed-bin`**, **`util-utc-stamp`** (gaps 1, 3, 5). No loops. `util-utc-stamp` is pure
-   integer arithmetic once the string is a model of `format!` padding, and it feeds
+## 6. Proof order
+
+For §1's rows: fewest gaps first, then value. Only `restore-since` lacks gap 1.
+
+1. **`restore-since`** (gaps 3, 6): one cast and a `{:.1}` float format, whose model
+   `pyjson-py-float` and `stub-rate-headers` reuse.
+2. **`probe-judge-table`** (gaps 1, 3): the sandbox probe's verdict table, where a wrong cell would
+   hide a jail leak. **`relay-parse-args`** (gaps 1, 3): slice patterns returning a borrowed tail.
+3. **`lab-managed-bin`** and **`util-utc-stamp`** (gaps 1, 3, 5): no loops; `util-utc-stamp` feeds
    `codex-auth-json-lab-jwt`.
-5. **`lexical-validators`**, **`paths-forgotten`**, **`recorder-logged`**, **`util-one-line`**,
-   **`screen-kv-field`**, **`screen-idle-status`** (gaps 1, 5, 7). Small character predicates over
-   one loop each. Security value: `paths-forgotten` decides which agent credentials the lab's
-   children never see, and `recorder-logged` that no URL query is logged.
-6. Then `lab-parse-launch` (1, 3, 7), the string utilities (`util-shell-quote-unquote-roundtrip`,
-   `util-b64url-roundtrip`, `util-py-repr`), and the rest of §1's dependency order. The gap-8
-   specs (`sys-*`, `util-keep-tree`, `restore-agents-of`, `paths-physical`, `jail-*`,
-   `procs-reap-liveness`, `footers-opts-parse`, `verbs-journal-line`) and
-   `stub-served-refines-handlers` come last.
+4. The one-loop predicates (gaps 1, 5, 7): `lexical-validators`, `paths-forgotten` (which
+   credentials the lab's children never see), `recorder-logged` (no URL query is logged),
+   `util-one-line`, `screen-kv-field` and `screen-idle-status`.
+5. `lab-parse-launch`, `protected-inside` and `tripwire-argv`; the string utilities
+   (`util-shell-quote-unquote-roundtrip`,
+   `util-b64url-roundtrip`, `util-py-repr`, `pyjson-py-float`); then `pyjson-*` and `screen-*`; the
+   parsers built on them (`nudge-*`, `record-stream-framing`, `sampler-endpoints`, the pure
+   `stub-*` readers); and the composites (`codex-auth-json-lab-jwt`, `run-env-sh-roundtrip`,
+   `launcher-argv`, `scn-*`).
+6. Last, the gap-8 rows (`sys-*` first, then `util-keep-tree`, `restore-agents-of`,
+   `paths-physical`, `jail-*`, `procs-reap-liveness`, `footers-opts-parse`, `verbs-journal-line`)
+   and `stub-served-refines-handlers`.
 
 ## 7. Added 2026-10-16: the agy tests (first written with Gemini CLI's)
 
@@ -434,19 +434,7 @@ The selftest itself (`agy-selftest`) is not a unit test: like `selftest` and
 `codex-selftest` it runs the real agent in a lab, and its judges are the seven `agy-proof-*`
 specs.
 
-**Still unread** (older than this branch, absent from §1–§2 when it began, and the codex-alab proof's; 31 tests):
-`presence.rs` (6: `a_resize_row_reads_its_id_time_and_rows`,
-`a_shrink_pairs_with_the_grow_that_takes_it_back`, `the_floor_judges_the_closest_pair`,
-`phases_parse_in_any_spelling_and_refuse_strangers`,
-`the_stand_in_frame_fills_the_screen_and_parks_on_the_composer`,
-`a_verdict_is_the_first_stderr_line_without_the_client_prefix`), `prices.rs` (4), `stats.rs` (3),
-`codex_rig.rs` (3: two moved from the retired `codex_upgrade.rs` with the code they read, and `a_stream_carries_each_item_once_and_completes_with_all_of_them`), `codex_alab_proof.rs` (4), `stub/account.rs` (3), `verbs.rs` (3: the two `headers` tests and
-`a_custom_mode_is_named_what_the_stub_serves_from_its_file`), `stub/tests.rs` (3:
-`each_headers_verb_keeps_the_others_entries`,
-`served_on_loopback_the_account_routes_answer_from_the_account_file`,
-`a_mode_name_is_judged_as_the_volume_names_its_file`), `restore.rs`
-(`the_lift_is_read_off_the_held_tabs_record`) and `sys.rs`
-(`scratch_dir_lists_files_and_dirs_through_no_link`).
+## 8. The open recorder's verdict
 
 ## 8. Added 2026-10-21: the open recorder's verdict
 
@@ -465,12 +453,10 @@ file	test	primary	also
 src/recorder.rs	nothing_opened_needs_an_empty_log_and_the_control_logged	recorder-nothing-opened	
 ```
 
-## 9. Added 2026-10-21: the settings witness
+## 9. The settings witness
 
-The selftest's forced survey card did not show in 3 runs out of 3 on a loaded machine. The flag
-was written 3 s before the turn, and the lab assumed Claude Code had read it. Every lab's scratch
-settings now carry a `ConfigChange` hook (`settings_witness`), and `scn::Ctx::arm` writes the flag
-until Claude Code reports that it re-read the file. Five new tests, read the same way as §1.
+Every lab's scratch settings carry a `ConfigChange` hook (`settings_witness`), and
+`scn::Ctx::arm` rewrites the survey flag until Claude Code reports that it re-read the file.
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
@@ -490,13 +476,11 @@ src/settings_witness.rs	the_hook_runs_the_script_which_appends_its_input_and_nev
 src/lab.rs	a_lab_ups_claude_settings_carry_the_settings_witness_hook	witness-in-every-lab	witness-hook-script
 ```
 
-## 10. Added 2026-10-21: the windowed lab and L13's keys
+## 10. The windowed lab and L13's keys
 
-L13 (a person's own exchange) passed live only through the development seam `send|key as=person`.
-`forever --window` opens the lab's instance as a window, in the same jail, and types `land-p`'s first
-prompt through `hwkey`, the path a key press takes. A windowed aterm also adds Claude Code's defaults to
-the lab's scratch settings, so Claude Code labels its top rule and the composer reader takes a labelled
-rule. Five new tests, read the same way as §1.
+`forever --window` opens the lab's instance as a window in the same jail and types `land-p`'s first
+prompt through `hwkey`, the path a key press takes, so L13 (a person's own exchange) is judged on
+real keys (`l13-keys-account`).
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
@@ -516,7 +500,7 @@ src/forever_tests.rs	land_p_s_prompt_is_typed_key_by_key_through_hwkey	l13-keys-
 src/screen.rs	claude_code_s_labelled_top_rule_frames_its_composer	composer-labelled-rule	
 ```
 
-## 11. Added 2026-10-21: the review's gaps, closed
+## 11. The windowed lab's refusal and start, and the survey arm
 
 A review of `b9/lab-hygiene` found behaviour no test held: the refusal of a windowed lab under
 `LAB_RESTORE=1`, the windowed launch's readiness wait, the survey arm's use of the settings witness
@@ -545,12 +529,9 @@ src/scn.rs	the_survey_arm_returns_only_once_claude_code_reported_a_reread	arm-aw
 src/verbs.rs	survey_takes_on_or_off_and_reread_after_it	survey-words	
 ```
 
-## 12. Added 2026-10-23: the `ps` stand-in on the kernel's records
+## 12. The `ps` stand-in on the kernel's records
 
-The jailed Codex's `ps` stand-in (`aterm-lab` run as `ps`) prints `aterm_sysprobe::kproc` records
-instead of the lab's own `proc_pidinfo` reader, which is gone with `proc_row` and `all_pids`; the
-input-source record reads its start through `aterm_uds::process::read_process_birth`. One new test,
-read the same way as §1.
+The jailed Codex's `ps` stand-in (`aterm-lab` run as `ps`) prints `aterm_sysprobe::kproc` records.
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
@@ -563,7 +544,7 @@ src/codex_rig.rs	a_ps_line_reads_the_kernel_record	ps-line-fields
 src/codex_rig.rs	the_pid_list_chooses_exactly_its_pids	ps-line-fields	
 ```
 
-## 13. Added 2026-10-23: a jail listing that was not read
+## 13. A jail listing that was not read
 
 `jail_pids` lists this user's processes through `aterm_uds::holders::uid_pids`, and a listing that
 fails is an error, never an empty jail. The four proofs that print the jail's members (`selftest`,
@@ -583,21 +564,20 @@ src/sys.rs	a_listing_that_fails_is_an_error_and_never_an_empty_jail	jail-members
 src/selftest.rs	a_member_table_that_was_not_read_says_why	jail-members-table	
 ```
 
-## 14. Added 2026-10-23: the distributed search's workers (aos M5b)
+## 14. The distributed search's workers (aos M5b)
 
-`aos-search --threads N` and `--workers N` (`src/aos_search.rs`) and the worker verb and its pool
-(`src/aos_workers.rs`) are new, and so is the measurement's runner `aos-workers-bench`
-(`src/aos_workers_bench.rs`). Design of record: `docs/DESIGN-aos-hosted-execution-2026-10-21.md`
-§11; the pure core they drive is aterm-effects' `aos-dist-*` (its SPECS §7). The process tests in
-`tests/aos_workers.rs` spawn the built `aterm-lab`, so their spec is an effect (gap 8). Read the same
-way as §1.
+`aos-search --threads N` and `--workers N` (`src/aos_search.rs`), the worker verb and its pool
+(`src/aos_workers.rs`) and the measurement's runner `aos-workers-bench`
+(`src/aos_workers_bench.rs`) drive aterm-effects' pure `aos-dist-*` core (its SPECS §7); the design
+is `docs/DESIGN-aos-hosted-execution-2026-10-21.md` §11. The tests in `tests/aos_workers.rs`
+spawn the built `aterm-lab`, so their spec is an effect (gap 8).
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
-aos-workers-process	contract	aos_workers::{worker_main,Pool::{spawn,admit,run,void,shutdown},binary}; aos_search::{run_in,distributed,summary_of}	For F the six-line plans file and N ≥ 1 workers: `aos-search --grid --plans F --workers N` prints the serial run's result and winners and writes the serial run's bundles, mode and timings aside, and `--threads N` and `--check all` do too. Each fault that only costs work (kill, hang, slow, late, dup, each at one lease) fires once and leaves that result unchanged. Each lie (late-lie, dup-lie, close-lie, lie-refusal, lie-best, inflate, garbage, flood) fires once and exits 1 with `result=void`, its refusal named, every bundle the command wrote removed, and no later search run; a void while other leases are live drains their holders by their acks, never by DrainTimeout. A foreign worker is refused alone (NoWorkers when it is the only one). SIGTERM exits 143 with refusal Cancelled; SIGKILL to the coordinator ends every worker through its stdin. On every exit path every spawned worker is reaped.	tests/aos_workers.rs::{honest_workers_give_the_local_result,check_all_judges_every_claim_and_records_search,threads_give_the_local_result,a_killed_worker_costs_a_retry_only,a_hung_worker_expires_and_is_retried,a_slow_worker_is_stale_and_its_late_progress_dropped,a_late_equal_result_is_stale,an_equal_resend_is_a_duplicate,a_late_lie_voids,a_differing_resend_voids_and_drains_by_acks,a_refusal_claimed_for_an_admitted_plan_voids,a_forged_best_voids,an_inflated_winner_is_found_by_the_dominance_check,garbage_voids_and_drains_by_acks,a_flood_voids,a_foreign_worker_is_refused_alone,a_void_in_a_later_search_removes_the_earlier_bundle,a_void_in_an_earlier_search_runs_no_later_one,a_lie_the_shutdown_drain_reads_removes_the_bundle,every_held_lie_is_sent_at_the_close_in_order,sigterm_voids_and_reaps,sigkill_to_the_coordinator_ends_every_worker_by_the_lifeline}	processes, pipes, signals, threads, files	0,1,8,13
-aos-workers-shell	contract	aos_workers::{read_frame,frame_bytes,read_worker,Fault::{parse,on},Timed::{run,calls},percentiles,Tail::take,PoolArgs::limits}; spread::Threads::run	read_frame(frame_bytes(p)) = Ok(Some(p)) for |p| ≤ MAX_FRAME, a clean end between frames is Ok(None), a header over MAX_FRAME is Oversize before any payload byte is read, and a cut header or payload, a bad magic or a bad CRC is Corrupt. Fault::parse accepts exactly `KIND@G.S.A` (`:K` for kill, hang and slow only; G, A ≥ 1) and `foreign@W`, and `on(t)` fires only for t's search, slot and attempt. Threads(w).run(n, f) calls f once per index below n; percentiles is nearest rank in ms; the stderr tail keeps the last STDERR_TAIL bytes and counts each `fault=… fired` line across chunks; limits() is LIMITS_V1 but the hello, the window, the grace and max_workers. Readers into a channel of capacity 2 × workers block when it is full and lose and reorder nothing.	src/aos_workers_tests.rs::{frames_round_trip_and_each_damage_is_refused_by_name,fault_specs_parse_by_lease_and_refuse_by_reason,threads_run_every_index_once,percentiles_are_nearest_rank,the_stderr_tail_is_bounded_and_counts_fired_faults,pool_limits_are_v1_but_the_hello_the_window_the_grace_and_the_size,a_full_channel_blocks_its_readers_and_loses_nothing}	Vec, slices, Result, string parsing, threads, atomics	0,1,3,5,7,13
+aos-workers-process	contract	aos_workers::{worker_main,Pool::{spawn,admit,run,void,shutdown},binary}; aos_search::{run_in,search,distributed,summary_of}	For F the six-line plans file and N ≥ 1 workers: `aos-search --grid --plans F --workers N` prints the serial run's result and winners and writes the serial run's bundles, mode and timings aside, and `--threads N` and `--check all` do too. Each fault that only costs work (kill, hang, slow, late, dup, each at one lease) fires once and leaves that result unchanged. Each lie (late-lie, dup-lie, close-lie, lie-refusal, lie-best, inflate, garbage, flood) fires once and exits 1 with `result=void`, its refusal named, every bundle the command wrote removed, and no later search run; a void while other leases are live drains their holders by their acks, never by DrainTimeout. A foreign worker is refused alone (NoWorkers when it is the only one). SIGTERM exits 143 with refusal Cancelled; SIGKILL to the coordinator ends every worker through its stdin. On every exit path every spawned worker is reaped. Under `--frames` a run without `--workers` says on stderr `aos-workers step=0.evaluator` once its evaluator is built, then for each search G one `G.trained.N` per candidate trained (N from 0, in order on one thread); a pool run says `G.check` once G's claims are accepted, and no evaluator or trained step. Either says `G.held-out` only once G picked a winner and `G.verify` only once the held-out read admitted it, so a search with no winner says neither.	tests/aos_workers.rs::{honest_workers_give_the_local_result,check_all_judges_every_claim_and_records_search,threads_give_the_local_result,a_search_with_no_winner_says_no_held_out_or_verify,a_killed_worker_costs_a_retry_only,a_hung_worker_expires_and_is_retried,a_slow_worker_is_stale_and_its_late_progress_dropped,a_late_equal_result_is_stale,an_equal_resend_is_a_duplicate,a_late_lie_voids,a_differing_resend_voids_and_drains_by_acks,a_refusal_claimed_for_an_admitted_plan_voids,a_forged_best_voids,an_inflated_winner_is_found_by_the_dominance_check,garbage_voids_and_drains_by_acks,a_flood_voids,a_foreign_worker_is_refused_alone,a_void_in_a_later_search_removes_the_earlier_bundle,a_void_in_an_earlier_search_runs_no_later_one,a_lie_the_shutdown_drain_reads_removes_the_bundle,every_held_lie_is_sent_at_the_close_in_order,sigterm_voids_and_reaps,sigkill_to_the_coordinator_ends_every_worker_by_the_lifeline}	processes, pipes, signals, threads, files	0,1,8,13
+aos-workers-shell	contract	aos_workers::{read_frame,frame_bytes,read_worker,Fault::{parse,on},Timed::{run,calls},Stepped::run,percentiles,Tail::take,PoolArgs::limits}; spread::Threads::run	read_frame(frame_bytes(p)) = Ok(Some(p)) for |p| ≤ MAX_FRAME, a clean end between frames is Ok(None), a header over MAX_FRAME is Oversize before any payload byte is read, and a cut header or payload, a bad magic or a bad CRC is Corrupt. Fault::parse accepts exactly `KIND@G.S.A` (`:K` for kill, hang and slow only; G, A ≥ 1) and `foreign@W`, and `on(t)` fires only for t's search, slot and attempt. Threads(w).run(n, f) calls f once per index below n; Stepped over s with serial G runs f once per index below n through s and says `aos-workers step=G.trained.K` once per job finished, K counting from 0 across its calls, and nothing for n = 0; percentiles is nearest rank in ms; the stderr tail keeps the last STDERR_TAIL bytes and counts each `fault=… fired` line across chunks; limits() is LIMITS_V1 but the hello, the window, the grace and max_workers. Readers into a channel of capacity 2 × workers block when it is full and lose and reorder nothing.	src/aos_workers_tests.rs::{frames_round_trip_and_each_damage_is_refused_by_name,fault_specs_parse_by_lease_and_refuse_by_reason,threads_run_every_index_once,stepped_spreads_say_one_step_per_job_and_run_every_index_once,percentiles_are_nearest_rank,the_stderr_tail_is_bounded_and_counts_fired_faults,pool_limits_are_v1_but_the_hello_the_window_the_grace_and_the_size,a_full_channel_blocks_its_readers_and_loses_nothing}	Vec, slices, Result, string parsing, threads, atomics	0,1,3,5,7,13
 aos-workers-bench-record	contract	aos_workers_bench::{williams,parse_summary,gates,c0,criteria,record}	The runner of design §11.8's pre-registered session: round r runs row (r−1) mod 6 of a Williams square of the six arms (each arm once in every position and after every other once; 12 rounds are the six orders twice); a summary parses only with its header and result line and no stray line; gate 0 needs one clean commit and a debug lab byte-identical to the runner and unchanged at the end; gate 1 is A reproducing the M4 record's figures, each mismatch named; gate 2 (a void, an unreaped worker, a failing exit, a C0 mismatch, a run never compared) is a defect that stops the session; gate 3 leaves out a clean P round with any lost, expired, stale, duplicate, late progress, foreign, dropped, retry or cancel; gates 4–6 as registered; C0 sets aside exactly the timings, the toolchain line and the mode; C1–C3 are shown only when they hold in every valid round; each fault of the fault session must fire once and move its counter; a smoke run (rounds < 12) makes no claim; the statistics are the median and the range.	src/aos_workers_bench_tests.rs::{the_williams_square_puts_each_arm_once_in_every_position,the_williams_square_puts_each_arm_after_every_other_exactly_once,twelve_rounds_are_the_six_orders_twice_over,aos_workers_bench_parses_its_flags_and_defaults_to_the_registered_twelve_rounds,a_run_adds_its_arms_flags_then_its_fault,a_real_workers_summary_parses_field_by_field,a_real_serial_summary_and_a_real_fault_summary_parse,a_summary_without_its_header_or_result_or_with_a_stray_line_does_not_parse,the_load_average_is_the_first_of_sysctls_three,gate0_holds_for_one_clean_commit_on_a_debug_lab_and_fails_otherwise,gate1_passes_the_m4_records_figures_and_names_each_mismatch,an_a_run_that_does_not_reproduce_the_record_voids_the_session,gate2_a_void_an_unreaped_worker_a_failing_exit_or_a_c0_mismatch_is_a_defect_that_stops,gate2_a_run_waits_for_its_reference_and_a_run_never_compared_voids,gate3_a_clean_p_run_that_counts_a_lost_worker_leaves_its_round_out,gate4_a_wall_times_spanning_more_than_1_3x_void_the_session,gate5_the_deadline_and_the_memory_budget_each_leave_a_run_out,gate6_ten_of_twelve_valid_rounds_hold_and_nine_do_not,c0_sets_aside_the_timings_the_toolchain_line_and_the_mode_and_nothing_else,settle_takes_the_first_reproducing_a_run_as_the_reference_and_judges_the_waiting_runs,c1_c2_c3_are_shown_when_they_hold_in_every_valid_round,a_criterion_failing_in_one_valid_round_is_not_shown,a_left_out_round_is_not_paired,each_fault_must_fire_once_and_move_its_counter,the_fault_session_shows_every_fault_and_discloses_its_109_builds,a_fault_that_did_not_show_in_one_run_is_not_shown,a_fault_runs_c0_mismatch_stops_the_fault_session,a_smoke_records_stable_lines_say_smoke_and_make_no_claim,a_registered_valid_session_makes_its_claims_and_a_void_one_exits_1,a_session_with_faults_exits_0_only_when_every_fault_shows,the_statistics_are_the_median_and_the_range}	Vec, string parsing, f64, enum match	0,1,3,5,7
-aos-search-parallel-flags	contract	aos_search::parse_args	--threads and --workers are exclusive; --check, --lease-ms, --hello-ms, --grace-ms, --fault and --frames need --workers; --check is dominance (the default) or all; --workers takes 1 to min(available, 16) and --threads 1 to 256; --lease-ms, --hello-ms, --grace-ms, --fault and --frames parse only in debug builds, a fault spec by Fault::parse and a window, a hello or a grace in positive milliseconds; each refusal is a usage line naming its rule.	src/aos_search.rs::the_parallel_flags_are_exclusive_and_bounded	string matching, Option, Result	0,1,3
+aos-search-parallel-flags	contract	aos_search::parse_args	--threads and --workers are exclusive; --check, --lease-ms, --hello-ms, --grace-ms and --fault need --workers, and --frames parses in debug builds with or without it; --check is dominance (the default) or all; --workers takes 1 to min(available, 16) and --threads 1 to 256; --lease-ms, --hello-ms, --grace-ms, --fault and --frames parse only in debug builds, a fault spec by Fault::parse and a window, a hello or a grace in positive milliseconds; each refusal is a usage line naming its rule.	src/aos_search.rs::the_parallel_flags_are_exclusive_and_bounded	string matching, Option, Result	0,1,3
 aos-search-distributed-verify	contract	aos_search::{passed,verify}; aterm_effects m4 check_proposer, check_selection	A bundle of Mode::Distributed naming the grid is checked for what the grid fixes (its plan is plans()[index], round 0, the grid's counts), and its winner and admitted count are reported as provenance=declared, never as established. A forged count (duplicates = 1) is a Selection refusal after the rows have run; an index past the grid or a later round is a Proposer refusal, with no panic.	src/aos_search.rs::a_distributed_grid_bundle_is_declared_and_what_the_grid_fixes_is_checked	enum match, slices	0,1,3,12
 ```
 
@@ -606,6 +586,7 @@ file	test	primary	also
 tests/aos_workers.rs	honest_workers_give_the_local_result	aos-workers-process	
 tests/aos_workers.rs	check_all_judges_every_claim_and_records_search	aos-workers-process	
 tests/aos_workers.rs	threads_give_the_local_result	aos-workers-process	
+tests/aos_workers.rs	a_search_with_no_winner_says_no_held_out_or_verify	aos-workers-process	
 tests/aos_workers.rs	a_killed_worker_costs_a_retry_only	aos-workers-process	
 tests/aos_workers.rs	a_hung_worker_expires_and_is_retried	aos-workers-process	
 tests/aos_workers.rs	a_slow_worker_is_stale_and_its_late_progress_dropped	aos-workers-process	
@@ -628,6 +609,7 @@ tests/aos_workers.rs	sigkill_to_the_coordinator_ends_every_worker_by_the_lifelin
 src/aos_workers_tests.rs	frames_round_trip_and_each_damage_is_refused_by_name	aos-workers-shell	
 src/aos_workers_tests.rs	fault_specs_parse_by_lease_and_refuse_by_reason	aos-workers-shell	
 src/aos_workers_tests.rs	threads_run_every_index_once	aos-workers-shell	
+src/aos_workers_tests.rs	stepped_spreads_say_one_step_per_job_and_run_every_index_once	aos-workers-shell	
 src/aos_workers_tests.rs	percentiles_are_nearest_rank	aos-workers-shell	
 src/aos_workers_tests.rs	the_stderr_tail_is_bounded_and_counts_fired_faults	aos-workers-shell	
 src/aos_workers_tests.rs	pool_limits_are_v1_but_the_hello_the_window_the_grace_and_the_size	aos-workers-shell	
@@ -885,7 +867,9 @@ src/verbs.rs	a_header_names_the_route_the_tab_was_launched_on	verbs-claude-route
 `claude-rotation-proof [tag]` runs the installed Claude Code on a private headless instance built
 from this tree, on the lab's stub, which the instance reads as Claude Code's default route only
 through its development seam (`ATERM_DEBUG_LAB_DEFAULT_ROUTE`, admitted for the stub's exact
-loopback URL alone; `--no-route-seam` brings the lab up without it). The world is the owner's
+loopback URL alone; `--no-route-seam` brings the lab up without it). The aterm image must be at
+a persistent path: the verb rejects temporary and cache-tagged images before starting a lab,
+because account restarts correctly decline to persist their usage-tap command. The world is the owner's
 shape, laid in the scratch alone: a fleet file beside the roster lists three dedicated rows of one
 machine, opted in by name, and the instance's own sync writes the roster from it (`lab-a` the
 default login: the scratch HOME's `.claude` and the profile naming its address; `lab-b` and
@@ -918,7 +902,7 @@ rotation-proof-world	contract	claude_rotation_proof::{live_login,fleet_text,rost
 rotation-proof-r1	contract	claude_rotation_proof::{judge_r1,judge_wall_move,stepped_wrong}	judge_wall_move(ev, leg, (from, to, auth), P).verdict = Ok ⇔ within leg's window aterm.log holds `account advice: move to <to>`; the ledger books a five_hour `wall` for from, a `rotate` from → to and then a `proven` for to; the journal holds restarted(…, to, window), its line saying `(from the limit its turn ended on; the same conversation)`, and a usage-resume@v1 act after it; stepped_wrong(ev, `restart:account`, window) = None, that is the upgrade ledger holds a row of the tab (ev.sid) whose step is exactly `restart:account` (not `restart:account-ahead`) stamped within the window (its whole second), and the first row of the tab after it that is `adopted` or another `restart:` step is an `adopted` of a pid aterm.log's adopted lines of the window name; adopted_wrong(ev, to, window) = None, that is aterm.log's `restart:account pid=N … step=adopted` (or `restart:account-ahead pid=N …`, a move ahead of a wall) within the window names a pid some launch has, and that launch's login is to's (the restart starts its process before the `RESTARTED` record, so the pid, not the time, ties the two); the first 200 `main` turn served after the restart carried auth; and leg.history holds each prompt of P; else Fail naming each missing clause. judge_r1 = judge_wall_move(…, (lab-a, lab-b, oat:lab-b), [P1, P2]).	-	1	-
 rotation-proof-r3	contract	claude_rotation_proof::judge_r3	judge_r3(ev, leg, a_reset).verdict = Ok ⇔ advice_until(log, lab-b, leg.from) = Some(u) with a_reset ≤ u ≤ a_reset + 600; a `WAITING ` record within the window names an instant within 120 s of u; the restart onto lab-a comes no earlier than u − 5 s; and judge_wall_move(ev, leg, (lab-b, lab-a, oat:lab-a), [P1, P2, P3]) is Ok; else Fail.	-	1	-
 rotation-proof-r4	contract	claude_rotation_proof::{judge_r4,r4_wait_past_reset}	judge_r4(ev, leg).verdict = Ok ⇔ no account restart within the window; the ledger books a `sign-in` for lab-b at or after leg.from whose why starts `auto `; a `WAITING ` record within the window whose reason (waiting_why) starts `usage-session` names an instant from leg.reset − 60 s to leg.reset + max(auto_resume_grace, reset_grace + reset_jitter) + 60 s (TurnEndTiming's defaults: the host's own resume deadline, never a weekly or other far instant); no usage-resume@v1 act is typed from leg.from to before leg.reset − 5 s; the first 200 `main` turn served at or after leg.reset − 5 s carried oat:lab-a (Claude Code's own continuation at the reset it named, or the host's resume once that is later than `auto_resume_grace`; the verdict's words name which); and leg.history holds P1 and P4; else Fail.	-	1	-
-rotation-proof-r5	contract	claude_rotation_proof::{judge_r5,failing}	With B = listed(leg.before, d.to) and A = listed(leg.listing, d.to): judge_r5(ev, leg, d) = Fail unless the ledger books d.from `displaced` to d.to at or after leg.from; where B.auth = signed-out, an `auth` row `ok` for d.to; no `sign-in` row for d.to at or after the displacement; no account restart within the window; A exists with auth = ok, login ≠ expired and ¬failing(A.sign_in) (failing(o) ⇔ o ∈ {no-route, failed}); the first 200 `main` turn served at or after leg.asked (else leg.from) carried d.auth; and leg.history holds each of d.prompts. Where every clause holds it is Ok if B shows auth signed-out or failing(B.sign_in), else Unproven (nothing stale stood against d.to, so a sync with no fix would pass too).	-	1	-
+rotation-proof-r5	contract	claude_rotation_proof::{judge_r5,failing}	With B = listed(leg.before, d.to) and A = listed(leg.listing, d.to): judge_r5(ev, leg, d) = Fail unless the ledger books d.from `displaced` to d.to at or after leg.from and through leg.to; where B.auth = signed-out, an `auth` row `ok` for d.to through leg.to; no `sign-in` row for d.to at or after the displacement through leg.to (a later leg may displace that account again); no account restart within the window; A exists with auth = ok, login ≠ expired and ¬failing(A.sign_in) (failing(o) ⇔ o ∈ {no-route, failed}); the first 200 `main` turn served at or after leg.asked (else leg.from) carried d.auth; and leg.history holds each of d.prompts. Where every clause holds it is Ok if B shows auth signed-out or failing(B.sign_in), else Unproven (nothing stale stood against d.to, so a sync with no fix would pass too).	-	1	-
 rotation-proof-r2	contract	claude_rotation_proof::{judge_r2,session_pct}	judge_r2(ev, leg).verdict = Ok ⇔ the ledger books a `sample` row of lab-a whose why starts `tap: ` and whose `session N%` has N ≥ 90, at or after leg.from and no later than the `rotate` lab-a → lab-c, and then a `proven` for lab-c (a `warned` row, Claude Code's own warning read off its screen, never stands for the tap's sample; the evidence says whether one was booked); restarted(…, lab-c, window) exists and says `(at a turn end; the same conversation)`; stepped_wrong(ev, `restart:account-ahead`, window) = None; the stub gave oat:lab-a no 429 within the window; adopted_wrong(ev, lab-c, window) = None; the first 200 `main` turn served after it (the lab's P8, typed once the move came at P7's turn end) carried oat:lab-c; and leg.history holds P1, P7 and P8; else Fail.	-	1	-
 rotation-proof-stub	contract	claude_rotation_proof::judge_stub	judge_stub(S) = Fail if some s ∈ S has auth ∉ {oat:lab-a, oat:lab-b, oat:lab-c}; else Unproven if one of the three carried no request; else Ok.	-	1	-
 rotation-proof-asked	contract	claude_rotation_proof::{judge_asked,names_login}	judge_asked(j, N) reads the instance's whole messages.log (N = notes_of, every line from the instance's start) and the tab's whole journal j, whenever each line was written. For each posted note p, with e the last retired note of p's id: a Fail where p's or e's title or detail names `/login`, or p's or e's sev is `error`; else where p.later (a fact for later), a Fail where p.key starts `harness.accounts.` and is not `harness.accounts.no-sign-in` (the recorded no-route error after every route was tried), else allowed and named in the evidence with e.rep (`open` where no e) and, for the no-route error, the rows its detail names; else where e.record (retired `folded` with `rec=1`) allowed and counted; else a Fail (it stood on the owner's screen). A Fail too where a record of j starts `EXCEPTION `, `ESCALATED `, `NEEDS ` or `LEFT ` or is typed_for RULE_LOGIN. Ok where nothing failed and no `dropped` line stands; Unproven where nothing failed but the log dropped lines.	-	1	-
@@ -940,6 +924,7 @@ src/claude_rotation_proof_tests.rs	r1_passes_on_the_runs_own_move_and_fails_on_e
 src/claude_rotation_proof_tests.rs	r3_waits_for_the_first_row_to_open_and_fails_on_an_early_move_or_another_instant	rotation-proof-r3	rotation-proof-r1
 src/claude_rotation_proof_tests.rs	r4_passes_on_the_runs_own_wait_and_sign_in_and_fails_on_a_move_or_none	rotation-proof-r4	rotation-proof-evidence
 src/claude_rotation_proof_tests.rs	r5_passes_on_the_runs_own_displacements_and_fails_on_a_stale_row_or_a_turn_elsewhere	rotation-proof-r5	rotation-proof-evidence
+src/claude_rotation_proof_tests.rs	r5_keeps_later_legs_sign_ins_and_witnesses_out_of_its_verdict	rotation-proof-r5	rotation-proof-evidence
 src/claude_rotation_proof_tests.rs	r2_passes_on_the_taps_move_ahead_and_fails_on_a_screen_warning_alone_a_wall_or_another_row	rotation-proof-r2	rotation-proof-evidence, rotation-proof-r1
 src/claude_rotation_proof_tests.rs	the_stub_row_holds_only_where_every_request_carried_a_roster_rows_credential	rotation-proof-stub	
 src/claude_rotation_proof_tests.rs	messages_log_reads_as_its_posts_retirements_and_folds	rotation-proof-evidence	
@@ -952,16 +937,28 @@ src/claude_rotation_proof_tests.rs	the_verbs_exit_is_the_tables_and_under_the_co
 
 ## 22. Added 2026-10-28: `swarm partition`, the lab partition lane (fluid swarm F8)
 
-`swarm partition [--one-url] [--writers both|a] [--hold SECS]` splits five private headless aterms
-and one vault-only Mac on this Mac's loopback into two islands with aterm-uds's partition seam
+`swarm partition [--one-url] [--writers both|a] [--minter-away] [--hold SECS] [--label WORD]` splits
+seven private headless aterms (a4 joined the fleet at a2, b4 at b2, and b3 joins at b1 during the
+cut) and one vault-only Mac on this Mac's loopback into two islands with aterm-uds's partition seam
 (`ATERM_DEBUG_PARTITION`, a file of `ip:port` lines that aterm-net's and aterm-http's connect
 funnels read on every dial of a debug build), lets
 each island write and admit, heals, and judges the vault and the fleet. Each Mac's subscriber and
 approver is `aterm_secrets::client::watch` in a lab process (`partition-agent`), whose converge
 runner is the lab's `init --converge` stand-in, which records the start and runs no pass. The
 judge is a pure function of the evidence; the run prints one row per check and exits 1 on any
-FAIL, 3 when the lane could not run (a fleet not whole within a minute before the cut is one).
-`--one-url` (no `aterm-swarm-policy` server list) is F8's negative control: `one-head` must FAIL.
+FAIL, 3 when the lane could not run (a fleet not whole within a minute before the cut is one:
+a1's and b1's surveys must hear a1, a2, b1 and b2; every fleet Mac's survey hearing every other
+is waited for too, but is evidence, not a gate). Every fleet Mac surveys before, during and after
+the cut, every member drives every other at the end, and each member's own `fleet-answered`
+stamps, read from the fleet's forming until the first survey before the cut and again after the
+heal before any member surveys (a survey stamps who answered it too), say whom its heartbeat
+reached and which members its last dial missed; a2's, b1's and b2's heartbeats back at a1 are read
+from the same stamps, never from a1's book, whose `seen_ms` for a member a merge of any other
+member's book moves. The instances run with `ATERM_DEBUG_FLEET_JOINED_PER_ADDRESS=16`
+(aterm-net's debug-only seam that raises, never lowers, the four members a book records from one
+address), since every lab Mac registers from 127.0.0.1. `--minter-away` kills a1's instance
+before the heal. `--one-url` (no `aterm-swarm-policy` server list) is F8's negative control: `one-head` must
+FAIL.
 Lab instances run no Commons runtime and no harness, so the Commons plane runs the repair exchange
 in the lab process on each Mac's own custody (pairing Macs of one island during the cut, across
 after the heal, then round a ring of every enrolled Mac until they read alike, a pass moves
@@ -971,11 +968,11 @@ replicas on a simulated clock (a cut longer than the 20 minutes an unheard Mac's
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
 partition-vault	contract	swarm_partition::judge	Of judge(ev)'s vault rows, with expected = ev.vault.members_before ∪ {every Mac in during the cut}: `cut held` ⇔ ev.vault.end_of_cut has both islands, no island view lists a crossed value, every member of each held its island's server's digest, and the two servers' digests differ where an island set anything; `kept writing` ⇔ each island set at least one entry, every set exited 0, and every Mac that asked was posted and in during the cut; ONE_HEAD ⇔ healed = Some((_, h)) and every server and every expected Mac of the run's end reads `in` and holds h's digest; `nothing lost` ⇔ every entry set during the cut was looked for after the heal and is on every expected Mac, and every expected Mac is still `in`; `asked in` ⇔ every Mac that asked during the cut is `in` at the end.	-	1	-
-partition-fleet	contract	swarm_partition::judge	Of judge(ev)'s fleet rows: FLEET_CUT_HELD ⇔ at least two surveys ran early in the cut, each heard itself and no Mac of the other island, and no drive across the cut early in it exited 0; `drove its own` ⇔ late drives ran and each exited 0; `b3 joined` ⇔ b3's join early in the cut joined; `whole again` ⇔ a survey ran after the heal and each heard every Mac heard before the cut, and b3 where some b3 join joined, every heartbeat came back after the heal, every drive after the heal exited 0, and some b3 join joined. A run is recorded under docs/measured only where CUT_HELD and FLEET_CUT_HELD both pass.	-	1	-
+partition-fleet	contract	swarm_partition::{judge,members_after}	Of judge(ev)'s fleet rows, with M = members_after(ev.fleet) = ev.fleet.before_members less ev.fleet.away, then b3 where some b3 join joined: FLEET_CUT_HELD ⇔ some survey early in the cut came from each island, each heard itself and no Mac of the other island, and no drive across the cut early in it exited 0; `drove its own` ⇔ late drives ran and each exited 0; `b3 joined` ⇔ b3's join early in the cut joined; `spread before` ⇔ before_members ≠ ∅ and each of them has a survey before the cut whose last one heard every one of them; `reached every member before the cut` ⇔ |before_members| ≥ 2 and each of them has a Reach in reach_before whose `reached` holds every other one of them; `whole again` ⇔ M ≠ ∅, each m ∈ M has a survey after the heal whose last one heard every member of M, every heartbeat came back after the heal, every drive after the heal exited 0, and some b3 join joined; `drove every other` ⇔ |M| ≥ 2 and for each ordered pair of distinct members of M the last drive at the end between them exited 0; `reached every member` ⇔ |M| ≥ 2 and each m ∈ M has a Reach whose `reached` holds every other member of M. A run is recorded under docs/measured only where CUT_HELD and FLEET_CUT_HELD both pass.	-	1	-
 partition-commons	contract	swarm_partition::commons::judge	Of commons::judge(ev): skipped = Some(why) ⇒ one FAIL row naming why (a failed enrolment or write before the cut is one); else `kept working` ⇔ each island wrote its `-in-cut` row and let a newcomer in, none with an error; `one history` ⇔ some Mac was read after the heal and every one is `ready` on one head, the same head; `rows` ⇔ some Mac was read and every one reads every row a write succeeded for.	-	1	-
 partition-repair	contract	swarm_partition::commons::{alike,settled}	alike(reads) ⇔ every read holds the first's state, heads, rows and unreadable reason (true of no read and of one); settled(before, after, failed) ⇔ alike(after) ∨ (after = before ∧ failed = 0).	-	1	-
 partition-accounts	contract	swarm_partition::accounts::judge	Of accounts::judge(ev): `one user` ⇔ the `lease` scenario ran and its last users set has exactly one Mac; `kept through the cut` ⇔ it ran and b2 never stopped, or stopped at or after the heal; `claims before use` ⇔ it ran and no scenario recorded a use while the user's own row held no live claim on the account; `home blocks a cold claim` ⇔ the `home` scenario ran and no instant had two users.	-	1	-
-partition-parse	contract	swarm_partition::parse	∀ args: parse(args) = Ok(o) ⇔ args matches ("--one-url" | "--keep" | "--record" | "--aterm" P | "--writers" ("both" | "a") | "--hold" N)* with each N a whole number of seconds in 10..=600; o starts as {aterm: None, publish: Policy, writers: Both, hold: DEFAULT_HOLD (80 s), keep: false, record: false}, each flag sets its field, a later one overwriting an earlier one ("--one-url" ⇒ publish = OneUrl); "-h"/"--help", any other word, or a flag missing or with a bad value ⇒ Err(Fail::usage(..)) (code 2).	-	1	-
+partition-parse	contract	swarm_partition::{parse,record_arm}	∀ args: parse(args) = Ok(o) ⇔ args matches ("--one-url" | "--minter-away" | "--keep" | "--record" | "--aterm" P | "--writers" ("both" | "a") | "--hold" N | "--label" W)* with each N a whole number of seconds in 10..=600 and each W 1 to 40 of `[a-z0-9-]`, neither first nor last `-`; o starts as {aterm: None, publish: Policy, writers: Both, minter_away: false, hold: DEFAULT_HOLD (80 s), keep: false, record: false, label: None}, each flag sets its field, a later one overwriting an earlier one ("--one-url" ⇒ publish = OneUrl); "-h"/"--help", any other word, or a flag missing or with a bad value ⇒ Err(Fail::usage(..)) (code 2). record_arm(o) = ("-one-url" where OneUrl) ++ ("-writers-a" where Writers::A) ++ ("-minter-away" where set) ++ ("-" W where labelled), with the flags that chose each.	-	1	-
 ```
 
 ```tsv
@@ -995,6 +992,17 @@ src/swarm_partition_tests.rs	parse_reads_each_arm_and_refuses_what_it_does_not_k
 src/swarm_partition_tests.rs	a_member_before_the_cut_that_the_heal_left_out_fails_one_head_and_is_lost	partition-vault	
 src/swarm_partition_tests.rs	a_value_that_crossed_the_cut_is_a_leak_though_the_servers_differ	partition-vault	
 src/swarm_partition_tests.rs	b3_joined_and_unheard_after_the_heal_is_not_whole	partition-fleet	
+src/swarm_partition_tests.rs	a_cut_surveyed_from_one_island_alone_is_not_shown_to_hold	partition-fleet	
+src/swarm_partition_tests.rs	a_member_that_never_surveyed_after_the_heal_is_not_shown_whole	partition-fleet	
+src/swarm_partition_tests.rs	macs_that_joined_at_members_and_never_spread_fail_the_survey_the_drives_and_the_reach	partition-fleet	
+src/swarm_partition_tests.rs	a_pair_never_driven_fails_every_mac_drove_every_other	partition-fleet	
+src/swarm_partition_tests.rs	a_heartbeat_that_asks_the_same_three_members_never_reaches_the_rest	partition-fleet	
+src/swarm_partition_tests.rs	a_mac_unheard_before_the_cut_fails_the_spread_before_it	partition-fleet	
+src/swarm_partition_tests.rs	with_the_minter_away_the_rest_must_still_spread	partition-fleet	
+src/swarm_partition_tests.rs	the_minter_away_and_label_flags_read_and_name_the_record	partition-parse	
+src/swarm_partition_tests.rs	a_heartbeat_that_asks_the_same_three_members_before_the_cut_fails_the_reach_before_it	partition-fleet	
+src/swarm_partition_tests.rs	a_member_passed_over_after_a_missed_dial_is_told_from_one_never_asked	partition-fleet	
+src/swarm_partition_tests.rs	a_heartbeat_answer_is_read_from_the_heartbeating_macs_own_stamps	partition-fleet	
 src/swarm_partition_commons_tests.rs	a_whole_commons_passes_every_check	partition-commons	
 src/swarm_partition_commons_tests.rs	two_islands_that_each_let_a_mac_in_and_never_recover_fail_one_history_and_the_rows	partition-commons	
 src/swarm_partition_commons_tests.rs	macs_each_ready_on_a_different_head_are_not_one_history	partition-commons	
@@ -1009,4 +1017,110 @@ src/swarm_partition_accounts_tests.rs	the_claims_leave_one_user_after_the_heal_a
 src/swarm_partition_accounts_tests.rs	two_users_after_the_heal_or_nobody_is_not_one_user	partition-accounts	
 src/swarm_partition_accounts_tests.rs	a_use_with_no_claim_of_its_own_fails_claims_before_use	partition-accounts	
 src/swarm_partition_accounts_tests.rs	a_scenario_that_did_not_run_fails_its_checks	partition-accounts	
+```
+
+## 23. Added 2026-10-30: `git-starts`, the git starts of one busy Mac
+
+`git-starts [--minutes N] [--every-ms M]` reads the Mac as it is and changes nothing: every M ms
+(100) it lists this uid's processes (`aterm_uds::holders::uid_pids`) and reads each pid new to the
+listing, and again each one whose read was none (`read_process_birth`, `read_process_path`; no
+argv, no environment), and every 1 s it reads each local aterm's `survey facts` over its control
+socket from the lab's own process, so it starts no process. A survey read counts only where every
+aterm that accepts on its socket answered it. It prints process starts a minute (the advance of
+the newest-born process's pid, from the first process born during the run), git starts seen a
+minute (a lower bound), agent sessions' turn ends a minute (a lower bound), and the work record's
+projected reads and git starts at its 20 s floor, with that projection's ceiling. The readers are
+the `Readers` trait; the tests drive `Tally` over a fake. `git-starts --read [--reads K]` instead
+reads each local aterm's `survey content` once, takes each agent row's folder (`folders_of`), and
+reads its work record K times (5) with `aterm_agent::harness::repo_work::read_work`, printing the
+git starts and the wall time per read (`Reads::summary`) and naming no folder. Read the same way as
+§1.
+
+```tsv
+id	kind	functions	statement	subsumes	difficulty	blocking_gaps
+git-starts-pids	contract	git_starts::forward	forward(f, t) = t − f for t ≥ f; (PID_MAX − f) + (t − PID_WRAP_TO) for t < f with t ≥ PID_WRAP_TO and f < PID_MAX; else 0.	-	1	-
+git-starts-tally	contract	git_starts::{Tally::{list,survey,look},in_turn,resting}	list(t, None) counts one failed listing and changes nothing else. list(t, Some(P), read): listings += 1; each p ∈ P (on the first listing) or p ∈ P not in the previous listing's read pids (on a later one) is read once; on a later listing a read Some(s) with s.git puts (p, s.birth) into gits; with (b, p) the read of greatest birth, newest := (b, p) where none was held, and where newest = (b₀, p₀) with b > b₀: the first time, counted := (t, t) and nothing is added; after, starts += forward(p₀, p) and counted's end := t; then newest := (b, p); the previous listing's read pids := the p ∈ P carried over or read Some (on the first listing, those read Some). survey(t, None): unanswered += 1, nothing else. survey(t, Some(R)): surveys += 1; for each row its sid joins sessions; for each agent row shown += 1, busy += [word = `busy`], an agent Session (first_ms = t, new ⇔ an earlier Some read was folded) is kept, a turn end at t is pushed where in_turn(its word) (`busy`, `prompt`) and resting(the row's word) (`idle`, `survey`, `question`, `wall:*`), and its word and last_ms become the row's. look(t, r) = list(t, r.pids(), r.process) then survey of each r.survey() in order until it is None.	-	1	-
+git-starts-floor	contract	git_starts::{floor_reads,Tally::summary}	floor_reads(s, F) = the count of reads where, from last = s.first_ms if s.new (one read) else none, each turn end at ≥ last + F (or with no last) reads and becomes last. summary(): minutes = (last − first listing) / 60000; reads = Σ floor_reads(s, FLOOR) over agent sessions / minutes; ceiling = (agent rows shown / survey reads) · 60 / FLOOR_s + new sessions / minutes; process starts a minute = starts / ((counted's end − counted's start) / 60000), 0 where that is 0; git starts a minute = |gits| / minutes; turn ends = the nearest-rank median, 95th percentile and most of each agent session's turn ends / ((last_ms − first_ms + SURVEY_EVERY) / 60000).	-	1	-
+git-starts-rows	contract	git_starts::rows_of	rows_of(b) = one Row per line of b starting `session ` with a non-empty `sid=`, its sid and agent word pct-decoded, agent ⇔ `program_kind=agent`; other lines read as nothing.	-	1	-
+git-starts-pass	contract	git_starts::survey_pass	survey_pass(Err, read) = None. survey_pass(Ok(I), read) = None where some (_, s) ∈ I has read(s) an error other than ConnectionRefused or NotFound; else Some of the concatenated Ok rows in I's order, a ConnectionRefused or NotFound read adding none.	-	1	-
+git-starts-read	contract	git_starts::{folders_of,Reads::{fold,summary}}	folders_of(b, h) = for each `session ` line of b whose program_kind=agent, its pct-decoded work_tree= (not `-`) else cwd=, a leading `~` (alone or before `/`) replaced by h, kept where absolute. fold(r, ms) pushes (r's starts, ms) for a Read, counts a None or an Unread. summary() names the three counts, the fewest, nearest-rank median and most git starts and the nearest-rank p50, p95 and most wall time over the pushed reads, 0 for none.	-	1	-
+```
+
+```tsv
+file	test	primary	also
+src/git_starts_tests.rs	a_git_seen_in_many_samples_counts_once	git-starts-tally	
+src/git_starts_tests.rs	a_process_that_read_as_none_is_read_again	git-starts-tally	
+src/git_starts_tests.rs	process_starts_count_from_the_first_process_born_during_the_run	git-starts-tally	
+src/git_starts_tests.rs	process_starts_count_through_the_pid_wrap	git-starts-pids	git-starts-tally
+src/git_starts_tests.rs	a_turn_end_is_a_row_in_a_turn_coming_to_rest	git-starts-tally	
+src/git_starts_tests.rs	a_survey_read_an_aterm_did_not_answer_folds_nothing	git-starts-tally	
+src/git_starts_tests.rs	every_survey_read_finished_between_two_looks_is_folded	git-starts-tally	
+src/git_starts_tests.rs	a_survey_pass_counts_only_where_every_listening_aterm_answered	git-starts-pass	
+src/git_starts_tests.rs	the_projection_caps_each_session_at_the_floor	git-starts-floor	
+src/git_starts_tests.rs	the_summary_reads_each_count_over_its_minutes	git-starts-floor	git-starts-tally
+src/git_starts_tests.rs	a_survey_reply_reads_as_its_session_rows	git-starts-rows	
+src/git_starts_tests.rs	a_survey_of_an_aterm_that_accepts_nothing_ends_unanswered	git-starts-pass	
+src/git_starts_tests.rs	an_agent_rows_folder_is_its_work_tree_else_its_cwd	git-starts-read	
+src/git_starts_tests.rs	the_read_summary_counts_starts_and_wall_time_per_read	git-starts-read	
+```
+
+## 24. Added 2026-10-31: what aterm checked, on every surface (Autopilot v6 slice 9c)
+
+`forever`'s judge holds 9c's surfaces to the receipt 9b journals (`forever_checked.rs`): `status`'s
+four `landed_*` fields, the Done for you row's tip (L16, L17), the worker's `checked=` on `await
+task`, `result` and its row's tip (L15), the landed chip's title read in front (L1, L7, L16–L19),
+and the leg each chain's folder makes, with two chains
+whose folders make the legs no other chain does: land-n (L18, a repository with no remote) and
+land-o (L19, a plain folder). Read the same way as §1.
+
+```tsv
+id	kind	functions	statement	subsumes	difficulty	blocking_gaps
+checked-status-fields	contract	forever::checked::{status_agrees,receipt_at,fields_of,leg_of,receipt_of}	For status_agrees(chain, seen, t0) with R the RECEIPT lines journaled after t0: a status read after t0 lacking any of landed_head=, landed_on=, landed_leg=, landed_repo= ⇒ Fail. Else Fail iff some read's four fields (landed_on and landed_repo percent-decoded) differ from fields_of(receipt_at(t)) where its task= is landed and from `- - - -` elsewhere (receipt_at(t) = the last of R journaled by t, else the first of R), or the last of R has a leg other than leg_of(chain) (no-remote for Repo::NoRemote, no-repo for Repo::Plain, on-main otherwise), a head other than the first 12 digits of seen.head where both are named, or an on-main ref other than origin/main. Otherwise Unobserved iff the chain lands (Chain::lands or a scenario whose receipt the lab judges) and no read said landed or R is empty; else Pass. No read after t0 ⇒ Unobserved.	-	1	-
+checked-done-tip	contract	forever::checked::done_tip	done_tip(seen, t0) with r the last receipt after t0: none ⇒ Unobserved; Pass iff some Done for you tip read after t0 (not `-`) equals mode_words::landed_tip(Some(r)) and contains `<r.head> on origin/main`; else Fail.	-	1	-
+checked-worker	contract	forever::checked::worker_checked	worker_checked(seen, t0) with r the last receipt after t0: none ⇒ Unobserved; Pass iff the manager's await task output has the token checked=<r.checked_word()>, result's header ends ` checked=<word>`, and some worker row's tip after t0 equals mode_words::checked_words(Some(r)); else Fail naming each that did not.	-	1	-
+checked-title	contract	forever::checked::{title_checked,titled}	title_checked(seen, t0): no window read ⇒ Pass, saying SKIPPED. Else with T the title reads after t0 whose chip wears face=landed (window.front's line split by split_title, and each window.title read whose latest window.chip line by then has face=landed), `-` and `?` dropped: T empty ⇒ Unobserved; Fail iff some title read at t lacks mode_words::landed_brief(receipt_at(t)) (landed_brief(None) where the journal holds no receipt); else Pass. titled(s) ⇔ s ∈ {L1, L7, L16, L17, L18, L19}.	-	1	-
+checked-wants-join	contract	forever::checked::{with_checked,judged}	with_checked(chain, s, seen, t0, v) = v where ¬judged(chain, s); else the wants W = [status_agrees] ++ [done_tip if s ∈ {L16, L17}] ++ [worker_checked if s = L15] ++ [title_checked if titled(s)], joined to v: Fail if v or some W fails, else Unobserved if v or some W is, else Pass, its words v's followed by `; checked: <WORD> (<why>)` for each W. judged(chain, s) ⇔ receipt::judged(chain, s) is Some ∨ s ∈ {W2, W4, W5, W6, W9, W10, W11, O1, the switch scenarios}.	-	1	-
+```
+
+```tsv
+file	test	primary	also
+src/forever_checked_tests.rs	status_agrees_with_the_receipt_and_says_dash_off_the_landing	checked-status-fields	
+src/forever_checked_tests.rs	each_folder_makes_its_own_leg	checked-status-fields	
+src/forever_checked_tests.rs	the_done_rows_tip_names_the_head	checked-done-tip	
+src/forever_checked_tests.rs	the_workers_await_result_and_row_say_checked	checked-worker	
+src/forever_checked_tests.rs	the_landed_title_says_its_own_receipt	checked-title	
+```
+
+## 24. Added 2026-10-31: the tether's verb
+
+Both of the lab's `main`s call `aterm_uds::tether::entry` before the `argv[0]` dispatch (the
+macOS one after the debug build's claim holder, as aterm's and atpkg's do), so a child the lab
+spawns tethered can start through the lab's own image. The tether's own contract is aterm-uds'.
+Read the same way as §1.
+
+```tsv
+id	kind	functions	statement	subsumes	difficulty	blocking_gaps
+tether-verb-first	contract	main, aterm_uds::tether::entry	For every argv = [exe, "__tether", p, program, argv0, args…], whatever exe's file name: with p this process's parent's pid (> 1) the process ties itself to p and execs program under argv0 with args (the program's exit status, its output its own); with p = 1, or a pid that is not its parent, it exits UNTETHERED (125) and execs nothing. Every other argv dispatches as before.	tests/tether_entry.rs::the_lab_serves_the_tether_verb	process exec and fork, argv dispatch	0,1,8
+```
+
+```tsv
+file	test	primary	also
+tests/tether_entry.rs	the_lab_serves_the_tether_verb	tether-verb-first	
+```
+
+## 25. Added 2026-11-01: a letter judged by the ring round its strokes (round 27)
+
+`trail-contrast`'s thresholds (`min_contrast`, `--min`, `--newest-min`) judge a glyph cell by its
+`local_contrast`, what a reader sees round each stroke, the one reading the letter guard keeps
+(`aterm-effects` SPECS §18): the whole cell's `contrast` only where a glyph has no ground that near
+or there is no clean twin. Read the same way as §1.
+
+```tsv
+id	kind	functions	statement	subsumes	difficulty	blocking_gaps
+trail-contrast-judged	contract	trail_contrast::{judged,measure_cell,solid_ink_ratios,report}	For every measured cell c: judged(c) = c.local_contrast where measure_cell gave one, else c.contrast, else None; report counts a cell under --min, and a newest glyph under --newest-min, by judged alone, so a light laid on the cell's ground more than RING_REACH from every solid ink pixel leaves judged(c) = the clean reading of its strokes whatever the whole cell's median ground reads.	-	1	-
+```
+
+```tsv
+file	test	primary	also
+src/trail_contrast_tests.rs	a_light_away_from_the_strokes_leaves_the_letter_its_reading	trail-contrast-judged	
 ```

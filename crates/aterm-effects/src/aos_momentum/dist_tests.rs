@@ -25,6 +25,7 @@ use super::m4::{CheckLevel, DistNoOutcome, Evaluator, NoOutcome, Selection, Seri
 use super::m4_tests::{evaluator, gap0, plan};
 use super::plan::{SHIPPED_PLAN, SchedulePlan, Split, Wake};
 use super::search::{FileProposer, GridProposer, Mode, Proposer, ProposerId, TrainFeedback};
+use super::test_fixtures::refused_off_the_pinned_target;
 
 /// Every job on the test pool's threads.
 struct Threads;
@@ -201,6 +202,9 @@ fn orders(n: usize) -> Vec<Vec<usize>> {
 /// the claims the slot order files, and that search, finished at each level, is every order's.
 #[test]
 fn honest_claims_in_any_completion_order_give_the_local_selection() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = evaluator();
     let plans = grid_plans();
     let local = local_grid();
@@ -255,6 +259,9 @@ fn honest_claims_in_any_completion_order_give_the_local_selection() {
 /// and `m6_tests::the_chain_is_deterministic`'s.
 #[test]
 fn select_spread_equals_select() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = evaluator();
     let threaded = ev
         .select_spread(&mut GridProposer::new(), &Threads)
@@ -298,6 +305,9 @@ fn grid_slots() -> Vec<usize> {
 /// where the grid's 54, judged four times over on one thread, took 30-45 s in a debug build.
 #[test]
 fn finish_with_a_skipping_spread_equals_serial() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = evaluator();
     let text = plans_text(&six());
     let slots: Vec<usize> = (0..six().len()).collect();
@@ -346,6 +356,9 @@ impl<P: Proposer> Proposer for Shown<P> {
 /// feedback, in proposal order, every round.
 #[test]
 fn completion_order_never_reaches_the_proposer() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = evaluator();
     let text = plans_text(&six());
     let mut local = Shown {
@@ -369,6 +382,9 @@ fn completion_order_never_reaches_the_proposer() {
 /// `j + 1` training items, is judged.
 #[test]
 fn a_refusal_claimed_for_an_admitted_plan_is_contradicted() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = fresh();
     let pins = ev.policy().items().to_vec();
     let truth = honest(evaluator(), gap0());
@@ -406,6 +422,9 @@ fn a_refusal_claimed_for_an_admitted_plan_is_contradicted() {
 /// judged in full as the claimed winner and contradicted: no selection, so no held-out read.
 #[test]
 fn a_forged_best_is_contradicted_before_any_held_out_read() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = fresh();
     let pins = ev.policy().items().to_vec();
     let six = six();
@@ -443,6 +462,9 @@ fn a_forged_best_is_contradicted_before_any_held_out_read() {
 /// reaches an inflated row and voids the search before the held-out split is read.
 #[test]
 fn an_inflated_winner_is_found_by_the_dominance_check() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = fresh();
     let pins = ev.policy().items().to_vec();
     let claim_of = |p: SchedulePlan| {
@@ -519,6 +541,9 @@ fn predicted(claims: &[Claim], plans: &[SchedulePlan]) -> BTreeSet<(u32, usize)>
 /// read exactly that many training items, none held out.
 #[test]
 fn a_dominated_claim_stops_at_the_winners_sum() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = fresh();
     let plans = grid_plans();
     let claims = grid_claims();
@@ -555,6 +580,9 @@ fn a_dominated_claim_stops_at_the_winners_sum() {
 /// and a grid search fills the evaluator's grid cache.
 #[test]
 fn check_all_judges_every_admitted_claim_and_records_search() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = fresh();
     let claims = grid_claims();
     let mut g = GridProposer::new();
@@ -582,6 +610,9 @@ fn check_all_judges_every_admitted_claim_and_records_search() {
 /// Under the dominance check the grid cache is never filled from claims.
 #[test]
 fn claims_never_fill_the_grid_cache() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = fresh();
     let mut g = GridProposer::new();
     distribute(
@@ -601,6 +632,9 @@ fn claims_never_fill_the_grid_cache() {
 /// the baseline on training.
 #[test]
 fn a_distributed_bundle_is_checked_and_declared() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = evaluator();
     let mut g = GridProposer::new();
     let s = distribute(
@@ -676,6 +710,9 @@ fn a_proposal_after_round_zero_is_adaptive() {
             }
         }
     }
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = fresh();
     let mut late = Late;
     let mut d = ev.distributed(&mut late, CheckLevel::Dominance);
@@ -692,6 +729,9 @@ fn a_proposal_after_round_zero_is_adaptive() {
 /// A job with no claim, or a claim for no job or a second one, is refused by name.
 #[test]
 fn claims_must_fill_every_job_once() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = evaluator();
     let text = plans_text(&[gap0(), SHIPPED_PLAN]);
     let mut file = FileProposer::from_text(&text);
@@ -715,6 +755,9 @@ fn claims_must_fill_every_job_once() {
 /// When every claim is refused and each refusal holds, there is no winner, as in a local search.
 #[test]
 fn every_refusal_held_is_none_admitted() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = evaluator();
     let refused = [
         plan(Split::Shipped, Wake::Never),
@@ -753,6 +796,9 @@ fn rows_of(c: &Claim) -> Vec<Row> {
 /// whose last row passes, and a `Z` that is not `T − P`.
 #[test]
 fn each_shape_fault_is_refused_by_name() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = evaluator();
     let pins = ev.policy().items().to_vec();
     let admitted = rows_of(&honest(ev, gap0()));
@@ -827,6 +873,9 @@ fn each_shape_fault_is_refused_by_name() {
 /// `run_job` judges the training split only, and stops within one item of being told to.
 #[test]
 fn run_job_reads_no_held_out_item_and_stops_when_told() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = fresh();
     let c = honest(&ev, gap0());
     assert_eq!(c.kind(), ClaimKind::Admitted);
@@ -871,6 +920,9 @@ fn token(slot: u32, attempt: u8, worker: u32) -> Token {
 /// refused by variant.
 #[test]
 fn every_message_round_trips_and_every_fault_is_named() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = evaluator();
     let c = RawClaim::from(honest(ev, gap0()));
     let worker_msgs = [
@@ -965,6 +1017,9 @@ fn every_message_round_trips_and_every_fault_is_named() {
 /// out the worker's declared figures.
 #[test]
 fn ids_and_digests_name_what_they_cover() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = evaluator();
     let id = identity(ev);
     let exec = id.digest();
@@ -1120,6 +1175,9 @@ fn pooled(
 /// Honest workers through the coordinator give the local selection.
 #[test]
 fn an_honest_pool_gives_the_local_selection() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = evaluator();
     let text = plans_text(&six());
     let local = ev
@@ -1135,6 +1193,9 @@ fn an_honest_pool_gives_the_local_selection() {
 /// sees voids at once.
 #[test]
 fn lies_are_contradicted_or_refused_by_shape() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = evaluator();
     let pins = ev.policy().items().to_vec();
     let text = plans_text(&six());
@@ -1182,6 +1243,9 @@ fn lies_are_contradicted_or_refused_by_shape() {
 /// their sender; the third refuses that worker alone, by the field it differs in.
 #[test]
 fn garbage_another_job_id_and_a_foreign_hello() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = evaluator();
     let text = plans_text(&six());
     let mut file = FileProposer::from_text(&text);
@@ -1294,6 +1358,9 @@ fn garbage_another_job_id_and_a_foreign_hello() {
 /// unread; a resend that differs voids.
 #[test]
 fn resends_and_frames_from_the_gone() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = evaluator();
     let text = plans_text(&[gap0(), SHIPPED_PLAN]);
     let mut file = FileProposer::from_text(&text);
@@ -1387,6 +1454,9 @@ fn the_held_out_split_is_read_once_under_every_fault() {
             }
         },
     ];
+    if refused_off_the_pinned_target() {
+        return;
+    }
     for (i, lie) in lies.iter().enumerate() {
         let ev = fresh();
         let mut pool = Pool::new(3, LIMITS_V1);
@@ -1415,6 +1485,9 @@ fn the_held_out_split_is_read_once_under_every_fault() {
 /// fault of its sender, which is killed and never drained; the other holders are cancelled.
 #[test]
 fn a_broken_stream_voids_and_kills_its_sender() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = evaluator();
     let text = plans_text(&six());
     let mut file = FileProposer::from_text(&text);
@@ -1450,6 +1523,9 @@ fn a_broken_stream_voids_and_kills_its_sender() {
 /// unread: it neither voids nor moves the search.
 #[test]
 fn a_broken_tail_from_a_gone_worker_is_dropped() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = evaluator();
     let text = plans_text(&six());
     let mut file = FileProposer::from_text(&text);

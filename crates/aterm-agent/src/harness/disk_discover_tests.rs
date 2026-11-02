@@ -1492,6 +1492,7 @@ fn real_with(
 ) -> impl FnMut(&Row) -> std::io::Result<Removed> {
     remover_among(
         judge_at(now),
+        None,
         processes,
         |_| Ok(Running::default()),
         crate::harness::disk::idle::Sessions::default,
@@ -2324,9 +2325,12 @@ fn a_build_directory_a_checkout_also_names_is_the_checkouts() {
     assert_eq!(page.found[0].origin, Origin::Linked { from: alias });
 }
 
-fn until_err(mut f: impl FnMut() -> Result<(), String>) -> Result<(), String> {
+/// The first refusal of `f` that names `why`, polled under the hang detector, or `Ok` once that
+/// has passed with none: a process the scan meets while it starts is unreadable for a moment, and
+/// refuses for that first.
+fn until_said(why: &str, mut f: impl FnMut() -> Result<(), String>) -> Result<(), String> {
     within(MUST_HAPPEN, std::time::Duration::from_millis(20), || {
-        f().err()
+        f().err().filter(|said| said.contains(why))
     })
     .map_or(Ok(()), Err)
 }
@@ -2345,15 +2349,21 @@ fn a_process_running_from_an_ended_sessions_build_keeps_it() {
         unreachable!("a whole row");
     };
 
-    let mut tests = aterm_uds::spawnfd::command("/bin/sleep")
+    let mut tests = aterm_uds::spawnfd::command(crate::test_program::kept("/bin/sleep"))
         .arg("120")
         .current_dir(gone.join("debug/deps"))
         .spawn()
         .expect("a test binary's stand-in");
-    let seen = until_err(|| unused(owner, &row.path, &among(vec![tests.id()])));
+    let seen = until_said("working directory", || {
+        unused(owner, &row.path, &among(vec![tests.id()]))
+    });
     let err = real_among(now, vec![tests.id()])(&row).expect_err("a process works in deps/");
-    let shipped = remover(judge_at(now), crate::harness::disk::idle::Sessions::default)(&row)
-        .expect_err("the product reads it too");
+    let shipped = remover(
+        judge_at(now),
+        None,
+        crate::harness::disk::idle::Sessions::default,
+    )(&row)
+    .expect_err("the product reads it too");
     let _ = tests.kill();
     let _ = tests.wait();
     assert!(seen.is_err_and(|why| why.contains("working directory")));
@@ -2362,20 +2372,26 @@ fn a_process_running_from_an_ended_sessions_build_keeps_it() {
     assert!(shipped.to_string().contains(&user), "{shipped}");
     assert!(gone.join("debug/deps/liblay.rlib").exists());
 
-    let held = owner.dir().join("tasks/t1.output");
-    let mut holder = aterm_uds::spawnfd::command("/bin/sh")
-        .arg("-c")
-        .arg("exec 3<\"$1\"; exec /bin/sleep 120")
-        .arg("sh")
-        .arg(&held)
+    // One program from its start, the file its stdin: a shell that opened it and then exec'd
+    // another is unreadable for a moment mid-exec, after it was first seen holding the file.
+    let held = std::fs::File::open(owner.dir().join("tasks/t1.output")).expect("the task output");
+    let mut holder = aterm_uds::spawnfd::command(crate::test_program::kept("/bin/sleep"))
+        .arg("120")
+        .stdin(held)
         .current_dir("/")
         .spawn()
         .expect("a holder");
-    let seen = until_err(|| unused(owner, &row.path, &among(vec![holder.id()])));
+    let seen = until_said("open file", || {
+        unused(owner, &row.path, &among(vec![holder.id()]))
+    });
     let err = real_among(now, vec![holder.id()])(&row)
         .expect_err("a process holds a file of the session's");
-    let shipped = remover(judge_at(now), crate::harness::disk::idle::Sessions::default)(&row)
-        .expect_err("the product reads it too");
+    let shipped = remover(
+        judge_at(now),
+        None,
+        crate::harness::disk::idle::Sessions::default,
+    )(&row)
+    .expect_err("the product reads it too");
     let _ = holder.kill();
     let _ = holder.wait();
     assert!(seen.is_err_and(|why| why.contains("open file")));
@@ -2716,7 +2732,7 @@ fn a_recreated_worktree_or_a_process_inside_keeps_a_build_cache() {
     assert!(dir.join("debug/deps/liblay.rlib").is_file());
     std::fs::remove_dir_all(&ws).expect("removed again");
 
-    let mut inside = aterm_uds::spawnfd::command("/bin/sleep")
+    let mut inside = aterm_uds::spawnfd::command(crate::test_program::kept("/bin/sleep"))
         .arg("120")
         .current_dir(dir.join("debug"))
         .spawn()
@@ -2724,7 +2740,9 @@ fn a_recreated_worktree_or_a_process_inside_keeps_a_build_cache() {
     let Witness::OwnerGone { owner, .. } = &row.witness else {
         unreachable!("a whole row");
     };
-    let seen = until_err(|| unused(owner, &row.path, &among(vec![inside.id()])));
+    let seen = until_said("working directory", || {
+        unused(owner, &row.path, &among(vec![inside.id()]))
+    });
     let err = real_among(now, vec![inside.id()])(&row).expect_err("a process works inside");
     let _ = inside.kill();
     let _ = inside.wait();

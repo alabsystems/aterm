@@ -34,6 +34,23 @@ pub(crate) fn outlived_dir(prefix: &'static str) -> aterm_tempfile::TempDir {
     aterm_tempfile::TempDir::new_in(&root).expect("a scratch directory")
 }
 
+/// Write `text` as an `aterm.toml` that stands in for the person's own: owner-only (`0600`, as
+/// the config rule's refusal asks), whatever the umask. A plain write under a user-private-group
+/// login's umask `002` (Ubuntu's default) leaves it `664`, which the rule every reader of
+/// `aterm.toml` holds (`aterm_types::dirs::aterm_config_refusal`) refuses, so the test would read
+/// no config at all.
+#[cfg(test)]
+#[track_caller]
+pub(crate) fn write_config(path: &Path, text: impl AsRef<[u8]>) {
+    std::fs::write(path, text).expect("write the config");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .expect("make the config owner-only");
+    }
+}
+
 /// Per-test directory under `/tmp`, short enough for a Unix socket's `sun_path`.
 #[cfg(test)]
 #[track_caller]

@@ -1,23 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The System State tab (`docs/DESIGN-system-state-2026-10-21.md` §3): what
-//! this Mac reads now beside what aterm wants, in five groups. A group's
-//! `Set up │ Leave as is` choice takes effect at once. First launch admits
-//! its offer automatically at the first unblocked tick.
+//! The System State tab, the setup screen (`docs/DESIGN-init-on-by-default-2026-10-25.md` §4):
+//! what this Mac reads now beside what aterm wants, in five lines, each with its state, its live
+//! phrase and its switch, which takes effect at once; one pinned card for everything that needs
+//! the person; the lockup as the run's progress. First launch admits its offer automatically at
+//! the first unblocked tick, with no wait for a person. The row, headline and notes rules here
+//! are the page's model; [`lines`] says what the screen says from them and [`page`] draws it.
 
-mod paint;
+mod kitty;
+pub(crate) mod lines;
+mod lockup;
+mod marks;
+mod page;
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use aterm_grapheme::GraphemeClusters;
 use aterm_secrets::SecretBytes;
 use aterm_types::macos_setup::{
     Access, BASE_PLAN, FailureKind, Group, Observation, PassOutcome, Plan, PutBack, RestoreOutcome,
-    SYNC_OFF, Selection, Setting, Standing, Subject, SyncKind, TRIED_TWICE, Unfinished,
+    SYNC_OFF, Selection, Setting, StageRow, Standing, Subject, SyncKind, TRIED_TWICE, Unfinished,
 };
 
 use crate::native_app::{
@@ -26,14 +32,48 @@ use crate::native_app::{
     TextInputEvent, UpdateCx, ViewCx,
 };
 use crate::native_text_input::{TextInputProjection, TextInputState, TextSelection};
-use crate::native_ui::{
-    ActionId, AuditedCustomNode, ButtonSpec, Control, ControlState, GroupSpec, Insets, Layout,
-    Length, SemanticRole, SemanticValue, StyleRef, TextFieldSpec, TextSpec, UiContent, UiKey,
-    UiNode, UiTree,
-};
+use crate::native_ui::{UiKey, UiTree};
+use crate::system_state_host::PhraseOutcome;
 use crate::workstation_setup::{OfferKind, Request, SetupAnswer, WorkstationSetupDecision};
 
-pub(crate) use paint::{BrandSpec, Chip, paint_brand, paint_chip, paint_meter};
+pub(crate) use lockup::{LockupSpec, paint_lockup};
+#[cfg(any(test, feature = "bench-support"))]
+pub(crate) use marks::working_spinner;
+pub(crate) use marks::{paint_mark, paint_surface};
+
+/// Where a row stands, as the row rule says it (§3.3): its small mark on the page
+/// ([`lines::Mark`]) and the words a screen reader hears for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Chip {
+    /// Read as wanted.
+    InPlace,
+    /// Managed and differs; `busy` while its step runs.
+    WillChange { busy: bool },
+    /// A step waits for aterm to try it again, or for Check again (a stage aterm parked): calm,
+    /// nothing for the person to do here.
+    Waiting,
+    /// macOS waits for a person.
+    NeedsYou,
+    /// The last attempt failed.
+    Failed,
+    /// Its line is turned off: aterm leaves it as is.
+    LeftAsIs,
+}
+
+impl Chip {
+    /// What a screen reader hears for it, in the row's label.
+    pub(crate) fn spoken(self) -> &'static str {
+        match self {
+            Self::InPlace => "in place",
+            Self::WillChange { busy: false } => "will change",
+            Self::WillChange { busy: true } => "changing now",
+            Self::Waiting => "waiting",
+            Self::NeedsYou => "needs you",
+            Self::Failed => "failed",
+            Self::LeftAsIs => "left as is",
+        }
+    }
+}
 
 /// A non-secret snapshot published by setup's worker.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -93,23 +133,58 @@ pub struct SetupStatus {
     /// could not read (§3.5): every Mac preference group left as is, aterm's own permissions
     /// set up. The page says so in one calm note until a person chooses. Filled by the worker.
     pub recovered: bool,
-    /// A person's Cancel of the first-launch review stands (§3.3): every group reads Leave as
-    /// is, nothing runs, and the page says so in one calm line beside Set up now, which applies
-    /// the plan the review showed ([`CANCELLED_NOTE`]). Filled by the worker.
+    /// The saved setup holds a Cancel an older aterm's first-launch review recorded (§3.3): the
+    /// worker's plan has those groups turned off, so they read Leave as is and turn back on by
+    /// their switch, as any group a person left as is. The page says nothing more of it. Filled
+    /// by the worker.
     pub cancelled: bool,
-    /// The person closed this launch's review unanswered and no run is admitted (§3.3): the
-    /// page shows the plan the review showed with Set up now, calm, and lights nothing for the
-    /// permissions nobody approved: no Needs you, no diamond, no menu line. Filled by the worker.
-    pub unanswered: bool,
     /// Where an install of Apple's Command Line Tools stands, which the GitHub repositories row
-    /// waits on while they are missing (§3.3): its tab asks for the person's password, was
-    /// restored, or the installer runs. `None`: none, so the row's Install… opens the tab. Filled by
-    /// the window (`App::developer_tools_install_step`), never by the worker.
+    /// waits on while they are missing (§3.3): its tab asks for the person's password or was
+    /// restored, an install runs, Apple's own installer window waits for the person, or a press
+    /// of Install… waits for a macOS step or opened nothing. `None`: none of these, so the row's
+    /// Install… opens the tab. Filled by the window (`App::developer_tools_install_step`), never
+    /// by the worker.
     pub developer_tools: Option<ToolsInstall>,
+    /// What waits for another setup ([`Self::queued`]) is aterm's own: the automatic admission
+    /// of the groups this Mac's ALab signal adds, which nobody pressed (§3.5). The page says it
+    /// waits to add this Mac's ALab profile, never the person's choice. Filled by the worker.
+    pub queued_widen: bool,
+    /// The permission walk's page now and its place in the walk, which the Needs-you card says
+    /// beside its grant (`Step 1 of 3`). Filled by the window (`App::system_state_walk_page`),
+    /// never by the worker.
+    pub walk: Option<WalkPage>,
+    /// The automatic join has exceeded the initial observation interval. This is
+    /// diagnostic state; it does not turn admission into a person's approval task.
+    pub asking_long: bool,
+    /// How long the last setup run took from its start to its end, which the finished page says
+    /// (`ready in 1 min 12 s`). `None` before one finished in this process. Filled by the window,
+    /// never by the worker.
+    pub ready_in: Option<std::time::Duration>,
+    /// This Mac is an ALab Mac, as its secrets records say (`aterm_cli::macos_doctor::alab_mac`):
+    /// only an ALab Mac signs out of Messages and FaceTime, so elsewhere that line is out of
+    /// scope and its switch stays off. Filled by the worker.
+    pub alab: bool,
+    /// aterm saved this Mac's preferences before it changed them, so Restore previous settings
+    /// has something to put back: before that the footer offers no Restore. Filled by the
+    /// worker.
+    pub restorable: bool,
 }
 
-/// An install of Apple's Command Line Tools under way (§3.3), as the window sees it
-/// ([`SetupStatus::developer_tools`]).
+/// The permission walk's page now (`crate::permission_walk`), as the Needs-you card says it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WalkPage {
+    /// The grant its System Settings page is for.
+    pub access: Access,
+    /// The page's place, 1-based, among the pages the person sees.
+    pub at: usize,
+    /// How many pages the walk shows.
+    pub of: usize,
+}
+
+pub(crate) use lines::JOIN_QUIET;
+
+/// An install of Apple's Command Line Tools under way, or a press of Install… that is not (§3.3),
+/// as the window sees it ([`SetupStatus::developer_tools`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolsInstall {
     /// `Install…` was pressed while a macOS permission gesture held the dialog slot: the tab
@@ -121,9 +196,39 @@ pub enum ToolsInstall {
     /// A live installer tab was restored. Its exact prompt is not known: the person continues
     /// there, or closes it before retrying, and no second installer is opened.
     Recovered,
-    /// The installer runs (its on-demand placeholder, or Apple's own installer, is there): the
-    /// row waits, calmly, and moves on once the tools arrive.
+    /// An install runs (`softwareupdate` or Apple's installer holding the on-demand placeholder,
+    /// the tab's program outliving it, or the tab having said they are installed while the row's
+    /// next reading is still to come): the row waits, calmly, and moves on once the tools arrive.
     Installing,
+    /// Apple's own installer window waits for the person's Install or Agree press: they are
+    /// needed there.
+    AppleWindow,
+    /// The tab a person's Install… asked for did not open, for this reason: the row offers
+    /// Install… again and says why.
+    NotOpened(NotOpened),
+    /// Low Data Mode holds the tools' download back: the row waits, calmly, and the tab opens by
+    /// itself once the mode is off. Install… stays, for a person who turned it off.
+    LowData,
+    /// This account is none of the Mac's administrators, whom alone macOS lets install them: the
+    /// row says so, with no Install… that would only say it again, and no menu line, since
+    /// nothing here changes it.
+    NotAdmin,
+}
+
+/// Why the tab a person's Install… asked for did not open ([`ToolsInstall::NotOpened`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotOpened {
+    /// System State was no longer the front view of its window when the tab was ready.
+    LeftPage,
+}
+
+impl NotOpened {
+    /// The GitHub repositories row's note for it, in place of the reason the tools are needed.
+    pub(crate) const fn note(self) -> &'static str {
+        match self {
+            Self::LeftPage => TOOLS_NOT_OPENED_NOTE,
+        }
+    }
 }
 
 /// A read-only Check again or a Restore the window started: the worker is
@@ -204,6 +309,16 @@ impl SetupStatus {
     /// another setup ([`Self::queued`]).
     pub(crate) fn running(&self) -> bool {
         self.busy && self.operation.is_none() && !self.queued
+    }
+
+    /// Default ALab admission stays automatic while pending, with no approval card,
+    /// tab attention or menu request, including after its initial observation interval.
+    pub(crate) fn joins_quietly(&self) -> bool {
+        !self.newer()
+            && self.observed.iter().any(|row| {
+                row.subject == Subject::Setting(Setting::Secrets)
+                    && row.now.as_deref() == Some(aterm_types::macos_setup::VAULT_ASKING)
+            })
     }
 
     /// Readings valid for this vault source; the rest of the Mac is shared
@@ -308,7 +423,7 @@ impl SetupStatus {
     /// pause, [`Failure::retried`]) and no row they name needs a person
     /// ([`Failure::failed`]). A step naming a row `plan` no longer manages is
     /// left out. A Check's results are never among them: a Check only reads,
-    /// and pressing it again is its remedy, which the page's note says. A Restore that failed
+    /// and another Check is its remedy, which the page gives by itself. A Restore that failed
     /// as a whole is the page's alone (§3.4): its headline and note say it beside the button
     /// that tries it again.
     pub(crate) fn failed_steps<'a>(
@@ -353,20 +468,21 @@ impl SetupStatus {
     }
 
     /// Whether aterm tries `row`, a failed result, again by itself (§3.5): it is transient
-    /// ([`FailureKind::of_status`]), and the words it carries say so, or the run still retries
-    /// regardless of an older saved row's two-attempt wording. Meanwhile it counts as waiting,
-    /// and Set up now is no remedy the page
+    /// ([`FailureKind::of_status`]), and the words it carries say so (on its pause, or, a vault
+    /// try held after two, once this Mac's network or vault changes, [`TRIED_TWICE`]), or the run
+    /// still retries. Meanwhile it counts as waiting, calm, and Set up now is no remedy the page
     /// offers for it ([`Said::words`]).
     fn retries_by_itself(&self, row: &SetupStatusRow) -> bool {
         FailureKind::of_status(&row.status).is_some_and(FailureKind::retried)
-            && (row.detail == RETRIES_NOTE || self.retrying)
+            && (row.detail == RETRIES_NOTE || row.detail == TRIED_TWICE || self.retrying)
     }
 
     /// The reason a step the last run could not finish gives for `row` (§3.6): its words, in the
     /// page's terms (`The change did not take.`, `GitHub can't be reached`), which the row keeps
     /// as its note where its reading gives none. Never a Check's (a read, whose note says to
     /// press it again), a Restore's, a whole sentence said alone ([`Said::whole`]), or the words
-    /// of what comes next a vault try carries ([`RETRIES_NOTE`], [`TRIED_TWICE`]).
+    /// a vault try carries that say only what comes next ([`RETRIES_NOTE`]). A vault try held
+    /// after two says why and what comes next in one line ([`TRIED_TWICE`]), which the row keeps.
     fn step_reason<'a>(&'a self, plan: &'a Plan, row: Subject) -> Option<&'a str> {
         self.results(Some(plan))
             .find(|result| {
@@ -376,9 +492,40 @@ impl SetupStatus {
                     && !result.whole()
                     && !result.row.detail.trim().is_empty()
                     && result.row.detail != RETRIES_NOTE
-                    && result.row.detail != TRIED_TWICE
             })
             .map(|result| result.row.detail.as_str())
+    }
+
+    /// What the stage that changes `subject`'s row says of it while that stage waits
+    /// (init-on-by-default design §6.5): parked until Check again, after aterm stopped in it
+    /// twice or it took over an hour (a `waiting` stage row in the ledger's words), still running
+    /// past the hour in the aterm that runs it (a `running` one), or resuming after aterm stopped
+    /// (a `running` or `pending` one). `None` when its stage says none of these.
+    fn stage_says(&self, subject: Subject) -> Option<StageSays<'_>> {
+        if matches!(subject, Subject::Sync(_)) {
+            return None;
+        }
+        self.rows.iter().find_map(|row| {
+            let stage = StageRow::named(&row.name)?;
+            if !stage.settings.contains(&subject.setting()) {
+                return None;
+            }
+            match row.status.as_str() {
+                "waiting" if row.detail.ends_with(StageRow::PARKED_TAIL) => {
+                    Some(StageSays::Parked(row.detail.as_str()))
+                }
+                "waiting" if row.detail.ends_with(StageRow::HELD_TAIL) => {
+                    Some(StageSays::Held(row.detail.as_str()))
+                }
+                "running" if row.detail.ends_with(StageRow::STILL_RUNNING_TAIL) => {
+                    Some(StageSays::StillRunning(row.detail.as_str()))
+                }
+                "running" | "pending" if row.detail == StageRow::RESUMING => {
+                    Some(StageSays::Resuming(row.detail.as_str()))
+                }
+                _ => None,
+            }
+        })
     }
 
     /// The notes the page shows under its headline, in the page's own words
@@ -393,9 +540,6 @@ impl SetupStatus {
     /// leave it out.
     fn notes(&self, plan: &Plan) -> Vec<String> {
         let mut notes = Vec::new();
-        if self.cancelled {
-            notes.push(CANCELLED_NOTE.to_owned());
-        }
         if self.queued {
             notes.push(self.queued_note().to_owned());
         }
@@ -403,7 +547,7 @@ impl SetupStatus {
             notes.push(self.recovered_note(plan));
         }
         if self.widened && self.running() {
-            notes.push(WIDENED_NOTE.to_owned());
+            notes.push(widened_note(plan).to_owned());
         }
         // Each kind of result (whose, how it came out, the words it carries), with the
         // names it is said for, in the order first seen.
@@ -438,6 +582,26 @@ impl SetupStatus {
                         .as_deref()
                             == Some(result.row.detail.as_str())
                 });
+            // A vault try held after two says why and what comes next on its row: a note would
+            // say it again.
+            if result.on_row && result.row.detail == TRIED_TWICE {
+                continue;
+            }
+            // A step that failed is the card's (§4.8): its item says what failed, the reason its
+            // row keeps, and what aterm does next; and a row a run or a Check could not confirm
+            // says so on the row, which the headline names (`Not confirmed: …`). A note would say
+            // either again. Only words a failed step's row does not keep are a note's.
+            let managed_row =
+                subject_named(result.name).is_some_and(|subject| manages(plan.selection, subject));
+            let carded = (result.on_row || result.row.detail.is_empty())
+                && matches!(result.row.status.as_str(), "error" | "failed")
+                && !self.retries_by_itself(result.row);
+            if !result.name.starts_with(RESTORE_ROW)
+                && managed_row
+                && (carded || result.row.status == "unverified")
+            {
+                continue;
+            }
             match result.row.status.as_str() {
                 "not started" | "error" | "failed" | "unverified" | "restored" | NOTED => {
                     match alike.iter_mut().find(|(seen, _)| seen.alike(&result)) {
@@ -495,27 +659,45 @@ impl SetupStatus {
     }
 }
 
-/// The calm note a run aterm widened by itself carries while it goes (§3.5): it heard this
-/// Mac's ALab signal (the vault, or vault or fleet membership), so the groups it had left as
-/// is are set up now. It names that fact as [`ALAB_ADDED_NOTE`] does.
+/// What a stage says of a row it changes while it waits ([`SetupStatus::stage_says`]), in its
+/// own words.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StageSays<'a> {
+    /// Parked after it took over an hour: the row waits, calm, and the page checks again by
+    /// itself, which lifts the park ([`SystemStateApp::go_on_by_itself`]).
+    Parked(&'a str),
+    /// Parked after aterm stopped twice in it: the row waits, calm, until the person's Check
+    /// again lifts the park. Nothing lifts it by itself, which could stop aterm again.
+    Held(&'a str),
+    /// Past the hour and still running in the aterm that runs it: the row waits, calm, and
+    /// nothing offers Check again, which could change nothing while it runs.
+    StillRunning(&'a str),
+    /// Going again after aterm stopped in it.
+    Resuming(&'a str),
+}
+
+/// The one calm note of a plan aterm widened by itself (§3.5), from the moment the page shows the
+/// widened plan to the end of its run: it heard this Mac's ALab signal (the vault, or vault or
+/// fleet membership), so the groups it had left as is are set up now.
 pub(crate) const WIDENED_NOTE: &str =
     "This Mac is an ALab Mac, so aterm is setting up its profile.";
 
-/// The calm line while a person's Cancel of the first-launch review stands
-/// ([`SetupStatus::cancelled`]), beside Set up now.
-pub(crate) const CANCELLED_NOTE: &str =
-    "Setup was cancelled. Set up now applies the setup the review showed.";
-
-/// The headline while the review a person closed this launch waits for an answer
-/// ([`SetupStatus::unanswered`]), beside Set up now.
-pub(crate) const NOT_STARTED: &str = "Setup has not started";
-
-/// The calm line while a review shows the profile this Mac's ALab signal added (§3.5).
-pub(crate) const ALAB_ADDED_NOTE: &str = "This Mac is an ALab Mac, so its profile was added.";
+/// The calm line while aterm widens a plan an older aterm saved with its permissions alone to the
+/// base plan every Mac gets (`aterm_types::macos_setup::BASE_PLAN`), with no ALab signal: from
+/// the moment the page shows it to the end of its run, in place of [`WIDENED_NOTE`], which names
+/// the ALab profile.
+pub(crate) const SYNC_ADDED_NOTE: &str =
+    "Every Mac syncs now, so aterm added the Secrets vault and Rust in Spotlight.";
 
 /// The calm note while a person's choice waits for another setup ([`SetupStatus::queued`]).
 pub(crate) const QUEUED_CHOICE_NOTE: &str =
     "Another setup is running; aterm applies your choice when it finishes.";
+
+/// The calm note while the automatic admission of the groups aterm widens its own plan by (the
+/// ALab profile, or the base plan an older aterm's plan lacked) waits for another setup
+/// ([`SetupStatus::queued_widen`]).
+pub(crate) const QUEUED_WIDEN_NOTE: &str =
+    "Another setup is running; aterm adds the rest of this Mac's setup when it finishes.";
 
 /// The calm note while Restore previous settings waits for another setup
 /// ([`SetupStatus::queued`]).
@@ -604,9 +786,22 @@ impl SetupStatus {
     fn queued_note(&self) -> &'static str {
         if self.operation == Some(SetupOperation::Restore) {
             QUEUED_RESTORE_NOTE
+        } else if self.queued_widen {
+            QUEUED_WIDEN_NOTE
         } else {
             QUEUED_CHOICE_NOTE
         }
+    }
+}
+
+/// Why a plan aterm widened by itself changed (§3.5), for the widened `plan`: [`WIDENED_NOTE`]
+/// for the whole profile, which only the ALab signal adds; [`SYNC_ADDED_NOTE`] for the base plan
+/// an older aterm's plan lacked.
+fn widened_note(plan: &Plan) -> &'static str {
+    if plan.selection == Selection::all() {
+        WIDENED_NOTE
+    } else {
+        SYNC_ADDED_NOTE
     }
 }
 
@@ -858,9 +1053,12 @@ pub fn clear_setup_set_aside() {
 }
 
 /// The exceptions digest's entry for settings a person changed after this setup had them as
-/// wanted: setup leaves them as they are (no automatic pass rewrites a row that read back ok), a
-/// fact for later, never an alert, whose one navigation opens System State to set them again.
-/// `rows` names them, which the log keeps.
+/// wanted: setup keeps the person's change (no automatic pass rewrites a row that read back ok),
+/// a fact for later, never an alert. The change is theirs, so the entry asks nothing of them: it
+/// says only how to have aterm set them again, should they want it (turn the group off and on,
+/// which forgets the kept keys of the groups it turns on, init design §6.6), and its one
+/// navigation opens System State, where each such row reads "Changed by you". `rows` names
+/// them, which the log keeps.
 #[must_use]
 pub fn setup_changed_since_entry(rows: &str) -> aterm_messages::exceptions::Entry {
     use aterm_messages::need::{Reason, Then, Why};
@@ -870,15 +1068,20 @@ pub fn setup_changed_since_entry(rows: &str) -> aterm_messages::exceptions::Entr
         "changed-since",
         "Settings changed since setup",
         Why::OnlyYou(Reason::new(
-            "settings this Mac's setup had set were changed since, and setup leaves them as they are",
+            "you changed settings this Mac's setup had set, and setup keeps your change",
         )),
-        Then::step("Open System State and Set up now to set them again"),
+        Then::step(CHANGED_SINCE_STEP),
     )
     .show(aterm_messages::Intent::ReviewVaultSync)
     .log_line(format!(
         "System State: changed since setup set them, left as they are: {rows}"
     ))
 }
+
+/// What [`setup_changed_since_entry`] says to do, should the person want aterm to set their
+/// changed settings again: never Set up now, which no row the person changed offers.
+pub(crate) const CHANGED_SINCE_STEP: &str =
+    "To have aterm set them again, turn their group off and on in System State";
 
 /// Raise [`setup_changed_since_entry`] in the exceptions digest.
 #[cfg(unix)]
@@ -893,11 +1096,12 @@ pub fn clear_setup_changed_since() {
     crate::message_inbox::queue_exception_clear(setup_changed_since_entry("").key());
 }
 
-/// The exceptions digest's entry for setup an update successor did not offer (§3.3): an update
-/// may relaunch aterm with nobody at this Mac, so a setup nobody reviewed waits for the person,
-/// a fact for later whose one navigation opens System State, where they review and apply it.
-#[must_use]
-pub fn setup_unfinished_entry() -> aterm_messages::exceptions::Entry {
+/// The key of the exceptions digest's entry an older aterm raised when its update successor
+/// left setup unstarted ("Mac setup is unfinished"). No build raises it now: every launch, an
+/// update successor's included, starts setup at once (init-on-by-default design §6.1). The
+/// digest keeps an open entry across launches, so the key stays for [`clear_setup_unfinished`].
+#[cfg(unix)]
+fn setup_unfinished_key() -> String {
     use aterm_messages::need::{Reason, Then, Why};
     aterm_messages::exceptions::Entry::new(
         aterm_messages::exceptions::Family::Setup,
@@ -905,25 +1109,52 @@ pub fn setup_unfinished_entry() -> aterm_messages::exceptions::Entry {
         "unfinished",
         "Mac setup is unfinished",
         Why::OnlyYou(Reason::new(
-            "this Mac's setup needs your review, and an update relaunched aterm without it",
+            "an older aterm left this Mac's setup unstarted",
         )),
-        Then::step("Open System State to review and apply it"),
+        Then::step("Open System State"),
     )
-    .show(aterm_messages::Intent::ReviewVaultSync)
-    .log_line("System State: an update relaunched aterm; setup waits for its review")
+    .key()
 }
 
-/// Raise [`setup_unfinished_entry`] in the exceptions digest.
-#[cfg(unix)]
-pub fn note_setup_unfinished() {
-    crate::message_inbox::queue_exception(setup_unfinished_entry());
-}
-
-/// A setup run was admitted, or the review is on the page: [`setup_unfinished_entry`] leaves the
-/// exceptions digest.
+/// A setup run was admitted, or offered: the entry an older aterm raised when its update
+/// successor left setup unstarted leaves the exceptions digest ([`setup_unfinished_key`]).
 #[cfg(unix)]
 pub fn clear_setup_unfinished() {
-    crate::message_inbox::queue_exception_clear(setup_unfinished_entry().key());
+    crate::message_inbox::queue_exception_clear(setup_unfinished_key());
+}
+
+/// The exceptions digest's entry for aCaffiene, which aterm sets up to keep this Mac awake, that
+/// could not keep it awake for ten minutes (its mug cannot start, or macOS refuses its
+/// activity), while launchd starts it again and it asks macOS again by itself: a fact for later,
+/// never an alert. `why` is the trouble the mug recorded, which the log keeps.
+#[must_use]
+pub fn keep_awake_failing_entry(why: &str) -> aterm_messages::exceptions::Entry {
+    use aterm_messages::need::{Reason, Then, Why};
+    aterm_messages::exceptions::Entry::new(
+        aterm_messages::exceptions::Family::Setup,
+        "",
+        "keep-awake",
+        "aCaffiene cannot keep this Mac awake",
+        Why::Spent {
+            tried: Reason::new("kept this Mac awake with aCaffiene for ten minutes"),
+            reason: Reason::new("its mug keeps failing, and aterm starts it again by itself"),
+        },
+        Then::step("Run aterm doctor and read its awake row"),
+    )
+    .log_line(format!("aCaffiene: not keeping this Mac awake: {why}"))
+}
+
+/// Raise [`keep_awake_failing_entry`] in the exceptions digest.
+#[cfg(unix)]
+pub fn note_keep_awake_failing(why: &str) {
+    crate::message_inbox::queue_exception(keep_awake_failing_entry(why));
+}
+
+/// The mug keeps this Mac awake again, or the person turned it off:
+/// [`keep_awake_failing_entry`] leaves the exceptions digest.
+#[cfg(unix)]
+pub fn clear_keep_awake_failing() {
+    crate::message_inbox::queue_exception_clear(keep_awake_failing_entry("").key());
 }
 
 /// The rows of `outcome` that came out `how`, in its order.
@@ -1127,9 +1358,13 @@ impl Said<'_> {
 /// The headline while rows are read: a Check going, or readings still to come.
 const CHECKING: &str = "Checking this Mac…";
 
+/// The headline while every group is left as is (§3.3): calm, with no button, since each group
+/// turns back on by its own switch.
+pub(crate) const EVERYTHING_LEFT_AS_IS: &str = "Everything is left as is";
+
 /// The headline while the first launch's offer waits for the page's own answer, which it gives
-/// on its first tick with a person at this Mac (design revision 4: no review, no countdown, no
-/// confirmation): the only signal it gives; no diamond, no menu line.
+/// on its first tick (design revision 4: no review, no countdown, no confirmation, and no wait for
+/// a person), or once a busy page is free: the only signal it gives; no diamond, no menu line.
 pub(crate) const STARTING_HEADLINE: &str = "Starting this Mac's setup";
 
 /// The headline while a newer aterm's setup is in force ([`SetupStatus::newer`]): calm, and the
@@ -1144,10 +1379,10 @@ const SETUP_RETRIED: &str = "Waiting to try setup again…";
 /// a pass failed before its stages): no System State row, and the note's own words.
 pub const SETUP_ROW: &str = "Setup";
 
-/// What the page says after `Check again failed.`: the rows keep their last readings meanwhile,
-/// and the button is its own remedy, said calmly. The log keeps why.
+/// What the page says after `Check again failed.`: the lines keep their last readings meanwhile,
+/// and the page checks again by itself, said calmly. The log keeps why.
 pub const CHECK_FAILED_NOTE: &str =
-    "The rows show what aterm read before; pressing it again reads them anew.";
+    "The lines show what aterm read before; aterm checks again by itself.";
 
 /// What the page says under a Restore that failed as a whole (headlined `Restore previous
 /// settings failed`) for a reason the page has no words of its own for. The log keeps why.
@@ -1212,9 +1447,9 @@ pub fn calm_setup_row(words: &str) -> SetupStatusRow {
 /// ([`aterm_types::macos_setup::TRIES_AGAIN_BY_ITSELF`]).
 pub(crate) const RETRIES_NOTE: &str = aterm_types::macos_setup::TRIES_AGAIN_BY_ITSELF;
 
-/// What a failed step's note says once the run no longer retries it: the headline's Set up now
-/// runs it again (§3.2).
-pub(crate) const SET_UP_NOW_NOTE: &str = "Set up now tries again.";
+/// What a failed step's note says once the run no longer retries it: the page runs it again by
+/// itself, a little later each time (§3.2, revision 4), so nobody has to press anything.
+pub(crate) const SET_UP_NOW_NOTE: &str = "aterm tries it again by itself.";
 
 /// Empty preedit clears platform composition state without any typed input.
 pub(crate) const fn text_input_interacts(event: &TextInputEvent) -> bool {
@@ -1227,7 +1462,7 @@ pub(crate) const fn text_input_interacts(event: &TextInputEvent) -> bool {
 /// admission receipt to the worker (`InitialSetupApplyReceipt::admission`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Admission {
-    /// The first-run offer's automatic answer while a person is at this Mac.
+    /// The first-run offer's automatic answer, which waits for nobody.
     Automatic,
     /// A person pressed the page.
     Person,
@@ -1283,10 +1518,100 @@ pub(crate) enum SystemStateAction {
     /// The GitHub repositories row's Install…: the terminal tab that installs Apple's Command
     /// Line Tools opens now (`App::press_developer_tools_install`).
     InstallDeveloperTools { by_person: bool },
+    /// The password headline's Go to tab: the Command Line Tools tab comes to the front
+    /// (`App::go_to_developer_tools_tab`).
+    GoToToolsTab,
+    /// A Copy Command: the line a vault admin runs to save a new GitHub token
+    /// ([`aterm_types::macos_setup::GITHUB_TOKEN_COMMAND`]), or the one an admin Mac runs to
+    /// approve this Mac, goes on the clipboard, for a person's press alone.
+    CopyCommand { command: String, by_person: bool },
+    /// The Secrets vault row's Join under its phrase field: ALab lets this Mac in with the phrase
+    /// a member shows once its person pressed Allow (`InitialSetupHandlers::join_phrase`), its
+    /// words as typed, blanks between them made one, and the try they are ([`PhraseTry`]), which
+    /// the join's answer names ([`SystemStateApp::phrase_finished`]).
+    JoinPhrase(SecretBytes, PhraseTry),
+}
+
+/// One try of a phrase typed on the Secrets vault row ([`SystemStateAction::JoinPhrase`]): which
+/// words a join's answer is about. Numbered across the process, so a page opened again while an
+/// earlier page's try runs never takes that try's answer for one of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PhraseTry(u64);
+
+impl PhraseTry {
+    /// A try no earlier one of this process was.
+    fn next() -> Self {
+        static TRIES: AtomicU64 = AtomicU64::new(0);
+        Self(TRIES.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+/// One text input to a plain field's words (`input`); Return and Escape change none.
+fn edit_text(input: &mut TextInputState, event: TextInputEvent) {
+    match event {
+        TextInputEvent::Commit(text) => input.insert(&text),
+        TextInputEvent::Preedit { text, selection } => input.set_preedit(text, selection),
+        TextInputEvent::Backspace => input.delete_backward(),
+        TextInputEvent::Delete => input.delete_forward(),
+        TextInputEvent::Left { extend } => input.move_left(extend),
+        TextInputEvent::Right { extend } => input.move_right(extend),
+        TextInputEvent::WordLeft { extend } => input.move_word_left(extend),
+        TextInputEvent::WordRight { extend } => input.move_word_right(extend),
+        TextInputEvent::Home { extend } => input.move_to_start(extend),
+        TextInputEvent::End { extend } => input.move_to_end(extend),
+        TextInputEvent::KillToEnd => input.kill_to_end(),
+        TextInputEvent::KillToStart => input.kill_to_start(),
+        TextInputEvent::DeleteWordBackward => input.delete_word_backward(),
+        TextInputEvent::DeleteWordForward => input.delete_word_forward(),
+        TextInputEvent::SelectAll => input.select_all(),
+        TextInputEvent::Undo => {
+            input.undo();
+        }
+        TextInputEvent::Redo => {
+            input.redo();
+        }
+        TextInputEvent::Submit | TextInputEvent::Cancel => {}
+    }
 }
 
 /// The key of the Secrets vault row's Turn On Sync button.
 const TURN_ON_SYNC: &str = "system-state/row/secrets/sync-on";
+
+/// The Secrets vault row's field for the phrase a Mac in ALab shows once its person presses Allow
+/// (`docs/DESIGN-fluid-swarm-2026-10-28.md` §3.6 step 5), there while the row reads
+/// [`aterm_types::macos_setup::VAULT_ASKING`]: the join runs in the window, so the person types
+/// the phrase here and never in a terminal.
+pub(crate) const PHRASE_FIELD: &str = "system-state/vault/phrase";
+
+/// The phrase field's Join.
+pub(crate) const PHRASE_JOIN: &str = "system-state/vault/phrase-join";
+
+/// The line under the phrase field before a try.
+pub(crate) const PHRASE_HELP: &str =
+    "Type the three words a Mac in ALab shows once you press Allow on it.";
+
+/// The line under the phrase field once a phrase did not let this Mac in: a phrase is good for
+/// one try, so the member's person presses Allow again for a new one. Why it failed goes to the
+/// log, never the page.
+pub(crate) const PHRASE_REFUSED: &str = "That phrase did not let this Mac in. Press Allow again on a Mac in ALab, then type the new \
+     phrase it shows.";
+
+/// The line under the phrase field once a try reached no Mac in ALab: nothing was asked of the
+/// phrase, so the words stay in the field, good for another Join, and the line says what helps.
+pub(crate) const PHRASE_NOT_REACHED: &str = "No Mac in ALab answered on this network yet, so \
+    the phrase is still good. Make sure the Mac that showed it is awake and on this network, \
+    then press Join again.";
+
+/// [`PHRASE_NOT_REACHED`] while this Mac reads macOS's Local Network switch for aterm off: macOS
+/// let the join reach no Mac, so the line names that switch and where it is, not the other Mac.
+pub(crate) const PHRASE_LOCAL_NETWORK_OFF: &str = "macOS's Local Network switch for aterm is \
+    off, so the phrase reached no Mac and is still good. Turn aterm on in System Settings > \
+    Privacy & Security > Local Network, then press Join again.";
+
+/// The line under the phrase field once a try stopped before it said what the phrase came to
+/// (its worker ended): the words stay in the field, and Join tries again.
+pub(crate) const PHRASE_STOPPED: &str = "The try with this phrase stopped before it finished. \
+    The words are still here: press Join to try again.";
 
 /// Whether `status` reads the Secrets row as waiting for input here: it needs the person and
 /// carries no note (a note is a code an admin Mac approves, or a step elsewhere).
@@ -1327,15 +1652,6 @@ pub(crate) fn row_slug(subject: Subject) -> &'static str {
     }
 }
 
-/// The words a Needs-you row's button says (§3.4), and the shorter ones the
-/// headline's button paints.
-fn open_words(access: Access) -> (String, &'static str) {
-    match access {
-        Access::Debugger => (format!("Turn On {}…", access.name()), "Turn On…"),
-        _ => (format!("Open {}", access.name()), "Open"),
-    }
-}
-
 /// A row's value, in the words a probe read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RowValue {
@@ -1369,23 +1685,36 @@ pub(crate) struct RowView {
     /// this Mac's sync off, which reads in place as their choice (§3.3).
     pub(crate) turn_on_sync: bool,
     /// The GitHub repositories row's Install… button: Apple's Command Line Tools are missing
-    /// and nothing installs them, so a press opens their terminal tab (§3.3).
+    /// and nothing installs them (Low Data Mode holding them back included), so a press opens
+    /// their terminal tab (§3.3).
     pub(crate) install_tools: bool,
+    /// The GitHub repositories row's Copy Command button: GitHub refuses the vault's token, and
+    /// only a vault admin saves a new one, with the line it copies
+    /// ([`aterm_types::macos_setup::GITHUB_TOKEN_COMMAND`]).
+    pub(crate) copy_command: bool,
     /// Where the row stands (`None`: not read yet).
     pub(crate) standing: Option<Standing>,
+    /// The person changed the row after aterm set it (design §6.6): it differs, as they left
+    /// it, and no automatic pass sets it again, so it is no change to make.
+    pub(crate) changed_by_you: bool,
     /// What a screen reader hears for the row.
     pub(crate) label: String,
 }
 
 impl RowView {
     /// A managed row that is not yet as wanted (it will change, needs a
-    /// person, or failed).
+    /// person, or failed), unless the person changed it after aterm set it, and not waiting
+    /// ([`Chip::Waiting`]).
     fn to_change(&self) -> bool {
         self.managed
+            && !self.changed_by_you
             && matches!(
                 self.standing,
                 Some(Standing::Differs | Standing::Waiting | Standing::NeedsYou | Standing::Failed)
             )
+            // A row whose step waits for aterm's next try, or for Check again, is no change a
+            // press of Set up now makes.
+            && self.chip != Some(Chip::Waiting)
     }
 
     fn settled(&self) -> bool {
@@ -1481,7 +1810,9 @@ fn row_view_as(
             open: None,
             turn_on_sync: false,
             install_tools: false,
+            copy_command: false,
             standing,
+            changed_by_you: false,
             label: format!("{name}: {spoken_read}, left as is"),
         };
     }
@@ -1500,7 +1831,9 @@ fn row_view_as(
             open: None,
             turn_on_sync: false,
             install_tools: false,
+            copy_command: false,
             standing,
+            changed_by_you: false,
             label: format!("{name}: not needed"),
         };
     }
@@ -1537,6 +1870,13 @@ fn row_view_as(
         && status.access_step == Some(Access::Debugger);
     // The review reads a row that will need a person as one that will change (§3.3).
     let standing = match standing {
+        Some(Standing::NeedsYou)
+            if subject == Subject::Setting(Setting::Secrets)
+                && reading.and_then(|row| row.now.as_deref())
+                    == Some(aterm_types::macos_setup::VAULT_ASKING) =>
+        {
+            Some(Standing::Waiting)
+        }
         Some(Standing::NeedsYou) if review => Some(Standing::Differs),
         standing => standing,
     };
@@ -1555,12 +1895,50 @@ fn row_view_as(
             note = Some(TOOLS_QUEUED_NOTE.to_owned());
             Some(Standing::Waiting)
         }
+        Some(ToolsWait::LowData) => {
+            note = Some(TOOLS_LOW_DATA_NOTE.to_owned());
+            Some(Standing::Waiting)
+        }
         _ => standing,
+    };
+    // A stage that waits (init-on-by-default design §6.5) says so on the rows it changes that are
+    // not yet as wanted, in its own words: parked until Check again, the row waits, calm, which
+    // the headline's Check again answers; resuming after aterm stopped, the row says so beside
+    // what it changes to. A row that reads as wanted, needs a person or failed keeps its own, as
+    // does one the person changed after aterm set it, which no stage sets again.
+    let stage = (!review)
+        .then(|| status.stage_says(subject))
+        .flatten()
+        .filter(|_| {
+            matches!(
+                standing,
+                None | Some(Standing::Unknown | Standing::Differs | Standing::Waiting)
+            ) && note.as_deref() != Some(aterm_types::macos_setup::CHANGED_BY_YOU)
+        });
+    let standing = match stage {
+        Some(
+            StageSays::Parked(words) | StageSays::Held(words) | StageSays::StillRunning(words),
+        ) => {
+            note = Some(words.to_owned());
+            Some(Standing::Waiting)
+        }
+        Some(StageSays::Resuming(words)) => {
+            if note.as_deref().is_none_or(|note| note.trim().is_empty()) {
+                note = Some(words.to_owned());
+            }
+            standing
+        }
+        None => standing,
     };
     let open = match subject {
         Subject::Access(access) if standing == Some(Standing::NeedsYou) && !asking => Some(access),
         _ => None,
     };
+    let token_refused = subject == Subject::Setting(Setting::Repositories)
+        && standing == Some(Standing::NeedsYou)
+        && reading.and_then(|o| o.note.as_deref())
+            == Some(aterm_types::macos_setup::GITHUB_TOKEN_REFUSED);
+    let copy_command = !review && token_refused;
     // The vault read in place at Sync off is the person's opt-out: its row turns it back on,
     // quietly, unless it reads as what Apply will do, which acts on nothing yet. The base plan's
     // vault read in place not joined, where none answers, has no sync to turn on.
@@ -1570,7 +1948,7 @@ fn row_view_as(
         && wanted == SYNC_OFF;
     // A step the last run said of this row (§3.6): one the page says failed takes the failed
     // chip, though the row reads in place, and one aterm tries again by itself the waiting one,
-    // as the headline and the village say them. A step whose row needs a person says nothing of
+    // as the headline and the card say them. A step whose row needs a person says nothing of
     // its own: the row's reading says it.
     let plan = Plan {
         selection,
@@ -1584,7 +1962,7 @@ fn row_view_as(
         if said.iter().any(Failure::failed) {
             Some(Chip::Failed)
         } else if said.iter().any(|failure| failure.retried) {
-            Some(Chip::WillChange { busy })
+            Some(retry_chip(busy))
         } else {
             None
         }
@@ -1608,6 +1986,10 @@ fn row_view_as(
     } else {
         (Some(Chip::InPlace), "in place")
     };
+    // A row the person changed after aterm set it (design §6.6), read as they left it below,
+    // while a pass runs its stage too, since that pass keeps the person's value.
+    let changed_by_you = standing == Some(Standing::Differs)
+        && note.as_deref() == Some(aterm_types::macos_setup::CHANGED_BY_YOU);
     let (value, chip, label) = match standing {
         None => (
             RowValue::One("—".to_owned()),
@@ -1660,18 +2042,23 @@ fn row_view_as(
                 format!("{name}: {wanted}, {settled_words}"),
             )
         }
-        // A row the person changed after aterm set it (design §6.9): no automatic pass sets it
-        // again, so it reads as they left it, under its note, with no chip saying it will
-        // change; Set up now sets it again.
-        Some(Standing::Differs)
-            if !busy && note.as_deref() == Some(aterm_types::macos_setup::CHANGED_BY_YOU) =>
-        {
-            (
-                RowValue::One(from.clone()),
-                None,
-                format!("{name}: {spoken_from}, changed by you"),
-            )
-        }
+        // A row the person changed after aterm set it (init design §6.6): no automatic pass sets
+        // it again, so it reads as they left it, under its note, with no chip saying it will
+        // change, while a pass runs its stage too, since that pass keeps the person's value.
+        // Turning its group off and on, or Set up now, has aterm set it again.
+        Some(Standing::Differs) if changed_by_you => (
+            RowValue::One(from.clone()),
+            None,
+            format!("{name}: {spoken_from}, changed by you"),
+        ),
+        // A row that waits on something its note names (a vault to answer, a member's Allow
+        // recorded, the Command Line Tools installing, Check again for a stage aterm parked) is
+        // calm: `Waiting`, never a change a press makes, until its step runs.
+        Some(Standing::Waiting) if !busy => (
+            change(),
+            Some(Chip::Waiting),
+            format!("{name}: {spoken_from}, waiting to change to {wanted}"),
+        ),
         // The probe's own note only (set above): never the description.
         Some(Standing::Differs | Standing::Waiting) => {
             let chip = Chip::WillChange { busy };
@@ -1689,14 +2076,23 @@ fn row_view_as(
             )
         }
         Some(Standing::NeedsYou) => {
-            note = if asking {
-                Some(PASSWORD_NOTE.to_owned())
-            } else if tools == Some(ToolsWait::Password) {
-                Some(TOOLS_PASSWORD_NOTE.to_owned())
-            } else if tools == Some(ToolsWait::Recovered) {
-                Some(TOOLS_RECOVERED_NOTE.to_owned())
-            } else {
-                explained()
+            note = match tools {
+                _ if asking => Some(PASSWORD_NOTE.to_owned()),
+                Some(ToolsWait::Password) => Some(TOOLS_PASSWORD_NOTE.to_owned()),
+                Some(ToolsWait::Recovered) => Some(TOOLS_RECOVERED_NOTE.to_owned()),
+                Some(ToolsWait::AppleWindow) => Some(APPLE_WINDOW_NOTE.to_owned()),
+                Some(ToolsWait::NotAdmin) => Some(TOOLS_NOT_ADMIN_NOTE.to_owned()),
+                // Install… says what to do; the note says why, or why the last press opened
+                // nothing.
+                Some(ToolsWait::Missing { refused }) => Some(
+                    refused
+                        .map_or(TOOLS_NEEDED_NOTE, NotOpened::note)
+                        .to_owned(),
+                ),
+                // GitHub refuses the vault's token: the note says who renews it and the line they
+                // run, which the row's Copy Command puts on the clipboard.
+                _ if token_refused => Some(GITHUB_TOKEN_RENEW_NOTE.to_owned()),
+                _ => explained(),
             };
             (
                 change(),
@@ -1705,7 +2101,7 @@ fn row_view_as(
             )
         }
         // A reading that failed keeps its reason in its note. While the run still retries it
-        // waits for the next try (§3.5), as the headline and the village say: the waiting chip,
+        // waits for the next try (§3.5), as the headline and its line say: the waiting chip,
         // never Failed, unless a step nothing tries again says the row failed.
         Some(Standing::Failed) => {
             note = reading.and_then(|o| o.detail.clone().or_else(|| o.note.clone()));
@@ -1716,10 +2112,11 @@ fn row_view_as(
                     format!("{name}: {spoken_from}, failed"),
                 )
             } else {
+                let chip = retry_chip(busy);
                 (
                     change(),
-                    Some(Chip::WillChange { busy }),
-                    format!("{name}: {spoken_from}, {RETRY_WORDS}"),
+                    Some(chip),
+                    format!("{name}: {spoken_from}, {}", retry_words(chip)),
                 )
             }
         }
@@ -1732,7 +2129,7 @@ fn row_view_as(
             let words = if said == Chip::Failed {
                 "failed"
             } else {
-                RETRY_WORDS
+                retry_words(said)
             };
             (Some(said), format!("{name}: {spoken_read}, {words}"))
         }
@@ -1765,15 +2162,46 @@ fn row_view_as(
         note,
         open,
         turn_on_sync,
-        install_tools: tools == Some(ToolsWait::Missing),
+        install_tools: matches!(tools, Some(ToolsWait::Missing { .. } | ToolsWait::LowData)),
+        copy_command,
         standing,
+        changed_by_you,
         label,
     }
 }
 
+/// The GitHub repositories row's note when GitHub refuses the vault's token
+/// ([`aterm_types::macos_setup::GITHUB_TOKEN_REFUSED`]): who renews it, and the exact line they
+/// run, which the row's Copy Command ([`COPY_TOKEN_COMMAND`]) copies.
+pub(crate) const GITHUB_TOKEN_RENEW_NOTE: &str = "GitHub refuses your token, and only a vault \
+     admin can save a new one: with a new token from GitHub copied, they run this on their Mac: \
+     pbpaste | aterm secrets set gh_access_token";
+
+/// The GitHub repositories row's Copy Command button ([`RowView::copy_command`]).
+pub(crate) const COPY_TOKEN_COMMAND: &str = "system-state/row/repositories/copy-command";
+
 /// What a screen reader hears of a row whose step aterm tries again by itself (§3.5), after its
-/// value: the waiting chip's words would say it will change, which is the next try's to say.
+/// value, beside the calm `Waiting` chip, whose word it opens with: the next try is aterm's.
 const RETRY_WORDS: &str = "waiting for aterm to try again";
+
+/// The chip of a row whose step aterm tries again by itself (§3.5): `Waiting`, calm, until that
+/// try runs (`busy`), when it changes now.
+const fn retry_chip(busy: bool) -> Chip {
+    if busy {
+        Chip::WillChange { busy: true }
+    } else {
+        Chip::Waiting
+    }
+}
+
+/// What a screen reader hears of a retried row beside `chip` ([`retry_chip`]): the words the chip
+/// says, in full.
+fn retry_words(chip: Chip) -> &'static str {
+    match chip {
+        Chip::Waiting => RETRY_WORDS,
+        chip => chip.spoken(),
+    }
+}
 
 /// The note of a waiting row whose probe gave no reason: it is blocked on
 /// something, and nothing more can be said of it.
@@ -1786,9 +2214,14 @@ pub(crate) const PASSWORD_NOTE: &str =
     "Waiting for your administrator password in the SamplingTools dialog";
 
 /// The headline while the Command Line Tools tab asks for the person's password
-/// ([`ToolsInstall::Password`]): they are needed there now (§3.2).
+/// ([`ToolsInstall::Password`]): they are needed there now (§3.2), and its Go to tab button
+/// ([`GO_TO_TOOLS_TAB`]) brings that tab to the front.
 pub(crate) const TOOLS_PASSWORD_HEADLINE: &str =
     "Enter your password in the Command Line Tools tab";
+
+/// The button of a headline that names the Command Line Tools tab (its password, or its restored
+/// session): that tab comes to the front.
+pub(crate) const GO_TO_TOOLS_TAB: &str = "system-state/headline/go-to-tab";
 
 /// The GitHub repositories row's note while the Command Line Tools tab asks for the password,
 /// which takes the place of its Install… button.
@@ -1796,12 +2229,14 @@ pub(crate) const TOOLS_PASSWORD_NOTE: &str =
     "Waiting for your password in the Command Line Tools tab";
 
 /// The headline for a restored live installer tab: its command may not have started before
-/// recovery, so no particular prompt is claimed.
+/// recovery, so no particular prompt is claimed. Its Go to tab ([`GO_TO_TOOLS_TAB`]) brings that
+/// tab to the front.
 pub(crate) const TOOLS_RECOVERED_HEADLINE: &str = "Continue in the Command Line Tools tab";
 
-/// The recovered tab remains the place to continue, or the person closes it before retrying.
+/// The recovered tab remains the place to continue, or the person closes it before trying again.
+/// It names the tab as its title and the headline do.
 pub(crate) const TOOLS_RECOVERED_NOTE: &str =
-    "Installer tab restored. Continue there, or close it to retry.";
+    "Command Line Tools tab restored. Continue there, or close it to try again.";
 
 /// The GitHub repositories row's calm note while `Install…` is queued behind a macOS permission
 /// gesture ([`ToolsInstall::Queued`]): nobody needs to press `Install…` again, and the tab opens
@@ -1813,6 +2248,34 @@ pub(crate) const TOOLS_QUEUED_NOTE: &str =
 /// ([`ToolsInstall::Installing`]): nobody needs to act, and the row moves on once they arrive.
 pub(crate) const INSTALLING_TOOLS_NOTE: &str = "Installing Apple's Command Line Tools…";
 
+/// The GitHub repositories row's note while Install… shows: why the tools are needed, naming
+/// them.
+pub(crate) const TOOLS_NEEDED_NOTE: &str =
+    "Git and your GitHub repositories need Apple's Command Line Tools.";
+
+/// The label of the card's button that installs the tools ([`INSTALL_TOOLS`]), which it shows
+/// and VoiceOver hears.
+pub(crate) const INSTALL_TOOLS_LABEL: &str = "Install Command Line Tools…";
+
+/// The GitHub repositories row's note while Apple's own installer window waits for the person's
+/// press ([`ToolsInstall::AppleWindow`]).
+pub(crate) const APPLE_WINDOW_NOTE: &str = "Finish in Apple's installer window";
+
+/// The GitHub repositories row's note when the tab a press of Install… asked for did not open
+/// because System State was no longer in front ([`NotOpened::LeftPage`]); Install… is there again.
+pub(crate) const TOOLS_NOT_OPENED_NOTE: &str =
+    "The installer did not open: System State was no longer in front.";
+
+/// The GitHub repositories row's calm note while Low Data Mode holds the tools' download back
+/// ([`ToolsInstall::LowData`]): the tab opens by itself once the mode is off.
+pub(crate) const TOOLS_LOW_DATA_NOTE: &str =
+    "Waiting for Low Data Mode to be off (System Settings \u{203a} Network)";
+
+/// The GitHub repositories row's note when this account may not install the tools
+/// ([`ToolsInstall::NotAdmin`]), in place of Install….
+pub(crate) const TOOLS_NOT_ADMIN_NOTE: &str =
+    "Only an administrator of this Mac can install Apple's Command Line Tools";
+
 /// The GitHub repositories row's button while Apple's Command Line Tools are missing and nothing
 /// installs them: it opens their terminal tab, whose one password prompt installs them.
 pub(crate) const INSTALL_TOOLS: &str = "system-state/row/repositories/install";
@@ -1821,16 +2284,35 @@ pub(crate) const INSTALL_TOOLS: &str = "system-state/row/repositories/install";
 /// runs (§3.3), once its reading needs a person to install them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ToolsWait {
-    /// Nothing installs them: the row's Install… opens their tab.
-    Missing,
+    /// Nothing installs them: the row's Install… opens their tab. `refused` says why a person's
+    /// last press opened nothing.
+    Missing { refused: Option<NotOpened> },
     /// `Install…` is queued behind a macOS permission step holding the dialog slot.
     Queued,
     /// Their tab asks for the person's password.
     Password,
     /// Their live tab was restored; no particular prompt is known.
     Recovered,
-    /// The installer runs.
+    /// An install runs.
     Installing,
+    /// Apple's own installer window waits for the person.
+    AppleWindow,
+    /// Low Data Mode holds the download back; the tab opens by itself once it is off.
+    LowData,
+    /// This account may not install them: only an administrator of the Mac can.
+    NotAdmin,
+}
+
+impl ToolsWait {
+    /// Whether the wait needs nobody here: one that runs or ends by itself (an install, a queued
+    /// press, Low Data Mode), or one no press here changes (an account that may not install
+    /// them). Calm: no menu line.
+    pub(crate) const fn calm(self) -> bool {
+        matches!(
+            self,
+            Self::Installing | Self::Queued | Self::LowData | Self::NotAdmin
+        )
+    }
 }
 
 impl SetupStatus {
@@ -1843,21 +2325,28 @@ impl SetupStatus {
             && reading.note.as_deref()
                 == Some(aterm_types::macos_setup::COMMAND_LINE_TOOLS_MISSING))
         .then_some(match self.developer_tools {
-            None => ToolsWait::Missing,
+            None => ToolsWait::Missing { refused: None },
+            Some(ToolsInstall::NotOpened(why)) => ToolsWait::Missing { refused: Some(why) },
             Some(ToolsInstall::Queued) => ToolsWait::Queued,
             Some(ToolsInstall::Password) => ToolsWait::Password,
             Some(ToolsInstall::Recovered) => ToolsWait::Recovered,
             Some(ToolsInstall::Installing) => ToolsWait::Installing,
+            Some(ToolsInstall::AppleWindow) => ToolsWait::AppleWindow,
+            Some(ToolsInstall::LowData) => ToolsWait::LowData,
+            Some(ToolsInstall::NotAdmin) => ToolsWait::NotAdmin,
         })
+    }
+
+    /// The GitHub repositories reading for the plan in force, if one.
+    pub(crate) fn repositories_reading(&self) -> Option<&Observation> {
+        let repositories = Subject::Setting(Setting::Repositories);
+        self.observations_for(self.plan.as_ref().map(|plan| plan.vault_url.as_str()))
+            .find(|observation| observation.subject == repositories)
     }
 
     /// [`Self::tools_wait`] of the GitHub repositories reading for the plan in force.
     pub(crate) fn repositories_tools_wait(&self) -> Option<ToolsWait> {
-        let repositories = Subject::Setting(Setting::Repositories);
-        self.tools_wait(
-            self.observations_for(self.plan.as_ref().map(|plan| plan.vault_url.as_str()))
-                .find(|observation| observation.subject == repositories),
-        )
+        self.tools_wait(self.repositories_reading())
     }
 }
 
@@ -1905,7 +2394,9 @@ fn rows_as_they_stand(status: &SetupStatus) -> Vec<RowView> {
                 open: None,
                 turn_on_sync: false,
                 install_tools: false,
+                copy_command: false,
                 standing: reading.map(|observation| observation.standing),
+                changed_by_you: false,
                 label,
             }
         })
@@ -1920,7 +2411,8 @@ pub(crate) fn rows(status: &SetupStatus, selection: Selection) -> Vec<RowView> {
         .collect()
 }
 
-/// A group's choice, read from the plan's bits.
+/// A group's choice, read from the plan's bits (a test's read of the plan).
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GroupChoice {
     SetUp,
@@ -1929,6 +2421,7 @@ pub(crate) enum GroupChoice {
     Partly,
 }
 
+#[cfg(test)]
 pub(crate) fn group_choice(group: Group, selection: Selection) -> GroupChoice {
     let set = group
         .settings()
@@ -1944,34 +2437,6 @@ pub(crate) fn group_choice(group: Group, selection: Selection) -> GroupChoice {
     }
 }
 
-/// A group header's count (`1 of 3 to change`, `Partly set up`), shown only
-/// when the group is not all in place, and the group's spoken label.
-pub(crate) fn group_words(
-    group: Group,
-    selection: Selection,
-    rows: &[RowView],
-) -> (Option<String>, String) {
-    let title = group.title();
-    let members: Vec<&RowView> = rows
-        .iter()
-        .filter(|row| row.subject.group() == group)
-        .collect();
-    let managed = members.iter().filter(|row| row.managed).count();
-    let to_change = members.iter().filter(|row| row.to_change()).count();
-    match group_choice(group, selection) {
-        GroupChoice::SetUp if to_change > 0 => {
-            let count = format!("{to_change} of {managed} to change");
-            (Some(count.clone()), format!("{title}, Set up, {count}"))
-        }
-        GroupChoice::SetUp => (None, format!("{title}, Set up")),
-        GroupChoice::LeaveAsIs => (None, format!("{title}, Left as is")),
-        GroupChoice::Partly => (
-            Some("Partly set up".to_owned()),
-            format!("{title}, Partly set up"),
-        ),
-    }
-}
-
 /// The line under the page heading (§3.2) and the button beside it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Headline {
@@ -1984,6 +2449,12 @@ pub(crate) struct Headline {
     /// Its Set up now button runs the plan again: managed rows differ and
     /// nothing is going (a stopped run, a step that could not finish).
     pub(crate) start: bool,
+    /// Its Go to tab button brings the Command Line Tools tab, which the headline names, to the
+    /// front ([`GO_TO_TOOLS_TAB`]).
+    pub(crate) go_to_tab: bool,
+    /// A stage aterm parked waits for a Check (init-on-by-default design §6.5): the page's own,
+    /// after a wait, or the person's Check again for one parked after aterm stopped in it.
+    pub(crate) check: bool,
     /// It says the Mac is set up (§3.2: nothing differs in a managed group), which `setup=`
     /// reads as done ([`crate::system_state_access::setup_field`]).
     pub(crate) set_up: bool,
@@ -1996,7 +2467,38 @@ impl Headline {
             open: None,
             show: None,
             start: false,
+            go_to_tab: false,
+            check: false,
             set_up: false,
+        }
+    }
+
+    /// [`Self::waiting`] for `waiting`, where a step aterm parked (init-on-by-default design
+    /// §6.5) offers Check again alone: its rows say why in the stage's words, and Check again is
+    /// what lifts the park. Nothing signals: no diamond, no menu line.
+    fn waiting_on(status: &SetupStatus, waiting: &[Subject]) -> Self {
+        let parked = waiting.iter().any(|subject| {
+            matches!(
+                status.stage_says(*subject),
+                Some(StageSays::Parked(_) | StageSays::Held(_))
+            )
+        });
+        if parked {
+            Self {
+                show: None,
+                check: true,
+                ..Self::waiting(waiting)
+            }
+        } else {
+            Self::waiting(waiting)
+        }
+    }
+
+    /// A headline that sends the person to the Command Line Tools tab, with Go to tab.
+    fn tools_tab(text: &str) -> Self {
+        Self {
+            go_to_tab: true,
+            ..Self::line(text)
         }
     }
 
@@ -2020,10 +2522,14 @@ impl Headline {
         }))
     }
 
-    /// The headline while a person's press waits for another setup ([`SetupStatus::queued`]).
+    /// The headline while a press waits for another setup ([`SetupStatus::queued`]): a person's
+    /// Restore or choice, or the ALab profile aterm adds by itself ([`SetupStatus::queued_widen`]),
+    /// which nobody chose.
     fn queued(status: &SetupStatus) -> Self {
         Self::line(if status.operation == Some(SetupOperation::Restore) {
             "Waiting to restore previous settings…"
+        } else if status.queued_widen {
+            "Waiting to add this Mac's ALab profile…"
         } else {
             "Waiting to apply your choice…"
         })
@@ -2111,13 +2617,6 @@ pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Pla
             Access::Debugger.name()
         ));
     }
-    // A review closed unanswered (§3.3): nothing was approved, so no row needs anyone yet.
-    if status.unanswered && !status.busy {
-        return Headline {
-            start: true,
-            ..Headline::line(NOT_STARTED)
-        };
-    }
     // The Command Line Tools tab needs the person (§3.3): at its known password prompt, or
     // continuing its restored session without claiming which prompt it has reached.
     let repositories = Subject::Setting(Setting::Repositories);
@@ -2129,8 +2628,8 @@ pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Pla
                 .observations_for(plan.map(|plan| plan.vault_url.as_str()))
                 .find(|observation| observation.subject == repositories),
         ) {
-            Some(ToolsWait::Password) => return Headline::line(TOOLS_PASSWORD_HEADLINE),
-            Some(ToolsWait::Recovered) => return Headline::line(TOOLS_RECOVERED_HEADLINE),
+            Some(ToolsWait::Password) => return Headline::tools_tab(TOOLS_PASSWORD_HEADLINE),
+            Some(ToolsWait::Recovered) => return Headline::tools_tab(TOOLS_RECOVERED_HEADLINE),
             _ => {}
         }
     }
@@ -2203,7 +2702,7 @@ pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Pla
         if waiting.is_empty() {
             return Headline::line(SETUP_RETRIED);
         }
-        return Headline::waiting(&waiting);
+        return Headline::waiting_on(status, &waiting);
     }
     // Readings still to come, or a saved setup aterm reads again by itself, whose calm line
     // says so: nothing is claimed of a plan the worker could not read just now.
@@ -2215,10 +2714,12 @@ pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Pla
     // count is a change to make only while one does. Rows that only wait are
     // nothing a press changes: the headline names them, and each row's note
     // says what it waits on.
+    // A row the person changed after aterm set it is theirs (design §6.6): nothing automatic
+    // sets it again, so it is no change to make and lights no Set up now of its own.
     let to_change = rows.iter().filter(|row| row.to_change()).count();
     let differs = rows
         .iter()
-        .any(|row| row.managed && row.standing == Some(Standing::Differs));
+        .any(|row| row.managed && !row.changed_by_you && row.standing == Some(Standing::Differs));
     if differs {
         let changes = if to_change == 1 { "change" } else { "changes" };
         return Headline {
@@ -2228,15 +2729,13 @@ pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Pla
     }
     let waiting = steps.waiting(rows);
     if !waiting.is_empty() {
-        return Headline::waiting(&waiting);
+        return Headline::waiting_on(status, &waiting);
     }
     let managed = rows.iter().filter(|row| row.managed).count();
     if managed == 0 {
-        // After a person's Cancel, Set up now applies the plan the review showed (§3.3).
-        return Headline {
-            start: status.cancelled,
-            ..Headline::line("Everything is left as is")
-        };
+        // Every group left as is, by the person or by a Cancel an older aterm recorded (§3.3):
+        // each turns back on by its own switch, so nothing more is offered here.
+        return Headline::line(EVERYTHING_LEFT_AS_IS);
     }
     // A reading that ended without an answer (its reader unwound) says so in
     // its note: no check is under way for it, so the headline names it and
@@ -2247,15 +2746,10 @@ pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Pla
         .map(|row| row.subject)
         .collect();
     if let Some(first) = unread.first() {
-        let rows = if unread.len() == 1 { "row" } else { "rows" };
         let names: Vec<&str> = unread.iter().map(|subject| subject.name()).collect();
         return Headline {
             show: Some(*first),
-            ..Headline::line(format!(
-                "{} {rows} could not be read: {}",
-                unread.len(),
-                names.join(", ")
-            ))
+            ..Headline::line(format!("Could not read: {}", names.join(", ")))
         };
     }
     // A source change can leave just its managed rows unread. Known changes
@@ -2272,11 +2766,6 @@ pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Pla
     // not be confirmed is counted, and shown, where its note says so; a Check that failed as a
     // whole leaves every row as aterm read it before, which the headline says.
     if let Some(first) = steps.unconfirmed.first() {
-        let count = if steps.unconfirmed.len() == 1 {
-            "row"
-        } else {
-            "rows"
-        };
         let names: Vec<&str> = steps
             .unconfirmed
             .iter()
@@ -2284,11 +2773,7 @@ pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Pla
             .collect();
         return Headline {
             show: Some(*first),
-            ..Headline::line(format!(
-                "{} {count} not confirmed: {}",
-                steps.unconfirmed.len(),
-                names.join(", ")
-            ))
+            ..Headline::line(format!("Not confirmed: {}", names.join(", ")))
         };
     }
     // A plan that manages aterm's permissions and nothing beyond the base plan (a non-ALab Mac,
@@ -2319,11 +2804,11 @@ pub(crate) fn headline(status: &SetupStatus, rows: &[RowView], plan: Option<&Pla
 
 /// What a set-up headline adds after a Check that failed as a whole: the rows show what aterm
 /// read before ([`CHECK_FAILED_NOTE`]).
-const AS_LAST_READ: &str = "as last read";
+pub(crate) const AS_LAST_READ: &str = "as last read";
 
 /// Where the steps the last run and Check said stand, against the page's rows (§3.2, §3.6):
-/// what the headline names failed, counts as waiting or as not confirmed, and the village
-/// draws ([`village_spec`]).
+/// what the headline names failed, counts as waiting or as not confirmed, and the card holds
+/// ([`lines::card_items`]).
 struct Steps {
     /// Managed rows that failed: a reading that failed once the run no longer retries, or a step
     /// the run could not finish that nothing tries again by itself ([`Failure::failed`]). A
@@ -2405,85 +2890,25 @@ impl Steps {
     }
 }
 
-/// THE VILLAGE RULE (pure): the scene
-/// [`crate::settings::paint_rainbow_kitty_village`] draws beside the lockup,
-/// one station per [`Setting`] in its order, in the painter's letters: `_`
-/// left as is, `E` a managed row needs a person or failed (a reading, or a
-/// step, the headline names failed), `W` running now, `D` a step aterm tries
-/// again by itself, which waits for that try, or a row a run or a Check could
-/// not confirm, `G` every managed row in place, `D` otherwise (it differs,
-/// waits or is not read yet). `done` and `total`
-/// are the meter's count of managed rows. `plan` is the page's review, whose
-/// selection says what is left as is.
-pub(crate) fn village_spec(
-    status: &SetupStatus,
-    rows: &[RowView],
-    plan: &Plan,
-    phase_ms: u64,
-) -> String {
-    let steps = Steps::of(status, rows, Some(plan));
-    let of = |subjects: &[Subject], setting: Setting| {
-        subjects.iter().any(|subject| subject.setting() == setting)
-    };
-    let states: String = Setting::ALL
-        .iter()
-        .map(|&setting| {
-            let mut managed = rows
-                .iter()
-                .filter(|row| row.managed && row.subject.setting() == setting);
-            if !plan.selection.contains(setting) {
-                '_'
-            } else if managed
-                .clone()
-                .any(|row| row.standing == Some(Standing::NeedsYou))
-                || of(&steps.failed, setting)
-            {
-                'E'
-            } else if status.running.contains(&setting) {
-                'W'
-            } else if of(&steps.retried, setting) || of(&steps.unconfirmed, setting) {
-                'D'
-            } else if managed.all(RowView::settled) {
-                'G'
-            } else {
-                'D'
-            }
-        })
-        .collect();
-    let total = rows.iter().filter(|row| row.managed).count();
-    let done = rows.iter().filter(|row| row.settled()).count();
-    // Only a setup run walks: Check again and Restore are busy, and no run.
-    let busy = u8::from(status.running());
-    format!("phase={phase_ms};busy={busy};done={done};total={total};states={states}")
-}
-
-/// The least room the village takes beside the lockup: a narrower page shows
-/// the lockup alone.
-const VILLAGE_MIN_W: f32 = 200.0;
-
-/// How far the village's kitties walk in one page tick.
-const VILLAGE_TICK_MS: u64 = 120;
-
 /// §5.6 wake rule (pure): the setup page owes its own sub-second wake only while a
-/// run's village walks — a run going (`running`) on a shown page — and the hands are
-/// off the keys (`hands_off_keys`). Re-reads, offer answers and retries ride the
-/// worker's publications and the one-second status poll, each of which already wakes
-/// the loop (`system_state_host`'s `Host::deadline`), so a settled, finished or
-/// hidden page owes no animation tick and stands still ([`SystemStateApp::tick`]'s
-/// `walked`, the `running && shown` gate without `walks`, so a run whose motion is
-/// reduced still owes no idle wake once it ends).
+/// run goes (`running`) on a shown page, whose lockup moves with it, and the hands are
+/// off the keys (`hands_off_keys`). Re-reads and offer answers ride the worker's
+/// publications, a focus, file or network event, and, only while an open page shows
+/// something moving, the status poll, each of which already wakes the loop
+/// (`system_state_host`'s `Host::deadline`), so a settled, finished or hidden page owes
+/// no animation tick and stands still, and a run whose motion is reduced still owes no
+/// idle wake once it ends.
 ///
 /// `hands_off_keys` is the app-wide typing hold ([`crate::hands_off_keys`], a
 /// 2.5 s gap): while a key was typed that recently in a focused window, the walk's
-/// wake is held, so a motion frame never preempts an input frame (§5.6). The status
-/// poll still wakes the loop, so the walk resumes within a poll once the typing
-/// pauses; the walk clock itself ([`SystemStateApp::tick`]'s `walked`) only advances
-/// on a present that is already happening, never on a wake this gate suppressed.
+/// wake is held, so a motion frame never preempts an input frame (§5.6). A running
+/// page's status poll still wakes the loop, so the motion resumes within a poll once the
+/// typing pauses.
 ///
-/// The full motion engine of §5.1–5.5 (paint-only frames, the easing and pose
-/// vocabulary, `MotionPolicy`'s native-page gate) is MOT-1's; until it lands the
-/// page keeps today's static working glyph and content-path transitions, and this
-/// rule holds the idle wake at zero and holds the walk off the typing path.
+/// The working spinner is not this wake's: it is a moving node ([`crate::native_ui::NodeMotion`]),
+/// stepped by the window's own motion tick under the page's motion policy (§5.1, §5.5). The
+/// lockup's glide is SCR-3's; until it lands the caret and kitty jump to where the run stands,
+/// and this rule holds the idle wake at zero and motion off the typing path.
 pub(crate) const fn page_owes_animation_wake(
     running: bool,
     shown: bool,
@@ -2518,18 +2943,42 @@ pub(crate) struct SystemStateViewState {
     limit: Cell<f32>,
     /// The revealable keys the last render placed in the list.
     spans: RefCell<Vec<Span>>,
-    /// The last render of this view showed a village whose kitties walk.
-    village_walks: Cell<bool>,
+    /// The one line the person opened in this view (§4.1: one at a time; collapsed until they
+    /// open it).
+    open_line: Option<lines::Line>,
+    /// A test's view with every line open at once, so a row-level test reads every row the
+    /// page can show; the person opens one at a time.
+    #[cfg(test)]
+    every_line_open: Cell<bool>,
+    /// The kitty pose this view's lockup drew last, which it keeps until the next one is baked
+    /// ([`kitty::pose_to_draw`]).
+    kitty_pose: Cell<Option<aterm_effects::pet_glyphs_gen::PetGlyphId>>,
 }
 
 impl SystemStateViewState {
-    /// Whether this view's last render showed a village whose kitties walk.
-    /// Each view renders at its own window's size, so one view's village can
-    /// show while another's is left out: a busy tick repaints the page only
-    /// where a view someone sees draws its village walking
-    /// ([`SystemStateApp::tick`]).
-    pub(crate) fn village_walks(&self) -> bool {
-        self.village_walks.get()
+    /// A view with the dev scenario's line open ([`fixture_line`]), so a lab capture sees that
+    /// line's rows; `None` opens none.
+    pub(crate) fn with_line_open(line: Option<lines::Line>) -> Self {
+        Self {
+            open_line: line,
+            ..Self::default()
+        }
+    }
+
+    /// The line this view has open (a host test's read).
+    #[cfg(test)]
+    pub(crate) const fn open_line(&self) -> Option<&'static str> {
+        match self.open_line {
+            Some(line) => Some(line.slug()),
+            None => None,
+        }
+    }
+
+    /// Open every line of this view at once, so a host test reaches every row's controls
+    /// without opening each line first.
+    #[cfg(test)]
+    pub(crate) fn open_every_line(&self) {
+        self.every_line_open.set(true);
     }
 
     /// The list's scroll and its room, as last rendered (a host test's read).
@@ -2847,34 +3296,86 @@ pub(crate) struct SystemStateApp {
     stopping: bool,
     url: TextInputState,
     password: Password,
+    /// The Secrets vault row's phrase field ([`PHRASE_FIELD`]).
+    phrase: TextInputState,
+    /// The try that sent this field's phrase to the join, while its answer has not come back.
+    phrase_sent: Option<PhraseTry>,
+    /// What the last phrase came to ([`PHRASE_REFUSED`], [`PHRASE_NOT_REACHED`]), until the
+    /// field is typed into again.
+    phrase_came_to: Option<PhraseOutcome>,
     /// The person's own disclosure of the vault fields; `None` follows the row.
     vault_open: Option<bool>,
     status: SetupStatus,
     request: Option<Request>,
     /// The offer in `request` waits for the page's own answer, which the page gives on its
-    /// first tick with a person at this Mac ([`Self::tick`]): no review, no countdown and
-    /// no confirmation (design revision 4). Only a person at the Mac changes it (SAFE-1).
+    /// first tick ([`Self::tick`]): no review, no countdown, no confirmation and no wait for a
+    /// person (design revision 4, init-on-by-default design §6.1).
     answer_waits: bool,
-    /// The launch's offer shows the plan this Mac's ALab signal widened it to while it waited
-    /// (§3.5).
-    review_widened: bool,
     actions: VecDeque<SystemStateAction>,
     /// Whether the gesture being handled is a person's (not a control client's).
     by_person: bool,
-    /// Page ticks seen while a run goes and the page is shown: the village's
-    /// walk, and its only clock, so idle kitties stand still.
-    anim_ticks: u64,
+    /// What the page does by itself (design revision 4): no press for anything aterm can do.
+    by_itself: ByItself,
+}
+
+/// The page's own runs and Checks (design revision 4, init-on-by-default design §4.3): changes to
+/// make that nothing holds, or a step a run could not finish, start a run at once; a Check that
+/// failed, or left a row unconfirmed, reads again after a minute. Each that leaves things as they
+/// were waits longer before the next ([`by_itself_after`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ByItself {
+    /// Runs the page started since it last had nothing to start.
+    runs: u32,
+    /// When the next of them may start; `None`: at once.
+    run_after: Option<aterm_time::Instant>,
+    /// Checks the page started since no Check was owed.
+    checks: u32,
+    /// When the next of them goes; `None`: none is owed.
+    check_after: Option<aterm_time::Instant>,
+}
+
+/// How long the page waits before its next try of the same thing by itself, after `tries`
+/// (§4.3): 1, 2, 4, 8, then 15 minutes, so a step that keeps failing costs a run a quarter hour
+/// at most, and none before the first try.
+pub(crate) fn by_itself_after(tries: u32) -> aterm_time::Duration {
+    let minutes = match tries {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        3 => 4,
+        4 => 8,
+        _ => 15,
+    };
+    aterm_time::Duration::from_secs(minutes * 60)
 }
 
 impl SystemStateApp {
     pub(crate) fn text_input(&self, key: &str) -> Option<&TextInputState> {
-        (key == "system-state/url").then_some(&self.url)
+        match key {
+            "system-state/url" => Some(&self.url),
+            PHRASE_FIELD => Some(&self.phrase),
+            _ => None,
+        }
     }
 
+    /// Whether the field `key` shows marked text now, as its projection does
+    /// (the password's never does), read without copying its words.
+    pub(crate) fn field_composing(&self, key: &str) -> bool {
+        match key {
+            "system-state/url" => self.url.preedit().is_some(),
+            PHRASE_FIELD => self.phrase.preedit().is_some(),
+            _ => false,
+        }
+    }
+
+    /// The field `key`'s projection, its words included: tests read what a field holds through
+    /// it, and the window asks [`Self::field_composing`], which copies no words.
+    #[cfg(test)]
     pub(crate) fn field_projection(&self, key: &str) -> Option<TextInputProjection> {
         match key {
             "system-state/url" => Some(self.url.projection()),
             "system-state/password" => Some(self.password.projection()),
+            PHRASE_FIELD => Some(self.phrase.projection()),
             _ => None,
         }
     }
@@ -2883,12 +3384,108 @@ impl SystemStateApp {
         if key.is_some_and(|key| key.as_str() == "system-state/password") {
             return std::mem::take(&mut self.password.composing);
         }
-        if key.is_some_and(|key| key.as_str() == "system-state/url") && self.url.preedit().is_some()
-        {
-            self.url.cancel_preedit();
-            return true;
+        let input = match key.map(UiKey::as_str) {
+            Some("system-state/url") => &mut self.url,
+            Some(PHRASE_FIELD) => &mut self.phrase,
+            _ => return false,
+        };
+        if input.preedit().is_none() {
+            return false;
         }
-        false
+        input.cancel_preedit();
+        true
+    }
+
+    /// Whether the Secrets vault row asks ALab's members to let this Mac in, so its phrase field
+    /// shows ([`PHRASE_FIELD`]): a newer aterm's setup joins for this Mac itself.
+    pub(crate) fn phrase_asked(&self) -> bool {
+        !self.status.newer()
+            && self.status.observed.iter().any(|row| {
+                row.subject == Subject::Setting(Setting::Secrets)
+                    && row.now.as_deref() == Some(aterm_types::macos_setup::VAULT_ASKING)
+            })
+    }
+
+    /// Whether the phrase field takes words now: it shows, and no phrase is out for a join.
+    fn phrase_editable(&self) -> bool {
+        self.phrase_asked() && self.phrase_sent.is_none()
+    }
+
+    /// The try out for this field's phrase, while its join has not answered.
+    #[cfg(test)]
+    pub(crate) fn phrase_try(&self) -> Option<PhraseTry> {
+        self.phrase_sent
+    }
+
+    /// Join with the phrase as typed, once: its words with one blank between each.
+    fn join_phrase(&mut self) {
+        let phrase = self
+            .phrase
+            .value()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !self.phrase_editable() || phrase.is_empty() {
+            return;
+        }
+        let sent = PhraseTry::next();
+        self.phrase_sent = Some(sent);
+        self.phrase_came_to = None;
+        self.actions.push_back(SystemStateAction::JoinPhrase(
+            SecretBytes::from(phrase),
+            sent,
+        ));
+    }
+
+    /// The line under the phrase field: what to type, that the last phrase let nobody in, or
+    /// that it reached no Mac in ALab and is still good.
+    /// A try that reached no member while this page reads macOS's Local Network switch for aterm
+    /// off names that switch, not the other Mac: macOS let the join reach nobody.
+    pub(crate) fn phrase_help(&self) -> &'static str {
+        match self.phrase_came_to {
+            Some(PhraseOutcome::Refused) => PHRASE_REFUSED,
+            Some(PhraseOutcome::NotReached) if self.local_network_reads_off() => {
+                PHRASE_LOCAL_NETWORK_OFF
+            }
+            Some(PhraseOutcome::NotReached) => PHRASE_NOT_REACHED,
+            Some(PhraseOutcome::Stopped) => PHRASE_STOPPED,
+            Some(PhraseOutcome::Joined) | None => PHRASE_HELP,
+        }
+    }
+
+    /// Whether this page reads macOS's Local Network switch for aterm off: a look macOS refused
+    /// (`access::observation`'s `Off`).
+    fn local_network_reads_off(&self) -> bool {
+        self.status.observed.iter().any(|row| {
+            row.subject == Subject::Access(Access::LocalNetwork)
+                && row.now.as_deref() == Some("Off")
+        })
+    }
+
+    /// What the phrase try `sent` came to: once the join answered, a phrase that let this Mac in
+    /// or was refused is spent (one try each), and the field is emptied and wiped; one that
+    /// reached no member was asked nothing, and a try that stopped before it said what the phrase
+    /// came to may not have sent it, so their words stay for another Join; `None`, a join that
+    /// never started, keeps the words too. Only the words that try sent are touched: the answer
+    /// to another try (one a page closed since sent, while the person typed new words into this
+    /// page, opened again) changes nothing here, so a phrase is wiped only once its own try is
+    /// spent.
+    pub(crate) fn phrase_finished(
+        &mut self,
+        sent: PhraseTry,
+        outcome: Option<PhraseOutcome>,
+    ) -> bool {
+        if self.phrase_sent != Some(sent) {
+            return false;
+        }
+        self.phrase_sent = None;
+        if let Some(outcome) = outcome {
+            self.phrase_came_to = Some(outcome);
+            if matches!(outcome, PhraseOutcome::Joined | PhraseOutcome::Refused) {
+                self.phrase.wipe();
+            }
+        }
+        true
     }
 
     /// A page that knows `plan` from the start (a test's stand-in for the
@@ -2915,14 +3512,16 @@ impl SystemStateApp {
             awaiting: None,
             stopping: false,
             password: Password::default(),
+            phrase: TextInputState::new(String::new()),
+            phrase_sent: None,
+            phrase_came_to: None,
             vault_open: None,
             status: SetupStatus::default(),
             request: None,
             answer_waits: false,
-            review_widened: false,
             actions: VecDeque::new(),
             by_person: false,
-            anim_ticks: 0,
+            by_itself: ByItself::default(),
         }
     }
 
@@ -2937,6 +3536,22 @@ impl SystemStateApp {
     /// aterm joins nothing, so they read as they stand, as its Join does.
     pub(crate) fn vault_editable(&self) -> bool {
         !self.status.busy && !self.status.newer()
+    }
+
+    /// The vault address as this Mac's readings name it, for the page of a newer aterm's setup,
+    /// which shows it in words: the source the rows were read for, else the address the page
+    /// holds, else that none is set.
+    pub(crate) fn vault_address_as_it_stands(&self) -> String {
+        [
+            self.status.observed_vault_url.as_deref(),
+            Some(self.url.value()),
+        ]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|address| !address.is_empty())
+        .unwrap_or("None set")
+        .to_owned()
     }
 
     pub(crate) fn can_offer(&self) -> bool {
@@ -2973,62 +3588,19 @@ impl SystemStateApp {
         }
         self.plan = request.initial().clone();
         self.plan_known = true;
-        // The review of the groups the ALab signal adds keeps the plan in force as the one the
-        // worker holds: a Cancel leaves its groups as they are (§3.5). The vault it offers is the
-        // worker's, never a draft of the person's.
-        self.submitted = match request.kind() {
-            OfferKind::Launch | OfferKind::Resume => self.plan.clone(),
-            OfferKind::Widen { in_force } => Plan {
-                selection: in_force.selection,
-                vault_url: self.plan.vault_url.clone(),
-            },
-        };
+        self.submitted = self.plan.clone();
         self.url = TextInputState::new(self.plan.vault_url.clone());
         self.password = Password::default();
         self.status = SetupStatus::default();
         self.request = Some(request);
         self.answer_waits = true;
-        self.review_widened = false;
         true
     }
 
-    /// Whether the review up is the one of the groups the ALab signal adds (§3.5).
-    fn reviewing_widen(&self) -> bool {
-        self.reviewing()
-            && self
-                .request
-                .as_ref()
-                .is_some_and(|request| matches!(request.kind(), OfferKind::Widen { .. }))
-    }
-
-    /// The worker heard this Mac's ALab signal while the launch's offer waits for its answer
-    /// (§3.5): the offer widens to `widened` in place, and the page says why
-    /// ([`ALAB_ADDED_NOTE`]); a vault address or password being typed stays as it is, unwidened.
-    /// Whether the page changed.
-    fn widen_review(&mut self, widened: Plan) -> bool {
-        if !self.reviewing()
-            || self.reviewing_widen()
-            || self.plan != self.submitted
-            || self.vault_draft()
-        {
-            return false;
-        }
-        self.url = TextInputState::new(widened.vault_url.clone());
-        self.plan = widened.clone();
-        self.submitted = widened;
-        self.review_widened = true;
-        true
-    }
-
-    /// The calm lines over the groups: why a review shows the ALab profile, then the
-    /// status's own ([`SetupStatus::notes`]).
+    /// The calm lines over the groups ([`SetupStatus::notes`]): why a plan aterm widened shows
+    /// more ([`widened_note`]) is said there while its run goes.
     fn notes(&self, plan: &Plan) -> Vec<String> {
-        let mut notes = Vec::new();
-        if self.review_widened || self.reviewing_widen() {
-            notes.push(ALAB_ADDED_NOTE.to_owned());
-        }
-        notes.extend(self.status.notes(plan));
-        notes
+        self.status.notes(plan)
     }
 
     /// Take the worker's latest status. Its plan becomes the page's while
@@ -3061,6 +3633,12 @@ impl SystemStateApp {
             self.vault_open = None;
         }
         self.status = status;
+        // The phrase field hid (the row no longer asks ALab's members): a phrase typed in it is
+        // wiped, never kept for a field that is gone.
+        if !self.phrase_asked() && !self.phrase.value().is_empty() {
+            self.phrase.wipe();
+            changed = true;
+        }
         changed
     }
 
@@ -3117,16 +3695,19 @@ impl SystemStateApp {
     }
 
     /// A withdrawn offer is let go. An offer that waits for its answer is answered by the page
-    /// itself, as the plan stands, on the first tick, focused, shown or not,
-    /// without waiting for keyboard or mouse activity:
-    /// no review, no countdown, no confirmation (design revision 4); a status that says the page
-    /// is busy holds it until it is not, but for the offer of a plan an earlier process admitted,
-    /// whose run is what keeps it busy ([`Self::answer_resume`]). While a setup run goes and the page is `shown` (the
-    /// visible view of a window), the village's kitties walk a step. `walks` says whether a shown
-    /// view's last render showed a walking village ([`SystemStateViewState::village_walks`]).
-    /// `true` when the page changed: a page nobody sees, one Check again or Restore keeps busy,
-    /// or one whose shown views draw no walking village owes no repaint for the walk.
-    pub(crate) fn tick(&mut self, _present: bool, shown: bool, walks: bool) -> bool {
+    /// itself, as the plan stands, at its first tick, whoever is at this Mac, focused, shown or
+    /// not, whatever was clicked or typed meanwhile: no review, no countdown, no confirmation and
+    /// no wait for a person (init-on-by-default design §6.1, the owner's ruling of 2026-10-25),
+    /// since only the person stages wait for one (`App::system_state_front_with_a_person`); a
+    /// status that says the page is busy holds it until it is not, but for the offer of a plan
+    /// an earlier process admitted, whose run is what keeps it busy ([`Self::answer_resume`]).
+    /// `true` when the page changed.
+    pub(crate) fn tick(&mut self) -> bool {
+        self.tick_at(aterm_time::Instant::now())
+    }
+
+    /// [`Self::tick`] at `now`, which also starts what the page does by itself ([`ByItself`]).
+    pub(crate) fn tick_at(&mut self, now: aterm_time::Instant) -> bool {
         let before = (
             self.request.is_some(),
             self.status.busy,
@@ -3140,37 +3721,172 @@ impl SystemStateApp {
         {
             self.request = None;
             self.answer_waits = false;
-            self.review_widened = false;
         }
-        let widened = self
-            .request
-            .as_ref()
-            .and_then(Request::take_widened)
-            .is_some_and(|widened| self.widen_review(widened));
         if self.reviewing() && !self.status.busy {
             self.apply(Admission::Automatic, Submission::Offer, None);
         } else if self.resume_waits() && !self.stopping {
             // The run it resumes is going: its busy status holds nothing here. A Stop asked of
             // that run is no run to go on with, so the page gives no answer after one.
             self.answer_resume();
+        } else {
+            self.go_on_by_itself(now);
         }
-        let walked = self.status.running() && shown && {
-            self.anim_ticks = self.anim_ticks.wrapping_add(1);
-            walks
-        };
-        walked
-            || widened
-            || before
-                != (
-                    self.request.is_some(),
-                    self.status.busy,
-                    self.reviewing(),
-                    self.resume_waits(),
+        before
+            != (
+                self.request.is_some(),
+                self.status.busy,
+                self.reviewing(),
+                self.resume_waits(),
+            )
+    }
+
+    /// Start what the page does by itself and is due at `now` ([`ByItself`]): a run of the plan
+    /// in force as it stands, as Set up now would, or a Check.
+    fn go_on_by_itself(&mut self, now: aterm_time::Instant) {
+        if self.wants_start() {
+            if self.by_itself.run_after.is_none() && self.last_run_failed() {
+                // The run just tried a step it could not finish, its own tries spent: the next
+                // waits its turn, so the failure is said before it goes again.
+                self.by_itself.runs = 1;
+                self.by_itself.run_after = Some(now + by_itself_after(1));
+            }
+            if self.by_itself.run_after.is_none_or(|after| after <= now) {
+                self.by_itself.runs = self.by_itself.runs.saturating_add(1);
+                self.by_itself.run_after = Some(now + by_itself_after(self.by_itself.runs));
+                // The window's own admission, as its answer to the launch's offer is: the plan
+                // as it stands, a provisional plan staying provisional.
+                self.apply(
+                    Admission::Automatic,
+                    Submission::AsItStands,
+                    Some(Selection::none()),
+                );
+                return;
+            }
+        } else if !self.status.busy && !self.headline().start {
+            self.by_itself.runs = 0;
+            self.by_itself.run_after = None;
+        }
+        if self.check_owed() {
+            match self.by_itself.check_after {
+                None => {
+                    self.by_itself.check_after =
+                        Some(now + by_itself_after(self.by_itself.checks.saturating_add(1)));
+                }
+                Some(after) if after <= now && self.can_check() && !self.status.busy => {
+                    self.by_itself.checks = self.by_itself.checks.saturating_add(1);
+                    self.by_itself.check_after = None;
+                    self.check_again();
+                }
+                Some(_) => {}
+            }
+        } else if !self.status.busy {
+            self.by_itself.checks = 0;
+            self.by_itself.check_after = None;
+        }
+    }
+
+    /// The keys of the card's buttons, in the card's order: where keyboard focus goes when the
+    /// item it was on leaves the card (the walk moved on, a step resolved), so it never stays on
+    /// a control that is gone.
+    pub(crate) fn card_buttons(&self) -> Vec<String> {
+        let rows = page::page_rows(self);
+        lines::card_items(self, &rows)
+            .into_iter()
+            .filter_map(|item| item.button.map(|button| button.key))
+            .collect()
+    }
+
+    /// When the page next does something by itself, for the window's wake: `None` while nothing
+    /// is due.
+    pub(crate) fn next_by_itself(&self) -> Option<aterm_time::Instant> {
+        let run = self.by_itself.run_after.filter(|_| self.wants_start());
+        let check = self.by_itself.check_after.filter(|_| self.check_owed());
+        run.into_iter().chain(check).min()
+    }
+
+    /// A hold stands on the plan's run: a person's Stop, or an older aterm's Cancel. Only then do
+    /// changes to make wait for a press: the footer's quiet Set up now (revision 4).
+    pub(crate) fn held(&self) -> bool {
+        self.stopping || self.status.cancelled || self.status.run.is_some_and(|run| !run.allowed)
+    }
+
+    /// Whether the plan in force has something a run changes and nothing holds it: the page
+    /// starts that run itself ([`Self::go_on_by_itself`]).
+    fn wants_start(&self) -> bool {
+        self.plan_known
+            && !self.status.busy
+            && !self.status.queued
+            && !self.status.newer()
+            && self.request.is_none()
+            && self.awaiting.is_none()
+            && !self.held()
+            && self.headline().start
+    }
+
+    /// Whether the page starts a run by itself at its next tick: the hero says it sets up. A run
+    /// that just failed a step waits its turn first ([`Self::last_run_failed`]).
+    pub(crate) fn starts_by_itself(&self) -> bool {
+        self.wants_start() && self.by_itself.run_after.is_none() && !self.last_run_failed()
+    }
+
+    /// Whether the last run tried a step it could not finish, which the card says.
+    fn last_run_failed(&self) -> bool {
+        let plan = self.reviewed_plan();
+        let rows = self.reviewed_rows();
+        !Steps::of(&self.status, &rows, Some(&plan))
+            .failed
+            .is_empty()
+    }
+
+    /// Whether a run left things as they were, and the next waits its turn.
+    pub(crate) fn retry_waits(&self) -> bool {
+        self.wants_start() && (self.by_itself.run_after.is_some() || self.last_run_failed())
+    }
+
+    /// Whether a Check is owed: the last one failed as a whole, a row a run or a Check could not
+    /// confirm waits for one, or a stage aterm parked waits for one.
+    fn check_owed(&self) -> bool {
+        if !self.plan_known || self.status.newer() {
+            return false;
+        }
+        let plan = self.reviewed_plan();
+        let rows = self.reviewed_rows();
+        let steps = Steps::of(&self.status, &rows, Some(&plan));
+        // A stage aterm parked after it took over an hour (init-on-by-default design §6.5) is
+        // lifted by the next Check: the page gives it, after its wait. One parked after aterm
+        // stopped in it twice ([`StageSays::Held`]) waits for the person's Check again.
+        let parked = rows.iter().any(|row| {
+            row.managed
+                && matches!(
+                    self.status.stage_says(row.subject),
+                    Some(StageSays::Parked(_))
                 )
+        });
+        steps.check_failed || !steps.unconfirmed.is_empty() || parked
     }
 
     pub(crate) fn pending(&self) -> bool {
         self.request.as_ref().is_some_and(Request::pending)
+    }
+
+    /// An unanswered offer with no draft or work can be recreated after a handoff.
+    /// This answers nothing: the successor reads the durable plan and offers it again.
+    #[cfg(any(unix, test))]
+    pub(crate) fn offer_can_restart(&self, request: &Request) -> bool {
+        let Some(offered) = self.request.as_ref() else {
+            return false;
+        };
+        let plan = request.initial();
+        offered.same_offer(request)
+            && offered.pending()
+            && self.answer_waits
+            && self.awaiting.is_none()
+            && self.actions.is_empty()
+            && !self.stopping
+            && !self.status.busy
+            && self.plan == *plan
+            && self.url.value() == plan.vault_url
+            && !self.vault_draft()
     }
 
     /// A vault address or password typed and not joined yet.
@@ -3210,34 +3926,21 @@ impl SystemStateApp {
             &self.status,
             self.plan.selection,
             Some(self.url.value().trim()),
-            self.reads_as_review(subject),
+            self.reads_as_review(),
         )
     }
 
-    /// Whether `subject`'s row reads as what setup, or Set up now, will do (§3.3): every row
-    /// while the first launch's offer waits for its answer, or after it was closed unanswered
-    /// (nothing was approved, so nothing waits on anyone yet), and, in the offer of the groups
-    /// the ALab signal adds (§3.5), the rows those groups add. A row the plan in force manages
-    /// keeps its real reading there, with its buttons and signals: that offer changes none of it.
-    fn reads_as_review(&self, subject: Subject) -> bool {
-        if self.status.unanswered {
-            return true;
-        }
-        if !self.reviewing() {
-            return false;
-        }
-        match self.request.as_ref().map(Request::kind) {
-            Some(OfferKind::Widen { in_force }) => !manages(in_force.selection, subject),
-            _ => true,
-        }
+    /// Whether `subject`'s row reads as what setup will do (§3.3): every row while the launch's
+    /// offer waits for the page's answer at its first tick (nothing was admitted yet, so nothing
+    /// waits on anyone).
+    fn reads_as_review(&self) -> bool {
+        self.reviewing()
     }
 
-    /// Whether the page's own signals are still (§3.3, §3.6): while the first launch's offer
-    /// waits for its answer its headline is the one signal, and an offer closed unanswered
-    /// approved nothing. The offer of the groups the ALab signal adds stills nothing: its tab
-    /// never takes focus, and the plan in force goes on under it.
+    /// Whether the page's own signals are still (§3.3, §3.6): while the launch's offer waits for
+    /// the page's answer at its first tick, its headline is the one signal.
     pub(crate) fn signals_still(&self) -> bool {
-        self.status.unanswered || (self.reviewing() && !self.reviewing_widen())
+        self.reviewing()
     }
 
     fn reviewed_rows(&self) -> Vec<RowView> {
@@ -3279,16 +3982,6 @@ impl SystemStateApp {
             if self.status.busy {
                 return Headline::before_plan(&self.status);
             }
-            // The offer of the groups the ALab signal adds says what the plan in force needs of
-            // a person, as its rows, the diamond and the menu line do; the offer applies by
-            // itself, so the headline offers no Set up now beside it.
-            if self.reviewing_widen() && self.needs_attention() {
-                let plan = self.reviewed_plan();
-                return Headline {
-                    start: false,
-                    ..headline(&self.status, &self.reviewed_rows(), Some(&plan))
-                };
-            }
             return Headline::line(STARTING_HEADLINE);
         }
         if !self.plan_known {
@@ -3314,20 +4007,20 @@ impl SystemStateApp {
 
     /// The tab's attention diamond (§3.6): a managed row needs a person, or
     /// failed and the run no longer retries it (§3.5). Never while the page's signals are still
-    /// ([`Self::signals_still`]): first-launch admission still waits or its page closed
-    /// unanswered (§3.3). While wider scope awaits admission, the plan already in force
-    /// keeps its existing signals.
+    /// ([`Self::signals_still`]): the launch's admission still waits (§3.3).
     pub(crate) fn needs_attention(&self) -> bool {
         if self.signals_still() {
             return false;
         }
         let signal = self.status.failures_signal();
         let reviewed = self.reviewed_plan();
+        let quiet = self.status.joins_quietly();
         (self.plan_known
-            && self
-                .reviewed_rows()
-                .iter()
-                .any(|row| row.attention() && (signal || row.standing != Some(Standing::Failed))))
+            && self.reviewed_rows().iter().any(|row| {
+                row.attention()
+                    && (signal || row.standing != Some(Standing::Failed))
+                    && !(quiet && row.subject == Subject::Setting(Setting::Secrets))
+            }))
             || self
                 .status
                 .failed_steps(self.plan_known.then_some(&reviewed))
@@ -3343,7 +4036,6 @@ impl SystemStateApp {
     /// and leaves a draft where it is. `changed` is what the worker takes of the plan onto the
     /// plan in force ([`SetupAnswer::changed`]).
     fn apply(&mut self, admission: Admission, submission: Submission, changed: Option<Selection>) {
-        let offer = submission == Submission::Offer;
         let with_vault = submission == Submission::Join;
         let mut plan = self.plan.clone();
         plan.vault_url = if with_vault {
@@ -3362,7 +4054,6 @@ impl SystemStateApp {
         self.status.operation = None;
         self.stopping = false;
         self.answer_waits = false;
-        let widened = offer && std::mem::take(&mut self.review_widened);
         self.awaiting = Some(Awaiting {
             plan: plan.clone(),
             password: password.as_ref().and(self.password.acceptance.clone()),
@@ -3376,7 +4067,6 @@ impl SystemStateApp {
                 chosen: !matches!(submission, Submission::AsItStands | Submission::Offer),
                 vault_typed: with_vault,
                 changed,
-                widened,
             },
             admission,
         ));
@@ -3425,15 +4115,14 @@ impl SystemStateApp {
     }
 
     /// The host calls this only after the final view has actually detached.
-    /// Closing never cancels (§3.3): an offer still waiting for its answer is
-    /// closed for this launch, nothing is recorded, and the next launch offers
-    /// it again. What the page sent is the worker's already.
+    /// Closing never answers (§3.3): an offer still waiting for the page's answer is let go
+    /// ([`Request::let_go`]), so the launch's is made again where a page can answer it, and
+    /// nothing is recorded. What the page sent is the worker's already.
     pub(crate) fn closed(&mut self, _scope: CloseScope) {
         if let Some(request) = self.request.take() {
-            request.finish(WorkstationSetupDecision::Closed);
+            request.let_go();
         }
         self.answer_waits = false;
-        self.review_widened = false;
     }
 
     /// The plan the worker will run next: the one sent last, else the one it
@@ -3460,6 +4149,19 @@ impl SystemStateApp {
     /// no plan, yet reading writes nothing: Check again reads its rows as they stand (§3.2).
     fn can_check(&self) -> bool {
         (self.plan_known || self.status.newer()) && (!self.status.busy || self.status.queued)
+    }
+
+    /// Check again, from the footer or a parked step's headline: the rows are read again for the
+    /// page's plan, and the worker lifts every stage aterm parked (init-on-by-default design
+    /// §6.5).
+    fn check_again(&mut self) {
+        let plan = self.reviewed_plan();
+        // A press waiting for another setup keeps its words: the reading goes beside it.
+        if !self.status.queued {
+            self.status.busy = true;
+            self.status.operation = Some(SetupOperation::Check);
+        }
+        self.actions.push_back(SystemStateAction::Check(plan));
     }
 
     /// Whether Restore previous settings can start: nothing is busy, no offer waits, and the
@@ -3496,27 +4198,41 @@ impl SystemStateApp {
         }
     }
 
-    /// Set every bit of `group` to `on`, and submit the plan when that changes
-    /// what the worker will run, or while the plan aterm chose by itself may still
-    /// widen ([`Self::may_widen`]): a group choice makes the plan the person's, even
-    /// one that returns to aterm's plan (§3.5). Nothing while a Restore runs.
+    /// Set every bit of `group` to `on`, as [`Self::choose_settings`] does: a test's press on
+    /// one plan group, where the page's lines each turn one or two groups.
+    #[cfg(test)]
     fn choose(&mut self, group: Group, on: bool) {
+        self.choose_settings(group.settings(), on);
+    }
+
+    /// Set every bit of `settings` (a group's, a line's) to `on`, and submit the plan when that
+    /// changes what the worker will run, or while the plan aterm chose by itself may still
+    /// widen ([`Self::may_widen`]): a choice makes the plan the person's, even one that returns
+    /// to aterm's plan (§3.5). Nothing while a Restore runs.
+    fn choose_settings(&mut self, settings: &[Setting], on: bool) {
         if !self.plan_known || self.restoring() {
             return;
         }
-        for setting in group.settings() {
+        for setting in settings {
             self.plan.selection.set(*setting, on);
         }
         // A press while the offer waits for its answer answers it, as the presser's choice: an
         // offer still pending is one the plan may widen.
         if self.plan.selection != self.next_plan().selection || self.may_widen() {
-            let changed = self.press_changed(group.settings());
+            let changed = self.press_changed(settings);
             self.apply(
                 Admission::of_gesture(self.by_person),
                 Submission::Choice,
                 changed,
             );
         }
+    }
+
+    /// Whether any bit of `line` is set: its switch reads On.
+    fn line_on(&self, line: lines::Line) -> bool {
+        line.settings()
+            .iter()
+            .any(|setting| self.plan.selection.contains(*setting))
     }
 
     /// Whether the plan in force is aterm's own, which a look that finds the ALab signal
@@ -3544,6 +4260,21 @@ impl SystemStateApp {
                 && matches!(row.standing, Some(Standing::NeedsYou | Standing::Failed))
                 && row.note.is_none()
         })
+    }
+
+    /// Whether the field with focus takes words now: the phrase field while it shows and no
+    /// phrase is out, whether or not a run goes (the join is no part of one); the vault's own
+    /// fields while they are editable ([`Self::vault_editable`]).
+    fn takes_words(&self, view: &SystemStateViewState) -> bool {
+        if view
+            .common
+            .last_focus
+            .as_ref()
+            .is_some_and(|key| key.as_str() == PHRASE_FIELD)
+        {
+            return self.phrase_editable();
+        }
+        self.vault_editable()
     }
 
     /// One text input to the vault field with focus, which scrolls into
@@ -3576,8 +4307,9 @@ impl SystemStateApp {
             && self.field_event(key.as_str(), event)
         {
             // A field someone types into stays shown, as one filled through
-            // its action does: a draft is never hidden.
-            if edits {
+            // its action does: a draft is never hidden. The phrase field sits
+            // above the disclosure and opens nothing.
+            if edits && key.as_str() != PHRASE_FIELD {
                 self.vault_open = Some(true);
             }
             view.reveal_listed_control(&key);
@@ -3585,44 +4317,60 @@ impl SystemStateApp {
     }
 
     /// One text input to the vault field `key`: `false` when `key` names
-    /// neither vault field.
+    /// no vault field. Return in the phrase field joins with it, as its Join does.
     fn field_event(&mut self, key: &str, event: TextInputEvent) -> bool {
+        // Return in the vault's address or password joins, as its Join does.
+        if matches!(key, "system-state/url" | "system-state/password")
+            && event == TextInputEvent::Submit
+        {
+            self.join_vault();
+            return true;
+        }
         if key == "system-state/password" {
             self.password.input(event);
+            return true;
+        }
+        if key == PHRASE_FIELD {
+            if !self.phrase_editable() {
+                return false;
+            }
+            if event == TextInputEvent::Submit {
+                self.join_phrase();
+            } else {
+                // A new phrase is on its way in: what the last one came to is old news.
+                self.phrase_came_to = None;
+                edit_text(&mut self.phrase, event);
+            }
             return true;
         }
         if key != "system-state/url" {
             return false;
         }
-        match event {
-            TextInputEvent::Commit(text) => self.url.insert(&text),
-            TextInputEvent::Preedit { text, selection } => self.url.set_preedit(text, selection),
-            TextInputEvent::Backspace => self.url.delete_backward(),
-            TextInputEvent::Delete => self.url.delete_forward(),
-            TextInputEvent::Left { extend } => self.url.move_left(extend),
-            TextInputEvent::Right { extend } => self.url.move_right(extend),
-            TextInputEvent::WordLeft { extend } => self.url.move_word_left(extend),
-            TextInputEvent::WordRight { extend } => self.url.move_word_right(extend),
-            TextInputEvent::Home { extend } => self.url.move_to_start(extend),
-            TextInputEvent::End { extend } => self.url.move_to_end(extend),
-            TextInputEvent::KillToEnd => self.url.kill_to_end(),
-            TextInputEvent::KillToStart => self.url.kill_to_start(),
-            TextInputEvent::DeleteWordBackward => self.url.delete_word_backward(),
-            TextInputEvent::DeleteWordForward => self.url.delete_word_forward(),
-            TextInputEvent::SelectAll => self.url.select_all(),
-            TextInputEvent::Undo => {
-                self.url.undo();
-            }
-            TextInputEvent::Redo => {
-                self.url.redo();
-            }
-            TextInputEvent::Submit | TextInputEvent::Cancel => {}
-        }
+        edit_text(&mut self.url, event);
         true
+    }
+
+    /// Join the vault at the address typed, with the password typed: Join, or Return in either
+    /// field.
+    fn join_vault(&mut self) {
+        if !self.vault_editable() || !self.plan_known {
+            return;
+        }
+        self.vault_open = Some(true);
+        self.plan.selection.set(Setting::Secrets, true);
+        let changed = self.press_changed(&[Setting::Secrets]);
+        self.apply(
+            Admission::of_gesture(self.by_person),
+            Submission::Join,
+            changed,
+        );
     }
 
     /// One pressed control of the page.
     fn act(&mut self, view: &mut SystemStateViewState, key: &str, value: Option<SemanticInput>) {
+        // A test's press on one plan group (`system-state/group/<index>/<set-up|leave>`): the
+        // page draws no such control, its lines each turning one or two groups at once.
+        #[cfg(test)]
         if let Some(rest) = key.strip_prefix("system-state/group/") {
             let mut parts = rest.split('/');
             if let (Some(group), Some(choice)) = (
@@ -3637,15 +4385,29 @@ impl SystemStateApp {
             }
             return;
         }
-        if let Some(slug) = key.strip_prefix("system-state/headline/open/") {
-            if self.plan_known
-                && let Some(access) = Access::ALL.into_iter().find(|access| access.word() == slug)
-                && self.headline().open == Some(access)
+        if let Some(rest) = key.strip_prefix("system-state/line/") {
+            let mut parts = rest.split('/');
+            if let (Some(line), Some(part)) =
+                (parts.next().and_then(lines::Line::from_slug), parts.next())
             {
-                self.actions.push_back(SystemStateAction::OpenAccess {
-                    access,
-                    by_person: self.by_person,
-                });
+                match part {
+                    "switch" => {
+                        let on = match value {
+                            Some(SemanticInput::Bool(on)) => on,
+                            _ => !self.line_on(line),
+                        };
+                        // A line out of this Mac's scope (the sign-outs outside ALab) stays off.
+                        if on && lines::out_of_scope(self, line, self.line_on(line)) {
+                            return;
+                        }
+                        self.choose_settings(line.settings(), on);
+                    }
+                    // One line open at a time (§4.1): opening one closes the other.
+                    "disclose" => {
+                        view.open_line = (view.open_line != Some(line)).then_some(line);
+                    }
+                    _ => {}
+                }
             }
             return;
         }
@@ -3656,15 +4418,7 @@ impl SystemStateApp {
                 self.stopping = true;
                 self.actions.push_back(SystemStateAction::Stop);
             }
-            "system-state/check" if self.can_check() => {
-                let plan = self.reviewed_plan();
-                // A press waiting for another setup keeps its words: the reading goes beside it.
-                if !self.status.queued {
-                    self.status.busy = true;
-                    self.status.operation = Some(SetupOperation::Check);
-                }
-                self.actions.push_back(SystemStateAction::Check(plan));
-            }
+            "system-state/check" if self.can_check() => self.check_again(),
             "system-state/restore" if self.can_restore() => {
                 self.status.busy = true;
                 self.status.operation = Some(SetupOperation::Restore);
@@ -3680,25 +4434,37 @@ impl SystemStateApp {
                     Some(Selection::none()),
                 );
             }
-            "system-state/headline/show" => {
-                if let Some(subject) = self.headline().show {
-                    // The vault's fields sit under its row: Join, their last
-                    // control, brings all of them into view.
-                    let key = if subject == Subject::Setting(Setting::Secrets) && self.vault_shown()
-                    {
-                        "system-state/vault/join".to_owned()
-                    } else {
-                        format!("system-state/row/{}", row_slug(subject))
-                    };
-                    view.reveal_listed_control(&UiKey::new(key));
-                }
-            }
             "system-state/row/secrets/disclose" => {
                 self.vault_open = Some(!self.vault_shown());
             }
             TURN_ON_SYNC => {
                 if self.reviewed_rows().iter().any(|row| row.turn_on_sync) {
                     self.actions.push_back(SystemStateAction::TurnSyncOn {
+                        by_person: self.by_person,
+                    });
+                }
+            }
+            GO_TO_TOOLS_TAB if self.headline().go_to_tab => {
+                self.actions.push_back(SystemStateAction::GoToToolsTab);
+            }
+            COPY_TOKEN_COMMAND => {
+                if self.reviewed_rows().iter().any(|row| row.copy_command) {
+                    self.actions.push_back(SystemStateAction::CopyCommand {
+                        command: aterm_types::macos_setup::GITHUB_TOKEN_COMMAND.to_owned(),
+                        by_person: self.by_person,
+                    });
+                }
+            }
+            lines::COPY_APPROVE_COMMAND => {
+                let command = self
+                    .reviewed_rows()
+                    .iter()
+                    .find(|row| row.subject == Subject::Setting(Setting::Secrets))
+                    .and_then(|row| row.note.as_deref().and_then(lines::approve_command))
+                    .map(str::to_owned);
+                if let Some(command) = command {
+                    self.actions.push_back(SystemStateAction::CopyCommand {
+                        command,
                         by_person: self.by_person,
                     });
                 }
@@ -3711,16 +4477,27 @@ impl SystemStateApp {
                         });
                 }
             }
-            "system-state/vault/join" if self.vault_editable() && self.plan_known => {
-                self.vault_open = Some(true);
-                self.plan.selection.set(Setting::Secrets, true);
-                let changed = self.press_changed(&[Setting::Secrets]);
-                self.apply(
-                    Admission::of_gesture(self.by_person),
-                    Submission::Join,
-                    changed,
-                );
+            PHRASE_JOIN => self.join_phrase(),
+            PHRASE_FIELD if self.phrase_editable() => {
+                view.common.last_focus = Some(UiKey::new(key));
+                match value {
+                    Some(SemanticInput::Text(text)) => {
+                        self.phrase_came_to = None;
+                        self.phrase.select_all();
+                        self.phrase.insert(&text);
+                    }
+                    Some(SemanticInput::TextPosition { byte, extend }) => {
+                        let anchor = if extend {
+                            self.phrase.selection().anchor
+                        } else {
+                            byte
+                        };
+                        self.phrase.set_selection(anchor, byte);
+                    }
+                    _ => {}
+                }
             }
+            "system-state/vault/join" => self.join_vault(),
             "system-state/url" | "system-state/password" if self.vault_editable() => {
                 // A field someone fills shows: a draft is never hidden.
                 self.vault_open = Some(true);
@@ -3776,6 +4553,8 @@ impl Drop for SystemStateApp {
         if let Some(request) = self.request.take() {
             request.finish(WorkstationSetupDecision::Unavailable);
         }
+        // The page closed: a phrase typed on the vault row goes with it, wiped.
+        self.phrase.wipe();
     }
 }
 
@@ -3836,14 +4615,14 @@ impl NativeAppModel for SystemStateApp {
                 true
             }
             AppEvent::TextInput(event) => {
-                if self.vault_editable() && event != TextInputEvent::Cancel {
+                if self.takes_words(view) && event != TextInputEvent::Cancel {
                     self.type_into(view, event);
                 }
                 true
             }
             #[cfg(any(a11y_tree, test))]
             AppEvent::InsertText(text) => {
-                if self.vault_editable() {
+                if self.takes_words(view) {
                     self.type_into(view, TextInputEvent::Commit(text));
                 }
                 true
@@ -3873,7 +4652,7 @@ impl NativeAppModel for SystemStateApp {
     }
 
     fn view(&self, view: &Self::ViewState, cx: &ViewCx<'_>) -> UiTree {
-        Page::new(self, view, cx).tree()
+        page::Page::new(self, view, cx).tree()
     }
 
     fn commands(&self, _view: &Self::ViewState, _out: &mut Vec<Command>) {}
@@ -3898,1997 +4677,6 @@ impl NativeAppModel for SystemStateApp {
     }
 }
 
-/// The page's measures at one viewport and text scale.
-struct Metrics {
-    compact: bool,
-    pad_x: f32,
-    pad_y: f32,
-    gap: f32,
-    /// The list's width.
-    inner: f32,
-    /// A card's side padding.
-    card_pad_x: f32,
-    /// A card's content width.
-    card_inner: f32,
-    /// Rows put the value under the name: the card is too narrow for both at this text size.
-    two_line: bool,
-    body_px: f32,
-    row_h: f32,
-    line_h: f32,
-    control_h: f32,
-    header_h: f32,
-    name_w: f32,
-    chip_w: f32,
-}
-
-impl Metrics {
-    const CARD_PAD_Y: f32 = 6.0;
-
-    fn new(width: f32, height: f32) -> Self {
-        let compact = width < 720.0 || height < 700.0;
-        let narrow = width < 260.0;
-        let scale = crate::native_settings::settings_text_scale();
-        let pad_x = if narrow {
-            8.0
-        } else if compact {
-            12.0
-        } else {
-            24.0
-        };
-        let card_pad_x = if narrow { 8.0 } else { 14.0 };
-        let inner = (width - pad_x * 2.0).max(1.0);
-        let card_inner = (inner - card_pad_x * 2.0).max(1.0);
-        let body_px = crate::native_ui::native_type_px(crate::type_scale::TypeStep::Body).get();
-        let name_w = Subject::all()
-            .into_iter()
-            .map(|subject| crate::tray_raster::ui_text_width(subject.name(), body_px))
-            .fold(0.0_f32, f32::max)
-            .ceil()
-            + 20.0;
-        let chip_w = [
-            Chip::WillChange { busy: true },
-            Chip::NeedsYou,
-            Chip::Failed,
-            Chip::LeftAsIs,
-            Chip::InPlace,
-        ]
-        .into_iter()
-        .map(Chip::width)
-        .fold(0.0_f32, f32::max);
-        Self {
-            compact,
-            pad_x,
-            pad_y: if compact { 10.0 } else { 16.0 },
-            gap: if compact { 10.0 } else { 12.0 },
-            inner,
-            card_pad_x,
-            card_inner,
-            two_line: card_inner < 520.0 * scale.max(1.0),
-            body_px,
-            row_h: (30.0 * scale).max(30.0),
-            line_h: (20.0 * scale).max(20.0),
-            control_h: (30.0 * scale).max(30.0),
-            header_h: (38.0 * scale).max(38.0),
-            name_w: name_w.min(card_inner * 0.45),
-            chip_w,
-        }
-    }
-
-    fn text_w(&self, words: &str) -> f32 {
-        crate::tray_raster::ui_text_width(words, self.body_px).ceil() + 1.0
-    }
-
-    /// The width `words` paint at in the face and size `role` and `style` give them.
-    fn words_w(role: SemanticRole, style: StyleRef, words: &str) -> f32 {
-        let (px, face) = crate::native_ui::text_paint_metrics(role, style);
-        crate::tray_raster::ui_text_width_for(face, words, px).ceil() + 1.0
-    }
-
-    /// A button's width for `words` (padding either side).
-    fn button_w(&self, words: &str) -> f32 {
-        self.text_w(words) + 28.0
-    }
-}
-
-/// One rendering of the page.
-struct Page<'a, 'b> {
-    app: &'a SystemStateApp,
-    view: &'a SystemStateViewState,
-    cx: &'a ViewCx<'b>,
-    m: Metrics,
-    rows: Vec<RowView>,
-    /// Revealable keys and where they sit in the list's content.
-    spans: Vec<Span>,
-}
-
-impl<'a, 'b> Page<'a, 'b> {
-    fn new(app: &'a SystemStateApp, view: &'a SystemStateViewState, cx: &'a ViewCx<'b>) -> Self {
-        let m = Metrics::new(cx.viewport.width.max(64.0), cx.viewport.height.max(120.0));
-        // Until the page knows the plan in force it cannot say which rows
-        // aterm manages: every row reads `—`, with no chip. A newer aterm's
-        // setup names none it can know, so its rows read as they stand.
-        let rows = if app.plan_known {
-            app.reviewed_rows()
-        } else if app.status.newer() {
-            rows_as_they_stand(&app.status)
-        } else {
-            rows(&SetupStatus::default(), Selection::all())
-        };
-        Self {
-            rows,
-            app,
-            view,
-            cx,
-            m,
-            spans: Vec::new(),
-        }
-    }
-
-    fn tree(mut self) -> UiTree {
-        let (pad_x, pad_y, gap, row_h) = (self.m.pad_x, self.m.pad_y, self.m.gap, self.m.row_h);
-        let headline = self.app.headline();
-        let (brand, brand_h, brand_walks) = self.brand();
-        let mut heading = crate::native_settings::page_heading("System State", &headline.text);
-        let subtitle = heading.pop();
-        let mut title = heading.pop();
-        let fixed = |node: Option<&UiNode>| match node.map(|node| node.layout.height) {
-            Some(Length::Fixed(height)) => height,
-            _ => 0.0,
-        };
-        let subtitle_h = fixed(subtitle.as_ref());
-        let mut title_h = fixed(title.as_ref());
-        // A title wider than the page takes a line per word that fits.
-        if let Some(node) = title.as_ref()
-            && let UiContent::Text(spec) = &node.content
-            && Metrics::words_w(spec.role, spec.style, &spec.text) > self.m.inner
-        {
-            let (px, _) = crate::native_ui::text_paint_metrics(spec.role, spec.style);
-            let line_h = (px * 1.2).ceil().min(title_h);
-            let (wrapped, height) = words_node(
-                node.key.as_str(),
-                &spec.text.clone(),
-                spec.role,
-                spec.style,
-                self.m.inner,
-                line_h,
-            );
-            title_h = height + (title_h - line_h).max(0.0);
-            title = Some(
-                wrapped.layout(
-                    Layout::column()
-                        .gap(0.0)
-                        .width(Length::Fill)
-                        .height(Length::Fixed(title_h)),
-                ),
-            );
-        }
-        let stop = self.app.status.running().then_some(!self.app.stopping);
-        let (headline_row, headline_h) = self.headline_row(subtitle, subtitle_h, &headline, stop);
-        // The meter shows only while a run is going (§3.2).
-        let meter = (self.app.plan_known && self.app.status.running()).then(|| self.meter());
-        let (footer, footer_h) = self.footer();
-        let meter_h = if meter.is_some() { 6.0 + 4.0 } else { 0.0 };
-        // The list's lead gap: a spacer between two of the column's own gaps,
-        // so the list sits `gap` under the headline.
-        let lead = (gap - 8.0).max(0.0);
-        // The column's own gaps (4pt between the headline, the lead gap, the
-        // list and the footer) and the lead gap itself.
-        let rest = self.cx.viewport.height
-            - pad_y * 2.0
-            - headline_h
-            - meter_h
-            - footer_h
-            - lead
-            - 4.0 * 3.0;
-        // The room under the tallest headline and the meter any state shows,
-        // which the brand and the title are judged by, so a run that starts,
-        // needs you or fails one step neither takes them away nor puts them
-        // back; a headline naming several rows that stands taller still
-        // counts its own.
-        let steady =
-            rest - (self.tallest_headline().max(headline_h) - headline_h) - (6.0 + 4.0 - meter_h);
-        // A window too short for the headline, the footer and two rows' height
-        // of the list leaves out the brand, then the title: each shows only
-        // where the list keeps that height with it. The list then shrinks to
-        // one row's height before the footer leaves the window, since the list
-        // scrolls and the footer does not.
-        let roomy = row_h * 2.0;
-        let title_cost = title.as_ref().map_or(0.0, |_| title_h + 4.0);
-        let show_title = steady - title_cost >= roomy;
-        let show_brand = show_title && steady - title_cost - (brand_h + 4.0) >= roomy;
-        let list_h = (rest
-            - if show_title { title_cost } else { 0.0 }
-            - if show_brand { brand_h + 4.0 } else { 0.0 })
-        .max(row_h);
-        let list = self.list(list_h);
-        // A village left out with the brand walks for nobody.
-        self.view.village_walks.set(show_brand && brand_walks);
-        let mut children = Vec::new();
-        if show_brand {
-            children.push(brand);
-        }
-        if show_title {
-            children.extend(title);
-        }
-        children.push(headline_row);
-        if let Some(meter) = meter {
-            children.push(meter);
-        }
-        children.push(
-            UiNode::new(
-                "system-state/list-gap",
-                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-            )
-            .layout(Layout::default().height(Length::Fixed(lead)))
-            .paint_only(),
-        );
-        children.push(list);
-        children.push(footer);
-        *self.view.spans.borrow_mut() = std::mem::take(&mut self.spans);
-        UiTree::new(
-            UiNode::new(
-                "system-state/app",
-                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Application)),
-            )
-            .layout(
-                Layout::column()
-                    .padding(Insets::symmetric(pad_x, pad_y))
-                    .gap(4.0)
-                    .clipped(),
-            )
-            .children(children),
-        )
-    }
-
-    /// The brand lockup (§3.1), with its height and whether the village beside
-    /// it walks (it shows, and motion is not reduced).
-    fn brand(&self) -> (UiNode, f32, bool) {
-        // The words' middle dot marks the lockup for the eye; a screen reader hears the words
-        // alone, as it does a row's value.
-        let spoken = paint::BRAND_WORDS.replace(" · ", " ");
-        let mut spec = BrandSpec {
-            kitty: !self.cx.motion.serious
-                && !crate::native_appearance::current_preferences().high_contrast,
-            px: if self.m.compact { 17.0 } else { 22.0 },
-            scale: self.cx.terminal_scale.max(1.0),
-        };
-        // A narrow page sets the whole lockup smaller rather than cut it.
-        while spec.width() > self.m.inner && spec.px > 8.0 {
-            spec.px -= 1.0;
-        }
-        let height =
-            (if self.m.compact { 44.0 } else { 56.0_f32 }).max(spec.needed_height().ceil());
-        let width = spec.width().min(self.m.inner);
-        let village = self.village(spec.kitty, self.m.inner - width - 12.0);
-        let motion = &self.cx.motion;
-        let walks = village.is_some() && !motion.system_reduced && !motion.performance_reduced;
-        let mut children = vec![
-            UiNode::new(
-                "system-state/brand/art",
-                UiContent::Custom(AuditedCustomNode {
-                    audit_id: crate::native_ui::SYSTEM_STATE_BRAND_AUDIT,
-                    role: SemanticRole::Text,
-                    label: spoken.clone(),
-                    paint: Some(spec.value()),
-                    action: None,
-                    focusable: false,
-                    focused: false,
-                    focus_visible: false,
-                }),
-            )
-            .layout(
-                Layout::default()
-                    .width(Length::Fixed(width))
-                    .height(Length::Fill),
-            )
-            .paint_only(),
-        ];
-        children.extend(village);
-        (
-            UiNode::new(
-                "system-state/brand",
-                UiContent::Group(GroupSpec {
-                    label: Some(spoken),
-                    role: SemanticRole::Text,
-                    style: StyleRef::Plain,
-                }),
-            )
-            .layout(Layout::row().gap(12.0).height(Length::Fixed(height)))
-            .children(children),
-            height,
-            walks,
-        )
-    }
-
-    /// The village beside the lockup ([`village_spec`]): the run's progress
-    /// as a scene, never a second mark. It shows where the brand row has
-    /// `room` for it, the plan is known and the kitty may show (not in
-    /// serious mode or high contrast); its kitties stand still where motion
-    /// is reduced. Paint only: the headline and the meter say the same in
-    /// words.
-    fn village(&self, kitty: bool, room: f32) -> Option<UiNode> {
-        if !kitty || !self.app.plan_known || room < VILLAGE_MIN_W {
-            return None;
-        }
-        let motion = &self.cx.motion;
-        // The page's own ticks are the walk's only clock: kitties stand still
-        // between runs, whatever else repaints the page.
-        let phase_ms = if motion.system_reduced || motion.performance_reduced {
-            0
-        } else {
-            self.app.anim_ticks.wrapping_mul(VILLAGE_TICK_MS)
-        };
-        Some(
-            UiNode::new(
-                "system-state/village",
-                UiContent::Custom(AuditedCustomNode {
-                    audit_id: crate::native_ui::RAINBOW_BANNER_AUDIT,
-                    role: SemanticRole::Group,
-                    label: String::new(),
-                    paint: Some(village_spec(
-                        &self.app.status,
-                        &self.rows,
-                        &self.app.reviewed_plan(),
-                        phase_ms,
-                    )),
-                    action: None,
-                    focusable: false,
-                    focused: false,
-                    focus_visible: false,
-                }),
-            )
-            .layout(Layout::default().width(Length::Fill).height(Length::Fill))
-            .paint_only(),
-        )
-    }
-
-    fn button(
-        &self,
-        key: &str,
-        label: String,
-        visual: Option<&str>,
-        style: StyleRef,
-        enabled: bool,
-    ) -> UiNode {
-        let width = self.m.button_w(visual.unwrap_or(&label));
-        let mut spec = ButtonSpec::new(label);
-        spec.visual_label = visual.map(str::to_owned);
-        UiNode::new(
-            key.to_owned(),
-            UiContent::Button(
-                Control::new(spec, ActionId::new(key.to_owned()))
-                    .state(ControlState {
-                        enabled,
-                        ..ControlState::default()
-                    })
-                    .style(style),
-            ),
-        )
-        .layout(
-            Layout::default()
-                .width(Length::Fixed(width))
-                .height(Length::Fixed(self.m.control_h)),
-        )
-    }
-
-    /// A button at most `room` wide, with its width and height: its face on one line where it
-    /// fits, else its words on as many lines as they need in a button `room` wide, else (a
-    /// word wider than the room) its `short` face where that fits.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "a button's words, look and room, as `button` takes them"
-    )]
-    fn fitted_button(
-        &self,
-        key: &str,
-        label: String,
-        visual: Option<&str>,
-        short: Option<&str>,
-        style: StyleRef,
-        enabled: bool,
-        room: f32,
-    ) -> (UiNode, f32, f32) {
-        let face = visual.unwrap_or(&label).to_owned();
-        let width = self.m.button_w(&face);
-        if width <= room {
-            return (
-                self.button(key, label, visual, style, enabled),
-                width,
-                self.m.control_h,
-            );
-        }
-        let mut node = self.button(key, label, Some(&face), style, enabled);
-        let mut height = self.m.control_h;
-        if let UiContent::Button(control) = &mut node.content {
-            let words_room = crate::native_ui::text_button_label_room(&control.spec, room);
-            match crate::native_ui::native_button_label_lines(&face, words_room) {
-                Some(lines) if lines.len() > 1 => {
-                    height = crate::native_ui::native_button_height_for_lines(lines.len(), height);
-                    control.spec.visual_label = Some(lines.join("\n"));
-                }
-                None if short.is_some_and(|short| self.m.button_w(short) <= room) => {
-                    control.spec.visual_label = short.map(str::to_owned);
-                }
-                _ => {}
-            }
-        }
-        (
-            node.layout(
-                Layout::default()
-                    .width(Length::Fixed(room))
-                    .height(Length::Fixed(height)),
-            ),
-            room,
-            height,
-        )
-    }
-
-    /// `buttons` (each `(node, width, height)`) side by side where they fit `room`, else one to
-    /// a row, as one node keyed `key`, with its height.
-    fn button_rows(key: &str, buttons: Vec<(UiNode, f32, f32)>, room: f32) -> (UiNode, f32) {
-        let gaps = 8.0 * buttons.len().saturating_sub(1) as f32;
-        // Side by side, the trailing space takes a gap too.
-        let side_by_side = buttons.iter().map(|b| b.1).sum::<f32>() + gaps + 8.0 <= room;
-        let height = if side_by_side {
-            buttons.iter().map(|b| b.2).fold(0.0_f32, f32::max)
-        } else {
-            buttons.iter().map(|b| b.2).sum::<f32>() + gaps
-        };
-        let layout = if side_by_side {
-            Layout::row()
-        } else {
-            Layout::column()
-        };
-        let mut children: Vec<UiNode> = buttons.into_iter().map(|b| b.0).collect();
-        if side_by_side {
-            children.push(
-                UiNode::new(
-                    format!("{key}/space"),
-                    UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-                )
-                .layout(Layout::default().width(Length::Fill))
-                .paint_only(),
-            );
-        }
-        (
-            UiNode::new(
-                key.to_owned(),
-                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-            )
-            .layout(layout.gap(8.0).height(Length::Fixed(height)))
-            .children(children),
-            height,
-        )
-    }
-
-    /// Centre `node` (of `height`) down a row `row_h` tall.
-    fn centred(key: String, node: UiNode, width: Length, height: f32, row_h: f32) -> UiNode {
-        let top = ((row_h - height) / 2.0).max(0.0);
-        UiNode::new(
-            key,
-            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-        )
-        .layout(
-            Layout::column()
-                .width(width)
-                .height(Length::Fixed(row_h))
-                .padding(Insets {
-                    top,
-                    right: 0.0,
-                    bottom: 0.0,
-                    left: 0.0,
-                }),
-        )
-        .children(vec![node])
-    }
-
-    /// The height of the tallest headline the page's states put at this
-    /// width, each with Stop beside it: waiting on the debugger password, one
-    /// that needs you with its Turn On or its Show, one failed step with its Show
-    /// and Set up now, one waiting step with its Show, changes to make with Set
-    /// up now, and the run's own words.
-    /// The forms that name a row name the longest, and those that count rows
-    /// count every row. A longer list of names can stand taller still; the
-    /// page then counts its own.
-    fn tallest_headline(&self) -> f32 {
-        let rows = Subject::all();
-        let longest = rows
-            .iter()
-            .copied()
-            .max_by_key(|subject| subject.name().len())
-            .unwrap_or(Subject::Access(Access::Debugger))
-            .name();
-        let (all, more) = (rows.len(), rows.len().saturating_sub(1));
-        let needs = format!("Needs you: {longest} and {more} more");
-        let forms = [
-            Headline::line(format!(
-                "Enter your password for {}",
-                Access::Debugger.name()
-            )),
-            Headline::line(TOOLS_PASSWORD_HEADLINE),
-            Headline::line(TOOLS_RECOVERED_HEADLINE),
-            Headline {
-                open: Some(Access::Debugger),
-                ..Headline::line(needs.clone())
-            },
-            Headline {
-                show: Some(Subject::Access(Access::Debugger)),
-                ..Headline::line(needs)
-            },
-            Headline {
-                show: Some(Subject::Access(Access::Debugger)),
-                start: true,
-                ..Headline::line(format!("1 step failed: {longest}"))
-            },
-            Headline {
-                show: Some(Subject::Access(Access::Debugger)),
-                ..Headline::line(format!("1 step waiting: {longest}"))
-            },
-            Headline {
-                start: true,
-                ..Headline::line(format!("{all} changes to make"))
-            },
-            Headline::line(format!("Setting up this Mac… {all} of {all}")),
-            Headline::line("Restoring previous settings…"),
-        ];
-        forms
-            .iter()
-            .map(|form| {
-                let subtitle =
-                    crate::native_settings::page_heading("System State", &form.text).pop();
-                let subtitle_h = match subtitle.as_ref().map(|node| node.layout.height) {
-                    Some(Length::Fixed(height)) => height,
-                    _ => 0.0,
-                };
-                self.headline_row(subtitle, subtitle_h, form, Some(true)).1
-            })
-            .fold(0.0, f32::max)
-    }
-
-    /// The headline (§3.2) beside its button: Open, Show, Set up now, or Stop,
-    /// which `stop` asks for while a run is going and says whether it is enabled.
-    /// Where they do not fit one line, the words take the page's width and the
-    /// buttons go under them. Returns the node and its height.
-    fn headline_row(
-        &self,
-        subtitle: Option<UiNode>,
-        subtitle_h: f32,
-        headline: &Headline,
-        stop: Option<bool>,
-    ) -> (UiNode, f32) {
-        let m = &self.m;
-        let row_h = subtitle_h.max(m.control_h);
-        let mut faces: Vec<(&str, String, Option<&str>, StyleRef, bool)> = Vec::new();
-        let open_key = headline
-            .open
-            .map(|access| format!("system-state/headline/open/{}", access.word()));
-        if let Some((access, key)) = headline.open.zip(open_key.as_deref()) {
-            let (label, visual) = open_words(access);
-            faces.push((key, label, Some(visual), StyleRef::Accent, true));
-        }
-        if let Some(subject) = headline.show {
-            faces.push((
-                "system-state/headline/show",
-                format!("Show {}", subject.name()),
-                Some("Show"),
-                StyleRef::Secondary,
-                true,
-            ));
-        }
-        if headline.start {
-            // Its label is the action alone: the headline beside it already says what it is
-            // about, and VoiceOver reads them together.
-            faces.push((
-                "system-state/headline/start",
-                "Set up now".to_owned(),
-                None,
-                StyleRef::Accent,
-                true,
-            ));
-        }
-        if let Some(enabled) = stop {
-            faces.push((
-                "system-state/stop",
-                "Stop".to_owned(),
-                None,
-                StyleRef::Secondary,
-                enabled,
-            ));
-        }
-        // The buttons sit beside the words they act on (§3.2), not across
-        // the page from them.
-        let buttons_w: f32 = faces
-            .iter()
-            .map(|(_, label, visual, ..)| m.button_w(visual.unwrap_or(label)) + 8.0)
-            .sum();
-        let words_w = Metrics::words_w(SemanticRole::Text, StyleRef::Quiet, &headline.text) + 12.0;
-        if words_w + buttons_w <= m.inner {
-            let mut children = Vec::new();
-            if let Some(subtitle) = subtitle {
-                children.push(Self::centred(
-                    "system-state/headline".to_owned(),
-                    subtitle,
-                    Length::Fixed(words_w),
-                    subtitle_h,
-                    row_h,
-                ));
-            }
-            children.extend(
-                faces
-                    .into_iter()
-                    .map(|(key, label, visual, style, enabled)| {
-                        self.button(key, label, visual, style, enabled)
-                    }),
-            );
-            children.push(
-                UiNode::new(
-                    "system-state/headline/space",
-                    UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-                )
-                .layout(Layout::default().width(Length::Fill))
-                .paint_only(),
-            );
-            return (
-                UiNode::new(
-                    "system-state/headline-row",
-                    UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-                )
-                .layout(Layout::row().gap(8.0).height(Length::Fixed(row_h)))
-                .children(children),
-                row_h,
-            );
-        }
-        let mut children = Vec::new();
-        let mut height = 0.0;
-        if subtitle.is_some() {
-            let (words, words_h) = words_node(
-                "settings/page-subtitle/system-state",
-                &headline.text,
-                SemanticRole::Text,
-                StyleRef::Quiet,
-                m.inner,
-                subtitle_h,
-            );
-            children.push(
-                UiNode::new(
-                    "system-state/headline",
-                    UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-                )
-                .layout(Layout::column().height(Length::Fixed(words_h)))
-                .children(vec![words]),
-            );
-            height += words_h;
-        }
-        if !faces.is_empty() {
-            let buttons = faces
-                .into_iter()
-                .map(|(key, label, visual, style, enabled)| {
-                    self.fitted_button(key, label, visual, None, style, enabled, m.inner)
-                })
-                .collect();
-            let (buttons, buttons_h) =
-                Self::button_rows("system-state/headline/buttons", buttons, m.inner);
-            if height > 0.0 {
-                height += 4.0;
-            }
-            children.push(buttons);
-            height += buttons_h;
-        }
-        (
-            UiNode::new(
-                "system-state/headline-row",
-                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-            )
-            .layout(Layout::column().gap(4.0).height(Length::Fixed(height)))
-            .children(children),
-            height,
-        )
-    }
-
-    fn meter(&self) -> UiNode {
-        let managed = self.rows.iter().filter(|row| row.managed).count();
-        let done = self.rows.iter().filter(|row| row.settled()).count();
-        UiNode::new(
-            "system-state/meter",
-            UiContent::Custom(AuditedCustomNode {
-                audit_id: crate::native_ui::SYSTEM_STATE_METER_AUDIT,
-                role: SemanticRole::Group,
-                label: String::new(),
-                paint: Some(format!("{done},{managed}")),
-                action: None,
-                focusable: false,
-                focused: false,
-                focus_visible: false,
-            }),
-        )
-        .layout(
-            Layout::default()
-                .width(Length::Fixed(self.m.inner.min(320.0)))
-                .height(Length::Fixed(6.0)),
-        )
-        .paint_only()
-    }
-
-    /// Check again, and, quiet and right-aligned, Restore previous settings
-    /// (§3.4); one to a row where both do not fit. Returns the node and its height.
-    fn footer(&self) -> (UiNode, f32) {
-        let room = self.m.inner;
-        let check = self.fitted_button(
-            "system-state/check",
-            "Check again".to_owned(),
-            None,
-            Some("Check"),
-            StyleRef::Secondary,
-            self.app.can_check(),
-            room,
-        );
-        // A Restore waiting for another setup says so on its own button, which waits with it.
-        let status = &self.app.status;
-        let restore_waits = status.queued && status.operation == Some(SetupOperation::Restore);
-        let mut restore = if restore_waits {
-            self.fitted_button(
-                "system-state/restore",
-                RESTORE_WAITS.to_owned(),
-                None,
-                Some("Waiting…"),
-                StyleRef::Quiet,
-                false,
-                room,
-            )
-        } else {
-            self.fitted_button(
-                "system-state/restore",
-                RESTORE_FINISHED.to_owned(),
-                None,
-                Some("Restore"),
-                StyleRef::Quiet,
-                self.app.can_restore(),
-                room,
-            )
-        };
-        if let UiContent::Button(control) = &mut restore.0.content {
-            control.spec.description = Some(if restore_waits {
-                QUEUED_RESTORE_NOTE.to_owned()
-            } else {
-                "Puts back the Mac preferences aterm saved before changing them. Sign-outs, \
-                 Rust docs, repositories, credentials and permissions stay."
-                    .to_owned()
-            });
-        }
-        let side_by_side = check.1 + 16.0 + restore.1 <= room;
-        if !side_by_side {
-            return Self::button_rows("system-state/footer", vec![check, restore], room);
-        }
-        let height = check.2.max(restore.2);
-        (
-            UiNode::new(
-                "system-state/footer",
-                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-            )
-            .layout(Layout::row().gap(8.0).height(Length::Fixed(height)))
-            .children(vec![
-                check.0,
-                UiNode::new(
-                    "system-state/footer/space",
-                    UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-                )
-                .layout(Layout::default().width(Length::Fill))
-                .paint_only(),
-                restore.0,
-            ]),
-            height,
-        )
-    }
-
-    /// The scrolling list: the notes an observation cannot carry, then the
-    /// five groups, `list_h` tall. A list that scrolls keeps its last
-    /// [`FADE_STRIP`] as a strip its rows fade out in, so a card its room
-    /// cuts reads as going on, never as a control cut off with no words; and
-    /// it reaches into the page's right gutter, where its thumb stands clear
-    /// of the cards, as a Settings page's does
-    /// (`settings_scroll::seat_page_scroller`): cards, headline and footer
-    /// end at one edge.
-    fn list(&mut self, list_h: f32) -> UiNode {
-        let gap = self.m.gap;
-        let mut items: Vec<(UiNode, f32)> = Vec::new();
-        let mut top = 0.0;
-        let reviewed = self.app.reviewed_plan();
-        let notes = self.app.notes(&reviewed);
-        for (index, note) in notes.iter().enumerate() {
-            let (node, height) = crate::native_settings::wrapped_copy_node(
-                &format!("system-state/note/{index}"),
-                note,
-                SemanticRole::Text,
-                StyleRef::Secondary,
-                self.m.inner,
-                self.m.line_h,
-                Some(3),
-            );
-            self.span(format!("system-state/note/{index}"), top, height);
-            items.push((node, height));
-            top += height + gap;
-        }
-        for (index, group) in Group::ALL.into_iter().enumerate() {
-            let (node, height) = self.card(index, group, top);
-            items.push((node, height));
-            top += height + gap;
-        }
-        let content = (top - gap).max(0.0);
-        let scrolls = content > list_h + 0.5;
-        // The live room, above the strip: the last row scrolls fully into it.
-        let room = if scrolls {
-            list_h - FADE_STRIP.min(list_h / 4.0)
-        } else {
-            list_h
-        };
-        let limit = (content - room).max(0.0);
-        let mut offset = self.view.scroll.get().clamp(0.0, limit);
-        // A room that shrank (as when the brand or the title comes back, or
-        // the window gets shorter), or a list whose rows above it changed
-        // height (a vault row whose note leaves once a draft address is typed),
-        // keeps in view the focused control it showed: whole, or more of it
-        // than a sliver the list leaves unpainted.
-        let (was, before) = (self.view.room.get(), self.view.scroll.get());
-        const EDGE: f32 = crate::native_ui::CLIP_EDGE_EPSILON;
-        if let Some(focus) = self.view.common.last_focus.as_ref()
-            && let Some((old_top, old_bottom)) = self
-                .view
-                .spans
-                .borrow()
-                .iter()
-                .find(|span| *span.key == *focus.as_str())
-                .map(|span| (span.top, span.bottom))
-            && let Some(span) = self.spans.iter().find(|span| *span.key == *focus.as_str())
-            && (room + EDGE < was || (span.top - old_top).abs() > EDGE)
-            && old_bottom.min(before + was) - old_top.max(before) + EDGE
-                >= crate::native_ui::LIST_PEEK_MIN.min(old_bottom - old_top)
-        {
-            offset = whole_at(offset, room, span.top, span.bottom).clamp(0.0, limit);
-        }
-        self.view.scroll.set(offset);
-        self.view.height.set(list_h);
-        self.view.room.set(room);
-        self.view.limit.set(limit);
-        let mut y = 0.0;
-        let children: Vec<UiNode> = items
-            .into_iter()
-            .map(|(node, height)| {
-                let (item_top, item_bottom) = (y - offset, y - offset + height);
-                y += height + gap;
-                if item_bottom <= 0.01 || item_top >= list_h - 0.01 {
-                    node.offscreen()
-                } else {
-                    node
-                }
-            })
-            .collect();
-        let list = UiNode::new(
-            "system-state/groups",
-            UiContent::Group(GroupSpec {
-                label: Some("Mac setup".to_owned()),
-                role: if scrolls {
-                    SemanticRole::List
-                } else {
-                    SemanticRole::Group
-                },
-                style: StyleRef::Plain,
-            }),
-        )
-        .layout(
-            Layout::column()
-                .width(Length::Fill)
-                .height(Length::Fixed(list_h))
-                .gap(gap)
-                .padding(Insets {
-                    top: 0.0,
-                    right: if scrolls { self.m.pad_x } else { 0.0 },
-                    bottom: 0.0,
-                    left: 0.0,
-                })
-                .scrolled(offset)
-                .clipped(),
-        )
-        .room(room, scrolls)
-        .lists_every_row()
-        .children(children);
-        if !scrolls {
-            return list;
-        }
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "points of a page a few thousand tall, rounded"
-        )]
-        let share = format!(
-            "{},{},{}",
-            offset.round() as u32,
-            room.round() as u32,
-            content.round() as u32
-        );
-        UiNode::new(
-            "system-state/scroll",
-            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-        )
-        .layout(
-            Layout::default()
-                .width(Length::Fill)
-                .height(Length::Fixed(list_h))
-                .outdent(Insets {
-                    right: self.m.pad_x,
-                    ..Insets::default()
-                }),
-        )
-        .children(vec![
-            list,
-            UiNode::new(
-                "system-state/scroll/thumb",
-                UiContent::Custom(AuditedCustomNode {
-                    audit_id: crate::native_ui::PAGE_SCROLL_AUDIT,
-                    role: SemanticRole::Group,
-                    label: String::new(),
-                    paint: Some(share),
-                    action: None,
-                    focusable: false,
-                    focused: false,
-                    focus_visible: false,
-                }),
-            )
-            .layout(
-                Layout::default()
-                    .width(Length::Fill)
-                    .height(Length::Fixed(room)),
-            )
-            .paint_only(),
-        ])
-    }
-
-    fn span(&mut self, key: impl Into<Arc<str>>, top: f32, height: f32) {
-        self.spans.push(Span {
-            key: key.into(),
-            top,
-            bottom: top + height,
-        });
-    }
-
-    /// One group's card (§3.3): its name, count and segmented choice over its
-    /// rows. `top` is where it starts in the list.
-    fn card(&mut self, index: usize, group: Group, top: f32) -> (UiNode, f32) {
-        let selection = self.app.plan.selection;
-        let (count, label) = if self.app.plan_known {
-            group_words(group, selection, &self.rows)
-        } else {
-            (None, group.title().to_owned())
-        };
-        let key = format!("system-state/group/{index}");
-        let mut y = Metrics::CARD_PAD_Y;
-        let mut children = Vec::new();
-        let (header, header_h) = self.card_header(index, group, count);
-        self.span(format!("{key}/set-up"), top + y, header_h);
-        self.span(format!("{key}/leave"), top + y, header_h);
-        children.push(header);
-        y += header_h;
-        let members: Vec<RowView> = self
-            .rows
-            .iter()
-            .filter(|row| row.subject.group() == group)
-            .cloned()
-            .collect();
-        for row in &members {
-            children.push(rule(format!(
-                "system-state/row/{}/rule",
-                row_slug(row.subject)
-            )));
-            y += 1.0;
-            let (node, height) = self.row(row);
-            let slug = row_slug(row.subject);
-            self.span(format!("system-state/row/{slug}"), top + y, height);
-            if row.open.is_some() {
-                self.span(format!("system-state/row/{slug}/open"), top + y, height);
-            }
-            if row.turn_on_sync {
-                self.span(TURN_ON_SYNC.to_owned(), top + y, height);
-            }
-            if row.install_tools {
-                self.span(INSTALL_TOOLS.to_owned(), top + y, height);
-            }
-            children.push(node);
-            y += height;
-            if row.subject == Subject::Setting(Setting::Secrets) {
-                for (node, height, keys) in self.vault(top + y) {
-                    for (key, at, h) in keys {
-                        self.span(key, at, h);
-                    }
-                    children.push(node);
-                    y += height;
-                }
-            }
-        }
-        y += Metrics::CARD_PAD_Y;
-        self.span(key.clone(), top, y);
-        (
-            UiNode::new(
-                key,
-                UiContent::Group(GroupSpec {
-                    label: Some(label),
-                    role: SemanticRole::Group,
-                    style: StyleRef::Secondary,
-                }),
-            )
-            .layout(
-                Layout::column()
-                    .width(Length::Fill)
-                    .height(Length::Fixed(y))
-                    .padding(Insets {
-                        top: Metrics::CARD_PAD_Y,
-                        right: self.m.card_pad_x,
-                        bottom: Metrics::CARD_PAD_Y,
-                        left: self.m.card_pad_x,
-                    }),
-            )
-            .children(children),
-            y,
-        )
-    }
-
-    /// A group's name, its count, and `Set up │ Leave as is`: one line where they fit,
-    /// else the name (and the count beside it where both fit) over the choice, whose two
-    /// buttons go one to a row, the card's width, where side by side they do not fit.
-    fn card_header(&self, index: usize, group: Group, count: Option<String>) -> (UiNode, f32) {
-        let m = &self.m;
-        let key = format!("system-state/group/{index}");
-        // Until the plan is known, neither segment is chosen; neither is
-        // pressable then, nor while a Restore changes the plan (§3.4).
-        let known = self.app.plan_known;
-        let pressable = known && !self.app.restoring();
-        let choice = if known {
-            group_choice(group, self.app.plan.selection)
-        } else {
-            GroupChoice::Partly
-        };
-        let seg_h = m.control_h;
-        let seg_w = m.button_w("Set up") + m.button_w("Leave as is") + 2.0;
-        let stacked_choice = seg_w > m.card_inner;
-        let segments: Vec<(UiNode, f32)> = [("set-up", "Set up"), ("leave", "Leave as is")]
-            .into_iter()
-            .map(|(word, words)| {
-                let chosen = match choice {
-                    GroupChoice::SetUp => word == "set-up",
-                    GroupChoice::LeaveAsIs => word == "leave",
-                    GroupChoice::Partly => false,
-                };
-                let mut spec = ButtonSpec {
-                    visual_label: Some(words.to_owned()),
-                    ..ButtonSpec::new(format!("{}: {words}", group.title()))
-                };
-                let (width, height) = if stacked_choice {
-                    let room = crate::native_ui::text_button_label_room(&spec, m.card_inner);
-                    let lines = crate::native_ui::native_button_label_lines(words, room)
-                        .filter(|lines| lines.len() > 1);
-                    let height = lines.as_ref().map_or(seg_h, |lines| {
-                        crate::native_ui::native_button_height_for_lines(lines.len(), seg_h)
-                    });
-                    if let Some(lines) = lines {
-                        spec.visual_label = Some(lines.join("\n"));
-                    }
-                    (Length::Fixed(m.card_inner), height)
-                } else {
-                    (Length::Fixed(m.button_w(words)), seg_h)
-                };
-                let mut control = Control::new(spec, ActionId::new(format!("{key}/{word}")))
-                    .state(ControlState {
-                        selected: chosen,
-                        enabled: pressable,
-                        ..ControlState::default()
-                    })
-                    .style(StyleRef::Navigation);
-                if chosen {
-                    control = control.value(SemanticValue::Text(words.to_owned()));
-                }
-                let height_len = if stacked_choice {
-                    Length::Fixed(height)
-                } else {
-                    Length::Fill
-                };
-                (
-                    UiNode::new(format!("{key}/{word}"), UiContent::Button(control))
-                        .layout(Layout::default().width(width).height(height_len)),
-                    height,
-                )
-            })
-            .collect();
-        let choice_h = if stacked_choice {
-            segments.iter().map(|s| s.1).sum::<f32>() + 4.0
-        } else {
-            seg_h
-        };
-        let choice_group = UiNode::new(
-            format!("{key}/choice"),
-            UiContent::Group(GroupSpec {
-                label: Some(group.title().to_owned()),
-                role: SemanticRole::Group,
-                style: StyleRef::Secondary,
-            }),
-        );
-        let segments: Vec<UiNode> = segments.into_iter().map(|s| s.0).collect();
-        let segmented = if stacked_choice {
-            choice_group
-                .layout(
-                    Layout::column()
-                        .gap(4.0)
-                        .width(Length::Fixed(m.card_inner))
-                        .height(Length::Fixed(choice_h)),
-                )
-                .children(segments)
-        } else {
-            choice_group
-                .layout(
-                    Layout::row()
-                        .gap(2.0)
-                        .width(Length::Fixed(seg_w))
-                        .height(Length::Fixed(seg_h)),
-                )
-                .children(segments)
-                .segmented()
-        };
-        let title = UiNode::new(
-            format!("{key}/title"),
-            UiContent::Text(TextSpec {
-                text: group.title().to_owned(),
-                role: SemanticRole::Heading,
-                style: StyleRef::Plain,
-            }),
-        );
-        let title_w = Metrics::words_w(SemanticRole::Heading, StyleRef::Plain, group.title()) + 4.0;
-        let count_w = count
-            .as_deref()
-            .map(|count| Metrics::words_w(SemanticRole::Text, StyleRef::Quiet, count) + 4.0);
-        let count_node = |count: String| {
-            UiNode::new(
-                format!("{key}/count"),
-                UiContent::Text(TextSpec {
-                    text: count,
-                    role: SemanticRole::Text,
-                    style: StyleRef::Quiet,
-                }),
-            )
-            .paint_only()
-        };
-        let one_line = title_w + count_w.unwrap_or(0.0) + 24.0 + seg_w <= m.card_inner;
-        if !one_line {
-            let line = m.header_h * 0.8;
-            let count_beside = count_w.is_some_and(|w| title_w + 12.0 + w <= m.card_inner);
-            let mut column = Vec::new();
-            let mut height = 0.0;
-            if title_w <= m.card_inner {
-                let mut top_line = vec![
-                    title.layout(
-                        Layout::default()
-                            .width(Length::Fixed(title_w))
-                            .height(Length::Fill),
-                    ),
-                ];
-                if count_beside && let Some(count) = count.clone() {
-                    top_line.push(
-                        count_node(count)
-                            .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
-                    );
-                }
-                column.push(
-                    UiNode::new(
-                        format!("{key}/header/line"),
-                        UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-                    )
-                    .layout(Layout::row().gap(12.0).height(Length::Fixed(line)))
-                    .children(top_line),
-                );
-                height += line;
-            } else {
-                let (title, title_h) = words_node(
-                    &format!("{key}/title"),
-                    group.title(),
-                    SemanticRole::Heading,
-                    StyleRef::Plain,
-                    m.card_inner,
-                    m.line_h,
-                );
-                column.push(title);
-                height += title_h;
-            }
-            if let Some(count) = count.filter(|_| !count_beside) {
-                let (count, count_h) = words_node(
-                    &format!("{key}/count"),
-                    &count,
-                    SemanticRole::Text,
-                    StyleRef::Quiet,
-                    m.card_inner,
-                    m.line_h,
-                );
-                column.push(count.paint_only());
-                height += count_h;
-            }
-            column.push(segmented);
-            height += choice_h + 6.0;
-            return (
-                UiNode::new(
-                    format!("{key}/header"),
-                    UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-                )
-                .layout(
-                    Layout::column()
-                        .gap(0.0)
-                        .height(Length::Fixed(height))
-                        .padding(Insets {
-                            top: 0.0,
-                            right: 0.0,
-                            bottom: 6.0,
-                            left: 0.0,
-                        }),
-                )
-                .children(column),
-                height,
-            );
-        }
-        let row_h = m.header_h;
-        let mut children = vec![
-            title.layout(
-                Layout::default()
-                    .width(Length::Fixed(title_w))
-                    .height(Length::Fill),
-            ),
-        ];
-        children.push(match count {
-            Some(count) => {
-                count_node(count).layout(Layout::default().width(Length::Fill).height(Length::Fill))
-            }
-            None => UiNode::new(
-                format!("{key}/header/space"),
-                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-            )
-            .layout(Layout::default().width(Length::Fill))
-            .paint_only(),
-        });
-        children.push(Self::centred(
-            format!("{key}/choice-seat"),
-            segmented,
-            Length::Fixed(seg_w),
-            seg_h,
-            row_h,
-        ));
-        (
-            UiNode::new(
-                format!("{key}/header"),
-                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-            )
-            .layout(Layout::row().gap(12.0).height(Length::Fixed(row_h)))
-            .children(children),
-            row_h,
-        )
-    }
-
-    /// The value's words as text pieces: `now → wanted`, one value, or the
-    /// muted reading, each `(words, style)`.
-    fn value_pieces(row: &RowView) -> Vec<(String, StyleRef)> {
-        match &row.value {
-            RowValue::Change { now, wanted } => vec![
-                (now.clone(), StyleRef::Secondary),
-                ("→".to_owned(), StyleRef::Quiet),
-                (wanted.clone(), StyleRef::Primary),
-            ],
-            RowValue::One(value) => vec![(value.clone(), StyleRef::Primary)],
-            RowValue::Muted(value) => vec![(value.clone(), StyleRef::Secondary)],
-        }
-    }
-
-    /// Paint-only text nodes for `pieces`, keyed from `first` on, each as wide as its
-    /// words, within `room` (the last one takes what is left).
-    fn value_nodes(
-        &self,
-        key: &str,
-        pieces: Vec<(String, StyleRef)>,
-        first: usize,
-        room: f32,
-    ) -> Vec<UiNode> {
-        let mut left = room.max(0.0);
-        pieces
-            .into_iter()
-            .enumerate()
-            .map(|(index, (words, style))| {
-                let index = first + index;
-                // The last piece takes what is left, elided where it must be.
-                let width = self.m.text_w(&words).min(left);
-                left = (left - width - 8.0).max(0.0);
-                UiNode::new(
-                    format!("{key}/value/{index}"),
-                    UiContent::Text(TextSpec {
-                        text: words,
-                        role: SemanticRole::Text,
-                        style,
-                    }),
-                )
-                .layout(
-                    Layout::default()
-                        .width(Length::Fixed(width))
-                        .height(Length::Fill),
-                )
-                .paint_only()
-            })
-            .collect()
-    }
-
-    /// The chip's node, as wide as the widest chip (a column), or `own` its own width.
-    fn chip_node(&self, key: &str, chip: Option<Chip>) -> UiNode {
-        self.chip_node_as(key, chip, false)
-    }
-
-    fn chip_node_as(&self, key: &str, chip: Option<Chip>, own: bool) -> UiNode {
-        let width = match chip {
-            Some(chip) if own => chip.width().ceil(),
-            _ => self.m.chip_w,
-        };
-        match chip {
-            Some(chip) => UiNode::new(
-                format!("{key}/chip"),
-                UiContent::Custom(AuditedCustomNode {
-                    audit_id: crate::native_ui::SYSTEM_STATE_CHIP_AUDIT,
-                    role: SemanticRole::Text,
-                    label: chip.spoken().to_owned(),
-                    paint: Some(chip.value().to_owned()),
-                    action: None,
-                    focusable: false,
-                    focused: false,
-                    focus_visible: false,
-                }),
-            ),
-            None => UiNode::new(
-                format!("{key}/chip"),
-                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-            ),
-        }
-        .layout(
-            Layout::default()
-                .width(Length::Fixed(width))
-                .height(Length::Fill),
-        )
-        .paint_only()
-    }
-
-    /// One row (§3.3): its name, value and chip, read as one line by a
-    /// screen reader, and its quiet button (a Needs-you row's, or the vault's
-    /// Turn On Sync). Where one line cannot hold them, the value goes under the
-    /// name, `now` and `→ wanted` each on a line of its own where together they do
-    /// not fit, the chip under them where it does not fit beside the name, and the
-    /// button on its own line where it does not fit beside the value. Its note
-    /// follows it.
-    fn row(&self, row: &RowView) -> (UiNode, f32) {
-        let m = &self.m;
-        let slug = row_slug(row.subject);
-        let key = format!("system-state/row/{slug}");
-        let name_style = if row.managed || row.chip != Some(Chip::LeftAsIs) {
-            StyleRef::Primary
-        } else {
-            StyleRef::Secondary
-        };
-        let name_text = row.subject.name();
-        // The button's key, label, face and shortest face.
-        // A row read as what Apply will do has none (`row_view_as`).
-        let face = row
-            .open
-            .map(|access| {
-                let (label, short) = open_words(access);
-                let visual = (access == Access::Debugger).then_some(short);
-                (format!("{key}/open"), label, visual, Some(short))
-            })
-            .or_else(|| {
-                row.turn_on_sync.then(|| {
-                    (
-                        TURN_ON_SYNC.to_owned(),
-                        "Turn On Sync".to_owned(),
-                        None,
-                        None,
-                    )
-                })
-            })
-            .or_else(|| {
-                row.install_tools.then(|| {
-                    (
-                        INSTALL_TOOLS.to_owned(),
-                        "Install Command Line Tools…".to_owned(),
-                        Some("Install…"),
-                        Some("Install…"),
-                    )
-                })
-            });
-        let face_w = face
-            .as_ref()
-            .map(|(_, label, visual, _)| m.button_w(visual.unwrap_or(label)));
-        let spacer = |name: &str| {
-            UiNode::new(
-                format!("{key}/{name}"),
-                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-            )
-            .layout(Layout::default().width(Length::Fill))
-            .paint_only()
-        };
-        let line_of = |name: String, children: Vec<UiNode>, height: f32| {
-            UiNode::new(
-                name,
-                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-            )
-            .layout(Layout::row().gap(8.0).height(Length::Fixed(height)))
-            .children(children)
-            .paint_only()
-        };
-        let pieces = Self::value_pieces(row);
-        let pieces_w = |pieces: &[(String, StyleRef)]| {
-            pieces.iter().map(|(words, _)| m.text_w(words)).sum::<f32>()
-                + 8.0 * pieces.len().saturating_sub(1) as f32
-        };
-        let value_w = pieces_w(&pieces);
-        let beside = face_w.map_or(0.0, |width| width + 8.0);
-        // The one line's gaps: after the name, the value and the space.
-        let one_line = !m.two_line
-            && m.text_w(name_text) <= m.name_w
-            && value_w <= m.card_inner - m.name_w - m.chip_w - beside - 24.0;
-        // Each text line's height, and where the button's line starts (`None`: beside the chip).
-        let (info, row_h, button_at) = if one_line {
-            let room = m.card_inner - m.name_w - m.chip_w - beside - 24.0;
-            let mut children = vec![
-                UiNode::new(
-                    format!("{key}/name"),
-                    UiContent::Text(TextSpec {
-                        text: name_text.to_owned(),
-                        role: SemanticRole::Text,
-                        style: name_style,
-                    }),
-                )
-                .layout(
-                    Layout::default()
-                        .width(Length::Fixed(m.name_w))
-                        .height(Length::Fill),
-                )
-                .paint_only(),
-            ];
-            children.extend(self.value_nodes(&key, pieces, 0, room));
-            children.push(spacer("space"));
-            children.push(self.chip_node(&key, row.chip));
-            let info = UiNode::new(
-                format!("{key}/info"),
-                UiContent::Group(GroupSpec {
-                    label: Some(row.label.clone()),
-                    role: SemanticRole::Text,
-                    style: StyleRef::Plain,
-                }),
-            )
-            .layout(
-                Layout::row()
-                    .gap(8.0)
-                    .width(Length::Fill)
-                    .height(Length::Fill),
-            )
-            .children(children);
-            (info, m.row_h, None)
-        } else {
-            let line_h = m.row_h * 0.8;
-            let mut lines = Vec::new();
-            let mut height = 0.0;
-            // The name, and the chip beside it where both fit.
-            let chip_beside = m.text_w(name_text) + 8.0 + m.chip_w <= m.card_inner;
-            let name_room = if chip_beside {
-                m.card_inner - m.chip_w - 8.0
-            } else {
-                m.card_inner
-            };
-            let (name, name_h) = words_node(
-                &format!("{key}/name"),
-                name_text,
-                SemanticRole::Text,
-                name_style,
-                name_room,
-                line_h,
-            );
-            let mut first = vec![name.paint_only()];
-            if chip_beside {
-                first.push(self.chip_node(&key, row.chip));
-            }
-            lines.push(line_of(format!("{key}/line-0"), first, name_h));
-            height += name_h;
-            // The value, beside the button where both fit.
-            let button_beside = face_w.is_some_and(|width| value_w + 16.0 + width <= m.card_inner);
-            let value_room = m.card_inner - if button_beside { beside } else { 0.0 };
-            let value_top = height;
-            // A value line ends in a space, which takes a gap.
-            if value_w + 8.0 <= value_room {
-                let mut second = self.value_nodes(&key, pieces, 0, value_room);
-                second.push(spacer("space"));
-                lines.push(line_of(format!("{key}/line-1"), second, line_h));
-                height += line_h;
-            } else {
-                // `now`, then `→ wanted`, each on its line, its words wrapped where one
-                // line cannot hold them.
-                let mut at = 0;
-                for (index, part) in pieces
-                    .chunks(1)
-                    .take(1)
-                    .chain(pieces[1..].chunks(2))
-                    .enumerate()
-                {
-                    let part = part.to_vec();
-                    let part_w = pieces_w(&part);
-                    let first = at;
-                    at += part.len();
-                    let (children, part_h) = if part_w + 8.0 <= m.card_inner {
-                        let mut children = self.value_nodes(&key, part, first, m.card_inner);
-                        children.push(spacer(&format!("space-{index}")));
-                        (children, line_h)
-                    } else {
-                        // The last piece wraps beside any before it (the arrow).
-                        let (last_words, last_style) = part[part.len() - 1].clone();
-                        let lead: Vec<(String, StyleRef)> = part[..part.len() - 1].to_vec();
-                        let lead_w = if lead.is_empty() {
-                            0.0
-                        } else {
-                            pieces_w(&lead) + 8.0
-                        };
-                        let mut children = self.value_nodes(&key, lead, first, lead_w);
-                        let (words, words_h) = words_node(
-                            &format!("{key}/value/{}", first + part.len() - 1),
-                            &last_words,
-                            SemanticRole::Text,
-                            last_style,
-                            m.card_inner - lead_w,
-                            line_h,
-                        );
-                        children.push(words.paint_only());
-                        (children, words_h)
-                    };
-                    lines.push(line_of(
-                        format!("{key}/line-{}", index + 1),
-                        children,
-                        part_h,
-                    ));
-                    height += part_h;
-                }
-            }
-            if !chip_beside {
-                lines.push(line_of(
-                    format!("{key}/line-chip"),
-                    vec![
-                        self.chip_node_as(&key, row.chip, true),
-                        spacer("chip-space"),
-                    ],
-                    line_h,
-                ));
-                height += line_h;
-            }
-            let info = UiNode::new(
-                format!("{key}/info"),
-                UiContent::Group(GroupSpec {
-                    label: Some(row.label.clone()),
-                    role: SemanticRole::Text,
-                    style: StyleRef::Plain,
-                }),
-            )
-            .layout(
-                Layout::column()
-                    .width(Length::Fill)
-                    .height(Length::Fixed(height)),
-            )
-            .children(lines);
-            let button_at = if button_beside {
-                Some((value_top, line_h))
-            } else {
-                Some((height, 0.0))
-            };
-            (info, height, button_at)
-        };
-        let mut row_h = row_h;
-        let mut layers = vec![info];
-        if let Some((button_key, label, visual, short)) = face {
-            let (button, top, right, room) = match button_at {
-                // Beside the chip's column, on the one line.
-                None => {
-                    let button = self.button(&button_key, label, visual, StyleRef::Quiet, true);
-                    let height = m.control_h.min(row_h);
-                    (
-                        button.layout(
-                            Layout::default()
-                                .width(Length::Fixed(face_w.unwrap_or(0.0)))
-                                .height(Length::Fixed(height)),
-                        ),
-                        ((row_h - height) / 2.0).max(0.0),
-                        m.chip_w + 8.0,
-                        height,
-                    )
-                }
-                // Beside the value, on its first line.
-                Some((top, line_h)) if line_h > 0.0 => {
-                    let button = self.button(&button_key, label, visual, StyleRef::Quiet, true);
-                    let height = m.control_h.min(line_h);
-                    (
-                        button.layout(
-                            Layout::default()
-                                .width(Length::Fixed(face_w.unwrap_or(0.0)))
-                                .height(Length::Fixed(height)),
-                        ),
-                        top + ((line_h - height) / 2.0).max(0.0),
-                        0.0,
-                        height,
-                    )
-                }
-                // On a line of its own, under the rest.
-                Some((top, _)) => {
-                    let (button, _, height) = self.fitted_button(
-                        &button_key,
-                        label,
-                        visual,
-                        short,
-                        StyleRef::Quiet,
-                        true,
-                        m.card_inner,
-                    );
-                    row_h = top + height + 4.0;
-                    (button, top + 2.0, 0.0, height)
-                }
-            };
-            let own_line = matches!(button_at, Some((_, line_h)) if line_h <= 0.0);
-            let children = if own_line {
-                vec![button, spacer("actions/space")]
-            } else {
-                vec![spacer("actions/space"), button]
-            };
-            layers.push(
-                UiNode::new(
-                    format!("{key}/actions"),
-                    UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-                )
-                .layout(
-                    Layout::row()
-                        .width(Length::Fill)
-                        .height(Length::Fixed(top + room))
-                        .padding(Insets {
-                            top,
-                            right,
-                            bottom: 0.0,
-                            left: 0.0,
-                        }),
-                )
-                .children(children),
-            );
-        }
-        let line = UiNode::new(
-            key.clone(),
-            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-        )
-        .layout(
-            Layout::default()
-                .width(Length::Fill)
-                .height(Length::Fixed(row_h)),
-        )
-        .children(layers);
-        let Some(note) = &row.note else {
-            return (line, row_h);
-        };
-        let indent = if one_line { m.name_w + 8.0 } else { 0.0 };
-        let (note, note_h) = crate::native_settings::wrapped_copy_node(
-            &format!("{key}/note"),
-            note,
-            SemanticRole::Text,
-            StyleRef::Secondary,
-            (m.card_inner - indent).max(40.0),
-            m.line_h,
-            None,
-        );
-        let height = row_h + note_h + 6.0;
-        (
-            UiNode::new(
-                format!("{key}/with-note"),
-                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-            )
-            .layout(Layout::column().height(Length::Fixed(height)))
-            .children(vec![
-                line,
-                UiNode::new(
-                    format!("{key}/note-seat"),
-                    UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-                )
-                .layout(
-                    Layout::column()
-                        .height(Length::Fixed(note_h + 6.0))
-                        .padding(Insets {
-                            top: 0.0,
-                            right: 0.0,
-                            bottom: 6.0,
-                            left: indent,
-                        }),
-                )
-                .children(vec![note]),
-            ]),
-            height,
-        )
-    }
-
-    /// The Secrets vault's disclosure and, open, its fields and Join (§3.3),
-    /// each `(node, height, revealable keys at their tops)`.
-    #[allow(
-        clippy::type_complexity,
-        reason = "one caller zips these into the card it builds"
-    )]
-    fn vault(&self, top: f32) -> Vec<(UiNode, f32, Vec<(String, f32, f32)>)> {
-        let m = &self.m;
-        let open = self.app.vault_shown();
-        let mut disclose_h = m.row_h * 0.9;
-        // The disclosure and the fields sit under the row's value column.
-        let indent = if m.two_line { 0.0 } else { m.name_w + 8.0 };
-        let mut out = Vec::new();
-        let mut spec = ButtonSpec::new("Vault address and password");
-        // Its words wrap where the card cannot hold them on one line.
-        let room = crate::native_ui::disclosure_label_room(m.card_inner - (indent - 10.0).max(0.0));
-        match crate::native_ui::native_button_label_lines(&spec.label, room) {
-            Some(lines) if lines.len() > 1 => {
-                disclose_h =
-                    crate::native_ui::native_button_height_for_lines(lines.len(), disclose_h);
-                spec.visual_label = Some(lines.join("\n"));
-            }
-            None => spec.visual_label = Some("Vault".to_owned()),
-            Some(_) => {}
-        }
-        let disclose = UiNode::new(
-            "system-state/row/secrets/disclose",
-            UiContent::Button(
-                Control::new(spec, ActionId::new("system-state/row/secrets/disclose"))
-                    .state(ControlState {
-                        expanded: Some(open),
-                        ..ControlState::default()
-                    })
-                    .style(StyleRef::Plain),
-            ),
-        )
-        .layout(
-            Layout::default()
-                .width(Length::Fill)
-                .height(Length::Fixed(disclose_h)),
-        );
-        // The button's own inset puts its words on the value column.
-        let disclose = UiNode::new(
-            "system-state/row/secrets/disclose-seat",
-            UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-        )
-        .layout(
-            Layout::row()
-                .width(Length::Fill)
-                .height(Length::Fixed(disclose_h))
-                .padding(Insets {
-                    top: 0.0,
-                    right: 0.0,
-                    bottom: 0.0,
-                    left: (indent - 10.0).max(0.0),
-                }),
-        )
-        .children(vec![disclose]);
-        out.push((
-            disclose,
-            disclose_h,
-            vec![(
-                "system-state/row/secrets/disclose".to_owned(),
-                top,
-                disclose_h,
-            )],
-        ));
-        if !open {
-            return out;
-        }
-        let field_w = (m.card_inner - indent).clamp(40.0, 420.0);
-        let enabled = self.app.vault_editable();
-        let caption = |key: &str, words: &str| {
-            let (node, height) = words_node(
-                key,
-                words,
-                SemanticRole::Text,
-                StyleRef::Secondary,
-                (m.card_inner - indent).max(40.0),
-                m.line_h,
-            );
-            (node.paint_only(), height)
-        };
-        let (address_caption, address_h) =
-            caption("system-state/vault/address-label", "Vault address");
-        let (password_caption, password_h) =
-            caption("system-state/vault/password-label", "Password (optional)");
-        let field = |key: &str,
-                     label: &str,
-                     input: TextInputProjection,
-                     secret: bool,
-                     description: Option<&str>| {
-            UiNode::new(
-                key.to_owned(),
-                UiContent::TextField(
-                    Control::new(
-                        TextFieldSpec {
-                            label: label.to_owned(),
-                            placeholder: (!secret)
-                                .then(|| aterm_types::macos_setup::DEFAULT_VAULT_URL.to_owned()),
-                            secret,
-                            visual_value: None,
-                            input: Some(input.clone()),
-                            swatch: None,
-                            swatch_line: false,
-                            trailing_hint: None,
-                            description: description.map(str::to_owned),
-                            end_button: false,
-                        },
-                        ActionId::new(key.to_owned()),
-                    )
-                    .value(SemanticValue::Text(input.text))
-                    .state(ControlState {
-                        enabled,
-                        focused: self
-                            .view
-                            .common
-                            .last_focus
-                            .as_ref()
-                            .is_some_and(|focus| focus.as_str() == key),
-                        ..ControlState::default()
-                    })
-                    .style(StyleRef::Secondary),
-                ),
-            )
-            .layout(
-                Layout::default()
-                    .width(Length::Fixed(field_w))
-                    .height(Length::Fixed(m.control_h)),
-            )
-        };
-        let blank = "Leave the password blank to join without one; the Secrets row then says \
-                     what lets this Mac in.";
-        // The hint wraps under the field rather than lose its words on a narrow page.
-        let (help, help_h) = crate::native_settings::wrapped_copy_node(
-            "system-state/vault/password-help",
-            blank,
-            SemanticRole::Text,
-            StyleRef::Secondary,
-            (m.card_inner - indent).max(40.0),
-            m.line_h,
-            None,
-        );
-        let mut column = vec![
-            address_caption,
-            field(
-                "system-state/url",
-                "Vault address",
-                self.app.url.projection(),
-                false,
-                None,
-            ),
-            password_caption,
-            field(
-                "system-state/password",
-                "Password (optional)",
-                self.app.password.projection(),
-                true,
-                Some(blank),
-            ),
-            help,
-        ];
-        column.push(self.button(
-            "system-state/vault/join",
-            "Join".to_owned(),
-            None,
-            StyleRef::Secondary,
-            enabled && self.app.plan_known,
-        ));
-        let height = address_h + password_h + help_h + m.control_h * 3.0 + 4.0 * 5.0 + 10.0;
-        // Each field under its caption, 4pt apart (the column's gap).
-        let url_top = top + disclose_h + address_h + 4.0;
-        let password_top = url_top + m.control_h + 4.0 + password_h + 4.0;
-        let join_top =
-            top + disclose_h + address_h + password_h + help_h + m.control_h * 2.0 + 4.0 * 5.0;
-        let keys = vec![
-            ("system-state/url".to_owned(), url_top, m.control_h),
-            (
-                "system-state/password".to_owned(),
-                password_top,
-                m.control_h,
-            ),
-            ("system-state/vault/join".to_owned(), join_top, m.control_h),
-        ];
-        out.push((
-            UiNode::new(
-                "system-state/vault",
-                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-            )
-            .layout(
-                Layout::column()
-                    .gap(4.0)
-                    .height(Length::Fixed(height))
-                    .padding(Insets {
-                        top: 0.0,
-                        right: 0.0,
-                        bottom: 10.0,
-                        left: indent,
-                    }),
-            )
-            .children(column),
-            height,
-            keys,
-        ));
-        out
-    }
-}
-
-/// `text` set in a box `width` wide in the face and size `role` and `style` paint: whole
-/// words, a word broken only where it cannot fit a line ([`crate::native_settings::wrap_to_box`]).
-fn lines_in(text: &str, role: SemanticRole, style: StyleRef, width: f32) -> Vec<String> {
-    let (px, face) = crate::native_ui::text_paint_metrics(role, style);
-    let measure = |line: &str| crate::tray_raster::ui_text_width_for(face, line, px);
-    crate::native_settings::wrap_to_box(text, width.max(1.0), &measure)
-}
-
-/// `text` as a node `width` wide on its [`lines_in`], `line_h` apart, with its height: one
-/// line is the text node `key`, more are `key/line-N` under a group `key` that names it whole.
-fn words_node(
-    key: &str,
-    text: &str,
-    role: SemanticRole,
-    style: StyleRef,
-    width: f32,
-    line_h: f32,
-) -> (UiNode, f32) {
-    let line = |key: String, text: String| {
-        UiNode::new(key, UiContent::Text(TextSpec { text, role, style })).layout(
-            Layout::default()
-                .width(Length::Fill)
-                .height(Length::Fixed(line_h)),
-        )
-    };
-    let lines = lines_in(text, role, style, width);
-    if lines.len() <= 1 {
-        return (line(key.to_owned(), text.to_owned()), line_h);
-    }
-    let height = line_h * lines.len() as f32;
-    let children = lines
-        .into_iter()
-        .enumerate()
-        .map(|(index, words)| line(format!("{key}/line-{index}"), words).paint_only())
-        .collect();
-    (
-        UiNode::new(
-            key.to_owned(),
-            UiContent::Group(GroupSpec {
-                label: Some(text.to_owned()),
-                role,
-                style: StyleRef::Plain,
-            }),
-        )
-        .layout(
-            Layout::column()
-                .gap(0.0)
-                .width(Length::Fill)
-                .height(Length::Fixed(height)),
-        )
-        .children(children),
-        height,
-    )
-}
-
-/// A hairline between a card's rows.
-fn rule(key: String) -> UiNode {
-    UiNode::new(
-        key,
-        UiContent::Custom(AuditedCustomNode {
-            audit_id: crate::native_ui::MESSAGES_RULE_AUDIT,
-            role: SemanticRole::Group,
-            label: String::new(),
-            paint: None,
-            action: None,
-            focusable: false,
-            focused: false,
-            focus_visible: false,
-        }),
-    )
-    .layout(Layout::default().height(Length::Fixed(1.0)))
-    .paint_only()
-}
-
 /// Why the fixtures' repositories failed for a while: GitHub stopped answering, which passes.
 #[cfg(any(debug_assertions, feature = "dev-seams"))]
 const GITHUB_STOPPED: &str = "GitHub stopped answering partway through.";
@@ -5900,27 +4688,103 @@ pub(crate) const GITHUB_UNREACHED: &str = "GitHub can't be reached";
 /// The repositories' note where GitHub refuses the token the vault syncs, in
 /// `init_observe`'s words (`Wait::TokenRefused`).
 #[cfg(any(debug_assertions, feature = "dev-seams"))]
-pub(crate) const GITHUB_TOKEN_REFUSED: &str = "GitHub refuses your token: renew it in the vault";
+pub(crate) const GITHUB_TOKEN_REFUSED: &str = aterm_types::macos_setup::GITHUB_TOKEN_REFUSED;
 
 /// The page's scenarios for looking at it without a Mac to set up
-/// (`ATERM_DEV_SYSTEM_STATE_FIXTURE`): `checking`, `running`, `widened`, `debugger`,
-/// `needs-you`, `vault`, `vault-unreached`, `vault-not-syncing`, `vault-not-set-up`,
-/// `sync-off`, `vault-failed`, `set-up`, `non-alab`, `widen-stopped`, `failed`,
-/// `check-failed`, `check-unconfirmed`, `mixed`, `named-result-failed`, `restore-at-login`,
-/// `restore-blocked`, `restore-unlogged`, `vault-source-mismatch`, `plan-unread`, `fresh`,
-/// `queued-choice`, `queued-restore`, `set-aside`, `set-aside-non-alab`, `startup-retry`,
-/// `restore-failed`, `setup-retried`, `failed-retrying`, `github-sign-in`, `vault-unreadable`,
-/// `join-refused`, `vault-not-joined`, `vault-held`, `newer`, `restoring`, the first launch's
-/// offer waiting for a person at this Mac, `review` and `review-widened` ([`fixture_review`]), a
-/// `cancelled` an earlier aterm recorded and `review-closed`, the offer of the groups the ALab
-/// signal adds, `widen-review`,
-/// and Apple's Command Line Tools: `clt-password`, `clt-recovered`, `clt-installing` and `clt-missing`.
-/// Each draws only what the worker gives the page: the readings `init_observe` and the
-/// worker's probes make, and the rows a run, a Check or a Restore reports.
+/// (`ATERM_DEV_SYSTEM_STATE_FIXTURE`), in the order [`fixture_status`] draws them: the names its
+/// switch answers, and no others, so a scenario is drawn only once it is listed here, and every
+/// test that sweeps the scenarios sweeps it. `older-cancel` is a Cancel an older aterm recorded.
+/// Debug and dev-seam builds only.
+#[cfg(any(debug_assertions, feature = "dev-seams"))]
+pub(crate) const FIXTURES: [&str; 66] = [
+    "checking",
+    "plan-unread",
+    "vault-source-mismatch",
+    "check-failed",
+    "check-unconfirmed",
+    "running",
+    "debugger",
+    "needs-you",
+    "vault",
+    "vault-unreached",
+    "vault-not-syncing",
+    "vault-not-set-up",
+    "sync-off",
+    "vault-failed",
+    "set-up",
+    "non-alab",
+    "widened",
+    "widen-stopped",
+    "failed",
+    "github-sign-in",
+    "named-result-failed",
+    "named-results-failed",
+    "restore-at-login",
+    "mixed",
+    "restore-blocked",
+    "restore-unlogged",
+    "fresh",
+    "queued-choice",
+    "queued-widen",
+    "queued-restore",
+    "set-aside",
+    "set-aside-non-alab",
+    "startup-retry",
+    "restore-failed",
+    "setup-retried",
+    "failed-retrying",
+    "vault-unreadable",
+    "join-refused",
+    "vault-not-joined",
+    "vault-held",
+    "newer",
+    "restoring",
+    "older-cancel",
+    "clt-queued",
+    "clt-password",
+    "clt-recovered",
+    "clt-installing",
+    "clt-missing",
+    "clt-apple-window",
+    "clt-not-opened",
+    "changed-by-you",
+    "parked",
+    "still-running",
+    "resumed",
+    "vault-asking",
+    "vault-allowed",
+    "clt-low-data",
+    "clt-not-admin",
+    "vault-asking-long",
+    "walk",
+    "local-network",
+    "vault-approve",
+    "mixed@mac",
+    "set-up@secrets",
+    "named-result-failed@developer",
+    "vault-approve@secrets",
+];
+
+/// The line a scenario named `<scenario>@<line>` ([`FIXTURES`]) shows open, so the gallery
+/// judges that line's rows and phrases (`mixed@mac`); `None` for a scenario shown collapsed.
+#[cfg(any(debug_assertions, feature = "dev-seams"))]
+pub(crate) fn fixture_line(name: &str) -> Option<lines::Line> {
+    let (_, line) = name.split_once('@')?;
+    lines::Line::from_slug(line)
+}
+
+/// The scenario `name` ([`FIXTURES`]), `None` for a name not listed there. Each draws only what
+/// the worker gives the page: the readings `init_observe` and the worker's probes make, and the
+/// rows a run, a Check or a Restore reports.
 /// Debug and dev-seam builds only: a release build carries none of
 /// their words.
 #[cfg(any(debug_assertions, feature = "dev-seams"))]
 pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
+    if !FIXTURES.contains(&name) {
+        return None;
+    }
+    // `<scenario>@<line>` is that scenario with the line open ([`fixture_line`]).
+    let name = name.split_once('@').map_or(name, |(scenario, _)| scenario);
     use Standing::{
         AtLogin, Differs, Failed, InPlace, NeedsYou, NotNeeded, Unknown, Untold, Waiting,
     };
@@ -5984,11 +4848,23 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
         ..setting(Setting::Repositories, Waiting, None)
     };
     let all = Plan::default();
+    // An ALab Mac aterm has set up before, so Restore has its saved preferences to put back,
+    // unless the scenario says otherwise.
     let mut status = SetupStatus {
         observed_vault_url: Some(all.vault_url.clone()),
         plan: Some(all.clone()),
+        alab: true,
+        restorable: true,
         ..SetupStatus::default()
     };
+    // Nothing changed on this Mac yet: Restore has nothing to put back.
+    if matches!(name, "checking" | "plan-unread" | "fresh" | "older-cancel") {
+        status.restorable = false;
+    }
+    // No ALab membership on this Mac (§3.5): the sign-outs are out of its scope.
+    if matches!(name, "non-alab" | "set-aside-non-alab" | "vault-approve") {
+        status.alab = false;
+    }
     match name {
         "checking" => {}
         "plan-unread" => {
@@ -6058,6 +4934,39 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
                 ],
             );
         }
+        "walk" => {
+            // The permission walk at its first page of three, while the run carries on: the card
+            // says the grant, where the walk stands, and why.
+            status.busy = true;
+            status.running = vec![Setting::Permissions];
+            let mut fda = access(Access::FullDiskAccess, NeedsYou, Some("Off"));
+            fda.detail = Some(
+                "Full Disk Access keeps macOS from interrupting programs you run here with \
+                 privacy dialogs. Only you can switch it on, in System Settings."
+                    .to_owned(),
+            );
+            status.walk = Some(WalkPage {
+                access: Access::FullDiskAccess,
+                at: 1,
+                of: 3,
+            });
+            status.observed = with(
+                in_place(),
+                vec![
+                    fda,
+                    access(Access::DeveloperTools, NeedsYou, Some("Off")),
+                    access(Access::Accessibility, NeedsYou, Some("Off")),
+                ],
+            );
+        }
+        "local-network" => {
+            // macOS's Local Network question is up, at the walk's moment for it: the person
+            // answers it in macOS's dialog.
+            status.busy = true;
+            status.running = vec![Setting::Permissions];
+            status.access_step = Some(Access::LocalNetwork);
+            status.observed = with(in_place(), vec![untold_lan()]);
+        }
         "debugger" => {
             status.busy = true;
             status.running = vec![Setting::Permissions];
@@ -6072,8 +4981,9 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
             status.observed = with(in_place(), vec![debugger]);
         }
         "needs-you" => {
-            // Each reason where its probe puts it: a grant's in the
-            // description, Developer Tools' and the vault's code in the note.
+            // Each reason where its probe puts it: a grant's in the description, Developer
+            // Tools' in the note; and the ALab join, asking the Macs in ALab past its quiet, so
+            // automatic admission stays quiet while Full Disk Access still needs the person.
             let mut fda = access(Access::FullDiskAccess, NeedsYou, Some("Not confirmed"));
             fda.detail = Some(
                 "Full Disk Access keeps macOS from interrupting programs you run here with \
@@ -6082,10 +4992,33 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
             );
             let mut tools = access(Access::DeveloperTools, Waiting, None);
             tools.note = Some("Readable once Full Disk Access is on".to_owned());
+            status.asking_long = true;
+            let mut vault = setting(
+                Setting::Secrets,
+                NeedsYou,
+                Some(aterm_types::macos_setup::VAULT_ASKING),
+            );
+            vault.note = Some(aterm_types::macos_setup::VAULT_ASKING_NOTE.to_owned());
+            status.observed = with(in_place(), vec![fda, tools, vault, token_waiting()]);
+        }
+        "vault-approve" => {
+            // A Mac outside ALab that asked to join a vault of its own: an admin Mac of that
+            // vault approves it with the command its row's note names.
+            let mut plan = Plan::from(BASE_PLAN);
+            plan.vault_url = "https://vault.home.example/v1/family".to_owned();
+            status.observed_vault_url = Some(plan.vault_url.clone());
+            status.plan = Some(plan);
             let mut vault = setting(Setting::Secrets, NeedsYou, Some("Awaiting code"));
             vault.note =
                 Some("On an admin Mac: aterm secrets approve 7QK2-M9WD-4HTX-PL3B".to_owned());
-            status.observed = with(in_place(), vec![fda, tools, vault]);
+            status.observed = with(
+                in_place(),
+                vec![
+                    access(Access::Accessibility, NotNeeded, None),
+                    untold_lan(),
+                    vault,
+                ],
+            );
         }
         "vault" => {
             // A Join the person typed a password for found no vault at the ALab address: while
@@ -6094,6 +5027,28 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
             // aterm's own join reads Not joined in place here (§3.2).
             let mut vault = setting(Setting::Secrets, Waiting, Some("Not joined"));
             vault.note = Some("No vault on this network".to_owned());
+            status.observed = with(in_place(), vec![vault, token_waiting()]);
+        }
+        "vault-asking" | "vault-asking-long" => {
+            // ALab admission and its retries stay automatic throughout the wait.
+            status.asking_long = name == "vault-asking-long";
+            let mut vault = setting(
+                Setting::Secrets,
+                NeedsYou,
+                Some(aterm_types::macos_setup::VAULT_ASKING),
+            );
+            vault.note = Some(aterm_types::macos_setup::VAULT_ASKING_NOTE.to_owned());
+            status.observed = with(in_place(), vec![vault, token_waiting()]);
+        }
+        "vault-allowed" => {
+            // A member let this Mac in: the vault records it by itself, so nothing waits on the
+            // person and the row is calm.
+            let mut vault = setting(
+                Setting::Secrets,
+                Waiting,
+                Some(aterm_types::macos_setup::VAULT_ALLOWED),
+            );
+            vault.note = Some(aterm_types::macos_setup::VAULT_ALLOWED_NOTE.to_owned());
             status.observed = with(in_place(), vec![vault, token_waiting()]);
         }
         "vault-unreached" => {
@@ -6142,7 +5097,8 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
         "set-up" => {
             // Trackpad scrolling, set in this login session, is in full use from the next.
             // Local Network reads as `access::observation` reads it where no LAN look has
-            // answered aterm: macOS tells apps nothing of it.
+            // answered aterm: macOS tells apps nothing of it. The run took 72 seconds.
+            status.ready_in = Some(std::time::Duration::from_secs(72));
             status.observed = with(
                 in_place(),
                 vec![
@@ -6249,6 +5205,18 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
                 status: "error".into(),
                 detail: String::new(),
             }];
+        }
+        "named-results-failed" => {
+            // A whole Workstation-stage error is published under each selected setting, as
+            // initial::a_stage_that_fails_as_a_whole_is_paged_under_its_rows exercises.
+            status.observed = in_place();
+            status.rows = [Setting::CapsLock, Setting::Dock]
+                .map(|setting| SetupStatusRow {
+                    name: setting.name().into(),
+                    status: "error".into(),
+                    detail: String::new(),
+                })
+                .into();
         }
         "restore-at-login" => {
             // Right after a Restore of the whole profile (§3.4): the groups it put back are
@@ -6477,6 +5445,18 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
                 vec![setting(Setting::Dock, Differs, Some("9 apps"))],
             );
         }
+        "queued-widen" => {
+            // The automatic admission of the groups this Mac's ALab signal adds, while another
+            // setup holds the records (§3.5): it waits to add the profile, which nobody chose,
+            // and the plan in force sets up Permissions alone.
+            status.busy = true;
+            status.queued = true;
+            status.queued_widen = true;
+            let mut selection = Selection::none();
+            selection.set(Setting::Permissions, true);
+            status.plan = Some(Plan::from(selection));
+            status.observed = in_place();
+        }
         "queued-restore" => {
             // Restore previous settings waits for another setup that holds the records.
             status.busy = true;
@@ -6568,9 +5548,60 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
                 VAULT_NOT_JOINED_NOTE
             })];
         }
+        "changed-by-you" => {
+            // The person rearranged the Dock after aterm set it (init-on-by-default design §6.6):
+            // it reads as they left it, with no chip saying it will change, and no automatic pass
+            // sets it again.
+            let mut dock = setting(Setting::Dock, Differs, Some("12 apps"));
+            dock.note = Some(aterm_types::macos_setup::CHANGED_BY_YOU.to_owned());
+            status.observed = with(in_place(), vec![dock]);
+        }
+        "parked" => {
+            // aterm stopped twice while cloning the repositories, so the run's ledger parked that
+            // stage until Check again (init-on-by-default design §6.5) and the others went on.
+            status.observed = with(
+                in_place(),
+                vec![setting(Setting::Repositories, Differs, Some("3 of 12"))],
+            );
+            status.rows = vec![SetupStatusRow {
+                name: aterm_types::macos_setup::REPOSITORIES_STAGE.name.into(),
+                status: "waiting".into(),
+                detail: format!(
+                    "Stopped twice while cloning GitHub repositories; {}",
+                    StageRow::HELD_TAIL
+                ),
+            }];
+        }
+        "still-running" => {
+            // The repositories stage passed the hour while its owner still runs it: the row
+            // waits calmly and offers no Check again, which could change nothing yet.
+            status = fixture_status("parked")?;
+            let row = status.rows.first_mut()?;
+            row.status = "running".into();
+            row.detail = format!(
+                "Still cloning GitHub repositories after more than an hour; {}",
+                StageRow::STILL_RUNNING_TAIL
+            );
+        }
+        "resumed" => {
+            // aterm stopped while it set the Mac settings: this launch's pass goes on with them.
+            status.busy = true;
+            status.running = aterm_types::macos_setup::WORKSTATION_STAGE
+                .settings
+                .to_vec();
+            status.observed = with(
+                in_place(),
+                vec![setting(Setting::Dock, Differs, Some("14 apps"))],
+            );
+            status.rows = vec![SetupStatusRow {
+                name: aterm_types::macos_setup::WORKSTATION_STAGE.name.into(),
+                status: "running".into(),
+                detail: StageRow::RESUMING.into(),
+            }];
+        }
         "vault-held" => {
-            // A vault try held after two tries did not take: aterm tries it again only when
-            // this Mac's network or vault changes, so it failed, and Set up now tries it now.
+            // A vault try held after two tries did not take: aterm tries it again by itself once
+            // this Mac's network or vault changes, so the row waits, calm, saying so.
             status.observed = with(
                 in_place(),
                 vec![
@@ -6608,63 +5639,33 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
             status.operation = Some(SetupOperation::Restore);
             status.observed = in_place();
         }
-        "cancelled" => {
-            // The first launch's review a person cancelled (§3.3): the worker keeps every group
-            // at Leave as is, and the page says so in one calm line, Set up now beside it applying
-            // the setup the review showed. A grant that would need a person once Permissions run
-            // asks nothing of anyone while Permissions are left as is.
-            status = fixture_status("review")?;
-            status.plan = Some(Plan::from(Selection::none()));
-            status.cancelled = true;
-        }
-        "review-closed" => {
-            // The first launch's review a person closed unanswered, and the page opened again in
-            // that launch (§3.3): nothing was approved, so it reads as the review did, calm, with
-            // Set up now.
-            status = fixture_status("review")?;
-            status.unanswered = true;
-        }
-        "review-widened" => {
-            // The first launch's review on a Mac whose ALab signal the worker heard while it was
-            // up (§3.3): offered Permissions alone, it widens in place to the whole profile
-            // ([`fixture_review`]), and the page says why.
-            status = fixture_status("review")?;
-            let mut selection = Selection::none();
-            selection.set(Setting::Permissions, true);
-            status.plan = Some(Plan::from(selection));
-        }
-        "widen-review" => {
-            // The review of the groups the ALab signal adds to a plan that set up Permissions
-            // alone (§3.5), while that plan waits on Full Disk Access: the grant still needs the
-            // person, with its Open and its signals, and only the added groups read as what
-            // Apply will do.
-            let mut selection = Selection::none();
-            selection.set(Setting::Permissions, true);
-            status = fixture_status("non-alab")?;
-            status.plan = Some(Plan::from(selection));
+        "older-cancel" => {
+            // A fresh Mac whose saved setup holds a Cancel an older aterm's first-launch review
+            // recorded (§3.3): the worker's plan has every group turned off, so each reads Leave
+            // as is and turns back on by its switch, with no word of a review. A grant that would
+            // need a person once Permissions run asks nothing of anyone while they are left as is.
+            status = fixture_status("fresh")?;
             let mut fda = access(Access::FullDiskAccess, NeedsYou, Some("Not confirmed"));
             fda.detail = Some(
                 "Full Disk Access keeps macOS from interrupting programs you run here with \
                  privacy dialogs. Only you can switch it on, in System Settings."
                     .to_owned(),
             );
-            // Read for that plan, which manages neither Spotlight nor the vault.
-            status.observed = with(
-                status.observed,
-                vec![
-                    fda,
-                    setting(Setting::Spotlight, Differs, Some("Docs indexed")),
-                    setting(Setting::Secrets, Differs, Some("Not joined")),
-                ],
-            );
+            status.observed = with(status.observed, vec![fda]);
+            status.plan = Some(Plan::from(Selection::none()));
+            status.cancelled = true;
         }
-        "clt-queued" | "clt-password" | "clt-recovered" | "clt-installing" | "clt-missing" => {
+        "clt-queued" | "clt-password" | "clt-recovered" | "clt-installing" | "clt-missing"
+        | "clt-apple-window" | "clt-not-opened" | "clt-low-data" | "clt-not-admin" => {
             // The GitHub repositories wait on Apple's Command Line Tools (§3.3), which the
             // window installs in a terminal tab of its own: the tab asking for the password
-            // (`clt-password`), its restored live tab (`clt-recovered`), Apple's installer
-            // running (`clt-installing`), or the tools
-            // missing with no tab open and nothing installing them (`clt-missing`), where the
-            // row offers Install…. `clt-queued` shows `Install…` queued behind a permission step.
+            // (`clt-password`), its restored live tab (`clt-recovered`), an install running
+            // (`clt-installing`), the tools missing with no tab open and nothing installing them
+            // (`clt-missing`), where the row offers Install…, Apple's own installer window
+            // waiting for the person's press (`clt-apple-window`), a press of Install… queued
+            // behind a macOS permission step (`clt-queued`), a press whose tab did not open
+            // because the page was left (`clt-not-opened`), Low Data Mode holding the download
+            // back (`clt-low-data`), and an account that may not install them (`clt-not-admin`).
             let mut repositories = setting(Setting::Repositories, NeedsYou, None);
             repositories.note =
                 Some(aterm_types::macos_setup::COMMAND_LINE_TOOLS_MISSING.to_owned());
@@ -6674,27 +5675,12 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
                 "clt-password" => Some(ToolsInstall::Password),
                 "clt-recovered" => Some(ToolsInstall::Recovered),
                 "clt-installing" => Some(ToolsInstall::Installing),
+                "clt-apple-window" => Some(ToolsInstall::AppleWindow),
+                "clt-not-opened" => Some(ToolsInstall::NotOpened(NotOpened::LeftPage)),
+                "clt-low-data" => Some(ToolsInstall::LowData),
+                "clt-not-admin" => Some(ToolsInstall::NotAdmin),
                 _ => None,
             };
-        }
-        "review" => {
-            // The first launch's offer on a fresh signed Mac ([`fixture_review`]): every group
-            // set up, most rows to change, and Full Disk Access and Debugger access, which a
-            // person grants once setup runs, read as what setup changes.
-            status = fixture_status("fresh")?;
-            let mut fda = access(Access::FullDiskAccess, NeedsYou, Some("Not confirmed"));
-            fda.detail = Some(
-                "Full Disk Access keeps macOS from interrupting programs you run here with \
-                 privacy dialogs. Only you can switch it on, in System Settings."
-                    .to_owned(),
-            );
-            let mut debugger = access(Access::Debugger, NeedsYou, Some("Off"));
-            debugger.detail = Some(
-                "Turning it on lets debuggers attach without a password. macOS asks for an \
-                 administrator password in a dialog named SamplingTools."
-                    .to_owned(),
-            );
-            status.observed = with(status.observed, vec![fda, debugger]);
         }
         _ => return None,
     }
@@ -6702,33 +5688,7 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
     Some(status)
 }
 
-/// How a scenario shows an offer still waiting for its answer (`review`, `review-widened`,
-/// `widen-review`): the page is offered the plan a launch offers, and draws the scenario's
-/// status under it until a person is at this Mac (a headless instance has none). Its answer
-/// goes nowhere, as every action of a scenario is inert. Debug and dev-seam builds only.
-#[cfg(any(debug_assertions, feature = "dev-seams"))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FixtureReview {
-    /// The launch's offer waits for its answer.
-    Waiting,
-    /// Offered Permissions alone, the offer widens in place to the whole profile once the
-    /// ALab signal is heard (§3.3).
-    Widened,
-    /// The review of the groups the ALab signal adds to a plan that set up Permissions alone
-    /// (§3.5).
-    Widen,
-}
-
-/// The review the scenario `name` shows, if one ([`FixtureReview`]).
-#[cfg(any(debug_assertions, feature = "dev-seams"))]
-pub(crate) fn fixture_review(name: &str) -> Option<FixtureReview> {
-    match name {
-        "review" => Some(FixtureReview::Waiting),
-        "review-widened" => Some(FixtureReview::Widened),
-        "widen-review" => Some(FixtureReview::Widen),
-        _ => None,
-    }
-}
-
+#[cfg(test)]
+mod page_tests;
 #[cfg(test)]
 mod tests;

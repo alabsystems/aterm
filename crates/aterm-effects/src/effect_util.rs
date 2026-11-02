@@ -874,6 +874,62 @@ pub(crate) fn push_twinkle_star(
     true
 }
 
+/// Add `d` to `at`, saturating at the platform's maximum representable [`aterm_time::Instant`].
+#[inline]
+#[must_use]
+pub(crate) fn saturating_add_duration(
+    at: aterm_time::Instant,
+    d: std::time::Duration,
+) -> aterm_time::Instant {
+    if let Some(next) = at.checked_add(d) {
+        return next;
+    }
+    let mut cur = at;
+    let mut shift = 63u32;
+    loop {
+        let step = std::time::Duration::from_secs(1u64 << shift);
+        if let Some(next) = cur.checked_add(step) {
+            cur = next;
+        }
+        if shift == 0 {
+            break;
+        }
+        shift -= 1;
+    }
+    let mut nshift = 29u32;
+    loop {
+        let step = std::time::Duration::from_nanos(1u64 << nshift);
+        if let Some(next) = cur.checked_add(step) {
+            cur = next;
+        }
+        if nshift == 0 {
+            break;
+        }
+        nshift -= 1;
+    }
+    cur
+}
+
+/// Add `secs` (`> 0` seconds) to `at`, saturating on `Duration` or `Instant` overflow.
+#[inline]
+#[must_use]
+pub(crate) fn saturating_add_secs_f32(at: aterm_time::Instant, secs: f32) -> aterm_time::Instant {
+    if !secs.is_finite() {
+        return if secs.is_sign_positive() {
+            saturating_add_duration(at, std::time::Duration::MAX)
+        } else {
+            at
+        };
+    }
+    if secs <= 0.0 {
+        return at;
+    }
+    match std::time::Duration::try_from_secs_f32(secs) {
+        Ok(d) => saturating_add_duration(at, d),
+        Err(_) => saturating_add_duration(at, std::time::Duration::MAX),
+    }
+}
+
 /// Channel-weighted lit-pixel sum of a quad batch.
 #[cfg(test)]
 #[inline]

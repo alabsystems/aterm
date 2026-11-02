@@ -439,6 +439,66 @@ fn a_time_atom_is_its_next_instant() {
 }
 
 #[test]
+fn a_time_atom_declared_before_a_daylight_change_fires_on_the_target_days_wall_clock() {
+    const PDT: i64 = -7 * 3_600;
+    const PST: i64 = -8 * 3_600;
+    let instant = |book: &WakeBook, ord| book.get(ord).expect("declared").when[0].at_ms;
+
+    // 2026-10-31 22:00 PDT (2026-11-01T05:00:00Z); change at 2026-11-01T09:00:00Z.
+    let fall_now_ms = 1_793_509_200_000;
+    let fall_change_s = 1_793_523_600;
+    let la_fall = |unix: i64| Some(if unix < fall_change_s { PDT } else { PST });
+    let mut book = WakeBook::default();
+    let dst = book
+        .declare_local(
+            req("label=t when=at:07:00"),
+            Declarer::Agent,
+            AGENT,
+            fall_now_ms,
+            &la_fall,
+        )
+        .expect("declared");
+    let flat = book
+        .declare(
+            req("label=t when=at:07:00"),
+            Declarer::Agent,
+            AGENT,
+            fall_now_ms,
+            PDT,
+        )
+        .expect("declared");
+    assert_eq!(
+        instant(&book, dst),
+        Some(fall_now_ms + 10 * HOUR_MS),
+        "07:00 PST after falling back is 10 hours past 22:00 PDT"
+    );
+    assert_eq!(
+        instant(&book, flat),
+        Some(fall_now_ms + 9 * HOUR_MS),
+        "CONTROL: a flat today-offset places it an hour early"
+    );
+
+    // 2027-03-13 22:00 PST (2027-03-14T06:00:00Z); change at 2027-03-14T10:00:00Z.
+    let spring_now_ms = 1_805_004_000_000;
+    let spring_change_s = 1_805_018_400;
+    let la_spring = |unix: i64| Some(if unix < spring_change_s { PST } else { PDT });
+    let spring = book
+        .declare_local(
+            req("label=t when=at:07:00"),
+            Declarer::Agent,
+            AGENT,
+            spring_now_ms,
+            &la_spring,
+        )
+        .expect("declared");
+    assert_eq!(
+        instant(&book, spring),
+        Some(spring_now_ms + 8 * HOUR_MS),
+        "07:00 PDT after springing forward is 8 hours past 22:00 PST"
+    );
+}
+
+#[test]
 fn an_edge_latches_through_a_false_level() {
     let blip = || {
         let (mut book, ord) = declared("label=t when=file:~/scratch.noindex/x/flag");

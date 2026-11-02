@@ -3,6 +3,15 @@
 
 use super::*;
 use crate::WindowId;
+
+/// A landed state line `landed` where aterm checked nothing (no receipt, §14.9 slice 9c).
+fn unchecked(landed: &str) -> String {
+    format!(
+        "{landed}{}{}",
+        crate::native_ui::FACT_SEPARATOR,
+        aterm_agent::supervise::mode_words::NO_RECORD
+    )
+}
 use crate::native_app::{ActionInvocation, AppEvent};
 use crate::native_ui::ActionId;
 
@@ -1842,6 +1851,7 @@ fn a_sessions_row_names_its_agent_once() {
         state.sessions = vec![HarnessSession {
             stopped: None,
             waiting: None,
+            switch_asked: false,
             local_id: 0,
             sid: "s-0".to_string(),
             title: title.to_string(),
@@ -1856,6 +1866,7 @@ fn a_sessions_row_names_its_agent_once() {
             supervised: true,
             need: None,
             hold: None,
+            receipt: None,
         }];
         state.projection().sessions[0].detail.clone()
     };
@@ -1946,6 +1957,7 @@ fn the_sessions_state_line_is_formatted_from_the_glass_for_every_state() {
     let dated = |view: AutopilotView, glass: ChipGlass, today: i64| HarnessSessionRow {
         stopped: None,
         waiting: None,
+        switch_asked: false,
         local_id: 7,
         title: "fix the build".to_string(),
         name: "fix the build".to_string(),
@@ -1960,6 +1972,7 @@ fn the_sessions_state_line_is_formatted_from_the_glass_for_every_state() {
         setting: "follows the default".to_string(),
         need: None,
         hold: None,
+        receipt: None,
     };
     let row = |view: AutopilotView, glass: ChipGlass| dated(view, glass, TODAY);
     let clock = |h: u16, m: u16| Clock::of_minute(h * 60 + m);
@@ -1994,7 +2007,7 @@ fn the_sessions_state_line_is_formatted_from_the_glass_for_every_state() {
         (
             AutopilotView::Land,
             told(TaskFace::Landed),
-            "landed 17:42".to_string(),
+            unchecked("landed 17:42"),
         ),
         (
             AutopilotView::Cruise,
@@ -2061,7 +2074,7 @@ fn the_sessions_state_line_is_formatted_from_the_glass_for_every_state() {
         (
             AutopilotView::Land,
             told(TaskFace::Landed),
-            "landed Fri 17:42",
+            unchecked("landed Fri 17:42"),
         ),
         (
             AutopilotView::Cruise,
@@ -2069,11 +2082,11 @@ fn the_sessions_state_line_is_formatted_from_the_glass_for_every_state() {
                 last,
                 ..ChipGlass::default()
             },
-            "last: \u{2713} approved Fri 14:05",
+            "last: \u{2713} approved Fri 14:05".to_string(),
         ),
     ] {
         assert_eq!(
-            dated(view, glass, TODAY + 1).state_line().as_deref(),
+            dated(view, glass, TODAY + 1).state_line(),
             Some(line),
             "{view:?} {glass:?}"
         );
@@ -2086,7 +2099,7 @@ fn the_sessions_state_line_is_formatted_from_the_glass_for_every_state() {
         (
             AutopilotView::Land,
             told(TaskFace::Landed),
-            "landed 11 Oct 17:42",
+            unchecked("landed 11 Oct 17:42"),
         ),
         (
             AutopilotView::Cruise,
@@ -2094,11 +2107,11 @@ fn the_sessions_state_line_is_formatted_from_the_glass_for_every_state() {
                 last,
                 ..ChipGlass::default()
             },
-            "last: \u{2713} approved 11 Oct 14:05",
+            "last: \u{2713} approved 11 Oct 14:05".to_string(),
         ),
     ] {
         assert_eq!(
-            dated(view, glass, TODAY + 7).state_line().as_deref(),
+            dated(view, glass, TODAY + 7).state_line(),
             Some(line),
             "{view:?} {glass:?}"
         );
@@ -2116,8 +2129,8 @@ fn the_sessions_state_line_is_formatted_from_the_glass_for_every_state() {
         ..ChipGlass::default()
     };
     assert_eq!(
-        row(AutopilotView::Land, unplaced).state_line().as_deref(),
-        Some("landed")
+        row(AutopilotView::Land, unplaced).state_line(),
+        Some(unchecked("landed"))
     );
 }
 
@@ -2130,6 +2143,7 @@ fn the_state_line_says_the_pause_where_no_face_or_timer_has_the_line() {
     let row = |view: AutopilotView, glass: ChipGlass| HarnessSessionRow {
         stopped: None,
         waiting: None,
+        switch_asked: false,
         local_id: 7,
         title: "fix the build".to_string(),
         name: "fix the build".to_string(),
@@ -2144,6 +2158,7 @@ fn the_state_line_says_the_pause_where_no_face_or_timer_has_the_line() {
         setting: "follows the default".to_string(),
         need: None,
         hold: None,
+        receipt: None,
     };
     let stamp = |h: u16, m: u16| Stamp {
         clock: Clock::of_minute(h * 60 + m),
@@ -2184,8 +2199,8 @@ fn the_state_line_says_the_pause_where_no_face_or_timer_has_the_line() {
         ..pausing
     };
     assert_eq!(
-        row(AutopilotView::Land, landed).state_line().as_deref(),
-        Some("landed 17:42"),
+        row(AutopilotView::Land, landed).state_line(),
+        Some(unchecked("landed 17:42")),
         "the landing wins"
     );
     assert_eq!(
@@ -2226,6 +2241,7 @@ fn the_state_line_leads_with_an_outage_wait_and_its_next_try() {
     let row = |view: AutopilotView, glass: ChipGlass, waiting| HarnessSessionRow {
         stopped: None,
         waiting,
+        switch_asked: false,
         local_id: 7,
         title: "fix the build".to_string(),
         name: "fix the build".to_string(),
@@ -2240,6 +2256,7 @@ fn the_state_line_leads_with_an_outage_wait_and_its_next_try() {
         setting: "follows the default".to_string(),
         need: None,
         hold: None,
+        receipt: None,
     };
     let stamp = |h: u16, m: u16, day: i64| Stamp {
         clock: Clock::of_minute(h * 60 + m),
@@ -2805,7 +2822,7 @@ fn a_page_held_open_across_midnight_names_the_faces_day_from_then_on() {
     };
     assert!(app.open_harness_settings(WindowId(0), crate::harness_screen::HarnessFocus::Top));
     assert!(app.harness_page_shown());
-    assert_eq!(line(&app).as_deref(), Some("landed 23:50"), "its own day");
+    assert_eq!(line(&app), Some(unchecked("landed 23:50")), "its own day");
     assert_eq!(
         app.autopilot_offer_deadline(),
         Some(mono(local(day + 1, 0, 0))),
@@ -2814,7 +2831,7 @@ fn a_page_held_open_across_midnight_names_the_faces_day_from_then_on() {
 
     clocks(local(day + 1, 0, 0) - 1);
     app.expire_autopilot_offer();
-    assert_eq!(line(&app).as_deref(), Some("landed 23:50"), "short of it");
+    assert_eq!(line(&app), Some(unchecked("landed 23:50")), "short of it");
 
     clocks(local(day + 1, 0, 0));
     let revision = app.harness_screen.revision;
@@ -2823,7 +2840,7 @@ fn a_page_held_open_across_midnight_names_the_faces_day_from_then_on() {
     let fri = crate::claude_lights::Weekday::of_days(day).short();
     assert_eq!(
         line(&app),
-        Some(format!("landed {fri} 23:50")),
+        Some(unchecked(&format!("landed {fri} 23:50"))),
         "yesterday's, by its weekday"
     );
     assert_eq!(
@@ -3033,6 +3050,7 @@ fn each_row_takes_its_own_sessions_day_and_a_name_its_own() {
     let session = |local_id: u64, title: &str, place: &str| HarnessSession {
         stopped: None,
         waiting: None,
+        switch_asked: false,
         local_id,
         sid: format!("s-{local_id}"),
         title: title.to_string(),
@@ -3047,6 +3065,7 @@ fn each_row_takes_its_own_sessions_day_and_a_name_its_own() {
         supervised: true,
         need: None,
         hold: None,
+        receipt: None,
     };
     let mut today = HarnessStats::per_session(0);
     today.approved = 9;
@@ -3122,6 +3141,7 @@ fn a_rows_escalation_clock_uses_the_events_offset_not_the_readings() {
         let session = |local_id, sid: &str| HarnessSession {
             stopped: None,
             waiting: None,
+            switch_asked: false,
             local_id,
             sid: sid.to_string(),
             title: sid.to_string(),
@@ -3136,6 +3156,7 @@ fn a_rows_escalation_clock_uses_the_events_offset_not_the_readings() {
             supervised: false,
             need: None,
             hold: None,
+            receipt: None,
         };
         let mut state = HarnessState::unobserved();
         state.observed = true;
@@ -3536,6 +3557,7 @@ fn state_deciding(
     state.sessions = vec![HarnessSession {
         stopped: None,
         waiting: None,
+        switch_asked: false,
         local_id: 7,
         sid: "s-7".to_string(),
         title: "fix the build".to_string(),
@@ -3550,6 +3572,7 @@ fn state_deciding(
         supervised: true,
         need: None,
         hold: None,
+        receipt: None,
     }];
     state.decided_open = vec![OpenSession {
         sid: "s-9".to_string(),
@@ -4109,6 +4132,7 @@ fn listed_with(local_id: u64, verdict: &crate::needs::Verdict) -> HarnessSession
     HarnessSession {
         stopped: None,
         waiting: None,
+        switch_asked: false,
         local_id,
         sid: format!("s-{local_id}"),
         title: format!("tab {local_id}"),
@@ -4123,6 +4147,7 @@ fn listed_with(local_id: u64, verdict: &crate::needs::Verdict) -> HarnessSession
         supervised: true,
         need: verdict.harness_ask().cloned(),
         hold: None,
+        receipt: None,
     }
 }
 
@@ -4201,6 +4226,7 @@ fn a_need_heads_the_rows_state_line() {
     let row = |glass: ChipGlass| HarnessSessionRow {
         stopped: None,
         waiting: None,
+        switch_asked: false,
         local_id: 7,
         title: "fix the build".to_string(),
         name: "fix the build".to_string(),
@@ -4215,6 +4241,7 @@ fn a_need_heads_the_rows_state_line() {
         setting: "follows the default".to_string(),
         need: ask.harness_ask().cloned(),
         hold: None,
+        receipt: None,
     };
     let pausing = ChipGlass {
         pause: Some(PauseGlass {
@@ -4236,6 +4263,21 @@ fn a_need_heads_the_rows_state_line() {
     assert_eq!(
         row(ChipGlass::default()).state_line().as_deref(),
         Some("needs you: sign 0.48.0 (+1 more); carrying on")
+    );
+    // Where Land rests on the need or the work landed beside it, the entry's tail says the work
+    // waits on the person, and so does the line (the second review, 2026-11-01).
+    let waits = asked(
+        crate::harness_host::NEEDS_ATTENTION_OWNER,
+        "claude needs you: sign 0.48.0 (+1 more) \u{2014} waits on you",
+    );
+    assert_eq!(
+        HarnessSessionRow {
+            need: waits.harness_ask().cloned(),
+            ..row(ChipGlass::default())
+        }
+        .state_line()
+        .as_deref(),
+        Some("needs you: sign 0.48.0 (+1 more); waits on you")
     );
 }
 
@@ -4397,17 +4439,29 @@ fn an_aterm_that_is_not_its_accounts_own_reads_no_fleet() {
 /// macOS's Local Network question on screen where macOS never asked aterm, so it waits while
 /// System State's Local Network step, which asks that question first, is still to come, and the
 /// page says why it shows no computer on the network; once the step asked, or never will, it
-/// sweeps and the page says nothing of it.
+/// sweeps and the page says nothing of it. While `[swarm] enabled = false` turns sharing off it
+/// sweeps nothing and says that instead.
 #[cfg(target_os = "macos")]
 #[test]
 fn tab_control_sweeps_the_local_network_only_after_the_local_network_step() {
     let mut swept = 0;
     assert_eq!(
-        sweep_lan_after_the_step(false, || swept += 1),
+        sweep_lan_after_the_step(true, || false, || swept += 1),
         Some(LAN_WAITS)
     );
     assert_eq!(swept, 0, "no sweep while the step is still to come");
-    assert_eq!(sweep_lan_after_the_step(true, || swept += 1), None);
+    assert_eq!(
+        sweep_lan_after_the_step(
+            false,
+            || panic!("sharing off: the door is not asked"),
+            || {
+                swept += 1;
+            }
+        ),
+        Some(LAN_SHARING_OFF)
+    );
+    assert_eq!(swept, 0, "no sweep while sharing is off");
+    assert_eq!(sweep_lan_after_the_step(true, || true, || swept += 1), None);
     assert_eq!(swept, 1, "the step asked, or never will: it sweeps");
 
     let mut app = App::headless_for_test();
@@ -5165,4 +5219,87 @@ fn monitor_swarm_census_maps_members_aliases_and_stragglers_without_per_mac_dial
         2,
         "raw aliases share the census session identity"
     );
+}
+
+/// THE LANDED STATE LINE SAYS WHAT ATERM CHECKED, WHOLE (`docs/DESIGN-harness-autopilot-2026-10-15.md`
+/// §14.9, slice 9c): `landed 17:42`, then the receipt's words for its leg in full and what the
+/// agent said, both from `mode_words` (`it said “…”`; `it said nothing is left` where the receipt
+/// kept none of its words), as the record, the tips and the description say them. No leg is
+/// cut, however long its folder: the page wraps the line. NEGATIVE CONTROLS (run by hand): the
+/// landed arm without `landed_line`, and the quote spelt here rather than read from
+/// `mode_words::said_words`, each fail it.
+#[test]
+fn the_landed_state_line_says_what_aterm_checked_whole() {
+    use crate::claude_lights::{ChipGlass, Clock, Stamp};
+    use aterm_agent::harness::acts::{LandReceipt, ReceiptLeg, TaskFace};
+    use aterm_agent::supervise::mode_words::{checked_words, said_words};
+    let sep = crate::native_ui::FACT_SEPARATOR;
+    let glass = ChipGlass {
+        task: Some(TaskFace::Landed),
+        task_at: Some(Stamp {
+            clock: Clock::of_minute(17 * 60 + 42),
+            day: 20_007,
+        }),
+        ..ChipGlass::default()
+    };
+    let row = |receipt: Option<LandReceipt>| HarnessSessionRow {
+        stopped: None,
+        waiting: None,
+        local_id: 7,
+        title: "fix the build".to_string(),
+        name: "fix the build".to_string(),
+        day_line: None,
+        detail: String::new(),
+        mode: AutopilotView::Land.mode(),
+        default: AutopilotView::Land.mode(),
+        view: AutopilotView::Land,
+        glass,
+        armed_at_ms: None,
+        today: 20_007,
+        setting: "follows the default".to_string(),
+        need: None,
+        hold: None,
+        switch_asked: false,
+        receipt: receipt.map(std::sync::Arc::new),
+    };
+    let long = format!("/Users//me/{}/proj", "deep/".repeat(30));
+    let said = "Nothing left: the parser is committed and pushed to origin/main.";
+    for leg in [ReceiptLeg::OnMain, ReceiptLeg::NoRemote, ReceiptLeg::Gone] {
+        let r = LandReceipt {
+            head: "3f9a1c2e4b7d".into(),
+            main_ref: if leg == ReceiptLeg::OnMain {
+                "origin/main"
+            } else {
+                ""
+            }
+            .into(),
+            repo: long.clone(),
+            branch: "main".into(),
+            leg,
+            check: false,
+            said: said.into(),
+            at_ms: 0,
+        };
+        let checked = checked_words(Some(&r));
+        assert_eq!(
+            row(Some(r.clone())).state_line(),
+            Some(format!(
+                "landed 17:42{sep}{checked}{sep}it said \u{201c}{said}\u{201d}"
+            )),
+            "{leg:?}"
+        );
+        let quiet = LandReceipt {
+            said: String::new(),
+            ..r
+        };
+        assert_eq!(
+            row(Some(quiet.clone())).state_line(),
+            Some(format!(
+                "landed 17:42{sep}{checked}{sep}{}",
+                said_words(&quiet)
+            )),
+            "{leg:?}"
+        );
+        assert!(said_words(&quiet).ends_with("nothing is left"), "{leg:?}");
+    }
 }

@@ -572,6 +572,12 @@ fn identifier_joints(token: &str) -> IdentifierJoints {
     tiers
 }
 
+fn clamp_piece(text: &str, piece: std::ops::Range<usize>) -> std::ops::Range<usize> {
+    let start = crate::word::floor_char_boundary(text, piece.start);
+    let end = crate::word::floor_char_boundary(text, piece.end).max(start);
+    start..end
+}
+
 /// A PIECE WIDER THAN A WHOLE LINE, BROKEN INSIDE ITSELF where a typesetter
 /// would break it: the lines `text[piece]` takes in a box `fits` measures,
 /// each `(the byte of text it starts at, what it paints)`, every line but
@@ -584,6 +590,7 @@ pub fn break_inside(
     mark: &str,
     fits: &dyn Fn(&str) -> bool,
 ) -> Vec<(usize, String)> {
+    let piece = clamp_piece(text, piece);
     let inside = Inside::new(text, piece.clone(), mark);
     let mut lines = Vec::new();
     let mut start = piece.start;
@@ -620,6 +627,7 @@ pub fn break_into_line(
     fits_here: &dyn Fn(&str) -> bool,
     fits_line: &dyn Fn(&str) -> bool,
 ) -> Option<(usize, String)> {
+    let piece = clamp_piece(text, piece);
     let inside = Inside::new(text, piece.clone(), mark);
     let start = piece.start;
     let point = if inside.word {
@@ -1040,6 +1048,21 @@ mod tests {
         assert_eq!(
             break_inside("a \u{b7}", 0..4, "-", &|line| line.chars().count() <= 1),
             [(0, "a".to_string()), (1, "\u{b7}".to_string())]
+        );
+        // Out-of-bounds, inverted, or mid-UTF-8 piece ranges clamp cleanly instead of panicking.
+        let multibyte = "設定";
+        let inverted = core::ops::Range { start: 5, end: 2 };
+        assert_eq!(
+            break_inside(multibyte, 1..99, "-", &|_| false),
+            [(0, "設-".to_string()), (3, "定".to_string())]
+        );
+        assert_eq!(
+            break_inside(multibyte, inverted.clone(), "-", &|_| false),
+            [(3, String::new())]
+        );
+        assert_eq!(
+            break_into_line(multibyte, inverted, "-", &|_| true, &|_| true),
+            None
         );
     }
     /// A typesetter breaks a name AFTER its hyphens (the hyphen ends the line, never starts

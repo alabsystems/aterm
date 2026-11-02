@@ -1331,6 +1331,7 @@ fn land(
         build: c.version.build_id(),
         artifact: art,
         exposes: &exposes,
+        version: "",
         shim_env: &shim_env,
         aliases: crate::activate::Aliases::Off,
         installed: pending.active,
@@ -1981,7 +1982,9 @@ pub(crate) mod world {
     pub(crate) const CODEX_DL: &str = "https://github.com/openai/codex/releases/download/";
 
     /// The triple the tests resolve for: the real host's OS and architecture, so
-    /// the CLI's native selection and the fixture's signed artifacts agree.
+    /// the CLI's native selection and the fixture's signed artifacts agree; a Windows
+    /// host resolves as Linux on its architecture, since the world publishes no
+    /// Windows artifact.
     pub(crate) fn triple() -> &'static str {
         match (cfg!(target_os = "macos"), cfg!(target_arch = "aarch64")) {
             (true, true) => "aarch64-apple-darwin",
@@ -2098,9 +2101,11 @@ pub(crate) mod world {
         aterm_codec::base64::encode(sig.as_ref()).unwrap()
     }
 
-    /// grok's npm and bucket names for [`triple`]; `None` where xAI serves no build
-    /// (Windows), so a test's landing half could not run.
+    /// grok's npm and bucket names for [`triple`]; `None` where xAI serves no build for the
+    /// real host (Windows, which [`triple`] stands in for as Linux, while the stager names a
+    /// Windows binary `grok.exe`), so a test's landing half could not run.
     pub(crate) fn grok_platform() -> Option<GrokPlatform> {
+        resolve::grok_platform(crate::cli::current_triple())?;
         resolve::grok_platform(triple())
     }
 
@@ -2964,11 +2969,21 @@ mod tests {
         url
     }
 
+    /// Why a program the vendor lane serves on darwin alone did not land here, naming the
+    /// real host (the fixture world resolves a Windows host as Linux).
+    fn darwin_only(program: &str, why: &str) -> String {
+        format!(
+            "the vendor lane serves {program} on darwin only ({why}), and this host is {}: \
+             the landing half did not run",
+            crate::cli::current_triple()
+        )
+    }
+
     fn publish_muse(f: &Fake, version: &str, exe: &[u8]) {
         let Some((key, file)) = resolve::muse_platform(world::triple()) else {
-            aterm_uds::host::could_not_run(format!(
-                "muse is not served for {}, so the landing half did not run",
-                world::triple()
+            aterm_uds::host::could_not_run(darwin_only(
+                "muse",
+                "Meta's release manifest names macOS builds alone",
             ));
         };
         let version = v(version);
@@ -3032,7 +3047,7 @@ mod tests {
         f.publish_grok(version, exe).unwrap_or_else(|| {
             aterm_uds::host::could_not_run(format!(
                 "grok is not served for {}, so the landing half did not run",
-                world::triple()
+                crate::cli::current_triple()
             ))
         })
     }
@@ -4508,7 +4523,9 @@ mod tests {
         )));
     }
 
-    /// The files [`Fake::publish_codex_default`]'s package lays.
+    /// The files [`Fake::publish_codex_default`]'s package lays. Unix only, as the tests that
+    /// read a lent tree are ([`sibling_tree`]).
+    #[cfg(unix)]
     fn codex_default_files() -> [String; 4] {
         [
             world::bin("codex"),
@@ -4550,6 +4567,9 @@ mod tests {
     /// (each file a clone on its own inode, nothing linked), its alias, shim and twin in its own
     /// build, a record naming the lender, and otherwise exactly the tree, record and modes a
     /// download of its own lays.
+    ///
+    /// Unix only: a build lends its tree only there ([`sibling_tree`]).
+    #[cfg(unix)]
     #[test]
     fn codex_old_takes_codexs_verified_tree_and_downloads_nothing() {
         let (l, f) = codex_landed("codex-old-taken");
@@ -4653,6 +4673,9 @@ mod tests {
 
     /// Only a codex build of exactly codex-old's candidate is copied: a record naming another
     /// digest or URL, or no codex build of the version codex-old lands, means a download.
+    ///
+    /// Unix only: a build lends its tree only there ([`sibling_tree`]).
+    #[cfg(unix)]
     #[test]
     fn only_the_same_bytes_are_shared() {
         let landed = |label: &str, edit: &dyn Fn(&mut VendorRecord)| {
@@ -4711,6 +4734,9 @@ mod tests {
 
     /// A copied codex-old owns its tree outright: gc reclaiming the codex build it was copied
     /// from, then codex's uninstall, leave its bytes, shim and verify as they were.
+    ///
+    /// Unix only: a build lends its tree only there ([`sibling_tree`]).
+    #[cfg(unix)]
     #[test]
     fn codex_old_outlives_codex() {
         let (l, f) = codex_landed("codex-old-outlives");
@@ -4809,6 +4835,9 @@ mod tests {
     }
 
     /// codex-old follows codex release by release, copying each: two releases, two downloads.
+    ///
+    /// Unix only: a build lends its tree only there ([`sibling_tree`]).
+    #[cfg(unix)]
     #[test]
     fn codex_old_follows_codex_forward() {
         let l = world::layout("codex-old-forward");

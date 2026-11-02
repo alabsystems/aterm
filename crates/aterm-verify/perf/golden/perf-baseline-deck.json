@@ -1,0 +1,10 @@
+{
+  "_comment": "aterm DECK baseline (docs/DESIGN-stats-deck-gpu-motion-2026-10-26.md §6): the stats deck's frame cost from aterm-gui's deck_frame_cost bench (opt-test, the busy scene, 2238 device px at 2x): for the Folded and Full forms, a needle frame, a grid frame and a new reading's whole card, each as 10^6 / its p50 in us of layout plus patch (frames per second of main-thread work). BIGGER-IS-BETTER. The lane's headless idle take (aterm-lab deck-motion idle, release dev-seams) is reported, not judged. Re-record with targo --unverified verify perf --record deck.",
+  "folded_needle_fps": 5081.301,
+  "folded_grid_fps": 2454.590,
+  "folded_reading_fps": 849.473,
+  "full_needle_fps": 4353.505,
+  "full_grid_fps": 4336.513,
+  "full_reading_fps": 733.030,
+  "pass_ratio": 0.450
+}

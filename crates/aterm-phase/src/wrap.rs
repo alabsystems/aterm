@@ -53,7 +53,7 @@ fn wraps_with(
 
 /// The room a line drawn from column `col` of a pane `width` cells wide has in a box as wide as the pane less `col` on each side: a footer's, a banner's, a `⎿` notice's (whose box ends at the pane's edge: the rule reads such a row full a little early).
 pub(crate) const fn room(col: usize, width: usize) -> usize {
-    width.saturating_sub(2 * col)
+    width.saturating_sub(col.saturating_mul(2))
 }
 
 /// The last row of the line row `first` opens, its text there `head` (trimmed) from column `col`, in a pane `width` cells wide ([`room`]): each row after it, short of row `until`, that [`continues`] the row above it.
@@ -68,8 +68,11 @@ pub(crate) fn line_end(
     let until = until.min(rows.len());
     let room = room(col, width);
     let (mut end, mut above) = (first, head);
-    while end + 1 < until && continues(above, col, &rows[end + 1], room) {
-        end += 1;
+    while let Some(next) = end.checked_add(1)
+        && next < until
+        && continues(above, col, &rows[next], room)
+    {
+        end = next;
         above = crate::text::trim(&rows[end]);
     }
     end
@@ -138,12 +141,15 @@ pub(crate) fn run_end(rows: &[String], first: usize, col: usize, until: usize) -
     let until = until.min(rows.len());
     let drawn = |t: &str| t.chars().any(|c| ('\u{2500}'..='\u{259F}').contains(&c));
     let mut end = first;
-    while end + 1 < until && {
-        let r = &rows[end + 1];
-        let t = crate::text::trim(r);
-        !t.is_empty() && leading_spaces(r) == col && !drawn(t)
-    } {
-        end += 1;
+    while let Some(next) = end.checked_add(1)
+        && next < until
+        && {
+            let r = &rows[next];
+            let t = crate::text::trim(r);
+            !t.is_empty() && leading_spaces(r) == col && !drawn(t)
+        }
+    {
+        end = next;
     }
     end
 }
@@ -184,12 +190,59 @@ pub(crate) fn rows_in(line: &str, room: usize) -> usize {
 
 /// Rows `run`, one line Ink wrapped, as that line: the first row's indent, then each row's text, joined with one space (Ink's word wrap breaks at a space and draws none at either end of a row).
 pub(crate) fn rejoined(run: &[String]) -> String {
-    let mut out = " ".repeat(leading_spaces(&run[0]));
+    let Some(first) = run.first() else {
+        return String::new();
+    };
+    let mut out = " ".repeat(leading_spaces(first));
     for (k, r) in run.iter().enumerate() {
         if k > 0 {
             out.push(' ');
         }
         out.push_str(crate::text::trim(r));
+    }
+    out
+}
+
+/// A message's rows `said` (each a row of `rows` and its text there, trimmed, in order), a line a row.
+pub(crate) fn said_rows(said: &[(usize, &str)]) -> String {
+    let texts: Vec<&str> = said.iter().map(|&(_, text)| text).collect();
+    texts.join("\n")
+}
+
+/// Rejoin word-wrapped message rows `said` (as [`said_rows`] takes them), whose box ends `margin`
+/// cells short of a pane as wide as `rows`' widest row. The leading cell consumed but not drawn
+/// after an exactly-full row ([`lead`]) counts against its next row's room. A row that
+/// [`continues_exactly`] the one above, from its [`text_column`], joins it with one separating
+/// space unless `apart(line, row)` opens a line of its own. A first word that would have fit above
+/// opens a new line. These row strings alone cannot distinguish a hard-broken token from separate
+/// words that drew the same rows, so the original spelling cannot always be recovered.
+pub(crate) fn said_lines(
+    rows: &[String],
+    said: &[(usize, &str)],
+    margin: usize,
+    apart: crate::reader::Apart,
+) -> String {
+    let width = crate::question::screen_width(rows);
+    let mut out = String::new();
+    let (mut col, mut lead, mut from) = (0, 0, 0);
+    for (k, &(i, text)) in said.iter().enumerate() {
+        let room = width.saturating_sub(col + margin);
+        let wraps = k > 0 && {
+            let (above, line) = said[k - 1];
+            above + 1 == i
+                && continues_exactly(line, lead, col, &rows[i], room)
+                && !apart(&out[from..], text)
+        };
+        if wraps {
+            lead = self::lead(lead + cells(said[k - 1].1), room);
+            out.push(' ');
+        } else {
+            if k > 0 {
+                out.push('\n');
+            }
+            (col, lead, from) = (text_column(&rows[i]), 0, out.len());
+        }
+        out.push_str(text);
     }
     out
 }
@@ -202,11 +255,11 @@ pub(crate) fn rejoined_cells(
 ) -> Option<Vec<String>> {
     let (&first, rest) = starts.split_first()?;
     let last_start = *rest.last().unwrap_or(&first);
-    let ends: Vec<usize> = rest
+    let widths: Vec<usize> = starts
         .iter()
-        .copied()
-        .chain([width.max(last_start)])
-        .collect();
+        .zip(rest.iter().copied().chain([width.max(last_start)]))
+        .map(|(&start, end)| end.checked_sub(start))
+        .collect::<Option<_>>()?;
     let mut texts = vec![String::new(); starts.len()];
     let mut full = vec![false; starts.len()];
     for (k, row) in run.iter().enumerate() {
@@ -214,8 +267,8 @@ pub(crate) fn rejoined_cells(
         if !crate::text::trim(left).is_empty() {
             return None;
         }
-        for (b, &end) in ends.iter().enumerate() {
-            let (cell, after) = crate::question::split_at_cell(row, end - starts[b]);
+        for (b, &box_w) in widths.iter().enumerate() {
+            let (cell, after) = crate::question::split_at_cell(row, box_w);
             row = after;
             let text = crate::text::trim_end(cell);
             if text.is_empty() {
@@ -229,7 +282,7 @@ pub(crate) fn rejoined_cells(
                 texts[b].push(' ');
             }
             texts[b].push_str(text);
-            full[b] = cells(cell.trim_end()) >= end - starts[b];
+            full[b] = cells(cell.trim_end()) >= box_w;
         }
     }
     Some(texts)
@@ -316,6 +369,14 @@ mod tests {
             " x                        Dismiss",
         ]);
         assert_eq!(rejoined_cells(&left, &[2, 10, 18, 26], 34), None);
+        assert_eq!(rejoined_cells(&at_34, &[10, 2], 34), None);
+        assert_eq!(rejoined(&[]), "");
+        assert_eq!(room(usize::MAX, 80), 0);
+        assert_eq!(
+            line_end(&at_34, usize::MAX, "x", 0, 80, usize::MAX),
+            usize::MAX
+        );
+        assert_eq!(run_end(&at_34, usize::MAX, 0, usize::MAX), usize::MAX);
     }
 
     /// Verify `line_start` walks back to the opening row of wrapped agent
@@ -372,5 +433,154 @@ mod tests {
         ]);
         assert_eq!(line_start(&list, 1, 50), 0, "an item's wrapped row");
         assert_eq!(line_start(&list, 2, 50), 2, "the control: an item opens");
+    }
+
+    /// A reply drawn at column2, with a text box `room` cells wide and the reader's right margin.
+    fn said_at(parts: &[String], room: usize, margin: usize) -> String {
+        let mut screen: Vec<String> = parts
+            .iter()
+            .enumerate()
+            .map(|(i, part)| format!("{}{part}", if i == 0 { "⏺ " } else { "  " }))
+            .collect();
+        screen.push("─".repeat(2 + room + margin));
+        let texts: Vec<(usize, &str)> = parts
+            .iter()
+            .enumerate()
+            .map(|(i, part)| (i, crate::text::trim(part)))
+            .collect();
+        said_lines(&screen, &texts, margin, |_, _| false)
+    }
+
+    #[test]
+    fn said_lines_preserve_a_word_boundary_after_a_full_row() {
+        let prefix = "NEEDS YOU: open the ";
+        let (first, second) = ("A".repeat(60), "B".repeat(40));
+        let line = format!("{prefix}{first} {second}");
+        let parts = crate::prompt::fixtures::ink_wrap(&line, 80);
+        assert_eq!(parts, [format!("{prefix}{first}"), second.clone()]);
+        // A hard-broken token can draw exactly the same rows. Their combined width is no proof
+        // that the author omitted a space, so the ordinary word-wrap reading must keep it.
+        let token = format!("{prefix}{first}{second}");
+        assert_eq!(crate::prompt::fixtures::ink_wrap(&token, 80), parts);
+        for margin in [0, 2] {
+            assert_eq!(
+                said_at(&parts, 80, margin),
+                line,
+                "separate words individually fit the box; margin={margin}"
+            );
+        }
+    }
+
+    /// Each reader's `said_lines` reads its measured 50-column reply's wrapped paragraph as one
+    /// line, its first paragraph a line of its own, where `said_tail` reads a line a row; the turn's
+    /// earlier message is read so too. NEGATIVE CONTROL: the wrapped paragraph's first row cut
+    /// short, its next row is a line of its own.
+    #[test]
+    fn said_lines_rejoin_each_readers_measured_wrap() {
+        use crate::prompt::fixtures::screen;
+        use crate::reader::{ScreenReader, identify};
+        let first = "I finished the parser and the suite is green.";
+        let second = "Two ways on from here: keep the old API, or move every caller now. Which do \
+                      you prefer (1 or 2)?";
+        for (name, text) in [
+            ("claude", crate::prompt::fixtures::REPLY_WRAPPED_50_2_1_302),
+            ("agy", crate::agy::fixtures::lab::REPLY_WRAPPED_50),
+            ("muse", crate::muse::fixtures::REPLY_WRAPPED_50_1_4_10),
+        ] {
+            let rows = screen(text);
+            let reader: &dyn ScreenReader = identify(Some(name), &rows);
+            let tail = reader.said_tail(&rows).expect("the reply");
+            assert_eq!(
+                tail.lines().count(),
+                if name == "agy" { 4 } else { 3 },
+                "{name}"
+            );
+            assert_eq!(
+                reader.said_lines(&rows, |_, _| false).as_deref(),
+                Some(format!("{first}\n{second}").as_str()),
+                "{name}"
+            );
+            assert_eq!(
+                reader.said_lines(&rows, |_, _| true).as_deref(),
+                Some(tail.as_str()),
+                "CONTROL: {name}: every row set apart is a line of its own"
+            );
+            let at = rows
+                .iter()
+                .position(|r| r.contains("Two ways on"))
+                .expect("the wrapped paragraph");
+            let mut cut = rows.clone();
+            cut[at] = "  Two ways on from here.".to_string();
+            let lines = reader.said_lines(&cut, |_, _| false).expect("the reply");
+            assert_eq!(lines.lines().count(), 3, "CONTROL: {name}: {lines:?}");
+            assert!(
+                lines.lines().nth(1) == Some("Two ways on from here."),
+                "CONTROL: {name}: {lines:?}"
+            );
+            if name == "claude" {
+                let mut earlier = rows.clone();
+                let head = earlier
+                    .iter()
+                    .position(|r| r.starts_with("⏺ "))
+                    .expect("the reply's head");
+                let moved: Vec<String> = earlier.drain(head + 2..=at + 1).collect();
+                let mut turn = vec![format!("⏺ {}", crate::text::trim(&moved[0]))];
+                turn.extend(moved[1..].iter().cloned());
+                turn.extend([
+                    "".to_string(),
+                    "⏺ Bash(targo --unverified test)".to_string(),
+                ]);
+                turn.extend(["  ⎿  ok".to_string(), String::new()]);
+                earlier.splice(head..head, turn);
+                assert_eq!(
+                    reader.turn_lines_before(&earlier, |_, _| false).as_deref(),
+                    Some(second),
+                    "{earlier:#?}"
+                );
+                assert_eq!(
+                    reader.turn_said_before(&earlier).map(|t| t.lines().count()),
+                    Some(2),
+                    "{earlier:#?}"
+                );
+            }
+        }
+    }
+
+    /// `said_lines` carries the lead Ink leaves under an exactly full row ([`lead`]): a need whose
+    /// first row fills the room (78 of 78 cells) and whose third row opens on `Settings` is read
+    /// as one line, as Ink wrapped it (1 + 69 + 1 + 8 > 78). NEGATIVE CONTROL: a 7-cell word there
+    /// fits even past the lead, so that row is a line of its own.
+    #[test]
+    fn said_lines_carry_the_lead_an_exactly_full_row_leaves() {
+        use crate::prompt::fixtures::ink_wrap;
+        let need = "NEEDS YOU: grant aterm (dev).app the Accessibility and the Screen Recording \
+                    on rights under Privacy & Security in the pane for the dev app in System \
+                    Settings so the window lab can drive it.";
+        let wrapped = ink_wrap(need, 78);
+        let widths: Vec<usize> = wrapped.iter().map(|r| cells(r)).collect();
+        assert_eq!(widths, [78, 69, 40], "{wrapped:#?}");
+        assert!(wrapped[2].starts_with("Settings "), "{wrapped:#?}");
+        let screen = |third: &str| -> Vec<String> {
+            vec![
+                format!("⏺ {}", wrapped[0]),
+                format!("  {}", wrapped[1]),
+                format!("  {third}"),
+            ]
+        };
+        let lines = |rows: &[String]| {
+            let said: Vec<(usize, &str)> = rows
+                .iter()
+                .enumerate()
+                .map(|(i, r)| (i, crate::text::trim(r.trim_start_matches('⏺'))))
+                .collect();
+            said_lines(rows, &said, 0, |_, _| false)
+        };
+        assert_eq!(lines(&screen(&wrapped[2])), need);
+        let control = lines(&screen("Display is next."));
+        assert_eq!(
+            control.lines().nth(1),
+            Some("Display is next."),
+            "CONTROL: {control:?}"
+        );
     }
 }

@@ -299,14 +299,11 @@ fn a_refused_mailbox_login_waits_before_it_is_tried_again() {
         words.starts_with("mailbox re…@… refused its last sign-in"),
         "{words}"
     );
-    let started = std::time::Instant::now();
+    // A poll that waited out its deadline would say it timed out: the refusal's words are the
+    // poll ending on the refusal.
     assert_eq!(
-        poll_mailbox_config_for_credential(&cfg, target, Duration::from_secs(3)),
+        poll_mailbox_config_for_credential(&cfg, target, HANG),
         Err(words)
-    );
-    assert!(
-        started.elapsed() < Duration::from_secs(3),
-        "it ended at once"
     );
     assert_eq!(logins.load(Ordering::SeqCst), 1);
     let now = unix_now();
@@ -330,7 +327,7 @@ fn a_refused_mailbox_login_waits_before_it_is_tried_again() {
     }
 
     assert_eq!(
-        poll_mailbox_config_for_credential(&cfg, target, Duration::from_secs(3)),
+        poll_mailbox_config_for_credential(&cfg, target, HANG),
         Err(words),
         "the next sign-in is refused from the record"
     );
@@ -945,6 +942,29 @@ m22,g@gmail.example.test,claude,itself (gmail),guess,\n";
     assert!(
         !debug.contains("owner@") && debug.contains("text_bytes"),
         "a plan's Debug never shows the file: {debug}"
+    );
+    assert_eq!(
+        login_in_cell("*@pm.example.test", "a@pm.example.test"),
+        None
+    );
+    assert_eq!(
+        login_in_cell("owner@.example.test", "a@pm.example.test"),
+        None
+    );
+    assert_eq!(
+        login_in_cell("owner@example..test", "a@pm.example.test"),
+        None
+    );
+    let upper_url = config(
+        "[[mailboxes]]\nlogin = \"o@example.test\"\npassword = \"p\"\n\
+         url = \"IMAPS://imap.example.test/INBOX\"\nreceives = [\"a@pm.example.test\"]\n",
+    );
+    assert_eq!(
+        upper_url
+            .routed_for(Some("a@pm.example.test"))
+            .imap_url
+            .as_deref(),
+        Some("IMAPS://imap.example.test/INBOX")
     );
 }
 

@@ -9,6 +9,236 @@ use crate::{
 use aterm_secrets::commons::roster::Role;
 use aterm_spec::interp::State;
 
+#[test]
+fn causal_joins_preserve_import_sources_and_allow_the_next_import() {
+    let lab = Lab::new(&[Role::Writer]);
+    let source = lab._home.path().join("first.csv");
+    std::fs::write(&source, "email,google\nfirst@example.test,1\n").unwrap();
+    let db = Imports::at(lab.paths[0].clone());
+    let receipt = db.apply(&source, [41; 16]).unwrap();
+    let before = db.snapshot().unwrap();
+    let merged = crate::documents::application::with_store(
+        &lab.paths[0],
+        false,
+        descriptor,
+        |session, store, _| {
+            store.commit_catalog(session, &Command::Merge { request: [42; 16] }.encode()?)
+        },
+    )
+    .unwrap();
+    let after = db.snapshot().unwrap();
+    assert!(after.history_complete());
+    assert_eq!(after.retained, before.retained + 1);
+    assert_eq!(after.cells, before.cells);
+    assert!(
+        after
+            .operations
+            .iter()
+            .any(|operation| operation.header.id == merged.id && operation.eligible)
+    );
+    assert_eq!(db.apply(&source, [41; 16]).unwrap(), receipt);
+    assert_eq!(db.snapshot().unwrap().retained, after.retained);
+
+    let next = lab._home.path().join("second.csv");
+    std::fs::write(&next, "email,google\nsecond@example.test,1\n").unwrap();
+    db.apply(&next, [43; 16]).unwrap();
+    let final_snapshot = db.snapshot().unwrap();
+    assert!(final_snapshot.history_complete());
+    assert_eq!(final_snapshot.cells.len(), 2);
+    for (key, cell) in before.cells {
+        assert_eq!(final_snapshot.cells.get(&key), Some(&cell));
+    }
+}
+
+#[test]
+fn structural_fallback_keeps_noncanonical_and_foreign_records_refused() {
+    let merge = Command::Merge { request: [46; 16] };
+    let mut trailing = merge.encode().unwrap();
+    trailing.push(b'\n');
+    let mut extended: Value = aterm_json::from_slice(&merge.encode().unwrap()).unwrap();
+    extended
+        .as_object_mut()
+        .unwrap()
+        .insert("extra".into(), json!("unrecognized"));
+    let foreign = Command::Write {
+        request: [47; 16],
+        changes: vec![Change {
+            collection: "other".into(),
+            key: "item".into(),
+            value: Some(json!(true)),
+        }],
+    };
+    for payload in [
+        trailing,
+        aterm_json::to_vec(&extended).unwrap(),
+        foreign.encode().unwrap(),
+    ] {
+        let lab = Lab::new(&[Role::Writer]);
+        let source = lab._home.path().join("source.csv");
+        std::fs::write(&source, "email,google\nfirst@example.test,1\n").unwrap();
+        let db = Imports::at(lab.paths[0].clone());
+        db.apply(&source, [48; 16]).unwrap();
+        let before = db.snapshot().unwrap();
+        let refused = crate::documents::application::with_store(
+            &lab.paths[0],
+            false,
+            descriptor,
+            |session, store, _| store.commit_catalog(session, &payload),
+        )
+        .unwrap();
+        let snapshot = db.snapshot().unwrap();
+        assert!(!snapshot.history_complete());
+        assert_eq!(snapshot.cells, before.cells);
+        let operation = snapshot
+            .operations
+            .iter()
+            .find(|op| op.header.id == refused.id)
+            .unwrap();
+        assert!(!operation.eligible);
+        assert_eq!(
+            operation.refusal.as_deref(),
+            Some(decode(&payload).unwrap_err().to_string().as_str())
+        );
+        assert!(db.apply(&source, [49; 16]).is_err());
+    }
+}
+
+fn cli_in_home(home: &Path, source: &Path, command: &str) -> Value {
+    let mut child = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+    child
+        .args([
+            "--exact",
+            "import::commons::tests::child_import_cli",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env_clear()
+        .env("HOME", home)
+        .env("ATERM_TEST_IMPORT_SOURCE", source)
+        .env("ATERM_TEST_IMPORT_COMMAND", command);
+    let output =
+        aterm_uds::deadline::output_within(&mut child, std::time::Duration::from_secs(60)).unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let result = stdout
+        .lines()
+        .find_map(|line| {
+            line.split_once("import-cli-result:")
+                .map(|(_, value)| value)
+        })
+        .expect("child reported its command result");
+    aterm_json::from_str(result).unwrap()
+}
+
+#[test]
+#[ignore = "child process fixture, invoked by the import preview and conformance tests"]
+fn child_import_cli() {
+    let home = std::env::var_os("HOME").unwrap();
+    assert_eq!(Paths::live().unwrap().home, Path::new(&home));
+    let source = std::env::var("ATERM_TEST_IMPORT_SOURCE").unwrap();
+    let command = std::env::var("ATERM_TEST_IMPORT_COMMAND").unwrap();
+    assert!(matches!(
+        command.as_str(),
+        "accounts-preview-csv"
+            | "accounts-import-csv"
+            | "preview-with-request"
+            | "accounts-compare-csv"
+            | "compare-without-store"
+    ));
+    let verb = if command == "preview-with-request" {
+        "accounts-preview-csv"
+    } else if command == "compare-without-store" {
+        "accounts-compare-csv"
+    } else {
+        &command
+    };
+    let mut args = vec![verb.into(), "--file".into(), source];
+    if command == "accounts-import-csv" || command == "preview-with-request" {
+        args.extend(["--request".into(), "52".repeat(16)]);
+    }
+    let value = if command == "preview-with-request" || command == "compare-without-store" {
+        assert!(crate::cli::run(&args).is_err());
+        json!({"refused":true})
+    } else {
+        crate::cli::run(&args).unwrap()
+    };
+    println!(
+        "import-cli-result:{}",
+        aterm_json::to_string(&value).unwrap()
+    );
+}
+
+#[test]
+fn comparison_refuses_unestablished_commons_without_initializing_it() {
+    let settled = Lab::new(&[Role::Writer]);
+    let source = settled._home.path().join("source.csv");
+    std::fs::write(&source, "email,google\nprivate@example.test,1\n").unwrap();
+    let db = Imports::at(settled.paths[0].clone());
+    db.apply(&source, [45; 16]).unwrap();
+    let before = crate::tests::files(&settled.paths[0].home);
+    let report = db.compare(&source).unwrap();
+    assert_eq!(
+        report["comparisons"][0]["exact_candidate_match"],
+        json!(true)
+    );
+    assert_eq!(report["history_complete"], json!(true));
+    assert_eq!(report["authority"], json!("none"));
+    assert_eq!(crate::tests::files(&settled.paths[0].home), before);
+
+    let pending = Lab::new(&[Role::Writer]);
+    let paths = &pending.paths[0];
+    assert!(matches!(
+        aterm_secrets::commons::observe(paths).unwrap(),
+        aterm_secrets::commons::Observation::Visible(_)
+    ));
+    let commons = paths.dir.join("commons");
+    assert!(!paths.dir.join("commons.claim").exists());
+    assert!(!commons.join("default.pin").exists());
+    assert!(!commons.join("control").exists());
+    let before = crate::tests::files(&paths.home);
+    assert!(Imports::at(paths.clone()).compare(&source).is_err());
+    assert_eq!(crate::tests::files(&paths.home), before);
+    assert!(!paths.dir.join("commons.claim").exists());
+    assert!(!commons.join("default.pin").exists());
+    assert!(!commons.join("control").exists());
+}
+
+#[test]
+fn comparison_cli_is_read_only_in_existing_and_unenrolled_homes() {
+    let lab = Lab::new(&[Role::Writer]);
+    let path = lab._home.path().join("source.csv");
+    std::fs::write(&path, "email,google\nprivate@example.test,1\n").unwrap();
+    let db = Imports::at(lab.paths[0].clone());
+    db.apply(&path, [44; 16]).unwrap();
+    let before = crate::tests::files(&lab.paths[0].home);
+    let report = cli_in_home(&lab.paths[0].home, &path, "accounts-compare-csv");
+    assert_eq!(
+        report["comparisons"][0]["exact_candidate_match"],
+        json!(true)
+    );
+    assert_eq!(report["history_complete"], json!(true));
+    assert_eq!(report["authority"], json!("none"));
+    assert!(
+        !aterm_json::to_string(&report)
+            .unwrap()
+            .contains("private@example.test")
+    );
+    assert_eq!(crate::tests::files(&lab.paths[0].home), before);
+    cli_in_home(&lab.paths[0].home, &path, "accounts-import-csv");
+    assert_ne!(crate::tests::files(&lab.paths[0].home), before);
+    let unenrolled = lab._home.path().join("unenrolled");
+    std::fs::create_dir(&unenrolled).unwrap();
+    assert_eq!(
+        cli_in_home(&unenrolled, &path, "compare-without-store")["refused"],
+        json!(true)
+    );
+    assert_eq!(std::fs::read_dir(unenrolled).unwrap().count(), 0);
+}
+
 pub(crate) fn atomic_transition(state: &State, action: &str) -> State {
     let lab = Lab::new(&[Role::Writer]);
     let path = lab._home.path().join("accounts.csv");
@@ -17,6 +247,16 @@ pub(crate) fn atomic_transition(state: &State, action: &str) -> State {
     let mut stable = true;
     let mut private_writes = 0;
     let phase = match action {
+        "Preview" => {
+            assert_eq!(state["phase"], 0);
+            let viewed = cli_in_home(&lab.paths[0].home, &path, "accounts-preview-csv");
+            assert_eq!(viewed, preview(&path).unwrap());
+            assert_eq!(
+                viewed["rows"][0]["providers"][0]["presence_marker"],
+                json!(true)
+            );
+            4
+        }
         "Reject" => {
             assert_eq!(state["phase"], 0);
             let private = lab._home.path().join("private");
@@ -110,14 +350,73 @@ fn atomic_import_conforms_with_negative_controls() {
                 assert!(!model.check_invariant("OriginalReceipt", &wrong));
                 assert!(!model.successors(action.name, &state).contains(&wrong));
                 if action.name == "Reject" {
-                    let mut written = next;
+                    let mut written = next.clone();
                     written.insert("effects", 1);
                     assert!(!model.check_invariant("RejectBeforeWrites", &written));
                     assert!(!model.successors(action.name, &state).contains(&written));
                 }
+                if action.name == "Preview" {
+                    for (field, law) in [
+                        ("published", "PreviewBeforePublication"),
+                        ("effects", "PreviewBeforeWrites"),
+                    ] {
+                        let mut written = next.clone();
+                        written.insert(field, 1);
+                        assert!(!model.check_invariant(law, &written));
+                        assert!(!model.successors(action.name, &state).contains(&written));
+                    }
+                }
             }
         }
     }
+}
+
+#[test]
+fn preview_cli_needs_only_the_source_and_does_not_create_a_database() {
+    let root = crate::tests::tmp();
+    let path = root.path().join("source.csv");
+    let source =
+        "email,computer,google,notes\nCase+tag@example.test,m3.2,phone required,PRIVATE-NOTE\n";
+    std::fs::write(&path, source).unwrap();
+    let home = root.path().join("unenrolled");
+    std::fs::create_dir(&home).unwrap();
+    let value = cli_in_home(&home, &path, "accounts-preview-csv");
+    assert_eq!(value["rows"][0]["email"], json!("Case+tag@example.test"));
+    assert_eq!(value["rows"][0]["machine_slot_hint"], json!("m3.2"));
+    assert_eq!(value["rows"][0]["providers"], json!([]));
+    let encoded = aterm_json::to_string(&value).unwrap();
+    assert!(!encoded.contains("PRIVATE-NOTE"));
+    assert!(!encoded.contains("phone required"));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 2);
+    assert_eq!(std::fs::read_dir(&home).unwrap().count(), 0);
+    assert_eq!(
+        cli_in_home(&home, &path, "preview-with-request")["refused"],
+        json!(true)
+    );
+    assert_eq!(std::fs::read_dir(&home).unwrap().count(), 0);
+}
+
+#[test]
+fn preview_process_witness_observes_real_import_writes() {
+    let lab = Lab::new(&[Role::Writer]);
+    let path = lab._home.path().join("source.csv");
+    std::fs::write(&path, "email,google\ncontrol@example.test,1\n").unwrap();
+    let db = Imports::at(lab.paths[0].clone());
+    assert!(db.snapshot().is_err());
+    let value = cli_in_home(&lab.paths[0].home, &path, "accounts-preview-csv");
+    assert!(db.snapshot().is_err());
+    let receipt = cli_in_home(&lab.paths[0].home, &path, "accounts-import-csv");
+    let snapshot = db.snapshot().unwrap();
+    assert_eq!(snapshot.operations.len(), 1);
+    assert_eq!(
+        snapshot.cells.values().next().unwrap().candidates[0].value,
+        value
+    );
+    assert_eq!(
+        snapshot.operations[0].receipt.id,
+        decode_hex::<32>(receipt["operation"].as_str().unwrap()).unwrap()
+    );
 }
 
 #[test]
@@ -193,10 +492,11 @@ fn import_is_one_atomic_retryable_inert_source_document() {
     let path = lab._home.path().join("accounts.csv");
     let original = "email,computer,google,claude,notes,payment\nOwner+Two@example.test,m3.2,email link,1,alias of private PRIVATE-NOTE,PRIVATE-PAYMENT\nowner@example.test,m100,1,,phone +12025550123,\ninvalid,unknown,1,,PRIVATE-CELL,\n";
     std::fs::write(&path, original).unwrap();
+    let previewed = preview(&path).unwrap();
     let db = Imports::at(lab.paths[0].clone());
     let first = db.apply(&path, [1; 16]).unwrap();
     assert_eq!(first["candidate_rows"], json!(3));
-    assert_eq!(first["provider_hints"], json!(4));
+    assert_eq!(first["provider_hints"], json!(3));
     assert_eq!(first["email_candidates"], json!(2));
     assert_eq!(first["credentials_activated"], json!(false));
     assert_eq!(db.apply(&path, [1; 16]).unwrap(), first);
@@ -205,8 +505,24 @@ fn import_is_one_atomic_retryable_inert_source_document() {
     assert_eq!(snapshot.operations.len(), 1);
     assert_eq!(snapshot.cells.len(), 1);
     let value = &snapshot.cells.values().next().unwrap().candidates[0].value;
+    assert_eq!(
+        &previewed, value,
+        "preview and publication use the same candidate"
+    );
     assert_eq!(value["rows"][0]["email"], json!("Owner+Two@example.test"));
     assert_eq!(value["rows"][0]["machine_slot_hint"], json!("m3.2"));
+    assert_eq!(
+        value["rows"][0]["providers"],
+        json!([{"provider":"anthropic","column":4,"presence_marker":true}]),
+        "a free-form Google note is not a negative account declaration"
+    );
+    assert!(
+        value["rows"][0]["unclassified_columns"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(3)),
+        "the Google note keeps its source coordinate"
+    );
     assert_eq!(value["rows"][1]["machine_slot_hint"], json!("m100"));
     assert!(value["rows"][2]["email"].is_null());
     let encoded = aterm_json::to_string(value).unwrap();
@@ -228,6 +544,13 @@ fn import_is_one_atomic_retryable_inert_source_document() {
         snapshot.operations[0].receipt.id,
         decode_hex::<32>(first["operation"].as_str().unwrap()).unwrap()
     );
+    assert_eq!(
+        &cli_in_home(&lab.paths[0].home, &path, "accounts-preview-csv"),
+        value
+    );
+    let after_preview = db.snapshot().unwrap();
+    assert_eq!(after_preview.cells, snapshot.cells);
+    assert_eq!(after_preview.operations.len(), snapshot.operations.len());
     std::fs::write(&path, "email,google\nchanged@example.test,1\n").unwrap();
     assert!(db.apply(&path, [1; 16]).is_err());
     assert_eq!(db.snapshot().unwrap().operations.len(), 1);
@@ -278,12 +601,14 @@ fn invalid_and_oversize_documents_are_refused_before_table_publication() {
     let path = lab._home.path().join("accounts.csv");
     let db = Imports::at(lab.paths[0].clone());
     std::fs::write(&path, "email,email\na@example.test,b@example.test\n").unwrap();
+    assert!(preview(&path).is_err());
     assert!(db.apply(&path, [1; 16]).is_err());
     let mut csv = "email,google\n".to_owned();
     for index in 0..1500 {
         csv.push_str(&format!("owner{index}@example.test,1\n"));
     }
     std::fs::write(&path, csv).unwrap();
+    assert!(preview(&path).is_err());
     assert!(db.apply(&path, [2; 16]).is_err());
     let bootstrap = lab.bootstrap(0);
     let session = Session::open(&bootstrap).unwrap();

@@ -4,6 +4,11 @@
 use super::*;
 use aterm_spec::interp::State;
 
+/// Rows that give one address two machines choose neither, in either order: that address is in
+/// no machine's pool and its rows are named, while the sheet's other rows are read, each keeping
+/// the label it had with the address's first row alone (a conflicting row added after it moves
+/// no other account's label). NEGATIVE CONTROL: before, the whole sheet was refused, so one bad
+/// row stopped every account's sync.
 #[test]
 fn duplicate_account_rows_cannot_choose_a_machine_by_source_order() {
     for cli in [Cli::Claude, Cli::Codex, Cli::Grok, Cli::Kimi] {
@@ -13,15 +18,50 @@ fn duplicate_account_rows_cannot_choose_a_machine_by_source_order() {
             format!("one@example.test,m3,{value}\n"),
             format!("ONE@example.test,m8,{value}\n"),
         ];
+        let other = format!("two@example.test,m3,{value}\n");
+        let alone = |first: &str| {
+            parse_accounting_csv_for(
+                cli,
+                &format!("email,computer,{member}\n{first}{other}"),
+                "fixture.csv",
+            )
+            .unwrap()
+        };
+        let label_of = |fleet: &CliFleet, email: &str| {
+            fleet
+                .roster
+                .accounts
+                .iter()
+                .find(|a| accounts::email_matches(&a.email, email))
+                .map(|a| a.label.clone())
+        };
         for order in [[0, 1], [1, 0]] {
             let source = format!(
-                "email,computer,{member}\n{}{}",
+                "email,computer,{member}\n{}{}{other}",
                 rows[order[0]], rows[order[1]]
             );
-            let error = parse_accounting_csv_for(cli, &source, "fixture.csv")
-                .expect_err("conflicting duplicate rows must not choose the first machine");
-            assert!(error.contains("conflicting duplicate"), "{error}");
-            assert!(!error.contains("example.test"), "no address in errors");
+            let fleet = parse_accounting_csv_for(cli, &source, "fixture.csv")
+                .expect("one address's conflict leaves the rest of the sheet read");
+            assert_eq!(label_of(&fleet, "one@example.test"), None, "{cli:?}");
+            assert_eq!(
+                label_of(&fleet, "two@example.test"),
+                label_of(&alone(&rows[order[0]]), "two@example.test"),
+                "{cli:?}: the other row keeps its label"
+            );
+            assert!(fleet.roster.accounts_for_machine("m8").is_empty());
+            let expected = if order == [0, 1] {
+                vec!["m3".to_owned(), "m8".to_owned()]
+            } else {
+                vec!["m8".to_owned(), "m3".to_owned()]
+            };
+            assert_eq!(
+                fleet.roster.conflicts,
+                [SheetConflict {
+                    cli,
+                    rows: vec![2, 3],
+                    machines: expected,
+                }]
+            );
         }
     }
 }
@@ -41,15 +81,15 @@ fn duplicate_held_rows_coalesce_but_do_not_select_a_region_from_an_active_row() 
         "first@example.test,m3,1\nFIRST@example.test,m3,global\n",
         "FIRST@example.test,m3,global\nfirst@example.test,m3,1\n",
     ] {
-        assert!(
-            parse_accounting_csv_for(
-                Cli::Kimi,
-                &format!("email,computer,kimi\n{rows}"),
-                "fixture.csv"
-            )
-            .unwrap_err()
-            .contains("conflicting duplicate")
-        );
+        let parsed = parse_accounting_csv_for(
+            Cli::Kimi,
+            &format!("email,computer,kimi\n{rows}"),
+            "fixture.csv",
+        )
+        .unwrap();
+        assert!(parsed.roster.accounts.is_empty() && parsed.held.is_empty());
+        assert_eq!(parsed.roster.conflicts.len(), 1);
+        assert_eq!(parsed.roster.conflicts[0].rows, [2, 3]);
     }
 }
 
@@ -155,7 +195,16 @@ fn project(state: &State, cli: Cli, action: &str, source: &str) -> State {
     };
     let present = csv_names_column(cli, source);
     let result = parse_accounting_csv_for(cli, source, "fixture.csv");
+    let conflicted = matches!(action, "ConflictingRows" | "ExcludedDuplicate");
     let exact = result.as_ref().map_or(true, |fleet| {
+        if conflicted {
+            return fleet.cli == cli
+                && fleet.held.is_empty()
+                && fleet.roster.accounts.is_empty()
+                && fleet.roster.conflicts.len() == 1
+                && fleet.roster.conflicts[0].cli == cli
+                && fleet.roster.conflicts[0].rows == [2, 3];
+        }
         let machines = if action == "MultiMachine" {
             vec!["m3".to_owned(), "m8".to_owned()]
         } else {
@@ -173,6 +222,7 @@ fn project(state: &State, cli: Cli, action: &str, source: &str) -> State {
         };
         fleet.cli == cli
             && fleet.held.is_empty()
+            && fleet.roster.conflicts.is_empty()
             && fleet.roster.accounts.len() == 1
             && accounts::email_matches(&fleet.roster.accounts[0].email, "first@example.test")
             && fleet.roster.accounts[0].machines == machines
@@ -243,9 +293,11 @@ fn sheet_columns_conform_and_ambiguity_mutants_are_detected() {
         ("DuplicateEmail", "accepted", 1, "NoAmbiguousSource"),
         ("DuplicateMember", "present", 0, "HeaderPresence"),
         ("MultiMachine", "exact", 0, "ExactMapping"),
-        ("ConflictingRows", "accepted", 1, "NoAmbiguousSource"),
+        ("ConflictingRows", "accepted", 0, "ValidSource"),
+        ("ConflictingRows", "exact", 0, "ExactMapping"),
         ("EquivalentRows", "accepted", 0, "ValidSource"),
-        ("ExcludedDuplicate", "accepted", 1, "NoAmbiguousSource"),
+        ("ExcludedDuplicate", "accepted", 0, "ValidSource"),
+        ("ExcludedDuplicate", "exact", 0, "ExactMapping"),
     ] {
         let mut wrong = sheet_transition(&model.init_state(), action);
         wrong.insert(field, value);

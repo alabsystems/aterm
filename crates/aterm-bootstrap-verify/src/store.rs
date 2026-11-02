@@ -8,7 +8,7 @@ use std::os::unix::fs::MetadataExt as _;
 
 use aterm_toml::Value;
 
-use crate::chain::{open_file, parse_toml, read_bounded, strings};
+use crate::chain::{open_file, parse_toml, read_bounded_file, strings};
 use crate::py::{PyPath, bare_os_error, equals_int, equals_str, os_error, truthy, uint, uint_or};
 use crate::{MAX_BINARY, Refusal, Verdict, require};
 
@@ -100,16 +100,19 @@ fn identity_digest(value: Option<&Value>) -> Option<&str> {
         .filter(|sha| digest(sha))
 }
 
-/// The lowercase SHA-256 of the open `file`.
-fn sha256_of(mut file: std::fs::File) -> Verdict<String> {
+/// The lowercase SHA-256 of the open `file`, bounded to `max_bytes`.
+fn sha256_of(mut file: std::fs::File, max_bytes: u64) -> Verdict<String> {
     use std::io::Read as _;
     let mut hasher = aterm_digest::Sha256::new();
     let mut buffer = vec![0u8; 1 << 16];
+    let mut total: u64 = 0;
     loop {
         let n = file.read(&mut buffer).map_err(|e| bare_os_error(&e))?;
         if n == 0 {
             break;
         }
+        total = total.saturating_add(n as u64);
+        require(total <= max_bytes, "unsafe installed executable")?;
         hasher.update(&buffer[..n]);
     }
     Ok(aterm_codec::hex::encode_lower(&hasher.finalize()))
@@ -148,7 +151,17 @@ pub fn read_install_policy(store: &OsStr) -> Verdict<Policy> {
         meta.file_type().is_file() && meta.uid() == me && meta.mode() & 0o077 == 0,
         "unsafe update-state file",
     )?;
-    let state = parse_toml(&read_bounded(&path, 262_144)?, &path)?;
+    let state_file = open_file(&real)?;
+    let state_opened = state_file.metadata().map_err(|e| os_error(&e, &real))?;
+    require(
+        state_opened.file_type().is_file()
+            && state_opened.uid() == me
+            && state_opened.mode() & 0o077 == 0
+            && state_opened.dev() == meta.dev()
+            && state_opened.ino() == meta.ino(),
+        "unsafe update-state file",
+    )?;
+    let state = parse_toml(&read_bounded_file(state_file, &path, 262_144)?, &path)?;
     require(
         equals_int(state.get("schema"), 1),
         "unsupported update-state schema",
@@ -213,7 +226,20 @@ pub fn read_install_policy(store: &OsStr) -> Verdict<Policy> {
             && target_meta.len() <= MAX_BINARY,
         "unsafe installed executable",
     )?;
-    let actual = sha256_of(open_file(&target_path)?)?;
+    let target_file = open_file(&target_path)?;
+    let target_opened = target_file
+        .metadata()
+        .map_err(|e| os_error(&e, &target_path))?;
+    require(
+        target_opened.file_type().is_file()
+            && target_opened.uid() == me
+            && target_opened.mode() & 0o6022 == 0
+            && target_opened.len() <= MAX_BINARY
+            && target_opened.dev() == target_meta.dev()
+            && target_opened.ino() == target_meta.ino(),
+        "unsafe installed executable",
+    )?;
+    let actual = sha256_of(target_file, MAX_BINARY)?;
     let mut rejected = policy.rejected_build;
     let trial = state.get("trial");
     if truthy(trial) {

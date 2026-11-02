@@ -96,7 +96,7 @@ pub(crate) use line_codec::{MAX_DECODE_PAGE_LINES, count_page_lines, serialize_p
 pub use line_codec::{
     deserialize_lines, deserialize_lines_strict, deserialize_lines_strict_dropping_over_cap_links,
     deserialize_lines_tail_strict, deserialize_page_lines, max_linked_record_bytes,
-    serialize_lines, serialize_lines_bounded,
+    serialize_line_views, serialize_lines, serialize_lines_bounded,
 };
 #[cfg(test)]
 pub(crate) use line_codec_block::take_records_walked;
@@ -532,15 +532,9 @@ impl Line {
             LineContent::Inline(_) => 0,
             LineContent::Heap(v) => v.capacity(),
         };
-        let attrs_mem = if self.attrs.is_some() {
-            std::mem::size_of::<Rle<CellAttrs>>().saturating_add(
-                attr_runs(self.attrs.as_deref())
-                    .len()
-                    .saturating_mul(std::mem::size_of::<aterm_rle::Run<CellAttrs>>()),
-            )
-        } else {
-            0
-        };
+        let attrs_mem = self.attrs.as_deref().map_or(0, |attrs| {
+            std::mem::size_of::<Rle<CellAttrs>>().saturating_add(attrs.heap_bytes())
+        });
         let hyperlinks_mem = match self.hyperlinks() {
             Some(spans) => {
                 let boxed = std::mem::size_of::<SmallVec<HyperlinkSpan, 2>>();

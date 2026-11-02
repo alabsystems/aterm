@@ -76,7 +76,12 @@ impl Receipt {
             "auth" => Some(ProgramBlockedKind::Auth),
             _ => return None,
         };
-        let began = began.parse::<u64>().ok().filter(|began| *began > 0)?;
+        let began = began
+            .bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| began.parse::<u64>().ok())
+            .flatten()
+            .filter(|began| *began > 0)?;
         Some(Self { kind, began })
     }
 }

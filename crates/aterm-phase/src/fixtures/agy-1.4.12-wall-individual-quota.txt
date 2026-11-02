@@ -1,0 +1,22 @@
+# agy 1.4.12 · MEASURED 2026-11-01 on m15 (`aterm ctl text` of s-262519f185e467ac15d2, email redacted): agy 1.4.12 prints the signed-in account's subscription quota directly after `⚠ ` with no `agent executor error` wrapper (`⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 124h19m39s.`) while a background command task runs on in the panel under the composer and `/model` switched the session to `Claude Opus 5.5 · high`
+
+      ▄▀▀▄        Antigravity CLI 1.4.12
+     ▀▀▀▀▀▀       andrew@example.com
+    ▀▀▀▀▀▀▀▀      Gemini 4 Argon (High)
+   ▄▀▀    ▀▀▄     ~/aterm
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────
+> run verify
+
+○ Running (targo --unverified verify --no-windows) (ctrl+o to expand)
+
+⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 124h19m39s.
+Error ID: 19209f28-6772-41c0-b182-484d60a8a3e5-39713
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ● [11:38:05] targo --unverified verify --no-windows running
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+? for shortcuts                                                                                        Claude Opus 5.5 · high · 1 task(s) · /tasks

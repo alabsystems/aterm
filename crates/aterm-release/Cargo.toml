@@ -112,6 +112,8 @@ aterm-png = { workspace = true }
 # Same-filesystem clock stamps own an exclusive scratch directory in the slot;
 # they never remove a fixed pre-existing marker merely to read its mtime.
 aterm-tempfile = { workspace = true }
+# Nested lockfile bumps pin their directories and replace entries without following aliases.
+aterm-dirfd.workspace = true
 
 [dev-dependencies]
 # Binds the release-floor resolver and late guard to their derived lifecycle model.

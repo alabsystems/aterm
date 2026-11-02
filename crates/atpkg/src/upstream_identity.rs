@@ -232,11 +232,39 @@ fn rustup_proxy(target: &Path, canonical: &Path) -> Option<PathBuf> {
         };
         theirs.is_file()
             && ours.len() == theirs.len()
-            && (same_inode(&ours, &theirs)
-                || std::fs::read(canonical)
-                    .ok()
-                    .is_some_and(|bytes| std::fs::read(sibling).ok() == Some(bytes)))
+            && (same_inode(&ours, &theirs) || files_equal_bounded(canonical, sibling, ours.len()))
     })
+}
+
+fn files_equal_bounded(a: &Path, b: &Path, expected_len: u64) -> bool {
+    use std::io::Read as _;
+    const MAX_PROXY_BYTES: u64 = 64 * 1024 * 1024;
+    if expected_len > MAX_PROXY_BYTES {
+        return false;
+    }
+    let (Ok(mut fa), Ok(mut fb)) = (std::fs::File::open(a), std::fs::File::open(b)) else {
+        return false;
+    };
+    let (mut ba, mut bb) = ([0u8; 8192], [0u8; 8192]);
+    let mut total = 0u64;
+    loop {
+        let Ok(na) = fa.read(&mut ba) else {
+            return false;
+        };
+        if na == 0 {
+            let Ok(nb) = fb.read(&mut bb[..1]) else {
+                return false;
+            };
+            return nb == 0 && total == expected_len;
+        }
+        if fb.read_exact(&mut bb[..na]).is_err() || ba[..na] != bb[..na] {
+            return false;
+        }
+        total = total.saturating_add(na as u64);
+        if total > MAX_PROXY_BYTES {
+            return false;
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -650,8 +678,13 @@ fn cache_put(file: &Path, kind: &str, key: &str, values: &[&str], keep: usize) {
     let Some(dir) = file.parent() else {
         return;
     };
-    let tmp = dir.join(format!(".{CACHE_FILE}.{}.tmp", std::process::id()));
-    if std::fs::write(&tmp, body).is_err() || std::fs::rename(&tmp, file).is_err() {
+    static CACHE_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = CACHE_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(".{CACHE_FILE}.{}-{seq}.tmp", std::process::id()));
+    let written = crate::platform::open_create_new_write(&tmp, 0o644)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, body.as_bytes()))
+        .and_then(|()| std::fs::rename(&tmp, file));
+    if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
 }

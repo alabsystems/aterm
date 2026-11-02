@@ -17,9 +17,6 @@ use std::io;
 
 use super::JAIL_SEAM;
 
-/// `SANDBOX_FILTER_NONE`: whether a process is sandboxed at all.
-const FILTER_NONE: c_int = 0;
-
 /// `SANDBOX_FILTER_GLOBAL_NAME`: a Mach global name.
 const FILTER_GLOBAL_NAME: c_int = 2;
 
@@ -54,14 +51,12 @@ fn jail_pids(mark: &str) -> io::Result<Vec<u32>> {
     // SAFETY: a data symbol of libSystem, read once.
     let no_report = unsafe { SANDBOX_CHECK_NO_REPORT };
     let member = |pid: u32| {
+        let sandboxed = super::sandboxed(pid) == Some(true);
         let Ok(pid) = i32::try_from(pid) else {
             return false;
         };
-        // SAFETY: `sandbox_check` reads only its arguments; the operation is a null pointer
-        // under `SANDBOX_FILTER_NONE`, which takes no further argument.
-        let sandboxed = unsafe { sandbox_check(pid, std::ptr::null(), FILTER_NONE) };
-        // SAFETY: as above; the operation is a C string literal and the one variadic argument
-        // is the name, a valid C string that outlives the call.
+        // SAFETY: `sandbox_check` reads only its arguments; the operation is a C string literal
+        // and the one variadic argument is the name, a valid C string that outlives the call.
         let denies = |n: &CString| unsafe {
             sandbox_check(
                 pid,
@@ -70,7 +65,7 @@ fn jail_pids(mark: &str) -> io::Result<Vec<u32>> {
                 n.as_ptr(),
             )
         };
-        sandboxed == 1 && denies(&name) == 1 && denies(&none) == 0
+        sandboxed && denies(&name) == 1 && denies(&none) == 0
     };
     if !member(std::process::id()) {
         return Err(refused(format!("this process is not in the jail {mark}")));

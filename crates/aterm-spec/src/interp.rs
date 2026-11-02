@@ -322,18 +322,24 @@ impl Resolved {
     }
 
     /// Every successor of `s` under the model's `a`-th action.
+    /// # Panics
+    /// If `a` is out of range or `s.len()` does not match the model's state width.
     #[must_use]
     pub fn successors(&self, a: usize, s: &[i64]) -> Vec<Vec<i64>> {
         self.0.successors(a, s)
     }
 
     /// Whether the model's `i`-th invariant holds at `s` ([`Model::check_invariant_in`]).
+    /// # Panics
+    /// If `i` is out of range or `s.len()` does not match the model's state width.
     #[must_use]
     pub fn holds(&self, i: usize, s: &[i64]) -> bool {
         self.0.holds(i, s)
     }
 
     /// `s` as a [`State`].
+    /// # Panics
+    /// If `s.len()` does not match the model's state width.
     #[must_use]
     pub fn state(&self, s: &[i64]) -> State {
         self.0.state(s)
@@ -690,6 +696,8 @@ fn reachable_on<W: Walker>(m: &Model, w: &W) -> Vec<State> {
 }
 
 /// A reachable state with no successor under any action that is not declared final.
+/// # Panics
+/// If the reachable space exceeds [`MAX_STATES`], exactly like [`bmc`].
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn find_deadlock(m: &Model, is_final: impl Fn(&State) -> bool) -> Option<State> {
@@ -709,6 +717,11 @@ fn find_deadlock_on<W: Walker>(
 ) -> Option<State> {
     let mut walk = Walk::new(w);
     while walk.pop(w) {
+        assert!(
+            walk.expanded < MAX_STATES,
+            "{} state space unexpectedly large — tighten bounds",
+            m.name
+        );
         let mut any_succ = false;
         let st = walk.held.borrow();
         let env = w.env(st);
@@ -1801,6 +1814,23 @@ mod tests {
         let r = Resolved::new(m).expect("compiles");
         for (i, name) in m.init_state().keys().enumerate() {
             assert_eq!(r.slot(name), i, "{}: slot of {name}", m.name);
+        }
+        let mut wrong = r.init();
+        wrong.push(0);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.state(&wrong))).is_err()
+        );
+        if !m.actions.is_empty() {
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.successors(0, &wrong)))
+                    .is_err()
+            );
+        }
+        if !m.invariants.is_empty() {
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.holds(0, &wrong)))
+                    .is_err()
+            );
         }
         for (st, &compact) in states.iter().zip(&walked) {
             assert_eq!(&c.state(compact), st);

@@ -57,7 +57,9 @@ pub(crate) fn in_flight_here(entry: &OsStr) -> bool {
         .and_then(|name| name.rsplit_once(".lay-"))
         .and_then(|(_, tail)| tail.split_once('-'))
         .is_some_and(|(pid, seq)| {
-            pid.parse() == Ok(std::process::id())
+            !pid.is_empty()
+                && pid.bytes().all(|b| b.is_ascii_digit())
+                && pid.parse() == Ok(std::process::id())
                 && !seq.is_empty()
                 && seq.bytes().all(|b| b.is_ascii_digit())
         })

@@ -1,0 +1,24 @@
+seq v=1 rig=screen program=claude build=2.1.0
+# §2.4: a box the person stops the turn under (Esc, or the box's own "No")
+# closes `declined`. The screen reports the interrupt (Claude Code's
+# `⎿  Interrupted · What should Claude do instead?` under the call the box
+# asked about) with the idle it publishes next, and that verdict closes the
+# box; the person's key bound to the box makes the close theirs, as any other.
+# The report holds for that one verdict: a box a later verdict closes passed.
+see busy
+half
+see prompt bash:not-read-only fixture=claude-2.1.280-box-bash-touch
+expect open p1 approval par=t1 box=bash:not-read-only @500
+person
+at 700 interrupted
+see idle fixture=claude-2.1.316-box-bash-declined-esc
+expect close p1 approval out=declined by=human @700
+half
+half
+expect close t1 turn out=interrupted
+at 3000 see busy
+at 3200 interrupted
+see prompt bash:not-read-only
+expect open p2 approval par=t2 box=bash:not-read-only @3200
+at 3400 see busy
+expect close p2 approval out=passed @3400

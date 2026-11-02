@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! agh.toml: its rows, the validation L1–L10, the release floor, and where agh's files live.
+//! agh.toml: its rows, the validation L1–L11, the release floor, and where agh's files live.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -100,9 +100,21 @@ impl Dirs {
         xdg_config_home: Option<&Path>,
         xdg_state_home: Option<&Path>,
     ) -> Option<Dirs> {
-        // WP1 writes the body (plan §5, body 4); until then no directory is resolved.
-        let _ = (home, xdg_config_home, xdg_state_home);
-        None
+        use aterm_types::dirs::{StatePlatform, resolve_aterm_config_dir, resolve_state_dir};
+        let config = resolve_aterm_config_dir(
+            xdg_config_home.map(Path::as_os_str),
+            None,
+            Some(home.as_os_str()),
+        );
+        let state = resolve_state_dir(
+            None,
+            StatePlatform {
+                home: Some(home.to_path_buf()),
+                xdg_state_home: xdg_state_home.map(Path::to_path_buf),
+                local_app_data: None,
+            },
+        );
+        Dirs::of(config, state, Some(home.to_path_buf()))
     }
 
     /// `<state>/journal`: the write journals.
@@ -239,7 +251,7 @@ fn default_read() -> Vec<String> {
 /// One broken rule.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConfigFault {
-    /// The rule: `L1` to `L10`.
+    /// The rule: `L1` to `L11`.
     pub rule: &'static str,
     /// What breaks it.
     pub what: String,
@@ -258,7 +270,7 @@ pub struct OwnerRule {
     pub write: Option<String>,
 }
 
-/// agh.toml after L1–L10.
+/// agh.toml after L1–L11.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Validated {
     pub(crate) profiles: BTreeMap<String, Profile>,
@@ -483,6 +495,17 @@ pub(crate) fn profile_name_fault(name: &str) -> Option<String> {
             as_name(name)
         ))
     }
+}
+
+/// The fault for a `[[writers]]` caller that is not `[a-z][a-z0-9-]{0,31}`, or `None` when it
+/// is one. The caller is shown as a fault shows a name, so a token typed in its place is masked.
+pub(crate) fn caller_fault(caller: &str) -> Option<String> {
+    (!is_row_name(caller)).then(|| {
+        format!(
+            "writer caller \"{}\" is not [a-z][a-z0-9-]{{0,31}}",
+            as_name(caller)
+        )
+    })
 }
 
 /// The usage error for a profile agh.toml does not name: `no profile named {name}`, with `next`.
@@ -955,6 +978,81 @@ impl Rows<'_> {
         }
     }
 
+    /// The tier `owner` holds at decide time, as `Router::tier_of` judges it over these owner
+    /// rows and the release floor: release on the floor, else the row's own tier, else
+    /// external for an owner with no row. `None` for a row whose tier L1 already refuses.
+    fn owner_tier(&self, owner: &str) -> Option<Tier> {
+        if on_floor(owner) {
+            return Some(Tier::Release);
+        }
+        match self
+            .config
+            .owners
+            .iter()
+            .find(|row| row.name.eq_ignore_ascii_case(owner))
+        {
+            Some(row) => Tier::parse(&row.tier),
+            None => Some(Tier::External),
+        }
+    }
+
+    fn l11(&self, faults: &mut Faults) {
+        let mut seen: Vec<&str> = Vec::new();
+        let mut twice: Vec<&str> = Vec::new();
+        for (i, row) in self.config.writers.iter().enumerate() {
+            let caller = row.caller.as_str();
+            if !is_row_name(caller) {
+                faults.push(
+                    "L11",
+                    format!(
+                        "writers row {}: caller {:?} is not [a-z][a-z0-9-]{{0,31}}",
+                        i + 1,
+                        as_name(caller).to_string()
+                    ),
+                );
+            }
+            if seen.contains(&caller) {
+                if !twice.contains(&caller) {
+                    twice.push(caller);
+                    faults.push(
+                        "L11",
+                        format!("writers: caller {} has two rows", as_name(caller)),
+                    );
+                }
+            } else {
+                seen.push(caller);
+            }
+            let shown = as_name(caller);
+            if row.repos.is_empty() {
+                faults.push("L11", format!("writers row for {shown}: repos is empty"));
+            }
+            for entry in &row.repos {
+                let Ok(slug) = Slug::parse(entry) else {
+                    faults.push(
+                        "L11",
+                        format!(
+                            "writers row for {shown}: {:?} is not a literal OWNER/NAME",
+                            as_value(entry).to_string()
+                        ),
+                    );
+                    continue;
+                };
+                match self.owner_tier(slug.owner()) {
+                    Some(Tier::Release) | None => {}
+                    Some(tier) => faults.push(
+                        "L11",
+                        format!(
+                            "writers row for {shown}: {} is not a release-tier repository ({} is {})",
+                            as_value(entry),
+                            as_owner(slug.owner()),
+                            tier.slug()
+                        ),
+                    ),
+                }
+            }
+        }
+    }
+
     /// The rows as a `Validated`, once no rule is broken; `None` for a row no rule let
     /// through, which a fault already names.
     fn build(&self) -> Option<Validated> {
@@ -1006,6 +1104,15 @@ impl Rows<'_> {
         for (name, value) in &self.config.targets {
             targets.insert(name.clone(), Slug::parse(value).ok()?);
         }
+        let mut writers = Vec::with_capacity(self.config.writers.len());
+        for row in &self.config.writers {
+            let repos = row
+                .repos
+                .iter()
+                .map(|entry| Slug::parse(entry).ok())
+                .collect::<Option<Vec<Slug>>>()?;
+            writers.push((row.caller.clone(), repos));
+        }
         Some(Validated {
             profiles,
             owners,
@@ -1013,12 +1120,14 @@ impl Rows<'_> {
             targets,
             vault: self.config.vault,
             origin: ConfigOrigin::Text,
-            writers: Vec::new(),
+            writers,
         })
     }
 }
 
-/// L1 (references and values) to L10, every fault at once, in rule order.
+/// L1 (references and values) to L11, every fault at once, in rule order. The `Validated` it
+/// makes is of origin [`ConfigOrigin::Text`], so its `[[writers]]` rows grant nothing; only
+/// [`load`] and [`load_for_host`] make one of origin `File`.
 /// # Errors
 /// The faults.
 pub fn validate(
@@ -1038,6 +1147,7 @@ pub fn validate(
     rows.l8(&mut faults);
     rows.l9(&mut faults);
     rows.l10(&mut faults);
+    rows.l11(&mut faults);
     if !faults.0.is_empty() {
         return Err(faults.0);
     }
@@ -1084,7 +1194,7 @@ pub fn expand(path: &str, home: &Path) -> Option<PathBuf> {
 pub fn load(dirs: &Dirs) -> Result<Option<Validated>> {
     #[cfg(unix)]
     {
-        load_private(dirs)
+        load_private(dirs, false)
     }
     #[cfg(not(unix))]
     {
@@ -1101,8 +1211,15 @@ pub fn load(dirs: &Dirs) -> Result<Option<Validated>> {
 ///
 /// As [`load`].
 pub fn load_for_host(dirs: &Dirs) -> Result<Option<Validated>> {
-    let _ = dirs;
-    Err(crate::error::Error::not_yet("load_for_host", "WP1"))
+    #[cfg(unix)]
+    {
+        load_private(dirs, true)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dirs;
+        Ok(None)
+    }
 }
 
 /// Make `leaf`, a directory strictly under `dirs.state`, and every directory between them,
@@ -1165,24 +1282,437 @@ fn make_private_level(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// agh.toml's text with `repo` added to `caller`'s `[[writers]]` row (`add`), or removed from
-/// it, in aterm-toml's comment-preserving document. Adding to a missing row appends the row;
-/// removing a row's last repository removes the row. `agh policy grant` and `revoke` call it.
+/// agh.toml's text with `repo` added to `caller`'s `writers` row (`add`), or removed from it,
+/// in either form the rows take: `[[writers]]` tables or an array of inline tables
+/// (`writers = [{..}]`). A row's `repos` is edited in the text itself, so every comment,
+/// line break and other entry in it stands: an added slug goes on a line of its own, indented
+/// as the entry before it, when the closing `]` has a line of its own, and after `, ` when not;
+/// a removed one takes its own line, or its comma, with it. Adding to a missing row appends
+/// the row: after the last `[[writers]]` row, at the end of the inline array, or, in a file
+/// with none (an empty `writers = []` included, which it replaces and whose comment lines it
+/// keeps), at the end of the text, after its last table. In a file whose every line ends in
+/// CRLF, each line the edit writes does too. Removing a row's last repository removes the
+/// row. Each edited text is parsed again, and its rows must be the old rows with this one edit
+/// made. `agh policy grant` and `revoke` call it.
 ///
 /// # Errors
 ///
-/// Invalid when the text does not parse.
+/// Invalid when the text does not parse, when its `writers` is neither `[[writers]]` tables
+/// nor an array of inline tables, when the caller's row has a `repos` that is not an array,
+/// and when that `repos` holds an entry that is not a string (which the edit would otherwise
+/// drop). Refused, with nothing edited, when an inline row with no `repos` would gain one, or
+/// when the edited text does not read back as that one edit (a layout the edit cannot follow).
 pub(crate) fn edit_writers(text: &str, caller: &str, repo: &Slug, add: bool) -> Result<String> {
-    let _ = (text, caller, repo, add);
-    Err(crate::error::Error::not_yet(
-        "agh.toml's writers edit",
-        "WP1",
-    ))
+    use crate::error::{Error, Kind};
+    use aterm_toml::edit::{ArrayOfTables, DocumentMut, Item, Table, TableLike, Value};
+    let parse = |text: &str| {
+        text.parse::<DocumentMut>().map_err(|e| {
+            let at = e.span().map_or_else(String::new, |span| {
+                format!(" at line {}", line_of(text, span.start))
+            });
+            Error::new(Kind::Invalid, format!("agh.toml does not parse{at}"))
+                .with_next(POLICY_CHECK)
+        })
+    };
+    let mut doc = parse(text)?;
+    let wanted = repo.to_string();
+    let before = writer_rows(&doc).ok_or_else(|| {
+        Error::new(
+            Kind::Invalid,
+            "agh.toml's writers is not [[writers]] tables or an array of inline tables",
+        )
+        .with_next(POLICY_CHECK)
+    })?;
+    let ours = |row: &dyn TableLike| row.get("caller").and_then(Item::as_str) == Some(caller);
+    let new_row = || {
+        format!(
+            "{{ caller = {}, repos = [{}] }}",
+            Value::from(caller),
+            Value::from(wanted.as_str())
+        )
+    };
+    let edited: Option<String> = if let Some(array) = doc.get("writers").and_then(Item::as_array) {
+        let rows: Vec<&dyn TableLike> = array
+            .iter()
+            .filter_map(|value| value.as_inline_table().map(|row| row as &dyn TableLike))
+            .collect();
+        match rows.iter().position(|row| ours(*row)) {
+            None if !add => return Ok(text.to_string()),
+            None if rows.is_empty() => {
+                // `DocumentMut::remove` keeps the comment lines above `writers = []`
+                // (`Table::remove` would delete them with it).
+                doc.remove("writers");
+                Some(append_writers_row(&doc.to_string(), caller, &wanted))
+            }
+            None => splice_push(text, array, &new_row()),
+            Some(at) => match edit_repos(text, rows[at], caller, &wanted, add)? {
+                Repos::Unchanged => return Ok(text.to_string()),
+                Repos::Edited(edited) => edited,
+                Repos::Emptied => splice_remove(text, array, at),
+                Repos::Missing => None,
+            },
+        }
+    } else {
+        let mut rows: Vec<Table> = doc
+            .get("writers")
+            .and_then(Item::as_array_of_tables)
+            .map(|tables| tables.iter().cloned().collect())
+            .unwrap_or_default();
+        let mut rebuilt = |rows: Vec<Table>| {
+            let root = doc.as_table_mut();
+            if rows.is_empty() {
+                root.remove("writers");
+            } else {
+                let mut array = ArrayOfTables::new();
+                for row in rows {
+                    array.push(row);
+                }
+                root.insert("writers", Item::ArrayOfTables(array));
+            }
+            Some(doc.to_string())
+        };
+        match rows.iter().position(|row| ours(row)) {
+            None if !add => return Ok(text.to_string()),
+            None if rows.is_empty() => Some(append_writers_row(text, caller, &wanted)),
+            None => {
+                let mut row = Table::new();
+                row.insert("caller", Item::Value(Value::from(caller)));
+                row.insert("repos", Item::Value(new_repos(&wanted)));
+                rows.push(row);
+                rebuilt(rows)
+            }
+            Some(at) => match edit_repos(text, &rows[at], caller, &wanted, add)? {
+                Repos::Unchanged => return Ok(text.to_string()),
+                Repos::Edited(edited) => edited,
+                Repos::Emptied => {
+                    rows.remove(at);
+                    rebuilt(rows)
+                }
+                Repos::Missing => {
+                    rows[at].insert("repos", Item::Value(new_repos(&wanted)));
+                    rebuilt(rows)
+                }
+            },
+        }
+    };
+    let expected = with_edit(before, caller, &wanted, add);
+    edited
+        .map(|edited| follow_crlf(text, edited))
+        .filter(|edited| {
+            parse(edited)
+                .ok()
+                .and_then(|doc| writer_rows(&doc))
+                .is_some_and(|after| after == expected)
+        })
+        .ok_or_else(|| {
+            Error::refused(format!(
+                "agh.toml's writers row for {caller} cannot be edited in place (nothing is \
+                 written)"
+            ))
+            .with_next("edit agh.toml's writers rows by hand, then run agh policy check")
+        })
 }
 
-/// `load` on unix: agh.toml through `read_private`.
+/// One `writers` row as `edit_writers` compares it: its `caller`, and its `repos` with each
+/// entry that is no string as `None` (`None` for a `repos` that is missing or no array).
+type WriterSummary = (Option<String>, Option<Vec<Option<String>>>);
+
+/// A document's `writers` rows, in either form; `None` when `writers` is neither.
+fn writer_rows(doc: &aterm_toml::edit::DocumentMut) -> Option<Vec<WriterSummary>> {
+    use aterm_toml::edit::{Item, TableLike};
+    let summary = |row: &dyn TableLike| -> WriterSummary {
+        let repos = row.get("repos").and_then(Item::as_array).map(|array| {
+            array
+                .iter()
+                .map(|entry| entry.as_str().map(str::to_string))
+                .collect()
+        });
+        (
+            row.get("caller").and_then(Item::as_str).map(str::to_string),
+            repos,
+        )
+    };
+    match doc.get("writers") {
+        None => Some(Vec::new()),
+        Some(item) => match (item.as_array_of_tables(), item.as_array()) {
+            (Some(tables), _) => Some(tables.iter().map(|row| summary(row)).collect()),
+            (None, Some(array)) => array
+                .iter()
+                .map(|value| value.as_inline_table().map(|row| summary(row)))
+                .collect(),
+            (None, None) => None,
+        },
+    }
+}
+
+/// `rows` with `wanted` added to `caller`'s row (a new row when it has none), or removed from
+/// it (the row with its last entry): what `edit_writers`'s text must read back as.
+fn with_edit(
+    mut rows: Vec<WriterSummary>,
+    caller: &str,
+    wanted: &str,
+    add: bool,
+) -> Vec<WriterSummary> {
+    let held = |entry: &Option<String>| {
+        entry
+            .as_deref()
+            .is_some_and(|entry| entry.eq_ignore_ascii_case(wanted))
+    };
+    let at = rows
+        .iter()
+        .position(|(name, _)| name.as_deref() == Some(caller));
+    match (at, add) {
+        (None, true) => rows.push((
+            Some(caller.to_string()),
+            Some(vec![Some(wanted.to_string())]),
+        )),
+        (None, false) => {}
+        (Some(at), true) => {
+            let repos = rows[at].1.get_or_insert_with(Vec::new);
+            if !repos.iter().any(held) {
+                repos.push(Some(wanted.to_string()));
+            }
+        }
+        (Some(at), false) => {
+            if let Some(repos) = rows[at].1.as_mut() {
+                repos.retain(|entry| !held(entry));
+                if repos.is_empty() {
+                    rows.remove(at);
+                }
+            }
+        }
+    }
+    rows
+}
+
+/// A new row's `repos`: `[wanted]`.
+fn new_repos(wanted: &str) -> aterm_toml::edit::Value {
+    use aterm_toml::edit::{Array, Value};
+    Value::from(std::iter::once(wanted).collect::<Array>())
+}
+
+/// `text` with a first `[[writers]]` row for `caller` appended at its end, after a blank line.
+fn append_writers_row(text: &str, caller: &str, wanted: &str) -> String {
+    use aterm_toml::edit::Value;
+    let mut appended = text.to_string();
+    if !appended.is_empty() && !appended.ends_with('\n') {
+        appended.push('\n');
+    }
+    if !appended.is_empty() {
+        appended.push('\n');
+    }
+    appended.push_str(&format!(
+        "[[writers]]\ncaller = {}\nrepos = {}\n",
+        Value::from(caller),
+        new_repos(wanted)
+    ));
+    appended
+}
+
+/// `edited` with a CR before each bare LF when every line of `original` ends in CRLF, so the
+/// lines an edit wrote follow the file's; `edited` as it is otherwise (a file of LF lines, of
+/// mixed lines, or of one line). Every bare LF of such an `edited` is one the edit wrote, since
+/// `original` holds none; the rows it writes hold no multi-line string.
+fn follow_crlf(original: &str, edited: String) -> String {
+    let bytes = original.as_bytes();
+    let mut ends = original.match_indices('\n').map(|(at, _)| at).peekable();
+    let crlf = ends.peek().is_some()
+        && ends.all(|at| at.checked_sub(1).and_then(|cr| bytes.get(cr)) == Some(&b'\r'));
+    if !crlf {
+        return edited;
+    }
+    let mut out = String::with_capacity(edited.len() + 16);
+    let mut previous = '\0';
+    for c in edited.chars() {
+        if c == '\n' && previous != '\r' {
+            out.push('\r');
+        }
+        out.push(c);
+        previous = c;
+    }
+    out
+}
+
+/// What `edit_repos` made of a row's `repos`.
+enum Repos {
+    /// The edit changes nothing.
+    Unchanged,
+    /// The text with the edit made in place (`None` when the layout would not take it).
+    Edited(Option<String>),
+    /// The edit removes the row's last entry, so the row goes.
+    Emptied,
+    /// The row has no `repos` for the added slug to join.
+    Missing,
+}
+
+/// The edit of one row's `repos` in `text`, which the row was parsed from.
+fn edit_repos(
+    text: &str,
+    row: &dyn aterm_toml::edit::TableLike,
+    caller: &str,
+    wanted: &str,
+    add: bool,
+) -> Result<Repos> {
+    use crate::error::{Error, Kind};
+    use aterm_toml::edit::Value;
+    let invalid = |what: &str| {
+        Error::new(
+            Kind::Invalid,
+            format!("agh.toml's writers row for {caller}: {what}"),
+        )
+        .with_next(POLICY_CHECK)
+    };
+    let Some(item) = row.get("repos") else {
+        return Ok(if add {
+            Repos::Missing
+        } else {
+            Repos::Unchanged
+        });
+    };
+    let array = item
+        .as_array()
+        .ok_or_else(|| invalid("repos is not a list"))?;
+    let entries: Vec<&str> = array
+        .iter()
+        .map(Value::as_str)
+        .collect::<Option<_>>()
+        .ok_or_else(|| invalid("repos holds an entry that is not a string"))?;
+    let held: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.eq_ignore_ascii_case(wanted))
+        .map(|(at, _)| at)
+        .collect();
+    Ok(match (add, held.is_empty()) {
+        (true, false) | (false, true) => Repos::Unchanged,
+        (true, true) => Repos::Edited(splice_push(text, array, &Value::from(wanted).to_string())),
+        (false, false) if held.len() == entries.len() => Repos::Emptied,
+        (false, false) => {
+            Repos::Edited(held.iter().rev().try_fold(text.to_string(), |text, at| {
+                splice_remove(&text, array, *at)
+            }))
+        }
+    })
+}
+
+/// The whitespace before the value that starts at `start`, when nothing else precedes it on
+/// its line; two spaces otherwise.
+fn indent_before(text: &str, start: usize) -> &str {
+    let line = text[..start].rfind('\n').map_or(0, |at| at + 1);
+    let lead = &text[line..start];
+    if lead.bytes().all(|b| b == b' ' || b == b'\t') {
+        lead
+    } else {
+        "  "
+    }
+}
+
+/// Whether the trivia between an array's last value and its `]` holds the trailing comma.
+fn trivia_has_comma(trivia: &str) -> bool {
+    let mut in_comment = false;
+    for c in trivia.chars() {
+        match (in_comment, c) {
+            (true, '\n') => in_comment = false,
+            (true, _) => {}
+            (false, '#') => in_comment = true,
+            (false, ',') => return true,
+            (false, _) => {}
+        }
+    }
+    false
+}
+
+/// `text` with `entry` (one value's TOML) as the last element of `array`, which was parsed
+/// from `text` (see `edit_writers` for the layout). `None` when `array` carries no source
+/// spans.
+fn splice_push(text: &str, array: &aterm_toml::edit::Array, entry: &str) -> Option<String> {
+    let span = array.span()?;
+    let close = span.end.checked_sub(1)?;
+    let Some(last) = array.iter().last() else {
+        let mut out = text.to_string();
+        out.insert_str(span.start + 1, entry);
+        return Some(out);
+    };
+    let last_span = last.span()?;
+    let trivia = text.get(last_span.end..close)?;
+    let comma = trivia_has_comma(trivia);
+    let mut out = String::with_capacity(text.len() + entry.len() + 8);
+    match trivia.rfind('\n') {
+        Some(at) => {
+            let line = last_span.end + at + 1;
+            out.push_str(&text[..last_span.end]);
+            if !comma {
+                out.push(',');
+            }
+            out.push_str(&text[last_span.end..line]);
+            out.push_str(indent_before(text, last_span.start));
+            out.push_str(entry);
+            if comma {
+                out.push(',');
+            }
+            out.push('\n');
+            out.push_str(&text[line..]);
+        }
+        None => {
+            out.push_str(&text[..last_span.end]);
+            out.push_str(", ");
+            out.push_str(entry);
+            out.push_str(&text[last_span.end..]);
+        }
+    }
+    Some(out)
+}
+
+/// `text` with `array`'s element `at` removed: its whole line, comment and all, when it is the
+/// only value on that line, and otherwise the element and the comma beside it. `array` was
+/// parsed from `text`, or from a text that differs from it only after that element. `None`
+/// when `array` carries no source spans.
+fn splice_remove(text: &str, array: &aterm_toml::edit::Array, at: usize) -> Option<String> {
+    let span = array.get(at)?.span()?;
+    let blank = |b: u8| b == b' ' || b == b'\t';
+    let bytes = text.as_bytes();
+    let skip_blank = |mut pos: usize| {
+        while bytes.get(pos).copied().is_some_and(blank) {
+            pos += 1;
+        }
+        pos
+    };
+    let line = text[..span.start].rfind('\n').map_or(0, |at| at + 1);
+    let alone_before = text[line..span.start].bytes().all(blank);
+    let mut after = skip_blank(span.end);
+    let comma = bytes.get(after) == Some(&b',');
+    if comma {
+        after = skip_blank(after + 1);
+    }
+    let mut end_of_line = after;
+    if bytes.get(end_of_line) == Some(&b'#') {
+        end_of_line += text[end_of_line..]
+            .find('\n')
+            .unwrap_or(text.len() - end_of_line);
+    }
+    if bytes.get(end_of_line) == Some(&b'\r') {
+        end_of_line += 1;
+    }
+    let (cut_from, cut_to) = if alone_before && bytes.get(end_of_line) == Some(&b'\n') {
+        (line, end_of_line + 1)
+    } else if comma {
+        (span.start, after)
+    } else if let Some(previous) = at.checked_sub(1).and_then(|before| array.get(before)) {
+        (previous.span()?.end, span.end)
+    } else {
+        (span.start, span.end)
+    };
+    let mut out = String::with_capacity(text.len());
+    out.push_str(&text[..cut_from]);
+    out.push_str(&text[cut_to..]);
+    Some(out)
+}
+
+/// `load` on unix: agh.toml through `read_private`, of origin `File`. With `honour_loose`
+/// (`load_for_host`), each profile row's `legacy_loose` is copied onto its profile; without it
+/// (`load`), every profile's is false whatever the row says.
 #[cfg(unix)]
-fn load_private(dirs: &Dirs) -> Result<Option<Validated>> {
+fn load_private(dirs: &Dirs, honour_loose: bool) -> Result<Option<Validated>> {
     let text = match read_config_in(&dirs.config, CONFIG_FILE, &dirs.home, Some(&dirs.config)) {
         ConfigText::Missing => return Ok(None),
         ConfigText::Refused { error, remedy } => {
@@ -1197,8 +1727,19 @@ fn load_private(dirs: &Dirs) -> Result<Option<Validated>> {
         }
         ConfigText::Text(text) => text,
     };
-    match judge(&text, &dirs.home).verdict {
-        Ok(validated) => Ok(Some(validated)),
+    let judged = judge(&text, &dirs.home);
+    match judged.verdict {
+        Ok(mut validated) => {
+            validated.origin = ConfigOrigin::File;
+            if honour_loose && let Some(parsed) = &judged.parsed {
+                for (name, row) in &parsed.profiles {
+                    if let Some(profile) = validated.profiles.get_mut(name) {
+                        profile.set_legacy_loose(row.legacy_loose);
+                    }
+                }
+            }
+            Ok(Some(validated))
+        }
         Err(faults) => Err(invalid(
             format!(
                 "agh.toml breaks {} rule(s): {}",
@@ -1253,13 +1794,19 @@ pub(crate) struct Counts {
     pub(crate) profiles: usize,
     /// Target rows.
     pub(crate) targets: usize,
+    /// `[[writers]]` rows.
+    pub(crate) writers: usize,
 }
 
-/// What [`judge`] found: the parsed file's row counts, and the validated file or its faults.
+/// What [`judge`] found: the parsed file's row counts, the rows as written, and the
+/// validated file or its faults.
 #[cfg(unix)]
 pub(crate) struct Judgement {
     /// The row counts.
     pub(crate) counts: Counts,
+    /// The rows as written, when the text parsed: `policy check` reports their `[[writers]]`
+    /// and `legacy_loose`, and `load_for_host` copies `legacy_loose` from them.
+    pub(crate) parsed: Option<AghConfig>,
     /// The validated file, or its faults.
     pub(crate) verdict: std::result::Result<Validated, Vec<ConfigFault>>,
 }
@@ -1270,6 +1817,7 @@ impl Judgement {
     fn faults(faults: Vec<ConfigFault>) -> Judgement {
         Judgement {
             counts: Counts::default(),
+            parsed: None,
             verdict: Err(faults),
         }
     }
@@ -1285,8 +1833,10 @@ pub(crate) fn judge(text: &str, home: &Path) -> Judgement {
                 owners: parsed.owners.len(),
                 profiles: parsed.profiles.len(),
                 targets: parsed.targets.len(),
+                writers: parsed.writers.len(),
             },
             verdict: validate(&parsed, home, &file_id),
+            parsed: Some(parsed),
         },
     }
 }

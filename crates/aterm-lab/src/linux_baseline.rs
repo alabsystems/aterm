@@ -955,6 +955,9 @@ pub fn quoted_field(line: &str, key: &str) -> Option<String> {
                         return None;
                     }
                     let hex: String = chars.by_ref().take_while(|c| *c != '}').collect();
+                    if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                        return None;
+                    }
                     out.push(char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?);
                 }
                 other => out.push(other),

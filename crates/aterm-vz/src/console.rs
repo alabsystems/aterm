@@ -24,6 +24,9 @@ pub const TAIL_LINES: usize = 40;
 /// The bytes one line of the tail keeps.
 pub const LINE_BYTES: usize = 512;
 
+/// The normalized lines kept for progress deduplication.
+pub const SEEN_LINES: usize = 4096;
+
 /// What a feed saw.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Seen {
@@ -37,6 +40,7 @@ pub struct Console {
     partial: Vec<u8>,
     tail: VecDeque<String>,
     seen: HashSet<String>,
+    seen_order: VecDeque<String>,
     last_progress: Option<Duration>,
     lines: u64,
     repeats: u64,
@@ -142,7 +146,13 @@ impl Console {
             return None;
         }
         self.lines += 1;
-        if self.seen.insert(key) {
+        if self.seen.insert(key.clone()) {
+            if self.seen_order.len() == SEEN_LINES
+                && let Some(oldest) = self.seen_order.pop_front()
+            {
+                self.seen.remove(&oldest);
+            }
+            self.seen_order.push_back(key);
             self.last_progress = Some(now);
         } else {
             self.repeats += 1;
@@ -231,6 +241,19 @@ mod tests {
             assert_eq!(c.last_progress(), Some(S * i));
         }
         assert_eq!(c.counts(), (5, 0));
+
+        let mut bounded = Console::new();
+        for i in 0..(SEEN_LINES + 10) {
+            let word = format!(
+                "{}{}{}\n",
+                char::from(b'a' + u8::try_from(i % 26).unwrap()),
+                char::from(b'a' + u8::try_from((i / 26) % 26).unwrap()),
+                char::from(b'a' + u8::try_from((i / 676) % 26).unwrap()),
+            );
+            bounded.feed(word.as_bytes(), S);
+        }
+        assert_eq!(bounded.seen.len(), SEEN_LINES);
+        assert_eq!(bounded.seen_order.len(), SEEN_LINES);
     }
 
     #[test]

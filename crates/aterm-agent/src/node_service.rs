@@ -154,9 +154,9 @@ impl NodeJobLock {
 
     fn try_acquire_at(state_dir: &Path, name: &str) -> std::io::Result<Option<Self>> {
         aterm_uds::private_file::ensure_private_dir(state_dir)?;
-        let file = aterm_uds::private_file::open_private_rw(state_dir, name)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-        aterm_uds::keep_out_of_children(&file)?;
+        let file =
+            aterm_uds::kept_out(|| aterm_uds::private_file::open_private_rw(state_dir, name))
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
         for attempt in 0..32 {
             #[expect(
                 clippy::disallowed_methods,
@@ -229,12 +229,11 @@ pub fn node_port_holds_lock(state_dir: &Path) -> bool {
 
 #[cfg(unix)]
 fn holds_lock_at(state_dir: &Path, name: &str) -> bool {
-    let Ok((file, _)) = aterm_uds::private_file::open_private(state_dir, name) else {
+    let Ok((file, _)) =
+        aterm_uds::kept_out(|| aterm_uds::private_file::open_private(state_dir, name))
+    else {
         return false;
     };
-    if aterm_uds::keep_out_of_children(&file).is_err() {
-        return false;
-    }
     #[expect(
         clippy::disallowed_methods,
         reason = "shared probe lock is CLOEXEC/CLOFORK and NodeJobProbe::drop releases immediately by LOCK_UN"
@@ -626,6 +625,34 @@ pub fn node_systemd_unit_text(program: &Path, home: &Path) -> String {
     )
 }
 
+fn systemd_unescape_exec(rest: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = rest.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => return (!out.is_empty()).then_some(out),
+            '\\' => match chars.next()? {
+                '\\' => out.push('\\'),
+                '"' => out.push('"'),
+                other => {
+                    out.push('\\');
+                    out.push(other);
+                }
+            },
+            '%' if chars.peek() == Some(&'%') => {
+                chars.next();
+                out.push('%');
+            }
+            '$' if chars.peek() == Some(&'$') => {
+                chars.next();
+                out.push('$');
+            }
+            c => out.push(c),
+        }
+    }
+    None
+}
+
 /// Extract the `ProgramArguments[0]` or `ExecStart` binary path from a rendered unit file.
 #[must_use]
 pub fn kept_program_in_unit(text: &str) -> Option<PathBuf> {
@@ -646,16 +673,9 @@ pub fn kept_program_in_unit(text: &str) -> Option<PathBuf> {
     }
     for line in text.lines() {
         if let Some(rest) = line.trim().strip_prefix("ExecStart=\"")
-            && let Some(end) = rest.find('"')
+            && let Some(unescaped) = systemd_unescape_exec(rest)
         {
-            let unescaped = rest[..end]
-                .replace("$$", "$")
-                .replace("%%", "%")
-                .replace("\\\"", "\"")
-                .replace("\\\\", "\\");
-            if !unescaped.is_empty() {
-                return Some(PathBuf::from(unescaped));
-            }
+            return Some(PathBuf::from(unescaped));
         }
     }
     None
@@ -748,6 +768,20 @@ pub const LAUNCHCTL_WITHIN: Duration = Duration::from_secs(30);
 /// How long a reload waits for launchd to let the old job go before it loads the plist again.
 pub const BOOTOUT_SETTLE: Duration = Duration::from_secs(30);
 
+fn deadline_after(d: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(d)
+        .unwrap_or_else(|| now + Duration::from_secs(86_400))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn run_systemctl_bounded(systemctl: &str, args: &[&str]) -> Result<std::process::Output, String> {
+    let mut command = aterm_uds::spawnfd::command(systemctl);
+    command.args(args);
+    aterm_uds::deadline::output_until(&mut command, deadline_after(LAUNCHCTL_WITHIN))
+        .map_err(|e| format!("{systemctl} {}: {e}", args.join(" ")))
+}
+
 /// `/bin/launchctl`, each call bounded by [`LAUNCHCTL_WITHIN`].
 pub struct RealLaunchctl;
 
@@ -755,10 +789,7 @@ impl RealLaunchctl {
     fn output(&self, args: &[&str]) -> Result<(std::process::ExitStatus, String), String> {
         let mut cmd = aterm_uds::spawnfd::command(LAUNCHCTL);
         cmd.args(args);
-        let deadline = Instant::now()
-            .checked_add(LAUNCHCTL_WITHIN)
-            .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400));
-        let out = aterm_uds::deadline::output_until(&mut cmd, deadline)
+        let out = aterm_uds::deadline::output_until(&mut cmd, deadline_after(LAUNCHCTL_WITHIN))
             .map_err(|e| format!("{LAUNCHCTL} {}: {e}", args.join(" ")))?;
         let mut said = String::from_utf8_lossy(&out.stdout).into_owned();
         said.push_str(&String::from_utf8_lossy(&out.stderr));
@@ -824,18 +855,30 @@ impl Launchd<'_> {
         })
     }
 
-    /// Each domain that holds the job, with its pid while it runs.
-    fn loaded(&self) -> Result<Vec<(String, Option<u32>)>, String> {
+    /// Each domain that holds the job, with what `launchctl print` says of it there.
+    fn printed(&self) -> Result<Vec<(String, String)>, String> {
         let mut held = Vec::new();
         for domain in [self.gui(), self.user()] {
             let printed = self
                 .launchctl
                 .print_service(&format!("{domain}/{NODE_LABEL}"))?;
             if let Some(said) = printed {
-                held.push((domain, parse_launchctl_pid(&said)));
+                held.push((domain, said));
             }
         }
         Ok(held)
+    }
+
+    /// Each domain that holds the job, with its pid while it runs.
+    fn loaded(&self) -> Result<Vec<(String, Option<u32>)>, String> {
+        Ok(self
+            .printed()?
+            .into_iter()
+            .map(|(domain, said)| {
+                let pid = parse_launchctl_pid(&said);
+                (domain, pid)
+            })
+            .collect())
     }
 
     /// The running job's pid, in whichever domain holds it.
@@ -857,9 +900,7 @@ impl Launchd<'_> {
         for (domain, _) in self.loaded()? {
             let target = format!("{domain}/{NODE_LABEL}");
             let _ = self.launchctl.run(&["bootout", &target])?;
-            let until = Instant::now()
-                .checked_add(self.settle)
-                .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400));
+            let until = deadline_after(self.settle);
             while self.launchctl.run(&["print", &target])?.0 {
                 if Instant::now() >= until {
                     return Err(format!(
@@ -885,12 +926,17 @@ impl Launchd<'_> {
         Err(refused)
     }
 
-    /// Unload the job from every domain that holds it.
+    /// Unload the job `unit` loaded from every domain that holds it. A job launchd names another
+    /// plist for is another home's (the person's own, beside an isolated home's leave), so it
+    /// stays; one whose print names no plist is taken for this one's.
     ///
     /// # Errors
     /// `launchctl` could not be asked, or refused to unload a job it reported loaded.
-    pub fn unload(&self) -> Result<(), String> {
-        for (domain, _) in self.loaded()? {
+    pub fn unload(&self, unit: &Path) -> Result<(), String> {
+        for (domain, said) in self.printed()? {
+            if launchctl_path(&said).is_some_and(|path| path != unit) {
+                continue;
+            }
             let target = format!("{domain}/{NODE_LABEL}");
             let (ok, said) = self.launchctl.run(&["bootout", &target])?;
             if !ok {
@@ -1073,17 +1119,14 @@ impl ServiceSupervisor for LiveSupervisor {
                 return Ok(None);
             };
             let service = format!("{NODE_LABEL}.service");
-            let out = aterm_uds::spawnfd::command(systemctl)
-                .args(["--user", "show", "--property=MainPID", "--value", &service])
-                .output()
-                .map_err(|e| format!("{systemctl} show {service}: {e}"))?;
+            let out = run_systemctl_bounded(
+                systemctl,
+                &["--user", "show", "--property=MainPID", "--value", &service],
+            )?;
             if !out.status.success() {
                 return Ok(None);
             }
-            let pid = String::from_utf8_lossy(&out.stdout)
-                .trim()
-                .parse::<u32>()
-                .ok()
+            let pid = crate::parse_uint::<u32>(String::from_utf8_lossy(&out.stdout).trim())
                 .filter(|&p| p > 0);
             Ok(pid)
         }
@@ -1106,22 +1149,15 @@ impl ServiceSupervisor for LiveSupervisor {
                 .find(|p| Path::new(p).is_file())
                 .ok_or_else(|| "systemctl not found".to_owned())?;
             let service = format!("{NODE_LABEL}.service");
-            let _ = aterm_uds::spawnfd::command(systemctl)
-                .args(["--user", "daemon-reload"])
-                .output();
-            let out = aterm_uds::spawnfd::command(systemctl)
-                .args(["--user", "enable", "--now", &service])
-                .output()
-                .map_err(|e| format!("{systemctl} --user enable --now {service}: {e}"))?;
+            let _ = run_systemctl_bounded(systemctl, &["--user", "daemon-reload"]);
+            let out = run_systemctl_bounded(systemctl, &["--user", "enable", "--now", &service])?;
             if !out.status.success() {
                 return Err(format!(
                     "{systemctl} --user enable --now {service}: {}",
                     String::from_utf8_lossy(&out.stderr).trim()
                 ));
             }
-            let _ = aterm_uds::spawnfd::command(systemctl)
-                .args(["--user", "restart", &service])
-                .output();
+            let _ = run_systemctl_bounded(systemctl, &["--user", "restart", &service]);
             Ok(())
         }
         #[cfg(not(unix))]
@@ -1131,25 +1167,20 @@ impl ServiceSupervisor for LiveSupervisor {
         }
     }
 
-    fn stop_and_unload(&self, _unit_path: &Path) -> Result<(), String> {
+    fn stop_and_unload(&self, unit_path: &Path) -> Result<(), String> {
         #[cfg(target_os = "macos")]
         {
-            live_launchd(&RealLaunchctl).unload()
+            live_launchd(&RealLaunchctl).unload(unit_path)
         }
         #[cfg(all(unix, not(target_os = "macos")))]
         {
+            let _ = unit_path;
             let systemctl = SYSTEMCTL_PATHS
                 .into_iter()
                 .find(|p| Path::new(p).is_file())
                 .ok_or_else(|| "systemctl not found; the node unit was kept".to_owned())?;
             unload_systemd(&|args| {
-                let mut command = aterm_uds::spawnfd::command(systemctl);
-                command.args(args);
-                let deadline = Instant::now()
-                    .checked_add(LAUNCHCTL_WITHIN)
-                    .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400));
-                let out = aterm_uds::deadline::output_until(&mut command, deadline)
-                    .map_err(|error| format!("{systemctl} {}: {error}", args.join(" ")))?;
+                let out = run_systemctl_bounded(systemctl, args)?;
                 let mut said = String::from_utf8_lossy(&out.stdout).into_owned();
                 said.push_str(&String::from_utf8_lossy(&out.stderr));
                 Ok((out.status.success(), said))
@@ -1157,6 +1188,7 @@ impl ServiceSupervisor for LiveSupervisor {
         }
         #[cfg(not(unix))]
         {
+            let _ = unit_path;
             Ok(())
         }
     }
@@ -1188,10 +1220,7 @@ impl ServiceSupervisor for LiveSupervisor {
                 .find(|p| Path::new(p).is_file())
                 .ok_or_else(|| "systemctl not found".to_owned())?;
             let service = format!("{NODE_LABEL}.service");
-            let out = aterm_uds::spawnfd::command(systemctl)
-                .args(["--user", "restart", &service])
-                .output()
-                .map_err(|e| format!("{systemctl} --user restart {service}: {e}"))?;
+            let out = run_systemctl_bounded(systemctl, &["--user", "restart", &service])?;
             if out.status.success() {
                 Ok(())
             } else {
@@ -1244,6 +1273,13 @@ impl ServiceSupervisor for FileOnlySupervisor {
     }
 }
 
+/// The plist a job was loaded from, as `launchctl print` names it (its `path = …` line).
+fn launchctl_path(text: &str) -> Option<&Path> {
+    text.lines()
+        .find_map(|line| line.strip_prefix("\tpath = "))
+        .map(|path| Path::new(path.trim_end()))
+}
+
 /// Parse `pid = <u32>` from `launchctl print` output.
 #[must_use]
 pub fn parse_launchctl_pid(text: &str) -> Option<u32> {
@@ -1251,7 +1287,7 @@ pub fn parse_launchctl_pid(text: &str) -> Option<u32> {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("pid = ") {
             let digits = rest.trim_end_matches(';').trim();
-            if let Ok(pid) = digits.parse::<u32>()
+            if let Some(pid) = crate::parse_uint::<u32>(digits)
                 && pid > 0
             {
                 return Some(pid);
@@ -1261,18 +1297,24 @@ pub fn parse_launchctl_pid(text: &str) -> Option<u32> {
     None
 }
 
+const UNIT_READ_MAX_BYTES: u64 = 256 * 1024;
+
 /// Inspect `systems.alab.aterm-node` state via `supervisor`.
 ///
 /// # Errors
 /// Returns an error if reading the unit file or supervisor state fails fatally.
 pub fn state_with(home: &Path, supervisor: &dyn ServiceSupervisor) -> Result<NodeJobState, String> {
     let unit = supervisor.unit_file(home);
-    if !unit.is_file() {
-        return Ok(NodeJobState::Absent);
-    }
-    let program = std::fs::read_to_string(&unit)
-        .ok()
-        .and_then(|text| kept_program_in_unit(&text));
+    let program = match crate::harness::accounts::read_bounded(&unit, UNIT_READ_MAX_BYTES) {
+        Ok(None) => return Ok(NodeJobState::Absent),
+        Ok(Some(text)) => kept_program_in_unit(&text),
+        Err(_) => {
+            if !std::fs::metadata(&unit).is_ok_and(|meta| meta.is_file()) {
+                return Ok(NodeJobState::Absent);
+            }
+            None
+        }
+    };
     let pid = supervisor.running_pid(home)?;
     Ok(NodeJobState::Installed { pid, unit, program })
 }
@@ -1336,6 +1378,40 @@ pub fn remove_with(
 ) -> Result<Option<PathBuf>, String> {
     #[cfg(unix)]
     let _guard = node_admin_lock(state_dir)?;
+    remove_locked(home, state_dir, record_off, supervisor)
+}
+
+/// Remove the node job after a fleet leave has let the book's lock go, only while membership
+/// is still absent. The check and service removal share the node administration lock with
+/// `sync.node`, so a job a later join already started is kept. A join published after this
+/// check can be served by an ensure once the removal releases that lock.
+/// # Errors
+/// As [`remove_with`], or membership cannot be read well enough to establish absence.
+pub(crate) fn remove_after_fleet_leave_with(
+    home: &Path,
+    state_dir: &Path,
+    supervisor: &dyn ServiceSupervisor,
+) -> Result<Option<PathBuf>, String> {
+    let _guard = node_admin_lock(state_dir)?;
+    match aterm_net::fleet::read_key_file(state_dir) {
+        Ok(_) => return Ok(None),
+        Err(aterm_net::fleet::KeyFileError::Missing) => {}
+        Err(why) => {
+            return Err(format!(
+                "the node job was kept: fleet absence could not be established ({why})"
+            ));
+        }
+    }
+    remove_locked(home, state_dir, false, supervisor)
+}
+
+/// The stop and unlink while the caller holds the node administration lock.
+fn remove_locked(
+    home: &Path,
+    state_dir: &Path,
+    record_off: bool,
+    supervisor: &dyn ServiceSupervisor,
+) -> Result<Option<PathBuf>, String> {
     if record_off {
         aterm_uds::private_file::ensure_private_dir(state_dir).map_err(|e| e.to_string())?;
         aterm_uds::private_file::write_private(
@@ -1355,21 +1431,19 @@ pub fn remove_with(
     }
 }
 
-/// Remove `systems.alab.aterm-node` during `aterm fleet leave` (C20).
-///
-/// # Errors
-/// Returns an error if the unit file exists and cannot be removed.
-pub fn remove_for_fleet_leave(home: &Path, state_dir: &Path) -> Result<Option<PathBuf>, String> {
-    if std::env::var_os("ATERM_STATE_HOME").is_some() || std::env::var_os("CI").is_some() {
-        // In isolated test homes, never call the host's live launchctl/systemctl.
-        let unit = LiveSupervisor.unit_file(home);
-        return match std::fs::remove_file(&unit) {
-            Ok(()) => Ok(Some(unit)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(format!("{}: {e}", unit.display())),
-        };
+/// The supervisor this process reaches `systems.alab.aterm-node` through: [`FileOnlySupervisor`]
+/// where this process runs under a private state root (a build with dev seams told so by
+/// `ATERM_STATE_HOME`: [`aterm_types::dirs::runs_under_private_state_root`]) or under `CI`, since
+/// its launchd or systemd is still the host's and the job loaded there serves other state, else
+/// [`LiveSupervisor`]. Outside `CI`, a release build, whose state is the person's whatever
+/// `ATERM_STATE_HOME` says, reaches the person's job, that state's.
+#[must_use]
+pub fn supervisor_here() -> &'static dyn ServiceSupervisor {
+    if aterm_types::dirs::runs_under_private_state_root() || std::env::var_os("CI").is_some() {
+        &FileOnlySupervisor
+    } else {
+        &LiveSupervisor
     }
-    remove_with(home, state_dir, false, &LiveSupervisor)
 }
 
 /// Converge read state for `sync.node` (C20).
@@ -1417,8 +1491,7 @@ pub fn resolve_installed_program(
 /// A fresh service must run a release that includes this node implementation.
 fn required_node_release() -> Result<(u64, u64, u64), String> {
     let number = |part: &str| {
-        part.parse::<u64>()
-            .map_err(|_| "invalid node release version".to_owned())
+        crate::parse_uint::<u64>(part).ok_or_else(|| "invalid node release version".to_owned())
     };
     Ok((
         number(env!("CARGO_PKG_VERSION_MAJOR"))?,
@@ -1610,7 +1683,10 @@ fn renewal(
         return Some(Renewal::Reload(why));
     }
     let unit = supervisor.unit_file(home);
-    if std::fs::read_to_string(&unit).ok() != Some(supervisor.render_unit(program, home, state_dir))
+    if crate::harness::accounts::read_bounded(&unit, UNIT_READ_MAX_BYTES)
+        .ok()
+        .flatten()
+        != Some(supervisor.render_unit(program, home, state_dir))
     {
         return Some(Renewal::Reload(format!(
             "{} is not the unit this build writes",

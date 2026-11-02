@@ -7,11 +7,14 @@
 use std::time::{Duration, Instant};
 
 use super::super::config::{Autopilot, SupervisorConfig};
-use super::super::policy::cruise_carry::{BackgroundCarries, RULE_BACKGROUND, carry_words};
-use super::super::policy::exception::Exception;
+use super::super::policy::cruise_carry::{
+    BackgroundCarries, RULE_BACKGROUND, carry_words, recovery_words,
+};
 use super::super::policy::go_ahead::{self, RULE_GO_AHEAD};
+use super::super::policy::needs;
 use super::super::policy::turn_end::{
-    GO_AHEAD_REFUSED, TurnEndTiming, go_ahead_answer, irreversible_ask,
+    GO_AHEAD_REFUSED, GO_AHEAD_WAIT, GoAheadVerdict, TurnEndAction, TurnEndReading, TurnEndTiming,
+    go_ahead_answer, go_ahead_answers,
 };
 use super::approvals::Outcome;
 use super::turn_end_loop::Written;
@@ -40,6 +43,64 @@ pub(super) struct CarryWatch {
     /// When the last carry of a loop before this one was typed ([`Self::seed`]), until this loop's
     /// first busy read: the counts that carry was typed under were that loop's.
     owed: Option<Instant>,
+    /// The turn a settled break read whole from the history (`Session::break_turn`), by the mark
+    /// of the words its screen shows: read once while they stand, for that turn only. A new turn
+    /// read live ([`Self::live`]), a judged point and a carry typed forget it, so a later turn
+    /// whose screen shows the same words (an agent that repeats its report under tool rows) is
+    /// read whole again, never judged on an earlier turn's messages (2026-10-30 review 9).
+    turn_read: Option<(u64, Option<TurnWords>)>,
+    /// The go-ahead the read of a settled Cruise break judged before any of its lines
+    /// ([`Session::break_go_ahead`]), which that read's carry types or holds
+    /// ([`Session::cruise_carry`]); `None` from the start of every read until it is judged.
+    judged: Option<BreakPark>,
+}
+
+/// The go-ahead a settled Cruise break's read judged ([`Session::break_go_ahead`]).
+#[derive(Debug, Clone)]
+struct BreakPark {
+    /// The turn's park, past an irreversible ask and the person's hold: the go-ahead answers it
+    /// where answers are on.
+    parked: Option<go_ahead::Park>,
+    /// [`Self::parked`] with answers on.
+    park: Option<go_ahead::Park>,
+    /// The continuation owed in the carry's place (a `/compact`'s,
+    /// [`super::super::policy::turn_end::TurnEndState::owed_at_break`]).
+    owed: Option<&'static str>,
+    /// The routine answer budget is spent: use forward recovery on the carry's ladder.
+    spent: bool,
+}
+
+impl BreakPark {
+    /// The park the go-ahead answers in the carry's place, on the carry's ladder: none where
+    /// the bound is spent or a continuation is owed.
+    fn answers(&self) -> Option<&go_ahead::Park> {
+        self.park
+            .as_ref()
+            .filter(|_| !self.spent && self.owed.is_none())
+    }
+
+    /// What the break does with the go-ahead's lines (DESIGN-harness-autopilot §15.6).
+    fn verdict(&self) -> GoAheadVerdict {
+        if self.spent {
+            return GoAheadVerdict::Refused;
+        }
+        self.answers().map_or(GoAheadVerdict::Other, |park| {
+            GoAheadVerdict::Answers(park.needs.clone())
+        })
+    }
+}
+
+/// The turn a settled break ends, as a point reads it ([`Session::break_turn`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TurnWords {
+    /// Its last message's lines and its earlier messages' lines, each line the program wrapped
+    /// read as one (`said_lines`, `turn_lines_before`): what the needs fold reads.
+    lines: (Option<String>, Option<String>),
+    /// Its last message and its earlier messages as drawn (`said_tail`, `turn_said_before`): what
+    /// the go-ahead reads, as a turn end's reading holds them.
+    said: (Option<String>, Option<String>),
+    /// It opens cut: the act's own rows may head it.
+    opens_cut: bool,
 }
 
 /// A turn read live since the last settled break or point.
@@ -50,6 +111,8 @@ struct Opened {
     /// A read of it drew someone else's prompt row newest ([`newest_prompt_ours`]): a message no
     /// key in this window typed (Claude Code's Remote Control, another driver) or a person's.
     theirs: bool,
+    /// When it opened: the carry's typing, for the carry's answer, else its first live read.
+    from: Instant,
     /// Its live stretches' busy time so far, each from its live edge (the carry's typing, for the
     /// carry's answer) to the start of the break it reached.
     busy: Duration,
@@ -83,13 +146,16 @@ impl CarryWatch {
     pub(super) fn live(&mut self, ours: bool, at: impl FnOnce() -> Instant) {
         match self.opened.as_mut() {
             None => {
+                let from = self.carried.unwrap_or_else(at);
                 self.opened = Some(Opened {
                     ours,
                     theirs: false,
+                    from,
                     busy: Duration::ZERO,
-                    since: Some(self.carried.unwrap_or_else(at)),
+                    since: Some(from),
                     unread: false,
                 });
+                self.turn_read = None;
             }
             Some(opened) if opened.since.is_none() => opened.since = Some(at()),
             Some(_) => {}
@@ -156,16 +222,21 @@ impl CarryWatch {
     /// - THE PROGRAM'S OWN WAKE keeps them, as the harness's own line does: REAL WORK IS BUSY
     ///   TIME, the turn's stretches summed, and a turn of real work starts them again while a
     ///   short one leaves them ([`BackgroundCarries::ended`]).
+    ///
+    /// Returns when the turn a settled break ends opened ([`Opened::from`]), which bounds the
+    /// person's key it holds the go-ahead for
+    /// ([`super::super::policy::turn_end::TurnEndState::break_keyed`]), and its busy time, whose
+    /// real work starts the go-ahead's span again
+    /// ([`super::super::policy::turn_end::TurnEndState::go_ahead_worked`]); `None` unsettled, or
+    /// with no turn read live since the last settled break or point.
     pub(super) fn at_break(
         &mut self,
         timing: &TurnEndTiming,
         screen: &Screen,
         began: Instant,
         settled: bool,
-    ) {
-        let Some(mut turn) = self.opened.take() else {
-            return;
-        };
+    ) -> Option<(Instant, Duration)> {
+        let mut turn = self.opened.take()?;
         if let Some(since) = turn.since.take() {
             turn.unread |= began < since;
             turn.busy = turn
@@ -174,7 +245,7 @@ impl CarryWatch {
         }
         if !settled {
             self.opened = Some(turn);
-            return;
+            return None;
         }
         let carried = self.carried.take().is_some();
         let own = u64::from(turn.ours || carried);
@@ -187,9 +258,10 @@ impl CarryWatch {
         self.submits = screen.submits;
         if someone || turn.unread {
             self.books.reset();
-            return;
+        } else {
+            self.books.ended(timing, turn.busy);
         }
-        self.books.ended(timing, turn.busy);
+        Some((turn.from, turn.busy))
     }
 
     /// A judged point: the policy carries the session from here, and the next break is carried
@@ -199,6 +271,7 @@ impl CarryWatch {
         self.carried = None;
         self.books.reset();
         self.said = None;
+        self.turn_read = None;
     }
 
     /// The carry was typed at `now` at a break read on `screen`.
@@ -208,6 +281,7 @@ impl CarryWatch {
         self.count = screen.human_seq;
         self.submits = screen.submits;
         self.said = None;
+        self.turn_read = None;
     }
 }
 
@@ -235,6 +309,35 @@ fn newest_prompt_ours(reader: &dyn ScreenReader, rows: &[String]) -> Option<bool
 }
 
 impl<C: Ctl> Session<'_, C> {
+    /// THE BREAK THAT BEGAN AT `at`, read on `screen` ([`CarryWatch::at_break`]). Settled, the
+    /// real work of the turn it ends starts the go-ahead's span again
+    /// ([`super::super::policy::turn_end::TurnEndState::go_ahead_worked`]), and it reads the
+    /// person's last key as a turn end does
+    /// ([`super::super::policy::turn_end::TurnEndState::break_keyed`]), bounded by when the turn
+    /// the break ends opened: the window's measured typing (`human_typed_ms`, from the last
+    /// `status` or the screen) or a driver's hand, never a draft (`Session::key_ago`). Nothing the harness
+    /// types stamps a key, so its own carries and go-aheads never renew the hour.
+    pub(super) fn break_judged(&mut self, screen: &Screen, at: Instant, settled: bool) {
+        let turn = self
+            .cruise_carry
+            .at_break(&self.turn_end.timing, screen, at, settled);
+        if !settled {
+            return;
+        }
+        if let Some((_, busy)) = turn {
+            self.turn_end.go_ahead_worked(busy, false);
+        }
+        let opened = turn.map(|(from, _)| from);
+        let now = self.fx.mono();
+        if let Some(key) = self
+            .key_ago(now, screen)
+            .and_then(|ago| now.checked_sub(ago))
+        {
+            self.turn_end.break_keyed(key, at, opened, now);
+            self.book_go_ahead_hour(screen.seq);
+        }
+    }
+
     /// CRUISE NEVER PARKS AT A BREAK OF THE AGENT'S OWN BACKGROUND WORK (owner ruling
     /// 2026-10-26): where nothing else went at the break that began at `at` (`line_gone`: a
     /// wake's, the host's, the stuck fact's or the door's line), it has settled
@@ -245,15 +348,19 @@ impl<C: Ctl> Session<'_, C> {
     /// typing or another driver's hand, a halt, a draft or unread input, a session nobody asked
     /// anything, the memory wall, the API's route down, and the host's withhold. Off and Land type
     /// nothing here, by the mode the loop last read and again by the one read just before the
-    /// write ([`Self::autopilot_at_busy`]). Where the break's turn parks its own reversible work
-    /// on a person's go-ahead (read as a turn end reads it,
+    /// write ([`Self::autopilot_at_busy`]). A `/compact`'s continuation owed is no act untaken:
+    /// it is typed in the carry's place, as the policy's act
+    /// ([`super::super::policy::turn_end::TurnEndState::owed_at_break`]). Else, where the break's
+    /// turn parks its own reversible work on a person's go-ahead (read as a turn end reads it,
     /// [`super::super::policy::turn_end::TurnEndState::go_ahead_at_break`]) and answers are on,
     /// the owner's standing go-ahead ([`RULE_GO_AHEAD`]) goes in the carry's place, on the
-    /// carry's ladder, unless a person's turn holds it
+    /// carry's ladder with its wait at most [`GO_AHEAD_WAIT`], as at a point, unless a person's
+    /// turn holds it
     /// ([`super::super::policy::turn_end::TurnEndState::go_ahead_held`]); once its bound is spent
-    /// nothing goes and the person is told now ([`Exception::refuses_go_ahead`]). With answers
-    /// off the carry goes without its sentence that the go-ahead is no need. Returns whether it
-    /// typed.
+    /// the carry changes approach without asking the person. With answers
+    /// off the carry goes without its sentence that the go-ahead is no need. The go-ahead is the
+    /// one the read judged before any of the break's lines ([`Self::break_go_ahead`]). Returns
+    /// whether it typed.
     pub(super) fn cruise_carry(
         &mut self,
         screen: &Screen,
@@ -276,27 +383,58 @@ impl<C: Ctl> Session<'_, C> {
         let Some(host) = self.stall_host.clone() else {
             return Ok(false);
         };
+        // The go-ahead this read judged before any line went ([`Self::break_go_ahead`]).
+        // A spent go-ahead changes the approach; the normal carry keeps working.
+        let Some(judged) = self.cruise_carry.judged.take() else {
+            return Ok(false);
+        };
         let seq = screen.seq;
         let now = at + waited;
-        let due = self.cruise_carry.books.due(&self.turn_end.timing, at);
+        // The lines the go-ahead answers are off the menu bar from the judgment, its ladder's
+        // wait included, unless the go-ahead is not written (DESIGN-harness-autopilot §15.6). That
+        // wait is at most [`GO_AHEAD_WAIT`] from the last carry, as a point's is from the last act
+        // typed, so no line is held back longer at a break.
+        let cap = if judged.answers().is_some() {
+            GO_AHEAD_WAIT
+        } else {
+            Duration::MAX
+        };
+        let BreakPark {
+            parked,
+            park,
+            owed,
+            spent,
+        } = judged;
+        let park = park.filter(|_| !spent);
+        let due = self
+            .cruise_carry
+            .books
+            .due_within(&self.turn_end.timing, at, cap);
         if now < due {
             self.carry_said(seq, CarrySaid::Waits(due), review);
             return Ok(false);
         }
         let cap = usize::try_from(cfg.continue_per_hour).unwrap_or(usize::MAX);
         if cap != 0 && self.turn_end.acts_in_window(now) >= cap {
+            self.turn_end.go_ahead_unwritten();
             self.carry_said(seq, CarrySaid::Budget, review);
             return Ok(false);
         }
         let guards = match self.write_guards(screen, now, cfg, host.as_ref())? {
             Ok(guards) => guards,
             Err(guard) => {
+                self.turn_end.go_ahead_unwritten();
                 self.carry_said(seq, CarrySaid::Held(guard), review);
                 return Ok(false);
             }
         };
-        let held = guards
-            .brake
+        let brake = match (guards.brake, owed) {
+            (Some(Guard::ActUntaken), Some(_)) => {
+                self.occupancy_brake(now, cfg, &screen.rows, false)
+            }
+            (brake, _) => brake,
+        };
+        let held = brake
             .or_else(|| {
                 [
                     (Guard::Person, guards.person),
@@ -315,12 +453,14 @@ impl<C: Ctl> Session<'_, C> {
                     .then_some(Guard::HostWithheld)
             });
         if let Some(guard) = held {
+            self.turn_end.go_ahead_unwritten();
             self.carry_said(seq, CarrySaid::Held(guard), review);
             return Ok(false);
         }
         // The mode the session keeps, read afresh for the write: a switch from the chip since
         // the loop last read it (to Land or Off) types nothing.
         if self.autopilot_at_busy(cfg)? != Some(Autopilot::Cruise) {
+            self.turn_end.go_ahead_unwritten();
             return Ok(false);
         }
         let rules = cfg
@@ -328,61 +468,69 @@ impl<C: Ctl> Session<'_, C> {
             .as_ref()
             .and_then(|path| self.fx.read_text(path))
             .and_then(|text| super::turn_end_loop::standing_rules_in(&text));
-        let reader = self.reader(&screen.rows);
-        let tail = reader.said_tail(&screen.rows);
-        let before = reader.turn_said_before(&screen.rows);
-        let opens_cut =
-            tail.is_some() && !reader.bounds_messages() && !reader.turn_whole(&screen.rows);
-        // The go-ahead goes at a break where it would at a turn end: the turn read whole (its
-        // earlier messages too), never over an irreversible ask, never within a person's hold,
-        // and never past its bound, where nothing goes and the person is told now.
-        let parked = tail
-            .as_deref()
-            .filter(|t| !irreversible_ask(Some(t)))
-            .and_then(|t| {
-                self.turn_end
-                    .go_ahead_at_break(before.as_deref(), t, opens_cut)
-            })
-            .filter(|_| !self.turn_end.go_ahead_held(now));
-        let park = parked.clone().filter(|_| cfg.answer_questions);
-        if park
-            .as_ref()
-            .is_some_and(|p| self.turn_end.go_ahead_spent(p, now))
-        {
-            self.carry_said(seq, CarrySaid::Refused, review);
-            self.exception_now = Some(Exception::refuses_go_ahead());
-            self.raise_exception(seq, review);
-            return Ok(false);
-        }
-        let (text, rule, why) = match &park {
-            Some(park) => (
+        // The owed continuation is the policy's act, typed on one line as a point types it.
+        let (text, rule, act, why) = match (owed, &park) {
+            (Some(rule), _) => {
+                let words = self.turn_end.owed_words(rule, cfg, rules.as_deref(), now);
+                let text = super::turn_end_loop::one_turn(&words);
+                let act = TurnEndAction::Type {
+                    text: words,
+                    rule_id: rule,
+                };
+                (text, rule, Some(act), None)
+            }
+            (None, Some(park)) => (
                 go_ahead_answer(park, false, rules.as_deref()),
                 RULE_GO_AHEAD,
-                "the agent parked its own reversible work on a person's go-ahead at a break of \
-                 its background work (autopilot cruise)",
+                None,
+                Some(
+                    "the agent parked its own reversible work on a person's go-ahead at a break \
+                     of its background work (autopilot cruise)",
+                ),
             ),
             // With answers off the carry goes, but never says the go-ahead is no need over a
             // park the person chose to answer themselves.
-            None => (
+            (None, None) if spent => (
+                recovery_words(rules.as_deref()),
+                RULE_BACKGROUND,
+                None,
+                Some("the standing decision was refused; changing approach and continuing"),
+            ),
+            (None, None) => (
                 go_ahead::unless_held(
                     &carry_words(rules.as_deref()),
                     self.turn_end.go_ahead_held(now) || parked.is_some(),
                 )
                 .into_owned(),
                 RULE_BACKGROUND,
-                "the turn ended while the agent's own background work runs (autopilot cruise)",
+                None,
+                Some(
+                    "the turn ended while the agent's own background work runs (autopilot cruise)",
+                ),
             ),
         };
         let point = self.turn_of(screen.clone());
         let written = self.type_text_written(&point, &text, rule, review)?;
         if written != Written::Submitted {
+            self.turn_end.go_ahead_unwritten();
             return Ok(false);
         }
         let typed_at = self.fx.mono();
         self.cruise_carry.typed(typed_at, screen);
-        self.turn_end.background_carried(typed_at);
-        if let Some(park) = &park {
-            self.turn_end.go_ahead_typed(park, typed_at);
+        if let Some(act) = act {
+            let reading = self
+                .reader(&screen.rows)
+                .read(&screen.rows, Some(screen.cursor_col));
+            let mut reading =
+                TurnEndReading::of(&reading, &screen.rows, None::<bool>, None, None, rules);
+            reading.autopilot = Autopilot::Cruise;
+            reading.submits = screen.submits;
+            self.turn_end.acted(&act, &reading, typed_at);
+        } else {
+            self.turn_end.background_carried(typed_at, &text);
+            if let Some(park) = &park {
+                self.turn_end.go_ahead_typed(park, typed_at);
+            }
         }
         let typed_ms = self.hold_ms(typed_at);
         self.break_lined(typed_ms);
@@ -390,33 +538,177 @@ impl<C: Ctl> Session<'_, C> {
         host.break_taken();
         host.inform(&text);
         review.say(&format!("CONTINUED seq={seq} rule={rule} {}", clip(&text)))?;
-        self.ledger_row(rule, Outcome::Typed, &text, why, seq);
+        let reason = why.map_or_else(
+            || super::approvals::act_reason_after(self.carried(), self.turn_end.limit_try()),
+            str::to_string,
+        );
+        self.ledger_row(rule, Outcome::Typed, &text, &reason, seq);
         Ok(true)
     }
 
     /// THE NEEDS A BREAK'S REPORT NAMES: a turn that ends with the agent's own background work
-    /// running reaches no point, where needs are read, so its `NEEDS YOU:` lines are read here
-    /// at the settled break and put on the menu bar and the border as a point puts them
-    /// ([`Self::sync_needs_under`]), whatever else the break types, and the work goes on.
-    pub(super) fn break_needs(
+    /// running reaches no point, where needs are read, so its `NEEDS YOU:` lines, in every message
+    /// of the turn, are read here at the settled break, before any line the break types, and put
+    /// on the menu bar and the border as a point puts them once its lines went
+    /// ([`Self::break_needs`]), and the work goes on. Where the turn names no need the fold
+    /// answers the lines a go-ahead decided at an earlier read held back, as the agent went on
+    /// past them; then the read judges the go-ahead again, before any line the break types
+    /// ([`Self::break_go_ahead`]; DESIGN-harness-autopilot §15.6). The key of the needs the menu
+    /// bar showed before the read, `None` where the break is not read (unsettled, or Off).
+    pub(super) fn break_fold(
         &mut self,
         screen: &Screen,
-        waited: Duration,
+        (at, waited): (Instant, Duration),
         cfg: Option<&SupervisorConfig>,
         review: &mut dyn Review,
-    ) -> Result<(), Fail> {
-        let Some(cfg) = cfg else {
-            return Ok(());
-        };
+    ) -> Option<u64> {
+        self.cruise_carry.judged = None;
+        let cfg = cfg?;
         if waited < self.setup.background_settle
             || cfg.autopilot_for(self.autopilot.word()) == Autopilot::Off
         {
-            return Ok(());
+            return None;
         }
-        let tail = self.reader(&screen.rows).said_tail(&screen.rows);
-        let before = self.turn_end.needs_key();
-        self.turn_end.fold_break_needs(tail.as_deref());
-        if self.turn_end.needs_key() == before {
+        let turn = self.break_turn(screen);
+        let (tail, said) = &turn.lines;
+        let before = self.turn_end.shown_key();
+        self.turn_end
+            .fold_break_needs(said.as_deref(), tail.as_deref(), turn.opens_cut);
+        self.break_go_ahead(&turn, (screen.seq, at + waited), cfg, review);
+        Some(before)
+    }
+
+    /// THE GO-AHEAD A SETTLED BREAK DECIDES, judged at its read `seq` on the break's `turn` at
+    /// `now` before any line the break types, as a point judges its decision before a host's
+    /// step: a line another takes the break with (a wake's, the host's, the stuck fact's or the
+    /// door's) leaves it decided, so the lines it answers stay off the menu bar, as through the
+    /// carry's ladder, until the next read judges again (2026-10-30 review 9). The carry types it
+    /// or holds it ([`Self::cruise_carry`]), and a hold or a write that does not go puts its lines
+    /// back. A park whose bound is spent switches to forward recovery, recorded ahead of
+    /// the carry's ladder, its budget and the write's guards, as a point tells them at its
+    /// decision, and its lines are back beside the exception; not where the window's host
+    /// withholds the session's decisions, where a point tells nothing either. Where the carry
+    /// cannot go (not Cruise, the continuation off, an attended run, no window host) nothing is
+    /// decided and no line is being answered, and a line answered before stays off only where
+    /// the turn's park still answers it
+    /// ([`super::super::policy::turn_end::TurnEndState::go_ahead_unjudged`]), so a person's need
+    /// that cleans to it shows (2026-10-30 review 9). The go-ahead's count starts again
+    /// where the turn parks no more
+    /// ([`super::super::policy::turn_end::TurnEndState::go_ahead_read`]), before the carry's
+    /// ladder, its budget and the write guards, as at an idle point.
+    fn break_go_ahead(
+        &mut self,
+        turn: &TurnWords,
+        (seq, now): (u64, Instant),
+        cfg: &SupervisorConfig,
+        review: &mut dyn Review,
+    ) {
+        // The break's turn read as a turn end reads it, whole where it opens above the screen,
+        // as the needs fold read it ([`Self::break_turn`]).
+        let (tail, before) = &turn.said;
+        let at_break = tail.as_deref().and_then(|t| {
+            self.turn_end
+                .go_ahead_at_break(before.as_deref(), t, turn.opens_cut)
+        });
+        let parks = at_break.is_some();
+        // The go-ahead goes at a break where it would at a turn end: the turn read whole (its
+        // earlier messages too), never over an irreversible ask ([`go_ahead_answers`]), never
+        // within a person's hold. Past the routine answer budget, the carry changes approach.
+        let parked = at_break
+            .filter(|_| go_ahead_answers(tail.as_deref()))
+            .filter(|_| !self.turn_end.go_ahead_held(now));
+        let park = parked.clone().filter(|_| cfg.answer_questions);
+        let host = self.stall_host.clone().filter(|_| {
+            cfg.autopilot_for(self.autopilot.word()) == Autopilot::Cruise
+                && cfg.continue_policy
+                && review.unattended()
+        });
+        let Some(host) = host else {
+            // No go-ahead is judged here: a line answered before stays off only where this
+            // turn's park still answers it, so a person's need that cleans to it shows.
+            self.turn_end.go_ahead_unjudged(park.as_ref());
+            return;
+        };
+        self.turn_end.go_ahead_read(parks);
+        let owed = self.turn_end.owed_at_break();
+        let spent = owed.is_none() && park.is_some() && self.turn_end.go_ahead_spent(now);
+        let judged = BreakPark {
+            parked,
+            park,
+            owed,
+            spent,
+        };
+        self.turn_end.go_ahead_judged(judged.verdict());
+        self.cruise_carry.judged = Some(judged);
+        if spent && !Self::write_at(host.as_ref()).withheld {
+            self.carry_said(seq, CarrySaid::Refused, review);
+        }
+    }
+
+    /// THE TURN A SETTLED BREAK ENDS, read as a point reads it: from the screen, and where it
+    /// opens above the screen, whole from the history, read once per turn while the screen's
+    /// words stand ([`CarryWatch::turn_read`]). The needs fold ([`Self::break_fold`]) and the
+    /// go-ahead ([`Self::cruise_carry`]) both judge this one turn, so a plan in a message that
+    /// scrolled off parks nothing at a break either (2026-10-30 review 9).
+    fn break_turn(&mut self, screen: &Screen) -> TurnWords {
+        let reader = self.reader(&screen.rows);
+        let words = |rows: &[String]| {
+            let lines = (
+                reader.said_lines(rows, needs::apart),
+                reader.turn_lines_before(rows, needs::apart),
+            );
+            let opens_cut =
+                lines.0.is_some() && !reader.bounds_messages() && !reader.turn_whole(rows);
+            TurnWords {
+                lines,
+                said: (reader.said_tail(rows), reader.turn_said_before(rows)),
+                opens_cut,
+            }
+        };
+        let shown = words(&screen.rows);
+        if shown.lines.0.is_none() || reader.turn_whole(&screen.rows) {
+            return shown;
+        }
+        let mark = aterm_hash::fnv1a_64(
+            format!(
+                "{}\0{}",
+                shown.lines.1.as_deref().unwrap_or_default(),
+                shown.lines.0.as_deref().unwrap_or_default()
+            )
+            .as_bytes(),
+        );
+        let read = match &self.cruise_carry.turn_read {
+            Some((at, read)) if *at == mark => read.clone(),
+            _ => {
+                let read = self
+                    .turn_read_whole(screen, reader, true)
+                    .map(|(rows, _)| rows)
+                    .filter(|rows| reader.said_whole(rows))
+                    .map(|rows| words(&rows));
+                self.cruise_carry.turn_read = Some((mark, read.clone()));
+                read
+            }
+        };
+        read.filter(|turn| turn.lines.0.is_some()).unwrap_or(shown)
+    }
+
+    /// THE NEEDS THE BREAK READ ([`Self::break_fold`], which returned `before`), told once its
+    /// lines went, whatever they returned: on the menu bar and the border where what it shows
+    /// moved ([`Self::sync_needs_under`]), so a line the carry's go-ahead answers never goes up,
+    /// or where the entry is still owed what it shows ([`Self::needs_owed`]): a tell lost or
+    /// refused at an earlier read is made again here, as no retry of the loop's own runs inside
+    /// the agent's background work.
+    pub(super) fn break_needs(
+        &mut self,
+        screen: &Screen,
+        before: Option<u64>,
+        cfg: Option<&SupervisorConfig>,
+        review: &mut dyn Review,
+    ) -> Result<(), Fail> {
+        let (Some(before), Some(cfg)) = (before, cfg) else {
+            return Ok(());
+        };
+        if self.turn_end.shown_key() == before && !self.needs_owed() {
             return Ok(());
         }
         self.sync_needs_under(screen, cfg, review)
@@ -436,7 +728,7 @@ impl<C: Ctl> Session<'_, C> {
                 self.cruise_carry.books.streak()
             ),
             CarrySaid::Budget => "held:continue_per_hour".to_string(),
-            CarrySaid::Refused => format!("held:{GO_AHEAD_REFUSED}"),
+            CarrySaid::Refused => format!("recovering:{GO_AHEAD_REFUSED}"),
         };
         review.note(&format!("DEFERRED seq={seq} {RULE_BACKGROUND} {why}"));
     }

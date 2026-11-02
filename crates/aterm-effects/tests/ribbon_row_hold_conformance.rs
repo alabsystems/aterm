@@ -21,6 +21,7 @@ fn config() -> Config {
         theme_bg: 0x001c_1c1c,
         reduced_motion: false,
         light: aterm_effects::cursor_glow::Light::OFF,
+        head_dx: 0.5,
     }
 }
 

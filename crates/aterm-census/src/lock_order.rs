@@ -290,6 +290,16 @@ const GUARD_HELPERS: &[GuardHelper] = &[
         identity: "COPIES",
         def_file: "crates/aterm-gui/src/self_claim.rs",
     },
+    GuardHelper {
+        symbol: "spawn_lock_shared",
+        identity: "SPAWN_LOCK",
+        def_file: "crates/aterm-uds/src/spawn_lock.rs",
+    },
+    GuardHelper {
+        symbol: "spawn_lock_exclusive",
+        identity: "SPAWN_LOCK",
+        def_file: "crates/aterm-uds/src/spawn_lock.rs",
+    },
 ];
 
 /// A fn that implements a standard acquisition method by delegating through bare `self`.
@@ -1901,11 +1911,7 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
             let Ok(text) = crate::tree::read_to_string(&file) else {
                 continue;
             };
-            let rel = file
-                .strip_prefix(root)
-                .unwrap_or(&file)
-                .to_string_lossy()
-                .into_owned();
+            let rel = crate::rel_path(root, &file);
             let masked = mask_cfg_test_items(&text);
             field_types.harvest(&masked);
             let impls = impl_spans(&masked);
@@ -1934,21 +1940,13 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
             let Ok(text) = crate::tree::read_to_string(&file) else {
                 continue;
             };
-            let in_crate = file
-                .strip_prefix(&crate_root)
-                .unwrap_or(&file)
-                .to_string_lossy()
-                .replace('\\', "/");
+            let in_crate = crate::rel_path(&crate_root, &file);
             let slice_idx = v.platform_slices.iter().position(|s| {
                 s.paths
                     .iter()
                     .any(|p| in_crate == *p || in_crate.starts_with(&format!("{p}/")))
             });
-            let rel = file
-                .strip_prefix(root)
-                .unwrap_or(&file)
-                .to_string_lossy()
-                .into_owned();
+            let rel = crate::rel_path(root, &file);
             let masked = mask_cfg_test_items(&text);
             let impls = impl_spans(&masked);
             let ctx = FileCtx {
@@ -2643,8 +2641,8 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
     let _ = writeln!(
         log,
         "    scope: lexical receiver-name identities over {}; vendored-identity mode \
-         over {}; one interprocedural hop (precision limits: \
-         docs/temporal-safety-gate.md).",
+         over {}; one interprocedural hop; a lexical walk, not a \
+         proof.",
         scan.scan_dirs.join(", "),
         vendored_dirs.join(", ")
     );

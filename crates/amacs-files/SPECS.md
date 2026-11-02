@@ -3,85 +3,33 @@
 
 # amacs-files: specs proved through Trust/Clean, and what blocks the rest
 
-> Status 2026-10-20 (amacs slices TR3 and F2, merged). **5 specs are proved**, each a
-> `trust_contract_fn!` postcondition that cites a Clean theorem over the kernel import of the
-> compiled body (`trust_import_amacs_files__<module>__<fn>`), the recipe of
-> `docs/PLAN-tests-to-specs-2026-10-15.md` ("The recipe that works"). Four are TR3's. F2
-> (admission options, BOM and CRLF kept, `open_path`) added `is_bare_line_feed`, and its
-> `decode_utf8` returns the held mapping through TR3's slice pattern and `is_utf8_bom`. Each spec
-> has a negative control (§1).
->
-> The lane measured the crate at **132/662** before either slice. Apart, TR3 measured
-> **153/676** on its final tree (merged with main `03aebc88f9`), and F2 **158/748** on its
-> final tree (composed onto main `4a3c4ecfd0`). On the tree that merges both (F2 merged with main
-> `6214986664`), `targo --unverified ship trust run -p amacs-files --update-ratchet --obligations`,
-> prover `targo 1.99.0-dev (41d799797 2026-10-16) (targo 0.10.0+g41d799797)`
-> (`~/toolchains/trust-41d79979`), measured **171/753** and wrote that `floors.tsv` row.
-> That is 13 more proved than F2's tree alone, which had neither TR3's three other contracts nor
-> its safety fixes (§2); no row was attributed one by one. The failed rows are four, all of them
-> named in §3 (`AtomicCommitResult`'s derived `eq`, the two symlink walks,
-> `JournalDocumentKey::keyed`), and the log has no `withheld at publication` row.
-> Every postcondition row of the five functions reads
-> `PROVED (clean-kernel-citation, CONSTRUCTIVE (certified; validation=kernel-rechecked, closure=empty, coverage=unbounded, execution=unmonitored, reflection=unrecorded))`.
->
-> TR3's own run: the contracts and safety fixes first measured 153/674; the two rows more on its
-> final tree are `DraftJournalReducer::plan_record` and `SaveReducer::begin`, code TR3 did not
-> touch, whose one `native-verification-gap` row each became two runtime-checked assertions (an
-> absent callee, and std's `Layout::array::inner`). Of its +21 proved: 16 are the contracts'
-> postconditions. One is `bounded_read`'s allocation, which failed before. Four are the bounds
-> checks of `decode_utf8`'s slice pattern, which replaced a failed `drain` (§2). That prover
-> publishes them, and its log has no `withheld at publication` row.
->
-> No test was deleted. No existing test sampled one of the five predicates alone. TR3 added three
-> tests and F2 fifteen, for the code around them, which the proofs do not cover (§4).
->
-> T3 (amacs's terminal face) added `DocumentPersistenceStore::accept_overwrite`, the second
-> `C-x C-s` after a save found the file changed on disk: it accepts the disk's version as the
-> one the save may replace, keeping the buffer's own BOM and line-ending mapping (a reload takes
-> the disk's, `accept_reloaded_observation`). No contract: it moves structs (Gap 1). On T3's tree
-> the lane measured **172/756** and wrote that `floors.tsv` row; its three new rows are an
-> `unreachable` proved, a drop-glue assertion runtime-checked and the allocator assumption.
+§1 holds the proved specs: each is a `trust_contract_fn!` postcondition citing a Clean theorem
+over the kernel import of the compiled body (`trust_import_amacs_files__<module>__<fn>`), the
+recipe of `docs/PLAN-tests-to-specs-2026-10-15.md` ("The recipe that works"). §2 lists the
+safety obligations the code was reshaped to discharge, §3 the properties not provable today.
 
-The contract macros are aterm-log's two `trust_contract_fn!` arms and two `verify_island!` arms,
-defined once in `src/lib.rs` ahead of the modules. Both key on `cfg(trust_verify)`: the theorems
-name `trust_import_*` constants, which exist only in a verifying session. Keying the islands on
-`cfg(clean_islands)` instead, mounted from a build script as aterm-bidi does, was measured. It
-breaks every `targo --unverified` build with four `AutoBoundHeadOverApplied` rejections ("this
-island names the kernel-import namespace, which is populated only by an enabled verification
-walk; it cannot elaborate under -Ztrust-verify=off"). So the crate has no build script, and
-nothing in it reads `cfg(clean_islands)`. Stock rustc gets plain fns; the `linux-arm` cell lints
-and type-checks the crate (§5).
+The contract macros (two `trust_contract_fn!` and two `verify_island!` arms, copied from
+aterm-log) sit in `src/lib.rs` ahead of the modules and key on `cfg(trust_verify)`, because the
+theorems name `trust_import_*` constants that exist only in a verifying session. Keying the
+islands on a build-script `cfg(clean_islands)` instead breaks every `targo --unverified` build
+(`AutoBoundHeadOverApplied`), so the crate has no build script. Stock rustc gets plain fns.
 
-The clauses and theorems spell the 32 MiB limits as the literal 33554432, while the bodies
-compare against `DOCUMENT_LIMIT_LEN` and `MAX_INSERT_LEN`, which derive from
-`DEFAULT_DOCUMENT_LIMIT` and `MAX_INSERT_BYTES`. No landing check runs the lane, so a const
-assertion beside each constant (`const _: () = assert!(DOCUMENT_LIMIT_LEN == 33_554_432 && …)`)
-makes an ordinary build fail the moment a constant leaves its spec. Measured: setting both
-constants to 16 MiB fails `targo --unverified check -p amacs-files` with two `E0080` "evaluation
-panicked: assertion failed" errors. The const items add no lane rows.
+The clauses and theorems spell the 32 MiB limits as the literal 33554432; the bodies compare
+against `DOCUMENT_LIMIT_LEN` (host.rs) and `MAX_INSERT_LEN` (io.rs). No landing check runs the
+lane, so a const assertion beside each constant fails an ordinary build when it leaves its spec.
 
-Clean parses `a && b && c` as `a && (b && c)`, which is the nesting the E6 reader gives the
-compiled body, but the clause parser nests it to the left. A clause over three or more
-conjuncts therefore spells the right nesting with parentheses, so the theorem's statement and
-the clause's denotation are the same term. Unparenthesized, the audit refused the citation with
-a `TypeMismatch` (expected `Bool.and (Bool.and A B) C`, inferred `Bool.and A (Bool.and B C)`).
-
-Clean renders `a != b` in a `bool` body as `!decide (a = b)` (`Bool.not (Decidable.decide …)` in
-the goal), and `is_bare_line_feed`'s clause states it as `previous != 13`.
+A clause over three or more conjuncts nests them to the right with parentheses
+(`a && (b && c)`), as Clean and the E6 reader do; the clause parser nests to the left, and the
+citation audit refuses the mismatch (`TypeMismatch`). Clean renders `a != b` in a `bool` body as
+`!decide (a = b)`.
 
 ## 1. Proved specs (TSV)
 
-Columns: `id`, `function`, `statement`, `clause`, `theorem`, `verdict` (the lane's row on the
-final tree), `negative control` (the body mutation, then what the lane printed). Each control ran
-`targo --unverified ship trust run -p amacs-files` on the mutated tree of the slice that wrote the
-spec. The file was then restored from a copy saved beforehand, and `cmp` confirmed it was byte for
-byte the same. A rejected island taints the crate's Clean environment. So during each control
-every citation in the crate failed, not just the mutated one ("cannot be validated because an
-earlier Clean island was rejected and the crate-local environment is tainted"). On TR3's tree the
-lane total fell to 148 (of 670 or 671). `bare-line-feed`'s control ran on F2's tree before it
-merged a newer main, where the unmutated tree measured 153/715 and carried only the
-`is_bare_line_feed` and `is_utf8_bom` citations, so its total fell to 150 (of 715, or 714 when the
-mutation changed the count).
+Columns: `id`, `function`, `statement`, `clause`, `theorem`, `verdict` (the lane's row),
+`negative control` (the body mutation, then what `targo --unverified ship trust run -p
+amacs-files` printed on the mutated tree, which was then restored byte for byte). A rejected
+island taints the crate's Clean environment, so during a control every citation in the crate
+fails; the `lane` total in that column is the mutated tree's.
 
 ```tsv
 id	function	statement	clause	theorem	verdict	negative control
@@ -92,18 +40,15 @@ journal-edit-order	io::journal_edit_in_order(start: u64, end: u64, previous_end:
 bare-line-feed	io::is_bare_line_feed(previous: u8, byte: u8) -> bool	∀ previous byte: is_bare_line_feed ⇔ byte = LF (10) ∧ previous ≠ CR (13). line_ending_of holds a file as CRLF only when it has a line feed and this is false at every byte (previous = 0 before the first), so one bare LF keeps a mixed file byte for byte.	ensures result == (byte == 10 && previous != 13)	is_bare_line_feed_is_lf_after_no_cr: import previous byte = (decide (byte = 10) && !decide (previous = 13)), by simp only [import]	[VERIFIED] (3 obligations: 3 proved); postcondition PROVED (clean-kernel-citation, CONSTRUCTIVE (certified; validation=kernel-rechecked))	`previous != b'\r'` → `b'\n'`: "Clean island declaration rejected: InTactic { tactic: "simp", … UnsolvedGoals … ⊢ Bool.and (Decidable.decide (fvar#1 = UInt8.ofNat 10) …) (Bool.not (Decidable.decide (fvar#0 = UInt8.ofNat 10) …)) = and (decide (fvar#1 = UInt8.ofNat 10) …) (Bool.not (decide (fvar#0 = UInt8.ofNat 13) …))"; fn row [VIOLATIONS] (3 obligations: 1 proved, 0 runtime-checked, 1 failed, 1 unknown); lane 150/715
 ```
 
-The size and offset predicates take `u64`, and their callers convert with `as u64`. E6 imports
-only `bool`, `uN` and `iN` carriers, and it refuses a body that holds a cast or a call
-(`docs/AUDIT-trust-for-test-migration-2026-10-15.md` §3.3). For the same reason,
-`is_lower_hex_digit` compares instead of calling `RangeInclusive::contains`, and says so in an
-`#[expect(clippy::manual_range_contains)]`.
+The size and offset predicates take `u64` and their callers convert with `as u64`: E6 imports
+only `bool`, `uN` and `iN` carriers and refuses a body that holds a cast or a call
+(`docs/AUDIT-trust-for-test-migration-2026-10-15.md` §3.3). For the same reason
+`is_lower_hex_digit` compares instead of calling `RangeInclusive::contains`.
 
 ## 2. Safety obligations TR3 made provable (TSV)
 
-The baseline is the lane's `--obligations` record at main `3eda2d3d76`. The after column is the
-same record on this tree. A read reserves at most 32 MiB + 1 up front, whatever the caller's
-limit and the file's claimed length (row 1), and a lock budget the clock cannot add to has no
-ceiling (row 5). `decode_utf8` returns `Decoded` through the same slice pattern.
+Each row is a site the code was reshaped at so the lane discharges it: `before` is the lane's
+`--obligations` text before the change, `after` its row since.
 
 ```tsv
 site	before (lane text)	change	after
@@ -118,11 +63,9 @@ io::parse_hex16	closure runtime_checked: absent callee `RangeInclusive::contains
 
 ## 3. Not provable today: the worklist (TSV)
 
-Each row is an important property the crate does not prove. The blocker is the lane's exact text
-where it reported one on this crate (prover 41d799797, on the tree of the slice that wrote the row),
-or else the gap of `docs/PLAN-tests-to-specs-2026-10-15.md` ("What blocks the rest"). In that
-second case no contract was attempted here, and the row says so. The rows from `A held text
-encodes back` on are F2's.
+Each row is a property the crate does not prove. The blocker is the lane's exact text where it
+reported one (prover 41d799797), or else a gap of audit §7
+(`docs/AUDIT-trust-for-test-migration-2026-10-15.md`), for which no contract was attempted.
 
 ```tsv
 property	functions	blocker	held today by
@@ -148,36 +91,17 @@ Whole-crate rows the lane leaves open	every fn	On the merged tree: 230 unsupport
 
 ## 4. Tests
 
-- **Deleted:** none. The five predicates are new extractions, and no existing test sampled one alone.
-- **Added by TR3** (they hold the wrappers and the safety changes, which the proofs do not reach):
-  - `host::tests::decoding_takes_off_one_leading_bom_and_still_checks_the_rest`: one leading mark
-    comes off, a second stays as U+FEFF, a trailing one stays, a short `EF BB` and invalid bytes
-    after the mark are `InvalidUtf8`. Since the merge with F2 it reads the held text of the
-    `Decoded` that `decode_utf8` returns.
-  - `io::tests::a_delta_takes_sorted_disjoint_forward_edits_only`: the first edit may start
-    anywhere, touching edits pass, and out-of-order, overlapping and backward ranges are
-    `InvalidEdit`.
-  - `host::tests::a_lock_budget_past_the_clock_waits_without_a_ceiling`: `Duration::MAX` takes an
-    uncontended lock at once, and a waiter on a held lock takes it once the holder lets go, under
-    a one-minute hang detector.
-- **Added by F2**, all for the code around the predicates: the thirteen `host::tests` and two
-  `io::tests` named in F2's rows of §3. Four came with F2's review fixes. Three were run against a
-  mutant, and each mutant failed exactly its test: comparing texts instead of file bytes
-  (`a_save_read_back_another_way_is_unchanged`), `accept_reloaded_observation` keeping the mapping
-  for either reading (`a_reload_takes_the_fresh_reading_and_its_mapping`), and a document save
-  that makes its directory (`a_document_save_makes_no_folder`). The fourth,
-  `the_observed_text_fingerprint_is_the_admitted_texts`, had no mutant run.
-- `targo --unverified test -p amacs-files` on the merged tree: 59 unit tests pass (41 before
-  either slice, 3 from TR3, 15 from F2).
-- **Added by T3:** `host::tests::an_overwrite_keeps_the_buffers_mapping`: a CRLF buffer
-  overwriting an LF file is written `ours\r\n`, and a mixed buffer over a CRLF file byte for
-  byte. With it, 60 unit tests pass.
+No test samples one of the five predicates alone, so the proofs retire none. The tests in §3's
+last column and `a_lock_budget_past_the_clock_waits_without_a_ceiling` (§2) hold the code the
+proofs do not reach. `DocumentPersistenceStore::accept_overwrite` (a second `C-x C-s` over a
+file changed on disk keeps the buffer's BOM and line-ending mapping) has no row: it moves
+structs (Gap 1), and `an_overwrite_keeps_the_buffers_mapping` holds it.
 
 ## 5. Re-measuring
 
 - Proofs and floor: `targo --unverified ship trust run -p amacs-files --obligations` (the
-  per-obligation record lands beside the log under `target-trust.noindex/logs/`), then `--update-ratchet`
-  to raise `crates/aterm-release/trust/floors.tsv`.
+  per-obligation record lands beside the log under `target-trust.noindex/logs/`); add
+  `--update-ratchet` to raise `crates/aterm-release/trust/floors.tsv`.
 - Before committing a contract: `targo --unverified verify test -p aterm-contract-probe`.
-- Stock rustc: `targo --unverified verify cells --cell linux-arm` (it reads the whole tree and
-  ignores `-p`).
+- Stock rustc: `targo --unverified verify cells --cell linux-arm -p amacs-files` type-checks the
+  crate as a Linux target (without `-p`, all of aterm's graph).

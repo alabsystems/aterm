@@ -12,6 +12,7 @@
 use aterm_hash::{FxHashMap, FxHashSet};
 use std::num::NonZeroU16;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Settings for [`Font::from_bytes`].
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
@@ -229,10 +230,8 @@ pub struct Font {
     char_to_glyph: FxHashMap<char, NonZeroU16>,
     /// Where [`Font::unicode_glyph_index`] answers differently from [`Self::char_to_glyph`].
     unicode_overrides: Box<[(char, u16)]>,
-    /// `hmtx` advance per glyph id, in design units.
-    advances: Box<[u16]>,
-    /// Per-glyph ink box in design units `(x_min, y_min, x_max, y_max)`, for `glyf` faces.
-    bboxes: Option<Box<[[i16; 4]]>>,
+    /// Each glyph's advance and, for a `glyf` face, ink box, kept once asked for.
+    memo: Arc<GlyphMemo>,
     /// Unscaled `hhea`/`OS/2` line metrics, `None` only if the face declares none.
     line_metrics: Option<LineMetrics>,
     /// The legacy `kern` table, copied out (kilobytes) so a pair lookup parses only it.
@@ -320,21 +319,7 @@ impl Font {
         }
         let unicode_overrides = unicode_overrides(&face, &char_to_glyph, contested, glyph_count);
 
-        let advances: Box<[u16]> = (0..glyph_count)
-            .map(|gid| {
-                face.glyph_hor_advance(aterm_font::GlyphId(gid))
-                    .unwrap_or(0)
-            })
-            .collect();
-
-        let bboxes: Option<Box<[[i16; 4]]>> = face.tables().glyf.map(|_| {
-            (0..glyph_count)
-                .map(|gid| {
-                    face.glyph_bounding_box(aterm_font::GlyphId(gid))
-                        .map_or([0, 0, 0, 0], |b| [b.x_min, b.y_min, b.x_max, b.y_max])
-                })
-                .collect()
-        });
+        let memo = Arc::new(GlyphMemo::new(glyph_count, face.tables().glyf.is_some()));
 
         let line_metrics = Some(LineMetrics::new(
             face.ascender(),
@@ -354,8 +339,7 @@ impl Font {
             glyph_count,
             char_to_glyph,
             unicode_overrides,
-            advances,
-            bboxes,
+            memo,
             line_metrics,
             kern,
         })
@@ -492,23 +476,105 @@ impl Font {
     /// Scaled `hmtx` advance for `gid` (`scale * units`), the number the grid is built from.
     #[inline]
     fn advance_px(&self, gid: u16, px: f32) -> f32 {
-        let units = self.advances.get(usize::from(gid)).copied().unwrap_or(0);
+        let units = self.memo.advance(gid, || {
+            let face = aterm_font::Face::parse(&self.data, self.index).ok()?;
+            face.glyph_hor_advance(aterm_font::GlyphId(gid))
+        });
         self.scale_factor(px) * f32::from(units)
     }
 
-    /// Design-space ink box for `gid`: the precomputed `glyf` entry when there
-    /// is one, otherwise a face parse (the CFF path).
+    /// Design-space ink box for `gid`: kept once outlined for a `glyf` face,
+    /// otherwise a face parse per call (the CFF path).
     fn design_bbox(&self, gid: u16) -> Option<[i16; 4]> {
         if gid >= self.glyph_count {
             return None;
         }
-        if let Some(table) = self.bboxes.as_ref() {
-            let b = *table.get(usize::from(gid))?;
+        let outline = || {
+            let face = aterm_font::Face::parse(&self.data, self.index).ok()?;
+            face.glyph_bounding_box(aterm_font::GlyphId(gid))
+                .map(|b| [b.x_min, b.y_min, b.x_max, b.y_max])
+        };
+        if self.memo.keeps_boxes() {
+            let b = self.memo.ink_box(gid, outline);
             return (b != [0, 0, 0, 0]).then_some(b);
         }
-        let face = aterm_font::Face::parse(&self.data, self.index).ok()?;
-        face.glyph_bounding_box(aterm_font::GlyphId(gid))
-            .map(|b| [b.x_min, b.y_min, b.x_max, b.y_max])
+        outline()
+    }
+}
+
+/// What a [`Font`] answers per glyph, worked out the first time each glyph
+/// is asked for and kept: its `hmtx` advance (with `HVAR` or `gvar` deltas)
+/// and, for a `glyf` face, its ink box. Working out every glyph's at parse
+/// cost an outline per glyph id (and a variation walk per glyph of a variable
+/// face) before the first character drew, for glyphs that never draw.
+struct GlyphMemo {
+    /// Per glyph: the advance in the low 16 bits, [`Self::ADVANCE_KNOWN`]
+    /// once it is there, [`Self::BOX_KNOWN`] once `boxes` holds the box.
+    words: Box<[AtomicU32]>,
+    /// Per glyph, the ink box's four `i16`s, for a `glyf` face; empty for
+    /// any other, whose box is outlined per call.
+    boxes: Box<[AtomicU64]>,
+}
+
+impl GlyphMemo {
+    const ADVANCE_KNOWN: u32 = 1 << 16;
+    const BOX_KNOWN: u32 = 1 << 17;
+
+    fn new(glyph_count: u16, keeps_boxes: bool) -> Self {
+        let count = usize::from(glyph_count);
+        Self {
+            words: (0..count).map(|_| AtomicU32::new(0)).collect(),
+            boxes: (0..if keeps_boxes { count } else { 0 })
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+        }
+    }
+
+    fn keeps_boxes(&self) -> bool {
+        !self.boxes.is_empty()
+    }
+
+    /// `gid`'s advance in design units, `0` when the face has none (or past
+    /// the glyph count); `compute` runs the first time it is asked for.
+    fn advance(&self, gid: u16, compute: impl FnOnce() -> Option<u16>) -> u16 {
+        let Some(word) = self.words.get(usize::from(gid)) else {
+            return 0;
+        };
+        let known = word.load(Ordering::Acquire);
+        if known & Self::ADVANCE_KNOWN != 0 {
+            return known as u16;
+        }
+        let advance = compute().unwrap_or(0);
+        // A racing thread computes the same advance, so the bits agree.
+        word.fetch_or(Self::ADVANCE_KNOWN | u32::from(advance), Ordering::Release);
+        advance
+    }
+
+    /// `gid`'s ink box, `[0; 4]` when it has none; `compute` runs the first
+    /// time it is asked for.
+    fn ink_box(&self, gid: u16, compute: impl FnOnce() -> Option<[i16; 4]>) -> [i16; 4] {
+        let (Some(word), Some(packed)) = (
+            self.words.get(usize::from(gid)),
+            self.boxes.get(usize::from(gid)),
+        ) else {
+            return [0; 4];
+        };
+        if word.load(Ordering::Acquire) & Self::BOX_KNOWN != 0 {
+            let bits = packed.load(Ordering::Relaxed).to_le_bytes();
+            let (pairs, _) = bits.as_chunks::<2>();
+            return core::array::from_fn(|i| {
+                pairs.get(i).map_or(0, |&pair| i16::from_le_bytes(pair))
+            });
+        }
+        let ink = compute().unwrap_or([0; 4]);
+        let mut bits = [0u8; 8];
+        for (pair, v) in bits.as_chunks_mut::<2>().0.iter_mut().zip(ink) {
+            *pair = v.to_le_bytes();
+        }
+        // Stored before the flag is released, so a reader that sees the flag sees it.
+        packed.store(u64::from_le_bytes(bits), Ordering::Relaxed);
+        word.fetch_or(Self::BOX_KNOWN, Ordering::Release);
+        ink
     }
 }
 
@@ -846,5 +912,49 @@ mod tests {
             );
         }
         moved_from_the_enumerated_map(&font, &face);
+    }
+
+    /// A PARSE OUTLINES NO GLYPH: a glyph's box is outlined the first time
+    /// its metrics are asked for, and kept.
+    #[cfg(feature = "embedded-font")]
+    #[test]
+    fn a_parse_outlines_no_glyph_until_asked_for_it() {
+        let bytes = crate::embedded_font();
+        let _ = aterm_font::take_spent();
+        let font = Font::from_bytes(bytes, FontSettings::default()).expect("the embedded face");
+        assert_eq!(
+            aterm_font::take_spent().outline_steps,
+            0,
+            "the parse outlined"
+        );
+
+        let face = aterm_font::Face::parse(bytes, 0).expect("the embedded face");
+        let a = face.glyph_index('A').expect("A").0;
+        let ink = face
+            .glyph_bounding_box(aterm_font::GlyphId(a))
+            .expect("A has ink");
+        let advance = face.glyph_hor_advance(aterm_font::GlyphId(a)).expect("A");
+        let _ = aterm_font::take_spent();
+        let metrics = font.metrics_indexed(a, 32.0);
+        assert!(
+            aterm_font::take_spent().outline_steps > 0,
+            "A outlined when asked for"
+        );
+        assert_eq!(font.metrics_indexed(a, 32.0), metrics);
+        assert_eq!(aterm_font::take_spent().outline_steps, 0, "A outlined once");
+
+        let scale = font.scale_factor(32.0);
+        let (xmin, ymin, width, height) =
+            super::ink_box_px([ink.x_min, ink.y_min, ink.x_max, ink.y_max], scale);
+        assert_eq!(
+            metrics,
+            super::Metrics {
+                xmin,
+                ymin,
+                width,
+                height,
+                advance_width: scale * f32::from(advance),
+            }
+        );
     }
 }

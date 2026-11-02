@@ -70,8 +70,9 @@ pub struct UpOpts {
     pub reroute: bool,
     /// The instance reads the stub's own base URL as Claude Code's default route
     /// ([`aterm_agent::harness::netwatch::LAB_ROUTE_SEAM`]), so a lab Claude Code on the stub
-    /// with a stored login is a roster row's process: `claude-rotation-proof`'s alone (no
-    /// `LAB_*` variable).
+    /// with a stored login is a roster row's process: `claude-rotation-proof`'s, and `forever
+    /// --mode sysmsg`'s expired-login chains on Claude Code but under `--token-login`
+    /// (`forever::sysmsg::login::stored_arm`); no `LAB_*` variable.
     pub route_seam: bool,
     /// `LAB_HOME_IMAGE=<size>` (`16g`): the scratch's `home/` is a sparse APFS image of that size,
     /// a volume of its own, which the `down` that removes the scratch detaches
@@ -345,6 +346,26 @@ pub fn find_muse() -> Option<String> {
     executable_at(c)
 }
 
+/// The Grok Build under test: `LAB_GROK`, else the managed store's build.
+#[must_use]
+pub fn find_grok() -> Option<String> {
+    let c = match std::env::var("LAB_GROK") {
+        Ok(c) if !c.is_empty() => crate::paths::from_caller(&c),
+        _ => managed_store_bin("grok")?,
+    };
+    executable_at(c)
+}
+
+/// The Kimi Code under test: `LAB_KIMI`, else the managed store's.
+#[must_use]
+pub fn find_kimi() -> Option<String> {
+    let c = match std::env::var("LAB_KIMI") {
+        Ok(c) if !c.is_empty() => crate::paths::from_caller(&c),
+        _ => managed_store_bin("kimi")?,
+    };
+    executable_at(c)
+}
+
 /// `text` when it is a version (a digit, then letters, digits, `.`, `+` and `-`), else `?`.
 #[must_use]
 pub fn clean_ver(text: &str) -> String {
@@ -394,6 +415,22 @@ pub fn vendor_version(text: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Grok Build's version: the `version = "…"` of the record atpkg keeps beside its store build,
+/// else `?`. Never `--version`: a Grok Build run without the lab's key starts xAI's device
+/// sign-in (`docs/DESIGN-harness-repos-2026-10-24.md` D27).
+#[must_use]
+pub fn grok_version(bin: &str) -> String {
+    let vendor = Path::new(bin)
+        .parent()
+        .and_then(Path::parent)
+        .map(|b| PathBuf::from(format!("{}.vendor", b.display())));
+    let v = vendor
+        .and_then(|p| crate::sys::scratch_read(&p).ok().flatten())
+        .map(|b| vendor_version(&String::from_utf8_lossy(&b)))
+        .unwrap_or_default();
+    clean_ver(&v)
+}
+
 /// The build Muse Code's `--version` names.
 #[must_use]
 pub fn muse_build(version_line: &str) -> Option<&str> {
@@ -414,6 +451,25 @@ pub fn muse_version(run: &Run, bin: &str) -> String {
         .unwrap_or_default();
     if v.is_empty() {
         jailed_version(run, bin, muse_build)
+    } else {
+        clean_ver(&v)
+    }
+}
+
+/// Kimi Code's version: the `version = "…"` of the record atpkg keeps beside its store build,
+/// else the last word of its `--version`, run inside the jail.
+#[must_use]
+pub fn kimi_version(run: &Run, bin: &str) -> String {
+    let vendor = Path::new(bin)
+        .parent()
+        .and_then(Path::parent)
+        .map(|b| PathBuf::from(format!("{}.vendor", b.display())));
+    let v = vendor
+        .and_then(|p| crate::sys::scratch_read(&p).ok().flatten())
+        .map(|b| vendor_version(&String::from_utf8_lossy(&b)))
+        .unwrap_or_default();
+    if v.is_empty() {
+        jailed_version(run, bin, |l| l.split_whitespace().last())
     } else {
         clean_ver(&v)
     }
@@ -1443,6 +1499,12 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
     if let Some(c) = find_muse() {
         run.muse_bin = outside("Muse Code", c)?;
     }
+    if let Some(c) = find_grok() {
+        run.grok_bin = outside("Grok Build", c)?;
+    }
+    if let Some(c) = find_kimi() {
+        run.kimi_bin = outside("Kimi Code", c)?;
+    }
     run.agent = "claude".into();
     run.cols.clone_from(&o.cols);
     run.rows.clone_from(&o.lines);
@@ -1533,6 +1595,8 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
     );
     spec.agy.clone_from(&run.agy_bin);
     spec.muse.clone_from(&run.muse_bin);
+    spec.grok.clone_from(&run.grok_bin);
+    spec.kimi.clone_from(&run.kimi_bin);
     let jail = crate::jail::render(&spec).map_err(|e| abort(&run, &[], &e))?;
     fs::write(run.run.join("jail.sb"), jail).map_err(|e| abort(&run, &[], &e.to_string()))?;
     if let Err(e) = crate::jail::check(&run.run.join("jail.sb")) {
@@ -1778,6 +1842,12 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
     if !run.muse_bin.is_empty() {
         run.muse_ver = muse_version(&run, &run.muse_bin);
     }
+    if !run.grok_bin.is_empty() {
+        run.grok_ver = grok_version(&run.grok_bin);
+    }
+    if !run.kimi_bin.is_empty() {
+        run.kimi_ver = kimi_version(&run, &run.kimi_bin);
+    }
     run.save();
     Ok(run)
 }
@@ -1950,6 +2020,18 @@ pub fn cmd_up(args: &[String]) -> Res {
             &run.muse_ver,
             "aterm pkg install muse, or LAB_MUSE",
         ),
+        (
+            "grok",
+            &run.grok_bin,
+            &run.grok_ver,
+            "LAB_GROK=<a scratch store's build>",
+        ),
+        (
+            "kimi",
+            &run.kimi_bin,
+            &run.kimi_ver,
+            "aterm pkg install kimi, or LAB_KIMI",
+        ),
     ] {
         if bin.is_empty() {
             println!("  {name:<11} none here ({LAB} {name} needs one: {how})");
@@ -2067,6 +2149,7 @@ pub fn down(tag: &str, keep_dumps: bool) -> Result<PathBuf, Fail> {
         "codex-run.sh",
         "agy.sh",
         "muse.sh",
+        "grok.sh",
         "jailed.pids",
         crate::workers::WORKER_TEXTS,
         "probe.txt",
@@ -2123,6 +2206,7 @@ pub fn down(tag: &str, keep_dumps: bool) -> Result<PathBuf, Fail> {
         &r.w.join("home/.local/share/muse/sessions"),
         &keep.join("muse-sessions"),
     );
+    keep_tree(&r.w.join(crate::grok::HOME), &keep.join("grok-home"));
     let sec = r.w.join("security.log");
     if let Ok(Some(b)) = crate::sys::scratch_read(&sec) {
         let masked: String = String::from_utf8_lossy(&b)
@@ -2278,15 +2362,35 @@ fn ps_one(tag: &str) -> Result<(), Fail> {
     }
     if live.is_empty() {
         println!("  nothing of it is alive: {LAB} down {tag} removes its run directory");
-    } else if let Ok(out) = aterm_uds::spawnfd::command("/bin/ps")
-        .args(["-o", "pid,ppid,etime,comm", "-p", &live.join(",")])
-        .output()
-    {
-        for l in String::from_utf8_lossy(&out.stdout).lines() {
+    } else {
+        for l in ps_rows(&live) {
             println!("  {l}");
         }
     }
     Ok(())
+}
+
+/// `ps`'s rows for `live`, its header first, read a pid at a time: asked for two or
+/// more pids at once, a `ps` whose own device read is wedged never returns, while each
+/// pid asked alone answers (the kproc oracle's lesson in `aterm-agent`). A pid `ps`
+/// cannot read contributes no row.
+fn ps_rows(live: &[String]) -> Vec<String> {
+    let mut rows = Vec::new();
+    for pid in live {
+        let Ok(out) = aterm_uds::spawnfd::command("/bin/ps")
+            .args(["-o", "pid,ppid,etime,comm", "-p", pid])
+            .output()
+        else {
+            continue;
+        };
+        for (i, l) in String::from_utf8_lossy(&out.stdout).lines().enumerate() {
+            if i == 0 && !rows.is_empty() {
+                continue;
+            }
+            rows.push(l.to_string());
+        }
+    }
+    rows
 }
 
 /// `ps [tag]`: that lab, or (no argument) every lab that has a run directory.
@@ -2311,6 +2415,17 @@ pub fn cmd_ps(args: &[String]) -> Res {
     Ok(0)
 }
 
+/// The proxy variables a launch on the stub's route alone unsets ([`Launch::stub_route_alone`]),
+/// each a route of its own to the instance.
+pub const PROXY_KEYS: [&str; 6] = [
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+];
+
 /// How `claude` launches.
 #[derive(Debug, Default)]
 pub struct Launch {
@@ -2320,10 +2435,16 @@ pub struct Launch {
     pub envs: Vec<String>,
     /// `--no-wait`.
     pub no_wait: bool,
+    /// Emit a jailed child launch plan without typing into the preparation host.
+    pub prepare_only: bool,
     /// `--relay`: behind the PTY relay, on the fullscreen renderer.
     pub relay: bool,
     /// `--subscriber`: a fake claude.ai login.
     pub subscriber: bool,
+    /// The stub's base URL its only route: no black-hole proxy in the environment, so a stored
+    /// login's process is the default route's where the instance's seam admits that base URL
+    /// ([`UpOpts::route_seam`]); the jail still denies every connection but loopback.
+    pub stub_route_alone: bool,
     /// `--debug-log`: Claude Code's debug log into the scratch ([`crate::stats::debug_log`]).
     pub debug_log: bool,
     /// `--by-name`: `claude` found on `PATH`, not the binary by path: in a `LAB_REROUTE=1` lab the
@@ -2352,6 +2473,7 @@ pub fn parse_launch(args: &[String]) -> Result<Launch, String> {
                 l.envs.push(kv);
             }
             "--no-wait" => l.no_wait = true,
+            "--prepare-only" => l.prepare_only = true,
             "--relay" => l.relay = true,
             "--subscriber" => l.subscriber = true,
             "--debug-log" => l.debug_log = true,
@@ -2361,7 +2483,7 @@ pub fn parse_launch(args: &[String]) -> Result<Launch, String> {
             }
             other => {
                 return Err(format!(
-                    "claude: unknown option '{other}' (use -e K=V, --no-wait, --relay, --subscriber, --debug-log, --by-name, -- <claude args>)"
+                    "claude: unknown option '{other}' (use -e K=V, --no-wait, --prepare-only, --relay, --subscriber, --debug-log, --by-name, -- <claude args>)"
                 ));
             }
         }
@@ -2390,7 +2512,6 @@ pub(crate) struct LaunchWords {
 
 impl LaunchWords {
     /// Every name the launch sets, in order.
-    #[cfg(test)]
     #[must_use]
     pub fn names(&self) -> Vec<String> {
         self.env
@@ -2463,6 +2584,10 @@ pub(crate) fn launch_words(run: &Run, l: &Launch) -> LaunchWords {
             pair("BROWSER", q(&run.run.join("shim/open").to_string_lossy())),
         ],
     ];
+    let mut env = env;
+    if l.stub_route_alone {
+        env.retain(|line| !line.iter().any(|(k, _)| PROXY_KEYS.contains(&k.as_str())));
+    }
     let mut args = Vec::new();
     if l.debug_log {
         args.push("--debug-file".to_string());
@@ -2492,6 +2617,11 @@ pub fn launcher(run: &Run, l: &Launch) -> String {
         s.push(' ');
     }
     s.push_str("env");
+    if l.stub_route_alone {
+        for k in PROXY_KEYS {
+            s.push_str(&format!(" -u {k}"));
+        }
+    }
     for (i, line) in words.env.iter().enumerate() {
         s.push_str(if i == 0 { " " } else { "  " });
         let pairs: Vec<String> = line.iter().map(|(k, v)| format!("{k}={v}")).collect();
@@ -2509,6 +2639,163 @@ pub fn launcher(run: &Run, l: &Launch) -> String {
     }
     s.push('\n');
     s
+}
+
+/// A canonical CLI-only jail plan. The preparation host continues owning its own socket,
+/// instance and fake provider; this plan can be passed after `lab instance --`.
+pub(crate) struct PreparedChild {
+    kind: &'static str,
+    pub(crate) launcher: PathBuf,
+    pub(crate) cwd: PathBuf,
+    pub(crate) argv: Vec<String>,
+}
+
+impl PreparedChild {
+    /// Construct the canonical jailed CLI argv without launching or saving its host.
+    pub(crate) fn new(
+        run: &Run,
+        kind: &'static str,
+        launcher: PathBuf,
+        vars: &[(String, String)],
+    ) -> Result<Self, Fail> {
+        let pairs: Vec<_> = vars
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        let script_word = launcher
+            .to_str()
+            .ok_or_else(|| Fail::usage("lab launcher path is not UTF-8"))?;
+        let argv = procs::jailed_argv(
+            run,
+            Some(Path::new(&run.proj)),
+            &pairs,
+            &["/bin/sh", script_word],
+        );
+        Ok(Self {
+            kind,
+            launcher,
+            cwd: PathBuf::from(&run.proj),
+            argv,
+        })
+    }
+
+    pub(crate) fn json(&self, tag: &str) -> J {
+        J::obj([
+            ("schema", J::Int(1)),
+            ("kind", J::s(self.kind)),
+            ("tag", J::s(tag)),
+            ("launcher", J::s(self.launcher.to_string_lossy())),
+            ("cwd", J::s(self.cwd.to_string_lossy())),
+            (
+                "argv",
+                J::Arr(self.argv.iter().cloned().map(J::s).collect()),
+            ),
+            ("requires_preparation_host", J::Bool(true)),
+        ])
+    }
+}
+
+/// Prepare without an input connection or a saved-run mutation. Validation, including the
+/// existing witness identity check, finishes before any launcher or directory is written.
+fn prepare_claude_with(
+    run: &Run,
+    l: &Launch,
+    user: &str,
+    witness: impl FnOnce(&Run) -> Result<(), String>,
+) -> Result<PreparedChild, Fail> {
+    if l.relay || l.subscriber || l.by_name {
+        return Err(Fail::usage(
+            "claude --prepare-only takes no --relay, --subscriber or --by-name",
+        ));
+    }
+    let vars = prepared_child_vars(
+        run,
+        user,
+        "claude",
+        &l.envs,
+        &launch_words(run, &Launch::default()).names(),
+        &l.args,
+    )?;
+    witness(run).map_err(Fail::die)?;
+    let plan = PreparedChild::new(
+        run,
+        "claude-prepared",
+        run.run.join("claude-prepared.sh"),
+        &vars,
+    )?;
+    atomic_write(&plan.launcher, launcher(run, l).as_bytes())
+        .map_err(|error| Fail::die(format!("cannot write {}: {error}", plan.launcher.display())))?;
+    Ok(plan)
+}
+
+/// The CLI child's private environment, validated before any preparation files are written.
+pub(crate) fn prepared_child_vars(
+    run: &Run,
+    user: &str,
+    program: &str,
+    envs: &[String],
+    fixed: &[String],
+    args: &[String],
+) -> Result<Vec<(String, String)>, Fail> {
+    let mut vars = instance_vars(run, user).map_err(Fail::usage)?;
+    let tmp = vars
+        .iter()
+        .find(|(name, _)| name == "TMPDIR")
+        .map_or_else(|| run.w.join("tmp"), |(_, value)| PathBuf::from(value));
+    if !tmp.starts_with(&run.w)
+        || tmp
+            .components()
+            .any(|part| part == std::path::Component::ParentDir)
+    {
+        return Err(Fail::usage(format!(
+            "{program} --prepare-only requires TMPDIR within the lab scratch"
+        )));
+    }
+    let roots = [
+        ("TMPDIR", tmp.clone()),
+        ("TMP", tmp.clone()),
+        ("TEMP", tmp),
+        ("XDG_CACHE_HOME", run.w.join("home/.cache")),
+        ("XDG_DATA_HOME", run.w.join("home/.local/share")),
+        ("XDG_STATE_HOME", run.w.join("home/.local/state")),
+    ];
+    for (name, path) in &roots {
+        vars.retain(|(key, _)| key != name);
+        vars.push((name.to_string(), path.to_string_lossy().into_owned()));
+    }
+    // These are the interactive protocol values aterm puts on its PTY child.
+    // The private child clears inherited environment, so restore them explicitly.
+    vars.extend([
+        ("TERM".into(), "xterm-256color".into()),
+        ("COLORTERM".into(), "truecolor".into()),
+        ("TERM_PROGRAM".into(), "aterm".into()),
+    ]);
+    for kv in envs {
+        let Some((name, value)) = kv.split_once('=') else {
+            return Err(Fail::usage(format!(
+                "{program} --prepare-only -e needs NAME=value"
+            )));
+        };
+        if !shell_name(name) || value.contains('\0') {
+            return Err(Fail::usage(format!(
+                "{program} --prepare-only -e needs a valid name and no NUL"
+            )));
+        }
+        if vars.iter().any(|(key, _)| key == name)
+            || fixed.iter().any(|key| key == name)
+            || crate::clock::is_clock_var(name)
+        {
+            return Err(Fail::usage(format!(
+                "{program} --prepare-only fixes {name} to its private launch value"
+            )));
+        }
+    }
+    if args.iter().any(|arg| arg.contains('\0')) {
+        return Err(Fail::usage(format!(
+            "{program} --prepare-only arguments cannot contain NUL"
+        )));
+    }
+    Ok(vars)
 }
 
 /// The line `claude --by-name` types at the tab's prompt, as a person types it: the launch's
@@ -2622,6 +2909,11 @@ fn lay_relay(run: &Run) -> Result<(), Fail> {
 /// # Errors
 /// The launch line could not be typed, or the relay could not be laid.
 pub fn launch_claude(run: &Run, l: &Launch) -> Result<String, Fail> {
+    if l.prepare_only {
+        return Err(Fail::usage(
+            "--prepare-only emits a child launch plan; it cannot type a launch",
+        ));
+    }
     if let Some(why) = by_name_refused(run, l) {
         return Err(Fail::usage(why));
     }
@@ -2651,7 +2943,13 @@ pub fn launch_claude(run: &Run, l: &Launch) -> Result<String, Fail> {
     if sent.code != 0 {
         return Err(Fail::die("could not type the launch line"));
     }
-    door.ctl(&["key", "enter"])?;
+    let entered = door.ctl(&["key", "enter"])?;
+    if entered.code != 0 {
+        return Err(Fail::die(format!(
+            "could not submit the launch line (exit {}): {}{}",
+            entered.code, entered.stdout, entered.stderr
+        )));
+    }
     Ok(format!(
         "launched: {} ({}) in lab '{}'{}  (launcher: {})",
         if l.by_name {
@@ -2673,13 +2971,18 @@ pub fn launch_claude(run: &Run, l: &Launch) -> Result<String, Fail> {
     ))
 }
 
-/// `claude [tag] [-e K=V]... [--no-wait] [--relay] [--subscriber] [--debug-log] [--by-name]
+/// `claude [tag] [-e K=V]... [--no-wait] [--prepare-only] [--relay] [--subscriber] [--debug-log] [--by-name]
 /// [-- claude args]`.
 pub fn cmd_claude(args: &[String]) -> Res {
     let mut args = args.to_vec();
     let tag = take_tag(&mut args)?;
     let run = Run::load(&tag)?;
     let l = parse_launch(&args)?;
+    if l.prepare_only {
+        let plan = prepare_claude_with(&run, &l, &paths().user, procs::need_witness)?;
+        println!("{}", plan.json(&tag).dump(crate::pyjson::COMPACT));
+        return Ok(0);
+    }
     println!("{}", launch_claude(&run, &l)?);
     if !l.no_wait
         && Door::new(&run)?
@@ -2690,6 +2993,10 @@ pub fn cmd_claude(args: &[String]) -> Res {
     }
     Ok(0)
 }
+
+#[cfg(test)]
+#[path = "claude_prepared_tests.rs"]
+mod prepared_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2717,6 +3024,37 @@ mod tests {
             None,
             "only what it holds"
         );
+    }
+
+    /// `ps_rows` reads each pid alone: its header once, a row for each live pid, and no
+    /// row for a reaped one. Asked for the whole list at once, a wedged `ps` never
+    /// returns; this test's return is that proof's other half.
+    #[cfg(unix)]
+    #[test]
+    fn ps_rows_reads_each_pid_alone() {
+        let gone = {
+            let mut child = aterm_uds::spawnfd::command("/bin/sleep")
+                .arg("0.01")
+                .spawn()
+                .expect("spawn the short-lived pid");
+            let id = child.id().to_string();
+            let _ = child.wait();
+            id
+        };
+        let me = std::process::id().to_string();
+        let rows = ps_rows(&[me.clone(), gone.clone(), "1".to_string()]);
+        let first_words: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| r.split_whitespace().next())
+            .collect();
+        assert_eq!(
+            first_words.iter().filter(|w| **w == "PID").count(),
+            1,
+            "{rows:?}"
+        );
+        assert!(first_words.contains(&me.as_str()), "{rows:?}");
+        assert!(first_words.contains(&"1"), "{rows:?}");
+        assert!(!first_words.contains(&gone.as_str()), "{rows:?}");
     }
 
     #[test]

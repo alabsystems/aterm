@@ -5,6 +5,362 @@ use super::*;
 use aterm_secrets::fsx;
 
 #[test]
+fn a_later_expired_push_cannot_replace_a_pending_table_or_acknowledge_it() {
+    for wait in [Duration::ZERO, Duration::from_millis(100)] {
+        let pusher = Pusher::default();
+        let board = pusher.0.clone();
+        let _serving = board.serving();
+        let first = pusher.clone();
+        let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        let caller = thread::spawn(move || first.push_until([1; 32], deadline));
+        // Observe registration without letting the runtime take the first table yet.
+        loop {
+            if board.desk().ask.is_some() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "first push never registered");
+            thread::sleep(Duration::from_millis(1));
+        }
+        let expired = pusher.push_until([2; 32], Instant::now() + wait);
+        let taken = board.take().expect("the original pending push");
+        board.settle(taken.id, Pushed::Reached);
+        let first_result = caller.join().expect("first caller");
+        assert_eq!(expired, Pushed::TimedOut);
+        assert_eq!(
+            taken.table, [1; 32],
+            "an expired caller replaced the pending table"
+        );
+        assert_eq!(first_result, Pushed::Reached);
+    }
+}
+
+fn next_push(board: &Board, deadline: Instant) -> Ask {
+    loop {
+        if let Some(ask) = board.take() {
+            return ask;
+        }
+        assert!(Instant::now() < deadline, "push never registered");
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn concurrent_pushes_get_their_own_result_and_ignore_stale_completion() {
+    let pusher = Pusher::default();
+    let board = pusher.0.clone();
+    let _serving = board.serving();
+    let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let first = pusher.clone();
+    let first_caller = thread::spawn(move || first.push_until([1; 32], deadline));
+    let first = next_push(&board, deadline);
+    let second = pusher.clone();
+    let second_caller = thread::spawn(move || second.push_until([2; 32], deadline));
+    board.settle(first.id, Pushed::Reached);
+    assert_eq!(first_caller.join().unwrap(), Pushed::Reached);
+    let second = next_push(&board, deadline);
+    assert_eq!(second.table, [2; 32]);
+    board.settle(first.id, Pushed::TimedOut);
+    let priority = *board.first();
+    board.settle(second.id, Pushed::NoPeers);
+    assert_eq!(second_caller.join().unwrap(), Pushed::NoPeers);
+    assert_eq!(
+        priority,
+        Some([2; 32]),
+        "stale completion cleared the current table"
+    );
+}
+
+#[test]
+fn an_abandoned_push_round_releases_its_priority_after_a_later_caller_expires() {
+    let board = Board::default();
+    let _serving = board.serving();
+    {
+        let mut desk = board.desk();
+        desk.asked = 1;
+        desk.ask = Some(Ask {
+            id: 1,
+            table: [1; 32],
+            deadline: Instant::now(),
+        });
+    }
+    let first = board.take().unwrap();
+    // Caller one expired while its round ran. Caller two then registered and expired
+    // before the owner took its request. Only round one's priority remains active.
+    board.desk().asked = 2;
+    board.settle(first.id, Pushed::Reached);
+    assert_eq!(
+        *board.first(),
+        None,
+        "the abandoned round left its table prioritized"
+    );
+    assert!(
+        board.desk().settled.is_none(),
+        "round one cannot answer caller two"
+    );
+}
+
+#[test]
+fn stopping_repair_wakes_every_push_caller() {
+    let pusher = Pusher::default();
+    let board = pusher.0.clone();
+    let serving = board.serving();
+    let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let first = pusher.clone();
+    let first_caller = thread::spawn(move || first.push_until([1; 32], deadline));
+    next_push(&board, deadline);
+    let second_caller = thread::spawn(move || pusher.push_until([2; 32], deadline));
+    drop(serving);
+    assert_eq!(first_caller.join().unwrap(), Pushed::NotServing);
+    assert_eq!(second_caller.join().unwrap(), Pushed::NotServing);
+}
+
+#[test]
+fn a_rapid_restart_cancels_unfinished_pushes_and_keeps_completed_results() {
+    for stage in 0..3 {
+        let pusher = Pusher::default();
+        let board = pusher.0.clone();
+        let serving = board.serving();
+        let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        let first = pusher.clone();
+        let caller = thread::spawn(move || first.push_until([1; 32], deadline));
+        loop {
+            if board.desk().ask.is_some() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "push never registered");
+            thread::sleep(Duration::from_millis(1));
+        }
+        let taken = (stage > 0).then(|| board.take().unwrap());
+        // Hold the desk across the production stop/start transitions so the waiting
+        // caller cannot observe the brief false value between service generations.
+        {
+            let mut desk = board.desk();
+            if stage == 2 {
+                // The owner had already completed this request before it stopped.
+                desk.settled = Some((taken.unwrap().id, Pushed::Reached));
+            }
+            desk.stop();
+            *board.first() = None;
+            desk.start();
+        }
+        board.changed.notify_all();
+        let result = caller.join().unwrap();
+        assert_eq!(
+            result,
+            if stage == 2 {
+                Pushed::Reached
+            } else {
+                Pushed::NotServing
+            },
+            "the push outcome crossed a service generation"
+        );
+        let next = thread::spawn(move || pusher.push_until([2; 32], deadline));
+        let ask = next_push(&board, deadline);
+        board.settle(ask.id, Pushed::Reached);
+        assert_eq!(next.join().unwrap(), Pushed::Reached);
+        drop(serving);
+        assert!(
+            board.desk().serving,
+            "an old guard stopped the replacement service"
+        );
+    }
+}
+
+#[test]
+fn diagnostics_keep_live_policy_and_owner_lease_separate_from_the_observer() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let home = aterm_tempfile::Builder::new()
+        .prefix("rdg-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let lab = crate::table::tests::Lab::new(&[aterm_secrets::commons::roster::Role::Writer]);
+    let paths = lab.paths[0].clone();
+    let config = home.path().join("aterm.toml");
+    fsx::write_atomic(&config, b"[commons]\nenabled=false\n", 0o600).unwrap();
+    let observer_home = aterm_tempfile::Builder::new()
+        .prefix("runtime-diagnostic-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let observer_config = observer_home.path().join("aterm.toml");
+    fsx::write_atomic(&observer_config, b"[commons]\nenabled=true\n", 0o600).unwrap();
+    let live_observer = Observer::open(&config, ObservationHandle::default()).unwrap();
+    let lease = owner::Lease::acquire(&paths.dir.join("commons"))
+        .unwrap()
+        .unwrap();
+    let recovery = paths.dir.join("commons/writer-generation");
+    fsx::ensure_private_dir(&recovery).unwrap();
+    let selection = recovery.join("selection");
+    fsx::write_atomic(&selection, b"incomplete recovery", 0o600).unwrap();
+    let opens = Arc::new(AtomicUsize::new(0));
+    let (observe, wait) = statuses();
+    let runtime = Runtime::start_mode_with_sources(
+        paths.clone(),
+        config.clone(),
+        (observer_config.clone(), false),
+        observe,
+        Network {
+            opens: Some(opens.clone()),
+            stand_in: Some(Arc::new(AtomicBool::new(true))),
+            ..Network::default()
+        },
+        false,
+        |_| {},
+    )
+    .unwrap();
+    wait(Status::Disabled);
+    assert!(!crate::network_state::history_exists(&observer_config));
+    fsx::write_atomic(&config, b"[commons]\nenabled=true\n", 0o600).unwrap();
+    wait(Status::Waiting);
+    assert!(crate::network_state::history_exists(&observer_config));
+    assert_eq!(opens.load(Ordering::SeqCst), 0);
+    runtime.stop();
+    assert_eq!(std::fs::read(&selection).unwrap(), b"incomplete recovery");
+    assert!(!recovery.join("home").exists());
+
+    // The ordinary recovery pass sees the incomplete selection and refuses;
+    // a copied-policy observation must not run that persistent transition.
+    let (observe, wait) = statuses();
+    let runtime = Runtime::start_mode_with_sources(
+        paths,
+        config,
+        (observer_config, true),
+        observe,
+        Network {
+            opens: Some(opens.clone()),
+            stand_in: Some(Arc::new(AtomicBool::new(true))),
+            ..Network::default()
+        },
+        false,
+        |_| {},
+    )
+    .unwrap();
+    wait(Status::Refused("writer recovery"));
+    runtime.stop();
+    assert_eq!(opens.load(Ordering::SeqCst), 0);
+    assert_eq!(std::fs::read(&selection).unwrap(), b"incomplete recovery");
+    drop((lease, live_observer));
+}
+
+/// How many tries an owner makes in ten virtual minutes of one persistent refusal, each try
+/// taking `each` before it is refused, under `wait` (the wait after each try).
+fn tries_in_ten_minutes(each: Duration, mut wait: impl FnMut() -> Duration) -> usize {
+    let mut elapsed = Duration::ZERO;
+    let mut tries = 0;
+    while elapsed < Duration::from_secs(600) {
+        tries += 1;
+        elapsed += each + wait();
+    }
+    tries
+}
+
+/// A window's owner tries a persistent refusal (local configuration or trust state) again at a
+/// doubling wait, up to [`REFUSED_MAX`], not every 200 ms: each try rebuilds custody, an endpoint
+/// and a transport. The background owner keeps [`POLL`], so it yields to a window that opens
+/// within one. NEGATIVE CONTROL: the fixed wait the owner kept before (`TICK * 2` after every
+/// refusal) makes 3000 tries of an instant refusal in ten minutes and 250 of one refused at its
+/// first poll; the doubling makes at most 27 of either.
+#[test]
+fn a_persistent_refusal_backs_off_to_thirty_seconds_and_a_served_run_resets_it() {
+    let base = TICK * 2;
+    for each in [Duration::ZERO, POLL + base] {
+        let mut refusals = Refusals::new(false);
+        let doubling = tries_in_ten_minutes(each, || {
+            refusals.after(Some(Status::Refused("generation guard")), None)
+        });
+        let fixed = tries_in_ten_minutes(each, || base);
+        assert!(doubling <= 27, "{doubling} tries after {each:?} each");
+        assert!(fixed >= 200, "the fixed control made {fixed} tries");
+    }
+
+    let mut refusals = Refusals::new(false);
+    let refused = Some(Status::Refused("custody"));
+    let waits: Vec<_> = (0..10).map(|_| refusals.after(refused, None)).collect();
+    assert_eq!(waits[0], base, "the first refusal is tried again as before");
+    assert_eq!(waits[1], base * 2);
+    assert_eq!(waits[2], base * 4);
+    assert_eq!(*waits.last().unwrap(), REFUSED_MAX);
+    // A try that served briefly before it was refused (an owner refused at each poll) keeps the
+    // doubling; one that served for the longest wait, or one that ended to rebuild, resets it.
+    assert_eq!(
+        refusals.after(refused, Some(POLL)),
+        REFUSED_MAX,
+        "a refusal at the first poll reset the backoff"
+    );
+    assert_eq!(refusals.after(refused, Some(REFUSED_MAX)), base);
+    assert_eq!(refusals.after(refused, None), base * 2);
+    assert_eq!(refusals.after(None, None), base);
+    assert_eq!(refusals.after(refused, None), base);
+    // Every other status keeps the mode's wait and the streak.
+    assert_eq!(refusals.after(Some(Status::Offline), None), base);
+    assert_eq!(refusals.after(refused, None), base * 2);
+    let mut background = Refusals::new(true);
+    assert!(
+        (0..6).all(|_| background.after(refused, None) == POLL),
+        "the background owner backed off"
+    );
+}
+
+/// The owner loop waits as [`Refusals`] says, at its gate and after a refused try. A window's
+/// owner refused by an unreadable configuration before its first LAN use, and one refused by an
+/// incomplete writer recovery past it, wait 200, 400, 800 and 1600 ms between tries; the
+/// background owner waits [`POLL`] each time. NEGATIVE CONTROL: the fixed `TICK * 2` the loop
+/// kept before after each refusal, at its gate or past it, reads four waits of 200 ms.
+#[test]
+fn the_owner_loop_waits_out_a_persistent_refusal_at_a_doubling_interval() {
+    let home = aterm_tempfile::tempdir().unwrap();
+    let lab = crate::table::tests::Lab::new(&[aterm_secrets::commons::roster::Role::Writer]);
+    let paths = lab.paths[0].clone();
+    let recovery = paths.dir.join("commons/writer-generation");
+    fsx::ensure_private_dir(&recovery).unwrap();
+    fsx::write_atomic(&recovery.join("selection"), b"incomplete recovery", 0o600).unwrap();
+    let unreadable = home.path().join("unreadable/aterm.toml");
+    fsx::ensure_private_dir(unreadable.parent().unwrap()).unwrap();
+    fsx::write_atomic(&unreadable, b"[commons\n", 0o600).unwrap();
+    let enabled = home.path().join("enabled/aterm.toml");
+    fsx::ensure_private_dir(enabled.parent().unwrap()).unwrap();
+    fsx::write_atomic(&enabled, b"[commons]\nenabled=true\n", 0o600).unwrap();
+    let doubling = [TICK * 2, TICK * 4, TICK * 8, TICK * 16];
+    for (config, background, refused, expected) in [
+        (&unreadable, false, "configuration", &doubling[..]),
+        (&enabled, false, "writer recovery", &doubling[..]),
+        (&enabled, true, "writer recovery", &[POLL, POLL][..]),
+    ] {
+        let retries = Arc::new(Mutex::new(Vec::new()));
+        let (observe, wait) = statuses();
+        let runtime = Runtime::start_mode_with_sources(
+            paths.clone(),
+            config.clone(),
+            (config.clone(), true),
+            observe,
+            Network {
+                retries: Some(retries.clone()),
+                ..Network::default()
+            },
+            background,
+            |_| {},
+        )
+        .unwrap();
+        wait(Status::Refused(refused));
+        let until = Instant::now() + Duration::from_secs(60);
+        while retries.lock().unwrap().len() < expected.len() {
+            assert!(
+                Instant::now() < until,
+                "{refused}: {:?}",
+                retries.lock().unwrap()
+            );
+            thread::sleep(TICK / 10);
+        }
+        runtime.stop();
+        let retries = retries.lock().unwrap();
+        assert_eq!(
+            retries[..expected.len()],
+            *expected,
+            "{refused}, background {background}"
+        );
+    }
+}
+
+#[test]
 fn delayed_worker_completion_does_not_refresh_old_authentication() {
     let root = aterm_tempfile::tempdir().unwrap();
     let handle = crate::network_state::ObservationHandle::default();
@@ -661,7 +1017,9 @@ fn a_heard_refusal_says_so_and_never_closes_the_lan() {
     heard.store(false, Ordering::Release);
     wait_network(&observation, "no refusal heard", |state| {
         state.visibility == Visibility::Unavailable
-            && state.detail == "Local network sockets unavailable; Commons control unavailable"
+            && state.detail.starts_with(
+                "Local network sockets unavailable; Commons control unavailable: discovery beacon",
+            )
     });
     heard.store(true, Ordering::Release);
     wait_network(&observation, "the refusal heard again", |state| {

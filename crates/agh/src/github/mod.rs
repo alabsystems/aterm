@@ -16,7 +16,7 @@ pub mod users;
 pub use contents::Contents;
 pub use git::{CompareResult, Git};
 pub use public::{Probe, Public};
-pub use raw::{Raw, RawAnswer, RawGet, RawOutcome};
+pub use raw::{Raw, RawAnswer, RawGet, RawOutcome, RawSend};
 pub use refs::Refs;
 pub use releases::{Releases, TagObjects};
 pub use repos::{RepoListKind, Repos};
@@ -177,11 +177,14 @@ impl How {
         route
     }
 
-    /// `Call::get(path, self.route(target))` with this routing's probe and retry policy.
+    /// `Call::get(path, self.route(target))` with this routing's probe, retry policy, rate
+    /// book and sleep budget.
     pub(crate) fn get(&self, path: impl Into<String>, target: RouteTarget) -> Call {
         Call::get(path, self.route(target))
             .probe_404(!self.no_probe)
             .retry(self.retry)
+            .rate_book(self.rate_book)
+            .sleep_budget(self.sleep_budget)
     }
 
     /// The same routing with `access`.

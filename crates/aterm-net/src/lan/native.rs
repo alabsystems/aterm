@@ -319,14 +319,16 @@ impl Socket {
     fn of_kind(domain: i32, kind: i32, protocol: i32) -> io::Result<Self> {
         #[cfg(target_os = "linux")]
         let kind = kind | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK;
-        // SAFETY: socket has no pointer arguments; a successful fd is owned below.
-        let raw = unsafe { libc::socket(domain, kind, protocol) };
-        if raw < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: this is the fresh, uniquely owned successful socket descriptor.
-        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-        aterm_uds::keep_out_of_children(&fd)?;
+        let fd = aterm_uds::kept_out(|| {
+            // SAFETY: socket has no pointer arguments; a successful fd is owned below.
+            let raw = unsafe { libc::socket(domain, kind, protocol) };
+            if raw < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: this is the fresh, uniquely owned successful socket descriptor.
+            Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+        })?;
+        let raw = fd.as_raw_fd();
         // SAFETY: both fcntl getters take no extra argument on this live fd.
         let status = unsafe { libc::fcntl(raw, libc::F_GETFL) };
         // SAFETY: as above.

@@ -1396,10 +1396,14 @@ impl<'a> PlistScanner<'a> {
             },
             ("real" | "integer", TagKind::Open) => {
                 let text = self.text_until_close(name)?;
-                Ok(text
-                    .trim()
-                    .parse::<f64>()
-                    .map_or(PlistValue::Other, PlistValue::Number))
+                let trimmed = text.trim();
+                Ok(if trimmed.starts_with('+') {
+                    PlistValue::Other
+                } else {
+                    trimmed
+                        .parse::<f64>()
+                        .map_or(PlistValue::Other, PlistValue::Number)
+                })
             }
             ("string", TagKind::Open) => Ok(PlistValue::Text(self.text_until_close("string")?)),
             ("string", TagKind::Empty) => Ok(PlistValue::Text(String::new())),
@@ -1453,8 +1457,14 @@ fn decode_entities(text: &str) -> String {
             "apos" => Some('\''),
             _ => entity
                 .strip_prefix("#x")
+                .filter(|hex| !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()))
                 .map(|hex| u32::from_str_radix(hex, 16))
-                .or_else(|| entity.strip_prefix('#').map(str::parse::<u32>))
+                .or_else(|| {
+                    entity
+                        .strip_prefix('#')
+                        .filter(|dec| !dec.is_empty() && dec.bytes().all(|b| b.is_ascii_digit()))
+                        .map(str::parse::<u32>)
+                })
                 .and_then(Result::ok)
                 .and_then(char::from_u32),
         };
@@ -1720,7 +1730,12 @@ fn archived_components(
         .ok()?
         .trim_end_matches('\0')
         .split_ascii_whitespace()
-        .map(|component| component.parse::<f64>().ok().filter(|n| n.is_finite()));
+        .map(|component| {
+            (!component.starts_with('+'))
+                .then(|| component.parse::<f64>().ok())
+                .flatten()
+                .filter(|n| n.is_finite())
+        });
     let mut next = || components.next().flatten();
     let read = if rgb {
         [next()?, next()?, next()?]
@@ -2187,6 +2202,7 @@ impl JsonReader<'_> {
                         b't' => out.push('\t'),
                         b'u' => {
                             let high = self.hex4()?;
+                            let save = self.pos;
                             let code = if (0xD800..0xDC00).contains(&high)
                                 && self
                                     .text
@@ -2195,9 +2211,12 @@ impl JsonReader<'_> {
                             {
                                 self.pos = self.pos.saturating_add(2);
                                 let low = self.hex4()?;
-                                0x10000
-                                    + ((high - 0xD800) << 10)
-                                    + (low.wrapping_sub(0xDC00) & 0x3FF)
+                                if (0xDC00..0xE000).contains(&low) {
+                                    0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00)
+                                } else {
+                                    self.pos = save;
+                                    high
+                                }
                             } else {
                                 high
                             };
@@ -2217,6 +2236,9 @@ impl JsonReader<'_> {
             .text
             .get(self.pos..self.pos.saturating_add(4))
             .ok_or_else(|| self.error("short \\u escape"))?;
+        if !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(self.error("bad \\u escape"));
+        }
         let value = u32::from_str_radix(digits, 16).map_err(|_| self.error("bad \\u escape"))?;
         self.pos = self.pos.saturating_add(4);
         Ok(value)
@@ -2421,7 +2443,7 @@ fn looks_like_base16(text: &str) -> bool {
 
 fn base_index(key: &str) -> Option<usize> {
     let digits = key.strip_prefix("base")?;
-    if digits.len() != 2 {
+    if digits.len() != 2 || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     let index = usize::from_str_radix(digits, 16).ok()?;
@@ -3559,6 +3581,13 @@ mod tests {
         assert!(first.notes.iter().any(|n| n.contains("2 schemes")));
         let second = convert(ImportFormat::WindowsTerminal, &text, Some("second é")).unwrap();
         assert_eq!(second.scheme.name, "Second é");
+        let unpaired = windows_terminal_scheme("Pair \\uD800\\u0041 \\uD800\\uD83D\\uDE00");
+        let unpaired = convert(ImportFormat::WindowsTerminal, &unpaired, None).unwrap();
+        assert_eq!(unpaired.scheme.name, "Pair \u{fffd}A \u{fffd}😀");
+        assert_eq!(
+            decode_entities("&#x41;&#65;&#x+41;&#+65;"),
+            "AA&#x+41;&#+65;"
+        );
     }
 
     #[test]
@@ -3645,7 +3674,11 @@ mod tests {
                 "<plist><dict><key>Foreground Color</key><dict><key>Red Component</key><real>1</real><key>Green Component</key><real>1</real><key>Blue Component</key><real>1</real></dict><key>Background Color</key><dict><key>Red Component</key><real>0</real><key>Green Component</key><real>0</real><key>Blue Component</key><real>0</real></dict>",
                 "<key>frobnicate</key><integer>1</integer>",
             ),
-            (ImportFormat::Base16, "", "frobnicate: 1\n"),
+            (
+                ImportFormat::Base16,
+                "",
+                "base+0: \"#112233\"\nfrobnicate: 1\n",
+            ),
         ];
         let base16_body: String = BASE_NAMES
             .iter()
@@ -3667,7 +3700,7 @@ mod tests {
             assert!(clean.dropped.is_empty(), "{format:?}: {:?}", clean.dropped);
             let with = convert(format, &format!("{body}{extra}{close}"), None).unwrap();
             assert!(
-                with.dropped.len() == 1 && with.dropped[0].ends_with("frobnicate"),
+                with.dropped.iter().any(|k| k.ends_with("frobnicate")),
                 "{format:?}: {:?}",
                 with.dropped
             );
@@ -3758,6 +3791,10 @@ mod tests {
             (
                 ImportFormat::WindowsTerminal,
                 "{\n\"background\": \"#000\",\n\"x\": }",
+            ),
+            (
+                ImportFormat::WindowsTerminal,
+                "{\n\"name\": \"\\u+041\",\n\"background\": \"#000\"}",
             ),
             (
                 ImportFormat::ITerm,

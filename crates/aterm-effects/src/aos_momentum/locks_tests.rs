@@ -320,11 +320,14 @@ fn aos_locks_are_present() {
             if !below.to_string_lossy().starts_with(prefix) {
                 continue;
             }
+            // `/`-joined on every host, as the census spells it.
             let file = path
                 .strip_prefix(crates)
                 .expect("under crates/")
-                .to_string_lossy()
-                .into_owned();
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
             let src = std::fs::read_to_string(&path).expect("a readable source");
             for (code, line) in blocks(&src) {
                 assert!(

@@ -2145,17 +2145,34 @@ struct GlassBed {
     seen: [f32; BED_INK_LUT_LEN],
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A negative control's seam: the flat spelling lights the glass as the comet does, as it
+    /// did from §15.2 1.5 until composed O11(a) ([`glass_table`]).
+    static FLAT_GLASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// The glass129 the bed draws a frame by (`glass_lit`, §15.0.4, §15.2 1.5): on a light frame
-/// whose light draws glass, the tall spelling, a page whose palette `palettes` holds solved (the
-/// frame advances a pending solve by its counted units) and which has headroom. A dark frame, the
-/// flat spelling and a light below the glass level never ask the cache, so no solve unit runs
-/// there.
+/// whose light draws glass, the tall comet spelling, a page whose palette `palettes` holds solved
+/// (the frame advances a pending solve by its counted units) and which has headroom. A dark
+/// frame, the underline and flat spellings and a light below the glass level never ask the
+/// cache, so no solve unit runs there.
+///
+/// The flat spelling keeps main's paper bed, its soft even band (looks9 Q6), as the underline
+/// spelling does (composed O11(a)): under the glass it laid the comet's own body at the comet's
+/// height and colours, its taper the only difference (§15.2 1.7: 0.96 ch against 0.86 ch twelve
+/// cells back), and on GitHub Light 969 px of the ribbon's box told the two apart where looks10's
+/// paper told 7684.
 #[inline]
 fn glass_table<'p>(
     cfg: &Config,
     palettes: &'p mut PaletteCache,
 ) -> Option<&'p [u32; BED_INK_LUT_LEN]> {
-    if !cfg.light.glass() || !cfg.ribbon_tall || cfg.dark_theme {
+    #[cfg(test)]
+    let flat = cfg.ribbon_flat && !FLAT_GLASS.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    let flat = cfg.ribbon_flat;
+    if !cfg.light.glass() || !cfg.ribbon_tall || flat || cfg.dark_theme {
         return None;
     }
     palettes
@@ -3648,8 +3665,9 @@ impl Ribbon {
             } else {
                 PHRASE_REST_MIN_S
             };
-            let restart = now
-                .checked_sub(std::time::Duration::from_secs_f32(lead_s))
+            let restart = std::time::Duration::try_from_secs_f32(lead_s)
+                .ok()
+                .and_then(|d| now.checked_sub(d))
                 .unwrap_or(now);
             coh.alive_at = restart;
             if coh.flow.is_some() {
@@ -5458,8 +5476,9 @@ impl Ribbon {
             if coh.abandoned {
                 continue;
             }
-            let Some(rewound) =
-                at.checked_sub(std::time::Duration::from_secs_f32(coh.retract_start()))
+            let Some(rewound) = std::time::Duration::try_from_secs_f32(coh.retract_start())
+                .ok()
+                .and_then(|d| at.checked_sub(d))
             else {
                 continue;
             };
@@ -5652,7 +5671,7 @@ impl Ribbon {
         self.cells.push(cell);
         let coh = &mut self.cohorts[idx];
         coh.col0 = coh.col0.min(col);
-        coh.col1 = coh.col1.max(col + 1);
+        coh.col1 = coh.col1.max(col.saturating_add(1));
         if typing {
             coh.wake = false;
             if coh.flow.take().is_some() {
@@ -5723,10 +5742,9 @@ impl Ribbon {
         loop {
             let col = if leftward { to + k } else { to - k };
             let j = span - k;
-            let born_new = at
-                .checked_add(std::time::Duration::from_secs_f32(
-                    flight_s * f32::from(j) / n,
-                ))
+            let born_new = std::time::Duration::try_from_secs_f32(flight_s * f32::from(j) / n)
+                .ok()
+                .and_then(|d| at.checked_add(d))
                 .unwrap_or(at);
             let (over, base_cov, base_leaving) = self.corridor_column(ctx, row, col, at);
             let over_live = if let Some(i) = over {
@@ -6238,7 +6256,7 @@ impl Ribbon {
     #[inline]
     fn retract_span(&mut self, row: u16, col: u16, min_cells: u16, at: Instant, span_s: f32) {
         let last = col.saturating_add(min_cells.max(1) - 1);
-        let n = f32::from(last - col + 1);
+        let n = f32::from(last - col) + 1.0;
         let step = span_s / n;
         let mut i = 0;
         while i < self.cells.len() {
@@ -6248,7 +6266,9 @@ impl Ribbon {
                 continue;
             }
             let rank = f32::from(last - cell.col);
-            cell.retract_at = at.checked_add(std::time::Duration::from_secs_f32(rank * step));
+            cell.retract_at = std::time::Duration::try_from_secs_f32(rank * step)
+                .ok()
+                .and_then(|d| at.checked_add(d));
         }
     }
 
@@ -6301,7 +6321,7 @@ impl Ribbon {
         } else {
             at
         };
-        let n = f32::from(last - col + 1);
+        let n = f32::from(last - col) + 1.0;
         let step = span_s / n;
         let mut k = 0;
         while k < self.cells.len() {
@@ -6316,7 +6336,9 @@ impl Ribbon {
                 continue;
             }
             let rank = f32::from(last - cell.col);
-            let mut retract_at = at.checked_add(std::time::Duration::from_secs_f32(rank * step));
+            let mut retract_at = std::time::Duration::try_from_secs_f32(rank * step)
+                .ok()
+                .and_then(|d| at.checked_add(d));
             if let Some(t) = &mut retract_at
                 && *t < base_at
             {
@@ -6345,8 +6367,9 @@ impl Ribbon {
             if !coh.abandoned {
                 coh.rejoinable = rejoinable;
             }
-            let Some(rewound) =
-                at.checked_sub(std::time::Duration::from_secs_f32(coh.retract_start()))
+            let Some(rewound) = std::time::Duration::try_from_secs_f32(coh.retract_start())
+                .ok()
+                .and_then(|d| at.checked_sub(d))
             else {
                 continue;
             };
@@ -8655,7 +8678,10 @@ impl Ribbon {
             && let Some((px, p)) = prev
             && let Some(af) = self.attach_floor
         {
-            let x = px + cw;
+            // Under a block the band crosses the whole cell the caret covers; behind a bar
+            // (`head_dx` 0.08) it ends just past the bar, twice the insertion point across, and
+            // lays no coloured block beside it (composed r1's judges; O4(c)).
+            let x = px + cw * (2.0 * ctx.cfg.head_dx);
             let mut j = 1;
             while j <= slabs {
                 let f = j as f32 * inv_slabs;
@@ -10874,6 +10900,7 @@ mod tests {
             theme_bg: if dark { DEFAULT_BG } else { 0x00FF_FFFF },
             reduced_motion: false,
             light: crate::cursor_glow::Light::OFF,
+            head_dx: 0.5,
         }
     }
 
@@ -11325,9 +11352,11 @@ mod tests {
     /// The glass twin of [`the_paper_bed_keeps_every_stop_its_hue_and_every_letter_its_bar`]
     /// (Prism Glass §15.2 1.5): on every paper page whose shipped palette has headroom, the bed a
     /// glass frame syncs draws its palette's glass129 at every entry and main's sampler between
-    /// them, and every entry composited over the page at every alpha keeps the theme fg at the
-    /// glass bar; what of each the page shows is the glass's own, and main's table beside it is
-    /// main's. A lip-forward page (Solarized Light, Catppuccin Latte) draws main's paper bed.
+    /// them, and every entry composited over the page at every alpha keeps the theme fg's glyph,
+    /// as it is seen (`prism_glass::colour::seen`), at the glass bar; what of each the page shows
+    /// is the glass's own, and main's table beside it is
+    /// main's. A lip-forward page (Gruvbox Light, Solarized Light, Catppuccin Latte) draws main's
+    /// paper bed.
     #[test]
     fn the_glass_bed_keeps_every_entry_its_glass_and_every_letter_its_bar() {
         use crate::rainbow_kitty::prism_glass::{Palette, colour, glass_bar};
@@ -11379,7 +11408,7 @@ mod tests {
                 );
                 for cov in 1..=255u8 {
                     let lit = over_premul(bg, premul_rgb(glass, cov), cov);
-                    let c = colour::contrast(fg, lit);
+                    let c = colour::seen(fg, bg, lit);
                     assert!(
                         c >= bar,
                         "#{fg:06X} on #{bg:06X}: glass #{glass:06X} at cov {cov} composites #{lit:06X}, {c:.3}:1 under {bar:.3}:1"
@@ -11407,7 +11436,7 @@ mod tests {
                 "control: #{bg:06X}'s glass is not its paper bed"
             );
         }
-        assert_eq!((glass_pages, forward), (4, 2), "the pages swept");
+        assert_eq!((glass_pages, forward), (3, 3), "the pages swept");
     }
 
     /// Prism Glass's bed pin (§15.2 1.5, §15.0.3): on every dark ground (each built-in and pack
@@ -11526,14 +11555,15 @@ mod tests {
         assert_eq!(take_solves(), 0, "a shipped page runs no unit");
     }
 
-    /// The glass needs the tall spelling and a page with headroom (§15.0.4): the underline
-    /// spelling of a glass page, and a lip-forward page, draw main's paper bed under any light;
-    /// the tall spellings of a glass page, the flat one among them, light the glass.
+    /// The glass needs the tall comet spelling and a page with headroom (§15.0.4): the underline
+    /// and flat spellings of a glass page (composed O11(a)), and a lip-forward page, draw main's
+    /// paper bed under any light; the tall comet spelling of a glass page lights the glass.
     #[test]
     fn the_glass_lights_only_the_tall_spelling_of_a_page_with_headroom() {
         let (fg, bg) = (0x002B_2D33, 0x00F6_F7F9);
         for (what, c) in [
             ("the underline spelling", cfg(false, false)),
+            ("the flat spelling", flat(false, true)),
             ("Solarized Light", cfg(false, true)),
             ("Catppuccin Latte", cfg(false, true)),
         ] {
@@ -11558,21 +11588,23 @@ mod tests {
                 assert_eq!(bed.at(t), main.at(t), "{what} at {t}");
             }
         }
-        for (what, c) in [
-            ("the tall", cfg(false, true)),
-            ("the flat", flat(false, true)),
-        ] {
-            let lit = Config {
-                theme_fg: fg,
-                theme_bg: bg,
-                light: Light::at(Live::Vanish),
-                ..c
-            };
-            assert!(
-                BedInkLut::synced(&lit).glass_lit(),
-                "{what} spelling lights the glass"
-            );
-        }
+        let lit = |c: Config| Config {
+            theme_fg: fg,
+            theme_bg: bg,
+            light: Light::at(Live::Vanish),
+            ..c
+        };
+        assert!(
+            BedInkLut::synced(&lit(cfg(false, true))).glass_lit(),
+            "the tall spelling lights the glass"
+        );
+        FLAT_GLASS.with(|on| on.set(true));
+        let flat_lit = BedInkLut::synced(&lit(flat(false, true))).glass_lit();
+        FLAT_GLASS.with(|on| on.set(false));
+        assert!(
+            flat_lit,
+            "control: with its seam set back the flat spelling lights the glass"
+        );
     }
 
     /// A light page whose palette does not ship draws main's paper bed while its solve runs, at
@@ -11670,6 +11702,95 @@ mod tests {
         (rib, sink.under, now)
     }
 
+    /// ON A GLASS PAGE THE FLAT RIBBON READS APART FROM THE PET'S (composed O11(a), identity r3's
+    /// must_fix): under the glass the flat spelling laid the comet's body at the comet's height
+    /// and in its colours, its taper the only difference, and on GitHub Light 969 px of the
+    /// ribbon's box told the pet's and the flat ribbon apart where looks10's paper told 7684. It
+    /// keeps main's paper bed there, its soft even band (looks9 Q6), as the underline spelling
+    /// does. Typing one run on Default Light at the glass level, each laid on the page: the
+    /// pixels whose deepest channel lies more than 24 levels apart between the pet's ribbon and
+    /// the flat one are at least half of the pet's lit pixels (those more than 24 levels off the
+    /// page) in the run's box, from two rows above its row's bottom to half a row below it.
+    /// Read here: 2087 px apart against the pet's 1677 lit. Negative control (`FLAT_GLASS`: the
+    /// flat spelling lights the glass, as before): under three tenths (read: 330).
+    #[test]
+    fn on_a_glass_page_the_flat_ribbon_reads_apart_from_the_pet_s() {
+        use aterm_render::{add_sat, glow_lerp, glow_lerp_rgb};
+        let (g, t0) = (geom(), Instant::now());
+        let (cw, ch) = (g.cw as i32, g.ch as i32);
+        let page = glass_cfg(cfg(false, true)).theme_bg;
+        let laid = |c: Config| {
+            let (rib, under, _) = typed_frame(&glass_cfg(c), t0);
+            (rib.ink.glass_lit(), under)
+        };
+        // `under` laid on the page at `(x, y)`, each quad's colour and alpha lerped across it.
+        let on_page = |under: &[GlowQuad], x: i32, y: i32| -> u32 {
+            under
+                .iter()
+                .filter(|q| {
+                    let (qx, qy) = (i32::from(q.x), i32::from(q.y));
+                    q.w > 0
+                        && (qx..qx + i32::from(q.w)).contains(&x)
+                        && (qy..qy + i32::from(q.h).max(1)).contains(&y)
+                })
+                .fold(page, |acc, q| {
+                    let (i, w) = ((x - i32::from(q.x)) as u32, u32::from(q.w));
+                    let color = glow_lerp_rgb(q.color, q.color2, i, w);
+                    if q.alpha == 0 && q.alpha2 == 0 {
+                        add_sat(acc, color)
+                    } else {
+                        let alpha = glow_lerp(u32::from(q.alpha), u32::from(q.alpha2), i, w);
+                        over_premul(acc, color, alpha.min(255) as u8)
+                    }
+                })
+        };
+        let deepest = |a: u32, b: u32| {
+            [16u32, 8, 0]
+                .map(|sh| ((a >> sh) & 0xff).abs_diff((b >> sh) & 0xff))
+                .into_iter()
+                .max()
+                .unwrap_or(0)
+        };
+        // The pet's lit pixels in the run's box, and those the flat ribbon lays apart from it.
+        let apart = |pet: &[GlowQuad], flat: &[GlowQuad]| {
+            let (mut lit, mut apart) = (0usize, 0usize);
+            for y in ROW2_BOTTOM - 2 * ch..ROW2_BOTTOM + ch / 2 {
+                for x in i32::from(g.origin_x) + 10 * cw..i32::from(g.origin_x) + 23 * cw {
+                    let (p, f) = (on_page(pet, x, y), on_page(flat, x, y));
+                    lit += usize::from(deepest(p, page) > 24);
+                    apart += usize::from(deepest(p, f) > 24);
+                }
+            }
+            (apart, lit)
+        };
+        let (pet_glass, pet) = laid(cfg(false, true));
+        let (flat_glass, band) = laid(flat(false, true));
+        assert!(
+            pet_glass && !flat_glass,
+            "fixture: the pet lights the glass and the flat spelling keeps main's paper"
+        );
+        let (read_apart, lit) = apart(&pet, &band);
+        assert!(lit > 0, "fixture: the pet's glass lights the run");
+        assert!(
+            2 * read_apart >= lit,
+            "the flat ribbon lays {read_apart} px apart from the pet's {lit} lit px"
+        );
+        FLAT_GLASS.with(|on| on.set(true));
+        let (old_glass, glassy) = laid(flat(false, true));
+        FLAT_GLASS.with(|on| on.set(false));
+        assert!(
+            old_glass,
+            "control fixture: the seam lights the flat spelling's glass"
+        );
+        let (alike, _) = apart(&pet, &glassy);
+        eprintln!("flat apart {read_apart} of the pet's {lit} lit px; under the glass {alike}");
+        assert!(
+            10 * alike < 3 * lit,
+            "negative control: under the glass the flat ribbon lays {alike} px apart from the \
+             pet's {lit} lit px"
+        );
+    }
+
     /// A glass frame (§15.2 1.5, 1.7) lays the glass in the glass's ink, standing on its row's
     /// bottom with nothing below it where main's paper body reaches below the row, and says so
     /// ([`Ribbon::glass_drew_at`], Prism Glass's `glass` arm). Its plan keeps main's geometry, so
@@ -11713,10 +11834,10 @@ mod tests {
             "the glass lays its whole opacity, {opaque} or more"
         );
         for ink in whole {
-            let c = colour::contrast(lit.theme_fg, ink);
+            let c = colour::seen(lit.theme_fg, lit.theme_bg, ink);
             assert!(
                 c >= bar,
-                "the glass's #{ink:06X} keeps the letters {c:.3}:1, under {bar:.3}:1"
+                "the glass's #{ink:06X} keeps the letters, as seen, {c:.3}:1, under {bar:.3}:1"
             );
         }
         assert!(rib.glass_planned() && !main_rib.glass_planned());
@@ -12105,16 +12226,13 @@ mod tests {
     }
 
     /// No rail under glass (§15.2 1.7, the declared interim until the lip): a glass frame lays
-    /// no rail span and nothing on or below its row's bottom, on the comet and the flat
-    /// spellings, with the row below free and with the row held. The negative control is main's
-    /// paper comet, whose rail lies below the row.
+    /// no rail span and nothing on or below its row's bottom, on the comet spelling (the flat
+    /// one keeps main's paper bed, composed O11(a)), with the row below free and with the row
+    /// held. The negative control is main's paper comet, whose rail lies below the row.
     #[test]
     fn no_rail_quad_under_glass() {
         let t0 = Instant::now();
-        for (what, c) in [
-            ("the comet", cfg(false, true)),
-            ("the flat spelling", flat(false, true)),
-        ] {
+        for (what, c) in [("the comet", cfg(false, true))] {
             for held in [false, true] {
                 let lit = glass_cfg(c);
                 let mut rib = Ribbon::new();

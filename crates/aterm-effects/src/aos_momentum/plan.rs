@@ -407,11 +407,12 @@ impl SchedulePlan {
     /// Whether a changed hot frame settles at once under this plan's split.
     #[inline]
     fn settles_at_step(&self, v: &PlanView) -> bool {
-        match (self.split, v.gap()) {
-            (Split::SettleAtStep { gap_us }, Some(gap)) => {
-                gap >= Duration::from_micros(u64::from(gap_us))
-            }
-            _ => false,
+        match self.split {
+            Split::Shipped => false,
+            Split::SettleAtStep { gap_us } => match v.gap() {
+                Some(gap) => gap.as_nanos() >= Duration::from_micros(gap_us as u64).as_nanos(),
+                None => false,
+            },
         }
     }
 
@@ -427,6 +428,26 @@ impl SchedulePlan {
     #[must_use]
     pub(crate) fn settling(&self, v: &PlanView) -> bool {
         v.hot && !self.is_active(v)
+    }
+
+    /// Frame cadence directly from [`MomentumGlow`], avoiding [`PlanView::of`]'s logarithm calls when `Split::Shipped` or unchanged/cold.
+    #[inline]
+    #[must_use]
+    pub(crate) fn is_glow_active(&self, glow: &MomentumGlow) -> bool {
+        if !glow.hot() || !glow.changed() {
+            return false;
+        }
+        match self.split {
+            Split::Shipped => true,
+            Split::SettleAtStep { .. } => !self.settles_at_step(&PlanView::of(glow)),
+        }
+    }
+
+    /// `hot ∧ ¬active` directly from [`MomentumGlow`], avoiding [`PlanView::of`]'s logarithm calls when `Split::Shipped` or unchanged/cold.
+    #[inline]
+    #[must_use]
+    pub(crate) fn is_glow_settling(&self, glow: &MomentumGlow) -> bool {
+        glow.hot() && !self.is_glow_active(glow)
     }
 
     /// The wake this plan names.
@@ -494,12 +515,19 @@ impl PlanView {
     #[inline]
     #[must_use]
     pub(crate) fn of(glow: &MomentumGlow) -> PlanView {
+        let hot = glow.hot();
+        let (cold_at, forecast) = if hot {
+            let cold = glow.cold_at();
+            (cold, glow.settle_forecast_with_cold(cold))
+        } else {
+            (None, None)
+        };
         PlanView {
-            hot: glow.hot(),
+            hot,
             changed: glow.changed(),
-            forecast: glow.settle_forecast(),
+            forecast,
             stamp: glow.stamp(),
-            cold_at: glow.cold_at(),
+            cold_at,
         }
     }
 
@@ -526,7 +554,10 @@ impl PlanView {
     /// The forecast's gap from the stamp (`None` without a forecast).
     #[inline]
     fn gap(&self) -> Option<Duration> {
-        self.forecast?.checked_duration_since(self.stamp?)
+        match (self.forecast, self.stamp) {
+            (Some(forecast), Some(stamp)) => forecast.checked_duration_since(stamp),
+            _ => None,
+        }
     }
 
     #[inline]

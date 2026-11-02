@@ -591,18 +591,32 @@ impl Grid {
         let end_col = right.saturating_add(1);
 
         let scrub_extras = !self.storage.extras.is_empty();
+        let scrub_complex = self.storage.extras.has_complex_ring();
         let mut wiped_cols: Vec<u16> = Vec::new();
         for row_idx in top..=bottom {
             wiped_cols.clear();
             if let Some(row) = self.row_mut(row_idx) {
                 row.selective_wipe_range(left, end_col, &mut wiped_cols);
             }
+            if scrub_complex {
+                for &col in &wiped_cols {
+                    self.storage.extras.clear_complex_ring_cell(row_idx, col, 1);
+                }
+            }
+            let mut removed_any = false;
             if scrub_extras {
                 for &col in &wiped_cols {
                     if self.storage.extras.scrub_char_marks(row_idx, col) {
-                        self.remove_cell_extra(row_idx, col);
+                        removed_any |= self.remove_cell_extra(row_idx, col);
                     }
                 }
+            }
+            if removed_any
+                && let Some(row) = self.row_mut(row_idx)
+                && let Some(last) = row.len().checked_sub(1)
+                && row.get(last).is_some_and(super::Cell::is_empty)
+            {
+                row.recompute_len();
             }
             self.storage.mark_content_row(row_idx);
         }
@@ -753,11 +767,10 @@ impl Grid {
             return;
         }
 
-        let rect_height = src_bottom - src_top + 1;
-        let rect_width = src_right - src_left + 1;
-
         let dst_top = dst_top.min(max_row);
         let dst_left = dst_left.min(max_col);
+        let rect_height = (src_bottom - src_top + 1).min(max_row - dst_top + 1);
+        let rect_width = (src_right - src_left + 1).min(max_col - dst_left + 1);
 
         let mut buf: Vec<Vec<super::Cell>> = Vec::with_capacity(rect_height as usize);
         for row_offset in 0..rect_height {
@@ -796,7 +809,12 @@ impl Grid {
                     row: src_row,
                     col: src_col,
                 };
-                if let Some(extra) = self.storage.extras.get(coord) {
+                if (cell.has_extras()
+                    || cell.is_complex()
+                    || cell.fg_needs_overflow()
+                    || cell.bg_needs_overflow())
+                    && let Some(extra) = self.storage.extras.get(coord)
+                {
                     extras_buf.push((row_offset, col_offset, extra.clone()));
                 }
                 let fg = if cell.fg_needs_overflow() {
@@ -1561,6 +1579,31 @@ mod tests {
             grid.extras().get(crate::CellCoord::new(0, 4)).is_none(),
             "empty extra entry must be dropped"
         );
+        assert_eq!(
+            grid.row_len(0),
+            Some(0),
+            "wiping the last default-coloured marked cell must shrink row.len to 0"
+        );
+        assert_eq!(grid.row_text(0).as_deref(), Some(""));
+
+        let rows = grid.rows();
+        let cols = grid.cols();
+        let mut complex_cell = crate::Cell::EMPTY;
+        complex_cell.set_flags(CellFlags::COMPLEX);
+        if let Some(r) = grid.row_mut(1) {
+            r.set(2, complex_cell);
+            r.update_len(3);
+        }
+        grid.extras_mut()
+            .set_complex_char_ring(1, 2, '\u{1F600}', rows, cols);
+        assert_eq!(grid.complex_char_at(1, 2), Some('\u{1F600}'));
+        grid.selective_erase_rect(1, 2, 1, 2);
+        assert_eq!(
+            grid.complex_char_at(1, 2),
+            None,
+            "DECSERA must clear wiped complex_ring codepoints"
+        );
+        assert_eq!(grid.row_len(1), Some(0));
     }
 
     #[test]
@@ -1813,6 +1856,31 @@ mod tests {
             'X',
             "the in-range cell copies normally"
         );
+        grid.assert_invariants();
+
+        // Destination right-edge clipping of a wide pair must blank the split lead cell.
+        grid.copy_rect(0, 0, 0, 2, 1, 9);
+        assert!(
+            is_empty_at(&grid, 1, 9),
+            "wide pair cut by destination right edge must be blanked"
+        );
+        grid.assert_invariants();
+
+        // Boundary-blanked wide continuation must not copy overflow CellExtra RGB into Cell::EMPTY.
+        if let Some(r) = grid.row_mut(0) {
+            r.get_mut(1).unwrap().set_has_extras(true);
+        }
+        grid.extras_mut()
+            .get_or_create(crate::CellCoord::new(0, 1))
+            .set_bg_rgb(Some([11, 22, 33]));
+        grid.copy_rect(0, 1, 0, 2, 2, 4);
+        assert!(is_empty_at(&grid, 2, 4));
+        assert_eq!(
+            grid.bg_rgb_at(2, 4),
+            None,
+            "blanked boundary cell must not retain source overflow RGB"
+        );
+        grid.assert_invariants();
     }
 
     #[test]
@@ -2304,6 +2372,41 @@ mod tests {
             None,
             "stale dst complex codepoint must be cleared by copy_rect"
         );
+
+        // DECSEL and wide-orphan fixup in fill_rect must also scrub complex_ring.
+        if let Some(r) = grid.row_mut(1) {
+            r.set(3, complex_cell);
+            r.update_len(4);
+        }
+        grid.extras_mut()
+            .set_complex_char_ring(1, 3, '\u{1F680}', rows, cols);
+        grid.move_cursor_to(1, 0);
+        grid.selective_erase_line();
+        assert_eq!(
+            grid.complex_char_at(1, 3),
+            None,
+            "DECSEL must scrub complex_ring on wiped cells"
+        );
+
+        let mut wide_complex = Cell::EMPTY;
+        wide_complex.set_flags(CellFlags::WIDE | CellFlags::COMPLEX);
+        let mut wide_cont = Cell::EMPTY;
+        wide_cont.set_flags(CellFlags::WIDE_CONTINUATION);
+        if let Some(r) = grid.row_mut(3) {
+            r.set(0, wide_complex);
+            r.set(1, wide_cont);
+            r.update_len(2);
+        }
+        grid.extras_mut()
+            .set_complex_char_ring(3, 0, '\u{1F60E}', rows, cols);
+        grid.fill_rect(Cell::new('Z'), 3, 1, 3, 2, None, None);
+        assert!(is_empty_at(&grid, 3, 0));
+        assert_eq!(
+            grid.complex_char_at(3, 0),
+            None,
+            "orphaned wide lead cleared by fill_rect must lose its complex_ring entry"
+        );
+        grid.assert_invariants();
     }
 
     /// Set a row's DEC line attribute the way `ESC#3` / `ESC#4` / `ESC#6` does:

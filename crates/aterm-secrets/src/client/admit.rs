@@ -77,7 +77,7 @@ pub struct LogAdmission {
 /// whichever audience holds `aterm-swarm-policy`), and the labels it only counts toward "one above
 /// the highest" (each `m<N>` a fleet-accounts sheet names, as the approver's `next_free_number`
 /// counts them).
-fn labels_taken(
+pub(super) fn labels_taken(
     by_audience: &BTreeMap<Audience, BTreeMap<String, Entry>>,
 ) -> (BTreeSet<String>, BTreeSet<String>) {
     let mut taken =
@@ -98,9 +98,18 @@ fn labels_taken(
         {
             for member in &roster.members {
                 taken.insert(member.label.clone());
+                taken.extend(canonical(&member.label));
                 taken.extend(member.aliases.iter().cloned());
-                taken.extend(member.claimed_label.iter().cloned());
-                taken.extend(canonical(&member.vault_name));
+                taken.extend(member.aliases.iter().filter_map(|a| canonical(a)));
+                if !roster.is_member_denied(member) {
+                    if let Some(claim) = member.claimed_label.as_deref().filter(|c| {
+                        crate::swarm_roster::leading_m_label(c)
+                            .is_some_and(|(_, canon)| canon == *c)
+                    }) {
+                        taken.insert(claim.to_owned());
+                    }
+                    taken.extend(canonical(&member.vault_name));
+                }
             }
             taken.extend(roster.deny_labels.iter().filter_map(|raw| canonical(raw)));
         } else if entry.name == crate::SWARM_POLICY_ENTRY
@@ -152,10 +161,20 @@ pub(super) fn kept_out_with_node(
     let recipient = binding.recipient();
     let membership = log.membership();
     let removal = removal_naming(log, binding);
-    if removal.is_some() || log.recipient_is_removed(&recipient) || node_removed(log, node) {
+    let node_rem = match (
+        node_removal(log, node),
+        node_removal(log, *binding.writer()),
+    ) {
+        (Some(a), Some(b)) => Some(a || b),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+    if removal.is_some() || log.recipient_is_removed(&recipient) || node_rem.is_some() {
         let quorum = removal == Some(true)
+            || node_rem == Some(true)
             || super::remove::notes_of(log)
-                .of(&recipient, binding.writer())
+                .of_with_node(&recipient, binding.writer(), &node)
                 .is_some_and(|note| note.quorum);
         if quorum {
             return Some(
@@ -164,19 +183,40 @@ pub(super) fn kept_out_with_node(
                     .to_owned(),
             );
         }
-        if restore {
-            // "Allow again" (F16): a person restores what one member's removal took out.
-            return None;
+        if !restore {
+            return Some(
+                "the vault removed this Mac: \"Allow again\" restores it, a plain Allow does not"
+                    .to_owned(),
+            );
         }
-        return Some(
-            "the vault removed this Mac: \"Allow again\" restores it, a plain Allow does not"
-                .to_owned(),
-        );
+        // "Allow again" (F16): a person restores what one member's removal took out, unless
+        // the presented key is already bound to a different active (non-removed) seat.
+        return membership
+            .members()
+            .iter()
+            .any(|(actor, m)| {
+                !log.recipient_is_removed(&m.binding.recipient())
+                    && !m.node_key.is_some_and(|nk| node_removal(log, nk).is_some())
+                    && (((*actor == member || m.binding.recipient() == recipient)
+                        && m.binding != *binding)
+                        || (node != [0; 32]
+                            && m.node_key == Some(node)
+                            && (*actor != member || m.binding != *binding)))
+            })
+            .then(|| {
+                "this Mac's key is already bound to a different seat in the membership log"
+                    .to_owned()
+            });
     }
+    let active_node_holder = node != [0; 32]
+        && membership.members().iter().any(|(actor, m)| {
+            m.node_key == Some(node)
+                && !log.audience_left_out(&EpochAudience::Everyone, actor)
+                && !log.recipient_is_removed(&m.binding.recipient())
+                && node_removal(log, node).is_none()
+        });
     if membership.members().iter().any(|(actor, m)| {
-        (*actor == member
-            || m.binding.recipient() == recipient
-            || (node != [0; 32] && m.node_key == Some(node)))
+        (*actor == member || (!active_node_holder && node != [0; 32] && m.node_key == Some(node)))
             && log.audience_left_out(&EpochAudience::Everyone, actor)
     }) || log.audience_left_out_recipient(&EpochAudience::Everyone, &recipient)
     {
@@ -190,10 +230,14 @@ pub(super) fn kept_out_with_node(
         .members()
         .iter()
         .any(|(actor, m)| {
-            ((*actor == member || m.binding.recipient() == recipient) && m.binding != *binding)
-                || (node != [0; 32]
-                    && m.node_key == Some(node)
-                    && (*actor != member || m.binding != *binding))
+            !log.recipient_is_removed(&m.binding.recipient())
+                && !m.node_key.is_some_and(|nk| node_removal(log, nk).is_some())
+                && !log.audience_left_out(&EpochAudience::Everyone, actor)
+                && (((*actor == member || m.binding.recipient() == recipient)
+                    && m.binding != *binding)
+                    || (node != [0; 32]
+                        && m.node_key == Some(node)
+                        && (*actor != member || m.binding != *binding)))
         })
         .then(|| {
             "this Mac's key is already bound to a different seat in the membership log".to_owned()
@@ -202,7 +246,10 @@ pub(super) fn kept_out_with_node(
 
 /// Whether the log removed the Mac `binding` names, by its actor or its device's writer key under
 /// another incarnation (each is the Mac a removal took out), and if so whether a quorum did.
-fn removal_naming(log: &Log, binding: &crate::commons::binding::Binding) -> Option<bool> {
+pub(super) fn removal_naming(
+    log: &Log,
+    binding: &crate::commons::binding::Binding,
+) -> Option<bool> {
     let member = binding.actor();
     let writer = binding.writer();
     let membership = log.membership();
@@ -222,13 +269,17 @@ fn removal_naming(log: &Log, binding: &crate::commons::binding::Binding) -> Opti
     Some(removals.any(|quorum| quorum))
 }
 
-/// Whether the log removed the node key `node` (`[0; 32]`: none).
-fn node_removed(log: &Log, node: [u8; 32]) -> bool {
-    node != [0; 32]
-        && matches!(
-            log.membership().nodes().get(&node),
-            Some(crate::membership_log::NodeStanding::Removed(_))
-        )
+/// Whether the log removed the node key `node` (`[0; 32]`: none), and if so whether a quorum did.
+pub(super) fn node_removal(log: &Log, node: [u8; 32]) -> Option<bool> {
+    if node == [0; 32] {
+        return None;
+    }
+    let membership = log.membership();
+    let Some(crate::membership_log::NodeStanding::Removed(actor)) = membership.nodes().get(&node)
+    else {
+        return None;
+    };
+    Some(membership.removed().get(actor).is_some_and(|r| r.quorum))
 }
 
 /// Whether "Allow again" restores the Mac `binding` and `node` name: the log removed it (not by a
@@ -243,7 +294,8 @@ fn restoring(
     restore
         && (removal_naming(log, binding).is_some()
             || log.recipient_is_removed(&binding.recipient())
-            || node_removed(log, node))
+            || node_removal(log, node).is_some()
+            || node_removal(log, *binding.writer()).is_some())
 }
 
 pub(super) fn roster_keeps_out(
@@ -253,9 +305,15 @@ pub(super) fn roster_keeps_out(
     node: [u8; 32],
 ) -> Option<String> {
     let hex_node = (node != [0; 32]).then(|| aterm_codec::hex::encode_lower(&node));
+    let hex_writer = aterm_codec::hex::encode_lower(binding.writer());
+    let hex_incarnation = aterm_codec::hex::encode_lower(binding.incarnation());
+    let hex_machine = aterm_codec::hex::encode_lower(binding.machine());
     let rec_str = binding.recipient().to_bech32();
     let check_roster = |r: &crate::swarm_roster::SwarmRoster| {
         hex_node.as_deref().is_some_and(|h| r.is_node_denied(h))
+            || r.is_node_denied(&hex_writer)
+            || r.is_node_denied(&hex_incarnation)
+            || r.is_node_denied(&hex_machine)
             || r.member_by_recipient(&rec_str)
                 .is_some_and(|m| steward::member_is_denied_in_roster(r, m))
     };
@@ -310,7 +368,7 @@ fn trusted_log_keeps_out(
 /// The log, keys and opened entries the member at `paths` admits from: its vault's log where the
 /// pin trusts it and it holds epochs, and what this Mac's identity opens of it. `None` where it
 /// holds no such log or opens nothing of it.
-fn held_log(
+pub(super) fn held_log(
     paths: &Paths,
 ) -> crate::Result<Option<(membership_log::Store, Log, Identity, OpenedAudienceEntries)>> {
     let Some(config) = config(paths)? else {
@@ -406,28 +464,9 @@ fn log_path(
     else {
         return Ok(ByLog::NotHere);
     };
-    let mut audiences = admission_audiences(&opened);
-    // An epoch this Mac lacks as a wrap gap of its own (admitted on one side of a split while
-    // the other minted it, before a holder wrapped it to this Mac) is no reason to hand F10's
-    // files: the new Mac takes the log with the epochs this Mac holds, and the same holders
-    // close that epoch for both ([`close_wrap_gaps`]).
-    let holds = |audience: &EpochAudience| {
-        Log::admission_epochs(&opened, std::slice::from_ref(audience))
-            .iter()
-            .all(|(_, epoch)| {
-                opened.unwrapped_keys.contains_key(epoch) || log.is_wrap_gap(&opened, epoch, &actor)
-            })
-    };
-    if !holds(&EpochAudience::Everyone)
-        || !Log::admission_epochs(&opened, &[EpochAudience::Everyone])
-            .iter()
-            .any(|(_, epoch)| opened.unwrapped_keys.contains_key(epoch))
-    {
+    let Some(audiences) = held_audiences(&log, &opened, &actor) else {
         return Ok(ByLog::NotHere);
-    }
-    // A Commons epoch this Mac cannot open stays closed to the new Mac; a member that holds it
-    // closes that gap ([`close_wrap_gaps`]).
-    audiences.retain(|audience| holds(audience));
+    };
 
     let member = request.binding().actor();
     let recipient = request.binding().recipient();
@@ -441,28 +480,7 @@ fn log_path(
         if let Some(already) = membership.get(&member) {
             // Let in already (a run whose bundle never arrived, or another member's Admit, which
             // the new Mac takes as it would this Mac's): only the Wraps it lacks.
-            let mut signed = Vec::new();
-            for (audience, epoch) in Log::admission_epochs(&opened, &audiences) {
-                if log.left_out(&opened, &audience, &member) {
-                    continue;
-                }
-                if opened
-                    .wrapped_recipients
-                    .get(&epoch)
-                    .is_some_and(|wrapped| wrapped.contains(&recipient))
-                {
-                    continue;
-                }
-                // One this Mac lacks as its own wrap gap: a holder closes it for both.
-                let Some(key) = opened.unwrapped_keys.get(&epoch) else {
-                    continue;
-                };
-                let wrap = log
-                    .draft_wrap(&actor, now_ms, epoch, key, recipient)?
-                    .sign(signer.seed, signer.incarnation)?;
-                log.insert(wrap.clone())?;
-                signed.push(wrap);
-            }
+            let signed = wraps_lacking(&mut log, &opened, &audiences, &signer, &member, now_ms)?;
             return Ok((already.entry, already.label.clone(), signed));
         }
         // A Mac "Allow again" restores keeps the label it had, where no member holds it now.
@@ -470,12 +488,34 @@ fn log_path(
             .then(|| super::remove::notes_of(&log))
             .and_then(|notes| {
                 notes
-                    .of(&recipient, request.binding().writer())
+                    .of_with_node(&recipient, request.binding().writer(), &node)
                     .map(|note| note.label.clone())
             })
             .filter(|label| {
+                let label_canon =
+                    crate::swarm_roster::leading_m_label(label).map(|(_, canon)| canon);
+                let matches_label = |other: &str| {
+                    other == label
+                        || crate::swarm_roster::leading_m_label(other).is_some_and(|(_, canon)| {
+                            canon == *label || label_canon.as_deref() == Some(canon.as_str())
+                        })
+                };
                 membership_log::is_label(label)
-                    && !membership.members().values().any(|m| m.label == *label)
+                    && !membership.members().values().any(|m| {
+                        m.binding.recipient() != recipient
+                            && !log.recipient_is_removed(&m.binding.recipient())
+                            && !m
+                                .node_key
+                                .is_some_and(|nk| node_removal(&log, nk).is_some())
+                            && (node == [0; 32] || m.node_key != Some(node))
+                            && (matches_label(&m.label) || matches_label(&m.name))
+                    })
+                    && !membership.unproved().iter().any(|f| {
+                        f.recipient != recipient
+                            && !log.recipient_is_removed(&f.recipient)
+                            && (node == [0; 32] || f.node_key != Some(node))
+                            && (matches_label(&f.label) || matches_label(&f.name))
+                    })
             });
         let (taken, counted) = labels_taken(&opened.by_audience);
         let label = match restored {
@@ -504,6 +544,79 @@ fn log_path(
         signed,
         records: store.encode(),
     }))
+}
+
+/// The audiences the member `actor`, which opened `opened` of `log`, hands a new Mac: `[everyone]`
+/// and Commons where it holds every epoch of them a new Mac needs. An epoch it lacks as a wrap
+/// gap of its own (admitted on one side of a split while the other minted it, before a holder
+/// wrapped it to this Mac) is no reason to hand F10's files: the new Mac takes the log with the
+/// epochs this Mac holds, and the same holders close that epoch for both ([`close_wrap_gaps`]).
+/// A Commons epoch it cannot open stays closed to the new Mac, and a member that holds it closes
+/// that gap. `None` where it cannot hand `[everyone]` at all: no epoch of it opened here, or one
+/// missing that is no wrap gap of its own.
+pub(super) fn held_audiences(
+    log: &Log,
+    opened: &OpenedAudienceEntries,
+    actor: &crate::membership_log::MemberId,
+) -> Option<Vec<EpochAudience>> {
+    let holds = |audience: &EpochAudience| {
+        Log::admission_epochs(opened, std::slice::from_ref(audience))
+            .iter()
+            .all(|(_, epoch)| {
+                opened.unwrapped_keys.contains_key(epoch) || log.is_wrap_gap(opened, epoch, actor)
+            })
+    };
+    if !holds(&EpochAudience::Everyone)
+        || !Log::admission_epochs(opened, &[EpochAudience::Everyone])
+            .iter()
+            .any(|(_, epoch)| opened.unwrapped_keys.contains_key(epoch))
+    {
+        return None;
+    }
+    let mut audiences = admission_audiences(opened);
+    audiences.retain(|audience| holds(audience));
+    Some(audiences)
+}
+
+/// The `Wrap`s of `audiences`' epochs that the member `member`, let in already, lacks, signed by
+/// `signer` into `log`: none of an epoch that left it out on purpose ([`Log::left_out`]), and
+/// none of one this Mac lacks as its own wrap gap, which a holder closes for both.
+///
+/// # Errors
+/// A `Wrap` fails to draft, sign or insert.
+pub(super) fn wraps_lacking(
+    log: &mut Log,
+    opened: &OpenedAudienceEntries,
+    audiences: &[EpochAudience],
+    signer: &Signer<'_>,
+    member: &crate::membership_log::MemberId,
+    now_ms: u64,
+) -> crate::Result<Vec<Record>> {
+    let Some(recipient) = log.membership().get(member).map(|m| m.binding.recipient()) else {
+        return Ok(Vec::new());
+    };
+    let mut signed = Vec::new();
+    for (audience, epoch) in Log::admission_epochs(opened, audiences) {
+        if log.left_out(opened, &audience, member) {
+            continue;
+        }
+        if opened
+            .wrapped_recipients
+            .get(&epoch)
+            .is_some_and(|wrapped| wrapped.contains(&recipient))
+        {
+            continue;
+        }
+        let Some(key) = opened.unwrapped_keys.get(&epoch) else {
+            continue;
+        };
+        let wrap = log
+            .draft_wrap(signer.actor, now_ms, epoch, key, recipient)?
+            .sign(signer.seed, signer.incarnation)?;
+        log.insert(wrap.clone())?;
+        signed.push(wrap);
+    }
+    Ok(signed)
 }
 
 /// Whether this Mac admits through the membership log ([`admit_by_phrase`]): its vault has a log
@@ -547,14 +660,12 @@ pub fn log_admitted_actors(paths: &Paths) -> BTreeSet<crate::membership_log::Mem
             .iter()
             .filter(|(actor, member)| {
                 !log.recipient_is_removed(&member.binding.recipient())
-                    && !member.node_key.is_some_and(|nk| {
-                        nk != [0; 32]
-                            && matches!(
-                                membership.node(&nk),
-                                crate::membership_log::NodeStanding::Removed(_)
-                            )
-                    })
+                    && !membership.member_node_removed(member)
                     && !log.audience_left_out(&EpochAudience::Everyone, actor)
+                    && !log.audience_left_out_recipient(
+                        &EpochAudience::Everyone,
+                        &member.binding.recipient(),
+                    )
                     && !roster
                         .as_ref()
                         .is_some_and(|r| log_entries::member_denied_by_roster(r, member))
@@ -610,7 +721,11 @@ pub fn hand_over(paths: &Paths, handing: &Handing<'_>) -> crate::Result<Handout>
     })
 }
 
-fn log_bundle(paths: &Paths, allowed: &Allowed, admission: LogAdmission) -> crate::Result<Bundle> {
+pub(super) fn log_bundle(
+    paths: &Paths,
+    allowed: &Allowed,
+    admission: LogAdmission,
+) -> crate::Result<Bundle> {
     let config = config(paths)?.ok_or_else(|| Error::new("no vault configured"))?;
     let signer = config
         .signer
@@ -702,9 +817,19 @@ pub fn write_from_log_bundle(paths: &Paths, bundle: &Bundle) -> crate::Result<Re
     if identity.recipient() != bundle.allowed.binding().recipient() {
         return Err(Error::new("the member's bundle allows another Mac's key"));
     }
+    if !crate::envelope::valid_name(&bundle.vault)
+        || !text::valid_machine_name(bundle.allowed.name())
+    {
+        return Err(Error::new("the member's join bundle is malformed"));
+    }
     let server = bundle
         .servers
         .first()
+        .filter(|url| {
+            (url.starts_with("http://") || url.starts_with("https://"))
+                && url.len() <= 512
+                && url.bytes().all(|b| b.is_ascii_graphic())
+        })
         .cloned()
         .ok_or_else(|| Error::new("the member's bundle names no vault server"))?;
     let config = Config {
@@ -714,6 +839,11 @@ pub fn write_from_log_bundle(paths: &Paths, bundle: &Bundle) -> crate::Result<Re
         followed: bundle.followed.clone(),
         host: bundle.allowed.name().to_owned(),
     };
+    if !pin_admitted(&config, None) {
+        return Err(Error::new(
+            "the member's bundle pins a retired vault signer",
+        ));
+    }
     // ALab's genesis comes only from what this build compiles (`Store::for_vault`: the digest,
     // or until F12b the vault keys it names). `records_store_for` also takes a genesis under the
     // pin and the keys it was reached through, which on an applied config are the envelope's;
@@ -747,6 +877,42 @@ pub fn write_from_log_bundle(paths: &Paths, bundle: &Bundle) -> crate::Result<Re
     }
     if !log_entries::log_alone_admits(log, &identity)? {
         return Err(Error::new("the member's records hand this Mac no key"));
+    }
+    let opened = log
+        .open_audience_entries(&identity)?
+        .ok_or_else(|| Error::new("the member's records hand this Mac no key"))?;
+    let mut r =
+        log_entries::roster_from_doc_or_opened(None, Some(&opened), Some(log)).unwrap_or_default();
+    roster::overlay_log_membership(log, &mut r);
+    if log_entries::member_denied_by_roster(&r, entry)
+        || log_entries::recipient_denied_by_roster_or_log(Some(&r), log, &identity.recipient())
+    {
+        return Err(Error::new(
+            "the member's records hold a swarm roster that denies this Mac",
+        ));
+    }
+    if *admit != *log.network()
+        && let Some(admit_rec) = log.get(admit)
+        && membership.get(admit_rec.actor()).is_some_and(|admitter| {
+            log_entries::member_denied_by_roster(&r, admitter)
+                || log.recipient_is_removed(&admitter.binding.recipient())
+                || admitter.node_key.is_some_and(|nk| {
+                    nk != [0; 32]
+                        && matches!(
+                            membership.node(&nk),
+                            crate::membership_log::NodeStanding::Removed(_)
+                        )
+                })
+                || log.audience_left_out(&EpochAudience::Everyone, admit_rec.actor())
+                || log.audience_left_out_recipient(
+                    &EpochAudience::Everyone,
+                    &admitter.binding.recipient(),
+                )
+        })
+    {
+        return Err(Error::new(
+            "the member that signed this Admit is revoked in the vault",
+        ));
     }
     let entries = log
         .open_entries(&identity)?
@@ -803,18 +969,32 @@ mod tests {
     #[test]
     fn a_newcomer_label_keeps_off_denied_reserved_and_machines_names_and_counts_the_sheet() {
         let roster = SwarmRoster {
-            members: vec![SwarmMember {
-                recipient: "age1synthetic".to_owned(),
-                vault_name: "m40-studio".to_owned(),
-                label: "m41".to_owned(),
-                aliases: Vec::new(),
-                hint: None,
-                admitted_ms: 0,
-                claimed_label: None,
-                claimed_at_ms: None,
-                node_id: None,
-                node_key: None,
-            }],
+            members: vec![
+                SwarmMember {
+                    recipient: "age1synthetic".to_owned(),
+                    vault_name: "m40-studio".to_owned(),
+                    label: "m41".to_owned(),
+                    aliases: Vec::new(),
+                    hint: None,
+                    admitted_ms: 0,
+                    claimed_label: Some("m42".to_owned()),
+                    claimed_at_ms: Some(1_000),
+                    node_id: None,
+                    node_key: None,
+                },
+                SwarmMember {
+                    recipient: "age1denied".to_owned(),
+                    vault_name: "m98-forged".to_owned(),
+                    label: "m9".to_owned(),
+                    aliases: Vec::new(),
+                    hint: None,
+                    admitted_ms: 0,
+                    claimed_label: Some("m99".to_owned()),
+                    claimed_at_ms: Some(1_000),
+                    node_id: None,
+                    node_key: None,
+                },
+            ],
             deny_labels: vec!["m9".to_owned()],
             deny_nodes: Vec::new(),
         };
@@ -845,9 +1025,13 @@ mod tests {
             "[[account]]\nlabel = \"a\"\nmachines = [\"m70\"]\n",
         );
         let (taken, counted) = labels_taken(&by_audience);
-        for held in ["m9", "m40", "m50", "m41", "m3"] {
+        for held in ["m9", "m40", "m50", "m41", "m42", "m3"] {
             assert!(taken.contains(held), "{held} is taken: {taken:?}");
         }
+        assert!(
+            !taken.contains("m98") && !taken.contains("m99"),
+            "denied row's forged claimed_label or vault_name must not be taken: {taken:?}"
+        );
         assert!(!taken.contains("m70"), "a sheet's number holds no label");
         assert!(counted.contains("m70"), "{counted:?}");
     }
@@ -935,6 +1119,228 @@ mod tests {
         assert!(
             removed_why.contains("the vault removed this Mac"),
             "{removed_why}"
+        );
+
+        // Even under `restore = true` ("Allow again"), a removed Mac cannot claim a node_key
+        // (`node1`) that is already bound to a different active member (`m1`).
+        let steal_active = kept_out_with_node(&log, req3.binding(), node1, true)
+            .expect("restore must not allow claiming another active member's node_key");
+        assert!(
+            steal_active.contains("already bound to a different seat"),
+            "{steal_active}"
+        );
+
+        // Restoring single-member-removed `node2` under `req3` (`restore = true`) is permitted
+        // and supersedes the removed seat so `node2` becomes `NodeStanding::Member`.
+        assert!(kept_out_with_node(&log, req3.binding(), node2, true).is_none());
+        let admit3 = log
+            .draft(
+                &actor1,
+                4_000,
+                Body::Admit {
+                    entrant: Entrant {
+                        request: req3,
+                        node_key: node2,
+                        name: "m3".to_owned(),
+                        label: "m3".to_owned(),
+                    },
+                    evidence: Evidence::Phrase,
+                },
+            )
+            .sign(&seed1, inc1)
+            .unwrap();
+        log.insert(admit3).unwrap();
+        assert!(
+            matches!(
+                log.membership().node(&node2),
+                crate::membership_log::NodeStanding::Member(_)
+            ),
+            "restored node_key must become Member, got: {:?}",
+            log.membership().node(&node2)
+        );
+    }
+
+    #[test]
+    fn write_from_log_bundle_refuses_admitter_left_out_without_roster_entry() {
+        use crate::membership_log::{Body, Entrant, Evidence, encode_records};
+        use ring::signature::{Ed25519KeyPair, KeyPair as _};
+
+        let root = aterm_tempfile::tempdir().unwrap();
+        let vault_seed = [9u8; 32];
+        let vault_signer: [u8; 32] = Ed25519KeyPair::from_seed_unchecked(&vault_seed)
+            .unwrap()
+            .public_key()
+            .as_ref()
+            .try_into()
+            .unwrap();
+        let network = [0x61; 16];
+        let authority = [0x62; 32];
+        let make_req = |tag: u8, id: &Identity| {
+            let seed = [tag; 32];
+            let inc = [tag; 16];
+            let req = Request::create(
+                network,
+                authority,
+                [tag.wrapping_add(0x20); 16],
+                inc,
+                id,
+                &seed,
+            )
+            .expect("request");
+            (seed, inc, req)
+        };
+
+        let id1 = Identity::from_secret_bytes([0x41; 32]);
+        let id2 = Identity::from_secret_bytes([0x42; 32]);
+        let (seed1, inc1, req1) = make_req(1, &id1);
+        let (seed2, inc2, req2) = make_req(2, &id2);
+        let actor1 = req1.binding().actor();
+        let actor2 = req2.binding().actor();
+
+        let genesis = Record::found(
+            &vault_seed,
+            vec![
+                Entrant {
+                    request: req1.clone(),
+                    node_key: [0x11; 32],
+                    name: "m1".to_owned(),
+                    label: "m1".to_owned(),
+                },
+                Entrant {
+                    request: req2.clone(),
+                    node_key: [0x22; 32],
+                    name: "m2".to_owned(),
+                    label: "m2".to_owned(),
+                },
+            ],
+            1_000,
+        )
+        .expect("genesis");
+        let mut log = Log::new(genesis).expect("log");
+
+        // m1 mints `[everyone]` epoch 1, wraps to m1 and m2, and puts `"shared"` (no roster entry).
+        let (ep1_draft, ep1_key) = log
+            .draft_epoch(&actor1, 1_500, Audience::Everyone, 1)
+            .unwrap();
+        let ep1 = ep1_draft.sign(&seed1, inc1).unwrap();
+        let ep1_id = *ep1.id();
+        log.insert(ep1).unwrap();
+        for rec in [id1.recipient(), id2.recipient()] {
+            let w = log
+                .draft_wrap(&actor1, 1_501, ep1_id, &ep1_key, rec)
+                .unwrap()
+                .sign(&seed1, inc1)
+                .unwrap();
+            log.insert(w).unwrap();
+        }
+        let put = log
+            .draft_put(
+                &actor1,
+                1_502,
+                ep1_id,
+                &ep1_key,
+                &Entry {
+                    name: "shared".to_owned(),
+                    value: crate::SecretBytes::from(&b"v1"[..]),
+                    audience: Audience::Everyone,
+                    if_absent: false,
+                    anchor: None,
+                },
+            )
+            .unwrap()
+            .sign(&seed1, inc1)
+            .unwrap();
+        log.insert(put).unwrap();
+
+        // m2 admits m3 and wraps epoch 1 to m3.
+        let m3_ok = Paths::for_home(&root.path().join("m3-ok"));
+        let id3 = machine_identity(&m3_ok).unwrap();
+        let (_, _, req3) = make_req(3, &id3);
+        let admit3 = log
+            .draft(
+                &actor2,
+                2_000,
+                Body::Admit {
+                    entrant: Entrant {
+                        request: req3.clone(),
+                        node_key: [0x33; 32],
+                        name: "m3".to_owned(),
+                        label: "m3".to_owned(),
+                    },
+                    evidence: Evidence::Phrase,
+                },
+            )
+            .sign(&seed2, inc2)
+            .unwrap();
+        let admit3_id = *admit3.id();
+        log.insert(admit3).unwrap();
+        let wrap3_ep1 = log
+            .draft_wrap(&actor2, 2_001, ep1_id, &ep1_key, id3.recipient())
+            .unwrap()
+            .sign(&seed2, inc2)
+            .unwrap();
+        log.insert(wrap3_ep1).unwrap();
+
+        let allowed = Allowed::sign(req3.binding(), "m3", &seed2).unwrap();
+        let make_bundle = |l: &Log| Bundle {
+            vault: "test-vault".to_owned(),
+            signer: vault_signer,
+            followed: Vec::new(),
+            servers: vec!["http://127.0.0.1:9/v1/test-vault".to_owned()],
+            allowed: allowed.clone(),
+            handed: Handed::Log {
+                admit: admit3_id,
+                records: encode_records(l.records()),
+            },
+        };
+
+        // Positive control: before m2 is left out of `[everyone]`, m3 accepts the log bundle.
+        write_from_log_bundle(&m3_ok, &make_bundle(&log)).expect("active admitter succeeds");
+
+        // Negative control: m1 rotates `[everyone]` to epoch 2, wrapping to m1 and m3 while
+        // leaving admitter m2 out (still with no `aterm-swarm-roster` entry in the log).
+        let (ep2_draft, ep2_key) = log
+            .draft_epoch(&actor1, 3_000, Audience::Everyone, 2)
+            .unwrap();
+        let ep2 = ep2_draft.sign(&seed1, inc1).unwrap();
+        let ep2_id = *ep2.id();
+        log.insert(ep2).unwrap();
+        for rec in [id1.recipient(), id3.recipient()] {
+            let w = log
+                .draft_wrap(&actor1, 3_001, ep2_id, &ep2_key, rec)
+                .unwrap()
+                .sign(&seed1, inc1)
+                .unwrap();
+            log.insert(w).unwrap();
+        }
+        let put2 = log
+            .draft_put(
+                &actor1,
+                3_002,
+                ep2_id,
+                &ep2_key,
+                &Entry {
+                    name: "shared".to_owned(),
+                    value: crate::SecretBytes::from(&b"v2"[..]),
+                    audience: Audience::Everyone,
+                    if_absent: false,
+                    anchor: None,
+                },
+            )
+            .unwrap()
+            .sign(&seed1, inc1)
+            .unwrap();
+        log.insert(put2).unwrap();
+
+        let m3_revoked = Paths::for_home(&root.path().join("m3-revoked"));
+        fsx::ensure_private_dir(&m3_revoked.dir).unwrap();
+        std::fs::copy(m3_ok.dir.join("identity"), m3_revoked.dir.join("identity")).unwrap();
+        let err = write_from_log_bundle(&m3_revoked, &make_bundle(&log))
+            .expect_err("admitter left out of Everyone must be refused even without roster entry")
+            .to_string();
+        assert!(
+            err.contains("the member that signed this Admit is revoked in the vault"),
+            "{err}"
         );
     }
 }

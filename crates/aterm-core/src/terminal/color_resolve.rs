@@ -168,6 +168,13 @@ pub fn floor_contrast(fg: Rgb, bg: Rgb, min: f32) -> Rgb {
     first_clearing_tenth(fg, pole, lb, min).map_or_else(|| grey(pole), |(_, nudged)| nudged)
 }
 
+/// The WCAG contrast ratio of `a` against `b` (1 for equal inks, 21 for black on white).
+#[must_use]
+#[inline]
+pub fn contrast_ratio(a: Rgb, b: Rgb) -> f32 {
+    wcag_contrast(wcag_luminance(a), wcag_luminance(b))
+}
+
 /// WCAG relative luminance on this module's transfer tables.
 #[inline]
 fn wcag_luminance(c: Rgb) -> f32 {

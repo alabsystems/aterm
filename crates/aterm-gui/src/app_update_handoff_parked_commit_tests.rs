@@ -230,6 +230,63 @@ fn assert_whole(frame: &[u8]) {
 
 const WRITTEN: &str = "attempt-bound Commit pipe closed before its atomic write";
 
+#[test]
+fn a_setup_offer_edited_after_collected_facts_cannot_reach_the_commit_write() {
+    use crate::native_app::{ActionInvocation, AppEvent, SemanticInput};
+    use crate::workstation_setup::Request;
+    use aterm_types::macos_setup::Plan;
+
+    fn edit_offer(app: &mut crate::App) {
+        let wid = crate::WindowId(0);
+        let (_, view) = app.active_native_view(wid).unwrap();
+        app.dispatch_native_view_event(
+            wid,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: crate::native_ui::ActionId::new("system-state/url"),
+                value: Some(SemanticInput::Text("http://draft.local/v1/team".into())),
+            }),
+        )
+        .unwrap();
+        assert!(app.workstation_setup_holds_handoff());
+    }
+
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    for edit_after_facts in [false, true] {
+        let (send, receive) = std::sync::mpsc::channel();
+        let request = Request::new(Plan::default(), send);
+        let offered = request.clone();
+        let (mut parked, attempt) = Parked::with_app(b"", None, move |app| {
+            app.headless = false;
+            app.user_input_recent = |_| false;
+            app.windows
+                .get_mut(&crate::WindowId(0))
+                .unwrap()
+                .os_window_for_test = true;
+            app.offer_workstation_setup(offered);
+            app.headless = true;
+        });
+        assert!(matches!(attempt, ParkAttempt::Parked), "{attempt:?}");
+        assert!(!parked.app.workstation_setup_holds_handoff());
+        if edit_after_facts {
+            super::BEFORE_FINAL_SETUP_CHECK.set(Some(edit_offer));
+        }
+        let completion = parked.proof_ready();
+        let verdict = parked.run_to_verdict(completion);
+        if edit_after_facts {
+            assert_ne!(verdict, WRITTEN, "the final guard preserves the new draft");
+            assert!(
+                super::BEFORE_FINAL_SETUP_CHECK.take().is_none(),
+                "the late edit ran"
+            );
+        } else {
+            assert_eq!(verdict, WRITTEN, "an untouched offer permits the write");
+        }
+        assert!(request.pending(), "a returned Commit preserves the offer");
+        assert!(receive.try_recv().is_err(), "no approval was fabricated");
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod queued_setup_custody {
     use std::cell::RefCell;
@@ -905,7 +962,7 @@ fn a_reset_at_the_write_is_never_answered_ok() {
 #[test]
 fn the_outgoing_commit_writes_the_persons_stamps_at_its_write() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
-    for keyed in [true, false] {
+    for (keyed, typed) in [(true, false), (true, true), (false, false)] {
         let mut parked = Parked::new(b"");
         if keyed {
             parked
@@ -916,6 +973,16 @@ fn the_outgoing_commit_writes_the_persons_stamps_at_its_write() {
                 .ctx
                 .human_input
                 .carry(90_000, crate::metrics::now_us());
+        }
+        if typed {
+            parked
+                .app
+                .pool
+                .get(0)
+                .expect("session 0")
+                .ctx
+                .human_input
+                .carry_typed(30_000, crate::metrics::now_us());
         }
         let path = crate::seamless::person_stamps_path(
             &crate::seamless::outgoing_manifest_path(&parked.nonce).expect("a manifest path"),
@@ -932,8 +999,15 @@ fn the_outgoing_commit_writes_the_persons_stamps_at_its_write() {
             .try_recv()
             .expect("read at the write")
             .expect("the sidecar stands at the write");
-        let (id, age) = body.trim().split_once(' ').expect("one row");
-        assert_eq!(id, "0", "{body:?}");
+        let rows: Vec<_> = body
+            .lines()
+            .map(|line| line.split_once(' ').expect("a stamp row"))
+            .collect();
+        assert_eq!(rows.len(), 2, "one gesture and one typing row: {body:?}");
+        let age = rows
+            .iter()
+            .find_map(|&(id, age)| (id == "0").then_some(age))
+            .expect("the session's gesture row");
         if keyed {
             assert!(age.parse::<u64>().is_ok_and(|ms| ms >= 90_000), "{body:?}");
         } else {
@@ -942,6 +1016,18 @@ fn the_outgoing_commit_writes_the_persons_stamps_at_its_write() {
                     .is_some_and(|ms| ms.parse::<u64>().is_ok()),
                 "NEGATIVE CONTROL: nobody keyed: {body:?}"
             );
+        }
+        let typing_age = rows
+            .iter()
+            .find_map(|&(id, age)| (id == "t0").then_some(age))
+            .expect("the session's typing provenance row");
+        if typed {
+            assert!(
+                typing_age.parse::<u64>().is_ok_and(|ms| ms >= 30_000),
+                "{body:?}"
+            );
+        } else {
+            assert_eq!(typing_age, "-", "no typing was carried: {body:?}");
         }
         assert!(!path.exists(), "the Commit returned: taken back");
     }
@@ -976,8 +1062,17 @@ fn note_settles_and_the_write(parked: &mut Parked) {
                 }
                 COMMIT_STEPS.with(|steps| steps.borrow_mut().push("settle"));
             },
+            cut_off: |going| {
+                COMMIT_STEPS.with(|steps| {
+                    steps
+                        .borrow_mut()
+                        .push(if going { "cut off" } else { "taken back" });
+                });
+            },
             sync_on: || false,
             fda_granted: || {},
+            tools_installed: || {},
+            join_phrase: |_, _| false,
         });
     parked.app.handoff_before_egress_fence = Some(Box::new(|| {
         COMMIT_STEPS.with(|steps| steps.borrow_mut().push("write"));
@@ -987,6 +1082,8 @@ fn note_settles_and_the_write(parked: &mut Parked) {
 /// A System State Stop clicked while the handoff drains input may still owe its save: the
 /// Commit settles it among what its claim answers and again right before its write, as a quit
 /// does. This attempt never passed the handoff's start, so both settles seen are the Commit's.
+/// The setup stages the Commit cuts off are noted right before the write, and, since this
+/// write returned (its pipe closed), taken back: the handoff did not go (design §6.5).
 #[cfg(target_os = "macos")]
 #[test]
 fn the_commit_settles_a_system_state_stop_before_its_write() {
@@ -997,7 +1094,7 @@ fn the_commit_settles_a_system_state_stop_before_its_write() {
     assert_eq!(parked.run_to_verdict(completion), WRITTEN);
     assert_eq!(
         COMMIT_STEPS.with(|steps| steps.take()),
-        ["settle", "settle", "write"]
+        ["settle", "settle", "write", "cut off", "taken back"]
     );
 }
 
@@ -1018,6 +1115,164 @@ fn a_system_state_settle_that_waits_holds_the_commit_through_one_more_fence() {
     assert_eq!(COMMIT_STEPS.with(|steps| steps.take()), ["settle"]);
     let held = reposted.pop().expect("the held claim's pass");
     assert_eq!(parked.run_to_verdict(held), WRITTEN);
-    assert_eq!(COMMIT_STEPS.with(|steps| steps.take()), ["settle", "write"]);
+    assert_eq!(
+        COMMIT_STEPS.with(|steps| steps.take()),
+        ["settle", "write", "cut off", "taken back"]
+    );
     SETTLE_WAITS.set(false);
+}
+
+/// The process registry's guard for `item`, as an item whose checks still hold takes it: at once,
+/// or once a pending handoff on another thread is refused.
+fn hold(
+    item: crate::app_update_handoff_boundary::GuardedItem,
+) -> crate::app_update_handoff_boundary::Held<'static> {
+    crate::app_update_handoff_boundary::Boundary::process()
+        .hold(item, || Ok::<(), ()>(()))
+        .expect("its checks hold")
+}
+
+/// An item that cannot be cut in half and takes its boundary guard after the handoff's start (no
+/// latch held it back here, as for one whose wait on the latch ran out, or one on the handoff's
+/// own thread) refuses the Commit: it is refused as activity, so the handoff is tried again, and
+/// nothing cuts the item in half. The try's wait is one budget across its start and its Commit:
+/// the start that followed an item began it, and past it the Commit is refused for this try (the
+/// updater's next check tries again with a new budget), never written over the item. Before, the
+/// guard was read only as the handoff started and the Commit was written with a sign-out's clicks
+/// under way; then, round 22, a Commit past the budget was written over the item, or held a fresh
+/// budget of its own (design §6.7).
+#[test]
+fn a_guard_taken_after_the_start_check_holds_the_commit() {
+    use crate::app_update_handoff_boundary::{GuardedItem, MAX_BOUNDARY_WAIT};
+
+    // The guard is process-wide and every Commit reads it: alone, so no other test's sees it.
+    if !crate::test_alone::alone() {
+        return;
+    }
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let refused_as_activity = |parked: &mut Parked| {
+        let completion = parked.proof_ready();
+        assert_eq!(
+            parked.run_to_verdict(completion),
+            "structural activity arrived before Commit",
+            "the Commit was written with a sign-out's clicks holding the boundary guard"
+        );
+        assert!(
+            parked
+                .app
+                .pending_update_handoff
+                .as_ref()
+                .is_some_and(|pending| pending.revoked_by_activity),
+            "an activity refusal, which the handoff tries again"
+        );
+    };
+    // The handoff started with every guard free; now a sign-out's click sequence begins.
+    super::end_boundary_wait();
+    let clicks = hold(GuardedItem::SignOutSequence);
+    refused_as_activity(&mut Parked::new(b""));
+    assert!(
+        super::BOUNDARY_WAIT_SINCE
+            .with(std::cell::Cell::get)
+            .is_some(),
+        "within the budget the try follows the clicks"
+    );
+    drop(clicks);
+    // A try whose start followed a clone's publish a budget ago: the start found the rename in its
+    // section and deferred, then found it done and went on, the try's wait standing.
+    super::end_boundary_wait();
+    let started = std::time::Instant::now()
+        .checked_sub(MAX_BOUNDARY_WAIT)
+        .expect("this Mac has been up ten seconds");
+    let rename = hold(GuardedItem::ClonePublishRename);
+    assert!(
+        super::start_at_boundary(started).is_err(),
+        "the start follows the rename"
+    );
+    drop(rename);
+    drop(super::start_at_boundary(started).expect("the rename done, the start goes on"));
+    // A sign-out's clicks take the guard after the start: the Commit, past the try's budget, is
+    // refused for this try, never written over them and never given a fresh budget.
+    let clicks = hold(GuardedItem::SignOutSequence);
+    refused_as_activity(&mut Parked::new(b""));
+    assert_eq!(
+        super::BOUNDARY_WAIT_SINCE.with(std::cell::Cell::get),
+        None,
+        "past the budget the try ends; the next check starts afresh"
+    );
+    // The updater's next check: a new try, which follows the clicks still under way.
+    refused_as_activity(&mut Parked::new(b""));
+    // The clicks end: the Commit is written.
+    drop(clicks);
+    let mut parked = Parked::new(b"");
+    let completion = parked.proof_ready();
+    assert_eq!(parked.run_to_verdict(completion), WRITTEN);
+    super::end_boundary_wait();
+}
+
+/// The handoff's boundary latch lasts while the handoff is in flight: an item on another thread
+/// asks for its guard and waits, in no critical section, and the loop turn after the handoff
+/// ends (refused, its records gone) releases the latch, so the item goes on (design §6.7).
+#[test]
+fn the_boundary_latch_holds_items_while_the_handoff_is_in_flight() {
+    use crate::app_update_handoff_boundary::{
+        GuardedItem, HANDOFF_PENDING_BOUND, handoff_pending, is_held, latch_handoff, waiting,
+    };
+
+    // The latch is process-wide: alone, so no other test's item waits on it.
+    if !crate::test_alone::alone() {
+        return;
+    }
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let mut parked = Parked::new(b"");
+    parked.app.update_boundary_latch = Some(latch_handoff(HANDOFF_PENDING_BOUND));
+    parked.app.settle_update_boundary_latch();
+    assert!(handoff_pending(), "in flight, the latch stays");
+    let rename = std::thread::spawn(|| {
+        let _guard = hold(GuardedItem::ClonePublishRename);
+    });
+    assert!(
+        aterm_spec::wait::within(
+            aterm_spec::wait::MUST_HAPPEN,
+            std::time::Duration::from_millis(1),
+            || (waiting() == 1).then_some(())
+        )
+        .is_some(),
+        "the rename waits for the handoff"
+    );
+    assert!(!is_held(GuardedItem::ClonePublishRename));
+    // The handoff is refused and its records go: the next loop turn releases the latch.
+    parked.app.pending_update_handoff = None;
+    parked.app.update_handoff_prelaunch = None;
+    parked.app.settle_update_boundary_latch();
+    assert!(!handoff_pending());
+    rename.join().expect("the rename goes on");
+    assert_eq!(waiting(), 0);
+}
+
+/// The handoff's start latches the boundary before it reads the guard: with every guard free it
+/// keeps the latch for the handoff in flight, so an item that asks for its guard now waits; with
+/// an item already in its section it is refused as activity and leaves no latch behind, so that
+/// item and every other goes on (design §6.7).
+#[test]
+fn the_handoffs_start_latches_the_boundary_before_it_reads_the_guard() {
+    use crate::app_update_handoff_boundary::{GuardedItem, handoff_pending};
+
+    // The latch and the guard are process-wide: alone, so no other test's item or Commit sees
+    // them.
+    if !crate::test_alone::alone() {
+        return;
+    }
+    let now = std::time::Instant::now();
+    let latch = super::start_at_boundary(now).expect("every guard free: the handoff starts");
+    assert!(handoff_pending(), "the start latched the boundary");
+    drop(latch);
+    assert!(!handoff_pending());
+    let clicks = hold(GuardedItem::SignOutSequence);
+    assert!(
+        super::start_at_boundary(now).is_err(),
+        "a sign-out's clicks under way hold the start"
+    );
+    assert!(!handoff_pending(), "a refused start leaves no latch");
+    drop(clicks);
+    super::end_boundary_wait();
 }

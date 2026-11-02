@@ -13,9 +13,13 @@ pub mod lineage_switch;
 pub mod pack;
 pub mod package;
 pub mod pkgdoc;
+mod relink;
 pub mod relocate;
 pub mod sign;
 pub mod tarwrite;
 pub mod toolchain;
 pub mod tools;
 pub mod upload;
+
+#[cfg(all(test, unix))]
+mod relink_tests;

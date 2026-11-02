@@ -276,6 +276,70 @@ fn ipv6_zone_is_explicit_and_mapped_addresses_are_not_silently_relabelled() {
 }
 
 #[test]
+fn bound_ipv4_only_looks_up_matching_addresses_and_keeps_ambiguity() {
+    use aterm_uds::network::InterfaceAddress;
+    let entries = [
+        ("other", "192.0.2.9"),
+        ("v6", "fe80:5::1"),
+        ("lan", "192.0.2.1"),
+        ("alias", "192.0.2.1"),
+    ]
+    .map(|(name, address)| InterfaceAddress {
+        name: name.into(),
+        address: address.parse().unwrap(),
+        netmask: None,
+        flags: REQUIRED_FLAGS,
+    });
+    for selected in [None, Some(3)] {
+        let mut looked_up = Vec::new();
+        let attachments = local_attachments_from(
+            entries.clone(),
+            Some("192.0.2.1:0".parse().unwrap()),
+            selected,
+            |name| {
+                looked_up.push(name.to_owned());
+                Ok(match name {
+                    "lan" => 3,
+                    "alias" => 4,
+                    _ => 5,
+                })
+            },
+            |_| Ok(true),
+        )
+        .unwrap();
+        assert_eq!(looked_up, ["lan", "alias"]);
+        assert_eq!(attachments.len(), if selected.is_some() { 1 } else { 2 });
+        assert!(
+            attachments
+                .iter()
+                .all(|entry| entry.netmask == IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+        );
+    }
+}
+
+#[test]
+fn attachment_scan_still_validates_ipv6_zones() {
+    let entry = aterm_uds::network::InterfaceAddress {
+        name: "lan".into(),
+        address: "fe80:3::1".parse().unwrap(),
+        netmask: Some("ffff:ffff:ffff:ffff::".parse().unwrap()),
+        flags: REQUIRED_FLAGS,
+    };
+    let local = Some("[fe80::1%3]:0".parse().unwrap());
+    for address in [None, local] {
+        let observed =
+            local_attachments_from([entry.clone()], address, None, |_| Ok(3), |_| Ok(true))
+                .unwrap();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].address, "fe80::1".parse::<IpAddr>().unwrap());
+        assert!(
+            local_attachments_from([entry.clone()], address, None, |_| Ok(4), |_| Ok(true))
+                .is_err()
+        );
+    }
+}
+
+#[test]
 fn loopback_is_explicit_and_the_witness_owns_its_exact_connection() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let peer = listener.local_addr().unwrap();

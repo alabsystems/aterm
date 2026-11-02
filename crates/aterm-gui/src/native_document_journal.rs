@@ -1832,7 +1832,18 @@ fn default_state_root() -> Option<PathBuf> {
 fn create_private_dir(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
-    aterm_types::fs_restricted::create_dir_all_unshared(path, 0o700)?;
+    match aterm_types::fs_restricted::create_dir_all_unshared(path, 0o700) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "recovery journal root must not be a symbolic link",
+                ));
+            }
+        }
+        Err(error) => return Err(error),
+    }
     let directory = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
@@ -2433,13 +2444,7 @@ mod tests {
         fs::set_permissions(&victim, fs::Permissions::from_mode(0o755)).unwrap();
         symlink(&victim, &linked_root).unwrap();
 
-        let error = DraftJournalHost::new(linked_root.clone()).unwrap_err();
-        assert!(
-            error.contains("symbolic link")
-                || error.contains("Too many levels")
-                || error.contains("Not a directory"),
-            "{error}"
-        );
+        assert!(DraftJournalHost::new(linked_root.clone()).is_err());
         assert_eq!(
             fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
             0o755

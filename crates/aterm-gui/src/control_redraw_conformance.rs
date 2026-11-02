@@ -97,7 +97,7 @@ fn pump_until_quiet(
     }
 }
 
-fn registered_session(local_id: u64, term: &Arc<Mutex<Terminal>>) -> SessionHandle {
+pub(super) fn registered_session(local_id: u64, term: &Arc<Mutex<Terminal>>) -> SessionHandle {
     let sid = SessionId::generate();
     let nonce = LaunchNonce::generate();
     let observed = crate::session_watch::Observed::default();
@@ -135,6 +135,7 @@ fn registered_session(local_id: u64, term: &Arc<Mutex<Terminal>>) -> SessionHand
         frame: Default::default(),
         witness: Default::default(),
         fenced_writes: Default::default(),
+        native_policy: Default::default(),
     });
     SessionHandle {
         sid,

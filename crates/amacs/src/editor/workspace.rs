@@ -42,6 +42,13 @@ pub enum CloseWhy {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EditorEffect {
+    /// Open a directory entry through the host's ordinary admission path.
+    OpenPath {
+        uri: String,
+    },
+    RefreshDirectory {
+        document: DocumentId,
+    },
     SaveDocument {
         document: DocumentId,
         seq: Seq,
@@ -334,6 +341,13 @@ impl EditorWorkspace {
         if view.accept_argument_digit(text) {
             return Ok(Vec::new());
         }
+        if store.directory(view.document).is_some() {
+            if text.is_empty() {
+                return Ok(Vec::new());
+            }
+            view.take_prefix_argument();
+            return Ok(vec![EditorEffect::Status("Directory is read-only".into())]);
+        }
         if !self.playing_macro
             && let Some(steps) = &mut self.macros_mut().recording
         {
@@ -370,8 +384,52 @@ impl EditorWorkspace {
         view: &mut EditorBufferView,
         chord: KeyChord,
     ) -> Result<Vec<EditorEffect>, EditorError> {
+        if !view.minibuffer_active()
+            && !view.chord_pending()
+            && let Some(listing) = store.directory(view.document)
+        {
+            if chord == KeyChord::parse("f").expect("static chord") {
+                return self.execute(store, view, EditorCommand::Newline);
+            }
+            if chord == KeyChord::parse("q").expect("static chord") {
+                return self.execute(store, view, EditorCommand::SaveBuffersKillTerminal);
+            }
+            for (key, command) in [
+                ("n", EditorCommand::MoveLineDown),
+                ("p", EditorCommand::MoveLineUp),
+            ] {
+                if chord == KeyChord::parse(key).expect("static chord") {
+                    return self.execute(store, view, command);
+                }
+            }
+            if chord == KeyChord::parse("g").expect("static chord") {
+                view.take_prefix_argument();
+                if !self.granted.contains(&CommandAuthority::Files) {
+                    return Ok(vec![EditorEffect::Status(
+                        "Directory refresh requires file access".into(),
+                    )]);
+                }
+                return Ok(vec![EditorEffect::RefreshDirectory {
+                    document: view.document,
+                }]);
+            }
+            if chord == KeyChord::parse("^").expect("static chord") {
+                view.take_prefix_argument();
+                if !self.granted.contains(&CommandAuthority::Files) {
+                    return Ok(vec![EditorEffect::Status(
+                        "Directory navigation requires file access".into(),
+                    )]);
+                }
+                return Ok(listing
+                    .parent
+                    .clone()
+                    .map(|uri| EditorEffect::OpenPath { uri })
+                    .into_iter()
+                    .collect());
+            }
+        }
         if chord == KeyChord::parse("C-g").expect("static chord") {
-            view.cancel_transient();
+            self.cancel_transient(store, view);
             return Ok(vec![EditorEffect::Status("Quit".into())]);
         }
         if view.minibuffer_active() {
@@ -427,6 +485,9 @@ impl EditorWorkspace {
             && let Some(digit) = view
                 .chord_prefix
                 .last()
+                .filter(|chord| {
+                    !chord.key.is_empty() && chord.key.bytes().all(|b| b.is_ascii_digit())
+                })
                 .and_then(|chord| chord.key.parse::<u32>().ok())
                 .filter(|digit| *digit <= 9)
         {
@@ -547,7 +608,7 @@ impl EditorWorkspace {
     ) -> Result<Vec<EditorEffect>, EditorError> {
         if view.minibuffer_active() {
             if command == EditorCommand::Abort {
-                view.cancel_transient();
+                self.cancel_transient(store, view);
                 return Ok(vec![EditorEffect::Status("Quit".into())]);
             }
             if matches!(&view.minibuffer, Minibuffer::Search { .. }) {
@@ -569,6 +630,45 @@ impl EditorWorkspace {
             view.prefix_argument = None;
             view.prefix_hud = None;
             return Ok(vec![EditorEffect::Status(refusal)]);
+        }
+        if let Some(listing) = store.directory(view.document) {
+            if matches!(
+                command,
+                EditorCommand::Newline | EditorCommand::RevertBuffer
+            ) && !self.granted.contains(&CommandAuthority::Files)
+            {
+                return Ok(vec![EditorEffect::Status(
+                    "Directory navigation requires file access".into(),
+                )]);
+            }
+            if command == EditorCommand::Newline {
+                view.take_prefix_argument();
+                let head = view.primary_selection().head;
+                return Ok(listing
+                    .target_at(head)
+                    .map(|uri| EditorEffect::OpenPath {
+                        uri: uri.to_string(),
+                    })
+                    .into_iter()
+                    .collect());
+            }
+            if command == EditorCommand::RevertBuffer {
+                view.take_prefix_argument();
+                return Ok(vec![EditorEffect::RefreshDirectory {
+                    document: view.document,
+                }]);
+            }
+            if matches!(command.authority(), CommandAuthority::Edit)
+                || matches!(
+                    command,
+                    EditorCommand::Save
+                        | EditorCommand::KeepBufferOverDisk
+                        | EditorCommand::ToggleGridView
+                )
+            {
+                view.take_prefix_argument();
+                return Ok(vec![EditorEffect::Status("Directory is read-only".into())]);
+            }
         }
         let argument_command = matches!(
             command,
@@ -885,7 +985,7 @@ impl EditorWorkspace {
                 }]);
             }
             EditorCommand::Abort => {
-                view.cancel_transient();
+                self.cancel_transient(store, view);
                 return Ok(vec![EditorEffect::Status("Quit".into())]);
             }
             EditorCommand::UniversalArgument => {
@@ -971,6 +1071,19 @@ impl EditorWorkspace {
         }
         Ok(Vec::new())
     }
+
+    /// Cancel any open minibuffer, chord prefix, prefix argument or active mark on `view`, and
+    /// scroll a grid view back to `origin` when the cancelled minibuffer restored it.
+    fn cancel_transient(&mut self, store: &DocumentStore, view: &mut EditorBufferView) {
+        let restores_origin = matches!(
+            view.minibuffer,
+            Minibuffer::Search { .. } | Minibuffer::GotoLine { .. }
+        );
+        view.cancel_transient();
+        if restores_origin {
+            self.grid_reveal_caret(store, view);
+        }
+    }
 }
 
 pub(super) fn snapshot_for_view(
@@ -1022,6 +1135,97 @@ mod tests {
     use crate::editor::editor;
     use crate::editor::kill::YANK_POP_NEEDS_YANK;
     use crate::store::DocumentTxnOutcome;
+
+    #[test]
+    fn directory_navigation_uses_exact_targets_and_cannot_edit() {
+        use crate::input::EditorInput;
+        use aterm_types::keyboard::{Key, Modifiers};
+        let (mut store, mut workspace, mut view, document) = editor("");
+        store
+            .set_directory(
+                document,
+                crate::store::DirectoryListing {
+                    text: "  escaped\\nname\n".into(),
+                    parent: Some("file:///parent".into()),
+                    entries: vec![(0..16, "file:///parent/escaped%0Aname".into())],
+                },
+            )
+            .unwrap();
+        view.anchor_seq = store.snapshot(document).unwrap().seq;
+        let before = store.snapshot(document).unwrap();
+        assert!(
+            workspace
+                .insert_text(&mut store, &mut view, "")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            workspace
+                .handle_input(&mut store, &mut view, EditorInput::Paste(String::new()))
+                .unwrap()
+                .effects
+                .is_empty()
+        );
+        assert_eq!(
+            workspace
+                .execute(&mut store, &mut view, EditorCommand::Newline)
+                .unwrap(),
+            vec![EditorEffect::OpenPath {
+                uri: "file:///parent/escaped%0Aname".into()
+            }]
+        );
+        for (key, expected) in [
+            (
+                '^',
+                EditorEffect::OpenPath {
+                    uri: "file:///parent".into(),
+                },
+            ),
+            ('g', EditorEffect::RefreshDirectory { document }),
+        ] {
+            assert_eq!(
+                workspace
+                    .handle_input(
+                        &mut store,
+                        &mut view,
+                        EditorInput::Key {
+                            key: Key::Character(if key == '^' { '6' } else { key }),
+                            mods: if key == '^' {
+                                Modifiers::SHIFT
+                            } else {
+                                Modifiers::empty()
+                            },
+                            text: Some(key.to_string()),
+                        }
+                    )
+                    .unwrap()
+                    .effects,
+                vec![expected]
+            );
+        }
+        workspace
+            .insert_text(&mut store, &mut view, "oops")
+            .unwrap();
+        workspace
+            .execute(&mut store, &mut view, EditorCommand::DeleteForward)
+            .unwrap();
+        assert!(matches!(
+            store.replace_text(document, before.seq, "oops"),
+            DocumentTxnOutcome::Rejected(_)
+        ));
+        assert_eq!(store.snapshot(document).unwrap().text, before.text);
+        assert_eq!(store.dirty(document), Some(false));
+        workspace
+            .granted
+            .retain(|authority| *authority != CommandAuthority::Files);
+        assert!(matches!(
+            workspace
+                .execute(&mut store, &mut view, EditorCommand::Newline)
+                .unwrap()
+                .as_slice(),
+            [EditorEffect::Status(_)]
+        ));
+    }
 
     #[test]
     fn multi_selection_edit_is_one_document_transaction() {

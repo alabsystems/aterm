@@ -149,6 +149,7 @@ pub(super) struct HandRow {
 pub(super) struct UnownedCaret {
     pub(super) row: u16,
     pub(super) parked: bool,
+    pub(super) boundary: Option<CaretBoundary>,
 }
 
 impl HandRow {
@@ -2445,7 +2446,7 @@ impl CursorGlow {
     #[inline]
     pub fn note_reflow(&mut self, now: Instant) {
         self.recent_typed_run = None;
-        self.clear_typed(now);
+        self.clear_typed_from(now, BoundaryOrigin::Reflow);
         self.unsettle();
         self.reflow_hint = Some(now);
     }
@@ -2466,7 +2467,7 @@ impl CursorGlow {
     #[doc(hidden)]
     pub fn note_synthetic_move(&mut self, now: Instant) {
         self.recent_typed_run = None;
-        self.clear_typed(now);
+        self.clear_typed_from(now, BoundaryOrigin::Synthetic);
         self.unsettle();
         self.user_gesture_hint = Some(now);
     }
@@ -2942,13 +2943,13 @@ impl CursorGlow {
     /// Disarm dangling typed and backspace hints when a key with its own move semantics arrives.
     #[inline]
     pub fn clear_typed(&mut self, now: Instant) {
-        #[inline]
-        const fn unparked(last: Option<(u16, u16)>) -> Option<UnownedCaret> {
-            match last {
-                Some((row, _)) => Some(UnownedCaret { row, parked: false }),
-                None => None,
-            }
-        }
+        self.clear_typed_from(now, BoundaryOrigin::Unknown);
+    }
+
+    /// [`Self::clear_typed`] with a fixed host origin retained with the resulting row doubt.
+    /// This metadata never contributes to a licence decision.
+    #[inline]
+    pub fn clear_typed_from(&mut self, now: Instant, origin: BoundaryOrigin) {
         self.clear_typed_keeping_hand(now);
         // A typed lay still waiting for its caret to rest is never recalled across this
         // boundary: vim's Escape right after an echo steps the caret back behind it, and the rest
@@ -2957,7 +2958,16 @@ impl CursorGlow {
         // which lit NORMAL's motions).
         self.torn_lay = None;
         self.hand_row = None;
-        self.unowned_caret = unparked(self.last);
+        self.boundary_seq = self.boundary_seq.saturating_add(1);
+        self.unowned_caret = self.last.map(|(row, _)| UnownedCaret {
+            row,
+            parked: false,
+            boundary: Some(CaretBoundary {
+                seq: self.boundary_seq,
+                origin,
+                at: now,
+            }),
+        });
         self.composer_boundary = Some(now);
     }
 

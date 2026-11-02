@@ -3,10 +3,6 @@
 
 //! `aterm-release`: the release cutter behind the `targo --unverified ship` alias.
 
-#![allow(
-    clippy::disallowed_types,
-    reason = "never linked into the shipped binary: the release cutter, run from source"
-)]
 mod apple;
 
 mod artifact;

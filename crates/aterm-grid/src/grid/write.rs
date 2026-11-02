@@ -193,29 +193,35 @@ impl Grid {
         }
     }
 
-    /// Drop the extras-map entries in `cols` of visible row `row` whose cells no longer claim one.
+    /// Drop the extras-map and complex-ring entries in `cols` of visible row `row` whose cells no longer claim them.
     pub fn drop_unclaimed_extras(&mut self, row: u16, cols: core::ops::Range<u16>) {
-        if self.storage.extras.is_empty() || cols.is_empty() {
+        if cols.is_empty() {
             return;
         }
         let width = usize::from(cols.end - cols.start);
-        if !self.storage.extras.map_may_have_row(row, width) {
+        let has_map =
+            !self.storage.extras.is_empty() && self.storage.extras.map_may_have_row(row, width);
+        let has_complex = self.storage.extras.has_complex_ring();
+        if !has_map && !has_complex {
             return;
         }
         let Some(idx) = self.storage.row_index(row) else {
             return;
         };
         for col in cols {
-            let claimed = self
+            let (claims_map, claims_complex) = self
                 .storage
                 .rows
                 .get(idx)
                 .and_then(|r| r.get(col))
-                .is_some_and(Cell::has_extras);
-            if !claimed {
+                .map_or((false, false), |c| (c.has_extras(), c.is_complex()));
+            if has_map && !claims_map {
                 self.storage
                     .extras
                     .strip_unclaimed(CellCoord::new(row, col));
+            }
+            if has_complex && !claims_complex {
+                self.storage.extras.clear_complex_ring_cell(row, col, 1);
             }
         }
     }
@@ -235,6 +241,12 @@ impl Grid {
     /// - above it: move down one row;
     /// - below it: move down unless at the screen bottom (xterm `xtermIndex`: below the region
     ///   is CursorDown clamped at `max_row`, never a display scroll).
+    ///
+    /// The cursor lands on a column its row has: a left margin past a double-width row's
+    /// `cols / 2` columns takes the row's last column. The bulk writers rely on it: they wrap
+    /// whenever the cursor's row has no room left, so a wrap that left the cursor past its
+    /// row's end would wrap again, and at the region bottom (where a margined scroll keeps the
+    /// row's line size) for ever.
     #[inline]
     pub(crate) fn advance_autowrap_line(&mut self) {
         self.storage.wrap_serial += 1;
@@ -275,6 +287,30 @@ impl Grid {
                 }
             }
         }
+
+        let max_col = self.storage.max_col_for_row(self.storage.cursor.row);
+        if self.storage.cursor.col > max_col {
+            self.storage.cursor.col = max_col;
+        }
+    }
+
+    /// The wrap a bulk writer makes when the cursor's row has no room left, refused when the
+    /// previous pass of its loop wrapped without writing: [`Self::advance_autowrap_line`] lands
+    /// on a column its row has, so the pass after a wrap always writes, and a second wrap in a
+    /// row would mean the loop can make no progress. The writer then stops, dropping the rest
+    /// of its run, rather than spin.
+    #[inline]
+    pub(super) fn wrap_for_room(&mut self, wrapped_without_write: &mut bool) -> bool {
+        debug_assert!(
+            !*wrapped_without_write,
+            "a wrap left the cursor where its row has no room"
+        );
+        if *wrapped_without_write {
+            return false;
+        }
+        *wrapped_without_write = true;
+        self.advance_autowrap_line();
+        true
     }
 
     /// Write a character at the cursor and advance it, without wrapping.
@@ -355,6 +391,7 @@ impl Grid {
         let mut remaining = count;
         let scan_stale = !self.storage.extras.is_empty();
 
+        let mut wrapped_without_write = false;
         while remaining > 0 {
             self.resolve_pending_wrap();
 
@@ -395,9 +432,12 @@ impl Grid {
             let to_write = remaining.min(available);
 
             if to_write == 0 {
-                self.advance_autowrap_line();
+                if !self.wrap_for_room(&mut wrapped_without_write) {
+                    break;
+                }
                 continue;
             }
+            wrapped_without_write = false;
 
             let to_write_u16 = u16::try_from(to_write).unwrap_or(u16::MAX);
 
@@ -444,6 +484,7 @@ impl Grid {
         let mut written = 0;
         let mut remaining = ascii;
         let scan_stale = !self.storage.extras.is_empty();
+        let mut wrapped_without_write = false;
         while !remaining.is_empty() {
             self.resolve_pending_wrap();
             let cursor_row = self.storage.cursor.row;
@@ -483,9 +524,12 @@ impl Grid {
             let to_write = remaining.len().min(available);
 
             if to_write == 0 {
-                self.advance_autowrap_line();
+                if !self.wrap_for_room(&mut wrapped_without_write) {
+                    break;
+                }
                 continue;
             }
+            wrapped_without_write = false;
 
             let to_write_u16 = u16::try_from(to_write).unwrap_or(u16::MAX);
 
@@ -562,6 +606,7 @@ impl Grid {
         let mut remaining = ascii;
         let scan_stale = !self.storage.extras.is_empty();
 
+        let mut wrapped_without_write = false;
         while !remaining.is_empty() {
             self.resolve_pending_wrap();
 
@@ -603,9 +648,12 @@ impl Grid {
             let to_write = remaining.len().min(available);
 
             if to_write == 0 {
-                self.advance_autowrap_line();
+                if !self.wrap_for_room(&mut wrapped_without_write) {
+                    break;
+                }
                 continue;
             }
+            wrapped_without_write = false;
 
             let to_write_u16 = u16::try_from(to_write).unwrap_or(u16::MAX);
 

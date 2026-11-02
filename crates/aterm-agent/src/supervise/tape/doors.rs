@@ -5,6 +5,13 @@
 
 /// Control-socket round-trip lane.
 pub const CTL: &str = "ctl";
+/// A semantic duty, exact revision and actual control argv, with a typed-adapter reply.
+pub const CTL_DUTY: &str = "ctl.duty";
+/// A recorded private hosted adapter authority observation; never an input act.
+pub const CTL_AUTHORITY: &str = "ctl.builtin-authority";
+/// A recorded observation of what the host lets the harness do in a session (`on` or
+/// `observe`: whether the kernel confirms its agent); never an input act.
+pub const CTL_AGENT_ACT: &str = "ctl.agent-act";
 
 /// The teller's lane (`story`), its own `Ctl` beside the loop's.
 pub const TELLER: &str = "teller";
@@ -87,7 +94,7 @@ pub const PROBE_ZONE_OFFSET: &str = "probe.zone_offset";
 /// The local zone's offset at an instant, as [`PROBE_ZONE_OFFSET`].
 pub const PROBE_LOCAL_OFFSET: &str = "probe.local_offset_at";
 
-/// The local zone's offset now (`date +%z`), read once a run.
+/// The local zone's offset now, read again once the last read is a minute old.
 pub const PROBE_TZ_OFFSET: &str = "probe.tz_offset";
 
 /// Task-result snapshot write door at a tasked session's done edge.

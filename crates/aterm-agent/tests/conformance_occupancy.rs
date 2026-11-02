@@ -120,6 +120,7 @@ fn facts_read(r: &Real, names: bool) -> FactsReading {
         } else {
             Vec::new()
         },
+        ..FactsReading::default()
     }
 }
 

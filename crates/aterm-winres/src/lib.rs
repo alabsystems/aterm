@@ -248,7 +248,9 @@ fn locate_compiler(target_env: &str, target_arch: &str) -> Result<(PathBuf, Dial
 
     let gnu = target_env == "gnu";
 
-    if let Some(explicit) = std::env::var_os("ATERM_RC") {
+    if let Some(explicit) = std::env::var_os("ATERM_RC")
+        && !explicit.is_empty()
+    {
         let p = PathBuf::from(explicit);
         let found = if p.is_file() {
             Some(p.clone())
@@ -292,7 +294,9 @@ fn locate_compiler(target_env: &str, target_arch: &str) -> Result<(PathBuf, Dial
 
     if !gnu {
         // 2. vcvars exports the versioned SDK bin directory it selected.
-        if let Some(dir) = std::env::var_os("WindowsSdkVerBinPath") {
+        if let Some(dir) = std::env::var_os("WindowsSdkVerBinPath")
+            && !dir.is_empty()
+        {
             let p = PathBuf::from(dir).join(host_sdk_arch()).join("rc.exe");
             if p.is_file() {
                 return Ok((p, Dialect::Rc));
@@ -303,6 +307,9 @@ fn locate_compiler(target_env: &str, target_arch: &str) -> Result<(PathBuf, Dial
             let Some(root) = std::env::var_os(root_var) else {
                 continue;
             };
+            if root.is_empty() {
+                continue;
+            }
             let bin = PathBuf::from(root)
                 .join("Windows Kits")
                 .join("10")
@@ -395,12 +402,20 @@ fn sdk_versions_newest_first<'a>(names: impl IntoIterator<Item = &'a str>) -> Ve
 /// Resolve a program name against `PATH`.
 #[allow(clippy::question_mark)]
 fn find_on_path(program: &Path) -> Option<PathBuf> {
-    if program.components().count() > 1 {
-        return if program.is_file() {
-            Some(program.to_path_buf())
-        } else {
-            None
-        };
+    let mut comps = program.components();
+    match (comps.next(), comps.next()) {
+        (None, _)
+        | (Some(std::path::Component::CurDir | std::path::Component::ParentDir), None) => {
+            return None;
+        }
+        (Some(std::path::Component::Normal(_)), None) => {}
+        _ => {
+            return if program.is_file() {
+                Some(program.to_path_buf())
+            } else {
+                None
+            };
+        }
     }
     let Some(paths) = std::env::var_os("PATH") else {
         return None;
@@ -411,6 +426,9 @@ fn find_on_path(program: &Path) -> Option<PathBuf> {
         &[]
     };
     for dir in std::env::split_paths(&paths) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
         let bare = dir.join(program);
         if bare.is_file() {
             return Some(bare);

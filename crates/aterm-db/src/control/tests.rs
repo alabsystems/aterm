@@ -16,8 +16,25 @@ fn a_previous_round_actor_is_not_a_new_authenticated_contact() {
     assert_eq!(repair.authenticated_actor(), Some(actor));
     repair.application = Some(crate::replica::Report::default());
     repair.application_error = Some("previous upgrade failed".into());
+    repair.data.interrupted = Some(crate::replica::Report {
+        received: 1,
+        ..Default::default()
+    });
+    assert_eq!(repair.application_interrupted().unwrap().received, 1);
+    repair.data.deferral = Some(crate::replica::InventoryDeferral {
+        inventory: "conflicts",
+        local_error: Some("previous store refused".into()),
+        retaining_primary_conflicts: false,
+        peer_unavailable: false,
+    });
+    repair.data.batch_deferral = Some(crate::replica::BatchDeferral {
+        batch: "operations",
+        stage: "ingest",
+        reason: "previous batch refused".into(),
+    });
     repair.membership = Some(Report::default());
     repair.membership_error = Some("previous membership exchange failed".into());
+    repair.data.retry_probe = true;
     repair.phase = Phase::Complete;
     repair.begin_round();
     assert_eq!(repair.phase(), Phase::Connecting);
@@ -32,9 +49,13 @@ fn a_previous_round_actor_is_not_a_new_authenticated_contact() {
         "a failed new connection cannot refresh presence"
     );
     assert!(repair.application().is_none());
+    assert!(repair.application_interrupted().is_none());
     assert!(repair.application_error().is_none());
+    assert!(repair.application_deferral().is_none());
+    assert!(repair.application_batch_deferral().is_none());
     assert!(repair.membership().is_none());
     assert!(repair.membership_error().is_none());
+    assert!(!repair.retry_application_probe());
 }
 use aterm_net::lan::{Connection, Scope};
 use aterm_secrets::{
@@ -158,14 +179,22 @@ fn crossed_native_tls_dials_finish_one_channel_after_both_responders_hold_leases
             )
         });
         let losing_initiator = scope.spawn(move || {
-            high_endpoint.exchange(
+            let mut repair = Repair::default();
+            let lost = high_endpoint.exchange(
                 Connection::connect(low_address, Scope::Loopback, Duration::from_secs(60)).unwrap(),
                 Side::Initiator,
-                &mut Repair::default(),
-            )
+                &mut repair,
+            );
+            (lost, repair)
         });
-        let rejection = losing_initiator.join().unwrap().unwrap_err();
+        let (lost, repair) = losing_initiator.join().unwrap();
+        let rejection = lost.unwrap_err();
         assert!(rejection.to_string().contains("active repair round"));
+        // The losing dial authenticated its peer before it lost: contention, not a refusal.
+        assert_eq!(
+            crate::runtime::Outcome::of(false, &repair, None),
+            crate::runtime::Outcome::Busy
+        );
         assert!(losing_responder.join().unwrap().is_err());
         let initiated = winning_initiator.join().unwrap().unwrap();
         let responded = winning_responder.join().unwrap().unwrap();
@@ -179,6 +208,82 @@ fn crossed_native_tls_dials_finish_one_channel_after_both_responders_hold_leases
             expected
         );
     }
+}
+
+/// One loopback dial from `initiator` to `responder`: what each side's exchange returned, and the
+/// initiator's repair.
+fn dial(responder: &Endpoint, initiator: &Endpoint) -> (Result<Report>, Result<Report>, Repair) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    thread::scope(|scope| {
+        let responded = scope.spawn(|| {
+            responder.exchange(
+                Connection::admit(listener.accept().unwrap().0, Scope::Loopback).unwrap(),
+                Side::Responder,
+                &mut Repair::default(),
+            )
+        });
+        let mut repair = Repair::default();
+        let dialed = initiator.exchange(
+            Connection::connect(address, Scope::Loopback, Duration::from_secs(60)).unwrap(),
+            Side::Initiator,
+            &mut repair,
+        );
+        (responded.join().unwrap(), dialed, repair)
+    })
+}
+
+/// A responder answers a dial only once it admits the round, so contention it meets before its
+/// hello closes the channel with no answer: the other channel of a crossed dial already holds the
+/// pair (the lower actor's preferred round is live when the higher one dials it), or its peer
+/// cache is full of live rounds. The dialing side never authenticates its peer there, and its
+/// endpoint is dialed again at the ordinary interval (`Busy`), never backed off as a refusal.
+/// NEGATIVE CONTROL: with `Outcome::of` reading authentication alone, both dials read `Refused`.
+#[test]
+fn a_dial_its_peer_closes_before_answering_for_contention_is_busy() {
+    use crate::runtime::Outcome;
+    let lab = Lab::new();
+    let endpoints = [lab.endpoint(0), lab.endpoint(1)];
+    let low = usize::from(endpoints[0].actor > endpoints[1].actor);
+    let (low, high) = (&endpoints[low], &endpoints[1 - low]);
+    let until = Instant::now() + Duration::from_secs(60);
+    {
+        let mut preferred = Repair::default();
+        let _round = low
+            .peers
+            .acquire_on(high.actor, &mut preferred, true, until)
+            .unwrap();
+        let (responded, dialed, repair) = dial(low, high);
+        let refusal = responded.unwrap_err().to_string();
+        assert!(refusal.contains("active repair round"), "{refusal}");
+        assert!(dialed.is_err());
+        assert_eq!(repair.authenticated_actor(), None, "the responder answered");
+        assert!(repair.unanswered());
+        assert_eq!(Outcome::of(false, &repair, None), Outcome::Busy);
+    }
+    {
+        let mut others: Vec<_> = (0..peers::CAPACITY).map(|_| Repair::default()).collect();
+        let _rounds: Vec<_> = others
+            .iter_mut()
+            .enumerate()
+            .map(|(n, repair)| low.peers.acquire([n as u8 ^ 0xa5; 48], repair).unwrap())
+            .collect();
+        let (responded, dialed, repair) = dial(low, high);
+        let refusal = responded.unwrap_err().to_string();
+        assert!(refusal.contains("capacity is busy"), "{refusal}");
+        assert!(dialed.is_err());
+        assert!(repair.unanswered());
+        assert_eq!(Outcome::of(false, &repair, None), Outcome::Busy);
+    }
+    // The answered round that follows clears the mark.
+    let (responded, dialed, repair) = dial(low, high);
+    responded.unwrap();
+    let control = dialed.unwrap();
+    assert!(!repair.unanswered());
+    assert!(matches!(
+        Outcome::of(true, &repair, Some(control)),
+        Outcome::Repaired { .. }
+    ));
 }
 
 #[test]
@@ -457,6 +562,7 @@ struct Lab {
 }
 impl Lab {
     fn new() -> Self {
+        aterm_spec::fs_lane::join();
         let authority = crate::crypto::public(&ROOT).unwrap();
         let identities = [Identity::generate().unwrap(), Identity::generate().unwrap()];
         let requests = std::array::from_fn(|n| {
@@ -1396,6 +1502,7 @@ fn failed_responder_hello_reports_current_peer_without_stale_application_success
             saved.prepare(lab.trust, peer.actor);
             saved.cursor = Some([9; 32]);
             saved.application = Some(crate::replica::Report::default());
+            saved.data.retry_probe = true;
             saved.phase = Phase::Complete;
             drop(endpoint.peers.acquire(peer.actor, &mut saved).unwrap());
         }
@@ -1419,6 +1526,7 @@ fn failed_responder_hello_reports_current_peer_without_stale_application_success
         assert_eq!(repair.actor(), Some(peer.actor));
         assert_eq!(repair.phase(), Phase::Membership);
         assert!(repair.application().is_none());
+        assert!(!repair.retry_application_probe());
         assert_eq!(repair.cursor, if cached { Some([9; 32]) } else { None });
     }
 }
@@ -2363,19 +2471,30 @@ fn multi_round_membership_sync_sends_seats_and_parents_before_children_regardles
     // every remaining record lands cleanly in the minimum `ceil(unsent / 16)` rounds.
     let missing_total = local_inv.difference(&remote_inv).count();
     let expected_rounds = missing_total.div_ceil(RECORDS_PER_ROUND);
-    let (mut cur_a, mut cur_b) = (None, None);
+    let (mut cur_a, mut cur_b) = (MembershipHint::default(), MembershipHint::default());
     let mut rounds = 0usize;
     loop {
         rounds += 1;
         let (mut sa, mut sb) = UnixStream::pair().unwrap();
         let ((rep_a, done_a), (rep_b, done_b)) = thread::scope(|s| {
             let responder = s.spawn(|| {
-                exchange_membership_round(&mut sb, &receiver_disk, Side::Responder, &mut cur_b)
-                    .unwrap()
+                exchange_membership_round(
+                    &mut sb,
+                    &receiver_disk,
+                    Side::Responder,
+                    &mut cur_b,
+                    Instant::now(),
+                )
+                .unwrap()
             });
-            let initiator =
-                exchange_membership_round(&mut sa, &sender_disk, Side::Initiator, &mut cur_a)
-                    .unwrap();
+            let initiator = exchange_membership_round(
+                &mut sa,
+                &sender_disk,
+                Side::Initiator,
+                &mut cur_a,
+                Instant::now(),
+            )
+            .unwrap();
             (initiator, responder.join().unwrap())
         });
         assert_eq!(rep_a.deferred, 0, "round {rounds} deferred records");
@@ -2448,10 +2567,17 @@ fn a_converged_membership_exchange_reads_the_records_file_once_per_side() {
     let side = |stream: &mut UnixStream, paths: &Paths, side: Side| {
         let disk = MembershipDisk::new(paths, trust);
         let mut reconciles = 0usize;
-        let report = sync_log_membership(stream, &disk, side, &mut None, &mut |_| {
-            reconciles += 1;
-            false
-        })
+        let report = sync_log_membership(
+            stream,
+            &disk,
+            side,
+            &mut MembershipHint::default(),
+            &mut |_| {
+                reconciles += 1;
+                false
+            },
+            Instant::now(),
+        )
         .unwrap();
         (report, disk.loads.load(Ordering::Relaxed), reconciles)
     };
@@ -2472,4 +2598,737 @@ fn a_converged_membership_exchange_reads_the_records_file_once_per_side() {
             "a converged exchange reconciled {reconciles} times"
         );
     }
+}
+
+/// Two Macs whose complete records each fill `MAX_RECORDS`, on branches the other lacks, refuse
+/// every record the other offers: a store at its bound takes no complete record. Each pass still
+/// offered 16 of them a round, in each of up to three rounds (the refusals moved the second
+/// pass), so 48 refused records crossed each way every pass, every few seconds, forever. A peer
+/// at the bound that took none of a round's records is now offered none while both inventories
+/// stay the same: one round's 16 in the first pass, none in the next, and one round again once
+/// the hold lapses.
+/// NEGATIVE CONTROLS: `MembershipHint::offers` always answering `true`, and `settle` ignoring a
+/// full peer (`full` taken as `false`), each fail "the first pass offered 48 refused records
+/// each way, not one round's 16" (`[48, 48]` against `[16, 16]`).
+#[test]
+fn full_stores_on_different_branches_stop_offering_records_the_other_refused() {
+    use aterm_secrets::{
+        age::Identity,
+        client::{Paths, load_records, save_records},
+        commons::binding::Request as BindRequest,
+        membership_log::{Body, Founder, Log, MAX_RECORDS, Record, Root, encode_records},
+    };
+    use std::os::unix::net::UnixStream;
+    use std::sync::atomic::Ordering;
+
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let a = Paths::for_home(&tmp.path().join("a"));
+    let b = Paths::for_home(&tmp.path().join("b"));
+    let network = [0x45; 16];
+    let authority = [0x46; 32];
+    let founder = |n: u8| {
+        let identity = Identity::from_secret_bytes([0x10 + n; 32]);
+        let writer = [0x20 + n; 32];
+        let incarnation = [0x30 + n; 16];
+        let request =
+            BindRequest::create(network, authority, [n; 16], incarnation, &identity, &writer)
+                .unwrap();
+        let founder = Founder {
+            recipient: identity.recipient(),
+            binding: Some(request.binding().clone()),
+            node_key: Some([0x50 + n; 32]),
+            name: format!("m{n}"),
+            label: format!("m{n}"),
+        };
+        (request.binding().actor(), writer, incarnation, founder)
+    };
+    let (m1, w1, inc1, f1) = founder(1);
+    let (m2, w2, inc2, f2) = founder(2);
+    let genesis = Record::genesis(
+        &[0x97; 32],
+        Root { network, authority },
+        vec![f1, f2],
+        1_000,
+    )
+    .unwrap();
+    let trust = Trust {
+        network,
+        authority,
+        genesis: *genesis.id(),
+    };
+    // Each Mac's own branch from the shared genesis, filled to the bound.
+    for (paths, tag, actor, writer, incarnation) in
+        [(&a, "a", m1, w1, inc1), (&b, "b", m2, w2, inc2)]
+    {
+        let mut log = Log::new(genesis.clone()).unwrap();
+        for n in 1..MAX_RECORDS {
+            let name = format!("{tag}-{n}");
+            let record = log
+                .draft(&actor, 10_000 + n as u64, Body::Name { name })
+                .sign(&writer, incarnation)
+                .unwrap();
+            log.insert(record).unwrap();
+        }
+        let records: Vec<Record> = log.records().cloned().collect();
+        save_records(paths, &encode_records(&records)).unwrap();
+        assert_eq!(
+            load_records(paths).unwrap().complete_inventory().len(),
+            MAX_RECORDS
+        );
+    }
+
+    // One pass each way at `now`, with each side's hint for the other kept across passes;
+    // answers how many records each side put on the wire.
+    let mut hints = [MembershipHint::default(), MembershipHint::default()];
+    let mut pass = |now: Instant| {
+        let [hint_a, hint_b] = &mut hints;
+        let side = |stream: &mut UnixStream, paths: &Paths, side: Side, hint| {
+            let disk = MembershipDisk::new(paths, trust);
+            let report =
+                sync_log_membership(stream, &disk, side, hint, &mut |_| false, now).unwrap();
+            assert_eq!(
+                (report.sent, report.received),
+                (0, 0),
+                "a full store took a record"
+            );
+            disk.batched.load(Ordering::Relaxed)
+        };
+        let (mut sa, mut sb) = UnixStream::pair().unwrap();
+        thread::scope(|s| {
+            let responder = s.spawn(|| side(&mut sb, &b, Side::Responder, hint_b));
+            let initiator = side(&mut sa, &a, Side::Initiator, hint_a);
+            [initiator, responder.join().unwrap()]
+        })
+    };
+    let start = Instant::now();
+    let first = pass(start);
+    assert_eq!(
+        first, [RECORDS_PER_ROUND; 2],
+        "the first pass offered {} refused records each way, not one round's {RECORDS_PER_ROUND}",
+        first[0]
+    );
+    let second = pass(start + Duration::from_secs(1));
+    assert_eq!(
+        second, [0; 2],
+        "the next pass offered records the full peer refused"
+    );
+    let lapsed = pass(start + REFUSAL_HOLD);
+    assert_eq!(
+        lapsed, [RECORDS_PER_ROUND; 2],
+        "a lapsed hold retries one round, as a refusal from a busy disk needs"
+    );
+    for paths in [&a, &b] {
+        assert_eq!(
+            load_records(paths).unwrap().complete_inventory().len(),
+            MAX_RECORDS
+        );
+    }
+}
+
+/// A peer that took none of one round, because another writer held its state lock past
+/// `retain_records_for_commons`'s wait, still takes every record it lacks on the next pass. The
+/// rounds after the busy one offered its children, which the peer parks, waiting for their
+/// parents, without taking them; a hold armed by the one refused round renewed itself on each of
+/// those and walked the rest 16 records a minute. A hold now needs a run of refused rounds that
+/// offered every record the peer lacks (or a peer at `MAX_RECORDS`), so the next pass comes back
+/// round to the parents at once.
+/// NEGATIVE CONTROL: `MembershipHint::settle` proving a hold on a run's first refused round
+/// (`full` taken as `true`) fails "a peer that refused one busy round lacks 56 records a pass
+/// later".
+#[test]
+fn a_peer_busy_for_one_round_takes_every_record_on_the_next_pass() {
+    use aterm_secrets::{
+        client::{Paths, load_records, save_records},
+        commons::binding::Request as BindRequest,
+        membership_log::{Body, Founder, Log, Record, Root, encode_records},
+    };
+    use std::os::unix::net::UnixStream;
+    use std::sync::atomic::Ordering;
+
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let a = Paths::for_home(&tmp.path().join("a"));
+    let b = Paths::for_home(&tmp.path().join("b"));
+    let network = [0x47; 16];
+    let authority = [0x48; 32];
+    let identity = Identity::from_secret_bytes([0x14; 32]);
+    let writer = [0x24; 32];
+    let incarnation = [0x34; 16];
+    let request =
+        BindRequest::create(network, authority, [4; 16], incarnation, &identity, &writer).unwrap();
+    let m1 = request.binding().actor();
+    let genesis = Record::genesis(
+        &[0x96; 32],
+        Root { network, authority },
+        vec![Founder {
+            recipient: identity.recipient(),
+            binding: Some(request.binding().clone()),
+            node_key: Some([0x54; 32]),
+            name: "m1".into(),
+            label: "m1".into(),
+        }],
+        1_000,
+    )
+    .unwrap();
+    let trust = Trust {
+        network,
+        authority,
+        genesis: *genesis.id(),
+    };
+    // One chain from the genesis, each record the parent of the next, that only `a` holds: more
+    // than a pass's three rounds offer, so the busy pass never comes back round to its parents.
+    let mut log = Log::new(genesis.clone()).unwrap();
+    for n in 1..=3 * RECORDS_PER_ROUND + 8 {
+        let name = format!("m1-{n}");
+        let record = log
+            .draft(&m1, 10_000 + n as u64, Body::Name { name })
+            .sign(&writer, incarnation)
+            .unwrap();
+        log.insert(record).unwrap();
+    }
+    let records: Vec<Record> = log.records().cloned().collect();
+    save_records(&a, &encode_records(&records)).unwrap();
+    save_records(&b, genesis.bytes()).unwrap();
+    let held = load_records(&a).unwrap().complete_inventory();
+
+    // One pass each way at `now`, with each side's hint kept across passes, while `b` takes
+    // none of its first `busy` batches.
+    let mut hints = [MembershipHint::default(), MembershipHint::default()];
+    let mut pass = |now: Instant, busy: usize| {
+        let [hint_a, hint_b] = &mut hints;
+        let side = |stream: &mut UnixStream, paths: &Paths, side: Side, hint, busy| {
+            let disk = MembershipDisk::new(paths, trust);
+            disk.busy.store(busy, Ordering::Relaxed);
+            sync_log_membership(stream, &disk, side, hint, &mut |_| false, now).unwrap();
+        };
+        let (mut sa, mut sb) = UnixStream::pair().unwrap();
+        thread::scope(|s| {
+            let responder = s.spawn(|| side(&mut sb, &b, Side::Responder, hint_b, busy));
+            side(&mut sa, &a, Side::Initiator, hint_a, 0);
+            responder.join().unwrap();
+        });
+    };
+    let start = Instant::now();
+    pass(start, 1);
+    assert_eq!(
+        load_records(&b).unwrap().complete_inventory().len(),
+        1,
+        "the busy round left the peer holding only the genesis"
+    );
+    pass(start + Duration::from_secs(1), 0);
+    let taken = load_records(&b).unwrap().complete_inventory();
+    assert_eq!(
+        taken.len(),
+        held.len(),
+        "a peer that refused one busy round lacks {} records a pass later",
+        held.len() - taken.len()
+    );
+    assert_eq!(taken, held);
+}
+
+/// A store that holds the ids inside and durably takes no record offered it.
+struct Refusing(std::sync::Mutex<BTreeSet<Digest>>);
+impl Store for Refusing {
+    const MAX_WIRE: usize = 32;
+    fn inventory(&self) -> Result<BTreeSet<Digest>> {
+        Ok(self.0.lock().unwrap().clone())
+    }
+    fn batch(&self, ids: &[Digest]) -> Result<Vec<Vec<u8>>> {
+        Ok(ids.iter().map(|id| id.to_vec()).collect())
+    }
+    fn retain(&self, wires: &[Vec<u8>]) -> Result<Vec<bool>> {
+        Ok(vec![false; wires.len()])
+    }
+}
+
+/// A hold is keyed on both complete inventories a round trades: a peer that refused everything
+/// is offered records again as soon as it holds a new record or this Mac does, since either can
+/// change what it takes, and the one round a lapsed hold offers, refused, holds again at once.
+/// NEGATIVE CONTROLS: `hold_key` over this Mac's inventory alone (`local` twice) fails "the peer
+/// took a record, so it is offered records again"; over the peer's alone (`remote` twice) fails
+/// "this Mac took a record, so it offers records again"; `settle` not renewing a held run fails
+/// "a refused retry holds again at once".
+#[test]
+fn a_refusal_hold_ends_when_either_inventory_changes_and_a_refused_retry_renews_it() {
+    use std::os::unix::net::UnixStream;
+
+    let ids = |n: std::ops::RangeInclusive<u8>| n.map(|n| [n; 32]).collect::<BTreeSet<Digest>>();
+    // `b` holds a subset of `a`, so only `a` offers.
+    let a = Refusing(std::sync::Mutex::new(ids(1..=20)));
+    let b = Refusing(std::sync::Mutex::new(ids(1..=1)));
+    let mut hints = [MembershipHint::default(), MembershipHint::default()];
+    // One round at `now`; answers how many records `a` offered, every one refused.
+    let mut round = |now: Instant| {
+        let [hint_a, hint_b] = &mut hints;
+        let (mut sa, mut sb) = UnixStream::pair().unwrap();
+        thread::scope(|s| {
+            let responder = s.spawn(|| {
+                exchange_membership_round(&mut sb, &b, Side::Responder, hint_b, now).unwrap()
+            });
+            let (report, _) =
+                exchange_membership_round(&mut sa, &a, Side::Initiator, hint_a, now).unwrap();
+            let (answer, _) = responder.join().unwrap();
+            assert_eq!(
+                (report.sent, answer.received, answer.deferred),
+                (0, 0, report.deferred)
+            );
+            report.deferred
+        })
+    };
+    let start = Instant::now();
+    assert_eq!(round(start), RECORDS_PER_ROUND, "the first round offers");
+    assert_eq!(
+        round(start),
+        RECORDS_PER_ROUND,
+        "one refused round short of every missing record proves nothing"
+    );
+    assert_eq!(round(start), 0, "an unchanged pair of inventories is held");
+    let lapsed = start + REFUSAL_HOLD;
+    assert_eq!(
+        round(lapsed),
+        RECORDS_PER_ROUND,
+        "a lapsed hold offers one round"
+    );
+    assert_eq!(round(lapsed), 0, "a refused retry holds again at once");
+    b.0.lock().unwrap().insert([20; 32]);
+    assert_eq!(
+        round(lapsed),
+        RECORDS_PER_ROUND,
+        "the peer took a record, so it is offered records again"
+    );
+    assert_eq!(round(lapsed), RECORDS_PER_ROUND);
+    assert_eq!(round(lapsed), 0, "the new pair of inventories is held");
+    a.0.lock().unwrap().insert([21; 32]);
+    assert_eq!(
+        round(lapsed),
+        RECORDS_PER_ROUND,
+        "this Mac took a record, so it offers records again"
+    );
+}
+
+/// A hint for one peer never holds back another: `Repair::prepare` starts a new peer's hint
+/// afresh, while the same peer's next connection keeps it.
+/// NEGATIVE CONTROL: `Repair::prepare` keeping the hint for a new peer fails "another peer is not
+/// held by the first one's refusal".
+#[test]
+fn a_new_peer_is_not_held_by_the_last_peers_refusal() {
+    let now = Instant::now();
+    let key = [1; 32];
+    let trust = Trust {
+        network: [1; 16],
+        authority: [2; 32],
+        genesis: [3; 32],
+    };
+    let mut repair = Repair::default();
+    repair.prepare(trust, [4; 48]);
+    repair.membership_hint.settle(key, &[[2; 32]], 0, true, now);
+    repair.prepare(trust, [4; 48]);
+    assert!(
+        !repair.membership_hint.offers(&key, now),
+        "the same peer's next connection keeps its hold"
+    );
+    repair.prepare(trust, [5; 48]);
+    assert!(
+        repair.membership_hint.offers(&key, now),
+        "another peer is not held by the first one's refusal"
+    );
+}
+
+#[test]
+fn log_witness_and_acx2_handle_restored_seats_rotated_node_keys_and_denied_writer_keys() {
+    use aterm_secrets::{
+        client::{
+            JoinOptions, JoinPassword, Paths, admin_cached, admin_commons_init, admin_open,
+            admin_publish, admin_publish_approved, admit_member_in_log, create, join, load_records,
+            machine_identity, remove_member_in_log, save_records, sync, test_sign_genesis,
+        },
+        commons::{
+            binding::Pending,
+            bootstrap::{Bootstrap, Device},
+            journal::Journal,
+        },
+        membership_log::{Body, Entrant, Evidence, NodeStanding, node_proof_message},
+        swarm_roster::{ROSTER_ENTRY, SwarmRoster},
+        text::Audience,
+    };
+    use ring::signature::{Ed25519KeyPair, KeyPair};
+
+    let join_local = |paths: &Paths, source: &str, host: &str| {
+        join(
+            paths,
+            &JoinOptions {
+                source: source.to_owned(),
+                host: Some(host.to_owned()),
+                interactive: false,
+                wait: Duration::from_secs(2),
+                confirm: &|_| false,
+                password: JoinPassword::Given(None),
+                fetched: None,
+                requested: &|| {},
+                say: &|_| {},
+            },
+        )
+        .expect("join local vault");
+    };
+    let enroll_v1 = |owner_paths: &Paths, member_paths: &Paths| {
+        sync(member_paths, None).expect("sync member");
+        let owner = Bootstrap::required(owner_paths).expect("owner bootstrap");
+        let peer = Bootstrap::required(member_paths).expect("peer bootstrap");
+        let req = peer.request().expect("peer request");
+        let (mut pending, ch) =
+            Pending::issue(&req, owner.trust().network, owner.trust().authority).unwrap();
+        let ans = peer.device().answer(&req, &ch).unwrap();
+        let mut journal = Journal::open_existing(owner.journal_dir(), owner.trust()).unwrap();
+        admin_cached(owner_paths)
+            .unwrap()
+            .enroll_commons_member(&owner, &mut journal, pending.verify(&ans).unwrap())
+            .expect("v1 enroll");
+        let mut peer_journal = Journal::open(peer.journal_dir(), peer.trust()).unwrap();
+        let ids: Vec<_> = journal.inventory().copied().collect();
+        for id in ids {
+            let _ = peer_journal
+                .ingest(journal.node(&id).unwrap().bytes())
+                .unwrap();
+        }
+    };
+
+    let root = aterm_tempfile::tempdir().unwrap();
+    let vault_file = root.path().join("witness.vault");
+    let m1 = Paths::for_home(&root.path().join("m1"));
+    let created = create(&m1, vault_file.to_str().unwrap(), None, Some("m1")).unwrap();
+    admin_commons_init(&m1).unwrap();
+    let pinned = format!("{}#{}", vault_file.display(), created.signer);
+
+    let m2 = Paths::for_home(&root.path().join("m2"));
+    let m3 = Paths::for_home(&root.path().join("m3"));
+    let r2 = machine_identity(&m2).unwrap().recipient().to_bech32();
+    let r3 = machine_identity(&m3).unwrap().recipient().to_bech32();
+    {
+        let admin = admin_open(&m1).unwrap();
+        let mut doc = admin.doc.clone();
+        doc.add_machine("m2", &r2).unwrap();
+        doc.add_machine("m3", &r3).unwrap();
+        admin_publish_approved(&m1, &admin, &doc, &[r2.clone(), r3.clone()]).unwrap();
+    }
+    for (p, h) in [(&m2, "m2"), (&m3, "m3")] {
+        join_local(p, &pinned, h);
+        enroll_v1(&m1, p);
+        sync(p, None).unwrap();
+    }
+
+    let genesis_out = root.path().join("witness.genesis");
+    test_sign_genesis(&m1, &genesis_out, &created.signer).expect("sign genesis");
+
+    // 1. Admit `m4` with node key `[0x77; 32]`, remove `m2` via `remove_member_in_log` (rotates
+    //    Commons and Vault epochs), restore `m2` via `Log::admit` with that same node key
+    //    `[0x77; 32]`, and then remove `m4` so `[0x77; 32]` becomes `NodeStanding::Removed`.
+    let b1 = Bootstrap::required(&m1).unwrap();
+    let trust = b1.trust();
+    let req1 = b1.request().unwrap();
+    let actor_m1 = req1.binding().actor();
+    let id1 = machine_identity(&m1).unwrap();
+    let req2 = Device::open(&m2)
+        .unwrap()
+        .unwrap()
+        .request(trust.network, trust.authority)
+        .unwrap();
+    let actor_m2 = req2.binding().actor();
+
+    let m4 = Paths::for_home(&root.path().join("m4"));
+    aterm_secrets::client::configure_log_member(&m4, &pinned, "m4").unwrap();
+    let _ = machine_identity(&m4).unwrap();
+    let req4 = Device::open(&m4)
+        .unwrap()
+        .unwrap()
+        .request(trust.network, trust.authority)
+        .unwrap();
+    let actor_m4 = req4.binding().actor();
+    admit_member_in_log(
+        &m1,
+        Entrant {
+            request: req4,
+            node_key: [0x77; 32],
+            name: "m4".into(),
+            label: "m4".into(),
+        },
+        Evidence::Phrase,
+    )
+    .expect("admit m4 with node key 0x77");
+
+    remove_member_in_log(&m1, actor_m2).expect("remove m2");
+
+    {
+        let mut store1 = load_records(&m1).unwrap();
+        let mut log1 = store1.log().unwrap().clone();
+        let opened1 = log1.open_audience_entries(&id1).unwrap().unwrap();
+        let audiences1 = aterm_secrets::membership_log::admission_audiences(&opened1);
+        let dev1 = Device::open(&m1).unwrap().unwrap();
+        let restored_recs = dev1
+            .with_seed(|seed| {
+                log1.admit(
+                    &aterm_secrets::membership_log::Signer {
+                        actor: &actor_m1,
+                        seed,
+                        incarnation: *req1.binding().incarnation(),
+                    },
+                    Entrant {
+                        request: req2.clone(),
+                        node_key: [0x77; 32],
+                        name: "m2".into(),
+                        label: "m2".into(),
+                    },
+                    &opened1,
+                    &audiences1,
+                    5_000,
+                )
+            })
+            .expect("restore m2 via Log::admit");
+        store1
+            .ingest(&aterm_secrets::membership_log::encode_records(
+                &restored_recs,
+            ))
+            .unwrap();
+        save_records(&m1, &store1.encode()).unwrap();
+    }
+
+    remove_member_in_log(&m1, actor_m4).expect("remove m4 so node key 0x77 is Removed");
+
+    // Verify `historical_seat_entry` for `m2` points to its restoring `Admit` (not `records[0]`),
+    // and `[0x77; 32]` is `NodeStanding::Removed`.
+    let store1 = load_records(&m1).unwrap();
+    let log1 = store1.log().unwrap();
+    let log_genesis_id = *log1.genesis().id();
+    assert_ne!(
+        log1.historical_seat_entry(req2.binding()),
+        Some(log_genesis_id),
+        "restored founder m2 must use restoring Admit as historical_seat_entry"
+    );
+    assert!(matches!(
+        log1.membership().node(&[0x77; 32]),
+        NodeStanding::Removed(_)
+    ));
+
+    // 2. `m2` rotates its fleet node key via `Body::Node` to a fresh key `fresh_node_pub`, and
+    //    `Bootstrap::log_witness()` includes the restoring `Admit`, `Wrap`, and `Node` record so
+    //    `check_log_witness` and `Endpoint::from_bootstrap` succeed!
+    let fresh_node_pair = Ed25519KeyPair::from_seed_unchecked(&[0x88; 32]).unwrap();
+    let mut fresh_node_pub = [0u8; 32];
+    fresh_node_pub.copy_from_slice(fresh_node_pair.public_key().as_ref());
+    let proof_sig = fresh_node_pair.sign(&node_proof_message(&log_genesis_id, &actor_m2));
+    let mut proof_bytes = [0u8; 64];
+    proof_bytes.copy_from_slice(proof_sig.as_ref());
+
+    let mut log_with_node = log1.clone();
+    let dev2 = Device::open(&m2).unwrap().unwrap();
+    let draft = log_with_node.draft(
+        &actor_m2,
+        9_999,
+        Body::Node {
+            node_key: fresh_node_pub,
+            proof: proof_bytes,
+        },
+    );
+    let node_rec = dev2
+        .with_seed(|seed| draft.sign(seed, *req2.binding().incarnation()))
+        .unwrap();
+    log_with_node.insert(node_rec).unwrap();
+    assert_eq!(
+        log_with_node.membership().node(&fresh_node_pub),
+        NodeStanding::Member(actor_m2)
+    );
+
+    let mut store_all = store1.clone();
+    let _ = store_all.ingest(&aterm_secrets::membership_log::encode_records(
+        &log_with_node.records().cloned().collect::<Vec<_>>(),
+    ));
+    let encoded_all = store_all.encode();
+    save_records(&m1, &encoded_all).unwrap();
+    save_records(&m2, &encoded_all).unwrap();
+
+    let b2 = Bootstrap::required(&m2).expect("restored + node-rotated m2 bootstrap");
+    let witness2 = b2
+        .log_witness()
+        .expect("log_witness succeeds")
+        .expect("witness present");
+    let peer_log = check_log_witness(trust, &req2, &witness2)
+        .expect("restored + node-rotated member witness must pass check_log_witness");
+    let ep2 = Endpoint::from_bootstrap(&b2)
+        .expect("Endpoint::from_bootstrap succeeds for restored + node-rotated member")
+        .expect("endpoint present");
+    verify_peer_against_local_log(Some(&m1), trust, actor_m2, &ep2.hello, Some(&peer_log))
+        .expect("restored + node-rotated member must pass verify_peer_against_local_log");
+
+    // 3. Direct writer-key denial in `verify_peer_against_local_log`:
+    // Even if `m2`'s recipient has an un-denied row in `SwarmRoster`, denying `req2.binding().writer()`
+    // in `deny_nodes` must cause `verify_peer_against_local_log` to reject `m2`!
+    {
+        let admin = admin_open(&m1).unwrap();
+        let mut doc = admin.doc.clone();
+        let mut writer_hex = String::with_capacity(64);
+        for b in req2.binding().writer() {
+            use std::fmt::Write;
+            write!(&mut writer_hex, "{b:02x}").unwrap();
+        }
+        let roster_toml = format!(
+            "version = 1\ndeny_nodes = [\"{writer_hex}\"]\n\n[[members]]\nlabel = \"m2\"\nvault_name = \"m2\"\nage_recipient = \"{r2}\"\n"
+        );
+        let roster = SwarmRoster::from_toml(&roster_toml).unwrap();
+        doc.set_entry(
+            &Audience::Hosts(vec!["m1".into(), "m2".into(), "m3".into()]),
+            ROSTER_ENTRY,
+            roster.to_toml().as_bytes(),
+        )
+        .unwrap();
+        admin_publish(&m1, &admin, &doc).unwrap();
+    }
+
+    let err =
+        verify_peer_against_local_log(Some(&m1), trust, actor_m2, &ep2.hello, Some(&peer_log))
+            .expect_err("peer whose writer key is in deny_nodes must be refused");
+    assert!(
+        err.to_string()
+            .contains("Commons peer was removed from the membership log"),
+        "unexpected error: {err}"
+    );
+}
+
+/// Distinct valid membership-log witnesses of one founder's request: `count` prefixes of one log
+/// (its genesis, then one more of the founder's signed `Name` records in each).
+fn witness_prefixes(count: usize) -> (Trust, Request, Vec<Vec<u8>>) {
+    use aterm_secrets::{
+        age::Identity,
+        membership_log::{Body, Founder, Log, Record, Root, encode_records},
+    };
+    let network = [0x41; 16];
+    let authority = [0x42; 32];
+    let identity = Identity::from_secret_bytes([0x11; 32]);
+    let writer = [0x21; 32];
+    let incarnation = [0x31; 16];
+    let request =
+        Request::create(network, authority, [1; 16], incarnation, &identity, &writer).unwrap();
+    let genesis = Record::genesis(
+        &[0x99; 32],
+        Root { network, authority },
+        vec![Founder {
+            recipient: identity.recipient(),
+            binding: Some(request.binding().clone()),
+            node_key: Some([0x51; 32]),
+            name: "m1".into(),
+            label: "m1".into(),
+        }],
+        1_000,
+    )
+    .unwrap();
+    let trust = Trust {
+        network,
+        authority,
+        genesis: *genesis.id(),
+    };
+    let actor = request.binding().actor();
+    let mut log = Log::new(genesis).unwrap();
+    for seq in 1..count {
+        let name = log
+            .draft(
+                &actor,
+                10_000 + seq as u64,
+                Body::Name {
+                    name: format!("m1-{seq}"),
+                },
+            )
+            .sign(&writer, incarnation)
+            .unwrap();
+        log.insert(name).unwrap();
+    }
+    let records: Vec<_> = log.records().cloned().collect();
+    let witnesses = (1..=count).map(|n| encode_records(&records[..n])).collect();
+    (trust, request, witnesses)
+}
+
+fn decodes(logs: &WitnessLogs) -> usize {
+    logs.decodes.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A fleet's peers present their log witnesses round-robin, one per round, and every round
+/// checks its peer's twice (authentication, then the local log). The cache holds one decoded log
+/// per peer of a full roster and keeps the most recently used, so each witness is decoded once.
+/// NEGATIVE CONTROL: at the 16 entries the cache held before, 24 peers round-robin decode on
+/// every access (72 in three passes, not 24), and first-in first-out eviction (no move to the
+/// back on a hit) decodes a hot peer's witness again.
+#[test]
+fn witness_logs_decode_each_peer_once_round_robin_and_keep_the_hot_one() {
+    const PEERS: usize = 24;
+    const { assert!(WITNESS_ENTRIES > aterm_secrets::commons::roster::MAX_MEMBERS) };
+    const { assert!(WITNESS_BYTES >= 16 * (MAX_ACX2_HELLO - HELLO_FIXED)) };
+    let (trust, request, witnesses) = witness_prefixes(PEERS);
+    let pass = |logs: &WitnessLogs| {
+        for wire in &witnesses {
+            let log = logs.check(trust, &request, wire).unwrap();
+            assert_eq!(
+                aterm_secrets::membership_log::encode_records(
+                    &log.records().cloned().collect::<Vec<_>>()
+                ),
+                *wire,
+                "a held log was handed out for other bytes"
+            );
+        }
+    };
+    let roster = WitnessLogs::new(PEERS, usize::MAX);
+    for _ in 0..3 {
+        pass(&roster);
+    }
+    assert_eq!(decodes(&roster), PEERS);
+    let sixteen = WitnessLogs::new(16, usize::MAX);
+    for _ in 0..3 {
+        pass(&sixteen);
+    }
+    assert_eq!(
+        decodes(&sixteen),
+        3 * PEERS,
+        "the negative control kept a log"
+    );
+
+    // Most recently used survives: a, b, a, c, a decodes a, b and c once each with room for two.
+    let two = WitnessLogs::new(2, usize::MAX);
+    for n in [0, 1, 0, 2, 0] {
+        two.check(trust, &request, &witnesses[n]).unwrap();
+    }
+    assert_eq!(
+        decodes(&two),
+        3,
+        "a hot witness was evicted first-in first-out"
+    );
+
+    // The byte bound evicts the least recently used too, never the entry just kept.
+    let bytes = witnesses[PEERS - 1].len() + witnesses[PEERS - 2].len();
+    let tight = WitnessLogs::new(PEERS, bytes);
+    for wire in witnesses[PEERS - 3..].iter().chain(&witnesses[PEERS - 3..]) {
+        tight.check(trust, &request, wire).unwrap();
+    }
+    assert_eq!(
+        decodes(&tight),
+        6,
+        "the byte bound held three witnesses it has room for two of"
+    );
+    assert!(tight.check(trust, &request, &witnesses[PEERS - 1]).is_ok());
+    assert_eq!(decodes(&tight), 6);
+
+    // A held log still judges each request: another device it gives no seat is refused, without
+    // decoding again, and its refusal is not kept.
+    let stranger = Request::create(
+        trust.network,
+        trust.authority,
+        [2; 16],
+        [0x32; 16],
+        &aterm_secrets::age::Identity::from_secret_bytes([0x12; 32]),
+        &[0x22; 32],
+    )
+    .unwrap();
+    for _ in 0..2 {
+        assert!(roster.check(trust, &stranger, &witnesses[0]).is_err());
+    }
+    assert_eq!(decodes(&roster), PEERS);
+    assert!(
+        WitnessLogs::new(PEERS, usize::MAX)
+            .check(trust, &stranger, &witnesses[0])
+            .is_err()
+    );
 }

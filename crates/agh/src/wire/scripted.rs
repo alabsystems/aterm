@@ -46,7 +46,9 @@ pub struct SeenRequest {
 #[derive(Default)]
 pub struct ScriptedTransport {
     queue: Mutex<VecDeque<Scripted>>,
-    seen: Mutex<Vec<SeenRequest>>,
+    /// Each request seen, with its permit's profile or `None`, pushed as one pair so that
+    /// concurrent round trips never pair a request with another's permit.
+    seen: Mutex<Vec<(SeenRequest, Option<String>)>>,
 }
 
 impl ScriptedTransport {
@@ -82,14 +84,21 @@ impl ScriptedTransport {
         self.seen
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+            .iter()
+            .map(|(request, _)| request.clone())
+            .collect()
     }
 
     /// The permit's profile beside each request seen, in order: one entry per request, the
-    /// profile or `None`. Empty until WP3 records the permits (plan §7, body 2).
+    /// profile or `None`.
     #[must_use]
     pub fn permits(&self) -> Vec<Option<String>> {
-        Vec::new()
+        self.seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|(_, permit)| permit.clone())
+            .collect()
     }
 
     /// Outcomes still queued.
@@ -126,14 +135,17 @@ impl Transport for ScriptedTransport {
         self.seen
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push(SeenRequest {
-                method: req.method,
-                url: req.url,
-                headers: req.headers,
-                auth_profile: req.auth.map(|a| a.profile().to_string()),
-                auth_fingerprint: req.auth.map(|a| a.fingerprint().to_string()),
-                body,
-            });
+            .push((
+                SeenRequest {
+                    method: req.method,
+                    url: req.url,
+                    headers: req.headers,
+                    auth_profile: req.auth.map(|a| a.profile().to_string()),
+                    auth_fingerprint: req.auth.map(|a| a.fingerprint().to_string()),
+                    body,
+                },
+                req.permit.map(|permit| permit.profile().to_string()),
+            ));
         let next = self
             .queue
             .lock()

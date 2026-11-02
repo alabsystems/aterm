@@ -4,7 +4,7 @@ seq v=1 rig=transcript program=claude build=2.1.294
 # fixture, lines 2-6, folded whole there): each row at the offset and time
 # the real reader hands it on (dated= relative, the prompt at 0), read the
 # instant it was written. 2.1.294 is no measured build (aterm-agent's
-# MEASURED_BUILDS names 2.1.303 alone), so the reader hands every row on Partial
+# MEASURED_BUILDS does not name it), so the reader hands every row on Partial
 # (S9): the transcript adds at strong and never opens or closes the turn
 # nor names its wall. The screen lines are this test's own (no fixture):
 # busy as the prompt is written, at rest after the turn end.

@@ -3,25 +3,16 @@
 
 # aterm-serde: spec recovery from its unit tests
 
-> Status 2026-10-19: this is the crate's migration worklist. Each of the 22 specs below is
-> proved through Trust/Clean about the compiled Rust, and then the tests it subsumes are
-> deleted. No test has been deleted yet. None of the 190 mapped tests is a non-spec check, so
-> nothing can be deleted ahead of a proof (§4).
+Each row of §1 is a property of `crates/aterm-serde`'s compiled Rust, or of the code
+`crates/aterm-serde-derive` generates (its input parser is `crates/aterm-macro-support`), that a
+group of tests samples; once a row is proved through Trust/Clean, the tests §2 maps to it can go.
+The tests are in `tests/`, all run by `tests/serde_suite.rs`; `src/` has none. §0 defines the
+notation, §4 lists the tests to trim, §5 the places where an implied spec and the code or a test
+disagree, and §6 orders the proofs. The claims come from reading the code.
 
-Source: `crates/aterm-serde` (read only), plus the derive it tests (`crates/aterm-serde-derive`,
-`crates/aterm-macro-support`). The tests are `tests/{de 47, de_error 36, annotations 23, ser 22,
-enum_untagged 17, enum_internally_tagged 16, derive_input 13, attrs 8, untrusted 4, value 2,
-text_keys 2, ignored_any 1}` = 191, all run by `tests/serde_suite.rs`. `src/` has no `#[test]`.
-`derive_input::self_inside_a_type_macro_remains_the_macros_input` landed after this map and is
-not mapped yet; the other 190 are.
-`tests/support/` is the serde_test token harness. It is test-only code that the tests use to
-observe the crate. It is not itself tested, and no spec is about it.
-The first recovery pass read 176 tests. The merge read the 12 in `derive_input.rs` and added
-`derive-input-parse` for them. Nothing was compiled or run. The claims below come from reading
-the code. `buffered-text-key` and its 2 `text_keys` tests came with ATERM-KI-1015-7's fix, and
-were run.
-
-Result: **22 specs**, covering **190 of the 191 tests**. **0 tests are non-spec samples** (§4).
+`tests/support/` is the serde_test token harness: test-only code the tests observe the crate
+through, and no spec is about it. §2 maps every test except
+`derive_input::self_inside_a_type_macro_remains_the_macros_input`.
 
 ## 0. Notation used in the statements
 
@@ -33,15 +24,14 @@ Result: **22 specs**, covering **190 of the 191 tests**. **0 tests are non-spec 
   `Struct{name,len}`/`StructEnd`, `StructVariant`/`StructVariantEnd`, `Enum{name}`.
 - `Ser(v)`: the sequence of `Serializer`/`SerializeSeq`/`SerializeMap`/`SerializeStruct`/… method
   calls that `<T as Serialize>::serialize(&v, s)` makes on an arbitrary `Serializer` `s`, written as
-  `Tok`. A recording serializer sees exactly this trace. `SerErr(v)` is the `Err` the impl returns,
-  together with the trace up to that point.
+  `Tok`; a recording serializer sees exactly this trace.
 - A *self-describing source* for `ts`: any `Deserializer` whose `deserialize_*` calls drive the
   `Visitor` with the `visit_*` calls that `ts` encodes. `support::Deserializer` is one model of it.
   `De_T(ts)` is the result of `T::deserialize` over that source, with `ts` consumed exactly.
   `Accepts_T(v) = {ts | De_T(ts) = Ok(v)}`.
 - `InPlace_T(ts, p)`: `T::deserialize_in_place` over the same source, starting from place `p`.
 - `msg(e) = e.to_string()` for the source's error type, which is built only through
-  `de::Error::custom`/`ser::Error::custom`. So every message is fixed by the default constructors in
+  `de::Error::custom`/`ser::Error::custom`, so every message is fixed by the default constructors in
   `src/de/mod.rs` (`declare_error_trait!`) and `src/ser/mod.rs`.
 - `Exp(V)`: the text `V::expecting` writes. `Unexp(x)`: `Unexpected::fmt(x)`. `Range(T)`: the
   mathematical integer interval `[T::MIN, T::MAX]`.
@@ -56,18 +46,17 @@ Result: **22 specs**, covering **190 of the 191 tests**. **0 tests are non-spec 
   `CRef(c) = ContentRefDeserializer::new(&c)` and `CDe(c) = ContentDeserializer::new(c)`.
 - `FlatBuf`: the `Vec<Option<(Content, Content)>>` that a struct with `flatten` fields gathers from
   its unrecognised entries, in input order.
-- **Generic code.** Most specs quantify over `T`, `Serializer` and `Deserializer`. Until gap 11
-  closes, every one of them is proved per instantiation: the types and the harness's
-  serializer/deserializer the tests use today. The harness is how we observe the code, not what we
-  prove.
-- **Gap 0** (the installed seal publishes no Clean row) applies to every spec, so it is left out of
-  the column. The local seal `150efe4a` closes it (PLAN, "Seal `150efe4a`"). No spec is blocked by
-  gap 0 alone: every row also needs at least one of gaps 1–13.
+- **Generic code.** Most specs quantify over `T`, `Serializer` and `Deserializer`; until gap 11
+  closes, each is proved per instantiation (the types, and the harness serializer and deserializer,
+  the tests use). The harness is how the tests observe the code, not what is proved.
+- **Gap 0** (the installed seal publishes no Clean row) applies to every spec and is left out of the
+  column.
 
 ## 1. Specs (TSV)
 
 Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (primary tests; the full map is in §2),
-`difficulty` (the Rust features the proof must handle), and `blocking_gaps` (audit §7 numbers).
+`difficulty` (the Rust features the proof must handle), `blocking_gaps` (rows of §7 of
+`docs/AUDIT-trust-for-test-migration-2026-10-15.md`).
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
@@ -95,34 +84,14 @@ flatten-ser-inline	refinement	private::ser::{FlatMapSerializer, FlatMapSerialize
 derive-input-parse	refinement	aterm-macro-support {item.rs, ty.rs, lit.rs, cursor.rs, meta.rs} as aterm-serde-derive's input parser	∀ item I that the derive accepts, let Plain(I) be the same data with plain syntax: no generic bounds, defaults or where clauses; no raw `r#` prefixes; string literals unescaped; no doc attributes or visibilities; None-delimited macro groups flattened; discriminants dropped. Then the parsed item has the same container name, the same fields or variants in order, the same field types, and the same serde attributes as Plain(I), so Derive(I) is Derive(Plain(I)) with I's generics carried through as bounds. In particular: a raw identifier's key is the ident without `r#`, and a rename string literal is its unescaped value (raw strings, \u{..}, \t and \x.. escapes included). `pub (A, B)` in a tuple field is a visibility followed by a tuple type. A `$ty` None-group starts a type, not a visibility. `->`, nested `<…>`, associated types and `Self` stay inside the field type. A discriminant expression ends only at a comma outside generic arguments: `<` and `<<` compare or shift unless they open a turbofish, a qualified path or a cast's type. Deprecated variants derive without warnings. A #[repr(packed)] struct reads each field by copy.	derive_input::generics_with_bounds_defaults_and_a_where_clause, where_clauses_after_a_tuple_and_before_an_enum_body, raw_identifiers_and_strings_name_the_data, doc_attributes_and_visibilities, macro_fragments_read_through_their_none_groups, nested_generics_and_an_associated_type_are_bounded, arrows_in_types_and_higher_ranked_bounds, self_in_a_field_type_is_the_type_itself, discriminants_and_deprecated_variants, shifts_and_comparisons_in_a_discriminant_end_at_its_comma, a_packed_struct_is_read_by_copy, lifetime_parameters_with_bounds	HARD: a token-cursor parser over proc_macro::TokenStream (which exists only inside the compiler), recursive descent with depth counting for `<`/`>`, string-literal unescaping. The "compiles at all" half is a compile-time fact that serde_suite already asserts by building. Recovered at merge time from tests/derive_input.rs.	1,2,3,7,9,12
 ```
 
-### Distribution by kind (22)
-
-| kind | count | ids |
-|---|---|---|
-| refinement | 10 | de-std-shape, ser-std-shape, derive-struct-ser, derive-struct-de, derive-enum-external, derive-enum-internal, derive-enum-untagged, flatten-de-partition, flatten-ser-inline, derive-input-parse |
-| contract | 8 | size-hint-cautious, de-float-convert, de-error-messages, ignored-any-skips-one-value, ser-128-default-unsupported, derive-rename-rules, flat-map-take-entry, buffered-text-key |
-| table-property | 2 | de-int-convert, de-std-invalid-type |
-| equivalence | 2 | de-in-place-agrees, content-buffer-transparent |
-
-### Proof dependency order
-
-`de-error-messages` (every `de` error string is built here) → `de-int-convert`, `de-float-convert`,
-`de-std-invalid-type` → `ignored-any-skips-one-value` → `de-std-shape` → `de-in-place-agrees`.
-In parallel, `ser-128-default-unsupported` → `ser-std-shape`.
-`derive-rename-rules` and `derive-input-parse` (key(f) and the parsed item) → `derive-struct-ser`,
-`derive-struct-de` → `derive-enum-external` → `content-buffer-transparent` → `derive-enum-internal`,
-`derive-enum-untagged` → `flat-map-take-entry` → `flatten-de-partition` + `flatten-ser-inline`
-(their round trip is the last proof). `size-hint-cautious` has no dependency: its core stands
-alone, and its composed half sits under `de-std-shape` and `content-buffer-transparent`.
-
 ## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
-A test is deleted only when its primary spec and every spec under `also` are Certified.
-Two secondary samplings are too broad to list per row. Every `assert_de_tokens` call samples
-`de-in-place-agrees`. Every `de.rs` test that goes through its local `test` helper samples
-`ignored-any-skips-one-value` (via `assert_de_tokens_ignore`). Every `assert_de_tokens_error`
-message also samples `de-error-messages`.
+A test is deleted only when its primary spec and every spec under `also` are Certified. Three
+secondary samplings are too broad to list per row: every `assert_de_tokens` call samples
+`de-in-place-agrees`, every `de.rs` test that goes through its local `test` helper samples
+`ignored-any-skips-one-value` (via `assert_de_tokens_ignore`), and every `assert_de_tokens_error`
+message samples `de-error-messages`.
 
 ```tsv
 file	test	primary	also
@@ -335,7 +304,7 @@ tests/value.rs	test_map_access_to_enum	derive-enum-external
 
 ## 4. Tests that are not spec samples
 
-None. Every test checks production code (`src/` or the derive) at sample points of a spec in §1.
+Every test samples a spec in §1. These need a trim:
 
 | test | why it still needs a change | action |
 |---|---|---|
@@ -368,53 +337,36 @@ samples, not non-spec tests.
    would break it.
 6. **A skipped field's name is unknown, even under `deny_unknown_fields`.**
    `de_error::test_skipped_field_is_unknown` pins that `#[serde(skip)]` removes the name from the
-   expected list as well as from the input. That matches upstream serde. The spec keeps it, so a
-   reader should not read "skip" as "ignore if present".
+   expected list as well as from the input, as upstream serde does. `derive-struct-de` keeps it:
+   "skip" does not mean "ignore if present".
 
 ## 6. Proof order (easiest high-value first)
 
-No spec is blocked by gap 0 alone (§0). Each proof needs the local seal `150efe4a` plus the gaps
-in its row. The order below takes the smallest gap sets first and weighs them by the tests they
-retire.
+Each proof needs the gaps in its row. Smallest gap sets first, weighed by the tests they retire:
 
-1. **`size-hint-cautious`**, scalar core first. Instantiate per `Element` (sidesteps gap 11).
-   The body is `size_of`, `unwrap_or`, `min` and a division by a nonzero constant, so it is
-   omega-class once gap 3 admits calls to std `min` and the division. This is the crate's
-   untrusted-input guarantee: no length hint can make it allocate more than 1 MiB up front.
-   The 3 `untrusted.rs` tests retire once the composed half (gaps 1 and 4) lands.
-2. **`ser-128-default-unsupported`.** One default trait method that returns `Error::custom` of a
-   fixed string. It needs only a concrete serializer instantiation (gap 11) and a `&str` carrier
-   (gap 1). It retires 1 test and is the smallest end-to-end exercise of the trait default path.
-3. **`de-int-convert`**, scalar core. The heart of it is "in range ⇔ the conversion preserves the
-   value", over 12 targets × 8 source widths. That is a table property over casts and MIN/MAX
-   comparisons (gap 3), instantiated per `E` (gap 11). It retires **22 tests**, the most of any spec
-   outside the derive. The error-message half follows `de-error-messages`.
-4. **`derive-rename-rules`.** Move `case.rs` out of the proc-macro crate into a plain library, or
-   prove it in place once gap 9 is closed. Then it is non-generic string code (gaps 1, 3 and 7), with
-   no trait dispatch. It fixes `key(f)` for every derive spec, so it is high leverage despite
-   retiring 1 test directly.
-5. **`flat-map-take-entry`.** Non-generic, no proc macro: one `Option::take` guarded by a
-   `contains` over `&[&str]` (gaps 1, 2, 3, 5 and 7). It is the lemma `flatten-de-partition` rests on.
+1. **`size-hint-cautious`**, scalar core first, instantiated per `Element` (sidesteps gap 11). The
+   body is `size_of`, a match on the hint, a comparison and a division by a nonzero constant, so it
+   is omega-class once gap 3 admits them. It is the crate's untrusted-input guarantee: no length hint
+   makes a buffer preallocate more than 1 MiB. The `untrusted.rs` tests retire once the composed half
+   (gaps 1 and 4) lands.
+2. **`ser-128-default-unsupported`**: one default trait method that returns `Error::custom` of a
+   fixed string. It needs a concrete serializer instantiation (gap 11) and a `&str` carrier (gap 1).
+3. **`de-int-convert`**, scalar core: "in range ⇔ the conversion preserves the value" over 12
+   targets × 8 source widths, a table property over casts and MIN/MAX comparisons (gap 3),
+   instantiated per `E` (gap 11). The error-message half follows `de-error-messages`.
+4. **`derive-rename-rules`**: move `case.rs` out of the proc-macro crate into a library, or prove it
+   in place once gap 9 closes; then it is non-generic string code (gaps 1, 3, 7). It fixes `key(f)`
+   for every derive spec.
+5. **`flat-map-take-entry`**: non-generic and outside the proc macro, one `Option::take` guarded by a
+   `contains` over `&[&str]` (gaps 1, 2, 3, 5, 7). It is the lemma `flatten-de-partition` rests on.
 
-Next: `de-error-messages` (it unlocks every error-text clause), then `de-std-invalid-type` and
-`de-float-convert` (once floats have a model). The derive specs and `content-buffer-transparent`
-follow, and the flatten pair comes last. They wait on gap 9 (proc-macro boundary), gap 12
-(cross-crate citation) and gap 13 (closures in `map_err`/visitors), on top of gaps 1, 2, 4 and 11.
-
-## 7. Gap histogram
-
-Number of specs (of 21) whose row names each audit §7 gap. Gap 0 applies to all 21 and is
-excluded (§0).
-
-| gap | specs blocked |
-|---|---|
-| 1 | 20 |
-| 2 | 14 |
-| 3 | 7 |
-| 4 | 12 |
-| 5 | 7 |
-| 7 | 13 |
-| 9 | 9 |
-| 11 | 18 |
-| 12 | 9 |
-| 13 | 14 |
+The rest follow their dependencies. `de-error-messages` (every `de` error string is built there) →
+`de-int-convert`, `de-float-convert` (once floats have a model), `de-std-invalid-type` →
+`ignored-any-skips-one-value` → `de-std-shape` → `de-in-place-agrees`; `ser-128-default-unsupported`
+→ `ser-std-shape`. `derive-rename-rules` and `derive-input-parse` → `derive-struct-ser`,
+`derive-struct-de` → `derive-enum-external` → `content-buffer-transparent` → `derive-enum-internal`,
+`derive-enum-untagged` → `flatten-de-partition` (on `flat-map-take-entry`) and `flatten-ser-inline`,
+whose round trip is the last proof. `size-hint-cautious`'s composed half sits under `de-std-shape`
+and `content-buffer-transparent`. The derive rows and the flatten pair wait on gap 9 (proc-macro
+boundary), gap 12 (cross-crate citation) and gap 13 (closures in `map_err` and visitors), on top of
+gaps 1, 2, 4 and 11.

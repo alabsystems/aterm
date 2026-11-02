@@ -1,11 +1,44 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-use super::fixtures::{CONCURRENT_LIMIT, DRAFT, IDLE, SIGNED_OUT_TURN, WALL_QUOTA};
+use super::fixtures::{
+    AUTH_401_240, CONCURRENT_LIMIT, DRAFT, IDLE, LIMIT_429_FINAL_240, LIMIT_429_RETRYING_240,
+    SIGNED_OUT_TURN, WALL_QUOTA,
+};
 use super::*;
 use crate::prompt::fixtures::{bash_one_row, composer as claude_composer, rows, screen};
 use crate::reader::{Program, identify, program_of, read};
 use crate::wall::{Placement, WallKind};
+
+#[test]
+fn the_measured_context_counters_keep_the_241_composer_readable() {
+    let measured = screen(super::fixtures::STUB_REPLY);
+    assert_eq!(composer(&measured).expect("measured composer").1, vec![""]);
+    assert_eq!(read(Some("kimi"), &measured, None).context_left, Some(85));
+    for (row, used) in [
+        ("context: 0%", 0),
+        ("context: 0% (0/97.7k)", 0),
+        ("context: 15% (13.7k/97.7k)", 15),
+        ("context: 25% (1/4)", 25),
+    ] {
+        assert_eq!(context_row(row), Some(used), "{row}");
+    }
+    for row in [
+        "context: +15%",
+        "context: +15% (13.7k/97.7k)",
+        "context: -15% (13.7k/97.7k)",
+        "context: % (13.7k/97.7k)",
+        "context: 15% then approve",
+        "context: 15% (hello/world)",
+        "context: 15% (1/2/3)",
+        "context: 15% (1.2.3/2)",
+        "context: 15% (1/2) trailing words",
+        "context: 15% (1/2",
+        "context: fifteen% (1/2)",
+    ] {
+        assert_eq!(context_row(row), None, "{row}");
+    }
+}
 
 #[test]
 fn the_quota_exhausted_turn_is_a_wall_and_the_concurrency_throttle_is_none() {
@@ -20,6 +53,48 @@ fn the_quota_exhausted_turn_is_a_wall_and_the_concurrency_throttle_is_none() {
     let r = read(Some("kimi"), &rows, None);
     assert_eq!(r.program, Program::Kimi);
     assert_eq!(r.wall.map(|w| w.kind), Some(WallKind::UsageSession));
+
+    // Measured 2.4.0 final 429: both `Error: [provider.rate_limit] 429 …` and the indented
+    // `/export-debug-zip` advice soft-wrap back to column 1 (` details.`, ` publicly.`).
+    let measured_429 = screen(LIMIT_429_FINAL_240);
+    let mw = wall(&measured_429).expect("the measured 2.4.0 soft-wrapped quota 429 is a wall");
+    assert_eq!(mw.kind, WallKind::UsageSession);
+    assert_eq!(mw.placement, Placement::ErrorRow);
+    assert!(
+        mw.message.contains("billing details. If this persists")
+            && mw.message.ends_with("publicly."),
+        "soft-wrapped continuations join cleanly: {}",
+        mw.message
+    );
+    assert_eq!(
+        read(Some("kimi"), &measured_429, None).wall.map(|w| w.kind),
+        Some(WallKind::UsageSession)
+    );
+
+    // Negative: while Kimi Code is still retrying (`Retrying (6/10) · …`), and when a later turn
+    // ends on a custom provider's 401 (`[provider.auth_error]`) under an earlier quota wall,
+    // neither screen is a wall.
+    assert_eq!(wall(&screen(LIMIT_429_RETRYING_240)), None);
+    assert_eq!(wall(&screen(AUTH_401_240)), None);
+
+    // Negative: a column-1 row under a short `Error:` that had room to spare, or a turn glyph at
+    // column 1 right under a full-width `Error:` with no blank row between, is no continuation.
+    let mut short_then_col1 = screen(SIGNED_OUT_TURN);
+    let err_at = short_then_col1
+        .iter()
+        .position(|r| r.starts_with("   Error: "))
+        .expect("error row");
+    short_then_col1[err_at] = "   Error: You exceeded your current quota".to_string();
+    short_then_col1.insert(err_at + 1, " Answered fine.".to_string());
+    assert_eq!(wall(&short_then_col1), None);
+
+    let mut glyph_under_wrap = measured_429.clone();
+    let pub_at = glyph_under_wrap
+        .iter()
+        .rposition(|r| r == " publicly.")
+        .expect("wrapped tail");
+    glyph_under_wrap[pub_at] = " ● Answered fine.".to_string();
+    assert_eq!(wall(&glyph_under_wrap), None);
 
     // Negative: the 429 a request over the account's concurrency answers is a throttle Kimi Code
     // retries, no spent quota: no wall, so nothing a rotation would act on.

@@ -1819,13 +1819,8 @@ fn rendered(app: &mut App, wid: WindowId) -> (usize, usize, Vec<u8>) {
 /// paper, rendered by the capture route `aterm ctl image` takes, written whole and as the switch's
 /// row round it, twice its size.
 #[test]
-#[ignore = "writes PNGs for a person to read: set ATERM_SWITCH_GALLERY to a directory"]
 fn harness_switch_gallery() {
-    let Some(dir) = std::env::var_os("ATERM_SWITCH_GALLERY") else {
-        return;
-    };
-    let dir = std::path::PathBuf::from(dir);
-    std::fs::create_dir_all(&dir).expect("the gallery directory");
+    let (dir, _gallery) = crate::scripted_redraw_fixture::gallery_directory("ATERM_SWITCH_GALLERY");
     let scheme = |name: &str| {
         crate::chrome_band::hc_fixtures::STOCK
             .iter()

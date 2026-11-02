@@ -30,43 +30,36 @@ pub(super) fn base_swarm_roster(paths: &Paths) -> crate::Result<Option<SwarmRost
         .flatten();
     let envelope_bound = cached.is_some();
     if state.membership == Stored::In
+        && !state.failed
+        && state.pending.is_empty()
         && pin_admitted(&expected, None)
         && (log_only_bound || envelope_bound)
         && let Some(identity) = read_identity(paths)?
     {
         if let Some(cached_bytes) = &cached
             && let Ok(env) = envelope::parse(cached_bytes)
-            && let Ok((Some(entries), log_digest)) =
-                log_entries::open_entries_preferring_log(paths, &expected, &env, &identity)
+            && let Ok((read, log_digest)) =
+                log_entries::roster_preferring_log(paths, &expected, &env, &identity)
         {
-            if let Some(entry) = entries
-                .into_iter()
-                .find(|e| e.name == ROSTER_ENTRY && !e.if_absent && e.anchor.is_none())
-            {
-                let text = std::str::from_utf8(entry.value.as_slice())
-                    .map_err(|_| Error::new(format!("{ROSTER_ENTRY} is not UTF-8")))?;
-                return Ok(Some(SwarmRoster::from_toml(text)?));
+            let visible = read.visible;
+            if let Some(roster) = read.into_roster()? {
+                return Ok(Some(roster));
             }
-            if log_digest.is_some() {
+            if visible && log_digest.is_some() {
                 return Ok(None);
             }
         }
         if let Some(log) = log_entries::trusted_local_log(paths, &expected)?
             && !log.recipient_is_removed(&identity.recipient())
+            && !log_entries::recipient_denied_by_roster_or_log(None, &log, &identity.recipient())
             && !log.audience_left_out_recipient(
                 &crate::membership_log::EpochAudience::Everyone,
                 &identity.recipient(),
             )
             && log.wraps_to(&identity.recipient())
-            && let Some(entry) = log.open_entries(&identity)?.and_then(|entries| {
-                entries
-                    .into_iter()
-                    .find(|e| e.name == ROSTER_ENTRY && !e.if_absent && e.anchor.is_none())
-            })
+            && let Some(roster) = log_entries::roster_from_log(&log, &identity)?.into_roster()?
         {
-            let text = std::str::from_utf8(entry.value.as_slice())
-                .map_err(|_| Error::new(format!("{ROSTER_ENTRY} is not UTF-8")))?;
-            return Ok(Some(SwarmRoster::from_toml(text)?));
+            return Ok(Some(roster));
         }
     }
     Ok(None)
@@ -80,12 +73,23 @@ pub fn swarm_roster(paths: &Paths) -> crate::Result<Option<SwarmRoster>> {
         if let Some(log) = log_entries::trusted_local_log(paths, &expected)? {
             overlay_log_membership(&log, &mut roster);
         } else {
+            let active_nodes: BTreeSet<String> = roster
+                .members
+                .iter()
+                .filter(|m| !steward::member_is_denied_in_roster(&roster, m))
+                .flat_map(|m| m.node_id.iter().chain(m.node_key.iter()))
+                .map(|n| n.trim().to_ascii_lowercase())
+                .collect();
             for m in &roster.members {
                 if steward::member_is_denied_in_roster(&roster, m) {
-                    if let Some(node_id) = &m.node_id {
+                    if let Some(node_id) = &m.node_id
+                        && !active_nodes.contains(&node_id.trim().to_ascii_lowercase())
+                    {
                         roster.deny_nodes.push(node_id.clone());
                     }
-                    if let Some(node_key) = &m.node_key {
+                    if let Some(node_key) = &m.node_key
+                        && !active_nodes.contains(&node_key.trim().to_ascii_lowercase())
+                    {
                         roster.deny_nodes.push(node_key.clone());
                     }
                 }
@@ -108,6 +112,7 @@ pub fn swarm_roster(paths: &Paths) -> crate::Result<Option<SwarmRoster>> {
         && let Some(identity) = read_identity(paths)?
         && let Some(log) = log_entries::trusted_local_log(paths, &expected)?
         && !log.recipient_is_removed(&identity.recipient())
+        && !log_entries::recipient_denied_by_roster_or_log(None, &log, &identity.recipient())
         && !log.audience_left_out_recipient(
             &crate::membership_log::EpochAudience::Everyone,
             &identity.recipient(),
@@ -162,6 +167,7 @@ fn restored_by_log_parts(
         }
     }
     let mut voided_removed: BTreeSet<crate::membership_log::MemberId> = BTreeSet::new();
+    let mut admitted_actors: BTreeSet<crate::membership_log::MemberId> = BTreeSet::new();
     for record in log.records().skip(1) {
         if voided.contains(record.id()) {
             if let crate::membership_log::Body::Remove { member, .. } = record.body()
@@ -175,18 +181,7 @@ fn restored_by_log_parts(
             crate::membership_log::Body::Admit { entrant, .. }
                 if record.actor() != &entrant.member() =>
             {
-                let actor = entrant.member();
-                seat_recipients
-                    .entry(actor)
-                    .or_insert_with(|| entrant.request.binding().recipient());
-                if let Some((_, canon)) =
-                    leading_m_label(&entrant.label).or_else(|| leading_m_label(&entrant.name))
-                {
-                    seat_labels.entry(actor).or_default().push(canon);
-                }
-                if entrant.node_key != [0; 32] {
-                    seat_nodes.entry(actor).or_default().push(entrant.node_key);
-                }
+                admitted_actors.insert(entrant.member());
             }
             crate::membership_log::Body::Node { node_key, .. } if *node_key != [0; 32] => {
                 seat_nodes
@@ -197,6 +192,62 @@ fn restored_by_log_parts(
             _ => {}
         }
     }
+    let node_bound_to_actor = |actor: &crate::membership_log::MemberId, nk: [u8; 32]| -> bool {
+        if nk == [0; 32] {
+            return false;
+        }
+        match membership.node(&nk) {
+            crate::membership_log::NodeStanding::Member(active)
+            | crate::membership_log::NodeStanding::Retired(active) => {
+                active == *actor
+                    || membership.get(&active).is_some_and(|m| {
+                        log.ancestor_closure(&[m.entry]).iter().any(|r| {
+                            matches!(
+                                r.body(),
+                                crate::membership_log::Body::Remove { member, .. }
+                                    if member == actor
+                            )
+                        })
+                    })
+            }
+            _ => false,
+        }
+    };
+    let founder_actors: BTreeSet<crate::membership_log::MemberId> =
+        seat_recipients.keys().copied().collect();
+    let mut record_entrant_seat =
+        |actor: crate::membership_log::MemberId, entrant: &crate::membership_log::Entrant| {
+            seat_recipients
+                .entry(actor)
+                .or_insert_with(|| entrant.request.binding().recipient());
+            if let Some((_, canon)) =
+                leading_m_label(&entrant.label).or_else(|| leading_m_label(&entrant.name))
+            {
+                let list = seat_labels.entry(actor).or_default();
+                if !list.contains(&canon) {
+                    list.push(canon);
+                }
+            }
+            if node_bound_to_actor(&actor, entrant.node_key) {
+                let list = seat_nodes.entry(actor).or_default();
+                if !list.contains(&entrant.node_key) {
+                    list.push(entrant.node_key);
+                }
+            }
+        };
+    for actor in admitted_actors {
+        if !founder_actors.contains(&actor)
+            && let Some((_, entrant)) = super::remove::earliest_admit_of(log, &actor)
+        {
+            record_entrant_seat(actor, entrant);
+        }
+        if let Some(m) = membership.get(&actor)
+            && let Some(r) = log.get(&m.entry)
+            && let crate::membership_log::Body::Admit { entrant, .. } = r.body()
+        {
+            record_entrant_seat(actor, entrant);
+        }
+    }
 
     let mut labels = BTreeSet::new();
     let mut nodes = BTreeSet::new();
@@ -204,7 +255,12 @@ fn restored_by_log_parts(
     for (actor, member) in membership.members() {
         let recipient = member.binding.recipient();
         if log.audience_left_out(&crate::membership_log::EpochAudience::Everyone, actor)
+            || log.audience_left_out_recipient(
+                &crate::membership_log::EpochAudience::Everyone,
+                &recipient,
+            )
             || log.recipient_is_removed(&recipient)
+            || membership.member_node_removed(member)
         {
             continue;
         }
@@ -212,16 +268,31 @@ fn restored_by_log_parts(
             *rem == *actor
                 || rem[..32] == actor[..32]
                 || seat_recipients.get(rem) == Some(&recipient)
+                || member
+                    .node_key
+                    .filter(|k| *k != [0; 32])
+                    .is_some_and(|nk| seat_nodes.get(rem).is_some_and(|nks| nks.contains(&nk)))
         };
         let mut matched: BTreeSet<crate::membership_log::MemberId> = voided_removed
             .iter()
             .copied()
-            .filter(|rem| same_mac(rem))
+            .filter(|rem| {
+                same_mac(rem)
+                    && (*rem == *actor
+                        || membership
+                            .removal(rem)
+                            .is_some_and(|removal| !removal.quorum))
+            })
             .collect();
         if member.entry != *log.network() {
             for r in log.ancestor_closure(&[member.entry]) {
-                if let crate::membership_log::Body::Remove { member: rem, .. } = r.body()
+                if !voided.contains(r.id())
+                    && let crate::membership_log::Body::Remove { member: rem, .. } = r.body()
                     && r.actor() != rem
+                    && (*rem == *actor
+                        || membership
+                            .removal(rem)
+                            .is_some_and(|removal| !removal.quorum))
                     && same_mac(rem)
                 {
                     matched.insert(*rem);
@@ -239,9 +310,9 @@ fn restored_by_log_parts(
             labels.insert(canon);
         }
         if let Some(key) = member.node_key.filter(|k| *k != [0; 32])
-            && !matches!(
+            && matches!(
                 membership.node(&key),
-                crate::membership_log::NodeStanding::Removed(_)
+                crate::membership_log::NodeStanding::Member(_)
             )
         {
             nodes.insert(aterm_codec::hex::encode_lower(&key));
@@ -256,9 +327,9 @@ fn restored_by_log_parts(
             }
             if let Some(rem_nodes) = seat_nodes.get(&rem) {
                 for key in rem_nodes {
-                    if !matches!(
+                    if matches!(
                         membership.node(key),
-                        crate::membership_log::NodeStanding::Removed(_)
+                        crate::membership_log::NodeStanding::Member(_)
                     ) {
                         nodes.insert(aterm_codec::hex::encode_lower(key));
                     }
@@ -273,17 +344,27 @@ pub(super) fn lift_restored_from_roster(
     log: &crate::membership_log::Log,
     roster: &mut SwarmRoster,
 ) -> Vec<String> {
-    let (mut labels, mut nodes) = restored_by_log(log);
-    if labels.is_empty() && nodes.is_empty() {
+    let (mut labels, mut nodes, recipients) = restored_by_log_parts(log);
+    if labels.is_empty() && nodes.is_empty() && recipients.is_empty() {
         return Vec::new();
     }
-    let (_, _, recipients) = restored_by_log_parts(log);
     let membership = log.membership();
     for m in &roster.members {
+        let same_node = m
+            .node_key
+            .as_ref()
+            .is_some_and(|nk| nodes.contains(&nk.trim().to_ascii_lowercase()))
+            || m.node_id
+                .as_ref()
+                .is_some_and(|nid| nodes.contains(&nid.trim().to_ascii_lowercase()));
+        let other_node = m
+            .node_key
+            .as_ref()
+            .is_some_and(|nk| !nodes.contains(&nk.trim().to_ascii_lowercase()));
         let matches_restored = recipients.contains(m.recipient.trim())
-            || labels.contains(&m.label)
-            || m.aliases.iter().any(|a| labels.contains(a))
-            || m.claimed_label.as_ref().is_some_and(|c| labels.contains(c));
+            || same_node
+            || (!other_node
+                && (labels.contains(&m.label) || m.aliases.iter().any(|a| labels.contains(a))));
         if !matches_restored {
             continue;
         }
@@ -305,25 +386,37 @@ pub(super) fn lift_restored_from_roster(
                 labels.insert(alias.clone());
             }
         }
-        if let Some(claimed) = &m.claimed_label
-            && !membership.removed_labels().contains(claimed)
-        {
-            labels.insert(claimed.clone());
-        }
-        if let Some(node_id) = &m.node_id {
-            nodes.insert(node_id.trim().to_ascii_lowercase());
-        }
-        if let Some(node_key) = &m.node_key {
-            nodes.insert(node_key.trim().to_ascii_lowercase());
+        let roster_key_held_out = m.node_key.as_deref().is_some_and(|nk| {
+            let trimmed = nk.trim();
+            let mut key = [0u8; 32];
+            trimmed.len() == 64
+                && aterm_codec::hex::decode_into(trimmed.as_bytes(), &mut key)
+                && matches!(
+                    membership.node(&key),
+                    crate::membership_log::NodeStanding::Removed(_)
+                        | crate::membership_log::NodeStanding::Retired(_)
+                )
+        });
+        if !roster_key_held_out {
+            if let Some(node_id) = &m.node_id {
+                nodes.insert(node_id.trim().to_ascii_lowercase());
+            }
+            if let Some(node_key) = &m.node_key {
+                nodes.insert(node_key.trim().to_ascii_lowercase());
+            }
         }
     }
+    let matches_label = |raw: &str| {
+        labels.contains(raw)
+            || leading_m_label(raw).is_some_and(|(_, canon)| labels.contains(&canon))
+    };
     let lifted: Vec<String> = roster
         .deny_labels
         .iter()
-        .filter(|label| labels.contains(*label))
+        .filter(|label| matches_label(label))
         .cloned()
         .collect();
-    roster.deny_labels.retain(|label| !labels.contains(label));
+    roster.deny_labels.retain(|label| !matches_label(label));
     roster
         .deny_nodes
         .retain(|node| !nodes.contains(&node.trim().to_ascii_lowercase()));
@@ -333,39 +426,88 @@ pub(super) fn lift_restored_from_roster(
 pub(super) fn overlay_log_membership(log: &crate::membership_log::Log, roster: &mut SwarmRoster) {
     let _ = lift_restored_from_roster(log, roster);
     let membership = log.membership();
+    let log_removed_node_hexes: BTreeSet<String> = membership
+        .nodes()
+        .iter()
+        .filter(|&(nk, standing)| {
+            matches!(standing, crate::membership_log::NodeStanding::Removed(_)) && *nk != [0; 32]
+        })
+        .map(|(nk, _)| aterm_codec::hex::encode_lower(nk))
+        .collect();
     let mut removed_labels = BTreeSet::new();
+    let mut log_removed_rows = Vec::new();
     let mut kept = Vec::with_capacity(roster.members.len());
     for m in std::mem::take(&mut roster.members) {
-        if Recipient::parse(&m.recipient).is_ok_and(|rec| {
-            log.recipient_is_removed(&rec)
-                || log.audience_left_out_recipient(
-                    &crate::membership_log::EpochAudience::Everyone,
-                    &rec,
-                )
-        }) {
-            removed_labels.insert(m.label);
-            for alias in m.aliases {
-                removed_labels.insert(alias);
-            }
-            if let Some(claimed) = m.claimed_label {
-                removed_labels.insert(claimed);
-            }
-            if let Some(node_id) = m.node_id {
-                roster.deny_nodes.push(node_id);
-            }
-            if let Some(node_key) = m.node_key {
-                roster.deny_nodes.push(node_key);
-            }
+        let node_removed_in_log = m
+            .node_key
+            .as_deref()
+            .is_some_and(|nk| log_removed_node_hexes.contains(&nk.trim().to_ascii_lowercase()))
+            || m.node_id.as_deref().is_some_and(|nid| {
+                log_removed_node_hexes.contains(&nid.trim().to_ascii_lowercase())
+            });
+        if node_removed_in_log
+            || Recipient::parse(&m.recipient).is_ok_and(|rec| {
+                log.recipient_is_removed(&rec)
+                    || log_entries::recipient_denied_by_roster_or_log(None, log, &rec)
+                    || log.audience_left_out_recipient(
+                        &crate::membership_log::EpochAudience::Everyone,
+                        &rec,
+                    )
+            })
+        {
+            log_removed_rows.push(m);
         } else {
-            if steward::member_is_denied_in_roster(roster, &m) {
-                if let Some(node_id) = &m.node_id {
-                    roster.deny_nodes.push(node_id.clone());
-                }
-                if let Some(node_key) = &m.node_key {
-                    roster.deny_nodes.push(node_key.clone());
-                }
-            }
             kept.push(m);
+        }
+    }
+    let active_nodes: BTreeSet<String> = kept
+        .iter()
+        .filter(|m| {
+            !steward::member_is_denied_in_roster(roster, m)
+                && !m.node_key.as_deref().is_some_and(|nk| {
+                    log_removed_node_hexes.contains(&nk.trim().to_ascii_lowercase())
+                })
+                && !Recipient::parse(&m.recipient).is_ok_and(|rec| {
+                    log_entries::recipient_denied_by_roster_or_log(Some(roster), log, &rec)
+                })
+        })
+        .flat_map(|m| m.node_id.iter().chain(m.node_key.iter()))
+        .map(|n| n.trim().to_ascii_lowercase())
+        .collect();
+    for m in log_removed_rows {
+        removed_labels.insert(m.label);
+        for alias in m.aliases {
+            removed_labels.insert(alias);
+        }
+        if let Some(claimed) = m
+            .claimed_label
+            .filter(|c| crate::membership_log::is_label(c))
+        {
+            removed_labels.insert(claimed);
+        }
+        if let Some(node_id) = m.node_id
+            && !active_nodes.contains(&node_id.trim().to_ascii_lowercase())
+        {
+            roster.deny_nodes.push(node_id);
+        }
+        if let Some(node_key) = m.node_key
+            && !active_nodes.contains(&node_key.trim().to_ascii_lowercase())
+        {
+            roster.deny_nodes.push(node_key);
+        }
+    }
+    for m in &kept {
+        if steward::member_is_denied_in_roster(roster, m) {
+            if let Some(node_id) = &m.node_id
+                && !active_nodes.contains(&node_id.trim().to_ascii_lowercase())
+            {
+                roster.deny_nodes.push(node_id.clone());
+            }
+            if let Some(node_key) = &m.node_key
+                && !active_nodes.contains(&node_key.trim().to_ascii_lowercase())
+            {
+                roster.deny_nodes.push(node_key.clone());
+            }
         }
     }
     roster.members = kept;
@@ -375,10 +517,8 @@ pub(super) fn overlay_log_membership(log: &crate::membership_log::Log, roster: &
             removed_labels.insert(canon);
         }
     }
-    for (nk, standing) in membership.nodes() {
-        if matches!(standing, crate::membership_log::NodeStanding::Removed(_)) && *nk != [0; 32] {
-            roster.deny_nodes.push(aterm_codec::hex::encode_lower(nk));
-        }
+    for nk_hex in &log_removed_node_hexes {
+        roster.deny_nodes.push(nk_hex.clone());
     }
     for founder in membership.unproved() {
         if log.recipient_is_removed(&founder.recipient)
@@ -387,13 +527,17 @@ pub(super) fn overlay_log_membership(log: &crate::membership_log::Log, roster: &
                 &founder.recipient,
             )
         {
-            if let Some((_, canon)) =
-                leading_m_label(&founder.label).or_else(|| leading_m_label(&founder.name))
+            if let Some((_, canon)) = leading_m_label(&founder.label)
+                .filter(|(_, c)| c == &founder.label)
+                .or_else(|| leading_m_label(&founder.name).filter(|(_, c)| c == &founder.name))
             {
                 removed_labels.insert(canon);
             }
             if let Some(nk) = founder.node_key.filter(|k| *k != [0; 32]) {
-                roster.deny_nodes.push(aterm_codec::hex::encode_lower(&nk));
+                let nk_hex = aterm_codec::hex::encode_lower(&nk);
+                if !active_nodes.contains(&nk_hex) {
+                    roster.deny_nodes.push(nk_hex);
+                }
             }
             continue;
         }
@@ -405,14 +549,60 @@ pub(super) fn overlay_log_membership(log: &crate::membership_log::Log, roster: &
         let key_denied = node_key
             .as_deref()
             .is_some_and(|nk| roster.is_node_denied(nk));
-        if let Some(pos) = roster.members.iter().position(|m| m.recipient == rec) {
+        let canonical = leading_m_label(&founder.label)
+            .or_else(|| leading_m_label(&founder.name))
+            .map(|(_, c)| c);
+        if let Some(pos) = roster
+            .members
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.recipient == rec)
+            .max_by_key(|(idx, m)| {
+                (
+                    !steward::member_is_denied_in_roster(roster, m),
+                    canonical.as_deref() == Some(m.label.as_str()),
+                    m.node_key.is_some() || m.node_id.is_some(),
+                    m.admitted_ms,
+                    std::cmp::Reverse(*idx),
+                )
+            })
+            .map(|(idx, _)| idx)
+        {
             if key_denied {
-                let removed = roster.members.remove(pos);
-                removed_labels.insert(removed.label);
+                if let Some(canon) = &canonical {
+                    removed_labels.insert(canon.clone());
+                }
+                roster.members.retain(|m| {
+                    if m.recipient == rec {
+                        removed_labels.insert(m.label.clone());
+                        for alias in &m.aliases {
+                            removed_labels.insert(alias.clone());
+                        }
+                        if let Some(claimed) = &m
+                            .claimed_label
+                            .as_deref()
+                            .filter(|c| crate::membership_log::is_label(c))
+                        {
+                            removed_labels.insert((*claimed).to_owned());
+                        }
+                        if let Some(node_id) = &m.node_id
+                            && !active_nodes.contains(&node_id.trim().to_ascii_lowercase())
+                        {
+                            roster.deny_nodes.push(node_id.clone());
+                        }
+                        if let Some(nk) = &m.node_key
+                            && !active_nodes.contains(&nk.trim().to_ascii_lowercase())
+                        {
+                            roster.deny_nodes.push(nk.clone());
+                        }
+                        false
+                    } else {
+                        true
+                    }
+                });
             } else if let Some(key) = node_key {
                 if steward::member_is_denied_in_roster(roster, &roster.members[pos])
-                    || roster.is_label_denied(&founder.label)
-                    || roster.is_label_denied(&founder.name)
+                    && !active_nodes.contains(&key.trim().to_ascii_lowercase())
                 {
                     roster.deny_nodes.push(key.clone());
                 }
@@ -420,9 +610,7 @@ pub(super) fn overlay_log_membership(log: &crate::membership_log::Log, roster: &
             }
             continue;
         }
-        let Some((_, canonical)) =
-            leading_m_label(&founder.label).or_else(|| leading_m_label(&founder.name))
-        else {
+        let Some(canonical) = canonical else {
             continue;
         };
         if key_denied {
@@ -430,7 +618,9 @@ pub(super) fn overlay_log_membership(log: &crate::membership_log::Log, roster: &
             continue;
         }
         if roster.is_label_denied(&canonical) {
-            if let Some(key) = node_key {
+            if let Some(key) = node_key
+                && !active_nodes.contains(&key.trim().to_ascii_lowercase())
+            {
                 roster.deny_nodes.push(key);
             }
             continue;
@@ -453,33 +643,103 @@ pub(super) fn overlay_log_membership(log: &crate::membership_log::Log, roster: &
     }
 
     for (actor, member) in membership.members() {
-        if log.audience_left_out(&crate::membership_log::EpochAudience::Everyone, actor) {
-            if let Some((_, canon)) =
-                leading_m_label(&member.label).or_else(|| leading_m_label(&member.name))
+        let recipient = member.binding.recipient();
+        if log.recipient_is_removed(&recipient)
+            || log.audience_left_out(&crate::membership_log::EpochAudience::Everyone, actor)
+            || log.audience_left_out_recipient(
+                &crate::membership_log::EpochAudience::Everyone,
+                &recipient,
+            )
+        {
+            if let Some((_, canon)) = leading_m_label(&member.label)
+                .filter(|(_, c)| c == &member.label)
+                .or_else(|| leading_m_label(&member.name).filter(|(_, c)| c == &member.name))
             {
                 removed_labels.insert(canon);
             }
             if let Some(nk) = member.node_key.filter(|k| *k != [0; 32]) {
-                roster.deny_nodes.push(aterm_codec::hex::encode_lower(&nk));
+                let nk_hex = aterm_codec::hex::encode_lower(&nk);
+                if !active_nodes.contains(&nk_hex) {
+                    roster.deny_nodes.push(nk_hex);
+                }
             }
             continue;
         }
-        let rec = member.binding.recipient().to_bech32();
+        let my_rank = (log.record_index(&member.entry).unwrap_or(0), member.entry);
+        if membership.members().values().any(|other| {
+            other.binding.recipient() == recipient
+                && (log.record_index(&other.entry).unwrap_or(0), other.entry) > my_rank
+        }) {
+            continue;
+        }
+        let rec = recipient.to_bech32();
         let node_key = member
             .node_key
             .filter(|k| *k != [0; 32])
             .map(|k| aterm_codec::hex::encode_lower(&k));
         let key_denied = node_key
             .as_deref()
-            .is_some_and(|nk| roster.is_node_denied(nk));
-        if let Some(pos) = roster.members.iter().position(|m| m.recipient == rec) {
+            .is_some_and(|nk| roster.is_node_denied(nk))
+            || roster.is_node_denied(&aterm_codec::hex::encode_lower(member.binding.writer()))
+            || roster.is_node_denied(&aterm_codec::hex::encode_lower(
+                member.binding.incarnation(),
+            ))
+            || roster.is_node_denied(&aterm_codec::hex::encode_lower(member.binding.machine()))
+            || membership.member_node_removed(member);
+        let canonical = leading_m_label(&member.label)
+            .or_else(|| leading_m_label(&member.name))
+            .map(|(_, c)| c);
+        if let Some(pos) = roster
+            .members
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.recipient == rec)
+            .max_by_key(|(idx, m)| {
+                (
+                    !steward::member_is_denied_in_roster(roster, m),
+                    canonical.as_deref() == Some(m.label.as_str()),
+                    m.node_key.is_some() || m.node_id.is_some(),
+                    m.admitted_ms,
+                    std::cmp::Reverse(*idx),
+                )
+            })
+            .map(|(idx, _)| idx)
+        {
             if key_denied {
-                let removed = roster.members.remove(pos);
-                removed_labels.insert(removed.label);
+                if let Some(canon) = &canonical {
+                    removed_labels.insert(canon.clone());
+                }
+                roster.members.retain(|m| {
+                    if m.recipient == rec {
+                        removed_labels.insert(m.label.clone());
+                        for alias in &m.aliases {
+                            removed_labels.insert(alias.clone());
+                        }
+                        if let Some(claimed) = &m
+                            .claimed_label
+                            .as_deref()
+                            .filter(|c| crate::membership_log::is_label(c))
+                        {
+                            removed_labels.insert((*claimed).to_owned());
+                        }
+                        if let Some(node_id) = &m.node_id
+                            && !active_nodes.contains(&node_id.trim().to_ascii_lowercase())
+                        {
+                            roster.deny_nodes.push(node_id.clone());
+                        }
+                        if let Some(nk) = &m.node_key
+                            && !active_nodes.contains(&nk.trim().to_ascii_lowercase())
+                        {
+                            roster.deny_nodes.push(nk.clone());
+                        }
+                        false
+                    } else {
+                        true
+                    }
+                });
             } else if let Some(key) = node_key {
                 if steward::member_is_denied_in_roster(roster, &roster.members[pos])
-                    || roster.is_label_denied(&member.label)
-                    || roster.is_label_denied(&member.name)
+                    && !active_nodes.contains(&key.trim().to_ascii_lowercase())
                 {
                     roster.deny_nodes.push(key.clone());
                 }
@@ -487,9 +747,7 @@ pub(super) fn overlay_log_membership(log: &crate::membership_log::Log, roster: &
             }
             continue;
         }
-        let Some((_, canonical)) =
-            leading_m_label(&member.label).or_else(|| leading_m_label(&member.name))
-        else {
+        let Some(canonical) = canonical else {
             continue;
         };
         if key_denied {
@@ -497,7 +755,9 @@ pub(super) fn overlay_log_membership(log: &crate::membership_log::Log, roster: &
             continue;
         }
         if roster.is_label_denied(&canonical) {
-            if let Some(key) = node_key {
+            if let Some(key) = node_key
+                && !active_nodes.contains(&key.trim().to_ascii_lowercase())
+            {
                 roster.deny_nodes.push(key);
             }
             continue;
@@ -521,11 +781,64 @@ pub(super) fn overlay_log_membership(log: &crate::membership_log::Log, roster: &
             node_key,
         });
     }
+    let mut active_log_labels = BTreeSet::new();
+    for founder in membership.unproved() {
+        let rec_str = founder.recipient.to_bech32();
+        let key_denied = founder
+            .node_key
+            .filter(|k| *k != [0; 32])
+            .is_some_and(|k| roster.is_node_denied(&aterm_codec::hex::encode_lower(&k)));
+        if !key_denied
+            && !log.recipient_is_removed(&founder.recipient)
+            && !log.audience_left_out_recipient(
+                &crate::membership_log::EpochAudience::Everyone,
+                &founder.recipient,
+            )
+            && roster.member_by_recipient(&rec_str).is_none()
+            && let Some((_, canon)) =
+                leading_m_label(&founder.label).or_else(|| leading_m_label(&founder.name))
+        {
+            active_log_labels.insert(canon);
+        }
+    }
+    for (actor, member) in membership.members() {
+        let rec = member.binding.recipient();
+        let rec_str = rec.to_bech32();
+        let key_denied = member
+            .node_key
+            .filter(|k| *k != [0; 32])
+            .is_some_and(|k| roster.is_node_denied(&aterm_codec::hex::encode_lower(&k)))
+            || roster.is_node_denied(&aterm_codec::hex::encode_lower(member.binding.writer()))
+            || roster.is_node_denied(&aterm_codec::hex::encode_lower(
+                member.binding.incarnation(),
+            ))
+            || roster.is_node_denied(&aterm_codec::hex::encode_lower(member.binding.machine()))
+            || membership.member_node_removed(member);
+        if !key_denied
+            && !log.recipient_is_removed(&rec)
+            && !log.audience_left_out(&crate::membership_log::EpochAudience::Everyone, actor)
+            && !log
+                .audience_left_out_recipient(&crate::membership_log::EpochAudience::Everyone, &rec)
+            && roster.member_by_recipient(&rec_str).is_none()
+            && let Some((_, canon)) =
+                leading_m_label(&member.label).or_else(|| leading_m_label(&member.name))
+        {
+            active_log_labels.insert(canon);
+        }
+    }
     for lbl in removed_labels {
-        if !roster.members.iter().any(|m| {
-            m.matches_label_or_alias(&lbl) || m.claimed_label.as_deref() == Some(lbl.as_str())
-        }) {
-            roster.deny_labels.push(lbl);
+        let canon = leading_m_label(&lbl).map_or(lbl, |(_, c)| c);
+        if !active_log_labels.contains(&canon)
+            && !roster.members.iter().any(|m| {
+                !steward::member_is_denied_in_roster(roster, m)
+                    && (m.matches_label_or_alias(&canon)
+                        || leading_m_label(&m.label).is_some_and(|(_, c)| c == canon)
+                        || m.aliases
+                            .iter()
+                            .any(|a| leading_m_label(a).is_some_and(|(_, c)| c == canon)))
+            })
+        {
+            roster.deny_labels.push(canon);
         }
     }
     roster.canonicalize();
@@ -565,20 +878,11 @@ pub fn swarm_lease_holder(paths: &Paths) -> crate::Result<Option<String>> {
         return Ok(None);
     }
     if let Ok(Some(roster)) = swarm_roster(paths) {
-        if roster.is_label_denied(&holder) {
+        if roster.is_label_denied(&holder) || roster.is_node_denied(&holder) {
             return Ok(None);
         }
         if let Some(member) = roster.member_by_label_or_alias(&holder)
-            && (roster.is_label_denied(&member.label)
-                || member.aliases.iter().any(|a| roster.is_label_denied(a))
-                || member
-                    .node_id
-                    .as_deref()
-                    .is_some_and(|n| roster.is_node_denied(n))
-                || member
-                    .node_key
-                    .as_deref()
-                    .is_some_and(|k| roster.is_node_denied(k)))
+            && roster.is_member_denied(member)
         {
             return Ok(None);
         }
@@ -609,22 +913,15 @@ pub fn resolve_local_swarm_label(
     let Some(identity) = read_identity(paths)? else {
         return Ok(None);
     };
+    if local_recipient_denied_in_roster(paths) {
+        return Ok(None);
+    }
     let recipient = identity.recipient().to_bech32();
     let roster_opt = swarm_roster(paths)?;
     if let Some(roster) = &roster_opt
         && let Some(member) = roster.member_by_recipient(&recipient)
     {
-        if roster.is_label_denied(&member.label)
-            || member.aliases.iter().any(|a| roster.is_label_denied(a))
-            || member
-                .node_id
-                .as_deref()
-                .is_some_and(|n| roster.is_node_denied(n))
-            || member
-                .node_key
-                .as_deref()
-                .is_some_and(|k| roster.is_node_denied(k))
-        {
+        if roster.is_member_denied(member) {
             return Ok(None);
         }
         return Ok(Some(member.label.clone()));
@@ -641,6 +938,9 @@ pub fn resolve_local_swarm_label(
         && local_log.is_some();
     if state.membership != Stored::In
         || state.failed
+        || !state.pending.is_empty()
+        || expected.signer.is_none()
+        || !pin_admitted(&expected, None)
         || (!source_bound(&expected, &state) && !log_only_bound)
     {
         return Ok(None);
@@ -657,6 +957,11 @@ pub fn resolve_local_swarm_label(
 
     if let Some(log) = &local_log {
         if log.recipient_is_removed(&identity.recipient())
+            || log_entries::recipient_denied_by_roster_or_log(
+                roster_opt.as_ref(),
+                log,
+                &identity.recipient(),
+            )
             || log.audience_left_out_recipient(
                 &crate::membership_log::EpochAudience::Everyone,
                 &identity.recipient(),
@@ -883,15 +1188,45 @@ pub(super) fn log_labels(paths: &Paths) -> (BTreeMap<String, String>, Vec<String
         return (BTreeMap::new(), Vec::new());
     };
     let membership = log.membership();
+    let mut active_members: Vec<_> = membership
+        .members()
+        .iter()
+        .filter(|(actor, member)| {
+            let rec = member.binding.recipient();
+            !log.recipient_is_removed(&rec)
+                && !log.audience_left_out(&crate::membership_log::EpochAudience::Everyone, actor)
+                && !log.audience_left_out_recipient(
+                    &crate::membership_log::EpochAudience::Everyone,
+                    &rec,
+                )
+                && !membership.member_node_removed(member)
+        })
+        .collect();
+    active_members.sort_by_key(|(_, m)| (log.record_index(&m.entry).unwrap_or(0), m.entry));
     let by_recipient = membership
         .unproved()
         .iter()
+        .filter(|founder| {
+            !log.recipient_is_removed(&founder.recipient)
+                && !log.audience_left_out_recipient(
+                    &crate::membership_log::EpochAudience::Everyone,
+                    &founder.recipient,
+                )
+                && !founder
+                    .node_key
+                    .filter(|k| *k != [0; 32])
+                    .is_some_and(|nk| {
+                        matches!(
+                            membership.node(&nk),
+                            crate::membership_log::NodeStanding::Removed(_)
+                        )
+                    })
+        })
         .map(|founder| (founder.recipient.to_bech32(), founder.label.clone()))
         .chain(
-            membership
-                .members()
-                .values()
-                .map(|member| (member.binding.recipient().to_bech32(), member.label.clone())),
+            active_members
+                .into_iter()
+                .map(|(_, member)| (member.binding.recipient().to_bech32(), member.label.clone())),
         )
         .collect();
     let all = membership.claimed_labels().iter().cloned().collect();
@@ -1284,21 +1619,43 @@ email = "one@example.org"
 
         let (m1_id, m1_ent) = mk_entrant(1, "m1");
         let (m2_id, m2_ent) = mk_entrant(2, "m2");
-        let (_m7_id, m7_ent) = mk_entrant(7, "m7");
+        let (m7_id, m7_ent) = mk_entrant(7, "m7");
+        let m7_rebound_req =
+            Request::create([2; 16], [3; 32], [17; 16], [17; 16], &m7_id, &[17; 32])
+                .expect("m7 rebound request");
+        let m7_rebound_ent = Entrant {
+            request: m7_rebound_req,
+            node_key: [17; 32],
+            name: "m7.local".to_owned(),
+            label: "m7".to_owned(),
+        };
         let m1_actor = m1_ent.request.binding().actor();
         let m2_actor = m2_ent.request.binding().actor();
-        let m7_actor = m7_ent.request.binding().actor();
+        let m7_actor = m7_rebound_ent.request.binding().actor();
 
         let genesis = Record::found(&[99; 32], vec![m1_ent, m2_ent], 1_000).expect("genesis");
         let genesis_id = *genesis.id();
         let mut log = Log::new(genesis).expect("log");
 
-        let admit_m7 = log
+        let admit_m7_old = log
             .draft(
                 &m1_actor,
                 2_000,
                 Body::Admit {
                     entrant: m7_ent,
+                    evidence: Evidence::Phrase,
+                },
+            )
+            .sign(&[1; 32], [1; 16])
+            .expect("sign admit old m7");
+        log.insert(admit_m7_old).expect("insert admit old m7");
+
+        let admit_m7 = log
+            .draft(
+                &m1_actor,
+                2_500,
+                Body::Admit {
+                    entrant: m7_rebound_ent,
                     evidence: Evidence::Phrase,
                 },
             )
@@ -1332,6 +1689,7 @@ email = "one@example.org"
             .sign(&[1; 32], [1; 16])
             .expect("sign remove m7");
         log.insert(remove_m7).expect("insert remove m7");
+        assert!(log.recipient_is_removed(&m7_id.recipient()));
 
         // Removed m7 attempts to self-Admit (claiming another recipient and label "m41") and
         // rename itself to "m43.local"; neither un-removes m7's recipient nor poisons m41/m43 in
@@ -1340,10 +1698,10 @@ email = "one@example.org"
         let self_forged_req = Request::create(
             [2; 16],
             [3; 32],
-            [7; 16],
-            [7; 16],
+            [17; 16],
+            [17; 16],
             &Identity::from_secret_bytes([0x99; 32]),
-            &[7; 32],
+            &[17; 32],
         )
         .expect("forged self request");
         m41_ent.request = self_forged_req;
@@ -1356,7 +1714,7 @@ email = "one@example.org"
                     evidence: Evidence::Phrase,
                 },
             )
-            .sign(&[7; 32], [7; 16])
+            .sign(&[17; 32], [17; 16])
             .expect("sign bogus self admit");
         log.insert(bogus_self_admit)
             .expect("insert bogus self admit");
@@ -1368,7 +1726,7 @@ email = "one@example.org"
                     name: "m43.local".to_owned(),
                 },
             )
-            .sign(&[7; 32], [7; 16])
+            .sign(&[17; 32], [17; 16])
             .expect("sign bogus name");
         log.insert(bogus_name).expect("insert bogus name");
 
@@ -1420,8 +1778,483 @@ email = "one@example.org"
             vec![
                 "0202020202020202020202020202020202020202020202020202020202020202".to_owned(),
                 "0707070707070707070707070707070707070707070707070707070707070707".to_owned(),
+                "1111111111111111111111111111111111111111111111111111111111111111".to_owned(),
                 "22222222222222222222222222222222".to_owned(),
             ]
+        );
+    }
+
+    #[test]
+    fn overlay_log_membership_cascades_key_denied_members_to_deny_labels_and_deny_nodes() {
+        use crate::commons::binding::Request;
+        use crate::membership_log::{Entrant, Founder, Log, Record, Root};
+
+        let entrant = |tag: u8, label: &str| {
+            let identity = Identity::from_secret_bytes([tag; 32]);
+            let request = Request::create(
+                [2; 16], [3; 32], [tag; 16], [tag; 16], &identity, &[tag; 32],
+            )
+            .unwrap();
+            Entrant {
+                request,
+                node_key: [tag; 32],
+                name: format!("{label}.local"),
+                label: label.to_owned(),
+            }
+        };
+        for unproved in [false, true] {
+            let first = entrant(1, "m1");
+            let second = entrant(2, "m2");
+            let third = entrant(3, "m3");
+            let root = Root::of(first.request.binding());
+            let second_rec = second.request.binding().recipient().to_bech32();
+            let mut second_founder = Founder::from(second);
+            let mut third_founder = Founder::from(third);
+            if unproved {
+                second_founder.binding = None;
+                third_founder.binding = None;
+            }
+            let log = Log::new(
+                Record::genesis(
+                    &[99; 32],
+                    root,
+                    vec![Founder::from(first), second_founder, third_founder],
+                    1,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let second_nk = "02".repeat(32);
+            let third_nk = "03".repeat(32);
+            let prior_nid = "aa".repeat(16);
+            let prior_nk = "bb".repeat(32);
+            let mut roster = SwarmRoster {
+                members: vec![crate::swarm_roster::SwarmMember {
+                    recipient: second_rec,
+                    vault_name: "m2".to_owned(),
+                    label: "m2".to_owned(),
+                    aliases: vec!["m20".to_owned()],
+                    hint: None,
+                    admitted_ms: 1,
+                    claimed_label: Some("m21".to_owned()),
+                    claimed_at_ms: Some(1),
+                    node_id: Some(prior_nid.clone()),
+                    node_key: Some(prior_nk.clone()),
+                }],
+                deny_labels: Vec::new(),
+                deny_nodes: vec![second_nk.clone(), third_nk.clone()],
+            };
+            overlay_log_membership(&log, &mut roster);
+            assert_eq!(roster.members.len(), 1);
+            assert_eq!(roster.members[0].label, "m1");
+            assert_eq!(
+                roster.deny_labels,
+                vec![
+                    "m2".to_owned(),
+                    "m20".to_owned(),
+                    "m21".to_owned(),
+                    "m3".to_owned()
+                ],
+                "unproved={unproved}"
+            );
+            assert_eq!(
+                roster.deny_nodes,
+                vec![second_nk, third_nk, prior_nid, prior_nk],
+                "unproved={unproved}"
+            );
+        }
+    }
+
+    #[test]
+    fn overlay_log_membership_does_not_deny_renumbered_member_or_suppress_removed_colliding_label()
+    {
+        use crate::commons::binding::Request;
+        use crate::membership_log::{Body, Entrant, Log, Record};
+
+        let mk_entrant = |tag: u8, label: &str, name: &str| {
+            let id = Identity::from_secret_bytes([tag ^ 0x33; 32]);
+            let req = Request::create([2; 16], [3; 32], [tag; 16], [tag; 16], &id, &[tag; 32])
+                .expect("request");
+            (
+                id,
+                Entrant {
+                    request: req,
+                    node_key: [tag; 32],
+                    name: name.to_owned(),
+                    label: label.to_owned(),
+                },
+            )
+        };
+
+        let (m1_id, m1_ent) = mk_entrant(1, "m1", "m1.local");
+        let (m2_id, m2_ent) = mk_entrant(2, "m2", "m2.local");
+        // m70 collided on hostname `m2.local` when admitted, so its log `name` is `m2.local`
+        // while its assigned label is `m70` and its `[machines]` vault_name is `m2-2`.
+        let (m70_id, m70_ent) = mk_entrant(70, "m70", "m2.local");
+        let m1_actor = m1_ent.request.binding().actor();
+        let m2_actor = m2_ent.request.binding().actor();
+        let m70_actor = m70_ent.request.binding().actor();
+
+        let genesis =
+            Record::found(&[99; 32], vec![m1_ent, m2_ent, m70_ent], 1_000).expect("genesis");
+        let genesis_id = *genesis.id();
+        let mut log = Log::new(genesis).expect("log");
+
+        let remove_m2 = log
+            .draft(
+                &m1_actor,
+                2_000,
+                Body::Remove {
+                    member: m2_actor,
+                    cutoff: genesis_id,
+                },
+            )
+            .sign(&[1; 32], [1; 16])
+            .expect("sign remove m2");
+        log.insert(remove_m2).expect("insert remove m2");
+
+        let mut roster = SwarmRoster {
+            members: vec![
+                crate::swarm_roster::SwarmMember {
+                    recipient: m1_id.recipient().to_bech32(),
+                    vault_name: "m1".to_owned(),
+                    label: "m1".to_owned(),
+                    aliases: Vec::new(),
+                    hint: None,
+                    admitted_ms: 1_000,
+                    claimed_label: None,
+                    claimed_at_ms: None,
+                    node_id: None,
+                    node_key: None,
+                },
+                crate::swarm_roster::SwarmMember {
+                    recipient: m2_id.recipient().to_bech32(),
+                    vault_name: "m2".to_owned(),
+                    label: "m2".to_owned(),
+                    aliases: Vec::new(),
+                    hint: None,
+                    admitted_ms: 1_000,
+                    claimed_label: None,
+                    claimed_at_ms: None,
+                    node_id: None,
+                    node_key: None,
+                },
+                crate::swarm_roster::SwarmMember {
+                    recipient: m70_id.recipient().to_bech32(),
+                    vault_name: "m2-2".to_owned(),
+                    label: "m70".to_owned(),
+                    aliases: Vec::new(),
+                    hint: None,
+                    admitted_ms: 1_000,
+                    claimed_label: None,
+                    claimed_at_ms: None,
+                    node_id: None,
+                    node_key: None,
+                },
+            ],
+            deny_labels: Vec::new(),
+            deny_nodes: Vec::new(),
+        };
+
+        overlay_log_membership(&log, &mut roster);
+        assert!(
+            roster.is_label_denied("m2"),
+            "removed m2 must be added to deny_labels despite m70's colliding m2.local hostname"
+        );
+        let m70_row = roster
+            .member_by_recipient(&m70_id.recipient().to_bech32())
+            .expect("m70 remains in roster");
+        assert_eq!(m70_row.label, "m70");
+        assert!(
+            !roster.is_member_denied(m70_row),
+            "surviving m70 must not be denied when colliding m2 is in deny_labels"
+        );
+        let membership = log.membership();
+        let m70_log_member = membership.members().get(&m70_actor).expect("m70 in log");
+        assert!(
+            !log_entries::member_denied_by_roster(&roster, m70_log_member),
+            "member_denied_by_roster must honor m70's active roster row over m2.local hostname"
+        );
+    }
+
+    #[test]
+    fn swarm_roster_and_resolve_local_swarm_label_refuse_failed_pending_or_unpinned_state() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let vault_path = root.path().join("alab.vault");
+        let admin_paths = Paths::for_home(&root.path().join("admin"));
+        let _ = create(
+            &admin_paths,
+            vault_path.to_str().unwrap(),
+            None,
+            Some("m22"),
+        )
+        .unwrap();
+        let _ = admin_seed_swarm_roster(&admin_paths, &[]).unwrap();
+
+        assert!(swarm_roster(&admin_paths).unwrap().is_some());
+        assert_eq!(
+            resolve_local_swarm_label(&admin_paths, &["m22.local".to_owned()])
+                .unwrap()
+                .as_deref(),
+            Some("m22")
+        );
+
+        let clean_state = load_state(&admin_paths).unwrap();
+        let clean_cfg = config(&admin_paths).unwrap().unwrap();
+
+        let mut failed_state = clean_state.clone();
+        failed_state.failed = true;
+        save_state(&admin_paths, &failed_state).unwrap();
+        assert!(
+            swarm_roster(&admin_paths).unwrap().is_none(),
+            "failed apply state must not expose un-overlaid base_swarm_roster"
+        );
+        assert_eq!(
+            resolve_local_swarm_label(&admin_paths, &["m22.local".to_owned()]).unwrap(),
+            None
+        );
+
+        let mut pending_state = clean_state.clone();
+        pending_state
+            .pending
+            .insert("other".to_owned(), "00".repeat(32));
+        save_state(&admin_paths, &pending_state).unwrap();
+        assert!(
+            swarm_roster(&admin_paths).unwrap().is_none(),
+            "pending apply state must not expose un-overlaid base_swarm_roster"
+        );
+        assert_eq!(
+            resolve_local_swarm_label(&admin_paths, &["m22.local".to_owned()]).unwrap(),
+            None
+        );
+
+        save_state(&admin_paths, &clean_state).unwrap();
+        let mut unpinned_cfg = clean_cfg.clone();
+        unpinned_cfg.signer = None;
+        save_config(&admin_paths, &unpinned_cfg).unwrap();
+        assert!(swarm_roster(&admin_paths).unwrap().is_none());
+        assert_eq!(
+            resolve_local_swarm_label(&admin_paths, &["m22.local".to_owned()]).unwrap(),
+            None
+        );
+
+        save_config(&admin_paths, &clean_cfg).unwrap();
+        assert_eq!(
+            resolve_local_swarm_label(&admin_paths, &["m22.local".to_owned()])
+                .unwrap()
+                .as_deref(),
+            Some("m22")
+        );
+    }
+
+    #[test]
+    fn overlay_and_lift_restored_ignore_forged_or_suffixed_claimed_labels() {
+        use crate::commons::binding::Request;
+        use crate::membership_log::{Body, Entrant, Evidence, Log, Record};
+
+        let mk_entrant = |tag: u8, node_tag: u8, label: &str, name: &str| {
+            let id = Identity::from_secret_bytes([tag ^ 0x55; 32]);
+            let req = Request::create([2; 16], [3; 32], [tag; 16], [tag; 16], &id, &[tag; 32])
+                .expect("request");
+            (
+                id,
+                Entrant {
+                    request: req,
+                    node_key: [node_tag; 32],
+                    name: name.to_owned(),
+                    label: label.to_owned(),
+                },
+            )
+        };
+
+        let (m1_id, m1_ent) = mk_entrant(1, 1, "m1", "m1.local");
+        let (m2_id, m2_ent) = mk_entrant(2, 2, "m2", "m2.local");
+        let (m3_id, m3_ent) = mk_entrant(3, 3, "m3", "m3.local");
+        let m1_actor = m1_ent.request.binding().actor();
+        let m2_actor = m2_ent.request.binding().actor();
+        let m3_actor = m3_ent.request.binding().actor();
+
+        let genesis =
+            Record::found(&[99; 32], vec![m1_ent, m2_ent, m3_ent], 1_000).expect("genesis");
+        let genesis_id = *genesis.id();
+        let mut log = Log::new(genesis).expect("log");
+
+        // Remove m2, which carried a suffixed stale `claimed_label = Some("m1-3fa2")` colliding
+        // with surviving `m1`'s canonical label.
+        let remove_m2 = log
+            .draft(
+                &m1_actor,
+                2_000,
+                Body::Remove {
+                    member: m2_actor,
+                    cutoff: genesis_id,
+                },
+            )
+            .sign(&[1; 32], [1; 16])
+            .expect("sign remove m2");
+        log.insert(remove_m2).expect("insert remove m2");
+
+        let mut roster = SwarmRoster {
+            members: vec![
+                crate::swarm_roster::SwarmMember {
+                    recipient: m1_id.recipient().to_bech32(),
+                    vault_name: "m1".to_owned(),
+                    label: "m1".to_owned(),
+                    aliases: Vec::new(),
+                    hint: None,
+                    admitted_ms: 1_000,
+                    claimed_label: None,
+                    claimed_at_ms: None,
+                    node_id: None,
+                    node_key: Some(aterm_codec::hex::encode_lower(&[1u8; 32])),
+                },
+                crate::swarm_roster::SwarmMember {
+                    recipient: m2_id.recipient().to_bech32(),
+                    vault_name: "m2".to_owned(),
+                    label: "m2".to_owned(),
+                    aliases: Vec::new(),
+                    hint: None,
+                    admitted_ms: 1_000,
+                    claimed_label: Some("m1-3fa2".to_owned()),
+                    claimed_at_ms: Some(1_500),
+                    node_id: None,
+                    node_key: Some(aterm_codec::hex::encode_lower(&[2u8; 32])),
+                },
+                crate::swarm_roster::SwarmMember {
+                    recipient: m3_id.recipient().to_bech32(),
+                    vault_name: "m3".to_owned(),
+                    label: "m3".to_owned(),
+                    aliases: Vec::new(),
+                    hint: None,
+                    admitted_ms: 1_000,
+                    claimed_label: None,
+                    claimed_at_ms: None,
+                    node_id: None,
+                    node_key: Some(aterm_codec::hex::encode_lower(&[3u8; 32])),
+                },
+            ],
+            deny_labels: Vec::new(),
+            deny_nodes: Vec::new(),
+        };
+
+        overlay_log_membership(&log, &mut roster);
+        assert!(
+            roster.is_label_denied("m2"),
+            "removed m2 must be added to deny_labels: {:?}",
+            roster.deny_labels
+        );
+        assert!(
+            !roster.is_label_denied("m1"),
+            "surviving m1 must not be collateral-denied by m2's suffixed claimed_label m1-3fa2: {:?}",
+            roster.deny_labels
+        );
+
+        // Now remove m3 and restore m3 under a fresh secrets key with the same node_key `[3; 32]`,
+        // while a denied row for m9 in `roster.members` carries a forged `claimed_label = Some("m3")`.
+        let remove_m3 = log
+            .draft(
+                &m1_actor,
+                3_000,
+                Body::Remove {
+                    member: m3_actor,
+                    cutoff: genesis_id,
+                },
+            )
+            .sign(&[1; 32], [1; 16])
+            .expect("sign remove m3");
+        log.insert(remove_m3).expect("insert remove m3");
+
+        let (_m3_restored_id, m3_restored_ent) = mk_entrant(30, 3, "m3", "m3.local");
+        let admit_m3 = log
+            .draft(
+                &m1_actor,
+                4_000,
+                Body::Admit {
+                    entrant: m3_restored_ent,
+                    evidence: Evidence::Phrase,
+                },
+            )
+            .sign(&[1; 32], [1; 16])
+            .expect("sign admit m3");
+        log.insert(admit_m3).expect("insert admit m3");
+
+        let (m9_id, _) = mk_entrant(9, 9, "m9", "m9.local");
+        let m9_nk = aterm_codec::hex::encode_lower(&[9u8; 32]);
+        let m3_nk = aterm_codec::hex::encode_lower(&[3u8; 32]);
+        let mut restore_roster = SwarmRoster {
+            members: vec![crate::swarm_roster::SwarmMember {
+                recipient: m9_id.recipient().to_bech32(),
+                vault_name: "m9".to_owned(),
+                label: "m9".to_owned(),
+                aliases: Vec::new(),
+                hint: None,
+                admitted_ms: 1_000,
+                claimed_label: Some("m3".to_owned()),
+                claimed_at_ms: Some(1_500),
+                node_id: None,
+                node_key: Some(m9_nk.clone()),
+            }],
+            deny_labels: vec!["m3".to_owned(), "m9".to_owned()],
+            deny_nodes: vec![m3_nk.clone(), m9_nk.clone()],
+        };
+        let _ = lift_restored_from_roster(&log, &mut restore_roster);
+        assert!(
+            !restore_roster.is_label_denied("m3") && !restore_roster.is_node_denied(&m3_nk),
+            "restored m3 must be lifted from deny_labels and deny_nodes"
+        );
+        assert!(
+            restore_roster.is_label_denied("m9") && restore_roster.is_node_denied(&m9_nk),
+            "denied m9 with forged claimed_label='m3' must not be lifted when m3 is restored: labels={:?}, nodes={:?}",
+            restore_roster.deny_labels,
+            restore_roster.deny_nodes
+        );
+
+        // A stale label-denied row (`m40`) sharing `node_id` / `node_key` with active `m1`
+        // must not push `m1`'s node into `deny_nodes` or wipe `m1` during `overlay_log_membership`.
+        let m1_nk = aterm_codec::hex::encode_lower(&[1u8; 32]);
+        let mut stale_row_roster = SwarmRoster {
+            members: vec![
+                crate::swarm_roster::SwarmMember {
+                    recipient: "age1m40stale".to_owned(),
+                    vault_name: "m40".to_owned(),
+                    label: "m40".to_owned(),
+                    aliases: Vec::new(),
+                    hint: None,
+                    admitted_ms: 500,
+                    claimed_label: None,
+                    claimed_at_ms: None,
+                    node_id: Some("00000000000000000000000000000001".to_owned()),
+                    node_key: Some(m1_nk.clone()),
+                },
+                crate::swarm_roster::SwarmMember {
+                    recipient: m1_id.recipient().to_bech32(),
+                    vault_name: "m1".to_owned(),
+                    label: "m1".to_owned(),
+                    aliases: Vec::new(),
+                    hint: None,
+                    admitted_ms: 1_000,
+                    claimed_label: None,
+                    claimed_at_ms: None,
+                    node_id: Some("00000000000000000000000000000001".to_owned()),
+                    node_key: Some(m1_nk.clone()),
+                },
+            ],
+            deny_labels: vec!["m40".to_owned()],
+            deny_nodes: Vec::new(),
+        };
+        overlay_log_membership(&log, &mut stale_row_roster);
+        assert!(
+            !stale_row_roster.is_node_denied(&m1_nk)
+                && !stale_row_roster.is_node_denied("00000000000000000000000000000001")
+                && !stale_row_roster.is_label_denied("m1"),
+            "stale denied row sharing node_id/node_key with active m1 must not poison m1: labels={:?}, nodes={:?}",
+            stale_row_roster.deny_labels,
+            stale_row_roster.deny_nodes
+        );
+        assert!(
+            stale_row_roster.members.iter().any(|m| m.label == "m1"),
+            "active m1 must remain in roster.members: {:?}",
+            stale_row_roster.members
         );
     }
 }

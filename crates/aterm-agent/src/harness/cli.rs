@@ -29,6 +29,10 @@ use crate::supervise::run::{Ctl, Session};
 use crate::supervise::transport::{Endpoint, RelayCtl};
 use crate::supervise::{SupervisorConfig, approvals, limit};
 
+#[path = "cli_shared_adoption.rs"]
+pub(in crate::harness) mod shared_adoption;
+#[path = "cli_shared_provider.rs"]
+pub mod shared_provider;
 #[path = "cli_shared_renewal.rs"]
 pub mod shared_renewal;
 
@@ -70,6 +74,7 @@ USAGE:
     aterm harness agy pick [<model>] [--json]    the model an agy launch runs after quota rotation
     aterm harness limits [@<sid>] [--json]       wall and painted /usage windows on the session's screen
     aterm harness disk [<build-dir> ...] [--apply <class>] [--json]
+    aterm harness disk watch                    foreground automatic maintenance on macOS
                                                  report or reclaim stale build directories and caches
     aterm harness disk why [--json]              which agent session was asked to free disk space, and why
     aterm harness disk free <path>... [--dry-run] [--json] | --dry-run [--json]
@@ -97,7 +102,7 @@ USAGE:
     aterm harness accounts browser <label> [--cli <id>]
                                                  open the row's own browser profile for a person to sign in once
     aterm harness accounts renew [--due | <label>...] [--on <host>,... | --here]
-                                                 renew logins via staging sign-in (and over ssh)
+                                                 renew logins via staging sign-in and native fleet
     aterm harness accounts shared-renew <label> --account <digest> --decision <digest> --request <nonce>
                                                  renew one local Claude row under an exact root decision
     aterm harness accounts use <label> | --auto  pin an account or return to automatic rotation
@@ -120,7 +125,8 @@ USAGE:
     aterm harness signin --cli grok [--wait] [--json]
                                                  sign this machine in to Grok Build once: sandboxed, one
                                                  sign-in and one need however many sessions ask
-    aterm harness versions [--json]              incremental numeric version of each CLI harness
+    aterm harness versions [--json]              each harness's version: built-in, installed
+                                                 harness packages, and live claims
     aterm harness tap                            Claude Code statusLine usage tap (`[harness] usage_tap`)
 
 `hook` and `statusline` do nothing and exit 0, so settings that still name them stay harmless.
@@ -143,8 +149,8 @@ OPTIONS:
     --defer <dur>       upgrade <sid>: hold for <dur> (90s, 30m, 6h, 2d; max 30d)
     --skip              upgrade <sid>: stay on the running build until a newer target lands
     --cli <id>          accounts, ledger accounts: the CLI's pool (`claude`, the default; `codex`,
-                        `grok`, `kimi`; `all` for the report alone)
-    --region <r>        accounts add, adopt-default --cli kimi: `global` (kimi.ai) or
+                        `grok`, `kimi`; `all` for the report and `accounts table` alone)
+    --region <r>        accounts add, adopt-default, import --cli kimi: `global` (kimi.ai) or
                         `mainland-cn` (kimi.com)
     --flow <f>          accounts add, adopt-default --cli codex|grok: `browser` or `device`
     --shared            accounts add: mark account `shared` across machines
@@ -153,7 +159,7 @@ OPTIONS:
                         reported account email when the login email is an alias
     --browser <b>       accounts add, adopt-default: browser profile display name for sign-in
     --due               accounts renew: renew every due or expired login on this machine
-    --on <host>,...     accounts renew: machines to renew next over ssh (`host` or `host:/abs/aterm`)
+    --on <host>,...     accounts renew: native fleet hosts, node IDs or host:port endpoints
     --here              accounts renew: renew this machine's logins only
     --agy               usage: read agy's model quota (`agy -p /usage`)
     --refresh           agy: ask agy now instead of the kept reading
@@ -212,7 +218,9 @@ limit's burn per hour and the moment it runs out at that rate are reckoned.
     spent pool rotates any launch to the first `[harness.agy] order` model in an open pool,
     else in the low pool with the most left, else it waits (exit 3) until the earliest refill;
     a low pool rotates agy's default, and keeps a named model. `aterm ctl spawn agent=agy`
-    workers launch on this pick.
+    workers launch on this pick (waiting for the earliest refill when every pool is spent), and
+    a live supervised `agy` session stopped at a quota wall rotates across pools on `--model`
+    or resumes in place once its pool refills.
   - `[harness.agy]` in aterm.toml: `rotate = false` turns rotation off; `low = 0.1` (or `10`);
     `order = [\"claude-opus-5-5-medium\", \"gemini-4-argon-high\", ...]`.
 ";
@@ -264,6 +272,12 @@ invalid `aterm.toml`, or a `[disk]` removal key (`apply`, `target_stale_days`,
 `auto_free_gib`, `dead_build_dirs`, `idle_build_dirs`, `idle_build_days`) of the wrong type
 or below another table's header, turns every manual and automatic removal off.
 
+`disk watch` runs automatic maintenance in the foreground on macOS, reading the supported
+`--config <path>` every minute. It uses the window's automatic tiers, thresholds, paged
+discovery, managed-cache schedule and write-ahead journal. `--state <path>` moves its journal,
+not the user's home or the shared pass lock. Set `disk.auto_free_gib = 0` to stop new passes;
+SIGTERM stops the process. An already-admitted pass is not quiescent until its lock is released.
+
 With no `<build-dir>` arguments, `disk` scans this working directory, `$HOME` checkouts
 and worktrees (2 levels deep), `x.py` stage build dirs, aterm's Rust build cache, and
 Claude Code's temp root on the current volume (never crossing mount points or protected
@@ -281,7 +295,7 @@ THRESHOLDS (`watch:`):
   A knob written in `aterm.toml` is read as written; only the defaults follow the volume.
   Volume state is `ok` (>=warn), `low` (<warn), `short` (<floor), or `emergency`.
 
-WINDOW AUTOMATIC TIERS (cheapest first, re-measuring free space before each item):
+AUTOMATIC TIERS (window or `disk watch`, cheapest first, re-measuring before each item):
   - tier 1 (`low`, `disk.dead_build_dirs = true`): whole scratch/workspace build dirs whose
     owner session or checkout is gone, with signed `CACHEDIR.TAG` and no locks or open files.
   - tier 2 (`low`): idle Cargo profile `incremental/` dirs (idle past `disk.target_stale_days`,
@@ -292,7 +306,7 @@ WINDOW AUTOMATIC TIERS (cheapest first, re-measuring free space before each item
     space reaches `floor + 5 GiB` or reclaimed bytes cover the shortfall.
 
 `--apply cargo-targets` takes tier 1 (when `low`), tier 2 (at any free level), and tier 4
-(when `short`); tier 3 (`idle_whole_up_to=`) is emptied only by the window's pass.
+(when `short`); tier 3 (`idle_whole_up_to=`) is emptied only by an automatic pass.
 
 ASKING AN AGENT (`rule disk-free@v1`):
   When the home volume stays `short` or `emergency` and aterm's own freeing is done (a pass
@@ -305,9 +319,11 @@ ASKING AN AGENT (`rule disk-free@v1`):
   for 150 s, and the best is elected. An elected session found unfit at its turn break is
   released, which costs no election. A session that frees under 1 GiB in 20 minutes, ends,
   or reaches no turn break in 30 hands the ask to one other session; after two lines (or four
-  elections) no more agents are asked and the owner's disk line says so. The episode ends back at or above the floor; no new one opens within
-  6 hours of the last line. `disk why` prints the lease and its recent decisions (the
-  `free-ask` rows of `<state>/disk.jsonl`); `--json` prints the lease, then the rows.
+  elections) no more agents are asked and the owner's disk line says so. The episode ends
+  once free space is 5 GiB past the floor (and free inodes, where counted, 50,000 past their
+  line); no new one opens within 6 hours of the last line. `disk why` prints the lease and
+  its recent decisions (the `free-ask` rows of `<state>/disk.jsonl`); `--json` prints the
+  lease, then the rows.
 
 `disk free <path>...` is the one way aterm's disk-free worker removes anything. A path goes
 only when all of these hold:
@@ -359,12 +375,12 @@ accounts store (another tapped session on the same login), whichever is newer:
 `weekly <p>% left` up to 15 minutes old, `weekly <p>% left \u{b7} 40m ago` up to an hour, then
 nothing. Without a figure the footer shows no week; the account's hover title and the
 Accounts menu say why, and never ask you to act:
-`weekly ? \u{b7} until relaunch` (a relaunch aterm offers now would add the tap),
-`weekly ? \u{b7} untapped` (no relaunch line can carry it, or none is offered, or the line
+`weekly \u{2013} \u{b7} until relaunch` (a relaunch aterm offers now would add the tap),
+`weekly \u{2013} \u{b7} untapped` (no relaunch line can carry it, or none is offered, or the line
 would have no room for it),
-`weekly ? \u{b7} tap off` (the tap is off),
-`weekly ? \u{b7} no reply yet` (tapped, and no reply since it started brought the week),
-`weekly ? \u{b7} no reply 1h` (tapped, and its week is over an hour old),
+`weekly \u{2013} \u{b7} tap off` (the tap is off),
+`weekly \u{2013} \u{b7} no reply yet` (tapped, and no reply since it started brought the week),
+`weekly \u{2013} \u{b7} no reply 1h` (tapped, and its week is over an hour old),
 no words at all (no account profile is trusted for this process, so neither figure is:
 the profile could not be read, `accounts.toml` or the store's `logins.json` could not be, or
 the roster has no row for this login, or one with no `email` or another one; only the
@@ -379,8 +395,22 @@ keeps writing readings until it is relaunched.
 ";
 
 const HELP_VERSIONS: &str = "\
-`versions` (`version`) prints the incremental numeric harness version (`v0.1`, \u{2026})
-for each CLI harness (`codex-alab`, `claude`, `agy`, `grok`, `kimi`, `muse`).
+`versions` (`version`) prints every harness version on this machine, in three sections
+(`docs/DESIGN-harness-repos-2026-10-24.md` \u{a7}5):
+  - built-in: the incremental numeric version (`v0.4`, \u{2026}) of each CLI harness compiled
+    into this aterm (`claude`, `agy`, `grok`, `kimi`, `muse`), updated with aterm;
+  - installed harness packages: each `<agent>-alab` program in the atpkg store, with the
+    version its signed manifest named (`version unrecorded` for a build installed before the
+    record), and codex-alab (`codex`'s ALab build) with its package version; a dev link names
+    its checkout;
+  - live claims: each session a harness supervises on this machine's aterm instances
+    (`--sock` reads one), as `@<sid> <harness> <version> (<agent> <vendor version>)`, the
+    versions a proven contract 3 claim announced (`unknown` where it named none); a proven
+    codex-alab self-claim shows the package version of the store build its process runs.
+`--json` prints one array of objects, each with `kind`: `built-in` (`id`, `slug`, `label`,
+`version`, `major`, `minor`), `package` (`harness`, `program`, `build`, `version`, `link`) or
+`claim` (`session`, `holder`, `harness`, `proven`, `version`, `agent`, `vendor`); a field
+nothing records is `null`.
 ";
 
 const HELP_LEDGER: &str = "\
@@ -403,6 +433,9 @@ The roster is `accounts.toml` beside `aterm.toml`: `[[account]]` rows with `labe
 machine's default login), and optional `email`, `identity_email` and `browser`. An invalid roster is
 refused whole (exit 1). The report prints no credential, and no email but in Codex's JSON report
 (`--cli codex --json`), which carries each row's `email` and `identity_email`.
+A label names one login, never a machine: a row found by itself is named for the Mac or Macs it
+runs on, with a number past the first (`m2`, `m2-2`, `m2-3`, or `m106-m38` for a shared one), and
+its `email` in the roster says which account that is.
 
 REPORT & ROTATION (`[harness] accounts = \"early\" | \"wall\" | \"off\"`):
   Prints `active: <label>, N of M sessions on it`; a row per account with its class, its
@@ -420,6 +453,13 @@ REPORT & ROTATION (`[harness] accounts = \"early\" | \"wall\" | \"off\"`):
     another table's header, or `[swarm] enabled = false`), or says aterm.toml is not valid
     TOML, whose lines are then read one by one.
 
+OUTLOOK (Claude Code's pool):
+  Under each row, a line per window (used, left, its reset, how fresh the reading is, and
+  where today's pace takes it by its reset) and a `plan` line; after `next:`, an `outlook`
+  block: what the rotation's own policy would do if today's pace holds, from readings aterm
+  already has; it moves nothing and reads no account. `--json` carries the same model as
+  each window's `fresh` and `projection`, each row's `plan` and a top-level `outlook`.
+
 LIMIT RESET (`[harness] limit_reset = true`, default false):
   At Claude Code's usage-limit dialog on the machine's default login (no other account run
   since 25h before the session started, and a limit >24h away or an offer expiring within
@@ -434,8 +474,9 @@ VERBS:
     provenance and explicit provider markers. Unknown authentication methods stay pending.
     Reads the shared source table and local rosters: active, pending and local labels,
     preferred machines, class, region/flow and login readiness. Empty pools are
-    `needs-source`; source membership alone is not a working login. Prints no email
-    address or credential and writes nothing.
+    `needs-source`; source membership alone is not a working login. Prints no credential
+    and writes nothing; it shows an email only on a retained Commons row (`<email>`;
+    `--json`: `email`).
   - `accounts import <label> --cli kimi [--region <r>]`
     Imports one pending source row for its preferred machine. A missing region must be
     explicit. The source supplies the account identity; no credentials are copied.
@@ -455,19 +496,21 @@ VERBS:
     Lists the machine's default login (no `dir`). With `--email`, it is a renewable row.
     Claude Code requires that address; Codex reads it from its auth.json when omitted.
     A Kimi row may omit it where the existing local login has no verified email to record;
-    that row is not renewable until an email is supplied. With `--identity-email`, its
-    current Claude subscription must report that canonical address; `--email` remains
-    the address used for sign-in. This records metadata, not a new credential or proof
-    that the login will remain usable. A locally owned fleet source is updated too;
-    a read-only source is named and nothing is written.
+    that row is not renewable until an email is supplied. With `--identity-email`, the
+    default login must report that canonical address (Claude Code's subscription, Codex's
+    auth.json) or nothing is written; `--email` remains the address used for sign-in.
+    This records metadata, not a new credential or proof that the login will remain
+    usable. A locally owned fleet source is updated too; a read-only source is named and
+    nothing is written.
     Retained login or account state under the label refuses adoption. Creation also
     waits briefly for any managed sign-in, then refuses while it remains in flight.
   - `accounts login <label>`
-    Runs `CLAUDE_CONFIG_DIR='<dir>' claude auth login` (plain `claude auth login` for the
-    default row) in a terminal, then checks once with `claude auth status --json` (20 s cap)
-    under `CLAUDE_SECURESTORAGE_CONFIG_DIR` and records `signed in` (exit 0) or the failure
-    (exit 1). With no terminal on stdin it prints the command, runs nothing, and exits 0.
-    Refuses a row with `email` (use `accounts renew`).
+    Runs `CLAUDE_CONFIG_DIR='<staging>' claude auth login` in a terminal, in a fresh staging
+    dir (`<label>+<n>`, the default row's too), then checks once with `claude auth status
+    --json` (20 s cap) under `CLAUDE_SECURESTORAGE_CONFIG_DIR`; signed in, it binds the row
+    to that dir in `<state>/accounts/logins.json` (exit 0), else binds nothing and keeps the
+    staging dir (exit 1). With no terminal on stdin it prints the command, runs nothing, and
+    exits 0. Refuses a row with `email` or `identity_email` (use `accounts renew`).
   - `accounts browser <label> [--cli <id>]`
     Opens the row's own browser profile (the one its headless sign-ins use: Claude Code's
     under `<state>/accounts/browsers/`, another CLI's under `<state>/accounts/vendor-browsers/`
@@ -499,8 +542,17 @@ VERBS:
     account email matches, and binds the row in `<state>/accounts/logins.json` so sessions
     move at their next idle turn end (the reply names a `[harness]` switch that stops this;
     `wrong-account` deletes the staging dir and changes nothing live, though a bound row
-    records the attempt). Then runs `ssh -t <host> aterm harness accounts renew --due --here`
-    on each host in `--on` (or `[harness] hosts` under `--due`; none with `--here`).
+    records the attempt). A row whose page stopped its automatic sign-in (`blocked`) signs in
+    with a person at this Mac's terminal in its own browser profile, or with none named their
+    default browser, with no headless try; SSH takes the usual route, and so does an agent's
+    terminal, which never opens a browser: a row with no headless route is left to a person there. A person at a terminal waits out a sign-in
+    that holds the machine's sign-in lock, about 16 minutes at most; anyone else is refused
+    (`held`), and `accounts login` and `accounts browser` do the same. Then requests each host's
+    own unattended
+    `renew --due --here`
+    over authenticated native fleet Drive (`--on`, or `[harness] hosts` under `--due`;
+    none with `--here`). Interactive rows remain pending on that machine. SSH paths and
+    user@host entries are refused; peers must support the accounts-renew control verb.
   - `accounts use <label> | --auto`
     Pins an enrolled account that is not signed out (clearing its recorded walls), or
     clears the pin (`--auto`).
@@ -526,9 +578,9 @@ VERBS:
     guess),why I guessed,your correction (leave blank if my guess is right)`) and routes each
     AI email to the mailbox login its sign-in codes arrive in: the correction where it is not
     blank (nor only `ok`/`yes`), else the guess (the first address in the cell, or the AI
-    email itself where the whole cell says `itself` or `its own inbox`). It adds each email
-    to that login's `[[mailboxes]]` entry's `receives` in `<toml>` (usually
-    `~/.secrets/ai-mailbox.toml`), takes it off any other entry's exact `receives`
+    email's base address, no `+tag`, where the whole cell says `itself` or `its own inbox`).
+    It adds each email to that login's `[[mailboxes]]` entry's `receives` in `<toml>`
+    (usually `~/.secrets/ai-mailbox.toml`), takes it off any other entry's exact `receives`
     (wildcards stay), and appends an entry for a login the file lacks: one that uses the
     password the file already keeps for that login (the top-level `user`'s, or a per-email
     one), else one with `password = \"\"`. Every other byte, every password, second
@@ -852,6 +904,12 @@ pub struct Env {
     pub tz_s: i64,
 }
 
+/// Whether the report's outlook says each instant on the machine's clock as it will stand then
+/// ([`limit::local_offset_at`], a daylight change before a reset included): set by
+/// [`main_entry`] for `accounts report` alone, so a report a test runs says UTC.
+static REPORT_LOCAL_CLOCK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// The variable aterm names a tab's session by in the programs the tab runs (`aterm ctl @self`
 /// reads it), which Codex passes to its tools unless its `shell_environment_policy` keeps it out.
 const TAB_SESSION_VAR: &str = "ATERM_PARENT_SESSION_ID";
@@ -884,7 +942,7 @@ fn codex_of_env(
         .collect();
     let var = |name: &str| {
         vars.iter()
-            .find(|(n, _)| n == name)
+            .rfind(|(n, _)| n == name)
             .map(|(_, value)| value.as_str())
     };
     let thread = var("CODEX_THREAD_ID")
@@ -922,7 +980,7 @@ impl Env {
         let now = crate::supervise::limit::unix_now();
         let claude_pid = std::env::var("CLAUDE_PID")
             .ok()
-            .and_then(|p| p.parse::<u32>().ok())
+            .and_then(|p| crate::parse_uint::<u32>(&p))
             .filter(|&p| p > 0);
         let config_dir = std::env::var("CLAUDE_CONFIG_DIR").ok();
         let claude_dir = footer::claude_dir_of(
@@ -1103,7 +1161,7 @@ pub enum AccountsCmd {
         labels: Vec<String>,
         /// `--due`: every login of this machine that is due or expired.
         due: bool,
-        /// `--on`: the machines to renew on next, over SSH; `None` reads `[harness] hosts` (only under `--due`).
+        /// `--on`: native fleet hosts or node IDs to renew on next; `None` reads `[harness] hosts` (only under `--due`).
         on: Option<Vec<String>>,
     },
     /// `accounts login <label>`: the vendor's sign-in flow for that account, waited for, and — after a flow that exits 0 — what its new login then answers recorded.
@@ -1224,6 +1282,8 @@ pub enum Cmd {
         /// The JSON form.
         json: bool,
     },
+    /// Foreground automatic maintenance using the ordinary paged watch and config.
+    DiskWatch,
     /// `disk why`: which agent session the ask (`disk-free@v1`) chose and why
     /// ([`run_disk_why`]).
     DiskWhy {
@@ -1724,9 +1784,41 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
             sid: sid_operand(&rest[1..])?,
             json,
         },
+        "disk" if rest.get(1) == Some(&"watch") => {
+            if rest.len() != 2
+                || apply.is_some()
+                || dry_run
+                || json
+                || over.sock.is_some()
+                || shared
+                || auto
+                || due
+                || here
+                || agy
+                || refresh
+                || wait
+                || email.is_some()
+                || identity_email.is_some()
+                || browser.is_some()
+                || machine.is_some()
+                || bind.is_some()
+                || into.is_some()
+                || on.is_some()
+                || pool.is_some()
+                || region.is_some()
+                || flow.is_some()
+                || !owner.is_empty()
+            {
+                return Err("disk watch takes only --config and --state; automatic policy comes from [disk]".into());
+            }
+            Cmd::DiskWatch
+        }
         "disk" if rest.get(1) == Some(&"why") => {
             if rest.len() > 2 || apply.is_some() {
-                return Err(format!("disk why takes only --json, not {:?}", &rest[2..]));
+                return Err(format!(
+                    "disk why takes only --json (no operand or --apply), not {:?}",
+                    &rest[2..]
+                ));
             }
             Cmd::DiskWhy { json }
         }
@@ -1764,7 +1856,7 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
                     file = LedgerFile::Accounts(Cli::Claude);
                 } else if op.starts_with('@') && op.len() > 1 {
                     file = LedgerFile::Approvals(Some((*op).to_string()));
-                } else if let Ok(n) = op.parse::<usize>() {
+                } else if let Some(n) = crate::parse_uint::<usize>(op) {
                     count = n;
                 } else {
                     return Err(format!(
@@ -1934,8 +2026,9 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
                 },
                 other => {
                     return Err(format!(
-                        "accounts takes nothing (or `list`), `stats`, `sync [<source>] [--machine <mN>]`, \
-                         `serve [<source>] [--bind <addr:port>] [--machine <mN>]`, `add <label> \
+                        "accounts takes nothing (or `list`), `table`, `import <label>`, `stats`, \
+                         `refresh`, `sync [<source>] [--machine <mN>]`, `serve [<source>] \
+                         [--bind <addr:port>] [--machine <mN>]`, `add <label> \
                          [--shared] [--email <e>] [--browser <b>]`, `adopt-default <label> \
                          --email <e>`, `login <label>`, `browser <label>`, `renew [--due | \
                          <label>…] [--on <host>,…]` or `use <label> | --auto`, not {other:?}"
@@ -1954,8 +2047,8 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
             {
                 return Err(
                     "--json is the report's form (`aterm harness accounts --json`), \
-                     `accounts stats --json`, and `accounts sync --json`: the other forms print \
-                     lines"
+                     `accounts table --json`, `accounts stats --json`, `accounts refresh \
+                     --cli kimi --json`, and `accounts sync --json`: the other forms print lines"
                         .to_string(),
                 );
             }
@@ -2025,7 +2118,11 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
             );
         }
         if over.sock.is_some() {
-            return Err("accounts takes no --sock: it reads no session".to_string());
+            return Err(
+                "accounts takes no --sock: `accounts refresh`, the one form that reads a \
+                 session, uses the resolved socket"
+                    .to_string(),
+            );
         }
     }
     Ok((cmd, over))
@@ -2234,10 +2331,11 @@ fn source_table_rows(
                         .records
                         .roster
                         .row(&account.label)
-                        .filter(|row| {
-                            row.email
-                                .as_deref()
-                                .is_some_and(|email| accounts::email_matches(email, &account.email))
+                        .filter(|row| row.held_by.is_none() && row.matches_email(&account.email))
+                        .or_else(|| {
+                            local.records.roster.rows.iter().find(|row| {
+                                row.held_by.is_none() && row.matches_email(&account.email)
+                            })
                         })
                         .map_or_else(
                             || "elsewhere".to_owned(),
@@ -2260,12 +2358,13 @@ fn source_table_rows(
     }
     if let Some(local) = &local {
         for row in &local.records.roster.rows {
-            if fleet
-                .roster
-                .accounts
-                .iter()
-                .chain(&fleet.held)
-                .any(|account| account.label == row.label)
+            if row.held_by.is_some()
+                || fleet
+                    .roster
+                    .accounts
+                    .iter()
+                    .chain(&fleet.held)
+                    .any(|account| account.label == row.label || row.matches_email(&account.email))
             {
                 continue;
             }
@@ -2469,7 +2568,10 @@ fn accounts_of(
             AccountsCmd::Report { json } if region.is_none() && flow.is_none() => {
                 Ok(Cmd::AccountsAll { json })
             }
-            _ => Err("--cli all belongs to the report (`accounts [list]`) alone".to_string()),
+            _ => Err(
+                "--cli all belongs to the report (`accounts [list]`) and `accounts table` alone"
+                    .to_string(),
+            ),
         };
     }
     let cli = match pool.as_deref() {
@@ -2506,7 +2608,8 @@ fn accounts_of(
         None => None,
         Some(_) if !rows || keys != RowKeys::Region => {
             return Err(
-                "--region belongs to `accounts add` and `adopt-default` with `--cli kimi`"
+                "--region belongs to `accounts add`, `adopt-default` and `import` with \
+                 `--cli kimi`"
                     .to_string(),
             );
         }
@@ -2735,27 +2838,116 @@ impl ClaudeProcess for LiveClaude {
     }
 }
 
-fn usage_label(env: &Env, pick: &Pick, process: &dyn ClaudeProcess) -> String {
-    let label = || {
-        let Pick::Named { path, .. } = pick else {
-            return None;
-        };
-        let pid = env.claude_pid?;
-        let roster = env
-            .accounts_store()
-            .read_roster(env.accounts_roster().as_deref(), env.now)
-            .ok()
-            .filter(Roster::several)?;
-        let who = accounts::ProcessLogin::of_exec_env(&process.exec_env(pid)?)?;
-        let started = process.started(pid)?;
-        let entry = footer::session_of_pid(&env.claude_dir()?, pid, Some(started))?;
-        let folded = path.file_stem().and_then(|stem| stem.to_str());
-        let proven = entry.proc_start == Some(started) && folded == Some(entry.session_id.as_str());
-        accounts::footer_label(&roster, &who)
-            .filter(|_| proven)
-            .map(str::to_owned)
+/// The roster label of the account this session's Claude Code runs under, where its own
+/// transcript and its process prove it on a roster of two or more rows
+/// ([`accounts::footer_label`]); `None` elsewhere, and the line names it [`USAGE_ACCOUNT`].
+fn usage_account(env: &Env, pick: &Pick, process: &dyn ClaudeProcess) -> Option<String> {
+    let Pick::Named { path, .. } = pick else {
+        return None;
     };
-    label().unwrap_or_else(|| USAGE_ACCOUNT.to_owned())
+    let pid = env.claude_pid?;
+    let roster = env
+        .accounts_store()
+        .read_roster(env.accounts_roster().as_deref(), env.now)
+        .ok()
+        .filter(Roster::several)?;
+    let who = accounts::ProcessLogin::of_exec_env(&process.exec_env(pid)?)?;
+    let started = process.started(pid)?;
+    let entry = footer::session_of_pid(&env.claude_dir()?, pid, Some(started))?;
+    let folded = path.file_stem().and_then(|stem| stem.to_str());
+    let proven = entry.proc_start == Some(started) && folded == Some(entry.session_id.as_str());
+    accounts::footer_label(&roster, &who)
+        .filter(|_| proven)
+        .map(str::to_owned)
+}
+
+/// WHAT aterm HOLDS OF THE ACCOUNT THIS SESSION'S CLAUDE CODE RUNS UNDER beside its own reading
+/// ([`super::account_stats::home_windows`]), and what it read for it ([`usage::Consulted`]): the
+/// accounts store's record (every tapped session's figure on the login, its newest sample, a wall,
+/// Claude Code's warning) and, where the process runs on the default home's own login, that
+/// home's cached `/usage` body. The account is the one [`usage_account`] proved (`proven`), else,
+/// for a tapped process (`reading`), the one its login is judged to on the roster as every footer
+/// judges it ([`accounts::judged_label`]: a stored login in the default home), so no other
+/// account's figure reaches the line. The home's profile is read only for a process whose login is
+/// the default one (no [`accounts::LOGIN_ENV`]) on a machine with one login, whose default-login
+/// row is the judged one (the own row where the roster is empty); a profile naming another
+/// account than the record's drops the cache, never the record. `None` and nothing consulted
+/// (nothing more is read, the process included) for an untapped process with no proven account,
+/// where the store cannot be read, or where no account is judged.
+fn usage_held(
+    env: &Env,
+    proven: Option<&str>,
+    reading: Option<&super::tap::Reading>,
+    process: &dyn ClaudeProcess,
+) -> (Option<super::account_stats::View>, usage::Consulted) {
+    let unread = (None, usage::Consulted::default());
+    if proven.is_none() && reading.is_none() {
+        return unread;
+    }
+    let Ok(records) = env
+        .accounts_store()
+        .read_account_records(env.accounts_roster().as_deref(), env.now)
+    else {
+        return unread;
+    };
+    let judged = match proven {
+        Some(label) => Some((label.to_owned(), false)),
+        None => usage_judged(env, &records.roster, process),
+    };
+    let Some((label, home)) = judged else {
+        return unread;
+    };
+    let record = records.state.accounts.get(&label);
+    let read = env
+        .claude_profile
+        .as_deref()
+        .filter(|_| home)
+        .map(|own| profile::effective(own, env.claude_dir().as_deref(), env.claude_custom_oauth))
+        .map(|file| profile::read(&file));
+    let (profile, usage_cache) = match read {
+        None if home => (
+            Err(profile::NoProfile::NoHome),
+            usage::CacheRead::Unreadable,
+        ),
+        None => (
+            Err(profile::NoProfile::NoHome),
+            usage::CacheRead::OtherLogin,
+        ),
+        Some(Ok(read)) if record.is_some_and(|a| a.of_another(read.key)) => (
+            Err(profile::NoProfile::NoHome),
+            usage::CacheRead::OtherLogin,
+        ),
+        Some(Ok(read)) => (Ok(read), usage::CacheRead::Read),
+        Some(Err(why)) => (Err(why), usage::CacheRead::Unreadable),
+    };
+    let consulted = usage::Consulted {
+        store: true,
+        usage_cache,
+    };
+    let held = super::account_stats::home_windows(
+        record,
+        &profile,
+        Some(&records.state.machine),
+        stats_tap_for(env, true),
+        env.now,
+    );
+    (Some(held), consulted)
+}
+
+/// The roster label a tapped process's login is judged to ([`accounts::judged_label`], the own
+/// row where `roster` is empty), and whether it runs on the default home's own login: no
+/// [`accounts::LOGIN_ENV`], one login on the machine, and the judged row is the default-login row.
+fn usage_judged(env: &Env, roster: &Roster, process: &dyn ClaudeProcess) -> Option<(String, bool)> {
+    let who = accounts::ProcessLogin::of_exec_env(&process.exec_env(env.claude_pid?)?)?;
+    let own = Roster::own();
+    let roster = if roster.rows.is_empty() { &own } else { roster };
+    let label = accounts::judged_label(roster, &who)?;
+    let home = !roster.several()
+        && who.login.as_deref().is_none_or(str::is_empty)
+        && roster
+            .row_for_login(None)
+            .is_some_and(|row| row.label == label);
+    Some((label.to_owned(), home))
 }
 
 fn usage_reading(env: &Env, process: &dyn ClaudeProcess) -> Option<super::tap::Reading> {
@@ -2785,13 +2977,27 @@ fn run_usage(env: &Env, process: &dyn ClaudeProcess, json: bool, out: &mut dyn W
     let mut view = UsageView::new(env.now);
     let reading = usage_reading(env, process);
     if folded.is_some() || reading.is_some() {
-        let mut account = AccountView::new(usage_label(env, &pick, process), true);
+        let proven = usage_account(env, &pick, process);
+        let (held, consulted) = usage_held(env, proven.as_deref(), reading.as_ref(), process);
+        let mut account =
+            AccountView::new(proven.unwrap_or_else(|| USAGE_ACCOUNT.to_owned()), true);
         if let Some((_, _, total)) = &folded {
             account.add_transcript(total);
         }
         if let Some(reading) = &reading {
             account.add_reading(reading, env.now);
         }
+        let held = held.map_or_else(Vec::new, |held| held.windows);
+        for win in &held {
+            if let Some(fig) = &win.fig {
+                account.add_held(win.id, fig, env.now);
+            }
+        }
+        account.note_gaps(reading.as_ref(), consulted, |name| {
+            held.iter().any(|win| {
+                win.id == name && win.missing == Some(super::account_stats::Missing::NotReported)
+            })
+        });
         view.accounts.push(account);
     }
     if json {
@@ -2829,6 +3035,9 @@ fn run_usage(env: &Env, process: &dyn ClaudeProcess, json: bool, out: &mut dyn W
     }
     let line = usage::hud_line(&view);
     let _ = writeln!(out, "{line}  [source={}]", source.as_str());
+    for why in usage::gap_lines(&view) {
+        let _ = writeln!(out, "{why}");
+    }
     let Some((session, refresh, total)) = &folded else {
         let why = match &pick {
             Pick::NamedButAbsent { session } => format!(
@@ -3049,15 +3258,35 @@ fn run_agy(
         AgyWhat::Pick(asked) => {
             let (model, named) = match asked {
                 Some(m) => (m.clone(), true),
-                None => match source.default_model() {
-                    Ok(m) => (m, false),
-                    Err(why) => {
-                        let _ = writeln!(out, "agy pick: agy's default model is unread: {why}");
-                        return ExitCode::FAILURE;
+                None => {
+                    let kept = (!refresh).then(|| st.kept_default(env.now)).flatten();
+                    match kept {
+                        Some(m) => (m, false),
+                        None => match source.default_model() {
+                            Ok(m) => {
+                                st.keep_default(&m, env.now);
+                                (m, false)
+                            }
+                            Err(why) => match st.kept_default(env.now) {
+                                Some(m) => (m, false),
+                                None => {
+                                    let _ = writeln!(
+                                        out,
+                                        "agy pick: agy's default model is unread: {why}"
+                                    );
+                                    return ExitCode::FAILURE;
+                                }
+                            },
+                        },
                     }
-                },
+                }
             };
-            let pick = agy_quota::pick(&reading.quota, &model, named, &rotation);
+            let effective_quota = if got == store::Got::Stale {
+                reading.quota_at_stale(env.now)
+            } else {
+                reading.quota.clone()
+            };
+            let pick = agy_quota::pick(&effective_quota, &model, named, &rotation);
             if json {
                 let mut o = Map::new();
                 o.insert("schema".to_owned(), Value::from(1u64));
@@ -3345,30 +3574,38 @@ pub fn limits_view(
     local_offset_s: i64,
     zone_offset_at: &dyn Fn(&str, i64) -> Option<i64>,
 ) -> LimitsView {
+    limits_view_local(reader, rows, now, &|_| Some(local_offset_s), zone_offset_at)
+}
+
+/// [`limits_view`], reading the local zone at each candidate instant (`local_at`).
+#[must_use]
+pub fn limits_view_local(
+    reader: &dyn aterm_phase::ScreenReader,
+    rows: &[String],
+    now: i64,
+    local_at: &dyn Fn(i64) -> Option<i64>,
+    zone_offset_at: &dyn Fn(&str, i64) -> Option<i64>,
+) -> LimitsView {
     let place = |text: &str| {
         limit::parse_reset(text)
-            .map(|spec| limit::reset_at_with(&spec, now, local_offset_s, zone_offset_at))
+            .map(|spec| limit::reset_at_local(&spec, now, local_at, zone_offset_at))
     };
     let wall = reader.wall(rows);
     let resets_at = wall.as_ref().and_then(|w| {
         let spec = limit::parse_reset(w.reset.as_deref()?)?;
         if !crate::supervise::run::places_resets_on_print(reader.program()) {
-            return Some(limit::reset_at_with(
-                &spec,
-                now,
-                local_offset_s,
-                zone_offset_at,
-            ));
+            return Some(limit::reset_at_local(&spec, now, local_at, zone_offset_at));
         }
         let window = w.kind == aterm_phase::WallKind::UsageSession
             && limit::names_a_session_window(&w.message);
-        let printed = limit::printed_by_the_screen(rows, now, local_offset_s, false);
-        Some(limit::place_reset_with(
+        let printed =
+            limit::printed_from(limit::done_row_ended_local(rows, now, local_at), now, false);
+        Some(limit::place_reset_local(
             &spec,
             window,
             now,
             printed,
-            local_offset_s,
+            local_at,
             zone_offset_at,
         ))
     });
@@ -3483,7 +3720,7 @@ fn record_limits_usage(
     target: &str,
     cli: Cli,
     view: &LimitsView,
-    local_offset_s: i64,
+    local_at: &dyn Fn(i64) -> Option<i64>,
 ) -> Result<(), String> {
     if view.windows.is_empty() {
         return Ok(());
@@ -3520,7 +3757,7 @@ fn record_limits_usage(
         .iter()
         .map(|(window, _)| window.clone())
         .collect();
-    let sample = usage::panel_sample(&windows, env.now, local_offset_s, &limit::zone_offset_at);
+    let sample = usage::panel_sample_local(&windows, env.now, local_at, &limit::zone_offset_at);
     let monthly = view
         .windows
         .iter()
@@ -3547,7 +3784,12 @@ fn record_limits_usage(
 fn limits_accounts_line(env: &Env, target: &str) -> Option<String> {
     let roster_path = env.accounts_roster()?;
     let store = env.accounts_store();
-    let accounts::AccountRecords { roster, state, .. } = store
+    let accounts::AccountRecords {
+        roster,
+        state,
+        logins,
+        ..
+    } = store
         .read_account_records(Some(&roster_path), env.now)
         .ok()?;
     if roster.rows.is_empty() {
@@ -3591,6 +3833,12 @@ fn limits_accounts_line(env: &Env, target: &str) -> Option<String> {
         .iter()
         .map(|(label, why)| match why {
             NotNext::Pool(accounts::WhyNot::NotEnrolled)
+                if roster.row(label).is_some_and(|row| row.email.is_some())
+                    && accounts::sign_in_blocked(&logins, label) =>
+            {
+                format!("{label}: not-enrolled ({})", stopped_step(label))
+            }
+            NotNext::Pool(accounts::WhyNot::NotEnrolled)
                 if roster.row(label).is_some_and(|row| row.email.is_some()) =>
             {
                 format!(
@@ -3617,11 +3865,12 @@ fn limits_accounts_line(env: &Env, target: &str) -> Option<String> {
 /// A normal limits read may be empty; a refresh must measure its launched CLI's quota.
 struct LimitsRead<'a> {
     sid: Option<&'a str>,
-    local_offset_s: i64,
+    local_at: &'a dyn Fn(i64) -> Option<i64>,
     json: bool,
     require_quota_for: Option<Cli>,
 }
 
+#[cfg(test)]
 fn run_limits_with<C: Ctl>(
     ctl: &mut C,
     env: &Env,
@@ -3636,7 +3885,7 @@ fn run_limits_with<C: Ctl>(
         env,
         LimitsRead {
             sid,
-            local_offset_s,
+            local_at: &|_| Some(local_offset_s),
             json,
             require_quota_for: None,
         },
@@ -3654,7 +3903,7 @@ fn run_limits_read<C: Ctl>(
 ) -> ExitCode {
     let LimitsRead {
         sid,
-        local_offset_s,
+        local_at,
         json,
         require_quota_for,
     } = read;
@@ -3674,11 +3923,11 @@ fn run_limits_read<C: Ctl>(
     match session.read_screen() {
         Ok(screen) => {
             let reader = aterm_phase::identify(program.as_deref(), &screen.rows);
-            let view = limits_view(
+            let view = limits_view_local(
                 reader,
                 &screen.rows,
                 env.now,
-                local_offset_s,
+                local_at,
                 &limit::zone_offset_at,
             );
             if let Some(cli) = require_quota_for
@@ -3691,7 +3940,7 @@ fn run_limits_read<C: Ctl>(
                 return ExitCode::from(1);
             }
             if let Some(cli) = Cli::of(reader.program())
-                && let Err(why) = record_limits_usage(env, &target, cli, &view, local_offset_s)
+                && let Err(why) = record_limits_usage(env, &target, cli, &view, local_at)
             {
                 let _ = writeln!(err, "aterm harness limits: could not record usage: {why}");
                 return ExitCode::from(1);
@@ -3734,7 +3983,19 @@ fn run_limits(
         },
     };
     let mut ctl = RelayCtl::new(endpoint, None);
-    run_limits_with(&mut ctl, env, sid, limit::tz_offset_s(), json, out, err)
+    let now_offset = limit::tz_offset_s();
+    run_limits_read(
+        &mut ctl,
+        env,
+        LimitsRead {
+            sid,
+            local_at: &|unix| Some(limit::local_offset_at(unix).unwrap_or(now_offset)),
+            json,
+            require_quota_for: None,
+        },
+        out,
+        err,
+    )
 }
 
 fn kimi_refresh_command(env: &Env) -> Result<String, String> {
@@ -3856,7 +4117,7 @@ fn run_kimi_refresh_with<C: Ctl>(
             env,
             LimitsRead {
                 sid: Some(&target),
-                local_offset_s: 0,
+                local_at: &|_| Some(0),
                 json,
                 require_quota_for: Some(Cli::Kimi),
             },
@@ -3982,6 +4243,7 @@ fn disk_roots(env: &Env, targets: &[PathBuf]) -> disk::Roots {
             .as_ref()
             .map(|h| h.join(".local").join("state").join("claude").join("locks")),
         version_hashes: Some(env.state.join(disk::versions::HASH_FILE)),
+        first_exec: Some(super::first_exec::holds_dir(&env.state)),
         store_dir: home.as_ref().map(|h| default_store_dir(h)),
         targets: targets.to_vec(),
         transcripts: home.as_ref().map(|h| h.join(".claude").join("projects")),
@@ -4884,7 +5146,7 @@ pub struct DiskWatchStatus {
     pub json: Value,
 }
 
-/// The disk watch as it stands for the volume `volume`: the thresholds in force there ([`disk::Config::thresholds`], the knob or the volume's share), where the volume stands against them, the reserve ([`disk::reserve`] under `home`), and the last `poke` and `reserve` rows of the ledger at `ledger`.
+/// The disk watch as it stands for the volume `volume`: the thresholds in force there ([`disk::Config::thresholds`], the knob or the volume's share), where the volume stands against them, the reserve ([`disk::reserve`] under `home`), the last `poke` and `reserve` rows of the ledger at `ledger`, and how many build-cache removals the ledger's last [`DISK_LEDGER_KEEP_ROWS`] rows hold in flight (`sweep_in_flight`, [`disk::sweep_in_flight`]: intent rows, `removing`, that no `removed` or `kept` row followed; the line says it only when there is one).
 #[must_use]
 pub fn disk_watch_status(
     ledger: &Path,
@@ -4913,13 +5175,10 @@ pub fn disk_watch_status(
     };
     let mut last_poke = Value::Null;
     let mut last_reserve = Value::Null;
-    for line in std::fs::read_to_string(ledger)
-        .unwrap_or_default()
-        .lines()
-        .rev()
-        .take(DISK_LEDGER_KEEP_ROWS)
-    {
-        let Ok(row) = aterm_json::from_str::<Value>(line) else {
+    let rows = tail_lines(ledger, DISK_LEDGER_KEEP_ROWS).unwrap_or_default();
+    let in_flight = disk::sweep_in_flight(rows.iter().map(String::as_str));
+    for line in rows.into_iter().rev() {
+        let Ok(row) = aterm_json::from_str::<Value>(&line) else {
             continue;
         };
         match row["kind"].as_str() {
@@ -4933,7 +5192,7 @@ pub fn disk_watch_status(
     }
     let human = |b: u64| disk::human_bytes(b);
     let line = format!(
-        "watch: disk={} free={} of {} room={} (warn {}, floor {}, back at {}, emergency {}){} reserve={}",
+        "watch: disk={} free={} of {} room={} (warn {}, floor {}, back at {}, emergency {}){} reserve={}{}",
         level.as_str(),
         stats.map_or_else(|| "unknown".to_owned(), |s| human(s.free)),
         stats.map_or_else(|| "unknown".to_owned(), |s| human(s.total)),
@@ -4946,6 +5205,11 @@ pub fn disk_watch_status(
             .and_then(|s| s.files_free)
             .map_or_else(String::new, |f| format!(" inodes_free={f}")),
         reserve_state,
+        if in_flight > 0 {
+            format!(" sweep_in_flight={in_flight}")
+        } else {
+            String::new()
+        },
     );
     let mut o = Map::new();
     o.insert("schema".to_owned(), Value::from(1u64));
@@ -4971,13 +5235,17 @@ pub fn disk_watch_status(
     );
     o.insert("last_poke".to_owned(), last_poke);
     o.insert("last_reserve".to_owned(), last_reserve);
+    o.insert(
+        "sweep_in_flight".to_owned(),
+        Value::from(u64::try_from(in_flight).unwrap_or(u64::MAX)),
+    );
     DiskWatchStatus {
         line,
         json: Value::Object(o),
     }
 }
 
-/// Journal one build directory of aterm's Rust build cache the sweep (`atpkg::build_cache::reclaim_watched`, the watch's pass with no session supervised) is about to remove (`removed` false: the write-ahead intent row) or removed, `bytes` in it, and `why` it goes, into `<state>/disk.jsonl`.
+/// Journal one build directory of aterm's Rust build cache the sweep (`atpkg::build_cache::reclaim_watched`, the watch's pass with no session supervised) is about to remove (`removed` false: the write-ahead intent row, `removing`) or what became of it (`removed` true: the outcome row that closes that intent, `removed`, or `kept` for one nothing of which went, `atpkg::build_cache::Unused::Refused`, with 0 bytes: [`disk::SweepAction::outcome`]), `bytes` in it, and `why` it goes, into `<state>/disk.jsonl`.
 pub fn disk_sweep_journal(
     state: &Path,
     path: &Path,
@@ -4991,9 +5259,94 @@ pub fn disk_sweep_journal(
     if std::fs::create_dir_all(state).is_err() {
         return false;
     }
+    if bound_ledger(&ledger, DISK_LEDGER_MAX_BYTES, DISK_LEDGER_KEEP_ROWS).is_err() {
+        return false;
+    }
     let mut journal = Journal::open(Some(&ledger), None, &mut sink);
-    let action = if removed { "removed" } else { "removing" };
+    let action = if removed {
+        disk::SweepAction::outcome(why)
+    } else {
+        disk::SweepAction::Removing
+    };
     journal.append_raw(&disk::sweep_row(now, path, action, bytes, why), &mut sink)
+}
+
+/// A managed-cache sweep with its write-ahead sizes and any journal refusal.
+#[derive(Debug, Default)]
+pub struct DiskSweep {
+    /// Actual returned removals, including partial stages.
+    pub swept: Vec<(PathBuf, atpkg::build_cache::Unused)>,
+    /// Sizes recorded before admission.
+    pub sized: Vec<(PathBuf, atpkg::build_cache::Unused, u64)>,
+    /// Some proposed removal could not be journalled and was refused.
+    pub unrecorded: bool,
+}
+
+impl DiskSweep {
+    /// Bytes actually accounted for, respecting partial or revoked stages.
+    #[must_use]
+    pub fn freed(&self) -> u64 {
+        self.swept
+            .iter()
+            .map(|(path, why)| disk_sweep_sized(&self.sized, path, *why))
+            .fold(0, u64::saturating_add)
+    }
+}
+
+/// Run the ordinary managed-cache sweep with an intent before each admitted removal and an
+/// outcome afterward. A failed intent refuses the corresponding removal.
+#[must_use]
+pub fn disk_sweep_journalled(
+    state: &Path,
+    now: i64,
+    sweep: impl FnOnce(
+        &mut dyn FnMut(&Path, atpkg::build_cache::Unused) -> bool,
+    ) -> Vec<(PathBuf, atpkg::build_cache::Unused)>,
+) -> DiskSweep {
+    let mut sized = Vec::new();
+    let mut unrecorded = false;
+    let swept = sweep(&mut |path, why| {
+        let (bytes, _) = disk::dir_bytes(path);
+        let admitted = disk_sweep_journal(state, path, bytes, why, false, now);
+        if admitted {
+            sized.push((path.to_path_buf(), why, bytes));
+        } else {
+            unrecorded = true;
+        }
+        admitted
+    });
+    for (path, why) in &swept {
+        let bytes = disk_sweep_sized(&sized, path, *why);
+        disk_sweep_journal(state, path, bytes, *why, true, now);
+    }
+    DiskSweep {
+        swept,
+        sized,
+        unrecorded,
+    }
+}
+
+/// Account a returned stage using its observed outcome rather than its original full size;
+/// an entry nothing of which went (`atpkg::build_cache::Unused::Refused`, its outcome row
+/// `kept`) freed nothing.
+#[must_use]
+pub fn disk_sweep_sized(
+    sized: &[(PathBuf, atpkg::build_cache::Unused, u64)],
+    path: &Path,
+    why: atpkg::build_cache::Unused,
+) -> u64 {
+    if let atpkg::build_cache::Unused::Stayed { freed, .. }
+    | atpkg::build_cache::Unused::Revoked { freed } = why
+    {
+        return freed;
+    }
+    if why.nothing_went() {
+        return 0;
+    }
+    sized
+        .iter()
+        .find(|(p, w, _)| p == path && *w == why)
+        .map_or(0, |(_, _, b)| *b)
 }
 
 fn on_volume<V: PartialEq>(
@@ -5100,7 +5453,11 @@ fn run_disk(
             &rep,
             survey.transcripts_root.as_deref(),
             class,
-            &mut disk::remover(judge, || sessions.clone()),
+            &mut disk::remover(
+                judge,
+                Some(super::first_exec::holds_dir(&env.state)),
+                || sessions.clone(),
+            ),
             &mut || {
                 volume
                     .as_deref()
@@ -6163,11 +6520,59 @@ pub const ACCOUNTS_OWN_LABEL: &str = "main";
 /// How long one `claude auth status --json` may run ([`auth_status_of`]).
 pub const AUTH_CHECK_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// The provider time allowed to one unattended Claude renewal.
+pub(super) const UNATTENDED_RENEWAL_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(300);
+
+/// The longest one sign-in holds the machine's sign-in lock by itself, in seconds: Claude Code's
+/// unattended renewal ends within [`UNATTENDED_RENEWAL_BUDGET`], and another CLI's within its hang
+/// detector ([`super::login_drive::HANG`]), since the lock is one for every CLI.
+const LONGEST_SIGN_IN_S: u64 = {
+    let claude = UNATTENDED_RENEWAL_BUDGET.as_secs();
+    let other = super::login_drive::HANG.as_secs();
+    if claude > other { claude } else { other }
+};
+
+/// What a person who waited for a sign-in is told where it renewed their row ([`renewed_since`]).
+const RENEWED_WHILE_WAITING: &str = "renewed by the sign-in you waited for; nothing was run";
+
+/// How long one try of the machine's sign-in lock waits: [`accounts::LOCK_LADDER`] added up, in
+/// seconds.
+#[allow(clippy::cast_possible_truncation)]
+const LOCK_TRY_S: u64 = {
+    let (mut ms, mut step) = (0, 0);
+    while step < accounts::LOCK_LADDER.len() {
+        ms += accounts::LOCK_LADDER[step].as_millis() as u64;
+        step += 1;
+    }
+    ms / 1000
+};
+
+/// How many times a person's sign-in tries the machine's sign-in lock ([`signin_guard`]), which
+/// together outlast [`LONGEST_SIGN_IN_S`].
+#[allow(clippy::cast_possible_truncation)]
+const PERSON_LOCK_TRIES: u32 = (LONGEST_SIGN_IN_S / LOCK_TRY_S) as u32 + 15;
+
 /// The most of that command's stdout that is read.
 pub const MAX_AUTH_STDOUT: usize = 64 * 1024;
 
-/// What `accounts login` and `renew` need of the machine beyond files: their `claude` runs (a sign-in flow, and the check after one that exits 0), a renewal's `ssh`, whether stdin is a terminal and whether this runs over SSH, this executable, and the clock once a flow has ended.
+/// What `accounts login` and `renew` need of the machine beyond files: their `claude` runs (a sign-in flow, and the check after one that exits 0), native fleet renewal, whether stdin is a terminal and whether this runs over SSH, this executable, and the clock once a flow has ended.
 pub trait AccountsHost {
+    /// Whether this call is automatic and must obey the local sign-in switches.
+    fn automatic_sign_in(&self) -> bool {
+        false
+    }
+    /// Whether this live host prepares browser and native credential storage
+    /// dependencies. Test hosts stay inert; this grants no account authority.
+    fn native_credential_setup(&self) -> bool {
+        false
+    }
+    /// Whether a person's sign-in that has tried the machine's sign-in lock `tried` times tries
+    /// again ([`signin_guard`]).
+    fn retries_sign_in_lock(&self, tried: u32) -> bool {
+        let _ = tried;
+        false
+    }
     /// Whether stdin is a terminal.
     fn stdin_is_terminal(&self) -> bool;
 
@@ -6183,16 +6588,65 @@ pub trait AccountsHost {
     /// Unix seconds, read when it is asked.
     fn now(&self) -> i64;
 
-    /// A renewal's sign-in ([`run_accounts_renew`]): `claude auth login --claudeai --email <email>` on this terminal, waited for, with [`accounts::HOME_ENV`] set to `home` (the new staging directory) and [`accounts::LOGIN_ENV`] removed, so the new login is that directory's own keychain item and no live session's ([`renew_command`]).
+    /// A renewal's sign-in ([`run_accounts_renew`]): `claude auth login --claudeai --email <email>`,
+    /// with a bounded wait when unattended and a terminal when interactive. [`accounts::HOME_ENV`]
+    /// names the new staging directory and [`accounts::LOGIN_ENV`] is removed, so the login is
+    /// that directory's own keychain item and no live session's ([`renew_command`]).
     fn renew_flow(&self, home: &str, email: &str, browser: &RenewBrowser) -> Result<i32, String> {
         let _ = (home, email, browser);
         Err("this host renews nothing".to_string())
+    }
+
+    /// A renewal's exit and any validated browser outcome. Hosts that only provide an
+    /// exit code retain their existing behavior through [`AccountsHost::renew_flow`].
+    fn renew_outcome(
+        &self,
+        home: &str,
+        email: &str,
+        browser: &RenewBrowser,
+    ) -> Result<RenewalExit, String> {
+        self.renew_flow(home, email, browser).map(RenewalExit::from)
+    }
+
+    /// Run a native renewal through the explicit private mailbox input file.
+    /// The host must not substitute its ambient mailbox or browser route.
+    fn renew_flow_with_inputs(
+        &self,
+        home: &str,
+        email: &str,
+        browser: &RenewBrowser,
+        inputs: &Path,
+    ) -> Result<i32, String> {
+        let _ = (home, email, browser, inputs);
+        Err("this host has no approved mailbox flow".into())
+    }
+
+    /// The exit and browser outcome of the exact approved mailbox flow.
+    fn renew_outcome_with_inputs(
+        &self,
+        home: &str,
+        email: &str,
+        browser: &RenewBrowser,
+        inputs: &Path,
+    ) -> Result<RenewalExit, String> {
+        self.renew_flow_with_inputs(home, email, browser, inputs)
+            .map(RenewalExit::from)
     }
 
     /// The check after a renewal's flow exited 0: `claude auth status --json` in the staging home ([`accounts::HOME_ENV`] set to `home`, [`accounts::LOGIN_ENV`] removed), bounded, its exit and stdout handed back.
     fn status_in_home(&self, home: &str) -> Result<Captured, String> {
         let _ = home;
         Err("this host checks nothing".to_string())
+    }
+
+    /// Check one staged token against the canonical Claude profile endpoint.
+    /// Test hosts are inert unless they explicitly supply a provider response.
+    fn shared_claude_profile(
+        &self,
+        _access_token: &str,
+        _wait: std::time::Duration,
+    ) -> Result<shared_provider::ClaudeProfile, String> {
+        Err("this host has no shared Claude profile check".into())
     }
 
     /// Full provider identity from this exact staging home, read only after
@@ -6211,10 +6665,9 @@ pub trait AccountsHost {
         }
     }
 
-    /// `ssh -t <host> <aterm> harness accounts renew --due --here` (`argv` after the host), its stdio this process's, waited for: the remote machine's own renewal, run in the same sitting.
-    fn ssh(&self, host: &str, argv: &[String]) -> Result<i32, String> {
-        let _ = (host, argv);
-        Err("this host runs no ssh".to_string())
+    /// The peer's own unattended due pass, using its authenticated native fleet Drive.
+    fn renew_remote(&self, _host: &str) -> Result<super::remote_renew::Output, String> {
+        Err("this host runs no native fleet renewal".to_string())
     }
 
     /// Whether this command runs over SSH (`SSH_CONNECTION` set): the browser is on the machine the owner is at, so nothing is opened here and Claude Code's own paste-code flow is used ([`RenewBrowser::Remote`]).
@@ -6227,11 +6680,40 @@ pub trait AccountsHost {
         None
     }
 
+    /// One variable of the environment `accounts renew`'s choice of rows reads (the mailbox and browser variables, [`claude_row_can_run_headless`]): the process's in a run ([`LiveAccounts`]); none on any other host, so a test's choice comes from its scratch home and store alone.
+    fn machine_var(&self, name: &str) -> Option<OsString> {
+        let _ = name;
+        None
+    }
+
+    /// Whether a browser installed outside the home (`/Applications`, `PATH`) counts in `accounts renew`'s choice of rows: in a run ([`LiveAccounts`]) it does; on any other host only one the home or [`Self::machine_var`] names does.
+    fn system_browsers(&self) -> bool {
+        false
+    }
+
     /// A renewal's sign-in of another CLI's pool ([`run_accounts_renew_for`]): the vendor's own flow in `req`'s staging directory, its page approved in the headless browser, driven to its end ([`super::login_drive::sign_in_live`]).
     fn vendor_sign_in(&self, req: &super::login_drive::Request<'_>) -> super::login_drive::Drove {
         let _ = req;
         super::login_drive::Drove {
             outcome: super::login_drive::Outcome::NotRun("this host signs nothing in".to_string()),
+            host: None,
+        }
+    }
+
+    /// Run a vendor's staged sign-in with exactly these approved mailbox inputs.
+    /// This is a separate effect from ambient-mailbox discovery; inert hosts
+    /// refuse it unless they explicitly implement the typed route.
+    fn vendor_sign_in_with_mailbox(
+        &self,
+        req: &super::login_drive::Request<'_>,
+        home: &Path,
+        mailbox: super::headless_oauth::MailboxConfig,
+    ) -> super::login_drive::Drove {
+        let _ = (req, home, mailbox);
+        super::login_drive::Drove {
+            outcome: super::login_drive::Outcome::NotRun(
+                "this host has no approved mailbox sign-in".into(),
+            ),
             host: None,
         }
     }
@@ -6318,6 +6800,14 @@ pub enum RenewBrowser {
         /// The profile's display name.
         profile: String,
     },
+    /// [`Self::Profile`] for a person signing in a row whose page stopped aterm's sign-in: it
+    /// opens at once, with no headless try first ([`super::open_url::NO_HEADLESS_ENV`]).
+    OwnProfile {
+        /// The opener's link ([`super::open_url::OPENER`]).
+        opener: PathBuf,
+        /// The profile's display name.
+        profile: String,
+    },
     /// Over SSH: nothing opens on this machine.
     Remote {
         /// The opener's link ([`super::open_url::OPENER`]), where one could be made.
@@ -6325,14 +6815,98 @@ pub enum RenewBrowser {
     },
 }
 
+/// A completed provider process, preserving its exit independently of browser diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenewalExit {
+    /// The provider process's exit code; it does not establish a valid login.
+    pub code: i32,
+    /// The optional, validated outcome recorded by this attempt's browser helper.
+    pub met: Option<super::open_url::Met>,
+}
+
+impl From<i32> for RenewalExit {
+    fn from(code: i32) -> Self {
+        Self { code, met: None }
+    }
+}
+
+impl RenewalExit {
+    pub(super) fn from_capture(
+        (ran, met): (Captured, Option<super::open_url::Met>),
+    ) -> Result<Self, String> {
+        match ran.code {
+            Some(code) => Ok(Self { code, met }),
+            None => Err(RenewalFailure {
+                reason: "provider flow ended without an exit code".into(),
+                met,
+            }
+            .to_string()),
+        }
+    }
+
+    pub(super) fn failure_words(&self) -> String {
+        self.met.as_ref().map_or_else(
+            || "provider sign-in did not complete".into(),
+            |met| format!("provider sign-in exited {}; {}", self.code, met.words()),
+        )
+    }
+}
+
 /// The shipped [`AccountsHost`]: `claude` as PATH resolves it.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LiveAccounts;
 
 impl AccountsHost for LiveAccounts {
+    fn native_credential_setup(&self) -> bool {
+        true
+    }
+    fn renew_flow_with_inputs(
+        &self,
+        home: &str,
+        email: &str,
+        browser: &RenewBrowser,
+        inputs: &Path,
+    ) -> Result<i32, String> {
+        self.renew_outcome_with_inputs(home, email, browser, inputs)
+            .map(|exit| exit.code)
+    }
+    fn renew_outcome_with_inputs(
+        &self,
+        home: &str,
+        email: &str,
+        browser: &RenewBrowser,
+        inputs: &Path,
+    ) -> Result<RenewalExit, String> {
+        let user_home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or("provider flow has no machine home")?;
+        RenewalExit::from_capture(
+            super::accounts_sync::shared_renewal::sign_in_with_inputs(
+                &user_home,
+                home,
+                email,
+                browser,
+                true,
+                None,
+                Some(inputs),
+            )
+            .map_err(|failure| failure.to_string())?,
+        )
+    }
+    fn shared_claude_profile(
+        &self,
+        access_token: &str,
+        wait: std::time::Duration,
+    ) -> Result<shared_provider::ClaudeProfile, String> {
+        shared_provider::read_claude_profile(access_token, wait)
+    }
     fn stdin_is_terminal(&self) -> bool {
         use std::io::IsTerminal as _;
         io::stdin().is_terminal()
+    }
+
+    fn retries_sign_in_lock(&self, tried: u32) -> bool {
+        tried < PERSON_LOCK_TRIES
     }
 
     fn auth_status(&self, login: &str) -> Result<Captured, String> {
@@ -6361,15 +6935,38 @@ impl AccountsHost for LiveAccounts {
         crate::supervise::limit::unix_now()
     }
 
+    fn machine_var(&self, name: &str) -> Option<OsString> {
+        std::env::var_os(name)
+    }
+
+    fn system_browsers(&self) -> bool {
+        true
+    }
+
     fn renew_flow(&self, home: &str, email: &str, browser: &RenewBrowser) -> Result<i32, String> {
+        self.renew_outcome(home, email, browser)
+            .map(|exit| exit.code)
+    }
+
+    fn renew_outcome(
+        &self,
+        home: &str,
+        email: &str,
+        browser: &RenewBrowser,
+    ) -> Result<RenewalExit, String> {
         let user_home = std::env::var_os("HOME").map(PathBuf::from);
         let prog = user_home
             .as_deref()
             .map(super::accounts_sync::resolve_claude_program)
             .unwrap_or_else(|| PathBuf::from("claude"));
-        renew_flow_of(prog.as_os_str(), home, email, browser, &|name| {
-            std::env::var_os(name)
-        })
+        renew_flow_of(
+            prog.as_os_str(),
+            home,
+            email,
+            browser,
+            &|name| std::env::var_os(name),
+            (!self.stdin_is_terminal()).then_some(UNATTENDED_RENEWAL_BUDGET),
+        )
     }
 
     fn status_in_home(&self, home: &str) -> Result<Captured, String> {
@@ -6394,12 +6991,8 @@ impl AccountsHost for LiveAccounts {
         profile::identity_in_home(Path::new(home), email)
     }
 
-    fn ssh(&self, host: &str, argv: &[String]) -> Result<i32, String> {
-        let mut cmd = aterm_uds::spawnfd::command("ssh");
-        cmd.arg("-t").arg(host).args(argv);
-        terminal_flow(|| cmd.spawn(), |mut child| child.wait(), || {})
-            .map(exit_code)
-            .map_err(|e| e.to_string())
+    fn renew_remote(&self, host: &str) -> Result<super::remote_renew::Output, String> {
+        super::remote_renew::request(host)
     }
 
     fn under_ssh(&self) -> bool {
@@ -6443,6 +7036,15 @@ impl AccountsHost for LiveAccounts {
             .map(PathBuf::from)
             .unwrap_or_default();
         super::login_drive::sign_in_live(req, &home, &|name| std::env::var_os(name))
+    }
+
+    fn vendor_sign_in_with_mailbox(
+        &self,
+        req: &super::login_drive::Request<'_>,
+        home: &Path,
+        mailbox: super::headless_oauth::MailboxConfig,
+    ) -> super::login_drive::Drove {
+        vendor_mailbox_sign_in(self, req, home, mailbox)
     }
 
     fn vendor_login(&self, req: &super::login_drive::Request<'_>) -> Result<i32, String> {
@@ -6524,6 +7126,39 @@ impl AccountsHost for LiveAccounts {
     fn hold_window_ends(&self) -> WindowEnds {
         WindowEnds::hold()
     }
+}
+
+/// The live and background hosts' explicit approved-mailbox effect. Callers
+/// retain program and environment selection; no inert host reaches this helper
+/// through a default trait implementation.
+pub(super) fn vendor_mailbox_sign_in(
+    host: &dyn AccountsHost,
+    req: &super::login_drive::Request<'_>,
+    home: &Path,
+    mailbox: super::headless_oauth::MailboxConfig,
+) -> super::login_drive::Drove {
+    let program = if req.cli == Cli::Codex {
+        host.codex_sign_in_program()
+            .unwrap_or_else(|| super::login_drive::program_of(req.cli, home))
+    } else {
+        super::login_drive::program_of(req.cli, home)
+    };
+    let mut approver = super::headless_oauth::VendorApprover::with_mailbox(
+        req.cli,
+        &req.row.label,
+        &req.store.shared_dir(),
+        home,
+        mailbox,
+    );
+    super::login_drive::sign_in_with(
+        req,
+        (&program, &[]),
+        None,
+        Some(Path::new(super::login_drive::SANDBOX_EXEC)),
+        &|name| host.machine_var(name),
+        &mut approver,
+        super::login_drive::HANG,
+    )
 }
 
 /// How long `accounts browser`'s headless pass after its window ([`AccountsHost::tidy_profile`]) may take.
@@ -6701,12 +7336,19 @@ pub(super) fn renew_command(
     cmd.args(["auth", "login", "--claudeai", "--email", email])
         .env_remove(accounts::LOGIN_ENV)
         .env(accounts::HOME_ENV, home)
-        .env_remove(super::open_url::PROFILE_ENV);
+        .env_remove(super::open_url::PROFILE_ENV)
+        .env_remove(super::open_url::INPUT_ENV)
+        .env_remove(super::open_url::NO_HEADLESS_ENV);
     match browser {
         RenewBrowser::Default => {}
         RenewBrowser::Profile { opener, profile } => {
             cmd.env("BROWSER", opener)
                 .env(super::open_url::PROFILE_ENV, profile);
+        }
+        RenewBrowser::OwnProfile { opener, profile } => {
+            cmd.env("BROWSER", opener)
+                .env(super::open_url::PROFILE_ENV, profile)
+                .env(super::open_url::NO_HEADLESS_ENV, "1");
         }
         RenewBrowser::Remote {
             opener: Some(opener),
@@ -6720,62 +7362,150 @@ pub(super) fn renew_command(
     cmd
 }
 
-/// A person's `accounts renew` sign-in of `email` into the staging home `home`, at the terminal:
-/// the mailbox and browser profile it may use are the ones `var` (the process's environment, in
-/// a run) and the harness's store name.
+/// Sign `email` into staging `home`. The mailbox and browser profile come from `var` and the
+/// harness store. An unattended call supplies `within`; an interactive call keeps its terminal.
 fn renew_flow_of(
     program: &std::ffi::OsStr,
     home: &str,
     email: &str,
     browser: &RenewBrowser,
     var: &dyn Fn(&str) -> Option<OsString>,
-) -> Result<i32, String> {
-    terminal_flow(
-        || {
-            let mut cmd = renew_command(program, home, email, browser);
-            cmd.env(super::open_url::EMAIL_ENV, email);
-            if let Some(harness_state) = Path::new(home)
-                .parent()
-                .and_then(Path::parent)
-                .and_then(Path::parent)
-            {
-                let store = accounts::Store::at(harness_state);
-                let user_home = var("HOME").map(PathBuf::from);
-                if var(super::open_url::MAILBOX_ENV).is_none_or(|v| v.is_empty())
-                    && let Some(mailbox) = super::accounts_sync::resolve_mailbox_dir_with(
-                        var,
-                        user_home.as_deref(),
-                        &store,
-                    )
-                {
-                    cmd.env(super::open_url::MAILBOX_ENV, mailbox);
-                }
-                let label = Path::new(home)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .and_then(|s| s.rsplit_once('+').map(|(l, _)| l))
-                    .unwrap_or("default");
-                let has_mailbox = super::accounts_sync::has_configured_mailbox_for_row_with(
-                    var,
-                    user_home.as_deref(),
-                    &store,
-                    Some(label),
-                    Some(email),
-                );
-                if matches!(browser, RenewBrowser::Remote { .. })
-                    && !has_mailbox
-                    && super::headless_oauth::has_browser_profile(&store.dir, label, Some(email))
-                {
-                    cmd.env(super::headless_oauth::HEADLESS_ENV, "1");
-                }
-            }
-            cmd.spawn()
-        },
-        |mut child| child.wait(),
-        || {},
-    )
-    .map(exit_code)
-    .map_err(|e| e.to_string())
+    within: Option<std::time::Duration>,
+) -> Result<RenewalExit, String> {
+    let mut cmd = renew_command(program, home, email, browser);
+    if within.is_some() {
+        cmd.envs(unattended_renewal_environment(var)?);
+    }
+    cmd.env(super::open_url::EMAIL_ENV, email);
+    if let Some(harness_state) = Path::new(home)
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+    {
+        let store = accounts::Store::at(harness_state);
+        let user_home = var("HOME").map(PathBuf::from);
+        if var(super::open_url::MAILBOX_ENV).is_none_or(|v| v.is_empty())
+            && let Some(mailbox) =
+                super::accounts_sync::resolve_mailbox_dir_with(var, user_home.as_deref(), &store)
+        {
+            cmd.env(super::open_url::MAILBOX_ENV, mailbox);
+        }
+        let label = Path::new(home)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|s| s.rsplit_once('+').map(|(l, _)| l))
+            .unwrap_or("default");
+        let has_mailbox = super::accounts_sync::has_configured_mailbox_for_row_with(
+            var,
+            user_home.as_deref(),
+            &store,
+            Some(label),
+            Some(email),
+        );
+        if matches!(browser, RenewBrowser::Remote { .. })
+            && !has_mailbox
+            && super::headless_oauth::has_browser_profile(&store.dir, label, Some(email))
+        {
+            cmd.env(super::headless_oauth::HEADLESS_ENV, "1");
+        }
+    }
+    if let Some(within) = within {
+        return RenewalExit::from_capture(
+            capture_unattended_renewal(cmd, within).map_err(|failure| failure.to_string())?,
+        );
+    }
+    terminal_flow(|| cmd.spawn(), |mut child| child.wait(), || {})
+        .map(exit_code)
+        .map(RenewalExit::from)
+        .map_err(|e| e.to_string())
+}
+
+/// A failed provider run and the safe browser outcome recorded before it ended.
+#[derive(Debug)]
+pub(crate) struct RenewalFailure {
+    reason: String,
+    pub(super) met: Option<super::open_url::Met>,
+}
+
+impl From<String> for RenewalFailure {
+    fn from(reason: String) -> Self {
+        Self { reason, met: None }
+    }
+}
+
+impl std::fmt::Display for RenewalFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.reason)?;
+        if let Some(met) = &self.met {
+            write!(f, "; {}", met.words())?;
+        }
+        Ok(())
+    }
+}
+
+/// Retain the opener's validated outcome even when the bounded provider run fails.
+pub(super) fn capture_unattended_renewal(
+    cmd: aterm_uds::spawnfd::Command,
+    within: std::time::Duration,
+) -> Result<(super::align::Captured, Option<super::open_url::Met>), RenewalFailure> {
+    capture_unattended_renewal_with(cmd, |cmd| {
+        super::align::capture_bounded(cmd, within, MAX_AUTH_STDOUT)
+    })
+}
+
+fn capture_unattended_renewal_with(
+    mut cmd: aterm_uds::spawnfd::Command,
+    capture: impl FnOnce(aterm_uds::spawnfd::Command) -> Result<super::align::Captured, String>,
+) -> Result<(super::align::Captured, Option<super::open_url::Met>), RenewalFailure> {
+    let outcome = aterm_tempfile::tempdir()
+        .ok()
+        .map(|dir| (dir.path().join("outcome"), dir));
+    cmd.env_remove(super::open_url::OUTCOME_ENV);
+    if let Some((path, _)) = &outcome {
+        cmd.env(super::open_url::OUTCOME_ENV, path);
+    }
+    let ran = capture(cmd);
+    let met = outcome
+        .as_ref()
+        .and_then(|(path, _)| super::open_url::read_outcome(path));
+    match ran {
+        Ok(ran) => Ok((ran, met)),
+        Err(reason) => Err(RenewalFailure { reason, met }),
+    }
+}
+
+/// The explicit identity and provider inputs shared by both unattended renewal entry points.
+pub(super) fn unattended_renewal_environment(
+    var: &dyn Fn(&str) -> Option<OsString>,
+) -> Result<Vec<(&'static str, OsString)>, String> {
+    let mut passed = auth_check_env(var)?;
+    passed.extend(
+        [
+            "HOME",
+            super::open_url::MAILBOX_ENV,
+            super::headless_oauth::BROWSER_BIN_ENV,
+            super::headless_oauth::HEADLESS_ENV,
+            super::headless_oauth::MAILBOX_URL_ENV,
+            super::headless_oauth::MAILBOX_TOKEN_ENV,
+            super::headless_oauth::IMAP_URL_ENV,
+            super::headless_oauth::IMAP_USER_ENV,
+            super::headless_oauth::IMAP_PASS_ENV,
+            super::headless_oauth::WEBMAIL_URL_ENV,
+            super::headless_oauth::WEBMAIL_PASS_ENV,
+            super::headless_oauth::TOTP_SECRET_ENV,
+            "XDG_CONFIG_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
+            "ATERM_STATE_HOME",
+        ]
+        .into_iter()
+        .filter_map(|name| {
+            var(name)
+                .filter(|value| !value.is_empty())
+                .map(|value| (name, value))
+        }),
+    );
+    Ok(passed)
 }
 
 /// `<program> auth status --json` in the staging home `home` ([`AccountsHost::status_in_home`]), bounded by `budget`: the bounded runner's environment (PATH, HOME, TMPDIR), [`accounts::HOME_ENV`] set to `home`, and the variables [`auth_check_env`] hands through, which do not include [`accounts::LOGIN_ENV`]: the login is the home's own item.
@@ -7335,7 +8065,12 @@ fn accounts_own_reading(state: &accounts::State, by: HeldBy, now: i64) -> String
             account_stats::percent(f.pct_x10, held.tenths),
             rfc3339_utc(f.reset)
         ),
-        None => format!("{name} ?"),
+        // Never a bare `?`: the window's reason ([`account_stats::Missing::phrase`]).
+        None => format!(
+            "{name} \u{2013} ({})",
+            win.and_then(|w| w.missing)
+                .map_or("no current figure", account_stats::Missing::phrase)
+        ),
     };
     format!(
         "this login ({ACCOUNTS_OWN_LABEL}), read by the usage tap at {}: {} \u{b7} {}",
@@ -7403,8 +8138,18 @@ impl Rotation {
         Rotation {
             mode: policy.accounts,
             off_by,
-            keyring: home.is_some_and(|home| super::accounts_pool::keyring_held_in(cli, home)),
+            keyring: cli == Cli::Codex
+                && home.is_none_or(|home| super::accounts_pool::keyring_held_in(cli, home)),
         }
+    }
+}
+
+/// The clock the report's outlook says its instants on ([`REPORT_LOCAL_CLOCK`]).
+fn report_clock(live: bool) -> fn(i64) -> i64 {
+    if live {
+        |t| limit::local_offset_at(t).unwrap_or(0)
+    } else {
+        |_| 0
     }
 }
 
@@ -7656,6 +8401,9 @@ fn own_condition(
     enrolled: &BTreeSet<String>,
     now: i64,
 ) -> Option<accounts::WhyNot> {
+    if row.held_by.is_some() {
+        return Some(accounts::WhyNot::HeldElsewhere);
+    }
     match accounts::condition(row, state, enrolled.contains(&row.label), now) {
         accounts::Condition::NotEnrolled => Some(accounts::WhyNot::NotEnrolled),
         accounts::Condition::SignedOut => Some(accounts::WhyNot::SignedOut),
@@ -8199,7 +8947,7 @@ fn usage_words(account: &accounts::Account, now: i64) -> String {
 /// `next:`, as `[harness] accounts` (`mode`) does ([`accounts_next`]).
 fn accounts_text(
     (cli, launch): (Cli, Launch<'_>),
-    rotation: &Rotation,
+    (rotation, outlook): (&Rotation, Option<&super::outlook::Outlook>),
     (path, present): (&Path, bool),
     roster: &Roster,
     (state, logins): (&accounts::State, &accounts::Logins),
@@ -8271,6 +9019,10 @@ fn accounts_text(
         if let Some(line) = sign_in_attempt_words(row, state, logins, here, now) {
             text.push_str(&format!("  {line}\n"));
         }
+        for line in outlook.map(|o| o.row_lines(&row.label)).unwrap_or_default() {
+            text.push_str(&line);
+            text.push('\n');
+        }
     }
     let next = accounts_next((cli, launch), rotation, roster, state, enrolled, now);
     text.push_str(&match (&next.to, next.wait_until, next.none.as_deref()) {
@@ -8299,11 +9051,22 @@ fn accounts_text(
                     None if cli != Cli::Claude => {
                         format!("{label}: {} (no login made yet)", why.as_str())
                     }
-                    None if roster.row(label).is_some_and(|row| row.email.is_some()) => format!(
-                        "{label}: {} (no login made yet: aterm signs it in by itself; `aterm \
-                         harness accounts renew {label}` runs that now)",
-                        why.as_str()
-                    ),
+                    None if roster.row(label).is_some_and(|row| row.email.is_some())
+                        && accounts::sign_in_blocked(logins, label) =>
+                    {
+                        format!(
+                            "{label}: {} (no login made yet: {})",
+                            why.as_str(),
+                            stopped_step(label)
+                        )
+                    }
+                    None if roster.row(label).is_some_and(|row| row.email.is_some()) => {
+                        format!(
+                            "{label}: {} (no login made yet: aterm signs it in by itself; `aterm \
+                             harness accounts renew {label}` runs that now)",
+                            why.as_str()
+                        )
+                    }
                     None => format!(
                         "{label}: {} (no login made yet: run `aterm harness accounts login \
                          {label}`)",
@@ -8343,6 +9106,9 @@ fn accounts_text(
     }
     if accounts::rotations_spent(state, roster, now) {
         text.push_str("the rotation bound for this hour is spent: a limit is waited out\n");
+    }
+    if let Some(outlook) = outlook {
+        text.push_str(&outlook.text());
     }
     text
 }
@@ -8418,8 +9184,9 @@ fn sign_in_attempt_json(logins: &accounts::Logins, label: &str) -> Value {
 /// ([`accounts::SignInAction::next_step`]), else, for a CLI whose renewals cannot approve its
 /// page ([`Cli::renews_headlessly`]: Grok Build's, which no background renewal starts), its
 /// `accounts login` while the row needs a sign-in ([`accounts::needs_sign_in`]), the step the
-/// dashboard names for each of its rows and the digest for each due one. `here` is whether its
-/// login is made on this machine.
+/// dashboard names for each of its rows and the digest for each due one, or the same for a row
+/// its page stopped ([`accounts::sign_in_blocked`]) in the verb such a row takes. `here` is
+/// whether its login is made on this machine.
 fn sign_in_needed(
     cli: Cli,
     row: &accounts::Row,
@@ -8427,11 +9194,32 @@ fn sign_in_needed(
     here: bool,
     now: i64,
 ) -> Option<String> {
+    if row.held_by.is_some() {
+        return None;
+    }
     if let Some(task) = logins.get(&row.label).and_then(|b| b.sign_in_task) {
         return Some(task.action.next_step(cli, &row.label));
     }
-    (!cli.renews_headlessly() && accounts::needs_sign_in(row, state, logins, here, now))
-        .then(|| accounts::SignInAction::Login.next_step(cli, &row.label))
+    let stopped = accounts::sign_in_blocked(logins, &row.label);
+    ((!cli.renews_headlessly() || stopped)
+        && accounts::needs_sign_in(row, state, logins, here, now))
+    .then(|| match cli.sign_in_verb(row.email.is_some()) {
+        "renew" => format!(
+            "Run aterm harness accounts renew {} --cli {} in a terminal on this Mac",
+            row.label,
+            cli.id()
+        ),
+        _ => accounts::SignInAction::Login.next_step(cli, &row.label),
+    })
+}
+
+/// What a person does for a row with an email whose page stopped aterm's automatic sign-in:
+/// `accounts renew` at a terminal here runs in the row's own browser ([`run_accounts_renew`]).
+fn stopped_step(label: &str) -> String {
+    format!(
+        "a page stopped aterm's sign-in: run `aterm harness accounts renew {label}` in a terminal \
+         on this Mac"
+    )
 }
 
 fn sign_in_task_json(cli: Cli, label: &str, logins: &accounts::Logins) -> Value {
@@ -8479,7 +9267,12 @@ fn accounts_json(
     roster: &Roster,
     (state, logins): (&accounts::State, &accounts::Logins),
     enrolled: &BTreeSet<String>,
-    (by, policy, judged): (HeldBy, &SupervisorConfig, &Rotation),
+    (by, policy, judged, outlook): (
+        HeldBy,
+        &SupervisorConfig,
+        &Rotation,
+        Option<&super::outlook::Outlook>,
+    ),
     now: i64,
 ) -> String {
     let mut o = accounts_json_head(Some(path), now);
@@ -8583,6 +9376,9 @@ fn accounts_json(
             if let Some(dir) = &row.dir {
                 m.insert("dir".to_owned(), Value::from(dir.clone()));
             }
+            if let Some(held_by) = &row.held_by {
+                m.insert("held_by".to_owned(), Value::from(held_by.clone()));
+            }
             m.insert("enrolled".to_owned(), Value::from(here));
             m.insert("condition".to_owned(), Value::from(condition.as_str()));
             put_time(
@@ -8681,7 +9477,19 @@ fn accounts_json(
                     by.windows(&account, state, now)
                         .windows
                         .iter()
-                        .map(|w| super::account_stats::window_value(w, now))
+                        .map(|w| {
+                            let mut value = super::account_stats::window_value(w, now);
+                            // The outlook's additive fields: how fresh, and where today's pace
+                            // takes it (docs/DESIGN-accounts-outlook-2026-10-25.md §9).
+                            if let (Value::Object(fields), Some((fresh, projection))) = (
+                                &mut value,
+                                outlook.and_then(|o| o.window_json(&row.label, w.kind)),
+                            ) {
+                                fields.insert("fresh".to_owned(), fresh);
+                                fields.insert("projection".to_owned(), projection);
+                            }
+                            value
+                        })
                         .collect(),
                 ),
             );
@@ -8736,10 +9544,16 @@ fn accounts_json(
                         .collect(),
                 ),
             );
+            if let Some(plan) = outlook.and_then(|o| o.plan_json(&row.label)) {
+                m.insert("plan".to_owned(), plan);
+            }
             Value::Object(m)
         })
         .collect();
     o.insert("accounts".to_owned(), Value::Array(rows));
+    if let Some(outlook) = outlook {
+        o.insert("outlook".to_owned(), outlook.json());
+    }
     aterm_json::to_string(&Value::Object(o)).unwrap_or_default()
 }
 
@@ -8893,9 +9707,11 @@ mod shared_catalog_tests {
                 email: Some("shared@example.test".into()),
                 realm: None,
                 secret_reference: true,
+                required_browser: false,
                 conflicted: false,
                 stopped: false,
                 import: None,
+                import_link: None,
             }],
             ..Default::default()
         });
@@ -9026,6 +9842,19 @@ fn write_accounts_report_snapshot(
         super::accounts_sync::fleet_origin(env.home.as_deref(), env.config.as_deref(), path)
     });
     let (policy, rotation) = rotation_beside(cli, env, path);
+    // The outlook speaks for Claude Code's pool alone (§13 of the outlook's design): the
+    // other pools keep today's rows. It replays under the policy the report states.
+    let outlook = (cli == Cli::Claude && !own && !roster.rows.is_empty()).then(|| {
+        super::outlook::for_report(
+            &env.state,
+            (&roster, &state, &logins, &enrolled),
+            (super::outlook::replay_mode(&policy), policy.usage_credits),
+            (
+                env.now,
+                report_clock(REPORT_LOCAL_CLOCK.load(std::sync::atomic::Ordering::Relaxed)),
+            ),
+        )
+    });
     let _ = if json {
         writeln!(
             out,
@@ -9036,14 +9865,14 @@ fn write_accounts_report_snapshot(
                 &roster,
                 read,
                 &enrolled,
-                (by, &policy, &rotation),
+                (by, &policy, &rotation, outlook.as_ref()),
                 env.now
             )
         )
     } else {
         let mut text = accounts_text(
             (cli, launch),
-            &rotation,
+            (&rotation, outlook.as_ref()),
             (path, roster_present),
             &roster,
             read,
@@ -9511,15 +10340,22 @@ fn signin_records_ready(
     }
 }
 
+/// The machine's sign-in lock for `label`, or why not. An automatic sign-in that holds it ends by
+/// itself, within [`LONGEST_SIGN_IN_S`], so a person at a terminal waits for it, told so once;
+/// anyone else is told `held` at once. The second value says a person waited: the sign-in they
+/// outlasted can have moved the records, so the caller reads them again, or its policy check
+/// refuses a row that only changed under the wait. A capture no one waited on stands, and so does
+/// that refusal.
 fn signin_guard(
     store: &accounts::Store,
+    host: &dyn AccountsHost,
     label: &str,
     verb: &str,
     out: &mut dyn Write,
     err: &mut dyn Write,
-) -> Result<accounts::Lock, Renewal> {
-    match store.signin_within() {
-        Ok(Some(lock)) => Ok(lock),
+) -> Result<(accounts::Lock, bool), Renewal> {
+    match signin_lock(store, host, label, out) {
+        Ok(Some(taken)) => Ok(taken),
         Ok(None) => {
             let _ = writeln!(
                 out,
@@ -9536,6 +10372,60 @@ fn signin_guard(
             Err(Renewal::Deferred)
         }
     }
+}
+
+/// [`accounts::Store::signin_within`], tried again for a person at a terminal for as long as the
+/// sign-in that holds the lock can run, with whether a person waited for it ([`signin_guard`]).
+fn signin_lock(
+    store: &accounts::Store,
+    host: &dyn AccountsHost,
+    label: &str,
+    out: &mut dyn Write,
+) -> io::Result<Option<(accounts::Lock, bool)>> {
+    if let Some(lock) = store.signin_now()? {
+        return Ok(Some((lock, false)));
+    }
+    let person = person_at_terminal(host);
+    for tried in 0.. {
+        match store.signin_within() {
+            Ok(None) if person && host.retries_sign_in_lock(tried) => {
+                if tried == 0 {
+                    let minutes = u64::from(PERSON_LOCK_TRIES) * LOCK_TRY_S / 60 + 1;
+                    let _ = writeln!(
+                        out,
+                        "{label}: {}; waiting for it to end, about {minutes} minutes at most \
+                         (Ctrl-C stops this)",
+                        accounts::SIGNIN_HELD
+                    );
+                }
+            }
+            taken => return taken.map(|lock| lock.map(|lock| (lock, person))),
+        }
+    }
+    Ok(None)
+}
+
+/// Whether the sign-in a person waited for renewed `label`, as `before` and `current` read it:
+/// only a renewal records a success, so there is nothing left for them to sign in.
+fn renewed_since(before: &accounts::Logins, current: &accounts::Logins, label: &str) -> bool {
+    let success = |logins: &accounts::Logins| {
+        logins
+            .get(label)
+            .map_or(0, |binding| binding.last_success_generation)
+    };
+    success(current) != 0 && success(current) != success(before)
+}
+
+/// Whether a person runs this at a terminal of their own: no automatic call, no pipe on stdin, and
+/// no agent's marker in its environment.
+fn person_at_terminal(host: &dyn AccountsHost) -> bool {
+    !host.automatic_sign_in()
+        && host.stdin_is_terminal()
+        && aterm_types::domain::agent_marker(&|name| {
+            host.machine_var(name)
+                .map(|value| value.to_string_lossy().into_owned())
+        })
+        .is_none()
 }
 
 /// Recheck a captured row and login generation after taking the machine's
@@ -9670,9 +10560,34 @@ fn run_accounts_login(
         );
         return ExitCode::from(1);
     }
-    let _signin = match signin_guard(&store, label, "login", out, err) {
+    let (_signin, waited) = match signin_guard(&store, host, label, "login", out, err) {
         Ok(guard) => guard,
         Err(_) => return ExitCode::from(1),
+    };
+    let logins = if waited {
+        let current = match store.load_logins(env.now) {
+            Ok((current, _)) => current,
+            Err(why) => {
+                let _ = writeln!(err, "aterm harness accounts login: {why}; nothing was run");
+                return ExitCode::from(1);
+            }
+        };
+        if renewed_since(&logins, &current, label) {
+            let _ = writeln!(out, "{label}: {RENEWED_WHILE_WAITING}");
+            return ExitCode::SUCCESS;
+        }
+        current
+    } else {
+        logins
+    };
+    let roster = accounts::bound(&file_roster, &logins);
+    let Some(row) = roster.row(label) else {
+        let _ = writeln!(
+            err,
+            "aterm harness accounts login: `{}` left the roster; nothing was run",
+            super::one_line(label, 80)
+        );
+        return ExitCode::from(1);
     };
     let policy = accounts::RenewalPolicy {
         roster_path: &path,
@@ -9840,7 +10755,16 @@ fn run_accounts_use(
             let Some((path, _)) = accounts_read_roster_for(cli, env, err) else {
                 return ExitCode::from(1);
             };
-            let _ = super::accounts_sync::recover_staging_renewals_for(cli, &store, &path, now);
+            let _ = super::accounts_sync::recover_staging_renewals_for(
+                cli,
+                &store,
+                &path,
+                now,
+                super::accounts_sync::shared_renewal::CheckpointAuthority::live(
+                    env.home.as_deref(),
+                    &path,
+                ),
+            );
             let Some((_, raw)) = accounts_read_roster_for(cli, env, err) else {
                 return ExitCode::from(1);
             };
@@ -10110,17 +11034,33 @@ pub fn account_adopt_source_environment() {}
 #[doc(hidden)]
 pub fn account_create_label_environment() {}
 
-fn machines_to_renew(
-    env: &Env,
-    due: bool,
-    on: Option<&[String]>,
-) -> Result<Vec<(String, String)>, String> {
+fn machines_to_renew(env: &Env, due: bool, on: Option<&[String]>) -> Result<Vec<String>, String> {
     let hosts: Vec<String> = match on {
         Some(on) => on.to_vec(),
         None if due => SupervisorConfig::from_path(env.config.as_deref()).0.hosts,
         None => Vec::new(),
     };
-    machine_entries(&hosts)
+    #[cfg(not(unix))]
+    if !hosts.is_empty() {
+        return Err("native fleet renewal is unavailable on this platform".into());
+    }
+    #[cfg(unix)]
+    for entry in &hosts {
+        let valid = !entry.is_empty()
+            && entry.trim() == entry
+            && aterm_net::fleet_member::parse_host_port(
+                entry,
+                Some(aterm_net::fleet_member::DEFAULT_PORT),
+            )
+            .is_ok();
+        if !valid {
+            return Err(format!(
+                "`{}` is not a native fleet host (use a host, node ID or host:port; SSH users and executable paths are not accepted)",
+                super::one_line(entry, 80)
+            ));
+        }
+    }
+    Ok(hosts)
 }
 
 /// `[harness] hosts` entries (`host` or `host:/abs/path/to/aterm`) as `(host, aterm)`, each refused by name unless both halves are plain words: no leading `-` (an `ssh` option), no whitespace, control character or shell metacharacter, and an absolute path for the aterm.
@@ -10364,11 +11304,14 @@ fn renew_one_guarded(
     };
     let how = match browser {
         RenewBrowser::Default => "it opens in your default browser".to_string(),
-        RenewBrowser::Profile { profile, .. } => {
+        RenewBrowser::Profile { profile, .. } | RenewBrowser::OwnProfile { profile, .. } => {
             format!(
                 "it opens in browser profile '{}'",
                 super::one_line(profile, 64)
             )
+        }
+        RenewBrowser::Remote { .. } if !host.stdin_is_terminal() => {
+            "its prepared sign-in route runs without a terminal, within five minutes".to_string()
         }
         RenewBrowser::Remote { .. } => match row.browser.as_deref() {
             Some(profile) => format!(
@@ -10388,7 +11331,7 @@ fn renew_one_guarded(
         say(err, &why);
         return Renewal::Deferred;
     }
-    let exited = host.renew_flow(&staging_text, email, browser);
+    let exited = host.renew_outcome(&staging_text, email, browser);
     let now = host.now().max(env.now);
     if let Err(why) = guard.check_policy(store, policy, now) {
         say(
@@ -10403,18 +11346,28 @@ fn renew_one_guarded(
             discard_staging(&staging, err);
             say(
                 err,
-                &format!("`claude` could not be run: {}", super::one_line(&why, 160)),
+                &format!(
+                    "`claude` sign-in did not complete: {}",
+                    super::one_line(&why, 160)
+                ),
             );
             return Renewal::Failed;
         }
     };
-    if exited != 0 {
+    if exited.code != 0 {
         discard_staging(&staging, err);
+        let browser = exited
+            .met
+            .as_ref()
+            .map_or_else(String::new, |met| format!("; {}", met.words()));
         say(
             err,
-            &format!("`claude auth login` exited {exited}; no login was bound"),
+            &format!(
+                "`claude auth login` exited {}{browser}; no login was bound",
+                exited.code
+            ),
         );
-        return Renewal::authentication_failed(Some(exited));
+        return Renewal::authentication_failed(Some(exited.code));
     }
     if !accounts::login_made(&staging) {
         discard_staging(&staging, err);
@@ -10700,11 +11653,18 @@ fn read_renewal_records(
     path: &Path,
     now: i64,
     recover_staging: bool,
+    home: Option<&Path>,
     err: &mut dyn Write,
 ) -> Option<accounts::AccountRecords> {
     let mut read = store.read_account_records(Some(path), now);
     if recover_staging && read.is_ok() {
-        let _ = super::accounts_sync::recover_staging_renewals_for(cli, store, path, now);
+        let _ = super::accounts_sync::recover_staging_renewals_for(
+            cli,
+            store,
+            path,
+            now,
+            super::accounts_sync::shared_renewal::CheckpointAuthority::live(home, path),
+        );
         // Even a failed staging publication may have admitted a pending receipt.
         // Never schedule from the earlier image after the recovery pass ran.
         read = store.read_account_records(Some(path), now);
@@ -10734,21 +11694,26 @@ fn read_renewal_records(
 }
 
 /// Whether the Claude Code row `label` (`email`) renews with nobody at this machine: a mailbox
-/// answers its sign-in's email, or its own browser profile, whose last renewal signed no other
-/// account in, is driven in a headless browser. `accounts renew` with no terminal runs only such
+/// answers its sign-in's email, or its own browser profile, ready for a new provider identity
+/// check ([`super::accounts_sync::claude_browser_profile_ready`]), is driven in a headless browser.
+/// `accounts renew` with no terminal runs only such
 /// rows ([`run_accounts_renew`]), and `aterm ai` calls any other row's sign-in a person's
-/// ([`crate::ai::facts::ClaudeAccounts::unattended`]).
+/// ([`crate::ai::facts::ClaudeAccounts::unattended`]). Of the machine beyond `home` and `store`
+/// it reads only the environment through `var` and, where `system_browsers`, the browsers
+/// installed outside the home.
 pub(crate) fn claude_row_can_run_headless(
+    var: &dyn Fn(&str) -> Option<OsString>,
+    system_browsers: bool,
     home: Option<&Path>,
     store: &accounts::Store,
     logins: &accounts::Logins,
     label: &str,
     email: Option<&str>,
 ) -> bool {
-    super::accounts_sync::has_configured_mailbox_for_row(home, store, Some(label), email)
-        || (logins.get(label).and_then(|b| b.wrong_at).is_none()
-            && super::headless_oauth::has_browser_profile(&store.dir, label, email)
-            && super::headless_oauth::find_headless_browser(home).is_some())
+    super::accounts_sync::has_configured_mailbox_for_row_with(var, home, store, Some(label), email)
+        || (super::accounts_sync::claude_browser_profile_ready(store, logins, label, email)
+            && super::headless_oauth::find_headless_browser_with(home, var, system_browsers)
+                .is_some())
 }
 
 fn run_accounts_renew(
@@ -10776,6 +11741,7 @@ fn run_accounts_renew(
         &path,
         now,
         due && labels.is_empty(),
+        env.home.as_deref(),
         err,
     ) else {
         return ExitCode::from(1);
@@ -10812,18 +11778,29 @@ fn run_accounts_renew(
             Some(_) => {}
         }
     }
+    // The machine is read through the host alone ([`AccountsHost::machine_var`]).
+    let machine_var = |name: &str| host.machine_var(name);
     let row_has_mailbox = |label: &str| {
         let em = roster.row(label).and_then(|r| r.email.as_deref());
-        super::accounts_sync::has_configured_mailbox_for_row(
+        super::accounts_sync::has_configured_mailbox_for_row_with(
+            &machine_var,
             env.home.as_deref(),
             &store,
             Some(label),
             em,
         )
     };
-    let row_can_run_headless = |label: &str| {
+    let row_can_run_headless = |label: &str, logins: &accounts::Logins| {
         let em = roster.row(label).and_then(|r| r.email.as_deref());
-        claude_row_can_run_headless(env.home.as_deref(), &store, &logins, label, em)
+        claude_row_can_run_headless(
+            &machine_var,
+            host.system_browsers(),
+            env.home.as_deref(),
+            &store,
+            logins,
+            label,
+            em,
+        )
     };
     if due {
         let enrolled = accounts::enrolled(&roster);
@@ -10847,7 +11824,7 @@ fn run_accounts_renew(
             let target = candidates
                 .iter()
                 .find(|r| {
-                    row_can_run_headless(&r.label)
+                    row_can_run_headless(&r.label, &logins)
                         || (host.stdin_is_terminal() && r.browser.is_some())
                 })
                 .or_else(|| candidates.first());
@@ -10867,17 +11844,22 @@ fn run_accounts_renew(
         }
         if labels.is_empty()
             && !host.stdin_is_terminal()
-            && chosen.iter().any(|label| row_can_run_headless(label))
+            && chosen
+                .iter()
+                .any(|label| row_can_run_headless(label, &logins))
         {
-            chosen.retain(|label| row_can_run_headless(label));
+            chosen.retain(|label| row_can_run_headless(label, &logins));
         }
     }
     if chosen.is_empty() && machines.is_empty() {
         let _ = writeln!(out, "nothing is due on this machine");
         return ExitCode::SUCCESS;
     }
-    let all_can_run_headless =
-        !chosen.is_empty() && chosen.iter().all(|label| row_can_run_headless(label));
+    let all_can_run_headless = !chosen.is_empty()
+        && chosen
+            .iter()
+            .all(|label| row_can_run_headless(label, &logins));
+    let mut ok = true;
     if !chosen.is_empty() && !host.stdin_is_terminal() && !all_can_run_headless {
         let _ = writeln!(out, "due here: {}", chosen.join(", "));
         let _ = writeln!(
@@ -10887,11 +11869,8 @@ fn run_accounts_renew(
         );
         // A row named and left as it was is a renewal that did not happen; a `--due` sweep only
         // says what is due.
-        return if labels.is_empty() {
-            ExitCode::SUCCESS
-        } else {
-            ExitCode::from(1)
-        };
+        ok = labels.is_empty();
+        chosen.clear();
     }
     if !chosen.is_empty()
         && let Some(why) = host.unaskable()
@@ -10901,34 +11880,49 @@ fn run_accounts_renew(
             "aterm harness accounts renew: not run: {why}, so no renewed login could be checked \
              afterwards"
         );
-        return ExitCode::from(1);
+        ok = false;
+        chosen.clear();
     }
-    let mut ok = true;
     let mut opener: Option<Option<PathBuf>> = None;
     for label in &chosen {
         // Each row starts a separate attempt. The preceding row may have allocated a
-        // generation, so capture this row and its parent together before waiting to sign in.
-        let attempt_logins = match store.load_logins(now) {
-            Ok((logins, _)) => logins,
+        // generation, so capture this row and its parent together before taking the lock, which
+        // refuses a row some other run just renewed.
+        let load = |err: &mut dyn Write| match store.load_logins(now) {
+            Ok((logins, _)) => Some(logins),
             Err(why) => {
                 let _ = writeln!(
                     err,
                     "aterm harness accounts renew: {label}: {why}; nothing was run"
                 );
-                ok = false;
-                continue;
+                None
             }
         };
-        let attempt_rows = accounts::bound(&file_roster, &attempt_logins);
-        let Some(row) = attempt_rows.row(label) else {
+        let Some(mut attempt_logins) = load(err) else {
+            ok = false;
             continue;
         };
-        let signin = match signin_guard(&store, label, "renew", out, err) {
+        let (signin, waited) = match signin_guard(&store, host, label, "renew", out, err) {
             Ok(guard) => guard,
             Err(_) => {
                 ok = false;
                 continue;
             }
+        };
+        if waited {
+            let Some(current) = load(err) else {
+                ok = false;
+                continue;
+            };
+            if renewed_since(&attempt_logins, &current, label) {
+                let _ = writeln!(out, "{label}: {RENEWED_WHILE_WAITING}");
+                continue;
+            }
+            attempt_logins = current;
+        }
+        let attempt_rows = accounts::bound(&file_roster, &attempt_logins);
+        let Some(row) = attempt_rows.row(label) else {
+            continue;
         };
         let own_dir = file_roster.row(label).and_then(|r| r.dir.as_deref());
         let interactive_browser =
@@ -10942,16 +11936,39 @@ fn run_accounts_renew(
                     None => RenewBrowser::Default,
                 },
             };
+        // A person is here for a row whose page stopped its automatic sign-in: a headless run
+        // would only meet that page again, so the sign-in is theirs, in the row's own browser
+        // profile, or with none named their default browser, where no opener of aterm's runs. An
+        // agent's terminal is nobody here.
+        let person = person_at_terminal(host);
+        let stopped =
+            !host.under_ssh() && person && accounts::sign_in_blocked(&attempt_logins, label);
+        let headless = row_can_run_headless(label, &attempt_logins);
         let used_headless_profile_only =
-            !host.under_ssh() && !row_has_mailbox(label) && row_can_run_headless(label);
-        let browser = if host.under_ssh() || row_can_run_headless(label) {
+            !stopped && !host.under_ssh() && !row_has_mailbox(label) && headless;
+        let browser = if stopped {
+            match interactive_browser(&mut opener) {
+                RenewBrowser::Profile { opener, profile } => {
+                    RenewBrowser::OwnProfile { opener, profile }
+                }
+                browser => browser,
+            }
+        } else if host.under_ssh() || headless {
             RenewBrowser::Remote {
                 opener: opener
                     .get_or_insert_with(|| opener_link(&store, host))
                     .clone(),
             }
-        } else {
+        } else if person {
             interactive_browser(&mut opener)
+        } else {
+            let _ = writeln!(
+                err,
+                "aterm harness accounts renew: {label}: not run: this row's sign-in opens a \
+                 browser, which takes a person at this Mac's terminal"
+            );
+            ok = false;
+            continue;
         };
         let policy = || accounts::RenewalPolicy {
             roster_path: &path,
@@ -10970,10 +11987,7 @@ fn run_accounts_renew(
             out,
             err,
         );
-        if renewal.can_retry_authentication()
-            && used_headless_profile_only
-            && host.stdin_is_terminal()
-        {
+        if renewal.can_retry_authentication() && used_headless_profile_only && person {
             let fallback = interactive_browser(&mut opener);
             renewal = renew_one(
                 env,
@@ -10989,33 +12003,28 @@ fn run_accounts_renew(
         }
         ok &= renewal == Renewal::Renewed;
     }
-    for (machine, aterm) in &machines {
+    for machine in &machines {
         let _ = writeln!(out, "renewing on {machine}:");
         let _ = out.flush();
-        let argv = [
-            aterm.as_str(),
-            "harness",
-            "accounts",
-            "renew",
-            "--due",
-            "--here",
-        ]
-        .map(str::to_string);
-        match host.ssh(machine, &argv) {
-            Ok(0) => {}
-            Ok(code) => {
-                ok = false;
-                let _ = writeln!(
-                    err,
-                    "aterm harness accounts renew: on {machine}: exited {code}"
-                );
+        match host.renew_remote(machine) {
+            Ok(result) => {
+                let _ = write!(out, "{}", result.stdout);
+                let _ = write!(err, "{}", result.stderr);
+                if result.code != 0 {
+                    ok = false;
+                    let _ = writeln!(
+                        err,
+                        "aterm harness accounts renew: on {machine}: exited {}",
+                        result.code
+                    );
+                }
             }
             Err(why) => {
                 ok = false;
                 let _ = writeln!(
                     err,
-                    "aterm harness accounts renew: on {machine}: `ssh` could not be run: {}",
-                    super::one_line(&why, 160)
+                    "aterm harness accounts renew: on {machine}: native fleet renewal failed: {}",
+                    super::one_line(&why, 400)
                 );
             }
         }
@@ -11086,6 +12095,7 @@ fn drove_words(outcome: &super::login_drive::Outcome) -> String {
 /// The selected row and its binding snapshot, with the raw directory the roster supplied, and
 /// for Codex the program a launch aterm makes runs here ([`report_program`]).
 struct SignInPolicy<'a> {
+    host: &'a dyn AccountsHost,
     row: &'a accounts::Row,
     logins: &'a accounts::Logins,
     roster_path: &'a Path,
@@ -11139,6 +12149,7 @@ fn sign_in_plan(
     err: &mut dyn Write,
 ) -> Result<SignInPlan, Renewal> {
     let SignInPolicy {
+        host,
         row,
         logins: captured_logins,
         roster_path,
@@ -11182,8 +12193,25 @@ fn sign_in_plan(
         );
         return Err(Renewal::Failed);
     };
-    let lock = signin_guard(store, label, verb, out, err)?;
-    let parent = accounts::RenewalParent::capture(captured_logins, label);
+    let (lock, waited) = signin_guard(store, host, label, verb, out, err)?;
+    let current;
+    let parent_logins = if waited {
+        current = match store.load_logins(now) {
+            Ok((logins, _)) => logins,
+            Err(why) => {
+                say(err, &format!("{why}; nothing was run"));
+                return Err(Renewal::Deferred);
+            }
+        };
+        if renewed_since(captured_logins, &current, label) {
+            let _ = writeln!(out, "{label}: {RENEWED_WHILE_WAITING}");
+            return Err(Renewal::Renewed);
+        }
+        &current
+    } else {
+        captured_logins
+    };
+    let parent = accounts::RenewalParent::capture(parent_logins, label);
     if let Err(why) =
         store.transact_logins_within(&accounts::LOCK_LADDER, now, &mut None, |_, current| {
             shared_renewal::unmanaged(current, row, None, false)?;
@@ -11199,7 +12227,7 @@ fn sign_in_plan(
     if cli == Cli::Codex
         && default_home
             .as_deref()
-            .is_some_and(crate::ai::facts::codex_keyring)
+            .is_none_or(|home| !crate::ai::facts::codex_file_store(home))
     {
         say(err, &keyring_staging(label, row.dir.is_none()));
         return Err(Renewal::Failed);
@@ -11778,6 +12806,7 @@ pub(super) fn renew_one_for(
         cli,
         store,
         SignInPolicy {
+            host,
             row,
             logins: captured_logins,
             roster_path,
@@ -11977,9 +13006,15 @@ fn run_accounts_renew_for(
         return ExitCode::from(1);
     };
     let now = env.now;
-    let Some(records) =
-        read_renewal_records(cli, &store, &path, now, due && labels.is_empty(), err)
-    else {
+    let Some(records) = read_renewal_records(
+        cli,
+        &store,
+        &path,
+        now,
+        due && labels.is_empty(),
+        env.home.as_deref(),
+        err,
+    ) else {
         return ExitCode::from(1);
     };
     let accounts::AccountRecords {
@@ -12150,6 +13185,7 @@ fn run_accounts_login_for(
         cli,
         &store,
         SignInPolicy {
+            host,
             row: &row,
             logins: &logins,
             roster_path: &path,
@@ -12162,6 +13198,7 @@ fn run_accounts_login_for(
         err,
     ) {
         Ok(plan) => plan,
+        Err(Renewal::Renewed) => return ExitCode::SUCCESS,
         Err(_) => return ExitCode::from(1),
     };
     let _ = writeln!(
@@ -12317,16 +13354,9 @@ fn run_accounts_browser_with(
         Ok((logins, _)) => logins,
         Err(why) => return refuse(err, &why),
     };
-    let bound = accounts::bound(&file_roster, &logins);
-    let Some(bound_row) = bound.row(label) else {
+    if accounts::bound(&file_roster, &logins).row(label).is_none() {
         return refuse(err, "the browser account is no longer listed");
-    };
-    let policy = accounts::RenewalPolicy {
-        roster_path: &path,
-        roster: &file_roster,
-        row: bound_row,
-        logins: &logins,
-    };
+    }
     if let Some(why) = desk_refusal {
         return refuse(err, why);
     }
@@ -12391,8 +13421,8 @@ fn run_accounts_browser_with(
             }
         }
     };
-    let _lock = match store.signin_within() {
-        Ok(Some(lock)) => lock,
+    let (_lock, waited) = match signin_lock(&store, host, label, out) {
+        Ok(Some(taken)) => taken,
         Ok(None) => return refuse(err, &format!("{label}: held: {}", accounts::SIGNIN_HELD)),
         Err(e) => {
             return refuse(
@@ -12400,6 +13430,24 @@ fn run_accounts_browser_with(
                 &format!("{label}: the sign-in lock could not be taken ({e})"),
             );
         }
+    };
+    let logins = if waited {
+        match store.load_logins(env.now) {
+            Ok((logins, _)) => logins,
+            Err(why) => return refuse(err, &why),
+        }
+    } else {
+        logins
+    };
+    let bound = accounts::bound(&file_roster, &logins);
+    let Some(bound_row) = bound.row(label) else {
+        return refuse(err, "the browser account is no longer listed");
+    };
+    let policy = accounts::RenewalPolicy {
+        roster_path: &path,
+        roster: &file_roster,
+        row: bound_row,
+        logins: &logins,
     };
     if !signin_policy_ready(&store, policy, env.now, "browser", err) {
         return ExitCode::from(1);
@@ -12578,6 +13626,14 @@ fn run_accounts_browser_with(
         return ExitCode::from(1);
     }
     if signed_in {
+        if let Err(e) = super::headless_oauth::adopt_browser_profile(&profile) {
+            let _ = writeln!(
+                err,
+                "aterm harness accounts browser: {label}: sign-in succeeded, but its profile \
+                 remains unproven and unavailable for renewal ({e})"
+            );
+            return ExitCode::SUCCESS;
+        }
         let _ = writeln!(
             out,
             "next: aterm harness accounts {} {label}{flag}   ({})",
@@ -12755,6 +13811,17 @@ pub fn run_accounts_of(
             identity_email,
             browser,
         } => {
+            if cli == Cli::Codex
+                && env.home.as_deref().is_none_or(|home| {
+                    !crate::ai::facts::codex_file_store(&home.join(cli.accounts().default_home))
+                })
+            {
+                let _ = writeln!(
+                    err,
+                    "Codex file storage is not selected or could not be read; no default file login was adopted"
+                );
+                return ExitCode::from(1);
+            }
             // An explicit canonical expectation is checked even when a login
             // alias was supplied. Adoption still records metadata, not a
             // fresh sign-in or a renewable credential proof.
@@ -12956,11 +14023,14 @@ fn run_accounts_stats_of(
     };
     let read = home
         .as_deref()
+        .filter(|home| crate::ai::facts::codex_file_store(home))
         .and_then(|home| crate::ai::codex_limits::home_sample(home, env.now));
     let figure = |name: &str, pct: Option<u32>, reset: Option<i64>| match (pct, reset) {
         (Some(pct), Some(reset)) => format!("{name} {pct}% until {}", rfc3339_utc(reset)),
         (Some(pct), None) => format!("{name} {pct}%"),
-        _ => format!("{name} ?"),
+        // Never a bare `?`: the row's newest reading (a usage tap's, a `/usage` panel's, a
+        // rollout's) carried no figure for the window.
+        _ => format!("{name} \u{2013} (not in its newest reading)"),
     };
     let window = |pct: Option<u32>, reset: Option<i64>| {
         let mut w = Map::new();
@@ -13144,7 +14214,7 @@ fn run_accounts_stats_of(
         );
         let monthly = if cli == Cli::Kimi {
             l.monthly.map_or_else(
-                || " \u{b7} monthly ?".to_owned(),
+                || " \u{b7} monthly \u{2013} (no reading yet)".to_owned(),
                 |w| {
                     format!(
                         " \u{b7} {} \u{b7} read {}",
@@ -13271,6 +14341,10 @@ fn run_accounts_stats(env: &Env, json: bool, out: &mut dyn Write) -> ExitCode {
         sessions,
     };
     let view = account_stats::view(&look);
+    let live_clock = REPORT_LOCAL_CLOCK.load(std::sync::atomic::Ordering::Relaxed);
+    let live_tz = |t: i64| limit::local_offset_at(t).unwrap_or(env.tz_s);
+    let fixed_tz = |_: i64| env.tz_s;
+    let tz_at: &dyn Fn(i64) -> i64 = if live_clock { &live_tz } else { &fixed_tz };
     let _ = if json {
         writeln!(
             out,
@@ -13278,7 +14352,7 @@ fn run_accounts_stats(env: &Env, json: bool, out: &mut dyn Write) -> ExitCode {
             account_stats::json(&look, &view, env!("CARGO_PKG_VERSION"))
         )
     } else {
-        write!(out, "{}", account_stats::text(&look, &view))
+        write!(out, "{}", account_stats::text_local(&look, &view, tz_at))
     };
     ExitCode::SUCCESS
 }
@@ -13381,6 +14455,17 @@ pub fn run(cmd: &Cmd, env: &Env, out: &mut dyn Write, err: &mut dyn Write) -> Ex
             apply,
             json,
         } => run_disk(env, targets, *apply, *json, out, err),
+        Cmd::DiskWatch => {
+            #[cfg(target_os = "macos")]
+            {
+                disk::watch::run(env, out, err)
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = writeln!(err, "aterm harness disk watch: supported on macOS");
+                ExitCode::from(2)
+            }
+        }
         Cmd::DiskWhy { json } => run_disk_why(env, *json, out, err),
         Cmd::DiskFree {
             paths,
@@ -13397,7 +14482,7 @@ pub fn run(cmd: &Cmd, env: &Env, out: &mut dyn Write, err: &mut dyn Write) -> Ex
         Cmd::AccountsSourceTable { cli, json } => {
             run_accounts_source_table(*cli, env, *json, out, err)
         }
-        Cmd::Versions { json } => run_versions(*json, out),
+        Cmd::Versions { json } => run_versions(env, *json, out),
         Cmd::Signin { wait, json } => run_signin(env, *wait, *json, out, err),
         Cmd::MailboxesImport { csv, into, dry_run } => {
             super::mailbox_routes::run_import(csv, into, *dry_run, env.home.as_deref(), out, err)
@@ -13487,13 +14572,231 @@ fn run_signin(
     ExitCode::from(ended.exit())
 }
 
-fn run_versions(json: bool, out: &mut dyn Write) -> ExitCode {
+/// `versions [--json]`: the built-in harness versions, the installed harness packages and the
+/// live harness claims ([`HELP_VERSIONS`]).
+fn run_versions(env: &Env, json: bool, out: &mut dyn Write) -> ExitCode {
+    let layout = versions_layout(env);
+    let packages = layout.as_ref().map(atpkg::harness::installed);
+    let socks = match &env.sock {
+        Some(sock) => vec![sock.clone()],
+        None => aterm_ctl::local_instances()
+            .map(|found| found.into_iter().map(|(_, sock)| sock).collect())
+            .unwrap_or_default(),
+    };
+    let claims = read_live_claims(&socks);
+    let codex_version = |pid: u32| {
+        layout
+            .as_ref()
+            .and_then(|l| claimant_build_version(l, "codex", pid))
+    };
+    write_versions(
+        packages.as_deref(),
+        claims.as_deref(),
+        &codex_version,
+        json,
+        out,
+    );
+    ExitCode::SUCCESS
+}
+
+/// The atpkg store `versions` reads: the `[packages] prefix` of [`Env::config`] under
+/// [`Env::home`], vetted as atpkg vets it, else the default prefix there.
+fn versions_layout(env: &Env) -> Option<atpkg::store::Layout> {
+    let home = env.home.as_deref()?;
+    let cfg = env
+        .config
+        .as_deref()
+        .and_then(atpkg::config::load_live)
+        .unwrap_or_default();
+    let configured = cfg.prefix_path(Some(home));
+    Some(atpkg::store::Layout {
+        prefix: atpkg::store::vet_prefix(configured.as_deref(), home),
+    })
+}
+
+/// One harness claim a `sessions` row carries (`supervisor=`, `supervisor_proven=`,
+/// `supervisor_version=`, `supervisor_vendor=`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveClaim {
+    /// The session (`s-…`).
+    sid: String,
+    /// The holder, decoded (`grok-alab@4242`, `codex-alab@4242`).
+    holder: String,
+    /// `supervisor_proven=1`.
+    proven: bool,
+    /// The harness version the claim announced.
+    version: Option<String>,
+    /// The vendor build the claim announced.
+    vendor: Option<String>,
+}
+
+impl LiveClaim {
+    /// The harness a holder names and its vendor agent: a rostered contract 3 harness
+    /// ([`super::contract::holder`]) or a codex-alab self-claim; `None` for any other holder.
+    fn harness(&self) -> Option<(&'static str, &'static str, Option<u32>)> {
+        if let Some((row, pid)) = super::contract::holder(&self.holder) {
+            return Some((row.id, row.vendor, Some(pid)));
+        }
+        let pid = self.holder.strip_prefix("codex-alab@")?;
+        let parsed = pid
+            .parse::<u32>()
+            .ok()
+            .filter(|p| *p > 1 && p.to_string() == pid);
+        Some(("codex-alab", "codex", parsed))
+    }
+}
+
+/// The harness claims of a `sessions` reply body, in row order: only rows whose holder names a
+/// harness ([`LiveClaim::harness`]).
+fn live_claims_of(body: &str) -> Vec<LiveClaim> {
+    let mut out = Vec::new();
+    for row in body.lines() {
+        let mut words = row.split_whitespace();
+        let Some(sid) = words.nth(1).filter(|s| s.starts_with("s-")) else {
+            continue;
+        };
+        let (mut holder, mut proven, mut version, mut vendor) = (None, false, None, None);
+        let word = |v: &str| (v != "-").then(|| aterm_codec::pct::decode(v));
+        for token in words {
+            if let Some(h) = token.strip_prefix("supervisor=") {
+                holder = holder.or_else(|| word(h));
+            } else if let Some(p) = token.strip_prefix("supervisor_proven=") {
+                proven = p == "1";
+            } else if let Some(v) = token.strip_prefix("supervisor_version=") {
+                version = word(v);
+            } else if let Some(v) = token.strip_prefix("supervisor_vendor=") {
+                vendor = word(v);
+            }
+        }
+        let Some(holder) = holder else {
+            continue;
+        };
+        let claim = LiveClaim {
+            sid: sid.to_string(),
+            holder,
+            proven,
+            version,
+            vendor,
+        };
+        if claim.harness().is_some() {
+            out.push(claim);
+        }
+    }
+    out
+}
+
+/// The harness claims every instance at `socks` carries ([`live_claims_of`]), or `None` when
+/// none answered `sessions`.
+fn read_live_claims(socks: &[String]) -> Option<Vec<LiveClaim>> {
+    let mut answered = false;
+    let mut out = Vec::new();
+    for sock in socks {
+        let Some(mut c) = super::upgrade_drive::roster_connection(sock) else {
+            continue;
+        };
+        // An instance that accepts and never answers is one that did not answer.
+        if c.transport()
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .is_err()
+        {
+            continue;
+        }
+        let Ok((head, body)) = c.request_counted("sessions") else {
+            continue;
+        };
+        if crate::is_ok_reply(&head) {
+            answered = true;
+            out.extend(live_claims_of(&body));
+        }
+    }
+    answered.then_some(out)
+}
+
+/// The recorded package version for `program`'s kernel-observed executable. A validated
+/// ALab entrypoint resolves independently of the current selection; legacy store and linked
+/// checkout fallbacks retain their existing reading. The kernel birth must stay the same
+/// across path and metadata reads. Display only: the claim's proof is aterm's, not this, and
+/// package records do not attest compiled identity.
+fn claimant_build_version(
+    layout: &atpkg::store::Layout,
+    program: &str,
+    pid: u32,
+) -> Option<String> {
+    claimant_build_version_reading(
+        layout,
+        program,
+        pid,
+        aterm_uds::process::read_birth,
+        aterm_uds::process::read_process_path,
+    )
+}
+
+fn claimant_build_version_reading(
+    layout: &atpkg::store::Layout,
+    program: &str,
+    pid: u32,
+    mut birth: impl FnMut(i32) -> Option<aterm_uds::process::Birth>,
+    path: impl FnOnce(i32) -> Option<PathBuf>,
+) -> Option<String> {
+    let pid = i32::try_from(pid).ok().filter(|pid| *pid > 1)?;
+    let before = birth(pid)?;
+    let exe = path(pid)?;
+    let exe = std::fs::canonicalize(exe).ok()?;
+    let version = package_build_version(layout, program, &exe);
+    (birth(pid)? == before).then_some(version).flatten()
+}
+
+fn package_build_version(
+    layout: &atpkg::store::Layout,
+    program: &str,
+    exe: &Path,
+) -> Option<String> {
+    if atpkg::alab::agent(program).is_some()
+        && let Some(version) = atpkg::alab::package_version_of_exe(exe)
+    {
+        return Some(version);
+    }
+    if let Ok(store) = std::fs::canonicalize(layout.prefix.join("store").join(program))
+        && let Ok(rest) = exe.strip_prefix(&store)
+    {
+        let build = rest.components().next()?.as_os_str().to_str()?;
+        let build = build
+            .parse::<u64>()
+            .ok()
+            .filter(|b| b.to_string() == build)?;
+        return atpkg::alab::package_version(&layout.build_dir(program, build));
+    }
+    let checkout = std::fs::canonicalize(atpkg::linked_checkout(layout, program)?).ok()?;
+    exe.starts_with(&checkout)
+        .then(|| atpkg::alab::package_version(&checkout))
+        .flatten()
+}
+
+/// Render the three sections of `versions` ([`HELP_VERSIONS`]): `packages` is `None` with no
+/// store to read, `claims` `None` when no aterm instance answered.
+fn write_versions(
+    packages: Option<&[atpkg::harness::Installed]>,
+    claims: Option<&[LiveClaim]>,
+    codex_version: &dyn Fn(u32) -> Option<String>,
+    json: bool,
+    out: &mut dyn Write,
+) {
+    use crate::supervise::journal::json_str;
+    let claim_versions = |c: &LiveClaim| {
+        let (harness, agent, pid) = c.harness().unwrap_or(("-", "-", None));
+        let version = match (&c.version, harness) {
+            (Some(v), _) => Some(v.clone()),
+            (None, "codex-alab") if c.proven => pid.and_then(codex_version),
+            (None, _) => None,
+        };
+        (harness, agent, version)
+    };
     if json {
         let mut items = Vec::new();
         for harness in aterm_phase::CliHarness::ALL {
             let v = harness.version();
             items.push(format!(
-                r#"{{"id":"{}","slug":"{}","label":"{}","version":"{}","major":{},"minor":{}}}"#,
+                r#"{{"kind":"built-in","id":"{}","slug":"{}","label":"{}","version":"{}","major":{},"minor":{}}}"#,
                 harness.id(),
                 harness.cli(),
                 harness.product(),
@@ -13502,19 +14805,86 @@ fn run_versions(json: bool, out: &mut dyn Write) -> ExitCode {
                 v.minor()
             ));
         }
+        let opt = |v: Option<&str>| v.map_or_else(|| "null".to_string(), json_str);
+        for p in packages.unwrap_or_default() {
+            items.push(format!(
+                r#"{{"kind":"package","harness":{},"program":{},"build":{},"version":{},"link":{}}}"#,
+                json_str(&p.harness),
+                json_str(&p.program),
+                p.build.map_or_else(|| "null".to_string(), |b| b.to_string()),
+                opt(p.version.as_deref()),
+                opt(p.linked.as_ref().map(|l| l.to_string_lossy()).as_deref()),
+            ));
+        }
+        for c in claims.unwrap_or_default() {
+            let (harness, agent, version) = claim_versions(c);
+            items.push(format!(
+                r#"{{"kind":"claim","session":{},"holder":{},"harness":{},"proven":{},"version":{},"agent":{},"vendor":{}}}"#,
+                json_str(&c.sid),
+                json_str(&c.holder),
+                json_str(harness),
+                c.proven,
+                opt(version.as_deref()),
+                json_str(agent),
+                opt(c.vendor.as_deref()),
+            ));
+        }
         let _ = writeln!(out, "[{}]", items.join(","));
-    } else {
-        for harness in aterm_phase::CliHarness::ALL {
-            let _ = writeln!(
-                out,
-                "{:<12} {:<16} v{}",
-                harness.id(),
-                harness.product(),
-                harness.version()
-            );
+        return;
+    }
+    let _ = writeln!(out, "built-in (compiled into this aterm, updated with it)");
+    for harness in aterm_phase::CliHarness::ALL {
+        let _ = writeln!(
+            out,
+            "  {:<12} {:<16} v{}  built-in",
+            harness.id(),
+            harness.product(),
+            harness.version()
+        );
+    }
+    let _ = writeln!(out, "installed harness packages");
+    match packages {
+        None => {
+            let _ = writeln!(out, "  (no atpkg store: the home is unknown)");
+        }
+        Some([]) => {
+            let _ = writeln!(out, "  (none installed)");
+        }
+        Some(packages) => {
+            for p in packages {
+                let version = p.version.as_deref().unwrap_or("version unrecorded");
+                let from = match (&p.linked, p.build) {
+                    (Some(checkout), _) => format!("dev link {}", checkout.display()),
+                    (None, Some(build)) if p.program == p.harness => format!("build {build}"),
+                    (None, Some(build)) => format!("{} build {build}", p.program),
+                    (None, None) => String::new(),
+                };
+                let _ = writeln!(out, "  {:<17} {version}  {from}", p.harness);
+            }
         }
     }
-    ExitCode::SUCCESS
+    let _ = writeln!(out, "live claims");
+    match claims {
+        None => {
+            let _ = writeln!(out, "  (no aterm instance answered)");
+        }
+        Some([]) => {
+            let _ = writeln!(out, "  (none: no session is supervised by a harness)");
+        }
+        Some(claims) => {
+            for c in claims {
+                let (harness, agent, version) = claim_versions(c);
+                let version = version.as_deref().unwrap_or("unknown");
+                let tail = if harness == "codex-alab" {
+                    "(self-claim)".to_string()
+                } else {
+                    format!("({agent} {})", c.vendor.as_deref().unwrap_or("unknown"))
+                };
+                let proof = if c.proven { "" } else { "  unproven" };
+                let _ = writeln!(out, "  @{} {harness} {version} {tail}{proof}", c.sid);
+            }
+        }
+    }
 }
 
 fn run_tap(out: &mut dyn Write) -> ExitCode {
@@ -13620,6 +14990,10 @@ fn launch_tap_value(args: &[String]) -> Option<String> {
 
 /// The front door's entry point (`aterm harness …`).
 pub fn main_entry(argv: Vec<OsString>) -> ExitCode {
+    #[cfg(unix)]
+    if let Some(result) = super::native_launch::entry(&argv) {
+        return result;
+    }
     use std::io::IsTerminal as _;
     let args: Vec<String> = argv
         .iter()
@@ -13678,8 +15052,10 @@ pub fn main_entry(argv: Vec<OsString>) -> ExitCode {
     if matches!(cmd, Cmd::Disk { .. }) || stats {
         env.claude_running = Some(disk::discover::running_claude_census(env.home.as_deref()));
     }
-    if stats {
+    // The report's outlook says its instants on the local clock, as the footer and the card do.
+    if stats || matches!(cmd, Cmd::Accounts(AccountsCmd::Report { .. })) {
         env.tz_s = limit::tz_offset_s();
+        REPORT_LOCAL_CLOCK.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     let stdout = io::stdout();
     let stderr = io::stderr();

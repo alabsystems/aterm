@@ -1,0 +1,31 @@
+# kimi 2.4.0 · MEASURED 2026-10-29, `aterm ctl text` of a private headless aterm (110x32, aterm 0.146.0) running the real Kimi Code, launched by path with a scratch `HOME` and `KIMI_CODE_HOME` whose `config.toml` names one `openai`-type provider at `http://127.0.0.1:<port>/v1` with a fake key (a local stub of the Chat Completions API, crates/aterm-lab), no login · Shift-Tab at the empty composer: `plan` leads the footer, the composer unchanged
+
+ ● lab tool turn done
+
+ ❯ lab run another shell command
+
+ ✗ Ran a command · $ echo lab-kimi-reject
+   Tool "Bash" was not run because the user rejected the approval request.
+
+   Rejected: Running: echo lab-kimi-reject
+
+ ● lab after the rejection
+
+ ❯ lab ask me a question
+
+ ● Collected your answers
+   Q  Which lab colour should the marker use?
+   →  Red (Recommended)
+
+ ● lab after the question
+
+   Plan mode: ON
+   Plan will be created here:
+ /private/tmp/at.lab-501/aterm-gk-kimi-c1dea2b9/runs/gkm/scratch/home/.kimi-code/sessions/wd_proj_a61892cfd98
+ 5/session_d240495d-90d8-422b-bc70-82ea4e4c480f/agents/main/plans/us-agent-constantine-obsidian.md
+
+ ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │ >                                                                                                        │
+ ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ plan  lab-model  …/tmp/at.H2aa/proj
+                                                                                   context: 22% (21.3k/97.7k)

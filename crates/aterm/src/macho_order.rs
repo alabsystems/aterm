@@ -275,9 +275,12 @@ pub(crate) fn write_probe_spacer_object(
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "stroff overflow"))?;
     let strsize = u32::try_from(strtab.len())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "strsize overflow"))?;
-    let const_fileoff = u32::try_from(data_fileoff + text_size).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "const_fileoff overflow")
-    })?;
+    let const_fileoff = data_fileoff
+        .checked_add(text_size)
+        .and_then(|v| u32::try_from(v).ok())
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "const_fileoff overflow")
+        })?;
 
     let seg_cmd_size: u32 = 72 + 80 * 2;
     let build_ver_cmd_size: u32 = 24;
@@ -651,7 +654,11 @@ fn extract_archive_symbols(bytes: &[u8], file_order: u32, out: &mut Vec<RawSym>)
         let Ok(size_str) = std::str::from_utf8(&hdr[48..58]) else {
             break;
         };
-        let Ok(member_size) = size_str.trim().parse::<usize>() else {
+        let size_trimmed = size_str.trim();
+        if !size_trimmed.bytes().all(|b| b.is_ascii_digit()) {
+            break;
+        }
+        let Ok(member_size) = size_trimmed.parse::<usize>() else {
             break;
         };
         let body_start = pos + 60;
@@ -663,6 +670,7 @@ fn extract_archive_symbols(bytes: &[u8], file_order: u32, out: &mut Vec<RawSym>)
         };
         if let Ok(name_field) = std::str::from_utf8(&hdr[0..16])
             && let Some(ext_len_str) = name_field.trim_end_matches(' ').strip_prefix("#1/")
+            && ext_len_str.bytes().all(|b| b.is_ascii_digit())
             && let Ok(ext_len) = ext_len_str.parse::<usize>()
             && let Some(trimmed) = body.get(ext_len..)
         {
@@ -1127,7 +1135,9 @@ fn extract_c_prefix(sym: &str) -> &str {
 
 /// Writes `symbols` to `path` (one symbol per line) for `ld -order_file`.
 pub(crate) fn write_order_file(path: &Path, symbols: &[String]) -> std::io::Result<()> {
-    let total_bytes: usize = symbols.iter().map(|s| s.len() + 1).sum();
+    let total_bytes: usize = symbols.iter().fold(0usize, |acc, s| {
+        acc.saturating_add(s.len()).saturating_add(1)
+    });
     let mut buf = String::with_capacity(total_bytes);
     for sym in symbols {
         buf.push_str(sym);
@@ -1350,6 +1360,7 @@ mod tests {
                 ("_hot_init", 1, 0x1_0000_4000),
                 ("_cold_neighbor", 1, 0x1_0000_4200),
                 ("_cold_page2", 1, 0x1_0000_8000),
+                ("_tail_edge", 1, u64::MAX),
             ],
         );
         let mut faulted = HashSet::new();
@@ -1433,13 +1444,14 @@ mod tests {
         let filelist = scratch.join("inputs.filelist");
         std::fs::write(&filelist, format!("{}\n", obj_b.display())).expect("write filelist");
         let resp = scratch.join("link.args");
+        let quoted = |p: &Path| p.display().to_string().replace('\\', "\\\\");
         std::fs::write(
             &resp,
             format!(
                 "-o \"{}\" \"{}\" -filelist \"{}\"\n",
-                scratch.join("out.o").display(),
-                obj_a.display(),
-                filelist.display()
+                quoted(&scratch.join("out.o")),
+                quoted(&obj_a),
+                quoted(&filelist)
             ),
         )
         .expect("write response file");

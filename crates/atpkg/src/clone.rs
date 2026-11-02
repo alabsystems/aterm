@@ -48,10 +48,16 @@ pub(crate) fn clone_file(src: &Path, dst: &Path) -> io::Result<()> {
         )
     })?;
     let modified = meta.modified()?;
-    let file = std::fs::OpenOptions::new().write(true).open(dst)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = opts.open(dst)?;
     file.set_modified(modified)?;
-    drop(file);
-    std::fs::set_permissions(dst, meta.permissions())?;
+    file.set_permissions(meta.permissions())?;
     Ok(())
 }
 
@@ -138,7 +144,10 @@ pub(crate) fn same_bytes(a: &Path, b: &Path) -> io::Result<bool> {
     if !ma.is_file() || !mb.is_file() || ma.len() != mb.len() {
         return Ok(false);
     }
-    let (mut fa, mut fb) = (std::fs::File::open(a)?, std::fs::File::open(b)?);
+    let (mut fa, mut fb) = (
+        crate::metadata_io::open_regular(a)?,
+        crate::metadata_io::open_regular(b)?,
+    );
     let (mut ba, mut bb) = (vec![0u8; 1 << 16], vec![0u8; 1 << 16]);
     loop {
         let n = fa.read(&mut ba)?;

@@ -584,15 +584,18 @@ fn files_under(dir: &Path) -> Result<Vec<(String, Vec<u8>)>> {
             fs::read_dir(&at).map_err(|e| Error::new(format!("read {}: {e}", at.display())))?;
         for entry in entries {
             let entry = entry.map_err(|e| Error::new(format!("read {}: {e}", at.display())))?;
+            let ft = entry
+                .file_type()
+                .map_err(|e| Error::new(format!("read {}: {e}", entry.path().display())))?;
             let name = entry.file_name().to_string_lossy().into_owned();
             let path = if rel.is_empty() {
                 name
             } else {
                 format!("{rel}/{name}")
             };
-            if entry.path().is_dir() {
+            if ft.is_dir() {
                 stack.push((entry.path(), path));
-            } else {
+            } else if ft.is_file() {
                 let bytes = fs::read(entry.path())
                     .map_err(|e| Error::new(format!("read {}: {e}", entry.path().display())))?;
                 out.push((path, bytes));
@@ -833,5 +836,25 @@ pub fn land(
                  again, which lands them on the tip it finds. Last rejection: {why}"
             )));
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::files_under;
+
+    #[test]
+    fn files_under_ignores_symlinks() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/a.txt"), b"ok").unwrap();
+        std::os::unix::fs::symlink(dir.path(), dir.path().join("sub/cycle")).unwrap();
+        std::os::unix::fs::symlink(
+            dir.path().join("sub/a.txt"),
+            dir.path().join("sub/link.txt"),
+        )
+        .unwrap();
+        let found = files_under(dir.path()).unwrap();
+        assert_eq!(found, vec![("sub/a.txt".to_string(), b"ok".to_vec())]);
     }
 }

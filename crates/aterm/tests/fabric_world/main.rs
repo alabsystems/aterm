@@ -18,6 +18,7 @@ aterm_durable::plain_durable_flushes_in_tests!();
 mod harness;
 mod harness_tests;
 
+mod at_rest;
 mod bridge_e2e;
 mod bridge_line_bound;
 mod bridge_oversize;

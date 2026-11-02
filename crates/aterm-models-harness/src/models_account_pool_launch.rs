@@ -22,6 +22,7 @@ pub fn account_pool_launch_model() -> Model {
             action NoLocalLogin when (phase == 0) { phase = 1; case = 8; }
             action InvalidPin when (phase == 0) { phase = 1; case = 9; }
             action UsageWriteFails when (phase == 0) { phase = 1; case = 10; }
+            action HeldDefault when (phase == 0) { phase = 1; case = 11; }
             action Choose when (phase == 1) {
                 phase = 2;
                 outcome = if case == 1 { if Buggy == 4 {2} else {0} }
@@ -33,6 +34,7 @@ pub fn account_pool_launch_model() -> Model {
                         || (case == 8 && Buggy == 7)
                         || (case == 9 && Buggy == 8) {0}
                     else if case == 10 && Buggy == 9 {1}
+                    else if case == 11 && Buggy == 10 {0}
                     else {2};
             }
             invariant UnmanagedPreserved: phase <= 1 || case > 1 || outcome == 0;
@@ -41,7 +43,8 @@ pub fn account_pool_launch_model() -> Model {
             invariant ExhaustedHeld: phase <= 1 || (case <= 4 || case > 5) && (case <= 7 || case > 8) || outcome == 2;
             invariant DriftHeld: phase <= 1 || case <= 5 || case > 6 || outcome == 2;
             invariant InvalidPinHeld: phase <= 1 || case <= 8 || case > 9 || outcome == 2;
-            invariant FreshUsageRecorded: phase <= 1 || case <= 9 || outcome == 2;
+            invariant FreshUsageRecorded: phase <= 1 || case <= 9 || case > 10 || outcome == 2;
+            invariant HeldDefaultRefused: phase <= 1 || case <= 10 || outcome == 2;
         }
     }
 }

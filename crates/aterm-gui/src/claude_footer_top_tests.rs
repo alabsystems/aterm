@@ -35,19 +35,16 @@ const TURNING_OFF: SwitchPaint = SwitchPaint::bare(
 
 const CELL: (u16, u16) = (7, 14);
 
-const MARKED: [aterm_phase::Program; 4] = [
+const MARKED: [aterm_phase::Program; 3] = [
     aterm_phase::Program::Claude,
     aterm_phase::Program::Agy,
     aterm_phase::Program::Muse,
-    aterm_phase::Program::Codex,
 ];
 
-const LOCKUPS: [(aterm_phase::Program, Build); 5] = [
+const LOCKUPS: [(aterm_phase::Program, Build); 3] = [
     (aterm_phase::Program::Claude, Build::Vendor),
     (aterm_phase::Program::Agy, Build::Vendor),
     (aterm_phase::Program::Muse, Build::Vendor),
-    (aterm_phase::Program::Codex, Build::Vendor),
-    (aterm_phase::Program::Codex, Build::Alab),
 ];
 
 fn screen_with(cols: usize, top: &str) -> String {
@@ -159,7 +156,6 @@ fn key_for(
     TopKey {
         frame_row: 30,
         term_row: 20,
-        line: TopLine::Rule,
         run,
         program,
         build: Build::Vendor,
@@ -172,7 +168,6 @@ fn key_for(
         clip: aterm_core::render::PxRect::EVERYWHERE,
         mark_hover: false,
         title_gen: 0,
-        chip: TopChip::NONE,
     }
 }
 
@@ -254,7 +249,7 @@ fn a_wide_name_moves_with_the_tag() {
             cols,
         };
         let blank = scratch.implicit_blank;
-        let run = read_top_run(scratch, region, 20, TopLine::Rule, blank, false).expect("the rule");
+        let run = read_top_run(scratch, region, 20, blank, false).expect("the rule");
         let zone = run.tail.expect("Claude's label zone");
         assert_eq!(zone.plain, plain, "{name:?}: plain");
         let row = scratch.cells[region.strip + 20].clone();
@@ -335,8 +330,7 @@ fn the_harness_lays_from_the_rules_right_end() {
             let before = scratch.cells[region.strip + 20].clone();
             for program in MARKED {
                 let muse = program == Program::Muse;
-                let Some(run) = read_top_run(scratch, region, 20, TopLine::Rule, blank, muse)
-                else {
+                let Some(run) = read_top_run(scratch, region, 20, blank, muse) else {
                     continue;
                 };
                 assert!(
@@ -472,7 +466,7 @@ fn the_harness_lays_from_the_rules_right_end() {
                 }
             }
             if what == "plain"
-                && let Some(run) = read_top_run(scratch, region, 20, TopLine::Rule, blank, false)
+                && let Some(run) = read_top_run(scratch, region, 20, blank, false)
             {
                 let key = |len| TopKey {
                     frame_row: region.strip + 20,
@@ -1000,27 +994,6 @@ fn the_lockup_stands_two_rule_cells_in() {
         "full and icon rungs laid: {laid:?}"
     );
     assert_eq!(controls, LOCKUPS.len() * 5, "a control a lockup and state");
-    let alab = CliMark::Codex.lockup_cells(Build::Alab);
-    let broken: Vec<usize> = (0..=200)
-        .filter(|&len| {
-            let top = composed_as(
-                (aterm_phase::Program::Codex, Build::Vendor),
-                plain_run(len),
-                Some(LIT),
-                None,
-                KeyFace::default(),
-            );
-            let Some(s) = top.switch else {
-                return false;
-            };
-            top.lockup.end - top.lockup.start == CliMark::Codex.lockup_cells(Build::Vendor)
-                && s.cols.end - SWITCH_SLOT < top.lockup.start + alab + RULE_MIN
-        })
-        .collect();
-    assert!(
-        broken.len() > 5,
-        "CONTROL: the vendor's ladder crowds codex-alab's name: {broken:?}"
-    );
 }
 
 /// A rung as spec §1's table names it.
@@ -1315,7 +1288,6 @@ fn a_switch_stands_wherever_it_stood() {
         (aterm_phase::Program::Claude, Build::Vendor),
         (aterm_phase::Program::Agy, Build::Vendor),
         (aterm_phase::Program::Muse, Build::Vendor),
-        (aterm_phase::Program::Codex, Build::Alab),
     ] {
         let mark = cli_mark(program).expect("a mark");
         for paint in [LIT, OFF, MASTER_OFF, TURNING, TURNING_OFF] {
@@ -2235,7 +2207,7 @@ fn marks_write_only_the_run() {
             );
             let blank = scratch.implicit_blank;
             let muse = program == Program::Muse;
-            let Some(run) = read_top_run(scratch, region, 20, TopLine::Rule, blank, muse) else {
+            let Some(run) = read_top_run(scratch, region, 20, blank, muse) else {
                 continue;
             };
             let tail: &[RenderCell] = run
@@ -3533,14 +3505,14 @@ fn the_labels_hover_says_only_what_it_leaves_out() {
     let full = SwitchPaint {
         hover: HoverAt::Label,
         cli_ver: Inline::new(&full_version),
-        ..SwitchPaint::bare(HarnessSwitch::On, Some(aterm_phase::CliHarness::CodexAlab))
+        ..SwitchPaint::bare(HarnessSwitch::On, Some(aterm_phase::CliHarness::ClaudeCode))
     };
     let (shown, _) = slot(&compose(full, 250));
     assert_eq!(
         shown.trim_start(),
         format!(
-            "alab codex harness v{} (v{full_version})",
-            aterm_phase::CliHarness::CodexAlab.version_str()
+            "alab claude harness v{} (v{full_version})",
+            aterm_phase::CliHarness::ClaudeCode.version_str()
         )
     );
     let overflow = SlotWords(vec![vec![("x".repeat(LABEL_MAX + 1), LabelInk::Muted)]], 0);

@@ -29,6 +29,13 @@ pub(crate) struct InputMark {
         aterm_session::SessionId,
         Arc<crate::typed_by::Caller>,
     )>,
+    /// Same-request custody through the actual ordered writer, not merely GUI queue admission.
+    supervisor: Option<Arc<crate::session_timeline::SupervisorInputBatch>>,
+    supervisor_work: Option<Arc<crate::session_timeline::SupervisorInputWork>>,
+    /// A fixed native continuation, admitted by its constructor rather than a typing scope.
+    /// Clones retain the same custody through Wake, actual writes and exact kernel drain.
+    native: Option<Arc<crate::native_act::NativeInput>>,
+    native_work: Option<Arc<crate::native_act::NativeInputWork>>,
 }
 
 impl std::fmt::Debug for InputMark {
@@ -68,6 +75,10 @@ impl InputMark {
             admission,
             accepted: Arc::new(AtomicBool::new(false)),
             typist: None,
+            supervisor: None,
+            supervisor_work: None,
+            native: crate::native_act::carried_custody(ctx),
+            native_work: None,
         }
     }
 
@@ -93,12 +104,64 @@ impl InputMark {
         self
     }
 
+    pub(crate) fn supervised(
+        mut self,
+        batch: Option<Arc<crate::session_timeline::SupervisorInputBatch>>,
+    ) -> Self {
+        if !self
+            .supervisor
+            .as_ref()
+            .zip(batch.as_ref())
+            .is_some_and(|(old, new)| Arc::ptr_eq(old, new))
+        {
+            self.supervisor_work = None;
+        }
+        self.supervisor = batch;
+        self
+    }
+
+    pub(crate) fn pending_supervisor(mut self) -> Self {
+        if self.supervisor_work.is_none() {
+            self.supervisor_work = self.supervisor.as_ref().and_then(|batch| batch.reserve());
+        }
+        if self.native_work.is_none() {
+            self.native_work = self.native.as_ref().and_then(|native| native.reserve());
+        }
+        self
+    }
+
+    pub(crate) fn supervisor_queue_ready(&self) -> bool {
+        (self.supervisor.is_none() || self.supervisor_work.is_some())
+            && (self.native.is_none() || self.native_work.is_some())
+    }
+
+    pub(crate) fn supervisor_producer(
+        &self,
+    ) -> Option<crate::session_timeline::SupervisorInputProducer> {
+        self.supervisor.as_ref().map(|batch| batch.producer())
+    }
+
+    pub(crate) fn seal_supervisor_input(&self) {
+        if let Some(batch) = &self.supervisor {
+            batch.seal();
+        }
+        if let Some(native) = &self.native {
+            native.seal();
+        }
+    }
+
+    pub(crate) fn native_producer(&self) -> Option<crate::native_act::NativeInputProducer> {
+        self.native.as_ref().map(|native| native.producer())
+    }
+
     pub(crate) const fn targets(&self, session: u64) -> bool {
         self.session == session
     }
 
     pub(crate) fn completion(&self) -> InputCompletion {
-        InputCompletion { mark: self.clone() }
+        InputCompletion {
+            mark: self.clone().pending_supervisor(),
+        }
     }
 }
 
@@ -108,6 +171,44 @@ pub(crate) struct InputCompletion {
 }
 
 impl InputCompletion {
+    fn start_native(&self, nonparking: bool) -> bool {
+        if !self
+            .mark
+            .native
+            .as_ref()
+            .is_none_or(|native| native.start(nonparking))
+        {
+            return false;
+        }
+        if let Some(work) = &self.mark.native_work {
+            work.attempted();
+        }
+        true
+    }
+    pub(crate) fn is_supervised(&self) -> bool {
+        self.mark.supervisor.is_some() || self.mark.native.is_some()
+    }
+
+    pub(crate) fn start_supervised(&self) -> bool {
+        self.mark.supervisor_queue_ready()
+            && self.start_native(false)
+            && self
+                .mark
+                .supervisor
+                .as_ref()
+                .is_none_or(|batch| batch.start())
+    }
+
+    pub(crate) fn start_supervised_inline(&self) -> bool {
+        self.mark.supervisor_queue_ready()
+            && self.start_native(true)
+            && self
+                .mark
+                .supervisor
+                .as_ref()
+                .is_none_or(|batch| batch.start_inline())
+    }
+
     pub(crate) fn matches(&self, session: u64, ctx: &SessionCtx) -> bool {
         self.mark.targets(session)
             && Weak::ptr_eq(&self.mark.timeline, &Arc::downgrade(&ctx.timeline))
@@ -119,6 +220,9 @@ impl InputCompletion {
 
     /// Called only after the source-blind seam and echo publication have returned.
     pub(crate) fn finish(self, receipt: EgressReceipt) {
+        if let Some(work) = &self.mark.native_work {
+            work.finish(receipt.accepted_order().is_some());
+        }
         if !receipt.fully_accepted_nonempty() {
             return;
         }

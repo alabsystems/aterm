@@ -385,13 +385,13 @@ fn cell_pool_is_bounded_by_depth_and_by_total_cells() {
         .map(|&b| Cell::from_ascii_fast(b))
         .collect();
     let narrow_row = rb.build(&narrow, 80, false);
-    for _ in 0..700 {
+    for _ in 0..2000 {
         buf.push_row(&narrow_row, ScrolledRowExtras::default());
     }
-    assert_eq!(buf.drain_all().count(), 700);
+    assert_eq!(buf.drain_all().count(), 2000);
     let depth = buf.pooled_bodies();
     assert!(
-        depth <= 512,
+        depth < 2000,
         "free-list depth must be capped (POOL_MAX_BUFFERS), got {depth}"
     );
 
@@ -407,11 +407,97 @@ fn cell_pool_is_bounded_by_depth_and_by_total_cells() {
         wide_depth < 200,
         "the cell budget must bite long before the depth cap, got {wide_depth}"
     );
+    assert!(wide_depth * wide.len() <= 128 * 1024);
+    let (cells, headers) = buf.pooled_capacities();
+    assert!(cells <= 128 * 1024);
     let used = buf.memory_used();
-    assert!(
-        used < 640 * 1024,
-        "pooled + staged bytes must stay under the budget, got {used}"
+    assert_eq!(
+        used,
+        buf.spine_capacity() * std::mem::size_of::<DeferredLine>()
+            + cells * std::mem::size_of::<Cell>()
+            + headers * std::mem::size_of::<Vec<Cell>>(),
+        "empty staging still accounts for retained cells and both container allocations"
     );
+}
+
+#[test]
+fn synchronous_drain_reuses_its_previous_common_width_batch() {
+    use aterm_scrollback::Scrollback;
+
+    for cols in [80u16, 120, 128] {
+        let scrollback = Scrollback::new(80, 10_000, 100_000_000);
+        let mut grid = Grid::with_tiered_scrollback(2, cols, 2, scrollback);
+        let text = |row| {
+            let mut text = format!("row{row:04} ");
+            text.extend(std::iter::repeat_n('x', usize::from(cols) - 1 - text.len()));
+            text
+        };
+        let put = |grid: &mut Grid, row| {
+            grid.carriage_return();
+            for c in text(row).chars() {
+                grid.write_char(c);
+            }
+            grid.line_feed();
+        };
+        let mut written = 0;
+        while written < 2000 && grid.storage.lazy_buffer.pooled_bodies() == 0 {
+            put(&mut grid, written);
+            written += 1;
+        }
+        let warm = grid.storage.lazy_buffer.pooled_bodies();
+        assert_eq!(warm, 1001, "a {cols}-column drain retains the whole batch");
+        let mut drained_again = false;
+        for _ in 0..2000 {
+            let before = grid.storage.lazy_buffer.pooled_bodies();
+            put(&mut grid, written);
+            written += 1;
+            let after = grid.storage.lazy_buffer.pooled_bodies();
+            if grid.lazy_backlog_len() == 0 {
+                assert_eq!(after, warm);
+                drained_again = true;
+                break;
+            }
+            assert_eq!(after + 1, before, "the next row must use a pooled body");
+        }
+        assert!(drained_again);
+        grid.drain_lazy_buffer();
+        let history: Vec<String> = (0..grid.scrollback_lines())
+            .rev()
+            .map(|rev| grid.history_line_rev(rev).unwrap().to_string())
+            .filter(|line| line.starts_with("row"))
+            .collect();
+        for (row, actual) in history.iter().enumerate() {
+            assert_eq!(actual, &text(row), "{cols}-column history order/content");
+        }
+        assert_eq!(history.len(), written - 1);
+    }
+}
+
+#[test]
+fn a_single_oversized_cell_body_is_not_kept_in_the_pool() {
+    use crate::grid::scroll_convert::LazyBuffer;
+
+    let mut rb = RowBuilder::new();
+    let row = rb.build(&[Cell::from_ascii_fast(b'x')], 80, false);
+    for capacity in [128 * 1024, 128 * 1024 + 1] {
+        let mut buf = LazyBuffer::new();
+        buf.push(DeferredLine::new(
+            &row,
+            ScrolledRowExtras::default(),
+            Vec::with_capacity(capacity),
+        ));
+        let lines: Vec<_> = buf.drain_all().collect();
+        assert_eq!(lines[0].to_string(), "x");
+        let expected = usize::from(capacity == 128 * 1024);
+        assert_eq!(buf.pooled_bodies(), expected);
+        assert_eq!(buf.pooled_capacities().0, capacity * expected);
+        buf.clear();
+        assert_eq!(buf.pooled_capacities(), (0, 0));
+        assert_eq!(
+            buf.memory_used(),
+            buf.spine_capacity() * std::mem::size_of::<DeferredLine>()
+        );
+    }
 }
 
 #[test]

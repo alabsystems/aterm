@@ -520,7 +520,7 @@ fn plain_claude_login_refuses_stale_policy_and_binding_for_every_auth_outcome() 
                                     logins,
                                     "work",
                                     original_dir.to_str(),
-                                    "/concurrent-login",
+                                    at!("/concurrent-login"),
                                     None,
                                     env.now,
                                 ))
@@ -776,6 +776,7 @@ fn codex_recovery_requires_scoped_identity_and_a_status_check() {
             &store,
             &path,
             env.now,
+            crate::harness::accounts_sync::shared_renewal::CheckpointAuthority::Unavailable,
         );
         assert_eq!(
             recovered,
@@ -992,6 +993,7 @@ fn publication_case(
         cli,
         &store,
         SignInPolicy {
+            host: &LiveAccounts,
             row,
             logins: &records.logins,
             roster_path: &path,

@@ -357,6 +357,9 @@ fn pmset_and_swapusage_read_as_this_host_prints_them() {
         parse_swap_used("total = 0.00M  used = 0.00M  free = 0.00M"),
         Some(0.0)
     );
+    assert_eq!(parse_swap_used("used = 10µ"), None);
+    assert_eq!(parse_swap_used("used = NaNM"), None);
+    assert_eq!(parse_swap_used("used = -1.0M"), None);
 }
 
 #[test]

@@ -13,6 +13,7 @@
 
 use super::fixed::{F2Dot14, Fixed, Point};
 use super::glyf::{PointFlags, PointMarker};
+use crate::work::VariationWork;
 
 /// A read past the end of the data, or data that cannot be what it claims.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -185,12 +186,15 @@ impl<'a> Gvar<'a> {
         GlyphVariationData::new(data, axis_count, shared_tuples).map(Some)
     }
 
-    /// Deltas of the four phantom points (`[left, right, top, bottom]`) at `coords`.
+    /// Deltas of the four phantom points (`[left, right, top, bottom]`) at `coords`,
+    /// charged to `work` a step per tuple header and, for each tuple that applies,
+    /// a step per point up to the phantom points.
     pub(crate) fn phantom_point_deltas(
         &self,
         glyf: &super::glyf::Glyf<'a>,
         coords: &[F2Dot14],
         glyph_id: u16,
+        work: &mut VariationWork,
     ) -> Result<Option<[Point<Fixed>; 4]>, ReadError> {
         let (glyph_id, point_count) = find_glyph_and_point_count(glyf, glyph_id, 0)?;
         let mut phantom_deltas = [Point::default(); 4];
@@ -198,8 +202,11 @@ impl<'a> Gvar<'a> {
         let Some(var_data) = self.glyph_variation_data(glyph_id)? else {
             return Ok(None);
         };
+        work.take(usize::from(var_data.tuple_count()))
+            .ok_or(ReadError)?;
         for (tuple, scalar) in var_data.active_tuples_at(coords) {
-            for tuple_delta in tuple.deltas() {
+            work.take(phantom_range.end).ok_or(ReadError)?;
+            for tuple_delta in tuple.deltas(phantom_range.end) {
                 let ix = tuple_delta.position as usize;
                 if phantom_range.contains(&ix) {
                     phantom_deltas[ix - phantom_range.start] += tuple_delta.apply_scalar(scalar);
@@ -283,6 +290,12 @@ impl<'a> GlyphVariationData<'a> {
             header_data,
             serialized_data,
         })
+    }
+
+    /// How many tuples the store holds, active or not: [`Self::active_tuples_at`]
+    /// reads every one's header.
+    pub(crate) fn tuple_count(&self) -> u16 {
+        self.tuple_count
     }
 
     /// The (tuple, scalar) pairs active at `coords`.
@@ -565,8 +578,24 @@ impl<'a> TupleVariation<'a> {
         }
     }
 
-    /// Explicitly encoded unscaled deltas.
-    pub(crate) fn deltas(&self) -> TupleDeltaIter<'a> {
+    /// How many point numbers the tuple names: 0 when it has a delta for every point.
+    pub(crate) fn point_count(&self) -> usize {
+        let numbers = if self.header.tuple_index() & PRIVATE_POINT_NUMBERS != 0 {
+            PackedPointNumbers {
+                data: self.serialized_data,
+            }
+        } else {
+            self.shared_point_numbers.unwrap_or_default()
+        };
+        usize::from(numbers.count())
+    }
+
+    /// Explicitly encoded unscaled deltas of the points (or components) before `limit`.
+    ///
+    /// The walk finds each numbered point by counting up to it, so it stops at
+    /// `limit`, which every caller ignores the deltas past: a tuple naming point
+    /// 65,534 of an empty glyph would otherwise count 65,534 steps for nothing.
+    pub(crate) fn deltas(&self, limit: usize) -> TupleDeltaIter<'a> {
         let (point_numbers, packed_deltas) = self.point_numbers_and_packed_deltas();
         let count = usize::from(point_numbers.count());
         let packed_deltas = if count == 0 {
@@ -580,7 +609,7 @@ impl<'a> TupleVariation<'a> {
                 count: Some(count * 2),
             }
         };
-        TupleDeltaIter::new(&point_numbers, packed_deltas)
+        TupleDeltaIter::new(&point_numbers, packed_deltas, limit)
     }
 
     fn point_numbers_and_packed_deltas(&self) -> (PackedPointNumbers<'a>, &'a [u8]) {
@@ -1009,6 +1038,8 @@ impl Iterator for DeltaRunIter<'_> {
 #[derive(Clone, Debug)]
 pub(crate) struct TupleDeltaIter<'a> {
     cur: usize,
+    /// The position the walk ends at.
+    limit: usize,
     points: Option<PackedPointNumbersIter<'a>>,
     next_point: usize,
     x: DeltaRunIter<'a>,
@@ -1016,11 +1047,16 @@ pub(crate) struct TupleDeltaIter<'a> {
 }
 
 impl<'a> TupleDeltaIter<'a> {
-    fn new(points: &PackedPointNumbers<'a>, deltas: PackedDeltas<'a>) -> TupleDeltaIter<'a> {
+    fn new(
+        points: &PackedPointNumbers<'a>,
+        deltas: PackedDeltas<'a>,
+        limit: usize,
+    ) -> TupleDeltaIter<'a> {
         let mut points = points.iter();
         let next_point = points.next();
         TupleDeltaIter {
             cur: 0,
+            limit,
             points: next_point.map(|_| points),
             next_point: usize::from(next_point.unwrap_or_default()),
             x: deltas.x_deltas(),
@@ -1034,6 +1070,10 @@ impl Iterator for TupleDeltaIter<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let (position, dx, dy) = loop {
+            // Each turn moves `cur` on by one, so a walk takes `limit` turns at most.
+            if self.cur >= self.limit {
+                return None;
+            }
             let position = if let Some(points) = &mut self.points {
                 if self.cur > self.next_point {
                     self.next_point = usize::from(points.next()?);
@@ -1173,6 +1213,35 @@ mod tests {
         let _ = iter.count();
     }
 
+    /// A walk ends at its limit, not at the tuple's highest point number:
+    /// the phantom points of an empty glyph whose tuple names point 65,534
+    /// are four turns away, not 65,535.
+    #[test]
+    fn a_delta_walk_stops_at_its_limit() {
+        // One private point number, 65,534 (a run of one word), then its
+        // deltas, (+5, +5).
+        let data = [0x01, 0x80, 0xFF, 0xFE, 0x00, 5, 0x00, 5];
+        let tuple = TupleVariation {
+            header: TupleVariationHeader {
+                data: &[0, 8, 0xA0, 0x00, 0, 0],
+                axis_count: 1,
+            },
+            serialized_data: &data,
+            shared_point_numbers: None,
+        };
+        let mut walk = tuple.deltas(4);
+        assert_eq!(walk.next(), None);
+        assert_eq!(walk.cur, 4);
+        assert_eq!(
+            tuple.deltas(usize::MAX).collect::<Vec<_>>(),
+            [GlyphDelta {
+                position: 65_534,
+                x_delta: 5,
+                y_delta: 5
+            }]
+        );
+    }
+
     #[test]
     fn accumulate_dense_and_sparse() {
         let header = [0, 0, 0x80, 0x00, 0x40, 0x00];
@@ -1222,7 +1291,7 @@ mod tests {
             .map(|f| f.has_marker(PointMarker::HAS_DELTA))
             .collect();
         assert_eq!(marked, [false, true, false, true]);
-        let explicit: Vec<_> = tuple.deltas().collect();
+        let explicit: Vec<_> = tuple.deltas(4).collect();
         assert_eq!(
             explicit,
             [

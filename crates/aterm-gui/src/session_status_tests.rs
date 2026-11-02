@@ -226,7 +226,7 @@ fn the_sweep_asks_for_a_released_codex_tabs_rollout_while_its_process_fronts_it(
     let wake = crate::claude_footer::LogWake::default();
     let now = Instant::now();
     let mut sweep = |program, pgid, at| {
-        observer.request_rollout_if_due(SESSION, ctx, Some(program), pgid, at, &wake);
+        observer.request_rollout_if_due(SESSION, ctx, Some(program), pgid, (at, None), &wake);
         observer.rollout_asked.contains_key(&SESSION)
     };
     assert!(!sweep("codex", group + 1, now), "another group in front");
@@ -1293,9 +1293,9 @@ fn the_status_record_and_the_roster_carry_land_at_and_task() {
     let record = status(&app);
     assert!(
         record.contains(
-            " flaps=0 land_at=- task=- pause=- land_held=- land_nudges=- land_since=- held=- waiting=- end=- end_seen=- \
+            " flaps=0 land_at=- task=- pause=- land_held=- land_nudges=- land_since=- held=- waiting=- land_asked=- landed_head=- landed_on=- landed_leg=- landed_repo=- end=- end_seen=- \
              end_cheered=- goal=- task_state=- task_rev=0 log_seq=1 log_ep=1 log_base=1 run=- \
-             turn=- step=- need=- need_since_ms=- rollout=- rollout_asks=0 editing=0 editor=- bells=0 bells_sounded=0 last_bell=- gen="
+             turn=- step=- need=- need_since_ms=- rollout=- rollout_asks=0 log_journal=off log_journal_why=- exec_watch=none exec_watch_why=- editing=0 editor=- bells=0 bells_sounded=0 last_bell=- gen="
         ),
         "{record}"
     );
@@ -1448,7 +1448,7 @@ fn the_status_record_and_the_roster_carry_the_pause_after_task() {
     let record = status(&app);
     assert!(
         record.contains(&format!(
-            " task=- pause={AT} land_held=- land_nudges=- land_since=- held=- waiting=- end=- end_seen=- end_cheered=- \
+            " task=- pause={AT} land_held=- land_nudges=- land_since=- held=- waiting=- land_asked=- landed_head=- landed_on=- landed_leg=- landed_repo=- end=- end_seen=- end_cheered=- \
              goal=- task_state=- task_rev=0 log_seq="
         )),
         "{record}"
@@ -1491,13 +1491,81 @@ fn the_status_record_and_the_roster_carry_the_pause_after_task() {
     );
 }
 
+/// A proven contract v3 claim's versions ride `status` right after `supervisor_proven=`
+/// (`docs/DESIGN-harness-repos-2026-10-24.md` §11 D48); a proven claim that named none shows `-`
+/// for both, as an unclaimed tab does (the controls).
+#[test]
+fn the_status_record_carries_a_scoped_claims_versions() {
+    let app = crate::App::headless_for_test();
+    let ctx = app.pool.get(0).expect("live session").ctx.clone();
+    let holder = "grok-alab@4242";
+    for (words, want) in [
+        (
+            &[
+                "contract=3",
+                "scope=relaunch",
+                "version=0.3.0",
+                "vendor=1.0.70",
+            ][..],
+            " supervisor_proven=1 supervisor_version=0.3.0 supervisor_vendor=1.0.70 supervisor_act=- \
+             autopilot=",
+        ),
+        (
+            &["contract=3", "scope=relaunch"][..],
+            " supervisor_proven=1 supervisor_version=- supervisor_vendor=- supervisor_act=- autopilot=",
+        ),
+    ] {
+        let aterm_agent::harness::contract::Words::Scoped(claim) =
+            aterm_agent::harness::contract::read(holder, words)
+        else {
+            panic!("grok-alab's claim reads as a scoped claim: {words:?}");
+        };
+        ctx.meta.lock().unwrap().supervisor = Some(crate::session_timeline::SupervisorClaim {
+            holder: holder.to_string(),
+            conn: Some(1),
+            expires_us: None,
+            proven: None,
+            scoped: Some(crate::harness_claim::Scoped {
+                proven: crate::self_claim::Proven {
+                    pid: 4242,
+                    start: "stand-in".to_string(),
+                },
+                claim,
+            }),
+        });
+        let record = app.session_status_record(0).expect("live session");
+        assert!(record.contains(want), "{want}: {record}");
+        assert!(
+            record.contains(
+                " supervisor_contract=3 supervisor_scope=relaunch supervisor_revision=0 "
+            ),
+            "{record}"
+        );
+    }
+    ctx.meta.lock().unwrap().supervisor = None;
+    let record = app.session_status_record(0).expect("live session");
+    assert!(
+        record.contains(" supervisor_contract=- supervisor_scope=- supervisor_revision=0 "),
+        "{record}"
+    );
+    assert!(
+        record.contains(
+            " supervisor=- supervisor_proven=0 supervisor_version=- supervisor_vendor=- "
+        ),
+        "{record}"
+    );
+}
+
 #[test]
 fn the_status_record_carries_the_effective_autopilot_beside_supervisor() {
     let mut app = crate::App::headless_for_test();
     let field = |app: &crate::App| {
         let record = app.session_status_record(0).expect("live session");
         assert!(
-            record.contains(" supervisor=- supervisor_proven=0 autopilot="),
+            record.contains(
+                " supervisor=- supervisor_proven=0 supervisor_version=- supervisor_vendor=- \
+                 supervisor_act="
+            ),
             "{record}"
         );
         record
@@ -1514,6 +1582,25 @@ fn the_status_record_carries_the_effective_autopilot_beside_supervisor() {
         tl.set_program(7, Some("claude".into()));
     }
     assert_eq!(field(&app), "off", "an agent no host supervises");
+    // `supervisor_act=` beside it: `-` before an agent and before the host reads its image, then
+    // what the host's read kept.
+    let act = |app: &crate::App| {
+        let record = app.session_status_record(0).expect("live session");
+        record
+            .split_whitespace()
+            .find_map(|t| t.strip_prefix("supervisor_act="))
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(act(&app), "-", "an agent whose image no read has judged");
+    let sid = app.pool.get(0).unwrap().ctx.self_id.as_str().to_string();
+    for (kept, word) in [
+        (aterm_agent::harness::agent_image::Act::On, "on"),
+        (aterm_agent::harness::agent_image::Act::Observe, "observe"),
+    ] {
+        crate::agent_act::keep_for_test(&sid, aterm_phase::Program::Claude, 7, kept);
+        assert_eq!(act(&app), word, "{kept:?}");
+    }
     let host = crate::harness_host::HostHandle::for_supervised_test(
         Vec::new(),
         Arc::new(|_| crate::harness_host::BodyEnd::Stopped),
@@ -1534,7 +1621,10 @@ fn the_status_record_carries_the_effective_autopilot_beside_supervisor() {
     };
     assert!(observed.contains(" observed=true "), "{observed}");
     assert!(
-        observed.contains(" supervisor=- supervisor_proven=0 autopilot=land human_ms="),
+        observed.contains(
+            " supervisor=- supervisor_proven=0 supervisor_version=- supervisor_vendor=- \
+             supervisor_act=observe autopilot=land human_ms="
+        ),
         "{observed}"
     );
     app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
@@ -1855,18 +1945,24 @@ fn the_status_record_keeps_one_field_set_on_both_arms_body() {
              hold_advisory fabric fabric_rtt_ms fabric_link_age_ms fleet units setup hand hand_pid \
              level story why \
              needs needs_n needs_told hold_by typed_by typed_ms path program agent agent_detail agent_rev \
-             agent_since_ms agent_gen agent_fp program_state program_state_ms \
+             agent_since_ms agent_gen agent_fp wait wait_gib wait_ahead program_state \
+             program_state_ms \
              last_act os_appearance theme_side reported_scheme scheme_from bg_dark \
              session_theme theme_origin{conpty} integration input input_bytes input_wait_ms fg_rss_mb \
              disk disk_free_mb disk_room_mb disk_age_ms job job_quiet_ms program_check syspolicyd \
              syspolicyd_workers syspolicyd_full_ms service_mem service_mem_top occupancy \
              occupancy_hold ready slots \
-             idle_ready_min waits waits_ready supervisor supervisor_proven autopilot \
-             human_ms human_seq launch launch_seq path_evidence copy upgrade history_lost \
+             idle_ready_min waits waits_ready supervisor_contract supervisor_scope \
+             supervisor_revision supervisor supervisor_proven supervisor_version \
+             supervisor_vendor supervisor_act autopilot \
+             human_ms human_typed_ms human_seq launch launch_seq path_evidence copy upgrade \
+             history_lost \
              journal journal_off integration_rev born render \
-             resizes flaps land_at task pause land_held land_nudges land_since held waiting end \
+             resizes flaps land_at task pause land_held land_nudges land_since held waiting \
+             land_asked landed_head landed_on landed_leg landed_repo end \
              end_seen end_cheered goal task_state task_rev \
-             log_seq log_ep log_base run turn step need need_since_ms rollout rollout_asks editing editor \
+             log_seq log_ep log_base run turn step need need_since_ms rollout rollout_asks \
+             log_journal log_journal_why exec_watch exec_watch_why editing editor \
              bells bells_sounded last_bell gen seq hash"
         ),
         "{observed}"
@@ -2958,7 +3054,7 @@ fn the_status_record_carries_the_task_record() {
     let none = app.session_status_record(0).expect("live session");
     assert!(
         none.contains(
-            " pause=- land_held=- land_nudges=- land_since=- held=- waiting=- end=- end_seen=- end_cheered=- \
+            " pause=- land_held=- land_nudges=- land_since=- held=- waiting=- land_asked=- landed_head=- landed_on=- landed_leg=- landed_repo=- end=- end_seen=- end_cheered=- \
              goal=- task_state=- task_rev=0 log_seq="
         ),
         "{none}"
@@ -2969,7 +3065,7 @@ fn the_status_record_carries_the_task_record() {
     let record = app.session_status_record(0).expect("live session");
     assert!(
         record.contains(
-            " task=- pause=- land_held=- land_nudges=- land_since=- held=- waiting=- end=- end_seen=- end_cheered=- \
+            " task=- pause=- land_held=- land_nudges=- land_since=- held=- waiting=- land_asked=- landed_head=- landed_on=- landed_leg=- landed_repo=- end=- end_seen=- end_cheered=- \
              goal=- task_state=done task_rev=2 log_seq="
         ),
         "{record}"
@@ -4872,4 +4968,97 @@ fn an_unended_block_ends_at_the_prompt_that_closed_it() {
             (1, BlockEnd::Running, Some("vim")),
         ]
     );
+}
+
+/// A BUILD'S FRONT WAITING FOR MEMORY READS AS ITS BUILD ON `status` AND THE SURVEY: while the
+/// resolver reads the leader in front as a front whose claim waits (12 GiB, 2 ahead), `status`
+/// says `program=targo … wait=memory wait_gib=12.0 wait_ahead=2` and the survey's row says the
+/// same; read again once admitted (the same group, the front exec'd into its build), both say
+/// `program=targo` and `wait=-`. NEGATIVE CONTROL: a plain build in front reads `wait=-` from
+/// the first.
+#[test]
+fn a_front_waiting_for_memory_reads_as_its_build_on_status_and_the_survey() {
+    use super::program::{BuildWait, LeaderFacts, ProgramResolver};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    const FRONT: i32 = i32::MAX - 31;
+    const PLAIN: i32 = i32::MAX - 32;
+    let field = |row: &str, key: &str| {
+        row.split(' ')
+            .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
+            .map(str::to_string)
+            .unwrap_or_default()
+    };
+    let admitted = Arc::new(AtomicBool::new(false));
+    let mut app = crate::App::headless_for_test();
+    app.session_factory.fg_probe = |master| master;
+    let flag = Arc::clone(&admitted);
+    app.session_status.programs = ProgramResolver::with_lookup(move |pgid, _shell| LeaderFacts {
+        program: matches!(pgid, FRONT | PLAIN).then(|| "targo".to_string()),
+        build_wait: (pgid == FRONT && !flag.load(Ordering::SeqCst)).then_some(BuildWait {
+            mem: Some(12 << 30),
+            ahead: Some(2),
+        }),
+        ..LeaderFacts::default()
+    });
+    let sid = app.next_session_id;
+    app.push_stub_tab(crate::WindowId(0), crate::stub_session(sid));
+    let timeline = Arc::clone(&app.pool.get(sid).expect("pooled").ctx.timeline);
+    let front = |app: &mut crate::App, group: i32| {
+        app.pool
+            .sessions
+            .get_mut(&sid)
+            .expect("pooled")
+            .session
+            .master = group;
+    };
+    let read = |app: &crate::App| {
+        let status = app.session_status_record(sid).expect("a record");
+        let here = crate::survey::Here {
+            host: None,
+            instances: 1,
+            drive: false,
+            facts: None,
+        };
+        let survey = crate::survey::survey_rows(
+            &app.store,
+            crate::survey::SurveyLevel::Facts,
+            usize::MAX,
+            &here,
+        );
+        let row = survey
+            .lines()
+            .find(|l| l.starts_with(&format!("session local={sid} ")))
+            .expect("the session's row")
+            .to_string();
+        [&status, &row].map(|r| {
+            ["program", "wait", "wait_gib", "wait_ahead"]
+                .map(|k| field(r, k))
+                .join(" ")
+        })
+    };
+    let settled = |app: &crate::App, want: &str| {
+        let got = aterm_spec::wait::within(
+            aterm_spec::wait::MUST_HAPPEN,
+            std::time::Duration::from_millis(1),
+            || (read(app) == [want, want]).then_some(()),
+        );
+        assert!(got.is_some(), "never read {want:?}: {:?}", read(app));
+    };
+    let t = std::time::Instant::now();
+    front(&mut app, PLAIN);
+    let _ = app.observe_session_statuses(t);
+    settled(&app, "targo - - -");
+    front(&mut app, FRONT);
+    let _ = app.observe_session_statuses(t + std::time::Duration::from_secs(1));
+    settled(&app, "targo memory 12.0 2");
+    admitted.store(true, Ordering::SeqCst);
+    app.session_status.request_program(
+        sid,
+        &timeline,
+        FRONT,
+        0,
+        t + std::time::Duration::from_secs(2),
+        None,
+    );
+    settled(&app, "targo - - -");
 }

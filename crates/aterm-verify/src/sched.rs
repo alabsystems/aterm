@@ -264,6 +264,7 @@ mod tests {
             exclusive,
             after_stages: Vec::new(),
             mem: 0,
+            part: None,
         }
     }
 
@@ -920,8 +921,37 @@ mod tests {
         *seed
     }
 
+    /// Plan `p` with its test compile shaped into `n` calls ([`crate::shape::Part`]), in its place
+    /// and lane, as [`crate::plan::plan`] plans one; `p` itself when it has none.
+    fn shaped(p: &[StageSpec], n: usize) -> Vec<StageSpec> {
+        p.iter()
+            .flat_map(|s| {
+                if s.id != StageId::TestCompile {
+                    return vec![s.clone()];
+                }
+                (0..n)
+                    .map(|index| StageSpec {
+                        title: format!("{}, call {} of {n}", s.title, index + 1),
+                        part: Some(crate::shape::Part {
+                            piece: crate::shape::Piece::of(&[format!("c{index}")], false),
+                            index,
+                            of: n,
+                            after: Vec::new(),
+                            said: String::new(),
+                            planned: None,
+                            refused: Vec::new(),
+                        }),
+                        ..s.clone()
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
     /// THE BUDGET'S LAWS ON SAMPLED PLANS: every plan a selection makes (each check alone, both
-    /// sets, every check at once, over three scopes) and the plan's shape, its stages claiming
+    /// sets, every check at once, over three scopes), each with its test compile shaped into two
+    /// and three calls too (VERIFY-SHAPE: each call its own stage in the main lane, its own
+    /// claim), and the plan's shape, its stages claiming
     /// twelve assignments of 0, 5, 15 and 30 GiB each (four rotations and eight drawn from a
     /// fixed seed: a sample, not every assignment), in budgets of 8, 21.5 and 44 GiB, finished in
     /// three orders, never deadlocks, never claims past the budget but for one stage alone
@@ -939,11 +969,19 @@ mod tests {
                 crate::Scope::changed("main", vec![], true),
             ] {
                 let p = crate::plan::plan(&ctx(&checks, scope));
-                if !shapes.contains(&p) {
-                    shapes.push(p);
+                for p in [shaped(&p, 2), shaped(&p, 3), p] {
+                    if !shapes.contains(&p) {
+                        shapes.push(p);
+                    }
                 }
             }
         }
+        assert!(
+            shapes
+                .iter()
+                .any(|p| p.iter().filter(|s| s.id == StageId::TestCompile).count() == 3),
+            "a test compile shaped into three calls is sampled"
+        );
         let mut seed = 0x2545_f491_u32;
         for shape in &shapes {
             let n = shape.len();

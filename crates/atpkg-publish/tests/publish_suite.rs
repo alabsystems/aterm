@@ -9,5 +9,7 @@ aterm_durable::plain_durable_flushes_in_tests!();
 
 mod artifact;
 mod channel;
+#[cfg(unix)]
+mod harness_local_guardian;
 mod lane;
 mod shared;

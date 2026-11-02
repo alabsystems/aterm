@@ -88,8 +88,8 @@ pub fn rerouted_entry(args: &[String]) -> ExitCode {
 
 /// Runs `abrew` on `args`.
 pub fn run(args: &[String], via_reroute: bool) -> ExitCode {
-    VIA_REROUTE.store(via_reroute, std::sync::atomic::Ordering::Relaxed);
-    #[cfg(unix)]
+    VIA_REROUTE.with(|cell| cell.set(via_reroute));
+    #[cfg(all(unix, not(test)))]
     {
         // Rust ignores SIGPIPE, which turns `abrew ... | head` into
         // a panic on EPIPE; restore the default disposition so the
@@ -188,13 +188,15 @@ pub(super) fn no_env_hints() -> bool {
     env_set("HOMEBREW_NO_ENV_HINTS")
 }
 
-/// Whether this process was entered through the `brew` reroute
-/// (`atpkg __abrew`, what the stub execs) rather than as `abrew`.
-/// A CLI process has exactly one entry mode; `run` records it.
-static VIA_REROUTE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    /// Whether this process was entered through the `brew` reroute
+    /// (`atpkg __abrew`, what the stub execs) rather than as `abrew`.
+    /// A CLI process has exactly one entry mode; `run` records it.
+    static VIA_REROUTE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 fn via_reroute() -> bool {
-    VIA_REROUTE.load(std::sync::atomic::Ordering::Relaxed)
+    VIA_REROUTE.with(std::cell::Cell::get)
 }
 
 /// The canonical command a help topic or argv0 names, resolving
@@ -351,9 +353,8 @@ fn named_arg_types(cmd: &str) -> String {
     let types: &[&str] = match cmd {
         "install" | "reinstall" | "fetch" | "cat" | "log" | "deps" | "info" | "home"
         | "homepage" | "missing" | "outdated" | "cleanup" => &["formula", "cask"],
-        "uninstall" | "remove" | "rm" | "link" | "ln" | "unlink" | "list" | "ls" | "upgrade" => {
-            &["installed formula", "installed cask"]
-        }
+        "uninstall" | "remove" | "rm" | "link" | "ln" | "unlink" | "list" | "ls" | "upgrade"
+        | "tab" | "migrate" => &["installed formula", "installed cask"],
         "search" | "-S" => &["text or regex"],
         "desc" => &["formula", "cask", "text or regex"],
         "uses" | "dependents" | "options" => &["formula"],
@@ -396,7 +397,11 @@ fn native_args(
             "test",
             "unpack",
         ];
-        if COMMANDS.contains(&cmd) || UNSUPPORTED_KNOWN.contains(&cmd) {
+        if COMMANDS.contains(&cmd)
+            || UNSUPPORTED_KNOWN.contains(&cmd)
+            || BREW_BUILTIN_COMMANDS.contains(&cmd)
+            || BREW_DEVELOPER_COMMANDS.contains(&cmd)
+        {
             InstallError::Unsupported(format!("'{cmd}' is not native"))
         } else {
             let dictionary: Vec<String> = command_names(true)
@@ -560,12 +565,44 @@ fn native_args(
             true,
         ),
         "missing" => (&[], 0, usize::MAX, true),
+        "migrate" => (
+            &[
+                "--force",
+                "-f",
+                "--dry-run",
+                "-n",
+                "--formula",
+                "--formulae",
+                "--cask",
+                "--casks",
+            ],
+            1,
+            usize::MAX,
+            true,
+        ),
         "zap" => (&["--force", "-f", "--cask", "--casks"], 1, usize::MAX, true),
+        "which-formula" => (&["--explain"], 0, usize::MAX, true),
         "cleanup" => (&["--dry-run", "-n", "-s", "--scrub"], 0, usize::MAX, true),
         "autoremove" => (&["--dry-run", "-n"], 0, 0, true),
+        // Brew's docs declares no named args but ignores any given.
+        "docs" => (&[], 0, usize::MAX, false),
+        "source" => (&[], 0, usize::MAX, true),
         "pin" | "unpin" => (
             &["--formula", "--formulae", "--cask", "--casks"],
             0,
+            usize::MAX,
+            true,
+        ),
+        "tab" => (
+            &[
+                "--installed-on-request",
+                "--no-installed-on-request",
+                "--formula",
+                "--formulae",
+                "--cask",
+                "--casks",
+            ],
+            1,
             usize::MAX,
             true,
         ),
@@ -746,6 +783,15 @@ fn native_args(
     if names && !ops.iter().all(valid_package_name) {
         return Err(unsupported());
     }
+    if cmd == "tab"
+        && has_flag(rest, "--installed-on-request", "")
+        && has_flag(rest, "--no-installed-on-request", "")
+    {
+        return Err(InstallError::Failed(
+            "Error: Invalid usage: Options --installed-on-request and --no-installed-on-request are mutually exclusive."
+                .to_string(),
+        ));
+    }
     if ops.len() < min {
         return Err(InstallError::Failed(format!(
             "Error: Invalid usage: This command requires {} {} {} {}.",
@@ -823,7 +869,7 @@ fn native_args(
             }
             "info" | "outdated" | "uses" | "dependents" | "home" | "homepage" | "cat" | "deps"
             | "pin" | "unpin" | "uninstall" | "remove" | "rm" | "fetch" | "link" | "ln"
-            | "unlink" | "log" | "--cache" => {
+            | "unlink" | "log" | "tab" | "migrate" | "--cache" => {
                 Some("Error: Invalid usage: Options --formula and --cask are mutually exclusive.")
             }
             "desc" | "search" | "-S" | "list" | "ls" => None,
@@ -1071,7 +1117,23 @@ fn prelock_admission(
                 Err(_) => continue,
             }
         } else {
-            install::preflight_plan(api, prefix, name, &opts)
+            // A plain install of an outdated, linked formula is
+            // brew's install-upgrade: admit its replacement here
+            // the way the command will run it.
+            let name_opts = if args.first().is_some_and(|a| a == "install")
+                && !opts.force
+                && !env_set("HOMEBREW_NO_INSTALL_UPGRADE")
+                && !prefix.is_pinned(Formula::short_name(name))
+                && outdated_linked_formula(prefix, api, name).is_some()
+            {
+                install::InstallOpts {
+                    upgrade: true,
+                    ..opts
+                }
+            } else {
+                opts
+            };
+            install::preflight_plan(api, prefix, name, &name_opts)
         };
         if result.is_err() {
             break;
@@ -1346,6 +1408,8 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
         "info" => cmd_info(prefix, &api, args, rest),
         "desc" => cmd_desc(prefix, &api, rest),
         "home" | "homepage" => cmd_home(&api, rest),
+        "docs" => cmd_docs(),
+        "source" => cmd_source(&api, rest),
         "cat" => cmd_cat(prefix, &api, rest),
         "formulae" => list_index(&api, false),
         "casks" => list_index(&api, true),
@@ -1440,6 +1504,8 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
             })
         }
         "unpin" => cmd_unpin(prefix, &api, rest),
+        "tab" => cmd_tab(prefix, &api, rest),
+        "which-formula" => cmd_which_formula(prefix, &api, rest),
         "link" | "ln" => cmd_link(prefix, &api, args, rest, true),
         "unlink" => cmd_link(prefix, &api, args, rest, false),
         "switch" => cmd_switch(prefix, &api, args, rest),
@@ -1449,6 +1515,7 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
         "uses" | "dependents" => cmd_uses(prefix, &api, rest),
         "leaves" => cmd_leaves(prefix, &api, rest),
         "missing" => cmd_missing(prefix, &api, rest),
+        "migrate" => cmd_migrate(prefix, &api, args, rest),
         "options" => cmd_options(prefix, &api, args, rest),
         "linkage" => cmd_linkage(prefix, &api, rest),
         "log" => cmd_log(prefix, rest),
@@ -1523,6 +1590,7 @@ const COMMANDS: &[&str] = &[
     "deps",
     "desc",
     "developer",
+    "docs",
     "doctor",
     "env",
     "fetch",
@@ -1536,6 +1604,7 @@ const COMMANDS: &[&str] = &[
     "linkage",
     "list",
     "log",
+    "migrate",
     "missing",
     "off",
     "on",
@@ -1547,8 +1616,10 @@ const COMMANDS: &[&str] = &[
     "search",
     "services",
     "shellenv",
+    "source",
     "status",
     "switch",
+    "tab",
     "tap",
     "tap-info",
     "uninstall",
@@ -1558,6 +1629,7 @@ const COMMANDS: &[&str] = &[
     "update",
     "upgrade",
     "uses",
+    "which-formula",
     "zap",
 ];
 
@@ -1737,7 +1809,7 @@ Common commands:
   list [--cask] [--versions] [-l] what is installed
   doctor                          what needs attention
   deps, uses, leaves, missing     the dependency graph
-  pin, unpin, link, unlink        manage kegs
+  pin, unpin, link, unlink, tab   manage kegs
   tap, untap                      manage taps
   bundle                          native Brewfile install, check and dump
   cleanup, autoremove, fetch      housekeeping
@@ -1785,6 +1857,9 @@ fn help_for(cmd: &str) -> &'static str {
             "Usage: abrew cleanup [--dry-run|-n] [--prune=<days>|--prune=all|--scrub|-s] [name…]\n  Removes old versions (only the named packages', when names are given). With no\n  names, --prune=<days> also deletes cached downloads at least that old, and\n  --prune=all or --scrub every cached download.\n"
         }
         "missing" => "Usage: abrew missing [--hide=<name>,…] [name…]\n",
+        "migrate" => {
+            "Usage: abrew migrate [--force] [--dry-run] [--formula|--cask] <oldname>…\n  Migrates renamed formulae and casks to their new names: moves the cellar\n  or caskroom, retargets links, pin and opt records, and leaves the old\n  rack or caskroom as a symlink.\n"
+        }
         "uses" | "dependents" => {
             "Usage: abrew uses [--installed] <formula>…\n  Installed formulae that depend directly on each name; abrew reads installed\n  formulae only, so --installed changes nothing.\n"
         }
@@ -1823,6 +1898,18 @@ fn help_for(cmd: &str) -> &'static str {
         }
         "services" => {
             "Usage: abrew services <args>…\n  Not supported: atpkg's brew compatibility has no native service manager.\n"
+        }
+        "tab" => {
+            "Usage: abrew tab [--formula|--cask] (--installed-on-request|--no-installed-on-request) <name>…\n  Marks installed packages as installed on request or not, which is what\n  autoremove keeps or removes.\n"
+        }
+        "which-formula" => {
+            "Usage: abrew which-formula [--explain] <command>…\n  Shows which formula provides each command, from the public executables\n  database; --explain phrases it as install advice.\n"
+        }
+        "docs" => {
+            "Usage: abrew docs\n  Opens the Homebrew documentation at https://docs.brew.sh in a browser.\n"
+        }
+        "source" => {
+            "Usage: abrew source [<formula>…]\n  Opens each formula's source repository in a browser, derived from its\n  head, stable or homepage URL; no name opens Homebrew's own repository.\n"
         }
         _ => HELP_MAIN,
     }
@@ -2389,6 +2476,28 @@ mod admission_tests {
             "Error: Invalid usage: Options --formula and --cask are mutually exclusive."
         );
         assert!(native_args("pin", &argv(&["--cask", "caffeine"])).is_ok());
+        assert!(native_args("tab", &argv(&["--installed-on-request", "wget"])).is_ok());
+        assert!(native_args("which-formula", &argv(&["git"])).is_ok());
+        assert!(native_args("which-formula", &argv(&["--explain", "g++"])).is_ok());
+        assert!(native_args("which-formula", &argv(&[])).is_ok());
+        assert!(matches!(
+            native_args(
+                "tab",
+                &argv(&["--installed-on-request", "--no-installed-on-request", "wget"])
+            ),
+            Err(InstallError::Failed(m)) if m
+                == "Error: Invalid usage: Options --installed-on-request and --no-installed-on-request are mutually exclusive."
+        ));
+        assert!(matches!(
+            native_args("tab", &argv(&["--formula", "--cask", "--installed-on-request", "wget"])),
+            Err(InstallError::Failed(m)) if m
+                == "Error: Invalid usage: Options --formula and --cask are mutually exclusive."
+        ));
+        assert!(matches!(
+            native_args("tab", &argv(&[])),
+            Err(InstallError::Failed(m)) if m
+                == "Error: Invalid usage: This command requires at least 1 installed formula or installed cask argument."
+        ));
         assert!(native_args("unpin", &argv(&["--formula", "acl"])).is_ok());
         assert_eq!(
             failed("link", &["--formula", "--cask", "acl"]),
@@ -2466,6 +2575,18 @@ mod admission_tests {
             Err(InstallError::Failed(m)) if m
                 == "Error: Invalid usage: Unknown command: brew frobnicate"
         ));
+        // Real brew commands abrew does not implement are known,
+        // not unknown: they refuse as not native (and delegate
+        // under the reroute) instead of claiming no such command.
+        for known in ["vulns", "readall"] {
+            assert!(
+                matches!(
+                    native_args(known, &argv(&[])),
+                    Err(InstallError::Unsupported(m)) if m == format!("'{known}' is not native")
+                ),
+                "{known}"
+            );
+        }
         assert!(native_args("missing", &argv(&["--hide="])).is_ok());
         assert!(matches!(
             native_args("search", &argv(&[])),

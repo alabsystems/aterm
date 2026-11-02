@@ -47,11 +47,49 @@ pub fn dial(sock: impl AsRef<Path>) -> io::Result<UnixStream> {
 /// One control connection: one descriptor, read through a buffer and written directly, kept out
 /// of every child this process spawns ([`aterm_uds::keep_out_of_children`]).
 pub struct Ctl {
-    stream: BufReader<UnixStream>,
+    stream: BufReader<Lane>,
     /// Latched on the first I/O failure. A stream that failed mid-request may be
     /// desynchronised, so nothing further is written to it and every later
     /// request answers the same way.
     lost: bool,
+}
+
+/// What a [`Ctl`]'s bytes travel over.
+enum Lane {
+    /// A connected Unix socket: every lane a process holds.
+    Socket(UnixStream),
+    /// The simulation's aterm, answering each request on the writing thread
+    /// ([`crate::sim::endpoint::Answered`]).
+    #[cfg(test)]
+    Answered(crate::sim::endpoint::Answered),
+}
+
+impl Read for Lane {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Socket(s) => s.read(buf),
+            #[cfg(test)]
+            Self::Answered(a) => a.read(buf),
+        }
+    }
+}
+
+impl Write for Lane {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Socket(s) => s.write(buf),
+            #[cfg(test)]
+            Self::Answered(a) => a.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Socket(s) => s.flush(),
+            #[cfg(test)]
+            Self::Answered(a) => a.flush(),
+        }
+    }
 }
 
 /// A reply, already framed.
@@ -78,7 +116,7 @@ impl Reply {
     /// Whether the reply is an `OK`.
     #[must_use]
     pub fn ok(&self) -> bool {
-        self.header().starts_with("OK")
+        is_ok_header(self.header())
     }
 
     /// The rows of a `Lines` reply, or an empty slice.
@@ -108,7 +146,7 @@ impl Ctl {
     pub fn adopt(fd: OwnedFd) -> io::Result<Self> {
         let stream = UnixStream::from(fd);
         stream.peer_addr()?;
-        let owned_copy = stream.try_clone()?;
+        let owned_copy = aterm_uds::kept_out(|| stream.try_clone())?;
         drop(stream);
         Self::from_stream(owned_copy)
     }
@@ -122,9 +160,19 @@ impl Ctl {
     pub fn from_stream(stream: UnixStream) -> io::Result<Self> {
         aterm_uds::keep_out_of_children(&stream)?;
         Ok(Self {
-            stream: BufReader::new(stream),
+            stream: BufReader::new(Lane::Socket(stream)),
             lost: false,
         })
+    }
+
+    /// The simulation's lane: aterm's end answers each request as it is written, on this thread
+    /// ([`crate::sim::endpoint::Answered`]).
+    #[cfg(test)]
+    pub(crate) fn simulated(aterm: crate::sim::endpoint::Answered) -> Self {
+        Self {
+            stream: BufReader::new(Lane::Answered(aterm)),
+            lost: false,
+        }
     }
 
     /// Connect to a control socket ([`dial`]) and authenticate with the instance token.
@@ -148,8 +196,14 @@ impl Ctl {
     /// Present `token` on a connection just made.
     ///
     /// # Errors
-    /// Marking the descriptor ([`Ctl::from_stream`]), or the write.
+    /// Marking the descriptor ([`Ctl::from_stream`]), an invalid token, or the write.
     pub(crate) fn authenticate(stream: UnixStream, token: &str) -> io::Result<Self> {
+        if token.is_empty() || token.contains(' ') || misframing_char(token).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid control token",
+            ));
+        }
         let mut ctl = Self::from_stream(stream)?;
         let s = ctl.stream.get_mut();
         s.write_all(format!("AUTH {token}\n").as_bytes())?;
@@ -158,9 +212,35 @@ impl Ctl {
     }
 
     /// The underlying stream, for a caller that must bound a read.
+    ///
+    /// # Panics
+    /// On the simulation's lane ([`Ctl::simulated`]), which has no socket. The bridge it runs
+    /// bounds no read of its verb lane and shuts it with [`Ctl::shutdown`], so nothing the
+    /// simulation runs calls this.
     #[must_use]
     pub fn get_ref(&self) -> &UnixStream {
-        self.stream.get_ref()
+        match self.stream.get_ref() {
+            Lane::Socket(s) => s,
+            #[cfg(test)]
+            Lane::Answered(_) => unreachable!("the simulation's verb lane has no socket"),
+        }
+    }
+
+    /// Shut the connection down as `shutdown(2)` does: after `Write` or `Both` a write fails,
+    /// and after `Read` or `Both` a read no longer waits on aterm. The simulation's lane shuts
+    /// the same way ([`crate::sim::endpoint::Answered::shutdown`]).
+    ///
+    /// # Errors
+    /// The socket's `shutdown(2)` errno.
+    pub fn shutdown(&mut self, how: std::net::Shutdown) -> io::Result<()> {
+        match self.stream.get_mut() {
+            Lane::Socket(s) => s.shutdown(how),
+            #[cfg(test)]
+            Lane::Answered(a) => {
+                a.shutdown(how);
+                Ok(())
+            }
+        }
     }
 
     /// Whether this connection is lost.
@@ -239,7 +319,7 @@ impl Ctl {
 
     fn read_line(&mut self) -> io::Result<String> {
         let mut s = String::new();
-        if self.stream.read_line(&mut s)? == 0 {
+        if self.stream.read_line(&mut s)? == 0 || !s.ends_with('\n') {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "aterm closed the control connection",
@@ -253,7 +333,7 @@ impl Ctl {
 
     fn read_reply(&mut self, verb: &str, request: &str) -> io::Result<Reply> {
         let header = self.read_line()?;
-        if !header.starts_with("OK") {
+        if !is_ok_header(&header) {
             return Ok(Reply::Status(header));
         }
         match framing_of(verb, request) {
@@ -288,6 +368,10 @@ impl Ctl {
 /// as part of the field it sits in: any control character (`\n` ends the
 /// request, `\r` and `\t` split a field) and any whitespace but the ASCII space
 /// (aterm's `split_whitespace` splits on U+00A0, U+2028 and the rest too).
+fn is_ok_header(header: &str) -> bool {
+    header == "OK" || header.starts_with("OK ")
+}
+
 fn misframing_char(line: &str) -> Option<char> {
     line.chars()
         .find(|c| c.is_control() || (c.is_whitespace() && *c != ' '))
@@ -303,7 +387,8 @@ fn request_verb(line: &str) -> &str {
 fn count_after_ok(header: &str, ceiling: usize) -> io::Result<usize> {
     let n: usize = header
         .strip_prefix("OK ")
-        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|rest| rest.split(' ').next())
+        .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
         .and_then(|n| n.parse().ok())
         .ok_or_else(|| {
             io::Error::new(
@@ -499,6 +584,48 @@ mod tests {
         assert_eq!(again.kind(), io::ErrorKind::BrokenPipe, "{again}");
     }
 
+    /// A lane the bridge shut fails its next request as a broken pipe and latches as lost, on
+    /// a socket and on the simulation's lane alike (the lost-aterm fault shuts the lane so).
+    #[test]
+    fn the_simulated_lane_shuts_as_a_socket_does() {
+        use crate::sim::endpoint::{Endpoint, EpRules};
+        let (near, far) = UnixStream::pair().expect("socketpair");
+        let server = std::thread::spawn(move || {
+            let mut reader = BufReader::new(far.try_clone().expect("clone"));
+            let mut writer = far;
+            let mut line = String::new();
+            while reader.read_line(&mut line).expect("read") > 0 {
+                writer.write_all(b"OK\n").expect("write");
+                line.clear();
+            }
+        });
+        let ep = Endpoint::new(EpRules::default(), false);
+        for mut ctl in [
+            Ctl::from_stream(near).expect("client"),
+            Ctl::simulated(ep.lane()),
+        ] {
+            assert!(ctl.request("hello build=x").expect("answered").ok());
+            ctl.shutdown(std::net::Shutdown::Both).expect("shut");
+            let shut = ctl.request("hello build=x").expect_err("a shut lane");
+            assert_eq!(shut.kind(), io::ErrorKind::BrokenPipe, "{shut}");
+            assert!(ctl.lost(), "the failure latches");
+        }
+        server.join().expect("server thread");
+    }
+
+    /// A read past aterm's reply on the simulation's lane panics, where aterm's socket would
+    /// block it for good: it never reads as the lane's end, which a framing bug would ride.
+    #[test]
+    #[should_panic(expected = "the bridge read past aterm's reply")]
+    fn a_read_past_the_reply_on_the_simulated_lane_panics() {
+        use crate::sim::endpoint::{Endpoint, EpRules};
+        let ep = Endpoint::new(EpRules::default(), false);
+        let mut lane = ep.lane();
+        lane.write_all(b"hello build=x\n").expect("asked");
+        let mut reply = Vec::new();
+        let _ = lane.read_to_end(&mut reply);
+    }
+
     /// An `ERR` is one line whatever the verb's framing is.
     #[test]
     fn an_error_reply_is_one_line_even_for_a_framed_verb() {
@@ -521,5 +648,74 @@ mod tests {
         }
         drop(ctl);
         server.join().expect("server thread");
+        assert!(Reply::Status("OK".into()).ok());
+        assert!(Reply::Status("OK 0".into()).ok());
+        assert!(!Reply::Status("OKAY".into()).ok());
+        assert!(!Reply::Status("OK_NO".into()).ok());
+        for bad_token in ["", "tok en", "tok\nen", "tok\r"] {
+            let (near, _far) = UnixStream::pair().expect("socketpair");
+            let err = Ctl::authenticate(near, bad_token)
+                .err()
+                .expect("invalid token rejected");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{bad_token:?}");
+        }
+        let (near, far) = UnixStream::pair().expect("socketpair");
+        let truncated = std::thread::spawn(move || {
+            let mut reader = BufReader::new(far.try_clone().expect("clone"));
+            let mut writer = far;
+            let mut line = String::new();
+            if reader.read_line(&mut line).expect("read") > 0 {
+                writer.write_all(b"OK without newline").expect("write");
+                writer.flush().expect("flush");
+            }
+        });
+        let mut ctl = Ctl::from_stream(near).expect("client");
+        assert_eq!(
+            ctl.request("version")
+                .expect_err("truncated status line")
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        drop(ctl);
+        truncated.join().expect("server thread");
+    }
+
+    #[test]
+    fn unsigned_parsers_reject_signed_and_padded_numbers() {
+        for bad in ["OK +12", "OK  12", "OK \t12"] {
+            assert!(count_after_ok(bad, REPLY_ROWS_MAX).is_err(), "{bad}");
+        }
+        assert!(crate::notify_need::Pair::parse("failure/+3/5").is_none());
+        assert!(crate::notify_need::Pair::parse("failure/3/+5").is_none());
+        assert!(crate::notify_need::Pair::parse("failure/3/~+5").is_none());
+        assert!(crate::mirror::parse_take("OK 0 slots=+1", b"").is_err());
+        assert!(
+            crate::mirror::Pin::parse("logpin v=2 inc=+1 n=0 total=0\n").is_err(),
+            "signed inc"
+        );
+        assert!(
+            crate::mirror::Pin::parse("logpin v=2 inc=1 n=0 total=0 win=+1:10\n").is_err(),
+            "signed win hi"
+        );
+        assert!(crate::state::Deadline::parse("off=+1 sid=s-a at=1 dl=1").is_none());
+        assert!(crate::state::Asked::parse("+1 s-a").is_none());
+        assert!(crate::fabric::GivenUpRange::parse("@+1..@2", None).is_none());
+        assert!(crate::fabric::GivenUpRange::parse("@1..@+2", None).is_none());
+        assert_eq!(
+            crate::fabric::parse_launchctl("+42\t0\tcom.example\n", 42),
+            None
+        );
+        assert!(crate::fabric_brief::BriefOpts::parse(&["--window".into(), "+10".into()]).is_err());
+        assert!(
+            crate::fabric_brief::BriefOpts::parse(&["--budget".into(), "+1000".into()]).is_err()
+        );
+        let drain = crate::bridge::parse_drain(
+            b"receipt sid=s-a rid=+1 off=1 verdict=handled kind=task from=s-b\n\
+              fetch sid=s-a off=+2\n\
+              sid=s-a id=+1 to=s-b kind=task len=1\nx",
+        );
+        assert!(drain.receipts.is_empty());
+        assert!(drain.fetches.is_empty());
+        assert!(drain.posts.is_empty());
     }
 }

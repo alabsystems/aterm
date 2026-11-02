@@ -2079,8 +2079,14 @@ fn the_hypervisors_kernel_switch_reads_on_macos_and_nowhere_else() {
 #[test]
 fn the_cpu_brand_volume_totals_tcp_summary_and_socket_count_read_on_this_host() {
     let words = crate::machine_words();
-    let cpu = words.cpu.as_deref().expect("CPU brand on this host");
-    assert!(!cpu.trim().is_empty(), "{words:?}");
+    // macOS always names its CPU. Linux's /proc/cpuinfo names one on x86 and on some ARM
+    // boards, but an aarch64 kernel that knows no board model writes only the implementer and
+    // part numbers (an Apple Virtualization guest's does), so there the brand is absent.
+    #[cfg(target_os = "macos")]
+    assert!(words.cpu.is_some(), "CPU brand on this host: {words:?}");
+    if let Some(cpu) = words.cpu.as_deref() {
+        assert!(!cpu.trim().is_empty(), "{words:?}");
+    }
 
     let root = crate::volume(Path::new("/")).expect("root volume space");
     assert!(

@@ -926,16 +926,16 @@ fn the_owners_desk_hands_both_sessions_over_at_the_full_rung() {
         bytes_total: 480 * 1024 * 1024,
     });
     app.settle_messages(std::time::Instant::now() + aterm_messages::PROGRESS_GRACE * 2);
-    assert_eq!(app.message_band_rows, 1, "the update's row is on the glass");
+    assert_eq!(app.message_band_rows, 0, "the update stays in the journal");
     app.on_resize(wid, size);
     assert_eq!(
         app.windows.get(&wid).map(|ws| (ws.rows, ws.cols)),
-        Some((55, 149)),
-        "the band's row came out of the grid"
+        Some((56, 149)),
+        "a recorded update takes no terminal row"
     );
     {
         let t = crate::term_lock(&claude);
-        assert_eq!((t.rows(), t.cols()), (55, 149));
+        assert_eq!((t.rows(), t.cols()), (56, 149));
         assert!(
             t.has_inactive_grid(),
             "Claude Code is on the alternate screen"
@@ -950,8 +950,8 @@ fn the_owners_desk_hands_both_sessions_over_at_the_full_rung() {
         crossed
             .window
             .as_ref()
-            .is_some_and(|window| window.status_bar_rows == 1 && !window.messages.is_empty()),
-        "{at}: the band row and its message ride the window carry: {:?}",
+            .is_some_and(|window| window.status_bar_rows == 0 && !window.messages.is_empty()),
+        "{at}: the message rides the window carry without a band row: {:?}",
         crossed.window
     );
     assert_eq!(
@@ -968,7 +968,7 @@ fn the_owners_desk_hands_both_sessions_over_at_the_full_rung() {
             .expect("both sessions crossed")
     };
     let claude_carry = carried(0);
-    assert_eq!((claude_carry.rows, claude_carry.cols), (55, 149));
+    assert_eq!((claude_carry.rows, claude_carry.cols), (56, 149));
     assert!(
         claude_carry.alt_grid.is_some(),
         "{at}: the Claude Code tab's saved primary crosses under its alternate screen"
@@ -977,14 +977,14 @@ fn the_owners_desk_hands_both_sessions_over_at_the_full_rung() {
         claude_carry
             .saved_cursor_main
             .map(|saved| (saved.cursor_row, saved.cursor_col)),
-        Some((54, 31)),
-        "{at}: the Claude Code tab's DECSC slot rode the band's shrink up with its \
-         prompt — row 54 of a 55-row grid, after `% claude`"
+        Some((55, 31)),
+        "{at}: the Claude Code tab's DECSC slot kept its \
+         prompt — row 55 of a 56-row grid, after `% claude`"
     );
     let shell_carry = carried(1);
     assert_eq!(
         (shell_carry.rows, shell_carry.history_lines),
-        (55, MAX_HANDOFF_HISTORY_LINES),
+        (56, MAX_HANDOFF_HISTORY_LINES),
         "{at}: the shell crosses with the full 256 lines of history the wire carries"
     );
     ptys.release(app);

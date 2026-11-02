@@ -335,15 +335,18 @@ fn the_light_comet_head_stays_in_the_caret_cell_and_wears_a_nucleus() {
             "comet ink past the caret's leading edge ({lead}) and its coma ({coma}): {q:?}"
         );
     }
-    let depth = |ink: &[GlowQuad], col: u16| -> f32 {
+    // Each trail's ink is read along its spine: Comet's at the row's middle, Lumen's paper
+    // tracer at the foot of the letters ([`CursorGlow::LUMEN_PAPER_TRACER`]).
+    let depth_at = |ink: &[GlowQuad], col: u16, drop: f32| -> f32 {
         let mut glass = Glass::new(g, 0x00FF_FFFF);
         glass.add_quads(ink);
         let (x0, y0, x1, _) = glass.cell_rect(row, col);
-        let y = y0 + g.ch as i32 / 2;
+        let y = y0 + (g.ch as f32 * (0.5 + drop)) as i32;
         (x0..x1)
             .map(|x| 1.0 - crate::color_math::relative_luminance(glass.at(y, x) & 0x00FF_FFFF))
             .fold(0.0f32, f32::max)
     };
+    let depth = |ink: &[GlowQuad], col: u16| depth_at(ink, col, 0.0);
     let (head, tail) = (depth(&ink, caret - 1), depth(&ink, caret - 3));
     assert!(
         head >= 1.3 * tail && head > 0.2,
@@ -352,9 +355,13 @@ fn the_light_comet_head_stays_in_the_caret_cell_and_wears_a_nucleus() {
     let mut lumen = light(GlowStyle::Lumen);
     lumen.theme_fg = c.theme_fg;
     let (_, even) = burst(&lumen);
-    let (lh, lt) = (depth(&even, caret - 1), depth(&even, caret - 3));
+    let spine = CursorGlow::LUMEN_PAPER_TRACER.0;
+    let (lh, lt) = (
+        depth_at(&even, caret - 1, spine),
+        depth_at(&even, caret - 3, spine),
+    );
     assert!(
-        lh < 1.3 * lt,
+        lt > 0.0 && lh < 1.3 * lt,
         "control: lumen's even tracer reads as a nucleus ({lh:.3} against {lt:.3})"
     );
     let mut lit = Glass::new(g, 0x00FF_FFFF);

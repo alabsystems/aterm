@@ -243,6 +243,17 @@ fn held_watch_ledgered(
     build: Build,
     tweak: impl FnOnce(&mut Mock, &mut SuperviseOpts),
 ) -> (Mock, Vec<String>, Vec<String>) {
+    held_watch_seamed(screens, typed_ms, |s| built(s, build), tweak)
+}
+
+/// [`held_watch_ledgered`] with `seam` set on the session the watch runs (a build's mutant, a
+/// read that answers late).
+fn held_watch_seamed(
+    screens: Vec<Vec<String>>,
+    typed_ms: Option<u64>,
+    seam: impl FnOnce(&mut Session<'_, TapedCtl<'_, Mock>>),
+    tweak: impl FnOnce(&mut Mock, &mut SuperviseOpts),
+) -> (Mock, Vec<String>, Vec<String>) {
     let (jdir, journal) = journal_file("box-hold");
     let (ldir, ledger) = ledger_file("box-hold");
     let mut m = fenced(screens);
@@ -264,7 +275,7 @@ fn held_watch_ledgered(
         s.set_person_hold_wait(Duration::ZERO);
         s.set_approval_ledger(Some(ledger.clone()));
         s.setup.pause = Duration::from_millis(5);
-        built(s, build);
+        seam(s);
     });
     let (records, _) = journal_records(&journal);
     let rows = ledger_rows(&ledger);
@@ -697,6 +708,236 @@ fn a_box_a_person_touched_is_held_as_ever() {
             .insert(3, u64::from(GRACE_S) * 1000 + 10_000);
     });
     assert_eq!(ones(&m), 1, "their grace over: {:#?}", m.requests);
+}
+
+/// A gesture the box's first read counted, made before the box was drawn, answered something else:
+/// the box's ticking countdown places its first frame two minutes before its deny
+/// (`approval_loop::AUTO_DENY_WINDOW`), so a keystroke 8 s before a read of a box drawn 2 s before
+/// it leaves the box untouched. Its hold ends at the deny's margin, however long the person's grace
+/// (300 s here), and the policy's answer goes before the vendor denies the box. A gesture after the
+/// box's first frame touches it, and a box with no countdown, which places nothing, is touched by
+/// any gesture its first read counts, as ever.
+#[test]
+fn a_gesture_counted_before_the_box_was_drawn_is_no_touch() {
+    let run = |typed_ms: u64, screens: Vec<Vec<String>>| {
+        held_watch(
+            watched(screens),
+            Some(typed_ms),
+            Build::Shipped,
+            |m, opts| {
+                opts.policy.human_grace_s = 300;
+                m.human_seq_from.insert(2, 1);
+            },
+        )
+    };
+    let past = |stamp: &str| {
+        aterm_types::rfc3339::parse_utc_fractional(stamp).expect("a stamp") - TEST_NOW
+    };
+    let margin = i64::try_from(approval_loop::DENY_MARGIN.as_secs()).expect("the margin");
+    let drawn_just_now = || ticking(118, 104, incident);
+    const COUNTED: &str = "a person's gesture was counted on the session since it appeared";
+
+    let (m, journal) = run(8_000, drawn_just_now());
+    assert_eq!(
+        ones(&m),
+        1,
+        "pressed at the deny's margin: {:#?}",
+        m.requests
+    );
+    assert!(ended(&journal), "{journal:#?}");
+    assert!(
+        journal.iter().all(|l| !l.contains(COUNTED)),
+        "untouched: {journal:#?}"
+    );
+    let held = held_lines(&journal);
+    assert!(held.len() > 2, "{journal:#?}");
+    for line in &held {
+        let (until, deny) = held_times(line);
+        if let Some(deny) = deny {
+            assert!(
+                past(&until) + margin <= past(&deny),
+                "held no later than the deny's margin: {line}"
+            );
+        }
+    }
+
+    let (m, journal) = run(1_000, drawn_just_now());
+    assert!(m.presses().is_empty(), "touched: {:#?}", m.requests);
+    assert!(!ended(&journal), "{journal:#?}");
+    assert!(
+        theirs(&journal).iter().any(|l| l.contains(&format!(
+            "{COUNTED}: held as ever, and the vendor denies it at "
+        ))),
+        "a gesture after its first frame: {journal:#?}"
+    );
+
+    let shell_c = f::shell_c_rm_box(" │ This shell -c script runs rm and could not be checked");
+    let (m, journal) = run(8_000, vec![shell_c; 6]);
+    assert!(m.presses().is_empty(), "touched: {:#?}", m.requests);
+    let held = held_lines(&journal);
+    assert!(!held.is_empty(), "{journal:#?}");
+    let (until, _) = held_times(held[0]);
+    assert!(
+        past(&until) > 280,
+        "no countdown places the box: the whole grace: {}",
+        held[0]
+    );
+}
+
+/// One box world for the dating of a gesture its first read counted: a whole grace of 300 s, the
+/// count rising at the box's first read (the read after the busy one), that read's gesture
+/// `typed_ms` before its snapshot, and the person's input 22 s old from the fifth read on (past an
+/// untouched box's bound, inside the whole grace), so an untouched box is pressed there and a
+/// touched one held.
+fn dated_box_watch(
+    screens: Vec<Vec<String>>,
+    typed_ms: u64,
+    seam: impl FnOnce(&mut Session<'_, TapedCtl<'_, Mock>>),
+) -> (Mock, Vec<String>) {
+    let (m, journal, _) = held_watch_seamed(watched(screens), Some(typed_ms), seam, |m, opts| {
+        opts.policy.human_grace_s = 300;
+        m.human_seq_from.insert(2, 1);
+        m.status_human_from.insert(5, TYPED_LONG_BEFORE_MS);
+    });
+    (m, journal)
+}
+
+const BY_OWED: &str = "a person's gesture was counted between the read before it and its first \
+                       read, which its countdown, once seen ticking, places before or after it";
+
+/// The box's first read is asked for at `a` and answered 6 s later, its snapshot (the countdown
+/// at 1:58, the gesture 1 s before it) taken at the end of those 6 s: the box was drawn at `a + 4`
+/// and touched at `a + 5`. The gesture is dated no earlier than the next read was asked for less
+/// its age, so it stays a touch, held for the person's grace. Dated from the instant the read was
+/// asked for, it fell at `a - 1`, before the first frame its countdown places, and the box the
+/// person touched was pressed. A gesture 8 s before that snapshot, before the box, is no touch
+/// either way.
+#[test]
+fn a_gesture_counted_by_a_slow_first_read_is_dated_no_earlier_than_its_answer() {
+    let slow = |s: &mut Session<'_, TapedCtl<'_, Mock>>| s.set_read_lag(2, Duration::from_secs(6));
+    let (m, journal) = dated_box_watch(ticking(118, 12, incident), 1_000, slow);
+    assert!(m.presses().is_empty(), "touched: {:#?}", m.requests);
+    assert!(
+        theirs(&journal).iter().any(|l| l.contains(
+            "a person's gesture was counted on the session since it appeared: held as ever"
+        )),
+        "{journal:#?}"
+    );
+    let (m, journal) = dated_box_watch(ticking(118, 12, incident), 8_000, slow);
+    assert_eq!(
+        ones(&m),
+        1,
+        "before the box: {:#?}\n{journal:#?}",
+        m.requests
+    );
+}
+
+/// A countdown that shows more time left than the two-minute window (4:58 on its first frame)
+/// runs longer than the window says, so the window places none of its box's frames: the gesture
+/// its first read counted, 1 s before that read and after the box was drawn, is a touch, held for
+/// the person's grace. Where the window placed it, the box's first frame fell 175 s after its
+/// first read and the gesture before it, and the box was pressed.
+#[test]
+fn a_countdown_longer_than_the_window_places_no_box() {
+    let (m, journal) = dated_box_watch(ticking(298, 12, incident), 1_000, |_| {});
+    assert!(m.presses().is_empty(), "touched: {:#?}", m.requests);
+    assert!(!ended(&journal), "{journal:#?}");
+    let (m, _) = dated_box_watch(ticking(118, 12, incident), 8_000, |_| {});
+    assert_eq!(
+        ones(&m),
+        1,
+        "the window's own countdown places it: {:#?}",
+        m.requests
+    );
+}
+
+/// A box whose first frame draws its countdown row with a time the parser does not read (`about
+/// 2 minutes`) is placed by the countdown of the frames after it: the gesture its first read
+/// counted, 22 s before that read, came before the box, which is pressed once the person's bound
+/// is over. Until then the count is owed its verdict, re-read within a second. Before, that first
+/// frame took the box for one that draws no countdown, and the gesture held it for the person's
+/// whole grace.
+#[test]
+fn a_countdown_its_first_frame_leaves_unread_places_the_box_from_the_next() {
+    let screens = [
+        vec![incident("about 2 minutes")],
+        ticking(118, 11, incident),
+    ]
+    .concat();
+    let (m, journal) = dated_box_watch(screens, TYPED_LONG_BEFORE_MS, |_| {});
+    assert_eq!(
+        ones(&m),
+        1,
+        "before the box: {:#?}\n{journal:#?}",
+        m.requests
+    );
+    let held = held_lines(&journal);
+    assert!(
+        held.first().is_some_and(|l| l.contains(BY_OWED)),
+        "the unread frame's hold looks again: {held:#?}"
+    );
+}
+
+/// A box drawn in the place of one nobody touched, before a read without a box between them, is
+/// read as a box of its own: the gesture its first read counted is placed by its countdown, and
+/// one made before its first frame is no touch. A gesture after its first frame is one, and so is
+/// a count owed its verdict at a box drawn over before its countdown placed it.
+#[test]
+fn a_box_drawn_in_an_untouched_ones_place_is_placed_by_its_own_countdown() {
+    let read = |rows: Vec<String>, count: u64, ms: u64| Screen {
+        rows,
+        human: HumanInput::Ago(ms),
+        human_seq: Some(count),
+        cols: Some(144),
+        ..Screen::default()
+    };
+    let t0 = Instant::now();
+    let run = |second: u64| {
+        let mut m = Mock::new(vec![busy_screen()]);
+        let mut s = session(&mut m, None);
+        let mut last: Option<Option<u64>> = Some(Some(0));
+        let mut touched = Vec::new();
+        let mut step = |s: &mut Session<'_, Mock>, r: Screen, at_s: u64| {
+            let at = t0 + Duration::from_secs(at_s);
+            s.keep_countdown(&r.rows, at);
+            s.keep_episode(&r, last, at);
+            last = Some(r.human_seq);
+            touched.push(s.touched());
+        };
+        step(&mut s, read(incident("0:30"), 0, 60_000), 0);
+        step(&mut s, read(incident("0:29"), 0, 60_000), 1);
+        step(&mut s, read(next_request("1:58"), 1, second), 12);
+        step(&mut s, read(next_request("1:57"), 1, second + 1_000), 13);
+        (touched, s.person_fence(&read(next_request("1:56"), 1, 0)))
+    };
+    const COUNTED: &str = "a person's gesture was counted on the session since it appeared";
+    let (touched, fence) = run(9_000);
+    assert_eq!(
+        touched,
+        [None, None, Some(BY_OWED), None],
+        "before its first frame"
+    );
+    assert_eq!(fence, Some(1), "the gesture's count is the baseline");
+    let (touched, _) = run(1_000);
+    assert_eq!(
+        touched,
+        [None, None, Some(BY_OWED), Some(COUNTED)],
+        "after its first frame"
+    );
+
+    let mut m = Mock::new(vec![busy_screen()]);
+    let mut s = session(&mut m, None);
+    s.keep_countdown(&incident("1:58"), t0);
+    s.keep_episode(&read(incident("1:58"), 1, 9_000), Some(Some(0)), t0);
+    assert_eq!(s.touched(), Some(BY_OWED));
+    let over = t0 + Duration::from_secs(1);
+    s.keep_countdown(&next_request("1:57"), over);
+    s.keep_episode(&read(next_request("1:57"), 1, 10_000), Some(Some(1)), over);
+    assert_eq!(
+        s.touched(),
+        Some(COUNTED),
+        "drawn over before its countdown placed it"
+    );
 }
 
 fn lease_before(screens: Vec<Vec<String>>) -> Vec<Vec<String>> {
@@ -1327,7 +1568,7 @@ fn an_episode_runs_from_the_first_box_to_the_first_read_without_one() {
     let mut s = session(&mut m, None);
     let mut last: Option<Option<u64>> = None;
     let mut step = |s: &mut Session<'_, Mock>, r: Screen| {
-        s.keep_episode(&r, last);
+        s.keep_episode(&r, last, Instant::now());
         last = Some(r.human_seq);
         s.touched()
     };
@@ -1352,7 +1593,7 @@ fn an_episode_runs_from_the_first_box_to_the_first_read_without_one() {
         assert_eq!(step(&mut s, seen(rows, 0)), None, "{why}");
     }
     const COUNTED: &str = "a person's gesture was counted on the session since it appeared";
-    assert_eq!(step(&mut s, seen(incident("0:13"), 1)), Some(COUNTED));
+    assert_eq!(step(&mut s, seen(subagent(100, "0:13"), 1)), Some(COUNTED));
     for (why, rows) in [
         ("relabelled", stacked(&incident("0:12"), "2 of 2")),
         ("re-wrapped", rewrapped(&incident("0:11"))),
@@ -1422,7 +1663,7 @@ fn an_episode_runs_from_the_first_box_to_the_first_read_without_one() {
     s.set_episode_per_box();
     let mut last: Option<Option<u64>> = Some(Some(0));
     let mut step = |s: &mut Session<'_, Mock>, r: Screen| {
-        s.keep_episode(&r, last);
+        s.keep_episode(&r, last, Instant::now());
         last = Some(r.human_seq);
         s.touched()
     };
@@ -1673,6 +1914,15 @@ fn worlds() -> Vec<World> {
             counted: true,
             ..ticks(
                 "touched, older person",
+                90,
+                Some(TYPED_LONG_BEFORE_MS),
+                true,
+            )
+        },
+        World {
+            counts: &[(2, 1)],
+            ..ticks(
+                "counted before the box",
                 104,
                 Some(TYPED_LONG_BEFORE_MS),
                 true,
@@ -1778,7 +2028,7 @@ fn tier1_a_hold_goes_only_where_the_model_allows() {
     };
     let shipped = [
         false, false, true, true, false, false, false, false, false, false, true, false, false,
-        false, false, false, false, true, true, true, false,
+        false, false, false, false, true, true, true, false, true,
     ];
     let (bad, presses) = box_hold_violations(Build::Shipped);
     assert_eq!(bad, Vec::<String>::new());
@@ -1787,8 +2037,13 @@ fn tier1_a_hold_goes_only_where_the_model_allows() {
     let (bad, presses) = box_hold_violations(Build::BoundOff);
     let mut want = shipped;
     want[19] = false;
+    want[21] = false;
     assert_eq!(presses, want);
-    assert_eq!(names(&bad), ["1:44 older person"], "{bad:#?}");
+    assert_eq!(
+        names(&bad),
+        ["1:44 older person", "counted before the box"],
+        "{bad:#?}"
+    );
     assert!(bad.iter().all(|b| b.contains(": Tick at ")), "{bad:#?}");
 
     let (bad, presses) = box_hold_violations(Build::CapOff);
@@ -2585,4 +2840,12 @@ fn no_still_wait_runs_past_the_deny_it_races() {
             .all(|&(quiet, ms)| quiet == 500 && ms <= 14_000),
         "{waits:?}"
     );
+}
+
+/// [`super::super::observe_table`]'s row of a decline: down, tab, the decline's text and Enter
+/// ([`a_decline_goes_before_the_countdown_runs_out`]).
+pub(crate) fn observe_row_decline() -> &'static [&'static str] {
+    let states = [0usize, 0, 0, 0, 1, 1, 2, 2, 3, 3];
+    let _ = tall_decline(18, &states, Build::Shipped, &|_| {});
+    &[" down", " tab", " enter"]
 }

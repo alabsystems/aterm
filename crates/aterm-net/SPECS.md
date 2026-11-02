@@ -35,16 +35,17 @@ Result: **12 specs**, covering **25 tests** (one fewer since `tls::relay` went).
 
 ## 0. Notation used in the statements
 
-- `hex(b)` = `aterm_codec::hex::encode_lower(b)`. `nib(c)` = `aterm_codec::hex::nibble(c)` (it accepts `0-9a-fA-F`).
-- Claim state `st ∈ {RUNNING=0, AUTHED=1, FIRED=2, EVICTED=3}` (the `WD_*` constants in `slots.rs`);
-  `Claim ∈ {Authed, Deadline, Evicted}` is what `finish()` reports. "Leaves RUNNING at most once" means
-  that over any execution, the values `st` holds are RUNNING followed by at most one other value.
-- `Pending(held)` = `{i | held[i].unauthenticated}`. `cnt(x)` = `|{i ∈ Pending | held[i].source = x}|`.
-  `argmin_since(I)` = the least index `i ∈ I` minimising `held[i].since` (`Iterator::min_by_key`
-  returns the *first* minimum).
-- `Dir(a→b)` for `tls::relay_answers` is the plaintext byte stream from endpoint `a` to endpoint `b`. Its
-  EOF is a local write-half shutdown or EOF on the control-socket side, or a peer `close_notify` on the
-  TLS side.
+- `hex(b)` = `aterm_codec::hex::encode_lower(b)`. `nib(c)` = `aterm_codec::hex::nibble(c)`
+  (it accepts `0-9a-fA-F`).
+- Claim state `st ∈ {RUNNING=0, AUTHED=1, FIRED=2, EVICTED=3}` (the `WD_*` constants in
+  `slots.rs`); `Claim ∈ {Authed, Deadline, Evicted}` is what `finish()` reports. "Leaves RUNNING at
+  most once": over any execution, `st` holds RUNNING followed by at most one other value.
+- `Pending(held)` = `{i | held[i].unauthenticated}`. `cnt(x)` =
+  `|{i ∈ Pending | held[i].source = x}|`. `argmin_since(I)` = the least index `i ∈ I` minimising
+  `held[i].since` (`Iterator::min_by_key` returns the first minimum).
+- `Dir(a→b)` for `tls::relay_answers` is the plaintext byte stream from endpoint `a` to `b`. Its
+  EOF is a local write-half shutdown or EOF on the control-socket side, or a peer `close_notify` on
+  the TLS side.
 - Timing statements quantify over the arming instant `t0` of a `HandshakeWatchdog` and over every
   interleaving of `unpark` and spurious `park_timeout` wakes.
 - Models: the refinement specs use the committed `ty_model!` machines
@@ -64,11 +65,12 @@ Result: **12 specs**, covering **25 tests** (one fewer since `tls::relay` went).
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions` (paths relative to `crates/aterm-net/src/`), `statement`,
-`subsumes` (primary tests, `tls::`/`slots::`/`fleet::` = `src/{tls,slots,fleet}.rs`; secondary in §2),
-`difficulty` (the Rust features the proof must handle), and `blocking gaps` (the numbers of the gap
-table in `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7). Gap 0 (the installed `trust` channel's
-seal publishes no Clean row; seal `150efe4a` fixes it but is not admitted to the channel) blocks every row.
+`functions` paths are relative to `crates/aterm-net/src/`. `subsumes` names the primary tests
+(`tls::`, `slots::`, `fleet::` = `src/{tls,slots,fleet}.rs`, `fleet_member::` =
+`src/fleet_member_tests.rs`; secondary tests are in §2). `difficulty` is what the proof must
+handle. `blocking gaps` are the rows of the gap table in
+`docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7; gap 0 (a seal that publishes Clean rows)
+blocks every row.
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking gaps
@@ -128,6 +130,7 @@ threads plus a rustls record-layer model). `fleet-book` stands apart: its pure h
 ## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
+`file` is relative to `crates/aterm-net/`.
 
 ```tsv
 file	test	primary	also
@@ -160,18 +163,6 @@ src/fleet_member_tests.rs	a_machine_at_the_issuers_old_address_never_speaks_for_
 src/fleet_member_tests.rs	an_issuer_that_cannot_share_its_book_now_leaves_the_copy	fleet-book	(its read_whole half stays a test)
 ```
 
-(`file` is relative to `crates/aterm-net/`.)
-
-## 3. Coverage
-
-- 26 tests: the pass's `tls.rs` and `drive.rs` tests that survived, under their names and files now,
-  and the six `fleet-book` tests. 25 map to one of the 12 specs. 1 is not a spec sample (§4).
-- The biggest collapses (primary tests): `relay-duplex-fidelity` (5), `pick-displaced-rule` (3),
-  `serve-slots-refine-net-slot-displacement` (3).
-- `hex-decode-bounded` and `poll-timeout-ceil` retire no test on their own. They are the lemmas the
-  fleet's reads and the readiness spec are built on, and the place where `MAX_HEX` and poll rounding are
-  actually stated.
-
 ## 4. Tests that are not spec samples
 
 | test | why | action |
@@ -193,9 +184,9 @@ instance of one of the general specs above.
    distinct sources, so `fleet::idle_sockets_from_one_address_never_turn_away_a_member_from_another` and
    `fleet::a_slow_handshake_is_never_cut_for_a_heavier_address` never silently pass without running.
 3. **A relay assertion that is mostly about rustls.** In
-   `tls::relay_early_request_close_delivers_guarded_reply_but_not_late_ack`, "the late ACK never reaches
-   upstream" depends mostly on rustls refusing or dropping application data written after the client's
-   own `send_close_notify`, not on `tls::relay_answers`. The relay half of the spec (no peer bytes after
+   `tls::relay_early_request_close_delivers_guarded_reply_but_not_late_ack`, "the late ACK never
+   reaches upstream" rests on rustls dropping application data written after the client's own
+   `send_close_notify`, not on `tls::relay_answers`. The relay half (no peer bytes after
    close_notify are delivered) needs the rustls record-layer axiom.
 4. **(Fixed 2026-10-28.) A test understated its spec.**
    `slots::spurious_wakes_neither_shorten_nor_starve_the_watchdog_deadline` now asserts
@@ -211,9 +202,9 @@ instance of one of the general specs above.
    receipt onto `tls_buffered_relay_model` transitions (`DrainBuffered` → `ServiceRecv` → `Done`) via
    `validate_transition_tiered`.
 
-## 6. The specs I would prove first (easiest, high value)
+## 6. Proof order
 
-No spec here is blocked by gap 0 alone, so the order prefers the fewest and smallest gaps.
+No row is blocked by gap 0 alone; the order prefers the fewest and smallest gaps.
 
 1. **`poll-timeout-ceil`**, after factoring the integer core over `(u128, u32)`. Saturating arithmetic,
    one `is_multiple_of`, one `try_from` clamp: an `omega`-class proof needing only gap 3. It retires no

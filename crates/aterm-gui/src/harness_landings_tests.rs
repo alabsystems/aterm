@@ -14,6 +14,7 @@ fn listed(local_id: u64, view: AutopilotView, task: Option<TaskFace>) -> Harness
     HarnessSession {
         stopped: None,
         waiting: None,
+        switch_asked: false,
         local_id,
         sid: format!("s-{local_id}"),
         title: format!("work {local_id}"),
@@ -31,6 +32,7 @@ fn listed(local_id: u64, view: AutopilotView, task: Option<TaskFace>) -> Harness
         set_by: None,
         need: None,
         hold: None,
+        receipt: None,
     }
 }
 
@@ -267,8 +269,8 @@ fn the_landed_row_stands_with_the_land_prompts() {
     assert!(none_names_landed(&rows), "{rows:?}");
 }
 
-/// THE DONE-CHECK ROW STANDS UNDER KEPT GOING (§12.4.6, §14.6): `past
-/// “done”  4 today · 12 in 7 days`, both windows, right under `Kept going`
+/// THE DONE-CHECK ROW STANDS UNDER KEPT GOING (§12.4.6, §14.6, §14.17 item 2): `Forced
+/// continues  4 today · 12 in 7 days`, both windows, right under `Kept going`
 /// and labelled as a part of it, read from the reading's acts by rule —
 /// Cruise's done check, and the challenges older builds typed at a done
 /// report instead, which the week still reads — never an ordinary

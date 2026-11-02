@@ -570,9 +570,7 @@ impl Parser {
             "--raw" => self.global.raw = true,
             "--jq" => self.global.jq = Some(text),
             "--limit" => {
-                let limit = text
-                    .parse::<usize>()
-                    .ok()
+                let limit = crate::path::digits::<usize>(&text)
                     .filter(|n| *n >= 1)
                     .ok_or_else(|| self.usage("--limit wants a whole number of at least 1"))?;
                 self.global.limit = Some(limit);
@@ -580,9 +578,7 @@ impl Parser {
             "--partial" => self.global.partial = true,
             "--as-read" => self.global.as_read = true,
             "--max-pages" => {
-                let pages = text
-                    .parse::<u32>()
-                    .ok()
+                let pages = crate::path::digits::<u32>(&text)
                     .filter(|n| (1..=1000).contains(n))
                     .ok_or_else(|| self.usage("--max-pages wants 1 to 1000"))?;
                 self.global.max_pages = Some(pages);

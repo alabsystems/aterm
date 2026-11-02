@@ -132,20 +132,22 @@ impl Seat<'_> {
         )
     }
 
-    /// `[harness] accounts =` in the `aterm.toml` beside the rosters: the one rotation switch of
-    /// every CLI whose roster this machine keeps.
+    /// `[harness] accounts =` in the `aterm.toml` beside the rosters as `cli`'s pool reads it
+    /// ([`crate::supervise::config::SupervisorConfig::accounts_for`]): off where the harness or
+    /// `cli` is switched off, as the window's host reads it.
     #[must_use]
-    pub fn mode(&self) -> Mode {
+    pub fn mode_for(&self, cli: Cli) -> Mode {
         crate::supervise::config::SupervisorConfig::from_path(Some(
             &self.config_dir.join("aterm.toml"),
         ))
         .0
-        .accounts
+        .accounts_for(cli.program())
     }
 
     /// Whether `cli` keeps its login where no row's own login file is read (Codex's
     /// `cli_auth_credentials_store` in its default home's `config.toml`, which every row's launch
-    /// reads directly: [`crate::ai::facts::codex_keyring`]).
+    /// reads directly: [`crate::ai::facts::codex_file_store`]). Unreadable configuration also
+    /// holds the file-account seam.
     #[must_use]
     pub fn keyring_held(&self, cli: Cli) -> bool {
         keyring_held_in(cli, self.home)
@@ -155,7 +157,8 @@ impl Seat<'_> {
 /// [`Seat::keyring_held`] under the user's home `home`.
 #[must_use]
 pub fn keyring_held_in(cli: Cli, home: &Path) -> bool {
-    cli == Cli::Codex && crate::ai::facts::codex_keyring(&home.join(cli.accounts().default_home))
+    cli == Cli::Codex
+        && !crate::ai::facts::codex_file_store(&home.join(cli.accounts().default_home))
 }
 
 /// Whether a launch of `cli` takes no row of its pool, the owner's pin included, whatever the
@@ -497,6 +500,7 @@ fn pool_read_using<T>(
 /// the overlay homes so any shared suffix file the CLI creates at startup exists there first.
 /// Samples from the future or before the last managed renewal are ignored. A context mismatch
 /// never clears stored usage or limits; only an accepted new sample receives the current tag.
+/// A non-file or unreadable Codex backend leaves its file accounts unpolled.
 /// # Errors
 /// Account state, bindings or current policy could not be read, the policy changed during
 /// polling, or fresh usage could not be recorded. A caller must not select from the old
@@ -508,6 +512,9 @@ pub fn record_usage(
     enrolled: &std::collections::BTreeSet<String>,
     read: ReadUsage<'_>,
 ) -> Result<Vec<String>, String> {
+    if seat.keyring_held(cli) {
+        return Ok(Vec::new());
+    }
     let before = pool_snapshot(seat, cli)?;
     if before.roster != *roster {
         return Err("account policy or login changed before usage read".into());
@@ -930,7 +937,8 @@ pub fn default_only_now<'a>(
 /// on a Codex program that keeps no row's login its own
 /// ([`super::codex_alab::auth_path_unread`]) it is a row of its own, or the recorded claims keep
 /// its row from this Mac (another Mac's senior live claim, or a claim this Mac cannot record on a
-/// row that is not its home), as [`launch_env_for`] refuses it.
+/// row that is not its home), as [`launch_env_for`] refuses it. A preparation-only hold on the
+/// default row also refuses a launch with no pin.
 pub fn off_launch<'a>(
     (cli, keyring): (Cli, bool),
     roster: &'a Roster,
@@ -958,7 +966,8 @@ pub fn off_launch<'a>(
 /// ([`keyring_held_in`]), the roster lists no row, rotation off holds no pin, or the roster's one
 /// row is this machine's own login and no pin stands. `aterm ai review` holds its reviewer to it
 /// ([`crate::ai::facts::CliAccounts::launch_refused`]), as [`off_launch`] holds the accounts
-/// report's `next:` under rotation off.
+/// report's `next:` under rotation off. A configured default row still needs execution authority
+/// when no row is taken.
 ///
 /// # Errors
 ///
@@ -966,7 +975,8 @@ pub fn off_launch<'a>(
 /// roster, or its row is not signed in here; on a Codex program that keeps no row's login its
 /// own ([`super::codex_alab::auth_path_unread`]), the pin is on a row of its own, or the row on
 /// this machine's own login cannot serve; under rotation off, the recorded claims keep the pin's
-/// row from this Mac ([`off_launch`]); or no row is usable.
+/// row from this Mac ([`off_launch`]); a preparation-only hold stands on the default row; or no
+/// row is usable.
 pub fn launch_now<'a>(
     (cli, keyring, mode): (Cli, bool, Mode),
     roster: &'a Roster,
@@ -990,6 +1000,7 @@ pub fn launch_now<'a>(
     }
     let pinned = launch_pin(cli, roster, state, enrolled, now)?;
     if lone_default(roster, pinned) {
+        default_execution(cli, roster, state)?;
         return Ok(None);
     }
     pick_row(cli, roster, state, enrolled, unread, now).map(Some)
@@ -1009,9 +1020,20 @@ fn pinned_own<'a>(roster: &'a Roster, state: &accounts::State) -> Option<&'a Row
 }
 
 /// Whether a launch under rotation takes no row because the roster's one row is this machine's
-/// own login and the owner's pin (`pinned`) holds none: it runs on that login as it is.
+/// own login, is not held for another machine, and the owner's pin (`pinned`) holds none:
+/// it runs on that login as it is.
 fn lone_default(roster: &Roster, pinned: Option<&Row>) -> bool {
-    matches!(roster.rows.as_slice(), [only] if only.dir.is_none()) && pinned.is_none()
+    matches!(roster.rows.as_slice(), [only] if only.dir.is_none() && only.held_by.is_none())
+        && pinned.is_none()
+}
+
+fn default_execution(cli: Cli, roster: &Roster, state: &accounts::State) -> Result<(), String> {
+    if let Some(row) = roster.row_for_login(None) {
+        state
+            .execution_verdict(&row.label)
+            .map_err(|why| format!("{} account {}: {}", cli.id(), row.label, why.as_str()))?;
+    }
+    Ok(())
 }
 
 /// The row a launch under rotation picks from `candidates` (the pool's state less the rows whose
@@ -1069,10 +1091,19 @@ fn off_pick<'a>(
         return Err(refused_pin(roster, state, enrolled, pinned, why, now));
     }
     let Some(pinned) = launch_pin(cli, roster, state, enrolled, now)? else {
+        default_execution(cli, roster, state)?;
         return Ok(None);
     };
-    // Nor does it start on a pin the recorded claims keep from this Mac: another Mac's senior
-    // live claim, or a claim this Mac cannot record on a row that is not its home.
+    // Nor does it start on a pin the recorded claims keep from this Mac: another Mac's warm set,
+    // another Mac's senior live claim, or a claim this Mac cannot record on a row that is not its
+    // home.
+    if pinned.held_by.is_some() {
+        return Err(off_claim_refused(
+            cli,
+            &pinned.label,
+            accounts::WhyNot::HeldElsewhere,
+        ));
+    }
     state
         .lease_verdict(&pinned.label, now)
         .map_err(|why| off_claim_refused(cli, &pinned.label, why))?;
@@ -1181,7 +1212,7 @@ fn launch_env_using(
         return Ok(None);
     }
     let enrolled = accounts::enrolled_in(cli, roster, seat.home);
-    let configured_mode = seat.mode();
+    let configured_mode = seat.mode_for(cli);
     let unread = default_only(cli, roster, program);
     let unread = unread.as_ref();
     if configured_mode == Mode::Off {
@@ -1199,6 +1230,9 @@ fn launch_env_using(
             .map_err(held)?;
         let env = prepare(pinned).map_err(|why| why.to_string())?;
         match seat.claim(cli, super::claims::Act::Claim(&pinned.label)) {
+            super::claims::Touched::PreparationOnly => {
+                return Err(held(accounts::WhyNot::PreparationOnly));
+            }
             super::claims::Touched::HeldElsewhere(holder) => {
                 return Err(held(accounts::WhyNot::LeasedElsewhere {
                     until: holder.until,
@@ -1230,6 +1264,7 @@ fn launch_env_using(
         None => checked_launch_pin(seat, cli, roster, &snapshot.state, &enrolled)?,
     };
     if lone_default(roster, pinned) {
+        default_execution(cli, roster, &snapshot.state)?;
         return Ok(None);
     }
     let (mut state, _) = poll_usage(seat, cli, &snapshot, &enrolled, read)?;
@@ -1255,7 +1290,8 @@ fn launch_env_using(
                 // on a row that is not its home, the launch picks again.
                 let claim = seat.claim(cli, super::claims::Act::Claim(&row.label));
                 let refused = match claim {
-                    super::claims::Touched::HeldElsewhere(_) => true,
+                    super::claims::Touched::HeldElsewhere(_)
+                    | super::claims::Touched::PreparationOnly => true,
                     super::claims::Touched::Unrecorded(_) => {
                         state.unrecorded = true;
                         !state.home_accounts.contains(&row.label)
@@ -1305,7 +1341,7 @@ fn launch_env_using(
 /// or the pool cannot be read. Reads no usage.
 #[must_use]
 pub fn launch_opening(seat: &Seat<'_>, cli: Cli, program: Option<&Path>) -> Option<i64> {
-    if !cli.accounts().measured || seat.keyring_held(cli) || seat.mode() == Mode::Off {
+    if !cli.accounts().measured || seat.keyring_held(cli) || seat.mode_for(cli) == Mode::Off {
         return None;
     }
     let snapshot = pool_snapshot(seat, cli).ok()?;
@@ -1343,7 +1379,8 @@ pub fn launch_opening(seat: &Seat<'_>, cli: Cli, program: Option<&Path>) -> Opti
 /// claimed it where claims apply): that row still serves, it ran on no row of the bound roster (a
 /// home or credential of its own), the pool has fewer than two rows, no row the program may run
 /// serves (the launch then fails as it would have, and a conversation on this machine's own login
-/// relaunches on it), or `[harness] accounts = "off"` moves no session.
+/// relaunches on it), or rotation is off for `cli` ([`Seat::mode_for`]: `[harness] accounts =
+/// "off"`, or the harness or `cli` switched off), which moves no session.
 #[must_use]
 pub fn cold_launch_env(
     seat: &Seat<'_>,
@@ -1352,7 +1389,7 @@ pub fn cold_launch_env(
     read: ReadUsage<'_>,
     program: Option<&Path>,
 ) -> Option<LoginEnv> {
-    if !cli.accounts().measured || seat.keyring_held(cli) || seat.mode() == Mode::Off {
+    if !cli.accounts().measured || seat.keyring_held(cli) || seat.mode_for(cli) == Mode::Off {
         return None;
     }
     seat.claim(cli, super::claims::Act::Look);
@@ -1371,16 +1408,20 @@ pub fn cold_launch_env(
         enrolled.contains(&ran.label),
         seat.now,
     );
-    let usable = !matches!(
-        cond,
-        accounts::Condition::Limited { .. }
-            | accounts::Condition::SignedOut
-            | accounts::Condition::NotEnrolled
-    ) && snapshot.state.lease_verdict(&ran.label, seat.now).is_ok();
+    let usable = ran.held_by.is_none()
+        && !matches!(
+            cond,
+            accounts::Condition::Limited { .. }
+                | accounts::Condition::SignedOut
+                | accounts::Condition::NotEnrolled
+        )
+        && snapshot.state.lease_verdict(&ran.label, seat.now).is_ok();
     if usable {
         let claim = seat.claim(cli, super::claims::Act::Claim(&ran.label));
         let refused = match claim {
-            super::claims::Touched::HeldElsewhere(_) => true,
+            super::claims::Touched::HeldElsewhere(_) | super::claims::Touched::PreparationOnly => {
+                true
+            }
             super::claims::Touched::Unrecorded(_) => {
                 !snapshot.state.home_accounts.contains(&ran.label)
             }
@@ -1452,7 +1493,7 @@ fn cold_resume_pick(
     env: &[(&str, &str)],
     default_only: bool,
 ) -> Option<LoginEnv> {
-    if !cli.accounts().measured || seat.keyring_held(cli) || seat.mode() == Mode::Off {
+    if !cli.accounts().measured || seat.keyring_held(cli) || seat.mode_for(cli) == Mode::Off {
         return None;
     }
     let store = seat.store(cli);
@@ -1488,16 +1529,22 @@ fn cold_resume_pick(
         return ready(default_serving(&roster, &state, &enrolled, seat.now).ok()?);
     }
     let cond = accounts::condition(ran, &state, enrolled.contains(&ran.label), seat.now);
-    if !matches!(
-        cond,
-        accounts::Condition::Limited { .. }
-            | accounts::Condition::SignedOut
-            | accounts::Condition::NotEnrolled
-    ) {
+    if ran.held_by.is_none()
+        && state.lease_verdict(&ran.label, seat.now).is_ok()
+        && !matches!(
+            cond,
+            accounts::Condition::Limited { .. }
+                | accounts::Condition::SignedOut
+                | accounts::Condition::NotEnrolled
+        )
+    {
         return None;
     }
     if let Some(pinned) = checked_launch_pin(seat, cli, &roster, &state, &enrolled).ok()? {
-        return ready(pinned).filter(|pick| pick.label != ran.label);
+        if pinned.held_by.is_none() && state.lease_verdict(&pinned.label, seat.now).is_ok() {
+            return ready(pinned).filter(|pick| pick.label != ran.label);
+        }
+        return None;
     }
     let mut excluded = std::collections::BTreeSet::new();
     loop {
@@ -1608,6 +1655,9 @@ fn launch_pin<'a>(
         .as_deref()
         .and_then(|label| roster.row(label))
         .ok_or_else(|| format!("{} account pin names no roster row", cli.id()))?;
+    state
+        .execution_verdict(&pinned.label)
+        .map_err(|why| format!("{} account {}: {}", cli.id(), pinned.label, why.as_str()))?;
     let cond = accounts::condition(pinned, state, enrolled.contains(&pinned.label), now);
     if matches!(
         cond,
@@ -1654,7 +1704,7 @@ fn finish_launch(
     {
         return Err("account policy or login changed while preparing a launch".into());
     }
-    if seat.keyring_held(cli) || seat.mode() != configured_mode {
+    if seat.keyring_held(cli) || seat.mode_for(cli) != configured_mode {
         return Err("account routing changed while preparing a launch".into());
     }
     check_failed_preparations(before, &current, excluded)?;
@@ -2112,7 +2162,7 @@ fn session_plan_using(
     let roster = &snapshot.roster;
     let state = &snapshot.state;
     let me = who.me(roster);
-    let configured_mode = seat.mode();
+    let configured_mode = seat.mode_for(s.cli);
     if s.mode != configured_mode {
         return SessionPlan::stay(StayWhy::NothingDue);
     }
@@ -2128,6 +2178,29 @@ fn session_plan_using(
     };
     let mut excluded = std::collections::BTreeSet::new();
     let mut saw_line_failure = false;
+    let no_line = |advice: &Advice| {
+        let until = match advice {
+            Advice::Wait { until }
+            | Advice::Move {
+                yields: Some(until),
+                ..
+            } => Some(*until),
+            _ => me
+                .label()
+                .and_then(|label| roster.row(label))
+                .and_then(|row| {
+                    (row.held_by.is_some() || state.lease_verdict(&row.label, seat.now).is_err())
+                        .then(|| seat.now.saturating_add(super::claims::RECHECK_S))
+                }),
+        };
+        match until {
+            Some(until) => SessionPlan {
+                advice: Advice::Wait { until },
+                prepared: None,
+            },
+            None => SessionPlan::stay(StayWhy::NoLine),
+        }
+    };
     let (advice, line) = loop {
         let candidates = without_failed_preparations(state, &excluded);
         let advice = accounts::advise_session(
@@ -2143,7 +2216,7 @@ fn session_plan_using(
         );
         let Advice::Move { to, .. } = &advice else {
             return if saw_line_failure {
-                SessionPlan::stay(StayWhy::NoLine)
+                no_line(&advice)
             } else {
                 SessionPlan {
                     advice,
@@ -2166,7 +2239,7 @@ fn session_plan_using(
         if (state.active.as_deref() == Some(to.as_str()) && !own_proven)
             || !excluded.insert(to.clone())
         {
-            return SessionPlan::stay(StayWhy::NoLine);
+            return no_line(&advice);
         }
     };
     SessionPlan {
@@ -2318,7 +2391,7 @@ fn finish_move(
     }
     if seat.keyring_held(session.cli)
         || session.mode != configured_mode
-        || seat.mode() != configured_mode
+        || seat.mode_for(session.cli) != configured_mode
     {
         return Err("account routing changed while preparing a move".into());
     }
@@ -2682,6 +2755,14 @@ pub fn account_pool_commit_environment() {}
         machine = "AccountPoolLaunch",
         action = "UsageWriteFails",
         reason = "Bounded environment scenario: the conformance test stages a held pool lock, so fresh usage cannot be recorded before the product's Choose"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountPoolLaunch",
+        action = "HeldDefault",
+        reason = "The fixture stages a single default-home row held for another machine."
     )
 )]
 #[doc(hidden)]

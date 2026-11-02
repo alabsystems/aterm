@@ -75,6 +75,9 @@ pub(crate) const MAIN_PORT_DEFAULT: mach_port_t = 0;
 unsafe extern "C" {
     /// Public IOPMLib.h; a +1 dictionary on success, released by its caller.
     pub fn IOPMCopyCPUPowerStatus(status: *mut CFDictionaryRef) -> kern_return_t;
+    /// Public IOPMLib.h: every process's power assertions, keyed by its pid (a CFNumber), each
+    /// an array of dictionaries; a +1 dictionary on success, released by its caller.
+    pub fn IOPMCopyAssertionsByProcess(by_pid: *mut CFDictionaryRef) -> kern_return_t;
     /// A +1 `CFMutableDictionaryRef`, consumed by `IOServiceGetMatchingService`.
     pub fn IOServiceMatching(name: *const c_char) -> CFMutableDictionaryRef;
     /// Consumes `matching`; the service it answers is the caller's (+1).
@@ -135,6 +138,14 @@ unsafe extern "C" {
         encoding: CFStringEncoding,
     ) -> Boolean;
     pub fn CFDictionaryGetValue(theDict: CFDictionaryRef, key: *const c_void) -> *const c_void;
+    pub fn CFDictionaryGetCount(theDict: CFDictionaryRef) -> CFIndex;
+    /// Fills `keys` and `values`, each room for `CFDictionaryGetCount` pointers, with borrowed
+    /// pointers (the Get rule) valid while the dictionary lives.
+    pub fn CFDictionaryGetKeysAndValues(
+        theDict: CFDictionaryRef,
+        keys: *mut *const c_void,
+        values: *mut *const c_void,
+    );
     pub fn CFNumberGetValue(
         number: CFNumberRef,
         theType: CFNumberType,
@@ -142,4 +153,19 @@ unsafe extern "C" {
     ) -> Boolean;
     pub fn CFDataGetLength(theData: CFDataRef) -> CFIndex;
     pub fn CFDataGetBytePtr(theData: CFDataRef) -> *const u8;
+}
+
+// The calls a test makes to hold a power assertion of its own, which
+// `IOPMCopyAssertionsByProcess` then lists under the test's pid.
+#[cfg(test)]
+#[link(name = "IOKit", kind = "framework")]
+unsafe extern "C" {
+    /// Public IOPMLib.h: `level` 255 is `kIOPMAssertionLevelOn`; `id` is written on success.
+    pub fn IOPMAssertionCreateWithName(
+        kind: CFStringRef,
+        level: u32,
+        name: CFStringRef,
+        id: *mut u32,
+    ) -> kern_return_t;
+    pub fn IOPMAssertionRelease(id: u32) -> kern_return_t;
 }

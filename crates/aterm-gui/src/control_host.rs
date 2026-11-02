@@ -83,7 +83,10 @@ struct SubscriberWait(Subscription);
 
 impl ChangeWait for SubscriberWait {
     fn wait(&self, timeout: Duration) -> bool {
-        let until = std::time::Instant::now() + timeout;
+        let now = std::time::Instant::now();
+        let until = now
+            .checked_add(timeout)
+            .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365));
         let woke = crate::park::park(
             |bound| self.0.wait(bound),
             until,
@@ -266,6 +269,7 @@ mod tests {
             update_parked: Default::default(),
             witness: Default::default(),
             fenced_writes: Default::default(),
+            native_policy: Default::default(),
             watchers: observed.watchers,
             frame: Default::default(),
         });

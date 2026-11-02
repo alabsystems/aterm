@@ -49,7 +49,10 @@ impl MainWatch {
     }
 
     fn wait_for_park(&self, bound: Duration) -> bool {
-        let until = std::time::Instant::now() + bound;
+        let now = std::time::Instant::now();
+        let until = now
+            .checked_add(bound)
+            .unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 3600));
         loop {
             if self.parked() {
                 return true;
@@ -89,7 +92,7 @@ label_enum! {
         /// beating every poll tick.
         UpdateHandoff => "update_handoff",
         /// A NESTED MODAL RUN LOOP spun from inside a work root — `-[NSAlert
-        /// runModal]` (`menu::confirm`, `menu::notify`) and `-[NSOpenPanel
+        /// runModal]` (`menu::confirm`) and `-[NSOpenPanel
         /// runModal]` (`menu::choose_local_file`).
         Modal => "modal",
         /// `about_to_wait`'s BODY: the message settle, the restore pass, the crash

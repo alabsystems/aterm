@@ -141,6 +141,12 @@ pub trait Item: Send + Sync {
         None
     }
 
+    /// Why the last probe or apply left the Command Line Tools uninstalled, in the class
+    /// `aterm machines here apply --plain` exits with (`developer.command-line-tools` alone).
+    fn unfinished(&self) -> Option<crate::init_clt::Unfinished> {
+        None
+    }
+
     /// Reason an `Unusable` probe was blocked by a missing prerequisite.
     fn read_aside(&self) -> Option<aterm_converge::StoodAside> {
         None

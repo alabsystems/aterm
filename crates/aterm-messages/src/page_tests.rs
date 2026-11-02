@@ -23,6 +23,8 @@ struct Desk {
     folder: Option<String>,
     unsaved: bool,
     offset_s: i64,
+    now_ms: Option<u64>,
+    offset_at: Option<fn(i64) -> i64>,
     staged: Option<u64>,
     files: Vec<&'static str>,
     /// `(tab, to, word)`: the words each standing upgrade takes.
@@ -35,7 +37,7 @@ struct Desk {
 
 impl Host for Desk {
     fn now_unix_ms(&self) -> u64 {
-        NOW
+        self.now_ms.unwrap_or(NOW)
     }
     fn log_folder(&self) -> Option<String> {
         self.folder.clone()
@@ -45,6 +47,9 @@ impl Host for Desk {
     }
     fn utc_offset_s(&self) -> i64 {
         self.offset_s
+    }
+    fn utc_offset_at(&self, unix_s: i64) -> i64 {
+        self.offset_at.map_or(self.offset_s, |f| f(unix_s))
     }
     fn staged_build(&self) -> Option<u64> {
         self.staged
@@ -1085,6 +1090,7 @@ fn an_old_open_exception_keeps_its_own_day_header() {
         log_folder: None,
         saved: false,
         utc_offset_s: 0,
+        entry_offsets: Vec::new(),
     };
     let lines = crate::page::wire_lines(&page, &MessagesFilter::default());
     let days: Vec<(String, Vec<(String, String)>)> = lines
@@ -1155,6 +1161,96 @@ fn a_headed_list_says_the_local_time_of_a_past_row() {
     assert_eq!(west.offset_s, -25_200);
     assert_eq!(west.today, words::local_day(NOW, -25_200));
     assert_eq!(west.now_unix_ms, NOW);
+
+    // Across 2026-11-01 fall-back (PDT UTC-7 -> PST UTC-8 at 09:00Z):
+    // 2026-10-31 23:30 PDT (1_793_514_600_000) is Yesterday at 11:30 PM, while
+    // 2026-11-01 00:30 PDT (1_793_518_200_000) is Today ("12 h ago" at 12:00 PST).
+    fn la_at(unix: i64) -> i64 {
+        if unix < 1_793_523_600 {
+            -7 * 3_600
+        } else {
+            -8 * 3_600
+        }
+    }
+    let now_pst_ms = 1_793_563_200_000;
+    let now_inst = Instant::now();
+    let mut dst_center = center(now_inst);
+    dst_center.post(
+        Message::new(tags::CONFIG, Severity::Warn, "late october")
+            .line("pdt row")
+            .hold(Hold::LogOnly),
+        stamp(1_793_514_600_000),
+        now_inst,
+    );
+    dst_center.post(
+        Message::new(tags::CONFIG, Severity::Info, "early november")
+            .line("after midnight pdt")
+            .hold(Hold::LogOnly),
+        stamp(1_793_518_200_000),
+        now_inst,
+    );
+    let dst_page = MessagesState::of(
+        &dst_center,
+        &Desk {
+            now_ms: Some(now_pst_ms),
+            offset_s: -8 * 3_600,
+            offset_at: Some(la_at),
+            ..Desk::default()
+        },
+    );
+    let dst_lines: Vec<(String, Vec<(String, String)>)> =
+        crate::page::wire_lines(&dst_page, &MessagesFilter::default())
+            .iter()
+            .map(|l| read_page_line(l))
+            .collect();
+    let dst_entries: Vec<(&str, &str)> = dst_lines
+        .iter()
+        .filter(|(k, _)| k == "entry")
+        .map(|(_, f)| {
+            (
+                page_field(f, "when").expect("when"),
+                page_field(f, "meta").expect("meta"),
+            )
+        })
+        .collect();
+    assert_eq!(dst_entries[0].0, "12 h ago");
+    assert!(
+        dst_entries[0].1.contains("Today 12:30:00 AM"),
+        "{dst_entries:?}"
+    );
+    assert_eq!(dst_entries[1].0, "11:30 PM");
+    assert!(
+        dst_entries[1].1.contains("Yesterday 11:30:00 PM"),
+        "{dst_entries:?}"
+    );
+    let flat_page = MessagesState::of(
+        &dst_center,
+        &Desk {
+            now_ms: Some(now_pst_ms),
+            offset_s: -8 * 3_600,
+            ..Desk::default()
+        },
+    );
+    let flat_entries: Vec<(String, String)> =
+        crate::page::wire_lines(&flat_page, &MessagesFilter::default())
+            .iter()
+            .map(|l| read_page_line(l))
+            .filter(|(k, _)| k == "entry")
+            .map(|(_, f)| {
+                (
+                    page_field(&f, "when").expect("when").to_string(),
+                    page_field(&f, "meta").expect("meta").to_string(),
+                )
+            })
+            .collect();
+    assert_eq!(
+        flat_entries[0].0, "11:30 PM",
+        "CONTROL: flat PST places 00:30 PDT under Yesterday: {flat_entries:?}"
+    );
+    assert_eq!(
+        flat_entries[1].0, "10:30 PM",
+        "CONTROL: flat PST shifts 11:30 PM PDT to 10:30 PM: {flat_entries:?}"
+    );
 }
 
 #[test]
@@ -1466,6 +1562,7 @@ fn any_word_survives_the_page_lines() {
         log_folder: Some(hostile.to_string()),
         saved: false,
         utc_offset_s: 0,
+        entry_offsets: Vec::new(),
     };
     let lines = crate::page::wire_lines(&page, &MessagesFilter::default());
     let read: Vec<(String, Vec<(String, String)>)> =
@@ -1909,6 +2006,7 @@ fn the_action_lines_carry_the_primary_after_every_older_key() {
         log_folder: None,
         saved: true,
         utc_offset_s: 0,
+        entry_offsets: Vec::new(),
     };
     let lines = crate::page::wire_lines(&page, &MessagesFilter::default());
     let actions: Vec<&str> = lines
@@ -1966,6 +2064,7 @@ fn the_primary_line_marks_a_position_in_the_offered_intents_not_an_action_index(
         log_folder: None,
         saved: true,
         utc_offset_s: 0,
+        entry_offsets: Vec::new(),
     };
     let lines = crate::page::wire_lines(&page, &MessagesFilter::default());
     let actions: Vec<&str> = lines

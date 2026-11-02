@@ -17,7 +17,7 @@ pub(crate) fn icon_px(dpi: u32) -> (u32, u32) {
 }
 
 fn scale_px(base: u32, dpi: u32) -> u32 {
-    (base * dpi + 48) / 96
+    u32::try_from((u64::from(base) * u64::from(dpi) + 48) / 96).unwrap_or(u32::MAX)
 }
 
 #[cfg(windows)]
@@ -237,5 +237,6 @@ mod tests {
                 "at scale {scale}"
             );
         }
+        assert!(icon_px(dpi_for_scale(f64::MAX)).0 > 0);
     }
 }

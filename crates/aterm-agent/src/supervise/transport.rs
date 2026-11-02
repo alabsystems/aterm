@@ -14,9 +14,8 @@ use aterm_types::control_verbs::{Framing, artifact_reply_requires_ack, framing_o
 use aterm_uds::CtlStream;
 
 use super::run::{Ctl, CtlReply, Interrupter};
-use crate::RelayClient;
+use crate::{DEFAULT_REPLY_WAIT, RelayClient};
 
-const DEFAULT_REPLY_WAIT: Duration = Duration::from_secs(60);
 const AWAIT_MARGIN: Duration = Duration::from_secs(5);
 
 /// Whether `a` and `b` name one socket: their folders resolve to one folder, and their names
@@ -165,8 +164,8 @@ impl RelayCtl {
         let given = self.token.as_deref().filter(|_| self.is_endpoint(sock));
         let (stream, token) = match given {
             Some(t) => {
-                let stream = CtlStream::connect(sock).map_err(|e| connect_failed(&e))?;
-                aterm_uds::keep_out_of_children(&stream).map_err(|e| connect_failed(&e))?;
+                let stream = aterm_uds::kept_out(|| CtlStream::connect(sock))
+                    .map_err(|e| connect_failed(&e))?;
                 (stream, t.trim().to_string())
             }
             None => {
@@ -178,14 +177,14 @@ impl RelayCtl {
             }
         };
         RelayClient::authenticated(stream, &token)
+            .map(|client| client.bounded(DEFAULT_REPLY_WAIT))
             .map_err(|e| DialError::Failed(format!("connect {sock}: {e}")))
     }
 
     fn hold(&mut self, sock: String, carries: Carries, client: RelayClient<CtlStream>) -> usize {
         let id = self.next_id;
         self.next_id += 1;
-        if let Ok(handle) = client.transport().try_clone() {
-            let _ = aterm_uds::keep_out_of_children(&handle);
+        if let Ok(handle) = aterm_uds::kept_out(|| client.transport().try_clone()) {
             self.shut
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -308,7 +307,8 @@ impl RelayCtl {
         }
         let given_token = self.token.is_some() && self.is_endpoint(&self.conns[at].sock);
         let conn = &mut self.conns[at].client;
-        let _ = conn.transport().set_read_timeout(Some(wait));
+        // reply_wait already includes the server's named wait; bounded adds it once.
+        conn.bound_by(wait.saturating_sub(crate::named_timeout(args).unwrap_or_default()));
         let got = match framing {
             Framing::Lines => conn
                 .request_counted(&line)
@@ -316,6 +316,7 @@ impl RelayCtl {
             Framing::Bytes => conn.request_bytes(&line),
             _ => conn.request_line(&line).map(|h| (h, Vec::new())),
         };
+        let unread = conn.reply_unread();
         match got {
             Ok((header, _)) if header == "ERR auth" && self.beside_on_refusal && given_token => {
                 self.beside_on_refusal = false;
@@ -324,7 +325,9 @@ impl RelayCtl {
                 self.exchange(args, host_of)
             }
             Ok((header, body)) => Ok(render(verb, framing, &header, body)),
-            Err(e) if e.kind() == io::ErrorKind::InvalidInput => Ok(client_failure(&e.to_string())),
+            Err(e) if e.kind() == io::ErrorKind::InvalidInput && !unread => {
+                Ok(client_failure(&e.to_string()))
+            }
             Err(e) => {
                 self.drop_conn(at);
                 if self.cut.load(Ordering::SeqCst) {
@@ -360,17 +363,7 @@ fn io_words(e: &io::Error) -> String {
 }
 
 fn reply_wait(args: &[&str]) -> Duration {
-    let ms = args.iter().enumerate().find_map(|(i, a)| {
-        if *a == "timeout" {
-            args.get(i + 1).and_then(|n| n.parse::<u64>().ok())
-        } else {
-            a.strip_prefix("timeout=").and_then(|n| n.parse().ok())
-        }
-    });
-    match ms {
-        Some(ms) => Duration::from_millis(ms) + AWAIT_MARGIN,
-        None => DEFAULT_REPLY_WAIT,
-    }
+    crate::named_timeout(args).map_or(DEFAULT_REPLY_WAIT, |wait| wait + AWAIT_MARGIN)
 }
 
 fn is_timeout(status: &str) -> bool {

@@ -9,11 +9,11 @@ pub fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec
     use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
     use std::sync::atomic::{AtomicUsize, Ordering};
     let configured = match std::env::var("RUST_TEST_THREADS") {
-        Ok(v) => match v.trim().parse::<usize>() {
+        Ok(v) if !v.trim().starts_with('+') => match v.trim().parse::<usize>() {
             Ok(n) if n > 0 => Some(n),
             _ => None,
         },
-        Err(_) => None,
+        _ => None,
     };
     let threads = match configured {
         Some(n) => n,

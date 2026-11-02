@@ -9,9 +9,9 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use aterm_uds::spawnfd::{Stdio, command};
 use aterm_update_core::pins;
 
 use crate::dev_identity::Bounded;
@@ -224,6 +224,16 @@ pub(crate) fn acquire(
             fix: "run provision as the user that will cut releases".into(),
         };
     };
+    let _lease = match aterm_secrets::release_keychain::wait_signing_lease(&home) {
+        Ok(lease) => lease,
+        Err(why) => {
+            return Outcome::Blocked {
+                what: format!("cannot acquire the signing keychain: {why}"),
+                fix: "resolve the reported signing-keychain condition, then resume the release"
+                    .into(),
+            };
+        }
+    };
     acquire_in(
         &Keychains::new(&home, &Bounded),
         id,
@@ -265,7 +275,7 @@ fn acquire_in(
             what: format!(
                 "cannot read the keychain, so this machine's Apple state is unknown: {why}"
             ),
-            fix: "install the Xcode command-line tools (`xcode-select --install`)".into(),
+            fix: "resolve the reported signing-keychain error, then resume the release".into(),
         };
     }
 
@@ -710,9 +720,11 @@ fn issuer_in_keychain(kc: &Keychains<'_>, leaf: &str) -> Option<String> {
         &["x509", "-noout", "-issuer"],
         Some(leaf.as_bytes()),
     )?;
-    let issuer = String::from_utf8_lossy(&out)
-        .trim()
-        .trim_start_matches("issuer=")
+    let out = String::from_utf8_lossy(&out);
+    let out = out.trim();
+    let issuer = out
+        .strip_prefix("issuer=")
+        .unwrap_or(out)
         .trim()
         .to_string();
     keychain_cert_with_subject(kc, &issuer)
@@ -723,27 +735,46 @@ fn enddate_iso(line: &str) -> Option<String> {
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
+    let uint = |s: &str| {
+        (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| s.parse::<u32>().ok())
+            .flatten()
+    };
     let tail = line.trim().strip_prefix("notAfter=")?;
     let mut parts = tail.split_whitespace();
     let month = parts.next()?;
-    let day: u32 = parts.next()?.parse().ok()?;
+    let day: u32 = uint(parts.next()?)?;
     let _time = parts.next()?;
-    let year: u32 = parts.next()?.parse().ok()?;
+    let year: u32 = uint(parts.next()?)?;
     let month = MONTHS.iter().position(|m| *m == month)? + 1;
     Some(format!("{year:04}-{month:02}-{day:02}"))
 }
 
 /// Whether `openssl x509 -checkend` says this certificate outlives `secs`.
 fn outlives(pem: &str, secs: u64) -> Option<bool> {
-    let mut child = Command::new("/usr/bin/openssl")
+    let mut child = command("/usr/bin/openssl")
         .args(["x509", "-noout", "-checkend", &secs.to_string()])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    child.stdin.take()?.write_all(pem.as_bytes()).ok()?;
-    Some(child.wait().ok()?.success())
+    let wrote = if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(pem.as_bytes())
+            .or_else(|e| {
+                if e.kind() == std::io::ErrorKind::BrokenPipe {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            })
+            .is_ok()
+    } else {
+        false
+    };
+    let status = child.wait().ok()?;
+    (wrote && status.success()).then_some(true).or(Some(false))
 }
 
 /// The label macOS gives the paired private key (the certificate's common name), as the
@@ -799,21 +830,21 @@ fn tty_line(prompt: &str, max: usize) -> Result<String, String> {
     }
     write!(tty, "{prompt}").map_err(|e| format!("cannot write to /dev/tty: {e}"))?;
     tty.flush().ok();
-    let mut line = String::new();
+    let mut raw = Vec::new();
     let mut byte = [0u8; 1];
     loop {
         match tty.read(&mut byte) {
             Ok(0) => break,
             Ok(_) if byte[0] == b'\n' => break,
             Ok(_) => {
-                if line.len() < max {
-                    line.push(byte[0] as char);
+                if raw.len() < max {
+                    raw.push(byte[0]);
                 }
             }
             Err(e) => return Err(format!("cannot read from /dev/tty: {e}")),
         }
     }
-    Ok(line.trim().to_string())
+    Ok(String::from_utf8_lossy(&raw).trim().to_string())
 }
 
 /// Prints the confirmation prompt for generating a new certificate request.
@@ -906,7 +937,7 @@ pub(crate) fn ensure_notary(may_change: bool) -> Outcome {
             ),
         };
     }
-    let status = Command::new("/usr/bin/xcrun")
+    let status = command("/usr/bin/xcrun")
         .args([
             "notarytool",
             "store-credentials",
@@ -1158,10 +1189,7 @@ impl Watch {
 fn surface_csr(csr: &Path, id: &str, named: &Path) -> Option<PathBuf> {
     let visible = named.join(format!("devid-{id}.certSigningRequest"));
     std::fs::copy(csr, &visible).ok()?;
-    let _ = Command::new("/usr/bin/open")
-        .arg("-R")
-        .arg(&visible)
-        .status();
+    let _ = command("/usr/bin/open").arg("-R").arg(&visible).status();
     Some(visible)
 }
 
@@ -1539,7 +1567,11 @@ fn install_issuer_intermediate(
     ];
     let issuer = cert_field(&cer.path, cer.form, "-issuer")
         .ok_or("could not read the certificate's issuer")?;
-    let issuer = issuer.trim_start_matches("issuer=").trim().to_string();
+    let issuer = issuer
+        .strip_prefix("issuer=")
+        .unwrap_or(&issuer)
+        .trim()
+        .to_string();
     if !issuer.contains("Developer ID Certification Authority") {
         return Ok(None);
     }
@@ -1561,7 +1593,7 @@ fn install_issuer_intermediate(
             let name = url.rsplit('/').next().unwrap_or(url);
             let tmp = dir.join("issuer.cer");
             let _ = std::fs::remove_file(&tmp);
-            let out = Command::new("/usr/bin/curl")
+            let out = command("/usr/bin/curl")
                 .args([
                     "-fsSL",
                     "--proto",
@@ -1588,7 +1620,7 @@ fn install_issuer_intermediate(
                 continue;
             };
             let got = cert_field(&tmp, form, "-subject")
-                .map(|s| s.trim_start_matches("subject=").trim().to_string());
+                .map(|s| s.strip_prefix("subject=").unwrap_or(&s).trim().to_string());
             if got.as_deref() != Some(issuer.as_str()) {
                 refused.push(format!("{name}: a different issuer name"));
                 continue;
@@ -1646,7 +1678,8 @@ fn key_id_from_text(text: &str, header: &str) -> Option<String> {
         inline
     };
     let hex: String = raw
-        .trim_start_matches("keyid:")
+        .strip_prefix("keyid:")
+        .unwrap_or(raw)
         .trim()
         .chars()
         .filter(|c| *c != ':')
@@ -1706,8 +1739,11 @@ fn temp_cert(bytes: &[u8]) -> Result<PathBuf, String> {
             .open(&path)
         {
             Ok(mut f) => {
-                f.write_all(bytes)
-                    .map_err(|e| format!("{}: {e}", path.display()))?;
+                if let Err(e) = f.write_all(bytes) {
+                    drop(f);
+                    let _ = std::fs::remove_file(&path);
+                    return Err(format!("{}: {e}", path.display()));
+                }
                 return Ok(path);
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -1739,11 +1775,9 @@ fn keychain_cert_with_subject(kc: &Keychains<'_>, subject: &str) -> Option<Strin
                 Some(block.as_bytes()),
             )
             .map(|o| {
-                String::from_utf8_lossy(&o)
-                    .trim()
-                    .trim_start_matches("subject=")
-                    .trim()
-                    .to_string()
+                let s = String::from_utf8_lossy(&o);
+                let s = s.trim();
+                s.strip_prefix("subject=").unwrap_or(s).trim().to_string()
             })
             .is_some_and(|s| s == subject)
         })
@@ -1819,20 +1853,33 @@ pub(crate) fn write_credentials_profile(
     roster: &Path,
     identity_sha1: Option<&str>,
 ) -> Result<Option<PathBuf>, String> {
-    use std::os::unix::fs::OpenOptionsExt;
-
     let Some(home) = std::env::var_os("HOME") else {
         return Err("HOME is not set".into());
     };
     let ring = PathBuf::from(home).join(atpkg_keys::provision::RELEASE_RING_REL);
+    write_credentials_profile_in(&ring, id, roster, identity_sha1)
+}
+
+fn write_credentials_profile_in(
+    ring: &Path,
+    id: &str,
+    roster: &Path,
+    identity_sha1: Option<&str>,
+) -> Result<Option<PathBuf>, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+
     let path = ring.join("release-credentials.toml");
-    if path.exists() {
+    if crate::bundle::exists_or_symlink(&path) {
         return Ok(None);
     }
-    let key_bytes = std::fs::read(ring.join("machine.key"))
+    let key_bytes = crate::durable::read_regular_bytes(&ring.join("machine.key"), 256)
+        .map(aterm_uds::secret::Secret::from_vec)
         .map_err(|e| format!("cannot read this machine's key: {e}"))?;
-    let signing_key = aterm_codec::base64::encode(&key_bytes)
+    let signing_key = aterm_codec::base64::encode(key_bytes.expose())
+        .map(|s| aterm_uds::secret::Secret::from_vec(s.into_bytes()))
         .map_err(|_| "this machine's key is too large to encode".to_string())?;
+    let signing_key_str = std::str::from_utf8(signing_key.expose())
+        .map_err(|_| "encoded signing key is not UTF-8".to_string())?;
 
     let mut body = String::new();
     body.push_str(&format!(
@@ -1841,13 +1888,14 @@ pub(crate) fn write_credentials_profile(
         crate::publish::SHIP_COMMAND,
         crate::publish::CUT_COMMAND
     ));
-    body.push_str(&format!("signing_key = \"{signing_key}\"\n"));
+    body.push_str(&format!("signing_key = \"{signing_key_str}\"\n"));
     body.push_str(&format!("machine_id = \"{id}\"\n"));
     body.push_str(&format!("machine_roster = \"{}\"\n", roster.display()));
     body.push_str(&format!("notary_profile = \"{}\"\n", NOTARY_PROFILE));
     if let Some(sha1) = identity_sha1 {
         body.push_str(&format!("signing_identity_sha1 = \"{sha1}\"\n"));
     }
+    let body = aterm_uds::secret::Secret::from_vec(body.into_bytes());
 
     let mut f = std::fs::OpenOptions::new()
         .write(true)
@@ -1855,8 +1903,14 @@ pub(crate) fn write_credentials_profile(
         .mode(0o600)
         .open(&path)
         .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
-    f.write_all(body.as_bytes())
-        .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    if let Err(e) = f
+        .write_all(body.expose())
+        .and_then(|()| crate::durable::sync_all(&f))
+    {
+        drop(f);
+        let _ = std::fs::remove_file(&path);
+        return Err(format!("cannot write {}: {e}", path.display()));
+    }
     Ok(Some(path))
 }
 
@@ -1898,7 +1952,7 @@ fn run_command(command: &mut aterm_uds::spawnfd::Command, within: Duration) -> R
 
 /// Run a command with optional stdin, returning stdout on success.
 fn capture(program: &str, args: &[&str], input: Option<&[u8]>) -> Option<Vec<u8>> {
-    let mut child = Command::new(program)
+    let mut child = command(program)
         .args(args)
         .stdin(if input.is_some() {
             Stdio::piped()
@@ -1909,11 +1963,26 @@ fn capture(program: &str, args: &[&str], input: Option<&[u8]>) -> Option<Vec<u8>
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    if let Some(bytes) = input {
-        child.stdin.take()?.write_all(bytes).ok()?;
-    }
+    let wrote = if let Some(bytes) = input {
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(bytes)
+                .or_else(|e| {
+                    if e.kind() == std::io::ErrorKind::BrokenPipe {
+                        Ok(())
+                    } else {
+                        Err(e)
+                    }
+                })
+                .is_ok()
+        } else {
+            false
+        }
+    } else {
+        true
+    };
     let out = child.wait_with_output().ok()?;
-    out.status.success().then_some(out.stdout)
+    (wrote && out.status.success()).then_some(out.stdout)
 }
 
 #[cfg(test)]
@@ -2621,5 +2690,49 @@ mod tests {
             [cer("a")],
             "a .cer that came back is named again"
         );
+    }
+
+    #[test]
+    fn write_credentials_profile_in_refuses_symlink_machine_key_and_writes_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("aterm-apple-creds-")
+            .tempdir()
+            .unwrap();
+        let ring = dir.path();
+        let real_key = ring.join("real.key");
+        let link_key = ring.join("machine.key");
+        std::fs::write(&real_key, [0x42u8; 32]).unwrap();
+        std::os::unix::fs::symlink(&real_key, &link_key).unwrap();
+        let roster = ring.join("machines.toml");
+        let err = write_credentials_profile_in(ring, "m1", &roster, Some("deadbeef")).unwrap_err();
+        assert!(err.contains("cannot read this machine's key"), "{err}");
+
+        std::fs::remove_file(&link_key).unwrap();
+        std::fs::rename(&real_key, &link_key).unwrap();
+        let written = write_credentials_profile_in(ring, "m1", &roster, Some("deadbeef"))
+            .unwrap()
+            .expect("created profile");
+        let mode = std::fs::symlink_metadata(&written)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        let content = std::fs::read_to_string(&written).unwrap();
+        assert!(content.contains("machine_id = \"m1\"\n"));
+        assert!(content.contains("signing_identity_sha1 = \"deadbeef\"\n"));
+        // Calling a second time returns Ok(None) without overwriting.
+        assert_eq!(
+            write_credentials_profile_in(ring, "m1", &roster, None).unwrap(),
+            None
+        );
+        assert_eq!(
+            enddate_iso("notAfter=Aug 18 16:36:18 2031 GMT").as_deref(),
+            Some("2031-08-18")
+        );
+        assert_eq!(enddate_iso("notAfter=Aug +18 16:36:18 2031 GMT"), None);
+        assert_eq!(enddate_iso("notAfter=Aug 18 16:36:18 +2031 GMT"), None);
     }
 }

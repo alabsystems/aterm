@@ -98,8 +98,7 @@ impl KeeperClient {
     /// # Errors
     /// The dial failing, the keeper failing the identity check (a [`NotThisBuild`] inside `PermissionDenied`), or the check not running (trustd not answering within `timeout` among the reasons).
     pub fn connect(path: &Path, identity: &Identity, timeout: Duration) -> io::Result<Self> {
-        let stream = CtlStream::connect(path)?;
-        aterm_uds::keep_out_of_children(&stream)?;
+        let stream = aterm_uds::kept_out(|| CtlStream::connect(path))?;
         identity.check(&stream, timeout).map_err(check_failed)?;
         stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;
@@ -718,9 +717,8 @@ struct Door {
 
 /// A bell and its door: a socket pair, each end non-blocking and kept out of every child.
 fn doorbell() -> io::Result<(Bell, Door)> {
-    let (near, far) = CtlStream::pair()?;
+    let (near, far) = aterm_uds::kept_out(CtlStream::pair)?;
     for end in [&near, &far] {
-        aterm_uds::keep_out_of_children(end)?;
         end.set_nonblocking(true)?;
     }
     let rung = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -786,51 +784,87 @@ impl Door {
         }
     }
 
-    /// The next op queued, as [`Receiver::recv_timeout`] answers it but waking for the keeper
-    /// too: the op at once when one is queued, else as soon as one is; `Timeout` once `keeper`
-    /// (the link's connection) has something to read or `idle` has passed with neither;
-    /// `Disconnected` once the queue is closed and empty.
+    /// What wakes the worker next: the op queued at once when there is one, else as soon as one
+    /// is; [`Woke::Keeper`] once `keeper` (the link's connection) has something to read with no
+    /// op queued; [`Woke::Idle`] once `idle` has passed with neither; [`Woke::Closed`] once the
+    /// queue is closed and empty. A ring whose op was already taken, or a signal, wakes nobody:
+    /// the wait goes on for what is left of `idle`.
     fn next(
         &mut self,
         rx: &Receiver<Queued>,
         keeper: Option<&KeeperClient>,
         idle: Duration,
-    ) -> Result<Queued, mpsc::RecvTimeoutError> {
+    ) -> Woke {
         use std::os::fd::AsRawFd as _;
-        self.answer();
-        match rx.try_recv() {
-            Err(mpsc::TryRecvError::Empty) => {}
-            taken => return taken.map_err(|_| mpsc::RecvTimeoutError::Disconnected),
-        }
-        if self.hung_up {
-            // Nothing will ring again, and a hung-up door reads ready for good: wait on the
-            // queue alone (the link is gone, so it is closed, or soon will be).
-            return rx.recv_timeout(idle);
-        }
-        let mut fds = [crate::sys::PollFd {
-            fd: self.far.as_raw_fd(),
-            events: crate::sys::POLLIN,
-            revents: 0,
-        }; 2];
-        let watched = match keeper {
-            Some(c) => {
-                fds[1].fd = c.stream.as_raw_fd();
-                2
+        let started = std::time::Instant::now();
+        loop {
+            self.answer();
+            match rx.try_recv() {
+                Ok(queued) => return Woke::Op(queued),
+                Err(mpsc::TryRecvError::Disconnected) => return Woke::Closed,
+                Err(mpsc::TryRecvError::Empty) => {}
             }
-            None => 1,
-        };
-        let millis = i32::try_from(idle.as_millis()).unwrap_or(i32::MAX);
-        match crate::sys::poll(&mut fds[..watched], millis) {
-            Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            // A poll that fails would fail again at once: wait on the queue alone.
-            Err(_) => return rx.recv_timeout(idle),
+            let left = idle.saturating_sub(started.elapsed());
+            if self.hung_up {
+                // Nothing will ring again, and a hung-up door reads ready for good: wait on the
+                // queue alone (the link is gone, so it is closed, or soon will be).
+                return Woke::of(rx.recv_timeout(left));
+            }
+            let mut fds = [crate::sys::PollFd {
+                fd: self.far.as_raw_fd(),
+                events: crate::sys::POLLIN,
+                revents: 0,
+            }; 2];
+            let watched = match keeper {
+                Some(c) => {
+                    fds[1].fd = c.stream.as_raw_fd();
+                    2
+                }
+                None => 1,
+            };
+            // Rounded up, so a wait shorter than a millisecond is not a poll that returns at once.
+            let millis = i32::try_from(left.as_micros().div_ceil(1_000)).unwrap_or(i32::MAX);
+            let (heard, over) = match crate::sys::poll(&mut fds[..watched], millis) {
+                Ok(0) => (false, true),
+                Ok(_) => (watched == 2 && fds[1].revents != 0, false),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => (false, false),
+                // A poll that fails would fail again at once: wait on the queue alone.
+                Err(_) => return Woke::of(rx.recv_timeout(left)),
+            };
+            if !heard && !over && left > Duration::ZERO {
+                continue;
+            }
+            self.answer();
+            return match rx.try_recv() {
+                Ok(queued) => Woke::Op(queued),
+                Err(mpsc::TryRecvError::Disconnected) => Woke::Closed,
+                Err(mpsc::TryRecvError::Empty) if heard => Woke::Keeper,
+                Err(mpsc::TryRecvError::Empty) => Woke::Idle,
+            };
         }
-        self.answer();
-        rx.try_recv().map_err(|e| match e {
-            mpsc::TryRecvError::Empty => mpsc::RecvTimeoutError::Timeout,
-            mpsc::TryRecvError::Disconnected => mpsc::RecvTimeoutError::Disconnected,
-        })
+    }
+}
+
+/// What woke the link's worker ([`Door::next`]).
+enum Woke {
+    /// An op was queued.
+    Op(Queued),
+    /// The keeper wrote a frame or closed the connection, and no op is queued.
+    Keeper,
+    /// The idle wait passed with no op queued and nothing from the keeper.
+    Idle,
+    /// The queue is closed and empty: the link is shut down.
+    Closed,
+}
+
+impl Woke {
+    /// What a wait on the queue alone answered.
+    fn of(waited: Result<Queued, mpsc::RecvTimeoutError>) -> Self {
+        match waited {
+            Ok(queued) => Self::Op(queued),
+            Err(mpsc::RecvTimeoutError::Timeout) => Self::Idle,
+            Err(mpsc::RecvTimeoutError::Disconnected) => Self::Closed,
+        }
     }
 }
 
@@ -854,7 +888,7 @@ struct LinkPeer {
 impl KeeperLink {
     /// Start the worker for the keeper at `path`.
     /// # Errors
-    /// The thread failing to spawn.
+    /// The worker's doorbell (a socket pair) not being made, or the thread failing to spawn.
     pub fn start(path: PathBuf, identity: Identity, build: String) -> io::Result<Self> {
         Self::start_on(path, identity, build, None)
     }
@@ -1061,7 +1095,8 @@ enum Send {
 /// How long an idle link's worker waits, with no op queued and nothing from the keeper to read,
 /// before it looks again: what paces its tries at a keeper it lost. A queued op rings its door and
 /// a keeper's frame (a SYNC's answer, a refusal, the keeper's close) makes its socket readable,
-/// and either wakes it at once ([`Door::next`]).
+/// and either wakes it at once ([`Door::next`]). Only an op's wake or this one dials a keeper,
+/// never the wake a keeper's close made.
 pub const LINK_POLL: Duration = Duration::from_millis(500);
 
 fn link_worker(
@@ -1078,18 +1113,23 @@ fn link_worker(
     let mut backoff = Duration::from_millis(50);
     let mut next_try = std::time::Instant::now();
     loop {
-        let (op, ack) = match door.next(&rx, client.as_ref(), peer.idle) {
-            Ok(queued) => {
+        // A wake only the keeper caused (its answer, its refusal, its close) dials nobody: a
+        // keeper that closed the link is tried again on the next op or idle wake, as one the
+        // worker found gone there would be, so one that drops every link it welcomes is not
+        // dialled again the moment it does.
+        let (op, ack, heard) = match door.next(&rx, client.as_ref(), peer.idle) {
+            Woke::Op(queued) => {
                 if queued.1.is_none() {
                     room.give_back(1);
                 }
                 match claim_queued(queued, std::time::Instant::now()) {
-                    Some((op, ack)) => (Some(op), ack),
+                    Some((op, ack)) => (Some(op), ack, false),
                     None => continue,
                 }
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => (None, None),
-            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            Woke::Keeper => (None, None, true),
+            Woke::Idle => (None, None, false),
+            Woke::Closed => return,
         };
         if let Some(c) = &client {
             let open = c.drain_with_refusals(|rdev, synced_before| {
@@ -1184,7 +1224,7 @@ fn link_worker(
             continue;
         }
         let fresh = client.is_none();
-        if fresh && (ack.is_some() || std::time::Instant::now() >= next_try) {
+        if fresh && !heard && (ack.is_some() || std::time::Instant::now() >= next_try) {
             client = reconnect(peer, &mut held, &metas, &mut owed);
             if client.is_some() {
                 backoff = Duration::from_millis(50);
@@ -1866,6 +1906,91 @@ mod tests {
             "a link shut down ends without waiting out its idle"
         );
         drop(server);
+    }
+
+    /// A keeper that welcomes a link and then closes it is tried again on the link's next op or
+    /// its idle wait, never on the wake its close caused: a worker that dialled there would dial
+    /// a keeper dropping every link it welcomes as fast as it could, with no pause between.
+    #[test]
+    fn a_keeper_that_closes_the_link_is_not_dialled_again_on_its_close() {
+        use crate::wire::Kind;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        /// Read `stream`'s frames, welcoming its HELLO, up to and including one of kind `last`.
+        fn kinds_until(stream: &std::os::unix::net::UnixStream, last: Kind) -> Vec<Kind> {
+            stream
+                .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
+                .expect("its hang detector");
+            let mut kinds = Vec::new();
+            loop {
+                let frame = read_frame(stream).expect("read").expect("a frame").frame;
+                kinds.push(frame.kind());
+                if matches!(frame, Frame::Hello { .. }) {
+                    let welcome = Frame::Welcome {
+                        proto: PROTO,
+                        offers: 0,
+                        version: "closing".into(),
+                        identity: Some(IdentityPolicy::SameUid),
+                        caps: Some(0),
+                    };
+                    write_frame(stream, &welcome, None).expect("welcome");
+                }
+                if frame.kind() == last {
+                    return kinds;
+                }
+            }
+        }
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("akl-closed-")
+            .tempdir()
+            .expect("exclusive closing-keeper fixture");
+        let sock = scratch.path().join("k.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+        let asked = std::sync::Arc::new(AtomicBool::new(false));
+        let (closed_tx, closed) = mpsc::sync_channel(1);
+        let keeper = {
+            let asked = std::sync::Arc::clone(&asked);
+            std::thread::spawn(move || {
+                let (first, _) = listener.accept().expect("the first link");
+                let first_kinds = kinds_until(&first, Kind::Register);
+                drop(first);
+                closed_tx.send(()).expect("the test waits for the close");
+                let (second, _) = listener.accept().expect("the second link");
+                let unasked = !asked.load(Ordering::SeqCst);
+                (first_kinds, unasked, kinds_until(&second, Kind::Pending))
+            })
+        };
+        let (_, register) = register_op("/dev/null", 1);
+        let link = KeeperLink::start_idling(
+            sock,
+            Identity::same_uid(),
+            "t".into(),
+            None,
+            None,
+            false,
+            IDLE_FOR_GOOD,
+        )
+        .expect("link");
+        assert!(link.enqueue(register));
+        closed
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("the keeper read the REGISTER and closed the link");
+        // Neither an op nor the link's idle wait comes here, so a dial in this pause is one the
+        // close's own wake made. Its length is only how sure the test is to see one.
+        std::thread::sleep(LINK_POLL);
+        asked.store(true, Ordering::SeqCst);
+        assert!(
+            link.send_and_wait(LinkOp::Pending { pid: 1 }, aterm_spec::wait::MUST_HAPPEN),
+            "a waited op dials the keeper at once"
+        );
+        let (first, unasked, second) = keeper.join().expect("the closing keeper");
+        assert_eq!(first, [Kind::Hello, Kind::Register]);
+        assert!(
+            !unasked,
+            "the link dialled the keeper again on its close, with no op queued and its idle wait \
+             not over"
+        );
+        assert_eq!(second, [Kind::Hello, Kind::Register, Kind::Pending]);
+        link.shutdown();
     }
 
     #[test]

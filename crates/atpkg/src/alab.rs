@@ -277,6 +277,14 @@ pub fn exe_is_alab(exe: &Path) -> bool {
     alab_root_of_exe(exe).is_some()
 }
 
+/// The recorded package version whose validated entrypoint is `exe`, independent of the
+/// currently selected store build or development link. This is display metadata, not proof
+/// of the running image's compiled identity or supervisor authority.
+#[must_use]
+pub fn package_version_of_exe(exe: &Path) -> Option<String> {
+    package_version(&alab_root_of_exe(exe)?)
+}
+
 /// The ALab package root whose entrypoint IS `exe` ([`exe_is_alab`]'s reading), canonical.
 pub(crate) fn alab_root_of_exe(exe: &Path) -> Option<PathBuf> {
     let exe = std::fs::canonicalize(exe).ok()?;

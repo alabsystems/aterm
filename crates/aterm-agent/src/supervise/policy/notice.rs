@@ -130,14 +130,14 @@ pub const WHYS: &[&str] = &[
     WHY_TURN_YOURS,
 ];
 
-/// The `/login` aterm typed opened its browser sign-in (the hand-off read on the screen), the method picker answered with the method the session already uses: the sign-in in the browser is the one step left, and only the owner can take it. Only over a login no roster row names (`login_label`: none lists the login, its row has no email, or `logins` is off) and no move put the session on: aterm's sign-in ladder has no row to sign in there, and the host's discovery, asked once before `/login` is typed (`IdleHost::login_discover`: the upkeep's sync, which adopts the default login's address), named none, or named it only after the hand-off was decided (and then aterm backs out of it, `super::login::backs_out`).
+/// The `/login` aterm typed reached its browser sign-in (the hand-off read on the screen), the person having picked the method at its picker (aterm never presses that pick, which brings the browser forward: `super::login::pick_method`): the sign-in in the browser is the one step left, and only the owner can take it. Only over a login no roster row names (`login_label`: none lists the login, its row has no email, or `logins` is off) and no move put the session on: aterm's sign-in ladder has no row to sign in there, and the host's discovery, asked once before `/login` is typed (`IdleHost::login_discover`: the upkeep's sync, which adopts the default login's address), named none, or named it only after the hand-off was decided (and then aterm backs out of it, `super::login::backs_out`).
 pub const LOGIN_SIGN_IN: NoticeText = NoticeText {
     id: "login-sign-in",
     code: "si",
     title: "Claude's login expired",
     short_title: "Login expired",
     happened: EXPIRED,
-    did: "aterm typed /login in the tab and opened the sign-in in your browser.",
+    did: "aterm typed /login in the tab, and its sign-in waits in your browser.",
     todo: "Finish the browser sign-in.",
     todo_as: None,
     expect: CONTINUES,
@@ -154,7 +154,7 @@ pub const LOGIN_SIGN_IN_AS: NoticeText = NoticeText {
     title: "Claude's login expired",
     short_title: "Login expired",
     happened: EXPIRED,
-    did: "aterm typed /login in the tab and opened the sign-in in your browser.",
+    did: "aterm typed /login in the tab, and its sign-in waits in your browser.",
     todo: "Sign in to {label} in your browser.",
     todo_as: None,
     expect: CONTINUES,
@@ -164,7 +164,7 @@ pub const LOGIN_SIGN_IN_AS: NoticeText = NoticeText {
     back: BACK,
 };
 
-/// The method picker of the `/login` aterm typed, which aterm does not answer: nothing says the session signs in with a subscription (the only method chosen for the owner), or the picker is not drawn as the one measured — or Console's own menu behind it (`How do you want to sign in?`, one of whose options mints an API key). Not over a login whose sign-in nobody needs (a roster row's, `login_label`; one back in another tab; one a renewal the tab follows replaced: `super::login::nobody_signs_in`), whose picker aterm backs out of (`super::login::backs_out`) and whose Console menu it tells nothing at but where the login is back in another tab ([`LOGIN_BACK_DIALOG`]).
+/// The method picker of the `/login` aterm typed, which aterm never answers, since every pick opens a sign-in only a person finishes, the subscription's bringing the browser forward (`super::login::pick_method`) — or Console's own menu behind it (`How do you want to sign in?`, one of whose options mints an API key). Not over a login whose sign-in nobody needs (a roster row's, `login_label`; one back in another tab; one a renewal the tab follows replaced: `super::login::nobody_signs_in`), whose picker aterm backs out of (`super::login::backs_out`) and whose Console menu it tells nothing at but where the login is back in another tab ([`LOGIN_BACK_DIALOG`]).
 pub const LOGIN_CHOOSE: NoticeText = NoticeText {
     id: "login-choose",
     code: "ch",

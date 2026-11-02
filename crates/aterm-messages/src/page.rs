@@ -116,6 +116,11 @@ pub trait Host {
     fn saved(&self) -> bool;
     /// Reader's local clock offset from UTC in seconds (0 if unknown).
     fn utc_offset_s(&self) -> i64;
+    /// Reader's local clock offset from UTC at `unix_s` (unix seconds), defaulting to
+    /// [`Self::utc_offset_s`].
+    fn utc_offset_at(&self, _unix_s: i64) -> i64 {
+        self.utc_offset_s()
+    }
     /// Build number currently staged by the updater, if any.
     fn staged_build(&self) -> Option<u64>;
     /// Whether `path` exists as a regular file.
@@ -149,6 +154,9 @@ pub struct MessagesState {
     pub saved: bool,
     /// Reader's UTC offset in seconds ([`Host::utc_offset_s`]).
     pub utc_offset_s: i64,
+    /// Sorted `(unix_ms, offset_s)` pairs for entry stamps ([`Host::utc_offset_at`]); falls back
+    /// to [`Self::utc_offset_s`] when empty or absent.
+    pub entry_offsets: Vec<(u64, i64)>,
 }
 
 impl MessagesState {
@@ -164,7 +172,16 @@ impl MessagesState {
             log_folder: None,
             saved: true,
             utc_offset_s: 0,
+            entry_offsets: Vec::new(),
         }
+    }
+
+    /// Reader's UTC offset in seconds at `unix_ms` ([`Self::entry_offsets`], else [`Self::utc_offset_s`]).
+    #[must_use]
+    pub fn offset_for(&self, unix_ms: u64) -> i64 {
+        self.entry_offsets
+            .binary_search_by_key(&unix_ms, |(ms, _)| *ms)
+            .map_or(self.utc_offset_s, |idx| self.entry_offsets[idx].1)
     }
 
     /// Looks up the entry with raw ID `id`.
@@ -203,7 +220,14 @@ impl MessagesState {
             .entries
             .iter()
             .flat_map(|entry| [entry.at_unix_ms, entry.began_unix_ms])
-            .map(|at| words::words_change_after(self.now_unix_ms, at, self.utc_offset_s))
+            .map(|at| {
+                words::words_change_after_at(
+                    self.now_unix_ms,
+                    self.utc_offset_s,
+                    at,
+                    self.offset_for(at),
+                )
+            })
             .min()?
             .min(self.now_unix_ms.saturating_add(86_400_000));
         let same_offset =
@@ -310,6 +334,7 @@ impl MessagesState {
                 .into_iter()
                 .filter(|(tag, _)| !tags::ALL.iter().any(|own| own.as_str() == tag)),
         );
+        let entry_offsets = entry_offsets_for(&entries, host);
         Self {
             revision: center.projection_revision(),
             now_unix_ms,
@@ -319,8 +344,27 @@ impl MessagesState {
             log_folder: host.log_folder(),
             saved: host.saved(),
             utc_offset_s: host.utc_offset_s(),
+            entry_offsets,
         }
     }
+}
+
+fn entry_offsets_for(entries: &[MessageView], host: &impl Host) -> Vec<(u64, i64)> {
+    let mut stamps: Vec<u64> = entries
+        .iter()
+        .flat_map(|entry| [entry.at_unix_ms, entry.began_unix_ms])
+        .collect();
+    stamps.sort_unstable();
+    stamps.dedup();
+    stamps
+        .into_iter()
+        .map(|ms| {
+            (
+                ms,
+                host.utc_offset_at(i64::try_from(ms / 1000).unwrap_or(i64::MAX)),
+            )
+        })
+        .collect()
 }
 
 /// Single message record projected for display on the page.
@@ -573,9 +617,26 @@ impl MessageView {
     /// Formats the expanded entry's meta line (`<time> · <tag> · <severity> · <state>`).
     #[must_use]
     pub fn meta_words(&self, now_unix_ms: u64, utc_offset_s: i64) -> String {
+        self.meta_words_at(now_unix_ms, utc_offset_s, utc_offset_s)
+    }
+
+    /// [`Self::meta_words`], with `now_unix_ms` at `now_offset_s` and [`Self::began_unix_ms`] at
+    /// `began_offset_s`.
+    #[must_use]
+    pub fn meta_words_at(
+        &self,
+        now_unix_ms: u64,
+        now_offset_s: i64,
+        began_offset_s: i64,
+    ) -> String {
         let meta = format!(
             "{} \u{00b7} {}",
-            words::local_words(now_unix_ms, self.began_unix_ms, utc_offset_s),
+            words::local_words_at(
+                now_unix_ms,
+                now_offset_s,
+                self.began_unix_ms,
+                began_offset_s
+            ),
             self.state_words()
         );
         if self.repeats > 1 {
@@ -845,7 +906,18 @@ impl MessagesClock {
     /// Builds calendar context for `visible` entries at `now_unix_ms` and `offset_s`.
     #[must_use]
     pub fn of(visible: &[&MessageView], now_unix_ms: u64, offset_s: i64) -> Self {
-        let day = |e: &&MessageView| words::local_day(e.at_unix_ms, offset_s);
+        Self::of_local(visible, now_unix_ms, offset_s, &|_| offset_s)
+    }
+
+    /// [`Self::of`], reading each entry's UTC offset via `offset_for(at_unix_ms)`.
+    #[must_use]
+    pub fn of_local(
+        visible: &[&MessageView],
+        now_unix_ms: u64,
+        offset_s: i64,
+        offset_for: &dyn Fn(u64) -> i64,
+    ) -> Self {
+        let day = |e: &&MessageView| words::local_day(e.at_unix_ms, offset_for(e.at_unix_ms));
         let today = words::local_day(now_unix_ms, offset_s);
         let headed = visible.iter().any(|e| day(e) < today);
         Self {
@@ -861,11 +933,17 @@ impl MessagesClock {
     /// words for its day ("Yesterday", "Fri, 16 Oct"), as local as the header.
     #[must_use]
     pub fn when(self, at_unix_ms: u64) -> String {
-        let day = words::local_day(at_unix_ms, self.offset_s);
+        self.when_at(at_unix_ms, self.offset_s)
+    }
+
+    /// [`Self::when`], reading `at_unix_ms` at `at_offset_s`.
+    #[must_use]
+    pub fn when_at(self, at_unix_ms: u64, at_offset_s: i64) -> String {
+        let day = words::local_day(at_unix_ms, at_offset_s);
         if day >= self.today {
             words::relative_words(self.now_unix_ms, at_unix_ms)
         } else if self.headed {
-            words::clock_words(at_unix_ms, self.offset_s)
+            words::clock_words(at_unix_ms, at_offset_s)
         } else {
             words::day_heading(self.today, day, true)
         }
@@ -876,11 +954,17 @@ impl MessagesClock {
     /// ([`words::day_forms`]); how long ago without its "ago" ("12 min ago", then "12 min").
     #[must_use]
     pub fn when_forms(self, at_unix_ms: u64) -> Vec<String> {
-        let day = words::local_day(at_unix_ms, self.offset_s);
+        self.when_forms_at(at_unix_ms, self.offset_s)
+    }
+
+    /// [`Self::when_forms`], reading `at_unix_ms` at `at_offset_s`.
+    #[must_use]
+    pub fn when_forms_at(self, at_unix_ms: u64, at_offset_s: i64) -> Vec<String> {
+        let day = words::local_day(at_unix_ms, at_offset_s);
         let mut forms = if day < self.today && !self.headed {
             words::day_forms(self.today, day)
         } else {
-            vec![self.when(at_unix_ms)]
+            vec![self.when_at(at_unix_ms, at_offset_s)]
         };
         if let Some(short) = forms.first().and_then(|when| when.strip_suffix(" ago")) {
             forms.push(short.to_string());
@@ -891,6 +975,16 @@ impl MessagesClock {
     /// Local day numbers for each entry in `visible` when [`Self::headed`] is true.
     #[must_use]
     pub fn sections(self, visible: &[&MessageView]) -> Option<Vec<i64>> {
+        self.sections_local(visible, &|_| self.offset_s)
+    }
+
+    /// [`Self::sections`], reading each entry's UTC offset via `offset_for(at_unix_ms)`.
+    #[must_use]
+    pub fn sections_local(
+        self,
+        visible: &[&MessageView],
+        offset_for: &dyn Fn(u64) -> i64,
+    ) -> Option<Vec<i64>> {
         if !self.headed {
             return None;
         }
@@ -904,7 +998,7 @@ impl MessagesClock {
                         in_open_run = false;
                         floor = self.today;
                     }
-                    floor = floor.min(words::local_day(e.at_unix_ms, self.offset_s));
+                    floor = floor.min(words::local_day(e.at_unix_ms, offset_for(e.at_unix_ms)));
                     floor
                 })
                 .collect(),
@@ -983,8 +1077,10 @@ impl MessagesState {
 pub fn wire_lines(state: &MessagesState, filter: &MessagesFilter) -> Vec<String> {
     let visible: Vec<&MessageView> = state.entries.iter().filter(|e| filter.admits(e)).collect();
     let chips = state.chips(filter.warn_only);
-    let clock = MessagesClock::of(&visible, state.now_unix_ms, state.utc_offset_s);
-    let sections = clock.sections(&visible);
+    let offset_for = |ms| state.offset_for(ms);
+    let clock =
+        MessagesClock::of_local(&visible, state.now_unix_ms, state.utc_offset_s, &offset_for);
+    let sections = clock.sections_local(&visible, &offset_for);
     let mut lines = Vec::with_capacity(1 + chips.len() + 2 * visible.len());
     lines.push(page_line(state, filter, visible.len()));
     let tag = filter.tag.as_deref();
@@ -1078,13 +1174,20 @@ fn page_line(state: &MessagesState, filter: &MessagesFilter, shown: usize) -> St
 /// words on `clock`.
 fn entry_line(state: &MessagesState, clock: MessagesClock, entry: &MessageView) -> String {
     let (sentence, technical) = entry.sentence_and_technical();
+    let at_offset = state.offset_for(entry.at_unix_ms);
+    let began_offset = state.offset_for(entry.began_unix_ms);
     Line::new("entry")
         .num("id", entry.id)
         .num("at", entry.at_unix_ms)
-        .field("when", &clock.when(entry.at_unix_ms))
+        .field("when", &clock.when_at(entry.at_unix_ms, at_offset))
         .field(
             "local",
-            &words::local_words(state.now_unix_ms, entry.began_unix_ms, state.utc_offset_s),
+            &words::local_words_at(
+                state.now_unix_ms,
+                state.utc_offset_s,
+                entry.began_unix_ms,
+                began_offset,
+            ),
         )
         .field("tag", &entry.tag)
         .field("tag_words", &tag_words(&entry.tag))
@@ -1100,7 +1203,7 @@ fn entry_line(state: &MessagesState, clock: MessagesClock, entry: &MessageView) 
         .lines("technical", &technical)
         .field(
             "meta",
-            &entry.meta_words(state.now_unix_ms, state.utc_offset_s),
+            &entry.meta_words_at(state.now_unix_ms, state.utc_offset_s, began_offset),
         )
         .field("copy", &entry.copy_text())
         .0

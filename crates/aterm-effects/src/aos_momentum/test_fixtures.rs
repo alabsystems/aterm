@@ -12,7 +12,9 @@ use aterm_aos::task::{Code, state_digest};
 use aterm_render::GlowQuad;
 use aterm_time::Instant;
 
-use super::corpus::SplitMix;
+use super::corpus::{GOLDEN_TRACE_TARGET, SplitMix};
+use super::m4::Evaluator;
+use super::policy::PolicyRefusal;
 use super::{
     HostMode, Hosted, MOMENTUM_MAX_EVENTS, MOMENTUM_QUEUE_CAP, MomentumCode, MomentumHost,
     MomentumSchema, NoStrandedLight, PrebuiltMomentum, Sched,
@@ -24,6 +26,30 @@ use crate::cursor_momentum::{
 };
 
 pub(super) const TAU: f32 = MOMENTUM_GLOW_TAU_S;
+
+/// Whether this target is the one v1's pins were measured on ([`GOLDEN_TRACE_TARGET`]): the
+/// system libm [`super::NUMERIC_PROFILE`] names computes the glow's `exp` and `ln`, so another
+/// target's lane digests and chains are its own and its profile is another policy, which v1
+/// refuses as mutated (`the_policy_is_pinned` holds that refusal on every target).
+pub(super) fn pinned_here() -> bool {
+    super::target_name() == GOLDEN_TRACE_TARGET
+}
+
+/// Whether this target judges nothing under v1's pins: off [`GOLDEN_TRACE_TARGET`]
+/// ([`pinned_here`]) [`Evaluator::v1`] refuses this target's profile as a mutated policy, and a
+/// test that judges under those pins asserts that refusal and goes no further, as aterm-gui's
+/// publishing tests do (`the_policy_is_pinned` holds the refusal's digests).
+pub(super) fn refused_off_the_pinned_target() -> bool {
+    if pinned_here() {
+        return false;
+    }
+    let refused = Evaluator::v1(BUILD, Instant::now()).err();
+    assert!(
+        matches!(refused, Some(PolicyRefusal::PolicyMutated { .. })),
+        "off {GOLDEN_TRACE_TARGET} v1 is refused as another policy: {refused:?}"
+    );
+    true
+}
 
 /// The shipped 120 Hz effect lane.
 pub(super) const LANE: Duration = Duration::from_nanos(16_666_667);
@@ -88,6 +114,7 @@ pub(super) fn cfg(dark: bool) -> MomentumGlowConfig {
         theme_fg: if dark { 0x00C8_C8D2 } else { 0x0024_292F },
         theme_bg: if dark { 0x0010_1016 } else { 0x00FF_FFFF },
         block: true,
+        bar: false,
         glyph_span: None,
         light_vivid: false,
         chosen_hue: false,

@@ -162,7 +162,7 @@ pub fn pid_version(pid: u32) -> Option<i32> {
 /// `/proc/<pid>/statm`'s resident pages (its second field).
 #[must_use]
 pub fn parse_statm_resident(text: &str) -> Option<u64> {
-    text.split_whitespace().nth(1)?.parse().ok()
+    crate::parse_uint(text.split_whitespace().nth(1)?)
 }
 
 /// A start on the boot clock (`start_ns` since boot, sleep included, as Linux counts a process's start) as unix ms, against the boot clock and the wall clock read together (`boot_now_ns`, `unix_now_ms`). A start after that moment (a process born while the sweep ran) is that moment; `None` before the epoch.

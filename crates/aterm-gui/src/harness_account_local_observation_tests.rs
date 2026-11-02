@@ -180,6 +180,7 @@ fn loss_time_tracks_authentication_context_and_allows_record_metadata() {
     let old = idle.account_look(&a.roster()).unwrap();
     assert_eq!(idle.lost_seen(&old, login_wall(), 10), Some(10));
     let mut next = AccountLook {
+        screen_wall: None,
         profile_env: old.profile_env.clone(),
         snap: old.snap.clone(),
         who: old.who.clone(),
@@ -217,6 +218,7 @@ fn local_case(case: i64) -> [i64; 3] {
             at: 17,
         });
         AccountLook {
+            screen_wall: None,
             profile_env: Vec::new(),
             who: accounts::ProcessLogin {
                 login: None,

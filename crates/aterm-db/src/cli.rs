@@ -14,14 +14,21 @@ use std::{
     collections::BTreeMap, ffi::OsString, io::Write, net::SocketAddr, path::Path, process::ExitCode,
 };
 
+#[path = "cli_lineage.rs"]
+mod lineage;
+
 /// Command help. Mutation request IDs are caller-held, so lost replies are safely retried.
 pub const USAGE: &str = "aterm db — encrypted embedded application databases (Unix)\n\
   Commons tables use enrolled secrets and default LAN repair (no --dir):\n\
   commons-status                       local membership, control history and sharing setting\n\
+  commons-lineage                      verified predecessor-to-current public writer identities\n\
   network-state                        live local observer or retained history; never grants access\n\
   commons-authority                    inspect cached admin control metadata; changes nothing\n\
   commons-tables                       list declarations, provenance and subscriptions\n\
   commons-inventory --table <digest>    local retained operation counts and fingerprints\n\
+                    [--records <1..256> [--after <digest>]]\n\
+                                       page operation IDs and eligibility; no values or keys\n\
+  commons-custody --table <digest>      inspect local recovery evidence without changing custody\n\
   commons-open --application <id> --role <id> [--version <n>]\n\
                                        open a deterministic offline application table\n\
   commons-create --application <id> --role <id> [--version <n>] [--name <name>]\n\
@@ -41,7 +48,24 @@ pub const USAGE: &str = "aterm db — encrypted embedded application databases (
         --parents <digest,...|none> --request <hex>\n\
                                       root-sign one reviewed login-preparation decision\n\
   accounts-stop --account <digest> --parents <digest,...|none> --request <hex>\n\
+  accounts-intent --account <digest> --key <id> --parents <digest,...|none> --request <hex>\n\
+                                      root-authorize automatic preparation on admitted machines\n\
   accounts-prepare --account <digest>  validate current permission and binding; no login\n\
+  accounts-billing-propose --allocation <hex> --provider <id> --adapter <id> [--base <file>]\n\
+                                      print an untrusted policy and account billing references\n\
+  accounts-billing-inspect --file <path>\n\
+                                      inspect proposed policy terms without opening a vault\n\
+  accounts-billing-prepare --account <digest>\n\
+                                      observe current root-pinned billing; no ledger or provider effect\n\
+  accounts-broker-propose --account <digest> --grant <hex> --producer <digest> [--seconds <1..3600>] [--base <file>]\n\
+                                      print an untrusted grant policy from current billing\n\
+  accounts-broker-inspect --file <path> inspect proposed grants offline; grants no rights\n\
+  accounts-broker-refresh --grant <hex>\n\
+                                      propose current bindings without changing producer identity\n\
+  accounts-request (--grant <hex> | --account <digest>) --request <hex> --file <private-json> [--seconds <1..60>]\n\
+                                      one Google text request through a root-authorized broker grant\n\
+  accounts-preview-csv --file <path>    exact inert candidates, without enrollment or writes\n\
+  accounts-compare-csv --file <path>    counts-only differences from retained imports\n\
   accounts-import-csv --file <path> --request <hex>\n\
                                        one atomic, inert CSV candidate document\n\
   accounts-imports                    shared candidates and signed provenance\n\
@@ -81,7 +105,8 @@ pub const USAGE: &str = "aterm db — encrypted embedded application databases (
   serve --listen <LAN-ip:port> [--peers <ip:port,ip:port>]\n\
   nonce                                generate a public 16-byte request ID\n\
 Accounts values: provider, method (oauth|device|api-key|browser|cli|email-link|phone|passkey), optional\n\
-email, realm, plan, secret_ref {vault,entry}, machines (preferred-first list).\n\
+email, realm, plan, secret_ref {vault,entry}, machines (preferred-first list),\n\
+billing {principal,policy} (root-approved request-count terms; API-key accounts only).\n\
 Account records are proposals, not permission to dispatch credentials. Raw secrets\n\
 belong in aterm secrets. Budget units are managed admissions, not vendor billing.\n\
 One machine works alone. Two synchronize as peers; no third voter is required.\n\
@@ -101,6 +126,9 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
     };
     if words.is_empty() || words.iter().any(|w| w == "--help" || w == "-h") {
         return aterm_uds::stdout::answer_exit("aterm db", USAGE, 0);
+    }
+    if words[0] == "accounts-request" {
+        return crate::accounts::broker::command::main_entry(&words[1..]);
     }
     match run(&words) {
         Ok(value) => match aterm_json::to_string(&value) {
@@ -131,10 +159,14 @@ pub fn run(words: &[String]) -> Result<Value> {
     if !remainder.is_empty() {
         return Err(Error::new("database option needs a value"));
     }
-    if command == "inspect-csv" {
+    if matches!(command, "inspect-csv" | "accounts-preview-csv") {
         let file = take(&mut options, "--file")?;
         empty(&options)?;
-        return crate::import::inspect(Path::new(file));
+        return if command == "inspect-csv" {
+            crate::import::inspect(Path::new(file))
+        } else {
+            crate::import::commons::preview(Path::new(file))
+        };
     }
     if command == "nonce" {
         if !options.is_empty() {
@@ -176,18 +208,38 @@ pub fn run(words: &[String]) -> Result<Value> {
             || (std::time::Instant::now(), aterm_time::unix_millis()),
         );
     }
+    if command == "commons-lineage" {
+        empty(&options)?;
+        return lineage::run();
+    }
+    if matches!(
+        command,
+        "accounts-billing-propose" | "accounts-billing-inspect" | "accounts-billing-prepare"
+    ) {
+        return crate::accounts::billing::command::run(command, options);
+    }
+    if matches!(
+        command,
+        "accounts-broker-propose" | "accounts-broker-inspect" | "accounts-broker-refresh"
+    ) {
+        return crate::accounts::broker::command::policy_command(command, options);
+    }
     if matches!(
         command,
         "commons-status"
             | "commons-authority"
             | "commons-tables"
             | "commons-inventory"
+            | "commons-custody"
             | "commons-open"
             | "commons-create"
     ) {
         return crate::catalog::command::run(command, options);
     }
-    if matches!(command, "accounts-import-csv" | "accounts-imports") {
+    if matches!(
+        command,
+        "accounts-import-csv" | "accounts-imports" | "accounts-compare-csv"
+    ) {
         return crate::import::commons::run(command, options);
     }
     if matches!(
@@ -205,6 +257,7 @@ pub fn run(words: &[String]) -> Result<Value> {
         "accounts-activation-init"
             | "accounts-activation-status"
             | "accounts-authorize"
+            | "accounts-intent"
             | "accounts-stop"
             | "accounts-prepare"
     ) {
@@ -320,9 +373,18 @@ pub fn run(words: &[String]) -> Result<Value> {
             let requested = options.remove("--name");
             empty(&options)?;
             let mut db = Database::open(dir)?;
+            if !db.credentials.has_control_authority() {
+                return Err(Error::new(
+                    "this replica does not hold administrative signing authority",
+                ));
+            }
             let actor = db.credentials.manifest.control_actor();
-            if let Some((_, old)) = db.history.find_request(&actor, request) {
-                if let Command::Write { changes, .. } = old
+            if let Some((_, old)) = db
+                .history
+                .find_request(&actor, request)
+                .map(|(id, c)| (id, c.clone()))
+            {
+                if let Command::Write { changes, .. } = &old
                     && changes.len() == 1
                     && changes[0].collection == "machines"
                     && changes[0].key == key
@@ -332,16 +394,14 @@ pub fn run(words: &[String]) -> Result<Value> {
                         .as_ref()
                         .and_then(|v| v.get("name"))
                         .and_then(Value::as_str)
-                        .ok_or_else(|| Error::new("stored machine assignment has no name"))?;
+                        .ok_or_else(|| Error::new("stored machine assignment has no name"))?
+                        .to_owned();
                     if requested
                         .map(crate::machines::Name::parse)
                         .transpose()?
                         .is_none_or(|n| n.canonical() == name)
                     {
-                        let id = db
-                            .history
-                            .retry(&actor, old)?
-                            .ok_or_else(|| Error::new("machine assignment receipt is absent"))?;
+                        let id = db.commit(old)?;
                         return Ok(
                             json!({"machine":key,"name":name,"operation":hex::encode_lower(&id),"request":hex::encode_lower(&request)}),
                         );
@@ -555,9 +615,39 @@ fn network_state_value_with(
     let network = network.current_at(now, wall);
     let services = services.current_at(now, wall);
     let service = |state: aterm_types::network_state::ServiceState| {
+        // A new service field needs an explicit wire decision rather than silently disappearing.
+        let aterm_types::network_state::ServiceState {
+            availability,
+            observed_at_ms,
+            last_success_ms,
+            network_materialization,
+            http204_response,
+            network_refresh,
+            revision,
+            detail,
+            refresh_failed,
+        } = state;
         json!({
-        "availability":format!("{:?}",state.availability),"observed_at_ms":state.observed_at_ms,
-        "last_success_ms":state.last_success_ms,"revision":state.revision,"detail":state.detail,"refresh_failed":state.refresh_failed})
+        "availability":format!("{availability:?}"),"observed_at_ms":observed_at_ms,
+        "last_success_ms":last_success_ms,"revision":revision,"detail":detail,"refresh_failed":refresh_failed,
+        "network_materialization":network_materialization.map(|receipt|json!({
+            "source":match receipt.source {
+                aterm_types::network_state::VaultNetworkSource::ConfiguredUrl => "configured_url",
+                aterm_types::network_state::VaultNetworkSource::PeerUrl => "peer_url",
+            },
+            "sequence":receipt.sequence,"sampled_at_ms":receipt.sampled_at_ms,
+        })),
+        "http204_response":http204_response.map(|response|json!({
+            "source":match response.source {
+                aterm_types::network_state::VaultNetworkSource::ConfiguredUrl => "configured_url",
+                aterm_types::network_state::VaultNetworkSource::PeerUrl => "peer_url",
+            },
+            "responded_at_ms":response.responded_at_ms,
+        })),
+        "network_refresh":network_refresh.map(|refresh|json!({
+            "outcome":format!("{:?}",refresh.outcome),
+            "completed_at_ms":refresh.completed_at_ms,
+        }))})
     };
     json!({"live_observation":network.via_local_process.is_some(),
         "live_observation_error":live_error.map(|error|format!("{:?}",error.kind)),
@@ -580,6 +670,9 @@ fn empty(options: &BTreeMap<&str, &str>) -> Result<()> {
     }
 }
 fn unsigned(s: &str) -> Result<u64> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(Error::new("expected unsigned admission units"));
+    }
     s.parse()
         .map_err(|_| Error::new("expected unsigned admission units"))
 }
@@ -639,6 +732,103 @@ mod network_state_tests {
             },
             at,
         )
+    }
+
+    #[test]
+    fn vault_network_receipt_json_remains_historical_after_local_observation_expires() {
+        use aterm_types::network_state::{
+            VaultNetworkMaterialization, VaultNetworkRefresh, VaultNetworkRefreshOutcome,
+            VaultNetworkSource,
+        };
+        let at = Instant::now();
+        let mut states = ServiceStates::default();
+        states.secrets.availability = ServiceAvailability::Cached;
+        states.secrets.observed_at_ms = 100_000;
+        states.secrets.network_materialization = Some(VaultNetworkMaterialization {
+            source: VaultNetworkSource::PeerUrl,
+            sequence: 17,
+            sampled_at_ms: 80_000,
+        });
+        states.secrets.refresh_failed = true;
+        states.secrets.network_refresh = Some(VaultNetworkRefresh {
+            completed_at_ms: 90_000,
+            outcome: VaultNetworkRefreshOutcome::Failed,
+        });
+        let value = network_state_value_with(
+            network(at, 100_000),
+            None,
+            || crate::service_state::Publication::new(states, at),
+            || (at + Duration::from_secs(61), Some(161_000)),
+        );
+        assert_eq!(
+            value["services"]["secrets"]["availability"],
+            json!("Unknown")
+        );
+        assert_eq!(value["services"]["secrets"]["last_success_ms"], Value::Null);
+        assert_eq!(value["services"]["secrets"]["refresh_failed"], json!(true));
+        assert_eq!(
+            value["services"]["secrets"]["network_refresh"],
+            json!({"outcome":"Failed", "completed_at_ms":90_000})
+        );
+        assert_eq!(
+            value["services"]["secrets"]["network_materialization"],
+            json!({
+                "source":"peer_url", "sequence":17, "sampled_at_ms":80_000,
+            })
+        );
+        assert_eq!(
+            value["services"]["accounts"]["network_materialization"],
+            Value::Null
+        );
+        assert_eq!(
+            value["services"]["accounts"]["network_refresh"],
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn a_retained_204_json_does_not_establish_access_or_signed_materialization() {
+        use aterm_types::network_state::{
+            VaultHttp204Response, VaultNetworkRefresh, VaultNetworkRefreshOutcome,
+            VaultNetworkSource,
+        };
+        let at = Instant::now();
+        let mut states = ServiceStates::default();
+        states.secrets.availability = ServiceAvailability::Unavailable;
+        states.secrets.observed_at_ms = 100_000;
+        states.secrets.http204_response = Some(VaultHttp204Response {
+            source: VaultNetworkSource::ConfiguredUrl,
+            responded_at_ms: 80_000,
+        });
+        states.secrets.network_refresh = Some(VaultNetworkRefresh {
+            completed_at_ms: 90_000,
+            outcome: VaultNetworkRefreshOutcome::Succeeded,
+        });
+        let value = network_state_value_with(
+            network(at, 100_000),
+            None,
+            || crate::service_state::Publication::new(states, at),
+            || (at + Duration::from_secs(61), Some(161_000)),
+        );
+        let secrets = &value["services"]["secrets"];
+        assert_eq!(secrets["availability"], json!("Unknown"));
+        assert_eq!(secrets["last_success_ms"], Value::Null);
+        assert_eq!(secrets["network_materialization"], Value::Null);
+        assert_eq!(secrets["refresh_failed"], json!(false));
+        assert_eq!(
+            secrets["network_refresh"],
+            json!({"outcome":"Succeeded", "completed_at_ms":90_000})
+        );
+        assert_eq!(
+            secrets["http204_response"],
+            json!({
+                "source":"configured_url", "responded_at_ms":80_000,
+            })
+        );
+        assert_eq!(
+            value["services"]["accounts"]["http204_response"],
+            Value::Null
+        );
     }
 
     #[test]

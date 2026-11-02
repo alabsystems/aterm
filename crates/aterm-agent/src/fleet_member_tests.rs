@@ -17,6 +17,90 @@ use std::sync::atomic::{AtomicBool, Ordering};
 const HANG: Duration = Duration::from_secs(60);
 
 #[test]
+fn automatic_join_uses_a_local_lan_address_and_reserves_its_port() {
+    let local = "192.168.1.102".parse().unwrap();
+    assert_eq!(
+        automatic_host([None, Some(local), None]).as_deref(),
+        Some("192.168.1.102")
+    );
+    assert_eq!(
+        automatic_host([Some("8.8.8.8".parse().unwrap()), None, None]),
+        None
+    );
+    let held = reserve_fleet_port("127.0.0.1", None).unwrap();
+    assert!(TcpListener::bind(held.local_addr().unwrap()).is_err());
+    let fallback =
+        reserve_fleet_port("127.0.0.1", Some(held.local_addr().unwrap().port())).unwrap();
+    assert_ne!(
+        fallback.local_addr().unwrap().port(),
+        held.local_addr().unwrap().port()
+    );
+    let ipv6 = reserve_fleet_port("::1", None).unwrap();
+    assert_eq!(
+        ipv6.local_addr().unwrap().ip(),
+        IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+    );
+}
+
+#[test]
+fn giving_a_node_better_names_keeps_its_temporary_alias() {
+    let world = World::new("primary-name");
+    name_machine(&world.places, &args(&["set", "m62"])).unwrap();
+    let node = own_node(&world.places).unwrap();
+    let alias = member::temporary_name(&node);
+    assert_eq!(names_this_machine(&world.places, "m62"), Some(node.clone()));
+    assert_eq!(
+        names_this_machine(&world.places, &alias),
+        Some(node.clone())
+    );
+    name_machine(&world.places, &args(&["set", "studio"])).unwrap();
+    assert_eq!(
+        names_this_machine(&world.places, "studio"),
+        Some(node.clone())
+    );
+    assert_eq!(names_this_machine(&world.places, &alias), Some(node));
+    assert!(name_machine(&world.places, &args(&["set", &alias])).is_err());
+    assert!(name_machine(&world.places, &args(&["set", "../escape"])).is_err());
+    assert_eq!(
+        member::read_primary_name(&world.places.state)
+            .unwrap()
+            .as_deref(),
+        Some("studio")
+    );
+}
+
+#[test]
+fn automatic_join_selects_its_own_port_and_delivers_the_signed_name() {
+    let (issuer, code, _serving) = issuing("automatic-named-issuer");
+    let newcomer = World::new("automatic-named-newcomer");
+    name_machine(&newcomer.places, &args(&["set", "studio"])).unwrap();
+    assert!(matches!(
+        converged(converge_on(&newcomer.places, &code, &Opts::default())),
+        FleetSync::Joined(_)
+    ));
+    let port = fleet_table(&newcomer.config())
+        .unwrap()
+        .listen_port()
+        .unwrap();
+    assert_ne!(
+        port,
+        fleet_table(&issuer.config())
+            .unwrap()
+            .listen_port()
+            .unwrap()
+    );
+    let _released = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
+    let peers = read_peers(&issuer.places.state).unwrap();
+    let node = own_node(&newcomer.places).unwrap();
+    let recorded = peers
+        .iter()
+        .find(|peer| peer.node.as_deref() == Some(&node))
+        .unwrap();
+    assert_eq!(recorded.primary_name(), Some("studio"));
+    assert!(recorded.answers_to(&member::temporary_name(&node)));
+}
+
+#[test]
 fn every_cli_report_ends_with_a_newline() {
     assert_eq!(
         with_final_newline("no fleet code".into()),
@@ -185,6 +269,25 @@ fn a_code_file_gives_its_first_line() {
     assert!(CodeFrom::Typed.left_behind().is_empty());
     std::fs::write(&file, "\n\n").unwrap();
     assert!(read_code(Some(&file)).is_err(), "an empty file is no code");
+    let dir_code = file.with_file_name("code-dir");
+    std::fs::create_dir_all(&dir_code).unwrap();
+    assert!(
+        read_code(Some(&dir_code)).is_err(),
+        "a directory --code-file must be refused"
+    );
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+        let fifo = file.with_file_name("code-fifo");
+        let c_fifo = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_fifo` is a valid NUL-terminated path inside our owned scratch directory.
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+        assert!(
+            read_code(Some(&fifo)).is_err(),
+            "a FIFO --code-file must fail immediately without blocking"
+        );
+    }
     let missing = file.with_file_name(a_code());
     match read_code(Some(&missing)) {
         Err(Failure::Failed(why)) => assert!(
@@ -447,7 +550,7 @@ fn closed_port() -> u16 {
     listener.local_addr().unwrap().port()
 }
 
-/// A host word with no port that nothing here names is dialled at the default port.
+/// A host word with no port is dialled at the default port, whether or not it serves another fleet.
 #[test]
 fn a_survey_of_a_host_alone_dials_it_at_the_default_port() {
     let world = World::new("bare-host");
@@ -461,7 +564,7 @@ fn a_survey_of_a_host_alone_dials_it_at_the_default_port() {
         within: HANG,
     };
     let read = survey_fleet_in(&world.places, &ask).unwrap_or_else(|why| panic!("{why}"));
-    let at = format!("nothing listens on 127.0.0.1:{}", member::default_port());
+    let at = format!("127.0.0.1:{}", member::default_port());
     assert!(
         matches!(&read.peers[..], [one] if one.answer.as_ref().is_err_and(|why| why.contains(&at))),
         "{at}: {read:?}"
@@ -728,15 +831,20 @@ fn a_peers_listing_that_reached_nobody_says_away_and_when_the_book_last_heard_of
         .seen_ms
         .expect("the join is heard");
     let at = i64::try_from(heard).unwrap();
-    let offset = aterm_uds::zone::local_offset_at(at / 1000).unwrap_or(0);
-    let clock = crate::supervise::occupancy::said::clock_words(at, offset);
+    let offset = aterm_uds::zone::local_offset_at(at / 1000);
+    let clock = format!(
+        "{}{}",
+        crate::supervise::occupancy::said::clock_words(at, offset.unwrap_or(0)),
+        if offset.is_some() { "" } else { " UTC" }
+    );
     let listed = ok(list_peers(&issuer.places, HANG));
+    let away = listed
+        .lines()
+        .find(|line| line.starts_with("Away from every member:"))
+        .unwrap_or_else(|| panic!("no peer answered:\n{listed}"));
     assert!(
-        listed.contains(&format!(
-            "Away from every member: the one peer dialled did not answer; the last this book \
-             heard of one was at {clock}"
-        )),
-        "the member runs no aterm:\n{listed}"
+        away.contains(&format!("at {clock}")),
+        "the book's historical heard time:\n{listed}"
     );
     let theirs = ok(list_peers(&member.places, HANG));
     assert!(
@@ -790,7 +898,7 @@ fn a_member_away_from_its_issuer_says_since_the_issuers_last_answer() {
     drop(serving.take());
     let away = ok(list_peers(&member.places, HANG));
     let back_ms = i64::try_from(back).unwrap();
-    let offset = aterm_uds::zone::local_offset_at(i64::try_from(at).unwrap() / 1000);
+    let offset = aterm_uds::zone::local_offset_at(back_ms / 1000);
     let clock = format!(
         "{}{} (1h ago)",
         crate::supervise::occupancy::said::clock_words(back_ms, offset.unwrap_or(0)),
@@ -836,12 +944,16 @@ fn each_member_that_did_not_answer_gets_a_line_of_its_own_after_the_table() {
                 ("10.0.0.9:7100".to_owned(), None),
             ],
             now,
-            Some(3_600),
+            |_| Some(3_600),
         ),
         "Last answer to this Mac from 1a2b3c4d: 09:30 (1h ago).\n\
          Last answer to this Mac from 10.0.0.9:7100: none recorded.\n"
     );
-    assert_eq!(last_answer_words(&[], now, None), "", "everyone answered");
+    assert_eq!(
+        last_answer_words(&[], now, |_| None),
+        "",
+        "everyone answered"
+    );
 }
 
 /// The away line's words: said only when peers were dialled and none answered, with the newest
@@ -855,17 +967,17 @@ fn each_member_that_did_not_answer_gets_a_line_of_its_own_after_the_table() {
 fn away_is_said_only_when_every_peer_dialled_went_unanswered() {
     let now = 10 * 3_600_000;
     assert_eq!(
-        away_words((1, 30), (Some(0), Some(0)), now, Some(0)),
+        away_words((1, 30), (Some(0), Some(0)), now, |_| Some(0)),
         None,
         "one answered"
     );
     assert_eq!(
-        away_words((0, 0), (Some(0), Some(0)), now, Some(0)),
+        away_words((0, 0), (Some(0), Some(0)), now, |_| Some(0)),
         None,
         "none dialled"
     );
     assert_eq!(
-        away_words((0, 31), (Some(now - 7_200_000), None), now, Some(3_600)).as_deref(),
+        away_words((0, 31), (Some(now - 7_200_000), None), now, |_| Some(3_600)).as_deref(),
         Some(
             "Away from every member: none of the 31 peers dialled answered; the last this book \
              heard of one was at 09:00 (2h ago).\n"
@@ -876,7 +988,7 @@ fn away_is_said_only_when_every_peer_dialled_went_unanswered() {
             (0, 31),
             (Some(now - 7_200_000), Some(now - 5_400_000)),
             now,
-            Some(3_600)
+            |_| Some(3_600)
         )
         .as_deref(),
         Some(
@@ -887,14 +999,14 @@ fn away_is_said_only_when_every_peer_dialled_went_unanswered() {
         "since the last answer, not the book's time"
     );
     assert_eq!(
-        away_words((0, 1), (Some(now - 60_000), None), now, None).as_deref(),
+        away_words((0, 1), (Some(now - 60_000), None), now, |_| None).as_deref(),
         Some(
             "Away from every member: the one peer dialled did not answer; the last this book \
              heard of one was at 09:59 UTC (1m ago).\n"
         )
     );
     assert_eq!(
-        away_words((0, 2), (None, Some(now - 120_000)), now, None).as_deref(),
+        away_words((0, 2), (None, Some(now - 120_000)), now, |_| None).as_deref(),
         Some(
             "Away from every member: none of the 2 peers dialled answered; this book holds no \
              time it heard of one.\n\
@@ -902,12 +1014,81 @@ fn away_is_said_only_when_every_peer_dialled_went_unanswered() {
         )
     );
     assert_eq!(
-        away_words((0, 2), (None, None), now, Some(0)).as_deref(),
+        away_words((0, 2), (None, None), now, |_| Some(0)).as_deref(),
         Some(
             "Away from every member: none of the 2 peers dialled answered; this book holds no \
              time it heard of one.\n"
         )
     );
+}
+
+#[test]
+fn historical_peer_clocks_use_each_event_offset_across_clock_changes() {
+    const HOUR: u64 = 3_600_000;
+    let heard = 9 * HOUR;
+    let answered = 11 * HOUR;
+    let now = 12 * HOUR;
+    // A zone's clock change at 10:00 UTC: the two records straddle either direction.
+    for (before, after, heard_clock, answered_clock) in [
+        (-7 * 3_600, -8 * 3_600, "02:00", "03:00"),
+        (-8 * 3_600, -7 * 3_600, "01:00", "04:00"),
+    ] {
+        let offset_at = |seconds| Some(if seconds < 10 * 3_600 { before } else { after });
+        let mut looked_up = Vec::new();
+        let away = away_words((0, 1), (Some(heard), Some(answered)), now, |seconds| {
+            looked_up.push(seconds);
+            offset_at(seconds)
+        })
+        .unwrap();
+        assert_eq!(looked_up, [9 * 3_600, 11 * 3_600]);
+        assert!(
+            away.contains(&format!("at {heard_clock} (3h ago)")),
+            "{away}"
+        );
+        assert!(
+            away.contains(&format!("since {answered_clock} (1h ago)")),
+            "{away}"
+        );
+
+        let last = [
+            ("member".to_owned(), Some(heard)),
+            ("other".to_owned(), Some(answered)),
+        ];
+        looked_up.clear();
+        let answers = last_answer_words(&last, now, |seconds| {
+            looked_up.push(seconds);
+            offset_at(seconds)
+        });
+        assert_eq!(looked_up, [9 * 3_600, 11 * 3_600]);
+        assert!(
+            answers.contains(&format!("member: {heard_clock} (3h ago)")),
+            "{answers}"
+        );
+        assert!(
+            answers.contains(&format!("other: {answered_clock} (1h ago)")),
+            "{answers}"
+        );
+
+        let event_clock = |query_now| {
+            clock_ago(heard, query_now, offset_at)
+                .split_once(' ')
+                .unwrap()
+                .0
+                .to_owned()
+        };
+        assert_eq!(event_clock(9 * HOUR), heard_clock);
+        assert_eq!(event_clock(now), heard_clock);
+        // Former behavior resolves the offset at query time and shifts an older event.
+        let old_current_offset = offset_at(i64::try_from(now / 1000).unwrap());
+        let old = away_words((0, 1), (Some(heard), Some(answered)), now, |_| {
+            old_current_offset
+        })
+        .unwrap();
+        assert!(
+            !old.contains(&format!("at {heard_clock} (3h ago)")),
+            "{old}"
+        );
+    }
 }
 
 #[test]
@@ -1333,7 +1514,7 @@ fn a_leave_whose_state_it_makes_inherits_an_access_list_takes_the_fleet_out_of_a
     let world = World::new("leave-acl");
     let parent = world.places.state.parent().unwrap().join("inherits");
     std::fs::create_dir(&parent).unwrap();
-    let ran = aterm_uds::spawnfd::command("/bin/chmod")
+    let ran = aterm_uds::spawnfd::command(crate::test_program::kept("/bin/chmod"))
         .args(["+a", "everyone allow list,search,directory_inherit"])
         .arg(&parent)
         .status()
@@ -3768,7 +3949,9 @@ fn a_join_to_an_issuer_past_the_lan_is_refused_by_its_kind() {
         &[("192.0.2.1".to_owned(), 7100)],
         (&secret, &me),
         (&Keyring::default(), None),
+        (&[], None),
         &registration,
+        false,
         &Vec::new,
     );
     assert!(
@@ -8690,7 +8873,8 @@ fn a_new_lan_member_receives_the_signed_fleet_code_and_joins_with_default_drive(
     let member = World::new("automatic-lan-newcomer");
     let root = aterm_tempfile::tempdir().unwrap();
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let server = server::start(
+    // The vault server stands in for one on the home ALab LAN, where members answered.
+    let server = server::start_at_home(
         listener,
         &server::Options {
             listen: "127.0.0.1:0".parse().unwrap(),
@@ -8700,6 +8884,7 @@ fn a_new_lan_member_receives_the_signed_fleet_code_and_joins_with_default_drive(
             hold: Duration::from_millis(200),
             keep_awake: false,
         },
+        server::JOIN_CHANGE_GAP,
     )
     .unwrap();
     let url = format!("http://{}/v1/alab", server.addr);
@@ -9626,8 +9811,11 @@ fn fleet_leave_stops_and_removes_installed_node_job_without_recording_node_off()
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
+    /// Its stop records whether the book's lock in `state` was free then, as the node job's own
+    /// heartbeat would need it.
     struct FakeNodeSupervisor {
-        stopped: Mutex<Vec<PathBuf>>,
+        state: PathBuf,
+        stopped: Mutex<Vec<(PathBuf, bool)>>,
     }
     impl ServiceSupervisor for FakeNodeSupervisor {
         fn unit_file(&self, home: &Path) -> PathBuf {
@@ -9643,7 +9831,11 @@ fn fleet_leave_stops_and_removes_installed_node_job_without_recording_node_off()
             Ok(())
         }
         fn stop_and_unload(&self, unit_file: &Path) -> Result<(), String> {
-            self.stopped.lock().unwrap().push(unit_file.to_path_buf());
+            let free = !member::book_held(&self.state);
+            self.stopped
+                .lock()
+                .unwrap()
+                .push((unit_file.to_path_buf(), free));
             Ok(())
         }
     }
@@ -9657,6 +9849,7 @@ fn fleet_leave_stops_and_removes_installed_node_job_without_recording_node_off()
     std::fs::create_dir_all(&home).unwrap();
     std::fs::write(&exe, b"bin").unwrap();
     let sup = FakeNodeSupervisor {
+        state: member.places.state.clone(),
         stopped: Mutex::new(Vec::new()),
     };
     let unit = node_service::install_with(&exe, &home, &member.places.state, false, &sup).unwrap();
@@ -9673,7 +9866,8 @@ fn fleet_leave_stops_and_removes_installed_node_job_without_recording_node_off()
         "report={report}"
     );
     assert!(!unit.exists(), "unit file must be unlinked on fleet leave");
-    assert_eq!(*sup.stopped.lock().unwrap(), vec![unit]);
+    // The stop, which waits on launchd and the job's exit, holds no writer of the book.
+    assert_eq!(*sup.stopped.lock().unwrap(), vec![(unit, true)]);
     assert!(
         !node_service::node_turned_off(&member.places.state),
         "fleet leave must write fleet-sync-off, not node-off, so a future join can install sync.node"
@@ -9854,10 +10048,13 @@ fn roster_identities_and_names_this_machine_bind_node_keys_and_enforce_deny_list
     assert_eq!(names_this_machine(&member.places, "m4"), None);
 
     // Once the denied alias is removed from m100's aliases, both `m100` and alias `m32` name this machine.
+    // And if surviving member `m25` has a legacy `vault_name` (`"m4-2"`) colliding with denied `"m4"`,
+    // `m25` remains in `roster_identities` under `m25` with its denied `vault_name`/`host` stripped.
     let adm2 = aterm_secrets::client::admin_open(&paths).expect("admin open");
     let mut doc2 = adm2.doc.clone();
     let mut clean_roster = roster;
     clean_roster.members[0].aliases = vec!["m32".to_owned()];
+    clean_roster.members[2].vault_name = "m4-2".to_owned();
     doc2.set_entry(
         &aterm_secrets::text::Audience::Everyone,
         ROSTER_ENTRY,
@@ -9866,6 +10063,13 @@ fn roster_identities_and_names_this_machine_bind_node_keys_and_enforce_deny_list
     .expect("set roster");
     aterm_secrets::client::admin_publish(&paths, &adm2, &doc2).expect("publish roster");
     aterm_secrets::client::sync(&paths, None).expect("sync local copy");
+    let clean_ids = roster_identities(&member.places);
+    let m25_after = clean_ids
+        .iter()
+        .find(|i| i.label.as_deref() == Some("m25"))
+        .expect("surviving m25 must stay in roster_identities despite denied vault_name m4-2");
+    assert_eq!(m25_after.vault_name, None);
+    assert_eq!(m25_after.host, None);
     assert_eq!(
         names_this_machine(&member.places, "m100"),
         Some(own.node().to_owned())
@@ -9876,13 +10080,34 @@ fn roster_identities_and_names_this_machine_bind_node_keys_and_enforce_deny_list
     );
     assert_eq!(names_this_machine(&member.places, "m4"), None);
 
-    // `drive_grants` must refuse a peer whose node_key is denied in `aterm-swarm-roster`, while
-    // allowing an active bound member (`m22`).
+    // `drive_grants` and `drive_fleet_in` must refuse a peer whose node_key is denied in
+    // `aterm-swarm-roster`, while `join_places` and `issuer_copies` filter it out.
     let denied_err = drive_grants(&member.places, &[denied_id.node().to_owned()], None)
         .expect_err("denied node must not be granted drive");
     assert!(
         failure_words(denied_err).contains("a revoked node may not be granted drive"),
         "expected revoked drive grant refusal"
+    );
+    let Err(drive_refused) =
+        drive_fleet_in(&member.places, denied_id.node(), Duration::from_millis(50))
+    else {
+        panic!("denied node must not be driven");
+    };
+    assert!(
+        drive_refused
+            .why
+            .contains("a revoked node may not be driven"),
+        "unexpected drive refusal: {drive_refused:?}"
+    );
+    let parsed_code = JoinCode::parse(&code).expect("parse code");
+    let dials = join_places(&member.places, &Opts::default(), &parsed_code);
+    assert!(
+        dials.contains(&("192.168.1.77".to_owned(), 7100)),
+        "active peer must remain in join_places: {dials:?}"
+    );
+    assert!(
+        !dials.contains(&("192.168.1.78".to_owned(), 7100)),
+        "denied peer must be excluded from join_places: {dials:?}"
     );
     let (granted, _) =
         drive_grants(&member.places, &["m22".to_owned()], None).expect("active m22 may drive");

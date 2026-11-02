@@ -339,7 +339,7 @@ impl HostVitals {
             parts.push(format!("up {}", Self::format_uptime(up)));
         }
         if let Some(rtt) = self.rtt_us.filter(|r| *r > 0) {
-            parts.push(format!("RTT {:.1} ms", f64::from(rtt as u32) / 1000.0));
+            parts.push(format!("RTT {:.1} ms", (rtt as f64) / 1000.0));
         }
         if parts.is_empty() {
             "telemetry unprobed".to_owned()
@@ -539,5 +539,10 @@ mod tests {
         assert!(line.contains("2.0 GiB used/unknown total"), "{line}");
         assert!(line.contains("3.0 GiB available"), "{line}");
         assert!(!line.contains('%'), "{line}");
+        let large_rtt = HostVitals {
+            rtt_us: Some(5_000_000_000),
+            ..Default::default()
+        };
+        assert_eq!(large_rtt.format_summary_line(), "RTT 5000000.0 ms");
     }
 }

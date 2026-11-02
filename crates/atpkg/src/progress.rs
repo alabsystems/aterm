@@ -231,6 +231,27 @@ impl Drop for ClockOverride {
 thread_local! {
     static CLOCK_OVERRIDE: std::cell::RefCell<Option<Arc<ManualPassClock>>> =
         const { std::cell::RefCell::new(None) };
+    static WRITES_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// TESTS ONLY: while held, this thread's snapshot writes fail before a temporary is made
+/// ([`write_now`]), as a full or read-only volume fails them.
+#[cfg(test)]
+pub(crate) struct FailWrites;
+
+#[cfg(test)]
+impl FailWrites {
+    pub(crate) fn hold() -> Self {
+        WRITES_FAIL.with(|fail| fail.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for FailWrites {
+    fn drop(&mut self) {
+        WRITES_FAIL.with(|fail| fail.set(false));
+    }
 }
 
 struct SinkState {
@@ -551,10 +572,17 @@ fn write_now(s: &mut SinkState) -> bool {
     let Ok(text) = aterm_json::to_string(&s.file) else {
         return false;
     };
-    let tmp = s
-        .path
-        .with_file_name(format!("progress.json.tmp-{}", std::process::id()));
-    if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, &s.path).is_ok() {
+    #[cfg(test)]
+    if WRITES_FAIL.with(std::cell::Cell::get) {
+        return false;
+    }
+    let Ok((tmp, mut file)) = crate::platform::create_temp_beside(&s.path, 0o644) else {
+        return false;
+    };
+    use std::io::Write as _;
+    let wrote = file.write_all(text.as_bytes());
+    drop(file);
+    if wrote.is_ok() && std::fs::rename(&tmp, &s.path).is_ok() {
         s.last_write = Some(s.clock.now());
         s.dirty = false;
         true
@@ -690,10 +718,14 @@ fn quiet_stdio(log: &Path) {
         .append(true)
         .create(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(log)
     else {
         return;
     };
+    if !file.metadata().is_ok_and(|m| m.is_file()) {
+        return;
+    }
     let fd = file.as_raw_fd();
     // SAFETY: `dup2` re-points fds 1 and 2 at an open file this process owns; `file` is
     // leaked right after, so its descriptor stays valid for the rest of the process. No
@@ -1107,10 +1139,16 @@ pub fn append_bump(
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        opts.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
         opts.mode(0o600);
     }
     let mut f = opts.open(&path)?;
+    if !f.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "bump is not a regular file",
+        ));
+    }
     use std::io::Write as _;
     let mut line = String::from(program.as_str());
     if asker == Asker::Script {
@@ -1258,6 +1296,45 @@ pub const fn same_owner(born: Option<u64>, now: crate::platform::Birth) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn occupied_legacy_temps_never_disable_progress_or_touch_their_targets() {
+        let ordinary = crate::testdir::layout("progress-temp-positive-");
+        let sink = ProgressSink::create(&ordinary.progress_file(), "install").unwrap();
+        assert!(sink.plan(&[("codex".into(), 100)]));
+        assert_eq!(read_progress(&ordinary).unwrap().queue, ["codex"]);
+        let mut outcomes = Vec::new();
+        for alias in [false, true] {
+            let layout = crate::testdir::layout("progress-occupied-temp-");
+            let target = layout.prefix.join("unrelated");
+            std::fs::write(&target, b"do not touch").unwrap();
+            let tmp = layout
+                .prefix
+                .join(format!("progress.json.tmp-{}", std::process::id()));
+            if alias {
+                std::os::unix::fs::symlink(&target, &tmp).unwrap();
+            } else {
+                std::fs::write(&tmp, b"previous writer's temporary").unwrap();
+            }
+            let sink = ProgressSink::create(&layout.progress_file(), "install");
+            let published = sink
+                .as_ref()
+                .is_some_and(|sink| sink.plan(&[("codex".into(), 100)]));
+            let fresh = read_progress(&layout).is_some_and(|file| file.queue == ["codex"]);
+            outcomes.push((alias, published && fresh));
+            assert_eq!(std::fs::read(&target).unwrap(), b"do not touch");
+            if alias {
+                assert_eq!(std::fs::read_link(&tmp).unwrap(), target);
+            } else {
+                assert_eq!(std::fs::read(&tmp).unwrap(), b"previous writer's temporary");
+            }
+        }
+        assert!(
+            outcomes.iter().all(|(_, fresh)| *fresh),
+            "regular and alias cases both attempted: {outcomes:?}"
+        );
+    }
 
     #[test]
     fn the_v1_example_snapshot_round_trips() {

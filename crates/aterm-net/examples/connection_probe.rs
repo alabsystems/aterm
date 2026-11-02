@@ -3,6 +3,11 @@
 
 //! Compare an anonymous fleet dial with plain TCP to the same explicit endpoint.
 //! The fleet join-ask handshake can be unavailable on an older fleet listener.
+//! On macOS, also report Network.framework's per-connection path and denial reason.
+
+#[cfg(target_os = "macos")]
+#[path = "support/connection_path.rs"]
+mod connection_path;
 
 #[cfg(unix)]
 fn run() -> Result<(), String> {
@@ -77,6 +82,21 @@ fn run() -> Result<(), String> {
             error.to_string(),
             started.elapsed().as_millis()
         ),
+    }
+    #[cfg(target_os = "macos")]
+    match connection_path::read(peer, within) {
+        Ok(reading) => println!(
+            "network=observed endpoint={peer} state={} state_raw={} path={} path_raw={:?} reason={} reason_raw={:?} error_domain={:?} error_code={:?}",
+            reading.state_name(),
+            reading.state,
+            reading.path_name(),
+            reading.path,
+            reading.reason_name(),
+            reading.reason,
+            reading.error_domain,
+            reading.error_code,
+        ),
+        Err(error) => println!("network=unobserved endpoint={peer} message={error:?}"),
     }
     Ok(())
 }

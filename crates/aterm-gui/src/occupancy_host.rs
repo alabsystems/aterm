@@ -1439,7 +1439,6 @@ pub(crate) fn cmd_occupancy(sid: Option<&str>, rest: &str) -> String {
     let now_unix_ms = aterm_time::unix_millis()
         .and_then(|ms| i64::try_from(ms).ok())
         .unwrap_or(0);
-    let offset_s = crate::presence::local_offset_s().unwrap_or(0);
     let words: Vec<&str> = rest.split_whitespace().collect();
     match words.as_slice() {
         [] | ["why"] => {
@@ -1450,7 +1449,12 @@ pub(crate) fn cmd_occupancy(sid: Option<&str>, rest: &str) -> String {
                     .as_ref()
                     .and_then(|j| j.said(sid).cloned())
             });
-            why_reply(mode(), said.as_ref(), now_unix_ms, offset_s)
+            why_reply_local(
+                mode(),
+                said.as_ref(),
+                now_unix_ms,
+                &crate::presence::local_offset_at,
+            )
         }
         ["check", "--replay", dur] => {
             let Some(window_ms) = aterm_agent::supervise::occupancy::replay::window_ms(dur) else {
@@ -1470,22 +1474,39 @@ pub(crate) fn cmd_occupancy(sid: Option<&str>, rest: &str) -> String {
                 .map(|state| aterm_agent::supervise::approvals::ledger_under(&state, Some(sid)))
                 .and_then(|path| std::fs::read_to_string(path).ok())
                 .unwrap_or_default();
-            replay_reply(sid, &rows, &ledger, (from_ms, now_unix_ms), offset_s)
+            replay_reply_local(
+                sid,
+                &rows,
+                &ledger,
+                (from_ms, now_unix_ms),
+                &crate::presence::local_offset_at,
+            )
         }
         _ => USAGE.to_string(),
     }
 }
 
-/// `occupancy why`'s reply for `said` ([`cmd_occupancy`]).
+/// `occupancy why`'s reply for `said`, at a fixed `offset_s`.
+#[cfg(test)]
 pub(crate) fn why_reply(
     mode: Occupancy,
     said: Option<&OccupancySaid>,
     now_unix_ms: i64,
     offset_s: i64,
 ) -> String {
+    why_reply_local(mode, said, now_unix_ms, &|_| Some(offset_s))
+}
+
+/// `occupancy why`'s reply for `said` ([`cmd_occupancy`]), resolving each instant's local offset.
+pub(crate) fn why_reply_local(
+    mode: Occupancy,
+    said: Option<&OccupancySaid>,
+    now_unix_ms: i64,
+    local_at: &dyn Fn(i64) -> Option<i64>,
+) -> String {
     let lines = match said {
         Some(said) => {
-            aterm_agent::supervise::occupancy::said::why_lines(said, now_unix_ms, offset_s)
+            aterm_agent::supervise::occupancy::said::why_lines_local(said, now_unix_ms, local_at)
         }
         None => vec![format!("occupancy={} unsaid", mode.word())],
     };
@@ -1493,13 +1514,26 @@ pub(crate) fn why_reply(
 }
 
 /// Format `occupancy check --replay`'s reply for session `sid` over `rows` and `ledger` in
-/// `(from_ms, to_ms)`.
+/// `(from_ms, to_ms)` at a fixed `offset_s`.
+#[cfg(test)]
 pub(crate) fn replay_reply(
     sid: &str,
     rows: &[RingRow],
     ledger: &str,
-    (from_ms, to_ms): (i64, i64),
+    window: (i64, i64),
     offset_s: i64,
+) -> String {
+    replay_reply_local(sid, rows, ledger, window, &|_| Some(offset_s))
+}
+
+/// Format `occupancy check --replay`'s reply for session `sid` over `rows` and `ledger` in
+/// `(from_ms, to_ms)`, resolving each instant's local offset.
+pub(crate) fn replay_reply_local(
+    sid: &str,
+    rows: &[RingRow],
+    ledger: &str,
+    (from_ms, to_ms): (i64, i64),
+    local_at: &dyn Fn(i64) -> Option<i64>,
 ) -> String {
     use aterm_agent::supervise::occupancy::{hold, replay};
     let spans = replay::spans_of(&hold::hold_rows_in(ledger, Some(sid)));
@@ -1508,12 +1542,12 @@ pub(crate) fn replay_reply(
         .iter()
         .filter(|s| s.end_ms.is_none_or(|end| end >= from_ms) && s.since_ms <= to_ms)
         .count();
-    lines_reply(&replay::replay_lines(
+    lines_reply(&replay::replay_lines_local(
         &replayed,
         rows.len(),
         holds,
         (from_ms, to_ms),
-        offset_s,
+        local_at,
     ))
 }
 

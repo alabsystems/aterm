@@ -704,11 +704,22 @@ fn wait(fds: &[RawFd], timeout: Option<Duration>) -> io::Result<Vec<bool>> {
         })
         .collect();
     let count = libc::nfds_t::try_from(polls.len()).unwrap_or(libc::nfds_t::MAX);
-    let millis = timeout.map_or(-1, |t| {
-        let ms = t.as_micros().div_ceil(1000);
-        libc::c_int::try_from(ms).unwrap_or(libc::c_int::MAX)
-    });
+    let deadline = match timeout {
+        None | Some(Duration::ZERO) => None,
+        Some(t) => Some(Instant::now().checked_add(t)),
+    };
     loop {
+        let millis = match (timeout, deadline) {
+            (None, _) => -1,
+            (Some(Duration::ZERO), _) => 0,
+            (_, Some(None)) => libc::c_int::MAX,
+            (_, Some(Some(until))) => {
+                let rem = until.saturating_duration_since(Instant::now());
+                let ms = rem.as_micros().div_ceil(1000);
+                libc::c_int::try_from(ms).unwrap_or(libc::c_int::MAX)
+            }
+            (Some(_), None) => 0,
+        };
         // SAFETY: `polls` is an initialized array of `count` pollfd records, alive and
         // exclusively borrowed for the call.
         let n = unsafe { libc::poll(polls.as_mut_ptr(), count, millis) };

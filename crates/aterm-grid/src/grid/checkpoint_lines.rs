@@ -74,6 +74,31 @@ impl Grid {
         lines
     }
 
+    /// Projects recent history and visible rows, borrowing materialized history
+    /// instead of cloning its text and attributes. Cold history and live rows
+    /// that need conversion remain owned by the returned view.
+    #[must_use]
+    pub fn checkpoint_line_views_bounded(
+        &self,
+        max_history: usize,
+    ) -> Vec<std::borrow::Cow<'_, Line>> {
+        let scrollback_count = self.scrollback_lines();
+        let keep = scrollback_count.min(max_history);
+        let first = scrollback_count - keep;
+        let mut lines = Vec::with_capacity(keep + self.rows() as usize);
+        lines.extend(
+            self.history_lines_from(first)
+                .take(keep)
+                .map(|line| line.unwrap_or_else(|| std::borrow::Cow::Owned(Line::new()))),
+        );
+        lines.extend(
+            self.checkpoint_visible_lines()
+                .into_iter()
+                .map(std::borrow::Cow::Owned),
+        );
+        lines
+    }
+
     /// Projects only the live visible rows into `Vec<Line>`.
     #[must_use]
     pub fn checkpoint_visible_lines(&self) -> Vec<Line> {
@@ -196,6 +221,7 @@ impl Grid {
     /// Captures inline-image spans across visible rows and at most `max_history` newest scrollback rows (`0` = newest).
     #[must_use]
     pub fn capture_image_carry(&self, max_history: usize) -> GridImageCarry {
+        crate::history_reads::note();
         let has_visible = self.extras().any_image();
         let has_history = max_history > 0 && self.history_any_image(&|_| true);
         if !has_visible && !has_history {
@@ -269,6 +295,7 @@ impl Grid {
 
     /// Installs inline-image spans captured by [`Self::capture_image_carry`] onto visible and uncompressed history rows.
     pub fn apply_image_carry(&mut self, carry: &GridImageCarry) {
+        crate::history_reads::note();
         if self.extras().any_image() {
             let rows = self.rows();
             let cols = self.cols();

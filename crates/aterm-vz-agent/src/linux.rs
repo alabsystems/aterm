@@ -117,9 +117,7 @@ fn c_path(path: &Path) -> Result<CString, String> {
 /// One step of a mount plan.
 fn apply(op: &Op) -> Result<(), String> {
     match op {
-        Op::Mkdir(at) => {
-            std::fs::create_dir_all(at).map_err(|e| format!("mkdir {}: {e}", at.display()))
-        }
+        Op::Mkdir(at) => mounts::ensure_plain_dir(at),
         Op::MountShare => {
             let tag = CString::new(mounts::TAG).map_err(|e| e.to_string())?;
             let at = CString::new(mounts::AT).map_err(|e| e.to_string())?;

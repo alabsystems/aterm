@@ -303,9 +303,19 @@ impl BoxFacts {
             worker: wire
                 .worker
                 .map(|w| match w {
-                    Answer::Ok(w) => u64::from_str_radix(&w.digest, 16)
-                        .map(|d| Ok(WorkerEnv::recorded(d, w.pid)))
-                        .map_err(|_| format!("a worker's digest {:?} that is not hex", w.digest)),
+                    Answer::Ok(w)
+                        if !w.digest.is_empty()
+                            && w.digest.bytes().all(|b| b.is_ascii_hexdigit()) =>
+                    {
+                        u64::from_str_radix(&w.digest, 16)
+                            .map(|d| Ok(WorkerEnv::recorded(d, w.pid)))
+                            .map_err(|_| {
+                                format!("a worker's digest {:?} that is not hex", w.digest)
+                            })
+                    }
+                    Answer::Ok(w) => {
+                        Err(format!("a worker's digest {:?} that is not hex", w.digest))
+                    }
                     Answer::Err(why) => Ok(Err(why)),
                 })
                 .transpose()?,

@@ -622,7 +622,7 @@ fn sub_script_gpu_matches_cpu() {
 fn synthetic_symbol_cells_match_cpu_within_tolerance() {
     let theme = Theme::default();
     let px = 18.0;
-    let ctx = aterm_gpu::GpuContext::new()
+    let ctx = aterm_gpu::GpuContext::new_headless()
         .unwrap_or_else(|e| aterm_spec::host::could_not_run(format!("no GPU available: {e}")));
     let face: &[u8] = include_bytes!("../../aterm-render/assets/DejaVuSansMono.ttf");
     let fontless = || {
@@ -632,6 +632,8 @@ fn synthetic_symbol_cells_match_cpu_within_tolerance() {
     };
     let mut gpu =
         aterm_gpu::GpuRenderer::from_parts(ctx, fontless(), None, theme).expect("GPU renderer");
+    gpu.prepare_offscreen()
+        .expect("the headless GPU arm prepares on an acquired device");
     let mut cpu = fontless();
 
     let narrow = [

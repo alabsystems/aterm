@@ -1,0 +1,63 @@
+# claude-code 2.1.310 · CAPTURED 2026-10-27 from a live Claude Code session under autopilot cruise (aterm ctl text --json, read only; 146 columns, its rows as drawn): the turn is over, its transcript's `system turn_duration` row written with `pendingWorkflowCount: 3`, while three dynamic workflows it started run on; the composer holds Claude Code's own dim suggestion `keep going` (its cells read dim, no draft), and a diff panel is drawn right of the column rule · a turn ended under its own background work
+                                                                                 │                                                              ✕
+⏺ Versioning is designed but unimplemented: no harness has a version tag or has  │1 file changed                                source: Current ▾
+  been packed into atpkg, the index blocks all harness pins under D24, and the   │
+  design doc wrongly claims this Mac can't sign (it does, as incumbent-head, per │crates/target-iceb
+  codex's index 77). I'm starting that implementation work now.                  │
+                                                                                 │───────────────────────────────────────────────────────────────
+⏺ Workflow(Give every harness a real released version, visible in aterm,         │crates/target-iceb (untracked)
+          distributed through atpkg)                                             │───────────────────────────────────────────────────────────────
+  ⎿  Running in background · /workflows to monitor and save · medium size        │New file not yet staged.
+     (/config)                                                                   │Run `git add :/crates/target-iceb` to see line counts.
+                                                                                 │
+  Ran 1 shell command, wrote 1 memory                                            │+2 files edited before this session (show)
+                                                                                 │
+⏺ I stopped because aterm's harness never saw any of my turns end. From the      │
+  harness's view, one turn had been open for 70 hours. It reads Claude Code as   │
+  busy whenever a background task is running, and my 48-hour                     │
+  wait-for-Grok-sign-in task was still running after my last report. So cruise   │
+  never had a turn end to continue from, and the session sat idle for 19 hours.  │
+                                                                                 │
+  I've stopped that task. Workflow workflow-a00001 is fixing the harness itself: │
+  a turn end will count from Claude Code's own record of it, and an idle screen  │
+  with a background task will no longer read as busy. It also covers the Claude  │
+  Code upgrade stuck for 19 hours waiting for an idle moment.                    │
+                                                                                 │
+  Pulled and aligned. Every checkout now matches its remote: Trust (pulled 96    │
+  commits, plus three missing submodule pins fetched and restored), aterm,       │
+  publication, the six harness repos, and ay, clean, ny, trust-cg, trust-ir and  │
+  ty. None had unpushed work; the 11 behind and clean were fast-forwarded.       │
+                                                                                 │
+  Fixing Trust (workflow-a00002):                                                │
+  - Build Trust main, measure both strict lanes (claude-code-alab and agy-alab), │
+    and group every remaining failure by cause.                                  │
+  - Fix each group in Trust: libc FFI descriptions (I'm taking that decision and │
+    recording it in TCB.md), generic std calls and modelling gaps, and the       │
+    hardened-profile rules. Each fix gets a soundness review before landing.     │
+  - Ship that Trust build into the atpkg store, then stage both repos.           │
+                                                                                 │
+  Harness versions (workflow-a00003):                                            │
+  - Version tags on all five harness repos.                                      │
+  - --version printing e.g. claude-code-alab 0.1.0 (claude 2.1.311).             │
+  - aterm harness versions, and harness versions shown wherever codex-alab's     │
+    already is.                                                                  │
+  - Each harness packed and signed into atpkg. Signing works from this Mac (as   │
+    incumbent-head); the design doc wrongly says it doesn't, and that gets       │
+    corrected.                                                                   │
+  - The open decision: the index refuses harness pins while aterm v0.135.0 and   │
+    older might still read it. I'll decide it so nothing gets installed unasked  │
+    on an old client, and record the decision.                                   │
+                                                                                 │
+  I'll keep going as each one reports.                                           │
+                                                                                 │
+✻ Waiting for 3 dynamic workflows to finish                                      │
+                                                                                 │
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── labelname ─
+❯ keep going
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+  ⏵⏵ bypass permissions on (shift+tab to cycle)
+
+  ◯ cruise-carry-turn-end         ▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱  0/1 · 3m55s · ↓ 179.6k tokens
+  ◯ trust-strict-lanes-harnesses  ▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱  0/1 · 3m10s · ↓ 74.1k tokens
+  ◯ harness-versions-atpkg        ▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱  0/1 · 2m00s · ↓ 121.5k tokens

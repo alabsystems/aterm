@@ -14,29 +14,22 @@ use crate::{App, Wake};
 /// System State's answer to the first-launch offer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkstationSetupDecision {
-    /// Begin with this plan: the page's own answer on its first tick with a person at this Mac
-    /// (no review, no countdown, no confirmation: design revision 4), or a press on the page.
+    /// Begin with this plan: the page's own answer on its first tick (no review, no countdown,
+    /// no confirmation and no wait for a person: design revision 4, init-on-by-default design
+    /// §6.1), or a press on the page. An answer that carries no receipt admits nothing: the
+    /// offer of a plan an earlier process admitted, while the window holds its own admission of
+    /// it, goes this way.
     Begin(Plan),
-    /// A Cancel: the worker records it for good (design §3.3). The page offers none since
-    /// revision 4; the worker's handling of the answer stays.
-    Cancelled,
-    /// The person closed the review that was shown, unanswered: not this launch. Nothing is
-    /// recorded and nothing offers it again in this launch; the next launch offers it once more.
-    Closed,
-    /// No window could show the offer, or the setup it offers ended meanwhile: the worker offers
-    /// it again once one can.
+    /// No window could show the offer, its page closed before it answered, or the setup it
+    /// offers ended meanwhile: the worker offers it again once a window can.
     Unavailable,
 }
 
-/// Which review an offer is (design §3.3, §3.5).
+/// Which offer this is (design §3.3).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OfferKind {
-    /// The launch's review of the plan to set up.
+    /// The launch's offer of the plan to set up.
     Launch,
-    /// The review of the groups this Mac's ALab signal adds to `in_force`, the provisional plan
-    /// a review admitted before: it holds none of aterm's own permissions (they are in
-    /// `in_force` and run), and it never takes the person's tab.
-    Widen { in_force: Plan },
     /// A launch's offer of the plan an earlier process admitted, whose run this launch resumes
     /// (design §3.3, §6): the run goes on whether or not it is answered. The page's automatic
     /// answer, by the first launch's rule, is this window's own admission of that same plan,
@@ -64,10 +57,6 @@ pub struct SetupAnswer {
     /// Empty: the plan in force as it stands (Set up now). `None`: the plan as sent (the
     /// first-run offer's answer).
     pub changed: Option<Selection>,
-    /// The review answered showed the widened plan the worker sent while it was up
-    /// ([`await_initial_setup_answer_while`]'s `look`), in place of the plan first offered:
-    /// what an untouched Apply admits, and what a Cancel names as the plan the review showed.
-    pub widened: bool,
 }
 
 impl From<WorkstationSetupDecision> for SetupAnswer {
@@ -79,7 +68,6 @@ impl From<WorkstationSetupDecision> for SetupAnswer {
             chosen: false,
             vault_typed: false,
             changed: None,
-            widened: false,
         }
     }
 }
@@ -97,47 +85,25 @@ pub(crate) fn send_setup_wake(wake: Wake) -> bool {
 /// Wait on a worker thread for System State's answer to the offer of `initial`.
 /// A delivered Begin calls `on_begin` before the window can handle another input,
 /// so a Stop and quit know its admission is under way even before this wait returns.
-/// `look` is asked each second while the review is up: the first plan it names widens the
-/// review's draft in place, unless the person edited it (design §3.5).
 pub fn await_initial_setup_answer_while(
     initial: Plan,
     finished: impl FnMut() -> bool,
-    look: impl FnMut() -> Option<Plan>,
     on_begin: impl FnOnce() + Send + 'static,
 ) -> SetupAnswer {
-    await_answer(OfferKind::Launch, initial, finished, look, on_begin)
-}
-
-/// Wait on a worker thread for System State's answer to the review of `widened`, the plan this
-/// Mac's ALab signal widens `in_force` to (design §3.5): offered in the System State tab without
-/// taking the person's tab, and holding none of aterm's own permissions.
-pub fn await_widen_answer_while(
-    widened: Plan,
-    in_force: Plan,
-    finished: impl FnMut() -> bool,
-    on_begin: impl FnOnce() + Send + 'static,
-) -> SetupAnswer {
-    await_answer(
-        OfferKind::Widen { in_force },
-        widened,
-        finished,
-        || None,
-        on_begin,
-    )
+    await_answer(OfferKind::Launch, initial, finished, on_begin)
 }
 
 /// Wait on a worker thread for System State's automatic answer to the offer of `resumed`, the
 /// plan an earlier process admitted and this launch resumes ([`OfferKind::Resume`]): offered in
 /// the System State tab without taking the person's tab. `finished` withdraws it.
 pub fn await_resume_answer_while(resumed: Plan, finished: impl FnMut() -> bool) -> SetupAnswer {
-    await_answer(OfferKind::Resume, resumed, finished, || None, || {})
+    await_answer(OfferKind::Resume, resumed, finished, || {})
 }
 
 fn await_answer(
     kind: OfferKind,
     initial: Plan,
     finished: impl FnMut() -> bool,
-    look: impl FnMut() -> Option<Plan>,
     on_begin: impl FnOnce() + Send + 'static,
 ) -> SetupAnswer {
     let proxy = PROXY.lock().ok().and_then(|proxy| proxy.clone());
@@ -148,34 +114,10 @@ fn await_answer(
     let mut request = Request::with_handoff(initial, send, on_begin);
     request.kind = kind;
     let pending = Arc::downgrade(&request.reply);
-    let widened = Arc::clone(&request.widened);
     if proxy.send_event(Wake::WorkstationSetup(request)).is_err() {
         return WorkstationSetupDecision::Unavailable.into();
     }
-    wait_for_decision(
-        pending,
-        receive,
-        finished,
-        widen_once(widened, look),
-        Duration::from_secs(1),
-    )
-}
-
-/// `look`, asked until it names a plan, which is left in `slot` for the review to take.
-fn widen_once(
-    slot: Arc<Mutex<Option<Plan>>>,
-    mut look: impl FnMut() -> Option<Plan>,
-) -> impl FnMut() {
-    let mut done = false;
-    move || {
-        if done {
-            return;
-        }
-        if let Some(plan) = look() {
-            done = true;
-            *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(plan);
-        }
-    }
+    wait_for_decision(pending, receive, finished, Duration::from_secs(1))
 }
 
 /// Focus gains of this process's windows ([`window_focus_gains`]).
@@ -242,7 +184,7 @@ pub fn drive_initial_setup_answer_for_test(
     let request = Request::with_handoff(initial, send, on_begin);
     let pending = Arc::downgrade(&request.reply);
     drive(Box::new(move |answer| request.finish_answer(answer)));
-    wait_for_decision(pending, receive, || false, || {}, Duration::from_secs(60))
+    wait_for_decision(pending, receive, || false, Duration::from_secs(60))
 }
 
 type Reply = Mutex<Option<mpsc::Sender<SetupAnswer>>>;
@@ -252,7 +194,6 @@ fn wait_for_decision(
     pending: Weak<Reply>,
     receive: mpsc::Receiver<SetupAnswer>,
     mut finished: impl FnMut() -> bool,
-    mut look: impl FnMut(),
     poll: Duration,
 ) -> SetupAnswer {
     loop {
@@ -266,8 +207,6 @@ fn wait_for_decision(
                     && let Some(reply) = pending.upgrade()
                 {
                     finish_reply(&reply, WorkstationSetupDecision::Unavailable.into());
-                } else if pending.upgrade().is_some() {
-                    look();
                 }
             }
         }
@@ -289,8 +228,6 @@ pub(crate) struct Request {
     kind: OfferKind,
     reply: Arc<Reply>,
     on_begin: Arc<Mutex<Option<BeginHandoff>>>,
-    /// A widened plan the worker sent while the review is up, not yet taken by the page.
-    widened: Arc<Mutex<Option<Plan>>>,
 }
 
 impl std::fmt::Debug for Request {
@@ -307,14 +244,6 @@ impl Request {
         Self::with_handoff(initial.into(), reply, || {})
     }
 
-    /// An offer whose answer nobody awaits: a dev scenario's review
-    /// (`crate::system_state::fixture_review`), whose actions are inert.
-    #[cfg(any(debug_assertions, feature = "dev-seams"))]
-    pub(crate) fn unanswered(initial: Plan) -> Self {
-        let (reply, _answer) = mpsc::channel();
-        Self::with_handoff(initial, reply, || {})
-    }
-
     fn with_handoff(
         initial: Plan,
         reply: mpsc::Sender<SetupAnswer>,
@@ -325,22 +254,7 @@ impl Request {
             kind: OfferKind::Launch,
             reply: Arc::new(Mutex::new(Some(reply))),
             on_begin: Arc::new(Mutex::new(Some(Box::new(on_begin)))),
-            widened: Arc::new(Mutex::new(None)),
         }
-    }
-
-    /// A test's review of the groups the ALab signal adds to `in_force` ([`OfferKind::Widen`]).
-    #[cfg(test)]
-    pub(crate) fn widen(
-        widened: impl Into<Plan>,
-        in_force: impl Into<Plan>,
-        reply: mpsc::Sender<SetupAnswer>,
-    ) -> Self {
-        let mut request = Self::new(widened, reply);
-        request.kind = OfferKind::Widen {
-            in_force: in_force.into(),
-        };
-        request
     }
 
     /// A test's offer of the plan an earlier process admitted ([`OfferKind::Resume`]).
@@ -351,32 +265,22 @@ impl Request {
         request
     }
 
-    /// A dev scenario's review of the groups the ALab signal adds to `in_force`
-    /// ([`OfferKind::Widen`]), whose answer nobody awaits, as [`Self::unanswered`]'s.
-    #[cfg(any(debug_assertions, feature = "dev-seams"))]
-    pub(crate) fn unanswered_widen(widened: Plan, in_force: Plan) -> Self {
-        let mut request = Self::unanswered(widened);
-        request.kind = OfferKind::Widen { in_force };
-        request
-    }
-
-    /// Leave `plan` for the review as the worker's look does ([`widen_once`]).
-    #[cfg(any(test, debug_assertions, feature = "dev-seams"))]
-    pub(crate) fn send_widened(&self, plan: Plan) {
-        *self.widened.lock().unwrap_or_else(PoisonError::into_inner) = Some(plan);
-    }
-
     pub(crate) const fn kind(&self) -> &OfferKind {
         &self.kind
     }
 
-    /// The widened plan the worker sent, once.
-    pub(crate) fn take_widened(&self) -> Option<Plan> {
-        self.widened
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
+    /// The offer goes with no answer of the page's: its page closed first, or it is moot. The
+    /// launch's offer is made again once a window can show it
+    /// ([`WorkstationSetupDecision::Unavailable`]), where the page answers it at its first tick;
+    /// the offer of a plan an earlier process admitted, whose run goes on whatever its answer, is
+    /// answered as offered with no receipt, which admits nothing and which the worker lets go.
+    pub(crate) fn let_go(&self) {
+        match self.kind {
+            OfferKind::Launch => self.finish(WorkstationSetupDecision::Unavailable),
+            OfferKind::Resume => self.finish(WorkstationSetupDecision::Begin(self.initial.clone())),
+        }
     }
+
     /// The page's answer, a closing window and a withdrawn offer compete for this single decision.
     pub(crate) fn finish(&self, decision: WorkstationSetupDecision) {
         self.finish_answer(decision.into());
@@ -409,6 +313,11 @@ impl Request {
 
     pub(crate) fn pending(&self) -> bool {
         self.reply.lock().is_ok_and(|reply| reply.is_some())
+    }
+
+    #[cfg(any(unix, test))]
+    pub(crate) fn same_offer(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.reply, &other.reply)
     }
 }
 
@@ -451,11 +360,11 @@ pub(crate) enum PagePress {
 /// when `window`, else a control client's) and a fresh status naming revision 1 with its
 /// Permissions group admitted.
 #[cfg(test)]
-pub(crate) fn gate_admission_for_test(window: bool) -> Option<AdmittedAccess> {
+pub(crate) fn gate_admission_for_test(person: bool) -> Option<AdmittedAccess> {
     let mut gate = PermissionGate::default();
     gate.hold();
-    let press = if window {
-        PagePress::Nobody
+    let press = if person {
+        PagePress::Person
     } else {
         PagePress::Controller
     };
@@ -480,15 +389,58 @@ pub(crate) struct Host {
     pub(crate) developer_tools: crate::clt_install::Install,
     /// Its dedicated children, including recovered ones: any live child owns the prompt slot.
     pub(crate) developer_tools_session: Vec<crate::clt_install::Terminal>,
+    /// The attempt whose result may change the install's state. Kept after its terminal leaves,
+    /// so an older child's delayed status cannot become current again.
+    pub(crate) developer_tools_attempt: Option<u64>,
     /// Whether the tab opened on this Mac before: aterm opens it by itself once per Mac.
     pub(crate) developer_tools_mark: crate::clt_install::Mark,
-    /// Whether Apple's installer runs now ([`crate::clt_install::installing_now`]); none in a
-    /// headless instance or a test, which never look at this Mac's installer.
-    pub(crate) developer_tools_probe: Option<fn() -> bool>,
+    /// What this Mac shows of an install under way ([`crate::clt_install::installing_now`]);
+    /// none in a headless instance or a test, which never look at this Mac's installers.
+    pub(crate) developer_tools_probe: Option<fn() -> crate::clt_install::Reading>,
+    /// What the page says of the install beyond its tab and this Mac's installers: the tab said
+    /// the tools are installed, or a person's press opened nothing, and why.
+    pub(crate) developer_tools_after: crate::clt_install::Aftermath,
+    /// The newest setup pass that ended wanting the Command Line Tools, until a later pass, a
+    /// Stop, a plan without the GitHub repositories or the tools' arrival withdraws it: what
+    /// keeps the git-and-friends shim wanted ([`crate::clt_shim`]), which outlives the tab.
+    pub(crate) developer_tools_want: Option<u64>,
+    /// That shim, reconciled at launch (the mark an earlier launch left goes, and its directory
+    /// too unless the launch adopted live shells: [`crate::clt_shim::Shim::reconcile`]) and
+    /// settled at each change of the want or of the install ([`App::settle_developer_tools_want`]).
+    pub(crate) developer_tools_shim: crate::clt_shim::Shim,
+    /// An install of the tools ended unfinished (the tab said why, or ended without saying), or
+    /// the tab opened for this account at an earlier launch and nothing has started one since:
+    /// nothing installs them until a person presses Install…, so the shim is off new shells
+    /// though a pass still wants them. A tab that starts the install, or one adopted alive from
+    /// an earlier aterm, clears it.
+    pub(crate) developer_tools_unfinished: bool,
+    /// Whether Low Data Mode holds the tools' download back, as the network watch reads it or the
+    /// tab's program said: the automatic tab waits while it does, unspent. `None`: unread.
+    pub(crate) developer_tools_low_data: Option<bool>,
+    /// The watch on Low Data Mode, kept while a pass wants the tools or the mode holds them back.
+    pub(crate) developer_tools_network: Option<crate::clt_install::NetworkWatch>,
+    /// This account is none of the Mac's administrators, whom alone macOS lets install the tools,
+    /// as its groups read when a pass first wants them or the tab's program said: no tab opens by
+    /// itself, and the row says so in place of Install….
+    pub(crate) developer_tools_not_admin: bool,
+    /// Whether the window reads this Mac's network and account for the install; none in a
+    /// headless instance or a test.
+    pub(crate) developer_tools_reads_mac: bool,
 }
 
 impl Host {
     pub(crate) fn for_launch(startup: Option<fn() -> bool>, headless: bool) -> Self {
+        Self::for_launch_marked(startup, headless, crate::clt_install::Mark::for_launch())
+    }
+
+    /// [`Self::for_launch`] with this account's Command Line Tools tab `mark` as the launch read
+    /// it: a tab that opened at an earlier launch, with nothing installing the tools since, leaves
+    /// them unfinished ([`Self::developer_tools_unfinished`]).
+    pub(crate) fn for_launch_marked(
+        startup: Option<fn() -> bool>,
+        headless: bool,
+        mark: crate::clt_install::Mark,
+    ) -> Self {
         let preview = aterm_types::dev_seam!("ATERM_DEBUG_WORKSTATION_SETUP");
         let mode = preview_mode(
             preview.is_some(),
@@ -512,9 +464,19 @@ impl Host {
             proxy_registered: false,
             developer_tools: crate::clt_install::Install::default(),
             developer_tools_session: Vec::new(),
-            developer_tools_mark: crate::clt_install::Mark::for_launch(),
-            developer_tools_probe: (!headless && !cfg!(test))
-                .then_some(crate::clt_install::installing_now as fn() -> bool),
+            developer_tools_attempt: None,
+            developer_tools_unfinished: mark.opened(),
+            developer_tools_mark: mark,
+            developer_tools_probe: (!headless && !cfg!(test)).then_some(
+                crate::clt_install::installing_now as fn() -> crate::clt_install::Reading,
+            ),
+            developer_tools_after: crate::clt_install::Aftermath::default(),
+            developer_tools_want: None,
+            developer_tools_shim: crate::clt_shim::Shim::for_launch(),
+            developer_tools_low_data: None,
+            developer_tools_network: None,
+            developer_tools_not_admin: false,
+            developer_tools_reads_mac: !headless && !cfg!(test),
         }
     }
 
@@ -615,8 +577,7 @@ fn start_preview() -> bool {
             } else {
                 Selection::all()
             };
-            let mut answer =
-                await_initial_setup_answer_while(initial.into(), || false, || None, || {});
+            let mut answer = await_initial_setup_answer_while(initial.into(), || false, || {});
             if matches!(answer.decision, WorkstationSetupDecision::Begin(_))
                 && let Some(receipt) = answer.receipt.take()
             {
@@ -628,8 +589,6 @@ fn start_preview() -> bool {
                         format!("begin\nselection_bits={}\n", plan.selection.bits())
                     }
                     WorkstationSetupDecision::Unavailable => "unavailable\n".to_owned(),
-                    WorkstationSetupDecision::Closed => "closed\n".to_owned(),
-                    WorkstationSetupDecision::Cancelled => "cancelled\n".to_owned(),
                 };
                 let result = format!("{word}elapsed_ms={}\n", started.elapsed().as_millis());
                 if let Err(error) =
@@ -673,6 +632,7 @@ impl App {
     /// is at this Mac, so nothing waits for a window to come to the front.
     pub(crate) fn offer_workstation_setup(&mut self, request: Request) {
         if self.headless
+            || self.update_handoff_in_flight()
             || !self
                 .windows
                 .values()
@@ -689,6 +649,27 @@ impl App {
         self.offer_system_state(request);
     }
 
+    /// An untouched offer lets the handoff go: the successor reads the plan still pending and
+    /// admits it at once, as every launch does (init-on-by-default design §6.1). A draft or an
+    /// answer still being processed belongs to this process until it has settled.
+    #[cfg(unix)]
+    pub(crate) fn workstation_setup_holds_handoff(&self) -> bool {
+        let Some(request) = self
+            .workstation_setup
+            .request
+            .as_ref()
+            .filter(|request| request.pending())
+        else {
+            return false;
+        };
+        let state = self
+            .native_runtime
+            .instance_by_kind(crate::native_app::AppKind::SystemState)
+            .and_then(|instance| self.native_runtime.app(instance));
+        !matches!(state, Some(crate::native_app::NativeApp::SystemState(state))
+            if state.offer_can_restart(request))
+    }
+
     pub(crate) fn hold_initial_setup_permissions(&mut self) {
         self.workstation_setup.unified = true;
         self.workstation_setup.permissions.hold();
@@ -698,8 +679,9 @@ impl App {
     pub(crate) fn stop_initial_setup_permissions(&mut self) {
         self.workstation_setup.unified = true;
         self.workstation_setup.permissions.stop();
-        // A Command Line Tools install the stopped run asked for opens no tab.
+        // A Command Line Tools install the stopped run asked for opens no tab, and its shim goes.
         self.workstation_setup.developer_tools = self.workstation_setup.developer_tools.withdrawn();
+        self.withdraw_developer_tools_want();
         self.retire_launch_warmup();
     }
 
@@ -785,9 +767,13 @@ impl App {
             .apply_started(answers_offer, press);
     }
 
-    /// The standing yes for an access step the window starts by itself: the plan with its
-    /// Permissions group admitted, while that plan is the window's own admission (design §6).
-    /// `None` otherwise.
+    /// Whether permission acquisition was explicitly chosen by the person.
+    pub(crate) fn person_permission_admission_stands(&self) -> bool {
+        self.workstation_setup.permissions.person_admission_stands()
+    }
+
+    /// A standing, explicit permission choice for an access step. An automatic setup
+    /// receipt records a decision but grants no authority to open an OS permission prompt.
     pub(crate) fn admitted_access(&self) -> Option<AdmittedAccess> {
         self.workstation_setup.permissions.admitted(false)
     }
@@ -848,9 +834,33 @@ impl App {
     }
 }
 
+/// The work an automatic setup can start without asking for OS permission.
+#[cfg(test)]
+pub(crate) fn automatic_plan_for_test(mut plan: Plan) -> Plan {
+    plan.selection
+        .set(aterm_types::macos_setup::Setting::Permissions, false);
+    plan
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_setup_cannot_authorize_a_permission_prompt() {
+        let mut gate = PermissionGate::default();
+        gate.apply_started(true, PagePress::Nobody);
+        gate.accepted();
+        gate.observe(policy(7, true));
+        assert!(gate.own_admission_stands());
+        assert!(gate.admitted(false).is_none());
+        assert_eq!(gate.admitted(true).unwrap().by(), AdmittedBy::Person);
+
+        gate.apply_started(false, PagePress::Person);
+        gate.accepted();
+        gate.observe(policy(8, true));
+        assert_eq!(gate.admitted(false).unwrap().by(), AdmittedBy::Person);
+    }
 
     #[test]
     fn permission_policy_holds_until_admission_and_a_fresh_authoritative_snapshot() {
@@ -969,10 +979,10 @@ mod tests {
     fn the_standing_yes_is_the_windows_own_admission_of_the_plan_in_force() {
         let mut gate = PermissionGate::default();
         assert!(apply(&mut gate, true, PagePress::Nobody, 3));
-        let yes = gate
-            .admitted(false)
-            .expect("the window's first automatic one");
-        assert_eq!((yes.revision(), yes.by()), (3, AdmittedBy::Window));
+        assert!(
+            gate.admitted(false).is_none(),
+            "automatic setup grants no permission capability"
+        );
 
         let mut gate = PermissionGate::default();
         assert!(apply(&mut gate, false, PagePress::Person, 4));
@@ -1055,7 +1065,7 @@ mod tests {
     }
 
     /// The page's own answer to the startup offer, end to end through the host, comes on the
-    /// first tick with a person at this Mac, as the offered plan stands, even after a control
+    /// first tick, as the offered plan stands, even after a control
     /// client touched the page: a touch holds no answer since design revision 4. It makes the
     /// window's own admission (`AdmittedBy::Window`) while a control client drives another tab;
     /// a control client's touch on the page itself leaves the plan standing with no standing
@@ -1080,10 +1090,12 @@ mod tests {
             app.tick_system_state(start);
             let mut answer = receive
                 .try_recv()
-                .expect("the first tick with a person here answers the offer");
+                .expect("the first tick answers the offer");
             assert_eq!(
                 answer.decision,
-                WorkstationSetupDecision::Begin(Plan::default())
+                WorkstationSetupDecision::Begin(crate::workstation_setup::automatic_plan_for_test(
+                    Plan::default()
+                ))
             );
             let receipt = answer.receipt.take().expect("an answer's receipt");
             assert_eq!(
@@ -1101,16 +1113,12 @@ mod tests {
                     "the plan stands"
                 );
             } else {
-                assert_eq!(
-                    admitted,
-                    Some((3, AdmittedBy::Window)),
-                    "elsewhere {elsewhere}"
-                );
+                assert_eq!(admitted, None, "elsewhere {elsewhere}");
             }
         }
     }
 
-    fn stopped_startup_review() -> (App, Request, std::sync::mpsc::Receiver<SetupAnswer>) {
+    fn stopped_launch_offer() -> (App, Request, std::sync::mpsc::Receiver<SetupAnswer>) {
         let mut app = App::headless_for_test();
         app.headless = false;
         let wid = crate::WindowId(0);
@@ -1131,8 +1139,8 @@ mod tests {
     }
 
     #[test]
-    fn startup_review_withdrawal_cannot_release_an_earlier_local_stop() {
-        let (mut app, request, receive) = stopped_startup_review();
+    fn a_withdrawn_launch_offer_cannot_release_an_earlier_local_stop() {
+        let (mut app, request, receive) = stopped_launch_offer();
         request.finish(WorkstationSetupDecision::Unavailable);
         app.tick_system_state(Instant::now());
         assert_eq!(
@@ -1141,19 +1149,19 @@ mod tests {
         );
         assert!(!request.pending());
         // This is the unchanged policy from before Stop, read after the
-        // unanswered review released its temporary hold. It admits no choice.
+        // withdrawn offer released its temporary hold. It admits no choice.
         app.observe_initial_setup_permissions(policy(4, true));
         assert!(
             app.access_revision().is_none(),
-            "ending an unanswered review must not release the earlier local Stop"
+            "a withdrawn offer must not release the earlier local Stop"
         );
         assert!(app.admitted_access().is_none());
         assert!(app.workstation_setup.suppresses_permissions());
     }
 
     #[test]
-    fn startup_review_an_accepted_post_stop_press_rearms_after_its_fresh_policy() {
-        let (mut app, _, receive) = stopped_startup_review();
+    fn an_accepted_press_after_a_stop_rearms_after_its_fresh_policy() {
+        let (mut app, _, receive) = stopped_launch_offer();
         let wid = crate::WindowId(0);
         let (_, view) = app.active_native_view(wid).unwrap();
         app.with_gesture_source(false, |app| {
@@ -1259,7 +1267,6 @@ mod tests {
                 Arc::downgrade(&request.reply),
                 receive,
                 || true,
-                || {},
                 Duration::ZERO
             )
             .decision,
@@ -1276,7 +1283,7 @@ mod tests {
         let pending = Arc::downgrade(&request.reply);
         drop(request); // the queued Wake was discarded when the event loop closed
         assert_eq!(
-            wait_for_decision(pending, receive, || false, || {}, Duration::from_secs(60)).decision,
+            wait_for_decision(pending, receive, || false, Duration::from_secs(60)).decision,
             WorkstationSetupDecision::Unavailable
         );
     }
@@ -1324,8 +1331,13 @@ mod tests {
         assert!(!request.pending());
     }
 
+    /// An offer its page let go ([`Request::let_go`]) admits nothing: the launch's offer comes
+    /// back as one no window showed, so the worker makes it again and the page answers it at its
+    /// first tick, and no Begin handoff runs; the offer of a resumed plan is answered as offered
+    /// with no receipt, which the worker lets go. Negative control: a launch offer let go as a
+    /// Begin runs its handoff and fails the first half.
     #[test]
-    fn a_cancelled_review_delivers_once_without_begin_handoff() {
+    fn an_offer_its_page_let_go_admits_nothing() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let calls = Arc::new(AtomicUsize::new(0));
         let called = calls.clone();
@@ -1333,14 +1345,23 @@ mod tests {
         let request = Request::with_handoff(Plan::default(), send, move || {
             called.fetch_add(1, Ordering::AcqRel);
         });
-        assert!(request.finish_answer(WorkstationSetupDecision::Cancelled.into()));
+        request.let_go();
         assert_eq!(
             receive.try_recv().unwrap().decision,
-            WorkstationSetupDecision::Cancelled
+            WorkstationSetupDecision::Unavailable
         );
         assert_eq!(calls.load(Ordering::Acquire), 0);
         assert!(!request.finish_answer(WorkstationSetupDecision::Begin(Plan::default()).into()));
         assert!(receive.try_recv().is_err());
+
+        let (send, receive) = mpsc::channel();
+        let resumed = Plan::from(preview_subset());
+        let request = Request::resume(resumed.clone(), send);
+        request.let_go();
+        let answer = receive.try_recv().unwrap();
+        assert_eq!(answer.decision, WorkstationSetupDecision::Begin(resumed));
+        assert!(answer.receipt.is_none() && !answer.chosen && answer.changed.is_none());
+        assert!(!request.pending());
     }
 
     #[test]
@@ -1446,7 +1467,7 @@ mod tests {
 
     /// An offer that reaches a window nobody has focused is shown in System State at once, not
     /// answered Unavailable for the worker to try again a minute later, and the page answers it
-    /// on the first tick with a person at this Mac.
+    /// on its first tick.
     #[test]
     fn an_offer_to_an_unfocused_window_is_shown_and_answered_at_once() {
         let (send, receive) = mpsc::channel();
@@ -1468,12 +1489,12 @@ mod tests {
             "System State shows it"
         );
         app.tick_system_state(Instant::now());
-        let mut answer = receive
-            .try_recv()
-            .expect("the first tick with a person here answers it");
+        let mut answer = receive.try_recv().expect("the first tick answers it");
         assert_eq!(
             answer.decision,
-            WorkstationSetupDecision::Begin(Plan::default())
+            WorkstationSetupDecision::Begin(crate::workstation_setup::automatic_plan_for_test(
+                Plan::default()
+            ))
         );
         answer.receipt.take().unwrap().accept();
         app.resolve_system_state_apply();

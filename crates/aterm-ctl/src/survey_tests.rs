@@ -128,10 +128,13 @@ fn the_arguments_parse_and_a_stray_one_is_the_usage_line() {
         &["survey", "--budget"][..],
         &["survey", "--budget", "0"],
         &["survey", "--sid"],
+        &["survey", "--sid", ""],
+        &["survey", "--sid", "@"],
         &["survey", "facts"],
         &["survey", "--host"],
         &["survey", "--fleet", "--host", "m7"],
         &["survey", "--fleet", "--timeout", "0"],
+        &["survey", "--fleet", "--timeout", "+2.5"],
         &["survey", "--fleet", "--timeout", "11"],
         &["survey", "--fleet", "--timeout", "soon"],
         &["survey", "--timeout", "3"],
@@ -2529,4 +2532,126 @@ fn an_email_label_is_masked_and_any_other_kept() {
     assert_eq!(masked_label("abcdef@example.com"), "ab\u{2026}@\u{2026}");
     assert_eq!(masked_label("a@example.com"), "a\u{2026}@\u{2026}");
     assert_eq!(masked_label("@example.com"), "\u{2026}@\u{2026}");
+}
+
+/// A BUILD'S FRONT WAITING FOR MEMORY READS AS THE BUILD IT WILL RUN: a session whose program is
+/// `targo` with `wait=memory` says `waiting for memory to run targo`, with its claim and the
+/// claims ahead where its record says them, either alone where it says one. NEGATIVE CONTROL: the
+/// same session with no wait (admitted: `wait=-`, or an older aterm that says none) reads
+/// `running targo`, and a figure that is no number is not shown.
+#[test]
+fn a_front_waiting_for_memory_says_so_before_its_build() {
+    let line = |extra: &[(&str, &str)]| {
+        let mut fields = vec![
+            ("sid", "s-00000000000000000004"),
+            ("program", "targo"),
+            ("program_kind", "program"),
+            ("agent", "-"),
+        ];
+        fields.extend_from_slice(extra);
+        let survey =
+            parse_reply(&["instance pid=1 sessions=1".to_owned(), wire_row(&fields)]).unwrap();
+        session_line(&survey.sessions[0], None, false, false)
+    };
+    let waits = |gib: &str, ahead: &str| {
+        line(&[("wait", "memory"), ("wait_gib", gib), ("wait_ahead", ahead)])
+    };
+    assert!(
+        waits("16.0", "2").contains(" waiting for memory to run targo (16.0 GiB, 2 ahead)"),
+        "{}",
+        waits("16.0", "2")
+    );
+    assert!(
+        waits("16.0", "-").contains(" waiting for memory to run targo (16.0 GiB)"),
+        "{}",
+        waits("16.0", "-")
+    );
+    assert!(
+        waits("-", "0").contains(" waiting for memory to run targo (0 ahead)"),
+        "{}",
+        waits("-", "0")
+    );
+    let bare = waits("-", "-");
+    assert!(bare.contains(" waiting for memory to run targo"), "{bare}");
+    assert!(!bare.contains('('), "{bare}");
+    let odd = waits("12;rm", "1");
+    assert!(
+        odd.contains(" waiting for memory to run targo (1 ahead)"),
+        "{odd}"
+    );
+    for running in [line(&[("wait", "-")]), line(&[])] {
+        assert!(running.contains(" running targo"), "{running}");
+        assert!(!running.contains("waiting"), "{running}");
+    }
+}
+
+/// THE JSON CARRIES EVERY NAME AND THE TEXT A SUMMARY: a row whose `work_paths=` names 64 files
+/// reaches `--json` whole, `--sid` names each file on its own line, and the text's `work:` line
+/// says the branch, the count, how far behind which main ref and the reading's age, and no file
+/// name. NEGATIVE CONTROL: a row with no `work` fields prints no `work:` line.
+#[test]
+fn survey_json_carries_every_name_and_the_text_a_summary() {
+    let names: Vec<String> = (0..64).map(|n| format!("src/f{n:02}.rs")).collect();
+    let joined = names.join("\n");
+    let worker = wire_row(&[
+        ("local", "1"),
+        ("sid", "s-00000000000000000001"),
+        ("program", "claude"),
+        ("program_kind", "agent"),
+        ("agent", "busy"),
+        ("work", "feat/x"),
+        ("work_repo", "~/Developer/x/.git"),
+        ("work_tree", "~/Developer/x-feat"),
+        ("work_base", "origin/main@e23254f84a67"),
+        ("work_behind", "3"),
+        ("work_files", "70"),
+        ("work_paths", &joined),
+        ("work_ms", "40000"),
+    ]);
+    let replies = [reply(4, vec![worker, busy_agent(4, 2)])];
+    let json = render_json(&replies);
+    let encoded = aterm_codec::json::escape(&joined);
+    assert!(
+        json.contains(&format!("\"work_paths\":\"{encoded}\"")),
+        "every name in the JSON: {json}"
+    );
+    for key in [
+        "work",
+        "work_repo",
+        "work_tree",
+        "work_base",
+        "work_behind",
+        "work_files",
+        "work_ms",
+    ] {
+        assert!(json.contains(&format!("\"{key}\":\"")), "{key} in the JSON");
+    }
+    let full = render_sid(&replies, "s-00000000000000000001", None).expect("found");
+    assert_eq!(
+        full.lines()
+            .filter(|l| l.starts_with("  work_paths: "))
+            .count(),
+        64,
+        "{full}"
+    );
+    let text = render_text(&replies, DEFAULT_BUDGET, None);
+    let work: Vec<&str> = text
+        .lines()
+        .filter(|l| l.starts_with("    work: "))
+        .collect();
+    assert_eq!(
+        work,
+        ["    work: feat/x · 70 files · 3 behind origin/main · 40s ago"],
+        "{text}"
+    );
+    assert!(
+        !text.contains("src/f00.rs"),
+        "the text names no file: {text}"
+    );
+
+    let plain = render_text(&[reply(4, vec![busy_agent(4, 2)])], DEFAULT_BUDGET, None);
+    assert!(
+        !plain.lines().any(|l| l.trim_start().starts_with("work:")),
+        "CONTROL: a row with no work fields: {plain}"
+    );
 }

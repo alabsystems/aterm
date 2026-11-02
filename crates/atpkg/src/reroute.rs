@@ -1275,7 +1275,11 @@ pub(crate) fn lay_with(
     let dir = dir(layout);
     layout.ensure_dir(&dir)?;
     let marker = dir.join(DIR_MARKER_FILE);
-    if marker_needs_lay(std::fs::read(&marker).ok().as_deref()) {
+    if marker_needs_lay(
+        crate::metadata_io::read_bounded_regular(&marker, MAX_STUB_BYTES)
+            .ok()
+            .as_deref(),
+    ) {
         crate::lay::write_regenerable(&crate::lay::Executable::new(&marker, marker_body()))?;
     }
     let mut files = Vec::new();
@@ -1285,7 +1289,9 @@ pub(crate) fn lay_with(
         match std::fs::symlink_metadata(&path) {
             Err(_) => {}
             Ok(_) if is_reroute_stub(&path) => {
-                if std::fs::read(&path).is_ok_and(|have| have == body.as_bytes()) {
+                if crate::metadata_io::read_bounded_regular(&path, MAX_STUB_BYTES)
+                    .is_ok_and(|have| have == body.as_bytes())
+                {
                     continue;
                 }
             }
@@ -1323,7 +1329,11 @@ pub(crate) fn lay_pending(
     }
     let dir = dir(layout);
     let mut pending = Vec::new();
-    if marker_needs_lay(std::fs::read(dir.join(DIR_MARKER_FILE)).ok().as_deref()) {
+    if marker_needs_lay(
+        crate::metadata_io::read_bounded_regular(&dir.join(DIR_MARKER_FILE), MAX_STUB_BYTES)
+            .ok()
+            .as_deref(),
+    ) {
         pending.push(DIR_MARKER_FILE.to_owned());
     }
     let wanted = wanted_stubs(layout, embedder, strict);
@@ -1332,7 +1342,8 @@ pub(crate) fn lay_pending(
         let lays = match std::fs::symlink_metadata(&path) {
             Err(_) => true,
             Ok(_) if is_reroute_stub(&path) => {
-                !std::fs::read(&path).is_ok_and(|have| have == body.as_bytes())
+                !crate::metadata_io::read_bounded_regular(&path, MAX_STUB_BYTES)
+                    .is_ok_and(|have| have == body.as_bytes())
             }
             Ok(_) => false,
         };
@@ -1455,19 +1466,27 @@ pub fn run(layout: &Layout, upstream: &str, args: &[String]) -> ExitCode {
                 eprintln!("atpkg: {error}; no build started");
                 return ExitCode::from(75);
             }
-            let args = if upstream == "cargo" && !machine.passthrough {
-                upstream_cargo_args(
+            let placed = if upstream == "cargo" && !machine.passthrough {
+                upstream_cargo_placement(
                     &target,
-                    args,
+                    &args,
                     &machine,
                     &crate::build_cache::with_build_dir_here,
                 )
             } else {
-                args
+                None
             };
-            exec_upstream(&target, &args)
+            let build_dir = placed
+                .as_deref()
+                .filter(|placed| {
+                    crate::build_cache::loses_config(placed, crate::build_cache::Tool::Cargo)
+                })
+                .and_then(crate::build_cache::directory_from_placed_args)
+                .map(str::to_owned);
+            let args = placed.unwrap_or(args);
+            exec_upstream(&target, &args, build_dir.as_deref())
         }
-        Plan::Quiet { copy, args } => exec_branded(layout, &copy, &args),
+        Plan::Quiet { copy, args } => exec_branded(layout, &copy, &args, None),
         Plan::Branded { say, copy, args } => {
             eprintln!("{say}");
             if upstream == "cargo"
@@ -1480,37 +1499,42 @@ pub fn run(layout: &Layout, upstream: &str, args: &[String]) -> ExitCode {
                 eprintln!("atpkg: {error}; no build started");
                 return ExitCode::from(75);
             }
-            let args = if upstream == "cargo" {
+            let placed = if upstream == "cargo" {
                 crate::build_cache::with_build_dir_here(&args, crate::build_cache::Tool::Targo)
-                    .unwrap_or(args)
             } else {
-                args
+                None
             };
-            exec_branded(layout, &copy, &args)
+            let build_dir = placed
+                .as_deref()
+                .filter(|placed| {
+                    crate::build_cache::loses_config(placed, crate::build_cache::Tool::Cargo)
+                })
+                .and_then(crate::build_cache::directory_from_placed_args)
+                .map(str::to_owned);
+            let args = placed.unwrap_or(args);
+            exec_branded(layout, &copy, &args, build_dir.as_deref())
         }
         Plan::Shim { shim, args } => {
             let copy = Managed {
                 target: shim,
                 env: crate::shim_env::ShimEnv::NONE,
             };
-            exec_branded(layout, &copy, &args)
+            exec_branded(layout, &copy, &args, None)
         }
     }
 }
 
 type Decide<'a> = dyn Fn(&[String], crate::build_cache::Tool) -> Option<Vec<String>> + 'a;
 
-fn upstream_cargo_args(
+fn upstream_cargo_placement(
     target: &Path,
-    args: Vec<String>,
+    args: &[String],
     machine: &Machine<'_>,
     decide: &Decide<'_>,
-) -> Vec<String> {
+) -> Option<Vec<String>> {
     use crate::build_cache::Tool;
-    if decide(&args, Tool::Cargo).is_none() {
-        return args;
-    }
-    match (machine.resolve)(target, explicit_toolchain(&args)).identity {
+    decide(args, Tool::Cargo)?;
+    match (machine.resolve)(target, explicit_toolchain(args)).identity {
         crate::upstream_identity::Identity::Known(vv)
             if crate::build_cache::release_reads_build_dir(&vv.release) =>
         {
@@ -1519,10 +1543,20 @@ fn upstream_cargo_args(
             } else {
                 Tool::Cargo
             };
-            decide(&args, tool).unwrap_or(args)
+            decide(args, tool)
         }
-        _ => args,
+        _ => None,
     }
+}
+
+#[cfg(test)]
+fn upstream_cargo_args(
+    target: &Path,
+    args: Vec<String>,
+    machine: &Machine<'_>,
+    decide: &Decide<'_>,
+) -> Vec<String> {
+    upstream_cargo_placement(target, &args, machine, decide).unwrap_or(args)
 }
 
 struct Machine<'a> {
@@ -1941,7 +1975,7 @@ pub fn run_storeless(upstream: &str, args: &[String]) -> ExitCode {
             if let Some(say) = say {
                 eprintln!("{say}");
             }
-            exec_upstream(&target, &args)
+            exec_upstream(&target, &args, None)
         }
         Plan::Refuse { say } => {
             eprintln!("{say}");
@@ -1993,7 +2027,7 @@ fn storeless_plan(row: &Row, args: &[String], machine: &Machine<'_>) -> Plan {
     }
 }
 
-fn exec_upstream(target: &Path, args: &[String]) -> ExitCode {
+fn exec_upstream(target: &Path, args: &[String], build_dir: Option<&str>) -> ExitCode {
     #[expect(
         clippy::disallowed_types,
         reason = "a pass-through by exec: its caller's descriptors are the program's"
@@ -2001,6 +2035,9 @@ fn exec_upstream(target: &Path, args: &[String]) -> ExitCode {
     let mut command = std::process::Command::new(target);
     aterm_uds::spawn::set_flags(&mut command, 0);
     command.args(args).env(ANNOUNCED_ENV, "1");
+    if let Some(directory) = build_dir {
+        command.env(crate::build_cache::BUILD_DIR_ENV, directory);
+    }
     let err = crate::platform::exec_or_run(&mut command);
     eprintln!("aterm: failed to exec {}: {err}", target.display());
     ExitCode::from(127)
@@ -2021,7 +2058,12 @@ fn direct_args(source_verb: Option<SourceVerb>, args: &[String]) -> Vec<String> 
     }
 }
 
-fn exec_branded(layout: &Layout, copy: &Managed, args: &[String]) -> ExitCode {
+fn exec_branded(
+    layout: &Layout,
+    copy: &Managed,
+    args: &[String],
+    build_dir: Option<&str>,
+) -> ExitCode {
     let child_path =
         crate::store::append_bin_to_path(std::env::var_os("PATH").as_deref(), &layout.bin_dir());
     #[expect(
@@ -2031,6 +2073,9 @@ fn exec_branded(layout: &Layout, copy: &Managed, args: &[String]) -> ExitCode {
     let mut command = std::process::Command::new(&copy.target);
     aterm_uds::spawn::set_flags(&mut command, 0);
     command.args(args).env("PATH", child_path);
+    if let Some(directory) = build_dir {
+        command.env(crate::build_cache::BUILD_DIR_ENV, directory);
+    }
     for (name, value) in copy.env.entries() {
         command.env(name, value);
     }

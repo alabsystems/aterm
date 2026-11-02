@@ -294,7 +294,11 @@ fn watch_stop_handoff_read_failures_keep_unknown_publication_debt_without_rebind
             lose_publication: lost.then_some((0, true)),
         };
         assert!(look_setup_upgrade_with(&mut widened, &mut port).is_err());
-        assert!(port.setup.upgrade_pending());
+        assert_eq!(
+            port.setup.upgrade_pending(),
+            !lost,
+            "a part-way write whose target only read badly is kept; one it cannot identify is let go"
+        );
         assert!(
             !settle_setup_stop(Duration::ZERO),
             "an unread target is not an unwritten one"
@@ -303,7 +307,7 @@ fn watch_stop_handoff_read_failures_keep_unknown_publication_debt_without_rebind
         port.unread = false;
         let retried = look_setup_upgrade_with(&mut widened, &mut port);
         if lost {
-            assert!(retried.is_err());
+            assert!(!matches!(retried, Ok(Some(_))), "{retried:?}");
             assert_eq!(
                 port.setup.snapshot().unwrap().observation,
                 before,
@@ -362,8 +366,11 @@ fn watch_stop_handoff_late_identity_loss_still_saves_its_reserved_target() {
             setup.recover().is_err(),
             "relaunch cannot resume the target"
         );
+        // The unidentified write was let go: a later look is a fresh one, which widens nothing.
+        assert!(!setup.upgrade_pending());
         let before = setup.snapshot().unwrap().observation;
-        assert!(setup.upgrade_outcome(None).is_err());
+        let again = setup.upgrade_outcome(None);
+        assert!(!matches!(again, Ok(Some(_))), "{again:?}");
         assert_eq!(setup.snapshot().unwrap().observation, before);
         assert!(script().runs.is_empty());
         drop(busy);
@@ -393,6 +400,7 @@ fn watch_stop_handoff_late_identity_loss_never_targets_a_newer_explicit_choice()
         )
         .is_err()
     );
+    assert!(!setup.upgrade_pending(), "the unidentified write is let go");
     let target = setup.snapshot().unwrap().revision;
     assert_eq!(target, original + 1);
     assert!(script().stops.is_empty());
@@ -405,9 +413,9 @@ fn watch_stop_handoff_late_identity_loss_never_targets_a_newer_explicit_choice()
     setup.choose().unwrap();
     let current = setup.snapshot().unwrap().revision;
     assert_eq!(current, target + 1);
-    // The same ended writer can offer only its older Stop evidence after
-    // replacement. It cannot adopt the current publication or admit again.
-    assert!(
+    // The writer whose publication went unidentified was let go with its look: the next look
+    // is a fresh one, which finds the person's plan, never widens it and adopts nothing.
+    assert_eq!(
         look_setup_upgrade_with(
             &mut widened,
             &mut ScratchUpgrade {
@@ -417,12 +425,12 @@ fn watch_stop_handoff_late_identity_loss_never_targets_a_newer_explicit_choice()
                 unread: false,
                 lose_publication: None,
             },
-        )
-        .is_err()
+        ),
+        Ok(None)
     );
     wait_until("the old evidence's Stop queue finishes", stop_worker_idle);
     let before = setup.snapshot().unwrap().observation;
-    assert!(setup.upgrade_outcome(None).is_err());
+    assert_eq!(setup.upgrade_outcome(None), Ok(None));
     assert_eq!(setup.snapshot().unwrap().observation, before);
     assert!(script().stops.iter().all(|saved| *saved < current));
     let claim = StartupClaim::claim().unwrap().unwrap();

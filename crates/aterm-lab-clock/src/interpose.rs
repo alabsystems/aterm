@@ -115,15 +115,15 @@ fn shifting() -> Option<(&'static Config, Outer)> {
 }
 
 fn look(config: &Config) {
-    let Some(file) = &config.file else {
+    if config.file.is_none() && config.dir.is_none() {
         return;
-    };
+    }
     let now = mach_absolute_time();
     if now < NEXT_LOOK.load(Ordering::Relaxed) || LOOKING.swap(true, Ordering::Acquire) {
         return;
     }
     NEXT_LOOK.store(now.saturating_add(config.look), Ordering::Relaxed);
-    let read = reread(file);
+    let read = config.file.as_deref().is_some_and(reread);
     if read || now >= NEXT_RECORD.load(Ordering::Relaxed) {
         NEXT_RECORD.store(now.saturating_add(config.record), Ordering::Relaxed);
         write_record(config);
@@ -135,6 +135,9 @@ fn reread(file: &Path) -> bool {
     let Ok(meta) = std::fs::metadata(file) else {
         return false;
     };
+    if !meta.is_file() {
+        return false;
+    }
     let size = i64::try_from(meta.size()).unwrap_or(i64::MAX);
     if meta.ino() == SEEN_INO.load(Ordering::Relaxed)
         && size == SEEN_SIZE.load(Ordering::Relaxed)
@@ -143,10 +146,22 @@ fn reread(file: &Path) -> bool {
     {
         return false;
     }
-    let mut buf = [0u8; 64];
-    let Ok(n) = std::fs::File::open(file).and_then(|mut f| f.read(&mut buf)) else {
+    let mut buf = [0u8; 65];
+    let Ok(mut f) = std::fs::File::open(file) else {
         return false;
     };
+    let mut n = 0;
+    while n < buf.len() {
+        match f.read(&mut buf[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return false,
+        }
+    }
+    if n == buf.len() {
+        return false;
+    }
     let Some(off) = buf.get(..n).and_then(parse_offset) else {
         return false;
     };

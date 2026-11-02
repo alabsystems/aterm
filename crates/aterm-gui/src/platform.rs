@@ -237,12 +237,28 @@ pub(crate) trait AppRt {
     /// Query the OS motion preference. macOS reads `NSWorkspace.accessibilityDisplayShouldReduceMotion`.
     fn reduce_motion(&self) -> bool;
 
+    /// Whether the machine is in Low Power Mode or a serious thermal state, under which a
+    /// native page's motion stills to a static glyph (§5.5 of
+    /// `docs/DESIGN-init-on-by-default-2026-10-25.md`). macOS reads `NSProcessInfo`; a host
+    /// that cannot tell says no.
+    fn low_power(&self) -> bool {
+        false
+    }
+
     /// Snapshot the OS-native display accessibility preferences consumed by the semantic native-app appearance system.
     fn native_appearance_preferences(&self) -> crate::native_appearance::AppearancePreferences {
         crate::native_appearance::AppearancePreferences::default()
     }
 
-    /// Subscribe to the OS reduce-motion change notification (macOS: `NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification` on the workspace centre), posting [`Wake::ReduceMotionChanged`] so the main thread re-queries [`Self::reduce_motion`] and repaints.
+    /// The accent the OS paints its own controls in, for [`crate::native_appearance::install_control_accent`]:
+    /// macOS reads `NSColor.controlAccentColor` under its dark and light appearances; a host
+    /// that cannot tell, or may not ask (a headless instance), reads none.
+    #[cfg(target_os = "macos")]
+    fn control_accent(&self) -> Option<crate::native_appearance::SystemAccent> {
+        None
+    }
+
+    /// Subscribe to OS motion-policy changes (macOS: accessibility display options on the workspace centre, power and thermal state on the default centre), posting [`Wake::ReduceMotionChanged`] so the main thread re-queries the preferences and repaints.
     fn observe_reduce_motion(&self, proxy: &EventLoopProxy<Wake>) -> Option<ReduceMotionObserver>;
 
     /// Hold App Nap off for the rest of the process's life; the activity ends when the returned
@@ -710,6 +726,10 @@ impl AppRt for AppRtMacOS {
         self.probe_preferences && reduce_motion::query()
     }
 
+    fn low_power(&self) -> bool {
+        self.probe_preferences && crate::spare::power_constrained()
+    }
+
     fn native_appearance_preferences(&self) -> crate::native_appearance::AppearancePreferences {
         if !self.probe_preferences {
             return crate::native_appearance::AppearancePreferences::default();
@@ -720,6 +740,13 @@ impl AppRt for AppRtMacOS {
             differentiate_without_color: reduce_motion::differentiate_without_color(),
             text_scale: 1.0,
         }
+    }
+
+    fn control_accent(&self) -> Option<crate::native_appearance::SystemAccent> {
+        if !self.probe_preferences {
+            return None;
+        }
+        reduce_motion::control_accent()
     }
 
     fn observe_reduce_motion(&self, proxy: &EventLoopProxy<Wake>) -> Option<ReduceMotionObserver> {
@@ -759,6 +786,13 @@ impl Windowed {
     /// Mint the proof at a windowed launch, before its AppKit event loop is built.
     pub(crate) fn launch() -> Self {
         WINDOWED_LAUNCH.store(true, std::sync::atomic::Ordering::Release);
+        aterm_window::platform::macos::set_window_key_classifier(|key| {
+            crate::hwkey::event_posted(crate::hwkey::PostedKey {
+                kind: key.kind,
+                keycode: key.keycode,
+                timestamp: key.timestamp,
+            })
+        });
         Self(())
     }
 
@@ -903,14 +937,20 @@ pub(crate) fn current_event_queue_age_ns() -> Option<u64> {
             appkit::send_f64(info, sel!(systemUptime)),
         )
     };
-    if ts <= 0.0 {
+    nsevent_queue_age_ns(ts, uptime)
+}
+
+/// An observed AppKit timestamp may be rounded slightly ahead of uptime; other
+/// unsupported clock values stay unavailable rather than becoming a zero wait.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn nsevent_queue_age_ns(timestamp: f64, uptime: f64) -> Option<u64> {
+    if timestamp <= 0.0 {
         return None;
     }
-    let age_s = uptime - ts;
-    if !(-0.001..=2.0).contains(&age_s) {
-        return None;
-    }
-    Some((age_s.max(0.0) * 1e9) as u64)
+    let age_s = uptime - timestamp;
+    (-0.001..=2.0)
+        .contains(&age_s)
+        .then(|| (age_s.max(0.0) * 1e9) as u64)
 }
 
 /// The key event AppKit is dispatching now (`-[NSApp currentEvent]`), as `hwkey` records the
@@ -965,6 +1005,53 @@ pub(crate) fn appkit_window_number(window: &Window) -> i64 {
 #[must_use]
 pub(crate) fn appkit_window_number(_window: &Window) -> i64 {
     0
+}
+
+/// Native window identity and AppKit focus, without changing either.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NativeFocus {
+    pub(crate) window: i64,
+    pub(crate) app_active: bool,
+    pub(crate) window_key: bool,
+}
+
+/// Observe an existing AppKit window on the main thread; unavailable without a native window.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub(crate) fn appkit_native_focus(window: &Window) -> Option<NativeFocus> {
+    use aterm_objc::sel;
+
+    use crate::appkit::{self, MainThread};
+
+    let _windowed = Windowed::get()?;
+    let main_thread = MainThread::new()?;
+    let app = appkit::existing_application(main_thread)?;
+    let ns_window = ns_window_of(window);
+    if ns_window.is_null() {
+        return None;
+    }
+    // SAFETY: the windowed witness, main-thread witness and live NSWindow keep these reads on
+    // existing AppKit objects. The borrowed application was read from NSApp without creating
+    // it. `-windowNumber` returns NSInteger (isize); `-isActive` and `-isKeyWindow` return BOOL.
+    // They are side-effect-free getters, with no activation or key posting.
+    unsafe {
+        let window = appkit::send_isize(ns_window, sel!(windowNumber)) as i64;
+        if window == 0 {
+            return None;
+        }
+        Some(NativeFocus {
+            window,
+            app_active: appkit::send_bool(app, sel!(isActive)),
+            window_key: appkit::send_bool(ns_window, sel!(isKeyWindow)),
+        })
+    }
+}
+
+/// Non-macOS peer: native AppKit focus is unavailable.
+#[cfg(not(target_os = "macos"))]
+#[must_use]
+pub(crate) fn appkit_native_focus(_window: &Window) -> Option<NativeFocus> {
+    None
 }
 
 /// Whether this window is the key window of the active application.
@@ -1053,6 +1140,135 @@ pub(crate) fn user_input_readable_source(headless: bool) -> fn() -> bool {
 #[must_use]
 pub(crate) const fn user_input_read_as_given() -> bool {
     true
+}
+
+/// Whether this login's screen is out of a person's reach: locked
+/// (`CGSessionCopyCurrentDictionary`'s `CGSSessionScreenIsLocked`, which the session carries
+/// only while it is), or switched away for another login at this Mac (its
+/// `kCGSessionOnConsoleKey` false: fast user switching, whose keyboard and mouse the HID idle
+/// reading counts as input too). `false` when the session cannot be read.
+#[cfg(target_os = "macos")]
+fn screen_is_away() -> bool {
+    screen_lock::away()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn screen_is_away() -> bool {
+    false
+}
+
+/// The screen-away source an `App` holds: a headless instance never reaches the window server.
+pub(crate) fn screen_away_source(headless: bool) -> fn() -> bool {
+    if headless {
+        screen_never_away
+    } else {
+        screen_is_away
+    }
+}
+
+/// The screen-away source for headless instances and unit tests: never away.
+#[must_use]
+pub(crate) const fn screen_never_away() -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+mod screen_lock {
+    use std::ffi::{c_char, c_void};
+    use std::sync::OnceLock;
+
+    type CfTypeRef = *const c_void;
+    type CfTypeId = usize;
+
+    const SCREEN_IS_LOCKED_KEY: &[u8] = b"CGSSessionScreenIsLocked\0";
+    /// `CGSession.h`'s `kCGSessionOnConsoleKey`.
+    const ON_CONSOLE_KEY: &[u8] = b"kCGSSessionOnConsoleKey\0";
+    const CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGSessionCopyCurrentDictionary() -> CfTypeRef;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFStringCreateWithCString(
+            alloc: CfTypeRef,
+            c_str: *const c_char,
+            encoding: u32,
+        ) -> CfTypeRef;
+        fn CFDictionaryGetValue(dict: CfTypeRef, key: CfTypeRef) -> CfTypeRef;
+        fn CFGetTypeID(cf: CfTypeRef) -> CfTypeId;
+        fn CFBooleanGetTypeID() -> CfTypeId;
+        fn CFBooleanGetValue(boolean: CfTypeRef) -> u8;
+        fn CFRelease(cf: CfTypeRef);
+    }
+
+    /// The two session keys, made once for the process.
+    struct Keys {
+        locked: CfTypeRef,
+        on_console: CfTypeRef,
+    }
+    // SAFETY: immutable CFStrings kept for the process, which CF documents as usable from any thread; nothing here is dereferenced by Rust.
+    unsafe impl Send for Keys {}
+    // SAFETY: as for `Send`: the strings are immutable and never released.
+    unsafe impl Sync for Keys {}
+
+    fn cf_string(text: &'static [u8]) -> CfTypeRef {
+        // SAFETY: `text` is a NUL-terminated UTF-8 literal; the Create rule's +1 goes to the caller.
+        unsafe {
+            CFStringCreateWithCString(
+                std::ptr::null(),
+                text.as_ptr().cast::<c_char>(),
+                CF_STRING_ENCODING_UTF8,
+            )
+        }
+    }
+
+    fn keys() -> Option<&'static Keys> {
+        static KEYS: OnceLock<Option<Keys>> = OnceLock::new();
+        KEYS.get_or_init(|| {
+            let locked = cf_string(SCREEN_IS_LOCKED_KEY);
+            let on_console = cf_string(ON_CONSOLE_KEY);
+            if locked.is_null() || on_console.is_null() {
+                for key in [locked, on_console] {
+                    if !key.is_null() {
+                        // SAFETY: a +1 string made just above that nothing else holds.
+                        unsafe { CFRelease(key) };
+                    }
+                }
+                return None;
+            }
+            // The Create rule's +1 on each is the process-wide cache, never released.
+            Some(Keys { locked, on_console })
+        })
+        .as_ref()
+    }
+
+    /// Whether the session dictionary names its screen locked or its session off the console;
+    /// `false` when there is none.
+    #[must_use]
+    pub(super) fn away() -> bool {
+        let Some(keys) = keys() else {
+            return false;
+        };
+        // SAFETY: the Copy rule gives +1 on the session dictionary, released on every path after use; `CFDictionaryGetValue` borrows (Get rule) values that live as long as the dictionary, and each one's type is checked before `CFBooleanGetValue` reads it.
+        unsafe {
+            let session = CGSessionCopyCurrentDictionary();
+            if session.is_null() {
+                return false;
+            }
+            let boolean = CFBooleanGetTypeID();
+            let locked = CFDictionaryGetValue(session, keys.locked);
+            let locked = !locked.is_null()
+                && (CFGetTypeID(locked) != boolean || CFBooleanGetValue(locked) != 0);
+            let on_console = CFDictionaryGetValue(session, keys.on_console);
+            let switched_away = !on_console.is_null()
+                && CFGetTypeID(on_console) == boolean
+                && CFBooleanGetValue(on_console) == 0;
+            CFRelease(session);
+            locked || switched_away
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1825,9 +2041,37 @@ mod reduce_motion {
     /// The system colours changed (the accent colour among them).
     pub(crate) const SYSTEM_COLORS_NOTIFICATION: &str = "NSSystemColorsDidChangeNotification";
 
+    #[link(name = "Foundation", kind = "framework")]
+    unsafe extern "C" {
+        /// `NSProcessInfo.h`: available since macOS 10.10.3, before this app's macOS 11 floor.
+        #[link_name = "NSProcessInfoThermalStateDidChangeNotification"]
+        static THERMAL_STATE_NOTIFICATION: aterm_objc::Id;
+    }
+
+    const POWER_STATE_SYMBOL: &std::ffi::CStr = c"NSProcessInfoPowerStateDidChangeNotification";
+
+    /// Resolve the value of an optional Foundation notification constant without importing it.
+    ///
+    /// # Safety
+    /// If present, `symbol` must export an immutable, process-lifetime NSString pointer.
+    unsafe fn optional_notification(symbol: &std::ffi::CStr) -> Option<aterm_objc::Id> {
+        // SAFETY: `RTLD_DEFAULT` searches the loaded images, `symbol` is NUL-terminated, and
+        // the caller names an NSString-pointer constant. dlsym returns its address, not value.
+        let at =
+            unsafe { libc::dlsym(libc::RTLD_DEFAULT, symbol.as_ptr()).cast::<aterm_objc::Id>() };
+        if at.is_null() {
+            return None;
+        }
+        // SAFETY: a found constant has the pointer type and process lifetime the caller pins.
+        let name = unsafe { *at };
+        (!name.is_null()).then_some(name)
+    }
+
     /// The observer target's ivars.
     pub(crate) struct ReduceMotionIvars {
-        relay: Box<dyn Fn()>,
+        // Power and thermal notifications arrive on the global dispatch queue. This relay
+        // only posts to the event loop; all preference reads and redraws stay on its thread.
+        relay: Box<dyn Fn() + Send + Sync>,
         woke: Box<dyn Fn()>,
         colors: Box<dyn Fn()>,
         sleeps: Box<dyn Fn()>,
@@ -1863,7 +2107,7 @@ mod reduce_motion {
 
     fn new_target(
         mtm: aterm_objc::MainThread,
-        relay: Box<dyn Fn()>,
+        relay: Box<dyn Fn() + Send + Sync>,
         woke: Box<dyn Fn()>,
         colors: Box<dyn Fn()>,
         sleeps: Box<dyn Fn()>,
@@ -1976,6 +2220,38 @@ mod reduce_motion {
                     );
                 }
             }
+            if !center.is_null() {
+                // SAFETY: these are Foundation NSString constants. Low Power Mode's name
+                // arrived in macOS 12, so macOS 11 observes only the thermal notification.
+                let names = unsafe {
+                    [
+                        optional_notification(POWER_STATE_SYMBOL),
+                        Some(THERMAL_STATE_NOTIFICATION),
+                    ]
+                };
+                for name in names.into_iter().flatten() {
+                    // SAFETY: as above, with an immortal Foundation name and the proxy-only
+                    // selector, which may run on the notification's global dispatch queue.
+                    unsafe {
+                        let add: unsafe extern "C-unwind" fn(
+                            aterm_objc::Id,
+                            aterm_objc::Sel,
+                            aterm_objc::Id,
+                            aterm_objc::Sel,
+                            aterm_objc::Id,
+                            aterm_objc::Id,
+                        ) = aterm_objc::checked_msg();
+                        add(
+                            center,
+                            aterm_objc::sel!(addObserver:selector:name:object:),
+                            target.as_id(),
+                            aterm_objc::sel!(reduceMotionDidChange:),
+                            name,
+                            aterm_objc::Id::NIL,
+                        );
+                    }
+                }
+            }
             true
         })
     }
@@ -2009,11 +2285,77 @@ mod reduce_motion {
         workspace_flag(sel!(accessibilityDisplayShouldDifferentiateWithoutColor))
     }
 
-    /// Register a workspace-notification observer for the accessibility display-options change, the wake from sleep and the sleep to come, and return the retained target (the caller keeps it alive for the process life — the notification center references it weakly, and it is never removed, exactly like the menu target).
+    /// Read `NSColor.controlAccentColor` as sRGB under the dark and the light appearance (its
+    /// dynamic colour resolves to a shade for each), or `None` where either will not resolve.
+    /// Main thread only, as every AppKit colour read is.
+    pub(crate) fn control_accent() -> Option<crate::native_appearance::SystemAccent> {
+        aterm_objc::autoreleasepool(|_| {
+            let shade = |dark: bool| -> Option<[u8; 3]> {
+                // SAFETY: called on the main thread (the resample, the launch's first window and
+                // the system-colours wake all run there). Every message is a documented
+                // non-raising AppKit call: `+currentAppearance` returns a +0 appearance (or nil),
+                // `+appearanceNamed:` a +0 built-in appearance for a system name
+                // (`appkit::appearance_name`) or nil, `+setCurrentAppearance:` takes one (nil
+                // restores the default) only until it is put back below, `+controlAccentColor` is
+                // a +0 dynamic colour, `+sRGBColorSpace` an immortal shared space,
+                // `-colorUsingColorSpace:` a +0 colour or nil, and the component getters return
+                // plain `CGFloat`s. The autorelease pool outlives every +0 object read here.
+                unsafe {
+                    let appearance = class(c"NSAppearance").as_id();
+                    let named = appkit::send_id_id(
+                        appearance,
+                        sel!(appearanceNamed:),
+                        appkit::appearance_name(dark),
+                    );
+                    if named.is_null() {
+                        return None;
+                    }
+                    let previous = appkit::send_id(appearance, sel!(currentAppearance));
+                    appkit::send_v_id(appearance, sel!(setCurrentAppearance:), named);
+                    let space =
+                        appkit::send_id(class(c"NSColorSpace").as_id(), sel!(sRGBColorSpace));
+                    let accent =
+                        appkit::send_id(class(c"NSColor").as_id(), sel!(controlAccentColor));
+                    let color = if accent.is_null() || space.is_null() {
+                        aterm_objc::Id::NIL
+                    } else {
+                        appkit::send_id_id(accent, sel!(colorUsingColorSpace:), space)
+                    };
+                    let rgb = (!color.is_null()).then(|| {
+                        #[allow(
+                            clippy::cast_possible_truncation,
+                            clippy::cast_sign_loss,
+                            reason = "a colour component in 0..=1, scaled to a byte"
+                        )]
+                        let channel = |component: aterm_objc::Sel| {
+                            (appkit::send_f64(color, component).clamp(0.0, 1.0) * 255.0).round()
+                                as u8
+                        };
+                        [
+                            channel(sel!(redComponent)),
+                            channel(sel!(greenComponent)),
+                            channel(sel!(blueComponent)),
+                        ]
+                    });
+                    appkit::send_v_id(appearance, sel!(setCurrentAppearance:), previous);
+                    rgb
+                }
+            };
+            Some(crate::native_appearance::SystemAccent {
+                on_dark: shade(true)?,
+                on_light: shade(false)?,
+            })
+        })
+    }
+
+    /// Register workspace and default-centre observers for motion-policy changes, system colours, wake and sleep, and return the retained target (the caller keeps it alive for the process life — the notification center references it weakly, and it is never removed, exactly like the menu target).
     pub(crate) fn observe(
         proxy: &EventLoopProxy<Wake>,
     ) -> Option<aterm_objc::Retained<ReduceMotionTarget>> {
         let main_thread = MainThread::new()?;
+        // Foundation requires reading thermalState before subscribing to its notifications.
+        // This observer is installed only for a windowed runtime that permits OS probes.
+        let _ = crate::spare::power_constrained();
         let colors = proxy.clone();
         let proxy = proxy.clone();
         let target = new_target(
@@ -2042,8 +2384,9 @@ mod reduce_motion {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         use super::{
-            DID_WAKE_NOTIFICATION, DISPLAY_OPTIONS_NOTIFICATION, ReduceMotionTarget,
-            WILL_SLEEP_NOTIFICATION, new_target, register,
+            DID_WAKE_NOTIFICATION, DISPLAY_OPTIONS_NOTIFICATION, POWER_STATE_SYMBOL,
+            ReduceMotionTarget, THERMAL_STATE_NOTIFICATION, WILL_SLEEP_NOTIFICATION, new_target,
+            optional_notification, register,
         };
 
         fn unregister(target: &aterm_objc::Retained<ReduceMotionTarget>) {
@@ -2063,12 +2406,11 @@ mod reduce_motion {
             }
         }
 
-        fn post_default(notification: &str) {
+        fn post_default(name: aterm_objc::Id) {
             aterm_objc::autoreleasepool(|_| {
                 let center = super::default_center();
                 assert!(!center.is_null(), "no default notification centre");
-                let name = aterm_objc::ns_string(notification).expect("NSString");
-                // SAFETY: `-postNotificationName:object:` is `-(void)(id, id)`; `center` is live, `name` a live +1 NSString, nil sender is legal.
+                // SAFETY: `-postNotificationName:object:` is `-(void)(id, id)`; `center` is live, callers keep the NSString name alive, nil sender is legal.
                 unsafe {
                     let f: unsafe extern "C-unwind" fn(
                         aterm_objc::Id,
@@ -2079,7 +2421,7 @@ mod reduce_motion {
                     f(
                         center,
                         aterm_objc::sel!(postNotificationName:object:),
-                        name.id(),
+                        name,
                         aterm_objc::Id::NIL,
                     );
                 }
@@ -2117,6 +2459,21 @@ mod reduce_motion {
         fn a_real_workspace_notification_reaches_the_declared_class() {
             use aterm_objc::{ClassType, class, class_name, superclass_of};
 
+            // SAFETY: these symbols are either absent or immutable Foundation NSString
+            // constants. The known thermal value controls the required pointer dereference.
+            let power_available = unsafe {
+                assert_eq!(
+                    optional_notification(c"aterm_missing_foundation_notification_58495"),
+                    None,
+                    "an unavailable notification must be omitted"
+                );
+                assert_eq!(
+                    optional_notification(c"NSProcessInfoThermalStateDidChangeNotification"),
+                    Some(THERMAL_STATE_NOTIFICATION),
+                    "the resolver reads the exported value, not its address"
+                );
+                optional_notification(POWER_STATE_SYMBOL).is_some()
+            };
             let hits = Arc::new(AtomicUsize::new(0));
             let seen = Arc::clone(&hits);
             let wakes = Arc::new(AtomicUsize::new(0));
@@ -2174,14 +2531,36 @@ mod reduce_motion {
             assert!(register(&target), "workspace centre registration failed");
             post();
             post();
+            // Foundation delivers these on the global dispatch queue. No AppKit work may
+            // happen in the relay, and a quiet page needs no motion tick to receive it.
+            std::thread::spawn(|| {
+                // SAFETY: Foundation owns these immutable names for the process lifetime.
+                unsafe {
+                    if let Some(name) = optional_notification(POWER_STATE_SYMBOL) {
+                        post_default(name);
+                    }
+                    post_default(THERMAL_STATE_NOTIFICATION);
+                }
+            })
+            .join()
+            .expect("power notification sender");
             post_named(DID_WAKE_NOTIFICATION);
             post_named(WILL_SLEEP_NOTIFICATION);
-            post_default(super::SYSTEM_COLORS_NOTIFICATION);
+            let colors_name =
+                aterm_objc::ns_string(super::SYSTEM_COLORS_NOTIFICATION).expect("NSString");
+            post_default(colors_name.id());
             unregister(&target);
             post();
             post_named(DID_WAKE_NOTIFICATION);
             post_named(WILL_SLEEP_NOTIFICATION);
-            post_default(super::SYSTEM_COLORS_NOTIFICATION);
+            post_default(colors_name.id());
+            // SAFETY: Foundation owns these immutable names for the process lifetime.
+            unsafe {
+                if let Some(name) = optional_notification(POWER_STATE_SYMBOL) {
+                    post_default(name);
+                }
+                post_default(THERMAL_STATE_NOTIFICATION);
+            }
             assert_eq!(
                 recolors.load(Ordering::SeqCst),
                 1,
@@ -2191,8 +2570,8 @@ mod reduce_motion {
 
             assert_eq!(
                 hits.load(Ordering::SeqCst),
-                2,
-                "AppKit did not deliver the notification to the declared class \
+                3 + usize::from(power_available),
+                "Foundation/AppKit did not deliver policy notifications to the declared class \
                  exactly as many times as it was posted"
             );
             assert_eq!(

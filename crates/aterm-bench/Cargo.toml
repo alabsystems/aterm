@@ -32,6 +32,8 @@ libc = { workspace = true }
 # The Aos harness (the `aos` lane): checkpoints, the event log and shadow replay of the hosted
 # momentum glow, beside aterm-effects' `MomentumHost`.
 aterm-aos = { workspace = true }
+# The vte-engine harness reads the load average it ran at through the machine reader.
+aterm-sysprobe = { workspace = true }
 
 # `aos_gpu` drains the autorelease pool its Metal jobs ran in before its last footprint read.
 [target.'cfg(target_os = "macos")'.dev-dependencies]
@@ -59,4 +61,10 @@ test = false
 name = "aos_gpu"
 required-features = ["aos-gpu"]
 # Its unit tests (the record's shaping and C0's poison) run in `targo --unverified test -p aterm-bench --features aos-gpu --example aos_gpu`, and the gated required-features lint compiles them.
+test = true
+
+[[example]]
+name = "vte_engine_harness"
+# Its unit tests (the interleave and the performance-core cycle count) run in
+# `targo --unverified test -p aterm-bench`.
 test = true

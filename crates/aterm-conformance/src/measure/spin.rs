@@ -36,14 +36,27 @@ pub enum SpinScene {
     /// returns (about 18 frames at a 120 Hz panel's 16.7 ms effect interval), and a pointer over
     /// its pane heats the pet's gaze, so the scene's take decides only with no window event other
     /// than a redraw ([`os_events_unidle`]) and a pet that asks for no frame as the window opens.
+    /// The window's rest is off (`idle_rest_secs = 0`), so the take measures an awake window's
+    /// deck; a take whose window rests anyway is a refusal ([`rest_unready`]).
     PetAsleep,
+    /// [`Self::PetAsleep`] with the rest on at its measured candidate (`idle_rest_secs = 30`; off
+    /// unless set): by [`PET_DEEP_SLEEP`] the window has rested (ATERM-KI-1027-4), so its deck
+    /// draws still on background readings. The take decides only once the window reads
+    /// `resting=true` as it opens and as it ends, and, since any window event would wake it, only
+    /// with no window event other than a redraw.
+    Resting,
 }
 
 impl SpinScene {
     /// Whether the scene opens a window.
     #[must_use]
     pub const fn windowed(self) -> bool {
-        matches!(self, Self::Windowed | Self::PetAsleep)
+        matches!(self, Self::Windowed | Self::PetAsleep | Self::Resting)
+    }
+
+    /// Whether the scene measures a focused window's sleeping pet ([`PET_READY`]).
+    const fn pet(self) -> bool {
+        matches!(self, Self::PetAsleep | Self::Resting)
     }
 }
 
@@ -71,6 +84,9 @@ pub struct SpinRow {
     pub needle_owed: bool,
     /// Every loop wake in the window (`event_wakes`).
     pub max_wakes: u64,
+    /// The frames the window presented (`frames`), where the row bounds them; `None` bounds
+    /// nothing.
+    pub max_frames: Option<u64>,
 }
 
 const SETTLE_QUIET_MS: &str = "3000";
@@ -78,13 +94,20 @@ const SETTLE_QUIET_MS: &str = "3000";
 /// The deadline owner the cursor effects (the pet, the glow, the trail) fire as.
 pub const EFFECT_LANE: &str = "cursor_effect";
 
-/// The deadline owner the stats deck's dial needle fires as while it sweeps to a reading.
-pub const NEEDLE_LANE: &str = "stats_needle";
+/// The deadline owner the stats deck's dial needle fires as while it sweeps to a reading: its
+/// deck clock's (`aterm-gui`'s `stats_clock.rs`), the synthetic grid's ticks and a display
+/// link's resumes.
+pub const NEEDLE_LANE: &str = "deck_clock";
+
+/// The deadline owner the stats deck's live edge (its glide, slide, beat and steam) fires as.
+pub const LIVE_LANE: &str = "stats_live";
 
 /// The loop wakes one needle frame takes: its deadline's timer wake and the `GpuSurfaceReady`
 /// wake its present brings. Three pet takes on 2026-10-28 counted 19, 34 and 46 needle fires
 /// beside 129, 160 and 184 wakes, as many `GpuSurfaceReady` wakes as frames: 91 or 92 wakes
-/// besides the needle's in each.
+/// besides the needle's in each. Those takes predate the deck clock: a window on its display
+/// link fires [`NEEDLE_LANE`] only to resume the paused link, one timer wake, and draws its
+/// frames on the link's ticks, window events that [`SpinRow::max_wakes`] counts.
 pub const WAKES_PER_NEEDLE_FRAME: u64 = 2;
 
 /// How long the pet scene waits on a quiet prompt before its window opens: past the pet's deep
@@ -97,9 +120,9 @@ pub const PET_DEEP_SLEEP: Duration = Duration::from_secs(40);
 const PET_STYLE: &str = "rainbow kitty pet";
 
 /// The `trail status` fields a pet take records: the style, the focus and motion its effects saw,
-/// the pet's state, why it is in it, and its console events so far, which differ between the
-/// window's edges where an event reached the pet between them.
-const PET_FIELDS: [&str; 11] = [
+/// the pet's state, why it is in it, its console events so far, which differ between the
+/// window's edges where an event reached the pet between them, and whether the window rests.
+const PET_FIELDS: [&str; 12] = [
     "resolved",
     "focused",
     "motion",
@@ -111,6 +134,7 @@ const PET_FIELDS: [&str; 11] = [
     "pet_pose",
     "pet_reason",
     "pet_event_seq",
+    "resting",
 ];
 
 /// What a pet take's `trail status` must read for its bound to decide anything: the pet drawn, in
@@ -137,18 +161,144 @@ fn pet_unready(line: &str) -> Option<String> {
         .map(|(key, _)| format!("{key}={}", field(line, key).unwrap_or("?")))
 }
 
+/// Whether a pet take's `trail status` reads the window's rest as `scene` needs it, as
+/// `resting=value` (`?` for a reply without it) when it does not: a [`SpinScene::Resting`] take
+/// decides only on a window that rests, and a [`SpinScene::PetAsleep`] take only on one awake, so
+/// a rest its `idle_rest_secs = 0` failed to turn off is a refusal, never a pass on a still deck.
+/// A reply without the field (a build from before the rest) is awake.
+fn rest_unready(scene: SpinScene, line: &str) -> Option<String> {
+    let resting = field(line, "resting");
+    let ready = match scene {
+        SpinScene::Resting => resting == Some("true"),
+        SpinScene::PetAsleep => resting != Some("true"),
+        SpinScene::ClaudeShaped | SpinScene::Idle | SpinScene::Rewound | SpinScene::Windowed => {
+            true
+        }
+    };
+    (!ready).then(|| format!("resting={}", resting.unwrap_or("?")))
+}
+
+/// How often a windowed take reads the instance's footprint ([`super::usage`]).
+pub const SAMPLE_EVERY: Duration = Duration::from_millis(50);
+
+/// How far above a take's least footprint a sample may sit and still count as at the floor: the
+/// GPU driver's render-pass block is about 179 MB, so a sample within this has it released
+/// (`docs/measured/idle-memory-window-2026-10-27.md`).
+pub const FLOOR_BAND: u64 = 32 << 20;
+
+/// A windowed take's footprint over its window, sampled every [`SAMPLE_EVERY`], and what the
+/// instance used in it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sampled {
+    pub samples: usize,
+    /// The samples' median, least and greatest footprint, bytes.
+    pub p50: u64,
+    pub min: u64,
+    pub max: u64,
+    /// The samples within [`FLOOR_BAND`] of the least.
+    pub at_floor: usize,
+    /// The CPU time the instance took in the window, ns.
+    pub cpu_ns: u64,
+}
+
+impl Sampled {
+    /// The summary of `footprints` (`None` for none), with the window's CPU time.
+    #[must_use]
+    pub fn of(footprints: &[u64], cpu_ns: u64) -> Option<Self> {
+        let mut sorted = footprints.to_vec();
+        sorted.sort_unstable();
+        let min = *sorted.first()?;
+        let max = *sorted.last()?;
+        Some(Self {
+            samples: sorted.len(),
+            p50: sorted[sorted.len() / 2],
+            min,
+            max,
+            at_floor: sorted
+                .iter()
+                .filter(|&&f| f <= min.saturating_add(FLOOR_BAND))
+                .count(),
+            cpu_ns,
+        })
+    }
+
+    /// The share of the samples at the floor ([`Self::at_floor`]), 0 to 1.
+    #[must_use]
+    pub fn floor_share(&self) -> f64 {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a share of a few hundred samples"
+        )]
+        let share = self.at_floor as f64 / self.samples.max(1) as f64;
+        share
+    }
+}
+
+impl std::fmt::Display for Sampled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mib = |b: u64| {
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "a footprint in MiB, for reading"
+            )]
+            let m = b as f64 / f64::from(1u32 << 20);
+            m
+        };
+        write!(
+            f,
+            "samples={} footprint_p50_mib={:.1} footprint_min_mib={:.1} footprint_max_mib={:.1} \
+             floor_share={:.2} cpu_ns={}",
+            self.samples,
+            mib(self.p50),
+            mib(self.min),
+            mib(self.max),
+            self.floor_share(),
+            self.cpu_ns
+        )
+    }
+}
+
+/// Watches `pid` for `window`, reading its footprint every [`SAMPLE_EVERY`].
+#[cfg(target_os = "macos")]
+fn sample(pid: u32, window: Duration) -> Result<Option<Sampled>, CouldNotRun> {
+    let start = std::time::Instant::now();
+    let first = super::usage(pid)?;
+    let mut footprints = vec![first.footprint];
+    let mut last = first;
+    loop {
+        let ran = start.elapsed();
+        if ran >= window {
+            break;
+        }
+        std::thread::sleep(SAMPLE_EVERY.min(window - ran));
+        last = super::usage(pid)?;
+        footprints.push(last.footprint);
+    }
+    Ok(Sampled::of(
+        &footprints,
+        last.cpu_ns.saturating_sub(first.cpu_ns),
+    ))
+}
+
+/// Where no footprint is named, the window passes unsampled.
+#[cfg(not(target_os = "macos"))]
+fn sample(_pid: u32, window: Duration) -> Result<Option<Sampled>, CouldNotRun> {
+    std::thread::sleep(window);
+    Ok(None)
+}
+
 /// The most window events other than a redraw (`ctl metrics os_window_events`) a windowed take may
 /// see and still be idle: a focus or occlusion change is one or two, and a pointer over the window
 /// or a key typed into it is many, which make the take a refusal, never a finding.
 pub const MAX_OS_EVENTS: u64 = 30;
 
 /// Why `scene`'s take cannot decide after `input` window events other than a redraw, or `None`
-/// when it can: more than [`MAX_OS_EVENTS`] for a windowed scene, and any for
-/// [`SpinScene::PetAsleep`], whose pet answers each (a focus lost and regained, two events, fades
-/// it back in over 0.30 s, about 18 cursor-effect frames at a 16.7 ms effect interval; a pointer
-/// over its pane heats its gaze; a resize can move its seat).
+/// when it can: more than [`MAX_OS_EVENTS`] for a windowed scene, and any for a pet scene, whose
+/// pet answers each (a focus lost and regained, two events, fades it back in over 0.30 s, about
+/// 18 cursor-effect frames at a 16.7 ms effect interval; a pointer over its pane heats its gaze; a
+/// resize can move its seat) and whose window each but a focus leaving wakes from rest.
 fn os_events_unidle(scene: SpinScene, input: u64) -> Option<&'static str> {
-    if scene == SpinScene::PetAsleep {
+    if scene.pet() {
         (input > 0).then_some("its pet may answer any of them")
     } else {
         (input > MAX_OS_EVENTS).then_some("more than an idle window takes")
@@ -162,6 +312,8 @@ pub const BUDGET_SECS: u64 = 90;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpinReport {
     pub row: SpinRow,
+    /// A windowed take's footprint and CPU time over its window ([`Sampled`]).
+    pub sampled: Option<Sampled>,
     pub past_deadline_arms: u64,
     pub stale_arm_heals: Option<u64>,
     pub frames: Option<u64>,
@@ -206,7 +358,7 @@ impl std::fmt::Display for SpinReport {
              wait_cancelled_wakes={:?} turns={:?} \
              wakes_by_variant={:?} fires_by_owner={:?} os_events={:?} os_event_kinds={:?} \
              pet_open={:?} pet={:?} \
-             reasons={:?} \
+             reasons={:?} max_frames={:?} {} \
              verdict={:?} {}",
             self.row.scene,
             self.row.window,
@@ -234,6 +386,9 @@ impl std::fmt::Display for SpinReport {
             self.pet_open,
             self.pet,
             self.reasons,
+            self.row.max_frames,
+            self.sampled
+                .map_or_else(|| "sampled=none".to_string(), |s| s.to_string()),
             self.verdict,
             self.checks
         )
@@ -249,6 +404,8 @@ pub struct Counts<'a> {
     pub owner_fires: &'a [(&'static str, Option<u64>)],
     pub needle: NeedleCounts,
     pub wakes: Option<u64>,
+    /// The frames presented in the window (`frames`).
+    pub frames: Option<u64>,
 }
 
 /// The dial's needle in a window: its owner's fires ([`NEEDLE_LANE`]), the readings in the
@@ -274,8 +431,9 @@ const fn within(max: Option<u64>, n: Option<u64>) -> bool {
 
 /// The row's bounds against the window's counters: past-deadline arms, timer wakes, each
 /// bounded owner's fires ([`SpinRow::max_owner_fires`]), the needle's fires by the frames its
-/// readings owed ([`SpinRow::needle_owed`]), and every loop wake (`wakes`) beyond the needle's
-/// own, which an unreported count never passes.
+/// readings owed ([`SpinRow::needle_owed`]), every loop wake (`wakes`) beyond the needle's own
+/// and, where the row bounds them, the frames ([`SpinRow::max_frames`]); an unreported count
+/// never passes its bound.
 #[must_use]
 pub fn judge(row: &SpinRow, c: Counts<'_>) -> ShapeVerdict {
     let owners = row.max_owner_fires.iter().all(|&(owner, max)| {
@@ -306,6 +464,7 @@ pub fn judge(row: &SpinRow, c: Counts<'_>) -> ShapeVerdict {
         && owners
         && needle.is_some()
         && within(Some(row.max_wakes), wakes)
+        && within(row.max_frames, c.frames)
     {
         ShapeVerdict::Pass
     } else {
@@ -358,11 +517,12 @@ pub fn needle_counts(opened: &str, ended: &str) -> NeedleCounts {
     }
 }
 
-/// The pet scene's [`PET_FIELDS`] as its window `edge` (opened, ended), refusing the take where
+/// A pet scene's [`PET_FIELDS`] as its window `edge` (opened, ended), refusing the take where
 /// its `trail status` does not read a focused window's deeply sleeping pet at full motion
-/// ([`PET_READY`]): a pet that is awake, still breathing or still fading in as the window opens
-/// fires frames the scene does not measure.
-fn pet_take(ctl: &Ctl, edge: &str) -> Result<String, CouldNotRun> {
+/// ([`PET_READY`]), resting as `scene` needs ([`rest_unready`]): a pet that is awake, still
+/// breathing or still fading in as the window opens fires frames the scene does not measure, and
+/// a window that rests or not against its scene measures the other scene's deck.
+fn pet_take(ctl: &Ctl, scene: SpinScene, edge: &str) -> Result<String, CouldNotRun> {
     let trail = ctl.call(&["trail", "status"]);
     if !trail.ok() {
         return could_not_run(format!(
@@ -377,6 +537,12 @@ fn pet_take(ctl: &Ctl, edge: &str) -> Result<String, CouldNotRun> {
         return could_not_run(format!(
             "the pet scene's window read {off} as its window {edge}, not a focused window's \
              deeply sleeping pet at full motion ({fields})"
+        ));
+    }
+    if let Some(off) = rest_unready(scene, &trail.stdout) {
+        return could_not_run(format!(
+            "the {scene:?} scene's window read {off} as its window {edge}, not resting as the \
+             scene needs ({fields})"
         ));
     }
     Ok(fields)
@@ -397,14 +563,15 @@ fn pet_fields(line: &str) -> String {
 /// claude scene was not the shape it claims (off the alt screen, or its output
 /// moved the grid), the window took more than [`MAX_OS_EVENTS`] events other than
 /// a redraw (a person's pointer or keys: not idle) or the pet scene's took any
-/// ([`os_events_unidle`]), or the pet scene's window was not a focused window's
-/// deeply sleeping pet at full motion ([`PET_READY`]) as it opened or as it ended.
+/// ([`os_events_unidle`]), or a pet scene's window was not a focused window's
+/// deeply sleeping pet at full motion ([`PET_READY`]), resting as its scene needs
+/// ([`rest_unready`]), as it opened or as it ended, or its footprint could not be read.
 pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
     let _one = super::ONE_TAKE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     super::instance::first_exec(&rig.fake_tui);
-    let settle = if row.scene == SpinScene::PetAsleep {
+    let settle = if row.scene.pet() {
         PET_DEEP_SLEEP
     } else {
         Duration::ZERO
@@ -420,8 +587,13 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
         SpinScene::Windowed => "motion = \"reduced\"".to_string(),
         // `full`, not the shipped `auto`: what `auto` resolves to on a Mac whose Reduce Motion is
         // off, so the take's pet animates whatever this Mac's accessibility setting says.
+        // The awake control turns the window's rest off, so the deck it measures is a focused
+        // window's whatever the default; the resting scene turns it on at 30 s.
         SpinScene::PetAsleep => {
-            format!("motion = \"full\"\ncursor_trail_style = \"{PET_STYLE}\"")
+            format!("motion = \"full\"\ncursor_trail_style = \"{PET_STYLE}\"\nidle_rest_secs = 0")
+        }
+        SpinScene::Resting => {
+            format!("motion = \"full\"\ncursor_trail_style = \"{PET_STYLE}\"\nidle_rest_secs = 30")
         }
         SpinScene::ClaudeShaped | SpinScene::Idle => {
             "# effect settings: the shipped defaults".to_string()
@@ -451,8 +623,8 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
     // pet: what an event before the reset left the pet doing (its fade back in, its gaze's heat)
     // either reads here as a pet asking for frames or ended before the fires' count opened. The
     // read's own wake lands in the window, which its wake bound has room for.
-    let pet_open = if row.scene == SpinScene::PetAsleep {
-        Some(pet_take(ctl, "opened")?)
+    let pet_open = if row.scene.pet() {
+        Some(pet_take(ctl, row.scene, "opened")?)
     } else {
         None
     };
@@ -468,7 +640,12 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
         ctl.ok(&["send", &launch])?;
         ctl.ok(&["key", "enter"])?;
     }
-    std::thread::sleep(row.window);
+    let sampled = if row.scene.windowed() {
+        sample(inst.pid(), row.window)?
+    } else {
+        std::thread::sleep(row.window);
+        None
+    };
     let mut reasons = None;
     if row.scene == SpinScene::ClaudeShaped {
         let modes = ctl.ok(&["modes"])?;
@@ -493,8 +670,8 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
         }
     }
     let metrics = ctl.ok(&["metrics"])?;
-    let pet = if row.scene == SpinScene::PetAsleep {
-        Some(pet_take(ctl, "ended")?)
+    let pet = if row.scene.pet() {
+        Some(pet_take(ctl, row.scene, "ended")?)
     } else {
         None
     };
@@ -541,12 +718,18 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
             "ctl metrics does not report needle_frames_owed and needle_episode_left",
         );
     }
+    let frames = uint_field(&metrics, "frames")
+        .map(|n| n.saturating_sub(uint_field(&opened, "frames").unwrap_or(0)));
+    if row.max_frames.is_some() && frames.is_none() {
+        return unanswered("ctl metrics does not report frames");
+    }
     let arms = after.saturating_sub(before);
     Ok(SpinReport {
         row: *row,
+        sampled,
         past_deadline_arms: arms,
         stale_arm_heals: uint_field(&metrics, "stale_arm_heals"),
-        frames: uint_field(&metrics, "frames"),
+        frames,
         timer_wakes,
         wakes,
         wait_cancelled_wakes: uint_field(&metrics, "wait_cancelled_wakes"),
@@ -566,6 +749,7 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
                 owner_fires: &fired,
                 needle,
                 wakes,
+                frames,
             },
         ),
         owner_fires: fired,
@@ -586,6 +770,7 @@ mod tests {
         max_owner_fires: &[],
         needle_owed: false,
         max_wakes: 400,
+        max_frames: None,
     };
 
     const PET: SpinRow = SpinRow {
@@ -609,7 +794,85 @@ mod tests {
                 carried: Some(0),
             },
             wakes,
+            frames: None,
         }
+    }
+
+    /// A row that bounds its frames fails one frame past the bound and passes at it, and an
+    /// unreported frame count passes no bound; a row without one passes any count.
+    #[test]
+    fn a_bounded_frame_count_fails_one_past_its_bound() {
+        let resting = SpinRow {
+            scene: SpinScene::Resting,
+            max_frames: Some(6),
+            ..CLAUDE
+        };
+        let at = |frames| Counts {
+            frames,
+            ..counts(0, Some(5), Some(200))
+        };
+        assert_eq!(judge(&resting, at(Some(6))), ShapeVerdict::Pass);
+        assert_eq!(
+            judge(&resting, at(Some(7))),
+            ShapeVerdict::Fail,
+            "a frame past the bound, under every other"
+        );
+        assert_eq!(judge(&resting, at(None)), ShapeVerdict::Fail);
+        assert_eq!(
+            judge(&CLAUDE, at(Some(10_000))),
+            ShapeVerdict::Pass,
+            "an unbounded row"
+        );
+    }
+
+    /// A resting take decides only on a window that reads `resting=true`; the awake control
+    /// refuses one that rests and takes one whose build says nothing of rest, and every pet scene
+    /// refuses a take whose window took any event.
+    #[test]
+    fn a_rest_take_decides_only_at_rest_and_the_awake_control_only_awake() {
+        let at = |resting: &str| format!("OK 1\ntrail focused=true selection=front {resting}");
+        assert_eq!(rest_unready(SpinScene::Resting, &at("resting=true")), None);
+        assert_eq!(
+            rest_unready(SpinScene::Resting, &at("resting=false")).as_deref(),
+            Some("resting=false")
+        );
+        assert_eq!(
+            rest_unready(SpinScene::Resting, &at("")).as_deref(),
+            Some("resting=?")
+        );
+        assert_eq!(
+            rest_unready(SpinScene::PetAsleep, &at("resting=false")),
+            None
+        );
+        assert_eq!(
+            rest_unready(SpinScene::PetAsleep, &at("")),
+            None,
+            "an older build"
+        );
+        assert_eq!(
+            rest_unready(SpinScene::PetAsleep, &at("resting=true")).as_deref(),
+            Some("resting=true")
+        );
+        assert_eq!(rest_unready(SpinScene::Windowed, &at("resting=true")), None);
+        assert!(os_events_unidle(SpinScene::Resting, 1).is_some());
+        assert_eq!(os_events_unidle(SpinScene::Resting, 0), None);
+    }
+
+    /// The take's footprint summary: the median, the extremes, and the samples within the floor
+    /// band of the least.
+    #[test]
+    fn a_takes_footprint_reads_its_median_and_its_share_at_the_floor() {
+        let mib = |m: u64| m << 20;
+        let footprints = [mib(280), mib(100), mib(110), mib(281), mib(105)];
+        let s = Sampled::of(&footprints, 7).expect("samples");
+        assert_eq!(
+            (s.samples, s.min, s.max, s.p50, s.at_floor),
+            (5, mib(100), mib(281), mib(110), 3)
+        );
+        assert!((s.floor_share() - 0.6).abs() < 1e-9, "{s:?}");
+        assert_eq!(s.cpu_ns, 7);
+        assert_eq!(Sampled::of(&[], 0), None);
+        assert!(s.to_string().contains("footprint_p50_mib=110.0 "), "{s}");
     }
 
     /// A pet take whose needle fired `fires` times against the frames its window's readings owed
@@ -794,9 +1057,9 @@ mod tests {
             ShapeVerdict::Fail,
             "a row that bounds no needle leaves none of its wakes out"
         );
-        let opened = "OK past_deadline_arms=3 deadline_fires_by_owner=stats_needle:2 \
+        let opened = "OK past_deadline_arms=3 deadline_fires_by_owner=deck_clock:2 \
                       needle_sweeps=1 needle_frames_owed=8 needle_episode_left=6";
-        let ended = "OK past_deadline_arms=3 deadline_fires_by_owner=stats_live:30,stats_needle:11 \
+        let ended = "OK past_deadline_arms=3 deadline_fires_by_owner=stats_live:30,deck_clock:11 \
                      needle_sweeps=2 needle_frames_owed=20 needle_episode_left=0";
         assert_eq!(
             needle_counts(opened, ended),
@@ -817,7 +1080,7 @@ mod tests {
             fires_between("OK deadline_fires_by_owner=none", ended, EFFECT_LANE),
             Some(0)
         );
-        let line = "OK timer_wakes=46 deadline_fires_by_owner=stats_live:30,stats_needle:4,\
+        let line = "OK timer_wakes=46 deadline_fires_by_owner=stats_live:30,deck_clock:4,\
                     system_vitals:10 wakes_by_variant=none";
         assert_eq!(owner_fires(line, NEEDLE_LANE), Some(4));
         assert_eq!(owner_fires(line, EFFECT_LANE), Some(0));
@@ -891,7 +1154,8 @@ mod tests {
         assert_eq!(
             pet_fields(reply),
             "resolved=rainbow-kitty focused=true motion=full motion_stage=full shed=? \
-             pet_active=true pet_action=sleep pet_deep=? pet_pose=? pet_reason=? pet_event_seq=?"
+             pet_active=true pet_action=sleep pet_deep=? pet_pose=? pet_reason=? pet_event_seq=? \
+             resting=?"
         );
     }
 }

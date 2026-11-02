@@ -3,15 +3,21 @@
 
 //! This member's desk for the Macs asking to join ALab (`docs/DESIGN-fluid-swarm-2026-10-28.md`
 //! F10, §3.3.1). The fleet port's `ask` op hands each asking Mac's stream to the desk
-//! ([`ask_handler`]); the band shows one row per request the desk heard ("<name> wants to join
-//! ALab") with [Allow] and [Ignore]; Allow shows a phrase in a native sheet on this Mac's own
-//! display, for a person to type on the asking Mac. Allow takes only a person's own press
+//! ([`ask_handler`]); the digest files one Info entry per request the desk heard that needs a
+//! person ("New Mac calling itself <name>", [`crate::join_entries`]), never an alert on screen,
+//! with [Allow] beside it; a request from this member's home ALab LAN on the default ALab vault
+//! feeds the vault's own automatic admission queue instead and files nothing. Allow shows a
+//! phrase in a native sheet on this Mac's own display, for a person to type on the asking Mac. A
+//! row follows its Mac: it lapses once the Mac stops asking, closes on any admission, and goes
+//! when this Mac moves to another network ([`follow_network`]), and its entry ends with it.
+//! Allow takes only a person's own press
 //! (§3.3.5): `notice act`, a fleet drive and a control client's gesture are refused it. The
 //! phrase goes to that sheet alone, never to a terminal, a log, `aterm ctl`, a message or a fleet
 //! reply.
 //!
-//! F16: a Mac the membership log removed that asks again shows as removed ("m12 was removed by m7
-//! on Oct 30. Allow again?") with [Allow again], which restores a plain removal; a quorum's
+//! F16: a Mac the membership log removed that asks again shows as removed ("Removed Mac calling
+//! itself m12", who removed it and when in its detail) with [Allow again], which restores a plain
+//! removal; a quorum's
 //! removal offers no Allow. A Mac a member's removals took out shows "m7 removed this Mac and 3
 //! others. Undo m7's removals?" with [Undo removals], which signs its share of the quorum
 //! `Remove` of m7 ([`aterm_secrets::client::undo_removals`]), off the event loop. Both are a
@@ -22,20 +28,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use aterm_messages::exceptions::{Entry, Family};
 use aterm_messages::need::{Ask, Reason, StandingWhy, Then};
 use aterm_messages::{Intent, Message, Severity, tags};
-use aterm_secrets::members::desk::{self, COLLAPSE_AT, Desk, Local, Row, RowState};
+use aterm_secrets::client::Asking;
+use aterm_secrets::members::desk::{self, Desk, Local, Row, RowState};
 use aterm_secrets::members::{self, Allowed, PhraseState};
 use aterm_types::MutexExt;
 
 use crate::App;
 use crate::messages_host::wall_stamp_now;
-
-/// The key every row of a Mac asking to join starts with.
-pub(crate) const KEY_PREFIX: &str = "members.ask.";
-
-/// The one row that stands for [`COLLAPSE_AT`] or more asking Macs.
-const MANY_KEY: &str = "members.ask.many";
 
 /// The key every "Undo m7's removals?" row starts with, the remover's join code after it.
 pub(crate) const UNDO_PREFIX: &str = "members.undo.";
@@ -114,7 +116,32 @@ pub(crate) fn serve_ask(
         let paths = aterm_secrets::client::Paths::live()?;
         aterm_secrets::client::hand_over(&paths, handing)
     };
-    let served = desk::serve(desk, stream, peer.ip(), &bundle);
+    // A Mac that is ALab's already but whose vault key changed proves its fleet node key on this
+    // connection and is let back in with nobody (`aterm_secrets::client::readmit`), as far as
+    // this Mac's fleet book allows it (read here, on the connection's thread).
+    let prove = |proving: &desk::Proving<'_>| {
+        let paths = aterm_secrets::client::Paths::live()?;
+        let peers = aterm_types::dirs::state_dir()
+            .and_then(|state| aterm_net::fleet_member::read_peers(&state).ok())
+            .unwrap_or_default();
+        let book = aterm_agent::vault_join::book_word(
+            &peers,
+            &proving.node,
+            Some(peer.ip()),
+            aterm_time::unix_millis().unwrap_or(0),
+        );
+        aterm_secrets::client::prove_at(&paths, proving, book)
+    };
+    let served = desk::serve_with(
+        desk,
+        stream,
+        peer.ip(),
+        &bundle,
+        Some(desk::Proof {
+            decide: &prove,
+            fleet: None,
+        }),
+    );
     CHANGED.store(true, Ordering::Release);
     match served {
         Ok(Some(let_in)) => {
@@ -137,6 +164,34 @@ pub(crate) fn serve_ask(
         }
         Ok(None) => {}
         Err(error) => aterm_log::info!("members: an ask from {peer} ended: {error}"),
+    }
+}
+
+/// Serve one `vault-join` from `peer` on [`LIVE`]'s desk (or, with none, one made for this
+/// connection): the fleet listener judged the channel (`judged`), and the desk's `prove` exchange
+/// runs on the listener's connection thread ([`aterm_agent::vault_join::serve`]), never the main
+/// thread. What it came to goes to the log only: nothing pops up.
+pub(crate) fn serve_vault_join(
+    stream: &mut dyn aterm_net::fleet::Duplex,
+    peer: Option<SocketAddr>,
+    judged: Result<aterm_agent::vault_join::Judged, String>,
+) {
+    let from = peer.map_or(std::net::Ipv4Addr::UNSPECIFIED.into(), |at| at.ip());
+    let ended = judged.and_then(|judged| {
+        let paths = aterm_secrets::client::Paths::live().map_err(|error| error.to_string())?;
+        let desk = LIVE.lock_or_recover().clone();
+        aterm_agent::vault_join::serve(stream, from, &judged, desk.as_deref(), &paths)
+            .map_err(|error| error.to_string())
+    });
+    CHANGED.store(true, Ordering::Release);
+    match ended {
+        Ok(()) => {
+            aterm_log::info!("members: let a Mac back in by its proof over the fleet from {from}")
+        }
+        Err(why) => {
+            let _ = members::refuse(stream, &why);
+            aterm_log::info!("members: a vault-join from {from} ended: {why}");
+        }
     }
 }
 
@@ -219,10 +274,12 @@ pub(crate) fn spawn_lane(headless: bool) -> bool {
             };
             let mut looked: Option<std::time::Instant> = None;
             let mut before: Option<Snapshot> = None;
+            let mut moved = crate::network_moved::watch();
             loop {
                 if looked.is_none_or(|at| at.elapsed() >= LOCAL_EVERY) {
                     looked = Some(std::time::Instant::now());
                     follow_local(&LIVE, &paths);
+                    follow_network(&LIVE);
                     follow_undo(&paths);
                 }
                 // A desk dropped reads as a change too: the window ends its rows.
@@ -234,7 +291,23 @@ pub(crate) fn spawn_lane(headless: bool) -> bool {
                     CHANGED.store(true, Ordering::Release);
                     before = now;
                 }
-                std::thread::sleep(READ_EVERY);
+                if let Some(desk) = &desk {
+                    match desk::forward_automatic_requests(desk, &paths) {
+                        Ok(0) => {}
+                        Ok(count) => aterm_log::info!(
+                            "members: queued {count} LAN requests for automatic ALab admission"
+                        ),
+                        Err(error) => aterm_log::info!(
+                            "members: automatic ALab admission will retry: {error}"
+                        ),
+                    }
+                }
+                if moved.wait(READ_EVERY) != crate::network_moved::Woke::Timer {
+                    follow_network(&LIVE);
+                    // The member's home ALab LAN is read with its Commons state
+                    // (`Local::automatically_admits`): read both again at once after a move.
+                    looked = None;
+                }
             }
         });
     match spawned {
@@ -265,6 +338,21 @@ fn follow_local(slot: &Slot, paths: &aterm_secrets::client::Paths) {
         Err(error) => {
             aterm_log::warn!("members: this Mac's Commons state: {error}");
         }
+    }
+}
+
+/// Tell the desk in `slot` which network this Mac is on now
+/// ([`aterm_secrets::heard::network_key`], read before the desk's lock): the rows heard on
+/// another one go ([`Desk::on_network`]), and their entries end.
+fn follow_network(slot: &Slot) {
+    let Some(desk) = slot.lock_or_recover().clone() else {
+        return;
+    };
+    let network = aterm_secrets::heard::network_key();
+    let gone = desk.lock_or_recover().on_network(network);
+    if gone > 0 {
+        aterm_log::info!("members: this Mac moved; {gone} join request(s) heard before ended");
+        CHANGED.store(true, Ordering::Release);
     }
 }
 
@@ -347,7 +435,7 @@ fn left(paths: &aterm_secrets::client::Paths) -> bool {
     )
 }
 
-/// What the band shows of a desk: the requests still asking, and whether this Mac can allow.
+/// What the digest files of a desk: the requests still asking, and whether this Mac can allow.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Snapshot {
     rows: Vec<Row>,
@@ -365,114 +453,6 @@ impl Snapshot {
             can_allow: desk.local().can_allow(),
         }
     }
-
-    /// The band's rows: one per asking Mac, or one for them all from [`COLLAPSE_AT`] on.
-    pub(crate) fn notices(&self) -> Vec<Message> {
-        if self.rows.len() >= COLLAPSE_AT {
-            return vec![many(self.rows.len())];
-        }
-        self.rows
-            .iter()
-            .map(|row| notice(row, self.can_allow))
-            .collect()
-    }
-}
-
-/// The row of one Mac asking to join: its name, model and address, [Allow] where this Mac can
-/// allow and [Ignore]. Allow is never the row's default ([`Intent::never_default`]). A Mac the
-/// log removed shows as removed instead ([`removed_notice`]).
-pub(crate) fn notice(row: &Row, can_allow: bool) -> Message {
-    if let Some(note) = &row.removed {
-        return removed_notice(row, note, can_allow);
-    }
-    let title = format!(
-        "{} wants to join ALab ({}, {})",
-        row.name, row.model, row.from
-    );
-    let message = Message::new(tags::PRIVACY, Severity::Warn, title);
-    let (message, then) = if can_allow {
-        (
-            message.action(Intent::AllowJoin { request: row.id }),
-            format!(
-                "Press Allow, then type the phrase this Mac shows on {}",
-                row.name
-            ),
-        )
-    } else {
-        (
-            message.sentence("this Mac cannot allow yet: it has no Commons binding"),
-            format!(
-                "Press Allow on a member that can, then type its phrase on {}",
-                row.name
-            ),
-        )
-    };
-    message
-        .action(Intent::IgnoreJoin { request: row.id })
-        .now(Ask::standing(
-            StandingWhy::OnlyYou(Reason::new(format!(
-                "only a person at a member lets {} into ALab, and it shows code {}",
-                row.name, row.code
-            ))),
-            Then::step(then),
-        ))
-        .key(&format!("{KEY_PREFIX}{}", row.id))
-}
-
-/// The row of a Mac the membership log removed that asks again (F16): who removed it and when,
-/// with [Allow again] where this Mac can allow and a plain removal took it out, and [Ignore]. A
-/// Mac a quorum removed gets no Allow: one person does not bring it back.
-fn removed_notice(
-    row: &Row,
-    note: &aterm_secrets::client::RemovedNote,
-    can_allow: bool,
-) -> Message {
-    let message = Message::new(tags::PRIVACY, Severity::Warn, note.title());
-    let (message, then) = if note.quorum {
-        (
-            message.sentence(
-                "a quorum of members removed it, and one person's Allow does not bring it back",
-            ),
-            format!("Reset {} to let it in as a new Mac", row.name),
-        )
-    } else if can_allow {
-        (
-            message.action(Intent::AllowJoinAgain { request: row.id }),
-            format!(
-                "Press Allow again, then type the phrase this Mac shows on {}",
-                row.name
-            ),
-        )
-    } else {
-        (
-            message.sentence("this Mac cannot allow yet: it has no Commons binding"),
-            format!(
-                "Press Allow again on a member that can, then type its phrase on {}",
-                row.name
-            ),
-        )
-    };
-    message
-        .action(Intent::IgnoreJoin { request: row.id })
-        .now(Ask::standing(
-            StandingWhy::OnlyYou(Reason::new(format!(
-                "only a person at a member lets {} back into ALab, and it shows code {}",
-                row.name, row.code
-            ))),
-            Then::step(then),
-        ))
-        .key(&format!("{KEY_PREFIX}{}", row.id))
-}
-
-/// The one row for `count` asking Macs: no Allow, which needs a name.
-fn many(count: usize) -> Message {
-    Message::new(
-        tags::PRIVACY,
-        Severity::Warn,
-        format!("{count} Macs want to join ALab"),
-    )
-    .sentence("aterm members requests lists them; aterm members allow <name> allows one")
-    .key(MANY_KEY)
 }
 
 /// Where a phrase can show: this Mac's own display, none, or a test's record.
@@ -495,6 +475,8 @@ pub(crate) struct Members {
     slot: &'static Slot,
     sheets: Sheets,
     shown: Option<Shown>,
+    /// A test's approver record; `None` reads the lane's ([`crate::secrets_asking::current`]).
+    approver: Option<Vec<Asking>>,
 }
 
 /// The phrase on screen now, and its sheet.
@@ -515,6 +497,7 @@ impl Members {
                 Sheets::Screen
             },
             shown: None,
+            approver: None,
         }
     }
 
@@ -525,7 +508,14 @@ impl Members {
             slot: Box::leak(Box::new(Mutex::new(Some(desk)))),
             sheets: Sheets::Recorded(Vec::new()),
             shown: None,
+            approver: Some(Vec::new()),
         }
+    }
+
+    /// Hand a test's side `asking` as its approver's record.
+    #[cfg(test)]
+    pub(crate) fn set_approver(&mut self, asking: Vec<Asking>) {
+        self.approver = Some(asking);
     }
 
     /// The text of each sheet shown so far (a test's record).
@@ -541,6 +531,13 @@ impl Members {
         self.slot.lock_or_recover().clone()
     }
 
+    /// The admin approver's record of the Macs it left to a person.
+    fn approver(&self) -> Vec<Asking> {
+        self.approver
+            .clone()
+            .unwrap_or_else(crate::secrets_asking::current)
+    }
+
     /// The "Undo m7's removals?" rows to show: none on a test's side.
     fn undo(&self) -> Vec<aterm_secrets::client::UndoOffer> {
         if std::ptr::eq(self.slot, &raw const LIVE) {
@@ -552,31 +549,27 @@ impl Members {
 }
 
 impl App {
-    /// The rows of the Macs asking to join, once the desk changed, and the phrase sheet closed
-    /// once its phrase was used, burned or expired.
+    /// The entries of the Macs asking to join and the undo rows, once the desk or the approver's
+    /// record changed, and the phrase sheet closed once its phrase was used, burned or expired.
     pub(crate) fn follow_member_requests(&mut self) {
-        if CHANGED.swap(false, Ordering::AcqRel) {
+        let desk = CHANGED.swap(false, Ordering::AcqRel);
+        if crate::secrets_asking::take_changed() || desk {
             self.refresh_member_rows();
         }
         self.close_spent_phrase_sheet();
     }
 
-    /// Post, replace and end the rows so they match the desk; with no desk (this Mac is no
-    /// member, or it left the vault) every row ends.
+    /// File the asking Macs' entries ([`Self::refresh_join_entries`]), and post, replace and end
+    /// the undo rows so they match this Mac's removals.
     pub(crate) fn refresh_member_rows(&mut self) {
-        let mut wanted = match self.members.desk() {
-            Some(desk) => {
-                Snapshot::of(&desk.lock_or_recover(), aterm_time::Instant::now()).notices()
-            }
-            None => Vec::new(),
-        };
-        wanted.extend(self.members.undo().iter().map(undo_notice));
+        self.refresh_join_entries();
+        let wanted: Vec<Message> = self.members.undo().iter().map(undo_notice).collect();
         let now = std::time::Instant::now();
         let shown: Vec<(String, aterm_messages::MessageId)> = self
             .messages
             .live_rows()
             .filter_map(|live| live.msg.key.clone().map(|key| (key, live.id)))
-            .filter(|(key, _)| key.starts_with(KEY_PREFIX) || key.starts_with(UNDO_PREFIX))
+            .filter(|(key, _)| key.starts_with(UNDO_PREFIX))
             .collect();
         for (key, id) in shown {
             if !wanted
@@ -602,6 +595,38 @@ impl App {
             }
         }
         self.sync_messages();
+    }
+
+    /// [`Family::Join`]'s one pass: the desk's asking rows and the approver's record as entries
+    /// ([`crate::join_entries`]); with no desk (this Mac is no member, or it left the vault) only
+    /// the approver's. An entry whose Mac no longer asks ends at once, not a family pass's ten
+    /// minutes later: rows are held in memory and do not flicker.
+    pub(crate) fn refresh_join_entries(&mut self) {
+        let mut askers = match self.members.desk() {
+            Some(desk) => {
+                let snapshot = Snapshot::of(&desk.lock_or_recover(), aterm_time::Instant::now());
+                crate::join_entries::desk_askers(&snapshot.rows, snapshot.can_allow)
+            }
+            None => Vec::new(),
+        };
+        askers.extend(crate::join_entries::approver_askers(
+            &self.members.approver(),
+        ));
+        let entries = crate::join_entries::entries(askers);
+        self.except_replace(Family::Join, &entries);
+        let named: Vec<String> = entries.iter().map(Entry::key).collect();
+        let prefix = Family::Join.prefix();
+        let gone: Vec<String> = self
+            .messages
+            .digest()
+            .entries
+            .into_iter()
+            .map(|entry| entry.key)
+            .filter(|key| key.starts_with(&prefix) && !named.contains(key))
+            .collect();
+        for key in gone {
+            self.except_end(&key);
+        }
     }
 
     fn close_spent_phrase_sheet(&mut self) {
@@ -849,6 +874,7 @@ impl App {
                             crate::control::pct_encode(&note.by.join(",")),
                             if note.quorum { " quorum=1" } else { "" }
                         ),
+                        _ if row.automatic => "joining".to_owned(),
                         (None, RowState::Allowed(_)) => "allowed".to_owned(),
                         (None, _) => "asking".to_owned(),
                     };

@@ -18,6 +18,7 @@ fn spec(id: StageId, lane: Lane) -> StageSpec {
         exclusive: false,
         after_stages: Vec::new(),
         mem: 0,
+        part: None,
     }
 }
 
@@ -55,6 +56,7 @@ fn a_stage_claims_the_most_it_kept_and_a_fifth_more() {
     let heavy = kept(StageId::TestCompile, &gui(), &[10, 4]);
     let n = need(
         &heavy,
+        &Records::default(),
         &compile(),
         &over(&compile(), &gui()),
         Some(24 * GIB),
@@ -73,6 +75,7 @@ fn a_stage_claims_the_most_it_kept_and_a_fifth_more() {
     assert_eq!(
         need(
             &light,
+            &Records::default(),
             &compile(),
             &over(&compile(), &gui()),
             Some(24 * GIB)
@@ -95,19 +98,44 @@ fn with_nothing_kept_a_compiling_stage_claims_the_cold_figure() {
         (Some(8 * GIB), 4 * GIB),
         (None, 16 * GIB),
     ] {
-        let n = need(&none, &compile(), &over(&compile(), &gui()), physical);
+        let n = need(
+            &none,
+            &Records::default(),
+            &compile(),
+            &over(&compile(), &gui()),
+            physical,
+        );
         assert_eq!((n.bytes, &n.how), (want, &How::Cold), "{physical:?}");
     }
     let run = spec(StageId::Test, Lane::MainTarget);
-    let n = need(&none, &run, &over(&run, &gui()), Some(24 * GIB));
+    let n = need(
+        &none,
+        &Records::default(),
+        &run,
+        &over(&run, &gui()),
+        Some(24 * GIB),
+    );
     assert_eq!((n.bytes, n.how), (0, How::Light));
     let fmt = spec(StageId::Formatting, Lane::Pure);
     let pure = kept(StageId::Formatting, &gui(), &[3]);
-    let n = need(&pure, &fmt, &over(&fmt, &gui()), Some(24 * GIB));
+    let n = need(
+        &pure,
+        &Records::default(),
+        &fmt,
+        &over(&fmt, &gui()),
+        Some(24 * GIB),
+    );
     assert_eq!((n.bytes, n.how), (0, How::Unmetered));
     let warm = kept(StageId::TestCompile, &gui(), &[5]);
     assert_eq!(
-        need(&warm, &compile(), &over(&compile(), &gui()), Some(24 * GIB)).bytes,
+        need(
+            &warm,
+            &Records::default(),
+            &compile(),
+            &over(&compile(), &gui()),
+            Some(24 * GIB)
+        )
+        .bytes,
         6 * GIB
     );
 }
@@ -177,6 +205,7 @@ fn a_wider_selections_most_peak_bounds_a_narrower_one() {
     assert_eq!(narrow.learned(&workspace), None);
     let n = need(
         &r,
+        &Records::default(),
         &compile(),
         &over(&compile(), &packages(&["c"])),
         Some(24 * GIB),
@@ -244,7 +273,13 @@ fn a_new_checkout_claims_what_another_checkout_kept() {
         30 * GIB,
         6,
     );
-    let n = need(&r, &compile(), &at("/new", &gui()), Some(24 * GIB));
+    let n = need(
+        &r,
+        &Records::default(),
+        &compile(),
+        &at("/new", &gui()),
+        Some(24 * GIB),
+    );
     assert_eq!(
         (n.bytes, &n.how),
         (
@@ -264,7 +299,13 @@ fn a_new_checkout_claims_what_another_checkout_kept() {
     );
     let mut wide = r.clone();
     wide.push(at("/new", &wider), 8 * GIB, 7);
-    let n = need(&wide, &compile(), &at("/new", &gui()), Some(24 * GIB));
+    let n = need(
+        &wide,
+        &Records::default(),
+        &compile(),
+        &at("/new", &gui()),
+        Some(24 * GIB),
+    );
     assert_eq!(
         (n.bytes, n.how),
         (
@@ -278,7 +319,13 @@ fn a_new_checkout_claims_what_another_checkout_kept() {
         "a wider selection's in its own checkout"
     );
     r.push(at("/new", &gui()), 5 * GIB, 8);
-    let n = need(&r, &compile(), &at("/new", &gui()), Some(24 * GIB));
+    let n = need(
+        &r,
+        &Records::default(),
+        &compile(),
+        &at("/new", &gui()),
+        Some(24 * GIB),
+    );
     assert_eq!(
         (n.bytes, n.how),
         (
@@ -290,6 +337,127 @@ fn a_new_checkout_claims_what_another_checkout_kept() {
             })
         ),
         "its own"
+    );
+}
+
+/// A stage verify keeps no run of anywhere claims by what a plain `targo` build of the same work
+/// kept (BUILD-ADMIT's book): the test compile over `-p aterm-gui` by the most of a plain
+/// `targo test -p aterm-gui` (15.6 GiB in /badmit) and a `--tests` one (16 GiB in /other), and a
+/// fifth more; the lint by a plain `targo tippy --all-targets`. A plain build of less work or
+/// other work is never read: `--lib`, `--release`, `--features`, `targo build`, another
+/// selection, a lint of the default targets (30 GiB each). Verify's own record of it, in another
+/// checkout, wins over the plain book. NEGATIVE CONTROL: with the plain book unread, the test
+/// compile claimed the cold 12 GiB.
+#[test]
+fn a_stage_verify_never_ran_claims_what_a_plain_build_of_it_kept() {
+    let plain_key = |stage: &str, checkout: &str, crates: &[&str], variant: Option<&str>| Key {
+        stage: stage.to_owned(),
+        checkout: checkout.to_owned(),
+        crates: Some(crates.iter().map(|c| (*c).to_owned()).collect()),
+        variant: variant.map(str::to_owned),
+    };
+    let mut plain = Records::default();
+    let test = plain_key("targo test", "/badmit", &["aterm-gui"], None);
+    plain.push(test.clone(), 15 * GIB, 1);
+    plain.push(test.clone(), 14 * GIB, 2);
+    let tests = plain_key("targo test", "/other", &["aterm-gui"], Some("--tests"));
+    plain.push(tests.clone(), 16 * GIB, 3);
+    for (stage, crates, variant) in [
+        ("targo test", &["aterm-gui"][..], Some("--lib")),
+        ("targo test", &["aterm-gui"][..], Some("release")),
+        (
+            "targo test",
+            &["aterm-gui"][..],
+            Some("--tests, features x"),
+        ),
+        ("targo build", &["aterm-gui"][..], None),
+        ("targo test", &["aterm-gui", "aterm-grid"][..], None),
+        ("targo tippy", &["aterm-gui"][..], None),
+    ] {
+        plain.push(plain_key(stage, "/far", crates, variant), 30 * GIB, 4);
+    }
+    let lint = plain_key("targo tippy", "/far", &["aterm-gui"], Some("--all-targets"));
+    plain.push(lint.clone(), 9 * GIB, 5);
+    let here = |id: StageId| Key {
+        checkout: "/new".to_owned(),
+        ..Key::of(id, &gui())
+    };
+    let n = need(
+        &Records::default(),
+        &plain,
+        &compile(),
+        &here(StageId::TestCompile),
+        Some(24 * GIB),
+    );
+    assert_eq!(
+        (n.bytes, &n.how),
+        (
+            aterm_capacity::peak_claim(16 * GIB),
+            &How::Plain(Learned {
+                peak: 16 * GIB,
+                runs: 1,
+                wider: Some(tests),
+            })
+        ),
+        "{n}"
+    );
+    assert!(
+        n.to_string()
+            .contains("the most a plain `targo test` of it in /other used (16 GiB)"),
+        "{n}"
+    );
+    let tippy = spec(StageId::Tippy, Lane::TippyTarget);
+    let n = need(
+        &Records::default(),
+        &plain,
+        &tippy,
+        &here(StageId::Tippy),
+        Some(24 * GIB),
+    );
+    assert_eq!(
+        (n.bytes, n.how),
+        (
+            aterm_capacity::peak_claim(9 * GIB),
+            How::Plain(Learned {
+                peak: 9 * GIB,
+                runs: 1,
+                wider: Some(lint),
+            })
+        )
+    );
+    let mut verify = Records::default();
+    verify.push(
+        Key {
+            checkout: "/vmem".to_owned(),
+            ..Key::of(StageId::TestCompile, &gui())
+        },
+        5 * GIB,
+        6,
+    );
+    let n = need(
+        &verify,
+        &plain,
+        &compile(),
+        &here(StageId::TestCompile),
+        Some(24 * GIB),
+    );
+    assert!(matches!(n.how, How::Elsewhere(_)), "{n}");
+    assert_eq!(n.bytes, 6 * GIB);
+    let tagged = Key {
+        variant: Some("after -p aterm-grid".to_owned()),
+        ..here(StageId::TestCompile)
+    };
+    let n = need(
+        &Records::default(),
+        &plain,
+        &compile(),
+        &tagged,
+        Some(24 * GIB),
+    );
+    assert_eq!(
+        n.how,
+        How::Cold,
+        "a variant verify keeps is no plain build's"
     );
 }
 
@@ -330,7 +498,11 @@ fn a_run_keys_each_stage_by_its_checkout_selection_and_variant() {
     let foreign = Key::of_run(StageId::ForeignCells, &cells);
     assert_eq!(
         (foreign.crates, foreign.variant),
-        (None, Some("cells linux-arm win".to_owned()))
+        (
+            Some(vec!["aterm-gui".to_owned()]),
+            Some("cells linux-arm win".to_owned())
+        ),
+        "`-p` narrows a named `cells`, so its small peak stays off the whole graph's record"
     );
     let pulled = Key::of_run(StageId::ForeignCells, &ctx("/ck").with_cells_pulled(true));
     assert_eq!(
@@ -382,6 +554,169 @@ fn a_light_run_does_not_hide_a_heavy_one_it_keeps() {
         many.learned(&Key::of(StageId::Tippy, &packages(&["0"])))
             .is_none(),
         "the oldest record went"
+    );
+}
+
+/// A compiling stage's book keeps nothing for a run light beside its heaviest peak of the last
+/// two weeks: after a 16 GiB test compile, a 2 GiB one (its units were fresh) is not kept and the
+/// next run still claims by 16 GiB, while a 5 GiB one is. A stage that compiles nothing keeps
+/// every run: the test run's light peak after a heavy one. NEGATIVE CONTROL: with the compile
+/// kept as the test run is, the 2 GiB run was kept.
+#[test]
+fn a_compile_light_beside_its_heavy_peak_keeps_nothing() {
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let book = Book::at(
+        Some(dir.path().join("stage-memory.json")),
+        Some(24 * GIB),
+        Some(21 * GIB),
+    );
+    let key = over(&compile(), &gui());
+    assert_eq!(
+        book.keep(&compile(), &key, 16 * GIB).expect("kept"),
+        Kept::Kept
+    );
+    assert_eq!(
+        book.keep(&compile(), &key, 2 * GIB).expect("read"),
+        Kept::Light
+    );
+    assert_eq!(
+        book.records().learned(&key).map(|l| (l.peak, l.runs)),
+        Some((16 * GIB, 1))
+    );
+    assert_eq!(
+        book.keep(&compile(), &key, 5 * GIB).expect("kept"),
+        Kept::Kept
+    );
+    let run = spec(StageId::Test, Lane::MainTarget);
+    let run_key = over(&run, &gui());
+    assert_eq!(
+        book.keep(&run, &run_key, 16 * GIB).expect("kept"),
+        Kept::Kept
+    );
+    assert_eq!(book.keep(&run, &run_key, GIB).expect("kept"), Kept::Kept);
+    assert_eq!(book.records().learned(&run_key).map(|l| l.runs), Some(2));
+    let fmt = spec(StageId::Formatting, Lane::Pure);
+    assert_eq!(
+        book.keep(&fmt, &over(&fmt, &gui()), GIB).expect("nothing"),
+        Kept::Nowhere
+    );
+}
+
+/// A SHAPED CALL KEEPS NO RECORD OF A RUN THAT COMPILED ALMOST NONE OF ITS WORK, even as the
+/// first under its key: a cut planned by 13.02 GiB keeps neither a fresh run's 31 MiB nor a 3 GiB
+/// one under a key that holds nothing, and keeps a 13 GiB one; a call planned by nothing (the
+/// closing call claiming the whole estimate) keeps its first run, as any stage does. NEGATIVE
+/// CONTROL, by hand: with the planned peak unread, the 31 MiB run was kept, the record's first.
+#[test]
+fn a_shaped_call_keeps_no_run_light_beside_what_it_was_planned_by() {
+    use crate::shape::{Part, Piece};
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let book = Book::at(
+        Some(dir.path().join("stage-memory.json")),
+        Some(24 * GIB),
+        Some(21 * GIB),
+    );
+    let cut = |planned: Option<u64>| StageSpec {
+        part: Some(Part {
+            piece: Piece::of(&["aterm-agent".to_owned()], false),
+            index: 0,
+            of: 2,
+            after: Vec::new(),
+            said: String::new(),
+            planned,
+            refused: Vec::new(),
+        }),
+        ..compile()
+    };
+    let key = over(&compile(), &packages(&["aterm-agent"]));
+    let planned = cut(Some(1302 * GIB / 100));
+    assert_eq!(
+        book.keep(&planned, &key, 31 << 20).expect("read"),
+        Kept::LightBeside(1302 * GIB / 100)
+    );
+    assert_eq!(
+        book.keep(&planned, &key, 3 * GIB).expect("read"),
+        Kept::LightBeside(1302 * GIB / 100)
+    );
+    assert_eq!(book.records().learned(&key), None, "nothing is kept");
+    assert_eq!(
+        book.keep(&planned, &key, 13 * GIB).expect("kept"),
+        Kept::Kept
+    );
+    let other = over(&compile(), &packages(&["aterm-types"]));
+    assert_eq!(
+        book.keep(&cut(None), &other, 31 << 20).expect("kept"),
+        Kept::Kept
+    );
+    assert_eq!(
+        book.records().learned(&key).map(|l| (l.peak, l.runs)),
+        Some((13 * GIB, 1))
+    );
+}
+
+/// A call of a shaped test compile keeps its record over its own crates under its variant
+/// ([`StageKey::of_stage`]): the first call, a cut that follows no call, under `verify -p
+/// <its crates>`'s own key, so a run of that selection unshaped reads it and it reads theirs; a
+/// lib-test call under `targets --lib`; the closing call under `after <the cuts>`, so the rest
+/// of the work never stands for the whole of it. An unshaped test compile, a part of one call,
+/// keeps under [`StageKey::of_run`]. NEGATIVE CONTROL: the closing call keyed as the stage
+/// unshaped would read the whole run's record.
+#[test]
+fn a_shaped_calls_record_is_kept_under_its_own_crates_and_variant() {
+    use crate::shape::{Part, Piece};
+    let names = |c: &[&str]| c.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+    let whole = ["aterm-agent", "aterm-gui", "aterm-types"];
+    let ctx = crate::Ctx::new(
+        std::path::PathBuf::from("/ck"),
+        packages(&whole),
+        crate::EnvSnapshot::default(),
+        std::path::PathBuf::from("/tmp"),
+    );
+    let cut = Piece::of(&names(&["aterm-gui"]), false);
+    let lib = Piece::of(&names(&["aterm-agent"]), true);
+    let closing = Piece::of(&names(&whole), false);
+    let part = |piece: &Piece, index: usize, after: &[&Piece]| StageSpec {
+        part: Some(Part {
+            piece: piece.clone(),
+            index,
+            of: 3,
+            after: after.iter().map(|p| (*p).clone()).collect(),
+            said: String::new(),
+            planned: None,
+            refused: Vec::new(),
+        }),
+        ..compile()
+    };
+    assert_eq!(
+        Key::of_stage(&part(&cut, 0, &[]), &ctx),
+        Key {
+            checkout: "/ck".to_owned(),
+            ..Key::of(StageId::TestCompile, &gui())
+        }
+    );
+    assert_eq!(
+        Key::of_stage(&part(&lib, 1, &[]), &ctx).variant.as_deref(),
+        Some("targets --lib")
+    );
+    let last = Key::of_stage(&part(&closing, 2, &[&cut, &lib]), &ctx);
+    assert_eq!(
+        (last.crates, last.variant.as_deref()),
+        (
+            Some(names(&whole)),
+            Some("after -p aterm-gui; -p aterm-agent --lib")
+        )
+    );
+    let mut alone = part(&closing, 0, &[]);
+    if let Some(p) = alone.part.as_mut() {
+        p.of = 1;
+    }
+    assert_eq!(
+        Key::of_stage(&alone, &ctx),
+        Key::of_run(StageId::TestCompile, &ctx)
+    );
+    assert_ne!(
+        Key::of_stage(&part(&closing, 2, &[&cut, &lib]), &ctx),
+        Key::of_run(StageId::TestCompile, &ctx)
     );
 }
 
@@ -470,4 +805,114 @@ fn every_stage_that_builds_claims_the_cold_figure() {
     ] {
         assert!(!compiles(id), "{id:?}");
     }
+}
+
+/// How many times [`counted_reader`] was asked, by pid.
+static READS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+fn counted_reader(pid: u32) -> Option<crate::unitgraph::UnitName> {
+    READS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(pid);
+    (pid != 3).then(|| crate::unitgraph::UnitName {
+        package: "aterm-gui".to_owned(),
+        kind: if pid == 1 {
+            "aterm_gui test"
+        } else {
+            "aterm_gui lib"
+        }
+        .to_owned(),
+    })
+}
+
+/// A METER THAT ATTRIBUTES READS EACH HEAVY COMPILER ONCE: a member is read for its unit the first
+/// time its footprint reaches the floor (1 GiB), and never again however often it is booked; its
+/// unit's peak is the most it held, its lifetime peak included; a light member is never read; a
+/// member that compiles no unit (pid 3) is read once and books nothing; two compilers of one unit
+/// keep the most of them. A command line names its unit by `--crate-name`, `--test` or
+/// `--crate-type`, and `CARGO_PKG_NAME`. NEGATIVE CONTROL: with the floor ignored by hand, the
+/// light member was read.
+#[test]
+fn a_meter_reads_each_heavy_compiler_once_for_its_unit() {
+    let m = |pid: u32, start: u64, footprint: u64, peak: u64| aterm_sysprobe::MemberUsage {
+        pid,
+        start,
+        footprint,
+        peak_footprint: peak,
+        ..aterm_sysprobe::MemberUsage::default()
+    };
+    let meter = Meter::attributing(counted_reader, UNIT_FLOOR);
+    meter.book(9, &[m(1, 5, GIB / 2, GIB / 2), m(2, 5, 2 * GIB, 2 * GIB)]);
+    meter.book(
+        9,
+        &[
+            m(1, 5, 4 * GIB, 6 * GIB),
+            m(2, 5, GIB, 2 * GIB),
+            m(3, 5, 5 * GIB, 5 * GIB),
+        ],
+    );
+    meter.book(
+        9,
+        &[
+            m(1, 5, 5 * GIB, 6 * GIB),
+            m(4, 6, 3 * GIB, 3 * GIB),
+            m(5, 7, GIB / 4, GIB / 4),
+        ],
+    );
+    let peaks: Vec<(String, u64)> = meter
+        .unit_peaks()
+        .into_iter()
+        .map(|(n, p)| (n.kind, p))
+        .collect();
+    assert_eq!(
+        peaks,
+        [
+            ("aterm_gui lib".to_owned(), 3 * GIB),
+            ("aterm_gui test".to_owned(), 6 * GIB)
+        ]
+    );
+    let mut reads = READS.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    reads.sort_unstable();
+    assert_eq!(
+        reads,
+        [1, 2, 3, 4],
+        "each heavy member once, the light one never"
+    );
+    assert!(Meter::new().unit_peaks().is_empty());
+
+    let words = |w: &[&str]| w.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+    let env = words(&["HOME=/h", "CARGO_PKG_NAME=aterm-gui"]);
+    assert_eq!(
+        unit_of(
+            words(&[
+                "rustc",
+                "--crate-name",
+                "aterm_gui",
+                "--edition=2024",
+                "--test"
+            ]),
+            env.clone()
+        ),
+        Some(crate::unitgraph::UnitName {
+            package: "aterm-gui".to_owned(),
+            kind: "aterm_gui test".to_owned()
+        })
+    );
+    assert_eq!(
+        unit_of(
+            words(&["rustc", "--crate-name", "aterm_gui", "--crate-type", "lib"]),
+            env.clone()
+        )
+        .map(|n| n.kind),
+        Some("aterm_gui lib".to_owned())
+    );
+    assert_eq!(unit_of(words(&["ld", "-o", "x"]), env), None);
+    assert_eq!(
+        unit_of(
+            words(&["rustc", "--crate-name", "x", "--test"]),
+            words(&["HOME=/h"])
+        ),
+        None
+    );
 }

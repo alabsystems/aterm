@@ -10,7 +10,10 @@ pub mod cli;
 pub mod ctx;
 pub mod error;
 pub mod git;
+#[cfg(unix)]
+pub mod harness_local;
 pub mod host;
+pub mod hosts_check;
 pub mod identity;
 pub mod lane;
 pub mod pins;

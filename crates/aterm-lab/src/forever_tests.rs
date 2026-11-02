@@ -4,13 +4,17 @@
 //! Tests for `lab forever` stub scripts, request readers, and scenario judge.
 
 use aterm_agent::harness::acts::HeldBy;
-use aterm_agent::harness::repo_work::RepoWork;
+use aterm_agent::harness::repo_work::{RepoRead, RepoWork};
 use aterm_agent::supervise::approvals::LEFT_REASON;
 use aterm_agent::supervise::config::CONTINUE_TEXT;
+use aterm_agent::supervise::policy::land_check::{
+    LAND_CHECK_HINT_CLOSE, WAITS_ON_YOU, hint_clause, land_check_text, listed_suffix,
+};
 use aterm_agent::supervise::policy::needs::needs_you;
 use aterm_agent::supervise::policy::turn_end::{
-    DONE_CHECK, LAND, LAND_ANSWER, LAND_NUDGE, REVERSIBLE_ANSWER, RULE_LEFT, Said, classify_said,
-    clean_defense, open_work_suffix, repo_work_suffix, says_done,
+    DONE_CHECK, LAND, LAND_ANSWER, LAND_CHECK, LAND_CONTRADICTED_HEAD, LAND_NUDGE,
+    REVERSIBLE_ANSWER, RULE_LAND_CHECK, RULE_LEFT, Said, classify_said, clean_defense,
+    land_contradicted, open_work_suffix, repo_work_suffix, says_done,
 };
 
 use super::surfaces::held::tests::three_a_said;
@@ -504,6 +508,10 @@ fn the_p2_replies_open_wrote_with_a_sentence_after_it() {
     let mut n = 0;
     for c in P2_CHAINS {
         for r in c.rules() {
+            // The land check's answer is the literal word, never a reply's sentence.
+            if r.get("last").and_then(J::as_str) == Some(LAND_CHECK_KEY) {
+                continue;
+            }
             let text = r.get("text").and_then(J::as_str).unwrap_or("");
             let head = text.lines().next().unwrap_or("");
             let rest = head
@@ -615,21 +623,30 @@ fn the_coverage_chains_are_scripted_turn_by_turn() {
     assert_ne!(WallHid.token(), Wall.token());
 }
 
+/// Every chain the lab drives at its wall before `reset - HIDE_BEFORE_RESET_MS` (the hide, the
+/// tapped walls' Esc and narrow pane) has room for it past the land act.
 #[test]
 fn the_remembered_walls_reset_leaves_room_for_the_hide() {
     assert_eq!(Chain::Wall.wall_ahead_ms(), WALL_AHEAD_MS);
-    for now in [1_792_500_010_000_i64, 1_792_500_059_999, 1_792_500_060_000] {
-        let r = reset_s_ahead(now, Chain::WallHid.wall_ahead_ms()) * 1000;
-        assert_eq!(r % 60_000, 0, "{now}");
-        let hidden_by = now + 120_000 + 30_000 + i64::try_from(HIDE_TRIES).unwrap() * 4_000;
-        assert!(r - hidden_by >= HIDE_BEFORE_RESET_MS, "{now}");
+    let driven: Vec<Chain> = Chain::every()
+        .into_iter()
+        .filter(|c| c.tapped() || Harness::ALL.iter().any(|h| c.hides_on(*h)))
+        .collect();
+    assert!(driven.contains(&Chain::NarrowTapWall), "{driven:?}");
+    for c in driven {
+        for now in [1_792_500_010_000_i64, 1_792_500_059_999, 1_792_500_060_000] {
+            let r = crate::stub::reset_s_ahead(now, c.wall_ahead_ms()) * 1000;
+            assert_eq!(r % 60_000, 0, "{c:?} {now}");
+            let hidden_by = now + 120_000 + 30_000 + i64::try_from(HIDE_TRIES).unwrap() * 4_000;
+            assert!(r - hidden_by >= HIDE_BEFORE_RESET_MS, "{c:?} {now}");
+        }
     }
 }
 
 #[test]
 fn the_wall_resets_on_a_whole_minute_past_the_land_act() {
     for now in [1_792_500_010_000_i64, 1_792_500_059_999, 1_792_500_060_000] {
-        let r = reset_s_ahead(now, WALL_AHEAD_MS) * 1000;
+        let r = crate::stub::reset_s_ahead(now, WALL_AHEAD_MS) * 1000;
         assert_eq!(r % 60_000, 0, "{now}");
         assert!(
             r >= now + WALL_AHEAD_MS && r < now + WALL_AHEAD_MS + 60_000,
@@ -684,7 +701,6 @@ fn the_coverage_modes_pick_their_chains() {
         [LandP, Cap, LandQ].map(Chain::orchestrated),
         [Some(ORCHESTRATED), Some(RESUMED), None]
     );
-    assert_eq!(Chain::every().len(), 47);
     assert!(
         Chain::every()
             .iter()
@@ -776,6 +792,8 @@ fn the_modes_pick_their_chains_and_off_runs_in_each() {
         Chain::of_mode(Mode::Land),
         [
             LandA,
+            LandN,
+            LandO,
             LandB,
             LandC,
             LandD,
@@ -788,7 +806,13 @@ fn the_modes_pick_their_chains_and_off_runs_in_each() {
             InstantLand,
             LandJ,
             LandK,
-            SameLand
+            SameLand,
+            LandHinted,
+            LandListed,
+            LandSameList,
+            LandReworded,
+            LandContradicted,
+            LandContradictedList
         ]
     );
     assert_eq!(
@@ -810,7 +834,18 @@ fn the_modes_pick_their_chains_and_off_runs_in_each() {
             .into_iter()
             .filter(|c| surfaces::holds_at_end(*c))
             .collect::<Vec<_>>(),
-        [LandB, LandC, LandD, LandF, LandG, LandH, LandI]
+        [
+            LandB,
+            LandC,
+            LandD,
+            LandF,
+            LandG,
+            LandH,
+            LandI,
+            LandSameList,
+            LandReworded,
+            LandContradictedList
+        ]
     );
     assert_eq!(
         Chain::every()
@@ -818,8 +853,21 @@ fn the_modes_pick_their_chains_and_off_runs_in_each() {
             .filter(|c| c.same_reply())
             .collect::<Vec<_>>(),
         [
-            LandB, LandC, LandD, LandE, LandF, LandG, LandH, LandI, Cruise, SameLand, SameCruise,
-            WroteC, SwitchHeld
+            LandB,
+            LandC,
+            LandE,
+            LandF,
+            LandG,
+            LandH,
+            LandI,
+            Cruise,
+            SameLand,
+            SameCruise,
+            LandSameList,
+            LandReworded,
+            LandContradictedList,
+            WroteC,
+            SwitchOverHeld
         ]
     );
     assert!(SameLand.repo() == Repo::Untracked && SameCruise.repo() == Repo::Clean);
@@ -914,6 +962,132 @@ fn the_instant_chains_answer_at_once_and_the_others_are_paced() {
             Some(REPLY_PACE_S),
             "{chain:?}"
         );
+    }
+}
+
+/// Every chain under Land answers the land check: `LANDED` where nothing is scripted left
+/// (never its `MARK` rule's defense), land-b and land-same-list a list, land-d its need alone,
+/// land-listed a list until the work its nudge asked for, then `LANDED`; land-hinted's defense is
+/// one the reader reads open, so its check is hinted with the stale-lock clause.
+#[test]
+fn each_land_chain_answers_the_land_check_as_its_scenario_needs() {
+    let check = land_check_text(None, false, None);
+    for c in Chain::every() {
+        if c.autopilot() != "land" || c == Chain::SameLand {
+            continue;
+        }
+        let want = match c {
+            Chain::LandB => CHECK_LIST.to_string(),
+            Chain::LandD => format!("NEEDS YOU: {NEED}"),
+            Chain::LandListed => RELEASE_LIST.to_string(),
+            Chain::LandSameList => SAME_LIST.to_string(),
+            Chain::LandReworded | Chain::LandContradictedList => CHECK_LIST.to_string(),
+            _ => LANDED.to_string(),
+        };
+        assert_eq!(
+            reply(c, &[LAND, &check]).as_deref(),
+            Some(want.as_str()),
+            "{c:?}"
+        );
+    }
+    assert_eq!(reply(Chain::LandHinted, &[LAND]).as_deref(), Some(HINTED));
+    let hint = hint_clause(HINTED).expect("the reader reads a clause of it open");
+    assert!(hint.contains(HINT_KEY), "{hint}");
+    assert!(clean_defense(Some(CLEAN)) && hint_clause(CLEAN).is_none());
+    let hinted = land_check_text(Some(&hint), false, None);
+    assert!(
+        hinted.contains(HINT_OPEN)
+            && hinted.contains(HINT_KEY)
+            && hinted.contains(LAND_CHECK_HINT_CLOSE),
+        "{hinted}"
+    );
+    let quoting = format!(
+        "{LAND_NUDGE} {}",
+        listed_suffix(RELEASE_LIST).expect("a list")
+    );
+    assert_eq!(
+        reply(Chain::LandListed, &[LAND, &check, &quoting]).as_deref(),
+        Some(RELEASE_WORK)
+    );
+    assert_eq!(
+        reply(Chain::LandListed, &[LAND, &check, &quoting, LAND_NUDGE]).as_deref(),
+        Some(CLEAN)
+    );
+    assert_eq!(
+        reply(
+            Chain::LandListed,
+            &[LAND, &check, &quoting, LAND_NUDGE, &check]
+        )
+        .as_deref(),
+        Some(LANDED)
+    );
+    assert_eq!(
+        reply(
+            Chain::LandSameList,
+            &[LAND, &check, &format!("{LAND_NUDGE} x")]
+        )
+        .as_deref(),
+        Some(CLEAN)
+    );
+    assert!(Chain::LandSameList.same_reply() && !Chain::LandD.same_reply());
+    // land-contradicted-list: its defense answers Land's instruction, the nudge quoting its list
+    // and the contradiction after it alike (the hold at its second no-work saying).
+    let contradiction =
+        land_contradicted(&RepoRead::Clean, Some(CHECK_LIST), &[], None).expect("the Open leg");
+    let quoting_check_list = format!("{LAND_NUDGE} {}", listed());
+    for prompts in [
+        &[LAND][..],
+        &[LAND, &check, &quoting_check_list],
+        &[LAND, &check, &quoting_check_list, &contradiction],
+    ] {
+        assert_eq!(
+            reply(Chain::LandContradictedList, prompts).as_deref(),
+            Some(open_defense().as_str()),
+            "{prompts:?}"
+        );
+    }
+    assert!(Chain::LandContradictedList.same_reply() && !Chain::LandContradictedList.lands());
+    // land-reworded: the nudge quoting its list gets work, the check after that work (a nudge
+    // that quoted a list before it) the list reworded, the nudge quoting that the defense.
+    let quoting_old = format!(
+        "{LAND_NUDGE} {}",
+        listed_suffix(CHECK_LIST).expect("a list")
+    );
+    let quoting_new = format!(
+        "{LAND_NUDGE} {}",
+        listed_suffix(REWORDED_LIST).expect("a list")
+    );
+    assert_eq!(
+        reply(Chain::LandReworded, &[LAND, &check, &quoting_old]).as_deref(),
+        Some(REWORD_WORK)
+    );
+    assert_eq!(
+        reply(
+            Chain::LandReworded,
+            &[LAND, &check, &quoting_old, LAND_NUDGE, &check]
+        )
+        .as_deref(),
+        Some(REWORDED_LIST)
+    );
+    assert_eq!(
+        reply(
+            Chain::LandReworded,
+            &[LAND, &check, &quoting_old, LAND_NUDGE, &check, &quoting_new]
+        )
+        .as_deref(),
+        Some(CLEAN)
+    );
+    assert!(Chain::LandReworded.same_reply() && !Chain::LandReworded.lands());
+    assert!(Chain::LandHinted.lands() && Chain::LandListed.lands());
+    assert!(!Chain::LandSameList.lands());
+    for c in [
+        Chain::LandHinted,
+        Chain::LandListed,
+        Chain::LandSameList,
+        Chain::LandReworded,
+    ] {
+        assert!(Chain::of_mode(Mode::Land).contains(&c), "{c:?}");
+        assert_eq!(c.repo(), Repo::Clean, "{c:?}");
     }
 }
 
@@ -1205,6 +1379,7 @@ fn stamp(t: i64) -> String {
 fn row(t: i64, rule: &str, decision: &str, command: &str, reason: &str) -> Row {
     Row {
         ts: T0 + t,
+        box_seq: None,
         rule: rule.into(),
         decision: decision.into(),
         command: command.into(),
@@ -1260,14 +1435,48 @@ fn no_meta(t: i64) -> (i64, String) {
     j(t, "attention_owners=0 attention_kinds=- attention=-")
 }
 
+/// [`super::judge`] over a 9c build's `status` (slice 9c): these fixtures were written before
+/// `status` said what aterm checked, so each read gains the four `landed_*` fields a 9c build
+/// prints for it ([`checked::as_built`]). `forever_checked_tests.rs` holds that want itself, a
+/// read without them included.
+fn judge(chain: Chain, seen: &Seen, program: &str, t0: i64) -> Vec<(Scenario, Verdict)> {
+    super::judge(chain, &checked::as_built(chain, seen, t0), program, t0)
+}
+
+/// `seen` as this tree's Land records a landing: a Land chain's landing over a repository the
+/// check reads clean ([`Repo::reads_clean`]) comes through one land check ([`with_land_check`], which leaves records that have one, or no
+/// landing, as they are). The fixtures were written before the check; [`verdicts_unchecked`] and
+/// [`one_unchecked`] judge main's records as they are.
+fn land_checked(chain: Chain, seen: &Seen) -> Seen {
+    if chain.autopilot() == "land" && chain.repo().reads_clean() {
+        with_land_check(seen.clone())
+    } else {
+        seen.clone()
+    }
+}
+
 fn verdicts(chain: Chain, seen: &Seen, program: &str) -> Vec<(&'static str, &'static str)> {
+    verdicts_unchecked(chain, &land_checked(chain, seen), program)
+}
+
+fn one(chain: Chain, seen: &Seen, program: &str, s: Scenario) -> (&'static str, String) {
+    one_unchecked(chain, &land_checked(chain, seen), program, s)
+}
+
+/// [`verdicts`] of records judged as they are: main's, which land at the defense.
+fn verdicts_unchecked(
+    chain: Chain,
+    seen: &Seen,
+    program: &str,
+) -> Vec<(&'static str, &'static str)> {
     judge(chain, seen, program, T0)
         .iter()
         .map(|(s, v)| (s.id(), v.word()))
         .collect()
 }
 
-fn one(chain: Chain, seen: &Seen, program: &str, s: Scenario) -> (&'static str, String) {
+/// [`one`] of records judged as they are.
+fn one_unchecked(chain: Chain, seen: &Seen, program: &str, s: Scenario) -> (&'static str, String) {
     judge(chain, seen, program, T0)
         .into_iter()
         .find(|(x, _)| *x == s)
@@ -1275,14 +1484,47 @@ fn one(chain: Chain, seen: &Seen, program: &str, s: Scenario) -> (&'static str, 
         .expect("the scenario")
 }
 
-fn needs_nudge() -> String {
-    format!("{LAND_NUDGE} {NEEDS_ACK}")
+/// The land check carrying the needs ack (L3's).
+fn acked_check() -> String {
+    land_check_text(None, true, None)
 }
 
-/// LandA landed: Land's instruction at its first point (typed at once, v6 §14.10: no back-off
-/// before it), the need raised, a nudge, the need cleared, the landing.
+/// The chains' repository's `HEAD` in the landing fixtures below ([`receipted`]).
+const RECEIPT_HEAD: &str = "1c81bc6f0e2a3b4c5d6e7f8091a2b3c4d5e6f708";
+
+/// `s` as a build with the landing receipt (§14.9, slice 9b) journals it: each land `DONE` note
+/// followed by the `RECEIPT` of its seq naming [`RECEIPT_HEAD`] on `origin/main`, and the chain's
+/// `HEAD` read once the watch is over.
+fn receipted(mut s: Seen) -> Seen {
+    let mut journal = Vec::with_capacity(s.journal.len() + 1);
+    for (t, l) in s.journal {
+        let seq = l
+            .split(' ')
+            .find_map(|w| w.strip_prefix("seq="))
+            .filter(|_| l.starts_with("DONE ") && l.contains(" rule=land@v1 "))
+            .map(str::to_string);
+        journal.push((t, l));
+        if let Some(seq) = seq {
+            journal.push((
+                t,
+                format!(
+                    "RECEIPT seq={seq} rule=land@v1 head={} on=origin/main leg=on-main \
+                     check=land-check@v1 repo=/private/tmp/at.x/proj/land-a Nothing left: the \
+                     parser",
+                    &RECEIPT_HEAD[..12]
+                ),
+            ));
+        }
+    }
+    s.journal = journal;
+    s.head = Some(RECEIPT_HEAD.to_string());
+    s
+}
+
+/// land-a on this tree: land@v1, the need and the defense, the check at that point (no
+/// back-off), its `LANDED`, landed, the need standing beside the landing (no retraction).
 fn landed_a() -> Seen {
-    Seen {
+    receipted(Seen {
         journal: vec![
             j(124_800, "EVENT idle seq=1 Implemented the parser"),
             j(
@@ -1295,50 +1537,49 @@ fn landed_a() -> Seen {
             ),
             j(130_000, "EVENT idle seq=2 Nothing left: the parser"),
             j(
-                130_100,
-                "WAITING seq=2 until=x 2 short turn(s) in a row: 4 min back-off",
+                130_200,
+                "CONTINUED seq=2 rule=land-check@v1 [aterm harness] Land check: Reread",
             ),
+            j(135_000, "EVENT idle seq=3 LANDED"),
             j(
-                370_000,
-                "CONTINUED seq=2 rule=land-nudge@v1 [aterm harness] Still landing:",
-            ),
-            j(375_000, "CLEARED seq=3 needs attention=OK none stands now"),
-            j(375_000, "EVENT idle seq=3 Nothing left: the parser"),
-            j(
-                375_000,
-                "DONE seq=3 rule=land@v1 the worker defended that nothing is left",
+                135_000,
+                "DONE seq=3 rule=land@v1 the worker answered the land check: LANDED",
             ),
         ],
         ledger: vec![
             point(124_800, 1),
             typed(125_000, "land@v1", LAND),
             point(130_000, 2),
-            typed(370_000, "land-nudge@v1", &needs_nudge()),
-            point(375_000, 3),
-            task_done(375_000),
+            typed(130_200, RULE_LAND_CHECK, &acked_check()),
+            point(135_000, 3),
+            task_done(135_000),
         ],
         status: vec![
             status(1_000, "open", "land"),
             status_of(131_000, "open", "ask", "land", "aterm-harness@1"),
-            status(376_000, "landed", "land"),
+            status(136_000, "landed", "land"),
         ],
-        meta: vec![no_meta(1_000), needs_meta(131_000, "agy"), no_meta(376_000)],
+        meta: vec![
+            no_meta(1_000),
+            needs_meta(131_000, "agy"),
+            needs_meta(136_000, "agy"),
+        ],
         task: vec![j(1_000, "OK task -")],
         reply_ms: None,
         asked_ms: None,
         ask_refused_ms: None,
-        end_ms: T0 + 920_000,
+        end_ms: T0 + 680_000,
         stub: Some(StubSeen {
             baseline: 2,
             read: 3,
             new_turns: 0,
         }),
         ..Seen::default()
-    }
+    })
 }
 
 #[test]
-fn land_a_passes_on_a_landing_with_its_need_raised_then_cleared() {
+fn land_a_passes_on_a_landing_its_need_stands_beside() {
     assert_eq!(
         verdicts(Chain::LandA, &landed_a(), "agy"),
         [("L1", "PASS"), ("L3", "PASS"), ("L5", "PASS")]
@@ -1348,15 +1589,22 @@ fn land_a_passes_on_a_landing_with_its_need_raised_then_cleared() {
 #[test]
 fn a_landing_is_watched_past_the_ladders_next_step() {
     let s = landed_a();
-    let d = T0 + 375_000;
+    let d = T0 + 135_000;
     assert_eq!(quiet_after_landed_ms(&s, d, false), 9 * 60_000);
     assert_eq!(next_step_ms(1, false), 2 * 60_000);
     assert_eq!(next_step_ms(4, false), 16 * 60_000);
     assert_eq!(next_step_ms(2, true), 0);
     assert_eq!(next_step_ms(4, true), 16 * 60_000);
     assert_eq!(quiet_after_landed_ms(&Seen::default(), d, true), 90_000);
+    // With no point row, the streak is read off the last back-off's WAITING row and the replies
+    // since (land-a's check waits none, so one is put in for the read).
     let mut w = landed_a();
     w.ledger.retain(|r| r.rule != RULE_POINT);
+    w.journal.push(j(
+        130_100,
+        "WAITING seq=2 until=x 2 short turn(s) in a row: 4 min back-off",
+    ));
+    w.journal.sort_by_key(|(at, _)| *at);
     assert_eq!(quiet_after_landed_ms(&w, d, false), 9 * 60_000);
 }
 
@@ -1372,7 +1620,7 @@ fn land_a_fails_what_it_must_and_says_what_it_did_not_see() {
     s.status.remove(1);
     assert_eq!(l3(&s, "agy"), ("L3", "FAIL"));
     let mut s = landed_a();
-    s.ledger[3].command = LAND_NUDGE.to_string();
+    s.ledger[3].command = LAND_CHECK.to_string();
     assert_eq!(l3(&s, "agy"), ("L3", "FAIL"));
     let mut s = landed_a();
     s.journal.push(j(
@@ -1389,7 +1637,7 @@ fn land_a_fails_what_it_must_and_says_what_it_did_not_see() {
     assert_eq!(l5(&s), ("L5", "FAIL"));
     let mut s = landed_a();
     s.journal.push(j(
-        375_000,
+        135_000,
         "WAITING seq=3 until=x 3 short turn(s) in a row: 8 min back-off",
     ));
     assert_eq!(l5(&s), ("L5", "FAIL"));
@@ -1414,22 +1662,29 @@ fn land_a_fails_what_it_must_and_says_what_it_did_not_see() {
     let mut s = landed_a();
     s.stub = None;
     assert_eq!(l5(&s), ("L5", "UNOBSERVED"));
+    // A `LANDED` retracts no need: one taken down at it, or gone from meta, fails.
+    let mut s = landed_a();
+    s.journal.push(j(
+        135_000,
+        "CLEARED seq=3 needs attention=OK none stands now",
+    ));
+    assert_eq!(l5(&s), ("L5", "FAIL"));
     let mut s = landed_a();
     s.meta.pop();
-    s.journal.remove(6);
+    s.meta.push(no_meta(136_000));
     assert_eq!(l5(&s), ("L5", "FAIL"));
     let mut s = landed_a();
     s.task
-        .push(j(377_000, "OK task rev=4 state=done why=marker from=ctl"));
+        .push(j(137_000, "OK task rev=4 state=done why=marker from=ctl"));
     assert_eq!(l5(&s), ("L5", "FAIL"));
     let mut s = landed_a();
     s.status.pop();
     assert_eq!(l5(&s), ("L5", "FAIL"));
     let mut s = landed_a();
-    s.ledger[3].command = format!("{} {REPO_SUFFIX}: x", needs_nudge());
+    s.ledger[3].command = format!("{} {REPO_SUFFIX}: x", acked_check());
     assert_eq!(l5(&s), ("L5", "FAIL"));
     let mut s = landed_a();
-    s.end_ms = T0 + 470_000;
+    s.end_ms = T0 + 230_000;
     let (w, why) = one(Chain::LandA, &s, "agy", Scenario::L5);
     assert_eq!(w, "UNOBSERVED", "{why}");
     let s = Seen {
@@ -1445,16 +1700,62 @@ fn land_a_fails_what_it_must_and_says_what_it_did_not_see() {
     s.ledger.retain(|r| r.rule != "land@v1");
     assert_eq!(verdicts(Chain::LandA, &s, "agy")[0], ("L1", "FAIL"));
     let mut s = landed_a();
-    s.journal.retain(|(_, l)| !l.contains("land-nudge"));
+    s.journal.retain(|(_, l)| !l.contains("land-check"));
     s.journal.push(j(131_000, "DONE seq=2 rule=land@v1 x"));
     s.journal.sort();
-    assert_eq!(l3(&s, "agy"), ("L3", "FAIL"));
+    assert_eq!(
+        verdicts_unchecked(Chain::LandA, &s, "agy")[1],
+        ("L3", "FAIL")
+    );
 }
 
-fn repo_suffix(repo: Repo) -> String {
+/// L5's check is one, typed at the defense's point (no back-off), and the landing comes only
+/// through it: main's landing at the defense (no check) fails L5 and L1 and L3 with it.
+#[test]
+fn land_a_lands_only_through_one_check_at_the_defenses_point() {
+    let l5 = |s: &Seen| one(Chain::LandA, s, "agy", Scenario::L5);
+    let (w, why) = l5(&landed_a());
+    assert_eq!(w, "PASS", "{why}");
+    let mut s = landed_a();
+    s.journal.insert(
+        5,
+        j(
+            130_100,
+            "WAITING seq=2 until=x 2 short turn(s) in a row: 4 min back-off",
+        ),
+    );
+    let (w, why) = l5(&s);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("a back-off decided before the check"), "{why}");
+    let mut s = landed_a();
+    s.journal.insert(
+        6,
+        j(
+            131_000,
+            "CONTINUED seq=2 rule=land-check@v1 [aterm harness] Land check: again",
+        ),
+    );
+    let (w, why) = l5(&s);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("2 land checks typed"), "{why}");
+    let mut main = landed_a();
+    main.journal.retain(|(_, l)| !l.contains("land-check"));
+    main.ledger.retain(|r| r.rule != RULE_LAND_CHECK);
+    main.journal.push(j(130_500, "DONE seq=2 rule=land@v1 x"));
+    main.journal.sort();
+    let (w, why) = one_unchecked(Chain::LandA, &main, "agy", Scenario::L5);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("with no land check typed"), "{why}");
+    let (w, why) = one_unchecked(Chain::LandA, &main, "agy", Scenario::L1);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("no land check typed before it"), "{why}");
+}
+
+/// What the repository probe finds in a land chain's repository holding `repo`'s work.
+fn repo_work(repo: Repo) -> RepoWork {
     let r = "/r/proj/land-x";
     let work = match repo {
-        Repo::Clean => None,
+        Repo::Clean | Repo::NoRemote | Repo::Plain => None,
         Repo::Untracked => RepoWork::of_git(r, "?? wip-notes.txt\0", "", 0, 0, "origin/main"),
         Repo::Changed => RepoWork::of_git(r, " M README.md\0", "", 0, 0, "origin/main"),
         Repo::Stashed => RepoWork::of_git(r, "", "WIP on main: 1a2b lab\n", 0, 0, "origin/main"),
@@ -1462,11 +1763,33 @@ fn repo_suffix(repo: Repo) -> String {
         Repo::Unlanded => RepoWork::of_git(r, "", "", 0, 1, "origin/main"),
         Repo::Others => RepoWork::of_git(r, "", "On main: another\n", 0, 0, "origin/main"),
     };
-    repo_work_suffix(&work.expect("work found"))
+    work.expect("work found")
+}
+
+/// The repository's suffix of Land's nudge, as main typed it after a false defense before slice
+/// 4c: a negative control of the repository chains now.
+fn repo_suffix(repo: Repo) -> String {
+    repo_work_suffix(&repo_work(repo))
+}
+
+/// LAND'S CONTRADICTION of a false defense over `repo`'s work (slice 4c), whole: what the
+/// repository chains' nudge types on this tree ([`nudged`] takes it as the nudge's text).
+fn contradicted(repo: Repo) -> String {
+    land_contradicted(&RepoRead::Found(repo_work(repo)), None, &[], None).expect("git's leg")
 }
 
 fn open_suffix() -> String {
     open_work_suffix(&["still open"]).expect("open work")
+}
+
+/// The nudge [`nudged`] records: [`LAND_NUDGE`] then `suffix`, or `suffix` whole where it is Land's
+/// contradiction ([`contradicted`]).
+fn nudge_text(suffix: &str) -> String {
+    if suffix.starts_with(LAND_CONTRADICTED_HEAD) {
+        suffix.to_string()
+    } else {
+        format!("{LAND_NUDGE} {suffix}")
+    }
 }
 
 fn nudged(suffix: &str) -> Seen {
@@ -1494,13 +1817,626 @@ fn nudged(suffix: &str) -> Seen {
         ledger: vec![
             point(124_800, 1),
             typed(125_000, "land@v1", LAND),
-            typed(370_000, "land-nudge@v1", &format!("{LAND_NUDGE} {suffix}")),
+            typed(370_000, "land-nudge@v1", &nudge_text(suffix)),
         ],
         status: vec![status(1_000, "open", "land")],
         meta: vec![no_meta(1_000)],
         end_ms: T0 + 380_000,
         ..Seen::default()
     }
+}
+
+/// L2's nudge suffix: the agent's own list, quoted.
+fn listed() -> String {
+    listed_suffix(CHECK_LIST).expect("a list")
+}
+
+/// The hinted check land-b's open defense gets.
+fn hinted_check() -> String {
+    land_check_text(hint_clause(&open_defense()).as_deref(), false, None)
+}
+
+/// `s` (a [`nudged`] chain's records) with land-b's check before its nudge: the defense's yield,
+/// the hinted check at that point, and the list answering it where the nudged records read the
+/// defense.
+fn checked_b(s: Seen) -> Seen {
+    checked_of(s, &hinted_check(), CHECK_LIST)
+}
+
+/// [`checked_b`] with the check typed as `check` and answered with `list`.
+fn checked_of(mut s: Seen, check: &str, list: &str) -> Seen {
+    // The later points each move one seq on, as the defense's point now comes before them.
+    for (_, l) in s.journal.iter_mut().skip(1) {
+        if let Some(n) = word(l, "seq").and_then(|n| n.parse::<u64>().ok()) {
+            *l = l.replacen(&format!("seq={n}"), &format!("seq={}", n + 1), 1);
+        }
+    }
+    s.journal
+        .insert(1, j(128_000, "EVENT idle seq=2 Nothing left: the parser"));
+    s.journal.insert(
+        2,
+        j(
+            128_100,
+            "CONTINUED seq=2 rule=land-check@v1 [aterm harness] Land check: Reread",
+        ),
+    );
+    s.journal[3].1 = format!("EVENT idle seq=3 {list}");
+    s.ledger.insert(1, typed(128_100, RULE_LAND_CHECK, check));
+    s
+}
+
+/// land-same-list on this tree: the clean defense's plain check, its list, the nudge quoting it.
+fn same_listed() -> Seen {
+    checked_of(
+        nudged(&listed_suffix(SAME_LIST).expect("a list")),
+        LAND_CHECK,
+        SAME_LIST,
+    )
+}
+
+#[test]
+fn land_same_list_passes_on_one_plain_check_and_the_nudge_quoting_its_list() {
+    let (w, why) = one(Chain::LandSameList, &same_listed(), "agy", Scenario::LS);
+    assert_eq!(w, "PASS", "{why}");
+    let mut hinted = same_listed();
+    hinted.ledger[1].command = hinted_check();
+    assert_eq!(
+        verdicts(Chain::LandSameList, &hinted, "agy"),
+        [("LS", "FAIL")]
+    );
+    let other = checked_of(nudged(&listed()), LAND_CHECK, SAME_LIST);
+    assert_eq!(
+        verdicts(Chain::LandSameList, &other, "agy"),
+        [("LS", "FAIL")]
+    );
+    let main = nudged(&open_suffix());
+    assert_eq!(
+        verdicts(Chain::LandSameList, &main, "agy"),
+        [("LS", "FAIL")]
+    );
+    let mut landed = same_listed();
+    landed.journal.push(j(374_000, "DONE seq=3 rule=land@v1 x"));
+    assert_eq!(
+        verdicts(Chain::LandSameList, &landed, "agy"),
+        [("LS", "FAIL")]
+    );
+}
+
+/// land-contradicted-list on this tree (LY, slice 4c's Open leg): land-b's defense, its hinted
+/// check, the list, the nudge quoting it, the audited defense again (a `WAITING` out the back-off),
+/// Land's contradiction quoting the list, and the same defense after it held, as 3a journals the
+/// hold ([`three_a_said`]).
+fn contradicted_listed() -> Seen {
+    three_a_said(contradicted_listed_raw(), Chain::LandContradictedList)
+}
+
+/// [`contradicted_listed`]'s records before 3a's words on the hold.
+fn contradicted_listed_raw() -> Seen {
+    let mut s = checked_b(nudged(&listed()));
+    s.journal.extend([
+        j(
+            853_600,
+            "CONTINUED seq=4 rule=land-nudge@v1 [aterm harness] Still landing: your last reply \
+             says Nothing left, but",
+        ),
+        j(857_000, "EVENT idle seq=5 Nothing left: the parser"),
+        j(
+            857_100,
+            "EXCEPTION seq=5 kind=stalled when=later Its program answers aterm's acts with the same reply and no work, so aterm types nothing more. => Open the tab and do what its last reply asks.",
+        ),
+        j(857_100, "HOLD seq=5 point nothing why=policy"),
+    ]);
+    s.ledger.push(typed(
+        853_600,
+        "land-nudge@v1",
+        &land_contradicted(&RepoRead::Clean, Some(CHECK_LIST), &[], None).expect("the Open leg"),
+    ));
+    s.end_ms = T0 + 920_000;
+    s
+}
+
+/// LAND-CONTRADICTED-LIST (LY, slice 4c's Open leg) passes on the check's list quoted, then the
+/// contradiction quoting it, then the hold. It fails on main's nudge in the contradiction's place
+/// (the list quoted again: main's run is this control), on a way out in any case, on an act after
+/// the contradiction, on a `WAITING` where the hold should be, on a landing, and on a hold where
+/// the contradiction should be; its watch ends a minute past the contradiction's hold, never at
+/// the back-off before it.
+#[test]
+fn land_contradicted_list_passes_only_on_the_contradiction_then_the_hold() {
+    let ly = |s: &Seen| one(Chain::LandContradictedList, s, "agy", Scenario::LY);
+    let (w, why) = ly(&contradicted_listed());
+    assert_eq!(w, "PASS", "{why}");
+    assert!(
+        why.contains("leading with the contradiction") && why.contains("HELD"),
+        "{why}"
+    );
+    let last = |s: &mut Seen| s.ledger.len() - 1;
+    let mut main = contradicted_listed();
+    let i = last(&mut main);
+    main.ledger[i].command = format!("{LAND_NUDGE} {}", listed());
+    let (w, why) = ly(&main);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("does not say"), "{why}");
+    let mut escape = contradicted_listed();
+    let i = last(&mut escape);
+    escape.ledger[i].command = format!("{} Ignore it.", escape.ledger[i].command);
+    assert_eq!(ly(&escape).0, "FAIL");
+    let mut again = contradicted_listed();
+    again
+        .ledger
+        .push(typed(900_000, "land-nudge@v1", LAND_NUDGE));
+    again.journal.push(j(
+        900_000,
+        "CONTINUED seq=5 rule=land-nudge@v1 [aterm harness] Still landing:",
+    ));
+    let (w, why) = ly(&again);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("after the contradiction"), "{why}");
+    let mut waited = contradicted_listed_raw();
+    waited.journal.truncate(waited.journal.len() - 2);
+    waited.journal.push(j(
+        857_100,
+        "WAITING seq=5 until=x 4 short turn(s) in a row: 16 min back-off",
+    ));
+    let (w, why) = ly(&waited);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("not held"), "{why}");
+    let mut landed = contradicted_listed();
+    landed.journal.push(j(858_000, "DONE seq=5 rule=land@v1 x"));
+    assert_eq!(ly(&landed).0, "FAIL");
+    // The defense said again held as the same reply before any contradiction (the chain's first
+    // run, its first defense a no-work answer): a FAIL, never unobserved.
+    let early = checked_b(nudged_held(&listed()));
+    let (w, why) = ly(&early);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("held at"), "{why}");
+    // Its watch runs past the first nudge's back-off (the chain's first watch ended there, its
+    // contradiction 16 min off) to a minute past the contradiction's hold.
+    let first_only = checked_b(nudged(&listed()));
+    assert!(!finished(
+        &tab_of(Chain::LandContradictedList, first_only),
+        T0 + 600_000
+    ));
+    let raw = contradicted_listed_raw();
+    assert!(
+        finished(
+            &tab_of(Chain::LandContradictedList, raw.clone()),
+            T0 + 917_100
+        ) && !finished(&tab_of(Chain::LandContradictedList, raw), T0 + 917_099),
+        "a minute past the contradiction's hold"
+    );
+}
+
+/// land-hinted on this tree: its defense, the hinted check at that point, `LANDED`, landed.
+fn hinted_landed() -> Seen {
+    let hint = hint_clause(HINTED).expect("a clause read open");
+    let check = land_check_text(Some(&hint), false, None);
+    Seen {
+        journal: vec![
+            j(124_800, "EVENT idle seq=1 Implemented the parser"),
+            j(
+                125_000,
+                "CONTINUED seq=1 rule=land@v1 [aterm harness] Autopilot is Land: land",
+            ),
+            j(
+                130_000,
+                "EVENT idle seq=2 Nothing left: the parser is on origin/main",
+            ),
+            j(
+                130_200,
+                "CONTINUED seq=2 rule=land-check@v1 [aterm harness] Land check: Your report",
+            ),
+            j(135_000, "EVENT idle seq=3 LANDED"),
+            j(
+                135_000,
+                "DONE seq=3 rule=land@v1 the worker answered the land check: LANDED",
+            ),
+        ],
+        ledger: vec![
+            point(124_800, 1),
+            typed(125_000, "land@v1", LAND),
+            point(130_000, 2),
+            typed(130_200, RULE_LAND_CHECK, &check),
+            point(135_000, 3),
+            task_done(135_000),
+        ],
+        status: vec![
+            status(1_000, "open", "land"),
+            status(136_000, "landed", "land"),
+        ],
+        meta: vec![no_meta(1_000)],
+        task: vec![j(1_000, "OK task -")],
+        end_ms: T0 + 680_000,
+        stub: Some(StubSeen {
+            baseline: 2,
+            read: 3,
+            new_turns: 0,
+        }),
+        cover: Cover {
+            check_texts: Some(vec![check]),
+            ..Cover::default()
+        },
+        ..Seen::default()
+    }
+}
+
+#[test]
+fn land_hinted_passes_only_on_the_hinted_check_held_as_typed_and_landed() {
+    let lh = |s: &Seen| one(Chain::LandHinted, s, "claude", Scenario::LH);
+    let (w, why) = lh(&hinted_landed());
+    assert_eq!(w, "PASS", "{why}");
+    let mut unread = hinted_landed();
+    unread.cover.check_texts = None;
+    assert_eq!(lh(&unread).0, "UNOBSERVED");
+    let mut straight = hinted_landed();
+    straight.cover.check_texts = Some(vec![LAND_CHECK.to_string()]);
+    let (w, why) = lh(&straight);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("holds the quote as typed"), "{why}");
+    let mut plain = hinted_landed();
+    plain.ledger[3].command = LAND_CHECK.to_string();
+    assert_eq!(lh(&plain).0, "FAIL");
+    let mut nudged = hinted_landed();
+    nudged.journal.insert(
+        5,
+        j(
+            131_000,
+            "CONTINUED seq=2 rule=land-nudge@v1 [aterm harness] Still landing:",
+        ),
+    );
+    assert_eq!(lh(&nudged).0, "FAIL");
+    let mut main = hinted_landed();
+    main.journal.retain(|(_, l)| !l.contains("land-check"));
+    main.ledger.retain(|r| r.rule != RULE_LAND_CHECK);
+    main.journal
+        .insert(4, j(130_000, "DONE seq=2 rule=land@v1 x"));
+    let (w, why) = one_unchecked(Chain::LandHinted, &main, "claude", Scenario::LH);
+    assert_eq!(w, "FAIL", "{why}");
+}
+
+/// land-listed on this tree: the check's list, the nudge quoting it, the work, the nudge after
+/// it, the defense, the second check, `LANDED`, landed.
+fn relisted() -> Seen {
+    let quoting = format!(
+        "{LAND_NUDGE} {}",
+        listed_suffix(RELEASE_LIST).expect("a list")
+    );
+    Seen {
+        journal: vec![
+            j(
+                125_000,
+                "CONTINUED seq=1 rule=land@v1 [aterm harness] Autopilot is Land: land",
+            ),
+            j(130_000, "EVENT idle seq=2 Nothing left: the parser"),
+            j(
+                130_200,
+                "CONTINUED seq=2 rule=land-check@v1 [aterm harness] Land check: Reread",
+            ),
+            j(
+                135_000,
+                "EVENT idle seq=3 The release notes are not written yet.",
+            ),
+            j(
+                135_100,
+                "WAITING seq=3 until=x 3 short turn(s) in a row: 4 min back-off",
+            ),
+            j(
+                375_000,
+                "CONTINUED seq=3 rule=land-nudge@v1 [aterm harness] Still landing:",
+            ),
+            j(
+                455_000,
+                "EVENT idle seq=4 Implemented the release notes for the parser in this turn.",
+            ),
+            j(
+                455_200,
+                "CONTINUED seq=4 rule=land-nudge@v1 [aterm harness] Still landing:",
+            ),
+            j(460_000, "EVENT idle seq=5 Nothing left: the parser"),
+            j(
+                460_200,
+                "CONTINUED seq=5 rule=land-check@v1 [aterm harness] Land check: Reread",
+            ),
+            j(465_000, "EVENT idle seq=6 LANDED"),
+            j(
+                465_000,
+                "DONE seq=6 rule=land@v1 the worker answered the land check: LANDED",
+            ),
+        ],
+        ledger: vec![
+            typed(125_000, "land@v1", LAND),
+            point(130_000, 1),
+            typed(130_200, RULE_LAND_CHECK, LAND_CHECK),
+            typed(375_000, "land-nudge@v1", &quoting),
+            typed(455_200, "land-nudge@v1", LAND_NUDGE),
+            typed(460_200, RULE_LAND_CHECK, LAND_CHECK),
+            point(465_000, 2),
+            task_done(465_000),
+        ],
+        status: vec![
+            status(1_000, "open", "land"),
+            status(466_000, "landed", "land"),
+        ],
+        meta: vec![no_meta(1_000)],
+        task: vec![j(1_000, "OK task -")],
+        end_ms: T0 + 770_000,
+        stub: Some(StubSeen {
+            baseline: 5,
+            read: 2,
+            new_turns: 0,
+        }),
+        ..Seen::default()
+    }
+}
+
+/// land-contradicted on this tree (slice 4c): land@v1, the false defense over the untracked file,
+/// Land's contradiction after the back-off, the lab's landing of the file it named, the defense
+/// of the landed work, the check, `LANDED`, landed.
+fn contradicted_landed() -> Seen {
+    let mut s = receipted(Seen {
+        journal: vec![
+            j(
+                125_000,
+                "CONTINUED seq=1 rule=land@v1 [aterm harness] Autopilot is Land: land",
+            ),
+            j(130_000, "EVENT idle seq=2 Nothing left: the parser"),
+            j(
+                130_100,
+                "WAITING seq=2 until=x 2 short turn(s) in a row: 4 min back-off",
+            ),
+            j(
+                370_000,
+                "CONTINUED seq=2 rule=land-nudge@v1 [aterm harness] Still landing: your last \
+                 reply says Nothing left, but",
+            ),
+            j(
+                380_000,
+                "EVENT idle seq=3 Committed wip-notes.txt and pushed it to origin/main.",
+            ),
+            j(
+                380_200,
+                "CONTINUED seq=3 rule=land-check@v1 [aterm harness] Land check: Reread",
+            ),
+            j(385_000, "EVENT idle seq=4 LANDED"),
+            j(
+                385_000,
+                "DONE seq=4 rule=land@v1 the worker answered the land check: LANDED",
+            ),
+        ],
+        ledger: vec![
+            point(124_800, 1),
+            typed(125_000, "land@v1", LAND),
+            typed(370_000, "land-nudge@v1", &contradicted(Repo::Untracked)),
+            typed(380_200, RULE_LAND_CHECK, LAND_CHECK),
+            point(385_000, 3),
+            task_done(385_000),
+        ],
+        status: vec![
+            status(1_000, "open", "land"),
+            status(386_000, "landed", "land"),
+        ],
+        meta: vec![no_meta(1_000)],
+        task: vec![j(1_000, "OK task -")],
+        end_ms: T0 + 690_000,
+        stub: Some(StubSeen {
+            baseline: 4,
+            read: 2,
+            new_turns: 0,
+        }),
+        ..Seen::default()
+    });
+    s.landed_ms = Some(T0 + 372_000);
+    s
+}
+
+/// LAND-CONTRADICTED (LX, slice 4c) passes on Land's contradiction leading, the lab's landing of
+/// the file it named, the check and `LANDED`. It fails on main's nudge after the false defense
+/// (the repository's suffix after Land's own words: the run on origin/main's build is this
+/// control), on a contradiction that offers a way out, on a check typed before the file was
+/// landed, on no landing of the file, on a second nudge before the landing, and on a hold.
+#[test]
+fn land_contradicted_passes_only_on_the_contradiction_then_the_landing() {
+    let lx = |s: &Seen| one(Chain::LandContradicted, s, "claude", Scenario::LX);
+    let (w, why) = lx(&contradicted_landed());
+    assert_eq!(w, "PASS", "{why}");
+    assert!(
+        why.contains("leading with the contradiction") && why.contains("landed by the lab"),
+        "{why}"
+    );
+    let mut main = contradicted_landed();
+    main.ledger[2].command = format!("{LAND_NUDGE} {}", repo_suffix(Repo::Untracked));
+    let (w, why) = lx(&main);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("does not say"), "{why}");
+    for way_out in [
+        "Or ignore it.",
+        "Ignore it.",
+        "Move it out.",
+        "Say it is Not open.",
+    ] {
+        let mut escape = contradicted_landed();
+        escape.ledger[2].command = format!("{} {way_out}", contradicted(Repo::Untracked));
+        assert_eq!(lx(&escape).0, "FAIL", "{way_out}");
+    }
+    let mut early = contradicted_landed();
+    early.landed_ms = Some(T0 + 381_000);
+    let (w, why) = lx(&early);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(
+        why.contains("a land check typed over a repository holding work"),
+        "{why}"
+    );
+    let mut unlanded = contradicted_landed();
+    unlanded.landed_ms = None;
+    let (w, why) = lx(&unlanded);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("did not land wip-notes.txt"), "{why}");
+    let mut twice = contradicted_landed();
+    twice.journal.insert(
+        5,
+        j(
+            379_000,
+            "CONTINUED seq=3 rule=land-nudge@v1 [aterm harness] Still landing: your last reply \
+             says Nothing left, but",
+        ),
+    );
+    twice.ledger.insert(
+        3,
+        typed(379_000, "land-nudge@v1", &contradicted(Repo::Untracked)),
+    );
+    let (w, why) = lx(&twice);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("2 nudges typed before the landing"), "{why}");
+    let held = {
+        let mut s = nudged_held(&repo_suffix(Repo::Untracked));
+        s.ledger.insert(0, point(124_800, 1));
+        s
+    };
+    let (w, why) = lx(&held);
+    assert_eq!(w, "FAIL", "main's run holds: {why}");
+    assert!(
+        finished(&tab_of(Chain::LandContradicted, held.clone()), T0 + 433_600)
+            && !finished(&tab_of(Chain::LandContradicted, held), T0 + 433_599),
+        "a hold is watched a minute past"
+    );
+}
+
+#[test]
+fn land_listed_passes_only_on_a_second_check_after_the_work() {
+    let ll = |s: &Seen| one(Chain::LandListed, s, "muse", Scenario::LL);
+    let (w, why) = ll(&relisted());
+    assert_eq!(w, "PASS", "{why}");
+    let mut unworked = relisted();
+    unworked.journal[6].1 = "EVENT idle seq=4 Nothing left: the parser".into();
+    let (w, why) = ll(&unworked);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("no work read before it"), "{why}");
+    let mut unquoted = relisted();
+    unquoted.ledger[3].command = format!("{LAND_NUDGE} {}", open_suffix());
+    assert_eq!(ll(&unquoted).0, "FAIL");
+    let mut on_the_list = relisted();
+    on_the_list
+        .journal
+        .insert(4, j(135_000, "DONE seq=3 rule=land@v1 x"));
+    assert_eq!(ll(&on_the_list).0, "FAIL");
+    let mut waiting = relisted();
+    waiting.journal.truncate(9);
+    waiting.ledger.truncate(5);
+    waiting.end_ms = T0 + 470_000;
+    assert_eq!(ll(&waiting).0, "UNOBSERVED");
+}
+
+/// land-reworded on this tree: its defense's check answered with the list, the nudge quoting
+/// it, the work, the second check answered with the list reworded, the nudge quoting the new
+/// words, then its defense again.
+fn reworded() -> Seen {
+    let quoting = |list: &str| format!("{LAND_NUDGE} {}", listed_suffix(list).expect("a list"));
+    Seen {
+        journal: vec![
+            j(
+                125_000,
+                "CONTINUED seq=1 rule=land@v1 [aterm harness] Autopilot is Land: land",
+            ),
+            j(130_000, "EVENT idle seq=2 Nothing left: the parser"),
+            j(
+                130_200,
+                "CONTINUED seq=2 rule=land-check@v1 [aterm harness] Land check: Reread",
+            ),
+            j(135_000, "EVENT idle seq=3 The docs PR is still open."),
+            j(
+                135_100,
+                "WAITING seq=3 until=x 3 short turn(s) in a row: 4 min back-off",
+            ),
+            j(
+                375_000,
+                "CONTINUED seq=3 rule=land-nudge@v1 [aterm harness] Still landing:",
+            ),
+            j(
+                455_000,
+                "EVENT idle seq=4 Rebased the docs branch onto main in this turn.",
+            ),
+            j(
+                455_200,
+                "CONTINUED seq=4 rule=land-nudge@v1 [aterm harness] Still landing:",
+            ),
+            j(460_000, "EVENT idle seq=5 Nothing left: the parser"),
+            j(
+                460_200,
+                "CONTINUED seq=5 rule=land-check@v1 [aterm harness] Land check: Reread",
+            ),
+            j(
+                465_000,
+                "EVENT idle seq=6 The pull request for the docs is still open.",
+            ),
+            j(
+                465_200,
+                "CONTINUED seq=6 rule=land-nudge@v1 [aterm harness] Still landing:",
+            ),
+            j(470_000, "EVENT idle seq=7 Nothing left: the parser"),
+        ],
+        ledger: vec![
+            typed(125_000, "land@v1", LAND),
+            point(130_000, 1),
+            typed(130_200, RULE_LAND_CHECK, LAND_CHECK),
+            typed(375_000, "land-nudge@v1", &quoting(CHECK_LIST)),
+            typed(455_200, "land-nudge@v1", LAND_NUDGE),
+            typed(460_200, RULE_LAND_CHECK, LAND_CHECK),
+            typed(465_200, "land-nudge@v1", &quoting(REWORDED_LIST)),
+        ],
+        status: vec![status(1_000, "open", "land")],
+        meta: vec![no_meta(1_000)],
+        task: vec![j(1_000, "OK task -")],
+        end_ms: T0 + 770_000,
+        stub: Some(StubSeen {
+            baseline: 5,
+            read: 2,
+            new_turns: 0,
+        }),
+        ..Seen::default()
+    }
+}
+
+/// LR's records: the list quoted, the work, a second check after it answered with the list
+/// reworded, and the nudge after it, where one was typed, quoting the new words.
+/// Negative controls: the old words quoted after the second check fail, as do a nudge after it
+/// quoting no list, a second check with no work before it and a landing; records that stop before
+/// the second check's answer go unjudged.
+#[test]
+fn land_reworded_passes_only_on_the_new_words_quoted_after_the_second_check() {
+    let lr = |s: &Seen| one(Chain::LandReworded, s, "claude", Scenario::LR);
+    let (w, why) = lr(&reworded());
+    assert_eq!(w, "PASS", "{why}");
+    let mut stale = reworded();
+    stale.ledger[6].command = format!(
+        "{LAND_NUDGE} {}",
+        listed_suffix(CHECK_LIST).expect("a list")
+    );
+    let (w, why) = lr(&stale);
+    assert_eq!(w, "FAIL", "{why}");
+    let mut unworked = reworded();
+    unworked.journal[6].1 = "EVENT idle seq=4 Nothing left: the parser".into();
+    let (w, why) = lr(&unworked);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("no work read before it"), "{why}");
+    let mut landed = reworded();
+    landed.journal.push(j(474_000, "DONE seq=7 rule=land@v1 x"));
+    assert_eq!(lr(&landed).0, "FAIL");
+    let mut plain = reworded();
+    plain.ledger[6].command = LAND_NUDGE.to_string();
+    let (w, why) = lr(&plain);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("quotes no new words"), "{why}");
+    let mut backing_off = reworded();
+    backing_off.journal.truncate(11);
+    backing_off.ledger.truncate(6);
+    backing_off.end_ms = T0 + 525_000;
+    let (w, why) = lr(&backing_off);
+    assert_eq!(w, "PASS", "{why}");
+    let mut waiting = reworded();
+    waiting.journal.truncate(9);
+    waiting.ledger.truncate(5);
+    waiting.end_ms = T0 + 470_000;
+    assert_eq!(lr(&waiting).0, "UNOBSERVED", "{:?}", lr(&waiting));
 }
 
 const REPO_CHAINS: [(Chain, &str); 5] = [
@@ -1513,19 +2449,63 @@ const REPO_CHAINS: [(Chain, &str); 5] = [
 
 #[test]
 fn land_b_and_the_repository_chains_pass_on_a_nudge_naming_what_is_left() {
-    assert_eq!(
-        verdicts(Chain::LandB, &nudged(&open_suffix()), "claude"),
-        [("L2", "PASS")]
+    let (w, why) = one(
+        Chain::LandB,
+        &checked_b(nudged(&listed())),
+        "claude",
+        Scenario::L2,
     );
+    assert_eq!(w, "PASS", "{why}");
+    let (w, why) = one(Chain::LandB, &nudged(&listed()), "claude", Scenario::L2);
+    assert_eq!(w, "FAIL", "main's nudge at the defense, no check: {why}");
+    assert!(why.contains("with no land check before it"), "{why}");
+    assert_eq!(
+        verdicts(Chain::LandB, &checked_b(nudged(&open_suffix())), "claude"),
+        [("L2", "FAIL")],
+        "the reader's words in place of the list"
+    );
+    let mut plain = checked_b(nudged(&listed()));
+    plain.ledger[1].command = LAND_CHECK.to_string();
+    assert_eq!(verdicts(Chain::LandB, &plain, "claude"), [("L2", "FAIL")]);
+    let mut twice = checked_b(nudged(&listed()));
+    twice.journal.insert(
+        7,
+        j(
+            373_550,
+            "CONTINUED seq=3 rule=land-check@v1 [aterm harness] Land check: Reread",
+        ),
+    );
+    let (w, why) = one(Chain::LandB, &twice, "claude", Scenario::L2);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("2 land checks typed"), "{why}");
     for (c, id) in REPO_CHAINS {
+        let (w, why) = one(
+            c,
+            &nudged(&contradicted(c.repo())),
+            "claude",
+            c.scenarios()[0],
+        );
+        assert_eq!((id, w), (id, "PASS"), "{c:?}: {why}");
+        assert!(!why.contains("L5's judge"), "{why}");
+        // Main's nudge after the false defense, the repository's suffix after Land's own words
+        // (the old suffix order, before slice 4c), names the work but leads with no contradiction.
         let (w, why) = one(
             c,
             &nudged(&repo_suffix(c.repo())),
             "claude",
             c.scenarios()[0],
         );
-        assert_eq!((id, w), (id, "PASS"), "{c:?}: {why}");
-        assert!(!why.contains("L5's judge"), "{why}");
+        assert_eq!(w, "FAIL", "{c:?}: main's nudge: {why}");
+        assert!(why.contains("does not say"), "{why}");
+        // The contradiction's fact after Land's own nudge words, its head dropped: every word
+        // the contradiction says, none of it leading.
+        let contra = contradicted(c.repo());
+        let trailing = contra
+            .strip_prefix(LAND_CONTRADICTED_HEAD)
+            .unwrap_or_default()
+            .trim_start();
+        let (w, why) = one(c, &nudged(trailing), "claude", c.scenarios()[0]);
+        assert_eq!(w, "FAIL", "{c:?}: the fact trailing Land's words: {why}");
         for other in [
             Repo::Untracked,
             Repo::Changed,
@@ -1534,7 +2514,7 @@ fn land_b_and_the_repository_chains_pass_on_a_nudge_naming_what_is_left() {
             Repo::Unlanded,
         ] {
             if other != c.repo() {
-                let (w, why) = one(c, &nudged(&repo_suffix(other)), "claude", c.scenarios()[0]);
+                let (w, why) = one(c, &nudged(&contradicted(other)), "claude", c.scenarios()[0]);
                 assert_eq!(w, "FAIL", "{c:?} named {other:?}: {why}");
             }
         }
@@ -1543,110 +2523,255 @@ fn land_b_and_the_repository_chains_pass_on_a_nudge_naming_what_is_left() {
             verdicts(c, &nudged(&open_suffix()), "claude"),
             [(id, "FAIL")]
         );
+        for escape in ESCAPES {
+            let (w, why) = one(
+                c,
+                &nudged(&format!("{} Or {escape} the rest.", contradicted(c.repo()))),
+                "claude",
+                c.scenarios()[0],
+            );
+            assert_eq!(w, "FAIL", "{c:?}: a way out ({escape}): {why}");
+        }
+        let (w, why) = one(
+            c,
+            &checked_b(nudged(&contradicted(c.repo()))),
+            "claude",
+            c.scenarios()[0],
+        );
+        assert_eq!(
+            w, "FAIL",
+            "{c:?}: a check over the repository's work: {why}"
+        );
+        assert!(
+            why.contains("a land check typed over a repository holding work"),
+            "{why}"
+        );
     }
+}
+
+/// A NO-REMOTE OR PLAIN-FOLDER LANDING COMES THROUGH THE CHECK (slices 9c and 13a): the
+/// repository check reads land-n's committed repository with no remote and land-o's plain folder
+/// clean (`RepoWork::is_clean`), so Land types the land check before landing there, as it does
+/// over a clean repository; a chain over work (land-c's untracked file) still types none.
+/// NEGATIVE CONTROL (run by hand): reading `Repo::Clean` alone as clean fails land-n's and
+/// land-o's checked landings as a land check typed over a repository holding work, as the first
+/// agy lab on the merge with 13a did.
+#[test]
+fn a_no_remote_or_plain_landing_comes_through_the_check() {
+    let landing = |checked: bool| {
+        let mut s = Seen::default();
+        if checked {
+            s.journal.push((
+                T0 + 1_000,
+                format!(
+                    "CONTINUED seq=3 rule={} {}",
+                    turn_end::RULE_LAND_CHECK,
+                    turn_end::LAND_CHECK_HEAD
+                ),
+            ));
+        }
+        s.journal.push((
+            T0 + 2_000,
+            format!(
+                "DONE seq=4 rule={} Nothing left: committed.",
+                turn_end::RULE_LAND
+            ),
+        ));
+        s
+    };
+    let pass = || Verdict::Pass("landed".into());
+    for chain in [Chain::LandN, Chain::LandO, Chain::LandA] {
+        let v = through_check(chain, &landing(true), T0, pass());
+        assert!(matches!(v, Verdict::Pass(_)), "{chain:?}: {v:?}");
+        let v = through_check(chain, &landing(false), T0, pass());
+        assert!(
+            matches!(&v, Verdict::Fail(why) if why.contains("with no land check typed before it")),
+            "{chain:?}: {v:?}"
+        );
+    }
+    let v = through_check(Chain::LandC, &landing(true), T0, pass());
+    assert!(
+        matches!(&v, Verdict::Fail(why) if why.contains("a land check typed over a repository holding work")),
+        "{v:?}"
+    );
 }
 
 #[test]
 fn the_nudge_chains_fail_a_stray_suffix_a_need_or_an_unread_yield() {
     let open = open_suffix();
+    let list = listed();
     let repo = repo_suffix(Repo::Untracked);
+    let contra = contradicted(Repo::Untracked);
+    let b = |suffix: &str| checked_b(nudged(suffix));
     assert_eq!(
-        verdicts(Chain::LandB, &nudged(&repo), "claude"),
+        verdicts(Chain::LandB, &b(&repo), "claude"),
         [("L2", "FAIL")]
     );
     assert_eq!(
-        verdicts(Chain::LandB, &nudged(&format!("{open} {repo}")), "claude"),
+        verdicts(Chain::LandB, &b(&format!("{list} {repo}")), "claude"),
         [("L2", "FAIL")]
     );
     assert_eq!(
-        verdicts(Chain::LandC, &nudged(&format!("{repo} {open}")), "claude"),
+        verdicts(Chain::LandB, &b(&contra), "claude"),
+        [("L2", "FAIL")]
+    );
+    assert_eq!(
+        verdicts(Chain::LandC, &nudged(&format!("{contra} {open}")), "claude"),
         [("L4", "FAIL")]
     );
     assert_eq!(
-        verdicts(
-            Chain::LandB,
-            &nudged(&format!("{open} {NEEDS_ACK}")),
-            "claude"
-        ),
+        verdicts(Chain::LandC, &nudged(&format!("{contra} {repo}")), "claude"),
+        [("L4", "FAIL")]
+    );
+    assert_eq!(
+        verdicts(Chain::LandB, &b(&format!("{list} {NEEDS_ACK}")), "claude"),
         [("L2", "FAIL")]
     );
-    let mut s = nudged(&open);
+    let mut s = b(&list);
     s.journal.insert(
-        2,
+        4,
         j(
             130_000,
             "NEEDS seq=2 count=1 attention=OK rotate the deploy key",
         ),
     );
     assert_eq!(verdicts(Chain::LandB, &s, "claude"), [("L2", "FAIL")]);
-    let mut s = nudged(&repo);
+    assert_eq!(
+        verdicts(Chain::LandC, &nudged(&contra), "claude"),
+        [("L4", "PASS")]
+    );
+    let mut s = nudged(&contra);
     s.meta.push(needs_meta(131_000, "claude"));
     assert_eq!(verdicts(Chain::LandC, &s, "claude"), [("L4", "FAIL")]);
-    let mut s = nudged(&repo);
+    let mut s = nudged(&contra);
     s.status
         .push(status_of(131_000, "open", "ask", "land", "aterm-harness@1"));
     assert_eq!(verdicts(Chain::LandC, &s, "claude"), [("L4", "FAIL")]);
-    let mut s = nudged(&open);
+    let mut s = b(&list);
     s.journal.push(j(374_000, "DONE seq=3 rule=land@v1 x"));
     assert_eq!(verdicts(Chain::LandB, &s, "claude"), [("L2", "FAIL")]);
-    let mut s = nudged(&repo);
+    let mut s = nudged(&contra);
     s.status.push(status(374_000, "landed", "land"));
     assert_eq!(verdicts(Chain::LandC, &s, "claude"), [("L4", "FAIL")]);
-    let mut s = nudged(&repo);
+    let mut s = nudged(&contra);
     s.journal.truncate(4);
     assert_eq!(verdicts(Chain::LandC, &s, "claude"), [("L4", "UNOBSERVED")]);
-    let mut s = nudged(&repo);
+    let mut s = nudged(&contra);
     s.journal.pop();
     assert_eq!(verdicts(Chain::LandC, &s, "claude"), [("L4", "FAIL")]);
-    let mut s = nudged(&open);
-    s.journal.truncate(3);
+    let mut s = b(&list);
+    s.journal.truncate(5);
     s.ledger.pop();
     assert_eq!(verdicts(Chain::LandB, &s, "claude"), [("L2", "UNOBSERVED")]);
 }
 
+/// land-d on this tree: the tall reply's need raised, the plain check typed at its point, its
+/// answer the need alone, and Land resting on it.
 fn tall() -> Seen {
-    let mut s = nudged(NEEDS_ACK);
-    s.journal.insert(
-        1,
-        j(
-            130_000,
-            "NEEDS seq=2 count=1 attention=OK rotate the deploy key",
-        ),
-    );
-    s.meta = vec![no_meta(1_000), needs_meta(131_000, "muse")];
-    s
+    Seen {
+        journal: vec![
+            j(
+                125_000,
+                "CONTINUED seq=1 rule=land@v1 [aterm harness] Autopilot is Land:",
+            ),
+            j(
+                130_000,
+                "NEEDS seq=2 count=1 attention=OK rotate the deploy key",
+            ),
+            j(130_000, "EVENT idle seq=2 Nothing left: the parser"),
+            j(
+                130_200,
+                "CONTINUED seq=2 rule=land-check@v1 [aterm harness] Land check: Reread",
+            ),
+            j(135_000, "EVENT idle seq=3 NEEDS YOU: rotate the deploy key"),
+            j(
+                135_100,
+                &format!("WAITING seq=3 rule={RULE_LAND_CHECK} {WAITS_ON_YOU}: {NEED}"),
+            ),
+        ],
+        ledger: vec![
+            point(124_800, 1),
+            typed(125_000, "land@v1", LAND),
+            typed(130_200, RULE_LAND_CHECK, &acked_check()),
+        ],
+        status: vec![
+            status(1_000, "open", "land"),
+            j(
+                136_000,
+                "task=open needs=ask autopilot=land supervisor=aterm-harness@1 agent=- land_held=needs",
+            ),
+        ],
+        meta: vec![no_meta(1_000), needs_meta(131_000, "muse")],
+        end_ms: T0 + 330_000,
+        ..Seen::default()
+    }
 }
 
 #[test]
-fn land_d_passes_unlanded_with_the_need_raised_and_carried_on() {
-    assert_eq!(verdicts(Chain::LandD, &tall(), "muse"), [("L6", "PASS")]);
+fn land_d_passes_unlanded_resting_on_its_checks_need() {
+    let (w, why) = one(Chain::LandD, &tall(), "muse", Scenario::L6);
+    assert_eq!(w, "PASS", "{why}");
     let mut landed = tall();
-    landed.journal.push(j(131_000, "DONE seq=2 rule=land@v1 x"));
+    landed.journal.push(j(136_000, "DONE seq=3 rule=land@v1 x"));
     landed.journal.sort();
     assert_eq!(verdicts(Chain::LandD, &landed, "muse"), [("L6", "FAIL")]);
     let mut unraised = tall();
     unraised.journal.remove(1);
     unraised.meta.truncate(1);
     assert_eq!(verdicts(Chain::LandD, &unraised, "muse"), [("L6", "FAIL")]);
-    let mut blocked = tall();
-    blocked.journal.retain(|(_, l)| !l.contains("land-nudge"));
-    blocked.ledger.pop();
-    blocked.end_ms = T0 + 960_000;
-    let (w, why) = one(Chain::LandD, &blocked, "muse", Scenario::L6);
+    let mut nudged_in_it = tall();
+    nudged_in_it.journal.push(j(
+        300_000,
+        "CONTINUED seq=3 rule=land-nudge@v1 [aterm harness] Still landing:",
+    ));
+    let (w, why) = one(Chain::LandD, &nudged_in_it, "muse", Scenario::L6);
     assert_eq!(w, "FAIL", "{why}");
-    assert!(why.contains("PERSISTENCE LOST"), "{why}");
-    blocked.end_ms = T0 + 420_000;
+    assert!(why.contains("TYPED into the rest"), "{why}");
+    let mut unsaid = tall();
+    unsaid.journal.pop();
+    unsaid.end_ms = T0 + 200_000;
     assert_eq!(
-        verdicts(Chain::LandD, &blocked, "muse"),
+        verdicts(Chain::LandD, &unsaid, "muse"),
         [("L6", "UNOBSERVED")]
     );
-    let mut silent = tall();
-    silent.ledger[2].command = LAND_NUDGE.to_string();
-    assert_eq!(verdicts(Chain::LandD, &silent, "muse"), [("L6", "FAIL")]);
+    unsaid.end_ms = T0 + 500_000;
+    let (w, why) = one(Chain::LandD, &unsaid, "muse", Scenario::L6);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("PERSISTENCE LOST"), "{why}");
+    let mut short = tall();
+    short.end_ms = T0 + 200_000;
+    assert_eq!(
+        verdicts(Chain::LandD, &short, "muse"),
+        [("L6", "UNOBSERVED")]
+    );
+    let mut hinted = tall();
+    hinted.ledger[2].command = hinted_check();
+    assert_eq!(verdicts(Chain::LandD, &hinted, "muse"), [("L6", "FAIL")]);
+    // The status said the need before the rest was journaled, and it stood: a pass. A need the
+    // status said and dropped before the rest is not held.
+    let mut early = tall();
+    early.status[1].0 = T0 + 135_000;
+    let (w, why) = one(Chain::LandD, &early, "muse", Scenario::L6);
+    assert_eq!(w, "PASS", "{why}");
+    let mut dropped = early.clone();
+    dropped.status.push(status(135_050, "open", "land"));
+    let (w, why) = one(Chain::LandD, &dropped, "muse", Scenario::L6);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("never read land_held=needs"), "{why}");
+    let mut unheld = tall();
+    unheld.status.pop();
+    assert_eq!(verdicts(Chain::LandD, &unheld, "muse"), [("L6", "FAIL")]);
+    let mut main = tall();
+    main.journal.truncate(3);
+    main.ledger.truncate(1);
+    main.end_ms = T0 + 960_000;
+    assert_eq!(verdicts(Chain::LandD, &main, "muse"), [("L6", "FAIL")]);
+    assert!(finished(&tab_of(Chain::LandD, tall()), T0 + 330_000));
+    assert!(!finished(&tab_of(Chain::LandD, tall()), T0 + 300_000));
 }
 
 fn tasked() -> Seen {
-    Seen {
+    receipted(Seen {
         journal: vec![
             j(5_000, "EVENT idle seq=1 Implemented the parser"),
             j(
@@ -1688,7 +2813,7 @@ fn tasked() -> Seen {
             new_turns: 0,
         }),
         ..Seen::default()
-    }
+    })
 }
 
 #[test]
@@ -1916,7 +3041,7 @@ fn off_passes_only_with_no_supervisor_and_quiet_past_a_four_minute_step() {
 }
 
 fn instant_landed() -> Seen {
-    Seen {
+    receipted(Seen {
         journal: vec![
             j(900, "EVENT idle seq=1 Implemented the parser"),
             j(
@@ -1955,7 +3080,9 @@ fn instant_landed() -> Seen {
         band_reads: Vec::new(),
         stop_person_ms: None,
         stop_person_sent_ms: None,
-    }
+        head: None,
+        landed_ms: None,
+    })
 }
 
 #[test]
@@ -2014,7 +3141,7 @@ fn p4_land_passes_only_where_every_instant_reply_is_judged_once() {
     );
     let (w, why) = p4l(&doubled);
     assert_eq!(w, "FAIL", "{why}");
-    assert!(why.contains("2 acts before the landing"), "{why}");
+    assert!(why.contains("3 acts before the landing"), "{why}");
     let mut after = instant_landed();
     after.journal.push(j(
         250_000,
@@ -2366,7 +3493,7 @@ fn the_window_witness_counts_inside_its_window() {
 }
 
 fn answered() -> Seen {
-    Seen {
+    receipted(Seen {
         journal: vec![
             j(5_000, "EVENT idle seq=1 Implemented the parser"),
             j(
@@ -2416,7 +3543,7 @@ fn answered() -> Seen {
             new_turns: 0,
         }),
         ..Seen::default()
-    }
+    })
 }
 
 #[test]
@@ -2507,7 +3634,7 @@ fn land_q_passes_on_lands_answer_and_the_landing_at_its_yield() {
 }
 
 fn left_to_them() -> Seen {
-    Seen {
+    receipted(Seen {
         journal: vec![
             j(
                 14_000,
@@ -2557,7 +3684,7 @@ fn left_to_them() -> Seen {
             ..Cover::default()
         },
         ..Seen::default()
-    }
+    })
 }
 
 #[test]
@@ -2658,6 +3785,96 @@ fn land_p_passes_only_on_a_persons_exchange_left_to_them() {
     }
 }
 
+fn immediate_first_land() -> Seen {
+    let mut s = left_to_them();
+    s.journal.remove(3);
+    s.journal[3].0 = T0 + 314_500;
+    s.ledger[2].box_seq = Some(2);
+    s.ledger[3].box_seq = Some(2);
+    s.ledger[3].ts = T0 + 314_500;
+    s
+}
+
+/// The first Land instruction is immediate at its judged point. It needs both the point's
+/// ledger row and the reply's event under the act's sequence, rather than an invented back-off.
+#[test]
+fn land_p_accepts_an_immediate_first_land_only_at_its_recorded_point() {
+    let l13 = |s: &Seen| one(Chain::LandP, s, "claude", Scenario::L13);
+    let immediate = immediate_first_land;
+    let (word, why) = l13(&immediate());
+    assert_eq!(word, "PASS", "{why}");
+    let mut missing = immediate();
+    missing.ledger.remove(2);
+    assert_eq!(l13(&missing).0, "FAIL");
+    let mut missing = immediate();
+    missing.journal.remove(2);
+    assert_eq!(l13(&missing).0, "FAIL");
+    let mut stale = immediate();
+    stale.ledger[2].box_seq = Some(1);
+    assert_eq!(l13(&stale).0, "FAIL");
+    let mut stale = immediate();
+    stale.ledger[3].box_seq = Some(1);
+    assert_eq!(l13(&stale).0, "FAIL");
+    let mut stale = immediate();
+    stale.journal[3].1 = "CONTINUED seq=9 rule=land@v1 [aterm harness] Autopilot is Land:".into();
+    assert_eq!(l13(&stale).0, "FAIL");
+    let mut later = immediate();
+    later.journal[3].1 = "CONTINUED seq=2 rule=land-nudge@v1 [aterm harness] Still landing:".into();
+    later.ledger[3].rule = "land-nudge@v1".into();
+    assert_eq!(l13(&later).0, "FAIL");
+    let mut waited = immediate();
+    waited.journal.insert(
+        3,
+        j(
+            314_100,
+            "WAITING seq=2 until=x 1 short turn(s) in a row: 2 min back-off",
+        ),
+    );
+    assert_eq!(
+        l13(&waited).0,
+        "FAIL",
+        "a real back-off still binds its act"
+    );
+}
+
+/// Journal and ledger writers each read the clock for their own row. Equal stamps are an
+/// ordinary positive; either one-millisecond ordering must retain the same recorded act.
+#[test]
+fn land_p_joins_independently_stamped_records_of_the_same_act() {
+    let l13 = |s: &Seen| one(Chain::LandP, s, "claude", Scenario::L13);
+    let (word, why) = l13(&immediate_first_land());
+    assert_eq!(word, "PASS", "the equal-stamp premise: {why}");
+    let mut refused = Vec::new();
+    for offset in [-1, 1] {
+        let mut seen = immediate_first_land();
+        seen.ledger[3].ts += offset;
+        let (word, why) = l13(&seen);
+        if word != "PASS" {
+            refused.push((offset, word, why));
+        }
+    }
+    assert!(
+        refused.is_empty(),
+        "independently stamped records were refused: {refused:?}"
+    );
+}
+
+/// Same-millisecond journal writes still preserve whether the reply preceded its act.
+#[test]
+fn land_p_uses_journal_order_when_the_point_and_act_share_a_stamp() {
+    let l13 = |s: &Seen| one(Chain::LandP, s, "claude", Scenario::L13);
+    let mut seen = immediate_first_land();
+    seen.journal[2].0 = seen.journal[3].0;
+    let (word, why) = l13(&seen);
+    assert_eq!(word, "PASS", "the point was appended before the act: {why}");
+    seen.journal.swap(2, 3);
+    assert_eq!(
+        l13(&seen).0,
+        "FAIL",
+        "a reply appended only after the act is not its judged point"
+    );
+}
+
 #[test]
 fn forever_window_under_the_restore_seam_is_a_usage_error_not_could_not_run() {
     let restored = crate::lab::UpOpts {
@@ -2712,81 +3929,84 @@ fn the_ladder_and_angles_modes_alone_run_the_ladder_at_an_eighth_and_the_outages
 }
 
 #[test]
-fn land_p_typed_through_hwkey_passes_only_where_the_keys_account_for_the_stamp() {
-    let l13 = |s: &Seen| one(Chain::LandP, s, "claude", Scenario::L13);
-    let posted = u64::try_from(Chain::LandP.prompt().chars().count() + 1).unwrap();
-    let keyed = |before: u64, after: Option<u64>, posted: u64| {
-        let mut s = left_to_them();
-        s.cover.keyed = Some(Keyed {
-            posted,
-            key_window: 0,
-            seq_before: before,
-            seq_after: after,
-        });
-        s
+fn a_native_key_ack_requires_one_posted_key_in_the_active_window() {
+    let reply = |code, stdout: &str| Reply {
+        code,
+        stdout: stdout.to_string(),
+        ..Reply::default()
     };
-    let (w, why) = l13(&keyed(0, Some(posted), posted));
-    assert_eq!(w, "PASS", "{why}");
-    assert!(
-        why.contains(&format!(
-            "typed through hwkey: {posted} key(s) posted to the window's event queue (0 to the key window of the active app), status human_seq= 0 -> {posted}"
-        )),
-        "{why}"
-    );
-    assert!(why.contains("land@v1 typed at +434.0 s"), "{why}");
-    let (w, why) = l13(&left_to_them());
-    assert_eq!(w, "PASS", "{why}");
-    assert!(
-        why.starts_with("typed through the `as=person` seam;"),
-        "{why}"
-    );
-    let mut s = keyed(3, Some(3 + posted), posted);
-    s.journal.insert(
-        2,
-        j(
-            134_000,
-            "CONTINUED seq=1 rule=land@v1 [aterm harness] Autopilot is Land:",
-        ),
-    );
-    assert_eq!(l13(&s).0, "FAIL");
-    for (before, after, n, said) in [
-        (
-            0,
-            Some(posted - 1),
-            posted,
-            "not every key the real key path took",
-        ),
-        (
-            0,
-            Some(posted + 1),
-            posted,
-            "another hand reached the session",
-        ),
-        (0, None, posted, "was not read after the Enter"),
-        (9, Some(4), posted, "the person's count went back"),
-        (0, Some(0), 0, "no key was posted"),
+    assert!(active_key_posted(&reply(0, "OK posted=1 key=1\n")));
+    for (code, stdout) in [
+        (1, "OK posted=1 key=1"),
+        (0, "OK posted=0 key=1"),
+        (0, "OK posted=2 key=1"),
+        (0, "OK posted=? key=1"),
+        (0, "OK posted=1 key=0"),
+        (0, "OK posted=1 key=?"),
+        (0, "OK posted=1"),
+        (0, "OK key=1"),
+        (0, "OK posted=1 key=1 key=0"),
     ] {
-        let mut s = keyed(before, after, n);
-        s.journal.insert(
-            2,
-            j(
-                134_000,
-                "CONTINUED seq=1 rule=land@v1 [aterm harness] Autopilot is Land:",
-            ),
-        );
-        let (w, why) = l13(&s);
-        assert_eq!(w, "UNOBSERVED", "{said}: {why}");
-        assert!(why.contains(said), "{why}");
         assert!(
-            why.contains("whose hand the prompt was is not known"),
-            "{why}"
+            !active_key_posted(&reply(code, stdout)),
+            "code={code}, {stdout}"
         );
     }
-    let mut s = keyed(0, Some(0), posted);
-    s.cover.person_stamp = Some("-".into());
-    let (w, why) = l13(&s);
-    assert_eq!(w, "UNOBSERVED", "{why}");
-    assert!(why.contains("(hwkey's keys did not stamp it)"), "{why}");
+}
+
+fn delivered_controller_keys() -> Keyed {
+    let posted = u64::try_from(Chain::LandP.prompt().chars().count() + 1).unwrap();
+    Keyed {
+        posted,
+        key_window: posted,
+        draft_stood: true,
+        draft_taken: true,
+        seq_before: 3,
+        seq_after: Some(3),
+    }
+}
+
+#[test]
+fn native_controller_delivery_needs_composer_effects_and_unchanged_person_count() {
+    let proved = delivered_controller_keys();
+    assert_eq!(cover::keys_unaccounted(&proved), None);
+    let mut controls = Vec::new();
+    let mut no_posts = proved.clone();
+    no_posts.posted = 0;
+    no_posts.key_window = 0;
+    controls.push(no_posts);
+    let mut inactive = proved.clone();
+    inactive.key_window -= 1;
+    controls.push(inactive);
+    let mut no_draft = proved.clone();
+    no_draft.draft_stood = false;
+    controls.push(no_draft);
+    let mut no_submission = proved.clone();
+    no_submission.draft_taken = false;
+    controls.push(no_submission);
+    for after in [None, Some(2), Some(4), Some(3 + proved.posted)] {
+        let mut changed = proved.clone();
+        changed.seq_after = after;
+        controls.push(changed);
+    }
+    for control in controls {
+        assert!(cover::keys_unaccounted(&control).is_some(), "{control:?}");
+    }
+}
+
+#[test]
+fn land_p_does_not_claim_person_takeover_from_controller_delivery() {
+    let l13 = |s: &Seen| one(Chain::LandP, s, "claude", Scenario::L13);
+    assert_eq!(l13(&left_to_them()).0, "PASS");
+    let mut controller = left_to_them();
+    controller.cover.keyed = Some(delivered_controller_keys());
+    for stamp in ["-", "1200"] {
+        controller.cover.person_stamp = Some(stamp.to_string());
+        let (word, why) = l13(&controller);
+        assert_eq!(word, "UNOBSERVED", "{why}");
+    }
+    controller.cover.keyed.as_mut().unwrap().seq_after = Some(100);
+    assert_eq!(l13(&controller).0, "UNOBSERVED");
 }
 
 #[test]
@@ -2837,7 +4057,7 @@ fn land_w_passes_only_where_the_wrote_replies_are_read() {
     s.status.remove(1);
     assert_eq!(l14(&s).0, "FAIL");
     let mut s = pass.clone();
-    s.journal.pop();
+    s.journal.retain(|(_, l)| !l.starts_with("DONE "));
     assert_eq!(l14(&s).0, "FAIL");
     let mut s = pass;
     s.end_ms = T0 + 470_000;
@@ -2956,11 +4176,19 @@ fn spawned_on(program: &str) -> Seen {
         awaited: Some((
             T0 + 9_500,
             0,
-            "OK 1\n@s-w1 rev=2 state=done agent=idle attention=- result_bytes=120\n".into(),
+            format!(
+                "OK 1\n@s-w1 rev=2 state=done agent=idle attention=- result_bytes=120 \
+                 checked={}@origin/main\n",
+                &RECEIPT_HEAD[..12]
+            ),
         )),
         result: Some(format!("{WORK}\n\n{CLEAN}\n")),
         agent: Some(program.into()),
-        result_head: Some(result_head(program)),
+        result_head: Some(format!(
+            "{} checked={}@origin/main",
+            result_head(program),
+            &RECEIPT_HEAD[..12]
+        )),
         worker: Some(program.into()),
         ..Cover::default()
     };
@@ -3293,7 +4521,7 @@ fn the_orchestrator_turns_come_once_at_their_time_and_cap_is_watched_to_its_verd
 const WALL_END: &str = "wall-wait-end@v1";
 
 fn walled() -> Seen {
-    Seen {
+    receipted(Seen {
         journal: vec![
             j(5_000, "EVENT idle seq=1 Implemented the parser"),
             j(
@@ -3362,7 +4590,7 @@ fn walled() -> Seen {
             ..Cover::default()
         },
         ..Seen::default()
-    }
+    })
 }
 
 #[test]
@@ -3528,47 +4756,37 @@ fn wall_passes_on_nothing_typed_into_it_gone_on_past_it_and_landed() {
 
 #[test]
 fn an_act_before_the_due_its_back_off_named_fails_every_scenario_of_its_chain() {
-    // The nudge after the second point's 4-minute back-off (due +370.0 s), moved: Land's
-    // instruction waits no back-off.
-    let moved = |t: i64| {
+    // Land's instruction and its land check wait no back-off (v6 §14.10, §14.17 item 5), and
+    // `landed_a` names none. The check typed under a back-off its point named is an act before
+    // that due, a fault of every scenario of the chain.
+    let backed = |waiting: &str| {
         let mut s = landed_a();
-        s.journal[5].0 = T0 + t;
-        s.ledger[3].ts = T0 + t;
+        s.journal.insert(4, j(130_100, waiting));
         s
     };
-    assert_eq!(
-        verdicts(Chain::LandA, &moved(368_100), "agy"),
-        [("L1", "PASS"), ("L3", "PASS"), ("L5", "PASS")]
-    );
-    let early = moved(367_900);
+    let early = backed("WAITING seq=2 until=x 2 short turn(s) in a row: 4 min back-off");
     assert_eq!(
         verdicts(Chain::LandA, &early, "agy"),
         [("L1", "FAIL"), ("L3", "FAIL"), ("L5", "FAIL")]
     );
     let (_, why) = one(Chain::LandA, &early, "agy", Scenario::L1);
     assert!(
-        why.contains("+367.9 s land-nudge@v1 typed 2.1 s BEFORE the due"),
+        why.contains("+130.2 s land-check@v1 typed") && why.contains("BEFORE the due"),
         "{why}"
     );
     assert!(why.contains("its own judge: PASS"), "{why}");
-    assert_eq!(
-        verdicts(Chain::LandA, &moved(250_000), "agy")[0],
-        ("L1", "FAIL")
-    );
-    let (w, why) = one(Chain::LandA, &moved(190_000), "agy", Scenario::L3);
+    let (w, why) = one(Chain::LandA, &early, "agy", Scenario::L3);
     assert_eq!(w, "FAIL", "{why}");
-    assert!(why.contains("land-nudge@v1 typed"), "{why}");
-    let mut s = moved(250_000);
+    assert!(why.contains("land-check@v1 typed"), "{why}");
+    let mut s = early.clone();
     s.journal
-        .insert(5, j(249_000, "EVENT idle seq=9 another turn ended"));
+        .insert(5, j(130_150, "EVENT idle seq=9 another turn ended"));
     let (w, why) = one(Chain::LandA, &s, "agy", Scenario::L1);
     assert_eq!(w, "PASS", "{why}");
-    let mut s = moved(250_000);
-    s.journal[4].1 = "WAITING seq=2 until=x the person at the keyboard".into();
+    let s = backed("WAITING seq=2 until=x the person at the keyboard");
     let (w, why) = one(Chain::LandA, &s, "agy", Scenario::L1);
     assert_eq!(w, "PASS", "{why}");
-    let mut s = landed_a();
-    s.journal[4].1 = "WAITING seq=2 until=soon 2 short turn(s) in a row: 4 min back-off".into();
+    let s = backed("WAITING seq=2 until=soon 2 short turn(s) in a row: 4 min back-off");
     let (w, why) = one(Chain::LandA, &s, "agy", Scenario::L1);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("names no due that reads"), "{why}");
@@ -3582,12 +4800,13 @@ fn an_act_before_the_due_its_back_off_named_fails_every_scenario_of_its_chain() 
 #[test]
 fn an_act_typed_twice_with_no_point_between_fails_any_chain() {
     let open = open_suffix();
-    let mut s = nudged(&open);
+    let list = listed();
+    let mut s = checked_b(nudged(&list));
     s.journal.insert(
-        4,
+        6,
         j(
             371_000,
-            "CONTINUED seq=2 rule=land-nudge@v1 [aterm harness] Still landing:",
+            "CONTINUED seq=3 rule=land-nudge@v1 [aterm harness] Still landing:",
         ),
     );
     let (w, why) = one(Chain::LandB, &s, "claude", Scenario::L2);
@@ -3609,6 +4828,22 @@ fn an_act_typed_twice_with_no_point_between_fails_any_chain() {
     );
     assert!(doubled_acts(&s, T0).is_empty());
     assert_eq!(doubled_acts(&nudged(&open), T0), Vec::<String>::new());
+    // The land check typed at its defense's point, a new point and no back-off: judged.
+    assert_eq!(
+        doubled_acts(&checked_b(nudged(&list)), T0),
+        Vec::<String>::new()
+    );
+    // The same act again at the same point: doubled.
+    let mut s = checked_b(nudged(&list));
+    s.journal[3].1 = "EVENT idle seq=2 The docs PR is still open.".into();
+    s.journal.insert(
+        4,
+        j(
+            130_050,
+            "CONTINUED seq=2 rule=land-check@v1 [aterm harness] Land check: Reread",
+        ),
+    );
+    assert_eq!(doubled_acts(&s, T0).len(), 1, "{:?}", doubled_acts(&s, T0));
 }
 
 #[test]
@@ -3674,6 +4909,7 @@ fn the_instant_cruise_tab_is_watched_until_the_chain_goes_on() {
         t0: T0,
         ask_tried: true,
         over: false,
+        gate_opened: false,
     };
     let mut stopped = instant_asked();
     stopped.journal.pop();
@@ -4014,7 +5250,7 @@ fn agys_hide_enters_only_the_command_its_menu_offers_first() {
 }
 
 fn walled_hidden() -> Seen {
-    Seen {
+    receipted(Seen {
         journal: vec![
             j(5_000, "EVENT idle seq=1 Implemented the parser"),
             j(
@@ -4105,7 +5341,7 @@ fn walled_hidden() -> Seen {
             ..Cover::default()
         },
         ..Seen::default()
-    }
+    })
 }
 
 const UNREAD_LOOK: &str =
@@ -4268,13 +5504,7 @@ fn seen_land_a(program: &str) -> Seen {
             "0",
             LAND_SINCE,
         ),
-        hold(
-            st(371_000, "open", "ask", "1", "-", "-"),
-            "needs",
-            "1",
-            LAND_SINCE,
-        ),
-        hold(st(376_000, "landed", "-", "-", "-", "-"), "-", "-", "-"),
+        hold(st(136_000, "landed", "-", "-", "-", "-"), "-", "-", "-"),
     ];
     s.status_reads.push(T0 + 380_000);
     s.window = surfaces::Window {
@@ -4282,40 +5512,61 @@ fn seen_land_a(program: &str) -> Seen {
         page_reads: vec![T0 + 380_000],
         chip: vec![
             j(1_000, &behind(program, "land")),
-            j(377_000, &behind(program, "landed")),
+            j(137_000, &behind(program, "landed")),
         ],
         strip: vec![
             j(1_000, "index=1 selected=0 states=busy"),
             j(131_000, "index=1 selected=0 states=attention"),
-            j(376_000, "index=1 selected=0 states=-"),
         ],
         hover: vec![
             j(1_000, "driven by aterm (land)"),
-            j(131_000, "driven by aterm (land: not landed yet, needs you)"),
-            j(377_000, "driven by aterm (land, landed)"),
+            j(131_000, "driven by aterm (land: waits only on you)"),
+            j(137_000, "driven by aterm (land, landed)"),
         ],
-        menu: vec![
-            j(
-                131_000,
-                &format!("needs-head|Needs you (1) rows=1\nneeds|◇ land-a — {NEED} · #"),
-            ),
-            j(376_000, ""),
-        ],
+        menu: vec![j(
+            131_000,
+            &format!("needs-head|Needs you (1) rows=1\nneeds|◇ land-a — {NEED} · #"),
+        )],
         page: vec![
             j(1_000, "head=land-a: Window 2, tab 2"),
             j(
                 131_000,
                 &format!(
-                    "head=land-a: Window 2, tab 2\nstate=not landed yet: needs you: {NEED} \u{b7} \
+                    "head=land-a: Window 2, tab 2\nstate=waits only on you: {NEED} \u{b7} \
                      landing since 03:18"
                 ),
             ),
-            j(377_000, "head=land-a: Window 2, tab 2\nstate=landed 03:24"),
+            j(
+                137_000,
+                &format!(
+                    "head=land-a: Window 2, tab 2\nstate=needs you: {NEED}; waits on you \
+                     \u{b7} landed 03:18"
+                ),
+            ),
         ],
         opening: opened(program, "land"),
         ..window("land-a")
     };
+    s.window.front = landed_front(&s, program, 380_000);
     s
+}
+
+/// END's front sweep of a landed tab: its chip drawn `✓ landed`, its hovered title saying what
+/// aterm checked at the landing (`mode_words::landed_brief` of the run's receipt), as a live run
+/// reads it (`forever_checked::title_checked`).
+fn landed_front(s: &Seen, program: &str, at: i64) -> Option<(i64, String)> {
+    let brief =
+        aterm_agent::supervise::mode_words::landed_brief(checked::receipt_of(s, T0).as_ref());
+    let title = format!(
+        "autopilot: land, landed 03:24 \u{2014} {brief} \u{b7} click: off \u{b7} right-click: more"
+    );
+    Some((
+        T0 + at,
+        format!(
+            "window=2 program={program} face=landed drawn=\"\u{2713} landed\" spoken=\"x\" \
+             description=- title={title:?}"
+        ),
+    ))
 }
 
 #[test]
@@ -4324,11 +5575,12 @@ fn land_a_passes_on_the_window_a_person_would_see() {
         assert_eq!(
             verdicts(Chain::LandA, &seen_land_a(program), program),
             [("L1", "PASS"), ("L3", "PASS"), ("L5", "PASS")],
-            "{program}"
+            "{program}: {:?}",
+            one(Chain::LandA, &seen_land_a(program), program, Scenario::L5)
         );
     }
     let (_, why) = one(Chain::LandA, &seen_land_a("claude"), "claude", Scenario::L5);
-    assert!(why.contains("state=landed 03:24"), "{why}");
+    assert!(why.contains("waits on you \u{b7} landed 03:18"), "{why}");
 }
 
 #[test]
@@ -4351,6 +5603,17 @@ fn land_a_fails_a_wrong_window_read() {
     let mut s = seen_land_a("claude");
     s.window.page.pop();
     assert_eq!(l(&s, "claude", Scenario::L5).0, "FAIL");
+    // The need beside the landing said to carry on (the second review, 2026-11-01).
+    let mut s = seen_land_a("claude");
+    s.window.page.push(j(
+        380_000,
+        &format!(
+            "head=land-a: Window 2, tab 2\nstate=needs you: {NEED}; carrying on \u{b7} landed 03:18"
+        ),
+    ));
+    let (w, why) = l(&s, "claude", Scenario::L5);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("not \"\u{2026}; waits on you\""), "{why}");
     let mut s = seen_land_a("claude");
     for (_, p) in &mut s.window.page {
         *p = "-".into();
@@ -4406,8 +5669,8 @@ fn land_a_fails_a_wrong_window_read() {
     assert!(why.contains("face=land while it lands: PASS"), "{why}");
     let mut s = seen_land_a("claude");
     s.window.chip = vec![
-        j(370_000, &behind("claude", "landed")),
-        j(377_000, &behind("claude", "landed")),
+        j(130_000, &behind("claude", "landed")),
+        j(137_000, &behind("claude", "landed")),
     ];
     let (w, why) = l(&s, "claude", Scenario::L1);
     assert_eq!(w, "FAIL", "{why}");
@@ -4821,7 +6084,7 @@ fn seen_land_j(label: &str) -> Seen {
             ),
         )
     };
-    Seen {
+    let mut s = receipted(Seen {
         journal: vec![
             j(124_800, "EVENT idle seq=1 Implemented the parser"),
             j(
@@ -4890,7 +6153,12 @@ fn seen_land_j(label: &str) -> Seen {
             ..window(label)
         },
         ..Seen::default()
-    }
+    });
+    // The Done for you row's tip at the landing says what aterm checked (§14.9, 9c).
+    let tip = aterm_agent::supervise::mode_words::landed_tip(checked::receipt_of(&s, T0).as_ref());
+    s.window.done_tip = vec![j(166_000, &tip)];
+    s.window.front = landed_front(&s, "claude", 903_000);
+    s
 }
 
 #[test]
@@ -5028,11 +6296,15 @@ fn land_e_passes_on_its_row_and_this_mac_counting_every_landed_tab() {
             opening: opened("agy", "land"),
             ..window("land-e")
         };
+        s.window.front = landed_front(&s, "agy", 11_000);
         s
     };
+    // The run's 2 done checks, and the Forced continues row and line that count them, as END
+    // reads them on a live run (§14.17.6): with none read, that want is UNOBSERVED and so is L7.
     let rest = |here: &str, landed: usize, today: &str, every: &str| {
+        use aterm_agent::harness::stats::{FORCED_CONTINUES, FORCED_CONTINUES_LINE};
         format!(
-            "here=\"{here}\" landed_tabs={landed} landing_tabs=6 held_landing=6 held_needs=0 held_unread=0 landings=3 today=\"{today}\" every=\"{every}\" did=\"Landed: 3 today \u{b7} 3 in 7 days\" status_failed=\"-\""
+            "here=\"{here}\" landed_tabs={landed} landing_tabs=6 held_landing=6 held_needs=0 held_unread=0 landings=3 today=\"{today}\" every=\"{every}\" did=\"Landed: 3 today \u{b7} 3 in 7 days\" forced=2 forced_row=\"{FORCED_CONTINUES}: 2 today \u{b7} 2 in 7 days\" forced_line=\"{FORCED_CONTINUES_LINE}\" status_failed=\"-\""
         )
     };
     const TODAY: &str = "3 landed today · 2 kept going · 7 land prompts";
@@ -5711,6 +6983,114 @@ fn the_tool_ended_turn_is_scripted_per_harness_on_its_prompts_rule_alone() {
     assert_eq!(
         spec_on(&Chain::LADDER, Harness::Claude, &dirs[..2]),
         spec(&Chain::LADDER)
+    );
+}
+
+/// LL's work on its quoted list runs a read before it says what it did, on every harness: a long
+/// answer with no tool row is no work to a reader that reads them, so the list would stand and
+/// the next nudge quote it again (the chain's stall, 2026-10-25). Only that rule gets the call,
+/// and LR's (slice 4b: its first run stalled the same way), and LY's first defense (slice 4c: a
+/// defense with no tool row is a no-work answer, so its second saying held as the same reply
+/// before the contradiction came).
+#[test]
+fn land_listeds_work_on_its_list_runs_a_tool_first() {
+    let chains = [
+        Chain::LandA,
+        Chain::LandListed,
+        Chain::LandReworded,
+        Chain::LandContradictedList,
+    ];
+    let dirs: Vec<PathBuf> = chains
+        .iter()
+        .map(|c| PathBuf::from(format!("/w/{}", c.name())))
+        .collect();
+    let quoting = format!(
+        "{LAND_NUDGE} {}",
+        listed_suffix(RELEASE_LIST).expect("a list")
+    );
+    for h in [Harness::Claude, Harness::Agy, Harness::Muse] {
+        let sp = spec_on(&chains, h, &dirs);
+        let rules = sp.get("replies").and_then(J::as_arr).unwrap();
+        let tooled: Vec<&J> = rules.iter().filter(|r| r.get("tool").is_some()).collect();
+        assert_eq!(tooled.len(), 3, "{h:?}");
+        assert_eq!(
+            tooled
+                .iter()
+                .map(|r| r.get("last").and_then(J::as_str))
+                .collect::<Vec<_>>(),
+            [Some(LISTED_KEY), Some(OPEN_KEY), Some(LAND_KEY)],
+            "{h:?}"
+        );
+        let defended = crate::stub::with_reply(
+            sp.clone(),
+            &[Chain::LandContradictedList.prompt(), LAND.to_string()],
+        );
+        assert!(
+            crate::stub::scripted_call(&defended, false).is_some(),
+            "{h:?}: LY's first defense runs the read"
+        );
+        assert_eq!(
+            defended.get("text").and_then(J::as_str),
+            Some(open_defense().as_str())
+        );
+        let said_again = crate::stub::with_reply(
+            sp.clone(),
+            &[
+                Chain::LandContradictedList.prompt(),
+                LAND.to_string(),
+                format!("{LAND_NUDGE} {}", listed()),
+            ],
+        );
+        assert_eq!(
+            crate::stub::scripted_call(&said_again, false),
+            None,
+            "{h:?}: LY's defense said again runs nothing"
+        );
+        let reworded = crate::stub::with_reply(
+            sp.clone(),
+            &[
+                Chain::LandReworded.prompt(),
+                LAND.to_string(),
+                format!(
+                    "{LAND_NUDGE} {}",
+                    listed_suffix(CHECK_LIST).expect("a list")
+                ),
+            ],
+        );
+        assert!(
+            crate::stub::scripted_call(&reworded, false).is_some(),
+            "{h:?}: LR's work runs the read too"
+        );
+        assert_eq!(reworded.get("text").and_then(J::as_str), Some(REWORD_WORK));
+        let users = [
+            Chain::LandListed.prompt(),
+            LAND.to_string(),
+            quoting.clone(),
+        ];
+        let work = crate::stub::with_reply(sp.clone(), &users);
+        let (name, _) = crate::stub::scripted_call(&work, false).expect("the call");
+        assert_eq!(
+            name,
+            read_call(h, Path::new("x"))
+                .get("name")
+                .and_then(J::as_str)
+                .unwrap()
+        );
+        assert_eq!(crate::stub::scripted_call(&work, true), None);
+        assert_eq!(work.get("text").and_then(J::as_str), Some(RELEASE_WORK));
+        let nudged = crate::stub::with_reply(
+            sp.clone(),
+            &[
+                Chain::LandListed.prompt(),
+                LAND.to_string(),
+                LAND_NUDGE.to_string(),
+            ],
+        );
+        assert_eq!(crate::stub::scripted_call(&nudged, false), None, "{h:?}");
+    }
+    assert_eq!(
+        spec_on(&[Chain::LandA], Harness::Claude, &dirs[..1]),
+        spec(&[Chain::LandA])
     );
 }
 
@@ -6760,6 +8140,15 @@ mod walls;
 #[path = "forever_outage_tests.rs"]
 mod outage_tests;
 
+#[path = "forever_sysmsg_tests.rs"]
+mod sysmsg_tests;
+
+#[path = "forever_sysmsg_login_tests.rs"]
+mod sysmsg_login_tests;
+
+#[path = "forever_tap_tests.rs"]
+mod tap_tests;
+
 #[test]
 fn the_hide_waits_on_the_walls_wait_either_side_of_its_point() {
     let wait = "WAITING seq=38891 until=2026-10-22T11:47:18Z usage-session resets";
@@ -6819,6 +8208,113 @@ fn the_hide_waits_on_the_walls_wait_either_side_of_its_point() {
     waited.push((156_500, resets));
     assert!(waits_on_the_wall(&seen(&waited)));
     assert!(!waits_on_the_wall(&seen(&muse)));
+}
+
+/// A PROGRAM IS PROMPTED ONLY ONCE IT HAS FINISHED STARTING (slice at1): an empty composer drawn
+/// over input the program has not read is still starting (rv1-l2: Claude Code's composer stood
+/// over 56 bytes of its terminal's replies unread for 26.9 s and more), and the same composer
+/// once `status` reads its input clear (or a host that does not measure it) is ready. A draft or
+/// an editor still ends the wait at once. Over the screen and the input together the wait is a
+/// hang detector: a program reading its input in parts is waited for; one that holds it a minute,
+/// drawing nothing, is a hang named by its unread input. Control: the screen alone (the old wait)
+/// calls the stalled program ready at once.
+#[test]
+fn a_program_is_ready_for_its_prompt_once_its_input_is_read_too() {
+    let input = |word: &str, bytes: &str| Input {
+        word: word.into(),
+        bytes: bytes.into(),
+        wait_ms: "26937".into(),
+    };
+    let (pending, clear) = (input("pending", "56"), input("clear", "0"));
+    let unmeasured = Input::of("OK schema=1 sid=4 phase=quiet");
+    assert!(!unmeasured.unread(), "{unmeasured:?}");
+    let empty = || Some(String::new());
+    assert_eq!(start_stand(empty(), None, &pending), Stand::Starting);
+    assert_eq!(
+        start_stand(empty(), None, &input("typeahead", "3")),
+        Stand::Starting
+    );
+    assert_eq!(
+        start_stand(empty(), None, &clear),
+        Stand::Composer(String::new())
+    );
+    assert_eq!(
+        start_stand(empty(), None, &unmeasured),
+        Stand::Composer(String::new())
+    );
+    assert_eq!(
+        start_stand(Some("]10;rgb".into()), None, &pending),
+        Stand::Composer("]10;rgb".into())
+    );
+    assert_eq!(
+        start_stand(None, Some("\"x.md\" 1L".into()), &clear),
+        Stand::Editor("\"x.md\" 1L".into())
+    );
+    assert_eq!(start_stand(None, None, &clear), Stand::Starting);
+
+    let t0 = Instant::now();
+    let clock = std::cell::Cell::new(0u64);
+    let tick = || {
+        clock.set(clock.get() + 1);
+        Ok(t0 + Duration::from_secs(clock.get()))
+    };
+    // Its bytes read in parts (56, then 1 at 40 s), clear at 95 s, the screen never moving.
+    let read_in_parts = || match clock.get() {
+        0..40 => pending.clone(),
+        40..95 => input("pending", "1"),
+        _ => clear.clone(),
+    };
+    let looked = composer_wait(
+        || {
+            let i = read_in_parts();
+            (
+                (i.word.clone(), i.bytes.clone()),
+                start_stand(empty(), None, &i),
+            )
+        },
+        COMPOSER_HANG,
+        t0,
+        tick,
+    );
+    assert_eq!(looked, Ok(ComposerWait::Ready));
+    assert_eq!(clock.get(), 95, "ready at the read that found it all read");
+    clock.set(0);
+    let held = composer_wait(
+        || {
+            (
+                (pending.word.clone(), pending.bytes.clone()),
+                start_stand(empty(), None, &pending),
+            )
+        },
+        COMPOSER_HANG,
+        t0,
+        tick,
+    );
+    assert_eq!(held, Ok(ComposerWait::Hung));
+    assert_eq!(clock.get(), 60, "a minute holding it, drawing nothing");
+    let why = start_failed(
+        &Started {
+            wait: ComposerWait::Hung,
+            ms: 60_000,
+            held: Some(pending.clone()),
+            last: pending.clone(),
+        },
+        "claude",
+    );
+    let why = why.expect("a hang");
+    for named in ["claude", "60 s", "input=pending", "input_bytes=56"] {
+        assert!(why.contains(named), "{named}: {why}");
+    }
+    // Control: the screen alone, as the wait before at1 read it, is ready over the unread input.
+    clock.set(0);
+    let screen_only = composer_wait(
+        || ((), Stand::Composer(String::new())),
+        COMPOSER_HANG,
+        t0,
+        tick,
+    );
+    assert_eq!(screen_only, Ok(ComposerWait::Ready));
+    assert_eq!(clock.get(), 0);
 }
 
 /// A TAB'S WAIT FOR ITS EMPTY COMPOSER IS A HANG DETECTOR OVER ITS SCREEN, AND A
@@ -7020,6 +8516,7 @@ fn tab_of(chain: Chain, seen: Seen) -> Tab {
         t0: T0,
         ask_tried: false,
         over: false,
+        gate_opened: false,
     }
 }
 
@@ -7187,37 +8684,47 @@ fn nudged_held(suffix: &str) -> Seen {
 fn a_held_nudge_is_its_points_decision_and_the_watch_runs_past_it() {
     for (c, id) in REPO_CHAINS.into_iter().chain([(Chain::LandB, "L2")]) {
         let suffix = if c == Chain::LandB {
-            open_suffix()
+            listed()
         } else {
-            repo_suffix(c.repo())
+            contradicted(c.repo())
         };
-        let (w, why) = one(c, &nudged_held(&suffix), "claude", c.scenarios()[0]);
+        let held = |suffix: &str| {
+            if c == Chain::LandB {
+                checked_b(nudged_held(suffix))
+            } else {
+                nudged_held(suffix)
+            }
+        };
+        let plain = |suffix: &str| {
+            if c == Chain::LandB {
+                checked_b(nudged(suffix))
+            } else {
+                nudged(suffix)
+            }
+        };
+        let (w, why) = one(c, &held(&suffix), "claude", c.scenarios()[0]);
         assert_eq!(w, "FAIL", "{id}: {why}");
         assert!(
-            why.contains("+373.6 s HELD EXCEPTION seq=3 kind=stalled")
+            why.contains("+373.6 s HELD EXCEPTION seq=")
+                && why.contains(" kind=stalled")
                 && why.contains("SKIPPED (--no-surfaces)")
                 && why.contains("held=(none)"),
             "{id}: {why}"
         );
         let (w, why) = one(
             c,
-            &three_a_said(nudged_held(&suffix), c),
+            &three_a_said(held(&suffix), c),
             "claude",
             c.scenarios()[0],
         );
         assert_eq!(w, "PASS", "{id}: {why}");
-        let when = if c == Chain::LandB { "later" } else { "now" };
-        assert!(
-            why.contains(&format!("journaled when={when} held=same-reply")),
-            "{id}: {why}"
-        );
         assert!(!why.contains("no WAITING decided"), "{id}: {why}");
-        assert!(!finished(&tab_of(c, nudged_held(&suffix)), T0 + 433_599));
-        assert!(finished(&tab_of(c, nudged_held(&suffix)), T0 + 433_600));
-        assert!(!finished(&tab_of(c, nudged(&suffix)), T0 + 376_600));
-        assert!(finished(&tab_of(c, nudged(&suffix)), T0 + 433_600));
+        assert!(!finished(&tab_of(c, held(&suffix)), T0 + 433_599));
+        assert!(finished(&tab_of(c, held(&suffix)), T0 + 433_600));
+        assert!(!finished(&tab_of(c, plain(&suffix)), T0 + 376_600));
+        assert!(finished(&tab_of(c, plain(&suffix)), T0 + 433_600));
     }
-    let mut undecided = nudged_held(&repo_suffix(Repo::Untracked));
+    let mut undecided = nudged_held(&contradicted(Repo::Untracked));
     undecided.journal.truncate(5);
     let (w, why) = one(Chain::LandC, &undecided, "claude", Scenario::L4);
     assert_eq!(w, "FAIL", "{why}");
@@ -7252,7 +8759,7 @@ fn a_hold_fails_every_scenario_of_a_chain_that_scripts_no_same_reply() {
 /// HL and HC run in the measured pass, each to a minute past its second act's point.
 #[test]
 fn the_hold_chains_end_a_minute_past_their_second_acts_point() {
-    let held = three_a_said(nudged_held(&repo_suffix(Repo::Untracked)), Chain::SameLand);
+    let held = three_a_said(nudged_held(&contradicted(Repo::Untracked)), Chain::SameLand);
     assert!(!finished(
         &tab_of(Chain::SameCruise, held.clone()),
         T0 + 433_599
@@ -7277,7 +8784,6 @@ fn the_hold_chains_end_a_minute_past_their_second_acts_point() {
         &tab_of(Chain::SameLand, typed.clone()),
         p + 60_000
     ));
-    let withdrawn = typed.band[0].1.replace("state=live", "state=withdrawn");
     let mut gone = typed.clone();
     gone.journal.push((
         p + 400,
@@ -7285,7 +8791,7 @@ fn the_hold_chains_end_a_minute_past_their_second_acts_point() {
          working"
             .into(),
     ));
-    gone.band.push((p + 2_000, withdrawn));
+    gone.band.push((p + 2_000, "-".into()));
     gone.band_reads.push(p + 2_000);
     gone.end_ms = p + 2_000;
     assert!(finished(&tab_of(Chain::SameLand, gone.clone()), p + 2_000));
@@ -7295,7 +8801,7 @@ fn the_hold_chains_end_a_minute_past_their_second_acts_point() {
     assert!(!finished(&tab_of(Chain::SameCruise, cold), T0 + 900_000));
     let (w, why) = one(
         Chain::SameLand,
-        &nudged_held(&repo_suffix(Repo::Untracked)),
+        &nudged_held(&contradicted(Repo::Untracked)),
         "claude",
         Scenario::HL,
     );
@@ -7306,10 +8812,6 @@ fn the_hold_chains_end_a_minute_past_their_second_acts_point() {
     );
     let (w, why) = one(Chain::SameLand, &gone, "claude", Scenario::HL);
     assert_eq!(w, "PASS", "{why}");
-    assert!(
-        why.contains("one `Stopped typing` row") && why.contains("the row gone by +436.0 s"),
-        "{why}"
-    );
     let (w, why) = one(
         Chain::SameCruise,
         &cruise_held(CRUISE_ON_MAIN),
@@ -7440,4 +8942,70 @@ fn wrote_c_is_watched_past_its_hold_and_fails_where_nothing_says_it() {
         "{why}"
     );
     assert!(Chain::WroteC.same_reply());
+}
+
+/// THE NEED CHAINS ANSWER THE CHECK ONCE THE LAB READ THE NEED (L3's land-a, L14's land-w): their
+/// `LANDED` carries the gate the lab opens ([`Chain::need_gate`]) and no delay of its own, so the
+/// need is read standing however slow the lab's reads run; no other chain's answer waits on one;
+/// the gate opens only once every surface the need's wants judge has read it ([`need_read`]); and
+/// the need chains are prompted last ([`prompt_order`]), since the watch that opens the gate begins
+/// once every chain is prompted. Negative controls: a fixed delay in place of the gate (the 20 s
+/// race the lab lost under load); the chains prompted in their own order (Muse Code's land-a raised
+/// its need at +15.9 s, and the watch first read it at +111 s, after the gate gave way at 60 s).
+#[test]
+fn the_need_chains_answer_the_check_once_the_lab_read_the_need() {
+    let chains = [Chain::LandA, Chain::LandW, Chain::LandB, Chain::LandP];
+    let s = spec(&chains);
+    let picked = |chain: Chain, acts: &[&str]| {
+        let mut u = vec![chain.prompt()];
+        u.extend(acts.iter().map(|a| (*a).to_string()));
+        crate::stub::with_reply(s.clone(), &u)
+    };
+    for chain in [Chain::LandA, Chain::LandW] {
+        let r = picked(chain, &[LAND, LAND_CHECK]);
+        assert_eq!(
+            r.get("gate").and_then(J::as_str).map(str::to_string),
+            chain.need_gate(),
+            "{chain:?}"
+        );
+        assert_eq!(
+            r.get("delay_ms").and_then(J::as_i64),
+            Some(REPLY_DELAY_MS),
+            "{chain:?}: no delay of its own"
+        );
+    }
+    for chain in [Chain::LandB, Chain::LandP] {
+        assert!(chain.need_gate().is_none(), "{chain:?}");
+        assert!(
+            picked(chain, &[LAND, LAND_CHECK]).get("gate").is_none(),
+            "{chain:?}"
+        );
+    }
+    let mut seen = Seen::default();
+    seen.status.push((
+        1,
+        "task=open needs=ask needs_n=1 autopilot=land".to_string(),
+    ));
+    assert!(!need_read(&seen, false), "no meta entry read yet");
+    seen.meta.push((
+        2,
+        "attention_owners=1 attention_kinds=ask:needs attention=claude needs you".to_string(),
+    ));
+    assert!(need_read(&seen, false), "status and meta");
+    assert!(!need_read(&seen, true), "the window not read yet");
+    seen.window
+        .menu
+        .push((3, "needs|◇ land-a — rotate the deploy key · #".to_string()));
+    assert!(!need_read(&seen, true), "no attention state read yet");
+    seen.window
+        .strip
+        .push((4, "index=1 selected=0 states=busy,attention".to_string()));
+    assert!(need_read(&seen, true), "every surface");
+    // Prompted last, so the lab's watch has begun when their need comes; the rest keep their order.
+    let run = [Chain::LandA, Chain::LandB, Chain::LandW, Chain::LandP];
+    let order: Vec<Chain> = prompt_order(&run).into_iter().map(|i| run[i]).collect();
+    assert_eq!(
+        order,
+        [Chain::LandB, Chain::LandP, Chain::LandA, Chain::LandW]
+    );
 }

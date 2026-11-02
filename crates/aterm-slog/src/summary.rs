@@ -168,12 +168,17 @@ impl Log {
         if !head.starts_with("slog-sum v=1 ") {
             return Err(CarryError::Version);
         }
+        let parse_u64 = |v: &str| {
+            (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| v.parse().ok())
+                .flatten()
+        };
         let hk = |k: &str| -> Result<u64, CarryError> {
             head.split(' ')
                 .skip(2)
                 .filter_map(|t| t.split_once('='))
                 .find(|(key, _)| *key == k)
-                .and_then(|(_, v)| v.parse().ok())
+                .and_then(|(_, v)| parse_u64(v))
                 .ok_or(CarryError::Line("a summary header field"))
         };
         let ep = u32::try_from(hk("ep")?).map_err(|_| CarryError::Line("an epoch"))?;
@@ -192,6 +197,10 @@ impl Log {
                 "r" => {
                     let r = decode(rest).map_err(|_| CarryError::Record("a summary record"))?;
                     if r.node != Node::SESSION
+                        || !matches!(r.op, Op::Open | Op::Close)
+                        || recs
+                            .iter()
+                            .any(|p| p.op == r.op || (p.op == Op::Close && r.op == Op::Open))
                         || recs.last().is_some_and(|p| p.seq >= r.seq)
                         || r.seq == 0
                         || r.seq > last
@@ -204,11 +213,11 @@ impl Log {
                     let mut it = rest.split(' ');
                     let lo: u64 = it
                         .next()
-                        .and_then(|v| v.parse().ok())
+                        .and_then(parse_u64)
                         .ok_or(CarryError::Line("a hole"))?;
                     let hi: u64 = it
                         .next()
-                        .and_then(|v| v.parse().ok())
+                        .and_then(parse_u64)
                         .ok_or(CarryError::Line("a hole"))?;
                     if lo == 0
                         || lo > hi

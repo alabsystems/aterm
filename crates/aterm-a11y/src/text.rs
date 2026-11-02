@@ -2,8 +2,16 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 //
-// Derived from accesskit_consumer 0.37.0 (MIT OR Apache-2.0, used under Apache-2.0)
-// src/text.rs, modified by the aterm project in 2026.
+// Derived from accesskit_consumer 0.37.0 (MIT OR Apache-2.0, used under
+// Apache-2.0) src/text.rs, and cut by the aterm project in 2026 to what the
+// AT-SPI Text interface reads (aterm's model has no text attributes, so no
+// format runs, and no lines spanning runs), with fixes: a blank line no
+// longer stalls or misplaces a paragraph search (see
+// `Position::backward_to_line_start` and `Position::is_paragraph_start`),
+// and positions stay in bounds: a word search past 255 characters does not
+// wrap, a step past the document's end stops there, a run whose geometry is
+// shorter than its text gives no boxes and a hit test reads none past its
+// text, and a selection in another document is none.
 
 //! Text documents: positions, ranges, and navigation by character, word, line, and paragraph.
 

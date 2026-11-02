@@ -46,7 +46,7 @@ pub(crate) use unix::errno;
 #[cfg(unix)]
 mod unix {
     use std::io;
-    use std::os::fd::RawFd;
+    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
     use std::sync::OnceLock;
     use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 
@@ -119,15 +119,22 @@ mod unix {
         if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
             return None;
         }
-        for fd in fds {
-            // SAFETY: `fd` is a descriptor `pipe` just returned; these only set its flags.
-            unsafe {
-                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        // SAFETY: `pipe` just returned two fresh open descriptors in `fds`.
+        let (rd, wr) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        for fd in [rd.as_raw_fd(), wr.as_raw_fd()] {
+            // SAFETY: `fd` is a descriptor owned by `rd` or `wr`; these only set its flags.
+            let ok = unsafe {
+                let cloexec = libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
                 let flags = libc::fcntl(fd, libc::F_GETFL);
-                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                cloexec != -1
+                    && flags != -1
+                    && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) != -1
+            };
+            if !ok {
+                return None;
             }
         }
-        Some((fds[0], fds[1]))
+        Some((rd.into_raw_fd(), wr.into_raw_fd()))
     }
 
     /// The disposition `sig` has now.

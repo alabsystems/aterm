@@ -23,20 +23,27 @@
 //!    another build's reduction, or another file names the build ([`admit`]);
 //! 2. build aterm, under the measurements' one lock from here to the end ([`hold_clean`]), and the
 //!    lab's aterm is that build ([`same_aterm`]);
-//! 3. run 1, one session expecting `partial` ([`session`]): a turn, a Bash call through its
-//!    approval box, and a turn that meets the stub's five-hour limit; the lab's Claude Code must
-//!    say the key (KEY), and its session log is judged ([`judge_log`]); PROOF-RED on any FAIL;
+//! 3. run 1, one session expecting `partial` ([`session`]): a turn, four Bash calls ([`CALLS`]:
+//!    one granted once in its approval box, one granted for the session, one declined with Esc,
+//!    and one run sandboxed, where Claude Code offers no box), each call's end read off the screen
+//!    ([`shown`]), and a turn that meets the stub's five-hour limit; the lab's Claude Code must
+//!    say the key (KEY), and its session log is judged, each call's end against what the screen
+//!    showed of it ([`judge_log`]); PROOF-RED on any FAIL;
 //! 4. the session's one transcript (TRANSCRIPTS), every row that names a version naming the key
 //!    (KEY), reduced twice and a third pass byte-identical (FIXED-POINT), its own line naming the
 //!    key (KEY), and held to the privacy oracle every committed reduction is held to, against the
 //!    transcript itself: keys, row order, numbers and closed words only (TEXT)
 //!    ([`reduce_session`]);
-//! 5. its keys and record kinds against every committed Claude Code reduction (NEW-KEY) and the
-//!    transcript keys the fold reads that the previous build showed (GONE) ([`judge`]); other
-//!    drift is noted;
+//! 5. its keys and record kinds against every committed Claude Code reduction and the transcript
+//!    keys the fold reads that the previous build showed ([`judge`], by the judge's rule in
+//!    [`crate::measure`]): what is new on a row the fold does not act on ([`inert`]) is noted, a
+//!    new key the fold reads refuses (NEW-KEY), a lost one refuses (GONE), any other new key or
+//!    record kind waits on run 2; other drift is noted;
 //! 6. `<build>.jsonl` written create-new;
 //! 7. the standing tests ([`STANDING`]), the crates named (STANDING);
-//! 8. aterm rebuilt and run 2 expecting `on` (NOT-BOUND);
+//! 8. aterm rebuilt and run 2 expecting `on` (NOT-BOUND); then each key step 5 left to it is
+//!    admitted by the row of run 2's transcript that carries it and the check that read the step
+//!    the fold made of that row, or refused as one no run exercised (NEW-KEY) ([`admitted_by`]);
 //! 9. the note, `docs/measured/claude-code-<build>-session-log-<date>.md`, only when all passed;
 //! 10. both worlds removed (kept and named on a refusal, or with `--keep`).
 //!
@@ -47,6 +54,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use aterm_agent::harness::steps::StepEvent;
 use aterm_json::Value;
 use aterm_phase::anchors::TRANSCRIPT_KEYS;
 use aterm_uds::spawnfd::Stdio;
@@ -56,17 +64,21 @@ use crate::door::Door;
 use crate::instance::{World, take_flag};
 use crate::lab::{Launch, UpOpts};
 use crate::measure::{
-    Class, Family, Judged, MEASURED, Reduction, Refusal, STEPS, build_aterm, committed_in, gate,
-    hold_clean, judge, landed, not_run, reduce_checked, reduce_leg, rows, sha256, standing,
-    standing_line, today, undo_on_hard_exit, with_world, word,
+    Class, Family, Judged, MEASURED, Reduction, Refusal, STEPS, build_aterm, committed_in,
+    exercised, gate, hold_clean, judge, landed, not_run, reduce_checked, reduce_leg, row_steps,
+    rows, sha256, standing, standing_line, today, undo_on_hard_exit, with_world, word,
 };
 use crate::paths::paths;
+use crate::pyjson::J;
 use crate::reduce::{self, Program, oracle};
 use crate::run::Run as Lab;
 use crate::{Fail, LAB, Res};
 
 /// The one leg a Claude Code measurement reduces: the session.
 pub(crate) const LEG: &str = "session";
+
+/// Run 2, as a verdict names the run that admitted a key.
+const RUN2: &str = "run 2 (expecting `on`)";
 
 /// A made-up word every prompt of the session carries: the reduction must keep it nowhere.
 pub(crate) const WORD: &str = "quokkafern";
@@ -78,9 +90,149 @@ const HANG: Duration = Duration::from_mins(1);
 /// [`HANG`] in seconds, as the door's waits take it.
 const HANG_S: u64 = 60;
 
-/// The call the stub makes in turn 2: a Bash `touch` in the project, which the approval box
-/// asks about (`--permission-mode default`), then its reply.
-const TOOL: &str = r#"[{"name": "Bash", "input": {"command": "touch @PROJ@/quokkafern.txt", "description": "Touch a marker"}}, {"text": "Done."}]"#;
+/// The call the stub makes for Bash call `k` (from 1): a `touch` of a marker of the call's own in
+/// the project, which the approval box asks about (`--permission-mode default`), then its reply
+/// `Done <k>.`, so each call's row, box and reply on the screen are its own.
+fn tool(k: usize) -> String {
+    format!(
+        r#"[{{"name": "Bash", "input": {{"command": "touch @PROJ@/{WORD}-{k}.txt", "description": "Touch marker {k}"}}}}, {{"text": "Done {k}."}}]"#
+    )
+}
+
+/// How the session answers one of its Bash calls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Answer {
+    /// `1. Yes` in its approval box: granted once (2.1.316 writes `grantScope` `once`).
+    Once,
+    /// `2. Yes, and always allow access to <folder> from this project`: granted for the session
+    /// (2.1.316 writes `grantScope` `session` and persists nothing, so the next call's box is
+    /// drawn).
+    Session,
+    /// Esc in its approval box: declined (`⎿  Interrupted · What should Claude do instead?`).
+    Declined,
+    /// No box: the sandbox on (`sandbox.enabled`, re-read before the call), Claude Code runs the
+    /// call sandboxed and offers none. In the lab's own sandbox the nested one cannot start, so
+    /// the call fails (`Error: Exit code 71`).
+    Sandboxed,
+}
+
+/// The session's Bash calls, in order, by how each is answered: the ways a call's permission ends
+/// whose rows a measured build must have read (fix J2-4, step 2).
+pub(crate) const CALLS: [Answer; 4] = [
+    Answer::Once,
+    Answer::Session,
+    Answer::Declined,
+    Answer::Sandboxed,
+];
+
+impl Answer {
+    /// How a check says it.
+    #[must_use]
+    pub(crate) const fn word(self) -> &'static str {
+        match self {
+            Answer::Once => "granted once",
+            Answer::Session => "granted for the session",
+            Answer::Declined => "declined",
+            Answer::Sandboxed => "sandboxed, no box",
+        }
+    }
+
+    /// The key that answers its approval box, or none: no box is drawn.
+    #[must_use]
+    pub(crate) const fn key(self) -> Option<&'static str> {
+        match self {
+            Answer::Once => Some("1"),
+            Answer::Session => Some("2"),
+            Answer::Declined => Some("escape"),
+            Answer::Sandboxed => None,
+        }
+    }
+
+    /// What the screen shows once call `k`'s turn has ended (a pattern for [`Door::seen`]): the
+    /// stub's reply, or for a declined call Claude Code's question to the person.
+    fn ended(self, k: usize) -> String {
+        match self {
+            Answer::Declined => "What should Claude do instead\\?".to_string(),
+            _ => format!("Done {k}\\."),
+        }
+    }
+
+    /// Whether a call so answered can end as the screen shows `s`: a declined one interrupted,
+    /// any other one not.
+    #[must_use]
+    pub(crate) fn ends_as(self, s: Shown) -> bool {
+        (self == Answer::Declined) == (s == Shown::Interrupted)
+    }
+}
+
+/// The turns whose end the session log takes from the transcript (`turn_duration`, `vdur_ms=`):
+/// every turn of the session (the first, one per call and the last) but the declined call's.
+/// 2.1.316 writes a `turn_duration` after that call's interrupt too, but the session log has
+/// ended the vendor turn at the interrupt, and a turn already ended takes no second end.
+#[must_use]
+pub(crate) fn turns_ended() -> usize {
+    2 + CALLS.iter().filter(|a| **a != Answer::Declined).count()
+}
+
+/// What the screen shows of a Bash call's end: the `⎿` row under the call's own row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Shown {
+    /// It ran (`⎿  Done`, or its output).
+    Ran,
+    /// It failed (`⎿  Error: …`).
+    Failed,
+    /// A person interrupted it (the anchor `turn.interrupted`).
+    Interrupted,
+}
+
+impl Shown {
+    /// The `out=` the transcript must end a call with that the screen shows so: `ok` for one that
+    /// ran, `error` for one that failed or that a person interrupted (Claude Code writes a
+    /// declined call's result as an error).
+    #[must_use]
+    pub(crate) const fn out(self) -> &'static str {
+        match self {
+            Shown::Ran => "ok",
+            Shown::Failed | Shown::Interrupted => "error",
+        }
+    }
+
+    /// How a check says it.
+    #[must_use]
+    pub(crate) const fn word(self) -> &'static str {
+        match self {
+            Shown::Ran => "ran",
+            Shown::Failed => "failed",
+            Shown::Interrupted => "interrupted",
+        }
+    }
+}
+
+/// What `screen` (`aterm ctl text`) shows of Bash call `k`'s end: the first `⎿` row under the
+/// call's own `⏺ Bash(… <WORD>-<k>.txt)` row, before the next `⏺` or `❯` row; none while it runs
+/// (`Waiting…`, `Running…`) or when the screen shows no such row.
+#[must_use]
+pub(crate) fn shown(screen: &str, k: usize) -> Option<Shown> {
+    let rows: Vec<&str> = screen.lines().map(str::trim).collect();
+    let marker = format!("/{WORD}-{k}.txt)");
+    let at = rows
+        .iter()
+        .position(|r| r.starts_with("⏺ Bash(") && r.ends_with(&marker))?;
+    let rest = rows[at + 1..]
+        .iter()
+        .take_while(|r| !r.starts_with(['⏺', '❯']))
+        .find_map(|r| r.strip_prefix('⎿'))?
+        .trim_start();
+    if rest.starts_with(aterm_phase::anchor!("turn.interrupted")) {
+        Some(Shown::Interrupted)
+    } else if rest.starts_with("Error") {
+        Some(Shown::Failed)
+    } else if rest.is_empty() || ["Waiting", "Running"].iter().any(|w| rest.starts_with(w)) {
+        None
+    } else {
+        Some(Shown::Ran)
+    }
+}
 
 /// The libtest filters step 7 runs: the step fold's tests (the measured builds held to their
 /// reductions, each folding whole and exact with a lab run's events, and the corpus), the
@@ -97,11 +249,15 @@ const FILTERS: [&str; 4] = [
 /// reduction folds whole, exact and with a lab run's events, and `MEASURED_BUILDS` is what the
 /// committed reductions name; the corpus still folds to its lines; every committed reduction keeps
 /// no text and its limit's words; every Claude Code build in the step testdata reads as measured;
-/// and every key the fold reads of a committed reduction is one GONE holds the next build to.
-pub(crate) const STANDING: [&str; 7] = [
+/// every key the fold reads of a committed reduction is one GONE holds the next build to; and the
+/// judge's rule (a) holds with the new reduction among the committed ones (an inert row changes
+/// nothing the fold makes of it, and `TRANSCRIPT_KEYS` is the fold's read set).
+pub(crate) const STANDING: [&str; 9] = [
     "harness::steps::tests::a_build_is_exact_iff_its_reduction_is_committed",
     "harness::steps::tests::the_measured_builds_are_what_the_committed_reductions_name",
     "harness::steps::corpus_tests::every_corpus_slice_folds_to_its_lines",
+    "harness::steps::inert_tests::an_inert_row_changes_nothing_the_fold_makes",
+    "harness::steps::inert_tests::the_fold_reads_what_the_transcript_keys_name",
     "reduce::tests::a_tool_argument_name_is_never_kept_as_written",
     "reduce::tests::every_committed_claude_reduction_keeps_its_limit_words",
     "claude_measure::tests::every_claude_build_in_the_step_testdata_reads_as_measured",
@@ -114,6 +270,7 @@ pub(crate) const CLAUDE: Family = Family {
     verb: "claude-measure",
     source: "transcript",
     read: TRANSCRIPT_KEYS,
+    inert,
     holds: is_reduction,
     measures: every,
     kind: record_kind,
@@ -133,6 +290,12 @@ fn is_reduction(name: &str) -> bool {
 /// Every Claude Code build a committed reduction names is measured.
 fn every(_: &str) -> bool {
     true
+}
+
+/// Whether the step fold acts on no row of the record kind `kind` (`<type>/<subtype>`): its
+/// `type` is none of the fold's [`ROW_KINDS`](aterm_agent::harness::steps::ROW_KINDS).
+fn inert(kind: &str) -> bool {
+    !aterm_agent::harness::steps::acts_on(kind.split('/').next().unwrap_or(kind))
 }
 
 /// A transcript row's record kind: `<type>/<subtype>`.
@@ -398,29 +561,69 @@ fn turn_ends(recs: &[Rec<'_>]) -> usize {
         .count()
 }
 
-/// Whether the transcript opened the session's Bash call (`open p<n> tool … cls=shell`).
-fn shell_opened(log: &str) -> bool {
-    records(log).iter().any(|r| {
-        r.transcript() && r.verb == "open" && r.kind == "tool" && r.get("cls") == Some("shell")
-    })
+/// Whether `r` is the transcript's opening of a Bash call (`open p<n> tool … cls=shell`).
+fn opens_call(r: &Rec<'_>) -> bool {
+    r.transcript() && r.verb == "open" && r.kind == "tool" && r.get("cls") == Some("shell")
 }
 
-/// Whether the session log holds everything the transcript gives of the session: its three turn
-/// ends, and, read exact, the usage wall it confirms.
+/// How many of the session's Bash calls the transcript opened.
+fn shell_calls(log: &str) -> usize {
+    records(log).iter().filter(|r| opens_call(r)).count()
+}
+
+/// How many approval boxes the screen opened (`open p<n> approval`).
+fn boxes(log: &str) -> usize {
+    records(log)
+        .iter()
+        .filter(|r| r.verb == "open" && r.kind == "approval")
+        .count()
+}
+
+/// Whether the session log holds everything the transcript gives of the session: every turn end
+/// it writes ([`turns_ended`]), and, read exact, the usage wall it confirms.
 fn settled(log: &str, expect: Expect) -> bool {
     let recs = records(log);
-    turn_ends(&recs) >= 3
+    turn_ends(&recs) >= turns_ended()
         && (expect == Expect::Partial || recs.iter().any(|r| r.get("confirmed") == Some("1")))
 }
 
-/// STEP 3's judgment of the session log `log` of one session of `build` expecting `expect`: each
-/// check, and whether it held. The transcript source reads `expect`; the transcript names the
-/// build; it opens the Bash call and ends it ok; it ends the three turns; every record it gives
-/// but the source's own mark is at `expect`'s confidence (strong while partial, fix E1; exact once
-/// measured); the usage wall is confirmed once measured and never while partial; and no step is
-/// lost (`dropped=`).
+/// What a check of a session log reads: the source, the build, a Bash call's opening or end (the
+/// call's number in the session, from 1), the turns, every record, the wall, or what was lost.
+/// The judge's rule names, for each key it admits, the check that read the step the fold made of
+/// the row carrying it ([`check_of_row`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum About {
+    Source,
+    Build,
+    Opens(usize),
+    Ends(usize),
+    Turns,
+    Records,
+    Wall,
+    Lost,
+}
+
+/// One check of a session log: whether it held, what it says, what it reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Check {
+    pub ok: bool,
+    pub what: String,
+    pub about: About,
+}
+
+fn check(ok: bool, what: String, about: About) -> Check {
+    Check { ok, what, about }
+}
+
+/// STEP 3's judgment of the session log `log` of one session of `build` expecting `expect`, whose
+/// screen showed its Bash calls end as `shown` says (in order, [`shown`]): each check, and whether
+/// it held. The transcript source reads `expect`; the transcript names the build; it opens each
+/// Bash call and ends it as the screen showed it ended ([`Shown::out`]); it ends every turn
+/// Claude Code writes an end for ([`turns_ended`]); every record it gives but the source's own
+/// mark is at `expect`'s confidence (strong while partial, fix E1; exact once measured); the usage
+/// wall is confirmed once measured and never while partial; and no step is lost (`dropped=`).
 #[must_use]
-pub(crate) fn judge_log(log: &str, build: &str, expect: Expect) -> Vec<(bool, String)> {
+pub(crate) fn judge_log(log: &str, build: &str, expect: Expect, shown: &[Shown]) -> Vec<Check> {
     let recs = records(log);
     let conf = expect.conf();
     let tx: Vec<&Rec<'_>> = recs.iter().filter(|r| r.transcript()).collect();
@@ -429,50 +632,63 @@ pub(crate) fn judge_log(log: &str, build: &str, expect: Expect) -> Vec<(bool, St
         .rev()
         .find(|r| r.kind == "source" && r.get("field") == Some("transcript"))
         .and_then(|r| r.get("state"));
-    let mut out = vec![(
+    let mut out = vec![check(
         source == Some(expect.word()),
         format!(
             "the transcript source reads {} (the log says {})",
             expect.word(),
             source.unwrap_or("nothing")
         ),
+        About::Source,
     )];
-    out.push((
+    out.push(check(
         tx.iter()
             .any(|r| r.kind == "agent" && r.get("ver") == Some(build)),
         format!("the transcript names the build (ver={build})"),
+        About::Build,
     ));
-    let call = tx
-        .iter()
-        .find(|r| r.verb == "open" && r.kind == "tool" && r.get("cls") == Some("shell"));
-    out.push((
-        call.is_some_and(|r| r.get("conf") == Some(conf)),
-        format!("the transcript opens the Bash call at conf={conf}"),
-    ));
-    let ended = call.is_some_and(|c| {
-        tx.iter().any(|r| {
-            r.id == c.id
-                && r.kind == "tool"
-                && matches!(r.verb, "close" | "amend")
-                && r.get("out") == Some("ok")
-                && r.get("conf") == Some(conf)
-        })
-    });
-    out.push((
-        ended,
-        format!("the transcript ends the Bash call ok at conf={conf}"),
-    ));
-    let ends = turn_ends(&recs);
-    out.push((
-        ends == 3,
-        format!("the transcript ends the three turns (vdur_ms= on {ends})"),
+    let calls: Vec<&&Rec<'_>> = tx.iter().filter(|r| opens_call(r)).collect();
+    for (i, s) in shown.iter().enumerate() {
+        let k = i + 1;
+        let call = calls.get(i);
+        out.push(check(
+            call.is_some_and(|r| r.get("conf") == Some(conf)),
+            format!("the transcript opens Bash call {k} at conf={conf}"),
+            About::Opens(k),
+        ));
+        let ended = call.is_some_and(|c| {
+            tx.iter().any(|r| {
+                r.id == c.id
+                    && r.kind == "tool"
+                    && matches!(r.verb, "close" | "amend")
+                    && r.get("out") == Some(s.out())
+                    && r.get("conf") == Some(conf)
+            })
+        });
+        out.push(check(
+            ended,
+            format!(
+                "the transcript ends Bash call {k} {} at conf={conf}, as the screen showed it {}",
+                s.out(),
+                s.word()
+            ),
+            About::Ends(k),
+        ));
+    }
+    let (ends, due) = (turn_ends(&recs), turns_ended());
+    out.push(check(
+        ends == due,
+        format!(
+            "the transcript ends the {due} turns Claude Code writes an end for (vdur_ms= on {ends})"
+        ),
+        About::Turns,
     ));
     let off: Vec<String> = tx
         .iter()
         .filter(|r| r.kind != "source" && r.get("conf") != Some(conf))
         .map(|r| r.said())
         .collect();
-    out.push((
+    out.push(check(
         off.is_empty(),
         format!(
             "every transcript record is at conf={conf}{}",
@@ -482,16 +698,19 @@ pub(crate) fn judge_log(log: &str, build: &str, expect: Expect) -> Vec<(bool, St
                 format!(" (not: {})", off.join(", "))
             }
         ),
+        About::Records,
     ));
     match expect {
-        Expect::On => out.push((
+        Expect::On => out.push(check(
             tx.iter()
                 .any(|r| r.kind == "wall" && r.get("confirmed") == Some("1")),
             "the transcript confirms the usage wall (confirmed=1)".to_string(),
+            About::Wall,
         )),
-        Expect::Partial => out.push((
+        Expect::Partial => out.push(check(
             !recs.iter().any(|r| r.get("confirmed").is_some()),
             "no wall is confirmed while the build is unmeasured (no confirmed=)".to_string(),
+            About::Wall,
         )),
     }
     let dropped: Vec<String> = recs
@@ -499,7 +718,7 @@ pub(crate) fn judge_log(log: &str, build: &str, expect: Expect) -> Vec<(bool, St
         .filter(|r| r.get("dropped").is_some())
         .map(|r| r.said())
         .collect();
-    out.push((
+    out.push(check(
         dropped.is_empty(),
         format!(
             "no step is lost{}",
@@ -509,8 +728,69 @@ pub(crate) fn judge_log(log: &str, build: &str, expect: Expect) -> Vec<(bool, St
                 format!(" (dropped= on {})", dropped.join(", "))
             }
         ),
+        About::Lost,
     ));
     out
+}
+
+/// What a check reads of the steps the step fold made of row `row` (0-based among its rows) of
+/// the reduction `text`: a call's opening or end by the call's number among the reduction's calls
+/// (an interrupt ends the call it cut short), a prompt or a turn's end the turns, a wall the
+/// wall, a model the build, any other step every record, and a row it made no step of what was
+/// lost. A row the fold made several steps of (a turn's first assistant row opens the turn and a
+/// call) is read by the check of its call, else of its wall, its build, its turn, in that order.
+#[must_use]
+pub(crate) fn about_row(text: &str, row: usize) -> About {
+    let steps = reduce::readings(text, Program::Claude).steps;
+    let mut calls = Vec::new();
+    for s in &steps {
+        if let StepEvent::ToolUse { id, .. } = s.ev
+            && !calls.contains(&id)
+        {
+            calls.push(id);
+        }
+    }
+    let number = |id| calls.iter().position(|c| *c == id).map(|i| i + 1);
+    let rank = |a: About| match a {
+        About::Opens(_) | About::Ends(_) => 0,
+        About::Wall => 1,
+        About::Build => 2,
+        About::Turns => 3,
+        _ => 4,
+    };
+    let (mut last, mut best) = (None, None);
+    for s in &steps {
+        if s.row == row {
+            let about = match s.ev {
+                StepEvent::ToolUse { id, .. } => number(id).map_or(About::Records, About::Opens),
+                StepEvent::ToolResult { id, .. } => number(id).map_or(About::Records, About::Ends),
+                StepEvent::Interrupt => last.map_or(About::Turns, About::Ends),
+                StepEvent::Prompt { .. } | StepEvent::TurnEnd { .. } => About::Turns,
+                StepEvent::EndWall { .. } => About::Wall,
+                StepEvent::Model { .. } => About::Build,
+                _ => About::Records,
+            };
+            if best.is_none_or(|b| rank(about) < rank(b)) {
+                best = Some(about);
+            }
+        }
+        if let StepEvent::ToolUse { id, .. } = s.ev {
+            last = number(id);
+        }
+    }
+    best.unwrap_or(About::Lost)
+}
+
+/// The check of `checks` (a run's, every one passed) that read the step the fold made of row
+/// `row` of the reduction `text` ([`about_row`]), as a verdict names it.
+#[must_use]
+pub(crate) fn check_of_row(checks: &[Check], text: &str, row: usize) -> String {
+    let about = about_row(text, row);
+    let steps = row_steps(Program::Claude, text, row);
+    checks.iter().find(|c| c.about == about).map_or_else(
+        || format!("{steps}; every one of its {} checks passed", checks.len()),
+        |c| format!("{steps}; its check \"{}\" passed", c.what),
+    )
 }
 
 /// A run's checks: how many held, and each that failed.
@@ -560,9 +840,9 @@ fn log_until(door: &Door<'_>, done: &dyn Fn(&str) -> bool) -> Result<(bool, Stri
 
 /// STEPS 3 AND 8, the session the lab `tag` runs, each step a check that must hold before the
 /// next is taken: Claude Code launched on the subscriber path in the approval mode, a turn
-/// answered, a Bash call the transcript reads before its approval box is answered, and a turn
-/// that meets the stub's five-hour limit.
-fn drive(tag: &str, c: &mut Checks) -> Result<(), Fail> {
+/// answered, the Bash calls ([`CALLS`], [`call`]), and a turn that meets the stub's five-hour
+/// limit. What the screen showed of each call's end, in order, once every step held.
+fn drive(tag: &str, c: &mut Checks) -> Result<Vec<Shown>, Fail> {
     let lab = Lab::load(tag)?;
     let launch = Launch {
         subscriber: true,
@@ -572,11 +852,12 @@ fn drive(tag: &str, c: &mut Checks) -> Result<(), Fail> {
     crate::lab::launch_claude(&lab, &launch)?;
     let lab = Lab::load(tag)?;
     let door = Door::new(&lab)?;
+    let mut shown = Vec::new();
     if !c.check(
         door.seen("Claude Code v", HANG_S)?,
         "Claude Code drew its banner",
     ) {
-        return Ok(());
+        return Ok(shown);
     }
     door.await_idle(1500, HANG_S)?;
     crate::verbs::set_mode(&lab, "ok")?;
@@ -585,41 +866,117 @@ fn drive(tag: &str, c: &mut Checks) -> Result<(), Fail> {
         "turn 1 typed",
     ) || !c.check(door.seen("local lab stub", HANG_S)?, "turn 1 answered")
     {
-        return Ok(());
+        return Ok(shown);
     }
     door.await_idle(1500, HANG_S)?;
-    crate::verbs::set_tool(&lab, TOOL)?;
-    if !c.check(
-        crate::verbs::turn(&door, &format!("toolstart {WORD}"))?,
-        "turn 2 typed",
-    ) || !c.check(
-        door.seen("Do you want to proceed", HANG_S)?,
-        "the Bash call's approval box drawn",
-    ) {
-        return Ok(());
+    for (i, answer) in CALLS.into_iter().enumerate() {
+        match call(&lab, &door, c, i + 1, answer)? {
+            Some(s) => shown.push(s),
+            None => return Ok(shown),
+        }
     }
-    let (read, _) = log_until(&door, &shell_opened)?;
-    if !c.check(
-        read,
-        "the transcript's Bash call read before its box is answered",
-    ) {
-        return Ok(());
-    }
-    door.ctl(&["key", "enter"])?;
-    if !c.check(door.seen("Done\\.", HANG_S)?, "turn 2 answered") {
-        return Ok(());
-    }
-    door.await_idle(1500, HANG_S)?;
+    let last = CALLS.len() + 2;
     crate::verbs::set_limit(&lab, "five_hour", crate::util::now_secs() + 3600, "")?;
     if !c.check(
         crate::verbs::turn(&door, &format!("one more {WORD}"))?,
-        "turn 3 typed",
-    ) || !c.check(door.seen("hit your", HANG_S)?, "turn 3 met the limit")
-    {
-        return Ok(());
+        &format!("turn {last} typed"),
+    ) || !c.check(
+        door.seen("hit your", HANG_S)?,
+        &format!("turn {last} met the limit"),
+    ) {
+        return Ok(shown);
     }
     door.await_idle(1500, HANG_S)?;
-    Ok(())
+    Ok(shown)
+}
+
+/// Bash call `k` (from 1) of the session, answered `answer`, in turn `k + 1`: for a sandboxed
+/// call the sandbox turned on first, Claude Code having re-read its settings; the call the stub
+/// makes ([`tool`]); its approval box drawn and the transcript's call read before the box is
+/// answered with the answer's key, or for a call with no box the transcript's call read and no box
+/// opened; the turn's end on the screen; and what the screen shows of the call's end, as the
+/// answer ends one ([`Answer::ends_as`]). None once a check failed.
+fn call(
+    lab: &Lab,
+    door: &Door<'_>,
+    c: &mut Checks,
+    k: usize,
+    answer: Answer,
+) -> Result<Option<Shown>, Fail> {
+    let turn = k + 1;
+    let what = format!("Bash call {k} ({})", answer.word());
+    if answer == Answer::Sandboxed {
+        let on = J::obj([("sandbox", J::obj([("enabled", J::Bool(true))]))]);
+        let reread = match crate::settings_witness::merge_reread(lab, &on) {
+            Err(f) if f.stopped.is_some() => return Err(f),
+            r => r.is_ok(),
+        };
+        if !c.check(
+            reread,
+            &format!("{what}: Claude Code re-read its settings with the sandbox on"),
+        ) {
+            return Ok(None);
+        }
+    }
+    crate::verbs::set_tool(lab, &tool(k))?;
+    if !c.check(
+        crate::verbs::turn(door, &format!("toolstart {WORD} {k}"))?,
+        &format!("turn {turn} typed"),
+    ) {
+        return Ok(None);
+    }
+    if let Some(key) = answer.key() {
+        if !c.check(
+            door.seen("Do you want to proceed", HANG_S)?,
+            &format!("{what}: its approval box drawn"),
+        ) {
+            return Ok(None);
+        }
+        let (read, _) = log_until(door, &|l| shell_calls(l) >= k)?;
+        if !c.check(
+            read,
+            &format!("{what}: the transcript's call read before its box is answered"),
+        ) {
+            return Ok(None);
+        }
+        door.ctl(&["key", key])?;
+    } else {
+        let (read, _) = log_until(door, &|l| shell_calls(l) >= k)?;
+        if !c.check(read, &format!("{what}: the transcript's call read")) {
+            return Ok(None);
+        }
+    }
+    if !c.check(
+        door.seen(&answer.ended(k), HANG_S)?,
+        &format!("turn {turn} ended ({})", answer.word()),
+    ) {
+        return Ok(None);
+    }
+    door.await_idle(1500, HANG_S)?;
+    if answer.key().is_none() {
+        let (drawn, offered) = (
+            boxes(&door.out(&["log", "n=400"])),
+            CALLS[..k].iter().filter(|a| a.key().is_some()).count(),
+        );
+        if !c.check(
+            drawn == offered,
+            &format!("{what}: no approval box offered ({drawn} opened, {offered} answered)"),
+        ) {
+            return Ok(None);
+        }
+    }
+    let s = shown(&door.out(&["text"]), k);
+    if !c.check(
+        s.is_some_and(|s| answer.ends_as(s)),
+        &format!(
+            "{what}: the screen shows its end as a call {} ends ({})",
+            answer.word(),
+            s.map_or("no end", Shown::word)
+        ),
+    ) {
+        return Ok(None);
+    }
+    Ok(s)
 }
 
 /// Write `text` to `path` in a run's world.
@@ -629,13 +986,14 @@ fn save(path: &Path, text: &str) -> Result<(), Fail> {
 
 /// STEPS 3 AND 8: one session of `build` in a lab of the verb's own (`up`, the folder trusted,
 /// the harness off, nothing else of `LAB_*` read), expecting `expect`, the `n`th: its checks
-/// ([`drive`], then [`judge_log`] on its session log), and a world holding its session log, its
-/// screen and its transcripts (`transcripts/`), kept until the verb releases it. The lab is down
-/// when it returns.
+/// ([`drive`], then [`judge_log`] on its session log and what the screen showed of each call's
+/// end), and a world holding its session log, its
+/// screen and its transcripts (`transcripts/`), kept until the verb releases it; and the session
+/// log's checks, when the drive passed. The lab is down when it returns.
 /// # Errors
 /// The run's interrupt; KEY: the lab's Claude Code says another build; NOT RUN: the lab could not
 /// come up or its world be written.
-fn session(n: u8, build: &str, expect: Expect) -> Result<Run, Fail> {
+fn session(n: u8, build: &str, expect: Expect) -> Result<(Run, Vec<Check>), Fail> {
     let t = Instant::now();
     let mut world = World::new("").map_err(not_run)?;
     world.keep();
@@ -668,7 +1026,7 @@ fn session(n: u8, build: &str, expect: Expect) -> Result<Run, Fail> {
         .into());
     }
     let mut c = Checks::default();
-    drive(&tag, &mut c).map_err(|f| with_world(f, &world.dir, None))?;
+    let shown = drive(&tag, &mut c).map_err(|f| with_world(f, &world.dir, None))?;
     let lab = Lab::load(&tag)?;
     let door = Door::new(&lab)?;
     let (_, log) = log_until(&door, &|l| settled(l, expect))?;
@@ -684,18 +1042,23 @@ fn session(n: u8, build: &str, expect: Expect) -> Result<Run, Fail> {
         let to = into.join(format!("{}.jsonl", i + 1));
         std::fs::copy(p, &to).map_err(|e| not_run(format!("{}: {e}", p.display())))?;
     }
+    let mut checks = Vec::new();
     if c.fails.is_empty() {
-        for (ok, what) in judge_log(&log, build, expect) {
-            c.check(ok, &what);
+        checks = judge_log(&log, build, expect, &shown);
+        for k in &checks {
+            c.check(k.ok, &k.what);
         }
     }
-    Ok(Run {
-        world,
-        oks: c.oks,
-        fails: c.fails,
-        fences: Vec::new(),
-        took: Some(t.elapsed()),
-    })
+    Ok((
+        Run {
+            world,
+            oks: c.oks,
+            fails: c.fails,
+            fences: Vec::new(),
+            took: Some(t.elapsed()),
+        },
+        checks,
+    ))
 }
 
 /// STEPS 2 AND 8: the aterm the lab runs ([`crate::paths::Paths::need_aterm`]) is the one the
@@ -780,6 +1143,7 @@ struct Note<'a> {
     runs: [&'a Run; 2],
     text: &'a str,
     judged: &'a Judged,
+    admitted: &'a [String],
     passed: &'a [String],
 }
 
@@ -791,8 +1155,10 @@ impl Note<'_> {
              # Claude Code {build}: measured for the session log ({date})\n\n\
              `{LAB} claude-measure` measured Claude Code `{build}` on this Mac: one lab session \
              (a private headless instance, its harness off, Claude Code on the lab stub's subscriber \
-             path: a turn, a Bash call through its approval box, a turn that meets the stub's \
-             five-hour limit) run twice, first expecting the build unmeasured (read partial), then \
+             path: a turn; four Bash calls, one granted once in its approval box, one granted for \
+             the session, one declined with Esc and one run sandboxed with no box offered, each \
+             call's end read off the screen and held to the transcript's; a turn that meets the \
+             stub's five-hour limit) run twice, first expecting the build unmeasured (read partial), then \
              measured (read on), with run 1's transcript reduced between the runs. This page is the \
              verb's own record.\n\n\
              ## What ran\n\n\
@@ -826,18 +1192,32 @@ impl Note<'_> {
         ));
         let j = self.judged;
         t.push_str(&format!(
-            "\n**Transcript keys.** It shows {} keys and {} record kinds, none that the {} measured \
-             builds' reductions do not show, and no transcript key the fold reads that {} showed is \
-             gone.",
+            "\n**Transcript keys.** It shows {} keys and {} record kinds. None of them is a key the \
+             fold reads that the {} measured builds' reductions do not show, and no transcript key \
+             the fold reads that {} showed is gone.",
             j.keys,
             j.kinds,
             j.builds,
             j.prev.as_deref().unwrap_or("a previous build")
         ));
+        if self.admitted.is_empty() {
+            t.push_str(" Nothing new is on a row the fold acts on.");
+        } else {
+            t.push_str(
+                " What is new on rows the fold acts on, and no key it reads, was admitted by run 2, \
+                 which wrote rows carrying it and passed every check expecting the build exact:\n\n",
+            );
+            for a in self.admitted {
+                t.push_str(&format!("* {a}\n"));
+            }
+        }
         if j.noted.is_empty() {
             t.push_str(" No other key, record kind or step shape moved.\n");
         } else {
-            t.push_str(" What moved and does not refuse:\n\n");
+            t.push_str(
+                "\nWhat moved and does not refuse (new on rows the fold does not act on, gone, or \
+                 a step shape):\n\n",
+            );
             for n in &j.noted {
                 t.push_str(&format!("* {n}\n"));
             }
@@ -853,6 +1233,39 @@ impl Note<'_> {
         ));
         t
     }
+}
+
+/// STEP 8's judgment of what step 5 left to run 2 ([`Judged::pending`]): run 2's one transcript,
+/// reduced as run 1's was, its privacy check included ([`reduce_session`]), and each new key
+/// admitted by the row of run 2's that carries it and the check of `checks` (run 2's, every one
+/// passed) that read the step the fold made of that row ([`exercised`], [`check_of_row`]).
+/// # Errors
+/// TRANSCRIPTS, KEY, FIXED-POINT or TEXT on run 2's transcript; NEW-KEY: run 2 exercised one not.
+fn admitted_by(
+    build: &str,
+    judged: &Judged,
+    run2: &Run,
+    checks: &[Check],
+) -> Result<Vec<String>, Refusal> {
+    if judged.pending.is_empty() {
+        return Ok(Vec::new());
+    }
+    let from = one_transcript(&run2.world.dir.join("transcripts"))?;
+    let source = std::fs::read_to_string(&from).map_err(|e| {
+        Refusal::new(
+            Class::Transcripts,
+            format!("{LEG}: {}: {e}", from.display()),
+        )
+    })?;
+    let text = reduce_session(&source, build, &reduce_checked(Program::Claude))?;
+    exercised(
+        &CLAUDE,
+        build,
+        &judged.pending,
+        RUN2,
+        &[(LEG, text)],
+        &|_, text, row| check_of_row(checks, text, row),
+    )
 }
 
 /// A refusal of step 4 or 5 as the run's failure, naming run 1's world, kept for it.
@@ -897,7 +1310,7 @@ pub fn cmd_claude_measure(args: &[String]) -> Res {
     let aterm = build_aterm(&CLAUDE, &repo)?;
     same_aterm(&aterm)?;
     println!("claude-measure: 3. run 1, expecting {build} unmeasured (read partial)");
-    let mut run1 = session(1, &build, Expect::Partial)?;
+    let (mut run1, _) = session(1, &build, Expect::Partial)?;
     println!("claude-measure: 3. {}", run_line(1, Expect::Partial, &run1));
     gate(Class::ProofRed, &run1)?;
     let world1 = run1.world.dir.clone();
@@ -919,11 +1332,24 @@ pub fn cmd_claude_measure(args: &[String]) -> Res {
     let judged =
         judge(&CLAUDE, &build, &[(LEG, text.clone())], &committed).map_err(kept(&world1))?;
     println!(
-        "claude-measure: 5. {} keys and {} record kinds, nothing new against {} measured builds' reductions, no transcript key gone against {}{}",
+        "claude-measure: 5. {} keys and {} record kinds, no key the fold reads new against {} measured builds' reductions, no transcript key gone against {}; {}{}",
         judged.keys,
         judged.kinds,
         judged.builds,
         judged.prev.as_deref().unwrap_or("no previous build"),
+        if judged.pending.is_empty() {
+            "nothing new on a row the fold acts on".to_string()
+        } else {
+            format!(
+                "left to run 2 to exercise: {}",
+                judged
+                    .pending
+                    .iter()
+                    .map(crate::measure::Pending::said)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        },
         if judged.noted.is_empty() {
             "; nothing else moved".to_string()
         } else {
@@ -942,9 +1368,15 @@ pub fn cmd_claude_measure(args: &[String]) -> Res {
         let aterm = build_aterm(&CLAUDE, &repo).map_err(|f| with_world(f, &world1, None))?;
         same_aterm(&aterm).map_err(|f| with_world(f, &world1, None))?;
         println!("claude-measure: 8. run 2, expecting {build} measured (read on)");
-        let run2 = session(2, &build, Expect::On).map_err(|f| with_world(f, &world1, None))?;
+        let (run2, checks2) =
+            session(2, &build, Expect::On).map_err(|f| with_world(f, &world1, None))?;
         println!("claude-measure: 8. {}", run_line(2, Expect::On, &run2));
         gate(Class::NotBound, &run2).map_err(|f| with_world(f, &world1, None))?;
+        let admitted = admitted_by(&build, &judged, &run2, &checks2)
+            .map_err(|r| with_world(r.into(), &world1, Some(&run2.world.dir)))?;
+        for a in &admitted {
+            println!("claude-measure: 8. admitted {a}");
+        }
         let note = Note {
             build: &build,
             bin_said: &bin_said,
@@ -953,6 +1385,7 @@ pub fn cmd_claude_measure(args: &[String]) -> Res {
             runs: [&run1, &run2],
             text: &text,
             judged: &judged,
+            admitted: &admitted,
             passed: &passed,
         };
         w.create(&note_path, note.text().as_bytes())

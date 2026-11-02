@@ -341,6 +341,10 @@ const _: () = {
                 Texel::Ink(i) | Texel::Half(i) => assert!((i as usize) < b.icon.dark.len()),
                 Texel::Hole(rgb) => assert!(rgb <= 0x00FF_FFFF),
             }
+            if b.icon.dark.len() > 2 {
+                assert!(b.texels.len() == b.icon.dark.len());
+                assert!(matches!(b.texels[k], Texel::Ink(i) if i as usize == k));
+            }
             k += 1;
         }
         let w = b.word.len();
@@ -496,23 +500,45 @@ pub fn icon_palette(mark: CliMark, ground: u32) -> Vec<FxInk> {
     let table = crate::color_math::relative_luminance_table();
     let lg = crate::color_math::relative_luminance_with(table, ground);
     let inks = b.icon.on(lg < 0.5);
-    let mut floored = [0u32; MAX_ICON_INKS];
-    let mut k = 0;
-    while k < inks.len() {
-        floored[k] = crate::color_math::floor_contrast_keeping_hue_with_ground_lum(
+    let mut out = Vec::with_capacity(b.texels.len());
+    if inks.len() <= 2 {
+        let f0 = crate::color_math::floor_contrast_keeping_hue_with_ground_lum(
             table,
-            inks[k],
+            inks[0],
             lg,
             ICON_CONTRAST,
         );
-        k += 1;
+        let f1 = if inks.len() > 1 {
+            crate::color_math::floor_contrast_keeping_hue_with_ground_lum(
+                table,
+                inks[1],
+                lg,
+                ICON_CONTRAST,
+            )
+        } else {
+            0
+        };
+        let floored = [f0, f1];
+        out.extend(b.texels.iter().map(|&t| match t {
+            Texel::Ink(i) => FxInk::over(floored[usize::from(i)], 255),
+            Texel::Half(i) => {
+                FxInk::over(premul_rgb(floored[usize::from(i)], HALF_ALPHA), HALF_ALPHA)
+            }
+            Texel::Hole(rgb) => FxInk::over(rgb, 255),
+        }));
+    } else {
+        out.extend(inks.iter().map(|&ink| {
+            FxInk::over(
+                crate::color_math::floor_contrast_keeping_hue_with_ground_lum(
+                    table,
+                    ink,
+                    lg,
+                    ICON_CONTRAST,
+                ),
+                255,
+            )
+        }));
     }
-    let mut out = Vec::with_capacity(b.texels.len());
-    out.extend(b.texels.iter().map(|&t| match t {
-        Texel::Ink(i) => FxInk::over(floored[usize::from(i)], 255),
-        Texel::Half(i) => FxInk::over(premul_rgb(floored[usize::from(i)], HALF_ALPHA), HALF_ALPHA),
-        Texel::Hole(rgb) => FxInk::over(rgb, 255),
-    }));
     out
 }
 

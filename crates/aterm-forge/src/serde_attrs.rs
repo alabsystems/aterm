@@ -100,6 +100,13 @@ fn lex(src: &str) -> Vec<Tok> {
                 .unwrap_or(i + 1);
             push(&mut out, Kind::Lit, b[i..end].iter().collect(), line);
             i = end;
+        } else if c == 'r'
+            && b.get(i + 1) == Some(&'#')
+            && b.get(i + 2).is_some_and(|&ch| ident_start(ch))
+        {
+            let end = (i + 2..n).find(|&j| !ident_char(b[j])).unwrap_or(n);
+            push(&mut out, Kind::Ident, b[i..end].iter().collect(), line);
+            i = end;
         } else if ident_start(c) {
             let end = (i..n).find(|&j| !ident_char(b[j])).unwrap_or(n);
             push(&mut out, Kind::Ident, b[i..end].iter().collect(), line);
@@ -209,7 +216,7 @@ fn split_commas(toks: &[Tok]) -> Vec<&[Tok]> {
         if t.kind == Kind::Punct {
             match t.text.as_str() {
                 "(" | "[" | "{" => depth += 1,
-                ")" | "]" | "}" => depth -= 1,
+                ")" | "]" | "}" if depth > 0 => depth -= 1,
                 "," if depth == 0 => {
                     if k > start {
                         items.push(&toks[start..k]);
@@ -274,7 +281,11 @@ fn derives(attr: &[Tok]) -> Vec<(String, bool)> {
 }
 
 fn form_of(item: &[Tok]) -> (String, String) {
-    let key = item[0].text.clone();
+    let key = item[0]
+        .text
+        .strip_prefix("r#")
+        .unwrap_or(&item[0].text)
+        .to_string();
     if item.len() == 1 {
         return (key, "bare".into());
     }
@@ -591,7 +602,7 @@ fn rs_files(
             if name != "target" && skip != Some(entry.path().as_path()) {
                 dirs.push(name);
             }
-        } else if name.ends_with(".rs") {
+        } else if ty.is_file() && name.ends_with(".rs") {
             files.push(name);
         }
     }
@@ -744,7 +755,7 @@ mod tests {
             ("crates/x/src/shebang_eof.rs", "#!"),
             (
                 "crates/x/src/broken_item.rs",
-                "#[serde(with(a) b)] struct B { f: u8 }",
+                "#[serde(with(a) b)] struct B { r#struct: u8, #[serde(r#type = \"T\")] f: u8 }",
             ),
         ]);
         let rendered = inv.render("crates/");
@@ -755,12 +766,16 @@ mod tests {
             rendered
                 .contains("container\twith\t?( a ) b\t1\t0\t0\tcrates/x/src/broken_item.rs:1\n")
         );
+        assert!(
+            rendered.contains("field\ttype\t= <string>\t1\t0\t0\tcrates/x/src/broken_item.rs:1\n")
+        );
         assert!(test_path("crates/a/src/foo_tests.rs") && !test_path("crates/a/src/latest.rs"));
     }
 
     #[test]
     fn the_implementation_is_listed_only_when_named() {
-        let root = std::env::temp_dir().join(format!("forge-serde-{}", std::process::id()));
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
         for (rel, src) in [
             (
                 "crates/aterm-serde/src/lib.rs",
@@ -775,9 +790,8 @@ mod tests {
             std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
             std::fs::write(&path, src).expect("write");
         }
-        let default = inventory(&root, &[]).expect("default tree");
-        let named = inventory(&root, &["crates/aterm-serde".into()]).expect("named tree");
-        let _ = std::fs::remove_dir_all(&root);
+        let default = inventory(root, &[]).expect("default tree");
+        let named = inventory(root, &["crates/aterm-serde".into()]).expect("named tree");
         assert!(
             default.contains("\tdefault\t") && !default.contains("\tskip\t"),
             "{default}"
@@ -793,5 +807,18 @@ mod tests {
             named.contains("form under crates/aterm-serde/\n"),
             "{named}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rs_files_ignores_symlinked_rs_files() {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join("real.rs"), "struct S;\n").expect("real.rs");
+        std::os::unix::fs::symlink(root.join("missing.rs"), root.join("dangling.rs"))
+            .expect("symlink");
+        let mut out = Vec::new();
+        rs_files(root, None, &mut out).expect("walk");
+        assert_eq!(out, vec![root.join("real.rs")]);
     }
 }

@@ -538,6 +538,39 @@ fn the_result_is_the_report_before_the_land_acts_then_the_defense() {
     );
 }
 
+/// THE RECEIPT QUOTES THE AUDITED DEFENSE: a landing the land check's `LANDED` ended reports the
+/// task's report and the defense the check audited, never the word itself; a check answered with
+/// anything else ends nothing. Negative control: the `LANDED` answer kept in the report.
+#[test]
+fn the_receipt_quotes_the_audited_defense() {
+    use crate::supervise::policy::land_check::{LAND_CHECK, LANDED};
+    let defense = "Nothing left: merged to origin/main at 4f2a9c1, worktree removed.";
+    let checked = |answer: &str| {
+        let mut rows = landing(LAND_NUDGE, &[says("a-defense", "msg_3", defense)]);
+        rows.extend([
+            user("u-check", LAND_CHECK),
+            says("a-checked", "msg_4", answer),
+            turn_duration(),
+        ]);
+        jsonl(&rows)
+    };
+    for by in [DoneBy::Turn, DoneBy::Check] {
+        let got = report(&checked(LANDED), by).expect("the landing's result");
+        assert_eq!(
+            (got.text.as_str(), got.uuid.as_str()),
+            (
+                format!("The parser is fixed; 12 tests pass.\n\n{defense}").as_str(),
+                "a-defense"
+            ),
+            "{by:?}"
+        );
+    }
+    assert_eq!(
+        report(&checked("The docs PR is still open."), DoneBy::Turn),
+        Err("no-reply")
+    );
+}
+
 #[test]
 fn a_landing_prunes_the_previous_result_pair() {
     let tasks = ScratchDir::new("result", "prune");
@@ -646,7 +679,7 @@ fn dead_pid() -> u32 {
         cmd
     };
     #[cfg(not(windows))]
-    let mut command = aterm_uds::spawnfd::Command::new("true");
+    let mut command = aterm_uds::spawnfd::Command::new(crate::test_program::kept("/usr/bin/true"));
     let mut child = command.spawn().expect("spawn");
     let dead = child.id();
     child.wait().expect("reap");
@@ -915,6 +948,93 @@ fn result_answers_the_snapshot_and_full_reads_the_thread_now() {
         "> Fix the parser and run the suite.\n\nRunning the suite.\n\nFixed the parser.\nAll green.\nATERM-TASK-DONE\n\n\
          > [aterm harness] A newer Claude Code is installed. Reply READY.\n\nREADY\n\n\
          > what did you change?\n\nOnly the parser.\n"
+    );
+}
+
+/// THE RESULT SAYS WHAT ATERM CHECKED (§14.9, slice 9c): a landing's `checked=` word noted in
+/// the sidecar ends `result`'s `OK` header, full or not, and the body is as it was; a later note
+/// replaces it, a word no record holds is refused and changes nothing, an `ERR` reply stays as it
+/// is, and a turn read again keeps the word. NEGATIVE CONTROL (run by hand): `answer` without
+/// `with_checked` fails the header.
+#[test]
+fn the_results_header_names_what_aterm_checked() {
+    let root = ScratchDir::new("result", "checked");
+    let tasks = root.join("tasks");
+    let transcript = root.join(format!("{SESSION}.jsonl"));
+    let rows = worked(&[says(
+        "a-report",
+        "msg_2",
+        "Fixed the parser.\nATERM-TASK-DONE",
+    )]);
+    std::fs::write(&transcript, jsonl(&rows)).expect("transcript");
+    let text = std::fs::read_to_string(&transcript).expect("read");
+    let snap =
+        snapshot(&tasks, "s-ab12-1", Some((&transcript, &text)), DoneBy::Turn).expect("written");
+    let plain = answer(&snap.path, false);
+    assert_eq!(checked_of(&snap.path), None);
+    assert!(!plain.contains("checked="), "{plain}");
+    note_checked(&snap.path, "3f9a1c2e4b7d@origin/main").expect("noted");
+    let (head, body) = plain.split_once('\n').expect("a header");
+    assert_eq!(
+        answer(&snap.path, false),
+        format!("{head} checked=3f9a1c2e4b7d@origin/main\n{body}")
+    );
+    let full = answer(&snap.path, true);
+    assert!(
+        full.lines()
+            .next()
+            .is_some_and(|h| h.ends_with(" checked=3f9a1c2e4b7d@origin/main")),
+        "{full}"
+    );
+    note_checked(&snap.path, "no-remote").expect("noted again");
+    assert_eq!(checked_of(&snap.path).as_deref(), Some("no-remote"));
+    let sidecar = std::fs::read_to_string(sidecar_of(&snap.path)).expect("sidecar");
+    assert_eq!(sidecar.matches("checked=").count(), 1, "{sidecar}");
+    for bad in ["", "a b", "x\u{7}", &"x".repeat(129)] {
+        assert!(note_checked(&snap.path, bad).is_err(), "{bad:?}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(sidecar_of(&snap.path)).expect("sidecar"),
+        sidecar,
+        "a refused word changes nothing"
+    );
+    assert!(note_checked(&tasks.join("s-none-1.result.md"), "no-repo").is_err());
+
+    let lag = jsonl(&lagging());
+    std::fs::write(&transcript, &lag).expect("transcript");
+    let lagged =
+        snapshot(&tasks, "s-ab12-2", Some((&transcript, &lag)), DoneBy::Turn).expect("written");
+    note_checked(&lagged.path, "no-repo").expect("noted");
+    assert!(
+        answer(&lagged.path, false).starts_with("ERR "),
+        "an ERR reply is as it is: {}",
+        answer(&lagged.path, false)
+    );
+    let mut later = lagging();
+    later.extend([
+        says("a-report", "msg_2", "Fixed the parser.\nATERM-TASK-DONE"),
+        turn_duration(),
+    ]);
+    std::fs::write(&transcript, jsonl(&later)).expect("transcript");
+    let again = reread(&lagged.path).expect("the turn's reply");
+    assert!(
+        again
+            .answer(&lagged.path, false)
+            .lines()
+            .next()
+            .is_some_and(|h| h.ends_with(" checked=no-repo")),
+        "{}",
+        again.answer(&lagged.path, false)
+    );
+    again.write(&lagged.path).expect("written over");
+    assert_eq!(checked_of(&lagged.path).as_deref(), Some("no-repo"));
+    assert!(
+        answer(&lagged.path, false)
+            .lines()
+            .next()
+            .is_some_and(|h| h.starts_with("OK 1 ") && h.ends_with(" checked=no-repo")),
+        "{}",
+        answer(&lagged.path, false)
     );
 }
 
@@ -2909,7 +3029,15 @@ fn an_older_codex_snapshot_reads_as_it_did_and_a_new_one_reads_in_an_older_reade
         "source=none why=no-transcript thread=-",
         "the fields it has"
     );
-    for source in [missed.clone(), bare] {
+    let negative_landed = Source::RolloutUnavailable {
+        why: "no-reply".to_string(),
+        thread: THREAD.to_string(),
+        turn: Some("t 3".to_string()),
+        rollout: Some(PathBuf::from("/Users//a b/.codex/sessions/rollout-x.jsonl")),
+        home: Some(PathBuf::from("/Users//a b/.codex")),
+        landed: Some(-42),
+    };
+    for source in [missed.clone(), negative_landed, bare] {
         assert_eq!(Source::parse(&source.line()), Some(source.clone()));
     }
     let line = missed.line();

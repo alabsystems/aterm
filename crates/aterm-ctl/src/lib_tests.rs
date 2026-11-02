@@ -4,6 +4,53 @@
 use super::*;
 
 #[test]
+fn maintenance_inventory_cannot_skip_an_unreadable_or_malformed_graph_record() {
+    let scratch = aterm_tempfile::tempdir().expect("private inventory");
+    let dir = scratch.path();
+    let read =
+        || enumerate_instances_with(dir, std::fs::read_dir(dir).unwrap(), Inventory::Complete);
+    assert!(read().expect("genuinely empty inventory").is_empty());
+    let graph = dir.join("graph");
+    std::fs::create_dir(&graph).unwrap();
+    let record = graph.join("session");
+    std::fs::write(&record, "sock /tmp/aterm-123.sock\n").unwrap();
+    assert_eq!(
+        read()
+            .expect("complete legacy graph record")
+            .into_iter()
+            .map(Target::listed)
+            .collect::<Vec<_>>(),
+        vec![(0, "/tmp/aterm-123.sock".into())],
+    );
+    std::fs::write(&record, "pid 123\n").unwrap();
+    assert!(read().is_err(), "no socket is unknown");
+    assert!(
+        enumerate_instances(dir, std::fs::read_dir(dir).unwrap()).is_empty(),
+        "ordinary display still skips a malformed record",
+    );
+    std::fs::write(&record, vec![b'x'; MAX_GRAPH_ENTRY_BYTES as usize + 1]).unwrap();
+    assert!(read().is_err(), "bounded graph read");
+    std::fs::remove_file(&record).unwrap();
+    std::fs::create_dir(&record).unwrap();
+    assert!(read().is_err(), "non-file is unknown");
+    std::fs::remove_dir(&record).unwrap();
+    assert!(read().expect("known empty again").is_empty());
+    let entries = || -> [io::Result<std::fs::DirEntry>; 1] {
+        [Err(io::Error::other("injected directory iteration error"))]
+    };
+    assert!(
+        enumerate_instances_with(dir, entries(), Inventory::Complete).is_err(),
+        "the actual enumeration cannot drop an iterator error",
+    );
+    assert!(
+        enumerate_instances_with(dir, entries(), Inventory::Display)
+            .unwrap()
+            .is_empty(),
+        "display retains its lenient behavior",
+    );
+}
+
+#[test]
 fn protocol_success_requires_a_complete_ok_token() {
     for header in ["OK", "OK 0", "OK version=1", "OK subscribe 2"] {
         assert!(is_ok_reply(header), "{header}");
@@ -45,6 +92,7 @@ fn byte_count_first_token_and_cap() {
     assert_eq!(byte_count("77 incomplete"), Some(77));
     assert_eq!(byte_count(""), None);
     assert_eq!(byte_count("x"), None);
+    assert_eq!(byte_count("+1234"), None);
     assert_eq!(
         byte_count(&MAX_BODY_BYTES.to_string()),
         Some(MAX_BODY_BYTES)
@@ -314,6 +362,8 @@ fn stream_count_ignores_incomplete_marker() {
     assert_eq!(note("3"), None);
     assert_eq!(stream_count("42"), Some(42));
     assert_eq!(stream_count("0"), Some(0));
+    assert_eq!(stream_count("+42"), None);
+    assert_eq!(note("+100000 incomplete").as_deref(), Some(depth));
     assert_eq!(stream_count(""), None);
     assert_eq!(stream_count("incomplete"), None);
     assert_eq!(
@@ -746,6 +796,23 @@ fn a_spawn_line_keeps_a_spaced_folder_whole() {
     assert_eq!(
         line(&["spawn", "cwd=/a \"b"]).unwrap_err().kind(),
         io::ErrorKind::InvalidInput
+    );
+}
+
+#[test]
+fn a_spawn_line_keeps_a_spaced_theme_whole() {
+    let line = |parts: &[&str]| spawn_wire_line(&argv(parts));
+    assert_eq!(
+        line(&["spawn", "theme=Rose Pine", "cwd=/w"]).unwrap(),
+        "spawn theme=\"Rose Pine\" cwd=/w"
+    );
+    assert_eq!(
+        line(&["spawn", "theme=\"Aterm Day\""]).unwrap(),
+        "spawn theme=\"Aterm Day\""
+    );
+    assert_eq!(
+        line(&["spawn", "theme=Hearth"]).unwrap(),
+        "spawn theme=Hearth"
     );
 }
 
@@ -1433,7 +1500,7 @@ fn parse_timeout_zero_disables_positive_is_seconds() {
         parse_timeout("5").unwrap(),
         Some(std::time::Duration::from_secs(5))
     );
-    for bad in ["", "-1", "abc", "1.5", "  "] {
+    for bad in ["", "-1", "+5", "abc", "1.5", "  "] {
         let e = parse_timeout(bad).unwrap_err();
         assert_eq!(
             e.kind(),
@@ -2108,6 +2175,7 @@ fn help_is_answered_client_side_only_for_what_the_client_knows() {
     let ls = client_help_reply(&strings(&["help", "ls"]), HelpAsked::ByVerb).unwrap();
     let order = [
         "supervisor=<holder|->",
+        "supervisor_version=<pct|-> supervisor_vendor=<pct|->",
         "autopilot=<off|cruise|land|->",
         "path_evidence=",
         "upgrade=<-|<state>/<to>/<why>/<age>>",
@@ -3560,6 +3628,11 @@ fn windows_rows_never_read_the_title_as_a_token() {
         window_rows_from_sessions(9, &lines),
         vec!["9 window=- sessions=1".to_string()]
     );
+    let lines = vec!["0 s-a - alive sh meta=0 window=+1 active=1 wfocus=1 detail=-".to_string()];
+    assert_eq!(
+        window_rows_from_sessions(9, &lines),
+        vec!["9 window=- sessions=1".to_string()]
+    );
 }
 
 #[test]
@@ -4174,5 +4247,26 @@ fn a_sys_instances_all_run_sends_the_plain_request_to_each_instance() {
         "{sent:?}"
     );
     let _ = std::fs::remove_file(&sock);
+    let _ = std::fs::remove_dir(&dir);
+}
+
+#[test]
+fn read_control_token_file_rejects_internal_whitespace_and_control_chars() {
+    let dir = std::env::temp_dir().join(format!("aterm-ctl-tok-bad-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("aterm-1.sock.token");
+    std::fs::write(&path, "  deadbeef  \n").expect("write valid token");
+    assert_eq!(read_control_token_file(&path).unwrap(), "deadbeef");
+    for bad in [
+        "dead beef\n",
+        "dead\tbeef\n",
+        "dead\x00beef\n",
+        "dead\nbeef\n",
+    ] {
+        std::fs::write(&path, bad).expect("write bad token");
+        let err = read_control_token_file(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{bad:?}");
+    }
+    let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir(&dir);
 }

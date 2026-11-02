@@ -141,11 +141,15 @@ pub(crate) fn build(
     device.new_render_pipeline(&desc)
 }
 
-/// Compiles `library` for `device` ([`super::shaders::source_for`]) with [`ffi::CompileOptions::aterm_default`]: [`compile_library_with`] over the device's own compiler.
+/// Compiles `library` for `device` ([`super::shaders::source_for`]) with [`ffi::CompileOptions::aterm_default`], or [`ffi::CompileOptions::aterm_precise`] for [`ShaderLibrary::TrayPrims`], whose floats must land the CPU raster's: [`compile_library_with`] over the device's own compiler.
 pub(crate) fn compile_library(device: &Device, library: ShaderLibrary) -> Result<Library, String> {
     compile_library_with(device, library, |src| {
-        let opts = ffi::CompileOptions::aterm_default()
-            .ok_or_else(|| "MTLCompileOptions allocation failed".to_owned())?;
+        let opts = if matches!(library, ShaderLibrary::TrayPrims) {
+            ffi::CompileOptions::aterm_precise()
+        } else {
+            ffi::CompileOptions::aterm_default()
+        }
+        .ok_or_else(|| "MTLCompileOptions allocation failed".to_owned())?;
         device.new_library_with_options(src, &opts)
     })
 }
@@ -207,6 +211,20 @@ mod tests {
             }
         }
         if super::super::fetch::capable(&dev) {
+            build(
+                &dev,
+                &libs[&ShaderLibrary::TrayPrims],
+                &crate::pipeline_table::TRAY_PRIMS,
+                PixelFormat::Bgra8Unorm,
+            )
+            .unwrap_or_else(|e| panic!("the tray prims pipeline failed to build: {e}"));
+            build(
+                &dev,
+                &libs[&ShaderLibrary::TrayPrims],
+                &crate::pipeline_table::TRAY_LAYER,
+                PixelFormat::Bgra8Unorm,
+            )
+            .unwrap_or_else(|e| panic!("the tray layer pipeline failed to build: {e}"));
             for twin in crate::pipeline_table::FetchTwin::ALL {
                 build(
                     &dev,

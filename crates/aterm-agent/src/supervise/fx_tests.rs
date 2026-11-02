@@ -201,6 +201,24 @@ fn a_running_scripted_clock_keeps_pace_with_the_monotonic_clock() {
     }
 }
 
+/// A TICKING CLOCK: each wall read moves the fixed clock on by its tick after the read, so two
+/// reads never agree, and a peek (the fixed stamp's) moves nothing. Untick it (0) and the reads
+/// agree again, which is the control.
+#[test]
+fn a_ticking_scripted_clock_moves_on_at_each_read_alone() {
+    let mut fx = Fx::os();
+    let clock = fx.scripted_handle().expect("scripted");
+    clock.set_at_ms(NOW * 1000);
+    assert_eq!((fx.wall_ms(), fx.wall_ms()), (NOW * 1000, NOW * 1000));
+    clock.set_tick_ms(1);
+    assert_eq!(
+        [fx.wall_ms(), fx.peek().1, fx.wall_ms(), fx.wall_ms()],
+        [NOW * 1000, NOW * 1000 + 1, NOW * 1000 + 1, NOW * 1000 + 2]
+    );
+    clock.set_tick_ms(0);
+    assert_eq!(fx.wall_ms(), fx.wall_ms());
+}
+
 /// After `stand_mono`, monotonic reads and peeks stay fixed across real sleeps.
 #[test]
 fn a_standing_monotonic_clock_reads_no_real_time() {

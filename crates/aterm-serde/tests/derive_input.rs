@@ -317,6 +317,15 @@ impl Assoc for u8 {
     type Out = String;
 }
 
+impl<X> Assoc for fn() -> X {
+    type Out = Vec<X>;
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+struct QualifiedAssoc<T> {
+    nested: <<fn() -> T as Assoc>::Out as ::core::iter::IntoIterator>::Item,
+}
+
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 struct Nested<K: Ord, V, A: Assoc> {
     map: BTreeMap<K, Vec<Option<(V, [u8; 2])>>>,
@@ -357,6 +366,18 @@ fn nested_generics_and_an_associated_type_are_bounded() {
             Token::MapEnd,
             Token::Str("out"),
             Token::Str("x"),
+            Token::StructEnd,
+        ],
+    );
+    assert_tokens(
+        &QualifiedAssoc::<u16> { nested: 42 },
+        &[
+            Token::Struct {
+                name: "QualifiedAssoc",
+                len: 1,
+            },
+            Token::Str("nested"),
+            Token::U16(42),
             Token::StructEnd,
         ],
     );

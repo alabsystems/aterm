@@ -167,6 +167,10 @@ impl Proposal {
     pub fn terms(&self) -> &Terms {
         &self.terms
     }
+    /// Proposed root identities for review. These bytes confer no authority.
+    pub const fn trust(&self) -> Trust {
+        self.trust
+    }
 }
 
 /// An allocation whose exact bytes match an independently trusted activation

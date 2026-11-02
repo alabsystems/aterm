@@ -322,11 +322,7 @@ fn scan_files(root: &Path) -> Vec<PathBuf> {
         let _ = crate::collect_rs_files(&dir, &mut files);
     }
     files.retain(|p| !crate::is_test_file(p));
-    files.retain(|p| {
-        !p.to_string_lossy()
-            .replace('\\', "/")
-            .contains(SELF_EXCLUDED_DIR)
-    });
+    files.retain(|p| !crate::slash(p).contains(SELF_EXCLUDED_DIR));
     files.sort();
     files
 }
@@ -341,11 +337,7 @@ fn read_sources(root: &Path, files: &[PathBuf]) -> Vec<(String, String)> {
         let Ok(raw) = crate::tree::read_to_string(path) else {
             continue;
         };
-        let rel = path
-            .strip_prefix(root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let rel = crate::rel_path(root, path);
         out.push((rel, raw));
     }
     out
@@ -853,9 +845,9 @@ fn enclosing_fns(lines: &[&str]) -> Vec<Option<String>> {
 
 /// The text between the `(` at byte offset `at` and its matching `)`.
 fn balanced(joined: &str, at: usize) -> Vec<String> {
-    let bytes = joined.as_bytes();
+    let at = joined.floor_char_boundary(at.min(joined.len()));
     let mut depth = 0i32;
-    let mut end = joined.len().min(at + 40_000);
+    let mut end = joined.floor_char_boundary(joined.len().min(at.saturating_add(40_000)));
     for (i, b) in joined[at..end].bytes().enumerate() {
         if b == b'(' {
             depth += 1;
@@ -867,7 +859,6 @@ fn balanced(joined: &str, at: usize) -> Vec<String> {
             }
         }
     }
-    let _ = bytes;
     joined[at..end].lines().map(str::to_string).collect()
 }
 
@@ -1448,6 +1439,11 @@ pub fn armed() -> bool {
                 Some(vec!["[OB-19]"]),
             ));
         }
+        let mut multibyte = String::from("(");
+        multibyte.push_str(&"x".repeat(39_998));
+        multibyte.push('\u{00a0}');
+        multibyte.push(')');
+        assert!(!balanced(&multibyte, 0).is_empty());
         for (name, sources, red) in &cases {
             let out = run_synth_sources(sources);
             match red {

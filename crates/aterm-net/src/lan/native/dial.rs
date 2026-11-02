@@ -4,10 +4,7 @@
 //! An unconnected TCP socket whose source, interface and hop limit are fixed
 //! before the first SYN. The caller checks its exact tuple before `connect`.
 
-use super::{
-    refuse, socket_policy,
-    tcp::{Address, bound},
-};
+use super::{refuse, socket_policy, tcp::bound};
 use std::{
     io,
     net::{SocketAddr, TcpStream},
@@ -158,7 +155,7 @@ impl Dial {
 }
 
 fn start(stream: &TcpStream, peer: SocketAddr) -> io::Result<()> {
-    let address = Address::new(peer);
+    let address = aterm_uds::connect::Inet::new(peer);
     let (pointer, length) = address.parts();
     // SAFETY: address owns a correctly sized, initialized sockaddr.
     if unsafe { libc::connect(stream.as_raw_fd(), pointer, length) } == 0 {

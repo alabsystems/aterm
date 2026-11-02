@@ -149,18 +149,17 @@ impl Program {
         }
     }
 
-    /// Canonical [`crate::CliHarness`] entry for this program, or `None` for [`Program::Generic`].
+    /// Canonical [`crate::CliHarness`] entry for this program, or `None` for Codex (native controls) and [`Program::Generic`].
     #[inline]
     #[must_use]
     pub const fn cli_harness(self) -> Option<crate::CliHarness> {
         match self {
             Program::Claude => Some(crate::CliHarness::ClaudeCode),
-            Program::Codex => Some(crate::CliHarness::CodexAlab),
             Program::Agy => Some(crate::CliHarness::Agy),
             Program::Muse => Some(crate::CliHarness::Muse),
             Program::Grok => Some(crate::CliHarness::Grok),
             Program::Kimi => Some(crate::CliHarness::Kimi),
-            Program::Generic => None,
+            Program::Codex | Program::Generic => None,
         }
     }
 
@@ -237,14 +236,19 @@ pub struct Reading {
     pub warning: Option<crate::credits::Warning>,
 }
 
+/// A caller's veto on a row [`ScreenReader::said_lines`] would join by the pane's width:
+/// `apart(line, row)`, `line` the line so far and `row` the next row's text, says the row opens
+/// a line of its own all the same.
+pub type Apart = fn(&str, &str) -> bool;
+
 /// Per-program screen grammar.
 pub trait ScreenReader: Sync {
     fn program(&self) -> Program;
-    /// Structured version of this program's harness, or `None` for [`Program::Generic`].
+    /// Structured version of this program's harness, or `None` for Codex (native controls) and [`Program::Generic`].
     fn harness_version_num(&self) -> Option<crate::HarnessVersion> {
         self.program().harness_version_num()
     }
-    /// Incremental version of this program's harness (`"0.4"`), or `None` for [`Program::Generic`].
+    /// Incremental version of this program's harness (`"0.4"`), or `None` for Codex (native controls) and [`Program::Generic`].
     fn harness_version(&self) -> Option<&'static str> {
         self.program().harness_version()
     }
@@ -273,6 +277,12 @@ pub trait ScreenReader: Sync {
     }
     /// Description of agent-started background work keeping an idle screen busy, if any.
     fn background_wait(&self, _rows: &[String]) -> Option<&'static str> {
+        None
+    }
+    /// The phase a [`Phase::Busy`] screen rests at when only the agent's own background work keeps
+    /// it busy and its turn is over ([`crate::phase::background_rest`]), `None` where the reader
+    /// reads no such turn end.
+    fn background_rest(&self, _rows: &[String]) -> Option<Phase> {
         None
     }
     /// Whether the last turn's end is hidden off-screen while the session rests idle.
@@ -311,6 +321,15 @@ pub trait ScreenReader: Sync {
     /// Earlier agent messages from the same turn above [`Self::said_tail`], joined by blank lines.
     fn turn_said_before(&self, _rows: &[String]) -> Option<String> {
         None
+    }
+    /// [`Self::said_tail`], each line the program wrapped across rows read as one by the pane's
+    /// width, every other row, and each row `apart` sets apart ([`Apart`]), a line of its own.
+    fn said_lines(&self, rows: &[String], _apart: Apart) -> Option<String> {
+        self.said_tail(rows)
+    }
+    /// [`Self::turn_said_before`], its lines read as [`Self::said_lines`] reads them.
+    fn turn_lines_before(&self, rows: &[String], _apart: Apart) -> Option<String> {
+        self.turn_said_before(rows)
     }
     /// Whether the entire turn ending at [`Self::said_tail`] is visible on `rows`.
     fn turn_whole(&self, rows: &[String]) -> bool {
@@ -368,6 +387,10 @@ pub trait ScreenReader: Sync {
     }
     /// Whether the screen shows only the initial launch card with no turn yet.
     fn fresh(&self, _rows: &[String]) -> bool {
+        false
+    }
+    /// Whether the screen shows the opening exchange whole: the launch card, then one user message.
+    fn opening(&self, _rows: &[String]) -> bool {
         false
     }
     fn composer(&self, _rows: &[String]) -> Option<(usize, Vec<String>)> {
@@ -439,6 +462,11 @@ pub trait ScreenReader: Sync {
     /// at rest, `None` where the reader has no reading of the program's titles (the default).
     fn title_runs(&self, _title: &str) -> Option<bool> {
         None
+    }
+    /// Whether `rows` draw the program's own mark that its turn ended, in a frame that holds all
+    /// of its reply: an end that needs no title to vouch for it.
+    fn end_drawn(&self, _rows: &[String]) -> bool {
+        false
     }
     /// Whether cursor position `cursor_row` vouches for `reading`.
     fn cursor_vouches(
@@ -535,6 +563,9 @@ impl ScreenReader for ClaudeReader {
     fn background_wait(&self, rows: &[String]) -> Option<&'static str> {
         crate::phase::background_wait(rows)
     }
+    fn background_rest(&self, rows: &[String]) -> Option<Phase> {
+        crate::phase::background_rest(rows)
+    }
     fn context(&self, rows: &[String]) -> Option<u8> {
         context_left(rows)
     }
@@ -552,6 +583,12 @@ impl ScreenReader for ClaudeReader {
     }
     fn turn_said_before(&self, rows: &[String]) -> Option<String> {
         crate::turn::turn_said_before(rows)
+    }
+    fn said_lines(&self, rows: &[String], apart: Apart) -> Option<String> {
+        crate::turn::said_lines(rows, apart)
+    }
+    fn turn_lines_before(&self, rows: &[String], apart: Apart) -> Option<String> {
+        crate::turn::turn_lines_before(rows, apart)
     }
     fn turn_whole(&self, rows: &[String]) -> bool {
         crate::turn::turn_whole(rows)
@@ -576,6 +613,9 @@ impl ScreenReader for ClaudeReader {
     }
     fn fresh(&self, rows: &[String]) -> bool {
         crate::turn::fresh(rows)
+    }
+    fn opening(&self, rows: &[String]) -> bool {
+        crate::turn::opening(rows)
     }
     fn message_drawn(&self, rows: &[String]) -> bool {
         crate::turn::message_drawn(rows)
@@ -628,6 +668,18 @@ impl ScreenReader for ClaudeReader {
             || has_composer_frame(rows)
             || has_shell_mode_frame(rows)
             || wall(rows).is_some()
+    }
+    /// Its title's lead glyph ([`crate::phase::title_runs`]). Under a status line a reply still
+    /// being drawn shows no busy sign on the screen: the footer has no `esc to interrupt`, and
+    /// the spinner row is gone once the reply's first line is drawn. Every other title says it
+    /// is not running; an empty one is a title never set, which the harness takes as saying
+    /// nothing.
+    fn title_runs(&self, title: &str) -> Option<bool> {
+        Some(crate::phase::title_runs(title))
+    }
+    /// Its done row under the reply ([`crate::phase::done_row_drawn`]).
+    fn end_drawn(&self, rows: &[String]) -> bool {
+        crate::phase::done_row_drawn(rows)
     }
     /// Claude Code's `idle` at a prompt box is evidence only where that box holds the
     /// cursor ([`crate::phase::prompt_box_holds`]); a wall and every other phase stand as
@@ -696,6 +748,12 @@ impl ScreenReader for AgyReader {
     fn turn_said_before(&self, rows: &[String]) -> Option<String> {
         agy::turn_said_before(rows)
     }
+    fn said_lines(&self, rows: &[String], apart: Apart) -> Option<String> {
+        agy::said_lines(rows, apart)
+    }
+    fn turn_lines_before(&self, rows: &[String], apart: Apart) -> Option<String> {
+        agy::turn_lines_before(rows, apart)
+    }
     fn turn_whole(&self, rows: &[String]) -> bool {
         agy::turn_whole(rows)
     }
@@ -737,6 +795,9 @@ impl ScreenReader for AgyReader {
     fn fresh(&self, rows: &[String]) -> bool {
         agy::fresh(rows)
     }
+    fn opening(&self, rows: &[String]) -> bool {
+        agy::opening(rows)
+    }
     fn message_drawn(&self, rows: &[String]) -> bool {
         agy::message_drawn(rows)
     }
@@ -745,6 +806,9 @@ impl ScreenReader for AgyReader {
     }
     fn composer(&self, rows: &[String]) -> Option<(usize, Vec<String>)> {
         agy::composer_draft(rows)
+    }
+    fn transcript_end(&self, rows: &[String]) -> usize {
+        agy::transcript_end(rows)
     }
     fn caret(&self) -> Option<char> {
         Some('>')
@@ -798,6 +862,12 @@ impl ScreenReader for MuseReader {
     fn turn_said_before(&self, rows: &[String]) -> Option<String> {
         muse::turn_said_before(rows)
     }
+    fn said_lines(&self, rows: &[String], apart: Apart) -> Option<String> {
+        muse::said_lines(rows, apart)
+    }
+    fn turn_lines_before(&self, rows: &[String], apart: Apart) -> Option<String> {
+        muse::turn_lines_before(rows, apart)
+    }
     fn turn_whole(&self, rows: &[String]) -> bool {
         muse::turn_whole(rows)
     }
@@ -831,6 +901,9 @@ impl ScreenReader for MuseReader {
     }
     fn fresh(&self, rows: &[String]) -> bool {
         muse::fresh(rows)
+    }
+    fn opening(&self, rows: &[String]) -> bool {
+        muse::opening(rows)
     }
     fn message_drawn(&self, rows: &[String]) -> bool {
         muse::message_drawn(rows)
@@ -2337,17 +2410,17 @@ mod tests {
     }
 
     #[test]
-    fn every_named_program_reads_its_harness_version() {
+    fn only_hosted_harnesses_read_a_harness_version() {
         for prog in Program::ALL {
-            // Every named program's harness has a version; a `[harness.<agent>]` table only
-            // where its supervision has keys (Grok Build's and Kimi Code's has none yet).
+            // Codex owns its version. Hosted harnesses have an independent version;
+            // a Codex policy table does not introduce another harness.
             assert_eq!(
                 prog.harness_version().is_some(),
-                prog != Program::Generic,
+                !matches!(prog, Program::Generic | Program::Codex),
                 "{prog:?}"
             );
             assert!(
-                !prog.harness_table() || prog.harness_version().is_some(),
+                !prog.harness_table() || prog == Program::Codex || prog.harness_version().is_some(),
                 "{prog:?}"
             );
             assert_eq!(
@@ -2369,5 +2442,70 @@ mod tests {
         }
         assert_eq!(Program::Generic.harness_version(), None);
         assert_eq!(Program::Generic.harness_version_num(), None);
+    }
+
+    /// Claude Code's title runs under one of its two busy frames and a blank (2.1.311 lab `mr`:
+    /// `◐`/`◑ Claude Code` flipped every 0.96 s through the reply, `✳ Claude Code` once it
+    /// ended). Its rest glyph, a title with no glyph, an empty title (what `title` answers where
+    /// the program set none) and Muse Code's spinner say no run: each is a reading, never `None`,
+    /// since the loop asks `title_runs("")` whether to read the title at all.
+    #[test]
+    fn claude_codes_title_says_whether_its_turn_runs() {
+        let runs = |t: &str| ClaudeReader.title_runs(t);
+        for t in ["◐ Claude Code", "◑ Claude Code", "◑ Auto-prompting…", "◐ "] {
+            assert_eq!(runs(t), Some(true), "{t:?}");
+        }
+        let rest = format!("{} Claude Code", crate::anchor!("title.rest"));
+        for t in [
+            rest.as_str(),
+            "Claude Code",
+            "",
+            "◐",
+            "◐Claude Code",
+            "Claude Code ◐",
+            " ◑ Claude Code",
+            "◓ Claude Code",
+            "⠙ proj",
+        ] {
+            assert_eq!(runs(t), Some(false), "{t:?}");
+        }
+    }
+
+    /// Under a status line Claude Code draws a reply with no busy sign on the screen (2.1.311 lab
+    /// `mr`, MEASURED): the frames mid-reply and with the last line held back are the finished
+    /// reply's chrome row for row, less its done row. The finished reply reads an idle that is
+    /// evidence, every `NEEDS YOU` line in what it said, under its done row
+    /// ([`ScreenReader::end_drawn`]); the two frames before it hold fewer, which is why the loop
+    /// waits for the title's rest ([`crate::phase::title_runs`]) where no done row is drawn.
+    #[test]
+    fn a_reply_drawn_under_a_status_line_says_all_of_it_only_once_done() {
+        use crate::prompt::fixtures::{
+            STATUSLINE_LAST_LINE_HELD_2_1_311, STATUSLINE_MIDREPLY_2_1_311,
+            STATUSLINE_REPLY_DONE_2_1_311,
+        };
+        let needs = |r: &Reading| {
+            r.said_tail
+                .as_deref()
+                .map_or(0, |t| t.matches("NEEDS YOU:").count())
+        };
+        let done = read(Some("claude"), &screen(STATUSLINE_REPLY_DONE_2_1_311), None);
+        assert_eq!(
+            (done.phase.clone(), done.phase_authoritative, needs(&done)),
+            (Phase::Idle, true, 4),
+            "{done:?}"
+        );
+        assert!(ClaudeReader.end_drawn(&screen(STATUSLINE_REPLY_DONE_2_1_311)));
+        for (name, text, drawn) in [
+            ("mid-reply", STATUSLINE_MIDREPLY_2_1_311, 0),
+            ("the last line held", STATUSLINE_LAST_LINE_HELD_2_1_311, 3),
+        ] {
+            let rows = screen(text);
+            assert_eq!(needs(&read(Some("claude"), &rows, None)), drawn, "{name}");
+            assert!(!ClaudeReader.end_drawn(&rows), "{name}: no done row yet");
+            assert!(
+                !rows.iter().any(|r| r.contains("esc to interrupt")),
+                "{name}: the status line's footer"
+            );
+        }
     }
 }

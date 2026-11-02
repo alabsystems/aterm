@@ -197,7 +197,7 @@ no path of any kind (a font name with `/`, `\`, a leading `~` or `.`, a drive le
 reaches a theme only as `font_size_scale`); no padding or opacity; and nothing that moves or
 makes a sound. Any of those is an unknown key or a bad value, so the file does not load. aterm
 also skips symlinks in the folder, refuses a file over 256 KiB, and reads a bounded number of
-files (`aterm help themes` has the numbers). `docs/DESIGN-theme-packages.md` §3.3 gives the
+files (`aterm help themes` has the numbers). `docs/ATERM_DESIGN.md` §8.5 gives the
 reasoning key by key.
 
 ## The quality bar

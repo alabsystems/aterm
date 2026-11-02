@@ -174,6 +174,20 @@ fn a_tampered_or_expired_held_copy_is_not_used() {
     std::fs::write(&doc, "schema = 1\nseq = 1\npreferred = \"muse\"\n").expect("tamper");
     let got = held(dir.path(), URL, &a.public, NOW).expect_err("tampered");
     assert!(got.contains("does not verify"), "{got}");
+
+    let sig_file = cache_dir(dir.path()).join(SIG_FILE);
+    std::fs::write(&sig_file, vec![b'A'; (SIG_MAX as usize) + 1]).expect("oversize sig");
+    std::fs::write(&doc, "schema = 1\nseq = 1\nvalid_until = 1800003600\n").expect("restore doc");
+    let over = held(dir.path(), URL, &a.public, NOW).expect_err("oversize sig");
+    assert!(over.contains("signature is gone"), "{over}");
+    #[cfg(unix)]
+    {
+        let real_sig = dir.path().join("outside.sig");
+        std::fs::write(&real_sig, b"x").expect("outside sig");
+        std::fs::remove_file(&sig_file).expect("rm sig");
+        std::os::unix::fs::symlink(&real_sig, &sig_file).expect("symlink sig");
+        assert!(held(dir.path(), URL, &a.public, NOW).is_err());
+    }
 }
 
 #[test]

@@ -10,7 +10,7 @@ use std::io::{Read, Write};
 /// The longest line either side reads.
 pub(super) const MAX_LINE: usize = 4096;
 /// The longest free text field (a name, a model).
-const MAX_TEXT: usize = 64;
+pub(super) const MAX_TEXT: usize = 64;
 
 /// Read one `\n`-ended line, byte by byte so nothing after it is taken.
 pub(super) fn read_line<S: Read + ?Sized>(stream: &mut S) -> Result<String> {

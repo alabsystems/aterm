@@ -30,15 +30,9 @@ const TOPIC: &str = "seamless.t";
 
 const GAP_TOPIC: &str = "seamless.g";
 
-/// The topic the hwkey leg adds after its second key and drops after its third, each move an
-/// entry that writes a key a's timeline held.
-const KEYS_TOPIC: &str = "seamless.k";
-
 const ROLL_PAST: u64 = 200;
 
 const ROLL_MAX: u32 = 4000;
-
-const BURST_GAP_MS: u64 = 30_000;
 
 const RUNS: usize = 4;
 
@@ -406,15 +400,6 @@ impl Desk {
         field(&self.ctl(&[&format!("@{sid}"), "status"]).stdout, key)
     }
 
-    /// `@sid`'s `key=` count in `status`, or the failed reply: a baseline a later count must
-    /// exceed is a reading, never `None`, which every count exceeds.
-    fn status_count(&self, sid: &str, key: &str) -> Result<u64, String> {
-        let st = self.ok(&[&format!("@{sid}"), "status"])?.stdout;
-        field(&st, key)
-            .and_then(|v| v.parse().ok())
-            .ok_or_else(|| format!("@{sid} status names no {key}= count: {}", st.trim()))
-    }
-
     fn cursor(&self, sid: &str) -> Result<(String, String), String> {
         let st = self.ctl(&[&format!("@{sid}"), "status"]).stdout;
         match (field(&st, "log_seq"), field(&st, "log_ep")) {
@@ -594,8 +579,8 @@ fn across_update(aterm: &Path, keep: bool) -> Result<Vec<(&'static str, Verdict)
     if keep {
         world.keep();
     }
-    let mut fabric = Fabric::start(aterm, &world.dir.join("fabric"))
-        .map_err(|e| Fail::die(format!("seamless: cannot start the lab's bus: {e}")))?;
+    let mut fabric =
+        Fabric::start(aterm, &world.dir.join("fabric")).map_err(|e| e.fail("seamless", aterm))?;
     fabric
         .name_in(&world.cfg.join("aterm/aterm.toml"))
         .map_err(|e| Fail::die(format!("seamless: {e}")))?;
@@ -991,7 +976,7 @@ fn legs(
         .find(|(_, s)| *s == a)
         .map(|(l, _)| l);
     let (gap, gap_topics) = slow_readers(desk, fabric, &a, &b, local_a.as_deref(), &mut events)?;
-    let person = person_keys(desk, &a, &b)?;
+    let native = native_keys(desk, &b)?;
     events.end();
     ended.extend(bridge_pid(&fabric.state));
     if let Ok(p) = &planted {
@@ -1010,7 +995,7 @@ fn legs(
         ("redial", redial_need),
         ("redial75", redial_close),
         ("latch", latch),
-        ("hwkey", person),
+        ("hwkey", native),
         ("privacy", privacy),
     ])
 }
@@ -1673,199 +1658,211 @@ fn count_of(hay: &[u8], needle: &[u8]) -> usize {
     hay.windows(needle.len()).filter(|w| *w == needle).count()
 }
 
-fn person_keys(desk: &Desk, a: &str, b: &str) -> Result<Verdict, Fail> {
-    let verdict = keys_on(desk, a, b);
-    let _ = desk.ctl(&[&format!("@{a}"), "ctrl", "u"]);
-    verdict
-}
-
-fn keys_on(desk: &Desk, a: &str, b: &str) -> Result<Verdict, Fail> {
-    let at_a = format!("@{a}");
+/// Successor-local native input, after every handoff reader has finished. A fresh terminal
+/// keeps the deliberately rolled reader log and its shell untouched.
+fn native_keys(desk: &Desk, b: &str) -> Result<Verdict, Fail> {
     if let Err(why) = crate::meta_keys::await_idle()? {
         return Ok(Verdict::CouldNotRun(format!(
             "hwkey presses keys at an idle desk: {why}"
         )));
     }
-    let _ = desk.ctl(&["raise", a]);
-    let read = || desk.ctl(&[&at_a, "log", "kinds=mail,human"]).stdout;
-    // A reading the verdict counts from (a baseline, or the marks once the keys are written): a
-    // failed one is the leg's failure, never a count of nothing.
-    let read_ok = || {
-        desk.ok(&[&at_a, "log", "kinds=mail,human"])
-            .map(|r| r.stdout)
+    let spawned = match desk.ok(&["spawn"]) {
+        Ok(r) => r,
+        Err(why) => return Ok(Verdict::Fail(why)),
     };
-    // `status`'s count of a's keys. A wait for it to pass a baseline skips a failed read; a failed
-    // read of the baseline itself fails the leg, never stands as `None`, which every count exceeds.
-    let seq = || desk.status_count(a, "human_seq");
-    let shown = |s: Option<u64>| s.map_or_else(|| "?".to_string(), |n| n.to_string());
-    let press = |key: &str| -> Result<String, Verdict> {
-        let r = desk.ctl(&["hwkey", key]);
-        if r.code == 0 && r.stdout.starts_with("OK ") {
-            Ok(r.first())
-        } else {
-            let refusal = format!("{} {}", r.stdout.trim(), r.stderr.trim());
-            Err(press_refused(key, &refusal, &desk.ctl(&["privacy"]).stdout))
-        }
+    let Some(sid) = spawned
+        .first()
+        .split_whitespace()
+        .nth(1)
+        .map(str::to_string)
+    else {
+        return Ok(Verdict::Fail(format!("spawn answered {}", spawned.first())));
     };
-    // A key that opens no burst is written by its handler only if its `try_lock` takes a's
-    // timeline, which any of a's readers may hold (a `log` read, an events subscriber such as the
-    // bridge); else it is counted at once and written, with any mark it makes, when an entry next
-    // reconciles the person (delivered mail or another fabric fact, a control input, an agent's
-    // move), which a quiet shell tab may never make. A topic move is such an entry, recorded under
-    // a's timeline before its reply, and its `topic` mark is neither `mail` nor `human`: once
-    // `status` (which the main thread serves after the key's handler) counts the key, the move's
-    // reply means the key's marks are in a's log.
-    let flush = |verb: &str, done: &str| -> Result<(), String> {
-        let r = desk.ok(&[&at_a, "topic", verb, KEYS_TOPIC])?;
-        if r.stdout.contains(done) {
-            Ok(())
-        } else {
-            Err(format!("`topic {verb} {KEYS_TOPIC}` said {}", r.first()))
-        }
-    };
-    let base = match read_ok() {
-        Ok(log) => log,
-        Err(why) => return Ok(Verdict::Fail(format!("no baseline log: {why}"))),
-    };
-    let (h0, m0) = (human_marks(&base), mail_answers(&base));
-    let s0 = seq().ok();
-    let first = match press("a") {
-        Ok(said) => said,
-        Err(v) => return Ok(v),
-    };
-    let burst_at = Instant::now();
-    let opened = until(HANG, || (human_marks(&read()) > h0).then_some(()))?;
-    if opened.is_none() {
+    let at = format!("@{sid}");
+    if let Err(why) = desk.ok(&[&at, "ready"]) {
+        return Ok(Verdict::Fail(why));
+    }
+    let shell = desk.status_word(&sid, "program");
+    if !matches!(shell.as_deref(), Some("sh" | "bash" | "zsh" | "fish")) {
         return Ok(Verdict::Fail(format!(
-            "{first}: no human mark within a minute (human_seq {} -> {})",
-            shown(s0),
-            shown(seq().ok())
+            "the native input terminal is not a confirmed shell: {shell:?}"
         )));
     }
-    let s1 = match seq() {
-        Ok(n) => n,
-        Err(why) => {
-            return Ok(Verdict::Fail(format!(
-                "{first}: no human_seq after it: {why}"
-            )));
+    // Cat starts only if disabling canonical input and kernel echo succeeded. Its output,
+    // rather than a keyboard stamp or the tty's own echo, witnesses each posted byte.
+    for args in [
+        vec![
+            at.as_str(),
+            "send",
+            "stty -icanon -echo && printf '\\033[2J\\033[H' && exec /bin/cat",
+        ],
+        vec![at.as_str(), "key", "enter"],
+    ] {
+        if let Err(why) = desk.ok(&args) {
+            return Ok(Verdict::Fail(why));
         }
+    }
+    if until(HANG, || {
+        (desk.status_word(&sid, "program").as_deref() == Some("cat"))
+            .then(|| desk.ok(&[&at, "text"]).ok())
+            .flatten()
+            .filter(|r| r.stdout.trim().is_empty())
+    })?
+    .is_none()
+    {
+        return Ok(Verdict::Fail(
+            "echo-disabled cat did not become the foreground program with a cleared screen".into(),
+        ));
+    }
+    if let Err(why) = desk.ok(&["raise", &sid]) {
+        return Ok(Verdict::Fail(why));
+    }
+    let read = || {
+        let status = desk.ok(&[&at, "status"])?;
+        let log = desk.ok(&[&at, "log", "kinds=mail,human"])?;
+        key_person(&status.stdout, &log)
     };
-    let had_mail = match read_ok() {
-        Ok(log) => mail_count(&log),
-        Err(why) => {
-            return Ok(Verdict::Fail(format!(
-                "{first}; no log before the mail: {why}"
-            )));
+    let before = match read() {
+        Ok(state) => state,
+        Err(why) => return Ok(Verdict::Fail(why)),
+    };
+    let mut expected = String::new();
+    for key in ["a", "b", "c"] {
+        if key == "b" {
+            let base = desk.ok(&[&at, "log", "kinds=mail"]).map_err(Fail::die)?;
+            let had_mail = mail_count(&base.stdout);
+            desk.ok(&[
+                &format!("@{b}"),
+                "post",
+                &format!("to=@{sid}"),
+                "kind=task",
+                "seamless key",
+            ])
+            .map_err(Fail::die)?;
+            if until(HANG, || {
+                desk.ok(&[&at, "log", "kinds=mail"])
+                    .ok()
+                    .filter(|r| mail_count(&r.stdout) > had_mail)
+            })?
+            .is_none()
+            {
+                return Ok(Verdict::Fail(
+                    "mail never reached the native input terminal".into(),
+                ));
+            }
         }
-    };
-    let _ = desk.ctl(&[
-        &format!("@{b}"),
-        "post",
-        &format!("to=@{a}"),
-        "kind=task",
-        "seamless key",
-    ]);
-    if until(HANG, || (mail_count(&read()) > had_mail).then_some(()))?.is_none() {
-        return Ok(Verdict::Fail(format!(
-            "{first}; the second mail never reached @{a}'s log"
-        )));
-    }
-    if burst_at.elapsed().as_millis() >= u128::from(BURST_GAP_MS) {
-        return Ok(Verdict::CouldNotRun(format!(
-            "the mail took {} s, past the person's 30 s burst, so the next key opens a burst of its own",
-            burst_at.elapsed().as_secs()
-        )));
-    }
-    let second = match press("b") {
-        Ok(said) => said,
-        Err(v) => return Ok(v),
-    };
-    // `hwkey` answers before the app handles the key.
-    if until(HANG, || seq().is_ok_and(|n| n > s1).then_some(()))?.is_none() {
-        return Ok(Verdict::Fail(format!(
-            "{second}: the second key never reached the session within a minute (human_seq {} -> {s1} -> {})",
-            shown(s0),
-            shown(seq().ok())
-        )));
-    }
-    if let Err(why) = flush("add", "added=1") {
-        return Ok(Verdict::Fail(format!(
-            "{second}: no topic move wrote a mark the timeline held: {why}"
-        )));
-    }
-    let answered = match read_ok() {
-        Ok(log) => mail_answers(&log) > m0,
-        Err(why) => return Ok(Verdict::Fail(format!("{second}: no log after it: {why}"))),
-    };
-    let s2 = match seq() {
-        Ok(n) => n,
-        Err(why) => {
-            return Ok(Verdict::Fail(format!(
-                "{second}: no human_seq before the third key: {why}"
-            )));
+        let posted = desk.ctl(&["hwkey", key]);
+        if !active_key_posted(&posted) {
+            return Ok(press_refused(
+                key,
+                &format!("{} {}", posted.stdout.trim(), posted.stderr.trim()),
+                &desk.ctl(&["privacy"]).stdout,
+            ));
         }
-    };
-    let third = match press("c") {
-        Ok(said) => said,
-        Err(v) => return Ok(v),
-    };
-    let counted = until(HANG, || seq().is_ok_and(|n| n > s2).then_some(()))?.is_some();
-    let s3 = seq().ok();
-    if counted && let Err(why) = flush("drop", "dropped=1") {
-        return Ok(Verdict::Fail(format!(
-            "{third}: no topic move wrote a mark the timeline held: {why}"
-        )));
+        expected.push_str(key);
+        let output = until(HANG, || {
+            desk.ok(&[&at, "text"])
+                .ok()
+                .filter(|r| r.stdout.trim() == expected)
+        })?;
+        let after = match read() {
+            Ok(state) => state,
+            Err(why) => return Ok(Verdict::Fail(why)),
+        };
+        let verdict = keys_verdict(
+            &before,
+            &after,
+            &expected,
+            output.as_ref().map(|r| r.stdout.trim()),
+        );
+        if !matches!(verdict, Verdict::Pass(_)) {
+            return Ok(verdict);
+        }
     }
-    let after = match read_ok() {
-        Ok(log) => log,
-        Err(why) => return Ok(Verdict::Fail(format!("{third}: no log after it: {why}"))),
-    };
-    let (h3, m3) = (human_marks(&after), mail_answers(&after));
-    Ok(keys_verdict(
-        Keys {
-            answered,
-            third_counted: counted,
-            human: (h0, h3),
-            why_mail: (m0, m3),
-        },
-        &[&first, &second, &third],
-        &format!("human_seq {} -> {s1} -> {s2} -> {}", shown(s0), shown(s3)),
+    Ok(Verdict::Pass(
+        "successor-local native controller keys produced exactly abc through echo-disabled cat; \
+         person clocks, human_seq, Human and why=mail marks stayed unchanged; live person \
+         ownership was not measured"
+            .into(),
     ))
 }
 
-/// What the hwkey leg read after its three keys.
-#[derive(Clone, Copy, Debug)]
-struct Keys {
-    /// The second key wrote a why=mail mark, read once a topic move after it wrote any mark the
-    /// timeline held.
-    answered: bool,
-    /// `status` counted the third key, so the topic move after it wrote any mark it held.
-    third_counted: bool,
-    human: (usize, usize),
-    why_mail: (usize, usize),
+fn active_key_posted(reply: &Reply) -> bool {
+    reply.code == 0
+        && reply
+            .stdout
+            .split_whitespace()
+            .eq(["OK", "posted=1", "key=1"])
 }
 
-fn keys_verdict(k: Keys, said: &[&str; 3], seqs: &str) -> Verdict {
-    let [first, second, third] = said;
-    let (h0, h3) = k.human;
-    let (m0, m3) = k.why_mail;
-    if !k.answered {
-        Verdict::Fail(format!(
-            "{second}: no human why=mail mark once it was counted and written ({seqs})"
-        ))
-    } else if !k.third_counted {
-        Verdict::Fail(format!(
-            "{third}: the third key never reached the session within a minute ({seqs}), so its mark-free row proves nothing"
-        ))
-    } else if m3 == m0 + 1 && h3 == h0 + 2 {
-        Verdict::Pass(format!(
-            "{first} opened a burst (one human mark); a mail inside it; {second} wrote one human why=mail mark; {third}, counted, wrote none ({seqs})"
-        ))
-    } else {
-        Verdict::Fail(format!(
-            "human marks {h0} -> {h3}, why=mail {m0} -> {m3} after three keys ({first} / {second} / {third}; {seqs})"
-        ))
+/// Person provenance the native controller must leave untouched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KeyPerson {
+    seq: u64,
+    gesture_clear: bool,
+    typed_clear: bool,
+    human: usize,
+    why_mail: usize,
+}
+
+fn key_person(status: &str, log: &Reply) -> Result<KeyPerson, String> {
+    let header = log.header();
+    if log.code != 0
+        || !header.starts_with("OK ")
+        || field(&header, "ep")
+            .and_then(|v| v.parse::<u32>().ok())
+            .is_none()
+        || ["lost", "more"]
+            .iter()
+            .any(|key| field(&header, key).is_some_and(|v| v.parse::<u64>().ok() != Some(0)))
+        || log
+            .stdout
+            .lines()
+            .any(|line| line.split_whitespace().take(2).any(|word| word == "gap"))
+    {
+        return Err("the native input terminal's provenance log was unread or incomplete".into());
     }
+    let clear = |key| match field(status, key).as_deref() {
+        Some("-") => Ok(true),
+        Some(age) if age.parse::<u64>().is_ok() => Ok(false),
+        _ => Err(format!("status names no readable {key}= clock")),
+    };
+    Ok(KeyPerson {
+        seq: field(status, "human_seq")
+            .and_then(|n| n.parse().ok())
+            .ok_or("status names no readable human_seq= count")?,
+        gesture_clear: clear("human_ms")?,
+        typed_clear: clear("human_typed_ms")?,
+        human: human_marks(&log.stdout),
+        why_mail: mail_answers(&log.stdout),
+    })
+}
+
+fn keys_verdict(
+    before: &KeyPerson,
+    after: &KeyPerson,
+    expected: &str,
+    output: Option<&str>,
+) -> Verdict {
+    if output != Some(expected) {
+        return Verdict::Fail(format!(
+            "native output {output:?} does not prove the expected cat bytes {expected:?}"
+        ));
+    }
+    if before.seq != 0
+        || !before.gesture_clear
+        || !before.typed_clear
+        || before.human != 0
+        || before.why_mail != 0
+        || after != before
+    {
+        return Verdict::Fail(format!(
+            "native controller input changed or inherited person provenance: {before:?} -> {after:?}"
+        ));
+    }
+    Verdict::Pass(format!(
+        "native cat output {expected:?}; person provenance unchanged"
+    ))
 }
 
 fn press_refused(key: &str, refusal: &str, privacy: &str) -> Verdict {
@@ -2268,30 +2265,92 @@ mod tests {
     }
 
     #[test]
-    fn the_third_key_counts_only_once_it_reached_the_session() {
-        let said = ["k1", "k2", "k3"];
-        let keys = |answered, third_counted, h3| Keys {
-            answered,
-            third_counted,
-            human: (4, h3),
-            why_mail: (1, 2),
+    fn native_key_ack_needs_exact_active_posting() {
+        let reply = |code, stdout: &str| Reply {
+            code,
+            stdout: stdout.into(),
+            ..Reply::default()
         };
+        assert!(active_key_posted(&reply(0, "OK posted=1 key=1\n")));
+        for (code, stdout) in [
+            (1, "OK posted=1 key=1"),
+            (0, "OK posted=0 key=1"),
+            (0, "OK posted=2 key=1"),
+            (0, "OK posted=? key=1"),
+            (0, "OK posted=1 key=0"),
+            (0, "OK posted=1"),
+        ] {
+            assert!(!active_key_posted(&reply(code, stdout)), "{stdout}");
+        }
+    }
+
+    fn no_person() -> KeyPerson {
+        KeyPerson {
+            seq: 0,
+            gesture_clear: true,
+            typed_clear: true,
+            human: 0,
+            why_mail: 0,
+        }
+    }
+
+    #[test]
+    fn native_delivery_needs_actual_bytes_without_person_side_effects() {
+        let before = no_person();
         assert!(matches!(
-            keys_verdict(keys(true, true, 6), &said, "seqs"),
+            keys_verdict(&before, &before, "abc", Some("abc")),
             Verdict::Pass(_)
         ));
-        assert!(
-            matches!(keys_verdict(keys(true, false, 6), &said, "seqs"), Verdict::Fail(ref s) if s.contains("never reached the session")),
-            "a third key that never arrived leaves the same marks, and proves nothing"
-        );
-        assert!(matches!(
-            keys_verdict(keys(true, true, 7), &said, "seqs"),
-            Verdict::Fail(_)
-        ));
-        assert!(matches!(
-            keys_verdict(keys(false, true, 6), &said, "seqs"),
-            Verdict::Fail(_)
-        ));
+        for output in [None, Some("ab"), Some("aabbcc")] {
+            assert!(matches!(
+                keys_verdict(&before, &before, "abc", output),
+                Verdict::Fail(_)
+            ));
+        }
+        let mut controls = [before; 5];
+        controls[0].seq = 1;
+        controls[1].gesture_clear = false;
+        controls[2].typed_clear = false;
+        controls[3].human = 1;
+        controls[4].why_mail = 1;
+        for after in controls {
+            assert!(matches!(
+                keys_verdict(&before, &after, "abc", Some("abc")),
+                Verdict::Fail(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn native_person_snapshot_does_not_treat_unread_or_lost_as_empty() {
+        let status = "OK human_seq=0 human_ms=- human_typed_ms=-";
+        let log = |header: &str, stdout: &str| Reply {
+            stderr: format!("aterm-ctl: {header}\n"),
+            stdout: stdout.into(),
+            ..Reply::default()
+        };
+        let complete = log("OK 0 v=2 as_of=3 ep=7 oldest=1", "");
+        assert_eq!(key_person(status, &complete), Ok(no_person()));
+        for status in [
+            "OK human_ms=- human_typed_ms=-",
+            "OK human_seq=? human_ms=- human_typed_ms=-",
+            "OK human_seq=0 human_typed_ms=-",
+            "OK human_seq=0 human_ms=-",
+        ] {
+            assert!(key_person(status, &complete).is_err());
+        }
+        for unread in [
+            log("", ""),
+            log("OK 0 v=2 ep=7 oldest=1 lost=1", ""),
+            log("OK 0 v=2 ep=7 oldest=1 more=1", ""),
+            log("OK 1 v=2 ep=7 oldest=1", "gap why=evicted lost=1"),
+            Reply {
+                code: 1,
+                ..complete.clone()
+            },
+        ] {
+            assert!(key_person(status, &unread).is_err());
+        }
     }
 
     #[test]

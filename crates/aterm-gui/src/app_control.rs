@@ -16,9 +16,13 @@ use crate::native_ui::{ActionId, CompiledUi, SemanticRole, SemanticValue, UiKey}
 use crate::tab_model::{LogicalRect, SplitAxis, SplitTree, Tab, View, ViewId};
 use crate::{App, WindowId};
 
+#[path = "app_control_network.rs"]
+mod network;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum InspectRequest {
     Tabs,
+    Network,
     View {
         view: ViewId,
         projection: InspectionProjection,
@@ -37,6 +41,7 @@ pub(crate) struct ActRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum OpenRequest {
+    Mail,
     About,
     SystemState,
     Settings(crate::native_settings::SettingsRoute),
@@ -112,6 +117,7 @@ impl InspectedView {
 pub(crate) fn parse_inspect(rest: &str) -> Result<InspectRequest, String> {
     match aterm_types::app_inspection::parse_inspect(rest).map_err(|error| error.to_string())? {
         WireInspectRequest::Tabs => Ok(InspectRequest::Tabs),
+        WireInspectRequest::Network => Ok(InspectRequest::Network),
         WireInspectRequest::View { view, projection } => Ok(InspectRequest::View {
             view: parse_view(view)?,
             projection,
@@ -136,6 +142,7 @@ pub(crate) fn parse_act(rest: &str) -> Result<ActRequest, String> {
 
 pub(crate) fn parse_open(rest: &str) -> Result<OpenRequest, String> {
     match aterm_types::app_inspection::parse_open_app(rest).map_err(|error| error.to_string())? {
+        WireOpenAppRequest::Mail => Ok(OpenRequest::Mail),
         WireOpenAppRequest::About => Ok(OpenRequest::About),
         WireOpenAppRequest::SystemState => Ok(OpenRequest::SystemState),
         WireOpenAppRequest::Settings { route } => {
@@ -163,6 +170,7 @@ fn parse_view(view: WireViewId<'_>) -> Result<ViewId, String> {
 impl App {
     pub(crate) fn inspect_app(&self, request: InspectRequest) -> Result<Vec<String>, String> {
         match request {
+            InspectRequest::Network => network::inspect(self),
             InspectRequest::Tabs => {
                 let topology = self.inspect_tabs_body();
                 let revision = inspection_revision(self.inspection_fingerprint(&topology));
@@ -326,6 +334,10 @@ impl App {
 
     pub(crate) fn open_app(&mut self, request: OpenRequest) -> Result<String, String> {
         match request {
+            OpenRequest::Mail => self
+                .open_mail_tab()
+                .then(|| "app mail".to_owned())
+                .ok_or_else(|| "Mail could not be opened".to_owned()),
             OpenRequest::About => self
                 .open_about_tab()
                 .then(|| "app about".to_string())

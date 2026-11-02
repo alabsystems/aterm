@@ -12,6 +12,11 @@ use std::time::{Duration, Instant};
 
 use crate::input_backlog::{InputBacklog, InputLedger};
 
+#[path = "sink_prefix.rs"]
+mod prefix;
+use prefix::AcceptedFrame;
+pub use prefix::KernelPrefix;
+
 /// Outcome of one bounded, immediate actuator egress attempt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImmediateWrite {
@@ -255,53 +260,60 @@ fn deliver_owed_through(owed: &[u8], mut write: impl FnMut(&[u8]) -> io::Result<
 }
 
 /// Result of a blocking or spill-tolerant sink write, with its accepted order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[must_use]
 pub struct WriteReceipt {
     accepted: usize,
     order: Option<AcceptedOrder>,
     direct: bool,
+    prefix: Option<KernelPrefix>,
 }
 
 impl WriteReceipt {
     #[inline]
-    fn new(accepted: usize, order: Option<AcceptedOrder>) -> Self {
-        debug_assert_eq!(accepted == 0, order.is_none());
-        Self {
-            accepted,
-            order,
-            direct: false,
-        }
+    fn new(accepted: usize, frame: Option<&AcceptedFrame>) -> Self {
+        debug_assert_eq!(accepted == 0, frame.is_none());
+        frame.map_or(
+            Self {
+                accepted,
+                order: None,
+                direct: false,
+                prefix: None,
+            },
+            |frame| frame.receipt(accepted, false),
+        )
     }
 
     #[inline]
-    const fn completed(accepted: usize, intended: usize, order: AcceptedOrder) -> Self {
-        Self {
-            accepted,
-            order: if accepted > 0 { Some(order) } else { None },
-            direct: accepted > 0 && accepted == intended,
-        }
+    fn completed(accepted: usize, intended: usize, frame: &AcceptedFrame) -> Self {
+        frame.receipt(accepted, accepted > 0 && accepted == intended)
     }
 
     /// Whether the whole frame reached the kernel directly (see the field).
     #[must_use]
     #[inline]
-    pub const fn is_direct(self) -> bool {
+    pub const fn is_direct(&self) -> bool {
         self.direct
     }
 
     /// Number of bytes accepted by this call.
     #[must_use]
     #[inline]
-    pub const fn accepted(self) -> usize {
+    pub const fn accepted(&self) -> usize {
         self.accepted
     }
 
     /// Accepted serialization/spill order, or `None` when no bytes were accepted.
     #[must_use]
     #[inline]
-    pub const fn order(self) -> Option<AcceptedOrder> {
+    pub const fn order(&self) -> Option<AcceptedOrder> {
         self.order
+    }
+
+    /// Owned kernel custody, present only for a `*_with_prefix` call that admitted bytes.
+    #[must_use]
+    pub fn kernel_prefix(&self) -> Option<&KernelPrefix> {
+        self.prefix.as_ref()
     }
 }
 
@@ -314,36 +326,36 @@ pub struct WriteReceiptError {
 }
 
 impl WriteReceiptError {
-    fn new(error: io::Error, accepted: usize, order: Option<AcceptedOrder>) -> Self {
+    fn new(error: io::Error, accepted: usize, frame: Option<&AcceptedFrame>) -> Self {
         Self {
             error,
-            receipt: WriteReceipt::new(accepted, order),
+            receipt: WriteReceipt::new(accepted, frame),
             refused: false,
         }
     }
 
-    fn after_write(error: io::Error, accepted: usize, order: AcceptedOrder) -> Self {
-        Self::new(error, accepted, (accepted > 0).then_some(order))
+    fn after_write(error: io::Error, accepted: usize, frame: &AcceptedFrame) -> Self {
+        Self::new(error, accepted, (accepted > 0).then_some(frame))
     }
 
     #[cfg(unix)]
-    fn refused(accepted: usize, order: Option<AcceptedOrder>) -> Self {
+    fn refused(accepted: usize, frame: Option<&AcceptedFrame>) -> Self {
         Self {
             error: io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "input queue full: the program is not reading its input",
             ),
-            receipt: WriteReceipt::new(accepted, order),
+            receipt: WriteReceipt::new(accepted, frame),
             refused: true,
         }
     }
 
     #[cfg(unix)]
-    fn no_drainer(accepted: usize, order: Option<AcceptedOrder>) -> Self {
+    fn no_drainer(accepted: usize, frame: Option<&AcceptedFrame>) -> Self {
         Self::new(
             io::Error::other("input could not be queued: no spill drainer could be arranged"),
             accepted,
-            order,
+            frame,
         )
     }
 
@@ -359,6 +371,12 @@ impl WriteReceiptError {
     #[inline]
     pub const fn order(&self) -> Option<AcceptedOrder> {
         self.receipt.order()
+    }
+
+    /// Custody of any queued prefix accepted before this error.
+    #[must_use]
+    pub fn kernel_prefix(&self) -> Option<&KernelPrefix> {
+        self.receipt.kernel_prefix()
     }
 
     /// Recover the original I/O error without reclassification or wrapping.
@@ -432,10 +450,10 @@ enum Room<'a> {
     NoWait,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 #[cfg_attr(windows, allow(dead_code))]
 enum Spilled {
-    Accepted(AcceptedOrder),
+    Accepted(AcceptedFrame),
     Stopped,
     NoDrainer,
 }
@@ -572,8 +590,9 @@ struct Shared {
 
 struct Spill {
     buf: VecDeque<u8>,
+    generation: u64,
     #[cfg(unix)]
-    runs: VecDeque<(usize, Landing)>,
+    runs: VecDeque<(usize, Landing, Option<KernelPrefix>)>,
     chunk_written: usize,
     draining: bool,
     #[cfg(unix)]
@@ -583,41 +602,65 @@ struct Spill {
 
 impl Spill {
     fn clear(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
         self.buf.clear();
         #[cfg(unix)]
-        self.runs.clear();
+        {
+            let mut delivered = self.chunk_written;
+            for (len, _, prefix) in self.runs.drain(..) {
+                let already_written = delivered.min(len);
+                delivered -= already_written;
+                if let Some(prefix) = prefix {
+                    prefix.cancelled(len - already_written);
+                }
+            }
+        }
         self.chunk_written = 0;
+        #[cfg(unix)]
+        if self.arrange_pending {
+            self.arrange_pending = false;
+            self.draining = false;
+        }
     }
 
     #[cfg(unix)]
-    fn push_back(&mut self, bytes: &[u8], landing: Landing) {
+    fn push_back(&mut self, bytes: &[u8], landing: Landing, prefix: Option<&KernelPrefix>) {
         if bytes.is_empty() {
             return;
         }
         self.buf.extend(bytes.iter().copied());
-        if let Some((last_len, last_landing)) = self.runs.back_mut()
+        if let Some(prefix) = prefix {
+            prefix.admit(bytes.len());
+        }
+        if let Some((last_len, last_landing, last_prefix)) = self.runs.back_mut()
             && *last_landing == landing
+            && last_prefix.as_ref() == prefix
         {
             *last_len = last_len.saturating_add(bytes.len());
         } else {
-            self.runs.push_back((bytes.len(), landing));
+            self.runs.push_back((bytes.len(), landing, prefix.cloned()));
         }
     }
 
     #[cfg(unix)]
-    fn push_front(&mut self, bytes: &[u8], landing: Landing) {
+    fn push_front(&mut self, bytes: &[u8], landing: Landing, prefix: Option<&KernelPrefix>) {
         if bytes.is_empty() {
             return;
         }
         for b in bytes.iter().rev() {
             self.buf.push_front(*b);
         }
-        if let Some((first_len, first_landing)) = self.runs.front_mut()
+        if let Some(prefix) = prefix {
+            prefix.admit(bytes.len());
+        }
+        if let Some((first_len, first_landing, first_prefix)) = self.runs.front_mut()
             && *first_landing == landing
+            && first_prefix.as_ref() == prefix
         {
             *first_len = first_len.saturating_add(bytes.len());
         } else {
-            self.runs.push_front((bytes.len(), landing));
+            self.runs
+                .push_front((bytes.len(), landing, prefix.cloned()));
         }
     }
 
@@ -630,7 +673,7 @@ impl Spill {
         }
         let mut rem = take;
         while rem > 0 {
-            let Some((front_len, _)) = self.runs.front_mut() else {
+            let Some((front_len, _, _)) = self.runs.front_mut() else {
                 break;
             };
             if *front_len <= rem {
@@ -641,6 +684,12 @@ impl Spill {
                 break;
             }
         }
+    }
+}
+
+impl Drop for Spill {
+    fn drop(&mut self) {
+        self.clear();
     }
 }
 
@@ -1028,6 +1077,16 @@ impl SinkWriter {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         while spill.draining && !spill.buf.is_empty() {
+            #[cfg(unix)]
+            if spill.arrange_pending {
+                spill.arrange_pending = false;
+                if !self.shared.arrange_drainer(self.master, &mut spill) {
+                    self.shared.fail_spill(&mut spill);
+                    drop(spill);
+                    self.shared.drained.notify_all();
+                    return false;
+                }
+            }
             spill = self
                 .shared
                 .drained
@@ -1047,6 +1106,16 @@ impl SinkWriter {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         while spill.draining && !spill.buf.is_empty() {
+            #[cfg(unix)]
+            if spill.arrange_pending {
+                spill.arrange_pending = false;
+                if !self.shared.arrange_drainer(self.master, &mut spill) {
+                    self.shared.fail_spill(&mut spill);
+                    drop(spill);
+                    self.shared.drained.notify_all();
+                    return Some(false);
+                }
+            }
             let left = deadline.map_or(limit, |at| at.saturating_duration_since(Instant::now()));
             if left.is_zero() {
                 return None;
@@ -1087,13 +1156,27 @@ impl SinkWriter {
         }
         s.arrange_pending = false;
         if !self.shared.arrange_drainer(self.master, &mut s) {
-            s.draining = false;
+            self.shared.fail_spill(&mut s);
+            drop(s);
+            self.shared.drained.notify_all();
         }
     }
 
     /// Windows twin: no spill drainer exists, nothing is ever pending.
     #[cfg(not(unix))]
     pub fn arrange_pending_drainer(&self) {}
+
+    /// Wait only for this exact receipt's admitted bytes, never later replies or input.
+    /// The receipt must belong to this sink. No fd, spill or caller terminal lock is held
+    /// while this expendable producer waits; a discarded/closed prefix returns false.
+    #[must_use]
+    pub fn wait_prefix_to_kernel(&self, prefix: &KernelPrefix) -> bool {
+        if !prefix.belongs_to(&self.shared) {
+            return false;
+        }
+        self.arrange_pending_drainer();
+        prefix.wait()
+    }
 
     /// Current attempted-input epoch for this sink.
     #[must_use]
@@ -1143,7 +1226,9 @@ impl SinkWriter {
             return (ImmediateWrite::Full, None);
         }
         self.reserve_input_attempt();
-        self.try_write_frame_immediate_reserved(bytes, ShortWrite::InDoubt)
+        let (outcome, receipt) =
+            self.try_write_frame_immediate_reserved(bytes, ShortWrite::InDoubt, false);
+        (outcome, receipt.order())
     }
 
     /// THE GUARDED WRITE.
@@ -1156,7 +1241,33 @@ impl SinkWriter {
             return (ImmediateWrite::Full, None);
         }
         self.reserve_input_attempt();
-        self.try_write_frame_immediate_reserved(bytes, ShortWrite::Queue)
+        let (outcome, receipt) =
+            self.try_write_frame_immediate_reserved(bytes, ShortWrite::Queue, false);
+        (outcome, receipt.order())
+    }
+
+    /// Nonparking guarded admission with owned custody of any accepted direct/spill prefix.
+    /// The caller drops terminal/timeline locks before waiting on the returned receipt.
+    #[cfg(unix)]
+    pub fn try_write_frame_whole_with_prefix(
+        &self,
+        bytes: &[u8],
+    ) -> (ImmediateWrite, WriteReceipt) {
+        if bytes.is_empty() {
+            return (ImmediateWrite::Full, WriteReceipt::new(0, None));
+        }
+        self.reserve_input_attempt();
+        self.try_write_frame_immediate_reserved(bytes, ShortWrite::Queue, true)
+    }
+
+    /// Windows guarded egress remains fail-closed and accepts no nonempty prefix.
+    #[cfg(windows)]
+    pub fn try_write_frame_whole_with_prefix(
+        &self,
+        bytes: &[u8],
+    ) -> (ImmediateWrite, WriteReceipt) {
+        let (outcome, _) = self.try_write_frame_whole_with_receipt(bytes);
+        (outcome, WriteReceipt::new(0, None))
     }
 
     /// Windows fail-closed twin of [`Self::try_write_frame_whole_with_receipt`].
@@ -1173,34 +1284,36 @@ impl SinkWriter {
         &self,
         bytes: &[u8],
         short: ShortWrite,
-    ) -> (ImmediateWrite, Option<AcceptedOrder>) {
+        tracked: bool,
+    ) -> (ImmediateWrite, WriteReceipt) {
         if bytes.len() > Self::IMMEDIATE_FRAME_MAX || self.shared.is_severed() {
-            return (ImmediateWrite::BusyZero, None);
+            return (ImmediateWrite::BusyZero, WriteReceipt::new(0, None));
         }
         if !self.shared.master_nonblocking.load(Ordering::Relaxed) {
-            return (ImmediateWrite::BusyZero, None);
+            return (ImmediateWrite::BusyZero, WriteReceipt::new(0, None));
         }
 
         let fd_guard = match self.shared.lock.try_lock() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => {
-                return (ImmediateWrite::BusyZero, None);
+                return (ImmediateWrite::BusyZero, WriteReceipt::new(0, None));
             }
         };
         let spill_guard = match self.shared.spill.try_lock() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => {
-                return (ImmediateWrite::BusyZero, None);
+                return (ImmediateWrite::BusyZero, WriteReceipt::new(0, None));
             }
         };
         if !spill_guard.buf.is_empty() {
-            return (ImmediateWrite::BusyZero, None);
+            return (ImmediateWrite::BusyZero, WriteReceipt::new(0, None));
         }
         let Ok(order) = self.shared.next_accepted_order(false) else {
-            return (ImmediateWrite::BusyZero, None);
+            return (ImmediateWrite::BusyZero, WriteReceipt::new(0, None));
         };
+        let frame = AcceptedFrame::new(&self.shared, order, tracked);
 
         let mut spill_guard = spill_guard;
         let mut poke = false;
@@ -1208,8 +1321,12 @@ impl SinkWriter {
             aterm_pty::NonParkWrite::Wrote(n) if n == bytes.len() => ImmediateWrite::Full,
             aterm_pty::NonParkWrite::Wrote(n) if n > 0 && short == ShortWrite::Queue => {
                 match bytes.get(n..).and_then(|rest| {
-                    self.shared
-                        .queue_rest_held(self.master, &mut spill_guard, rest)
+                    self.shared.queue_rest_held(
+                        self.master,
+                        &mut spill_guard,
+                        rest,
+                        frame.prefix.as_ref(),
+                    )
                 }) {
                     Some(arrange) => {
                         poke = arrange;
@@ -1238,7 +1355,15 @@ impl SinkWriter {
         if accepted > 0 {
             let _ = self.shared.fire_input_hook();
         }
-        (result, (accepted > 0).then_some(order))
+        let admitted = if matches!(result, ImmediateWrite::Queued { .. }) {
+            bytes.len()
+        } else {
+            accepted
+        };
+        (
+            result,
+            frame.receipt(admitted, matches!(result, ImmediateWrite::Full)),
+        )
     }
 
     /// Windows fail-closed twin of [`Self::try_write_frame_immediate`].
@@ -1270,7 +1395,7 @@ impl SinkWriter {
     )]
     pub fn write_frame(&self, bytes: &[u8]) -> io::Result<usize> {
         self.write_frame_with_receipt(bytes)
-            .map(WriteReceipt::accepted)
+            .map(|receipt| receipt.accepted())
             .map_err(WriteReceiptError::into_error)
     }
 
@@ -1283,7 +1408,16 @@ impl SinkWriter {
             return Ok(WriteReceipt::new(0, None));
         }
         self.reserve_input_attempt();
-        self.write_frame_after_reserve(bytes, None, Landing::Driven)
+        self.write_frame_after_reserve(bytes, None, Landing::Driven, false)
+    }
+
+    /// A write receipt that additionally owns completion of exactly its admitted bytes.
+    pub fn write_frame_with_prefix(&self, bytes: &[u8]) -> Result<WriteReceipt, WriteReceiptError> {
+        if bytes.is_empty() {
+            return Ok(WriteReceipt::new(0, None));
+        }
+        self.reserve_input_attempt();
+        self.write_frame_after_reserve(bytes, None, Landing::Driven, true)
     }
 
     /// [`Self::write_frame_with_receipt`] for one bulk frame, reporting progress into `meter` and honouring its stop.
@@ -1291,6 +1425,24 @@ impl SinkWriter {
         &self,
         bytes: &[u8],
         meter: &BulkMeter,
+    ) -> Result<WriteReceipt, WriteReceiptError> {
+        self.write_metered_receipt(bytes, meter, false)
+    }
+
+    /// Metered twin of [`Self::write_frame_with_prefix`].
+    pub fn write_frame_metered_with_prefix(
+        &self,
+        bytes: &[u8],
+        meter: &BulkMeter,
+    ) -> Result<WriteReceipt, WriteReceiptError> {
+        self.write_metered_receipt(bytes, meter, true)
+    }
+
+    fn write_metered_receipt(
+        &self,
+        bytes: &[u8],
+        meter: &BulkMeter,
+        tracked: bool,
     ) -> Result<WriteReceipt, WriteReceiptError> {
         meter.total.store(bytes.len() as u64, Ordering::Relaxed);
         if bytes.is_empty() || meter.stop_requested() {
@@ -1302,7 +1454,7 @@ impl SinkWriter {
             .store(BulkState::Writing as u8, Ordering::Release);
         let since = self.shared.discard_epoch();
         self.reserve_input_attempt();
-        let result = self.write_frame_after_reserve(bytes, Some(meter), Landing::Driven);
+        let result = self.write_frame_after_reserve(bytes, Some(meter), Landing::Driven, tracked);
         let sent = meter.sent.load(Ordering::Relaxed);
         meter.finish(match &result {
             Err(_) => BulkState::Failed,
@@ -1321,6 +1473,7 @@ impl SinkWriter {
         bytes: &[u8],
         meter: Option<&BulkMeter>,
         landing: Landing,
+        tracked: bool,
     ) -> Result<WriteReceipt, WriteReceiptError> {
         if self.shared.is_severed() {
             return Err(Shared::severed_error().into());
@@ -1330,13 +1483,17 @@ impl SinkWriter {
             aterm_pty::settle_input(self.master);
         }
         if !self.shared.spill_is_empty() {
-            match self
-                .shared
-                .spill_append(self.master, bytes, landing, Room::Wait(meter), since)?
-            {
+            match self.shared.spill_append(
+                self.master,
+                bytes,
+                landing,
+                Room::Wait(meter),
+                since,
+                tracked,
+            )? {
                 Spilled::Accepted(order) => {
                     BulkMeter::note_spilled(meter, bytes.len());
-                    return Ok(WriteReceipt::new(bytes.len(), Some(order)));
+                    return Ok(WriteReceipt::new(bytes.len(), Some(&order)));
                 }
                 Spilled::Stopped => return Ok(WriteReceipt::new(0, None)),
                 Spilled::NoDrainer => {}
@@ -1349,18 +1506,24 @@ impl SinkWriter {
             .lock
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let Some(order) = self.shared.direct_order_if_spill_empty()? else {
+        let Some(order) = self.shared.direct_order_if_spill_empty(tracked)? else {
             drop(guard);
-            match self
-                .shared
-                .spill_append(self.master, bytes, landing, Room::Wait(meter), since)?
-            {
+            match self.shared.spill_append(
+                self.master,
+                bytes,
+                landing,
+                Room::Wait(meter),
+                since,
+                tracked,
+            )? {
                 Spilled::Accepted(order) => {
                     BulkMeter::note_spilled(meter, bytes.len());
-                    return Ok(WriteReceipt::new(bytes.len(), Some(order)));
+                    return Ok(WriteReceipt::new(bytes.len(), Some(&order)));
                 }
                 Spilled::Stopped => return Ok(WriteReceipt::new(0, None)),
-                Spilled::NoDrainer => return self.write_frame_locked(bytes, meter, since, landing),
+                Spilled::NoDrainer => {
+                    return self.write_frame_locked(bytes, meter, since, landing, tracked);
+                }
             }
         };
         self.write_frame_body_locked(guard, bytes, order, meter, since, landing)
@@ -1370,7 +1533,7 @@ impl SinkWriter {
         &self,
         guard: std::sync::MutexGuard<'_, ()>,
         bytes: &[u8],
-        order: AcceptedOrder,
+        order: AcceptedFrame,
         meter: Option<&BulkMeter>,
         since: u64,
         landing: Landing,
@@ -1385,35 +1548,45 @@ impl SinkWriter {
                 {
                     Ok(0) => break,
                     Ok(n) => off = off.saturating_add(n),
-                    Err(e) => return Err(WriteReceiptError::after_write(e, off, order)),
+                    Err(e) => return Err(WriteReceiptError::after_write(e, off, &order)),
                 }
             }
             drop(guard);
-            return Ok(WriteReceipt::completed(off, bytes.len(), order));
+            return Ok(WriteReceipt::completed(off, bytes.len(), &order));
         };
         let written = write_metered(bytes, meter, |rest| {
             self.shared
                 .write_stamped_blocking(self.master, rest, since, Some(meter), landing)
         })
         .map(|end| {
-            let accepted = end
-                .accepted
-                .saturating_add(self.deliver_owed_locked(&end.owed, since, landing));
+            let accepted = end.accepted.saturating_add(self.deliver_owed_locked(
+                &end.owed,
+                since,
+                landing,
+                order.prefix.as_ref(),
+            ));
             meter.note_sent(accepted);
             accepted
         });
         drop(guard);
         match written {
-            Ok(accepted) => Ok(WriteReceipt::completed(accepted, bytes.len(), order)),
-            Err((e, accepted)) => Err(WriteReceiptError::after_write(e, accepted, order)),
+            Ok(accepted) => Ok(WriteReceipt::completed(accepted, bytes.len(), &order)),
+            Err((e, accepted)) => Err(WriteReceiptError::after_write(e, accepted, &order)),
         }
     }
 
-    fn deliver_owed_locked(&self, owed: &[u8], since: u64, landing: Landing) -> usize {
+    fn deliver_owed_locked(
+        &self,
+        owed: &[u8],
+        since: u64,
+        landing: Landing,
+        prefix: Option<&KernelPrefix>,
+    ) -> usize {
         if owed.is_empty() {
             return 0;
         }
-        if landing == Landing::Driven && self.shared.prepend_owed(self.master, owed, since) {
+        if landing == Landing::Driven && self.shared.prepend_owed(self.master, owed, since, prefix)
+        {
             return owed.len();
         }
         deliver_owed_through(owed, |rest| {
@@ -1428,6 +1601,7 @@ impl SinkWriter {
         meter: Option<&BulkMeter>,
         since: u64,
         landing: Landing,
+        tracked: bool,
     ) -> Result<WriteReceipt, WriteReceiptError> {
         loop {
             let guard = self
@@ -1435,7 +1609,7 @@ impl SinkWriter {
                 .lock
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
-            let Some(order) = self.shared.direct_order_if_spill_empty()? else {
+            let Some(order) = self.shared.direct_order_if_spill_empty(tracked)? else {
                 drop(guard);
                 match self.shared.spill_append(
                     self.master,
@@ -1443,10 +1617,11 @@ impl SinkWriter {
                     landing,
                     Room::Wait(meter),
                     since,
+                    tracked,
                 )? {
                     Spilled::Accepted(order) => {
                         BulkMeter::note_spilled(meter, bytes.len());
-                        return Ok(WriteReceipt::new(bytes.len(), Some(order)));
+                        return Ok(WriteReceipt::new(bytes.len(), Some(&order)));
                     }
                     Spilled::Stopped => return Ok(WriteReceipt::new(0, None)),
                     Spilled::NoDrainer => continue,
@@ -1473,7 +1648,7 @@ impl SinkWriter {
     #[cfg(unix)]
     pub fn write_frame_nonparking(&self, bytes: &[u8]) -> io::Result<usize> {
         self.write_frame_nonparking_with_receipt(bytes)
-            .map(WriteReceipt::accepted)
+            .map(|receipt| receipt.accepted())
             .map_err(WriteReceiptError::into_error)
     }
 
@@ -1497,7 +1672,7 @@ impl SinkWriter {
         }
         self.reserve_attempt();
         aterm_pty::as_reply(|| self.write_frame_nonparking_after_reserve(bytes, Landing::Answer))
-            .map(WriteReceipt::accepted)
+            .map(|receipt| receipt.accepted())
             .map_err(WriteReceiptError::into_error)
     }
 
@@ -1509,7 +1684,7 @@ impl SinkWriter {
     ) -> Result<WriteReceipt, WriteReceiptError> {
         // Bulk takes the blocking path so `SPILL_CAP` applies (see `NONPARK_MAX`).
         if bytes.len() > Self::NONPARK_MAX {
-            return self.write_frame_after_reserve(bytes, None, landing);
+            return self.write_frame_after_reserve(bytes, None, landing, false);
         }
         self.write_frame_unparked(bytes, WhenFull::Park, landing)
     }
@@ -1520,7 +1695,7 @@ impl SinkWriter {
         bytes: &[u8],
         landing: Landing,
     ) -> Result<WriteReceipt, WriteReceiptError> {
-        self.write_frame_after_reserve(bytes, None, landing)
+        self.write_frame_after_reserve(bytes, None, landing, false)
     }
 
     /// The UI thread's egress.
@@ -1559,16 +1734,16 @@ impl SinkWriter {
         let spilled = self.shared.spill_len();
         if spilled >= Shared::SPILL_CAP {
             return match when_full {
-                WhenFull::Park => self.write_frame_after_reserve(bytes, None, landing),
+                WhenFull::Park => self.write_frame_after_reserve(bytes, None, landing, false),
                 WhenFull::Refuse => Err(WriteReceiptError::refused(0, None)),
             };
         }
         if spilled != 0
             && let Spilled::Accepted(order) =
                 self.shared
-                    .spill_append(self.master, bytes, landing, Room::NoWait, since)?
+                    .spill_append(self.master, bytes, landing, Room::NoWait, since, false)?
         {
-            return Ok(WriteReceipt::new(bytes.len(), Some(order)));
+            return Ok(WriteReceipt::new(bytes.len(), Some(&order)));
         }
         let mut spins: u32 = 0;
         let acquired = loop {
@@ -1587,7 +1762,7 @@ impl SinkWriter {
             // behind the current holder preserves order without waiting on it.
             return self.spill_or_when_full(bytes, since, when_full, landing);
         };
-        let Some(order) = self.shared.direct_order_if_spill_empty()? else {
+        let Some(order) = self.shared.direct_order_if_spill_empty(false)? else {
             drop(guard);
             return self.spill_or_when_full(bytes, since, when_full, landing);
         };
@@ -1608,7 +1783,7 @@ impl SinkWriter {
                         if off > 0 {
                             let _ = self.shared.fire_input_hook_for(landing);
                         }
-                        return Err(WriteReceiptError::after_write(e, off, order));
+                        return Err(WriteReceiptError::after_write(e, off, &order));
                     }
                 }
             }
@@ -1636,7 +1811,7 @@ impl SinkWriter {
                     if off > 0 {
                         let _ = self.shared.fire_input_hook_for(landing);
                     }
-                    return Err(WriteReceiptError::after_write(e, off, order));
+                    return Err(WriteReceiptError::after_write(e, off, &order));
                 }
             }
         }
@@ -1644,7 +1819,7 @@ impl SinkWriter {
         if off > 0 {
             let _ = self.shared.fire_input_hook_for(landing);
         }
-        Ok(WriteReceipt::completed(off, bytes.len(), order))
+        Ok(WriteReceipt::completed(off, bytes.len(), &order))
     }
 
     #[cfg(unix)]
@@ -1657,11 +1832,11 @@ impl SinkWriter {
     ) -> Result<WriteReceipt, WriteReceiptError> {
         match self
             .shared
-            .spill_append(self.master, bytes, landing, Room::NoWait, since)?
+            .spill_append(self.master, bytes, landing, Room::NoWait, since, false)?
         {
-            Spilled::Accepted(order) => Ok(WriteReceipt::new(bytes.len(), Some(order))),
+            Spilled::Accepted(order) => Ok(WriteReceipt::new(bytes.len(), Some(&order))),
             Spilled::NoDrainer | Spilled::Stopped => match when_full {
-                WhenFull::Park => self.write_frame_locked(bytes, None, since, landing),
+                WhenFull::Park => self.write_frame_locked(bytes, None, since, landing, false),
                 WhenFull::Refuse => Err(WriteReceiptError::no_drainer(0, None)),
             },
         }
@@ -1671,7 +1846,7 @@ impl SinkWriter {
     #[cfg(windows)]
     pub fn write_frame_nonparking(&self, bytes: &[u8]) -> io::Result<usize> {
         self.write_frame_nonparking_with_receipt(bytes)
-            .map(WriteReceipt::accepted)
+            .map(|receipt| receipt.accepted())
             .map_err(WriteReceiptError::into_error)
     }
 
@@ -1691,7 +1866,7 @@ impl SinkWriter {
         guard: std::sync::MutexGuard<'_, ()>,
         bytes: &[u8],
         off: usize,
-        order: AcceptedOrder,
+        order: AcceptedFrame,
         since: u64,
         when_full: WhenFull,
         landing: Landing,
@@ -1701,17 +1876,21 @@ impl SinkWriter {
             if off > 0 {
                 let _ = self.shared.fire_input_hook_for(landing);
             }
-            return Ok(WriteReceipt::new(bytes.len(), Some(order)));
+            return Ok(WriteReceipt::new(bytes.len(), Some(&order)));
         };
-        if self
-            .shared
-            .spill_prepend(self.master, tail, landing, since, Room::NoWait)
-        {
+        if self.shared.spill_prepend(
+            self.master,
+            tail,
+            landing,
+            since,
+            Room::NoWait,
+            order.prefix.as_ref(),
+        ) {
             drop(guard);
             if off > 0 {
                 let _ = self.shared.fire_input_hook_for(landing);
             }
-            return Ok(WriteReceipt::new(bytes.len(), Some(order)));
+            return Ok(WriteReceipt::new(bytes.len(), Some(&order)));
         }
         if when_full == WhenFull::Refuse {
             drop(guard);
@@ -1720,7 +1899,7 @@ impl SinkWriter {
             }
             return Err(WriteReceiptError::no_drainer(
                 off,
-                (off > 0).then_some(order),
+                (off > 0).then_some(&order),
             ));
         }
         let mut off = off;
@@ -1735,7 +1914,7 @@ impl SinkWriter {
                     if off > 0 {
                         let _ = self.shared.fire_input_hook_for(landing);
                     }
-                    return Ok(WriteReceipt::new(off, (off > 0).then_some(order)));
+                    return Ok(WriteReceipt::new(off, (off > 0).then_some(&order)));
                 }
                 Ok(n) => {
                     let room = bytes.len().saturating_sub(off);
@@ -1746,7 +1925,7 @@ impl SinkWriter {
                     if off > 0 {
                         let _ = self.shared.fire_input_hook_for(landing);
                     }
-                    return Err(WriteReceiptError::after_write(e, off, order));
+                    return Err(WriteReceiptError::after_write(e, off, &order));
                 }
             }
         }
@@ -1754,7 +1933,7 @@ impl SinkWriter {
         if off > 0 {
             let _ = self.shared.fire_input_hook_for(landing);
         }
-        Ok(WriteReceipt::new(off, (off > 0).then_some(order)))
+        Ok(WriteReceipt::new(off, (off > 0).then_some(&order)))
     }
 }
 
@@ -1818,6 +1997,15 @@ trust_island! {
 }
 
 impl Shared {
+    #[cfg(unix)]
+    fn fail_spill(&self, spill: &mut Spill) {
+        spill.clear();
+        spill.draining = false;
+        spill.failed = true;
+        self.spilled_bytes.store(0, Ordering::Release);
+        self.order_state
+            .fetch_and(!Self::SPILL_ACTIVE_BIT, Ordering::Release);
+    }
     const SPILL_ACTIVE_BIT: u64 = 1 << 63;
     const ORDER_MASK: u64 = (1 << 63) - 1;
     #[cfg(unix)]
@@ -1836,6 +2024,7 @@ impl Shared {
             cached_tty_swallows: AtomicU8::new(0),
             spill: Mutex::new(Spill {
                 buf: VecDeque::new(),
+                generation: 0,
                 #[cfg(unix)]
                 runs: VecDeque::new(),
                 chunk_written: 0,
@@ -2068,13 +2257,16 @@ impl Shared {
     }
 
     #[cfg(unix)]
+    #[allow(clippy::too_many_arguments)]
     fn drain_write(
         &self,
         fd: i32,
         chunk: &[u8],
         off: usize,
         since: u64,
+        generation: u64,
         landing: Landing,
+        prefix: Option<&KernelPrefix>,
     ) -> usize {
         let Some(bytes) = chunk.get(off..) else {
             return 0;
@@ -2082,9 +2274,12 @@ impl Shared {
         loop {
             let wrote = {
                 let s = self.spill.lock().unwrap_or_else(|p| p.into_inner());
-                if self.discarded_since(since) {
+                if self.discarded_since(since) || s.generation != generation {
                     return 0;
                 }
+                // Register before releasing spill: cancellation may clear queued bytes,
+                // but the receipt still owns this started native operation until return.
+                let _native = prefix.map(KernelPrefix::native_write);
                 let held = if self.master_nonblocking.load(Ordering::Relaxed) {
                     Some(s)
                 } else {
@@ -2101,8 +2296,11 @@ impl Shared {
                 if n > 0 {
                     let mut s = held
                         .unwrap_or_else(|| self.spill.lock().unwrap_or_else(|p| p.into_inner()));
-                    if !self.discarded_since(since) {
+                    if !self.discarded_since(since) && s.generation == generation {
                         s.chunk_written = off.saturating_add(n);
+                        if let Some(prefix) = prefix {
+                            prefix.delivered(n);
+                        }
                     }
                 }
                 wrote
@@ -2130,7 +2328,10 @@ impl Shared {
         }
     }
 
-    fn direct_order_if_spill_empty(&self) -> io::Result<Option<AcceptedOrder>> {
+    fn direct_order_if_spill_empty(
+        self: &Arc<Self>,
+        tracked: bool,
+    ) -> io::Result<Option<AcceptedFrame>> {
         let mut cur = self.order_state.load(Ordering::Acquire);
         loop {
             if cur & Self::SPILL_ACTIVE_BIT != 0 {
@@ -2147,7 +2348,7 @@ impl Shared {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Ok(Some(AcceptedOrder(next))),
+                Ok(_) => return Ok(Some(AcceptedFrame::new(self, AcceptedOrder(next), tracked))),
                 Err(actual) => cur = actual,
             }
         }
@@ -2163,7 +2364,13 @@ impl Shared {
     }
 
     #[cfg(unix)]
-    fn queue_rest_held(self: &Arc<Self>, master: i32, s: &mut Spill, rest: &[u8]) -> Option<bool> {
+    fn queue_rest_held(
+        self: &Arc<Self>,
+        master: i32,
+        s: &mut Spill,
+        rest: &[u8],
+        prefix: Option<&KernelPrefix>,
+    ) -> Option<bool> {
         let defer = self.arranger.get().is_some();
         if !s.draining {
             if defer {
@@ -2174,7 +2381,7 @@ impl Shared {
             }
         }
         let poke = defer && s.arrange_pending;
-        s.push_back(rest, Landing::Driven);
+        s.push_back(rest, Landing::Driven, prefix);
         self.spilled_bytes.store(s.buf.len(), Ordering::Release);
         if !s.buf.is_empty() {
             self.order_state
@@ -2191,9 +2398,13 @@ impl Shared {
         landing: Landing,
         since: u64,
         room: Room<'_>,
+        prefix: Option<&KernelPrefix>,
     ) -> bool {
         let mut s = self.spill.lock().unwrap_or_else(|p| p.into_inner());
         if self.discarded_since(since) {
+            if let Some(prefix) = prefix {
+                prefix.failed();
+            }
             return true;
         }
         let defer = matches!(room, Room::NoWait) && self.arranger.get().is_some();
@@ -2206,7 +2417,7 @@ impl Shared {
             }
         }
         let poke = defer && s.arrange_pending;
-        s.push_front(tail, landing);
+        s.push_front(tail, landing, prefix);
         self.spilled_bytes.store(s.buf.len(), Ordering::Release);
         if !s.buf.is_empty() {
             self.order_state
@@ -2220,12 +2431,31 @@ impl Shared {
     }
 
     #[cfg(unix)]
-    fn prepend_owed(self: &Arc<Self>, master: i32, owed: &[u8], since: u64) -> bool {
-        self.spill_prepend(master, owed, Landing::Driven, since, Room::Wait(None))
+    fn prepend_owed(
+        self: &Arc<Self>,
+        master: i32,
+        owed: &[u8],
+        since: u64,
+        prefix: Option<&KernelPrefix>,
+    ) -> bool {
+        self.spill_prepend(
+            master,
+            owed,
+            Landing::Driven,
+            since,
+            Room::Wait(None),
+            prefix,
+        )
     }
 
     #[cfg(not(unix))]
-    fn prepend_owed(self: &Arc<Self>, _master: i32, _owed: &[u8], _since: u64) -> bool {
+    fn prepend_owed(
+        self: &Arc<Self>,
+        _master: i32,
+        _owed: &[u8],
+        _since: u64,
+        _prefix: Option<&KernelPrefix>,
+    ) -> bool {
         false
     }
 
@@ -2237,6 +2467,7 @@ impl Shared {
         landing: Landing,
         room: Room<'_>,
         since: u64,
+        tracked: bool,
     ) -> io::Result<Spilled> {
         let mut s = self.spill.lock().unwrap_or_else(|p| p.into_inner());
         if let Room::Wait(stop) = room {
@@ -2248,7 +2479,8 @@ impl Shared {
                 if s.arrange_pending {
                     s.arrange_pending = false;
                     if !self.arrange_drainer(master, &mut s) {
-                        s.draining = false;
+                        self.fail_spill(&mut s);
+                        self.drained.notify_all();
                         continue;
                     }
                 }
@@ -2259,9 +2491,12 @@ impl Shared {
             }
         }
         if self.discarded_since(since) {
-            return self
-                .next_accepted_order(!s.buf.is_empty())
-                .map(Spilled::Accepted);
+            let order = self.next_accepted_order(!s.buf.is_empty())?;
+            let frame = AcceptedFrame::new(self, order, tracked);
+            if let Some(prefix) = &frame.prefix {
+                prefix.failed();
+            }
+            return Ok(Spilled::Accepted(frame));
         }
         let defer = matches!(room, Room::NoWait) && self.arranger.get().is_some();
         if !s.draining {
@@ -2275,13 +2510,14 @@ impl Shared {
         let poke = defer && s.arrange_pending;
         let will_be_non_empty = !s.buf.is_empty() || !bytes.is_empty();
         let order = self.next_accepted_order(will_be_non_empty)?;
-        s.push_back(bytes, landing);
+        let frame = AcceptedFrame::new(self, order, tracked);
+        s.push_back(bytes, landing, frame.prefix.as_ref());
         self.spilled_bytes.store(s.buf.len(), Ordering::Release);
         drop(s);
         if poke && let Some(arranger) = self.arranger.get() {
             arranger();
         }
-        Ok(Spilled::Accepted(order))
+        Ok(Spilled::Accepted(frame))
     }
 
     #[cfg(windows)]
@@ -2292,6 +2528,7 @@ impl Shared {
         _landing: Landing,
         _room: Room<'_>,
         _since: u64,
+        _tracked: bool,
     ) -> io::Result<Spilled> {
         Ok(Spilled::NoDrainer)
     }
@@ -2318,7 +2555,7 @@ impl Shared {
         let mut chunk: Vec<u8> = Vec::with_capacity(Self::DRAIN_CHUNK);
         loop {
             let guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
-            let (since, landing): (u64, Landing) = {
+            let (since, generation, landing, prefix): (u64, u64, Landing, Option<KernelPrefix>) = {
                 let mut s = self.spill.lock().unwrap_or_else(|p| p.into_inner());
                 if s.buf.is_empty() {
                     s.draining = false;
@@ -2330,12 +2567,12 @@ impl Shared {
                     self.drained.notify_all();
                     return;
                 }
-                let (limit, landing) = s
-                    .runs
-                    .front()
-                    .map_or((Self::DRAIN_CHUNK, Landing::Driven), |&(run_len, l)| {
-                        (run_len.clamp(1, Self::DRAIN_CHUNK), l)
-                    });
+                let (limit, landing, prefix) = s.runs.front().map_or(
+                    (Self::DRAIN_CHUNK, Landing::Driven, None),
+                    |(run_len, l, prefix)| {
+                        ((*run_len).clamp(1, Self::DRAIN_CHUNK), *l, prefix.clone())
+                    },
+                );
                 chunk.clear();
                 let (head, tail) = s.buf.as_slices();
                 let take_head = head.len().min(limit);
@@ -2349,12 +2586,20 @@ impl Shared {
                         chunk.extend_from_slice(prefix);
                     }
                 }
-                (self.discard_epoch(), landing)
+                (self.discard_epoch(), s.generation, landing, prefix)
             };
             let mut off = 0;
             let mut dead = false;
             while off < chunk.len() {
-                match self.drain_write(fd.as_raw_fd(), &chunk, off, since, landing) {
+                match self.drain_write(
+                    fd.as_raw_fd(),
+                    &chunk,
+                    off,
+                    since,
+                    generation,
+                    landing,
+                    prefix.as_ref(),
+                ) {
                     n if n > 0 => off = off.saturating_add(n),
                     _ => {
                         dead = true;
@@ -2365,8 +2610,7 @@ impl Shared {
             drop(guard);
             {
                 let mut s = self.spill.lock().unwrap_or_else(|p| p.into_inner());
-                s.chunk_written = 0;
-                if self.discarded_since(since) {
+                if self.discarded_since(since) || s.generation != generation {
                     drop(s);
                     self.drained.notify_all();
                     continue;
@@ -2383,6 +2627,7 @@ impl Shared {
                     return;
                 }
                 s.pop_front(off);
+                s.chunk_written = 0;
                 self.spilled_bytes.store(s.buf.len(), Ordering::Release);
                 if s.buf.is_empty() {
                     self.order_state
@@ -2720,7 +2965,13 @@ mod tests {
         }
 
         let receipt = sink
-            .write_frame_locked(b"A", None, sink.shared.discard_epoch(), Landing::Driven)
+            .write_frame_locked(
+                b"A",
+                None,
+                sink.shared.discard_epoch(),
+                Landing::Driven,
+                false,
+            )
             .expect("fallback queues behind the racing spill");
         assert_eq!(receipt.accepted(), 1);
         assert_eq!(receipt.order(), Some(AcceptedOrder(2)));
@@ -4124,6 +4375,40 @@ mod input_io_tests {
             Ok(1)
         );
         waiter.join().expect("waiter");
+
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the room waiter's drainer finished",
+            || (!sink.shared.spill.lock().unwrap().draining).then_some(()),
+        );
+        let held = sink.shared.lock.lock().unwrap();
+        assert_eq!(sink.write_frame_nonparking(b"C").expect("concede"), 1);
+        assert!(sink.shared.spill.lock().unwrap().arrange_pending);
+        drop(held);
+        assert!(
+            sink.wait_egress_drained_to_kernel(),
+            "completion fence arranges a pending drainer itself"
+        );
+        let mut c = [0u8; 1];
+        reader.read_exact(&mut c).expect("read C");
+        assert_eq!(&c, b"C");
+
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the completion waiter's drainer finished",
+            || (!sink.shared.spill.lock().unwrap().draining).then_some(()),
+        );
+        let held = sink.shared.lock.lock().unwrap();
+        assert_eq!(sink.write_frame_nonparking(b"T").expect("concede"), 1);
+        assert!(sink.shared.spill.lock().unwrap().arrange_pending);
+        drop(held);
+        assert_eq!(
+            sink.wait_egress_drained_to_kernel_for(aterm_spec::wait::MUST_HAPPEN),
+            Some(true),
+            "bounded completion fence arranges a pending drainer itself"
+        );
+        reader.read_exact(&mut c).expect("read T");
+        assert_eq!(&c, b"T");
     }
 
     #[test]

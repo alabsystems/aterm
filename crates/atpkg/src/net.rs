@@ -235,7 +235,7 @@ impl IndexHint {
     /// `<low>..<newest>`, or a bare `<newest>` ([`std::fmt::Display`]'s spellings).
     #[must_use]
     pub fn parse(text: &str) -> Option<Self> {
-        let number = |digits: &str| digits.parse::<u64>().ok().filter(|&n| n > 0);
+        let number = |s: &str| crate::store::parse_build_name(s).filter(|&n| n > 0);
         let (low, newest) = match text.trim().split_once("..") {
             Some((low, newest)) => (Some(number(low)?), number(newest)?),
             None => (None, number(text.trim())?),
@@ -2267,6 +2267,9 @@ mod tests {
             "x",
             "9..8",
             "0..8",
+            "+8..72",
+            "08..72",
+            "8..+72",
             "8..",
             "..8",
             "-1..8",

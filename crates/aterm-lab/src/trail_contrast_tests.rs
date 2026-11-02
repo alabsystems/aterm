@@ -359,6 +359,58 @@ fn a_body_over_part_of_a_glyph_is_judged_by_the_ground_next_to_its_ink() {
     assert_eq!(clear.get("local_under").and_then(J::as_i64), Some(0));
 }
 
+/// A light laid on most of a cell's ground but more than the ring away from every stroke: the
+/// whole cell's median ground is the light, while every stroke still reads against the page next
+/// to it. The cell is judged as a reader sees it, by the ring round its strokes, as the letter
+/// guard keeps it; the lower of the two, as the judge read before, took the light's reading.
+#[test]
+fn a_light_away_from_the_strokes_leaves_the_letter_its_reading() {
+    let grid = Grid {
+        ox: 0,
+        oy: 0,
+        cw: 12,
+        ch: 24,
+        rows: 1,
+        cols: 1,
+        source: "args",
+    };
+    let mut clean = Image::from_pixels(12, 24, vec![PAGE; 12 * 24]);
+    paint(
+        &mut clean,
+        PxBox {
+            x0: 4,
+            y0: 2,
+            x1: 8,
+            y1: 5,
+        },
+        INK,
+    );
+    let mut frame = clean.clone();
+    paint(
+        &mut frame,
+        PxBox {
+            x0: 0,
+            y0: 8,
+            x1: 12,
+            y1: 24,
+        },
+        RIBBON,
+    );
+    let cell = J::Obj(measure_cell(&frame, Some(&clean), &grid, 0, 0, 1));
+    let local = field(&cell, "local_contrast");
+    assert_eq!(local, round_to(contrast(INK, PAGE), 2));
+    assert_eq!(
+        field(&cell, "contrast"),
+        round_to(contrast(INK, RIBBON), 2),
+        "fixture: the whole cell's median ground is the light"
+    );
+    assert!(
+        field(&cell, "contrast") < local,
+        "fixture: the readings differ"
+    );
+    assert_eq!(judged(&cell), Some(local));
+}
+
 #[test]
 fn the_report_reads_the_sidecars_and_turns_ratios_into_failures() {
     let dir = scratch("report");
@@ -503,7 +555,7 @@ fn an_icon_caret_reads_by_its_ink_against_the_halo_it_sits_in() {
         let mut frame = Image::from_pixels(W, H, vec![PAGE; W * H]);
         paint(&mut frame, cell, halo);
         paint(&mut frame, ink, colour);
-        measure_caret(&frame, &GRID, row, col, PAGE)
+        measure_caret(&frame, None, &GRID, (row, col), PAGE, CaretShape::Block)
     };
     let caret = |halo: Rgb, ink: PxBox| lit(halo, ink, BOLT);
     let read = |c: &J, k: &str| c.get(k).and_then(J::as_f64).unwrap();
@@ -570,6 +622,272 @@ fn an_icon_caret_reads_by_its_ink_against_the_halo_it_sits_in() {
         Some(hex(PAGE).as_str())
     );
     assert_eq!(read(&flash, "contrast"), round_to(contrast(FLASH, PAGE), 2));
+}
+
+/// A BAR OR AN UNDERLINE CARET READS BY ITS OWN SPAN (composed r0's judges, must_fix 2; S1's tool
+/// defect): when the cursor reply names a thin shape, the caret is read by the run of lines at the
+/// cell's left edge (a bar) or foot (an underline), not by the cell's brightest light. A dim bar
+/// beside a bright head glow at the block's centre (the light no bar anchoring moved) reads as
+/// the dim bar; a bright bar in a halo reads against that halo; an underline reads by its foot.
+/// Negative control: the same frames read as a block, where the head glow is the caret and the
+/// unreadable bar passes.
+#[test]
+fn a_bar_or_an_underline_caret_reads_by_its_own_span() {
+    const DIM_BAR: Rgb = [0x2a, 0x30, 0x38];
+    const GLOW: Rgb = [0xf4, 0xee, 0xff];
+    const BAR: Rgb = [0x50, 0xfa, 0x7b];
+    const HALO: Rgb = [0x3a, 0x3d, 0x6a];
+    let (row, col) = (1, 3);
+    let cell = GRID.cell_box(row, col, 1);
+    let read = |c: &J, k: &str| c.get(k).and_then(J::as_f64).unwrap();
+    let frame = |halo: Rgb, ink: &[(PxBox, Rgb)]| {
+        let mut f = Image::from_pixels(W, H, vec![PAGE; W * H]);
+        paint(&mut f, cell, halo);
+        for &(b, c) in ink {
+            paint(&mut f, b, c);
+        }
+        f
+    };
+    let bar_box = PxBox {
+        x1: cell.x0 + 1,
+        ..cell
+    };
+    let glow_box = PxBox {
+        x0: cell.x0 + 2,
+        y0: cell.y0 + 3,
+        x1: cell.x0 + 5,
+        y1: cell.y0 + 7,
+    };
+    let foot_box = PxBox {
+        y0: cell.y1 - 1,
+        ..cell
+    };
+    assert!(contrast(DIM_BAR, PAGE) < LEGIBLE && contrast(GLOW, PAGE) >= LEGIBLE);
+
+    let beside = frame(PAGE, &[(bar_box, DIM_BAR), (glow_box, GLOW)]);
+    let thin = measure_caret(&beside, None, &GRID, (row, col), PAGE, CaretShape::Bar);
+    assert_eq!(thin.get("read_as").and_then(J::as_str), Some("bar"));
+    assert_eq!(
+        thin.get("colour").and_then(J::as_str),
+        Some(hex(DIM_BAR).as_str())
+    );
+    assert_eq!(
+        read(&thin, "contrast"),
+        round_to(contrast(DIM_BAR, PAGE), 2)
+    );
+    assert!(
+        read(&thin, "contrast") < LEGIBLE,
+        "the dim bar is read, and fails"
+    );
+    assert_eq!(
+        thin.get("span").and_then(J::as_arr).map(<[J]>::len),
+        Some(2),
+        "the span read is named"
+    );
+    let block = measure_caret(&beside, None, &GRID, (row, col), PAGE, CaretShape::Block);
+    assert!(
+        read(&block, "contrast") >= LEGIBLE,
+        "negative control: read as a block, the head glow passes for the caret"
+    );
+
+    let in_halo = frame(HALO, &[(bar_box, BAR)]);
+    let thin = measure_caret(&in_halo, None, &GRID, (row, col), PAGE, CaretShape::Bar);
+    assert_eq!(
+        read(&thin, "contrast"),
+        round_to(contrast(BAR, PAGE).min(contrast(BAR, HALO)), 2)
+    );
+    assert_eq!(
+        thin.get("ground").and_then(J::as_str),
+        Some(hex(HALO).as_str())
+    );
+
+    let under = frame(PAGE, &[(foot_box, BAR), (glow_box, GLOW)]);
+    let thin = measure_caret(&under, None, &GRID, (row, col), PAGE, CaretShape::Underline);
+    assert_eq!(
+        thin.get("colour").and_then(J::as_str),
+        Some(hex(BAR).as_str())
+    );
+    let as_bar = measure_caret(&under, None, &GRID, (row, col), PAGE, CaretShape::Bar);
+    assert_ne!(
+        as_bar.get("colour").and_then(J::as_str),
+        Some(hex(BAR).as_str()),
+        "negative control: an underline is not read at the bar's edge"
+    );
+
+    for (word, shape) in [
+        (Some("steady_bar"), CaretShape::Bar),
+        (Some("blinking_bar"), CaretShape::Bar),
+        (Some("steady_underline"), CaretShape::Underline),
+        (Some("blinking_block"), CaretShape::Block),
+        (Some("bolt"), CaretShape::Block),
+        (None, CaretShape::Block),
+    ] {
+        assert_eq!(CaretShape::named(word), shape, "{word:?}");
+    }
+}
+
+/// A THIN CARET'S SPAN IS ITS OWN INK (composed r1, S1's bar on paper): a trail's pastel light laid
+/// against a bar on a light page is as far from the page as the bar's antialiased edge, so the span
+/// is kept only through lines whose colour is the bar's ink or a blend of it with the page. The bar
+/// reads as itself against the light beside it, and its antialiased edge stays in its span.
+/// Negative control: the span widened by strength alone takes the light in, and reads a colour no
+/// pixel has.
+#[test]
+fn a_thin_caret_s_span_is_its_own_ink_and_not_the_light_beside_it() {
+    const PAPER: Rgb = [0xff, 0xff, 0xff];
+    const BAR: Rgb = [0x09, 0x69, 0xda];
+    const EDGE_75: Rgb = [0x89, 0xa1, 0xe4];
+    const LIGHT: Rgb = [0xdc, 0x8e, 0xce];
+    let (row, col) = (1, 3);
+    let cell = GRID.cell_box(row, col, 1);
+    let columns = |x0: i64, x1: i64| PxBox {
+        x0: cell.x0 + x0,
+        x1: cell.x0 + x1,
+        ..cell
+    };
+    let mut f = Image::from_pixels(W, H, vec![PAPER; W * H]);
+    paint(&mut f, columns(0, 2), BAR);
+    paint(&mut f, columns(2, 3), EDGE_75);
+    paint(&mut f, columns(3, 5), LIGHT);
+    let floor = contrast(BAR, PAPER).sqrt();
+    assert!(
+        contrast(LIGHT, PAPER) >= floor && contrast(EDGE_75, PAPER) >= floor,
+        "the light and the edge are both strong enough to join the span by strength"
+    );
+    assert!(blends(EDGE_75, PAPER, BAR) && !blends(LIGHT, PAPER, BAR));
+    let read = |c: &J, k: &str| c.get(k).and_then(J::as_f64).unwrap();
+    let span = |c: &J| {
+        c.get("span")
+            .and_then(J::as_arr)
+            .map(|s| s.iter().filter_map(J::as_i64).collect::<Vec<_>>())
+    };
+
+    let own = measure_caret(&f, None, &GRID, (row, col), PAPER, CaretShape::Bar);
+    assert_eq!(
+        span(&own),
+        Some(vec![cell.x0, cell.x0 + 3]),
+        "the bar and its edge, not the light"
+    );
+    assert_eq!(
+        own.get("colour").and_then(J::as_str),
+        Some(hex(BAR).as_str())
+    );
+    assert_eq!(
+        own.get("ground").and_then(J::as_str),
+        Some(hex(LIGHT).as_str())
+    );
+    assert_eq!(
+        read(&own, "contrast"),
+        round_to(contrast(BAR, LIGHT), 2),
+        "the bar reads against the light laid beside it"
+    );
+
+    let by_strength =
+        thin_caret_reading(&f, None, &GRID, (row, col), PAPER, CaretShape::Bar, false);
+    assert_eq!(
+        span(&by_strength),
+        Some(vec![cell.x0, cell.x0 + 5]),
+        "negative control: by strength alone the span takes the light in"
+    );
+    assert_ne!(
+        by_strength.get("colour").and_then(J::as_str),
+        Some(hex(BAR).as_str()),
+        "negative control: by strength alone the bar is not the colour read"
+    );
+}
+
+/// A THIN CARET'S SPAN IS WHERE ITS CLEAN TWIN DRAWS IT (composed r1, S1's bar on paper and the
+/// Return flash on dark): a light laid against a bar may share the bar's own hue (Comet's ice
+/// beside GitHub Light's blue bar is a blend of that blue with the paper) or outshine it (a Return
+/// flash over a green bar on dark), so the frame alone cannot tell the bar from it. With the
+/// frame's clean twin the span is the lines the twin draws the caret on, and the bar reads against
+/// the light beside it. Negative control: the same frame with no twin, read in the frame, takes
+/// the light in (the ice) or takes the flash for the caret.
+#[test]
+fn a_thin_caret_s_span_is_where_its_clean_twin_draws_it() {
+    const PAPER: Rgb = [0xff, 0xff, 0xff];
+    const BAR: Rgb = [0x09, 0x69, 0xda];
+    const ICE: Rgb = [0x5c, 0xaa, 0xe2];
+    const GREEN: Rgb = [0x50, 0xfa, 0x7b];
+    const FLASH: Rgb = [0xff, 0xfc, 0x9f];
+    let (row, col) = (1, 3);
+    let cell = GRID.cell_box(row, col, 1);
+    let columns = |x0: i64, x1: i64| PxBox {
+        x0: cell.x0 + x0,
+        x1: cell.x0 + x1,
+        ..cell
+    };
+    let span = |c: &J| {
+        c.get("span")
+            .and_then(J::as_arr)
+            .map(|s| s.iter().filter_map(J::as_i64).collect::<Vec<_>>())
+    };
+    let colour = |c: &J| c.get("colour").and_then(J::as_str).map(str::to_string);
+    let read = |c: &J| c.get("contrast").and_then(J::as_f64).unwrap();
+
+    let mut twin = Image::from_pixels(W, H, vec![PAPER; W * H]);
+    paint(&mut twin, columns(0, 2), BAR);
+    let mut iced = twin.clone();
+    paint(&mut iced, columns(2, 6), ICE);
+    assert!(blends(ICE, PAPER, BAR) && contrast(ICE, PAPER) >= contrast(BAR, PAPER).sqrt());
+    let by_twin = measure_caret(
+        &iced,
+        Some(&twin),
+        &GRID,
+        (row, col),
+        PAPER,
+        CaretShape::Bar,
+    );
+    assert_eq!(span(&by_twin), Some(vec![cell.x0, cell.x0 + 2]));
+    assert_eq!(by_twin.get("span_from").and_then(J::as_str), Some("twin"));
+    assert_eq!(colour(&by_twin), Some(hex(BAR)));
+    assert_eq!(read(&by_twin), round_to(contrast(BAR, ICE), 2));
+    let in_frame = measure_caret(&iced, None, &GRID, (row, col), PAPER, CaretShape::Bar);
+    assert_eq!(in_frame.get("span_from").and_then(J::as_str), Some("frame"));
+    assert_ne!(
+        colour(&in_frame),
+        Some(hex(BAR)),
+        "negative control: with no twin the ice, a blend of the bar's blue with the paper, is taken in"
+    );
+
+    let dark = PAGE;
+    let mut twin = Image::from_pixels(W, H, vec![dark; W * H]);
+    paint(&mut twin, columns(0, 1), GREEN);
+    let mut flashed = twin.clone();
+    paint(&mut flashed, columns(1, 6), FLASH);
+    assert!(contrast(FLASH, dark) > contrast(GREEN, dark));
+    let by_twin = measure_caret(
+        &flashed,
+        Some(&twin),
+        &GRID,
+        (row, col),
+        dark,
+        CaretShape::Bar,
+    );
+    assert_eq!(span(&by_twin), Some(vec![cell.x0, cell.x0 + 1]));
+    assert_eq!(colour(&by_twin), Some(hex(GREEN)));
+    assert_eq!(read(&by_twin), round_to(contrast(GREEN, FLASH), 2));
+    let in_frame = measure_caret(&flashed, None, &GRID, (row, col), dark, CaretShape::Bar);
+    assert_eq!(
+        colour(&in_frame),
+        Some(hex(FLASH)),
+        "negative control: with no twin the flash outshines the bar and is taken for it"
+    );
+
+    let blank = Image::from_pixels(W, H, vec![dark; W * H]);
+    let no_caret = measure_caret(
+        &flashed,
+        Some(&blank),
+        &GRID,
+        (row, col),
+        dark,
+        CaretShape::Bar,
+    );
+    assert_eq!(
+        no_caret.get("span_from").and_then(J::as_str),
+        Some("frame"),
+        "a twin that draws no caret there leaves the span to the frame"
+    );
 }
 
 #[test]

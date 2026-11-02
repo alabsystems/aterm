@@ -6,6 +6,111 @@
 
 use super::*;
 
+/// Authenticated local vault version for a named entry, even when that entry
+/// is absent or not safely materialized. Carries no secret commitment.
+#[derive(Clone)]
+pub struct EntryVersion {
+    config: Config,
+    name: String,
+    recipient: Recipient,
+    seq: u64,
+    envelope: [u8; 32],
+    log_ids: Option<std::sync::Arc<std::collections::BTreeSet<[u8; 32]>>>,
+}
+
+impl std::fmt::Debug for EntryVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EntryVersion").finish_non_exhaustive()
+    }
+}
+
+impl EntryVersion {
+    /// The same authenticated source and entry at a nondecreasing version.
+    /// A different signed envelope at the same sequence is a fork, not progress.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbEntryVersion",
+            action = "Same",
+            project = "aterm_secrets::client::entry::tests::version_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbEntryVersion",
+            action = "Advance",
+            project = "aterm_secrets::client::entry::tests::version_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbEntryVersion",
+            action = "Rollback",
+            project = "aterm_secrets::client::entry::tests::version_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbEntryVersion",
+            action = "Fork",
+            project = "aterm_secrets::client::entry::tests::version_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbEntryVersion",
+            action = "LogExtend",
+            project = "aterm_secrets::client::entry::tests::version_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbEntryVersion",
+            action = "LogDrop",
+            project = "aterm_secrets::client::entry::tests::version_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbEntryVersion",
+            action = "LogSwap",
+            project = "aterm_secrets::client::entry::tests::version_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbEntryVersion",
+            action = "Context",
+            project = "aterm_secrets::client::entry::tests::version_transition"
+        )
+    )]
+    pub fn not_before(&self, floor: &Self) -> bool {
+        self.config == floor.config
+            && self.name == floor.name
+            && self.recipient == floor.recipient
+            && (self.seq > floor.seq || (self.seq == floor.seq && self.envelope == floor.envelope))
+            && match (&self.log_ids, &floor.log_ids) {
+                (Some(current), Some(previous)) => previous.is_subset(current),
+                (None, Some(_)) => false,
+                _ => true,
+            }
+    }
+}
+
+/// A verified vault version and optional matching materialized entry. Absence
+/// does not authorize use, but its version can retain an observed revocation.
+pub struct EntryObservation {
+    pub version: EntryVersion,
+    pub entry: Option<VerifiedEntry>,
+}
+
 /// One exact authenticated entry, including its audience and materialization
 /// policy. The private commitment is not a public identifier or a generation
 /// counter. It must not be exported: weak secrets may be guessed from hashes.
@@ -18,6 +123,7 @@ pub struct EntrySnapshot {
     recipient: Recipient,
     seq: u64,
     envelope: [u8; 32],
+    log_ids: Option<std::sync::Arc<std::collections::BTreeSet<[u8; 32]>>>,
 }
 
 impl std::fmt::Debug for EntrySnapshot {
@@ -60,6 +166,23 @@ impl std::fmt::Debug for VerifiedEntry {
 }
 
 impl EntrySnapshot {
+    pub fn version(&self) -> EntryVersion {
+        EntryVersion {
+            config: self.config.clone(),
+            name: self.name.clone(),
+            recipient: self.recipient,
+            seq: self.seq,
+            envelope: self.envelope,
+            log_ids: self.log_ids.clone(),
+        }
+    }
+
+    /// Same exact entry value and policy, without rolling back its vault version.
+    pub fn continues(&self, floor: &Self) -> bool {
+        self.version().not_before(&floor.version())
+            && aterm_digest::ct_eq(self.fingerprint.as_slice(), floor.fingerprint.as_slice())
+    }
+
     /// Read again only while this exact entry and configured trust context still
     /// hold. An unrelated vault update may pass; a changed value, audience,
     /// materialization policy or source may not. Rejects rollback below the
@@ -119,17 +242,17 @@ impl EntrySnapshot {
         )
     )]
     pub fn read(&self, paths: &Paths) -> crate::Result<Option<VerifiedEntry>> {
-        Ok(
-            read_verified_entry(paths, &self.config, &self.name)?.filter(|entry| {
-                entry.snapshot.recipient == self.recipient
-                    && entry.snapshot.seq >= self.seq
-                    && (entry.snapshot.seq > self.seq || entry.snapshot.envelope == self.envelope)
-                    && aterm_digest::ct_eq(
-                        entry.snapshot.fingerprint.as_slice(),
-                        self.fingerprint.as_slice(),
-                    )
-            }),
-        )
+        self.read_as(paths, Reading::Materialized)
+    }
+
+    pub(super) fn read_publication(&self, paths: &Paths) -> crate::Result<Option<VerifiedEntry>> {
+        self.read_as(paths, Reading::PublicationMaterial)
+    }
+
+    fn read_as(&self, paths: &Paths, reading: Reading) -> crate::Result<Option<VerifiedEntry>> {
+        Ok(read_entry(paths, &self.config, &self.name, reading)?
+            .map(|(entry, _)| entry)
+            .filter(|entry| entry.snapshot.continues(self)))
     }
 }
 
@@ -246,6 +369,60 @@ pub fn read_verified_entry(
     Ok(read_entry(paths, expected, name, Reading::Materialized)?.map(|(entry, _)| entry))
 }
 
+/// Read the authenticated vault version even if the named entry is absent or
+/// its materialized file does not match. Untrusted/unavailable vault state has
+/// no version. Callers must retain the version before interpreting `entry`.
+/// # Errors
+/// The local source or entry cannot be safely read.
+pub fn observe_verified_entry(
+    paths: &Paths,
+    expected: &Config,
+    name: &str,
+) -> crate::Result<Option<EntryObservation>> {
+    let mut version = None;
+    let entry =
+        read_entry_with_version(paths, expected, name, Reading::Materialized, &mut version)?;
+    Ok(version.map(|version| EntryObservation {
+        version,
+        entry: entry.map(|(entry, _)| entry),
+    }))
+}
+
+/// Read existing signing bytes only when they equal the currently authorized vault entry.
+/// Unlike the general reader, an untracked file may supply these bytes without transferring
+/// its ownership to the vault. Any anchors must still be current vault-owned files.
+/// No file or manifest is changed.
+/// # Errors
+/// The name is outside the signing directory, or the existing authenticated entry or private
+/// file cannot be safely read.
+pub(super) fn read_signing_material(
+    paths: &Paths,
+    expected: &Config,
+    name: &str,
+) -> crate::Result<Option<SecretBytes>> {
+    Ok(read_entry(paths, expected, name, Reading::SigningMaterial)?.map(|(entry, _)| entry.value))
+}
+
+/// Exact authenticated publication-token bytes, without claiming an existing file.
+/// This exception is private to the explicit release probe; ordinary entry reads retain
+/// their manifest requirement. Its snapshot must use the same narrow mode on revalidation.
+pub(super) fn read_publication_material(
+    paths: &Paths,
+    expected: &Config,
+    name: &str,
+) -> crate::Result<Option<VerifiedEntry>> {
+    Ok(read_entry(paths, expected, name, Reading::PublicationMaterial)?.map(|(entry, _)| entry))
+}
+
+fn signing_material_name(name: &str) -> bool {
+    name.strip_prefix(super::release::APPLE_PREFIX)
+        .and_then(|leaf| {
+            leaf.strip_suffix(".cer")
+                .or_else(|| leaf.strip_suffix(".key"))
+        })
+        .is_some_and(|stem| !stem.is_empty() && !stem.contains(['/', '\\']))
+}
+
 pub(crate) fn read_reserved_entry(
     paths: &Paths,
     expected: &Config,
@@ -265,6 +442,8 @@ pub(crate) fn read_reserved_entry_and_admin(
 #[derive(Clone, Copy)]
 enum Reading {
     Materialized,
+    SigningMaterial,
+    PublicationMaterial,
     Reserved,
     ReservedAndAdmin,
 }
@@ -297,8 +476,25 @@ fn read_entry(
     name: &str,
     reading: Reading,
 ) -> crate::Result<Option<(VerifiedEntry, bool)>> {
-    let materialized = matches!(reading, Reading::Materialized);
-    let valid = if materialized {
+    read_entry_with_version(paths, expected, name, reading, &mut None)
+}
+
+fn read_entry_with_version(
+    paths: &Paths,
+    expected: &Config,
+    name: &str,
+    reading: Reading,
+    version: &mut Option<EntryVersion>,
+) -> crate::Result<Option<(VerifiedEntry, bool)>> {
+    let materialized = matches!(
+        reading,
+        Reading::Materialized | Reading::SigningMaterial | Reading::PublicationMaterial
+    );
+    let valid = if matches!(reading, Reading::SigningMaterial) {
+        text::valid_entry_name(name) && signing_material_name(name)
+    } else if matches!(reading, Reading::PublicationMaterial) {
+        matches!(name, "gh_access_token" | "gh_access_token_alabsystems")
+    } else if materialized {
         text::valid_entry_name(name) && !crate::reserved_name(name)
     } else {
         text::valid_entry_name(name)
@@ -344,6 +540,11 @@ fn read_entry(
             return Ok(None);
         };
         if configured.log.removes(&identity.recipient())
+            || super::log_entries::recipient_denied_by_roster_or_log(
+                None,
+                &configured.log,
+                &identity.recipient(),
+            )
             || configured.log.audience_left_out_recipient(
                 &crate::membership_log::EpochAudience::Everyone,
                 &identity.recipient(),
@@ -385,7 +586,7 @@ fn read_entry(
     {
         r.canonicalize();
         if let Some(log) = &trusted_log {
-            let _ = super::roster::lift_restored_from_roster(log, &mut r);
+            super::roster::overlay_log_membership(log, &mut r);
             if super::log_entries::recipient_denied_by_roster_or_log(
                 Some(&r),
                 log,
@@ -395,45 +596,43 @@ fn read_entry(
             }
         }
         let my_rec = identity.recipient().to_bech32();
-        if r.is_label_denied(&config.host)
-            || r.member_by_recipient(&my_rec)
-                .is_some_and(|m| steward::member_is_denied_in_roster(&r, m))
-        {
+        if let Some(m) = r.member_by_recipient(&my_rec) {
+            if steward::member_is_denied_in_roster(&r, m) {
+                return Ok(None);
+            }
+        } else if r.is_label_denied(&config.host) {
             return Ok(None);
         }
     }
-    let Some(entry) = entries.into_iter().find(|entry| entry.name == name) else {
+    let log_ids = trusted_log
+        .as_ref()
+        .map(|log| std::sync::Arc::new(log.records().map(|record| *record.id()).collect()));
+    *version = Some(EntryVersion {
+        config: config.clone(),
+        name: name.into(),
+        recipient: identity.recipient(),
+        seq: state.seq,
+        envelope: envelope_digest,
+        log_ids: log_ids.clone(),
+    });
+    let Some(entry) = entries.iter().find(|entry| entry.name == name) else {
         return Ok(None);
     };
     let (value, admin) = if materialized {
-        if state.manifest.files.get(name) != Some(&materialize::digest_hex(entry.value.as_slice()))
+        let untracked = matches!(
+            reading,
+            Reading::SigningMaterial | Reading::PublicationMaterial
+        );
+        let strict = matches!(reading, Reading::PublicationMaterial);
+        if untracked
+            && !state.manifest.files.contains_key(name)
+            && !material_anchors_current(paths, &state, &entries, entry, strict)?
         {
             return Ok(None);
         }
-        let path = materialize::target_path(&paths.home, name)?;
-        // Refuse observed parent links too. A concurrent path replacement cannot
-        // substitute returned bytes: the opened file is compared with the signed
-        // plaintext below. This does not claim a path lease against other writers.
-        let mut parent = path.parent();
-        loop {
-            let Some(directory) = parent.filter(|directory| directory.starts_with(&paths.home))
-            else {
-                return Ok(None);
-            };
-            if fsx::kind(directory)? != fsx::Kind::Dir {
-                return Ok(None);
-            }
-            if directory == paths.home {
-                break;
-            }
-            parent = directory.parent();
-        }
-        let Some(value) = fsx::read_private(&path, text::MAX_VALUE)? else {
+        let Some(value) = materialized_value(paths, &state, entry, !untracked, strict)? else {
             return Ok(None);
         };
-        if !aterm_digest::ct_eq(value.as_slice(), entry.value.as_slice()) {
-            return Ok(None);
-        }
         (value, false)
     } else {
         if entry.if_absent || entry.anchor.is_some() {
@@ -447,14 +646,112 @@ fn read_entry(
             snapshot: EntrySnapshot {
                 config,
                 name: name.into(),
-                fingerprint: fingerprint(&entry),
+                fingerprint: fingerprint(entry),
                 recipient: identity.recipient(),
                 seq: state.seq,
                 envelope: envelope_digest,
+                log_ids,
             },
         },
         admin,
     )))
+}
+
+fn material_anchors_current(
+    paths: &Paths,
+    state: &State,
+    entries: &[Entry],
+    entry: &Entry,
+    strict: bool,
+) -> crate::Result<bool> {
+    let mut seen = BTreeSet::new();
+    let mut anchor = entry.anchor.as_deref();
+    while let Some(name) = anchor {
+        if !seen.insert(name) {
+            return Ok(false);
+        }
+        let Some(entry) = entries.iter().find(|entry| entry.name == name) else {
+            return Ok(false);
+        };
+        if !entry.if_absent || materialized_value(paths, state, entry, true, strict)?.is_none() {
+            return Ok(false);
+        }
+        anchor = entry.anchor.as_deref();
+    }
+    Ok(true)
+}
+
+fn materialized_value(
+    paths: &Paths,
+    state: &State,
+    entry: &Entry,
+    require_tracked: bool,
+    strict: bool,
+) -> crate::Result<Option<SecretBytes>> {
+    let digest = materialize::digest_hex(entry.value.as_slice());
+    let tracked = state.manifest.files.get(&entry.name);
+    if tracked.is_some_and(|held| held != &digest) || (require_tracked && tracked.is_none()) {
+        return Ok(None);
+    }
+    let path = materialize::target_path(&paths.home, &entry.name)?;
+    // Refuse observed parent links too. A concurrent path replacement cannot substitute
+    // returned bytes: the opened file is compared with the signed plaintext below.
+    // This does not claim a path lease against other writers.
+    let mut parent = path.parent();
+    loop {
+        let Some(directory) = parent.filter(|directory| directory.starts_with(&paths.home)) else {
+            return Ok(None);
+        };
+        if fsx::kind(directory)? != fsx::Kind::Dir {
+            return Ok(None);
+        }
+        if directory == paths.home {
+            break;
+        }
+        parent = directory.parent();
+    }
+    let Some(value) = (if strict {
+        read_single_private(&path)?
+    } else {
+        fsx::read_private(&path, text::MAX_VALUE)?
+    }) else {
+        return Ok(None);
+    };
+    if !aterm_digest::ct_eq(value.as_slice(), entry.value.as_slice()) {
+        return Ok(None);
+    }
+    Ok(Some(value))
+}
+
+fn read_single_private(path: &Path) -> crate::Result<Option<SecretBytes>> {
+    use std::io::Read as _;
+    use std::os::unix::fs::MetadataExt as _;
+    let dir = path
+        .parent()
+        .ok_or_else(|| Error::new("publication material has no parent"))?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| Error::new("publication material has an invalid name"))?;
+    let (file, metadata) = match aterm_uds::private_file::open_private(dir, name) {
+        Ok(opened) => opened,
+        Err(aterm_uds::private_file::PrivateFileError::Missing) => return Ok(None),
+        Err(_) => {
+            return Err(Error::new(
+                "publication material is not a private owned file",
+            ));
+        }
+    };
+    if metadata.nlink() != 1 || metadata.len() > text::MAX_VALUE as u64 {
+        return Err(Error::new("publication material has unsafe links or size"));
+    }
+    let mut bytes = Vec::new();
+    crate::secret::read_to_end_wiping_on_error(file.take(text::MAX_VALUE as u64 + 1), &mut bytes)?;
+    let value = SecretBytes::new(bytes);
+    if value.as_slice().len() > text::MAX_VALUE {
+        return Err(Error::new("publication material exceeds its bound"));
+    }
+    Ok(Some(value))
 }
 
 fn field(hash: &mut aterm_digest::Sha256, bytes: &[u8]) {

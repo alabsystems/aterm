@@ -25,7 +25,8 @@ pub fn login_key(env: &[String]) -> Option<String> {
     }
     env.iter()
         .filter_map(|entry| entry.split_once('='))
-        .find(|(name, value)| *name == HOME_ENV && !value.is_empty())
+        .rfind(|(name, _)| *name == HOME_ENV)
+        .filter(|(_, value)| !value.is_empty())
         .map(|(_, home)| format!("dir:{home}"))
 }
 
@@ -125,8 +126,10 @@ impl LoginLatches {
             if other != key && latch.carrier.as_deref() == Some(sid) {
                 latch.carrier = None;
                 latch.carrier_owner = None;
+                latch.row = None;
             }
         }
+        logins.retain(|_, latch| !latch.idle());
         let latch = logins.entry(key.to_string()).or_default();
         if let Some(by) = latch.carrier.clone().filter(|by| by != sid) {
             latch.waiting.insert(sid.to_string());
@@ -153,7 +156,7 @@ impl LoginLatches {
             {
                 latch.carrier = None;
                 latch.carrier_owner = None;
-                row |= latch.row.is_some();
+                row |= latch.row.take().is_some();
             }
         }
         logins.retain(|_, latch| !latch.idle());
@@ -167,6 +170,7 @@ impl LoginLatches {
             if other != key && latch.carrier.as_deref() == Some(sid) {
                 latch.carrier = None;
                 latch.carrier_owner = None;
+                latch.row = None;
             }
         }
         logins.retain(|_, latch| !latch.idle());
@@ -177,6 +181,7 @@ impl LoginLatches {
             latch.back.insert(carrier, sid.to_string());
         }
         latch.carrier_owner = None;
+        latch.row = None;
         for waited in std::mem::take(&mut latch.waiting) {
             if waited != sid {
                 latch.back.insert(waited, sid.to_string());
@@ -195,6 +200,7 @@ impl LoginLatches {
             if latch.carrier.as_deref() == Some(sid) {
                 latch.carrier = None;
                 latch.carrier_owner = None;
+                latch.row = None;
             }
             latch.waiting.remove(sid);
             latch.back.remove(sid);

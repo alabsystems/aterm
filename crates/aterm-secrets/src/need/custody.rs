@@ -30,13 +30,13 @@ fn key_pair(seed: &[u8; 32]) -> crate::Result<Ed25519KeyPair> {
         .map_err(|_| Error::new("custody: the signing seed is not a usable Ed25519 seed"))
 }
 
-fn sign(seed: &[u8; 32], message: &[u8]) -> crate::Result<[u8; 64]> {
+pub(super) fn sign(seed: &[u8; 32], message: &[u8]) -> crate::Result<[u8; 64]> {
     let signature = key_pair(seed)?.sign(message);
     <[u8; 64]>::try_from(signature.as_ref())
         .map_err(|_| Error::new("custody: an Ed25519 signature is not 64 bytes"))
 }
 
-fn verifies(key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
+pub(super) fn verifies(key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
     UnparsedPublicKey::new(&ED25519, key)
         .verify(message, signature)
         .is_ok()
@@ -75,12 +75,18 @@ pub fn attestation_message(network: &[u8; 16], record: Attested<'_>) -> Vec<u8> 
 /// A custodian's attestation of `record` on `network`, by the vault signing seed `seed`.
 ///
 /// # Errors
-/// The body is over [`MAX_BODY`], or `seed` is not a usable seed.
+/// The kind is empty or over `u16::MAX` bytes, the body is over [`MAX_BODY`], or `seed` is not a
+/// usable seed.
 pub fn attest(
     seed: &[u8; 32],
     network: &[u8; 16],
     record: Attested<'_>,
 ) -> crate::Result<[u8; 64]> {
+    if record.kind.is_empty() || u16::try_from(record.kind.len()).is_err() {
+        return Err(Error::new(
+            "custody: a record kind must be non-empty and at most 65535 bytes",
+        ));
+    }
     if record.body.len() > MAX_BODY {
         return Err(Error::new(format!(
             "custody: a record body over {MAX_BODY} bytes is never attested"
@@ -99,7 +105,9 @@ pub fn attested(
     record: Attested<'_>,
     signature: &[u8; 64],
 ) -> bool {
-    record.body.len() <= MAX_BODY
+    !record.kind.is_empty()
+        && u16::try_from(record.kind.len()).is_ok()
+        && record.body.len() <= MAX_BODY
         && verifies(signer, &attestation_message(network, record), signature)
 }
 
@@ -168,5 +176,14 @@ mod tests {
             )
             .is_err()
         );
+        assert!(attest(&SIGNER_SEED, &[1; 16], record("", &[2; 16], body)).is_err());
+        let over_kind = "k".repeat(usize::from(u16::MAX) + 1);
+        assert!(attest(&SIGNER_SEED, &[1; 16], record(&over_kind, &[2; 16], body)).is_err());
+        assert!(!attested(
+            &public(&SIGNER_SEED),
+            &[1; 16],
+            record(&over_kind, &[2; 16], body),
+            &signature,
+        ));
     }
 }

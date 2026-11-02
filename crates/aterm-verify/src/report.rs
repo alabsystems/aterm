@@ -117,12 +117,17 @@ pub fn judge(
 /// `1.2s`, `47s`, `3m05s`.
 #[must_use]
 pub fn duration(secs: f64) -> String {
+    if !secs.is_finite() || secs <= 0.0 {
+        return "0.0s".to_string();
+    }
     if secs < 10.0 {
         format!("{secs:.1}s")
     } else if secs < 60.0 {
         format!("{secs:.0}s")
     } else {
-        let whole = Duration::from_secs_f64(secs).as_secs();
+        let whole = Duration::try_from_secs_f64(secs)
+            .unwrap_or(Duration::MAX)
+            .as_secs();
         format!("{}m{:02}s", whole / 60, whole % 60)
     }
 }
@@ -291,6 +296,10 @@ mod tests {
             "the failure, then what could not run beside it under its own word"
         );
         assert_eq!(r.detail, "a row");
+        assert_eq!(duration(0.0), "0.0s");
+        assert_eq!(duration(-1.5), "0.0s");
+        assert_eq!(duration(f64::NAN), "0.0s");
+        assert!(!duration(f64::INFINITY).is_empty());
     }
 
     #[test]
@@ -311,6 +320,11 @@ mod tests {
             crate::exit::FAILED
         );
         assert_eq!(code(&[ok, unrun], false), crate::exit::COULD_NOT_RUN);
+        assert_eq!(duration(f64::NAN), "0.0s");
+        assert_eq!(duration(-1.0), "0.0s");
+        assert_eq!(duration(f64::INFINITY), "0.0s");
+        assert!(duration(1e30).ends_with("15s"));
+        assert_eq!(duration(185.0), "3m05s");
     }
 
     #[test]

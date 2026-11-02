@@ -1222,7 +1222,7 @@ mod tests {
         };
         use crate::metal::swapchain::{Swapchain, SwapchainConfig};
 
-        let Some(dev) = Device::preferred() else {
+        let Some(dev) = Device::preferred_listed() else {
             aterm_spec::host::could_not_run("no Metal device");
         };
         let _test_pool = crate::metal::ffi::AutoreleasePool::new();
@@ -1329,7 +1329,7 @@ mod tests {
     }
 
     fn mint() -> Option<MetalResourceDevice> {
-        let dev = Device::preferred()?;
+        let dev = Device::preferred_listed()?;
         Some(MetalResourceDevice::new(&dev, Arc::new(LossLatch::new())))
     }
 

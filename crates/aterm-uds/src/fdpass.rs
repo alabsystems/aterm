@@ -920,7 +920,7 @@ mod scm {
     mod sigpipe_tests {
         use std::io::{IoSlice, Write as _};
         use std::os::unix::process::ExitStatusExt as _;
-        use std::process::{Command, ExitStatus, Stdio};
+        use std::process::{Command, ExitStatus};
 
         use crate::CtlStream;
 
@@ -936,17 +936,17 @@ mod scm {
 
         /// How the helper ended in `mode`, and what it printed.
         fn helper(mode: &str) -> (ExitStatus, String) {
-            let out = Command::new(std::env::current_exe().expect("the test binary"))
-                .args([
-                    "--exact",
-                    "fdpass::scm::sigpipe_tests::zz_helper_entry",
-                    "--nocapture",
-                    "--test-threads=1",
-                ])
-                .env(HELPER_ENV, mode)
-                .stderr(Stdio::null())
-                .output()
-                .expect("the helper runs");
+            let out = crate::deadline::std_ends_within(
+                Command::new(std::env::current_exe().expect("the test binary"))
+                    .args([
+                        "--exact",
+                        "fdpass::scm::sigpipe_tests::zz_helper_entry",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .env(HELPER_ENV, mode),
+                crate::deadline::ECHO_HANG,
+            );
             (
                 out.status,
                 String::from_utf8_lossy(&out.stdout).into_owned(),

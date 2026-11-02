@@ -22,6 +22,8 @@ const READY_WAIT: Duration = Duration::from_secs(10);
 
 const PID_CAP: u64 = 32;
 
+const LINE_CAP: u64 = 64;
+
 /// Starts a bridge process from the current executable and waits until it holds the activity:
 /// whether it does, or found keep-awake off and so had nothing to hold.
 pub(super) fn start() -> bool {
@@ -91,12 +93,19 @@ fn hear(out: impl io::Read + Send + 'static, within: Duration) -> Heard {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut line = String::new();
-        let read = io::BufReader::new(out).read_line(&mut line);
+        let read = io::BufReader::new(out.take(LINE_CAP)).read_line(&mut line);
         let _ = tx.send(read.map(|_| line));
     });
     match rx.recv_timeout(within) {
         Ok(Ok(line)) if line.is_empty() => Heard::Ended,
-        Ok(Ok(line)) if line.trim_end() == HELD => Heard::Held,
+        Ok(Ok(line))
+            if line
+                .strip_suffix('\n')
+                .map(|s| s.strip_suffix('\r').unwrap_or(s))
+                == Some(HELD) =>
+        {
+            Heard::Held
+        }
         Ok(_) | Err(_) => Heard::Not,
     }
 }
@@ -175,16 +184,31 @@ fn forget(file: &Path, me: u32) {
 }
 
 fn read_pid(file: &Path) -> Option<u32> {
-    let mut text = String::new();
-    std::fs::File::open(file)
-        .ok()?
-        .take(PID_CAP)
-        .read_to_string(&mut text)
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let opened = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(file)
         .ok()?;
-    text.trim().parse().ok()
+    if !opened.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut text = String::new();
+    opened.take(PID_CAP + 1).read_to_string(&mut text).ok()?;
+    if text.len() as u64 > PID_CAP {
+        return None;
+    }
+    let digits = text.trim();
+    (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| digits.parse().ok())
+        .flatten()
+        .filter(|pid| *pid > 0)
 }
 
 fn write_pid(file: &Path, pid: u32) -> io::Result<()> {
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let (tmp, mut out) = aterm_uds::atomic_file::create_temp_beside(file, 0o600)?;
     let written = out
         .write_all(format!("{pid}\n").as_bytes())
@@ -356,6 +380,9 @@ mod tests {
     #[test]
     fn the_mug_waits_for_held_alone() {
         assert_eq!(hear(&b"held\n"[..], SAYS), Heard::Held);
+        assert_eq!(hear(&b"held\r\n"[..], SAYS), Heard::Held);
+        assert_eq!(hear(&b"held"[..], SAYS), Heard::Not, "unterminated");
+        assert_eq!(hear(&[b'x'; 256][..], SAYS), Heard::Not, "past cap");
         assert_eq!(hear(&b"error\n"[..], SAYS), Heard::Not);
         assert_eq!(hear(&b""[..], SAYS), Heard::Ended);
         let (read, _write) = std::io::pipe().expect("pipe");
@@ -387,7 +414,7 @@ mod tests {
     #[test]
     fn a_pid_reads_back_and_anything_else_names_none() {
         let dir = aterm_tempfile::tempdir().expect("tempdir");
-        let file = dir.path().join("acaffiene.bridge");
+        let file = dir.path().join("nested").join("acaffiene.bridge");
         assert_eq!(read_pid(&file), None);
         write_pid(&file, 4242).expect("write");
         assert_eq!(read_pid(&file), Some(4242));
@@ -395,13 +422,26 @@ mod tests {
         assert_eq!(read_pid(&file), Some(4242), "another bridge's file stays");
         forget(&file, 4242);
         assert!(!file.exists());
+        std::fs::write(&file, b"0\n").expect("write");
+        assert_eq!(read_pid(&file), None, "zero is not a pid");
         std::fs::write(&file, b"not a pid").expect("write");
         assert_eq!(read_pid(&file), None);
+        let long_digits = format!(
+            "{}4242\n",
+            "0".repeat(usize::try_from(PID_CAP).expect("small"))
+        );
+        std::fs::write(&file, long_digits).expect("write");
+        assert_eq!(read_pid(&file), None, "digits past the cap never truncate");
         let past = format!(
             "{}4242\n",
             " ".repeat(usize::try_from(PID_CAP).expect("small"))
         );
         std::fs::write(&file, past).expect("write");
         assert_eq!(read_pid(&file), None, "past the cap");
+        let target = dir.path().join("real");
+        std::fs::write(&target, b"4242\n").expect("real");
+        let link = dir.path().join("link.bridge");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        assert_eq!(read_pid(&link), None, "symlinks are not followed");
     }
 }

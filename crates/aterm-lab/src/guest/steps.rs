@@ -45,8 +45,11 @@ pub(crate) fn browse(args: &[String]) -> Result<(), String> {
         return Err(usage.to_owned());
     };
     let secs: u64 = secs
-        .parse()
-        .map_err(|_| format!("browse: {secs} is no whole number of seconds"))?;
+        .bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| secs.parse().ok())
+        .flatten()
+        .ok_or_else(|| format!("browse: {secs} is no whole number of seconds"))?;
     if services.is_empty() {
         return Err(usage.to_owned());
     }
@@ -71,8 +74,11 @@ pub(crate) fn dns_sd(args: &[String]) -> Result<(), String> {
         return Err(usage.to_owned());
     };
     let secs: u64 = secs
-        .parse()
-        .map_err(|_| format!("dns-sd: {secs} is no whole number of seconds"))?;
+        .bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| secs.parse().ok())
+        .flatten()
+        .ok_or_else(|| format!("dns-sd: {secs} is no whole number of seconds"))?;
     if rest.is_empty() {
         return Err(usage.to_owned());
     }

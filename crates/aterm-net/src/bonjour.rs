@@ -8,6 +8,7 @@
 use std::ffi::{CStr, c_char, c_void};
 use std::io;
 use std::ops::ControlFlow;
+use std::time::Duration;
 
 type Reference = *mut c_void;
 type Reply = unsafe extern "C" fn(
@@ -65,6 +66,37 @@ pub fn browse(
     }
 }
 
+/// [`browse`] while `going` says so: with no reply for `look`, and before each reply it reads,
+/// it asks `going`, and returns `Ok(())` once that says no (a person turned sharing off), so a
+/// browse that hears nothing still ends within `look` of it.
+///
+/// # Errors
+/// As [`browse`].
+///
+/// # Panics
+/// As [`browse`].
+pub fn browse_while(
+    service: &CStr,
+    domain: &CStr,
+    look: Duration,
+    going: impl FnMut() -> bool,
+    heard: impl FnMut(Event<'_>) -> ControlFlow<()>,
+) -> io::Result<()> {
+    crate::loopback::check(crate::loopback::Reach::Browse(&service.to_string_lossy()))?;
+    #[cfg(not(test))]
+    {
+        browse_while_with(&native::System, service, domain, (look, going), heard)
+    }
+    #[cfg(test)]
+    {
+        let _ = (service, domain, look, going, heard);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "live Bonjour browsing is disabled in a unit test",
+        ))
+    }
+}
+
 /// The native calls, injected so lifecycle tests never contact the daemon.
 /// Replies run synchronously only inside `process`, on its calling thread.
 trait Api {
@@ -80,6 +112,11 @@ trait Api {
     /// # Safety
     /// `reference` is live and exclusively driven by the calling thread.
     unsafe fn keep_private(&self, reference: Reference) -> io::Result<()>;
+    /// Whether a reply waits to be read within `within` (an interrupted wait reads none).
+    ///
+    /// # Safety
+    /// `reference` is live and exclusively driven by the calling thread.
+    unsafe fn ready(&self, reference: Reference, within: Duration) -> io::Result<bool>;
     /// # Safety
     /// `reference` and its callback context are live, on their owning thread.
     unsafe fn process(&self, reference: Reference) -> i32;
@@ -118,6 +155,29 @@ fn browse_with<A: Api, F: FnMut(Event<'_>) -> ControlFlow<()>>(
     domain: &CStr,
     heard: F,
 ) -> io::Result<()> {
+    browse_until(api, service, domain, None, heard)
+}
+
+/// [`browse_while`] through `api`.
+fn browse_while_with<A: Api, F: FnMut(Event<'_>) -> ControlFlow<()>>(
+    api: &A,
+    service: &CStr,
+    domain: &CStr,
+    (look, mut going): (Duration, impl FnMut() -> bool),
+    heard: F,
+) -> io::Result<()> {
+    browse_until(api, service, domain, Some((look, &mut going)), heard)
+}
+
+/// The browse: replies read until a callback ends it, an error, or `until`'s `going` says no
+/// (asked before each read, and after each `look` with no reply).
+fn browse_until<A: Api, F: FnMut(Event<'_>) -> ControlFlow<()>>(
+    api: &A,
+    service: &CStr,
+    domain: &CStr,
+    mut until: Option<(Duration, &mut dyn FnMut() -> bool)>,
+    heard: F,
+) -> io::Result<()> {
     let mut context = Context {
         heard,
         stopped: false,
@@ -136,6 +196,17 @@ fn browse_with<A: Api, F: FnMut(Event<'_>) -> ControlFlow<()>>(
     // SAFETY: held exclusively owns this live reference on the current thread.
     unsafe { api.keep_private(held.reference) }?;
     loop {
+        if let Some((look, going)) = &mut until {
+            loop {
+                if !going() {
+                    return Ok(());
+                }
+                // SAFETY: held exclusively owns this live reference on the current thread.
+                if unsafe { api.ready(held.reference, *look) }? {
+                    break;
+                }
+            }
+        }
         // SAFETY: held and context remain live and are driven on this thread.
         let result = unsafe { api.process(held.reference) };
         if let Some(panicked) = context.panicked.take() {
@@ -261,6 +332,34 @@ mod native {
             // borrow; no driver or callback can close it concurrently.
             let fd = unsafe { BorrowedFd::borrow_raw(fd) };
             aterm_uds::keep_out_of_children(&fd)
+        }
+
+        unsafe fn ready(&self, reference: Reference, within: Duration) -> io::Result<bool> {
+            // SAFETY: caller supplies the live, exclusively held reference.
+            let fd = unsafe { DNSServiceRefSockFD(reference) };
+            if fd < 0 {
+                return Err(io::Error::other("Bonjour browse has no connection"));
+            }
+            let mut poll = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ms = libc::c_int::try_from(within.as_millis()).unwrap_or(libc::c_int::MAX);
+            // SAFETY: one valid pollfd, owned by this frame, for the call's length; the native
+            // reference owns the descriptor throughout it.
+            match unsafe { libc::poll(&raw mut poll, 1, ms) } {
+                n if n > 0 => Ok(true),
+                0 => Ok(false),
+                _ => {
+                    let error = io::Error::last_os_error();
+                    if error.kind() == io::ErrorKind::Interrupted {
+                        Ok(false)
+                    } else {
+                        Err(error)
+                    }
+                }
+            }
         }
 
         unsafe fn process(&self, reference: Reference) -> i32 {

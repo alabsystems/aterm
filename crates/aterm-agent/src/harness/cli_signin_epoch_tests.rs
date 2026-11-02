@@ -162,6 +162,8 @@ struct Host<'a> {
     after: RefCell<Records>,
     opened: Cell<usize>,
     tidied: Cell<usize>,
+    /// What the tidy pass after the window finds of the site's session.
+    session: Option<bool>,
 }
 
 impl Host<'_> {
@@ -240,7 +242,7 @@ impl AccountsHost for Host<'_> {
         self.tidied.set(self.tidied.get() + 1);
         Ok(crate::harness::browser_window::Tidied {
             dropped: 0,
-            session: Some(true),
+            session: self.session,
         })
     }
 }
@@ -257,6 +259,7 @@ fn exercise(browser: bool, provider: i64, case: i64) -> (bool, bool, bool, i64) 
         after: RefCell::new(bed.records()),
         opened: Cell::new(0),
         tidied: Cell::new(0),
+        session: Some(true),
     };
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let status = if browser {
@@ -437,6 +440,7 @@ fn unbound_rows_keep_the_conservative_global_counter_guard() {
                     after: RefCell::new(bed.records()),
                     opened: Cell::new(0),
                     tidied: Cell::new(0),
+                    session: Some(true),
                 };
                 let (mut out, mut err) = (Vec::new(), Vec::new());
                 let status = if browser {
@@ -466,4 +470,106 @@ fn unbound_rows_keep_the_conservative_global_counter_guard() {
             }
         }
     }
+}
+
+/// `accounts browser`'s window that signed the person in makes the row's folder a browser
+/// profile even where an automatic sign-in made it and failed in it (its
+/// [`crate::harness::headless_oauth::PROFILE_UNPROVEN_MARK`] goes), so a renewal then signs in
+/// through it. CONTROL: a window whose site kept no session leaves the folder no profile.
+#[test]
+fn a_windows_sign_in_makes_the_rows_folder_a_profile() {
+    use crate::harness::headless_oauth::{PROFILE_UNPROVEN_MARK, has_browser_profile};
+    for (session, case, profile_after) in [
+        (Some(true), 0, true),
+        (Some(false), 0, false),
+        (Some(true), 5, false),
+    ] {
+        let bed = Bed::new(Cli::Claude, true);
+        let profile = bed.profile.clone().unwrap();
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(profile.join(PROFILE_UNPROVEN_MARK), b"1\n").unwrap();
+        let has_profile = || has_browser_profile(&bed.store.dir, "main", Some("main@example.test"));
+        assert!(!has_profile());
+        let host = Host {
+            bed: &bed,
+            case,
+            browser: true,
+            changed: Cell::new(false),
+            after: RefCell::new(bed.records()),
+            opened: Cell::new(0),
+            tidied: Cell::new(0),
+            session,
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let status = run_accounts_browser_with(
+            Cli::Claude,
+            &bed.env,
+            &host,
+            "main",
+            &mut out,
+            &mut err,
+            None,
+        );
+        assert_eq!(host.opened.get(), 1, "{}", String::from_utf8_lossy(&err));
+        let signed_in = if profile_after {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(1)
+        };
+        assert_eq!(status, signed_in, "{}", String::from_utf8_lossy(&err));
+        assert_eq!(
+            has_profile(),
+            profile_after,
+            "session {session:?}: {}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+}
+
+#[test]
+fn a_recorded_windows_sign_in_survives_and_reports_profile_adoption_failure() {
+    use crate::harness::headless_oauth::{PROFILE_UNPROVEN_MARK, has_browser_profile};
+    let bed = Bed::new(Cli::Claude, true);
+    let profile = bed.profile.clone().unwrap();
+    let marker = profile.join(PROFILE_UNPROVEN_MARK);
+    std::fs::create_dir_all(&marker).unwrap();
+    let removal_error = std::fs::remove_file(&marker).unwrap_err().to_string();
+    let host = Host {
+        bed: &bed,
+        case: 0,
+        browser: true,
+        changed: Cell::new(false),
+        after: RefCell::new(bed.records()),
+        opened: Cell::new(0),
+        tidied: Cell::new(0),
+        session: Some(true),
+    };
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let got = run_accounts_browser_with(
+        Cli::Claude,
+        &bed.env,
+        &host,
+        "main",
+        &mut out,
+        &mut err,
+        None,
+    );
+    assert_eq!(got, ExitCode::SUCCESS);
+    assert_eq!(host.opened.get(), 1);
+    assert_eq!(host.tidied.get(), 1);
+    assert!(!has_browser_profile(
+        &bed.store.dir,
+        "main",
+        Some("main@example.test")
+    ));
+    assert!(String::from_utf8_lossy(&err).contains(&removal_error));
+    assert_eq!(
+        bed.store
+            .tail(100)
+            .unwrap()
+            .iter()
+            .filter(|event| event.kind == accounts::Kind::SignIn && event.account == "main")
+            .count(),
+        1
+    );
 }

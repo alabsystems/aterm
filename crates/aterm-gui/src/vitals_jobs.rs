@@ -5,13 +5,14 @@
 //! thread, so the stats bars' marks and the lens's Jobs well show its verdicts.
 
 use std::cell::OnceCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ffi::OsString;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use aterm_agent::supervise::{BackgroundCall, BackgroundEvidence};
+use aterm_agent::supervise::{BackgroundCall, BackgroundEvidence, HeldCall};
 
-use aterm_sysprobe::jobs::{self as probe, AtStart, JobsReader, ProcFacts, ReadReq};
+use aterm_sysprobe::jobs::{self as probe, AtStart, JobsReader, ProcFacts, ReadReq, StartFacts};
 use aterm_sysprobe::procs::ProcessReading;
 use aterm_sysprobe::volumes::Table;
 use aterm_vitals::jobs::{
@@ -19,6 +20,7 @@ use aterm_vitals::jobs::{
     JobTab, JobTick, Jobs, JobsView, Knote, KnoteFilter, LanesSeen, Machine, ProcState, Standing,
     StartWait, SweepProc, TcpState, TermWord, ThreadState, TtyMode,
 };
+use aterm_vitals::left::LeftView;
 use aterm_vitals::model::TabRoot;
 
 /// The engine's fast cadence, also the floor between passes, so a 2 Hz lens does not double the
@@ -35,9 +37,9 @@ pub(crate) const HELD_CPU_NS: u64 = 20_000_000;
 /// can hang on a program held mid-start (leftover M29).
 #[derive(Clone, Copy)]
 pub(crate) struct HeldReaders {
-    /// Where a process stands at its start, one mount table read for the pass
-    /// ([`probe::read_start_in`], [`probe::judge_start`]).
-    pub(crate) start: fn(u32, &OnceCell<Table>) -> Option<AtStart>,
+    /// What a process's start reads, its age taken at the pass's clock (µs since the epoch), one
+    /// mount table read for the pass ([`probe::read_start_in`]), judged by [`probe::judge_start`].
+    pub(crate) start: fn(u32, u64, &OnceCell<Table>) -> Option<StartFacts>,
     /// Its pid version, which moves on exec ([`aterm_uds::process::read_identity`]).
     pub(crate) exec: fn(u32) -> Option<u64>,
     /// Its resource coalition ([`aterm_sysprobe::coalitions::coalition_of`]).
@@ -53,9 +55,7 @@ pub(crate) struct HeldReaders {
 impl HeldReaders {
     /// The kernel's readers.
     pub(crate) const KERNEL: Self = Self {
-        start: |pid, mounts| {
-            probe::read_start_in(pid, probe::now_us(), mounts).map(|f| probe::judge_start(&f))
-        },
+        start: probe::read_start_in,
         exec: |pid| {
             i32::try_from(pid)
                 .ok()
@@ -75,7 +75,7 @@ impl HeldReaders {
 
     /// The inert arm: nothing outside a job is read, and nothing stands in.
     pub(crate) const INERT: Self = Self {
-        start: |_, _| None,
+        start: |_, _, _| None,
         exec: |_| None,
         coalition: |_| None,
         exe_name: |_| None,
@@ -83,15 +83,187 @@ impl HeldReaders {
     };
 }
 
+/// What a pass reads of a build's front ([`Fronts`]): the build it becomes and the ledger it
+/// claims in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FrontSeen {
+    /// The build it becomes, named as `status` names it
+    /// ([`crate::session_status::program::front_program`]).
+    becomes: String,
+    /// The ledger it claims in ([`atpkg::build_admit::ledger_of_front`]), where one is found.
+    ledger: Option<aterm_capacity::Ledger>,
+}
+
+/// How a pass reads its fronts: a pid's arguments, the ledger a front claims in, and a ledger's
+/// live claims.
+#[derive(Clone, Copy)]
+pub(crate) struct FrontReaders {
+    /// A pid's arguments ([`read_front_argv`]).
+    pub(crate) argv: fn(u32) -> Option<Vec<OsString>>,
+    /// The ledger the front `pid` claims in ([`ledger_of_front_pid`]).
+    pub(crate) ledger: fn(u32) -> Option<aterm_capacity::Ledger>,
+    /// A ledger's live claims ([`aterm_capacity::Ledger::list`]); `None` where unread.
+    pub(crate) claims: fn(&aterm_capacity::Ledger) -> Option<Vec<aterm_capacity::Record>>,
+}
+
+impl FrontReaders {
+    /// The live readers.
+    pub(crate) const LIVE: Self = Self {
+        argv: read_front_argv,
+        ledger: ledger_of_front_pid,
+        claims: |ledger| ledger.list().ok(),
+    };
+
+    /// Readers that read nothing (unit tests).
+    pub(crate) const INERT: Self = Self {
+        argv: |_| None,
+        ledger: |_| None,
+        claims: |_| None,
+    };
+}
+
+/// THE BUILD EACH FRONT AMONG A PASS'S MEMBERS BECOMES, AND WHETHER ITS CLAIM WAITS
+/// ([`aterm_uds::build_front::front`], which the engine names its row by, named as `status` names
+/// it, [`crate::session_status::program::front_program`]: [`JobProc::becomes`]; and
+/// [`atpkg::build_admit::front_claim_in`], which it waits on memory by: [`JobProc::claims_ahead`]).
+/// Only a member that runs the front's image by its short name or its executable
+/// ([`aterm_uds::build_front::FRONT_IMAGE`]) and whose thread list shows it ran is read, the
+/// thread list asked again right before the read ([`read_front_argv`]): a read of a program's
+/// arguments while it is held mid-start can hang (leftover M29). Its arguments are read once for
+/// each program a pid runs (its start, its short name and its executable: an exec moves the last
+/// two), and the ledger it claims in once a pass for every front that claims there.
+pub(crate) struct Fronts {
+    readers: FrontReaders,
+    /// What each pid's program was read as, by the program it ran then.
+    seen: HashMap<u32, (FrontKey, Option<FrontSeen>)>,
+    /// This pass's claims of each ledger a front claims in, by its folder.
+    listed: HashMap<std::path::PathBuf, Option<Vec<aterm_capacity::Record>>>,
+}
+
+/// Which program a pid runs, as a pass reads it: its start, its short name and its executable.
+type FrontKey = (Option<u64>, String, Option<String>);
+
+/// What a pass says of a front: the build it becomes, and while its claim waits the pids of the
+/// claims ahead of it ([`JobProc::claims_ahead`]).
+type FrontNow = (String, Option<Vec<u32>>);
+
+impl Fronts {
+    /// A reader of fronts through `readers`.
+    pub(crate) fn new(readers: FrontReaders) -> Self {
+        Self {
+            readers,
+            seen: HashMap::new(),
+            listed: HashMap::new(),
+        }
+    }
+
+    /// The build `p` becomes where it is a front, read once for the program it runs, and what its
+    /// ledger says of its claim this pass: waiting behind the claims it names, or behind ones
+    /// unknown where its ledger says nothing of it (none laid yet) or is unread, as `status`
+    /// reads it ([`crate::session_status::program::BuildWait::of`]); held (admitted, handing it
+    /// to its holder), no wait.
+    fn front(&mut self, p: &ProcFacts) -> Option<FrontNow> {
+        let image = aterm_uds::build_front::FRONT_IMAGE;
+        if p.name != image && p.exe.as_deref() != Some(image) {
+            return None;
+        }
+        let key = (p.start, p.name.clone(), p.exe.clone());
+        let cached = self
+            .seen
+            .get(&p.pid)
+            .filter(|(seen, _)| *seen == key)
+            .map(|(_, front)| front.clone());
+        let seen = match cached {
+            Some(front) => front,
+            None => {
+                let front = (self.readers.argv)(p.pid)
+                    .as_deref()
+                    .and_then(crate::session_status::program::front_program)
+                    .map(|becomes| FrontSeen {
+                        becomes,
+                        ledger: (self.readers.ledger)(p.pid),
+                    });
+                self.seen.insert(p.pid, (key, front.clone()));
+                front
+            }
+        }?;
+        let claims = self.readers.claims;
+        let claim = seen.ledger.as_ref().and_then(|ledger| {
+            self.listed
+                .entry(ledger.dir().to_path_buf())
+                .or_insert_with(|| claims(ledger))
+                .as_deref()
+                .and_then(|records| atpkg::build_admit::front_claim_in(records, p.pid))
+        });
+        let ahead = match claim {
+            Some(atpkg::build_admit::FrontClaim::Waiting { ahead, .. }) => Some(ahead),
+            Some(atpkg::build_admit::FrontClaim::Held) => None,
+            None => Some(Vec::new()),
+        };
+        Some((seen.becomes, ahead))
+    }
+
+    /// Forget each pid `read` no longer holds, and this pass's ledgers.
+    fn keep(&mut self, read: &[ProcFacts]) {
+        let live: BTreeSet<u32> = read.iter().map(|p| p.pid).collect();
+        self.seen.retain(|pid, _| live.contains(pid));
+        self.listed.clear();
+    }
+}
+
+/// `pid`'s arguments, read only once its thread list, asked right before the read, shows it ran:
+/// a read of a program's arguments while it is held mid-start can hang (leftover M29), and an
+/// exec since the pass's reading may have made this pid one.
+fn read_front_argv(pid: u32) -> Option<Vec<OsString>> {
+    let id = i32::try_from(pid).ok()?;
+    if aterm_uds::process::thread_ran(id) != Some(true) {
+        return None;
+    }
+    aterm_uds::process::read_process_argv(id)
+}
+
+/// The ledger the front `pid` claims in ([`atpkg::build_admit::ledger_of_front`]): this user's,
+/// or in a debug build the one its own environment names.
+fn ledger_of_front_pid(pid: u32) -> Option<aterm_capacity::Ledger> {
+    atpkg::build_admit::ledger_of_front(&|key| {
+        atpkg::caller_shell::process_args(pid)?
+            .env_var(key)
+            .map(str::to_owned)
+    })
+}
+
+/// Whether member reading `p` shows it ran past its start: its thread list read, and not the lone
+/// `0` of a thread that never ran; never `stand_in`, which a development build reads as held.
+fn ran(p: &ProcFacts, stand_in: Option<u32>) -> bool {
+    stand_in != Some(p.pid) && p.start_facts.as_ref().is_some_and(|f| !f.lone_zero)
+}
+
+/// What the host knows of aterm's Developer Tools grant at a reading, which the engine sets
+/// against a held program's fork time (`aterm_vitals::jobs::Findings::program_check_after_grant`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct GrantFacts {
+    /// When the grant took effect, unix ms (the end of the last verdict refresh that took,
+    /// `devtools_helper::Lane::took_at`), only while aterm reads granted.
+    pub(crate) grant_ms: Option<u64>,
+    /// The sessions another aterm process handed over (`consent_state::session_attribution` reads
+    /// `Adopted`): macOS may check their new programs whatever the grant says (the
+    /// leftover-processes design's M13).
+    pub(crate) adopted: Vec<u64>,
+}
+
 /// The engine, its reader and the last view, on the probe thread.
 pub(crate) struct JobsPass {
     jobs: Jobs,
     reader: JobsReader,
     held: HeldReaders,
+    fronts: Fronts,
     process_limit: Option<u64>,
     /// When the next pass is due, host ms (`None`: at the next reading).
     next_ms: Option<u64>,
     view: Option<Arc<JobsView>>,
+    /// The tab a session-mate's environment ties each program outside every job that has not
+    /// started to, by pid, as the leftover pass last judged it ([`Self::tie_held`]).
+    ties: BTreeMap<u32, u64>,
 }
 
 impl JobsPass {
@@ -104,10 +276,23 @@ impl JobsPass {
             } else {
                 HeldReaders::KERNEL
             },
+            fronts: Fronts::new(if cfg!(test) {
+                FrontReaders::INERT
+            } else {
+                FrontReaders::LIVE
+            }),
             process_limit: probe::process_limit(),
             next_ms: None,
             view: None,
+            ties: BTreeMap::new(),
         }
+    }
+
+    /// Takes the leftover pass's ties of programs that have not started to live tabs
+    /// ([`crate::vitals_left::LeftPass::ties`]): the next pass names each such program by its
+    /// tab, which its job's tab, where it has one, overrides in the engine.
+    pub(crate) fn tie_held(&mut self, ties: BTreeMap<u32, u64>) {
+        self.ties = ties;
     }
 
     /// One reading's pass: runs the engine when it is due, or whenever `now` (an edge's reading:
@@ -123,6 +308,7 @@ impl JobsPass {
         tabs: &[TabRoot],
         ttys: &[(u64, TtyMode)],
         feeds: &[(u64, TabFeed)],
+        grant: &GrantFacts,
         self_pid: u32,
         thrashing: bool,
         now: bool,
@@ -136,7 +322,7 @@ impl JobsPass {
         let self_uid = sweep.iter().find(|p| p.pid == self_pid).and_then(|p| p.uid);
         let readings = sweep;
         let sweep: Vec<SweepProc> = sweep.iter().map(sweep_proc).collect();
-        let tabs = job_tabs(tabs, ttys, feeds);
+        let tabs = job_tabs(tabs, ttys, feeds, &grant.adopted);
         let reqs: Vec<ReadReq> = self
             .jobs
             .plan(&sweep, &tabs)
@@ -150,18 +336,23 @@ impl JobsPass {
         let stand_in = (readers.stand_in)();
         // Each age is the probe's as its reading starts.
         let probe_ms = read_ms();
-        let read = self.reader.read_all(&reqs);
+        // One wall clock for every start the pass reads, so each fork time is its age before it.
+        let now_us = probe::now_us();
+        let read = self.reader.read_all_at(&reqs, now_us);
         let roots: BTreeSet<u32> = tabs.iter().map(|t| t.shell_pid).collect();
-        let procs = job_procs(&read, &roots, stand_in, readers.exec);
+        let fronts = &mut self.fronts;
+        let procs = job_procs(&read, &roots, stand_in, readers.exec, |p| fronts.front(p));
+        fronts.keep(&read);
         let read_ms = read_ms();
         let mounts = OnceCell::new();
         let ours = OnceCell::new();
-        let held = held_list(
+        let mut held = held_list(
             readings,
             &read,
             self_uid,
             stand_in,
-            |pid| (readers.start)(pid, &mounts),
+            now_us,
+            |pid| (readers.start)(pid, now_us, &mounts),
             readers.exec,
             |pid| {
                 let ours = *ours.get_or_init(|| (readers.coalition)(self_pid));
@@ -169,6 +360,9 @@ impl JobsPass {
             },
             readers.exe_name,
         );
+        for h in &mut held {
+            h.tab = self.ties.get(&h.pid).copied();
+        }
         let lanes = self.reader.lanes();
         let tick = JobTick {
             at_ms,
@@ -188,6 +382,7 @@ impl JobsPass {
             },
             process_limit: self.process_limit,
             held,
+            grant_ms: grant.grant_ms,
         };
         let view = self.jobs.absorb(&tick);
         self.next_ms = Some(at_ms + next_pass_ms(view.demand));
@@ -197,21 +392,25 @@ impl JobsPass {
 }
 
 /// This user's programs that have not started, members of a job or not: each member of `members`
-/// (judged from its own thread list, [`member_start`]) that reads held, translating or unstarted,
-/// and each other row of `sweep` of `self_uid` that is no zombie, has used at most
-/// [`HELD_CPU_NS`] (or is `stand_in`, held whatever its CPU) and that `start` reads so. Each is
-/// keyed by its pid version (`exec`, else its start, so an exec starts a new held time), named by
-/// its executable (a member's own reading, else `exe_name`, else its short name), and is aterm's
-/// when it is a member or `in_aterm` (aterm's coalition) says so. `start` is asked only of those
-/// sweep rows but the stand-in, `exec` only of the rows listed, and `exe_name` only of listed rows
-/// outside every job.
+/// (judged from its own thread list, [`member_start`]) that reads held, translating, unstarted, or
+/// unstarted and stopped or traced (any [`AtStart`] but `Started`), and each other row of `sweep`
+/// of `self_uid` that is no zombie, has used at most [`HELD_CPU_NS`] (or is `stand_in`, held
+/// whatever its CPU) and whose `start` facts judge so. Each is keyed by its pid version (`exec`,
+/// else its start, so an exec starts a new held time), named by its executable (a member's own
+/// reading, else `exe_name`, else its short name), is aterm's when it is a member or `in_aterm`
+/// (aterm's coalition) says so, and forked its start facts' age before `now_us`, the clock the
+/// members' reading and `start` took those ages at ([`fork_ms`]): a member's own reading's facts,
+/// else the first `start` read's (the stand-in outside every job, read held unasked, has none). An actual exec version is bound to a fresh `start` read of each
+/// listed row between equal versions; the stand-in supplies its own held reading. `exe_name` is
+/// asked only of listed rows outside every job.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn held_list(
     sweep: &[ProcessReading],
     members: &[ProcFacts],
     self_uid: Option<u32>,
     stand_in: Option<u32>,
-    mut start: impl FnMut(u32) -> Option<AtStart>,
+    now_us: u64,
+    mut start: impl FnMut(u32) -> Option<StartFacts>,
     exec: impl Fn(u32) -> Option<u64>,
     in_aterm: impl Fn(u32) -> bool,
     exe_name: impl Fn(u32) -> Option<String>,
@@ -225,12 +424,28 @@ pub(crate) fn held_list(
         .filter(|m| m.uid == Some(uid))
         .filter_map(|m| {
             let wait = start_wait(member_start(m, stand_in)?)?;
+            let version = exec(m.pid);
+            let exec_version = version_at_wait(
+                version,
+                wait,
+                || {
+                    if stand_in == Some(m.pid) {
+                        Some(StartWait::ProgramCheck)
+                    } else {
+                        start(m.pid).and_then(|f| start_wait(probe::judge_start(&f)))
+                    }
+                },
+                || exec(m.pid),
+            );
             Some(HeldProc {
                 pid: m.pid,
-                exec: exec(m.pid).or(m.start).unwrap_or(0),
+                exec: version.or(m.start).unwrap_or(0),
+                exec_version,
                 name: m.exe.clone().unwrap_or_else(|| m.name.clone()),
                 aterm: true,
                 wait,
+                tab: None,
+                started_ms: m.start_facts.as_ref().and_then(|f| fork_ms(f, now_us)),
             })
         })
         .collect();
@@ -240,22 +455,57 @@ pub(crate) fn held_list(
             && (p.cpu_ns.is_some_and(|c| c <= HELD_CPU_NS) || stand_in == Some(p.pid))
             && !read.contains(&p.pid)
     }) {
-        let at = if stand_in == Some(p.pid) {
-            Some(AtStart::Held)
+        let (at, facts) = if stand_in == Some(p.pid) {
+            (Some(AtStart::Held), None)
         } else {
-            start(p.pid)
+            let facts = start(p.pid);
+            (facts.as_ref().map(probe::judge_start), facts)
         };
         if let Some(wait) = at.and_then(start_wait) {
+            let version = exec(p.pid);
+            let exec_version = version_at_wait(
+                version,
+                wait,
+                || {
+                    if stand_in == Some(p.pid) {
+                        Some(StartWait::ProgramCheck)
+                    } else {
+                        start(p.pid).and_then(|f| start_wait(probe::judge_start(&f)))
+                    }
+                },
+                || exec(p.pid),
+            );
             held.push(HeldProc {
                 pid: p.pid,
-                exec: exec(p.pid).or(p.start).unwrap_or(0),
+                exec: version.or(p.start).unwrap_or(0),
+                exec_version,
                 name: exe_name(p.pid).unwrap_or_else(|| p.name.clone()),
                 aterm: in_aterm(p.pid),
                 wait,
+                tab: None,
+                started_ms: facts.as_ref().and_then(|f| fork_ms(f, now_us)),
             });
         }
     }
     held
+}
+
+/// When a process whose start reads `facts`, its age taken at `now_us` (µs since the epoch),
+/// forked: unix ms; `None` with its age unread.
+fn fork_ms(facts: &StartFacts, now_us: u64) -> Option<u64> {
+    facts.age_ms.map(|age| (now_us / 1000).saturating_sub(age))
+}
+
+/// Binds a fresh wait observation to one actual exec. Cached member facts alone cannot bind it:
+/// the process may have execed between those facts and the first version read.
+fn version_at_wait(
+    before: Option<u64>,
+    wait: StartWait,
+    current_wait: impl FnOnce() -> Option<StartWait>,
+    after: impl FnOnce() -> Option<u64>,
+) -> Option<u64> {
+    let version = before?;
+    (current_wait() == Some(wait) && after() == Some(version)).then_some(version)
 }
 
 /// What keeps a process that stands `at` its start from starting, as the engine names it; `None`
@@ -266,6 +516,9 @@ const fn start_wait(at: AtStart) -> Option<StartWait> {
         AtStart::Held => Some(StartWait::ProgramCheck),
         AtStart::Translating => Some(StartWait::Translating),
         AtStart::Unstarted => Some(StartWait::NotStarted),
+        AtStart::StoppedUnstarted { stopped, traced } => {
+            Some(StartWait::StoppedUnstarted { stopped, traced })
+        }
     }
 }
 
@@ -285,35 +538,63 @@ fn member_start(p: &ProcFacts, stand_in: Option<u32>) -> Option<AtStart> {
 /// How old the board's view may be and still speak for the canary ([`JobsBoard::evidence`]).
 pub(crate) const JOBS_FRESH: Duration = Duration::from_secs(60);
 
-/// Whether a jobs view `age` old speaks for now: one at most [`JOBS_FRESH`] old does, and so does a
-/// parked one (demand idle and no [`holds_a_wait`]) of any age while its reader runs (`reader`). A
-/// parked engine is read again only on an edge (output that moves a screen, a parked screen's
-/// redraw at most once a floor, a session's fork, exec or exit, the disk watch's look), so no
-/// reading since means nothing that draws or that the kernel tells of changed. A start raises no
-/// edge, and a view that holds a wait is read on a timer instead, so past [`JOBS_FRESH`] its
-/// reader has stopped delivering.
-pub(crate) fn speaks_for_now(view: &JobsView, age: Duration, reader: bool) -> bool {
-    age <= JOBS_FRESH || (reader && view.demand == Demand::Idle && !holds_a_wait(view))
+/// Whether a jobs view `age` old, read with the leftover view `left`, speaks for now: one at most
+/// [`JOBS_FRESH`] old does, and so does one that no timer reads again ([`read_on_a_timer`]) of any
+/// age while its reader runs (`reader`). Such an engine is read again only on an edge (output that
+/// moves a screen, a parked screen's redraw at most once a floor, a session's fork, exec or exit,
+/// the disk watch's look) or a pull, so no reading since means nothing that draws or that the
+/// kernel tells of changed; its quiet ages are told on to now. A start raises no edge, and a view
+/// that holds a wait or a suspect agent call, or a reading whose leftover view offers a row, is
+/// read on a timer instead, so past [`JOBS_FRESH`] its reader has stopped delivering.
+pub(crate) fn speaks_for_now(
+    view: &JobsView,
+    left: Option<&LeftView>,
+    age: Duration,
+    reader: bool,
+) -> bool {
+    age <= JOBS_FRESH || (reader && !read_on_a_timer(view, left))
+}
+
+/// Whether a reading no window shows is due again on a timer after one that gave `view` and `left`:
+/// within Slow's 30 s ([`held_on_slow`]), or a live agent call stands suspect
+/// ([`windowless_after`]). A live job's own demand is no timer with no window.
+pub(crate) fn read_on_a_timer(view: &JobsView, left: Option<&LeftView>) -> bool {
+    held_on_slow(view, left) || windowless_after(view).is_some()
+}
+
+/// Whether a reading no window shows is due again within Slow's 30 s after one that gave `view`
+/// and `left` (`vitals_host::held_wait_after`), for what no edge tells: `view`
+/// [`holds_a_wait`], since a start raises no edge, or `left` offers a row whose owner is gone
+/// ([`aterm_vitals::left::holds_an_offer`]), whose next reading no edge of a live session brings.
+pub(crate) fn held_on_slow(view: &JobsView, left: Option<&LeftView>) -> bool {
+    holds_a_wait(view) || left.is_some_and(aterm_vitals::left::holds_an_offer)
 }
 
 /// Whether `view` names a program of this user that has not started (held by macOS's program
-/// check, translating under Rosetta, or on a volume not proven local), or stands in a backed-up
-/// episode that has not had its closing reading. Such a view is read again within 30 s whatever
-/// its demand (`vitals_host::job_demand_after`), since a start raises no edge.
+/// check, translating under Rosetta, on a volume not proven local, or reading stopped or traced),
+/// or stands in a backed-up episode that has not had its closing reading. Such a view is read
+/// again within 30 s whatever its demand (`vitals_host::held_wait_after`), since a start (a
+/// debugger's resume included) raises no edge.
 pub(crate) fn holds_a_wait(view: &JobsView) -> bool {
     let f = &view.findings;
     !f.program_check.is_empty()
         || !f.translating.is_empty()
         || !f.not_started.is_empty()
+        || !f.stopped_unstarted.is_empty()
         || f.program_check_episode.is_some()
 }
 
 /// `privacy`'s `program_check=` from `view`, `age` old: how many of this user's programs macOS's
 /// program check holds (a lower bound, aterm's and others'), and the longest held to now in ms (its
-/// first sighting's age plus the view's); `None` when the view does not speak for now
-/// ([`speaks_for_now`]).
-pub(crate) fn program_check_of(view: &JobsView, age: Duration, reader: bool) -> Option<(u32, u64)> {
-    if !speaks_for_now(view, age, reader) {
+/// first sighting's age plus the view's); `None` when the view, read with the leftover view `left`,
+/// does not speak for now ([`speaks_for_now`]).
+pub(crate) fn program_check_of(
+    view: &JobsView,
+    left: Option<&LeftView>,
+    age: Duration,
+    reader: bool,
+) -> Option<(u32, u64)> {
+    if !speaks_for_now(view, left, age, reader) {
         return None;
     }
     let held = &view.findings.program_check;
@@ -427,6 +708,85 @@ impl JobsBoard {
                 .collect(),
         ))
     }
+
+    /// THE PROGRAMS OF SESSION `sid`'S AGENT'S CALLS THAT MACOS'S PROGRAM CHECK HOLDS, as the view
+    /// says at `now` (`docs/DESIGN-leftover-processes-2026-10-16.md` §6.3;
+    /// `harness_host::WorkerIdle::facts`): the view's held rows (`Findings.program_check`) of this
+    /// session's tab named [`JobKind::AgentCall`], members of one of its agent's calls or of what
+    /// one left (an orphan unit is named by the job it outlived), oldest (held longest) first, each
+    /// held for its `for_ms` as of the view, with the view's age; `None` with no view or one older
+    /// than [`JOBS_FRESH`]. A held member of the
+    /// shell's own jobs, or of what one left, is the person's, never the agent's, and so is one in
+    /// a nested terminal session (`JobKind::Nested`: sudo's, `script`'s, or an agent's pty call,
+    /// whose consumer the engine names a person). The rows are copied under the lock and nothing
+    /// else is done there.
+    pub(crate) fn held(&self, sid: &str, now: Instant) -> Option<(Duration, Vec<HeldCall>)> {
+        let (age, mut held) = {
+            let slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
+            let posted = slot
+                .as_ref()
+                .filter(|p| now.saturating_duration_since(p.at) <= JOBS_FRESH)?;
+            let held: Vec<HeldCall> = posted
+                .view
+                .findings
+                .program_check
+                .iter()
+                .filter(|n| {
+                    n.tab
+                        .and_then(|tab| posted.sids.get(&tab))
+                        .is_some_and(|s| s == sid)
+                })
+                .filter(|n| n.job == Some(JobKind::AgentCall))
+                .map(|n| HeldCall {
+                    pid: n.pid,
+                    exec_version: n.exec_version,
+                    held_ms: n.for_ms,
+                })
+                .collect();
+            (now.saturating_duration_since(posted.at), held)
+        };
+        held.sort_by_key(|h| std::cmp::Reverse(h.held_ms));
+        Some((age, held))
+    }
+}
+
+/// Whether macOS's program check still holds the same exec that the view timed (the facts'
+/// re-proof at the ask, `harness_host::WorkerIdle::facts`). Its actual version must match before
+/// and after the held and age reads, and its process must be no younger than its told wait. A
+/// reused pid or a new exec in the same process cannot inherit the old exec's wait. An
+/// unavailable version proves nothing. Kernel reads only, never WindowServer.
+pub(crate) fn held_as_long(held: &HeldCall) -> bool {
+    held_as_long_with(
+        held,
+        HeldReaders::KERNEL.exec,
+        crate::program_check_watch::held_now,
+        has_run,
+    )
+}
+
+/// The identity-bracketed proof, with inert readers in the exec-transition control.
+fn held_as_long_with(
+    held: &HeldCall,
+    mut exec: impl FnMut(u32) -> Option<u64>,
+    held_now: impl FnOnce(u32) -> bool,
+    has_run: impl FnOnce(u32, u64) -> bool,
+) -> bool {
+    let Some(version) = held.exec_version else {
+        return false;
+    };
+    exec(held.pid) == Some(version)
+        && held_now(held.pid)
+        && has_run(held.pid, held.held_ms)
+        && exec(held.pid) == Some(version)
+}
+
+/// Whether process `pid` has run at least `ms`, by the jobs engine's own reader (its age: the wall
+/// clock less its start).
+fn has_run(pid: u32, ms: u64) -> bool {
+    JobsReader::new()
+        .read(ReadReq { pid, fds: false })
+        .and_then(|f| f.age_ms)
+        .is_some_and(|age| age >= ms)
 }
 
 /// Whether the call whose leader is `pid`, born at `birth`, still lives (the facts' re-proof at
@@ -494,7 +854,7 @@ fn next_pass_ms(demand: Demand) -> u64 {
 /// How soon a reading no window shows is due again after one that gave `view`: while a live agent
 /// call (any consumer) stands suspect (`Standing::Capable | Capped`, the only rows that accrue φ)
 /// and the engine is not idle, the engine's own cadence ([`next_pass_ms`]); else `None`, and the
-/// next reading is `vitals_host::job_demand_after`'s or the disk watch's next look.
+/// next reading is `vitals_host::held_wait_after`'s, the next edge's or the disk watch's next look.
 pub(crate) fn windowless_after(view: &JobsView) -> Option<Duration> {
     let suspect = view.rows.iter().any(|r| {
         r.kind == JobKind::AgentCall
@@ -523,9 +883,14 @@ pub(crate) fn told_after(view: &JobsView) -> Option<Duration> {
 
 /// The engine's tabs from the host's request: its session key, the number
 /// the person sees (`Tab 2` is 2), its shell, its terminal mode word where
-/// `ttys` holds a current one, and what its PTY reader read where `feeds`
-/// holds it.
-fn job_tabs(tabs: &[TabRoot], ttys: &[(u64, TtyMode)], feeds: &[(u64, TabFeed)]) -> Vec<JobTab> {
+/// `ttys` holds a current one, what its PTY reader read where `feeds`
+/// holds it, and whether another aterm process handed it over (`adopted`).
+fn job_tabs(
+    tabs: &[TabRoot],
+    ttys: &[(u64, TtyMode)],
+    feeds: &[(u64, TabFeed)],
+    adopted: &[u64],
+) -> Vec<JobTab> {
     tabs.iter()
         .map(|t| {
             let feed = feeds
@@ -552,6 +917,7 @@ fn job_tabs(tabs: &[TabRoot], ttys: &[(u64, TtyMode)], feeds: &[(u64, TabFeed)])
                 drawn_ms: feed.drawn_ms,
                 alt_screen: feed.alt_screen,
                 output_bytes: feed.output_bytes,
+                adopted: adopted.contains(&t.key),
                 ..JobTab::default()
             }
         })
@@ -1000,23 +1366,33 @@ fn fd(f: &probe::FdReading) -> Fd {
 
 /// The engine's readings of `read` ([`job_proc`]), each of a tab's root (`roots`) with its pid
 /// version (`exec`, asked of those roots alone): it tells the engine the root ran a program anew
-/// (`exec zsh`).
+/// (`exec zsh`); and each member that [`ran`] with the build it becomes and the claims ahead of
+/// it where it is a build's front (`front`, asked of those members alone: [`Fronts::front`]).
 fn job_procs(
     read: &[ProcFacts],
     roots: &BTreeSet<u32>,
     stand_in: Option<u32>,
     exec: impl Fn(u32) -> Option<u64>,
+    mut front: impl FnMut(&ProcFacts) -> Option<FrontNow>,
 ) -> Vec<JobProc> {
     read.iter()
-        .map(|p| JobProc {
-            version: roots.contains(&p.pid).then(|| exec(p.pid)).flatten(),
-            ..job_proc(p, stand_in)
+        .map(|p| {
+            let (becomes, claims_ahead) = ran(p, stand_in)
+                .then(|| front(p))
+                .flatten()
+                .map_or((None, None), |(becomes, ahead)| (Some(becomes), ahead));
+            JobProc {
+                version: roots.contains(&p.pid).then(|| exec(p.pid)).flatten(),
+                becomes,
+                claims_ahead,
+                ..job_proc(p, stand_in)
+            }
         })
         .collect()
 }
 
-/// The engine's reading of `p`, held at macOS's program check where [`member_start`] reads it so
-/// (`stand_in` included).
+/// The engine's reading of `p`, with what keeps it from its first instruction where
+/// [`member_start`] reads it unstarted (`stand_in`'s held included).
 fn job_proc(p: &ProcFacts, stand_in: Option<u32>) -> JobProc {
     JobProc {
         pid: p.pid,
@@ -1060,14 +1436,45 @@ fn job_proc(p: &ProcFacts, stand_in: Option<u32>) -> JobProc {
         wchan: p.wchan.clone(),
         fds: p.fds.as_ref().map(|fs| fs.iter().map(fd).collect()),
         blocked_fd: p.blocked_fd,
-        program_check: member_start(p, stand_in) == Some(AtStart::Held),
+        start_wait: member_start(p, stand_in).and_then(start_wait),
         version: None,
+        becomes: None,
+        claims_ahead: None,
     }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// Start facts [`probe::judge_start`] judges `at`, read the held age after the fork.
+    fn judged(at: AtStart) -> StartFacts {
+        let unstarted = StartFacts {
+            lone_zero: true,
+            local: Some(true),
+            age_ms: Some(probe::PROGRAM_CHECK_AGE_MS),
+            ..StartFacts::default()
+        };
+        let facts = match at {
+            AtStart::Started => StartFacts::default(),
+            AtStart::Held => unstarted,
+            AtStart::Translating => StartFacts {
+                translated: true,
+                ..unstarted
+            },
+            AtStart::Unstarted => StartFacts {
+                local: Some(false),
+                ..unstarted
+            },
+            AtStart::StoppedUnstarted { stopped, traced } => StartFacts {
+                stopped,
+                traced,
+                ..unstarted
+            },
+        };
+        assert_eq!(probe::judge_start(&facts), at);
+        facts
+    }
 
     /// The engine's cadence, and with no window the suspect rule's: a live agent call that stands
     /// suspect asks for the engine's demand; an idle engine, an exited, running or listening call,
@@ -1141,6 +1548,7 @@ pub(crate) mod tests {
         JobRow {
             tab,
             kind: JobKind::AgentCall,
+            orphan_of: None,
             consumer,
             no_progress,
             leader: (pid, None),
@@ -1272,8 +1680,9 @@ pub(crate) mod tests {
         );
     }
 
-    /// Each tab keeps its key, number and shell, and takes the terminal word
-    /// and the reader's feed handed for its key.
+    /// Each tab keeps its key, number and shell, takes the terminal word
+    /// and the reader's feed handed for its key, and reads adopted only when
+    /// its key is among the handed-over sessions.
     #[test]
     fn a_tab_keeps_its_session_key_shell_and_number_and_its_own_terminal_word_and_feed() {
         let root = |key, label: &str| TabRoot {
@@ -1318,10 +1727,16 @@ pub(crate) mod tests {
             &[root(41, "Tab 3"), root(42, "Tab 4")],
             &[(41, raw)],
             &[(42, fed.clone())],
+            &[42],
         );
         assert_eq!(
             (tabs[0].key, tabs[0].number, tabs[0].shell_pid, tabs[0].tty),
             (41, 3, 941, Some(raw))
+        );
+        assert_eq!(
+            (tabs[0].adopted, tabs[1].adopted),
+            (false, true),
+            "only the handed-over session reads adopted"
         );
         assert_eq!(
             (tabs[0].output_ms, tabs[0].output_bytes, &tabs[0].block),
@@ -1662,6 +2077,7 @@ pub(crate) mod tests {
                 &tabs,
                 &[],
                 &[],
+                &GrantFacts::default(),
                 me,
                 false,
                 false,
@@ -1675,6 +2091,7 @@ pub(crate) mod tests {
                 &tabs,
                 &[],
                 &[],
+                &GrantFacts::default(),
                 me,
                 false,
                 false,
@@ -1689,6 +2106,7 @@ pub(crate) mod tests {
                 &tabs,
                 &[],
                 &[],
+                &GrantFacts::default(),
                 me,
                 false,
                 true,
@@ -1696,14 +2114,27 @@ pub(crate) mod tests {
             .expect("a new view");
         assert!(!Arc::ptr_eq(&first, &edge), "an edge's reading looks");
         assert!(
-            pass.tick(11_950, || 11_950, None, &tabs, &[], &[], me, false, true)
-                .is_some(),
+            pass.tick(
+                11_950,
+                || 11_950,
+                None,
+                &tabs,
+                &[],
+                &[],
+                &GrantFacts::default(),
+                me,
+                false,
+                true
+            )
+            .is_some(),
             "a reading without a sweep keeps the last view"
         );
     }
 
     /// Members count by their own reading; of the rest only this user's live rows with at most
-    /// 20 ms of CPU are asked, and the stand-in reads held unasked whatever its CPU.
+    /// 20 ms of CPU are asked. An actual version is proved around a fresh start read for each
+    /// named row; the stand-in reads held unasked whatever its CPU. A stopped or traced row that
+    /// never ran is handed on with what it read, a member (24) or outside every job (25).
     #[test]
     fn the_jobs_pass_counts_this_users_held_programs_members_or_not() {
         use std::cell::RefCell;
@@ -1744,8 +2175,32 @@ pub(crate) mod tests {
             member(10, "zsh", Some("gh"), unstarted(false)),
             member(22, "sleep", None, probe::StartFacts::default()),
             member(23, "x86tool", None, unstarted(true)),
+            member(
+                24,
+                "debuggee",
+                None,
+                probe::StartFacts {
+                    traced: true,
+                    ..unstarted(false)
+                },
+            ),
         ];
-        let sweep = [&sweep[..], &[row(23, ME, 2, probe::RunState::Sleeping)][..]].concat();
+        let traced = AtStart::StoppedUnstarted {
+            stopped: false,
+            traced: true,
+        };
+        let spawned = AtStart::StoppedUnstarted {
+            stopped: true,
+            traced: false,
+        };
+        let sweep = [
+            &sweep[..],
+            &[
+                row(23, ME, 2, probe::RunState::Sleeping),
+                row(25, ME, 2, probe::RunState::Stopped),
+            ][..],
+        ]
+        .concat();
         let asked = RefCell::new(Vec::new());
         let versions = RefCell::new(Vec::new());
         let held = held_list(
@@ -1753,33 +2208,42 @@ pub(crate) mod tests {
             &members,
             Some(ME),
             Some(30),
+            0,
             |pid| {
                 asked.borrow_mut().push(pid);
-                Some(if pid == 21 {
+                Some(judged(if pid == 21 {
                     AtStart::Unstarted
+                } else if pid == 23 {
+                    AtStart::Translating
+                } else if pid == 24 {
+                    traced
+                } else if pid == 25 {
+                    spawned
                 } else {
                     AtStart::Held
-                })
+                }))
             },
             |pid| {
                 versions.borrow_mut().push(pid);
                 Some(u64::from(pid) * 100 + 7)
             },
             |pid| pid == 20,
-            |pid| (pid == 20).then(|| "codex-command-runner".to_owned()),
+            |pid| match pid {
+                20 => Some("codex-command-runner".to_owned()),
+                25 => Some("start-suspended-helper".to_owned()),
+                _ => None,
+            },
         );
         assert_eq!(
             asked.into_inner(),
-            [20, 21],
-            "only this user's live rows outside every job with at most 20 ms of CPU are asked: \
-             never the 30 ms row (the stand-in's, read held unasked), another user's, a zombie \
-             or a member"
+            [10, 23, 24, 20, 20, 21, 21, 25, 25],
+            "held members are re-probed to bind their version; nonmembers first selected by \
+             CPU get the same proof; never another user's, a zombie or the stand-in"
         );
         assert_eq!(
             versions.into_inner(),
-            [10, 23, 20, 21, 30],
-            "the pid version is read of the rows the list names alone: never of member 22, \
-             which started"
+            [10, 10, 23, 23, 24, 24, 20, 20, 21, 21, 30, 30, 25, 25],
+            "the actual version brackets each fresh wait proof; never member 22, which started"
         );
         let got: Vec<(u32, u64, &str, bool, StartWait)> = held
             .iter()
@@ -1791,6 +2255,16 @@ pub(crate) mod tests {
                 (10, 1007, "gh", true, StartWait::ProgramCheck),
                 (23, 2307, "x86tool", true, StartWait::Translating),
                 (
+                    24,
+                    2407,
+                    "debuggee",
+                    true,
+                    StartWait::StoppedUnstarted {
+                        stopped: false,
+                        traced: true
+                    }
+                ),
+                (
                     20,
                     2007,
                     "codex-command-runner",
@@ -1799,23 +2273,128 @@ pub(crate) mod tests {
                 ),
                 (21, 2107, "p21", false, StartWait::NotStarted),
                 (30, 3007, "p30", false, StartWait::ProgramCheck),
+                (
+                    25,
+                    2507,
+                    "start-suspended-helper",
+                    false,
+                    StartWait::StoppedUnstarted {
+                        stopped: true,
+                        traced: false
+                    }
+                ),
             ],
             "each named by its executable where one reads, never by p_comm's 16 bytes, with what \
              keeps it; the stand-in's 30 ms row counted"
         );
+        assert!(held.iter().all(|h| h.exec_version == Some(h.exec)));
         assert!(
             held_list(
                 &sweep,
                 &members,
                 None,
                 Some(30),
-                |_| Some(AtStart::Held),
+                0,
+                |_| Some(judged(AtStart::Held)),
                 |_| None,
                 |_| true,
                 |_| None,
             )
             .is_empty(),
             "no user read, nothing counted"
+        );
+    }
+
+    /// Cached held facts select a member, but only a fresh held probe between equal actual
+    /// versions certifies its exec. NEGATIVE CONTROLS: the member has started, execs during the
+    /// fresh probe, or has no readable version; its descriptive row remains unproved.
+    #[test]
+    fn a_held_version_is_bound_to_a_fresh_start_read() {
+        use std::cell::Cell;
+        let member = ProcFacts {
+            pid: 601,
+            uid: Some(501),
+            start: Some(7),
+            start_facts: Some(probe::StartFacts {
+                lone_zero: true,
+                local: Some(true),
+                age_ms: Some(probe::PROGRAM_CHECK_AGE_MS),
+                ..probe::StartFacts::default()
+            }),
+            ..ProcFacts::default()
+        };
+        let read = |before, fresh, after| {
+            let version = Cell::new(before);
+            let rows = held_list(
+                &[],
+                std::slice::from_ref(&member),
+                Some(501),
+                None,
+                0,
+                |_| {
+                    version.set(after);
+                    Some(judged(fresh))
+                },
+                |_| version.get(),
+                |_| true,
+                |_| None,
+            );
+            assert_eq!(rows.len(), 1, "the cached descriptive held row remains");
+            rows[0].exec_version
+        };
+        assert_eq!(read(Some(17), AtStart::Held, Some(17)), Some(17));
+        assert_eq!(read(Some(17), AtStart::Held, Some(18)), None);
+        assert_eq!(read(Some(17), AtStart::Started, Some(17)), None);
+        assert_eq!(read(None, AtStart::Held, None), None);
+    }
+
+    /// Each held row forks its start facts' age before the clock those ages were taken at: a
+    /// member by its own reading's facts, a row outside every job by the start reader's, never by
+    /// the sweep's kernel start (Mach ticks on macOS). The stand-in outside every job is read
+    /// held unasked, so its fork time is unread.
+    #[test]
+    fn a_held_row_forks_its_start_facts_age_before_the_pass_clock() {
+        const ME: u32 = 501;
+        const NOW_US: u64 = 1_790_000_000_000_000;
+        let row = |pid| ProcessReading {
+            pid,
+            uid: Some(ME),
+            cpu_ns: Some(2_000_000),
+            start: Some(987_654_321),
+            name: format!("p{pid}"),
+            ..ProcessReading::default()
+        };
+        let held_for = |age_ms| StartFacts {
+            age_ms: Some(age_ms),
+            ..judged(AtStart::Held)
+        };
+        let member = ProcFacts {
+            pid: 10,
+            uid: Some(ME),
+            name: "gh".into(),
+            start: Some(987_654_321),
+            start_facts: Some(held_for(90_000)),
+            ..ProcFacts::default()
+        };
+        let held = held_list(
+            &[row(10), row(20), row(30)],
+            std::slice::from_ref(&member),
+            Some(ME),
+            Some(30),
+            NOW_US,
+            |pid| (pid == 20).then(|| held_for(25_000)),
+            |_| None,
+            |_| true,
+            |_| None,
+        );
+        let forks: Vec<(u32, Option<u64>)> = held.iter().map(|h| (h.pid, h.started_ms)).collect();
+        assert_eq!(
+            forks,
+            [
+                (10, Some(NOW_US / 1000 - 90_000)),
+                (20, Some(NOW_US / 1000 - 25_000)),
+                (30, None),
+            ]
         );
     }
 
@@ -1835,12 +2414,12 @@ pub(crate) mod tests {
         let sweep = [row(10, 400), row(20, 2), row(21, 2), row(22, 2), row(23, 2)];
         let mut pass = JobsPass::new();
         pass.held = HeldReaders {
-            start: |pid, _| {
-                Some(match pid {
+            start: |pid, _, _| {
+                Some(judged(match pid {
                     20 | 23 => AtStart::Held,
                     22 => AtStart::Translating,
                     _ => AtStart::Started,
-                })
+                }))
             },
             exec: |pid| Some(u64::from(pid)),
             coalition: |pid| Some(if pid == 23 { 8 } else { 7 }),
@@ -1855,6 +2434,7 @@ pub(crate) mod tests {
                 &[],
                 &[],
                 &[],
+                &GrantFacts::default(),
                 10,
                 false,
                 true,
@@ -1891,6 +2471,92 @@ pub(crate) mod tests {
         );
     }
 
+    /// The pass hands the engine the grant's facts, also from the vitals request through
+    /// `vitals_host::jobs_step`: aterm's held program forked after the grant counts against it;
+    /// with no grant time nothing counts, and nothing outside every tab while a tab the facts name
+    /// adopted is open.
+    #[test]
+    fn the_pass_hands_the_engine_the_grant_time_and_the_adopted_tabs() {
+        const ME: u32 = 501;
+        let row = |pid, cpu_ms: u64| ProcessReading {
+            pid,
+            uid: Some(ME),
+            cpu_ns: Some(cpu_ms * 1_000_000),
+            name: format!("p{pid}"),
+            ..ProcessReading::default()
+        };
+        let pass = || {
+            let mut pass = JobsPass::new();
+            pass.held = HeldReaders {
+                start: |_, _, _| Some(judged(AtStart::Held)),
+                coalition: |_| Some(7),
+                ..HeldReaders::INERT
+            };
+            pass
+        };
+        let tab = TabRoot {
+            key: 41,
+            tab: 41,
+            shell_pid: 941,
+            label: "Tab 1".into(),
+            program: String::new(),
+            tab_id: None,
+        };
+        let after_grant = |grant: &GrantFacts| {
+            pass()
+                .tick(
+                    10_000,
+                    || 10_000,
+                    Some(&[row(10, 400), row(20, 2)]),
+                    std::slice::from_ref(&tab),
+                    &[],
+                    &[],
+                    grant,
+                    10,
+                    false,
+                    true,
+                )
+                .expect("a view")
+                .findings
+                .program_check_after_grant
+        };
+        let granted = |adopted: Vec<u64>| GrantFacts {
+            grant_ms: Some(1),
+            adopted,
+        };
+        assert_eq!(
+            after_grant(&granted(Vec::new())),
+            1,
+            "aterm's held program forked after the grant"
+        );
+        assert_eq!(after_grant(&GrantFacts::default()), 0, "no grant time");
+        assert_eq!(
+            after_grant(&granted(vec![41])),
+            0,
+            "outside every tab while a tab is adopted"
+        );
+
+        let req = crate::vitals_host::Request {
+            self_pid: 10,
+            jobs_now: true,
+            grant: granted(Vec::new()),
+            ..crate::vitals_host::Request::default()
+        };
+        let epoch = Instant::now();
+        let view = crate::vitals_host::jobs_step(
+            &mut pass(),
+            &req.tab_reads(epoch, || epoch),
+            Some(&[row(10, 400), row(20, 2)]),
+            &req,
+            false,
+        )
+        .expect("a view");
+        assert_eq!(
+            view.findings.program_check_after_grant, 1,
+            "the request's grant reaches the engine"
+        );
+    }
+
     /// With this process's coalition unread, no held program outside every job counts as aterm's:
     /// one whose own coalition is unread too is no match.
     #[test]
@@ -1905,7 +2571,7 @@ pub(crate) mod tests {
         };
         let mut pass = JobsPass::new();
         pass.held = HeldReaders {
-            start: |_, _| Some(AtStart::Held),
+            start: |_, _, _| Some(judged(AtStart::Held)),
             coalition: |_| None,
             ..HeldReaders::INERT
         };
@@ -1917,6 +2583,7 @@ pub(crate) mod tests {
                 &[],
                 &[],
                 &[],
+                &GrantFacts::default(),
                 10,
                 false,
                 true,
@@ -1949,15 +2616,199 @@ pub(crate) mod tests {
             },
         ];
         let asked = RefCell::new(Vec::new());
-        let procs = job_procs(&read, &BTreeSet::from([10]), None, |pid| {
-            asked.borrow_mut().push(pid);
-            Some(u64::from(pid) * 100 + 7)
-        });
+        let procs = job_procs(
+            &read,
+            &BTreeSet::from([10]),
+            None,
+            |pid| {
+                asked.borrow_mut().push(pid);
+                Some(u64::from(pid) * 100 + 7)
+            },
+            |_| None,
+        );
         assert_eq!(
             procs.iter().map(|p| (p.pid, p.version)).collect::<Vec<_>>(),
             [(10, Some(1007)), (11, None)]
         );
         assert_eq!(asked.into_inner(), [10]);
+    }
+
+    /// How many times a stand-in's arguments, and a stand-in ledger, were read.
+    static FRONT_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static LEDGER_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    /// Whether the stand-in ledger holds pid 40's claim (admitted) rather than keeping it waiting.
+    static ADMITTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// The hop's argv for `tool` at `target`.
+    fn hop(tool: &str, target: &str) -> Vec<OsString> {
+        [
+            "/Applications/aterm.app/Contents/MacOS/atpkg",
+            "__build_admit",
+            "--shim",
+            tool,
+            "-",
+            target,
+            "--unverified",
+            "build",
+        ]
+        .iter()
+        .map(Into::into)
+        .collect()
+    }
+
+    /// Pids 40 and 46 run a shim's front (the hop's argv; 46's target a name `status` cleans,
+    /// `targo@dev`), 41 another verb of the same image; each read counts.
+    fn stand_in_argv(pid: u32) -> Option<Vec<OsString>> {
+        FRONT_READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Some(match pid {
+            40 => hop("targo", "/store/trust/bin/targo"),
+            46 => hop("targo-tippy", "/store/trust/bin/targo@dev"),
+            41 => [
+                "/Applications/aterm.app/Contents/MacOS/atpkg",
+                "__build_cache_register",
+                "targo",
+            ]
+            .iter()
+            .map(Into::into)
+            .collect(),
+            _ => return None,
+        })
+    }
+
+    /// The stand-in ledger: pid 77 holds 8 GiB; pid 40's claim waits behind it, or is held once
+    /// [`ADMITTED`]; pid 46's waits behind both.
+    fn stand_in_claims(_: &aterm_capacity::Ledger) -> Option<Vec<aterm_capacity::Record>> {
+        LEDGER_READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let record = |pid: u32, start_ms: u64, held: bool| aterm_capacity::Record {
+            pid,
+            start_ms,
+            seq: 0,
+            checkout: "/ws".to_owned(),
+            need: aterm_capacity::Need::new("a build").mem(8 << 30),
+            held: held.then_some(aterm_capacity::Held {
+                admitted_ms: start_ms,
+                cores: 1,
+                alone: false,
+            }),
+            credit: Vec::new(),
+            wrote: None,
+            next_ms: None,
+        };
+        let admitted = ADMITTED.load(std::sync::atomic::Ordering::SeqCst);
+        Some(vec![
+            record(77, 1_000, true),
+            record(40, 2_000, admitted),
+            record(46, 3_000, false),
+        ])
+    }
+
+    /// A MEMBER IS NAMED BY THE BUILD ITS FRONT BECOMES, WAITING BEHIND THE CLAIMS ITS LEDGER
+    /// NAMES: only a member running the front's image is asked, its arguments read once for the
+    /// program it runs and its ledger once a pass for every front that claims there; it is named
+    /// by the one rule `status` names a front by (`targo@dev` reads `targodev` in both); once
+    /// its ledger holds its claim it is still named by its build but waits for none. A member whose
+    /// thread list shows it never ran (held mid-start) and the development stand-in are never
+    /// read. NEGATIVE CONTROL: another verb of the same image becomes nothing, a build typed
+    /// plainly and a front that exec'd its build are not read, being no front's image.
+    #[test]
+    fn a_member_is_named_by_the_build_its_front_becomes() {
+        use std::sync::atomic::Ordering;
+        let ran = |pid: u32, name: &str, lone_zero: bool| ProcFacts {
+            pid,
+            name: name.to_owned(),
+            exe: Some(name.to_owned()),
+            start: Some(u64::from(pid)),
+            start_facts: Some(probe::StartFacts {
+                lone_zero,
+                ..probe::StartFacts::default()
+            }),
+            ..ProcFacts::default()
+        };
+        let read = [
+            ran(40, "atpkg", false),
+            ran(41, "atpkg", false),
+            ran(42, "targo", false),
+            ran(43, "atpkg", true),
+            ProcFacts {
+                pid: 44,
+                ..ProcFacts::default()
+            },
+            ran(46, "atpkg", false),
+        ];
+        let readers = FrontReaders {
+            argv: stand_in_argv,
+            ledger: |_| {
+                Some(aterm_capacity::Ledger::at(std::path::PathBuf::from(
+                    "/scratch",
+                )))
+            },
+            claims: stand_in_claims,
+        };
+        let mut fronts = Fronts::new(readers);
+        let pass = |fronts: &mut Fronts, read: &[ProcFacts], stand_in: Option<u32>| {
+            let procs = job_procs(
+                read,
+                &BTreeSet::new(),
+                stand_in,
+                |_| None,
+                |p| fronts.front(p),
+            )
+            .into_iter()
+            .map(|p| (p.pid, p.becomes, p.claims_ahead))
+            .collect::<Vec<_>>();
+            fronts.keep(read);
+            procs
+        };
+        let reads = || {
+            (
+                FRONT_READS.load(Ordering::SeqCst),
+                LEDGER_READS.load(Ordering::SeqCst),
+            )
+        };
+        FRONT_READS.store(0, Ordering::SeqCst);
+        LEDGER_READS.store(0, Ordering::SeqCst);
+        ADMITTED.store(false, Ordering::SeqCst);
+        let named = pass(&mut fronts, &read, None);
+        assert_eq!(
+            named,
+            [
+                (40, Some("targo".to_owned()), Some(vec![77])),
+                (41, None, None),
+                (42, None, None),
+                (43, None, None),
+                (44, None, None),
+                (46, Some("targodev".to_owned()), Some(vec![77, 40])),
+            ]
+        );
+        assert_eq!(
+            crate::session_status::program::front_program(&hop("targo-tippy", "/b/targo@dev")),
+            Some("targodev".to_owned()),
+            "as `status` names it"
+        );
+        assert_eq!(
+            reads(),
+            (3, 1),
+            "the members that ran its image; one ledger read a pass"
+        );
+        assert_eq!(pass(&mut fronts, &read, None), named);
+        assert_eq!(
+            reads(),
+            (3, 2),
+            "arguments once a program, the ledger each pass"
+        );
+        ADMITTED.store(true, Ordering::SeqCst);
+        let admitted = pass(&mut fronts, &read[..1], None);
+        assert_eq!(
+            admitted,
+            [(40, Some("targo".to_owned()), None)],
+            "its ledger holds its claim"
+        );
+        let execd = [ran(40, "targo", false)];
+        assert_eq!(pass(&mut fronts, &execd, None), [(40, None, None)]);
+        assert_eq!(reads(), (3, 3), "the build it exec'd is not read");
+        let mut again = Fronts::new(readers);
+        assert_eq!(pass(&mut again, &read[..1], Some(40)), [(40, None, None)]);
+        assert_eq!(reads(), (3, 3), "the stand-in is never read");
     }
 
     /// The stand-in reads held only where the reading judged a start (never a zombie's or another
@@ -1983,37 +2834,140 @@ pub(crate) mod tests {
             }),
             ..ProcFacts::default()
         };
-        assert!(job_proc(&read, Some(30)).program_check);
-        assert!(!job_proc(&read, None).program_check);
-        assert!(
-            !job_proc(&unread, Some(31)).program_check,
+        let held_at = |p: &ProcFacts, stand_in| job_proc(p, stand_in).start_wait;
+        assert_eq!(held_at(&read, Some(30)), Some(StartWait::ProgramCheck));
+        assert_eq!(held_at(&read, None), None);
+        assert_eq!(
+            held_at(&unread, Some(31)),
+            None,
             "no start read: a zombie, or another user's"
         );
-        assert!(job_proc(&held, Some(30)).program_check, "the kernel's own");
+        assert_eq!(
+            held_at(&held, Some(30)),
+            Some(StartWait::ProgramCheck),
+            "the kernel's own"
+        );
     }
 
-    /// A view speaks for now for a minute, and a parked one for as long as its reader runs; one
-    /// that holds a wait is read on a timer, not on edges, so past the minute it does not.
+    /// A member that has not started hands the engine what keeps it from its first instruction,
+    /// each as its reading judges it: Rosetta translating it, a volume not proven local, a stop or
+    /// a tracer; one that started hands none. NEGATIVE CONTROL: hand the engine only a held start,
+    /// and a member Rosetta translates reads `wait=unnamed` beside its own `translating` finding.
     #[test]
-    fn a_parked_view_speaks_for_now_while_its_reader_runs() {
-        use aterm_vitals::jobs::{Findings, HeldEpisode, Named};
+    fn a_member_that_has_not_started_hands_the_engine_its_start_wait() {
+        let at = |translated, local, stopped| ProcFacts {
+            pid: 40,
+            start_facts: Some(probe::StartFacts {
+                lone_zero: true,
+                stopped,
+                translated,
+                local,
+                age_ms: Some(probe::PROGRAM_CHECK_AGE_MS),
+                ..probe::StartFacts::default()
+            }),
+            ..ProcFacts::default()
+        };
+        let wait = |p: &ProcFacts| job_proc(p, None).start_wait;
+        assert_eq!(
+            wait(&at(true, Some(true), false)),
+            Some(StartWait::Translating)
+        );
+        assert_eq!(wait(&at(false, None, false)), Some(StartWait::NotStarted));
+        assert_eq!(
+            wait(&at(false, Some(true), true)),
+            Some(StartWait::StoppedUnstarted {
+                stopped: true,
+                traced: false
+            })
+        );
+        assert_eq!(
+            wait(&at(false, Some(true), false)),
+            Some(StartWait::ProgramCheck)
+        );
+        let started = ProcFacts {
+            pid: 41,
+            start_facts: Some(probe::StartFacts::default()),
+            ..ProcFacts::default()
+        };
+        assert_eq!(wait(&started), None, "it ran past its start");
+    }
+
+    /// A leftover view offering a closed tab's row (an owner gone), which a reading with no window
+    /// reads again within 30 s.
+    pub(crate) fn offered_left() -> LeftView {
+        LeftView {
+            rows: vec![aterm_vitals::left::LeftRow {
+                pid: 2606,
+                state: aterm_vitals::left::State::Left,
+                peer: None,
+                check_ms: None,
+                started_ms: Some(1_500),
+                cpu_ms: None,
+                exe_judged: None,
+                tier: aterm_vitals::left::Tier::Offer,
+                why: aterm_vitals::left::Why::OwnerGone,
+                proof: Vec::new(),
+                listen: false,
+                from: aterm_vitals::left::Source::Closed(7),
+                teller: None,
+                token: None,
+                foreground: false,
+            }],
+            ..LeftView::default()
+        }
+    }
+
+    /// A view speaks for now for a minute, and one read again only on edges (a parked one, or a
+    /// running job's: its own demand arms nothing with no window) for as long as its reader runs;
+    /// one read on a timer (a suspect agent call, a held wait, a leftover offer read with it) is
+    /// not read on edges, so past the minute it does not. A program that never ran and reads
+    /// stopped or traced is such a wait: a debugger's resume raises no edge. NEGATIVE CONTROL:
+    /// leave its finding out of `holds_a_wait`, and that view speaks past the minute.
+    #[test]
+    fn a_view_read_only_on_edges_speaks_for_now_while_its_reader_runs() {
+        use aterm_vitals::jobs::{Findings, HeldEpisode, Named, StoppedUnstarted, Verdict};
         let parked = JobsView::default();
         assert_eq!(parked.demand, Demand::Idle);
-        let watched = JobsView {
+        let running = JobsView {
             demand: Demand::Fast,
+            rows: vec![crate::stats_paint::tests::job_row(
+                "j41",
+                Verdict::Fine,
+                None,
+                Some(1_000),
+            )],
             ..JobsView::default()
         };
+        let watched = JobsView {
+            demand: Demand::Fast,
+            rows: vec![JobRow {
+                standing: Some(Standing::Capped),
+                ..call_row(0, Consumer::AgentBg, true, 31, 27098, "python3")
+            }],
+            ..JobsView::default()
+        };
+        assert!(windowless_after(&watched).is_some(), "{watched:?}");
         let late = JOBS_FRESH + Duration::from_secs(1);
-        assert!(speaks_for_now(&watched, JOBS_FRESH, false));
-        assert!(speaks_for_now(&parked, late, true), "parked, read on edges");
-        assert!(!speaks_for_now(&watched, late, true), "due long ago");
-        assert!(!speaks_for_now(&parked, late, false), "no reader");
+        assert!(speaks_for_now(&watched, None, JOBS_FRESH, false));
+        assert!(
+            speaks_for_now(&parked, None, late, true),
+            "parked, read on edges"
+        );
+        assert!(
+            speaks_for_now(&running, None, late, true),
+            "running, read on edges"
+        );
+        assert!(!speaks_for_now(&watched, None, late, true), "due long ago");
+        assert!(!speaks_for_now(&parked, None, late, false), "no reader");
+        assert!(!speaks_for_now(&running, None, late, false), "no reader");
         let held = JobsView {
             findings: Findings {
                 program_check: vec![Named {
                     pid: 25311,
+                    exec_version: None,
                     name: "gh".into(),
                     tab: None,
+                    job: None,
                     for_ms: 35_940_000,
                 }],
                 ..Findings::default()
@@ -2041,14 +2995,71 @@ pub(crate) mod tests {
             },
             ..JobsView::default()
         };
-        for view in [&held, &episode, &translating, &unstarted] {
+        let stopped = JobsView {
+            findings: Findings {
+                stopped_unstarted: vec![StoppedUnstarted {
+                    named: held.findings.program_check[0].clone(),
+                    stopped: true,
+                    traced: true,
+                }],
+                ..Findings::default()
+            },
+            ..JobsView::default()
+        };
+        for view in [&held, &episode, &translating, &unstarted, &stopped] {
             assert_eq!(view.demand, Demand::Idle);
-            assert!(speaks_for_now(view, JOBS_FRESH, true), "{view:?}");
+            assert!(speaks_for_now(view, None, JOBS_FRESH, true), "{view:?}");
             assert!(
-                !speaks_for_now(view, late, true),
+                !speaks_for_now(view, None, late, true),
                 "a held wait is read on a timer, not on edges: {view:?}"
             );
         }
+    }
+
+    /// A reading whose leftover view offers a closed tab's row is read again within 30 s with no
+    /// window (`vitals_host::held_wait_after`), so its jobs view, parked or running, speaks for now
+    /// for a minute and then, its reader having stopped delivering, no more; read without the
+    /// offer, the same views speak on. NEGATIVE CONTROL: `read_on_a_timer` that looks at the jobs
+    /// view alone lets both old views speak past the minute.
+    #[test]
+    fn a_view_read_with_a_leftover_offer_is_read_on_a_timer() {
+        use aterm_vitals::jobs::Verdict;
+        let offered = offered_left();
+        assert!(aterm_vitals::left::holds_an_offer(&offered));
+        let parked = JobsView::default();
+        let running = JobsView {
+            demand: Demand::Fast,
+            rows: vec![crate::stats_paint::tests::job_row(
+                "j41",
+                Verdict::Fine,
+                None,
+                Some(1_000),
+            )],
+            ..JobsView::default()
+        };
+        let late = JOBS_FRESH + Duration::from_secs(1);
+        for view in [&parked, &running] {
+            assert!(read_on_a_timer(view, Some(&offered)), "{view:?}");
+            assert!(speaks_for_now(view, Some(&offered), JOBS_FRESH, true));
+            assert!(
+                !speaks_for_now(view, Some(&offered), late, true),
+                "the offer's 30 s re-read never came: {view:?}"
+            );
+            assert!(
+                speaks_for_now(view, Some(&LeftView::default()), late, true),
+                "no offer, read on edges: {view:?}"
+            );
+        }
+        assert_eq!(
+            program_check_of(&parked, Some(&offered), late, true),
+            None,
+            "privacy's count pulls past the minute"
+        );
+        assert_eq!(
+            program_check_of(&parked, None, late, true),
+            Some((0, 61_000)),
+            "none held, read on edges"
+        );
     }
 
     /// Privacy's count: every held program of this user, aterm's and others', and the longest held
@@ -2058,8 +3069,10 @@ pub(crate) mod tests {
         use aterm_vitals::jobs::{Findings, Named};
         let named = |pid, for_ms| Named {
             pid,
+            exec_version: None,
             name: "gh".into(),
             tab: None,
+            job: None,
             for_ms,
         };
         let view = JobsView {
@@ -2071,19 +3084,161 @@ pub(crate) mod tests {
             ..JobsView::default()
         };
         assert_eq!(
-            program_check_of(&view, Duration::from_millis(1_500), false),
+            program_check_of(&view, None, Duration::from_millis(1_500), false),
             Some((2, 35_941_500)),
             "both held, the oldest plus the view's age"
         );
         assert_eq!(
-            program_check_of(&JobsView::default(), Duration::ZERO, false),
+            program_check_of(&JobsView::default(), None, Duration::ZERO, false),
             Some((0, 0)),
             "none held"
         );
         assert_eq!(
-            program_check_of(&view, JOBS_FRESH + Duration::from_secs(1), true),
+            program_check_of(&view, None, JOBS_FRESH + Duration::from_secs(1), true),
             None,
             "a view that does not speak for now"
+        );
+    }
+
+    /// THE BOARD'S HELD PROGRAMS ARE THIS SESSION'S CALLS' AND THEIR ORPHANS': of the view's held
+    /// rows, session `s-a` (tab 4) is given the members named its agent's calls (a live call's, and
+    /// the orphan an ended call left, which the engine names by the call), oldest first, each held
+    /// for its `for_ms` as of the view, with the view's age; not the member of its shell's job or
+    /// of what one left (the person's), of a nested terminal session, tab 5's call (session
+    /// `s-b`'s) or a row no tab holds. A session with no held row is given none; a view past
+    /// [`JOBS_FRESH`] and a board no view was posted to give no reading.
+    #[test]
+    fn the_boards_held_programs_are_this_sessions_calls_and_their_orphans() {
+        use aterm_vitals::jobs::{Findings, Named};
+        let held = |pid, tab, job, for_ms| Named {
+            pid,
+            exec_version: Some(u64::from(pid)),
+            name: "git-remote-https".into(),
+            tab,
+            job,
+            for_ms,
+        };
+        let view = Arc::new(JobsView {
+            findings: Findings {
+                program_check: vec![
+                    held(601, Some(4), Some(JobKind::AgentCall), 30_000),
+                    held(602, Some(4), Some(JobKind::AgentCall), 1_140_000),
+                    held(603, Some(4), Some(JobKind::Shell), 9_000_000),
+                    held(604, Some(5), Some(JobKind::AgentCall), 5_000),
+                    held(605, None, None, 9_999_000),
+                    held(606, Some(4), Some(JobKind::Nested), 9_000_000),
+                ],
+                ..Findings::default()
+            },
+            ..JobsView::default()
+        });
+        let sids = BTreeMap::from([
+            (4, "s-a".to_string()),
+            (5, "s-b".to_string()),
+            (6, "s-c".to_string()),
+        ]);
+        let board = JobsBoard::new();
+        let posted = Instant::now();
+        board.post(Arc::clone(&view), sids.clone(), posted);
+        let later = posted + Duration::from_secs(2);
+        let pids = |sid: &str| {
+            board.held(sid, later).map(|(age, rows)| {
+                (
+                    age,
+                    rows.iter()
+                        .map(|h| (h.pid, h.exec_version, h.held_ms))
+                        .collect(),
+                )
+            })
+        };
+        assert_eq!(
+            pids("s-a"),
+            Some((
+                Duration::from_secs(2),
+                vec![(602, Some(602), 1_140_000), (601, Some(601), 30_000)]
+            ))
+        );
+        assert_eq!(
+            pids("s-b"),
+            Some((Duration::from_secs(2), vec![(604, Some(604), 5_000)]))
+        );
+        assert_eq!(pids("s-c"), Some((Duration::from_secs(2), Vec::new())));
+        assert_eq!(
+            board.held("s-a", posted + JOBS_FRESH + Duration::from_secs(1)),
+            None,
+            "a view past the bound"
+        );
+        assert_eq!(JobsBoard::new().held("s-a", later), None, "no view");
+    }
+
+    /// A HELD PID IS PROVED ONLY IN A PROCESS AS OLD AS ITS TOLD WAIT ([`held_as_long`]): this
+    /// process has run a moment, and a pid no process holds has run none. NEGATIVE CONTROL: a wait
+    /// longer than this process has lived is a later process's, one that took the pid since; and
+    /// this process, past its start, is never held.
+    #[test]
+    fn a_held_pid_is_proved_only_in_a_process_as_old_as_its_wait() {
+        let me = std::process::id();
+        assert!(has_run(me, 0), "this process has run");
+        assert!(
+            !has_run(me, 10 * 365 * 24 * 3_600_000),
+            "a wait longer than this process has lived"
+        );
+        assert!(!has_run(u32::MAX - 1, 0), "a pid no process holds");
+        assert!(
+            !held_as_long(&HeldCall {
+                pid: me,
+                exec_version: (HeldReaders::KERNEL.exec)(me),
+                held_ms: 0,
+            }),
+            "this process is past its start"
+        );
+    }
+
+    /// A fork's age survives exec, but its old held duration does not. The unchanged exec is
+    /// proved with the same pid and sufficient age; a later exec, an exec during the probe and
+    /// an unavailable version are unproved even while the program is held and its fork is old.
+    #[test]
+    fn a_held_wait_is_reproved_only_for_its_original_exec() {
+        let held = HeldCall {
+            pid: 601,
+            exec_version: Some(17),
+            held_ms: 1_140_000,
+        };
+        let prove = |held: &HeldCall, versions: [Option<u64>; 2]| {
+            let mut versions = versions.into_iter();
+            held_as_long_with(
+                held,
+                |pid| {
+                    assert_eq!(pid, 601, "the same pid across exec");
+                    versions.next().flatten()
+                },
+                |_| true,
+                |_, ms| 10_000_000 >= ms,
+            )
+        };
+        assert!(prove(&held, [Some(17), Some(17)]), "the unchanged exec");
+        assert!(
+            !prove(&held, [Some(18), Some(18)]),
+            "a newer exec in the same old process cannot inherit the wait"
+        );
+        assert!(!prove(&held, [Some(17), Some(18)]), "exec during proof");
+        assert!(
+            !prove(&held, [Some(17), None]),
+            "the final identity was unread"
+        );
+        assert!(
+            !prove(&held, [None, None]),
+            "the current identity was unread"
+        );
+        assert!(
+            !prove(
+                &HeldCall {
+                    exec_version: None,
+                    ..held
+                },
+                [Some(17), Some(17)]
+            ),
+            "a birth fallback is no actual exec version"
         );
     }
 

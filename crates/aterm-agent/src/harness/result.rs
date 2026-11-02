@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 
 use aterm_json::Value;
 
-use super::upgrade::{ANNOUNCE_HEAD, is_land_act};
+use super::upgrade::{ANNOUNCE_HEAD, is_land_act, is_land_check_prompt};
+use crate::supervise::policy::land_check::landed_reply;
 use crate::supervise::policy::turn_end::{is_done_check, says_done, without_finished_lines};
 
 /// The most of a result one `result` reply prints, in characters.
@@ -244,6 +245,11 @@ impl TurnRows<'_> {
         self.prompt.is_some_and(is_land_act)
     }
 
+    /// The turn answers the land check (`land-check@v1`).
+    fn is_land_check(&self) -> bool {
+        self.prompt.is_some_and(is_land_check_prompt)
+    }
+
     fn answered_done(&self) -> bool {
         final_said(self.said).is_none_or(|r| says_done(Some(&r.text)))
     }
@@ -357,9 +363,17 @@ fn by_check(newest: &TurnRows<'_>, before: &[TurnRows<'_>]) -> Result<Report, &'
     if !newest.is_check() {
         return Err("no-check");
     }
-    if ends_in_call(newest.said)
-        || !final_said(newest.said).is_some_and(|r| says_done(Some(&r.text)))
-    {
+    // THE LAND CHECK'S `LANDED` ends a landing: the report is the defense it audited (the
+    // newest land act's done reply before it), the word itself adding nothing.
+    let checked = newest.is_land_check();
+    let done = |r: &Report| {
+        if checked {
+            landed_reply(Some(&r.text))
+        } else {
+            says_done(Some(&r.text))
+        }
+    };
+    if ends_in_call(newest.said) || !final_said(newest.said).is_some_and(|r| done(&r)) {
         return Err("no-reply");
     }
     let land = newest.is_land();
@@ -367,7 +381,11 @@ fn by_check(newest: &TurnRows<'_>, before: &[TurnRows<'_>]) -> Result<Report, &'
     let mut earlier = before.iter().rev();
     let reported = loop {
         match earlier.next() {
-            Some(t) if land && t.is_land() => {}
+            Some(t) if land && t.is_land() => {
+                if checked && checks.len() == 1 && !t.is_land_check() && t.answered_done() {
+                    checks.push(t);
+                }
+            }
             Some(t) if t.is_check() && !t.is_land() && t.answered_done() => checks.push(t),
             other => break other,
         }
@@ -397,7 +415,10 @@ fn check_words(turn: &TurnRows<'_>) -> Option<Report> {
         .find_map(|said| {
             let text = without_finished_lines(&said.text);
             let word = text.trim_matches(|c: char| !c.is_alphanumeric());
-            (!(word.is_empty() || word == "DONE")).then_some(Report { text, ..said })
+            (!(word.is_empty()
+                || word == "DONE"
+                || turn.is_land_check() && landed_reply(Some(&text))))
+            .then_some(Report { text, ..said })
         })
 }
 
@@ -903,7 +924,7 @@ impl Source {
                         turn,
                         rollout: field("rollout").map(PathBuf::from),
                         home: field("home").map(PathBuf::from),
-                        landed: field("landed").and_then(|ms| ms.parse().ok()),
+                        landed: field("landed").and_then(|ms| crate::parse_int(&ms)),
                     },
                 })
             }
@@ -930,6 +951,80 @@ fn is_word(w: &str) -> bool {
 #[must_use]
 pub fn sidecar_of(path: &Path) -> PathBuf {
     path.with_extension("src")
+}
+
+/// The sidecar's key for what aterm checked at the landing the snapshot is the result of
+/// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §14.9, slice 9c), after its [`Source::line`]:
+/// the task record's `checked=` word (`3f9a1c2e4b7d@origin/main`, `no-remote`, `no-repo`, …).
+const CHECKED_KEY: &str = "checked=";
+
+/// `line` (a sidecar's first line) with its `checked=` set to `word`: any it had replaced.
+fn with_checked_key(line: &str, word: &str) -> String {
+    let mut out: Vec<&str> = line
+        .split_whitespace()
+        .filter(|t| !t.starts_with(CHECKED_KEY))
+        .collect();
+    let field = format!("{CHECKED_KEY}{word}");
+    out.push(&field);
+    out.join(" ")
+}
+
+/// WHAT ATERM CHECKED, ON THE RESULT (§14.9, slice 9c): the sidecar beside the snapshot at
+/// `path` says `checked=<word>` after its source, so `result`'s header names it ([`answer`]).
+/// A reader that predates it reads the same source and passes the key by.
+///
+/// # Errors
+/// `word` is no `checked=` word, or the sidecar could not be read or written.
+pub fn note_checked(path: &Path, word: &str) -> std::io::Result<()> {
+    if !super::land_receipt::valid_checked_word(word) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{word:?} is no checked= word"),
+        ));
+    }
+    let sidecar = sidecar_of(path);
+    let line = super::footer::read_small(&sidecar, SIDECAR_READ_BYTES)
+        .and_then(|t| t.lines().next().map(str::to_owned))
+        .filter(|line| Source::parse(line).is_some())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("{} holds no source", sidecar.display()),
+            )
+        })?;
+    super::upgrade_models::write_atomic(&sidecar, &format!("{}\n", with_checked_key(&line, word)))
+}
+
+/// The `checked=` word the sidecar beside the snapshot at `path` holds ([`note_checked`]), or
+/// `None`.
+#[must_use]
+pub fn checked_of(path: &Path) -> Option<String> {
+    let text = super::footer::read_small(&sidecar_of(path), SIDECAR_READ_BYTES)?;
+    text.lines()
+        .next()?
+        .split_whitespace()
+        .find_map(|t| t.strip_prefix(CHECKED_KEY))
+        .filter(|word| super::land_receipt::valid_checked_word(word))
+        .map(str::to_owned)
+}
+
+/// A `result` reply with ` checked=<word>` at the end of its `OK` header, where the snapshot's
+/// sidecar names one ([`checked_of`]); an `ERR` reply as it is.
+fn with_checked(reply: String, checked: Option<String>) -> String {
+    let Some(word) = checked else {
+        return reply;
+    };
+    if !reply.starts_with("OK ") {
+        return reply;
+    }
+    let at = reply.find('\n').unwrap_or(reply.len());
+    let mut out = String::with_capacity(reply.len() + CHECKED_KEY.len() + word.len() + 1);
+    out.push_str(&reply[..at]);
+    out.push(' ');
+    out.push_str(CHECKED_KEY);
+    out.push_str(&word);
+    out.push_str(&reply[at..]);
+    out
 }
 
 /// What [`snapshot`] wrote.
@@ -1205,9 +1300,14 @@ fn tail_of(path: &Path, bytes: u64) -> Option<(String, bool)> {
 }
 
 /// The `result [full]` reply over the snapshot at `path` ([`snapshot`]), framed `OK <n>` and
-/// `n` lines.
+/// `n` lines, its header ending ` checked=<word>` where the sidecar names what aterm checked at
+/// the landing ([`note_checked`], slice 9c).
 #[must_use]
 pub fn answer(path: &Path, full: bool) -> String {
+    with_checked(answer_of(path, full), checked_of(path))
+}
+
+fn answer_of(path: &Path, full: bool) -> String {
     match source_of(path) {
         None => unavailable("no-snapshot"),
         Some(Source::Unavailable { why, .. } | Source::RolloutUnavailable { why, .. }) => {
@@ -1392,17 +1492,24 @@ impl Reread {
     /// # Errors
     /// A file could not be written.
     pub fn write(&self, path: &Path) -> std::io::Result<()> {
+        let checked = checked_of(path);
         super::upgrade_models::write_atomic(path, &self.report.text)?;
-        super::upgrade_models::write_atomic(
-            &sidecar_of(path),
-            &format!("{}\n", self.source().line()),
-        )
+        let line = self.source().line();
+        let line = match &checked {
+            Some(word) => with_checked_key(&line, word),
+            None => line,
+        };
+        super::upgrade_models::write_atomic(&sidecar_of(path), &format!("{line}\n"))
     }
 
     /// The `result [full]` reply for it ([`answer`]), whether or not it was written over the
-    /// snapshot at `path`.
+    /// snapshot at `path`, its header naming what aterm checked where the sidecar does.
     #[must_use]
     pub fn answer(&self, path: &Path, full: bool) -> String {
+        with_checked(self.answer_of(path, full), checked_of(path))
+    }
+
+    fn answer_of(&self, path: &Path, full: bool) -> String {
         let (session, uuid) = (&self.report.session, &self.report.uuid);
         let text = || Some(self.report.text.clone());
         match self.from {

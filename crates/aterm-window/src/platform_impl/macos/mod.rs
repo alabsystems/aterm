@@ -17,7 +17,9 @@ mod event;
 mod event_handler;
 mod event_loop;
 mod ffi;
+mod frame_clock;
 mod headless;
+mod key_origin;
 mod menu;
 mod monitor;
 mod observer;
@@ -33,6 +35,7 @@ pub(crate) use self::event::{option_only_character, KeyEventExtra};
 pub(crate) use self::event_loop::{
     ActiveEventLoop, EventLoop, EventLoopProxy, PlatformSpecificEventLoopAttributes,
 };
+pub(crate) use self::key_origin::{set_window_key_classifier, window_event_posted};
 pub(crate) use self::monitor::MonitorHandle;
 pub(crate) use self::window::WindowId;
 pub(crate) use self::window_delegate::PlatformSpecificWindowAttributes;

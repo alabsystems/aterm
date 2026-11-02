@@ -132,6 +132,7 @@ mod linux {
     const MS_REMOUNT: c_ulong = 32;
     const MS_BIND: c_ulong = 4096;
     const MNT_DETACH: c_int = 2;
+    const UMOUNT_NOFOLLOW: c_int = 8;
 
     /// Any CID: a listener's own.
     pub const VMADDR_CID_ANY: u32 = u32::MAX;
@@ -300,13 +301,13 @@ mod linux {
         .map(drop)
     }
 
-    /// Detach the mount at `at`.
+    /// Detach the mount at `at` without following a symbolic link.
     ///
     /// # Errors
     /// `umount2` failed.
     pub fn detach(at: &CStr) -> io::Result<()> {
         // SAFETY: `at` is a NUL-terminated string that outlives the call.
-        check(unsafe { umount2(at.as_ptr(), MNT_DETACH) }).map(drop)
+        check(unsafe { umount2(at.as_ptr(), MNT_DETACH | UMOUNT_NOFOLLOW) }).map(drop)
     }
 
     /// Become `uid` in `groups` with primary `gid`: `setgroups`, then `setgid`, then

@@ -341,6 +341,31 @@ pub(crate) use aterm_effects::cursor_fx::compose_caret_style_override;
 
 const INACTIVE_CURSOR_FILL: u32 = 0x00FF_FFFF;
 
+#[cfg(test)]
+thread_local! {
+    /// A test's negative control: off, every present path draws the caret in the block's fill
+    /// alone, as before composed r2 ([`presented_caret_fill`]).
+    static CARET_FILL_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// The colour every present path draws the caret body in: the tick's `caret_fill`
+/// (`CursorFxFrame::caret_fill`, a bar or underline caret's lifted colour over the block's),
+/// as the pipeline's own publish and the Settings preview draw it. Under the negative control
+/// (`CARET_FILL_READ` off), the block's fill alone.
+#[inline]
+fn presented_caret_fill(
+    caret_fill: Option<u32>,
+    block_fill: Option<crate::cursor_glow::BlockFill>,
+) -> Option<u32> {
+    #[cfg(test)]
+    if !CARET_FILL_READ.with(std::cell::Cell::get) {
+        return block_fill.map(|owned| owned.fill);
+    }
+    #[cfg(not(test))]
+    let _ = block_fill;
+    caret_fill
+}
+
 #[inline]
 fn window_cursor_fill(
     cursor_override: Option<CursorStyle>,
@@ -806,7 +831,7 @@ fn compiled_native_paint_damage(
     })
 }
 
-fn union_native_render_damage(
+pub(crate) fn union_native_render_damage(
     requested: crate::native_app::DamageRegion,
     derived: crate::native_app::DamageRegion,
 ) -> crate::native_app::DamageRegion {
@@ -902,9 +927,38 @@ fn retain_native_leaf_raster(
         .map_or(scene.damage, |derived| {
             union_native_render_damage(scene.damage, derived)
         });
-    let tray = scene
-        .compiled
-        .tray_with_chrome(chrome, terminal_theme, 13.0);
+    // A moving node whose frame changed since the raster painted it repaints whole with the
+    // patch, so no frame shows half of one frame and half of the next.
+    let effective_damage = cache
+        .native
+        .as_ref()
+        .and_then(|raster| {
+            crate::app_native_motion::due_motion_damage(
+                &scene.compiled,
+                raster.motion_ms,
+                scene.motion_ms,
+            )
+        })
+        .map_or(effective_damage, |moved| {
+            union_native_render_damage(effective_damage, moved)
+        });
+    let motion_ms = scene.motion_ms;
+    // A page with a moving node keeps its tray and where that node's prims fall in it, so its
+    // motion frames repaint the node alone (`app_native_motion::MotionTray`).
+    let (tray, motion_tray) = if scene.compiled.motion.is_empty() {
+        (
+            scene
+                .compiled
+                .tray_with_chrome(chrome, terminal_theme, 13.0, motion_ms),
+            None,
+        )
+    } else {
+        let (tray, spans) =
+            scene
+                .compiled
+                .tray_with_motion(chrome, terminal_theme, 13.0, motion_ms);
+        (tray, Some(spans))
+    };
     let ime_caret = scene.compiled.ime_caret_rect();
     let paint_serial = cache.native_paint_serial;
     let patched = match (cache.native.as_mut(), effective_damage) {
@@ -949,9 +1003,12 @@ fn retain_native_leaf_raster(
                 raster.stamp = scene.stamp;
                 raster.paint_serial = paint_serial;
                 raster.compiled = scene.compiled.clone();
+                raster.compiled_fp.take();
                 raster.ime_caret = ime_caret;
                 raster.presented = false;
                 raster.raster_fingerprint_once.take();
+                raster.motion_ms = motion_ms;
+                raster.card_serial = 0;
                 raster.last_work = crate::NativeRasterWork::Region {
                     rect: region,
                     pixels: region.pixels(),
@@ -962,7 +1019,12 @@ fn retain_native_leaf_raster(
         }
         _ => false,
     };
-    if !patched {
+    if patched {
+        if let Some(raster) = cache.native.as_mut() {
+            raster.motion_tray = motion_tray
+                .map(|spans| crate::app_native_motion::MotionTray::new(tray.prims, spans));
+        }
+    } else {
         let (full_rasters, regional_rasters) = cache.native.as_ref().map_or((1, 0), |raster| {
             (
                 raster.full_rasters.saturating_add(1),
@@ -992,6 +1054,11 @@ fn retain_native_leaf_raster(
             full_rasters,
             regional_rasters,
             raster_fingerprint_once: std::sync::OnceLock::new(),
+            motion_ms,
+            motion_tray: motion_tray
+                .map(|spans| crate::app_native_motion::MotionTray::new(tray.prims, spans)),
+            compiled_fp: std::sync::OnceLock::new(),
+            card_serial: 0,
         });
         if crate::tray_raster::chrome_text_holes() == holes_before
             && let Some(raster) = cache.native.as_mut()
@@ -2364,6 +2431,7 @@ mod strip_band_landing_tests {
             SuccessfulPresentRoute::Terminal,
             crate::VisibleContentRoute::Terminal { composed: false },
             HostVisualState::default(),
+            None,
             &plan,
         );
     }
@@ -2848,7 +2916,136 @@ pub(crate) fn tray_quad_below_y(
         scrim: card
             .scrim
             .map(|rgba| aterm_gpu::TrayScrim { rgba, top: floor_y }),
+        serial: card.serial,
+        // The rows a motion frame patched, counted from the quad's first row.
+        delta: card.delta.map(|delta| aterm_gpu::TrayDelta {
+            since: delta.since,
+            rows: (
+                delta.rows.0.saturating_sub(skipped_rows),
+                delta.rows.1.saturating_sub(skipped_rows),
+            ),
+        }),
+        above: &[],
     })
+}
+
+/// What the GPU present's quad of window `ws`'s card carries when that card is the deck's
+/// ([`crate::WindowState::present_card`]): its generation and the rows changed since the last
+/// present's quad ([`crate::stats_clock::DeckMotion::stamp`], [`stamped_tray_quad`]); `None`
+/// when another card covers it, whose quad carries that card's own serial (0 for a fold, which
+/// is compared).
+pub(crate) fn deck_tray_stamp(
+    ws: &mut crate::WindowState,
+) -> Option<(u64, Option<aterm_gpu::TrayDelta>)> {
+    let deck_on_top = ws.deck_fold.is_none()
+        && ws.route_card.is_none()
+        && ws.settings_card.is_none()
+        && ws.badge_card.is_none()
+        && ws.deck_card.is_some();
+    // A tray stack's base card is the deck's own quad as well (design §3.3).
+    let deck_base = ws.tray_stack().is_some_and(|cards| cards[0].is_some());
+    (deck_on_top || deck_base).then(|| ws.deck_motion.stamp())
+}
+
+/// The serial of a tray stack's card other than the deck ([`aterm_gpu::TrayQuad::serial`]): the
+/// card's identity as the CPU fold caches it ([`crate::App::fold_stats_deck`]: its model, its
+/// own serial, which a native page's motion frame renews, geometry, place and size) with the
+/// rows `quad` keeps of it, in the upper half of the serials, which the cards' counter
+/// (`app_native_motion::next_card_serial`) never reaches. The renderer keeps a card it holds at
+/// this serial, as the fold keeps its surface for the same identity; the layer carries no
+/// delta, as a card the fold composes carries none.
+fn stack_card_generation(card: &crate::SettingsCard, quad: &aterm_gpu::TrayQuad<'_>) -> u64 {
+    [
+        card.fp,
+        card.serial,
+        card.geom,
+        u64::from(card.dx),
+        u64::from(card.dy),
+        u64::from(card.pw),
+        u64::from(card.ph),
+        u64::from(quad.dy.saturating_sub(card.dy)),
+        u64::from(quad.ph),
+    ]
+    .into_iter()
+    .fold(aterm_hash::FNV64_OFFSET, aterm_hash::fnv1a_64_u64_le)
+        | 1 << 63
+}
+
+/// The quad the GPU present draws for a window's tray, at or below `floor_y`, moved down by
+/// `crop` (the source rows the present crops off): its tray stack's (`stack`,
+/// [`crate::tray_stack_of`]), the base card's quad with every card above it in `layers`, at
+/// full opacity where it lies; else its one card's (`card`). The deck's quad carries the deck's
+/// `stamp` ([`deck_tray_stamp`]); every other card of a stack its identity
+/// ([`stack_card_generation`]).
+pub(crate) fn present_tray_quad<'a>(
+    stack: Option<[Option<&'a crate::SettingsCard>; 3]>,
+    card: Option<&'a crate::SettingsCard>,
+    stamp: Option<(u64, Option<aterm_gpu::TrayDelta>)>,
+    floor_y: u32,
+    crop: u32,
+    layers: &'a mut Vec<aterm_gpu::TrayLayer<'a>>,
+) -> Option<aterm_gpu::TrayQuad<'a>> {
+    let lower = |mut quad: aterm_gpu::TrayQuad<'a>| {
+        quad.dy = quad.dy.saturating_add(crop);
+        if let Some(scrim) = quad.scrim.as_mut() {
+            scrim.top = scrim.top.saturating_add(crop);
+        }
+        quad
+    };
+    let Some([deck, lens, top]) = stack else {
+        return card
+            .and_then(|card| {
+                tray_quad_below_y(card, floor_y).map(|quad| stamped_tray_quad(quad, card, stamp))
+            })
+            .map(lower);
+    };
+    let deck = deck.and_then(|card| {
+        tray_quad_below_y(card, floor_y).map(|quad| stamped_tray_quad(quad, card, stamp))
+    });
+    let mut quads = deck
+        .into_iter()
+        .chain([lens, top].into_iter().flatten().filter_map(|card| {
+            tray_quad_below_y(card, floor_y).map(|quad| aterm_gpu::TrayQuad {
+                serial: stack_card_generation(card, &quad),
+                delta: None,
+                ..quad
+            })
+        }))
+        .map(lower);
+    let base = quads.next()?;
+    layers.clear();
+    layers.extend(quads.map(|quad| aterm_gpu::TrayLayer {
+        quad,
+        opacity: 1.0,
+        offset_y: 0,
+    }));
+    let layers: &'a Vec<aterm_gpu::TrayLayer<'a>> = layers;
+    Some(aterm_gpu::TrayQuad {
+        above: layers,
+        ..base
+    })
+}
+
+/// `quad`, [`tray_quad_below_y`]'s of `card`, with the deck's `stamp` ([`deck_tray_stamp`]):
+/// the renderer then neither compares the card nor uploads more than its band. The band counts
+/// card rows, so it moves up by the rows the floor cut off.
+pub(crate) fn stamped_tray_quad<'a>(
+    mut quad: aterm_gpu::TrayQuad<'a>,
+    card: &crate::SettingsCard,
+    stamp: Option<(u64, Option<aterm_gpu::TrayDelta>)>,
+) -> aterm_gpu::TrayQuad<'a> {
+    if let Some((generation, delta)) = stamp {
+        let skipped = quad.dy.saturating_sub(card.dy);
+        quad.serial = generation;
+        quad.delta = delta.map(|d| aterm_gpu::TrayDelta {
+            since: d.since,
+            rows: (
+                d.rows.0.saturating_sub(skipped),
+                d.rows.1.saturating_sub(skipped),
+            ),
+        });
+    }
+    quad
 }
 
 #[cfg(test)]
@@ -3018,6 +3215,10 @@ pub(crate) fn apply_host_chrome_at(
 #[cfg(test)]
 #[path = "app_render_drop_overlay_tests.rs"]
 mod drop_overlay_tests;
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "app_render_tray_stack_tests.rs"]
+mod tray_stack_tests;
 
 #[allow(
     clippy::too_many_arguments,
@@ -4973,10 +5174,6 @@ struct FocusedComposedCursorEffects<'a> {
     /// Whether the focused pane's text holds the GPU's bloom, or the post
     /// passes spare its letters ([`RenderInput::bloom_gate`]).
     bloom_gate: aterm_core::render::BloomGate,
-    /// The pet's veil its last pet tick laid ([`aterm_effects::cursor_glow::CursorGlow::pet_veil`]),
-    /// projected with the under stream on a frame that runs no pet tick (empty
-    /// on a full frame, whose word publish lays it afresh).
-    pet_veil: &'a [aterm_core::render::GlowQuad],
 }
 
 /// Keep a glow stream, `quads` and their `ramps`, to the composed pane
@@ -5047,7 +5244,6 @@ fn project_focused_composed_cursor_effects(
     dst.glow_under.extend_from_slice(effects.glow_under);
     dst.glow_under_ramps
         .append_from(effects.glow_under_ramps, 0);
-    dst.glow_under.extend_from_slice(effects.pet_veil);
     dst.char_fg.extend_from_slice(effects.char_fg);
     dst.fire_halo.extend_from_slice(effects.fire_halo);
     dst.cursor_trail.extend_from_slice(effects.trail);
@@ -5583,6 +5779,7 @@ mod presented_grid_record_tests {
             SuccessfulPresentRoute::Heterogeneous,
             crate::VisibleContentRoute::Heterogeneous,
             HostVisualState::default(),
+            None,
             &plan,
         );
         assert!(
@@ -5681,6 +5878,46 @@ fn blend_rgba_pixel_over(destination: &mut [u8], source: &[u8]) {
             ((source_premultiplied + destination_premultiplied) / out_a).min(255) as u8;
     }
     destination[3] = out_a.min(255) as u8;
+}
+
+/// Blend `region` of `src` (a raster placed at `origin` in `dst`) again over cleared pixels
+/// of `dst`, as [`blit_rgba_over`] blends it onto a cleared layer: a reused card takes a
+/// leaf's motion frame. The rows of `dst` it wrote, `None` where the region falls outside.
+fn reblend_rgba_region(
+    dst: &mut [u8],
+    (dst_width, dst_height): (u32, u32),
+    src: &[u8],
+    (src_width, src_height): (u32, u32),
+    (x, y): (u32, u32),
+    region: crate::tray_raster::RasterRect,
+) -> Option<(u32, u32)> {
+    let right = region.x.checked_add(region.width)?.min(src_width);
+    let bottom = region.y.checked_add(region.height)?.min(src_height);
+    let right = right.min(dst_width.checked_sub(x)?);
+    let bottom = bottom.min(dst_height.checked_sub(y)?);
+    if right <= region.x || bottom <= region.y {
+        return None;
+    }
+    let span = (right - region.x) as usize * 4;
+    for row in region.y..bottom {
+        let from = (row as usize * src_width as usize + region.x as usize) * 4;
+        let to = ((y + row) as usize * dst_width as usize + (x + region.x) as usize) * 4;
+        let (Some(source), Some(destination)) =
+            (src.get(from..from + span), dst.get_mut(to..to + span))
+        else {
+            return None;
+        };
+        destination.fill(0);
+        for (destination, source) in destination
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(source.as_chunks::<4>().0)
+        {
+            blend_rgba_pixel_over(destination, source);
+        }
+    }
+    Some((y + region.y, y + bottom))
 }
 
 fn blit_rgba_over(
@@ -6522,6 +6759,10 @@ impl CursorFxInputs {
 #[path = "app_render_sync_cursor_fx_hold_tests.rs"]
 mod sync_cursor_fx_hold_tests;
 
+#[cfg(test)]
+#[path = "app_render_thin_caret_fill_tests.rs"]
+mod thin_caret_fill_tests;
+
 pub(crate) struct CursorFxTick {
     pub win_focused: bool,
     pub motion: crate::motion::MotionPolicy,
@@ -6536,6 +6777,9 @@ pub(crate) struct CursorFxTick {
     pub glow_fp: u64,
     pub trail_fp: u64,
     pub block_fill: Option<crate::cursor_glow::BlockFill>,
+    /// The caret body's colour this tick (`CursorFxFrame::caret_fill`): a bar or underline
+    /// caret's lifted colour over the block's.
+    pub caret_fill: Option<u32>,
     pub bolt_cursor: bool,
     pub twinkle_cursor: bool,
     pub momentum_steady: Option<CursorStyle>,
@@ -8091,17 +8335,36 @@ impl App {
         Ok((v, now))
     }
 
-    /// What the host knows of the page under a window's text (`docs/design/PRISM-GLASS.md` §15.2
-    /// 1.7, D1): the window is opaque where its `background_opacity` is whole, and a wallpaper
-    /// lies under the text once its image is ready (`splice_wallpaper` lays it then). The light
-    /// glass draws only on a clear page ([`aterm_effects::host::PageFacts::clear`]).
-    pub(crate) fn page_facts(&self) -> aterm_effects::host::PageFacts {
+    /// What the host knows of the page under window `wid`'s text, its live page `(fg, bg)`
+    /// (`docs/design/PRISM-GLASS.md` §15.2 1.7, D1, §15.8 amendment 53): the window is opaque
+    /// where its `background_opacity` is whole, a wallpaper lies under the text once its image is
+    /// ready (`splice_wallpaper` lays it then), and its face lays its thinnest glyph as the glyph
+    /// ink the window's glow last observed says, in the page's ink on the page
+    /// ([`aterm_render::GlyphInk::thin_share`]; a window whose face is not read yet takes none
+    /// near the full ink). The light glass draws only on a clear page whose face keeps its
+    /// letters under it ([`aterm_effects::host::PageFacts::glass`]).
+    pub(crate) fn page_facts(
+        &self,
+        wid: WindowId,
+        (fg, bg): (u32, u32),
+    ) -> aterm_effects::host::PageFacts {
+        let thin_ink = self
+            .windows
+            .get(&wid)
+            .and_then(|ws| ws.fx.cursor().glow.glyph_ink())
+            .map_or(1.0, |ink| {
+                ink.thin_share(
+                    aterm_render::linear_luminance(fg),
+                    aterm_render::linear_luminance(bg),
+                )
+            });
         aterm_effects::host::PageFacts {
             opaque: self.config.background_opacity_or_default() >= 1.0,
             wallpaper: matches!(
                 self.config_assets.wallpaper,
                 crate::app_config::WallpaperAsset::Ready { .. }
             ),
+            thin_ink,
         }
     }
 
@@ -8281,8 +8544,9 @@ impl App {
             icons.push_str("none");
         }
         Ok(format!(
-            "{line} word_icons={icons} {}",
-            self.trail_target_fields()?
+            "{line} word_icons={icons} {} resting={}",
+            self.trail_target_fields()?,
+            ws.rest.resting()
         ))
     }
 
@@ -8396,7 +8660,26 @@ impl App {
             win_focused,
         );
         let session = self.front_terminal(id).map_or(0, |front| front.session);
-        let page = self.page_facts();
+        let (glow_cw, glow_ch) = self.win_cell_size(id);
+        // Read this input once while the shared renderer is at this window's cells. Its
+        // retained face table still admits the page by thin_share; exact glyph evidence
+        // protects the current frame. Keep the table while a backend is unavailable, but
+        // revoke its current-frame evidence instead of borrowing another window's rasters.
+        let glyph_ink = (!self.backend.is_pending()
+            && self.backend.cell_size() == (glow_cw, glow_ch))
+            .then(|| {
+                self.windows
+                    .get(&id)
+                    .and_then(|ws| self.backend.glyph_ink_for(&ws.input_scratch))
+            })
+            .flatten();
+        let glow = &mut self.windows.get_mut(&id)?.fx.cursor_mut().glow;
+        if let Some(ink) = glyph_ink {
+            glow.observe_glyph_ink(Some(ink));
+        } else {
+            glow.observe_glyph_ink_unavailable();
+        }
+        let page = self.page_facts(id, (default_fg, default_bg));
         self.windows.get_mut(&id)?.trail_ground.ground(
             &mut glow_cfg,
             (default_fg, default_bg),
@@ -8413,7 +8696,6 @@ impl App {
             cursor_motion.animate(crate::motion::MotionEffect::CursorGlow) && shed_env > 0.0;
         trail_cfg.enabled &= !aterm_effects::cursor_fx::comet_tail_is_its_streak(&glow_cfg);
         let pet_mode = trail_presentation.pet_species.is_some();
-        let (glow_cw, glow_ch) = self.win_cell_size(id);
         aterm_effects::cursor_fx::follow_live_cursor(
             &mut glow_cfg,
             &mut trail_cfg,
@@ -8462,17 +8744,8 @@ impl App {
         };
         let editable =
             editable && vim_frame.is_some_and(|frame| self.vim_frame_is_current(id, frame));
-        // What the live face lays of each glyph, for the letter guard (a thin face's stems show
-        // the light laid under them): read while the shared face is at this window's cells, the
-        // last reading standing while it is at another's.
-        let glyph_ink = (!self.backend.is_pending()
-            && self.backend.cell_size() == (glow_cw, glow_ch))
-            .then(|| self.backend.glyph_ink())
-            .flatten();
+        self.aos_settle_hold(id, frame_started);
         let ws = self.windows.get_mut(&id)?;
-        if let Some(ink) = glyph_ink {
-            ws.fx.cursor_mut().glow.observe_glyph_ink(Some(ink));
-        }
         ws.fx.cursor_mut().glow.note_composer_entry(vim_entry);
         ws.fx.cursor_mut().glow.note_composer_insert_frame(editable);
         glow_cfg.head_dx = aterm_effects::cursor_fx::head_dx_for(cursor_style);
@@ -8637,6 +8910,7 @@ impl App {
             glow_fp: frame.glow_fp,
             trail_fp: frame.trail_fp,
             block_fill: frame.block_fill,
+            caret_fill: frame.caret_fill(),
             bolt_cursor: frame.bolt_cursor,
             twinkle_cursor: frame.twinkle_cursor,
             momentum_steady: frame.momentum_steady,
@@ -8771,7 +9045,6 @@ impl App {
                     active_cursor_fill,
                     fx_layers: &[],
                     bloom_gate,
-                    pet_veil: cursor_glow.pet_veil(),
                 },
                 clip,
                 cursor_override,
@@ -8794,7 +9067,6 @@ impl App {
                     active_cursor_fill: None,
                     fx_layers: &[],
                     bloom_gate,
-                    pet_veil: &[],
                 },
                 None,
                 cursor_override,
@@ -9241,7 +9513,7 @@ impl App {
             return false;
         };
         let block_fill = fx.block_fill;
-        let active_fill = block_fill.map(|owned| owned.fill);
+        let active_fill = presented_caret_fill(fx.caret_fill, block_fill);
         let body_style_override =
             compose_caret_style_override(fx.bolt_cursor, fx.twinkle_cursor, fx.momentum_steady);
         let Some(window) = self.windows.get_mut(&wid) else {
@@ -9543,6 +9815,7 @@ impl App {
         let mut identity = std::collections::hash_map::DefaultHasher::new();
         for card in [base, host] {
             card.fp.hash(&mut identity);
+            card.serial.hash(&mut identity);
             card.geom.hash(&mut identity);
             card.dx.hash(&mut identity);
             card.dy.hash(&mut identity);
@@ -9615,6 +9888,8 @@ impl App {
             fp,
             geom,
             raster_fingerprint_once: std::sync::OnceLock::new(),
+            serial: crate::app_native_motion::next_card_serial(),
+            delta: None,
         });
         true
     }
@@ -9706,6 +9981,21 @@ impl App {
             .map_or(Some(crate::native_app::DamageRegion::All), |cache| {
                 pending_native_leaf_damage(cache, stamp, width, height)
             });
+        // A paint-only motion frame (§5.1): nothing to compile, and a moving node's frame owed.
+        let motion_at = damage
+            .is_none()
+            .then(|| {
+                let raster = self
+                    .windows
+                    .get(&id)?
+                    .leaf_render_cache
+                    .get(&view)?
+                    .native
+                    .as_ref()
+                    .filter(|raster| raster.motion_tray.is_some())?;
+                self.native_motion_frame_ms(id, raster.motion_ms)
+            })
+            .flatten();
         let holes_before = crate::tray_raster::chrome_text_holes();
         let compiled = if damage.is_some() {
             match self.compiled_native_ui_for(id, instance, view, viewport) {
@@ -9730,6 +10020,7 @@ impl App {
                     viewport,
                     damage,
                     compiled,
+                    motion_ms: self.native_motion_ms(),
                 },
                 (width, height),
                 scale,
@@ -9740,6 +10031,12 @@ impl App {
             true
         } else {
             false
+        };
+        let motion_regions = match (motion_at, cache.native.as_mut()) {
+            (Some(t_ms), Some(raster)) => {
+                raster.paint_motion_frame(t_ms, (page, terminal_theme), scale)
+            }
+            _ => Vec::new(),
         };
         let Some(base_raster) = cache.native.as_ref() else {
             if let Some(window) = self.windows.get_mut(&id) {
@@ -9753,21 +10050,57 @@ impl App {
         let fp = {
             use std::hash::{Hash, Hasher};
             let mut hash = std::collections::hash_map::DefaultHasher::new();
-            compiled.fingerprint().hash(&mut hash);
+            base_raster.compiled_fingerprint().hash(&mut hash);
             overlay_fp.hash(&mut hash);
             stamp.hash(&mut hash);
             hash.finish() | 1
         };
+        // A motion frame hands its rows over in place: the window's card is this raster's
+        // plain copy, so the rows it repainted are copied in and named to the GPU arm, with no
+        // clone of the card and no compile.
+        let card_patched = !leaf_rasterized
+            && !motion_regions.is_empty()
+            && self
+                .windows
+                .get_mut(&id)
+                .and_then(|ws| ws.settings_card.as_mut())
+                .is_some_and(|card| {
+                    let plain = card.serial != 0
+                        && card.serial == base_raster.card_serial
+                        && card.fp == fp
+                        && card.geom == geom
+                        && (card.pw, card.ph) == (base_raster.width, base_raster.height);
+                    if !plain
+                        || !crate::app_native_motion::copy_card_regions(
+                            &mut card.rgba,
+                            &base_raster.rgba,
+                            card.pw,
+                            &motion_regions,
+                        )
+                    {
+                        return false;
+                    }
+                    let since = card.serial;
+                    card.serial = crate::app_native_motion::next_card_serial();
+                    card.delta = crate::app_native_motion::rows_of(&motion_regions)
+                        .map(|rows| aterm_gpu::TrayDelta { since, rows });
+                    card.raster_fingerprint_once.take();
+                    true
+                });
         let should_raster = leaf_rasterized
+            || (!motion_regions.is_empty() && !card_patched)
             || self.windows.get(&id).is_some_and(|ws| {
                 ws.settings_card
                     .as_ref()
                     .is_none_or(|card| card.fp != fp || card.geom != geom)
             });
+        let motion_only = card_patched && !should_raster;
+        // The card, and whether it is the raster's plain copy (a motion frame patches only that).
         let raster = should_raster.then(|| {
             let mut prims = Vec::new();
             if self.append_native_modal_prims(id, &mut prims, pad as f32 / scale, Some(plan)) {
-                let mut tray = compiled.tray_with_chrome(page, terminal_theme, 13.0);
+                let mut tray =
+                    compiled.tray_with_chrome(page, terminal_theme, 13.0, base_raster.motion_ms);
                 tray.prims.extend(prims);
                 (
                     crate::tray_raster::rasterize_tray_pixels(
@@ -9779,9 +10112,10 @@ impl App {
                     ),
                     width,
                     height,
+                    false,
                 )
             } else {
-                (base_raster.rgba.clone(), width, height)
+                (base_raster.rgba.clone(), width, height, true)
             }
         });
 
@@ -9827,15 +10161,27 @@ impl App {
                 compiled: compiled.clone(),
             });
         }
+        let card_serial = match (&raster, ws.settings_card.as_ref()) {
+            (Some(_), _) => crate::app_native_motion::next_card_serial(),
+            (None, Some(card)) => card.serial,
+            (None, None) => 0,
+        };
         if let Some(native) = cache.native.as_mut() {
             if native.presented_x != 0 || native.presented_y != 0 {
                 native.presented = false;
             }
             native.presented_x = 0;
             native.presented_y = 0;
+            match &raster {
+                Some((_, _, _, plain)) => {
+                    native.card_serial = if *plain { card_serial } else { 0 };
+                }
+                None if card_patched => native.card_serial = card_serial,
+                None => {}
+            }
         }
         ws.leaf_render_cache.insert(view, cache);
-        if let Some((rgba, pw, ph)) = raster {
+        if let Some((rgba, pw, ph, _)) = raster {
             ws.settings_card = Some(crate::SettingsCard {
                 scrim: None,
                 rgba,
@@ -9846,13 +10192,19 @@ impl App {
                 fp,
                 geom,
                 raster_fingerprint_once: std::sync::OnceLock::new(),
+                serial: card_serial,
+                delta: None,
             });
         }
         self.splice_tab_strip_with(id, tab_strip);
+        // A motion frame changes nothing a person can hear (a moving node is paint only), so it
+        // stages no accessibility; the window's push reads the tree it already holds.
         #[cfg(a11y_tree)]
-        if !overlay_open {
+        if !overlay_open && !motion_only {
             self.stage_native_accessibility(id, view, plan);
         }
+        #[cfg(not(a11y_tree))]
+        let _ = motion_only;
         true
     }
 
@@ -10043,6 +10395,10 @@ impl App {
             .checked_mul(usize::try_from(height).ok()?)?
             .checked_mul(4)?;
         let mut pending_blits: Vec<(crate::tab_model::ViewId, u32, u32)> = Vec::new();
+        let mut motion_patches: Vec<(
+            crate::tab_model::ViewId,
+            Vec<crate::tray_raster::RasterRect>,
+        )> = Vec::new();
         let mut any_leaf_rasterized = false;
         let mut modal_native_prims = Vec::new();
         let mut native_fp = std::collections::hash_map::DefaultHasher::new();
@@ -10457,6 +10813,21 @@ impl App {
                             holes_before,
                         );
                         any_leaf_rasterized = true;
+                    } else if let Some(t_ms) = cache
+                        .native
+                        .as_ref()
+                        .filter(|raster| raster.motion_tray.is_some())
+                        .and_then(|raster| self.native_motion_frame_ms(id, raster.motion_ms))
+                    {
+                        // A paint-only motion frame of this leaf (§5.1): its card rows are
+                        // re-blended below where the card is reused.
+                        let palette = (self.chrome_palette(ChromeSurface::NativePage), self.theme);
+                        if let Some(raster) = cache.native.as_mut() {
+                            let regions = raster.paint_motion_frame(t_ms, palette, scale);
+                            if !regions.is_empty() {
+                                motion_patches.push((leaf.view, regions));
+                            }
+                        }
                     }
                     // What the raster holds: the faces it painted with, where its paint parsed one.
                     let stamp = cache.native.as_ref().map_or(stamp, |raster| raster.stamp);
@@ -10474,7 +10845,7 @@ impl App {
                         abandoned = true;
                         break;
                     };
-                    raster.compiled.fingerprint().hash(&mut native_fp);
+                    raster.compiled_fingerprint().hash(&mut native_fp);
                     pending_blits.push((leaf.view, x, y));
                     if overlay_open {
                         let logical_x = x as f32 / scale;
@@ -10489,6 +10860,7 @@ impl App {
                             self.chrome_palette(ChromeSurface::NativePage),
                             self.theme,
                             13.0,
+                            raster.motion_ms,
                         );
                         crate::widget::translate_prims(&mut tray.prims, logical_x, logical_y);
                         modal_native_prims.extend(tray.prims);
@@ -10570,6 +10942,49 @@ impl App {
                     card.fp == fp && card.geom == geom && card.pw == width && card.ph == height
                 })
             });
+        // A reused card takes the leaves' motion frames in place: each moved rect blended again
+        // from its leaf's raster, as the full blit below would blend it.
+        if reuse
+            && !motion_patches.is_empty()
+            && let Some(window) = self.windows.get_mut(&id)
+            && let Some(card) = window.settings_card.as_mut()
+        {
+            let mut rows: Option<(u32, u32)> = None;
+            for (view, regions) in &motion_patches {
+                let Some(&(_, x, y)) = pending_blits.iter().find(|(blit, _, _)| blit == view)
+                else {
+                    continue;
+                };
+                let Some(raster) = window
+                    .leaf_render_cache
+                    .get(view)
+                    .and_then(|cache| cache.native.as_ref())
+                else {
+                    continue;
+                };
+                for region in regions {
+                    if let Some(band) = reblend_rgba_region(
+                        &mut card.rgba,
+                        (card.pw, card.ph),
+                        &raster.rgba,
+                        (raster.width, raster.height),
+                        (x, y),
+                        *region,
+                    ) {
+                        rows =
+                            Some(rows.map_or(band, |(top, bottom)| {
+                                (top.min(band.0), bottom.max(band.1))
+                            }));
+                    }
+                }
+            }
+            let since = card.serial;
+            card.serial = crate::app_native_motion::next_card_serial();
+            card.delta = rows
+                .filter(|_| since != 0)
+                .map(|rows| aterm_gpu::TrayDelta { since, rows });
+            card.raster_fingerprint_once.take();
+        }
         let native_layer = if reuse {
             None
         } else if overlay_open {
@@ -10625,6 +11040,8 @@ impl App {
                         fp,
                         geom,
                         raster_fingerprint_once: std::sync::OnceLock::new(),
+                        serial: crate::app_native_motion::next_card_serial(),
+                        delta: None,
                     });
                 }
                 None => {
@@ -10874,6 +11291,7 @@ impl App {
             SuccessfulPresentRoute::Terminal,
             visible_route,
             visuals,
+            None,
             &plan,
         );
     }
@@ -10888,6 +11306,7 @@ impl App {
         route: SuccessfulPresentRoute,
         visible_route: crate::VisibleContentRoute,
         visuals: HostVisualState,
+        lens_input: Option<crate::stats_lens::LensPaintReceipt>,
         presented_plan: &crate::tab_model::VisibleLeafPlan,
     ) {
         let frame_started = startup_timing.frame_started();
@@ -11019,6 +11438,15 @@ impl App {
 
         let present_latency_ns = self.present_latency_ns_with_plan(id, presented_plan);
         let capture_forced = self.capture_barrier == Some(id);
+        let lens_visible = window.is_some()
+            && self.windows.get(&id).is_some_and(|state| {
+                !state.occluded
+                    && matches!(
+                        state.present,
+                        Some(PresentTarget::Cpu { .. } | PresentTarget::Gpu { .. })
+                    )
+            });
+        self.stats_lens_presented(id, lens_input, lens_visible, capture_forced);
         metrics::record_present(
             present_latency_ns,
             render_ns,
@@ -11027,6 +11455,7 @@ impl App {
             &mut self.present_observer,
             capture_forced,
         );
+        self.note_deck_present(id, frame_started, presented_at, acquire_wait_ns);
         self.rewind_presented(id);
 
         #[cfg(windows)]
@@ -11381,6 +11810,7 @@ impl App {
             SuccessfulPresentRoute::Heterogeneous,
             crate::VisibleContentRoute::Heterogeneous,
             visuals,
+            composed.lens_input,
             plan,
         );
     }
@@ -11445,6 +11875,7 @@ impl App {
             },
             crate::VisibleContentRoute::Native { instance, view },
             visuals,
+            composed.lens_input,
             plan,
         );
     }
@@ -12029,6 +12460,7 @@ impl App {
                 glow_fp,
                 trail_fp,
                 block_fill,
+                caret_fill,
                 bolt_cursor,
                 twinkle_cursor,
                 momentum_steady,
@@ -12709,6 +13141,8 @@ impl App {
                 && !ws.pred_shown
                 && ws.fx_prefetch_pending.is_empty()
             {
+                // The frame laid the deck out where its clock asked and proved it unchanged.
+                ws.deck_clock.served();
                 metrics::note_redraw_early_out();
                 ws.redraws_proved_unchanged = ws.redraws_proved_unchanged.wrapping_add(1);
                 self.discard_unpresented_output_stamps_from_plan(plan, frame_started);
@@ -12717,6 +13151,39 @@ impl App {
                 }
                 return;
             }
+            // A frame whose key moved by the deck's alone is the last frame with the deck's new
+            // tray: an overlay-only present shows it, where the renderer can (design §3.3).
+            let deck_only = !deco_rescan
+                && !rain_refresh
+                && !ws.present_retry.recovery_redraw_outstanding
+                && !ws.predictor.is_displaying(frame_started)
+                && !ws.pred_shown
+                && ws.fx_prefetch_pending.is_empty()
+                && last_present.is_some_and(|last| {
+                    RepaintKey {
+                        deck_fp: key.deck_fp,
+                        ..last
+                    } == key
+                });
+            if deck_only {
+                ws.stamp_present_decision(key);
+                if let Some(shown) =
+                    self.present_deck_overlay(id, visuals.invert, visuals.overlay, frame_started)
+                {
+                    self.finish_deck_overlay(
+                        id,
+                        shown,
+                        frame_started,
+                        window.as_ref(),
+                        &title,
+                        (route, visuals, plan),
+                    );
+                    return;
+                }
+            }
+            let Some(ws) = self.windows.get_mut(&id) else {
+                return;
+            };
             if let Some((pmode, editing)) = single_pane_pred_mode {
                 if pmode == crate::predict::PredictMode::Off {
                     ws.predictor.reset();
@@ -12771,8 +13238,10 @@ impl App {
                     &mut ws.input_scratch.glow_halo,
                 );
             }
-            ws.input_scratch.cursor_fill_override =
-                window_cursor_fill(cursor_override, block_fill.map(|owned| owned.fill));
+            ws.input_scratch.cursor_fill_override = window_cursor_fill(
+                cursor_override,
+                presented_caret_fill(caret_fill, block_fill),
+            );
             ws.input_scratch.input_hot = ws.input_hot;
             ws.input_scratch.cursor_trail_color = trail_color;
             ws.block_fill = presented_block_fill(
@@ -12899,6 +13368,7 @@ impl App {
             SuccessfulPresentRoute::Terminal,
             route,
             visuals,
+            composed.lens_input,
             plan,
         );
     }
@@ -13356,6 +13826,261 @@ impl App {
         result
     }
 
+    /// Leave the deck, the lens and the card on top to the renderer as one tray stack where it
+    /// folds them itself (`docs/DESIGN-stats-deck-gpu-motion-2026-10-26.md` §3.3), else fold
+    /// them on the CPU ([`Self::fold_stats_deck`]), as the backends other than Metal's take one
+    /// tray card.
+    pub(crate) fn stack_or_fold_stats_deck(&mut self, wid: WindowId) {
+        let stacked = self.backend.gpu_mut().is_some_and(|gpu| {
+            gpu.set_tray_prim_law(crate::tray_raster::gpu_prims::tray_prim_law());
+            gpu.tray_stack_supported()
+        });
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.tray_stacked = stacked;
+            if stacked {
+                ws.deck_fold = None;
+            }
+        }
+        if !stacked {
+            self.fold_stats_deck(wid);
+        }
+    }
+
+    /// An **overlay-only present** of window `id` (design §3.3), for a frame whose only change
+    /// since the last present is the deck's: the deck's cards are composed alone, and the
+    /// renderer shows the frame it last presented again under their new tray. The rest of the
+    /// frame is left uncomposed, as a redraw that proves its frame unchanged leaves it. `None`
+    /// where the renderer refuses ([`aterm_gpu::OverlayRefusal`]): the caller then redraws in
+    /// full, and the deck's change rides along. Otherwise the main-thread time from the redraw's
+    /// entry (`frame_started`) to the present, and the present's result, as
+    /// [`Self::present_input_scratch`]'s.
+    fn present_deck_overlay(
+        &mut self,
+        id: WindowId,
+        invert: bool,
+        overlay: Option<OverlayGlow>,
+        frame_started: Instant,
+    ) -> Option<(u64, Result<Option<u64>, metrics::PresentDropReason>)> {
+        if !self
+            .backend
+            .gpu_mut()
+            .is_some_and(aterm_gpu::GpuRenderer::presents_overlay_only)
+        {
+            return None;
+        }
+        self.splice_stats_deck(id);
+        self.stack_or_fold_stats_deck(id);
+        let tray_floor_y = self.paste_banner_tray_floor_y(id);
+        let app_frame_interval = self.frame_interval;
+        let App {
+            backend, windows, ..
+        } = self;
+        let ws = windows.get_mut(&id)?;
+        let (input_rows, input_cols) = (ws.input_scratch.rows, ws.input_scratch.cols);
+        let (visible_width, visible_height) = backend.frame_size(input_rows, input_cols);
+        let destination_height = ws
+            .win_px
+            .map_or_else(|| visible_height, |size| size.height.max(1) as usize);
+        let source_crop_top =
+            backend.configure_gpu_visible_y(input_rows, input_cols, destination_height);
+        let present_crop = aterm_gpu::PresentCrop {
+            source_y: u32::try_from(source_crop_top).unwrap_or(u32::MAX),
+            height: u32::try_from(visible_height).unwrap_or(u32::MAX),
+        };
+        // A refusal leaves the deck's stamp for the full present that follows.
+        let motion = ws.deck_motion.clone();
+        let deck_stamp = deck_tray_stamp(ws);
+        let deck_target_ns = deck_stamp
+            .filter(|&(generation, dirty)| dirty.is_none_or(|d| d.since != generation))
+            .and(ws.deck_clock.asked_target())
+            .and_then(aterm_gpu::present_glass::media_ns_of);
+        let top_card = ws
+            .route_card
+            .as_ref()
+            .or(ws.settings_card.as_ref())
+            .or(ws.badge_card.as_ref());
+        let mut tray_layers = Vec::new();
+        let tray = present_tray_quad(
+            crate::tray_stack_of(
+                ws.tray_stacked,
+                ws.deck_card.as_ref(),
+                ws.lens_card.as_ref(),
+                top_card,
+            ),
+            ws.deck_fold.as_ref().or(top_card).or(ws.deck_card.as_ref()),
+            deck_stamp,
+            tray_floor_y,
+            u32::try_from(source_crop_top).unwrap_or(u32::MAX),
+            &mut tray_layers,
+        );
+        let gpu_overlay = overlay.map(|g| aterm_gpu::DropOverlay {
+            accent: g.accent,
+            wash_a: g.wash_a,
+            border_a: g.border_a,
+            border_scale_q4: g.border_scale_q4,
+        });
+        let present_interval_ns =
+            u64::try_from(ws.frame_interval.unwrap_or(app_frame_interval).as_nanos())
+                .unwrap_or(u64::MAX);
+        let present_hot = ws.input_hot;
+        let prev_registered_ns = ws.last_registration_ns;
+        let mut pending_surface = None;
+        let compose_ns = u64::try_from(frame_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let presented = match (backend.gpu_mut(), ws.present.as_mut()) {
+            (
+                Some(gpu),
+                Some(PresentTarget::Gpu {
+                    gpu_surface,
+                    window_gpu,
+                }),
+            ) => {
+                aterm_gpu::present_glass::arm_deck_target(deck_target_ns);
+                aterm_gpu::present_glass::arm_present(aterm_gpu::present_glass::ArmedPresent {
+                    input_hot: present_hot,
+                    occluded: window_gpu.occluded_hint(),
+                    interval_ns: present_interval_ns,
+                    prev_registered_ns,
+                });
+                let result = gpu.present_overlay(
+                    window_gpu,
+                    gpu_surface,
+                    invert,
+                    gpu_overlay,
+                    tray,
+                    Some(present_crop),
+                );
+                // A present refused or failed before it registered leaves no deck target armed
+                // for the next window's.
+                aterm_gpu::present_glass::arm_deck_target(None);
+                result.ok().map(|result| {
+                    if let Some(parked_ns) = window_gpu.take_gpu_park_sample_ns() {
+                        metrics::note_gpu_park(parked_ns);
+                    }
+                    if let Some(queued_ns) = window_gpu.take_acquire_queue_sample_ns() {
+                        metrics::note_acquire_queue(queued_ns);
+                    }
+                    let reported = report_gpu_surface_present(
+                        result,
+                        window_gpu.take_acquire_wait_sample_ns(),
+                        metrics::note_acquire_wait,
+                    );
+                    if matches!(reported, Ok(None)) {
+                        pending_surface = Some(gpu_surface.acquire_id());
+                    }
+                    reported.map(|presented| {
+                        presented.map(|()| {
+                            metrics::note_gpu_frame(
+                                gpu.frame_shape(),
+                                window_gpu.last_present_encode_ns(),
+                            );
+                            window_gpu.last_present_work_ns()
+                        })
+                    })
+                })
+            }
+            (Some(gpu), Some(PresentTarget::Virtual { window_gpu })) => gpu
+                .present_overlay_virtual(
+                    window_gpu,
+                    invert,
+                    gpu_overlay,
+                    tray,
+                    Some(present_crop),
+                    (
+                        u32::try_from(visible_width).unwrap_or(u32::MAX),
+                        u32::try_from(visible_height).unwrap_or(u32::MAX),
+                    ),
+                )
+                .ok()
+                .map(|shown| {
+                    if shown {
+                        metrics::note_gpu_frame(
+                            gpu.frame_shape(),
+                            window_gpu.last_present_encode_ns(),
+                        );
+                        Ok(Some(window_gpu.last_present_work_ns()))
+                    } else {
+                        Err(metrics::PresentDropReason::Virtual)
+                    }
+                }),
+            _ => None,
+        };
+        metrics::note_overlay_present(presented.is_some());
+        let Some(presented) = presented else {
+            ws.deck_motion = motion;
+            return None;
+        };
+        metrics::note_pre_present(compose_ns);
+        if matches!(presented, Ok(Some(_))) {
+            ws.capture_present_frame = Some((
+                u32::try_from(visible_width).unwrap_or(u32::MAX),
+                u32::try_from(visible_height).unwrap_or(u32::MAX),
+            ));
+        }
+        if let Some(surface) = pending_surface {
+            ws.on_gpu_acquire_pending(surface);
+        }
+        if let Some(gpu) = backend.gpu_mut() {
+            metrics::note_gpu_repaint_totals(
+                gpu.scissor_taken(),
+                gpu.full_repaints(),
+                gpu.scroll_rescues(),
+            );
+        }
+        if matches!(presented, Ok(Some(_)))
+            && let Some(window) = self.windows.get(&id).and_then(|ws| ws.os_window.as_ref())
+        {
+            self.apprt.window_frame_presented(window);
+        }
+        Some((compose_ns, presented))
+    }
+
+    /// Book an overlay-only present ([`Self::present_deck_overlay`]) as the full redraw books
+    /// its present, after the early-out's own bookkeeping: what the frame proved unchanged is
+    /// not presented again.
+    fn finish_deck_overlay(
+        &mut self,
+        id: WindowId,
+        (compose_ns, result): (u64, Result<Option<u64>, metrics::PresentDropReason>),
+        frame_started: Instant,
+        window: Option<&Arc<Window>>,
+        title: &Arc<str>,
+        (route, visuals, plan): (
+            crate::VisibleContentRoute,
+            HostVisualState,
+            &crate::tab_model::VisibleLeafPlan,
+        ),
+    ) {
+        // The lens this present showed, as a composition's receipt says it
+        // (`App::stats_lens_input_receipt`): the tray it carried was spliced and stacked
+        // or folded just before it.
+        let lens_input = self.stats_lens_input_receipt(id);
+        self.discard_unpresented_output_stamps_from_plan(plan, frame_started);
+        if let Some(w) = window {
+            self.apply_title(id, w, title);
+        }
+        let raster_submit_ns = match result {
+            Ok(None) => return,
+            Ok(Some(work_ns)) => work_ns,
+            Err(reason) => {
+                self.handle_failed_present(id, reason, frame_started);
+                return;
+            }
+        };
+        let render_ns = causal_render_cost_ns(compose_ns, raster_submit_ns)
+            .saturating_add(self.gpu_backpressure_ns(id));
+        self.finalize_successful_present(
+            id,
+            metrics::StartupPresentTiming::finish(frame_started, None),
+            render_ns,
+            window,
+            SuccessfulPresentRoute::Terminal,
+            route,
+            visuals,
+            lens_input,
+            plan,
+        );
+    }
+
     fn present_input_scratch_inner(
         &mut self,
         id: WindowId,
@@ -13387,22 +14112,32 @@ impl App {
                 source_y: u32::try_from(source_crop_top).unwrap_or(u32::MAX),
                 height: u32::try_from(visible_height).unwrap_or(u32::MAX),
             };
-            let tray_arg = ws
-                .deck_fold
+            let deck_stamp = deck_tray_stamp(ws);
+            // A present that shows a deck frame its clock's tick asked carries the tick's vsync,
+            // so its `presentedTime` books `deck_glass_late`.
+            let deck_target_ns = deck_stamp
+                .filter(|&(generation, dirty)| dirty.is_none_or(|d| d.since != generation))
+                .and(ws.deck_clock.asked_target())
+                .and_then(aterm_gpu::present_glass::media_ns_of);
+            let top_card = ws
+                .route_card
                 .as_ref()
-                .or(ws.route_card.as_ref())
                 .or(ws.settings_card.as_ref())
-                .or(ws.badge_card.as_ref())
-                .or(ws.deck_card.as_ref())
-                .and_then(|card| tray_quad_below_y(card, tray_floor_y))
-                .map(|mut quad| {
-                    let crop = u32::try_from(source_crop_top).unwrap_or(u32::MAX);
-                    quad.dy = quad.dy.saturating_add(crop);
-                    if let Some(scrim) = quad.scrim.as_mut() {
-                        scrim.top = scrim.top.saturating_add(crop);
-                    }
-                    quad
-                });
+                .or(ws.badge_card.as_ref());
+            let mut tray_layers = Vec::new();
+            let tray_arg = present_tray_quad(
+                crate::tray_stack_of(
+                    ws.tray_stacked,
+                    ws.deck_card.as_ref(),
+                    ws.lens_card.as_ref(),
+                    top_card,
+                ),
+                ws.deck_fold.as_ref().or(top_card).or(ws.deck_card.as_ref()),
+                deck_stamp,
+                tray_floor_y,
+                u32::try_from(source_crop_top).unwrap_or(u32::MAX),
+                &mut tray_layers,
+            );
             let gpu_overlay = overlay.map(|g| aterm_gpu::DropOverlay {
                 accent: g.accent,
                 wash_a: g.wash_a,
@@ -13433,6 +14168,7 @@ impl App {
                         window_gpu,
                     }),
                 ) => {
+                    aterm_gpu::present_glass::arm_deck_target(deck_target_ns);
                     aterm_gpu::present_glass::arm_present(aterm_gpu::present_glass::ArmedPresent {
                         input_hot: present_hot,
                         occluded: window_gpu.occluded_hint(),
@@ -13449,6 +14185,7 @@ impl App {
                         present_crop,
                         effects_transport_shift_y,
                     );
+                    aterm_gpu::present_glass::arm_deck_target(None);
                     if let Some(parked_ns) = window_gpu.take_gpu_park_sample_ns() {
                         metrics::note_gpu_park(parked_ns);
                     }
@@ -15734,7 +16471,7 @@ impl App {
         let glow_fp = fx.glow_fp;
         let trail_fp = fx.trail_fp;
         let block_fill = fx.block_fill;
-        let active_cursor_fill = block_fill.map(|owned| owned.fill);
+        let active_cursor_fill = presented_caret_fill(fx.caret_fill, block_fill);
         let body_style_override =
             compose_caret_style_override(fx.bolt_cursor, fx.twinkle_cursor, fx.momentum_steady);
         let focused = fx.win_focused;
@@ -16407,7 +17144,6 @@ impl App {
                 active_cursor_fill,
                 fx_layers: &[],
                 bloom_gate: cursor_fx.bloom_gate(),
-                pet_veil: &[],
             },
             pane_clip,
             cursor_override,
@@ -16424,18 +17160,7 @@ impl App {
         ws.composed_cursor_style_override = body_style_override;
         ws.composed_cursor_trail_color = trail_color;
         ws.fx.publish_rain(&mut ws.input_scratch);
-        let under_from = ws.input_scratch.glow_under.len();
         ws.fx.publish_words(&mut ws.input_scratch);
-        // The pet's veil the word publish laid keeps to the focused pane as
-        // the trail's streams do, and goes where they were withdrawn.
-        match &pane_clip {
-            Some(clip) => clip_glow_stream(
-                &mut ws.input_scratch.glow_under,
-                &mut ws.input_scratch.glow_under_ramps,
-                clip,
-            ),
-            None => ws.input_scratch.glow_under.truncate(under_from),
-        }
         if let Some((pr, pc)) = focus_pred_cursor {
             ws.input_scratch.cursor_row = focus_off.0 as usize + usize::from(pr);
             ws.input_scratch.cursor_col =
@@ -17761,6 +18486,8 @@ impl App {
                 fp,
                 geom: geom_key,
                 raster_fingerprint_once: std::sync::OnceLock::new(),
+                serial: 0,
+                delta: None,
             });
         }
         ws.input_scratch.cursor_visible = false;
@@ -17822,6 +18549,7 @@ impl App {
             pad_top.hash(&mut h);
             head.hash(&mut h); // the dy anchor moves with the chrome headroom
             strip_dy.hash(&mut h); // …and with the strip's rows where it clears them
+            ws.scale.to_bits().hash(&mut h); // its type floor, radius cap and border are points
             palette.hash(&mut h);
             h.finish()
         };
@@ -17868,6 +18596,8 @@ impl App {
                 fp,
                 geom: geom_key,
                 raster_fingerprint_once: std::sync::OnceLock::new(),
+                serial: 0,
+                delta: None,
             });
         }
     }
@@ -18991,14 +19721,6 @@ mod split_sparkle_tests;
 mod rain_host_tests;
 
 #[cfg(test)]
-#[path = "app_render_message_band_visual_tests.rs"]
-mod message_band_visual_tests;
-
-#[cfg(test)]
-#[path = "app_render_message_band_raster_tests.rs"]
-mod message_band_raster_tests;
-
-#[cfg(test)]
 #[path = "app_render_tone_melody_seam_tests.rs"]
 mod tone_melody_seam_tests;
 
@@ -19318,6 +20040,7 @@ mod native_ime_anchor_tests {
                 },
                 crate::VisibleContentRoute::Native { instance, view },
                 HostVisualState::default(),
+                None,
                 &plan,
             );
             let (x, y, w, h) = app.windows[&wid].last_ime_rect.expect("native IME anchor");
@@ -19574,35 +20297,6 @@ mod prediction_input_tests;
 #[cfg(test)]
 #[path = "app_render_licence_fence_tests.rs"]
 mod licence_fence_tests;
-
-#[cfg(test)]
-mod effects_rise_allowance_tests {
-    #[test]
-    fn no_rise_allowance_over_the_message_band() {
-        let mut app = crate::App::headless_for_test();
-        let wid = crate::WindowId(0);
-        app.backend.set_head(40);
-        let (rows, cols) = (
-            usize::from(app.windows[&wid].rows),
-            usize::from(app.windows[&wid].cols),
-        );
-        let ch = app.win_cell_size(wid).1;
-        let head = app.win_head(wid);
-        assert!(head > 0, "the fixture has a head band");
-        assert_eq!(app.chrome_rows(wid), 0);
-        let (_, y0, _, _, rise0) = app.effects_origin_win(wid, rows, cols, ch);
-        assert_eq!(usize::from(rise0), head, "no chrome: the head is rise room");
-        app.post_message(aterm_messages::Message::new(
-            aterm_messages::tags::CONFIG,
-            aterm_messages::Severity::Warn,
-            "Misspelled setting",
-        ));
-        assert_eq!(app.message_band_rows, 1);
-        let (_, y1, _, _, rise1) = app.effects_origin_win(wid, rows, cols, ch);
-        assert_eq!(usize::from(y1), usize::from(y0) + ch, "the band's row");
-        assert_eq!(rise1, 0, "no rise over the band");
-    }
-}
 
 #[cfg(test)]
 mod rain_latch_without_engine_tests {

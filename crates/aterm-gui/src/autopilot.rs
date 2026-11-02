@@ -71,7 +71,7 @@ pub(crate) const fn agent_switch_off(agent: aterm_phase::Program) -> &'static st
     use aterm_phase::Program;
     match agent {
         Program::Claude => "Supervise Claude Code sessions is off",
-        Program::Codex => "Watch codex-alab sessions is off",
+        Program::Codex => "Enable codex-alab Autopilot is off",
         Program::Agy => "Supervise Antigravity CLI sessions is off",
         Program::Muse => "Supervise Muse Code sessions is off",
         Program::Grok | Program::Kimi | Program::Generic => "Supervise the program sessions is off",
@@ -301,7 +301,7 @@ impl AutopilotView {
                 }
                 let off: &str = match agent {
                     Program::Claude => agent_off!("Supervise Claude Code sessions"),
-                    Program::Codex => agent_off!("Watch codex-alab sessions"),
+                    Program::Codex => agent_off!("Enable codex-alab Autopilot"),
                     Program::Agy => agent_off!("Supervise Antigravity CLI sessions"),
                     Program::Muse => agent_off!("Supervise Muse Code sessions"),
                     Program::Grok | Program::Kimi | Program::Generic => {
@@ -1416,7 +1416,7 @@ mod tests {
         }
         assert_eq!(
             agent_switch_off(Program::Codex),
-            "Watch codex-alab sessions is off"
+            "Enable codex-alab Autopilot is off"
         );
         let mut codes: Vec<u64> = AutopilotView::ALL.iter().map(|v| v.code()).collect();
         codes.extend(Program::ALL.map(|p| AutopilotView::AgentOff(p).code()));

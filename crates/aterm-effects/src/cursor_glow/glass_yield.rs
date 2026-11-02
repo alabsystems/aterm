@@ -4,8 +4,8 @@
 //! The yield (`docs/design/PRISM-GLASS.md` §4, §15.2 1.9): app colour wins over the light glass.
 //!
 //! The glass is solved so the theme fg keeps its bar at every alpha; an app's own ink is not.
-//! After the frame's word pass ([`GlassYield::apply`], called by
-//! `EffectsPipeline::yield_glass`), each word of the glass's rows takes a cap `k`: the least,
+//! After the frame's word pass (`EffectsPipeline::yield_glass`, through
+//! [`CursorGlow::yield_glass`]), each word of the glass's rows takes a cap `k`: the least,
 //! over its inks and the glass laid under it, of the largest alpha at which the ink keeps
 //! [`YIELD_BAR`] at every lower alpha ([`cap`]); a cap under [`K_MIN`] is `0`. The glass in the
 //! word's cells is scaled by `k / 255`, so it lies at whole strength, at a strength the ink
@@ -25,15 +25,30 @@
 //!
 //! A scaled end whose alpha rounds to `0` carries no colour ([`scale_end`]): it would draw as an
 //! additive light.
+//!
+//! That is the colour law ([`GlassYield::apply`]), every glyph's ink judged solid; the hosts'
+//! yield keeps it while the glow holds no glyph table. Once a host has observed one
+//! ([`CursorGlow::observe_glyph_ink`]) the yield is strict: each glyph, theme-fg ones too, is
+//! judged by its raster in the frame's own evidence ([`GlyphInk::for_frame`]), its solid pixels
+//! and core keeping their bars as the renderer blends text, and a word holding a glyph no
+//! evidence vouches for takes `0`. A measured theme-fg glyph stays plain for rule 5b, and one
+//! under `255` bounds an orphan run as a word does. A strict cap is then stepped down until the
+//! gradient the lay publishes at it, which rounds apart from the scaled composites, keeps every
+//! judged glyph's bars.
+//!
+//! [`CursorGlow::yield_glass`]: super::CursorGlow::yield_glass
+//! [`CursorGlow::observe_glyph_ink`]: super::CursorGlow::observe_glyph_ink
 
 use aterm_core::render::{GlowEnd, GlowQuad, GlowRamp, GlowRamps, Laid, RenderInput};
 use aterm_core::terminal::UnderlineStyle;
 use aterm_hash::FxHashMap;
+use aterm_render::glyph_ink::{FrameGlyphInk, GlyphInkEpoch};
 use aterm_render::sprites::{FreeSprite, FreeZ};
+use aterm_render::{GlyphCoverage, GlyphInk, GlyphKey};
 use aterm_time::Instant;
 
-/// The bar an app's ink keeps over the glass: the glass's own ([`GLASS_BAR`], 5.25:1), the
-/// `bar` of §4's seam and §15.2 1.9's rules.
+/// The bar an app's ink keeps over the glass: the glass's own ([`GLASS_BAR`], 5.25:1, on the
+/// glyph as it is seen), the `bar` of §4's seam and §15.2 1.9's rules.
 ///
 /// [`GLASS_BAR`]: crate::rainbow_kitty::prism_glass::GLASS_BAR
 pub const YIELD_BAR: f64 = crate::rainbow_kitty::prism_glass::GLASS_BAR;
@@ -162,6 +177,47 @@ impl GlassLaid {
     }
 }
 
+/// Remove only `glass` from its actual pre-yield publication, preserving every other light.
+/// The temporary all-cell selection is restored before the returned input can be rendered.
+///
+/// # Panics
+/// Panics if the temporary selection does not cover every materialized cell and grid column.
+#[cfg(any(test, debug_assertions))]
+#[must_use]
+pub fn without_body_glass_for_test(input: &RenderInput, glass: &GlassLaid) -> RenderInput {
+    use aterm_core::selection::{SelectionSide, SelectionType};
+
+    let mut twin = input.clone();
+    let saved = (
+        std::mem::take(&mut twin.selection),
+        twin.selection_clip.take(),
+        twin.selection_bg,
+        twin.selection_fg,
+        std::mem::take(&mut twin.selections),
+    );
+    twin.selection
+        .start_selection(i32::MIN, 0, SelectionSide::Left, SelectionType::Simple);
+    twin.selection
+        .update_selection(i32::MAX, u16::MAX, SelectionSide::Right);
+    twin.selection.complete_selection();
+    assert!(
+        twin.cells.iter().enumerate().all(|(row, cells)| {
+            (0..cells.len().max(twin.cols))
+                .all(|col| twin.selection_hit(row, col, false, false).is_some())
+        }),
+        "the ablation selects every possible body-glass cell"
+    );
+    let _ = GlassYield::default().apply(&mut twin, glass, &[]);
+    (
+        twin.selection,
+        twin.selection_clip,
+        twin.selection_bg,
+        twin.selection_fg,
+        twin.selections,
+    ) = saved;
+    twin
+}
+
 /// What a yield cut.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct YieldReport {
@@ -201,6 +257,12 @@ enum Class {
 }
 
 impl Class {
+    /// Strict observation measures theme ink too, while retaining its plain-run
+    /// classification for rule 5b after that measurement.
+    const fn needs_cap(self, strict: bool) -> bool {
+        matches!(self, Self::Ink(_)) || strict && matches!(self, Self::Fg)
+    }
+
     /// Whether the cell is a word's glyph the yield caps (rules 3 and 4): another ink, or one
     /// the word pass animates. A rule-1 ground (`Forced`) is no word: rule 5b's orphan runs are
     /// bounded by words and the caret alone.
@@ -256,6 +318,12 @@ pub struct GlassYield {
     /// Caps by `(ink, glass composite)` on [`Self::memo_page`].
     memo: FxHashMap<(u32, u32), u8>,
     memo_page: u32,
+    memo_fg: u32,
+    observed_caps: FxHashMap<(GlyphKey, u32, u32, u8), u8>,
+    judges: FxHashMap<(GlyphKey, u32), Option<GlyphJudge>>,
+    /// The judges' levels, shared across glyphs and kept across glyph epochs.
+    level_tables: LevelTables,
+    observed_epoch: Option<GlyphInkEpoch>,
     seq_in: Vec<Piece>,
     seq_rec: Vec<Piece>,
     /// Whether each piece of the input stream (by its place in [`Self::seq_in`]) is glass,
@@ -269,7 +337,7 @@ pub struct GlassYield {
     ks: Vec<u8>,
     inks: Vec<u32>,
     sprites: Vec<(i32, i32, i32, i32)>,
-    composites: Vec<u32>,
+    composites: Vec<(u32, u8)>,
     /// A ramp's rows' distinct ends, for [`Self::word_cap`].
     row_ends: Vec<(GlowEnd, GlowEnd)>,
     knots: Vec<i32>,
@@ -277,14 +345,292 @@ pub struct GlassYield {
     out_ramps: GlowRamps,
 }
 
-/// Push to `out` the composite on `page` of each pixel of a light `(x, w)` with premultiplied
-/// ends `(e0, e1)` that lies in `[wx0, wx1)`, a pixel of no light none.
+/// The actual raster pixels that the two existing judges read, with their own
+/// clean-page bars. Alpha bytes are retained so every candidate is blended by
+/// the renderer's exact text operation rather than an assumed full ink.
+///
+/// Each level is held as its channel tables ([`aterm_render::TextLevel::channel_tables`]): what
+/// the renderer lays over a ground, by the ground's channel. [`Self::cap`] reads every solid
+/// level over up to 255 grounds, and reads each distinct ground once. Blending each level
+/// afresh for each ground (three sRGB transfers, two of them `powf`, in every `blend_text`)
+/// slowed the Rainbow Kitty's glass on GitHub Light. In composed final's gallery the pet's typed
+/// line ended 2415 ms after its first key, against 1441 ms before the strict judge, and
+/// `yield_glass` took 1910 of a captured instance's 3181 main-thread samples. Every cap is the
+/// one reading each alpha in turn through `blend_text` gives
+/// (`a_judge_caps_as_every_alpha_read_in_turn`).
+///
+/// A cap is mostly settled without reading a single alpha ([`Self::settled_cap`]): the glass is
+/// animated, its colour and alpha new on almost every frame, so a memo keyed by them missed, and
+/// on GitHub Light every frame of the typed line read about 2,300 caps of up to 255 grounds each
+/// (some 435,000 ground readings, 12 ms a frame at the median and 47 at the 95th percentile in a
+/// debug build, the frames a person saw jitter). The judge's [`Margins`], worked out once per
+/// glyph, ink and page, bound every level's reading over a whole box of grounds, and the grounds
+/// a glass lays at its alphas lie in the box between the page and its whole composite.
+#[derive(Clone, Debug)]
+struct GlyphJudge {
+    page: u32,
+    solid: Vec<LevelChannels>,
+    core: LevelChannels,
+    solid_bar: f64,
+    core_bar: f64,
+    /// Whether the bare page keeps every bar: a page that does not caps every glass at `0`.
+    page_kept: bool,
+    margins: Margins,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// The grounds the thread's judges read level by level ([`GlyphJudge::keeps`] past its
+    /// margins), for the tests that count them.
+    static LEVEL_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// [`LEVEL_READS`], zeroed.
+#[cfg(test)]
+fn take_level_reads() -> u64 {
+    LEVEL_READS.with(|n| n.replace(0))
+}
+
+/// Per channel and channel level `v` of a ground, the least over a judge's levels of what that
+/// channel adds to the room its level's reading keeps over its bar, taken over every level
+/// between `v` and the page's own level in that channel ([`margins`]), rounded down to an `f32`
+/// (3 KB a judge). A ground whose three margins sum over [`MARGIN_ROOM`] keeps every bar, and so
+/// does every ground in a box of channel levels that holds the page, by the margins of its two
+/// corners.
+type Margins = std::sync::Arc<[[f32; 256]; 3]>;
+
+/// The most judges a yield holds before it forgets them all: each holds its [`Margins`], 3 KB, and
+/// the glyphs a glass lies on near the caret are far fewer.
+const JUDGES_HELD: usize = 1 << 12;
+
+/// The room over `0` a sum of [`Margins`] must leave for the judge to take it as kept: over every
+/// rounding of the luminance's sums, which are of order `1` in `f64`.
+const MARGIN_ROOM: f64 = 1e-9;
+
+/// The [`Margins`] of `levels` (each a level's tables and the bar its reading keeps) on `page`.
+///
+/// A level's reading of a ground keeps its bar where the ground is the lighter
+/// (`(y_g + 0.05) / (y_ink + 0.05) >= bar`), which is
+/// `Σ_c w_c (lin(g_c) − bar · lin(t_c(g_c))) >= 0.05 (bar − 1)`: a sum of one term per channel,
+/// as WCAG's luminance is. Each channel's least term over the levels, less a third of its level's
+/// constant, sums to no more than any one level's whole sum, so a sum of the least terms over
+/// `MARGIN_ROOM` keeps every level. A ground darker than its ink is never kept by them: it falls
+/// to the levels' own readings.
+fn margins(levels: &[(&LevelChannels, f64)], page: u32) -> Margins {
+    let lin = crate::rainbow_kitty::prism_glass::colour::linear_levels();
+    let weights = [0.2126, 0.7152, 0.0722];
+    let mut out = [[f64::INFINITY; 256]; 3];
+    for (c, row) in out.iter_mut().enumerate() {
+        let w = weights[c];
+        for (v, slot) in row.iter_mut().enumerate() {
+            for &(tables, bar) in levels {
+                let term =
+                    w * (lin[v] - bar * lin[usize::from(tables[c][v])]) - 0.05 * (bar - 1.0) / 3.0;
+                *slot = slot.min(term);
+            }
+        }
+        // Each level the least over every level between it and the page's.
+        let p = ((page >> (16 - 8 * c)) & 0xff) as usize;
+        for v in (0..p).rev() {
+            row[v] = row[v].min(row[v + 1]);
+        }
+        for v in p + 1..256 {
+            row[v] = row[v].min(row[v - 1]);
+        }
+    }
+    // Rounded down, so a sum of them is never over the one in `f64`.
+    let down = |v: f64| {
+        let f = v as f32;
+        if f64::from(f) > v { f.next_down() } else { f }
+    };
+    std::sync::Arc::new(out.map(|row| row.map(down)))
+}
+
+/// One judged level's channel tables ([`aterm_render::TextLevel::channel_tables`]), shared by
+/// every judge of its ink, page and level.
+type LevelChannels = std::sync::Arc<[[u8; 256]; 3]>;
+
+/// The judges' channel tables by `(ink, page, level, corrected)`: a level's tables do not depend
+/// on the glyph, so the judges of one ink on one page share at most 256 levels' worth.
+#[derive(Clone, Debug, Default)]
+struct LevelTables(FxHashMap<(u32, u32, u8, bool), LevelChannels>);
+
+impl LevelTables {
+    /// The tables of level `t` of `ink` on `page`.
+    fn of(&mut self, ink: u32, page: u32, t: u8, corrected: bool) -> LevelChannels {
+        if self.0.len() >= 1 << 12 {
+            self.0.clear();
+        }
+        std::sync::Arc::clone(self.0.entry((ink, page, t, corrected)).or_insert_with(|| {
+            std::sync::Arc::new(
+                aterm_render::TextLevel::new(ink, page, t, corrected).channel_tables(),
+            )
+        }))
+    }
+}
+
+impl GlyphJudge {
+    #[cfg(test)]
+    fn new(
+        coverage: &GlyphCoverage,
+        ink: u32,
+        page: u32,
+        theme_fg: u32,
+        corrected: bool,
+    ) -> Option<Self> {
+        Self::new_in(
+            &mut LevelTables::default(),
+            coverage,
+            ink,
+            page,
+            theme_fg,
+            corrected,
+        )
+    }
+
+    /// The judge of `coverage` in `ink` on `page`, its levels' tables from `tables`.
+    fn new_in(
+        tables: &mut LevelTables,
+        coverage: &GlyphCoverage,
+        ink: u32,
+        page: u32,
+        theme_fg: u32,
+        corrected: bool,
+    ) -> Option<Self> {
+        use crate::rainbow_kitty::prism_glass::colour::{SOLID_SHARE, contrast, luminance};
+        let pixel = |a| aterm_render::blend_text(page, ink, page, a, corrected);
+        let core_level =
+            coverage.core_level(luminance(ink) as f32, luminance(page) as f32, corrected)?;
+        let solid_floor = SOLID_SHARE * contrast(pixel(coverage.max), page);
+        let solid: Vec<_> = (1..=coverage.max)
+            .filter(|&a| {
+                coverage.levels[usize::from(a)] > 0 && contrast(pixel(a), page) >= solid_floor
+            })
+            .collect();
+        let own = solid
+            .iter()
+            .map(|&a| contrast(pixel(a), page))
+            .reduce(f64::min)?;
+        let solid_bar = if ink == theme_fg {
+            YIELD_BAR.min(crate::rainbow_kitty::prism_glass::PAGE_SHARE * own)
+        } else {
+            YIELD_BAR
+        };
+        let solid: Vec<_> = solid
+            .iter()
+            .map(|&a| tables.of(ink, page, a, corrected))
+            .collect();
+        let core = tables.of(ink, page, core_level, corrected);
+        let core_bar = 4.5_f64.min(0.97 * contrast(pixel(core_level), page));
+        let levels: Vec<_> = std::iter::once((&core, core_bar))
+            .chain(solid.iter().map(|t| (t, solid_bar)))
+            .collect();
+        let margins = margins(&levels, page);
+        let mut judge = Self {
+            page,
+            solid,
+            core,
+            solid_bar,
+            core_bar,
+            page_kept: false,
+            margins,
+        };
+        judge.page_kept = judge.keeps(page);
+        Some(judge)
+    }
+
+    /// Whether every ground in the box of channel levels `lo ..= hi`, which holds the page's,
+    /// keeps every bar by the judge's [`Margins`] alone. Not settled is no verdict: the levels'
+    /// own readings give it.
+    fn box_kept(&self, lo: [u8; 3], hi: [u8; 3]) -> bool {
+        let m = &*self.margins;
+        let mut sum = 0.0_f64;
+        for c in 0..3 {
+            sum += f64::from(m[c][usize::from(lo[c])].min(m[c][usize::from(hi[c])]));
+        }
+        sum > MARGIN_ROOM
+    }
+
+    /// Whether the glyph keeps every bar over `ground`.
+    fn keeps(&self, ground: u32) -> bool {
+        let at = [16_u32, 8, 0].map(|sh| ((ground >> sh) & 0xff) as u8);
+        if self.box_kept(at, at) {
+            return true;
+        }
+        #[cfg(test)]
+        LEVEL_READS.with(|n| n.set(n.get() + 1));
+        self.keeps_by_levels(ground)
+    }
+
+    /// [`Self::keeps`] by each level's own reading of `ground`.
+    fn keeps_by_levels(&self, ground: u32) -> bool {
+        use crate::rainbow_kitty::prism_glass::colour::{contrast_y, luminance, luminance_rgb};
+        let y = luminance(ground);
+        let [r, g, b] = [16_u32, 8, 0].map(|sh| ((ground >> sh) & 0xff) as usize);
+        // `luminance(blend_text(ground, ink, page, level, corrected))`, read off the tables.
+        let reading = |t: &LevelChannels| contrast_y(luminance_rgb([t[0][r], t[1][g], t[2][b]]), y);
+        reading(&self.core) >= self.core_bar
+            && self.solid.iter().all(|t| reading(t) >= self.solid_bar)
+    }
+
+    /// The cap of the glass `(premultiplied colour, alpha)` where it is settled without reading
+    /// its alphas: `0` on a page the glyph does not keep its bars on, `255` where the box of
+    /// grounds the glass can lay at any alpha keeps them by the judge's margins.
+    ///
+    /// At alpha `a` the glass lays `over_premul(page, scale_end(glass, a / 255))`: per channel
+    /// `C' + round(P · (255 − A') / 255)`, its colour `C' = round(C · a / 255)` and alpha
+    /// `A' = round(α · a / 255)` each within half a level of the line from the page `P` to the
+    /// whole composite, the composite within half a level of the line's end, and the sum within
+    /// half a level more: within two levels of the box between the page and the composite. A
+    /// glass whose colour outruns its alpha in a channel (not premultiplied) is clamped there
+    /// ([`scale_end`]) and left to the reading.
+    fn settled_cap(&self, (color, alpha): (u32, u8)) -> Option<u8> {
+        if !self.page_kept {
+            return Some(0);
+        }
+        let ch = |c: u32, sh: u32| ((c >> sh) & 0xff) as u8;
+        if [16, 8, 0].iter().any(|&sh| ch(color, sh) > alpha) {
+            return None;
+        }
+        let whole = aterm_render::over_premul(self.page, color & 0x00FF_FFFF, alpha);
+        let (mut lo, mut hi) = ([0_u8; 3], [0_u8; 3]);
+        for (c, sh) in [16_u32, 8, 0].into_iter().enumerate() {
+            let (p, g) = (ch(self.page, sh), ch(whole, sh));
+            lo[c] = p.min(g).saturating_sub(2);
+            hi[c] = p.max(g).saturating_add(2);
+        }
+        self.box_kept(lo, hi).then_some(255)
+    }
+
+    fn cap(&self, glass: (u32, u8)) -> u8 {
+        if let Some(k) = self.settled_cap(glass) {
+            return k;
+        }
+        // Neighbouring alphas round to one ground where the light is faint, and a ground kept
+        // once is kept again: each distinct ground is read once.
+        let mut kept = self.page;
+        for alpha in 1..=255_u16 {
+            let (color, coverage) = scale_end(glass.0, glass.1, f32::from(alpha) / 255.0);
+            let ground = aterm_render::over_premul(self.page, color, coverage) & 0x00FF_FFFF;
+            if ground == kept {
+                continue;
+            }
+            if !self.keeps(ground) {
+                return (alpha - 1) as u8;
+            }
+            kept = ground;
+        }
+        255
+    }
+}
+
+/// Push the actual premultiplied color and alpha of each column under the word, so
+/// a cap scales source-over light rather than its already-composited RGB.
 fn composites_under(
-    out: &mut Vec<u32>,
+    out: &mut Vec<(u32, u8)>,
     (wx0, wx1): (i32, i32),
     (x, w): (u16, u16),
     (e0, e1): ((u32, u8), (u32, u8)),
-    page: u32,
 ) {
     let (x0, x1) = (i32::from(x), i32::from(x) + i32::from(w));
     for px in x0.max(wx0)..x1.min(wx1) {
@@ -295,7 +641,7 @@ fn composites_under(
         if alpha == 0 && col == 0 {
             continue;
         }
-        out.push(aterm_render::over_premul(page, col, alpha) & 0x00FF_FFFF);
+        out.push((col, alpha));
     }
 }
 
@@ -324,9 +670,12 @@ fn channels(c: u32) -> [f64; 3] {
 }
 
 /// The cap of `ink` over a glass whose whole composite on `page` is `glass` (§4 rule 3): the
-/// largest alpha `k` such that `ink` keeps `bar` over the glass at every alpha `1 ..= k`, the
-/// glass at alpha `a` laying `page + (glass − page)·a/255`; `0` where the page itself is under
-/// the bar, or the ink is no darker than the page (no ink of a light page's app reads lighter).
+/// largest alpha `k` such that `ink`'s glyph keeps `bar` over the glass at every alpha `1 ..= k`,
+/// as it is seen (`prism_glass::colour::seen`: its dimmest solid ink against the ground, as the
+/// glass's own bar is read), the glass at alpha `a` laying `page + (glass − page)·a/255`; `0`
+/// where the page itself is under the bar, or the ink is no darker than the page (no ink of a
+/// light page's app reads lighter). The seen reading rises with the ground's luminance, so the
+/// bar is one luminance.
 ///
 /// The luminance along the lerp is convex (each channel is linear in `a` and WCAG's curve is
 /// convex), so it falls to its least and rises after: the cap is whole where its least clears
@@ -338,7 +687,7 @@ pub fn cap(ink: u32, glass: u32, page: u32, bar: f64) -> u8 {
     if yi >= yp {
         return 0;
     }
-    let y_bar = bar * (yi + 0.05) - 0.05;
+    let y_bar = crate::rainbow_kitty::prism_glass::colour::seen_floor_y(yi, yp, bar);
     if yp < y_bar {
         return 0;
     }
@@ -467,6 +816,28 @@ impl GlassYield {
         glass: &GlassLaid,
         sprites: &[FreeSprite],
     ) -> YieldReport {
+        self.apply_inner(input, glass, sprites, None, false)
+    }
+
+    fn apply_observed(
+        &mut self,
+        input: &mut RenderInput,
+        glass: &GlassLaid,
+        sprites: &[FreeSprite],
+        ink: Option<&GlyphInk>,
+        strict: bool,
+    ) -> YieldReport {
+        self.apply_inner(input, glass, sprites, ink, strict)
+    }
+
+    fn apply_inner(
+        &mut self,
+        input: &mut RenderInput,
+        glass: &GlassLaid,
+        sprites: &[FreeSprite],
+        ink: Option<&GlyphInk>,
+        strict: bool,
+    ) -> YieldReport {
         let (_, _, cw, ch) = glass.grid;
         if glass.is_empty() || cw <= 0 || ch <= 0 {
             return YieldReport::default();
@@ -474,7 +845,8 @@ impl GlassYield {
         if !self.find(input, glass) {
             return YieldReport::default();
         }
-        let cells = self.solve(input, glass, sprites);
+        let observed = ink.and_then(|ink| ink.for_frame(input, (cw as usize, ch as usize)));
+        let cells = self.solve(input, glass, sprites, observed, strict);
         if cells == 0 {
             return YieldReport::default();
         }
@@ -553,11 +925,30 @@ impl GlassYield {
     }
 
     /// Each glass row's scales ([`Self::rows`], [`Self::scales`]) by the rules; the cells cut.
-    fn solve(&mut self, input: &RenderInput, glass: &GlassLaid, sprites: &[FreeSprite]) -> usize {
+    fn solve(
+        &mut self,
+        input: &RenderInput,
+        glass: &GlassLaid,
+        sprites: &[FreeSprite],
+        observed: Option<&FrameGlyphInk>,
+        strict: bool,
+    ) -> usize {
         let (fg, bg) = glass.page;
-        if self.memo_page != bg || self.memo.len() > 1 << 14 {
+        if self.memo_page != bg || self.memo_fg != fg || self.memo.len() > 1 << 14 {
             self.memo.clear();
             self.memo_page = bg;
+            self.memo_fg = fg;
+            self.observed_caps.clear();
+            self.judges.clear();
+        }
+        let epoch = observed.map(FrameGlyphInk::epoch);
+        if self.observed_epoch != epoch
+            || self.observed_caps.len() > 1 << 14
+            || self.judges.len() > JUDGES_HELD
+        {
+            self.observed_caps.clear();
+            self.judges.clear();
+            self.observed_epoch = epoch;
         }
         self.rows.clear();
         self.scales.clear();
@@ -592,18 +983,18 @@ impl GlassYield {
                         self.ks[c] = 0;
                         c += 1;
                     }
-                    Class::Ink(_) => {
+                    class if class.needs_cap(strict) => {
                         let mut e = c;
-                        while e + 1 < cols && matches!(self.classes[e + 1], Class::Ink(_)) {
+                        while e + 1 < cols && self.classes[e + 1].needs_cap(strict) {
                             e += 1;
                         }
-                        let k = self.word_cap(input, glass, r, (c, e), (fg, bg));
+                        let k = self.word_cap(input, glass, (r, c, e), (fg, bg), observed, strict);
                         for kk in &mut self.ks[c..=e] {
                             *kk = k;
                         }
                         c = e + 1;
                     }
-                    Class::Blank | Class::Fg | Class::Outside => c += 1,
+                    _ => c += 1,
                 }
             }
             self.bridge(cols, glass.caret.filter(|&(cr, _)| usize::from(cr) == r));
@@ -776,8 +1167,10 @@ impl GlassYield {
                 e += 1;
             }
             let word = |ks: &[u8], classes: &[Class], at: Option<usize>| {
-                at.filter(|&a| a < cols && classes[a].worded())
-                    .and_then(|a| yielded(ks, Some(a)))
+                at.filter(|&a| {
+                    a < cols && (classes[a].worded() || classes[a] == Class::Fg && ks[a] < 255)
+                })
+                .and_then(|a| yielded(ks, Some(a)))
             };
             let (left, right) = (
                 word(&self.ks, &self.classes, c.checked_sub(1)),
@@ -837,13 +1230,18 @@ impl GlassYield {
         &mut self,
         input: &RenderInput,
         glass: &GlassLaid,
-        r: usize,
-        (c, e): (usize, usize),
-        (_, bg): (u32, u32),
+        (r, c, e): (usize, usize, usize),
+        (fg, bg): (u32, u32),
+        observed: Option<&FrameGlyphInk>,
+        strict: bool,
     ) -> u8 {
         let (ox, _, cw, _) = glass.grid;
         let (wx0, wx1) = (ox + c as i32 * cw, ox + (e as i32 + 1) * cw);
         self.composites.clear();
+        // The source spans under the word, kept beside their per-column composites so a
+        // strict cap can be re-judged against the gradient `lay` publishes (below).
+        type SourceSpan = (i32, u16, (u32, u8), (u32, u8));
+        let mut spans: Vec<SourceSpan> = Vec::new();
         for (p, g) in self.seq_in.iter().zip(&self.glass) {
             if *g != Some(r) {
                 continue;
@@ -851,12 +1249,17 @@ impl GlassYield {
             match *p {
                 Piece::Quad(a) => {
                     let q = &input.glow_under[a];
+                    spans.push((
+                        i32::from(q.x),
+                        q.w,
+                        (q.color, q.alpha),
+                        (q.color2, q.alpha2),
+                    ));
                     composites_under(
                         &mut self.composites,
                         (wx0, wx1),
                         (q.x, q.w),
                         ((q.color, q.alpha), (q.color2, q.alpha2)),
-                        bg,
                     );
                 }
                 // Every row's own ends: a wedge row carries its own colours, so a dimmer row of
@@ -876,12 +1279,12 @@ impl GlassYield {
                                 aterm_core::render::end_alpha(e),
                             )
                         };
+                        spans.push((i32::from(ramp.x), ramp.w, end(l), end(rt)));
                         composites_under(
                             &mut self.composites,
                             (wx0, wx1),
                             (ramp.x, ramp.w),
                             (end(l), end(rt)),
-                            bg,
                         );
                     }
                 }
@@ -890,22 +1293,108 @@ impl GlassYield {
         self.composites.sort_unstable();
         self.composites.dedup();
         let mut k = 255u8;
+        let mut judged: Vec<GlyphJudge> = Vec::new();
         'inks: for col in c..=e {
-            let Class::Ink(ink) = self.classes[col] else {
-                continue;
+            let ink = match self.classes[col] {
+                Class::Ink(ink) => ink,
+                Class::Fg if strict => fg,
+                _ => continue,
             };
-            if col > c && self.classes[col - 1] == Class::Ink(ink) {
+            if !strict && col > c && self.classes[col - 1] == Class::Ink(ink) {
                 continue;
             }
-            for &g in &self.composites {
-                let kk = *self
-                    .memo
-                    .entry((ink, g))
-                    .or_insert_with(|| cap(ink, g, bg, YIELD_BAR));
+            if !strict {
+                for &(color, alpha) in &self.composites {
+                    let g = aterm_render::over_premul(bg, color, alpha) & 0x00FF_FFFF;
+                    let kk = *self
+                        .memo
+                        .entry((ink, g))
+                        .or_insert_with(|| cap(ink, g, bg, YIELD_BAR));
+                    k = k.min(kk);
+                    if k < K_MIN {
+                        break 'inks;
+                    }
+                }
+                continue;
+            }
+            if self.composites.is_empty() {
+                continue;
+            }
+            let Some(frame) = observed else {
+                return 0;
+            };
+            let Some((key, coverage)) = frame.coverage(r, col) else {
+                return 0;
+            };
+            if self.observed_caps.len() >= 1 << 14 {
+                self.observed_caps.clear();
+            }
+            if self.judges.len() >= JUDGES_HELD {
+                self.judges.clear();
+            }
+            let tables = &mut self.level_tables;
+            let judge = self.judges.entry((key, ink)).or_insert_with(|| {
+                GlyphJudge::new_in(tables, coverage, ink, bg, fg, frame.corrected())
+            });
+            let Some(judge) = judge else {
+                return 0;
+            };
+            judged.push(judge.clone());
+            for &(color, alpha) in &self.composites {
+                // Settled by the judge's margins as a rule; the memo keeps the caps it reads
+                // alpha by alpha, for a glass that holds still.
+                let kk = match judge.settled_cap((color, alpha)) {
+                    Some(kk) => kk,
+                    None => *self
+                        .observed_caps
+                        .entry((key, ink, color, alpha))
+                        .or_insert_with(|| judge.cap((color, alpha))),
+                };
                 k = k.min(kk);
                 if k < K_MIN {
                     break 'inks;
                 }
+            }
+        }
+        if strict && k >= K_MIN && !judged.is_empty() {
+            // The cap above judges each source column scaled on its own; what `lay`
+            // publishes is a gradient between scaled ends, whose interior rounding can
+            // land a channel step past the per-column prediction. Re-judge the emitted
+            // columns (sub-spans cut at the word's cell edges, as `lay` cuts them) and
+            // step the cap down until the published gradient itself keeps every bar.
+            let emitted_keeps = |k: u8| {
+                let s = f32::from(k) / 255.0;
+                spans.iter().all(|&(x, w, e0, e1)| {
+                    let (a, b) = (wx0.max(x), wx1.min(x + i32::from(w)));
+                    let mut cuts: Vec<i32> = vec![a];
+                    cuts.extend(
+                        (c..=e + 1)
+                            .map(|col| ox + col as i32 * cw)
+                            .filter(|&edge| edge > a && edge < b),
+                    );
+                    cuts.push(b);
+                    cuts.windows(2).all(|pair| {
+                        let (xa, xb) = (pair[0], pair[1]);
+                        let ea = edge_end(e0, e1, xa - x, i32::from(w));
+                        let eb = edge_end(e0, e1, xb - x, i32::from(w));
+                        let sa = scale_end(ea.0, ea.1, s);
+                        let sb = scale_end(eb.0, eb.1, s);
+                        let pw = (xb - xa) as u32;
+                        (xa..xb).all(|px| {
+                            let i = (px - xa) as u32;
+                            let ground = aterm_render::over_premul(
+                                bg,
+                                aterm_render::glow_lerp_rgb(sa.0, sb.0, i, pw),
+                                aterm_render::glow_lerp(u32::from(sa.1), u32::from(sb.1), i, pw)
+                                    as u8,
+                            ) & 0x00FF_FFFF;
+                            judged.iter().all(|judge| judge.keeps(ground))
+                        })
+                    })
+                })
+            };
+            while k >= K_MIN && !emitted_keeps(k) {
+                k -= 1;
             }
         }
         if k < K_MIN { 0 } else { k }
@@ -995,10 +1484,10 @@ impl GlassYield {
         *self = Self::default();
     }
 
-    /// The caps the memo holds.
+    /// What the memo holds: its caps, and the judges that settle a kept glass's cap with none.
     #[cfg(any(test, debug_assertions))]
     pub(super) fn memo_len(&self) -> usize {
-        self.memo.len()
+        self.memo.len() + self.observed_caps.len() + self.judges.len()
     }
 
     /// Lay the input's under stream again with its glass yielded; whether its quads and its
@@ -1194,7 +1683,19 @@ impl super::CursorGlow {
         {
             return YieldReport::default();
         }
-        let report = self.glass_yield.apply(input, &self.glass_laid, sprites);
+        // Strict (actual-raster) caps apply only once a glyph table has been observed:
+        // with none ever said, every glyph's ink is judged solid and the colour-only
+        // law decides. A table retained while its frame evidence is unavailable stays
+        // strict, so its words fail closed rather than borrow the solid reading.
+        let report = self.glass_yield.apply_observed(
+            input,
+            &self.glass_laid,
+            sprites,
+            self.glyph_frame_available
+                .then_some(self.glyph_ink.as_deref())
+                .flatten(),
+            self.glyph_ink.is_some(),
+        );
         if report.cut() {
             self.yield_spent = Some(at);
             self.yield_left.0.clone_from(&input.glow_under);
@@ -1216,8 +1717,8 @@ impl super::CursorGlow {
         self.yield_left.1.clear();
     }
 
-    /// The step whose glass a word publish cut ([`Self::yield_glass`]) and the caps the yield's
-    /// memo holds: `(None, 0)` once the light leaves. Debug and test builds only.
+    /// The step whose glass a word publish cut ([`Self::yield_glass`]) and what the yield's memo
+    /// holds (its caps and judges): `(None, 0)` once the light leaves. Debug and test builds only.
     #[cfg(any(test, debug_assertions))]
     #[must_use]
     pub fn yield_held(&self) -> (Option<Instant>, usize) {
@@ -1251,6 +1752,501 @@ impl super::CursorGlow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn published_caps_keep_synthetic_ink_readable_after_gradient_rounding() {
+        const WIDTH: usize = 15;
+        let mut renderer =
+            aterm_render::Renderer::from_system(40.0, aterm_render::Theme::default()).unwrap();
+        renderer.set_font_subpixel("off");
+        renderer.debug_block_on_lazy_fallbacks();
+        let (cw, ch) = renderer.cell_size();
+        assert!(cw >= WIDTH, "the gradient fits wholly inside one word cell");
+        let mut term = Terminal::new(1, 1);
+        term.process(b"\x1b[?25l\x1b]10;rgb:2b/2d/33\x07\x1b]11;rgb:f6/f7/f9\x07M");
+        let base = term.cell_frame(1, 1);
+        let clean = renderer.render_input(&base);
+        assert_eq!((clean.width, clean.height), (cw, ch));
+        let ink = renderer.glyph_ink_for(&base);
+        let frame = ink
+            .for_frame(&base, (cw, ch))
+            .expect("stable actual glyph key");
+        let (key, _) = frame
+            .coverage(0, 0)
+            .expect("the carrier has an observed raster");
+        let (epoch, corrected) = (frame.epoch(), frame.corrected());
+        assert!(corrected, "the witness uses corrected text blending");
+        let baseline = renderer.baseline();
+        let image = renderer.glyph_image(key);
+        let ink_top = baseline - image.height() as i32 - image.ymin();
+        let ink_bottom = baseline - image.ymin();
+        let y = (0..ch)
+            .find(|&y| {
+                !(ink_top..ink_bottom).contains(&(y as i32))
+                    && (0..WIDTH).all(|x| clean.pixels[y * clean.width + x] & 0x00FF_FFFF == BG)
+            })
+            .expect("a row outside the actual glyph raster exposes only the published ground");
+        let palette = crate::rainbow_kitty::prism_glass::Palette::shipped(FG, BG).unwrap();
+        let mut quad = GlowQuad::flat(0, 0, 0, WIDTH as u16, ch as u16, palette.glass[34], 255);
+        quad.color2 = palette.glass[42];
+
+        for level in [255, 175] {
+            // Only the profile is synthetic. Reuse a real key/epoch in this test's
+            // private memo so production word-cap, publication and lay run unchanged.
+            // This does not claim that the carrier font has this uniform coverage.
+            let judge = GlyphJudge::new(&GlyphCoverage::of(&[level; 32]), FG, BG, FG, corrected)
+                .expect("nonempty synthetic coverage");
+            assert!(
+                judge.keeps(BG),
+                "the synthetic ink keeps its clean-page bar"
+            );
+            let at = Instant::now();
+            let mut effects = crate::pipeline::EffectsPipeline::for_window();
+            let glow = &mut effects.cursor_mut().glow;
+            glow.observe_glyph_ink(Some(std::sync::Arc::clone(&ink)));
+            glow.under_out = vec![quad];
+            glow.glass_laid = GlassLaid::new(
+                at,
+                (vec![quad], GlowRamps::default()),
+                (FG, BG),
+                (0, 0, cw as i32, ch as i32),
+                None,
+            );
+            glow.glass_yield.memo_fg = FG;
+            glow.glass_yield.memo_page = BG;
+            glow.glass_yield.observed_epoch = Some(epoch.clone());
+            glow.glass_yield
+                .judges
+                .insert((key, FG), Some(judge.clone()));
+            let mut input = base.clone();
+            effects.publish_cursor(&mut input);
+            assert_eq!(
+                input.glow_under,
+                [quad],
+                "the actual publisher carries the source gradient"
+            );
+            let report = effects.cursor_mut().glow.yield_glass(&mut input, &[], at);
+            let cap = effects.cursor().glow.glass_yield.ks[0];
+            if level == 255 {
+                assert_eq!(cap, 255, "the ordinary full-coverage control keeps glass");
+                assert!(!report.cut());
+            } else {
+                assert!(
+                    (K_MIN..255).contains(&cap),
+                    "the thin profile chooses a finite retained cap"
+                );
+                assert!(
+                    report.cut(),
+                    "the actual lay must rewrite the capped gradient"
+                );
+            }
+
+            // Check the cap's own predictions through its existing sampling and
+            // scaling operations, rather than a second interpolation formula.
+            let mut predicted = Vec::new();
+            composites_under(
+                &mut predicted,
+                (0, WIDTH as i32),
+                (quad.x, quad.w),
+                ((quad.color, quad.alpha), (quad.color2, quad.alpha2)),
+            );
+            for (color, alpha) in predicted {
+                let (color, alpha) = scale_end(color, alpha, f32::from(cap) / 255.0);
+                assert!(
+                    judge.keeps(aterm_render::over_premul(BG, color, alpha)),
+                    "the selected cap's predictions must pass before judging its emitted stream"
+                );
+            }
+            let actual = renderer.render_input(&input);
+            assert_eq!((actual.width, actual.height), (clean.width, clean.height));
+            assert!(
+                (0..WIDTH).any(|x| actual.pixels[y * actual.width + x] & 0x00FF_FFFF != BG),
+                "the witness must rasterize retained glass"
+            );
+            for x in 0..WIDTH {
+                let ground = actual.pixels[y * actual.width + x] & 0x00FF_FFFF;
+                assert!(
+                    judge.keeps(ground),
+                    "coverage {level}, cap {cap}, x {x}: emitted ground {ground:06x} must keep the unchanged glyph bar"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn actual_raster_coverage_keeps_safe_glass_and_caps_thin_ink() {
+        let (fg, page) = (0x002B_2D33, 0x00F6_F7F9);
+        let glass = crate::rainbow_kitty::prism_glass::Palette::shipped(fg, page)
+            .unwrap()
+            .glass[0];
+        let source = (aterm_render::premul_rgb(glass, 255), 255);
+        let full = GlyphJudge::new(&GlyphCoverage::of(&[255; 32]), fg, page, fg, true).unwrap();
+        let thin = GlyphJudge::new(&GlyphCoverage::of(&[160; 32]), fg, page, fg, true).unwrap();
+        assert_eq!(
+            full.cap(source),
+            255,
+            "safe observed ink retains actual glass"
+        );
+        assert_eq!(
+            cap(fg, glass, page, YIELD_BAR),
+            255,
+            "the calibrated color-only law accepts it"
+        );
+        assert!(
+            thin.cap(source) < 255,
+            "the real thin raster cannot borrow full-ink coverage"
+        );
+        assert!(GlyphJudge::new(&GlyphCoverage::default(), fg, page, fg, true).is_none());
+    }
+
+    /// A judge reads each distinct ground of a glass's alphas once, and each level's corrected
+    /// alpha is worked out once ([`aterm_render::TextLevel`]): its cap is still the last alpha
+    /// before the first whose ground the glyph does not keep, as reading every alpha in turn
+    /// gives. This holds over the glass of Default Light and GitHub Light at every eighth
+    /// colour, whole and faint, for a full, a thin and an antialiased glyph, corrected and not.
+    #[test]
+    fn a_judge_caps_as_every_alpha_read_in_turn() {
+        let ramp: Vec<u8> = (0..32_u8).map(|i| i * 8 + 7).collect();
+        let (mut read, mut capped) = (0, 0);
+        for (fg, page) in [(0x002B_2D33, 0x00F6_F7F9), (0x001F_2328, 0x00FF_FFFF)] {
+            let palette = crate::rainbow_kitty::prism_glass::Palette::shipped(fg, page).unwrap();
+            for corrected in [true, false] {
+                for levels in [&[255_u8; 32][..], &[160; 32], &ramp] {
+                    let Some(judge) =
+                        GlyphJudge::new(&GlyphCoverage::of(levels), fg, page, fg, corrected)
+                    else {
+                        continue;
+                    };
+                    for &glass in palette.glass.iter().step_by(8) {
+                        for alpha in [255_u8, 160, 64, 12] {
+                            let source = (aterm_render::premul_rgb(glass, alpha), alpha);
+                            let ground = |a: u16| {
+                                let (c, k) = scale_end(source.0, source.1, f32::from(a) / 255.0);
+                                aterm_render::over_premul(page, c, k) & 0x00FF_FFFF
+                            };
+                            let every = if judge.keeps(page) {
+                                (1..=255_u16)
+                                    .find(|&a| !judge.keeps(ground(a)))
+                                    .map_or(255, |a| (a - 1) as u8)
+                            } else {
+                                0
+                            };
+                            assert_eq!(
+                                judge.cap(source),
+                                every,
+                                "#{glass:06x} at {alpha} over {levels:?} (corrected {corrected})"
+                            );
+                            read += 1;
+                            capped += usize::from(every < 255);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            read > 100 && capped > 0,
+            "fixture: {read} glasses read, {capped} capped"
+        );
+    }
+
+    /// r25 K8-1, THE LIGHT GLASS'S CAPS COST NO FRAME: the glass is animated, its colour and
+    /// alpha new on almost every frame, so the caps' memo missed and every frame of a line typed
+    /// on GitHub Light read about 2,300 caps of up to 255 grounds each, level by level (12 ms a
+    /// frame at the median, 47 at the 95th percentile, in a debug build: frames a person sees
+    /// jitter). A glass a full glyph keeps at every alpha (the solid ink of every glyph's core)
+    /// is capped by the judge's margins without one ground read level by level: every glass of
+    /// Default Light's and GitHub Light's at each alpha here, in the theme's ink and in an app's,
+    /// corrected and not. Every cap, over an antialiased glyph too, is still the one reading
+    /// every alpha in turn gives, and a glass the glyph does not keep is read to its first
+    /// ground under a bar.
+    #[test]
+    fn a_kept_glass_is_capped_without_reading_its_alphas() {
+        let ramp: Vec<u8> = (0..32_u8).map(|i| i * 8 + 7).collect();
+        let (mut settled, mut capped) = (0, 0);
+        for (fg, page) in [(0x002B_2D33, 0x00F6_F7F9), (0x001F_2328, 0x00FF_FFFF)] {
+            let palette = crate::rainbow_kitty::prism_glass::Palette::shipped(fg, page).unwrap();
+            for ink in [fg, 0x0011_1111] {
+                for corrected in [true, false] {
+                    for levels in [&[255_u8; 32][..], &ramp] {
+                        let judge =
+                            GlyphJudge::new(&GlyphCoverage::of(levels), ink, page, fg, corrected)
+                                .expect("an inked glyph");
+                        assert!(judge.page_kept, "fixture: the bare page keeps the glyph");
+                        for &glass in &palette.glass {
+                            for alpha in [255_u8, 192, 128, 64, 16] {
+                                let source = (aterm_render::premul_rgb(glass, alpha), alpha);
+                                let every = (1..=255_u16)
+                                    .find(|&a| {
+                                        let (c, k) =
+                                            scale_end(source.0, source.1, f32::from(a) / 255.0);
+                                        !judge.keeps_by_levels(
+                                            aterm_render::over_premul(page, c, k) & 0x00FF_FFFF,
+                                        )
+                                    })
+                                    .map_or(255, |a| (a - 1) as u8);
+                                let _ = take_level_reads();
+                                let cap = judge.cap(source);
+                                let reads = take_level_reads();
+                                assert_eq!(cap, every, "#{glass:06x} at {alpha} over {levels:?}");
+                                capped += usize::from(every < 255);
+                                if every == 255 && levels[0] == 255 {
+                                    assert_eq!(
+                                        reads, 0,
+                                        "#{glass:06x} at {alpha} (ink #{ink:06x}, corrected \
+                                         {corrected}): a kept glass read {reads} grounds level \
+                                         by level"
+                                    );
+                                    settled += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            settled > 1000 && capped > 0,
+            "fixture: {settled} kept glasses settled, {capped} capped"
+        );
+    }
+
+    /// r25 K8-1 through the yield: a line of the face's own glyphs under a glass whose colour
+    /// and alpha move every frame, as the trail's do, reads no ground level by level on a frame
+    /// whose every word keeps the whole glass, on Default Light and GitHub Light.
+    #[test]
+    fn an_animated_glass_over_a_kept_line_reads_no_alpha() {
+        let mut renderer =
+            aterm_render::Renderer::from_system(24.0, aterm_render::Theme::default())
+                .expect("the bundled face");
+        let (cw, ch) = renderer.cell_size();
+        let mut kept_frames = 0;
+        for (fg, bg, colours) in [
+            (
+                0x002B_2D33,
+                0x00F6_F7F9,
+                b"\x1b]10;rgb:2b/2d/33\x07\x1b]11;rgb:f6/f7/f9\x07",
+            ),
+            (
+                0x001F_2328,
+                0x00FF_FFFF,
+                b"\x1b]10;rgb:1f/23/28\x07\x1b]11;rgb:ff/ff/ff\x07",
+            ),
+        ] {
+            let mut term = Terminal::new(1, 24);
+            term.process(colours);
+            term.process(b"echo the quick brown fox");
+            let mut base = term.cell_frame(1, 24);
+            base.cursor_visible = false;
+            let ink = renderer.glyph_ink_for(&base);
+            let glasses = crate::rainbow_kitty::prism_glass::Palette::shipped(fg, bg)
+                .unwrap()
+                .glass;
+            let mut yield_ = GlassYield::default();
+            for frame in 0..24_usize {
+                let alpha = [64_u8, 96, 128][frame % 3];
+                let colour = |i: usize| aterm_render::premul_rgb(glasses[i % glasses.len()], alpha);
+                let mut quad = GlowQuad::flat(
+                    0,
+                    0,
+                    0,
+                    (24 * cw) as u16,
+                    ch as u16,
+                    colour(frame * 5),
+                    alpha,
+                );
+                quad.color2 = colour(frame * 5 + 40);
+                let mut input = base.clone();
+                input.glow_under = vec![quad];
+                let glass = GlassLaid::new(
+                    Instant::now(),
+                    (vec![quad], GlowRamps::default()),
+                    (fg, bg),
+                    (0, 0, cw as i32, ch as i32),
+                    None,
+                );
+                let _ = take_level_reads();
+                let _ = yield_.apply_observed(&mut input, &glass, &[], Some(&ink), true);
+                let reads = take_level_reads();
+                if yield_.ks.iter().all(|&k| k == 255) {
+                    assert_eq!(
+                        reads, 0,
+                        "#{bg:06x} frame {frame}: every word keeps the glass, yet {reads} grounds \
+                         were read level by level"
+                    );
+                    kept_frames += 1;
+                }
+            }
+        }
+        assert!(
+            kept_frames >= 40,
+            "fixture: {kept_frames} frames kept the glass"
+        );
+    }
+
+    /// Strict observation measures a theme glyph and keeps it plain for rule 5b: a safe one,
+    /// which its own raster keeps under the whole glass, is still yielded where rule 5b yields a
+    /// run, between two yielded words or between a yielded word and the caret, the caret's cell
+    /// with it. A theme glyph touching an app's ink is measured with that ink's word (rule 3
+    /// reads a run of glyphs of any ink), so the words that bound a one-cell run here are ones
+    /// the word pass animates (rule 4), which no cap measures. The negative control is a run of
+    /// [`ORPHAN_CELLS`] cells between two yielded words, ` M `, which is no orphan: the safe glyph
+    /// keeps its glass.
+    #[test]
+    fn observed_safe_theme_ink_still_bridges_between_yielded_words_and_caret() {
+        let mut renderer =
+            aterm_render::Renderer::from_system(24.0, aterm_render::Theme::default())
+                .expect("the bundled face");
+        let red = |cols: std::ops::Range<u16>| {
+            cols.map(|col| InkCell {
+                row: 0,
+                col,
+                color: [196, 38, 46],
+            })
+            .collect::<Vec<_>>()
+        };
+        // (text, the caret, the word pass's animated cells, the theme glyph's column, the
+        // run's columns, whether rule 5b yields it)
+        for (text, caret, animated, safe_col, run, bridged) in [
+            (
+                b"\x1b[38;2;196;38;46mred\x1b[39mM\x1b[38;2;196;38;46mred".as_slice(),
+                None,
+                [red(0..3), red(4..7)].concat(),
+                3,
+                3..4,
+                true,
+            ),
+            (
+                b"\x1b[38;2;196;38;46mred\x1b[39m M".as_slice(),
+                Some((0, 5)),
+                Vec::new(),
+                4,
+                3..5,
+                true,
+            ),
+            (
+                b"\x1b[38;2;196;38;46mred\x1b[39m M \x1b[38;2;196;38;46mred".as_slice(),
+                None,
+                Vec::new(),
+                4,
+                3..6,
+                false,
+            ),
+        ] {
+            let mut input = page(text);
+            input.ink = animated;
+            let (cw, ch) = renderer.cell_size();
+            let ink = renderer.glyph_ink_for(&input);
+            let frame = ink
+                .for_frame(&input, (cw, ch))
+                .expect("actual current glyph evidence");
+            let (_, coverage) = frame
+                .coverage(0, safe_col)
+                .expect("the theme glyph's actual raster");
+            assert_eq!(
+                GlyphJudge::new(coverage, FG, BG, FG, frame.corrected())
+                    .unwrap()
+                    .cap(GLASS),
+                255,
+                "the theme glyph is safe before rule5b bridges it"
+            );
+            let quad = GlowQuad::flat(0, 0, 0, (24 * cw) as u16, ch as u16, GLASS.0, GLASS.1);
+            input.glow_under = vec![quad];
+            let glass = GlassLaid::new(
+                Instant::now(),
+                (vec![quad], GlowRamps::default()),
+                (FG, BG),
+                (0, 0, cw as i32, ch as i32),
+                caret,
+            );
+            let mut yield_ = GlassYield::default();
+            assert!(
+                yield_
+                    .apply_observed(&mut input, &glass, &[], Some(&ink), true)
+                    .cut()
+            );
+            assert_eq!(
+                yield_.classes[safe_col],
+                Class::Fg,
+                "measurement preserves plain classification"
+            );
+            assert!(
+                yield_.ks[run.start - 1] < 255
+                    && yield_.classes[run.start - 1].worded()
+                    && (caret.is_some() || yield_.ks[run.end] < 255),
+                "premise: a yielded word bounds the run {run:?} on the left, and one or the caret \
+                 on the right: {:?}",
+                &yield_.ks[..8]
+            );
+            if bridged {
+                assert!(run.len() < ORPHAN_CELLS, "premise: the run is an orphan");
+                assert_eq!(
+                    yield_.ks[safe_col], 0,
+                    "rule5b bridges the safe theme glyph in the run {run:?}"
+                );
+            } else {
+                assert_eq!(run.len(), ORPHAN_CELLS, "premise: the run is no orphan");
+                assert_eq!(
+                    &yield_.ks[run.clone()],
+                    [255; ORPHAN_CELLS],
+                    "control: a run of ORPHAN_CELLS keeps its glass, the safe glyph's too"
+                );
+            }
+            if let Some((_, caret_col)) = caret {
+                assert_eq!(
+                    yield_.ks[usize::from(caret_col)],
+                    0,
+                    "the orphan's caret yields too"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unavailable_frame_evidence_keeps_the_guard_table_and_yields_glass() {
+        let mut renderer =
+            aterm_render::Renderer::from_system(24.0, aterm_render::Theme::default()).unwrap();
+        let mut input = page(b"M");
+        let (cw, ch) = renderer.cell_size();
+        let ink = renderer.glyph_ink_for(&input);
+        assert!(
+            ink.for_frame(&input, (cw, ch))
+                .unwrap()
+                .coverage(0, 0)
+                .is_some()
+        );
+        let quad = GlowQuad::flat(0, 0, 0, (24 * cw) as u16, ch as u16, GLASS.0, GLASS.1);
+        input.glow_under = vec![quad];
+        let at = Instant::now();
+        let glass = GlassLaid::new(
+            at,
+            (vec![quad], GlowRamps::default()),
+            (FG, BG),
+            (0, 0, cw as i32, ch as i32),
+            None,
+        );
+        let mut known = input.clone();
+        assert!(
+            !GlassYield::default()
+                .apply_observed(&mut known, &glass, &[], Some(&ink), true)
+                .cut(),
+            "actual safe ink keeps its glass before the renderer becomes unavailable"
+        );
+        let mut glow = super::super::CursorGlow {
+            glass_laid: glass,
+            ..Default::default()
+        };
+        glow.observe_glyph_ink(Some(std::sync::Arc::clone(&ink)));
+        glow.observe_glyph_ink_unavailable();
+        assert!(
+            std::sync::Arc::ptr_eq(glow.glyph_ink.as_ref().unwrap(), &ink),
+            "the existing non-glass guard retains its table"
+        );
+        assert!(
+            glow.yield_glass(&mut input, &[], at).cut(),
+            "retaining the guard does not confer fresh frame evidence"
+        );
+        assert_eq!(glow.glass_yield.ks[0], 0);
+    }
     use aterm_core::render::InkCell;
     use aterm_core::terminal::Terminal;
 
@@ -1371,13 +2367,15 @@ mod tests {
         }
     }
 
-    /// The measured caps (§4 rule 3 and its Measured table), over Default Light's shipped glass
-    /// at its anchors, whole (alpha 255), each a word's k (a cap under [`K_MIN`] is 0): the
-    /// theme's ink `#2b2d33` keeps every anchor whole (the glass is solved for it); the grey
-    /// `#474d57` keeps the yellow, the green and the cyan whole and loses the rest; `#c4262e`,
-    /// `#0b5cc4`, `#a2269e` and `#5c6370` lose every anchor; `#1a7f37`, `#8a6100`, `#0f7684`
-    /// and `#6b7280`, under the bar on the page itself, take 0 at every alpha. An ink lighter
-    /// than the page, or a page under the bar itself, keeps no glass either.
+    /// The measured caps (§4 rule 3 and its Measured table, as `docs/design/PRISM-GLASS.md`
+    /// §15.8 amendment 49 amends it: each ink's glyph is read as it is seen), over Default
+    /// Light's shipped glass at its anchors, whole (alpha 255), each a word's k (a cap under
+    /// [`K_MIN`] is 0): the theme's ink `#2b2d33` keeps every anchor whole (the glass is solved
+    /// for it); the grey `#474d57` keeps the yellow, the green and the cyan whole and loses the
+    /// rest; `#c4262e`, `#0b5cc4`, `#a2269e`, `#5c6370`, `#1a7f37`, `#8a6100`, `#0f7684` and
+    /// `#6b7280`, whose glyphs read under the bar as seen on the page itself (`#c4262e` is
+    /// 5.34:1 there, 4.41 seen), take 0 at every alpha. An ink lighter than the page, or a page
+    /// under the bar itself, keeps no glass either.
     #[test]
     fn the_caps_are_the_measured_ones() {
         use crate::rainbow_kitty::prism_glass::{ANCHOR_AT, Palette};
@@ -1396,10 +2394,16 @@ mod tests {
                 grey,
                 "#474d57 on anchor {i} #{glass:06x}"
             );
-            for ink in [0x00C4_262E, 0x000B_5CC4, 0x00A2_269E, 0x005C_6370] {
-                assert_eq!(k(ink, glass), 0, "#{ink:06x} on anchor {i} #{glass:06x}");
-            }
-            for ink in [0x001A_7F37, 0x008A_6100, 0x000F_7684, 0x006B_7280] {
+            for ink in [
+                0x00C4_262E,
+                0x000B_5CC4,
+                0x00A2_269E,
+                0x005C_6370,
+                0x001A_7F37,
+                0x008A_6100,
+                0x000F_7684,
+                0x006B_7280,
+            ] {
                 assert_eq!(
                     cap(ink, glass, BG, YIELD_BAR),
                     0,
@@ -1413,15 +2417,23 @@ mod tests {
             0,
             "a page under the bar"
         );
-        // The bar is §4's 5.25:1: Default Light's red is 5.34:1 on the page itself, between the
-        // bar and 5.35 (the bar with the glass's lerp guard over it), so a glass that leaves the
-        // page no darker keeps it whole, where 5.35 would cut it at every alpha.
+        // The bar is §4's 5.25:1 on the glyph as it is seen: the grey #5a5a5a is 6.43:1 on the
+        // page itself and 5.27 seen, between the bar and 5.35 (the bar with the glass's lerp
+        // guard over it), so a glass that leaves the page no darker keeps it whole, where 5.35
+        // would cut it at every alpha; read bare, 5.34:1 #c4262e kept it.
+        let seen = |ink: u32| crate::rainbow_kitty::prism_glass::colour::seen(ink, BG, BG);
+        assert!(
+            (5.25..5.35).contains(&seen(0x005A_5A5A)),
+            "{}",
+            seen(0x005A_5A5A)
+        );
         let pale = aterm_render::over_premul(BG, 0x0005_0505, 3) & 0x00FF_FFFF;
         assert_eq!(
-            cap(0x00C4_262E, pale, BG, YIELD_BAR),
+            cap(0x005A_5A5A, pale, BG, YIELD_BAR),
             255,
-            "#c4262e over #{pale:06x}"
+            "#5a5a5a over #{pale:06x}"
         );
+        assert_eq!(cap(0x00C4_262E, pale, BG, YIELD_BAR), 0, "#c4262e as seen");
     }
 
     /// §4 rules 1-3 and 6: an app's red word takes no glass, the grey word beside it and the
@@ -1824,6 +2836,45 @@ mod tests {
                 .any(|q| q.x < 30 && q.alpha > 0),
             "the glass under the red word is yielded: {:?}",
             input.glow_under
+        );
+    }
+
+    #[test]
+    fn a_body_only_twin_restores_selections_and_keeps_unrecorded_lights() {
+        use aterm_core::render::{PaneSelection, SelectionClip};
+        use aterm_core::selection::{SelectionSide, SelectionType};
+
+        let mut input = page(b"ordinary words");
+        input
+            .selection
+            .start_selection(0, 1, SelectionSide::Left, SelectionType::Simple);
+        input.selection.update_selection(0, 3, SelectionSide::Right);
+        input.selection.complete_selection();
+        input.selection_clip = Some(SelectionClip::new(0, 1, 1, 4));
+        input.selection_bg = 0x0012_3456;
+        input.selection_fg = 0x0065_4321;
+        input.selections.push(PaneSelection {
+            selection: input.selection.clone(),
+            clip: SelectionClip::new(0, 1, 8, 12),
+            bg: 0x0023_4567,
+            fg: 0x0076_5432,
+            inactive: true,
+        });
+        let glass = glass_over(&mut input, 0, 16, Instant::now(), None);
+        let lip = GlowQuad::flat(0, 0, 18, 160, 2, 0x0030_2010, 0x40);
+        input.glow_under.push(lip);
+        input.cursor_glow_add.push(lip);
+        assert_eq!(
+            without_body_glass_for_test(&input, &GlassLaid::default()),
+            input,
+            "an absent body record removes no light or selection"
+        );
+        let twin = without_body_glass_for_test(&input, &glass);
+        let mut expected = input.clone();
+        expected.glow_under = vec![lip];
+        assert_eq!(
+            twin, expected,
+            "only the recorded body leaves; all five selection fields and other lights survive"
         );
     }
 }

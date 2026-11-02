@@ -29,6 +29,9 @@ use aterm_effects::aos_momentum::{
 
 use crate::{App, WindowId};
 
+#[path = "aos_echo.rs"]
+pub(crate) mod echo;
+
 /// The most kept faults a window holds before it drops the oldest.
 pub(crate) const KEPT_CAP: usize = 4;
 
@@ -38,8 +41,8 @@ pub(crate) const NO_ECHO_KEY: &str = "no-echo key";
 /// Why a press or a config change detached the recording: Secure Keyboard Entry is on.
 pub(crate) const SECURE_ENTRY: &str = "secure keyboard entry";
 
-/// Why a press detached the recording: a program reads it raw, or the tty's mode is unreadable, and it is not typed at a prompt of aterm's own integrated shell, so it may be a password.
-pub(crate) const RAW_KEY: &str = "raw key";
+/// Why a key detached the recording: a program reads it raw, or the tty's mode is unreadable, it is not typed at a prompt of aterm's own integrated shell, and its own echo was not proven in place ([`echo`]), so it may be a password.
+pub(crate) use aterm_effects::aos_momentum::RAW_KEY;
 
 /// Why the watcher left a segment unjudged: its host worker did not start.
 pub(crate) const WATCHER_DID_NOT_RUN: &str = "the watcher's host worker did not run";
@@ -50,7 +53,7 @@ pub(crate) const REPAIR_THREAD: &str = "aterm-aos-repair";
 /// The watcher's host worker thread's name.
 pub(crate) const WATCH_THREAD: &str = "aterm-aos-watch";
 
-/// Why a typed key may expose a secret if recorded, or `None` when aterm sees it go where it is echoed (the tty echoes it, or it is typed at an open prompt of aterm's own shell); `echo` reads the tty only when that decides.
+/// Why a typed key may expose a secret if recorded, or `None` when aterm sees it go where it is echoed (the tty echoes it, or it is typed at an open prompt of aterm's own shell); `echo` reads the tty only when that decides. A [`RAW_KEY`] is held for the proof of its own echo ([`echo::admit_key`]).
 pub(crate) fn key_privacy(
     swallows: bool,
     secure: bool,
@@ -66,6 +69,17 @@ pub(crate) fn key_privacy(
     } else {
         Some(RAW_KEY)
     }
+}
+
+/// Routes a typed key with privacy verdict `verdict` ([`echo::admit_key`]) through `ws`'s hold.
+pub(crate) fn admit_key(
+    ws: &mut crate::WindowState,
+    verdict: Option<&'static str>,
+    press: &echo::Press,
+    cells: impl FnOnce(&mut Vec<char>) -> bool,
+) -> echo::KeyRoute {
+    let momentum = &mut ws.fx.cursor_mut().momentum;
+    echo::admit_key(&mut ws.aos, momentum, verdict, press, cells)
 }
 
 /// What the verb keeps per window between its calls.
@@ -92,10 +106,14 @@ pub(crate) struct AosWindow {
     repairing: Option<PendingRepair>,
     /// Repairs started so far; each one's token is the count including it.
     repairs: u64,
-    /// Whether a key the recording may not hold reached the glow since it last started from rest, so the next attach starts it from rest.
-    tainted: bool,
     /// The prompt each session last submitted a line from, by session: a key typed there since goes to whatever reads after the line, not to the prompt.
     submitted: std::collections::HashMap<u64, u64>,
+    /// Typed keys that wait for their program's own echo, while the glow's recording holds for them.
+    hold: Option<echo::EchoHold>,
+    /// Where the last proven run ended, for a hold that opens there.
+    echo_run: Option<echo::EchoRun>,
+    /// The frame's read of the hold's session, kept to reuse its buffers.
+    view: echo::EchoView,
 }
 
 impl AosWindow {
@@ -334,9 +352,9 @@ impl App {
         }
         let build = aterm_types::version::build_id();
         let ws = self.windows.get_mut(&id).ok_or(AosRefusal::NoWindow)?;
-        if std::mem::take(&mut ws.aos.tainted) {
-            ws.fx.cursor_mut().momentum.reset();
-        }
+        refute_hold(ws, now);
+        // A run proven under the last recording corroborates nothing in this one.
+        ws.aos.echo_run = None;
         ws.aos.attaches = ws.aos.attaches.saturating_add(1);
         ws.aos.epoch = Some(now);
         #[cfg(debug_assertions)]
@@ -590,15 +608,23 @@ impl App {
                 let _ = proxy.send_event(crate::Wake::AosWorked(Box::new(worked)));
             }
         });
-        self.aos_watch_via(post);
+        self.aos_watch_via(post, Instant::now());
     }
 
     /// [`Self::aos_watch`] with each worker's judgements handed to `post` for the main thread, or with no `post` judged in place; segments a worker that did not run leaves are timeline rows unjudged, never lost.
-    pub(crate) fn aos_watch_via<P>(&mut self, post: Option<P>)
+    pub(crate) fn aos_watch_via<P>(&mut self, post: Option<P>, now: Instant)
     where
         P: Fn(Worked) + Clone + Send + 'static,
     {
         for ws in self.windows.values_mut() {
+            if ws.aos.hold.is_some() {
+                let frame = ws.effect_present_interval();
+                if !ws.fx.cursor().momentum.aos_holding() {
+                    echo::settle_hold(ws, None, now);
+                } else if echo::hold_deadline(&ws.aos).is_some_and(|d| now >= d + frame) {
+                    private_key(ws, RAW_KEY, now);
+                }
+            }
             if let Some(why) = ws.fx.cursor_mut().momentum.aos_take_detached() {
                 ws.aos.epoch = None;
                 #[cfg(debug_assertions)]
@@ -740,9 +766,44 @@ impl App {
 
     /// Stops recording every window's glow for privacy (`why` names the no-echo key or Secure Keyboard Entry), each detach a timeline row whose recording's retired segments go to the watcher.
     pub(crate) fn aos_privacy_detach_all(&mut self, why: &'static str) {
+        let now = Instant::now();
         for ws in self.windows.values_mut() {
-            privacy_detach(ws, why);
+            privacy_detach(ws, why, now);
         }
+    }
+
+    /// Settles window `id`'s hold on its frame at `now`, before the frame ticks the glow: the window's live front terminal read under a lock it does not wait for (never the shown view, nor a rewound pane's), else no view ([`echo::settle_hold`]).
+    pub(crate) fn aos_settle_hold(&mut self, id: WindowId, now: Instant) {
+        let Some(ws) = self.windows.get_mut(&id) else {
+            return;
+        };
+        let Some(hold) = ws.aos.hold.take() else {
+            return;
+        };
+        let mut view = std::mem::take(&mut ws.aos.view);
+        let read = self
+            .front_terminal(id)
+            .filter(|front| !self.pool.is_rewound(front.session))
+            .and_then(|front| {
+                let t = crate::term_try_lock(&front.term)?;
+                view.read(&t, front.session, &hold);
+                Some(())
+            })
+            .is_some();
+        let Some(ws) = self.windows.get_mut(&id) else {
+            return;
+        };
+        ws.aos.hold = Some(hold);
+        echo::settle_hold(ws, read.then_some(&view), now);
+        ws.aos.view = view;
+    }
+
+    /// The soonest instant a window's held key is refuted unproven if no frame settles it first (its bound and a frame), for the loop's park.
+    pub(crate) fn aos_hold_deadline(&self) -> Option<Instant> {
+        self.windows
+            .values()
+            .filter_map(|ws| Some(echo::hold_deadline(&ws.aos)? + ws.effect_present_interval()))
+            .min()
     }
 
     /// `aos publish`: publishes `admitted`'s plan over the front window's glow, pausing it at `now` first if it runs, then reconciles the host as [`Self::aos_repair_at`] does and keeps the bundle.
@@ -805,8 +866,11 @@ impl App {
         })
     }
 
-    /// Stops hosting the front window's glow and returns its status.
-    pub(crate) fn aos_detach_now(&mut self) -> Result<(WindowId, MomentumAosStatus), AosRefusal> {
+    /// Stops hosting the front window's glow at `now` and returns its status; keys held for their echo go to the glow unrecorded, which taints it.
+    pub(crate) fn aos_detach_now(
+        &mut self,
+        now: Instant,
+    ) -> Result<(WindowId, MomentumAosStatus), AosRefusal> {
         let id = self.aos_front()?;
         let ws = self.windows.get_mut(&id).ok_or(AosRefusal::NoWindow)?;
         let momentum = &mut ws.fx.cursor_mut().momentum;
@@ -816,7 +880,9 @@ impl App {
         let retired = momentum.aos_take_retired();
         momentum.aos_detach();
         ws.aos.orphans.extend(retired);
-        let status = momentum.aos_status();
+        let held = ws.aos.hold.take();
+        echo::hand_over(ws, held, now);
+        let status = ws.fx.cursor().momentum.aos_status();
         ws.aos.epoch = None;
         #[cfg(debug_assertions)]
         {
@@ -964,7 +1030,9 @@ impl App {
             #[cfg(not(debug_assertions))]
             Asked::Bundle => return Err(crate::aos_verb::needs_debug("bundle")),
             Asked::Resume => self.aos_resume_now().map(|r| resume_line(&r)),
-            Asked::Detach => self.aos_detach_now().map(|(id, s)| status_line(id.0, &s)),
+            Asked::Detach => self
+                .aos_detach_now(now)
+                .map(|(id, s)| status_line(id.0, &s)),
             Asked::Trace => self.aos_trace_now().map(|t| trace_line(&t)),
             Asked::TraceHex => self
                 .aos_trace_file_now()
@@ -999,25 +1067,51 @@ thread_local! {
     pub(crate) static PRIVACY_DETACH_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Notes a typed key the recording may not hold (`why`, from [`key_privacy`]) before the glow sees it: the glow is tainted until an attach starts it from rest, and a recording of it stops ([`privacy_detach`]).
-pub(crate) fn private_key(ws: &mut crate::WindowState, why: &'static str) {
-    ws.aos.tainted = true;
-    privacy_detach(ws, why);
+/// Notes a typed key the recording may not hold (`why`, from [`key_privacy`], or [`RAW_KEY`] for a held run whose echo was not proven) before the glow sees it: a recording of it stops ([`privacy_detach`]), and the glow is tainted until an attach starts it from rest.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AosKeyHold",
+        action = "Private",
+        project = "aterm_gui::aos_echo_tests::claim2::Gui::project"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AosKeyHold",
+        action = "Refute",
+        project = "aterm_gui::aos_echo_tests::claim2::Gui::project"
+    )
+)]
+pub(crate) fn private_key(ws: &mut crate::WindowState, why: &'static str, now: Instant) {
+    privacy_detach(ws, why, now);
+    ws.fx.cursor_mut().momentum.taint();
 }
 
-/// Stops recording `ws`'s glow for privacy before the press `why` names reaches it, so no event of the press is logged: a timeline row, and the recording's retired segments go to the watcher.
-pub(crate) fn privacy_detach(ws: &mut crate::WindowState, why: &'static str) {
+/// Stops the recording for the keys `ws` holds for their echo, if any, as an unproven run does ([`private_key`] for [`RAW_KEY`]): a paste, an attach or a rewind while keys wait.
+pub(crate) fn refute_hold(ws: &mut crate::WindowState, now: Instant) {
+    if ws.aos.hold.is_some() {
+        private_key(ws, RAW_KEY, now);
+    }
+}
+
+/// Stops recording `ws`'s glow for privacy before the press `why` names reaches it, so no event of the press is logged: a timeline row, and the recording's retired segments go to the watcher. Keys held for their echo go to the glow at `now`, unrecorded.
+pub(crate) fn privacy_detach(ws: &mut crate::WindowState, why: &'static str, now: Instant) {
     #[cfg(test)]
     if PRIVACY_DETACH_OFF.with(std::cell::Cell::get) {
         return;
     }
+    let held = ws.aos.hold.take();
     let momentum = &mut ws.fx.cursor_mut().momentum;
     if !momentum.aos_attached() {
+        echo::hand_over(ws, held, now);
         return;
     }
     let retired = momentum.aos_take_retired();
     momentum.aos_detach();
     ws.aos.orphans.extend(retired);
+    echo::hand_over(ws, held, now);
     ws.aos.epoch = None;
     #[cfg(debug_assertions)]
     {

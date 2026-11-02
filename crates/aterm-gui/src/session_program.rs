@@ -111,10 +111,88 @@ fn argv_head(words: &[std::ffi::OsString]) -> Option<(String, Option<String>)> {
     Some((argv0, argv1))
 }
 
-/// The published program of `pid` ([`program_from_argv`], [`argv_head_of`]).
+/// The published program of `pid` ([`program_of_words`] its arguments).
 pub(crate) fn program_of(pid: i32) -> Option<String> {
-    let (argv0, argv1) = argv_head_of(pid)?;
+    if pid <= 0 {
+        return None;
+    }
+    program_of_words(&aterm_uds::process::read_process_argv(pid)?)
+}
+
+/// The published program of a process whose arguments are `words`: a build's front by the build
+/// it becomes ([`front_program`]), else [`program_from_argv`] its head ([`argv_head`]).
+fn program_of_words(words: &[std::ffi::OsString]) -> Option<String> {
+    if aterm_uds::build_front::front(words).is_some() {
+        return front_program(words);
+    }
+    let (argv0, argv1) = argv_head(words)?;
     program_from_argv(&argv0, argv1.as_deref(), &atpkg_shim)
+}
+
+/// THE PROGRAM A BUILD'S FRONT BECOMES, where `argv` names one ([`aterm_uds::build_front::front`]):
+/// its target's name as [`program_from_argv0`] reads it, which is how the tab names the build once
+/// the front has exec'd it. The one naming rule of a front, for `status` and the survey (the
+/// leader's facts) and for `sys jobs` (`vitals_jobs`' rows). `None` for any other argv.
+pub(crate) fn front_program<S: AsRef<std::ffi::OsStr>>(argv: &[S]) -> Option<String> {
+    let front = aterm_uds::build_front::front(argv)?;
+    program_from_argv0(&front.target.as_ref().to_string_lossy())
+}
+
+/// A BUILD'S FRONT WAITING FOR MEMORY, as `status` says it (`wait=memory wait_gib= wait_ahead=`):
+/// what its ledger says of its claim, where the ledger was read and holds it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BuildWait {
+    /// The memory its waiting claim asks, bytes.
+    pub(crate) mem: Option<u64>,
+    /// The memory claims ahead of it.
+    pub(crate) ahead: Option<usize>,
+}
+
+impl BuildWait {
+    /// What a front's ledger says of it ([`atpkg::build_admit::front_claim`]): waiting with its
+    /// figures; admitted (it execs its build, or runs it where no holder armed), no wait; unread
+    /// or holding no claim of its pid (its ledger is not the one this reader reads), still a
+    /// front, so waiting, its figures unknown.
+    pub(crate) fn of(claim: Option<atpkg::build_admit::FrontClaim>) -> Option<Self> {
+        match claim {
+            Some(atpkg::build_admit::FrontClaim::Waiting { mem, ahead }) => Some(Self {
+                mem: Some(mem),
+                ahead: Some(ahead.len()),
+            }),
+            Some(atpkg::build_admit::FrontClaim::Held) => None,
+            None => Some(Self::default()),
+        }
+    }
+
+    /// `status`'s fields: ` wait=memory wait_gib=<GiB to a tenth|-> wait_ahead=<n|->`, or
+    /// ` wait=- wait_gib=- wait_ahead=-` for a program that waits for none.
+    pub(crate) fn fields(wait: Option<&Self>) -> String {
+        let Some(wait) = wait else {
+            return " wait=- wait_gib=- wait_ahead=-".to_string();
+        };
+        let gib = wait.mem.map_or_else(
+            || "-".to_string(),
+            |bytes| {
+                let g = u128::from(1_u64 << 30);
+                let tenths = (u128::from(bytes) * 10 + g / 2) / g;
+                format!("{}.{}", tenths / 10, tenths % 10)
+            },
+        );
+        let ahead = wait
+            .ahead
+            .map_or_else(|| "-".to_string(), |n| n.to_string());
+        format!(" wait=memory wait_gib={gib} wait_ahead={ahead}")
+    }
+}
+
+/// [`BuildWait::of`] the front `pid`, read in the ledger the front claims in
+/// ([`atpkg::build_admit::ledger_of_front`], `env` its environment).
+fn build_wait_of(pid: i32, env: &dyn Fn(&str) -> Option<String>) -> Option<BuildWait> {
+    let claim = u32::try_from(pid)
+        .ok()
+        .zip(atpkg::build_admit::ledger_of_front(env))
+        .and_then(|(pid, ledger)| atpkg::build_admit::front_claim(&ledger, pid).ok().flatten());
+    BuildWait::of(claim)
 }
 
 /// What the shell's exported PATH does with the agent programs ([`path_verdict`]).
@@ -197,6 +275,9 @@ pub(crate) struct LeaderFacts {
     pub(crate) path: Option<PathVerdict>,
     /// Whether started with `--no-harness`, `--no-alab-harness`, or `ATERM_NO_HARNESS=1`.
     pub(crate) no_harness: bool,
+    /// A build's front, named [`Self::program`] by the build it becomes ([`front_program`]),
+    /// whose claim waits for memory ([`BuildWait`]); `None` for any other leader.
+    pub(crate) build_wait: Option<BuildWait>,
 }
 
 /// [`LeaderFacts`] from one parsed `KERN_PROCARGS2` read.
@@ -210,10 +291,14 @@ pub(crate) fn facts_from(
 ) -> LeaderFacts {
     let argv0 = args.argv.first().map_or("", String::as_str);
     let argv1 = args.argv.get(1).map(String::as_str);
-    let program = program_from_argv(argv0, argv1, &|script| shim_of(script).is_some());
-    let shim = program
-        .as_deref()
-        .is_some_and(|p| program_from_argv0(argv0).as_deref() != Some(p));
+    let front = front_program(&args.argv);
+    let is_front = front.is_some();
+    let named = program_from_argv(argv0, argv1, &|script| shim_of(script).is_some());
+    let shim = !is_front
+        && named
+            .as_deref()
+            .is_some_and(|p| program_from_argv0(argv0).as_deref() != Some(p));
+    let program = front.or(named);
     let reroute = shim && argv1.and_then(shim_of) == Some(Shim::Reroute);
     let store = managed.map(|layout| layout.prefix.join("store"));
     let script_agent = program
@@ -270,6 +355,7 @@ pub(crate) fn facts_from(
         copy,
         path,
         no_harness,
+        build_wait: is_front.then(BuildWait::default),
     }
 }
 
@@ -294,7 +380,9 @@ fn platform_parent(pid: i32) -> Option<i32> {
 
 #[cfg(target_os = "linux")]
 fn platform_parent(pid: i32) -> Option<i32> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let stat =
+        aterm_uds::process::read_proc_text(std::path::Path::new(&format!("/proc/{pid}/stat")))
+            .ok()?;
     let rest = &stat[stat.rfind(')')? + 1..];
     rest.split_whitespace().nth(1)?.parse().ok()
 }
@@ -311,8 +399,17 @@ pub(crate) fn leader_facts(pgid: i32, shell: i32) -> LeaderFacts {
         .filter(|p| *p > 0)
         .and_then(atpkg::caller_shell::process_args)
     else {
+        // One read of its arguments names it and says whether it is a front, so both come from
+        // the one program it ran then.
+        let words = (pgid > 0)
+            .then(|| aterm_uds::process::read_process_argv(pgid))
+            .flatten();
+        let front = words
+            .as_deref()
+            .is_some_and(|words| aterm_uds::build_front::front(words).is_some());
         return LeaderFacts {
-            program: program_of(pgid),
+            program: words.as_deref().and_then(program_of_words),
+            build_wait: front.then(|| build_wait_of(pgid, &|_| None)).flatten(),
             ..LeaderFacts::default()
         };
     };
@@ -321,14 +418,18 @@ pub(crate) fn leader_facts(pgid: i32, shell: i32) -> LeaderFacts {
         .as_ref()
         .map(atpkg::reroute::agents_routes)
         .unwrap_or_default();
-    facts_from(
+    let mut facts = facts_from(
         &args,
         parent_of(pgid),
         shell,
         managed.as_ref(),
         &|script| managed.as_ref().and_then(|layout| shim_in(script, layout)),
         &|dir| holds_agent(dir, &laid),
-    )
+    );
+    if facts.build_wait.is_some() {
+        facts.build_wait = build_wait_of(pgid, &|key| args.env_var(key).map(str::to_owned));
+    }
+    facts
 }
 
 /// One resolution request: the session, its timeline, the group to name and
@@ -698,7 +799,8 @@ fn publish_if_current(
     let program_changed = timeline.set_program(job.pgid, facts.program);
     timeline.set_leader(job.pgid, facts.copy, facts.path);
     let no_harness_changed = timeline.set_leader_no_harness(job.pgid, facts.no_harness);
-    let changed = program_changed || no_harness_changed;
+    let wait_changed = timeline.set_build_wait(job.pgid, facts.build_wait);
+    let changed = program_changed || no_harness_changed || wait_changed;
     let became_claude =
         program_changed && crate::claude_footer::drawn_for(timeline.agent().program.as_deref());
     (changed, became_claude, program_changed && was_claude)
@@ -1688,5 +1790,133 @@ mod tests {
         assert!(tl.set_leader_no_harness(4200, true));
         assert!(tl.unapplied_leader_no_harness());
         assert!(tl.take_leader_no_harness());
+    }
+
+    /// The argv a `targo` shim's hop execs its front with (`atpkg::build_cache_registered`'s
+    /// rendered hop, as its tests record it): the helper, the verb, `--shim targo <placed>`, the
+    /// store's `targo` and the typed words.
+    const HOP: [&str; 9] = [
+        "/Applications/aterm.app/Contents/MacOS/atpkg",
+        "__build_admit",
+        "--shim",
+        "targo",
+        "config",
+        "/Users//o/.local/share/aterm/store/trust/bin/targo",
+        "--unverified",
+        "build",
+        "-p",
+    ];
+
+    fn read_as(exec: &str, argv: &[&str]) -> LeaderFacts {
+        let args = atpkg::caller_shell::ProcArgs {
+            exec_path: exec.to_string(),
+            argv: argv.iter().map(|s| (*s).to_string()).collect(),
+            env: Vec::new(),
+        };
+        facts_from(&args, Some(1916), 1916, None, &|_| None, &|_| false)
+    }
+
+    /// A BUILD'S FRONT IS NAMED BY THE BUILD IT BECOMES, WAITING: the leader whose argv is a
+    /// shim's hop reads `program=targo` (its target's name, as the tab names the build once the
+    /// front execs it) and waits for memory, its figures unread until its ledger is; the
+    /// fallback reader names it the same way. NEGATIVE CONTROL: the same image running another
+    /// verb reads `atpkg` with no wait, a build typed plainly reads `targo` with none, and a
+    /// search for the verb's word reads as the search.
+    #[test]
+    fn a_front_is_named_by_the_build_it_becomes_and_waits() {
+        let exec = HOP[0];
+        let front = read_as(exec, &HOP);
+        assert_eq!(front.program.as_deref(), Some("targo"));
+        assert_eq!(front.build_wait, Some(BuildWait::default()));
+        assert_eq!(front.copy, None);
+        let words: Vec<String> = HOP.iter().map(|s| (*s).to_string()).collect();
+        assert_eq!(front_program(&words).as_deref(), Some("targo"));
+        let registration = read_as(
+            exec,
+            &[
+                exec,
+                "__build_cache_register",
+                "targo",
+                "--unverified",
+                "build",
+            ],
+        );
+        assert_eq!(registration.program.as_deref(), Some("atpkg"));
+        assert_eq!(registration.build_wait, None);
+        let capabilities = read_as(exec, &[exec, "__build_admit", "--capabilities"]);
+        assert_eq!(capabilities.program.as_deref(), Some("atpkg"));
+        assert_eq!(capabilities.build_wait, None);
+        let typed = read_as(HOP[5], &[HOP[5], "--unverified", "build"]);
+        assert_eq!(typed.program.as_deref(), Some("targo"));
+        assert_eq!(typed.build_wait, None);
+        let search = read_as("/usr/bin/rg", &["rg", "__build_admit", "crates/atpkg"]);
+        assert_eq!(search.program.as_deref(), Some("rg"));
+        assert_eq!(search.build_wait, None);
+    }
+
+    /// What a front's ledger says becomes its wait: waiting with its claim and the claims ahead;
+    /// admitted, none; unread, waiting with no figures. `status` prints the claim to a tenth of a
+    /// GiB and `-` for what is unknown. NEGATIVE CONTROL: a leader with no wait prints `-` for
+    /// all three.
+    #[test]
+    fn a_fronts_wait_is_what_its_ledger_says() {
+        use atpkg::build_admit::FrontClaim;
+        let gib = 1_u64 << 30;
+        let waiting = BuildWait::of(Some(FrontClaim::Waiting {
+            mem: 12 * gib,
+            ahead: vec![71, 72],
+        }));
+        assert_eq!(
+            waiting,
+            Some(BuildWait {
+                mem: Some(12 * gib),
+                ahead: Some(2)
+            })
+        );
+        assert_eq!(BuildWait::of(Some(FrontClaim::Held)), None);
+        assert_eq!(BuildWait::of(None), Some(BuildWait::default()));
+        assert_eq!(
+            BuildWait::fields(waiting.as_ref()),
+            " wait=memory wait_gib=12.0 wait_ahead=2"
+        );
+        let odd = BuildWait {
+            mem: Some(gib * 147 / 10),
+            ahead: Some(0),
+        };
+        assert_eq!(
+            BuildWait::fields(Some(&odd)),
+            " wait=memory wait_gib=14.7 wait_ahead=0"
+        );
+        assert_eq!(
+            BuildWait::fields(Some(&BuildWait::default())),
+            " wait=memory wait_gib=- wait_ahead=-"
+        );
+        assert_eq!(BuildWait::fields(None), " wait=- wait_gib=- wait_ahead=-");
+    }
+
+    /// The timeline keeps a front's wait for its group alone: a reading for another group is
+    /// dropped, a move of the foreground takes the wait away, and the same group read again as
+    /// admitted clears it. NEGATIVE CONTROL: an unchanged reading reports no change.
+    #[test]
+    fn the_timeline_keeps_a_fronts_wait_for_its_group_alone() {
+        let wait = BuildWait {
+            mem: Some(1 << 30),
+            ahead: Some(1),
+        };
+        let mut tl = crate::session_timeline::SessionTimeline::default();
+        assert!(tl.note_foreground_group(5100));
+        assert!(!tl.set_build_wait(5200, Some(wait)), "another group's");
+        assert_eq!(tl.build_wait(), None);
+        assert!(tl.set_build_wait(5100, Some(wait)));
+        assert!(!tl.set_build_wait(5100, Some(wait)), "no change");
+        assert_eq!(tl.build_wait(), Some(&wait));
+        assert!(
+            tl.set_build_wait(5100, None),
+            "admitted: it execs its build"
+        );
+        assert_eq!(tl.build_wait(), None);
+        assert!(tl.set_build_wait(5100, Some(wait)));
+        assert!(tl.note_foreground_group(5300));
+        assert_eq!(tl.build_wait(), None, "the front left the foreground");
     }
 }

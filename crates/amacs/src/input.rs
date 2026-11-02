@@ -199,6 +199,34 @@ impl EditorWorkspace {
             Some(twin) => (twin, text),
             None => (key, text),
         };
+        if store.directory(view.document).is_some()
+            && !view.minibuffer_active()
+            && !view.chord_pending()
+            && !mods.intersects(
+                Modifiers::CTRL
+                    | Modifiers::ALT
+                    | Modifiers::META
+                    | Modifiers::SUPER
+                    | Modifiers::HYPER,
+            )
+        {
+            let typed = match text.as_deref() {
+                Some(text) => {
+                    let mut chars = text.chars();
+                    chars.next().filter(|_| chars.next().is_none())
+                }
+                None => match key {
+                    Key::Character(character) => Some(character),
+                    _ => None,
+                },
+            };
+            if let Some(character @ ('n' | 'p' | 'g' | '^' | 'f' | 'q')) = typed
+                && let Some(chord) =
+                    KeyChord::from_key(&Key::Character(character), Modifiers::empty())
+            {
+                return self.handle_chord(store, view, chord).map(Reduction::reveal);
+            }
+        }
         let spelled = !mods.intersects(Modifiers::SUPER | Modifiers::HYPER)
             && KeyChord::from_key(&key, mods).is_some();
         if !spelled && view.end_escape_prefix() {

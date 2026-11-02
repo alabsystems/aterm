@@ -166,6 +166,24 @@ fn appnotice_text_is_recorded() {
         ("harness", "aterm harness acting \u{00b7} approving rm")
     );
     assert_eq!(app.messages.log().len(), before + 1);
+    let ended = "verify ended aterm (pid 71), left by the verify run of pid 41983 (/w): proof \
+                 run,tree; SIGTERM; gone";
+    for _ in 0..2 {
+        assert_eq!(
+            app.take_app_notice("proc", ended),
+            Ok(super::AppNoticeTaken::Recorded)
+        );
+    }
+    assert_eq!(live(&app), 0, "no row for what a verify run ended");
+    let ends: Vec<&str> = app
+        .messages
+        .log()
+        .records()
+        .filter(|r| r.key.as_deref() == Some("proc.auto-end"))
+        .map(|r| r.tag.as_str())
+        .collect();
+    assert_eq!(ends, ["system", "system"], "each end keeps its own record");
+    assert_eq!(app.messages.log().len(), before + 3);
     assert!(app.take_app_notice("elsewhere", "x").is_err());
 }
 

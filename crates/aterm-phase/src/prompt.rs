@@ -1203,10 +1203,19 @@ fn warning_of(row: &str) -> Option<&str> {
     Some(crate::text::trim(row).strip_prefix('⚠')?.trim())
 }
 
+/// What follows the auto-deny countdown's head on `text`: `deny this request in` (measured
+/// through 2.1.308) or `block this request in` (2.1.316). `None` when `text` opens with neither.
+pub(crate) fn after_countdown_head(text: &str) -> Option<&str> {
+    [
+        const { crate::anchor!("box.auto_deny") },
+        const { crate::anchor!("box.auto_block") },
+    ]
+    .into_iter()
+    .find_map(|head| text.strip_prefix(head))
+}
+
 fn auto_deny_left(text: &str) -> Option<std::time::Duration> {
-    let rest = text
-        .strip_prefix(const { crate::anchor!("box.auto_deny") })?
-        .strip_prefix(' ')?;
+    let rest = after_countdown_head(text)?.strip_prefix(' ')?;
     let time = rest.split(',').next()?;
     let (m, s) = time.split_once(':')?;
     let digits = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
@@ -1245,7 +1254,8 @@ fn auto_deny_block(body: &[String], col: usize) -> Option<(String, std::ops::Ran
         .filter(|p| !p.is_empty())
         .collect::<Vec<_>>()
         .join(" ");
-    text.starts_with(const { crate::anchor!("box.auto_deny") })
+    after_countdown_head(&text)
+        .is_some()
         .then_some((text, 0..end))
 }
 
@@ -2995,6 +3005,12 @@ pub mod fixtures {
         include_str!("fixtures/claude-2.1.304-transcript-degraded-eacces.txt");
     pub const WAIT_BG3: &str = include_str!("fixtures/wait_bg3.out");
     pub const WAIT_BG7: &str = include_str!("fixtures/wait_bg7.out");
+    pub const STATUSLINE_MIDREPLY_2_1_311: &str =
+        include_str!("fixtures/claude-2.1.311-lab-statusline-midreply.txt");
+    pub const STATUSLINE_LAST_LINE_HELD_2_1_311: &str =
+        include_str!("fixtures/claude-2.1.311-lab-statusline-last-line-held.txt");
+    pub const STATUSLINE_REPLY_DONE_2_1_311: &str =
+        include_str!("fixtures/claude-2.1.311-lab-statusline-reply-done.txt");
     pub const IDLE_AFTER_LIMIT_AND_MODEL_SWITCH: &str =
         include_str!("fixtures/idle-after-limit-and-model-switch.txt");
 
@@ -3006,6 +3022,10 @@ pub mod fixtures {
     pub const BOX_RM_AUTO_DENY: &str = include_str!("fixtures/claude-2.1.281-box-rm-auto-deny.txt");
     pub const BOX_RM_AUTO_DENY_2_1_301: &str =
         include_str!("fixtures/claude-2.1.301-box-rm-auto-deny-bypass.txt");
+    pub const BOX_RM_AUTO_BLOCK_2_1_316: &str =
+        include_str!("fixtures/claude-2.1.316-box-rm-auto-block-bypass.txt");
+    pub const BOX_BASH_DECLINED_ESC_2_1_316: &str =
+        include_str!("fixtures/claude-2.1.316-box-bash-declined-esc.txt");
     pub const BOX_RM_UNRESOLVABLE_WORKFLOW: &str =
         include_str!("fixtures/claude-2.1.280-box-rm-unresolvable-workflow.txt");
     pub const BOX_RM_WORKFLOW: &str = include_str!("fixtures/claude-2.1.28x-box-rm-workflow.txt");
@@ -3594,6 +3614,16 @@ pub mod fixtures {
     pub const MEMORY_BANNER_IDLE: &str = include_str!("fixtures/memory-banner-idle.txt");
     pub const IDLE_SHELLS_2_1_271: &str =
         include_str!("fixtures/claude-2.1.271-idle-shells-still-running.txt");
+    pub const WAITING_WORKFLOWS_2_1_310: &str =
+        include_str!("fixtures/claude-2.1.310-waiting-3-workflows-turn-over-panel.txt");
+    pub const WRAPUP_WAITING_2_1_283: &str =
+        include_str!("fixtures/claude-2.1.283-wall-session-wrapup-waiting-measured.txt");
+    pub const AGENTS_PANEL_AGENT_SELECTED_2_1_304: &str =
+        include_str!("fixtures/claude-2.1.304-agents-panel-agent-selected.txt");
+    pub const WAITING_AGENTS_WORKFLOWS_2_1_316: &str =
+        include_str!("fixtures/claude-2.1.316-waiting-agents-and-workflows-turn-over-panel.txt");
+    pub const INFERRING_OVER_BACKGROUND_2_1_316: &str =
+        include_str!("fixtures/claude-2.1.316-inferring-over-shells-and-agents-panel.txt");
 
     pub const ASK_TWO_FIRST: &str = include_str!("fixtures/claude-2.1.281-ask-two-first-tab.txt");
     pub const ASK_TWO_SECOND: &str = include_str!("fixtures/claude-2.1.281-ask-two-second-tab.txt");
@@ -5340,6 +5370,31 @@ mod tests {
         let mut bare = r.clone();
         bare[at] = " ⚠ Claude Code will automatically deny this request in".to_string();
         assert_eq!(left(&bare), None, "no time at all");
+    }
+
+    /// 2.1.316 words the countdown `block this request in …, to avoid holding up an unattended
+    /// session`: its measured box still says its time left, its rm note is one note apart from
+    /// it, and a wrapped one is still the countdown.
+    #[test]
+    fn the_countdown_worded_block_says_the_time_left() {
+        use std::time::Duration;
+        let r = screen(BOX_RM_AUTO_BLOCK_2_1_316);
+        let p = parse_prompt_v2(&r).expect("the 2.1.316 box");
+        assert_eq!(p.kind, PromptKind::Bash);
+        assert_eq!(p.auto_deny_left(), Some(Duration::from_secs(119)));
+        assert_eq!(p.notes.len(), 1, "{:?}", p.notes);
+        assert!(p.rm_breaker().is_some(), "{:?}", p.notes);
+        let at = r
+            .iter()
+            .position(|row| row.contains("automatically block"))
+            .expect("the countdown");
+        let mut wrapped = r.clone();
+        wrapped[at] =
+            " ⚠ Claude Code will automatically block this request in 1:59, to avoid".to_string();
+        wrapped.insert(at + 1, " holding up an unattended session".to_string());
+        let p = parse_prompt_v2(&wrapped).expect("the wrapped box");
+        assert_eq!(p.auto_deny_left(), Some(Duration::from_secs(119)));
+        assert_eq!(p.notes.len(), 1, "{:?}", p.notes);
     }
 
     #[test]

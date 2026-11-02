@@ -169,6 +169,16 @@ fn the_line_carries_the_launch_flags_as_the_relaunch_does() {
         "a control character is never printed as a command"
     );
     assert_eq!(
+        command(&argv(&["claude", "--model", "a\u{2028}b"]), OURS),
+        None,
+        "a Unicode line separator is never printed as a command"
+    );
+    assert_eq!(
+        with_env(&[("CLAUDE_CONFIG_DIR", "/tmp/a\u{2029}b")], "claude"),
+        None,
+        "a Unicode paragraph separator in env is refused"
+    );
+    assert_eq!(
         command(
             &argv(&[
                 "node",
@@ -370,4 +380,16 @@ fn the_footers_resume_line_carries_the_home_its_process_runs_under() {
     );
     assert_eq!(read(None, None), Some(bare));
     assert!(home_env(Path::new("/u/me"), None, Some(Path::new("/u/me/.claude"))).is_empty());
+    assert_eq!(
+        with_env(&[("1BAD", "x")], &format!("claude --resume {OURS}")),
+        None
+    );
+    assert_eq!(bare_of(&format!("muse --resume {OURS}")), None);
+    assert_eq!(bare_of(&format!("claude 'unclosed --resume {OURS}")), None);
+    assert_eq!(
+        mode_of(&format!(
+            "claude --permission-mode auto 'unclosed --resume {OURS}"
+        )),
+        None
+    );
 }

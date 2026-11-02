@@ -204,7 +204,9 @@ fn candidate_document(path: &Path) -> Result<Value> {
             if !nonempty(cell) {
                 continue;
             }
-            if let Some(provider) = csv.headers.get(column).and_then(|h| provider(h)) {
+            if let Some(provider) = csv.headers.get(column).and_then(|h| provider(h))
+                && matches!(cell.trim(), "0" | "1")
+            {
                 providers.push(json!({"provider":provider,"column":column+1,"presence_marker":cell.trim()=="1"}));
             }
             if !(column == email_column && email.is_some()
@@ -437,6 +439,44 @@ fn chunk_request(request: [u8; 16], index: u64) -> [u8; 16] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_binary_provider_markers_make_presence_claims() {
+        let root = crate::tests::tmp();
+        let path = root.path().join("markers.csv");
+        for (cell, expected) in [
+            ("1", Some(true)),
+            (" 1 ", Some(true)),
+            ("0", Some(false)),
+            (" 0 ", Some(false)),
+            ("phone required", None),
+            ("email link", None),
+            ("true", None),
+            ("false", None),
+            ("01", None),
+            ("1.0", None),
+            ("0.0", None),
+        ] {
+            std::fs::write(&path, format!("email,google\nowner@example.test,{cell}\n")).unwrap();
+            let value = candidate_document(&path).unwrap();
+            let row = &value["rows"][0];
+            let providers = row["providers"].as_array().unwrap();
+            if let Some(present) = expected {
+                assert_eq!(
+                    providers,
+                    &[json!({"provider":"google","column":2,"presence_marker":present})],
+                    "{cell}"
+                );
+            } else {
+                assert!(providers.is_empty(), "{cell} is unclassified, not absent");
+            }
+            assert_eq!(row["unclassified_columns"], json!([2]));
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                format!("email,google\nowner@example.test,{cell}\n")
+            );
+        }
+    }
+
     #[test]
     fn csv_quotes_multiline_unicode_and_empty_columns_preserve_positions() {
         let table = parse("a,,c\r\n\"two, fields\",\"a\"\"b\nü\",\r\n".as_bytes()).unwrap();

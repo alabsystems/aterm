@@ -7,7 +7,7 @@
 
 use super::{
     Snapshot,
-    binding::Request,
+    binding::{Binding, Request},
     constraints::Fact,
     journal::{Journal, State, Trust},
     node::{Kind, MAX_NODE, Node},
@@ -32,6 +32,35 @@ fn custody_digest(path: &Path) -> Result<[u8; 32]> {
     let bytes = fsx::read_private(path, MAX_DEVICE)?
         .ok_or_else(|| Error::new("Commons immutable custody is missing"))?;
     Ok(aterm_digest::Sha256::digest(bytes.as_slice()))
+}
+
+fn established_files(paths: &Paths) -> Result<()> {
+    let commons = paths.dir.join("commons");
+    let control = commons.join("control");
+    for dir in [&paths.dir, &commons, &control] {
+        aterm_uds::private_file::check_private_dir(dir)?;
+    }
+    for path in [
+        paths.dir.join("identity"),
+        paths.dir.join("commons.claim"),
+        paths.dir.join("commons.lock"),
+        paths.dir.join("commons-device.lock"),
+        commons.join("device.age"),
+        commons.join("device.claim"),
+        commons.join("default.pin"),
+        control.join("control.anchor"),
+    ] {
+        let parent = path.parent().unwrap();
+        let name = path.file_name().and_then(|name| name.to_str()).unwrap();
+        let (_, metadata) = aterm_uds::private_file::open_private(parent, name)
+            .map_err(|_| Error::new("existing Commons custody file is unavailable"))?;
+        if metadata.nlink() != 1 || metadata.len() > MAX_DEVICE as u64 {
+            return Err(Error::new(
+                "existing Commons custody file is not privately held",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// How long an observation waits for another local holder of `commons.lock`.
@@ -65,36 +94,64 @@ impl CustodyLock {
         name: &str,
         wait: bool,
         deadline: Option<std::time::Instant>,
+        held: impl FnMut(),
+    ) -> Result<Self> {
+        Self::acquire_policy(paths, name, wait, deadline, false, held)
+    }
+
+    fn observe_until_with(
+        paths: &Paths,
+        name: &str,
+        deadline: Option<std::time::Instant>,
+        held: impl FnMut(),
+    ) -> Result<Self> {
+        Self::acquire_policy(paths, name, false, deadline, true, held)
+    }
+
+    fn acquire_policy(
+        paths: &Paths,
+        name: &str,
+        wait: bool,
+        deadline: Option<std::time::Instant>,
+        existing_only: bool,
         mut held: impl FnMut(),
     ) -> Result<Self> {
         use std::os::unix::fs::OpenOptionsExt;
-        fsx::ensure_private_dir(&paths.dir)?;
+        if existing_only {
+            aterm_uds::private_file::check_private_dir(&paths.dir)?;
+        } else {
+            fsx::ensure_private_dir(&paths.dir)?;
+        }
         let path = paths.dir.join(name);
         // This empty inode is the lock, not a replaceable data record. A
         // hard-link publication briefly has two names and is correctly refused
         // by concurrent private-file readers. Publish it with one name from
         // the first instant; never truncate or replace an existing lock.
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(&path)
-        {
-            Ok(file) => {
-                aterm_durable::durable(&file)?;
-                aterm_durable::durable_dir(&paths.dir)?;
+        if !existing_only {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(&path)
+            {
+                Ok(file) => {
+                    aterm_durable::durable(&file)?;
+                    aterm_durable::durable_dir(&paths.dir)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
         }
-        let (file, metadata) = aterm_uds::private_file::open_private(&paths.dir, name)
-            .map_err(|error| Error::new(format!("Commons custody lock is not private: {error}")))?;
+        let (file, metadata) =
+            aterm_uds::kept_out(|| aterm_uds::private_file::open_private(&paths.dir, name))
+                .map_err(|error| {
+                    Error::new(format!("Commons custody lock is not private: {error}"))
+                })?;
         let custody_file: std::fs::File = file;
-        aterm_uds::keep_out_of_children(&custody_file)?;
         let mut observed_held = || {
             #[cfg(test)]
-            tests::custody_held();
+            tests::admission_held();
             held();
         };
         let result = if let Some(deadline) = deadline {
@@ -361,6 +418,113 @@ impl Device {
         Self::open_identity(paths, identity, true)
     }
 
+    pub(crate) fn open_existing_until(paths: &Paths, deadline: std::time::Instant) -> Result<Self> {
+        let identity = client::read_identity(paths)?
+            .ok_or_else(|| Error::new("Commons secrets identity is missing"))?;
+        Self::open_identity_checked(paths, identity, true, Some(deadline), false, || {
+            if std::time::Instant::now() >= deadline {
+                Err(Error::new("Commons device deadline expired"))
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    /// Observe an existing authenticated binding without acquiring device custody or repairing
+    /// files. This grants no bootstrap or membership. A present public claim must match; second
+    /// reads of the ciphertext and recipient must still match the authenticated observation.
+    pub(crate) fn existing_binding_for_observation(paths: &Paths) -> Result<Binding> {
+        Self::existing_binding_before_claim(paths, || {})
+    }
+
+    fn existing_binding_before_claim(
+        paths: &Paths,
+        before_claim: impl FnOnce(),
+    ) -> Result<Binding> {
+        let identity = client::read_identity(paths)?
+            .ok_or_else(|| Error::new("Commons secrets identity is missing"))?;
+        Self::observe_binding(paths, identity, before_claim)
+    }
+
+    fn observe_binding(
+        paths: &Paths,
+        identity: Identity,
+        before_claim: impl FnOnce(),
+    ) -> Result<Binding> {
+        type Key = ([u8; 32], [u8; 32]);
+        type Public = (Binding, [u8; 32]);
+        static BINDINGS: std::sync::Mutex<std::collections::VecDeque<(Key, Public)>> =
+            std::sync::Mutex::new(std::collections::VecDeque::new());
+        let recipient = identity.recipient();
+        let dir = paths.dir.join("commons");
+        let ciphertext = fsx::read_private(&dir.join("device.age"), MAX_DEVICE)?
+            .ok_or_else(|| Error::new("Commons device key is missing"))?;
+        let key = (
+            recipient.0,
+            aterm_digest::Sha256::digest(ciphertext.as_slice()),
+        );
+        let cached = BINDINGS.lock().ok().and_then(|cache| {
+            cache
+                .iter()
+                .find(|(held, _)| *held == key)
+                .map(|(_, public)| public.clone())
+        });
+        let was_cached = cached.is_some();
+        let (binding, expected) = match cached {
+            Some(public) => public,
+            None => {
+                let device = Self::decode(identity, ciphertext.as_slice())?;
+                (
+                    device.request([1; 16], [2; 32])?.binding().clone(),
+                    aterm_digest::Sha256::digest(device.claim()),
+                )
+            }
+        };
+        let current_ciphertext = fsx::read_private(&dir.join("device.age"), MAX_DEVICE)?;
+        before_claim();
+        let current_claim = fsx::read_private(&dir.join("device.claim"), CLAIM_LEN)?;
+        if current_ciphertext.as_ref().map(|bytes| bytes.as_slice()) != Some(ciphertext.as_slice())
+            || client::read_identity(paths)?
+                .is_none_or(|identity| identity.recipient() != recipient)
+        {
+            return Err(Error::new("Commons device changed during its observation"));
+        }
+        if current_claim
+            .as_ref()
+            .is_some_and(|claim| aterm_digest::Sha256::digest(claim.as_slice()) != expected)
+        {
+            return Err(Error::new(
+                "Commons device differs from its immutable claim",
+            ));
+        }
+        // Only an authenticated public binding and claim digest survive. Every
+        // use privately rereads the files and identity; denial is evaluated by
+        // the caller's current roster, never by this cache.
+        if !was_cached && let Ok(mut cache) = BINDINGS.lock() {
+            if cache.len() >= 16 {
+                cache.pop_front();
+            }
+            cache.push_back((key, (binding.clone(), expected)));
+        }
+        Ok(binding)
+    }
+
+    #[cfg(test)]
+    fn denied_in_roster(
+        paths: &Paths,
+        identity: Identity,
+        roster: &crate::swarm_roster::SwarmRoster,
+    ) -> Result<bool> {
+        let binding = Self::observe_binding(paths, identity, || {})?;
+        Ok([
+            binding.writer().as_slice(),
+            binding.incarnation().as_slice(),
+            binding.machine().as_slice(),
+        ]
+        .iter()
+        .any(|id| roster.is_node_denied(&aterm_codec::hex::encode_lower(id))))
+    }
+
     fn open_identity(paths: &Paths, identity: Identity, require_existing: bool) -> Result<Self> {
         Self::open_identity_until(paths, identity, require_existing, None)
     }
@@ -371,7 +535,14 @@ impl Device {
         require_existing: bool,
         deadline: Option<std::time::Instant>,
     ) -> Result<Self> {
-        Self::open_identity_checked(paths, identity, require_existing, deadline, || Ok(()))
+        Self::open_identity_checked(
+            paths,
+            identity,
+            require_existing,
+            deadline,
+            false,
+            || Ok(()),
+        )
     }
 
     fn open_identity_checked(
@@ -379,12 +550,17 @@ impl Device {
         identity: Identity,
         require_existing: bool,
         deadline: Option<std::time::Instant>,
+        observe_only: bool,
         validate: impl FnOnce() -> Result<()>,
     ) -> Result<Self> {
         // Device creation and loss checks share one lock even when invoked
         // without a network bootstrap. No caller holding this lock takes the
         // bootstrap lock, so bootstrap -> device is the sole lock order.
-        let _lock = CustodyLock::acquire_until(paths, "commons-device.lock", true, deadline)?;
+        let _lock = if observe_only {
+            CustodyLock::observe_until_with(paths, "commons-device.lock", deadline, || {})?
+        } else {
+            CustodyLock::acquire_until(paths, "commons-device.lock", true, deadline)?
+        };
         validate()?;
         if client::read_identity(paths)?
             .is_none_or(|current| current.recipient() != identity.recipient())
@@ -405,9 +581,16 @@ impl Device {
                 "established Commons device directory is missing; recovery is required",
             ));
         }
-        fsx::ensure_private_dir(&dir)?;
+        if observe_only {
+            aterm_uds::private_file::check_private_dir(&dir)?;
+        } else {
+            fsx::ensure_private_dir(&dir)?;
+        }
         let mut encrypted = fsx::read_private(&dir.join("device.age"), MAX_DEVICE)?;
         let claim = fsx::read_private(&dir.join("device.claim"), CLAIM_LEN)?;
+        if observe_only && (encrypted.is_none() || claim.is_none()) {
+            return Err(Error::new("existing Commons device custody is incomplete"));
+        }
         if encrypted.is_none()
             && (established
                 || claim.is_some()
@@ -546,6 +729,19 @@ impl Device {
         })
     }
 
+    /// Open an age file sealed to this device's identity: the bundle a member hands after a
+    /// proof (`members::joiner::prove`).
+    ///
+    /// # Errors
+    /// The file is not sealed to this identity, or is damaged.
+    pub fn open_sealed(&self, sealed: &[u8]) -> Result<SecretBytes> {
+        crate::age::decrypt(std::slice::from_ref(&self.identity), sealed).map_err(|error| {
+            Error::new(format!(
+                "the member's bundle does not open with this Mac's key: {error}"
+            ))
+        })
+    }
+
     pub fn answer(&self, request: &Request, challenge: &[u8]) -> Result<Vec<u8>> {
         if request.binding().machine() != &self.machine
             || request.binding().incarnation() != &self.incarnation
@@ -649,6 +845,7 @@ impl Bootstrap {
                         false,
                         Some(deadline),
                         true,
+                        false,
                         || {},
                     ) {
                         Ok(pair) => Ok(Some(pair)),
@@ -744,6 +941,7 @@ impl Bootstrap {
                         false,
                         Some(deadline),
                         true,
+                        false,
                         || {},
                     ) {
                         Ok(pair) => Ok(pair),
@@ -763,6 +961,50 @@ impl Bootstrap {
                     reason.explanation()
                 ))),
             };
+        }
+    }
+
+    /// Observe only already-established custody and control history. This never creates a
+    /// device, backfills a claim, updates a pin or ingests a descriptor. A missing setup
+    /// boundary remains unavailable for the ordinary convergence path to handle.
+    /// A transient source revalidation releases custody and reobserves the vault
+    /// within the same deadline; it never waits on a vault writer while holding custody.
+    ///
+    /// # Errors
+    /// The authenticated vault, existing private custody, descriptor or current control
+    /// history is unavailable, changed, incomplete or busy before the shared deadline.
+    pub fn established_with_journal_until(
+        paths: &Paths,
+        deadline: std::time::Instant,
+    ) -> Result<(Self, Journal)> {
+        established_files(paths)?;
+        loop {
+            let snapshot = match super::observe_until(paths, deadline)? {
+                super::Observation::Visible(snapshot) => snapshot,
+                super::Observation::Unavailable(_) => {
+                    return Err(Error::new(
+                        "existing Commons vault observation is unavailable",
+                    ));
+                }
+            };
+            match Self::open_snapshot_with_journal(
+                paths,
+                &snapshot,
+                true,
+                Some(deadline),
+                false,
+                true,
+                || {},
+            ) {
+                Ok(pair) => return Ok(pair),
+                Err(error)
+                    if std::time::Instant::now() < deadline
+                        && is_transient_vault_revalidation(&error) =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Err(error) => return Err(error),
+            }
         }
     }
 
@@ -958,8 +1200,16 @@ impl Bootstrap {
         deadline: Option<std::time::Instant>,
         held: impl FnMut(),
     ) -> Result<Self> {
-        Self::open_snapshot_with_journal(paths, snapshot, require_device, deadline, false, held)
-            .map(|(bootstrap, _journal)| bootstrap)
+        Self::open_snapshot_with_journal(
+            paths,
+            snapshot,
+            require_device,
+            deadline,
+            false,
+            false,
+            held,
+        )
+        .map(|(bootstrap, _journal)| bootstrap)
     }
 
     fn open_snapshot_with_journal(
@@ -968,10 +1218,18 @@ impl Bootstrap {
         require_device: bool,
         deadline: Option<std::time::Instant>,
         retain_writer: bool,
+        observe_only: bool,
         held: impl FnMut(),
     ) -> Result<(Self, Journal)> {
         let descriptor = Descriptor::decode(snapshot.control())?;
-        let _lock = CustodyLock::acquire_until_with(paths, "commons.lock", false, deadline, held)?;
+        let _lock = if observe_only {
+            CustodyLock::observe_until_with(paths, "commons.lock", deadline, held)?
+        } else {
+            CustodyLock::acquire_until_with(paths, "commons.lock", false, deadline, held)?
+        };
+        if observe_only {
+            established_files(paths)?;
+        }
         if deadline.is_some() {
             Self::validate_snapshot(paths, snapshot)?;
         }
@@ -1003,7 +1261,11 @@ impl Bootstrap {
                 "established Commons directory is missing; recovery is required",
             ));
         }
-        fsx::ensure_private_dir(&dir)?;
+        if observe_only {
+            aterm_uds::private_file::check_private_dir(&dir)?;
+        } else {
+            fsx::ensure_private_dir(&dir)?;
+        }
         let established = fsx::read_private(&dir.join("default.pin"), PIN_LEN)?;
         if established
             .as_ref()
@@ -1012,6 +1274,16 @@ impl Bootstrap {
             return Err(Error::new(
                 "Commons default network differs from its immutable pin",
             ));
+        }
+        if observe_only
+            && (retained
+                .as_ref()
+                .is_none_or(|kept| kept.as_slice() != claim)
+                || established
+                    .as_ref()
+                    .is_none_or(|kept| kept.as_slice() != pin))
+        {
+            return Err(Error::new("existing Commons pins or claims are incomplete"));
         }
         // Validate the journal's independent immutable pin before writing ours.
         // If our pin was lost, a replacement descriptor must not poison it before
@@ -1027,13 +1299,22 @@ impl Bootstrap {
                 "established Commons control directory is missing; recovery is required",
             ));
         }
-        let device =
-            Device::open_identity_checked(paths, identity, require_device, deadline, || {
+        let device = Device::open_identity_checked(
+            paths,
+            identity,
+            require_device,
+            deadline,
+            observe_only,
+            || {
+                if observe_only {
+                    established_files(paths)?;
+                }
                 if deadline.is_some() {
                     Self::validate_snapshot(paths, snapshot)?;
                 }
                 Ok(())
-            })?;
+            },
+        )?;
         let device_custody = [
             paths.dir.join("identity"),
             dir.join("device.age"),
@@ -1075,6 +1356,10 @@ impl Bootstrap {
         };
         let mut journal = if let Some(journal) = settled {
             journal
+        } else if observe_only {
+            return Err(Error::new(
+                "existing Commons control awaits normal descriptor ingestion",
+            ));
         } else if must_exist {
             match deadline {
                 Some(deadline) => {
@@ -1188,6 +1473,20 @@ impl Bootstrap {
         Ok(())
     }
 
+    /// Hold this freshly revalidated source against vault writers for one local
+    /// batch. Acquisition never waits while Commons or journal custody is held.
+    /// The guard grants no membership or policy rights; drop it before network
+    /// I/O or a vault mutation.
+    ///
+    /// # Errors
+    /// The state lock is unavailable or unsafe, or the source, applied version
+    /// or immutable custody no longer matches this bootstrap.
+    pub fn local_source_read(&self) -> Result<crate::client::CommonsSourceRead> {
+        let read = crate::client::hold_commons_source(&self.paths)?;
+        self.revalidate_custody()?;
+        Ok(read)
+    }
+
     pub fn trust(&self) -> Trust {
         self.descriptor.trust()
     }
@@ -1246,6 +1545,9 @@ impl Bootstrap {
         if chain.is_empty() {
             return Ok(None);
         }
+        let full_membership = log.membership();
+        let actor_removed_in_full = full_membership.removal(&binding.actor()).is_some();
+        let recipient_removed_in_full = log.recipient_is_removed(&binding.recipient());
         let check_chain = |records: &[crate::membership_log::Record]| -> (bool, bool) {
             let mut iter = records.iter().cloned();
             let Some(mut sub) = iter
@@ -1259,7 +1561,25 @@ impl Bootstrap {
                     return (false, false);
                 }
             }
-            let seat_ok = sub.has_historical_seat(binding);
+            let sub_membership = sub.membership();
+            let removal_ok =
+                actor_removed_in_full || sub_membership.removal(&binding.actor()).is_none();
+            let recipient_ok =
+                recipient_removed_in_full || !sub.recipient_is_removed(&binding.recipient());
+            let node_ok = !matches!(
+                sub_membership.node(binding.writer()),
+                crate::membership_log::NodeStanding::Removed(_)
+            ) && !sub_membership.members().iter().any(|(m_actor, m)| {
+                (*m_actor == binding.actor() || m.binding.recipient() == binding.recipient())
+                    && m.node_key.is_some_and(|nk| {
+                        nk != [0; 32]
+                            && matches!(
+                                sub_membership.nodes().get(&nk),
+                                Some(crate::membership_log::NodeStanding::Removed(_))
+                            )
+                    })
+            });
+            let seat_ok = sub.has_historical_seat(binding) && removal_ok && recipient_ok && node_ok;
             let audience_ok = !sub.audience_left_out(
                 &crate::membership_log::EpochAudience::Commons,
                 &binding.actor(),
@@ -1275,29 +1595,46 @@ impl Bootstrap {
             );
             (seat_ok, audience_ok)
         };
-        let (seat_ok, audience_ok) = check_chain(&chain);
-        if !seat_ok || !audience_ok {
-            let mut targets = vec![entry_id];
+        let push_seat_targets = |targets: &mut Vec<crate::membership_log::RecordId>| {
             for rec in log.records().skip(1) {
                 match rec.body() {
-                    crate::membership_log::Body::Remove { .. } if !seat_ok => {
+                    crate::membership_log::Body::Remove { .. } => {
                         targets.push(*rec.id());
                     }
-                    crate::membership_log::Body::Wrap { recipient, .. }
-                        if *recipient == binding.recipient() =>
+                    crate::membership_log::Body::Admit { entrant, .. }
+                        if entrant.request.binding() == binding
+                            || entrant.request.binding().recipient() == binding.recipient() =>
+                    {
+                        targets.push(*rec.id());
+                    }
+                    crate::membership_log::Body::Node { .. }
+                        if *rec.actor() == binding.actor()
+                            || full_membership
+                                .get(rec.actor())
+                                .is_some_and(|m| m.binding.recipient() == binding.recipient()) =>
                     {
                         targets.push(*rec.id());
                     }
                     _ => {}
                 }
             }
+        };
+        let (seat_ok, audience_ok) = check_chain(&chain);
+        if !seat_ok || !audience_ok {
+            let mut targets = vec![entry_id];
+            if !seat_ok {
+                push_seat_targets(&mut targets);
+            }
+            for rec in log.records().skip(1) {
+                if let crate::membership_log::Body::Wrap { recipient, .. } = rec.body()
+                    && *recipient == binding.recipient()
+                {
+                    targets.push(*rec.id());
+                }
+            }
             chain = log.ancestor_closure(&targets);
             if seat_ok && !check_chain(&chain).0 {
-                for rec in log.records().skip(1) {
-                    if matches!(rec.body(), crate::membership_log::Body::Remove { .. }) {
-                        targets.push(*rec.id());
-                    }
-                }
+                push_seat_targets(&mut targets);
                 chain = log.ancestor_closure(&targets);
             }
         }
@@ -1378,8 +1715,24 @@ impl Bootstrap {
                     &crate::membership_log::EpochAudience::Commons,
                     &me,
                 )
+                || log.audience_left_out(
+                    &crate::membership_log::EpochAudience::Everyone,
+                    &req.binding().actor(),
+                )
+                || log.audience_left_out(
+                    &crate::membership_log::EpochAudience::Commons,
+                    &req.binding().actor(),
+                )
                 || log.membership().removal(&req.binding().actor()).is_some()
                 || log.has_historical_seat(req.binding())
+                || log.has_known_actor(&req.binding().actor())
+                || matches!(
+                    log.genesis().body(),
+                    crate::membership_log::Body::Genesis { founders, .. }
+                        if founders.iter().any(|f| {
+                            f.recipient == me || f.binding.as_ref() == Some(req.binding())
+                        })
+                )
                 || log.records().skip(1).any(|r| {
                     matches!(
                         r.body(),
@@ -1673,4 +2026,4 @@ pub(crate) fn retains_control(paths: &Paths) -> Result<bool> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

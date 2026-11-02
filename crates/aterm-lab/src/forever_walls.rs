@@ -13,6 +13,11 @@ const CLEARED_BY_DONE_MS: i64 = 5_000;
 
 const UNREAD_LOOK_MS: i64 = 5 * 60_000;
 
+/// The policy's maximum reset jitter, in milliseconds.
+fn reset_jitter_ms() -> i64 {
+    i64::try_from(turn_end::TurnEndTiming::default().reset_jitter.as_millis()).unwrap_or(i64::MAX)
+}
+
 fn goings_on(seen: &Seen, t1: i64) -> Vec<(i64, String)> {
     let mut v: Vec<(i64, String)> = seen
         .all_acts()
@@ -105,7 +110,8 @@ fn landed(seen: &Seen, done: &(i64, String), mut bad: Vec<String>, said: &str, t
     }
 }
 
-/// Judges `--mode wall-redraw`: a usage wall redrawn under a new reset after a typed resume.
+/// Judges `--mode wall-redraw`: a usage wall redrawn under a new reset after a typed resume,
+/// waited out to that reset ([`reset_wait_after`]).
 pub(super) fn judge_wall_redraw(
     seen: &Seen,
     land: Option<&(i64, String)>,
@@ -201,9 +207,24 @@ pub(super) fn judge_wall_redraw(
     if let Some(g) = going_in(&on, r1 + AT_DONE_MS, r2_ms, t0) {
         return Verdict::Fail(format!("{said}; TYPED into the redrawn wall: {g}"));
     }
-    let (due2, floor) = redraw_due(r2_ms + RESET_MINUTE_MS + grace, rule1, *tr);
+    let due2 = r2_ms + RESET_MINUTE_MS + grace;
+    if let Some((tw, until, wl)) = reset_wait_after(seen, *tr)
+        && until > due2 + reset_jitter_ms() + DUE_SLACK_MS
+    {
+        return Verdict::Fail(format!(
+            "{said}; WAITED PAST THE NEW RESET: the loop's wait at +{} ran to +{}, {} past the new reset (due by +{}): {}",
+            at(t0, tw),
+            at(t0, until),
+            at(0, until - r2_ms),
+            at(t0, due2 + reset_jitter_ms()),
+            crate::util::one_line(wl, 100)
+        ));
+    }
     let lost2 = due2 + WALL_LOST_MS;
-    let after = on.iter().find(|(t, _)| *t >= r2_ms);
+    // The land check answers the program's own continuation's defense, no act on top of it.
+    let after = on
+        .iter()
+        .find(|(t, rule)| *t >= r2_ms && rule != turn_end::RULE_LAND_CHECK);
     let went_on = seen.cover.went_on_ms.filter(|t| *t >= lift);
     let gone = match (after, went_on) {
         (Some((ta, rule)), Some(tv)) if tv < *ta => {
@@ -225,17 +246,9 @@ pub(super) fn judge_wall_redraw(
                 return Verdict::Fail(format!("{said}; {why}"));
             }
             format!(
-                "gone on: {rule} at +{} ({} past the new reset{})",
+                "gone on: {rule} at +{} ({} past the new reset)",
                 at(t0, *ta),
-                at(0, ta - r2_ms),
-                if floor {
-                    format!(
-                        "; the loop's floor after a resume that met the wall again: +{}",
-                        at(t0, due2)
-                    )
-                } else {
-                    String::new()
-                }
+                at(0, ta - r2_ms)
             )
         }
         (None, Some(tv)) => format!(
@@ -275,16 +288,20 @@ pub(super) fn judge_wall_redraw(
     landed(seen, done, Vec::new(), &said, t0)
 }
 
-fn redraw_due(at_reset: i64, rule1: &str, redrawn: i64) -> (i64, bool) {
-    if rule1 != turn_end::RULE_LIMIT_RESUME {
-        return (at_reset, false);
-    }
-    let floor = redrawn + take_window_ms() + limit_retry_ms();
-    if floor > at_reset {
-        (floor, true)
-    } else {
-        (at_reset, false)
-    }
+/// The first wait on a limit's reset (`WAITING … until=<when> … resets`) the journal wrote after
+/// `tr`: its time, its due (unix ms) and its line.
+fn reset_wait_after(seen: &Seen, tr: i64) -> Option<(i64, i64, &str)> {
+    seen.journal.iter().find_map(|(t, l)| {
+        if *t <= tr || !l.starts_with("WAITING ") {
+            return None;
+        }
+        let (_, rest) = l.split_once(" until=")?;
+        if !rest.trim_end().ends_with(" resets") {
+            return None;
+        }
+        let due = crate::workers::iso_ms(rest.split_whitespace().next()?)?;
+        Some((*t, due, l.as_str()))
+    })
 }
 
 fn switch_land_within_ms() -> i64 {
@@ -299,6 +316,12 @@ fn switch_land_due(seen: &Seen, prompt_ms: i64) -> (i64, String) {
             "no back-off named; one short turn's".to_string(),
         ),
     }
+}
+
+/// Whether the back-off W5's second agent's first point named (`line`) is one short turn's: its
+/// own streak's first.
+fn own_streak(line: &str) -> bool {
+    line.contains(" 1 short turn(s) in a row: ")
 }
 
 fn land_act_after(seen: &Seen, t: i64) -> Option<(i64, &str)> {
@@ -320,7 +343,8 @@ fn holds_on_a_limit(line: &str) -> bool {
                 .is_some_and(|(_, rest)| rest.trim_end().ends_with(" resets")))
 }
 
-/// Judges `--mode wall-switch`: a cross-program switch after a usage wall in the same tab.
+/// Judges `--mode wall-switch`: a cross-program switch after a usage wall in the same tab; the
+/// second agent's first point names its own streak's first back-off ([`own_streak`]).
 pub(super) fn judge_wall_switch(
     seen: &Seen,
     land: Option<&(i64, String)>,
@@ -391,6 +415,13 @@ pub(super) fn judge_wall_switch(
         return Verdict::Fail(format!("{said}; TYPED before {}'s land act: {g}", sw.to));
     }
     let (due, backoff) = switch_land_due(seen, sw.prompt_ms);
+    if let Some((_, line)) = named_backoff(seen, sw.prompt_ms).filter(|(_, l)| !own_streak(l)) {
+        return Verdict::Fail(format!(
+            "{said}; {program}'s STREAK CARRIED into {}: its first point named {}",
+            sw.to,
+            crate::util::one_line(line, 120)
+        ));
+    }
     let Some((b1, b_rule)) = b_act else {
         if seen.end_ms >= due {
             return Verdict::Fail(format!(
@@ -647,7 +678,10 @@ fn gone_past(
     t0: i64,
 ) -> Result<(i64, String), Verdict> {
     let lost = r_ms + RESET_MINUTE_MS + wall_grace_ms(program) + WALL_LOST_MS;
-    let after = on.iter().find(|(t, _)| *t >= r_ms);
+    // The land check answers the program's own continuation's defense, no act on top of it.
+    let after = on
+        .iter()
+        .find(|(t, rule)| *t >= r_ms && rule != turn_end::RULE_LAND_CHECK);
     let went_on = seen.cover.went_on_ms.filter(|t| *t >= lift);
     let own = |tv: i64| {
         (
@@ -718,6 +752,13 @@ pub(super) fn named_backoff(seen: &Seen, tg: i64) -> Option<(i64, &str)> {
         })
 }
 
+/// Whether the back-off Cruise's act waits after W8's wall (`line`) is the chain's two short
+/// turns': the done claim's and the done check's the wall cut. What went on past the wall is the
+/// wall's, paced by its reset, and no short turn of the streak.
+fn wall_streak(line: &str) -> bool {
+    line.contains(" 2 short turn(s) in a row: ")
+}
+
 /// Returns the timestamp of Cruise's first act after the stub's wall was raised.
 #[must_use]
 pub(super) fn cruise_met(seen: &Seen) -> Option<i64> {
@@ -738,7 +779,8 @@ pub(super) fn cruise_went_on(seen: &Seen) -> Option<i64> {
         .map(|(t, _)| *t)
 }
 
-/// Judges `--mode wall-cruise`: a usage wall encountered and resumed under Cruise.
+/// Judges `--mode wall-cruise`: a usage wall encountered and resumed under Cruise; Cruise's act
+/// after it waits the chain's two short turns' back-off ([`wall_streak`]).
 pub(super) fn judge_wall_cruise(seen: &Seen, program: &str, t0: i64) -> Verdict {
     let Some((raised, reset_s)) = seen.cover.wall else {
         return Verdict::Unobserved(
@@ -814,6 +856,12 @@ pub(super) fn judge_wall_cruise(seen: &Seen, program: &str, t0: i64) -> Verdict 
     };
     let said = format!("{said}; nothing typed into it; {gone}");
     let backoff = named_backoff(seen, tg);
+    if let Some((_, line)) = backoff.filter(|(_, l)| !wall_streak(l)) {
+        return Verdict::Fail(format!(
+            "{said}; THE STREAK AFTER THE WALL is not the chain's two short turns (the done claim, the done check the wall cut): {}",
+            crate::util::one_line(line, 120)
+        ));
+    }
     let deadline = backoff.map_or(tg + CRUISE_AFTER_WALL_MS, |(due, _)| {
         due + PERSISTENCE_GRACE_MS
     });

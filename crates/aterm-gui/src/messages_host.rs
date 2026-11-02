@@ -90,6 +90,14 @@ impl page::Host for PageDesk<'_> {
         self.app.messages_wall.offset_s().unwrap_or(0)
     }
 
+    fn utc_offset_at(&self, unix_s: i64) -> i64 {
+        self.app
+            .messages_wall
+            .offset_at(unix_s)
+            .or_else(|| self.app.messages_wall.offset_s())
+            .unwrap_or(0)
+    }
+
     fn staged_build(&self) -> Option<u64> {
         self.staged
     }
@@ -117,19 +125,9 @@ impl page::Host for PageDesk<'_> {
     }
 }
 
-/// Witness token authorizing [`crate::notify::deliver_update_health_banner`].
-#[cfg(all(target_os = "macos", not(test)))]
-pub(crate) struct HealthBannerVoice(());
-
 #[cfg(test)]
 thread_local! {
     static PTY_RESIZES_FOR_MESSAGES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-thread_local! {
-    pub(crate) static UPDATE_HEALTH_BANNERS: std::cell::RefCell<Vec<(String, String)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
@@ -183,6 +181,15 @@ pub(crate) enum WallClock {
         /// Seconds east of UTC.
         offset_s: i64,
     },
+    /// The instant `unix_ms`, in a zone whose offset from UTC varies by unix second: a test's
+    /// daylight-saving clock.
+    #[cfg(test)]
+    Zone {
+        /// Unix milliseconds.
+        unix_ms: u64,
+        /// Unix second -> seconds east of UTC.
+        offset_at: fn(i64) -> Option<i64>,
+    },
 }
 
 impl WallClock {
@@ -191,7 +198,7 @@ impl WallClock {
         match self {
             Self::Host => wall_stamp_now(),
             #[cfg(test)]
-            Self::Pinned { unix_ms, .. } => WallStamp { unix_ms },
+            Self::Pinned { unix_ms, .. } | Self::Zone { unix_ms, .. } => WallStamp { unix_ms },
         }
     }
 
@@ -201,6 +208,10 @@ impl WallClock {
             Self::Host => crate::presence::local_offset_s(),
             #[cfg(test)]
             Self::Pinned { offset_s, .. } => Some(offset_s),
+            #[cfg(test)]
+            Self::Zone { unix_ms, offset_at } => {
+                offset_at(i64::try_from(unix_ms / 1000).unwrap_or(i64::MAX))
+            }
         }
     }
 
@@ -210,6 +221,8 @@ impl WallClock {
             Self::Host => crate::presence::local_offset_at(unix),
             #[cfg(test)]
             Self::Pinned { offset_s, .. } => Some(offset_s),
+            #[cfg(test)]
+            Self::Zone { offset_at, .. } => offset_at(unix),
         }
     }
 }
@@ -783,14 +796,9 @@ impl App {
         drive::Commit {
             now,
             frozen: self.message_holds_frozen(),
-            afford: drive::afford(
-                self.windows
-                    .keys()
-                    .filter_map(|&wid| self.chrome_commit_grid_rows(wid))
-                    .filter(|&(_, windowed)| windowed)
-                    .map(|(rows, _)| rows),
-                self.message_band_rows,
-            ),
+            // Diagnostics retain their lifecycle and durable history, but never take
+            // terminal rows or require an acknowledgement before work can continue.
+            afford: 0,
             reserved: self.message_band_rows,
             floor: self.band_regrow_floor(),
         }
@@ -858,8 +866,6 @@ impl App {
     /// Drains messages queued in the pre-`App` inbox and reconciles the exceptions digest row.
     pub(crate) fn drain_message_inbox(&mut self) {
         #[cfg(unix)]
-        self.follow_join_requests();
-        #[cfg(unix)]
         self.follow_member_requests();
         let queued = crate::message_inbox::take_queued();
         let exceptions = crate::message_inbox::take_queued_exceptions();
@@ -884,34 +890,6 @@ impl App {
         let _ = self.keep_config_rows_settings_shows_as_records();
         if !folders.is_empty() {
             self.fold_folder_faults(&folders);
-        }
-        self.sync_messages();
-    }
-
-    /// An admin Mac's notices of the Macs asking to join that its approver left to a person,
-    /// as its record last changed ([`crate::secrets_asking`]): one per Mac, each ended once
-    /// that Mac no longer asks.
-    #[cfg(unix)]
-    fn follow_join_requests(&mut self) {
-        use crate::secrets_asking::{KEY_PREFIX, notice, reconcile, take_changed};
-        let Some(asking) = take_changed() else {
-            return;
-        };
-        let shown: Vec<String> = self
-            .messages
-            .live_rows()
-            .filter_map(|live| live.msg.key.clone())
-            .filter(|key| key.starts_with(KEY_PREFIX))
-            .collect();
-        let (post, gone) = reconcile(&shown, &asking);
-        let now = Instant::now();
-        for key in gone {
-            if let Some(id) = self.messages.live_by_key(&key).map(|live| live.id) {
-                self.messages.withdraw(id, now);
-            }
-        }
-        for asking in post {
-            self.post_unsynced(notice(asking), wall_stamp_now());
         }
         self.sync_messages();
     }
@@ -2090,67 +2068,6 @@ impl App {
         self.remember_update_health_said(HealthSaid::of(kind, &msg, body));
         if !restated {
             self.record_message(msg);
-        }
-    }
-
-    /// Delivers the OS notification banner for an update-health warning at most once per 24 hours.
-    pub(crate) fn post_update_health_banner(
-        &self,
-        kind: update_words::HealthKind,
-        title: &str,
-        body: &str,
-    ) -> bool {
-        let staged = self
-            .native_updater_service
-            .snapshot()
-            .staged
-            .as_ref()
-            .map(|stage| stage.build);
-        let remedy = match self.apply_retry_for(staged) {
-            crate::update_apply_trouble::ApplyRetry::NeedsPerson(remedy)
-                if kind == update_words::HealthKind::Install =>
-            {
-                remedy
-            }
-            _ => {
-                aterm_log::info!(
-                    "update-health: no desktop banner: nothing here needs a person now"
-                );
-                return false;
-            }
-        };
-        if !self.config.desktop_alerts_or_default() {
-            aterm_log::info!("update-health: desktop banner not posted: desktop_alerts is off");
-            return false;
-        }
-        #[cfg(test)]
-        {
-            let banner = update_words::health_notification_body(body, remedy);
-            let title = update_words::health_notification_title(title);
-            UPDATE_HEALTH_BANNERS.with(|posted| posted.borrow_mut().push((title, banner)));
-            true
-        }
-        #[cfg(all(target_os = "macos", not(test)))]
-        {
-            let banner = update_words::health_notification_body(body, remedy);
-            let title = update_words::health_notification_title(title);
-            let center = self.notice_center;
-            let own_alerts = std::sync::Arc::clone(&self.notify_own_alerts);
-            std::thread::spawn(move || {
-                crate::notify::deliver_update_health_banner(
-                    HealthBannerVoice(()),
-                    center,
-                    &own_alerts,
-                    &title,
-                    &banner,
-                );
-            });
-            true
-        }
-        #[cfg(all(not(target_os = "macos"), not(test)))]
-        {
-            let _ = (title, body, remedy);
-            false
         }
     }
 

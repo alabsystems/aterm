@@ -10,7 +10,9 @@
 use super::*;
 use aterm_machines::init::WorkstationGroup;
 use aterm_machines::model::{Effect, Mode, Outcome};
-use aterm_types::macos_setup::{Access, Observation, SYNC_OFF, Standing, Subject};
+use aterm_types::macos_setup::{
+    Access, Observation, SHARING_OFF, SHARING_OFF_NOTE, SYNC_OFF, Standing, Subject,
+};
 
 #[cfg(test)]
 mod typed_join_tests;
@@ -46,6 +48,12 @@ fn observe_subjects(plan: &Plan, subjects: &[Subject], network: bool) -> Vec<Obs
     // repositories beside it.
     let heard = std::cell::OnceCell::new();
     let here = || *heard.get_or_init(|| heard_for(plan, root.as_deref(), &secrets_retry::Live));
+    // Whether `[swarm] enabled = false` turns sharing off, read once for the same two rows: the
+    // Secrets stage then joins and syncs nothing, and the repositories run on this Mac's own GitHub
+    // credentials ([`vault_not_here`]).
+    let swarm = std::cell::OnceCell::new();
+    let sharing_off =
+        || *swarm.get_or_init(|| matches!(aterm_secrets::swarm::enabled_live(), Ok(false)));
 
     let mut workstation = Selection::none();
     for subject in subjects {
@@ -105,12 +113,14 @@ fn observe_subjects(plan: &Plan, subjects: &[Subject], network: bool) -> Vec<Obs
         );
     }
     if wants(Setting::Secrets) {
-        out.push(vault(plan, here(), root.as_deref()).unwrap_or_else(|why| vault_unread(&why)));
+        out.push(vault_row(sharing_off(), || {
+            vault(plan, here(), root.as_deref())
+        }));
     }
     if network && wants(Setting::Repositories) {
         out.push(
             context()
-                .and_then(|ctx| repositories_heard(&sys, &ctx, plan, here))
+                .and_then(|ctx| repositories_heard(&sys, &ctx, plan, sharing_off(), here))
                 .unwrap_or_else(|why| unread(Subject::Setting(Setting::Repositories), &why)),
         );
     }
@@ -199,8 +209,8 @@ enum VaultRead {
         approve: Option<String>,
         with_password: bool,
     },
-    /// Asked to join the ALab vault at a URL: an Allow on any Mac in ALab and the phrase that Mac
-    /// shows let it in ([`aterm_machines::init_secrets::LET_IN`]), so its note names no admin.
+    /// Asked to join the default ALab vault at a URL: admission and retries run automatically,
+    /// so its note names no person step or admin.
     /// `with_password` as for [`Self::Pending`].
     Asking { with_password: bool },
     /// Asked to join the ALab vault, and a member let it in: it holds that member's `Allowed`
@@ -339,17 +349,50 @@ fn heard_for(
 
 /// The GitHub repositories row for `plan`, read as their stage runs ([`repositories::observe`]):
 /// through the plan's vault where Secrets is in the plan, but on this Mac's own GitHub credentials
-/// where what aterm last heard at the ALab vault's address (`here`, [`heard_for`], read only then)
-/// leaves it off this network, as the stage runs them beside a Secrets try that left it so
-/// ([`vault_not_here`]).
+/// where `[swarm] enabled = false` turns sharing off (`sharing_off`), or what aterm last heard at
+/// the ALab vault's address (`here`, [`heard_for`], read only then) leaves it off this network, as
+/// the stage runs them beside a Secrets try that left it so ([`vault_not_here`]).
 fn repositories_heard(
     sys: &dyn aterm_machines::port::System,
     ctx: &aterm_machines::items::Ctx,
     plan: &Plan,
+    sharing_off: bool,
     here: impl FnOnce() -> scope::VaultHere,
 ) -> Result<Observation, String> {
     let vault = super::Stage::Secrets.selected(plan).then_some(plan);
-    super::repositories::observe(sys, ctx, vault, vault.is_some() && here().not_here())
+    super::repositories::observe(
+        sys,
+        ctx,
+        vault,
+        vault.is_some() && (sharing_off || here().not_here()),
+    )
+}
+
+/// The Secrets vault row: [`vault_sharing_off`] while `[swarm] enabled = false` turns sharing off
+/// (`sharing_off`), which reads no membership, else what `read` reads ([`vault`]), or why it could
+/// not ([`vault_unread`]).
+fn vault_row(sharing_off: bool, read: impl FnOnce() -> Result<Observation, String>) -> Observation {
+    if sharing_off {
+        return vault_sharing_off();
+    }
+    read().unwrap_or_else(|why| vault_unread(&why))
+}
+
+/// The Secrets vault row while `[swarm] enabled = false` turns sharing with the person's other
+/// Macs off: in place at [`SHARING_OFF`], their choice and so what the row wants, whatever this
+/// Mac's membership reads, with [`SHARING_OFF_NOTE`] its one note. The Secrets stage joins and
+/// syncs nothing then ([`automatic_secrets_rows`]) and a running subscriber waits for the switch,
+/// so no reading here is a change Set up now could make.
+fn vault_sharing_off() -> Observation {
+    Observation {
+        subject: Subject::Setting(Setting::Secrets),
+        standing: Standing::InPlace,
+        now: Some(SHARING_OFF.to_owned()),
+        after_login: None,
+        wanted: SHARING_OFF.to_owned(),
+        note: Some(SHARING_OFF_NOTE.to_owned()),
+        detail: None,
+    }
 }
 
 /// The Secrets vault row for `plan`, from this Mac's vault records and what aterm last heard at the
@@ -386,11 +429,10 @@ fn vault(plan: &Plan, here: scope::VaultHere, root: Option<&Path>) -> Result<Obs
 }
 
 /// The Secrets row's read of this Mac's join while it waits (`status`, with the records under
-/// `paths`). The ALab vault at a URL lets a Mac in by an Allow on any Mac in ALab and the phrase
-/// that Mac shows (`docs/DESIGN-fluid-swarm-2026-10-28.md` §3.3.1), so its words name no admin
-/// ([`VaultRead::Asking`], and [`VaultRead::Allowed`] once a member let it in); another vault,
-/// or one at a path, which no Allow reaches, by the approve an admin Mac runs
-/// ([`aterm_secrets::client::Status::approve_command`]).
+/// `paths`). The default ALab vault at a URL admits a Mac automatically, so its words name no
+/// person step and no admin ([`VaultRead::Asking`], and [`VaultRead::Allowed`] once the vault
+/// has let it in); another vault, or one at a path, which automatic admission does not reach,
+/// by the approve an admin Mac runs ([`aterm_secrets::client::Status::approve_command`]).
 fn pending_read(
     paths: &aterm_secrets::client::Paths,
     status: &aterm_secrets::client::Status,
@@ -490,7 +532,7 @@ const RETYPE: &str = "or retype the join password";
 const APPROVE: &str = "On an admin Mac:";
 
 /// The note of a Mac a member let into the ALab vault, which waits for the vault to record it.
-const ALLOWED: &str = "Allowed; waits for the vault to record this Mac";
+const ALLOWED: &str = aterm_types::macos_setup::VAULT_ALLOWED_NOTE;
 
 /// The value of a join an admin Mac refused for its join password: its fields open to take it
 /// again (no note, so `vault_shown` opens them).
@@ -571,19 +613,25 @@ fn vault_observation(
                 APPROVAL.to_owned()
             }),
         ),
+        // Default ALab admission stays automatic, including after the first wait.
         VaultRead::Asking { with_password } => {
-            let allow = format!("To join, {}", aterm_machines::init_secrets::LET_IN);
+            let joining = aterm_types::macos_setup::VAULT_ASKING_NOTE;
             (
-                person,
-                "Awaiting code",
+                Standing::Waiting,
+                aterm_types::macos_setup::VAULT_ASKING,
                 Some(if *with_password {
-                    format!("{allow}, {RETYPE}")
+                    format!("{joining}, {RETYPE}")
                 } else {
-                    allow
+                    joining.to_owned()
                 }),
             )
         }
-        VaultRead::Allowed => (Standing::Waiting, "Awaiting code", Some(ALLOWED.to_owned())),
+        // Nobody's to do: the vault records this Mac by itself, so the row waits, calm.
+        VaultRead::Allowed => (
+            Standing::Waiting,
+            aterm_types::macos_setup::VAULT_ALLOWED,
+            Some(ALLOWED.to_owned()),
+        ),
         VaultRead::Refused => (person, WRONG_PASSWORD, None),
         // No ALab vault answered: aterm's own join has none to join, so the row waits on nothing
         // on any plan, while the Secrets stage still asks again by itself. A join the person
@@ -1137,7 +1185,10 @@ mod tests {
             let note = seen
                 .note
                 .unwrap_or_else(|| panic!("{read:?} waits on nothing"));
-            assert!(note.chars().count() <= 52, "{note}");
+            assert!(
+                !note.trim().is_empty(),
+                "{read:?} waits without an explanation"
+            );
             assert!(!note.contains('/') && !note.contains('~'), "{note}");
         }
         assert!(waiting >= 4, "the waiting rows were read: {waiting}");
@@ -1285,17 +1336,18 @@ mod tests {
         }
     }
 
-    /// A join waiting on the ALab vault is let in by an Allow on any Mac in ALab and the phrase
-    /// that Mac shows (`docs/DESIGN-fluid-swarm-2026-10-28.md` F10: the joiner's words drop
-    /// "admin"), with sync on or off. Another vault, at a URL or at a path, has no Allow to wait
-    /// for, so its row still names the approve an admin Mac runs. A Mac a member already let in
-    /// waits for the vault to record it, with nothing more to press. Read on a scratch home.
-    /// NEGATIVE CONTROL: a read that takes no vault for ALab's names the admin's approve on the
-    /// ALab row; one that takes every vault at a URL for ALab's tells a team vault to press
-    /// Allow; one that reads no `Allowed` asks the Mac a member let in to press Allow again; an
-    /// approve kept for ALab with sync off names it in the sync-off note.
+    /// A join waiting on the ALab vault is admitted automatically: its row waits on the
+    /// automatic-admission note, naming no person step, no command and no admin
+    /// (`docs/DESIGN-fluid-swarm-2026-10-28.md` F10: the joiner's words drop "admin"), with
+    /// sync on or off. Another vault, at a URL or at a path, has no automatic admission to wait
+    /// for, so its row still names the approve an admin Mac runs. A Mac already let in waits
+    /// for the vault to record it. Read on a scratch home. NEGATIVE CONTROL: a read that
+    /// takes no vault for ALab's names the admin's approve on the ALab row; one that takes
+    /// every vault at a URL for ALab's tells a team vault its join is automatic; one that
+    /// reads no `Allowed` leaves a let-in Mac at the automatic wait; an approve kept for ALab
+    /// with sync off names it in the sync-off note.
     #[test]
-    fn a_join_waiting_on_the_alab_vault_says_press_allow_and_names_no_admin() {
+    fn a_join_waiting_on_the_alab_vault_is_automatic_and_names_no_admin() {
         use aterm_secrets::client::{Config, Membership, Paths, Status};
         use aterm_secrets::commons::bootstrap::Device;
         use aterm_secrets::members::Allowed;
@@ -1324,10 +1376,17 @@ mod tests {
         let alab_at = || Source::Url(aterm_types::macos_setup::DEFAULT_VAULT_URL.into());
         let asking = row(&waiting(alab_at(), alab));
         let note = asking.note.unwrap();
-        assert_eq!(asking.standing, Standing::NeedsYou, "{note}");
+        assert_eq!(asking.standing, Standing::Waiting, "{note}");
+        assert_eq!(
+            (asking.now.as_deref(), note.as_str()),
+            (
+                Some(aterm_types::macos_setup::VAULT_ASKING),
+                aterm_types::macos_setup::VAULT_ASKING_NOTE
+            ),
+        );
         assert!(
-            note.contains(aterm_machines::init_secrets::LET_IN),
-            "{note}"
+            !note.contains("aterm secrets"),
+            "no command on the page: {note}"
         );
         assert!(
             !note.contains("admin") && !note.contains("approve"),
@@ -1365,8 +1424,16 @@ mod tests {
         .unwrap();
         let let_in = row(&waiting(alab_at(), alab));
         assert_eq!(
-            (let_in.standing, let_in.note.as_deref()),
-            (Standing::Waiting, Some(ALLOWED))
+            (
+                let_in.standing,
+                let_in.now.as_deref(),
+                let_in.note.as_deref()
+            ),
+            (
+                Standing::Waiting,
+                Some(aterm_types::macos_setup::VAULT_ALLOWED),
+                Some(ALLOWED)
+            )
         );
         // Sync turned off: the ALab join lands once it is on, still with no admin in the words.
         // A scratch home has no launchd job of its own, so this reads no launchd state.

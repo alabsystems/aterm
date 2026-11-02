@@ -1017,6 +1017,9 @@ fn uptime_reads_to_the_nanosecond() {
         "past the nanosecond"
     );
     assert_eq!(linux::parse_uptime_ns("1.-5"), None);
+    assert_eq!(linux::parse_uptime_ns("+12 7\n"), None);
+    assert_eq!(linux::parse_uptime_ns("12. 7\n"), None);
+    assert_eq!(linux::parse_uptime_ns(".5 7\n"), None);
     assert_eq!(linux::parse_uptime_ns(""), None);
     assert_eq!(linux::parse_uptime_ns("18446744074 0"), None, "past u64 ns");
 }
@@ -1229,4 +1232,320 @@ fn open_socket_count_counts_only_socket_symlinks_in_fd_dir() {
     symlink("anon_inode:[eventpoll]", fd_dir.join("5")).expect("epoll");
     assert_eq!(Root::new(root.path()).open_socket_count(4242), Some(2));
     assert_eq!(Root::new(root.path()).open_socket_count(9999), None);
+}
+
+/// The sequence the socket-dump fixtures answer.
+const DUMP_SEQ: u32 = 7;
+
+/// One netlink message as the kernel writes it, from literal numbers (never the parser's
+/// constants, so a wrong constant there fails here): its header (length, `kind`, `flags`, `seq`,
+/// port 0), then `payload`, padded to 4 bytes.
+fn nlmsg(kind: u16, flags: u16, seq: u32, payload: &[u8]) -> Vec<u8> {
+    let len = u32::try_from(16 + payload.len()).expect("a fixture fits a u32");
+    let mut m = Vec::new();
+    m.extend(len.to_ne_bytes());
+    m.extend(kind.to_ne_bytes());
+    m.extend(flags.to_ne_bytes());
+    m.extend(seq.to_ne_bytes());
+    m.extend(0_u32.to_ne_bytes());
+    m.extend(payload);
+    m.resize(m.len().next_multiple_of(4), 0);
+    m
+}
+
+/// One attribute: its length (header and value, unpadded), `kind`, `value`, padded to 4 bytes.
+fn nlattr(kind: u16, value: &[u8]) -> Vec<u8> {
+    let len = u16::try_from(4 + value.len()).expect("a fixture fits a u16");
+    let mut a = Vec::new();
+    a.extend(len.to_ne_bytes());
+    a.extend(kind.to_ne_bytes());
+    a.extend(value);
+    a.resize(a.len().next_multiple_of(4), 0);
+    a
+}
+
+/// The name attribute (type 0) of a socket bound at `path`: the kernel's copy of `sun_path`,
+/// ending in its NUL.
+fn name_attr(path: &[u8]) -> Vec<u8> {
+    nlattr(0, &[path, b"\0"].concat())
+}
+
+/// The shutdown attribute (type 6, one byte) the kernel adds to every record.
+fn shutdown_attr() -> Vec<u8> {
+    nlattr(6, &[0])
+}
+
+/// A `unix_diag_msg` record of `family`: type 1 (stream), `state`, `inode`, a cookie, then
+/// `attrs`, in a message of type 20 (`SOCK_DIAG_BY_FAMILY`) with flag 0x2 (`NLM_F_MULTI`).
+fn diag_record(family: u8, state: u8, inode: u32, attrs: &[Vec<u8>]) -> Vec<u8> {
+    let mut r = vec![family, 1, state, 0];
+    r.extend(inode.to_ne_bytes());
+    r.extend([9, 0, 0, 0, 0, 0, 0, 0]);
+    r.extend(attrs.concat());
+    nlmsg(20, 0x2, DUMP_SEQ, &r)
+}
+
+/// A listener (state 10) of family 1 bound at `path`.
+fn listener_at(inode: u32, path: &[u8]) -> Vec<u8> {
+    diag_record(1, 10, inode, &[name_attr(path), shutdown_attr()])
+}
+
+/// The bound file attribute (type 1): the file's inode, then the kernel's device number.
+fn vfs_attr(ino: u32, dev: u32) -> Vec<u8> {
+    nlattr(1, &[ino.to_ne_bytes(), dev.to_ne_bytes()].concat())
+}
+
+/// What the dump decodes a listener bound at `path`, its record naming no file, to.
+fn listener(inode: u64, path: &[u8]) -> linux::UnixDiagListener {
+    linux::UnixDiagListener {
+        inode,
+        path: path.to_vec(),
+        file: None,
+    }
+}
+
+/// The dump's end: type 3 with flag 0x2 and the dump's `int` result.
+fn dump_done(result: i32) -> Vec<u8> {
+    nlmsg(3, 0x2, DUMP_SEQ, &result.to_ne_bytes())
+}
+
+/// A dump names each listener bound at a path by its inode and its path's bytes, with the file
+/// its bind made where the record names one: a stream at a listener's path (state 1), an abstract
+/// listener and a record with no name are left out, a path with a space or with no UTF-8 is kept
+/// as its bytes, and a dump runs across datagrams to its end. NEGATIVE CONTROL: read a record of
+/// any state, and the stream at the listener's path joins.
+#[test]
+fn a_socket_dump_names_each_listener_by_its_bound_path() {
+    let first = [
+        listener_at(41001, b"/run/user/1000/b.sock"),
+        diag_record(
+            1,
+            10,
+            41009,
+            &[
+                name_attr(b"/run/user/1000/b.sock.812.0"),
+                vfs_attr(0x1234, (8 << 20) | 0x123),
+                shutdown_attr(),
+            ],
+        ),
+        diag_record(
+            1,
+            10,
+            41003,
+            &[nlattr(0, b"\0/tmp/.X11-unix/X0"), shutdown_attr()],
+        ),
+        diag_record(
+            1,
+            1,
+            41002,
+            &[name_attr(b"/run/user/1000/b.sock"), shutdown_attr()],
+        ),
+        listener_at(41005, b"/tmp/a b.sock"),
+        listener_at(41007, b"/tmp/\xff.sock"),
+    ]
+    .concat();
+    let second = [diag_record(1, 10, 41008, &[shutdown_attr()]), dump_done(0)].concat();
+    let mut into = Vec::new();
+    assert_eq!(
+        linux::unix_diag_listeners(&first, DUMP_SEQ, &mut into),
+        Ok(linux::Dump::More)
+    );
+    assert_eq!(
+        linux::unix_diag_listeners(&second, DUMP_SEQ, &mut into),
+        Ok(linux::Dump::Done)
+    );
+    let sibling = linux::UnixDiagListener {
+        file: Some(linux::BoundFile { ino: 0x1234 }),
+        ..listener(41009, b"/run/user/1000/b.sock.812.0")
+    };
+    assert_eq!(
+        into,
+        [
+            listener(41001, b"/run/user/1000/b.sock"),
+            sibling,
+            listener(41005, b"/tmp/a b.sock"),
+            listener(41007, b"/tmp/\xff.sock"),
+        ],
+        "listeners bound at a path, a stream at that path left out"
+    );
+}
+
+/// An inode number as `stat(2)` reports one is a bound file's by the low 32 bits the record
+/// keeps.
+#[test]
+fn a_bound_file_is_its_inode_by_the_low_32_bits() {
+    let file = linux::BoundFile { ino: 0x1234 };
+    assert!(file.is_inode(0x1234));
+    assert!(
+        file.is_inode(0x7_0000_1234),
+        "the record keeps the low 32 bits"
+    );
+    assert!(!file.is_inode(0x1235));
+}
+
+/// A socket name holding a newline and a whole forged `/proc/net/unix` row is one name: the
+/// record and each attribute carry their length, so the row names no listener of its own, and an
+/// attribute before the name (the shutdown byte, padded to 4) moves nothing. NEGATIVE CONTROL:
+/// step over each attribute by its length unpadded, and the name's header is misread.
+#[test]
+fn a_socket_name_holding_a_newline_is_one_name() {
+    let forged: &[u8] = b"/tmp/x\n0: 0 0 10000 1 1 41001 /run/user/1000/b.sock";
+    let datagram = diag_record(1, 10, 41010, &[shutdown_attr(), name_attr(forged)]);
+    let mut into = Vec::new();
+    assert_eq!(
+        linux::unix_diag_listeners(&datagram, DUMP_SEQ, &mut into),
+        Ok(linux::Dump::More)
+    );
+    assert_eq!(into, [listener(41010, forged)]);
+    assert!(
+        !into.iter().any(|l| l.path == b"/run/user/1000/b.sock"),
+        "{into:?}"
+    );
+}
+
+/// A datagram the kernel does not write, or one that says the dump failed or was interrupted,
+/// is refused whole and appends nothing, even after a record it read: a dump read in part
+/// proves no absence. NEGATIVE CONTROL: accept a message of another sequence, and another
+/// request's record reads as this dump's.
+#[test]
+fn a_dump_read_in_part_is_refused() {
+    use linux::DumpFault::{Interrupted, Refused, Torn};
+    let good = listener_at(41001, b"/run/b.sock");
+    let with_len = |mut m: Vec<u8>, len: u32| {
+        m[0..4].copy_from_slice(&len.to_ne_bytes());
+        m
+    };
+    let len_of = |m: &[u8]| u32::try_from(m.len()).expect("a fixture fits a u32");
+    let short_msg = nlmsg(20, 0x2, DUMP_SEQ, &[1, 1, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    let mut attr_past = diag_record(1, 10, 41001, &[]);
+    attr_past.extend(40_u16.to_ne_bytes());
+    attr_past.extend(0_u16.to_ne_bytes());
+    attr_past.extend(b"/run");
+    let attr_past = with_len(attr_past.clone(), len_of(&attr_past));
+    let error = |errno: i32| {
+        nlmsg(
+            2,
+            0,
+            DUMP_SEQ,
+            &[&errno.to_ne_bytes()[..], &good[..16]].concat(),
+        )
+    };
+    let mut interrupted = listener_at(41004, b"/run/c.sock");
+    interrupted[6..8].copy_from_slice(&(0x2_u16 | 0x10).to_ne_bytes());
+    let cases: Vec<(&str, Vec<u8>, Result<linux::Dump, linux::DumpFault>)> = vec![
+        (
+            "a length under a header",
+            with_len(good.clone(), 12),
+            Err(Torn("")),
+        ),
+        (
+            "a length past the datagram",
+            with_len(good.clone(), len_of(&good) + 4),
+            Err(Torn("")),
+        ),
+        (
+            "another request's record",
+            [good.clone(), nlmsg(20, 0x2, DUMP_SEQ + 1, &good[16..])].concat(),
+            Err(Torn("")),
+        ),
+        (
+            "a record of another family",
+            diag_record(2, 10, 41001, &[name_attr(b"/run/b.sock")]),
+            Err(Torn("")),
+        ),
+        ("a socket record cut short", short_msg, Err(Torn(""))),
+        ("an attribute past its record", attr_past, Err(Torn(""))),
+        (
+            "a bound file attribute of another size",
+            diag_record(
+                1,
+                10,
+                41001,
+                &[name_attr(b"/run/b.sock"), nlattr(1, &[0; 4])],
+            ),
+            Err(Torn("")),
+        ),
+        (
+            "an error",
+            [good.clone(), error(-1)].concat(),
+            Err(Refused(1)),
+        ),
+        ("an acknowledgement", error(0), Err(Torn(""))),
+        (
+            "a dump that ended in an error",
+            [good.clone(), dump_done(-105)].concat(),
+            Err(Refused(105)),
+        ),
+        (
+            "an interrupted dump",
+            [good.clone(), interrupted].concat(),
+            Err(Interrupted),
+        ),
+        (
+            "an overrun",
+            [good.clone(), nlmsg(4, 0, DUMP_SEQ, &[])].concat(),
+            Err(Torn("")),
+        ),
+        (
+            "a message of another type",
+            nlmsg(16, 0, DUMP_SEQ, &[0; 16]),
+            Err(Torn("")),
+        ),
+        ("an empty datagram", Vec::new(), Err(Torn(""))),
+    ];
+    for (what, datagram, want) in cases {
+        let mut into = Vec::new();
+        let got = linux::unix_diag_listeners(&datagram, DUMP_SEQ, &mut into);
+        match want {
+            Err(Torn(_)) => assert!(matches!(got, Err(Torn(_))), "{what}: {got:?}"),
+            want => assert_eq!(got, want, "{what}"),
+        }
+        assert!(into.is_empty(), "{what}: nothing appended, {into:?}");
+    }
+    let mut into = Vec::new();
+    let noop = nlmsg(1, 0, DUMP_SEQ, &[]);
+    assert_eq!(
+        linux::unix_diag_listeners(&[noop, good].concat(), DUMP_SEQ, &mut into),
+        Ok(linux::Dump::More),
+        "a no-op is skipped"
+    );
+    assert_eq!(into, [listener(41001, b"/run/b.sock")]);
+}
+
+/// The request asks the kernel for every `AF_UNIX` socket in state `TCP_LISTEN` with its name and
+/// bound file, as a dump, under its sequence. NEGATIVE CONTROL: ask for another state, and the
+/// bytes differ.
+#[test]
+fn the_dump_request_asks_for_every_listener_by_name() {
+    let want: Vec<u8> = [
+        &40_u32.to_ne_bytes()[..],
+        &20_u16.to_ne_bytes(),
+        &0x301_u16.to_ne_bytes(),
+        &7_u32.to_ne_bytes(),
+        &0_u32.to_ne_bytes(),
+        &[1, 0],
+        &0_u16.to_ne_bytes(),
+        &0x400_u32.to_ne_bytes(),
+        &0_u32.to_ne_bytes(),
+        &3_u32.to_ne_bytes(),
+        &0xffff_ffff_u32.to_ne_bytes(),
+        &0xffff_ffff_u32.to_ne_bytes(),
+    ]
+    .concat();
+    assert_eq!(linux::unix_diag_request(7).to_vec(), want);
+}
+
+#[test]
+fn speed_bps_psi_and_zones_reject_plus_prefixed_tokens() {
+    assert_eq!(linux::speed_bps("+1000\n"), None);
+    assert_eq!(linux::psi("some avg10=+1.25\nfull avg10=0.00\n"), None);
+    let root = tree(&[
+        ("sys/class/thermal/thermal_zone0/temp", "+45000\n"),
+        ("sys/class/thermal/thermal_zone0/trip_point_0_type", "hot\n"),
+        (
+            "sys/class/thermal/thermal_zone0/trip_point_0_temp",
+            "80000\n",
+        ),
+    ]);
+    assert!(Root::new(root.path()).zones().is_empty());
 }

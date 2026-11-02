@@ -136,6 +136,68 @@ fn a_read_is_served_from_its_own_segment_alone() {
     assert_eq!(c.position(), 0, "and nothing consumed");
 }
 
+/// A read of the local zone at an instant the tape holds no answer for is unknown: nothing
+/// consumed, the segment not strayed from.
+/// A different door is STALE as any read is.
+#[test]
+fn a_local_zone_read_the_tape_lacks_is_unknown() {
+    let mut c = cursor(vec![ctl(&["text"], "t"), ctl(&["key", "1"], "pressed")]);
+    assert!(ask(&mut c, &["text"]).is_ok());
+    let unknown = c
+        .exchange(doors::PROBE_LOCAL_OFFSET, b"1793523600")
+        .expect("no refusal");
+    assert_eq!((unknown.at, unknown.reply), (None, Vec::new()));
+    assert_eq!((c.position(), c.account.housekept), (1, 1));
+    assert!(!c.strayed);
+    assert!(c.exchange(doors::PROBE_ZONE_OFFSET, b"UTC 1").is_err());
+}
+
+/// A tape a build that read no titles recorded answers each `title` read as no title: the
+/// refusal of a host without the verb, nothing consumed, the segment not strayed from. A tape
+/// that holds a `title` read serves it from its records, and a read its segment does not hold
+/// is STALE as any read is.
+#[test]
+fn a_title_read_on_a_tape_that_holds_none_is_no_title() {
+    let mut c = cursor(vec![ctl(&["text"], "t"), ctl(&["key", "1"], "pressed")]);
+    assert!(ask(&mut c, &["text"]).is_ok());
+    let titled = ask(&mut c, &["@s-1", "title"]).expect("no title");
+    let reply = super::codec::ctl_reply_of(&titled.reply)
+        .ok()
+        .and_then(Result::ok)
+        .expect("a reply");
+    assert_eq!(
+        (titled.at, reply.code, reply.stdout.as_str()),
+        (None, 1, "")
+    );
+    assert!(reply.stderr.contains("unknown verb 'title'"), "{reply:?}");
+    assert_eq!((c.position(), c.account.housekept), (1, 1));
+    assert!(!c.strayed);
+    assert!(ask(&mut c, &["key", "1"]).is_ok());
+    assert_eq!(
+        ask(&mut c, &["titles"]).err(),
+        Some(Refusal::Stale {
+            class: ActClass::Read
+        }),
+        "another verb"
+    );
+    let mut c = cursor(vec![
+        ctl(&["title"], "◐ Claude Code"),
+        ctl(&["key", "1"], "pressed"),
+    ]);
+    assert_eq!(
+        ask(&mut c, &["title"]).map(|s| s.reply),
+        Ok(said("◐ Claude Code"))
+    );
+    assert!(ask(&mut c, &["key", "1"]).is_ok());
+    assert_eq!(
+        ask(&mut c, &["title"]).err(),
+        Some(Refusal::Stale {
+            class: ActClass::Read
+        }),
+        "a titled tape's segment that holds none"
+    );
+}
+
 #[test]
 fn a_wait_held_only_past_the_act_is_the_act_skipped() {
     let wait = ["await", "seq", "102", "timeout", "20000"];
@@ -542,5 +604,388 @@ fn a_keyed_answer_is_astreams_at_every_cursor() {
     assert!(
         inclusive_disagreed,
         "the negative control: an inclusive bound answers from the future somewhere"
+    );
+}
+
+#[test]
+fn a_wait_or_sleep_the_cursor_dropped_is_charged_once() {
+    use aterm_spec::rng::XorShift;
+    const MS: u64 = 1_000_000;
+    let settle = ["await", "idle", "500", "timeout", "1500"];
+    let nap = (250 * MS).to_string();
+    let filler =
+        |rng: &mut XorShift, i: usize| ctl(&[*rng.pick(&["text", "status"])], &i.to_string());
+    let mut rng = XorShift::new(340);
+    for case in 0..64 {
+        let mut records = Vec::new();
+        let mut took = Vec::new();
+        let lead = rng.range(0, 6);
+        for i in 0..lead {
+            records.push(filler(&mut rng, i));
+            took.push(rng.range(1, 50) as u64 * MS);
+        }
+        let mut waited = [
+            (ctl(&settle, "idle"), rng.range(500, 1501) as u64 * MS),
+            (
+                EffectRecord::Exchange {
+                    door: doors::SLEEP.to_string(),
+                    request: nap.clone().into_bytes(),
+                    reply: Vec::new(),
+                },
+                250 * MS,
+            ),
+        ];
+        if rng.below(2) == 0 {
+            waited.reverse();
+        }
+        for (record, ns) in waited {
+            records.push(record);
+            took.push(ns);
+        }
+        for i in 0..rng.range(0, 6) {
+            records.push(filler(&mut rng, i));
+            took.push(rng.range(1, 50) as u64 * MS);
+        }
+        records.push(ctl(&["who"], "w"));
+        took.push(rng.range(1, 50) as u64 * MS);
+        for i in 0..rng.range(0, 4) {
+            records.push(filler(&mut rng, i));
+            took.push(MS);
+        }
+        let mut mono = 0;
+        let stamps: Vec<Option<Stamp>> = took
+            .iter()
+            .map(|ns| {
+                mono += ns;
+                Some(Stamp {
+                    mono_ns: mono,
+                    wall_ms: 1_700_000_000_000 + (mono / MS) as i64,
+                })
+            })
+            .collect();
+        let at = |asked: Vec<u8>| {
+            records
+                .iter()
+                .position(
+                    |r| matches!(r, EffectRecord::Exchange { request, .. } if *request == asked),
+                )
+                .expect("on the tape")
+        };
+        let (w, r) = (at(ctl_request(&settle)), at(ctl_request(&["who"])));
+        let end = |at: usize| stamps[at].expect("stamped").mono_ns;
+        let mut c = ActsCursor::new(records.clone(), stamps.clone());
+        assert_eq!(
+            ask(&mut c, &["who"]).map(|s| s.at),
+            Ok(Some(r)),
+            "case {case}"
+        );
+        let recorded = c.now();
+        assert_eq!(recorded.0, end(r), "case {case}");
+        assert_eq!(
+            ask(&mut c, &settle).map(|s| s.at),
+            Ok(Some(w)),
+            "case {case}"
+        );
+        c.exchange(doors::SLEEP, nap.as_bytes())
+            .expect("a sleep is always served");
+        assert_eq!(
+            c.now(),
+            recorded,
+            "case {case}: the wait and the sleep the read dropped are in its stamp already"
+        );
+        assert_eq!(
+            ask(&mut c, &settle).map(|s| s.at),
+            Ok(Some(w)),
+            "case {case}"
+        );
+        assert_eq!(
+            c.now().0,
+            end(r) + 1_500 * MS,
+            "case {case}: the dropped wait served once already passes its timeout"
+        );
+        c.exchange(doors::SLEEP, nap.as_bytes())
+            .expect("a sleep is always served");
+        assert_eq!(
+            c.now().0,
+            end(r) + 1_750 * MS,
+            "case {case}: and the sleep its length"
+        );
+        assert_eq!(
+            ask(&mut c, &["await", "gone", "nothing", "timeout", "7"]).err(),
+            Some(Refusal::Stale {
+                class: ActClass::Wait
+            }),
+            "case {case}: a wait never on the tape"
+        );
+        assert_eq!(
+            c.now().0,
+            end(r) + 1_750 * MS,
+            "case {case}: and no time passed"
+        );
+        let mut c = ActsCursor::new(records.clone(), stamps.clone());
+        assert_eq!(
+            ask(&mut c, &settle).map(|s| s.at),
+            Ok(Some(w)),
+            "case {case}"
+        );
+        assert_eq!(
+            ask(&mut c, &settle).map(|s| s.at),
+            Ok(Some(w)),
+            "case {case}"
+        );
+        assert_eq!(
+            c.now().0,
+            end(w) + 1_500 * MS,
+            "case {case}: a wait the candidate consumed passes its timeout when asked again"
+        );
+    }
+}
+
+#[test]
+fn a_dropped_wait_owes_only_what_the_base_lacks_and_at_most_its_timeout() {
+    const MS: u64 = 1_000_000;
+    let settle = ["await", "idle", "500", "timeout", "1500"];
+    let stamp = |mono_ns| {
+        Some(Stamp {
+            mono_ns,
+            wall_ms: 0,
+        })
+    };
+    let run = |wait_end| {
+        let mut c = ActsCursor::new(
+            vec![
+                ctl(&["text"], "t"),
+                ctl(&settle, "idle"),
+                ctl(&["who"], "w"),
+            ],
+            vec![stamp(100 * MS), wait_end, None],
+        );
+        assert!(ask(&mut c, &["text"]).is_ok());
+        assert!(
+            ask(&mut c, &["who"]).is_ok(),
+            "the wait dropped, the base the text's"
+        );
+        assert!(ask(&mut c, &settle).is_ok());
+        c.now().0
+    };
+    assert_eq!(
+        run(stamp(800 * MS)),
+        800 * MS,
+        "the rest of its run: its recorded end"
+    );
+    assert_eq!(
+        run(stamp(5_000 * MS)),
+        1_600 * MS,
+        "never more than its timeout"
+    );
+    assert_eq!(
+        run(None),
+        1_600 * MS,
+        "an unstamped dropped wait passes its whole timeout"
+    );
+    let settle_eq = ["await", "idle", "500", "timeout=1500"];
+    let mut c = ActsCursor::new(
+        vec![
+            ctl(&["text"], "t"),
+            ctl(&settle_eq, "idle"),
+            ctl(&["who"], "w"),
+        ],
+        vec![stamp(100 * MS), None, None],
+    );
+    assert!(ask(&mut c, &["text"]).is_ok());
+    assert!(ask(&mut c, &["who"]).is_ok());
+    assert!(ask(&mut c, &settle_eq).is_ok());
+    assert_eq!(
+        c.now().0,
+        1_600 * MS,
+        "dropped timeout=1500 wait charges its timeout"
+    );
+    let mut c = ActsCursor::new(
+        vec![ctl(&["key", "1"], "pressed"), ctl(&settle_eq, "idle")],
+        vec![None, None],
+    );
+    assert_eq!(
+        ask(&mut c, &["await", "idle", "500", "timeout=900"]).err(),
+        Some(Refusal::Skipped {
+            closing: 0,
+            class: ActClass::Wait,
+        })
+    );
+    let mut c = ActsCursor::new(
+        vec![
+            ctl(&["text"], "t"),
+            ctl(&settle, "idle"),
+            EffectRecord::File {
+                path: "@ledger/x".to_string(),
+                bytes: b"x".to_vec(),
+            },
+        ],
+        vec![stamp(100 * MS), stamp(800 * MS), None],
+    );
+    assert!(ask(&mut c, &["text"]).is_ok());
+    c.exchange(doors::SLEEP, (500 * MS).to_string().as_bytes())
+        .expect("a sleep is always served");
+    assert!(
+        matches!(c.file("@ledger/x"), Ok(Ok(_))),
+        "the settle dropped"
+    );
+    assert!(ask(&mut c, &settle).is_ok());
+    assert_eq!(
+        c.now().0,
+        800 * MS,
+        "a sleep since the base counts toward the dropped wait's end"
+    );
+    let mut c = ActsCursor::new(
+        vec![
+            ctl(&["text"], "t"),
+            ctl(&["status"], "s"),
+            ctl(&settle, "idle"),
+            ctl(&["who"], "w"),
+        ],
+        vec![stamp(100 * MS), stamp(150 * MS), stamp(800 * MS), None],
+    );
+    assert!(ask(&mut c, &["text"]).is_ok());
+    c.exchange(doors::SLEEP, (300 * MS).to_string().as_bytes())
+        .expect("a sleep is always served");
+    assert_eq!(c.mono(), 400 * MS, "a virtual read raises the floor");
+    assert!(ask(&mut c, &["status"]).is_ok());
+    assert_eq!(c.now().0, 400 * MS, "the floor above the base");
+    assert!(ask(&mut c, &["who"]).is_ok(), "the settle dropped");
+    assert!(ask(&mut c, &settle).is_ok());
+    assert_eq!(
+        c.now().0,
+        800 * MS,
+        "the floor does not shorten the dropped wait: the clock reaches its end"
+    );
+}
+
+#[test]
+fn a_virtual_sleep_stands_for_the_identical_sleep_ahead_in_its_segment() {
+    const MS: u64 = 1_000_000;
+    let nap = (250 * MS).to_string();
+    let stamp = |ms: u64| {
+        Some(Stamp {
+            mono_ns: ms * MS,
+            wall_ms: 0,
+        })
+    };
+    let sleep_record = || EffectRecord::Exchange {
+        door: doors::SLEEP.to_string(),
+        request: nap.clone().into_bytes(),
+        reply: Vec::new(),
+    };
+    let nap_on = |c: &mut ActsCursor| {
+        c.exchange(doors::SLEEP, nap.as_bytes())
+            .expect("a sleep is always served");
+        c.now().0
+    };
+    let one = || {
+        ActsCursor::new(
+            vec![
+                ctl(&["text"], "t"),
+                ctl(&["status"], "s"),
+                sleep_record(),
+                ctl(&["who"], "w"),
+            ],
+            vec![stamp(100), stamp(110), stamp(360), stamp(370)],
+        )
+    };
+    let mut c = one();
+    assert!(ask(&mut c, &["text"]).is_ok());
+    assert!(ask(&mut c, &["who"]).is_ok(), "the sleep dropped");
+    assert_eq!(
+        nap_on(&mut c),
+        370 * MS,
+        "the negative control: in the base"
+    );
+    let mut c = one();
+    assert!(ask(&mut c, &["text"]).is_ok());
+    assert_eq!(
+        nap_on(&mut c),
+        350 * MS,
+        "virtual: status is under the cursor"
+    );
+    assert!(ask(&mut c, &["who"]).is_ok(), "the sleep dropped");
+    assert_eq!(
+        nap_on(&mut c),
+        620 * MS,
+        "the virtual sleep stood for the recorded one: this one passes its length"
+    );
+    let two = || {
+        ActsCursor::new(
+            vec![
+                ctl(&["text"], "t"),
+                ctl(&["status"], "s"),
+                sleep_record(),
+                sleep_record(),
+                ctl(&["who"], "w"),
+            ],
+            vec![stamp(100), stamp(110), stamp(360), stamp(610), stamp(620)],
+        )
+    };
+    let mut c = two();
+    assert!(ask(&mut c, &["text"]).is_ok());
+    nap_on(&mut c);
+    assert!(ask(&mut c, &["who"]).is_ok(), "both sleeps dropped");
+    assert_eq!(
+        nap_on(&mut c),
+        620 * MS,
+        "one virtual sleep stood for the first alone: the second is in the base"
+    );
+    let mut c = two();
+    assert!(ask(&mut c, &["text"]).is_ok());
+    nap_on(&mut c);
+    nap_on(&mut c);
+    assert!(ask(&mut c, &["who"]).is_ok(), "both sleeps dropped");
+    assert_eq!(
+        nap_on(&mut c),
+        870 * MS,
+        "two virtual sleeps stood for both: the third passes its length"
+    );
+    let mut c = ActsCursor::new(
+        vec![
+            ctl(&["text"], "t"),
+            sleep_record(),
+            ctl(&["who"], "w"),
+            ctl(&["key", "1"], "pressed"),
+            ctl(&["status"], "s"),
+            ctl(&["key", "2"], "pressed"),
+            ctl(&["status"], "s"),
+            sleep_record(),
+            ctl(&["who"], "w"),
+        ],
+        vec![
+            stamp(100),
+            stamp(350),
+            stamp(360),
+            stamp(400),
+            stamp(410),
+            stamp(500),
+            stamp(510),
+            stamp(760),
+            stamp(770),
+        ],
+    );
+    assert!(ask(&mut c, &["text"]).is_ok());
+    assert!(
+        ask(&mut c, &["who"]).is_ok(),
+        "the first segment's sleep dropped"
+    );
+    assert_eq!(ask(&mut c, &["key", "1"]).map(|s| s.at), Ok(Some(3)));
+    assert_eq!(
+        nap_on(&mut c),
+        650 * MS,
+        "an earlier segment's dropped sleep is not this one's: its length passes"
+    );
+    assert!(ask(&mut c, &["status"]).is_ok());
+    assert_eq!(ask(&mut c, &["key", "2"]).map(|s| s.at), Ok(Some(5)));
+    assert!(
+        ask(&mut c, &["who"]).is_ok(),
+        "this segment's sleep dropped"
+    );
+    assert_eq!(
+        nap_on(&mut c),
+        770 * MS,
+        "the sleep before the act stood for none past it: this one is in the base"
     );
 }

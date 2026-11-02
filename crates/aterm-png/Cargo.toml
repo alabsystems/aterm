@@ -20,5 +20,9 @@ aterm-codec = { workspace = true }
 # dependencies or platform code of its own; aterm-codec already brings it.
 astream-wire = { path = "../../vendor/astream/crates/astream-wire" }
 
+[dev-dependencies]
+# `check::each`: the repository corpus test decodes a file per core.
+aterm-spec = { workspace = true }
+
 [lints]
 workspace = true

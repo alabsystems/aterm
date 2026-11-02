@@ -1,77 +1,44 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-objc: spec recovery from its 201 unit tests
+# aterm-objc: spec recovery from its unit tests
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the spec rows no longer
-> cite the tests it deleted. Counts elsewhere in this file were taken before.
-
-> Status 2026-10-16: this is the crate's migration worklist. Each of the 35 specs below is
-> proved through Trust/Clean about the compiled Rust, and then the tests it subsumes are
-> deleted. The 36 checks in §4 sample no spec. They are deleted, or re-homed as
-> `aterm-census` guards, without waiting for a proof.
->
-> Status 2026-10-17: `cf-catch-up-arithmetic` is gone with its functions
-> (`wake_timer::{cf_catch_up_steps,interval_ticks}`), so 34 specs are left. Of the 36 checks §4
-> listed, 35 are deleted and one is left.
->
-> **Tried 2026-10-16 on seal `150efe4a`: `bool-semantics` is blocked, not proved (gap 1).**
-> `Bool::new` gets no E6 import: an island over `trust_import_aterm_objc__encode__Bool__new` is
-> rejected (`AutoBoundHeadOverApplied { name: "trust_import_aterm_objc__encode__Bool__new", .. }`),
-> and no clause can name its struct result (`result.0 == value`, `result == Self(value)` and, with
-> a named field, `result.value == value` are each "unsupported contract predicate expression").
-> `Bool::as_bool` is admitted, with the newtype flattened to its field (`b : Bool`), but its clause
-> `result == self.0` is refused: a clause may project only a named field of a parameter, never a
-> tuple index. Renamed to a named field, `ensures result == self.value by …` does certify
-> (`clean-kernel-citation`, Certified), but that only restates the body; the round trip needs
-> `new`. The code is unchanged and both tests stay; each also checks things the spec does not
-> (`Bool::ENCODING` against Foundation and the cfg arms, which is `encode-table`).
-
-Source: `crates/aterm-objc` (read only). I read every `#[test]` in `src/{exception,wake_timer}.rs`
-and `tests/*.rs`, and the source each one reaches (`src/{lib,encode,exception,wake_timer,runtime,
-declare,class_macro,block,sel_cache,swizzle,weak,main_thread_bound,send}.rs`). Nothing was compiled
-or run. The claims below come from reading the code.
-
-Count: a grep for `#[test]` finds 202 lines, but two of them are doc-comment text
-(`tests/main_thread_bound_drive.rs:23`, `tests/objc_static_suite.rs:9`). There are 200 real `#[test]`
-fns. The `harness = false` target `main_thread_bound_drive` answers libtest's argv as one test from
-its `fn main`, so it counts as one more: **201 tests**.
-
-Result: **34 specs**, covering **165 tests**. **36 tests are not spec samples** (§4).
-
-Paths in this file are relative to `crates/aterm-objc` unless they name another crate.
+Each §1 row is a property of `crates/aterm-objc` that its tests sample, recovered by reading the
+tests and the code they reach; nothing was compiled or run. Once a spec is proved through
+Trust/Clean, the tests it subsumes are deleted. Paths are relative to `crates/aterm-objc` unless
+they name another crate.
 
 ## 0. Notation used in the statements
 
-- `Enc(T)` = `<T as Encode>::ENCODING`. `UA(T)` = `<T as Encode>::HAS_UNALIGNED_FIELDS`. `++` is string
-  concatenation.
+- `Enc(T)` = `<T as Encode>::ENCODING`; `UA(T)` = `<T as Encode>::HAS_UNALIGNED_FIELDS`; `++`
+  concatenates strings.
 - `MEnc(R; A1..An)` = `Enc(R) ++ "@:" ++ Enc(A1) ++ … ++ Enc(An)`, for `n ≤ 14`.
 - `strip` = `encode::strip_method_offsets`. `depth_i` and `inq_i` are the bracket depth and the
-  in-quote flag after scanning the prefix `s[0..i]` of the char sequence `s`. The depth is one counter
-  for `{([` and `})]`, saturates at 0, and is ignored inside quotes.
-- `Arch` ∈ {aarch64, x86_64}. `BOOLENC(Arch)` = `B` on aarch64, `c` on x86_64. `BOOLPTR(Arch)` = `^B` / `^c`.
-- `P`: the platform specification of libobjc, Foundation, CoreFoundation, libdispatch and AppKit that a
-  Trust FFI assumption channel would hold (audit gap 8). It covers method tables, the weak table,
-  autorelease pools, the block runtime, the run loop, `sel_registerName` interning, and `@encode` as
-  clang emits it for `Arch`.
-- `RC(o)`: an object's retain count. `Alive(o)`: `o` is not deallocated. `Pools`: the thread's
-  autorelease-pool stack.
-- `CONTAINED` = `exception::CONTAINED`. `Sink`: the function installed by `set_sink`, else `default_sink`.
-- `Model` = `aterm_models_core::run_loop_waker_model`, with vars `cache, spent, armed, want, delivered,
-  steps` and invariants `NoLostWake` and `BoundedCatchUp`.
-- Declared site `D`: one `declare_class!` invocation, with `NAME`, superclass `S`, protocols `Ps`, rows
-  `(sel_i, fn_i(&self, A_i..) -> R_i, abort_i ∈ {contain, abort_on_exception})`, and ivars type `I`.
-- Gaps: numbers in the `gaps` column are rows of the gap table in
-  `AUDIT-trust-for-test-migration-2026-10-15.md` (historical internal audit) §7.
-  Gap 0 (a seal that publishes Clean rows) is a prerequisite of every row and is not repeated in the
-  column. **No spec here is blocked by gap 0 alone.** Five specs (`strip-offsets-filter`,
-  `method-encoding-concat`, `encode-table`, `bool-semantics`, `wake-plan-refines-model`) need no
-  platform lane (gap 8).
+  in-quote flag after the prefix `s[0..i]`; the depth is one counter for `{([` and `})]`, saturates
+  at 0, and is ignored inside quotes.
+- `Arch` ∈ {aarch64, x86_64}. `BOOLENC(Arch)` = `B` on aarch64, `c` on x86_64; `BOOLPTR(Arch)` =
+  `^B` / `^c`.
+- `P`: the platform specification of libobjc, Foundation, CoreFoundation, libdispatch and AppKit
+  that a Trust FFI assumption channel would hold (gap 8): method tables, the weak table, autorelease
+  pools, the block runtime, the run loop, `sel_registerName` interning, and `@encode` as clang emits
+  it for `Arch`.
+- `RC(o)`: retain count. `Alive(o)`: `o` is not deallocated. `Pools`: the thread's autorelease-pool
+  stack.
+- `CONTAINED` = `exception::CONTAINED`. `Sink`: the function installed by `set_sink`, else
+  `default_sink`.
+- `Model` = `aterm_models_core::run_loop_waker_model`, whose vars include `cache, spent, armed,
+  want, delivered, steps`, with invariants `NoLostWake` and `BoundedCatchUp`.
+- Declared site `D`: one `declare_class!` invocation, with `NAME`, superclass `S`, protocols `Ps`,
+  rows `(sel_i, fn_i(&self, A_i..) -> R_i, abort_i ∈ {contain, abort_on_exception})`, and ivars
+  type `Ivars`.
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (every test that samples the spec),
-`difficulty` (Rust features the proof must handle), and `gaps` (blocking audit §7 gaps besides 0).
+Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (every test that samples the spec:
+`file::fn` is in `tests/file.rs`, `src/file.rs::fn` is a unit test, `-` is none), `difficulty`
+(Rust features the proof must handle), and `gaps`: the rows of the gap table in
+`docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7 that block the spec. Gap 0 (a seal that
+publishes Clean rows) is a prerequisite of every row and is left out.
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	gaps
@@ -109,7 +76,7 @@ sdk-constants-equal	table-property	aterm-gui appkit.rs consts, aterm-window plat
 send-site-abi	refinement	send::{checked_msg,CheckedFn,prototype_check,block_signatures,block_check,abi_shape,swift_override_of_the_same_width}, send::send_* helpers, aterm-gui and aterm-window send call sites	abi_shape(t) tokenises a stripped Objective-C encoding, preserving scalar sign/width, array dimensions and struct/union tags+fields while collapsing every pointer/object/class/SEL/block (@, #, :, ^T, *, @?, @?<...>) to "p" and dropping method qualifiers (r, n, N, o, O, R, V). swift_override_of_the_same_width(cls, rt, ours) holds iff cls is a Swift class ("_Tt"* or contains '.') and abi_shape(rt) equals abi_shape(ours) after erasing struct tags and wide-integer signs (i/I, q/Q, c/B on x86_64/arm64 BOOL). prototype_check::<F>(cls, sel) succeeds iff cls implements sel and abi_shape(strip(runtime)) matches abi_shape(F::types()) (or swift_override_of_the_same_width holds). block_signatures(ext) extracts each top-level @?<...> payload outside quotes; block_check::<P>(sig) checks abi_shape(strip(sig)) = abi_shape(P::types()). Under debug_assertions, checked_msg::<F>() checks (class_of(recv), sel, trampoline) before forwarding to msg::<F>(), caching passed triples per thread and panicking on any mismatch.	src/send.rs::the_shape_keeps_sign_width_and_layout_and_merges_pointers, src/send.rs::a_swift_override_may_differ_only_in_a_wide_integers_sign, src/send.rs::a_prototype_is_checked_without_a_send, src/send.rs::a_block_prototype_is_checked_against_its_recorded_signature, src/send.rs::a_send_cast_to_the_wrong_prototype_panics_in_a_debug_build, src/send.rs::a_reused_checked_cast_is_checked_per_receiver_and_selector	FFI method tables, String encoding tokeniser loops, generic CheckedFn/BlockFn traits, thread_local Passed cache, cross-crate call-site contracts	1, 7, 8, 11, 12
 declared-row-matches-authority	refinement	aterm-window declare_class! sites (71 rows), aterm-window app.rs SendEvent swizzle	∀ aterm-window declared row r (selector s, Rust signature fn(&self, A..) -> R) with a runtime authority (a protocol method description or the superclass's method): strip(authority(s)) = MEnc(R; A..). No row takes or returns a block (@?) or a function pointer (^?). For the swizzled -[NSApplication sendEvent:]: strip(method_types(NSApplication, sendEvent:)) = <SendEvent as MethodFn>::method_encoding() = "v@:@". draggingEntered: is Q@:@, while prepare/performDragOperation: are BOOLENC@:@.	-	cross-crate declare_class! sites, protocol_getMethodDescription FFI, String	8, 10, 12
 send-rect-nil	contract	send::send_rect	∀ sel: send_rect(Id::NIL, sel) = CGRect::default() (all four f64 fields +0.0) without sending, whatever the caller's stack held. For a non-null recv it returns the prototype-exact send's result. The same nil guard is owed by every helper whose return is indirect on some Arch (returns_indirectly).	runtime::a_nil_receiver_returns_a_zero_rect_on_this_arch	an early return on a null check, then an FFI send; a struct return. The nil branch alone is pure (gaps 1, 3); the non-nil branch needs 8	1, 3, 8
-path-monitor-and-status	contract	path_monitor::PathStatus::from_raw, path_monitor::Network::{open,table}, path_monitor::PathMonitor::{start,drop}	PathStatus::from_raw(1) = Satisfied, from_raw(2) = Unsatisfied, from_raw(3) = Satisfiable, and from_raw(r) = Invalid for every other c_int r (including 0, 4, −1, i32::MIN, i32::MAX). Network::open() dlopens Network.framework once (RTLD_LAZY, never closed) and resolves all 8 nw_path_monitor_* / nw_path_* / nw_release symbols into Network::table(). PathMonitor::start creates a +1 nw_path_monitor_t bound to a fresh SerialQueue and an RcBlock::new1 handler delivering PathReading{status: from_raw(status(p)), constrained: constrained(p)} to sink; Drop cancels and releases the monitor once.	src/path_monitor.rs::the_framework_opens_and_every_function_resolves, src/path_monitor.rs::each_raw_status_reads_as_the_one_the_header_names	const fn c_int match (pure, gap 1 alone), OnceLock dlopen/dlsym FFI table, RcBlock + SerialQueue ownership	1, 8, 13
+path-monitor-and-status	contract	path_monitor::PathStatus::from_raw, path_monitor::Network::{open,table}, path_monitor::PathMonitor::{start,drop}	PathStatus::from_raw(1) = Satisfied, from_raw(2) = Unsatisfied, from_raw(3) = Satisfiable, and from_raw(r) = Invalid for every other c_int r (including 0, 4, −1, i32::MIN, i32::MAX). Network::open() dlopens Network.framework once (RTLD_LAZY, never closed) and resolves all 9 nw_path_monitor_* / nw_path_* / nw_release symbols into Network::table(). PathMonitor::start creates a +1 nw_path_monitor_t bound to a fresh SerialQueue and an RcBlock::new1 handler delivering PathReading{status: from_raw(status(p)), constrained: constrained(p), expensive: expensive(p)} to sink; Drop cancels and releases the monitor once.	src/path_monitor.rs::the_framework_opens_and_every_function_resolves, src/path_monitor.rs::each_raw_status_reads_as_the_one_the_header_names	const fn c_int match (pure, gap 1 alone), OnceLock dlopen/dlsym FFI table, RcBlock + SerialQueue ownership	1, 8, 13
 serial-queue-dispatch	contract	queue::SerialQueue::{new,as_id,is_current,sync,spawn,drop}, queue::ContainedOnQueue	SerialQueue::new(label) creates a +1 serial dispatch_queue_t stamped with its own address under CURRENT. Work submitted via spawn or sync executes one item at a time in FIFO submission order inside an autoreleasepool; sync waits for all prior items and returns f()'s value. is_current() holds iff called from work executing on this queue. sync called when is_current() panics immediately ("would deadlock") without calling dispatch_sync_f, leaving the queue usable. A Rust panic in sync is caught and resume_unwind'd on the caller; an NSException in sync is contained via exception::contain and panicked as ContainedOnQueue{ordinal}; in spawn, either is contained/caught, reported on stderr, and later work still runs. Drop calls dispatch_release once while pending spawned work keeps the queue alive until drained; as_id() exposes the non-null Objective-C dispatch_queue_t.	src/queue.rs::work_runs_one_at_a_time_in_submission_order_and_sync_waits_for_it, src/queue.rs::the_queue_knows_its_own_work_and_no_other, src/queue.rs::a_sync_from_the_queues_own_work_is_refused_not_deadlocked, src/queue.rs::a_panic_in_sync_reaches_the_caller_and_the_queue_goes_on, src/queue.rs::a_panic_in_spawned_work_is_reported_and_later_work_still_runs, src/queue.rs::pending_work_outlives_the_dropped_holder, src/queue.rs::the_queue_is_an_object_the_runtime_can_message	libdispatch FFI (dispatch_queue_create, dispatch_sync_f, dispatch_async_f, dispatch_get_specific, dispatch_release), catch_unwind + resume_unwind, Box::into_raw/from_raw closure trampolines	2, 8, 11, 13
 ```
 
@@ -148,41 +115,12 @@ Gap 8 dominates: 29 of 34 specs, because this crate is an FFI binding. Only five
 
 ## 2. Test → spec map
 
-The recovery wrote no test map for this crate. The block that stood here was
-`aterm-shell-integration`'s: every row named a test in that crate's `src/tests*.rs`, `src/lib.rs` or
-`tests/prepare_*.rs` and a spec id (`script-const-lints`, `sh-*`, …) that §1 does not have, so it is
-removed. §1's `subsumes` column names every test that samples each spec.
-
-## 3. Coverage
-
-- 201 tests read (200 `#[test]` fns plus the `main_thread_bound_drive` harness). 165 map to one of the
-  34 specs. 36 are not spec samples (§4).
-- The biggest collapses: `platform-runtime-axioms` (18 primary), `declared-dispatch` (14),
-  `declared-class-registration` (11), `block-abi` (10), `containment-trampoline` (9),
-  `weak-obj-model` (9), `ownership-balance` (8), `swizzle-install-decision` (8), `main-thread-bound` (7).
-- `platform-runtime-axioms` retires nothing by proof. Its 18 tests turn into the conformance witnesses
-  and negative controls of the FFI assumptions it names. They stay as long as those assumptions are
-  trusted rather than proved, and are deleted only if the platform lane can check the facts some other
-  way.
-- 38 tests in `gui_*`, `winit_*` and `cf_sdk` check code in other crates (`aterm-gui`,
-  `aterm-window`). Their specs (`sdk-constants-equal`, `send-site-abi`, `declared-row-matches-authority`)
-  belong on those crates' functions and need gap 12 to be cited from here.
+None: §1's `subsumes` column names every test that samples each spec.
 
 ## 4. Tests that are not spec samples
 
-**Status (2026-10-16):** deleted `main_thread_bound::the_container_is_send_and_sync_over_a_t_that_is_neither`, `adversary_w2c::the_return_types_this_crate_can_send_all_declare_their_abi`, `adversary_w2d::the_three_real_block_shapes_all_satisfy_the_new_encode_bounds`, `gui_appkit_constants::an_unparenthesised_compound_literal_would_be_vacuous`, `winit_seam::the_host_allowance_is_exactly_what_this_host_lacks`, and the three `winit_seam` source scans (`every_site_points_at_the_line_that_declares_it`, `the_table_still_covers_every_declared_method`, `the_fork_patches_exactly_the_framework_rows_this_file_checks`); the table's `site` column now names a file, not a line. The `gui_sent_prototypes`, `winit_sent_prototypes`, `send_prototype_census` and `objc2_exit_condition` files are no longer in this crate, so their rows were already gone.
-
-**Status (2026-10-17):** every test this section listed is deleted except `cf_sdk::the_parser_saw_every_declaration`, so the other 35 rows are gone: the `main_thread_bound` Send/Sync assertion, the `adversary_w2c` and `adversary_w2d` bound checks, the `support/sdk_consts` parser test, three `gui_appkit_constants` checks and one `winit_seam_constants` check, the whole `gui_sent_prototypes`, `winit_sent_prototypes`, `winit_seam`, `send_prototype_census` and `objc2_exit_condition` files, and the pool-parameter scan in `tests/weak.rs`.
-
-Action counts: **delete 1**.
-
-| test | why | action |
-|---|---|---|
-| cf_sdk::the_parser_saw_every_declaration | A vacuity guard for the test-side parser behind the SDK probe (no production caller). Obsolete once `ffi-decls-match-sdk` is a declaration-level contract. | delete |
-
-No test here is a pure regression with no general property behind it. Every adversary-review test
-(now in `declared_abi`, `declared_lifetimes`, `blocks`, `runtime` and `fatal_paths`) maps to one of
-the specs above.
+`cf_sdk::the_parser_saw_every_declaration` guards the test-side parser behind the SDK probe against
+vacuity. It goes once `ffi-decls-match-sdk` is a declaration-level contract.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
@@ -203,36 +141,33 @@ the specs above.
 
 ## 6. Proof order (easiest high-value first)
 
-No spec is blocked by gap 0 alone, so the order starts with the five specs that need no platform lane,
-cheapest first, and then the pure halves that can be factored out of effectful specs.
+First the specs that need no platform lane (gap 8), cheapest first, then the pure halves of
+effectful specs.
 
-1. **`bool-semantics`** (gap 1). A one-byte `repr(transparent)` newtype with `const fn` accessors; the
-   round trip is a case split on `bool` (and on `i8 ≠ 0` for x86_64). Drop or factor the Debug clause.
-2. **`encode-table`** (gaps 1, 11). Decidable by const evaluation of each impl's associated const once
-   `&'static str` consts are carriers. It is the base of every encoding spec below.
-3. **`strip-offsets-filter`** (gaps 1, 3, 5, 7). One loop over chars with a two-variable state; the loop
-   invariant is the filter itself over the prefix. It underlies `swizzle-install-decision`,
-   `send-site-abi` and `declared-row-matches-authority`.
-4. **`method-encoding-concat`** (gaps 1, 3, 11). Straight-line concatenation per arity; with
-   `encode-table` it gives the expected side of every encoding comparison.
-5. **`wake-plan-refines-model`** (gaps 1, 2, 10). A small deterministic state machine over an `Option`
-   and a `bool`, bound to an existing `ty_model!` model with a negative control already written.
-6. **`returns-indirectly-and-entry`**, decision half (gaps 3, 11). The `returns_indirectly` predicate is
-   pure; the symbol-address half needs gap 8.
-7. **`send-rect-nil`**, nil branch (gaps 1, 3). An early return on a null check; the non-nil branch
-   waits on gap 8.
+1. **`bool-semantics`**: a one-byte `repr(transparent)` newtype with `const fn` accessors; the
+   round trip is a case split on `bool` (and on `i8 ≠ 0` on x86_64). Drop or factor the Debug
+   clause. Trust refuses it on seal `150efe4a`: `Bool::new` gets no E6 import
+   (`AutoBoundHeadOverApplied`), no clause can name its struct result, and a clause cannot project
+   the tuple field `self.0` that `as_bool` reads.
+2. **`encode-table`**: decidable by const evaluation of each impl's associated const once
+   `&'static str` consts are carriers. Every encoding spec builds on it.
+3. **`strip-offsets-filter`**: one loop over chars with a two-variable state, whose loop invariant
+   is the filter over the prefix. `swizzle-install-decision`, `send-site-abi` and
+   `declared-row-matches-authority` build on it.
+4. **`method-encoding-concat`**: straight-line concatenation per arity; with `encode-table` it
+   gives the expected side of every encoding comparison.
+5. **`wake-plan-refines-model`**: a deterministic state machine over an `Option` and a `bool`,
+   bound to `Model`, with its negative control already written.
+6. **`returns-indirectly-and-entry`**, the `returns_indirectly` predicate (gaps 3, 11); the
+   symbol-address half needs gap 8.
+7. **`send-rect-nil`**, the nil branch (gaps 1, 3).
 8. **`swizzle-install-decision`**, after factoring the decision table into a pure fn over
-   `(claim, owner, registered, expected, current, new)` (gap 1 for that half). It retires 8 tests once the
-   CAS/FFI half (gaps 2, 8, 13) lands.
-9. **`ivar-slot-contract`**, slot half (`IvarSlot::{init,get,dispose}`, gaps 1, 2, 11): flag protocol and
-   exactly-once drop on a `repr(C)` struct, independent of the runtime's offset placement.
+   `(claim, owner, registered, expected, current, new)` (gap 1); the CAS and FFI half needs gaps 2,
+   8 and 13.
+9. **`ivar-slot-contract`**, the `IvarSlot::{init,get,dispose}` half (gaps 1, 2, 11): the flag
+   protocol and exactly-once drop, independent of the runtime's offset placement.
 
-Then the specs gated on gap 8, starting with the FFI assumption channel itself: state
-`platform-runtime-axioms` and `encode-matches-platform` as assumptions with their tests as conformance
-witnesses, then `class-lookup`, `main-thread-witness`, `owning-class`, `sel-cache-coherent`,
-`ownership-balance`, `autoreleasepool-scope`, `string-bridge-round-trip`, `weak-obj-model`,
-`block-abi`, `objc-try-protocol`, `containment-trampoline` and its report format,
-`declared-class-registration` and `declared-dispatch`, `main-thread-bound`, `protocol-or-register`,
-`wake-timer-cf-refinement`. The cross-crate ones (`ffi-decls-match-sdk`, `sdk-constants-equal`,
-`send-site-abi`, `declared-row-matches-authority`) also need gap 12 and belong with `aterm-gui` and
-`aterm-window`.
+The rest wait on gap 8, starting with the FFI assumption channel: `platform-runtime-axioms` and
+`encode-matches-platform` become assumptions with their tests as conformance witnesses.
+`sdk-constants-equal`, `send-site-abi` and `declared-row-matches-authority` state facts about
+`aterm-gui` and `aterm-window` code, so they also need gap 12 and belong on those crates.

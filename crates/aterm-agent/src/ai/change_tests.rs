@@ -9,7 +9,7 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 fn git_home(dir: &Path, args: &[&str], home: &Path) {
-    let mut cmd = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"));
+    let mut cmd = aterm_uds::spawnfd::command(crate::test_program::git());
     cmd.env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("HOME", home)
@@ -525,4 +525,19 @@ fn a_repository_root_ending_in_space_keeps_its_change() {
 #[test]
 fn a_repository_root_ending_in_newlines_keeps_its_change() {
     root_whitespace_keeps_the_selected_repository("\n\n");
+}
+
+#[test]
+fn new_file_hunk_rejects_oversized_and_multiline_paths() {
+    let r = repo();
+    let max_ok = "a".repeat(UNTRACKED_FILE_MAX as usize);
+    std::fs::write(r.root.join("exact.txt"), &max_ok).expect("write exact");
+    assert!(new_file_hunk(&r.root, "exact.txt").is_some());
+
+    let too_big = "a".repeat(UNTRACKED_FILE_MAX as usize + 1);
+    std::fs::write(r.root.join("big.txt"), &too_big).expect("write big");
+    assert_eq!(new_file_hunk(&r.root, "big.txt"), None);
+    assert_eq!(new_file_hunk(&r.root, ""), None);
+    assert_eq!(new_file_hunk(&r.root, "bad\nname.txt"), None);
+    assert_eq!(new_file_hunk(&r.root, "bad\rname.txt"), None);
 }

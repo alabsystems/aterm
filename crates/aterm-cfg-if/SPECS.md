@@ -1,74 +1,54 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-cfg-if: spec recovery from its 6 unit tests
+# aterm-cfg-if: spec recovery from its unit tests
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 2 tests it
-> deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
-> were taken before.
+The crate's migration worklist: each spec is to be proved through Trust/Clean, and the tests it
+subsumes then deleted. The claims come from reading the code, not from running it.
 
-> Status 2026-10-16: this is the crate's migration worklist. Each of the 3 specs below is
-> to be proved through Trust/Clean, and then the tests it subsumes are deleted. No test has
-> been deleted yet. All 3 specs are blocked by gap 0, by gap 10 (the nearest audit §7 row)
-> and by a gap that is **not in audit §7**: N1, `macro_rules!` expansion semantics (§0).
-
-Source: `crates/aterm-cfg-if` (read only). The directory is `aterm-cfg-if`, the package is
-`cfg-if` and the lib is `cfg_if`. The crate has **no runtime function**. Its whole production
-surface is one `macro_rules! cfg_if` in `src/lib.rs`, which has three rule families: the entry
-rule, the `@__arms` accumulator (with its empty base case) and the `@__group` splice. The
-manifest sets `test = false` on the lib, so all 6 `#[test]` fns are in `tests/differential.rs`.
-The 4 doctests on the macro are not counted among the 6 (see §3). Nothing was compiled or run.
-The claims below come from reading the code.
-
-Result: **3 specs**, covering **5 tests**. **1 test is not a spec sample** (§4).
+The directory is `aterm-cfg-if`, the package `cfg-if`, the lib `cfg_if`. The crate has no
+runtime function: its whole surface is one `macro_rules! cfg_if` in `src/lib.rs`, with three rule
+families (the entry rule, the `@__arms` accumulator with its empty base case, and the `@__group`
+splice). The lib sets `test = false`, so the tests are `tests/differential.rs` and the macro's
+doctests (§3).
 
 ## 0. Notation used in the statements
 
-- A chain `C = [(p_1,T_1), …, (p_n,T_n)]` with `n ≥ 1`, plus an optional else body `T_e`. Each
-  `p_i` is a cfg predicate token tree. Each `T_i` is a token sequence: items, statements or one
-  expression.
-- `cfg(p)` is rustc's evaluation of predicate `p` for the target being compiled, which is the
-  value `cfg!(p)` gives. `cfg(all()) = true` and `cfg(any()) = false` on every target.
-- `sel(C) = min{ i | cfg(p_i) }`. If no `p_i` holds, `sel(C) = else` when `T_e` is present and
+- A chain `C = [(p_1,T_1), …, (p_n,T_n)]`, `n ≥ 1`, with an optional else body `T_e`. Each `p_i`
+  is a cfg predicate token tree; each `T_i` is a token sequence (items, statements or one
+  expression).
+- `cfg(p)` is rustc's evaluation of `p` for the target being compiled, the value `cfg!(p)` gives.
+  `cfg(all()) = true` and `cfg(any()) = false` on every target.
+- `sel(C) = min{ i | cfg(p_i) }`; if no `p_i` holds, `sel(C) = else` when `T_e` is present and
   `none` when it is absent.
 - `E(C)` is what `cfg_if::cfg_if!{ if #[cfg(p_1)]{T_1} else if … else {T_e} }` leaves after
-  cfg-stripping. The entry rule normalizes the arms into `((p_i) (T_i))` pairs, with the else arm
-  given an empty predicate. `@__arms` then emits arm `i` under the guard
-  `g_i = #[cfg(all(p_i, not(any(p_1, …, p_{i-1}))))]`. The else arm's guard is
-  `all(not(any(p_1, …, p_n)))`. Each arm's tokens go through one `@__group` call, which is the
-  item the guard attaches to.
-- `depth(C)` is the `macro_rules!` recursion depth the expansion uses. The code spends one
-  `@__arms` level per arm (else included), plus the entry level and one `@__group` level.
+  cfg-stripping. The entry rule normalizes the arms into `((p_i) (T_i))` pairs, the else arm with
+  an empty predicate; `@__arms` emits arm `i` under
+  `g_i = #[cfg(all(p_i, not(any(p_1, …, p_{i-1}))))]`, and the else arm under
+  `all(not(any(p_1, …, p_n)))`. Each arm's tokens go through one `@__group` call, the item the
+  guard attaches to.
+- `depth(C)` is the `macro_rules!` recursion depth of the expansion: one `@__arms` level per arm
+  (else included) and the base case, plus the entry level and one `@__group` level.
+- **N1, `macro_rules!` expansion semantics.** These specs are about macro expansion, while
+  Trust/Clean reason about compiled MIR, and no row of the audit §7 gap table covers expansion.
+  N1 names that gap. Route (a) is a `ty_model!`/Clean model of the three rules (tt-muncher
+  recursion with an accumulator of the predicates seen, attribute binding on a macro-call item,
+  `#[cfg(all(.., not(any(..))))]` evaluation, splicing in item, statement and expression
+  position), bound to the real macro by a conformance test with a negative control. Route (b)
+  is an expansion certificate from rustc's `rustc_expand`. Gap 10 (model→code refinement) is the
+  nearest existing row but does not cover a macro, which has no compiled body; hence
+  `blocking_gaps = 0, 10, N1` on every row.
 
-**Why none of this fits audit §7.** These are properties of macro expansion, not of a compiled
-Rust function. Clean/Trust reason about compiled MIR, so they cannot state these properties today,
-and no row 0–17 of the gap table covers `macro_rules!` expansion semantics. This file therefore
-uses a new gap:
-
-- **N1. `macro_rules!` expansion semantics (new; not in audit §7).** Two routes are possible.
-  (a) A `ty_model!`/Clean model of this three-rule transcription: tt-muncher recursion with an
-  accumulator of the predicates seen so far, attribute binding on a macro-call item,
-  `#[cfg(all(.., not(any(..))))]` evaluation, and splicing in item, statement and expression
-  position. It would be bound to the real macro by a conformance test with a negative control.
-  (b) A compiler-side expansion certificate from rustc's `rustc_expand`.
-  The cost is S–M for (a) and L for (b). N1 should be added to the audit §7 gap table.
-
-Route (a) is the nearest fit to an existing row: **gap 10** (model→code refinement compiler
-surface beyond scalars), because the conformance binding of a `ty_model!` to the code is what
-route (a) needs. Gap 10 alone does not cover it: gap 10 refines models against compiled Rust,
-and a macro has no compiled body. So the `blocking_gaps` column below lists `0, 10, N1`: gap 0
-(the installed seal) blocks every proof, gap 10 is the nearest existing row, and N1 is the real
-blocker.
-
-The per-instance corollaries are straight-line constant fns. Examples are `tail_value()`, which
-equals its `cfg!()` cascade, and `pick()`, which equals `expected()`. Trust can already prove them,
-blocked only by gap 0, but they are samples, not the spec. Proving them is not a migration (PLAN,
-"Rules for agents").
+The per-instance corollaries (`tail_value()` equals its `cfg!()` cascade, `pick()` equals
+`expected()`) are straight-line constant fns that need only gap 0, but they are point samples of
+the spec and retire no test (`docs/PLAN-tests-to-specs-2026-10-15.md`, "Rules for agents doing
+this").
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes`, `difficulty (Rust features the proof
-must handle)`, `blocking_gaps` (audit §7 numbers, plus `N1`, the new gap in §0).
+`subsumes` lists the primary tests; `difficulty` names the Rust features the proof must handle;
+`blocking_gaps` are rows of the gap table in `docs/AUDIT-trust-for-test-migration-2026-10-15.md`
+§7, plus `N1` (§0).
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
@@ -77,24 +57,9 @@ cfgif-dead-arm-fully-absent	invariant	cfg_if::cfg_if! (@__arms guard, @__group s
 cfgif-linear-recursion-depth	other	cfg_if::cfg_if!	∀ chain C with m arms (m = n, plus 1 if T_e is present): depth(C) ≤ m + c for a small constant c (one @__arms level per arm and the base case, plus the entry and @__group levels). So any chain with m + c ≤ 128 (the default recursion_limit) expands with no #![recursion_limit]. This covers getrandom's backend chain and the 40-arm sample.	differential::forty_arms_stay_inside_the_default_recursion_limit	MEDIUM: a bound on expansion depth by induction over the arm list. N1 must model rustc's recursion counter, which counts nesting depth and not the total number of expansions.	0, 10, N1
 ```
 
-### Distribution by kind (3)
-
-| kind | count |
-|---|---|
-| equivalence | 1 |
-| invariant | 1 |
-| other (resource bound) | 1 |
-
-### Proof dependency order
-
-`cfgif-first-match-selection` and `cfgif-dead-arm-fully-absent` are independent of each other and
-share the N1 model. Together they give the crate-doc contract: E(C) emits exactly T_{sel(C)} and
-nothing from any other arm. `cfgif-linear-recursion-depth` reuses the same induction over
-`@__arms`.
-
 ## 2. Test → spec map (TSV)
 
-`primary` is the spec that retires the test. `also` lists the other specs the same test samples.
+`primary` is the spec that retires the test; `also` lists the other specs it samples.
 
 ```tsv
 file	test	primary	also
@@ -107,11 +72,11 @@ tests/differential.rs	statement_arm_preserves_caller_hygiene_for_let_bindings	cf
 tests/differential.rs	cfg_if_expansion_conformance_and_tripwire_negative_controls	cfgif-first-match-selection	cfgif-dead-arm-fully-absent, cfgif-linear-recursion-depth
 ```
 
-`real_macro_matches_rustc_on_every_chain` samples `cfgif-dead-arm-fully-absent` only weakly.
-Every arm of its chains defines the same `pick()`, so a leaked first item would be a
-duplicate-definition compile error.
+`a_dead_arm_contributes_none_of_its_items` has no row; it samples `cfgif-dead-arm-fully-absent`.
+`real_macro_matches_rustc_on_every_chain` samples that spec only weakly: every arm of its chains
+defines the same `pick()`, so a leaked first item would be a duplicate-definition error.
 
-## 3. Coverage
+## 3. Doctests
 
 - 6 tests: 5 are retired by a spec and 1 is not a spec sample.
 - 1 spec retires 3 tests; 2 specs retire 1 test each.
@@ -126,14 +91,14 @@ duplicate-definition compile error.
   now states caller-context splicing explicitly and `statement_arm_preserves_caller_hygiene_for_let_bindings`
   tests it directly.
 
-## 4. Tests that are not spec samples
+## 4. Findings
 
 Status 2026-10-28: `CfgIfExpansion` (`aterm_models_core::cfg_if_expansion_model`) and
 `cfg_if_expansion_conformance_and_tripwire_negative_controls` in `tests/differential.rs` now carry
 the N1 route (a) `ty_model!` and both negative-control tripwire mutations (`Buggy = 1` last-match-wins
 and `Buggy = 2` un-grouped multi-item arms).
 
-## 5. Implied specs that look wrong, or disagree with the code
+## 5. Proof order (easiest, high value first)
 
 1. Fixed 2026-10-16: the `case!` comment in `tests/differential.rs` now says "ONE chain in, two
    answers out", which is what `case!` generates (`real` and `expected`).

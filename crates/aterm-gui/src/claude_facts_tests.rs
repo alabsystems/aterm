@@ -251,7 +251,10 @@ fn an_account_with_no_weekly_figure_names_why_in_its_title_and_to_a_reader() {
         )
     };
     let (title, spoken) = said(&with(None));
-    assert!(title.contains("weekly ? \u{b7} until relaunch"), "{title}");
+    assert!(
+        title.contains("weekly \u{2013} \u{b7} until relaunch"),
+        "{title}"
+    );
     assert_eq!(
         spoken,
         "Account: owner@example.com, Max 20x, weekly figure unknown until aterm next relaunches this Claude Code"

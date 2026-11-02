@@ -464,6 +464,10 @@ pub(crate) fn plan_transition(
             );
             14
         }
+        "Causal" => {
+            snapshot = crate::accounts::proposals::tests::pending_snapshot();
+            15
+        }
         _ => panic!("unknown plan action"),
     };
     let cells = snapshot.cells.clone();
@@ -506,6 +510,7 @@ fn plans_conform_and_missing_dependency_or_conflict_checks_are_detected() {
     for (action, field, law) in [
         ("Dependency", "configuration", "BindConfiguration"),
         ("Conflict", "complete", "WithholdIncomplete"),
+        ("Causal", "complete", "WithholdIncomplete"),
     ] {
         let mut unsafe_state = plan_transition(&model.init_state(), action);
         unsafe_state.insert(field, if field == "complete" { 1 } else { 0 });

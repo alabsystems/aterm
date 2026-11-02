@@ -66,7 +66,7 @@ impl std::fmt::Display for AosReport {
 pub fn p99(samples: &[u64]) -> u64 {
     let mut s = samples.to_vec();
     s.sort_unstable();
-    let rank = (s.len() * 99).div_ceil(100);
+    let rank = ((s.len() as u128) * 99).div_ceil(100) as usize;
     rank.checked_sub(1)
         .and_then(|i| s.get(i))
         .copied()

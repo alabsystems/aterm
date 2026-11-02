@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! SETTINGS ▸ HARNESS'S PLAIN COUNTS (design §14.6, slice 6a): WHAT THE HARNESS DID says
-//! `past “done”`, `Waited for you`, `Needs, carried on` and `None in 7 days`, and a row's day
-//! line reads the same words.
+//! SETTINGS ▸ HARNESS'S PLAIN COUNTS (design §14.6, slice 6a; §14.17 item 2, slice 6c): WHAT THE
+//! HARNESS DID says `Forced continues`, `Waited for you`, `Needs, carried on` and `None in 7
+//! days`, and a row's day line reads the same words.
 
 use super::*;
 use aterm_agent::harness::stats::Tally;
@@ -86,12 +86,12 @@ fn every_count(n: u64) -> HarnessStats {
     s
 }
 
-/// THE DONE-CHECK ROW READS `past “done”` (§14.6): right under `Kept going`, labelled as a part of
-/// it, its value the counts alone (`past “done”  3 today · 3 in 7 days`), only where the week had
+/// THE DONE-CHECK ROW READS ITS COUNTS ALONE (§14.6, §14.17 item 2): right under `Kept going`,
+/// labelled as a part of it (`Forced continues  3 today · 3 in 7 days`), only where the week had
 /// one; and the unproven row under Approved reads `no safe rule` the same way. The two parts keep
 /// two labels, so the page's fact keys stay apart.
 #[test]
-fn the_done_check_row_reads_past_done() {
+fn the_done_check_row_reads_its_counts_alone() {
     use aterm_agent::supervise::policy::turn_end::{RULE_CONTINUE, RULE_DONE_CHECK};
     let mut today = HarnessStats::new(0);
     today.continued = 5;

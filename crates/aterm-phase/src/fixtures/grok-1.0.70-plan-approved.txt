@@ -1,0 +1,50 @@
+# grok 1.0.70 · MEASURED 2026-10-29, `aterm ctl text` of a private headless aterm (144x50, aterm 0.146.0) running the real Grok Build, launched by path in the lab's jail with a scratch `HOME` and `GROK_HOME`, the lab's `XAI_API_KEY` and `GROK_XAI_API_BASE_URL`/`GROK_CLI_CHAT_PROXY_BASE_URL=http://127.0.0.1:<port>/v1` (a local stub of xAI's API, crates/aterm-lab) · the empty plan approved with `a`: the pane gone, `◆ Plan mode entered` / `Agent entered plan mode · active permission mode: ask · …`, `◆ Plan mode exited` / `Plan approved · plan mode off · active permission mode: ask`, the stub's `Tool call done.` (it got `Plan mode exit approved. No plan content was found — you can proceed.`), the composer back with the suggestion · cursor=45,6 (visible, blinking_block) · in this run the stub answered every side request, the prompt predictor's among them, `Lab stub session`, so that is the suggestion · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+  /p/t/at.lab0/proj                                                                                                   13K / 256K │ [Dashboard]
+
+
+     ❯ toolstart make a plan                                                                                                         2:00 PM
+
+
+     ◆ Plan mode entered
+
+     Agent entered plan mode · active permission mode: ask · file edits outside session plan.md blocked until plan mode exits
+
+     ◆ Plan mode exited
+
+     Plan approved · plan mode off · active permission mode: ask
+
+     Tool call done.                                                                                                                 2:00 PM
+
+     Worked for 16s
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ ❯ Lab stub session                                                                                                                       │
+  ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── lab-stub ─╯
+
+  Tab/→:accept suggestion  │  Shift+Tab:mode  │  Ctrl+x:shortcuts

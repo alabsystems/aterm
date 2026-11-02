@@ -277,6 +277,9 @@ unsafe extern "system" {
 #[must_use]
 pub fn volume_free_bytes(dir: &Path) -> Option<u64> {
     let mut wide: Vec<u16> = dir.as_os_str().encode_wide().collect();
+    if wide.contains(&0) {
+        return None;
+    }
     wide.push(0);
     let mut free_to_caller: u64 = 0;
     // SAFETY: `wide` is a NUL-terminated UTF-16 buffer that outlives the call, `free_to_caller` is a valid out-param, and the two optional totals are NULL.
@@ -335,6 +338,9 @@ pub fn directory_identity(dir: &Path) -> Option<(u32, u64)> {
     const INVALID_HANDLE_VALUE: isize = -1;
 
     let mut wide: Vec<u16> = dir.as_os_str().encode_wide().collect();
+    if wide.contains(&0) {
+        return None;
+    }
     wide.push(0);
     // SAFETY: `wide` is a NUL-terminated UTF-16 buffer that outlives the call; the optional security-attributes and template params are NULL.
     let handle = unsafe {

@@ -29,3 +29,4 @@ mod never_panic;
 mod reader_oracle;
 mod sinks;
 mod synthetic_tables;
+mod variation_work;

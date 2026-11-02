@@ -136,18 +136,19 @@ impl Wait {
         }
     }
 
-    /// Missing credentials and developer tools are workflow dependencies. They resume on
-    /// delivery or installation, just as temporary network and disk waits do. Invalid
-    /// credentials and conflicting local files require their input to change.
+    /// What ends this wait (design §3.6): GitHub answering again, or room on the disk (which the
+    /// disk watch, a finished download or a person frees), each tried again by itself while the
+    /// run has tries left ([`FailureKind::Transient`]), or a person's act for every other reason, which no pass
+    /// retries: the token the vault syncs is refused, missing, unusable or another account's,
+    /// aterm's GitHub settings cannot be used, a folder is in a repository's place, or Apple's
+    /// Command Line Tools are not installed ([`FailureKind::NeedsPerson`]).
     #[must_use]
     pub const fn kind(self) -> FailureKind {
         match self {
-            Self::Unreached
-            | Self::GitHub
-            | Self::DiskSpace
-            | Self::CommandLineTools
-            | Self::Token => FailureKind::Transient,
-            Self::Settings
+            Self::Unreached | Self::GitHub | Self::DiskSpace => FailureKind::Transient,
+            Self::CommandLineTools
+            | Self::Settings
+            | Self::Token
             | Self::TokenUnusable
             | Self::TokenRefused
             | Self::OtherAccount
@@ -163,10 +164,10 @@ impl Wait {
         match self {
             Self::CommandLineTools => aterm_types::macos_setup::COMMAND_LINE_TOOLS_MISSING,
             Self::Settings => "Fix aterm's GitHub settings; aterm doctor says how",
-            Self::Token => "Waiting for credentials",
+            Self::Token => "Add your GitHub token to the Secrets vault",
             Self::TokenUnusable => "Fix your GitHub token file; aterm doctor says how",
             Self::Unreached => "GitHub can't be reached",
-            Self::TokenRefused => "GitHub refuses your token: renew it in the vault",
+            Self::TokenRefused => aterm_types::macos_setup::GITHUB_TOKEN_REFUSED,
             Self::OtherAccount => "Your GitHub token is for another account; replace it",
             Self::GitHub => "Can't read your repositories from GitHub",
             Self::InTheWay => "A folder blocks a repository; aterm doctor names it",
@@ -176,7 +177,7 @@ impl Wait {
 
     /// Whether the wait is for a GitHub sign-in that works: the row reads `Needs sign-in`.
     const fn signs_in(self) -> bool {
-        matches!(self, Self::TokenRefused | Self::OtherAccount)
+        matches!(self, Self::Token | Self::TokenRefused | Self::OtherAccount)
     }
 }
 
@@ -221,7 +222,7 @@ impl Reading {
         let body = row.detail.as_deref()?.strip_prefix(TOKEN)?;
         let mut parts = body.split(':');
         let kind = parts.next()?;
-        let mut number = || parts.next()?.parse::<usize>().ok();
+        let mut number = || crate::parse_uint::<usize>(parts.next()?);
         let reading = match kind {
             "caps-lock" => Self::CapsLock,
             "natural-on" => Self::NaturalOn,
@@ -1060,8 +1061,8 @@ mod tests {
             };
             assert_eq!(read.standing, standing, "{wait:?}");
             assert_eq!(read.note.as_deref(), Some(wait.note()), "{wait:?}");
-            let now =
-                matches!(wait, Wait::TokenRefused | Wait::OtherAccount).then_some("Needs sign-in");
+            let now = matches!(wait, Wait::Token | Wait::TokenRefused | Wait::OtherAccount)
+                .then_some("Needs sign-in");
             assert_eq!(
                 (read.now.as_deref(), read.wanted.as_str()),
                 (now, "All"),

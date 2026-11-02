@@ -14,7 +14,7 @@
 //! its condition has been seen clear once ([`FactsState::observe_closed`]), so a restart never
 //! tells it twice.
 //!
-//! Three kinds, in priority order among what a reading names (a wake's line is ranked at a break
+//! Four kinds, in priority order among what a reading names (a wake's line is ranked at a break
 //! by the occupancy door, `occupancy::rules::rank`, not by this order):
 //!
 //! * [`FactKind::NoProgress`]: a live background call of this session's agent that the host's
@@ -27,6 +27,15 @@
 //!   break of the agent's own background work (the occupancy design's §2.1 rank 4). It is
 //!   forgotten only on a present, fresh reading that no longer names it ([`FactsState::observe`]),
 //!   so an absent or stale reading never makes a told fact new again.
+//! * [`FactKind::ProgramCheck`]: programs macOS's program check holds before their first
+//!   instruction, in this session's agent's calls and the orphans they left
+//!   (`docs/DESIGN-leftover-processes-2026-10-16.md` §6.3), read through [`FactsReading::held`]
+//!   ([`HeldReading`]). Its episode is the session's run of held programs: it opens at the first
+//!   fresh reading that names one and closes at a fresh reading that names none, whichever
+//!   programs come and go between, so a queue that holds one program after another is told once.
+//!   Its id is the opening reading's time, which a successor cannot place again, so a seed holds
+//!   the kind ([`SEED_HOLD_MS`]). It rides the same prompts and the same break as the call at no
+//!   progress, after it.
 //! * [`FactKind::Hold`]: the session's wait on its own background work, whose rows the hold
 //!   clock writes (`occupancy::hold`), and the occupancy door's outcome rows under `prompt`
 //!   (`occupancy::door`).
@@ -55,6 +64,9 @@ pub enum FactKind {
     /// A live background call of the agent's that has made no progress (the hung-call design's
     /// R2; `aterm_vitals::jobs::JobRow::no_progress`).
     NoProgress,
+    /// Programs of the agent's calls (or their orphans) that macOS's program check holds before
+    /// their first instruction ([`HeldReading`]): a call that hangs is the agent's to fix first.
+    ProgramCheck,
     /// The session's wait on its own background work: how long it has held, and whether the
     /// agent declared it (`WAITING:`; the occupancy design's §3.1 `hold`).
     Hold,
@@ -64,7 +76,12 @@ pub enum FactKind {
 
 impl FactKind {
     /// Every kind, in priority order.
-    pub const ALL: [FactKind; 3] = [FactKind::NoProgress, FactKind::Hold, FactKind::Wake];
+    pub const ALL: [FactKind; 4] = [
+        FactKind::NoProgress,
+        FactKind::ProgramCheck,
+        FactKind::Hold,
+        FactKind::Wake,
+    ];
 
     /// The ledger rule a row of this kind is booked under, `fact-<kind>@v1`. Stable: a successor
     /// loop seeds by it ([`Self::of_rule`]).
@@ -72,6 +89,7 @@ impl FactKind {
     pub const fn rule(self) -> &'static str {
         match self {
             FactKind::NoProgress => "fact-no-progress@v1",
+            FactKind::ProgramCheck => "fact-program-check@v1",
             FactKind::Hold => "fact-hold@v1",
             FactKind::Wake => "fact-wake@v1",
         }
@@ -82,6 +100,7 @@ impl FactKind {
     pub const fn word(self) -> &'static str {
         match self {
             FactKind::NoProgress => "no-progress",
+            FactKind::ProgramCheck => "program-check",
             FactKind::Hold => "hold",
             FactKind::Wake => "wake",
         }
@@ -102,20 +121,21 @@ impl FactKind {
     /// Whether a seed holds the whole kind told ([`FactsState::seed`]): a kind whose episode ids
     /// a successor cannot name again exactly. A no-progress episode's id folds the call's group
     /// and its leader's birth, and a wake's its declaration's stamp and ordinal, which survive a
-    /// restart, so its own key carries it (the slice-2 plan's S3).
+    /// restart, so its own key carries it (the slice-2 plan's S3); a held episode's and the
+    /// hold's are the times they opened, which a successor places anew.
     fn seeds_whole(self) -> bool {
         use crate::supervise::occupancy::fault::{Fault, armed};
         match self {
             FactKind::NoProgress => false,
-            FactKind::Hold => true,
+            FactKind::ProgramCheck | FactKind::Hold => true,
             FactKind::Wake => armed(Fault::KindWideWakeSeed),
         }
     }
 }
 
-/// One episode of a kind's condition: the kind and an id that survives a restart (a job's
-/// `(pgid, leader birth)` folded, [`Self::no_progress`]; for the hold, the episode's start in
-/// Unix milliseconds).
+/// One episode of a kind's condition: the kind and an id (a job's `(pgid, leader birth)` folded,
+/// [`Self::no_progress`], which survives a restart; for the held programs, the opening reading's
+/// time, and for the hold, the episode's start, each in Unix milliseconds).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EpisodeKey {
     /// What the episode is of.
@@ -269,14 +289,102 @@ pub struct Fact {
 
 /// WHAT THE HOST READ FOR THIS SESSION'S AGENT (`IdleHost::facts`): the live background calls of
 /// THIS session's agent that made no progress, each regardless of the others, worst (quiet
-/// longest) first, as of `as_of_ms` (unix ms). Plain values only: this crate takes no dependency
-/// on the engine's types.
+/// longest) first, as of `as_of_ms` (unix ms), and the programs of its calls macOS's program
+/// check holds ([`Self::held`], as of its own time). Plain values only: this crate takes no
+/// dependency on the engine's types.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FactsReading {
     /// When the reading was taken, unix ms.
     pub as_of_ms: i64,
     /// Each call at no progress.
     pub no_progress: Vec<BackgroundCall>,
+    /// The held programs ([`FactKind::ProgramCheck`]): `None` where they were not read, which
+    /// neither opens nor closes an episode; `Some` with no program where none is held, which
+    /// closes one.
+    pub held: Option<HeldReading>,
+}
+
+/// One program of the agent's calls (or an orphan of one) that macOS's program check holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeldCall {
+    /// Its pid.
+    pub pid: u32,
+    /// The actual exec version at the held reading, when available. The live host must match it
+    /// when re-proving the wait; an older tape may omit it without changing its recorded answer.
+    pub exec_version: Option<u64>,
+    /// How long it has been held, ms: since the first reading that saw it held, to the reading's
+    /// time.
+    pub held_ms: u64,
+}
+
+/// THE HELD PROGRAMS THE HOST READ FOR THIS SESSION'S AGENT ([`FactsReading::held`]): each program
+/// of its calls and their orphans that macOS's program check holds, oldest (held longest) first,
+/// as of `as_of_ms` (unix ms), when the host last proved the claim: its own re-proof at the ask
+/// where it proved one held, else the jobs view's. The part keeps its own time because the view
+/// that names a held program is read every 30 s, and a fact is told only from a reading
+/// [`FACT_FRESH_MS`] old.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HeldReading {
+    /// When the claim was last proved, unix ms.
+    pub as_of_ms: i64,
+    /// Each held program, oldest first.
+    pub programs: Vec<HeldCall>,
+}
+
+/// How many pids the held sentence names before `…`.
+const HELD_PIDS_SHOWN: usize = 4;
+
+impl HeldReading {
+    /// No older than [`NO_PROGRESS_FRESH_MS`] at `now_ms` (the jobs board's bound, as for the
+    /// calls at no progress): a part that may open or close an episode.
+    #[must_use]
+    pub fn fresh_at(&self, now_ms: i64) -> bool {
+        now_ms.saturating_sub(self.as_of_ms) <= NO_PROGRESS_FRESH_MS
+    }
+
+    /// No older than [`FACT_FRESH_MS`] at `now_ms`: a part a fact may be told from.
+    #[must_use]
+    pub fn tells_at(&self, now_ms: i64) -> bool {
+        now_ms.saturating_sub(self.as_of_ms) <= FACT_FRESH_MS
+    }
+
+    /// The longest any program has been held, ms; 0 with none.
+    #[must_use]
+    pub fn oldest_ms(&self) -> u64 {
+        self.programs.iter().map(|p| p.held_ms).max().unwrap_or(0)
+    }
+
+    /// THE HELD SENTENCE, from a closed template of numbers only (system awareness §14.4: no exe
+    /// word, path, argv or imperative): how many programs, at most [`HELD_PIDS_SHOWN`] pids
+    /// (oldest first) then `…`, and the oldest's age in the words every surface that counts the
+    /// wait shares (`aterm_uds::process::held_age`). Empty with no program.
+    #[must_use]
+    pub fn told(&self) -> String {
+        let n = self.programs.len();
+        if n == 0 {
+            return String::new();
+        }
+        let mut pids: Vec<String> = self
+            .programs
+            .iter()
+            .take(HELD_PIDS_SHOWN)
+            .map(|p| format!("pid {}", p.pid))
+            .collect();
+        if n > HELD_PIDS_SHOWN {
+            pids.push("…".to_string());
+        }
+        let age = aterm_uds::process::held_age(self.oldest_ms());
+        let (programs, oldest) = if n == 1 {
+            ("1 program".to_string(), "for")
+        } else {
+            (format!("{n} programs"), "the oldest for")
+        };
+        format!(
+            "macOS's program check is holding {programs} this tab started ({}), {oldest} {age}; a \
+             retry waits in the same line",
+            pids.join(", ")
+        )
+    }
 }
 
 impl FactsReading {
@@ -294,15 +402,15 @@ impl FactsReading {
         now_ms.saturating_sub(self.as_of_ms) <= FACT_FRESH_MS
     }
 
-    /// Every open episode the reading names, with its sentence and its quiet: in priority order,
-    /// each kind's worst first. A call with no birth names none.
+    /// Every no-progress episode the reading names, with its sentence and its quiet, worst first.
+    /// A call with no birth names none.
     fn open(&self) -> Vec<(EpisodeKey, String, u64)> {
         let mut open: Vec<(EpisodeKey, String, u64)> = self
             .no_progress
             .iter()
             .filter_map(|c| Some((EpisodeKey::of_call(c)?, c.told(), c.quiet_ms)))
             .collect();
-        open.sort_by(|a, b| a.0.kind.cmp(&b.0.kind).then(b.2.cmp(&a.2)));
+        open.sort_by_key(|a| std::cmp::Reverse(a.2));
         open
     }
 }
@@ -322,6 +430,9 @@ pub struct FactsState {
     /// the session's manager, never the session, so a line the managed guard no longer holds is
     /// still the session's to be told.
     noted: BTreeMap<EpisodeKey, i64>,
+    /// The held episode open now ([`FactKind::ProgramCheck`]): opened by a fresh reading that
+    /// names a held program, closed by a fresh one that names none ([`Self::observe`]).
+    held_open: Option<EpisodeKey>,
     /// Each episode whose line stands left in the composer ([`Self::leave`]), until a look
     /// settles it ([`Self::look`]).
     left: BTreeMap<EpisodeKey, Left>,
@@ -341,34 +452,70 @@ impl FactsState {
             .retain(|(seeded, _)| *seeded != kind || open.iter().any(|key| key.kind == kind));
     }
 
-    /// FOLD IN WHAT THE HOST READ at `now_ms` ([`FactKind::NoProgress`]): on a reading that is
-    /// present and fresh, a told episode it no longer names is over (the call made progress or
-    /// ended) and forgotten. An absent or stale reading forgets nothing.
+    /// FOLD IN WHAT THE HOST READ at `now_ms`, each part by its own freshness. The held part
+    /// ([`FactKind::ProgramCheck`]), present and fresh ([`HeldReading::fresh_at`]): naming a
+    /// program, it opens the held episode where none is open (keyed by its own time) and keeps
+    /// the open one whichever programs it names; naming none, it closes the episode and forgets
+    /// it. The no-progress part ([`FactKind::NoProgress`]), present and fresh: a told episode it
+    /// no longer names is over (the call made progress or ended) and forgotten. An absent or
+    /// stale part opens, closes and forgets nothing.
     pub fn observe(&mut self, reading: Option<&FactsReading>, now_ms: i64) {
-        let Some(r) = reading.filter(|r| r.fresh_at(now_ms)) else {
+        let Some(r) = reading else {
             return;
         };
-        let open: Vec<EpisodeKey> = r.open().into_iter().map(|(key, ..)| key).collect();
-        self.observe_closed(FactKind::NoProgress, &open);
+        if let Some(held) = r.held.as_ref().filter(|h| h.fresh_at(now_ms)) {
+            if held.programs.is_empty() {
+                self.held_open = None;
+                self.observe_closed(FactKind::ProgramCheck, &[]);
+            } else {
+                let key = *self.held_open.get_or_insert(EpisodeKey {
+                    kind: FactKind::ProgramCheck,
+                    id: held.as_of_ms.unsigned_abs(),
+                });
+                self.observe_closed(FactKind::ProgramCheck, &[key]);
+            }
+        }
+        if r.fresh_at(now_ms) {
+            let open: Vec<EpisodeKey> = r.open().into_iter().map(|(key, ..)| key).collect();
+            self.observe_closed(FactKind::NoProgress, &open);
+        }
     }
 
-    /// THE FACT TO TELL NOW: the highest-priority open episode of a present, fresh reading that
-    /// was not told and stands left in no composer, its sentence within [`FACT_CAP`]; else
-    /// `None`. The others wait, and one whose
-    /// episode closes meanwhile is never told late. Told only from a reading at most
-    /// [`FACT_FRESH_MS`] old ([`FactsReading::tells_at`]).
+    /// THE FACT TO TELL NOW: the highest-priority open episode that was not told and stands left
+    /// in no composer, its sentence within [`FACT_CAP`]; else `None`. A call at no progress comes
+    /// from the reading's own part, told only while it is at most [`FACT_FRESH_MS`] old
+    /// ([`FactsReading::tells_at`]); the held programs from the episode [`Self::observe`] opened,
+    /// told only while the held part names one and is that young by its own time
+    /// ([`HeldReading::tells_at`]). The others wait, and one whose episode closes meanwhile is
+    /// never told late.
     #[must_use]
     pub fn pending(&self, reading: Option<&FactsReading>, now_ms: i64) -> Option<Fact> {
-        let r = reading.filter(|r| r.tells_at(now_ms))?;
-        r.open()
-            .into_iter()
+        let r = reading?;
+        let mut open: Vec<(EpisodeKey, String, i64)> = Vec::new();
+        if let (Some(key), Some(held)) = (
+            self.held_open,
+            r.held
+                .as_ref()
+                .filter(|h| h.tells_at(now_ms) && !h.programs.is_empty()),
+        ) {
+            open.push((key, held.told(), held.as_of_ms));
+        }
+        if r.tells_at(now_ms) {
+            open.extend(
+                r.open()
+                    .into_iter()
+                    .map(|(key, text, _)| (key, text, r.as_of_ms)),
+            );
+        }
+        open.sort_by_key(|(key, ..)| key.kind);
+        open.into_iter()
             .find(|(key, text, _)| {
                 !self.is_spoken_for(*key) && !text.is_empty() && text.chars().count() <= FACT_CAP
             })
-            .map(|(key, text, _)| Fact {
+            .map(|(key, text, as_of_ms)| Fact {
                 key,
                 text,
-                as_of_ms: r.as_of_ms,
+                as_of_ms,
             })
     }
 

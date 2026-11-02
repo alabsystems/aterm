@@ -267,13 +267,15 @@ pub fn fetch(exe: &Path, env: Vec<(&str, std::ffi::OsString)>, cwd: &Path) -> Op
     cmd.process_group(0);
     let mut child = cmd.spawn().ok()?;
     let streams = (child.stdout.take(), child.stdin.take());
+    let now = Instant::now();
+    let deadline = now.checked_add(BUDGET).unwrap_or(now);
     let ran = match streams {
         (Some(from), Some(to)) => read_usage(
             AppServer {
                 from: Box::new(from),
                 to: Box::new(to),
             },
-            Instant::now() + BUDGET,
+            deadline,
         ),
         _ => None,
     };

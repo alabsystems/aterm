@@ -238,6 +238,8 @@ fn native_route_card_composes_global_priority_and_modal_suppression() {
         fp,
         geom: fp,
         raster_fingerprint_once: std::sync::OnceLock::new(),
+        serial: 0,
+        delta: None,
     };
     {
         let window = app.windows.get_mut(&wid).expect("window");
@@ -251,6 +253,8 @@ fn native_route_card_composes_global_priority_and_modal_suppression() {
             fp: 1,
             geom: 1,
             raster_fingerprint_once: std::sync::OnceLock::new(),
+            serial: 0,
+            delta: None,
         });
         window.badge_card = Some(host([0, 0, 255, 255], 2));
     }
@@ -1210,6 +1214,7 @@ fn appearance_paint_identity_forces_full_native_raster() {
                 height: 23,
             },
             compiled,
+            motion_ms: 0,
         },
         (width, height),
         1.0,
@@ -1267,6 +1272,7 @@ fn a_raster_that_inked_every_char_keeps_the_faces_it_painted_with() {
                 viewport,
                 damage: crate::native_app::DamageRegion::All,
                 compiled,
+                motion_ms: 0,
             },
             (width, height),
             1.0,
@@ -1846,6 +1852,7 @@ fn a_key_typed_into_a_native_page_is_timed_to_the_present_of_its_answer() {
             },
             route,
             HostVisualState::default(),
+            None,
             &plan,
         );
     };

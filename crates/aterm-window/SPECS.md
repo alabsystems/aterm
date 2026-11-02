@@ -40,29 +40,29 @@ The historical map has **15 specs** covering **25 entries** and **0 non-spec ent
 
 Paths are relative to `crates/aterm-window`.
 
-- `PortTrace(P, op)`: the ordered list of `SelectionPort` primitive calls (`focused`, `offers(sel)`,
-  `release(sel)`, `claim(sel, serial) -> bool`) that the default method `SelectionPort::copy` makes on a
-  port `P`. It is a ghost trace, the way aterm-parser's `Obs` uses its sink.
-- `CompositorModel M`: today the test-only `FakeSeat` in `wayland/clipboard.rs`; author it with
-  `ty_model!`. State: `offered: Option<src>`, `selection: Option<(src, serial)>`, `cached: text`,
-  `slot: text`, `focused`, `device`. `claim(serial)` mints a source. The source is dropped iff `¬focused`
-  or `serial ≤` the serial behind the held selection. Otherwise `selection := (src, serial)` and
-  `cached := slot`, and installing the new source destroys the displaced one. `destroy(src)` clears the
-  selection when `src` held it. `read() = slot` if `selection` is `Some`, else `cached`.
+- `PortTrace(P, op)`: the ordered ghost list of `SelectionPort` primitive calls (`focused`,
+  `offers(sel)`, `release(sel)`, `claim(sel, serial) -> bool`) that the default method
+  `SelectionPort::copy` makes on a port `P`.
+- `CompositorModel M`: today the test-only `FakeSeat` in `wayland/clipboard.rs`, to be authored
+  with `ty_model!`. State: `offered: Option<src>`, `selection: Option<(src, serial)>`,
+  `cached: text`, `slot: text`, `focused`, `device`. `claim(serial)` fails without a `device`, else
+  mints a source. The source is dropped iff `¬focused` or `serial ≤` the serial behind the held
+  selection; otherwise `selection := (src, serial)` and `cached := slot`. Installing the new source
+  destroys the displaced one. `destroy(src)` clears the selection when `src` held it.
+  `read() = slot` if `selection` is `Some`, else `cached`.
 - `HeadlessTrace(run)`: the sequence of `Event` variants that `EventLoop::{run_on_demand,pump_events}`
   pass to the callback on the Unix headless backend (`platform_impl/linux/headless.rs`).
 - `Turn := NewEvents(cause) UserEvent* AboutToWait`. `InitTurn := NewEvents(Init) Resumed UserEvent* AboutToWait`.
 - `dec(bytes)`: the percent decoder as a recursive function. `dec([]) = []`.
-  `dec('%' h l r) = (hex(h)<<4 | hex(l)) :: dec(r)` when `hex(h)` and `hex(l)` are both `Some`.
+  `dec('%' h l r) = (hex(h)<<4 | hex(l)) :: dec(r)` when `hex(h)` and `hex(l)` are both `Some`;
   `dec(b r) = b :: dec(r)` otherwise. `hex: [0-9a-fA-F] → 0..=15`.
 - `enc_xsettings(endian, serial, L)`: the XSETTINGS wire encoding. Byte order `'l'` or `'B'`, 3 pad bytes,
   a 4-byte serial, an `i32` count, then for each setting: type `i8`, pad 1, `name_len i16`, name, pad to 4,
   last-change serial `u32`, then the value (`i32` | `i32` len + bytes + pad to 4 | four `i16`).
-- Auto-trait facts (`Send`/`Sync`) are discharged by rustc's trait solver. That spec is a non-test
-  `const _` static assertion in the library, not a Clean proof.
-- Gap numbers in `blocking_gaps` are the rows of the gap table in
-  `AUDIT-trust-for-test-migration-2026-10-15.md` (historical internal audit) §7.
-  Gap 0 (a seal that publishes Clean rows) blocks every spec proved through Clean.
+- `blocking_gaps` lists gap numbers from §7 of
+  `docs/AUDIT-trust-for-test-migration-2026-10-15.md`. Gap 0 (a seal that publishes Clean rows) is
+  on every row proved through Clean; `none` marks the auto-trait spec, which rustc's trait solver
+  discharges.
 
 ## 1. Specs (TSV)
 
@@ -135,7 +135,9 @@ negative control) → `copy-verdict` and `wayland-clipboard-handle`. `percent-de
 
 ## 2. Historical test → spec map (TSV)
 
-`primary` is the spec that retires the test. `also` lists the other specs the same test samples.
+`primary` is the spec that retires the test; `also` lists the other specs it samples. The Windows
+IME, key-replay and attention-flash tests appear only in §1, and `common/poll.rs`'s tests (which
+sample `headless-wait-deadline` (b)) in neither.
 
 ```tsv
 file	test	primary	also
@@ -212,7 +214,7 @@ src/platform_impl/macos/wake_queue.rs	a_drain_that_finds_the_lock_held_still_cle
 6. **Redundant clipboard order assertion removed.** The production wire-trace assertions remain;
    the duplicate CLAIM_ORDER constant assertion no longer substitutes for behavior coverage.
 
-## 6. Proof order (easiest high-value first)
+## 6. Proof order
 
 1. **`public-handles-send-sync`** *(discharged)*. No Trust gap at all: the `const _` auto-trait assertion
    item lives in `src/lib.rs`, and the 9 compile-only `Send`/`Sync` tests it retired are deleted.

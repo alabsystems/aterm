@@ -80,6 +80,9 @@ fn parse_text_scale(word: &str) -> Option<Option<f32>> {
     if word.eq_ignore_ascii_case("os") {
         return Some(None);
     }
+    if word.starts_with('+') {
+        return None;
+    }
     let scale = word.parse::<f32>().ok().filter(|scale| scale.is_finite())?;
     (0.85..=2.0).contains(&scale).then_some(Some(scale))
 }
@@ -128,6 +131,45 @@ pub(crate) fn text_scale_status_line() -> String {
             "os"
         }
     )
+}
+
+/// The display accessibility settings `$ATERM_DEV_ACCESSIBILITY` turns on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DevAccessibility {
+    pub(crate) high_contrast: bool,
+    pub(crate) reduced_transparency: bool,
+    pub(crate) differentiate_without_color: bool,
+    pub(crate) reduce_motion: bool,
+}
+
+/// The `$ATERM_DEV_ACCESSIBILITY` launch seam ([`aterm_types::dev_seam!`]), read once: a comma
+/// list of `high-contrast`, `reduce-transparency`, `differentiate-without-color` and
+/// `reduce-motion`, each read as on over what the operating system says (and in a headless
+/// instance, which asks it nothing), so a lab instance shows them without a change to the
+/// person's own settings. A release build reads no seam: every setting stays the operating
+/// system's.
+pub(crate) fn dev_accessibility() -> DevAccessibility {
+    static SEAM: std::sync::OnceLock<DevAccessibility> = std::sync::OnceLock::new();
+    *SEAM.get_or_init(|| {
+        aterm_types::dev_seam!("ATERM_DEV_ACCESSIBILITY")
+            .and_then(|value| value.to_str().map(parse_dev_accessibility))
+            .unwrap_or_default()
+    })
+}
+
+/// [`dev_accessibility`]'s list; a word it does not name is logged and turns nothing on.
+fn parse_dev_accessibility(list: &str) -> DevAccessibility {
+    let mut on = DevAccessibility::default();
+    for word in list.split(',').map(str::trim).filter(|w| !w.is_empty()) {
+        match word {
+            "high-contrast" => on.high_contrast = true,
+            "reduce-transparency" => on.reduced_transparency = true,
+            "differentiate-without-color" => on.differentiate_without_color = true,
+            "reduce-motion" => on.reduce_motion = true,
+            other => aterm_log::warn!("ATERM_DEV_ACCESSIBILITY names no setting {other:?}"),
+        }
+    }
+    on
 }
 
 /// The `$ATERM_TEXT_SCALE` launch seam ([`aterm_types::dev_seam!`]).
@@ -190,6 +232,11 @@ pub(crate) fn install_preferences(mut preferences: AppearancePreferences) -> boo
     if let Some(scale) = injected_text_scale() {
         preferences.text_scale = scale;
     }
+    // So does a development build's accessibility seam, for each setting it turns on.
+    let dev = dev_accessibility();
+    preferences.high_contrast |= dev.high_contrast;
+    preferences.reduced_transparency |= dev.reduced_transparency;
+    preferences.differentiate_without_color |= dev.differentiate_without_color;
     let preferences = preferences.normalized();
     let moved = {
         #[cfg(test)]
@@ -260,7 +307,7 @@ impl SystemAccent {
         }
     }
 
-    #[cfg(all(windows, not(test)))]
+    #[cfg(all(any(windows, target_os = "macos"), not(test)))]
     fn pack(self) -> u64 {
         let rgb = |c: [u8; 3]| (u64::from(c[0]) << 16) | (u64::from(c[1]) << 8) | u64::from(c[2]);
         (rgb(self.on_dark) << 24) | rgb(self.on_light)
@@ -328,6 +375,70 @@ pub(crate) fn system_accent() -> Option<SystemAccent> {
     }
 }
 
+/// macOS's system blue, its control accent where the person picked none ("Multicolor") and
+/// where macOS gives none to read: `#0A84FF` on a dark ground, `#007AFF` on a light one.
+pub(crate) const MACOS_SYSTEM_BLUE: SystemAccent = SystemAccent {
+    on_dark: [0x0A, 0x84, 0xFF],
+    on_light: [0x00, 0x7A, 0xFF],
+};
+
+/// The control accent where the platform reads none: on a Mac, its system blue (a headless
+/// instance asks macOS nothing); elsewhere none, and the chrome's accent stands in.
+const CONTROL_ACCENT_DEFAULT: Option<SystemAccent> = if cfg!(target_os = "macos") {
+    Some(MACOS_SYSTEM_BLUE)
+} else {
+    None
+};
+
+/// The installed control accent ([`install_control_accent`]), packed as [`SYSTEM_ACCENT`] is.
+#[cfg(not(test))]
+static CONTROL_ACCENT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(NO_SYSTEM_ACCENT);
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CONTROL_ACCENT: Cell<Option<SystemAccent>> = const { Cell::new(None) };
+}
+
+/// Install macOS's control accent (`NSColor.controlAccentColor`) as the platform read it at
+/// launch or when the system colours changed (`None`: it read none, and system blue stands in).
+/// It is what a native control wears where AppKit would paint the accent (a switch's on track,
+/// the setup screen's spinner and working band), and leads nothing else: the chrome keeps its
+/// theme's accent.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn install_control_accent(accent: Option<SystemAccent>) -> bool {
+    let moved = {
+        #[cfg(test)]
+        {
+            TEST_CONTROL_ACCENT.with(|slot| slot.replace(accent) != accent)
+        }
+
+        #[cfg(not(test))]
+        {
+            let packed = accent.map_or(NO_SYSTEM_ACCENT, SystemAccent::pack);
+            CONTROL_ACCENT.swap(packed, Ordering::AcqRel) != packed
+        }
+    };
+    if moved {
+        note_chrome_inputs_moved();
+    }
+    moved
+}
+
+/// The control accent the platform read: macOS's `controlAccentColor` where it was installed,
+/// else the OS accent the chrome follows (Windows'), else none.
+#[must_use]
+pub(crate) fn control_accent() -> Option<SystemAccent> {
+    #[cfg(test)]
+    let read = TEST_CONTROL_ACCENT.with(Cell::get);
+    #[cfg(not(test))]
+    let read = match CONTROL_ACCENT.load(Ordering::Acquire) {
+        NO_SYSTEM_ACCENT => None,
+        packed => Some(SystemAccent::unpack(packed)),
+    };
+    read.or_else(system_accent)
+}
+
 impl AppearancePreferences {
     pub(crate) fn normalized(self) -> Self {
         Self {
@@ -354,6 +465,10 @@ pub(crate) struct NativeRoles {
     /// The accent as text.
     pub(crate) accent_ink: [u8; 3],
     pub(crate) on_accent: [u8; 3],
+    /// The accent a native control wears where its platform paints the OS accent (a switch's on
+    /// track, the setup screen's spinner and working band): the OS's own shade for this ground
+    /// ([`control_accent`]; macOS's system blue where it reads none), else [`Self::accent`].
+    pub(crate) control_accent: [u8; 3],
     pub(crate) separator: [u8; 3],
     /// A resting control's own boundary, 3:1 on the card and the page: the rim of a chip, a
     /// Secondary or Setting button, a field, a slider or a boxed switch, whose fill stands only a
@@ -383,6 +498,11 @@ pub(crate) const ACCENT_WASH_SELECTED: f32 = 0.13;
 /// The deepest accent wash that still carries accent ink.
 pub(crate) const ACCENT_WASH_PRESSED: f32 = 0.16;
 const ACCENT_INK_FLOOR: f32 = 3.0;
+// Keep headroom above the 4.5 floor for small painted accent labels.
+const ACCENT_TEXT_TARGET: f32 = 5.0;
+const CARD_CONTRAST_MIN: f32 = 1.2;
+// Leave room for the gallery's f64 calculation of the quantized u8 colours.
+const CONTRAST_ROUNDING_MARGIN: f32 = 0.000_1;
 const LIGHT_ELEVATION_STEP: f32 = 0.035;
 const LIGHT_ELEVATION_TOWARD_WHITE: f32 = 0.6;
 
@@ -402,11 +522,60 @@ fn light_elevated(surface: [u8; 3], fg: [u8; 3]) -> [u8; 3] {
     }
 }
 
+/// Keep the preferred elevation when it leaves a readable foreground on both grounds.
+/// A near-white page cannot support a lighter card at the floor; near mid-grey, either
+/// direction can also lose the only readable foreground. Try the other direction then.
+fn card_surface(surface: [u8; 3], preferred: [u8; 3], rises: bool, text_target: f32) -> [u8; 3] {
+    let readable = (text_target + CONTRAST_ROUNDING_MARGIN).min(best_endpoint_contrast(&[surface]));
+    let card_target = CARD_CONTRAST_MIN + CONTRAST_ROUNDING_MARGIN;
+    let holds = |card| {
+        contrast_ratio(card, surface) >= card_target
+            && best_endpoint_contrast(&[surface, card]) >= readable
+    };
+    if holds(preferred) {
+        return preferred;
+    }
+    // Search from the page, so an opposite-direction search cannot stop at a
+    // candidate that already passes the card floor on the wrong side.
+    let source = rgb_to_oklch(surface);
+    let pole = if rises { 1.0 } else { 0.0 };
+    let preferred = contrast_candidate(source, &[surface], card_target, pole);
+    let opposite = contrast_candidate(source, &[surface], card_target, 1.0 - pole);
+    for card in [preferred, opposite].into_iter().flatten() {
+        if holds(card) {
+            return card;
+        }
+    }
+    // An unattainable text target must not discard the card floor. As with the
+    // ink solver, keep the best common foreground instead of changing the page.
+    match (preferred, opposite) {
+        (Some(a), Some(b)) => {
+            if best_endpoint_contrast(&[surface, a]) >= best_endpoint_contrast(&[surface, b]) {
+                a
+            } else {
+                b
+            }
+        }
+        (Some(card), None) | (None, Some(card)) => card,
+        (None, None) => ensure_contrast(surface, surface, CARD_CONTRAST_MIN),
+    }
+}
+
 /// Straight sRGB channel lerp.
 pub(crate) fn mix_srgb(a: [u8; 3], b: [u8; 3], amount: f32) -> [u8; 3] {
     let amount = amount.clamp(0.0, 1.0);
     std::array::from_fn(|index| {
         (f32::from(a[index]) + (f32::from(b[index]) - f32::from(a[index])) * amount).round() as u8
+    })
+}
+
+/// `b` laid over `a` at `amount` alpha as an sRGB render target blends it, in linear light: on a
+/// dark ground a light ink's wash comes out lighter than [`mix_srgb`] says.
+pub(crate) fn mix_linear(a: [u8; 3], b: [u8; 3], amount: f32) -> [u8; 3] {
+    let amount = amount.clamp(0.0, 1.0);
+    std::array::from_fn(|index| {
+        let (a, b) = (srgb_to_linear(a[index]), srgb_to_linear(b[index]));
+        (linear_to_srgb(a + (b - a) * amount).clamp(0.0, 1.0) * 255.0).round() as u8
     })
 }
 
@@ -470,9 +639,12 @@ pub(crate) fn roles(
     let primary_target = if preferences.high_contrast { 7.0 } else { 4.5 };
     let secondary_target = if preferences.high_contrast { 7.0 } else { 4.5 };
     let tertiary_target = if preferences.high_contrast { 4.5 } else { 3.0 };
-    let text_primary = ensure_contrast(fg, surface, primary_target);
-    let text_secondary = ensure_contrast(mix_oklab(fg, surface, 0.27), surface, secondary_target);
-    let text_tertiary = ensure_contrast(mix_oklab(fg, surface, 0.48), surface, tertiary_target);
+    let elevated = card_surface(surface, elevated, dark || LIGHT_CARDS_RISE, primary_target);
+    let grounds = [surface, elevated];
+    let text_primary = ensure_contrast_on(fg, &grounds, primary_target);
+    let text_secondary =
+        ensure_contrast_on(mix_oklab(fg, surface, 0.27), &grounds, secondary_target);
+    let text_tertiary = ensure_contrast_on(mix_oklab(fg, surface, 0.48), &grounds, tertiary_target);
 
     let mut accent_seed = rgb_to_oklch(packed_rgb(theme.cursor));
     let selection_seed = rgb_to_oklch(selection);
@@ -494,16 +666,20 @@ pub(crate) fn roles(
     };
     let accent = ensure_contrast(oklch_to_rgb(accent_seed), surface, ACCENT_INK_FLOOR);
     let accent = accent_over_its_own_wash(accent, elevated);
-    let ink_target = if preferences.high_contrast { 7.0 } else { 4.5 };
-    let accent_ink = [
-        surface,
-        elevated,
-        mix_srgb(elevated, accent, ACCENT_WASH_PRESSED),
-    ]
-    .into_iter()
-    .fold(accent, |ink, backdrop| {
-        ensure_contrast(ink, backdrop, ink_target)
-    });
+    let ink_target = if preferences.high_contrast {
+        7.0
+    } else {
+        ACCENT_TEXT_TARGET
+    };
+    let accent_ink = ensure_contrast_on(
+        accent,
+        &[
+            surface,
+            elevated,
+            mix_srgb(elevated, accent, ACCENT_WASH_PRESSED),
+        ],
+        ink_target,
+    );
 
     let black = [8, 10, 13];
     let white = [250, 251, 253];
@@ -513,6 +689,9 @@ pub(crate) fn roles(
         white
     };
     let on_accent = ensure_contrast(on_seed, accent, 4.5);
+    let control_accent = control_accent()
+        .or(CONTROL_ACCENT_DEFAULT)
+        .map_or(accent, |os| os.for_surface(bg));
 
     let separator_target = if preferences.high_contrast { 3.0 } else { 1.5 };
     let separator = match tokens.border {
@@ -520,41 +699,29 @@ pub(crate) fn roles(
         None => ensure_contrast(mix_oklab(fg, surface, 0.70), surface, separator_target),
     };
     let control_track = ensure_contrast(mix_oklab(fg, surface, 0.57), surface, 2.0);
-    let control_edge = [elevated, surface]
-        .into_iter()
-        .fold(separator, |edge, backdrop| {
-            ensure_contrast(edge, backdrop, 3.0)
-        });
+    let control_edge = ensure_contrast_on(separator, &grounds, 3.0);
 
     #[allow(
         clippy::cast_possible_truncation,
         reason = "an OkLCh hue in degrees, [0, 360), fits f32"
     )]
     let hue = |token: Option<f64>, fallback: f32| token.map_or(fallback, |h| h as f32);
-    let danger = ensure_contrast(
-        ensure_contrast(
-            status_seed(
-                dark,
-                preferences.high_contrast,
-                hue(tokens.danger_hue, DANGER_HUE_DEGREES),
-            ),
-            surface,
-            4.5,
+    let danger = ensure_contrast_on(
+        status_seed(
+            dark,
+            preferences.high_contrast,
+            hue(tokens.danger_hue, DANGER_HUE_DEGREES),
         ),
-        elevated,
+        &grounds,
         4.5,
     );
-    let success = ensure_contrast(
-        ensure_contrast(
-            status_seed(
-                dark,
-                preferences.high_contrast,
-                hue(tokens.success_hue, SUCCESS_HUE_DEGREES),
-            ),
-            surface,
-            4.5,
+    let success = ensure_contrast_on(
+        status_seed(
+            dark,
+            preferences.high_contrast,
+            hue(tokens.success_hue, SUCCESS_HUE_DEGREES),
         ),
-        elevated,
+        &grounds,
         4.5,
     );
 
@@ -566,6 +733,7 @@ pub(crate) fn roles(
         accent,
         accent_ink,
         on_accent,
+        control_accent,
         separator,
         control_edge,
         control_track,
@@ -580,6 +748,59 @@ impl NativeRoles {
     pub(crate) fn from_theme(p: impl Into<crate::chrome_band::ChromePalette>) -> Self {
         default_roles(p)
     }
+
+    /// The grounds of a grouped form, as macOS's grouped form style lays one out (the setup
+    /// screen is one): its page and the cards on it. On a light ground the cards rise to near
+    /// white and the page sinks until a card stands [`CARD_CONTRAST_MIN`] apart from it, where a
+    /// light theme's own cards sink into a lighter page. If those grounds would reduce the
+    /// existing text inks' shared contrast, keep the already-solved surface and elevated pair.
+    /// On a dark ground the page is the surface and the cards the elevated surface, held that
+    /// far apart.
+    pub(crate) fn grouped(&self) -> Grouped {
+        let apart = CARD_CONTRAST_MIN + 0.01;
+        if surface_is_dark(self.surface) {
+            let card = if contrast_ratio(self.elevated, self.surface) >= CARD_CONTRAST_MIN {
+                self.elevated
+            } else {
+                ensure_contrast(self.elevated, self.surface, apart)
+            };
+            return Grouped {
+                page: self.surface,
+                card,
+            };
+        }
+        let card = mix_srgb(self.surface, [255, 255, 255], GROUPED_CARD_TOWARD_WHITE);
+        let grouped = Grouped {
+            page: ensure_contrast(self.surface, card, apart),
+            card,
+        };
+        let original = [self.surface, self.elevated];
+        let proposed = [grouped.page, grouped.card];
+        if [self.text_primary, self.text_secondary, self.text_tertiary]
+            .into_iter()
+            .all(|ink| least_contrast(ink, &proposed) >= least_contrast(ink, &original))
+        {
+            grouped
+        } else {
+            Grouped {
+                page: self.surface,
+                card: self.elevated,
+            }
+        }
+    }
+}
+
+/// How far toward white a light grouped form's cards rise from the page's surface: near white,
+/// keeping a trace of a tinted theme's hue.
+const GROUPED_CARD_TOWARD_WHITE: f32 = 0.85;
+
+/// A grouped form's grounds ([`NativeRoles::grouped`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Grouped {
+    /// The page under the cards.
+    pub(crate) page: [u8; 3],
+    /// A card's ground.
+    pub(crate) card: [u8; 3],
 }
 
 pub(crate) fn default_roles(p: impl Into<crate::chrome_band::ChromePalette>) -> NativeRoles {
@@ -771,9 +992,25 @@ pub(crate) fn contrast_ratio(a: [u8; 3], b: [u8; 3]) -> f32 {
     (high + 0.05) / (low + 0.05)
 }
 
-fn contrast_candidate(color: Oklch, bg: [u8; 3], target: f32, pole: f32) -> Option<[u8; 3]> {
+fn least_contrast(ink: [u8; 3], grounds: &[[u8; 3]]) -> f32 {
+    grounds
+        .iter()
+        .map(|&ground| contrast_ratio(ink, ground))
+        .fold(f32::INFINITY, f32::min)
+}
+
+fn best_endpoint_contrast(grounds: &[[u8; 3]]) -> f32 {
+    least_contrast([0, 0, 0], grounds).max(least_contrast([255, 255, 255], grounds))
+}
+
+fn contrast_candidate(
+    color: Oklch,
+    grounds: &[[u8; 3]],
+    target: f32,
+    pole: f32,
+) -> Option<[u8; 3]> {
     let pole_color = oklch_to_rgb(Oklch { l: pole, ..color });
-    if contrast_ratio(pole_color, bg) < target {
+    if least_contrast(pole_color, grounds) < target {
         return None;
     }
     let mut lo = 0.0;
@@ -785,7 +1022,7 @@ fn contrast_candidate(color: Oklch, bg: [u8; 3], target: f32, pole: f32) -> Opti
             l: color.l + (pole - color.l) * t,
             ..color
         });
-        if contrast_ratio(candidate, bg) >= target {
+        if least_contrast(candidate, grounds) >= target {
             hi = t;
             best = candidate;
         } else {
@@ -805,13 +1042,49 @@ pub(crate) fn ensure_text_contrast(fg: [u8; 3], bg: [u8; 3]) -> [u8; 3] {
     ensure_contrast(fg, bg, target)
 }
 
+/// `fg` moved in lightness, its hue kept, until it reads at `target` against `bg`: the rule of
+/// [`ensure_text_contrast`] at a ratio the caller names (a state mark's 3:1, a card's 1.2:1
+/// separation from its page).
+pub(crate) fn ensure_contrast_ratio(fg: [u8; 3], bg: [u8; 3], target: f32) -> [u8; 3] {
+    ensure_contrast(fg, bg, target)
+}
+
+/// How far apart two colours' OKLCH hues stand, in degrees (0 to 180).
+pub(crate) fn hue_distance(a: [u8; 3], b: [u8; 3]) -> f32 {
+    let apart = (rgb_to_oklch(a).h - rgb_to_oklch(b).h)
+        .to_degrees()
+        .rem_euclid(360.0);
+    apart.min(360.0 - apart)
+}
+
+/// A colour's OKLCH chroma: 0 for a grey.
+#[cfg(test)]
+pub(crate) fn chroma(rgb: [u8; 3]) -> f32 {
+    rgb_to_oklch(rgb).c
+}
+
+/// `rgb` with its chroma taken out: the grey of the same OKLCH lightness.
+pub(crate) fn without_chroma(rgb: [u8; 3]) -> [u8; 3] {
+    let mut color = rgb_to_oklch(rgb);
+    color.c = 0.0;
+    oklch_to_rgb(color)
+}
+
 fn ensure_contrast(fg: [u8; 3], bg: [u8; 3], target: f32) -> [u8; 3] {
-    if contrast_ratio(fg, bg) >= target {
+    ensure_contrast_on(fg, &[bg], target)
+}
+
+/// Search once against every ground: repairing the last must not break an earlier one.
+/// If even black and white cannot meet the target (for example 7:1 on mid-grey),
+/// retain the best endpoint common contrast without changing the page's policy.
+pub(crate) fn ensure_contrast_on(fg: [u8; 3], grounds: &[[u8; 3]], target: f32) -> [u8; 3] {
+    let target = target + CONTRAST_ROUNDING_MARGIN;
+    if least_contrast(fg, grounds) >= target {
         return fg;
     }
     let source = rgb_to_oklch(fg);
-    let dark = contrast_candidate(source, bg, target, 0.0);
-    let light = contrast_candidate(source, bg, target, 1.0);
+    let dark = contrast_candidate(source, grounds, target, 0.0);
+    let light = contrast_candidate(source, grounds, target, 1.0);
     match (dark, light) {
         (Some(a), Some(b)) => {
             let da = (rgb_to_oklch(a).l - source.l).abs();
@@ -823,7 +1096,7 @@ fn ensure_contrast(fg: [u8; 3], bg: [u8; 3], target: f32) -> [u8; 3] {
         (None, None) => {
             let black = [0, 0, 0];
             let white = [255, 255, 255];
-            if contrast_ratio(black, bg) >= contrast_ratio(white, bg) {
+            if least_contrast(black, grounds) >= least_contrast(white, grounds) {
                 black
             } else {
                 white
@@ -835,6 +1108,28 @@ fn ensure_contrast(fg: [u8; 3], bg: [u8; 3], target: f32) -> [u8; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_accessibility_seam_turns_on_what_it_names_and_nothing_else() {
+        assert_eq!(parse_dev_accessibility(""), DevAccessibility::default());
+        assert_eq!(
+            parse_dev_accessibility("high-contrast, reduce-motion"),
+            DevAccessibility {
+                high_contrast: true,
+                reduce_motion: true,
+                ..DevAccessibility::default()
+            }
+        );
+        assert_eq!(
+            parse_dev_accessibility("reduce-transparency,differentiate-without-color,dark"),
+            DevAccessibility {
+                reduced_transparency: true,
+                differentiate_without_color: true,
+                ..DevAccessibility::default()
+            },
+            "an unknown word turns nothing on"
+        );
+    }
 
     #[test]
     fn the_os_accent_leads_the_chrome_where_none_is_authored() {
@@ -876,6 +1171,70 @@ mod tests {
                 .accent,
             cursor_accent
         );
+        let _ = take_chrome_inputs_moved();
+    }
+
+    /// THE CONTROL ACCENT FOLLOWS THE SYSTEM'S (init-on-by-default design §4.4, D1): the
+    /// `controlAccentColor` the platform read is what a native control wears, its dark shade on
+    /// a dark ground and its light one on a light ground, and another reading moves it; with
+    /// none read a Mac wears system blue (`#0A84FF` / `#007AFF`), elsewhere the chrome's accent.
+    /// NEGATIVE CONTROL: the chrome's own accent never moves with it.
+    #[test]
+    fn the_control_accent_follows_the_systems() {
+        let light = aterm_types::scheme::builtin_names()
+            .into_iter()
+            .map(|name| Theme::from(&aterm_types::scheme::builtin(name).expect("a builtin")))
+            .find(|theme| !surface_is_dark(packed_rgb(theme.bg)))
+            .expect("a light builtin theme");
+        let dark = Theme::default();
+        let _ = install_control_accent(None);
+        let _ = take_chrome_inputs_moved();
+        let worn = |theme: Theme| roles(theme, AppearancePreferences::default()).control_accent;
+        let chrome = |theme: Theme| roles(theme, AppearancePreferences::default()).accent;
+        let (chrome_dark, chrome_light) = (chrome(dark), chrome(light));
+        // None read: a Mac's system blue, else the chrome's accent.
+        if cfg!(target_os = "macos") {
+            assert_eq!(worn(dark), [0x0A, 0x84, 0xFF]);
+            assert_eq!(worn(light), [0x00, 0x7A, 0xFF]);
+        } else {
+            assert_eq!((worn(dark), worn(light)), (chrome_dark, chrome_light));
+        }
+        for reading in [
+            SystemAccent {
+                on_dark: [0xA5, 0x50, 0xA7],
+                on_light: [0x95, 0x3D, 0x96],
+            },
+            SystemAccent {
+                on_dark: [0xFF, 0x9F, 0x0A],
+                on_light: [0xF7, 0x82, 0x1B],
+            },
+        ] {
+            assert!(install_control_accent(Some(reading)), "a new reading moves");
+            assert!(take_chrome_inputs_moved(), "and the windows are told");
+            assert_eq!(
+                worn(dark),
+                reading.on_dark,
+                "the dark shade on a dark ground"
+            );
+            assert_eq!(
+                worn(light),
+                reading.on_light,
+                "the light shade on a light ground"
+            );
+            assert_eq!(
+                (chrome(dark), chrome(light)),
+                (chrome_dark, chrome_light),
+                "the chrome keeps its theme's accent"
+            );
+            assert!(
+                !install_control_accent(Some(reading)),
+                "no move, no repaint"
+            );
+        }
+        assert!(install_control_accent(None));
+        if cfg!(target_os = "macos") {
+            assert_eq!(worn(dark), MACOS_SYSTEM_BLUE.on_dark);
+        }
         let _ = take_chrome_inputs_moved();
     }
 
@@ -982,17 +1341,31 @@ mod tests {
 
     fn assert_role_contract(what: &str, r: NativeRoles) {
         assert!(
-            contrast_ratio(r.text_primary, r.surface) >= 4.5,
-            "{what}: primary text"
+            contrast_ratio(r.elevated, r.surface) >= CARD_CONTRAST_MIN,
+            "{what}: opaque card against the page"
         );
-        assert!(
-            contrast_ratio(r.text_secondary, r.surface) >= 4.5,
-            "{what}: secondary text"
-        );
-        assert!(
-            contrast_ratio(r.text_tertiary, r.surface) >= 3.0,
-            "{what}: tertiary text"
-        );
+        for (on, backdrop) in [("card", r.elevated), ("page", r.surface)] {
+            assert!(
+                contrast_ratio(r.text_primary, backdrop) >= 4.5,
+                "{what}: primary text on the {on}"
+            );
+            assert!(
+                contrast_ratio(r.text_secondary, backdrop) >= 4.5,
+                "{what}: secondary text on the {on}"
+            );
+            assert!(
+                contrast_ratio(r.text_tertiary, backdrop) >= 3.0,
+                "{what}: tertiary text on the {on}"
+            );
+            assert!(
+                contrast_ratio(r.danger, backdrop) >= 4.5,
+                "{what}: danger on the {on}"
+            );
+            assert!(
+                contrast_ratio(r.success, backdrop) >= 4.5,
+                "{what}: success on the {on}"
+            );
+        }
         assert!(
             contrast_ratio(r.accent, r.surface) >= ACCENT_INK_FLOOR,
             "{what}: accent as a rule on the page"
@@ -1033,52 +1406,34 @@ mod tests {
                 "{what}: a control's edge on the {on} is {ratio:.2}:1"
             );
         }
-        assert!(contrast_ratio(r.danger, r.surface) >= 4.5, "{what}: danger");
-        assert!(
-            contrast_ratio(r.success, r.surface) >= 4.5,
-            "{what}: success"
-        );
-        assert_ne!(r.surface, r.elevated, "{what}: elevation is visible");
-        if LIGHT_CARDS_RISE || surface_is_dark(r.surface) {
-            assert!(
-                relative_luminance(r.elevated) > relative_luminance(r.surface),
-                "{what}: a card {:?} sits above, so lighter than, the page {:?}",
-                r.elevated,
-                r.surface
-            );
-        }
     }
 
     #[test]
-    fn light_cards_rise_above_the_page_on_windows_only() {
-        let mut light = 0;
-        for (name, theme) in bundled_themes() {
-            let bg = packed_rgb(theme.bg);
-            if surface_is_dark(bg) {
-                continue;
+    fn cards_preserve_the_preferred_direction_when_both_grounds_remain_readable() {
+        for (surface, preferred_rise, expected_rise) in [
+            ([32; 3], true, true),
+            ([224; 3], true, true),
+            ([224; 3], false, false),
+            // A brighter card loses white text here; black cannot read the page.
+            ([111; 3], true, false),
+            // A darker card loses black text here; white cannot read the page.
+            ([124; 3], false, true),
+            // There is not enough room before white for the preferred rise.
+            ([250; 3], true, false),
+        ] {
+            let card = card_surface(surface, surface, preferred_rise, 4.5);
+            let grounds = [surface, card];
+            assert!(contrast_ratio(card, surface) >= CARD_CONTRAST_MIN);
+            assert_eq!(
+                relative_luminance(card) > relative_luminance(surface),
+                expected_rise,
+                "page {surface:?}, preferred rise {preferred_rise}"
+            );
+            for seed in [[0; 3], [128; 3], [255; 3]] {
+                let ink = ensure_contrast_on(seed, &grounds, 4.5);
+                assert!(least_contrast(ink, &grounds) >= 4.5);
             }
-            light += 1;
-            let r = default_roles(theme);
-            let toward_ink = neutral_surface(r.surface, packed_rgb(theme.fg), 0.065);
-            let toward_white = light_elevation(r.surface);
-            assert!(
-                relative_luminance(toward_white) > relative_luminance(r.surface),
-                "{name}: Windows' card {toward_white:?} on page {:?}",
-                r.surface
-            );
-            assert!(
-                relative_luminance(toward_ink) < relative_luminance(r.surface),
-                "{name}: the other platforms' card {toward_ink:?} on page {:?}",
-                r.surface
-            );
-            let expected = if cfg!(windows) {
-                toward_white
-            } else {
-                toward_ink
-            };
-            assert_eq!(r.elevated, expected, "{name}: this platform's card");
         }
-        assert!(light >= 4, "light built-ins measured: {light}");
     }
 
     #[test]
@@ -1105,6 +1460,69 @@ mod tests {
                 };
                 assert_role_contract(name, default_roles(palette));
             }
+        }
+    }
+
+    #[test]
+    fn grouped_surfaces_keep_shared_text_readable_on_a_low_contrast_theme() {
+        let theme = Theme {
+            bg: 0x0076_7676,
+            fg: 0x0076_7676,
+            ..Theme::default()
+        };
+        for high_contrast in [false, true] {
+            let r = roles(
+                theme,
+                AppearancePreferences {
+                    high_contrast,
+                    ..AppearancePreferences::default()
+                },
+            );
+            assert!(
+                !surface_is_dark(r.surface),
+                "exercise light grouped grounds"
+            );
+            let grouped = r.grouped();
+            assert!(contrast_ratio(grouped.page, grouped.card) >= CARD_CONTRAST_MIN);
+            for (ink, normal_floor) in [
+                (r.text_primary, 4.5),
+                (r.text_secondary, 4.5),
+                (r.text_tertiary, 3.0),
+            ] {
+                let original = least_contrast(ink, &[r.surface, r.elevated]);
+                for ground in [grouped.page, grouped.card] {
+                    let contrast = contrast_ratio(ink, ground);
+                    assert!(
+                        contrast >= original,
+                        "{ink:?} on {ground:?}: {contrast} < original {original}, high contrast {high_contrast}"
+                    );
+                    if !high_contrast {
+                        assert!(contrast >= normal_floor);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn accent_text_keeps_headroom_over_plain_and_selected_surfaces() {
+        for theme in THEMES
+            .into_iter()
+            .chain(bundled_themes().into_iter().map(|(_, theme)| theme))
+        {
+            let r = default_roles(theme);
+            let grounds = [
+                r.surface,
+                r.elevated,
+                mix_srgb(r.elevated, r.accent, ACCENT_WASH_SELECTED),
+                mix_srgb(r.elevated, r.accent, ACCENT_WASH_PRESSED),
+            ];
+            let target = 5.0_f32.min(best_endpoint_contrast(&grounds));
+            assert!(
+                least_contrast(r.accent_ink, &grounds) >= target,
+                "accent text {:?} on {grounds:?} must retain {target}:1",
+                r.accent_ink
+            );
         }
     }
 
@@ -1263,7 +1681,11 @@ mod tests {
                     ..AppearancePreferences::default()
                 },
             );
-            assert!(contrast_ratio(high.text_secondary, high.surface) >= 7.0);
+            for backdrop in [high.surface, high.elevated] {
+                assert!(contrast_ratio(high.text_primary, backdrop) >= 7.0);
+                assert!(contrast_ratio(high.text_secondary, backdrop) >= 7.0);
+                assert!(contrast_ratio(high.text_tertiary, backdrop) >= 4.5);
+            }
             assert!(contrast_ratio(high.separator, high.surface) >= 3.0);
             assert!(
                 contrast_ratio(high.separator, high.surface)

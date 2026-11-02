@@ -151,18 +151,24 @@ impl WarmBlock {
         self.logical_suffix(&decompressed, stored_line_count)
     }
 
-    /// Decompress to the serialized page bytes for cold re-compression, with the same framing
-    /// validation and failure bookkeeping as [`Self::decompress`].
-    pub(crate) fn decompress_serialized_page(&self) -> Result<Vec<u8>, ScrollbackError> {
-        let result = self.try_decompress_serialized();
+    /// Validate a warm page for the cold tier, reusing its LZ4 payload when every
+    /// physical line remains live. A trimmed prefix is decoded and re-encoded so
+    /// the cold page contains only its logical suffix.
+    pub(crate) fn to_cold_compressed(&self) -> Result<(Vec<u8>, usize), ScrollbackError> {
+        let result = self.try_cold_serialized_suffix();
         if result.is_err() {
             let failures = self.decompress_failures.get().saturating_add(1);
             self.decompress_failures.set(failures);
         }
-        result
+        let compressed = match result? {
+            Some(serialized) => crate::encode_cold_block(&serialized)?,
+            None => self.compressed.clone(),
+        };
+        Ok((compressed, self.line_count))
     }
 
-    fn try_decompress_serialized(&self) -> Result<Vec<u8>, ScrollbackError> {
+    /// `None` means the validated original payload already represents every live line.
+    fn try_cold_serialized_suffix(&self) -> Result<Option<Vec<u8>>, ScrollbackError> {
         let decompressed = decompress_lz4_bounded(&self.compressed)?;
         let stored_line_count = Self::stored_line_count(&decompressed)?;
         if stored_line_count == self.line_count {
@@ -177,9 +183,9 @@ impl WarmBlock {
                 )));
             }
             self.decompress_failures.set(0);
-            return Ok(decompressed);
+            return Ok(None);
         }
         let lines = self.logical_suffix(&decompressed, stored_line_count)?;
-        Ok(serialize_lines(&lines))
+        Ok(Some(serialize_lines(&lines)))
     }
 }

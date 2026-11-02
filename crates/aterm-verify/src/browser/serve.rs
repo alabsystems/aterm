@@ -245,6 +245,9 @@ fn percent_decoded(raw: &str) -> Option<String> {
     while i < bytes.len() {
         if bytes[i] == b'%' {
             let hex = std::str::from_utf8(bytes.get(i + 1..i + 3)?).ok()?;
+            if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return None;
+            }
             out.push(u8::from_str_radix(hex, 16).ok()?);
             i += 3;
         } else {
@@ -266,7 +269,13 @@ fn content_length(head: &str) -> Option<usize> {
     head.lines().find_map(|line| {
         let (name, value) = line.split_once(':')?;
         name.eq_ignore_ascii_case("content-length")
-            .then(|| value.trim().parse().ok())
+            .then(|| {
+                let v = value.trim();
+                v.bytes()
+                    .all(|b| b.is_ascii_digit())
+                    .then(|| v.parse().ok())
+                    .flatten()
+            })
             .flatten()
     })
 }
@@ -698,5 +707,7 @@ mod tests {
         );
         assert!(get(&server.origin(), BEAT).starts_with("HTTP/1.1 404"));
         assert_eq!(server.beats().last(), last, "another request moves nothing");
+        assert_eq!(percent_decoded("a%20b"), Some("a b".to_string()));
+        assert_eq!(percent_decoded("a%+ab"), None);
     }
 }

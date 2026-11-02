@@ -248,7 +248,13 @@ impl CFString {
         let s = self.as_ptr();
         // SAFETY: `self` holds a live CFString.
         let length = unsafe { CFStringGetLength(s) };
-        let mut units = vec![0_u16; usize::try_from(length).unwrap_or(0)];
+        let Ok(n) = usize::try_from(length) else {
+            return String::new();
+        };
+        if n == 0 {
+            return String::new();
+        }
+        let mut units = vec![0_u16; n];
         let range = CFRange {
             location: 0,
             length,

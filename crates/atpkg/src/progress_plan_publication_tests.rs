@@ -51,10 +51,7 @@ fn a_promised_plan_keeps_its_promise_if_publication_fails() {
     let sink = promised_sink(&layout);
     let promise = std::fs::read(layout.pass_owed_file()).unwrap();
     let empty = std::fs::read(layout.progress_file()).unwrap();
-    let blocked = layout
-        .progress_file()
-        .with_file_name(format!("progress.json.tmp-{}", std::process::id()));
-    std::fs::create_dir(&blocked).unwrap();
+    let fail = FailWrites::hold();
     cap_writes(&sink);
     sink.plan_promised_pass(&layout, &[("trust".into(), 17)]);
 
@@ -69,8 +66,5 @@ fn a_promised_plan_keeps_its_promise_if_publication_fails() {
         sink.snapshot().unwrap().programs["trust"].phase,
         Phase::Queued
     );
-    assert!(
-        blocked.is_dir(),
-        "the failed publication leaves the obstacle alone"
-    );
+    drop(fail);
 }

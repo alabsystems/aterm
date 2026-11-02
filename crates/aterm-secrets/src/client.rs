@@ -15,9 +15,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 mod account;
+pub use account::AccountIssuerSuccession;
+mod account_input;
+pub use account_input::{admin_set_entry_until, open_account_input};
 mod admin_keys;
 mod admission;
 mod admit;
+mod bounded;
+mod chain_cache;
 mod creation;
 pub mod custodian;
 mod enrollment;
@@ -26,23 +31,39 @@ mod fleet;
 mod foundation;
 mod genesis;
 mod handover;
+mod http204_observation;
 mod inspection;
+pub(crate) mod join_routing;
 mod ledger_publish;
 mod locker_skew;
 mod log_entries;
+mod network_observation;
+mod network_refresh;
+mod open_migration;
+mod peer_candidates;
+mod readmit;
+mod records_cache;
 pub mod release;
+mod release_migration;
 mod remove;
 mod retirement;
 mod roster;
 mod steward;
+mod subscriber;
+mod toml_cache;
+mod vault_memo;
 use admin_keys::parse_admin;
 pub use admission::{Evidence as AdmissionEvidence, Method as AdmissionMethod};
 pub use admit::{
     ByLog, LogAdmission, admit_by_phrase, admits_by_log, hand_over, log_admitted_actors,
     post_records_to_servers, write_from_log_bundle,
 };
-pub use enrollment::admin_cached;
-pub use entry::{EntrySnapshot, VerifiedEntry, read_account_bound_entry, read_verified_entry};
+pub use bounded::{join_if_unchanged_until, sync_reader_until};
+pub use enrollment::{admin_cached, admin_cached_until};
+pub use entry::{
+    EntryObservation, EntrySnapshot, EntryVersion, VerifiedEntry, observe_verified_entry,
+    read_account_bound_entry, read_verified_entry,
+};
 #[cfg(any(test, debug_assertions))]
 pub use fleet::test_alab_fleet;
 pub use fleet::{
@@ -59,16 +80,25 @@ pub use handover::{
     HANDOVER_LOCK_WAIT, ask_allowed, handover_bundle, holds_allowed, post_allowed,
     write_from_bundle,
 };
+pub use http204_observation::{VaultHttp204Response, observe_http204_response};
 pub use inspection::CommonsControlInspection;
 pub use ledger_publish::{
     MergedHeads, ObservedHead, extend_parent_spine, ledger_publish_environment,
     merge_diverged_heads, publish_to_servers, read_server_heads, verify_approved_in_served_head,
 };
-pub(crate) use log_entries::member_denied_by_roster;
 pub use log_entries::{
     admin_mirror_log, admit_member_in_log, check_log_commons_enrollment, configure_log_member,
-    enroll_commons_member_in_log, local_swarm_roster_for_log, publish_local_node_key,
-    reconcile_commons_log, remove_member_in_log, trusted_commons_log,
+    enroll_commons_member_in_log, local_swarm_roster_for_log, member_denied_by_roster,
+    publish_local_node_key, reconcile_commons_log, remove_member_in_log, trusted_commons_log,
+};
+pub use network_observation::{VaultNetworkMaterialization, VaultNetworkSource};
+pub use network_refresh::{
+    VaultNetworkRefresh, VaultNetworkRefreshOutcome, observe_network_refresh,
+};
+use peer_candidates::{PeerDiscovery, PeerUse};
+pub use readmit::{
+    AUTOMATIC_PER_HOUR, Book, How as ReadmitHow, MAX_READMISSIONS, Proven, READMIT_EVERY_MS,
+    Readmit, admit_by_proof, prove_at, prove_at_ms,
 };
 #[cfg(any(test, debug_assertions))]
 pub use remove::test_put_everyone;
@@ -84,18 +114,23 @@ pub use retirement::{
 pub use roster::{
     admin_seed_swarm_roster, resolve_local_swarm_label, swarm_lease_holder, swarm_roster,
 };
+pub(crate) use steward::{AlabRoleContext, AlabRoleObservation, observe_alab_role};
 pub use steward::{
     StewardLease, StewardRevoke, StewardStandbyServer, Stewardship,
     local_recipient_denied_in_roster, steward_alab_policy_role, steward_ensure_lease,
     steward_ensure_standby_server, steward_finish_revokes, steward_lease_check,
     steward_revoke_check, steward_standby_server_check, stewardship,
 };
+pub use subscriber::mend_subscriber;
+pub use vault_memo::{swarm_denied_nodes_now, swarm_roster_now};
 #[cfg(test)]
 mod birth_tests;
 #[cfg(test)]
 mod join_tests;
 #[cfg(test)]
 mod log_entries_tests;
+#[cfg(test)]
+mod peer_candidates_tests;
 #[cfg(test)]
 mod records_sync_tests;
 
@@ -240,11 +275,12 @@ pub enum Membership {
     Unconfigured,
     /// Configured; asked to join; no locker has opened yet.
     Pending,
-    /// A locker opened: holding this seq, last heard from the source at this unix time.
+    /// A locker opened; this machine holds this sequence.
     In {
         /// The seq held.
         seq: u64,
-        /// When the source last answered.
+        /// Stored source-processing marker in Unix seconds. Local replay and an unanswered
+        /// long-poll timeout can advance it; this is not successful network-sync evidence.
         heard: u64,
     },
     /// It was in, and the latest envelope has no locker for it.
@@ -523,49 +559,27 @@ fn decode_key32(text: &str) -> Option<[u8; 32]> {
 /// Largest serialized client state accepted by the reader and writer, in bytes.
 pub const MAX_STATE: usize = 4 * text::MAX_TEXT;
 
-fn read_toml(path: &Path, what: &str, max: usize) -> crate::Result<Option<aterm_toml::Table>> {
-    let Some(bytes) = fsx::read_private(path, max)? else {
-        return Ok(None);
-    };
-    let text = bytes
-        .as_str()
-        .ok_or_else(|| Error::new(format!("{what}: not UTF-8")))?;
-    match aterm_toml::from_str::<aterm_toml::Value>(text) {
-        Ok(aterm_toml::Value::Table(table)) => Ok(Some(table)),
-        _ => Err(Error::new(format!(
-            "{}: not a valid {what}; move it aside and run aterm secrets join again",
-            path.display()
-        ))),
-    }
+fn read_toml(
+    path: &Path,
+    what: &str,
+    max: usize,
+) -> crate::Result<Option<std::sync::Arc<aterm_toml::Table>>> {
+    toml_cache::read(path, what, max)
 }
 
 struct StateLock(std::fs::File);
 
+/// A missing observation place and a writer holding it are different read outcomes.
+enum StateObservation {
+    Absent,
+    Busy,
+    Held(StateLock),
+}
+
 impl StateLock {
     fn open_lock_file(paths: &Paths, path: &Path) -> crate::Result<std::fs::File> {
-        use std::os::unix::fs::OpenOptionsExt;
         fsx::ensure_private_dir(&paths.dir)?;
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(path)
-            .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
-        let metadata = file
-            .metadata()
-            .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
-        if !metadata.file_type().is_file() {
-            return Err(Error::new(format!(
-                "{}: not a regular file",
-                path.display()
-            )));
-        }
-        aterm_uds::keep_out_of_children(&file)
-            .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
-        Ok(file)
+        fsx::open_lock(path)
     }
 
     fn take(paths: &Paths) -> crate::Result<StateLock> {
@@ -574,7 +588,7 @@ impl StateLock {
 
     /// [`StateLock::take`] of the lock file at `path` in `paths.dir` ([`publish_lock`]).
     fn take_at(paths: &Paths, path: &Path) -> crate::Result<StateLock> {
-        let file = Self::open_lock_file(paths, path)?;
+        let file: std::fs::File = Self::open_lock_file(paths, path)?;
         #[expect(
             clippy::disallowed_methods,
             reason = "the take of StateLock, whose Drop releases by LOCK_UN (File::unlock)"
@@ -584,9 +598,22 @@ impl StateLock {
         Ok(StateLock(file))
     }
 
+    fn take_at_until(paths: &Paths, path: &Path, deadline: Instant) -> crate::Result<StateLock> {
+        publication_current(Some(deadline))?;
+        let file: std::fs::File = Self::open_lock_file(paths, path)?;
+        aterm_uds::private_file::lock_exclusive_until(
+            &file,
+            deadline,
+            "vault publication lock is busy",
+        )?;
+        let lock = StateLock(file);
+        publication_current(Some(deadline))?;
+        Ok(lock)
+    }
+
     fn try_take(paths: &Paths) -> crate::Result<Option<StateLock>> {
         let path = paths.lock_file();
-        let file = Self::open_lock_file(paths, &path)?;
+        let file: std::fs::File = Self::open_lock_file(paths, &path)?;
         #[expect(
             clippy::disallowed_methods,
             reason = "the non-blocking take of StateLock, whose Drop releases by LOCK_UN (File::unlock)"
@@ -597,6 +624,29 @@ impl StateLock {
             Err(std::fs::TryLockError::Error(e)) => {
                 Err(Error::new(format!("{}: {e}", path.display())))
             }
+        }
+    }
+
+    /// Try an existing private lock without creating files or repairing their permissions.
+    fn try_take_existing(paths: &Paths) -> crate::Result<Option<StateLock>> {
+        use std::os::unix::fs::MetadataExt as _;
+        let Some((file, metadata)) = Self::open_existing(paths, true)? else {
+            return Ok(None);
+        };
+        let dir =
+            std::fs::symlink_metadata(&paths.dir).map_err(|error| Error::new(error.to_string()))?;
+        if dir.uid() != fsx::euid() || dir.mode() & 0o7777 != 0o700 || metadata.mode() & 0o7077 != 0
+        {
+            return Ok(None);
+        }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "nonblocking exclusive take of the existing state lock, released by StateLock Drop"
+        )]
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self(file))),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => Err(Error::new(error.to_string())),
         }
     }
 
@@ -615,11 +665,31 @@ impl StateLock {
         }
     }
 
-    fn observe(paths: &Paths) -> crate::Result<Option<StateLock>> {
-        use std::os::unix::fs::OpenOptionsExt;
+    fn open_existing(
+        paths: &Paths,
+        writable: bool,
+    ) -> crate::Result<Option<(std::fs::File, std::fs::Metadata)>> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        match fsx::kind(&paths.dir)? {
+            fsx::Kind::Missing => return Ok(None),
+            fsx::Kind::Dir => {}
+            fsx::Kind::Symlink => {
+                return Err(Error::new(format!(
+                    "{}: is a symlink; refusing to keep secrets through it",
+                    paths.dir.display()
+                )));
+            }
+            fsx::Kind::File | fsx::Kind::Other => {
+                return Err(Error::new(format!(
+                    "{}: not a directory",
+                    paths.dir.display()
+                )));
+            }
+        }
         let path = paths.lock_file();
         let file = match std::fs::OpenOptions::new()
             .read(true)
+            .write(writable)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&path)
         {
@@ -636,15 +706,72 @@ impl StateLock {
                 path.display()
             )));
         }
+        if metadata.uid() != fsx::euid() {
+            return Err(Error::new(format!(
+                "{}: owned by uid {}, not this user",
+                path.display(),
+                metadata.uid()
+            )));
+        }
+        if metadata.nlink() != 1 {
+            return Err(Error::new(format!(
+                "{}: has {} hard links",
+                path.display(),
+                metadata.nlink()
+            )));
+        }
         aterm_uds::keep_out_of_children(&file)
             .map_err(|error| Error::new(format!("{}: {error}", path.display())))?;
+        Ok(Some((file, metadata)))
+    }
+
+    fn permissions_need_repair(paths: &Paths) -> crate::Result<bool> {
+        use std::os::unix::fs::MetadataExt as _;
+        let Some((_file, metadata)) = Self::open_existing(paths, true)? else {
+            return Ok(false);
+        };
+        let dir = std::fs::symlink_metadata(&paths.dir)
+            .map_err(|error| Error::new(format!("{}: {error}", paths.dir.display())))?;
+        if !dir.is_dir() || dir.uid() != fsx::euid() {
+            return Err(Error::new(
+                "the vault state directory is not this user's directory",
+            ));
+        }
+        let mode = metadata.mode();
+        // open_lock needs owner read/write before it can narrow the mode. Opening without
+        // create or truncate above also refuses a read-only filesystem or denied write access.
+        Ok(mode & 0o600 == 0o600 && (mode & 0o077 != 0 || mode & 0o6000 != 0))
+    }
+
+    fn observe(paths: &Paths) -> crate::Result<Option<StateLock>> {
+        match Self::observe_classified(paths)? {
+            StateObservation::Held(lock) => Ok(Some(lock)),
+            StateObservation::Absent | StateObservation::Busy => Ok(None),
+        }
+    }
+
+    /// Classify one nonblocking read without another filesystem probe or permission repair.
+    fn observe_classified(paths: &Paths) -> crate::Result<StateObservation> {
+        use std::os::unix::fs::MetadataExt as _;
+        let Some((file, metadata)) = Self::open_existing(paths, false)? else {
+            return Ok(StateObservation::Absent);
+        };
+        let file: std::fs::File = file;
+        let path = paths.lock_file();
+        if metadata.mode() & 0o077 != 0 || metadata.mode() & 0o6000 != 0 {
+            return Err(Error::new(format!(
+                "{}: mode {:o} lets other users read it; run chmod 600 on it",
+                path.display(),
+                metadata.mode() & 0o7777
+            )));
+        }
         #[expect(
             clippy::disallowed_methods,
             reason = "the shared take of StateLock, whose Drop releases by LOCK_UN (File::unlock)"
         )]
         match file.try_lock_shared() {
-            Ok(()) => Ok(Some(StateLock(file))),
-            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Ok(()) => Ok(StateObservation::Held(StateLock(file))),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(StateObservation::Busy),
             Err(std::fs::TryLockError::Error(error)) => {
                 Err(Error::new(format!("{}: {error}", path.display())))
             }
@@ -704,8 +831,8 @@ pub fn default_host_name() -> String {
     if let Some(name) = aterm_uds::process::lan_host_name() {
         candidates.push(name);
     }
-    if let Ok(name) = std::fs::read_to_string("/etc/hostname") {
-        candidates.push(name.trim().to_string());
+    if let Some(name) = read_etc_hostname() {
+        candidates.push(name);
     }
     if let Some(tag) = candidates.iter().find_map(|c| extract_machine_tag(c)) {
         return tag;
@@ -721,6 +848,29 @@ pub fn default_host_name() -> String {
         }
     }
     "machine".to_string()
+}
+
+fn read_etc_hostname() -> Option<String> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open("/etc/hostname")
+        .ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.file_type().is_file() || meta.len() > 1024 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0).saturating_add(1));
+    file.take(1025).read_to_end(&mut bytes).ok()?;
+    (bytes.len() <= 1024)
+        .then(|| {
+            std::str::from_utf8(&bytes)
+                .ok()
+                .map(|s| s.trim().to_owned())
+        })
+        .flatten()
 }
 
 fn extract_machine_tag(raw: &str) -> Option<String> {
@@ -967,6 +1117,12 @@ struct State {
     records_digest: Option<[u8; 32]>,
     /// The source, vault name and signer this version and membership belong to.
     source_identity: Option<[u8; 32]>,
+    /// The last successful actual URL body admission, kept separately from heartbeats.
+    network_materialization: Option<network_observation::Receipt>,
+    /// A retained actual configured-URL response; never inferred from the heard clock.
+    http204_response: Option<http204_observation::Receipt>,
+    /// Last retained actual network-refresh result, separate from local cache access.
+    network_refresh: Option<network_refresh::Receipt>,
     heard: u64,
     requested: u64,
     membership: Stored,
@@ -1029,6 +1185,9 @@ fn load_state(paths: &Paths) -> crate::Result<State> {
         digest: digest("digest"),
         records_digest: digest("records_digest"),
         source_identity: digest("source_identity"),
+        network_materialization: network_observation::Receipt::parse(&table),
+        http204_response: http204_observation::Receipt::parse(&table),
+        network_refresh: network_refresh::Receipt::parse(&table),
         heard: int("heard"),
         requested: int("requested"),
         membership: Stored::from_word(
@@ -1126,6 +1285,28 @@ fn save_state(paths: &Paths, state: &State) -> crate::Result<()> {
             paths.state_file().display()
         )));
     }
+    if let Some(receipt) = &state.network_materialization {
+        let ordinary_size = text.len();
+        receipt.write(&mut text);
+        // Optional visibility must not make a previously writable ordinary state too large.
+        if text.len() > MAX_STATE {
+            text.truncate(ordinary_size);
+        }
+    }
+    if let Some(receipt) = &state.http204_response {
+        let previous_size = text.len();
+        receipt.write(&mut text);
+        if text.len() > MAX_STATE {
+            text.truncate(previous_size);
+        }
+    }
+    if let Some(receipt) = &state.network_refresh {
+        let previous_size = text.len();
+        receipt.write(&mut text);
+        if text.len() > MAX_STATE {
+            text.truncate(previous_size);
+        }
+    }
     fsx::write_atomic(&paths.state_file(), text.as_bytes(), 0o600)
 }
 
@@ -1213,6 +1394,15 @@ pub fn status(paths: &Paths) -> crate::Result<Status> {
         membership,
         names: state.manifest.files.keys().cloned().collect(),
     })
+}
+
+/// Names in this machine's applied registry, read from metadata without opening its
+/// vault identity or any materialized credential.
+///
+/// # Errors
+/// The saved client state cannot be read or parsed.
+pub fn registered_names(paths: &Paths) -> crate::Result<Vec<String>> {
+    Ok(load_state(paths)?.manifest.files.into_keys().collect())
 }
 
 /// The entries this Mac reads from the membership log whose register holds concurrent values
@@ -1338,6 +1528,20 @@ pub fn materialization_ready(paths: &Paths) -> crate::Result<bool> {
     materialization_ready_with(paths, None, files_intact)
 }
 
+/// Setup readiness, including an owned legacy lock that ordinary sync can repair.
+/// This reads only: a repairable lock is not ready, and grants no credential access.
+/// The setup's normal apply must still take and validate the lock before narrowing it.
+/// # Errors
+/// Readiness fails for any reason other than repairable permissions on an owned,
+/// regular, single-link state lock that can already be opened for reading and writing.
+pub fn materialization_ready_for_setup(paths: &Paths) -> crate::Result<bool> {
+    let ready = materialization_ready(paths);
+    if ready.is_err() && StateLock::permissions_need_repair(paths)? {
+        return Ok(false);
+    }
+    ready
+}
+
 /// Observe readiness only while `expected` is still configured.
 pub fn materialization_ready_for(paths: &Paths, expected: &Config) -> crate::Result<bool> {
     materialization_ready_with(paths, Some(expected), files_intact)
@@ -1407,13 +1611,25 @@ pub fn materialization_mark(paths: &Paths) -> crate::Result<Option<Materializati
 
 /// The source and complete materialized version whose local inputs were read.
 /// Heartbeats and pending join proofs are not part of this identity.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct MaterializationSnapshot {
     config: Config,
     seq: u64,
     digest: Option<[u8; 32]>,
     manifest: Manifest,
+    network_materialization: Option<VaultNetworkMaterialization>,
 }
+
+impl PartialEq for MaterializationSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.config == other.config
+            && self.seq == other.seq
+            && self.digest == other.digest
+            && self.manifest == other.manifest
+    }
+}
+
+impl Eq for MaterializationSnapshot {}
 
 /// Local inputs read while their materialized version was held against writers.
 pub struct Materialized<T> {
@@ -1456,6 +1672,12 @@ const CURRENT_WAIT: Duration = Duration::from_secs(30);
 const CURRENT_LOOK: Duration = Duration::from_millis(100);
 
 impl MaterializationSnapshot {
+    /// Historical evidence from an actual signed URL body whose admitted context matched
+    /// this guarded observation. It is not a claim of remote currency or provider sign-in.
+    pub const fn network_materialization(&self) -> Option<VaultNetworkMaterialization> {
+        self.network_materialization
+    }
+
     /// Whether the same vault is still configured, ready and intact, holding the files this
     /// snapshot read: a later version that writes none of them (a machine let in, which on an
     /// open vault every join publishes) leaves it current, and one that changes, adds or
@@ -1536,6 +1758,14 @@ fn materialization_ready_with(
     ))
 }
 
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbVaultNetworkMaterializationProjection",
+        action = "Unready",
+        project = "aterm_secrets::client::network_observation::conformance_tests::projection_transition"
+    )
+)]
 fn with_ready_state<T>(
     paths: &Paths,
     expected: Option<&Config>,
@@ -1578,6 +1808,7 @@ fn with_ready_state<T>(
     Ok(MaterializationObservation::Ready(Box::new(Materialized {
         inputs: read()?,
         snapshot: MaterializationSnapshot {
+            network_materialization: network_observation::project(paths, &config, &state),
             config,
             seq: state.seq,
             digest: state.digest.or(state.records_digest),
@@ -1789,6 +2020,42 @@ pub(crate) fn sight(paths: &Paths) -> crate::Result<Option<crate::need::Sight>> 
     }))
 }
 
+/// A shared vault-state lock for a bounded local Commons read. It grants no
+/// authority: the caller still validates custody, membership and policy.
+/// Drop it before network I/O or any vault mutation.
+#[must_use = "hold the source read guard for the local batch"]
+pub struct CommonsSourceRead {
+    _lock: StateLock,
+}
+
+/// Try to hold existing vault state for a local Commons batch. Missing or busy
+/// state returns `None`; acquisition never waits or creates state. This grants
+/// no authority: admit and revalidate the source after acquiring its guard, and
+/// drop it before network I/O or a vault mutation.
+///
+/// # Errors
+/// The existing lock cannot be opened safely or its shared lock fails.
+pub fn try_commons_source_read(paths: &Paths) -> crate::Result<Option<CommonsSourceRead>> {
+    Ok(StateLock::observe(paths)?.map(|lock| CommonsSourceRead { _lock: lock }))
+}
+
+pub(crate) fn hold_commons_source(paths: &Paths) -> crate::Result<CommonsSourceRead> {
+    let read = try_commons_source_read(paths)?.ok_or_else(|| {
+        use crate::commons::Unavailable;
+        let reason = if fsx::kind(&paths.lock_file()).ok() == Some(fsx::Kind::Missing) {
+            Unavailable::MissingStateLock
+        } else {
+            Unavailable::Busy
+        };
+        Error::new(format!(
+            "Commons vault became unavailable while acquiring custody ({}): {}",
+            reason.code(),
+            reason.explanation()
+        ))
+    })?;
+    Ok(read)
+}
+
 /// The offline Commons reader, kept beside the vault's lock, pin and version
 /// checks so it cannot accidentally bypass the locally applied source binding.
 pub(crate) fn observe_commons(paths: &Paths) -> crate::Result<crate::commons::Observation> {
@@ -1910,7 +2177,7 @@ pub(crate) fn observe_commons(paths: &Paths) -> crate::Result<crate::commons::Ob
         state.seq,
         Some(digest),
         identity.recipient().0,
-        aterm_digest::Sha256::digest(bytes.as_slice()),
+        envelope::digest_bytes(bytes.as_slice()),
         records_frontier,
     );
     if obs_key.5.is_some()
@@ -2107,7 +2374,7 @@ impl Tries for LiveTries {
         {
             return Ok(transport::Answer::Fetched(Fetched::Body(probed.envelope)));
         }
-        transport::get_bounded(url, None, wait, Some(transport::LOOK_CONNECT))
+        transport::look_bounded(url, wait, Some(transport::LOOK_CONNECT))
     }
 
     fn now(&mut self) -> Instant {
@@ -2369,13 +2636,7 @@ fn pin_gives_way(config: &Config) -> bool {
 }
 
 fn cached_chain(paths: &Paths, pin: &[u8; 32]) -> Vec<[u8; 32]> {
-    fsx::read_private(&paths.cache_file(), envelope::MAX_ENVELOPE)
-        .ok()
-        .flatten()
-        .and_then(|bytes| envelope::parse(bytes.as_slice()).ok())
-        .filter(|cached| cached.signer == *pin && cached.verify_signature().is_ok())
-        .map(|cached| cached.reached_from())
-        .unwrap_or_default()
+    chain_cache::read(paths, pin)
 }
 
 fn chain_keys(envelope: &Envelope) -> Vec<[u8; 32]> {
@@ -2450,11 +2711,20 @@ fn place(source: &Source) -> String {
 }
 
 fn held_copy(paths: &Paths, config: &Config, state: &State) -> Option<Vec<u8>> {
+    if state.membership != Stored::In {
+        return None;
+    }
+    verified_cached_envelope(paths, config, state)
+}
+
+/// The exact authenticated cached envelope for local reading, even while admission is pending.
+/// Only [`held_copy`] admits one for publication back to a server.
+fn verified_cached_envelope(paths: &Paths, config: &Config, state: &State) -> Option<Vec<u8>> {
     let pin = config.signer?;
     let elsewhere = state
         .source_identity
         .is_some_and(|bound| bound != source_identity(config));
-    if state.membership != Stored::In || elsewhere || pin_gives_way(config) {
+    if elsewhere || pin_gives_way(config) {
         return None;
     }
     let cached = fsx::read_private(&paths.cache_file(), envelope::MAX_ENVELOPE)
@@ -2589,43 +2859,8 @@ fn records_store_for(
 /// `source.toml` cannot be read or parsed, `records` cannot be read, or this build's ALab genesis
 /// digest is malformed.
 pub fn load_records(paths: &Paths) -> crate::Result<crate::membership_log::Store> {
-    // A store recovered under other keys (a config re-pinned since, a build's retired keys)
-    // roots another genesis, so the keys are part of what the cache matches.
-    type RecordsCacheEntry = (
-        String,
-        Option<Vec<[u8; 32]>>,
-        [u8; 32],
-        crate::membership_log::Store,
-    );
-    static RECORDS_CACHE: std::sync::Mutex<std::collections::VecDeque<RecordsCacheEntry>> =
-        std::sync::Mutex::new(std::collections::VecDeque::new());
-
     let (vault, store) = records_store(paths)?;
-    match fsx::read_owned_head(
-        &paths.records_file(),
-        crate::membership_log::MAX_RECORDS_STREAM,
-    )? {
-        Some(bytes) => {
-            let digest = sha256(&bytes);
-            let keys = store.keys().map(<[[u8; 32]]>::to_vec);
-            let same = |(v, k, d, _): &RecordsCacheEntry| v == &vault && k == &keys && *d == digest;
-            if let Ok(cache) = RECORDS_CACHE.lock()
-                && let Some((_, _, _, store)) = cache.iter().find(|entry| same(entry))
-            {
-                return Ok(store.clone());
-            }
-            let store = store.recovering(&bytes);
-            if let Ok(mut cache) = RECORDS_CACHE.lock() {
-                cache.retain(|entry| !same(entry));
-                if cache.len() >= 16 {
-                    cache.pop_front();
-                }
-                cache.push_back((vault, keys, digest, store.clone()));
-            }
-            Ok(store)
-        }
-        None => Ok(store),
-    }
+    records_cache::read(paths, vault, store)
 }
 
 /// Verify and merge `records` into `paths.records_file()` under the client state lock, returning
@@ -2776,6 +3011,16 @@ fn sync_records_inner(
     extra_peers: &[String],
     browsed: Option<Found<'_>>,
 ) -> crate::Result<usize> {
+    sync_records_until(paths, wait, extra_peers, browsed, None)
+}
+
+fn sync_records_until(
+    paths: &Paths,
+    wait: Option<Duration>,
+    extra_peers: &[String],
+    browsed: Option<Found<'_>>,
+    deadline: Option<Instant>,
+) -> crate::Result<usize> {
     let config = configured(paths)?;
     let Source::Url(primary_url) = &config.source else {
         return Ok(0);
@@ -2784,12 +3029,29 @@ fn sync_records_inner(
     let have = local_store.have();
     let subscriber = subscriber_recipient(paths);
     let total = wait.map_or(servers_within(Duration::from_secs(10)), |w| {
-        w + Duration::from_secs(10)
+        w.saturating_add(Duration::from_secs(10))
     });
+    let total = bounded::budget(
+        deadline,
+        deadline.map_or(total, |_| total.min(PROBE_DEADLINE)),
+    )?;
     let primary =
         transport::fetch_records_sync(primary_url, &have, wait, total, subscriber.as_deref());
-    let peers = collect_sync_peer_urls(paths, &config, primary_url, extra_peers, browsed);
-    let probe_peers = !peers.is_empty() && (primary.is_err() || wait.is_none());
+    // A successful long poll uses only the primary. Leave the next peer batch for a pass
+    // that asks those peers instead of consuming it without a request.
+    let peers = if primary.is_err() || wait.is_none() {
+        collect_sync_peer_urls(
+            paths,
+            &config,
+            primary_url,
+            extra_peers,
+            browsed,
+            PeerUse::Records,
+        )
+    } else {
+        Vec::new()
+    };
+    let probe_peers = !peers.is_empty();
     type PeerRecordsFetch = (String, crate::Result<(Vec<u8>, bool)>);
     let peer_batches: Vec<PeerRecordsFetch> = if probe_peers {
         // Read on this thread: each peer's fetch runs on a scoped thread of its own.
@@ -2803,7 +3065,9 @@ fn sync_records_inner(
                     scope.spawn(move || {
                         (
                             url.clone(),
-                            transport::fetch_records_sync(url, have_ref, None, probe, sub_ref),
+                            bounded::budget(deadline, probe).and_then(|left| {
+                                transport::fetch_records_sync(url, have_ref, None, left, sub_ref)
+                            }),
                         )
                     })
                 })
@@ -2885,7 +3149,7 @@ fn sync_records_inner(
     let added = if verified_batches.is_empty() {
         0
     } else {
-        let _lock = StateLock::take(paths)?;
+        let _lock = bounded::take(paths, deadline)?;
         let mut store = load_records(paths)?;
         let before = store.inventory();
         let rooted = store.log().is_some();
@@ -2927,7 +3191,8 @@ fn sync_records_inner(
         }
         added
     };
-    if !push_urls.is_empty()
+    if deadline.is_none()
+        && !push_urls.is_empty()
         && let Ok(store) = load_records(paths)
         && store.log().is_some()
     {
@@ -3068,25 +3333,21 @@ fn policy_peer_urls(paths: &Paths, config: &Config) -> Vec<String> {
     out
 }
 
-/// The vault servers a subscriber's standing browse found for a config's vault
-/// ([`crate::discover::Watch::found`]), or a test's own.
-type Found<'a> = &'a dyn Fn(&Config) -> Vec<crate::discover::DiscoveredVault>;
+/// A subscriber's discovery source and independent record/envelope selection cursors.
+type Found<'a> = &'a PeerDiscovery<'a>;
 
 /// A [`Found`] that found nothing.
 #[cfg(test)]
-fn found_none(_config: &Config) -> Vec<crate::discover::DiscoveredVault> {
-    Vec::new()
-}
+static FOUND_NONE: PeerDiscovery<'static> = PeerDiscovery::empty();
 
-/// The vault servers a pass of `config` looks at beyond its source and the policy's. For the
-/// ALab vault, the compiled-in ALab URLs come first. Then come the servers `found` (a subscriber's
-/// standing browse), or else those of a bounded browse, highest advertised `seq` first
-/// ([`crate::discover::candidate_urls`]). A unit test's pass dials no compiled-in URL and runs no
-/// browse: it reads only what its `found` hands it.
+/// Additional publication servers: the compiled-in ALab URLs first, then the servers `found`
+/// or a bounded browse supplies, highest advertised `seq` first
+/// ([`crate::discover::candidate_urls`]). The publisher separately includes its trusted policy
+/// and explicit URLs. A unit test dials no compiled-in URL and runs no browse.
 fn live_alab_peer_urls(_paths: &Paths, config: &Config, found: Option<Found<'_>>) -> Vec<String> {
     let alab = !cfg!(test) && alab_vault(config);
     let discovered = match found {
-        Some(found) => found(config),
+        Some(found) => found.read(config),
         None if alab => crate::discover::browse_alab(PROBE_DEADLINE).unwrap_or_default(),
         None => Vec::new(),
     };
@@ -3100,48 +3361,20 @@ fn collect_sync_peer_urls(
     primary_url: &str,
     extra_peers: &[String],
     found: Option<Found<'_>>,
+    purpose: PeerUse,
 ) -> Vec<String> {
-    let primary_endpoint = transport::describe(primary_url);
-    let mut out: Vec<String> = Vec::new();
-    let mut push = |raw: &str| {
-        if out.len() >= crate::discover::MAX_CANDIDATES {
-            return;
-        }
-        let base = raw.split_once('#').map_or(raw, |(b, _)| b).trim();
-        let Ok((Source::Url(clean), None)) = transport::parse_source(base, Path::new("/")) else {
-            return;
-        };
-        if transport::vault_name(&Source::Url(clean.clone()))
-            .ok()
-            .as_deref()
-            != Some(config.name.as_str())
-        {
-            return;
-        }
-        let endpoint = transport::describe(&clean);
-        if endpoint.eq_ignore_ascii_case(&primary_endpoint) {
-            return;
-        }
-        if !out
-            .iter()
-            .any(|existing| transport::describe(existing).eq_ignore_ascii_case(&endpoint))
-        {
-            out.push(clean);
-        }
-    };
-    for url in policy_peer_urls(paths, config) {
-        push(&url);
+    if let Some(selected) = found.and_then(|source| source.preselected(config, primary_url)) {
+        return selected;
     }
-    if extra_peers.is_empty() {
-        for url in live_alab_peer_urls(paths, config, found) {
-            push(&url);
-        }
-    } else {
-        for url in extra_peers {
-            push(url);
-        }
-    }
-    out
+    let direct = PeerDiscovery::direct(None);
+    found.unwrap_or(&direct).select(
+        paths,
+        config,
+        primary_url,
+        &policy_peer_urls(paths, config),
+        extra_peers,
+        purpose,
+    )
 }
 
 struct SyncPeerHead {
@@ -3149,15 +3382,26 @@ struct SyncPeerHead {
     digest: [u8; 32],
     parents: Vec<[u8; 32]>,
     envelope: Vec<u8>,
+    network_body: Option<network_observation::Body>,
 }
 
 fn probe_sync_peer(
+    paths: &Paths,
     url: &str,
     config: &Config,
     pin: &[u8; 32],
     total: Duration,
+    subscriber: Option<&str>,
 ) -> Option<SyncPeerHead> {
-    let body = match transport::get_within(url, total).ok()? {
+    let attempt = network_observation::Attempt::start(paths, config, VaultNetworkSource::PeerUrl);
+    let fetched = transport::get_within_as(url, total, subscriber).ok()?;
+    let network_body = match &fetched {
+        transport::Answer::Fetched(fetched) => {
+            attempt.and_then(|attempt| attempt.received(fetched))
+        }
+        transport::Answer::Foreign(_) => None,
+    };
+    let body = match fetched {
         transport::Answer::Fetched(Fetched::Body(body)) => body,
         transport::Answer::Fetched(Fetched::Missing | Fetched::NoNewer(_))
         | transport::Answer::Foreign(_) => return None,
@@ -3170,14 +3414,17 @@ fn probe_sync_peer(
         digest,
         parents: envelope.parents,
         envelope: body,
+        network_body,
     })
 }
 
 fn probe_peers_for_sync(
+    paths: &Paths,
     urls: &[String],
     config: &Config,
     pin: &[u8; 32],
     total: Duration,
+    subscriber: Option<&str>,
 ) -> Vec<SyncPeerHead> {
     if urls.is_empty() {
         return Vec::new();
@@ -3185,7 +3432,9 @@ fn probe_peers_for_sync(
     let found: Vec<Option<SyncPeerHead>> = std::thread::scope(|scope| {
         let handles: Vec<_> = urls
             .iter()
-            .map(|url| scope.spawn(move || probe_sync_peer(url, config, pin, total)))
+            .map(|url| {
+                scope.spawn(move || probe_sync_peer(paths, url, config, pin, total, subscriber))
+            })
             .collect();
         handles
             .into_iter()
@@ -3294,78 +3543,223 @@ fn sync_repairing_inner(
         log_entries::current_records_digest(paths, &config, &before) != before.records_digest;
     let waited_on_primary =
         matches!(&config.source, Source::Url(_)) && wait.is_some() && !pending_records;
-    let subscriber = subscriber_recipient(paths);
-    let asked = Instant::now();
-    let mut primary_result = match (&config.source, wait) {
-        (Source::Url(_), Some(wait)) if !pending_records => transport::fetch_as(
-            &config.source,
-            long_poll_after(&config, &before),
-            wait + Duration::from_secs(10),
-            subscriber.as_deref(),
-        ),
-        _ => transport::fetch_as(
-            &config.source,
-            None,
-            Duration::from_secs(30),
-            subscriber.as_deref(),
-        ),
-    };
-    if let Some((_, said)) = subscribing {
-        said.set(SourceSaid::of(primary_result.is_ok(), asked.elapsed()));
-    }
-    if waited_on_primary && matches!(primary_result, Ok(Fetched::Body(_))) {
-        let _ = sync_records_inner(paths, None, extra_peers, browsed);
-    }
-    // The source's body is news only as far as it verifies under the pin (the servers found are
-    // read only under one): a body that claims a newer seq and does not verify (anyone on the
-    // LAN can answer at the source's name or address) must not keep the servers found unread.
-    let primary_advanced = match (&primary_result, config.signer.as_ref()) {
-        (Ok(Fetched::Body(bytes)), Some(pin)) => {
-            envelope::verify_for_reader(bytes, &config.name, pin, &config.followed, None)
-                .is_ok_and(|(envelope, _, _)| envelope.seq > before.seq)
-        }
-        _ => false,
-    };
-    let mut peers = Vec::new();
-    let mut max_peer_seq: Option<u64> = None;
-    let is_local_admin = allow_mirror
-        && admin_text_here(paths, &config, &before)
+    network_refresh::run(paths, &config, |refresh| {
+        let subscriber = subscriber_recipient(paths);
+        let attempt =
+            network_observation::Attempt::start(paths, &config, VaultNetworkSource::ConfiguredUrl);
+        let after = if waited_on_primary {
+            long_poll_after(&config, &before)
+        } else {
+            None
+        };
+        let http204_request =
+            http204_observation::Request::start(paths, &config, after, subscriber.as_deref());
+        let asked = Instant::now();
+        let observed = match (&config.source, wait) {
+            (Source::Url(_), Some(wait)) if !pending_records => transport::fetch_as_observed(
+                &config.source,
+                after,
+                wait.saturating_add(Duration::from_secs(10)),
+                subscriber.as_deref(),
+            ),
+            _ => transport::fetch_as_observed(
+                &config.source,
+                None,
+                Duration::from_secs(30),
+                subscriber.as_deref(),
+            ),
+        };
+        refresh.observed(&observed);
+        let http204 = observed.as_ref().ok().and_then(|observed| observed.http204);
+        let mut primary_result = observed.map(|observed| observed.fetched);
+        let mut network_body = primary_result
+            .as_ref()
             .ok()
-            .flatten()
-            .is_some();
-    if let (Source::Url(primary_url), Some(pin)) = (&config.source, config.signer.as_ref()) {
-        peers = collect_sync_peer_urls(paths, &config, primary_url, extra_peers, browsed);
-        if !peers.is_empty() && (!primary_advanced || (is_local_admin && wait.is_none())) {
-            let found = probe_peers_for_sync(&peers, &config, pin, servers_within(PROBE_DEADLINE));
-            max_peer_seq = found.iter().map(|p| p.seq).max();
-            if is_local_admin && !found.is_empty() {
-                let mut observed: Vec<HeadLineage> = found
-                    .iter()
-                    .map(|p| (p.seq, p.digest, p.parents.clone()))
-                    .collect();
-                match &primary_result {
-                    Ok(Fetched::Body(bytes)) => {
-                        if let Ok((env, _, _)) = envelope::verify_for_reader(
-                            bytes,
-                            &config.name,
-                            pin,
-                            &config.followed,
-                            None,
-                        ) {
-                            observed.push((env.seq, env.digest(), env.parents));
+            .and_then(|fetched| attempt.and_then(|attempt| attempt.received(fetched)));
+        if let Some((_, said)) = subscribing {
+            said.set(SourceSaid::of(primary_result.is_ok(), asked.elapsed()));
+        }
+        if let Some(request) = &http204_request {
+            http204_observation::retain(paths, &config, request, http204.as_ref());
+        }
+        if waited_on_primary && matches!(primary_result, Ok(Fetched::Body(_))) {
+            let _ = sync_records_inner(paths, None, extra_peers, browsed);
+        }
+        // The source's body is news only as far as it verifies under the pin (the servers found are
+        // read only under one): a body that claims a newer seq and does not verify (anyone on the
+        // LAN can answer at the source's name or address) must not keep the servers found unread.
+        let primary_advanced = match (&primary_result, config.signer.as_ref()) {
+            (Ok(Fetched::Body(bytes)), Some(pin)) => {
+                envelope::verify_for_reader(bytes, &config.name, pin, &config.followed, None)
+                    .is_ok_and(|(envelope, _, _)| envelope.seq > before.seq)
+            }
+            _ => false,
+        };
+        // Select only when a probe, mirror or recovery needs peers, and reuse the same batch
+        // throughout this pass. A primary advancing by itself must not skip a failover batch.
+        let peers = std::cell::OnceCell::new();
+        let peer_urls = || {
+            peers.get_or_init(|| match (&config.source, config.signer.as_ref()) {
+                (Source::Url(primary_url), Some(_)) => collect_sync_peer_urls(
+                    paths,
+                    &config,
+                    primary_url,
+                    extra_peers,
+                    browsed,
+                    PeerUse::Envelope,
+                ),
+                _ => Vec::new(),
+            })
+        };
+        let mut max_peer_seq: Option<u64> = None;
+        let is_local_admin = allow_mirror
+            && admin_text_here(paths, &config, &before)
+                .ok()
+                .flatten()
+                .is_some();
+        if let (Source::Url(primary_url), Some(pin)) = (&config.source, config.signer.as_ref())
+            && (!primary_advanced || (is_local_admin && wait.is_none()))
+        {
+            let peers = peer_urls();
+            if !peers.is_empty() {
+                let found = probe_peers_for_sync(
+                    paths,
+                    peers,
+                    &config,
+                    pin,
+                    servers_within(PROBE_DEADLINE),
+                    subscriber.as_deref(),
+                );
+                max_peer_seq = found.iter().map(|p| p.seq).max();
+                if is_local_admin && !found.is_empty() {
+                    let mut observed: Vec<HeadLineage> = found
+                        .iter()
+                        .map(|p| (p.seq, p.digest, p.parents.clone()))
+                        .collect();
+                    match &primary_result {
+                        Ok(Fetched::Body(bytes)) => {
+                            if let Ok((env, _, _)) = envelope::verify_for_reader(
+                                bytes,
+                                &config.name,
+                                pin,
+                                &config.followed,
+                                None,
+                            ) {
+                                observed.push((env.seq, env.digest(), env.parents));
+                            }
+                        }
+                        Ok(Fetched::NoNewer(Some(seq)))
+                            if *seq == before.seq && before.digest.is_some() =>
+                        {
+                            observed.push((*seq, before.digest.unwrap(), Vec::new()));
+                        }
+                        _ => {}
+                    }
+                    if heads_diverged(&observed) {
+                        let mut mirror_urls = vec![primary_url.clone()];
+                        mirror_urls.extend(peers.iter().cloned());
+                        if log_entries::mirror_log_to_servers(paths, &mirror_urls)?.is_some() {
+                            refresh.delegated();
+                            return sync_repairing_inner(
+                                paths,
+                                None,
+                                repaired,
+                                extra_peers,
+                                false,
+                                subscribing,
+                            );
                         }
                     }
-                    Ok(Fetched::NoNewer(Some(seq)))
-                        if *seq == before.seq && before.digest.is_some() =>
-                    {
-                        observed.push((*seq, before.digest.unwrap(), Vec::new()));
-                    }
-                    _ => {}
                 }
-                if heads_diverged(&observed) {
+                let exact_held_peer = before.digest.and_then(|held_digest| {
+                    found
+                        .iter()
+                        .find(|p| p.seq == before.seq && p.digest == held_digest)
+                        .map(|p| (p.envelope.clone(), p.network_body))
+                });
+                if let Some(probed) = found.into_iter().max_by_key(|p| (p.seq, p.digest)) {
+                    let take_peer = match &primary_result {
+                        Err(_) => probed.seq >= before.seq,
+                        Ok(Fetched::Missing) => probed.seq > before.seq || before.seq == 0,
+                        Ok(Fetched::NoNewer(_) | Fetched::Body(_)) => {
+                            probed.seq > before.seq
+                                && peer_subsumes_held(paths, &config, &before, &probed)
+                        }
+                    };
+                    if take_peer {
+                        network_body = probed.network_body;
+                        primary_result = Ok(Fetched::Body(probed.envelope));
+                    } else if let (Ok(Fetched::Body(primary_bytes)), Some((exact_env, exact_body))) =
+                        (&primary_result, exact_held_peer)
+                        && envelope::parse(primary_bytes).is_ok_and(|parsed| {
+                            parsed.seq == before.seq && Some(parsed.digest()) != before.digest
+                        })
+                    {
+                        // When primary and a verified peer hold an equal-seq split while awaiting an
+                        // admin mirror, keep the non-admin reader steady on the verified head it
+                        // already applied instead of error-looping on primary's sibling fork.
+                        network_body = exact_body;
+                        primary_result = Ok(Fetched::Body(exact_env));
+                    }
+                }
+            }
+        }
+        // After a heal the higher-seq side's version takes every server over, so no two heads differ
+        // for `heads_diverged` to flag, and a subscriber whose source advanced probes no peer: an
+        // admin whose log moved since the version it applied mirrors the merged log, which publishes
+        // only where the log changes the version, so the lower-seq side's edits reach the envelope a
+        // 0.145 Mac reads with nobody acting.
+        if is_local_admin
+            && let Source::Url(primary_url) = &config.source
+            && log_entries::current_records_digest(paths, &config, &before) != before.records_digest
+        {
+            let mut mirror_urls = vec![primary_url.clone()];
+            mirror_urls.extend(peer_urls().iter().cloned());
+            if let Ok(Some(_)) = log_entries::mirror_log_to_servers(paths, &mirror_urls) {
+                refresh.delegated();
+                return sync_repairing_inner(
+                    paths,
+                    None,
+                    repaired,
+                    extra_peers,
+                    false,
+                    subscribing,
+                );
+            }
+        }
+        if network_body.is_some() {
+            refresh.peer_response();
+        }
+        let fetched = primary_result?;
+        match apply_fetched_repairing(
+            paths,
+            config.clone(),
+            before,
+            network_observation::Received {
+                fetched,
+                body: network_body,
+            },
+            repaired.as_deref_mut(),
+        ) {
+            Ok(outcome) => Ok(outcome),
+            Err(err)
+                if err.kind() == crate::ErrorKind::NotStored
+                    && let (Source::Url(primary_url), Some(pin)) =
+                        (&config.source, config.signer.as_ref())
+                    && !peer_urls().is_empty() =>
+            {
+                let peers = peer_urls();
+                let current = load_state(paths)?;
+                if allow_mirror
+                    && admin_text_here(paths, &config, &current)
+                        .ok()
+                        .flatten()
+                        .is_some()
+                {
                     let mut mirror_urls = vec![primary_url.clone()];
                     mirror_urls.extend(peers.iter().cloned());
                     if log_entries::mirror_log_to_servers(paths, &mirror_urls)?.is_some() {
+                        refresh.delegated();
                         return sync_repairing_inner(
                             paths,
                             None,
@@ -3376,101 +3770,27 @@ fn sync_repairing_inner(
                         );
                     }
                 }
-            }
-            let exact_held_peer = before.digest.and_then(|held_digest| {
-                found
-                    .iter()
-                    .find(|p| p.seq == before.seq && p.digest == held_digest)
-                    .map(|p| p.envelope.clone())
-            });
-            if let Some(probed) = found.into_iter().max_by_key(|p| (p.seq, p.digest)) {
-                let take_peer = match &primary_result {
-                    Err(_) => probed.seq >= before.seq,
-                    Ok(Fetched::Missing) => probed.seq > before.seq || before.seq == 0,
-                    Ok(Fetched::NoNewer(_) | Fetched::Body(_)) => {
-                        probed.seq > before.seq
-                            && peer_subsumes_held(paths, &config, &before, &probed)
-                    }
-                };
-                if take_peer {
-                    primary_result = Ok(Fetched::Body(probed.envelope));
-                } else if let (Ok(Fetched::Body(primary_bytes)), Some(exact_env)) =
-                    (&primary_result, exact_held_peer)
-                    && envelope::parse(primary_bytes).is_ok_and(|parsed| {
-                        parsed.seq == before.seq && Some(parsed.digest()) != before.digest
-                    })
-                {
-                    // When primary and a verified peer hold an equal-seq split while awaiting an
-                    // admin mirror, keep the non-admin reader steady on the verified head it
-                    // already applied instead of error-looping on primary's sibling fork.
-                    primary_result = Ok(Fetched::Body(exact_env));
-                }
-            }
-        }
-    }
-    // After a heal the higher-seq side's version takes every server over, so no two heads differ
-    // for `heads_diverged` to flag, and a subscriber whose source advanced probes no peer: an
-    // admin whose log moved since the version it applied mirrors the merged log, which publishes
-    // only where the log changes the version, so the lower-seq side's edits reach the envelope a
-    // 0.145 Mac reads with nobody acting.
-    if is_local_admin
-        && let Source::Url(primary_url) = &config.source
-        && log_entries::current_records_digest(paths, &config, &before) != before.records_digest
-    {
-        let mut mirror_urls = vec![primary_url.clone()];
-        mirror_urls.extend(peers.iter().cloned());
-        if let Ok(Some(_)) = log_entries::mirror_log_to_servers(paths, &mirror_urls) {
-            return sync_repairing_inner(paths, None, repaired, extra_peers, false, subscribing);
-        }
-    }
-    let fetched = primary_result?;
-    match apply_fetched_repairing(
-        paths,
-        config.clone(),
-        before,
-        fetched,
-        repaired.as_deref_mut(),
-    ) {
-        Ok(outcome) => Ok(outcome),
-        Err(err)
-            if err.kind() == crate::ErrorKind::NotStored
-                && !peers.is_empty()
-                && let (Source::Url(primary_url), Some(pin)) =
-                    (&config.source, config.signer.as_ref()) =>
-        {
-            let current = load_state(paths)?;
-            if allow_mirror
-                && admin_text_here(paths, &config, &current)
-                    .ok()
-                    .flatten()
-                    .is_some()
-            {
-                let mut mirror_urls = vec![primary_url.clone()];
-                mirror_urls.extend(peers.iter().cloned());
-                if log_entries::mirror_log_to_servers(paths, &mirror_urls)?.is_some() {
-                    return sync_repairing_inner(
+                let verified_peer_seq = max_peer_seq.or_else(|| {
+                    probe_peers_for_sync(
                         paths,
-                        None,
-                        repaired,
-                        extra_peers,
-                        false,
-                        subscribing,
-                    );
-                }
-            }
-            let verified_peer_seq = max_peer_seq.or_else(|| {
-                probe_peers_for_sync(&peers, &config, pin, servers_within(PROBE_DEADLINE))
+                        peers,
+                        &config,
+                        pin,
+                        servers_within(PROBE_DEADLINE),
+                        subscriber.as_deref(),
+                    )
                     .into_iter()
                     .map(|p| p.seq)
                     .max()
-            });
-            if verified_peer_seq.is_some_and(|seq| seq >= current.seq) {
-                return Ok(SyncOutcome::Unchanged { seq: current.seq });
+                });
+                if verified_peer_seq.is_some_and(|seq| seq >= current.seq) {
+                    return Ok(SyncOutcome::Unchanged { seq: current.seq });
+                }
+                Err(err)
             }
-            Err(err)
+            Err(err) => Err(err),
         }
-        Err(err) => Err(err),
-    }
+    })
 }
 
 /// [`sync`] as one try of a bounded wait (an approval's): a long-poll whose whole request ends
@@ -3480,22 +3800,44 @@ fn sync_repairing_inner(
 pub fn sync_within(paths: &Paths, total: Duration) -> crate::Result<SyncOutcome> {
     let config = configured(paths)?;
     let before = load_state(paths)?;
-    let subscriber = subscriber_recipient(paths);
-    let fetched = match &config.source {
-        Source::Url(url) => match transport::fetch_within_as(
-            url,
-            long_poll_after(&config, &before),
-            total,
-            subscriber.as_deref(),
-        ) {
-            Err(error) if error.kind() == crate::ErrorKind::TimedOut => {
-                return Ok(SyncOutcome::Unchanged { seq: before.seq });
+    network_refresh::run(paths, &config, |refresh| {
+        let subscriber = subscriber_recipient(paths);
+        let attempt =
+            network_observation::Attempt::start(paths, &config, VaultNetworkSource::ConfiguredUrl);
+        let after = long_poll_after(&config, &before);
+        let http204_request =
+            http204_observation::Request::start(paths, &config, after, subscriber.as_deref());
+        let observed = match &config.source {
+            Source::Url(url) => {
+                match transport::fetch_within_as_observed(url, after, total, subscriber.as_deref())
+                {
+                    Err(error) if error.kind() == crate::ErrorKind::TimedOut => {
+                        return Ok(SyncOutcome::Unchanged { seq: before.seq });
+                    }
+                    fetched => fetched,
+                }
             }
-            fetched => fetched?,
-        },
-        Source::Path(_) => transport::fetch(&config.source, None, Duration::from_secs(30))?,
-    };
-    apply_fetched(paths, config, before, fetched)
+            Source::Path(_) => transport::fetch_as_observed(
+                &config.source,
+                None,
+                Duration::from_secs(30),
+                subscriber.as_deref(),
+            ),
+        };
+        refresh.observed(&observed);
+        let observed = observed?;
+        if let Some(request) = &http204_request {
+            http204_observation::retain(paths, &config, request, observed.http204.as_ref());
+        }
+        let fetched = observed.fetched;
+        let body = attempt.and_then(|attempt| attempt.received(&fetched));
+        apply_fetched(
+            paths,
+            config.clone(),
+            before,
+            network_observation::Received { fetched, body },
+        )
+    })
 }
 
 /// The seq a long-poll waits past (`?after=`): the one this Mac holds, once it is bound to
@@ -3521,7 +3863,7 @@ fn apply_fetched(
     paths: &Paths,
     config: Config,
     before: State,
-    fetched: Fetched,
+    fetched: impl Into<network_observation::Received>,
 ) -> crate::Result<SyncOutcome> {
     apply_fetched_repairing(paths, config, before, fetched, None)
 }
@@ -3530,16 +3872,46 @@ fn apply_fetched(
 /// writing the files of a version it holds again ([`put_back_due`]).
 fn apply_fetched_repairing(
     paths: &Paths,
-    mut config: Config,
+    config: Config,
     before: State,
-    fetched: Fetched,
+    fetched: impl Into<network_observation::Received>,
     repaired: Option<&mut Repaired>,
 ) -> crate::Result<SyncOutcome> {
-    let lock = StateLock::take(paths)?;
+    apply_fetched_until(paths, config, before, fetched, repaired, None)
+}
+
+fn apply_fetched_until(
+    paths: &Paths,
+    mut config: Config,
+    before: State,
+    fetched: impl Into<network_observation::Received>,
+    repaired: Option<&mut Repaired>,
+    deadline: Option<Instant>,
+) -> crate::Result<SyncOutcome> {
+    let network_observation::Received {
+        mut fetched,
+        mut body,
+    } = fetched.into();
+    let lock = bounded::take(paths, deadline)?;
     if self::config(paths)?.as_ref() != Some(&config) {
         return Ok(SyncOutcome::Unchanged { seq: before.seq });
     }
+    let requested_config = config.clone();
     let mut state = load_state(paths)?;
+    if deadline.is_some()
+        && log_entries::current_records_digest(paths, &config, &state) != state.records_digest
+        && match &fetched {
+            Fetched::Missing | Fetched::NoNewer(_) => true,
+            Fetched::Body(bytes) => envelope::parse(bytes)
+                .is_ok_and(|body| body.name == config.name && body.seq < state.seq),
+        }
+        && let Some(copy) = verified_cached_envelope(paths, &config, &state)
+    {
+        // Local record progress must not depend on repairing an unavailable or older
+        // envelope server. The normal verifier below still checks the cached head and log.
+        fetched = Fetched::Body(copy);
+        body = None;
+    }
     let bytes = match fetched {
         Fetched::NoNewer(served) => {
             if now().saturating_sub(state.heard) >= 60 {
@@ -3552,6 +3924,9 @@ fn apply_fetched_repairing(
             if let Some((served, copy)) =
                 older.and_then(|served| Some((served, held_copy(paths, &config, &state)?)))
             {
+                if deadline.is_some() {
+                    return Ok(SyncOutcome::Unchanged { seq: state.seq });
+                }
                 drop(lock);
                 transport::publish(&config.source, &copy).map_err(|error| {
                     Error::of_kind(
@@ -3572,6 +3947,7 @@ fn apply_fetched_repairing(
             if log_entries::current_records_digest(paths, &config, &state) != state.records_digest
                 && let Some(copy) = held_copy(paths, &config, &state)
             {
+                body = None;
                 copy
             } else if state.digest.is_none()
                 && fsx::kind(&paths.cache_file())? == fsx::Kind::Missing
@@ -3596,6 +3972,9 @@ fn apply_fetched_repairing(
             let Some(copy) = copy else {
                 return Err(missing(&config));
             };
+            if deadline.is_some() {
+                return Ok(SyncOutcome::Unchanged { seq: state.seq });
+            }
             drop(lock);
             transport::publish(&config.source, &copy).map_err(|error| {
                 Error::of_kind(
@@ -3686,6 +4065,9 @@ fn apply_fetched_repairing(
             else {
                 return Err(error);
             };
+            if deadline.is_some() {
+                return Ok(SyncOutcome::Unchanged { seq: state.seq });
+            }
             drop(lock);
             transport::publish(&config.source, &copy).map_err(|failed| {
                 Error::of_kind(
@@ -3736,6 +4118,14 @@ fn apply_fetched_repairing(
                     )
                 })))
     {
+        network_observation::record(
+            paths,
+            &requested_config,
+            &config,
+            &mut state,
+            &envelope,
+            body,
+        );
         save_state(paths, &state)?;
         return Ok(SyncOutcome::Unchanged { seq: state.seq });
     }
@@ -3770,6 +4160,11 @@ fn apply_fetched_repairing(
     let (opened, applied_records_digest) = match seeded_log {
         Some((log, digest))
             if log.removes(&identity.recipient())
+                || log_entries::recipient_denied_by_roster_or_log(
+                    None,
+                    &log,
+                    &identity.recipient(),
+                )
                 || log.audience_left_out_recipient(
                     &crate::membership_log::EpochAudience::Everyone,
                     &identity.recipient(),
@@ -3811,6 +4206,14 @@ fn apply_fetched_repairing(
     state.membership = Stored::In;
     state.failed = apply_failed(&report);
     state.source_identity = (!state.failed).then(|| source_identity(&config));
+    network_observation::record(
+        paths,
+        &requested_config,
+        &config,
+        &mut state,
+        &envelope,
+        body,
+    );
     save_state(paths, &state)?;
     Ok(SyncOutcome::Applied {
         seq: envelope.seq,
@@ -3837,6 +4240,11 @@ fn apply_configured_log(
     let identity = read_identity(paths)?
         .ok_or_else(|| Error::new("this machine has no key: run aterm secrets join"))?;
     let opened = if configured.log.removes(&identity.recipient())
+        || log_entries::recipient_denied_by_roster_or_log(
+            None,
+            &configured.log,
+            &identity.recipient(),
+        )
         || configured.log.audience_left_out_recipient(
             &crate::membership_log::EpochAudience::Everyone,
             &identity.recipient(),
@@ -3882,13 +4290,56 @@ pub fn watch(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<()> {
 /// Sleep `total`, ending early once `stop` is set or `moved` says so (each looked at every
 /// `look`).
 fn nap_unless(stop: &AtomicBool, total: Duration, look: Duration, moved: &dyn Fn() -> bool) {
-    let deadline = Instant::now() + total;
+    let deadline = Instant::now() + total.min(Duration::from_secs(365 * 24 * 60 * 60));
     while !stop.load(Ordering::Relaxed) && !moved() {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return;
         }
         std::thread::sleep(left.min(look));
+    }
+}
+
+/// How often a subscriber, or the approver beside it, that `[swarm] enabled = false` holds looks
+/// at `aterm.toml` again: one `stat` ([`crate::swarm::Switch`]).
+const SWARM_LOOK: Duration = Duration::from_secs(1);
+
+/// Whether `[swarm] enabled` lets `who` (this subscriber, the approver beside it) work now
+/// (`switch`, [`crate::swarm::Switch`]; `docs/DESIGN-alab-swarm-2026-10-27.md` §9: the switch
+/// sets `aterm secrets agent off` among the rest). An off switch holds it, and so does one that
+/// cannot be read, as it holds all automatic vault work (`aterm init`'s Secrets stage, the
+/// subscriber's mend). Each hold, and its end, is said once in `log` (`held` keeps whether one
+/// stands).
+fn swarm_lets(
+    switch: &mut crate::swarm::Switch,
+    held: &mut bool,
+    who: &str,
+    log: &dyn Fn(&str),
+) -> bool {
+    match switch.enabled() {
+        Ok(true) => {
+            if std::mem::take(held) {
+                log(&format!(
+                    "sharing is on again ([swarm] enabled): {who} works again"
+                ));
+            }
+            true
+        }
+        off => {
+            if !std::mem::replace(held, true) {
+                log(&match off {
+                    Ok(_) => format!(
+                        "sharing is off ([swarm] enabled = false): {who} asks, reads and applies \
+                         nothing until it is on"
+                    ),
+                    Err(error) => format!(
+                        "cannot read [swarm] in aterm.toml ({error}): {who} asks, reads and \
+                         applies nothing until it reads"
+                    ),
+                });
+            }
+            false
+        }
     }
 }
 
@@ -4211,6 +4662,11 @@ struct Hearing<'a> {
     /// How it asks ALab's members on the LAN to show this Mac's request while it waits to be
     /// let in ([`ask_members_if_due`]): how many heard it.
     ask: AskMembers<'a>,
+    /// What a round `[swarm] enabled` holds does with the LAN uses that run by themselves between
+    /// rounds: the live loop's drops its standing `_alab-vault._tcp` browse
+    /// ([`StandingBrowse::stop`]), which the first pass of the ALab vault once sharing is on
+    /// starts afresh. A test's does nothing, or counts.
+    hold: &'a dyn Fn(),
 }
 
 /// How a waiting Mac asks ALab's members on the LAN to show its request (F10's `ask`): how many
@@ -4229,58 +4685,124 @@ pub fn on_ask_members(ask: fn(&Paths) -> crate::Result<usize>) {
     let _ = ASK_MEMBERS.set(ask);
 }
 
-/// How often a Mac waiting to be let into ALab asks its members again: a member that woke,
-/// joined the LAN or restarted its window since shows the row within this.
-const ASK_MEMBERS_EVERY: Duration = Duration::from_secs(60);
+/// How long a Mac waiting to be let into ALab waits before asking its members again, after
+/// `asks` asks in a row: 1, 2, 4 and 8 minutes, then every 15. A member keeps one row per asking
+/// Mac (`members::desk`), so an ask again shows nothing new there; it brings the row back only on
+/// a member that slept, was off the LAN or restarted its window since.
+fn ask_members_pause(asks: u32) -> Duration {
+    const MINUTES: [u64; 5] = [1, 2, 4, 8, 15];
+    let at = usize::try_from(asks.saturating_sub(1))
+        .map_or(MINUTES.len() - 1, |at| at.min(MINUTES.len() - 1));
+    Duration::from_secs(MINUTES[at] * 60)
+}
 
-/// When the subscriber last asked ALab's members, and what it last said of it.
-#[derive(Default)]
+/// When the subscriber last asked ALab's members, how many times in a row, on what, and what it
+/// last said of it.
 struct MembersAsked {
     at: Option<Instant>,
     said: String,
+    /// The asks in a row since this Mac began waiting, or last started over
+    /// ([`ask_members_pause`]).
+    asks: u32,
+    /// What the last ask went out on: this Mac's network ([`crate::network::default_route`]), the
+    /// last one known (a read that finds none, or a part not read yet, keeps it), and its join
+    /// request's time (`State::requested`). Another network, or a request a person's Join posted
+    /// again, starts the pauses over.
+    on: Option<(Option<String>, u64)>,
+    /// How this Mac's network is read: [`crate::network::default_route`], or a test's.
+    network: fn() -> Option<String>,
 }
 
-/// Ask ALab's members on the LAN to show this Mac's request with `ask`, at most once each
-/// [`ASK_MEMBERS_EVERY`], while it waits to be let into the ALab vault at a URL
-/// (`docs/DESIGN-fluid-swarm-2026-10-28.md` §3.6 step 3: System State's join posts only to the
-/// vault's queue, which no member's desk reads). Each member keeps a heard request in memory
-/// only, so asking again is what shows it on a member that slept, was off the LAN, or restarted
-/// its window when this Mac first asked. What it heard is said in `log` when it changes.
+impl Default for MembersAsked {
+    fn default() -> Self {
+        Self {
+            at: None,
+            said: String::new(),
+            asks: 0,
+            on: None,
+            network: crate::network::default_route,
+        }
+    }
+}
+
+impl MembersAsked {
+    /// Keep the join request's time this subscriber's own ask again moved it to (`requested`,
+    /// read after [`ask_again_if_due`]), so that move is not taken for a person's Join.
+    fn asked_again(&mut self, requested: Option<u64>) {
+        if let (Some((_, kept)), Some(requested)) = (&mut self.on, requested) {
+            *kept = requested;
+        }
+    }
+}
+
+/// Ask ALab's members on the LAN to show this Mac's request with `ask` while it waits to be let
+/// into the ALab vault at a URL (`docs/DESIGN-fluid-swarm-2026-10-28.md` §3.6 step 3: System
+/// State's join posts only to the vault's queue, which no member's desk reads): at once as the
+/// wait begins, then after each [`ask_members_pause`], and at once again where this Mac moved to
+/// another network or a person's Join posted its request again (the subscriber's own hourly ask
+/// again, and its reset of a request a pass failed with, are not a person's). Each member keeps a
+/// heard request in memory only, so asking again is what shows it on a member that slept, was
+/// off the LAN, or restarted its window when this Mac first asked. What it heard is said in `log`
+/// when it changes.
 ///
 /// A Mac holding a member's `Allowed` (F10's files) waits on an admin's approver and asks
-/// nobody, while its vault has no membership log; once it holds a trusted one (F12b), any member
-/// can let it in by the log (F15), so it asks the members again rather than wait on an approver
-/// that may never run.
+/// nobody, while its vault has no membership log, so a member's Allow ends the asking; once it
+/// holds a trusted one (F12b), any member can let it in by the log (F15), so it asks the members
+/// again rather than wait on an approver that may never run.
 fn ask_members_if_due(
     paths: &Paths,
     asked: &mut MembersAsked,
     ask: AskMembers<'_>,
     log: &dyn Fn(&str),
 ) {
-    if asked.at.is_some_and(|at| at.elapsed() < ASK_MEMBERS_EVERY) {
-        return;
-    }
     let config = self::config(paths)
         .ok()
         .flatten()
         .filter(|config| matches!(config.source, Source::Url(_)) && alab_vault(config));
+    let state = load_state(paths).ok();
     let waiting = config.as_ref().is_some_and(|config| {
-        load_state(paths).is_ok_and(|state| {
-            state.membership == Stored::Pending
-                && (state.failed
-                    || !holds_allowed(paths)
-                    || log_entries::trusted_configured_log(paths, config)
-                        .is_ok_and(|log| log.is_some()))
-        })
+        state
+            .as_ref()
+            .is_some_and(|state| state.membership == Stored::Pending)
+            && (!holds_allowed(paths)
+                || log_entries::trusted_configured_log(paths, config)
+                    .is_ok_and(|log| log.is_some()))
     });
-    if !waiting {
+    let Some(state) = state.filter(|_| waiting) else {
+        // A wait that begins again starts its pauses over.
+        asked.at = None;
+        asked.asks = 0;
+        asked.on = None;
+        return;
+    };
+    // A read with no default route (the Wi-Fi not joined yet after a wake), or one whose gateway
+    // ARP has not resolved, is no move: the last route known stands.
+    let network = (asked.network)()
+        .filter(|route| crate::network::route_known(route))
+        .or_else(|| asked.on.as_ref().and_then(|(was, _)| was.clone()));
+    let moved = asked.on.as_ref().is_some_and(|(was, requested)| {
+        (network.is_some() && network != *was)
+            || (state.requested != 0 && state.requested != *requested)
+    });
+    if moved {
+        asked.at = None;
+        asked.asks = 0;
+    }
+    if asked
+        .at
+        .is_some_and(|at| at.elapsed() < ask_members_pause(asked.asks))
+    {
         return;
     }
     asked.at = Some(Instant::now());
+    asked.asks = asked.asks.saturating_add(1);
+    asked.on = Some((network, state.requested));
     let said = match ask(paths) {
-        Ok(0) => "waiting for an ALab member on this LAN".to_owned(),
-        Ok(heard) => format!("automatic LAN credential sync completed through {heard} member(s)"),
-        Err(error) => format!("automatic LAN credential sync will retry: {error}"),
+        Ok(0) => "asked ALab's members to let this Mac in: none answers on this network".to_owned(),
+        Ok(heard) => format!(
+            "asked ALab's members to let this Mac in: {heard} show its request; press Allow on any one"
+        ),
+        Err(error) => format!("asking ALab's members to let this Mac in failed: {error}"),
     };
     if said != asked.said {
         log(&said);
@@ -4296,45 +4818,116 @@ fn subscriber_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<
     };
     let bell = std::sync::Arc::new(crate::wake::Bell::default());
     let routes = crate::wake::hear_routes(&bell);
-    let watch = std::sync::OnceLock::new();
-    let found = |config: &Config| browsed(config, &bell, &watch);
+    let standing = StandingBrowse::default();
+    let found = PeerDiscovery::watching(&bell, &standing);
     let ask = |paths: &Paths| match ASK_MEMBERS.get() {
         Some(ask) => ask(paths),
         None => Err(Error::new("this program cannot reach ALab's members")),
     };
+    let hold = || standing.stop();
     let hearing = Hearing {
         found: &found,
         bell: &bell,
         routes,
         ask: &ask,
+        hold: &hold,
     };
     subscriber_loop_until(paths, log, &|| false, &converging, &hearing)
 }
 
-/// The ALab vault servers this Mac's standing browse found for `config`'s vault, `watch`, which
-/// starts the first time a pass of the ALab vault asks and then rings `bell` ([`Hearing`]); none
-/// for another vault. While it has heard none yet (it has just started, or this Mac is alone),
-/// a bounded browse's.
+/// The subscriber's standing `_alab-vault._tcp` browse (a `dns-sd -B` child, a Local Network
+/// use): started the first time a pass of the ALab vault asks ([`browsed`]), dropped while
+/// `[swarm] enabled` holds the rounds ([`Hearing::hold`]), and started afresh by the first pass
+/// once sharing is on again.
+#[derive(Default)]
+struct StandingBrowse {
+    watch: std::sync::Mutex<Option<std::sync::Arc<crate::discover::Watch>>>,
+}
+
+impl StandingBrowse {
+    /// The browse running now, `start`ed where none does.
+    fn watch_or_start(
+        &self,
+        start: impl FnOnce() -> crate::discover::Watch,
+    ) -> std::sync::Arc<crate::discover::Watch> {
+        std::sync::Arc::clone(
+            self.watch
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get_or_insert_with(|| std::sync::Arc::new(start())),
+        )
+    }
+
+    /// End the browse running now, if one does (dropping it kills its child).
+    fn stop(&self) {
+        drop(
+            self.watch
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+        );
+    }
+
+    /// Whether a browse runs now.
+    #[cfg(test)]
+    fn running(&self) -> bool {
+        self.watch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+}
+
+/// What runs once, at this process's subscriber's first Local Network use ([`on_lan_first_use`]).
+static LAN_FIRST_USE: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Whether this process's subscriber made a Local Network use yet ([`note_lan_use`]).
+static LAN_USED: AtomicBool = AtomicBool::new(false);
+
+/// Register what runs once, the first time this process's subscriber uses the local network (its
+/// `_alab-vault._tcp` browse), which puts macOS's Local Network question to aterm if nothing did
+/// before: aterm keeps that for this Mac and app, so a window's System State step reads the
+/// question as asked and raises no second hold. The first registration wins.
+pub fn on_lan_first_use(used: fn()) {
+    let _ = LAN_FIRST_USE.set(used);
+}
+
+/// Note this process's subscriber's Local Network use, running [`on_lan_first_use`]'s the first
+/// time.
+fn note_lan_use() {
+    if !LAN_USED.swap(true, Ordering::AcqRel)
+        && let Some(used) = LAN_FIRST_USE.get()
+    {
+        used();
+    }
+}
+
+/// The ALab vault servers this Mac's `standing` browse found for `config`'s vault, which starts
+/// the first time a pass of the ALab vault asks (and again after `[swarm]` held the rounds) and
+/// then rings `bell` ([`Hearing`]); none for another vault. While it has heard none yet (it has
+/// just started, or this Mac is alone), a bounded browse's.
 fn browsed(
     config: &Config,
     bell: &std::sync::Arc<crate::wake::Bell>,
-    watch: &std::sync::OnceLock<crate::discover::Watch>,
+    standing: &StandingBrowse,
 ) -> Vec<crate::discover::DiscoveredVault> {
     if !alab_vault(config) {
         return Vec::new();
     }
+    note_lan_use();
     // Every vault server it hears counts, this Mac's own included: the server here is one more
     // place this subscriber may read.
-    let watch = watch.get_or_init(|| crate::discover::Watch::start(bell, &[]));
+    let watch = standing.watch_or_start(|| crate::discover::Watch::start(bell, &[]));
     if watch.heard().is_empty() {
         return crate::discover::browse_alab(PROBE_DEADLINE).unwrap_or_default();
     }
     watch.found(PROBE_DEADLINE)
 }
 
-/// [`subscriber_loop`], ending at the top of a round once `stop` says so (a test's end), its
-/// converge runner started and its routes read through `converging`, its passes reading the
-/// vault servers `hearing` found, and its naps after an error ended by what `hearing` hears.
+/// [`subscriber_loop`], ending once `stop` says so (a test's end) at the top of a round or
+/// before the pause or nap that ends one, its converge runner started and its routes read
+/// through `converging`, its passes reading the vault servers `hearing` found, and its naps
+/// after an error ended by what `hearing` hears.
 fn subscriber_loop_until(
     paths: &Paths,
     log: &(dyn Fn(&str) + Sync),
@@ -4363,12 +4956,21 @@ fn subscriber_loop_until(
         }
     };
     let now_ms = || aterm_time::unix_millis().unwrap_or(0);
-    let due = converge.at_start(
-        now_ms(),
-        (converging.routes)(),
-        crate::converge::Last::of(runner.as_mut()),
-    );
-    converge_if(due, &mut runner);
+    // `[swarm] enabled = false` holds every round: no ask, long-poll, apply or converge pass
+    // until it is on again, looked at each [`SWARM_LOOK`] at the cost of one `stat`.
+    let mut swarm = crate::swarm::Switch::new(&paths.home);
+    let mut held = false;
+    if swarm_lets(&mut swarm, &mut held, "this subscriber", log) {
+        let due = converge.at_start(
+            now_ms(),
+            (converging.routes)(),
+            crate::converge::Last::of(runner.as_mut()),
+        );
+        converge_if(due, &mut runner);
+    } else {
+        // The first healthy pass once sharing is on starts it.
+        converge.failed();
+    }
     let mut members = MembersAsked::default();
     loop {
         if stop() {
@@ -4381,6 +4983,12 @@ fn subscriber_loop_until(
         if crate::server::replaced(program, stamp()) {
             log("this program was replaced on disk; exiting so the service starts the new one");
             return Ok(());
+        }
+        if !swarm_lets(&mut swarm, &mut held, "this subscriber", log) {
+            converge.failed();
+            (hearing.hold)();
+            std::thread::sleep(SWARM_LOOK);
+            continue;
         }
         // Whether or not the vault's source answers: the members on this LAN can let this Mac
         // in while it cannot be reached.
@@ -4425,9 +5033,18 @@ fn subscriber_loop_until(
                     crate::converge::Last::of(runner.as_mut()),
                 );
                 converge_if(due, &mut runner);
+                let requested = || load_state(paths).ok().map(|state| state.requested);
+                let before = requested();
                 ask_again_if_due(paths, &config, log);
+                let after = requested();
+                if after != before {
+                    members.asked_again(after);
+                }
                 // A verdict that ended the long-poll.
                 heed_verdict(paths, log);
+                if stop() {
+                    return Ok(());
+                }
                 let pause = pause_after(&config.source, &outcome, &mut failing, pass);
                 if failed_over_idle(pass) {
                     // The source is away and the servers found hold nothing newer: asked
@@ -4449,6 +5066,9 @@ fn subscriber_loop_until(
                 }
                 // The first healthy pass after this one starts a converge runner.
                 converge.failed();
+                if stop() {
+                    return Ok(());
+                }
                 let moved = nap_after_failing(hearing, routes, backoff, log);
                 // Until macOS lets aterm onto the LAN, asking again soon is what joins.
                 backoff = if error.kind() == crate::ErrorKind::LocalNetworkPending {
@@ -4568,7 +5188,7 @@ fn subscriber_pass_saying(
 const LONG_POLL: Duration = crate::server::DEFAULT_HOLD;
 
 /// How often a machine still waiting asks again ([`ask_again_if_due`]).
-const REASK: u64 = 30;
+const REASK: u64 = 60 * 60;
 
 /// How long a join has, from saving the vault, to post its own request ([`in_flight`]).
 const JOIN_GRACE: u64 = 5 * 60;
@@ -4578,7 +5198,7 @@ const JOIN_GRACE: u64 = 5 * 60;
 /// without the join's proof, would make the join's own request a change the server refuses for
 /// a while; a join cut off before it posts is asked for after the grace, not an hour on.
 fn in_flight() -> u64 {
-    now().saturating_add(JOIN_GRACE.saturating_sub(REASK))
+    now().saturating_sub(REASK - JOIN_GRACE)
 }
 
 fn ask_again_if_due(paths: &Paths, config: &Config, log: &dyn Fn(&str)) {
@@ -4595,7 +5215,7 @@ fn ask_again_if_due(paths: &Paths, config: &Config, log: &dyn Fn(&str)) {
         // post of the `Allowed` can miss.
         let waiting = state.membership == Stored::Pending
             || (state.membership == Stored::In && handover::holds_allowed(paths));
-        Ok((waiting && now() >= state.requested.saturating_add(REASK))
+        Ok((waiting && now().saturating_sub(state.requested) >= REASK)
             .then_some((current, state.proof)))
     };
     let Ok(Some((current, proof))) = due() else {
@@ -4612,8 +5232,9 @@ fn ask_again_if_due(paths: &Paths, config: &Config, log: &dyn Fn(&str)) {
 pub enum Approval {
     /// `password = …`: requests whose proof matches it.
     Password,
-    /// `open = yes`: LAN requests to the pinned default ALab vault, except `code-only` keys.
-    /// Other vaults still require a member's Allow.
+    /// `open = yes`, or its open note ([`text::OPEN_NOTE`]): requests to the pinned default ALab
+    /// vault its server observed on the home ALab LAN, where members answered, except
+    /// `code-only` keys ([`crate::home_lan`]). Other vaults still require a member's Allow.
     Open,
 }
 
@@ -4641,9 +5262,7 @@ fn admin_here(
     config: &Config,
     state: &State,
 ) -> crate::Result<Option<Option<Approval>>> {
-    Ok(admin_text_here(paths, config, state)?.map(|opened| {
-        Approval::of(&opened.doc).or_else(|| alab_vault(config).then_some(Approval::Open))
-    }))
+    Ok(admin_text_here(paths, config, state)?.map(|opened| Approval::of(&opened.doc)))
 }
 
 /// The admin text of the recorded vault from the local cache, when this machine is its admin.
@@ -4889,13 +5508,56 @@ pub enum HeldMend {
     /// while the mend judged it (an `on`, an `off`, a pin; [`crate::service::move_held`]), or,
     /// for the server, the system LaunchDaemon serves this Mac's vaults in its place.
     NotHeld,
-    /// Moved onto this aterm: the install's line.
-    Moved(String),
+    /// Moved onto this aterm, or (the ALab subscriber) installed on it where its job was missing:
+    /// the install's line, and why.
+    Moved(String, HeldMoved),
     /// Left on the program it holds, and why.
     Kept(HeldKept),
     /// Not judged now, and why: this Mac's vault state is being changed, or cannot be read. The
     /// next mend reads it again.
     Unread(String),
+}
+
+/// Why a vault job runs this aterm now ([`HeldMend::Moved`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeldMoved {
+    /// An ALab server older than [`steward::FLUID_SERVER_MIN_RELEASE`], whose store holds the ALab
+    /// vault (`DESIGN-fluid-swarm` §4.3 step 1).
+    FluidServer,
+    /// An unpinned ALab server or subscriber held on an older release or another copy of this
+    /// one: from [`ALAB_MANAGED_JOB_RELEASE`] ALab's jobs follow the installed release, so an old
+    /// but healthy job cannot hold back automatic LAN admission.
+    ManagedRelease,
+    /// On the ALab vault's admin Mac, an approver older than [`ALLOWED_APPROVER_MIN_RELEASE`],
+    /// which admits by `open` and drops a request a member Allowed.
+    OpenApprover,
+    /// A program older than the first release that reads the admin locker this Mac holds.
+    Locker,
+    /// Nothing was held: the ALab subscriber's job was missing, and [`mend_subscriber`]
+    /// installed it.
+    Missing,
+}
+
+impl HeldMoved {
+    /// Why the job runs this aterm now, as a clause for the window's log.
+    #[must_use]
+    pub const fn why(self) -> &'static str {
+        match self {
+            Self::FluidServer => {
+                "it ran an ALab server older than 0.146, which neither pulls from the other \
+                 servers nor hands the alab-secrets name on"
+            }
+            Self::ManagedRelease => {
+                "it ran an older copy of aterm, and ALab's jobs follow the installed release"
+            }
+            Self::OpenApprover => {
+                "it ran an ALab approver older than 0.146, which admits every Mac that asks and \
+                 drops each request a member Allowed"
+            }
+            Self::Locker => "it ran an aterm that cannot read the vault's admin locker",
+            Self::Missing => "its job was missing",
+        }
+    }
 }
 
 /// Why a held job stays where it is ([`HeldMend::Kept`]).
@@ -5001,6 +5663,7 @@ fn mend_held_with(
     move_it: &mut dyn FnMut(Option<&str>) -> crate::Result<Option<String>>,
 ) -> crate::Result<HeldMend> {
     let kept = |why| Ok(HeldMend::Kept(why));
+    let moved = |why: HeldMoved| move |line: String| HeldMend::Moved(line, why);
     let mut checked_move = |watch| {
         let program =
             destination.ok_or_else(|| Error::new("no lasting service destination is available"))?;
@@ -5033,9 +5696,12 @@ fn mend_held_with(
                 if version < steward::FLUID_SERVER_MIN_RELEASE
                     || held_alab_release_due(own, version) =>
             {
-                return Ok(
-                    checked_move(Some(url.as_str()))?.map_or(HeldMend::NotHeld, HeldMend::Moved)
-                );
+                let why = if version < steward::FLUID_SERVER_MIN_RELEASE {
+                    HeldMoved::FluidServer
+                } else {
+                    HeldMoved::ManagedRelease
+                };
+                return Ok(checked_move(Some(url.as_str()))?.map_or(HeldMend::NotHeld, moved(why)));
             }
             Ok(_) => {}
         }
@@ -5053,7 +5719,9 @@ fn mend_held_with(
         match release_of(&held.program) {
             Err(why) => return kept(HeldKept::Unknown(why)),
             Ok(version) if held_alab_release_due(own, version) => {
-                return Ok(checked_move(None)?.map_or(HeldMend::NotHeld, HeldMend::Moved));
+                return Ok(
+                    checked_move(None)?.map_or(HeldMend::NotHeld, moved(HeldMoved::ManagedRelease))
+                );
             }
             Ok(_) => {}
         }
@@ -5074,7 +5742,9 @@ fn mend_held_with(
         match release_of(&held.program) {
             Err(why) => return kept(HeldKept::Unknown(why)),
             Ok(version) if version < ALLOWED_APPROVER_MIN_RELEASE => {
-                return Ok(checked_move(None)?.map_or(HeldMend::NotHeld, HeldMend::Moved));
+                return Ok(
+                    checked_move(None)?.map_or(HeldMend::NotHeld, moved(HeldMoved::OpenApprover))
+                );
             }
             Ok(_) => {}
         }
@@ -5085,7 +5755,7 @@ fn mend_held_with(
     match release_of(&held.program) {
         Err(why) => kept(HeldKept::Unknown(why)),
         Ok(version) if version >= need => kept(HeldKept::Reads),
-        Ok(_) => Ok(checked_move(None)?.map_or(HeldMend::NotHeld, HeldMend::Moved)),
+        Ok(_) => Ok(checked_move(None)?.map_or(HeldMend::NotHeld, moved(HeldMoved::Locker))),
     }
 }
 
@@ -5115,7 +5785,13 @@ fn approver_loop_napping(
     if let Err(error) = clear_dead_stuck(paths) {
         log(&format!("could not clear old approver records: {error}"));
     }
+    let mut swarm = crate::swarm::Switch::new(&paths.home);
+    let mut held = false;
     while !stop.load(Ordering::Relaxed) {
+        if !swarm_lets(&mut swarm, &mut held, "the approver", log) {
+            nap_unless(stop, SWARM_LOOK, REST_LOOK, &|| false);
+            continue;
+        }
         let pause = approver_pass(paths, log, &mut approver);
         if !pause.is_zero() {
             nap(pause);
@@ -5128,12 +5804,15 @@ fn approver_loop_napping(
 const JOINS_WAIT: Duration = crate::server::DEFAULT_HOLD;
 
 /// The join queue as an approver last heard it: where, the version the server named (`None`:
-/// a server that names none, polled), and its lines.
+/// a server that names none, polled), its lines, and the address of the server that answered
+/// (`None`: not known), whose `home=` words count only where this Mac reaches it at home
+/// ([`crate::home_lan::Place::serving`]).
 #[derive(Default)]
 struct Heard {
     url: String,
     version: Option<u64>,
     lines: Vec<String>,
+    from: Option<std::net::IpAddr>,
 }
 
 /// The join queue of the vault at `config`'s URL, long-polled past the version `heard` holds
@@ -5144,16 +5823,17 @@ fn hear_joins(config: &Config, heard: &mut Heard) -> crate::Result<(Vec<String>,
         return Ok((Vec::new(), true));
     };
     let after = heard.version.filter(|_| heard.url == *url);
-    match transport::wait_joins(url, after, JOINS_WAIT) {
-        Ok(transport::Joins::Listed(lines, version)) => {
+    match transport::wait_joins_from(url, after, JOINS_WAIT) {
+        Ok((transport::Joins::Listed(lines, version), from)) => {
             *heard = Heard {
                 url: url.clone(),
                 version,
                 lines: lines.clone(),
+                from,
             };
             Ok((lines, true))
         }
-        Ok(transport::Joins::Unchanged) => Ok((heard.lines.clone(), false)),
+        Ok((transport::Joins::Unchanged, _)) => Ok((heard.lines.clone(), false)),
         Err(error) => {
             // Read plainly next: a server put back by an older one refuses the long-poll.
             heard.version = None;
@@ -5162,12 +5842,14 @@ fn hear_joins(config: &Config, heard: &mut Heard) -> crate::Result<(Vec<String>,
     }
 }
 
-/// What a judged approver pass read: the vault version, the requests, and those of them the vault
-/// answered as they stand ([`still_answered`]).
+/// What a judged approver pass read: the vault version, the requests, those of them the vault
+/// answered as they stand ([`still_answered`]), and the home ALab LAN networks this Mac was on
+/// ([`crate::home_lan`]).
 type Listed = (
     u64,
     std::collections::BTreeSet<Judged>,
     std::collections::BTreeSet<Answered>,
+    Vec<crate::home_lan::HomeTag>,
 );
 
 /// The requests in `pending` the vault answered as they stand ([`Answered`]). One whose time the
@@ -5269,6 +5951,10 @@ fn stayed_named(
 struct Approver {
     settled: Settled,
     checked: Option<ApprovalCheck>,
+    release_migration: release_migration::Rounds,
+    /// Writes the ALab vault's `open = yes` line as its open note ([`open_migration`]).
+    open_migration: open_migration::Rounds,
+    account_upkeep_at: Option<Instant>,
     /// What the last judged pass read ([`Listed`]).
     listed: Option<Listed>,
     /// What [`write_asking`] last wrote.
@@ -5308,6 +5994,46 @@ struct Approver {
     heard: Heard,
     /// The key the vault's join password stretches to ([`JoinKeys`]).
     keys: JoinKeys,
+}
+
+type AccountUpkeep = fn(&Paths, &Admin, Instant) -> crate::Result<usize>;
+static ACCOUNT_UPKEEP: std::sync::OnceLock<AccountUpkeep> = std::sync::OnceLock::new();
+
+/// Install the executable's account application maintenance. The normal
+/// approver invokes it only after opening current local root authority.
+pub fn on_account_upkeep(upkeep: AccountUpkeep) {
+    let _ = ACCOUNT_UPKEEP.set(upkeep);
+}
+
+fn account_upkeep(
+    paths: &Paths,
+    config: &Config,
+    seq: u64,
+    at: &mut Option<Instant>,
+    log: &dyn Fn(&str),
+) {
+    let Some(upkeep) = ACCOUNT_UPKEEP.get() else {
+        return;
+    };
+    if at.is_some_and(|at| at.elapsed() < Duration::from_secs(2))
+        || crate::service::subscriber_turned_off(&paths.home)
+    {
+        return;
+    }
+    *at = Some(Instant::now());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let result = enrollment::admin_cached_until(paths, deadline).and_then(|admin| {
+        if admin.config != *config || admin.seq != seq {
+            return Err(Error::new("account upkeep authority changed"));
+        }
+        if crate::service::subscriber_turned_off(&paths.home) {
+            return Ok(0);
+        }
+        upkeep(paths, &admin, deadline)
+    });
+    if let Err(error) = result {
+        log(&format!("shared account upkeep: {error}"));
+    }
 }
 
 /// The key a vault's join password stretches to, kept from one approver pass to the next while
@@ -5492,6 +6218,22 @@ fn remove_stuck(path: &Path) -> crate::Result<()> {
 
 /// Remove the records of approvers that are gone, and one an earlier process with this pid left.
 fn clear_dead_stuck(paths: &Paths) -> crate::Result<()> {
+    match fsx::kind(&paths.dir)? {
+        fsx::Kind::Missing => return Ok(()),
+        fsx::Kind::Dir => {}
+        fsx::Kind::Symlink => {
+            return Err(Error::new(format!(
+                "{}: is a symlink; refusing to keep secrets through it",
+                paths.dir.display()
+            )));
+        }
+        fsx::Kind::File | fsx::Kind::Other => {
+            return Err(Error::new(format!(
+                "{}: not a directory",
+                paths.dir.display()
+            )));
+        }
+    }
     let entries = match std::fs::read_dir(&paths.dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -5502,6 +6244,7 @@ fn clear_dead_stuck(paths: &Paths) -> crate::Result<()> {
         let Some(pid) = name
             .to_str()
             .and_then(|name| name.strip_prefix(STUCK_PREFIX))
+            .filter(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
             .and_then(|pid| pid.parse::<u32>().ok())
         else {
             continue;
@@ -5546,6 +6289,12 @@ fn approver_pass(paths: &Paths, log: &dyn Fn(&str), approver: &mut Approver) -> 
             return Duration::from_secs(2);
         }
     };
+    if approver.release_migration.step(paths, &config, seq, log)
+        || approver.open_migration.step(paths, &config, seq, log)
+    {
+        return Duration::ZERO;
+    }
+    account_upkeep(paths, &config, seq, &mut approver.account_upkeep_at, log);
     let (pending, moved) = match hear_joins(&config, &mut approver.heard) {
         Ok((lines, moved)) => (requests_in(lines, &[]), moved),
         Err(error) => {
@@ -5558,15 +6307,23 @@ fn approver_pass(paths: &Paths, log: &dyn Fn(&str), approver: &mut Approver) -> 
         }
     };
     let by = match approval {
-        _ if alab_vault(&config) => "by the default ALab LAN policy",
         Some(Approval::Password) => "by the join password",
+        Some(Approval::Open) if alab_vault(&config) => "by the default ALab home-LAN policy",
         Some(Approval::Open) | None => ALLOWED_BY,
     };
+    // The home ALab LAN networks this Mac is on now and reaches the server through: a request
+    // that server observed on one of them is the one the default ALab policy lets in, so a move
+    // onto or off it is judged anew. A server reached by a route, or not known, observed nothing
+    // this Mac stands behind.
+    let here = approver.heard.from.map_or_else(Vec::new, |from| {
+        crate::home_lan::Place::serving(&crate::home_lan::Live::new(paths.clone()), from)
+    });
     let judged: std::collections::BTreeSet<Judged> = pending.iter().map(Judged::of).collect();
     let listed = (
         seq,
         judged.clone(),
         still_answered(&pending, &approver.answered),
+        here.clone(),
     );
     let due =
         approval.is_some_and(|approval| approver.settled.due(&config, seq, &pending, approval));
@@ -5611,14 +6368,19 @@ fn approver_pass(paths: &Paths, log: &dyn Fn(&str), approver: &mut Approver) -> 
                 &pending,
                 &mut publishing,
                 &mut answered,
-                keys,
+                (keys, &here),
             )
         });
         match done {
             Ok(mut done) => {
                 approver.keep_answered(paths, log, answered, queue, seen, seq);
                 // Read against the record this pass left, so the next pass rests.
-                approver.listed = Some((seq, judged, still_answered(&pending, &approver.answered)));
+                approver.listed = Some((
+                    seq,
+                    judged,
+                    still_answered(&pending, &approver.answered),
+                    here,
+                ));
                 approver.tell(paths, log, std::mem::take(&mut done.asking));
                 for line in approved_lines(&done, by) {
                     log(&line);
@@ -5677,8 +6439,8 @@ pub struct Judged {
     pub proof: Option<String>,
     /// The member's Allow it carried, if any.
     pub allowed: Option<String>,
-    /// Whether the serving vault observed a LAN source for this request.
-    pub lan: bool,
+    /// The home ALab LAN the serving vault observed it on, if any.
+    pub home: Option<crate::home_lan::HomeTag>,
 }
 
 impl Judged {
@@ -5688,7 +6450,7 @@ impl Judged {
             host: request.host.clone(),
             proof: request.proof.clone(),
             allowed: request.allowed.clone(),
-            lan: request.lan,
+            home: request.home.clone(),
         }
     }
 }
@@ -5732,7 +6494,7 @@ impl Settled {
 const ALLOWED_BY: &str = "by a member's Allow";
 
 /// The approver's log lines for the machines `done` added: those a member's Allow let in apart
-/// from the rest, which `by` names (the join password or default ALab LAN policy).
+/// from the rest, which `by` names (the join password or default ALab home-LAN policy).
 fn approved_lines(done: &AutoApproved, by: &str) -> Vec<String> {
     let (allowed, rest): (Vec<&str>, Vec<&str>) = done
         .approved
@@ -5790,7 +6552,10 @@ pub fn test_auto_approve_alab_lan(paths: &Paths) -> crate::Result<AutoApproved> 
         &pending,
         &mut false,
         &mut read_answered(paths).answered,
-        &mut JoinKeys::default(),
+        (
+            &mut JoinKeys::default(),
+            &[crate::home_lan::HomeTag::test()],
+        ),
         true,
     )
 }
@@ -5802,14 +6567,17 @@ fn auto_approve_opened(
     publishing: &mut bool,
     answered: &mut std::collections::BTreeSet<Answered>,
 ) -> crate::Result<AutoApproved> {
-    let pending = requests_for(&admin.config, None)?;
+    let (pending, from) = requests_from(&admin.config)?;
+    let here = from.map_or_else(Vec::new, |from| {
+        crate::home_lan::Place::serving(&crate::home_lan::Live::new(paths.clone()), from)
+    });
     auto_approve_listed(
         paths,
         admin,
         &pending,
         publishing,
         answered,
-        &mut JoinKeys::default(),
+        (&mut JoinKeys::default(), &here),
     )
 }
 
@@ -5856,14 +6624,15 @@ fn allowed_by_roster(
 /// `answered` from a key no longer in the vault is judged and left alone: no approval, no
 /// refusal, no ask. On success `answered` holds the requests the vault has answered now: those
 /// of keys in the vault (this pass's approvals included), and those it held before that are
-/// still queued. The join password's key comes from `keys`.
+/// still queued. The join password's key comes from `keys`; `here` names the home ALab LAN
+/// networks this Mac is on now ([`crate::home_lan::Place::here`]).
 fn auto_approve_listed(
     paths: &Paths,
     admin: &Admin,
     pending: &[Request],
     publishing: &mut bool,
     answered: &mut std::collections::BTreeSet<Answered>,
-    keys: &mut JoinKeys,
+    keys_here: (&mut JoinKeys, &[crate::home_lan::HomeTag]),
 ) -> crate::Result<AutoApproved> {
     auto_approve_listed_in(
         paths,
@@ -5871,18 +6640,23 @@ fn auto_approve_listed(
         pending,
         publishing,
         answered,
-        keys,
+        keys_here,
         alab_vault(&admin.config),
     )
 }
 
+/// [`auto_approve_listed`] with the pinned ALab vault's own policy on (`default_alab`) or off.
+/// The default ALab policy lets a request in with no person only where its server observed it
+/// on a home ALab LAN network this Mac is on now too (`here`): an older server's `lan=1`, a
+/// request heard on a hotspot or a café, and one heard on a network this approver is not on
+/// all wait for a member's Allow.
 fn auto_approve_listed_in(
     paths: &Paths,
     admin: &Admin,
     pending: &[Request],
     publishing: &mut bool,
     answered: &mut std::collections::BTreeSet<Answered>,
-    keys: &mut JoinKeys,
+    (keys, here): (&mut JoinKeys, &[crate::home_lan::HomeTag]),
     default_alab: bool,
 ) -> crate::Result<AutoApproved> {
     let mut done = AutoApproved::default();
@@ -5974,9 +6748,8 @@ fn auto_approve_listed_in(
                     &request,
                 )
             });
-        let lan = default_alab && request.lan && !code_only.contains(&request.recipient);
         let approval = policy.filter(|approval| approval.reads(&request));
-        if !allowed && !lan && approval.is_none() {
+        if !allowed && approval.is_none() {
             if !members.contains(&request.recipient) {
                 done.asking.push(Asking::of(&request));
             }
@@ -5986,7 +6759,14 @@ fn auto_approve_listed_in(
         if !members.contains(&request.recipient) {
             let method = if allowed {
                 Some(AdmissionMethod::Manual)
-            } else if lan {
+            } else if default_alab
+                && approval == Some(Approval::Open)
+                && request
+                    .home
+                    .as_ref()
+                    .is_some_and(|home| here.contains(home))
+                && !code_only.contains(&request.recipient)
+            {
                 Some(AdmissionMethod::Open)
             } else if approval == Some(Approval::Password)
                 && key.zip(request.proof.as_ref()).is_some_and(|(key, proof)| {
@@ -6237,6 +7017,7 @@ fn read_answered(paths: &Paths) -> AnsweredRecord {
     let judged = queue
         .lines()
         .find_map(|line| line.strip_prefix(ANSWERED_JUDGED))
+        .filter(|seq| !seq.is_empty() && seq.bytes().all(|b| b.is_ascii_digit()))
         .and_then(|seq| seq.parse().ok());
     AnsweredRecord {
         answered: answered_lines(&requests),
@@ -6255,7 +7036,11 @@ fn answered_lines(text: &str) -> std::collections::BTreeSet<Answered> {
         .filter_map(|line| {
             let mut words = line.splitn(3, '\t');
             let (recipient, at, host) = (words.next()?, words.next()?, words.next()?);
-            (recipient.starts_with("age1") && !host.is_empty()).then_some(())?;
+            (recipient.starts_with("age1")
+                && !host.is_empty()
+                && !at.is_empty()
+                && at.bytes().all(|b| b.is_ascii_digit()))
+            .then_some(())?;
             Some(Answered {
                 recipient: recipient.to_owned(),
                 host: host.to_owned(),
@@ -6293,6 +7078,7 @@ fn answered_lines(text: &str) -> std::collections::BTreeSet<Answered> {
         let mut words = line.split('\t');
         let Some(index) = words
             .next()
+            .filter(|index| !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()))
             .and_then(|index| index.parse::<usize>().ok())
             .filter(|index| *index < ANSWERED_MOST)
         else {
@@ -6471,11 +7257,17 @@ fn approver_named() -> String {
 /// with that start, or with only a pid named, that pid.
 fn approver_runs(named: &str) -> bool {
     let (pid, birth) = named.split_once('@').unwrap_or((named, ""));
+    if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
     let Ok(pid) = pid.parse::<u32>() else {
         return false;
     };
     if birth.is_empty() {
         return aterm_uds::process::pid_alive(pid);
+    }
+    if !birth.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
     }
     let Ok(birth) = birth.parse::<u64>() else {
         return false;
@@ -6977,13 +7769,23 @@ fn request_join(
     proof: Option<String>,
     asker: Asker,
 ) -> crate::Result<String> {
+    request_join_until(paths, config, proof, asker, None)
+}
+
+fn request_join_until(
+    paths: &Paths,
+    config: &Config,
+    proof: Option<String>,
+    asker: Asker,
+    deadline: Option<Instant>,
+) -> crate::Result<String> {
     let identity = machine_identity(paths)?;
     let recipient = identity.recipient();
     let code = join_code(&recipient);
     // A join keeps its new proof before it asks: a request cut short (no answer, an interrupt,
     // the change gap's pause) leaves the proof the next ask sends, never the one before it.
     if asker == Asker::Join {
-        change_request(paths, config, |state| {
+        change_request_until(paths, config, deadline, |state| {
             if state.proof != proof {
                 state.refused = None;
             }
@@ -6995,7 +7797,7 @@ fn request_join(
         })?;
     }
     let posted = match &config.source {
-        Source::Url(url) => {
+        Source::Url(_) => {
             let mut line = format!("{} {} {code}", recipient.to_bech32(), config.host);
             if let Some(allowed) = handover::stored_allowed(paths) {
                 line.push_str(&format!(" allowed={allowed}"));
@@ -7003,13 +7805,13 @@ fn request_join(
             if let Some(proof) = &proof {
                 line.push_str(&format!(" proof={proof}"));
             }
-            transport::post_join(url, &line)
+            join_routing::post(paths, config, &line, deadline)
         }
         Source::Path(_) => Ok(()),
     };
     let queued = posted.is_ok();
     // Only while the proof sent is still this machine's (a later join may have changed it).
-    let recorded = change_request(paths, config, |state| {
+    let recorded = change_request_until(paths, config, deadline, |state| {
         if state.proof != proof {
             return false;
         }
@@ -7024,7 +7826,16 @@ fn change_request(
     config: &Config,
     change: impl FnOnce(&mut State) -> bool,
 ) -> crate::Result<()> {
-    let _lock = StateLock::take(paths)?;
+    change_request_until(paths, config, None, change)
+}
+
+fn change_request_until(
+    paths: &Paths,
+    config: &Config,
+    deadline: Option<Instant>,
+    change: impl FnOnce(&mut State) -> bool,
+) -> crate::Result<()> {
+    let _lock = bounded::take(paths, deadline)?;
     let current = self::config(paths)?;
     if current
         .as_ref()
@@ -7107,6 +7918,16 @@ fn join_with(
     expected: ExpectedConfig<'_>,
     fetch: impl FnOnce(&Source) -> crate::Result<Fetched>,
 ) -> crate::Result<JoinOutcome> {
+    join_with_until(paths, options, expected, fetch, None)
+}
+
+fn join_with_until(
+    paths: &Paths,
+    options: &JoinOptions<'_>,
+    expected: ExpectedConfig<'_>,
+    fetch: impl FnOnce(&Source) -> crate::Result<Fetched>,
+    deadline: Option<Instant>,
+) -> crate::Result<JoinOutcome> {
     let typed = options.source.trim();
     let typed = if typed.is_empty() {
         crate::ALAB_DEFAULT_URL
@@ -7184,7 +8005,7 @@ fn join_with(
         };
         plain_entries(&config, path)?;
         let identity = {
-            let _lock = StateLock::take(paths)?;
+            let _lock = bounded::take(paths, deadline)?;
             creation::permit_join(paths)?;
             expected.check(paths)?;
             let identity = machine_identity(paths)?;
@@ -7198,7 +8019,10 @@ fn join_with(
             identity
         };
         announce(&identity);
-        sync(paths, None)?;
+        match deadline {
+            Some(deadline) => sync_reader_until(paths, deadline)?,
+            None => sync(paths, None)?,
+        };
         return Ok(JoinOutcome::Plain {
             names: load_state(paths)?.manifest.files.keys().cloned().collect(),
         });
@@ -7247,7 +8071,7 @@ fn join_with(
         host: host.clone(),
     };
     let identity = {
-        let _lock = StateLock::take(paths)?;
+        let _lock = bounded::take(paths, deadline)?;
         creation::permit_join(paths)?;
         expected.check(paths)?;
         let identity = machine_identity(paths)?;
@@ -7278,8 +8102,19 @@ fn join_with(
     let recipient_text = identity.recipient().to_bech32();
     let code = join_code(&identity.recipient());
     // The envelope just verified is the version this join applies: no second fetch.
-    let synced = sync_with(paths, bytes).inspect_err(|_| {
-        let _ = change_request(paths, &config, |state| {
+    let synced = match deadline {
+        Some(deadline) => apply_fetched_until(
+            paths,
+            configured(paths)?,
+            load_state(paths)?,
+            Fetched::Body(bytes),
+            None,
+            Some(deadline),
+        ),
+        None => sync_with(paths, bytes),
+    }
+    .inspect_err(|_| {
+        let _ = change_request_until(paths, &config, deadline, |state| {
             state.requested = 0;
             true
         });
@@ -7309,7 +8144,7 @@ fn join_with(
                 (None, JoinPassword::Given(_)) => None,
             };
             by_password = key.is_some();
-            request_join(paths, &config, key.map(prove), Asker::Join)?;
+            request_join_until(paths, &config, key.map(prove), Asker::Join, deadline)?;
             (options.say)(&JoinEvent::Asked {
                 vault: &name,
                 code: &code,
@@ -7320,7 +8155,7 @@ fn join_with(
             }
         }
         Source::Path(_) => {
-            let _lock = StateLock::take(paths)?;
+            let _lock = bounded::take(paths, deadline)?;
             let mut state = load_state(paths)?;
             state.membership = Stored::Pending;
             save_state(paths, &state)?;
@@ -7334,7 +8169,7 @@ fn join_with(
     (options.requested)();
     if !options.wait.is_zero() {
         (options.say)(&JoinEvent::Waiting);
-        let deadline = Instant::now() + options.wait;
+        let deadline = Instant::now() + options.wait.min(Duration::from_secs(365 * 24 * 60 * 60));
         let mut pause = Duration::ZERO;
         while Instant::now() < deadline {
             // An admin Mac's verdict (which also ends the server's long-poll): a refused
@@ -7806,7 +8641,13 @@ pub fn admin_open_with_candidates(paths: &Paths, extra_urls: &[String]) -> crate
         .map(|bytes| bytes.as_slice().to_vec())
         .filter(|bytes| verifies(bytes));
     let mut primary_reachable = true;
-    let served = match transport::fetch(&config.source, None, Duration::from_secs(30)) {
+    // Every read here names this Mac's recipient, as sync's do: a server's heard history then
+    // counts it as the member it is, never as a plain read a `0.145` Mac may have made, which
+    // would keep the F20 mirror on while an admin opens the vault routinely (the approver's pass,
+    // the ALab release check, the steward's lease).
+    let reader = subscriber_recipient(paths);
+    let reader = reader.as_deref();
+    let served = match transport::fetch_as(&config.source, None, Duration::from_secs(30), reader) {
         Ok(Fetched::Body(bytes)) => {
             let mut chosen = bytes;
             if matches!(config.source, Source::Url(_))
@@ -7821,9 +8662,12 @@ pub fn admin_open_with_candidates(paths: &Paths, extra_urls: &[String]) -> crate
                     .into_iter()
                     .skip(1)
                 {
-                    if let Ok(Fetched::Body(cand_bytes)) =
-                        transport::fetch_within(&url, None, servers_within(PROBE_DEADLINE))
-                        && verifies(&cand_bytes)
+                    if let Ok(Fetched::Body(cand_bytes)) = transport::fetch_within_as(
+                        &url,
+                        None,
+                        servers_within(PROBE_DEADLINE),
+                        reader,
+                    ) && verifies(&cand_bytes)
                         && let Ok(cand_env) = envelope::parse(&cand_bytes)
                         && cand_env.seq > best_seq
                         && (cand_env.parents.is_empty()
@@ -7843,9 +8687,12 @@ pub fn admin_open_with_candidates(paths: &Paths, extra_urls: &[String]) -> crate
                     .into_iter()
                     .skip(1)
                 {
-                    if let Ok(Fetched::Body(cand_bytes)) =
-                        transport::fetch_within(&url, None, servers_within(PROBE_DEADLINE))
-                        && verifies(&cand_bytes)
+                    if let Ok(Fetched::Body(cand_bytes)) = transport::fetch_within_as(
+                        &url,
+                        None,
+                        servers_within(PROBE_DEADLINE),
+                        reader,
+                    ) && verifies(&cand_bytes)
                         && let Some(cand_seq) = seq_of(&cand_bytes)
                         && best.as_ref().is_none_or(|(s, _)| cand_seq > *s)
                     {
@@ -7866,7 +8713,7 @@ pub fn admin_open_with_candidates(paths: &Paths, extra_urls: &[String]) -> crate
                 .skip(1)
             {
                 if let Ok(Fetched::Body(cand_bytes)) =
-                    transport::fetch_within(&url, None, servers_within(PROBE_DEADLINE))
+                    transport::fetch_within_as(&url, None, servers_within(PROBE_DEADLINE), reader)
                     && verifies(&cand_bytes)
                     && let Some(cand_seq) = seq_of(&cand_bytes)
                     && best.as_ref().is_none_or(|(s, _)| cand_seq > *s)
@@ -8063,6 +8910,7 @@ fn admin_base(
     {
         let mut overlaid = doc.clone();
         if !log.removes(&identity.recipient())
+            && !log_entries::recipient_denied_by_roster_or_log(None, log, &identity.recipient())
             && !log.audience_left_out_recipient(
                 &crate::membership_log::EpochAudience::Everyone,
                 &identity.recipient(),
@@ -8082,20 +8930,23 @@ fn admin_base(
         }
     } else if base == log_entries::LogBase::Unstamped
         && let Some((log, _)) = &seeded
-        && !log.removes(&identity.recipient())
-        && !log.audience_left_out_recipient(
-            &crate::membership_log::EpochAudience::Everyone,
-            &identity.recipient(),
-        )
     {
         let mut overlaid = doc.clone();
-        if log_entries::overlay_log_commons_onto_document(log, identity, &mut overlaid).is_ok()
+        if !log.removes(&identity.recipient())
+            && !log_entries::recipient_denied_by_roster_or_log(None, log, &identity.recipient())
+            && !log.audience_left_out_recipient(
+                &crate::membership_log::EpochAudience::Everyone,
+                &identity.recipient(),
+            )
+            && log_entries::overlay_log_commons_onto_document(log, identity, &mut overlaid).is_ok()
             && admin_keys::validate_commons(&overlaid, &opened.commons_seed).is_ok()
             && let Ok(next_admissions) = opened.admissions.retained(&overlaid)
             && next_admissions.validate(&overlaid, envelope.seq).is_ok()
         {
             *doc = overlaid;
             *admissions = next_admissions;
+        } else {
+            return log_entries::LogBase::Behind;
         }
     }
     base
@@ -8371,7 +9222,7 @@ pub fn admin_publish_with_candidates(
     doc: &Document,
     extra_urls: &[String],
 ) -> crate::Result<Published> {
-    publish_as_with(paths, admin, doc, false, &[], false, extra_urls, None)
+    publish_as_with(paths, admin, doc, false, &[], false, extra_urls, None, None)
 }
 
 #[cfg(test)]
@@ -8381,7 +9232,7 @@ fn admin_publish_found(
     doc: &Document,
     found: Found<'_>,
 ) -> crate::Result<Published> {
-    publish_as_with(paths, admin, doc, false, &[], false, &[], Some(found))
+    publish_as_with(paths, admin, doc, false, &[], false, &[], Some(found), None)
 }
 
 /// [`admin_publish`] for a revoke that ran [`custody_readable`] before its permanent Commons
@@ -8546,6 +9397,7 @@ fn publish_as(
         custody_checked,
         &[],
         None,
+        None,
     )
 }
 
@@ -8562,7 +9414,9 @@ fn publish_as_with(
     custody_checked: bool,
     extra_urls: &[String],
     found: Option<Found<'_>>,
+    deadline: Option<Instant>,
 ) -> crate::Result<Published> {
+    publication_current(deadline)?;
     admin_keys::validate_commons_transition(&admin.published_doc, doc)?;
     if !custody_checked {
         custody_readable(paths, admin)?;
@@ -8602,7 +9456,7 @@ fn publish_as_with(
     // are kept once a server took the envelope, so a refused publish leaves nothing behind.
     let drafted = match admin.log_base {
         log_entries::LogBase::Covers | log_entries::LogBase::Unstamped => {
-            log_entries::draft_document_diff(
+            log_entries::draft_document_diff_until(
                 paths,
                 &admin.config,
                 &envelope::signer_public(&admin.seed)?,
@@ -8616,6 +9470,7 @@ fn publish_as_with(
                         .then_some(&admin.published_doc),
                     resolve: Some(&admin.resolve),
                 },
+                deadline,
             )
             .ok()
             .flatten()
@@ -8675,21 +9530,33 @@ fn publish_as_with(
     // envelope that stamps them: one stored by a publish that never got to keep them (the process
     // ended, every reply was lost) names records nobody else has, and its writer takes them in from
     // this hold when it next reads that version (`log_entries::adopt_held_draft`).
+    publication_current(deadline)?;
     if let Some(drafted) = &drafted {
         log_entries::hold_drafted(paths, drafted)?;
     }
+    publication_current(deadline)?;
     let local = match &admin.config.source {
         Source::Url(_) => {
+            let bounded_found = PeerDiscovery::empty();
             let urls = ledger_publish::publish_candidate_urls(
                 paths,
                 &admin.config,
                 &admin.published_doc,
                 doc,
                 extra_urls,
-                found,
+                if deadline.is_some() {
+                    Some(&bounded_found)
+                } else {
+                    found
+                },
             );
-            let outcomes =
-                ledger_publish::publish_to_servers_for_admin(paths, &admin.config, &urls, &bytes)?;
+            let outcomes = ledger_publish::publish_to_servers_for_admin_until(
+                paths,
+                &admin.config,
+                &urls,
+                &bytes,
+                deadline,
+            )?;
             #[cfg(test)]
             if CUT_AFTER_STORE.with(std::cell::Cell::take) {
                 return Err(Error::new(
@@ -8726,17 +9593,22 @@ fn publish_as_with(
                     .unwrap_or_else(|| Error::new("no candidate server accepted the publish")));
             }
             if let Some(drafted) = &drafted {
-                log_entries::keep_drafted(paths, drafted, &urls)?;
+                log_entries::keep_drafted_until(paths, drafted, &urls, deadline)?;
                 log_entries::forget_held_draft(paths);
             }
-            sync_without_reconcile(paths, &urls)
-                .err()
-                .map(|error| error.to_string())
+            match deadline {
+                Some(deadline) => sync_reader_until(paths, deadline)
+                    .err()
+                    .map(|error| error.to_string()),
+                None => sync_without_reconcile(paths, &urls)
+                    .err()
+                    .map(|error| error.to_string()),
+            }
         }
         Source::Path(_) => {
             {
-                let _lock = configured_admin(paths, &admin.config)?;
-                let published = transport::publish(&admin.config.source, &bytes);
+                let _lock = configured_admin_until(paths, &admin.config, deadline)?;
+                let published = transport::publish_until(&admin.config.source, &bytes, deadline);
                 if published.as_ref().is_err_and(|err| {
                     matches!(
                         err.kind(),
@@ -8748,10 +9620,15 @@ fn publish_as_with(
                 published?;
             }
             if let Some(drafted) = &drafted {
-                log_entries::keep_drafted(paths, drafted, &[])?;
+                log_entries::keep_drafted_until(paths, drafted, &[], deadline)?;
                 log_entries::forget_held_draft(paths);
             }
-            sync(paths, None).err().map(|error| error.to_string())
+            match deadline {
+                Some(deadline) => sync_reader_until(paths, deadline)
+                    .err()
+                    .map(|error| error.to_string()),
+                None => sync(paths, None).err().map(|error| error.to_string()),
+            }
         }
     };
     Ok(Published {
@@ -8811,7 +9688,26 @@ fn publication_rights(
 }
 
 fn configured_admin(paths: &Paths, expected: &Config) -> crate::Result<StateLock> {
-    let lock = StateLock::take(paths)?;
+    configured_admin_until(paths, expected, None)
+}
+
+fn publication_current(deadline: Option<Instant>) -> crate::Result<()> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        Err(Error::new("vault publication deadline expired"))
+    } else {
+        Ok(())
+    }
+}
+
+fn configured_admin_until(
+    paths: &Paths,
+    expected: &Config,
+    deadline: Option<Instant>,
+) -> crate::Result<StateLock> {
+    let lock = match deadline {
+        Some(deadline) => StateLock::take_at_until(paths, &paths.lock_file(), deadline)?,
+        None => StateLock::take(paths)?,
+    };
     if config(paths)?.as_ref() != Some(expected) {
         return Err(Error::new(
             "the configured vault changed while it was open; open it again before publishing",
@@ -8830,8 +9726,7 @@ fn let_go(old: &Document, doc: &Document) -> Vec<String> {
 }
 
 /// `doc` with a `code-only` line for each key it lets go of `old`'s machines, on any vault, and,
-/// in a version that opens the vault, for each request already waiting from a key not in it
-/// except a LAN request eligible for the default ALab admission policy;
+/// in a version that opens the vault, for each request already waiting from a key not in it;
 /// whether a key was let go from an open vault (the one a person is told about, [`Published`]);
 /// and the requests held. A let-go key's line keeps its request, still queued, from being let in
 /// when the vault opens and from being shown as asking by an approver that never read it
@@ -8852,9 +9747,7 @@ fn code_only_for(
         requests_for(config, Some(doc))?
             .into_iter()
             .filter(|request| {
-                !named.contains(&request.recipient)
-                    && !gone.contains(&request.recipient)
-                    && !(alab_vault(config) && request.lan)
+                !named.contains(&request.recipient) && !gone.contains(&request.recipient)
             })
             .collect()
     };
@@ -8957,7 +9850,7 @@ pub struct Created {
 
 /// Create a new vault at `source` with this machine as its initial admin.
 ///
-/// The vault starts open (`[join]`'s `open = yes`). A new personal vault requires a member's
+/// The vault starts open (`[join]`'s open note, [`text::OPEN_NOTE`]). A new personal vault requires a member's
 /// Allow; only the pinned default ALab vault also admits LAN requests automatically.
 /// `aterm secrets password new|set` enables admission by join password instead, and
 /// `password off` leaves each machine to a member's Allow or an admin's approval by code.
@@ -9190,8 +10083,9 @@ pub struct Request {
     pub code: String,
     /// When it asked (unix), when the server says.
     pub at: Option<u64>,
-    /// The serving vault observed a LAN source; absent on older server listings.
-    pub lan: bool,
+    /// The home ALab LAN the serving vault observed it on, while that server is still on it
+    /// ([`crate::home_lan`]); absent on older server listings, whose `lan=1` admits nothing.
+    pub home: Option<crate::home_lan::HomeTag>,
     /// A member's signed Allow of it (`crate::members::Allowed`), if it carried one.
     pub allowed: Option<String>,
     /// Its proof of the join password, if it sent one.
@@ -9236,6 +10130,16 @@ pub fn requests(paths: &Paths, doc: Option<&Document>) -> crate::Result<Vec<Requ
     requests_for(&config, doc)
 }
 
+/// The join requests queued at `config`'s URL, and the address of the server that answered
+/// (`None`: a vault read from a path, or not known).
+fn requests_from(config: &Config) -> crate::Result<(Vec<Request>, Option<std::net::IpAddr>)> {
+    let Source::Url(url) = &config.source else {
+        return Ok((Vec::new(), None));
+    };
+    let (lines, from) = transport::list_joins_from(url)?;
+    Ok((requests_in(lines, &[]), from))
+}
+
 fn requests_for(config: &Config, doc: Option<&Document>) -> crate::Result<Vec<Request>> {
     let Source::Url(url) = &config.source else {
         return Ok(Vec::new());
@@ -9264,7 +10168,7 @@ fn requests_in(lines: Vec<String>, known: &[String]) -> Vec<Request> {
             host: request.host,
             code: request.code,
             at: request.time,
-            lan: request.lan,
+            home: request.home,
             allowed: request.allowed,
             proof: request.proof,
         });
@@ -9450,13 +10354,7 @@ struct HeldLock(std::fs::File);
 
 impl HeldLock {
     fn try_take(path: &Path) -> crate::Result<Option<HeldLock>> {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)
-            .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+        let file: std::fs::File = fsx::open_lock(path)?;
         #[expect(
             clippy::disallowed_methods,
             reason = "the take of HeldLock, whose Drop releases by LOCK_UN (File::unlock)"
@@ -10431,6 +11329,25 @@ mod tests {
             std::fs::metadata(&reader.dir).unwrap().permissions().mode() & 0o777,
             0o755
         );
+
+        let linked_reader = Paths::for_home(&root.path().join("linked"));
+        std::fs::create_dir_all(linked_reader.dir.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&reader.dir, &linked_reader.dir).unwrap();
+        assert!(StateLock::observe(&linked_reader).is_err());
+
+        fsx::ensure_private_dir(&reader.dir).unwrap();
+        let _lock = StateLock::take(&reader).unwrap();
+        drop(_lock);
+        std::fs::set_permissions(reader.lock_file(), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        assert!(StateLock::observe(&reader).is_err());
+        std::fs::set_permissions(reader.lock_file(), std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        let hard_lock = reader.dir.join("state.lock.hard");
+        std::fs::hard_link(reader.lock_file(), &hard_lock).unwrap();
+        assert!(StateLock::observe(&reader).is_err());
+        std::fs::remove_file(&hard_lock).unwrap();
+        assert!(StateLock::observe(&reader).unwrap().is_some());
     }
 
     #[test]
@@ -10933,7 +11850,7 @@ mod tests {
         let (mut on_admin, mut on_plain) = (None, None);
         for (paths, repaired) in [(&admin, &mut on_admin), (&plain, &mut on_plain)] {
             let token = materialize::target_path(&paths.home, "token").unwrap();
-            let mut pass = || subscriber_pass(paths, repaired, &found_none).expect("a pass");
+            let mut pass = || subscriber_pass(paths, repaired, &FOUND_NONE).expect("a pass");
             pass();
             assert_eq!(std::fs::read(&token).unwrap(), b"inert-token");
             assert_eq!(replaced(paths), 0);
@@ -10952,7 +11869,7 @@ mod tests {
         }
         // A new version of the plain file is written whatever was put back before.
         fsx::write_atomic(&text, b"token=inert-token\nnote=inert-note\n", 0o600).unwrap();
-        subscriber_pass(&plain, &mut on_plain, &found_none).expect("a pass");
+        subscriber_pass(&plain, &mut on_plain, &FOUND_NONE).expect("a pass");
         let read = |name: &str| std::fs::read(materialize::target_path(&plain.home, name).unwrap());
         assert_eq!(read("note").unwrap(), b"inert-note");
         assert_eq!(read("token").unwrap(), b"inert-token");
@@ -11060,11 +11977,11 @@ mod tests {
         std::fs::remove_file(&token).unwrap();
         server.stop();
         let gone = Unserved::at(&socket);
-        assert!(subscriber_pass(&admin, &mut repaired, &found_none).is_err());
+        assert!(subscriber_pass(&admin, &mut repaired, &FOUND_NONE).is_err());
         gone.end();
         let server = serve(&store, &socket);
         let (_, outcome) =
-            subscriber_pass(&admin, &mut repaired, &found_none).expect("the server is back");
+            subscriber_pass(&admin, &mut repaired, &FOUND_NONE).expect("the server is back");
         assert!(
             matches!(outcome, SyncOutcome::Applied { .. }),
             "{outcome:?}"
@@ -12284,7 +13201,7 @@ mod tests {
                 status(paths).expect("status").membership,
                 Membership::Pending
             );
-            let (config, _) = subscriber_pass(paths, &mut None, &found_none).expect("a pass");
+            let (config, _) = subscriber_pass(paths, &mut None, &FOUND_NONE).expect("a pass");
             ask_again_if_due(paths, &config, &|_| {});
             let queued: Vec<String> = requests(&admin, None)
                 .expect("requests")
@@ -12613,18 +13530,18 @@ mod tests {
         server.stop();
         let gone = Unserved::at(&socket);
         assert!(
-            subscriber_pass(&mac, &mut None, &found_none).is_err(),
+            subscriber_pass(&mac, &mut None, &FOUND_NONE).is_err(),
             "the server is gone"
         );
         gone.end();
         let server = serve(&root.path().join("moved"), &socket);
         let (_, restored) =
-            subscriber_pass(&admin, &mut None, &found_none).expect("the admin's pass");
+            subscriber_pass(&admin, &mut None, &FOUND_NONE).expect("the admin's pass");
         assert!(
             matches!(restored, SyncOutcome::PutBack { served: None, .. }),
             "the admin's subscriber put the vault back: {restored:?}"
         );
-        let (config, outcome) = subscriber_pass(&mac, &mut None, &found_none).expect("a pass");
+        let (config, outcome) = subscriber_pass(&mac, &mut None, &FOUND_NONE).expect("a pass");
         assert!(
             matches!(outcome, SyncOutcome::Unchanged { .. }),
             "{outcome:?}"
@@ -12847,7 +13764,7 @@ mod tests {
             host: "m9".to_string(),
             code: "abcd-efgh-ijkm-npqr".to_string(),
             at: None,
-            lan: false,
+            home: None,
             allowed: None,
             proof: Some(format!("proof-{n}")),
         };
@@ -12880,18 +13797,46 @@ mod tests {
             Approval::Password
         ));
         assert_eq!(settled.judged.len(), 1);
-        let mut newly_lan = waiting.clone();
-        newly_lan.lan = true;
-        assert!(settled.due(&config, 1, std::slice::from_ref(&newly_lan), Approval::Open));
-        settled.settle(vec![Judged::of(&newly_lan)]);
-        assert!(!settled.due(&config, 1, &[newly_lan], Approval::Open));
+        let mut newly_home = waiting.clone();
+        newly_home.home = Some(crate::home_lan::HomeTag::test());
+        assert!(settled.due(
+            &config,
+            1,
+            std::slice::from_ref(&newly_home),
+            Approval::Open
+        ));
+        settled.settle(vec![Judged::of(&newly_home)]);
+        assert!(!settled.due(&config, 1, &[newly_home], Approval::Open));
     }
 
+    /// The default ALab policy lets a request in with no person only where the vault is the
+    /// pinned ALab vault, open, the serving vault observed the request on the home ALab LAN
+    /// (`home=`), this approver is on that same home network now (`here`), and the key is not
+    /// `code-only`. An older server's `lan=1`, a request heard on a network this approver is
+    /// not on, and one with no observation all wait for a member's Allow.
+    ///
+    /// NEGATIVE CONTROLS: with `auto_approve_listed_in`'s home check replaced by `true` (the old
+    /// rule took any private peer, which every request here is), the request with no home
+    /// observation is let in and "no observation" fails; with it narrowed to
+    /// `request.home.is_some()`, the approver off that network lets it in and "the approver is
+    /// elsewhere" fails.
     #[test]
-    fn automatic_lan_admission_requires_the_default_pin_and_an_unrevoked_key() {
+    fn automatic_lan_admission_requires_a_home_lan_observation_on_the_approvers_network() {
         let root = aterm_tempfile::tempdir().unwrap();
         let socket = bound();
-        let server = serve(&root.path().join("store"), &socket);
+        let server = crate::server::start_at_home(
+            socket.try_clone().expect("a copy of the socket"),
+            &crate::server::Options {
+                listen: "127.0.0.1:0".parse().expect("addr"),
+                store: root.path().join("store"),
+                advertise: None,
+                pins: Vec::new(),
+                hold: Duration::from_millis(200),
+                keep_awake: false,
+            },
+            Duration::ZERO,
+        )
+        .expect("server starts");
         let url = format!("http://{}/v1/alab", server.addr);
         let paths = Paths::for_home(&root.path().join("m1"));
         let created = create(&paths, &url, None, Some("m1")).unwrap();
@@ -12900,139 +13845,120 @@ mod tests {
         let mut admin = admin_open(&paths).unwrap();
         let mut requests = requests_for(&admin.config, None).unwrap();
         assert_eq!(requests.len(), 1);
-        assert!(requests[0].lan);
-        let judge = |admin: &Admin, requests: &[Request], default_alab| {
+        let home = crate::home_lan::HomeTag::test();
+        assert_eq!(requests[0].home.as_ref(), Some(&home));
+        let judge = |admin: &Admin, requests: &[Request], here: &[_], default_alab| {
             auto_approve_listed_in(
                 &paths,
                 admin,
                 requests,
                 &mut false,
                 &mut BTreeSet::new(),
-                &mut JoinKeys::default(),
+                (&mut JoinKeys::default(), here),
                 default_alab,
             )
             .unwrap()
         };
+        let at_home = std::slice::from_ref(&home);
         assert!(
             !alab_vault(&admin.config),
             "a personal vault named alab is not ALab"
         );
         assert!(auto_approve(&paths).unwrap().approved.is_empty());
-        requests[0].lan = false;
+        requests[0].home = None;
         assert!(
-            judge(&admin, &requests, true).approved.is_empty(),
-            "no public-source admission"
+            judge(&admin, &requests, at_home, true).approved.is_empty(),
+            "no observation"
         );
-        requests[0].lan = true;
+        requests[0].home = Some(home.clone());
         assert!(
-            judge(&admin, &requests, false).approved.is_empty(),
+            judge(&admin, &requests, &[], true).approved.is_empty(),
+            "the approver is elsewhere"
+        );
+        let other = crate::home_lan::HomeTag::of(std::net::Ipv4Addr::new(10, 9, 8, 0), 24);
+        assert!(
+            judge(&admin, &requests, std::slice::from_ref(&other), true)
+                .approved
+                .is_empty(),
+            "the approver is on another home network"
+        );
+        assert!(
+            judge(&admin, &requests, at_home, false).approved.is_empty(),
             "no personal-vault admission"
         );
         admin.published_doc.set_open(false).unwrap();
-        requests[0].lan = false;
         assert!(
-            judge(&admin, &requests, true).approved.is_empty(),
-            "a non-LAN request still needs admission"
+            judge(&admin, &requests, at_home, true).approved.is_empty(),
+            "closed policy"
         );
         admin
             .published_doc
             .set_join_password(Some(b"fixture-password-for-automatic-lan-tests"))
             .unwrap();
         assert!(
-            judge(&admin, &requests, true).approved.is_empty(),
-            "a non-LAN request without the password stays out"
+            judge(&admin, &requests, at_home, true).approved.is_empty(),
+            "password policy"
         );
         admin.published_doc.set_open(true).unwrap();
-        requests[0].lan = true;
+        let open = admin.published_doc.clone();
         admin
             .published_doc
             .add_code_only(&requests[0].recipient)
             .unwrap();
-        let done = judge(&admin, &requests, true);
+        let done = judge(&admin, &requests, at_home, true);
         assert!(done.approved.is_empty(), "a revoked key stays out");
         assert_eq!(done.code_only, [requests[0].recipient.clone()]);
-        // Exercise the real entry point under the same compiled-pin lookup used in production.
+        admin.published_doc = open;
+        // The real entry point under the compiled-pin lookup reads this approver's own place:
+        // a scratch home holds no member evidence, so it fails closed.
         let signer = admin.config.signer.unwrap();
         let done = retiring(Vec::new(), signer, || auto_approve(&paths)).unwrap();
-        assert_eq!(done.approved, ["m2"]);
+        assert!(done.approved.is_empty(), "no evidence: no admission");
+        // CONTROL: the same request, observed at home by a server on this approver's network.
+        assert_eq!(
+            judge(&admin, &requests, at_home, true).approved,
+            ["m2"],
+            "a home-LAN request on the approver's network"
+        );
         server.stop();
     }
 
+    /// A server that holds no member evidence (every server a test starts plainly, and one
+    /// started with no secrets directory) observes no request on the home ALab LAN, however
+    /// private its peer, so the default ALab policy lets nobody in through it.
+    ///
+    /// NEGATIVE CONTROL: with `home_lan::Nowhere` observing every request at home (as the old
+    /// `lan_join_peer` took every loopback or private peer), the request lists `home=` and this
+    /// test fails (`left: Some(HomeTag(..))`, `right: None`).
     #[test]
-    fn opening_the_default_lan_vault_does_not_quarantine_waiting_machines() {
+    fn a_server_with_no_member_evidence_observes_no_home() {
         let root = aterm_tempfile::tempdir().unwrap();
         let socket = bound();
         let server = serve(&root.path().join("store"), &socket);
         let url = format!("http://{}/v1/alab", server.addr);
-        let paths = Paths::for_home(&root.path().join("admin"));
-        let created = create(&paths, &url, None, Some("admin")).unwrap();
-        let newcomer = Paths::for_home(&root.path().join("newcomer"));
-        join_pinned(&newcomer, &format!("{url}#{}", created.signer), "newcomer");
+        let paths = Paths::for_home(&root.path().join("m1"));
+        let created = create(&paths, &url, None, Some("m1")).unwrap();
+        let newcomer = Paths::for_home(&root.path().join("m2"));
+        join_pinned(&newcomer, &format!("{url}#{}", created.signer), "m2");
         let admin = admin_open(&paths).unwrap();
-        let mut closed = admin.published_doc.clone();
-        closed.set_open(false).unwrap();
-        let mut opened = closed.clone();
-        opened.set_open(true).unwrap();
-        let signer = admin.config.signer.unwrap();
-        retiring(Vec::new(), signer, || {
-            let (changed, _, waiting) = code_only_for(&admin.config, &closed, &opened).unwrap();
-            assert!(changed.is_none());
-            assert!(
-                waiting.is_empty(),
-                "LAN join remains eligible for automatic admission"
-            );
-            // An explicit removal still creates a code-only entry, even on this LAN.
-            let removed = Identity::generate().unwrap().recipient().to_bech32();
-            let mut before_removal = closed.clone();
-            before_removal.add_machine("removed", &removed).unwrap();
-            let (changed, _, _) = code_only_for(&admin.config, &before_removal, &opened).unwrap();
-            assert!(changed.unwrap().code_only().contains(&removed));
-        });
-        // A personal vault retains its explicit opening policy.
-        let (_, _, waiting) = code_only_for(&admin.config, &closed, &opened).unwrap();
-        assert_eq!(waiting.len(), 1);
-        server.stop();
-    }
-
-    #[test]
-    fn default_lan_admission_does_not_require_the_legacy_join_opt_in() {
-        for policy in ["absent", "password", "open"] {
-            let root = aterm_tempfile::tempdir().unwrap();
-            let socket = bound();
-            let server = serve(&root.path().join("store"), &socket);
-            let url = format!("http://{}/v1/alab", server.addr);
-            let paths = Paths::for_home(&root.path().join("m1"));
-            let created = create(&paths, &url, None, Some("m1")).unwrap();
-            let newcomer = Paths::for_home(&root.path().join("m2"));
-            join_pinned(&newcomer, &format!("{url}#{}", created.signer), "m2");
-            let mut admin = admin_open(&paths).unwrap();
-            admin.published_doc.set_open(false).unwrap();
-            admin.published_doc.set_join_password(None).unwrap();
-            if policy == "password" {
-                admin
-                    .published_doc
-                    .set_join_password(Some(b"fixture-password-for-automatic-lan-tests"))
-                    .unwrap();
-            } else if policy == "open" {
-                admin.published_doc.set_open(true).unwrap();
-            }
-            let pending = requests_for(&admin.config, None).unwrap();
-            assert!(pending[0].lan);
-            assert!(pending[0].allowed.is_none() && pending[0].proof.is_none());
-            let done = auto_approve_listed_in(
-                &paths,
-                &admin,
-                &pending,
-                &mut false,
-                &mut BTreeSet::new(),
+        let requests = requests_for(&admin.config, None).unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].home, None);
+        let done = auto_approve_listed_in(
+            &paths,
+            &admin,
+            &requests,
+            &mut false,
+            &mut BTreeSet::new(),
+            (
                 &mut JoinKeys::default(),
-                true,
-            )
-            .unwrap();
-            assert_eq!(done.approved, ["m2"], "legacy policy: {policy}");
-            assert!(done.asking.is_empty(), "no manual admission: {policy}");
-            server.stop();
-        }
+                &[crate::home_lan::HomeTag::test()],
+            ),
+            true,
+        )
+        .unwrap();
+        assert!(done.approved.is_empty());
+        server.stop();
     }
 
     fn serve_apart(
@@ -13112,7 +14038,7 @@ mod tests {
         let copy = std::fs::read(member.cache_file()).expect("the member's copy");
 
         let server = lose(server, "moved");
-        let (config, outcome) = subscriber_pass(&member, &mut None, &found_none).expect("a pass");
+        let (config, outcome) = subscriber_pass(&member, &mut None, &FOUND_NONE).expect("a pass");
         assert_eq!(
             outcome,
             SyncOutcome::PutBack {
@@ -13139,7 +14065,7 @@ mod tests {
         };
         assert!(!report.failed.is_empty());
         let server = lose(server, "again");
-        let (_, outcome) = subscriber_pass(&member, &mut None, &found_none).expect("a pass");
+        let (_, outcome) = subscriber_pass(&member, &mut None, &FOUND_NONE).expect("a pass");
         assert_eq!(
             outcome,
             SyncOutcome::PutBack {
@@ -13219,7 +14145,7 @@ mod tests {
         let source = Source::Url(url);
         server.stop();
         let server = serve_apart(&root.path().join("moved"), &socket, &[]);
-        let first = subscriber_pass(&member, &mut None, &found_none)
+        let first = subscriber_pass(&member, &mut None, &FOUND_NONE)
             .expect_err("refused")
             .to_string();
         assert!(
@@ -13232,7 +14158,7 @@ mod tests {
             "{first}"
         );
         assert!(served_at(&source).is_none(), "nothing stored");
-        let second = subscriber_pass(&member, &mut None, &found_none)
+        let second = subscriber_pass(&member, &mut None, &FOUND_NONE)
             .expect_err("refused again")
             .to_string();
         assert_eq!(second, first, "one line in the log, then the backoff");
@@ -13263,7 +14189,7 @@ mod tests {
         let server = serve_apart(&root.path().join("moved"), &socket, &pin_of(&admin));
         let missing_here = |paths: &Paths| missing(&pinned(paths)).to_string();
 
-        let error = subscriber_pass(&waiting, &mut None, &found_none).expect_err("kept out");
+        let error = subscriber_pass(&waiting, &mut None, &FOUND_NONE).expect_err("kept out");
         assert_eq!(error.to_string(), missing_here(&waiting));
         assert!(
             served_at(&source).is_none(),
@@ -13294,13 +14220,13 @@ mod tests {
         ] {
             record(recorded);
             fsx::write_atomic(&member.cache_file(), cached, 0o600).expect("cache");
-            let error = subscriber_pass(&member, &mut None, &found_none).expect_err(what);
+            let error = subscriber_pass(&member, &mut None, &FOUND_NONE).expect_err(what);
             assert_eq!(error.to_string(), missing_here(&member), "{what}");
             assert!(served_at(&source).is_none(), "{what}: nothing put back");
         }
         record(held);
         fsx::write_atomic(&member.cache_file(), &copy, 0o600).expect("cache");
-        let (_, outcome) = subscriber_pass(&member, &mut None, &found_none).expect("a pass");
+        let (_, outcome) = subscriber_pass(&member, &mut None, &FOUND_NONE).expect("a pass");
         assert_eq!(
             outcome,
             SyncOutcome::PutBack {
@@ -13341,7 +14267,7 @@ mod tests {
         ));
         std::fs::remove_file(&shared).expect("the file gone");
 
-        let error = subscriber_pass(&member, &mut None, &found_none).expect_err("missing");
+        let error = subscriber_pass(&member, &mut None, &FOUND_NONE).expect_err("missing");
         assert_eq!(error.to_string(), missing(&pinned(&member)).to_string());
         assert!(!shared.exists(), "nothing written at the path");
         admin_open(&admin).expect("open");
@@ -13368,7 +14294,7 @@ mod tests {
         assert_eq!(approving_here(&admin).expect("read"), None, "no approver");
         server.stop();
         let server = serve_apart(&root.path().join("moved"), &socket, &pin_of(&admin));
-        let (_, outcome) = subscriber_pass(&admin, &mut None, &found_none).expect("a pass");
+        let (_, outcome) = subscriber_pass(&admin, &mut None, &FOUND_NONE).expect("a pass");
         assert_eq!(
             outcome,
             SyncOutcome::PutBack {
@@ -13434,7 +14360,7 @@ mod tests {
         ] {
             fsx::write_atomic(&member.cache_file(), cached, 0o600).expect("cache");
             assert!(
-                subscriber_pass(&member, &mut None, &found_none).is_err(),
+                subscriber_pass(&member, &mut None, &FOUND_NONE).is_err(),
                 "{what}: a missing valid local copy cannot make the older served version healthy"
             );
             assert_eq!(
@@ -13446,7 +14372,7 @@ mod tests {
             assert!(served() == stale, "{what}: nothing published");
         }
         fsx::write_atomic(&member.cache_file(), &newest, 0o600).expect("cache");
-        let (_, outcome) = subscriber_pass(&member, &mut None, &found_none).expect("a pass");
+        let (_, outcome) = subscriber_pass(&member, &mut None, &FOUND_NONE).expect("a pass");
         assert_eq!(
             outcome,
             SyncOutcome::PutBack {
@@ -13466,7 +14392,7 @@ mod tests {
         std::fs::remove_file(&token).expect("the token gone");
         let mut repaired = None;
         let (_, outcome) =
-            subscriber_pass(&member, &mut repaired, &found_none).expect("a repair pass");
+            subscriber_pass(&member, &mut repaired, &FOUND_NONE).expect("a repair pass");
         assert_eq!(
             outcome,
             SyncOutcome::PutBack {
@@ -13476,7 +14402,7 @@ mod tests {
         );
         assert!(served() == newest, "the newest copy is served again");
         let (_, outcome) =
-            subscriber_pass(&member, &mut repaired, &found_none).expect("the repair");
+            subscriber_pass(&member, &mut repaired, &FOUND_NONE).expect("the repair");
         assert!(
             matches!(outcome, SyncOutcome::Applied { seq: 3, .. }),
             "{outcome:?}"
@@ -13497,7 +14423,7 @@ mod tests {
         std::fs::remove_file(&token).expect("the token gone");
         let mut repaired = None;
         let (_, outcome) =
-            subscriber_pass(&member, &mut repaired, &found_none).expect("a repair pass");
+            subscriber_pass(&member, &mut repaired, &FOUND_NONE).expect("a repair pass");
         assert_eq!(
             outcome,
             SyncOutcome::PutBack {
@@ -13507,10 +14433,147 @@ mod tests {
         );
         assert!(served() == rotated, "the rotated copy is served");
         let (_, outcome) =
-            subscriber_pass(&member, &mut repaired, &found_none).expect("the repair");
+            subscriber_pass(&member, &mut repaired, &FOUND_NONE).expect("the repair");
         assert!(
             matches!(outcome, SyncOutcome::Applied { seq: 4, .. }),
             "{outcome:?}"
+        );
+        server.stop();
+    }
+
+    #[test]
+    fn bounded_member_join_and_sync_keep_normal_admission_and_materialization() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let socket = bound();
+        let (server, url, admin, _) = a_vault_with_a_member(root.path(), &socket);
+        let member = Paths::for_home(&root.path().join("bounded"));
+        let signer = crate::b64::encode_padded(&pinned(&admin).signer.expect("pin"));
+        let options = JoinOptions {
+            source: format!("{url}#{signer}"),
+            host: Some("bounded".into()),
+            interactive: false,
+            wait: Duration::ZERO,
+            confirm: &|_| false,
+            password: JoinPassword::Given(None),
+            fetched: None,
+            requested: &|| {},
+            say: &|_| {},
+        };
+        assert!(matches!(
+            join_if_unchanged_until(&member, &options, None, Instant::now() + HANG_DETECTOR)
+                .expect("join request"),
+            JoinOutcome::Pending { .. }
+        ));
+        let recipient = read_identity(&member)
+            .unwrap()
+            .unwrap()
+            .recipient()
+            .to_bech32();
+        let opened = admin_open(&admin).expect("open");
+        let mut doc = opened.doc.clone();
+        doc.add_machine("bounded", &recipient).expect("admit");
+        admin_publish(&admin, &opened, &doc).expect("publish approval");
+        assert!(matches!(
+            sync_reader_until(&member, Instant::now() + HANG_DETECTOR).expect("bounded sync"),
+            SyncOutcome::Applied { .. }
+        ));
+        assert_eq!(
+            std::fs::read(materialize::target_path(&member.home, "token").unwrap()).unwrap(),
+            b"inert-token"
+        );
+        assert_eq!(load_state(&member).unwrap().membership, Stored::In);
+        server.stop();
+    }
+
+    #[test]
+    fn bounded_member_sync_uses_a_verified_peer_when_the_primary_is_silent() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let socket = bound();
+        let (server, peer_url, admin, member) = a_vault_with_a_member(root.path(), &socket);
+        let opened = admin_open(&admin).expect("open");
+        let mut doc = opened.doc.clone();
+        doc.set_entry(&Audience::Everyone, "token", b"new-token")
+            .unwrap();
+        admin_publish(&admin, &opened, &doc).unwrap();
+        let silent = bound();
+        let mut config = configured(&member).unwrap();
+        config.source = Source::Url(format!("http://{}/v1/team", silent.local_addr().unwrap()));
+        save_config(&member, &config).unwrap();
+        assert!(matches!(
+            bounded::sync_reader_with_candidates_until(
+                &member,
+                Instant::now() + HANG_DETECTOR,
+                &[peer_url],
+            )
+            .expect("verified peer answers"),
+            SyncOutcome::Applied { seq: 3, .. }
+        ));
+        assert_eq!(
+            std::fs::read(materialize::target_path(&member.home, "token").unwrap()).unwrap(),
+            b"new-token"
+        );
+        server.stop();
+    }
+
+    #[test]
+    fn bounded_member_operations_do_not_wait_forever_for_the_state_lock() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let socket = bound();
+        let (server, url, _, member) = a_vault_with_a_member(root.path(), &socket);
+        let config = configured(&member).unwrap();
+        let bytes = std::fs::read(member.cache_file()).unwrap();
+        let state = std::fs::read(member.state_file()).unwrap();
+        let lock = StateLock::take(&member).expect("hold state lock");
+        let started = Instant::now();
+        let error = sync_reader_until(&member, Instant::now() + Duration::from_millis(200))
+            .expect_err("held state lock");
+        assert_eq!(error.kind(), crate::ErrorKind::TimedOut);
+        let options = JoinOptions {
+            source: url,
+            host: Some(config.host.clone()),
+            interactive: false,
+            wait: Duration::ZERO,
+            confirm: &|_| false,
+            password: JoinPassword::Given(None),
+            fetched: Some(&bytes),
+            requested: &|| {},
+            say: &|_| {},
+        };
+        let error = join_if_unchanged_until(
+            &member,
+            &options,
+            Some(&config),
+            Instant::now() + Duration::from_millis(200),
+        )
+        .expect_err("join respects the same state lock");
+        assert_eq!(error.kind(), crate::ErrorKind::TimedOut);
+        assert!(started.elapsed() < HANG_DETECTOR, "bounded operations hung");
+        assert_eq!(std::fs::read(member.state_file()).unwrap(), state);
+        drop(lock);
+        server.stop();
+    }
+
+    #[test]
+    fn bounded_member_sync_defers_putting_back_a_missing_server_envelope() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let socket = bound();
+        let (server, url, admin, member) = a_vault_with_a_member(root.path(), &socket);
+        server.stop();
+        let server = serve_apart(&root.path().join("empty"), &socket, &pin_of(&admin));
+        let source = Source::Url(url);
+        assert!(served_at(&source).is_none());
+        assert_eq!(
+            sync_reader_until(&member, Instant::now() + HANG_DETECTOR).unwrap(),
+            SyncOutcome::Unchanged { seq: 2 }
+        );
+        assert!(served_at(&source).is_none(), "reader did not publish");
+        assert!(matches!(
+            sync(&member, None).unwrap(),
+            SyncOutcome::PutBack { .. }
+        ));
+        assert!(
+            served_at(&source).is_some(),
+            "standing sync still repairs servers"
         );
         server.stop();
     }

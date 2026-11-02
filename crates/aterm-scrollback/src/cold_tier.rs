@@ -40,7 +40,7 @@ fn take_cold_find_page_steps() -> usize {
 /// A cold page (compressed with the LZ4 cold codec).
 #[derive(Debug, Clone)]
 struct ColdPage {
-    /// Cold-codec compressed data (re-compressed from the LZ4 warm block).
+    /// Validated LZ4 data, retaining the warm payload when its whole page is live.
     compressed: Vec<u8>,
     /// Number of lines in page.
     line_count: usize,
@@ -137,7 +137,7 @@ impl ColdTier {
         self.pages.len()
     }
 
-    /// Push a warm block (re-compresses with the cold codec).
+    /// Push a validated warm block, re-encoding only a trimmed logical suffix.
     pub(crate) fn push_block(&mut self, block: &WarmBlock) -> usize {
         self.push(block, false)
     }

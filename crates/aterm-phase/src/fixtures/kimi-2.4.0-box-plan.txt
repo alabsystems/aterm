@@ -1,0 +1,33 @@
+# kimi 2.4.0 · MEASURED 2026-10-29, `aterm ctl text` of a private headless aterm (110x32, aterm 0.146.0) running the real Kimi Code, launched by path with a scratch `HOME` and `KIMI_CODE_HOME` whose `config.toml` names one `openai`-type provider at `http://127.0.0.1:<port>/v1` with a fake key (a local stub of the Chat Completions API, crates/aterm-lab), no login · in plan mode, after a `Write` of the plan file, the stub calls `ExitPlanMode` with two options (mode plan): the plan in a box and `▶ Ready to build with this plan?` with the options, `Reject` and `Revise`
+ ● Used Write (…95d-90d8-422b-bc70-82ea4e4c480f/agents/main/plans/us-agent-constantine-obsidian.md) · 4 lines
+      1  # Lab plan
+      2
+      3  1. Lab step one.
+      4  2. Lab step two.
+      5
+
+ ● lab plan written
+
+ ❯ lab exit plan mode now
+
+ Current plan
+   ┌ plan: us-agent-constantine-obsidian.md ────────────────────────────────────────────────────────────────┐
+   │ Lab plan                                                                                               │
+   │                                                                                                        │
+   │ 1. Lab step one.                                                                                       │
+   │ 2. Lab step two.                                                                                       │
+   └────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ ────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   ▶ Ready to build with this plan?
+
+   ▶ 1. Lab plan A (Recommended)
+        the first way
+     2. Lab plan B
+        the second way
+     3. Reject
+     4. Revise
+
+   ↑/↓ select · 1/2/3/4 choose · ↵ confirm
+ ────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ plan  lab-model  …/tmp/at.H2aa/proj
+                                                                                   context: 25% (24.2k/97.7k)

@@ -28,7 +28,7 @@ mod value;
 
 pub use de::{Deserializer, from_slice, from_str};
 pub use error::{Error, Result};
-pub use ser::{to_string, to_vec};
+pub use ser::{quoted_string, to_string, to_vec};
 pub use value::{Map, Number, Value};
 
 use serde::Deserialize as _;

@@ -21,13 +21,14 @@ pub(super) fn parked_off_note(seq: u64) -> String {
     )
 }
 
-/// Whether journal line `line` is [`parked_off_note`]'s.
-pub(super) fn is_parked_off(line: &str) -> bool {
+/// The `seq=` of [`parked_off_note`]'s line `line`; `None` for any other line.
+pub(super) fn parked_off_seq(line: &str) -> Option<u64> {
     line.strip_prefix("PARKED seq=")
         .and_then(|rest| rest.split_once(' '))
-        .is_some_and(|(seq, rest)| {
+        .filter(|(seq, rest)| {
             seq.bytes().all(|b| b.is_ascii_digit()) && rest.starts_with("autopilot=off")
         })
+        .and_then(|(seq, _)| seq.parse().ok())
 }
 
 /// What makes two refusals the same for the journal ([`Session::refusal_news`]): the words, less every field the server measures anew at each retry, a `<name>=<number>` whose name counts time or bytes (`human_ms=<n>`, `bytes=<n>`, a `…_ms=` wait).
@@ -245,15 +246,20 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// AUTOPILOT OFF STANDS ON THE SESSION: what the park ends is over ([`TurnEndState::park_off`]), and the ledger says so ([`approvals::RULE_OFF_STOOD`]) for a loop that follows, which takes up its books as this one holds them after the park (`Session::seed_from_ledger`).
+    /// AUTOPILOT OFF STANDS ON THE SESSION: what the park ends is over ([`TurnEndState::park_off`]), and the ledger says so ([`approvals::RULE_OFF_STOOD`]) for a loop that follows, which takes up its books as this one holds them after the park (`Session::seed_from_ledger`). An Off no person set keeps the hold, and Land's rest on a need ([`TurnEndState::park_off_held`], [`approvals::OFF_STOOD_HELD`], [`approvals::OFF_STOOD_RESTING`]): only the person's own switch lifts one.
     pub(super) fn off_stood(&mut self, seq: u64) {
-        self.turn_end.park_off();
+        let kept = if self.autopilot.by_person() {
+            self.turn_end.park_off();
+            crate::supervise::policy::turn_end::OffStood::Person
+        } else {
+            self.turn_end.park_off_held()
+        };
         self.tell_hold();
         self.ledger_row(
             approvals::RULE_OFF_STOOD,
             approvals::Outcome::Waiting,
             "",
-            approvals::OFF_STOOD,
+            kept.reason(),
             seq,
         );
     }
@@ -309,7 +315,7 @@ impl<C: Ctl> Session<'_, C> {
             status_field(&read.stdout, "attention_owner").map(super::super::report::pct_decode);
         if shown_owner.as_deref() != Some(ATTENTION_OWNER) {
             let hidden = status_field(&read.stdout, "attention_owners")
-                .and_then(|n| n.parse::<usize>().ok())
+                .and_then(crate::parse_uint::<usize>)
                 .is_some_and(|n| n > 1);
             if hidden {
                 let said = self.clear_attention_entry()?;
@@ -426,12 +432,20 @@ impl<C: Ctl> Session<'_, C> {
             return Ok(());
         }
         if self.withhold_badge(seq, super::escalate::Escalation::Ask, review)? {
+            self.withheld_ask = Some(super::escalate::WithheldAsk {
+                text,
+                duty: Some(Scope::TurnEnd),
+                again: format!(" again={AGAIN_UNPARKED}"),
+                turn_end_badge: true,
+            });
             return Ok(());
         }
+        self.withheld_ask = None;
         self.attention_desired = Some(super::escalate::AttentionTarget::Set {
             text,
             kind: super::escalate::Escalation::Ask,
         });
+        self.attention_duty = Some(Scope::TurnEnd);
         let said = self.write_attention_target()?;
         self.turn_end_badge = true;
         review.note(&format!(

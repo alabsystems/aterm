@@ -8,6 +8,9 @@ use super::accounts::{self, Cli, Roster};
 use aterm_json::{Value, json};
 use std::{path::Path, sync::OnceLock};
 
+pub(crate) const NAMED_BROWSER_UNSUPPORTED: &str =
+    "Automatic sign-in cannot use a required named browser profile";
+
 /// Metadata observed from one retained Commons proposal table.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Catalog {
@@ -41,9 +44,11 @@ pub struct Account {
     pub email: Option<String>,
     pub realm: Option<String>,
     pub secret_reference: bool,
+    pub required_browser: bool,
     pub conflicted: bool,
     pub stopped: bool,
     pub import: Option<ImportOrigin>,
+    pub import_link: Option<String>,
 }
 
 type Reader = dyn Fn(&Path) -> Result<Catalog, String> + Send + Sync;
@@ -112,9 +117,8 @@ impl Account {
         }
         let email = self.email.as_deref()?;
         let mut rows = roster.rows.iter().filter(|row| {
-            row.email
-                .as_deref()
-                .is_some_and(|local| accounts::email_matches(local, email))
+            row.held_by.is_none()
+                && row.matches_email(email)
                 && row.vendor.region.map(|region| region.as_str()) == self.realm.as_deref()
         });
         let row = rows.next()?;
@@ -126,6 +130,8 @@ impl Account {
             "stopped"
         } else if self.conflicted {
             "conflicted"
+        } else if self.required_browser {
+            "unsupported-preparation"
         } else if let Some(source) = &self.import {
             match source.presence {
                 Some(true) => "auth-details-pending",
@@ -141,6 +147,7 @@ impl Account {
         match self.state() {
             "stopped" => "Stopped",
             "conflicted" => "Conflicting source details",
+            "unsupported-preparation" => NAMED_BROWSER_UNSUPPORTED,
             "auth-details-pending" => "Awaiting sign-in details",
             "not-indicated" => "Provider not indicated in source",
             "provider-details-pending" => "Awaiting provider details",
@@ -177,9 +184,12 @@ fn report_rows(
                 "key":row.key, "operation":row.operation, "label":row.label,
                 "provider":row.provider, "method":row.method, "email":row.email,
                 "realm":row.realm, "secret_reference":row.secret_reference,
+                "native_capability":super::native_keys::capability(&row.provider,row.method.as_deref(),row.secret_reference),
                 "state":row.state(), "local_label":roster.and_then(|roster| catalog.local_label(row, roster)),
+                "preparation_reason":(row.state() == "unsupported-preparation").then_some(NAMED_BROWSER_UNSUPPORTED),
                 "login_authority":"none", "auth_details_pending":row.import.is_some(),
                 "origin":if row.import.is_some() { "import-candidate" } else { "proposal" },
+                "import_link":row.import_link,
                 "import":row.import.as_ref().map(|source| json!({
                     "table":source.table, "source_sha256":source.source, "record":source.record,
                     "provider_column":source.provider_column, "presence_marker":source.presence,
@@ -257,9 +267,11 @@ mod tests {
             email: Some("one@example.test".into()),
             realm: None,
             secret_reference: true,
+            required_browser: false,
             conflicted: false,
             stopped: false,
             import: None,
+            import_link: None,
         }
     }
 
@@ -283,6 +295,31 @@ mod tests {
     }
 
     #[test]
+    fn an_unsupported_profile_is_explicit_without_granting_authority() {
+        let mut row = account();
+        row.required_browser = true;
+        let catalog = Ok(Catalog {
+            rows: vec![row],
+            history_complete: true,
+            ..Default::default()
+        });
+        let report = report_all(&catalog);
+        assert_eq!(
+            report["accounts"][0]["state"].as_str(),
+            Some("unsupported-preparation")
+        );
+        assert_eq!(
+            report["accounts"][0]["preparation_reason"].as_str(),
+            Some(NAMED_BROWSER_UNSUPPORTED)
+        );
+        assert_eq!(
+            report["accounts"][0]["login_authority"].as_str(),
+            Some("none")
+        );
+        assert!(text_all(&catalog).contains(NAMED_BROWSER_UNSUPPORTED));
+    }
+
+    #[test]
     fn only_a_unique_matching_local_identity_supplies_display_facts() {
         let mut roster = Roster {
             rows: vec![accounts::Row {
@@ -301,6 +338,12 @@ mod tests {
         changed.conflicted = false;
         changed.realm = Some("mainland-cn".into());
         assert_eq!(changed.local_label(&roster), None);
+        roster.rows[0].held_by = Some("other-mac".into());
+        assert_eq!(account().local_label(&roster), None);
+        roster.rows[0].held_by = None;
+        roster.rows[0].email = None;
+        roster.rows[0].identity_email = account().email;
+        assert_eq!(account().local_label(&roster), Some("local"));
     }
 
     #[test]

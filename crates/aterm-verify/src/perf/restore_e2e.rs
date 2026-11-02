@@ -64,8 +64,11 @@ impl Args {
             ..Args::default()
         };
         let number = |flag: &str, raw: &str| {
-            raw.parse::<u32>()
-                .map_err(|_| format!("`{flag}` needs a positive integer, got `{raw}`"))
+            raw.bytes()
+                .all(|b| b.is_ascii_digit())
+                .then(|| raw.parse::<u32>().ok())
+                .flatten()
+                .ok_or_else(|| format!("`{flag}` needs a positive integer, got `{raw}`"))
         };
         for (flag, raw) in options {
             match *flag {

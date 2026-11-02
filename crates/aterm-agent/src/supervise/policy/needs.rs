@@ -336,7 +336,7 @@ fn unquoted(t: &str) -> &str {
 
 const MENTION_NOUNS: &[&str] = &[
     "line", "lines", "head", "heads", "row", "rows", "block", "blocks", "label", "labels", "token",
-    "tokens", "prefix", "marker", "markers", "item", "items",
+    "tokens", "prefix", "marker", "markers",
 ];
 
 const MENTION_ARTICLES: &[&str] = &["a", "an", "the", "each", "every", "any", "one", "that"];
@@ -908,6 +908,10 @@ struct NeedLines {
     /// keeps each in [`without_needs`]: no need, but words the readers of
     /// open work read.
     clauses: Vec<(usize, String)>,
+    /// In the go-ahead reader's view ([`go_ahead_view`]), the rows a need took only there
+    /// ([`go_ahead_wrap`]), and the rows it took after them, each run with the need's words joined
+    /// and before it ([`Moved`]); every other reader's view takes none.
+    moved: Vec<Moved>,
 }
 
 impl NeedLines {
@@ -935,17 +939,107 @@ fn paragraph(under: &str) -> bool {
     !t.is_empty() && !fence(t) && !a_head(under)
 }
 
+/// Whether the row `next` continues `need`, a row the screen wrapped: the two are not [`apart`]
+/// and the row opens lowercase or with a digit. THE IRREVERSIBLE GUARD'S CUT ([`without_needs`])
+/// and every reader of the needs join a wrapped row so and only so: 246d1ddc2f's rule, which no
+/// go-ahead code reads into or widens. Only the go-ahead reader's own view ([`go_ahead_view`])
+/// takes more ([`go_ahead_wrap`]).
 fn wraps(need: &str, next: &str) -> bool {
+    !apart(need, next) && opens_lower(unquoted(next))
+}
+
+/// Whether `t` opens on a lowercase letter or a digit.
+fn opens_lower(t: &str) -> bool {
+    t.chars()
+        .next()
+        .is_some_and(|c| c.is_lowercase() || c.is_ascii_digit())
+}
+
+/// Whether row `next` opens a line of its own under the line `line`, whatever its first letter
+/// and the room the row above it left: a blank row, a fence, a list item, a need's or a defense's
+/// head, or any row under a line that ends a sentence or opens a list. A screen's reader joins a
+/// row the pane's width wrapped only where this says it may ([`aterm_phase::reader::Apart`]).
+pub(crate) fn apart(line: &str, next: &str) -> bool {
     let t = unquoted(next).trim_end();
-    !t.is_empty()
-        && !fence(t)
-        && past_marker(t).is_none()
-        && !a_head(next)
-        && t.trim_start_matches(['"', '\'', '`', '(', '“', '‘'])
-            .chars()
+    t.is_empty()
+        || fence(t)
+        || past_marker(t).is_some()
+        || a_head(next)
+        || line.trim_end().ends_with(['.', '!', '?', ':'])
+}
+
+/// How a need takes the row under it ([`needs_lines_by`]): `None` where it does not, `Some(false)`
+/// where it [`wraps`] it, `Some(true)` where it takes it only in the go-ahead reader's own view.
+type Join = fn(&str, &str) -> Option<bool>;
+
+/// The join of every reader but the go-ahead reader's own view: [`wraps`] alone.
+fn wrap_join(need: &str, next: &str) -> Option<bool> {
+    wraps(need, next).then_some(false)
+}
+
+/// THE GO-AHEAD READER'S JOIN ([`go_ahead_view`]): `Some(false)` where the row [`wraps`] the
+/// need, and `Some(true)` where, the two not [`apart`], it joins only in that view: it opens
+/// lowercase past an opening quote or bracket (`… then say` above `"rerun the checks" so …`), or
+/// the need stops mid-clause (`… say "rerun the checks" so` above `I can build …`). No reader but
+/// [`go_ahead_view`] passes it.
+fn go_ahead_wrap(need: &str, next: &str) -> Option<bool> {
+    if wraps(need, next) {
+        return Some(false);
+    }
+    (!apart(need, next)
+        && (opens_lower(unquoted(next).trim_start_matches(['"', '\'', '`', '(', '“', '‘']))
+            || mid_clause(need)))
+    .then_some(true)
+}
+
+/// Joins to `need` the rows from `i` on that `join` takes, each pushed to `out.lines`; the rows
+/// from the first that joins only in the go-ahead reader's view on are booked in `out.moved`,
+/// with the need's words before that row. Returns the row after the last joined.
+fn join_wrapped(
+    rows: &[&str],
+    mut i: usize,
+    need: &mut String,
+    join: Join,
+    out: &mut NeedLines,
+) -> usize {
+    let mut moved = Vec::new();
+    let mut base = None;
+    while let Some(late) = rows.get(i).and_then(|next| join(need, next)) {
+        if late && moved.is_empty() {
+            base = Some(need.clone());
+        }
+        need.push(' ');
+        need.push_str(unquoted(rows[i]).trim_end());
+        out.lines.push(i);
+        if late || !moved.is_empty() {
+            moved.push(i);
+        }
+        i += 1;
+    }
+    if let Some(base) = base {
+        out.moved.push(Moved {
+            need: need.clone(),
+            base,
+            rows: moved,
+        });
+    }
+    i
+}
+
+/// Whether `need` stops mid-clause: on a comma, or on a word no sentence ends on.
+fn mid_clause(need: &str) -> bool {
+    const OPEN_ENDS: &[&str] = &[
+        "so", "and", "or", "but", "then", "to", "the", "a", "an", "of", "for", "with", "which",
+        "if", "when", "once", "until", "unless", "before", "after", "because", "since", "while",
+        "whether", "can", "will", "would", "could", "should", "my", "your", "its", "our", "their",
+        "is", "are", "was", "were", "be", "on", "in", "at", "into", "onto", "from", "by", "as",
+        "than",
+    ];
+    let t = need.trim_end();
+    t.ends_with(',')
+        || t.rsplit(char::is_whitespace)
             .next()
-            .is_some_and(|c| c.is_lowercase() || c.is_ascii_digit())
-        && !need.trim_end().ends_with(['.', '!', '?', ':'])
+            .is_some_and(|w| OPEN_ENDS.contains(&w.to_lowercase().as_str()))
 }
 
 const CUT_INSTRUCTIONS: [&str; 3] = [
@@ -1074,11 +1168,15 @@ fn items_under(
     (i, items)
 }
 
+/// The NEEDS YOU lines of `tail` as the irreversible guard and every reader of the needs read them,
+/// a need's wrapped rows joined by [`wraps`] alone ([`wrap_join`]).
 fn needs_lines(tail: &str) -> NeedLines {
-    needs_lines_by(tail, &NONE_WORDS)
+    needs_lines_by(tail, &NONE_WORDS, wrap_join)
 }
 
-fn needs_lines_by(tail: &str, by: &NoneWords<'_>) -> NeedLines {
+/// The NEEDS YOU lines of `tail`, a need's wrapped rows joined as `join` takes them: [`wrap_join`]
+/// for every reader, [`go_ahead_wrap`] for the go-ahead reader's own view alone.
+fn needs_lines_by(tail: &str, by: &NoneWords<'_>, join: Join) -> NeedLines {
     let rows: Vec<&str> = tail.lines().collect();
     let mut out = NeedLines::default();
     let mut block = None;
@@ -1161,12 +1259,7 @@ fn needs_lines_by(tail: &str, by: &NoneWords<'_>) -> NeedLines {
                     let at = i;
                     i += 1;
                     let mut need = unquoted(under).trim_end().to_string();
-                    while let Some(&next) = rows.get(i).filter(|next| wraps(&need, next)) {
-                        need.push(' ');
-                        need.push_str(unquoted(next).trim_end());
-                        out.lines.push(i);
-                        i += 1;
-                    }
+                    i = join_wrapped(&rows, i, &mut need, join, &mut out);
                     out.said(at, &need, by);
                 }
                 None => out.needs.push(UNREAD_NEED.to_string()),
@@ -1174,12 +1267,7 @@ fn needs_lines_by(tail: &str, by: &NoneWords<'_>) -> NeedLines {
             continue;
         }
         let mut words = rest.to_string();
-        while let Some(&next) = rows.get(i).filter(|next| wraps(&words, next)) {
-            words.push(' ');
-            words.push_str(unquoted(next).trim_end());
-            out.lines.push(i);
-            i += 1;
-        }
+        i = join_wrapped(&rows, i, &mut words, join, &mut out);
         let colon = words.trim_end().ends_with(':');
         if colon {
             let (next, items) = items_under(&rows, (head, i), true, &mut out, by);
@@ -1219,12 +1307,6 @@ pub(super) fn sanitized(need: &str) -> String {
     cut
 }
 
-/// Each need of the report `tail` as written, wrapped rows joined, before [`needs_you`] cleans
-/// and cuts it: the go-ahead reader judges a need on all of its words.
-pub(super) fn need_words(tail: &str) -> Vec<String> {
-    needs_lines(tail).needs
-}
-
 /// What the report `tail` names only a person can give, each need one line.
 #[must_use]
 pub fn needs_you(tail: &str) -> Vec<String> {
@@ -1249,10 +1331,132 @@ pub fn says_no_needs(tail: &str) -> bool {
     read.cleared && read.needs.iter().all(|n| sanitized(n).is_empty())
 }
 
+/// THE AGENT'S LAST WORD ON NEEDS in a turn (v6 §14.17.13, the post-landing review): what the
+/// turn's earlier messages `before` said still stands beside its last message `last` unless a
+/// later word retracts it. A need stands until retracted, and a word that says none stands
+/// ([`says_no_needs`], `NEEDS YOU: nothing`) retracts every need the turn named before it: a last
+/// message that says it leaves `before` read for none (`None`), and an earlier paragraph that says
+/// it alone leaves `before` from that paragraph on (its none, and what came after it). The
+/// readers join a turn's messages with a blank line, so a message's own paragraphs are read as
+/// messages are; one paragraph that names a need and a none both is read as itself, a kept need
+/// ([`needs_you`]), and so is the last message, read whole. The one rule by which every reader of
+/// a turn's needs reads it: the land check's answer (`land_check::land_check_answer`), the fold
+/// that raises the needs on the menu bar (`TurnEndState::fold_turn_needs`), the readers of
+/// `TurnEndReading::needs_before`, and the go-ahead reader ([`retracted_cut`]).
+#[must_use]
+pub fn standing_before<'a>(before: Option<&'a str>, last: &str) -> Option<&'a str> {
+    let before = before?;
+    match retracted_to(before, last) {
+        Retracted::All => None,
+        Retracted::From(at) => Some(&before[at..]),
+    }
+}
+
+/// `before` WITHOUT THE NEEDS THE TURN'S LAST WORD RETRACTED ([`standing_before`]), its prose
+/// kept: the go-ahead reader's view of a turn's earlier messages (`go_ahead::parked`), whose
+/// sentences still say what the work plans and lacks, though a need they named was taken back.
+#[must_use]
+pub fn retracted_cut<'a>(before: &'a str, last: &str) -> Cow<'a, str> {
+    match retracted_to(before, last) {
+        Retracted::All => without_needs(before),
+        Retracted::From(0) => Cow::Borrowed(before),
+        Retracted::From(at) => Cow::Owned(format!(
+            "{}\n\n{}",
+            without_needs(&before[..at]).trim_end(),
+            &before[at..]
+        )),
+    }
+}
+
+/// How much of a turn's earlier messages its last word retracts ([`standing_before`]).
+enum Retracted {
+    /// The last message says no need stands.
+    All,
+    /// The needs named before this byte: the start of the last paragraph that says none alone.
+    From(usize),
+}
+
+fn retracted_to(before: &str, last: &str) -> Retracted {
+    if says_no_needs(last) {
+        return Retracted::All;
+    }
+    let mut paragraphs: Vec<(usize, usize)> = Vec::new();
+    let mut open: Option<usize> = None;
+    let mut at = 0;
+    for line in before.split_inclusive('\n') {
+        if line.trim().is_empty() {
+            if let Some(start) = open.take() {
+                paragraphs.push((start, at));
+            }
+        } else if open.is_none() {
+            open = Some(at);
+        }
+        at += line.len();
+    }
+    if let Some(start) = open {
+        paragraphs.push((start, at));
+    }
+    Retracted::From(
+        paragraphs
+            .iter()
+            .rev()
+            .find(|&&(start, end)| says_no_needs(&before[start..end]))
+            .map_or(0, |&(start, _)| start),
+    )
+}
+
 /// `tail` without its NEEDS YOU lines (heads, the items under a head, their wrapped rows).
 #[must_use]
 pub fn without_needs(tail: &str) -> Cow<'_, str> {
-    let read = needs_lines(tail);
+    cut_needs(tail, &needs_lines(tail))
+}
+
+/// THE GO-AHEAD READER'S OWN VIEW of the report `tail` (`go_ahead::parked`): its prose without
+/// its NEEDS YOU lines, each need's words, and the rows a need took only here. A row the screen
+/// wrapped after a need that stops mid-clause (`… say "rerun the checks" so` above `I can build
+/// …`), or that opens lowercase past a quote mark, is the need's here ([`go_ahead_wrap`]), so its
+/// reading does not hang on the tab's width. No other reader reads this view: the irreversible
+/// guard and every reader of open work read [`without_needs`], as before the go-ahead reader.
+pub(super) struct GoAheadView<'a> {
+    /// `tail` without its needs, the mid-clause rows cut with them.
+    pub prose: Cow<'a, str>,
+    /// Each need's words as written, wrapped rows joined, before [`needs_you`] cleans and cuts
+    /// it: the reader judges a need on all of its words.
+    pub needs: Vec<String>,
+    /// Each run of rows a need took only in this view: every other reader reads them as the
+    /// reply's own prose.
+    pub moved: Vec<Moved>,
+}
+
+/// A run of rows a need took only in the go-ahead reader's view ([`GoAheadView::moved`]).
+pub(super) struct Moved {
+    /// The need's words, the run joined.
+    pub need: String,
+    /// The need's words before the run: the need as every other reader joins it ([`wrap_join`]),
+    /// and so the line [`needs_you`] names for it, once cleaned.
+    pub base: String,
+    /// The rows of `tail`, by index.
+    pub rows: Vec<usize>,
+}
+
+/// Where the words of `row` start past its quote marks and indent: the row as a need's wrap
+/// joins it is `row[quote_lead(row)..]`, its end trimmed.
+pub(super) fn quote_lead(row: &str) -> usize {
+    row.len() - unquoted(row).len()
+}
+
+/// [`GoAheadView`] of `tail`.
+pub(super) fn go_ahead_view(tail: &str) -> GoAheadView<'_> {
+    let read = needs_lines_by(tail, &NONE_WORDS, go_ahead_wrap);
+    GoAheadView {
+        prose: cut_needs(tail, &read),
+        moved: read.moved,
+        needs: read.needs,
+    }
+}
+
+/// `tail` without the need lines `read` names.
+fn cut_needs<'a>(tail: &'a str, read: &NeedLines) -> Cow<'a, str> {
     if read.lines.is_empty() && read.cuts.is_empty() {
         return Cow::Borrowed(tail);
     }
@@ -1362,19 +1566,35 @@ fn defense_rest(line: &str) -> Option<Cow<'_, str>> {
     excepted(rest).map(except)
 }
 
-/// The worker's defense line.
-#[must_use]
-pub fn defense_line(tail: &str) -> Option<&str> {
+/// The worker's defense line, trimmed, and the lines of `tail` after it: the one scan
+/// [`defense_line`] and [`defense_and_after`] share.
+fn defense_at(tail: &str) -> Option<(&str, std::str::Lines<'_>)> {
     let mut block = None;
-    for line in tail.lines() {
+    let mut lines = tail.lines();
+    while let Some(line) = lines.next() {
         if fenced_line(line, &mut block) {
             continue;
         }
         if defense_rest(line).is_some() {
-            return Some(line.trim());
+            return Some((line.trim(), lines));
         }
     }
     None
+}
+
+/// The worker's defense line.
+#[must_use]
+pub fn defense_line(tail: &str) -> Option<&str> {
+    defense_at(tail).map(|(line, _)| line)
+}
+
+/// The worker's defense line ([`defense_line`]) and every non-blank line after it, each trimmed;
+/// `None` where `tail` holds no defense (a landing's receipt, `harness::land_receipt`).
+#[must_use]
+pub fn defense_and_after(tail: &str) -> Option<Vec<&str>> {
+    let (line, after) = defense_at(tail)?;
+    let after = after.map(str::trim).filter(|l| !l.is_empty());
+    Some(std::iter::once(line).chain(after).collect())
 }
 
 /// `tail` as Land's strict reading of open work takes it.

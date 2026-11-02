@@ -52,13 +52,23 @@ pub(crate) fn parse(rest: &str) -> Result<Ask, String> {
             stalled_seen = true;
             ask.if_stalled = true;
         } else if let Some(s) = w.strip_prefix("quiet=") {
-            match s.parse::<u32>() {
-                Ok(s) if ask.quiet.is_none() => ask.quiet = Some(s),
+            match s
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+                .then(|| s.parse::<u32>().ok())
+                .flatten()
+            {
+                Some(s) if ask.quiet.is_none() => ask.quiet = Some(s),
                 _ => return Err(bad()),
             }
         } else if let Some(n) = w.strip_prefix("pid=") {
-            match n.parse::<i32>() {
-                Ok(n) if n > 1 && ask.pid.is_none() => ask.pid = Some(n),
+            match n
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+                .then(|| n.parse::<i32>().ok())
+                .flatten()
+            {
+                Some(n) if n > 1 && ask.pid.is_none() => ask.pid = Some(n),
                 _ => return Err(bad()),
             }
         } else {
@@ -133,7 +143,7 @@ fn relaunchable(
 }
 
 /// WHETHER THE ACT IS OFFERED FOR PROCESS `pid` IN TAB `sid` as far as a word outside the
-/// session can tell (the Claude Code account's `weekly ? · until relaunch`): the host's published
+/// session can tell (the Claude Code account's `weekly – · until relaunch`): the host's published
 /// snapshot names that process (else `not-the-hosts-agent`: an Autopilot-off tab has none) and
 /// its relaunch would bring it back (else `not-relaunchable`, a program with no shell under it
 /// among them). The host's hand (`not-supervised`, `halted`, a driver's lease or turn) is the
@@ -145,7 +155,7 @@ pub(crate) fn offered_for(sid: &str, pid: u32) -> bool {
 }
 
 /// WHETHER THE RELAUNCH LINE aterm would type for process `pid` in tab `sid` HAS ROOM FOR THE
-/// USAGE TAP (the Claude Code account's `weekly ? · until relaunch`, beside [`offered_for`]): the
+/// USAGE TAP (the Claude Code account's `weekly – · until relaunch`, beside [`offered_for`]): the
 /// host's published snapshot names that process and its line, with the longer of the tap's two
 /// values (the one that carries the owner's statusLine) for this aterm's lasting path, fits the
 /// tty's line ([`aterm_agent::harness::relaunch::tap_room`]). `false` where any of that is unread.
@@ -226,14 +236,21 @@ fn offered_unless(
     })
 }
 
-/// The `restart` verb as dispatch runs it ([`restart_in`], [`crate::harness_host::harness_state`]).
+/// The `restart` verb as dispatch runs it, on `by`'s ask ([`restart_in`],
+/// [`crate::harness_host::harness_state`]).
 #[cfg(unix)]
-pub(crate) fn restart(master: i32, rest: &str, ctx: &Arc<SessionCtx>) -> String {
+pub(crate) fn restart(
+    master: i32,
+    rest: &str,
+    ctx: &Arc<SessionCtx>,
+    by: aterm_slog::Actor,
+) -> String {
     restart_in(
         master,
         rest,
         ctx,
         crate::harness_host::harness_state().as_deref(),
+        by,
     )
 }
 
@@ -244,14 +261,15 @@ pub(crate) fn restart_in(
     rest: &str,
     ctx: &Arc<SessionCtx>,
     state: Option<&std::path::Path>,
+    by: aterm_slog::Actor,
 ) -> String {
-    match begin(master, rest, ctx, state) {
+    match begin(master, rest, ctx, state, by) {
         Ok(stamped) => stamped.signal(),
         Err(reply) => reply,
     }
 }
 
-/// First half of the act (steps 1–3): reads the leader and its start, checks fences, and writes or joins a standing stamp for the process.
+/// First half of the act (steps 1–3): reads the leader and its start, checks fences, and writes or joins a standing stamp for the process; `by` is who asked (the session log's `act word=restart by=`, which [`term`] writes).
 #[cfg(unix)]
 #[cfg_attr(
     any(test, debug_assertions),
@@ -266,6 +284,7 @@ pub(crate) fn begin<'a>(
     rest: &str,
     ctx: &'a Arc<SessionCtx>,
     state: Option<&'a std::path::Path>,
+    by: aterm_slog::Actor,
 ) -> Result<Stamped<'a>, String> {
     let ask = parse(rest)?;
     let one_act = ACTING
@@ -323,6 +342,7 @@ pub(crate) fn begin<'a>(
             pgrp,
             stamp,
             wrote: false,
+            by,
             _one_act: one_act,
         });
     }
@@ -342,6 +362,7 @@ pub(crate) fn begin<'a>(
         pgrp,
         stamp,
         wrote: true,
+        by,
         _one_act: one_act,
     })
 }
@@ -359,6 +380,8 @@ pub(crate) struct Stamped<'a> {
     stamp: Stamp,
     /// Whether this act wrote [`Self::stamp`] (else it joined it).
     wrote: bool,
+    /// Who asked for it.
+    by: aterm_slog::Actor,
     _one_act: std::sync::MutexGuard<'static, ()>,
 }
 
@@ -373,11 +396,16 @@ impl Stamped<'_> {
             pgrp,
             stamp,
             wrote,
+            by,
             _one_act,
         } = self;
         let sid = ctx.self_id.as_str();
         let cause = stamp.cause;
-        match term(master, &ctx.sink, pgrp, &stamp.start) {
+        let asker = crate::session_log::EndAsker {
+            timeline: &ctx.timeline,
+            by,
+        };
+        match term(master, &ctx.sink, pgrp, &stamp.start, asker) {
             Signalled::Gone => {
                 let said = take_back(state, sid, &stamp, wrote);
                 aterm_log::info!(
@@ -430,8 +458,13 @@ fn renew(state: &std::path::Path, sid: &str, joined: Stamp) -> Stamp {
 
 /// Windows: no process groups to signal.
 #[cfg(not(unix))]
-pub(crate) fn restart(master: i32, rest: &str, ctx: &Arc<SessionCtx>) -> String {
-    let _ = (master, rest, ctx);
+pub(crate) fn restart(
+    master: i32,
+    rest: &str,
+    ctx: &Arc<SessionCtx>,
+    by: aterm_slog::Actor,
+) -> String {
+    let _ = (master, rest, ctx, by);
     "ERR restart unsupported on this platform\n".to_string()
 }
 
@@ -481,7 +514,10 @@ pub(crate) fn leads(master: i32, pgrp: i32, start: &str) -> bool {
 }
 
 /// Sends the act's `SIGTERM` (step 5) after re-reading the leader (step 4),
-/// dropping unread input first and waking the watch after.
+/// dropping unread input first and waking the watch after. Between the last re-read and the
+/// `killpg`, `asker` writes the act's mark and its ask ([`crate::session_log::EndAsker::ask`]),
+/// so an act that sends nothing writes nothing; a refused `killpg` takes the ask back
+/// ([`crate::session_log::EndAsker::delivered`]).
 #[cfg(unix)]
 #[cfg_attr(
     any(test, debug_assertions),
@@ -491,7 +527,13 @@ pub(crate) fn leads(master: i32, pgrp: i32, start: &str) -> bool {
         project = "harness_host::tests::project_restart_stamp"
     )
 )]
-fn term(master: i32, sink: &aterm_session::sink::SinkWriter, pgrp: i32, start: &str) -> Signalled {
+fn term(
+    master: i32,
+    sink: &aterm_session::sink::SinkWriter,
+    pgrp: i32,
+    start: &str,
+    asker: crate::session_log::EndAsker<'_>,
+) -> Signalled {
     if !leads(master, pgrp, start) {
         return Signalled::Gone;
     }
@@ -499,10 +541,11 @@ fn term(master: i32, sink: &aterm_session::sink::SinkWriter, pgrp: i32, start: &
     if !leads(master, pgrp, start) {
         return Signalled::Gone;
     }
+    asker.ask(pgrp, crate::session_log::AskWord::Restart);
     // SAFETY: `killpg` on the tab's own foreground group, re-read just above.
     let rc = unsafe { libc::killpg(pgrp, libc::SIGTERM) };
     crate::input_stall::after_signal(sink, libc::SIGTERM);
-    if rc == 0 {
+    if asker.delivered(pgrp, rc) {
         Signalled::Sent(discarded)
     } else {
         Signalled::Failed
@@ -857,7 +900,10 @@ impl Withheld {
 /// discard and `killpg` that the process still leads its tab ([`leads`]), no
 /// other hand holds the session ([`another_hand`]), its stamp still stands on
 /// disk with [`KILL_READ_MARGIN`] to spare ([`Watch::lapsed`], [`Watch::named`]),
-/// and the host holds its snapshot ([`read_by_host`]).
+/// and the host holds its snapshot ([`read_by_host`]). Just before the `killpg` it renews the
+/// end its act asked of the group ([`crate::session_log::renew_ask`]), and writes no mark; a
+/// refused `SIGKILL` leaves that ask standing, since the `SIGTERM` before it was delivered and a
+/// group that just led its tab and is now gone ended on it.
 #[cfg(unix)]
 #[cfg_attr(
     any(test, debug_assertions),
@@ -894,6 +940,7 @@ fn kill(ctx: &Weak<SessionCtx>, watch: &Watch) -> &'static str {
             let _ = crate::input_stall::discard_before_signal(master, &ctx.sink, libc::SIGKILL);
             why = withheld();
             if why.is_none() {
+                crate::session_log::renew_ask(&ctx.timeline, pgrp);
                 // SAFETY: `killpg` on the tab's own foreground group, re-read just above.
                 let rc = unsafe { libc::killpg(pgrp, libc::SIGKILL) };
                 crate::input_stall::after_signal(&ctx.sink, libc::SIGKILL);
@@ -941,6 +988,8 @@ fn kill(ctx: &Weak<SessionCtx>, watch: &Watch) -> &'static str {
 }
 
 /// Finishes an in-flight restart across handoff ([`KILL_READ_MARGIN`], [`DEADLINE`], [`kill`]).
+/// The act's end stands as aterm's ask again in this log ([`crate::session_log::EndAsker::stand`]),
+/// with no mark: the predecessor wrote it.
 #[cfg(unix)]
 #[cfg_attr(
     any(test, debug_assertions),
@@ -961,6 +1010,13 @@ pub(crate) fn carry(ctx: &Arc<SessionCtx>, state: &std::path::Path, now_s: u64) 
         return false;
     }
     let left = DEADLINE.saturating_sub(Duration::from_secs(stamp.age_s(now_s)));
+    // The act this carries ends its program on its asker's word; its predecessor wrote its mark,
+    // and this log, which carries no ask across the update, stands it again as aterm's.
+    crate::session_log::EndAsker {
+        timeline: &ctx.timeline,
+        by: aterm_slog::Actor::Aterm,
+    }
+    .stand(pgrp);
     let Some(watch) = watch(state, pgrp, &stamp) else {
         aterm_log::info!(
             "restart: pid {pgrp}: an act a Commit cut is watched already; that watch ends it"

@@ -895,7 +895,10 @@ impl App {
             .snapshot(document)
             .map_or(durable, |snapshot| snapshot.seq);
         let result = ending.map_or(EditResult::Closed, |ending| ending.result(durable));
-        let saved = result != EditResult::Aborted && durable > start && durable >= head;
+        let saved = self.document_store.directory(document).is_none()
+            && result != EditResult::Aborted
+            && durable > start
+            && durable >= head;
         EditOutcome {
             result,
             saved,
@@ -2075,12 +2078,9 @@ mod tests {
         let tabs = tab_ids(&app, WindowId(0));
         let missing =
             crate::native_document_host::path_to_file_uri(&f.path.with_extension("gone")).unwrap();
-        let directory =
-            crate::native_document_host::path_to_file_uri(f.path.parent().unwrap()).unwrap();
         for (uri, refusal) in [
             (f.uri.as_str(), "ERR refused invalid-utf8\n"),
             (missing.as_str(), "ERR refused missing\n"),
-            (directory.as_str(), "ERR refused not-regular\n"),
         ] {
             assert_eq!(edit(&mut app, sid, request(uri, None)).1, refusal, "{uri}");
         }
@@ -2862,13 +2862,53 @@ mod tests {
         );
         assert_eq!(tab_ids(&app, wid), tabs, "nothing opened");
         assert!(!path.exists());
-        let mut asked = request(
-            &crate::native_document_host::path_to_file_uri(f.path.parent().unwrap()).unwrap(),
-            None,
-        );
-        asked.create = true;
-        assert_eq!(edit(&mut app, sid, asked).1, "ERR refused not-regular\n");
         assert!(app.native_documents.edits.open.is_empty());
+    }
+
+    #[test]
+    fn edit_directory_opens_a_read_only_listing_and_closes_the_wait() {
+        let wid = WindowId(0);
+        let mut app = app();
+        let sid = caller(&mut app, wid);
+        let f = fixture("directory", b"contents");
+        let uri = crate::native_document_host::path_to_file_uri(f.path.parent().unwrap()).unwrap();
+        let (ticket, line) = edit(&mut app, sid, request(&uri, None));
+        assert!(line.starts_with("OK "), "{line}");
+        let (_, answer) = wait(&mut app, AwaitKey::Ticket(ticket));
+        let document = document_of(&app, view(&ok(&line)));
+        assert!(app.document_store.directory(document).is_some());
+        type_text(&mut app, wid, "must not edit");
+        assert_eq!(app.document_store.dirty(document), Some(false));
+        let key = |app: &mut App, letter| {
+            assert!(app.native_input_event(
+                wid,
+                &crate::input::InputEvent::Key {
+                    key: aterm_types::keyboard::Key::Character(letter),
+                    mods: aterm_types::keyboard::Modifiers::empty(),
+                    base_layout: None,
+                    layout_text: None,
+                    event_type: aterm_types::keyboard::KeyEventType::Press,
+                }
+            ));
+        };
+        std::fs::write(f.path.with_file_name("fresh.txt"), "new entry").unwrap();
+        key(&mut app, 'g');
+        assert!(
+            app.document_store
+                .snapshot(document)
+                .unwrap()
+                .text
+                .contains("fresh.txt")
+        );
+        key(&mut app, 'n');
+        key(&mut app, 'f');
+        let (_, file_uri) = crate::native_document_host::open_path(&f.path).unwrap();
+        assert!(app.document_store.id_for_uri(&file_uri).is_some());
+        app.close_active_native_tab(wid).unwrap();
+        key(&mut app, 'q');
+        let done = outcome(&answer);
+        assert_eq!((done.result, done.saved), (EditResult::Closed, false));
+        assert_eq!(std::fs::read(&f.path).unwrap(), b"contents");
     }
 
     /// T10 (docs/DESIGN-amacs-grid-2026-10-28.md): an `edit` of a table opens as a grid, and

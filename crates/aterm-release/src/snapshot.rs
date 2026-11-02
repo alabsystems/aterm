@@ -448,6 +448,8 @@ impl ObjectReader {
     }
 
     fn answer(&mut self, oid: &str, kind: &str) -> Result<Vec<u8>, String> {
+        const MAX_HEADER_BYTES: u64 = 4096;
+        const MAX_OBJECT_BYTES: u64 = 512 << 20;
         let dir = self.dir.display();
         if !(aterm_codec::hex::is_lower(oid, 40) || aterm_codec::hex::is_lower(oid, 64)) {
             return Err(format!(
@@ -460,9 +462,15 @@ impl ObjectReader {
             .and_then(|()| stdin.flush())
             .map_err(|e| format!("ask git cat-file in {dir} for {oid}: {e}"))?;
         let mut header = Vec::new();
-        self.stdout
+        (&mut self.stdout)
+            .take(MAX_HEADER_BYTES)
             .read_until(b'\n', &mut header)
             .map_err(|e| format!("read git cat-file in {dir}: {e}"))?;
+        if !header.ends_with(b"\n") {
+            return Err(format!(
+                "git cat-file in {dir} answered a truncated or oversized header for {oid}"
+            ));
+        }
         let line = String::from_utf8_lossy(&header);
         let line = line.trim_end_matches('\n');
         let mut words = line.split(' ');
@@ -478,10 +486,12 @@ impl ObjectReader {
                 "git cat-file in {dir} answered {echo} {seen} for the {kind} {oid}"
             ));
         }
-        let size: u64 = size
-            .parse()
-            .map_err(|_| format!("git cat-file in {dir} answered a bad size: {line}"))?;
-        let mut data = Vec::new();
+        let size: u64 = (!size.is_empty() && size.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| size.parse().ok())
+            .flatten()
+            .filter(|&n| n <= MAX_OBJECT_BYTES)
+            .ok_or_else(|| format!("git cat-file in {dir} answered a bad size: {line}"))?;
+        let mut data = Vec::with_capacity(usize::try_from(size).unwrap_or(0).saturating_add(1));
         (&mut self.stdout)
             .take(size.saturating_add(1))
             .read_to_end(&mut data)
@@ -738,9 +748,21 @@ fn read_blobs(repos: &[PathBuf], entries: &[TreeEntry], sync: &mut Syncer) -> Re
             let mut header = Vec::new();
             let mut result = Ok(());
             for entry in &mine {
+                const MAX_HEADER_BYTES: u64 = 4096;
+                const MAX_BLOB_BYTES: u64 = 512 << 20;
                 header.clear();
-                if let Err(e) = reader.read_until(b'\n', &mut header) {
+                if let Err(e) = (&mut reader)
+                    .take(MAX_HEADER_BYTES)
+                    .read_until(b'\n', &mut header)
+                {
                     result = Err(format!("read git cat-file: {e}"));
+                    break;
+                }
+                if !header.ends_with(b"\n") {
+                    result = Err(format!(
+                        "git cat-file answered a truncated or oversized header for {}",
+                        entry.oid
+                    ));
                     break;
                 }
                 let line = String::from_utf8_lossy(&header);
@@ -756,7 +778,11 @@ fn read_blobs(repos: &[PathBuf], entries: &[TreeEntry], sync: &mut Syncer) -> Re
                     ));
                     break;
                 };
-                let Ok(size) = size.parse::<usize>() else {
+                let Some(size) = (!size.is_empty() && size.bytes().all(|b| b.is_ascii_digit()))
+                    .then(|| size.parse::<u64>().ok())
+                    .flatten()
+                    .filter(|&n| n <= MAX_BLOB_BYTES)
+                else {
                     result = Err(format!("git cat-file answered a bad size: {}", line.trim()));
                     break;
                 };
@@ -767,12 +793,19 @@ fn read_blobs(repos: &[PathBuf], entries: &[TreeEntry], sync: &mut Syncer) -> Re
                     ));
                     break;
                 }
-                let mut data = vec![0u8; size + 1];
-                if let Err(e) = reader.read_exact(&mut data) {
+                let mut data =
+                    Vec::with_capacity(usize::try_from(size).unwrap_or(0).saturating_add(1));
+                if let Err(e) = (&mut reader)
+                    .take(size.saturating_add(1))
+                    .read_to_end(&mut data)
+                {
                     result = Err(format!("read blob {}: {e}", entry.oid));
                     break;
                 }
-                data.pop();
+                if data.pop() != Some(b'\n') || data.len() as u64 != size {
+                    result = Err(format!("read blob {}: cut short", entry.oid));
+                    break;
+                }
                 if object_id("blob", &data, entry.oid.len()).as_deref() != Some(&entry.oid) {
                     result = Err(format!(
                         "the object store of {} answered {} with bytes that are not that \
@@ -1122,9 +1155,31 @@ fn write_beside(full: &Path, data: &[u8], exec: bool) -> Result<(), String> {
     tmp_name.push(format!(".aterm-sync-{}", std::process::id()));
     let tmp = full.with_file_name(tmp_name);
     let _ = fs::remove_file(&tmp);
-    fs::write(&tmp, data).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    let meta = fs::symlink_metadata(&tmp).map_err(|e| format!("inspect {}: {e}", tmp.display()))?;
-    set_mode(&tmp, &meta, exec)?;
+    let want = if exec { 0o755 } else { 0o644 };
+    let mut open = fs::OpenOptions::new();
+    open.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        open.mode(want);
+    }
+    let mut file = open
+        .open(&tmp)
+        .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(fs::Permissions::from_mode(want))
+            .map_err(|e| format!("chmod {}: {e}", tmp.display()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = want;
+    if let Err(e) = std::io::Write::write_all(&mut file, data) {
+        drop(file);
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("write {}: {e}", tmp.display()));
+    }
+    drop(file);
     fs::rename(&tmp, full).map_err(|e| {
         let _ = fs::remove_file(&tmp);
         format!("place {}: {e}", full.display())

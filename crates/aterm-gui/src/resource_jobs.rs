@@ -2,6 +2,13 @@
 // Copyright 2026 Andrew Yates
 
 //! Authenticated delegated jobs.
+//!
+//! A tab's tool call can run in a shared, launchd-owned app server outside the tab's parent
+//! tree: parent traversal misses that work, and charging the server would bill every tab it
+//! serves to one. So a process claims itself. `resources register` binds only the caller's own
+//! kernel peer PID, checked against the start record it names (`aterm resource-run` registers,
+//! then execs the command in place), never an arbitrary PID, its ancestors or its siblings, and
+//! the ledger credits that root's start-checked descendants to its tab once.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
@@ -172,7 +179,7 @@ pub(crate) fn command(ctx: &crate::SessionCtx, owner: bool, rest: &str) -> Strin
             let mut expected_start = None;
             for part in words {
                 if let Some(value) = part.strip_prefix("start=") {
-                    if expected_start.is_some() {
+                    if expected_start.is_some() || !value.bytes().all(|b| b.is_ascii_digit()) {
                         return usage();
                     }
                     let Ok(start) = value.parse::<u64>() else {

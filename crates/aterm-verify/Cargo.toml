@@ -52,10 +52,26 @@ aterm-hash = { workspace = true }
 aterm-digest = { workspace = true }
 aterm-toml = { workspace = true }
 aterm-uds = { workspace = true }
+# The instance the run rides in, reached through aterm ctl's own client path
+# (`hosting_sock`, `connect_then_read_token`, `exchange_lines`): `window_list`
+# reads the run-start line's `listed:` word from it where verify's own read of
+# the Developer Tools list is refused outside a `.app`, and `runs::ToInstance`
+# tells it what a run's passes end unasked. Workspace crate, std-only, with no
+# third-party dependency.
+aterm-ctl = { path = "../aterm-ctl" }
 serde = { workspace = true, features = ["derive"] }
 # `glue` and `wasm-glue` read the descriptor aterm-wasm-abi's `#[export]`
 # writes, with that crate's own decoder and lowering table.
 aterm-wasm-abi = { workspace = true }
+# Disk admission (`atpkg::admit_disk`), whose directory tags spell a path as
+# `runs`' run roots do (`aterm_uds::runs::canonical`, which it re-exports), on
+# every target. On Unix, `verify
+# provision` too: atpkg's vetted extractor lays each pinned upstream archive
+# (`atpkg::extract::extract_tree`), its Mach-O walk and load-command reader
+# hold pwsh's tree to its signer and fish's build to the OS's libraries
+# (`atpkg::macho`), and the updater's codesign check is the Developer ID
+# requirement pwsh's Mach-Os meet.
+atpkg = { workspace = true }
 
 # Scratch output captures (and test directories) removed on drop.
 aterm-tempfile = { workspace = true }
@@ -89,12 +105,6 @@ aterm-types = { workspace = true }
 # The arena lanes' interrupt guard: block SIGINT/SIGTERM/SIGHUP, take them on
 # one thread with `sigwait`, and `killpg` the terminals under test.
 libc = { workspace = true }
-# `verify provision`: atpkg's vetted extractor lays each pinned upstream archive
-# (`atpkg::extract::extract_tree`), its Mach-O walk and load-command reader hold
-# pwsh's tree to its signer and fish's build to the OS's libraries
-# (`atpkg::macho`), and the updater's codesign check is the Developer ID
-# requirement pwsh's Mach-Os meet.
-atpkg = { workspace = true }
 aterm-update-core = { workspace = true }
 # `verify provision --linux`: Ubuntu's pinned image files for the lane's own VM
 # (`aterm_vz::pins`), the one place a pin bump edits, and the words for a
@@ -109,3 +119,10 @@ aterm-spec = { workspace = true }
 
 [lints]
 workspace = true
+
+# Nothing in `aterm` depends on verify, so `verify cells` reaches its Linux
+# code only through this key: the linux-arm cell lints it with the clippy.toml
+# bans and type-checks its targets (the Linux-only tests among them) on
+# aarch64-unknown-linux-gnu, beside `aterm` (STOCK EXCEPTION, as every cell).
+[package.metadata.aterm]
+cells = ["linux-arm"]

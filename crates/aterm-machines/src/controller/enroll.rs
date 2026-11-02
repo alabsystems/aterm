@@ -134,7 +134,7 @@ pub fn parse_args(sys: &dyn System, args: &[String]) -> Result<Args, String> {
         Some(v) => Some(
             v.parse::<usize>()
                 .ok()
-                .filter(|n| (1..=64).contains(n))
+                .filter(|n| !v.starts_with('+') && (1..=64).contains(n))
                 .ok_or_else(|| format!("enroll: --parallel takes 1 to 64, not {v:?}"))?,
         ),
     };

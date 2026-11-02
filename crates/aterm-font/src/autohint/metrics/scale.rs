@@ -234,8 +234,9 @@ fn scale_cjk_axis_metrics(
         let dist = fixed_mul(unscaled_blue.position - unscaled_blue.overshoot, scale);
         if (-48..=48).contains(&dist) {
             blue.position.fitted = pix_round(blue.position.scaled);
-            let delta1 = fixed_div(blue.position.fitted, scale) - unscaled_blue.overshoot;
-            let mut delta2 = fixed_mul(delta1.abs(), scale);
+            let delta1 =
+                fixed_div(blue.position.fitted, scale).wrapping_sub(unscaled_blue.overshoot);
+            let mut delta2 = fixed_mul(delta1.wrapping_abs(), scale);
             if delta2 < 32 {
                 delta2 = 0;
             } else {

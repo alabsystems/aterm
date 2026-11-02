@@ -267,6 +267,44 @@ fn output_redraw_admission_obeys_zoom_and_stamps_before_os_window_check() {
     assert_eq!(app.windows[&wid].pending_deco_birth, Some(second));
 }
 
+/// The tick's native sweep walks the pool at most once per [`session_status::NATIVE_SWEEP`], and
+/// asks for no wake where it left nothing open.
+#[test]
+fn the_native_sweep_walks_the_pool_once_per_its_period() {
+    let mut app = App::headless_for_test();
+    let t0 = Instant::now();
+    let walked = |app: &mut App, at: Instant| {
+        let before = wake_census::pool_visits();
+        let next = app.reconcile_native_extinctions(at);
+        (wake_census::pool_visits() - before, next)
+    };
+    let sessions = app.pool.iter().count() as u64;
+    let period = session_status::NATIVE_SWEEP;
+    assert_eq!(
+        walked(&mut app, t0),
+        (sessions, None),
+        "the first look walks"
+    );
+    let inside = t0 + period - Duration::from_millis(1);
+    assert_eq!(
+        walked(&mut app, inside),
+        (0, None),
+        "inside the period, none"
+    );
+    assert_eq!(
+        walked(&mut app, t0 + period),
+        (sessions, None),
+        "due, it walks"
+    );
+    // A sweep that left an operation open asks to be woken at its next.
+    app.session_status.note_native_sweep(t0, true);
+    assert_eq!(
+        walked(&mut app, t0 + Duration::from_millis(1)),
+        (0, Some(t0 + period)),
+        "open: the next look's time"
+    );
+}
+
 #[test]
 fn output_wake_redraw_admission_is_o_visible_windows_at_any_session_count() {
     let mut steady_locks: Option<u64> = None;
@@ -383,4 +421,58 @@ fn output_wake_redraw_admission_is_o_visible_windows_at_any_session_count() {
             "{background} background sessions: by a retry of it alone"
         );
     }
+}
+
+/// Output a window shows wakes that window from rest, and only that one: output of a pane its
+/// zoom hides, or of a session another window does not show, stirs nothing.
+#[test]
+fn visible_output_stirs_only_the_window_that_shows_it() {
+    let mut app = App::headless_for_test();
+    // The rest is off unless set.
+    app.config.idle_rest_secs = Some(30.0);
+    let original = WindowId(0);
+    let viewer = app
+        .open_active_session_in_new_window_logical()
+        .expect("session can be shared into a second window");
+    let sid = app.next_session_id;
+    app.push_stub_tab(viewer, stub_session(sid));
+    let shown = app.split_active_stub_tab(original);
+    let hidden = 0;
+    assert!(
+        app.windows
+            .get_mut(&original)
+            .expect("window")
+            .tab_set
+            .active_mut()
+            .expect("split tab")
+            .toggle_zoom()
+    );
+    let rest_at = Instant::now() + Duration::from_secs(60);
+    app.settle_rest(rest_at);
+    assert!(
+        !app.windows[&original].rest.resting(),
+        "a headless instance's windows never rest"
+    );
+    app.headless = false;
+    app.settle_rest(rest_at);
+    let resting = |app: &App| {
+        [original, viewer]
+            .into_iter()
+            .filter(|wid| app.windows[wid].rest.resting())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(resting(&app), vec![original, viewer]);
+
+    assert!(!app.admit_output_redraws(hidden, rest_at));
+    assert_eq!(
+        resting(&app),
+        vec![original, viewer],
+        "output no window shows stirs nothing"
+    );
+    assert!(app.admit_output_redraws(shown, rest_at));
+    assert_eq!(
+        resting(&app),
+        vec![viewer],
+        "the window that shows it wakes, the other rests on"
+    );
 }

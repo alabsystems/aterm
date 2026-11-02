@@ -118,7 +118,7 @@ fn ladder(f: &Facts) -> bool {
             .as_ref()
             .is_some_and(|a| a.refused.is_none() && (a.renews || a.next_sign_in.is_some()))
     } else {
-        f.pool.as_ref().is_some_and(|p| {
+        f.login_pool().is_some_and(|p| {
             p.refused.is_none()
                 && crate::harness::accounts::Cli::parse(f.connector.id)
                     .and_then(|cli| p.sign_in_target(cli))
@@ -156,7 +156,7 @@ pub fn bar(f: &Facts) -> Option<Bar> {
         .accounts
         .as_ref()
         .and_then(|a| a.off)
-        .or_else(|| f.pool.as_ref().and_then(|p| p.off));
+        .or_else(|| f.login_pool().and_then(|p| p.off));
     if let Some(switch) = off {
         return Some(Bar {
             why: format!("{switch} keeps aterm's own sign-ins off here"),
@@ -165,10 +165,16 @@ pub fn bar(f: &Facts) -> Option<Bar> {
     }
     if f.connector.is_claude() {
         let a = f.accounts.as_ref()?;
+        let label = a.next_sign_in.as_deref().unwrap_or(&a.label);
+        if a.tried.as_ref().is_some_and(|t| t.outcome == "blocked") {
+            return Some(Bar {
+                why: format!("a page stopped aterm's sign-in of `{label}`"),
+                step: format!("aterm harness accounts renew {label}"),
+            });
+        }
         if a.unattended {
             return None;
         }
-        let label = a.next_sign_in.as_deref().unwrap_or(&a.label);
         return Some(Bar {
             why: format!(
                 "no route signs `{label}` in with nobody at this Mac: no mailbox answers its \
@@ -177,7 +183,7 @@ pub fn bar(f: &Facts) -> Option<Bar> {
             step: format!("aterm harness accounts browser {label}"),
         });
     }
-    let p = f.pool.as_ref()?;
+    let p = f.login_pool()?;
     let cli = crate::harness::accounts::Cli::parse(id)?;
     let (label, _) = p.sign_in_target(cli)?;
     let step = match p.person_task? {
@@ -202,8 +208,7 @@ pub fn bar(f: &Facts) -> Option<Bar> {
 pub fn held(f: &Facts, now: i64) -> Option<String> {
     let hold = crate::harness::accounts_sync::PERSON_BACKOFF_SECS;
     if let Some(at) = f
-        .pool
-        .as_ref()
+        .login_pool()
         .and_then(|p| p.bot_check_at)
         .filter(|at| now.saturating_sub(*at) < hold)
     {
@@ -218,8 +223,8 @@ pub fn held(f: &Facts, now: i64) -> Option<String> {
         .accounts
         .as_ref()
         .and_then(|a| a.tried.as_ref())
-        .or_else(|| f.pool.as_ref().and_then(|p| p.tried.as_ref()))
-        .is_some_and(|t| t.outcome == "failed");
+        .or_else(|| f.login_pool().and_then(|p| p.tried.as_ref()))
+        .is_some_and(|t| matches!(t.outcome, "failed" | "blocked"));
     if !failed {
         return None;
     }
@@ -234,9 +239,10 @@ fn tried_words(f: &Facts, now: i64) -> Option<String> {
         .accounts
         .as_ref()
         .and_then(|a| a.tried.as_ref())
-        .or_else(|| f.pool.as_ref().and_then(|p| p.tried.as_ref()))?;
+        .or_else(|| f.login_pool().and_then(|p| p.tried.as_ref()))?;
     let how = match tried.outcome {
         "no-route" => "found no route",
+        "blocked" => "was stopped by its page",
         _ => "failed",
     };
     Some(format!(
@@ -351,6 +357,30 @@ const fn login_seen(f: &Facts) -> Option<bool> {
 
 /// Judges one CLI.
 #[must_use]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountHealthScope",
+        action = "Scope",
+        reason = "Select the login ownership fixture before assessing its health."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountHealthScope",
+        action = "Issue",
+        reason = "Select the health observation fixture before assessing its scope."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountHealthScope",
+        action = "Assess",
+        project = "aterm_agent::ai::state::tests::health_scope_transition"
+    )
+)]
 pub fn assess(f: &Facts, wanted: bool, now: i64) -> Row {
     let c = f.connector;
     let version = f.managed.as_ref().and_then(|m| m.version.clone());
@@ -405,6 +435,13 @@ pub fn assess(f: &Facts, wanted: bool, now: i64) -> Row {
             );
             return row;
         }
+        Some(Kept::RemovalUnreadable) => {
+            off(
+                &mut row,
+                "removal decisions are unreadable; installation is held",
+            );
+            return row;
+        }
         None => {}
     }
     if f.managed.is_none() {
@@ -435,35 +472,44 @@ pub fn assess(f: &Facts, wanted: bool, now: i64) -> Row {
         };
         return row;
     }
+    if let Some(why) = &f.credential_store_error {
+        row.state = State::Unproven;
+        row.fact = why.clone();
+        return row;
+    }
     let served_at = f
         .accounts
         .as_ref()
         .and_then(|a| a.served_at)
-        .or_else(|| f.pool.as_ref().and_then(|p| p.served_at));
+        .or_else(|| f.login_pool().and_then(|p| p.served_at));
     let renewed_at = f
         .accounts
         .as_ref()
         .and_then(|a| a.renewed_at)
-        .or_else(|| f.pool.as_ref().and_then(|p| p.renewed_at));
+        .or_else(|| f.login_pool().and_then(|p| p.renewed_at));
     let refreshed = f.login_file.as_ref().and_then(|(_, w)| *w);
-    let newest_use = [f.record.used_at, served_at, refreshed, renewed_at]
-        .into_iter()
-        .flatten()
-        .max();
-    let ended = f
-        .record
-        .ended_at
-        .filter(|end| newest_use.is_none_or(|u| *end >= u))
-        .map(|at| {
-            let why = f.record.ended_why.map_or("it ended", Ended::says);
-            (at, why)
-        });
-    let claude_expired = f.accounts.as_ref().and_then(|a| a.state) == Some("expired");
-    let pool_expired = f.pool.as_ref().and_then(|p| p.state) == Some("expired");
+    let record = f.default_record();
+    let newest_use = [
+        record.and_then(|r| r.used_at),
+        served_at,
+        refreshed,
+        renewed_at,
+    ]
+    .into_iter()
+    .flatten()
+    .max();
+    let ended = record.and_then(|r| {
+        r.ended_at
+            .filter(|end| newest_use.is_none_or(|u| *end >= u))
+            .map(|at| (at, r.ended_why.map_or("it ended", Ended::says)))
+    });
+    let claude_expired = f
+        .accounts
+        .as_ref()
+        .is_some_and(|a| a.state == Some("expired") || a.signed_out_at.is_some());
+    let pool_expired = f.login_pool().and_then(|p| p.state) == Some("expired");
     row.used = [
-        f.record
-            .used_at
-            .zip(f.record.used_how.map(crate::ai::store::How::word)),
+        record.and_then(|r| r.used_at.zip(r.used_how.map(crate::ai::store::How::word))),
         served_at.map(|t| (t, "served")),
         renewed_at.map(|t| (t, "renewed")),
         refreshed.map(|t| (t, "refreshed")),
@@ -489,7 +535,15 @@ pub fn assess(f: &Facts, wanted: bool, now: i64) -> Row {
     // Where Claude Code's sign-in starts nothing until a person does something else, that is
     // the row's step, never a command that would only say why it starts nothing.
     let mend = super::login::claude_mend(f);
+    let sign_in_refused = f
+        .accounts
+        .as_ref()
+        .and_then(|a| a.sign_in_refused.as_deref())
+        .or_else(|| f.login_pool().and_then(|p| p.sign_in_refused.as_deref()));
     let give_fix = |row: &mut Row| {
+        if sign_in_refused.is_some() {
+            return;
+        }
         match &mend {
             Some(m) => row.mend = Some(m.step.clone()),
             None => row.fix = Some(fix.clone()),
@@ -500,7 +554,7 @@ pub fn assess(f: &Facts, wanted: bool, now: i64) -> Row {
     // is the only one that runs, and while the pool cannot take it here (another Mac's warm set
     // holds it, another Mac's claim does, or this Mac cannot record its claims and is not its
     // home) `aterm ai login` signs nothing in.
-    let held_default = f.pool.as_ref().is_some_and(|p| {
+    let held_default = f.login_pool().is_some_and(|p| {
         p.unread
             && matches!(
                 p.default_row,
@@ -509,13 +563,18 @@ pub fn assess(f: &Facts, wanted: bool, now: i64) -> Row {
     });
     let signed_out = |row: &mut Row, fact: String| {
         row.state = State::SignedOut;
-        row.mark = Mark::Fail;
+        row.mark = if sign_in_refused.is_some() {
+            Mark::Note
+        } else {
+            Mark::Fail
+        };
         row.fact = [
             Some(format!("{fact}{unmeasured}")),
             mend.as_ref().map(|m| m.why.clone()),
             tried.clone(),
             barred.clone(),
             pool.clone(),
+            sign_in_refused.map(|why| format!("local sign-in is refused: {why}")),
         ]
         .into_iter()
         .flatten()
@@ -527,7 +586,7 @@ pub fn assess(f: &Facts, wanted: bool, now: i64) -> Row {
     };
     // A launch aterm makes of a pool's CLI that is refused as the records stand runs nothing (no
     // worker starts, `aterm ai review` runs no reviewer of it), in its words.
-    let launch_refused = f.pool.as_ref().and_then(|p| {
+    let launch_refused = f.login_pool().and_then(|p| {
         p.launch_refused.as_deref().map(|why| {
             why.strip_suffix(crate::harness::accounts_pool::NO_WORKER)
                 .unwrap_or(why)
@@ -537,7 +596,7 @@ pub fn assess(f: &Facts, wanted: bool, now: i64) -> Row {
     // as aterm runs it, whatever the records of the row the pool would serve past the pin say,
     // and the sign-in that ends it is that row's: the pool's next sign-in signs it in
     // ([`super::facts::CliAccounts::next`]), as aterm's own or a person's ([`sign_in_actor`]).
-    if let (Some(p), Some(why)) = (f.pool.as_ref(), launch_refused)
+    if let (Some(p), Some(why)) = (f.login_pool(), launch_refused)
         && let Some(super::facts::LaunchEnd::SignIn(label)) = &p.launch_end
         && p.next.as_deref() == Some(label.as_str())
     {
@@ -586,7 +645,7 @@ pub fn assess(f: &Facts, wanted: bool, now: i64) -> Row {
         } else {
             (
                 "its account pool",
-                f.pool.as_ref().and_then(|p| p.signed_out_at),
+                f.login_pool().and_then(|p| p.signed_out_at),
             )
         };
         let fact = match at {
@@ -609,6 +668,11 @@ pub fn assess(f: &Facts, wanted: bool, now: i64) -> Row {
         );
         return row;
     }
+    let limited = [f.limited_until, record.and_then(|r| r.limited_until)]
+        .into_iter()
+        .flatten()
+        .filter(|t| *t > now)
+        .max();
     match login_seen(f) {
         Some(false) if !f.home_exists => {
             signed_out(&mut row, "never signed in here".to_string());
@@ -618,16 +682,20 @@ pub fn assess(f: &Facts, wanted: bool, now: i64) -> Row {
             signed_out(&mut row, "no login is stored".to_string());
             return row;
         }
-        None if newest_use.is_none() => {
+        None if newest_use.is_none() && limited.is_none() => {
             row.state = State::Unproven;
             row.mark = Mark::Note;
             row.fact = if f.hidden_store {
-                "it keeps its login in the OS keyring, which aterm does not read".to_string()
+                "it uses credential storage that aterm does not inspect".to_string()
             } else if f.home_exists {
                 format!("it has run here; nothing has shown a login yet{unmeasured}")
             } else {
                 format!("its home is not there; nothing has shown a login yet{unmeasured}")
             };
+            if let Some(why) = sign_in_refused {
+                row.fact
+                    .push_str(&format!(" · local sign-in is refused: {why}"));
+            }
             return row;
         }
         _ => {}
@@ -643,19 +711,14 @@ pub fn assess(f: &Facts, wanted: bool, now: i64) -> Row {
         .accounts
         .as_ref()
         .and_then(|a| a.renew_by)
-        .or_else(|| f.pool.as_ref().and_then(|p| p.renew_by));
-    let limited = [f.limited_until, f.record.limited_until]
-        .into_iter()
-        .flatten()
-        .filter(|t| *t > now)
-        .max();
+        .or_else(|| f.login_pool().and_then(|p| p.renew_by));
     row.limited_until = limited;
     row.renew_by = renew_by;
     let next_sign_in = f
         .accounts
         .as_ref()
         .and_then(|a| a.next_sign_in.as_deref())
-        .or_else(|| f.pool.as_ref().and_then(|p| p.next_sign_in.as_deref()));
+        .or_else(|| f.login_pool().and_then(|p| p.next_sign_in.as_deref()));
     if let Some(by) = renew_by {
         words.push(format!("renew by {}", when(by)));
         row.state = State::Due(by);
@@ -663,7 +726,7 @@ pub fn assess(f: &Facts, wanted: bool, now: i64) -> Row {
         // On a Codex build that keeps no row's login its own, only Codex's own sign-in renews
         // the row on this machine's own login, and `aterm ai login` runs it only once that login
         // has ended, since it signs the login out first.
-        if !f.pool.as_ref().is_some_and(serves_default_row) {
+        if !f.login_pool().is_some_and(serves_default_row) {
             give_fix(&mut row);
         }
     } else if let Some(until) = limited {
@@ -681,7 +744,7 @@ pub fn assess(f: &Facts, wanted: bool, now: i64) -> Row {
             row.mark = Mark::Note;
         }
     } else if f.accounts.as_ref().and_then(|a| a.state) == Some("ok")
-        || f.pool.as_ref().and_then(|p| p.state) == Some("ok")
+        || f.login_pool().and_then(|p| p.state) == Some("ok")
         || newest_use.is_some_and(|t| now.saturating_sub(t) <= OK_FRESH_S)
     {
         row.state = State::Ok;
@@ -698,7 +761,7 @@ pub fn assess(f: &Facts, wanted: bool, now: i64) -> Row {
     // the sign-in of a pinned row the pool cannot sign in, is a person's: a warning whose step is
     // the commands that end it where they are known, else what to do. The pool's own records (a
     // lease, a warm set) end it by themselves, so that is a note that asks nobody for anything.
-    if let (Some(p), Some(why)) = (f.pool.as_ref(), launch_refused) {
+    if let (Some(p), Some(why)) = (f.login_pool(), launch_refused) {
         use super::facts::LaunchEnd;
         words.push(format!("a launch aterm makes of it now is refused: {why}"));
         if matches!(row.state, State::Ok | State::Idle) {
@@ -728,6 +791,22 @@ pub fn assess(f: &Facts, wanted: bool, now: i64) -> Row {
             }
         }
     }
+    if let Some(why) = f
+        .accounts
+        .as_ref()
+        .and_then(|a| a.launch_refused.as_deref())
+    {
+        words.push(format!("a launch aterm makes of it now is refused: {why}"));
+        if matches!(row.state, State::Ok | State::Idle) {
+            row.mark = Mark::Note;
+        }
+    }
+    if matches!(row.state, State::Due(_))
+        && let Some(why) = sign_in_refused
+    {
+        words.push(format!("local sign-in is refused: {why}"));
+        row.mark = Mark::Note;
+    }
     if !f.env_credentials.is_empty() {
         words.push(format!(
             "{} set in this environment would be used instead of the stored login",
@@ -745,7 +824,7 @@ pub fn assess(f: &Facts, wanted: bool, now: i64) -> Row {
 /// [`Facts::accounts`]).
 fn pool_words(f: &Facts) -> Option<String> {
     use crate::harness::codex_alab::DefaultRow;
-    let pool = f.pool.as_ref()?;
+    let pool = f.login_pool()?;
     let file = pool.roster.file_name().map_or_else(
         || pool.roster.display().to_string(),
         |n| n.to_string_lossy().into_owned(),
@@ -831,7 +910,7 @@ fn serves_default_row(pool: &crate::ai::facts::CliAccounts) -> bool {
 #[must_use]
 pub fn sign_in_then_pin(f: &Facts) -> Option<(&str, bool)> {
     use crate::harness::codex_alab::DefaultRow;
-    let p = f.pool.as_ref()?;
+    let p = f.login_pool()?;
     let Some(DefaultRow::SignedOut { label, stored }) = &p.default_row else {
         return None;
     };

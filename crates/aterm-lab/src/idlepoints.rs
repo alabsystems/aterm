@@ -72,7 +72,7 @@ pub(crate) fn spells(cast: &halfdraw::Cast, reader: &dyn ScreenReader) -> Vec<Sp
     let mut states: Vec<St> = Vec::new();
     let mut title: Option<String> = None;
     for e in &cast.events {
-        let at = base + std::time::Duration::from_secs_f64(e.at.max(0.0));
+        let at = halfdraw::event_instant(base, e.at);
         t.process_at(
             e.data.as_bytes(),
             ClockReading {
@@ -368,7 +368,13 @@ pub fn cmd_idle_points(args: &[String]) -> Res {
                         .transpose()?,
                 );
             }
-            "--show" => show = it.next().and_then(|n| n.parse().ok()).ok_or_else(usage)?,
+            "--show" => {
+                show = it
+                    .next()
+                    .filter(|n| n.bytes().all(|b| b.is_ascii_digit()))
+                    .and_then(|n| n.parse().ok())
+                    .ok_or_else(usage)?;
+            }
             f if !f.starts_with('-') => paths.push(PathBuf::from(f)),
             _ => return Err(usage()),
         }
@@ -1044,7 +1050,13 @@ mod tests {
                 .all(|s| s.title.is_none() && s.title_rested.is_none())
         );
         assert!(!spell_report("c", &bare, 1).contains("title:"));
+        // Claude Code's reader reads its own title, in which Muse Code's spinner is no run: a
+        // spell with a title rests where it opened.
         let claude = spells(&cast, Program::Claude.reader());
-        assert!(claude.iter().all(|s| s.title_rested.is_none()));
+        assert!(
+            claude
+                .iter()
+                .all(|s| s.title.is_none() || s.title_rested.is_some_and(|r| r <= 0.0))
+        );
     }
 }

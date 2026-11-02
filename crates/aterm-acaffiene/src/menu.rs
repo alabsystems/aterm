@@ -112,11 +112,9 @@ pub const STARTUP_LABEL: &str = "Enable at Startup";
 /// Menu title for Enable at Startup when blocked in Login Items ([`Startup::Blocked`]).
 pub const STARTUP_BLOCKED_LABEL: &str = "Enable at Startup \u{2014} Allow in Login Items\u{2026}";
 
-/// Compose the menu rows at `now` for `mode` as the mug keeps it ([`Mode::kept`], so a span past
-/// its deadline checks Forever), `startup`, and `version`.
+/// Compose the menu rows at `now` for `mode`, `startup`, and `version`.
 #[must_use]
 pub fn compose(mode: Mode, now: Clocks, startup: Startup, version: &str) -> Vec<Row> {
-    let mode = mode.kept(now);
     let current = mode.choice(now);
     let left = mode.remaining(now);
     let mut rows = vec![Row::Info(about_line(version)), Row::Separator];
@@ -124,11 +122,7 @@ pub fn compose(mode: Mode, now: Clocks, startup: Startup, version: &str) -> Vec<
         let checked = current == Some(choice);
         let label = match (checked, left) {
             (true, Some(secs)) => {
-                format!(
-                    "{} \u{2014} {} left, then forever",
-                    choice.label(),
-                    describe_left(secs)
-                )
+                format!("{} \u{2014} {} left", choice.label(), describe_left(secs))
             }
             _ => choice.label().to_string(),
         };
@@ -158,14 +152,21 @@ pub fn compose(mode: Mode, now: Clocks, startup: Startup, version: &str) -> Vec<
     rows
 }
 
-/// Status-item tooltip for `mode` at `now`.
+/// What the tooltip says while the mode is on but macOS refused the activity.
+pub const NOT_HELD_TIP: &str =
+    "aCaffiene could not keep this Mac awake \u{2014} it asks macOS again every minute";
+
+/// Status-item tooltip for `mode` at `now`; `held` says whether the mug holds its activity, which
+/// an on mode without it does not keep the Mac awake ([`NOT_HELD_TIP`]). A span says the time it
+/// has left, after which the Mac may sleep.
 #[must_use]
-pub fn tooltip(mode: Mode, now: Clocks) -> String {
+pub fn tooltip(mode: Mode, now: Clocks, held: bool) -> String {
     match mode.settled(now) {
         Mode::Off => "aCaffiene is off \u{2014} click to keep this Mac awake".to_string(),
+        _ if !held => NOT_HELD_TIP.to_string(),
         Mode::Forever => "aCaffiene is keeping this Mac awake until you click".to_string(),
         Mode::Until { deadline, .. } => format!(
-            "aCaffiene is keeping this Mac awake: {} left of this span, then until you click",
+            "aCaffiene is keeping this Mac awake for {} more",
             describe_left(deadline - now.since_boot)
         ),
     }
@@ -258,7 +259,7 @@ mod tests {
             checked,
             [
                 (
-                    "Activate for 8 Hours \u{2014} 7 h 12 min left, then forever",
+                    "Activate for 8 Hours \u{2014} 7 h 12 min left",
                     MenuAction::Activate(Choice::Hours8)
                 ),
                 (STARTUP_LABEL, MenuAction::ToggleStartup),
@@ -271,16 +272,9 @@ mod tests {
             .map(|(l, _, _)| l.as_str())
             .collect();
         assert_eq!(checked, ["Activate Forever"]);
-        // A span past its deadline, before the mug's tick takes it again, is the forever it
-        // ends in.
+        // A span past its deadline has ended: nothing is checked.
         let expired = actions(&compose(mode, NOW + 8 * HOUR, Startup::Off, "1"));
-        let checked: Vec<_> = expired
-            .iter()
-            .filter(|(_, _, c)| *c)
-            .map(|(l, _, _)| l.as_str())
-            .collect();
-        assert_eq!(checked, ["Activate Forever"]);
-        assert!(expired.iter().all(|(l, _, _)| !l.contains("left")));
+        assert!(expired.iter().all(|(l, _, c)| !c && !l.contains("left")));
     }
 
     #[test]
@@ -309,12 +303,14 @@ mod tests {
 
     #[test]
     fn the_tooltip_says_whether_and_how_long() {
-        assert!(tooltip(Mode::Off, NOW).contains("off"));
-        assert!(tooltip(Mode::Forever, NOW).contains("until you click"));
-        let timed = tooltip(Mode::chosen(Choice::Hours1, NOW), NOW + 8 * 60);
+        assert!(tooltip(Mode::Off, NOW, false).contains("off"));
+        assert!(tooltip(Mode::Forever, NOW, true).contains("until you click"));
+        let timed = tooltip(Mode::chosen(Choice::Hours1, NOW), NOW + 8 * 60, true);
         assert!(timed.contains(&describe_left(52 * 60)), "{timed}");
-        assert!(timed.ends_with("then until you click"), "{timed}");
-        assert!(tooltip(Mode::chosen(Choice::Hours1, NOW), NOW + HOUR).contains("off"));
+        assert!(tooltip(Mode::chosen(Choice::Hours1, NOW), NOW + HOUR, false).contains("off"));
+        for on in [Mode::Forever, Mode::chosen(Choice::Hours1, NOW)] {
+            assert_eq!(tooltip(on, NOW, false), NOT_HELD_TIP, "{on:?}");
+        }
     }
 
     /// Eight minutes into Activate for 1 Hour, the wall clock set back a day: the checked row and
@@ -327,14 +323,11 @@ mod tests {
             wall: NOW.wall - 24 * HOUR + 8 * 60,
         };
         let items = actions(&compose(mode, back, Startup::Off, "1"));
-        assert_eq!(
-            items[0].0,
-            "Activate for 1 Hour \u{2014} 52 min left, then forever"
-        );
+        assert_eq!(items[0].0, "Activate for 1 Hour \u{2014} 52 min left");
         assert!(items[0].2);
         assert_eq!(
-            tooltip(mode, back),
-            "aCaffiene is keeping this Mac awake: 52 min left of this span, then until you click"
+            tooltip(mode, back, true),
+            "aCaffiene is keeping this Mac awake for 52 min more"
         );
     }
 }

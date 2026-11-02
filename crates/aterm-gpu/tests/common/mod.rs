@@ -94,10 +94,14 @@ pub const FIXTURE_FONT: &str = concat!(
 /// not run the test (`aterm_spec::host::could_not_run`), which is no pass;
 /// past the device, a failure is the code's.
 fn gpu_on(font: &str, px: f32, theme: Theme) -> aterm_gpu::GpuRenderer {
-    let ctx = aterm_gpu::GpuContext::new()
+    let ctx = aterm_gpu::GpuContext::new_headless()
         .unwrap_or_else(|e| aterm_spec::host::could_not_run(format!("no GPU: {e}")));
-    aterm_gpu::GpuRenderer::from_parts(ctx, cpu_on(font, px, theme), Some(font.into()), theme)
-        .expect("the GPU renderer assembles on an acquired device")
+    let mut gpu =
+        aterm_gpu::GpuRenderer::from_parts(ctx, cpu_on(font, px, theme), Some(font.into()), theme)
+            .expect("the GPU renderer assembles on an acquired device");
+    gpu.prepare_offscreen()
+        .expect("the headless GPU arm prepares on an acquired device");
+    gpu
 }
 
 /// The arms a parity test runs on, each a fresh [`backends`] pair at

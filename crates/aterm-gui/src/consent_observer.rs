@@ -292,7 +292,10 @@ pub(crate) fn parse_line(line: &str) -> Option<TccEvent> {
 fn pid_in_block(body: &str, block: &str) -> Option<i32> {
     let at = body.find(block)?;
     let rest = body.get(at..)?;
-    field_after(rest, "pid=")?.parse::<i32>().ok()
+    field_after(rest, "pid=")
+        .filter(|p| p.bytes().all(|b| b.is_ascii_digit()))?
+        .parse::<i32>()
+        .ok()
 }
 
 /// `yes`/`true`/`1` are true; anything else is false. Case-insensitive.
@@ -1541,11 +1544,14 @@ impl ChildSlot {
 /// returns, and the worker that spawned the child is what reaps it.
 #[cfg(unix)]
 fn send_signal(pid: i32, signal: Signal) {
+    if pid <= 1 {
+        return;
+    }
     let signal = match signal {
         Signal::Term => libc::SIGTERM,
         Signal::Kill => libc::SIGKILL,
     };
-    // SAFETY: `kill` with a positive PID delivers a signal to our unreaped child process without memory effects.
+    // SAFETY: `kill` with `pid > 1` delivers a signal to our unreaped child process without memory effects.
     unsafe {
         libc::kill(pid, signal);
     }

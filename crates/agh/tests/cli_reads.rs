@@ -241,8 +241,6 @@ fn every_usage_error_is_exit_2_with_the_verb_s_help() {
             "release download",
         ),
         (vec!["can", APP, "write"], "can"),
-        (vec!["api", "/repos/fixture-dev/app", "-X", "POST"], "api"),
-        (vec!["api", "/repos/fixture-dev/app", "-X", "delete"], "api"),
         (vec!["api", "/repos/fixture-dev/app", "-X", "TRACE"], "api"),
         (
             vec!["api", "https://example.invalid/repos/fixture-dev/app"],
@@ -1174,5 +1172,29 @@ fn a_download_destination_outside_dir_or_not_a_file_is_usage_with_nothing_sent()
     assert_eq!(error["next"], Value::from("agh help release download"));
     assert!(w.fake.seen().is_empty(), "{:?}", w.fake.seen());
     assert!(!w.root.path().join("escaped").exists());
+    w.fake.assert_clean();
+}
+
+#[test]
+fn release_tag_regex_step_budget_exhaustion_fails_closed_instead_of_omitting() {
+    let w = World::new("cli-tag-regex-budget");
+    let long_tag = format!("{}z", "x".repeat(20_000));
+    w.fake.add_release(
+        APP,
+        ReleaseSpec::published(&long_tag, "2026-01-02T00:00:00Z"),
+    );
+    w.fake
+        .add_release(APP, ReleaseSpec::published("v1", "2026-01-01T00:00:00Z"));
+
+    for sub in ["list", "newest"] {
+        let ran = w.run(&["release", sub, APP, "--tag-regex", "(?:x?){2000}z"]);
+        let error = ran.failed(2, "usage", None);
+        assert!(
+            error["why"]
+                .as_str()
+                .is_some_and(|why| why.contains("--tag-regex") && why.contains("gave up")),
+            "{sub}: {error}"
+        );
+    }
     w.fake.assert_clean();
 }

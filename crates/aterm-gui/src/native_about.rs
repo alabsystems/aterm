@@ -226,6 +226,8 @@ impl NativeAppModel for AboutApp {
                     focusable: false,
                     focused: false,
                     focus_visible: false,
+                    progress: None,
+                    motion: None,
                 }),
             )
             .layout(Layout::default().height(Length::Fixed(44.0 * scale))),

@@ -57,7 +57,7 @@ impl Subject {
     /// A store build of `program`, or `None` for a name no store program carries.
     #[must_use]
     pub fn build(program: &str, build: u64) -> Option<Self> {
-        is_word(program).then(|| Self::Build {
+        (is_word(program) && crate::layout::is_valid_build_id(build)).then(|| Self::Build {
             program: program.to_string(),
             build,
         })
@@ -85,7 +85,10 @@ impl Subject {
     pub fn parse_stem(stem: &str) -> Option<Self> {
         if let Some(rest) = stem.strip_prefix("store-") {
             let (program, build) = rest.rsplit_once('-')?;
-            if build.is_empty() || !build.bytes().all(|b| b.is_ascii_digit()) {
+            if build.is_empty()
+                || (build.len() > 1 && build.starts_with('0'))
+                || !build.bytes().all(|b| b.is_ascii_digit())
+            {
                 return None;
             }
             return Self::build(program, build.parse().ok()?);
@@ -125,6 +128,12 @@ impl Subject {
                 let Ok(rel) = d.strip_prefix(p) else {
                     continue;
                 };
+                if rel
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+                {
+                    continue;
+                }
                 let mut parts = rel.components().filter_map(|c| match c {
                     std::path::Component::Normal(s) => s.to_str(),
                     _ => None,
@@ -134,9 +143,11 @@ impl Subject {
                         let build = raw_build
                             .strip_suffix(crate::build_cache::NOINDEX)
                             .unwrap_or(raw_build);
-                        (build.bytes().all(|b| b.is_ascii_digit()) && !build.is_empty())
-                            .then(|| build.parse().ok().and_then(|b| Self::build(program, b)))
-                            .flatten()
+                        (build.bytes().all(|b| b.is_ascii_digit())
+                            && !build.is_empty()
+                            && !(build.len() > 1 && build.starts_with('0')))
+                        .then(|| build.parse().ok().and_then(|b| Self::build(program, b)))
+                        .flatten()
                     }
                     (Some(VIEWS_DIR), Some(name), _) => Self::view(
                         name.strip_suffix(crate::build_cache::NOINDEX)
@@ -255,8 +266,34 @@ fn open_rendezvous(path: &Path) -> io::Result<File> {
     {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    options.open(path)
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    Ok(file)
+}
+
+fn open_regular_existing(path: &Path) -> io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    Ok(file)
 }
 
 /// The "who" line a holder writes: the first line of `who`, cut on a character boundary
@@ -451,7 +488,7 @@ impl Holders {
 /// Test one holder's file: `Ok(Some(who))` live, `Ok(None)` a dead holder's (removed when
 /// `reap`), `Err` when it could not be tested.
 fn probe_file(path: &Path, reap: bool) -> io::Result<Option<String>> {
-    let mut file: std::fs::File = match std::fs::File::open(path) {
+    let mut file: std::fs::File = match open_regular_existing(path) {
         Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
@@ -538,7 +575,8 @@ pub fn live(prefix: &Path) -> io::Result<Vec<(Subject, Holders)>> {
         Err(e) => return Err(e),
     };
     let mut subjects = std::collections::BTreeSet::new();
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             continue;
@@ -648,7 +686,7 @@ pub fn sweep(prefix: &Path, exists: &dyn Fn(&Subject) -> bool) {
         if subject.as_ref().is_some_and(exists) {
             continue;
         }
-        let Ok(gate) = File::open(&path) else {
+        let Ok(gate) = open_regular_existing(&path) else {
             continue;
         };
         let gate: std::fs::File = gate;
@@ -676,7 +714,7 @@ fn reap_taking(prefix: &Path, laying: &str, path: &Path) {
     let stem = laying
         .split_once(HOLDER_SEP)
         .map_or(laying, |(stem, _)| stem);
-    let gate = match File::open(dir(prefix).join(format!("{stem}{GATE_SUFFIX}"))) {
+    let gate = match open_regular_existing(&dir(prefix).join(format!("{stem}{GATE_SUFFIX}"))) {
         Ok(gate) => Some(gate),
         Err(e) if e.kind() == io::ErrorKind::NotFound => None,
         Err(_) => return,
@@ -751,6 +789,8 @@ mod tests {
             "store-trust",
             "store--9",
             "store-trust-x9",
+            "store-trust-0",
+            "store-trust-007",
             "rustup-",
             "other-x",
         ] {
@@ -758,6 +798,7 @@ mod tests {
         }
         assert!(Subject::build("a/b", 1).is_none());
         assert!(Subject::build("a.b", 1).is_none());
+        assert!(Subject::build("trust", 0).is_none());
         assert!(Subject::view("").is_none());
     }
 
@@ -804,6 +845,13 @@ mod tests {
             None
         );
         assert_eq!(Subject::of_dir(&p, &p.join("store/trust")), None);
+        assert_eq!(Subject::of_dir(&p, &p.join("store/trust/0/bin")), None);
+        assert_eq!(Subject::of_dir(&p, &p.join("store/trust/007/bin")), None);
+        assert_eq!(
+            Subject::of_dir(&p, &p.join("store/trust/9192/../../../outside")),
+            None,
+            "parent-dir traversal must not match a store subject"
+        );
         let _ = std::fs::remove_dir_all(&p);
     }
 

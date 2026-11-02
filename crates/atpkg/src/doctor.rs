@@ -68,19 +68,20 @@ fn missing_against_index(
     layout: &Layout,
     installed: &std::collections::BTreeMap<String, u64>,
     dev_linked: &std::collections::BTreeSet<String>,
-) -> Missing {
+) -> std::io::Result<Missing> {
     let index = crate::cli::cached_index(layout);
     if index.is_none() && !layout.adopted().is_file() {
-        return Missing::default();
+        return Ok(Missing::default());
     }
-    missing_from_set(
+    let removed = layout.removed_programs()?;
+    Ok(missing_from_set(
         index.as_deref(),
         crate::config::cached(),
         crate::cli::current_triple(),
         installed,
-        &layout.removed_programs(),
+        &removed,
         dev_linked,
-    )
+    ))
 }
 
 /// [`Missing`] for `index` (or, with none, the vendor half alone) and `cfg` on `triple`.
@@ -306,6 +307,9 @@ pub struct Probes {
     pub excluded: Vec<String>,
     /// What the `[packages]` table's own spelling asks of its owner.
     pub config_notes: Vec<String>,
+    /// The `aterm.toml` this process reads and the one the app launchd starts reads, when they
+    /// differ ([`crate::config_split`]); a fixture reads one.
+    pub config_split: Option<crate::config_split::Split>,
     /// A `[packages] prefix` this shipped build does not use, naming another store.
     pub ignored_prefix: Option<PathBuf>,
     /// Retired environment opt-outs still exported to this process.
@@ -333,6 +337,8 @@ pub struct Probes {
     pub trust_chain: Option<TrustChainProbe>,
     /// The rc the account's login shell reads.
     pub login_rc: Option<&'static str>,
+    /// The folder zsh reads its `.zshrc` from ([`crate::zdotdir`]); a fixture's is `$HOME`.
+    pub zsh: crate::zdotdir::ZshDir,
     /// Whether rustup answered `--version`, read beside the other probes; `None` leaves
     /// [`report_with`] to ask it.
     pub rustup_answers: Option<bool>,
@@ -582,6 +588,7 @@ impl Default for Probes {
             automatic: true,
             excluded: Vec::new(),
             config_notes: Vec::new(),
+            config_split: None,
             ignored_prefix: None,
             retired_env: Vec::new(),
             stub_env: crate::reroute::StubEnv::default(),
@@ -593,6 +600,7 @@ impl Default for Probes {
             rosetta: None,
             trust_chain: None,
             login_rc: None,
+            zsh: crate::zdotdir::ZshDir::Home,
             rustup_answers: None,
             exec_root: None,
             lan: None,
@@ -755,19 +763,20 @@ fn default_line(key: &str, want: &str) -> String {
 
 fn probe_claude_settings(home: &Path) -> Option<Result<Vec<(&'static str, DefaultState)>, String>> {
     let path = &home.join(".claude").join("settings.json");
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let meta = std::fs::symlink_metadata(path).ok()?;
-            if !meta.file_type().is_symlink() {
-                return None;
+    let text =
+        match crate::metadata_io::read_bounded_regular_utf8_follow_final_links(path, 1024 * 1024) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let meta = std::fs::symlink_metadata(path).ok()?;
+                if !meta.file_type().is_symlink() {
+                    return None;
+                }
+                let target = std::fs::read_link(path)
+                    .map_or_else(|_| "?".to_string(), |t| t.display().to_string());
+                return Some(Err(format!("a symlink to {target}, which does not exist")));
             }
-            let target = std::fs::read_link(path)
-                .map_or_else(|_| "?".to_string(), |t| t.display().to_string());
-            return Some(Err(format!("a symlink to {target}, which does not exist")));
-        }
-        Err(e) => return Some(Err(format!("it cannot be read: {e}"))),
-    };
+            Err(e) => return Some(Err(format!("it cannot be read: {e}"))),
+        };
     let held = compact_window_held(home);
     let states = claude_defaults_state(&text).map(|states| {
         states
@@ -959,7 +968,8 @@ fn workspace_with_trust_table(start: &Path) -> Option<PathBuf> {
     let mut dir = Some(start);
     while let Some(d) = dir {
         let manifest = d.join("Cargo.toml");
-        if let Ok(text) = std::fs::read_to_string(&manifest)
+        if let Ok(text) =
+            crate::metadata_io::read_bounded_regular_utf8_follow_final_links(&manifest, 1024 * 1024)
             && text.lines().any(|l| l.trim() == "[trust]")
         {
             return Some(d.to_path_buf());
@@ -1148,6 +1158,7 @@ fn rows_reading(
     let cfg = crate::config::cached();
     let trust_build = crate::ops::active_builds(layout).get("trust").copied();
     let rustup = rustup_binary(home.as_deref());
+    let rcs = home.as_deref().map(crate::hooks::RcHome::of_process);
     fn join<T>(handle: std::thread::ScopedJoinHandle<'_, T>) -> T {
         handle
             .join()
@@ -1185,6 +1196,7 @@ fn rows_reading(
         automatic: crate::manager_enabled() && cfg.enabled(),
         excluded: cfg.exclude().to_vec(),
         config_notes: cfg.config_notes(),
+        config_split: crate::config_split::of_process(),
         ignored_prefix: cfg.ignored_prefix.clone(),
         retired_env: retired_opt_outs_exported(),
         claude_defaults: home.as_deref().and_then(probe_claude_settings),
@@ -1199,7 +1211,8 @@ fn rows_reading(
             )
         }),
         trust_chain: probe_trust_chain(layout),
-        login_rc: home.as_deref().and_then(crate::hooks::account_login_rc),
+        login_rc: rcs.as_ref().and_then(crate::hooks::account_login_rc),
+        zsh: rcs.map(|rcs| rcs.zsh).unwrap_or_default(),
         devtools: None,
         rustup_answers: Some(rustup_answers),
         exec_root,
@@ -1657,6 +1670,25 @@ pub(crate) fn read(
             Class::Person,
             "the [packages] table",
             note.clone(),
+        ));
+    }
+    if let (Some(split), Some(home)) = (&probes.config_split, home) {
+        let remedy = match split.unify_command() {
+            Some(command) => Remedy::Command(command),
+            None => Remedy::Person {
+                pane: String::from("the two aterm.toml files"),
+                how: String::from(
+                    "merge what you keep into one, then link the other's folder to it",
+                ),
+            },
+        };
+        f.push(Finding::change(
+            c::of(c::CONFIG, "split"),
+            Class::Person,
+            "aterm.toml",
+            split.said(home),
+            "one aterm.toml for the app and the shell's aterm",
+            remedy,
         ));
     }
     if let Some(ignored) = probes.ignored_prefix.as_deref() {
@@ -2385,15 +2417,19 @@ pub(crate) fn read(
         }
         #[cfg(unix)]
         {
-            let wiring = crate::hooks::rc_wiring(home);
+            let rcs = crate::hooks::RcHome {
+                home: home.to_path_buf(),
+                zsh: probes.zsh.clone(),
+            };
+            let wiring = crate::hooks::rc_wiring(&rcs);
             let absent = probes
                 .login_rc
-                .and_then(|rc| crate::hooks::absent_login_rc(home, rc).map(|state| (rc, state)));
+                .and_then(|rc| crate::hooks::absent_login_rc(&rcs, rc).map(|state| (rc, state)));
             let names = |want: crate::hooks::RcState| -> Vec<String> {
                 wiring
                     .iter()
                     .filter(|(_, s)| *s == want)
-                    .map(|(rc, _)| format!("~/{rc}"))
+                    .map(|(rc, _)| rcs.shown(rc))
                     .collect()
             };
             let wired = names(crate::hooks::RcState::Wired);
@@ -2425,14 +2461,19 @@ pub(crate) fn read(
             }
             if let Some((rc, state)) = absent {
                 let id = c::of(c::RC, rc);
-                let title = format!("~/{rc}");
+                let shown = rcs.shown(rc);
+                let title = shown.clone();
                 match state {
+                    crate::hooks::RcState::HistoryUnreadable => f.push(Finding::note(
+                        id, Class::Person, title,
+                        format!("{shown}: shell wiring history is unreadable; automatic creation is held"),
+                    )),
                     crate::hooks::RcState::Unwired => f.push(Finding::change(
                         id,
                         Class::Relay,
                         title,
                         format!(
-                            "~/{rc} does not exist, and your login shell reads it (the next \
+                            "{shown} does not exist, and your login shell reads it (the next \
                              install or update pass, or `aterm pkg repair`, creates it holding \
                              atpkg's block)"
                         ),
@@ -2444,7 +2485,7 @@ pub(crate) fn read(
                         Class::Asked,
                         title,
                         format!(
-                            "~/{rc}: you deleted the one atpkg made for your login shell — \
+                            "{shown}: you deleted the one atpkg made for your login shell — \
                              opted out, left absent by every install and update pass (`aterm \
                              pkg repair` makes it again)"
                         ),
@@ -2454,26 +2495,33 @@ pub(crate) fn read(
                         Class::Person,
                         title,
                         format!(
-                            "~/{rc} is absent and its folder resolves under one macOS guards \
+                            "{shown} is absent and its folder resolves under one macOS guards \
                              with a consent dialog, so no atpkg pass makes it; source \
                              ~/.aterm/shell.d from your login shell's rc yourself, or reach the \
                              tools with `aterm <tool>`"
                         ),
                     )),
-                    crate::hooks::RcState::Wired | crate::hooks::RcState::SourcedElsewhere => {}
+                    crate::hooks::RcState::Wired
+                    | crate::hooks::RcState::SourcedElsewhere
+                    | crate::hooks::RcState::ZshFolderUnknown => {}
                 }
             }
             for (rc, state) in &wiring {
                 let id = c::of(c::RC, rc);
-                let title = format!("~/{rc}");
+                let shown = rcs.shown(rc);
+                let title = shown.clone();
                 match state {
                     crate::hooks::RcState::Wired | crate::hooks::RcState::SourcedElsewhere => {}
+                    crate::hooks::RcState::HistoryUnreadable => f.push(Finding::note(
+                        id, Class::Person, title,
+                        format!("{shown}: shell wiring history is unreadable; automatic wiring is held and the file is left unchanged"),
+                    )),
                     crate::hooks::RcState::OptedOut => f.push(Finding::note(
                         id,
                         Class::Asked,
                         title,
                         format!(
-                            "~/{rc}: atpkg's block was deleted — opted out, left alone by \
+                            "{shown}: atpkg's block was deleted — opted out, left alone by \
                              every install and update pass (`aterm pkg repair` lays it again)"
                         ),
                     )),
@@ -2482,10 +2530,24 @@ pub(crate) fn read(
                         Class::Person,
                         title,
                         format!(
-                            "~/{rc} resolves under a folder macOS guards with a consent \
+                            "{shown} resolves under a folder macOS guards with a consent \
                              dialog, so no atpkg pass opens it — it is left unwired; source \
                              ~/.aterm/shell.d from it yourself, or reach the tools with `aterm \
                              <tool>`"
+                        ),
+                    )),
+                    crate::hooks::RcState::ZshFolderUnknown => f.push(Finding::note(
+                        id,
+                        Class::Person,
+                        title,
+                        format!(
+                            "zsh's .zshrc is left unwired: which folder zsh reads it from is \
+                             unknown ({}); source ~/.aterm/shell.d from it yourself, or reach \
+                             the tools with `aterm <tool>`",
+                            match &probes.zsh {
+                                crate::zdotdir::ZshDir::Unknown(why) => why.as_str(),
+                                crate::zdotdir::ZshDir::Home | crate::zdotdir::ZshDir::At(_) => "",
+                            }
                         ),
                     )),
                     crate::hooks::RcState::Unwired => f.push(Finding::change(
@@ -2493,7 +2555,7 @@ pub(crate) fn read(
                         Class::Relay,
                         title,
                         format!(
-                            "~/{rc} does not source ~/.aterm/shell.d (an install pass or `aterm \
+                            "{shown} does not source ~/.aterm/shell.d (an install pass or `aterm \
                              pkg repair` appends atpkg's block)"
                         ),
                         "sources ~/.aterm/shell.d",
@@ -2504,7 +2566,7 @@ pub(crate) fn read(
             let login_rc_coming = matches!(absent, Some((_, crate::hooks::RcState::Unwired)));
             if wired.is_empty() && elsewhere.is_empty() && !login_rc_coming {
                 let checked: Vec<String> = crate::hooks::rc_files_read()
-                    .map(|rc| format!("~/{rc}"))
+                    .map(|rc| rcs.shown(rc))
                     .collect();
                 f.push(Finding::note(
                     format!("{}.none", c::RC),
@@ -3399,7 +3461,23 @@ fn toolset_findings(
         unexplained: missing_unexplained,
         on_purpose: missing_on_purpose,
         excluded,
-    } = missing_against_index(layout, installed, &dev_linked);
+    } = match missing_against_index(layout, installed, &dev_linked) {
+        Ok(missing) => missing,
+        Err(error) => {
+            f.push(
+                Finding::change(
+                    c::TOOLSET,
+                    Class::Person,
+                    "the ALab toolset",
+                    format!("removal decisions are unreadable: {error}; installation is held"),
+                    "readable removal decisions",
+                    Remedy::None,
+                )
+                .essential(),
+            );
+            return (f, active_count);
+        }
+    };
     let missing_unexplained = drop_unserved(missing_unexplained, toolset_unserved.as_deref());
     if let Some(unserved) = &toolset_unserved {
         let (vendors, alab): (Vec<&String>, Vec<&String>) = unserved
@@ -4514,7 +4592,8 @@ fn report_aterm_posture_at(
     installs_by_itself: bool,
 ) -> Option<Row> {
     let field = |file: &str, key: &str| -> Option<String> {
-        let text = std::fs::read_to_string(updates.join(file)).ok()?;
+        let text =
+            crate::metadata_io::read_bounded_regular_utf8(&updates.join(file), 64 * 1024).ok()?;
         text.lines()
             .find_map(|l| l.split_once('=').filter(|(k, _)| k.trim() == key))
             .map(|(_, v)| v.trim().trim_matches('"').to_string())
@@ -4526,14 +4605,19 @@ fn report_aterm_posture_at(
             text,
         })
     };
-    let installed = match (receipt.parse::<u64>().ok(), bundle_build) {
+    let parse_u64 = |s: &str| {
+        (!s.starts_with('+'))
+            .then(|| s.parse::<u64>().ok())
+            .flatten()
+    };
+    let installed = match (parse_u64(&receipt), bundle_build) {
         (Some(r), Some(b)) => r.max(b).to_string(),
         (None, Some(b)) => b.to_string(),
         _ => receipt,
     };
     let current = field("status.toml", "current_build");
-    let newer_on_disk = match (current.as_deref(), installed.parse::<u64>().ok()) {
-        (Some(c), Some(i)) => c.parse::<u64>().is_ok_and(|c| i > c),
+    let newer_on_disk = match (current.as_deref(), parse_u64(&installed)) {
+        (Some(c), Some(i)) => parse_u64(c).is_some_and(|c| i > c),
         _ => false,
     };
     let named = |build: &str| -> String {
@@ -4552,12 +4636,13 @@ fn report_aterm_posture_at(
     match (current, field("status.toml", "staged_build")) {
         (Some(current), Some(staged)) if current != staged => {
             let tries = field("health.toml", "apply_failures_for_target")
+                .filter(|n| !n.starts_with('+'))
                 .and_then(|n| n.parse::<u32>().ok())
                 .filter(|n| *n > 0)
                 .filter(|_| {
                     let tried = field("health.toml", "last_apply_failure_target_build")
-                        .and_then(|b| b.parse::<u64>().ok());
-                    tried.is_some() && tried == staged.parse::<u64>().ok()
+                        .and_then(|b| parse_u64(&b));
+                    tried.is_some() && tried == parse_u64(&staged)
                 });
             let (staged, current) = pair(&staged, &current);
             if let Some(n) = tries {
@@ -4638,7 +4723,10 @@ fn plist_bundle_version(text: &str) -> Option<u64> {
     let after = text.find(key)? + key.len();
     let value = text[after..].trim_start().strip_prefix("<string>")?;
     let end = value.find("</string>")?;
-    value[..end].trim().parse::<u64>().ok()
+    let v = value[..end].trim();
+    (!v.starts_with('+'))
+        .then(|| v.parse::<u64>().ok())
+        .flatten()
 }
 
 fn upstream_index_on_path(

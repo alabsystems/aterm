@@ -26,6 +26,353 @@ pub struct Grant {
 pub trait Authority {
     fn prepare(&self, row: &accounts::Row) -> Result<Grant, String>;
     fn current(&self, grant: &Grant, row: &accounts::Row) -> Result<(), String>;
+    /// Ask the issuer to consider a distinct preparation. This never permits
+    /// repeating the consumed provider action or replacing its unknown result.
+    fn request_recovery(
+        &self,
+        _grant: &Grant,
+        _row: &accounts::Row,
+        _intent: &shared::Intent,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// Called under the account writer immediately before checkpoint publication.
+/// Retained custody identifies the attempt; only the current root grants its
+/// publication. A successor grant cannot adopt an older preparation's result.
+pub(in crate::harness) fn check_checkpoint(
+    authority: &dyn Authority,
+    source: Source,
+    row: &accounts::Row,
+    logins: &accounts::Logins,
+    principal: Option<[u8; 32]>,
+) -> Result<(), String> {
+    let grant = authority.prepare(row)?;
+    let attempt = logins
+        .shared
+        .latest(source)
+        .ok_or_else(|| "shared checkpoint has no retained preparation".to_owned())?;
+    let intent = &attempt.intent;
+    if attempt.outcome != shared::Outcome::Pending
+        || grant.source != source
+        || grant.decision != intent.decision
+        || grant.generation != intent.generation
+        || grant.configuration != intent.configuration
+        || intent.label != row.label
+        || !accounts::email_matches(&grant.identity, &intent.identity)
+        || !row
+            .expected_identity_email()
+            .is_some_and(|email| accounts::email_matches(email, &intent.identity))
+        || intent.before_generation
+            != logins
+                .get(&row.label)
+                .map(|binding| binding.renewal_generation)
+        || !principal.is_some_and(|principal| {
+            logins.shared.principal_allowed(source, principal)
+                && grant
+                    .expected_principal
+                    .is_none_or(|expected| expected == principal)
+        })
+    {
+        return Err("shared checkpoint differs from current root preparation".into());
+    }
+    authority.current(&grant, row)
+}
+
+/// A completed local login has priority over asking for another preparation.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSharedRecovery",
+        action = "Checkpoint",
+        project = "aterm_agent::harness::accounts_sync::automatic_shared_tests::recovery_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSharedRecovery",
+        action = "MissingCredential",
+        project = "aterm_agent::harness::accounts_sync::automatic_shared_tests::recovery_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSharedRecovery",
+        action = "NewerSignout",
+        project = "aterm_agent::harness::accounts_sync::automatic_shared_tests::recovery_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSharedRecovery",
+        action = "QuotaCheckpoint",
+        project = "aterm_agent::harness::accounts_sync::automatic_shared_tests::recovery_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSharedRecovery",
+        action = "ReferencedCheckpoint",
+        project = "aterm_agent::harness::accounts_sync::automatic_shared_tests::recovery_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSharedAdoptionRecovery",
+        action = "SupersededCheckpoint",
+        project = "aterm_agent::harness::cli::tests::shared_adoption_tests::recovery::transition"
+    )
+)]
+pub(in crate::harness) fn pending_checkpoint(
+    cli: Cli,
+    row: &accounts::Row,
+    grant: &Grant,
+    roster: &accounts::Roster,
+    state: &accounts::State,
+    logins: &accounts::Logins,
+    now: i64,
+) -> bool {
+    // Shared Codex and Kimi results require their typed provider proof and
+    // current root grant. Their adoption path reconciles retained Pending data.
+    if cli != Cli::Claude {
+        return false;
+    }
+    let Ok(Some(source)) = logins.shared.required(row) else {
+        return false;
+    };
+    let Some(attempt) = logins.shared.latest(source) else {
+        return false;
+    };
+    if source != grant.source
+        || attempt.outcome != shared::Outcome::Pending
+        || attempt.intent.label != row.label
+        || attempt.intent.decision != grant.decision
+        || attempt.intent.generation != grant.generation
+        || attempt.intent.configuration != grant.configuration
+        || !accounts::email_matches(&attempt.intent.identity, &grant.identity)
+    {
+        return false;
+    }
+    let staging = Path::new(&attempt.intent.staging);
+    let Ok(actual) = std::fs::canonicalize(staging) else {
+        return false;
+    };
+    accounts::read_renewal_checkpoint_for(cli, staging, &actual, now).is_some_and(|checkpoint| {
+        checkpoint.label == row.label
+            && accounts::email_matches(&checkpoint.email, &attempt.intent.identity)
+            && accounts::checkpoint_identity_matches(cli, row, &checkpoint)
+            && accounts::checkpoint_unreferenced(roster, logins, staging, &actual)
+            && accounts::checkpoint_current(row, state, logins, &checkpoint)
+            && {
+                let identity = super::super::profile::identity_in_home(staging, &checkpoint.email);
+                identity.email_matches != Some(false)
+                    && identity.principal.is_some_and(|principal| {
+                        logins.shared.principal_allowed(source, principal)
+                            && grant
+                                .expected_principal
+                                .is_none_or(|expected| expected == principal)
+                    })
+                    && logins.shared.checkpoint_allowed(
+                        row,
+                        identity.principal,
+                        &checkpoint.dir,
+                        &checkpoint.parent,
+                    )
+            }
+    })
+}
+
+/// Advertise an uncertain consumed attempt without refunding its preparation.
+/// The issuer independently checks this advisory request before issuing a new
+/// decision. No account writer is held while publishing the request.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSharedRecovery",
+        action = "Unknown",
+        project = "aterm_agent::harness::accounts_sync::automatic_shared_tests::recovery_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSharedRecovery",
+        action = "Pending",
+        project = "aterm_agent::harness::accounts_sync::automatic_shared_tests::recovery_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSharedRecovery",
+        action = "Published",
+        project = "aterm_agent::harness::accounts_sync::automatic_shared_tests::recovery_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSharedRecovery",
+        action = "Held",
+        project = "aterm_agent::harness::accounts_sync::automatic_shared_tests::recovery_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSharedRecovery",
+        action = "NotStarted",
+        project = "aterm_agent::harness::accounts_sync::automatic_shared_tests::recovery_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSharedRecovery",
+        action = "ChangedBinding",
+        project = "aterm_agent::harness::accounts_sync::automatic_shared_tests::recovery_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSharedRecovery",
+        action = "ChangedDecision",
+        project = "aterm_agent::harness::accounts_sync::automatic_shared_tests::recovery_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSharedRecovery",
+        action = "Stopped",
+        project = "aterm_agent::harness::accounts_sync::automatic_shared_tests::recovery_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSharedRecovery",
+        action = "Unavailable",
+        project = "aterm_agent::harness::accounts_sync::automatic_shared_tests::recovery_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSharedRecovery",
+        action = "Retry",
+        project = "aterm_agent::harness::accounts_sync::automatic_shared_tests::recovery_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSharedRecovery",
+        action = "ChangedRoster",
+        project = "aterm_agent::harness::accounts_sync::automatic_shared_tests::recovery_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSharedRecovery",
+        action = "WrongIdentity",
+        project = "aterm_agent::harness::accounts_sync::automatic_shared_tests::recovery_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSharedRecovery",
+        action = "WrongConfiguration",
+        project = "aterm_agent::harness::accounts_sync::automatic_shared_tests::recovery_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSharedRecovery",
+        action = "WrongGeneration",
+        project = "aterm_agent::harness::accounts_sync::automatic_shared_tests::recovery_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSharedProgress",
+        action = "Fail",
+        project = "aterm_agent::harness::accounts_sync::automatic_shared_tests::shared_progress_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountSharedProgress",
+        action = "Retry",
+        project = "aterm_agent::harness::accounts_sync::automatic_shared_tests::shared_progress_transition"
+    )
+)]
+pub(in crate::harness) fn recover_consumed(
+    authority: &dyn Authority,
+    grant: &Grant,
+    store: &accounts::Store,
+    policy: accounts::RenewalPolicy<'_>,
+    _signin: &accounts::Lock,
+    now: i64,
+) -> Result<(), String> {
+    let records = store
+        .read_account_records(Some(policy.roster_path), now)
+        .map_err(|error| match error {
+            accounts::RosterReadError::Roster(why) | accounts::RosterReadError::Records(why) => why,
+        })?;
+    let row = policy.row;
+    if &records.raw_roster != policy.roster || records.roster.row(&row.label) != Some(row) {
+        return Ok(());
+    }
+    let logins = &records.logins;
+    let Some(attempt) = logins.shared.latest(grant.source) else {
+        return Ok(());
+    };
+    let intent = &attempt.intent;
+    if pending_checkpoint(
+        Cli::Claude,
+        row,
+        grant,
+        &records.raw_roster,
+        &records.state,
+        logins,
+        now,
+    ) {
+        return Ok(());
+    }
+    if !matches!(
+        attempt.outcome,
+        shared::Outcome::Pending | shared::Outcome::Unknown
+    ) || intent.decision != grant.decision
+        || intent.generation != grant.generation
+        || intent.configuration != grant.configuration
+        || intent.label != row.label
+        || !accounts::email_matches(&intent.identity, &grant.identity)
+        || !row
+            .expected_identity_email()
+            .is_some_and(|email| accounts::email_matches(email, &intent.identity))
+        || logins.shared.required(row)? != Some(grant.source)
+        || intent.before_generation
+            != logins
+                .get(&row.label)
+                .map(|binding| binding.renewal_generation)
+    {
+        return Ok(());
+    }
+    authority.current(grant, row)?;
+    authority.request_recovery(grant, row, intent)
 }
 
 pub(super) enum Guard<'a> {
@@ -122,18 +469,24 @@ impl Guard<'_> {
                 {
                     return Err("shared renewal identity differs from its local custody".into());
                 }
-                logins.shared.check_preparation(
+                if let Err(why) = logins.shared.check_preparation(
                     approved.source,
                     approved.generation,
                     approved.expected_principal,
-                )?;
+                ) {
+                    // Retain the checked terms for an advisory recovery request.
+                    // Begin still refuses this consumed or conflicting preparation.
+                    *grant = Some(Box::new(approved));
+                    return Err(why);
+                }
                 if let Some(required) = approved.required_browser_profile.as_deref() {
                     match browser {
                         RenewBrowser::Profile { profile, .. }
+                        | RenewBrowser::OwnProfile { profile, .. }
                             if !required.trim().is_empty() && profile == required => {}
                         RenewBrowser::Default => return Err("shared renewal requires a local browser profile, but its opener is unavailable".into()),
                         RenewBrowser::Remote { .. } => return Err("shared renewal cannot enforce the required browser profile over a remote route".into()),
-                        RenewBrowser::Profile { .. } => return Err("shared renewal selected a different browser profile than the approved requirement".into()),
+                        RenewBrowser::Profile { .. } | RenewBrowser::OwnProfile { .. } => return Err("shared renewal selected a different browser profile than the approved requirement".into()),
                     }
                 }
                 *grant = Some(Box::new(approved));
@@ -340,7 +693,14 @@ impl Guard<'_> {
         }
     }
 
-    fn failed(&mut self, store: &accounts::Store, now: i64, err: &mut dyn Write) {
+    fn failed(
+        &mut self,
+        store: &accounts::Store,
+        policy: accounts::RenewalPolicy<'_>,
+        signin: &accounts::Lock,
+        now: i64,
+        err: &mut dyn Write,
+    ) {
         if let Self::Shared { token, .. } = self
             && let Some(token) = token.take()
             && let Err(why) =
@@ -352,6 +712,17 @@ impl Guard<'_> {
                 })
         {
             let _ = writeln!(err, "shared renewal outcome remains unknown: {why}");
+        }
+        if let Self::Shared {
+            authority,
+            grant: Some(grant),
+            ..
+        } = self
+        {
+            let result = recover_consumed(*authority, grant, store, policy, signin, now);
+            if let Err(why) = result {
+                let _ = writeln!(err, "shared renewal recovery deferred: {why}");
+            }
         }
     }
 }
@@ -490,8 +861,22 @@ pub fn run(
         return ExitCode::from(1);
     };
     let store = env.accounts_store();
-    let Some(records) = read_renewal_records(Cli::Claude, &store, &path, env.now, false, err)
-    else {
+    super::super::accounts_sync::recover_staging_renewals_for(
+        Cli::Claude,
+        &store,
+        &path,
+        host.now().max(env.now),
+        super::super::accounts_sync::shared_renewal::CheckpointAuthority::Explicit(authority),
+    );
+    let Some(records) = read_renewal_records(
+        Cli::Claude,
+        &store,
+        &path,
+        host.now().max(env.now),
+        false,
+        env.home.as_deref(),
+        err,
+    ) else {
         return ExitCode::from(1);
     };
     let Some(row) = records.roster.row(label) else {
@@ -509,9 +894,29 @@ pub fn run(
         let _ = writeln!(err, "shared renewal cannot check its login: {why}");
         return ExitCode::from(1);
     }
-    let lock = match signin_guard(&store, label, "shared-renew", out, err) {
-        Ok(lock) => lock,
+    let (lock, waited) = match signin_guard(&store, host, label, "shared-renew", out, err) {
+        Ok(taken) => taken,
         Err(_) => return ExitCode::from(1),
+    };
+    let records = if waited {
+        let Some(records) = read_renewal_records(
+            Cli::Claude,
+            &store,
+            &path,
+            host.now().max(env.now),
+            false,
+            env.home.as_deref(),
+            err,
+        ) else {
+            return ExitCode::from(1);
+        };
+        records
+    } else {
+        records
+    };
+    let Some(row) = records.roster.row(label) else {
+        let _ = writeln!(err, "shared renewal requires an existing local row");
+        return ExitCode::from(1);
     };
     let opener = opener_link(&store, host);
     let browser = if host.under_ssh() {
@@ -544,7 +949,7 @@ pub fn run(
     if result == Renewal::Renewed {
         ExitCode::SUCCESS
     } else {
-        guard.failed(&store, host.now().max(env.now), err);
+        guard.failed(&store, policy, &lock, host.now().max(env.now), err);
         ExitCode::from(1)
     }
 }
@@ -587,7 +992,13 @@ pub(in crate::harness) fn background(
         &mut guard,
     );
     if result != Renewal::Renewed {
-        guard.failed(store, host.now().max(env.now), &mut io::sink());
+        guard.failed(
+            store,
+            policy,
+            signin,
+            host.now().max(env.now),
+            &mut io::sink(),
+        );
     }
     result
 }

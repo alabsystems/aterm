@@ -94,10 +94,16 @@ pub fn parse_take(header: &str, body: &[u8]) -> Result<Taken, String> {
     let mut due = None;
     for t in toks {
         if let Some(k) = t.strip_prefix("slots=") {
-            want = k.parse().ok();
+            want = (!k.is_empty() && k.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| k.parse().ok())
+                .flatten();
         } else if t == "more=1" {
             more = true;
-        } else if let Some(ms) = t.strip_prefix("due=").and_then(|ms| ms.parse().ok()) {
+        } else if let Some(ms) = t
+            .strip_prefix("due=")
+            .filter(|ms| !ms.is_empty() && ms.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|ms| ms.parse().ok())
+        {
             due = Some(std::time::Duration::from_millis(ms));
         }
     }
@@ -260,6 +266,7 @@ impl Pin {
             toks.next()
                 .and_then(|t| t.strip_prefix(k))
                 .and_then(|v| v.strip_prefix('='))
+                .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
                 .and_then(|v| v.parse().ok())
                 .ok_or_else(|| format!("a logpin header without {k}=: {head:?}"))
         };
@@ -283,6 +290,13 @@ impl Pin {
                 .split(',')
                 .map(|e| {
                     let (hi, bytes) = e.split_once(':')?;
+                    if hi.is_empty()
+                        || !hi.bytes().all(|b| b.is_ascii_digit())
+                        || bytes.is_empty()
+                        || !bytes.bytes().all(|b| b.is_ascii_digit())
+                    {
+                        return None;
+                    }
                     Some((hi.parse().ok()?, bytes.parse().ok()?))
                 })
                 .collect::<Option<Vec<(u64, u64)>>>()
@@ -297,6 +311,9 @@ impl Pin {
             else {
                 return Err(format!("a logpin slot that does not read: {line:?}"));
             };
+            if pseq.is_empty() || !pseq.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(format!("a logpin slot's sequence: {line:?}"));
+            }
             slots.push(PinSlot {
                 pseq: pseq
                     .parse()

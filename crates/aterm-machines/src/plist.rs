@@ -451,11 +451,11 @@ impl<'a> Parser<'a> {
                     .strip_prefix("#x")
                     .or_else(|| numeric.strip_prefix("#X"))
                 {
-                    u32::from_str_radix(hex, 16).ok()
+                    (!hex.starts_with('+'))
+                        .then(|| u32::from_str_radix(hex, 16).ok())
+                        .flatten()
                 } else {
-                    numeric
-                        .strip_prefix('#')
-                        .and_then(|d| d.parse::<u32>().ok())
+                    numeric.strip_prefix('#').and_then(crate::parse_uint::<u32>)
                 };
                 code.and_then(char::from_u32)
             }

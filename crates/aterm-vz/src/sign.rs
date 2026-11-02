@@ -89,11 +89,13 @@ pub struct Placed {
 
 /// Copy `built` to `host/<sha256>/aterm-vz-host` and sign the copy there with `sign`
 /// ([`codesign`] in the lab; the tests' records the argv), then make it 0555 and rename its
-/// directory into place. A directory already there is kept: a rename only ever puts a whole,
-/// signed copy under the name.
+/// directory into place. A completed copy already there is kept; replacing an incomplete real
+/// directory requires the same execution proof and in-use protection as [`reclaim`]. A rename
+/// only ever puts a whole, signed copy under the name.
 ///
 /// # Errors
-/// `built` could not be read, the signing failed (nothing is placed), or a write failed.
+/// `built` could not be read, the signing failed (nothing is placed), a write failed, or an
+/// existing incomplete copy cannot be proven safe to replace.
 pub fn place(
     built: &Path,
     host: &Path,
@@ -111,7 +113,10 @@ pub fn place(
         exe: exe.clone(),
         fresh,
     };
-    if exe.is_file() {
+    let placed_regular = || {
+        std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) && crate::is_regular_file(&exe)
+    };
+    if placed_regular() {
         return Ok(placed(false));
     }
     std::fs::create_dir_all(host)
@@ -134,22 +139,50 @@ pub fn place(
             .map_err(|e| io("chmod", &copy, e))?;
         drop(file);
         sign(&copy, &ents)?;
-        let file = std::fs::File::open(&copy).map_err(|e| io("open", &copy, e))?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(&copy)
+            .map_err(|e| io("open", &copy, e))?;
+        if !file.metadata().map_err(|e| io("open", &copy, e))?.is_file() {
+            return Err(format!(
+                "could not open {} (not a regular file)",
+                copy.display()
+            ));
+        }
         file.set_permissions(std::fs::Permissions::from_mode(0o555))
             .map_err(|e| io("chmod", &copy, e))?;
         aterm_durable::durable(&file).map_err(|e| io("flush", &copy, e))?;
         aterm_durable::durable_dir(&partial).map_err(|e| io("flush", &partial, e))?;
-        if dir.exists() {
-            if exe.is_file() {
-                // Another lab placed this helper meanwhile: keep its copy, which a helper may
-                // already run from.
-                return Ok(false);
+        let mut _retiring = None;
+        match std::fs::symlink_metadata(&dir) {
+            Ok(meta) => {
+                if meta.is_dir() && crate::is_regular_file(&exe) {
+                    // Another lab placed this helper meanwhile: keep its copy, which a helper
+                    // may already run from.
+                    return Ok(false);
+                }
+                let res = if meta.is_dir() {
+                    // A missing or nonregular executable says nothing about whether this
+                    // directory held a started copy. Keep its retirement hold through rename.
+                    _retiring = Some(removal_guard(&dir).ok_or_else(|| {
+                        format!(
+                            "could not replace {} (copy is unproven or in use)",
+                            dir.display()
+                        )
+                    })?);
+                    std::fs::remove_dir_all(&dir)
+                } else {
+                    // Unlink only this entry, including a hash-directory alias, never its target.
+                    std::fs::remove_file(&dir)
+                };
+                res.map_err(|e| io("remove", &dir, e))?;
             }
-            // A directory under this hash with no helper: nothing ever ran from it.
-            std::fs::remove_dir_all(&dir).map_err(|e| io("remove", &dir, e))?;
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io("inspect", &dir, error)),
         }
         if let Err(e) = std::fs::rename(&partial, &dir) {
-            return if exe.is_file() {
+            return if placed_regular() {
                 Ok(false)
             } else {
                 Err(io("rename into", &dir, e))
@@ -194,10 +227,12 @@ pub fn mark_started(exe: &Path) {
         && let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
-            .truncate(true)
+            .truncate(false)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(dir.join(STARTED))
+        && file.metadata().is_ok_and(|m| m.is_file())
+        && file.set_len(0).is_ok()
     {
         let _ = writeln!(file, "{}", std::process::id());
     }
@@ -229,9 +264,13 @@ pub fn mark_ran(exe: &Path) -> Option<InUse> {
         .write(true)
         .truncate(false)
         .mode(0o644)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(dir.join(RAN))
         .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    aterm_uds::keep_out_of_children(&file).ok()?;
     #[expect(
         clippy::disallowed_methods,
         reason = "the guard's own take: its Drop releases by LOCK_UN"
@@ -247,7 +286,25 @@ pub fn mark_ran(exe: &Path) -> Option<InUse> {
 
 /// Whether a helper from the copy at `dir` proved it ran: its `ran` marker holds a line.
 fn ran(dir: &Path) -> bool {
-    std::fs::metadata(dir.join(RAN)).is_ok_and(|m| m.len() > 0)
+    std::fs::symlink_metadata(dir.join(RAN)).is_ok_and(|m| m.is_file() && m.len() > 0)
+}
+
+struct RemovalGuard {
+    _ran: Option<DiskLock>,
+}
+
+/// Unknown or nonregular markers are not evidence that a copy was never started. A proved
+/// run also needs its marker held exclusively, so another state's live helper keeps the copy.
+fn removal_guard(dir: &Path) -> Option<RemovalGuard> {
+    if ran(dir) {
+        let held = DiskLock::try_take(&dir.join(RAN)).ok().flatten()?;
+        return ran(dir).then_some(RemovalGuard { _ran: Some(held) });
+    }
+    let absent = |name| {
+        matches!(std::fs::symlink_metadata(dir.join(name)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    };
+    (absent(STARTED) && absent(RAN)).then_some(RemovalGuard { _ran: None })
 }
 
 /// Remove the copies under `host` that no helper needs: every directory other than `keep`
@@ -261,6 +318,9 @@ pub fn reclaim(host: &Path, keep: &str, record: Option<&Record>) -> Vec<PathBuf>
     };
     let mut removed = Vec::new();
     for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
         let path = entry.path();
         let Some(name) = path
             .file_name()
@@ -274,19 +334,17 @@ pub fn reclaim(host: &Path, keep: &str, record: Option<&Record>) -> Vec<PathBuf>
         let removable = if let Some(rest) = name.strip_prefix(".partial-") {
             // `.partial-<sha256>-<pid>`: a placing whose process is gone; nothing ran from it.
             rest.rsplit_once('-')
-                .and_then(|(_, pid)| pid.parse::<u32>().ok())
+                .map(|(_, pid)| pid)
+                .filter(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|pid| pid.parse::<u32>().ok())
                 .is_some_and(|pid| !aterm_uds::process::pid_alive(pid))
         } else if crate::is_hex(&name, 64) {
             let named = record.is_some_and(|r| r.helper_sha256 == name);
-            let started = path.join(STARTED).exists();
-            let ran = ran(&path);
-            let unneeded = name != keep && !named && (!started || ran);
-            if unneeded && ran {
-                // A helper still running from it holds its marker shared.
-                held = DiskLock::try_take(&path.join(RAN)).ok().flatten();
+            if name != keep && !named {
+                held = removal_guard(&path);
                 held.is_some()
             } else {
-                unneeded
+                false
             }
         } else {
             false
@@ -483,6 +541,163 @@ mod tests {
         std::fs::write(empty.join(RAN), b"").unwrap();
         assert!(reclaim(host, &"a".repeat(64), Some(&record)).is_empty());
         assert!(empty.exists());
+        // A symlinked `ran` marker proves nothing and is refused by `mark_ran`.
+        let linked = copy(host, &"8".repeat(64), &[STARTED]);
+        let outside = tmp.path().join("outside-ran");
+        std::fs::write(&outside, b"pid 1\n").unwrap();
+        std::os::unix::fs::symlink(&outside, linked.join(RAN)).unwrap();
+        assert!(!super::ran(&linked));
+        assert!(mark_ran(&linked.join(EXE)).is_none());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"pid 1\n");
+    }
+
+    #[test]
+    fn unknown_started_markers_keep_copies_until_their_run_is_proven_and_unheld() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let host = tmp.path().join("host");
+        let never = copy(&host, &"a".repeat(64), &[]);
+        let proved = copy(&host, &"b".repeat(64), &[STARTED, RAN]);
+        assert_eq!(reclaim(&host, "", None), [never, proved]);
+
+        for kind in ["symlink", "dangling", "directory"] {
+            let dir = copy(&host, &sha(kind.as_bytes()), &[]);
+            let marker = dir.join(STARTED);
+            let outside = tmp.path().join(format!("outside-{kind}"));
+            if kind == "directory" {
+                std::fs::create_dir(&marker).unwrap();
+            } else {
+                if kind == "symlink" {
+                    std::fs::write(&outside, b"retained outside marker\n").unwrap();
+                }
+                std::os::unix::fs::symlink(&outside, &marker).unwrap();
+            }
+            assert!(std::fs::symlink_metadata(&marker).is_ok());
+            assert!(!super::ran(&dir));
+            assert!(
+                reclaim(&host, "", None).is_empty(),
+                "a {kind} marker proves no safe retirement"
+            );
+            assert_eq!(std::fs::read(dir.join(EXE)).unwrap(), b"helper");
+            assert!(std::fs::symlink_metadata(&marker).is_ok());
+
+            // These inert bytes are never executed: only the normal marker/lock API runs.
+            let held = mark_ran(&dir.join(EXE)).expect("a witnessed marker is held");
+            assert!(reclaim(&host, "", None).is_empty());
+            drop(held);
+            assert_eq!(reclaim(&host, "", None), [dir]);
+            if kind == "symlink" {
+                assert_eq!(
+                    std::fs::read(&outside).unwrap(),
+                    b"retained outside marker\n"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn replacing_a_nonregular_executable_requires_safe_retirement_of_its_real_directory() {
+        for state in ["never", "ran", "unproven", "in-use"] {
+            let tmp = aterm_tempfile::tempdir().unwrap();
+            let built = tmp.path().join("built");
+            std::fs::write(&built, b"inert built helper").unwrap();
+            let host = tmp.path().join("host");
+            let dir = host.join(sha(b"inert built helper"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let decoy = tmp.path().join("inert-decoy");
+            std::fs::write(&decoy, b"retained decoy").unwrap();
+            std::os::unix::fs::symlink(&decoy, dir.join(EXE)).unwrap();
+            let payload = dir.join("retained-state");
+            std::fs::write(&payload, b"unproven state must survive").unwrap();
+            if state != "never" {
+                std::fs::write(dir.join(STARTED), b"synthetic started\n").unwrap();
+            }
+            let held = matches!(state, "ran" | "in-use")
+                .then(|| mark_ran(&dir.join(EXE)).expect("the inert copy's marker"));
+            let held = if state == "ran" {
+                drop(held);
+                None
+            } else {
+                held
+            };
+            assert!(std::fs::symlink_metadata(&dir).unwrap().is_dir());
+            assert!(
+                std::fs::symlink_metadata(dir.join(EXE))
+                    .unwrap()
+                    .is_symlink()
+            );
+            let result = place(&built, &host, &mut |copy, _| {
+                std::fs::write(copy, b"inert signed replacement").unwrap();
+                Ok(())
+            });
+            if matches!(state, "never" | "ran") {
+                let placed = result.expect("safe, unused copies can be replaced");
+                assert!(placed.fresh);
+                assert_eq!(
+                    std::fs::read(&placed.exe).unwrap(),
+                    b"inert signed replacement"
+                );
+            } else {
+                assert!(
+                    result.is_err(),
+                    "the {state} real directory must be retained"
+                );
+                assert!(
+                    std::fs::symlink_metadata(dir.join(EXE))
+                        .unwrap()
+                        .is_symlink()
+                );
+                assert_eq!(
+                    std::fs::read(&payload).unwrap(),
+                    b"unproven state must survive"
+                );
+                assert_eq!(
+                    std::fs::read(dir.join(STARTED)).unwrap(),
+                    b"synthetic started\n"
+                );
+            }
+            assert_eq!(std::fs::read(&decoy).unwrap(), b"retained decoy");
+            let names: Vec<_> = std::fs::read_dir(&host)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert_eq!(names.len(), 1, "partial copies are not retained: {names:?}");
+            drop(held);
+        }
+    }
+
+    #[test]
+    fn place_replaces_a_symlinked_dir_or_exe_with_a_real_signed_copy() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let built = tmp.path().join("target/aterm-vz-host");
+        std::fs::create_dir_all(built.parent().unwrap()).unwrap();
+        std::fs::write(&built, b"helper-bytes").unwrap();
+        let digest = sha(b"helper-bytes");
+        let host = tmp.path().join("host");
+        std::fs::create_dir_all(&host).unwrap();
+        let decoy_dir = tmp.path().join("decoy");
+        std::fs::create_dir_all(&decoy_dir).unwrap();
+        let decoy_exe = decoy_dir.join(EXE);
+        std::fs::write(&decoy_exe, b"unsigned-decoy").unwrap();
+        std::fs::write(decoy_dir.join(STARTED), b"unproven decoy\n").unwrap();
+        // A symlink at `host/<sha256>` pointing to `decoy_dir` must not be trusted as placed.
+        std::os::unix::fs::symlink(&decoy_dir, host.join(&digest)).unwrap();
+        let placed = place(&built, &host, &mut |copy, _| {
+            std::fs::write(copy, b"signed-real").unwrap();
+            Ok(())
+        })
+        .unwrap();
+        assert!(placed.fresh);
+        assert!(
+            std::fs::symlink_metadata(host.join(&digest))
+                .unwrap()
+                .is_dir()
+        );
+        assert_eq!(std::fs::read(&placed.exe).unwrap(), b"signed-real");
+        assert_eq!(std::fs::read(&decoy_exe).unwrap(), b"unsigned-decoy");
+        assert_eq!(
+            std::fs::read(decoy_dir.join(STARTED)).unwrap(),
+            b"unproven decoy\n"
+        );
     }
 
     #[test]
@@ -497,7 +712,10 @@ mod tests {
         // pid 0 is never a live placing (`pid_alive` refuses it).
         let dead = tmp.path().join(format!(".partial-{}-0", "f".repeat(64)));
         std::fs::create_dir_all(&dead).unwrap();
+        let non_canonical = tmp.path().join(format!(".partial-{}-+0", "f".repeat(64)));
+        std::fs::create_dir_all(&non_canonical).unwrap();
         assert_eq!(reclaim(tmp.path(), "", None), [dead]);
         assert!(mine.exists());
+        assert!(non_canonical.exists());
     }
 }

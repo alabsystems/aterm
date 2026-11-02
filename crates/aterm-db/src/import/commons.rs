@@ -16,18 +16,76 @@ use aterm_json::{Value, json};
 use aterm_secrets::{client::Paths, commons::bootstrap::Bootstrap};
 use std::{collections::BTreeMap, path::Path};
 
+mod comparison;
+
 fn descriptor(bootstrap: &Bootstrap) -> Result<Descriptor> {
     Descriptor::application(bootstrap.trust(), "accounts", "imports", 1)
+}
+
+struct Prepared {
+    value: Value,
+    command: Command,
+    payload: Vec<u8>,
+}
+
+fn prepare(path: &Path, request: [u8; 16]) -> Result<Prepared> {
+    let value = super::candidate_document(path)?;
+    let source = field(&value, "source_sha256")?.to_owned();
+    let command = Command::Write {
+        request,
+        changes: vec![Change {
+            collection: "sources".into(),
+            key: source,
+            value: Some(value.clone()),
+        }],
+    };
+    let payload = command.encode()?;
+    if decode(&payload)? != command {
+        return Err(Error::new("import encoding would change its meaning"));
+    }
+    Ok(Prepared {
+        value,
+        command,
+        payload,
+    })
+}
+
+/// Preview the exact bounded candidate document without enrollment or publication.
+/// Unclassified source text remains in the source file.
+/// # Errors
+/// Returns an error if the CSV cannot be read or its candidate document cannot
+/// be encoded and validated as one complete import operation.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbImportAtomic",
+        action = "Preview",
+        project = "aterm_db::import::commons::tests::atomic_transition"
+    )
+)]
+pub fn preview(path: &Path) -> Result<Value> {
+    Ok(prepare(path, [0; 16])?.value)
 }
 
 /// Parsed input remains a proposal. No record from this table can activate a
 /// credential, assign a machine name, merge mailboxes or grant spending rights.
 pub struct Imports {
     paths: Paths,
+    deadline: Option<std::time::Instant>,
 }
 impl Imports {
     pub fn at(paths: Paths) -> Self {
-        Self { paths }
+        Self {
+            paths,
+            deadline: None,
+        }
+    }
+    /// Observe imported metadata within the caller's existing pass budget.
+    pub fn at_until(paths: Paths, deadline: std::time::Instant) -> Self {
+        Self {
+            paths,
+            deadline: Some(deadline),
+        }
     }
     /// Validate the complete source before any application mutation. Repeating
     /// a request with different bytes is refused by the shared metadata log.
@@ -56,20 +114,11 @@ impl Imports {
         )
     )]
     pub fn apply(&self, path: &Path, request: [u8; 16]) -> Result<Value> {
-        let value = super::candidate_document(path)?;
-        let source = field(&value, "source_sha256")?.to_owned();
-        let command = Command::Write {
-            request,
-            changes: vec![Change {
-                collection: "sources".into(),
-                key: source.clone(),
-                value: Some(value.clone()),
-            }],
-        };
-        let payload = command.encode()?;
-        if decode(&payload)? != command {
-            return Err(Error::new("import encoding would change its meaning"));
-        }
+        let Prepared {
+            value,
+            command,
+            payload,
+        } = prepare(path, request)?;
         let receipt = crate::documents::application::with_store(
             &self.paths,
             true,
@@ -83,17 +132,31 @@ impl Imports {
                         .receipt(session, &id)?
                         .ok_or_else(|| Error::new("import receipt is unavailable"));
                 }
-                store.commit_catalog(session, &payload)
+                crate::documents::application::append(session, store, &payload)
             },
         )?;
         Ok(report(&value, receipt, request))
     }
     pub fn snapshot(&self) -> Result<Snapshot> {
-        crate::documents::application::observe_store(
-            &self.paths,
-            descriptor,
-            |session, store, scope| Ok(Log::read_with(session, store, scope, decode)?.snapshot()),
-        )
+        let read =
+            |session: &crate::table::Session<'_>, store: &crate::table::store::Store, scope| {
+                Ok(Log::read_with(session, store, scope, decode)?.snapshot())
+            };
+        match self.deadline {
+            Some(deadline) => crate::documents::application::observe_store_until(
+                &self.paths,
+                descriptor,
+                deadline,
+                read,
+            ),
+            None => crate::documents::application::observe_store(&self.paths, descriptor, read),
+        }
+    }
+    /// Compare the validated CSV with retained sources without publishing,
+    /// replacing or selecting one. The report contains no source cell values.
+    pub fn compare(&self, path: &Path) -> Result<Value> {
+        let current = preview(path)?;
+        comparison::report(&current, &self.snapshot()?)
     }
 }
 
@@ -228,6 +291,15 @@ fn report(value: &Value, receipt: Receipt, request: [u8; 16]) -> Value {
 
 pub(crate) fn run(command: &str, mut options: BTreeMap<&str, &str>) -> Result<Value> {
     let db = Imports::at(Paths::live().map_err(crate::table::failure)?);
+    if command == "accounts-compare-csv" {
+        let path = options
+            .remove("--file")
+            .ok_or_else(|| Error::new("missing comparison file"))?;
+        if !options.is_empty() {
+            return Err(Error::new("unknown comparison option"));
+        }
+        return db.compare(Path::new(path));
+    }
     if command == "accounts-import-csv" {
         let path = options
             .remove("--file")
@@ -258,7 +330,7 @@ pub(crate) fn run(command: &str, mut options: BTreeMap<&str, &str>) -> Result<Va
             "sequence":op.header.sequence,"parents":op.header.parents.iter().map(|id|hex::encode_lower(id)).collect::<Vec<_>>(),
             "authored_at_unix_ms":op.authored_ms,"time_source":"signed-author-claim",
             "received_at_unix_ms":op.receipt.received_ms,"receipt_operation":hex::encode_lower(&op.receipt.id),
-            "eligible":op.eligible,"available":op.available,"refusal":op.refusal
+            "eligible":op.eligible,"available":op.available,"catalog_eligible":op.catalog_eligible,"refusal":op.refusal
         })).collect::<Vec<_>>()}))
 }
 

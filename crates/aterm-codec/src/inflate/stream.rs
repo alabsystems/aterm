@@ -6,8 +6,9 @@
 use std::io::{self, Read};
 
 use super::{
-    Adler32, BitReader, DIST_BASE, DIST_EXTRA, Huffman, InflateError, LENGTH_BASE, LENGTH_EXTRA,
-    ROOT_BUILD_AFTER, check_zlib_header, fixed_dist, fixed_lit, read_dynamic_tables,
+    Adler32, BitReader, DIST_BASE, DIST_EXTRA, DYNAMIC_HEADER_WORK, HEADER_WORK, Huffman,
+    InflateError, LENGTH_BASE, LENGTH_EXTRA, ROOT_BUILD_AFTER, check_zlib_header, fixed_tables,
+    read_dynamic_tables,
 };
 use crate::crc32::Crc32;
 
@@ -84,13 +85,43 @@ enum Phase {
     Stored { remaining: u32 },
     /// Inside a Huffman-coded block. `warm` counts symbols left before the root
     /// tables are built (the parent's `ROOT_BUILD_AFTER` deferral).
-    Huff {
-        lit: Box<Huffman>,
-        dist: Box<Huffman>,
-        warm: u32,
-    },
+    Huff { tables: Tables, warm: u32 },
     /// The final block is complete.
     Done,
+}
+
+/// The literal/length and distance alphabets a Huffman-coded block decodes with.
+enum Tables {
+    /// A fixed block's: the process's one armed pair (`fixed_tables`).
+    Fixed,
+    /// A dynamic block's own.
+    Dynamic {
+        lit: Box<Huffman>,
+        dist: Box<Huffman>,
+    },
+}
+
+impl Tables {
+    /// The literal/length and distance tables to decode with.
+    #[inline]
+    fn pair(&self) -> (&Huffman, &Huffman) {
+        match self {
+            Self::Fixed => {
+                let (lit, dist) = fixed_tables();
+                (lit, dist)
+            }
+            Self::Dynamic { lit, dist } => (lit, dist),
+        }
+    }
+
+    /// Build a dynamic pair's root tables; the fixed pair's are built already.
+    #[inline]
+    fn arm_root(&mut self) {
+        if let Self::Dynamic { lit, dist } = self {
+            lit.arm_root();
+            dist.arm_root();
+        }
+    }
 }
 
 /// What one [`Inflater::pump`] achieved.
@@ -119,6 +150,9 @@ struct Inflater {
     /// Total bytes ever decoded, which is the true bound on a back-reference
     /// distance once `out` has been compacted.
     produced: u64,
+    /// What the block headers still to come may cost ([`HEADER_WORK`],
+    /// [`DYNAMIC_HEADER_WORK`]); `u64::MAX` for a reader with no budget.
+    work_left: u64,
 }
 
 impl Inflater {
@@ -132,6 +166,7 @@ impl Inflater {
             out: Vec::new(),
             out_at: 0,
             produced: 0,
+            work_left: u64::MAX,
         }
     }
 
@@ -168,6 +203,7 @@ impl Inflater {
             out,
             out_at,
             produced,
+            work_left,
         } = self;
         let mut br = cursor.reader(input);
         loop {
@@ -194,14 +230,24 @@ impl Inflater {
                         }
                         Err(other) => return Err(other),
                         Ok((bfinal, btype)) => {
+                            // Charged before a dynamic header's tables are built, and
+                            // once: a header the input cuts short is charged when it is
+                            // read whole.
+                            let work = if btype == 2 {
+                                DYNAMIC_HEADER_WORK
+                            } else {
+                                HEADER_WORK
+                            };
+                            let Some(left) = work_left.checked_sub(work) else {
+                                return Err(InflateError::TooMuchWork);
+                            };
                             *final_block = bfinal;
                             match btype {
                                 0 => *phase = Phase::StoredHeader,
                                 1 => {
                                     *phase = Phase::Huff {
-                                        lit: Box::new(fixed_lit()),
-                                        dist: Box::new(fixed_dist()),
-                                        warm: ROOT_BUILD_AFTER,
+                                        tables: Tables::Fixed,
+                                        warm: 0,
                                     };
                                 }
                                 2 => {
@@ -214,8 +260,10 @@ impl Inflater {
                                         Err(other) => return Err(other),
                                         Ok((lit, dist)) => {
                                             *phase = Phase::Huff {
-                                                lit: Box::new(lit),
-                                                dist: Box::new(dist),
+                                                tables: Tables::Dynamic {
+                                                    lit: Box::new(lit),
+                                                    dist: Box::new(dist),
+                                                },
                                                 warm: ROOT_BUILD_AFTER,
                                             };
                                         }
@@ -223,6 +271,7 @@ impl Inflater {
                                 }
                                 _ => return Err(InflateError::BadBlockType),
                             }
+                            *work_left = left;
                             *cursor = Cursor::save(&br);
                         }
                     }
@@ -280,15 +329,15 @@ impl Inflater {
                     }
                     *cursor = Cursor::save(&br);
                 }
-                Phase::Huff { lit, dist, warm } => {
+                Phase::Huff { tables, warm } => {
                     loop {
                         if out.len().saturating_sub(*out_at) >= PUMP_TARGET {
                             break;
                         }
                         if *warm == 0 {
-                            lit.arm_root();
-                            dist.arm_root();
+                            tables.arm_root();
                         }
+                        let (lit, dist) = tables.pair();
                         let save = Cursor::save(&br);
                         match decode_one(&mut br, lit, dist, *warm > 0, out, produced) {
                             Err(InflateError::Truncated) => {
@@ -398,6 +447,7 @@ impl std::fmt::Display for InflateError {
             Self::BadDistance => "corrupt deflate stream: back-reference out of range",
             Self::OutputTooLarge => "decompressed output exceeds the caller's ceiling",
             Self::BadChecksum => "checksum mismatch",
+            Self::TooMuchWork => "deflate block headers exceed the reader's work budget",
         })
     }
 }
@@ -523,6 +573,18 @@ impl<R: Read> ZlibReader<R> {
             state: ZlibState::Header,
         }
     }
+
+    /// Wrap `source`, refusing it ([`InflateError::TooMuchWork`], as
+    /// `InvalidData`) once its block headers would cost more than `budget`:
+    /// [`HEADER_WORK`] a stored or fixed one, [`DYNAMIC_HEADER_WORK`] a dynamic
+    /// one. The rest of a decode's work is bounded by the output the caller
+    /// reads; a header's is not, since an empty block outputs nothing.
+    #[inline]
+    pub const fn with_work_budget(source: R, budget: u64) -> Self {
+        let mut reader = Self::new(source);
+        reader.inner.inflater.work_left = budget;
+        reader
+    }
 }
 
 impl<R: Read> Read for ZlibReader<R> {
@@ -603,33 +665,48 @@ fn parse_gzip_header(buf: &[u8]) -> io::Result<Option<usize>> {
     const FNAME: u8 = 1 << 3;
     const FCOMMENT: u8 = 1 << 4;
 
+    if let Some(&b0) = buf.first()
+        && b0 != 0x1f
+    {
+        return Err(gz_err("not a gzip stream: bad magic"));
+    }
+    if let Some(&b1) = buf.get(1)
+        && b1 != 0x8b
+    {
+        return Err(gz_err("not a gzip stream: bad magic"));
+    }
+    if let Some(&cm) = buf.get(2)
+        && cm != 8
+    {
+        return Err(gz_err("unsupported gzip compression method"));
+    }
+    if let Some(&flg) = buf.get(3)
+        && flg & 0xE0 != 0
+    {
+        return Err(gz_err("gzip header sets a reserved flag bit"));
+    }
     let Some(fixed) = buf.get(..10) else {
         return Ok(None);
     };
-    if fixed.first().copied() != Some(0x1f) || fixed.get(1).copied() != Some(0x8b) {
-        return Err(gz_err("not a gzip stream: bad magic"));
-    }
-    if fixed.get(2).copied() != Some(8) {
-        return Err(gz_err("unsupported gzip compression method"));
-    }
     let flg = fixed.get(3).copied().unwrap_or(0);
-    if flg & 0xE0 != 0 {
-        return Err(gz_err("gzip header sets a reserved flag bit"));
-    }
+    let mut tail_min = (if flg & FEXTRA != 0 { 2usize } else { 0 })
+        + usize::from(flg & FNAME != 0)
+        + usize::from(flg & FCOMMENT != 0)
+        + (if flg & FHCRC != 0 { 2 } else { 0 });
     let mut at = 10usize;
     if flg & FEXTRA != 0 {
         let (Some(lo), Some(hi)) = (buf.get(at).copied(), buf.get(at.saturating_add(1)).copied())
         else {
             return Ok(None);
         };
+        tail_min = tail_min.saturating_sub(2);
         let xlen = usize::from(u16::from_le_bytes([lo, hi]));
         at = at.saturating_add(2).saturating_add(xlen);
+        if at.saturating_add(tail_min) > MAX_GZIP_HEADER {
+            return Err(gz_err("gzip header is implausibly long"));
+        }
         if at > buf.len() {
-            return if at > MAX_GZIP_HEADER {
-                Err(gz_err("gzip header is implausibly long"))
-            } else {
-                Ok(None)
-            };
+            return Ok(None);
         }
     }
     for present in [flg & FNAME != 0, flg & FCOMMENT != 0] {
@@ -640,26 +717,37 @@ fn parse_gzip_header(buf: &[u8]) -> io::Result<Option<usize>> {
             return Ok(None);
         };
         let Some(nul) = rest.iter().position(|&b| b == 0) else {
-            return if buf.len() > MAX_GZIP_HEADER {
+            return if buf.len().saturating_add(tail_min) > MAX_GZIP_HEADER {
                 Err(gz_err("gzip header is implausibly long"))
             } else {
                 Ok(None)
             };
         };
+        tail_min = tail_min.saturating_sub(1);
         at = at.saturating_add(nul).saturating_add(1);
+        if at.saturating_add(tail_min) > MAX_GZIP_HEADER {
+            return Err(gz_err("gzip header is implausibly long"));
+        }
     }
     if flg & FHCRC != 0 {
         let end = at.saturating_add(2);
-        let (Some(head), Some(lo), Some(hi)) = (
-            buf.get(..at),
-            buf.get(at).copied(),
-            buf.get(at.saturating_add(1)).copied(),
-        ) else {
+        if end > MAX_GZIP_HEADER {
+            return Err(gz_err("gzip header is implausibly long"));
+        }
+        let Some(head) = buf.get(..at) else {
             return Ok(None);
         };
-        let stored = u16::from_le_bytes([lo, hi]);
-        let want = (Crc32::of(head) & 0xFFFF) as u16;
-        if stored != want {
+        let [want_lo, want_hi] = ((Crc32::of(head) & 0xFFFF) as u16).to_le_bytes();
+        let Some(lo) = buf.get(at).copied() else {
+            return Ok(None);
+        };
+        if lo != want_lo {
+            return Err(gz_err("gzip header checksum mismatch"));
+        }
+        let Some(hi) = buf.get(at.saturating_add(1)).copied() else {
+            return Ok(None);
+        };
+        if hi != want_hi {
             return Err(gz_err("gzip header checksum mismatch"));
         }
         at = end;

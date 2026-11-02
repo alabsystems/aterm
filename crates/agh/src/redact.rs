@@ -17,11 +17,20 @@ const TOKEN_PREFIXES: [&[u8]; 6] = [b"ghp_", b"gho_", b"ghu_", b"ghs_", b"ghr_",
 const SCHEMES: [&[u8]; 3] = [b"bearer", b"token", b"basic"];
 const LEARN_MIN: usize = 8;
 const BEARER_MIN: usize = 8;
+/// The shortest base64 run rule 4 redacts.
+const BASIC_MIN: usize = 16;
+
+/// One learned secret: its exact bytes, and the unpadded base64 of the Basic credential git
+/// sends for it, when it could be encoded.
+struct Learned {
+    exact: Secret,
+    basic: Option<Secret>,
+}
 
 /// Rewrites secrets out of text. Clones share one learned set.
 #[derive(Clone, Default)]
 pub struct Redactor {
-    exact: Arc<Mutex<Vec<Secret>>>,
+    exact: Arc<Mutex<Vec<Learned>>>,
 }
 
 /// Whether `bytes` at `at` start with `prefix`, ASCII case-insensitively.
@@ -171,16 +180,46 @@ impl Redactor {
         Redactor::default()
     }
 
-    /// Remembers `secret`'s exact bytes (values under 8 bytes or already learned are ignored).
+    /// Remembers two needles of `secret` (values under 8 bytes or already learned are
+    /// ignored): its exact bytes, and the unpadded standard base64 of `x-access-token:`
+    /// followed by it, the payload of the Basic credential git sends under agh's helper
+    /// username. The unpadded needle also matches the padded text, of which it is a prefix. A
+    /// secret too large to encode (over 64 MiB, which no token reaches) keeps the first needle
+    /// alone.
     pub fn learn(&self, secret: &[u8]) {
         if secret.len() < LEARN_MIN {
             return;
         }
         let mut exact = self.exact.lock().unwrap_or_else(PoisonError::into_inner);
-        if exact.iter().any(|known| known.expose() == secret) {
+        if exact.iter().any(|known| known.exact.expose() == secret) {
             return;
         }
-        exact.push(Secret::new(secret));
+        // The username git sends a helper's token under, before the token, in a Basic
+        // credential: the helper's own constant, so the needle follows what git sends. Both
+        // buffers hold the token (the second as its base64), so each is scrubbed: the first
+        // is sized once, so no growth leaves a copy behind, and the second goes whole,
+        // spare capacity included, into `Secret::from_vec`.
+        let user = crate::git::GIT_USERNAME.as_bytes();
+        let mut credential = Vec::with_capacity(user.len() + 1 + secret.len());
+        credential.extend_from_slice(user);
+        credential.push(b':');
+        credential.extend_from_slice(secret);
+        let basic = aterm_codec::base64::encode(&credential)
+            .ok()
+            .map(|encoded| {
+                let mut bytes = encoded.into_bytes();
+                let unpadded = bytes
+                    .iter()
+                    .rposition(|byte| *byte != b'=')
+                    .map_or(0, |last| last + 1);
+                bytes.truncate(unpadded);
+                Secret::from_vec(bytes)
+            });
+        aterm_uds::secret::scrub(&mut credential);
+        exact.push(Learned {
+            exact: Secret::new(secret),
+            basic,
+        });
     }
 
     /// Redacts every learned value (longest first), then applies [`Redactor::shapes`].
@@ -201,6 +240,7 @@ impl Redactor {
         let exact = self.exact.lock().unwrap_or_else(PoisonError::into_inner);
         let mut known: Vec<&str> = exact
             .iter()
+            .flat_map(|learned| std::iter::once(&learned.exact).chain(learned.basic.as_ref()))
             .filter_map(|secret| std::str::from_utf8(secret.expose()).ok())
             .collect();
         if known.is_empty() {
@@ -228,13 +268,35 @@ impl Redactor {
         out
     }
 
-    /// Redacts token shapes (`ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`/`github_pat_`),
-    /// `Authorization:` header values, and `bearer <8+ bytes>` runs into `[redacted]`.
+    /// Redacts into `[redacted]`: token shapes (`ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`/
+    /// `github_pat_`, rule 1), `Authorization:` header values (rule 2), `bearer <8+ bytes>`
+    /// runs (rule 3), and Basic credentials (rule 4): `basic` (ASCII case-insensitive), a space
+    /// or tab (raw or JSON-escaped), an optional `"` or `\"`, then a run of at least 16 bytes
+    /// of `[A-Za-z0-9+/=]` holding one byte outside `[A-Za-z]`. Prose such as
+    /// `the basic configuration` is left alone: a run of letters alone, or under 16 bytes.
     #[inline]
     #[must_use]
     pub fn shapes(text: &str) -> String {
         scan(text, true)
     }
+}
+
+/// Rule 4: matches `basic <base64 run>` at `at` and returns the run's start and end.
+fn basic_at(bytes: &[u8], at: usize) -> Option<(usize, usize)> {
+    let word = "basic".len();
+    if !starts_ci(bytes, at, b"basic") || blank_at(bytes, at + word) == 0 {
+        return None;
+    }
+    let (_, start) = open_quote(bytes, skip_blanks(bytes, at + word));
+    let mut end = start;
+    while bytes
+        .get(end)
+        .is_some_and(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+    {
+        end += 1;
+    }
+    let run = &bytes[start..end];
+    (run.len() >= BASIC_MIN && run.iter().any(|b| !b.is_ascii_alphabetic())).then_some((start, end))
 }
 
 fn scan(text: &str, context: bool) -> String {
@@ -246,7 +308,11 @@ fn scan(text: &str, context: bool) -> String {
             out.extend_from_slice(REDACTED);
             at = end;
         } else if let Some((keep, end)) = context
-            .then(|| header_at(bytes, at).or_else(|| bearer_at(bytes, at)))
+            .then(|| {
+                header_at(bytes, at)
+                    .or_else(|| bearer_at(bytes, at))
+                    .or_else(|| basic_at(bytes, at))
+            })
             .flatten()
         {
             out.extend_from_slice(&bytes[at..keep]);

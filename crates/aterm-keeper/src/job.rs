@@ -147,31 +147,45 @@ pub enum JobState {
     Loaded { pid: Option<u32> },
 }
 
+const LAUNCHCTL_HANG: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn launchctl_io_error(err: aterm_uds::deadline::RunError) -> io::Error {
+    match err {
+        aterm_uds::deadline::RunError::Spawn(e) => e,
+        other => io::Error::other(other),
+    }
+}
+
 /// Read a job's state with `launchctl print gui/<uid>/<label>` (read-only).
 ///
 /// # Errors
 /// `launchctl` failing to run at all.
 #[cfg(unix)]
 pub fn state(label: &str) -> io::Result<JobState> {
-    let out = aterm_uds::spawnfd::command("/bin/launchctl")
-        .arg("print")
-        .arg(format!("{}/{label}", gui_domain()))
-        .output()?;
+    let mut cmd = aterm_uds::spawnfd::command("/bin/launchctl");
+    cmd.arg("print").arg(format!("{}/{label}", gui_domain()));
+    let out =
+        aterm_uds::deadline::output_within(&mut cmd, LAUNCHCTL_HANG).map_err(launchctl_io_error)?;
     if !out.status.success() {
         return Ok(JobState::Absent);
     }
     let text = String::from_utf8_lossy(&out.stdout);
     let pid = text.lines().find_map(|l| {
-        let l = l.trim();
-        l.strip_prefix("pid = ").and_then(|p| p.trim().parse().ok())
+        let top = l.strip_prefix('\t')?;
+        let s = top.strip_prefix("pid = ")?.trim();
+        (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| s.parse::<u32>().ok())
+            .flatten()
+            .filter(|p| *p > 0)
     });
     Ok(JobState::Loaded { pid })
 }
 
 fn run_launchctl(argv: &[String]) -> io::Result<()> {
-    let out = aterm_uds::spawnfd::command("/bin/launchctl")
-        .args(argv)
-        .output()?;
+    let mut cmd = aterm_uds::spawnfd::command("/bin/launchctl");
+    cmd.args(argv);
+    let out =
+        aterm_uds::deadline::output_within(&mut cmd, LAUNCHCTL_HANG).map_err(launchctl_io_error)?;
     if out.status.success() {
         Ok(())
     } else {

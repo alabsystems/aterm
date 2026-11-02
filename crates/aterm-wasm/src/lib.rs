@@ -815,6 +815,10 @@ impl AtermTerminal {
     /// Expand an OSC-8 hyperlink to the span of contiguous cells sharing its
     /// link.
     fn osc8_span(&self, row: u16, col: u16) -> (u16, u16) {
+        let cols = u16::try_from(self.cols).unwrap_or(u16::MAX);
+        if col >= cols {
+            return (col, col);
+        }
         let same = |c: u16| -> bool {
             let id_here = self.term.hyperlink_id_at(row, col);
             let id_there = self.term.hyperlink_id_at(row, c);
@@ -830,8 +834,7 @@ impl AtermTerminal {
             start -= 1;
         }
 
-        let cols = self.cols as u16;
-        let mut end = col + 1;
+        let mut end = col.saturating_add(1);
         while end < cols && same(end) {
             end += 1;
         }

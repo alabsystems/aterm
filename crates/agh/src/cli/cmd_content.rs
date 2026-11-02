@@ -26,9 +26,7 @@ pub(crate) fn cat(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     };
     let max = match inv.flag("--max-bytes") {
         None => MAX_BYTES,
-        Some(text) => text
-            .parse::<u64>()
-            .ok()
+        Some(text) => crate::path::digits::<u64>(text)
             .filter(|n| *n > 0)
             .ok_or_else(|| inv.usage("--max-bytes wants a positive integer"))?,
     };
@@ -108,7 +106,8 @@ pub(crate) fn find(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
             .with_next("agh ls REPO@REF:DIR for one directory, or --partial")
             .with_repo(slug.to_string()));
     }
-    let mut entries: Vec<_> = tree
+    let mut entries = Vec::new();
+    for entry in tree
         .tree
         .into_iter()
         .filter(|entry| {
@@ -122,12 +121,21 @@ pub(crate) fn find(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
             })
         })
         .filter(|entry| kind.as_deref().is_none_or(|kind| entry.kind == kind))
-        .filter(|entry| {
-            pattern
-                .as_ref()
-                .is_none_or(|pattern| pattern.is_match(&entry.path))
-        })
-        .collect();
+    {
+        let matched = match &pattern {
+            None => true,
+            Some(pattern) => pattern.try_is_match(&entry.path).map_err(|e| {
+                inv.usage(format!(
+                    "--match {:?} gave up on a {}-byte path: {e}",
+                    pattern.as_str(),
+                    entry.path.len()
+                ))
+            })?,
+        };
+        if matched {
+            entries.push(entry);
+        }
+    }
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     let end = crate::page::cut(End::Complete, &mut entries, inv.global.limit);
     let completeness = if tree.truncated {

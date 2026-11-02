@@ -218,8 +218,10 @@ pub fn parse_args(args: &[String]) -> Result<Args, Fail> {
     let rounds = match rounds {
         None => REGISTERED_ROUNDS,
         Some(v) => v
-            .parse::<usize>()
-            .ok()
+            .bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| v.parse::<usize>().ok())
+            .flatten()
             .filter(|n| (1..=REGISTERED_ROUNDS).contains(n))
             .ok_or_else(|| {
                 Fail::usage(format!(
@@ -259,13 +261,19 @@ impl Summary {
     /// The value as one count.
     #[must_use]
     pub fn int(&self, key: &str) -> Option<u64> {
-        self.get(key)?.parse().ok()
+        let v = self.get(key)?;
+        v.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| v.parse().ok())?
     }
 
     /// Word `i` of the value as a count.
     #[must_use]
     pub fn nth(&self, key: &str, i: usize) -> Option<u64> {
-        self.get(key)?.split_whitespace().nth(i)?.parse().ok()
+        let w = self.get(key)?.split_whitespace().nth(i)?;
+        w.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| w.parse().ok())?
     }
 
     /// The value's words as counts.
@@ -273,7 +281,11 @@ impl Summary {
     pub fn ints(&self, key: &str) -> Option<Vec<u64>> {
         self.get(key)?
             .split_whitespace()
-            .map(|w| w.parse().ok())
+            .map(|w| {
+                w.bytes()
+                    .all(|b| b.is_ascii_digit())
+                    .then(|| w.parse().ok())?
+            })
             .collect()
     }
 
@@ -367,12 +379,16 @@ pub fn parse_ac(text: &str) -> Option<bool> {
 pub fn parse_swap_used(text: &str) -> Option<f64> {
     let rest = text.split_once("used = ")?.1;
     let word = rest.split_whitespace().next()?;
-    let (num, unit) = word.split_at(word.len().checked_sub(1)?);
-    let v: f64 = num.parse().ok()?;
+    let unit = word.chars().last()?;
+    let num = &word[..word.len() - unit.len_utf8()];
+    let v: f64 = num
+        .parse()
+        .ok()
+        .filter(|v: &f64| v.is_finite() && *v >= 0.0)?;
     match unit {
-        "M" => Some(v),
-        "G" => Some(v * 1024.0),
-        "K" => Some(v / 1024.0),
+        'M' => Some(v),
+        'G' => Some(v * 1024.0),
+        'K' => Some(v / 1024.0),
         _ => None,
     }
 }
@@ -787,8 +803,11 @@ fn gate5(r: &Run, s: &Summary, out: &mut Vec<(Gate, String)>) {
 /// The class word of a summary's `qos=` (`0x21 0`).
 #[must_use]
 pub fn qos_class(qos: &str) -> Option<u32> {
-    let word = qos.split_whitespace().next()?;
-    u32::from_str_radix(word.strip_prefix("0x")?, 16).ok()
+    let hex = qos.split_whitespace().next()?.strip_prefix("0x")?;
+    hex.bytes()
+        .all(|b| b.is_ascii_hexdigit())
+        .then(|| u32::from_str_radix(hex, 16).ok())
+        .flatten()
 }
 
 /// A `qos_class_t` value's name, for display only.
@@ -1564,7 +1583,12 @@ fn valid_runs<'a>(runs: &'a [Run], valid: &[usize], arm: Arm) -> Vec<&'a Run> {
 /// A value's words as numbers, `-` and other words as `None`.
 fn words(v: &str) -> Vec<Option<f64>> {
     v.split_whitespace()
-        .map(|w| w.parse::<u64>().ok().map(|n| n as f64))
+        .map(|w| {
+            w.bytes()
+                .all(|b| b.is_ascii_digit())
+                .then(|| w.parse::<u64>().ok().map(|n| n as f64))
+                .flatten()
+        })
         .collect()
 }
 

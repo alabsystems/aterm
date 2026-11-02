@@ -23,6 +23,11 @@ aterm-hash = { workspace = true }
 [target.'cfg(any(unix, windows))'.dependencies]
 aterm-uds = { workspace = true }
 
+# First-party Unix constants (`O_NOFOLLOW`, `O_NONBLOCK`, signal defaults) for bounded script
+# verification, spare-FIFO wakes, and live-shell fixtures.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 # No wasm32 dependency table: a browser spawns no shell, so the nonce mint exists only
 # where `aterm_uds::rand` does (src/lib.rs `fill_nonce_entropy`).
 
@@ -39,14 +44,10 @@ aterm-log = { workspace = true }
 # finds the live shells, as it does for atpkg's real-shell tests.
 aterm-spec = { workspace = true }
 
-# `LiveShell::spawn` starts every live shell with SIGINT and SIGQUIT at their defaults,
-# as aterm-pty starts a tab's (`signal` between fork and exec). The workspace's `libc`
-# is first-party (crates/aterm-libc).
-[target.'cfg(unix)'.dev-dependencies]
-libc = { workspace = true }
 # The live-pty tests' pty (`LiveShell::spawn_on_pty`): aterm-pty's pair, where `script(1)`
 # gave one before (BSD and util-linux `script` differ; docs/DESIGN-init-system-2026-10-20.md
 # §6.1 row 7).
+[target.'cfg(unix)'.dev-dependencies]
 aterm-pty = { workspace = true }
 
 # The Windows key-press test (src/tests_pwsh_keys.rs) types at a live PowerShell

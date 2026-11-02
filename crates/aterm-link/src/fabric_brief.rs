@@ -8,7 +8,10 @@ use std::io;
 use std::path::Path;
 use std::process::ExitCode;
 
-use aterm_slog::bus::{BusSpace, Gone};
+use aterm_slog::bus::{BusSpace, Gone, Seed};
+use aterm_slog::{
+    Actor, Conf, Fields, Fold, GapWhy, Key, Kind, Lvl, Need, Node, Op, Out, Rec, Src,
+};
 
 use crate::bridge::Config;
 use crate::fabric::J;
@@ -59,18 +62,18 @@ impl BriefOpts {
             match w.as_str() {
                 "--window" => {
                     let v = value()?;
-                    let n: u64 = v
-                        .parse()
-                        .ok()
+                    let n: u64 = (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                        .then(|| v.parse().ok())
+                        .flatten()
                         .filter(|n| (1..=WINDOW_MAX).contains(n))
                         .ok_or_else(|| format!("--window {}: 1..={WINDOW_MAX}", safe(&v, 32)))?;
                     o.window = Some(n);
                 }
                 "--budget" => {
                     let v = value()?;
-                    let n: usize = v
-                        .parse()
-                        .ok()
+                    let n: usize = (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                        .then(|| v.parse().ok())
+                        .flatten()
                         .filter(|n| (100..=100_000).contains(n))
                         .ok_or_else(|| format!("--budget {}: 100..=100000", safe(&v, 32)))?;
                     o.budget = Some(n);
@@ -105,6 +108,21 @@ pub(crate) struct Session {
     presence: Option<String>,
     /// The incarnation its presence row was written under (`inc=`).
     presence_inc: Option<u64>,
+    /// The newest incarnation of its node that hosted it, as far as this read saw: the
+    /// greatest `inc=` of a row of its presence that did not say `exited` ([`retired`]).
+    lived_inc: Option<u64>,
+    /// The earliest incarnation a row of its presence said `exited` under, as far as this read
+    /// saw ([`withdrawn`]): the one that hosted it, when its bridge withdrew it (a quit, its
+    /// own exit), or a later one, when that one's ghost sweep retired the row it left live.
+    exited_inc: Option<u64>,
+    /// The offset of the first record of a successor on its node whose restore names it
+    /// (`restore prev=<sid>`, [`restores`]): a new shell stands in the pane it held, after a
+    /// relaunch (a crash's or a quit's) or a reopened tab. Whether it died is [`restore_says_died`].
+    successor: Option<u64>,
+    /// The greatest seq of a body offered to each of its spaces, whether or not the space took
+    /// it (one outside this build's bus class is held unfolded): a derived record is numbered
+    /// past it ([`derive_close`]).
+    pub(crate) offered: BTreeMap<u32, u64>,
     newest_off: u64,
 }
 
@@ -204,13 +222,27 @@ impl Read {
             }
         } else {
             let s = self.session_mut(node, sid)?;
-            s.presence = state_of(body);
-            s.presence_inc = inc_of(body);
+            let (state, inc) = (state_of(body), inc_of(body));
+            s.row(state.as_deref(), inc);
+            s.presence = state;
+            s.presence_inc = inc;
         }
         Ok(())
     }
 
-    /// One `ev` record into its `(node, sid, ep)` view.
+    /// An earlier row of a session's presence than the one [`Self::presence`] took (a one-shot
+    /// read's window, [`lived_history`]): only the incarnation it names, as one that hosted the
+    /// session or one it exited under, for a session the read holds.
+    fn earlier_presence(&mut self, node: &str, sid: &str, body: &[u8]) {
+        if let Some(s) = self.sessions.get_mut(&(node.to_string(), sid.to_string())) {
+            s.row(state_of(body).as_deref(), inc_of(body));
+        }
+    }
+
+    /// One `ev` record into its `(node, sid, ep)` view; and, when it is a successor's restore
+    /// that names a session of its node the read holds for the first time ([`restores`]), that
+    /// session's `(node, sid)`. A read narrowed to one sid still reads its node's other
+    /// sessions' restores for it.
     pub(crate) fn ingest(
         &mut self,
         fleet: &str,
@@ -218,25 +250,82 @@ impl Read {
         off: u64,
         subject: &str,
         body: &[u8],
-    ) -> io::Result<()> {
+    ) -> io::Result<Option<(String, String)>> {
         let Some((node, sid)) = owner(fleet, subject, "ev") else {
-            return Ok(());
+            return Ok(None);
         };
-        if want.is_some_and(|want| want != sid) {
-            return Ok(());
+        let mine = want.is_none_or(|want| want == sid);
+        if !mine && !body.windows(RESTORE_WORD.len()).any(|w| w == RESTORE_WORD) {
+            return Ok(None);
         }
-        let Ok(b) = aterm_slog::decode_bus(&String::from_utf8_lossy(body)) else {
+        let decoded = aterm_slog::decode_bus(&String::from_utf8_lossy(body));
+        let named = decoded
+            .as_ref()
+            .ok()
+            .and_then(|b| restores(&b.rec))
+            .filter(|prev| *prev != sid && want.is_none_or(|want| want == *prev))
+            .and_then(|prev| self.restored(node, prev, off));
+        if !mine {
+            return Ok(named);
+        }
+        let Ok(b) = decoded else {
             self.opaque += 1;
-            return Ok(());
+            return Ok(named);
         };
         let s = self.session_mut(node, sid)?;
         s.newest_off = s.newest_off.max(off);
+        let (ep, seq) = (b.ep, b.rec.seq.min(aterm_slog::SEQ_LIMIT));
+        let top = s.offered.entry(ep).or_default();
+        *top = (*top).max(seq);
         s.spaces
-            .entry(b.ep)
-            .or_insert_with(|| BusSpace::new(b.ep))
+            .entry(ep)
+            .or_insert_with(|| BusSpace::new(ep))
             .offer(b);
-        Ok(())
+        Ok(named)
     }
+
+    /// A successor's restore at `off` names session `prev` of `node`: its key, when the read
+    /// holds it and no earlier restore named it.
+    fn restored(&mut self, node: &str, prev: &str, off: u64) -> Option<(String, String)> {
+        let key = (node.to_string(), prev.to_string());
+        let s = self.sessions.get_mut(&key)?;
+        if s.successor.is_some() {
+            return None;
+        }
+        s.successor = Some(off);
+        Some(key)
+    }
+}
+
+impl Session {
+    /// A row of this session's presence read: an incarnation that hosted it, or, when it says
+    /// `exited`, one it exited under.
+    fn row(&mut self, state: Option<&str>, inc: Option<u64>) {
+        let Some(inc) = inc else {
+            return;
+        };
+        if state == Some("exited") {
+            self.exited_inc = Some(self.exited_inc.map_or(inc, |e| e.min(inc)));
+        } else {
+            self.lived_inc = Some(self.lived_inc.map_or(inc, |l| l.max(inc)));
+        }
+    }
+}
+
+/// The token every successor's restore body carries (`k=restore`), which a read narrowed to
+/// another sid looks for before it decodes a body.
+const RESTORE_WORD: &[u8] = b"k=restore";
+
+/// The session a successor's record names as the one it restores: the `open - restore` or
+/// `amend - restore` with `prev=<sid>` that a restore's new shell writes on its own session
+/// node (aterm-gui's `note_restored`) when it fills the pane the old session held: at every
+/// cold relaunch, a crash's or a clean quit's, and when a closed tab is reopened, so the record
+/// alone says nothing of how the old session ended ([`restore_says_died`]). A seamless update
+/// keeps the session's own sid and names no `prev=`.
+fn restores(rec: &Rec) -> Option<&str> {
+    (rec.node == Node::SESSION && rec.k == Kind::Restore && matches!(rec.op, Op::Open | Op::Amend))
+        .then(|| rec.f.get_str(Key::Prev))
+        .flatten()
 }
 
 /// The `(node, sid)` of `/f/<F>/pub/<node>/<sid>/<leaf>`.
@@ -260,6 +349,7 @@ fn inc_of(body: &[u8]) -> Option<u64> {
     String::from_utf8_lossy(body)
         .split_whitespace()
         .find_map(|t| t.strip_prefix("inc="))
+        .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
         .and_then(|v| v.parse().ok())
 }
 
@@ -311,7 +401,54 @@ fn read(cfg: &Config, opts: &BriefOpts) -> io::Result<Read> {
         }
         at = next;
     }
+    if r.sessions.values().any(hosts_unknown) {
+        lived_history(&mut conn, fleet, opts, &mut r)?;
+    }
     Ok(r)
+}
+
+/// Whether a session with no close of it on the bus, whose last row says `exited` or that a
+/// successor's restore names, has no row the read knows that says which incarnation hosted it:
+/// the last-value walk hands a one-shot read only a session's newest row (and none once its
+/// bridge gave a departed session's row back), so whether a later incarnation retired it
+/// ([`retired`]), or the one that hosted it withdrew it ([`withdrawn`]), takes the session's
+/// earlier rows ([`lived_history`]).
+fn hosts_unknown(s: &Session) -> bool {
+    (exited(s) || s.successor.is_some())
+        && s.lived_inc.is_none()
+        && newest_fold(s).is_some_and(|(_, _, fold, _)| fold.state().closed.is_none())
+}
+
+/// The presence rows in the read's window (`from` to `head`), for the incarnations that hosted
+/// each session the read holds and those it exited under ([`Read::earlier_presence`]). Read
+/// only when some session needs them ([`hosts_unknown`]): a row older than the window, or one
+/// retention gave up, is not seen, and a session whose hosting incarnation the read then does
+/// not know derives no close.
+fn lived_history(
+    conn: &mut transport::Conn,
+    fleet: &str,
+    opts: &BriefOpts,
+    r: &mut Read,
+) -> io::Result<()> {
+    let presence = format!("/f/{fleet}/pub/*/*/presence");
+    let (mut at, mut pages) = (r.from, 0u64);
+    while at < r.head && pages < WINDOW_MAX / u64::from(PAGE_MAX) + 16 {
+        let ((rows, (next, _)), _) = transport::fetch_kept(conn, at, &presence, PAGE_MAX)?;
+        pages += 1;
+        for (_, subject, body) in rows {
+            let Some((node, sid)) = owner(fleet, &subject, "presence") else {
+                continue;
+            };
+            if sid != "node" && opts.node.as_deref().is_none_or(|want| want == node) {
+                r.earlier_presence(node, sid, &body);
+            }
+        }
+        if next <= at {
+            break;
+        }
+        at = next;
+    }
+    Ok(())
 }
 
 /// The smallest share a session's lines below its head are worth rendering.
@@ -362,18 +499,241 @@ pub(crate) fn node_gone(r: &Read, node: &str) -> bool {
     r.nodes_gone.iter().any(|n| n == node)
 }
 
-/// A session's newest seq space folded as the brief shows it: its epoch, the
+/// A session's newest seq space folded from what the bus carried: its epoch, the
 /// space, the fold and where the fold started ([`BusSpace::fold_seeded`]). The
-/// brief's lines and `--json` objects read it (the JSON `need` is
+/// brief's lines and `--json` objects read it through [`settled_fold`] with
+/// either signal of a death (the JSON `need` is
 /// [`aterm_slog::SessionState::top_observed_need`]), and so does `aterm link
-/// notify --on need`, which judges every observed need the fold names, not only
-/// the top one (`crate::notify_need`'s `named`).
-pub(crate) fn newest_fold(
-    s: &Session,
-) -> Option<(u32, &BusSpace, aterm_slog::Fold, aterm_slog::bus::Seed)> {
+/// notify --on need` with a successor's restore only, which judges every
+/// observed need the fold names, not only the top one (`crate::notify_need`'s
+/// `named`).
+pub(crate) fn newest_fold(s: &Session) -> Option<(u32, &BusSpace, Fold, Seed)> {
     let (ep, space) = s.spaces.iter().next_back()?;
     let (fold, seed) = space.fold_seeded();
     Some((*ep, space, fold, seed))
+}
+
+/// Why a reader knows a session died although its close never reached the bus (fix unit E9,
+/// finding E2E-5): a later record says the process that wrote its space is gone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Died {
+    /// A successor on its node names it as the session it restores ([`restores`]), and the
+    /// incarnation that hosted it ended without withdrawing it ([`restore_says_died`]): its
+    /// aterm died and a relaunch put a new shell in its pane.
+    Restored,
+    /// Its own presence says `exited` under a later incarnation of its node than any this read
+    /// saw host it ([`retired`]): a later bridge retired the row of a session it never carried.
+    Retired,
+}
+
+/// Which signals a reader derives a dead session's close on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Derive {
+    /// `aterm fabric brief`'s text and `--json` (and so the Overview, which reads the JSON):
+    /// either signal.
+    Shown,
+    /// `aterm link notify --on need`: a successor's restore only, the one signal a page may
+    /// rest on. A row a ghost sweep wrote shows in the brief and pages nothing.
+    Paged,
+}
+
+/// Whether the session's own presence says it exited under a later incarnation than the newest
+/// that hosted it ([`Died::Retired`]). Its node's bridge rewrites every session it hosts under
+/// each new incarnation and says `exited` under the one it hosted it in, so a later one is a
+/// bridge that never carried it: a relaunch's ghost sweep retiring the row of a session its
+/// predecessor left. A read that never saw a row of it that did not say `exited` cannot tell.
+fn retired(s: &Session) -> bool {
+    exited(s) && matches!((s.presence_inc, s.lived_inc), (Some(at), Some(lived)) if at > lived)
+}
+
+/// Whether an incarnation that hosted the session said it `exited`: its bridge withdrew it (a
+/// quit's withdrawal, or its own exit) under an `inc=` no later than the newest that hosted it.
+/// A ghost sweep says `exited` only under a later one ([`retired`]).
+fn withdrawn(s: &Session) -> bool {
+    matches!((s.exited_inc, s.lived_inc), (Some(at), Some(lived)) if at <= lived)
+}
+
+/// WHETHER A SUCCESSOR'S RESTORE SAYS THE SESSION DIED ([`Died::Restored`]). aterm writes the
+/// restore whenever a new shell fills the pane a session held: after a crash, after every clean
+/// quit's relaunch, and when a closed tab is reopened. Only the crash leaves the session's row
+/// as its bridge last wrote it, so the restore counts when a successor names it, the read knows
+/// an incarnation that hosted it, that incarnation ended (its node's row is its will, or says a
+/// later `inc=`), and none that hosted it withdrew it ([`withdrawn`]). A quit withdraws every
+/// session it carried before its node relaunches (the bridge's `withdraw`), whose closes stay in
+/// the journal (`quit_closes`); a reopened tab's successor runs under the closed session's own
+/// incarnation, whose close its mirror still publishes. A read that knows no incarnation that
+/// hosted the session cannot tell a quit from a crash, and takes no restore for one.
+fn restore_says_died(r: &Read, node: &str, s: &Session) -> bool {
+    let Some(lived) = s.lived_inc else {
+        return false;
+    };
+    let ended = node_gone(r, node) || r.node_inc.get(node).is_some_and(|now| *now > lived);
+    s.successor.is_some() && ended && !withdrawn(s)
+}
+
+/// Why the session died with no close on the bus, of the signals `by` takes: a successor's
+/// restore first.
+fn died(r: &Read, node: &str, s: &Session, by: Derive) -> Option<Died> {
+    if restore_says_died(r, node, s) {
+        Some(Died::Restored)
+    } else if by == Derive::Shown && retired(s) {
+        Some(Died::Retired)
+    } else {
+        None
+    }
+}
+
+/// A session's newest seq space folded as a reader shows it ([`settled_fold`]).
+pub(crate) struct Settled<'a> {
+    /// The space's epoch.
+    pub(crate) ep: u32,
+    /// The space.
+    pub(crate) space: &'a BusSpace,
+    /// The fold, the derived records applied.
+    pub(crate) fold: Fold,
+    /// Where the fold started ([`BusSpace::fold_seeded`]).
+    pub(crate) seed: Seed,
+    /// The fold's head before anything was derived: what a reader hands out as `as_of=` and
+    /// `last_seq`, never a seq of a record it derived (§5.4's rule for the journal's reader).
+    pub(crate) as_of: u64,
+    /// Why its close was derived; `None` when no signal holds or its close reached the bus.
+    pub(crate) died: Option<Died>,
+    /// The records derived, numbered past the space's head ([`derive_close`]).
+    pub(crate) derived: Vec<Rec>,
+}
+
+impl Settled<'_> {
+    /// Whether the fold holds a close the bus carried.
+    pub(crate) fn closed_on_bus(&self) -> bool {
+        self.died.is_none() && self.fold.state().closed.is_some()
+    }
+
+    /// The detail a reader shows beside need `n`: the need's own, but `gone` for the `exited` a
+    /// derived close raised.
+    pub(crate) fn detail(&self, n: &Need) -> Option<String> {
+        match self.derived.last() {
+            Some(close) if n.since_seq == close.seq => {
+                Some(Out::gone(Lvl::Session).word().to_string())
+            }
+            _ => n.detail.clone(),
+        }
+    }
+}
+
+/// THE DEAD SESSION'S CLOSE, DERIVED AT READ TIME (fix unit E9, finding E2E-5; DESIGN §5.5):
+/// [`newest_fold`], and, where a signal `by` takes says the session died ([`Died`]) and that
+/// space holds no close of it, the fold of a clone with the closes §5.4's journal reader
+/// derives for a crashed chain applied ([`derive_close`]): it reads `closed out=gone`, nothing
+/// open, and the `exited` that close raises. Never written and never published: no process
+/// writes into another process's chain, and a successor does not know the space's head. Derived
+/// again at every read, so a later read that holds the close the bus carried shows that close.
+/// A node's will alone derives nothing (a reattach may restore the session), nor does the
+/// relaunch moment (a session live under an older `inc=` than its node's), nor a restore after
+/// a quit withdrew the session or while its own incarnation lives ([`restore_says_died`]).
+pub(crate) fn settled_fold<'a>(
+    r: &Read,
+    node: &str,
+    s: &'a Session,
+    by: Derive,
+) -> Option<Settled<'a>> {
+    let (ep, space, mut fold, seed) = newest_fold(s)?;
+    let as_of = fold.state().as_of;
+    let died = died(r, node, s, by).filter(|_| fold.state().closed.is_none());
+    let derived = if died.is_some() {
+        derive_close(space, s.offered.get(&ep).copied().unwrap_or(0), &fold)
+    } else {
+        Vec::new()
+    };
+    for r in &derived {
+        fold.apply(r);
+    }
+    Some(Settled {
+        ep,
+        space,
+        fold,
+        seed,
+        as_of,
+        died,
+        derived,
+    })
+}
+
+/// The most node closes a derivation writes ([`derive_close`]): a fold tracks at most 64 open
+/// nodes (aterm-slog's `MAX_TRACKED`), and each close ends at least one of them.
+const CLOSES_MAX: usize = 64;
+
+/// The records §5.4's journal reader derives for a chain whose writer died (aterm-slog's
+/// `journal` view `build`: `gap_after(GapWhy::Crash, ..)`, then `close_session(..
+/// SessionOut::Gone ..)`): one `gap why=crash after=<head>`, a close `out=gone` of each node
+/// the fold holds open, innermost first (each bus step, then each turn, then each run: the
+/// fold's open path again after each close, [`Fold::bus_open_path`], since two runs may be
+/// open side by side), and the session's close `out=gone`, all by aterm at `src=aterm
+/// conf=exact` (the journal's: the doubt is the reader's, and the brief says it beside them in
+/// its `partial` word), stamped at the space's newest record, and numbered past the space's head
+/// in its own epoch: past every seq the read offered it (`offered`, a body outside this build's
+/// bus class among them, which the space holds unfolded), its snapshot's and the fold's, so
+/// none takes the seq of a body the space holds (no body past [`aterm_slog::SEQ_LIMIT`] is
+/// offered, and at most [`CLOSES_MAX`] closes are derived, so the count never reaches the top
+/// of `u64`; it saturates rather than wrap all the same).
+fn derive_close(space: &BusSpace, offered: u64, fold: &Fold) -> Vec<Rec> {
+    let st = fold.state();
+    let head = space
+        .records()
+        .map(|r| r.seq)
+        .last()
+        .unwrap_or(0)
+        .max(space.snap().map_or(0, |snap| snap.seq))
+        .max(st.as_of)
+        .max(offered);
+    let (t, mut seq) = (st.last_t, head);
+    let mut rec = |op: Op, node: Node, k: Kind, f: Fields| {
+        seq = seq.saturating_add(1);
+        Rec {
+            seq,
+            t,
+            op,
+            node,
+            par: None,
+            k,
+            src: Src::Aterm,
+            conf: Conf::Exact,
+            by: Actor::Aterm,
+            f,
+        }
+    };
+    let gone = |lvl: Lvl| {
+        Fields::new()
+            .word(Key::Out, Out::gone(lvl).word())
+            .unwrap_or_default()
+    };
+    let crash = Fields::new()
+        .word(Key::Why, GapWhy::Crash.word())
+        .and_then(|f| f.u(Key::After, head))
+        .unwrap_or_default();
+    let gap = rec(Op::Gap, Node::SESSION, Kind::Gap, crash);
+    let mut work = fold.clone();
+    work.apply(&gap);
+    let mut out = vec![gap];
+    let mut path = work.bus_open_path();
+    for _ in 0..CLOSES_MAX {
+        let Some((node, kind)) = path.iter().rev().flatten().next().copied() else {
+            break;
+        };
+        let close = rec(Op::Close, node, kind, gone(node.lvl));
+        work.apply(&close);
+        out.push(close);
+        let next = work.bus_open_path();
+        if next == path {
+            break;
+        }
+        path = next;
+    }
+    let kind = space
+        .records()
+        .find(|r| r.op == Op::Open && r.node == Node::SESSION)
+        .map_or(Kind::Unknown, |r| r.k);
+    out.push(rec(Op::Close, Node::SESSION, kind, gone(Lvl::Session)));
+    out
 }
 
 /// One session the read holds, by its `(node, sid)`.
@@ -394,20 +754,21 @@ fn shown(r: &Read) -> (Vec<Held<'_>>, usize) {
 }
 
 /// Why a session's newest fold is partial: its seed's word, then its close
-/// missing although its node or its own presence says it is gone.
-fn partial_why(
-    r: &Read,
-    node: &str,
-    s: &Session,
-    seed: aterm_slog::bus::Seed,
-    closed: bool,
-) -> Vec<&'static str> {
+/// missing although its node or its own presence says it is gone, or, for a
+/// close a read derived ([`settled_fold`]), that its close never reached the
+/// bus: `no-close` or `node-gone` as its rows say, else `node-gone` (a
+/// successor's restore is a relaunch of its node's).
+fn partial_why(r: &Read, node: &str, s: &Session, f: &Settled<'_>) -> Vec<&'static str> {
     let mut why: Vec<&'static str> = Vec::new();
-    if let Some(w) = seed.why() {
+    if let Some(w) = f.seed.why() {
         why.push(w);
     }
-    if let Some(gone) = gone_without_close(r, node, s).filter(|_| !closed) {
-        why.push(gone.word());
+    if !f.closed_on_bus() {
+        match gone_without_close(r, node, s) {
+            Some(gone) => why.push(gone.word()),
+            None if f.died.is_some() => why.push(Gone::NodeGone.word()),
+            None => {}
+        }
     }
     why
 }
@@ -420,11 +781,11 @@ fn render(cfg: &Config, opts: &BriefOpts, r: &Read, now_ms: u64) -> String {
     let (mut lines, mut used, mut partial, mut folded) = (Vec::new(), 0usize, 0usize, 0usize);
     let (mut dup, mut reordered, mut foreign) = (0u64, 0u64, 0u64);
     for (i, ((node, sid), s)) in shown.iter().enumerate() {
-        let Some((ep, space, fold, seed)) = newest_fold(s) else {
+        let Some(f) = settled_fold(r, node, s, Derive::Shown) else {
             continue;
         };
-        let st = fold.state();
-        let why = partial_why(r, node, s, seed, st.closed.is_some());
+        let (ep, space, st) = (f.ep, f.space, f.fold.state());
+        let why = partial_why(r, node, s, &f);
         let from = if r.from == 0 || space.holds_start() {
             1
         } else {
@@ -436,7 +797,7 @@ fn render(cfg: &Config, opts: &BriefOpts, r: &Read, now_ms: u64) -> String {
             safe(sid, 48),
             safe(node, 48),
             s.presence.as_deref().unwrap_or("-"),
-            st.as_of
+            f.as_of
         );
         if !why.is_empty() {
             head.push_str(&format!(" partial why={}", why.join(",")));
@@ -462,7 +823,8 @@ fn render(cfg: &Config, opts: &BriefOpts, r: &Read, now_ms: u64) -> String {
         let mut body_t = 0usize;
         let room = share - head_t;
         if room >= BODY_MIN_TOKENS {
-            let b = aterm_slog::brief(sid, space.records(), None, st, &[], room, now_ms);
+            let window = space.records().chain(&f.derived);
+            let b = aterm_slog::brief(sid, window, None, st, &[], room, now_ms);
             body = b.text.lines().skip(1).map(|l| safe(l, 512)).collect();
             body_t = body.iter().map(|l| line_tokens(l)).sum();
             if body_t > room {
@@ -530,9 +892,9 @@ fn session_json(
     this: Option<&str>,
 ) -> Option<(J, bool)> {
     let (node, sid) = key;
-    let (ep, _, fold, seed) = newest_fold(s)?;
-    let st = fold.state();
-    let why = partial_why(r, node, s, seed, st.closed.is_some());
+    let f = settled_fold(r, node, s, Derive::Shown)?;
+    let (ep, st) = (f.ep, f.fold.state());
+    let why = partial_why(r, node, s, &f);
     let need = st.top_observed_need();
     let open = st
         .open
@@ -551,11 +913,11 @@ fn session_json(
         J::Bool(this == Some(node.as_str())),
         J::Num(u64::from(ep)),
         J::opt_s(need.map(|n| n.word)),
-        J::opt_s(need.and_then(|n| n.detail.as_deref())),
+        J::opt_s(need.and_then(|n| f.detail(n)).as_deref()),
         J::Arr(open),
         J::Num(u64::from(st.totals.mail_in)),
         J::Num(u64::from(st.totals.mail_out)),
-        J::Num(st.as_of),
+        J::Num(f.as_of),
         J::opt_n(age_s),
         J::Arr(why.into_iter().map(J::s).collect()),
     ];

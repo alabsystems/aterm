@@ -53,6 +53,7 @@ fn assert_planned_frame_builds_once(mut app: App, expected: crate::VisibleConten
         successful_route,
         route,
         HostVisualState::default(),
+        None,
         &plan,
     );
     assert_eq!(

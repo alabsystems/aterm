@@ -767,7 +767,7 @@ fn an_idle_muse_behind_is_restarted_onto_the_new_build_and_nothing_is_typed() {
     );
     assert!(
         line.contains(&format!(
-            "'--base-url' 'http://127.0.0.1:9' '--trust-workspace' 'resume' '{S1}'"
+            "'--base-url' 'http://127.0.0.1:9' '--trust-workspace' '--contributor-mode' 'off' 'resume' '{S1}'"
         )),
         "{line}"
     );

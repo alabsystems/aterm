@@ -50,7 +50,8 @@ pub struct MemberRemoval {
     /// The entries the removed Mac could read, as this Mac opens them: each to rotate at the
     /// provider where it was lost.
     pub could_read: Vec<String>,
-    /// `aterm-fleet-code` was rotated (`--stolen`).
+    /// `aterm-fleet-code` was rotated: on every removal where `[everyone]` holds one (a plain one
+    /// too, since 0.148, so the removed Mac's copy proves nothing to the fleet or the vault).
     pub fleet_code_rotated: bool,
     /// The one `NEEDS YOU:` line for the provider rotations, on `--stolen` alone (C25).
     pub needs_you: Option<String>,
@@ -118,24 +119,46 @@ impl RemovedNote {
     }
 }
 
-/// Every Mac the log removed, by its age recipient (bech32) and by its writer key, so a removed
-/// Mac that asks again under a new device key with the same machine key, or a new machine key
-/// with the same writer key, is still named.
+/// Every Mac the log removed, by its age recipient (bech32), by its writer key, and by its fleet
+/// node key, so a removed Mac that asks again under a new device key with the same machine key,
+/// a new machine key with the same writer key, or a fresh secrets identity with its existing
+/// fleet node key, is still named.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RemovedNotes {
     /// By age recipient.
     pub by_recipient: BTreeMap<String, RemovedNote>,
     /// By Ed25519 writer key.
     pub by_writer: BTreeMap<[u8; 32], RemovedNote>,
+    /// By fleet Ed25519 node key.
+    pub by_node: BTreeMap<[u8; 32], RemovedNote>,
 }
 
 impl RemovedNotes {
     /// The note for the Mac a request binds, by recipient, else by writer key.
     #[must_use]
     pub fn of(&self, recipient: &Recipient, writer: &[u8; 32]) -> Option<&RemovedNote> {
-        self.by_recipient
-            .get(&recipient.to_bech32())
-            .or_else(|| self.by_writer.get(writer))
+        self.of_with_node(recipient, writer, &[0; 32])
+    }
+
+    /// [`RemovedNotes::of`] with the fleet node key `node` (`[0; 32]`: none) as a third lookup
+    /// key.
+    #[must_use]
+    pub fn of_with_node(
+        &self,
+        recipient: &Recipient,
+        writer: &[u8; 32],
+        node: &[u8; 32],
+    ) -> Option<&RemovedNote> {
+        let candidates = [
+            self.by_recipient.get(&recipient.to_bech32()),
+            self.by_writer.get(writer),
+            (*node != [0; 32]).then(|| self.by_node.get(node)).flatten(),
+        ];
+        candidates
+            .into_iter()
+            .flatten()
+            .find(|note| note.quorum)
+            .or_else(|| candidates.into_iter().flatten().next())
     }
 }
 
@@ -212,27 +235,117 @@ pub(super) fn open_local_seat_signer(
     Ok(Some((binding.actor(), device, *binding.incarnation())))
 }
 
+/// The causally earliest non-self-signed `Admit` for `actor` in `log` (preferring non-voided
+/// records, at a tie the lowest id).
+pub(super) fn earliest_admit_of<'a>(
+    log: &'a Log,
+    actor: &MemberId,
+) -> Option<(&'a RecordId, &'a crate::membership_log::Entrant)> {
+    let membership = log.membership();
+    let voided = membership.voided();
+    let collect = |skip_voided: bool| -> Vec<(&'a RecordId, &'a crate::membership_log::Entrant)> {
+        log.records()
+            .filter_map(|r| match r.body() {
+                Body::Admit { entrant, .. }
+                    if entrant.member() == *actor
+                        && r.actor() != actor
+                        && (!skip_voided || !voided.contains(r.id())) =>
+                {
+                    Some((r.id(), entrant))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let mut admits = collect(true);
+    if admits.is_empty() {
+        admits = collect(false);
+    }
+    let ids: BTreeSet<RecordId> = admits.iter().map(|(id, _)| **id).collect();
+    admits
+        .into_iter()
+        .filter(|(id, _)| {
+            !log.ancestor_closure(&[**id])
+                .iter()
+                .any(|anc| anc.id() != *id && ids.contains(anc.id()))
+        })
+        .min_by_key(|(id, _)| **id)
+}
+
 /// What a founder or `Admit` says of the Mac `actor`: its age recipient, label and name, from
-/// the genesis, else its `Admit` with the lowest id.
+/// the genesis, else its earliest `Admit` (at a tie, the lowest id).
 fn seat_of(log: &Log, actor: &MemberId) -> Option<(Recipient, String, String)> {
     if let Body::Genesis { founders, .. } = log.genesis().body()
         && let Some(f) = founders.iter().find(|f| f.member() == Some(*actor))
     {
         return Some((f.recipient, f.label.clone(), f.name.clone()));
     }
-    log.records()
-        .filter_map(|r| match r.body() {
-            Body::Admit { entrant, .. } if entrant.member() == *actor => Some((r.id(), entrant)),
-            _ => None,
-        })
-        .min_by_key(|(id, _)| **id)
-        .map(|(_, entrant)| {
-            (
-                entrant.request.binding().recipient(),
-                entrant.label.clone(),
-                entrant.name.clone(),
-            )
-        })
+    if let Some(m) = log.membership().get(actor)
+        && let Some(r) = log.get(&m.entry)
+        && let Body::Admit { entrant, .. } = r.body()
+    {
+        return Some((
+            entrant.request.binding().recipient(),
+            entrant.label.clone(),
+            entrant.name.clone(),
+        ));
+    }
+    earliest_admit_of(log, actor).map(|(_, entrant)| {
+        (
+            entrant.request.binding().recipient(),
+            entrant.label.clone(),
+            entrant.name.clone(),
+        )
+    })
+}
+
+/// Every non-zero fleet node key bound to `actor` in `log`.
+fn seat_nodes_of(
+    log: &Log,
+    membership: &crate::membership_log::Membership,
+    actor: &MemberId,
+) -> Vec<[u8; 32]> {
+    let mut nodes = BTreeSet::new();
+    for (nk, standing) in membership.nodes() {
+        if *nk != [0; 32]
+            && matches!(standing, crate::membership_log::NodeStanding::Removed(out) if out == actor)
+        {
+            nodes.insert(*nk);
+        }
+    }
+    let node_bound_to_actor = |nk: [u8; 32]| -> bool {
+        if nk == [0; 32] {
+            return false;
+        }
+        match membership.node(&nk) {
+            crate::membership_log::NodeStanding::Removed(_) => true,
+            crate::membership_log::NodeStanding::Member(active)
+            | crate::membership_log::NodeStanding::Retired(active) => {
+                active == *actor
+                    || membership.get(&active).is_some_and(|m| {
+                        log.ancestor_closure(&[m.entry]).iter().any(
+                            |r| matches!(r.body(), Body::Remove { member, .. } if member == actor),
+                        )
+                    })
+            }
+            _ => false,
+        }
+    };
+    if let Body::Genesis { founders, .. } = log.genesis().body()
+        && let Some(nk) = founders
+            .iter()
+            .find(|f| f.member() == Some(*actor))
+            .and_then(|f| f.node_key)
+            .filter(|k| node_bound_to_actor(*k))
+    {
+        nodes.insert(nk);
+    }
+    if let Some((_, entrant)) = earliest_admit_of(log, actor)
+        && node_bound_to_actor(entrant.node_key)
+    {
+        nodes.insert(entrant.node_key);
+    }
+    nodes.into_iter().collect()
 }
 
 /// A Mac's label as this log shows it: its member label, else its seat's.
@@ -355,7 +468,32 @@ fn removal_target(
                 seat_of(log, &actor).map(|(recipient, label, name)| (actor, recipient, label, name))
             })
             .collect::<Vec<_>>();
-        if let Ok((_, _, label)) = resolve(who, &removed) {
+        let matched_active = matching(who, &candidates);
+        if let Some((_, first_rec, _, _)) = matched_active.first()
+            && matched_active.len() > 1
+            && matched_active
+                .iter()
+                .all(|(actor, rec, _, _)| rec == first_rec && actor != me)
+            && let Some(&&(actor, recipient, ref label, _)) =
+                matched_active.iter().max_by_key(|(actor, _, _, _)| {
+                    (
+                        membership
+                            .get(actor)
+                            .and_then(|m| log.record_index(&m.entry))
+                            .unwrap_or(0),
+                        *actor,
+                    )
+                })
+        {
+            return Ok((actor, recipient, label.clone()));
+        }
+        let matched_removed = matching(who, &removed);
+        if matched_active.is_empty()
+            && let Some((_, first_rec, label, _)) = matched_removed.first()
+            && matched_removed
+                .iter()
+                .all(|(_, rec, _, _)| rec == first_rec)
+        {
             return Err(Error::new(format!("{label} is removed already")));
         }
     }
@@ -518,6 +656,7 @@ fn draft_removal(
             "the membership log seats no device key of this Mac as a member",
         ));
     };
+    let is_word_target = matches!(target, Target::Word(_));
     let named = match target {
         Target::Word(who) => removal_target(&log, who, &actor),
         Target::Actor(target) if target == actor => Err(Error::new("a Mac does not remove itself")),
@@ -608,33 +747,97 @@ fn draft_removal(
         .get(&Audience::Everyone)
         .cloned()
         .unwrap_or_default();
+    let membership = log.membership();
+    let is_other_active_member = |m: &crate::membership_log::Member| {
+        let rec = m.binding.recipient();
+        rec != recipient && !log.recipient_is_removed(&rec) && !membership.member_node_removed(m)
+    };
+    let other_active_labels: BTreeSet<String> = membership
+        .members()
+        .values()
+        .filter(|m| is_other_active_member(m))
+        .flat_map(|m| {
+            crate::swarm_roster::leading_m_label(&m.label)
+                .into_iter()
+                .chain(crate::swarm_roster::leading_m_label(&m.name))
+                .map(|(_, canon)| canon)
+        })
+        .chain(
+            membership
+                .unproved()
+                .iter()
+                .filter(|f| f.recipient != recipient && !log.recipient_is_removed(&f.recipient))
+                .flat_map(|f| {
+                    crate::swarm_roster::leading_m_label(&f.label)
+                        .into_iter()
+                        .chain(crate::swarm_roster::leading_m_label(&f.name))
+                        .map(|(_, canon)| canon)
+                }),
+        )
+        .collect();
+    let other_active_nodes: BTreeSet<[u8; 32]> = membership
+        .members()
+        .values()
+        .filter(|m| is_other_active_member(m))
+        .filter_map(|m| m.node_key.filter(|nk| *nk != [0; 32]))
+        .chain(
+            membership
+                .unproved()
+                .iter()
+                .filter(|f| f.recipient != recipient && !log.recipient_is_removed(&f.recipient))
+                .filter_map(|f| f.node_key.filter(|nk| *nk != [0; 32])),
+        )
+        .collect();
+    let held_by_other_active = |lbl: &str| {
+        other_active_labels.contains(lbl)
+            || crate::swarm_roster::leading_m_label(lbl)
+                .is_some_and(|(_, canon)| other_active_labels.contains(&canon))
+    };
     let mut labels = BTreeSet::from([label.clone()]);
-    if let Some((_, seat_label, _)) = seat_of(&log, &target) {
+    if let Some((_, seat_label, _)) = seat_of(&log, &target)
+        && crate::membership_log::is_label(&seat_label)
+        && !held_by_other_active(&seat_label)
+    {
         labels.insert(seat_label);
     }
     let mut node_keys = BTreeSet::new();
-    let membership = log.membership();
     let mut target_actors = BTreeSet::from([target]);
     if let Some(member) = membership.get(&target)
-        && let Some(nk) = member.node_key.filter(|k| *k != [0; 32])
+        && let Some(nk) = member
+            .node_key
+            .filter(|k| *k != [0; 32] && !other_active_nodes.contains(k))
     {
         node_keys.insert(aterm_codec::hex::encode_lower(&nk));
     }
-    for (actor, member) in membership
+    for (member_actor, member) in membership
         .members()
         .iter()
         .filter(|(_, m)| m.binding.recipient() == recipient)
     {
-        target_actors.insert(*actor);
-        if let Some((_, canon)) = crate::swarm_roster::leading_m_label(&member.label) {
-            labels.insert(canon);
+        target_actors.insert(*member_actor);
+        if crate::membership_log::is_label(&member.label) && !held_by_other_active(&member.label) {
+            labels.insert(member.label.clone());
         }
-        if let Some(nk) = member.node_key.filter(|k| *k != [0; 32]) {
+        if let Some(nk) = member
+            .node_key
+            .filter(|k| *k != [0; 32] && !other_active_nodes.contains(k))
+        {
             node_keys.insert(aterm_codec::hex::encode_lower(&nk));
+        }
+    }
+    for removed_actor in membership.removed().keys() {
+        if let Some((rec, seat_label, _)) = seat_of(&log, removed_actor)
+            && rec == recipient
+        {
+            target_actors.insert(*removed_actor);
+            if crate::membership_log::is_label(&seat_label) && !held_by_other_active(&seat_label) {
+                labels.insert(seat_label);
+            }
         }
     }
     for (nk, standing) in membership.nodes() {
         if *nk != [0; 32]
+            && !other_active_nodes.contains(nk)
             && matches!(
                 standing,
                 crate::membership_log::NodeStanding::Member(a)
@@ -646,6 +849,7 @@ fn draft_removal(
             node_keys.insert(aterm_codec::hex::encode_lower(nk));
         }
     }
+    labels.retain(|lbl| !held_by_other_active(lbl));
     let cascade = super::retirement::cascade_member_removal(
         &mut everyone,
         &recipient,
@@ -671,21 +875,39 @@ fn draft_removal(
         }
     });
 
+    let mut seats_to_remove = vec![(target, cutoff)];
+    if is_word_target {
+        for (&seat_actor, seat_member) in membership.members() {
+            if seat_actor != target
+                && seat_actor != actor
+                && seat_member.binding.recipient() == recipient
+            {
+                let seat_cutoff = log
+                    .records()
+                    .filter(|r| r.kind() != Kind::Genesis && *r.actor() == seat_actor)
+                    .max_by(|a, b| a.sequence().cmp(&b.sequence()).then(b.id().cmp(a.id())))
+                    .map_or(seat_member.entry, |r| *r.id());
+                seats_to_remove.push((seat_actor, seat_cutoff));
+            }
+        }
+    }
     let authored_ms = aterm_time::unix_millis().unwrap_or(0);
     let mut minted = Vec::new();
     let rotated = device.with_seed(|writer_seed| -> crate::Result<Vec<String>> {
-        let remove = log
-            .draft(
-                &actor,
-                authored_ms,
-                Body::Remove {
-                    member: target,
-                    cutoff,
-                },
-            )
-            .sign(writer_seed, incarnation)?;
-        let _ = log.insert(remove.clone())?;
-        minted.push(remove);
+        for (seat_actor, seat_cutoff) in seats_to_remove {
+            let remove = log
+                .draft(
+                    &actor,
+                    authored_ms,
+                    Body::Remove {
+                        member: seat_actor,
+                        cutoff: seat_cutoff,
+                    },
+                )
+                .sign(writer_seed, incarnation)?;
+            let _ = log.insert(remove.clone())?;
+            minted.push(remove);
+        }
         log_entries::rotate_after_removal(
             &mut log,
             &opened,
@@ -734,31 +956,43 @@ pub fn removed_notes(paths: &Paths) -> crate::Result<RemovedNotes> {
 
 pub(super) fn notes_of(log: &Log) -> RemovedNotes {
     let membership = log.membership();
+    let is_active_member = |m: &crate::membership_log::Member| {
+        !log.recipient_is_removed(&m.binding.recipient()) && !membership.member_node_removed(m)
+    };
     let active_recipients: BTreeSet<Recipient> = membership
         .members()
         .values()
-        .filter(|m| !log.recipient_is_removed(&m.binding.recipient()))
+        .filter(|m| is_active_member(m))
         .map(|m| m.binding.recipient())
         .collect();
     let active_writers: BTreeSet<[u8; 32]> = membership
         .members()
         .iter()
-        .filter(|(_, m)| !log.recipient_is_removed(&m.binding.recipient()))
+        .filter(|(_, m)| is_active_member(m))
         .map(|(actor, _)| {
             let mut w = [0u8; 32];
             w.copy_from_slice(&actor[..32]);
             w
         })
         .collect();
-    let mut notes = RemovedNotes::default();
+    let active_nodes: BTreeSet<[u8; 32]> = membership
+        .members()
+        .values()
+        .filter(|m| is_active_member(m))
+        .filter_map(|m| m.node_key.filter(|nk| *nk != [0; 32]))
+        .collect();
+    let mut staged = Vec::new();
     for (actor, removal) in membership.removed() {
         let Some((recipient, seat_label, _)) = seat_of(log, actor) else {
             continue;
         };
         let mut writer = [0u8; 32];
         writer.copy_from_slice(&actor[..32]);
+        let node_keys = seat_nodes_of(log, &membership, actor);
         if !removal.quorum
-            && (active_recipients.contains(&recipient) || active_writers.contains(&writer))
+            && (active_recipients.contains(&recipient)
+                || active_writers.contains(&writer)
+                || node_keys.iter().any(|nk| active_nodes.contains(nk)))
         {
             continue;
         }
@@ -771,6 +1005,9 @@ pub(super) fn notes_of(log: &Log) -> RemovedNotes {
             .map(Record::authored_ms)
             .min()
             .unwrap_or(0);
+        let seat_idx = earliest_admit_of(log, actor)
+            .and_then(|(id, _)| log.record_index(id))
+            .unwrap_or(0);
         let note = RemovedNote {
             label: seat_label,
             by: removal
@@ -781,7 +1018,23 @@ pub(super) fn notes_of(log: &Log) -> RemovedNotes {
             on_ms,
             quorum: removal.quorum,
         };
+        staged.push((
+            (removal.quorum, seat_idx, on_ms, *actor),
+            recipient,
+            writer,
+            node_keys,
+            note,
+        ));
+    }
+    staged.sort_by_key(|(priority, ..)| *priority);
+    let mut notes = RemovedNotes::default();
+    for (_, recipient, writer, node_keys, note) in staged {
         notes.by_writer.insert(writer, note.clone());
+        for nk in node_keys {
+            if !active_nodes.contains(&nk) {
+                notes.by_node.insert(nk, note.clone());
+            }
+        }
         notes.by_recipient.insert(recipient.to_bech32(), note);
     }
     notes
@@ -809,6 +1062,13 @@ pub fn undo_offers(paths: &Paths) -> crate::Result<Vec<UndoOffer>> {
     };
     let mut offers = Vec::new();
     for remover in &removal.by {
+        // A seat moved by its node key to a new vault key (`readmit`): undoing the move would
+        // seat this key again beside the new one on one node key, which the log then holds out
+        // for both. Which of the two Macs keeps the seat is a person's to sort out, with no
+        // alert: this Mac asks to join as any other.
+        if super::readmit::seat_moved_by(log, remover, &me) {
+            continue;
+        }
         let Some(undo) = log.undo(remover) else {
             continue;
         };
@@ -996,12 +1256,28 @@ pub fn tend_epochs_at(paths: &Paths, now_ms: u64) -> crate::Result<Vec<Record>> 
         return Ok(Vec::new());
     };
     let me_recipient = identity.recipient();
-    let active: BTreeSet<Recipient> = log
-        .membership()
-        .members()
-        .values()
-        .map(|m| m.binding.recipient())
-        .collect();
+    let active_recipients_of = |log: &Log| -> BTreeSet<Recipient> {
+        let local_roster = log_entries::local_swarm_roster_for_log(paths, log);
+        let membership = log.membership();
+        membership
+            .members()
+            .iter()
+            .filter(|(actor, m)| {
+                !log.recipient_is_removed(&m.binding.recipient())
+                    && !membership.member_node_removed(m)
+                    && !log.audience_left_out(&EpochAudience::Everyone, actor)
+                    && !log.audience_left_out_recipient(
+                        &EpochAudience::Everyone,
+                        &m.binding.recipient(),
+                    )
+                    && !local_roster
+                        .as_ref()
+                        .is_some_and(|r| log_entries::member_denied_by_roster(r, m))
+            })
+            .map(|(_, m)| m.binding.recipient())
+            .collect()
+    };
+    let active = active_recipients_of(log);
     let hosts_due = log.hosts_rotation_due(&me_recipient);
     if !log.rotation_due(&me_recipient, &active) && hosts_due.is_empty() {
         let _ = std::fs::remove_file(epoch_mark_file(paths));
@@ -1024,13 +1300,15 @@ pub fn tend_epochs_at(paths: &Paths, now_ms: u64) -> crate::Result<Vec<Record>> 
     let mut holders: Vec<([u8; 32], MemberId)> = membership
         .members()
         .iter()
-        .filter(|(_, m)| {
-            newest.iter().any(|id| {
-                opened
-                    .wrapped_recipients
-                    .get(id)
-                    .is_some_and(|set| set.contains(&m.binding.recipient()))
-            })
+        .filter(|(actor, m)| {
+            active.contains(&m.binding.recipient())
+                && !log.audience_left_out(&EpochAudience::Everyone, actor)
+                && newest.iter().any(|id| {
+                    opened
+                        .wrapped_recipients
+                        .get(id)
+                        .is_some_and(|set| set.contains(&m.binding.recipient()))
+                })
         })
         .map(|(actor, _)| {
             let mut buf = EPOCH_RANK_DOMAIN.to_vec();
@@ -1062,12 +1340,7 @@ pub fn tend_epochs_at(paths: &Paths, now_ms: u64) -> crate::Result<Vec<Record>> 
         let Some(mut log) = store.log().cloned() else {
             return Ok((Vec::new(), ()));
         };
-        let active: BTreeSet<Recipient> = log
-            .membership()
-            .members()
-            .values()
-            .map(|m| m.binding.recipient())
-            .collect();
+        let active = active_recipients_of(&log);
         let coalesce = log.rotation_due(&me_recipient, &active);
         if !coalesce && log.hosts_rotation_due(&me_recipient).is_empty() {
             return Ok((Vec::new(), ()));
@@ -1119,7 +1392,11 @@ fn read_epoch_mark(paths: &Paths) -> Option<([u8; 32], u64)> {
     let text = std::str::from_utf8(bytes.as_slice()).ok()?;
     let (key, at) = text.trim().split_once(' ')?;
     let mut out = [0u8; 32];
-    (key.len() == 64 && aterm_codec::hex::decode_into(key.as_bytes(), &mut out)).then_some(())?;
+    (key.len() == 64
+        && aterm_codec::hex::decode_into(key.as_bytes(), &mut out)
+        && !at.is_empty()
+        && at.bytes().all(|b| b.is_ascii_digit()))
+    .then_some(())?;
     Some((out, at.parse().ok()?))
 }
 
@@ -1216,12 +1493,22 @@ pub fn member_list(paths: &Paths) -> crate::Result<Option<Vec<ListedMac>>> {
     let Some(log) = store.log() else {
         return Ok(None);
     };
+    let local_roster = log_entries::local_swarm_roster_for_log(paths, log);
     let membership = log.membership();
     let mut out: Vec<ListedMac> = membership
         .members()
-        .values()
-        .filter(|m| !log.recipient_is_removed(&m.binding.recipient()))
-        .map(|m| ListedMac {
+        .iter()
+        .filter(|(actor, m)| {
+            !log.recipient_is_removed(&m.binding.recipient())
+                && !membership.member_node_removed(m)
+                && !log.audience_left_out(&EpochAudience::Everyone, actor)
+                && !log
+                    .audience_left_out_recipient(&EpochAudience::Everyone, &m.binding.recipient())
+                && !local_roster
+                    .as_ref()
+                    .is_some_and(|r| log_entries::member_denied_by_roster(r, m))
+        })
+        .map(|(_, m)| ListedMac {
             label: m.label.clone(),
             name: m.name.clone(),
             admitted_by: m.admitted_by.map(|by| label_of(log, &membership, &by)),
@@ -1231,25 +1518,21 @@ pub fn member_list(paths: &Paths) -> crate::Result<Option<Vec<ListedMac>>> {
         })
         .collect();
     out.sort_by(|a, b| a.label.cmp(&b.label));
-    let active_recipients: BTreeSet<Recipient> = membership
-        .members()
-        .values()
-        .filter(|m| !log.recipient_is_removed(&m.binding.recipient()))
-        .map(|m| m.binding.recipient())
-        .collect();
     let notes = notes_of(log);
+    let mut seen_gone = BTreeSet::new();
     let mut gone: Vec<ListedMac> = membership
         .removed()
-        .iter()
-        .filter_map(|(actor, removal)| {
+        .keys()
+        .filter_map(|actor| {
             let (recipient, label, name) = seat_of(log, actor)?;
-            if !removal.quorum
-                && (active_recipients.contains(&recipient)
-                    || membership.members().iter().any(|(active, m)| {
-                        active[..32] == actor[..32]
-                            && !log.recipient_is_removed(&m.binding.recipient())
-                    }))
-            {
+            let mut writer = [0u8; 32];
+            writer.copy_from_slice(&actor[..32]);
+            let node = seat_nodes_of(log, &membership, actor)
+                .into_iter()
+                .next()
+                .unwrap_or([0; 32]);
+            let removed = notes.of_with_node(&recipient, &writer, &node)?.clone();
+            if !seen_gone.insert((recipient.to_bech32(), label.clone())) {
                 return None;
             }
             Some(ListedMac {
@@ -1258,7 +1541,7 @@ pub fn member_list(paths: &Paths) -> crate::Result<Option<Vec<ListedMac>>> {
                 admitted_by: None,
                 admitted_ms: 0,
                 code: join_code(&recipient),
-                removed: notes.by_recipient.get(&recipient.to_bech32()).cloned(),
+                removed: Some(removed),
             })
         })
         .collect();

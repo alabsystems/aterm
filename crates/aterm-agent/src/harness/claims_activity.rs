@@ -223,6 +223,9 @@ impl Held {
         book.at = now;
         book.entries.retain(|_, until| *until > now);
         for (label, key) in keys {
+            if state.execution_verdict(label).is_err() {
+                continue;
+            }
             let until = state
                 .claimed_at
                 .get(label)

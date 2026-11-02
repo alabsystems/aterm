@@ -55,10 +55,9 @@
 //!   `Closer::set_write_timeout`), which XNU answers on a socket the peer already
 //!   shut down: then there is nothing left to bound, and the refusal is no error. A
 //!   refusal on a live socket is kept.
-//! - [`close_on_fork`]: keep a socket out of every child the process forks or spawns
-//!   (`FD_CLOFORK`). On Apple a descriptor scan of a child being spawned drains the
-//!   parent's copy of the socket for good; astream-broker marks every socket it
-//!   creates (listeners, accepted and dialled connections, and their duplicates).
+//! - [`close_on_fork`]: request `FD_CLOFORK` and report whether the kernel retained
+//!   it. Some Apple kernels ignore this flag; success alone does not establish
+//!   fork exclusion. The caller's close-on-exec and spawn policy still apply.
 //! - [`install_sighup_handler`] and [`sighup_generation`]: a process-wide `SIGHUP`
 //!   handler that only counts the signals (Apple; elsewhere `Unsupported` and a
 //!   count of zero). Only the broker's revocation file installs it, so that a
@@ -313,25 +312,17 @@ pub fn socket_hung_up(socket: std::os::fd::BorrowedFd<'_>) -> bool {
     apple::socket_hung_up(socket)
 }
 
-/// Keep `socket` out of every child this process forks or spawns (`FD_CLOFORK`, on
-/// top of the close-on-exec it already has).
+/// Request `FD_CLOFORK` for `socket` and report whether the kernel retained the flag.
 ///
-/// Apple: a socket is DRAINED, for good, when one of its descriptors is closed while
-/// another thread or process is inside a call on that same descriptor — a
-/// `proc_pidfdinfo` from any same-user inspector (lsof, a descriptor scan) or an
-/// `fstat` is enough. Every later blocking read on the socket's other descriptors then
-/// answers `EBADF` at once, and a drained LISTENER hands the drain to every connection
-/// it accepts afterwards. A child holds a copy of each of its parent's descriptors
-/// until its `exec` closes it, so a scan of a child being spawned drains the parent's
-/// sockets; a descriptor marked here is never copied into a child. Other Unix targets
-/// have no such drain and return `Ok(())` without a call. Unix only, as the descriptor
-/// type is: Windows has no `fork` and no `std::os::fd`, so a caller that also builds
-/// there keeps its own no-op twin (astream-broker's `kept_from_children`).
+/// Apple kernels may accept `F_SETFD` while ignoring this flag. `Ok(false)` reports
+/// that case, without claiming that a fork excludes the descriptor. The existing
+/// close-on-exec flag is preserved. Other Unix targets return `Ok(false)` without
+/// a call; callers still enforce their own descriptor policy when spawning.
 ///
 /// # Errors
 /// The `fcntl(2)` errno of reading or setting the descriptor's flags.
 #[cfg(unix)]
-pub fn close_on_fork(socket: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
+pub fn close_on_fork(socket: std::os::fd::BorrowedFd<'_>) -> io::Result<bool> {
     #[cfg(target_vendor = "apple")]
     {
         apple::close_on_fork(socket)
@@ -339,7 +330,7 @@ pub fn close_on_fork(socket: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
     #[cfg(not(target_vendor = "apple"))]
     {
         let _ = socket;
-        Ok(())
+        Ok(false)
     }
 }
 

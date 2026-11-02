@@ -1030,6 +1030,58 @@ fn the_exceptions_report_ranks_warnings_first_and_drops_a_fixed_entrys_action() 
         filed.iter().any(|l| l.trim_start().starts_with("then")),
         "{filed:#?}"
     );
+
+    // Across 2026-11-01 fall-back (PDT UTC-7 -> PST UTC-8 at 09:00Z):
+    // - 2026-10-31 23:30 PDT (1_793_514_600_000) is Yesterday, 11:30 PM (not 10:30 PM).
+    // - 2026-11-01 00:30 PDT (1_793_518_200_000) is Today, bare 12:30 AM (not Yesterday, 11:30 PM).
+    let change_s = 1_793_523_600;
+    let la_at = |unix: i64| {
+        Some(if unix < change_s {
+            -7 * 3_600
+        } else {
+            -8 * 3_600
+        })
+    };
+    let now_pst_ms = 1_793_563_200_000; // 2026-11-01 12:00 PST (20:00Z)
+    let mut dst = fresh(now);
+    dst.post(
+        fda(),
+        WallStamp {
+            unix_ms: 1_793_514_600_000,
+        },
+        now,
+    );
+    dst.post(
+        own_work("tab 1"),
+        WallStamp {
+            unix_ms: 1_793_518_200_000,
+        },
+        now,
+    );
+    let mut dst_log = MessageLog::empty();
+    dst_log.replay_all(
+        dst.drain_new_for_persist()
+            .iter()
+            .filter_map(|l| LogLine::decode(&l.encode()).ok()),
+    );
+    let local =
+        crate::exceptions_report_local(&dst_log, crate::ReportScope::Open, &la_at, now_pst_ms);
+    assert!(
+        local.iter().any(|l| l == "      since  12:30 AM"),
+        "{local:#?}"
+    );
+    assert!(
+        local
+            .iter()
+            .any(|l| l == "      since  Yesterday, 11:30 PM"),
+        "{local:#?}"
+    );
+    let flat = crate::exceptions_report(&dst_log, crate::ReportScope::Open, -8 * 3_600, now_pst_ms);
+    assert!(
+        flat.iter().any(|l| l == "      since  Yesterday, 11:30 PM")
+            && flat.iter().any(|l| l == "      since  Yesterday, 10:30 PM"),
+        "CONTROL: flat PST shifts both PDT stamps back an hour and moves 12:30 AM to Yesterday: {flat:#?}"
+    );
 }
 
 #[test]

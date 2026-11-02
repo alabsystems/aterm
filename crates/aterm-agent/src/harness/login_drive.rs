@@ -421,8 +421,25 @@ pub fn env_interpreter(program: &Path) -> Option<String> {
     if !(env == "env" || env.ends_with("/env")) {
         return None;
     }
-    let name = words.find(|w| !w.starts_with('-') && !w.contains('='))?;
-    (!name.contains('/') && !OPENERS.contains(&name)).then(|| name.to_owned())
+    let mut name = None;
+    while let Some(w) = words.next() {
+        if w == "--" {
+            name = words.find(|w| !w.contains('='));
+            break;
+        }
+        if matches!(w, "-u" | "-C" | "-P" | "-a" | "--unset" | "--chdir") {
+            let _ = words.next()?;
+            continue;
+        }
+        if w.starts_with('-') || w.contains('=') {
+            continue;
+        }
+        name = Some(w);
+        break;
+    }
+    let name = name?;
+    (!name.contains('/') && !matches!(name, "." | "..") && !OPENERS.contains(&name))
+        .then(|| name.to_owned())
 }
 
 /// The executable file a bare `word` names on `path` (the parent's `PATH`, its absolute
@@ -968,9 +985,10 @@ pub fn sign_in_with(
         ..
     } = &req.route.drive
     else {
-        let deadline = Instant::now()
+        let now = Instant::now();
+        let deadline = now
             .checked_add(hang)
-            .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400));
+            .unwrap_or_else(|| now + Duration::from_secs(86_400));
         return super::codex_app_login::login_in_home(
             req.staging,
             approver,

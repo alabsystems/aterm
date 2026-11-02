@@ -928,9 +928,11 @@ fn read_output(
 }
 
 fn parsed_identity(value: &Value, pid: &str, sec: &str, usec: &str) -> Option<Identity> {
+    let sec_str = value[sec].as_str()?;
+    (!sec_str.is_empty() && sec_str.bytes().all(|b| b.is_ascii_digit())).then_some(())?;
     let id = Identity {
         pid: u32::try_from(value[pid].as_u64()?).ok()?,
-        start_s: value[sec].as_str()?.parse().ok()?,
+        start_s: sec_str.parse().ok()?,
         start_us: u32::try_from(value[usec].as_u64()?).ok()?,
     };
     (id.pid > 0 && id.start_s > 0 && id.start_us < 1_000_000).then_some(id)

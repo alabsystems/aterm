@@ -1,0 +1,32 @@
+# kimi 2.4.0 · MEASURED 2026-10-29, `aterm ctl text` of a private headless aterm (110x32, aterm 0.146.0) running the real Kimi Code, launched by path with a scratch `HOME` and `KIMI_CODE_HOME` whose `config.toml` names one `openai`-type provider at `http://127.0.0.1:<port>/v1` with a fake key (a local stub of the Chat Completions API, crates/aterm-lab), no login · `ESC[200~lab paste one CR lab paste two ESC[201~` fed to the PTY: the CR inside the brackets is a newline in the draft, nothing sent
+
+ ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │                                                                                                          │
+ │  ▐█▛█▛█▌  Welcome to Kimi Code!                                                                          │
+ │  ▐█████▌  Send /help for help information.                                                               │
+ │                                                                                                          │
+ │  Directory: /private/tmp/at.H2aa/proj                                                                    │
+ │  Session:   session_d240495d-90d8-422b-bc70-82ea4e4c480f                                                 │
+ │  Model:     lab-model                                                                                    │
+ │  Version:   2.4.0                                                                                        │
+ │                                                                                                          │
+ ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+   No session yet — one will be created on your first message.
+
+ ❯ lab draft one
+
+ ● lab held reply, sent after 30 s
+
+ ❯ lab line one
+   lab line two
+   lab line three
+
+ ● Hi! I am the local lab stub, not a model. (reply 2)
+
+ ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │ > lab paste one                                                                                          │
+ │   lab paste two                                                                                          │
+ ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ lab-model  …/tmp/at.H2aa/proj
+                                                                                   context: 22% (20.7k/97.7k)

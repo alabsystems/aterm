@@ -1,0 +1,50 @@
+# grok 1.0.70 · MEASURED 2026-10-29, `aterm ctl text` of a private headless aterm (144x50, aterm 0.146.0) running the real Grok Build, launched by path in the lab's jail with a scratch `HOME` and `GROK_HOME`, the lab's `XAI_API_KEY` and `GROK_XAI_API_BASE_URL`/`GROK_CLI_CHAT_PROXY_BASE_URL=http://127.0.0.1:<port>/v1` (a local stub of xAI's API, crates/aterm-lab) · the stub's `tool` mode calls `enter_plan_mode` then `exit_plan_mode` with no plan written: the plan pane fills the view (its top edge `╭─ plan.md (empty) ─…─ [↗] ╮`, the numbered text `No plan written yet` …, a rule, and `a approve  |  s request changes  |  c comment  |  y copy plan  |  q quit plan` in its bottom row), the status row `◆ No plan written: approve or request changes`, a composer showing the placeholder `❯ Build anything` with `lab-stub · plan approval` in its bottom edge, and the key row `c:comment  │  y:copy plan  │  a:approve  │  q:quit plan  │  v:select  │  Tab:prompt` · cursor=42,6 (hidden)
+
+  ╭─ plan.md (empty) ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────── [↗] ╮
+  │1 No plan written yet                                                                                                                     │
+  │2                                                                                                                                         │
+  │3 The agent exited plan mode without writing a plan.                                                                                      │
+  │4                                                                                                                                         │
+  │5 • Approve: leave plan mode and start implementing                                                                                       │
+  │6 • Request changes: send the agent back to planning                                                                                      │
+  │7 • Quit: abandon and turn plan mode off                                                                                                  │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │
+  │                                                                                                                                          │ █
+  │                                                                                                                                          │ █
+  │                                                                                                                                          │ █
+  │                                                                                                                                          │ █
+  │                                                                                                                                          │ █
+  │                                                                                                                                          │ █
+  │──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────│ █
+  │                              a approve  |  s request changes  |  c comment  |  y copy plan  |  q quit plan                               │ █
+  ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+    ◆ No plan written: approve or request changes
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ ❯ Build anything                                                                                                                         │
+  ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────── lab-stub · plan approval ─╯
+
+  c:comment  │  y:copy plan  │  a:approve  │  q:quit plan  │  v:select  │  Tab:prompt

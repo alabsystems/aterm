@@ -717,6 +717,68 @@ fn a_glance_that_reached_nobody_backs_off_and_a_move_resets_it() {
     assert!(read_at(at + 120));
 }
 
+/// THE GLANCE WAITS FOR THE STEP: a read dials the fleet's Macs, so while System State's Local
+/// Network step, which asks macOS first, is still to come, the glance reads nothing by itself
+/// (its tick, a menu opening); once the step asked, it reads. A person's Read the Fleet Now reads
+/// all the same.
+#[test]
+fn the_glance_reads_nothing_by_itself_while_the_local_network_step_is_to_come() {
+    let hang = aterm_spec::wait::MUST_HAPPEN;
+    let step_asked = Arc::new(AtomicBool::new(false));
+    let (runs_tx, runs) = std::sync::mpsc::channel();
+    let (looks_tx, looks) = std::sync::mpsc::channel();
+    let (posts_tx, _posts) = std::sync::mpsc::channel();
+    let asked = Arc::clone(&step_asked);
+    let glance = spawn(
+        Box::new(Nobody { runs: runs_tx }),
+        ReaderSeams {
+            tick: Duration::from_millis(20),
+            lan: Box::new(move || {
+                let _ = looks_tx.send(());
+                asked.load(Ordering::SeqCst)
+            }),
+            ..seams(true, posts_tx)
+        },
+    )
+    .expect("the thread starts");
+    let looks_three_times = || {
+        while looks.try_recv().is_ok() {}
+        for _ in 0..3 {
+            looks
+                .recv_timeout(hang)
+                .expect("the reader looks at the step");
+        }
+    };
+    looks_three_times();
+    assert!(
+        runs.try_recv().is_err(),
+        "it read by itself before the step asked"
+    );
+    glance.kick(Kick::MenuOpening);
+    looks_three_times();
+    assert!(
+        runs.try_recv().is_err(),
+        "a menu opening read before the step asked"
+    );
+    step_asked.store(true, Ordering::SeqCst);
+    runs.recv_timeout(hang)
+        .expect("it reads once the step asked");
+
+    let (runs_tx, runs) = std::sync::mpsc::channel();
+    let (posts_tx, _posts) = std::sync::mpsc::channel();
+    let held = spawn(
+        Box::new(Nobody { runs: runs_tx }),
+        ReaderSeams {
+            lan: Box::new(|| false),
+            ..seams(true, posts_tx)
+        },
+    )
+    .expect("the thread starts");
+    held.kick(Kick::Now);
+    runs.recv_timeout(hang)
+        .expect("a person's Read the Fleet Now reads while the step is to come");
+}
+
 struct Gated {
     runs: Arc<AtomicUsize>,
     gate: Receiver<()>,
@@ -746,6 +808,7 @@ fn seams(minted: bool, posts: Sender<()>) -> ReaderSeams {
         post: Box::new(move || posts.send(()).is_ok()),
         tick: Duration::from_secs(3600),
         moved: None,
+        lan: Box::new(|| true),
     }
 }
 
@@ -795,6 +858,98 @@ fn the_reader_is_single_flight() {
         "the read before is kept"
     );
     assert!(glance.copy().snapshot_at(0).is_none());
+}
+
+/// A KICK THAT COMES ONCE A READ IS OVER IS ANSWERED: the kicks that come while a read runs are
+/// answered by it (but a move of the network,
+/// [`a_move_while_a_read_runs_reads_again_once_it_is_over`]), and one sent once its result is in
+/// the slot (a person's Read the Fleet Now, a move of the network) asks for a read of its own.
+/// NEGATIVE CONTROL: dropping the kicks queued once the slot is written loses that one.
+#[test]
+fn a_kick_once_a_read_is_in_the_slot_reads_again() {
+    let hang = aterm_spec::wait::MUST_HAPPEN;
+    let runs = Arc::new(AtomicUsize::new(0));
+    let (open, gate) = std::sync::mpsc::channel();
+    let (started_tx, started) = std::sync::mpsc::channel();
+    let (posts_tx, _posts) = std::sync::mpsc::channel();
+    let (looked_tx, looked) = std::sync::mpsc::channel();
+    let (go_on_tx, go_on) = std::sync::mpsc::channel::<()>();
+    let looks = AtomicUsize::new(0);
+    let glance = spawn(
+        Box::new(Gated {
+            runs: Arc::clone(&runs),
+            gate,
+            started: started_tx,
+        }),
+        ReaderSeams {
+            // The book's look once the first read is in the slot holds the reader there until
+            // the test has kicked.
+            book: Box::new(move || {
+                if looks.fetch_add(1, Ordering::SeqCst) == 1 {
+                    let _ = looked_tx.send(());
+                    let _ = go_on.recv_timeout(hang);
+                }
+                BookFacts {
+                    in_fleet: true,
+                    minted: true,
+                    issuer_label: None,
+                    unbound_issuer: None,
+                }
+            }),
+            ..seams(true, posts_tx)
+        },
+    )
+    .expect("the thread starts");
+    started
+        .recv_timeout(hang)
+        .expect("the issuer reads at once");
+    open.send(()).unwrap();
+    looked.recv_timeout(hang).expect("the read is over");
+    assert!(
+        glance.copy().tried_ms.is_some(),
+        "its result is in the slot"
+    );
+    glance.kick(Kick::Now);
+    go_on_tx.send(()).unwrap();
+    started.recv_timeout(hang).expect("the kick reads again");
+    open.send(()).unwrap();
+    assert_eq!(runs.load(Ordering::SeqCst), 2);
+}
+
+/// A MOVE WHILE A READ RUNS IS NOT ANSWERED BY IT: that read went out on the old network, so once
+/// it is over the reader reads again, as a move does at any other time, though the clock says the
+/// last read was just now.
+/// NEGATIVE CONTROL: dropping a move with the kicks a read answered reads nothing more.
+#[test]
+fn a_move_while_a_read_runs_reads_again_once_it_is_over() {
+    let hang = aterm_spec::wait::MUST_HAPPEN;
+    let runs = Arc::new(AtomicUsize::new(0));
+    let (open, gate) = std::sync::mpsc::channel();
+    let (started_tx, started) = std::sync::mpsc::channel();
+    let (posts_tx, _posts) = std::sync::mpsc::channel();
+    let glance = spawn(
+        Box::new(Gated {
+            runs: Arc::clone(&runs),
+            gate,
+            started: started_tx,
+        }),
+        ReaderSeams {
+            now_ms: Box::new(|| 1_000_000),
+            ..seams(true, posts_tx)
+        },
+    )
+    .expect("the thread starts");
+    started
+        .recv_timeout(hang)
+        .expect("the issuer reads at once");
+    glance.kick(Kick::Moved);
+    glance.kick(Kick::Now);
+    open.send(()).unwrap();
+    started
+        .recv_timeout(hang)
+        .expect("the move reads again on the new network");
+    open.send(()).unwrap();
+    assert_eq!(runs.load(Ordering::SeqCst), 2);
 }
 
 struct Empty;
@@ -952,6 +1107,7 @@ fn inert_seams() -> ReaderSeams {
         post: Box::new(|| true),
         tick: Duration::from_secs(3600),
         moved: None,
+        lan: Box::new(|| true),
     }
 }
 
@@ -1167,6 +1323,8 @@ fn host_words_and_herald_keys() {
     for ok in ["mac-17", "mac-17.local", "10.0.0.5", "a_b"] {
         assert_eq!(host_word(ok).as_deref(), Some(ok));
     }
+    assert_eq!(short_name("[::1]:7100"), "::1");
+    assert_eq!(short_name("[::ffff:127.0.0.1]:7100"), "::ffff:127.0.0.1");
     for bad in ["", "-x", "a b", "a;b", "a/b", "x@y", "\u{e9}"] {
         assert_eq!(host_word(bad), None, "{bad:?}");
     }
@@ -1558,4 +1716,39 @@ fn a_peer_that_says_drive_is_held_and_handed_back_over_the_fleet() {
     ] {
         assert_eq!(fleet_hold_args(dial, sid, true), None, "{dial:?} {sid:?}");
     }
+}
+
+/// The glance's `lan` seam is `lan_first_use::may_use`, which, past the Local Network step's
+/// wait, goes through the door: it takes this process's dialog slot for 30 s and notes that a use
+/// asked, after which every other use follows with no door. So the glance asks it only for a read
+/// it then makes; a tick that reads nothing (its quiet pause) does not.
+/// NEGATIVE CONTROL: ask `(seams.lan)()` before `should_poll` in `reader_loop`: every tick asks.
+#[test]
+fn the_glance_asks_the_lan_door_only_for_a_read_it_makes() {
+    let hang = aterm_spec::wait::MUST_HAPPEN;
+    let (runs_tx, runs) = std::sync::mpsc::channel();
+    let looks = Arc::new(AtomicUsize::new(0));
+    let (posts_tx, _posts) = std::sync::mpsc::channel();
+    let counted = Arc::clone(&looks);
+    let _glance = spawn(
+        Box::new(Nobody { runs: runs_tx }),
+        ReaderSeams {
+            tick: Duration::from_millis(20),
+            lan: Box::new(move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                true
+            }),
+            ..seams(true, posts_tx)
+        },
+    )
+    .expect("the thread starts");
+    runs.recv_timeout(hang).expect("the first read");
+    // About 25 ticks within the read's quiet pause: none reads.
+    std::thread::sleep(Duration::from_millis(500));
+    let made = 1 + runs.try_iter().count();
+    let asked = looks.load(Ordering::SeqCst);
+    assert!(
+        asked <= made,
+        "the glance went through the LAN door {asked} times for {made} reads"
+    );
 }

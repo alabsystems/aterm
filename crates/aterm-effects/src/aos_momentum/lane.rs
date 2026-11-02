@@ -364,6 +364,10 @@ impl Scenario {
         while i < events.len() {
             let (at, e) = events[i];
             if matches!(e, Exo::Present(_)) {
+                if i > 0 && events[i - 1].0 == at && matches!(events[i - 1].1, Exo::Key { .. }) {
+                    i += 1;
+                    continue;
+                }
                 let mut found = false;
                 let mut j = 0;
                 while j < events.len() {
@@ -1151,6 +1155,7 @@ const fn s0_config(page: Page, col: u16) -> MomentumGlowConfig {
         theme_fg: if dark { 0x00C8_C8D2 } else { 0x0024_292F },
         theme_bg: if dark { 0x0010_1016 } else { 0x00FF_FFFF },
         block: true,
+        bar: false,
         glyph_span: Some((0, col as i32)),
         light_vivid: false,
         chosen_hue: false,

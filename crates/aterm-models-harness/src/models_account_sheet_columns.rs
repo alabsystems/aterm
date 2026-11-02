@@ -3,8 +3,11 @@
 
 use aterm_spec::derive::Model;
 
-/// A selected account sheet refuses ambiguous columns and conflicting duplicate
-/// account rows while preserving provider discovery and equivalent duplicates.
+/// A selected account sheet refuses ambiguous columns while preserving provider discovery and
+/// equivalent duplicates; rows that give one address conflicting assignments (case 8, and case
+/// 10's member beside a row that disqualifies it) leave that address alone out and named, and
+/// the rest of the sheet is read (`exact` there: no row takes the address, and its rows are
+/// reported), so source order chooses no machine and one bad row stops no sync.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn account_sheet_columns_model() -> Model {
@@ -38,17 +41,19 @@ pub fn account_sheet_columns_model() -> Model {
                 exact = if Buggy == 10 {0} else {1};
             }
             action ConflictingRows when (case == 0) {
-                case = 8; accepted = if Buggy == 11 {1} else {0}; present = 1;
+                case = 8; accepted = if Buggy == 11 {0} else {1}; present = 1;
+                exact = if Buggy == 14 {0} else {1};
             }
             action EquivalentRows when (case == 0) {
                 case = 9; accepted = if Buggy == 12 {0} else {1}; present = 1;
             }
             action ExcludedDuplicate when (case == 0) {
-                case = 10; accepted = if Buggy == 13 {1} else {0}; present = 1;
+                case = 10; accepted = if Buggy == 13 {0} else {1}; present = 1;
+                exact = if Buggy == 15 {0} else {1};
             }
-            invariant NoAmbiguousSource: case <= 1 || case == 4 || case == 5 || case == 7 || case == 9 || accepted == 0;
+            invariant NoAmbiguousSource: case <= 1 || case == 4 || case == 5 || case > 6 || accepted == 0;
             invariant RequiredColumns: 4 > case || case > 5 || accepted == 0;
-            invariant ValidSource: case == 0 || (case > 1 && 7 > case) || case == 8 || case == 10 || accepted == 1;
+            invariant ValidSource: case == 0 || (case > 1 && 7 > case) || accepted == 1;
             invariant HeaderPresence: case == 0 || (case == 5 && present == 0) || ((5 > case || case > 5) && present == 1);
             invariant ExactMapping: accepted == 0 || exact == 1;
         }

@@ -277,8 +277,6 @@ pub(crate) struct PaletteLive {
     pub front_person_hold: bool,
     /// Whether the front session's hold belongs to another Mac (`origin=remote`).
     pub front_remote_hold: bool,
-    /// Whether View ▸ Show Needs in Windows (`[presence] rim`) is enabled.
-    pub needs_in_windows: bool,
     /// Active View ▸ Stats Bars setting (`[sys] stats_bars`).
     pub stats_bars: Option<crate::stats_deck::StatsBars>,
     /// Active View ▸ Deck Size setting (`[sys] stats_deck_size`).
@@ -635,7 +633,6 @@ impl PaletteState {
                 MenuAction::HandBack => {
                     row.enabled = live.terminal_front && live.front_person_hold;
                 }
-                MenuAction::ToggleNeedsInWindows => row.checked = Some(live.needs_in_windows),
                 MenuAction::StatsBarsDeck
                 | MenuAction::StatsBarsSill
                 | MenuAction::StatsBarsOff => {
@@ -1288,10 +1285,26 @@ fn palette_row_rect_in(
     let (card_x, card_y, card_w, _) = layout.card;
     Some((
         card_x + g.cw,
-        card_y + (2 + slot) as f32 * g.ch + 1.0,
+        card_y + (2 + slot) as f32 * g.ch + g.px_per_pt,
         (card_w - g.cw * 2.0).max(0.0),
-        (g.ch - 2.0).max(0.0),
+        (g.ch - 2.0 * g.px_per_pt).max(0.0),
     ))
+}
+
+/// The card-local centre of filtered row `filtered`'s painted rect while the card shows it, a
+/// point [`palette_row_hit`] reads back as that row.
+pub(crate) fn palette_row_centre(
+    state: &PaletteState,
+    g: &SettingsGeom,
+    filtered: usize,
+) -> Option<(f32, f32)> {
+    let count = state.filtered_count();
+    if filtered >= count {
+        return None;
+    }
+    let slot = filtered.checked_sub(state.scroll)?;
+    let (x, y, w, h) = palette_row_rect_in(&palette_layout_for_count(count, g), g, slot)?;
+    Some((x + w * 0.5, y + h * 0.5))
 }
 
 /// Filtered row index under card-local point `(px, py)`.
@@ -1333,13 +1346,25 @@ pub(crate) fn palette_tray(
     g: &SettingsGeom,
     theme: impl Into<crate::chrome_band::ChromePalette>,
 ) -> TrayInput {
+    palette_tray_in(state, g, theme, PALETTE_FLUENT)
+}
+
+/// [`palette_tray`] as a Fluent flyout or not (`fluent`, [`PALETTE_FLUENT`] on this platform), so
+/// a test on any platform draws either card's shapes.
+fn palette_tray_in(
+    state: &PaletteState,
+    g: &SettingsGeom,
+    theme: impl Into<crate::chrome_band::ChromePalette>,
+    fluent: bool,
+) -> TrayInput {
     let r = Roles::from_theme(theme);
     let (cw, ch, px) = (g.cw, g.ch, g.font_px);
     let vis = state.filtered();
     let layout = palette_layout_for_count(vis.len(), g);
     let (card_x, card_y, card_w, _) = layout.card;
-    let mut prims = overlay_card_frame(layout.card, ch, &r, true);
+    let mut prims = overlay_card_frame(layout.card, g, &r, true);
     let face = PALETTE_FACE;
+    let pt = g.px_per_pt;
 
     let text_at = |prims: &mut Vec<DrawPrim>,
                    x: f32,
@@ -1365,7 +1390,7 @@ pub(crate) fn palette_tray(
             text_at(prims, x, row_baseline(y0, ch, size.get()), size, s, color);
         };
 
-    if PALETTE_FLUENT {
+    if fluent {
         palette_filter_box(&mut prims, state, g, &r, layout.card, vis.len());
     } else {
         let title = if state.themes_only {
@@ -1395,14 +1420,17 @@ pub(crate) fn palette_tray(
         ));
 
         let qy = card_y + ch;
+        // The query field alone stays in device pixels (§14.16): its box is shorter than its type
+        // at 1x, and in points its 2x lines would cross `type to filter`. Fitting the box to its
+        // type is a design call that moves 1x.
         let (rim, alpha) = crate::native_ui::resting_rim(&r);
         prims.push(DrawPrim::Stroke {
             x: card_x + cw * 1.5,
-            y: qy + 2.0,
+            y: qy + QUERY_FIELD_INSET_PX,
             w: (card_w - cw * 3.0).max(0.0),
-            h: ch - 4.0,
+            h: ch - 2.0 * QUERY_FIELD_INSET_PX,
             radius: ch * 0.28,
-            width: 1.25,
+            width: QUERY_FIELD_LINE_PX,
             color: rgba(rim, alpha),
         });
         let prompt = if state.query.is_empty() {
@@ -1440,7 +1468,7 @@ pub(crate) fn palette_tray(
     let accel_right = card_x + card_w - cw * 2.0;
     let (body_px, cap) = (TypeStep::Body.px(px), TypeStep::Caption.px(px));
     let shown = || (0..body).filter_map(|slot| vis.get(state.scroll + slot));
-    let chip_right = PALETTE_FLUENT.then(|| {
+    let chip_right = fluent.then(|| {
         let widest = shown()
             .map(|&idx| face_w(face, &row_accel(&state.rows[idx]), cap.get()))
             .fold(0.0_f32, f32::max);
@@ -1463,22 +1491,22 @@ pub(crate) fn palette_tray(
         if is_sel {
             let (x, y, width, height) = palette_row_rect_in(&layout, g, slot)
                 .expect("painted palette slot has a row rectangle");
-            if PALETTE_FLUENT {
+            if fluent {
                 prims.push(DrawPrim::Panel {
                     x,
                     y,
                     w: width,
                     h: height,
-                    radius: PALETTE_ROW_RADIUS,
+                    radius: PALETTE_ROW_RADIUS * pt,
                     fill: rgba(palette_selected_fill(&r), 0xFF),
                 });
-                let pill_h = (ch * 0.6).min((height - 6.0).max(0.0));
+                let pill_h = (ch * 0.6).min((height - 6.0 * pt).max(0.0));
                 prims.push(DrawPrim::Panel {
                     x,
                     y: y + (height - pill_h) * 0.5,
-                    w: 3.0,
+                    w: 3.0 * pt,
                     h: pill_h,
-                    radius: 1.5,
+                    radius: 1.5 * pt,
                     fill: rgba(r.accent, 0xFF),
                 });
             } else {
@@ -1496,7 +1524,7 @@ pub(crate) fn palette_tray(
                     w: width,
                     h: height,
                     radius: ch * 0.3,
-                    width: 1.5,
+                    width: 1.5 * pt,
                     color: rgba(r.accent, 0xCC),
                 });
             }
@@ -1536,7 +1564,7 @@ pub(crate) fn palette_tray(
         let chip_x = chip_right.map_or(trailing, |right| {
             (right - face_w(face, &row.section, cap.get())).max(trailing)
         });
-        let chip_ink = if PALETTE_FLUENT && row.enabled {
+        let chip_ink = if fluent && row.enabled {
             r.text_secondary
         } else {
             r.text_tertiary
@@ -1561,7 +1589,7 @@ pub(crate) fn palette_tray(
             );
         }
     }
-    if PALETTE_FLUENT && vis.len() > body && body > 0 {
+    if fluent && vis.len() > body && body > 0 {
         let track_y = card_y + 2.0 * ch;
         let track_h = body as f32 * ch;
         let share = body as f32 / vis.len() as f32;
@@ -1569,16 +1597,16 @@ pub(crate) fn palette_tray(
         let max_scroll = (vis.len() - body) as f32;
         let along = (state.scroll as f32 / max_scroll).clamp(0.0, 1.0);
         prims.push(DrawPrim::Panel {
-            x: card_x + card_w - cw * 0.5 - 1.5,
+            x: card_x + card_w - cw * 0.5 - 1.5 * pt,
             y: track_y + (track_h - thumb_h) * along,
-            w: 3.0,
+            w: 3.0 * pt,
             h: thumb_h,
-            radius: 1.5,
+            radius: 1.5 * pt,
             fill: rgba(r.text_tertiary, 0xB0),
         });
     }
 
-    let hint = match (state.themes_only, PALETTE_FLUENT) {
+    let hint = match (state.themes_only, fluent) {
         (true, false) => "\u{2191}\u{2193} preview   \u{23ce} keep   esc revert",
         (false, false) => "\u{2191}\u{2193} move   \u{23ce} run   esc close",
         (true, true) => "\u{2191}\u{2193} preview   Enter keep   Esc revert",
@@ -1599,6 +1627,13 @@ const fn overlay_secondary_ink(r: &Roles) -> [u8; 3] {
 /// The corner radius of a Fluent palette's selected row and filter box: WinUI's `ControlCornerRadius`.
 const PALETTE_ROW_RADIUS: f32 = 4.0;
 
+/// How far the query field's box sits inside its cell row, top and bottom, in device pixels at
+/// every scale (§14.16).
+const QUERY_FIELD_INSET_PX: f32 = 2.0;
+
+/// The query field's line, in device pixels at every scale (§14.16).
+const QUERY_FIELD_LINE_PX: f32 = 1.25;
+
 /// A Fluent palette's selected-row fill ([`PALETTE_FLUENT`]): the card's surface a step toward the ink, the subtle neutral the Settings rail selects with (`native_ui::FLUENT_RAIL_SELECTION`) over its own ground.
 fn palette_selected_fill(r: &Roles) -> [u8; 3] {
     crate::native_appearance::mix_srgb(r.surface, r.text_primary, 0.09)
@@ -1615,9 +1650,10 @@ fn palette_filter_box(
 ) {
     let (card_x, card_y, card_w, _) = card;
     let (cw, ch) = (g.cw, g.ch);
+    let pt = g.px_per_pt;
     let face = PALETTE_FACE;
     let band = 2.0 * ch;
-    let h = (ch * 1.5).min(band - 4.0).max(0.0).round();
+    let h = (ch * 1.5).min(band - 4.0 * pt).max(0.0).round();
     let (x, w) = (card_x + cw, (card_w - cw * 2.0).max(0.0));
     let y = card_y + ((band - h) * 0.5).round();
     prims.push(DrawPrim::Panel {
@@ -1625,31 +1661,31 @@ fn palette_filter_box(
         y,
         w,
         h,
-        radius: PALETTE_ROW_RADIUS,
+        radius: PALETTE_ROW_RADIUS * pt,
         fill: rgba(crate::native_ui::control_rest_fill_over(r.surface, r), 0xFF),
     });
     let (rim, alpha) = crate::native_ui::resting_rim(r);
     prims.push(DrawPrim::Stroke {
-        x: x + 0.5,
-        y: y + 0.5,
-        w: (w - 1.0).max(0.0),
-        h: (h - 1.0).max(0.0),
-        radius: PALETTE_ROW_RADIUS,
-        width: 1.0,
+        x: x + 0.5 * pt,
+        y: y + 0.5 * pt,
+        w: (w - pt).max(0.0),
+        h: (h - pt).max(0.0),
+        radius: PALETTE_ROW_RADIUS * pt,
+        width: pt,
         color: rgba(rim, alpha),
     });
     prims.push(DrawPrim::ClipPush {
         x,
-        y: y + h - 2.0,
+        y: y + h - 2.0 * pt,
         w,
-        h: 2.0,
+        h: 2.0 * pt,
     });
     prims.push(DrawPrim::Panel {
         x,
         y,
         w,
         h,
-        radius: PALETTE_ROW_RADIUS,
+        radius: PALETTE_ROW_RADIUS * pt,
         fill: rgba(r.accent, 0xFF),
     });
     prims.push(DrawPrim::ClipPop);
@@ -1672,22 +1708,22 @@ fn palette_filter_box(
     let baseline = row_baseline(y, h, size.get());
     let text_x = x + inset;
     let right = (count_x - inset).max(text_x);
-    let caret_h = (size.get() * 1.25).min(h - 6.0).max(0.0);
+    let caret_h = (size.get() * 1.25).min(h - 6.0 * pt).max(0.0);
     let caret_y = y + ((h - caret_h) * 0.5).round();
     let caret = |prims: &mut Vec<DrawPrim>, at: f32| {
         prims.push(DrawPrim::Panel {
             x: at.round(),
             y: caret_y,
-            w: 1.0,
+            w: pt,
             h: caret_h,
             radius: 0.0,
             fill: rgba(r.text_primary, 0xFF),
         });
     };
     prims.push(DrawPrim::ClipPush {
-        x: text_x - 3.0,
+        x: text_x - 3.0 * pt,
         y,
-        w: (right - text_x + 3.0).max(0.0),
+        w: (right - text_x + 3.0 * pt).max(0.0),
         h,
     });
     if state.query.is_empty() {
@@ -1705,10 +1741,10 @@ fn palette_filter_box(
             face,
             rgba(overlay_secondary_ink(r), 0xFF),
         ));
-        caret(prims, text_x - 2.0);
+        caret(prims, text_x - 2.0 * pt);
     } else {
         let qw = face_w(face, &state.query, size.get());
-        let qx = text_x.min(right - 2.0 - qw);
+        let qx = text_x.min(right - 2.0 * pt - qw);
         prims.push(text_prim(
             qx,
             baseline,
@@ -1718,35 +1754,39 @@ fn palette_filter_box(
             face,
             rgba(r.text_primary, 0xFF),
         ));
-        caret(prims, qx + qw + 1.0);
+        caret(prims, qx + qw + pt);
     }
     prims.push(DrawPrim::ClipPop);
 }
 
-/// Appends the outer drop shadow, background, border, and title for a list overlay card.
+/// Appends the outer drop shadow, background, border, and title for a list overlay card. Its
+/// corner radius cap, shadow offsets and border are points, scaled by
+/// [`SettingsGeom::px_per_pt`] as the card's width cap is ([`overlay_card_span`]), so a Retina
+/// card wears the 1x card's corners and shadow at twice the pixels.
 pub(crate) fn overlay_card_frame(
     card: (f32, f32, f32, f32),
-    ch: f32,
+    g: &SettingsGeom,
     r: &Roles,
     contact_shadow: bool,
 ) -> Vec<DrawPrim> {
     let (card_x, card_y, card_w, card_h) = card;
-    let radius = (ch * 0.6).min(14.0);
+    let pt = g.px_per_pt;
+    let radius = (g.ch * 0.6).min(14.0 * pt);
     let mut prims = vec![DrawPrim::Panel {
-        x: card_x - 3.0,
-        y: card_y + 2.0,
-        w: card_w + 6.0,
-        h: card_h + 6.0,
-        radius: radius + 3.0,
+        x: card_x - 3.0 * pt,
+        y: card_y + 2.0 * pt,
+        w: card_w + 6.0 * pt,
+        h: card_h + 6.0 * pt,
+        radius: radius + 3.0 * pt,
         fill: rgba([0, 0, 0], 0x2A),
     }];
     if contact_shadow {
         prims.push(DrawPrim::Panel {
-            x: card_x - 1.0,
-            y: card_y + 2.0,
-            w: card_w + 2.0,
-            h: card_h + 3.0,
-            radius: radius + 1.0,
+            x: card_x - pt,
+            y: card_y + 2.0 * pt,
+            w: card_w + 2.0 * pt,
+            h: card_h + 3.0 * pt,
+            radius: radius + pt,
             fill: rgba([0, 0, 0], 0x30),
         });
     }
@@ -1765,7 +1805,7 @@ pub(crate) fn overlay_card_frame(
             w: card_w,
             h: card_h,
             radius,
-            width: 1.0,
+            width: pt,
             color: rgba(r.separator, 0xE0),
         },
         DrawPrim::ClipPush {
@@ -1843,9 +1883,204 @@ pub(crate) fn row_text_writer(
     }
 }
 
+/// The lengths of `prim` a scale must multiply: a shape's position, size, corner radius and
+/// stroke width, and a text's type size (text is placed by measured glyph advances, which a type
+/// size does not scale exactly, so its position is not among them). `None` for a clip pop.
+#[cfg(test)]
+pub(crate) fn scaled_lengths(prim: &DrawPrim) -> Option<(&'static str, Vec<f32>)> {
+    Some(match prim {
+        DrawPrim::Panel {
+            x, y, w, h, radius, ..
+        } => ("panel", vec![*x, *y, *w, *h, *radius]),
+        DrawPrim::Stroke {
+            x,
+            y,
+            w,
+            h,
+            radius,
+            width,
+            ..
+        } => ("stroke", vec![*x, *y, *w, *h, *radius, *width]),
+        DrawPrim::ClipPush { x, y, w, h } => ("clip", vec![*x, *y, *w, *h]),
+        DrawPrim::Text { px, .. } => ("text", vec![*px]),
+        DrawPrim::Dot { cx, cy, r, .. } => ("dot", vec![*cx, *cy, *r]),
+        DrawPrim::ClipPop => return None,
+        other => panic!("an overlay card draws no {other:?}"),
+    })
+}
+
+/// Asserts that `scaled`, drawn at `k` device pixels per point (cells, type and
+/// [`SettingsGeom::px_per_pt`] all `k` times), is `base`, drawn at 1, at `k` times the pixels:
+/// the same prims in the same order, each length [`scaled_lengths`] names `k` times its 1x
+/// value, save the indices `free` names (per prim kind) as following measured text.
+#[cfg(test)]
+pub(crate) fn assert_drawn_at_scale(
+    base: &[DrawPrim],
+    scaled: &[DrawPrim],
+    k: f32,
+    free: &[(&str, usize)],
+    what: &str,
+) {
+    assert_eq!(base.len(), scaled.len(), "{what}: the same prims at {k}x");
+    for (i, (one, two)) in base.iter().zip(scaled).enumerate() {
+        let (Some((kind, one)), Some((kind2, two))) = (scaled_lengths(one), scaled_lengths(two))
+        else {
+            continue;
+        };
+        assert_eq!(kind, kind2, "{what}: prim {i}'s kind");
+        for (j, (a, b)) in one.iter().zip(&two).enumerate() {
+            if free.contains(&(kind, j)) {
+                continue;
+            }
+            assert!(
+                (a * k - b).abs() <= 1e-3 * b.abs().max(1.0),
+                "{what}: {kind} prim {i}'s length {j} is {b} at {k}x, not {k} x {a}"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// At 2 device pixels per point the palette is the 1x palette at twice the pixels: its
+    /// corner radius cap, shadow offsets, border, row insets and selection ring are points.
+    /// The query field alone keeps its device-pixel inset and line, so at 2x its box clears its
+    /// type as it does on main. The cell (12 x 25) is tall enough that the 14-point radius cap
+    /// binds (§14.16). This is the macOS and Linux card on every platform; the Windows (Fluent)
+    /// card has its own test below.
+    #[test]
+    fn the_palette_wears_its_corners_shadow_and_ring_in_points() {
+        let at = |k: f32| SettingsGeom {
+            cw: 12.0 * k,
+            ch: 25.0 * k,
+            font_px: 18.0 * k,
+            cols: 120,
+            panel_rows: 40,
+            px_per_pt: k,
+        };
+        let theme = aterm_render::Theme::default;
+        let mut state = PaletteState::new();
+        for typed in ["", "s"] {
+            for c in typed.chars() {
+                state.push_char(c);
+            }
+            let mut one = palette_tray_in(&state, &at(1.0), theme(), false).prims;
+            let mut two = palette_tray_in(&state, &at(2.0), theme(), false).prims;
+            let DrawPrim::Stroke { radius, .. } = one[3] else {
+                panic!("the card's border: {:?}", one[3]);
+            };
+            assert_eq!(radius, 14.0, "the 1x radius is at its cap");
+            // The query field is the first stroke after the title, on the card's second row.
+            let query = |prims: &[DrawPrim]| {
+                prims
+                    .iter()
+                    .skip(4)
+                    .position(|p| matches!(p, DrawPrim::Stroke { .. }))
+                    .map(|i| i + 4)
+                    .expect("the query field")
+            };
+            let (q1, q2) = (query(&one), query(&two));
+            assert_eq!(q1, q2, "palette {typed:?}: the query field's place");
+            for (k, prim) in [(1.0_f32, &one[q1]), (2.0, &two[q2])] {
+                let DrawPrim::Stroke { h, width, .. } = *prim else {
+                    unreachable!()
+                };
+                assert_eq!(
+                    (h, width),
+                    (25.0 * k - 4.0, 1.25),
+                    "palette {typed:?} at {k}x: the query field's box is its row less 2 pixels \
+                     each side, its line 1.25 pixels"
+                );
+            }
+            one.remove(q1);
+            two.remove(q2);
+            assert_drawn_at_scale(&one, &two, 2.0, &[], &format!("palette {typed:?}"));
+        }
+    }
+
+    /// The Windows palette ([`PALETTE_FLUENT`]) is its 1x card at twice the pixels too: its
+    /// filter box's corners, rim, accent foot and caret, its selected row's corners and accent
+    /// pill, and its scroll thumb are points. Drawn through [`palette_tray_in`], so it runs on
+    /// every platform. Two lengths follow measured text, not the scale: the field's clip ends
+    /// where the count's words begin, and a typed query's caret follows the query. The cell
+    /// (12 x 24) keeps the box's rounded height and centring whole at both scales (§14.16).
+    #[test]
+    fn a_fluent_palette_wears_its_filter_box_pill_and_thumb_in_points() {
+        let at = |k: f32| SettingsGeom {
+            cw: 12.0 * k,
+            ch: 24.0 * k,
+            font_px: 18.0 * k,
+            cols: 120,
+            panel_rows: 40,
+            px_per_pt: k,
+        };
+        let theme = aterm_render::Theme::default;
+        let accent = rgba(Roles::from_theme(theme()).accent, 0xFF);
+        let mut state = PaletteState::new();
+        for typed in ["", "s"] {
+            for c in typed.chars() {
+                state.push_char(c);
+            }
+            let draw = |k: f32| palette_tray_in(&state, &at(k), theme(), true).prims;
+            let (mut one, mut two) = (draw(1.0), draw(2.0));
+            let DrawPrim::Stroke { radius, .. } = one[3] else {
+                panic!("the card's border: {:?}", one[3]);
+            };
+            assert_eq!(radius, 14.0, "the 1x radius is at its cap");
+            let bars = |prims: &[DrawPrim], k: f32| {
+                prims
+                    .iter()
+                    .filter(|p| matches!(p, DrawPrim::Panel { w, .. } if *w == 3.0 * k))
+                    .count()
+            };
+            if typed.is_empty() {
+                assert_eq!(
+                    bars(&one, 1.0),
+                    2,
+                    "the selected row's pill and the scroll thumb"
+                );
+            }
+            assert!(
+                one.iter()
+                    .any(|p| matches!(p, DrawPrim::Panel { fill, .. } if *fill == accent)),
+                "palette {typed:?}: the accent pill and the filter box's accent foot"
+            );
+            // Blank the two lengths measured text sets: the filter field's clip (the second clip
+            // after the box's rim, the first stroke past the card's border) and, typed, its caret.
+            let blank_measured = |prims: &mut [DrawPrim]| {
+                let rim = 4 + prims[4..]
+                    .iter()
+                    .position(|p| matches!(p, DrawPrim::Stroke { .. }))
+                    .expect("the filter box's rim");
+                let clip = rim
+                    + prims[rim..]
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, p)| matches!(p, DrawPrim::ClipPush { .. }))
+                        .nth(1)
+                        .map(|(i, _)| i)
+                        .expect("the field's clip");
+                let caret = clip
+                    + prims[clip..]
+                        .iter()
+                        .position(|p| matches!(p, DrawPrim::Panel { .. }))
+                        .expect("the caret");
+                if let DrawPrim::ClipPush { w, .. } = &mut prims[clip] {
+                    *w = 0.0;
+                }
+                if !typed.is_empty()
+                    && let DrawPrim::Panel { x, .. } = &mut prims[caret]
+                {
+                    *x = 0.0;
+                }
+            };
+            blank_measured(&mut one);
+            blank_measured(&mut two);
+            assert_drawn_at_scale(&one, &two, 2.0, &[], &format!("fluent palette {typed:?}"));
+        }
+    }
 
     #[test]
     fn palette_flattens_every_command() {
@@ -2003,9 +2238,9 @@ mod tests {
         );
     }
 
-    /// The person's hold pair follows the live hold — Take Over live without the person's hold, Hand Back live with it (and `invoke` refuses the greyed one as disabled) — and Show Needs in Windows is checkable from its live bit.
+    /// The person's hold pair follows the live hold — Take Over live without the person's hold, Hand Back live with it (and `invoke` refuses the greyed one as disabled).
     #[test]
-    fn the_person_pair_follows_the_hold_and_the_needs_row_checks() {
+    fn the_person_pair_follows_the_hold() {
         let mut s = PaletteState::new();
         let row = |s: &PaletteState, a: MenuAction| {
             s.rows
@@ -2017,27 +2252,17 @@ mod tests {
         let live = PaletteLive {
             terminal_front: true,
             can_rename: true,
-            needs_in_windows: true,
             ..PaletteLive::default()
         };
         s.resolve(&live);
         assert!(row(&s, MenuAction::TakeOver).enabled);
         assert!(!row(&s, MenuAction::HandBack).enabled);
-        assert_eq!(
-            row(&s, MenuAction::ToggleNeedsInWindows).checked,
-            Some(true)
-        );
         s.resolve(&PaletteLive {
             front_person_hold: true,
-            needs_in_windows: false,
             ..live.clone()
         });
         assert!(!row(&s, MenuAction::TakeOver).enabled);
         assert!(row(&s, MenuAction::HandBack).enabled);
-        assert_eq!(
-            row(&s, MenuAction::ToggleNeedsInWindows).checked,
-            Some(false)
-        );
         assert!(
             s.action_by_name("TakeOver")
                 .is_err_and(|e| e.contains("disabled")),

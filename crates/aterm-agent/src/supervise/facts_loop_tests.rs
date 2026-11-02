@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::supervise::BackgroundCall;
-use crate::supervise::facts::EpisodeKey;
+use crate::supervise::facts::{EpisodeKey, FactKind, HeldCall, HeldReading};
 
 const NO_PROGRESS: &str = "fact-no-progress@v1";
 
@@ -39,7 +39,13 @@ enum Step {
     End,
     Again,
     Done,
+    /// The screen as the step before left it, looked at (`Session::draft_look`); a look that
+    /// decides books [`LOOK_DECIDED`] among the decisions.
+    Look,
 }
+
+/// What a [`Step::Look`] that decided books among [`Both::decided`].
+const LOOK_DECIDED: &str = "the look decided";
 
 /// What moves between a point's decision and its act: the session, and the options the act is
 /// carried out under.
@@ -89,6 +95,12 @@ impl Both {
     }
 
     fn rows(&self) -> Vec<(String, String, String)> {
+        self.kind_rows(FactKind::NoProgress)
+    }
+
+    /// The ledger's rows of `kind`'s facts: its intents and its outcomes.
+    fn kind_rows(&self, kind: FactKind) -> Vec<(String, String, String)> {
+        let opens = format!("kind={} ", kind.word());
         self.ran
             .ledger
             .lines()
@@ -103,7 +115,7 @@ impl Both {
                 (text("rule_id"), text("decision"), text("reason"))
             })
             .filter(|(rule, _, reason)| {
-                rule == NO_PROGRESS || (rule == INTENT && reason.starts_with("kind=no-progress "))
+                rule == kind.rule() || (rule == INTENT && reason.starts_with(&opens))
             })
             .collect()
     }
@@ -223,6 +235,7 @@ impl<'a> Run<'a> {
                         "Stage {i} of the parser is in; the lexer is next."
                     )),
                     Step::Done => ran_then_ended("Fixed the parser; all done."),
+                    Step::Look => s.ctl.m.screens[0].clone(),
                 };
                 let (rows, stands) = match sent.iter().flatten().last() {
                     Some(text) if self.standing == Some(i) => (drafted(rows, text), true),
@@ -231,7 +244,7 @@ impl<'a> Run<'a> {
                 // A re-decision reads the point again.
                 s.ctl.m.screens = match step {
                     Step::Again => vec![rows.clone(), rows],
-                    Step::Break | Step::End | Step::Done => vec![rows],
+                    Step::Break | Step::End | Step::Done | Step::Look => vec![rows],
                 };
                 s.ctl.m.served = 0;
                 if stands {
@@ -264,6 +277,14 @@ impl<'a> Run<'a> {
                         }
                         s.turn_end_execute(&point, action, &act_opts, &[], &mut heard)
                             .expect("the point's act");
+                    }
+                    Step::Look => {
+                        let point = s.turn_of(screen);
+                        if s.draft_look(&point, &opts, &[], &mut heard)
+                            .expect("the look")
+                        {
+                            decided.push(LOOK_DECIDED.to_string());
+                        }
                     }
                     Step::Again => {
                         since = None;
@@ -916,6 +937,124 @@ fn a_planted_word_reaches_no_write_at_either_door() {
             .collect();
         assert!(informed.iter().all(|c| !c.contains(PLANT)), "{informed:#?}");
     }
+}
+
+/// The program the host reads held: one of the agent's calls, held 20 minutes.
+fn held_programs() -> Vec<HeldCall> {
+    vec![HeldCall {
+        pid: 72955,
+        exec_version: Some(1),
+        held_ms: 20 * MIN.unsigned_abs(),
+    }]
+}
+
+/// The held fact's sentence.
+fn held_told() -> String {
+    HeldReading {
+        as_of_ms: T0,
+        programs: held_programs(),
+    }
+    .told()
+}
+
+/// A run whose host reads a program of the agent's calls held, and no call at no progress.
+fn held_run<'a>(tag: &'a str, policy: SupervisorConfig, steps: &[(i64, Step)]) -> Run<'a> {
+    let run = Run::new(tag, policy, steps);
+    *run.host.facts.lock().expect("facts") = None;
+    *run.host.held.lock().expect("held") = Some(held_programs());
+    run
+}
+
+/// The intent and the typed outcome a told held fact books.
+fn held_told_rows() -> [(String, String); 2] {
+    [
+        (INTENT.to_string(), "waiting".to_string()),
+        (
+            FactKind::ProgramCheck.rule().to_string(),
+            "typed".to_string(),
+        ),
+    ]
+}
+
+fn decided(rows: &[(String, String, String)]) -> Vec<(String, String)> {
+    rows.iter()
+        .map(|(rule, decision, _)| (rule.clone(), decision.clone()))
+        .collect()
+}
+
+/// A HELD FACT RIDES THE CONTINUATION ONCE: the first turn end's continuation ends with
+/// ` (aterm: macOS's program check is holding …)`, booked as its intent then its
+/// `fact-program-check@v1` row typed at `door=turn-end` (the Harness page counts it under
+/// `program-check`), and the next turn end, the same program still held, carries none.
+#[test]
+fn a_held_fact_rides_the_continuation_once() {
+    let ran = held_run(
+        "facts-held-rider",
+        keyed(Occupancy::Off, false),
+        &[(0, Step::End), (60, Step::End)],
+    )
+    .run(&[], &mut taking);
+    let riding = format!(" (aterm: {})", held_told());
+    assert!(
+        ran.sent[0].len() == 1 && ran.sent[0][0].ends_with(&riding),
+        "{:#?}",
+        ran.sent
+    );
+    assert!(
+        ran.sent[1].len() == 1 && !ran.sent[1][0].contains(" (aterm: "),
+        "told once: {:#?}",
+        ran.sent
+    );
+    let rows = ran.kind_rows(FactKind::ProgramCheck);
+    assert_eq!(decided(&rows), held_told_rows());
+    assert!(
+        rows.iter()
+            .all(|(_, _, reason)| reason.contains(" door=turn-end")),
+        "{rows:#?}"
+    );
+    let mut stats = crate::harness::stats::HarnessStats::new(0);
+    for line in ran.ran.ledger.lines() {
+        crate::harness::stats::fold_ledger_line(&mut stats, line);
+    }
+    assert_eq!(
+        stats.facts_told.get("program-check"),
+        Some(&1),
+        "{stats:#?}"
+    );
+}
+
+/// A HELD FACT IS TYPED AT A BREAK ONLY UNDER THE KEY: with `stuck_break_note` off, a break asks
+/// no facts reading, types nothing and books nothing; on, the first break types
+/// `[aterm harness] aterm: macOS's program check is holding … .` once and books it at
+/// `door=break`, and the next break types nothing more.
+#[test]
+fn a_held_fact_is_typed_at_a_break_only_under_the_key() {
+    let breaks = [(0, Step::Break), (60, Step::Break)];
+    let off =
+        held_run("facts-held-key-off", keyed(Occupancy::Off, false), &breaks).run(&[], &mut taking);
+    assert!(off.sends().is_empty(), "{:#?}", off.ran.noted);
+    assert!(
+        !off.ran.calls.iter().any(|c| c == "facts"),
+        "{:#?}",
+        off.ran.calls
+    );
+    assert!(off.kind_rows(FactKind::ProgramCheck).is_empty());
+    let on =
+        held_run("facts-held-key-on", keyed(Occupancy::Off, true), &breaks).run(&[], &mut taking);
+    assert_eq!(
+        on.sends(),
+        [templates::stuck_line(&held_told())],
+        "{:#?}",
+        on.ran.noted
+    );
+    assert_eq!(on.facts("break"), ["typed"]);
+    let rows = on.kind_rows(FactKind::ProgramCheck);
+    assert_eq!(decided(&rows), held_told_rows());
+    assert!(
+        rows.iter()
+            .all(|(_, _, reason)| reason.contains(" door=break")),
+        "{rows:#?}"
+    );
 }
 
 /// §2.1 AT A BREAK WITH NO HOST STEP, RANKS 2 AND 4: a wake's line and a hung call's fact due at

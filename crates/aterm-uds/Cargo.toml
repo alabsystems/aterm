@@ -7,7 +7,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "aterm — the portable control-socket stream: pure type aliases to std Unix-domain sockets on Unix, AF_UNIX over winsock (afunix.sys) on Windows, plus the latest-alias, CSPRNG, pid-liveness, SCM_RIGHTS descriptor-passing and shared-memory region helpers the control channel and the PTY keeper need. Std-only but for aterm-libc's declarations and astream-sys's owner-only file rule and close-on-fork mark on Unix; the Windows side is direct ws2_32/kernel32/bcrypt FFI."
+description = "aterm — the portable control-socket stream: pure type aliases to std Unix-domain sockets on Unix, AF_UNIX over winsock (afunix.sys) on Windows, plus the latest-alias, CSPRNG, pid-liveness, SCM_RIGHTS descriptor-passing and shared-memory region helpers the control channel and the PTY keeper need. The Windows side is direct ws2_32/kernel32/bcrypt FFI."
 
 # Dependency-free on every platform (the Windows side is raw FFI) so the
 # whole transport stays auditable in one small crate, but for one first-party
@@ -19,17 +19,20 @@ description = "aterm — the portable control-socket stream: pure type aliases t
 # finishes an `atomic_file` write.
 [dependencies]
 # aterm-vitals: the program check's reading and verdict types
-# (`program_check`) and the services' reading and fold (`services`), which
-# this crate's readers fill. A pure model crate with
-# no dependencies of its own.
+# (`program_check`), the services' reading and fold (`services`) and the
+# leftover judge's facts (`left`), which this crate's readers fill, and the
+# jobs engine's backed-up count (`jobs::HELD_AT_ONCE`), which
+# `process::HeldNow::backed_up` reads. A pure model crate with no
+# dependencies of its own.
 aterm-vitals = { workspace = true }
 
 [target.'cfg(any(unix, windows))'.dependencies]
 # aterm-sysprobe: `procargs`, the workspace's one `KERN_PROCARGS2` reader and
 # parser, which this crate re-exports and its `process` reads argv with; the
-# job probe's socket table decoders (`jobs::darwin::unix_listeners`,
-# `jobs::linux::listening_unix`, `parse_fd_link`), which the listener-holder
-# scan (`holders::scan_listener_holders`) reads the kernel's socket table with; on
+# job probe's socket table decoders (`jobs::darwin::unix_listeners`, Linux's
+# socket dump `linux::unix_diag_listeners`, `parse_fd_link`), which the
+# listener-holder scan (`holders::scan_listener_holders`) reads the kernel's
+# socket table with; the one `/proc/<pid>/stat` parser (`jobs::linux::parse_stat`); on
 # Windows, the one rule that places a kernel path under a directory across
 # Windows' spellings (`volumes::Table::is_under`, over the mount table it
 # reads): the path-user scan compares through it and nothing else; and the one
@@ -73,6 +76,13 @@ workspace = true
 # (`targo --unverified bench -p aterm-uds --bench spawn_cost`), never a gate.
 [[bench]]
 name = "spawn_cost"
+harness = false
+
+# What the spawn lock costs a spawn and a kept-out socket's creation under a spawn-heavy load:
+# a benchmark run by hand (`targo --unverified bench -p aterm-uds --bench spawn_lock_cost`),
+# never a gate.
+[[bench]]
+name = "spawn_lock_cost"
 harness = false
 
 # Explicit mounted-volume acceptance; not an ordinary test or a release dependency.

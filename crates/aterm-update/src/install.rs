@@ -61,7 +61,8 @@ const STALE_COPY_ATTEMPT_AFTER: std::time::Duration = std::time::Duration::from_
 
 fn copy_owner_gone(root: &Path) -> bool {
     let Some(pid) = crate::read_ledger_text(&root.join(COPY_OWNER))
-        .and_then(|text| text.trim().parse::<i32>().ok())
+        .and_then(|text| crate::parse_uint::<u32>(text.trim()))
+        .and_then(|pid| i32::try_from(pid).ok())
         .filter(|pid| *pid > 0)
     else {
         return false;
@@ -247,7 +248,7 @@ pub(crate) fn free_bytes_at(path: &Path) -> Option<u64> {
     if rc != 0 {
         return None;
     }
-    Some(u64::from(vfs.f_bavail) * vfs.f_frsize)
+    Some(u64::from(vfs.f_bavail).saturating_mul(vfs.f_frsize))
 }
 
 /// Refuse to unpack `needed` bytes into `dir` when the volume cannot hold them plus
@@ -391,7 +392,7 @@ fn take_expected_artifact() -> Result<Option<ExpectedArtifact>, String> {
         (Some(build), Some(commit), Some(digest)) => {
             let build = build
                 .to_str()
-                .and_then(|value| value.parse::<u64>().ok())
+                .and_then(crate::parse_uint::<u64>)
                 .ok_or_else(|| "expected update build is malformed".to_string())?;
             let commit = commit
                 .to_str()
@@ -658,7 +659,7 @@ fn read_trial_launchers(staging: &Staging, build: u64) -> Vec<RecordedLauncher> 
     let mut lines = text.lines();
     if lines
         .next()
-        .and_then(|line| line.trim().parse::<u64>().ok())
+        .and_then(|line| crate::parse_uint::<u64>(line.trim()))
         != Some(build)
     {
         return Vec::new();
@@ -667,8 +668,11 @@ fn read_trial_launchers(staging: &Staging, build: u64) -> Vec<RecordedLauncher> 
         .filter_map(|line| {
             let mut fields = line.split_whitespace();
             let launcher = TrialLauncher {
-                pid: fields.next()?.parse().ok()?,
-                started: (fields.next()?.parse().ok()?, fields.next()?.parse().ok()?),
+                pid: crate::parse_uint(fields.next()?)?,
+                started: (
+                    crate::parse_uint(fields.next()?)?,
+                    crate::parse_uint(fields.next()?)?,
+                ),
             };
             let witness = if fields.next() == Some(HEADLESS_LAUNCHER_MARK) {
                 crate::TrialWitness::Headless
@@ -723,9 +727,9 @@ fn trial_window_launch(staging: &Staging, build: u64, now: u64) -> WindowLaunch 
     };
     let mut fields = text.split_whitespace();
     let (Some(recorded), Some(digest), Some(at)) = (
-        fields.next().and_then(|field| field.parse::<u64>().ok()),
+        fields.next().and_then(crate::parse_uint::<u64>),
         fields.next(),
-        fields.next().and_then(|field| field.parse::<u64>().ok()),
+        fields.next().and_then(crate::parse_uint::<u64>),
     ) else {
         return WindowLaunch::None;
     };
@@ -735,7 +739,10 @@ fn trial_window_launch(staging: &Staging, build: u64, now: u64) -> WindowLaunch 
     if recorded != build || !armed || !this_trial {
         return WindowLaunch::None;
     }
-    if now.abs_diff(at) < WINDOW_TRIAL_HEADLESS_WAIT.as_secs() {
+    if now
+        .checked_sub(at)
+        .is_some_and(|age| age < WINDOW_TRIAL_HEADLESS_WAIT.as_secs())
+    {
         WindowLaunch::Waiting {
             until: at.saturating_add(WINDOW_TRIAL_HEADLESS_WAIT.as_secs()),
         }
@@ -817,13 +824,9 @@ impl WindowUnproven {
         let text = crate::read_ledger_text(&window_unproven_path(staging))?;
         let mut lines = text.lines();
         let mut fields = lines.next()?.split_whitespace();
-        let build = fields
-            .next()?
-            .parse::<u64>()
-            .ok()
-            .filter(|build| *build != 0)?;
+        let build = crate::parse_uint::<u64>(fields.next()?).filter(|build| *build != 0)?;
         let digest = canonical_digest(fields.next()?)?;
-        let at = fields.next()?.parse::<u64>().ok()?;
+        let at = crate::parse_uint::<u64>(fields.next()?)?;
         let install_root = PathBuf::from(lines.next()?);
         install_root.is_absolute().then_some(Self {
             build,
@@ -848,7 +851,10 @@ impl WindowUnproven {
     }
 
     const fn lapsed(&self, now: u64) -> bool {
-        now.abs_diff(self.at) >= WINDOW_TRIAL_HEADLESS_WAIT.as_secs()
+        match now.checked_sub(self.at) {
+            Some(age) => age >= WINDOW_TRIAL_HEADLESS_WAIT.as_secs(),
+            None => true,
+        }
     }
 }
 
@@ -2492,7 +2498,7 @@ impl UnprovenCandidate {
         {
             return Ok(RecordAt::Parsed(record));
         }
-        let meta = match std::fs::metadata(path) {
+        let meta = match std::fs::symlink_metadata(path) {
             Ok(meta) if meta.is_file() => meta,
             Ok(_) => return Ok(RecordAt::Absent),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -2518,11 +2524,11 @@ impl UnprovenCandidate {
         let mut lines = text.lines();
         let mut fields = lines.next()?.split_whitespace();
         let version = fields.next()?;
-        let wall_secs = fields.next()?.parse().ok()?;
+        let wall_secs = crate::parse_uint(fields.next()?)?;
         // A v1 record, written after its probe was killed, carries the wall clock alone.
         let awake_ms = match (version, fields.next()) {
             ("v1", None) | ("v2", Some("-")) => None,
-            ("v2", Some(ms)) => Some(ms.parse().ok()?),
+            ("v2", Some(ms)) => Some(crate::parse_uint(ms)?),
             _ => return None,
         };
         let bytes = aterm_codec::hex::decode_vec(lines.next()?.as_bytes())?;
@@ -3279,11 +3285,19 @@ fn central_directory_claim(
 }
 
 fn checked_zip_extraction_claim(zip: &Path) -> Result<ZipExtractClaim, String> {
-    let mut file = std::fs::File::open(zip).map_err(|error| format!("open update zip: {error}"))?;
-    let file_len = file
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(zip)
+        .map_err(|error| format!("open update zip: {error}"))?;
+    let meta = file
         .metadata()
-        .map_err(|error| format!("stat update zip: {error}"))?
-        .len();
+        .map_err(|error| format!("stat update zip: {error}"))?;
+    if !meta.is_file() {
+        return Err("update zip is not a regular file".to_string());
+    }
+    let file_len = meta.len();
     let (eocd_offset, classic) = find_end_of_central_directory(&mut file, file_len)?;
     let extent = match zip64_directory_extent(&mut file, eocd_offset)? {
         Some(zip64) => {
@@ -4066,7 +4080,7 @@ fn read_left_launchers(staging: &Staging, ready: &Ready) -> std::io::Result<Vec<
     let mut launchers = Vec::new();
     for line in lines {
         let mut fields = line.split_whitespace();
-        let mut field = || fields.next().and_then(|field| field.parse::<i64>().ok());
+        let mut field = || fields.next().and_then(crate::parse_uint::<i64>);
         let (Some(pid), Some(seconds), Some(micros), None) = (field(), field(), field(), field())
         else {
             return Ok(Vec::new());
@@ -4715,13 +4729,24 @@ fn supersede_activation_locked(
         }
     };
     let floor = match crate::manifest::Floor::read_for_gate(&staging.floor()) {
-        Ok(floor) => floor.min_build,
+        Ok(floor) => floor,
         Err(refusal) => return for_now(refusal),
     };
-    if newer_build < floor {
-        return settled(format!(
-            "the staged build {newer_build} is below the operator floor {floor} (yanked)"
-        ));
+    if let Some(why) = floor.withdraws(newer_build, ready.machine_id.as_deref()) {
+        return settled(format!("the staged {why}"));
+    }
+    match crate::manifest::artifact_quarantined_for_gate(staging, newer_build, &ready.dmg_sha256) {
+        Ok(true) => {
+            return settled(format!("the staged build {newer_build} is quarantined"));
+        }
+        Ok(false) => {}
+        Err(refusal) => return for_now(refusal),
+    }
+    if let Some(refusal) = ready.roster_authorization_stale(
+        unix_now_secs(),
+        aterm_update_core::pins::roster_tier_armed(),
+    ) {
+        return for_now(refusal);
     }
     if !is_non_symlink_dir(&staging.staged_app) {
         return for_now(format!(
@@ -4967,8 +4992,11 @@ impl KeptPredecessor {
             return None;
         }
         let holder = TrialLauncher {
-            pid: fields.next()?.parse().ok()?,
-            started: (fields.next()?.parse().ok()?, fields.next()?.parse().ok()?),
+            pid: crate::parse_uint(fields.next()?)?,
+            started: (
+                crate::parse_uint(fields.next()?)?,
+                crate::parse_uint(fields.next()?)?,
+            ),
         };
         let bytes = aterm_codec::hex::decode_vec(lines.next()?.as_bytes())?;
         if fields.next().is_some() || lines.next().is_some() || bytes.contains(&0) {
@@ -5178,7 +5206,7 @@ fn write_trial_launch_stamp(stamp: &Path, launch: TrialLauncher) -> std::io::Res
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(stamp);
     let mut file = match opened {
         Ok(file) => file,
@@ -5196,7 +5224,7 @@ pub(crate) fn read_trial_launch_stamp(stamp: &Path) -> Option<LaunchName> {
 
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(stamp)
         .ok()?;
     if !file.metadata().ok()?.is_file() {
@@ -5206,10 +5234,16 @@ pub(crate) fn read_trial_launch_stamp(stamp: &Path) -> Option<LaunchName> {
     file.take(TRIAL_LAUNCH_STAMP_MAX_BYTES + 1)
         .read_to_string(&mut text)
         .ok()?;
+    if text.len() as u64 > TRIAL_LAUNCH_STAMP_MAX_BYTES {
+        return None;
+    }
     let mut fields = text.strip_suffix('\n')?.split(' ');
     let name = LaunchName {
-        pid: fields.next()?.parse().ok()?,
-        started: (fields.next()?.parse().ok()?, fields.next()?.parse().ok()?),
+        pid: crate::parse_uint(fields.next()?)?,
+        started: (
+            crate::parse_uint(fields.next()?)?,
+            crate::parse_uint(fields.next()?)?,
+        ),
     };
     fields.next().is_none().then_some(name)
 }
@@ -5414,8 +5448,10 @@ fn owe_trial_launch(
         pid,
         started: (seconds, micros),
     } = name;
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let file = format!("{build}-{pid}-{seconds}-{micros}");
-    let tmp = dir.join(format!(".{file}.tmp-{}", std::process::id()));
+    let tmp = dir.join(format!(".{file}.tmp-{}-{seq}", std::process::id()));
     let written = made
         .and_then(|()| {
             write_private_file(
@@ -5445,10 +5481,13 @@ fn owe_trial_launch(
 
 fn parse_owed_give_back(text: &str) -> Option<(u64, LaunchName)> {
     let mut fields = text.strip_suffix('\n')?.split(' ');
-    let build = fields.next()?.parse().ok()?;
+    let build = crate::parse_uint(fields.next()?)?;
     let name = LaunchName {
-        pid: fields.next()?.parse().ok()?,
-        started: (fields.next()?.parse().ok()?, fields.next()?.parse().ok()?),
+        pid: crate::parse_uint(fields.next()?)?,
+        started: (
+            crate::parse_uint(fields.next()?)?,
+            crate::parse_uint(fields.next()?)?,
+        ),
     };
     fields.next().is_none().then_some((build, name))
 }
@@ -5962,15 +6001,23 @@ fn random_nonce() -> Option<String> {
     aterm_uds::rand::hex_token::<16>().ok()
 }
 
-fn write_private_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_private_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
-        .truncate(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(path)?;
+    if !f.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing to write non-regular file",
+        ));
+    }
+    f.set_len(0)?;
+    let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
     f.write_all(data)
 }
 

@@ -273,6 +273,9 @@ fn stale_shared_dispatch_preserves_a_newer_request_and_unreadable_state() {
     fs::write(bed.store.state_file(), before).unwrap();
 }
 
+/// One upkeep's sign-in pass on `bed`: whether a sign-in started, and how many runs were handed
+/// a browser. Off Unix aterm links no opener for a run's page (`cli::opener_link`), so a run
+/// that starts is handed none ([`RUNS_HANDED`]).
 fn progress(bed: &Bed) -> (bool, usize) {
     let store = &bed.store;
     let opener = bed.home.join(".local/bin/aterm-open-url");
@@ -316,12 +319,23 @@ fn progress(bed: &Bed) -> (bool, usize) {
     )
 }
 
+/// The runs a started sign-in is handed a browser for: one on Unix, none elsewhere, where aterm
+/// links no opener for its page (`cli::opener_link`; the sign-in ladder's
+/// `an_unattended_run_is_handed_nothing_where_aterm_links_no_opener`).
+#[cfg(unix)]
+const RUNS_HANDED: usize = 1;
+/// The runs a started sign-in is handed a browser for: one on Unix, none elsewhere, where aterm
+/// links no opener for its page (`cli::opener_link`; the sign-in ladder's
+/// `an_unattended_run_is_handed_nothing_where_aterm_links_no_opener`).
+#[cfg(not(unix))]
+const RUNS_HANDED: usize = 0;
+
 #[test]
 fn retiring_a_shared_selection_allows_another_account_in_the_same_upkeep() {
     let bed = Bed::new();
     bed.shared(accounts::shared::Outcome::Unknown);
     let before = bed.store.load_logins(NOW).unwrap().0.shared;
-    assert_eq!(progress(&bed), (true, 1));
+    assert_eq!(progress(&bed), (true, RUNS_HANDED));
     assert!(bed.store.load(NOW).unwrap().0.pending_pin.is_none());
     assert_eq!(bed.store.load_logins(NOW).unwrap().0.shared, before);
 }
@@ -385,7 +399,7 @@ pub(super) fn selection_transition(
         "Progress" => {
             let (progressed, calls) = progress(&bed);
             next.insert("phase", 4);
-            next.insert("progressed", i64::from(progressed && calls == 1));
+            next.insert("progressed", i64::from(progressed && calls == RUNS_HANDED));
         }
         _ => unreachable!(),
     }

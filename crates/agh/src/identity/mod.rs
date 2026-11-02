@@ -101,8 +101,9 @@ impl InlineToken {
     ///
     /// `LoadError::Malformed` or `LoadError::Unsupported`, as for a token file.
     pub fn new(token: Secret) -> Result<InlineToken, LoadError> {
-        let _ = token;
-        Err(LoadError::Unavailable("not yet: inline tokens land in WP1"))
+        let trimmed = token_bytes(token.expose())?;
+        TokenKind::of(trimmed)?;
+        Ok(InlineToken(std::sync::Arc::new(Secret::new(trimmed))))
     }
 
     /// `fingerprint(token)`.
@@ -174,8 +175,17 @@ impl Profile {
         login: impl Into<String>,
         token: InlineToken,
     ) -> crate::error::Result<Profile> {
-        let _ = (name, tier, login, token);
-        Err(crate::error::Error::not_yet("inline profiles", "WP1"))
+        let name = name.into();
+        if tier == Tier::Release {
+            return Err(crate::policy::Refusal {
+                code: crate::policy::RefusalCode::TierMismatch,
+                why: format!("an inline profile is never release tier: {name}"),
+                next: "hold a release-tier token in a token file named by agh.toml".to_string(),
+                tried: Vec::new(),
+            }
+            .into_error(None));
+        }
+        Ok(Profile::new(name, Source::Inline(token), tier).with_login(login))
     }
 
     /// Whether AghHost's loader honoured `legacy_loose` for this profile.
@@ -184,7 +194,7 @@ impl Profile {
         self.legacy_loose
     }
 
-    /// Set whether `legacy_loose` is honoured: `config::load_for_host` (WP1) and
+    /// Set whether `legacy_loose` is honoured: `config::load_for_host` and
     /// `provision::add_with` (WP8) are its two callers.
     pub(crate) fn set_legacy_loose(&mut self, on: bool) {
         self.legacy_loose = on;
@@ -227,6 +237,8 @@ pub struct Credential {
     fingerprint: String,
     secret: Secret,
     file_id: Option<(u64, u64)>,
+    /// Whether a `legacy_loose` read let a group or other read bit through (design §6.6).
+    loose: bool,
 }
 
 impl Credential {
@@ -260,6 +272,14 @@ impl Credential {
         self.file_id
     }
 
+    /// Whether the token file was read loose: a `legacy_loose` profile (design §6.6) whose
+    /// file or directory had a group or other read bit, which the host's lane logs as a
+    /// warning. False for a strict, env or inline load, and off unix.
+    #[must_use]
+    pub const fn loose_file(&self) -> bool {
+        self.loose
+    }
+
     /// Returns the raw token bytes for `door::AuthHeader` and the redactor.
     pub(crate) const fn expose(&self) -> &[u8] {
         self.secret.expose()
@@ -276,6 +296,7 @@ impl Credential {
             fingerprint: fingerprint(token),
             secret: Secret::new(token),
             file_id: None,
+            loose: false,
         }
     }
 }
@@ -682,15 +703,19 @@ impl std::fmt::Display for LoadError {
     }
 }
 
-/// Loads `profile`'s token under strict permission and shape rules.
+/// Loads `profile`'s token under strict permission and shape rules, except that a file source
+/// whose profile has `legacy_loose()` (`load_for_host`'s, design §6.6) may carry a group or
+/// other read bit on the file or its directory; an inline source's bytes are the ones
+/// `InlineToken::new` judged.
 ///
 /// # Errors
 /// Returns why the profile gave no credential.
 pub(crate) fn load(profile: &Profile, env: &dyn EnvSource) -> Result<Credential, LoadError> {
     match &profile.source {
+        Source::File(path) if profile.legacy_loose() => load_loose_file(profile, path),
         Source::File(path) => load_file(profile, path),
         Source::Env(var) => load_env(profile, env, var),
-        Source::Inline(_) => Err(LoadError::Unavailable("not yet: inline tokens land in WP1")),
+        Source::Inline(token) => credential_from(profile, token.0.expose(), None),
     }
 }
 
@@ -721,6 +746,42 @@ fn load_file(profile: &Profile, path: &Path) -> Result<Credential, LoadError> {
     };
     aterm_uds::secret::scrub(&mut buf);
     loaded
+}
+
+/// A file source whose profile has `legacy_loose()` (design §6.6, M2 only), on unix:
+/// `read_owned_into` a stack buffer, which is scrubbed whatever the outcome. A group or other
+/// read bit on the file or its directory is let through; everything else `load_file` refuses
+/// (another user's file, a link, a write bit for group or other) is refused alike.
+#[cfg(unix)]
+fn load_loose_file(profile: &Profile, path: &Path) -> Result<Credential, LoadError> {
+    use aterm_uds::private_file::{PrivateFileError, read_owned_into};
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
+    let name = path.file_name().and_then(std::ffi::OsStr::to_str);
+    let (Some(dir), Some(name)) = (dir, name) else {
+        return Err(LoadError::Malformed(NO_DIRECTORY));
+    };
+    let mut buf = [0u8; crate::config::TOKEN_MAX];
+    let loaded = match read_owned_into(dir, name, crate::config::TOKEN_MAX, &mut buf) {
+        Ok(read) => credential_from(profile, &buf[..read.len], Some((read.dev, read.ino))).map(
+            |mut credential| {
+                credential.loose = read.loose;
+                credential
+            },
+        ),
+        Err(PrivateFileError::Missing) => Err(LoadError::Missing),
+        Err(PrivateFileError::NotPrivate(why)) => Err(LoadError::Loose(why.to_string())),
+        Err(PrivateFileError::Symlink) => Err(LoadError::Symlink),
+        Err(PrivateFileError::Malformed(why)) => Err(LoadError::Malformed(why)),
+        Err(PrivateFileError::Io(e)) => Err(LoadError::Io(e.to_string())),
+    };
+    aterm_uds::secret::scrub(&mut buf);
+    loaded
+}
+
+/// Off unix no token file is read, loose or not.
+#[cfg(not(unix))]
+fn load_loose_file(profile: &Profile, path: &Path) -> Result<Credential, LoadError> {
+    load_file(profile, path)
 }
 
 /// A file source, off unix: no permission check, so no file credential.
@@ -790,6 +851,7 @@ fn credential_from(
         fingerprint: fingerprint(token),
         secret: Secret::new(token),
         file_id,
+        loose: false,
     })
 }
 

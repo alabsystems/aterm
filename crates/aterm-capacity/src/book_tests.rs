@@ -88,7 +88,123 @@ fn a_kept_peak_is_read_back_from_its_file() {
     assert_eq!(read, Some((5 * GIB, 2)));
     let blocked = dir.path().join("file");
     std::fs::write(&blocked, b"x").expect("a file");
-    assert!(Records::keep(&blocked.join("targo-memory.json"), k, GIB, 3).is_err());
+    assert!(Records::keep(&blocked.join("targo-memory.json"), k.clone(), GIB, 3).is_err());
+    #[cfg(unix)]
+    {
+        let link = dir.path().join("record-link.json");
+        std::os::unix::fs::symlink(&path, &link).expect("record symlink");
+        assert_eq!(Records::load(&link), Records::default());
+        let lock_link = lock_path(&dir.path().join("guarded.json"));
+        std::os::unix::fs::symlink(&blocked, &lock_link).expect("lock symlink");
+        assert!(Records::keep(&dir.path().join("guarded.json"), k, GIB, 4).is_err());
+    }
+}
+
+fn book_past_the_read_bound() -> Records {
+    let mut records = Records::default();
+    let long = "feature".repeat(4_682);
+    for i in 0..ROWS_KEPT {
+        let mut k = key("targo test", "/ck", &["a"]);
+        k.variant = Some(format!("features {i}-{long}"));
+        records.push(k, 64 * GIB, i as u64);
+    }
+    assert!(
+        records.encode().len() > 16 * 1024 * 1024,
+        "oversized fixture"
+    );
+    records
+}
+
+#[test]
+fn an_oversized_book_save_preserves_the_previous_readable_peaks() {
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let path = dir.path().join("book.json");
+    let k = key("targo test", "/ck", &["a"]);
+    let previous = with(&[(k.clone(), 64)]);
+    previous.save(&path).expect("ordinary readable book");
+    let bytes = std::fs::read(&path).expect("previous bytes");
+    assert_eq!(Records::load(&path), previous, "ordinary round trip");
+    let result = book_past_the_read_bound().save(&path);
+    assert_eq!(
+        result
+            .expect_err("a successful save must remain readable")
+            .kind(),
+        std::io::ErrorKind::FileTooLarge
+    );
+    assert_eq!(std::fs::read(&path).expect("preserved bytes"), bytes);
+    assert_eq!(Records::load(&path).learned(&k).unwrap().peak, 64 * GIB);
+}
+
+#[test]
+fn a_read_refused_book_is_not_relearned_as_empty_by_an_update() {
+    for kind in ["oversized", "non-text", "directory", "symlink"] {
+        if kind == "symlink" && !cfg!(unix) {
+            continue;
+        }
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let path = dir.path().join("book.json");
+        let target = dir.path().join("target.json");
+        let before = match kind {
+            "oversized" => Some(book_past_the_read_bound().encode().into_bytes()),
+            "non-text" => Some(vec![0xff, 0xfe]),
+            "symlink" => {
+                #[cfg(unix)]
+                {
+                    std::fs::write(&target, b"retained target").expect("target");
+                    std::os::unix::fs::symlink(&target, &path).expect("book symlink");
+                }
+                None
+            }
+            "directory" => {
+                std::fs::create_dir(&path).expect("directory book");
+                None
+            }
+            _ => unreachable!(),
+        };
+        if let Some(bytes) = &before {
+            std::fs::write(&path, bytes).expect("existing refused book");
+        }
+        assert_eq!(
+            Records::load(&path),
+            Records::default(),
+            "soft lookup: {kind}"
+        );
+        let mut changed = false;
+        let result = Records::update(&path, |records| {
+            changed = true;
+            records.push(key("targo test", "/ck", &["a"]), GIB, 3);
+            true
+        });
+        assert!(
+            result.is_err(),
+            "{kind}: update must preserve refused evidence"
+        );
+        assert!(!changed, "{kind}: no callback sees a fabricated empty book");
+        if let Some(bytes) = before {
+            assert_eq!(
+                std::fs::read(&path).expect("preserved bytes"),
+                bytes,
+                "{kind}"
+            );
+        } else if kind == "directory" {
+            assert!(path.is_dir());
+            assert_eq!(std::fs::read_dir(&path).unwrap().count(), 0);
+        } else {
+            assert!(
+                std::fs::symlink_metadata(&path)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(std::fs::read(&target).unwrap(), b"retained target");
+        }
+    }
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let path = dir.path().join("new/book.json");
+    let k = key("targo test", "/ck", &["a"]);
+    Records::keep(&path, k.clone(), 3 * GIB, 1).expect("missing book can be created");
+    Records::keep(&path, k.clone(), 5 * GIB, 2).expect("readable book can be updated");
+    assert_eq!(Records::load(&path).learned(&k).unwrap().peak, 5 * GIB);
 }
 
 const MIB: u64 = 1 << 20;
@@ -310,4 +426,60 @@ fn a_plain_builds_light_runs_never_push_its_heavy_peak_out() {
         !Records::default().light(&k, 1, 1),
         "a key with no record has no heavy peak"
     );
+}
+
+/// A key reads back whole from the one line of JSON it writes, with or without its selection and
+/// variant. NEGATIVE CONTROL: text that holds no key (no stage, a number for the checkout, not
+/// JSON) reads as none.
+#[test]
+fn a_key_reads_back_from_its_json() {
+    let mut k = key("targo test", "/w/ck", &["a", "b"]);
+    k.variant = Some("--tests".to_owned());
+    assert_eq!(Key::from_json(&k.to_json()), Some(k.clone()));
+    k.crates = None;
+    k.variant = None;
+    assert_eq!(Key::from_json(&k.to_json()), Some(k));
+    for text in [
+        r#"{"checkout":"/w"}"#,
+        r#"{"stage":"s","checkout":7}"#,
+        "key",
+    ] {
+        assert_eq!(Key::from_json(text), None, "{text}");
+    }
+}
+
+/// A WRITER HOLDS THE RECORD'S LOCK FROM ITS READ TO ITS WRITE: while `update` changes the
+/// records, another handle of the lock beside the file cannot take it, so a second writer, in this
+/// process or another, waits for the first and then reads what it wrote; once `update` returns,
+/// the lock is free, and a second keep adds its row beside the first. NEGATIVE CONTROL, by hand:
+/// with the lock not taken, the other handle took it inside the change.
+#[test]
+fn a_writer_holds_the_records_lock_from_its_read_to_its_write() {
+    use aterm_toolchain::record_lock::RecordLock;
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let path = dir.path().join("verify/stage-memory.json");
+    let other = || {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(lock_path(&path))
+            .expect("the lock file")
+    };
+    let wrote = Records::update(&path, |records| {
+        let taken = RecordLock::try_lock(other(), 0);
+        assert!(
+            matches!(taken, Err(std::fs::TryLockError::WouldBlock)),
+            "{taken:?}"
+        );
+        records.push(key("TestCompile", "/a", &["x"]), GIB, 1);
+        true
+    })
+    .expect("written");
+    assert!(wrote);
+    let free = RecordLock::try_lock(other(), 0);
+    assert!(free.is_ok(), "{free:?}");
+    drop(free);
+    Records::keep(&path, key("TestCompile", "/b", &["x"]), 2 * GIB, 2).expect("kept");
+    assert_eq!(Records::load(&path).rows().len(), 2);
 }

@@ -1137,7 +1137,7 @@ pub(crate) fn follows_vendor(layout: &Layout, spec: &VendorSpec) -> bool {
 
 fn installed(layout: &Layout, spec: &VendorSpec) -> Option<Installed> {
     let program = spec.program;
-    if layout.removed_programs().contains(program)
+    if layout.removed_programs().ok()?.contains(program)
         || crate::pin::is_pinned(layout, program)
         || crate::linkmode::is_linked(layout, program)
     {

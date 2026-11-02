@@ -7,7 +7,9 @@
 # real registry dependencies (core_maths -> libm, smallvec, log), not aterm's
 # first-party facades. skrifa runs here on macOS, whose shipped renderer uses
 # CoreText instead. Its Cargo.lock pins the versions aterm's own
-# lockfile held when the corpora were recorded.
+# lockfile held when the corpora were recorded; its aterm path crates move
+# with the workspace's version at each `ship release --bump`, so a `--locked`
+# run (and the Linux lane's read-only checkout) keeps working.
 #
 # ttf-parser is built with `gvar-alloc`, as aterm's Linux build shipped it
 # until LW.5 (winit's `wayland-csd-adwaita` -> sctk-adwaita -> ab_glyph turned

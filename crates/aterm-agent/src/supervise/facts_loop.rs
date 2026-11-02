@@ -153,7 +153,8 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// Types the session's untold no-progress fact at a settled background break when due.
+    /// Types the session's untold `aterm:` fact (a call at no progress, programs held at macOS's
+    /// program check) at a settled background break when due.
     pub(super) fn stuck_break(
         &mut self,
         screen: &Screen,
@@ -258,7 +259,7 @@ impl<C: Ctl> Session<'_, C> {
                 continue;
             }
             let at_ms = start_ms.saturating_sub(ago.max(0));
-            if kind == FactKind::NoProgress {
+            if matches!(kind, FactKind::NoProgress | FactKind::ProgramCheck) {
                 self.door_lined(at_ms);
             }
             self.break_lined(at_ms);

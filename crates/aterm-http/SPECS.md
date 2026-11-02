@@ -1,7 +1,7 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-http: spec recovery from its 106 unit tests
+# aterm-http: spec recovery from its unit tests
 
 > Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 18 tests it
 > deleted and 1 spec whose functions it deleted are gone, and the spec rows no longer cite those
@@ -80,7 +80,7 @@ only secondary specs too, and `provider-advertises-modern-schemes` has no test l
 
 ## 0. Notation used in the statements
 
-Function paths are relative to the crate (`uri::Uri::parse` means `aterm_http::uri::Uri::parse`).
+Function paths are relative to the crate (`uri::Uri::parse` is `aterm_http::uri::Uri::parse`).
 
 - `ci(a,b)`: ASCII case-insensitive equality (`eq_ignore_ascii_case`).
 - `tchar(b)`: `b` is ASCII alphanumeric or one of ``!#$%&'*+-.^_`|~`` (the RFC 9110 token character).
@@ -90,15 +90,14 @@ Function paths are relative to the crate (`uri::Uri::parse` means `aterm_http::u
 - **URL split.** For the text after the scheme prefix (`rest`): `A` = `rest` up to its first `'/'`, `'?'`
   or `'#'` (all of `rest` if there is none), and `tail` = what follows `A`. `F` = `tail` up to its first
   `'#'`. `origin(F)` = `"/"` if `F` is empty, `"/" + F` if `F` starts with `'?'`, otherwise `F`.
-- **PEM scan.** `BEGIN = "-----BEGIN "`, `END = "-----END "`, `SUF = "-----"`. `Scan(text)` repeats:
-  find the first `BEGIN` in the remaining text; the label `L` runs to the next `SUF`; the body runs to
-  the first `END + L + SUF`; resume after that marker. `W(body)` = the body with every Unicode
-  whitespace char removed. `ScanLossy` is the same scan, except that it **stops** (yielding nothing
-  more) at a block whose begin line has no `SUF` or whose end marker is missing.
+- **PEM scan.** `ScanLossy(text)` repeats: find the first `"-----BEGIN "` in the remaining text; the
+  label `L` runs to the next `"-----"`; the body runs to the first `"-----END " + L + "-----"`; resume
+  after that marker. It stops, yielding nothing more, at a begin line with no `"-----"` or a missing
+  end marker. `W(body)` is the body with every Unicode whitespace char removed.
 - `EnvText(env,n)` = `env.var_os(n)`, converted lossily (each bad sequence becomes U+FFFD) and trimmed;
   `None` if unset or empty after trimming.
 - **Clock model.** `Instant::now()` is a monotone abstract clock. `Deadline::after(b)` taken at `t0`
-  sets `at = t0 + b`.
+  sets `at = t0 + b` (`stream::later`; `t0 + FAR_FUTURE` if that overflows).
 - `Obs(stream)`: the sequence of socket syscalls (`connect`, `set_*_timeout`, `read`, `write`, `flush`)
   issued on the `TcpStream`, including those rustls issues through `Bounded`.
 - `FS`: an abstract filesystem model (`exists`, `read_dir`, `metadata`, `read_to_string`) for the
@@ -116,14 +115,19 @@ Function paths are relative to the crate (`uri::Uri::parse` means `aterm_http::u
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes (primary tests; secondary in §2)`,
-`difficulty (Rust features the proof must handle)`, `blocking_gaps`.
+Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (primary tests; `-` or "secondary only"
+when §2 names it only under `also`), `difficulty` (Rust features the proof must handle), and
+`blocking_gaps`: rows of the gap table in `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7. 0 is
+the seal upgrade (every row), 1 non-scalar carriers, 2 `&self`/`&mut` views, 3 E6 body widening, 4
+callee-ensures composition, 5 quantified clauses, 7 loops, 8 effects/FFI, 10 model→code refinement, 11
+generics, 12 cross-crate citation (`aterm_codec`, rustls, webpki, ring), 13 closures, threads and
+`OnceLock`.
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
 uri-parse-accept-set	contract	uri::Uri::parse, uri::{strip_prefix_ascii_ci, split_authority, parse_port, parse_port_digits, host_is_plausible}	∀ text: Uri::parse(text).is_some() ⇔ (a) 1 ≤ text.len() ≤ 8192; (b) no char c has c.is_control() or c == ' '; (c) text starts with "https://" or "http://" under ci (https tried first), rest = what follows; (d) A is non-empty and has no '@'; (e) A is either the bracket form "[" h "]" T (h = text before the first ']', non-empty, parses as Ipv6Addr; T empty or ":" P) or the plain form with at most one ':', host H before it non-empty with every byte ASCII alphanumeric or one of - . _ ~ %, and port text P after it; P, when present, is non-empty ASCII digits with 1 ≤ val_10(P) ≤ 65535. Corollaries: userinfo is rejected, never stripped; CR, LF or NUL anywhere, a non-http(s) scheme, an unbracketed IPv6 literal and a port that is 0, empty or out of range are all rejected.	userinfo_is_rejected_rather_than_stripped, control_characters_and_spaces_cannot_smuggle_a_header, only_http_and_https_are_accepted, malformed_authorities_are_rejected	&str slicing, chars()/bytes() with closures, find with a char-array pattern, split(':'), std parse::<Ipv6Addr> and ::<u16>, Option ? chaining	0,1,3,5,7,13
 uri-parse-fields	contract	uri::Uri::parse, uri::origin_form, uri::Uri::{scheme, host, port, path_and_query, authority_as_written}	∀ text with Uri::parse(text) = Some(u), using the decomposition of uri-parse-accept-set: u.scheme() = Https ⇔ the https:// prefix matched (ci); u.authority_as_written() = A byte for byte, brackets included; u.host() = h (unbracketed) in the bracket form, H in the plain form; u.port() = val_10(P) if P is present, else u.scheme().default_port(), and explicit_port ⇔ P is present; u.path_and_query() = origin(F) byte for byte (no percent-decoding or re-encoding; the fragment is dropped). Invariant: path_and_query starts with '/', and neither it nor host contains a control char or a space.	parses_a_loopback_and_a_remote_endpoint, missing_path_becomes_root_and_a_bare_query_keeps_it, a_fragment_is_dropped_and_never_reaches_the_request_line, percent_encoding_is_carried_through_verbatim, ipv6_literals_round_trip_through_brackets, the_raw_authority_and_bare_path_are_available_for_agreement_checks	String/&str contents (not just lengths), struct field views, split/starts_with/format!	0,1,2,3,5,7
-uri-render	contract	uri::Uri::{host_header, authority, path}, uri::Scheme::{default_port, as_str}	∀ u: u.host_header() = bracket(u.host) + (":" + dec(u.port) if u.explicit_port ∧ u.port ≠ u.scheme.default_port(), else ""); u.authority() = bracket(u.host) + ":" + dec(u.port); u.path() = the prefix of u.path_and_query before its first '?' (all of it if none). default_port(Http) = 80, as_str(Http) = "http"; default_port(Https) = 443, as_str(Https) = "https".	(secondary only; see §2)	&self views of String fields, format!, contains(':'), split('?')	0,1,2,3; fragment: `uri::Scheme::default_port` F1+D2b (VF5 first target, docs/PLAN-tests-to-specs-2026-10-15.md "F1-ready specs").
+uri-render	contract	uri::Uri::{host_header, authority, path}, uri::Scheme::{default_port, as_str}	∀ u: u.host_header() = bracket(u.host) + (":" + dec(u.port) if u.explicit_port ∧ u.port ≠ u.scheme.default_port(), else ""); u.authority() = bracket(u.host) + ":" + dec(u.port); u.path() = the prefix of u.path_and_query before its first '?' (all of it if none). default_port(Http) = 80, as_str(Http) = "http"; default_port(Https) = 443, as_str(Https) = "https".	(secondary only; see §2)	&self views of String fields, format!, contains(':'), split('?')	0,1,2,3; fragment: `uri::Scheme::default_port` F1+D2b (VF5 first target, docs/PLAN-tests-to-specs-2026-10-15.md "F1-ready specs", row 41). Proved via mirror: Clean R213 row `uri_scheme_default_port` (`RowProvedB3` over a verbatim copy, with a false-clause control); not yet credited: Trust's compiler mints no calculus row until it pins a VF5 base (E4.7).
 pem-lossy	contract	pem::decode_certificates_lossy	∀ text: decode_certificates_lossy(text) terminates and never panics (decreases rest.len()), and equals the in-order list of d_i over the blocks of ScanLossy(text) with L_i = "CERTIFICATE" and aterm_codec::base64::decode(W(body_i)) = Ok(d_i), d_i non-empty. Any other label (TRUSTED CERTIFICATE, PRIVATE KEY, …) and any undecodable or empty CERTIFICATE block contributes nothing; an unterminated begin line or a missing end marker ends the scan.	the_lossy_parser_drops_undecodable_blocks_and_keeps_going, the_lossy_parser_terminates_on_every_malformed_input, the_lossy_parser_skips_an_aux_info_block	loop with a decreases measure, let-else, if-let chains, &str slicing, Vec, cross-crate base64 decode	0,1,3,5,7,12
 proxy-resolve-selection	contract	proxy::resolve, proxy::env_text	∀ mode, target t, env: (1) resolve(Direct, t, env) = Ok(None) and env.var_os is never called. (2) resolve(Environment, t, env): let np = EnvText(env, NO_PROXY), else EnvText(env, no_proxy); if no_proxy_matches(t, np) then Ok(None). (3) Otherwise take the first n in [HTTPS_PROXY, https_proxy] (t https) or [HTTP_PROXY, http_proxy] (t http), then [ALL_PROXY, all_proxy], with EnvText(env, n) = Some(raw); the result is parse_proxy(n, raw).map(Some). (4) No such n: Ok(None). A set but unusable value (including non-Unicode, read as text with U+FFFD) decides the outcome: it is never skipped for a later variable and never becomes a direct connection.	direct_mode_ignores_every_proxy_variable, scheme_selects_the_variable, uppercase_wins_over_lowercase_and_lowercase_is_a_fallback, all_proxy_is_the_fallback_after_the_schemes_own_variable, absent_configuration_is_a_direct_connection, an_unusable_proxy_setting_is_an_error_naming_the_variable_not_a_direct_connection, a_value_that_is_not_valid_unicode_fails_closed_naming_its_variable	generic E: EnvSource (abstract oracle), OsString::to_string_lossy, trim, into_iter().chain().find_map with closures	0,1,3,4,5,11,13
 proxy-parse	contract	proxy::parse_proxy, proxy::ProxyTarget::{uri, basic_auth}	∀ name, raw: parse_proxy(name, raw) = Ok(pt) ⇔ raw.len() ≤ 8192; no char of raw is a control char, ' ' or U+FFFD; raw starts with "http://" (ci), rest = what follows; with auth = rest up to its first '/', '?' or '#' and tail the remainder: if auth contains '@', split at its LAST '@' into userinfo and HP, and userinfo at its FIRST ':' into u and p (p = "" with no ':'), requiring userinfo ≠ "", pct::decode(u) free of ':' and U+FFFD, and pct::decode(p) free of U+FFFD; with no '@', HP = auth; and Uri::parse("http://" + HP + tail) = Some(x). Then pt.uri() = x, and pt.basic_auth() = Some(base64(pct::decode(u) + ":" + pct::decode(p))) when userinfo is present, else None.	userinfo_becomes_a_basic_credential_and_leaves_the_proxy_uri, a_credential_escape_that_is_not_utf8_is_refused_not_altered	split/rsplit_once/split_once, closures, format!, cross-crate aterm_codec pct::decode and base64::encode, composition with Uri::parse ensures	0,1,3,4,5,12
@@ -155,7 +159,7 @@ platform-verifier-conformance	refinement	<verifier::PlatformVerifier as ServerCe
 unix-store-fail-closed	contract	verifier::unix::Verifier::{from_ders, new}	∀ extra, sys, provider: some extra root rejected by RootCertStore::add → from_ders is Err (strict); otherwise S = extra ∪ {d ∈ sys | webpki parses d} (unparseable system roots skipped); S empty → Err(General(m)) with m containing "system trust store"; webpki builder failure → Err(General("system trust store is unusable: ...")); otherwise Ok with a verifier over exactly S. Verifier::new(extra, p) = from_ders(extra, system_root_ders(), p): either Ok or that loud Err, never a verifier over an empty store.	verifier::unix::{an_empty_system_store_is_a_loud_failure_not_a_silent_verifier, unparseable_system_roots_are_skipped_but_do_not_take_the_store_with_them, an_unusable_extra_anchor_is_an_error_rather_than_a_skip, the_shipped_constructor_reads_this_hosts_store}	for loop over Vec, rustls RootCertStore, Result mapping, fs effects in new()	0,1,7,8,12
 unix-cert-path-selection	contract	verifier::unix::{bundle_file, bundle_dirs, system_root_ders, collect_ders, read_pem_file}	Against FS: bundle_file(Some(p)) = Some(p) ⇔ FS.exists(p), else None (never a fallback to the built-in list); bundle_file(None) = the first existing path in CERTIFICATE_FILES; bundle_dirs(Some(l)) = [q ∈ split_paths(l) in order | q ≠ "" ∧ FS.exists(q)]; bundle_dirs(None) = the existing CERTIFICATE_DIRS in order; system_root_ders consults NEITHER built-in list when SSL_CERT_FILE is set, or SSL_CERT_DIR is set with a non-empty entry; collect_ders(f, ds) = sort_dedup(lossy(f) ++ concat over d ∈ ds and regular files e in d (symlinks followed; dangling or unreadable skipped) of lossy(e)), where lossy(x) = decode_certificates_lossy(read_to_string(x)), or [] when x is not readable as UTF-8.	verifier::unix::{a_configured_path_replaces_the_built_in_search, a_configured_cert_dir_is_a_list_of_directories, the_built_in_search_finds_this_machines_real_bundle}	PathBuf/OsString, std::fs (exists, read_dir, metadata, read_to_string), env::var_os, split_paths, iterator closures, Vec sort/dedup	0,1,7,8,13
 method-head-framing	table-property	client::decide_framing, client::Framed::{read, declared_len}	∀ method, status, hs with status ≠ 101: decide_framing(method, status, hs) = Ok(Empty) whenever method = Head or status ∈ 100..=199 or status ∈ {204, 304}, whatever framing headers hs carries; a final 101 is refused whatever the method (decide-framing-table rule 0); for every other (method, status) the rules of decide-framing-table apply unchanged. An Empty body yields 0 bytes on every read without reading the stream, and declared_len() = Some(0).	methods::a_head_answer_that_declares_a_length_reads_as_an_empty_body_at_once, methods::no_content_and_not_modified_read_as_empty_whatever_they_declare	enum match on Method, matches! over status ranges, &[(String,String)] view, a reader left untouched	0,1,3,5,7,13
-bodiless-no-content-length	contract	client::RequestBuilder::exchange_with_env, client::render_fields, client::Method::{takes_body, always_sends_length}, client::Body::len	∀ method m, body b with n = b.len(): the head carries "Content-Length: " + dec(n) + "\r\n" ⇔ m ∈ {Post, Patch, Put} ∨ (m = Delete ∧ n > 0), and none otherwise; m ∈ {Get, Head} ∧ n > 0 → Err(SendError { phase: NotSent, error: Invalid("a " + m.as_str() + " carries no body") }) before proxy::resolve and before any connector.connect call.	methods::get_and_head_carry_no_content_length, methods::delete_carries_a_length_only_with_a_body, methods::post_patch_and_put_carry_a_zero_length_when_empty, methods::a_body_on_a_get_or_head_is_refused_before_any_connection	enum carriers (Method, Body with a &mut dyn Read), Option<u64>, the connect effect ordered after the check	0,1,3,4,8; fragment: `client::Method::{takes_body,always_sends_length}` F1+D2b (VF5 first target, docs/PLAN-tests-to-specs-2026-10-15.md "F1-ready specs").
+bodiless-no-content-length	contract	client::RequestBuilder::exchange_with_env, client::render_fields, client::Method::{takes_body, always_sends_length}, client::Body::len	∀ method m, body b with n = b.len(): the head carries "Content-Length: " + dec(n) + "\r\n" ⇔ m ∈ {Post, Patch, Put} ∨ (m = Delete ∧ n > 0), and none otherwise; m ∈ {Get, Head} ∧ n > 0 → Err(SendError { phase: NotSent, error: Invalid("a " + m.as_str() + " carries no body") }) before proxy::resolve and before any connector.connect call.	methods::get_and_head_carry_no_content_length, methods::delete_carries_a_length_only_with_a_body, methods::post_patch_and_put_carry_a_zero_length_when_empty, methods::a_body_on_a_get_or_head_is_refused_before_any_connection	enum carriers (Method, Body with a &mut dyn Read), Option<u64>, the connect effect ordered after the check	0,1,3,4,8; fragment: `client::Method::{takes_body,always_sends_length}` F1+D2b (VF5 first target, docs/PLAN-tests-to-specs-2026-10-15.md "F1-ready specs", row 40). Proved via mirror: Clean R213 rows `http_takes_body`, `http_always_sends_length` (`RowProvedB3` over a verbatim copy, with a false-clause control); not yet credited: Trust's compiler mints no calculus row until it pins a VF5 base (E4.7).
 caller-accept	contract	client::render_fields, client::RequestBuilder::secret_header	∀ m, t, via, hs, cl: render_fields(m, t, via, hs, cl) writes "Accept: */*\r\n" right after the Content-Length position ⇔ no (k, _) ∈ hs has ci(k, "accept"); a caller Accept is written in its own place among hs, so the default never sits beside a caller's Accept, and with at most one caller Accept the head carries exactly one Accept line. render_head adds no Accept after them: secret_header refuses the name accept (secret-header-scrub).	methods::the_caller_owns_accept, streaming::a_secret_header_with_a_reserved_name_is_refused_before_any_connect	String building, iterator any over a Vec of pairs with a closure	0,1,3,5,7,13
 header-iteration	contract	client::{header_pairs, header_values}, client::Response::{headers, header_all, header}, client::Exchange::{headers, header_all, header}	∀ r (Response or Exchange), n: r.headers() yields r's (name, value) pairs in wire order, each name as sent; r.header_all(n) yields the value of every pair (k, v) with ci(k, n), in order (repeated headers each once); r.header(n) = r.header_all(n).next().	methods::headers_keep_their_order_and_repeated_ones_are_all_returned	impl Iterator returns over &self, filter/map closures, two lifetimes	0,1,2,5,13
 streamed-body-framing	refinement	client::Framed::{read, read_chunked, count}, client::{chunk_line, read_uninterrupted, body_error, read_to_end, send_body}, client::BodyReader::{read, consumed, declared_len}	∀ framing f, limit L, byte input B: the bytes a BodyReader yields over its reads, concatenated, equal the body response-body-framing decodes from B, and consumed() is their count after every read. Length(n) with n > L, and any read or chunk size (checked with checked_add before its data is read) that would take consumed past L, fail io::Error::other(Error::TooLarge { limit: L }); EOF before the framing's end fails UnexpectedEof; malformed chunk framing fails InvalidData carrying Error::Protocol; each chunk framing line is at most MAX_HEADER_LINE bytes and the trailer section at most MAX_HEADER_BYTES. send() maps a body failure through body_error to the Error inside it, so its values are response-body-framing's; read_to_end reserves at most min(declared, PREALLOC_CAP) bytes up front, through try_reserve_exact, so no declared length panics or aborts on allocation. BodyReader and Exchange are Send + 'static. Uploads: Body::Reader { len, reader } writes exactly len bytes and never asks the reader past len; a reader that ends at k < len fails Io(UnexpectedEof, "the body reader ended at " + dec(k) + " of " + dec(len) + " bytes") at Sent, and a reader whose read fails e (other than Interrupted, which is retried) at k fails Io(Other, "the body reader failed at " + dec(k) + " of " + dec(len) + " bytes: " + e) at Sent, so no reader error reads as a socket's (is_revoked() is false). An Interrupted read inside a chunk framing line is retried there, never returned, so a caller's retry cannot resume a line mid-way.	streaming::a_streamed_upload_arrives_whole_with_its_length, streaming::a_mebibyte_answer_reads_incrementally, streaming::a_chunked_mebibyte_in_small_chunks_reads_whole, streaming::a_body_cut_short_is_unexpected_eof, streaming::bad_chunk_framing_is_invalid_data, streaming::a_body_past_the_limit_is_too_large_inside_the_io_error, streaming::exchange_and_body_reader_are_send, streaming::a_failing_body_reader_is_never_read_as_the_socket_failing, a_declared_length_near_usize_max_is_a_short_body_not_an_allocation, an_interrupted_read_inside_a_chunk_size_line_loses_no_framing	a decoder state machine across calls (&mut self), generic R: BufRead, u64/usize conversions, a boxed error inside io::Error and its downcast	0,1,2,3,4,5,7,8,11
@@ -221,7 +225,8 @@ come last; the conformance spec needs the X.509 model `V`. The agh rows (2026-10
 
 ## 2. Test → spec map (TSV)
 
-`primary` is the spec that retires the test. `also` lists the other specs the same test samples.
+`primary` is the spec that retires the test. `also` lists the other specs the same test samples. A test
+leaves the suite only when every spec in its row is proved.
 
 ```tsv
 file	test	primary	also
@@ -375,7 +380,7 @@ tests/tls_stream.rs	an_answer_sent_before_the_peer_closed_over_a_failed_write_is
 tests/tls_stream.rs	authority_revoked_during_a_tls_read_stops_it	stream-admit-before-every-syscall	
 ```
 
-## 3. Coverage
+## 3. Open findings
 
 - 106 tests read. 102 mapped to one of the 35 specs and 4 were not spec samples (§4). After the
   deletions since, 88 map to one of the 33 specs; five more (the three in `src/connect.rs`, one in
@@ -400,10 +405,20 @@ tests/tls_stream.rs	authority_revoked_during_a_tls_read_stops_it	stream-admit-be
   example, `framing_refuses_every_response_whose_end_is_ambiguous` waits on both
   `decide-framing-table` and `http-number-grammar`.
 
-## 4. Tests that are not spec samples
+## 4. Proof order
 
-Status (2026-10-16): none is left. The 2 tests this section marked **delete** and the 2 it marked
-**move-to-bench** are deleted from the crate, and their rows are gone from it and from §2.
+Dependencies: `http-number-grammar`, `uri-render` and `error-is-revoked` → `uri-parse-accept-set` /
+`uri-parse-fields` → `proxy-parse`, `proxy-refusal-names-variable-never-value`, `no-proxy-match` →
+`proxy-resolve-selection`. `aterm_codec::base64`'s specs → `pem-lossy` → `client-config-roots-fail-closed`,
+`unix-cert-path-selection` → `unix-store-fail-closed`. On the wire: `header-validation-grammar`,
+`response-header-fields`, `status-line-grammar` → `read-head-skips-interim` + `decide-framing-table` →
+`response-body-framing`, `response-parse-no-panic` → `render-request-exact`, `connect-tunnel-exchange`
+→ `deadline-remaining`, `stream-admit-before-every-syscall` → `send-pipeline-order`. Then
+`decide-framing-table` → `method-head-framing`; `response-body-framing` → `streamed-body-framing`;
+`render-request-exact` → `bodiless-no-content-length`, `caller-accept`; `response-accessors` →
+`header-iteration`; `deadline-remaining` → `idle-deadline`, `dns-bounded` → `phase-classification`;
+`header-validation-grammar` and aterm-uds's `Secret` → `secret-header-scrub`. The verifier specs come
+last; `platform-verifier-conformance` needs the model `V`.
 
 No test is a pure regression of a removed bug with no general property; every regression-shaped test (header smuggling, the usize chunk-size wrap, the dribbling
 TLS peer) is an instance of a spec above.

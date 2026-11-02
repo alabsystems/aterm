@@ -3,7 +3,8 @@
 
 use crate::supervise::journal::{AGAIN_ADOPTED, AGAIN_RETRY, AGAIN_UNPARKED};
 use crate::supervise::policy::turn_end::{
-    DONE_CHECK, LAND, RULE_CONTINUE, RULE_DONE_CHECK, RULE_LAND, RULE_LAND_NUDGE, RULE_LEFT,
+    DONE_CHECK, LAND, LAND_CHECK, RULE_CONTINUE, RULE_DONE_CHECK, RULE_LAND, RULE_LAND_CHECK,
+    RULE_LAND_NUDGE, RULE_LEFT,
 };
 
 fn worked(said: &str) -> Vec<String> {
@@ -22,17 +23,19 @@ fn under(policy: SupervisorConfig) -> SuperviseOpts {
 }
 
 #[test]
-fn the_sessions_land_word_types_the_land_instruction_and_a_clean_defense_lands() {
+fn the_sessions_land_word_types_the_land_instruction_and_its_checks_landed_lands() {
     let (dir, journal) = journal_file("autopilot-land");
     let mut m = Mock::new(vec![
         busy_screen(),
         worked("Fixed the parser; the suite is green."),
         busy_screen(),
         worked("Nothing left: all of it is merged into the remote main branch."),
+        busy_screen(),
+        worked("LANDED"),
     ]);
     m.history_served();
     m.autopilot = Some("land");
-    m.turn_releases = Some(1);
+    m.turn_gates = vec![1, 3];
     m.vanish_after = Some(4);
     let opts = SuperviseOpts {
         journal: Some(journal.clone()),
@@ -45,9 +48,16 @@ fn the_sessions_land_word_types_the_land_instruction_and_a_clean_defense_lands()
     assert!(LAND.starts_with(&typed[0][head.len()..]), "{lines:#?}");
     assert_eq!(
         count(&m, "turn"),
-        1,
-        "the instruction alone: {:#?}",
+        2,
+        "the instruction, then the land check: {:#?}",
         m.requests
+    );
+    let check = format!("CONTINUED seq=104 rule={RULE_LAND_CHECK} ");
+    let checked: Vec<&String> = lines.iter().filter(|l| l.starts_with(&check)).collect();
+    assert_eq!(checked.len(), 1, "{lines:#?}");
+    assert!(
+        LAND_CHECK.starts_with(&checked[0][check.len()..]),
+        "{lines:#?}"
     );
     let turn = continue_request(LAND);
     let at = m
@@ -69,7 +79,7 @@ fn the_sessions_land_word_types_the_land_instruction_and_a_clean_defense_lands()
         .collect();
     assert_eq!(done.len(), 1, "{done:#?}");
     assert!(
-        done[0].starts_with(&format!("DONE seq=104 rule={RULE_LAND} ")),
+        done[0].starts_with(&format!("DONE seq=106 rule={RULE_LAND} ")),
         "{done:#?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -404,6 +414,90 @@ fn run_lifted(
     let said = journaled(&journal);
     let _ = std::fs::remove_dir_all(&dir);
     (count(&m, "turn"), said, lines)
+}
+
+/// A LOOP STARTED AS THE SESSION'S OFF LIFTED, ITS BOOKS EMPTY, CARRIES A PERSON'S QUICK TURN
+/// UNDER LAND (D2-2): the session ran under Off, unjudged, so the turn the lifted loop first reads
+/// busy is a message mid-session, and Land types its instruction after the reply. CONTROLS: the
+/// same screens under a loop that was not lifted (the session's first loop, or none hosted) are
+/// the session's opening exchange, left to the person (`LEFT`), as is a lifted loop's point that
+/// shows the program's launch card over the one message (R1). MUTANT: with the opening read out of
+/// `TurnEndState::observe`, that opening is carried and Land types its instruction.
+#[test]
+fn a_loop_lifted_off_off_carries_a_persons_quick_turn_under_land() {
+    let quick = answered(
+        &["❯ what did you change?"],
+        "I edited parser.rs and lexer.rs; neither is committed yet.",
+        Some("5s"),
+    );
+    let opening = answered(
+        &[
+            " ▐▛███▛█   Claude Code v2.1.312",
+            "▝▜██████▀  Opus 5.5 · Claude Max",
+            " ▝▝   ▝▝   /w",
+            "",
+            "❯ what does this repo do?",
+        ],
+        "It is a terminal emulator written in Rust.",
+        Some("5s"),
+    );
+    let run = |screen: &Vec<String>, lifted: Option<bool>, tag: &str| {
+        let (dir, journal) = journal_file(tag);
+        // The session's books, as the host keeps them for every tab: empty, as Off left them.
+        let ledger = dir.join("ledger.jsonl");
+        std::fs::write(&ledger, "").expect("ledger");
+        let mut m = Mock::new(vec![busy_screen(), screen.clone()]);
+        m.autopilot = Some("land");
+        m.turn_releases = Some(1);
+        m.vanish_after = Some(8);
+        m.human = vec!["3000"];
+        let opts = SuperviseOpts {
+            policy: SupervisorConfig {
+                human_grace_s: 0,
+                ..owners_policy()
+            },
+            journal: Some(journal.clone()),
+            idle_host: lifted.map(|l| Arc::new(Lifted(l)) as Arc<dyn IdleHost>),
+            ..auto(1)
+        };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_turn_end_timing(TurnEndTiming {
+                short_backoff: Duration::from_millis(30),
+                short_backoff_max: Duration::from_millis(60),
+                ..TurnEndTiming::default()
+            });
+            s.set_approval_ledger(Some(ledger.clone()));
+        });
+        let said = journaled(&journal);
+        let _ = std::fs::remove_dir_all(&dir);
+        (count(&m, "turn"), said, lines)
+    };
+    let (turns, said, lines) = run(&quick, Some(true), "autopilot-lifted-quick");
+    assert!(turns >= 1, "{lines:#?} {said:#?}");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains(&format!("rule={RULE_LAND} "))),
+        "{lines:#?}"
+    );
+    assert!(!said.iter().any(|l| l.starts_with("LEFT ")), "{said:#?}");
+    for (lifted, tag) in [
+        (Some(false), "autopilot-restarted-quick"),
+        (None, "autopilot-first-quick"),
+    ] {
+        let (turns, said, lines) = run(&quick, lifted, tag);
+        assert_eq!(turns, 0, "{tag}: {lines:#?}");
+        assert!(
+            said.iter().any(|l| l.starts_with("LEFT ")),
+            "{tag}: {said:#?}"
+        );
+    }
+    let (turns, said, lines) = run(&opening, Some(true), "autopilot-lifted-opening");
+    assert_eq!(turns, 0, "the opening exchange: {lines:#?}");
+    assert!(
+        said.iter().any(|l| l.starts_with("LEFT ")),
+        "the opening exchange: {said:#?}"
+    );
 }
 
 fn continued(case: &str, (turns, said, lines): &(usize, Vec<String>, Vec<String>)) {
@@ -1307,6 +1401,8 @@ fn an_off_parks_badges_come_down_each_with_its_cleared_line() {
                 reset_text: "-".to_string(),
                 extended: false,
                 raised: true,
+                worked: false,
+                message: String::new(),
             });
         },
         "limited: You've hit your session limit",
@@ -1542,6 +1638,66 @@ fn a_limit_badge_is_a_wait_only_where_the_loop_waits_it_out() {
     }
 }
 
+/// The usage tap times the standing wall at another reset than the open limit episode holds
+/// (`Session::limit_retimed`): the episode takes the tap's, earlier as later, since the loop waits
+/// to that one (a reset the notice placed a minute later moves back to the tap's exact one). A badge
+/// raised for the wall is raised again when the tap's reset changes whether the harness waits the
+/// wall out (a cut wall's first reset inside the horizon: an ask becomes a wait); one outside it
+/// changes nothing, and a handled wall raised no badge to raise again.
+#[test]
+fn the_taps_reset_retimes_the_limit_episode_and_its_raised_badge() {
+    let message = "You've hit your session limit";
+    let kind = aterm_phase::WallKind::UsageSession;
+    let key = crate::supervise::approvals::wall_reset_key(kind, None);
+    let run = |held: Option<i64>, tap: i64, raised: bool| {
+        let mut m = Mock::new(vec![limited_screen()]);
+        let mut notes = Notes::default();
+        let ep = {
+            let mut s = session(&mut m, None);
+            s.set_clock(TEST_NOW, PDT);
+            s.resume_limits = true;
+            s.limit = Some(Episode {
+                seq: 90,
+                resumes_itself: false,
+                reset_unix: held,
+                reset_text: "-".to_string(),
+                extended: false,
+                raised,
+                worked: false,
+                message: message.to_string(),
+            });
+            s.wall_reset = Some((key.clone(), held));
+            s.seed_tap(key.clone(), kind, message, tap, TEST_NOW);
+            let mut deadline = Instant::now();
+            assert_eq!(s.limit_retimed(91, &mut deadline, &mut notes), Ok(()));
+            s.limit.clone()
+        };
+        (
+            ep.and_then(|ep| ep.reset_unix),
+            m.attentions,
+            m.attention_kind.clone(),
+        )
+    };
+    let notice = TEST_NOW + 3600;
+    assert_eq!(
+        run(Some(notice), notice - 60, false),
+        (Some(notice - 60), 0, None),
+        "the tap's earlier reset"
+    );
+    assert_eq!(
+        run(None, notice, true),
+        (Some(notice), 1, Some("kind=wait".to_string())),
+        "raised again, a wait"
+    );
+    let far = TEST_NOW + i64::try_from(RESET_HORIZON.as_secs()).unwrap() + 3600;
+    assert_eq!(run(None, far, true), (Some(far), 0, None), "still no wait");
+    assert_eq!(
+        run(None, notice, false),
+        (Some(notice), 0, None),
+        "no badge"
+    );
+}
+
 #[test]
 fn a_limit_spanning_an_off_park_is_one_episode_one_escalation() {
     use crate::harness::stats::{HarnessStats, fold_journal};
@@ -1556,6 +1712,8 @@ fn a_limit_spanning_an_off_park_is_one_episode_one_escalation() {
             reset_text: "-".to_string(),
             extended: false,
             raised: true,
+            worked: false,
+            message: String::new(),
         });
     };
     let run = |setup: fn(&mut Session<'_, Mock>), park: bool| {
@@ -1649,6 +1807,8 @@ fn a_limit_the_worker_answered_past_in_a_park_is_a_new_episode() {
             reset_text: "-".to_string(),
             extended: false,
             raised: true,
+            worked: false,
+            message: String::new(),
         });
     };
     let run = |setup: fn(&mut Session<'_, Mock>), read: Vec<String>| {

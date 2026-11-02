@@ -446,7 +446,9 @@ pub fn cmd_mailbox_signin(args: &[String]) -> Res {
         let raw =
             std::fs::read(&mbx_src).map_err(|e| format!("read {}: {e}", mbx_src.display()))?;
         let tmp_check = aterm_tempfile::tempdir().map_err(|e| e.to_string())?;
-        let tmp_secrets = tmp_check.path().join(".secrets");
+        // `sys::put` refuses a link in its path, as macOS's `/var` is.
+        let tmp_root = std::fs::canonicalize(tmp_check.path()).map_err(|e| e.to_string())?;
+        let tmp_secrets = tmp_root.join(".secrets");
         std::fs::create_dir_all(&tmp_secrets).map_err(|e| e.to_string())?;
         sys::put(
             &tmp_secrets.join(SECRETS_MAILBOX_TOML_FILE),
@@ -454,8 +456,8 @@ pub fn cmd_mailbox_signin(args: &[String]) -> Res {
             &sys::PutSrc::Bytes(&raw),
         )
         .map_err(|e| e.to_string())?;
-        let parsed = headless_oauth::discover_mailbox_config(Some(tmp_check.path()), None)
-            .ok_or_else(|| {
+        let parsed =
+            headless_oauth::discover_mailbox_config(Some(&tmp_root), None).ok_or_else(|| {
                 Fail::die(format!(
                     "{} parsed no mailbox configuration",
                     mbx_src.display()
@@ -626,6 +628,14 @@ pub fn cmd_mailbox_signin(args: &[String]) -> Res {
     env.push(("ATERM_LOG".into(), "info".into()));
     env.push((aterm_types::domain::ENV_DEV_FAST_TIMERS.into(), "1".into()));
     env.push((UPKEEP_SEAM.into(), "1".into()));
+    if opts.live {
+        // A real Claude Code's sign-in runs only under a named user.
+        for name in ["USER", "LOGNAME"] {
+            if let Ok(value) = std::env::var(name) {
+                env.push((name.into(), value));
+            }
+        }
+    }
     let mut inst = Instance::start(
         &world,
         Launch {
@@ -693,8 +703,9 @@ pub fn cmd_mailbox_signin(args: &[String]) -> Res {
         write_hermetic_ai_mailbox_toml(&world.home, &maildir, &email)?;
     }
 
+    // Past the sign-in's own 300 s bound, so a run a page stopped reads as its outcome.
     let signin_wait = if opts.live {
-        Duration::from_secs(300)
+        Duration::from_secs(360)
     } else {
         HANG
     };

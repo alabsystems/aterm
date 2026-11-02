@@ -639,7 +639,15 @@ impl DeckWords {
                     })
                     .collect()
             })
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                snap.total_cores()
+                    .map(|count| CoreCluster {
+                        name: None,
+                        heat: vec![None; count],
+                    })
+                    .into_iter()
+                    .collect()
+            });
         let mut tail_candidates: Vec<String> = Vec::new();
         if let Some(brand) = snap.facts.cpu_brand.as_deref().filter(|b| !b.is_empty()) {
             tail_candidates.push(brand.to_owned());
@@ -655,7 +663,7 @@ impl DeckWords {
         Self {
             rows,
             cores,
-            cpu_total: snap.cpu.as_ref().map(|cpu| cpu.total()).filter(|&n| n > 0),
+            cpu_total: snap.total_cores(),
             cores_tail_forms,
             totals: words::machine_totals(snap),
             time_gaps: snap.time_gaps.clone(),
@@ -699,9 +707,9 @@ impl DeckWords {
         }
     }
 
-    /// Whether a strip of `strip`'s multi-scale horizon draws an over mark in any slot.
-    fn over_shown(&self, strip: &Strip) -> bool {
-        self.rows.iter().any(|row| {
+    /// Whether one of `rows` draws an over mark in `strip`'s multi-scale horizon.
+    fn over_shown<'r>(rows: impl IntoIterator<Item = &'r RowWords>, strip: &Strip) -> bool {
+        rows.into_iter().any(|row| {
             row.strip_text.is_none() && row.multi_scale_slots(strip).iter().any(|s| s.cell.over)
         })
     }
@@ -1814,6 +1822,7 @@ impl<'a> Deck<'a> {
                 r_outer: r,
                 thickness: lw,
                 track: clear,
+                start: 0.0,
                 frac: 1.0,
                 fill: rgba(ink, 0xFF),
             });
@@ -1829,6 +1838,7 @@ impl<'a> Deck<'a> {
                     r_outer: ((r_pt + grow) * s) as f32,
                     thickness: (0.9 * s).max(1.0) as f32,
                     track: clear,
+                    start: 0.0,
                     frac: 1.0,
                     fill: rgba(ink, a),
                 });
@@ -2711,7 +2721,7 @@ impl<'a> Deck<'a> {
         let text = HeaderText {
             tab: self.tab,
             machine: self.machine,
-            over: words.over_shown(&plan.strip),
+            over: [DeckWords::over_shown(&words.rows, &plan.strip), false],
             totals: &words.totals,
         };
         let t = Table::of_full(&plan);
@@ -2861,10 +2871,12 @@ impl<'a> Deck<'a> {
         let text = HeaderText {
             tab: self.tab,
             machine: self.machine,
-            over: plan
-                .blocks
-                .first()
-                .is_some_and(|b| words.over_shown(&b.strip)),
+            over: [0, 1].map(|bi| {
+                DeckWords::over_shown(
+                    words.rows.iter().skip(bi * 4).take(4),
+                    &plan.blocks[bi].strip,
+                )
+            }),
             totals: &words.totals,
         };
         let labels: [Option<StateLabel<'_>>; 2] = [0, 1].map(|bi| {
@@ -3458,6 +3470,7 @@ impl crate::App {
         self.network_snapshot.network.detail.hash(&mut h);
         self.network_snapshot.network.via_local_process.hash(&mut h);
         self.network_snapshot.network.retention_limited.hash(&mut h);
+        self.network_snapshot.network.accounts_exchange.hash(&mut h);
         crate::network_deck::hash_peer_reachability(&self.network_snapshot, &mut h);
         self.network_snapshot.services.hash(&mut h);
         self.vitals
@@ -3484,10 +3497,11 @@ impl crate::App {
 
     /// What frame `f`'s card shows: its inputs and the App's reading.
     pub(crate) fn deck_input(&self, f: &DeckFrame) -> DeckInput<'_> {
+        let snap = self.vitals.snapshot.as_deref();
         DeckInput {
             network: (f.form == StatsBars::Deck).then_some(self.network_snapshot.as_ref()),
             network_target: crate::network_deck::Target::Overview,
-            snap: self.vitals.snapshot.as_deref(),
+            snap,
             prev_snap: self.vitals.prev_snapshot.as_deref(),
             tab_panes: f.tab_panes.clone(),
             tab_label: f.tab_label.clone(),
@@ -3498,10 +3512,7 @@ impl crate::App {
             plate: f.plate,
             form: f.deck,
             contrast: f.contrast,
-            locale: Locale {
-                platform: Platform::host(),
-                utc_offset_s: crate::presence::local_offset_s().unwrap_or(0),
-            },
+            locale: host_locale(snap),
             live: f.live,
         }
     }
@@ -3644,7 +3655,7 @@ impl crate::App {
         if let Some(card) = ws.deck_card.as_mut()
             && card_base == base
             && card.dy == f.dy
-            && patch_live(
+            && let Some(rows) = patch_live_rows(
                 card,
                 &prims,
                 &ws.deck_live_rects.borrow(),
@@ -3656,6 +3667,7 @@ impl crate::App {
             card.geom = key;
             card.raster_fingerprint_once = std::sync::OnceLock::new();
             ws.deck_live_card.set((base, live));
+            ws.deck_motion.card_changed(rows);
             return;
         }
         ws.deck_live_card.set((base, live));
@@ -3676,7 +3688,10 @@ impl crate::App {
             fp,
             geom: key,
             raster_fingerprint_once: std::sync::OnceLock::new(),
+            serial: 0,
+            delta: None,
         });
+        ws.deck_motion.card_changed((0, ph));
     }
 
     /// Fold the stats card and the open lens under the card the window would otherwise
@@ -3706,6 +3721,7 @@ impl crate::App {
         let mut identity = std::collections::hash_map::DefaultHasher::new();
         for card in &cards {
             card.fp.hash(&mut identity);
+            card.serial.hash(&mut identity);
             card.geom.hash(&mut identity);
             card.dx.hash(&mut identity);
             card.dy.hash(&mut identity);
@@ -3733,7 +3749,9 @@ pub(crate) struct DeckLaid {
 /// Re-raster into `card` only the rects of `rects` whose layer moved from `was` to `now`
 /// ([`LiveLayer::moved`]), from the frame's whole `prims`: each rect's pixels are what the whole
 /// raster would give there, since every prim is drawn into it, clipped. `false` (and `card`
-/// untouched) when a rect leaves the card, so the caller rasters it whole.
+/// untouched) when a rect leaves the card, so the caller rasters it whole. The splice calls
+/// [`patch_live_rows`], which says which rows it drew.
+#[cfg(test)]
 pub(crate) fn patch_live(
     card: &mut crate::SettingsCard,
     prims: &[DrawPrim],
@@ -3741,6 +3759,18 @@ pub(crate) fn patch_live(
     was: &DeckLive,
     now: &DeckLive,
 ) -> bool {
+    patch_live_rows(card, prims, rects, was, now).is_some()
+}
+
+/// [`patch_live`], saying which of the card's rows it re-rastered: `y0..y1` around every rect it
+/// drew, `(0, 0)` where no rect moved; `None` where [`patch_live`] says `false`.
+pub(crate) fn patch_live_rows(
+    card: &mut crate::SettingsCard,
+    prims: &[DrawPrim],
+    rects: &[(LiveLayer, Rect)],
+    was: &DeckLive,
+    now: &DeckLive,
+) -> Option<(u32, u32)> {
     let (pw, ph) = (card.pw, card.ph);
     let mut regions = Vec::new();
     for &(layer, (x, y, w, h)) in rects {
@@ -3767,23 +3797,26 @@ pub(crate) fn patch_live(
     }
     let stride = pw as usize * 4;
     if card.rgba.len() != stride * ph as usize {
-        return false;
+        return None;
     }
+    let rows = regions
+        .iter()
+        .map(|r| (r.y, r.y + r.height))
+        .reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)))
+        .unwrap_or((0, 0));
     for r in regions {
         let px = crate::tray_raster::rasterize_tray_region(prims, 1.0, [0, 0, 0, 0], r);
         let row = r.width as usize * 4;
         if px.len() != row * r.height as usize {
-            return false;
+            return None;
         }
         for (i, src) in px.chunks_exact(row).enumerate() {
             let at = (r.y as usize + i) * stride + r.x as usize * 4;
-            let Some(dst) = card.rgba.get_mut(at..at + row) else {
-                return false;
-            };
+            let dst = card.rgba.get_mut(at..at + row)?;
             dst.copy_from_slice(src);
         }
     }
-    true
+    Some(rows)
 }
 
 /// `cards` composited in order onto one surface over their union, the fold the backends present
@@ -3817,6 +3850,8 @@ pub(crate) fn fold_cards(cards: &[&crate::SettingsCard], fp: u64) -> Option<crat
         fp,
         geom: fp,
         raster_fingerprint_once: std::sync::OnceLock::new(),
+        serial: 0,
+        delta: None,
     })
 }
 
@@ -3938,6 +3973,19 @@ pub(crate) fn stats_a11y_group(
     }
 }
 
+/// Host [`Locale`] for `snap`, carrying per-instant local offsets across daylight-saving changes.
+pub(crate) fn host_locale(snap: Option<&Snapshot>) -> Locale {
+    let utc_offset_s = snap
+        .and_then(|s| crate::presence::local_offset_at(s.at_unix_ms.div_euclid(1000)))
+        .or_else(crate::presence::local_offset_s)
+        .unwrap_or(0);
+    Locale {
+        platform: Platform::host(),
+        utc_offset_s,
+        utc_offset_at: Some(crate::presence::local_offset_at),
+    }
+}
+
 impl crate::App {
     /// The stats deck for `wid`'s accessibility tree, while it shows one.
     #[cfg(a11y_tree)]
@@ -3949,10 +3997,7 @@ impl crate::App {
                 .filter(|lens| lens.focus == Instrument::NetworkState)
                 .and_then(|_| self.network_lens_frame(wid))
         })?;
-        let loc = Locale {
-            platform: Platform::host(),
-            utc_offset_s: crate::presence::local_offset_s().unwrap_or(0),
-        };
+        let loc = host_locale(self.vitals.snapshot.as_deref());
         let (ox, oy) = self.frame_origin(wid);
         let bounds = aterm_a11y::model::Rect {
             x0: ox as f64,
@@ -4075,6 +4120,8 @@ pub(crate) mod tests {
             first_seen_ms: 1_000,
             last_seen_ms: 2_000,
             last_checked_ms: Some(2_000),
+            last_repair: None,
+            last_authenticated_endpoint: None,
             reachability: Reachability::Reachable,
             instances: None,
             samples: Vec::new(),
@@ -4210,7 +4257,7 @@ pub(crate) mod tests {
                     app.backend.set_head(head);
                     let size = PhysicalSize::new(800, h as u32);
                     let (rows, _) = app.grid_dims_for(wid, size);
-                    (rows, app.whole_cell_min_size(wid).height)
+                    (rows, app.least_window_size(wid).height)
                 };
                 let low = full + 8 * ch;
                 for h in low..low + 3 * ch {
@@ -4754,6 +4801,7 @@ pub(crate) mod tests {
             locale: Locale {
                 platform: Platform::MacOs,
                 utc_offset_s: 0,
+                utc_offset_at: None,
             },
             live: DeckLive::STILL,
         }
@@ -5288,9 +5336,59 @@ pub(crate) mod tests {
                     );
                 }
                 assert_eq!(g.h, GEOM.h, "capacity text adds no chrome height");
+                let mut unread = snap.clone();
+                unread.cpu = None;
+                unread.cpu_counter_sample = Some(vec![Ticks { busy: 0, total: 0 }; 18]);
+                unread.resources[Resource::Cpu.index()] = ResourceView::default();
+                unread.gpu = None;
+                unread.resources[Resource::Gpu.index()] = ResourceView::default();
+                unread
+                    .facts
+                    .gpu
+                    .as_mut()
+                    .expect("fixture hardware")
+                    .device_pct = None;
+                for hardware_known in [true, false] {
+                    let mut sample = unread.clone();
+                    if !hardware_known {
+                        sample.facts.gpu = None;
+                    }
+                    let mut i = input(&sample);
+                    i.form = form;
+                    let laid = lay(&g, &i, &DeckWords::new(&i, &m), &m, true);
+                    assert!(
+                        laid.prims.iter().any(|p| matches!(p, DrawPrim::Text { s, .. } if s == "18 cores" || s == "18 ")),
+                        "{form:?}/{columns}: raw counters still report the core count"
+                    );
+                    assert!(!laid.prims.iter().any(
+                        |p| matches!(p, DrawPrim::Text { s, .. } if s.contains("cores unknown"))
+                    ));
+                    let cpu_said = drawn_row_text(&laid, &table, 0, g.scale);
+                    assert!(
+                        cpu_said.contains('–') && !cpu_said.contains("0%"),
+                        "{cpu_said}"
+                    );
+                    let said = drawn_row_text(&laid, &table, 1, g.scale);
+                    assert!(said.contains('–') && !said.contains("0%"), "{said}");
+                    if hardware_known {
+                        assert!(
+                            said.contains("M5 Max") && said.contains("40 cores"),
+                            "{form:?}/{columns}: unread utilization must keep known hardware: {said}"
+                        );
+                        assert!(!said.contains("no GPU reading"), "{said}");
+                    } else {
+                        assert!(said.contains("no GPU reading"), "{said}");
+                        assert!(
+                            !said.contains("M5 Max") && !said.contains("40 cores"),
+                            "{said}"
+                        );
+                    }
+                }
             }
         }
         snap.cpu = None;
+        snap.cpu_counter_sample = None;
+        snap.resources[Resource::Cpu.index()].capacity = None;
         let mut i = input(&snap);
         i.form = DeckForm::Full;
         let g = DeckGeom {
@@ -5487,6 +5585,7 @@ pub(crate) mod tests {
         const MAC: Locale = Locale {
             platform: Platform::MacOs,
             utc_offset_s: 0,
+            utc_offset_at: None,
         };
         let said = |snap: &Snapshot| stats_a11y_group(Some(snap), &[FRONT], &MAC);
         let meter = |snap: &Snapshot, res: Resource| {

@@ -440,13 +440,28 @@ impl PaneTrace {
             let log = d.bytes("trace.log")?.to_vec();
             let n = d.count("trace.effects", len_u64(PANE_MAX_EVENTS))?;
             let mut effects = Vec::with_capacity(n.min(body.len() / 46));
-            for _ in 0..n {
+            for i in 0..n {
+                let seq = d.u64("trace.effect.seq")?;
+                if seq != len_u64(i) {
+                    return Err(WireFault::NonCanonical {
+                        field: "trace.effect.seq",
+                    });
+                }
+                let target = d.u32("trace.effect.target")?;
+                let op = d.u16("trace.effect.op")?;
+                let payload = d.digest("trace.effect.payload")?;
+                let result = d.bytes("trace.effect.result")?;
+                if !result.is_empty() {
+                    return Err(WireFault::NonCanonical {
+                        field: "trace.effect.result",
+                    });
+                }
                 effects.push(EffectRecord {
-                    seq: d.u64("trace.effect.seq")?,
-                    target: d.u32("trace.effect.target")?,
-                    op: d.u16("trace.effect.op")?,
-                    payload: d.digest("trace.effect.payload")?,
-                    result: d.bytes("trace.effect.result")?.to_vec(),
+                    seq,
+                    target,
+                    op,
+                    payload,
+                    result: Vec::new(),
                 });
             }
             Ok(PaneTrace {
@@ -481,6 +496,27 @@ impl PaneTrace {
         let schema = PaneSchema::new(origin);
         let checkpoint =
             Checkpoint::decode(&self.checkpoint).map_err(PaneTraceFault::Checkpoint)?;
+        let prov = checkpoint.provenance();
+        if prov.log_epoch != 0
+            || prov.input_cursor != 0
+            || prov.effect_cursor != 0
+            || prov.branch != BranchId(0)
+            || prov.revision != Revision(0)
+            || prov.parent.is_some()
+        {
+            return Err(PaneTraceFault::Checkpoint(CheckpointFault::Wire(
+                WireFault::NonCanonical {
+                    field: "checkpoint.provenance",
+                },
+            )));
+        }
+        if prov.identity.task == self.identity.task
+            && prov.identity.schema == self.identity.schema
+            && prov.identity.profile == self.identity.profile
+            && let Some(mismatch) = IdentityMismatch::first(&prov.identity, &self.identity)
+        {
+            return Err(PaneTraceFault::Restore(RestoreRefusal::Identity(mismatch)));
+        }
         let start = checkpoint
             .restore(&schema, &self.identity)
             .map_err(PaneTraceFault::Restore)?;
@@ -492,6 +528,20 @@ impl PaneTrace {
             PANE_MAX_EVENTS,
         )
         .map_err(PaneTraceFault::Log)?;
+        if log.header().log_epoch != 0 || log.header().first_cursor != 0 {
+            return Err(PaneTraceFault::Log(LogFault::Wire(
+                WireFault::NonCanonical {
+                    field: "log.header",
+                },
+            )));
+        }
+        if log.broken().is_some() {
+            return Err(PaneTraceFault::Log(LogFault::Wire(
+                WireFault::NonCanonical {
+                    field: "log.broken",
+                },
+            )));
+        }
         if tail != Tail::Clean {
             return Err(PaneTraceFault::Tail(tail));
         }

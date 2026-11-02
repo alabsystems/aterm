@@ -8,6 +8,9 @@
 //! process of the user's uses it, and aterm's own grant is on (`[disk] auto_free_gib > 0`). Each
 //! removal is journalled in the disk ledger before it starts, and a removal the ledger cannot
 //! record does not start.
+//! Managed markers, package coordinators and complete registry custody take precedence over
+//! this safelist. A bounded FD preflight and the guarded remover never follow nested links;
+//! partial removal reports the walker's released allocation, not a before/after size estimate.
 
 use std::path::{Path, PathBuf};
 
@@ -325,6 +328,12 @@ fn strictly_under(p: &Path, dir: &Path) -> bool {
     aterm_sysprobe::paths::is_under(p, dir) == Some(true) && !same(p, dir)
 }
 
+/// Prove absence of filesystem custody without following links. An incomplete bounded read
+/// is uncertainty, never permission to remove an ancestor of a managed cache.
+fn custody_clear(path: &Path) -> Result<(), String> {
+    super::target::unmanaged_custody(path, super::target::WalkBudget::SHIPPED)
+}
+
 /// The bytes removing the file `meta` describes releases: its blocks, unless another link keeps
 /// them.
 fn file_bytes(meta: &std::fs::Metadata) -> u64 {
@@ -417,6 +426,8 @@ pub fn judge(path: &Path, world: &World<'_>) -> Result<Admitted, String> {
     }
     super::mounts_clear(path, world.mounts)?;
     discover::unused_under(&[path.to_path_buf()], world.processes)?;
+    custody_clear(path)?;
+    atpkg::build_cache::registered::ordinary_clearance(&home, path)?;
     let (bytes, partial) = released(path, id.dev);
     Ok(Admitted {
         path: path.to_path_buf(),
@@ -581,25 +592,68 @@ fn one(
                 .to_owned(),
         );
     }
-    match super::remove_tree(&a.path) {
-        Ok(()) => {
+    if let Err(why) = custody_clear(&a.path) {
+        return Verdict::Refused(why);
+    }
+    let clearance = match atpkg::build_cache::registered::ordinary_clearance(world.home, &a.path) {
+        Ok(clearance) => clearance,
+        Err(why) => return Verdict::Refused(why),
+    };
+    let mut permit = || {
+        if clearance.current() {
+            Ok(())
+        } else {
+            Err("registered-cache index changed during removal".to_owned())
+        }
+    };
+    record_removal(
+        &a,
+        super::target::remove_unmanaged_tree(&a.path, a.id, &mut permit),
+        world,
+        journal,
+        &why,
+    )
+}
+
+fn record_removal(
+    a: &Admitted,
+    result: std::io::Result<super::Removed>,
+    world: &World<'_>,
+    journal: &mut dyn FnMut(&str) -> bool,
+    why: &str,
+) -> Verdict {
+    match result {
+        Ok(done)
+            if done.units.iter().any(|path| path == &a.path)
+                && done.trouble.is_empty()
+                && done.skipped.is_empty() =>
+        {
             journal(&row(
                 world.now,
                 world.sid,
                 &a.path,
                 "removed",
-                Some(a.bytes),
-                &why,
+                Some(done.bytes),
+                why,
             ));
             Verdict::Removed {
-                bytes: a.bytes,
-                partial: a.partial,
+                bytes: done.bytes,
+                partial: false,
             }
         }
-        Err(e) => {
-            let (left, _) = released(&a.path, a.id.dev);
-            let freed = a.bytes.saturating_sub(left);
-            let why = e.to_string();
+        Ok(done) => {
+            let freed = done.bytes;
+            let why = done
+                .trouble
+                .into_iter()
+                .chain(done.skipped.into_iter().map(|(_, why)| why))
+                .collect::<Vec<_>>()
+                .join("; ");
+            let why = if why.is_empty() {
+                "removal retained part of the path".to_owned()
+            } else {
+                why
+            };
             journal(&row(
                 world.now,
                 world.sid,
@@ -610,6 +664,7 @@ fn one(
             ));
             Verdict::Failed { freed, why }
         }
+        Err(error) => Verdict::Refused(error.to_string()),
     }
 }
 

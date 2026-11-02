@@ -135,6 +135,12 @@ fn a_linked_worktree_reads_the_main_worktrees_local_settings() {
         found(owner_asks(&worker, &sub)),
         [("Write".to_string(), local.display().to_string())]
     );
+    write(&gitdir.join("commondir"), &"x".repeat(5000));
+    assert!(
+        owner_asks(&worker, &sub)
+            .expect_err("oversized commondir")
+            .contains("larger than 4096 bytes")
+    );
 }
 
 #[test]
@@ -338,6 +344,14 @@ fn the_chain_is_read_where_claude_code_reads_it() {
             "{argv:?}"
         );
     }
+    let after_ddash = WorkerEnv::hermetic(None).with(&dir).launched_with(&[
+        "claude",
+        "--",
+        "--project-config-root",
+        "../root",
+        r#"--settings={"permissions":{"ask":["Bash"]}}"#,
+    ]);
+    assert_eq!(tools(&after_ddash, &proj), ["Grep", "Read"]);
 }
 
 #[test]
@@ -432,6 +446,9 @@ fn a_settings_file_under_a_file_provider_domain_is_reported_never_opened() {
         let linked = home.join("src/.claude/settings.local.json");
         std::os::unix::fs::symlink(&provider, &linked).expect("a link into the domain");
         fenced.push(linked);
+        let out_link = proj.join(".claude/settings.local.json");
+        std::os::unix::fs::symlink(&ordinary, &out_link).expect("a link out of the domain");
+        fenced.push(out_link);
     }
     for fenced in &fenced {
         assert!(

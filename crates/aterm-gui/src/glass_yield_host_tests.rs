@@ -6,8 +6,8 @@
 //! a windowed composed capture re-projects the step's uncut glass and publishes the window's
 //! words over it, and the heterogeneous route (a terminal beside a native view) projects it with
 //! no word pass at all. Each must cut the glass off an app's red words as the frame's own
-//! publish does. `LIVE` is still `Live::Off`, so each run raises the level with the rig's
-//! `live glass`.
+//! publish does. Each run sets the level with the rig's `live glass`, which is the shipped
+//! level (`prism_glass::LIVE`) since 1.12, so the runs do not move when a later phase raises it.
 
 use crate::app_render::ComposedCursorFxClock;
 use crate::trail_rig::TrailRig;
@@ -30,11 +30,13 @@ const CONFIG: &str = "trail_sounds = false\ncursor_trail_style = \"rainbow kitty
 /// glass the yield keeps (§4 Measured).
 const RED_W: &[u8] = b"\x1b[38;2;196;38;46mw\x1b[39m";
 
-/// A rig on Default Light, gridded, before its first frame.
+/// A rig on Default Light on a scale-2 display, whose face the glass draws under (§15.8
+/// amendment 53, `light_fork_pin_tests::at_scale_two`), gridded, before its first frame.
 fn rig() -> TrailRig {
     let mut rig = TrailRig::new(std::path::Path::new(FIXTURE_FONT)).expect("the rig");
     let t0 = rig.t0();
     rig.configure(CONFIG, t0).expect("the config admits");
+    crate::light_fork_pin_tests::at_scale_two(&mut rig, t0);
     rig.grid(8, 80, t0).expect("the grid");
     rig
 }

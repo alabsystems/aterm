@@ -3,8 +3,8 @@
 // Author: Andrew Yates
 
 //! Route-wall Tier-1 conformance tests for `Router::decide` and `hop::rebuild` (`AghRouteWall`),
-//! over the canonical agh.toml (`Vault = 0`) and over the rows vault adoption derives with no
-//! agh.toml (`Vault = 1`, design §6.10).
+//! over the canonical agh.toml with its `[[writers]]` grant (`Vault = 0`) and over the rows vault
+//! adoption derives with no agh.toml (`Vault = 1`, design §6.10).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
@@ -25,7 +25,14 @@ use crate::wire::{Deadlines, Endpoints, Method, WireRequest};
 const MACHINE: &str = "AghRouteWall";
 const CDN_URL: &str = "https://objects.githubusercontent.com/github-production-release-asset/1";
 
-const LAWS: [&str; 11] = [
+/// `tests/common.rs`'s `WRITERS`, which the crate's own tests cannot reach: the grant the
+/// worlds' agh.toml holds.
+const WRITERS: &str =
+    "\n[[writers]]\ncaller = \"fixture-caller\"\nrepos = [\"alabsystems/aterm\"]\n";
+/// The caller `WRITERS` grants.
+const CALLER: &str = "fixture-caller";
+
+const LAWS: [&str; 12] = [
     "ReleaseTokenStaysHome",
     "TierWall",
     "NamedDestination",
@@ -37,11 +44,12 @@ const LAWS: [&str; 11] = [
     "ExternalWriteOff",
     "HopDropsAuth",
     "NoWriteHop",
+    "IdentityNamed",
 ];
 
-const MUTANTS: [(&str, &str); 9] = [
+const MUTANTS: [(&str, &str); 11] = [
     ("BuggyDecideFallback", "TierWall"),
-    ("BuggyDecideAlias", "NamedDestination"),
+    ("BuggyDecideUngranted", "NamedDestination"),
     ("BuggyDecideReleaseAbroad", "ReleaseTokenStaysHome"),
     ("BuggyDecideAmbient", "NoAmbient"),
     ("BuggyAnonymousCarries", "AnonymousCarriesNothing"),
@@ -49,12 +57,17 @@ const MUTANTS: [(&str, &str); 9] = [
     ("BuggyRefuseButSend", "RefusalSendsNothing"),
     ("BuggyHopKeepsAuth", "HopDropsAuth"),
     ("BuggyHopOnWrite", "NoWriteHop"),
+    ("BuggyRelReadAbroad", "ReleaseTokenStaysHome"),
+    ("BuggyIdentityDefault", "IdentityNamed"),
 ];
 
-const WORLD: [&str; 7] = [
+const WORLD: [&str; 10] = [
     "NextTier",
     "NextOp",
     "ToggleNamed",
+    "ToggleGranted",
+    "ToggleRelRead",
+    "ToggleIdent",
     "ToggleDev",
     "ToggleRel",
     "ToggleAmbient",
@@ -81,30 +94,70 @@ fn access(op: i64) -> Access {
     }
 }
 
-fn request(state: &State, named: Named) -> RouteRequest {
-    let slug = Slug::parse(slug_text(var(state, "tier"))).expect("a canonical slug");
-    let target = RouteTarget::Repo(slug);
-    let req = match access(var(state, "op")) {
+fn with_access(target: RouteTarget, op: i64) -> RouteRequest {
+    match access(op) {
         Access::Read => RouteRequest::read(target),
         Access::WriterRead => RouteRequest::writer_read(target),
         Access::Write => RouteRequest::write(target),
-    };
-    req.with_named(named)
+    }
 }
 
-fn namings(state: &State) -> Vec<Named> {
-    if var(state, "named") == 1 {
-        let typed = ExplicitTarget::from_argv(OsStr::new(slug_text(var(state, "tier"))))
-            .expect("the CLI's literal");
-        vec![Named::Literal(typed)]
-    } else {
-        vec![Named::Default, Named::Target("channel".to_string())]
+/// The requests that stand for `state` on `router`. The identity path is one request whatever
+/// the tier, with `--as dev` when `named`. A repository's is the argv literal when `named`;
+/// else, with `granted` on the release owner and a router that grants (`grants`: one read
+/// from a file), `Router::grant`'s literal; else both `Default` and `@channel`. A `granted`
+/// state whose grant is refused (another tier's repository, or a router that does not grant)
+/// asserts the refusal is `not_granted` and stands for what `granted` 0 does.
+fn requests(state: &State, router: &Router, grants: bool) -> Vec<RouteRequest> {
+    let op = var(state, "op");
+    if var(state, "ident") == 1 {
+        let profile = (var(state, "named") == 1).then(|| "dev".to_string());
+        return vec![with_access(RouteTarget::Identity, op).with_as(profile)];
     }
+    let text = slug_text(var(state, "tier"));
+    let slug = Slug::parse(text).expect("a canonical slug");
+    let req = |named: Named| with_access(RouteTarget::Repo(slug.clone()), op).with_named(named);
+    if var(state, "named") == 1 {
+        let typed = ExplicitTarget::from_argv(OsStr::new(text)).expect("the CLI's literal");
+        return vec![req(Named::Literal(typed))];
+    }
+    if var(state, "granted") == 1 {
+        match router.grant(CALLER, &slug) {
+            Ok(target) => {
+                assert!(
+                    grants && var(state, "tier") == 1,
+                    "{state:?}: a grant for {text}"
+                );
+                assert_eq!(target.provenance(), Provenance::Granted);
+                assert_eq!(target.granted_to(), Some(CALLER));
+                return vec![req(Named::Literal(target))];
+            }
+            Err(error) => {
+                assert!(
+                    !grants || var(state, "tier") != 1,
+                    "{state:?}: {}",
+                    error.why
+                );
+                assert_eq!(
+                    error.sub,
+                    crate::error::Sub::Policy(RefusalCode::NotGranted),
+                    "{state:?}: {}",
+                    error.why
+                );
+            }
+        }
+    }
+    vec![
+        req(Named::Default),
+        req(Named::Target("channel".to_string())),
+    ]
 }
 
 struct World {
     _root: aterm_tempfile::TempDir,
     router: Router,
+    /// The same agh.toml through `config::validate` (origin `Text`); `None` over the vault.
+    text_router: Option<Router>,
 }
 
 fn setup_file(path: &std::path::Path, bytes: &[u8]) {
@@ -119,13 +172,23 @@ fn setup_file(path: &std::path::Path, bytes: &[u8]) {
         .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
 }
 
-fn world(dev: bool, rel: bool) -> World {
+/// The canonical agh.toml with the grant, and with `relread` the release profile at the head of
+/// the release owner's read chain, read back by `config::load` (origin `File`).
+fn world(dev: bool, rel: bool, relread: bool) -> World {
     let root = aterm_tempfile::Builder::new()
         .prefix("agh-wall-")
         .tempdir()
         .expect("a scratch root");
     let base = root.path();
-    let text = super::tests::canonical_text(base);
+    let mut text = super::tests::canonical_text(base);
+    if relread {
+        text = text.replacen(
+            "read = [\"dev\", \"anonymous\"]",
+            "read = [\"release\", \"dev\", \"anonymous\"]",
+            1,
+        );
+    }
+    text.push_str(WRITERS);
     let dirs = Dirs::under(base);
     let parent = dirs.config.parent().expect("the config's parent");
     std::fs::create_dir_all(parent).expect("the config's parent");
@@ -146,17 +209,25 @@ fn world(dev: bool, rel: bool) -> World {
     let validated = config::load(&dirs)
         .expect("the canonical agh.toml loads")
         .expect("the canonical agh.toml is there");
+    assert_eq!(validated.origin(), config::ConfigOrigin::File);
+    let parsed = config::parse(&text).expect("the world's agh.toml parses");
+    let from_text =
+        config::validate(&parsed, base, &config::file_id).expect("the world's agh.toml validates");
+    assert_eq!(from_text.origin(), config::ConfigOrigin::Text);
     World {
         _root: root,
         router: Router::from_validated(validated),
+        text_router: Some(Router::from_validated(from_text)),
     }
 }
 
 /// The router a call with no agh.toml builds (`vault::view`, as `vault::adopt` does once each
 /// login is recorded): the vault's dev token (login `fixture-dev`, so the dev owner is the
 /// model's tier 0) when `dev`, its release token when `rel`, and a record holding both logins,
-/// as a machine whose tokens were adopted before has.
-fn vault_world(dev: bool, rel: bool) -> World {
+/// as a machine whose tokens were adopted before has. Adoption's rows hold no chain that
+/// `relread` names, so it builds the same world either way.
+fn vault_world(dev: bool, rel: bool, relread: bool) -> World {
+    let _ = relread;
     let root = aterm_tempfile::Builder::new()
         .prefix("agh-wall-vault-")
         .tempdir()
@@ -186,7 +257,32 @@ fn vault_world(dev: bool, rel: bool) -> World {
     World {
         _root: root,
         router: adoption.router().expect("the adopted rows validate"),
+        text_router: None,
     }
+}
+
+/// Every world `make` builds, each built once: by `(dev, rel, relread)`.
+type Worlds = BTreeMap<(bool, bool, bool), World>;
+
+fn worlds(make: fn(bool, bool, bool) -> World) -> Worlds {
+    let mut built = BTreeMap::new();
+    for dev in [false, true] {
+        for rel in [false, true] {
+            for relread in [false, true] {
+                built.insert((dev, rel, relread), make(dev, rel, relread));
+            }
+        }
+    }
+    built
+}
+
+fn world_of<'a>(worlds: &'a Worlds, state: &State) -> &'a World {
+    let key = (
+        var(state, "dev") == 1,
+        var(state, "rel") == 1,
+        var(state, "relread") == 1,
+    );
+    &worlds[&key]
 }
 
 fn env(amb: bool) -> MapEnv {
@@ -248,22 +344,25 @@ fn get<'a>(endpoints: &Endpoints, auth: Option<&'a AuthHeader>) -> WireRequest<'
     req
 }
 
-type Key = (i64, i64, i64, i64, i64, i64);
+type Key = [i64; 9];
 
 fn key(state: &State) -> Key {
-    (
+    [
         var(state, "tier"),
         var(state, "op"),
         var(state, "named"),
+        var(state, "granted"),
+        var(state, "relread"),
+        var(state, "ident"),
         var(state, "dev"),
         var(state, "rel"),
         var(state, "amb"),
-    )
+    ]
 }
 
 #[test]
 fn the_real_router_and_hop_conform_to_the_route_wall() {
-    conform(&agh_route_wall_model(), world);
+    conform(&agh_route_wall_model(), world, true);
 }
 
 /// The same wall over vault adoption's rows: no route path of adoption's sends what the laws
@@ -271,26 +370,26 @@ fn the_real_router_and_hop_conform_to_the_route_wall() {
 #[test]
 fn the_adopted_router_conforms_to_the_route_wall() {
     let model = interp::with_consts(&agh_route_wall_model(), &[("Vault", 1)]);
-    conform(&model, vault_world);
+    conform(&model, vault_world, false);
 }
 
-/// `model`'s Decide against `Router::decide` over each world `world` builds, its Hop against
-/// `hop::rebuild`, and its mutants against both.
-fn conform(model: &Model, world: fn(bool, bool) -> World) {
+/// `model`'s Decide against `Router::decide` over each world `make` builds, its Hop against
+/// `hop::rebuild`, and its mutants against both. `grants` says whether the worlds' routers
+/// grant (`Router::grant` over a file-made `Validated`).
+fn conform(model: &Model, make: fn(bool, bool, bool) -> World, grants: bool) {
     std::hint::black_box(crate::policy::route_wall_environment as fn());
     let states = interp::reachable_states(model);
+    let worlds = worlds(make);
     let mut ev = StepEvidence::new(MACHINE);
 
     let mut real: BTreeMap<Key, (i64, i64)> = BTreeMap::new();
 
     for state in states.iter().filter(|s| var(s, "phase") == 0) {
-        let (dev, rel) = (var(state, "dev") == 1, var(state, "rel") == 1);
-        let world = world(dev, rel);
+        let world = world_of(&worlds, state);
         let amb = env(var(state, "amb") == 1);
         let expected = successor(model, state, "Decide").expect("Decide fires in phase 0");
         let mut projected = BTreeSet::new();
-        for named in namings(state) {
-            let req = request(state, named);
+        for req in requests(state, &world.router, grants) {
             let decision = decide(&world.router, &req, &amb, Some(&mut ev));
             let projection = project_decision(&decision);
             assert_eq!(
@@ -374,15 +473,25 @@ fn conform(model: &Model, world: fn(bool, bool) -> World) {
         }
     }
 
+    let forged: BTreeMap<(bool, bool, bool), Router> = worlds
+        .iter()
+        .map(|(key, world)| (*key, forged_floor(world)))
+        .collect();
+    // The literals judged on the forged router: (argv, minted grant).
+    let mut literals = (0_usize, 0_usize);
     for state in states
         .iter()
         .filter(|s| var(s, "phase") == 0 && var(s, "tier") == 1)
     {
-        let world = world(var(state, "dev") == 1, var(state, "rel") == 1);
-        let router = &forged_floor(&world);
+        let at = (
+            var(state, "dev") == 1,
+            var(state, "rel") == 1,
+            var(state, "relread") == 1,
+        );
+        let router = &forged[&at];
         let amb = env(var(state, "amb") == 1);
-        for named in namings(state) {
-            let decision = decide(router, &request(state, named), &amb, Some(&mut ev));
+        for req in requests(state, router, grants) {
+            let decision = decide(router, &req, &amb, Some(&mut ev));
             let projection = project_decision(&decision);
             let next = with_decision(state, projection);
             for law in LAWS {
@@ -393,7 +502,62 @@ fn conform(model: &Model, world: fn(bool, bool) -> World) {
             }
             if var(state, "op") > 0 {
                 assert_eq!(projection, (3, 0), "{state:?}: {decision:?}");
+                // A literal (the argv's, or a minted grant) meets the forged dev rule for the
+                // release owner, which is `TierMismatch`; a default or `@target` write is
+                // refused before the tier is judged, for want of a literal.
+                if let Named::Literal(literal) = &req.named {
+                    if literal.provenance() == Provenance::Granted {
+                        literals.1 += 1;
+                    } else {
+                        literals.0 += 1;
+                    }
+                    assert!(
+                        matches!(
+                            &decision,
+                            Decision::Refuse(refusal) if refusal.code == RefusalCode::TierMismatch
+                        ),
+                        "{state:?}: {decision:?}"
+                    );
+                }
             }
+        }
+    }
+    // A router that grants (one read from a file) mints grants there too.
+    assert!(
+        literals.0 > 0 && (literals.1 > 0) == grants,
+        "forged-floor literals judged: {literals:?}"
+    );
+
+    // Outside the model: the same agh.toml through `config::validate` (origin `Text`) grants
+    // nothing, so its WriterReads and Writes on the release owner project as `granted` 0.
+    for state in states.iter().filter(|s| {
+        var(s, "phase") == 0
+            && var(s, "tier") == 1
+            && var(s, "op") > 0
+            && var(s, "ident") == 0
+            && var(s, "named") == 0
+    }) {
+        let Some(text_router) = &world_of(&worlds, state).text_router else {
+            continue;
+        };
+        let slug = Slug::parse(slug_text(1)).expect("the release slug");
+        let refused = text_router
+            .grant(CALLER, &slug)
+            .expect_err("a text-made agh.toml grants nothing");
+        assert_eq!(
+            refused.sub,
+            crate::error::Sub::Policy(RefusalCode::NotGranted)
+        );
+        let mut ungranted = state.clone();
+        ungranted.insert("granted", 0);
+        let amb = env(var(state, "amb") == 1);
+        for req in requests(&ungranted, text_router, false) {
+            let decision = decide(text_router, &req, &amb, None);
+            assert_eq!(
+                project_decision(&decision),
+                real[&key(&ungranted)],
+                "{state:?}: {decision:?}"
+            );
         }
     }
 
@@ -416,8 +580,10 @@ fn conform(model: &Model, world: fn(bool, bool) -> World) {
         .into_iter()
         .chain(MUTANTS.iter().map(|(mutant, _)| *mutant))
         .collect();
+    assert_eq!(waived.len(), 21);
     assert_eq!(waived, expected);
     let every: BTreeSet<&str> = model.actions.iter().map(|a| a.name).collect();
+    assert_eq!(every.len(), 23);
     assert_eq!(
         bound.union(&waived).copied().collect::<BTreeSet<_>>(),
         every

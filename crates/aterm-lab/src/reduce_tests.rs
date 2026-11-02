@@ -966,6 +966,11 @@ fn a_codex_rollout_keeps_its_namespace_and_moves_its_millisecond_times() {
 fn a_line_that_is_no_json_refuses_the_file() {
     let e = reduce("{\"type\":\"user\"}\n{\"type\":", Program::Claude).expect_err("refused");
     assert!(e.starts_with("line 2: not one JSON value"), "{e}");
+    assert_eq!(
+        parse(r#""\uD83D\uDE00 \uD800\u0041 \uD800\uD83D\uDE00 \uDE00""#).expect("surrogates"),
+        Node::Str("😀 \u{fffd}A \u{fffd}😀 \u{fffd}".to_string())
+    );
+    assert!(parse(r#""\u+041""#).is_err());
 }
 
 #[test]

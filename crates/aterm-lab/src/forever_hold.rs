@@ -3,13 +3,17 @@
 
 //! WHY LAND STILL HOLDS.
 
-use aterm_agent::supervise::policy::turn_end;
+use aterm_agent::supervise::policy::{land_check, turn_end};
 
 use super::super::{at, word};
 use super::held::unstopped;
-use super::{Ctx, Seen, Verdict, observed, page_field, standing, told, worker_field};
+use super::{
+    Ctx, Seen, Verdict, observed, page_field, quoted as field_quoted, split_title, standing, told,
+    worker_field,
+};
 use crate::util::one_line;
-use aterm_agent::harness::acts::StopForm;
+use aterm_agent::harness::acts::{NOT_LANDED_YET, StopForm};
+use aterm_agent::harness::hold_said::{OPEN_IN_REPORT, WAITS_ON_YOU, quoted};
 
 /// How far before the land act's journal line a read may already show its
 /// hold (the hold is told as the act is typed, the line written after).
@@ -157,9 +161,12 @@ pub fn begins(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
 pub struct Legs {
     /// `land_held=`'s legs, in `status`'s order.
     pub legs: &'static str,
-    /// Words the state line must carry after `not landed yet: `.
+    /// What the state line and the hover lead with: `not landed yet`, or `waits only on you`
+    /// for a hold its need alone holds (said once, §14.4, slice 4b).
+    pub head: &'static str,
+    /// Words the state line must carry after its head.
     pub line: &'static [&'static str],
-    /// Words the hover must carry after `not landed yet, `.
+    /// Words the hover must carry after its head.
     pub hover: &'static [&'static str],
     /// Words neither may carry: another leg's.
     pub not: &'static [&'static str],
@@ -191,11 +198,13 @@ const fn others(own: usize) -> [&'static str; 6] {
     out
 }
 
-/// L2: the open words its reading found.
+/// L2: the agent's own list, quoted (slice 4b: the quote is checked against the list Land's
+/// nudge quoted, [`listed_quote`]).
 pub const L2: Legs = Legs {
     legs: "open",
-    line: &["in its report"],
-    hover: &["in its report"],
+    head: NOT_LANDED_YET,
+    line: &[OPEN_IN_REPORT],
+    hover: &[OPEN_IN_REPORT],
     not: &[
         "needs you",
         "changed file",
@@ -205,12 +214,15 @@ pub const L2: Legs = Legs {
         "not on the remote main",
     ],
 };
-/// L3: its need.
+/// L3: its need alone: it waits only on the person, its need named once (slice 4b).
 pub const L3: Legs = Legs {
     legs: "needs",
-    line: &["needs you"],
-    hover: &["needs you"],
+    head: WAITS_ON_YOU,
+    line: &[super::super::NEED],
+    hover: &[],
     not: &[
+        NOT_LANDED_YET,
+        "needs you",
         "in its report",
         "changed file",
         "untracked file",
@@ -220,19 +232,23 @@ pub const L3: Legs = Legs {
         "too tall",
     ],
 };
-/// L4: one untracked file.
+/// L4: one untracked file, named (slice 4b).
 pub const L4: Legs = Legs {
     legs: "repo",
-    line: &["1 untracked file"],
-    hover: &["1 untracked file"],
+    head: NOT_LANDED_YET,
+    line: &["1 untracked file: wip-notes.txt"],
+    hover: &["1 untracked file: wip-notes.txt"],
     not: &others(1),
 };
-/// L6: its need.
+/// L6: its need alone, as L3's.
 pub const L6: Legs = Legs {
     legs: "needs",
-    line: &["needs you"],
-    hover: &["needs you"],
+    head: WAITS_ON_YOU,
+    line: &[super::super::NEED],
+    hover: &[],
     not: &[
+        NOT_LANDED_YET,
+        "needs you",
         "in its report",
         "changed file",
         "untracked file",
@@ -242,16 +258,18 @@ pub const L6: Legs = Legs {
         "too tall",
     ],
 };
-/// L8: one changed file.
+/// L8: one changed file, named (slice 4b).
 pub const L8: Legs = Legs {
     legs: "repo",
-    line: &["1 changed file"],
-    hover: &["1 changed file"],
+    head: NOT_LANDED_YET,
+    line: &["1 changed file: README.md"],
+    hover: &["1 changed file: README.md"],
     not: &others(0),
 };
 /// L9: one stash.
 pub const L9: Legs = Legs {
     legs: "repo",
+    head: NOT_LANDED_YET,
     line: &["1 stash"],
     hover: &["1 stash"],
     not: &others(2),
@@ -259,6 +277,7 @@ pub const L9: Legs = Legs {
 /// L10: one unpushed commit, so one not on the remote main.
 pub const L10: Legs = Legs {
     legs: "repo",
+    head: NOT_LANDED_YET,
     line: &["1 unpushed commit", "1 commit not on the remote main"],
     hover: &["1 unpushed commit", "1 commit not on the remote main"],
     not: &[
@@ -272,6 +291,7 @@ pub const L10: Legs = Legs {
 /// L11: one commit pushed elsewhere, not on the remote main.
 pub const L11: Legs = Legs {
     legs: "repo",
+    head: NOT_LANDED_YET,
     line: &["1 commit not on the remote main"],
     hover: &["1 commit not on the remote main"],
     not: &others(4),
@@ -288,6 +308,7 @@ pub const DEFENSE_WORDS: &str = match aterm_agent::harness::acts::HoldLeg::Defen
 /// `Nothing left:` defense in it.
 pub const DEFENSE: Legs = Legs {
     legs: "defense",
+    head: NOT_LANDED_YET,
     line: &[DEFENSE_WORDS],
     hover: &[DEFENSE_WORDS],
     not: &[
@@ -301,42 +322,32 @@ pub const DEFENSE: Legs = Legs {
     ],
 };
 
-/// The words the open leg in `line` names (`open work in its report:
-/// follow-up, still open; …`: `follow-up`, `still open`), up to the next
-/// leg, the line's next part or the hover's end; split as the nudge's suffix
-/// is ([`nudge_named`]), so a word with a comma in it splits alike on both.
-fn named_words(line: &str) -> Vec<&str> {
-    let Some((_, rest)) = line.split_once("open work in its report: ") else {
-        return Vec::new();
-    };
-    let end = [";", " \u{b7} ", ")"]
-        .iter()
-        .filter_map(|stop| rest.find(stop))
-        .min()
-        .unwrap_or(rest.len());
-    rest[..end].split(", ").collect()
+/// L2: the agent's list as the first Land nudge after `t1` that quotes it quoted it
+/// (`You said this is left: “<list>”.`, `land_check::LISTED_OPEN`, or the contradiction's
+/// `you said this is left: “<list>”`, [`listed_in_nudge`]), each item as the hold's
+/// quote spells it: the list's items ([`land_check::listed_items`]) in the curly quotes the glass
+/// quotes in; `None` before such a nudge.
+fn listed_quote(seen: &Seen, t1: i64) -> Option<Vec<String>> {
+    seen.acts(turn_end::RULE_LAND_NUDGE)
+        .into_iter()
+        .filter(|(t, _)| *t > t1)
+        .find_map(|nudge| {
+            let text = seen.act_text(turn_end::RULE_LAND_NUDGE, nudge);
+            let list = listed_in_nudge(text)?;
+            Some(list.split("; ").map(quoted).collect())
+        })
 }
 
-/// L2: the words the nudge after `t1` named open (`Your report still names
-/// open work (<words>): …`); `None` before a nudge.
-fn nudge_named(seen: &Seen, t1: i64) -> Option<Vec<String>> {
-    let nudge = seen
-        .acts(turn_end::RULE_LAND_NUDGE)
+/// The agent's list as a land nudge quotes it: after Land's nudge's opening
+/// (`land_check::LISTED_OPEN`) or its contradiction's (`turn_end::CONTRADICTED_LISTED`, slice 4c),
+/// up to the closing quote mark, which the contradiction follows with its own words, not `.`.
+pub(crate) fn listed_in_nudge(text: &str) -> Option<&str> {
+    let after = [land_check::LISTED_OPEN, turn_end::CONTRADICTED_LISTED]
         .into_iter()
-        .find(|(t, _)| *t > t1)?;
-    let text = seen.act_text(turn_end::RULE_LAND_NUDGE, nudge);
-    let named = text
-        .split_once("still names open work (")?
-        .1
-        .split_once(')')?
-        .0;
-    Some(
-        named
-            .split(", ")
-            .filter(|w| *w != "\u{2026}")
-            .map(str::to_string)
-            .collect(),
-    )
+        .filter_map(|open| text.find(open).map(|i| &text[i + open.len()..]))
+        .next()?;
+    let close = land_check::LISTED_CLOSE.trim_end_matches('.');
+    Some(after.split_once(close)?.0)
 }
 
 /// L2, L3, L4, L6, L8–L11.
@@ -375,17 +386,25 @@ pub fn legs(seen: &Seen, cx: &Ctx<'_>, want: Legs) -> Verdict {
         ));
     }
     let w = &seen.window;
-    let says = |line: &str, words: &[&str]| {
+    let carries = |line: &str, words: &[&str]| {
         words.iter().all(|x| line.contains(x)) && !want.not.iter().any(|x| line.contains(x))
     };
     let hover_reads = observed(&w.hover, &w.hover_reads, t1, until);
     // A stopped tab's hover and state line lead with the stop (3a), the hold's words behind it.
+    let hover_head = format!("driven by aterm (land: {}", want.head);
     let hovers: Vec<(i64, std::borrow::Cow<'_, str>)> = hover_reads
         .iter()
         .map(|(t, h)| (*t, unstopped(h, StopForm::Hover)))
-        .filter(|(_, h)| h.starts_with("driven by aterm (land: not landed yet, "))
+        .filter(|(_, h)| {
+            h.starts_with(&format!("driven by aterm (land: {NOT_LANDED_YET}"))
+                || h.starts_with(&format!("driven by aterm (land: {WAITS_ON_YOU}"))
+        })
         .collect();
-    let hover = hovers.iter().find(|(_, h)| says(h, want.hover));
+    let says =
+        |line: &str, words: &[&str], head: &str| line.starts_with(head) && carries(line, words);
+    let hover = hovers
+        .iter()
+        .find(|(_, h)| says(h, want.hover, &hover_head));
     if hover.is_none() {
         let late = held
             .first()
@@ -412,10 +431,11 @@ pub fn legs(seen: &Seen, cx: &Ctx<'_>, want: Legs) -> Verdict {
                 HOVER_SLACK_MS / 1000
             ));
         } else if hovers.is_empty() {
-            unread.push("the hover never said `not landed yet`".into());
+            unread.push("the hover never said the hold".into());
         } else {
             bad.push(format!(
-                "the hover never said {:?} without {:?}: {:?}",
+                "the hover never said {:?} {:?} without {:?}: {:?}",
+                want.head,
                 want.hover,
                 want.not,
                 hovers.iter().map(|(_, h)| h.as_ref()).collect::<Vec<_>>()
@@ -425,51 +445,74 @@ pub fn legs(seen: &Seen, cx: &Ctx<'_>, want: Legs) -> Verdict {
     let lines: Vec<(i64, std::borrow::Cow<'_, str>)> = observed(&w.page, &w.page_reads, t1, until)
         .into_iter()
         .filter_map(|(t, p)| Some((t, unstopped(page_field(p, "state")?, StopForm::Line))))
-        .filter(|(_, l)| l.starts_with("not landed yet: "))
+        .filter(|(_, l)| {
+            l.starts_with(&format!("{NOT_LANDED_YET}: ")) || l.starts_with(WAITS_ON_YOU)
+        })
         .collect();
-    let line = lines.iter().find(|(_, l)| says(l, want.line));
+    let line = lines.iter().find(|(_, l)| says(l, want.line, want.head));
     let page_from = held.first().map_or(until, |(t, _)| t.saturating_sub(1));
     let page_reads = observed(&w.page, &w.page_reads, page_from, until);
     let on_page = page_reads.iter().any(|(_, p)| *p != "-");
+    let mut described: Vec<(i64, String)> = Vec::new();
     if line.is_none() && !lines.is_empty() {
         bad.push(format!(
-            "the state line never said {:?} without {:?}: {:?}",
+            "the state line never said {:?} {:?} without {:?}: {:?}",
+            want.head,
             want.line,
             want.not,
             lines.iter().map(|(_, l)| l.as_ref()).collect::<Vec<_>>()
         ));
     } else if line.is_none() && on_page {
-        bad.push("its row on the page never said `not landed yet: `".into());
+        bad.push(format!("its row on the page never said `{}`", want.head));
     } else if page_reads.is_empty() {
         unread.push("no Harness page read after Land's instruction".into());
     }
     if want.legs == "open" {
-        match nudge_named(seen, t1) {
-            Some(named) => {
-                for said in hover
-                    .map(|(_, h)| h.as_ref())
-                    .into_iter()
-                    .chain(line.map(|(_, l)| l.as_ref()))
+        match listed_quote(seen, t1) {
+            Some(items) => {
+                let shown = format!("{OPEN_IN_REPORT}: {}", items.join("; "));
+                // The hover quotes the first item cut to the room it has, so it is held to the
+                // first item's opening words; the state line to the list whole.
+                let first = items.first().map_or("", String::as_str);
+                let opening = first.chars().take(24).collect::<String>();
+                if let Some((_, l)) = line
+                    && !l.contains(&shown)
                 {
-                    let words = named_words(said);
-                    let quoted =
-                        said.contains('\u{201c}') && !said.contains("\u{201c}Nothing left:");
-                    if words.is_empty()
-                        || words.iter().any(|w| !named.iter().any(|n| n == w))
-                        || quoted
-                    {
-                        bad.push(format!(
-                            "names {words:?}, but the nudge named {named:?}: {}",
-                            one_line(said, 200)
-                        ));
-                    }
+                    bad.push(format!(
+                        "the state line does not quote the list its nudge quoted ({shown:?}): {}",
+                        one_line(l, 200)
+                    ));
+                }
+                if let Some((_, h)) = hover
+                    && !h.contains(&format!("{OPEN_IN_REPORT}: {opening}"))
+                {
+                    bad.push(format!(
+                        "the hover does not quote the list its nudge quoted ({first:?}): {}",
+                        one_line(h, 200)
+                    ));
+                }
+                // The description is spoken: the first item whole, with no quote marks a screen
+                // reader would read out.
+                let heard = format!(
+                    "{}: {}",
+                    spoken_open(),
+                    opening.trim_start_matches('\u{201c}')
+                );
+                described = described_open(seen, (page_from, until));
+                if let Some((t, d)) = described.iter().find(|(_, d)| !d.contains(&heard)) {
+                    bad.push(format!(
+                        "+{} the chip's description does not say the list its nudge quoted \
+                         ({heard:?}): {}",
+                        at(cx.t0, *t),
+                        one_line(d, 200)
+                    ));
                 }
             }
-            None => unread.push("no land-nudge@v1 named the open words".into()),
+            None => unread.push("no land-nudge@v1 quoted the agent's list".into()),
         }
     }
     let said = format!(
-        "status {:?}; hover {}; state line {}",
+        "status {:?}; hover {}; state line {}{}",
         held.iter()
             .map(|(t, f)| format!("+{} {}/{}/{}", at(cx.t0, *t), f[0], f[1], f[2]))
             .collect::<Vec<_>>(),
@@ -484,9 +527,164 @@ pub fn legs(seen: &Seen, cx: &Ctx<'_>, want: Legs) -> Verdict {
                 "(its row off the page's screen)".to_string()
             },
             |(t, l)| format!("+{} {}", at(cx.t0, *t), one_line(l, 200))
-        )
+        ),
+        match described.first() {
+            Some((t, d)) => format!(
+                "; the chip's description +{} {}",
+                at(cx.t0, *t),
+                one_line(d, 200)
+            ),
+            None if want.legs == "open" =>
+                "; the chip's description: not read in front".to_string(),
+            None => String::new(),
+        }
     );
     told(said, &bad, &unread)
+}
+
+/// The chip's accessibility description at each `chrome` read from `from` to `until` (the hold
+/// standing) that drew the tab's chip under `⤓ land` (`face=land`, a description printed), as
+/// `chrome` prints it beside the node the screen reader is handed (§14.3's windowed read): a tab
+/// behind says none. Every one is held to the list, whatever its words.
+fn described_open(seen: &Seen, (from, until): (i64, i64)) -> Vec<(i64, String)> {
+    let w = &seen.window;
+    let mut out: Vec<(i64, String)> = w
+        .chip
+        .iter()
+        .chain(&w.held)
+        .filter(|(t, _)| *t >= from && *t < until)
+        .filter_map(|(t, l)| {
+            let (rest, _) = split_title(l);
+            (word(&rest, "face").as_deref() == Some("land"))
+                .then(|| field_quoted(&rest, "description"))
+                .flatten()
+                .filter(|d| !d.is_empty() && d != "-")
+                .map(|d| (*t, d))
+        })
+        .collect();
+    out.sort_by_key(|(t, _)| *t);
+    out
+}
+
+/// [`OPEN_IN_REPORT`] as the chip's description says it, a spoken sentence's head (`Open in its
+/// report`).
+fn spoken_open() -> String {
+    let mut cs = OPEN_IN_REPORT.chars();
+    cs.next()
+        .map(|first| first.to_uppercase().collect::<String>() + cs.as_str())
+        .unwrap_or_default()
+}
+
+/// LR (land-reworded): A REWORDED ITEM REFRESHES THE QUOTE (slice 4b). Every read of the state
+/// line or the hover that says the hold (`not landed yet`) while `status` holds the Open leg
+/// (`land_held` names `open` at the reads either side of it) quotes the check's first list
+/// ([`super::super::CHECK_LIST`]) until the second check is typed, and the reworded one
+/// ([`super::super::REWORDED_LIST`]) after it: a hold whose word family and legs stayed the same,
+/// so only its own words moved. A read of the Open leg in any other words (the reader's family
+/// words a build without 4b says) fails; a surface never read while the Open leg stood goes
+/// unobserved.
+pub fn reworded(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
+    let Some((t1, _)) = began(seen) else {
+        return Verdict::Unobserved("no land act (its records)".into());
+    };
+    let until = landed_after(seen, t1);
+    let status = match reads(seen, t1, until) {
+        Ok(r) => r,
+        Err(e) => return Verdict::Fail(e),
+    };
+    let open = |f: &[String; 3]| {
+        f[0].split(',')
+            .any(|l| l == aterm_agent::harness::acts::HoldLeg::Open.word())
+    };
+    let open_at = |t: i64| {
+        status
+            .iter()
+            .rev()
+            .find(|(ts, _)| *ts <= t)
+            .is_some_and(|(_, f)| open(f))
+            && status
+                .iter()
+                .find(|(ts, _)| *ts >= t)
+                .is_none_or(|(_, f)| open(f))
+    };
+    let second = seen
+        .acts(turn_end::RULE_LAND_CHECK)
+        .iter()
+        .filter(|(t, _)| *t > t1)
+        .nth(1)
+        .map(|(t, _)| *t);
+    let w = &seen.window;
+    let (old, new) = (
+        format!("{OPEN_IN_REPORT}: {}", quoted(super::super::CHECK_LIST)),
+        format!("{OPEN_IN_REPORT}: {}", quoted(super::super::REWORDED_LIST)),
+    );
+    let lines: Vec<(i64, String)> = observed(&w.page, &w.page_reads, t1, until)
+        .into_iter()
+        .filter_map(|(t, p)| {
+            Some((
+                t,
+                unstopped(page_field(p, "state")?, StopForm::Line).into_owned(),
+            ))
+        })
+        .collect();
+    let hovers: Vec<(i64, String)> = observed(&w.hover, &w.hover_reads, t1, until)
+        .into_iter()
+        .map(|(t, h)| (t, unstopped(h, StopForm::Hover).into_owned()))
+        .collect();
+    let mut bad = Vec::new();
+    let mut unread = Vec::new();
+    let mut said = Vec::new();
+    for (surface, reads) in [("state line", &lines), ("hover", &hovers)] {
+        let shown: Vec<&(i64, String)> = reads
+            .iter()
+            .filter(|(t, l)| l.contains(NOT_LANDED_YET) && open_at(*t))
+            .collect();
+        let (early, late): (Vec<_>, Vec<_>) = shown
+            .into_iter()
+            .partition(|(t, _)| second.is_none_or(|c| *t <= c));
+        if let Some((t, l)) = early.iter().find(|(_, l)| !l.contains(&old)) {
+            bad.push(format!(
+                "+{} the {surface} said the Open leg without quoting the list: {}",
+                at(cx.t0, *t),
+                one_line(l, 200)
+            ));
+        }
+        if let Some((t, l)) = late.iter().find(|(_, l)| !l.contains(&new)) {
+            bad.push(format!(
+                "+{} the {surface} said the Open leg after the second check without its new \
+                 words: {}",
+                at(cx.t0, *t),
+                one_line(l, 200)
+            ));
+        }
+        match (early.first(), late.first()) {
+            (Some((tf, _)), Some((tn, _))) => said.push(format!(
+                "the {surface} quoted the list at +{}, the new words at +{}",
+                at(cx.t0, *tf),
+                at(cx.t0, *tn)
+            )),
+            (None, Some((tn, _))) => {
+                said.push(format!(
+                    "the {surface} quoted the new words at +{}",
+                    at(cx.t0, *tn)
+                ));
+                unread.push(format!("the {surface} never read the first list's hold"));
+            }
+            (Some((tf, _)), None) => unread.push(format!(
+                "the {surface} quoted the list at +{}, and {}",
+                at(cx.t0, *tf),
+                if second.is_some() {
+                    "never said the Open leg after the second check"
+                } else {
+                    "no second check was typed"
+                }
+            )),
+            (None, None) => unread.push(format!(
+                "the {surface} never said the Open leg while `status` held it"
+            )),
+        }
+    }
+    told(said.join("; "), &bad, &unread)
 }
 
 /// L5 (and L16's and L17's end).
@@ -511,13 +709,17 @@ pub fn gone(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
         ));
     }
     let hovers = observed(&w.hover, &w.hover_reads, after, seen.end_ms + 1);
-    if let Some((t, h)) = hovers.iter().find(|(_, h)| h.contains("not landed yet")) {
+    if let Some((t, h)) = hovers
+        .iter()
+        .find(|(_, h)| h.contains(NOT_LANDED_YET) || h.contains(WAITS_ON_YOU))
+    {
         bad.push(format!("+{} the hover: {h}", at(cx.t0, *t)));
     }
     let pages = observed(&w.page, &w.page_reads, after, seen.end_ms + 1);
     if let Some((t, p)) = pages.iter().find(|(_, p)| {
-        page_field(p, "state")
-            .is_some_and(|s| s.contains("landing since") || s.contains("not landed yet"))
+        page_field(p, "state").is_some_and(|s| {
+            s.contains("landing since") || s.contains(NOT_LANDED_YET) || s.contains(WAITS_ON_YOU)
+        })
     }) {
         bad.push(format!(
             "+{} the state line: {}",
@@ -558,8 +760,8 @@ pub fn defense_tip(nudges: usize) -> String {
 /// one level into its manager's submenu says `● <label> — working` before Land's instruction
 /// (§12.4.1: a worker on its first task works) and `● <label> — landing` once the instruction
 /// was typed and its hold stands, its manager's row counting it `1 landing`; once `status`
-/// reads the hold, its tip is the hold's tip form ([`defense_tip`]); never `landing` once
-/// landed.
+/// reads the hold, its tip is the hold's tip form ([`defense_tip`]), or its nudges alone once
+/// a defense got the land check; never `landing` once landed.
 pub fn worker_row(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     let Some((t1, _)) = began(seen) else {
         return Verdict::Unobserved("no land act (its records)".into());
@@ -626,10 +828,23 @@ pub fn worker_row(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
             defense_tip(n),
             defense_tip(nudges_between(seen, t1, *t - NUDGE_SLACK_MS)),
         ];
+        // Its defense answered the hold: while the land check it got is out, the tip is its
+        // nudges alone (slice 13a: a defense is checked before it lands).
+        let checked = seen
+            .acts(turn_end::RULE_LAND_CHECK)
+            .iter()
+            .any(|(c, _)| *c > t1 && *c < *t + NUDGE_SLACK_MS);
+        let answered = || {
+            [n, nudges_between(seen, t1, *t - NUDGE_SLACK_MS)].map(|n| {
+                aterm_agent::harness::acts::nudge_words(u32::try_from(n).unwrap_or(u32::MAX))
+            })
+        };
         match tip {
             Some(tip) if wants.iter().any(|w| w == tip) => {
                 tipped.get_or_insert((*t, tip.to_string()));
             }
+            Some(tip) if checked && answered().iter().any(|w| w.as_deref() == Some(tip)) => {}
+            None if checked => {}
             Some(tip) if read || tip.starts_with("not landed yet") => bad.push(format!(
                 "+{} its tip {tip:?}, not the hold's {:?}",
                 at(cx.t0, *t),

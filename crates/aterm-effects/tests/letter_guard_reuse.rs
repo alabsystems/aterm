@@ -2,12 +2,14 @@
 // Copyright 2026 Andrew Yates
 //
 // The letter guard's work follows what moved: replayed through the shipping
-// effects pipeline (`EffectsPipeline::apply`), a guard that takes back the
-// frame before's streams while its lights, text and grid are unchanged, and
-// a cell's verdict while the cell's lights and text are the frame before's,
-// publishes every frame's light streams exactly as one that judges every
-// cell of every frame afresh, and a frame whose lights did not move judges
-// no cell at all.
+// effects pipeline (`EffectsPipeline::apply`), the frame's glyph ink observed
+// first as the GUI observes it (so a letter whose glyph the face's table holds
+// a raster for is read by the ring round its strokes and read again on its cut
+// lights, and any other by its solid ink), a guard that takes back the frame
+// before's streams while its lights, text and grid are unchanged, and a cell's
+// verdict while the cell's lights and text are the frame before's, publishes
+// every frame's light streams exactly as one that judges every cell of every
+// frame afresh, and a frame whose lights did not move judges no cell at all.
 
 use aterm_core::render::{GlowQuad, RenderInput};
 use aterm_core::terminal::{ClockReading, Rgb, Terminal};
@@ -17,13 +19,14 @@ use aterm_effects::pipeline::EffectsPipeline;
 
 const ROWS: u16 = 14;
 const COLS: u16 = 72;
-const CELL: (usize, usize) = (18, 38);
 const FRAME_MS: u64 = 16;
 
 struct Replay {
     term: Terminal,
     fx: EffectsPipeline,
     ms: u64,
+    /// The face whose glyph ink each frame observes and whose cells it lays out.
+    rend: aterm_render::Renderer,
 }
 
 impl Replay {
@@ -54,7 +57,20 @@ impl Replay {
         let pet = aterm_effects::cursor_glow::GlowStyle::style_names_any_pet(style);
         fx.set_cursor_pet(pet, 0x5EED);
         fx.set_letter_guard_reuse(reuse);
-        Self { term, fx, ms: 0 }
+        // The render suite's bundled last-resort face, so the fold below reads the same
+        // rasters on every machine; it draws the Latin, Cyrillic and Greek letters typed here.
+        let rend = aterm_render::Renderer::from_bytes(
+            include_bytes!("../../aterm-render/assets/DejaVuSansMono.ttf"),
+            22.0,
+            aterm_render::Theme::default(),
+        )
+        .expect("the bundled face");
+        Self {
+            term,
+            fx,
+            ms: 0,
+            rend,
+        }
     }
 
     fn to(&mut self, ms: u64) {
@@ -83,10 +99,14 @@ impl Replay {
     }
 
     /// One frame: the light streams it publishes, each stream's ramps
-    /// expanded into the quads they draw.
+    /// expanded into the quads they draw. The frame's glyph ink is read off
+    /// its input before the effects run, as `app_render` reads it.
     fn present(&mut self) -> Frame {
         let mut input: RenderInput = self.term.cell_frame(usize::from(ROWS), usize::from(COLS));
-        self.fx.apply(&mut self.term, &mut input, CELL.0, CELL.1);
+        let ink = self.rend.glyph_ink_for(&input);
+        self.fx.cursor_mut().glow.observe_glyph_ink(Some(ink));
+        let (cw, ch) = self.rend.cell_size();
+        self.fx.apply(&mut self.term, &mut input, cw, ch);
         let mut over = Vec::new();
         input
             .cursor_glow_add_ramps
@@ -244,9 +264,11 @@ fn kept_frames_and_verdicts_publish_what_judging_afresh_does() {
         let style = styles[(next() % styles.len() as u64) as usize];
         let look = looks[(next() % looks.len() as u64) as usize];
         let len = 6 + next() % 24;
+        // Letters the face's table holds rasters for, and some it holds none for.
         let text: String = (0..len)
-            .map(|_| match next() % 6 {
+            .map(|_| match next() % 7 {
                 0 => ' ',
+                1 => ['é', 'ж', 'λ', 'ß'][(next() % 4) as usize],
                 k => char::from(b'a' + ((next() + k) % 26) as u8),
             })
             .collect();
@@ -278,10 +300,27 @@ fn kept_frames_and_verdicts_publish_what_judging_afresh_does() {
 /// guard's cuts; this test, run on that branch's tip before it merged 1.9 (0088eabcf0), folded to
 /// `0xc907_d12e_9b56_8217`, and so did the merged tree: 1.9 still leaves the guard as its parent
 /// had it. Review 9's trail/rev9fix floats Comet's dark dust only into a row blank across on the
-/// page's own ground (the owner's ruling); merged onto main 227b056193 it folds to the value
-/// below. Folded style by style there and on that main, 22 of the 24 styles and grounds fold
-/// alike, and the two that differ are Comet on the dark and dim grounds, where the dust is drawn.
-const GUARDED_FOLD_AT_THE_PARENT: u64 = 0x0664_f9bc_280d_ea74;
+/// page's own ground (the owner's ruling); merged onto main 227b056193 it folded to
+/// `0x0664_f9bc_280d_ea74`. Folded style by style there and on that main, 22 of the
+/// 24 styles and grounds fold alike, and the two that differ are Comet on the dark and dim
+/// grounds, where the dust is drawn. trail/composed round 3 keeps Sparkle's paper marks off the
+/// letters just typed and gives paper Lumen (`aurora` reads as Lumen) its lingering tracer along
+/// the letters' foot; folded style by style before and after, 22 of the 24 fold alike, and the
+/// two that differ are Sparkle and Lumen on the light ground: `0x386b_bd32_9b36_d7ab`. r24 K7-1
+/// takes the companion's flight off a typing run's first key (looks8's first keys' spring);
+/// folded style by style before and after, 18 of the 24 fold alike, and the six that differ
+/// are the two companion styles (`rainbow kitty pet`, `rainbow kitty`) on each ground, whose
+/// cat now gets going on foot with `echo`'s first keys (fold `0x2707_980b_81f4_ce4f`). r25 K8-4 takes
+/// away the pet's page veil, which lay beneath the body it was laid for: folded style by style
+/// before and after, 18 of the 24 fold alike, and the six that differ are the two companion
+/// styles on each ground (no veil in their under stream): `0xf0f3_3640_b18b_9c2b`. r27 LG1 reads
+/// a letter whose glyph the face's table holds a raster for by the ring round its strokes, as the
+/// judges do, and keeps the room a dim letter's bar keeps over its share (`OWN_ROOM`) for a letter
+/// read by its solid ink alone; replayed without the frame's glyph ink, as they were until then
+/// (every letter read by its solid ink), the guarded streams still fold to that value. Its review
+/// has the replays observe the frame's glyph ink as the GUI does, from the render suite's bundled
+/// face at its own cells, so they judge the guard that ships: the value below.
+const GUARDED_FOLD_AT_THE_PARENT: u64 = 0x651f_3de5_5468_2007;
 
 /// FNV-1a over `words`, from `h`.
 fn fold_words(mut h: u64, words: impl IntoIterator<Item = u64>) -> u64 {

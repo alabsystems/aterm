@@ -7,7 +7,7 @@ use aterm_phase::{ApiCause, WallKind, classify_wall};
 
 use super::{
     Entry, TranscriptEnd, confirms, ended_with_nothing_pending, found_named, limit_named,
-    limit_words, refined, transcript_ends_on, transcript_wall, waits_on_background,
+    limit_words, refined, transcript_ends_on, transcript_wall, unanswered, waits_on_background,
 };
 
 fn fixture(name: &str) -> &'static str {
@@ -197,6 +197,58 @@ fn every_wall_claude_code_writes_confirms_its_own_kind_and_no_other() {
                 );
             }
         }
+    }
+}
+
+/// G1 (v6 §14.17.5): an overload, a server error (a 429 among them) or a lost connection over a
+/// transcript that ends on the prompt or a tool's result is the outage's; at the model's reply or
+/// a notice it is not, and no other wall, a reply cut off included, ever is.
+#[test]
+fn only_an_outage_over_a_prompt_or_a_tools_result_the_api_never_answered_is_unanswered() {
+    let rows = |name: &str| -> Vec<&'static str> { fixture(name).lines().skip(1).collect() };
+    let at_prompt = transcript_ends_on(&rows("context")[..1].join("\n"));
+    let bash = rows("bash-output-then-context");
+    let result = bash
+        .iter()
+        .position(|r| r.contains("\"tool_result\""))
+        .expect("the tool's result");
+    let at_result = transcript_ends_on(&bash[..=result].join("\n"));
+    let at_reply = transcript_ends_on(&bash[..result].join("\n"));
+    let at_notice = transcript_ends_on(fixture("529"));
+    assert_eq!(
+        (&at_prompt.last, &at_result.last, &at_reply.last),
+        (&Entry::Input, &Entry::ToolResult, &Entry::Reply)
+    );
+    let cut = WallKind::ApiError {
+        code: None,
+        retryable: true,
+        cause: ApiCause::CutOff,
+    };
+    let config = WallKind::ApiError {
+        code: None,
+        retryable: true,
+        cause: ApiCause::Config,
+    };
+    for kind in every_kind().into_iter().chain([cut, config]) {
+        let outage = matches!(
+            kind,
+            WallKind::Overloaded
+                | WallKind::ApiError {
+                    cause: ApiCause::Server | ApiCause::Unreachable | ApiCause::Config,
+                    ..
+                }
+        );
+        assert_eq!(
+            unanswered(kind, &at_prompt),
+            outage,
+            "{kind:?} at the prompt"
+        );
+        assert_eq!(unanswered(kind, &at_result), outage, "{kind:?} at a result");
+        assert!(
+            !unanswered(kind, &at_reply),
+            "{kind:?} at the model's reply"
+        );
+        assert!(!unanswered(kind, &at_notice), "{kind:?} at a notice");
     }
 }
 

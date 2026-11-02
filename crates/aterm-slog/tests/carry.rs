@@ -1507,6 +1507,25 @@ fn a_closed_summary_whose_fold_holds_a_node_open_is_refused() {
             back.fold().state().open[0].as_ref().map(|o| o.node)
         ),
     }
+
+    let dup_open = summary.replacen("\nr 1 ", "\nr 1 1 0 1 o - s spawn aterm exact -\nr 2 ", 1);
+    if dup_open != summary {
+        assert!(
+            matches!(
+                Log::from_closed_summary(&dup_open),
+                Err(CarryError::Record(_))
+            ),
+            "duplicate session open record in closed summary must be refused"
+        );
+    }
+    let mark_rec = "slog-sum v=1 ep=1 base=1 first=1 last=5 lost=0 newest_lost=0\nr 1 1 0 1 m - s spawn aterm exact -";
+    assert!(
+        matches!(
+            Log::from_closed_summary(mark_rec),
+            Err(CarryError::Record(_))
+        ),
+        "non-open/close session record in closed summary must be refused"
+    );
 }
 
 #[test]
@@ -1613,4 +1632,51 @@ fn a_carry_sheds_a_cmd_detail_amend_with_its_open() {
         some && none,
         "PRECONDITION: the cuts carried some commands' opens and shed others"
     );
+}
+
+#[test]
+fn carry_and_cursor_parsers_reject_plus_prefixed_numbers_and_bound_step_detail() {
+    assert_eq!(aterm_slog::BusCursor::parse("+1:2:3"), None);
+    assert_eq!(aterm_slog::BusCursor::parse("1:+2:3"), None);
+    assert_eq!(aterm_slog::BusCursor::parse("1:2:+3"), None);
+    assert_eq!(
+        aterm_slog::BusCursor::parse("1:2:3"),
+        Some(aterm_slog::BusCursor::new(1, 2, 3))
+    );
+
+    let now = at(1_000);
+    assert!(
+        TurnTracker::from_carry_line(
+            "tracker run=r1 turn=none word=idle interrupted=0 settle=idle settle_wall=+100",
+            now
+        )
+        .is_none()
+    );
+    assert!(
+        TurnTracker::from_carry_line(
+            "tracker run=r1 turn=none word=idle interrupted=0 ledger=+1 ledger_by=human ledger_wall=100",
+            now
+        )
+        .is_none()
+    );
+    let tr = TurnTracker::from_carry_line(
+        "tracker run=r1 turn=t1 word=busy interrupted=0 step=p1 step_under=1 step_what=wall step_wall=usage-session step_detail=%00%07 tx_fp=+1a tx_off=10",
+        now,
+    )
+    .expect("tracker parses");
+    let carried = tr.carry_line(now);
+    assert!(
+        !carried.contains("tx_fp="),
+        "plus-prefixed tx_fp is rejected: {carried}"
+    );
+    assert!(
+        !carried.contains("step_detail="),
+        "step_detail with only control bytes is sanitized to None by BoundedToken: {carried}"
+    );
+
+    let bad_summary = "slog-sum v=1 ep=+1 base=1 first=1 last=1 lost=0 newest_lost=0";
+    assert!(matches!(
+        Log::from_closed_summary(bad_summary),
+        Err(CarryError::Line(_))
+    ));
 }

@@ -57,6 +57,7 @@ pub struct Formula {
     pub oldnames: Vec<String>,
     /// A `head` spec exists (`urls.head` in the API object).
     pub head: bool,
+    pub head_url: String,
     /// Declared build options as (flag, description) pairs.
     pub options: Vec<(String, String)>,
     pub deprecate_disable: DeprecateDisable,
@@ -482,6 +483,7 @@ impl Formula {
             aliases: str_list(v.get("aliases")),
             oldnames: str_list(v.get("oldnames")),
             head: matches!(v.pointer("/urls/head"), Some(Value::Object(_))),
+            head_url: s(v.pointer("/urls/head/url")),
             options: parse_options(v.get("options")),
             deprecate_disable: parse_deprecate_disable(v),
             executables: str_list(v.get("executables")),
@@ -639,6 +641,8 @@ pub struct Cask {
     pub git_branch_path: Option<(String, String)>,
     /// `container nested: "<path>"`.
     pub nested: Option<String>,
+    /// Renamed-from tokens (`old_tokens`; `migrate` resolution).
+    pub old_tokens: Vec<String>,
 }
 
 /// One cask `variations` entry.
@@ -1393,6 +1397,7 @@ impl Cask {
             naked,
             git_branch_path,
             nested,
+            old_tokens: str_list(v.get("old_tokens")),
         })
     }
 }
@@ -1464,8 +1469,12 @@ fn token_cmp(x: &str, y: &str) -> Ordering {
     if x == y {
         return Ordering::Equal;
     }
-    let xn = x.parse::<u128>().ok();
-    let yn = y.parse::<u128>().ok();
+    let xn = (!x.starts_with('+'))
+        .then(|| x.parse::<u128>().ok())
+        .flatten();
+    let yn = (!y.starts_with('+'))
+        .then(|| y.parse::<u128>().ok())
+        .flatten();
     match (xn, yn) {
         (Some(a), Some(b)) => a.cmp(&b),
         (None, Some(0)) | (Some(0), None) if x.is_empty() || y.is_empty() => Ordering::Equal,
@@ -1911,5 +1920,6 @@ mod tests {
             f.bottle_for(&["arm64_tahoe".to_string()]).unwrap().sha256,
             "def"
         );
+        assert_ne!(token_cmp("+10", "10"), Ordering::Equal);
     }
 }

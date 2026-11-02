@@ -42,7 +42,7 @@ pub fn temp_roots() -> Vec<PathBuf> {
 pub fn temp_roots_from(temp_dir: PathBuf) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     let mut push = |candidate: PathBuf| {
-        if candidate.is_absolute() && candidate.parent().is_some() && !roots.contains(&candidate) {
+        if candidate.has_root() && candidate.parent().is_some() && !roots.contains(&candidate) {
             roots.push(candidate);
         }
     };
@@ -59,12 +59,23 @@ pub fn temp_roots_from(temp_dir: PathBuf) -> Vec<PathBuf> {
 /// that starts with [`CACHEDIR_TAG_SIGNATURE`].
 fn is_cache_dir(dir: &Path) -> bool {
     let tag = dir.join("CACHEDIR.TAG");
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(not(unix))]
     if !std::fs::symlink_metadata(&tag).is_ok_and(|meta| meta.file_type().is_file()) {
         return false;
     }
-    let Ok(file) = std::fs::File::open(&tag) else {
+    let Ok(file) = options.open(&tag) else {
         return false;
     };
+    if !file.metadata().is_ok_and(|meta| meta.is_file()) {
+        return false;
+    }
     let mut head = Vec::with_capacity(CACHEDIR_TAG_SIGNATURE.len());
     file.take(4096).read_to_end(&mut head).is_ok()
         && head.starts_with(CACHEDIR_TAG_SIGNATURE.as_bytes())
@@ -103,6 +114,16 @@ mod tests {
         )
         .unwrap();
         assert!(transient(&inside.join("aterm"), &elsewhere));
+        #[cfg(unix)]
+        {
+            let target = cache.join("real-tag");
+            std::fs::rename(cache.join("CACHEDIR.TAG"), &target).unwrap();
+            std::os::unix::fs::symlink(&target, cache.join("CACHEDIR.TAG")).unwrap();
+            assert!(
+                !transient(&inside.join("aterm"), &elsewhere),
+                "a symlinked CACHEDIR.TAG is rejected by O_NOFOLLOW"
+            );
+        }
         std::fs::remove_dir_all(&cache).unwrap();
 
         let dup_roots = temp_roots_from(PathBuf::from("/tmp"));

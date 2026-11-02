@@ -69,6 +69,78 @@ fn owner(app: &App) -> Option<MenuOwner> {
 }
 
 #[test]
+fn a_transcript_limit_without_a_recovery_observation_has_a_menu_and_copy() {
+    use aterm_agent::harness::{footer::UNOBSERVED_RECOVERY_FINDING, session_usage::Wall};
+
+    crate::control::PBPASTE_STUB.with(|board| *board.borrow_mut() = None);
+    let (mut app, wid, session, mut reader) = glass(true);
+    let _host = host(&mut app);
+    let human = human_seq(&app, session);
+    {
+        let mut timeline = app.pool.get(session).unwrap().ctx.timeline.lock().unwrap();
+        let mut facts = timeline.claude_footer().unwrap().clone();
+        assert!(facts.account_progress.is_none());
+        facts.usage.get_or_insert_with(Default::default).wall = Some(Wall {
+            label: "7d",
+            resets: "tomorrow at 3pm".into(),
+        });
+        assert!(timeline.set_claude_footer(PGID, None, Some(facts)));
+    }
+    menu_frame(&mut app, wid);
+    press_fact(&mut app, wid, session, Fact::Account, MouseButton::Right);
+    let notes = app
+        .autopilot_menu
+        .as_ref()
+        .expect("open account menu")
+        .rows
+        .iter()
+        .filter_map(|row| match row {
+            MenuRow::Note { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        notes
+            .iter()
+            .any(|text| text.contains("provider reset: tomorrow at 3pm"))
+    );
+    assert!(notes.iter().any(|text| {
+        text.strip_prefix("Limit: ")
+            .is_some_and(|limit| limit.contains("provider reset: tomorrow at 3pm"))
+    }));
+    assert!(notes.iter().any(|text| text == UNOBSERVED_RECOVERY_FINDING));
+    assert!(notes.iter().any(|text| text == "Observed unknown"));
+    assert!(notes.iter().any(|text| text == "Next event unknown"));
+
+    row_of(&app, "fact-menu/account/network-state");
+    let copy = row_of(&app, "fact-menu/account/copy-recovery");
+    app.choose_autopilot_menu_row(copy);
+    let copied = crate::control::PBPASTE_STUB
+        .with(|board| board.borrow().clone())
+        .unwrap();
+    assert!(copied.contains("Recovery: State unknown"));
+    assert!(copied.contains("Accounts: unknown; eligible: unknown"));
+    assert!(copied.contains("provider reset: tomorrow at 3pm"));
+    assert!(copied.contains("Next event unknown"));
+    assert!(
+        app.pool
+            .get(session)
+            .unwrap()
+            .ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .claude_footer()
+            .unwrap()
+            .account_progress
+            .is_none()
+    );
+    assert!(pty(&mut reader, 0).is_empty(), "disclosure types nothing");
+    assert_eq!(human_seq(&app, session), human);
+    crate::control::PBPASTE_STUB.with(|board| *board.borrow_mut() = None);
+}
+
+#[test]
 fn a_right_click_on_a_fact_opens_its_menu_hung_from_it() {
     let (mut app, wid, session, mut reader) = glass(true);
     let human = human_seq(&app, session);
@@ -466,7 +538,7 @@ fn a_click_on_usage_opens_the_card_and_a_second_click_closes_it() {
     assert_eq!(
         menu.rows
             .iter()
-            .filter(|row| matches!(row, MenuRow::Plot(_)))
+            .filter(|row| matches!(row, MenuRow::Plot { .. }))
             .count(),
         5,
         "two bands of two rows and the axis"

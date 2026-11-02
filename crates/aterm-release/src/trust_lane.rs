@@ -23,9 +23,6 @@ const LANE_PROFILE: &str = "trust-lane";
 /// Per-check wall-clock budget (`6h`) before a check is terminated as `OVER-BUDGET`.
 pub const DEFAULT_BUDGET: Duration = Duration::from_secs(6 * 3600);
 
-/// Maximum time to wait for a foreign or silent `trustd` to leave the socket.
-pub const TRUSTD_WAIT: Duration = Duration::from_secs(330);
-
 /// How often the slots are polled.
 const POLL: Duration = Duration::from_millis(250);
 
@@ -97,9 +94,8 @@ pub struct Config {
     pub prover: Option<PathBuf>,
     /// Directory for cost history and host memory records.
     pub state: Option<PathBuf>,
-    pub trustd_wait: Duration,
-    /// Whether a target root another run holds is COULD NOT RUN at once (`--no-wait`) instead
-    /// of waited for.
+    /// Whether a target root another run holds, or a socket a trustd of another build serves,
+    /// is COULD NOT RUN at once (`--no-wait`) instead of waited for.
     pub no_wait: bool,
     /// How the run's disk claim and each check's memory claim are admitted (`--admit wait`, the
     /// default, or `--admit now`, which takes each at once and says what it would have waited
@@ -124,7 +120,6 @@ impl Config {
             stop_if_narrowed: false,
             prover: None,
             state: None,
-            trustd_wait: TRUSTD_WAIT,
             no_wait: false,
             admit: aterm_capacity::Admit::Wait,
         }
@@ -177,6 +172,12 @@ impl Outcome {
     }
 }
 
+fn parse_uint<T: std::str::FromStr>(s: &str) -> Option<T> {
+    (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| s.parse().ok())
+        .flatten()
+}
+
 /// Parses CLI arguments after `trust run`.
 ///
 /// # Errors
@@ -198,7 +199,7 @@ pub fn parse<'a>(it: &mut impl Iterator<Item = &'a str>) -> Result<Config, Strin
                 let v = value()?;
                 cfg.jobs = match v {
                     "auto" => None,
-                    n => Some(n.parse().ok().filter(|n| *n > 0).ok_or(format!(
+                    n => Some(parse_uint(n).filter(|n| *n > 0).ok_or(format!(
                         "trust run: --jobs takes a count or auto, got {n:?}"
                     ))?),
                 };
@@ -206,7 +207,7 @@ pub fn parse<'a>(it: &mut impl Iterator<Item = &'a str>) -> Result<Config, Strin
             "--target-root" => cfg.target_root = Some(PathBuf::from(value()?)),
             "--crate-budget" => {
                 let v = value()?;
-                let secs: u64 = v.parse().ok().filter(|s| *s > 0).ok_or(format!(
+                let secs: u64 = parse_uint(v).filter(|s| *s > 0).ok_or(format!(
                     "trust run: --crate-budget takes whole seconds, got {v:?}"
                 ))?;
                 cfg.budget = Duration::from_secs(secs);
@@ -341,7 +342,9 @@ pub fn lane_env(bin: &Path, host: &dyn Fn(&str) -> Option<String>) -> Vec<(Strin
             env.push((k.into(), v));
         }
     }
-    if let Some(j) = host("CARGO_BUILD_JOBS").filter(|j| j.parse::<u32>().is_ok_and(|n| n > 0)) {
+    if let Some(j) =
+        host("CARGO_BUILD_JOBS").filter(|j| parse_uint::<u32>(j).is_some_and(|n| n > 0))
+    {
         env.push(("CARGO_BUILD_JOBS".into(), j));
     }
     let doc = bin.join("trustdoc");
@@ -825,9 +828,9 @@ pub fn parse_costs(text: &str) -> BTreeMap<String, Cost> {
             Some((
                 (*f.first()?).to_string(),
                 Cost {
-                    cpu: f.get(1)?.parse().ok()?,
-                    wall: f.get(2)?.parse().ok()?,
-                    maxrss: f.get(3)?.parse().ok()?,
+                    cpu: parse_uint(f.get(1)?)?,
+                    wall: parse_uint(f.get(2)?)?,
+                    maxrss: parse_uint(f.get(3)?)?,
                     when: f.get(4).map_or_else(String::new, |w| (*w).to_string()),
                 },
             ))
@@ -919,6 +922,11 @@ pub trait Checks {
     fn start(&mut self, job: &mut Job) -> std::io::Result<Box<dyn Check>>;
     /// Whether this build's `trustd` currently holds the socket.
     fn trustd_held(&self) -> bool;
+    /// How many times so far the `trustd` this run held went away under it
+    /// ([`trustd::Keeper::lost`]): a check across which it rose lost its prover.
+    fn trustd_lost(&self) -> u32 {
+        0
+    }
     /// Probes the current `trustd` socket state (`<none|ours|foreign|silent>\t<detail>`).
     fn probe_trustd(&mut self) -> String;
     /// Whether the run was interrupted by a signal.
@@ -1136,6 +1144,16 @@ impl<'m> Admission<'m> {
         }
         let waited = now.saturating_sub(head.entered);
         match head.waiter.poll(self.machine) {
+            // Its claim file was removed (the ledger's directory cleaned): no look could ever
+            // admit it, so it starts unclaimed, saying why, as a check whose ledger cannot be
+            // used does.
+            Polled::Gone(e) => {
+                say(&format!(
+                    "capacity: {what} starts unclaimed after waiting {} at the launch gate: {e}",
+                    span(waited)
+                ));
+                Some(Admitted::unclaimed())
+            }
             Polled::Admitted(claim) => {
                 if head.said.is_some() {
                     say(&format!("capacity: {what} admitted after {}", span(waited)));
@@ -1191,6 +1209,8 @@ pub struct Finished {
     /// The host's mean one-minute load over the polls the check ran through ([`Checks::load`]);
     /// `None` when none could be read.
     pub load: Option<f64>,
+    /// Whether the `trustd` the run held went away while the check ran ([`Checks::trustd_lost`]).
+    pub trustd_lost: bool,
 }
 
 /// Reason [`run_slots`] stopped before draining its queue.
@@ -1225,6 +1245,8 @@ pub fn run_slots(
         load: (f64, u32),
         /// Its memory claim, let go when it ends.
         _claim: Admitted,
+        /// [`Checks::trustd_lost`] as it started.
+        lost: u32,
     }
     let mut queue: VecDeque<Job> = jobs.into();
     let slots = slots.max(1);
@@ -1268,6 +1290,7 @@ pub fn run_slots(
                     since: checks.now(),
                     load: (0.0, 0),
                     _claim: claim,
+                    lost: checks.trustd_lost(),
                 }),
                 Err(e) => {
                     stop_all(&mut running);
@@ -1305,6 +1328,7 @@ pub fn run_slots(
                         ended,
                         over_budget,
                         load: (r.load.1 > 0).then(|| r.load.0 / f64::from(r.load.1)),
+                        trustd_lost: checks.trustd_lost() > r.lost,
                     },
                     checks,
                 );
@@ -1379,7 +1403,9 @@ impl TreeTimes {
     }
 }
 
-/// Writes sidecar status, pace, budget, and `trustd` marks for the judge after a check ends.
+/// Writes sidecar status, pace, budget, and `trustd` marks for the judge after a check ends: a
+/// `.trustd` mark when targo would not start it, and a `.trustd-lost` mark, what serves the
+/// socket now, when the `trustd` it ran beside went away while it ran.
 ///
 /// # Errors
 /// Returns an error if any sidecar mark file cannot be written.
@@ -1400,6 +1426,12 @@ pub fn record(
     let refused = String::from_utf8_lossy(&text).contains(trust_facts::TRUSTD_REFUSED);
     if refused {
         fs::write(beside("trustd"), format!("{}\n", probe()))?;
+    }
+    if f.trustd_lost {
+        // What serves the socket now that the trustd the check ran beside went away.
+        let now = probe();
+        let what = now.split_once('\t').map_or(now.as_str(), |(_, what)| what);
+        fs::write(beside("trustd-lost"), format!("{what}\n"))?;
     }
     if let Some(lock) = &f.job.lock
         && lock.created
@@ -1438,6 +1470,13 @@ trait Bench {
     /// # Errors
     /// trustc could not be run, or printed nothing.
     fn takes_ceiling(&mut self, driver: &Driver) -> Result<bool, String>;
+    /// Waits for trustd's socket to serve `prep`'s prover's `trustd` or nothing
+    /// ([`trustd::wait_usable`]): a run with checks to make waits here, before it claims its
+    /// disk, so a wait with no deadline holds no claim other builds wait behind.
+    ///
+    /// # Errors
+    /// What held the socket when `--no-wait` would not wait or an interrupt ended the wait.
+    fn trustd(&mut self, cfg: &Config, prep: &Prepared, out: &mut dyn Write) -> Result<(), String>;
     /// Runs `jobs` across `slots` beside this prover's `trustd`.
     ///
     /// # Errors
@@ -1548,6 +1587,18 @@ impl Bench for Machine {
         Ok(lists_ceiling(&help))
     }
 
+    fn trustd(&mut self, cfg: &Config, prep: &Prepared, out: &mut dyn Write) -> Result<(), String> {
+        let want = trustd::build_digest(&prep.driver.bin.join("trustd"));
+        let wait = if cfg.no_wait {
+            named_lock::Wait::No
+        } else {
+            named_lock::Wait::Block
+        };
+        trustd::wait_usable(&trustd::socket(), &want, wait, out, &|| {
+            crate::interrupt::caught().is_some()
+        })
+    }
+
     fn checks(
         &mut self,
         cfg: &Config,
@@ -1559,7 +1610,8 @@ impl Bench for Machine {
     ) -> Result<(), String> {
         let sock = trustd::socket();
         let want = trustd::build_digest(&prep.driver.bin.join("trustd"));
-        trustd::wait_usable(&sock, &want, cfg.trustd_wait, out)?;
+        // Again: another build's trustd can have come while the run waited for its disk.
+        self.trustd(cfg, prep, out)?;
         let keeper = trustd::Keeper::start(
             sock.clone(),
             want.clone(),
@@ -1683,7 +1735,12 @@ pub fn run(cfg: &Config, out: &mut dyn Write) -> Outcome {
 fn run_on(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Outcome {
     let ran = match prepare(cfg, bench, out) {
         Ok(prep) => {
-            let judged = match claim_disk(cfg, &prep.root, bench, out) {
+            let usable = if work(&prep).is_empty() {
+                Ok(())
+            } else {
+                bench.trustd(cfg, &prep, out).map_err(Stop::CouldNotRun)
+            };
+            let judged = match usable.and_then(|()| claim_disk(cfg, &prep.root, bench, out)) {
                 Ok(disk) => {
                     let judged =
                         check_and_conclude(cfg, &prep, bench, out).map_err(Stop::CouldNotRun);
@@ -2008,6 +2065,14 @@ fn prepare(cfg: &Config, bench: &mut dyn Bench, out: &mut dyn Write) -> Result<P
     })
 }
 
+/// The libraries `prep` checks: those gated that the memory guard did not refuse.
+fn work(prep: &Prepared) -> Vec<&Selected> {
+    prep.selected
+        .iter()
+        .filter(|s| matches!(s.decision, Decision::Gate(_)) && !prep.refused.contains(&s.lib.name))
+        .collect()
+}
+
 /// The checks, then the judge: `Err` is why nothing was decided.
 fn check_and_conclude(
     cfg: &Config,
@@ -2015,11 +2080,7 @@ fn check_and_conclude(
     bench: &mut dyn Bench,
     out: &mut dyn Write,
 ) -> Result<Outcome, String> {
-    let work: Vec<&Selected> = prep
-        .selected
-        .iter()
-        .filter(|s| matches!(s.decision, Decision::Gate(_)) && !prep.refused.contains(&s.lib.name))
-        .collect();
+    let work = work(prep);
     for stale in [".trustd-grants", ".trustd-seen"] {
         let _ = fs::remove_file(prep.logdir.join(stale));
     }
@@ -2030,6 +2091,7 @@ fn check_and_conclude(
             ".rc",
             ".pace",
             ".trustd",
+            ".trustd-lost",
             ".budget",
             ".oblig.tsv",
             ".oblig.err",
@@ -2399,20 +2461,37 @@ fn tree_state(repo: &Path) -> Option<(String, String)> {
 }
 
 /// The disk a run claims (`docs/DESIGN-adaptive-build-2026-10-24.md`, DISK-ADMIT): its target
-/// root, where its slots build and its logs go, measured, with what the last runs there wrote
-/// kept under `logs`, or where none was measured [`COLD_DISK`] less what the root holds.
+/// root, where its slots build and its logs go, measured, with what the last runs of its scope
+/// there wrote kept under `logs` (the whole tree, its `-p` set sorted, or a remeasure: a `-p`
+/// run's growth is not what a whole-tree run claims, nor the reverse), or where none of its scope
+/// was measured [`COLD_DISK`] less what the root holds.
 fn disk_run(cfg: &Config, root: &Path) -> atpkg::admit_disk::Run {
     let scope = match &cfg.scope {
         Scope::WholeTree => String::new(),
         Scope::Packages(p) => p.iter().map(|n| format!(" -p {n}")).collect(),
         Scope::Remeasure => " --remeasure".to_owned(),
     };
+    let kept_by = match &cfg.scope {
+        Scope::WholeTree => "whole-tree".to_owned(),
+        Scope::Packages(p) => {
+            let mut p = p.clone();
+            p.sort_unstable();
+            p.dedup();
+            p.iter()
+                .map(|n| format!("-p {n}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+        Scope::Remeasure => "--remeasure".to_owned(),
+    };
     atpkg::admit_disk::Run {
         what: format!("ship trust run{scope}"),
+        scope: kept_by,
         dirs: vec![root.to_path_buf()],
         record: root.join("logs").join(DISK_RECORD),
         cold: COLD_DISK,
         on: root.to_path_buf(),
+        stuck_ends: None,
     }
 }
 
@@ -2609,7 +2688,7 @@ impl CheckRecord {
     fn parse(text: &str) -> CheckRecord {
         fn two<A: std::str::FromStr, B: std::str::FromStr>(v: &str) -> Option<(A, B)> {
             let (a, b) = v.split_once(':')?;
-            Some((a.parse().ok()?, b.parse().ok()?))
+            Some((parse_uint(a)?, parse_uint(b)?))
         }
         let mut rec = CheckRecord::default();
         let (mut pid, mut serial) = (None, None);
@@ -2624,8 +2703,8 @@ impl CheckRecord {
                 Some(("boot", v)) if !v.is_empty() && v != "-" => rec.boot = Some(v.to_owned()),
                 Some(("lane", v)) => rec.lane = two(v).filter(|(p, _): &(i32, u64)| *p > 1),
                 Some(("dir", v)) => rec.dir = two(v),
-                Some(("pid", v)) => pid = v.parse::<i32>().ok().filter(|p| *p > 1),
-                Some(("serial", v)) => serial = v.parse::<u64>().ok(),
+                Some(("pid", v)) => pid = parse_uint::<i32>(v).filter(|p| *p > 1),
+                Some(("serial", v)) => serial = parse_uint::<u64>(v),
                 Some(("kept", v)) => rec.kept.extend(two(v).filter(|(p, _): &(i32, u64)| *p > 1)),
                 _ => {}
             }
@@ -2681,11 +2760,7 @@ fn dir_id(dir: &Path) -> Option<(u64, u64)> {
 
 /// The pid an earlier build's record (`<pid> <ps start>`) names its root by.
 fn earlier_pid(text: &str) -> Option<i32> {
-    text.split_whitespace()
-        .next()?
-        .parse::<i32>()
-        .ok()
-        .filter(|p| *p > 1)
+    parse_uint::<i32>(text.split_whitespace().next()?).filter(|p| *p > 1)
 }
 
 /// A serial no process holds: what it names (an earlier build's root, named by its pid alone;
@@ -2932,7 +3007,7 @@ fn host_memory() -> (u64, bool) {
     let kib = fs::read_to_string("/proc/meminfo").ok().and_then(|t| {
         t.lines()
             .find_map(|l| l.strip_prefix("MemTotal:"))
-            .and_then(|v| v.split_whitespace().next()?.parse::<u64>().ok())
+            .and_then(|v| parse_uint::<u64>(v.split_whitespace().next()?))
     });
     kib.map_or((0, false), |k| (k * 1024, true))
 }
@@ -3856,6 +3931,10 @@ impl Checks for RealChecks<'_> {
         self.keeper.held()
     }
 
+    fn trustd_lost(&self) -> u32 {
+        self.keeper.lost()
+    }
+
     fn probe_trustd(&mut self) -> String {
         trustd::probe(self.sock, self.want, Duration::from_secs(10)).line()
     }
@@ -4390,7 +4469,8 @@ pub mod proc_tree {
     #[cfg(target_os = "linux")]
     fn kin(pid: i32) -> Option<Kin> {
         stat_kin(
-            &std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?,
+            &aterm_uds::process::read_proc_text(std::path::Path::new(&format!("/proc/{pid}/stat")))
+                .ok()?,
             pid,
         )
     }
@@ -4408,18 +4488,22 @@ pub mod proc_tree {
     #[cfg(any(target_os = "linux", test))]
     fn stat_kin(stat: &str, pid: i32) -> Option<Kin> {
         let open = stat.find(" (")?;
-        if stat[..open].trim().parse::<i32>().ok()? != pid {
+        if super::parse_uint::<i32>(stat[..open].trim())? != pid {
             return None;
         }
         let close = stat.rfind(')')?;
         let comm = stat.get(open + 2..close)?;
         let mut fields = stat[close + 1..].split_ascii_whitespace();
         let state = fields.next()?;
-        let ppid = fields.next()?.parse().ok()?;
-        let sid = fields.nth(1)?.parse().ok().filter(|s| *s > 0);
-        let tty: i64 = fields.next()?.parse().ok()?;
-        let threads: u64 = fields.nth(12)?.parse().ok()?;
-        let serial = fields.nth(1)?.parse().ok()?;
+        let ppid = super::parse_uint(fields.next()?)?;
+        let sid = super::parse_uint(fields.nth(1)?).filter(|s| *s > 0);
+        let tty: i64 = fields
+            .next()
+            .filter(|s| !s.starts_with('+'))?
+            .parse()
+            .ok()?;
+        let threads: u64 = super::parse_uint(fields.nth(12)?)?;
+        let serial = super::parse_uint(fields.nth(1)?)?;
         let exited = matches!(state, "Z" | "X" | "x");
         Some(Kin {
             ppid,
@@ -4916,7 +5000,7 @@ pub mod proc_tree {
     /// Waits until none of `set` runs but those caught mid-spawn, which no signal went to, for
     /// at most [`Procs::settle_within`].
     fn settle(procs: &mut dyn Procs, set: &[Proc]) {
-        let deadline = Instant::now() + procs.settle_within();
+        let deadline = crate::durable::deadline_after(procs.settle_within());
         while set.iter().any(|p| !p.spawning && procs.alive(p)) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -4949,6 +5033,14 @@ pub mod proc_tree {
             assert!(k.ctty && !k.zombie, "on /dev/pts/0");
             assert_eq!(k.serial, 987_654);
             assert!(stat_kin(line, 4243).is_none(), "another pid's line");
+            assert!(
+                stat_kin(&line.replacen("4242 ", "+4242 ", 1), 4242).is_none(),
+                "plus-prefixed pid"
+            );
+            assert!(
+                stat_kin(&line.replace(") S 4200 ", ") S +4200 "), 4242).is_none(),
+                "plus-prefixed ppid"
+            );
         }
 
         /// The re-read before a signal must show the listed serial, no zombie, under the listed
@@ -5063,7 +5155,7 @@ pub mod trustd {
     use std::io::{BufRead as _, BufReader, Read as _, Write as _};
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -5128,10 +5220,21 @@ pub mod trustd {
     }
 
     fn ask(s: &mut BufReader<UnixStream>, req: &str) -> std::io::Result<String> {
+        const MAX_REPLY: usize = 64 * 1024;
         s.get_mut().write_all(format!("{req}\n").as_bytes())?;
         let mut line = String::new();
-        if s.read_line(&mut line)? == 0 {
+        if std::io::Read::by_ref(s)
+            .take((MAX_REPLY as u64) + 1)
+            .read_line(&mut line)?
+            == 0
+        {
             return Err(std::io::Error::other("it closed the connection"));
+        }
+        if line.len() > MAX_REPLY {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "trustd reply exceeds 64 KiB",
+            ));
         }
         Ok(line.trim().to_string())
     }
@@ -5189,7 +5292,8 @@ pub mod trustd {
             );
         }
         let t0 = Instant::now();
-        let stream = match UnixStream::connect(sock) {
+        // A Unix-domain connect never waits on Apple, so it may hold the spawn lock.
+        let stream = match aterm_uds::kept_out(|| UnixStream::connect(sock)) {
             Ok(s) => s,
             Err(e) => {
                 let what = format!("nothing serves {} ({e})", sock.display());
@@ -5241,60 +5345,268 @@ pub mod trustd {
         }
     }
 
-    /// Waits up to `wait` for `sock` to hold this build's `trustd` or nothing.
-    ///
-    /// # Errors
-    /// What held the socket once `wait` ran out or the run was interrupted, and how to resolve
-    /// it.
-    pub fn wait_usable(
-        sock: &Path,
-        want: &str,
-        wait: Duration,
-        out: &mut dyn std::io::Write,
-    ) -> Result<(), String> {
-        let until = Instant::now() + wait;
-        let mut said = false;
-        loop {
-            let p = probe(sock, want, Duration::from_secs(10));
-            if matches!(p.held, Held::None | Held::Ours) {
-                return Ok(());
-            }
-            if !said {
-                let _ = writeln!(
-                    out,
-                    "trust: waiting up to {} s for this build's trustd or none: {}",
-                    wait.as_secs(),
-                    p.what
-                );
-                said = true;
-            }
-            let never = "never signal it: a killed trustd records DIRTY and blocks every check \
+    /// How often a wait for the socket looks at it again ([`wait_usable`]).
+    pub const LOOK_EVERY: Duration = Duration::from_secs(5);
+
+    /// What a look at the socket gives each answer it waits for: a trustd that takes longer
+    /// reads silent, and the wait looks again.
+    const LOOK_GIVES: Duration = Duration::from_secs(10);
+
+    /// The most leases a wait line names.
+    const LEASES_SAID: usize = 8;
+
+    const NEVER: &str = "never signal it: a killed trustd records DIRTY and blocks every check \
                          until `--recover-after-crash` attests no solver survives";
-            if Instant::now() >= until || crate::interrupt::caught().is_some() {
-                let remedy = if p.held == Held::Foreign {
-                    format!("re-run once it retires (300 s after its last grant); {never}")
+
+    /// A lease a trustd granted, as its STATUS names it.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct Lease {
+        pub pid: u32,
+        /// What its holder said it holds trustd for: the lane's keeper says `trust lane holds
+        /// trustd for its run`.
+        pub label: String,
+    }
+
+    /// The leases the trustd at `sock` says it has granted (its STATUS `active` list), or
+    /// `None` when it would not say.
+    fn leases(sock: &Path, wait: Duration) -> Option<Vec<Lease>> {
+        let stream = aterm_uds::kept_out(|| UnixStream::connect(sock)).ok()?;
+        let _ = stream.set_read_timeout(Some(wait));
+        let _ = stream.set_write_timeout(Some(wait));
+        let mut s = BufReader::new(stream);
+        ask(&mut s, "IDENTITY").ok()?;
+        let status: aterm_json::Value = aterm_json::from_str(&ask(&mut s, "STATUS").ok()?).ok()?;
+        status
+            .get("active")?
+            .as_array()?
+            .iter()
+            .map(|lease| {
+                Some(Lease {
+                    pid: u32::try_from(lease.get("pid")?.as_u64()?).ok()?,
+                    label: crate::trust_facts::one_line(
+                        lease
+                            .get("label")
+                            .and_then(aterm_json::Value::as_str)
+                            .unwrap_or(""),
+                    ),
+                })
+            })
+            .collect()
+    }
+
+    /// Whom `leases` names, for a wait line: what keeps a trustd of another build serving,
+    /// since one retires 300 s after its last grant ends.
+    #[must_use]
+    pub fn leased_by(leases: Option<&[Lease]>) -> String {
+        let Some(leases) = leases else {
+            return String::new();
+        };
+        if leases.is_empty() {
+            return "; it holds no lease, so it retires 300 s after its last grant".into();
+        }
+        let mut named: Vec<String> = leases
+            .iter()
+            .take(LEASES_SAID)
+            .map(|l| {
+                let label = if l.label.is_empty() {
+                    String::new()
                 } else {
-                    format!("re-run when the machine is quieter; {never}")
+                    format!(" ({})", l.label)
                 };
-                return Err(format!(
-                    "{}, and it held the socket through the {} s the run waits; nothing was \
-                     verified; {remedy}",
-                    p.what,
-                    wait.as_secs()
-                ));
+                let gone = if aterm_uds::process::pid_alive(l.pid) {
+                    ""
+                } else {
+                    ", which has exited"
+                };
+                format!("pid {}{label}{gone}", l.pid)
+            })
+            .collect();
+        if leases.len() > LEASES_SAID {
+            named.push(format!("and {} more", leases.len() - LEASES_SAID));
+        }
+        format!("; leased by {}", named.join(", "))
+    }
+
+    /// The clock a wait for the socket keeps ([`wait_on`]): the machine's, or a test's.
+    pub trait Clock {
+        /// How long the wait has lasted.
+        fn waited(&self) -> Duration;
+        /// Nap `d`: `true` when `stop` ended it early.
+        fn nap(&mut self, d: Duration, stop: &dyn Fn() -> bool) -> bool;
+    }
+
+    /// The machine's clock, napping in steps an interrupt ends ([`aterm_toolchain::interrupt::NAP`]).
+    struct Wall(Instant);
+
+    impl Clock for Wall {
+        fn waited(&self) -> Duration {
+            self.0.elapsed()
+        }
+
+        fn nap(&mut self, d: Duration, stop: &dyn Fn() -> bool) -> bool {
+            let end = Instant::now() + d;
+            loop {
+                if stop() {
+                    return true;
+                }
+                let now = Instant::now();
+                if now >= end {
+                    return false;
+                }
+                std::thread::sleep((end - now).min(aterm_toolchain::interrupt::NAP));
             }
-            std::thread::sleep(
-                until
-                    .saturating_duration_since(Instant::now())
-                    .min(Duration::from_secs(5)),
-            );
         }
     }
 
-    /// Holds a one-byte lease on this build's `trustd` so it does not idle out mid-run.
+    /// Why a wait for the socket ended without it ([`wait_on`]).
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum Unusable {
+        /// `--no-wait`: what holds it.
+        Held(String),
+        /// An interrupt, or the caller's `stop`: what held it then.
+        Stopped(String),
+    }
+
+    /// One look at `sock` against `want`, with the leases of a trustd of another build, made on
+    /// a thread of its own so that `stop` is heard every [`aterm_toolchain::interrupt::NAP`]
+    /// while a trustd takes its time to answer; `None` once `stop` says so first.
+    fn look(
+        sock: &Path,
+        want: &str,
+        stop: &dyn Fn() -> bool,
+    ) -> Option<(Probe, Option<Vec<Lease>>)> {
+        let seen = |sock: &Path, want: &str| {
+            let p = probe(sock, want, LOOK_GIVES);
+            let leases = (p.held == Held::Foreign)
+                .then(|| leases(sock, LOOK_GIVES))
+                .flatten();
+            (p, leases)
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (owned_sock, owned_want) = (sock.to_path_buf(), want.to_string());
+        let spawned = std::thread::Builder::new()
+            .name("trustd look".into())
+            .spawn(move || {
+                let _ = tx.send(seen(&owned_sock, &owned_want));
+            });
+        if spawned.is_err() {
+            return Some(seen(sock, want));
+        }
+        loop {
+            match rx.recv_timeout(aterm_toolchain::interrupt::NAP) {
+                Ok(found) => return Some(found),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) if stop() => return None,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Some(seen(sock, want));
+                }
+            }
+        }
+    }
+
+    /// Waits for `sock` to serve this build's `trustd` or nothing: admission behind whatever
+    /// holds it, with no deadline (D-TRUSTD-330S). A trustd of another build serves while any
+    /// run of that build holds a lease on it, which a lane run does for hours, and retires 300 s
+    /// after its last grant; a fixed wait ended a busy socket COULD NOT RUN. While it waits it
+    /// says what holds the socket and who holds its leases as it starts and once a minute, and
+    /// marks the wait where a ceiling reads it ([`aterm_toolchain::waits`]); it looks every
+    /// [`LOOK_EVERY`]. An interrupt (SIGINT, SIGTERM or SIGHUP, [`aterm_toolchain::interrupt`])
+    /// or `stop` ends it within a nap, and `--no-wait` ([`named_lock::Wait::No`]) answers at once.
+    ///
+    /// # Errors
+    /// What held the socket when `--no-wait` would not wait or the wait was interrupted, and
+    /// that nothing was verified.
+    pub fn wait_usable(
+        sock: &Path,
+        want: &str,
+        wait: aterm_toolchain::named_lock::Wait,
+        out: &mut dyn std::io::Write,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<(), String> {
+        let watch = aterm_toolchain::interrupt::Watch::enter();
+        let stopped = || watch.caught().is_some() || stop();
+        let ended = wait_on(sock, want, wait, out, &stopped, &mut Wall(Instant::now()));
+        ended.map_err(|e| match e {
+            Unusable::Held(what) => format!(
+                "{what}: --no-wait does not wait for it, so nothing was verified; leave out \
+                 --no-wait to wait until it serves this build or retires; {NEVER}"
+            ),
+            Unusable::Stopped(what) => format!(
+                "interrupted{} while waiting for this build's trustd or none: {what}; nothing \
+                 was verified",
+                watch.take().map_or_else(String::new, |sig| format!(
+                    " ({})",
+                    aterm_toolchain::interrupt::name(sig)
+                ))
+            ),
+        })
+    }
+
+    /// [`wait_usable`]'s wait on `clock`.
+    ///
+    /// # Errors
+    /// [`Unusable`]: what held the socket when it would not wait, or when `stop` ended the wait.
+    pub fn wait_on(
+        sock: &Path,
+        want: &str,
+        wait: aterm_toolchain::named_lock::Wait,
+        out: &mut dyn std::io::Write,
+        stop: &dyn Fn() -> bool,
+        clock: &mut dyn Clock,
+    ) -> Result<(), Unusable> {
+        let mut said: Option<Duration> = None;
+        let mut mark: Option<aterm_toolchain::waits::Mark> = None;
+        let mut held = format!("what serves {} was not read yet", sock.display());
+        loop {
+            let Some((p, leases)) = look(sock, want, stop) else {
+                return Err(Unusable::Stopped(held));
+            };
+            let waited = clock.waited();
+            if matches!(p.held, Held::None | Held::Ours) {
+                if said.is_some() {
+                    let _ = writeln!(
+                        out,
+                        "trust: the socket is usable after {} min: {}",
+                        waited.as_secs() / 60,
+                        p.what
+                    );
+                }
+                return Ok(());
+            }
+            held = format!("{}{}", p.what, leased_by(leases.as_deref()));
+            if wait == aterm_toolchain::named_lock::Wait::No {
+                return Err(Unusable::Held(held));
+            }
+            let line = match said {
+                None => Some(format!(
+                    "trust: waiting for this build's trustd or none: {held}"
+                )),
+                Some(t) if waited >= t + aterm_toolchain::named_lock::SAY_EVERY => Some(format!(
+                    "trust: still waiting for this build's trustd or none ({} min): {held}",
+                    waited.as_secs() / 60
+                )),
+                Some(_) => None,
+            };
+            if let Some(line) = line {
+                let _ = writeln!(out, "{line}");
+                match &mut mark {
+                    Some(m) => m.say(&line),
+                    None => mark = aterm_toolchain::waits::Mark::begin(&line),
+                }
+                said = Some(waited);
+            }
+            if clock.nap(LOOK_EVERY, stop) {
+                return Err(Unusable::Stopped(held));
+            }
+        }
+    }
+
+    /// Holds a one-byte lease on this build's `trustd` so it does not idle out mid-run, and
+    /// counts the leases that ended under it ([`Keeper::lost`]).
     pub struct Keeper {
         stop: Arc<AtomicBool>,
         held: Arc<AtomicBool>,
+        lost: Arc<AtomicU32>,
         conn: Arc<Mutex<Option<UnixStream>>>,
         thread: Option<std::thread::JoinHandle<()>>,
     }
@@ -5306,16 +5618,19 @@ pub mod trustd {
             let _ = std::fs::remove_file(&seen);
             let stop = Arc::new(AtomicBool::new(false));
             let held = Arc::new(AtomicBool::new(false));
+            let lost = Arc::new(AtomicU32::new(0));
             let conn = Arc::new(Mutex::new(None));
             let k = Kept {
                 stop: Arc::clone(&stop),
                 held: Arc::clone(&held),
+                lost: Arc::clone(&lost),
                 conn: Arc::clone(&conn),
             };
             let thread = std::thread::spawn(move || keep(&sock, &want, &grants, &seen, &k));
             Keeper {
                 stop,
                 held,
+                lost,
                 conn,
                 thread: Some(thread),
             }
@@ -5324,6 +5639,34 @@ pub mod trustd {
         #[must_use]
         pub fn held(&self) -> bool {
             self.held.load(Ordering::SeqCst)
+        }
+
+        /// How many of its grants trustd ended under it (it closed or failed the lease's
+        /// connection: it went away): a check that ran across one lost its prover. A grant
+        /// whose connection trustd has already closed counts at once, before the keeper's
+        /// thread reads the end, so a check that ended of that loss counts it.
+        #[must_use]
+        pub fn lost(&self) -> u32 {
+            use std::os::fd::AsRawFd as _;
+            // Read before the count: the thread counts an end before it lets `held` go, so an
+            // end it has not counted yet is the held grant's, and none is missed (one counted
+            // twice still counts as lost).
+            let ending = self.held()
+                && self
+                    .conn
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                    .is_some_and(|c| {
+                        matches!(
+                            aterm_uds::hangup::fd_peer_state(c.as_raw_fd()),
+                            aterm_uds::hangup::PeerState::Gone
+                                | aterm_uds::hangup::PeerState::HalfClosed
+                        )
+                    });
+            self.lost
+                .load(Ordering::SeqCst)
+                .saturating_add(u32::from(ending))
         }
     }
 
@@ -5349,6 +5692,8 @@ pub mod trustd {
     struct Kept {
         stop: Arc<AtomicBool>,
         held: Arc<AtomicBool>,
+        /// The grants trustd ended under it ([`Keeper::lost`]).
+        lost: Arc<AtomicU32>,
         /// The connection it waits on, for the drop to shut.
         conn: Arc<Mutex<Option<UnixStream>>>,
     }
@@ -5374,8 +5719,8 @@ pub mod trustd {
         let mut grants = 0u32;
         let tick = Duration::from_secs(2);
         while !stop.load(Ordering::SeqCst) {
-            if let Ok(stream) = UnixStream::connect(sock) {
-                if !k.name(stream.try_clone()) {
+            if let Ok(stream) = aterm_uds::kept_out(|| UnixStream::connect(sock)) {
+                if !k.name(aterm_uds::kept_out(|| stream.try_clone())) {
                     break;
                 }
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(130)));
@@ -5393,9 +5738,13 @@ pub mod trustd {
                         held.store(true, Ordering::SeqCst);
                         let _ = s.get_ref().set_read_timeout(Some(tick));
                         let mut buf = [0u8; 256];
+                        let mut ended = false;
                         while !stop.load(Ordering::SeqCst) {
                             match s.get_mut().read(&mut buf) {
-                                Ok(0) => break,
+                                Ok(0) => {
+                                    ended = true;
+                                    break;
+                                }
                                 Ok(_) => {}
                                 Err(e)
                                     if matches!(
@@ -5403,8 +5752,16 @@ pub mod trustd {
                                         std::io::ErrorKind::WouldBlock
                                             | std::io::ErrorKind::TimedOut
                                     ) => {}
-                                Err(_) => break,
+                                Err(_) => {
+                                    ended = true;
+                                    break;
+                                }
                             }
+                        }
+                        // trustd ended the lease, not this keeper's drop: counted before
+                        // `held` goes, as [`Keeper::lost`] reads them.
+                        if ended && !stop.load(Ordering::SeqCst) {
+                            k.lost.fetch_add(1, Ordering::SeqCst);
                         }
                         held.store(false, Ordering::SeqCst);
                     }
@@ -5422,11 +5779,78 @@ pub mod trustd {
     mod tests {
         use super::*;
 
+        /// The trustd the keeper holds a grant on goes away (TP-4): the keeper counts the grant lost
+        /// once trustd's end of the lease is closed. NEGATIVE CONTROL: while trustd keeps the lease
+        /// nothing is lost, and the keeper's own drop of a grant it holds is no loss.
+        #[test]
+        fn the_keeper_counts_a_grant_trustd_ended_and_not_its_own_drop() {
+            use std::io::BufRead as _;
+
+            for trustd_ends in [true, false] {
+                let private = aterm_tempfile::Builder::new()
+                    .prefix("tl-g-")
+                    .tempdir_in("/tmp")
+                    .unwrap();
+                let d = private.path();
+                let sock = d.join("g.sock");
+                let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+                let (end_tx, end_rx) = std::sync::mpsc::channel::<()>();
+                let (ended_tx, ended_rx) = std::sync::mpsc::channel::<()>();
+                let trustd = std::thread::spawn(move || {
+                    let (conn, _) = listener.accept().unwrap();
+                    let mut w = conn.try_clone().unwrap();
+                    let mut lines = BufReader::new(conn).lines();
+                    for reply in [
+                        "{\"executable_sha256\":\"aa\",\"release\":\"1.99\",\"commit\":\"abc\"}",
+                        "GRANTED 1",
+                    ] {
+                        lines.next().expect("a request").unwrap();
+                        writeln!(w, "{reply}").unwrap();
+                    }
+                    // Gone at the test's word: the lease's connection closes, both ends of it.
+                    let _ = end_rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
+                    drop((lines, w, listener));
+                    let _ = ended_tx.send(());
+                });
+                let keeper = Keeper::start(sock, "aa".into(), d.join("grants"), d.join("seen"));
+                let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+                while !keeper.held() {
+                    assert!(Instant::now() < deadline, "the keeper took no grant");
+                    std::thread::yield_now();
+                }
+                assert_eq!(keeper.lost(), 0, "a held grant is not lost");
+                if trustd_ends {
+                    end_tx.send(()).unwrap();
+                    ended_rx
+                        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                        .expect("the stand-in closed the lease");
+                    // Once the lease's last copy closes: a child another test forks may hold
+                    // one until it execs.
+                    while keeper.lost() == 0 {
+                        assert!(
+                            Instant::now() < deadline,
+                            "the grant trustd ended is not lost"
+                        );
+                        std::thread::yield_now();
+                    }
+                    trustd.join().unwrap();
+                    drop(keeper);
+                } else {
+                    let lost = Arc::clone(&keeper.lost);
+                    drop(keeper);
+                    assert_eq!(lost.load(std::sync::atomic::Ordering::SeqCst), 0);
+                    drop(end_tx);
+                    trustd.join().unwrap();
+                }
+            }
+        }
+
         #[test]
         fn a_failed_connection_clone_refuses_an_uncancellable_wait() {
             let k = Kept {
                 stop: Arc::new(AtomicBool::new(false)),
                 held: Arc::new(AtomicBool::new(false)),
+                lost: Arc::new(AtomicU32::new(0)),
                 conn: Arc::new(Mutex::new(None)),
             };
             assert!(!k.name(Err(std::io::Error::other("injected clone failure"))));
@@ -5454,6 +5878,7 @@ pub mod trustd {
             let k = Kept {
                 stop: Arc::new(AtomicBool::new(false)),
                 held: Arc::new(AtomicBool::new(false)),
+                lost: Arc::new(AtomicU32::new(0)),
                 conn: Arc::new(Mutex::new(None)),
             };
             let stop = Arc::clone(&k.stop);
@@ -5461,6 +5886,7 @@ pub mod trustd {
             let mut keeper = Keeper {
                 stop: Arc::clone(&k.stop),
                 held: Arc::clone(&k.held),
+                lost: Arc::clone(&k.lost),
                 conn: Arc::clone(&k.conn),
                 thread: None,
             };
@@ -6011,6 +6437,9 @@ mod tests {
             let w = self.w.borrow();
             w.starts.len() >= self.held_after && self.trustd_until.is_none_or(|t| w.now < t)
         }
+        fn trustd_lost(&self) -> u32 {
+            u32::from(self.trustd_until.is_some_and(|t| self.w.borrow().now >= t))
+        }
         fn probe_trustd(&mut self) -> String {
             "ours\tthis build's".into()
         }
@@ -6153,6 +6582,27 @@ mod tests {
             gate: None,
             holder: None,
         }
+    }
+
+    /// A check across which the run's trustd went away is marked so (TP-4: its trustc then dies
+    /// of SIGPIPE and measures nothing, which says nothing of the code), and only that one:
+    /// NEGATIVE CONTROL, a check that ended before trustd went away, and one that started after,
+    /// are not.
+    #[test]
+    fn a_check_the_trustd_went_away_under_is_marked_and_no_other() {
+        let mut f = fake(&[("before", 3), ("across", 20), ("after", 2)]);
+        f.trustd_until = Some(Duration::from_secs(10));
+        let jobs = ["before", "across"].map(job).to_vec();
+        let (r, done) = slots(&mut f, jobs, 2, 100);
+        assert_eq!(r, Ok(()));
+        let lost: Vec<(&str, bool)> = done
+            .iter()
+            .map(|d| (d.job.name.as_str(), d.trustd_lost))
+            .collect();
+        assert_eq!(lost, [("before", false), ("across", true)]);
+        let (r, done) = slots(&mut f, vec![job("after")], 1, 100);
+        assert_eq!(r, Ok(()));
+        assert!(!done[0].trustd_lost, "it started after the loss");
     }
 
     /// A check's load is the mean of the readings taken while it ran, not the last one; a
@@ -6376,6 +6826,7 @@ mod tests {
         {
             aterm_capacity::Polled::Admitted(c) => c,
             aterm_capacity::Polled::Waiting(_, short) => panic!("the holder waits: {short}"),
+            aterm_capacity::Polled::Gone(e) => panic!("the holder is gone: {e}"),
         };
         let covers: Vec<(String, bool)> = l
             .list()
@@ -6391,6 +6842,71 @@ mod tests {
             ]
         );
         drop((admitted, plain));
+    }
+
+    /// A check waiting at the launch gate whose claim file is removed (the ledger's directory
+    /// cleaned) can never be admitted, since its grant could not be written: at its next look it
+    /// starts unclaimed, saying so and naming the file, as a check whose ledger cannot be used
+    /// does (DA-TRUST-GATE-FILE-GONE; before, it waited for ever, a line a minute). NEGATIVE
+    /// CONTROL: with its file in place it is still waiting at every look.
+    #[cfg(unix)]
+    #[test]
+    fn a_check_whose_claim_file_is_removed_at_the_gate_starts_unclaimed() {
+        for remove in [true, false] {
+            let (_d, l) = ledger();
+            let m = aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(48, 40, 14));
+            let hold = match aterm_capacity::Waiter::enter(
+                &l,
+                &m,
+                aterm_capacity::Need::new("hold").mem_gib(30),
+            )
+            .unwrap()
+            .poll(&m)
+            {
+                aterm_capacity::Polled::Admitted(c) => c,
+                other => panic!("the holder is not admitted: {other:?}"),
+            };
+            let mut g = gate(&l, &m, aterm_capacity::Admit::Wait);
+            let check = needing("a", 20);
+            let mut said = Vec::new();
+            assert!(
+                g.admit(&check, Duration::ZERO, &mut |s| said.push(s.to_string()))
+                    .is_none(),
+                "20 GiB beside 30 waits"
+            );
+            if remove {
+                for e in l.dir().read_dir().expect("the ledger").flatten() {
+                    if e.file_name().to_string_lossy().ends_with(".wait") {
+                        fs::remove_file(e.path()).expect("a's file removed");
+                    }
+                }
+            }
+            let mut look = |n: u64, said: &mut Vec<String>| {
+                g.admit(&check, Duration::from_secs(2 * n), &mut |s| {
+                    said.push(s.to_string());
+                })
+                .is_some()
+            };
+            if remove {
+                assert!(look(1, &mut said), "started at the next look: {said:?}");
+                let line = said.last().expect("it says why");
+                assert!(
+                    line.contains("starts unclaimed")
+                        && line.contains(".wait")
+                        && line.contains("was removed while it waited"),
+                    "{line}"
+                );
+                assert!(
+                    l.list().unwrap().iter().all(|r| r.need.what == "hold"),
+                    "it holds no claim"
+                );
+            } else {
+                for n in 1..=3 {
+                    assert!(!look(n, &mut said), "still waiting at look {n}: {said:?}");
+                }
+            }
+            drop(hold);
+        }
     }
 
     /// TRUST-MEM's acceptance on an injected machine: another holder's claim leaves
@@ -6421,6 +6937,7 @@ mod tests {
         {
             aterm_capacity::Polled::Admitted(c) => c,
             aterm_capacity::Polled::Waiting(_, short) => panic!("the holder waits: {short}"),
+            aterm_capacity::Polled::Gone(e) => panic!("the holder is gone: {e}"),
         };
         let mut f = fake(&[("aterm-render", 5)]);
         f.gate = Some(gate(&l, &m, aterm_capacity::Admit::Wait));
@@ -6795,10 +7312,45 @@ mod tests {
             wall: Duration::from_secs(5),
             over_budget: over,
             load: Some(30.0),
+            trustd_lost: false,
         }
     }
 
     const DONE: &str = "Summary: 5 proved, 0 failed (20 total); reproducible\nCoverage: 3/3 eligible function bodies verified (complete)\n";
+
+    /// A check the trustd went away under leaves a `.trustd-lost` mark naming what serves the
+    /// socket now, and the judge reads it into the check's facts. NEGATIVE CONTROL: a check it
+    /// stayed under leaves none, and probes nothing for one.
+    #[test]
+    fn a_check_the_trustd_went_away_under_leaves_what_serves_the_socket() {
+        for lost in [true, false] {
+            let d = tmp("trust-lane-lost");
+            let mut f = finished(
+                d.path(),
+                "error: Broken pipe (os error 32)\nerror: could not compile `alpha`\n",
+                101,
+                false,
+            );
+            f.trustd_lost = lost;
+            let mut probed = 0;
+            record(&f, Duration::from_secs(60), 14, &mut || {
+                probed += 1;
+                "none\tnothing serves /tmp/t.sock".into()
+            })
+            .unwrap();
+            let mark = d.path().join("alpha@1.0.0.log.trustd-lost");
+            if lost {
+                assert_eq!(probed, 1);
+                assert_eq!(
+                    fs::read_to_string(&mark).unwrap(),
+                    "nothing serves /tmp/t.sock\n"
+                );
+            } else {
+                assert_eq!(probed, 0);
+                assert!(!mark.exists());
+            }
+        }
+    }
 
     #[test]
     fn a_check_leaves_its_status_and_only_its_own_marks() {
@@ -7220,6 +7772,11 @@ mod tests {
             self.ceiling_probes += 1;
             self.ceiling.clone()
         }
+        /// The socket is usable: a test run never reads the user's trustd ([`Claims`] stands in
+        /// for a wait that ends without it).
+        fn trustd(&mut self, _: &Config, _: &Prepared, _: &mut dyn Write) -> Result<(), String> {
+            Ok(())
+        }
         fn checks(
             &mut self,
             cfg: &Config,
@@ -7403,12 +7960,16 @@ mod tests {
 
     /// A [`Site`] whose disk claim answers as the capacity ledger would, refused (`never`),
     /// ended by an interrupt (`interrupt`) or admitted with no claim, keeping each run it was
-    /// asked to claim with how many checks had started by then.
+    /// asked to claim with how many checks had started by then; and whose wait for trustd's
+    /// socket ends without it when `trustd` says why, keeping how many disk claims had been
+    /// asked for each time the run waited (`trustd_at`).
     struct Claims<'s> {
         site: &'s mut Site,
         never: Option<String>,
         interrupt: Option<i32>,
         asked: Vec<(atpkg::admit_disk::Run, atpkg::admit_disk::Admit, usize)>,
+        trustd: Option<String>,
+        trustd_at: Vec<usize>,
     }
 
     impl Bench for Claims<'_> {
@@ -7435,6 +7996,18 @@ mod tests {
         }
         fn takes_ceiling(&mut self, driver: &Driver) -> Result<bool, String> {
             self.site.takes_ceiling(driver)
+        }
+        fn trustd(
+            &mut self,
+            cfg: &Config,
+            prep: &Prepared,
+            out: &mut dyn Write,
+        ) -> Result<(), String> {
+            self.trustd_at.push(self.asked.len());
+            match &self.trustd {
+                Some(why) => Err(why.clone()),
+                None => self.site.trustd(cfg, prep, out),
+            }
         }
         fn checks(
             &mut self,
@@ -7480,6 +8053,8 @@ mod tests {
             never: None,
             interrupt: None,
             asked: Vec::new(),
+            trustd: None,
+            trustd_at: Vec::new(),
         };
         let mut out = Vec::new();
         let outcome = run_on(&cfg, &mut claims, &mut out);
@@ -7499,10 +8074,12 @@ mod tests {
             run,
             &atpkg::admit_disk::Run {
                 what: "ship trust run -p alpha".into(),
+                scope: "-p alpha".into(),
                 dirs: vec![root.clone()],
                 record: root.join("logs").join(DISK_RECORD),
                 cold: COLD_DISK,
                 on: root.clone(),
+                stuck_ends: None,
             }
         );
         assert!(root.join("logs").is_dir(), "{}", root.display());
@@ -7519,6 +8096,8 @@ mod tests {
             ),
             interrupt: None,
             asked: Vec::new(),
+            trustd: None,
+            trustd_at: Vec::new(),
         };
         let mut out = Vec::new();
         let outcome = run_on(&cfg, &mut claims, &mut out);
@@ -7537,6 +8116,8 @@ mod tests {
             never: None,
             interrupt: Some(15),
             asked: Vec::new(),
+            trustd: None,
+            trustd_at: Vec::new(),
         };
         let mut out = Vec::new();
         let outcome = run_on(&cfg, &mut claims, &mut out);
@@ -7548,6 +8129,65 @@ mod tests {
             "{outcome:?}: {said}"
         );
         assert!(claims.site.started.is_empty(), "{said}");
+    }
+
+    /// A run with checks to make waits for trustd's socket before it claims its disk, so a
+    /// wait with no deadline (another build's trustd, for hours) holds no claim other builds
+    /// wait behind; a run with none does not wait. NEGATIVE CONTROL: a wait that ends without
+    /// the socket is COULD NOT RUN with no disk claimed and no check started.
+    #[test]
+    fn a_run_waits_for_trustd_before_it_claims_its_disk() {
+        let claims = |s: &mut Site, trustd: Option<&str>| {
+            let cfg = s.cfg.clone();
+            let mut c = Claims {
+                site: s,
+                never: None,
+                interrupt: None,
+                asked: Vec::new(),
+                trustd: trustd.map(str::to_string),
+                trustd_at: Vec::new(),
+            };
+            let mut out = Vec::new();
+            let outcome = run_on(&cfg, &mut c, &mut out);
+            let said = String::from_utf8(out).unwrap();
+            let (asked, at) = (c.asked.len(), c.trustd_at);
+            (outcome, said, asked, at)
+        };
+        let mut s = site(Scope::Packages(vec!["alpha".into()]));
+        let (outcome, said, asked, at) = claims(&mut s, None);
+        assert_eq!(outcome, Outcome::Pass, "{said}");
+        assert_eq!(at, [0], "the wait comes before the disk claim: {said}");
+        assert_eq!(asked, 1, "{said}");
+        assert!(!s.started.is_empty(), "{said}");
+
+        const HELD: &str = "interrupted (SIGINT) while waiting for this build's trustd or none: \
+                            a trustd of another build serves /tmp/t.sock; leased by pid 7 \
+                            (trust lane holds trustd for its run); nothing was verified";
+        let mut s = site(Scope::Packages(vec!["alpha".into()]));
+        let (outcome, said, asked, at) = claims(&mut s, Some(HELD));
+        assert_eq!(outcome, Outcome::CouldNotRun(HELD.into()), "{said}");
+        assert_eq!((asked, at), (0, vec![0]), "no disk claimed: {said}");
+        assert!(s.started.is_empty(), "{said}");
+
+        // Its one library refused for memory and the run going on: nothing to check, no wait.
+        let mut s = site(Scope::WholeTree);
+        s.ceiling = Ok(true);
+        fs::write(
+            s.repo.join(trust_facts::MEMORY),
+            "# no host here verifies alpha's floor\nalpha\t4096.0\t4096\t512.0\t1000.0\t=\ta test\n",
+        )
+        .unwrap();
+        git_in(&s.repo, &["commit", "-q", "-am", "a floor set at 4 TiB"]);
+        s.cfg.stop_if_narrowed = false;
+        let (outcome, said, _, at) = claims(&mut s, Some(HELD));
+        assert!(
+            matches!(&outcome, Outcome::Narrowed(l) if l.len() == 1),
+            "{outcome:?}: {said}"
+        );
+        assert!(
+            at.is_empty(),
+            "nothing to check waits for no trustd: {said}"
+        );
     }
 
     #[test]
@@ -12695,11 +13335,21 @@ mod tests {
     }
 
     fn stand_in(sock: &Path, sha: &'static str) -> std::thread::JoinHandle<()> {
+        stand_in_saying(sock, sha, "{\"active\":[]}".into())
+    }
+
+    /// A stand-in trustd whose IDENTITY names `sha` and whose STATUS answers `status`.
+    fn stand_in_saying(
+        sock: &Path,
+        sha: &'static str,
+        status: String,
+    ) -> std::thread::JoinHandle<()> {
         use std::io::{BufRead as _, BufReader as Reader};
         let listener = std::os::unix::net::UnixListener::bind(sock).unwrap();
         std::thread::spawn(move || {
             for conn in listener.incoming() {
                 let Ok(conn) = conn else { return };
+                let status = status.clone();
                 std::thread::spawn(move || {
                     let mut w = conn.try_clone().unwrap();
                     for line in Reader::new(conn).lines() {
@@ -12708,7 +13358,7 @@ mod tests {
                             Some("IDENTITY") => format!(
                                 "{{\"executable_sha256\":\"{sha}\",\"release\":\"1.99\",\"commit\":\"abc\"}}"
                             ),
-                            Some("STATUS") => "{\"active\":[]}".into(),
+                            Some("STATUS") => status.clone(),
                             Some("RESERVE") => "GRANTED 1".into(),
                             _ => "ERR".into(),
                         };
@@ -12726,6 +13376,169 @@ mod tests {
             .prefix(&format!("tl{tag}-"))
             .tempdir_in("/tmp")
             .unwrap()
+    }
+
+    /// A test's clock for a wait on the socket: each nap moves it on at once, and `at` hears
+    /// each moment it reaches.
+    struct Sim<'a> {
+        now: Duration,
+        at: &'a mut dyn FnMut(Duration),
+    }
+
+    impl trustd::Clock for Sim<'_> {
+        fn waited(&self) -> Duration {
+            self.now
+        }
+        fn nap(&mut self, d: Duration, stop: &dyn Fn() -> bool) -> bool {
+            self.now += d;
+            (self.at)(self.now);
+            stop()
+        }
+    }
+
+    /// STATUS naming one lease, this process's, as the lane's keeper takes it.
+    fn leased_status() -> String {
+        format!(
+            "{{\"version\":1,\"active\":[{{\"pid\":{},\"bytes\":1,\"label\":\"trust lane holds trustd for its run\",\"since_secs\":5,\"token\":\"t\"}}]}}",
+            std::process::id()
+        )
+    }
+
+    /// D-TRUSTD-330S: a trustd of another build, which another run's lease keeps serving, is
+    /// waited for past the 330 s the lane used to give it, naming what serves the socket and who
+    /// holds its lease as the wait starts and once a minute, and the run goes on at the first
+    /// look after it retires. NEGATIVE CONTROL: a fixed limit put back ends this wait before the
+    /// trustd retires at 400 s, and the test fails.
+    #[test]
+    fn a_trustd_of_another_build_is_waited_for_naming_its_leases_until_it_retires() {
+        let private = short_dir("w");
+        let sock = private.path().join("w.sock");
+        let _t = stand_in_saying(&sock, "bb", leased_status());
+        let mut out = Vec::new();
+        let gone = sock.clone();
+        let mut retire = |now: Duration| {
+            if now >= Duration::from_secs(400) {
+                let _ = fs::remove_file(&gone);
+            }
+        };
+        let mut clock = Sim {
+            now: Duration::ZERO,
+            at: &mut retire,
+        };
+        let r = trustd::wait_on(
+            &sock,
+            "aa",
+            named_lock::Wait::Block,
+            &mut out,
+            &|| false,
+            &mut clock,
+        );
+        assert_eq!(r, Ok(()));
+        assert_eq!(clock.now, Duration::from_secs(400), "past 330 s");
+        let out = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        let me = format!(
+            "leased by pid {} (trust lane holds trustd for its run)",
+            std::process::id()
+        );
+        assert!(
+            lines[0].starts_with(
+                "trust: waiting for this build's trustd or none: a trustd of another build serves"
+            ) && lines[0].contains(&me),
+            "{out}"
+        );
+        let minutes: Vec<&str> = lines
+            .iter()
+            .filter(|l| l.starts_with("trust: still waiting"))
+            .copied()
+            .collect();
+        assert_eq!(minutes.len(), 6, "a line a minute: {out}");
+        assert!(minutes.iter().all(|l| l.contains(&me)), "{out}");
+        assert!(minutes[5].contains("(6 min)"), "{out}");
+        assert_eq!(
+            lines.last().copied(),
+            Some(
+                format!(
+                    "trust: the socket is usable after 6 min: nothing serves {}",
+                    sock.display()
+                )
+                .as_str()
+            ),
+            "{out}"
+        );
+    }
+
+    /// The wait for a trustd of another build ends when the run is interrupted (`stop`, which
+    /// the lane's interrupt and WAIT-INTERRUPT's watch answer), naming what held the socket, and
+    /// `--no-wait` answers at once with no wait line. NEGATIVE CONTROL: this build's trustd, or
+    /// none, is used at once, with nothing said.
+    #[test]
+    fn an_interrupt_or_no_wait_ends_the_wait_for_another_builds_trustd() {
+        let private = short_dir("i");
+        let d = private.path();
+        let foreign = d.join("f.sock");
+        let _f = stand_in_saying(&foreign, "bb", leased_status());
+        let naps = std::cell::Cell::new(0_u32);
+        let mut count = |_: Duration| naps.set(naps.get() + 1);
+        let mut clock = Sim {
+            now: Duration::ZERO,
+            at: &mut count,
+        };
+        let mut out = Vec::new();
+        let r = trustd::wait_on(
+            &foreign,
+            "aa",
+            named_lock::Wait::Block,
+            &mut out,
+            &|| naps.get() >= 3,
+            &mut clock,
+        );
+        let Err(trustd::Unusable::Stopped(held)) = r else {
+            panic!("{r:?}");
+        };
+        assert!(held.contains("a trustd of another build serves"), "{held}");
+        assert!(
+            held.contains(&format!("pid {}", std::process::id())),
+            "{held}"
+        );
+        assert_eq!(
+            clock.now,
+            Duration::from_secs(15),
+            "ended at the nap it was stopped in"
+        );
+
+        let mut out = Vec::new();
+        let refused =
+            trustd::wait_usable(&foreign, "aa", named_lock::Wait::No, &mut out, &|| false)
+                .expect_err("--no-wait does not wait");
+        assert!(
+            refused.contains("a trustd of another build serves")
+                && refused.contains("--no-wait does not wait for it")
+                && refused.contains("trust lane holds trustd for its run"),
+            "{refused}"
+        );
+        assert!(out.is_empty(), "--no-wait says nothing of a wait");
+
+        let ours = d.join("o.sock");
+        let _o = stand_in(&ours, "aa");
+        for sock in [ours, d.join("absent.sock")] {
+            let mut out = Vec::new();
+            let mut never = |_: Duration| panic!("no nap");
+            let mut clock = Sim {
+                now: Duration::ZERO,
+                at: &mut never,
+            };
+            let r = trustd::wait_on(
+                &sock,
+                "aa",
+                named_lock::Wait::No,
+                &mut out,
+                &|| false,
+                &mut clock,
+            );
+            assert_eq!(r, Ok(()), "{}", sock.display());
+            assert!(out.is_empty());
+        }
     }
 
     #[test]

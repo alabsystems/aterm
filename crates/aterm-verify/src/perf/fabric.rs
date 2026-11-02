@@ -33,6 +33,9 @@ pub(crate) struct Arm {
     pub tier: bench_spec::Tier,
     /// Ordered-tier horizon in milliseconds (`Some` iff `tier` is ordered).
     pub horizon_ms: Option<u64>,
+    /// Whether the arm's logs are sealed at rest (`--at-rest`), as a fabric root's are: on unless
+    /// a run names it off.
+    pub at_rest: bool,
 }
 
 impl Arm {
@@ -42,6 +45,7 @@ impl Arm {
             tier,
             horizon_ms: (tier == bench_spec::Tier::Ordered)
                 .then_some(bench_spec::ORDERED_HORIZON_MS),
+            at_rest: true,
         }
     }
 
@@ -50,6 +54,9 @@ impl Arm {
         if let Some(ms) = self.horizon_ms {
             words.push(format!("horizon_ms={ms}"));
         }
+        if !self.at_rest {
+            words.push("at_rest=off".to_string());
+        }
         words
     }
 
@@ -57,6 +64,9 @@ impl Arm {
         let mut flags = format!(" --durability {}", self.tier.word());
         if let Some(ms) = self.horizon_ms {
             flags.push_str(&format!(" --horizon-ms {ms}"));
+        }
+        if !self.at_rest {
+            flags.push_str(" --at-rest off");
         }
         flags
     }
@@ -94,11 +104,18 @@ pub(crate) struct Args {
     pub mix_every: Option<u32>,
     /// Records behind every session's refill watermark in the attach world (`--attach-backlog`).
     pub backlog: Option<u32>,
+    /// Rows the ask world's asked table is pre-filled to (`--asked-prefill`).
+    pub asked_prefill: Option<u32>,
 }
 
 fn positive(flag: &str, raw: &str) -> Result<u32, String> {
-    match raw.parse::<u32>() {
-        Ok(v) if v > 0 => Ok(v),
+    match raw
+        .bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| raw.parse::<u32>().ok())
+        .flatten()
+    {
+        Some(v) if v > 0 => Ok(v),
         _ => Err(format!("`{flag}` needs a positive integer, got `{raw}`")),
     }
 }
@@ -115,8 +132,21 @@ impl Args {
         };
         let mut tiers: Vec<bench_spec::Tier> = Vec::new();
         let mut horizons: Vec<u64> = Vec::new();
+        let mut at_rest: Vec<bool> = Vec::new();
         for (flag, raw) in options {
             match *flag {
+                "--at-rest" => {
+                    at_rest = raw
+                        .split(',')
+                        .map(|word| match word {
+                            "on" => Ok(true),
+                            "off" => Ok(false),
+                            _ => Err(format!(
+                                "`--at-rest` takes on or off, comma-separated, not `{raw}`"
+                            )),
+                        })
+                        .collect::<Result<_, _>>()?;
+                }
                 "--scenario" => {
                     a.scenario = bench_spec::Scenario::parse(raw).map_err(|_| {
                         format!(
@@ -156,12 +186,16 @@ impl Args {
                     horizons = raw
                         .split(',')
                         .map(|ms| {
-                            ms.parse::<u64>().map_err(|_| {
-                                format!(
-                                    "`--horizon-ms` takes milliseconds, comma-separated, not \
-                                     `{raw}`"
-                                )
-                            })
+                            ms.bytes()
+                                .all(|b| b.is_ascii_digit())
+                                .then(|| ms.parse::<u64>().ok())
+                                .flatten()
+                                .ok_or_else(|| {
+                                    format!(
+                                        "`--horizon-ms` takes milliseconds, comma-separated, not \
+                                         `{raw}`"
+                                    )
+                                })
                         })
                         .collect::<Result<_, _>>()?;
                 }
@@ -186,14 +220,37 @@ impl Args {
                     a.retention_interval_ms = Some(u64::from(positive(flag, raw)?));
                 }
                 "--bystanders" => {
-                    a.bystanders = Some(raw.parse::<u32>().map_err(|_| {
-                        format!("`{flag}` needs a non-negative integer, got `{raw}`")
-                    })?);
+                    a.bystanders = Some(
+                        raw.bytes()
+                            .all(|b| b.is_ascii_digit())
+                            .then(|| raw.parse::<u32>().ok())
+                            .flatten()
+                            .ok_or_else(|| {
+                                format!("`{flag}` needs a non-negative integer, got `{raw}`")
+                            })?,
+                    );
                 }
                 "--attach-backlog" => {
-                    a.backlog = Some(raw.parse::<u32>().map_err(|_| {
-                        format!("`{flag}` needs a non-negative integer, got `{raw}`")
-                    })?);
+                    a.backlog = Some(
+                        raw.bytes()
+                            .all(|b| b.is_ascii_digit())
+                            .then(|| raw.parse::<u32>().ok())
+                            .flatten()
+                            .ok_or_else(|| {
+                                format!("`{flag}` needs a non-negative integer, got `{raw}`")
+                            })?,
+                    );
+                }
+                "--asked-prefill" => {
+                    a.asked_prefill = Some(
+                        raw.bytes()
+                            .all(|b| b.is_ascii_digit())
+                            .then(|| raw.parse::<u32>().ok())
+                            .flatten()
+                            .ok_or_else(|| {
+                                format!("`{flag}` needs a non-negative integer, got `{raw}`")
+                            })?,
+                    );
                 }
                 "--no-windows" | "--admit" => {}
                 other => {
@@ -214,17 +271,31 @@ impl Args {
                     a.arms.extend(horizons.iter().map(|&ms| Arm {
                         tier,
                         horizon_ms: Some(ms),
+                        at_rest: true,
                     }));
                 }
                 bench_spec::Tier::Ordered => a.arms.push(Arm {
                     tier,
                     horizon_ms: Some(bench_spec::ORDERED_HORIZON_MS),
+                    at_rest: true,
                 }),
                 _ => a.arms.push(Arm {
                     tier,
                     horizon_ms: None,
+                    at_rest: true,
                 }),
             }
+        }
+        if !at_rest.is_empty() {
+            let arms = if a.arms.is_empty() {
+                vec![Arm::shipped()]
+            } else {
+                std::mem::take(&mut a.arms)
+            };
+            a.arms = arms
+                .into_iter()
+                .flat_map(|arm| at_rest.iter().map(move |&at_rest| Arm { at_rest, ..arm }))
+                .collect();
         }
         for arm in a.plan() {
             bench_spec::parse(&a.bench_words(Path::new("/scratch"), arm))
@@ -301,6 +372,9 @@ impl Args {
         if let Some(n) = self.backlog {
             words.push(format!("backlog={n}"));
         }
+        if let Some(n) = self.asked_prefill {
+            words.push(format!("asked_prefill={n}"));
+        }
         words.extend(arm.words());
         words.join(" ")
     }
@@ -350,6 +424,9 @@ impl Args {
         }
         if let Some(n) = self.backlog {
             line.push_str(&format!(" --attach-backlog {n}"));
+        }
+        if let Some(n) = self.asked_prefill {
+            line.push_str(&format!(" --asked-prefill {n}"));
         }
         line.push_str(&arm.flags());
         line
@@ -530,6 +607,7 @@ mod tests {
         let shipped = Arm {
             tier: bench_spec::Tier::Ordered,
             horizon_ms: Some(bench_spec::ORDERED_HORIZON_MS),
+            at_rest: true,
         };
         assert_eq!(
             a.plan(),
@@ -550,6 +628,7 @@ mod tests {
         let relaxed = Arm {
             tier: bench_spec::Tier::Relaxed,
             horizon_ms: None,
+            at_rest: true,
         };
         assert_eq!(a.plan(), [relaxed]);
         assert_eq!(
@@ -678,6 +757,40 @@ mod tests {
         }
     }
 
+    /// `--at-rest off,on --passes 2` is an A B B A set, each arm reproducible alone, and a plain run
+    /// measures what ships: a sealed log.
+    #[test]
+    fn the_at_rest_arms_reach_the_bench_and_the_ledger() {
+        let mut o = BTreeMap::new();
+        o.insert("--at-rest", "off,on".to_string());
+        o.insert("--passes", "2".to_string());
+        let a = Args::from_options(&o).expect("parses");
+        let plan = a.plan();
+        let sealed: Vec<bool> = plan.iter().map(|arm| arm.at_rest).collect();
+        assert_eq!(sealed, [false, true, true, false]);
+        assert!(
+            a.bench_words(Path::new("/s"), plan[0])
+                .ends_with("at_rest=off"),
+            "{}",
+            a.bench_words(Path::new("/s"), plan[0])
+        );
+        assert!(!a.bench_words(Path::new("/s"), plan[1]).contains("at_rest"));
+        assert!(a.command_line(plan[0]).ends_with(" --at-rest off"));
+        assert!(!a.command_line(plan[1]).contains("--at-rest"));
+        let bare = Args::from_options(&BTreeMap::new()).expect("bare");
+        assert!(bare.plan()[0].at_rest, "a bare run measures what ships");
+        let spec = bench_spec::parse(&bare.bench_words(Path::new("/s"), bare.plan()[0]))
+            .expect("the bench reads it");
+        assert!(spec.at_rest, "and the bench is told so");
+        let mut o = BTreeMap::new();
+        o.insert("--at-rest", "sealed".to_string());
+        assert!(
+            Args::from_options(&o)
+                .unwrap_err()
+                .contains("`--at-rest` takes on or off")
+        );
+    }
+
     #[test]
     fn the_bystanders_reach_the_bench_and_the_ledger() {
         let shipped = Arm::shipped();
@@ -746,6 +859,47 @@ mod tests {
         }
     }
 
+    /// C04: the ask world's asked prefill reaches the bench's words and each
+    /// entry's Run line, and the bench's own refusals reach the flag (past the
+    /// table's cap, or on a run that measures no ask).
+    #[test]
+    fn the_asked_prefill_reaches_the_bench_and_the_ledger() {
+        let shipped = Arm::shipped();
+        for n in ["0", "1024"] {
+            let mut o = BTreeMap::new();
+            o.insert("--asked-prefill", n.to_string());
+            o.insert("--scenario", "ask".to_string());
+            let a = Args::from_options(&o).expect("parses");
+            assert_eq!(
+                a.bench_words(Path::new("/s"), shipped),
+                format!("out=/s scenario=ask asked_prefill={n} durability=ordered horizon_ms=100")
+            );
+            assert!(
+                a.command_line(shipped)
+                    .contains(&format!(" --scenario ask --asked-prefill {n} ")),
+                "{}",
+                a.command_line(shipped)
+            );
+        }
+        let a = Args::from_options(&BTreeMap::new()).expect("bare");
+        assert!(
+            !a.bench_words(Path::new("/s"), shipped)
+                .contains("asked_prefill")
+        );
+        for (scenario, bad) in [
+            ("ask", "-1"),
+            ("ask", "+5"),
+            ("ask", "many"),
+            ("ask", "1025"),
+            ("attach", "10"),
+        ] {
+            let mut o = BTreeMap::new();
+            o.insert("--asked-prefill", bad.to_string());
+            o.insert("--scenario", scenario.to_string());
+            assert!(Args::from_options(&o).is_err(), "{scenario} {bad}");
+        }
+    }
+
     #[test]
     fn the_asks_and_the_mix_reach_the_bench_and_the_ledger() {
         let shipped = Arm::shipped();
@@ -778,7 +932,11 @@ mod tests {
     #[test]
     fn the_arms_run_in_order_and_alternate_by_pass() {
         use bench_spec::Tier;
-        let arm = |tier, horizon_ms| Arm { tier, horizon_ms };
+        let arm = |tier, horizon_ms| Arm {
+            tier,
+            horizon_ms,
+            at_rest: true,
+        };
         let mut o = BTreeMap::new();
         o.insert("--durability", "strict,ordered,relaxed".to_string());
         o.insert("--horizon-ms", "1000,100".to_string());

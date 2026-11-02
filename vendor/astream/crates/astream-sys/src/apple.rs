@@ -137,19 +137,23 @@ pub(crate) fn boot_session_uuid() -> Option<[u8; 64]> {
 }
 
 /// `fcntl(fd, F_SETFD, flags | FD_CLOFORK)` ([`crate::close_on_fork`]).
-pub(crate) fn close_on_fork(socket: BorrowedFd<'_>) -> io::Result<()> {
+pub(crate) fn close_on_fork(socket: BorrowedFd<'_>) -> io::Result<bool> {
     let fd = socket.as_raw_fd();
     let flags = apple_ffi!(fd_flags(fd));
     if flags == -1 {
         return Err(io::Error::last_os_error());
     }
     if flags & FD_CLOFORK != 0 {
-        return Ok(());
+        return Ok(true);
     }
     if apple_ffi!(set_fd_flags(fd, flags | FD_CLOFORK)) == -1 {
         return Err(io::Error::last_os_error());
     }
-    Ok(())
+    let retained = apple_ffi!(fd_flags(fd));
+    if retained == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(retained & FD_CLOFORK != 0)
 }
 
 /// Separate read/write entries keep their EOF evidence distinct. A single entry
@@ -187,23 +191,39 @@ mod tests {
     const EBADF: c_int = 9;
     const ENOENT: c_int = 2;
 
-    /// The kernel keeps a marked socket out of a forked child and leaves an unmarked
-    /// one in it. The child looks at its own table between fork and exec — the window a
-    /// descriptor scan drains a parent's socket through — then execs a path that does
-    /// not exist, so no program runs and its `ENOENT` is the all-clear.
+    /// The reported support agrees with a forked child's descriptor table. The unmarked
+    /// socket is a negative control; a nonexistent exec target reports successful checks
+    /// as `ENOENT`, without running another program.
     #[test]
-    fn close_on_fork_keeps_a_socket_out_of_a_forked_child() {
+    fn close_on_fork_reports_the_kernel_inheritance_behavior() {
+        let expected = {
+            let (probe, _peer) = UnixStream::pair().expect("an independent capability probe");
+            // SAFETY: the probe owns its descriptor; these fcntls access only its flags.
+            unsafe {
+                let flags = fcntl(probe.as_raw_fd(), F_GETFD);
+                assert!(flags >= 0);
+                assert_eq!(fcntl(probe.as_raw_fd(), F_SETFD, flags | FD_CLOFORK), 0);
+                fcntl(probe.as_raw_fd(), F_GETFD) & FD_CLOFORK != 0
+            }
+        };
         let (marked, _peer) = UnixStream::pair().expect("a socket pair");
         let (unmarked, _peer2) = UnixStream::pair().expect("a second socket pair");
-        crate::close_on_fork(marked.as_fd()).expect("mark the socket");
-        crate::close_on_fork(marked.as_fd()).expect("marking twice is a no-op");
+        let supported = crate::close_on_fork(marked.as_fd()).expect("request the mark");
+        assert_eq!(
+            supported, expected,
+            "the API must actually request the kernel flag"
+        );
+        assert_eq!(
+            crate::close_on_fork(marked.as_fd()).expect("requesting twice is stable"),
+            supported
+        );
         let (m, u) = (marked.as_raw_fd(), unmarked.as_raw_fd());
         let mut child = std::process::Command::new("/nonexistent/astream-sys-close-on-fork");
         // SAFETY: the hook only calls `fcntl(F_GETFD)`, which is async-signal-safe, and
         // allocates nothing: `from_raw_os_error` builds its error without the heap.
         unsafe {
             child.pre_exec(move || {
-                if fcntl(m, F_GETFD) != -1 {
+                if (fcntl(m, F_GETFD) == -1) != supported {
                     return Err(io::Error::from_raw_os_error(EEXIST));
                 }
                 if fcntl(u, F_GETFD) == -1 {
@@ -215,7 +235,7 @@ mod tests {
         let refused = child.spawn().expect_err("no program exists at that path");
         match refused.raw_os_error() {
             Some(ENOENT) => {}
-            Some(EEXIST) => panic!("the marked socket reached the forked child"),
+            Some(EEXIST) => panic!("fork inheritance disagreed with the reported kernel support"),
             Some(EBADF) => panic!("NEGATIVE CONTROL: the unmarked socket did not reach the child"),
             _ => panic!("the child failed some other way: {refused}"),
         }

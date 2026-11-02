@@ -122,27 +122,32 @@ pub enum EvictClass {
     Pinned,
 }
 
-/// THE AMEND THAT RIDES ITS OPEN (fix unit H4, finding GATE3-7): an amend that writes what its
-/// node is, a field the node's open carries when it knows it at the start ([`names_the_node`]: a
-/// `cmd`'s `detail=` once its program is confirmed, an agent's `prog=` or `model=`, a restored
-/// session's `prev=` and `lineage=`). While its node's open is live and it holds, for some such
-/// field, the value the fold keeps under the confidence law ([`crate::confidence_law`]: the highest
-/// confidence, then the newest), it is classed as that open ([`Log::class_of`]) and is evicted,
-/// carried and restated in a journal snap with it, so no read shows the open without what the fold
-/// shows of the node. A node has at most one such amend per identity key, so the ones an open node
-/// pins stay bounded.
+/// THE AMEND THAT RIDES ITS OPEN (fix unit H4, finding GATE3-7; the turn's, fix unit J0-2): an
+/// amend that writes what its node is, a field the node's open carries when it knows it at the
+/// start ([`names_the_node`]: a `cmd`'s `detail=` once its program is confirmed, an agent's
+/// `prog=` or `model=`, a turn's `vref=` once the transcript names its vendor turn and its `cont=`
+/// once it continues an earlier one, a restored session's `prev=` and `lineage=`). While its
+/// node's open is live and it holds, for some such field, the value the fold keeps under the
+/// confidence law ([`crate::confidence_law`]: the highest confidence, then the newest), it is
+/// classed as that open ([`Log::class_of`]) and is evicted, carried and restated in a journal snap
+/// with it, so no read shows the open without what the fold shows of the node. A node has at most
+/// one such amend per identity key, so the ones an open node pins stay bounded, and a closed
+/// node's go with its open. Riding is the ring's, the carry's and the journal snap's: the bus
+/// mirror copies an amend as it copies any record, whether or not it rides.
 #[must_use]
 pub fn rides_open(r: &Rec) -> bool {
     r.op == Op::Amend && r.f.iter().any(|(k, _)| names_the_node(r.node, *k))
 }
 
 /// Whether `k` says what `node` is, a field its open carries when it knows it at the start: a
-/// run's program or model identifier ([`Tier::WireMeta`]), and the session's restore lineage.
+/// run's program or model identifier ([`Tier::WireMeta`]), a turn's vendor turn (`vref=`) and
+/// the earlier turn it continues (`cont=`), and the session's restore lineage.
 fn names_the_node(node: Node, k: Key) -> bool {
     match node.lvl {
         Lvl::Run => k.tier() == Tier::WireMeta,
+        Lvl::Turn => matches!(k, Key::Vref | Key::Cont),
         Lvl::Session => node == Node::SESSION && matches!(k, Key::Prev | Key::Lineage),
-        Lvl::Instance | Lvl::Turn | Lvl::Step => false,
+        Lvl::Instance | Lvl::Step => false,
     }
 }
 
@@ -731,9 +736,10 @@ impl IdCounters {
 struct Entry {
     rec: Arc<Rec>,
     bytes: usize,
-    /// The record's place in the bus class's dense count (phase 4, design
-    /// §5.5): `1..` for a bus-class record ([`Rec::is_bus_class`]), 0 for a
-    /// local one.
+    /// The record's place in the mirror's dense count (phase 4, design
+    /// §5.5): `1..` for a record the mirror publishes ([`Rec::is_mirrored`]:
+    /// a bus-class record whose body carries something, fix unit E5), 0 for
+    /// a local one.
     ms: u64,
     /// THE RECORD'S PROCESS-CLOCK READING:
     /// the `mono_ms` of the [`Stamp`] its append was given, so a view that
@@ -818,11 +824,14 @@ impl Clone for JournalMark {
 }
 
 /// THE WRITER'S HOLD ON A TAKE ([`Log::take_journaled`], audit fix C7 and its review): what a
-/// write that does not land gives back, without the timeline's lock, so the records it took and
-/// did not write rank with the unwritten again at once (a full disk's backoff never finds them
-/// spent first), while a write that lands, and the burst after it, needs no lock to keep them
-/// spent first. It acts only on the log it was taken from; once that log is gone or replaced,
-/// it does nothing.
+/// writer gives back, without the timeline's lock, for records it took and will not write
+/// ([`Journaled::unwritten`]): they rank with the unwritten again at once, so a burst never finds
+/// them spent first while no line of theirs is held to be written. A write that lands, and the
+/// burst after it, needs no lock to keep them spent first. It acts only on the log it was taken
+/// from; once that log is gone or replaced, it does nothing. The API leaves to the writer when to
+/// give back: the GUI's journal writer keeps a failed take's lines to write again, and their hold
+/// with them, so its records stay spent first through the backoff, and gives back only for the
+/// lines it lets go unwritten (fix unit G5).
 #[derive(Debug)]
 pub struct Journaled {
     mark: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -830,8 +839,9 @@ pub struct Journaled {
 }
 
 impl Journaled {
-    /// The take's write did not land: the log's mark falls back to where the take began (the
-    /// writer's cursor before it), never below.
+    /// The writer will not write the take's records from its lines (its write did not land and
+    /// it lets them go): the log's mark falls back to where the take began (the writer's cursor
+    /// before it), never below.
     pub fn unwritten(&self) {
         self.mark
             .fetch_min(self.from, std::sync::atomic::Ordering::AcqRel);
@@ -895,13 +905,14 @@ pub struct Log {
     /// How far the host's journal writer has this log ([`Log::journaled`]), while one
     /// follows it.
     journaled: Option<JournalMark>,
-    /// The bus class's count in this seq space (phase 4): the `ms` of the
-    /// newest bus-class record appended, evicted or not.
+    /// The mirror's count in this seq space (phase 4): the `ms` of the
+    /// newest record the mirror publishes ([`Rec::is_mirrored`]) appended,
+    /// evicted or not.
     ms_head: u64,
     /// [`Self::ms_head`] when the readers were fenced ([`Log::fence_reads`]):
     /// what a take under the fence and its tail gap stop at.
     fence_ms: u64,
-    /// THE MIRROR (phase 4, `mirror.rs`): where this log's bus-class records
+    /// THE MIRROR (phase 4, `mirror.rs`): where this log's mirrored records
     /// stand on the bus.
     mirror: Option<Box<mirror::Mirror>>,
     /// THE TIMELINE'S ROWS (`log_rows`): the host's row
@@ -1127,7 +1138,8 @@ impl Log {
     /// The journal writer took this log's records from `from` through `seq` into a write: they
     /// are spent first from now ([`Log::note_journaled`]), under the take's own hold, so neither
     /// a busy lock after the write nor a burst during it finds them ranked with the unwritten.
-    /// The returned hold gives them back if the write does not land ([`Journaled::unwritten`]).
+    /// The returned hold gives them back when the writer will not write them
+    /// ([`Journaled::unwritten`]).
     pub fn take_journaled(&mut self, from: u64, seq: u64) -> Journaled {
         let mark = self.journaled.get_or_insert_with(|| JournalMark::at(seq));
         mark.raise(seq);
@@ -1138,7 +1150,8 @@ impl Log {
     }
 
     /// How far the journal writer has this log, while one follows: its lines through this seq
-    /// are on disk or in a write under way (one that fails gives them back, [`Journaled`]).
+    /// are on disk, in a write under way or held to be written again (a writer that lets them go
+    /// unwritten gives them back, [`Journaled`]).
     #[must_use]
     pub fn journaled(&self) -> Option<u64> {
         self.journaled.as_ref().map(JournalMark::get)
@@ -1288,21 +1301,13 @@ impl Log {
     /// the open it rides with. An amend rides while its node's open is live and, for some identity
     /// field it writes, it is the amend the fold keeps under the confidence law
     /// ([`crate::confidence_law`], as `NodeFields::offer` keeps it): the highest confidence, then
-    /// the newest seq.
+    /// the newest seq. The opens looked up are those of the nodes a kept amend names, at any level
+    /// [`names_the_node`] gives keys to, so no second list of levels says which opens ride.
     fn riders(&self) -> Vec<Option<usize>> {
         let mut out = vec![None; self.ring.len()];
         if !self.ring.iter().any(|e| rides_open(&e.rec)) {
             return out;
         }
-        let opens: BTreeMap<Node, usize> = self
-            .ring
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| {
-                e.rec.op == Op::Open && (e.rec.node.lvl == Lvl::Run || e.rec.node == Node::SESSION)
-            })
-            .map(|(i, e)| (e.rec.node, i))
-            .collect();
         let mut kept: BTreeMap<(Node, Key), (Conf, u64, usize)> = BTreeMap::new();
         for (i, e) in self.ring.iter().enumerate() {
             if !rides_open(&e.rec) {
@@ -1316,8 +1321,17 @@ impl Log {
                 }
             }
         }
+        let mut opens: BTreeMap<Node, Option<usize>> =
+            kept.keys().map(|(node, _)| (*node, None)).collect();
+        for (i, e) in self.ring.iter().enumerate() {
+            if e.rec.op == Op::Open
+                && let Some(o) = opens.get_mut(&e.rec.node)
+            {
+                *o = Some(i);
+            }
+        }
         for ((node, _), (_, _, i)) in kept {
-            out[i] = opens.get(&node).copied();
+            out[i] = opens.get(&node).copied().flatten();
         }
         out
     }
@@ -2082,7 +2096,7 @@ impl Log {
         let bytes = encoded_size(&rec, Tier::Content).unwrap_or(MAX_RECORD_BYTES);
         let claim = rec.src == Src::Mark;
         let program = (rec.op == Op::Mark && rec.k == Kind::Program).then_some(rec.node);
-        let ms = if rec.is_bus_class() {
+        let ms = if rec.is_mirrored() {
             self.ms_head = self.ms_head.saturating_add(1);
             self.ms_head
         } else {

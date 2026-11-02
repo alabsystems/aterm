@@ -127,6 +127,8 @@ struct Knobs {
     cmdline: Option<&'static str>,
     /// agy's quota rotates the launch onto this model (default: it keeps its own).
     quota_to: Option<&'static str>,
+    /// agy's quota rotates the launch onto this model only when stopped at a quota wall on screen.
+    quota_at_wall_to: Option<&'static str>,
     /// Actual vendor-record versions, with build ids derived by the same typed parser.
     versions: Option<(&'static str, &'static str)>,
 }
@@ -330,6 +332,29 @@ impl AgyKernel for LiveKernel {
                 standing: Standing::Open,
             },
         })
+    }
+
+    fn quota_pick_at(
+        &self,
+        model: Option<&str>,
+        exe: &Path,
+        env: &[(String, String)],
+        flags: &[String],
+        at_wall: bool,
+    ) -> Option<crate::harness::agy_quota::Pick> {
+        use crate::harness::agy_quota::{Pick, Standing};
+        if at_wall && let Some(to) = self.knobs.quota_at_wall_to {
+            let from = model.unwrap_or("gemini-4-argon-high").to_owned();
+            if to != from {
+                return Some(Pick::Rotate {
+                    from,
+                    from_standing: Standing::Low,
+                    to: to.to_owned(),
+                    to_standing: Standing::Open,
+                });
+            }
+        }
+        self.quota_pick(model, exe, env, flags)
     }
 
     fn summaries(&self, _: &Path, _: &str) -> Result<String, ()> {
@@ -1473,7 +1498,7 @@ fn the_summary_database_is_read_only_open_or_closed() {
         )
     };
     let made = aterm_uds::deadline::output_until(
-        aterm_uds::spawnfd::command("/usr/bin/sqlite3")
+        aterm_uds::spawnfd::command(crate::test_program::kept("/usr/bin/sqlite3"))
             .arg(&db)
             .arg(format!(
                 "{schema}{} PRAGMA wal_checkpoint(TRUNCATE);",
@@ -1491,7 +1516,7 @@ fn the_summary_database_is_read_only_open_or_closed() {
         !side("wal").exists() && !side("shm").exists(),
         "the read writes nothing"
     );
-    let mut holder = aterm_uds::spawnfd::command("/usr/bin/sqlite3")
+    let mut holder = aterm_uds::spawnfd::command(crate::test_program::kept("/usr/bin/sqlite3"))
         .arg(&db)
         .stdin(aterm_uds::spawnfd::Stdio::piped())
         .stdout(aterm_uds::spawnfd::Stdio::piped())
@@ -1556,7 +1581,7 @@ fn the_summary_database_is_read_only_open_or_closed() {
     let bad_config = std::fs::canonicalize(&*bad_dir).expect("canonical");
     let bad_db = bad_config.join(live::SUMMARIES);
     let bad_made = aterm_uds::deadline::output_until(
-        aterm_uds::spawnfd::command("/usr/bin/sqlite3")
+        aterm_uds::spawnfd::command(crate::test_program::kept("/usr/bin/sqlite3"))
             .arg(&bad_db)
             .arg(
                 "PRAGMA journal_mode=WAL; \
@@ -1574,7 +1599,7 @@ fn the_summary_database_is_read_only_open_or_closed() {
     );
 
     let injected = aterm_uds::deadline::output_until(
-        aterm_uds::spawnfd::command("/usr/bin/sqlite3")
+        aterm_uds::spawnfd::command(crate::test_program::kept("/usr/bin/sqlite3"))
             .arg(&db)
             .arg(format!(
                 "INSERT INTO conversation_summaries (conversation_id,status,not_fully_idle,parent_conversation_id) \
@@ -1613,7 +1638,7 @@ fn the_summary_read_never_locks_out_a_writer_with_no_busy_timeout() {
             "INSERT OR REPLACE INTO conversation_summaries VALUES ('{C1}','{status}',{nfi},'');"
         )
     };
-    let mut holder = aterm_uds::spawnfd::command("/usr/bin/sqlite3")
+    let mut holder = aterm_uds::spawnfd::command(crate::test_program::kept("/usr/bin/sqlite3"))
         .arg(&db)
         .stdin(aterm_uds::spawnfd::Stdio::piped())
         .stdout(aterm_uds::spawnfd::Stdio::piped())
@@ -1644,7 +1669,7 @@ fn the_summary_read_never_locks_out_a_writer_with_no_busy_timeout() {
     assert!(side("wal").exists() && side("shm").exists(), "left behind");
     let writer = || {
         aterm_uds::deadline::output_until(
-            aterm_uds::spawnfd::command("/usr/bin/sqlite3")
+            aterm_uds::spawnfd::command(crate::test_program::kept("/usr/bin/sqlite3"))
                 .arg(&db)
                 .arg(row(STATUS_IDLE, 0)),
             std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
@@ -1675,7 +1700,7 @@ fn the_summary_read_never_locks_out_a_writer_with_no_busy_timeout() {
     let wrote = writer();
     assert!(wrote.status.success(), "{wrote:?}");
     let back = aterm_uds::deadline::output_until(
-        aterm_uds::spawnfd::command("/usr/bin/sqlite3")
+        aterm_uds::spawnfd::command(crate::test_program::kept("/usr/bin/sqlite3"))
             .arg(&db)
             .arg(format!(
                 "SELECT status FROM conversation_summaries WHERE conversation_id = '{C1}';"
@@ -2152,4 +2177,163 @@ fn an_idle_agy_on_a_spent_pool_is_relaunched_on_the_quota_pick() {
     assert!(older.asked("signal").is_empty());
     assert!(older.asked("turn").is_empty());
     assert!(older.record().is_none());
+}
+
+#[test]
+fn an_agy_stopped_at_a_quota_wall_rotates_onto_the_other_pool_and_resumes_the_turn() {
+    let rig = LiveRig::new(Knobs {
+        twin: Some(Twin::Same),
+        screen: Some(aterm_phase::agy::fixtures::lab::ERROR_429_INDIVIDUAL),
+        summary: Some(Ok(format!("{C1}|CASCADE_RUN_STATUS_RUNNING|0|\n"))),
+        quota_at_wall_to: Some("claude-opus-5-5-medium"),
+        ..Knobs::default()
+    });
+    let tabs = LiveRig::tabs();
+    assert_eq!(
+        live::rotation_due(
+            &rig.kernel.exe,
+            &rig.kernel.args(TUI).expect("running launch"),
+            Some(rig.twin.clone()),
+            &rig.opts.home,
+            &rig.kernel,
+        ),
+        None,
+        "without a quota wall on screen, a low named pool stays put"
+    );
+    assert_eq!(
+        live::upgrade_due_with(&rig.opts, &tabs, Some(rig.twin.clone()), &rig.kernel),
+        Some(Due::Yes),
+        "a quota wall on screen with another pool open makes rotation due"
+    );
+    let r = rig.visit();
+    assert_eq!(r.step, "continued", "{r:?}");
+    assert_eq!(
+        (r.from.as_str(), r.to.as_str()),
+        ("gemini-4-argon-high", "claude-opus-5-5-medium(quota)")
+    );
+    let typed = rig.asked("turn");
+    assert_eq!(
+        typed.len(),
+        2,
+        "the relaunch line and the continuation prompt: {typed:#?}"
+    );
+    assert!(
+        typed[0].contains(&format!(
+            "'--model=claude-opus-5-5-medium' '--effort' 'high' '--conversation={C1}'"
+        )),
+        "{}",
+        typed[0]
+    );
+    assert!(
+        typed[1].contains(
+            "Relaunched on claude-opus-5-5-medium: the model this session ran reached its usage limit, so it was restarted with that model"
+        ),
+        "{}",
+        typed[1]
+    );
+    let st = rig.record().expect("the record");
+    assert!(!st.quiet, "a quota wall rotation must type carry-on");
+    assert!(
+        st.outcome.ends_with("the same conversation resumed"),
+        "{}",
+        st.outcome
+    );
+}
+#[test]
+fn an_agy_behind_twin_and_stopped_at_a_quota_wall_upgrades_and_rotates_together() {
+    let rig = LiveRig::new(Knobs {
+        twin: Some(Twin::Newer),
+        screen: Some(aterm_phase::agy::fixtures::lab::ERROR_429_INDIVIDUAL),
+        summary: Some(Ok(format!("{C1}|CASCADE_RUN_STATUS_RUNNING|0|\n"))),
+        quota_at_wall_to: Some("claude-opus-5-5-medium"),
+        ..Knobs::default()
+    });
+    let r = rig.visit();
+    assert_eq!(r.step, "continued", "{r:?}");
+    assert_eq!(
+        (r.from.as_str(), r.to.as_str()),
+        ("gemini-4-argon-high", "claude-opus-5-5-medium(quota)")
+    );
+    let st = rig.record().expect("the record");
+    assert_eq!((st.from.as_str(), st.to.as_str()), (VERSION, NEW_VERSION));
+    assert!(!st.quiet, "a quota wall rotation must type carry-on");
+    let typed = rig.asked("turn");
+    assert_eq!(typed.len(), 2, "{typed:#?}");
+    assert!(
+        typed[0].contains(&format!(
+            "'--model=claude-opus-5-5-medium' '--effort' 'high' '--conversation={C1}'"
+        )),
+        "{}",
+        typed[0]
+    );
+    assert!(
+        typed[1].contains("Relaunched on claude-opus-5-5-medium:"),
+        "{}",
+        typed[1]
+    );
+}
+
+#[test]
+fn an_agy_switched_via_slash_model_with_a_large_transcript_rotates_at_an_individual_quota_wall() {
+    use std::io::Write as _;
+    let screen = aterm_phase::agy::fixtures::lab::ERROR_429_INDIVIDUAL
+        .replace(
+            "⚠ agent executor error: generating and executing: RESOURCE_EXHAUSTED (code 429): Individual quota reached.",
+            "⚠ Individual quota reached.",
+        )
+        .replace("Gemini 4 Argon · high", "Claude Opus 5.5 · high");
+    let screen: &'static str = Box::leak(screen.into_boxed_str());
+    let rig = LiveRig::new(Knobs {
+        twin: Some(Twin::Same),
+        screen: Some(screen),
+        argv: Some(vec!["--dangerously-skip-permissions".to_owned()]),
+        summary: Some(Ok(format!("{C1}|CASCADE_RUN_STATUS_IDLE|0|\n"))),
+        quota_at_wall_to: Some("gemini-4-argon-high"),
+        ..Knobs::default()
+    });
+    // Grow `transcript.jsonl` past 32 MiB with post-start rows so the old 32 MiB tail seek would
+    // have failed with `wait:log-unproved`.
+    let config = rig.opts.home.join(".gemini/antigravity-cli");
+    let path = config
+        .join("brain")
+        .join(C1)
+        .join(".system_generated/logs/transcript.jsonl");
+    std::fs::create_dir_all(path.parent().expect("logs dir")).expect("create logs dir");
+    {
+        let mut f = std::fs::File::create(&path).expect("transcript file");
+        let pad = "x".repeat(64 * 1024);
+        let row = format!(
+            "{{\"created_at\":\"{AT}\",\"type\":\"PLANNER_RESPONSE\",\"content\":\"{pad}\"}}\n"
+        );
+        for _ in 0..540 {
+            f.write_all(row.as_bytes()).expect("write row");
+        }
+    }
+    assert!(
+        std::fs::metadata(&path).expect("meta").len() > (33 << 20),
+        "transcript exceeds 33 MiB"
+    );
+    assert_eq!(live::transcript_look(&config, C1, START_MS), Ok(()));
+
+    let tabs = LiveRig::tabs();
+    assert_eq!(
+        live::upgrade_due_with(&rig.opts, &tabs, Some(rig.twin.clone()), &rig.kernel),
+        Some(Due::Yes),
+        "footer's Claude Opus 5.5 model triggers rotation onto gemini-4-argon-high even without --model on argv"
+    );
+    let r = rig.visit();
+    assert_eq!(r.step, "continued", "{r:?}");
+    assert_eq!(
+        (r.from.as_str(), r.to.as_str()),
+        ("Claude Opus 5.5", "gemini-4-argon-high(quota)")
+    );
+    let typed = rig.asked("turn");
+    assert_eq!(typed.len(), 2, "{typed:#?}");
+    assert!(
+        typed[0].contains(&format!(
+            "'--model=gemini-4-argon-high' '--dangerously-skip-permissions' '--conversation={C1}'"
+        )),
+        "{}",
+        typed[0]
+    );
 }

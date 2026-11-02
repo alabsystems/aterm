@@ -96,11 +96,17 @@ impl Ledger {
         let mut rows = Vec::new();
         for line in lines.filter(|l| !l.is_empty()) {
             let mut words = line.split(' ');
+            let key = OfferKey::parse(words.next()?)?;
+            let mut next_digits = || {
+                words
+                    .next()
+                    .filter(|w| !w.is_empty() && w.bytes().all(|b| b.is_ascii_digit()))
+            };
             let row = Tried {
-                key: OfferKey::parse(words.next()?)?,
-                count: words.next()?.parse().ok()?,
-                first_ms: words.next()?.parse().ok()?,
-                last_ms: words.next()?.parse().ok()?,
+                key,
+                count: next_digits()?.parse().ok()?,
+                first_ms: next_digits()?.parse().ok()?,
+                last_ms: next_digits()?.parse().ok()?,
             };
             if words.next().is_some() || rows.len() >= LEDGER_ROWS {
                 return None;
@@ -364,12 +370,10 @@ pub(crate) fn claim_order(offer: &Offer, folder: Option<&Path>) -> crate::task_l
 /// session trusted it ([`credit_offers::is_claim_folder`]).
 pub(crate) fn worker_folder_under(state: &Path) -> Option<PathBuf> {
     let dir = state.join(credit_offers::CLAIM_FOLDER);
-    std::fs::create_dir_all(&dir).ok()?;
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).ok()?;
-    }
+    crate::control_auth::ensure_private_dir(&dir).ok()?;
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
 }
 

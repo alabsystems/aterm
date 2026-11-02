@@ -5,6 +5,7 @@
 
 use crate::console::Presence;
 use crate::engine::{Journal, Place};
+use crate::init_secrets::Here;
 use crate::items::defaults::Target;
 use crate::items::{Ctx, Item};
 use crate::model::{Effect, HostFacts, ItemReport, Mode, Outcome, PValue, Probe, Read};
@@ -38,28 +39,28 @@ pub fn usage() -> String {
     format!(
         "\
 aterm init [--plan | --check] [--json] [--verbose] [--only <id,...>] [--vault <url|path>]
-           [--profile] [--sign-out] [--clone] [--develop | --no-develop] [--no-wait]
+           [--[no-]profile] [--[no-]sign-out] [--[no-]clone] [--[no-]develop] [--no-wait]
 aterm init --converge [--check] [--json] [--verbose] [--trigger subscriber|window|setup]
   aterm.app's first launch does this setup by itself; init is for SSH and CLI-only Macs,
   and Linux (the base layer, the vault and --clone; each Mac row reads \"macOS only\").
-  Run it as yourself, without sudo; safe to run again. Over SSH too: what `aterm doctor`
-  restores, the ALab toolset and missing Command Line Tools automatically. Then,
-  in this Mac's console account (background and agent launches included; remote logins defer):
+  Run it as yourself, without sudo; safe to run again. Every Mac gets what `aterm doctor`
+  restores, the ALab toolset, the Command Line Tools if missing (one sudo password), and
     {spotlight}
-    {secrets} (default ALab joins automatically on the LAN; --vault may ask for a password)
+    {secrets} (joins ALab's open vault on the LAN, over SSH too, asking nothing)
     {permissions} (a row for each grant to switch on)
-  and these three, all of them unless a flag names the ones to run:
+  An ALab Mac runs these too (--no-<flag> leaves one out); elsewhere --<flag> adds one:
     --profile   {profile}
     --sign-out  {sign_out}
     --clone     {clone}
                 (your own, no forks or archived; init.toml [github] scopes or disables it)
-  --plan reports, --check only reads, --json prints the report, --verbose every row (else
-  the changed, failed and needs-you rows, then a tally); --only runs the ids or families
-  named (base, workstation, init.spotlight, ...); --develop records this checkout as a
-  develop machine, fetched and provisioned each run, and --no-develop drops it.
-  --converge runs one converge pass now, as the subscriber and window do; it asks nothing.
-  Exit: 0 done; 75 waits on
-  a lock (--no-wait) or a step, 77 a permission, 69 the network; 1 otherwise; 2 usage.
+  Preferences need you at the console; sign-outs run last, with you at the screen. A group
+  off in System State (all after a Stop) stays as is unless a flag names it; one turned
+  off mid-run stays as is. A setting you changed stays yours till Set up now or aterm
+  doctor --apply. --plan reports, --check only reads, --json prints JSON, --verbose every
+  row; --only runs those ids, families or groups (base, github, dock, ...); --[no-]develop
+  records or drops this checkout as a develop machine; --no-wait waits for no System State
+  pass (else 10 min); --converge runs one pass now. Exit: 0 done, or left to the vault or
+  a person; 75 a lock or step, 77 a permission, 69 the network; 1 otherwise; 2 usage.
 ",
         spotlight = Setting::Spotlight.label(),
         secrets = Setting::Secrets.label(),
@@ -105,9 +106,9 @@ struct Options {
     /// `--verbose`: print every row as it finishes, not only the changed, failed and needs-you
     /// rows.
     verbose: bool,
-    /// The groups `--profile`, `--sign-out` and `--clone` picked; `None` when no flag did, and
-    /// every group runs (no question: setup is on by default).
-    choice: Option<Choice>,
+    /// What `--profile`, `--sign-out`, `--clone` and their `--no-` forms said ([`Picks`]); with
+    /// none, this Mac's scope decides (no question: setup is on by default).
+    picks: Picks,
     /// The `--only` words that name no base or develop item: workstation items, which only a
     /// built workstation knows ([`converge`] refuses a word that names none).
     station: Vec<String>,
@@ -121,13 +122,16 @@ struct Options {
 }
 
 impl Options {
-    /// What this run's base layer may do with the store lock ([`Host::base`]).
-    const fn base_lock(&self, applies: bool) -> BaseLock {
-        match (applies, self.no_wait) {
-            (false, _) => BaseLock::Read,
-            (true, false) => BaseLock::Wait,
-            (true, true) => BaseLock::Try,
-        }
+    /// What this run's base layer may do with the store lock ([`Host::base`], [`lock_for`]).
+    fn base_lock(&self, applies: bool) -> BaseLock {
+        lock_for(
+            &self.only,
+            match (applies, self.no_wait) {
+                (false, _) => BaseLock::Read,
+                (true, false) => BaseLock::Wait,
+                (true, true) => BaseLock::Try,
+            },
+        )
     }
     /// Whether this run converges the workstation layer.
     fn workstation(&self) -> bool {
@@ -164,10 +168,11 @@ impl Options {
     }
 }
 
-/// The workstation groups a run applies: every one, or the ones `--profile`, `--sign-out` and
-/// `--clone` name. Nothing asks: first-run setup is on by default and the person turns a part
-/// off later (owner ruling 2026-10-25, AGENTS.md).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The workstation groups a run applies: by this Mac's scope (every one on an ALab Mac, none
+/// elsewhere), the ones `--profile`, `--sign-out` and `--clone` name, less the ones their
+/// `--no-` forms leave out ([`Picks`]). Nothing asks: first-run setup is on by default and the
+/// person turns a part off later (owner ruling 2026-10-25, AGENTS.md).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Choice {
     /// The workstation preferences ([`PROFILE`]).
     profile: bool,
@@ -191,6 +196,221 @@ impl Choice {
         sign_out: false,
         clone: false,
     };
+
+    /// The groups `self` takes and `other` does not.
+    const fn without(self, other: Self) -> Self {
+        Self {
+            profile: self.profile && !other.profile,
+            sign_out: self.sign_out && !other.sign_out,
+            clone: self.clone && !other.clone,
+        }
+    }
+
+    /// Whether one of `self`'s groups holds `setting`; the base plan's settings are in none.
+    const fn names(self, setting: Setting) -> bool {
+        match setting {
+            Setting::Messages | Setting::FaceTime => self.sign_out,
+            Setting::Repositories => self.clone,
+            Setting::CapsLock
+            | Setting::NaturalScrolling
+            | Setting::TrackpadScrolling
+            | Setting::Desktop
+            | Setting::Widgets
+            | Setting::Dock => self.profile,
+            Setting::Spotlight | Setting::Permissions | Setting::Secrets => false,
+        }
+    }
+
+    /// The settings a run with `self`'s groups takes: the base plan every Mac runs
+    /// ([`aterm_types::macos_setup::BASE_PLAN`]) and each group's own.
+    fn selection(self) -> Selection {
+        let mut selection = aterm_types::macos_setup::BASE_PLAN;
+        for setting in Setting::ALL {
+            if self.names(setting) {
+                selection.set(setting, true);
+            }
+        }
+        selection
+    }
+}
+
+/// How a person names `setting`'s group on `aterm init`'s command line, to run it where their
+/// choice in System State left it as it is, or where this Mac's scope leaves it out: the
+/// narrowest run that sets it up and nothing else, `aterm init --only` with its word
+/// ([`only_word`]). A flag would run more: `--profile` sets every profile group, `--sign-out`
+/// both sign-outs, and on an ALab Mac each adds to a scope that takes every group.
+#[must_use]
+pub const fn naming(setting: Setting) -> &'static str {
+    match setting {
+        Setting::CapsLock => "aterm init --only keyboard",
+        Setting::NaturalScrolling => "aterm init --only scrolling",
+        Setting::TrackpadScrolling => "aterm init --only trackpad",
+        Setting::Desktop => "aterm init --only desktop",
+        Setting::Widgets => "aterm init --only widgets",
+        Setting::Dock => "aterm init --only dock",
+        Setting::Messages => "aterm init --only init.messages",
+        Setting::FaceTime => "aterm init --only init.facetime",
+        Setting::Spotlight => "aterm init --only spotlight",
+        Setting::Permissions => "aterm init --only permissions",
+        Setting::Secrets => "aterm init --only secrets",
+        Setting::Repositories => "aterm init --only github",
+    }
+}
+
+/// The `--only` word that names `setting`'s group alone ([`naming`]): the family of its items,
+/// or the id of the one sign-out.
+#[must_use]
+pub fn only_word(setting: Setting) -> &'static str {
+    let way = naming(setting);
+    way.strip_prefix("aterm init --only ").unwrap_or(way)
+}
+
+/// The settings a run takes ([`picked`]), and the one plain line it says of those in its scope
+/// that the person's choices in System State held ([`Holds::line`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Picked {
+    /// The settings this run applies.
+    runs: Selection,
+    /// What it says of the ones it left as the person set them.
+    held: Option<String>,
+    /// The settings in its scope it left as the person set them ([`Self::held`]'s).
+    kept: Selection,
+    /// The System State row each Desktop-lane item was built for, by its id, tagged as the
+    /// item is built (an id may carry more than one: a group that could not be built stands for
+    /// each of its rows). [`converge`] reads the person's choices again once it holds System
+    /// State's records, and leaves the items whose rows they hold by then.
+    rows: Vec<(String, Setting)>,
+    /// The person's choices as the run read them when it began: a group the run names (a flag's,
+    /// or every one `--only` words name) runs over these holds alone, never over a Stop pressed
+    /// or a group turned off since ([`Holds::later`]).
+    start: Holds,
+}
+
+impl Picked {
+    /// Every setting, holding none: a run whose `--only` words name what it runs.
+    const ALL: Self = Self {
+        runs: Selection::all(),
+        held: None,
+        kept: Selection::none(),
+        rows: Vec::new(),
+        start: Holds::NONE,
+    };
+
+    /// No setting: a run that builds no workstation.
+    const NONE: Self = Self {
+        runs: Selection::none(),
+        held: None,
+        kept: Selection::none(),
+        rows: Vec::new(),
+        start: Holds::NONE,
+    };
+
+    /// Whether this run signs out of Messages or FaceTime.
+    const fn signs_out(&self) -> bool {
+        self.runs.contains(Setting::Messages) || self.runs.contains(Setting::FaceTime)
+    }
+
+    /// Whether this run applies every preference and both sign-outs: the whole profile, which
+    /// the setup records record as verified ([`Records::hold`]).
+    const fn whole(&self) -> bool {
+        let mut each = 0;
+        while each < PROFILE.len() {
+            if !self.runs.contains(PROFILE[each]) {
+                return false;
+            }
+            each += 1;
+        }
+        self.runs.contains(Setting::Messages) && self.runs.contains(Setting::FaceTime)
+    }
+}
+
+/// The settings a run takes (design §7): with `--only` words, every one, since the words name
+/// what runs; otherwise this Mac's scope (`alab`: every group on an ALab Mac, the base plan
+/// elsewhere) with the groups `picks` names and less the ones it leaves out, and less each
+/// setting the person's choices in System State hold (`holds`) unless a flag names its group.
+/// The line it says of those names only ways back that run where it is printed (`at_console`,
+/// [`Holds::line`]).
+fn picked(
+    picks: Picks,
+    only: &[String],
+    alab: &dyn Fn() -> bool,
+    holds: &Holds,
+    at_console: bool,
+) -> Picked {
+    if !only.is_empty() {
+        if at_console {
+            return Picked {
+                start: holds.clone(),
+                ..Picked::ALL
+            };
+        }
+        // Away from the console `--only` narrows the run and names no group over the person's
+        // choices: it is no person's pick there, as `--profile`, `--sign-out` and `--clone` are
+        // not ([`converge`] refuses those).
+        let mut runs = Selection::all();
+        let mut kept = Selection::none();
+        for setting in Setting::ALL.into_iter().filter(|s| holds.holds(*s)) {
+            runs.set(setting, false);
+            kept.set(setting, true);
+        }
+        return Picked {
+            runs,
+            held: None,
+            kept,
+            rows: Vec::new(),
+            start: holds.clone(),
+        };
+    }
+    let scope = picks.choice(alab()).selection();
+    let mut runs = Selection::none();
+    let mut kept = Selection::none();
+    let mut held = Vec::new();
+    for setting in Setting::ALL.into_iter().filter(|s| scope.contains(*s)) {
+        if holds.holds(setting) && !picks.named.names(setting) {
+            held.push(setting);
+            kept.set(setting, true);
+        } else {
+            runs.set(setting, true);
+        }
+    }
+    Picked {
+        runs,
+        held: holds.line(&held, at_console),
+        kept,
+        rows: Vec::new(),
+        start: holds.clone(),
+    }
+}
+
+/// What `--profile`, `--sign-out`, `--clone` and `--no-profile`, `--no-sign-out`, `--no-clone`
+/// said (design §7): on an ALab Mac every group runs and a `--no-` flag leaves one out; elsewhere
+/// none runs and a flag adds one. A group a flag names runs even where the person turned it off
+/// in System State: naming it is their choice too ([`Holds`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Picks {
+    /// The groups `--profile`, `--sign-out` and `--clone` named.
+    named: Choice,
+    /// The groups `--no-profile`, `--no-sign-out` and `--no-clone` left out.
+    left: Choice,
+}
+
+impl Picks {
+    /// Whether any of the six flags was given.
+    fn any(self) -> bool {
+        self.named != Choice::NONE || self.left != Choice::NONE
+    }
+
+    /// The groups a run takes on a Mac `alab` says is an ALab Mac ([`Host::alab`]): its scope's
+    /// groups and the named ones, less the ones left out.
+    const fn choice(self, alab: bool) -> Choice {
+        let scope = if alab { Choice::ALL } else { Choice::NONE };
+        Choice {
+            profile: scope.profile || self.named.profile,
+            sign_out: scope.sign_out || self.named.sign_out,
+            clone: scope.clone || self.named.clone,
+        }
+        .without(self.left)
+    }
 }
 
 fn options(args: &[OsString]) -> Result<Options, String> {
@@ -254,13 +474,25 @@ fn options(args: &[OsString]) -> Result<Options, String> {
             Some("--verbose") => options.verbose = true,
             Some("--no-wait") => options.no_wait = true,
             Some("--converge") => options.converge = true,
-            Some(flag @ ("--profile" | "--sign-out" | "--clone")) => {
-                let choice = options.choice.get_or_insert(Choice::NONE);
-                match flag {
-                    "--profile" => choice.profile = true,
-                    "--sign-out" => choice.sign_out = true,
-                    _ => choice.clone = true,
+            Some(
+                flag @ ("--profile" | "--sign-out" | "--clone" | "--no-profile" | "--no-sign-out"
+                | "--no-clone"),
+            ) => {
+                let (named, group) = match flag.strip_prefix("--no-") {
+                    Some(group) => (false, group),
+                    None => (true, &flag[2..]),
+                };
+                let (on, off) = (&mut options.picks.named, &mut options.picks.left);
+                let (this, other) = if named { (on, off) } else { (off, on) };
+                let (mine, theirs) = match group {
+                    "profile" => (&mut this.profile, other.profile),
+                    "sign-out" => (&mut this.sign_out, other.sign_out),
+                    _ => (&mut this.clone, other.clone),
+                };
+                if theirs {
+                    return Err(format!("choose either --{group} or --no-{group}"));
                 }
+                *mine = true;
             }
             Some(flag @ ("--develop" | "--no-develop")) => {
                 let develop = flag == "--develop";
@@ -290,7 +522,7 @@ fn options(args: &[OsString]) -> Result<Options, String> {
         && (options.action == Action::Plan
             || !options.only.is_empty()
             || options.vault.is_some()
-            || options.choice.is_some()
+            || options.picks.any()
             || options.develop.is_some()
             || options.no_wait)
     {
@@ -299,10 +531,10 @@ fn options(args: &[OsString]) -> Result<Options, String> {
     if options.develop.is_some() && options.only.iter().any(|word| word == "workstation") {
         return Err("--develop and --no-develop cannot be combined with --only workstation".into());
     }
-    if options.choice.is_some() && (options.develop.is_some() || !options.only.is_empty()) {
+    if options.picks.any() && (options.develop.is_some() || !options.only.is_empty()) {
         return Err(
-            "--profile, --sign-out and --clone pick within the whole run; --only and --develop \
-             narrow it: use one"
+            "--profile, --sign-out, --clone and their --no- forms pick within the whole run; \
+             --only and --develop narrow it: use one"
                 .into(),
         );
     }
@@ -391,6 +623,20 @@ impl Base {
     }
 }
 
+/// The store lock a run narrowed to `only` asks its base layer for, `lock` unless no item it
+/// selects touches the store: `--only base.clt` (System State's Command Line Tools tab, and a
+/// person's own run of it) selects Apple's Command Line Tools alone, which run once the lock is
+/// let go, so its base layer is composed as a read ([`BaseLock::Read`]) and never waits for an
+/// install pass that holds the store.
+#[must_use]
+pub fn lock_for(only: &[String], lock: BaseLock) -> BaseLock {
+    if !only.is_empty() && only.iter().all(|word| word == crate::init_clt::ID) {
+        BaseLock::Read
+    } else {
+        lock
+    }
+}
+
 /// What the base layer's run may do with the store lock ([`Host::base`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BaseLock {
@@ -424,6 +670,163 @@ pub struct Host<'a> {
     /// `--converge`'s machine: the converge pass reads and changes it only through these
     /// ([`crate::sync::Ports`]).
     pub converge: &'a dyn crate::sync::Ports,
+    /// Whether this is an ALab Mac, by the one rule System State's window reads (a membership of
+    /// the ALab vault opened under this Mac's own key): its workstation profile, clones and
+    /// sign-outs run by default there, and elsewhere only when a flag names them (design §7).
+    pub alab: &'a dyn Fn() -> bool,
+    /// Whether a person is at this Mac's screen now, as the window's person stages read it: a
+    /// keyboard, mouse or trackpad used within the last minute, and the screen neither locked
+    /// nor switched to another login. Read on every run right before the Messages and FaceTime
+    /// sign-outs, again by each of them right before its own clicks (the run's port,
+    /// [`Live::with_presence`]), and with no terminal also as the run decides whether to build
+    /// them and whether `--sign-out` runs (design §6.4).
+    pub present: fn() -> bool,
+}
+
+/// What a person's own choices in System State hold of this Mac's setup ([`Records::holds`]):
+/// `aterm init` and `aterm doctor --apply` leave each such group as it is, and only its switch on
+/// the page, or the person naming it on the command line, turns it on again (design §3,
+/// principle 4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Holds {
+    /// The settings the person turned off (Leave as is) in a plan of their own, or that an older
+    /// aterm's Cancel left as they were. A plan aterm chose by itself holds none.
+    pub off: Selection,
+    /// Why every group waits whatever its switch says: the person's Stop of setup, or System
+    /// State's records that cannot be read now.
+    pub stopped: Option<String>,
+    /// The original revision of the stopped run, including one a Restore carries on. `None`
+    /// when the records give no stopped run, as when they cannot be read.
+    pub stopped_revision: Option<u64>,
+    /// A newer aterm saved this Mac's setup records: every group waits, and this aterm, which
+    /// leaves that setup alone, names no way to set one up ([`Self::line`]).
+    pub newer: bool,
+}
+
+impl Default for Holds {
+    fn default() -> Self {
+        Self::NONE
+    }
+}
+
+impl Holds {
+    /// Nothing held: a Mac with no setup records, or a plan aterm chose by itself.
+    pub const NONE: Self = Self {
+        off: Selection::none(),
+        stopped: None,
+        stopped_revision: None,
+        newer: false,
+    };
+
+    /// Whether `setting` is held as it is.
+    #[must_use]
+    pub fn holds(&self, setting: Setting) -> bool {
+        self.newer || self.stopped.is_some() || self.off.contains(setting)
+    }
+
+    /// Whether these holds hold `setting` for a reason `earlier`, read before them, did not: a
+    /// Stop, records a newer aterm saved, or the group turned off since. A run that names a group
+    /// runs it over a hold already on record when the run began, never over a later one: a Stop
+    /// pressed, or a group turned off, after `aterm init` started is the person's later choice,
+    /// and holds what has not run yet (principle 4).
+    #[must_use]
+    pub fn later(&self, earlier: &Self, setting: Setting) -> bool {
+        self.later_stop(earlier)
+            || (self.newer && !earlier.newer)
+            || (self.off.contains(setting) && !earlier.off.contains(setting))
+    }
+
+    /// Whether a Stop appeared, or names a different run, since `earlier` was read.
+    fn later_stop(&self, earlier: &Self) -> bool {
+        self.stopped.is_some()
+            && (earlier.stopped.is_none() || self.stopped_revision != earlier.stopped_revision)
+    }
+
+    /// Why these holds hold `setting`, in the words a row it left ends with.
+    #[must_use]
+    pub fn why(&self, setting: Setting) -> String {
+        if self.newer {
+            "left as it is: a newer aterm set this Mac up, and this aterm leaves its settings \
+             alone"
+                .to_owned()
+        } else if let Some(why) = &self.stopped {
+            format!("left as it is because {why}")
+        } else if self.off.contains(setting) {
+            "left as you set it in System State".to_owned()
+        } else {
+            "left as it is".to_owned()
+        }
+    }
+
+    /// The one plain line a run says of `held`, the settings these holds kept from it, naming
+    /// how one comes back on, and only a way that runs where the line is printed: its switch in
+    /// System State (Set up now after a Stop) anywhere, and for a person at this Mac's console
+    /// (`at_console`) the narrowest `aterm init` that names it too ([`naming`]), which an
+    /// agent's tab, an SSH shell or a run with no terminal refuses. Records a newer aterm saved
+    /// name no way: this aterm leaves that setup alone. `None` when it kept none.
+    #[must_use]
+    pub fn line(&self, held: &[Setting], at_console: bool) -> Option<String> {
+        if held.is_empty() {
+            return None;
+        }
+        let names = held
+            .iter()
+            .map(|setting| setting.name())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if self.newer {
+            return Some(format!(
+                "left as they are: a newer aterm set this Mac up, and this aterm leaves its \
+                 settings alone: {names}"
+            ));
+        }
+        // One group's way back is its run; several are one `--only` with each one's word, in
+        // the order the names are.
+        let flags = match held {
+            _ if !at_console => String::new(),
+            [one] => format!(", or run {}", naming(*one)),
+            several => format!(
+                ", or run aterm init --only with each one's word ({})",
+                several
+                    .iter()
+                    .map(|setting| only_word(*setting))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+        Some(match &self.stopped {
+            Some(why) => format!(
+                "left as they are because {why}: {names}. Set up now in System State goes \
+                 on{flags}"
+            ),
+            None => format!(
+                "left as you set them in System State: {names}. Turn one on with its switch \
+                 there{flags}"
+            ),
+        })
+    }
+}
+
+/// What a pass that holds System State's records sets ([`Records::hold`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pass {
+    /// Part of the profile, or none of its preferences (the sign-outs alone): the hold records
+    /// nothing of it as the plan, and no stage of the window's run as done.
+    Part,
+    /// Every preference and both sign-outs, recorded as the plan the way `aterm doctor --apply`
+    /// records its pass.
+    Whole {
+        /// The pass clones the GitHub repositories too, so the plan it saves holds them.
+        clones: bool,
+    },
+}
+
+impl Pass {
+    /// Whether the pass sets the whole profile.
+    #[must_use]
+    pub const fn whole(self) -> bool {
+        matches!(self, Self::Whole { .. })
+    }
 }
 
 /// This Mac's setup records (`profile.lock` and the initial-setup record), which `aterm init`
@@ -431,17 +834,59 @@ pub struct Host<'a> {
 /// workstation holds them, so two surfaces never relaunch the Dock over each other, and a whole
 /// profile it verified is recorded, so the first launch neither runs nor offers it again.
 pub trait Records: Sync {
-    /// Hold the records for a workstation pass, waiting while another setup holds them
-    /// (`wait` hears one line as that wait starts). `whole`: the pass applies every preference
-    /// and both sign-outs, recorded as the plan the way `aterm doctor --apply` records it.
+    /// Hold the records for a workstation pass that sets `pass`, waiting a bounded while another
+    /// setup holds them (`wait` hears one line as that wait starts; `None`, `--no-wait`, waits for
+    /// nothing).
     ///
     /// # Errors
-    /// The records cannot be held or written; nothing was changed.
-    fn hold(&self, whole: bool, wait: &dyn Fn(&str)) -> Result<Box<dyn Held>, String>;
+    /// [`Unheld::Busy`]: another setup held them past the wait (or at once, with no wait);
+    /// [`Unheld::Failed`]: they cannot be held or written. Either way nothing was changed.
+    fn hold(&self, pass: Pass, wait: Option<&dyn Fn(&str)>) -> Result<Box<dyn Held>, Unheld>;
+
+    /// What the person's own choices in System State hold ([`Holds`]), read from these records
+    /// without holding them. Records that cannot be read hold every group, saying why.
+    fn holds(&self) -> Holds {
+        Holds::default()
+    }
+
+    /// The items whose keys the person changed after aterm set them (design §6.6): `aterm init`
+    /// leaves each as they set it ([`KEPT_BY_YOU`]), as the window's unattended pass does. Read
+    /// while the records are held.
+    ///
+    /// # Errors
+    /// The record of those keys cannot be read: init then sets none of the preferences
+    /// ([`KEPT_UNREAD`]).
+    fn kept(&self) -> Result<Vec<String>, String> {
+        Ok(Vec::new())
+    }
+}
+
+/// Why [`Records::hold`] (or [`Held::again`]) did not hold the setup records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unheld {
+    /// Another setup held them past the wait, or at once for a run that waits for nothing: the
+    /// Desktop lane's items stand aside for that lock, in these words, and the run goes on.
+    Busy(String),
+    /// They cannot be held or written: the run ends saying why.
+    Failed(String),
+}
+
+impl From<String> for Unheld {
+    fn from(why: String) -> Self {
+        Self::Failed(why)
+    }
+}
+
+impl From<Unheld> for String {
+    fn from(unheld: Unheld) -> Self {
+        match unheld {
+            Unheld::Busy(why) | Unheld::Failed(why) => why,
+        }
+    }
 }
 
 /// A hold on the setup records ([`Records::hold`]), let go when dropped.
-pub trait Held {
+pub trait Held: Send {
     /// Retain the selected preference items left for a later permission grant.
     ///
     /// # Errors
@@ -460,18 +905,32 @@ pub trait Held {
     }
 
     /// Record the whole profile verified, as `aterm doctor --apply` records its pass; only for a
-    /// hold taken `whole`.
+    /// hold taken for a [`Pass::Whole`].
     ///
     /// # Errors
     /// The record cannot be written.
     fn verified(self: Box<Self>) -> Result<(), String>;
+
+    /// Let the records go while the run's other lanes finish (the clones, the Command Line
+    /// Tools), keeping what this hold records of the pass: System State's Stop, its switches,
+    /// Restore and Set up now wait only while the preferences change, and [`Self::again`] holds
+    /// the records once more for the sign-outs.
+    fn release(&mut self) {}
+
+    /// Hold the records again after [`Self::release`], waiting as [`Records::hold`] waits.
+    ///
+    /// # Errors
+    /// As [`Records::hold`]; nothing was changed.
+    fn again(&mut self, _wait: Option<&dyn Fn(&str)>) -> Result<(), Unheld> {
+        Ok(())
+    }
 }
 
 /// No setup records: a test's run, which shares nothing with a first launch.
 pub struct NoRecords;
 
 impl Records for NoRecords {
-    fn hold(&self, _whole: bool, _wait: &dyn Fn(&str)) -> Result<Box<dyn Held>, String> {
+    fn hold(&self, _pass: Pass, _wait: Option<&dyn Fn(&str)>) -> Result<Box<dyn Held>, Unheld> {
         Ok(Box::new(NoRecords))
     }
 }
@@ -516,6 +975,22 @@ const AWAY_FROM_HOME: &str = "run in your own login and home directory; under an
 /// context, the questions, the base and workstation layers), and one aterm.log line says the
 /// same totals.
 pub fn main_entry(args: Vec<OsString>, host: &Host<'_>) -> ExitCode {
+    entry(
+        args,
+        host,
+        std::env::var_os(aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB).as_deref(),
+        &tab_entry,
+    )
+}
+
+/// [`main_entry`] with the tab's variable as `tab_var` and the tab's own run as `tab_run`
+/// ([`in_tab`], [`tab_entry`]).
+fn entry(
+    args: Vec<OsString>,
+    host: &Host<'_>,
+    tab_var: Option<&std::ffi::OsStr>,
+    tab_run: &dyn Fn(&Options, &Host<'_>) -> u8,
+) -> ExitCode {
     let mut options = match options(&args) {
         Ok(options) => options,
         Err(why) => {
@@ -526,6 +1001,9 @@ pub fn main_entry(args: Vec<OsString>, host: &Host<'_>) -> ExitCode {
     if options.help {
         print!("{}", usage());
         return ExitCode::SUCCESS;
+    }
+    if in_tab(tab_var, &options) {
+        return ExitCode::from(tab_run(&options, host));
     }
     if options.converge {
         return converge_entry(&options, host.converge);
@@ -558,7 +1036,19 @@ pub fn main_entry(args: Vec<OsString>, host: &Host<'_>) -> ExitCode {
     let ahead = (options.action == Action::Apply && options.joins() && options.vault.is_none())
         .then(crate::init_secrets::look_ahead)
         .flatten();
+    // What the person turned off in System State, or their Stop, holds this run's groups as it
+    // holds the window's; the line saying so follows the tally.
+    let held: Mutex<Vec<ItemReport>> = Mutex::new(Vec::new());
+    // The person's choices as the run read them when it began: the clone it owes is stamped
+    // with them ([`note_owed`]).
+    let start: Mutex<Holds> = Mutex::new(Holds::NONE);
     let groups = |sys: &dyn System, ctx: &Ctx, mode: Mode, reading: &Reading<'_>| {
+        let standing = Standing {
+            alab: host.alab,
+            present: &host.present,
+            holds: host.records.holds(),
+        };
+        *start.lock().unwrap_or_else(PoisonError::into_inner) = standing.holds.clone();
         prepare_groups(
             sys,
             ctx,
@@ -566,14 +1056,17 @@ pub fn main_entry(args: Vec<OsString>, host: &Host<'_>) -> ExitCode {
             ahead.clone(),
             options.vault.as_deref(),
             reading,
+            &standing,
             host.grants,
         )
     };
-    let sys = Live::new().with_full_disk_access(if options.workstation() {
-        (host.full_disk_access)()
-    } else {
-        None
-    });
+    let sys = Live::new()
+        .with_full_disk_access(if options.workstation() {
+            (host.full_disk_access)()
+        } else {
+            None
+        })
+        .with_presence(host.present);
     let cwd = std::env::current_dir().ok();
     let printer = Printer::new(options.verbose, options.json);
     let result = sys
@@ -590,6 +1083,12 @@ pub fn main_entry(args: Vec<OsString>, host: &Host<'_>) -> ExitCode {
                     cwd: cwd.as_deref(),
                     records: host.records,
                     on_row: &|row| printer.row(row),
+                    present: &host.present,
+                    on_held: &|row| {
+                        held.lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .push(row)
+                    },
                 },
                 journal.as_mut(),
                 &mut laps,
@@ -608,10 +1107,26 @@ pub fn main_entry(args: Vec<OsString>, host: &Host<'_>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let start = start.into_inner().unwrap_or_else(PoisonError::into_inner);
+    let recorded = note_owed(
+        &rows,
+        options.action,
+        host.converge.state_dir().as_deref(),
+        &start,
+    );
+    if let Err(why) = &recorded {
+        eprintln!(
+            "aterm init: {why}; once this Mac is let into the vault, {} runs the GitHub step",
+            naming(Setting::Repositories)
+        );
+    }
     let complete = complete(&rows, options.action);
     let code = status(&rows, options.action);
     aterm_log::info!("aterm init: {} rows, exit {code}; {laps}", rows.len());
+    let held = held.into_inner().unwrap_or_else(PoisonError::into_inner);
     if options.json {
+        let mut rows = rows;
+        rows.extend(held);
         match report_json(options.action, complete, rows, &laps) {
             Ok(report) => println!("{report}"),
             Err(why) => {
@@ -620,7 +1135,15 @@ pub fn main_entry(args: Vec<OsString>, host: &Host<'_>) -> ExitCode {
             }
         }
     } else {
-        println!("{}", tally(&rows, options.action));
+        println!(
+            "{}",
+            completion_summary(&rows, options.action, recorded.is_ok())
+        );
+        for row in held {
+            if let Some(line) = row.why {
+                println!("aterm init: {line}");
+            }
+        }
         let missing = walk_grants(&rows);
         if options.action == Action::Apply
             && !missing.is_empty()
@@ -630,6 +1153,152 @@ pub fn main_entry(args: Vec<OsString>, host: &Host<'_>) -> ExitCode {
         }
     }
     ExitCode::from(code)
+}
+
+/// The id of the row `--json` carries for the line of what the person's choices in System
+/// State held ([`held_row`]).
+const HELD: &str = "init.system-state";
+
+/// The id of the row `--json` carries for the line of the keys the person changed since aterm
+/// set them ([`held_row`]).
+const CHANGED: &str = "init.changed-by-you";
+
+/// The row `--json` carries for `line` ([`Front::on_held`]), a line a run says of what the
+/// person's choices held, which the text output prints after its tally: the groups System State
+/// holds ([`HELD`], [`Holds::line`]) or the keys they changed ([`CHANGED`]). Each is left as
+/// they set it, so not applicable to this run, and no failure.
+fn held_row(id: &str, title: &str, line: String) -> ItemReport {
+    ItemReport {
+        id: id.into(),
+        family: "init".into(),
+        title: title.into(),
+        outcome: Outcome::NotApplicable,
+        from: None,
+        to: None,
+        why: Some(line),
+        revert: None,
+        effect: Effect::Now,
+        detail: None,
+        layer: Some(Layer::Workstation),
+        class: None,
+        explain: None,
+        stood_aside: None,
+        essential: false,
+        elapsed_ms: Some(0),
+    }
+}
+
+/// Whether this run is System State's Command Line Tools tab's program: `--only base.clt` alone,
+/// with [`aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB`] set (to `var`) and not empty
+/// ([`tab`]). Anywhere else, `aterm init --only base.clt` speaks as it always does.
+fn in_tab(var: Option<&std::ffi::OsStr>, options: &Options) -> bool {
+    var.is_some_and(|value| !value.is_empty())
+        && *options
+            == Options {
+                only: vec![crate::init_clt::ID.to_owned()],
+                ..Options::default()
+            }
+}
+
+/// What the tab's run exits with when the window's go line never came ([`tab`]): neither 0 nor
+/// 1, which say the run printed its last line, so the window ends the tab itself if it still
+/// shows.
+const TAB_NOT_STARTED: u8 = 2;
+
+/// Clears the tab's screen and scrollback once its run starts, so nothing typed or echoed while
+/// it waited for the go line stays in view.
+const TAB_CLEAR: &str = "\x1b[H\x1b[2J\x1b[3J";
+
+/// [`tab`] on this Mac: its words on this run's terminal, its install in this account.
+fn tab_entry(options: &Options, host: &Host<'_>) -> u8 {
+    let sys = Live::new().with_presence(host.present);
+    let out = crate::init_clt::Tab::new(Arc::new(|text: &str| {
+        use std::io::Write as _;
+        let mut stdout = std::io::stdout().lock();
+        let _ = stdout.write_all(text.as_bytes());
+        let _ = stdout.flush();
+    }));
+    let cwd = std::env::current_dir().ok();
+    let groups = |_: &dyn System, _: &Ctx, _: Mode, _: &Reading<'_>| Ok((Vec::new(), Picked::NONE));
+    tab(&sys, &out, &crate::sessions::is_live_account, &|tab| {
+        let in_tab = |applies: bool| {
+            let mut composed = (host.base)(options.base_lock(applies));
+            composed.clt = composed.clt.map(|clt| clt.in_tab(tab.clone()));
+            composed
+        };
+        let mut laps = Laps::start();
+        sys.journal()
+            .map_err(Refused::Failed)
+            .and_then(|mut journal| {
+                converge(
+                    &sys,
+                    options,
+                    &Front {
+                        base: &in_tab,
+                        groups: &groups,
+                        targo: None,
+                        cwd: cwd.as_deref(),
+                        records: host.records,
+                        on_row: &|_| {},
+                        present: &host.present,
+                        on_held: &|_| {},
+                    },
+                    journal.as_mut(),
+                    &mut laps,
+                )
+            })
+    })
+}
+
+/// System State's Command Line Tools tab's run of `aterm init --only base.clt` (design §3.3),
+/// speaking through `out`: it waits for the window's go line
+/// ([`aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_GO`], read with echo off and kept when
+/// typed ahead of the read), which comes only once the tab landed, and else starts nothing,
+/// says nothing and exits [`TAB_NOT_STARTED`]. Then it clears the screen, installs through
+/// `converge` (in this person's own login, `live`), and ends on one line:
+/// [`crate::init_clt::TAB_INSTALLED`] and 0, or why the install did not finish
+/// ([`crate::init_clt::Unfinished::line`]) and that class's exit
+/// ([`crate::init_clt::Unfinished::tab_exit`]: 1, or Low Data Mode's and a non-administrator's
+/// own). None of init's own report is printed.
+fn tab(
+    sys: &dyn System,
+    out: &crate::init_clt::Tab,
+    live: &dyn Fn() -> bool,
+    converge: &dyn Fn(&crate::init_clt::Tab) -> Result<Vec<ItemReport>, Refused>,
+) -> u8 {
+    // Read with echo off, keeping what was typed before the read: the window types the go line
+    // as soon as the tab lands, often before this run reaches here, and a read that discarded
+    // typed-ahead input would wait for a line that never comes again. The screen clear after
+    // it removes the line's echo.
+    let go = sys.ask_kept("");
+    if !matches!(&go, Ok(Some(line))
+        if line.bytes() == aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_GO.as_bytes())
+    {
+        return TAB_NOT_STARTED;
+    }
+    drop(go);
+    out.write(TAB_CLEAR);
+    let installed = if live() {
+        converge(out).is_ok_and(|rows| {
+            rows.iter().any(|row| {
+                row.id == crate::init_clt::ID
+                    && matches!(row.outcome, Outcome::Ok | Outcome::Changed)
+            })
+        })
+    } else {
+        out.note(crate::init_clt::Unfinished::NotOwnLogin);
+        false
+    };
+    if installed {
+        out.line(crate::init_clt::TAB_INSTALLED);
+        0
+    } else {
+        let why = out
+            .unfinished()
+            .unwrap_or(crate::init_clt::Unfinished::Other);
+        out.line(&why.line());
+        why.tab_exit()
+    }
 }
 
 /// `aterm init --converge`: one converge pass ([`crate::sync::converge`]) over `ports`, which
@@ -685,7 +1354,7 @@ fn converge_entry(options: &Options, ports: &dyn crate::sync::Ports) -> ExitCode
     } else {
         println!(
             "{} \u{b7} converge {}/{}",
-            tally(&pass.rows, action),
+            completion_summary(&pass.rows, action, pass.unrecorded.is_none()),
             trigger.word(),
             pass.due.word()
         );
@@ -809,7 +1478,7 @@ impl Printer {
             return;
         }
         let mut later = self.later.lock().unwrap_or_else(PoisonError::into_inner);
-        later.push(rendered(row));
+        later.push(rendered(row, self.verbose));
         // The terminal stays the printer's while it writes, so no prompt starts mid-row.
         if let Some(_free) = crate::port::terminal_free() {
             Self::write(&mut later, out);
@@ -840,15 +1509,20 @@ fn shown(row: &ItemReport) -> bool {
     !matches!(row.outcome, Outcome::Ok | Outcome::NotApplicable)
 }
 
-/// `row` as `aterm init` prints it: its word, title and id, then what changed or why.
-fn rendered(row: &ItemReport) -> String {
+/// `row` as `aterm init` prints it: its word and title (with `--verbose` its id too), then what
+/// changed or why.
+fn rendered(row: &ItemReport, verbose: bool) -> String {
     use std::fmt::Write as _;
     let word = if waiting(row) {
         "waiting"
     } else {
         word(row.outcome)
     };
-    let mut text = format!("{word}: {} ({})\n", row.title, row.id);
+    let mut text = if verbose {
+        format!("{word}: {} ({})\n", row.title, row.id)
+    } else {
+        format!("{word}: {}\n", row.title)
+    };
     if let (Some(from), Some(to)) = (&row.from, &row.to) {
         let _ = writeln!(text, "    {from} \u{2192} {to}");
     } else if let (Outcome::Ok, Some(Layer::Develop), Some(now)) = (row.outcome, row.layer, &row.to)
@@ -880,6 +1554,7 @@ fn tally(rows: &[ItemReport], action: Action) -> String {
             count(waits_by_itself),
             "waiting to be let in (it finishes by itself)",
         ),
+        (count(owed), "to run once this Mac is let in"),
         (count(waits_on_a_step), "waiting on another step"),
     ] {
         if n > 0 {
@@ -904,6 +1579,24 @@ fn tally(rows: &[ItemReport], action: Action) -> String {
     format!("aterm init: {}{tail}", parts.join(" \u{b7} "))
 }
 
+/// Announce success only after both the selected items and the pass's record are complete.
+fn completion_summary(rows: &[ItemReport], action: Action, recorded: bool) -> String {
+    let mut summary = tally(rows, action);
+    if recorded
+        && action != Action::Plan
+        && !rows.is_empty()
+        && rows.iter().all(|row| {
+            matches!(
+                row.outcome,
+                Outcome::Ok | Outcome::Changed | Outcome::NotApplicable
+            )
+        })
+    {
+        summary.push_str(" — Successfully completed. No further action is needed.");
+    }
+    summary
+}
+
 /// Whether `row` waits on something other than a person: a lock, the network, or another row
 /// that does ([`waits_by_itself`] apart).
 fn waits_on_a_step(row: &ItemReport) -> bool {
@@ -918,8 +1611,333 @@ fn waits_on_a_step(row: &ItemReport) -> bool {
 /// Whether only the person can finish `row`: a step of theirs, a grant, or a precondition no
 /// other step lifts.
 fn needs_you(row: &ItemReport) -> bool {
-    matches!(row.outcome, Outcome::Person | Outcome::Deferred)
+    (matches!(row.outcome, Outcome::Person | Outcome::Deferred) && !owed(row))
         || (row.outcome == Outcome::Blocked && !waits_by_itself(row) && !waits_on_a_step(row))
+}
+
+/// What a row that waits for this Mac to be let into the vault says ([`owe`]): the run records
+/// it owed ([`note_owed`]), and the converge pass clones then ([`clone_owed`]), unless the
+/// person leaves GitHub repositories as they are in System State after this run began; a Stop
+/// holds it until Set up now ([`owed_clone`]).
+const OWED: &str = "runs by itself once this Mac is let into the vault: the vault's sync clones \
+                    when the GitHub token lands, with no second aterm init, unless you leave \
+                    GitHub repositories as they are in System State before then (a Stop there \
+                    holds it until Set up now)";
+
+/// The record an apply leaves under the account's converge state when its GitHub step waits
+/// for this Mac to be let into the vault ([`owed`]): the converge pass the vault's subscriber
+/// starts once the vault's files land runs that step then, once ([`owed_clone`],
+/// [`clone_owed`]), so nobody runs `aterm init` again for it (design §7).
+const CLONE_OWED: &str = "clone-owed";
+
+/// What `sync.clone` reads of the clone an `aterm init` owes ([`owed_clone`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwedClone {
+    /// None is owed (never, or the pass ran it): the row reads in place.
+    Nothing(String),
+    /// One is owed, but init.toml turned the GitHub step off since: why.
+    Off(String),
+    /// One is owed, and the token it waits for, or the git every clone runs, is not on this Mac
+    /// yet: why it waits.
+    Waiting(String),
+    /// One is owed, and its token is here: what the pass finds.
+    Due(String),
+    /// One is owed, but its last run stopped at a step only a person can take, and neither
+    /// the token nor init.toml changed since: what they do, in plain words. The pass leaves it
+    /// until one of those changes or they run it themselves.
+    Person(String),
+    /// One is owed, but the person left GitHub repositories as they are in System State since
+    /// the run that owes it began: their held line ([`Holds::line`]). A hold already on record
+    /// then, which the run went past because the person named the group (`aterm init --only
+    /// github`), keeps it owed, and a Stop holds it owed ([`OwedClone::Waiting`]).
+    Held(String),
+}
+
+/// The line of [`CLONE_OWED`] that records what held GitHub repositories when the run that owes
+/// the clone began ([`Holds`]): `held`, then `off`, `stopped` and `newer`, each that held them.
+const HELD_MARK: &str = "held";
+
+/// [`HELD_MARK`]'s line for `holds`.
+fn held_stamp(holds: &Holds) -> String {
+    let mut line = HELD_MARK.to_owned();
+    for (word, held) in [
+        ("off", holds.off.contains(Setting::Repositories)),
+        ("stopped", holds.stopped.is_some()),
+        ("newer", holds.newer),
+    ] {
+        if held {
+            line.push(' ');
+            line.push_str(word);
+        }
+    }
+    line
+}
+
+/// What held GitHub repositories when the run that owes the clone began, as `record` says
+/// ([`held_stamp`]); nothing for a record that says none (an older aterm's).
+fn stamped_holds(record: &str) -> Holds {
+    let mut holds = Holds::NONE;
+    let words = record
+        .lines()
+        .filter_map(|line| line.strip_prefix(HELD_MARK))
+        .filter(|rest| rest.is_empty() || rest.starts_with(' '))
+        .flat_map(str::split_whitespace);
+    for word in words {
+        match word {
+            "off" => holds.off.set(Setting::Repositories, true),
+            "stopped" => holds.stopped = Some(String::new()),
+            "newer" => holds.newer = true,
+            _ => {}
+        }
+    }
+    holds
+}
+
+/// The account's converge state under `state`, where [`CLONE_OWED`] lives.
+fn converge_state(state: &Path) -> PathBuf {
+    state.join(aterm_converge::FileJournal::DIR)
+}
+
+/// Record, under the account's state directory `state`, that an apply's GitHub step waits for
+/// this Mac to be let into the vault ([`CLONE_OWED`]), stamped with what the person's choices in
+/// System State held of GitHub repositories when the run began (`start`, [`HELD_MARK`]);
+/// nothing for a plan, a check or a run whose rows owe nothing.
+///
+/// # Errors
+/// The record cannot be written, or there is no state directory to write it in.
+fn note_owed(
+    rows: &[ItemReport],
+    action: Action,
+    state: Option<&Path>,
+    start: &Holds,
+) -> Result<(), String> {
+    if action != Action::Apply || !rows.iter().any(owed) {
+        return Ok(());
+    }
+    owe_clone(
+        state.ok_or("no state directory records the clone it owes")?,
+        start,
+    )
+}
+
+/// Write [`CLONE_OWED`] under the account's state directory `state`, stamped with `start`
+/// ([`note_owed`]).
+///
+/// # Errors
+/// The record cannot be written.
+pub(crate) fn owe_clone(state: &Path, start: &Holds) -> Result<(), String> {
+    let dir = converge_state(state);
+    aterm_uds::private_file::ensure_private_dir(&dir)
+        .map_err(|why| format!("{}: {why}", dir.display()))?;
+    aterm_uds::private_file::write_private(
+        &dir,
+        CLONE_OWED,
+        format!(
+            "aterm init's GitHub step waits for this Mac to be let into the vault\n{}\n",
+            held_stamp(start)
+        )
+        .as_bytes(),
+    )
+    .map_err(|why| format!("{}: {why}", dir.join(CLONE_OWED).display()))
+}
+
+/// The line [`CLONE_OWED`] carries when the step's last run stopped at a step only a person
+/// can take: the step's mark then ([`crate::init_github::TokenRead::mark`]) follows it.
+const PERSON_MARK: &str = "mark ";
+
+/// `sync.clone`'s reading under the account's state directory `state`: whether an `aterm init`
+/// owes its GitHub step ([`note_owed`]), whether the person's choices in System State (`now`)
+/// came to hold GitHub repositories after the run that owes it began ([`OwedClone::Held`]), and
+/// whether the token that step reads, and Apple's git, are on this Mac now. A step only a person
+/// can finish waits for them until the token, init.toml or git's presence changes
+/// ([`OwedClone::Person`]); a Stop holds the step and keeps it owed ([`OwedClone::Waiting`]).
+///
+/// # Errors
+/// The record, this login's context or its init.toml cannot be read.
+pub fn owed_clone(sys: &dyn System, state: &Path, now: &Holds) -> Result<OwedClone, String> {
+    let dir = converge_state(state);
+    let record = match aterm_uds::private_file::read_private(&dir, CLONE_OWED, 4096) {
+        Ok(record) => String::from_utf8_lossy(&record).into_owned(),
+        Err(aterm_uds::private_file::PrivateFileError::Missing) => {
+            return Ok(OwedClone::Nothing("aterm init owes no clone".into()));
+        }
+        Err(why) => return Err(format!("{}: {why}", dir.join(CLONE_OWED).display())),
+    };
+    let (ctx, _) = local_context(sys)?;
+    let Some(read) = crate::init_github::token_read(sys, &ctx)? else {
+        return Ok(OwedClone::Off(
+            "off: init.toml's [github] enabled = false".into(),
+        ));
+    };
+    // A Stop, or records a newer aterm saved, hold the clone and keep it owed: Set up now goes
+    // on, the clone with it. Only GitHub repositories left as they are since the run began
+    // forgets it, as turning the step off does.
+    if now.stopped.is_some() || now.newer {
+        return Ok(OwedClone::Waiting(now.why(Setting::Repositories)));
+    }
+    if now.later(&stamped_holds(&record), Setting::Repositories)
+        && let Some(line) = now.line(&[Setting::Repositories], false)
+    {
+        return Ok(OwedClone::Held(line));
+    }
+    // Every clone runs Apple's git, which aterm installs by itself (`base.clt`): no person's step
+    // the step waits for, and nothing a pass could do before it is there.
+    if crate::items::github::installed_git(sys).is_none() {
+        return Ok(OwedClone::Waiting(
+            "aterm init's GitHub step waits for Apple's Command Line Tools, which aterm installs, \
+             to bring git"
+                .into(),
+        ));
+    }
+    if let Some((how, _)) = record
+        .lines()
+        .zip(record.lines().skip(1))
+        .find(|(_, mark)| mark.strip_prefix(PERSON_MARK) == Some(read.mark.as_str()))
+    {
+        return Ok(OwedClone::Person(how.to_owned()));
+    }
+    if let Some(why) = read.unusable {
+        return Ok(OwedClone::Waiting(format!(
+            "aterm init's GitHub step waits for a token it can use: {why}"
+        )));
+    }
+    Ok(if read.landed {
+        OwedClone::Due(
+            "aterm init's GitHub step waited for the vault, whose GitHub token is here now".into(),
+        )
+    } else {
+        OwedClone::Waiting(
+            "aterm init's GitHub step waits for the vault's GitHub token to land on this Mac"
+                .into(),
+        )
+    })
+}
+
+/// Forget the GitHub step an `aterm init` owes, under the account's state directory `state`:
+/// its step was turned off (init.toml's `[github] enabled = false`, or GitHub repositories left
+/// as they are in System State), so turning it on later clones nothing by itself.
+///
+/// # Errors
+/// The record cannot be removed.
+pub fn forget_owed_clone(state: &Path) -> Result<(), String> {
+    let dir = converge_state(state);
+    aterm_uds::private_file::remove_private(&dir, CLONE_OWED)
+        .map(|_| ())
+        .map_err(|why| format!("{}: {why}", dir.join(CLONE_OWED).display()))
+}
+
+/// `sync.clone`'s apply: the GitHub step an `aterm init` owes, run once as init runs it, in any
+/// shell of the account; its record under `state` goes once every row is in place, and stays
+/// for the next pass otherwise. A row only a person can finish marks the record with the
+/// step's mark now ([`OwedClone::Person`]), so no pass runs the step again until the token,
+/// init.toml or git's presence changes, or the person's own `aterm init` owes it afresh
+/// ([`note_owed`]).
+///
+/// # Errors
+/// A row of the step did not end in place (its words), or the step could not run.
+pub fn clone_owed(sys: &dyn System, state: &Path) -> Result<String, String> {
+    let (ctx, _) = local_context(sys)?;
+    let items = crate::init_github::items(sys, &ctx, None)?;
+    let bound = crate::engine::bind(
+        items
+            .iter()
+            .map(|item| (item.as_ref(), anywhere(Class::Install))),
+        sys,
+        &ctx,
+    );
+    let mut journal = sys.journal()?;
+    let rows = aterm_converge::run(&bound, Mode::Apply, journal.as_mut())
+        .map_err(|why| why.to_string())?;
+    let dir = converge_state(state);
+    if let Some(row) = rows.iter().find(|row| {
+        !matches!(
+            row.outcome,
+            Outcome::Ok | Outcome::Changed | Outcome::NotApplicable
+        )
+    }) {
+        let why = format!(
+            "{}: {}",
+            row.title,
+            row.why.as_deref().unwrap_or(word(row.outcome))
+        );
+        if row.outcome == Outcome::Person
+            && let Some(read) = crate::init_github::token_read(sys, &ctx)?
+        {
+            let how = format!(
+                "{why}. Only you can fix this; the vault's sync runs the step again once its \
+                 GitHub token or init.toml changes, or run {} once it is fixed",
+                naming(Setting::Repositories)
+            );
+            // The stamp of the run that owes it stays ([`HELD_MARK`]).
+            let start = aterm_uds::private_file::read_private(&dir, CLONE_OWED, 4096)
+                .map(|record| stamped_holds(&String::from_utf8_lossy(&record)))
+                .unwrap_or(Holds::NONE);
+            aterm_uds::private_file::write_private(
+                &dir,
+                CLONE_OWED,
+                format!(
+                    "{}\n{PERSON_MARK}{}\n{}\n",
+                    person_line(&how),
+                    read.mark,
+                    held_stamp(&start)
+                )
+                .as_bytes(),
+            )
+            .map_err(|why| format!("{}: {why}", dir.join(CLONE_OWED).display()))?;
+        }
+        return Err(why);
+    }
+    aterm_uds::private_file::remove_private(&dir, CLONE_OWED)
+        .map_err(|why| format!("{}: {why}", dir.join(CLONE_OWED).display()))?;
+    let changed = rows
+        .iter()
+        .filter(|row| row.outcome == Outcome::Changed)
+        .count();
+    Ok(format!(
+        "ran the GitHub step aterm init owed: {changed} changed, the rest in place"
+    ))
+}
+
+/// The longest line of what the person does that [`CLONE_OWED`] keeps, in bytes: the record is
+/// read whole within 4 KiB ([`owed_clone`]), so a long row's words never make it unreadable.
+const PERSON_LINE_MAX: usize = 1024;
+
+/// `how` as [`CLONE_OWED`]'s one line of it: on one line, and cut at a character boundary to
+/// [`PERSON_LINE_MAX`] bytes, an ellipsis saying so.
+fn person_line(how: &str) -> String {
+    let line = how.replace(['\n', '\r'], " ");
+    if line.len() <= PERSON_LINE_MAX {
+        return line;
+    }
+    let mut end = PERSON_LINE_MAX - '\u{2026}'.len_utf8();
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\u{2026}", &line[..end])
+}
+
+/// `row`, deferred in plain words ([`OWED`]) when it waits for this Mac to be let into the vault
+/// (GitHub's sign-in and the clones, design §7): the vault's join finishes by itself, and what
+/// waits on it runs then, so it is no step of this run's. A sign-out that found nobody at the
+/// screen right before its own clicks (the person left during the other's) is deferred as the
+/// sign-outs are when nobody is there as they start ([`NOBODY_AT_THE_SCREEN`]).
+fn owe(mut row: ItemReport) -> ItemReport {
+    if crate::init_accounts::found_nobody(&row) {
+        row.outcome = Outcome::Deferred;
+        row.why = Some(NOBODY_AT_THE_SCREEN.into());
+        row.stood_aside = None;
+        return row;
+    }
+    if row.outcome == Outcome::Blocked && waiting(&row) && !waits_by_itself(&row) {
+        row.outcome = Outcome::Deferred;
+        row.why = Some(OWED.into());
+    }
+    row
+}
+
+/// Whether `row` waits for this Mac to be let into the vault, and runs once it is ([`owe`]).
+fn owed(row: &ItemReport) -> bool {
+    waiting(row) && !waits_by_itself(row)
 }
 
 /// The develop layer as `aterm doctor` reads it on this Mac ([`crate::init_develop::doctor`]),
@@ -1148,6 +2166,13 @@ struct Front<'a> {
     records: &'a dyn Records,
     /// Hears each row as its item finishes, from whichever lane ran it ([`run_layers`]).
     on_row: &'a (dyn Fn(&ItemReport) + Sync),
+    /// Whether a person is at this Mac's screen now ([`Host::present`]), read again as the
+    /// sign-outs start in a run with no terminal.
+    present: &'a (dyn Fn() -> bool + Sync),
+    /// Hears each line of what the person's choices held, once the run is over, as the row
+    /// `--json` carries ([`held_row`]): the groups System State holds ([`Holds::line`]), and the
+    /// keys they changed since aterm set them ([`Records::kept`]).
+    on_held: &'a dyn Fn(ItemReport),
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -1172,7 +2197,7 @@ pub fn converge_workstation_for_test(
                 .into_iter()
                 .map(|items| (items, workstation_place(Class::Preference)))
                 .collect(),
-            Choice::ALL,
+            Picked::ALL,
         ))
     };
     converge(
@@ -1189,6 +2214,8 @@ pub fn converge_workstation_for_test(
             cwd: None,
             records,
             on_row: &|_| {},
+            present: &|| true,
+            on_held: &|_| {},
         },
         &mut crate::engine::NoJournal,
         &mut Laps::start(),
@@ -1198,21 +2225,70 @@ pub fn converge_workstation_for_test(
     })
 }
 
+/// Why the sign-outs wait, read again as they start, on every run: nobody is at this Mac's
+/// screen ([`Front::present`]), with a terminal or without one (the clones before them can take
+/// half an hour, and the person who started the run may have gone).
+const NOBODY_AT_THE_SCREEN: &str = "waits for a person at this Mac's screen: the sign-outs, \
+                                    which nothing undoes, run only while someone is there, and \
+                                    nobody was as they started; the next aterm init runs them";
+
+/// Why `aterm init --sign-out` with no terminal is refused while nobody is at this Mac's screen:
+/// the sign-outs are a person stage (design §6.4), so the flag runs only for a person there.
+const SIGN_OUT_NEEDS_A_PERSON: &str = "--sign-out runs with no terminal only while a person is \
+                                       at this Mac's screen, and nobody is there now (no input \
+                                       within the last minute, or the screen is locked): run it \
+                                       there, or leave it out";
+
+/// Whether the Desktop-lane item `id` is left as it is because the person's choices in System
+/// State, read as the records are held (`holds`), hold every row it was built for (`rows`,
+/// [`Picked::rows`]). A group the run names, by a flag (`named`) or by its `--only` words
+/// (`only`), runs over the holds already on record when the run began (`start`), as [`picked`]
+/// runs it, but never over a later one ([`Holds::later`]): a Stop pressed, or a group turned off,
+/// after init started holds the items not yet run, named or not. An item built for no row is
+/// held only by a Stop (or records a newer aterm saved), and for a run whose `--only` words name
+/// it only by one that came later.
+fn leaves_held(
+    start: &Holds,
+    holds: &Holds,
+    named: Choice,
+    only: &[String],
+    rows: &[(String, Setting)],
+    id: &str,
+) -> bool {
+    let names = |setting: Setting| !only.is_empty() || named.names(setting);
+    let mut built_for = rows
+        .iter()
+        .filter(|(each, _)| each == id)
+        .map(|(_, setting)| *setting)
+        .peekable();
+    if built_for.peek().is_none() {
+        let stopped = |holds: &Holds| holds.newer || holds.stopped.is_some();
+        return stopped(holds)
+            && (only.is_empty() || (holds.newer && !start.newer) || holds.later_stop(start));
+    }
+    built_for
+        .all(|setting| holds.holds(setting) && (!names(setting) || holds.later(start, setting)))
+}
+
+/// Whether a way back that names `aterm init` runs where this process runs ([`Holds::line`]'s
+/// `at_console`): for a person at this Mac's console, never in an agent's tab, an SSH shell or a
+/// run with no terminal, where `aterm init` names no group over the person's choices.
+#[must_use]
+pub fn ways_back_run_here() -> bool {
+    ways_back_run(&Live::new())
+}
+
+/// [`ways_back_run_here`] on `sys`.
+fn ways_back_run(sys: &dyn System) -> bool {
+    !sys.macos() || init_presence(sys).why().is_none()
+}
+
 /// Initialization keeps agent ancestry when a tool call has no controlling terminal.
 fn init_presence(sys: &dyn System) -> Presence {
     match crate::console::presence(sys) {
         Presence::NoTerminal if sys.agent_ancestor().is_some() => Presence::AgentTab,
         presence => presence,
     }
-}
-
-/// Automatic setup belongs to the console account's local session; a terminal or a
-/// person's keystroke is not a prerequisite for applying its selected defaults.
-const fn local_workstation(presence: Presence) -> bool {
-    matches!(
-        presence,
-        Presence::AtConsole | Presence::NoTerminal | Presence::AgentTab
-    )
 }
 
 /// Converge the requested base, workstation, and develop layers, each step a phase of `laps`:
@@ -1230,21 +2306,26 @@ fn converge(
     } else {
         Mode::Plan
     };
+    // Preferences and repository setup remain a person's picks. Account sign-out also runs in
+    // the console user's graphic session with no terminal while a person is at the screen, but
+    // never from SSH or an agent tab.
     let presence = init_presence(sys);
-    let restricted = options.choice.is_some_and(|choice| {
-        choice.profile
-            || choice.clone
-            || (choice.sign_out && !matches!(presence, Presence::AtConsole | Presence::NoTerminal))
-    });
+    let named = options.picks.named;
+    let restricted = named.profile
+        || named.clone
+        || (named.sign_out && !matches!(presence, Presence::AtConsole | Presence::NoTerminal));
     if restricted
         && sys.macos()
-        && !local_workstation(presence)
         && let Some(why) = presence.why()
     {
         return Err(Refused::Usage(format!(
             "--profile, --sign-out and --clone are picks for a person at this Mac's console \
              ({why}): run them there, or leave them out"
         )));
+    }
+    // With no terminal `--sign-out` is a person's pick only while a person is at the screen.
+    if named.sign_out && sys.macos() && presence == Presence::NoTerminal && !(front.present)() {
+        return Err(Refused::Usage(SIGN_OUT_NEEDS_A_PERSON.into()));
     }
     let only = &options.only;
     let workstation = options.workstation();
@@ -1300,7 +2381,7 @@ fn converge(
         )));
     }
     laps.lap("context");
-    let (groups, choice) = if workstation {
+    let (groups, picked) = if workstation {
         (front.groups)(
             sys,
             &ctx,
@@ -1308,11 +2389,11 @@ fn converge(
             &Reading {
                 keyboards: keyboards.as_deref(),
                 only,
-                choice: options.choice,
+                picks: options.picks,
             },
         )?
     } else {
-        (Vec::new(), Choice::NONE)
+        (Vec::new(), Picked::NONE)
     };
     // A workstation word names an item of the workstation this run built; away from a Mac's
     // console one row stands for every one of them.
@@ -1330,79 +2411,267 @@ fn converge(
         .map(String::as_str)
         .collect();
     if !unknown.is_empty() {
-        return Err(Refused::Usage(format!(
-            "--only {} names no item ({ONLY_WORDS})",
-            unknown.join(",")
-        )));
+        // A word may name a group the person's choices hold, which a run away from the console
+        // never builds ([`picked`]): say so in their words.
+        let kept: Vec<Setting> = Setting::ALL
+            .into_iter()
+            .filter(|setting| picked.kept.contains(*setting))
+            .collect();
+        return Err(Refused::Usage(match picked.start.line(&kept, false) {
+            Some(line) => format!(
+                "--only {} names no item this run takes: {line}",
+                unknown.join(",")
+            ),
+            None => format!("--only {} names no item ({ONLY_WORDS})", unknown.join(",")),
+        }));
     }
     // A pass that changes the preferences or signs out holds the setup records the first
-    // launch holds for the same pass, over the Desktop lane alone: the base layer, the vault and
-    // the clones never wait behind a first-launch pass, and System State's presses and the
-    // subscriber's repair wait only while preferences change. A whole profile the lane verified
-    // is recorded for the first launch.
-    let whole = choice.profile && choice.sign_out && only.is_empty();
-    let holds = mode == Mode::Apply
-        && groups.iter().any(|(items, place)| {
-            place.class == Class::Preference
-                && items.iter().any(|item| {
-                    only.is_empty()
-                        || only.iter().any(|word| {
-                            aterm_converge::selects(
-                                word,
-                                &item.id(),
-                                item.family(),
-                                Some(place.layer),
-                            )
-                        })
-                })
-        });
-    let records = front.records;
-    let desktop: &Around<'_> = &|lane| {
-        if !holds {
-            return lane();
-        }
-        let held = records.hold(whole, &|line| eprintln!("aterm init: {line}"))?;
-        let withheld: Vec<String> = groups
-            .iter()
-            .filter(|(_, place)| {
-                place.layer == Layer::Workstation && place.class == Class::Preference
+    // launch holds for the same pass, over the Desktop lane's own changes alone: the base layer,
+    // the vault, the clones and the Command Line Tools never wait behind a first-launch pass,
+    // and System State's Stop, its switches, Restore and Set up now wait only while preferences
+    // change. The records are let go once the preferences are set and held again for the
+    // sign-outs, after every other lane; each time the person's choices are read again, so a
+    // Stop or a group turned off while init waited holds what it covers. A whole profile the
+    // lane verified is recorded for the first launch; a run that builds no preference (with no
+    // terminal they wait for a person at the console) sets none, so it holds the records for its
+    // sign-outs alone and rewrites neither the plan nor the window's finished stages.
+    let selected = |item: &dyn Item, place: &Place| {
+        only.is_empty()
+            || only.iter().any(|word| {
+                aterm_converge::selects(word, &item.id(), item.family(), Some(place.layer))
             })
-            .flat_map(|(items, place)| items.iter().map(move |item| (item, place)))
-            .filter_map(|(item, place)| {
-                let id = item.id();
-                (item.withheld().is_some()
-                    && (only.is_empty()
-                        || only.iter().any(|word| {
-                            aterm_converge::selects(word, &id, item.family(), Some(place.layer))
-                        })))
-                .then_some(id)
-            })
-            .collect();
-        if !withheld.is_empty() {
-            held.withheld(&withheld)?;
-        }
-        let rows = lane()?;
-        if whole {
-            let verified = verified_mac_settings(&ctx, &groups, &rows);
-            if !verified.is_empty() {
-                held.checkpoint(verified)?;
-            }
-            if verified == Selection::all().workstation()
-                && rows
-                    .iter()
-                    .filter(|row| {
-                        row.layer == Some(Layer::Workstation)
-                            && row.class == Some(Class::Preference)
+    };
+    let holds_for = |sign_outs: bool| {
+        mode == Mode::Apply
+            && groups.iter().any(|(items, place)| {
+                place.class == Class::Preference
+                    && items.iter().any(|item| {
+                        signs_out(&item.id()) == sign_outs && selected(item.as_ref(), place)
                     })
-                    .all(|row| counts(row, Action::Apply))
-            {
-                held.verified()?;
+            })
+    };
+    let (holds_preferences, holds_sign_outs) = (holds_for(false), holds_for(true));
+    let pass = if picked.whole() && only.is_empty() && holds_preferences {
+        Pass::Whole {
+            clones: picked.runs.contains(Setting::Repositories),
+        }
+    } else {
+        Pass::Part
+    };
+    let records = front.records;
+    let flags_run = ways_back_run(sys);
+    // The settings the person's choices held by the time the records were held, past the ones
+    // the run's preparation already left ([`Picked::kept`]), and the holds that said so.
+    let late: Mutex<(Selection, Option<Holds>)> = Mutex::new((Selection::none(), None));
+    let leaves = |now: &Holds, id: &str| {
+        leaves_held(
+            &picked.start,
+            now,
+            options.picks.named,
+            only,
+            &picked.rows,
+            id,
+        )
+    };
+    let note_left = |now: &Holds, ids: &mut dyn Iterator<Item = String>| {
+        let mut late = late.lock().unwrap_or_else(PoisonError::into_inner);
+        for id in ids {
+            for (_, setting) in picked.rows.iter().filter(|(each, _)| *each == id) {
+                late.0.set(*setting, true);
             }
+        }
+        late.1 = Some(now.clone());
+    };
+    let left_of = |now: &Holds, sign_outs: bool| {
+        groups
+            .iter()
+            .filter(|(_, place)| place.class == Class::Preference)
+            .flat_map(|(items, _)| items.iter().map(|item| item.id()))
+            .filter(|id| signs_out(id) == sign_outs && leaves(now, id))
+            .collect::<Vec<String>>()
+    };
+    // A GitHub clone, which may start half an hour in, reads the person's choices again as it
+    // starts: a Stop pressed, or the group turned off, since the run began holds it, as it holds
+    // the Desktop lane's items (`--clone` runs over a hold on record when the run began alone).
+    let held_late = |id: &str| {
+        if mode != Mode::Apply || !aterm_converge::selects(GITHUB, id, "", None) {
+            return None;
+        }
+        let now = records.holds();
+        if !now.later(&picked.start, Setting::Repositories) {
+            return None;
+        }
+        let why = now.why(Setting::Repositories);
+        let mut late = late.lock().unwrap_or_else(PoisonError::into_inner);
+        late.0.set(Setting::Repositories, true);
+        late.1 = Some(now);
+        Some(why)
+    };
+    // A whole profile the lane verified is recorded for the first launch, under the hold.
+    // It keeps the hold unless it recorded the whole profile, which lets the hold go. A pass
+    // that could not read which keys the person changed set no preference (each row reads not
+    // applicable, [`KEPT_UNREAD`]), so it records nothing: the window's run sets them.
+    let finish = |taken: Box<dyn Held>, rows: &[ItemReport], last: bool, unread: bool| {
+        if !pass.whole() || unread {
+            return Ok(Some(taken));
+        }
+        let verified = verified_mac_settings(&ctx, &groups, rows);
+        if !verified.is_empty() {
+            taken.checkpoint(verified)?;
+        }
+        if last
+            && verified == Selection::all().workstation()
+            && rows
+                .iter()
+                .filter(|row| {
+                    row.layer == Some(Layer::Workstation) && row.class == Some(Class::Preference)
+                })
+                .all(|row| counts(row, Action::Apply))
+        {
+            taken.verified()?;
+            return Ok(None);
+        }
+        Ok::<_, String>(Some(taken))
+    };
+    // The keys the person changed since aterm set them stay theirs ([`Records::kept`]), and
+    // the words their rows end with; with no record of them readable, every one does.
+    let read_kept = || {
+        let kept = records.kept();
+        let why = if kept.is_ok() {
+            KEPT_BY_YOU
+        } else {
+            KEPT_UNREAD
+        };
+        (kept, why)
+    };
+    let desktop: &Around<'_> = &|stages| {
+        let said = |line: &str| eprintln!("aterm init: {line}");
+        let wait: Option<&dyn Fn(&str)> = (!options.no_wait).then_some(&said);
+        let mut held: Option<Box<dyn Held>> = None;
+        // Why the records were not held: another setup held them past the wait, or at once.
+        let mut busy: Option<String> = None;
+        // The record of the keys the person changed could not be read: no preference was set.
+        let mut unread = false;
+        let mut rows = if holds_preferences {
+            match records.hold(pass, wait) {
+                Err(Unheld::Failed(why)) => return Err(why),
+                Err(Unheld::Busy(why)) => {
+                    let rows = (stages.preferences)(Desk::instead(Instead::Lock(&why)))?;
+                    busy = Some(why);
+                    rows
+                }
+                Ok(taken) => {
+                    let now = records.holds();
+                    note_left(&now, &mut left_of(&now, false).into_iter());
+                    let left = |id: &str| leaves(&now, id);
+                    let (kept, kept_why) = read_kept();
+                    unread = kept.is_err();
+                    let keeps = |id: &str| keeps_key(&kept, id);
+                    let withheld: Vec<String> = groups
+                        .iter()
+                        .filter(|(_, place)| {
+                            place.layer == Layer::Workstation && place.class == Class::Preference
+                        })
+                        .flat_map(|(items, place)| items.iter().map(move |item| (item, place)))
+                        .filter_map(|(item, place)| {
+                            let id = item.id();
+                            (item.withheld().is_some()
+                                && !left(&id)
+                                && !keeps(&id)
+                                && selected(item.as_ref(), place))
+                            .then_some(id)
+                        })
+                        .collect();
+                    if !withheld.is_empty() {
+                        taken.withheld(&withheld)?;
+                    }
+                    let rows = (stages.preferences)(Desk {
+                        leaves: &left,
+                        kept: &keeps,
+                        kept_why,
+                        ..Desk::ALL
+                    })?;
+                    if let Some(mut taken) =
+                        finish(taken, &rows, stages.sign_outs.is_none(), unread)?
+                    {
+                        taken.release();
+                        held = Some(taken);
+                    }
+                    rows
+                }
+            }
+        } else {
+            let (kept, kept_why) = read_kept();
+            (stages.preferences)(Desk {
+                kept: &|id| keeps_key(&kept, id),
+                kept_why,
+                ..Desk::ALL
+            })?
+        };
+        let Some(sign_outs) = stages.sign_outs else {
+            return Ok(rows);
+        };
+        // The sign-outs, which nothing undoes, run last of all: once every other lane is done.
+        (stages.others)();
+        if let Some(why) = &busy {
+            rows.extend(sign_outs(Desk::instead(Instead::Lock(why)))?);
+            return Ok(rows);
+        }
+        if !holds_sign_outs {
+            let (kept, kept_why) = read_kept();
+            rows.extend(sign_outs(Desk {
+                kept: &|id| keeps_key(&kept, id),
+                kept_why,
+                ..Desk::ALL
+            })?);
+            return Ok(rows);
+        }
+        let again = match held.take() {
+            Some(mut taken) => {
+                let again = taken.again(wait);
+                held = Some(taken);
+                again
+            }
+            None => records.hold(pass, wait).map(|taken| held = Some(taken)),
+        };
+        match again {
+            Err(Unheld::Failed(why)) => return Err(why),
+            Err(Unheld::Busy(why)) => {
+                rows.extend(sign_outs(Desk::instead(Instead::Lock(&why)))?);
+                return Ok(rows);
+            }
+            Ok(()) => {}
+        }
+        let now = records.holds();
+        note_left(&now, &mut left_of(&now, true).into_iter());
+        // They run only for a person at the screen, read again now that they start, terminal or
+        // not: the clones before them can take half an hour, and the person who started the run
+        // may have walked away from an idle or locked screen (design §6.4).
+        if !(front.present)() {
+            rows.extend(sign_outs(Desk {
+                leaves: &|id| leaves(&now, id),
+                ..Desk::instead(Instead::Person(NOBODY_AT_THE_SCREEN))
+            })?);
+            return Ok(rows);
+        }
+        // A sign-out the person undid since aterm made it (they signed back in) is theirs, as
+        // a key they changed is (design §6.6): the record is read again under this hold.
+        let (kept, kept_why) = read_kept();
+        unread |= kept.is_err();
+        rows.extend(sign_outs(Desk {
+            leaves: &|id| leaves(&now, id),
+            kept: &|id| keeps_key(&kept, id),
+            kept_why,
+            ..Desk::ALL
+        })?);
+        if let Some(taken) = held.take() {
+            finish(taken, &rows, true, unread)?;
         }
         Ok(rows)
     };
     laps.lap("questions");
-    Ok(run_layers(
+    let on_row = |row: &ItemReport| (front.on_row)(&owe(row.clone()));
+    let rows = run_layers(
         sys,
         &ctx,
         (front.base)(mode == Mode::Apply).narrowed(only),
@@ -1416,10 +2685,79 @@ fn converge(
         journal,
         laps,
         &Hooks {
-            on_row: front.on_row,
+            on_row: &on_row,
             desktop,
+            held: &held_late,
         },
-    )?)
+    )?;
+    // The one line of what the person's choices held: the preparation's, or, where the records
+    // read later held more, all of them in the words the later reading gives.
+    let (left, now) = late.into_inner().unwrap_or_else(PoisonError::into_inner);
+    let line = match now {
+        Some(now) if !left.is_empty() => {
+            let kept = left.union(picked.kept);
+            let held: Vec<Setting> = Setting::ALL
+                .into_iter()
+                .filter(|setting| kept.contains(*setting))
+                .collect();
+            now.line(&held, flags_run)
+        }
+        _ => picked.held.clone(),
+    };
+    if let Some(line) = line {
+        (front.on_held)(held_row(
+            HELD,
+            "Groups left as you set them in System State",
+            line,
+        ));
+    }
+    for line in kept_lines(&rows, &picked.rows) {
+        (front.on_held)(held_row(
+            CHANGED,
+            "Settings you changed since aterm set them",
+            line,
+        ));
+    }
+    Ok(rows.into_iter().map(owe).collect())
+}
+
+/// The lines of the keys a run left as the person set them ([`Instead::Kept`]), by the System
+/// State row each was built for (`tags`): the ones they changed since aterm set them, and the
+/// ones left because the record of those cannot be read.
+fn kept_lines(rows: &[ItemReport], tags: &[(String, Setting)]) -> Vec<String> {
+    let names = |ends: &str| {
+        let mut left = Selection::none();
+        for row in rows.iter().filter(|row| {
+            row.outcome == Outcome::NotApplicable
+                && row.why.as_deref().is_some_and(|why| why.ends_with(ends))
+        }) {
+            for (_, setting) in tags.iter().filter(|(id, _)| *id == row.id) {
+                left.set(*setting, true);
+            }
+        }
+        Setting::ALL
+            .into_iter()
+            .filter(|setting| left.contains(*setting))
+            .map(Setting::name)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut lines = Vec::new();
+    let changed = names(KEPT_BY_YOU);
+    if !changed.is_empty() {
+        lines.push(format!(
+            "left as you changed them since aterm set them: {changed}. Set up now in System \
+             State, or aterm doctor --apply, sets them again"
+        ));
+    }
+    let unread = names(KEPT_UNREAD);
+    if !unread.is_empty() {
+        lines.push(format!(
+            "aterm could not read which settings you changed, so it left these as they are: \
+             {unread}. aterm doctor --apply sets them again"
+        ));
+    }
+    lines
 }
 
 /// The one envelope every `--json` surface prints (`aterm pkg doctor --json` too), with the
@@ -1442,32 +2780,22 @@ fn report_json(
 
 /// Compute the exit status for `rows` under `action` (`0`, `75`, `77`, `69`, or `1`): a run
 /// left only by rows that stood aside exits with the first of 75, 77 and 69 one of them maps to
-/// ([`aterm_converge::StoodAside::exit_status`]). Pending prerequisites remain incomplete
-/// even when a subscriber will finish them without this process.
+/// ([`aterm_converge::StoodAside::exit_status`]). A row waiting on an admin counts as done
+/// ([`counts`]).
 fn status(rows: &[ItemReport], action: Action) -> u8 {
     if complete(rows, action) {
         return 0;
     }
-    let incomplete: Vec<&ItemReport> = rows
-        .iter()
-        .filter(|row| !complete(std::slice::from_ref(*row), action))
-        .collect();
-    let codes: Vec<u8> = incomplete
+    let incomplete: Vec<&ItemReport> = rows.iter().filter(|row| !counts(row, action)).collect();
+    let codes: Option<Vec<u8>> = incomplete
         .iter()
         .map(|row| {
-            row.stood_aside.as_ref().map_or_else(
-                || match row.outcome {
-                    Outcome::Person => 77,
-                    Outcome::Blocked | Outcome::Deferred => 75,
-                    _ => 1,
-                },
-                aterm_converge::StoodAside::exit_status,
-            )
+            row.stood_aside
+                .as_ref()
+                .map(aterm_converge::StoodAside::exit_status)
         })
         .collect();
-    if codes.contains(&1) {
-        return 1;
-    }
+    let codes = codes.unwrap_or_default();
     [75, 77, 69]
         .into_iter()
         .find(|code| codes.contains(code))
@@ -2261,6 +3589,15 @@ type Group = (Vec<Box<dyn Item>>, Place);
 
 const ACCOUNTS_GROUP: &str = "init.accounts";
 
+/// The id of GitHub's group, and the word that names each of its items ([`Setting::Repositories`]).
+const GITHUB: &str = "init.github";
+
+/// Whether the item `id` is a Messages or FaceTime sign-out, or the row that stands for them
+/// when they could not be built.
+fn signs_out(id: &str) -> bool {
+    id == ACCOUNTS_GROUP || crate::init_accounts::signs_out(id)
+}
+
 /// What [`converge`] read and was told before the workstation's groups are built.
 struct Reading<'a> {
     /// Why the keyboard list could not be read ([`local_context`]): only the Caps Lock rows go
@@ -2268,26 +3605,43 @@ struct Reading<'a> {
     keyboards: Option<&'a str>,
     /// The run's `--only` words.
     only: &'a [String],
-    /// What `--profile`, `--sign-out` and `--clone` picked, when one was given.
-    choice: Option<Choice>,
+    /// What `--profile`, `--sign-out`, `--clone` and their `--no-` forms said.
+    picks: Picks,
+}
+
+/// What decides which groups a run takes besides its flags ([`picked`]), and whether the
+/// Messages and FaceTime sign-outs may run with no terminal: read from the `aterm` that runs it
+/// ([`Host`]) and from System State's records.
+struct Standing<'a> {
+    /// Whether this is an ALab Mac ([`Host::alab`]).
+    alab: &'a dyn Fn() -> bool,
+    /// Whether a person is at this Mac's screen now ([`Host::present`]).
+    present: &'a (dyn Fn() -> bool + Sync),
+    /// What the person's own choices in System State hold ([`Records::holds`]).
+    holds: Holds,
 }
 
 /// How a run prepares the workstation's groups ([`prepare_groups`], or a test's stand-in), with
-/// the groups it picked.
+/// the settings it picked.
 type Prepare<'a> =
-    dyn Fn(&dyn System, &Ctx, Mode, &Reading<'_>) -> Result<(Vec<Group>, Choice), String> + 'a;
+    dyn Fn(&dyn System, &Ctx, Mode, &Reading<'_>) -> Result<(Vec<Group>, Picked), String> + 'a;
 
-/// Prepare workstation groups, reading optional profiles and prompting for vault credentials
-/// before probing; the look for the ALab vault answers with `ahead`'s, and `vault` is
-/// `--vault`'s. Who is at this run ([`crate::console::presence`]) decides whether it may
-/// change the person's own Mac: over SSH, or under another login's console, nothing of the
-/// workstation is read; from an agent's tool call or with no terminal, the vault's item is
-/// built as a plan builds it (never a prompt, never the network, `--vault` included) and
-/// [`groups`] leaves preferences to them while still building the account sign-out in the
-/// console user's graphic session. The vault is read only when this run names its
-/// item. Every group runs unless a flag names the ones to (nothing asks), and for a person at
-/// the console the Permissions phase lists aterm's grants. A group that cannot be built is one
-/// row saying why ([`Unbuilt`]); the others run.
+/// Prepare workstation groups, reading optional profiles before probing; the look for the ALab
+/// vault answers with `ahead`'s, and `vault` is `--vault`'s. Which settings run is this Mac's
+/// scope, the flags and the person's choices in System State ([`picked`], `standing`); nothing
+/// asks. Who is at this run ([`crate::console::presence`]) decides whether it may change the
+/// person's own Mac: over SSH, or under another login's console, nothing of the workstation is
+/// read, and only a remote shell of the console's own login joins the open ALab vault; from an
+/// agent's tool call or with no terminal, the vault's join runs with no question (never the
+/// person's join password, which nothing asks for) and [`groups`] leaves the preferences to
+/// them, building the Messages and FaceTime sign-outs with no terminal only for a person at the
+/// screen ([`Standing::present`]). The vault is read only when this run names its item. For a
+/// person at the console the Permissions phase lists aterm's grants. A group that cannot be
+/// built is one row saying why ([`Unbuilt`]); the others run.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one run's workstation inputs, each its own"
+)]
 fn prepare_groups(
     sys: &dyn System,
     ctx: &Ctx,
@@ -2295,66 +3649,140 @@ fn prepare_groups(
     ahead: Option<Arc<crate::init_secrets::Lookahead>>,
     vault: Option<&str>,
     reading: &Reading<'_>,
+    standing: &Standing<'_>,
     grants: Grants,
-) -> Result<(Vec<Group>, Choice), String> {
-    prepare_groups_with(sys, ctx, mode, vault, reading, grants, |ctx| {
+) -> Result<(Vec<Group>, Picked), String> {
+    prepare_groups_with(sys, ctx, mode, vault, reading, standing, grants, |ctx| {
         crate::init_secrets::live(ctx, ahead)
     })
 }
 
 /// [`prepare_groups`] with the vault's port from `secrets` (a test's scripted one).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one run's workstation inputs, each its own"
+)]
 fn prepare_groups_with(
     sys: &dyn System,
     ctx: &Ctx,
     mode: Mode,
     vault: Option<&str>,
     reading: &Reading<'_>,
+    standing: &Standing<'_>,
     grants: Grants,
     secrets: impl FnOnce(&Ctx) -> Result<Arc<dyn crate::init_secrets::SecretsOps>, String>,
-) -> Result<(Vec<Group>, Choice), String> {
-    if !sys.macos() {
-        return elsewhere(sys, ctx, mode, vault, reading, secrets);
-    }
+) -> Result<(Vec<Group>, Picked), String> {
     let presence = init_presence(sys);
+    // A way back runs only for a person at this Mac's console (`--profile`, `--sign-out` and
+    // `--clone` are refused elsewhere, and `--only` names no held group there), so only there
+    // does the held line name one.
+    let flags_run = ways_back_run(sys);
+    let mut picked = picked(
+        reading.picks,
+        reading.only,
+        standing.alab,
+        &standing.holds,
+        flags_run,
+    );
+    let runs = picked.runs;
+    if !sys.macos() {
+        return Ok((
+            elsewhere(sys, ctx, mode, vault, reading, runs, secrets)?,
+            picked,
+        ));
+    }
+    let none = || crate::init_secrets::Secrets {
+        items: Vec::new(),
+        waited_on: None,
+    };
+    let github = |secrets: &crate::init_secrets::Secrets| {
+        if runs.contains(Setting::Repositories) {
+            built(
+                GITHUB,
+                "init",
+                Setting::Repositories.label(),
+                crate::init_github::items(sys, ctx, secrets.waited_on.as_deref()),
+            )
+        } else {
+            Vec::new()
+        }
+    };
     if ctx.console.is_none() {
-        return Ok((vec![away_from_console(presence)], Choice::NONE));
+        let mut groups = vec![away_from_console(presence)];
+        // A remote shell of the console's own login runs the background rows an agent's tab
+        // runs (design §7): Rust in Spotlight, the open ALab vault's join and the GitHub
+        // repositories, each in any shell of the account, asking nothing. Another login's
+        // console, or nobody's, sets up nothing of this one.
+        if presence == Presence::Remote {
+            if runs.contains(Setting::Spotlight) {
+                groups.push((spotlight(ctx), anywhere(Class::Asked)));
+            }
+            let secrets = if runs.contains(Setting::Secrets) {
+                vault_items(sys, ctx, mode, vault, reading, Here::Remote, secrets)?
+            } else {
+                none()
+            };
+            let github = github(&secrets);
+            groups.push((secrets.items, anywhere(Class::Install)));
+            if !github.is_empty() {
+                groups.push((github, anywhere(Class::Install)));
+            }
+        }
+        return Ok((groups, picked));
     }
     let person = presence == Presence::AtConsole;
-    let asks = if person { mode } else { Mode::Plan };
-    let secrets = vault_items(sys, ctx, asks, vault, reading, secrets)?;
-    let github = built(
-        "init.github",
-        "init",
-        Setting::Repositories.label(),
-        crate::init_github::items(sys, ctx, secrets.waited_on.as_deref()),
-    );
-    let choice = reading.choice.unwrap_or(Choice::ALL);
-    let mut groups = groups(
+    let here = if person { Here::Person } else { Here::Session };
+    let secrets = if runs.contains(Setting::Secrets) {
+        vault_items(sys, ctx, mode, vault, reading, here, secrets)?
+    } else {
+        none()
+    };
+    let github = github(&secrets);
+    // Off a terminal the sign-outs, which nothing undoes, run only for a person at the screen
+    // now: input within the last minute and the screen unlocked (design §6.4), read again as
+    // they start ([`converge`]). An agent's tab never runs them.
+    let signs_out = picked.signs_out()
+        && (person || (presence == Presence::NoTerminal && (standing.present)()));
+    let (mut groups, rows) = groups(
         ctx,
         presence,
         secrets,
         github,
         reading.keyboards,
-        choice,
+        runs,
         reading.only,
+        signs_out,
     );
-    if local_workstation(presence) {
+    picked.rows = rows;
+    if person && runs.contains(Setting::Permissions) {
         groups.push((
-            permissions(grants, choice.sign_out),
+            permissions(grants, picked.signs_out()),
             workstation_place(Class::Person),
         ));
     }
-    Ok((groups, choice))
+    Ok((groups, picked))
 }
 
-/// The vault's items, asking (`asks`) for its join password only in a run that applies for a
-/// person; none when `--only` names neither the workstation nor the vault.
+/// Rust in Spotlight's items ([`crate::init_spotlight::items`]), or the one row saying why
+/// they could not be built: a background row, run wherever this login's shell is.
+fn spotlight(ctx: &Ctx) -> Vec<Box<dyn Item>> {
+    built(
+        crate::init_spotlight::ID,
+        "spotlight",
+        Setting::Spotlight.label(),
+        crate::init_spotlight::items(ctx),
+    )
+}
+
+/// The vault's items for `here` ([`crate::init_secrets::items_at`]), which ask for no join
+/// password anywhere; none when `--only` names neither the workstation nor the vault.
 fn vault_items(
     sys: &dyn System,
     ctx: &Ctx,
-    asks: Mode,
+    mode: Mode,
     vault: Option<&str>,
     reading: &Reading<'_>,
+    here: Here,
     secrets: impl FnOnce(&Ctx) -> Result<Arc<dyn crate::init_secrets::SecretsOps>, String>,
 ) -> Result<crate::init_secrets::Secrets, String> {
     let names_vault = reading.only.is_empty()
@@ -2370,7 +3798,7 @@ fn vault_items(
             })
         });
     Ok(if names_vault {
-        crate::init_secrets::items(sys, ctx, secrets(ctx)?, asks, vault)?
+        crate::init_secrets::items_at(sys, ctx, secrets(ctx)?, mode, vault, here)?
     } else {
         crate::init_secrets::Secrets {
             items: Vec::new(),
@@ -2379,32 +3807,44 @@ fn vault_items(
     })
 }
 
+/// [`workstation_place`] for a group that runs in any shell of the account: the vault's join
+/// away from the console, and every group on a machine that is not a Mac.
+fn anywhere(class: Class) -> Place {
+    Place {
+        requires: Requires::Account,
+        ..workstation_place(class)
+    }
+}
+
 /// The workstation layer on a machine that is not a Mac (Linux): one row per macOS group, each
-/// reading "macOS only"; the vault, asking its join password only of a person at a terminal (an
-/// SSH session's included: nobody sits at a Linux box's console); and the repositories, unless
-/// the flags leave them out. Each runs in any shell of the account.
+/// reading "macOS only"; the vault, which asks nothing of anyone (`--vault`'s questions only of
+/// a person at a terminal, an SSH session's included: nobody sits at a Linux box's console);
+/// and the repositories where `runs` takes them. Each runs in any shell of the account.
 fn elsewhere(
     sys: &dyn System,
     ctx: &Ctx,
     mode: Mode,
     vault: Option<&str>,
     reading: &Reading<'_>,
+    runs: Selection,
     secrets: impl FnOnce(&Ctx) -> Result<Arc<dyn crate::init_secrets::SecretsOps>, String>,
-) -> Result<(Vec<Group>, Choice), String> {
+) -> Result<Vec<Group>, String> {
     let person = sys.terminal() && sys.agent_ancestor().is_none();
-    let asks = if person { mode } else { Mode::Plan };
-    let secrets = vault_items(sys, ctx, asks, vault, reading, secrets)?;
+    let here = if person { Here::Person } else { Here::Remote };
+    let secrets = if runs.contains(Setting::Secrets) {
+        vault_items(sys, ctx, mode, vault, reading, here, secrets)?
+    } else {
+        crate::init_secrets::Secrets {
+            items: Vec::new(),
+            waited_on: None,
+        }
+    };
     let github = built(
-        "init.github",
+        GITHUB,
         "init",
         Setting::Repositories.label(),
         crate::init_github::items(sys, ctx, secrets.waited_on.as_deref()),
     );
-    let choice = reading.choice.unwrap_or(Choice::ALL);
-    let anywhere = |class| Place {
-        requires: Requires::Account,
-        ..workstation_place(class)
-    };
     let mac_only: Vec<Box<dyn Item>> = [
         ("init.preferences", "init", "Workstation preferences"),
         (
@@ -2432,10 +3872,10 @@ fn elsewhere(
         (mac_only, anywhere(Class::Asked)),
         (secrets.items, anywhere(Class::Install)),
     ];
-    if choice.clone {
+    if runs.contains(Setting::Repositories) {
         groups.push((github, anywhere(Class::Install)));
     }
-    Ok((groups, choice))
+    Ok(groups)
 }
 
 /// A workstation group that exists on macOS alone ([`elsewhere`]): its one row is not
@@ -2562,108 +4002,175 @@ fn built(
 }
 
 /// Workstation item groups in run order, each paired with its [`Place`]: for a person at the
-/// console session (`presence`), the groups `choice` picks, Rust in Spotlight and fseventsd's memory
-/// ([`crate::init_fseventsd`], restarted only when the run's `only` words name it),
-/// with the keyboard list unread (`keyboards`) the Caps Lock rows one row saying why. Agent and
-/// background launches select the same defaults; remote runs defer ([`AwayFromConsole`]).
-/// Then the vault, and its GitHub profile (`github`, already built) when
-/// `choice` clones.
+/// console (`presence`), the preferences `runs` takes and fseventsd's memory
+/// ([`crate::init_fseventsd`], restarted only when the run's `only` words name it), with the
+/// keyboard list unread (`keyboards`) the Caps Lock rows one row saying why; anywhere else the
+/// preferences wait for that person ([`AwayFromConsole`]). Rust in Spotlight, a background row,
+/// runs for anyone in the console's session. Then the vault, its GitHub profile (`github`,
+/// already built, empty where `runs` takes none), and last the Messages and FaceTime sign-outs
+/// `runs` takes, where `signs_out` lets them run ([`run_layers`] runs them after every other
+/// row). With the groups, the System State row each Desktop-lane item was built for, by its id
+/// ([`Picked::rows`]).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one run's workstation composition, each part its own input"
+)]
 fn groups(
     ctx: &Ctx,
     presence: Presence,
     secrets: crate::init_secrets::Secrets,
     github: Vec<Box<dyn Item>>,
     keyboards: Option<&str>,
-    choice: Choice,
+    runs: Selection,
     only: &[String],
-) -> Vec<Group> {
+    signs_out: bool,
+) -> (Vec<Group>, Vec<(String, Setting)>) {
     let place = workstation_place;
-    let local = local_workstation(presence);
+    let person = presence == Presence::AtConsole;
     let mut groups = Vec::new();
-    if !local {
+    let mut rows: Vec<(String, Setting)> = Vec::new();
+    // `items`, each tagged with every one of `settings`: a group's rows, or the one row that
+    // says why it could not be built.
+    let mut tagged = |settings: &[Setting], items: Vec<Box<dyn Item>>| {
+        for item in &items {
+            rows.extend(settings.iter().map(|setting| (item.id(), *setting)));
+        }
+        items
+    };
+    if !person {
         groups.push(away_from_console(presence));
     }
-    if local && choice.profile {
-        let preferences = match keyboards {
-            None => built(
-                "init.preferences",
-                "init",
-                "Workstation preferences",
-                crate::init_preferences::items(ctx),
-            ),
-            Some(why) => {
-                let mut rest = Selection::all();
-                rest.set(Setting::CapsLock, false);
-                let mut rows = built(
-                    "init.preferences",
-                    "init",
-                    "Workstation preferences",
-                    crate::init_preferences::selected_items(ctx, rest),
-                );
-                rows.insert(
-                    0,
-                    Box::new(Unbuilt {
+    if person {
+        let mut preferences = Selection::none();
+        for setting in [
+            Setting::CapsLock,
+            Setting::Desktop,
+            Setting::Widgets,
+            Setting::Dock,
+        ] {
+            preferences.set(setting, runs.contains(setting));
+        }
+        let unread = keyboards.filter(|_| preferences.contains(Setting::CapsLock));
+        if unread.is_some() {
+            preferences.set(Setting::CapsLock, false);
+        }
+        let mut items = if preferences.is_empty() {
+            Vec::new()
+        } else {
+            match crate::init_preferences::selected_tagged_items(ctx, preferences) {
+                Ok(built) => built
+                    .into_iter()
+                    .map(|(setting, item)| tagged(&[setting], vec![item]).remove(0))
+                    .collect(),
+                Err(why) => {
+                    let each: Vec<Setting> = Setting::ALL
+                        .into_iter()
+                        .filter(|setting| preferences.contains(*setting))
+                        .collect();
+                    tagged(
+                        &each,
+                        built(
+                            "init.preferences",
+                            "init",
+                            "Workstation preferences",
+                            Err(why),
+                        ),
+                    )
+                }
+            }
+        };
+        if let Some(why) = unread {
+            items.insert(
+                0,
+                tagged(
+                    &[Setting::CapsLock],
+                    vec![Box::new(Unbuilt {
                         id: "keyboard.caps-lock".into(),
                         family: "keyboard",
                         title: Setting::CapsLock.label(),
                         why: why.to_owned(),
-                    }),
-                );
-                rows
-            }
-        };
-        groups.push((preferences, place(Class::Preference)));
-        groups.push((
-            built(
-                "init.trackpad",
-                "trackpad",
-                Setting::NaturalScrolling.label(),
-                crate::init_trackpad::items(ctx),
-            ),
-            place(Class::Preference),
-        ));
-        groups.push((
-            built(
-                "init.trackpad.behavior",
-                "trackpad",
-                Setting::TrackpadScrolling.label(),
-                crate::init_trackpad::behavior_items(ctx),
-            ),
-            place(Class::Preference),
-        ));
+                    })],
+                )
+                .remove(0),
+            );
+        }
+        if !items.is_empty() {
+            groups.push((items, place(Class::Preference)));
+        }
+        if runs.contains(Setting::NaturalScrolling) {
+            groups.push((
+                tagged(
+                    &[Setting::NaturalScrolling],
+                    built(
+                        "init.trackpad",
+                        crate::init_trackpad::NATURAL,
+                        Setting::NaturalScrolling.label(),
+                        crate::init_trackpad::items(ctx),
+                    ),
+                ),
+                place(Class::Preference),
+            ));
+        }
+        if runs.contains(Setting::TrackpadScrolling) {
+            groups.push((
+                tagged(
+                    &[Setting::TrackpadScrolling],
+                    built(
+                        "init.trackpad.behavior",
+                        "trackpad",
+                        Setting::TrackpadScrolling.label(),
+                        crate::init_trackpad::behavior_items(ctx),
+                    ),
+                ),
+                place(Class::Preference),
+            ));
+        }
     }
-    if local {
-        groups.push((
-            built(
-                crate::init_spotlight::ID,
-                "spotlight",
-                Setting::Spotlight.label(),
-                crate::init_spotlight::items(ctx),
-            ),
-            place(Class::Asked),
-        ));
+    // Rust in Spotlight changes nothing on the screen and asks nothing: a background row, as
+    // the vault's join is (design §7).
+    if runs.contains(Setting::Spotlight) {
+        groups.push((spotlight(ctx), place(Class::Asked)));
+    }
+    if person {
         let named = only.iter().any(|word| word == crate::init_fseventsd::ID);
         groups.push((
             vec![Box::new(crate::init_fseventsd::Fseventsd::new(named))],
             crate::init_fseventsd::place(),
         ));
     }
-    if local && choice.sign_out {
-        groups.push((
-            built(
-                ACCOUNTS_GROUP,
-                "init",
-                "Sign out of Messages and FaceTime",
-                crate::init_accounts::items(ctx),
-            ),
-            place(Class::Preference),
-        ));
-    }
     groups.push((secrets.items, place(Class::Install)));
-    if choice.clone {
+    if !github.is_empty() {
         groups.push((github, place(Class::Install)));
     }
-    groups
+    if signs_out {
+        let mut accounts = Selection::none();
+        for setting in SIGN_OUT {
+            accounts.set(setting, runs.contains(setting));
+        }
+        let items = match crate::init_accounts::selected_tagged_items(ctx, accounts) {
+            Ok(built) => built
+                .into_iter()
+                .map(|(setting, item)| tagged(&[setting], vec![item]).remove(0))
+                .collect(),
+            Err(why) => {
+                let each: Vec<Setting> = SIGN_OUT
+                    .into_iter()
+                    .filter(|setting| accounts.contains(*setting))
+                    .collect();
+                tagged(
+                    &each,
+                    built(
+                        ACCOUNTS_GROUP,
+                        "init",
+                        "Sign out of Messages and FaceTime",
+                        Err(why),
+                    ),
+                )
+            }
+        };
+        groups.push((items, place(Class::Preference)));
+    }
+    (groups, rows)
 }
 
 /// The Permissions phase's rows: Full Disk Access, Developer Tools and debugger access, and
@@ -2793,9 +4300,12 @@ struct Narrowing<'a> {
 struct Hooks<'a> {
     /// Hears each row as its item finishes, from whichever lane ran it.
     on_row: &'a (dyn Fn(&ItemReport) + Sync),
-    /// Runs the Desktop lane, handed to it as a call: [`converge`] holds the setup records
-    /// around it ([`Records`]), so only that lane waits behind a first-launch pass.
+    /// Runs the Desktop lane's two stages, handed to it ([`Stages`]): [`converge`] holds the
+    /// setup records around each ([`Records`]), so only they wait behind a first-launch pass.
     desktop: &'a Around<'a>,
+    /// Why the person's choices hold the Network-lane item with this id as it starts, if they
+    /// do ([`HeldLate`]): a Stop pressed, or a group turned off, after the run began.
+    held: &'a (dyn Fn(&str) -> Option<String> + Sync),
 }
 
 impl Hooks<'_> {
@@ -2803,15 +4313,261 @@ impl Hooks<'_> {
     #[cfg(test)]
     const QUIET: Hooks<'static> = Hooks {
         on_row: &|_| {},
-        desktop: &|lane| lane(),
+        desktop: &|stages| stages.plain(),
+        held: &|_| None,
     };
 }
 
-/// One lane's run, handed to [`Hooks::desktop`] to call.
-type LaneRun<'a> = dyn Fn() -> Result<Vec<ItemReport>, String> + 'a;
+/// One stage of the Desktop lane, run as `Desk` says ([`Stages`]).
+type StageRun<'a> = dyn Fn(Desk<'_>) -> Result<Vec<ItemReport>, String> + 'a;
 
-/// What runs a lane around its call ([`Hooks::desktop`]).
-type Around<'a> = dyn Fn(&LaneRun<'_>) -> Result<Vec<ItemReport>, String> + Sync + 'a;
+/// The Desktop lane's stages, handed to [`Hooks::desktop`] to run in order: the preferences,
+/// then, once every other lane is done ([`Self::others`]), the sign-outs.
+struct Stages<'s> {
+    /// The preferences and the trackpad.
+    preferences: &'s StageRun<'s>,
+    /// The Messages and FaceTime sign-outs, which run last of all; `None` where the run has
+    /// none.
+    sign_outs: Option<&'s StageRun<'s>>,
+    /// Returns once every other lane is done.
+    others: &'s dyn Fn(),
+}
+
+#[cfg(test)]
+impl Stages<'_> {
+    /// Run every stage as it is, in order.
+    fn plain(&self) -> Result<Vec<ItemReport>, String> {
+        let mut rows = (self.preferences)(Desk::ALL)?;
+        if let Some(sign_outs) = self.sign_outs {
+            (self.others)();
+            rows.extend(sign_outs(Desk::ALL)?);
+        }
+        Ok(rows)
+    }
+}
+
+/// What runs the Desktop lane's stages ([`Hooks::desktop`]).
+type Around<'a> = dyn Fn(&Stages<'_>) -> Result<Vec<ItemReport>, String> + Sync + 'a;
+
+/// What one stage of the Desktop lane runs of its items ([`Stages`]), as [`converge`]'s hold
+/// on System State's records decides.
+#[derive(Clone, Copy)]
+struct Desk<'d> {
+    /// Whether the item with this id is left out: the person's choices hold the System State
+    /// row it was built for by the time the records are held ([`leaves_held`]).
+    leaves: &'d dyn Fn(&str) -> bool,
+    /// What each item the stage runs does in place of a change, where it cannot make one now.
+    instead: Option<Instead<'d>>,
+    /// Whether the item with this id is a key the person changed after aterm set it (design
+    /// §6.6, [`Records::kept`]): it is left as they set it, in [`Self::kept_why`]'s words.
+    kept: &'d dyn Fn(&str) -> bool,
+    /// Why a kept item is left as it is ([`Instead::Kept`]).
+    kept_why: &'d str,
+}
+
+impl Desk<'static> {
+    /// Every item, as it is.
+    const ALL: Self = Self {
+        leaves: &leaves_none,
+        instead: None,
+        kept: &leaves_none,
+        kept_why: "",
+    };
+}
+
+impl<'d> Desk<'d> {
+    /// Every item, each doing `instead` in place of a change.
+    const fn instead(instead: Instead<'d>) -> Self {
+        Self {
+            instead: Some(instead),
+            ..Desk::ALL
+        }
+    }
+
+    /// What the item with this id does in place of a change, if anything.
+    fn instead_of(&self, id: &str) -> Option<Instead<'d>> {
+        self.instead
+            .or_else(|| (self.kept)(id).then_some(Instead::Kept(self.kept_why)))
+    }
+}
+
+/// Whether `kept` ([`Records::kept`]) keeps the item with id `id` as the person set it: every
+/// item, where the record could not be read.
+fn keeps_key(kept: &Result<Vec<String>, String>, id: &str) -> bool {
+    kept.as_ref()
+        .map_or(true, |ids| ids.iter().any(|kept| kept == id))
+}
+
+/// [`Desk::leaves`] of a stage that leaves no item out, and [`Desk::kept`] of one that keeps
+/// none.
+const fn leaves_none(_id: &str) -> bool {
+    false
+}
+
+/// How a row the person changed after aterm set it ends ([`Instead::Kept`]): `aterm init`
+/// leaves it, and names the ways that set it again (design §6.6). It mirrors the words the
+/// window's unattended pass uses.
+const KEPT_BY_YOU: &str = "changed by you: aterm init leaves it as you set it, and Set up now in \
+                           System State or aterm doctor --apply sets it again";
+
+/// How a row ends when the record of the keys the person changed cannot be read: `aterm init`
+/// sets none of them rather than one of theirs, and records none as set.
+const KEPT_UNREAD: &str = "left as it is: aterm could not read which settings you changed, so \
+                           it changed none of them; aterm doctor --apply sets them again";
+
+/// What a Desktop-lane item does in place of a change it cannot make now ([`Unchanged`]).
+#[derive(Clone, Copy, Debug)]
+enum Instead<'d> {
+    /// Stand aside for another setup's hold on System State's records, in these words: the row
+    /// reads as it is and changes nothing (exit 75, "a lock").
+    Lock(&'d str),
+    /// Wait for a person at this Mac's screen, in these words, reading nothing.
+    Person(&'d str),
+    /// Leave a key the person changed after aterm set it ([`KEPT_BY_YOU`]), in these words:
+    /// the row reads as it is, and one that would change reads as left.
+    Kept(&'d str),
+}
+
+/// A Desktop-lane item that cannot change anything now ([`Instead`]): it reads as it is and
+/// stands aside where it would change, or waits for a person without reading at all. It
+/// refreshes and relaunches nothing.
+struct Unchanged<'a> {
+    inner: &'a dyn Item,
+    instead: Instead<'a>,
+}
+
+impl Item for Unchanged<'_> {
+    fn id(&self) -> String {
+        self.inner.id()
+    }
+    fn family(&self) -> &'static str {
+        self.inner.family()
+    }
+    fn title(&self) -> String {
+        self.inner.title()
+    }
+    fn probe(&self, sys: &dyn System, ctx: &Ctx) -> Probe {
+        match self.instead {
+            Instead::Lock(_) => self.inner.probe(sys, ctx),
+            Instead::Person(why) => Probe::Deferred { why: why.into() },
+            Instead::Kept(why) => match self.inner.probe(sys, ctx) {
+                Probe::Change { from, .. } => Probe::NotApplicable {
+                    why: format!("{from}; {why}"),
+                },
+                probe => probe,
+            },
+        }
+    }
+    fn apply(&self, _sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
+        Err(match self.instead {
+            Instead::Lock(why) | Instead::Person(why) | Instead::Kept(why) => why.into(),
+        })
+    }
+    fn revert(&self) -> Option<String> {
+        self.inner.revert()
+    }
+    fn effect(&self) -> Effect {
+        self.inner.effect()
+    }
+    fn after(&self) -> Vec<String> {
+        self.inner.after()
+    }
+    fn read_aside(&self) -> Option<aterm_converge::StoodAside> {
+        self.inner.read_aside()
+    }
+    fn stands_aside(&self, _sys: &dyn System, _ctx: &Ctx) -> Option<aterm_converge::StoodAside> {
+        match self.instead {
+            Instead::Lock(why) => Some(aterm_converge::StoodAside::Lock(why.into())),
+            Instead::Person(_) | Instead::Kept(_) => None,
+        }
+    }
+}
+
+/// A Network-lane item of a group the person's choices can hold after the run began (a GitHub
+/// clone, which may start half an hour in): it reads those choices as it starts
+/// ([`Hooks::held`]), and one they hold by then changes nothing and reads as left, in their
+/// words. Its first reading stands, so the read-back after its own change is the item's.
+struct HeldLate<'a> {
+    inner: &'a dyn Item,
+    held: &'a (dyn Fn(&str) -> Option<String> + Sync),
+    decided: std::sync::OnceLock<Option<String>>,
+}
+
+impl HeldLate<'_> {
+    /// Why the person's choices hold this item, read once as it starts.
+    fn held(&self) -> Option<&String> {
+        self.decided
+            .get_or_init(|| (self.held)(&self.inner.id()))
+            .as_ref()
+    }
+}
+
+impl Item for HeldLate<'_> {
+    fn id(&self) -> String {
+        self.inner.id()
+    }
+    fn family(&self) -> &'static str {
+        self.inner.family()
+    }
+    fn title(&self) -> String {
+        self.inner.title()
+    }
+    fn probe(&self, sys: &dyn System, ctx: &Ctx) -> Probe {
+        match self.held() {
+            Some(why) => Probe::NotApplicable { why: why.clone() },
+            None => self.inner.probe(sys, ctx),
+        }
+    }
+    fn apply(&self, sys: &dyn System, ctx: &Ctx) -> Result<(), String> {
+        match self.held() {
+            Some(why) => Err(why.clone()),
+            None => self.inner.apply(sys, ctx),
+        }
+    }
+    fn preference_changes(
+        &self,
+        sys: &dyn System,
+        ctx: &Ctx,
+    ) -> Result<Vec<(Target, Read<PValue>)>, String> {
+        self.inner.preference_changes(sys, ctx)
+    }
+    fn refresh(&self, sys: &dyn System, ctx: &Ctx) -> Option<Result<(), String>> {
+        self.inner.refresh(sys, ctx)
+    }
+    fn revert(&self) -> Option<String> {
+        self.inner.revert()
+    }
+    fn effect(&self) -> Effect {
+        self.inner.effect()
+    }
+    fn activation(&self) -> Option<Arc<dyn crate::items::Activation>> {
+        self.inner.activation()
+    }
+    fn after(&self) -> Vec<String> {
+        self.inner.after()
+    }
+    fn detail(&self, sys: &dyn System, ctx: &Ctx) -> Option<String> {
+        self.inner.detail(sys, ctx)
+    }
+    fn stood_aside(&self) -> Option<aterm_converge::StoodAside> {
+        self.inner.stood_aside()
+    }
+    fn unfinished(&self) -> Option<crate::init_clt::Unfinished> {
+        self.inner.unfinished()
+    }
+    fn read_aside(&self) -> Option<aterm_converge::StoodAside> {
+        self.inner.read_aside()
+    }
+    fn withheld(&self) -> Option<String> {
+        self.inner.withheld()
+    }
+    fn stands_aside(&self, sys: &dyn System, ctx: &Ctx) -> Option<aterm_converge::StoodAside> {
+        if self.held().is_some() {
+            return None;
+        }
+        self.inner.stands_aside(sys, ctx)
+    }
+}
 
 /// The lanes of one run ([`run_layers`]), each its items in order, all at the same time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2971,13 +4727,17 @@ fn run_layers(
         .collect();
     let released = Latch::default();
     let gate = AfterBase(&released);
-    let (mut spotlight, mut network, mut desktop, mut later) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    // The Messages and FaceTime sign-outs run last of all, once every other lane is done: what
+    // they change nothing undoes, so nothing else of the run is left to fail after them.
+    let others = Latch::default();
+    let (mut spotlight, mut network, mut desktop, mut later, mut last) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for (items, place) in groups {
         for item in items {
             let at = (item.as_ref(), place.clone());
             match lane(place.class) {
                 Lane::Base => spotlight.push(at),
+                Lane::Desktop if signs_out(&item.id()) => last.push(at),
                 Lane::Desktop => desktop.push(at),
                 // The vault's join starts at once; what may take the store lock waits behind
                 // the gate.
@@ -2986,6 +4746,15 @@ fn run_layers(
             }
         }
     }
+    // The workstation's Network-lane items each read the person's choices as they start.
+    let held_late: Vec<HeldLate<'_>> = later
+        .iter()
+        .map(|(inner, _)| HeldLate {
+            inner: *inner,
+            held: hooks.held,
+            decided: std::sync::OnceLock::new(),
+        })
+        .collect();
     let gated: Vec<(&dyn Item, Place)> = clt
         .as_ref()
         .map(|clt| (clt as &dyn Item, crate::init_clt::place()))
@@ -2995,7 +4764,12 @@ fn run_layers(
                 .as_ref()
                 .map(|toolset| (toolset as &dyn Item, crate::init_toolset::place())),
         )
-        .chain(later)
+        .chain(
+            later
+                .iter()
+                .zip(&held_late)
+                .map(|((_, place), item)| (item as &dyn Item, place.clone())),
+        )
         .chain(
             develop
                 .iter()
@@ -3033,7 +4807,43 @@ fn run_layers(
         Ok(rows)
     };
     let network_lane = || run(&network);
-    let desktop_lane = || (hooks.desktop)(&|| run(&desktop));
+    // A Desktop-lane stage as its desk says: the items it leaves out dropped, and the rest each
+    // doing what it says in place of a change.
+    let staged = |lane: &[(&dyn Item, Place)], desk: Desk<'_>| {
+        let ran: Vec<(&dyn Item, Place)> = lane
+            .iter()
+            .filter(|(item, _)| !(desk.leaves)(&item.id()))
+            .cloned()
+            .collect();
+        let unchanged: Vec<Option<Unchanged<'_>>> = ran
+            .iter()
+            .map(|(inner, _)| {
+                desk.instead_of(&inner.id()).map(|instead| Unchanged {
+                    inner: *inner,
+                    instead,
+                })
+            })
+            .collect();
+        run(&ran
+            .iter()
+            .zip(&unchanged)
+            .map(|((inner, place), unchanged)| {
+                (
+                    unchanged.as_ref().map_or(*inner, |item| item as &dyn Item),
+                    place.clone(),
+                )
+            })
+            .collect::<Vec<_>>())
+    };
+    let preferences = |desk: Desk<'_>| staged(&desktop, desk);
+    let sign_outs = |desk: Desk<'_>| staged(&last, desk);
+    let desktop_lane = || {
+        (hooks.desktop)(&Stages {
+            preferences: &preferences,
+            sign_outs: (!last.is_empty()).then_some(&sign_outs as &StageRun<'_>),
+            others: &|| others.wait(),
+        })
+    };
     let (base_rows, lanes) = std::thread::scope(|threads| {
         let network_thread = std::thread::Builder::new()
             .name("aterm-init-network".into())
@@ -3044,6 +4854,7 @@ fn run_layers(
             .spawn_scoped(threads, desktop_lane)
             .ok();
         let opens = Opens(&released);
+        let done = Opens(&others);
         let base_rows =
             aterm_converge::run_scoped(&items, mode, scope, &mut Shared(&journal), &mut |row| {
                 on_row(row);
@@ -3064,6 +4875,7 @@ fn run_layers(
             }
         };
         let network_rows = joined(network_thread, &network_lane);
+        drop(done);
         let desktop_rows = joined(desktop_thread, &desktop_lane);
         (base_rows, [spotlight_rows, network_rows, desktop_rows])
     });
@@ -3185,13 +4997,35 @@ fn complete(rows: &[ItemReport], action: Action) -> bool {
     !rows.is_empty() && rows.iter().all(|row| counts(row, action))
 }
 
-/// Whether `row` is verified for `action`. Waiting for admission, a permission, or the
-/// console does not complete an item, even when its continuation is already scheduled.
+/// Whether `row` counts as done for `action`: a row that waits on an admin's approval does
+/// ([`waits_by_itself`]). For a run that is not `--check`, a grant only the person switches on
+/// ([`is_grant`]), a row deferred to a person ([`waits_for_a_person`]), one that runs once
+/// this Mac is let into the vault ([`owed`]), and Apple's Command Line Tools deferred to an
+/// install under way or to a person at this Mac's console ([`crate::init_clt::deferred`]) are
+/// not this run's to finish, so an apply or a plan completes with them (exit 0), naming them;
+/// `--check` still reads them as not verified.
 fn counts(row: &ItemReport, action: Action) -> bool {
     matches!(
         row.outcome,
         Outcome::Ok | Outcome::Changed | Outcome::NotApplicable
     ) || (action == Action::Plan && row.outcome == Outcome::Planned)
+        || waits_by_itself(row)
+        || (action != Action::Check
+            && (is_grant(row)
+                || waits_for_a_person(row)
+                || owed(row)
+                || crate::init_clt::deferred(row)))
+}
+
+/// Whether `row` is deferred to a person: the stand-in for the workstation rows a person at
+/// this Mac's console makes ([`AwayFromConsole`]), a sign-out that found nobody at the screen
+/// as it started ([`NOBODY_AT_THE_SCREEN`]), or the vault's look, which waits for a person to
+/// answer macOS's Local Network question ([`crate::init_secrets::waits_for_local_network`]).
+fn waits_for_a_person(row: &ItemReport) -> bool {
+    row.outcome == Outcome::Deferred
+        && (row.id == AWAY
+            || (signs_out(&row.id) && row.why.as_deref() == Some(NOBODY_AT_THE_SCREEN))
+            || crate::init_secrets::waits_for_local_network(row))
 }
 
 /// Whether `row` is one of the Permissions phase's grants ([`Permission`]) waiting for the
@@ -3227,13 +5061,20 @@ mod tests {
     /// A machines item whose probes answer from a list (the last one repeats).
     struct Listed {
         id: String,
+        family: &'static str,
         probes: Mutex<Vec<Probe>>,
     }
 
     impl Listed {
         fn boxed(id: impl Into<String>, probes: Vec<Probe>) -> Box<dyn Item> {
+            Self::of("test", id, probes)
+        }
+
+        /// [`Self::boxed`], of `family`.
+        fn of(family: &'static str, id: impl Into<String>, probes: Vec<Probe>) -> Box<dyn Item> {
             Box::new(Self {
                 id: id.into(),
+                family,
                 probes: Mutex::new(probes),
             })
         }
@@ -3244,7 +5085,7 @@ mod tests {
             self.id.clone()
         }
         fn family(&self) -> &'static str {
-            "test"
+            self.family
         }
         fn title(&self) -> String {
             self.id.clone()
@@ -3284,23 +5125,52 @@ mod tests {
             .collect()
     }
 
-    /// [`prepare_groups`] for an apply with no flag, no `--only`, no vault look and no grant.
+    /// [`prepare_groups_with`] for an apply with no flag, no `--only` and no grant, on an ALab
+    /// Mac ([`alab_standing`]), whose vault look (a scripted one: a test never reads the
+    /// network) finds no vault.
     fn prepared(sys: &dyn System, ctx: &Ctx) -> Vec<Group> {
-        prepare_groups(
+        let vault = crate::init_secrets::tests::Scripted::new(vec![Ok(
+            crate::init_secrets::tests::unconfigured(),
+        )]);
+        prepare_groups_with(
             sys,
             ctx,
             Mode::Apply,
             None,
-            None,
-            &Reading {
-                keyboards: None,
-                only: &[],
-                choice: None,
-            },
+            &reading(&[]),
+            &alab_standing(),
             no_grants,
+            move |_| Ok(vault as Arc<dyn crate::init_secrets::SecretsOps>),
         )
         .unwrap()
         .0
+    }
+
+    /// A run with no flag and the `--only` words `only`.
+    fn reading(only: &[String]) -> Reading<'_> {
+        Reading {
+            keyboards: None,
+            only,
+            picks: Picks::default(),
+        }
+    }
+
+    /// An ALab Mac with a person at its screen, nothing held in System State.
+    fn alab_standing() -> Standing<'static> {
+        Standing {
+            alab: &|| true,
+            present: &|| true,
+            holds: Holds::default(),
+        }
+    }
+
+    /// A Mac that is not ALab's, with a person at its screen, nothing held in System State.
+    fn personal_standing() -> Standing<'static> {
+        Standing {
+            alab: &|| false,
+            present: &|| true,
+            holds: Holds::default(),
+        }
     }
 
     #[test]
@@ -4301,7 +6171,7 @@ mod tests {
         sys.euid = 501;
         let profile =
             b"[github]\naccount='octocat'\nowner='octocat'\ntoken_file='~/.secrets/github'\n";
-        let path = "/Users/alice/.config/aterm/init.toml";
+        let path = "/Users//alice/.config/aterm/init.toml";
         sys.file(path, profile).stat_of(
             path,
             Stat {
@@ -4322,9 +6192,11 @@ mod tests {
             },
             crate::init_github::items(&sys, &alice, None).unwrap(),
             None,
-            Choice::ALL,
+            Selection::all(),
             &[],
-        );
+            true,
+        )
+        .0;
         let bound = crate::engine::bind(
             groups.iter().flat_map(|(items, place)| {
                 items.iter().map(move |item| (item.as_ref(), place.clone()))
@@ -4495,7 +6367,7 @@ mod tests {
     struct NoSetup;
 
     impl Records for NoSetup {
-        fn hold(&self, _whole: bool, _wait: &dyn Fn(&str)) -> Result<Box<dyn Held>, String> {
+        fn hold(&self, _pass: Pass, _wait: Option<&dyn Fn(&str)>) -> Result<Box<dyn Held>, Unheld> {
             panic!("--converge held the setup records")
         }
     }
@@ -4514,6 +6386,8 @@ mod tests {
             grants: grants_unread,
             walk: &|_| panic!("--converge walked the grants"),
             converge: ports,
+            alab: &|| panic!("--converge read the ALab scope"),
+            present: || panic!("--converge read who is at the screen"),
         };
         format!(
             "{:?}",
@@ -4740,6 +6614,7 @@ mod tests {
             Remedy::Develop.command().unwrap(),
         ];
         for text in [
+            crate::init_clt::NO_TTY,
             crate::items::developer::LOW_DATA,
             crate::init_github::NEEDS_GIT,
             crate::controller::github::NO_GIT,
@@ -4798,8 +6673,11 @@ mod tests {
         assert!(all.items.len() == 1 && all.clt.is_some());
     }
 
+    /// `base.clt` reads only once the base layer let its hold go, and off the console (no one
+    /// logged in at its screen, no terminal) its install waits for a person there: Deferred,
+    /// naming where to run it, with nothing run.
     #[test]
-    fn base_clt_runs_after_the_base_hold_is_released_without_a_terminal() {
+    fn base_clt_runs_after_the_base_hold_is_released_and_waits_for_a_person_off_the_console() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
         struct Held(Arc<AtomicBool>);
@@ -4832,25 +6710,16 @@ mod tests {
             ..ctx(&[alice])
         };
         let sys = Fake::default();
-        sys.on(
-            "/usr/sbin/softwareupdate -l",
-            Ran::ok("No new software available."),
-        );
         let rows = run(&sys, &ctx, base, &[], Mode::Apply, &mut NoJournal).unwrap();
         assert_eq!(rows.len(), 1, "{rows:?}");
         let row = &rows[0];
         assert_eq!(row.id, crate::init_clt::ID);
-        assert_eq!(
-            row.outcome,
-            Outcome::Failed,
-            "an empty catalog cannot verify the install: {row:?}"
-        );
+        assert_eq!(row.outcome, Outcome::Deferred, "{row:?}");
         assert_eq!(row.layer, Some(Layer::Base));
-        assert_eq!(row.class, Some(Class::Install));
+        assert_eq!(row.class, Some(Class::Elevate));
         assert!(
-            row.why
-                .as_deref()
-                .is_some_and(|why| why.contains("automatic setup will retry")),
+            row.why.as_deref().is_some_and(|why| why
+                .ends_with("console (nobody is logged in at its screen): run aterm init there")),
             "{row:?}"
         );
         let saw = saw.lock().unwrap();
@@ -4858,16 +6727,7 @@ mod tests {
             !saw.is_empty() && saw.iter().all(|&released| released),
             "{saw:?}"
         );
-        assert!(
-            sys.calls()
-                .iter()
-                .any(|call| call.contains("softwareupdate -l"))
-        );
-        assert!(
-            sys.calls()
-                .iter()
-                .all(|call| !call.contains("sudo") && !call.starts_with("tty "))
-        );
+        assert!(sys.calls().is_empty(), "{:?}", sys.calls());
     }
 
     /// `base.pkg.toolset` READS ONLY ONCE THE BASE LAYER LET THE STORE LOCK GO (its passes
@@ -5135,9 +6995,9 @@ mod tests {
                 assert!(!sys.calls().iter().any(|call| call.contains("defaults")
                     || call.contains("hidutil")
                     || call.contains("accounts.data")));
-                assert_eq!(status(&rows, Action::Apply), 75);
-                assert_eq!(status(&rows, Action::Plan), 75);
-                assert_eq!(status(&rows, Action::Check), 75);
+                assert_eq!(status(&rows, Action::Apply), 0);
+                assert_eq!(status(&rows, Action::Plan), 0);
+                assert_eq!(status(&rows, Action::Check), 1);
             }
         }
         assert!(
@@ -5186,10 +7046,29 @@ mod tests {
                 &mut NoJournal,
             )
             .unwrap();
-            assert_eq!(rows.len(), 1, "{rows:?}");
-            assert_eq!(rows[0].outcome, Outcome::Deferred);
-            assert_eq!(rows[0].why, Presence::Remote.needs_person());
-            assert_eq!(status(&rows, Action::Apply), 75);
+            let away = rows
+                .iter()
+                .find(|row| row.id == AWAY)
+                .expect("the stand-in");
+            assert_eq!(away.outcome, Outcome::Deferred);
+            assert_eq!(away.why, Presence::Remote.needs_person());
+            // Beside it run the background rows an agent's tab runs (design §7): Rust in
+            // Spotlight, the vault's join (here no vault answers) and the GitHub repositories,
+            // and nothing of the console session.
+            let background = ["init.spotlight.", "init.secrets@", "init.github."];
+            assert!(
+                rows.iter()
+                    .all(|row| row.id == AWAY
+                        || background.iter().any(|lane| row.id.starts_with(lane))),
+                "{rows:?}"
+            );
+            for lane in background {
+                assert!(
+                    rows.iter().any(|row| row.id.starts_with(lane)),
+                    "{lane}: {rows:?}"
+                );
+            }
+            assert_eq!(status(&rows, Action::Apply), 0);
             assert!(
                 !sys.calls().iter().any(|call| call.contains("hidutil")),
                 "{:?}",
@@ -5198,59 +7077,322 @@ mod tests {
         }
     }
 
-    /// Local background and agent launches select the same defaults as a terminal launch.
+    type BoundFixture = (
+        Vec<(String, Class)>,
+        Vec<Group>,
+        Ctx,
+        Arc<crate::init_secrets::tests::Scripted>,
+    );
+
+    /// The rows a run of `sys` binds, standing as `standing` says, with an unconfigured vault
+    /// whose look answers as ALab's open vault when `alab`; the groups, context and vault port
+    /// to read back.
+    fn bound_for(sys: &Fake, standing: &Standing<'_>, alab: bool) -> BoundFixture {
+        let (ctx, _) = local_context(sys).unwrap();
+        let vault = crate::init_secrets::tests::Scripted::new(vec![Ok(
+            crate::init_secrets::tests::unconfigured(),
+        )]);
+        if alab {
+            vault.alab_answers();
+        }
+        let port = Arc::clone(&vault);
+        let groups = prepare_groups_with(
+            sys,
+            &ctx,
+            Mode::Apply,
+            None,
+            &reading(&[]),
+            standing,
+            no_grants,
+            move |_| Ok(port as Arc<dyn crate::init_secrets::SecretsOps>),
+        )
+        .unwrap()
+        .0;
+        let bound = crate::engine::bind(
+            groups.iter().flat_map(|(items, place)| {
+                items.iter().map(move |item| (item.as_ref(), place.clone()))
+            }),
+            sys,
+            &ctx,
+        )
+        .iter()
+        .map(|b| (b.id(), b.class()))
+        .collect::<Vec<_>>();
+        (bound, groups, ctx, vault)
+    }
+
+    /// With no terminal (an agent's tool call, a launch agent, a script), in the console's own
+    /// session, init runs the base layer and looks for the vault, and signs out of Messages and
+    /// FaceTime, which nothing undoes, only for a person at the screen now (input within the
+    /// last minute, the screen unlocked); with nobody there they wait. An agent's tab never
+    /// signs out. Rust in Spotlight runs for each, a background row (design §7); no preference
+    /// runs off the console: no `killall`, no `defaults write`. Control: a person at the console
+    /// gets every row.
     #[test]
-    fn local_init_composes_every_group_without_a_person_or_terminal() {
-        for (terminal, agent) in [
-            (false, None),
-            (false, Some("Codex")),
-            (true, Some("Claude Code")),
-            (true, None),
+    fn with_no_terminal_the_sign_outs_wait_for_a_person_at_the_screen() {
+        let personal = [Class::Preference];
+        for (terminal, agent, presence, present) in [
+            (false, None, Presence::NoTerminal, false),
+            (false, None, Presence::NoTerminal, true),
+            (true, Some("Claude Code"), Presence::AgentTab, true),
+            (true, None, Presence::AtConsole, false),
         ] {
             let mut sys = alice_at(501);
             sys.terminal = terminal;
             sys.agent = agent;
-            let (ctx, _) = local_context(&sys).unwrap();
-            let vault = crate::init_secrets::tests::Scripted::new(vec![Ok(
-                crate::init_secrets::tests::unconfigured(),
-            )]);
-            let (groups, choice) = prepare_groups_with(
+            assert_eq!(crate::console::presence(&sys), presence);
+            let standing = Standing {
+                alab: &|| true,
+                present: if present { &|| true } else { &|| false },
+                holds: Holds::default(),
+            };
+            let (bound, groups, ctx, vault) = bound_for(&sys, &standing, false);
+            assert!(ctx.console.is_some(), "the console's own session");
+            assert_eq!(vault.probes(), 1, "{presence:?} looks for the ALab vault");
+            assert!(
+                bound
+                    .iter()
+                    .any(|(id, _)| id == "init.spotlight.rustup-profile@alice"),
+                "{presence:?}: {bound:?}"
+            );
+            if presence == Presence::AtConsole {
+                assert!(
+                    bound.iter().any(|(_, class)| *class == Class::Preference),
+                    "{bound:?}"
+                );
+                continue;
+            }
+            let personal_rows = bound
+                .iter()
+                .filter(|(_, class)| personal.contains(class))
+                .collect::<Vec<_>>();
+            if presence == Presence::NoTerminal && present {
+                assert_eq!(personal_rows.len(), 2, "{bound:?}");
+                assert!(
+                    personal_rows
+                        .iter()
+                        .all(|(id, _)| crate::init_accounts::signs_out(id)),
+                    "{bound:?}"
+                );
+            } else {
+                assert!(personal_rows.is_empty(), "{presence:?}: {bound:?}");
+            }
+            let rows = run(
                 &sys,
                 &ctx,
+                Base::none(),
+                &groups,
                 Mode::Apply,
-                None,
-                &Reading {
-                    keyboards: None,
-                    only: &[],
-                    choice: None,
-                },
-                no_grants,
-                move |_| Ok(vault as Arc<dyn crate::init_secrets::SecretsOps>),
+                &mut NoJournal,
             )
             .unwrap();
-            assert_eq!(choice, Choice::ALL);
-            let ids: Vec<String> = groups
+            let away = rows
                 .iter()
-                .flat_map(|(items, _)| items.iter().map(|item| item.id()))
-                .collect();
-            assert!(!ids.iter().any(|id| id == AWAY), "{ids:?}");
-            for expected in [
-                "init.spotlight.rustup-profile@alice",
-                "init.messages.signed-out@alice",
-                "init.facetime.signed-out@alice",
-            ] {
-                assert!(ids.iter().any(|id| id == expected), "{expected}: {ids:?}");
+                .find(|row| row.id == AWAY)
+                .expect("the stand-in");
+            assert_eq!(away.outcome, Outcome::Deferred);
+            assert_eq!(away.why, presence.needs_person());
+            let calls = sys.calls();
+            for change in ["killall", "defaults write"] {
+                assert!(
+                    !calls.iter().any(|call| call.contains(change)),
+                    "{change}: {calls:?}"
+                );
             }
-            assert!(
-                groups
-                    .iter()
-                    .any(|(_, place)| place.class == Class::Preference)
-            );
-            assert!(
-                !sys.calls().iter().any(|call| call.starts_with("ask ")),
-                "background setup asks nothing"
-            );
+            if !present || presence == Presence::AgentTab {
+                assert!(
+                    !calls.iter().any(|call| call.contains("osascript")),
+                    "{calls:?}"
+                );
+            }
         }
+    }
+
+    /// On a Mac that is not ALab's, `aterm init` at the console with no flag runs the base
+    /// plan (Permissions, the secrets, Spotlight) and the Sync rows; it changes no preference
+    /// of the ALab profile and signs out of nothing, which take `--profile` and `--sign-out`.
+    #[test]
+    fn a_personal_macs_console_run_changes_no_profile_and_signs_out_of_nothing() {
+        let mut sys = alice_at(501);
+        sys.terminal = true;
+        sys.agent = None;
+        assert_eq!(init_presence(&sys), Presence::AtConsole);
+        let (bound, _, _, vault) = bound_for(&sys, &personal_standing(), false);
+        assert_eq!(vault.probes(), 1, "the vault look ran and found nothing");
+        assert!(
+            bound
+                .iter()
+                .any(|(id, _)| id == "init.spotlight.rustup-profile@alice"),
+            "the base plan's Spotlight runs: {bound:?}"
+        );
+        let profile: Vec<_> = bound
+            .iter()
+            .filter(|(id, class)| {
+                *class == Class::Preference || crate::init_accounts::signs_out(id)
+            })
+            .collect();
+        assert!(profile.is_empty(), "{profile:?}");
+        let (bound, _, _, _) = bound_for(&sys, &alab_standing(), false);
+        assert!(
+            bound
+                .iter()
+                .any(|(id, _)| crate::init_accounts::signs_out(id))
+                && bound.iter().any(|(_, class)| *class == Class::Preference),
+            "an ALab Mac's run takes the profile: {bound:?}"
+        );
+    }
+
+    /// Off the console the vault join is a background row: an agent's tab whose look finds
+    /// ALab's open vault asks it to let this Mac in, with no join password and no code shown.
+    #[test]
+    fn an_agent_tab_joins_the_open_alab_vault() {
+        let mut sys = alice_at(501);
+        sys.terminal = true;
+        sys.agent = Some("Claude Code");
+        assert_eq!(init_presence(&sys), Presence::AgentTab);
+        let (_, groups, ctx, vault) = bound_for(&sys, &alab_standing(), true);
+        let _ = run(
+            &sys,
+            &ctx,
+            Base::none(),
+            &groups,
+            Mode::Apply,
+            &mut NoJournal,
+        )
+        .unwrap();
+        assert_eq!(vault.joins().len(), 1, "probes {}", vault.probes());
+        assert_eq!(vault.passwords(), [false], "no join password");
+    }
+
+    /// Before macOS has an answer to aterm's Local Network question, an agent's tab does not
+    /// look for the vault: the look would put that question on the screen with nobody to answer
+    /// it. The vault row waits, deferred, and the run exits 0.
+    #[test]
+    fn an_agent_tab_leaves_the_vault_look_until_local_network_is_answered() {
+        let mut sys = alice_at(501);
+        sys.terminal = true;
+        sys.agent = Some("Claude Code");
+        let (ctx, _) = local_context(&sys).unwrap();
+        let vault = crate::init_secrets::tests::Scripted::new(vec![Ok(
+            crate::init_secrets::tests::unconfigured(),
+        )]);
+        vault.alab_answers();
+        vault.lan_unanswered();
+        let port = Arc::clone(&vault);
+        let groups = prepare_groups_with(
+            &sys,
+            &ctx,
+            Mode::Apply,
+            None,
+            &reading(&[]),
+            &alab_standing(),
+            no_grants,
+            move |_| Ok(port as Arc<dyn crate::init_secrets::SecretsOps>),
+        )
+        .unwrap()
+        .0;
+        let rows = run(
+            &sys,
+            &ctx,
+            Base::none(),
+            &groups,
+            Mode::Apply,
+            &mut NoJournal,
+        )
+        .unwrap();
+        assert_eq!(vault.probes(), 0, "no look");
+        let row = rows
+            .iter()
+            .find(|row| row.id.starts_with("init.secrets@"))
+            .expect("the vault row");
+        assert_eq!(row.outcome, Outcome::Deferred, "{row:?}");
+        assert_eq!(status(&rows, Action::Apply), 0);
+    }
+
+    /// An apply whose GitHub step waits for this Mac to be let into the vault records the clone
+    /// it owes; the converge pass waits for the vault's GitHub token, then runs that step once
+    /// and forgets it, so nobody runs `aterm init` again. A plan, or a run that owes nothing,
+    /// records nothing.
+    #[test]
+    fn the_clone_init_owes_runs_once_the_token_lands_with_no_second_init() {
+        use aterm_converge::StoodAside;
+        let state = aterm_tempfile::tempdir().unwrap();
+        let waiting = ItemReport {
+            stood_aside: Some(StoodAside::Waiting("waiting to be let in".into())),
+            ..report("init.github.native@alice", Outcome::Blocked)
+        };
+        let sys = alice_at(501);
+        let nothing = || OwedClone::Nothing("aterm init owes no clone".into());
+        note_owed(
+            std::slice::from_ref(&waiting),
+            Action::Plan,
+            Some(state.path()),
+            &Holds::NONE,
+        )
+        .unwrap();
+        note_owed(
+            &[report("init.test", Outcome::Changed)],
+            Action::Apply,
+            Some(state.path()),
+            &Holds::NONE,
+        )
+        .unwrap();
+        assert_eq!(
+            owed_clone(&sys, state.path(), &Holds::NONE).unwrap(),
+            nothing()
+        );
+        note_owed(&[waiting], Action::Apply, Some(state.path()), &Holds::NONE).unwrap();
+        let owed = owed_clone(&sys, state.path(), &Holds::NONE).unwrap();
+        assert!(matches!(owed, OwedClone::Waiting(_)), "{owed:?}");
+        crate::init_github::scripted::converged(&sys, &user("alice", 501), "notes");
+        let owed = owed_clone(&sys, state.path(), &Holds::NONE).unwrap();
+        assert!(matches!(owed, OwedClone::Due(_)), "{owed:?}");
+        clone_owed(&sys, state.path()).unwrap();
+        assert_eq!(
+            owed_clone(&sys, state.path(), &Holds::NONE).unwrap(),
+            nothing(),
+            "run once"
+        );
+    }
+
+    /// GitHub waiting for the vault to let this Mac in is owed, not blocked: its row reads
+    /// deferred, saying when it runs, and init exits 0, not 75.
+    #[test]
+    fn github_waiting_on_the_vaults_approval_exits_0() {
+        use aterm_converge::StoodAside;
+        let row = |id: &str| ItemReport {
+            id: id.into(),
+            family: "test".into(),
+            title: id.into(),
+            outcome: Outcome::Blocked,
+            from: None,
+            to: None,
+            why: Some("waits for init.secrets@alice: waiting to be let in".into()),
+            revert: None,
+            effect: Effect::Now,
+            detail: None,
+            layer: None,
+            class: None,
+            explain: None,
+            stood_aside: Some(StoodAside::Waiting("waiting to be let in".into())),
+            essential: false,
+            elapsed_ms: None,
+        };
+        let rows: Vec<ItemReport> = [row("init.secrets@alice"), row("init.github.native@alice")]
+            .into_iter()
+            .map(owe)
+            .collect();
+        assert_eq!(status(&rows, Action::Apply), 0);
+        assert_eq!(
+            rows[0].outcome,
+            Outcome::Blocked,
+            "the join finishes by itself"
+        );
+        assert!(
+            rows[1].outcome == Outcome::Deferred && rows[1].why.as_deref() == Some(OWED),
+            "{rows:?}"
+        );
+        assert!(tally(&rows, Action::Apply).contains("to run once this Mac is let in"));
     }
 
     /// On Linux init runs the base layer, the vault and GitHub in any shell of the account (an
@@ -5271,21 +7413,18 @@ mod tests {
             assert!(ctx.console.is_none(), "nobody's console session: {ctx:?}");
             let vault = crate::init_secrets::tests::converged();
             let port = Arc::clone(&vault);
-            let (groups, choice) = prepare_groups_with(
+            let (groups, picked) = prepare_groups_with(
                 &sys,
                 &ctx,
                 Mode::Apply,
                 None,
-                &Reading {
-                    keyboards: None,
-                    only: &[],
-                    choice: None,
-                },
+                &reading(&[]),
+                &alab_standing(),
                 no_grants,
                 move |_| Ok(port as Arc<dyn crate::init_secrets::SecretsOps>),
             )
             .unwrap();
-            assert_eq!(choice, Choice::ALL);
+            assert_eq!(picked, Picked::ALL);
             let applied = Arc::new(std::sync::atomic::AtomicU32::new(0));
             let base = Base {
                 items: vec![Box::new(BaseItem {
@@ -5394,18 +7533,20 @@ mod tests {
             id: "init.secrets@alice".into(),
             ..row(Outcome::Blocked, waiting())
         };
-        // A vault join remains incomplete until the subscriber verifies admission.
+        // A vault join an admin has yet to approve, made now or on an earlier run, is done
+        // for this run: the subscriber finishes it.
         for action in [Action::Apply, Action::Check] {
-            assert_eq!(status(&[done.clone(), vault()], action), 75);
+            assert_eq!(status(&[done.clone(), vault()], action), 0);
         }
-        // A row waiting for that join is left for another run.
+        // A row waiting for that join is owed, and runs once this Mac is let in: no second
+        // run is needed for it.
         assert_eq!(
             status(&[vault(), row(Outcome::Blocked, waiting())], Action::Apply),
-            75
+            0
         );
         assert_eq!(
             status(&[vault(), row(Outcome::Blocked, offline())], Action::Apply),
-            75
+            69
         );
         assert_eq!(
             status(
@@ -5506,9 +7647,11 @@ mod tests {
                 },
                 Vec::new(),
                 Some(&why),
-                Choice::ALL,
+                Selection::all(),
                 &[],
-            );
+                true,
+            )
+            .0;
             let preferences: Vec<&dyn Item> = groups
                 .iter()
                 .filter(|(_, place)| place.class == Class::Preference)
@@ -5572,22 +7715,6 @@ mod tests {
                 assert!(!complete(&[row.clone()], action));
             }
         }
-        row.id = "init.secrets@alice".into();
-        row.outcome = Outcome::Blocked;
-        row.stood_aside = Some(aterm_converge::StoodAside::Waiting(
-            "admission pending".into(),
-        ));
-        assert!(!complete(&[row.clone()], Action::Apply));
-        assert_eq!(status(&[row.clone()], Action::Apply), 75);
-        row.id = "init.permissions.full-disk-access".into();
-        row.outcome = Outcome::Person;
-        row.stood_aside = None;
-        assert!(!complete(&[row.clone()], Action::Apply));
-        assert_eq!(status(&[row.clone()], Action::Apply), 77);
-        row.id = AWAY.into();
-        row.outcome = Outcome::Deferred;
-        assert!(!complete(&[row.clone()], Action::Apply));
-        assert_eq!(status(&[row.clone()], Action::Apply), 75);
         row.outcome = Outcome::Planned;
         assert!(complete(&[row.clone()], Action::Plan));
         assert!(!complete(&[row.clone()], Action::Apply));
@@ -5607,8 +7734,8 @@ mod tests {
             len: 0,
         };
         sys.stat_of("/dev/console", owned(console_uid, false));
-        sys.stat_of("/Users/alice", owned(501, true));
-        sys.stat_of("/Users/alice/aterm", owned(501, true));
+        sys.stat_of("/Users//alice", owned(501, true));
+        sys.stat_of("/Users//alice/aterm", owned(501, true));
         sys.on(
             &crate::facts::hidutil_keyboards().display(),
             Ran::ok("Services:\n\nDevices:\n"),
@@ -5616,7 +7743,7 @@ mod tests {
         let alice = user("alice", 501);
         sys.write_user_file(
             &alice,
-            Path::new("/Users/alice/aterm/Cargo.toml"),
+            Path::new("/Users//alice/aterm/Cargo.toml"),
             crate::checkout::tests::manifest(Path::new("/srv/origin.git")).as_bytes(),
             0o644,
         )
@@ -5624,7 +7751,7 @@ mod tests {
         if let Some(profile) = profile {
             sys.write_user_file(
                 &alice,
-                Path::new("/Users/alice/.config/aterm/init.toml"),
+                Path::new("/Users//alice/.config/aterm/init.toml"),
                 profile.as_bytes(),
                 0o600,
             )
@@ -5688,7 +7815,7 @@ mod tests {
                         vec![Listed::boxed("init.test.dock", vec![change(), ok()])],
                         place(Class::Preference),
                     )],
-                    Choice::ALL,
+                    Picked::ALL,
                 ))
             };
             converge(
@@ -5698,9 +7825,11 @@ mod tests {
                     base: &base,
                     groups: &groups,
                     targo: None,
-                    cwd: Some(Path::new("/Users/alice/aterm")),
+                    cwd: Some(Path::new("/Users//alice/aterm")),
                     records: &NoRecords,
                     on_row: &|_| {},
+                    present: &|| true,
+                    on_held: &|_| {},
                 },
                 &mut NoJournal,
                 laps,
@@ -5822,13 +7951,13 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|call| call == "alice$ write /Users/alice/.config/aterm/init.toml 600"),
+                .any(|call| call == "alice$ write /Users//alice/.config/aterm/init.toml 600"),
             "{calls:?}"
         );
         assert!(
             calls
                 .iter()
-                .any(|call| call.contains("git -C /Users/alice/aterm")),
+                .any(|call| call.contains("git -C /Users//alice/aterm")),
             "{calls:?}"
         );
     }
@@ -5950,7 +8079,7 @@ mod tests {
                 let alice = user("alice", 501);
                 sys.write_user_file(
                     &alice,
-                    Path::new("/Users/alice/.config/aterm/init.toml"),
+                    Path::new("/Users//alice/.config/aterm/init.toml"),
                     profile.as_bytes(),
                     mode,
                 )
@@ -6032,7 +8161,7 @@ mod tests {
                     "",
                 );
                 sys.on(
-                    &crate::checkout::git(&sys, &alice, Some(Path::new("/Users/alice/aterm")))
+                    &crate::checkout::git(&sys, &alice, Some(Path::new("/Users//alice/aterm")))
                         .args(["ls-remote", "--symref", "origin", "HEAD"])
                         .display(),
                     Ran::exit(128, stderr),
@@ -6192,9 +8321,9 @@ mod tests {
     /// own shell the same item is blocked and its apply never runs.
     #[test]
     fn doctor_s_rust_docs_repair_is_a_relay_item_of_the_account_s_own() {
-        const RUSTUP: &str = "alice$ CARGO_HOME=/Users/alice/.cargo \
-                              RUSTUP_HOME=/Users/alice/.rustup /Users/alice/.cargo/bin/rustup";
-        const STABLE: &str = "/Users/alice/.rustup/toolchains/stable-aarch64-apple-darwin";
+        const RUSTUP: &str = "alice$ CARGO_HOME=/Users//alice/.cargo \
+                              RUSTUP_HOME=/Users//alice/.rustup /Users//alice/.cargo/bin/rustup";
+        const STABLE: &str = "/Users//alice/.rustup/toolchains/stable-aarch64-apple-darwin";
         let remove =
             format!("{RUSTUP} component remove rust-docs --toolchain stable-aarch64-apple-darwin");
         let mac = || {
@@ -6204,7 +8333,7 @@ mod tests {
             sys.create_dir_all(Path::new(&format!("{html}/std")), 0o755)
                 .unwrap();
             sys.file(&format!("{html}/std/index.html"), b"<html>")
-                .file("/Users/alice/.cargo/bin/rustup", b"")
+                .file("/Users//alice/.cargo/bin/rustup", b"")
                 .on(
                     &format!("{RUSTUP} toolchain list"),
                     Ran::ok("stable-aarch64-apple-darwin (active, default)\n"),
@@ -6217,7 +8346,7 @@ mod tests {
                 .on_write(&remove, Path::new(&record), b"cargo-aarch64-apple-darwin\n");
             let setup = sys.calls().len();
             (
-                Doctor::over(sys, Some(PathBuf::from("/Users/alice")), None),
+                Doctor::over(sys, Some(PathBuf::from("/Users//alice")), None),
                 setup,
             )
         };
@@ -6418,6 +8547,64 @@ mod tests {
         );
     }
 
+    /// The Messages and FaceTime sign-outs, which nothing undoes, run after every other row,
+    /// another lane's included: the vault's join here holds its lane for a second watching for
+    /// a sign-out to start, and none starts until it ends.
+    #[test]
+    fn the_sign_outs_run_after_every_other_row() {
+        type Log = Arc<(Mutex<Vec<&'static str>>, std::sync::Condvar)>;
+        let log: Log = Arc::default();
+        let note = |log: &Log, what: &'static str| {
+            log.0.lock().unwrap().push(what);
+            log.1.notify_all();
+        };
+        let (dock, sign_out, vault) = (Arc::clone(&log), Arc::clone(&log), Arc::clone(&log));
+        let groups = vec![
+            (
+                vec![
+                    then("init.test.dock", "dock", move || note(&dock, "dock")),
+                    then("init.messages.signed-out@alice", "init", move || {
+                        note(&sign_out, "sign-out");
+                    }),
+                ],
+                place(Class::Preference),
+            ),
+            (
+                vec![then(
+                    "init.test.vault",
+                    crate::init_secrets::FAMILY,
+                    move || {
+                        let (seen, started) = &*vault;
+                        drop(
+                            started
+                                .wait_timeout_while(
+                                    seen.lock().unwrap(),
+                                    std::time::Duration::from_secs(1),
+                                    |seen| !seen.contains(&"sign-out"),
+                                )
+                                .unwrap(),
+                        );
+                        note(&vault, "vault");
+                    },
+                )],
+                place(Class::Install),
+            ),
+        ];
+        let alice = at_console(user("alice", 501));
+        run(
+            &Fake::root(),
+            &alice,
+            Base::none(),
+            &groups,
+            Mode::Apply,
+            &mut NoJournal,
+        )
+        .unwrap();
+        let seen = log.0.lock().unwrap().clone();
+        let at = |what| seen.iter().position(|seen| *seen == what).unwrap();
+        assert!(at("vault") < at("sign-out"), "{seen:?}");
+    }
+
     /// Each row reaches `on_row` as its item finishes, while the run goes on: the preference
     /// waits for the vault's row to have been printed. The rows come back in composition
     /// order all the same.
@@ -6469,7 +8656,8 @@ mod tests {
             &mut Laps::start(),
             &Hooks {
                 on_row: &on_row,
-                desktop: &|lane| lane(),
+                desktop: &|stages| stages.plain(),
+                held: &|_| None,
             },
         )
         .unwrap();
@@ -6536,8 +8724,12 @@ mod tests {
 
     /// What the default output prints for `rows`: each shown row, then the tally.
     fn printed(rows: &[ItemReport], action: Action) -> String {
-        let mut text: String = rows.iter().filter(|row| shown(row)).map(rendered).collect();
-        text.push_str(&tally(rows, action));
+        let mut text: String = rows
+            .iter()
+            .filter(|row| shown(row))
+            .map(|row| rendered(row, false))
+            .collect();
+        text.push_str(&completion_summary(rows, action, true));
         text.push('\n');
         text
     }
@@ -6550,7 +8742,10 @@ mod tests {
             .map(|n| report(&format!("init.test.{n}"), Outcome::Ok))
             .collect();
         let quiet = printed(&rows, Action::Apply);
-        assert_eq!(quiet, "aterm init: 45 ok\n");
+        assert_eq!(
+            quiet,
+            "aterm init: 45 ok — Successfully completed. No further action is needed.\n"
+        );
         rows[3] = ItemReport {
             from: Some("on".into()),
             to: Some("off".into()),
@@ -6559,7 +8754,7 @@ mod tests {
         let changed = printed(&rows, Action::Apply);
         assert_eq!(changed.lines().count(), 3, "{changed}");
         assert!(
-            changed.ends_with("aterm init: 44 ok \u{b7} 1 changed\n"),
+            changed.ends_with("aterm init: 44 ok \u{b7} 1 changed — Successfully completed. No further action is needed.\n"),
             "{changed}"
         );
         rows[5] = ItemReport {
@@ -6572,6 +8767,31 @@ mod tests {
         assert!(
             person.ends_with("43 ok \u{b7} 1 changed \u{b7} 1 needs you: Full Disk Access\n"),
             "{person}"
+        );
+    }
+
+    #[test]
+    fn unfinished_or_planned_setup_never_claims_successful_completion() {
+        for outcome in [
+            Outcome::Failed,
+            Outcome::Unknown,
+            Outcome::Blocked,
+            Outcome::Person,
+            Outcome::Planned,
+        ] {
+            let rows = [report("base.clt", outcome)];
+            assert!(
+                !completion_summary(&rows, Action::Apply, true).contains("Successfully completed")
+            );
+        }
+        assert!(!completion_summary(&[], Action::Apply, true).contains("Successfully completed"));
+        assert!(
+            !completion_summary(&[report("base.clt", Outcome::Ok)], Action::Apply, false)
+                .contains("Successfully completed")
+        );
+        assert!(
+            completion_summary(&[report("base.clt", Outcome::Ok)], Action::Plan, true)
+                .ends_with("(nothing changed)")
         );
     }
 
@@ -6592,7 +8812,7 @@ mod tests {
         let mut after = Vec::new();
         printer.row_to(&report("init.test.ok", Outcome::Ok), &mut after);
         printer.flush_to(&mut after);
-        assert_eq!(String::from_utf8(after).unwrap(), rendered(&changed));
+        assert_eq!(String::from_utf8(after).unwrap(), rendered(&changed, false));
     }
 
     /// `aterm init --help` and `aterm help init` read one page: every System State setting by
@@ -6607,12 +8827,13 @@ mod tests {
         assert!(usage.contains("first launch"), "{usage}");
     }
 
-    /// First-run setup is on by default (owner ruling 2026-10-25): a person at the console with
-    /// no flag gets every group, the preferences and both sign-outs included, and is asked
-    /// nothing; a flag runs only the group it names.
+    /// First-run setup is on by default (owner ruling 2026-10-25): a person at an ALab Mac's
+    /// console with no flag gets every group, the preferences and both sign-outs included, and
+    /// is asked nothing; `--no-profile` and `--no-clone` leave theirs out. On another Mac a flag
+    /// adds its group to the base plan.
     #[test]
     fn a_person_at_the_console_gets_every_group_and_is_asked_nothing() {
-        let prepared_with = |choice: Option<Choice>| {
+        let prepared_with = |picks: Picks, standing: Standing<'static>| {
             let mut sys = alice_at(501);
             sys.terminal = true;
             sys.agent = None;
@@ -6629,8 +8850,9 @@ mod tests {
                 &Reading {
                     keyboards: None,
                     only: &[],
-                    choice,
+                    picks,
                 },
+                &standing,
                 no_grants,
                 move |_| Ok(vault as Arc<dyn crate::init_secrets::SecretsOps>),
             )
@@ -6647,9 +8869,9 @@ mod tests {
                 .collect();
             (preferences, picked, asked)
         };
-        let signs_out = |id: &String| id.contains(".signed-out@");
-        let (preferences, picked, asked) = prepared_with(None);
-        assert_eq!(picked, Choice::ALL);
+        let signs_out = |id: &String| crate::init_accounts::signs_out(id);
+        let (preferences, picked, asked) = prepared_with(Picks::default(), alab_standing());
+        assert_eq!((picked.runs, picked.held), (Picked::ALL.runs, None));
         assert!(asked.is_empty(), "nothing is asked: {asked:?}");
         assert!(
             preferences.iter().filter(|id| signs_out(id)).count() == 2
@@ -6660,13 +8882,96 @@ mod tests {
             sign_out: true,
             ..Choice::NONE
         };
-        let (preferences, picked, asked) = prepared_with(Some(sign_out));
-        assert_eq!(picked, sign_out);
-        assert!(asked.is_empty(), "{asked:?}");
+        for (picks, standing) in [
+            (
+                Picks {
+                    named: sign_out,
+                    left: Choice::NONE,
+                },
+                personal_standing(),
+            ),
+            (
+                Picks {
+                    named: Choice::NONE,
+                    left: Choice {
+                        profile: true,
+                        clone: true,
+                        ..Choice::NONE
+                    },
+                },
+                alab_standing(),
+            ),
+        ] {
+            let (preferences, picked, asked) = prepared_with(picks, standing);
+            assert_eq!(picked.runs, sign_out.selection());
+            assert!(asked.is_empty(), "{asked:?}");
+            assert!(
+                preferences.len() == 2 && preferences.iter().all(signs_out),
+                "{preferences:?}"
+            );
+        }
+    }
+
+    /// A group the person turned off in System State, or every group while a Stop there holds,
+    /// is left as it is by a plain `aterm init`, which says so and how to set it up anyway; a
+    /// flag that names the group runs it.
+    #[test]
+    fn init_keeps_a_group_the_person_turned_off_and_names_the_way_to_run_it() {
+        let mut off = Selection::all();
+        off.set(Setting::Messages, false);
+        off.set(Setting::FaceTime, false);
+        let mut kept = Selection::none();
+        kept.set(Setting::Messages, true);
+        kept.set(Setting::FaceTime, true);
+        let turned_off = Holds {
+            off: kept,
+            ..Holds::NONE
+        };
+        let plain = picked(Picks::default(), &[], &|| true, &turned_off, true);
+        assert_eq!(plain.runs, off, "{plain:?}");
+        assert!(!plain.signs_out());
+        let line = plain.held.expect("the held line");
         assert!(
-            preferences.len() == 2 && preferences.iter().all(signs_out),
-            "{preferences:?}"
+            line.contains("left as you set them in System State")
+                && line.contains(
+                    "aterm init --only with each one's word (init.messages, init.facetime)"
+                ),
+            "{line}"
         );
+        let named = Picks {
+            named: Choice {
+                sign_out: true,
+                ..Choice::NONE
+            },
+            left: Choice::NONE,
+        };
+        let flagged = picked(named, &[], &|| true, &turned_off, true);
+        assert!(flagged.signs_out() && flagged.held.is_none(), "{flagged:?}");
+        let stopped = Holds {
+            stopped: Some("you stopped setup in System State".into()),
+            stopped_revision: Some(1),
+            ..Holds::NONE
+        };
+        let plain = picked(Picks::default(), &[], &|| true, &stopped, true);
+        assert!(plain.runs.is_empty(), "{plain:?}");
+        let line = plain.held.expect("the held line");
+        assert!(
+            line.starts_with("left as they are because you stopped setup in System State"),
+            "{line}"
+        );
+        let only = picked(
+            Picks::default(),
+            &["init.dock".into()],
+            &|| true,
+            &stopped,
+            true,
+        );
+        assert_eq!(
+            (only.runs, only.held, only.kept),
+            (Picked::ALL.runs, None, Selection::none()),
+            "--only runs what it names"
+        );
+        assert_eq!(only.start, stopped, "over the holds on record as it began");
     }
 
     /// The setup records a first launch shares: a pass that changes the preferences holds
@@ -6679,8 +8984,8 @@ mod tests {
     }
 
     impl Records for Recorded {
-        fn hold(&self, whole: bool, _wait: &dyn Fn(&str)) -> Result<Box<dyn Held>, String> {
-            self.holds.lock().unwrap().push(whole);
+        fn hold(&self, pass: Pass, _wait: Option<&dyn Fn(&str)>) -> Result<Box<dyn Held>, Unheld> {
+            self.holds.lock().unwrap().push(pass.whole());
             Ok(Box::new(Verifies(Arc::clone(&self.verified))))
         }
     }
@@ -6703,7 +9008,16 @@ mod tests {
         records: &dyn Records,
     ) -> Result<Vec<ItemReport>, Refused> {
         let prepare = |_: &dyn System, ctx: &Ctx, _: Mode, reading: &Reading<'_>| {
-            Ok((groups(ctx), reading.choice.unwrap_or(Choice::ALL)))
+            Ok((
+                groups(ctx),
+                picked(
+                    reading.picks,
+                    reading.only,
+                    &|| true,
+                    &Holds::default(),
+                    true,
+                ),
+            ))
         };
         converge(
             sys,
@@ -6715,6 +9029,8 @@ mod tests {
                 cwd: None,
                 records,
                 on_row: &|_| {},
+                present: &|| true,
+                on_held: &|_| {},
             },
             &mut NoJournal,
             &mut Laps::start(),
@@ -6729,7 +9045,11 @@ mod tests {
     fn only_the_desktop_lane_waits_behind_the_setup_records() {
         struct Behind(Arc<Meet>, Mutex<Vec<String>>);
         impl Records for Behind {
-            fn hold(&self, _whole: bool, _wait: &dyn Fn(&str)) -> Result<Box<dyn Held>, String> {
+            fn hold(
+                &self,
+                _pass: Pass,
+                _wait: Option<&dyn Fn(&str)>,
+            ) -> Result<Box<dyn Held>, Unheld> {
                 self.1.lock().unwrap().push("held".into());
                 self.0.arrive();
                 Ok(Box::new(NoRecords))
@@ -6764,7 +9084,7 @@ mod tests {
             ]
         };
         let prepare =
-            |_: &dyn System, ctx: &Ctx, _: Mode, _: &Reading<'_>| Ok((groups(ctx), Choice::ALL));
+            |_: &dyn System, ctx: &Ctx, _: Mode, _: &Reading<'_>| Ok((groups(ctx), Picked::ALL));
         let sys = alice_with_checkout(501, None);
         let rows = converge(
             &sys,
@@ -6776,6 +9096,8 @@ mod tests {
                 cwd: None,
                 records: &records,
                 on_row: &|_| {},
+                present: &|| true,
+                on_held: &|_| {},
             },
             &mut NoJournal,
             &mut Laps::start(),
@@ -6800,11 +9122,15 @@ mod tests {
             items.push(Listed::boxed("init.test.dock", vec![change(), change()]));
             vec![(items, place(Class::Preference))]
         };
-        let profile = Options {
-            choice: Some(Choice {
-                profile: true,
-                ..Choice::NONE
-            }),
+        // On an ALab Mac `--no-sign-out` runs the profile without the sign-outs: a part.
+        let part = Options {
+            picks: Picks {
+                named: Choice::NONE,
+                left: Choice {
+                    sign_out: true,
+                    ..Choice::NONE
+                },
+            },
             ..Options::default()
         };
         for (options, groups, holds, verified) in [
@@ -6815,7 +9141,7 @@ mod tests {
                 1,
             ),
             (&Options::default(), &unverified, [true], 0),
-            (&profile, &dock, [false], 0),
+            (&part, &dock, [false], 0),
         ] {
             let sys = alice_with_checkout(501, None);
             let records = Recorded::default();
@@ -6835,7 +9161,7 @@ mod tests {
     }
 
     impl Records for WithheldRecords {
-        fn hold(&self, _whole: bool, _wait: &dyn Fn(&str)) -> Result<Box<dyn Held>, String> {
+        fn hold(&self, _pass: Pass, _wait: Option<&dyn Fn(&str)>) -> Result<Box<dyn Held>, Unheld> {
             Ok(Box::new(Self {
                 events: Arc::clone(&self.events),
                 refuses: self.refuses,
@@ -7027,9 +9353,11 @@ mod tests {
                 },
                 Vec::new(),
                 None,
-                Choice::ALL,
+                Selection::all(),
                 &only,
-            );
+                true,
+            )
+            .0;
             let bound = crate::engine::bind(
                 groups.iter().flat_map(|(items, place)| {
                     items
@@ -7059,14 +9387,18 @@ mod tests {
         );
     }
 
-    /// All local launchers can apply explicitly selected defaults in the console session.
+    /// Account sign-out runs in the console user's graphic session with no terminal; an agent
+    /// tab stays refused, and preferences still need a person at the console.
     #[test]
-    fn selected_workstation_defaults_run_from_local_agent_and_background_launches() {
+    fn sign_out_runs_without_a_terminal_but_not_from_an_agent_tab() {
         let options = Options {
-            choice: Some(Choice {
-                sign_out: true,
-                ..Choice::NONE
-            }),
+            picks: Picks {
+                named: Choice {
+                    sign_out: true,
+                    ..Choice::NONE
+                },
+                left: Choice::NONE,
+            },
             ..Options::default()
         };
         let groups = |_: &Ctx| {
@@ -7077,9 +9409,9 @@ mod tests {
         };
         for (terminal, agent, allowed) in [
             (false, None, true),
-            (false, Some("Claude Code"), true),
-            (false, Some("Codex"), true),
-            (true, Some("Claude Code"), true),
+            (false, Some("Claude Code"), false),
+            (false, Some("Codex"), false),
+            (true, Some("Claude Code"), false),
             (true, None, true),
         ] {
             let mut sys = alice_with_checkout(501, None);
@@ -7106,31 +9438,45 @@ mod tests {
             Choice {
                 sign_out: true,
                 ..Choice::NONE
-            },
+            }
+            .selection(),
             &[],
-        );
+            true,
+        )
+        .0;
         let ids: Vec<String> = accounts
             .iter()
             .flat_map(|(items, _)| items.iter().map(|item| item.id()))
-            .filter(|id| id.contains(".signed-out@"))
             .collect();
         assert_eq!(
             ids,
             [
+                AWAY,
+                "init.spotlight.rustup-profile@alice",
+                "init.spotlight.rust-docs@alice",
+                "init.spotlight.build-noindex@alice",
                 "init.messages.signed-out@alice",
                 "init.facetime.signed-out@alice"
-            ]
+            ],
+            "the preferences wait for a person at the console, Rust in Spotlight runs as a \
+             background row, and the sign-outs run last"
         );
         let preferences = Options {
-            choice: Some(Choice {
-                profile: true,
-                ..Choice::NONE
-            }),
+            picks: Picks {
+                named: Choice {
+                    profile: true,
+                    ..Choice::NONE
+                },
+                left: Choice::NONE,
+            },
             ..Options::default()
         };
         let mut sys = alice_with_checkout(501, None);
         sys.terminal = false;
-        assert!(converge_with(&sys, &preferences, &groups, &NoRecords).is_ok());
+        assert!(matches!(
+            converge_with(&sys, &preferences, &groups, &NoRecords),
+            Err(Refused::Usage(_))
+        ));
     }
 
     #[test]
@@ -7152,9 +9498,11 @@ mod tests {
             },
             github,
             None,
-            Choice::ALL,
+            Selection::all(),
             &[],
-        );
+            true,
+        )
+        .0;
         let applied = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let base = Base {
             items: vec![Box::new(BaseItem {
@@ -7237,10 +9585,9 @@ mod tests {
             .iter()
             .find(|row| row.outcome == Outcome::Person)
             .expect("the grant only the person switches on");
-        assert!(!counts(person, Action::Apply) && !counts(person, Action::Check));
+        assert!(counts(person, Action::Apply) && !counts(person, Action::Check));
         assert!(tally(&reported, Action::Apply).ends_with("needs you: Full Disk Access"));
-        assert!(!complete(&reported, Action::Apply));
-        assert_eq!(status(&reported, Action::Apply), 77, "{reported:?}");
+        assert_eq!(status(&reported, Action::Apply), 0, "{reported:?}");
     }
 
     #[test]
@@ -7267,6 +9614,1741 @@ mod tests {
         assert_eq!(
             line,
             "aterm init: 1 ok \u{b7} [swarm] enabled = false (nothing changed)"
+        );
+    }
+
+    /// What one run of the Command Line Tools tab's program did: its exit code, everything it
+    /// wrote to the tab, and how many times it converged.
+    struct TabRun {
+        code: u8,
+        said: Vec<String>,
+        converged: u32,
+    }
+
+    const TAB_ATERM: &str = "/Applications/aterm.app/Contents/MacOS/aterm";
+
+    const TAB_CC: &str = "/Library/Developer/CommandLineTools/usr/bin/cc";
+
+    /// The tab's `sudo` argv on `alice_with_checkout`: the plain prompt and the root half's
+    /// `--plain`, which reads no file.
+    fn tab_sudo() -> String {
+        format!("tty /usr/bin/sudo -p 'Mac password: ' {TAB_ATERM} machines here apply --plain")
+    }
+
+    /// [`tab`] over `sys` (`live`: in the person's own login), composing `base.clt` alone as
+    /// [`tab_entry`] does, its probe finding [`TAB_CC`] or nothing.
+    fn tab_run(sys: &Fake, live: bool) -> TabRun {
+        let said = Arc::new(Mutex::new(Vec::new()));
+        let out = crate::init_clt::Tab::new({
+            let said = Arc::clone(&said);
+            Arc::new(move |text: &str| said.lock().unwrap().push(text.to_owned()))
+        });
+        let converged = std::sync::atomic::AtomicU32::new(0);
+        let only = options(&["--only".into(), crate::init_clt::ID.into()]).unwrap();
+        let code = tab(sys, &out, &|| live, &|tab| {
+            converged.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let base = |_: bool| Base {
+                clt: Some(
+                    crate::init_clt::CommandLineTools::new(
+                        Box::new(|sys: &dyn System| {
+                            if sys.read_file(Path::new(TAB_CC)).is_ok() {
+                                crate::init_clt::Found::Present(TAB_CC.into())
+                            } else {
+                                crate::init_clt::Found::Missing("no developer directory".into())
+                            }
+                        }),
+                        PathBuf::from(TAB_ATERM),
+                    )
+                    .in_tab(tab.clone()),
+                ),
+                ..Base::none()
+            };
+            let groups =
+                |_: &dyn System, _: &Ctx, _: Mode, _: &Reading<'_>| Ok((Vec::new(), Picked::NONE));
+            converge(
+                sys,
+                &only,
+                &Front {
+                    base: &base,
+                    groups: &groups,
+                    targo: None,
+                    cwd: Some(Path::new("/Users//alice/aterm")),
+                    records: &NoRecords,
+                    on_row: &|_| {},
+                    present: &|| true,
+                    on_held: &|_| {},
+                },
+                &mut NoJournal,
+                &mut Laps::start(),
+            )
+        });
+        let said = said.lock().unwrap().clone();
+        TabRun {
+            code,
+            said,
+            converged: converged.load(std::sync::atomic::Ordering::SeqCst),
+        }
+    }
+
+    /// The tab's run is `--only base.clt` alone under the tab's variable; without the variable
+    /// (or with it empty), or with any other word or flag, `aterm init` speaks as it always did.
+    #[test]
+    fn only_base_clt_under_the_tab_variable_is_the_tabs_program() {
+        let tab_var = Some(std::ffi::OsStr::new("1"));
+        let parse =
+            |args: &[&str]| options(&args.iter().map(OsString::from).collect::<Vec<_>>()).unwrap();
+        assert!(in_tab(tab_var, &parse(&["--only", "base.clt"])));
+        assert!(in_tab(tab_var, &parse(&["--only=base.clt"])));
+        assert!(!in_tab(None, &parse(&["--only", "base.clt"])));
+        assert!(!in_tab(
+            Some(std::ffi::OsStr::new("")),
+            &parse(&["--only", "base.clt"])
+        ));
+        for other in [
+            &["--only", "base.clt,shell"][..],
+            &["--only", "base"],
+            &["--only", "base.clt", "--json"],
+            &["--plan", "--only", "base.clt"],
+            &[],
+        ] {
+            assert!(!in_tab(tab_var, &parse(other)), "{other:?}");
+        }
+    }
+
+    /// `aterm init --only base.clt` under the tab's variable is the tab's own run, whose code is
+    /// the run's exit: none of `aterm init`'s ports (its base layer, Full Disk Access, the
+    /// records, the grants, the walk), which here panic, is touched first.
+    /// NEGATIVE CONTROL: an entry that never hands the tab its run composes init's base layer,
+    /// whose port panics, and never exits 7.
+    #[test]
+    fn the_tabs_variable_hands_the_run_to_the_tab() {
+        struct NoRecords;
+        impl Records for NoRecords {
+            fn hold(
+                &self,
+                _pass: Pass,
+                _wait: Option<&dyn Fn(&str)>,
+            ) -> Result<Box<dyn Held>, Unheld> {
+                panic!("the tab's run held the setup records first")
+            }
+        }
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let ports = crate::sync::tests::Inert::new(scratch.path());
+        let host = Host {
+            base: &|_| panic!("the tab's run composed init's base layer first"),
+            full_disk_access: &|| panic!("the tab's run measured Full Disk Access"),
+            records: &NoRecords,
+            grants: |_| panic!("the tab's run read the grants"),
+            walk: &|_| panic!("the tab's run walked the grants"),
+            converge: &ports,
+            alab: &|| panic!("the tab's run read the ALab scope first"),
+            present: || panic!("the tab's run read who is at the screen first"),
+        };
+        let ran = std::cell::Cell::new(0);
+        let code = entry(
+            vec!["--only".into(), "base.clt".into()],
+            &host,
+            Some(std::ffi::OsStr::new("1")),
+            &|options, _| {
+                ran.set(ran.get() + 1);
+                assert_eq!(options.only, [crate::init_clt::ID]);
+                7
+            },
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(7)));
+        assert_eq!(ran.get(), 1);
+    }
+
+    /// The tab's program starts nothing and says nothing until the window types its go line
+    /// (read with echo off, keeping what was typed before the read), and ends on 2, so a tab
+    /// whose go line never came is never taken for an install that ran.
+    #[test]
+    fn the_tab_starts_nothing_and_says_nothing_until_its_go_line() {
+        for answer in [
+            Some(Some("installx")),
+            Some(Some("Install")),
+            Some(Some("")),
+            Some(None),
+            None,
+        ] {
+            let mut sys = alice_with_checkout(501, None);
+            sys.tty = true;
+            if let Some(answer) = answer {
+                sys.answer(answer);
+            }
+            let before = sys.calls();
+            let run = tab_run(&sys, true);
+            assert_eq!(run.code, TAB_NOT_STARTED, "{answer:?}");
+            assert!(run.said.is_empty(), "{answer:?}: {:?}", run.said);
+            assert_eq!(run.converged, 0, "{answer:?}");
+            let calls = sys.calls();
+            assert_eq!(
+                calls[before.len()..],
+                ["ask kept ".to_owned()],
+                "{answer:?}: one read with echo off, then nothing"
+            );
+        }
+    }
+
+    /// Past its go line, the tab's program clears the screen, says its one intro line right
+    /// before `sudo` asks for the Mac password with the plain prompt, runs the root half
+    /// `--plain`, and ends on its one installed line and 0. Tools already there end on the same
+    /// line with nothing asked.
+    #[test]
+    fn the_tab_installs_and_ends_on_its_one_installed_line() {
+        let mut sys = alice_with_checkout(501, None);
+        sys.tty = true;
+        sys.answer(Some(aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_GO));
+        let sudo = tab_sudo();
+        sys.on(&sudo, Ran::ok(""))
+            .on_write(&sudo, Path::new(TAB_CC), b"");
+        let run = tab_run(&sys, true);
+        assert_eq!(
+            run.said,
+            [
+                TAB_CLEAR.to_owned(),
+                format!("{}\n", crate::init_clt::TAB_INTRO),
+                format!("{}\n", crate::init_clt::TAB_INSTALLED),
+            ],
+            "{:?}",
+            sys.calls()
+        );
+        assert_eq!(run.code, 0);
+        assert_eq!(run.converged, 1);
+        assert_eq!(
+            sys.calls()
+                .iter()
+                .filter(|call| call.starts_with("tty "))
+                .collect::<Vec<_>>(),
+            [&sudo]
+        );
+
+        let mut there = alice_with_checkout(501, None);
+        there.tty = true;
+        there
+            .answer(Some(aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_GO))
+            .file(TAB_CC, b"");
+        let run = tab_run(&there, true);
+        assert_eq!(
+            run.said,
+            [
+                TAB_CLEAR.to_owned(),
+                format!("{}\n", crate::init_clt::TAB_INSTALLED),
+            ]
+        );
+        assert_eq!(run.code, 0);
+        assert!(!there.calls().iter().any(|call| call.starts_with("tty ")));
+    }
+
+    /// Every way the tab's install falls short, early ones included, ends on its one plain line
+    /// `The install did not finish: <reason>. Install… on System State tries again.` and 1:
+    /// `sudo`'s own refusal, each class the root half exits with, a signal, a `sudo` that never
+    /// ran, a run outside the person's own login, and a refused converge.
+    #[test]
+    fn the_tab_ends_on_one_line_saying_why_the_install_did_not_finish() {
+        use crate::init_clt::Unfinished;
+        let go = aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_GO;
+        let ends_on = |run: &TabRun, why: Unfinished, intro: bool| {
+            let mut said = vec![TAB_CLEAR.to_owned()];
+            if intro {
+                said.push(format!("{}\n", crate::init_clt::TAB_INTRO));
+            }
+            said.push(format!("{}\n", why.line()));
+            assert_eq!(run.said, said, "{why:?}");
+            assert_eq!(run.code, 1, "{why:?}");
+        };
+        let sudo = tab_sudo();
+        for (ran, why) in [
+            (Some(Ran::exit(1, "")), Unfinished::Password),
+            (Some(Ran::exit(80, "")), Unfinished::Catalog),
+            (Some(Ran::exit(81, "")), Unfinished::NoneOffered),
+            (Some(Ran::exit(82, "")), Unfinished::Download),
+            (Some(Ran::exit(83, "")), Unfinished::Installer),
+            (Some(Ran::exit(84, "")), Unfinished::Busy),
+            (Some(Ran::exit(85, "")), Unfinished::Stopped),
+            (Some(Ran::exit(86, "")), Unfinished::AppleWindow),
+            (Some(Ran::exit(87, "")), Unfinished::Other),
+            (Some(Ran::exit(127, "")), Unfinished::Other),
+            (
+                Some(Ran {
+                    status: None,
+                    ..Ran::default()
+                }),
+                Unfinished::Other,
+            ),
+            // Exit 0 with nothing installed after it.
+            (Some(Ran::ok("")), Unfinished::Other),
+            // `sudo` never ran.
+            (None, Unfinished::Other),
+        ] {
+            let mut sys = alice_with_checkout(501, None);
+            sys.tty = true;
+            sys.answer(Some(go));
+            if let Some(ran) = ran {
+                sys.on(&sudo, ran);
+            }
+            ends_on(&tab_run(&sys, true), why, true);
+        }
+
+        // Outside the person's own login nothing is converged.
+        let mut sys = alice_with_checkout(501, None);
+        sys.tty = true;
+        sys.answer(Some(go));
+        let run = tab_run(&sys, false);
+        ends_on(&run, Unfinished::NotOwnLogin, false);
+        assert_eq!(run.converged, 0);
+
+        // A converge refused before the item (run as root) is the other class.
+        let mut root = alice_with_checkout(501, None);
+        root.tty = true;
+        root.euid = 0;
+        root.answer(Some(go));
+        let run = tab_run(&root, true);
+        ends_on(&run, Unfinished::Other, false);
+        assert_eq!(run.converged, 1);
+
+        // So is a probe with no terminal to ask in.
+        let sys = alice_with_checkout(501, None);
+        sys.answer(Some(go));
+        ends_on(&tab_run(&sys, true), Unfinished::Other, false);
+    }
+
+    /// In Low Data Mode the tab asks for no password and ends on its own line, naming Low Data
+    /// Mode and how to go on, with its own exit, which the window reads to wait for the mode to
+    /// end without spending its one automatic opening. An account that is no administrator of
+    /// the Mac, which `sudo` would refuse, ends on its own line and exit too.
+    #[test]
+    fn low_data_mode_and_a_non_administrator_each_end_the_tab_on_their_own_line_and_exit() {
+        use crate::init_clt::Unfinished;
+        for (why, code, line) in [
+            (
+                Unfinished::LowData,
+                aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_LOW_DATA,
+                "Low Data Mode is on, so the download waits. Turn it off in System Settings \u{203a} \
+                 Network, then press Install\u{2026} again.",
+            ),
+            (
+                Unfinished::NotAdmin,
+                aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_NOT_ADMIN,
+                "Only an administrator of this Mac can install Apple's Command Line Tools. Ask \
+                 one to install them from their own login.",
+            ),
+        ] {
+            let mut sys = alice_with_checkout(501, None);
+            sys.tty = true;
+            match why {
+                Unfinished::LowData => sys.low_data = Some(true),
+                _ => sys.admin = Some(false),
+            }
+            sys.answer(Some(aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_GO));
+            let run = tab_run(&sys, true);
+            assert_eq!(run.code, code, "{why:?}");
+            assert_eq!(why.tab_exit(), code, "{why:?}");
+            assert_eq!(
+                run.said,
+                [TAB_CLEAR.to_owned(), format!("{line}\n")],
+                "{why:?}"
+            );
+            assert!(
+                !sys.calls().iter().any(|call| call.starts_with("tty ")),
+                "{why:?}: no password asked: {:?}",
+                sys.calls()
+            );
+        }
+    }
+
+    /// The tab's program (`--only base.clt`) composes init's base layer as a read: Apple's
+    /// Command Line Tools touch no store, so the tab never waits for an install pass that holds
+    /// it before its password prompt. CONTROL: any other run that applies waits for the lock,
+    /// and `--no-wait` only tries it.
+    #[test]
+    fn the_tab_never_asks_for_the_store_lock() {
+        let parse =
+            |args: &[&str]| options(&args.iter().map(OsString::from).collect::<Vec<_>>()).unwrap();
+        assert_eq!(
+            parse(&["--only", "base.clt"]).base_lock(true),
+            BaseLock::Read
+        );
+        assert_eq!(parse(&["--only=base.clt"]).base_lock(true), BaseLock::Read);
+        assert_eq!(parse(&[]).base_lock(true), BaseLock::Wait);
+        assert_eq!(parse(&["--only", "base"]).base_lock(true), BaseLock::Wait);
+        assert_eq!(
+            parse(&["--only", "base.clt,base.pkg.toolset"]).base_lock(true),
+            BaseLock::Wait
+        );
+        assert_eq!(parse(&["--no-wait"]).base_lock(true), BaseLock::Try);
+        assert_eq!(parse(&[]).base_lock(false), BaseLock::Read);
+    }
+
+    /// `base.clt` with the tools missing, run over `sys` in its login's own context.
+    fn clt_rows(sys: &Fake) -> Vec<ItemReport> {
+        let (ctx, _) = local_context(sys).unwrap();
+        let base = Base {
+            clt: Some(crate::init_clt::CommandLineTools::new(
+                Box::new(|_: &dyn System| {
+                    crate::init_clt::Found::Missing("no developer directory".into())
+                }),
+                PathBuf::from(TAB_ATERM),
+            )),
+            ..Base::none()
+        };
+        run(sys, &ctx, base, &[], Mode::Apply, &mut NoJournal).unwrap()
+    }
+
+    /// Who may be asked for the Mac password: installing Apple's Command Line Tools is a
+    /// person's step at this Mac's console (design §6.3, §7). In an agent's tab, or with no
+    /// terminal at all (an agent's tool call, a script), nothing asks for it, the row waits for
+    /// a person there, and the run exits 0. CONTROL: a person at the console is asked once.
+    #[test]
+    fn off_the_console_init_asks_no_password_for_the_command_line_tools_and_exits_0() {
+        let sudo = format!("tty /usr/bin/sudo {TAB_ATERM} machines here apply --plain");
+        for (terminal, agent) in [
+            (true, Some("Claude Code")),
+            (false, Some("Claude Code")),
+            (false, None),
+        ] {
+            let mut sys = alice_at(501);
+            sys.terminal = terminal;
+            sys.tty = terminal;
+            sys.agent = agent;
+            assert_ne!(init_presence(&sys), Presence::AtConsole);
+            let rows = clt_rows(&sys);
+            let row = rows
+                .iter()
+                .find(|row| row.id == crate::init_clt::ID)
+                .unwrap();
+            assert!(
+                !sys.calls().iter().any(|call| call.starts_with("tty ")),
+                "{terminal} {agent:?}: asked for the Mac password: {:?}",
+                sys.calls()
+            );
+            assert_eq!(row.outcome, Outcome::Deferred, "{row:?}");
+            assert_eq!(status(&rows, Action::Apply), 0, "{row:?}");
+            assert_ne!(status(&rows, Action::Check), 0, "{row:?}");
+        }
+
+        let mut sys = alice_at(501);
+        sys.terminal = true;
+        sys.tty = true;
+        sys.agent = None;
+        assert_eq!(init_presence(&sys), Presence::AtConsole);
+        sys.on(&sudo, Ran::exit(1, ""));
+        let rows = clt_rows(&sys);
+        assert_eq!(
+            sys.calls()
+                .iter()
+                .filter(|call| call.starts_with("tty "))
+                .collect::<Vec<_>>(),
+            [&sudo]
+        );
+        assert_ne!(status(&rows, Action::Apply), 0);
+    }
+
+    /// `aterm init` at the console while an install of the tools runs (System State's tab, or
+    /// another account's) asks for no password and fails nothing: the row waits for that
+    /// install, and the run exits 0. CONTROL: a placeholder nothing holds is no install.
+    #[test]
+    fn during_a_running_clt_install_init_asks_no_password_and_fails_nothing() {
+        let console = || {
+            let mut sys = alice_at(501);
+            sys.terminal = true;
+            sys.tty = true;
+            sys.agent = None;
+            sys.file(crate::items::developer::PLACEHOLDER, b"");
+            sys
+        };
+        let sys = console();
+        sys.running(&["/usr/sbin/softwareupdate"]);
+        let rows = clt_rows(&sys);
+        let row = rows
+            .iter()
+            .find(|row| row.id == crate::init_clt::ID)
+            .unwrap();
+        assert!(
+            !sys.calls().iter().any(|call| call.starts_with("tty ")),
+            "an install is running: no password asked: {:?}",
+            sys.calls()
+        );
+        assert_eq!(row.outcome, Outcome::Deferred, "{row:?}");
+        assert!(!row.outcome.is_failure(), "{row:?}");
+        assert_eq!(status(&rows, Action::Apply), 0, "{row:?}");
+
+        let stale = console();
+        stale.running(&["/tmp/installer"]);
+        let _ = clt_rows(&stale);
+        assert!(
+            stale.calls().iter().any(|call| call.starts_with("tty ")),
+            "{:?}",
+            stale.calls()
+        );
+    }
+
+    /// One converge of `sys` with `prepare`'s groups and `records`, a person at the screen as
+    /// `present` says: its rows (or why it was refused), and the lines of what the person's
+    /// choices held ([`Front::on_held`]).
+    fn converge_held(
+        sys: &Fake,
+        options: &Options,
+        prepare: &Prepare<'_>,
+        records: &dyn Records,
+        present: &(dyn Fn() -> bool + Sync),
+    ) -> (Result<Vec<ItemReport>, Refused>, Vec<ItemReport>) {
+        let held = Mutex::new(Vec::new());
+        let rows = converge(
+            sys,
+            options,
+            &Front {
+                base: &|_| Base::none(),
+                groups: prepare,
+                targo: None,
+                cwd: None,
+                records,
+                on_row: &|_| {},
+                present,
+                on_held: &|row| held.lock().unwrap().push(row),
+            },
+            &mut NoJournal,
+            &mut Laps::start(),
+        );
+        (rows, held.into_inner().unwrap())
+    }
+
+    /// [`desktop_rows`]'s pair: the items, and each one's tag.
+    type DesktopRows = (Vec<Box<dyn Item>>, Vec<(String, Setting)>);
+
+    /// The sign-outs for `ctx`'s one user and a Dock row, each a change, tagged with the System
+    /// State row each is built for ([`Picked::rows`]).
+    fn desktop_rows(ctx: &Ctx) -> DesktopRows {
+        let mut items: Vec<Box<dyn Item>> = crate::init_accounts::items(ctx)
+            .unwrap()
+            .into_iter()
+            .map(|item| Listed::boxed(item.id(), vec![change(), ok()]))
+            .collect();
+        items.push(Listed::boxed("init.test.dock", vec![change(), ok()]));
+        let tags = items
+            .iter()
+            .map(|item| {
+                let id = item.id();
+                let setting = if id.starts_with("init.messages.") {
+                    Setting::Messages
+                } else if id.starts_with("init.facetime.") {
+                    Setting::FaceTime
+                } else {
+                    Setting::Dock
+                };
+                (id, setting)
+            })
+            .collect();
+        (items, tags)
+    }
+
+    /// System State's stopped revision before and after init waits for the window's pass.
+    struct StoppedWhileWaiting {
+        waited: std::sync::atomic::AtomicBool,
+        before: Option<u64>,
+        after: u64,
+    }
+
+    impl Records for StoppedWhileWaiting {
+        fn hold(&self, _pass: Pass, wait: Option<&dyn Fn(&str)>) -> Result<Box<dyn Held>, Unheld> {
+            if let Some(wait) = wait {
+                wait("waiting while System State changes this Mac's settings");
+            }
+            self.waited.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::new(NoRecords))
+        }
+        fn holds(&self) -> Holds {
+            let stopped_revision = if self.waited.load(std::sync::atomic::Ordering::SeqCst) {
+                Some(self.after)
+            } else {
+                self.before
+            };
+            Holds {
+                stopped: stopped_revision.map(|_| "you stopped setup in System State".to_owned()),
+                stopped_revision,
+                ..Holds::NONE
+            }
+        }
+    }
+
+    /// A Stop the person presses in System State while `aterm init` waits for the records holds
+    /// init's preferences and sign-outs, as a Stop pressed before init started does (principle
+    /// 4): the holds are read again once the records are held, and the run says what it left.
+    #[test]
+    fn a_stop_pressed_while_init_waits_for_the_records_holds_its_desktop_lane() {
+        let records = StoppedWhileWaiting {
+            waited: std::sync::atomic::AtomicBool::new(false),
+            before: None,
+            after: 1,
+        };
+        let prepare = |_: &dyn System, ctx: &Ctx, _: Mode, reading: &Reading<'_>| {
+            let (items, tags) = desktop_rows(ctx);
+            let mut picked = picked(
+                reading.picks,
+                reading.only,
+                &|| true,
+                &records.holds(),
+                true,
+            );
+            picked.rows = tags;
+            Ok((vec![(items, place(Class::Preference))], picked))
+        };
+        let sys = alice_with_checkout(501, None);
+        let (rows, held) = converge_held(&sys, &Options::default(), &prepare, &records, &|| true);
+        let rows = rows.unwrap();
+        let changed: Vec<&str> = rows
+            .iter()
+            .filter(|row| row.outcome == Outcome::Changed)
+            .map(|row| row.id.as_str())
+            .collect();
+        assert!(
+            changed.is_empty(),
+            "the person's Stop landed before init changed anything, yet init changed {changed:?}"
+        );
+        let line = held
+            .iter()
+            .find(|row| row.id == HELD)
+            .and_then(|row| row.why.clone())
+            .expect("the held line");
+        assert!(
+            line.starts_with("left as they are because you stopped setup in System State")
+                && line.contains("Dock")
+                && line.contains("Messages"),
+            "{line}"
+        );
+    }
+
+    /// System State's records as init holds them: `taken` once held, `held` while held, as the
+    /// profile lock is.
+    struct Watched {
+        taken: Arc<std::sync::atomic::AtomicBool>,
+        held: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Records for Watched {
+        fn hold(&self, _pass: Pass, _wait: Option<&dyn Fn(&str)>) -> Result<Box<dyn Held>, Unheld> {
+            self.held.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.taken.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::new(Releases(Arc::clone(&self.held))))
+        }
+    }
+
+    /// The hold [`Watched`] hands out: it lets the records go when released or dropped.
+    struct Releases(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Held for Releases {
+        fn verified(self: Box<Self>) -> Result<(), String> {
+            Ok(())
+        }
+        fn release(&mut self) {
+            self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn again(&mut self, _wait: Option<&dyn Fn(&str)>) -> Result<(), Unheld> {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    impl Drop for Releases {
+        fn drop(&mut self) {
+            self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// init holds System State's records (profile.lock) only over its Desktop lane's own
+    /// changes: the preferences, then the sign-outs, which run last. While its clones (or the
+    /// Command Line Tools) run in the Network lane, the window's Stop, a group turned off,
+    /// Restore and Set up now never wait behind it. Here the clone waits (a one-minute hang
+    /// detector) for the records to be let go after the Dock changed.
+    #[test]
+    fn init_lets_system_states_records_go_while_its_clones_run() {
+        use std::sync::atomic::Ordering;
+        let (taken, held) = (
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        let saw = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let records = Watched {
+            taken: Arc::clone(&taken),
+            held: Arc::clone(&held),
+        };
+        let clone = {
+            let (taken, held, saw) = (Arc::clone(&taken), Arc::clone(&held), Arc::clone(&saw));
+            move || {
+                let start = std::time::Instant::now();
+                while start.elapsed() < std::time::Duration::from_secs(60) {
+                    if taken.load(Ordering::SeqCst) && !held.load(Ordering::SeqCst) {
+                        saw.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+        };
+        let prepare = move |_: &dyn System, ctx: &Ctx, _: Mode, _: &Reading<'_>| {
+            let (items, _) = desktop_rows(ctx);
+            Ok((
+                vec![
+                    (items, place(Class::Preference)),
+                    (
+                        vec![then("init.test.clone", "github", clone.clone())],
+                        place(Class::Install),
+                    ),
+                ],
+                Picked::ALL,
+            ))
+        };
+        let sys = alice_with_checkout(501, None);
+        let (rows, _) = converge_held(&sys, &Options::default(), &prepare, &records, &|| true);
+        let rows = rows.unwrap();
+        assert!(
+            saw.load(Ordering::SeqCst),
+            "init kept System State's records held for the whole minute its clone ran"
+        );
+        assert!(
+            rows.iter()
+                .filter(|row| crate::init_accounts::signs_out(&row.id))
+                .all(|row| row.outcome == Outcome::Changed),
+            "the sign-outs ran, under a fresh hold: {rows:?}"
+        );
+        assert!(
+            !held.load(Ordering::SeqCst),
+            "the records are let go at the end"
+        );
+    }
+
+    /// With no terminal, the Messages and FaceTime sign-outs, which nothing undoes, run only
+    /// while a person is at the screen. They run last, after every other lane (the clones
+    /// included), so the person who was there as the run began may have gone: the sign-outs
+    /// read the screen again when they start, and wait for the next `aterm init` if nobody is
+    /// there (exit 0, nothing failed). Control: a person still there gets them.
+    #[test]
+    fn with_no_terminal_the_sign_outs_read_the_person_again_when_they_start() {
+        use std::sync::atomic::Ordering;
+        for walks_away in [true, false] {
+            let here = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let mut sys = alice_at(501);
+            sys.terminal = false;
+            sys.agent = None;
+            assert_eq!(crate::console::presence(&sys), Presence::NoTerminal);
+            let gone = Arc::clone(&here);
+            let prepare = move |_: &dyn System, ctx: &Ctx, _: Mode, _: &Reading<'_>| {
+                let gone = Arc::clone(&gone);
+                let items: Vec<Box<dyn Item>> = crate::init_accounts::items(ctx)
+                    .unwrap()
+                    .into_iter()
+                    .map(|item| Listed::boxed(item.id(), vec![change(), ok()]))
+                    .collect();
+                // A clone that takes a while; the person walks away meanwhile.
+                let clone = then("init.test.clone", "github", move || {
+                    if walks_away {
+                        gone.store(false, Ordering::SeqCst);
+                    }
+                });
+                Ok((
+                    vec![
+                        (items, place(Class::Preference)),
+                        (vec![clone], anywhere(Class::Install)),
+                    ],
+                    Picked::ALL,
+                ))
+            };
+            let present = || here.load(Ordering::SeqCst);
+            let (rows, _) =
+                converge_held(&sys, &Options::default(), &prepare, &NoRecords, &present);
+            let rows = rows.unwrap();
+            let sign_outs: Vec<&ItemReport> = rows
+                .iter()
+                .filter(|row| crate::init_accounts::signs_out(&row.id))
+                .collect();
+            assert_eq!(sign_outs.len(), 2, "{rows:?}");
+            if walks_away {
+                assert!(
+                    sign_outs.iter().all(|row| row.outcome == Outcome::Deferred
+                        && row.why.as_deref() == Some(NOBODY_AT_THE_SCREEN)),
+                    "nobody was at the screen when the sign-outs started: {sign_outs:#?}"
+                );
+                assert_eq!(status(&rows, Action::Apply), 0, "{rows:?}");
+            } else {
+                assert!(
+                    sign_outs.iter().all(|row| row.outcome == Outcome::Changed),
+                    "{sign_outs:#?}"
+                );
+            }
+        }
+    }
+
+    /// The line init prints of the groups the person turned off names only a way back that
+    /// runs where it is printed: in an agent's tab (the owner's normal path) `aterm init
+    /// --profile` is refused and `aterm init --only dock` names no held group, so the line names
+    /// System State's switch alone; at the console it names the narrowest run too, which runs.
+    #[test]
+    fn the_held_line_off_the_console_names_a_way_back_that_runs_there() {
+        for (agent, flags) in [(Some("Claude Code"), false), (None, true)] {
+            let mut sys = alice_at(501);
+            sys.terminal = true;
+            sys.agent = agent;
+            let (ctx, _) = local_context(&sys).unwrap();
+            let mut off = Selection::none();
+            off.set(Setting::Dock, true);
+            let standing = Standing {
+                alab: &|| true,
+                present: &|| true,
+                holds: Holds { off, ..Holds::NONE },
+            };
+            let vault = crate::init_secrets::tests::Scripted::new(vec![Ok(
+                crate::init_secrets::tests::unconfigured(),
+            )]);
+            let (_, picked) = prepare_groups_with(
+                &sys,
+                &ctx,
+                Mode::Apply,
+                None,
+                &Reading {
+                    keyboards: None,
+                    only: &[],
+                    picks: Picks::default(),
+                },
+                &standing,
+                no_grants,
+                move |_| Ok(vault as Arc<dyn crate::init_secrets::SecretsOps>),
+            )
+            .unwrap();
+            let line = picked.held.expect("the held line");
+            assert!(line.contains("Turn one on with its switch there"), "{line}");
+            assert_eq!(
+                line.contains(naming(Setting::Dock)),
+                flags,
+                "{agent:?}: {line}"
+            );
+            // The way back itself: it sets the Dock at the console, and in an agent's tab names
+            // no item the run takes, saying the person left it as is.
+            let words: Vec<OsString> = naming(Setting::Dock)
+                .split_whitespace()
+                .skip(2)
+                .map(OsString::from)
+                .collect();
+            let mut way = options(&words).unwrap();
+            way.station = way.only.clone();
+            let holds = standing.holds.clone();
+            let prepare = |_: &dyn System, _: &Ctx, _: Mode, reading: &Reading<'_>| {
+                let picked = super::picked(reading.picks, reading.only, &|| true, &holds, flags);
+                let items: Vec<Box<dyn Item>> = if picked.runs.contains(Setting::Dock) {
+                    vec![Listed::of("dock", "init.dock@alice", vec![change(), ok()])]
+                } else {
+                    Vec::new()
+                };
+                Ok((vec![(items, place(Class::Preference))], picked))
+            };
+            let (ran, _) = converge_held(&sys, &way, &prepare, &NoRecords, &|| true);
+            if flags {
+                let ran = ran.unwrap();
+                assert!(
+                    ran.iter()
+                        .any(|row| row.id == "init.dock@alice" && row.outcome == Outcome::Changed),
+                    "{ran:?}"
+                );
+            } else {
+                assert!(
+                    matches!(&ran, Err(Refused::Usage(why))
+                        if why.contains("left as you set them in System State: Dock")),
+                    "{agent:?}: {ran:?}"
+                );
+            }
+            let named = Options {
+                picks: Picks {
+                    named: Choice {
+                        profile: true,
+                        ..Choice::NONE
+                    },
+                    left: Choice::NONE,
+                },
+                ..Options::default()
+            };
+            let none =
+                |_: &dyn System, _: &Ctx, _: Mode, _: &Reading<'_>| Ok((Vec::new(), Picked::NONE));
+            let (typed, _) = converge_held(&sys, &named, &none, &NoRecords, &|| true);
+            assert_eq!(
+                matches!(typed, Err(Refused::Usage(_))),
+                !flags,
+                "{agent:?}: {typed:?}"
+            );
+        }
+    }
+
+    /// The way back init names for the GitHub repositories ([`naming`], also the owed clone's
+    /// words when its record cannot be written) runs the repositories alone: on an ALab Mac
+    /// `--clone` adds to the scope's groups, which would also reset the Dock and sign out of
+    /// Messages and FaceTime.
+    #[test]
+    fn the_narrowest_way_back_for_the_repositories_runs_only_them() {
+        let words: Vec<OsString> = naming(Setting::Repositories)
+            .split_whitespace()
+            .skip(2)
+            .map(OsString::from)
+            .collect();
+        let mut options = options(&words).unwrap();
+        // As `entry` reads it: a word no base item names is the workstation's.
+        options.station = options.only.clone();
+        let groups = |ctx: &Ctx| {
+            let (items, _) = desktop_rows(ctx);
+            vec![
+                (items, place(Class::Preference)),
+                (
+                    vec![then("init.github.native@alice", "github", || {})],
+                    place(Class::Install),
+                ),
+            ]
+        };
+        let sys = alice_with_checkout(501, None);
+        let rows = converge_with(&sys, &options, &groups, &NoRecords).unwrap();
+        let ran: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(
+            ran,
+            ["init.github.native@alice"],
+            "`{}` ran more than the repositories",
+            naming(Setting::Repositories)
+        );
+    }
+
+    /// Records another setup holds past init's bounded wait.
+    struct NeverLetGo;
+
+    impl Records for NeverLetGo {
+        fn hold(&self, _pass: Pass, wait: Option<&dyn Fn(&str)>) -> Result<Box<dyn Held>, Unheld> {
+            if let Some(wait) = wait {
+                wait("waiting while System State changes this Mac's settings");
+            }
+            Err(Unheld::Busy(
+                "left as it is: System State was changing this Mac's settings for 10 minutes"
+                    .into(),
+            ))
+        }
+    }
+
+    /// When init's 10-minute wait for the records ends, the run still reports what its other
+    /// lanes did (the vault's join, the clones, the base layer) and exits 75, "a lock", as its
+    /// usage says: the Desktop lane's rows stand aside for that lock in plain words, nothing of
+    /// them changed. It does not end as a bare failure with every row lost.
+    #[test]
+    fn inits_bounded_wait_reports_the_other_lanes_and_exits_75() {
+        let prepare = |_: &dyn System, ctx: &Ctx, _: Mode, _: &Reading<'_>| {
+            let (items, _) = desktop_rows(ctx);
+            Ok((
+                vec![
+                    (items, place(Class::Preference)),
+                    (
+                        vec![then("init.test.vault", crate::init_secrets::FAMILY, || {})],
+                        place(Class::Install),
+                    ),
+                ],
+                Picked::ALL,
+            ))
+        };
+        let sys = alice_with_checkout(501, None);
+        let (result, _) = converge_held(&sys, &Options::default(), &prepare, &NeverLetGo, &|| true);
+        let rows = match result {
+            Ok(rows) => rows,
+            Err(refused) => panic!("the wait's end discards the run's report: {refused:?}"),
+        };
+        assert!(
+            rows.iter().any(|row| row.id == "init.test.vault"),
+            "{rows:?}"
+        );
+        let desk: Vec<&ItemReport> = rows
+            .iter()
+            .filter(|row| {
+                row.id.starts_with("init.test.dock") || crate::init_accounts::signs_out(&row.id)
+            })
+            .collect();
+        assert_eq!(desk.len(), 3, "{rows:?}");
+        assert!(
+            desk.iter().all(|row| row.outcome != Outcome::Changed
+                && row
+                    .stood_aside
+                    .as_ref()
+                    .is_some_and(|aside| aside.why().contains("10 minutes"))),
+            "{desk:#?}"
+        );
+        assert_eq!(status(&rows, Action::Apply), 75, "{rows:?}");
+    }
+
+    /// A key the person changed after aterm set it (design §6.6) is theirs: `aterm init` leaves
+    /// it as they set it, says so, and names the ways that set it again; a key of theirs that
+    /// reads as aterm wants is in place. With the record of those keys unreadable, it sets none.
+    #[test]
+    fn init_leaves_a_key_the_person_changed_and_names_the_way_to_set_it_again() {
+        struct Kept(Result<Vec<String>, String>);
+        impl Records for Kept {
+            fn hold(
+                &self,
+                _pass: Pass,
+                _wait: Option<&dyn Fn(&str)>,
+            ) -> Result<Box<dyn Held>, Unheld> {
+                Ok(Box::new(NoRecords))
+            }
+            fn kept(&self) -> Result<Vec<String>, String> {
+                self.0.clone()
+            }
+        }
+        let prepare = |_: &dyn System, _: &Ctx, _: Mode, reading: &Reading<'_>| {
+            let mut picked = picked(
+                reading.picks,
+                reading.only,
+                &|| true,
+                &Holds::default(),
+                true,
+            );
+            picked.rows = vec![
+                ("init.test.dock".to_owned(), Setting::Dock),
+                ("init.test.widgets".to_owned(), Setting::Widgets),
+            ];
+            Ok((
+                vec![(
+                    vec![
+                        Listed::boxed("init.test.dock", vec![change(), ok()]),
+                        Listed::boxed("init.test.widgets", vec![change(), ok()]),
+                    ],
+                    place(Class::Preference),
+                )],
+                picked,
+            ))
+        };
+        let sys = alice_with_checkout(501, None);
+        let outcome = |rows: &[ItemReport], id: &str| {
+            rows.iter().find(|row| row.id == id).map(|row| row.outcome)
+        };
+        let kept = Kept(Ok(vec!["init.test.dock".to_owned()]));
+        let (rows, held) = converge_held(&sys, &Options::default(), &prepare, &kept, &|| true);
+        let rows = rows.unwrap();
+        assert_eq!(
+            outcome(&rows, "init.test.dock"),
+            Some(Outcome::NotApplicable)
+        );
+        assert_eq!(outcome(&rows, "init.test.widgets"), Some(Outcome::Changed));
+        let line = held
+            .iter()
+            .find(|row| row.id == CHANGED)
+            .and_then(|row| row.why.clone())
+            .expect("the line of the keys the person changed");
+        assert!(
+            line.contains("Dock")
+                && !line.contains("Widgets")
+                && line.contains("Set up now in System State, or aterm doctor --apply"),
+            "{line}"
+        );
+        let unread = Kept(Err("setup-kept.json: not JSON".to_owned()));
+        let (rows, _) = converge_held(&sys, &Options::default(), &prepare, &unread, &|| true);
+        let rows = rows.unwrap();
+        assert!(
+            rows.iter().all(|row| row.outcome == Outcome::NotApplicable),
+            "{rows:?}"
+        );
+    }
+
+    /// A run with no terminal builds no preference (they wait for a person at the console), so
+    /// its Desktop lane holds the records for its sign-outs alone: a part of the profile, which
+    /// saves no plan and clears none of the window's finished stages ([`Pass::Part`]).
+    #[test]
+    fn a_run_that_sets_no_preference_takes_no_whole_hold() {
+        struct Passes(Mutex<Vec<Pass>>);
+        impl Records for Passes {
+            fn hold(
+                &self,
+                pass: Pass,
+                _wait: Option<&dyn Fn(&str)>,
+            ) -> Result<Box<dyn Held>, Unheld> {
+                self.0.lock().unwrap().push(pass);
+                Ok(Box::new(NoRecords))
+            }
+        }
+        let mut sys = alice_at(501);
+        sys.terminal = false;
+        sys.agent = None;
+        assert_eq!(crate::console::presence(&sys), Presence::NoTerminal);
+        let prepare = |_: &dyn System, ctx: &Ctx, _: Mode, reading: &Reading<'_>| {
+            let (mut items, mut tags) = desktop_rows(ctx);
+            // No preference: only the sign-outs.
+            items.retain(|item| crate::init_accounts::signs_out(&item.id()));
+            tags.retain(|(id, _)| crate::init_accounts::signs_out(id));
+            let mut picked = picked(
+                reading.picks,
+                reading.only,
+                &|| true,
+                &Holds::default(),
+                false,
+            );
+            picked.rows = tags;
+            Ok((vec![(items, place(Class::Preference))], picked))
+        };
+        let records = Passes(Mutex::new(Vec::new()));
+        let (rows, _) = converge_held(&sys, &Options::default(), &prepare, &records, &|| true);
+        let rows = rows.unwrap();
+        assert!(
+            rows.iter()
+                .filter(|row| crate::init_accounts::signs_out(&row.id))
+                .all(|row| row.outcome == Outcome::Changed),
+            "{rows:?}"
+        );
+        assert_eq!(
+            records.0.into_inner().unwrap(),
+            [Pass::Part],
+            "a run that set no preference held the records for a whole-profile pass"
+        );
+    }
+
+    /// The person typed `aterm init --sign-out`, then pressed Stop in System State while init
+    /// waited for the records: the Stop is their later choice, and holds the sign-outs, which
+    /// nothing undoes, though a flag named them. A flag goes past only a hold on record when the
+    /// run began: an unchanged Stop, never another stopped revision with the same words.
+    #[test]
+    fn a_stop_pressed_after_init_started_holds_a_named_sign_out() {
+        for (before, after, blocked) in [(None, 1, true), (Some(1), 1, false), (Some(1), 2, true)] {
+            let records = StoppedWhileWaiting {
+                waited: std::sync::atomic::AtomicBool::new(false),
+                before,
+                after,
+            };
+            let prepare = |_: &dyn System, ctx: &Ctx, _: Mode, reading: &Reading<'_>| {
+                let (items, tags) = desktop_rows(ctx);
+                let mut picked = picked(
+                    reading.picks,
+                    reading.only,
+                    &|| true,
+                    &records.holds(),
+                    true,
+                );
+                picked.rows = tags;
+                Ok((vec![(items, place(Class::Preference))], picked))
+            };
+            let sys = alice_with_checkout(501, None);
+            assert_eq!(crate::console::presence(&sys), Presence::AtConsole);
+            let named = Options {
+                picks: Picks {
+                    named: Choice {
+                        sign_out: true,
+                        ..Choice::NONE
+                    },
+                    left: Choice::NONE,
+                },
+                ..Options::default()
+            };
+            let (rows, held) = converge_held(&sys, &named, &prepare, &records, &|| true);
+            let rows = rows.unwrap();
+            let signed_out: Vec<&str> = rows
+                .iter()
+                .filter(|row| {
+                    crate::init_accounts::signs_out(&row.id) && row.outcome == Outcome::Changed
+                })
+                .map(|row| row.id.as_str())
+                .collect();
+            assert_eq!(
+                signed_out.len(),
+                if blocked { 0 } else { 2 },
+                "stopped revision {before:?} -> {after}: {signed_out:?}"
+            );
+            assert_eq!(
+                held.iter().any(|row| row.id == HELD
+                    && row
+                        .why
+                        .as_deref()
+                        .is_some_and(|why| why.contains("Messages, FaceTime"))),
+                blocked,
+                "{held:?}"
+            );
+        }
+    }
+
+    /// With the record of the keys the person changed unreadable, init sets no preference
+    /// ([`KEPT_UNREAD`]), so it records no Mac setting verified for the first launch: the
+    /// window's run then sets them.
+    #[test]
+    fn a_pass_that_could_not_read_the_kept_record_records_no_verified_settings() {
+        type Log = Arc<Mutex<Vec<(bool, bool)>>>;
+        struct Logged(Log);
+        impl Held for Logged {
+            fn checkpoint(&self, settings: Selection) -> Result<(), String> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((settings.contains(Setting::Dock), false));
+                Ok(())
+            }
+            fn verified(self: Box<Self>) -> Result<(), String> {
+                self.0.lock().unwrap().push((true, true));
+                Ok(())
+            }
+        }
+        struct Unread(Log);
+        impl Records for Unread {
+            fn hold(
+                &self,
+                _pass: Pass,
+                _wait: Option<&dyn Fn(&str)>,
+            ) -> Result<Box<dyn Held>, Unheld> {
+                Ok(Box::new(Logged(Arc::clone(&self.0))))
+            }
+            fn kept(&self) -> Result<Vec<String>, String> {
+                Err("setup-kept.json: not JSON".to_owned())
+            }
+        }
+        let prepare = |_: &dyn System, ctx: &Ctx, _: Mode, reading: &Reading<'_>| {
+            let (items, tags) = desktop_rows(ctx);
+            let mut picked = picked(
+                reading.picks,
+                reading.only,
+                &|| true,
+                &Holds::default(),
+                true,
+            );
+            picked.rows = tags;
+            Ok((vec![(items, place(Class::Preference))], picked))
+        };
+        let sys = alice_with_checkout(501, None);
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let records = Unread(Arc::clone(&log));
+        let (rows, _) = converge_held(&sys, &Options::default(), &prepare, &records, &|| true);
+        let rows = rows.unwrap();
+        assert!(
+            rows.iter().all(|row| row.outcome != Outcome::Changed),
+            "{rows:?}"
+        );
+        let log = log.lock().unwrap().clone();
+        assert!(
+            log.iter().all(|(dock, verified)| !dock && !verified),
+            "init set no preference, yet recorded the Dock or the whole profile verified: \
+             {log:?}"
+        );
+    }
+
+    /// A sign-out the person undid after aterm made it (they signed back in) is in the record
+    /// of the keys they changed (design §6.6), and the page reads "Changed by you" on its row:
+    /// `aterm init` leaves it as they set it, as it leaves a preference they changed.
+    #[test]
+    fn init_leaves_a_sign_out_the_person_undid_as_they_set_it() {
+        struct KeptSignOut(Vec<String>);
+        impl Records for KeptSignOut {
+            fn hold(
+                &self,
+                _pass: Pass,
+                _wait: Option<&dyn Fn(&str)>,
+            ) -> Result<Box<dyn Held>, Unheld> {
+                Ok(Box::new(NoRecords))
+            }
+            fn kept(&self) -> Result<Vec<String>, String> {
+                Ok(self.0.clone())
+            }
+        }
+        let sys = alice_with_checkout(501, None);
+        let (ctx, _) = local_context(&sys).unwrap();
+        let (_, tags) = desktop_rows(&ctx);
+        let messages = tags
+            .iter()
+            .find(|(_, setting)| *setting == Setting::Messages)
+            .map(|(id, _)| id.clone())
+            .expect("a Messages sign-out");
+        let prepare = |_: &dyn System, ctx: &Ctx, _: Mode, reading: &Reading<'_>| {
+            let (items, tags) = desktop_rows(ctx);
+            let mut picked = picked(
+                reading.picks,
+                reading.only,
+                &|| true,
+                &Holds::default(),
+                true,
+            );
+            picked.rows = tags;
+            Ok((vec![(items, place(Class::Preference))], picked))
+        };
+        let records = KeptSignOut(vec![messages.clone()]);
+        let (rows, held) = converge_held(&sys, &Options::default(), &prepare, &records, &|| true);
+        let rows = rows.unwrap();
+        let outcome = |id: &str| rows.iter().find(|row| row.id == id).map(|row| row.outcome);
+        assert_eq!(outcome(&messages), Some(Outcome::NotApplicable), "{rows:?}");
+        let facetime = tags
+            .iter()
+            .find(|(_, setting)| *setting == Setting::FaceTime)
+            .map(|(id, _)| id.as_str())
+            .expect("a FaceTime sign-out");
+        assert_eq!(outcome(facetime), Some(Outcome::Changed), "{rows:?}");
+        assert!(
+            held.iter().any(|row| row.id == CHANGED
+                && row
+                    .why
+                    .as_deref()
+                    .is_some_and(|why| why.contains("Messages"))),
+            "{held:?}"
+        );
+    }
+
+    /// `aterm init --help`: "A group off in System State (all after a Stop) stays as is unless a
+    /// flag names it; one turned off mid-run stays as is". A Stop pressed while a clone runs, which may take half an
+    /// hour, holds the clones that have not started; one the run named over a hold already on
+    /// record when it began still runs.
+    #[test]
+    fn a_stop_pressed_mid_run_holds_the_clones_not_yet_started() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct StopLater(Arc<AtomicBool>, Holds);
+        impl Records for StopLater {
+            fn hold(
+                &self,
+                _pass: Pass,
+                _wait: Option<&dyn Fn(&str)>,
+            ) -> Result<Box<dyn Held>, Unheld> {
+                Ok(Box::new(NoRecords))
+            }
+            fn holds(&self) -> Holds {
+                Holds {
+                    stopped: self
+                        .0
+                        .load(Ordering::SeqCst)
+                        .then(|| STOPPED.to_owned())
+                        .or_else(|| self.1.stopped.clone()),
+                    stopped_revision: if self.0.load(Ordering::SeqCst) {
+                        Some(2)
+                    } else {
+                        self.1.stopped_revision
+                    },
+                    ..self.1.clone()
+                }
+            }
+        }
+        const STOPPED: &str = "you stopped setup in System State";
+        let mut left = Selection::none();
+        left.set(Setting::Repositories, true);
+        for (start, named) in [
+            (Holds::NONE, false),
+            (
+                Holds {
+                    off: left,
+                    ..Holds::NONE
+                },
+                true,
+            ),
+            (
+                Holds {
+                    stopped: Some(STOPPED.to_owned()),
+                    stopped_revision: Some(1),
+                    ..Holds::NONE
+                },
+                true,
+            ),
+        ] {
+            let stop = Arc::new(AtomicBool::new(false));
+            let records = StopLater(Arc::clone(&stop), start.clone());
+            let pressed = Arc::clone(&stop);
+            let prepare = move |_: &dyn System, _: &Ctx, _: Mode, reading: &Reading<'_>| {
+                let pressed = Arc::clone(&pressed);
+                let picked = picked(reading.picks, reading.only, &|| true, &start, true);
+                Ok((
+                    vec![(
+                        vec![
+                            // The first repository: the person presses Stop while it clones.
+                            then("init.github.first@alice", "github", move || {
+                                pressed.store(true, Ordering::SeqCst);
+                            }),
+                            Listed::of("github", "init.github.second@alice", vec![change(), ok()]),
+                        ],
+                        place(Class::Install),
+                    )],
+                    picked,
+                ))
+            };
+            let sys = alice_with_checkout(501, None);
+            let options = if named {
+                Options {
+                    picks: Picks {
+                        named: Choice {
+                            clone: true,
+                            ..Choice::NONE
+                        },
+                        left: Choice::NONE,
+                    },
+                    ..Options::default()
+                }
+            } else {
+                Options::default()
+            };
+            let (rows, held) = converge_held(&sys, &options, &prepare, &records, &|| true);
+            let rows = rows.unwrap();
+            assert!(stop.load(Ordering::SeqCst), "the Stop was pressed mid-run");
+            let second = rows
+                .iter()
+                .find(|row| row.id == "init.github.second@alice")
+                .expect("the second clone's row");
+            assert_eq!(second.outcome, Outcome::NotApplicable, "{second:?}");
+            assert!(
+                second
+                    .why
+                    .as_deref()
+                    .is_some_and(|why| why.contains(STOPPED)),
+                "{second:?}"
+            );
+            assert!(
+                held.iter().any(|row| row.id == HELD
+                    && row
+                        .why
+                        .as_deref()
+                        .is_some_and(|why| why.contains("GitHub repositories"))),
+                "{held:?}"
+            );
+        }
+        // A hold on record when the run began, which `--clone` names, holds nothing it runs.
+        for start in [
+            Holds {
+                off: left,
+                ..Holds::NONE
+            },
+            Holds {
+                stopped: Some(STOPPED.to_owned()),
+                stopped_revision: Some(1),
+                ..Holds::NONE
+            },
+        ] {
+            let records = StopLater(Arc::new(AtomicBool::new(false)), start);
+            let start = records.holds();
+            let prepare = move |_: &dyn System, _: &Ctx, _: Mode, reading: &Reading<'_>| {
+                let picked = picked(reading.picks, reading.only, &|| true, &start, true);
+                Ok((
+                    vec![(
+                        vec![Listed::of(
+                            "github",
+                            "init.github.second@alice",
+                            vec![change(), ok()],
+                        )],
+                        place(Class::Install),
+                    )],
+                    picked,
+                ))
+            };
+            let named = Options {
+                picks: Picks {
+                    named: Choice {
+                        clone: true,
+                        ..Choice::NONE
+                    },
+                    left: Choice::NONE,
+                },
+                ..Options::default()
+            };
+            let sys = alice_with_checkout(501, None);
+            let (rows, _) = converge_held(&sys, &named, &prepare, &records, &|| true);
+            let rows = rows.unwrap();
+            assert!(
+                rows.iter()
+                    .any(|row| row.id == "init.github.second@alice"
+                        && row.outcome == Outcome::Changed),
+                "{rows:?}"
+            );
+        }
+    }
+
+    /// `aterm init --help`: "sign-outs run last, with you at the screen". With a terminal at the
+    /// console the person may walk away (screen locked or idle) during a long clone: the
+    /// sign-outs read presence again as they start, terminal or not, and wait for a person.
+    #[test]
+    fn a_terminal_runs_sign_outs_only_with_someone_at_the_screen() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let here = Arc::new(AtomicBool::new(true));
+        let mut sys = alice_at(501);
+        sys.terminal = true;
+        sys.agent = None;
+        assert_eq!(crate::console::presence(&sys), Presence::AtConsole);
+        let gone = Arc::clone(&here);
+        let prepare = move |_: &dyn System, ctx: &Ctx, _: Mode, _: &Reading<'_>| {
+            let gone = Arc::clone(&gone);
+            let items: Vec<Box<dyn Item>> = crate::init_accounts::items(ctx)
+                .unwrap()
+                .into_iter()
+                .map(|item| Listed::boxed(item.id(), vec![change(), ok()]))
+                .collect();
+            // A clone that takes half an hour; the person walks away meanwhile.
+            let clone = then("init.test.clone", "github", move || {
+                gone.store(false, Ordering::SeqCst);
+            });
+            Ok((
+                vec![
+                    (items, place(Class::Preference)),
+                    (vec![clone], anywhere(Class::Install)),
+                ],
+                Picked::ALL,
+            ))
+        };
+        let present = || here.load(Ordering::SeqCst);
+        let (rows, _) = converge_held(&sys, &Options::default(), &prepare, &NoRecords, &present);
+        let rows = rows.unwrap();
+        let sign_outs: Vec<&ItemReport> = rows
+            .iter()
+            .filter(|row| crate::init_accounts::signs_out(&row.id))
+            .collect();
+        assert!(!sign_outs.is_empty());
+        assert!(
+            sign_outs.iter().all(|row| row.outcome == Outcome::Deferred
+                && row.why.as_deref() == Some(NOBODY_AT_THE_SCREEN)),
+            "nobody was at the screen when the sign-outs started: {sign_outs:#?}"
+        );
+    }
+
+    /// A sign-out as it finds nobody at this Mac right before its own clicks
+    /// ([`crate::init_accounts::found_nobody`]): it clicks nothing and stands aside.
+    struct FoundNobody(String);
+
+    impl Item for FoundNobody {
+        fn id(&self) -> String {
+            self.0.clone()
+        }
+        fn family(&self) -> &'static str {
+            "init.messages"
+        }
+        fn title(&self) -> String {
+            self.0.clone()
+        }
+        fn probe(&self, _: &dyn System, _: &Ctx) -> Probe {
+            change()
+        }
+        fn apply(&self, _: &dyn System, _: &Ctx) -> Result<(), String> {
+            Ok(())
+        }
+        fn revert(&self) -> Option<String> {
+            None
+        }
+        fn stood_aside(&self) -> Option<aterm_converge::StoodAside> {
+            Some(aterm_converge::StoodAside::Waiting(
+                crate::init_accounts::away(),
+            ))
+        }
+    }
+
+    /// Each sign-out reads presence again right before its own clicks, through the run's port
+    /// (design §6.4, round 23): a person at the screen as the sign-outs start who leaves during
+    /// Messages' minute of clicks gets no FaceTime clicks. The run defers that sign-out as it
+    /// defers the sign-outs when nobody is there as they start, for the next aterm init and as
+    /// no failure of this one. Before, its stand-aside read as owed to the vault's join.
+    #[test]
+    fn a_sign_out_that_finds_nobody_before_its_clicks_waits_for_the_next_run() {
+        let mut sys = alice_at(501);
+        sys.terminal = true;
+        sys.agent = None;
+        let prepare = |_: &dyn System, ctx: &Ctx, _: Mode, _: &Reading<'_>| {
+            let items: Vec<Box<dyn Item>> = crate::init_accounts::items(ctx)
+                .unwrap()
+                .into_iter()
+                .map(|item| Box::new(FoundNobody(item.id())) as Box<dyn Item>)
+                .collect();
+            Ok((vec![(items, place(Class::Preference))], Picked::ALL))
+        };
+        let (rows, _) = converge_held(&sys, &Options::default(), &prepare, &NoRecords, &|| true);
+        let rows = rows.unwrap();
+        let sign_outs: Vec<&ItemReport> = rows
+            .iter()
+            .filter(|row| crate::init_accounts::signs_out(&row.id))
+            .collect();
+        assert!(!sign_outs.is_empty());
+        assert!(
+            sign_outs.iter().all(|row| row.outcome == Outcome::Deferred
+                && row.why.as_deref() == Some(NOBODY_AT_THE_SCREEN)
+                && waits_for_a_person(row)
+                && counts(row, Action::Apply)),
+            "a sign-out that found nobody before its clicks: {sign_outs:#?}"
+        );
+    }
+
+    /// [`naming`] promises the narrowest run that sets one group up and nothing else, and the
+    /// held line offers it to turn one group back on: on an ALab Mac the Dock's way back sets
+    /// the Dock alone, not the Widgets the person also left as is (`--profile` set both).
+    #[test]
+    fn the_way_back_for_one_group_left_as_is_runs_only_that_group() {
+        let mut off = Selection::none();
+        off.set(Setting::Dock, true);
+        off.set(Setting::Widgets, true);
+        let holds = Holds { off, ..Holds::NONE };
+        let words: Vec<OsString> = naming(Setting::Dock)
+            .split_whitespace()
+            .skip(2)
+            .map(OsString::from)
+            .collect();
+        let mut options = options(&words).unwrap();
+        options.station = options.only.clone();
+        let prepare = |_: &dyn System, _: &Ctx, _: Mode, reading: &Reading<'_>| {
+            let picked = picked(reading.picks, reading.only, &|| true, &holds, true);
+            let mut items: Vec<Box<dyn Item>> = Vec::new();
+            if picked.runs.contains(Setting::Dock) {
+                items.push(Listed::of("dock", "init.dock@alice", vec![change(), ok()]));
+            }
+            if picked.runs.contains(Setting::Widgets) {
+                items.push(Listed::of(
+                    "widgets",
+                    "consumer.widgets.test@alice",
+                    vec![change(), ok()],
+                ));
+            }
+            Ok((vec![(items, place(Class::Preference))], picked))
+        };
+        let sys = alice_with_checkout(501, None);
+        let (rows, _) = converge_held(&sys, &options, &prepare, &NoRecords, &|| true);
+        let changed: Vec<String> = rows
+            .unwrap()
+            .iter()
+            .filter(|row| row.outcome == Outcome::Changed)
+            .map(|row| row.id.clone())
+            .collect();
+        assert_eq!(
+            changed,
+            ["init.dock@alice"],
+            "`{}`, the Dock's way back, set more than the Dock",
+            naming(Setting::Dock)
+        );
+    }
+
+    /// Each Mac setting's way back ([`naming`]) names the items of its own System State row
+    /// and no other, as this build builds them: the preferences, the trackpad's two rows and
+    /// each sign-out.
+    #[test]
+    fn the_way_back_for_each_group_names_only_that_groups_items() {
+        let sys = alice_with_checkout(501, None);
+        let (ctx, _) = local_context(&sys).unwrap();
+        let mut items: Vec<(Setting, Box<dyn Item>)> =
+            crate::init_preferences::selected_tagged_items(&ctx, Selection::all()).unwrap();
+        items.extend(
+            crate::init_trackpad::items(&ctx)
+                .unwrap()
+                .into_iter()
+                .map(|item| (Setting::NaturalScrolling, item)),
+        );
+        items.extend(
+            crate::init_trackpad::behavior_items(&ctx)
+                .unwrap()
+                .into_iter()
+                .map(|item| (Setting::TrackpadScrolling, item)),
+        );
+        items.extend(crate::init_accounts::selected_tagged_items(&ctx, Selection::all()).unwrap());
+        for setting in Setting::ALL.into_iter().filter(|s| s.is_workstation()) {
+            let word = only_word(setting);
+            assert_eq!(naming(setting), format!("aterm init --only {word}"));
+            let named: Vec<(Setting, String)> = items
+                .iter()
+                .filter(|(_, item)| aterm_converge::selects(word, &item.id(), item.family(), None))
+                .map(|(each, item)| (*each, item.id()))
+                .collect();
+            let own = items.iter().filter(|(each, _)| *each == setting).count();
+            assert!(
+                named.len() == own && named.iter().all(|(each, _)| *each == setting),
+                "--only {word} names {named:?} for {setting:?}"
+            );
+        }
+    }
+
+    /// The line of the keys the person changed names each by the short name System State's
+    /// row shows ([`Setting::name`]), as the held line does.
+    #[test]
+    fn the_changed_by_you_line_names_rows_as_the_page_does() {
+        let rows = vec![
+            held_row("init.test.dock", "Dock", format!("a; {KEPT_BY_YOU}")),
+            held_row("init.test.caps", "Caps", format!("a; {KEPT_BY_YOU}")),
+        ];
+        let tags = vec![
+            ("init.test.dock".to_owned(), Setting::Dock),
+            ("init.test.caps".to_owned(), Setting::CapsLock),
+        ];
+        let lines = kept_lines(&rows, &tags);
+        let line = lines.first().expect("the changed-by-you line");
+        assert!(
+            line.contains("Caps Lock key, Dock.") && !line.contains("only aterm"),
+            "{line}"
+        );
+    }
+
+    /// The line of what a person does that the owed clone's record keeps stays on one line and
+    /// within what its reader reads whole, however long the row's words.
+    #[test]
+    fn the_owed_clones_person_line_stays_within_what_its_reader_reads() {
+        let long = format!("{}\nsecond line", "é".repeat(4000));
+        let line = person_line(&long);
+        assert!(line.len() <= PERSON_LINE_MAX, "{}", line.len());
+        assert!(!line.contains('\n') && line.ends_with('\u{2026}'));
+        assert_eq!(person_line("short"), "short");
+    }
+
+    /// A person who left GitHub repositories as is and then names them (`aterm init --clone`,
+    /// principle 4: naming a group is their choice too) is told the clone their run owes "runs by
+    /// itself once this Mac is let into the vault". The record their run leaves is stamped with
+    /// the hold they went past, so the vault's sync clones once the token lands, though System
+    /// State still holds the group.
+    #[test]
+    fn a_clone_the_person_named_is_not_forgotten_by_the_vaults_sync() {
+        use crate::sync::tests::owed_clone::{Hooked, alice};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mut left = Selection::none();
+        left.set(Setting::Repositories, true);
+        let holds = Holds {
+            off: left,
+            ..Holds::NONE
+        };
+        let named = Picks {
+            named: Choice {
+                clone: true,
+                ..Choice::NONE
+            },
+            left: Choice::NONE,
+        };
+        let picked = picked(named, &[], &|| true, &holds, true);
+        assert!(picked.runs.contains(Setting::Repositories), "{picked:?}");
+        // The run's GitHub step waits for this Mac to be let into the vault: owed.
+        let waiting = ItemReport {
+            stood_aside: Some(aterm_converge::StoodAside::Waiting(
+                "waiting to be let in".into(),
+            )),
+            ..held_row(
+                "init.github.native@alice",
+                "GitHub repositories",
+                "waits for init.secrets@alice: waiting to be let in".into(),
+            )
+        };
+        let waiting = ItemReport {
+            outcome: Outcome::Blocked,
+            ..waiting
+        };
+        assert_eq!(owe(waiting.clone()).why.as_deref(), Some(OWED));
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let state = scratch.path().to_path_buf();
+        note_owed(&[waiting], Action::Apply, Some(&state), &picked.start).unwrap();
+        // The vault's token lands; System State still holds the group, as it did.
+        let (sys, _) = alice();
+        let token = "/Users//alice/.secrets/gh_access_token";
+        sys.file(token, b"fixture_token_only").stat_of(
+            token,
+            Stat {
+                uid: 501,
+                gid: 20,
+                mode: 0o600,
+                dir: false,
+                symlink: false,
+                len: 18,
+            },
+        );
+        let cloned = AtomicBool::new(false);
+        let owed = || owed_clone(&sys, &state, &holds);
+        let clone = || {
+            cloned.store(true, Ordering::SeqCst);
+            Ok("cloned".to_owned())
+        };
+        let ports = Hooked {
+            inner: crate::sync::tests::Inert::new(&state),
+            held: &|| None,
+            owed: &owed,
+            clone: &clone,
+            forget: &|| forget_owed_clone(&state),
+        };
+        assert!(matches!(owed(), Ok(OwedClone::Due(_))), "{:?}", owed());
+        let _ = crate::sync::converge(
+            &ports,
+            crate::sync::Trigger::Subscriber,
+            Mode::Apply,
+            &mut |_| {},
+        );
+        assert!(
+            cloned.load(Ordering::SeqCst),
+            "the clone the person's own `aterm init --clone` owed was forgotten: {:?}",
+            owed()
         );
     }
 }

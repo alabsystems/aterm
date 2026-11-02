@@ -1,0 +1,26 @@
+# kimi 2.4.0 · MEASURED 2026-10-29, `aterm ctl text` of a private headless aterm (110x32, aterm 0.146.0) running the real Kimi Code, launched by path with a scratch `HOME` and `KIMI_CODE_HOME` whose `config.toml` names one `openai`-type provider at `http://127.0.0.1:<port>/v1` with a fake key (a local stub of the Chat Completions API, crates/aterm-lab), no login · `lab line one`, Shift-Enter (kitty keyboard CSI 13;2u), `lab line two`: a two-line draft, the second row indented under the caret's text, unsent
+
+ ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │                                                                                                          │
+ │  ▐█▛█▛█▌  Welcome to Kimi Code!                                                                          │
+ │  ▐█████▌  Send /help for help information.                                                               │
+ │                                                                                                          │
+ │  Directory: /private/tmp/at.H2aa/proj                                                                    │
+ │  Session:   session_d240495d-90d8-422b-bc70-82ea4e4c480f                                                 │
+ │  Model:     lab-model                                                                                    │
+ │  Version:   2.4.0                                                                                        │
+ │                                                                                                          │
+ ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+   No session yet — one will be created on your first message.
+
+ ❯ lab draft one
+
+ ● lab held reply, sent after 30 s
+
+ ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │ > lab line one                                                                                           │
+ │   lab line two                                                                                           │
+ ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ lab-model  …/tmp/at.H2aa/proj                                   /web: use the Web UI for a better experience
+                                                                                   context: 22% (20.6k/97.7k)

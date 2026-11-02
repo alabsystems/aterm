@@ -64,19 +64,24 @@ pub fn run(inputs: &Inputs) -> Result<Vec<String>, String> {
     ));
     let withheld = withheld_packages(inputs)?;
     let lock = inputs.export.join("Cargo.lock");
-    if !withheld.is_empty() && lock.is_file() {
-        let text =
-            std::fs::read_to_string(&lock).map_err(|e| format!("{}: {e}", lock.display()))?;
-        if let Some((pruned, gone)) = prune_lock(&text, &withheld)? {
-            std::fs::write(&lock, pruned).map_err(|e| format!("{}: {e}", lock.display()))?;
-            for package in gone {
-                said.push(format!("  lock-prune: {package}"));
+    if let Ok(meta) = std::fs::symlink_metadata(&lock) {
+        if !meta.file_type().is_file() {
+            return Err(format!("{}: not a regular file", lock.display()));
+        }
+        if !withheld.is_empty() {
+            let text =
+                std::fs::read_to_string(&lock).map_err(|e| format!("{}: {e}", lock.display()))?;
+            if let Some((pruned, gone)) = prune_lock(&text, &withheld)? {
+                std::fs::write(&lock, pruned).map_err(|e| format!("{}: {e}", lock.display()))?;
+                for package in gone {
+                    said.push(format!("  lock-prune: {package}"));
+                }
+                said.push(
+                    "== Cargo.lock: the packages the export withholds, and what only they reached, \
+                     were dropped"
+                        .into(),
+                );
             }
-            said.push(
-                "== Cargo.lock: the packages the export withholds, and what only they reached, \
-                 were dropped"
-                    .into(),
-            );
         }
     }
     for (manifest, kind, name) in strip_targets(&inputs.export)? {
@@ -129,8 +134,18 @@ fn astream(inputs: &Inputs) -> Result<(String, Vec<String>), String> {
             root.display()
         ));
     }
-    let dest = inputs.export.join("vendor/astream");
-    let _ = std::fs::remove_dir_all(&dest);
+    let vendor = inputs.export.join("vendor");
+    if std::fs::symlink_metadata(&vendor).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(format!("{}: refusing symbolic link", vendor.display()));
+    }
+    let dest = vendor.join("astream");
+    if let Ok(meta) = std::fs::symlink_metadata(&dest) {
+        if meta.file_type().is_dir() {
+            std::fs::remove_dir_all(&dest).map_err(|e| format!("{}: {e}", dest.display()))?;
+        } else {
+            std::fs::remove_file(&dest).map_err(|e| format!("{}: {e}", dest.display()))?;
+        }
+    }
     let _ = std::fs::remove_file(inputs.export.join(".gitmodules"));
     let crates = astream_closure(&inputs.export, &sub, &rev)
         .map_err(|e| format!("could not derive the astream crates the export depends on: {e}"))?;
@@ -174,16 +189,24 @@ fn astream(inputs: &Inputs) -> Result<(String, Vec<String>), String> {
         }
     }
     for (mode, blob, path) in &entries {
+        if !matches!(mode.as_str(), "100644" | "100755") {
+            return Err(format!(
+                "vendor/astream@{rev}: unsupported tree entry mode {mode} for {path}"
+            ));
+        }
+        let rel = Path::new(path);
+        if rel
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return Err(format!(
+                "vendor/astream@{rev}: invalid tree entry path {path}"
+            ));
+        }
         let bytes = git(&sub, &["cat-file", "blob", blob])?;
-        let target = dest.join(path);
+        let target = dest.join(rel);
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
-        }
-        if mode == "120000" {
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(String::from_utf8_lossy(&bytes).as_ref(), &target)
-                .map_err(|e| format!("{}: {e}", target.display()))?;
-            continue;
         }
         std::fs::write(&target, &bytes).map_err(|e| format!("{}: {e}", target.display()))?;
         #[cfg(unix)]
@@ -199,8 +222,19 @@ fn astream(inputs: &Inputs) -> Result<(String, Vec<String>), String> {
         .map_err(|e| format!("{}: {e}", root_manifest.display()))?;
     std::fs::write(&root_manifest, memberless_root(&text)?)
         .map_err(|e| format!("{}: {e}", root_manifest.display()))?;
-    std::fs::copy(root.join("LICENSE"), dest.join("LICENSE"))
-        .map_err(|e| format!("LICENSE: {e}"))?;
+    let license = git(
+        root,
+        &["cat-file", "blob", &format!("{}:LICENSE", inputs.captured)],
+    )
+    .or_else(|_| {
+        let path = root.join("LICENSE");
+        let meta = std::fs::symlink_metadata(&path).map_err(|e| format!("LICENSE: {e}"))?;
+        if !meta.file_type().is_file() {
+            return Err("LICENSE: not a regular file".into());
+        }
+        std::fs::read(&path).map_err(|e| format!("LICENSE: {e}"))
+    })?;
+    std::fs::write(dest.join("LICENSE"), license).map_err(|e| format!("LICENSE: {e}"))?;
     let named: Vec<String> = crates.iter().map(|c| format!("`{c}`")).collect();
     let readme = format!(
         "# vendor/astream\n\n\
@@ -484,7 +518,10 @@ fn withheld_packages(inputs: &Inputs) -> Result<std::collections::BTreeSet<Strin
     for path in listing.split(|b| *b == 0).filter(|p| !p.is_empty()) {
         let path = String::from_utf8_lossy(path);
         let is_manifest = path == "Cargo.toml" || path.ends_with("/Cargo.toml");
-        if !is_manifest || inputs.export.join(path.as_ref()).exists() {
+        if !is_manifest
+            || std::fs::symlink_metadata(inputs.export.join(path.as_ref()))
+                .is_ok_and(|m| m.file_type().is_file())
+        {
             continue;
         }
         let text = git(

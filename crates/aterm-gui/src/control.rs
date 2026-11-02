@@ -46,9 +46,14 @@ pub(crate) use control_query::{
     search_full_history_direction, search_full_history_point, set_search_max_lines,
 };
 
+#[path = "control_end.rs"]
+mod control_end;
+
 #[path = "control_input.rs"]
 mod control_input;
 use control_input::INPUT_QUEUE_FULL;
+#[cfg(all(test, unix))]
+pub(crate) use control_input::ask_signal_end;
 #[cfg(all(test, unix))]
 pub(crate) use control_input::cmd_key_guarded;
 pub(crate) use control_input::compile_guard;
@@ -76,6 +81,10 @@ use control_host::GuiHost;
 #[cfg(debug_assertions)]
 #[path = "control_redraw_conformance.rs"]
 pub(crate) mod control_redraw_conformance;
+
+#[cfg(all(unix, debug_assertions))]
+#[path = "native_host_fixture.rs"]
+pub(crate) mod native_host_fixture;
 
 #[path = "clipboard.rs"]
 mod clipboard;
@@ -383,6 +392,34 @@ fn sessionless_front_window_resize(
     )
 }
 
+/// The caller a bare `end` is served as with no terminal in front: an owner-class connection,
+/// which may end any row the view offers and needs no session to; an edge has no session to end
+/// its own rows from. `None` with a terminal in front or an explicit target, which keep the
+/// session's path.
+fn sessionless_front_end(
+    verb: &str,
+    selector: Option<&Selector>,
+    front_has_terminal: bool,
+    principal: NativeControlPrincipal,
+) -> Option<Result<control_end::Caller<'static>, &'static str>> {
+    if verb != "end" || front_has_terminal || !matches!(selector, None | Some(Selector::SelfTok)) {
+        return None;
+    }
+    Some(
+        match native_control_decision(false, true, principal, NativeControlTarget::App) {
+            NativeControlDecision::WithoutSession => Ok(control_end::Caller {
+                owner: true,
+                key: 0,
+                sid: "",
+            }),
+            NativeControlDecision::Denied => Err("ERR denied\n"),
+            NativeControlDecision::ResolveSession
+            | NativeControlDecision::NoActiveTerminal
+            | NativeControlDecision::NoSuchSession => Err("ERR invalid control target\n"),
+        },
+    )
+}
+
 enum AppAim {
     Front,
     Aimed(Target),
@@ -420,12 +457,6 @@ fn app_route(
         Resolution::Missing => Err("ERR no such session\n".to_string()),
         Resolution::Ambiguous(refusal) => Err(refusal),
     }
-}
-
-/// `open`'s words `rest` under `aim`: the session an `@<sid>` names is the one whose program
-/// asks for its Autopilot menu at its own cell ([`control_media::open_route`]).
-fn open_route(aim: &AppAim, rest: &str) -> control_media::OpenRoute {
-    control_media::open_route(aim.session(), rest)
 }
 
 /// What a connection is authorized to do, resolved at handshake.
@@ -533,6 +564,14 @@ fn argument_escalation(verb: &str, rest: &str) -> Option<Need> {
     use crate::menu::{InvokeAuthority, MenuAction};
     let (_, rest) = control_input::take_app_unread_ok(input_of(verb), rest);
     match verb {
+        "inspect"
+            if matches!(
+                aterm_types::app_inspection::parse_inspect(rest),
+                Ok(aterm_types::app_inspection::InspectRequest::Network)
+            ) =>
+        {
+            Some(Need::OwnerOnly)
+        }
         "invoke" => {
             let action = MenuAction::from_invoke_name(rest.trim())?;
             match action.invoke_authority() {
@@ -685,7 +724,7 @@ fn help_short_catalog() -> String {
          frames|drift or temporal status); empty content = no data, never an error\n\
          # --json on {json_verbs} = structured output · \"@<sid> <verb>\" = aim it at that session \
          (an app-level verb: its instance's front window; an @ that names nothing, as \"@$W\" with \
-         $W empty, is refused)\n\
+         $W empty, is refused; `aterm ctl` also takes a read's \"<verb> @<sid>\")\n\
          # help <verb> = the full entry · help --full = the complete catalog · help --json = the \
          catalog as JSON\n"
     );
@@ -734,6 +773,8 @@ fn help_full_catalog() -> String {
 # with it.
 # Cross-session: prefix a verb with "@<selector>" (@<sid>, @<n>, or @. for the active tab;
 # e.g. "@s-ab12 text"; `aterm ctl` also expands @self to the sid of the session it runs in).
+# `aterm ctl` also takes a read's selector, or the bare sid, right after its verb ("text
+# @s-ab12", "status s-ab12"; "read" is "text" there), as `aterm ctl --help` says.
 # `subscribe` takes its targets after the verb instead ("subscribe @s-ab12 screen"). An "@"
 # that names nothing (an empty $W in "@$W") is refused, never read as the active tab. Same
 # user only; `aterm ctl` reads the per-launch token itself. On an owner connection, a sid
@@ -766,6 +807,7 @@ fn help_full_catalog() -> String {
 #   open app markdown file:///abs/doc.md  read one bounded, local UTF-8 file
 #   open app editor file:///abs/doc.md    edit that file through a read/write grant
 #   inspect app/v1 tabs                   discover stable native view ids
+#   inspect app/v1 network                owner-only retained GUI network projection; no refresh
 #   inspect app/v1 view <id> text|controls|tree|audit
 #   act app/v1 view <id> <key> <action> [value]
 # A document is an absolute local file: URI (no remote host, no cloud-storage folder); the
@@ -2020,7 +2062,10 @@ impl ReplyWritten {
     /// TESTS ONLY.
     #[must_use]
     pub(crate) fn awaited_within(&self, within: std::time::Duration) -> bool {
-        let deadline = std::time::Instant::now() + within;
+        let now = std::time::Instant::now();
+        let deadline = now
+            .checked_add(within)
+            .unwrap_or_else(|| now + std::time::Duration::from_secs(86_400 * 365));
         let (latch, changed) = &*(self.0).0;
         let mut latch = latch
             .lock()
@@ -2981,7 +3026,10 @@ fn bind_control_listener_within(
         if !gate.wait_until_released(&AtomicBool::new(false)) {
             return None;
         }
-        let deadline = std::time::Instant::now() + handoff_wait;
+        let now = std::time::Instant::now();
+        let deadline = now
+            .checked_add(handoff_wait)
+            .unwrap_or_else(|| now + std::time::Duration::from_secs(86_400 * 365));
         if !parent_exited(deadline) {
             aterm_log::warn!(
                 "control socket {sock_path}: predecessor still alive after handoff Commit; \
@@ -3082,10 +3130,9 @@ fn bind_control_listener_within(
     let listener = bind_with_retry(
         plan,
         policy,
-        |path| CtlListener::bind(path),
+        |path| aterm_uds::kept_out(|| CtlListener::bind(path)),
         std::thread::sleep,
     )?;
-    let _ = aterm_uds::keep_out_of_children(&listener);
     Some(BoundControl::bound(listener, token, sock_path))
 }
 
@@ -3700,7 +3747,7 @@ fn dispatch_app_verb(
         "panes" => control_media::cmd_panes(proxy, aim.session()),
         "controls" => control_media::cmd_controls(proxy, rest),
         "inspect" => control_media::cmd_inspect(proxy, rest),
-        "open" => control_media::cmd_open(proxy, open_route(aim, rest)),
+        "open" => control_media::cmd_open(proxy, control_media::open_route(rest)),
         "edit" => crate::control_edit::cmd_edit(proxy, scope, aim.session(), rest),
         "doc" => crate::control_doc::cmd_doc(proxy, rest),
         "act" => control_media::cmd_act(proxy, rest),
@@ -4709,6 +4756,13 @@ fn dispatch_owner(
     let own_session = own_target.as_ref().map(|(session, _)| *session);
     let own_ctx = own_target.as_ref().map(|(_, ctx)| ctx.as_ref());
     match verb {
+        "accounts-renew" => {
+            let caller = crate::fabric::serving_driver().map_or_else(
+                || "local".to_owned(),
+                |driver| format!("fleet:{}", driver.node),
+            );
+            aterm_agent::harness::remote_renew::serve(&caller, rest)
+        }
         "topic" => dispatch_topic_verb(rest, selector, scope, store, own_session),
         "story" => dispatch_story_verb(rest, selector, scope, store, own_session, proxy),
         "sessions" => match rest.trim() {
@@ -4746,6 +4800,7 @@ fn dispatch_owner(
         }
         "flows" => control_session::cmd_flows(store, scope, rest),
         "raise" => control_session::cmd_raise(proxy, store, scope, rest),
+        "native-focus" => control_query::cmd_native_focus(proxy, rest),
         "appnotice" => control_query::cmd_appnotice(proxy, rest),
         "notice" => control_query::cmd_notice(proxy, rest),
         #[cfg(unix)]
@@ -4784,6 +4839,22 @@ fn dispatch_app(head: &Head<'_>, form: &Resolved, cx: &DispatchCx<'_>) -> Contro
         return refusal.into();
     }
     let active = resolve_active(cx.active);
+    {
+        let aimed = match &aim {
+            AppAim::Aimed((_, _, _, ctx)) => Some(ctx),
+            _ => None,
+        };
+        for ctx in active
+            .as_ref()
+            .map(|(_, _, _, ctx)| ctx)
+            .into_iter()
+            .chain(aimed)
+        {
+            if let Some(refusal) = scoped_app_input_refusal(ctx, class, verb, rest) {
+                return refusal.into();
+            }
+        }
+    }
     let (unread_ok, rest) = control_input::take_app_unread_ok(class, rest);
     let front = active.as_ref().map(|(_, _, front, _)| *front);
     if let Some(refusal) = crate::control_edit::hold::refusal(verb, rest, None, front) {
@@ -4890,6 +4961,17 @@ fn sessionless_front(head: &Head<'_>, cx: &DispatchCx<'_>) -> Option<ControlRepl
     } = *head;
     let selector = selector.as_ref();
     let principal = cx.scope.principal();
+    if let Some(caller) = sessionless_front_end(verb, selector, false, principal) {
+        return Some(
+            match caller {
+                Ok(caller) => control_end::cmd_end(&caller, rest, cx.proxy, cx.store, &|| {
+                    cx.scope.is_owner_class() && crate::fabric::any_hold_refusal(cx.store).is_none()
+                }),
+                Err(refusal) => refusal.to_owned(),
+            }
+            .into(),
+        );
+    }
     let route = match verb {
         "paste" => sessionless_front_paste_event(
             verb,
@@ -5344,7 +5426,10 @@ impl ControlReply {
         mut self,
         handoff_timeout: std::time::Duration,
     ) -> (Vec<u8>, Option<PendingHandoff>, Option<ReplyWritten>) {
-        let deadline = std::time::Instant::now() + handoff_timeout;
+        let now = std::time::Instant::now();
+        let deadline = now
+            .checked_add(handoff_timeout)
+            .unwrap_or_else(|| now + std::time::Duration::from_secs(86_400 * 365));
         let handoff = match self.retention.take() {
             None => None,
             Some(ReplyHandoff::WriteOnly(permit)) => Some(PendingHandoff::WriteOnly {
@@ -5442,7 +5527,7 @@ thread_local! {
         const { std::cell::Cell::new(None) };
     #[cfg(unix)]
     static SERVING_DIRECT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static CARRIED_FENCE: std::cell::RefCell<Option<String>> =
+    static CARRIED_FENCE: std::cell::RefCell<Option<crate::session_timeline::SupervisorInputDelivery>> =
         const { std::cell::RefCell::new(None) };
     static SERVING_PRINCIPAL: std::cell::Cell<Principal> =
         const { std::cell::Cell::new(Principal::Instance) };
@@ -5566,13 +5651,13 @@ impl Drop for ServingPrincipal {
 }
 
 struct CarriedFence {
-    outer: Option<String>,
+    outer: Option<crate::session_timeline::SupervisorInputDelivery>,
 }
 
 impl CarriedFence {
-    fn enter(holder: &str) -> Self {
+    fn enter(fence: crate::session_timeline::SupervisorInputDelivery) -> Self {
         Self {
-            outer: CARRIED_FENCE.with(|fence| fence.replace(Some(holder.to_string()))),
+            outer: CARRIED_FENCE.with(|carried| carried.replace(Some(fence))),
         }
     }
 }
@@ -5584,21 +5669,28 @@ impl Drop for CarriedFence {
     }
 }
 
-fn carried_fence() -> Option<String> {
+fn carried_fence() -> Option<crate::session_timeline::SupervisorInputDelivery> {
     CARRIED_FENCE.with(|fence| fence.borrow().clone())
 }
 
 fn under_fence<T>(
     ctx: &SessionCtx,
-    holder: Option<&str>,
+    fence: Option<&crate::session_timeline::SupervisorInputDelivery>,
     write: impl FnOnce() -> T,
 ) -> Result<T, String> {
-    let Some(holder) = holder else {
+    let Some(fence) = fence else {
         return Ok(write());
     };
-    let _counted =
-        crate::session_timeline::FencedWrite::enter(ctx, holder, crate::metrics::now_us())?;
-    let _carried = CarriedFence::enter(holder);
+    let _counted = match fence {
+        crate::session_timeline::SupervisorInputDelivery::Legacy(holder) => Some(
+            crate::session_timeline::FencedWrite::enter(ctx, holder, crate::metrics::now_us())?,
+        ),
+        crate::session_timeline::SupervisorInputDelivery::Scoped(_) => {
+            fence.check(ctx, crate::metrics::now_us())?;
+            None
+        }
+    };
+    let _carried = CarriedFence::enter(fence.clone());
     Ok(write())
 }
 
@@ -5608,15 +5700,81 @@ fn under_fence<T>(
 /// `Err(None)` for any other outcome, which may have written part of it.
 fn turn_write(
     ctx: &SessionCtx,
-    if_supervisor: Option<&str>,
+    fence: Option<&crate::session_timeline::SupervisorInputDelivery>,
     deliver: impl FnOnce() -> Result<InputOutcome, String>,
 ) -> Result<(), Option<String>> {
-    match under_fence(ctx, if_supervisor, deliver) {
+    match under_fence(ctx, fence, deliver) {
         Ok(Ok(InputOutcome::Ok)) => Ok(()),
         Ok(Ok(InputOutcome::QueueFull)) => Err(Some(INPUT_QUEUE_FULL.to_string())),
         Ok(_) => Err(None),
         Err(fence) => Err(Some(fence)),
     }
+}
+
+/// The private harness and kernel/connection-recognized scoped claimants cannot fall back to
+/// the ordinary operator adapter. Instance/edge/bridge/fleet credentials otherwise keep their
+/// existing authority; `as=person` and typed-by attribution are never evidence for an override.
+fn scoped_untyped_input_refusal(ctx: &SessionCtx, now_us: u64) -> Option<String> {
+    // Read the kernel outside MetaLock. A historical pid alone does not identify an actor:
+    // a different observed birth is an independent actor, but an unreadable birth on a
+    // known scoped PID is uncertainty and cannot recover the untyped operator adapter.
+    let peer_pid = serving_peer_pid();
+    let peer_start = peer_pid.and_then(aterm_agent::harness::restart_stamp::kernel_start);
+    let peer = peer_pid.map(|pid| crate::session_timeline::SupervisorInputPeer {
+        pid,
+        start: peer_start.as_deref(),
+    });
+    ctx.meta
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .scoped_input_required(serving_principal(), serving_connection(), peer, now_us)
+        .then(|| crate::session_timeline::SCOPED_INPUT_DENIED.to_string())
+}
+
+fn scoped_app_input_refusal(
+    ctx: &SessionCtx,
+    class: Input,
+    verb: &str,
+    rest: &str,
+) -> Option<String> {
+    let (_, body) = control_input::take_app_unread_ok(class, rest);
+    crate::input_stall::writes_input(class, verb, body.as_bytes())
+        .then(|| scoped_untyped_input_refusal(ctx, crate::metrics::now_us()))
+        .flatten()
+}
+
+fn supervisor_input_fence(
+    ctx: &SessionCtx,
+    master: i32,
+    request: Option<crate::session_timeline::SupervisorInputRequest>,
+    legacy: Option<&str>,
+) -> Result<Option<crate::session_timeline::SupervisorInputFence>, String> {
+    use crate::session_timeline::{SupervisorInputCaller, SupervisorInputFence};
+    // This exists only while the native handler internally dispatches its retained, exact
+    // continuation. No control word constructs it or converts a native duty to typing scope.
+    if crate::native_act::carried_custody(ctx).is_some() {
+        return if request.is_none() && legacy.is_none() {
+            Ok(None)
+        } else {
+            Err("ERR native continuation has no typing fence\n".into())
+        };
+    }
+    let Some(request) = request else {
+        if let Some(refusal) = scoped_untyped_input_refusal(ctx, crate::metrics::now_us()) {
+            return Err(refusal);
+        }
+        return Ok(legacy.map(|holder| SupervisorInputFence::Legacy(holder.to_string())));
+    };
+    let principal = serving_principal();
+    let caller = SupervisorInputCaller {
+        principal,
+        connection: serving_connection(),
+        peer: serving_peer_pid(),
+        proof: (principal != Principal::Harness)
+            .then(|| prove_self_claim_for(ctx, &request.holder, master))
+            .flatten(),
+    };
+    SupervisorInputFence::authorize(ctx, request, &caller, crate::metrics::now_us()).map(Some)
 }
 
 /// Marks the connection this lane serves as a DIRECT local one until dropped ([`SERVING_DIRECT`]).
@@ -5639,38 +5797,42 @@ impl Drop for DirectPeer {
 
 /// A set's PROOF: codex-alab's self-claim ([`crate::self_claim`]), or a rostered harness's
 /// contract 3 claim ([`crate::harness_claim`]) by its row's image rule.
-pub(crate) fn prove_self_claim(holder: &str, master: i32) -> Option<crate::self_claim::Proven> {
-    if let Some((row, _)) = aterm_agent::harness::contract::holder(holder) {
-        return prove_harness_claim_by(holder, master, &|pid| {
-            crate::harness_claim::runs_harness_build(row, pid)
-        });
+pub(crate) fn prove_self_claim_for(
+    ctx: &SessionCtx,
+    holder: &str,
+    master: i32,
+) -> Option<crate::self_claim::Proven> {
+    prove_claim_with_policy(&ctx.native_policy, holder, master)
+}
+
+fn prove_claim_with_policy(
+    policy: &crate::native_session_policy::SessionPolicy,
+    holder: &str,
+    master: i32,
+) -> Option<crate::self_claim::Proven> {
+    if let Some((row, pid)) = policy.holder(holder) {
+        let peer = serving_peer_pid();
+        let foreground = crate::quit_safety::foreground_pgrp(master);
+        let named = peer == Some(pid) && i64::from(foreground) == i64::from(pid);
+        if !named {
+            return None;
+        }
+        let before = aterm_agent::harness::restart_stamp::kernel_start(pid)?;
+        let proven = crate::harness_claim::prove_in(
+            policy.rows(),
+            holder,
+            crate::self_claim::Facts {
+                peer,
+                foreground,
+                alab_image: policy.actor_image(row, pid),
+            },
+        )?;
+        return (proven.start == before).then_some(proven);
     }
     prove_self_claim_by(holder, master, &crate::self_claim::runs_alab_build)
 }
 
-/// A rostered harness's contract 3 PROOF ([`crate::harness_claim::prove`]): the kernel facts read
-/// as for a self-claim, the image fact read by `image` once the peer and the foreground facts
-/// hold.
-pub(crate) fn prove_harness_claim_by(
-    holder: &str,
-    master: i32,
-    image: &dyn Fn(u32) -> bool,
-) -> Option<crate::self_claim::Proven> {
-    let (_, pid) = aterm_agent::harness::contract::holder(holder)?;
-    let peer = serving_peer_pid();
-    let foreground = crate::quit_safety::foreground_pgrp(master);
-    let named = peer == Some(pid) && i64::from(foreground) == i64::from(pid);
-    crate::harness_claim::prove(
-        holder,
-        crate::self_claim::Facts {
-            peer,
-            foreground,
-            alab_image: named && image(pid),
-        },
-    )
-}
-
-/// [`prove_self_claim`] with the image fact read by `alab_image`, which is asked only once the peer and the foreground facts hold.
+/// [`prove_self_claim_for`] with the image fact read by `alab_image`, which is asked only once the peer and the foreground facts hold.
 pub(crate) fn prove_self_claim_by(
     holder: &str,
     master: i32,
@@ -5932,9 +6094,11 @@ fn release_connection_claims(store: &Store, proxy: Option<&EventLoopProxy<Wake>>
     let now = crate::metrics::now_us();
     for handle in handles {
         control_session::release_connection_lease(&handle.ctx, conn);
+        crate::native_act::connection_closed(&handle.ctx, conn);
         let by = aterm_slog::Actor::Aterm;
         let released =
-            crate::session_timeline::release_supervisor(&handle.ctx, Some(conn), now, by);
+            crate::session_timeline::publish_release_supervisor(&handle.ctx, Some(conn), now, by)
+                .published();
         if !(crate::session_timeline::close_claim_connection(&handle.ctx, conn, now) || released) {
             continue;
         }
@@ -6134,6 +6298,7 @@ struct DriveAct {
     verb: &'static str,
     sid: Option<SessionId>,
     hold: Option<HoldAsk>,
+    shell: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6171,8 +6336,9 @@ fn drive_admission(
                 .by_sid(sid)
                 .is_some()
         };
-        let spawned = |sid: &SessionId| drive_spawned_by(sid).as_deref() == Some(&*driver.node);
-        return match drive_gate(request.line(), &hosts, &spawned) {
+        let spawned = |sid: &SessionId| drive_may_close(store, sid, &driver.node);
+        let shell = |sid: &SessionId| drive_owns_shell(store, sid, &driver.node);
+        return match drive_gate(request.line(), &hosts, &spawned, &shell) {
             Ok(DriveLine::Fleet) => Ok((request, scope, None)),
             Ok(DriveLine::Answer(reply)) => Err(reply),
             Ok(DriveLine::Act { line, mut write }) => {
@@ -6205,15 +6371,18 @@ fn drive_admission(
 }
 
 #[cfg(any(unix, test))]
-const DRIVE_CLOSE_REFUSED: &str = "a drive closes only a worker it spawned since the driven \
-                                   Mac's aterm started (an update or a restart forgets which; \
-                                   the person at the driven Mac closes it)";
+const DRIVE_CLOSE_REFUSED: &str = "a drive closes only its own worker or untouched plain shell \
+                                 from this aterm process";
+
+#[cfg(any(unix, test))]
+const DRIVE_SHELL_REFUSED: &str = "this read needs the same driver's untouched plain shell";
 
 #[cfg(any(unix, test))]
 fn drive_gate(
     line: &str,
     hosts: &dyn Fn(&SessionId) -> bool,
     spawned: &dyn Fn(&SessionId) -> bool,
+    shell: &dyn Fn(&SessionId) -> bool,
 ) -> Result<DriveLine, String> {
     const SID: &str = "a drive names a session the driven Mac hosts by its sid (`survey --host` \
                        lists them)";
@@ -6240,6 +6409,7 @@ fn drive_gate(
             verb,
             sid,
             hold: None,
+            shell: false,
         }),
     };
     let read = || DriveLine::Act {
@@ -6249,6 +6419,13 @@ fn drive_gate(
     match selector {
         None => match verb {
             "survey" | "version" => Ok(DriveLine::Fleet),
+            "accounts-renew" => {
+                use aterm_agent::harness::remote_renew::Request as RenewalRequest;
+                match RenewalRequest::parse(rest)? {
+                    RenewalRequest::Start(_) => Ok(act("accounts-renew", None)),
+                    RenewalRequest::Poll(_) => Ok(read()),
+                }
+            }
             "hold" => {
                 let mut words = rest.split_whitespace();
                 let (Some(sid), Some(way @ ("on" | "off"))) = (words.next(), words.next()) else {
@@ -6266,6 +6443,7 @@ fn drive_gate(
                     write: Some(DriveAct {
                         verb: "hold",
                         sid: Some(sid),
+                        shell: false,
                         hold: Some(HoldAsk {
                             on: way == "on",
                             held: false,
@@ -6274,12 +6452,14 @@ fn drive_gate(
                 })
             }
             "spawn" => drive_spawn(line, rest, &hosts).map(|line| DriveLine::Act {
-                line,
                 write: Some(DriveAct {
+                    shell: !control_media::split_quoted_tokens(rest)
+                        .is_some_and(|tokens| tokens.iter().any(|t| t.starts_with("agent="))),
                     verb: "spawn",
                     sid: None,
                     hold: None,
                 }),
+                line,
             }),
             "await" => {
                 let Some(words) = await_task_list(rest) else {
@@ -6302,7 +6482,7 @@ fn drive_gate(
                 Ok(read())
             }
             _ => Err(format!(
-                "a drive serves survey, version, hold, spawn agent=<word> and await task, \
+                "a drive serves survey, version, hold, spawn cwd=<absolute>|agent=<word> and await task, \
                  and @<sid> status|text|screen|result|inbox|post|turn|key|send|close; not `{}`",
                 verb.chars().take(32).collect::<String>()
             )),
@@ -6314,6 +6494,11 @@ fn drive_gate(
             };
             match verb {
                 "status" | "text" | "screen" | "result" | "inbox" => Ok(read()),
+                "blocks" | "blocktext" | "await" if shell(&sid) => {
+                    drive_shell_read(verb, rest)?;
+                    Ok(act("shell-read", Some(sid)))
+                }
+                "blocks" | "blocktext" | "await" => Err(DRIVE_SHELL_REFUSED.to_owned()),
                 "post" => Ok(act("post", Some(sid))),
                 "turn" => drive_turn(rest).map(|()| act("turn", Some(sid))),
                 "key" => Ok(act("key", Some(sid))),
@@ -6354,12 +6539,35 @@ fn drive_spawn(
 ) -> Result<String, String> {
     let usage = || {
         format!(
-            "a drive spawns only a worker: spawn agent=<{}> [model=<m>] [cwd=<absolute>] \
+            "a drive's worker form is spawn agent=<{}> [model=<m>] [cwd=<absolute>] \
              [from=<sid>] [raise=false] - < task",
             aterm_agent::harness::worker::started_words()
         )
     };
     let tokens = control_media::split_quoted_tokens(rest).ok_or_else(usage)?;
+    if !tokens.iter().any(|token| token.starts_with("agent=")) {
+        let mut cwd = None;
+        let mut raise = false;
+        for token in &tokens {
+            match token.split_once('=') {
+                Some(("cwd", value))
+                    if std::path::Path::new(value).is_absolute() && cwd.is_none() =>
+                {
+                    cwd = Some(value);
+                }
+                Some(("raise", "false")) if !raise => raise = true,
+                _ => return Err("a plain fleet shell is spawn cwd=/absolute [raise=false]; no task, command or other options".to_owned()),
+            }
+        }
+        if cwd.is_none() {
+            return Err("a plain fleet shell requires cwd=/absolute".to_owned());
+        }
+        return Ok(if raise {
+            line.to_owned()
+        } else {
+            format!("{} raise=false", line.trim_end_matches('\r'))
+        });
+    }
     let (mut agent, mut framed, mut raise) = (false, false, false);
     for token in &tokens {
         let (key, value) = token.split_once('=').ok_or_else(usage)?;
@@ -6402,6 +6610,40 @@ fn drive_spawn(
     })
 }
 
+/// The only extra history reads a drive gets are bounded reads of its own plain shell.
+#[cfg(any(unix, test))]
+fn drive_shell_read(verb: &str, rest: &str) -> Result<(), String> {
+    let words: Vec<_> = rest.split_whitespace().collect();
+    let number = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let valid = match (verb, words.as_slice()) {
+        ("blocks", [] | ["--json"]) => true,
+        ("blocks", [n] | [n, "--json"]) => number(n) && n.parse::<usize>().is_ok(),
+        ("blocktext", [id] | [id, "trim"]) => number(id) && id.parse::<u64>().is_ok(),
+        ("await", ["idle", idle, timeout]) => {
+            number(idle)
+                && idle
+                    .parse::<u64>()
+                    .is_ok_and(|ms| ms <= aterm_types::control_verbs::DRIVE_TURN_MAX_MS)
+                && shell_wait_timeout(timeout)
+        }
+        ("await", ["block", timeout]) => shell_wait_timeout(timeout),
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err("owned shell reads: blocks [n] [--json], blocktext <id> [trim], await idle <0..22000>|block timeout=<0..22000>".to_owned())
+    }
+}
+
+#[cfg(any(unix, test))]
+fn shell_wait_timeout(word: &str) -> bool {
+    word.strip_prefix("timeout=")
+        .filter(|value| !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|ms| ms <= aterm_types::control_verbs::DRIVE_TURN_MAX_MS)
+}
+
 #[cfg(any(unix, test))]
 fn remote_held_by(store: &Store, sid: &SessionId, node: &str) -> bool {
     store
@@ -6419,19 +6661,128 @@ fn remote_held_by(store: &Store, sid: &SessionId, node: &str) -> bool {
 }
 
 #[cfg(any(unix, test))]
-static DRIVE_SPAWNED: Mutex<VecDeque<(SessionId, String)>> = Mutex::new(VecDeque::new());
+static DRIVE_SPAWNED: Mutex<VecDeque<DrivenSpawn>> = Mutex::new(VecDeque::new());
+
+#[cfg(any(unix, test))]
+struct DrivenSpawn {
+    sid: SessionId,
+    node: String,
+    shell: bool,
+}
 
 #[cfg(any(unix, test))]
 const DRIVE_SPAWNED_MAX: usize = 256;
 
-#[cfg(any(unix, test))]
+#[cfg(test)]
 fn drive_spawned_by(sid: &SessionId) -> Option<String> {
     DRIVE_SPAWNED
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .iter()
-        .find(|(spawned, _)| spawned == sid)
-        .map(|(_, node)| node.clone())
+        .find(|spawned| &spawned.sid == sid)
+        .map(|spawned| spawned.node.clone())
+}
+
+#[cfg(any(unix, test))]
+fn drive_owns_shell(store: &Store, sid: &SessionId, node: &str) -> bool {
+    let owned = DRIVE_SPAWNED
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .any(|spawned| &spawned.sid == sid && spawned.node == node && spawned.shell);
+    owned && shell_untouched(store, sid)
+}
+
+#[cfg(any(unix, test))]
+fn shell_untouched(store: &Store, sid: &SessionId) -> bool {
+    store
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .by_sid(sid)
+        .is_some_and(|h| h.ctx.human_input.seq() == 0 && h.ctx.fabric.holds().person().is_none())
+}
+
+#[cfg(any(unix, test))]
+fn drive_may_close(store: &Store, sid: &SessionId, node: &str) -> bool {
+    let owned = DRIVE_SPAWNED
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .find(|spawned| &spawned.sid == sid && spawned.node == node)
+        .map(|spawned| spawned.shell);
+    owned.is_some_and(|shell| !shell || shell_untouched(store, sid))
+}
+
+#[cfg(any(unix, test))]
+fn drive_read_still_owned(act: &DriveAct, store: &Store) -> bool {
+    act.verb != "shell-read"
+        || act.sid.as_ref().is_some_and(|sid| {
+            crate::fabric::serving_driver()
+                .is_some_and(|driver| drive_owns_shell(store, sid, &driver.node))
+        })
+}
+
+/// Publish ownership at landing, before another main-thread event can adopt the plain shell.
+pub(crate) fn record_driven_shell(store: &Store, sid: &str, node: &str) -> bool {
+    #[cfg(any(unix, test))]
+    {
+        let sid = SessionId::new(sid);
+        if !shell_untouched(store, &sid) {
+            return false;
+        }
+        remember_driven_spawn(sid, node.to_owned(), true);
+        true
+    }
+    #[cfg(not(any(unix, test)))]
+    {
+        let _ = (store, sid, node);
+        false
+    }
+}
+
+#[cfg(any(unix, test))]
+fn remember_driven_spawn(sid: SessionId, node: String, shell: bool) {
+    let mut spawned = DRIVE_SPAWNED.lock().unwrap_or_else(|p| p.into_inner());
+    if spawned.len() >= DRIVE_SPAWNED_MAX {
+        spawned.pop_front();
+    }
+    spawned.push_back(DrivenSpawn { sid, node, shell });
+}
+
+/// Recheck on the event loop, after the control thread's admission and before any close.
+pub(crate) fn drive_close_admission(store: &Store, local: u64, node: &str) -> Option<bool> {
+    #[cfg(any(unix, test))]
+    {
+        let sid = store
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .by_local(local)
+            .map(|h| h.sid.clone());
+        let sid = sid?;
+        let shell = DRIVE_SPAWNED
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .find(|spawned| spawned.sid == sid && spawned.node == node)
+            .map(|spawned| spawned.shell)?;
+        (!shell || shell_untouched(store, &sid)).then_some(shell)
+    }
+    #[cfg(not(any(unix, test)))]
+    {
+        let _ = (store, local, node);
+        None
+    }
+}
+
+/// A person taking over a plain shell permanently ends that driver's extended authority.
+pub(crate) fn forget_driven_shell(sid: &SessionId) {
+    #[cfg(any(unix, test))]
+    DRIVE_SPAWNED
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retain(|spawned| &spawned.sid != sid || !spawned.shell);
+    #[cfg(not(any(unix, test)))]
+    let _ = sid;
 }
 
 #[cfg(any(unix, test))]
@@ -6447,6 +6798,7 @@ fn drive_record(act: &DriveAct, reply: &str, holds_now: bool) -> Option<&'static
         ("hold", Some(HoldAsk { on: false, held })) if ok && held && !holds_now => {
             Some("handed back (hold off)")
         }
+        ("spawn", _) if ok && act.shell => Some("opened a plain shell in"),
         ("spawn", _) if ok => Some("started a worker in"),
         ("close", _) if ok => Some("closed"),
         _ => None,
@@ -6473,12 +6825,10 @@ fn note_drive_act(act: &DriveAct, reply: &str, store: &Store) {
                 .nth(1)
                 .filter(|sid| sid.starts_with("s-"))
                 .map(SessionId::new);
-            if let Some(worker) = &worker {
-                let mut spawned = DRIVE_SPAWNED.lock().unwrap_or_else(|p| p.into_inner());
-                if spawned.len() >= DRIVE_SPAWNED_MAX {
-                    spawned.pop_front();
-                }
-                spawned.push_back((worker.clone(), driver.node.clone()));
+            if let Some(worker) = &worker
+                && !act.shell
+            {
+                remember_driven_spawn(worker.clone(), driver.node.clone(), false);
             }
             worker
         }
@@ -6487,7 +6837,7 @@ fn note_drive_act(act: &DriveAct, reply: &str, store: &Store) {
                 DRIVE_SPAWNED
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
-                    .retain(|(spawned, _)| spawned != sid);
+                    .retain(|spawned| &spawned.sid != sid);
             }
             act.sid.clone()
         }
@@ -6614,6 +6964,10 @@ fn serve_request_line(
     );
     #[cfg(any(unix, test))]
     if let Some(act) = &driven {
+        if !drive_read_still_owned(act, store) {
+            out.push_owned(format!("ERR denied: {DRIVE_SHELL_REFUSED}\n").into_bytes());
+            return None;
+        }
         note_drive_act(act, &resp.body, store);
     }
     #[cfg(not(any(unix, test)))]
@@ -6905,7 +7259,15 @@ mod final_reply_tests {
             drop(guard);
             assert!(!replies.owed(), "{line:?} delivered");
         }
-        for line in ["text", "turn hi", "close", "tab close", "ls", "keys"] {
+        for line in [
+            "text",
+            "turn hi",
+            "close",
+            "tab close",
+            "ls",
+            "keys",
+            "native-focus",
+        ] {
             assert!(replies.enter(line).is_none(), "{line:?}");
         }
         assert!(!replies.owed());
@@ -6918,6 +7280,10 @@ mod final_reply_tests {
         assert!(
             replies.enter("text").is_none(),
             "a read takes no input admission"
+        );
+        assert!(
+            replies.enter("native-focus").is_none(),
+            "native focus remains readable under the exclusive input fence"
         );
         let elsewhere = other.enter("send hi").expect("another registry stays open");
         drop(elsewhere);
@@ -7409,7 +7775,7 @@ fn parse_frame_header(rest: &str, keyed: bool) -> FeedBinFrame<'_> {
         },
         Some(_) => return FeedBinFrame::Malformed,
     };
-    if it.next().is_some() {
+    if it.next().is_some() || len_tok.is_empty() || !len_tok.bytes().all(|b| b.is_ascii_digit()) {
         return FeedBinFrame::Malformed;
     }
     let Ok(n) = len_tok.parse::<usize>() else {
@@ -7711,6 +8077,12 @@ where
         }
     };
 
+    if let Some(refusal) = scoped_untyped_input_refusal(&ctx, crate::metrics::now_us()) {
+        let _ = writer.write_all(refusal.as_bytes());
+        let _ = writer.flush();
+        return true;
+    }
+
     if let Some(refusal) = crate::pty_idem::empty_payload_refusal(idem_key, payload.is_empty()) {
         let _ = writer.write_all(refusal.as_bytes());
         let _ = writer.flush();
@@ -7960,19 +8332,28 @@ pub(crate) fn run_subscribe_with_peer_probe<W: Write, L: subscribe::PeerLiveness
     let mut log_base: Option<u32> = None;
     let mut non_coalesced = false;
     for tok in it {
-        let parse_u64 = |v: &str| v.parse::<u64>().ok();
+        let parse_u64 = |v: &str| {
+            (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| v.parse::<u64>().ok())
+                .flatten()
+        };
+        let parse_u32 = |v: &str| {
+            (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| v.parse::<u32>().ok())
+                .flatten()
+        };
         if let Some(v) = tok.strip_prefix("since-log=") {
             match parse_u64(v) {
                 Some(n) => since_log = Some(n),
                 None => return write_err(writer, b"ERR bad since-log\n"),
             }
         } else if let Some(v) = tok.strip_prefix("log-ep=") {
-            match v.parse::<u32>().ok() {
+            match parse_u32(v) {
                 Some(n) => log_ep = Some(n),
                 None => return write_err(writer, b"ERR bad log-ep\n"),
             }
         } else if let Some(v) = tok.strip_prefix("log-base=") {
-            match v.parse::<u32>().ok() {
+            match parse_u32(v) {
                 Some(n) => log_base = Some(n),
                 None => return write_err(writer, b"ERR bad log-base\n"),
             }
@@ -8625,9 +9006,16 @@ fn parse_scroll_intent(rest: &str) -> Result<ScrollIntent, String> {
         "down" => ScrollIntent::Down,
         "prev-prompt" => ScrollIntent::PrevPrompt,
         "next-prompt" => ScrollIntent::NextPrompt,
-        n => ScrollIntent::By(n.parse::<i32>().map_err(|_| {
-            "ERR usage: scroll <up|down|top|bottom|prev-prompt|next-prompt|N>\n".to_string()
-        })?),
+        n => {
+            let s = n.strip_prefix('-').unwrap_or(n);
+            let d = (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| n.parse::<i32>().ok())
+                .flatten()
+                .ok_or_else(|| {
+                    "ERR usage: scroll <up|down|top|bottom|prev-prompt|next-prompt|N>\n".to_string()
+                })?;
+            ScrollIntent::By(d)
+        }
     })
 }
 
@@ -8961,6 +9349,23 @@ fn serve_session_verb(
         ..
     } = *cx;
     let is_cross = !matches!(selector, None | Some(Selector::SelfTok));
+    let widened = match selector
+        .is_none()
+        .then(|| crate::sys_host::untargeted_left(verb, rest, scope.is_owner_class()))
+    {
+        Some(Err(())) => {
+            log_denial(
+                AUDIT_SUBSYSTEM,
+                "untargeted sys left",
+                aterm_containment::mode_or_containment(),
+                "a sys left that names no session reads every session's rows",
+            );
+            return "ERR denied\n".to_string();
+        }
+        Some(Ok(widened)) => widened,
+        None => None,
+    };
+    let rest = widened.as_deref().unwrap_or(rest);
     let (term, master, session, self_ctx) = (&target.0, target.1, target.2, &target.3);
     let ctx: &SessionCtx = self_ctx;
     let class = form.row.input_class();
@@ -9018,6 +9423,48 @@ fn serve_session_verb(
     }
     let host = GuiHost::with_fleet(session, term, Some(proxy), store, ctx);
 
+    if verb == "native-observe" {
+        return crate::native_act::serve_observation(self_ctx, master, rest);
+    }
+    if verb == "native-act" {
+        if matches!(
+            rest.split_ascii_whitespace().next(),
+            Some("prepare" | "recover" | "attach")
+        ) {
+            // Native channel custody also needs EOF publication when Recover deliberately
+            // binds a connection that owns no supervisor claim or ordinary driver lease.
+            note_connection_claim();
+        }
+        let reply = crate::native_act::serve(self_ctx, master, rest, &mut |turn| {
+            let Some(form) = aterm_types::control_verbs::spec_for("turn", turn) else {
+                return "ERR native continuation unavailable\n".into();
+            };
+            let nested = Head {
+                selector,
+                verb: "turn",
+                rest: turn,
+            };
+            serve_session_verb(
+                &nested,
+                &form,
+                target,
+                front_active_session,
+                cx,
+                reply_retention,
+            )
+        });
+        if rest.split_ascii_whitespace().next() == Some("commit") && reply.starts_with("OK ") {
+            crate::self_claim::meta_changed(ctx);
+            let _ = proxy.send_event(Wake::MetaChanged { session });
+        }
+        return reply;
+    }
+    if matches!(verb, "signal" | "restart")
+        && let Some(refusal) = crate::native_act::untyped_refusal(ctx)
+    {
+        return refusal;
+    }
+
     // Resolve and authorize the target before routing this owner-only operation.
     // It shares the panel's operation and must not enter the generic sys reader.
     if verb == "sys" && rest.split_whitespace().next() == Some("policy") {
@@ -9056,6 +9503,7 @@ fn serve_session_verb(
     }
 
     let (leading, rest) = control_input::take_leading_options(class, rest);
+    let supervisor_request = leading.supervisor_request();
     let idem_key = leading.idem;
     let as_person = leading.as_person;
     let if_supervisor = leading.if_supervisor.as_deref();
@@ -9110,23 +9558,45 @@ fn serve_session_verb(
     {
         return refusal;
     }
-    let _fenced = match if_supervisor {
-        Some(holder) if verb == "turn" => {
-            if let Some(refusal) =
-                crate::session_timeline::supervisor_fence(ctx, holder, crate::metrics::now_us())
+    let supervisor_fence = if class.contains(Input::WRITES) {
+        match supervisor_input_fence(ctx, master, supervisor_request, if_supervisor) {
+            Ok(fence) => fence.map(|fence| {
+                crate::session_timeline::SupervisorInputDelivery::new(self_ctx, fence)
+            }),
+            Err(refusal) => return refusal,
+        }
+    } else {
+        None
+    };
+    let _fenced = match supervisor_fence.as_ref() {
+        Some(crate::session_timeline::SupervisorInputDelivery::Legacy(holder))
+            if verb != "turn" =>
+        {
+            match crate::session_timeline::FencedWrite::enter(ctx, holder, crate::metrics::now_us())
             {
+                Ok(counted) => Some(counted),
+                Err(refusal) => return refusal,
+            }
+        }
+        Some(fence) => {
+            if let Err(refusal) = fence.check(ctx, crate::metrics::now_us()) {
                 return refusal;
             }
             None
         }
-        Some(holder) => {
-            match crate::session_timeline::FencedWrite::enter(ctx, holder, crate::metrics::now_us())
-            {
-                Ok(counted) => Some((counted, CarriedFence::enter(holder))),
-                Err(refusal) => return refusal,
-            }
-        }
         None => None,
+    };
+    let _carried = supervisor_fence
+        .as_ref()
+        .map(|fence| CarriedFence::enter(fence.clone()));
+    let _producer = supervisor_fence.as_ref().and_then(|fence| fence.producer());
+    let route = if supervisor_fence
+        .as_ref()
+        .is_some_and(|fence| fence.is_scoped())
+    {
+        InputRoute::Seam { pin: Some(session) }
+    } else {
+        route
     };
     let input_mark = crate::session_log::InputVerb::of(verb)
         .filter(|v| *v != crate::session_log::InputVerb::Turn)
@@ -9142,6 +9612,7 @@ fn serve_session_verb(
             .within_epoch(input_log_epoch)
             .acting(leading.act)
             .typed_by(ctx, serving_caller(scope, ctx))
+            .supervised(supervisor_fence.as_ref().and_then(|fence| fence.batch()))
         });
     let completion = || input_mark.as_ref().map(|mark| mark.completion());
     let log_wake = || ctx.watchers.ring_watchers();
@@ -9230,10 +9701,11 @@ fn serve_session_verb(
                 true,
             )
             .within_epoch(input_log_epoch)
-            .typed_by(ctx, serving_caller(scope, ctx));
+            .typed_by(ctx, serving_caller(scope, ctx))
+            .supervised(supervisor_fence.as_ref().and_then(|fence| fence.batch()));
             let refused = std::cell::RefCell::new(None);
             let applied = |ev: InputEvent| {
-                let wrote = turn_write(ctx, if_supervisor, || {
+                let wrote = turn_write(ctx, supervisor_fence.as_ref(), || {
                     deliver(route, class, front, term, ctx, ev, Some(mark.completion()))
                 });
                 let delivered = wrote.is_ok();
@@ -9324,8 +9796,46 @@ fn serve_session_verb(
             }
             Err(error) => error.to_string(),
         },
-        "signal" => control_input::signal_verb(master, rest, ctx),
-        "restart" => control_input::restart_verb(master, rest, self_ctx),
+        "signal" => {
+            control_input::signal_verb(master, rest, ctx, control_session::log_actor(scope, ctx))
+        }
+        "end" => {
+            let caller = control_end::Caller {
+                owner: scope.is_owner_class(),
+                key: session,
+                sid: ctx.self_id.as_str(),
+            };
+            let authorized = || {
+                let current = store
+                    .read()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .by_local(session)
+                    .cloned();
+                current.is_some_and(|current| {
+                    current.sid == ctx.self_id
+                        && current.nonce == ctx.nonce
+                        && Arc::ptr_eq(&current.ctx, self_ctx)
+                        && scope_holds_op(scope, Op::Signal, &current.ctx)
+                        && crate::fabric::hold_refusal(&current.ctx).is_none()
+                })
+            };
+            let reply = control_end::cmd_end(&caller, rest, proxy, store, &authorized);
+            if reply.starts_with("ERR denied") {
+                log_denial(
+                    AUDIT_SUBSYSTEM,
+                    &format!("end -> {}", ctx.self_id.as_str()),
+                    aterm_containment::mode_or_containment(),
+                    "an edge ends only its own session's rows",
+                );
+            }
+            reply
+        }
+        "restart" => control_input::restart_verb(
+            master,
+            rest,
+            self_ctx,
+            control_session::log_actor(scope, ctx),
+        ),
         "reset" => {
             let reply = crate::manual_reset::cmd_reset(session, term, ctx, rest);
             if ctx
@@ -9455,7 +9965,7 @@ fn serve_session_verb(
         "meta" => serve_meta_wired(
             rest,
             term,
-            &|holder: &str| prove_self_claim(holder, master),
+            &|holder: &str| prove_self_claim_for(ctx, holder, master),
             session,
             ctx,
             store,
@@ -9503,6 +10013,12 @@ fn serve_session_verb(
             })
         }
         "harness" => crate::harness_policy_verb::cmd(rest, scope.is_owner_class(), || {
+            if let Some(config) = ctx.native_policy.config() {
+                // Installed only by the explicit display-free private-host Rust factory.
+                return Ok(crate::harness_policy_verb::configured_facts(
+                    ctx, config, 1, true, true, false,
+                ));
+            }
             control_media::call_main(proxy, |tx| Wake::ReadHarnessPolicy { session, reply: tx })
                 .map_err(|e| e.to_string())
                 .and_then(|facts| facts)
@@ -9593,6 +10109,19 @@ fn post_input_reply_to_observed(
     mark: Option<crate::control_input_ack::InputMark>,
 ) -> Result<InputOutcome, String> {
     let fence = carried_fence();
+    if fence.as_ref().is_some_and(|fence| fence.is_scoped()) && mark.is_none() {
+        return Err(crate::session_timeline::SCOPED_INPUT_DENIED.to_string());
+    }
+    let mark = mark.map(|mark| {
+        mark.supervised(fence.as_ref().and_then(|fence| fence.batch()))
+            .pending_supervisor()
+    });
+    if mark
+        .as_ref()
+        .is_some_and(|mark| !mark.supervisor_queue_ready())
+    {
+        return Err(crate::session_timeline::SCOPED_INPUT_DENIED.to_string());
+    }
     control_media::call_main(proxy, |tx| Wake::Input {
         batch,
         mark,
@@ -9671,7 +10200,7 @@ pub(crate) fn meta_line_for_test(
     serve_meta(
         rest,
         term,
-        &|holder: &str| prove_self_claim(holder, -1),
+        &|holder: &str| prove_self_claim_for(ctx, holder, -1),
         session,
         ctx,
         store,
@@ -9691,7 +10220,7 @@ pub(crate) fn meta_wakes_for_test(
     conn: Option<u64>,
 ) -> (String, Vec<Wake>) {
     meta_wakes_proving_for_test(store, term, session, ctx, rest, conn, &|holder: &str| {
-        prove_self_claim(holder, -1)
+        prove_self_claim_for(ctx, holder, -1)
     })
 }
 

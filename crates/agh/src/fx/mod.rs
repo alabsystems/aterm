@@ -4,6 +4,7 @@
 //! THE effect seam (design §21.2).
 
 pub mod canon;
+pub mod child;
 #[cfg(any(test, debug_assertions))]
 mod sim;
 pub mod tape;
@@ -19,6 +20,7 @@ use astream_effects::{
 };
 
 use crate::error::{Error, Replay, Result, Sub};
+use crate::policy::{Decision, RouteRequest};
 use crate::redact::Redactor;
 use crate::wire::{Endpoints, Transport, WireError, WireRequest, WireResponse};
 
@@ -30,6 +32,19 @@ pub const DOOR_SLEEP: &str = "sleep";
 pub const DOOR_STDOUT: &str = "stdout";
 /// The exit's door: an emit of the exit code in decimal.
 pub const DOOR_EXIT: &str = "exit";
+/// A routing decision's door (design §21.3): an exchange, the decision's inputs out and the
+/// decision back, so a credentialed tape replays with no agh.toml and no token.
+pub const DOOR_ROUTE: &str = "route";
+/// The write journal's door: an emit of each record's body (design §6.8).
+pub const DOOR_JOURNAL: &str = "journal";
+/// The fabric's door: an emit of each post's request line (design §21.5).
+pub const DOOR_FABRIC: &str = "fabric";
+/// The git runner's door: an exchange, the run's canonical command out and its exit,
+/// stdout and stderr back.
+pub const DOOR_GIT: &str = "git";
+/// A child's door (`gh auth token`): never taped. `auth import` is a Provision verb, and
+/// tapes refuse those.
+pub const DOOR_CHILD: &str = "child";
 
 /// Which world the doors reach.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,6 +153,14 @@ fn stream_not_taped() -> Error {
         "a streamed answer is not taped: M1's tapes hold whole answers alone",
     )
     .with_next("run it without --record or --replay: a tape never holds a streamed answer")
+}
+
+fn child_not_taped() -> Error {
+    Error::replay(
+        Replay::StreamNotTaped,
+        "a child process is not taped: the verbs that run one provision, and tapes refuse those",
+    )
+    .with_next("run it without --record or --replay: a tape never runs a child")
 }
 
 fn ended(d: &ReplayDivergence, len: usize) -> Error {
@@ -656,10 +679,188 @@ impl Fx {
             _ => Vec::new(),
         }
     }
+
+    /// A routing decision. Live and simulated: `decide()`. Recording a `mode credentialed`
+    /// tape: `decide()`, taped as an exchange at `DOOR_ROUTE` (`canon::route_request`,
+    /// `canon::route_reply`). Replaying one: the tape's decision for the same inputs, and
+    /// `decide` is never called; another input is `replay.request`. Rerecording: as
+    /// replaying, taped again. Under a `mode anonymous` tape, in every mode: `decide()`,
+    /// untaped, over the empty router M1's tapes run with, so every M1 tape replays unchanged.
+    ///
+    /// # Errors
+    ///
+    /// A replay's divergence, latched.
+    pub(crate) fn route(
+        &self,
+        req: &RouteRequest,
+        decide: &mut dyn FnMut() -> Decision,
+    ) -> Result<Decision> {
+        let _ = req;
+        Ok(decide())
+    }
+
+    /// One journal record's body. Live and simulated: `Ok(None)`, and the journal writes its
+    /// file. Under any tape: an emit at `DOOR_JOURNAL`, compared on replay as stdout is, and
+    /// `Ok(Some(step))` from the tape's own counter of journal emits, from 0.
+    ///
+    /// # Errors
+    ///
+    /// A replay's divergence, latched.
+    pub(crate) fn emit_journal(&self, body: &[u8]) -> Result<Option<u64>> {
+        let _ = body;
+        match &self.seam {
+            Seam::Live(_) => Ok(None),
+            #[cfg(any(test, debug_assertions))]
+            Seam::Simulated(_) => Ok(None),
+            Seam::Recording { .. } | Seam::Replaying { .. } | Seam::Rerecording { .. } => {
+                Err(Error::not_yet("the journal door's tape arms", "WP10"))
+            }
+        }
+    }
+
+    /// One fabric post. Live and simulated: `send()`, its answer returned. Under any tape: an
+    /// emit at `DOOR_FABRIC` of `line`, compared on replay; `send` is never called, and the
+    /// answer is `Posted::Skipped("taped")`.
+    ///
+    /// # Errors
+    ///
+    /// A replay's divergence, latched.
+    pub(crate) fn emit_fabric(
+        &self,
+        line: &str,
+        send: &mut dyn FnMut() -> crate::notify::Posted,
+    ) -> Result<crate::notify::Posted> {
+        let _ = line;
+        match &self.seam {
+            Seam::Live(_) => Ok(send()),
+            #[cfg(any(test, debug_assertions))]
+            Seam::Simulated(_) => Ok(send()),
+            Seam::Recording { .. } | Seam::Replaying { .. } | Seam::Rerecording { .. } => {
+                Err(Error::not_yet("the fabric door's tape arms", "WP10"))
+            }
+        }
+    }
+
+    /// One child process (`gh auth token`). Live: `child::run(spec)`. Simulated: first the
+    /// live arm's refusal of a relative program (`child::check`, so a run the live seam would
+    /// refuse fails its simulated test too), then the next scripted child, whose program and
+    /// args must equal `spec`'s (a mismatch panics in the test that scripted it); an empty
+    /// scripted queue is could_not_run, why `{program} could not start: no scripted child`, as
+    /// a missing program is live. Under any tape: `Replay::StreamNotTaped`, before anything
+    /// runs.
+    ///
+    /// # Errors
+    ///
+    /// As above; the run's could_not_run.
+    pub(crate) fn child(&self, spec: &child::ChildSpec) -> Result<child::ChildOut> {
+        match &self.seam {
+            Seam::Live(_) => child::run(spec),
+            #[cfg(any(test, debug_assertions))]
+            Seam::Simulated(clock) => {
+                child::check(spec)?;
+                clock.log(spec);
+                let Some(scripted) = clock.next_child() else {
+                    return Err(Error::could_not_run(format!(
+                        "{} could not start: no scripted child",
+                        spec.program.display()
+                    ))
+                    .with_sub(Sub::Local));
+                };
+                let args: Vec<String> = spec
+                    .args
+                    .iter()
+                    .map(|arg| arg.to_string_lossy().into_owned())
+                    .collect();
+                assert_eq!(
+                    (&scripted.program, &scripted.args),
+                    (&spec.program, &args),
+                    "the scripted child is not the one this run asked for"
+                );
+                Ok(scripted.out)
+            }
+            Seam::Recording { .. } | Seam::Replaying { .. } | Seam::Rerecording { .. } => {
+                self.latched()?;
+                Err(self.latch(child_not_taped()))
+            }
+        }
+    }
+
+    /// One git run (`Github::run_git`). Live and simulated: `child::run(spec)`, the real
+    /// `git` (a simulated test runs the host's git against agh-fake or a local repository;
+    /// simulated, `child::check` passes before the spec is logged, as in `child`).
+    /// Recording: run, and taped as an exchange at `DOOR_GIT` (`canon::git_request`,
+    /// `canon::git_reply`). Replaying: the tape's answer, and nothing runs. Rerecording: as
+    /// replaying, taped again.
+    ///
+    /// # Errors
+    ///
+    /// A replay's divergence, latched; the run's could_not_run.
+    pub(crate) fn git(&self, spec: &child::ChildSpec, canonical: &[u8]) -> Result<child::ChildOut> {
+        let _ = canonical;
+        match &self.seam {
+            Seam::Live(_) => child::run(spec),
+            #[cfg(any(test, debug_assertions))]
+            Seam::Simulated(clock) => {
+                child::check(spec)?;
+                clock.log(spec);
+                child::run(spec)
+            }
+            Seam::Recording { .. } | Seam::Replaying { .. } | Seam::Rerecording { .. } => {
+                Err(Error::not_yet("the git door's tape arms", "WP10"))
+            }
+        }
+    }
+
+    /// Tests: the same simulated `Fx`, answering `child` from `children` in order.
+    ///
+    /// # Panics
+    ///
+    /// When the `Fx` is not simulated: a live `Fx` would run the real child (the host's
+    /// `gh auth token`) in place of the scripted one, and a taped one answers every child
+    /// `Replay::StreamNotTaped` and latches. A test built either way fails here, before it
+    /// reads a real credential or poisons a tape.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn with_children(self, children: Vec<child::ScriptedChild>) -> Fx {
+        let Seam::Simulated(clock) = &self.seam else {
+            panic!(
+                "Fx::with_children scripts only a simulated Fx, not {:?}",
+                self.mode()
+            );
+        };
+        clock.script(children);
+        self
+    }
+
+    /// Tests: every spec `child` or `git` accepted (one `child::check` passed) under a simulated
+    /// `Fx`, in call order, so a test of the git runner reads the environment and directories
+    /// its children got.
+    /// Empty in every other mode.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn children_run(&self) -> Vec<child::ChildSpec> {
+        match &self.seam {
+            Seam::Simulated(clock) => clock.children_run(),
+            _ => Vec::new(),
+        }
+    }
 }
 
 impl std::fmt::Debug for Fx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Fx({:?})", self.mode())
     }
+}
+
+/// Names the frozen crate-private doors whose first callers later packages write (WP3's
+/// route, WP4's journal, WP7's git, WP8's child, WP9's fabric), so the plain library's
+/// `dead_code` lint passes at every commit until then (plan §1, rule 14). It runs nothing
+/// and nothing calls it. No package edits it after WP0c; WP14 deletes it.
+#[doc(hidden)]
+pub fn frozen_roots() {
+    let _ = Fx::route;
+    let _ = Fx::emit_journal;
+    let _ = Fx::emit_fabric;
+    let _ = Fx::child;
+    let _ = Fx::git;
 }

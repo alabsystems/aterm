@@ -178,6 +178,8 @@ pub enum Verb {
     Fabric,
     /// `aterm ship` — the release tool (publishing; source checkouts only).
     Ship,
+    /// `aterm release` — explicit owned release-capability evidence.
+    Release,
     /// `aterm update` — the headless update lane (`status`, `check`, `identity`; on Linux also
     /// `enable`, `apply`, `rollback`).
     Update,
@@ -229,6 +231,7 @@ impl Verb {
         Verb::Link,
         Verb::Fabric,
         Verb::Ship,
+        Verb::Release,
         Verb::Update,
         Verb::Agents,
         Verb::Ai,
@@ -261,6 +264,7 @@ impl Verb {
             Verb::Link => "link",
             Verb::Fabric => "fabric",
             Verb::Ship => "ship",
+            Verb::Release => "release",
             Verb::Update => "update",
             Verb::Agents => "agents",
             Verb::Ai => "ai",
@@ -297,6 +301,7 @@ impl Verb {
             | Verb::Link
             | Verb::Fabric
             | Verb::Ship
+            | Verb::Release
             | Verb::Update
             | Verb::Agents
             | Verb::Ai
@@ -327,6 +332,7 @@ impl Verb {
             Verb::Link => "aterm link <args>",
             Verb::Fabric => "aterm fabric [<cmd>]",
             Verb::Ship => "aterm ship <args>",
+            Verb::Release => "aterm release probe <run|status|resume|cleanup> <options>",
             Verb::Update => "aterm update [<cmd>]",
             Verb::Agents => "aterm agents [<cmd>]",
             Verb::Ai => "aterm ai [<cmd>]",
@@ -401,6 +407,12 @@ impl Verb {
                 "Publish aterm: provision a signing machine, cut",
                 "and release a build. Needs a source checkout.",
             ],
+            Verb::Release => &[
+                "Prove an owned scratch binary can be signed,",
+                "accepted by Apple and uploaded as a GitHub draft",
+                "asset, then remove only its owned remote objects.",
+                "Explicit nonce and private evidence path required.",
+            ],
             Verb::Update => &[
                 "Report or check for an update, or print this",
                 "build's identity (status | check | identity;",
@@ -440,8 +452,9 @@ impl Verb {
             Verb::Members => &[
                 "Macs joining ALab: a new Mac asks every member",
                 "(join), a person presses Allow on any one and",
-                "types the phrase it shows (requests | allow |",
-                "invite | ignore | join | status). Unix only.",
+                "types the phrase it shows; any member removes",
+                "(requests | allow | invite | ignore | list |",
+                "remove | undo | join | status). Unix only.",
             ],
             Verb::Db => &[
                 "Encrypted embedded application databases, local",
@@ -494,9 +507,25 @@ impl Verb {
         }
     }
 
-    /// Resolve an `argv[1]` operand to a verb.
+    /// The other words this verb answers to as `argv[1]`, which help does not list: the
+    /// `acaffeine` spelling of aCaffiene. Its old name, `caffeine`, is none: the front door
+    /// answers it before the verb table (`aterm_acaffiene::legacy`).
+    #[must_use]
+    pub const fn operand_aliases(self) -> &'static [&'static str] {
+        if matches!(self, Verb::Acaffiene) {
+            &["acaffeine"]
+        } else {
+            &[]
+        }
+    }
+
+    /// Resolve an `argv[1]` operand to a verb: its name, or one of its
+    /// [`Verb::operand_aliases`].
     pub fn from_operand(operand: &str) -> Option<Verb> {
-        Verb::ALL.iter().copied().find(|v| v.name() == operand)
+        Verb::ALL
+            .iter()
+            .copied()
+            .find(|v| v.name() == operand || v.operand_aliases().contains(&operand))
     }
 }
 
@@ -734,18 +763,50 @@ fn explain_config_report() -> String {
 }
 
 fn config_path_paragraph() -> String {
-    let path = match aterm_types::dirs::aterm_config_path() {
+    let split = atpkg::config_split::of_process();
+    let home = aterm_types::dirs::home_dir();
+    config_path_paragraph_with(
+        aterm_types::dirs::aterm_config_path().as_deref(),
+        split.as_ref().zip(home.as_deref()),
+    )
+}
+
+/// The `aterm.toml:` paragraph for `path`, and, when the app opened from Finder reads another
+/// file (`split`, under its home), where each reads and how to make them one
+/// ([`atpkg::config_split`]).
+fn config_path_paragraph_with(
+    path: Option<&std::path::Path>,
+    split: Option<(&atpkg::config_split::Split, &std::path::Path)>,
+) -> String {
+    let path = match path {
         Some(path) => path.display().to_string(),
         #[cfg(windows)]
         None => "(unresolved: XDG_CONFIG_HOME, APPDATA and HOME are all unset)".to_string(),
         #[cfg(not(windows))]
         None => "(unresolved: XDG_CONFIG_HOME and HOME are unset)".to_string(),
     };
-    format!(
+    let mut out = format!(
         "aterm.toml: {path}\n\
          \x20 (need not exist; a command-line flag beats it, it beats the default;\n\
-         \x20 `aterm help config` has the keys)\n\n"
-    )
+         \x20 `aterm help config` has the keys)\n"
+    );
+    if let Some((split, home)) = split {
+        let mut line = String::from("  Not the app's:");
+        for word in split.said(home).split(' ') {
+            if line.len() + 1 + word.len() > 88 {
+                out.push_str(&line);
+                out.push('\n');
+                line = format!("  {word}");
+            } else {
+                line.push(' ');
+                line.push_str(word);
+            }
+        }
+        out.push_str(&line);
+        out.push_str(".\n");
+    }
+    out.push('\n');
+    out
 }
 
 /// The Windows paragraph of `explain-config`: the starter-file command and
@@ -1033,11 +1094,23 @@ fn exceptions_report(all: bool) -> String {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
-    let offset = local_offset_s(i64::try_from(now_ms / 1000).unwrap_or(i64::MAX));
-    exceptions_report_at(&path, all, now_ms, offset)
+    let fallback = local_offset_s(i64::try_from(now_ms / 1000).unwrap_or(i64::MAX));
+    exceptions_report_at_local(&path, all, now_ms, &|unix_s| {
+        Some(local_offset_at(unix_s).unwrap_or(fallback))
+    })
 }
 
+#[cfg(test)]
 fn exceptions_report_at(path: &std::path::Path, all: bool, now_ms: u64, offset_s: i64) -> String {
+    exceptions_report_at_local(path, all, now_ms, &|_| Some(offset_s))
+}
+
+fn exceptions_report_at_local(
+    path: &std::path::Path,
+    all: bool,
+    now_ms: u64,
+    offset_at: &dyn Fn(i64) -> Option<i64>,
+) -> String {
     let read = read_exceptions_log(path);
     if let Some(unreadable) = &read.unreadable {
         return format!("exceptions: {}\n", unreadable.why());
@@ -1050,7 +1123,7 @@ fn exceptions_report_at(path: &std::path::Path, all: bool, now_ms: u64, offset_s
     } else {
         aterm_messages::ReportScope::Latest
     };
-    let lines = aterm_messages::exceptions_report(&read.log, scope, offset_s, now_ms);
+    let lines = aterm_messages::exceptions_report_local(&read.log, scope, offset_at, now_ms);
     let mut out = format!("exceptions in {}\n", path.display());
     for line in &lines {
         out.push_str(line);
@@ -1495,13 +1568,19 @@ struct FactReads<'a> {
     instances: &'a (dyn Fn() -> Result<aterm_ctl::census::Census, String> + Sync),
     /// [`fabric_fact`], given why every program's command line goes unread.
     fabric: &'a (dyn Fn(Option<&str>) -> FabricFact + Sync),
+    /// [`awake_fact`].
+    awake: &'a (dyn Fn() -> Option<aterm_acaffiene::held::Held> + Sync),
+    /// The `end=` token the leftover view offers a pid ([`offered_token_live`]), asked only of an
+    /// unsupervised broker ([`aterm_ctl::census::supervise`]).
+    offered: &'a (dyn Fn(u32) -> Option<String> + Sync),
     /// [`person_here`]: a hand-over may follow the report.
     person_here: &'a (dyn Fn() -> bool + Sync),
 }
 
-/// The fabric's row as [`fabric_fact`] reads it: its mark, its fact, and whether it went
-/// unmeasured.
-type FabricFact = Option<(Mark, String, bool)>;
+/// The fabric's row as [`fabric_fact`] reads it: its mark, its fact, whether it went
+/// unmeasured, and who it found serving the fabric's socket
+/// ([`aterm_link::fabric::DoctorSummary::serving`]).
+type FabricFact = Option<(Mark, String, bool, Option<Option<u32>>)>;
 
 impl FactReads<'static> {
     const LIVE: Self = Self {
@@ -1513,6 +1592,8 @@ impl FactReads<'static> {
         debugger: &debugger_facts,
         instances: &instances_fact,
         fabric: &fabric_fact,
+        awake: &awake_fact,
+        offered: &offered_token_live,
         person_here: &person_here,
     };
 }
@@ -1611,6 +1692,7 @@ fn facts_rows_over(fix: bool, reads: &dyn Fn(&str) -> bool, ports: &FactReads<'_
             })
         });
         let fabric = reads("fabric:").then(|| scope.spawn(move || (ports.fabric)(withheld)));
+        let awake = reads("awake:").then(|| scope.spawn(ports.awake));
         let recovery = if reads("recovery:") {
             recovery_facts()
         } else {
@@ -1624,6 +1706,7 @@ fn facts_rows_over(fix: bool, reads: &dyn Fn(&str) -> bool, ports: &FactReads<'_
         let machine = MachineFacts {
             console_host: reads("conpty:").then(console_host_fact).flatten(),
             fabric: fabric.and_then(join),
+            awake: awake.and_then(join),
             spotlight: spotlight.and_then(join),
             services: services.and_then(join),
             shim_cache: reads("services:").then(shim_cache_fact).flatten(),
@@ -1638,7 +1721,13 @@ fn facts_rows_over(fix: bool, reads: &dyn Fn(&str) -> bool, ports: &FactReads<'_
             || DebuggerFacts::not_measured(DebuggerProbeLabel::UnsupportedPlatform),
             join,
         );
-        let instances = instances.map_or_else(unread, join);
+        let mut instances = instances.map_or_else(unread, join);
+        if let (Ok(census), Some(serving)) = (
+            instances.as_mut(),
+            machine.fabric.as_ref().and_then(|(.., serving)| *serving),
+        ) {
+            aterm_ctl::census::supervise(census, serving, ports.offered);
+        }
         let (devtools, devtools_due) =
             devtools.map_or_else(|| (DevtoolsFacts::absent(), None), join);
         let fda_due =
@@ -1722,7 +1811,7 @@ struct MachineFacts {
     /// Windows: the console host a new window's tab gets ([`console_host_fact`]).
     console_host: Option<aterm_pty::ConsoleHostReport>,
     /// Unix: the fabric's broker in one row ([`fabric_fact`]).
-    fabric: Option<(Mark, String, bool)>,
+    fabric: FabricFact,
     /// macOS: what Spotlight indexes of Rust build output and rustup's docs
     /// ([`spotlight::facts`]).
     spotlight: Option<Result<spotlight::Spotlit, String>>,
@@ -1733,6 +1822,8 @@ struct MachineFacts {
     services: Option<Result<aterm_uds::services::Reading, String>>,
     /// macOS: the cache root plain `targo` builds in ([`shim_cache_fact`]).
     shim_cache: Option<std::path::PathBuf>,
+    /// macOS: whether aCaffiene keeps this Mac awake now ([`awake_fact`]).
+    awake: Option<aterm_acaffiene::held::Held>,
 }
 
 impl MachineFacts {
@@ -1741,6 +1832,7 @@ impl MachineFacts {
             copies: None,
             console_host: None,
             fabric: None,
+            awake: None,
             spotlight: None,
             program_check: None,
             services: None,
@@ -1749,9 +1841,126 @@ impl MachineFacts {
     }
 }
 
+/// macOS: whether aCaffiene keeps this Mac awake now, as macOS lists its assertion
+/// ([`aterm_acaffiene::held::held`]); `None` elsewhere.
+fn awake_fact() -> Option<aterm_acaffiene::held::Held> {
+    cfg!(target_os = "macos").then(aterm_acaffiene::held::held)
+}
+
+/// The `awake:` row: whether the mug holds the assertion that keeps this Mac from idle sleep,
+/// read from the power manager, not off the saved mode.
+fn awake_rows(facts: &MachineFacts) -> Vec<DoctorRow> {
+    use aterm_acaffiene::held::Held;
+    let because = |why: &Option<String>| {
+        why.as_ref()
+            .map_or_else(String::new, |why| format!(" ({why})"))
+    };
+    let Some(held) = &facts.awake else {
+        return Vec::new();
+    };
+    let (mark, fact, unmeasured) = match held {
+        Held::NotHere(why) => (Mark::Note, format!("not read: {why}"), true),
+        Held::Off => (
+            Mark::Note,
+            "aCaffiene is off by your choice; `aterm acaffiene on` keeps this Mac awake".to_owned(),
+            false,
+        ),
+        Held::Held { pid } => (
+            Mark::Ok,
+            format!("aCaffiene (pid {pid}) holds macOS's idle-sleep assertion"),
+            false,
+        ),
+        Held::NotHeld { pid, why } => (
+            Mark::Warn,
+            format!(
+                "aCaffiene (pid {pid}) runs, but macOS lists no idle-sleep assertion of it{}; it \
+                 asks again every minute",
+                because(why)
+            ),
+            false,
+        ),
+        Held::Stopped { why } => (
+            Mark::Warn,
+            format!(
+                "no aCaffiene mug runs, so this Mac may idle-sleep{}; `aterm acaffiene start` \
+                 starts it",
+                because(why)
+            ),
+            false,
+        ),
+        Held::Unread { pid, why } => (
+            Mark::Note,
+            format!(
+                "aCaffiene (pid {pid}) runs; whether macOS holds its assertion is unread: {why}"
+            ),
+            true,
+        ),
+    };
+    vec![DoctorRow {
+        label: "awake:",
+        mark,
+        fact,
+        unmeasured,
+    }]
+}
+
 /// The window census ([`aterm_ctl::census::window_census`]) through the front door.
 fn instances_fact() -> Result<aterm_ctl::census::Census, String> {
     aterm_ctl::census::window_census(FRONT_DOOR)
+}
+
+/// The `end=` token `aterm ctl sys left` would offer `pid` now: its facts read once on fresh
+/// state ([`aterm_uds::left::read_one`], over this boot's verify run records in this user's
+/// rendezvous, W-writer read with no socket connect), judged by [`offered_token`].
+fn offered_token_live(pid: u32) -> Option<String> {
+    use aterm_uds::runs::Kernel as _;
+    let dir = aterm_uds::control_socket_dir();
+    let records = dir
+        .as_deref()
+        .map(|dir| {
+            aterm_uds::runs::records_dir(dir, aterm_uds::process::pid_namespace().as_deref())
+        })
+        .and_then(|records| aterm_uds::runs::read_records(&records).ok())
+        .unwrap_or_default();
+    let boot = aterm_uds::process::boot_id();
+    let me = std::process::id();
+    let known = aterm_uds::left::Known {
+        self_pid: me,
+        now_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+        boot: boot.as_deref(),
+        records: &records,
+        held: &[],
+        waiting: &[],
+        shells: &[],
+    };
+    let kernel = aterm_uds::left::Live {
+        writer: |pid| {
+            aterm_uds::control_socket_dir().is_some_and(|dir| aterm_ctl::graph_writer(&dir, pid))
+        },
+    };
+    let facts = aterm_uds::left::read_one(&kernel, pid, &known)?;
+    offered_token(&facts, kernel.launchd_version(), me)
+}
+
+/// The token the leftover view's judge offers for `facts` ([`aterm_vitals::left::judge`]),
+/// judged as a reading that knows no tab: only a run's witness (W-group or W-run with C-tree, of
+/// a dead run) or W-writer can offer one, and nothing tied by a name. `None` for every other row.
+fn offered_token(
+    facts: &aterm_vitals::left::Facts,
+    launchd: Option<i32>,
+    me: u32,
+) -> Option<String> {
+    let spared = [me];
+    let ctx = aterm_vitals::left::Ctx {
+        launchd,
+        live: &[],
+        closed: &[],
+        spared: &spared,
+        tellers: &[],
+    };
+    aterm_vitals::left::judge(facts, &ctx)?.token
 }
 
 fn program_check_fact() -> Option<aterm_uds::program_check::Look> {
@@ -1949,11 +2158,16 @@ fn program_check_rows(facts: &MachineFacts) -> Vec<DoctorRow> {
     }]
 }
 
-fn fabric_fact(withheld: Option<&str>) -> Option<(Mark, String, bool)> {
+fn fabric_fact(withheld: Option<&str>) -> FabricFact {
     #[cfg(unix)]
     {
         let summary = aterm_link::fabric::doctor_summary(withheld);
-        Some((fabric_mark(summary.level), summary.text, summary.unmeasured))
+        Some((
+            fabric_mark(summary.level),
+            summary.text,
+            summary.unmeasured,
+            summary.serving,
+        ))
     }
     #[cfg(not(unix))]
     {
@@ -1976,7 +2190,7 @@ fn fabric_rows(facts: &MachineFacts) -> Vec<DoctorRow> {
     facts
         .fabric
         .as_ref()
-        .map(|(mark, fact, unmeasured)| DoctorRow {
+        .map(|(mark, fact, unmeasured, _)| DoctorRow {
             label: "fabric:",
             mark: *mark,
             fact: fact.clone(),
@@ -2105,6 +2319,7 @@ fn permissions_hand_over_live(missing: &Missing) {
             );
             list.listing == aterm_containment::DevToolListing::On
         },
+        held_programs: &aterm_uds::process::held_programs,
         refresh_verdict: &dt::refresh_verdict,
         window_responsible: &window_responsible,
         open_fda_pane: &open_fda_pane,
@@ -2403,7 +2618,10 @@ fn fda_open_here(reach: &DevtoolsReach<'_>) -> String {
 fn open_fda_pane() -> Result<(), String> {
     let mut command = aterm_uds::spawnfd::command("/usr/bin/open");
     command.arg(aterm_machines::items::person::PANE_FULL_DISK_ACCESS);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let now = std::time::Instant::now();
+    let deadline = now
+        .checked_add(std::time::Duration::from_secs(10))
+        .unwrap_or_else(|| now + std::time::Duration::from_secs(365 * 86_400));
     match aterm_uds::deadline::output_until(&mut command, deadline) {
         Ok(out) if out.status.success() => Ok(()),
         Ok(out) => Err(format!(
@@ -2429,7 +2647,10 @@ const FDA_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 /// `true` once it reads on.
 fn await_fda_on() -> bool {
     let entered = enter_pressed();
-    let until = std::time::Instant::now() + DEVTOOLS_WAIT;
+    let now = std::time::Instant::now();
+    let until = now
+        .checked_add(DEVTOOLS_WAIT)
+        .unwrap_or_else(|| now + std::time::Duration::from_secs(365 * 86_400));
     loop {
         if aterm_containment::probe_fda(ProbeGate::on()).state == FdaState::Granted {
             return true;
@@ -2569,10 +2790,13 @@ struct DevtoolsReach<'a> {
     /// Wait up to [`DEVTOOLS_WAIT`] for aterm's switch, or until Enter: `true` once it
     /// reads on.
     await_on: &'a dyn Fn() -> bool,
+    /// [`aterm_uds::process::held_programs`]: this user's programs macOS's program check holds
+    /// now, read again once the switch reads on, since the report's count is a wait older.
+    held_programs: &'a dyn Fn() -> Option<aterm_uds::process::HeldNow>,
     /// [`atpkg::devtools::refresh_verdict`]: make macOS ask about aterm again once the
     /// switch read on (the running aterm, checked before, keeps that verdict until a
     /// fresh aterm process asks).
-    refresh_verdict: &'a dyn Fn() -> Result<(), String>,
+    refresh_verdict: &'a dyn Fn() -> Result<(), atpkg::devtools::RefreshFailed>,
     /// Whether the running aterm window is the app macOS holds responsible for doctor
     /// ([`aterm_machines::port::responsible_window`]): only then is the Full Disk Access grant
     /// its walk turns on the one doctor read.
@@ -2695,10 +2919,8 @@ fn devtools_open_here(
     if facts.list.label == aterm_containment::DevToolListLabel::Read {
         (reach.say)(DEVTOOLS_WAIT_LINE);
         let switched = (reach.await_on)();
-        if switched && let Err(why) = (reach.refresh_verdict)() {
-            (reach.say)(&format!(
-                "aterm doctor: could not make macOS ask about aterm again: {why}"
-            ));
+        if switched {
+            devtools_prime(facts.program_check, reach);
         }
         did.push_str(if switched {
             "; you switched it on"
@@ -2707,6 +2929,45 @@ fn devtools_open_here(
         });
     }
     (did, true)
+}
+
+/// Asks macOS about aterm again once the switch read on ([`DevtoolsReach::refresh_verdict`]),
+/// unless this user's programs read backed up at macOS's program check now, after the report's
+/// count `before` ([`aterm_uds::process::HeldNow::backed_up`]): the prime is itself a new
+/// program, which would wait in that line, so doctor starts none and says why. A count that does
+/// not read proves no queue.
+fn devtools_prime(before: Option<aterm_uds::process::HeldNow>, reach: &DevtoolsReach<'_>) {
+    if let Some(held) = (reach.held_programs)().filter(|now| now.backed_up(before)) {
+        (reach.say)(&prime_held_line(held));
+    } else if let Err(why) = (reach.refresh_verdict)() {
+        (reach.say)(&refresh_failed_line(&why));
+    }
+}
+
+/// What doctor says when it holds its prime back from a backed-up queue ([`devtools_prime`]),
+/// and what asks instead: an aterm process started after the grant is exempt at once, and from
+/// then so are the programs the one running before it starts.
+fn prime_held_line(held: aterm_uds::process::HeldNow) -> String {
+    format!(
+        "aterm doctor: did not ask macOS about aterm again: {}, and that ask is a new program \
+         that would wait behind them; macOS asks again when aterm next starts",
+        atpkg::devtools::held_words(held)
+    )
+}
+
+/// What doctor says when asking macOS about aterm again did not take: a prime macOS's backed-up
+/// queue still holds has not settled, which says nothing of the grant, so it is never "could not";
+/// the prime's own words, where it said any, name the copy it kept.
+fn refresh_failed_line(why: &atpkg::devtools::RefreshFailed) -> String {
+    match why {
+        atpkg::devtools::RefreshFailed::NotSettled(said) => format!(
+            "aterm doctor: asking macOS about aterm again has not settled: {}",
+            said.as_deref().unwrap_or("macOS's queue is backed up")
+        ),
+        atpkg::devtools::RefreshFailed::Failed(why) => {
+            format!("aterm doctor: could not make macOS ask about aterm again: {why}")
+        }
+    }
 }
 
 fn local_day_words(at: u64, offset_s: Option<i64>) -> String {
@@ -2972,14 +3233,22 @@ fn instances_row(census: &Result<aterm_ctl::census::Census, String>) -> (Mark, S
         .iter()
         .filter(|p| p.adopted || (p.build && p.deleted))
     {
-        let facts: Vec<&str> = [
+        let mut facts: Vec<String> = [
             (p.adopted, "its launcher exited and launchd adopted it"),
+            (
+                p.unsupervised,
+                "unsupervised: it is not the one broker found serving the fabric's socket",
+            ),
             (p.build, "from a build directory"),
             (p.deleted, "running a deleted binary"),
         ]
         .into_iter()
-        .filter_map(|(holds, said)| holds.then_some(said))
+        .filter(|(holds, _)| *holds)
+        .map(|(_, said)| said.to_owned())
         .collect();
+        if let Some(token) = &p.token {
+            facts.push(format!("end it with `aterm ctl end {token}`"));
+        }
         detail.push_str(&format!(
             "\npid {} `{}` (up {}): {}",
             p.pid,
@@ -3085,6 +3354,7 @@ fn doctor_rows(
     checks.extend(spotlight_rows(machine));
     checks.extend(program_check_rows(machine));
     checks.extend(services_rows(machine));
+    checks.extend(awake_rows(machine));
     checks.extend(console_host_rows(machine));
     let (instances_mark, instances_fact) = instances_row(instances);
     let (recovery_mark, recovery_fact) = recovery_row(recovery);
@@ -3399,7 +3669,11 @@ pub fn version_text_with_stamp(
 }
 
 fn running_build_from(stamp: Option<&aterm_types::version::BuildStamp>) -> Option<u64> {
-    let build = stamp?.build_number.parse::<u64>().ok()?;
+    let s = stamp?.build_number;
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let build = s.parse::<u64>().ok()?;
     (build > 0).then_some(build)
 }
 
@@ -3679,7 +3953,12 @@ fn session_path_env(
     inherited: Option<&str>,
 ) -> Option<(String, String)> {
     let sep = if cfg!(windows) { ';' } else { ':' };
-    let moved: Vec<&str> = [reroute_dir, agents_dir].into_iter().flatten().collect();
+    let mut moved: Vec<&str> = Vec::with_capacity(2);
+    for dir in [reroute_dir, agents_dir].into_iter().flatten() {
+        if !dir.is_empty() && !moved.contains(&dir) {
+            moved.push(dir);
+        }
+    }
     if moved.is_empty() {
         return front_door_dir.and_then(|dir| prepend_path(dir, inherited));
     }
@@ -3837,11 +4116,12 @@ mod tests {
         CliAction, DEBUGGER_ACCESS_REVERT, DIAG_COMMANDS, DebuggerFacts, DebuggerMember,
         DebuggerMode, DebuggerProbe, DebuggerProbeLabel, DevtoolsFacts, DrClass, ExceptionsFacts,
         FdaState, MachineFacts, Mark, PrivacyFacts, ProbeLabel, RecoveryFacts, SelfHardening,
-        ShellCheck, Verb, agents_dir_mode, config_conpty_from_text, decide_args, diag_report,
-        doctor_checks_with_origin, exceptions_report_at, explain_config_report, front_door_alias,
-        front_door_verb, help_text, is_tool_candidate, list_fonts_report, list_themes_alias,
-        managed_agents_dir, prepend_path, read_exceptions_log, reroute_dir_from_values,
-        session_limits, session_path_env, show_face_report, version_text,
+        ShellCheck, Verb, agents_dir_mode, config_conpty_from_text, config_path_paragraph_with,
+        decide_args, diag_report, doctor_checks_with_origin, exceptions_report_at,
+        explain_config_report, front_door_alias, front_door_verb, help_text, is_tool_candidate,
+        list_fonts_report, list_themes_alias, managed_agents_dir, prepend_path,
+        read_exceptions_log, reroute_dir_from_values, session_limits, session_path_env,
+        show_face_report, version_text,
     };
     #[cfg(unix)]
     use super::{args_read_withheld, fabric_mark, unix_shell};
@@ -3905,7 +4185,7 @@ mod tests {
         let machine = MachineFacts {
             spotlight: Some(Err("index unavailable".to_owned())),
             program_check: Some(aterm_uds::program_check::Look::Unread),
-            fabric: Some((Mark::Note, "withheld".to_owned(), true)),
+            fabric: Some((Mark::Note, "withheld".to_owned(), true, None)),
             ..MachineFacts::absent()
         };
         let gathered = super::doctor::Gathered::of_rows(super::doctor_rows(
@@ -4127,33 +4407,24 @@ mod tests {
         }
     }
 
-    struct Scratch(std::path::PathBuf);
+    struct Scratch(aterm_tempfile::TempDir);
 
     impl Scratch {
         fn new() -> Self {
-            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            let dir = std::env::temp_dir().join(format!(
-                "aterm-exceptions-reader-{}-{}",
-                std::process::id(),
-                N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            ));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
-            Self(dir)
+            Self(
+                aterm_tempfile::Builder::new()
+                    .prefix("aterm-exceptions-reader-")
+                    .tempdir()
+                    .expect("scratch dir"),
+            )
         }
 
         fn log(&self) -> std::path::PathBuf {
-            self.0.join("messages.log")
+            self.0.path().join("messages.log")
         }
 
         fn rotated(&self) -> std::path::PathBuf {
-            self.0.join("messages.log.1")
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            self.0.path().join("messages.log.1")
         }
     }
 
@@ -4295,6 +4566,21 @@ mod tests {
                 .count(),
             1
         );
+
+        // Across a daylight fall-back after T0 (`T0` at +2h, `now` at +1h), `exceptions`
+        // prints the entry's own +2h wall clock rather than shifting it by `now`'s +1h.
+        let change_s = i64::try_from(T0 / 1000).unwrap() + 1_800;
+        let dst = super::exceptions_report_at_local(&dir.log(), false, T0 + 3_600_000, &|unix| {
+            Some(if unix < change_s { 7_200 } else { 3_600 })
+        });
+        let summer = aterm_messages::words::clock_words(T0, 7_200);
+        let winter = aterm_messages::words::clock_words(T0, 3_600);
+        assert_ne!(summer, winter);
+        assert!(dst.contains(&summer), "{dst}");
+        assert!(
+            report.contains(&winter) && !report.contains(&summer),
+            "CONTROL: flat +1h shifts T0's clock by an hour: {report}"
+        );
     }
 
     /// A log is never worth a symlink: a `messages.log` that points elsewhere is not
@@ -4304,7 +4590,7 @@ mod tests {
     #[test]
     fn the_exceptions_reader_never_follows_a_symlink() {
         let dir = Scratch::new();
-        let real = dir.0.join("elsewhere.log");
+        let real = dir.0.path().join("elsewhere.log");
         std::fs::write(&real, format!("{}\n", exception_lines().join("\n"))).unwrap();
         std::os::unix::fs::symlink(&real, dir.log()).unwrap();
         let out = exceptions_report_at(&dir.log(), false, 1, 0);
@@ -4315,7 +4601,7 @@ mod tests {
         assert!(out.contains("is a symlink or folder, not the log"), "{out}");
         assert!(read_exceptions_log(&other.log()).unreadable.is_some());
         let rotated = Scratch::new();
-        let older = rotated.0.join("messages.log.1");
+        let older = rotated.0.path().join("messages.log.1");
         std::fs::create_dir(&older).unwrap();
         let out = exceptions_report_at(&rotated.log(), false, 1, 0);
         assert!(
@@ -4587,6 +4873,31 @@ mod tests {
         assert_eq!(Verb::from_operand(""), None);
     }
 
+    /// `acaffeine` is aCaffiene's (not a window, nor a store tool of that name), no verb's name
+    /// and not advertised in help. `caffeine`, its old name, is no verb: the front door answers
+    /// it before the verb table.
+    #[test]
+    fn the_misspelt_name_reaches_acaffiene() {
+        let help = help_text();
+        let alias = "acaffeine";
+        assert_eq!(Verb::from_operand(alias), Some(Verb::Acaffiene));
+        assert!(!is_tool_candidate(Some(alias)));
+        assert!(!Verb::ALL.iter().any(|v| v.name() == alias));
+        assert!(
+            !help
+                .lines()
+                .any(|line| line.trim_start().starts_with(&format!("aterm {alias}"))),
+            "{alias} is advertised"
+        );
+        for verb in Verb::ALL {
+            for alias in verb.operand_aliases() {
+                assert_eq!(Verb::from_operand(alias), Some(*verb), "{alias}");
+            }
+        }
+        assert_eq!(Verb::from_operand("caffein"), None);
+        assert_eq!(Verb::from_operand("caffeine"), None);
+    }
+
     #[test]
     fn path_injection_prepends_once_and_is_idempotent() {
         let sep = if cfg!(windows) { ';' } else { ':' };
@@ -4696,15 +5007,16 @@ mod tests {
             session_path_env(None, Some(agents), None, None).map(|p| p.1),
             Some(agents.to_string())
         );
+        assert_eq!(
+            session_path_env(Some(agents), Some(agents), Some(bin), Some("/usr/bin")).map(|p| p.1),
+            Some(join(&[agents, bin, "/usr/bin"])),
+            "when reroute and agents name one directory, PATH lists it once"
+        );
     }
 
     #[test]
     fn the_agents_dir_is_the_reroute_dirs_sibling_in_atpkgs_layout() {
-        let scratch = std::env::temp_dir().join(format!(
-            "aterm-cli-agents-{}-{}",
-            std::process::id(),
-            aterm_time::since_epoch().map_or(0, |d| d.as_nanos())
-        ));
+        let scratch = scratch_dir("agents-sibling");
         let layout = atpkg::store::Layout {
             prefix: scratch.join("pkg"),
         };
@@ -4734,7 +5046,6 @@ mod tests {
         );
         assert_eq!(reroute, layout.prefix.join(atpkg::reroute::DIR_NAME));
         assert_eq!(layout.agents_dir(), layout.prefix.join("agents"));
-        let _ = std::fs::remove_dir_all(&scratch);
     }
 
     #[test]
@@ -4809,14 +5120,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
-    fn scratch_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-cli-{tag}-{}-{}",
-            std::process::id(),
-            aterm_time::since_epoch().map_or(0, |d| d.as_nanos())
-        ));
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        dir
+    struct TestScratch(aterm_tempfile::TempDir);
+
+    impl std::ops::Deref for TestScratch {
+        type Target = std::path::Path;
+
+        fn deref(&self) -> &Self::Target {
+            self.0.path()
+        }
+    }
+
+    impl AsRef<std::path::Path> for TestScratch {
+        fn as_ref(&self) -> &std::path::Path {
+            self.0.path()
+        }
+    }
+
+    fn scratch_dir(tag: &str) -> TestScratch {
+        TestScratch(
+            aterm_tempfile::Builder::new()
+                .prefix(&format!("aterm-cli-{tag}-"))
+                .tempdir()
+                .expect("scratch dir"),
+        )
     }
 
     #[test]
@@ -5377,6 +5703,60 @@ mod tests {
         }
     }
 
+    /// Where a shell's aterm and the app opened from Finder read different files, the paragraph
+    /// names both and the step that makes them one (round 13); the control, no split, is the
+    /// paragraph alone.
+    #[test]
+    fn explain_config_names_the_app_s_file_when_it_is_another() {
+        let home = std::path::Path::new("/h");
+        let file = std::path::Path::new("/h/dots/aterm/aterm.toml");
+        let alone = config_path_paragraph_with(Some(file), None);
+        assert_eq!(
+            alone,
+            "aterm.toml: /h/dots/aterm/aterm.toml\n  (need not exist; a command-line flag beats \
+             it, it beats the default;\n  `aterm help config` has the keys)\n\n"
+        );
+        let split = atpkg::config_split::Split {
+            here: std::path::PathBuf::from("/h/dots/aterm"),
+            app: std::path::PathBuf::from("/h/.config/aterm"),
+            app_xdg: None,
+            differs: vec!["update.enabled".to_owned()],
+            compared: true,
+            unify: Some((
+                std::path::PathBuf::from("/h/.config/aterm"),
+                std::path::PathBuf::from("/h/dots/aterm"),
+            )),
+        };
+        let both = config_path_paragraph_with(Some(file), Some((&split, home)));
+        assert!(both.starts_with(alone.trim_end_matches('\n')), "{both}");
+        let flat = both.split_whitespace().collect::<Vec<_>>().join(" ");
+        let here_rel = format!(
+            "Not the app's: this aterm reads ~/{}",
+            std::path::Path::new("dots/aterm")
+                .join("aterm.toml")
+                .display()
+        );
+        let app_rel = format!(
+            "reads ~/{} (launchd gives apps no XDG_CONFIG_HOME)",
+            std::path::Path::new(".config/aterm")
+                .join("aterm.toml")
+                .display()
+        );
+        for said in [
+            here_rel.as_str(),
+            app_rel.as_str(),
+            "they differ in update.enabled",
+            "ln -s /h/dots/aterm /h/.config/aterm (undo: rm /h/.config/aterm)",
+        ] {
+            assert!(flat.contains(said), "{said:?} in {both}");
+        }
+        assert!(
+            both.lines().all(|line| line.chars().count() <= 100),
+            "{both}"
+        );
+        assert!(both.ends_with(".\n\n"), "{both:?}");
+    }
+
     #[test]
     fn explain_config_names_the_resolved_config_path() {
         let r = explain_config_report();
@@ -5598,6 +5978,8 @@ mod tests {
             adopted,
             build: adopted,
             deleted: false,
+            unsupervised: false,
+            token: None,
         };
         let with_programs = |programs: Vec<Program>| {
             Ok(Census {
@@ -5706,6 +6088,141 @@ mod tests {
             "at most six names, then a cut: {r}"
         );
         assert!(!r.contains("aterm v6"), "{r}");
+    }
+
+    /// A link broker launchd adopted, as the leftover view's reader gives its facts: running a
+    /// build under a verify run's roots, holding its listener, leading its own group with no
+    /// terminal; `runs` says how the run records tie it.
+    fn adopted_broker(runs: Vec<aterm_vitals::left::RunTie>) -> aterm_vitals::left::Facts {
+        aterm_vitals::left::Facts {
+            pid: 71102,
+            ppid: 1,
+            lineage: Some(aterm_vitals::left::Lin {
+                uniqueid: 310,
+                parent: 1,
+                pgid: 71102,
+                launcher_version: Some(100),
+                tty: None,
+            }),
+            token: Some("71102@1792098840004410:331".to_owned()),
+            exe: Some("/w/wt-a/target/debug/aterm".to_owned()),
+            exe_under_root: !runs.is_empty(),
+            thread_ran: Some(true),
+            listener: Some(true),
+            sandboxed: Some(false),
+            by_design: Some(false),
+            aterm: true,
+            runs,
+            tty_master_held: Some(false),
+            ..aterm_vitals::left::Facts::default()
+        }
+    }
+
+    /// The dead verify run whose run id an adopted broker carries, its executable under the
+    /// run's roots.
+    fn dead_runs_tie() -> aterm_vitals::left::RunTie {
+        aterm_vitals::left::RunTie {
+            id: "41983-1792163800331520".to_owned(),
+            run: true,
+            tree: true,
+            dead: true,
+            ..aterm_vitals::left::RunTie::default()
+        }
+    }
+
+    /// launchd's pid version in these facts: the broker's launcher was another process.
+    const LAUNCHD_VERSION: Option<i32> = Some(1026);
+
+    /// An unsupervised broker a dead verify run's record proves its own (W-run with C-tree)
+    /// gets the token the leftover view offers, and the `instances:` row says to end it with
+    /// `aterm ctl end` and that token; the fabric's own broker is named as adopted only. No row
+    /// prints a pid to `kill`.
+    #[test]
+    fn an_unsupervised_broker_from_a_dead_run_is_named_with_its_token() {
+        use aterm_ctl::census::{BROKER, Census, Program, supervise};
+        let facts = adopted_broker(vec![dead_runs_tie()]);
+        let token = super::offered_token(&facts, LAUNCHD_VERSION, 9000);
+        assert_eq!(token.as_deref(), Some("71102@1792098840004410:331"));
+        let program = |pid: u32| Program {
+            pid,
+            name: BROKER.to_owned(),
+            age: "10h 02m".to_owned(),
+            adopted: true,
+            build: true,
+            deleted: false,
+            unsupervised: false,
+            token: None,
+        };
+        let mut census = Census {
+            dir: "/run/aterm".to_owned(),
+            instances: 1,
+            unreached: Vec::new(),
+            programs: vec![program(71101), program(71102)],
+        };
+        supervise(&mut census, Some(71101), &|pid| {
+            (pid == 71102).then(|| token.clone()).flatten()
+        });
+        let (mark, fact) = super::instances_row(&Ok(census));
+        assert_eq!(mark, Mark::Ok, "{fact}");
+        assert!(
+            fact.contains(
+                "pid 71102 `aterm link broker` (up 10h 02m): its launcher exited and launchd \
+                 adopted it; unsupervised: it is not the one broker found serving the fabric's \
+                 socket; from a build directory; end it with `aterm ctl end \
+                 71102@1792098840004410:331`"
+            ),
+            "{fact}"
+        );
+        assert!(
+            fact.contains(
+                "pid 71101 `aterm link broker` (up 10h 02m): its launcher exited and launchd \
+                 adopted it; from a build directory\n"
+            ),
+            "the fabric's own broker is not unsupervised: {fact}"
+        );
+        assert!(!fact.contains("kill"), "{fact}");
+    }
+
+    /// An unsupervised broker no witness proves (no run record ties it, it writes no graph
+    /// entry) is offered no token: it holds a listener and leads its own group, so the view names
+    /// it and offers nothing, and nothing is printed to end it with. NEGATIVE CONTROL: give every
+    /// one its identity token, and this one gets one.
+    #[test]
+    fn an_unsupervised_broker_no_witness_proves_gets_no_token() {
+        assert_eq!(
+            super::offered_token(&adopted_broker(Vec::new()), LAUNCHD_VERSION, 9000),
+            None
+        );
+        let live = aterm_vitals::left::RunTie {
+            dead: false,
+            ..dead_runs_tie()
+        };
+        assert_eq!(
+            super::offered_token(&adopted_broker(vec![live]), LAUNCHD_VERSION, 9000),
+            None,
+            "a live run's tie proves nothing yet"
+        );
+        let mut census = aterm_ctl::census::Census {
+            dir: "/run/aterm".to_owned(),
+            instances: 1,
+            unreached: Vec::new(),
+            programs: vec![aterm_ctl::census::Program {
+                pid: 71102,
+                name: aterm_ctl::census::BROKER.to_owned(),
+                age: "1h 00m".to_owned(),
+                adopted: true,
+                build: false,
+                deleted: false,
+                unsupervised: false,
+                token: None,
+            }],
+        };
+        aterm_ctl::census::supervise(&mut census, None, &|_| {
+            super::offered_token(&adopted_broker(Vec::new()), LAUNCHD_VERSION, 9000)
+        });
+        let (_, fact) = super::instances_row(&Ok(census));
+        assert!(fact.contains("unsupervised"), "{fact}");
+        assert!(!fact.contains("aterm ctl end"), "{fact}");
     }
 
     #[test]
@@ -6008,7 +6525,7 @@ mod tests {
                 &no_recovery(),
                 &no_exceptions(),
                 &MachineFacts {
-                    fabric: fabric.map(|(mark, fact)| (mark, fact, false)),
+                    fabric: fabric.map(|(mark, fact)| (mark, fact, false, None)),
                     ..MachineFacts::absent()
                 },
             )
@@ -6133,6 +6650,7 @@ mod tests {
             program_check: None,
             services: None,
             shim_cache: None,
+            awake: None,
         };
         let report = |d: &DevtoolsFacts| {
             doctor_checks_with_origin(
@@ -6183,6 +6701,10 @@ mod tests {
         declined_at: Option<u64>,
         /// The wait sees the switch go on.
         switched: bool,
+        /// What asking macOS about aterm again ends in.
+        refreshed: Result<(), atpkg::devtools::RefreshFailed>,
+        /// This user's programs macOS's program check holds once the switch reads on.
+        held: Option<aterm_uds::process::HeldNow>,
         before_wait: Box<dyn Fn()>,
         log: std::cell::RefCell<Vec<String>>,
     }
@@ -6195,6 +6717,8 @@ mod tests {
                 responsible: true,
                 declined_at: None,
                 switched: true,
+                refreshed: Ok(()),
+                held: None,
                 before_wait: Box::new(|| {}),
                 log: std::cell::RefCell::new(Vec::new()),
             }
@@ -6232,9 +6756,13 @@ mod tests {
                     note("wait".to_string());
                     self.switched
                 },
+                held_programs: &|| {
+                    note("held".to_string());
+                    self.held
+                },
                 refresh_verdict: &|| {
                     note("refresh".to_string());
-                    Ok(())
+                    self.refreshed.clone()
                 },
                 window_responsible: &|| self.responsible,
                 open_fda_pane: &|| {
@@ -6361,6 +6889,14 @@ mod tests {
                     self.read("fabric");
                     None
                 },
+                awake: &|| {
+                    self.read("awake");
+                    None
+                },
+                offered: &|_| {
+                    self.read("offered");
+                    None
+                },
                 person_here: &|| false,
             };
             let rows = super::facts_rows_over(false, reads, &ports).rows;
@@ -6368,6 +6904,48 @@ mod tests {
             read.sort_unstable();
             (rows.iter().map(|row| row.label).collect(), read)
         }
+    }
+
+    /// THE `awake:` ROW SAYS WHAT MACOS HOLDS, NOT WHAT WAS SAVED: a mug that runs with no
+    /// assertion, and an on mode with no mug, are warnings that carry the recorded why; a
+    /// person's off is a note; only a listed assertion is ok. NEGATIVE CONTROL: no reading, no
+    /// row.
+    #[test]
+    fn the_awake_row_reads_the_assertion() {
+        use aterm_acaffiene::held::Held;
+        let row = |held: Held| {
+            let facts = MachineFacts {
+                awake: Some(held),
+                ..MachineFacts::absent()
+            };
+            let rows = super::awake_rows(&facts);
+            assert_eq!(rows.len(), 1);
+            let row = rows.into_iter().next().expect("one row");
+            assert_eq!(row.label, "awake:");
+            (row.mark, row.fact, row.unmeasured)
+        };
+        assert_eq!(row(Held::Held { pid: 42 }).0, Mark::Ok);
+        let (mark, fact, _) = row(Held::NotHeld {
+            pid: 42,
+            why: Some("macOS refused the keep-awake activity".to_owned()),
+        });
+        assert_eq!(mark, Mark::Warn);
+        assert!(
+            fact.contains("macOS refused the keep-awake activity"),
+            "{fact}"
+        );
+        let (mark, fact, _) = row(Held::Stopped {
+            why: Some("the menu bar refused the mug".to_owned()),
+        });
+        assert_eq!(mark, Mark::Warn);
+        assert!(fact.contains("the menu bar refused the mug"), "{fact}");
+        assert_eq!(row(Held::Off).0, Mark::Note);
+        let (mark, _, unmeasured) = row(Held::Unread {
+            pid: 42,
+            why: "the power manager did not answer".to_owned(),
+        });
+        assert_eq!((mark, unmeasured), (Mark::Note, true));
+        assert!(super::awake_rows(&MachineFacts::absent()).is_empty());
     }
 
     /// `--ONLY NARROWS WHAT DOCTOR'S OWN ROWS READ`: the help's "shell usability alone" check
@@ -6388,11 +6966,17 @@ mod tests {
         assert_eq!(rows, ["shell:"], "a Spotlight that read nothing has no row");
         assert_eq!(read, ["spotlight"]);
 
+        let awake = CountedReads::new(None);
+        let (_, read) =
+            awake.rows(&|label| super::doctor::reads(&["base.machine.awake".to_owned()], label));
+        assert_eq!(read, ["awake"]);
+
         let every = CountedReads::new(None);
         let (rows, read) = every.rows(&|label| super::doctor::reads(&[], label));
         assert_eq!(
             read,
             [
+                "awake",
                 "debugger",
                 "devtools",
                 "fabric",
@@ -6417,13 +7001,13 @@ mod tests {
     fn doctors_own_probes_read_at_once() {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let all = CountedReads::new(Some(std::sync::Barrier::new(7)));
+            let all = CountedReads::new(Some(std::sync::Barrier::new(8)));
             let _ = tx.send(all.rows(&|label| super::doctor::reads(&[], label)).1);
         });
         let read = rx
             .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
             .expect("the probes never met: one waited for another to finish");
-        assert_eq!(read.len(), 7, "{read:?}");
+        assert_eq!(read.len(), 8, "{read:?}");
     }
 
     fn devtools_facts_with(list: aterm_containment::DevToolList) -> atpkg::devtools::Facts {
@@ -6529,6 +7113,142 @@ mod tests {
             first.with(|reach| super::devtools_hand_over_after(&absent, reach));
         }));
         assert!(tripped.is_err(), "the check must trip on the old order");
+    }
+
+    /// Once the switch reads on, doctor asks macOS about aterm again. A prime macOS's backed-up
+    /// queue still holds has not settled, and doctor says so in those words, never that it
+    /// "could not": the grant may well take once the queue drains. A prime that failed says it
+    /// could not, with why.
+    #[test]
+    fn a_prime_that_did_not_settle_says_so_and_never_could_not() {
+        use super::WindowAnswer;
+        use aterm_containment::DevToolListing;
+        use atpkg::devtools::RefreshFailed;
+        let absent = devtools_facts_with(read_list(DevToolListing::Absent, 2));
+        let said_after_refresh = |refreshed| {
+            let mut scripted = Scripted::new(WindowAnswer::Unreachable);
+            scripted.refreshed = refreshed;
+            let (_, _, log) = scripted.run(&absent);
+            let at = log
+                .iter()
+                .position(|entry| entry == "refresh")
+                .unwrap_or_else(|| panic!("refresh in {log:?}"));
+            log[at + 1..]
+                .iter()
+                .filter_map(|entry| entry.strip_prefix("say ").map(str::to_owned))
+                .collect::<Vec<_>>()
+        };
+        let unsettled = said_after_refresh(Err(RefreshFailed::NotSettled(None)));
+        assert_eq!(
+            unsettled,
+            [
+                "aterm doctor: asking macOS about aterm again has not settled: macOS's queue is \
+                 backed up"
+            ]
+        );
+        let kept = "aterm pkg __devtools-prime: not settled: macOS's queue is backed up; kept \
+                    /tmp/aterm-devtools-prime-ab since aterm-devtools-ab never showed it ran";
+        let named = said_after_refresh(Err(RefreshFailed::NotSettled(Some(kept.into()))));
+        assert_eq!(
+            named,
+            [format!(
+                "aterm doctor: asking macOS about aterm again has not settled: {kept}"
+            )],
+            "the prime's own words name the copy it kept"
+        );
+        assert!(
+            unsettled
+                .iter()
+                .chain(&named)
+                .all(|line| !line.contains("could not")),
+            "{unsettled:?} {named:?}"
+        );
+        assert_eq!(
+            said_after_refresh(Err(RefreshFailed::Failed("codesign: denied".into()))),
+            ["aterm doctor: could not make macOS ask about aterm again: codesign: denied"]
+        );
+        assert!(
+            said_after_refresh(Ok(())).is_empty(),
+            "a refresh that took says nothing"
+        );
+    }
+
+    /// Doctor's prime is itself a new program, so once the switch reads on it reads the queue
+    /// again and starts none while it reads backed up, by the jobs engine's two halves over its
+    /// two counts: three of this user's programs held at macOS's program check at once, or one
+    /// held at the report's count and at this one. It says why in the devtools row's words and
+    /// what asks instead. Two held at the switch alone, one held at the report alone, or a count
+    /// that does not read, prove no queue, and doctor asks.
+    /// NEGATIVE CONTROL: a prime that does not read the queue starts behind three held programs,
+    /// and one that reads the switch's count alone starts behind one held at both.
+    #[test]
+    fn doctor_starts_no_prime_behind_a_backed_up_queue() {
+        use super::WindowAnswer;
+        use aterm_containment::DevToolListing;
+        use aterm_uds::process::HeldNow;
+        let one = HeldNow {
+            count: 1,
+            oldest_ms: 20 * 60_000,
+        };
+        let run_after = |before: Option<HeldNow>, held: Option<HeldNow>| {
+            let mut absent = devtools_facts_with(read_list(DevToolListing::Absent, 2));
+            absent.program_check = before;
+            let mut scripted = Scripted::new(WindowAnswer::Unreachable);
+            scripted.held = held;
+            let (did, _, log) = scripted.run(&absent);
+            assert!(did.ends_with("; you switched it on"), "{did}");
+            let at = log
+                .iter()
+                .position(|entry| entry == "held")
+                .unwrap_or_else(|| panic!("the queue is read in {log:?}"));
+            assert!(
+                log[..at].iter().any(|entry| entry == "wait"),
+                "read once the switch reads on: {log:?}"
+            );
+            log[at + 1..].to_vec()
+        };
+        let queue = HeldNow {
+            count: 3,
+            oldest_ms: 21 * 60_000,
+        };
+        assert_eq!(
+            run_after(None, Some(queue)),
+            [
+                "say aterm doctor: did not ask macOS about aterm again: now 3 programs of this user \
+                 wait for macOS's program check, the oldest started 21 m ago, and that ask is a \
+                 new program that would wait behind them; macOS asks again when aterm next starts"
+            ],
+            "no prime behind three held at once"
+        );
+        let later = HeldNow {
+            count: 1,
+            oldest_ms: 21 * 60_000,
+        };
+        assert_eq!(
+            run_after(Some(one), Some(later)),
+            [
+                "say aterm doctor: did not ask macOS about aterm again: now 1 program of this user \
+                 waits for macOS's program check; it started 21 m ago, and that ask is a new \
+                 program that would wait behind them; macOS asks again when aterm next starts"
+            ],
+            "no prime behind one held at both readings"
+        );
+        let two = HeldNow {
+            count: 2,
+            oldest_ms: 21 * 60_000,
+        };
+        for (before, held) in [
+            (None, Some(two)),
+            (Some(HeldNow::default()), Some(two)),
+            (Some(one), Some(HeldNow::default())),
+            (Some(queue), None),
+        ] {
+            assert_eq!(
+                run_after(before, held),
+                ["refresh"],
+                "{before:?} then {held:?} proves no queue"
+            );
+        }
     }
 
     /// `devtools_hand_over` asks the running window first (`now`) and opens System Settings
@@ -6743,6 +7463,8 @@ mod tests {
                 debugger: &no_debugger,
                 instances: &no_census,
                 fabric: &|_| None,
+                awake: &|| None,
+                offered: &|_| None,
                 person_here: &person,
             };
             super::facts_rows_over(fix, &|label| label == "privacy:", &ports)

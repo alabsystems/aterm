@@ -92,9 +92,9 @@ impl Sent {
         let text = std::str::from_utf8(bytes).ok()?;
         let mut words = text.split_whitespace();
         let sent = Self {
-            pid: words.next()?.parse().ok()?,
-            start_s: words.next()?.parse().ok()?,
-            at_s: words.next()?.parse().ok()?,
+            pid: crate::parse_uint(words.next()?)?,
+            start_s: crate::parse_uint(words.next()?)?,
+            at_s: crate::parse_uint(words.next()?)?,
         };
         words.next().is_none().then_some(sent)
     }

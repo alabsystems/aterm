@@ -213,8 +213,9 @@ fn every_act_with(rules_text: &str) -> Vec<(String, String)> {
         for n in 0..DONE_ANGLES.len() {
             add(
                 &format!("done-check-{}-fitted", n + 1),
-                fitted_act(
-                    &done_check_words(n),
+                fitted_check(
+                    n,
+                    false,
                     &[
                         Suffix::Open(&open),
                         Suffix::Repo(
@@ -230,6 +231,16 @@ fn every_act_with(rules_text: &str) -> Vec<(String, String)> {
         }
         add("done-check", done_check_text(rules, false));
         add("done-check-irreversible", done_check_text(rules, true));
+        for irreversible in [false, true] {
+            add(
+                &format!("done-check-held-{irreversible}"),
+                crate::supervise::policy::go_ahead::unless_held(
+                    &done_check_text(rules, irreversible),
+                    true,
+                )
+                .into_owned(),
+            );
+        }
         add("continue", continuation_text(&cfg(), rules));
         add("answer", answer_text(&cfg(), rules));
         add("reversible-answer", reversible_answer(rules));
@@ -464,14 +475,16 @@ fn a_cut_opening_on_the_acts_own_rows_names_no_need() {
         }
         st.standing_needs().to_vec()
     };
-    let (mut cuts, mut owners) = (0, 0);
-    for (name, act) in every_act_with(OWNER_NEED_RULES) {
-        if needs::needs_you(&typed(&act)) != [OWNER_NEED] {
-            continue;
+    // Pure reading, so one act at a time on every core.
+    let acts = every_act_with(OWNER_NEED_RULES);
+    let counted = aterm_spec::check::each(&acts, |(name, act)| {
+        let (mut cuts, mut owners) = (0, 0);
+        if needs::needs_you(&typed(act)) != [OWNER_NEED] {
+            return (0, 0);
         }
         for cols in WIDTHS {
             for reply in [PROGRESS, long.as_str()] {
-                let whole = agy_screen(cols, &typed(&act), reply);
+                let whole = agy_screen(cols, &typed(act), reply);
                 let at = whole
                     .iter()
                     .position(|r| r.starts_with("> "))
@@ -481,9 +494,9 @@ fn a_cut_opening_on_the_acts_own_rows_names_no_need() {
                     .expect("the act's end");
                 for drop in 1..end - at {
                     let r = agy_reading(&whole[at + drop..]);
-                    let tail = r.said_tail.as_deref().unwrap_or("");
+                    let tail = r.said_lines.as_deref().unwrap_or("");
                     let read = r
-                        .turn_said
+                        .turn_lines
                         .as_deref()
                         .map_or_else(|| tail.to_string(), |b| format!("{b}\n\n{tail}"));
                     let named = needs::needs_you(&read);
@@ -496,7 +509,7 @@ fn a_cut_opening_on_the_acts_own_rows_names_no_need() {
                     owners += usize::from(named.iter().any(|n| n.starts_with("the release key")));
                     for worked in [Some(3 * MIN), None] {
                         assert_eq!(
-                            needs_after(&act, &r, worked),
+                            needs_after(act, &r, worked),
                             Vec::<String>::new(),
                             "{at_cut}, worked {worked:?}"
                         );
@@ -510,7 +523,7 @@ fn a_cut_opening_on_the_acts_own_rows_names_no_need() {
             }
         }
         let said = format!("{PROGRESS}\n\nNEEDS YOU: the signing key");
-        let whole = agy_screen(80, &typed(&act), &said);
+        let whole = agy_screen(80, &typed(act), &said);
         let at = whole
             .iter()
             .position(|r| r.starts_with("> "))
@@ -519,12 +532,16 @@ fn a_cut_opening_on_the_acts_own_rows_names_no_need() {
         assert!(r.opens_cut, "{name}");
         for worked in [Some(3 * MIN), None] {
             assert_eq!(
-                needs_after(&act, &r, worked),
+                needs_after(act, &r, worked),
                 ["the signing key"],
                 "CONTROL: {name}, worked {worked:?}"
             );
         }
-    }
+        (cuts, owners)
+    });
+    let (cuts, owners) = counted
+        .into_iter()
+        .fold((0, 0), |all, one| (all.0 + one.0, all.1 + one.1));
     assert!(
         cuts > 100 && owners > 100,
         "{cuts} cuts, {owners} the owner's need"
@@ -543,6 +560,60 @@ fn a_cut_opening_on_the_acts_own_rows_names_no_need() {
             "CONTROL: {worked:?}"
         );
     }
+}
+
+/// A Cruise carry's rows are the act its answer opens with (`background_carried`): where they head
+/// a cut reply, the NEEDS YOU line of the owner's standing rules they quote names no need, at the
+/// next break and at the point alike. NEGATIVE CONTROL: after another act the same rows name it.
+#[test]
+fn a_carrys_own_rows_name_no_need() {
+    let carry =
+        crate::supervise::policy::cruise_carry::carry_words(Some(&rules_line(OWNER_NEED_RULES)));
+    let other = continuation_text(&cfg(), None);
+    let mut cuts = 0;
+    for cols in WIDTHS {
+        let whole = agy_screen(cols, &typed(&carry), PROGRESS);
+        let at = whole
+            .iter()
+            .position(|r| r.starts_with("> "))
+            .expect("the carry's row");
+        let end = (at + 1..whole.len())
+            .find(|&i| whole[i].is_empty())
+            .expect("the carry's end");
+        for drop in 1..end - at {
+            let r = agy_reading(&whole[at + drop..]);
+            let tail = r.said_lines.as_deref().unwrap_or("");
+            let read = r
+                .turn_lines
+                .as_deref()
+                .map_or_else(|| tail.to_string(), |b| format!("{b}\n\n{tail}"));
+            let named = needs::needs_you(&read);
+            if named.is_empty() {
+                continue;
+            }
+            cuts += 1;
+            let at_cut = format!("at {cols}, {drop} rows above");
+            for (act, want) in [(&carry, Vec::new()), (&other, named)] {
+                let mut st = TurnEndState::default();
+                st.background_carried(t0(), act);
+                st.fold_break_needs(
+                    r.turn_lines.as_deref(),
+                    r.said_lines.as_deref(),
+                    r.opens_cut,
+                );
+                assert_eq!(st.standing_needs(), want, "the break {at_cut}");
+                let mut st = TurnEndState::default();
+                st.background_carried(t0(), act);
+                let point = TurnEndReading {
+                    worked: Some(3 * MIN),
+                    ..r.clone()
+                };
+                st.observe(&point, t0() + 3 * MIN);
+                assert_eq!(st.standing_needs(), want, "the point {at_cut}");
+            }
+        }
+    }
+    assert!(cuts > 40, "{cuts} cuts");
 }
 
 #[test]

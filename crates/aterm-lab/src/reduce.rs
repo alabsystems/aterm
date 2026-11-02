@@ -408,6 +408,7 @@ impl Parser<'_> {
         };
         let v = std::str::from_utf8(h)
             .ok()
+            .filter(|h| h.bytes().all(|b| b.is_ascii_hexdigit()))
             .and_then(|h| u32::from_str_radix(h, 16).ok());
         match v {
             Some(v) => {
@@ -448,13 +449,14 @@ impl Parser<'_> {
                         b't' => '\t',
                         b'u' => {
                             let hi = self.hex4()?;
+                            let save = self.i;
                             let code = if (0xD800..0xDC00).contains(&hi) && self.eat(b"\\u") {
                                 let lo = self.hex4()?;
                                 if (0xDC00..0xE000).contains(&lo) {
                                     0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
                                 } else {
-                                    out.extend_from_slice("\u{fffd}".as_bytes());
-                                    lo
+                                    self.i = save;
+                                    hi
                                 }
                             } else {
                                 hi

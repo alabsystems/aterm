@@ -108,6 +108,8 @@ pub fn level_of(id: &str, argv: &[String], _claude_default: Option<&str>) -> Opt
     let mut level = None;
     let mut no_write = false;
     let mut no_shell = false;
+    let mut resuming = false;
+    let mut resumed_id = false;
     let mut i = 0;
     while let Some(arg) = argv.get(i) {
         if arg == "--" {
@@ -164,7 +166,25 @@ pub fn level_of(id: &str, argv: &[String], _claude_default: Option<&str>) -> Opt
                     | "--allow-dangerously-skip-permissions",
                     None,
                 )
-                | ("codex", "--skip-git-repo-check" | "--ephemeral", None) => None,
+                | ("codex", "--skip-git-repo-check" | "--ephemeral", None)
+                | ("agy", "-c" | "--continue", None)
+                | ("muse", "--trust-workspace", None) => None,
+                ("codex" | "muse", "resume", None) if !resuming => {
+                    resuming = true;
+                    None
+                }
+                ("codex" | "muse", "--last", None) if resuming && !resumed_id => {
+                    resumed_id = true;
+                    None
+                }
+                ("codex" | "muse", tok, None)
+                    if resuming
+                        && !resumed_id
+                        && crate::harness::upgrade_muse::is_session_uuid(tok) =>
+                {
+                    resumed_id = true;
+                    None
+                }
                 // Claude Code's `--resume [value]`: its value is optional, and a next word that
                 // starts with `-` is the next flag.
                 ("claude", "--resume", _) => {
@@ -190,17 +210,40 @@ pub fn level_of(id: &str, argv: &[String], _claude_default: Option<&str>) -> Opt
                     }
                     None
                 }
-                (
-                    "claude",
-                    "--append-system-prompt" | "--system-prompt" | "--model" | "--output-format",
-                    _,
-                )
-                | ("codex", "--model" | "-m" | "--color" | "--cd" | "-C", _)
-                | ("agy", "--print" | "--model" | "--output-format", _)
-                | ("muse", "--prompt-file", _) => {
+                ("claude", "--append-system-prompt" | "--system-prompt", _)
+                | ("agy", "--print", _) => {
                     if attached.is_none() {
                         i += 1;
                         argv.get(i)?;
+                    }
+                    None
+                }
+                ("claude", "--model" | "--output-format", _)
+                | ("codex", "--model" | "-m" | "--color" | "--cd" | "-C", _)
+                | (
+                    "agy",
+                    "--model" | "--output-format" | "--conversation" | "--effort" | "--gemini_dir"
+                    | "--app_data_dir" | "--log-file",
+                    _,
+                )
+                // Muse Code's model, effort and contributor-mode words — every launch
+                // aterm makes carries them (`crate::harness::upgrade_muse`), and none
+                // of them says anything about permissions.
+                | (
+                    "muse",
+                    "--prompt-file" | "--contributor-mode" | "--model" | "--reasoning-effort"
+                    | "--effort",
+                    _,
+                ) => {
+                    let value = match attached {
+                        Some(v) => v,
+                        None => {
+                            i += 1;
+                            argv.get(i)?.as_str()
+                        }
+                    };
+                    if value.is_empty() {
+                        return None;
                     }
                     None
                 }
@@ -253,9 +296,12 @@ impl Procs for LiveProcs {
     fn parent(&self, pid: u32) -> Option<u32> {
         #[cfg(target_os = "linux")]
         {
-            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            let stat = aterm_uds::process::read_proc_text(std::path::Path::new(&format!(
+                "/proc/{pid}/stat"
+            )))
+            .ok()?;
             let after = stat.rsplit_once(')')?.1;
-            after.split_whitespace().nth(1)?.parse().ok()
+            crate::parse_uint(after.split_whitespace().nth(1)?)
         }
         #[cfg(not(target_os = "linux"))]
         {

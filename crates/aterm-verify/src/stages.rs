@@ -26,7 +26,7 @@ pub fn run_stage(ctx: &Ctx, spec: &StageSpec) -> Report {
         return r;
     }
     match spec.id {
-        StageId::TestCompile => test_compile(ctx, &mut r),
+        StageId::TestCompile => test_compile(ctx, spec, &mut r),
         StageId::Test => test(ctx, &mut r),
         StageId::MeasuringTests => measuring_tests(ctx, &mut r),
         StageId::Doctests => doctests(ctx, &mut r),
@@ -84,6 +84,57 @@ pub fn test_compile_args(scope: &Scope) -> Vec<String> {
     a.push("--no-run".to_string());
     a.push("--message-format=json-render-diagnostics".to_string());
     a
+}
+
+/// One cut of a shaped test compile ([`crate::shape::Part`]): [`test_compile_args`] over the
+/// cut's crates, with `--lib` in place of `--tests` for a lib-test call.
+#[must_use]
+pub fn piece_compile_args(piece: &crate::shape::Piece) -> Vec<String> {
+    let mut a = test_compile_args(&Scope::packages(&piece.crates));
+    if piece.lib {
+        for arg in &mut a {
+            if arg == "--tests" {
+                "--lib".clone_into(arg);
+            }
+        }
+    }
+    a
+}
+
+/// What `targo` resolves a call's unit graph with, building nothing: the call's own arguments
+/// ([`piece_compile_args`]) and `--unit-graph -Z unstable-options`.
+pub const UNIT_GRAPH: [&str; 3] = ["--unit-graph", "-Z", "unstable-options"];
+
+/// The unit graph a test compile's call over `piece` would build ([`UNIT_GRAPH`]), resolved under
+/// the main lane's build directory and the test compile's environment ([`test_cmds`]): the one
+/// line of it on the child's output that is a version-1 graph. Why not otherwise: the child failed
+/// or printed none.
+///
+/// # Errors
+/// As above.
+pub fn unit_graph(ctx: &Ctx, piece: &crate::shape::Piece) -> Result<String, String> {
+    let mut args = piece_compile_args(piece);
+    args.extend(UNIT_GRAPH.map(String::from));
+    let (_, bind) = test_doc_binding(ctx);
+    let cmd = main_targo(ctx, args);
+    let cmd = if bind { with_trustdoc(ctx, cmd) } else { cmd }.demoted();
+    let out = exec::run(&cmd, ctx.exec_env());
+    let graph = out
+        .output
+        .lines()
+        .find(|l| l.starts_with("{\"version\":1"))
+        .map(str::to_owned);
+    match (out.ok, graph) {
+        (true, Some(g)) => Ok(g),
+        (_, _) => Err(format!(
+            "`targo {}` {}",
+            cmd.argv()[1..].join(" "),
+            out.trimmed_output()
+                .lines()
+                .rfind(|l| !l.trim().is_empty())
+                .unwrap_or("printed no unit graph")
+        )),
+    }
 }
 
 /// `targo --unverified test <scope> --no-fail-fast --tests`: the second child, run only when the first compiled: every lib, bin and integration test target with `test = true` ([`TEST_TARGETS`], the first child's), no doctests (the doctests stage runs those) and no examples or benches.
@@ -167,7 +218,11 @@ pub fn doctest_split(ctx: &Ctx) -> Option<DocSplit> {
     let mut names: Vec<String> = match &ctx.scope {
         Scope::Workspace if dirs.is_empty() => return None,
         Scope::Workspace => dirs.iter().map(|(name, _)| name.clone()).collect(),
-        s => s.crates().to_vec(),
+        s => s
+            .crates()
+            .iter()
+            .map(|c| crate::scope::spec_name(c).unwrap_or(c).to_string())
+            .collect(),
     };
     names.retain(|name| crate::changed::crate_dir_has_lib(&ctx.root, name));
     names.sort();
@@ -231,9 +286,9 @@ pub fn manifest_required_features(text: &str) -> Vec<(String, String)> {
     };
     let mut found = Vec::new();
     let mut lines = text.lines();
-    while let Some(line) = lines.next() {
+    while let Some(raw) = lines.next() {
+        let line = raw.split('#').next().unwrap_or("").trim();
         let Some(rest) = line
-            .trim()
             .strip_prefix("required-features")
             .and_then(|r| r.trim_start().strip_prefix('='))
         else {
@@ -242,11 +297,12 @@ pub fn manifest_required_features(text: &str) -> Vec<(String, String)> {
         let mut list = rest.to_string();
         while !list.contains(']') {
             let Some(more) = lines.next() else { break };
-            list.push_str(more);
+            list.push(' ');
+            list.push_str(more.split('#').next().unwrap_or(""));
         }
         let inner = list.split_once('[').map_or("", |(_, r)| r);
         for feat in inner.split(']').next().unwrap_or("").split(',') {
-            let feat = feat.trim().trim_matches('"');
+            let feat = feat.trim().trim_matches(['"', '\'']);
             if !feat.is_empty() {
                 found.push((pkg.clone(), feat.to_string()));
             }
@@ -371,7 +427,7 @@ pub struct ObjcDrive {
 }
 
 /// The objc drivers the `objc drives` stage builds and runs, in order — every row on every macOS run, whatever the scope, and every row after a failure.
-pub const OBJC_DRIVES: [ObjcDrive; 5] = [
+pub const OBJC_DRIVES: [ObjcDrive; 6] = [
     ObjcDrive {
         package: "aterm-gui",
         example: "objc_live_class_audit",
@@ -395,7 +451,7 @@ pub const OBJC_DRIVES: [ObjcDrive; 5] = [
         example: "objc_toolbar_drive",
         code3: Code3::Hung,
         no_status: Severity::CouldNotRun,
-        pass: "the real tab strip answered every question — every state its drawing matrix names, and all four declared classes read off live objects against the runtime's own authority — and the menu bar's real status item held This Mac as its glance counts it, and listed a box that stopped its agent above an older report whose row's tip says its program carries on meanwhile",
+        pass: "the real tab strip answered every question — every state its drawing matrix names, and all four declared classes read off live objects against the runtime's own authority — and the menu bar's real status item held This Mac as its glance counts it, and listed a box that stopped its agent above an older report whose row's tip says its program carries on meanwhile, and a landing's Done for you row and worker row whose tips say what aterm checked",
     },
     ObjcDrive {
         package: "aterm-gui",
@@ -410,6 +466,14 @@ pub const OBJC_DRIVES: [ObjcDrive; 5] = [
         code3: Code3::AbortFinding,
         no_status: Severity::GateFailed,
         pass: "every NSEvent-taking WinitView row and sendEvent: survived a real NSEvent of every type AppKit can deliver; the exception control was contained and the panic control aborted",
+    },
+    ObjcDrive {
+        package: "aterm-gui",
+        example: "objc_frame_clock_drive",
+        code3: Code3::Hung,
+        // A death by a signal is a crash in the link's callback or AppKit's window teardown while the drive held them: a finding. (A link left uninvalidated did not crash it at the desk, 2026-10-27 and 2026-10-28: no tick came after the close. On 2026-10-28 the drive's weak reference, still loading the link after the close, caught it, exit 1.)
+        no_status: Severity::GateFailed,
+        pass: "a real window's display link ran the deck's clock: by the link's own timestamps its ticks each named a period the screen runs, targeted the coming vsync (the median tick's and the best tick's lead both positive) and never stalled LINK_SILENCE, and the clock's hang detector never tripped; paused, the CADisplayLink said so (-isPaused) and fired nothing while the clock's detector tripped on real time and timed the window as one with no link, and the restarted link's first tick resumed the clock; the link ticked while the main run loop ran in NSEventTrackingRunLoopMode; and closing the window invalidated every link its view made (a weak reference to each CADisplayLink, which its run loop retains until -invalidate, loaded nil after the close, and no tick fired for a vsync after it)",
     },
 ];
 
@@ -466,7 +530,7 @@ pub fn objc_drive_outcome(drive: &ObjcDrive, code: Option<i32>) -> (Outcome, Str
             Outcome::Fail(drive.no_status),
             match drive.no_status {
                 Severity::GateFailed => "ABORTED — the driver died by a signal its trap could not convert, which is still the finding it exists to make".to_string(),
-                Severity::CouldNotRun => "no exit status — killed by a signal, or never spawned".to_string(),
+                Severity::CouldNotRun => "no exit status — killed by a signal".to_string(),
             },
         ),
     };
@@ -576,6 +640,13 @@ pub fn main_targo(ctx: &Ctx, args: Vec<String>) -> Cmd {
     let mut cmd = Cmd::new(&ctx.tools.targo);
     if let Some(value) = &ctx.main_build_dir {
         cmd = cmd.arg("--config").arg(value);
+        if aterm_toolchain::build_cache::loses_config(
+            &args,
+            aterm_toolchain::build_cache::Tool::Targo,
+        ) && let Some(directory) = aterm_toolchain::build_cache::directory_from_config(value)
+        {
+            cmd = cmd.env(aterm_toolchain::build_cache::BUILD_DIR_ENV, directory);
+        }
     }
     cmd.args(args)
 }
@@ -685,32 +756,171 @@ fn test_doc_binding(ctx: &Ctx) -> (&'static str, bool) {
     }
 }
 
-fn test_compile(ctx: &Ctx, r: &mut Report) {
+/// The test compile, or one call of it when it is shaped ([`crate::shape`]): a cut over its own
+/// crates ([`piece_compile_args`]), the closing call today's command over the run's selection.
+/// Behind a call that did not pass, a call is COULD NOT RUN and starts no cargo.
+fn test_compile(ctx: &Ctx, spec: &StageSpec, r: &mut Report) {
     if !ctx.tools.have_targo() {
         r.cannot_run(ctx.tools.missing_targo_label());
         return;
     }
-    let label = format!("targo test {} --no-run", ctx.scope.label());
+    let cut = spec
+        .part
+        .as_ref()
+        .filter(|p| p.shaped() && !p.closing())
+        .map(|p| &p.piece);
+    let label = format!(
+        "targo test {} --no-run",
+        cut.map_or_else(|| ctx.scope.label(), crate::shape::Piece::label)
+    );
     if ctx.scope.selects_nothing() {
         r.skip(format!("{label} {EMPTY_CONE}"));
         return;
     }
+    if ctx
+        .test_compile_failed
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        not_run_behind(
+            r,
+            &label,
+            "an earlier call of this test compile failed, and a call behind it would build what \
+             failed again",
+        );
+        return;
+    }
+    if let Some(part) = spec
+        .part
+        .as_ref()
+        .filter(|p| p.closing() && !p.refused.is_empty())
+    {
+        keep_refusals(ctx, part);
+    }
     let (suffix, bind) = test_doc_binding(ctx);
-    let [compile, _] = test_cmds(ctx, bind);
-    let _ = compile_tests(ctx, r, &format!("{label}{suffix}"), &compile);
+    let compile = match cut {
+        Some(piece) => {
+            let c = main_targo(ctx, piece_compile_args(piece));
+            if bind { with_trustdoc(ctx, c) } else { c }.demoted()
+        }
+        None => {
+            let [compile, _] = test_cmds(ctx, bind);
+            compile
+        }
+    };
+    let began = std::time::SystemTime::now();
+    let (compiled, _, artifacts) = compile_tests(ctx, r, &format!("{label}{suffix}"), &compile);
+    if !compiled {
+        ctx.test_compile_failed
+            .store(true, std::sync::atomic::Ordering::Release);
+    } else if let Some(part) = spec.part.as_ref().filter(|p| p.shaped()) {
+        shape_after(ctx, part, &artifacts, began);
+    }
 }
 
-fn compile_tests(
-    ctx: &Ctx,
-    r: &mut Report,
-    label: &str,
-    compile: &Cmd,
-) -> (bool, Result<Vec<crate::testrun::TestExe>, String>) {
+/// The closing call `part` keeps again each refusal its plan read ([`crate::shape::Part::refused`],
+/// [`crate::memory::Book::refuse`]), so none it keeps reading becomes its record's oldest row;
+/// one it could not keep goes on its time line.
+fn keep_refusals(ctx: &Ctx, part: &crate::shape::Part) {
+    let Some(book) = ctx.memory.as_ref() else {
+        return;
+    };
+    let whole = crate::shape::Piece::of(ctx.scope.crates(), false);
+    let checkout = ctx.root.display().to_string();
+    let failed: Vec<String> = part
+        .refused
+        .iter()
+        .filter_map(|cut| {
+            book.refuse(&crate::shape::refusal_key(&checkout, &whole, cut))
+                .err()
+                .map(|e| {
+                    format!(
+                        "shape: the refusal of `{}` was not kept again: {e}",
+                        cut.label()
+                    )
+                })
+        })
+        .collect();
+    if !failed.is_empty() {
+        said_on(ctx, part.index, failed.join("; "));
+    }
+}
+
+/// Add `said` to what call `index`'s time line says of its shaping ([`crate::shape::Run::said`]).
+fn said_on(ctx: &Ctx, index: usize, said: String) {
+    ctx.shape_run
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .said
+        .entry(index)
+        .and_modify(|s| {
+            s.push_str("; ");
+            s.push_str(&said);
+        })
+        .or_insert(said);
+}
+
+/// What a test compile's child did: whether it passed, the test executables it built, and every
+/// artifact it reported ([`crate::shape::artifacts`]).
+type Compiled = (
+    bool,
+    Result<Vec<crate::testrun::TestExe>, String>,
+    Vec<crate::shape::Artifact>,
+);
+
+fn compile_tests(ctx: &Ctx, r: &mut Report, label: &str, compile: &Cmd) -> Compiled {
     let mut out = exec::run(compile, ctx.exec_env());
+    let artifacts = crate::shape::artifacts(&out.output);
     let exes = crate::testrun::take_test_executables(&mut out.output);
     r.raw(out.output.as_str());
     r.decide_child(&out, label);
-    (out.ok, exes)
+    (out.ok, exes, artifacts)
+}
+
+/// After call `part` of a shaped test compile, which began at `began`, passed with `artifacts`: a
+/// cut keeps the files it built, and when it began, for the calls after it; every later call
+/// checks the earlier cuts' files came back fresh ([`crate::shape::fresh_check`], the sources it
+/// rebuilt from read under the checkout: [`crate::shape::changed_since`]), and keeps a refusal row
+/// for each cut that did not ([`crate::shape::refusal_key`]), so no later run cuts it; what it
+/// found goes on the call's time line.
+fn shape_after(
+    ctx: &Ctx,
+    part: &crate::shape::Part,
+    artifacts: &[crate::shape::Artifact],
+    began: std::time::SystemTime,
+) {
+    let mut run = ctx
+        .shape_run
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (refused, said) =
+        crate::shape::fresh_check(&run.built, artifacts, part.closing(), &|since| {
+            crate::shape::changed_since(&ctx.root, artifacts, since)
+        });
+    let whole = crate::shape::Piece::of(ctx.scope.crates(), false);
+    let checkout = ctx.root.display().to_string();
+    let mut said = vec![said]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>();
+    for (cut, _) in &refused {
+        let key = crate::shape::refusal_key(&checkout, &whole, cut);
+        if let Some(Err(e)) = ctx.memory.as_ref().map(|b| b.refuse(&key)) {
+            said.push(format!("shape: the refusal was not kept: {e}"));
+        }
+        run.built.retain(|(c, _, _)| c != cut);
+    }
+    if !part.closing() {
+        let files = artifacts
+            .iter()
+            .filter(|a| !a.fresh)
+            .flat_map(|a| a.filenames.iter().cloned())
+            .collect();
+        run.built.push((part.piece.clone(), files, began));
+    }
+    drop(run);
+    if !said.is_empty() {
+        said_on(ctx, part.index, said.join("; "));
+    }
 }
 
 fn test_cmds(ctx: &Ctx, bind: bool) -> [Cmd; 2] {
@@ -772,15 +982,20 @@ fn test(ctx: &Ctx, r: &mut Report) {
     let (suffix, bind) = test_doc_binding(ctx);
     let [compile, run] = test_cmds(ctx, bind);
     let run_label = format!("{label} --tests{suffix}");
+    let behind = "the compile above failed, and cargo runs no test after a compile error";
+    if ctx
+        .test_compile_failed
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        not_run_behind(r, &run_label, behind);
+        return;
+    }
     let compile_label = format!("{label} --no-run{suffix}");
-    let (compiled, exes) = compile_tests(ctx, r, &compile_label, &compile);
+    let (compiled, exes, _) = compile_tests(ctx, r, &compile_label, &compile);
     if compiled {
         crate::testrun::run_tests(ctx, r, &run_label, &run, exes);
     } else {
-        r.cannot_run(format!(
-            "{run_label} — the compile above failed, and cargo runs no test after a compile error{}",
-            NOT_RUN_BEHIND
-        ));
+        not_run_behind(r, &run_label, behind);
     }
 }
 
@@ -914,7 +1129,14 @@ struct MeasuringCounts {
 impl MeasuringCounts {
     fn parse(fields: &str) -> Option<Self> {
         let mut fields = fields.split_whitespace();
-        let mut count = |key: &str| fields.next()?.strip_prefix(key)?.parse().ok();
+        let mut count = |key: &str| {
+            fields
+                .next()?
+                .strip_prefix(key)
+                .filter(|v| v.bytes().all(|b| b.is_ascii_digit()))?
+                .parse()
+                .ok()
+        };
         let counts = Self {
             planned: count("planned=")?,
             passed: count("passed=")?,
@@ -1135,8 +1357,10 @@ fn names_rustdoc(line: &str) -> bool {
 fn tippy_cmd(ctx: &Ctx, bin: &std::path::Path, args: Vec<String>) -> Cmd {
     let dir = bin.parent().unwrap_or(&ctx.tools.stage2_dir).to_path_buf();
     let mut path = std::ffi::OsString::from(dir.as_os_str());
-    path.push(":");
-    path.push(&ctx.path_env);
+    if !ctx.path_env.is_empty() {
+        path.push(if cfg!(windows) { ";" } else { ":" });
+        path.push(&ctx.path_env);
+    }
     let cmd = if ctx.tools.borrowed(crate::toolchain::TIPPY) == Some(bin) {
         Cmd::new(bin).env("TRUST_STAGE2_BIN", &dir)
     } else {
@@ -1536,7 +1760,7 @@ pub fn redraw_outcome(code: Option<i32>) -> (Outcome, String) {
         ),
         None => (
             Outcome::Fail(Severity::CouldNotRun),
-            "aterm-redraw-conformance: no exit status — killed by a signal, or never spawned".to_string(),
+            "aterm-redraw-conformance: no exit status — killed by a signal".to_string(),
         ),
     }
 }
@@ -1564,12 +1788,9 @@ fn redraw_conformance(ctx: &Ctx, r: &mut Report) {
         return;
     }
     let out = exec::run(&Cmd::new(&bin), ctx.exec_env());
-    r.raw(out.output.as_str());
-    let (outcome, label) = redraw_outcome(out.code);
-    if r.child_could_not_run(&out, &label) {
-        return;
-    }
-    r.record_child(&out, outcome, label);
+    r.record_driven(&out, "aterm-redraw-conformance", |code, _| {
+        redraw_outcome(code)
+    });
 }
 
 fn objc_drives(ctx: &Ctx, r: &mut Report) {
@@ -1606,12 +1827,7 @@ fn objc_drive(ctx: &Ctx, r: &mut Report, drive: &ObjcDrive) {
         return;
     }
     let out = exec::run(&Cmd::new(&bin), ctx.exec_env());
-    r.raw(out.output.as_str());
-    let (outcome, label) = objc_drive_outcome(drive, out.code);
-    if r.child_could_not_run(&out, &label) {
-        return;
-    }
-    r.record_child(&out, outcome, label);
+    r.record_driven(&out, name, |code, _| objc_drive_outcome(drive, code));
 }
 
 /// `targo --unverified build --profile test -q -p aterm -p aterm-lab --bin aterm --bin aterm-lab`: the lab and the one binary it drives ([`MAIN_PROFILE`]).
@@ -1715,7 +1931,7 @@ pub fn lab_lane_outcome(
                 .lines()
                 .find_map(|l| l.split_once(crate::findings::CEILING_KILL))
                 .map_or_else(
-                    || format!("{name}: no exit status — killed by a signal, or never spawned"),
+                    || format!("{name}: no exit status — killed by a signal"),
                     |(_, kill)| format!("{name}: no exit status — ended at the ceiling{kill}"),
                 ),
         ),
@@ -1778,12 +1994,7 @@ fn codex_alab_proof(ctx: &Ctx, r: &mut Report) {
         }
     }
     let out = exec::run(&codex_alab_proof_cmd(ctx), ctx.exec_env());
-    r.raw(out.output.as_str());
-    let (outcome, label) = codex_alab_proof_outcome(out.code, &out.output);
-    if r.child_could_not_run(&out, &label) {
-        return;
-    }
-    r.record_child(&out, outcome, label);
+    r.record_driven(&out, name, codex_alab_proof_outcome);
 }
 
 // The guest compiles on a stock toolchain (STOCK EXCEPTION: no Linux build of Trust exists).
@@ -1878,12 +2089,7 @@ fn linux_lane(ctx: &Ctx, r: &mut Report) {
         return;
     }
     let out = exec::run(&linux_lane_cmd(ctx), ctx.exec_env());
-    r.raw(out.output.as_str());
-    let (outcome, label) = linux_lane_outcome(out.code, &out.output);
-    if r.child_could_not_run(&out, &label) {
-        return;
-    }
-    r.record_child(&out, outcome, label);
+    r.record_driven(&out, name, linux_lane_outcome);
 }
 
 fn wasm_glue(ctx: &Ctx, r: &mut Report) {
@@ -2174,6 +2380,7 @@ mod tests {
             exclusive: false,
             after_stages: Vec::new(),
             mem: 0,
+            part: None,
         };
         let tmp = crate::mktemp_dir("atv-doc-scope").expect("mktemp");
         let documented = tmp.join("crates/documented");
@@ -2188,9 +2395,17 @@ mod tests {
             "/// ```\n/// assert!(true);\n/// ```\npub fn f() {}\n",
         )
         .unwrap();
+        #[cfg(unix)]
+        let ok_targo = PathBuf::from("/usr/bin/true");
+        #[cfg(not(unix))]
+        let ok_targo = {
+            let p = tmp.join("true.cmd");
+            std::fs::write(&p, "@exit /b 0\r\n").unwrap();
+            p
+        };
         let no_driver = |scope| {
             let mut c = ctx(scope);
-            c.tools.targo = PathBuf::from("/usr/bin/true");
+            c.tools.targo = ok_targo.clone();
             c.tools.trustdoc = PathBuf::from("/nonexistent/trustdoc");
             c.path_env = "/nonexistent-dir".into();
             c.root = tmp.clone();
@@ -2361,22 +2576,26 @@ mod tests {
     #[test]
     fn the_stand_in_drives_rustdoc_only_where_the_scan_cleared_a_library() {
         let (driver, skip_env) = (crate::docdriver::DRIVER_ENV, crate::docdriver::SKIP_ENV);
+        let stage2 = std::path::absolute("/stage2/trustdoc").expect("absolute");
+        let caller = std::path::absolute("/caller/rustdoc").expect("absolute");
+        let recorder = std::path::absolute("/bin/aterm-verify").expect("absolute");
         let mut c = ctx(Scope::workspace());
-        c.tools.trustdoc = PathBuf::from("/stage2/trustdoc");
-        c.test_recorder = Some(PathBuf::from("/bin/aterm-verify"));
-        c.env.rustdoc_override = Some("/caller/rustdoc".into());
+        c.tools.trustdoc = stage2.clone();
+        c.test_recorder = Some(recorder.clone());
+        c.env.rustdoc_override = Some(caller.clone().into_os_string());
         let skip = ["other".to_string(), "plain".to_string()];
-        for (kind, real) in [
-            (DocDriver::Stage2, "/stage2/trustdoc"),
-            (DocDriver::Ambient, "/caller/rustdoc"),
-        ] {
+        for (kind, real) in [(DocDriver::Stage2, &stage2), (DocDriver::Ambient, &caller)] {
             let cmd = doctest_cmd(&c, &kind, &skip);
             assert_eq!(
                 env_of(&cmd, "RUSTDOC"),
-                Some("/bin/aterm-verify".into()),
+                Some(recorder.clone().into_os_string()),
                 "{kind:?}"
             );
-            assert_eq!(env_of(&cmd, driver), Some(real.into()), "{kind:?}");
+            assert_eq!(
+                env_of(&cmd, driver),
+                Some(real.clone().into_os_string()),
+                "{kind:?}"
+            );
             assert_eq!(
                 env_of(&cmd, skip_env),
                 Some("other,plain".into()),
@@ -2385,8 +2604,7 @@ mod tests {
             let cmd = doctest_cmd(&c, &kind, &[]);
             assert_eq!(env_of(&cmd, driver), None, "{kind:?}");
             assert_eq!(env_of(&cmd, skip_env), None, "{kind:?}");
-            let bound =
-                (kind == DocDriver::Stage2).then(|| std::ffi::OsString::from("/stage2/trustdoc"));
+            let bound = (kind == DocDriver::Stage2).then(|| stage2.clone().into_os_string());
             assert_eq!(env_of(&cmd, "RUSTDOC"), bound, "{kind:?}");
         }
     }
@@ -2636,6 +2854,7 @@ mod tests {
                     exclusive: false,
                     after_stages: Vec::new(),
                     mem: 0,
+                    part: None,
                 },
             );
             let outcomes: Vec<_> = r.outcomes().collect();
@@ -2667,13 +2886,16 @@ mod tests {
             env_of(&cmd, "TRUST_STAGE2_BIN").as_deref(),
             Some("/m/store/trust/9192/bin")
         );
-        assert!(
-            env_of(&cmd, "PATH").is_some_and(|p| p.starts_with("/m/store/trust/9192/bin:")),
+        assert_eq!(
+            env_of(&cmd, "PATH")
+                .as_deref()
+                .and_then(|p| std::env::split_paths(p).next()),
+            Some(PathBuf::from("/m/store/trust/9192/bin")),
             "{cmd:?}"
         );
         assert_eq!(
             crate::fmt::borrowed_suffix(&c, TIPPY),
-            " (the managed Trust build's /m/store/trust/9192/bin/targo-tippy)"
+            format!(" (the managed Trust build's {})", managed.display())
         );
         let own = c.tools.stage2_dir.join(TIPPY);
         c.tools.tippy = Some(own.clone());
@@ -2871,13 +3093,412 @@ mod tests {
         assert_eq!(row(false), 0);
     }
 
+    /// EACH CALL OF A SHAPED TEST COMPILE RUNS ITS OWN COMMAND, THE CLOSING ONE TODAY'S: a
+    /// stand-in targo traces each start, and the calls `-p aterm-gui --lib`, `-p aterm-gui` and
+    /// the run's selection start `test -p aterm-gui ... --lib --no-run`, the same with `--tests`,
+    /// and the unshaped command byte for byte, each under the main lane's build directory. Once
+    /// a call fails, the calls behind it are COULD NOT RUN and start nothing. NEGATIVE CONTROL:
+    /// the same three calls with none failing start three commands.
+    #[cfg(unix)]
+    #[test]
+    fn each_call_of_a_shaped_test_compile_runs_its_own_command() {
+        use crate::shape::{Part, Piece};
+        let tmp = std::fs::canonicalize(crate::mktemp_dir("atv-shape-calls").expect("mktemp"))
+            .expect("real");
+        let trace = tmp.join("starts");
+        let targo = tmp.join("bin/targo");
+        crate::standin_body(
+            &targo,
+            &format!(
+                "echo \"$*\" >> '{}'\nread code < '{}'\nexit \"$code\"",
+                trace.display(),
+                tmp.join("code").display()
+            ),
+        );
+        let gui = vec!["aterm-gui".to_owned()];
+        let pair = vec!["aterm-effects".to_owned(), "aterm-gui".to_owned()];
+        let lib = Piece::of(&gui, true);
+        let cut = Piece::of(&gui, false);
+        let whole = Piece::of(&pair, false);
+        let calls = |c: &Ctx| -> Vec<StageSpec> {
+            let declared = crate::plan::declared(&c.scope).remove(0);
+            [
+                (&lib, 0, vec![]),
+                (&cut, 1, vec![lib.clone()]),
+                (&whole, 2, vec![lib.clone(), cut.clone()]),
+            ]
+            .into_iter()
+            .map(|(piece, index, after)| StageSpec {
+                part: Some(Part {
+                    piece: piece.clone(),
+                    index,
+                    of: 3,
+                    after,
+                    said: String::new(),
+                    planned: None,
+                    refused: Vec::new(),
+                }),
+                ..declared.clone()
+            })
+            .collect()
+        };
+        type Rows = Vec<Vec<(crate::Outcome, String)>>;
+        let run = |code: &str| -> (Rows, Vec<String>, Ctx) {
+            std::fs::write(tmp.join("code"), code).expect("code");
+            std::fs::create_dir_all(tmp.join("scratch")).expect("scratch");
+            let _ = std::fs::remove_file(&trace);
+            let mut c = Ctx::new(
+                tmp.clone(),
+                Scope::packages(&pair),
+                EnvSnapshot::default(),
+                tmp.join("scratch"),
+            );
+            c.tools.targo = targo.clone();
+            let rows = calls(&c)
+                .iter()
+                .map(|spec| {
+                    let mut r = Report::new(spec.title.clone());
+                    test_compile(&c, spec, &mut r);
+                    r.outcomes().map(|(o, l)| (o, l.to_owned())).collect()
+                })
+                .collect();
+            let starts = std::fs::read_to_string(&trace)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
+                .collect();
+            (rows, starts, c)
+        };
+
+        let (rows, starts, c) = run("0");
+        assert!(
+            rows.iter()
+                .all(|r| r.iter().all(|(o, _)| *o == crate::Outcome::Ok)),
+            "{rows:?}"
+        );
+        let lead = format!(
+            "--config {}",
+            c.main_build_dir.as_deref().expect("a build dir")
+        );
+        let tail = "--no-fail-fast --tests --no-run --message-format=json-render-diagnostics";
+        assert_eq!(
+            starts,
+            [
+                format!(
+                    "{lead} --unverified test -p aterm-gui --no-fail-fast --lib --no-run --message-format=json-render-diagnostics"
+                ),
+                format!("{lead} --unverified test -p aterm-gui {tail}"),
+                test_cmds(&c, false)[0].argv()[1..].join(" "),
+            ]
+        );
+        assert_eq!(
+            starts[2],
+            format!("{lead} --unverified test -p aterm-effects -p aterm-gui {tail}")
+        );
+
+        let (rows, starts, _) = run("101");
+        assert_eq!(starts.len(), 1, "{starts:?}");
+        assert!(matches!(rows[0][0].0, crate::Outcome::Fail(_)), "{rows:?}");
+        for behind in &rows[1..] {
+            assert_eq!(behind.len(), 1);
+            assert_eq!(
+                behind[0].0,
+                crate::Outcome::Fail(crate::Severity::CouldNotRun)
+            );
+            assert!(
+                behind[0]
+                    .1
+                    .contains("an earlier call of this test compile failed"),
+                "{behind:?}"
+            );
+        }
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A CUT THE CLOSING CALL REBUILT IS REFUSED FOR THE NEXT RUN: a stand-in targo reports the
+    /// lib-test call building `libaterm_gui-1.rlib`, and the closing call reporting it again,
+    /// fresh or not. Fresh, the closing call's time line says so and the book keeps no refusal;
+    /// rebuilt, the book keeps the refusal row the planner reads ([`crate::shape::refusal_key`])
+    /// and the time line names it. NEGATIVE CONTROL: the fresh run keeps no row.
+    #[cfg(unix)]
+    #[test]
+    fn a_cut_the_closing_call_rebuilt_is_refused_for_the_next_run() {
+        use crate::shape::{Part, Piece};
+        let tmp = std::fs::canonicalize(crate::mktemp_dir("atv-shape-fresh").expect("mktemp"))
+            .expect("real");
+        std::fs::create_dir_all(tmp.join("scratch")).expect("scratch");
+        let targo = tmp.join("bin/targo");
+        let artifact = |fresh: &str| {
+            format!(
+                "{{\"reason\":\"compiler-artifact\",\"filenames\":[\"/d/libaterm_gui-1.rlib\"],\
+                 \"fresh\":{fresh}}}"
+            )
+        };
+        crate::standin_body(
+            &targo,
+            &format!(
+                "read fresh < '{}'\ncase \"$*\" in *--lib*) echo '{}';; *) echo \"$fresh\";; esac",
+                tmp.join("closing").display(),
+                artifact("false")
+            ),
+        );
+        let gui = vec!["aterm-gui".to_owned()];
+        let lib = Piece::of(&gui, true);
+        let whole = Piece::of(&gui, false);
+        let run = |fresh: &str| -> (crate::memory::Records, Option<String>) {
+            std::fs::write(tmp.join("closing"), artifact(fresh)).expect("closing");
+            let path = tmp.join(format!("book-{fresh}.json"));
+            let mut c = Ctx::new(
+                tmp.clone(),
+                Scope::packages(&gui),
+                EnvSnapshot::default(),
+                tmp.join("scratch"),
+            )
+            .with_memory(crate::memory::Book::at(
+                Some(path),
+                Some(24 << 30),
+                Some(21 << 30),
+            ));
+            c.tools.targo = targo.clone();
+            let declared = crate::plan::declared(&c.scope).remove(0);
+            for (piece, index, after) in [(&lib, 0, vec![]), (&whole, 1, vec![lib.clone()])] {
+                let spec = StageSpec {
+                    part: Some(Part {
+                        piece: piece.clone(),
+                        index,
+                        of: 2,
+                        after,
+                        said: String::new(),
+                        planned: None,
+                        refused: Vec::new(),
+                    }),
+                    ..declared.clone()
+                };
+                let mut r = Report::new(spec.title.clone());
+                test_compile(&c, &spec, &mut r);
+                assert!(
+                    r.outcomes().all(|(o, _)| o == crate::Outcome::Ok),
+                    "{}",
+                    r.render()
+                );
+            }
+            let said = c
+                .shape_run
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .said
+                .remove(&1);
+            (c.memory.as_ref().expect("a book").records(), said)
+        };
+        let refused = crate::shape::refusal_key(&tmp.display().to_string(), &whole, &lib);
+
+        let (records, said) = run("true");
+        assert!(records.rows().iter().all(|r| r.key != refused));
+        assert_eq!(
+            said.as_deref(),
+            Some("shape: fresh here: `-p aterm-gui --lib`'s 1 file")
+        );
+
+        let (records, said) = run("false");
+        assert!(
+            records.rows().iter().any(|r| r.key == refused),
+            "{:?}",
+            records.rows()
+        );
+        assert!(said.is_some_and(|s| s.contains("`-p aterm-gui --lib` refused: it rebuilt")));
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A CUT REBUILT FROM A SOURCE EDITED UNDER THE RUN IS NOT REFUSED: a stand-in targo reports
+    /// the lib-test call building `deps/libaterm_gui-1.rlib` and the closing call rebuilding it;
+    /// its dep-info lists `crates/aterm-gui/src/lib.rs`, under the checkout. Modified after the
+    /// cut began (an edit by the person or another agent in the worktree), the book keeps no
+    /// refusal and the time line names the source; unchanged since, the cut is refused as the
+    /// proof's miss. NEGATIVE CONTROL, by hand: with the sources unread, the edited run kept the
+    /// refusal, and every later run of the selection would have been one call claiming the
+    /// whole estimate alone.
+    #[cfg(unix)]
+    #[test]
+    fn a_cut_rebuilt_from_a_source_edited_under_the_run_is_not_refused() {
+        use crate::shape::{Part, Piece};
+        let tmp = std::fs::canonicalize(crate::mktemp_dir("atv-shape-edit").expect("mktemp"))
+            .expect("real");
+        std::fs::create_dir_all(tmp.join("scratch")).expect("scratch");
+        let deps = tmp.join("build/deps");
+        std::fs::create_dir_all(&deps).expect("deps");
+        let source = tmp.join("crates/aterm-gui/src/lib.rs");
+        std::fs::create_dir_all(source.parent().expect("its folder")).expect("src");
+        std::fs::write(&source, "").expect("source");
+        let rlib = deps.join("libaterm_gui-1.rlib");
+        std::fs::write(
+            deps.join("aterm_gui-1.d"),
+            format!("{}: crates/aterm-gui/src/lib.rs\n", rlib.display()),
+        )
+        .expect("dep-info");
+        let targo = tmp.join("bin/targo");
+        crate::standin_body(
+            &targo,
+            &format!(
+                "echo '{{\"reason\":\"compiler-artifact\",\"filenames\":[\"{}\"],\"fresh\":false}}'",
+                rlib.display()
+            ),
+        );
+        let gui = vec!["aterm-gui".to_owned()];
+        let lib = Piece::of(&gui, true);
+        let whole = Piece::of(&gui, false);
+        let run = |at: std::time::SystemTime| -> (crate::memory::Records, Option<String>) {
+            std::fs::File::options()
+                .write(true)
+                .open(&source)
+                .and_then(|f| f.set_modified(at))
+                .expect("its time");
+            let path = tmp.join("book.json");
+            let _ = std::fs::remove_file(&path);
+            let mut c = Ctx::new(
+                tmp.clone(),
+                Scope::packages(&gui),
+                EnvSnapshot::default(),
+                tmp.join("scratch"),
+            )
+            .with_memory(crate::memory::Book::at(
+                Some(path),
+                Some(24 << 30),
+                Some(21 << 30),
+            ));
+            c.tools.targo = targo.clone();
+            let declared = crate::plan::declared(&c.scope).remove(0);
+            for (piece, index, after) in [(&lib, 0, vec![]), (&whole, 1, vec![lib.clone()])] {
+                let spec = StageSpec {
+                    part: Some(Part {
+                        piece: piece.clone(),
+                        index,
+                        of: 2,
+                        after,
+                        said: String::new(),
+                        planned: None,
+                        refused: Vec::new(),
+                    }),
+                    ..declared.clone()
+                };
+                let mut r = Report::new(spec.title.clone());
+                test_compile(&c, &spec, &mut r);
+                assert!(
+                    r.outcomes().all(|(o, _)| o == crate::Outcome::Ok),
+                    "{}",
+                    r.render()
+                );
+            }
+            let said = c
+                .shape_run
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .said
+                .remove(&1);
+            (c.memory.as_ref().expect("a book").records(), said)
+        };
+        let refused = crate::shape::refusal_key(&tmp.display().to_string(), &whole, &lib);
+        let day = std::time::Duration::from_secs(24 * 3600);
+        let now = std::time::SystemTime::now();
+
+        let (records, said) = run(now + day);
+        assert!(
+            records.rows().iter().all(|r| r.key != refused),
+            "{:?}",
+            records.rows()
+        );
+        assert!(
+            said.as_deref().is_some_and(|s| s.contains(
+                "not refused, its sources changed under the run: `-p aterm-gui --lib` (it rebuilt \
+                 1 of its artifacts, and `crates/aterm-gui/src/lib.rs` changed after it began)"
+            )),
+            "{said:?}"
+        );
+
+        let (records, said) = run(now - day);
+        assert!(records.rows().iter().any(|r| r.key == refused));
+        assert!(said.is_some_and(|s| s.contains("`-p aterm-gui --lib` refused: it rebuilt")));
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A REFUSAL ITS SELECTION KEEPS READING IS KEPT AGAIN, SO IT OUTLIVES THE RECORD'S CHURN: the
+    /// one call a refused cut left S1's test compile in keeps the refusal row again as it runs,
+    /// its newest peak now, so 512 rows kept after the first refusal (the record keeps 512, and
+    /// lets the one whose newest peak is oldest go) leave it in place. NEGATIVE CONTROL, by hand:
+    /// with the refusal not kept again, the 512 rows pushed it out, and the next run would have
+    /// cut S1 the same wrong way.
+    #[cfg(unix)]
+    #[test]
+    fn a_refusal_its_selection_keeps_reading_outlives_the_records_churn() {
+        use crate::shape::{Part, Piece};
+        let tmp = std::fs::canonicalize(crate::mktemp_dir("atv-shape-keep").expect("mktemp"))
+            .expect("real");
+        std::fs::create_dir_all(tmp.join("scratch")).expect("scratch");
+        let targo = tmp.join("bin/targo");
+        crate::standin_body(&targo, "exit 0");
+        let s1 = crate::shape::tests::s1();
+        let whole = Piece::of(&s1, false);
+        let peel: Vec<String> = s1.iter().filter(|c| *c != "aterm-gui").cloned().collect();
+        let peel = Piece::of(&peel, false);
+        let path = tmp.join("book.json");
+        let refused = crate::shape::refusal_key(&tmp.display().to_string(), &whole, &peel);
+        let mut first = crate::memory::Records::default();
+        first.push(refused.clone(), 0, 9);
+        first.save(&path).expect("saved");
+        let mut c = Ctx::new(
+            tmp.clone(),
+            Scope::packages(&s1),
+            EnvSnapshot::default(),
+            tmp.join("scratch"),
+        )
+        .with_memory(crate::memory::Book::at(
+            Some(path.clone()),
+            Some(24 << 30),
+            Some(21 << 30),
+        ));
+        c.tools.targo = targo;
+        let mut part = Part::whole(whole, String::new());
+        part.refused = vec![peel];
+        let spec = StageSpec {
+            part: Some(part),
+            ..crate::plan::declared(&c.scope).remove(0)
+        };
+        let mut r = Report::new(spec.title.clone());
+        test_compile(&c, &spec, &mut r);
+        assert!(
+            r.outcomes().all(|(o, _)| o == crate::Outcome::Ok),
+            "{}",
+            r.render()
+        );
+        let mut records = crate::memory::Records::load(&path);
+        let rows = u64::try_from(crate::memory::ROWS_KEPT).expect("a count");
+        for at in 10..10 + rows {
+            records.push(
+                crate::memory::Key {
+                    stage: "Test".to_owned(),
+                    checkout: format!("/churn/{at}"),
+                    crates: None,
+                    variant: None,
+                },
+                1,
+                at,
+            );
+        }
+        assert!(
+            records.rows().iter().any(|r| r.key == refused),
+            "the refusal went: {} rows",
+            records.rows().len()
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
     #[test]
     fn no_targo_is_fail_closed_at_the_test_compile_and_honest_everywhere_after() {
         let c = ctx(Scope::workspace());
         assert!(!c.tools.have_targo());
 
         let mut r = Report::new("test compile");
-        test_compile(&c, &mut r);
+        let spec = crate::plan::declared(&c.scope).remove(0);
+        test_compile(&c, &spec, &mut r);
         let (outcome, label) = r.outcomes().next().expect("a decision");
         assert_eq!(
             outcome,
@@ -3318,20 +3939,24 @@ mod tests {
     #[test]
     fn the_main_lanes_children_lead_with_the_shims_build_dir() {
         let mut c = ctx(Scope::workspace());
-        let fallback = "build.build-dir='/repo/target/build.noindex'";
+        let repo_target = std::path::absolute(&c.target_dir).expect("absolute");
+        let fallback = format!(
+            "build.build-dir='{}'",
+            repo_target.join("build.noindex").display()
+        );
         assert_eq!(
             c.main_build_dir.as_deref(),
-            Some(fallback),
+            Some(fallback.as_str()),
             "no HOME in the fixture: no shim cache"
         );
         assert!(
             c.child_env_add
                 .iter()
-                .any(|(k, v)| k == "CARGO_TARGET_DIR" && v == "/repo/target")
+                .any(|(k, v)| k == "CARGO_TARGET_DIR" && v == c.target_dir.as_os_str())
         );
         assert_eq!(
             main_targo(&c, vec!["x".into()]).argv()[1..],
-            ["--config", fallback, "x"]
+            ["--config", fallback.as_str(), "x"]
         );
         let value = "build.build-dir='/h/Library/Caches/aterm/cargo-build.noindex{workspace-root}/.cargo-build'";
         c.main_build_dir = Some(value.to_string());
@@ -3343,7 +3968,32 @@ mod tests {
             &linux_lab_build_cmd(&c),
         ] {
             assert_eq!(cmd.argv()[1..3], ["--config", value], "{:?}", cmd.argv());
+            assert!(
+                !cmd.envs
+                    .iter()
+                    .any(|(name, _)| name == aterm_toolchain::build_cache::BUILD_DIR_ENV),
+                "a nested cargo in a build script must not inherit it: {:?}",
+                cmd.envs
+            );
         }
+        assert!(
+            main_targo(&c, vec!["tippy".into()])
+                .envs
+                .iter()
+                .any(
+                    |(name, directory)| name == aterm_toolchain::build_cache::BUILD_DIR_ENV
+                        && directory
+                            == aterm_toolchain::build_cache::directory_from_config(value).unwrap()
+                ),
+            "the same placement must reach an external subcommand"
+        );
+        c.main_build_dir = None;
+        assert!(
+            !main_targo(&c, vec!["tippy".into()])
+                .envs
+                .iter()
+                .any(|(name, _)| name == aterm_toolchain::build_cache::BUILD_DIR_ENV)
+        );
         assert!(
             !export_cmd(&c).argv().iter().any(|a| a == "--config"),
             "a side lane keeps its own dir"
@@ -3508,6 +4158,23 @@ mod tests {
         assert_eq!(
             std::path::Path::new(&cmd.argv()[0]).parent(),
             codex_aterm_binary(&c).parent()
+        );
+    }
+
+    #[test]
+    fn manifest_required_features_strips_comments_and_handles_single_quotes() {
+        let manifest = "[package]\nname = 'my-pkg'\n\
+                        [[bin]]\nname = \"b\"\n\
+                        required-features = [\n\
+                          \"feat-a\", # a comment with ] inside\n\
+                          'feat-b',\n\
+                        ]\n";
+        assert_eq!(
+            manifest_required_features(manifest),
+            vec![
+                ("my-pkg".to_string(), "feat-a".to_string()),
+                ("my-pkg".to_string(), "feat-b".to_string()),
+            ]
         );
     }
 }

@@ -976,6 +976,7 @@ fn the_backstop_swallows_only_a_spares_own_wakes() {
         Wake::CloseSession {
             session: id,
             by: crate::session_store::ExitActor::Human,
+            driver: None,
             reply: tx,
         }
         .local_session(),
@@ -2510,6 +2511,7 @@ impl TerminalSession {
             None,
             aterm_sandbox::Limits::inherit(),
             None,
+            None,
         )
         .expect("spawn the terminal's leader");
         let mut session = Self {
@@ -2951,36 +2953,25 @@ fn an_update_retires_the_spare_and_a_spare_is_never_activity() {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn a_promotion_runs_only_on_a_fresh_stamp_of_the_gate() {
-    use std::io::Read as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
     let mut app = app_in("/tmp");
     app.spares.captured = Some(Vec::new());
     app.spares.power = || false;
     app.config.spare_shell_needs_person = Some(false);
     let dir = aterm_tempfile::tempdir().expect("tempdir");
-    let fifo_at = dir.path().join("fifo");
+    let fifo = SpareFifo::make_at(dir.path().join("fifo")).expect("fifo");
+    let shell_end = fifo
+        .shell_end()
+        .try_clone_to_owned()
+        .expect("the shell's end");
     let id = app.next_session_id;
     app.next_session_id += 1;
     let slot = parked_slot(&app, id, Some("/tmp"));
-    slot.link
-        .witness
-        .hold_fifo(SpareFifo::make_at(fifo_at.clone()).expect("fifo"));
+    slot.link.witness.hold_fifo(fifo);
     app.spares.slot = Some(slot);
     let shared = Arc::clone(&app.spares.shared);
     shared.generation.store(7, Ordering::Release);
     shared.eligible.store(true, Ordering::Release);
-    let mut shell_end = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(&fifo_at)
-        .expect("the shell's end");
-    let mut read = move || {
-        let mut buf = [0u8; 16];
-        shell_end.read(&mut buf).map_or_else(
-            |_| String::new(),
-            |n| String::from_utf8_lossy(&buf[..n]).into_owned(),
-        )
-    };
+    let read = move || told(&shell_end);
     let asked = |app: &App| {
         app.spares.captured.as_ref().and_then(|jobs| {
             jobs.iter().rev().find_map(|j| match j {
@@ -3016,6 +3007,59 @@ fn a_promotion_runs_only_on_a_fresh_stamp_of_the_gate() {
     assert_eq!(state(&app), Some(SlotState::Warming));
     assert_eq!(app.spares.slot.as_ref().map(|s| s.generation), Some(8));
     assert_eq!(read(), "run\n");
+}
+
+/// What the hold's shell end holds now, read without waiting: the readable bytes when `poll` says
+/// there are any, else nothing (the end stays blocking, as the shell's is).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn told(end: &std::os::fd::OwnedFd) -> String {
+    use std::io::Read as _;
+    use std::os::fd::AsRawFd as _;
+    let mut poll = libc::pollfd {
+        fd: end.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `poll` reads and writes the one live `pollfd` above, with a zero timeout.
+    if unsafe { libc::poll(&raw mut poll, 1, 0) } != 1 || poll.revents & libc::POLLIN == 0 {
+        return String::new();
+    }
+    let mut buf = [0u8; 64];
+    let n = std::fs::File::from(end.try_clone().expect("a copy of the end"))
+        .read(&mut buf)
+        .expect("read the shell's end");
+    String::from_utf8_lossy(&buf[..n]).into_owned()
+}
+
+/// The FIFO hands its shell an end only its host writes: what `tell` writes reaches the shell's
+/// end, and once the `SpareFifo` drops (its session's first prompt, or the session's end), a copy
+/// of that end reads what was written, then end-of-file, which ends a shell still at a hold.
+/// Negative control: with `SpareFifo`'s shell end taken from the host's read-write open (the shape
+/// before the hold read a descriptor), the last assertion fails: that end is a writer itself, so it
+/// reads "would block" and never end-of-file.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_spare_fifo_hands_its_shell_an_end_only_its_host_writes() {
+    use std::io::Read as _;
+    let dir = aterm_tempfile::tempdir().expect("tempdir");
+    let fifo = SpareFifo::make_at(dir.path().join("fifo")).expect("fifo");
+    let shell = fifo
+        .shell_end()
+        .try_clone_to_owned()
+        .expect("the shell's end");
+    fifo.tell("run").expect("tell run");
+    assert_eq!(told(&shell), "run\n", "tell reaches the shell's end");
+    fifo.tell("go").expect("tell go");
+    drop(fifo);
+    let mut read = String::new();
+    let ended = std::fs::File::from(shell)
+        .read_to_string(&mut read)
+        .map_err(|e| e.kind());
+    assert_eq!(
+        (ended, read.as_str()),
+        (Ok(3), "go\n"),
+        "once its host drops, the end reads what was told, then end-of-file"
+    );
 }
 
 /// A spawned spare that misses `PARKED_DEADLINE` is retired and disables parked spares for that shell.
@@ -3471,9 +3515,60 @@ fn an_oversized_gate_snapshot_cannot_authorize_warm_startup() {
     assert!(!allowed, "oversized disk state authorized warm startup");
 }
 
-/// Gate persistence refuses to overwrite an existing staging file.
+/// A gate update publishes through a fresh owned stage, preserving an occupied ordinary entry
+/// or alias and its target. The ordinary update round-trips before any collision is planted.
 #[test]
 fn persisting_a_gate_never_overwrites_an_existing_staging_entry() {
+    const PRIVATE: &[u8] = b"private staging bytes\n";
+    let kinds = if cfg!(unix) {
+        &["file", "alias"][..]
+    } else {
+        &["file"][..]
+    };
+    let mut lost = Vec::new();
+    for &kind in kinds {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let path = gate_file(&dir);
+        let mut book = GateBook::at(Some(path.clone()));
+        for _ in 0..3 {
+            book.sample(0xa1, Sample::Clean { rc_ms: 1 });
+        }
+        assert!(GateBook::at(Some(path.clone())).eligible_at(0xa1, T));
+
+        let stage = dir.path().join("occupied");
+        let fresh = dir.path().join("fresh");
+        let target = dir.path().join("private-target");
+        std::fs::write(&target, PRIVATE).unwrap();
+        if kind == "file" {
+            std::fs::write(&stage, PRIVATE).unwrap();
+        } else {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&target, &stage).unwrap();
+        }
+        book.entry(0xa1).streak = 0;
+        let mut candidates = [stage.clone(), fresh.clone()].into_iter();
+        book.persist_with(|_| candidates.next().expect("two candidate names"));
+        assert!(
+            !GateBook::at(Some(path)).eligible_at(0xa1, T),
+            "the updated gate round-trips after a collision: {kind}"
+        );
+        assert!(!fresh.exists(), "the published owned stage is gone");
+        assert_eq!(std::fs::read(&target).unwrap(), PRIVATE);
+        let intact = if kind == "file" {
+            std::fs::read(&stage).ok().as_deref() == Some(PRIVATE)
+        } else {
+            std::fs::read_link(&stage).ok().as_deref() == Some(target.as_path())
+        };
+        if !intact {
+            lost.push(kind);
+        }
+    }
+    assert!(lost.is_empty(), "unowned staging entries changed: {lost:?}");
+}
+
+/// If all candidate names are occupied, the old book and occupants remain unchanged.
+#[test]
+fn exhausted_gate_staging_preserves_the_previous_book() {
     let dir = aterm_tempfile::tempdir().expect("tempdir");
     let path = gate_file(&dir);
     let mut book = GateBook::at(Some(path.clone()));
@@ -3482,10 +3577,11 @@ fn persisting_a_gate_never_overwrites_an_existing_staging_entry() {
     }
     assert!(GateBook::at(Some(path.clone())).eligible_at(0xa1, T));
     let before = std::fs::read(&path).unwrap();
-    let stage = path.with_extension(format!("tmp.{}", std::process::id()));
-    const PRIVATE: &[u8] = b"private staging bytes\n";
+    let stage = dir.path().join("occupied");
+    const PRIVATE: &[u8] = b"another writer's stage\n";
     std::fs::write(&stage, PRIVATE).unwrap();
-    book.sample(0xa1, Sample::Unclean);
+    book.entry(0xa1).streak = 0;
+    book.persist_with(|_| stage.clone());
     assert_eq!(
         std::fs::read(&stage).ok(),
         Some(PRIVATE.to_vec()),
@@ -3864,7 +3960,11 @@ fn too_many_gone_below_a_candidate_to_follow_is_no_answer() {
     }
 }
 
-/// Linux escape scan classifies orphans, session children, zombies, and foreign processes.
+/// Linux escape scan classifies orphans, session children, zombies, and foreign processes. A
+/// record is read by the shared `stat` parser, and a process reaped before its `stat` read
+/// (`ENOENT`, or `ESRCH` as the kernel answers a read of a task that died) is gone, not an
+/// unknown. NEGATIVE CONTROLS: read the parent from the group's field, and the record is
+/// another; judge `ESRCH` an error, and that process makes the scan unknown.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn the_linux_escape_scan_judges_each_kind_of_process_in_the_window() {
@@ -3873,6 +3973,23 @@ fn the_linux_escape_scan_judges_each_kind_of_process_in_the_window() {
     assert_eq!(
         read_proc_record(20, || Ok(line.into()), || Ok(501)).unwrap(),
         Some(proc_at(1, 20, 150))
+    );
+    assert_eq!(
+        read_proc_record(21, || Ok(line.into()), || Ok(501))
+            .unwrap_err()
+            .kind(),
+        ErrorKind::InvalidData,
+        "a line naming another pid"
+    );
+    assert_eq!(
+        read_proc_record(
+            20,
+            || Err(Error::from_raw_os_error(libc::ESRCH)),
+            || panic!("gone")
+        )
+        .map_err(|e| e.kind()),
+        Ok(None),
+        "a stat read of a task that died"
     );
     for kind in [ErrorKind::PermissionDenied, ErrorKind::InvalidData] {
         assert_eq!(
@@ -3910,17 +4027,6 @@ fn the_linux_escape_scan_judges_each_kind_of_process_in_the_window() {
             || Err(Error::from(ErrorKind::NotFound))
         )
         .unwrap(),
-        None
-    );
-    assert_eq!(
-        listed_proc_pids(["10", "self", "20", "-1"].map(|s| Ok(s.into()))),
-        Some(vec![10, 20])
-    );
-    assert_eq!(
-        listed_proc_pids([
-            Ok("10".into()),
-            Err(Error::from(ErrorKind::PermissionDenied))
-        ]),
         None
     );
     let fixture = || FixtureProcs {

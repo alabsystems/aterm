@@ -611,6 +611,8 @@ fn each_guard_in_hand_holds_the_due_line_once() {
                 reset_text: "-".to_string(),
                 extended: false,
                 raised: true,
+                worked: false,
+                message: String::new(),
             });
         }),
         ("act-untaken", "act-untaken", |s, on| {
@@ -631,10 +633,11 @@ fn each_guard_in_hand_holds_the_due_line_once() {
         }),
         ("wake-settle", "wake-settle", |s, on| {
             s.wake_settle = on.then(|| {
+                // Stamped as `settle_wake` stamps it: a settle the loop reads as still ahead.
                 let at = s.fx.mono() + Duration::from_secs(30);
                 let due = Due {
                     at,
-                    unix_ms: T0,
+                    unix_ms: s.unix_ms_of(at),
                     why: "the Mac woke".to_string(),
                     wait: WaitKind::Other,
                 };
@@ -1286,16 +1289,21 @@ fn a_tape_from_a_build_with_no_occupancy_door_replays_without_it() {
     };
     let is_said = |i: &Item| matches!(i.record(), Some(EffectRecord::Emit { door, .. }) if door == "host.occupancy_said");
     let is_book = |i: &Item| matches!(i.record(), Some(EffectRecord::Exchange { door, .. }) if door == "host.wakes");
-    // A build with no occupancy door had no reach peek either (a later door).
+    // A build with no occupancy door had no reach peek and no lasting hold either (later doors).
     let is_peek = |i: &Item| matches!(i.record(), Some(EffectRecord::Exchange { door, .. }) if door == "host.reach_peek");
+    let is_lasting = |i: &Item| matches!(i.record(), Some(EffectRecord::Emit { door, .. }) if door == "host.lasting_hold");
     let mut removed = vec![false; items.len()];
-    let (mut journals, mut ledgers, mut saids, mut books, mut peeks) = (0, 0, 0, 0, 0);
+    let (mut journals, mut ledgers, mut saids, mut books, mut peeks, mut lastings) =
+        (0, 0, 0, 0, 0, 0);
     for (at, item) in items.iter().enumerate() {
         if is_board(item) {
             removed[at] = true;
         } else if is_peek(item) {
             removed[at] = true;
             peeks += 1;
+        } else if is_lasting(item) {
+            removed[at] = true;
+            lastings += 1;
         } else if is_book(item) {
             removed[at] = true;
             books += 1;
@@ -1324,11 +1332,15 @@ fn a_tape_from_a_build_with_no_occupancy_door_replays_without_it() {
     assert!(saids >= 1, "the door told its host");
     assert!(books >= 1, "the loop read the book at the open hold");
     assert!(peeks >= 1, "the loop peeked the reach");
+    assert!(
+        lastings >= 1,
+        "the loop's first break told the host what holds"
+    );
     assert_eq!(
         removed.iter().filter(|gone| **gone).count(),
-        asks + books + saids + peeks + 2 * (journals + ledgers),
-        "only board exchanges, the book's reads, the host's tells, its reach peeks and identified \
-         row/stamp pairs"
+        asks + books + saids + peeks + lastings + 2 * (journals + ledgers),
+        "only board exchanges, the book's reads, the host's tells, its reach peeks, its lasting \
+         holds and identified row/stamp pairs"
     );
     let before_door: Vec<Item> = items
         .iter()

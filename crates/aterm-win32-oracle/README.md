@@ -35,7 +35,8 @@ It is the same STOCK EXCEPTION and reads no harvest or `--upstream` source.
 `targo --unverified verify cells` runs `oracle` and `oracle-052` as rows of its
 own whenever it checks a Windows cell (`win` or `win-arm`, both in its default
 set), so neither needs a hand step; `verify cells --cell win` runs them alone with
-that one cell.
+that one cell. A `-p` runs them only if it names `aterm-win32`, `windows-sys` or
+this crate.
 
 Exit 0 means all requested checks passed; 1 means a finding; 2 is usage; 3 means
 the check could not run. A build, clean or inspection failure never counts as a

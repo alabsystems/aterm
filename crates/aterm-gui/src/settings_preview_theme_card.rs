@@ -532,7 +532,13 @@ struct SlabColors {
 
 fn parse_slab(value: &str) -> Option<SlabColors> {
     let mut words = value.split_whitespace();
-    let mut color = || u32::from_str_radix(words.next()?, 16).ok();
+    let mut color = || {
+        let w = words.next()?;
+        w.bytes()
+            .all(|b| b.is_ascii_hexdigit())
+            .then(|| u32::from_str_radix(w, 16).ok())
+            .flatten()
+    };
     let bg = color()?;
     let fg = color()?;
     let dots = [color()?, color()?, color()?, color()?];

@@ -7,6 +7,7 @@
 //! storage, catalog cutoffs and resource admission belong above this boundary.
 
 pub mod conflict;
+mod signatures;
 pub mod store;
 
 use crate::{
@@ -133,14 +134,172 @@ pub struct Session<'a> {
     journal: Journal,
     access: Access,
     history: std::cell::RefCell<std::collections::BTreeMap<Digest, Historical>>,
+    generation: Option<crate::generation::Observation>,
+    generation_deadline: Option<std::time::Instant>,
 }
+
+/// Envelope authentication inside one source-pinned local read. The enclosing
+/// session rechecks custody and live context before returning its result.
+struct ReadBatch<'s, 'b> {
+    session: &'s Session<'b>,
+    scope: Scope,
+    keys: Option<ReadKeys>,
+    head: std::cell::OnceCell<ControlHead>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ControlHead {
+    Selected(Digest),
+    Unselected,
+    Uncertain,
+}
+
+struct ReadKey {
+    value: Zeroizing<[u8; 32]>,
+    reused: bool,
+}
+
+type ReadKeys = std::cell::RefCell<std::collections::BTreeMap<Digest, ReadKey>>;
+
+/// Local source guards bound to the exact session they protect. Reusing these
+/// guards avoids nesting read locks behind a waiting vault writer.
+struct SourceReads<'s, 'b> {
+    session: &'s Session<'b>,
+    _reads: Vec<aterm_secrets::client::CommonsSourceRead>,
+}
+
+impl SourceReads<'_, '_> {
+    fn with_read_batch<T>(
+        &self,
+        scope: Scope,
+        read: impl FnOnce(&ReadBatch<'_, '_>) -> Result<T>,
+    ) -> Result<T> {
+        self.session.read_context(scope)?;
+        let batch = ReadBatch {
+            session: self.session,
+            scope,
+            keys: Some(ReadKeys::default()),
+            head: std::cell::OnceCell::new(),
+        };
+        let result = read(&batch)?;
+        batch.revalidate()?;
+        drop(batch);
+        self.session
+            .bootstrap
+            .revalidate_custody()
+            .map_err(failure)?;
+        self.session.read_context(scope)?;
+        Ok(result)
+    }
+
+    /// Store opens already fence their single-record replay before finalization.
+    /// Keep its ordinary per-call admission when there is no key reuse to amortize.
+    fn with_store_replay<T>(
+        &self,
+        scope: Scope,
+        records: usize,
+        read: impl FnOnce(&ReadBatch<'_, '_>) -> Result<T>,
+    ) -> Result<T> {
+        if records > 1 {
+            self.with_read_batch(scope, read)
+        } else {
+            read(&ReadBatch {
+                session: self.session,
+                scope,
+                keys: None,
+                head: std::cell::OnceCell::new(),
+            })
+        }
+    }
+}
+
+impl ReadBatch<'_, '_> {
+    fn discarded_source(&self, envelope: &Envelope<'_>) -> Result<bool> {
+        if self.keys.is_none() {
+            return self.session.discarded_source(envelope);
+        }
+        // The enclosing source-pinned batch checks the complete current view
+        // before returning. Reuse only its head, never a decision about a record.
+        self.session.classify_discarded_source(
+            envelope,
+            *self.head.get_or_init(|| self.session.control_head()),
+        )
+    }
+
+    fn revalidate(&self) -> Result<()> {
+        // Restoring a file cannot undo uncertainty this batch already observed.
+        if self.head.get() == Some(&ControlHead::Uncertain) {
+            return Err(Error::snapshot_changed());
+        }
+        if let Some(keys) = &self.keys {
+            let histories = self.session.history.borrow();
+            for (roster, key) in &*keys.borrow() {
+                if key.reused {
+                    histories[roster]
+                        .with_key(&self.session.journal, |_| ())
+                        .map_err(failure)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn authenticate(&self, wire: &[u8]) -> Result<Record> {
+        self.open_envelope(Envelope::parse(self.scope, wire)?)
+    }
+
+    fn open_envelope(&self, envelope: Envelope<'_>) -> Result<Record> {
+        self.session
+            .decode_envelope(self.scope, envelope, false, self.keys.as_ref())?
+            .ok_or_else(|| Error::new("table payload authentication failed"))
+    }
+}
+
 impl<'a> Session<'a> {
     pub(crate) fn has_control_writer(&self) -> bool {
         self.journal.is_writer()
     }
 
+    /// The authenticated custody supplying this session, including a selected successor.
+    pub(crate) fn paths(&self) -> &aterm_secrets::client::Paths {
+        self.bootstrap.paths()
+    }
+
     pub(crate) const fn is_log_backed(&self) -> bool {
         self.access.is_log_backed()
+    }
+
+    pub(crate) fn check_known_actor(&self, actor: &Actor) -> Result<()> {
+        if self.access.is_log_backed() {
+            if self
+                .access
+                .members()
+                .iter()
+                .any(|m| m.binding().actor() == *actor)
+            {
+                return Ok(());
+            }
+            if aterm_secrets::client::trusted_commons_log(
+                self.bootstrap.paths(),
+                self.bootstrap.trust(),
+            )
+            .map_err(failure)?
+            .is_some_and(|(log, _)| log.has_known_actor(actor))
+            {
+                return Ok(());
+            }
+            return self
+                .journal
+                .retained_constraints()
+                .map_err(failure)?
+                .check_known_actor(actor)
+                .map_err(failure);
+        }
+        self.journal
+            .constraints()
+            .map_err(failure)?
+            .check_known_actor(actor)
+            .map_err(failure)
     }
 
     pub(crate) fn historical_writer_in(&self, roster: &Digest, actor: &Actor) -> bool {
@@ -179,11 +338,32 @@ impl<'a> Session<'a> {
         Ok(observation)
     }
 
+    /// Older wire commitment from this same validated access snapshot. Local
+    /// batches still fence on [`Self::observation`], including selected bindings.
+    pub(crate) fn legacy_observation(&self) -> Result<Option<[u8; 64]>> {
+        if !self.access.is_log_backed() {
+            return Ok(None);
+        }
+        self.observation()?;
+        let mut observation = [0; 64];
+        observation[..32].copy_from_slice(self.access.control_history_head());
+        observation[32..].copy_from_slice(self.access.basis());
+        Ok(Some(observation))
+    }
+
     /// Every current member's binding, for an application that names who has answered.
     pub(crate) fn members(&self) -> Vec<aterm_secrets::commons::binding::Binding> {
+        let roster = aterm_secrets::client::swarm_roster(self.bootstrap.paths())
+            .ok()
+            .flatten();
         self.access
             .members()
             .iter()
+            .filter(|member| {
+                !roster
+                    .as_ref()
+                    .is_some_and(|r| binding_denied_in_roster(r, member.binding()))
+            })
             .map(|member| member.binding().clone())
             .collect()
     }
@@ -204,12 +384,107 @@ impl<'a> Session<'a> {
         if !self.access.is_current(&self.journal) {
             return Err(Error::new("Commons membership changed during table repair"));
         }
+        let roster = aterm_secrets::client::swarm_roster(self.bootstrap.paths())
+            .ok()
+            .flatten();
         self.access
             .members()
             .iter()
-            .find(|member| member.binding().actor() == actor)
+            .find(|member| {
+                member.binding().actor() == actor
+                    && !roster
+                        .as_ref()
+                        .is_some_and(|r| binding_denied_in_roster(r, member.binding()))
+            })
             .map(|member| member.binding().clone())
             .ok_or_else(|| Error::new("table repair peer is not a current member"))
+    }
+
+    /// A credential contributor or custodian must still be a current Writer, rather
+    /// than merely possess historical authority evidence accepted for control repair.
+    pub(crate) fn peer_writer(
+        &self,
+        actor: Actor,
+    ) -> Result<aterm_secrets::commons::binding::Binding> {
+        let binding = self.peer(actor)?;
+        if !self
+            .access
+            .members()
+            .iter()
+            .any(|member| member.binding().actor() == actor && member.role() == Role::Writer)
+        {
+            return Err(Error::new("credential peer is not a current Writer"));
+        }
+        Ok(binding)
+    }
+
+    /// Every binding [`Self::members`] names whose actor [`Self::peer_writer`] accepts, under
+    /// one membership check and one roster read rather than one of each per member (each roster
+    /// read verifies the vault and its log).
+    pub(crate) fn writers(&self) -> Vec<aterm_secrets::commons::binding::Binding> {
+        if !self.access.is_current(&self.journal) {
+            return Vec::new();
+        }
+        let members = self.access.members();
+        self.members()
+            .into_iter()
+            .filter(|binding| {
+                members.iter().any(|member| {
+                    member.binding().actor() == binding.actor() && member.role() == Role::Writer
+                })
+            })
+            .collect()
+    }
+
+    /// Current admitted writers only; duplicate stable machine identities are
+    /// retained so an intent issuer can refuse an ambiguous target.
+    pub(crate) fn account_targets(&self) -> Result<Vec<aterm_secrets::commons::binding::Binding>> {
+        self.writer()?;
+        self.observed_account_targets()
+    }
+
+    /// Current Writer identities as metadata. Observation neither requires nor
+    /// grants a local mutation lease; authority is rechecked at every write.
+    pub(crate) fn observed_account_targets(
+        &self,
+    ) -> Result<Vec<aterm_secrets::commons::binding::Binding>> {
+        if !self.access.is_current(&self.journal) {
+            return Err(Error::new(
+                "Commons membership changed during target observation",
+            ));
+        }
+        let roster = aterm_secrets::client::swarm_roster(self.bootstrap.paths())
+            .ok()
+            .flatten();
+        Ok(self
+            .access
+            .members()
+            .iter()
+            .filter(|member| {
+                member.role() == Role::Writer
+                    && !roster
+                        .as_ref()
+                        .is_some_and(|r| binding_denied_in_roster(r, member.binding()))
+            })
+            .map(|member| member.binding().clone())
+            .collect())
+    }
+
+    pub(crate) fn sign_credential_delivery(
+        &self,
+        exchange: &aterm_secrets::need::transfer::Exchange,
+        values: &aterm_secrets::need::transfer::Values,
+    ) -> Result<Vec<u8>> {
+        self.may_write()?;
+        if exchange.holder != self.actor() || exchange.network != self.bootstrap.trust().network {
+            return Err(Error::new(
+                "credential delivery has another holder or network",
+            ));
+        }
+        self.bootstrap
+            .device()
+            .with_seed(|seed| exchange.seal(seed, values))
+            .map_err(failure)
     }
 
     /// Probe a bounded window of selected historical rosters, even when a lost
@@ -304,11 +579,15 @@ impl<'a> Session<'a> {
     /// Open a fresh, locked authorization batch, allowing another local writer
     /// to finish until `deadline`. Replay and current membership checks run only
     /// after acquiring the lock. Share the deadline with bootstrap admission.
+    /// After admission, generation checks receive fresh bounded budgets; the
+    /// lock-wait deadline is not an expiration of this session's authority.
     pub fn open_until(bootstrap: &'a Bootstrap, deadline: std::time::Instant) -> Result<Self> {
         let journal =
             Journal::open_existing_until(bootstrap.journal_dir(), bootstrap.trust(), deadline)
                 .map_err(failure)?;
-        Self::from_admitted_journal(bootstrap, journal)
+        let mut session = Self::from_admitted_journal_until(bootstrap, journal, Some(deadline))?;
+        session.generation_deadline = None;
+        Ok(session)
     }
 
     /// Authorize a local batch using the fresh, exclusively locked journal from
@@ -318,6 +597,14 @@ impl<'a> Session<'a> {
     /// A journal from another custody directory is refused even with equal trust.
     /// Drop this session before network I/O.
     pub fn from_admitted_journal(bootstrap: &'a Bootstrap, journal: Journal) -> Result<Self> {
+        Self::from_admitted_journal_until(bootstrap, journal, None)
+    }
+
+    pub(crate) fn from_admitted_journal_until(
+        bootstrap: &'a Bootstrap,
+        journal: Journal,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Self> {
         if journal.directory() != bootstrap.journal_dir() {
             return Err(Error::new(
                 "Commons session journal belongs to another custody directory",
@@ -329,7 +616,7 @@ impl<'a> Session<'a> {
             ));
         }
         bootstrap.revalidate_custody().map_err(failure)?;
-        Self::from_journal(bootstrap, journal)
+        Self::from_journal(bootstrap, journal, deadline)
     }
 
     /// Observe existing custody through a read-only control view, so another
@@ -345,10 +632,43 @@ impl<'a> Session<'a> {
         let journal =
             Journal::read_existing(bootstrap.journal_dir(), bootstrap.trust()).map_err(failure)?;
         bootstrap.revalidate_custody().map_err(failure)?;
-        Self::from_journal(bootstrap, journal)
+        Self::from_journal(bootstrap, journal, None)
     }
 
-    fn from_journal(bootstrap: &'a Bootstrap, journal: Journal) -> Result<Self> {
+    pub(crate) fn observe_until(
+        bootstrap: &'a Bootstrap,
+        deadline: std::time::Instant,
+    ) -> Result<Self> {
+        let journal =
+            Journal::read_existing(bootstrap.journal_dir(), bootstrap.trust()).map_err(failure)?;
+        bootstrap.revalidate_custody().map_err(failure)?;
+        Self::from_journal(bootstrap, journal, Some(deadline))
+    }
+
+    fn from_journal(
+        bootstrap: &'a Bootstrap,
+        journal: Journal,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Self> {
+        let generation = if crate::generation::is_candidate(bootstrap.paths()) {
+            let capture = if journal.is_writer() {
+                crate::generation::Observation::capture
+            } else {
+                crate::generation::Observation::observe
+            };
+            Some(capture(
+                bootstrap.paths(),
+                deadline.unwrap_or_else(crate::admission::deadline),
+            )?)
+        } else {
+            match deadline {
+                Some(deadline) => {
+                    crate::generation::guard_until(bootstrap.paths(), false, deadline)?
+                }
+                None => crate::generation::guard(bootstrap.paths(), false)?,
+            }
+            None
+        };
         let access = bootstrap
             .access_in(&journal)
             .map_err(failure)?
@@ -358,6 +678,8 @@ impl<'a> Session<'a> {
             journal,
             access,
             history: std::cell::RefCell::default(),
+            generation,
+            generation_deadline: deadline,
         })
     }
     pub fn actor(&self) -> Actor {
@@ -372,6 +694,68 @@ impl<'a> Session<'a> {
         self.writer()?;
         admin
             .prepare_account_decision(self.bootstrap, &self.journal, request)
+            .map_err(failure)
+    }
+
+    pub(crate) fn issue_account_with_intent(
+        &self,
+        admin: &aterm_secrets::client::Admin,
+        request: aterm_secrets::commons::accounts::Request,
+        intent: &aterm_secrets::commons::accounts::Record,
+    ) -> Result<aterm_secrets::commons::accounts::Record> {
+        self.writer()?;
+        admin
+            .prepare_account_decision_with_intent(self.bootstrap, &self.journal, request, intent)
+            .map_err(failure)
+    }
+
+    pub(crate) fn issue_account_with_recovered_issuer(
+        &self,
+        paths: &aterm_secrets::client::Paths,
+        admin: &aterm_secrets::client::Admin,
+        request: aterm_secrets::commons::accounts::Request,
+        intent: &aterm_secrets::commons::accounts::Record,
+        deadline: std::time::Instant,
+    ) -> Result<aterm_secrets::commons::accounts::Record> {
+        self.writer()?;
+        let aterm_secrets::commons::accounts::Action::Intent(terms) = &intent.request().action
+        else {
+            return Err(Error::new("account issuer succession needs an intent"));
+        };
+        let lineage = crate::generation::lineage_in(paths, self, deadline)?;
+        let predecessor =
+            crate::generation::issuer_predecessor(paths, self, &terms.issuer, deadline)?;
+        let proof = admin
+            .account_issuer_succession(predecessor, self.bootstrap, &self.journal, intent)
+            .map_err(failure)?;
+        if crate::generation::lineage_in(paths, self, deadline)? != lineage {
+            return Err(Error::new("account issuer succession changed"));
+        }
+        let decision = admin
+            .prepare_account_decision_after_succession(
+                self.bootstrap,
+                &self.journal,
+                request,
+                intent,
+                &proof,
+            )
+            .map_err(failure)?;
+        if crate::generation::lineage_in(paths, self, deadline)? != lineage {
+            return Err(Error::new(
+                "account issuer succession changed before commit",
+            ));
+        }
+        Ok(decision)
+    }
+
+    pub(crate) fn account_binding_unchanged(
+        &self,
+        admin: &aterm_secrets::client::Admin,
+        record: &aterm_secrets::commons::accounts::Record,
+    ) -> Result<()> {
+        self.writer()?;
+        admin
+            .account_binding_unchanged(self.bootstrap, &self.journal, record)
             .map_err(failure)
     }
 
@@ -414,7 +798,21 @@ impl<'a> Session<'a> {
         self.writer()?;
         Scope::fresh(self.journal.trust())
     }
+    fn local_source_reads(&self) -> Result<SourceReads<'_, 'a>> {
+        let mut reads = vec![self.bootstrap.local_source_read().map_err(failure)?];
+        if let Some(generation) = &self.generation {
+            reads.extend(generation.local_source_reads()?);
+        }
+        Ok(SourceReads {
+            session: self,
+            _reads: reads,
+        })
+    }
+
     fn context(&self, scope: Scope) -> Result<()> {
+        if self.generation.is_some() {
+            self.generation_guard(false)?;
+        }
         if scope.trust != self.journal.trust() || !self.access.is_current(&self.journal) {
             return Err(Error::new(
                 "table has another trust context or stale membership",
@@ -425,7 +823,13 @@ impl<'a> Session<'a> {
     /// Whether the current membership grants this device table writing: [`Self::writer`]'s role
     /// and currency, without the journal writer lock a read does not hold.
     pub(crate) fn may_write(&self) -> Result<()> {
-        if self.access.local().role() != Role::Writer || !self.access.is_current(&self.journal) {
+        if self.access.local().role() != Role::Writer
+            || !self.access.is_current(&self.journal)
+            || aterm_secrets::client::swarm_roster(self.bootstrap.paths())
+                .ok()
+                .flatten()
+                .is_some_and(|r| binding_denied_in_roster(&r, self.access.local().binding()))
+        {
             return Err(Error::new(
                 "current Commons membership does not grant table writing",
             ));
@@ -433,15 +837,44 @@ impl<'a> Session<'a> {
         Ok(())
     }
     pub(crate) fn writer(&self) -> Result<()> {
+        self.generation_guard(true)?;
         if !self.journal.is_writer()
             || self.access.local().role() != Role::Writer
             || !self.access.is_current(&self.journal)
+            || aterm_secrets::client::swarm_roster(self.bootstrap.paths())
+                .ok()
+                .flatten()
+                .is_some_and(|r| binding_denied_in_roster(&r, self.access.local().binding()))
         {
             return Err(Error::new(
                 "current Commons membership does not grant table writing",
             ));
         }
         Ok(())
+    }
+
+    fn generation_guard(&self, authoring: bool) -> Result<()> {
+        let Some(observation) = &self.generation else {
+            return crate::generation::guard(self.bootstrap.paths(), authoring);
+        };
+        observation.check(
+            authoring,
+            false,
+            self.generation_deadline
+                .unwrap_or_else(crate::admission::deadline),
+        )
+    }
+
+    pub(crate) fn mutation_guard(&self) -> Result<()> {
+        let Some(observation) = &self.generation else {
+            return crate::generation::allow_mutation(self.bootstrap.paths());
+        };
+        observation.check(
+            false,
+            true,
+            self.generation_deadline
+                .unwrap_or_else(crate::admission::deadline),
+        )
     }
     /// Internal envelope codec for the store's locked commit path and protocol
     /// fixtures. These signed bytes must never escape before durable storage.
@@ -583,13 +1016,36 @@ impl<'a> Session<'a> {
         self.open_envelope(scope, self.envelope(scope, wire)?)
     }
 
+    /// Amortize live context checks across a bounded local interpretation. Each
+    /// envelope still verifies its historical writer, signature and ciphertext.
+    /// No result leaves until custody and context have been checked again. The
+    /// callback performs no publication or network I/O while source guards live.
+    fn with_read_batch<T>(
+        &self,
+        scope: Scope,
+        read: impl FnOnce(&ReadBatch<'_, '_>) -> Result<T>,
+    ) -> Result<T> {
+        self.local_source_reads()?.with_read_batch(scope, read)
+    }
+
+    fn read_context(&self, scope: Scope) -> Result<()> {
+        let current = Journal::read_existing(self.bootstrap.journal_dir(), self.bootstrap.trust())
+            .map_err(failure)?;
+        // The projection includes retained restrictive facts as well as the
+        // selected roster. A changed prefix needs a fresh complete observation.
+        if !current.inventory().eq(self.journal.inventory()) || !self.access.is_current(&current) {
+            return Err(Error::snapshot_changed());
+        }
+        self.context(scope)
+    }
+
     fn envelope<'w>(&self, scope: Scope, wire: &'w [u8]) -> Result<Envelope<'w>> {
         self.context(scope)?;
         Envelope::parse(scope, wire)
     }
 
     fn open_envelope(&self, scope: Scope, envelope: Envelope<'_>) -> Result<Record> {
-        self.decode_envelope(scope, envelope, false)?
+        self.decode_envelope(scope, envelope, false, None)?
             .ok_or_else(|| Error::new("table payload authentication failed"))
     }
 
@@ -597,7 +1053,7 @@ impl<'a> Session<'a> {
     /// history still withholds evaluation; invalid payloads or writer roles do
     /// not make an obsolete certificate a fault of an unrelated writer.
     fn negative_record(&self, scope: Scope, wire: &[u8]) -> Result<Option<Record>> {
-        self.decode_envelope(scope, self.envelope(scope, wire)?, true)
+        self.decode_envelope(scope, self.envelope(scope, wire)?, true, None)
     }
 
     fn decode_envelope(
@@ -605,6 +1061,7 @@ impl<'a> Session<'a> {
         scope: Scope,
         envelope: Envelope<'_>,
         negative: bool,
+        keys: Option<&ReadKeys>,
     ) -> Result<Option<Record>> {
         let Envelope {
             roster,
@@ -637,20 +1094,44 @@ impl<'a> Session<'a> {
             return Err(Error::new("record lacks an exact historical writer grant"));
         }
         let mut payload = Zeroizing::new(body.to_vec());
-        let len = history
-            .with_key(&self.journal, |network_key| {
-                Ok::<_, Error>(
-                    crypto::cipher(&scope.key(&roster, epoch, network_key), &salt, aad)?
-                        .open_in_place(
-                            aead::Nonce::assume_unique_for_key([0; 12]),
-                            aead::Aad::from(aad),
-                            &mut payload,
-                        )
-                        .ok()
-                        .map(|plain| plain.len()),
+        let mut open = |key: &[u8; 32]| -> Result<Option<usize>> {
+            Ok(crypto::cipher(key, &salt, aad)?
+                .open_in_place(
+                    aead::Nonce::assume_unique_for_key([0; 12]),
+                    aead::Aad::from(aad),
+                    &mut payload,
                 )
-            })
-            .map_err(failure)??;
+                .ok()
+                .map(|plain| plain.len()))
+        };
+        let len = if let Some(keys) = keys {
+            // Only a source-pinned ReadBatch supplies this map. It validates
+            // each historical key at acquisition, revalidates reused keys
+            // before returning, and erases the derived keys with the batch.
+            let mut keys = keys.borrow_mut();
+            let key = match keys.entry(roster) {
+                std::collections::btree_map::Entry::Occupied(entry) => {
+                    let key = entry.into_mut();
+                    key.reused = true;
+                    key
+                }
+                std::collections::btree_map::Entry::Vacant(entry) => entry.insert(ReadKey {
+                    value: history
+                        .with_key(&self.journal, |network_key| {
+                            scope.key(&roster, epoch, network_key)
+                        })
+                        .map_err(failure)?,
+                    reused: false,
+                }),
+            };
+            open(&key.value)?
+        } else {
+            history
+                .with_key(&self.journal, |network_key| {
+                    open(&scope.key(&roster, epoch, network_key))
+                })
+                .map_err(failure)??
+        };
         let Some(len) = len else { return Ok(None) };
         payload.truncate(len);
         Ok(Some(Record {
@@ -665,11 +1146,36 @@ impl<'a> Session<'a> {
 
     // Only classifies source metadata. The store must first prove these exact
     // bytes were already witnessed; this never authorizes remote ingestion.
-    fn discarded_source(&self, envelope: &Envelope<'_>) -> bool {
-        use aterm_secrets::commons::{constraints::Fact, journal::State};
-        let State::Ready { head, .. } = self.journal.state() else {
-            return false;
-        };
+    fn discarded_source(&self, envelope: &Envelope<'_>) -> Result<bool> {
+        self.classify_discarded_source(envelope, self.control_head())
+    }
+
+    fn control_head(&self) -> ControlHead {
+        match self.journal.state() {
+            aterm_secrets::commons::journal::State::Ready { head, .. } => {
+                ControlHead::Selected(head)
+            }
+            aterm_secrets::commons::journal::State::Uncertain => ControlHead::Uncertain,
+            // A log-backed member can still be authorized when the legacy
+            // control journal has a signed fork but selects no data branch.
+            _ => ControlHead::Unselected,
+        }
+    }
+
+    fn classify_discarded_source(
+        &self,
+        envelope: &Envelope<'_>,
+        head: ControlHead,
+    ) -> Result<bool> {
+        match head {
+            ControlHead::Selected(head) => Ok(self.discarded_source_at(envelope, head)),
+            ControlHead::Unselected => Ok(false),
+            ControlHead::Uncertain => Err(Error::snapshot_changed()),
+        }
+    }
+
+    fn discarded_source_at(&self, envelope: &Envelope<'_>, head: Digest) -> bool {
+        use aterm_secrets::commons::constraints::Fact;
         let Some(node) = self.journal.node(&envelope.roster) else {
             return false;
         };
@@ -767,17 +1273,10 @@ impl<'w> Envelope<'w> {
         }
         let aad_end = wire.len() - r.remaining();
         let body = r.take(n)?;
-        let signed_end = wire.len() - r.remaining();
-        let signature = r.take(64)?;
+        r.take(64)?;
         r.end()?;
-        crypto::verify(
-            &actor[..32].try_into().unwrap(),
-            DOMAIN,
-            &wire[..signed_end],
-            signature,
-        )?;
         let header = Header {
-            id: Sha256::digest(wire),
+            id: signatures::verify(&actor[..32].try_into().unwrap(), wire)?,
             actor,
             sequence,
             previous,
@@ -809,6 +1308,22 @@ fn check_shape(header: Header) -> Result<()> {
         .insert(header)
         .map(|_| ())
         .map_err(|_| Error::new("malformed table causal header"))
+}
+
+pub(crate) fn binding_denied_in_roster(
+    roster: &aterm_secrets::swarm_roster::SwarmRoster,
+    binding: &aterm_secrets::commons::binding::Binding,
+) -> bool {
+    if roster.is_node_denied(&aterm_codec::hex::encode_lower(binding.writer()))
+        || roster.is_node_denied(&aterm_codec::hex::encode_lower(binding.incarnation()))
+        || roster.is_node_denied(&aterm_codec::hex::encode_lower(binding.machine()))
+    {
+        return true;
+    }
+    let rec_str = binding.recipient().to_bech32();
+    roster
+        .member_by_recipient(&rec_str)
+        .is_some_and(|member| roster.is_member_denied(member))
 }
 
 #[cfg(test)]

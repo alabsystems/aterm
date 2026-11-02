@@ -575,7 +575,7 @@ mod tests {
 
     fn names(set: &BTreeSet<PathBuf>) -> Vec<String> {
         set.iter()
-            .map(|p| p.strip_prefix("/c/src").unwrap().display().to_string())
+            .map(|p| crate::rel_path(Path::new("/c/src"), p))
             .collect()
     }
 
@@ -614,7 +614,7 @@ mod tests {
             .map(|c| {
                 format!(
                     "{}:{} `{}` under {}",
-                    c.file.display(),
+                    crate::slash(&c.file),
                     c.line,
                     c.loader,
                     c.gate

@@ -360,24 +360,39 @@ pub enum Mark {
 /// Read the legacy mark beside `log`, returning [`Mark::Unreadable`] if present but invalid.
 #[must_use]
 pub fn read_mark(log: &Path) -> Mark {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
     let path = mark_path(log);
-    match std::fs::read(&path) {
-        Ok(bytes) => {
-            let line = bytes.split(|b| *b == b'\n').next().unwrap_or_default();
-            line.strip_prefix(b"boot=")
-                .and_then(astream_sys::parse_boot_id)
-                .map_or(Mark::Unreadable, Mark::Boot)
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+    let f = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(&path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // A dangling link is something at the name, not an absent mark.
-            if std::fs::symlink_metadata(&path).is_ok() {
+            return if std::fs::symlink_metadata(&path).is_ok() {
                 Mark::Unreadable
             } else {
                 Mark::Absent
-            }
+            };
         }
-        Err(_) => Mark::Unreadable,
+        Err(_) => return Mark::Unreadable,
+    };
+    let Ok(meta) = f.metadata() else {
+        return Mark::Unreadable;
+    };
+    if !meta.is_file() {
+        return Mark::Unreadable;
     }
+    let mut bytes = Vec::with_capacity(256);
+    if f.take(4096).read_to_end(&mut bytes).is_err() {
+        return Mark::Unreadable;
+    }
+    let line = bytes.split(|b| *b == b'\n').next().unwrap_or_default();
+    line.strip_prefix(b"boot=")
+        .and_then(astream_sys::parse_boot_id)
+        .map_or(Mark::Unreadable, Mark::Boot)
 }
 
 /// Why a legacy mark made this open's verdict unclean.
@@ -466,23 +481,30 @@ pub fn open(
     durability: Durability,
     boot: Option<[u8; 16]>,
 ) -> io::Result<Opened> {
-    open_escalating(log, secret, durability, boot, Vec::new())
+    open_escalating(log, secret, durability, boot, Vec::new(), None)
 }
 
-/// [`open`] with `extra` escalation rules appended (used by dev fault-injection seams).
+/// [`open`] with `extra` escalation rules appended (used by dev fault-injection seams), and sealed
+/// at rest under `at_rest` (`crate::at_rest::prepare` decides it): keyed and bound, so a log whose
+/// `.seal` is gone refuses rather than reads as an older unbound one. No anti-rollback: astream
+/// keeps that for Strict, and this broker defaults to Ordered.
 /// # Errors
 ///
-/// As [`open`], and astream's refusal of a rule that does not parse.
+/// As [`open`], astream's refusal of a rule that does not parse, and its refusal of a key that is
+/// not the log's.
 pub fn open_escalating(
     log: &Path,
     secret: Option<Vec<u8>>,
     durability: Durability,
     boot: Option<[u8; 16]>,
     extra: Vec<astream_broker::Escalate>,
+    at_rest: Option<[u8; 32]>,
 ) -> io::Result<Opened> {
     let mut opts = durability.options();
     opts.boot = boot.map_or(astream_broker::Boot::Unknown, astream_broker::Boot::Known);
     opts.guard = secret;
+    opts.require_bound_at_rest = at_rest.is_some();
+    opts.at_rest_key = at_rest;
     if aterm_types::dev_seam!(VOLUME_SEAM).is_some_and(|v| v == "other") {
         opts.volume = astream_broker::Volume::Other;
     }
@@ -958,6 +980,11 @@ mod tests {
         std::fs::remove_file(mark_path(&log)).unwrap();
         std::os::unix::fs::symlink("gone", mark_path(&log)).unwrap();
         assert_eq!(read_mark(&log), Mark::Unreadable, "a dangling link");
+        let target = dir.path().join("real-mark");
+        std::fs::write(&target, legacy_mark_text(&one)).unwrap();
+        std::fs::remove_file(mark_path(&log)).unwrap();
+        std::os::unix::fs::symlink(&target, mark_path(&log)).unwrap();
+        assert_eq!(read_mark(&log), Mark::Unreadable, "a live link");
     }
 
     fn kernel_boot_text() -> Option<String> {

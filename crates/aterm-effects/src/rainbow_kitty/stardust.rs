@@ -885,7 +885,7 @@ impl Finish {
     #[inline]
     #[must_use]
     fn ends(&self) -> Instant {
-        self.at + std::time::Duration::from_secs_f32(self.span_s.max(0.0))
+        crate::effect_util::saturating_add_secs_f32(self.at, self.span_s.max(0.0))
     }
 
     #[inline]
@@ -899,7 +899,10 @@ impl Finish {
     #[inline]
     #[must_use]
     fn cull_at(&self) -> Instant {
-        self.at + std::time::Duration::from_secs_f32(self.span_s.max(0.0) * STAR_CULL_SPAN_SHARE)
+        crate::effect_util::saturating_add_secs_f32(
+            self.at,
+            self.span_s.max(0.0) * STAR_CULL_SPAN_SHARE,
+        )
     }
 }
 
@@ -5100,6 +5103,9 @@ fn settle_under_ceiling(
         halo_color: u32,
         halo_wt: u8,
     ) -> u32 {
+        if k == 0 {
+            return 0;
+        }
         let mut own = 0u32;
         if maskable {
             while qmask != 0 {
@@ -5654,6 +5660,7 @@ mod tests {
             theme_bg: if dark { 0x0000_0000 } else { 0x00FF_FFFF },
             reduced_motion: false,
             light: crate::cursor_glow::Light::OFF,
+            head_dx: 0.5,
         }
     }
 

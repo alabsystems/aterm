@@ -2220,7 +2220,7 @@ impl Predictor {
             Op::Insert => {
                 // R-ROW: the buffer's end, one cell on, short of the last
                 // column, as the chain's own fold keeps it.
-                if *cur > *len || *len + 2 > cells.len() {
+                if *cur > *len || len.checked_add(2).is_none_or(|n| n > cells.len()) {
                     return false;
                 }
                 if let Some(span) = cells.get_mut(*cur..=*len) {

@@ -79,12 +79,12 @@ allow-wildcard-paths = true
 # verification (`index.toml` / `pkg.toml`) and OpenPGP RSA digest verification.
 #
 # First-party crates use `aterm_uds::rand` for CSPRNG entropy. `getrandom` 0.2
-# is patched to `crates/aterm-getrandom` (`aterm_uds::rand`) for `ring`;
-# `fastrand` is restricted to the listed third-party parents.
+# is patched to `crates/aterm-getrandom` (`aterm_uds::rand`) for `ring` and `astream-aead`;
+# `fastrand` and the `rand` family are banned outright.
 deny = [
-    { name = "ring", version = "<0.17.14", reason = "atpkg's load-bearing Ed25519 and OpenPGP RSA verify root (TOOLCHAIN-PACKAGE-MANAGER.md S8/S13): never allow it to drift below the audited, vendored floor on the verify path" },
-    { name = "getrandom", wrappers = ["ring"], reason = "entropy comes from aterm_uds::rand; getrandom is its first-party facade (crates/aterm-getrandom), admitted only as ring's seed source" },
-    { name = "fastrand", wrappers = ["async-executor", "futures-lite", "phf_generator", "piper"], reason = "entropy comes from aterm_uds::rand; the Linux stack's own uses (phf's table generator, the wayland async helpers) are the admitted parents" },
+    { name = "ring", version = "<0.17.14", reason = "atpkg's load-bearing Ed25519 and OpenPGP RSA verify root (TOOLCHAIN-PACKAGE-MANAGER.md S8/S13): never allow it to drift below the audited floor on the verify path" },
+    { name = "getrandom", wrappers = ["astream-aead", "ring"], reason = "entropy comes from aterm_uds::rand; getrandom is its first-party facade (crates/aterm-getrandom), admitted only as the seed source of ring and of astream-aead, which seals the bus log at rest" },
+    { name = "fastrand", reason = "entropy comes from aterm_uds::rand" },
     { name = "rand", reason = "entropy comes from aterm_uds::rand" },
     { name = "rand_core", reason = "entropy comes from aterm_uds::rand" },
     { name = "rand_chacha", reason = "entropy comes from aterm_uds::rand" },

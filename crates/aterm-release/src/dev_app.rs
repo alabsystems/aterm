@@ -44,13 +44,16 @@ const EXEC_MARKS: &str = ".aterm-dev-app.exec.noindex";
 const INSTALL_LOCK: &str = ".aterm-dev-app.lock";
 
 pub const USAGE: &str = "
-  targo --unverified ship dev-app [--sign-id IDENTITY] [--out DIRECTORY]
+  targo --unverified ship dev-app [--profile release|test] [--sign-id IDENTITY] [--out DIRECTORY]
                  [--no-install | --install-dir DIRECTORY] [--no-link] [--no-pin]
       Build this checkout, dirty or not, into `aterm (dev).app` with the Trust
-      toolchain the cutter resolves (`targo --unverified build --release -p
-      aterm`): its own bundle id (com.aterm.aterm.dev), this Mac's slice only,
+      toolchain the cutter resolves (by default `targo --unverified build
+      --release -p aterm`): its own bundle id (com.aterm.aterm.dev), this Mac's slice only,
       HEAD's committer epoch as its build number. It is signed locally and
       installed beside the release; nothing is claimed, notarized or published.
+        --profile PROFILE   release (default) or test. Test builds the ordinary app
+                            with `build --profile test`, using debug/aterm for
+                            native validation; it does not build a test harness.
         --sign-id IDENTITY  sign with this codesign identity; `-` signs ad hoc.
                             Default: the \"aterm dev\" identity once `ship dev-app
                             identity` made it (macOS privacy grants then survive a
@@ -96,6 +99,8 @@ pub enum Cmd {
 /// How a dev build is made and where it goes.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Options {
+    /// Cargo profile for the ordinary executable, never a prebuilt binary override.
+    pub profile: Profile,
     /// Where the bundle is assembled; `None` is the checkout's `dist/`.
     pub out: Option<PathBuf>,
     pub install: Install,
@@ -104,6 +109,40 @@ pub struct Options {
     /// Point `~/.local/bin/aterm` and `amacs` at the installed build (off with `--no-link`).
     pub link: bool,
     pub sign: SignWith,
+}
+
+/// Supported profiles for building the executable before canonical bundle assembly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Profile {
+    /// The existing optimized development bundle default.
+    Release,
+    /// The ordinary app built in Cargo's test profile for native validation.
+    Test,
+}
+
+impl Profile {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Release => "release",
+            Self::Test => "test",
+        }
+    }
+
+    const fn cargo_args(self) -> &'static [&'static str] {
+        match self {
+            Self::Release => &["--release"],
+            Self::Test => &["--profile", "test"],
+        }
+    }
+
+    fn binary(self, target: &Path) -> PathBuf {
+        target
+            .join(match self {
+                Self::Release => "release",
+                Self::Test => "debug",
+            })
+            .join("aterm")
+    }
 }
 
 /// Where the assembled bundle is installed.
@@ -158,13 +197,14 @@ pub fn parse<'a>(it: &mut impl Iterator<Item = &'a str>) -> Result<Cmd, String> 
         return Ok(Cmd::Identity { remove, keychain });
     }
     let mut opts = Options {
+        profile: Profile::Release,
         out: None,
         install: Install::Applications,
         pin: true,
         link: true,
         sign: SignWith::Default,
     };
-    let (mut no_install, mut install_dir, mut sign) = (false, None, None);
+    let (mut no_install, mut install_dir, mut sign, mut profile) = (false, None, None, None);
     let value = |flag: &str, v: Option<&str>, dash: bool| match v {
         Some(v) if !v.is_empty() && (!v.starts_with('-') || (dash && v == "-")) => {
             Ok(v.to_string())
@@ -175,6 +215,16 @@ pub fn parse<'a>(it: &mut impl Iterator<Item = &'a str>) -> Result<Cmd, String> 
         let again = || format!("{flag} given twice");
         match flag {
             "-h" | "--help" => return Ok(Cmd::Help),
+            "--profile" => {
+                let selected = match value(flag, args.next(), false)?.as_str() {
+                    "release" => Profile::Release,
+                    "test" => Profile::Test,
+                    _ => return Err("--profile takes release or test".into()),
+                };
+                if profile.replace(selected).is_some() {
+                    return Err(again());
+                }
+            }
             "--out" => {
                 let dir = value(flag, args.next(), false)?;
                 if opts.out.replace(PathBuf::from(dir)).is_some() {
@@ -208,6 +258,7 @@ pub fn parse<'a>(it: &mut impl Iterator<Item = &'a str>) -> Result<Cmd, String> 
         (false, Some(dir)) => Install::Into(dir),
         (false, None) => Install::Applications,
     };
+    opts.profile = profile.unwrap_or(Profile::Release);
     opts.sign = match sign.as_deref() {
         None => SignWith::Default,
         Some("-") => SignWith::AdHoc,
@@ -275,10 +326,10 @@ impl Stamp {
             .map_err(|e| format!("read {}: {e}", manifest.display()))?;
         let version = crate::publish::workspace_version(&text).map_err(|e| e.to_string())?;
         let epoch = git(root, &["show", "-s", "--format=%ct", "HEAD"])?;
-        let build = epoch
-            .trim()
-            .parse()
-            .map_err(|_| format!("HEAD's committer epoch {epoch:?} is not a number"))?;
+        let build = Some(epoch.trim())
+            .filter(|s| !s.starts_with('+'))
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| format!("HEAD's committer epoch {epoch:?} is not a number"))?;
         let mut commit = git(root, &["rev-parse", "--short=12", "HEAD"])?;
         if !git(root, &["status", "--porcelain"])?.is_empty() {
             commit.push_str("-dirty");
@@ -290,7 +341,12 @@ impl Stamp {
         )
         .and_then(|tag| git(root, &["rev-list", &format!("{tag}..HEAD"), "--count"]))
         .ok()
-        .and_then(|count| count.trim().parse().ok())
+        .and_then(|count| {
+            let count = count.trim();
+            (!count.starts_with('+'))
+                .then(|| count.parse().ok())
+                .flatten()
+        })
         .unwrap_or(0);
         Ok(Self {
             version,
@@ -319,6 +375,18 @@ fn target_dir(root: &Path, env: Option<OsString>) -> PathBuf {
     }
 }
 
+fn built_binary(target: &Path, profile: Profile) -> Result<PathBuf, String> {
+    let bin = profile.binary(target);
+    if !bin.is_file() {
+        return Err(format!(
+            "no {} after the {} profile build — a target setting redirected it",
+            bin.display(),
+            profile.name()
+        ));
+    }
+    Ok(bin)
+}
+
 fn build_command(
     stage2: &Path,
     root: &Path,
@@ -326,6 +394,7 @@ fn build_command(
     build_dir: Option<&str>,
     path: &OsStr,
     stamp: &Stamp,
+    profile: Profile,
 ) -> Command {
     let mut joined = OsString::from(stage2.as_os_str());
     if !path.is_empty() {
@@ -337,14 +406,9 @@ fn build_command(
         cmd.arg("--config").arg(value);
     }
     cmd.current_dir(root)
-        .args([
-            "--unverified",
-            "build",
-            "--release",
-            "-p",
-            "aterm",
-            "--target-dir",
-        ])
+        .args(["--unverified", "build"])
+        .args(profile.cargo_args())
+        .args(["-p", "aterm", "--target-dir"])
         .arg(target)
         .env("PATH", joined);
     for key in [
@@ -416,8 +480,10 @@ pub fn run_build(root: &Path, opts: &Options) -> Result<(), String> {
     println!("==> toolchain: {version} ({})", targo.display());
     let target = target_dir(root, std::env::var_os("CARGO_TARGET_DIR"));
     println!(
-        "==> targo --unverified build --release -p aterm  [{}, build {}]",
-        stamp.commit, stamp.build
+        "==> targo --unverified build {} -p aterm  [{}, build {}]",
+        opts.profile.cargo_args().join(" "),
+        stamp.commit,
+        stamp.build
     );
     let build_dir =
         aterm_verify::fallback_build_dir(&aterm_verify::EnvSnapshot::capture(), root, &target);
@@ -428,6 +494,7 @@ pub fn run_build(root: &Path, opts: &Options) -> Result<(), String> {
         build_dir.as_deref(),
         &std::env::var_os("PATH").unwrap_or_default(),
         &stamp,
+        opts.profile,
     )
     .status()
     .map_err(|e| format!("start {}: {e}", targo.display()))?;
@@ -438,13 +505,7 @@ pub fn run_build(root: &Path, opts: &Options) -> Result<(), String> {
              Trust predates their fix: aterm pkg update trust"
         ));
     }
-    let bin = target.join("release/aterm");
-    if !bin.is_file() {
-        return Err(format!(
-            "no {} after the build — a target setting redirected it",
-            bin.display()
-        ));
-    }
+    let bin = built_binary(&target, opts.profile)?;
     let out = opts.out.clone().unwrap_or_else(|| root.join("dist"));
     let app = assemble(root, &out, &stamp, &bin, opts.pin)?;
     sign(&app, &opts.sign, &home, run)?;
@@ -479,8 +540,9 @@ fn assemble(
     std::fs::create_dir_all(out).map_err(|e| format!("create {}: {e}", out.display()))?;
     let app = out.join(DEV_APP_NAME);
     note_running(&app);
-    if app.exists() {
-        std::fs::remove_dir_all(&app).map_err(|e| format!("rm -rf {}: {e}", app.display()))?;
+    if crate::bundle::exists_or_symlink(&app) {
+        crate::bundle::remove_path_any(&app)
+            .map_err(|e| format!("rm -rf {}: {e}", app.display()))?;
     }
     let spec = crate::bundle::BundleSpec {
         repo_root: root.to_path_buf(),
@@ -669,7 +731,7 @@ fn install(
     )?;
     let installed = dir.join(DEV_APP_NAME);
     let marks = dir.join(EXEC_MARKS);
-    if installed.exists()
+    if crate::bundle::exists_or_symlink(&installed)
         && let Some(left) = crate::gates::first_exec_hold(&marks)
     {
         return Err(format!(
@@ -680,8 +742,8 @@ fn install(
         ));
     }
     let staging = dir.join(format!(".aterm-dev-app.{}.noindex", std::process::id()));
-    if staging.exists() {
-        std::fs::remove_dir_all(&staging)
+    if crate::bundle::exists_or_symlink(&staging) {
+        crate::bundle::remove_path_any(&staging)
             .map_err(|e| format!("rm -rf {}: {e}", staging.display()))?;
     }
     std::fs::create_dir(&staging).map_err(|e| format!("create {}: {e}", staging.display()))?;
@@ -696,14 +758,14 @@ fn install(
         })
         .and_then(|_| {
             note_running(&installed);
-            if installed.exists() {
-                std::fs::remove_dir_all(&installed)
+            if crate::bundle::exists_or_symlink(&installed) {
+                crate::bundle::remove_path_any(&installed)
                     .map_err(|e| format!("rm -rf {}: {e}", installed.display()))?;
             }
             std::fs::rename(&copy, &installed)
                 .map_err(|e| format!("move {} to {}: {e}", copy.display(), installed.display()))
         });
-    let _ = std::fs::remove_dir_all(&staging);
+    let _ = crate::bundle::remove_path_any(&staging);
     placed?;
     let exe = installed.join("Contents/MacOS/aterm");
     if let Some(bin_dir) = bin_dir {
@@ -792,8 +854,10 @@ fn point_link(target: &Path, link: &Path) -> Result<Option<PathBuf>, String> {
     #[cfg(unix)]
     std::os::unix::fs::symlink(target, &tmp)
         .map_err(|e| format!("symlink {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, link)
-        .map_err(|e| format!("move {} to {}: {e}", tmp.display(), link.display()))?;
+    if let Err(e) = std::fs::rename(&tmp, link) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("move {} to {}: {e}", tmp.display(), link.display()));
+    }
     Ok(displaced)
 }
 
@@ -838,6 +902,7 @@ mod tests {
         assert_eq!(
             build(&[]),
             Options {
+                profile: Profile::Release,
                 out: None,
                 install: Install::Applications,
                 pin: true,
@@ -857,6 +922,7 @@ mod tests {
                 "--no-pin",
             ]),
             Options {
+                profile: Profile::Release,
                 out: Some(PathBuf::from("o")),
                 install: Install::Into(PathBuf::from("d")),
                 pin: false,
@@ -865,6 +931,20 @@ mod tests {
             }
         );
         assert_eq!(build(&["--no-install"]).install, Install::No);
+        assert_eq!(build(&["--profile", "release"]), build(&[]));
+        let native = build(&[
+            "--profile",
+            "test",
+            "--no-install",
+            "--no-link",
+            "--sign-id",
+            "-",
+        ]);
+        assert_eq!(native.profile, Profile::Test);
+        assert_eq!(native.install, Install::No);
+        assert!(!native.link);
+        assert!(native.pin);
+        assert_eq!(native.sign, SignWith::AdHoc);
         assert_eq!(
             build(&["--sign-id", "Apple Development: Jane"]).sign,
             SignWith::Identity("Apple Development: Jane".into())
@@ -892,18 +972,27 @@ mod tests {
             &["--out", "--no-pin"],
             &["--install-dir", "-"],
             &["--sign-id", "a", "--sign-id", "b"],
+            &["--profile"],
+            &["--profile", ""],
+            &["--profile", "-"],
+            &["--profile", "--no-install"],
+            &["--profile", "debug"],
+            &["--profile", "test", "--profile", "test"],
+            &["--profile", "release", "--profile", "test"],
             &["identity", "--bogus"],
             &["identity", "--keychain"],
+            &["identity", "--profile", "test"],
         ] {
             assert!(parse_args(refused).is_err(), "{refused:?}");
         }
-        let args: Vec<String> = ["dev-app", "--no-link"]
+        let args: Vec<String> = ["dev-app", "--profile", "test", "--no-link"]
             .iter()
             .map(|s| s.to_string())
             .collect();
         assert!(matches!(
             crate::cli::parse(&args),
             Ok(crate::cli::Cmd::DevApp(Cmd::Build(Options {
+                profile: Profile::Test,
                 link: false,
                 ..
             })))
@@ -930,6 +1019,7 @@ mod tests {
             Some("build.build-dir='/src/aterm/target/build.noindex'"),
             OsStr::new("/usr/bin:/bin"),
             &stamp(),
+            Profile::Release,
         );
         let led: Vec<&OsStr> = led.get_args().collect();
         assert_eq!(
@@ -949,6 +1039,7 @@ mod tests {
             None,
             OsStr::new("/usr/bin:/bin"),
             &stamp(),
+            Profile::Release,
         );
         assert_eq!(cmd.get_program(), stage2.join("targo").as_os_str());
         let args: Vec<&OsStr> = cmd.get_args().collect();
@@ -1000,6 +1091,88 @@ mod tests {
             assert_eq!(envs.get(key), Some(&Some(value.to_string())), "{key}");
         }
         assert!(!envs.contains_key("RUSTFLAGS"));
+    }
+
+    #[test]
+    fn the_test_profile_builds_the_ordinary_app_with_the_same_stamp() {
+        let stage2 = Path::new("/store/trust/9192/bin");
+        let root = Path::new("/src/aterm");
+        let target = Path::new("/warm/test-profile.noindex");
+        let stamp = stamp();
+        let release = build_command(
+            stage2,
+            root,
+            target,
+            None,
+            OsStr::new("/usr/bin"),
+            &stamp,
+            Profile::Release,
+        );
+        let native = build_command(
+            stage2,
+            root,
+            target,
+            None,
+            OsStr::new("/usr/bin"),
+            &stamp,
+            Profile::Test,
+        );
+        assert_eq!(native.get_program(), release.get_program());
+        assert_eq!(native.get_current_dir(), release.get_current_dir());
+        assert_eq!(
+            native.get_envs().collect::<Vec<_>>(),
+            release.get_envs().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            native.get_args().collect::<Vec<_>>(),
+            [
+                "--unverified",
+                "build",
+                "--profile",
+                "test",
+                "-p",
+                "aterm",
+                "--target-dir",
+                "/warm/test-profile.noindex",
+            ]
+            .map(OsStr::new)
+        );
+        let with_config = build_command(
+            stage2,
+            root,
+            target,
+            Some("build.build-dir='/warm/intermediates.noindex'"),
+            OsStr::new("/usr/bin"),
+            &stamp,
+            Profile::Test,
+        );
+        let configured: Vec<_> = with_config.get_args().collect();
+        assert_eq!(
+            configured[..2],
+            ["--config", "build.build-dir='/warm/intermediates.noindex'"].map(OsStr::new)
+        );
+        assert_eq!(configured[2..], native.get_args().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_binary_from_the_other_profile_cannot_replace_the_selected_output() {
+        for (selected, other, folder) in [
+            (Profile::Test, Profile::Release, "debug"),
+            (Profile::Release, Profile::Test, "release"),
+        ] {
+            let (_dir, target) = scratch();
+            let old = other.binary(&target);
+            std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+            std::fs::write(&old, b"other profile").unwrap();
+            let expected = target.join(folder).join("aterm");
+            let refused = built_binary(&target, selected).unwrap_err();
+            assert!(refused.contains(&expected.display().to_string()));
+            assert!(refused.contains(selected.name()));
+            std::fs::create_dir_all(expected.parent().unwrap()).unwrap();
+            std::fs::write(&expected, b"selected profile").unwrap();
+            assert_eq!(built_binary(&target, selected).unwrap(), expected);
+            assert_eq!(std::fs::read(old).unwrap(), b"other profile");
+        }
     }
 
     #[test]

@@ -287,6 +287,49 @@ fn the_key_ledger_refuses_input_from_a_window_it_is_not_recording() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// A window a recording films never rests ([`super::App::settle_rest`]), so the film keeps its
+/// live deck; another window quiet as long rests, and the filmed one rests once the take ends.
+#[test]
+fn a_filmed_window_never_rests_while_another_does() {
+    let mut app = super::App::headless_for_test();
+    // Rest is for a window on screen: a headless instance's never rests. It is off unless set.
+    app.headless = false;
+    app.config.idle_rest_secs = Some(30.0);
+    let filmed = WindowId(0);
+    let other = app
+        .open_active_session_in_new_window_logical()
+        .expect("a second window");
+    let (root, _path, dir) = test_video_dir("video-rest-filmed");
+    let (reply, _rx) = std::sync::mpsc::channel();
+    app.video_rec = Some(VideoRec {
+        window: filmed,
+        deadline: Instant::now() + Duration::from_secs(3_600),
+        started_us: 0,
+        keys: false,
+        key_log: Vec::new(),
+        pace_ticks: Vec::new(),
+        unseamed_at_begin: 0,
+        unlogged_other_window: 0,
+        unlogged_over_cap: 0,
+        mode: VideoMode::SwapchainTap,
+        next_frame: None,
+        presented: None,
+        dir,
+        handoff: None,
+        cancel: VideoCancellation::new(),
+        reply,
+    });
+    let quiet = Instant::now() + Duration::from_secs(60);
+    app.settle_rest(quiet);
+    assert!(!app.windows[&filmed].rest.resting(), "the filmed window");
+    assert!(app.windows[&other].rest.resting(), "the other window");
+
+    let _ = app.video_rec.take();
+    app.settle_rest(quiet);
+    assert!(app.windows[&filmed].rest.resting(), "the take ended");
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[test]
 fn a_full_key_ledger_counts_the_attempts_it_drops() {
     let mut app = super::App::headless_for_test();

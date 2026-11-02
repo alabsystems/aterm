@@ -51,6 +51,18 @@ pub(super) fn wires(dir: &Path) -> Vec<Vec<u8>> {
         .map(|id| db.history.wire(id).unwrap().to_vec())
         .collect()
 }
+pub(super) fn files(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    let mut all = BTreeMap::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            all.extend(files(&entry.path()));
+        } else {
+            all.insert(entry.path(), std::fs::read(entry.path()).unwrap());
+        }
+    }
+    all
+}
 fn deliver(to: &Path, records: &[Vec<u8>]) {
     let mut db = Database::open(to).unwrap();
     for record in records.iter().rev() {
@@ -397,6 +409,52 @@ fn aliases_phone_routes_and_machine_name_history_remain_distinct() {
         )
         .is_err()
     );
+    crate::contacts::validate("mailboxes", &json!({"name":"inbox","provider":"proton"})).unwrap();
+    for bad_provider in [
+        json!(""),
+        json!("bad provider"),
+        json!(null),
+        json!({"secret":"raw"}),
+    ] {
+        assert!(
+            crate::contacts::validate(
+                "mailboxes",
+                &json!({"name":"inbox","provider":bad_provider})
+            )
+            .is_err()
+        );
+    }
+    crate::contacts::validate(
+        "phones",
+        &json!({"number":"+12025550123","label":"office line"}),
+    )
+    .unwrap();
+    for bad_label in [
+        json!(""),
+        json!("line\nbreak"),
+        json!("x".repeat(129)),
+        json!(null),
+        json!({"secret":"raw"}),
+    ] {
+        assert!(
+            crate::contacts::validate("phones", &json!({"label":bad_label})).is_err(),
+            "rejected bad phone label {bad_label:?}"
+        );
+    }
+    assert!(
+        crate::cli::run(&[
+            "spend".into(),
+            "--dir".into(),
+            root.path().to_str().unwrap().into(),
+            "--name".into(),
+            "window".into(),
+            "--cost".into(),
+            "+1".into(),
+            "--request".into(),
+            aterm_codec::hex::encode_lower(&[9; 16]),
+        ])
+        .is_err()
+    );
 }
 
 fn rights_state(
@@ -690,6 +748,10 @@ fn catalog_revocation_does_not_reclaim_offline_rights_or_poison_the_authority_st
         .commit(write(2, "old", json!(1)))
         .unwrap();
     reconcile(&a, &b);
+    let merged = Database::open(&b)
+        .unwrap()
+        .commit(Command::Merge { request: [10; 16] })
+        .unwrap();
     Database::open(&b)
         .unwrap()
         .commit(write(3, "late", json!(2)))
@@ -708,8 +770,10 @@ fn catalog_revocation_does_not_reclaim_offline_rights_or_poison_the_authority_st
     let view = db.view();
     assert!(view.cells.contains_key(&("example".into(), "old".into())));
     assert!(!view.cells.contains_key(&("example".into(), "late".into())));
+    assert!(!view.causal.ordered.contains(&merged));
     assert_eq!(view.spent[&(grant, cb.capability.actor)], 2);
     assert!(db.commit(write(6, "after-retirement", json!(3))).is_err());
+    assert!(db.commit(Command::Merge { request: [11; 16] }).is_err());
     assert!(db.spend([7; 16], "window", 1).is_err());
     drop(db);
     let mut owner = Database::open(&a).unwrap();
@@ -851,6 +915,56 @@ fn revert_is_an_atomic_audited_edit_and_refuses_intervening_changes_or_resource_
         })
         .unwrap();
     assert!(db.revert([14; 16], stop).is_err());
+
+    // A wire-crafted Revert naming mismatched keys or an invalid/stopped operation is marked
+    // invalid in the view, does not mutate cells, and cannot return a successful retry receipt.
+    let kept = db
+        .commit(write(15, "kept", json!({"value": "intact"})))
+        .unwrap();
+    let last_head = db
+        .history
+        .index
+        .project()
+        .ordered
+        .into_iter()
+        .filter_map(|id| db.history.index.get(&id))
+        .filter(|h| h.actor == actor)
+        .max_by_key(|h| h.sequence)
+        .unwrap()
+        .clone();
+    let forged = crypto::seal_at(
+        &db.credentials.manifest,
+        &db.credentials.key,
+        &db.credentials.seed,
+        &db.credentials.capability,
+        crypto::Causal {
+            sequence: last_head.sequence + 1,
+            previous: Some(last_head.id),
+            parents: &[last_head.id],
+        },
+        &Command::Revert {
+            request: [16; 16],
+            operation: create,
+            changes: vec![Change {
+                collection: "example".into(),
+                key: "kept".into(),
+                value: None,
+            }],
+        }
+        .encode()
+        .unwrap(),
+        1,
+    )
+    .unwrap();
+    let forged_id = aterm_digest::Sha256::digest(&forged);
+    db.ingest(&forged).unwrap();
+    assert!(db.view().invalid.contains(&forged_id));
+    assert_eq!(
+        db.view().cells[&("example".into(), "kept".into())].candidates[0].value,
+        json!({"value": "intact"})
+    );
+    assert!(db.revert([16; 16], create).is_err());
+    let _ = kept;
 }
 
 #[test]
@@ -895,4 +1009,125 @@ fn machine_name_cli_retries_the_receipt_and_preserves_semistructured_metadata() 
         .map(|row| row["value"]["name"].as_str().unwrap())
         .collect();
     assert_eq!(names, vec!["m1", "m1", "m100"]);
+
+    // A non-admin replica that receives control operations cannot claim or retry
+    // administrative receipts for machine-name, allocate, or control reverts.
+    let (_pair_root, admin_dir, replica_dir) = pair();
+    let mut admin = Database::open(&admin_dir).unwrap();
+    let actor = admin.credentials.capability.actor;
+    admin
+        .allocate([10; 16], "tokens".into(), 10, BTreeMap::from([(actor, 10)]))
+        .unwrap();
+    drop(admin);
+    let rename_op = crate::database::decode_hex::<32>(
+        crate::cli::run(&[
+            "machine-name".into(),
+            "--dir".into(),
+            admin_dir.to_str().unwrap().into(),
+            "--key".into(),
+            key.into(),
+            "--name".into(),
+            "m1".into(),
+            "--request".into(),
+            aterm_codec::hex::encode_lower(&[11; 16]),
+        ])
+        .unwrap()["operation"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    Database::open(&admin_dir)
+        .unwrap()
+        .revert([12; 16], rename_op)
+        .unwrap();
+    let mut replica = Database::open(&replica_dir).unwrap();
+    for wire in wires(&admin_dir) {
+        replica.ingest(&wire).unwrap();
+    }
+    assert!(
+        replica
+            .allocate([10; 16], "tokens".into(), 10, BTreeMap::from([(actor, 10)]))
+            .is_err()
+    );
+    assert!(replica.revert([12; 16], rename_op).is_err());
+    drop(replica);
+    assert!(
+        crate::cli::run(&[
+            "machine-name".into(),
+            "--dir".into(),
+            replica_dir.to_str().unwrap().into(),
+            "--key".into(),
+            key.into(),
+            "--name".into(),
+            "m1".into(),
+            "--request".into(),
+            aterm_codec::hex::encode_lower(&[11; 16]),
+        ])
+        .is_err()
+    );
+}
+
+#[test]
+fn local_credentials_and_journal_refuse_control_capabilities_and_hidden_records() {
+    let root = tmp();
+    let dir = root.path().join("db");
+    local::init(&dir, "test").unwrap();
+    let creds = Credentials::load(&dir).unwrap();
+    let root_seed = {
+        let raw = aterm_uds::private_file::read_private(&dir, "database.json", 4096).unwrap();
+        let v: Value = aterm_json::from_slice(&raw).unwrap();
+        database::decode_hex::<32>(v["root_seed"].as_str().unwrap()).unwrap()
+    };
+    let control_cap = crypto::Capability::control(&creds.manifest, &root_seed).unwrap();
+    let bad_cfg = json!({
+        "manifest": aterm_codec::hex::encode_lower(creds.manifest.bytes()),
+        "capability": aterm_codec::hex::encode_lower(control_cap.bytes()),
+        "key": aterm_codec::hex::encode_lower(&creds.key),
+        "root_seed": aterm_codec::hex::encode_lower(&root_seed),
+    });
+    let cfg_dir = root.path().join("bad-cfg");
+    aterm_uds::private_file::create_private_dir(&cfg_dir).unwrap();
+    let mut id_bytes = [0u8; 48];
+    id_bytes[..32].copy_from_slice(&root_seed);
+    id_bytes[32..].copy_from_slice(&creds.manifest.control_actor()[32..]);
+    aterm_uds::private_file::write_private(&cfg_dir, "identity", &id_bytes).unwrap();
+    aterm_uds::private_file::write_private(
+        &cfg_dir,
+        "database.json",
+        &aterm_json::to_vec(&bad_cfg).unwrap(),
+    )
+    .unwrap();
+    assert!(Credentials::load(&cfg_dir).is_err());
+
+    let join_dir = root.path().join("bad-join");
+    aterm_uds::private_file::create_private_dir(&join_dir).unwrap();
+    aterm_uds::private_file::write_private(&join_dir, "identity", &id_bytes).unwrap();
+    let bad_invite = json!({
+        "manifest": aterm_codec::hex::encode_lower(creds.manifest.bytes()),
+        "capability": aterm_codec::hex::encode_lower(control_cap.bytes()),
+        "key": aterm_codec::hex::encode_lower(&creds.key),
+    });
+    assert!(
+        local::join(
+            &join_dir,
+            &aterm_json::to_vec(&bad_invite).unwrap(),
+            creds.manifest.root,
+        )
+        .is_err()
+    );
+
+    // A pruned prefix in operations.astream must be refused rather than silently skipped.
+    Database::open(&dir)
+        .unwrap()
+        .commit(write(1, "k", json!(1)))
+        .unwrap();
+    {
+        let mut log = astream_broker::BrokerLog::open_with(
+            dir.join("operations.astream"),
+            astream_broker::Durability::Strict,
+        )
+        .unwrap();
+        log.retain_before(astream_wire::Offset(1)).unwrap();
+    }
+    assert!(Database::open(&dir).is_err());
 }

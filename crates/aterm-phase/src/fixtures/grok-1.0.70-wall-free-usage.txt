@@ -1,0 +1,50 @@
+# grok 1.0.70 · MEASURED 2026-10-29, `aterm ctl text` of a private headless aterm (144x50, aterm 0.146.0) running the real Grok Build, launched by path in the lab's jail with a scratch `HOME` and `GROK_HOME`, the lab's `XAI_API_KEY` and `GROK_XAI_API_BASE_URL`/`GROK_CLI_CHAT_PROXY_BASE_URL=http://127.0.0.1:<port>/v1` (a local stub of xAI's API, crates/aterm-lab) · the turn answered 429 `{"code": "subscription:free-usage-exhausted", "error": "lab stub: free usage exhausted"}` (a custom stub mode; the code is a string the binary carries): no retry (one request), and in the composer's place the free-usage upsell, drawn as a question card on the heavy left bar: `You hit your free usage limit.`, `1 (○) Upgrade to SuperGrok …`, `2 (○) Upgrade to SuperGrok Plus …`, `3 (○) Upgrade to SuperGrok Heavy …`, `↑/↓ navigate · y copy` with `Enter:submit`, and the question card's key row `Tab:next answer  │  Esc:scrollback  │  Shift+x:dismiss` · cursor=48,56 (hidden) · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+  /p/t/at.lab0/proj                                                                                                   14K / 256K │ [Dashboard]
+
+
+     ❯ use the free tier                                                                                                             2:04 PM
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+
+  ┃
+  ┃  You hit your free usage limit.
+  ┃
+  ┃
+  ┃  1 (○) Upgrade to SuperGrok        For everyday coding and productivity tasks
+  ┃  2 (○) Upgrade to SuperGrok Plus   Significantly higher usage and rate limits
+  ┃  3 (○) Upgrade to SuperGrok Heavy  Get the most out of Grok Build. Highest usage limits.
+  ┃
+  ┃  ↑/↓ navigate · y copy                                                                                                    Enter:submit
+  ┃
+
+  Tab:next answer  │  Esc:scrollback  │  Shift+x:dismiss

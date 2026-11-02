@@ -295,6 +295,10 @@ fn the_exe_form_finds_the_root_whose_entrypoint_is_the_exe() {
     let root = d.join("pkg");
     package(&root, "0.164.0-dev.12+gabc", b"x", true);
     assert!(exe_is_alab(&root.join("bin/codex")));
+    assert_eq!(
+        package_version_of_exe(&root.join("bin/codex")).as_deref(),
+        Some("0.164.0-dev.12+gabc")
+    );
     #[cfg(unix)]
     {
         let link = d.join("link-to-codex");
@@ -306,9 +310,11 @@ fn the_exe_form_finds_the_root_whose_entrypoint_is_the_exe() {
     }
     std::fs::write(root.join("bin/other"), b"x").unwrap();
     assert!(!exe_is_alab(&root.join("bin/other")), "not the entrypoint");
+    assert_eq!(package_version_of_exe(&root.join("bin/other")), None);
     assert!(!exe_is_alab(&d.join("missing")));
     std::fs::remove_file(root.join(ALAB_BUILD_JSON)).unwrap();
     assert!(!exe_is_alab(&root.join("bin/codex")));
+    assert_eq!(package_version_of_exe(&root.join("bin/codex")), None);
 }
 
 /// The upstream commit a test record names.

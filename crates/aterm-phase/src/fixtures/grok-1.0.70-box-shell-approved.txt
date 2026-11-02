@@ -1,0 +1,50 @@
+# grok 1.0.70 · MEASURED 2026-10-29, `aterm ctl text` of a private headless aterm (144x50, aterm 0.146.0) running the real Grok Build, launched by path in the lab's jail with a scratch `HOME` and `GROK_HOME`, the lab's `XAI_API_KEY` and `GROK_XAI_API_BASE_URL`/`GROK_CLI_CHAT_PROXY_BASE_URL=http://127.0.0.1:<port>/v1` (a local stub of xAI's API, crates/aterm-lab) · the shell prompt answered with the digit `3` (`Yes, proceed`): the card gone, `◆ Ran remove the lab file.`, the stub's `Tool call done.` (it got `exit: 0` back), `Worked for 19s`, and the composer back with the side request's suggestion · cursor=45,6 (visible, blinking_block) · in this run the stub answered every side request, the prompt predictor's among them, `Lab stub session`, so that is the suggestion · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+  /p/t/at.lab0/proj                                                                                                   12K / 256K │ [Dashboard]
+
+
+     ❯ toolstart remove the file                                                                                                     1:58 PM
+
+
+     ◆ Ran remove the lab file.
+
+     Tool call done.                                                                                                                 1:59 PM
+
+     Worked for 19s
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ ❯ Lab stub session                                                                                                                       │
+  ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── lab-stub ─╯
+
+  Tab/→:accept suggestion  │  Shift+Tab:mode  │  Ctrl+x:shortcuts

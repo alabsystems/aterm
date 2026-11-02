@@ -9,6 +9,8 @@
 //! mode starts network workers.
 //! `runs` lists retained test-run labels without exposing their values or
 //! starting network workers, so an audit can reuse an existing marker.
+//! `request-view` reads retained credential-request counts through the same
+//! read-only handler as `secrets need peek`, without printing request values.
 //! `audit <run-label> <seconds>` listens for native LAN advertisements and
 //! inspects authenticated operation inventories. Its protocol exchanges can
 //! themselves repair data; the report distinguishes prior retention from repair
@@ -17,6 +19,8 @@
 //! `serve-live` explicitly pauses the old owner with guarded config restoration.
 //! `receive-live` starts that same owner without a local marker or membership
 //! Session, then reads existing received probe rows after stopping the owner.
+//! `recover-live` observes with the persistent live policy and a separate private
+//! observer, allowing automatic writer succession without pausing that policy.
 
 #[cfg(unix)]
 #[path = "commons_probe/live_guard.rs"]
@@ -46,7 +50,7 @@ mod probe {
     const APPLICATION: &str = "aterm-sync-probe";
     const ROLE: &str = "verification";
     const KIND: &str = "aterm-sync-probe-v1";
-    const USAGE: &str = "usage: commons_probe runs | write <run-label> <JSON> | read <run-label> | audit <run-label> <seconds> | serve <run-label> <seconds> <private-config-path> | serve-live <run-label> <seconds> | receive-live <run-label> <seconds>";
+    const USAGE: &str = "usage: commons_probe runs | request-view | write <run-label> <JSON> | read <run-label> | audit <run-label> <seconds> | serve <run-label> <seconds> <private-config-path> | serve-live <run-label> <seconds> | receive-live <run-label> <seconds> | recover-live <run-label> <seconds>";
     pub(super) type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
     pub(super) struct LocalProbe {
@@ -71,7 +75,7 @@ mod probe {
     }
 
     pub(super) fn prepare_existing(run: &str, config: &Path) -> Result<(Paths, LocalProbe)> {
-        let paths = Paths::live()?;
+        let paths = aterm_db::application_paths(&Paths::live()?)?;
         if !paths.dir.join("commons/control").is_dir() {
             return Err(io::Error::other("existing Commons custody is unavailable").into());
         }
@@ -90,7 +94,11 @@ mod probe {
         config: &Path,
         run: &str,
     ) -> Result<Option<LocalProbe>> {
-        if !paths.dir.join("commons/tables").try_exists()? {
+        let selected = aterm_db::application_paths(paths)?;
+        let paths = &selected;
+        if !paths.dir.join("commons/tables").try_exists()?
+            && !paths.dir.join("commons/recovery/tables").try_exists()?
+        {
             return Ok(None);
         }
         if !paths.dir.join("commons/control").is_dir() {
@@ -99,12 +107,15 @@ mod probe {
         let bootstrap = Bootstrap::required_until(paths, Instant::now() + Duration::from_secs(2))?;
         let directory = Directory::new(paths, bootstrap.trust());
         let descriptor = Descriptor::application(bootstrap.trust(), APPLICATION, ROLE, 1)?;
+        let session = Session::observe(&bootstrap)?;
         for scope in [directory.catalog_scope(), descriptor.scope] {
-            if !directory.path(scope)?.try_exists()? {
+            if directory
+                .observe_table_if_exists(&session, scope)?
+                .is_none()
+            {
                 return Ok(None);
             }
         }
-        let session = Session::observe(&bootstrap)?;
         snapshot_in(paths, config, &bootstrap, &session, "read", run, None).map(Some)
     }
 
@@ -119,6 +130,16 @@ mod probe {
             .skip(1)
             .map(|arg| arg.into_string().map_err(|_| io::Error::other(USAGE)))
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        if let [mode] = args.as_slice()
+            && mode == "request-view"
+        {
+            let paths = Paths::live()?;
+            let words = ["peek", "--all", "--json"].map(str::to_owned);
+            let text = aterm_db::credentials::cli::run(&paths, &words)
+                .map_err(|(reason, _)| io::Error::other(reason))?;
+            let value = aterm_json::from_str::<Value>(&text)?;
+            return Ok(request_view_summary(&value));
+        }
         if let [mode, run, seconds, config] = args.as_slice()
             && mode == "serve"
         {
@@ -133,6 +154,11 @@ mod probe {
             && mode == "receive-live"
         {
             return crate::serve::receive_live(run, seconds.parse()?);
+        }
+        if let [mode, run, seconds] = args.as_slice()
+            && mode == "recover-live"
+        {
+            return crate::serve::recover_live(run, seconds.parse()?);
         }
         if let [mode, run, seconds] = args.as_slice()
             && mode == "audit"
@@ -152,8 +178,54 @@ mod probe {
         snapshot(mode, run, value)
     }
 
+    fn request_view_summary(value: &Value) -> Value {
+        let table = &value["table"];
+        json!({
+            "mode":"request-view", "available":table["available"],
+            "retained_operations":table["retained_operations"],
+            "interpreted_operations":table["interpreted_operations"],
+            "inert_records":table["inert_records"],
+            "current_members":table["current_members"],
+            "request_threads":table["requests"].as_array().map(Vec::len),
+            "reason":table["reason"],
+        })
+    }
+
+    #[cfg(test)]
+    mod request_view_tests {
+        use super::*;
+
+        #[test]
+        fn counts_do_not_disclose_local_needs_or_request_values() {
+            let value = json!({
+                "needs":[{"want":"private-local-need"}],
+                "table":{
+                    "available":true, "retained_operations":9,
+                    "interpreted_operations":8, "inert_records":1,
+                    "current_members":2,
+                    "requests":[{"want":"private-request-value"}],
+                },
+            });
+            let summary = request_view_summary(&value);
+            assert_eq!(summary["request_threads"], json!(1));
+            assert_eq!(summary["retained_operations"], json!(9));
+            assert_eq!(summary["interpreted_operations"], json!(8));
+            assert!(!summary.to_string().contains("private-"));
+        }
+
+        #[test]
+        fn an_unavailable_view_has_unknown_counts_and_keeps_its_reason() {
+            let value = json!({"table":{"available":false,"reason":"custody refused"}});
+            let summary = request_view_summary(&value);
+            assert_eq!(summary["available"], json!(false));
+            assert_eq!(summary["request_threads"], Value::Null);
+            assert_eq!(summary["retained_operations"], Value::Null);
+            assert_eq!(summary["reason"], value["table"]["reason"]);
+        }
+    }
+
     fn snapshot(mode: &str, run: &str, value: Option<Value>) -> Result<Value> {
-        let paths = Paths::live()?;
+        let paths = aterm_db::application_paths(&Paths::live()?)?;
         if matches!(mode, "read" | "runs") && !paths.dir.join("commons/control").is_dir() {
             return Err(io::Error::other("existing Commons custody is unavailable").into());
         }
@@ -177,6 +249,7 @@ mod probe {
     fn runs_value(observed: &LocalProbe) -> Value {
         json!({"mode":"runs","table":encode_lower(&observed.table),
             "runs":observed.runs.iter().collect::<Vec<_>>(),
+            "recovery_reader":observed.value["recovery_reader"],
             "known":{"count":observed.known.count,"sha256":encode_lower(&observed.known.fingerprint)}})
     }
 
@@ -199,7 +272,14 @@ mod probe {
                 descriptor.scope,
             )?;
             let payload = aterm_json::to_vec(&json!({"kind":KIND,"run":run,"value":value}))?;
-            Some(store.commit_catalog(session, &payload)?.id)
+            let committed = store.commit_catalog(session, &payload)?.id;
+            // The subsequent policy-aware observation can refuse after this
+            // durable append. Preserve its public ID before that failure.
+            eprintln!(
+                "commons-probe operation-committed id={}",
+                encode_lower(&committed)
+            );
+            Some(committed)
         } else {
             None
         };
@@ -221,11 +301,7 @@ mod probe {
                 io::Error::other("test table declaration is conflicted or excluded").into(),
             );
         }
-        let store = Store::open(
-            session,
-            &directory.path(descriptor.scope)?,
-            descriptor.scope,
-        )?;
+        let store = directory.observe_table(session, descriptor.scope)?;
         let records = store.catalog(session)?;
         let total_records = records.len();
         let mut operations = Vec::with_capacity(records.len());
@@ -274,6 +350,7 @@ mod probe {
             "mode":mode,"run":run,"application":APPLICATION,"role":ROLE,
             "network":encode_lower(&bootstrap.trust().network),
             "table":encode_lower(&table),"local_actor":encode_lower(&session.actor()),
+            "recovery_reader":store.is_recovery(),"catalog_recovery_reader":snapshot.recovery,
             "written_operation":written.map(|id|encode_lower(&id)),
             "declarations":entry.declarations.len(),"records":operations.len(),
             "total_table_records":total_records,"operations":operations,
@@ -407,6 +484,10 @@ mod probe {
             assert_eq!(labels["known"]["count"], json!(2));
             assert!(!labels.to_string().contains("private marker value"));
             assert!(!labels.to_string().contains("retained beside"));
+            let (audited, _endpoint, actor) = audit::prepare(&paths, &config, "active-owner")
+                .expect("audit preparation needs no writer admission");
+            assert_eq!(actor, session.actor());
+            assert_eq!(audited.value, read.value);
             assert_eq!(
                 std::fs::read(catalog_path.join("table.astream")).unwrap(),
                 before_catalog
@@ -476,6 +557,11 @@ mod probe {
                     ..Default::default()
                 }),
                 application_error: None,
+                application_interrupted: None,
+                application_deferral: None,
+                application_batch_deferral: None,
+                handoff: None,
+                completed_at: Instant::now(),
                 completed_at_ms: 1,
                 dropped_before: 0,
             };
@@ -490,7 +576,7 @@ mod probe {
             assert_eq!(evidence["baseline_changed"], json!(true));
             assert_eq!(evidence["post_stop_probe"]["total_table_records"], json!(2));
 
-            for mutation in 0..11 {
+            for mutation in 0..14 {
                 let mut invalid = round.clone();
                 match mutation {
                     0 => invalid.cancelled = true,
@@ -504,6 +590,22 @@ mod probe {
                     8 => invalid.application.as_mut().unwrap().local_offered = Some(baseline.known),
                     9 => invalid.application.as_mut().unwrap().peer_known = Some(baseline.known),
                     10 => invalid.membership_error = Some("membership failed".into()),
+                    11 => {
+                        invalid.application_deferral = Some(replica::InventoryDeferral {
+                            inventory: "conflicts",
+                            local_error: None,
+                            retaining_primary_conflicts: false,
+                            peer_unavailable: true,
+                        })
+                    }
+                    12 => {
+                        invalid.application_batch_deferral = Some(replica::BatchDeferral {
+                            batch: "operations",
+                            stage: "ingest",
+                            reason: "local batch refused".into(),
+                        })
+                    }
+                    13 => invalid.application_interrupted = invalid.application,
                     _ => unreachable!(),
                 }
                 assert_eq!(
@@ -764,11 +866,6 @@ mod probe {
             let port = u16::from_be_bytes([wire[36], wire[37]]);
             (port != 0).then_some(SocketAddr::from((ip, port)))
         }
-        fn inventory(value: Option<InventorySummary>) -> Value {
-            value.map_or(Value::Null, |summary| {
-                json!({"count":summary.count,"sha256":encode_lower(&summary.fingerprint)})
-            })
-        }
         fn classification(
             report: Option<Report>,
             table: &[u8; 32],
@@ -824,6 +921,10 @@ mod probe {
                 .exchange_started
                 .then(|| finished.repair.application_error())
                 .flatten();
+            let interrupted = finished
+                .exchange_started
+                .then(|| finished.repair.application_interrupted())
+                .flatten();
             // Failed control exchanges can already have sent records. Retain
             // that uncertainty under the current authenticated identity, not
             // merely this endpoint; another advertisement may name the same peer.
@@ -836,6 +937,7 @@ mod probe {
             let unaccounted = peer.previous_unaccounted
                 || failed
                 || application_error.is_some()
+                || interrupted.is_some()
                 || finished.cancelled;
             let prior = actor.map(|actor| effects.entry(actor).or_default());
             let mut before = Value::Null;
@@ -850,7 +952,7 @@ mod probe {
             if let Ok(control) = &finished.result {
                 current.control(control);
             }
-            if let Some(application) = application {
+            if let Some(application) = application.or(interrupted) {
                 current.application(&application);
             }
             let mut assisted = current.assisted() || global.assisted();
@@ -868,18 +970,7 @@ mod probe {
                 }),
                 Err(error) => json!({"error":error}),
             };
-            let application_value = application.map_or(Value::Null, |report| {
-                json!({
-                    "table":report.table.map(|id|encode_lower(&id)),
-                    "local_known":inventory(report.local_known),
-                    "local_offered":inventory(report.local_offered),
-                    "peer_known":inventory(report.peer_known),
-                    "sent":report.sent,"received":report.received,"deferred":report.deferred,
-                    "keys_sent":report.keys_sent,"keys_received":report.keys_received,
-                    "conflicts_sent":report.conflicts_sent,
-                    "conflicts_received":report.conflicts_received,
-                })
-            });
+            let application_value = crate::serve::application_value(application);
             rounds.push(json!({
                 "endpoint":finished.address.to_string(),"authenticated_this_round":authenticated,
                 "exchange_started":finished.exchange_started,
@@ -897,43 +988,58 @@ mod probe {
                 "classification":classification(application,table,expected,assisted),
                 "control":control,"application":application_value,
                 "application_error":application_error,
+                "application_interrupted":crate::serve::application_value(interrupted),
+                "application_deferral":crate::serve::deferral_value(
+                    finished.repair.application_deferral()
+                ),
+                "application_batch_deferral":crate::serve::batch_deferral_value(
+                    finished.repair.application_batch_deferral()
+                ),
             }));
             peer.previous_unaccounted = unaccounted;
             peer.repair = Some(finished.repair);
             peer.next = Instant::now() + Duration::from_secs(3);
         }
 
-        pub(super) fn run(run: &str, seconds: u64) -> Result<Value> {
-            if !(1..=60).contains(&seconds) {
-                return Err(io::Error::other("audit seconds must be between 1 and 60").into());
-            }
-            let started = Instant::now();
-            let paths = Paths::live()?;
+        pub(super) fn prepare(
+            paths: &Paths,
+            config: &Path,
+            run: &str,
+        ) -> Result<(LocalProbe, Arc<Endpoint>, Actor)> {
             if !paths.dir.join("commons/control").is_dir() {
                 return Err(io::Error::other("existing Commons custody is unavailable").into());
             }
-            let config = aterm_types::dirs::aterm_config_path()
-                .ok_or_else(|| io::Error::other("Commons configuration path is unavailable"))?;
             let admission = Instant::now() + Duration::from_secs(2);
-            let (bootstrap, journal) = Bootstrap::required_with_journal_until(&paths, admission)?;
-            let session = Session::from_admitted_journal(&bootstrap, journal)?;
-            let local_probe =
-                snapshot_in(&paths, &config, &bootstrap, &session, "read", run, None)?;
+            let bootstrap = Bootstrap::required_until(paths, admission)?;
+            let session = Session::observe(&bootstrap)?;
+            let local_probe = snapshot_in(paths, config, &bootstrap, &session, "read", run, None)?;
             if local_probe.requested_operations.is_empty() {
                 return Err(io::Error::other("requested probe run has no local operation").into());
             }
-            let table = local_probe.table;
             let actor = session.actor();
-            let expected = local_probe.known;
-            let endpoint = Arc::new(
-                Endpoint::from_session(&session)?
-                    .with_commons_from_session(&session, paths, config)?,
-            );
+            let endpoint = Arc::new(Endpoint::from_session(&session)?.with_commons_from_session(
+                &session,
+                paths.clone(),
+                config.to_owned(),
+            )?);
             // The local payload, marker IDs, canonical baseline and detached
-            // endpoint came from one consistent locked session. None of its
-            // locks may cross discovery or an authenticated network exchange.
-            drop(session);
-            drop(bootstrap);
+            // endpoint share one validated read session. No session or custody
+            // lock escapes into discovery or an authenticated network exchange;
+            // each later repair batch still rechecks its own authorization.
+            Ok((local_probe, endpoint, actor))
+        }
+
+        pub(super) fn run(run: &str, seconds: u64) -> Result<Value> {
+            if !(1..=600).contains(&seconds) {
+                return Err(io::Error::other("audit seconds must be between 1 and 600").into());
+            }
+            let started = Instant::now();
+            let paths = aterm_db::application_paths(&Paths::live()?)?;
+            let config = aterm_types::dirs::aterm_config_path()
+                .ok_or_else(|| io::Error::other("Commons configuration path is unavailable"))?;
+            let (local_probe, endpoint, actor) = prepare(&paths, &config, run)?;
+            let table = local_probe.table;
+            let expected = local_probe.known;
             let mut sockets = Vec::new();
             let mut discovery_errors = Vec::new();
             let addresses = Listener::candidates()?;

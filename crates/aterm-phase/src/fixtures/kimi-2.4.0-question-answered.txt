@@ -1,0 +1,26 @@
+# kimi 2.4.0 · MEASURED 2026-10-29, `aterm ctl text` of a private headless aterm (110x32, aterm 0.146.0) running the real Kimi Code, launched by path with a scratch `HOME` and `KIMI_CODE_HOME` whose `config.toml` names one `openai`-type provider at `http://127.0.0.1:<port>/v1` with a fake key (a local stub of the Chat Completions API, crates/aterm-lab), no login · Enter on `Submit`: the answer went back as the tool's result (`{"answers":{…:"Red (Recommended)"}}`) and the stub's next reply ends the turn
+
+ ● lab tool turn done
+
+ ❯ lab run another shell command
+
+ ✗ Ran a command · $ echo lab-kimi-reject
+   Tool "Bash" was not run because the user rejected the approval request.
+
+   Rejected: Running: echo lab-kimi-reject
+
+ ● lab after the rejection
+
+ ❯ lab ask me a question
+
+ ● Collected your answers
+   Q  Which lab colour should the marker use?
+   →  Red (Recommended)
+
+ ● lab after the question
+
+ ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │ >                                                                                                        │
+ ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ lab-model  …/tmp/at.H2aa/proj                                          shift+enter: newline | ctrl+c: cancel
+                                                                                   context: 22% (21.3k/97.7k)

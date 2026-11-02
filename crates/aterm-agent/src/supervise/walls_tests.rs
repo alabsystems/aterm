@@ -570,3 +570,193 @@ fn a_wall_met_again_after_a_seat_move_is_the_new_seats_own() {
         }
     }
 }
+
+#[test]
+fn an_agy_quota_wall_rotates_onto_the_other_pool_or_waits_for_the_earliest_refill_and_resumes() {
+    use aterm_phase::agy::fixtures::lab as agy;
+    let wall = screen(agy::ERROR_429);
+    let ended = screen(agy::END_OF_TURN);
+    let ended_flash = drawn(&ended, "Gemini 3.1 Pro · low", "Gemini 3.5 Flash · low");
+    let agy_shell = rows(&["$ agy", ""]);
+
+    // 1. When another pool is available (`upgrade_due = true`), the host steps right at the quota
+    //    wall to rotate `agy` onto the other model pool, and once relaunched on the new model seat,
+    //    steps at idle to type the continuation prompt (`continued`).
+    let host = AccountHost::scripted(&[None], &[]);
+    *host.step.lock().unwrap() = Some("continued");
+    host.upgrade_due.store(true, Ordering::SeqCst);
+    let opts = account_opts(&host);
+    let mut m = agy_mock(vec![ended_flash.clone()]);
+    let mut s = session(&mut m, Some("@s-1".to_string()));
+    s.set_zone_lookup(test_zones);
+    let mut clock = Clock::start(&mut s);
+    s.program = Some("agy".to_owned());
+    let wall_point = point_at(&s, wall.clone(), 1);
+    let _ = s
+        .turn_end_at_point(&wall_point, Some(Duration::from_secs(60)), &opts)
+        .expect("a decision");
+    assert!(s.policy_limit_holds());
+    host.carry.store(true, Ordering::SeqCst);
+    let stepped = s
+        .host_steps_here(&wall_point, &opts, &mut false, &mut Alone)
+        .expect("the host's rotation step at the wall");
+    assert!(stepped, "host rotates at the wall when another pool is due");
+    assert_eq!(host.said("carry-on").len(), 1);
+
+    // After relaunch onto the new model (`ended_flash`), the seat move releases the limit and
+    // lets the host's carry-on step type the continuation prompt immediately.
+    host.upgrade_due.store(false, Ordering::SeqCst);
+    host.relaunch_owed.store(true, Ordering::SeqCst);
+    clock.to(&mut s, 30);
+    s.program = Some("zsh".to_owned());
+    let shell_point = point_at(&s, agy_shell, 2);
+    let _ = s.turn_end_at_point(&shell_point, None, &opts);
+    clock.to(&mut s, 60);
+    s.program = Some("agy".to_owned());
+    let mut after_point = point_at(&s, ended_flash.clone(), 3);
+    if let Some(row) = aterm_phase::agy::composer(&ended_flash) {
+        after_point.screen.cursor_row = row;
+    }
+    let _ = s
+        .turn_end_at_point(&after_point, Some(Duration::from_secs(4)), &opts)
+        .expect("a decision");
+    assert!(
+        !s.policy_limit_holds(),
+        "seat move to the new model releases the limit"
+    );
+    host.carry.store(true, Ordering::SeqCst);
+    let stepped = s
+        .host_steps_here(&after_point, &opts, &mut false, &mut Alone)
+        .expect("the host's carry-on step on the new model");
+    assert!(stepped, "the continuation prompt is typed on the new model");
+    assert_eq!(host.said("carry-on").len(), 2);
+
+    // 2. When both pools are spent (`upgrade_due = false`), `limit_until` supplies the earliest
+    //    pool refill timestamp (900s, earlier than the screen's 1h notice), waits until then,
+    //    and seamlessly resumes via `usage-resume@v1` once the quota is restored.
+    let host = AccountHost::scripted(&[None], &[]);
+    let refill_unix = u64::try_from(TEST_NOW + 900).unwrap();
+    *host.limit_until.lock().unwrap() = Some(refill_unix);
+    let opts = account_opts(&host);
+    let mut m = agy_mock(vec![ended.clone()]);
+    let mut s = session(&mut m, Some("@s-2".to_string()));
+    s.set_zone_lookup(test_zones);
+    let mut clock = Clock::start(&mut s);
+    s.program = Some("agy".to_owned());
+    let wall_point = point_at(&s, wall.clone(), 1);
+    let decided = s
+        .turn_end_at_point(&wall_point, Some(Duration::from_secs(60)), &opts)
+        .expect("a decision");
+    assert!(
+        matches!(decided, TurnEndAction::WaitUntil { .. }),
+        "{decided:?}"
+    );
+    let mut deadline = s.fx.mono() + Duration::from_secs(7200);
+    s.limit_after(&wall_point, &mut deadline, true, &mut Alone)
+        .expect("open limit episode");
+    host.carry.store(true, Ordering::SeqCst);
+    let stepped = s
+        .host_steps_here(&wall_point, &opts, &mut false, &mut Alone)
+        .expect("the host's step");
+    assert!(
+        !stepped,
+        "withheld while both pools are spent before refill"
+    );
+
+    clock.to(&mut s, 600);
+    let wall_point = point_at(&s, wall.clone(), 2);
+    let decided = s
+        .turn_end_at_point(&wall_point, None, &opts)
+        .expect("a decision");
+    assert!(
+        matches!(decided, TurnEndAction::WaitUntil { .. }),
+        "{decided:?}"
+    );
+
+    // An early pool refill (`Pick::Keep`, reported past `LIMIT_GRACE_S` by `limit_until` at 700s,
+    // before the original 900s episode reset and before the 1h on-screen notice) marks
+    // `limit_spent` true and resumes immediately via `usage-resume@v1`.
+    clock.to(&mut s, 700);
+    let past_grace = i64::try_from(crate::harness::upgrade_drive::LIMIT_GRACE_S).unwrap() + 60;
+    *host.limit_until.lock().unwrap() = Some(u64::try_from(TEST_NOW + 700 - past_grace).unwrap());
+    assert!(
+        s.limit_spent(Some(host.as_ref()), None),
+        "live quota refill overrides the episode's earlier reset_unix"
+    );
+    let wall_point = point_at(&s, wall, 3);
+    let decided = s
+        .turn_end_at_point(&wall_point, None, &opts)
+        .expect("a decision");
+    assert_eq!(
+        decided.rule_id(),
+        Some("usage-resume@v1"),
+        "resumes at the earlier quota refill from limit_until before the 1h screen notice: {decided:?}"
+    );
+}
+
+#[test]
+fn an_agy_individual_quota_wall_never_spams_when_pool_never_read_blocked_or_background_task_ends() {
+    use aterm_phase::agy::fixtures::lab as agy;
+    let wall_bg = screen(agy::WALL_INDIVIDUAL_QUOTA);
+    let wall_after_task = drawn(
+        &screen(agy::ERROR_429_INDIVIDUAL),
+        "⚠ agent executor error: generating and executing: RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to",
+        "⚠ Individual quota reached. Please upgrade your subscription to",
+    );
+
+    // Even when `limit_until` returns a past timestamp right at wall arrival (e.g., `/usage` never
+    // observed the active model's pool blocked) and `upgrade_due` is false (e.g., a background
+    // task is still running), neither `usage-resume@v1` nor `carry-on` spams into the quota wall.
+    let host = AccountHost::scripted(&[None], &[]);
+    let past_grace = i64::try_from(crate::harness::upgrade_drive::LIMIT_GRACE_S).unwrap() + 60;
+    *host.limit_until.lock().unwrap() = Some(u64::try_from(TEST_NOW - past_grace).unwrap());
+    *host.step.lock().unwrap() = Some("continued");
+    let opts = account_opts(&host);
+    let mut m = agy_mock(vec![wall_bg.clone()]);
+    let mut s = session(&mut m, Some("@s-3".to_string()));
+    s.set_zone_lookup(test_zones);
+    let mut clock = Clock::start(&mut s);
+    s.program = Some("agy".to_owned());
+
+    let wall_point = point_at(&s, wall_bg.clone(), 1);
+    let decided = s
+        .turn_end_at_point(&wall_point, Some(Duration::from_secs(60)), &opts)
+        .expect("a decision");
+    assert!(
+        matches!(decided, TurnEndAction::WaitUntil { .. }),
+        "fresh Individual quota reached wall waits out its reset instead of spamming: {decided:?}"
+    );
+    let mut deadline = s.fx.mono() + Duration::from_secs(7200);
+    s.limit_after(&wall_point, &mut deadline, true, &mut Alone)
+        .expect("open limit episode");
+    host.carry.store(true, Ordering::SeqCst);
+    let stepped = s
+        .host_steps_here(&wall_point, &opts, &mut false, &mut Alone)
+        .expect("the host's step");
+    assert!(!stepped, "host withholds while rotation is not due");
+    assert!(host.said("carry-on").is_empty());
+
+    // Subsequent ticks while waiting and after the background task auto-wakes onto a new Error ID
+    // still hold without typing `usage-resume@v1` or `continue`.
+    clock.to(&mut s, 600);
+    *host.limit_until.lock().unwrap() = Some(u64::try_from(TEST_NOW + 600 - past_grace).unwrap());
+    let wall_point = point_at(&s, wall_bg, 2);
+    let decided = s
+        .turn_end_at_point(&wall_point, None, &opts)
+        .expect("a decision");
+    assert!(
+        matches!(decided, TurnEndAction::WaitUntil { .. }),
+        "stays waiting while pool never transitioned from blocked: {decided:?}"
+    );
+
+    clock.to(&mut s, 900);
+    *host.limit_until.lock().unwrap() = Some(u64::try_from(TEST_NOW + 900 - past_grace).unwrap());
+    let wake_wall = point_at(&s, wall_after_task, 3);
+    let decided = s
+        .turn_end_at_point(&wake_wall, Some(Duration::from_secs(2)), &opts)
+        .expect("a decision after background task auto-wake");
+    assert!(
+        matches!(decided, TurnEndAction::WaitUntil { .. }),
+        "auto-wake onto Individual quota reached still waits: {decided:?}"
+    );
+}

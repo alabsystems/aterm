@@ -228,9 +228,19 @@ fn the_prune_removes_only_a_stale_stamp() {
         "0badf00d.json",
         "codex-s-1.json",
         "asked-s-new.json.1.2.3.tmp",
+        "asked-.json",
+        "asked-s-new.json.1.2.3.json",
     ] {
         assert!(!prune(state, other, now), "{other}");
     }
+    assert_eq!(
+        Stamp::from_json(r#"{"pid":0,"start":"x","cause":"asked","at":1}"#),
+        None
+    );
+    assert_eq!(
+        Stamp::from_json(r#"{"pid":1,"start":"","cause":"asked","at":1}"#),
+        None
+    );
 }
 
 #[test]

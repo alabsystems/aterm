@@ -614,6 +614,100 @@ fn bounded_harness_acts_reject_expiry_and_stale_proof_without_publication() {
 }
 
 #[test]
+fn leased_standing_faces_wait_for_rest_and_keep_unbounded_compatibility() {
+    let state = aterm_tempfile::tempdir().expect("scratch state dir");
+    crate::test_env::scoped("ATERM_STATE_HOME", state.path(), || {
+        use super::control_session::{HarnessActSnapshot, cmd_meta_harness_act_with_clock};
+        use crate::session_timeline::LandingMark;
+        use aterm_agent::harness::acts::TaskFace;
+        for (act, face) in [
+            ("landed@v1", TaskFace::Landed),
+            ("left-to-person@v1", TaskFace::Theirs),
+        ] {
+            let h = crate::session_store::test_handle_on(7514, -1);
+            let ctx = h.ctx.as_ref();
+            let base = crate::metrics::now_us();
+            claim_supervisor_as(
+                ctx,
+                &format!("codex-alab@{}", std::process::id()),
+                Some(2),
+                None,
+                Some(running()),
+                base,
+                aterm_slog::Actor::Ctl,
+            )
+            .expect("proven holder");
+            let snapshot = |program_turns, left_at_rest| HarnessActSnapshot {
+                mark: LandingMark { program_turns },
+                left_at_rest,
+            };
+            let serve = |snapshot, rest: &str, now| {
+                cmd_meta_harness_act_with_clock(
+                    ctx,
+                    snapshot,
+                    Some(2),
+                    aterm_slog::Actor::Ctl,
+                    &|_| Some(running()),
+                    rest,
+                    &|| now,
+                )
+                .expect("a harness-act command")
+            };
+            let bounded = format!("set harness_act {act} until_us={}", base + 100);
+            // A missing snapshot and a pending turn's working report admit neither face.
+            // NEGATIVE CONTROL: checking only Theirs wrongly admits Landed here.
+            for point in [None, Some(snapshot(7, false))] {
+                assert_eq!(
+                    serve(point, &bounded, base),
+                    ("ERR busy harness_act\n".to_string(), false)
+                );
+                let mut timeline = ctx.timeline.lock().unwrap();
+                assert!(timeline.last_act().is_none(), "{act}");
+                assert!(timeline.landing_mark().is_none(), "{act}");
+                assert!(timeline.take_self_tasks().is_empty(), "{act}");
+                assert!(timeline.take_self_acts().is_empty(), "{act}");
+                assert!(
+                    !timeline
+                        .since(None)
+                        .any(|row| row.kind == crate::session_timeline::HARNESS_ACT)
+                );
+            }
+            assert_eq!(
+                serve(Some(snapshot(7, true)), &bounded, base),
+                ("OK\n".to_string(), true)
+            );
+            {
+                let mut timeline = ctx.timeline.lock().unwrap();
+                assert_eq!(timeline.last_act(), Some(act));
+                assert_eq!(timeline.landing_mark(), Some(snapshot(7, true).mark));
+                assert_eq!(timeline.take_self_tasks(), [face]);
+            }
+            assert_eq!(
+                serve(Some(snapshot(8, true)), &bounded, base + 100),
+                ("ERR expired harness_act\n".to_string(), false)
+            );
+            assert_eq!(
+                ctx.timeline.lock().unwrap().landing_mark(),
+                Some(snapshot(7, true).mark)
+            );
+            // Older clients use this spelling without a lease. Its historical behavior is
+            // unchanged; only a bounded client and the paired host fence this window.
+            assert_eq!(
+                serve(
+                    Some(snapshot(8, false)),
+                    &format!("set harness_act {act}"),
+                    base
+                ),
+                ("OK\n".to_string(), true)
+            );
+            let mut timeline = ctx.timeline.lock().unwrap();
+            assert_eq!(timeline.landing_mark(), Some(snapshot(8, false).mark));
+            assert_eq!(timeline.take_self_tasks(), [face]);
+        }
+    });
+}
+
+#[test]
 fn a_harness_act_rechecks_claim_expiry_at_the_timeline_commit() {
     use super::control_session::cmd_meta_harness_act_with_clock;
     for bounded in [false, true] {
@@ -2701,6 +2795,8 @@ fn only_a_proven_claims_holder_tells_its_own_land_hold() {
         stashes: 2,
         unpushed: 4,
         unlanded: 5,
+        sub_unpushed: 0,
+        parked: 0,
     };
     assert!(
         ["follow-up", "not pushed", "skipped", "untested", "todo"]
@@ -4382,6 +4478,80 @@ fn a_rostered_harness_claims_its_scope_through_meta_proven_or_refused_whole() {
         scoped_now(),
         (None, false),
         "an unrostered holder's claim is never proven"
+    );
+}
+
+/// A scoped renewal publishes semantic scope and version changes through MetaChanged, while an
+/// identical renewal wakes nothing. The holder row is not duplicated for those changes.
+#[test]
+fn a_scoped_renewal_wakes_for_scope_version_and_vendor_changes() {
+    let store = crate::session_store::new_store();
+    let h = crate::session_store::test_handle_on(7550, -1);
+    store.write().unwrap().register(h.clone());
+    let ctx = h.ctx.as_ref();
+    let me = format!("grok-alab@{}", stand_in());
+    let serve = |words: &str| {
+        super::meta_wakes_proving_for_test(
+            &store,
+            &h.term,
+            7550,
+            &h.ctx,
+            &format!("set supervisor {me} contract=3 {words}"),
+            Some(4),
+            &|_| Some(running()),
+        )
+    };
+    let claims = [
+        "scope=upgrade version=0.3.0 vendor=1.0.70",
+        "scope=relaunch version=0.3.0 vendor=1.0.70",
+        "scope=relaunch version=0.4.0 vendor=1.0.70",
+        "scope=relaunch version=0.4.0 vendor=1.0.71",
+        "scope=relaunch",
+    ];
+    for words in claims {
+        let (reply, wakes) = serve(words);
+        assert_eq!(reply, "OK\n");
+        assert!(
+            matches!(
+                wakes.as_slice(),
+                [crate::Wake::MetaChanged { session: 7550 }]
+            ),
+            "a semantic claim change wakes the window: {words}: {wakes:?}"
+        );
+        let before = ctx.meta.lock().unwrap().supervisor_revision;
+        let (reply, wakes) = serve(words);
+        assert_eq!(reply, "OK\n");
+        assert!(
+            wakes.is_empty(),
+            "an identical renewal wakes nothing: {wakes:?}"
+        );
+        let meta = ctx.meta.lock().unwrap();
+        assert_eq!(meta.supervisor_revision, before.wrapping_add(1));
+        assert_eq!(
+            meta.live_scoped(crate::metrics::now_us())
+                .expect("scoped")
+                .claim
+                .scopes
+                .words(),
+            words
+                .split_whitespace()
+                .next()
+                .expect("scope")
+                .strip_prefix("scope=")
+                .expect("scope value")
+        );
+    }
+    let (_, wakes) = serve("scope=upgrade,relaunch");
+    assert_eq!(wakes.len(), 1, "adding a scope wakes the window");
+    let (_, wakes) = serve("scope=relaunch,upgrade");
+    assert!(wakes.is_empty(), "scope word order changes no authority");
+    assert_eq!(
+        meta_changes(ctx)
+            .into_iter()
+            .filter(|row| row.starts_with("field=supervisor "))
+            .count(),
+        1,
+        "renewal changes no holder spelling"
     );
 }
 

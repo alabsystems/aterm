@@ -18,6 +18,16 @@ unsafe extern "C" {
     fn CACurrentMediaTime() -> f64;
 }
 
+/// `CACurrentMediaTime()`: the clock a drawable's `presentedTime` reads, seconds
+/// (`present_glass::media_ns_of`).
+///
+/// # Safety
+/// None beyond the call: it reads a monotonic clock.
+pub(crate) unsafe fn media_time_s() -> f64 {
+    // SAFETY: reading a monotonic clock.
+    unsafe { CACurrentMediaTime() }
+}
+
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
     fn CGColorSpaceCreateWithName(name: *const c_void) -> *mut c_void;
@@ -695,11 +705,7 @@ unsafe fn register_presented_handler(drawable: Id) {
             let get: unsafe extern "C-unwind" fn(Id, Sel) -> f64 = checked_msg();
             get(presented, sel(c"presentedTime"))
         };
-        crate::present_glass::deliver_report(
-            serial,
-            tag,
-            crate::present_glass::classify(registered_s, presented_s),
-        );
+        crate::present_glass::deliver_presented(serial, tag, registered_s, presented_s);
     };
     // SAFETY: `MTLDrawablePresentedHandler` is `void (^)(id<MTLDrawable>)`, exactly `(Id) -> ()`, and the closure captures only `Copy` values.
     let block = unsafe { aterm_objc::RcBlock::new1(handler) };

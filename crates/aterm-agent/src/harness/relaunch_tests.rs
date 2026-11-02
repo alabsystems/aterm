@@ -14,7 +14,10 @@ fn words(list: &[&str]) -> Vec<String> {
 #[cfg(unix)]
 #[test]
 fn the_program_is_the_script_or_the_image_that_is_claude() {
-    let native = Path::new("/h/.local/share/claude/versions");
+    let home = aterm_tempfile::tempdir().expect("scratch home");
+    let native = &super::super::agent_image::claude_versions(home.path());
+    std::fs::create_dir_all(native).expect("versions");
+    std::fs::write(native.join("2.1.281"), b"a native build").expect("a native build");
     let twin = words(&["/bin/sh", "/p/agents/claude", "--model", "opus"]);
     assert_eq!(
         launched(&twin, Some(Path::new("/bin/sh")), native, false),
@@ -40,6 +43,22 @@ fn the_program_is_the_script_or_the_image_that_is_claude() {
             ]
         ))
     );
+    // The vendor's layout is the agent identity predicate's ([`super::super::agent_image`]): a
+    // link in the versions directory to another program, and that program where it lies, are
+    // neither the native install.
+    let other = home.path().join("elsewhere/2.1.282");
+    std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+    std::fs::write(&other, b"another program").unwrap();
+    let link = native.join("2.1.283");
+    std::os::unix::fs::symlink(&other, &link).unwrap();
+    for exe in [&other, &link] {
+        assert_eq!(
+            launched(&binary, Some(exe), native, false),
+            None,
+            "{}",
+            exe.display()
+        );
+    }
     assert!(launched(&binary, Some(Path::new("/s/claude")), native, false).is_some());
     assert!(
         launched(&binary, Some(Path::new("/s/cc-2.1")), native, true).is_some(),
@@ -1588,6 +1607,30 @@ fn a_relaunch_resumes_the_mode_the_conversation_ran_in() {
             "ID"
         ])
     );
+    assert_eq!(
+        with_permission_mode(
+            args(&[
+                "--append-system-prompt",
+                "--dangerously-skip-permissions",
+                "--add-dir",
+                "--permission-mode",
+                "--resume",
+                "ID"
+            ]),
+            Some("plan")
+        ),
+        args(&[
+            "--append-system-prompt",
+            "--dangerously-skip-permissions",
+            "--add-dir",
+            "--permission-mode",
+            "--permission-mode",
+            "plan",
+            "--resume",
+            "ID"
+        ]),
+        "flag-shaped values of earlier options are never stripped or read as bypass"
+    );
 }
 
 #[test]
@@ -2355,7 +2398,9 @@ fn whether_the_adopted_agent_is_gone_is_the_records_to_say() {
     };
     std::fs::create_dir_all(state_dir(&o)).expect("state");
     let reaped = {
-        let mut child = aterm_uds::spawnfd::command("true").spawn().expect("spawn");
+        let mut child = aterm_uds::spawnfd::command(crate::test_program::kept("/usr/bin/true"))
+            .spawn()
+            .expect("spawn");
         let pid = child.id();
         child.wait().expect("reap");
         pid
@@ -2980,6 +3025,11 @@ fn the_tap_rides_before_the_resume_in_every_shells_form() {
         args(&["--verbose", "--settings", "v", "--resume", "X"])
     );
     assert_eq!(flags.iter().filter(|f| *f == "--resume").count(), 1);
+    assert_eq!(
+        with_tap(args(&["--append-system-prompt", "--resume"]), "v"),
+        args(&["--append-system-prompt", "--resume", "--settings", "v"]),
+        "a value equal to --resume on a fresh start is not split from its option"
+    );
 }
 
 /// The tap is dropped before anything required: a launch whose line fits its bound only without the tap is relaunched without it, the login still first on the line; one that fits only without the tap and the survey switch keeps the login alone.
@@ -3328,7 +3378,7 @@ fn a_relaunch_after_aterm_ended_is_made_on_the_carried_line_as_the_crash_rule_ma
         press: None,
         timings: crate::harness::Timings::FAST,
     };
-    let mut gone = aterm_uds::spawnfd::command("/usr/bin/true")
+    let mut gone = aterm_uds::spawnfd::command(crate::test_program::kept("/usr/bin/true"))
         .spawn()
         .expect("spawn true");
     let dead = gone.id();
@@ -3412,34 +3462,18 @@ fn an_adoption_promises_what_its_first_idle_point_does() {
     let owed = St::default();
     let why = NOBODY_ASKED;
     assert_eq!(
-        Adopted::of(
-            &quiet,
-            || panic!("the records are not read for a quiet move"),
-            || panic!("Land is not read for a quiet move")
-        ),
+        Adopted::of(&quiet, || panic!(
+            "the records are not read for a quiet move"
+        )),
         Adopted::Quiet
     );
-    assert_eq!(
-        Adopted::of(
-            &owed,
-            || Some(why),
-            || panic!("Land is not read where nothing is owed")
-        ),
-        Adopted::NothingOwed(why)
-    );
-    assert_eq!(Adopted::of(&owed, || None, || true), Adopted::Land);
-    assert_eq!(Adopted::of(&owed, || None, || false), Adopted::Owed);
-    let [q, n, l, o] = [
-        Adopted::Quiet,
-        Adopted::NothingOwed(why),
-        Adopted::Land,
-        Adopted::Owed,
-    ]
-    .map(Adopted::detail);
-    let rows = [&q, &n, &l, &o];
+    assert_eq!(Adopted::of(&owed, || Some(why)), Adopted::NothingOwed(why));
+    assert_eq!(Adopted::of(&owed, || None), Adopted::Owed);
+    let [q, n, o] = [Adopted::Quiet, Adopted::NothingOwed(why), Adopted::Owed].map(Adopted::detail);
+    let rows = [&q, &n, &o];
     for (i, a) in rows.iter().enumerate() {
         for b in &rows[i + 1..] {
-            assert_ne!(a, b, "four promises, four rows");
+            assert_ne!(a, b, "three promises, three rows");
         }
     }
     assert!(n.ends_with(why), "the row names why: {n}");
@@ -3494,7 +3528,7 @@ fn a_workers_first_line_hands_the_task_over_as_one_argument() {
         let argv_out = tmp.path().join(format!("argv-{}", dialect.hook_ext()));
         let _ = std::fs::remove_file(&argv_out);
         let out = aterm_uds::deadline::output_until(
-            aterm_uds::spawnfd::command(shell)
+            aterm_uds::spawnfd::command(crate::test_program::kept(shell))
                 .args(["-f", "-c", &format!("{prelude}\n{line}")])
                 .env("ATERM_TASK_FILE", &file)
                 .env("ARGV_OUT", &argv_out),
@@ -3549,7 +3583,7 @@ fn a_workers_first_line_hands_the_task_over_as_one_argument() {
         );
     }
     let evaluated = aterm_uds::deadline::output_until(
-        aterm_uds::spawnfd::command("/bin/sh")
+        aterm_uds::spawnfd::command(crate::test_program::kept("/bin/sh"))
             .args([
                 "-c",
                 r#"eval "$(sed -n 3p "$ATERM_TASK_FILE")" 2>/dev/null; true"#,
@@ -3692,7 +3726,7 @@ fn a_store_binarys_line_exports_its_shims_env_and_a_bare_build_adds_nothing() {
         let ran = tmp.path().join(format!("env-{}.ran", dialect.hook_ext()));
         let _ = std::fs::remove_file(&env_out);
         let out = aterm_uds::deadline::output_until(
-            aterm_uds::spawnfd::command(shell)
+            aterm_uds::spawnfd::command(crate::test_program::kept(shell))
                 .args(["-f", "-c", line])
                 .env_remove("DISABLE_AUTOUPDATER")
                 .env_remove("CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY")
@@ -4408,14 +4442,25 @@ fn every_lanes_carry_on_ends_on_the_continuation_and_its_needs_sentence() {
         &to,
         Some("claude-opus-5-5"),
     ));
+    let held_check =
+        crate::supervise::policy::go_ahead::unless_held(&done_check_words(0), true).into_owned();
     for text in &texts {
         assert!(text.ends_with(upgrade::CARRY_ON), "{text}");
-        let checked = upgrade::checking(text, false);
+        let checked = upgrade::checking(text, false, false);
         assert!(checked.ends_with(&done_check_words(0)), "{checked}");
         assert!(!checked.contains(upgrade::CARRY_ON), "{checked}");
+        // Within the person's hour the check says no go-ahead word, the rest of it whole.
+        let held = upgrade::checking(text, false, true);
+        assert!(held.ends_with(&held_check), "{held}");
+        assert!(
+            !held.contains(crate::supervise::policy::go_ahead::NEVER_A_NEED),
+            "{held}"
+        );
     }
     let other = format!("{} Upgraded.", upgrade::HARNESS_MARK);
-    assert_eq!(upgrade::checking(&other, false), other);
+    for held in [false, true] {
+        assert_eq!(upgrade::checking(&other, false, held), other);
+    }
 }
 
 /// A row's leader socket is `leader-<label>-<8 hex>.sock` in the grok home, the hex its auth
@@ -4436,19 +4481,19 @@ fn a_grok_rows_leader_socket_fits_sun_path_or_is_refused() {
         ),
         "f01ad3cec3bf7236"
     );
-    let named = |home: &str| format!("{home}/leader-{label}-99068163.sock");
-    let hashed = |home: &str| format!("{home}/leader-f01ad3cec3bf7236.sock");
+    // The socket is joined to its home as this host joins a path (`\` on Windows).
+    let sep = std::path::MAIN_SEPARATOR;
+    let named = |home: &str| format!("{home}{sep}leader-{label}-99068163.sock");
+    let hashed = |home: &str| format!("{home}{sep}leader-f01ad3cec3bf7236.sock");
     let socket = |home: &str| {
         grok_leader_socket(Path::new(home), label, login).map(|p| p.to_string_lossy().into_owned())
     };
     assert_eq!(
         socket("/g"),
-        Ok(concat!(
-            "/g/leader-",
-            "a-very-long-account-label-for-the-grok-pool-on-this-machine-0042",
-            "-99068163.sock"
-        )
-        .to_string())
+        Ok(format!(
+            "/g{sep}leader-{}-99068163.sock",
+            "a-very-long-account-label-for-the-grok-pool-on-this-machine-0042"
+        ))
     );
     // Under a home as long as `/Users//u/.grok`, that name and its daemon's take 107 bytes: past
     // macOS's sun_path (103), which takes the hashed name, and Linux's (107) to the byte.
@@ -4514,6 +4559,11 @@ fn pool_args_remove_what_each_cli_carries_in_place_of_a_row() {
     };
     let flags = words(&["-m", "x"]);
     let home = Some(Path::new("/Users//u/.grok"));
+    // The row's socket, joined to its home as this host joins a path (`\` on Windows).
+    let work_socket = Path::new("/Users//u/.grok")
+        .join("leader-work-07d954d5.sock")
+        .display()
+        .to_string();
     let grok = pool_args(
         accounts::Cli::Grok,
         &row("GROK_AUTH_PATH", Some("/l/auth.json")),
@@ -4524,12 +4574,7 @@ fn pool_args_remove_what_each_cli_carries_in_place_of_a_row() {
     assert_eq!(grok.unset, ["GROK_AUTH", "GROK_LEADER_SOCKET"]);
     assert_eq!(
         grok.flags,
-        words(&[
-            "-m",
-            "x",
-            "--leader-socket",
-            "/Users//u/.grok/leader-work-07d954d5.sock"
-        ])
+        words(&["-m", "x", "--leader-socket", &work_socket])
     );
     let codex = pool_args(
         accounts::Cli::Codex,
@@ -4630,13 +4675,7 @@ fn pool_args_remove_what_each_cli_carries_in_place_of_a_row() {
         &carried,
     )
     .expect("grok row");
-    assert_eq!(
-        own.flags,
-        words(&[
-            "--leader-socket",
-            "/Users//u/.grok/leader-work-07d954d5.sock"
-        ])
-    );
+    assert_eq!(own.flags, words(&["--leader-socket", &work_socket]));
 }
 
 /// The window host of the 2026-10-26 incident (tab `s-f16681f50e0ff4e76b34`): its harness held
@@ -5263,4 +5302,214 @@ fn agent_resumed_recognizes_aterm_relaunches_and_refuses_fresh_or_recycled_proce
         block: None,
     });
     assert!(agent_resumed(&o, &agy), "Agy resume");
+}
+
+/// A LAUNCH WHOSE OWN ARGUMENTS RESUME A CONVERSATION IS A RESUMED AGENT TO THE LOOP
+/// ([`resumes_conversation`], D2-2 and D2-9): whoever ran it, `claude --continue`, `claude --resume
+/// <id>`, `muse resume`, `agy --conversation <id>` or `agy --continue` carries on a session that
+/// worked before, so its first question opens none
+/// (`crate::supervise::TurnEndState::host_agent_resumed`). aterm's own relaunch still answers so.
+/// A `muse resume` carrying a flag the relaunch refuses or does not know is one too.
+/// NEGATIVE CONTROLS: a bare launch of each, with no relaunch record, answers no, as do a flag's
+/// value, another subcommand's argument and a prompt after `--` that read `resume`. MUTANT: with
+/// `launch_resumes` out of `resumes_conversation`, the person's own resumes answer no.
+#[test]
+fn a_launch_that_resumes_a_conversation_is_a_resumed_agent() {
+    const ID: &str = "0badf00d-1111-2222-3333-99990000eeee";
+    const START: &str = "Wed Oct 28 17:00:10 2026";
+    let dir = crate::supervise::ScratchDir::new("relaunch", "launch-resumes");
+    let o = Opts {
+        home: dir.join("home"),
+        state: dir.join("state"),
+        sock: None,
+        token: None,
+        only_sid: Some("s-own".to_string()),
+        dry_run: false,
+        human_grace_s: 0,
+        hand_back: true,
+        background: false,
+        aterm_state: None,
+        ask: false,
+        several_logins: false,
+        usage_credits: false,
+        instances: super::super::upgrade_drive::Instances::Listed(Vec::new()),
+        usage_tap: None,
+        agents_off: Vec::new(),
+        land: false,
+        tell: crate::harness::upgrade_drive::Tell::Off,
+        press: None,
+        timings: crate::harness::Timings::FAST,
+    };
+    std::fs::create_dir_all(state_dir(&o)).expect("state");
+    let snap = |argv: &[&str], run: AgentRun| Snapshot {
+        tab: "s-own".to_string(),
+        pid: 8200,
+        start: START.to_string(),
+        shell: 100,
+        program: PathBuf::from(format!("/p/{}", argv[0])),
+        argv: words(argv),
+        session: None,
+        cwd: "/w".to_string(),
+        version: Some("2.1.312".to_string()),
+        run,
+        dialect: None,
+        login: None,
+        home: None,
+        claude_dir: None,
+        stored_login: true,
+        profile: None,
+    };
+    let muse = || {
+        AgentRun::Muse(MuseRun {
+            data: dir.join("muse"),
+            env: Vec::new(),
+            workspace: None,
+            lock: None,
+            started_ms: 0,
+            block: None,
+        })
+    };
+    let agy = || {
+        AgentRun::Agy(AgyRun {
+            config: dir.join("agy"),
+            env: Vec::new(),
+            lock: None,
+            crash: None,
+            started_ms: 0,
+            block: None,
+        })
+    };
+    for (argv, run, want) in [
+        (&["claude", "--continue"][..], AgentRun::Claude, true),
+        (
+            &["claude", "-c", "what changed?"][..],
+            AgentRun::Claude,
+            true,
+        ),
+        (&["claude", "--resume", ID][..], AgentRun::Claude, true),
+        (
+            &["claude", "--resume", ID, "--fork-session"][..],
+            AgentRun::Claude,
+            true,
+        ),
+        (&["claude"][..], AgentRun::Claude, false),
+        (
+            &["claude", "what does this repo do?"][..],
+            AgentRun::Claude,
+            false,
+        ),
+        (&["muse", "resume", ID][..], muse(), true),
+        (&["muse", "resume", "--last"][..], muse(), true),
+        (
+            &["muse", "resume", ID, "--workspace", "/w"][..],
+            muse(),
+            true,
+        ),
+        (
+            &["muse", "resume", "--last", "--no-session-log"][..],
+            muse(),
+            true,
+        ),
+        (
+            &["muse", "--brand-new-flag", "resume", ID][..],
+            muse(),
+            true,
+        ),
+        (&["muse", "--model", "resume"][..], muse(), false),
+        (&["muse", "exec", "resume"][..], muse(), false),
+        (&["muse", "--", "resume"][..], muse(), false),
+        (&["muse"][..], muse(), false),
+        (&["agy", "--conversation", ID][..], agy(), true),
+        (&["agy", "--continue"][..], agy(), true),
+        (&["agy", "-c"][..], agy(), true),
+        (&["agy", "--continue=1"][..], agy(), true),
+        (&["agy", "--continue=TRUE"][..], agy(), true),
+        (&["agy", "--continue=false"][..], agy(), false),
+        (&["agy", "--continue=0"][..], agy(), false),
+        (&["agy", "--continue=FALSE"][..], agy(), false),
+        (&["agy", "-c=F"][..], agy(), false),
+        (
+            &["agy", "--continue=true", "--continue=false"][..],
+            agy(),
+            false,
+        ),
+        (&["agy", "--continue=false", "-c=true"][..], agy(), true),
+        (&["agy", "--model", "--continue"][..], agy(), false),
+        (&["agy", "--settings", "{}", "--continue"][..], agy(), true),
+        (&["agy", "--settings", "--continue"][..], agy(), false),
+        (&["agy", "--model", "--conversation", ID][..], agy(), false),
+        (&["agy", "--", "--continue"][..], agy(), false),
+        (&["agy", "prompt", "--continue"][..], agy(), false),
+        // A continuation flag does not turn a positional one-shot into an interactive agent.
+        (&["agy", "--continue", "--", "---bad"][..], agy(), false),
+        (&["agy", "--continue", "prompt", "---bad"][..], agy(), false),
+        (&["agy", "--continue", "---bad"][..], agy(), false),
+        (&["agy", "--continue", "-=bad"][..], agy(), false),
+        (&["agy"][..], agy(), false),
+        (&["agy", "--model", "c"][..], agy(), false),
+    ] {
+        let s = snap(argv, run);
+        assert!(!agent_resumed(&o, &s), "no relaunch record: {argv:?}");
+        assert_eq!(resumes_conversation(Some(&o), &s), want, "{argv:?}");
+        assert_eq!(resumes_conversation(None, &s), want, "no options: {argv:?}");
+    }
+    // aterm's own relaunch, its record on file, still answers so.
+    let began = crate::harness::upgrade_models::parse_lstart(START).expect("lstart");
+    save(
+        &o,
+        ID,
+        &St {
+            phase: upgrade::Phase::Done,
+            cause: CAUSE_ASKED.to_string(),
+            tab: "s-own".to_string(),
+            pid: 8100,
+            resumed_pid: 8200,
+            relaunched_at: began,
+            done_at: began + 2,
+            ..St::default()
+        },
+    );
+    let ours = snap(&["claude", "--resume", ID], AgentRun::Claude);
+    assert!(agent_resumed(&o, &ours), "aterm's relaunch");
+    assert!(resumes_conversation(Some(&o), &ours), "aterm's relaunch");
+}
+
+/// THE PERSON'S HOUR BY ONE `status` REPLY ([`go_ahead_held_by_status`]), which cuts the go-ahead's
+/// sentence from a relaunch's done check as the loop's hour cuts it from its own: their typing
+/// within [`crate::supervise::policy::turn_end::GO_AHEAD_HELD`] holds it, `human_typed_ms=` over
+/// `human_ms=` (a scroll or a click is no key), and a reply with no readable key holds it.
+/// NEGATIVE CONTROLS: a key at or past the hour, and no typing since the host began serving the
+/// tab, hold nothing.
+#[test]
+fn the_persons_hour_is_read_off_one_status_reply() {
+    let hour = crate::supervise::policy::turn_end::GO_AHEAD_HELD.as_millis();
+    for (status, held) in [
+        (
+            "OK schema=1 hold=0 hand=- human_ms=600000".to_string(),
+            true,
+        ),
+        (
+            format!("OK schema=1 hold=0 hand=- human_ms={}", hour - 1),
+            true,
+        ),
+        (format!("OK schema=1 hold=0 hand=- human_ms={hour}"), false),
+        ("OK schema=1 hold=0 hand=- human_ms=-".to_string(), false),
+        (
+            format!("OK schema=1 human_ms=5000 human_typed_ms={}", hour + 1),
+            false,
+        ),
+        (
+            "OK schema=1 human_ms=5000 human_typed_ms=-".to_string(),
+            false,
+        ),
+        (
+            format!("OK schema=1 human_ms={} human_typed_ms=5000", hour + 1),
+            true,
+        ),
+        ("OK schema=1 hold=0 hand=-".to_string(), true),
+        ("OK schema=1 human_ms=soon".to_string(), true),
+        ("ERR no such session".to_string(), true),
+    ] {
+        assert_eq!(go_ahead_held_by_status(&status), held, "{status}");
+    }
 }

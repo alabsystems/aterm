@@ -52,6 +52,13 @@ fn page_beside_terminal() -> Split {
     );
     assert!(app.open_system_state_tab());
     let (_, page) = app.active_native_view(window).unwrap();
+    // A read Mac with every line open, so the page's list runs past the pane and a wheel has
+    // somewhere to go (lines open to nothing while the plan is unknown).
+    app.publish_system_state(crate::system_state::fixture_status("mixed").unwrap());
+    let Some(AppViewState::SystemState(state)) = app.native_runtime.view_state(page) else {
+        panic!("a System State view");
+    };
+    state.open_every_line();
     assert!(app.commit_glassless_native_frame(window));
     assert!(app.system_state_frontmost());
 

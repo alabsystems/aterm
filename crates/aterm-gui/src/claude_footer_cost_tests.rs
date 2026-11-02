@@ -1252,3 +1252,127 @@ fn the_stamp_lane_vouches_for_rows_exactly_where_the_renderer_does() {
         );
     }
 }
+
+/// The account unit under the outlook with `used` cells of its week's bar used, as the resolver
+/// hands it (`docs/DESIGN-accounts-outlook-2026-10-25.md` §2).
+fn outlook_unit(used: usize) -> FooterFacts {
+    use aterm_agent::harness::outlook::{BarCell, Glance, VerdictWords};
+    let ten: [BarCell; 10] = std::array::from_fn(|i| match i {
+        i if i < used => BarCell::Used,
+        i if i < used + 2 => BarCell::More,
+        i if i == used + 2 => BarCell::Tick,
+        _ => BarCell::Left,
+    });
+    FooterFacts {
+        subscription: Some(SubscriptionDisplay {
+            email: Some("me@example.test".into()),
+            plan: Some("Max 20x".into()),
+            weekly: Some(format!("weekly {}% left", 100 - used * 10)),
+            ..SubscriptionDisplay::default()
+        }),
+        glance: Some(Glance {
+            bar: Some((ten, std::array::from_fn(|i| ten[i * 2]))),
+            reset: Some("Thu 09:00".into()),
+            five: Some("5h 62% left".into()),
+            verdict: Some(VerdictWords {
+                full: "continuous 7d".into(),
+                short: "continuous 7d".into(),
+                shortest: None,
+                warn: false,
+                kept_narrow: false,
+            }),
+            title: Some("50% used, ~70% by its reset at today's pace".into()),
+            title_verdict: Some("continuous 7d".into()),
+            spoken: Some("At today's pace about 70% used by then.".into()),
+        }),
+        ..facts()
+    }
+}
+
+/// T21: THE OUTLOOK'S GLANCE COSTS A FRAME AT REST NOTHING. With the week's bar on the rule, 30
+/// frames cost nothing; the resolver handing the same glance again (an outlook replayed with
+/// nothing moved) changes nothing and costs nothing; a bar that moved by a cell composes the
+/// rule exactly once and rests again, its new repaint key standing; a verdict that moved alone
+/// (the figure unchanged) does the same. Negative control: the glance left out of the
+/// fingerprint, so the moved verdict never reaches the glass. (A clock hashed into the
+/// fingerprint is an equivalent mutant here: the pane keeps its fingerprint while its facts are
+/// equal, so the hash is not taken at rest.)
+#[test]
+fn a_glance_at_rest_costs_nothing_and_a_moved_bar_composes_once() {
+    let (mut app, wid, session) = glass_with(&AT_REST, outlook_unit(5));
+    let rule = AT_REST.bottom();
+    let at_rest = glass_row(&app, wid, rule);
+    assert!(
+        at_rest.contains('\u{2386}') && at_rest.contains('\u{2501}'),
+        "the unit and its bar are on the rule: {at_rest:?}"
+    );
+    for i in 0..30 {
+        assert_eq!(cost(&mut app, wid), Cost::default(), "frame {i}");
+        assert_eq!(glass_row(&app, wid, rule), at_rest, "frame {i}");
+    }
+    let key = pass(&mut app, wid);
+    assert_eq!(pass(&mut app, wid), key, "the repaint key stands at rest");
+    {
+        let entry = app.pool.get(session).expect("session");
+        let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(
+            !timeline.set_claude_footer(4242, None, Some(outlook_unit(5))),
+            "the same glance again changes nothing"
+        );
+    }
+    for i in 0..30 {
+        assert_eq!(cost(&mut app, wid), Cost::default(), "replayed, frame {i}");
+    }
+    assert_eq!(pass(&mut app, wid), key, "the same glance keeps the key");
+
+    publish(&app, session, outlook_unit(6));
+    let moved = cost(&mut app, wid);
+    assert_eq!(
+        (moved.composed, moved.reads),
+        (1, 0),
+        "a moved bar composes once and reads no pane ({moved:?})"
+    );
+    let now = glass_row(&app, wid, rule);
+    assert_ne!(now, at_rest, "the moved bar is on the glass");
+    assert!(now.contains("40% left"), "{now:?}");
+    for i in 0..30 {
+        assert_eq!(cost(&mut app, wid), Cost::default(), "moved, frame {i}");
+    }
+    let moved_key = pass(&mut app, wid);
+    assert_ne!(moved_key, key, "CONTROL: the key moved with the bar");
+    assert_eq!(pass(&mut app, wid), moved_key, "the key it moved to stands");
+
+    // The outlook alone moves (a stop now ahead, the figure as it was): the glance is in the
+    // repaint key, so the rule composes once and says the stop in words.
+    let mut stop = outlook_unit(6);
+    if let Some(glance) = stop.glance.as_mut() {
+        glance.verdict = Some(aterm_agent::harness::outlook::VerdictWords {
+            full: "\u{29d7} stop ~Wed 22:30\u{2013}Thu 09:00".into(),
+            short: "\u{29d7} stop ~Wed 22:30".into(),
+            shortest: Some("\u{29d7} ~Wed 22:30".into()),
+            warn: true,
+            kept_narrow: true,
+        });
+        glance.title_verdict = Some("stop ~Wed 22:30".into());
+    }
+    publish(&app, session, stop);
+    let told = cost(&mut app, wid);
+    assert_eq!(
+        (told.composed, told.reads),
+        (1, 0),
+        "a verdict that moved alone composes once and reads no pane ({told:?})"
+    );
+    let stopped = glass_row(&app, wid, rule);
+    assert!(
+        stopped.contains('\u{29d7}') && stopped.contains("40% left"),
+        "the stop is on the glass beside the same figure: {stopped:?}"
+    );
+    for i in 0..30 {
+        assert_eq!(cost(&mut app, wid), Cost::default(), "told, frame {i}");
+    }
+    assert_ne!(
+        pass(&mut app, wid),
+        moved_key,
+        "the key moved with the verdict"
+    );
+}

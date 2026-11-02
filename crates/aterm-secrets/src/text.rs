@@ -58,9 +58,15 @@ pub struct Entry {
     pub anchor: Option<String>,
 }
 
-/// An open vault's `[join]` line: an admin's subscriber lets in a machine a person allowed on any
-/// member, with no password and no person at an admin Mac, except a key on a `code-only` line.
-const OPEN_LINE: &str = "open = yes";
+/// An open vault's `[join]` note, the text after its `#` word for word. It says what the
+/// `open = yes` line aterm 0.147 and earlier wrote says (an admin's subscriber lets in a machine a
+/// person allowed on any member, with no password and no person at an admin Mac, except a key on
+/// a `code-only` line), to aterm 0.148 and later only. An earlier aterm reads past it as a comment and reads the vault
+/// as closed, so its approver no longer lets in a request its own server took for a LAN one by
+/// its address alone (a phone hotspot's, a café's): the pinned default ALab vault's home-LAN
+/// rule is a later aterm's, which needs member evidence (`crate::home_lan`).
+pub const OPEN_NOTE: &str =
+    "open = yes (aterm 0.148 and later; an earlier aterm reads this vault as closed)";
 
 /// A parse failure: the 1-based line and what is wrong, never the line's contents.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,6 +198,9 @@ struct Model {
     join: Option<(SecretBytes, usize)>,
     /// Where an open vault's `[join]` line is (never beside a password).
     open: Option<usize>,
+    /// Where `[join]`'s open notes ([`OPEN_NOTE`]) are, in file order. A note beside a password
+    /// opens nothing: the password holds.
+    open_notes: Vec<usize>,
     /// The keys `[join]`'s `code-only` lines name, and where.
     code_only: Vec<(String, usize)>,
     /// The keys `[join]`'s notes ([`Document::set_code_only_notes`]) name, the version each says
@@ -279,7 +288,8 @@ impl Document {
             .map(|(password, _)| password.clone())
     }
 
-    /// Set the join password (`Some`), replacing any, or remove it (`None`).
+    /// Set the join password (`Some`), replacing any, an `open` line and every open note
+    /// ([`OPEN_NOTE`]), or remove it (`None`).
     pub fn set_join_password(&mut self, password: Option<&[u8]>) -> Result<(), TextError> {
         let existing = self.model.join.as_ref().map(|(_, line)| *line);
         let Some(password) = password else {
@@ -295,41 +305,94 @@ impl Document {
             return Err(whole("a join password is UTF-8 text"));
         };
         let spelled = format!("password = {text}");
-        match existing.or(self.model.open) {
-            Some(line) => {
-                let mut lines = self.lines.clone();
-                std::mem::replace(&mut lines[line], spelled).zeroize();
-                self.commit(lines)
+        let mut next = self.clone();
+        let notes = next.model.open_notes.clone();
+        if !notes.is_empty() {
+            let mut lines = next.lines.clone();
+            for at in notes.into_iter().rev() {
+                lines.remove(at).zeroize();
             }
-            None => self.append_to(&SectionKind::Join, "[join]", vec![spelled]),
+            next.commit(lines)?;
         }
+        match next
+            .model
+            .join
+            .as_ref()
+            .map(|(_, line)| *line)
+            .or(next.model.open)
+        {
+            Some(line) => {
+                let mut lines = next.lines.clone();
+                std::mem::replace(&mut lines[line], spelled).zeroize();
+                next.commit(lines)?;
+            }
+            None => next.append_to(&SectionKind::Join, "[join]", vec![spelled])?,
+        }
+        *self = next;
+        Ok(())
     }
 
-    /// Whether the vault is open (`[join]`'s `open = yes`). The pinned default ALab vault
-    /// admits LAN requests automatically; other vaults require a member's Allow. A key
-    /// [`Document::code_only`] names still needs explicit code approval.
-    pub const fn open(&self) -> bool {
+    /// Whether the vault is open: `[join]`'s `open = yes` line, or its open note ([`OPEN_NOTE`])
+    /// with no join password beside it. The pinned default ALab vault admits requests its server
+    /// observed on the home ALab LAN automatically ([`crate::home_lan`]); other vaults require a
+    /// member's Allow. A key [`Document::code_only`] names still needs explicit code approval.
+    pub fn open(&self) -> bool {
+        self.model.open.is_some()
+            || (!self.model.open_notes.is_empty() && self.model.join.is_none())
+    }
+
+    /// Whether the vault is open by the `open = yes` line aterm 0.147 and earlier read, which
+    /// [`Document::set_open`] writes as the open note instead.
+    pub const fn open_line(&self) -> bool {
         self.model.open.is_some()
     }
 
-    /// Make the vault open (`true`), its line in the join password's place if it has one, or close it (`false`), removing the `open` line and leaving a join password be.
+    /// Make the vault open (`true`) by its open note alone ([`OPEN_NOTE`]), in the place of a join
+    /// password or an `open = yes` line where it has one (so an earlier aterm reads it as
+    /// closed), or close it (`false`), removing the `open` line and every open note and leaving a
+    /// join password be.
     pub fn set_open(&mut self, open: bool) -> Result<(), TextError> {
-        match (self.model.open, open) {
-            (Some(_), true) | (None, false) => Ok(()),
-            (Some(line), false) => {
-                let mut lines = self.lines.clone();
-                lines.remove(line).zeroize();
-                self.commit(lines)
-            }
-            (None, true) => match self.model.join.as_ref().map(|(_, line)| *line) {
-                Some(line) => {
-                    let mut lines = self.lines.clone();
-                    std::mem::replace(&mut lines[line], OPEN_LINE.to_string()).zeroize();
-                    self.commit(lines)
+        let note = format!("# {OPEN_NOTE}");
+        let line = self.model.open;
+        let notes = self.model.open_notes.clone();
+        if open {
+            let mut lines = self.lines.clone();
+            let changed = match (
+                line.or(self.model.join.as_ref().map(|(_, at)| *at)),
+                notes.first(),
+            ) {
+                // The note holds already: the line or password beside it goes.
+                (Some(at), Some(_)) => {
+                    lines.remove(at).zeroize();
+                    true
                 }
-                None => self.append_to(&SectionKind::Join, "[join]", vec![OPEN_LINE.to_string()]),
-            },
+                (Some(at), None) => {
+                    std::mem::replace(&mut lines[at], note).zeroize();
+                    true
+                }
+                (None, Some(_)) => false,
+                (None, None) => {
+                    wipe_lines(lines);
+                    return self.append_to(&SectionKind::Join, "[join]", vec![note]);
+                }
+            };
+            return if changed {
+                self.commit(lines)
+            } else {
+                wipe_lines(lines);
+                Ok(())
+            };
         }
+        let mut gone: Vec<usize> = line.into_iter().chain(notes).collect();
+        if gone.is_empty() {
+            return Ok(());
+        }
+        gone.sort_unstable();
+        let mut lines = self.lines.clone();
+        for at in gone.into_iter().rev() {
+            lines.remove(at).zeroize();
+        }
+        self.commit(lines)
     }
 
     /// The keys a vault leaves to approval by code (`[join]`'s `code-only` lines), in file order: a machine it let go, or one that asked before it opened. An open vault's approver lets none of them in by itself.
@@ -956,6 +1019,9 @@ fn parse_lines(lines: &[String], mode: Mode) -> Result<Model, TextError> {
         }
         if let Some(comment) = trimmed.strip_prefix('#') {
             if current.is_some_and(|s| model.sections[s].kind == SectionKind::Join) {
+                if comment.trim_matches(BLANK) == OPEN_NOTE {
+                    model.open_notes.push(i);
+                }
                 note_line(comment, i, &mut model);
             }
             i += 1;
@@ -2986,15 +3052,25 @@ mod tests {
         let mut d = Document::parse(&base(&format!("[join]\npassword = {pw}\n"))).expect("valid");
         assert!(!d.open());
         d.set_open(true).expect("open");
-        assert!(text(&d).ends_with("[join]\nopen = yes\n"), "{}", text(&d));
+        let note = format!("# {OPEN_NOTE}");
+        assert!(
+            text(&d).ends_with(&format!("[join]\n{note}\n")),
+            "{}",
+            text(&d)
+        );
         assert!(d.join_password().is_none());
         let reread = Document::parse(&text(&d)).expect("parses");
         assert!(reread.open());
         assert_eq!(reread.render().as_slice(), d.render().as_slice());
+        let mut again = reread.clone();
+        again.set_open(true).expect("same");
+        assert_eq!(text(&again), text(&reread));
+        // An earlier aterm's line, however spelled, is read open and written as the note.
         let mut spelled = Document::parse(&base("[join]\n  open=yes \n")).expect("valid");
-        let before = text(&spelled);
-        spelled.set_open(true).expect("same");
-        assert_eq!(text(&spelled), before);
+        assert!(spelled.open() && spelled.open_line());
+        spelled.set_open(true).expect("noted");
+        assert!(spelled.open() && !spelled.open_line());
+        assert_eq!(text(&spelled), base(&format!("[join]\n{note}\n")));
         d.set_join_password(Some(pw.as_bytes())).expect("set");
         assert!(!d.open());
         assert!(text(&d).ends_with(&format!("[join]\npassword = {pw}\n")));
@@ -3005,6 +3081,67 @@ mod tests {
         open.set_open(false).expect("close");
         assert_eq!(text(&open), base("[join]\n[everyone]\nx=1\n"));
         assert!(!open.open());
+    }
+
+    /// The open note ([`OPEN_NOTE`]) opens a vault only word for word, only in `[join]` and only
+    /// with no join password beside it, and is a comment an earlier aterm reads past (it reads
+    /// no `open` line): setting a password drops it, opening drops the password or line beside
+    /// it, and closing drops every note and the line.
+    ///
+    /// NEGATIVE CONTROLS: with `set_open(true)` writing `open = yes` again, `open_line` reads
+    /// true and this test fails at its first assert; with `open` reading a note whatever stands
+    /// beside it, the note beside a password reads open and it fails.
+    #[test]
+    fn an_open_note_opens_only_this_aterm_and_gives_way_to_a_password() {
+        let pw = strong("pw");
+        let note = format!("# {OPEN_NOTE}");
+        let mut d = doc();
+        d.set_open(true).expect("open");
+        assert!(d.open() && !d.open_line());
+        assert!(
+            !text(&d)
+                .lines()
+                .any(|line| line.trim_start().starts_with("open")),
+            "{}",
+            text(&d)
+        );
+        let beside = Document::parse(&base(&format!("[join]\n{note}\npassword = {pw}\n")))
+            .expect("a note beside a password parses");
+        assert!(!beside.open());
+        assert_eq!(
+            Some(pw.as_bytes()),
+            beside.join_password().as_ref().map(SecretBytes::as_slice)
+        );
+        let mut opened = beside.clone();
+        opened.set_open(true).expect("open");
+        assert!(opened.open() && opened.join_password().is_none());
+        assert_eq!(text(&opened), base(&format!("[join]\n{note}\n")));
+        let mut locked = opened.clone();
+        locked
+            .set_join_password(Some(pw.as_bytes()))
+            .expect("password");
+        assert!(!locked.open());
+        assert_eq!(text(&locked), base(&format!("[join]\npassword = {pw}\n")));
+        for elsewhere in [
+            format!("[everyone]\n{note}\nx=1\n"),
+            "[join]\n# open = yes\n".to_string(),
+            format!("[join]\n# {OPEN_NOTE} please\n"),
+        ] {
+            assert!(
+                !Document::parse(&base(&elsewhere)).expect("parses").open(),
+                "{elsewhere}"
+            );
+        }
+        let mut both = Document::parse(&base(&format!(
+            "[join]\nopen = yes\n{note}\n{note}\n[everyone]\nx=1\n"
+        )))
+        .expect("valid");
+        let mut noted = both.clone();
+        noted.set_open(true).expect("open");
+        assert!(noted.open() && !noted.open_line());
+        both.set_open(false).expect("close");
+        assert!(!both.open());
+        assert_eq!(text(&both), base("[join]\n[everyone]\nx=1\n"));
     }
 
     #[test]
@@ -3052,7 +3189,7 @@ mod tests {
             std::slice::from_ref(&gone)
         );
         d.set_open(true).expect("open");
-        assert!(text(&d).ends_with(&format!("[join]\nopen = yes\ncode-only = {gone}\n")));
+        assert!(text(&d).ends_with(&format!("[join]\n# {OPEN_NOTE}\ncode-only = {gone}\n")));
         d.set_open(false).expect("close");
         assert_eq!(d.code_only(), std::slice::from_ref(&gone));
         d.set_join_password(Some(pw.as_bytes())).expect("set");

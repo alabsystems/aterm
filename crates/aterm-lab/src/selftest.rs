@@ -204,17 +204,13 @@ pub fn members_table(members: &Result<Vec<i32>, String>) -> String {
         Ok(pids) => pids,
         Err(why) => return format!("  not read: {why}\n"),
     };
-    let list: Vec<String> = pids.iter().map(ToString::to_string).collect();
-    aterm_uds::spawnfd::command("/bin/ps")
-        .args(["-o", "pid=,ppid=,comm=", "-p", &list.join(",")])
-        .output()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .map(|l| format!("  {}\n", l.chars().take(120).collect::<String>()))
-                .collect()
+    crate::procs::rows_of(pids)
+        .into_iter()
+        .map(|(pid, ppid, comm)| {
+            let line = format!("{pid:>5} {ppid:>5} {comm}");
+            format!("  {}\n", line.chars().take(120).collect::<String>())
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 /// Open-file observation for a process ([`observe_open_files`]).

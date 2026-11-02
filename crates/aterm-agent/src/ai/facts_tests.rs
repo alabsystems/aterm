@@ -150,6 +150,86 @@ fn a_keyring_store_in_codexs_config_hides_its_login() {
 }
 
 #[test]
+fn hidden_codex_backends_do_not_inherit_file_activity_or_rollout_limits() {
+    use crate::harness::codex_rollout::fixtures::{meta_as, rate};
+    const THREAD: &str = "01900000-0000-7000-8000-000000000001";
+    const NOW: i64 = 1_800_000_000;
+    let b = machine(&["codex"]);
+    let home = b.home.join(".codex");
+    let day = home.join("sessions/2026/12/15");
+    std::fs::create_dir_all(&day).unwrap();
+    std::fs::write(
+        home.join("auth.json"),
+        "a file login, not evidence of a hidden backend",
+    )
+    .unwrap();
+    let log = day.join(format!("rollout-2026-12-15T10-00-00-{THREAD}.jsonl"));
+    std::fs::write(
+        &log,
+        [
+            meta_as(
+                NOW * 1000 - 60000,
+                THREAD,
+                THREAD,
+                None,
+                Some("paginated"),
+                Some(("account", "user")),
+            ),
+            rate(NOW * 1000, "codex", Some((100.0, 300, NOW + 3600)), None),
+        ]
+        .concat(),
+    )
+    .unwrap();
+    std::fs::File::open(log)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(NOW as u64))
+        .unwrap();
+    for backend in ["file", "keyring", "auto", "ephemeral"] {
+        std::fs::write(
+            home.join("config.toml"),
+            format!("cli_auth_credentials_store = {backend:?}\n"),
+        )
+        .unwrap();
+        let facts = gather_with(&b, &[], &[], &CODEX);
+        assert_eq!(facts.login_file.is_some(), backend == "file", "{backend}");
+        assert_eq!(
+            facts.limited_until,
+            (backend == "file").then_some(NOW + 3600)
+        );
+        if backend != "file" {
+            assert_eq!(
+                crate::ai::state::assess(&facts, true, NOW).state,
+                crate::ai::state::State::Unproven
+            );
+        }
+    }
+}
+
+#[test]
+fn an_unknown_codex_backend_does_not_adopt_file_login_evidence() {
+    let b = machine(&["codex"]);
+    let home = b.home.join(".codex");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("auth.json"), "old file login").unwrap();
+    for text in [
+        "not TOML",
+        "cli_auth_credentials_store = 'future'",
+        "cli_auth_credentials_store = 12",
+    ] {
+        std::fs::write(home.join("config.toml"), text).unwrap();
+        let f = gather_with(&b, &[], &[], &CODEX);
+        assert!(f.credential_store_error.is_some());
+        assert!(!codex_file_store(&home));
+        assert!(f.login_file.is_none());
+        assert!(f.record_scope.is_none());
+        assert!(f.login_pool().is_none());
+        let row = crate::ai::state::assess(&f, true, 1_800_000_000);
+        assert_eq!(row.state, crate::ai::state::State::Unproven);
+        assert!(crate::ai::login::refusal(&f, &row).is_some());
+    }
+}
+
+#[test]
 fn the_home_variable_moves_the_home_and_a_relative_one_is_not_placed() {
     let b = machine(&["codex"]);
     let elsewhere = b.dir.path().join("codex-home");
@@ -236,6 +316,15 @@ fn a_program_uninstalled_on_purpose_is_kept_off() {
     assert_eq!(gather_with(&b, &[], &[], &CODEX).kept, None);
     std::fs::write(b.pkg.removed(), "codex\n").expect("removed");
     assert_eq!(gather_with(&b, &[], &[], &CODEX).kept, Some(Kept::Removed));
+}
+
+#[test]
+fn unreadable_removals_hold_the_install_without_claiming_a_person_removed_it() {
+    let b = machine(&[]);
+    assert_eq!(gather_with(&b, &[], &[], &CODEX).kept, None);
+    std::fs::write(b.pkg.removed(), [0xff]).unwrap();
+    let facts = gather_with(&b, &[], &[], &CODEX);
+    assert_eq!(facts.kept, Some(Kept::RemovalUnreadable));
 }
 
 #[test]
@@ -482,10 +571,14 @@ fn a_clis_own_roster_beside_accounts_toml_is_its_pool_and_names_the_row_to_sign_
     );
     std::fs::write(
         config.join("accounts-kimi.toml"),
-        "[[account]]\nlabel = \"plain\"\nclass = \"dedicated\"\ndir = \"/logins/kimi/plain\"\n\n\
-         [[account]]\nlabel = \"kimi-one\"\nclass = \"dedicated\"\n\
-         dir = \"/logins/kimi/kimi-one\"\nemail = \"kimi-one@example.com\"\n\
-         region = \"global\"\n",
+        format!(
+            "[[account]]\nlabel = \"plain\"\nclass = \"dedicated\"\ndir = \"{}\"\n\n\
+             [[account]]\nlabel = \"kimi-one\"\nclass = \"dedicated\"\n\
+             dir = \"{}\"\nemail = \"kimi-one@example.com\"\n\
+             region = \"global\"\n",
+            crate::harness::host_path::abs("/logins/kimi/plain"),
+            crate::harness::host_path::abs("/logins/kimi/kimi-one")
+        ),
     )
     .expect("roster");
     let pool = gather(&m(Some(roster.clone())), &KIMI)
@@ -508,7 +601,7 @@ fn a_clis_own_roster_beside_accounts_toml_is_its_pool_and_names_the_row_to_sign_
     std::fs::write(
         config.join("accounts-kimi.toml"),
         format!(
-            "[[account]]\nlabel = \"kimi-one\"\nclass = \"dedicated\"\ndir = \"{}\"\n\
+            "[[account]]\nlabel = \"kimi-one\"\nclass = \"dedicated\"\ndir = '{}'\n\
              email = \"kimi-one@example.com\"\nregion = \"global\"\n",
             made.display()
         ),
@@ -552,7 +645,11 @@ fn a_grok_pool_with_no_email_still_names_its_next_row() {
         accounts_mode: None,
         config: None,
     };
-    let rows = "[[account]]\nlabel = \"plain\"\nclass = \"dedicated\"\ndir = \"/logins/plain\"\n";
+    let rows = at!(
+        "[[account]]\nlabel = \"plain\"\nclass = \"dedicated\"\ndir = \"",
+        "/logins/plain",
+        "\"\n"
+    );
     std::fs::write(config.join("accounts-grok.toml"), rows).expect("grok roster");
     std::fs::write(config.join("accounts-kimi.toml"), rows).expect("kimi roster");
     let grok = gather(&m, &GROK).pool.expect("grok's pool");
@@ -701,6 +798,33 @@ fn pooled_codex_serves_enrolled_staging_login_without_default_auth_and_rotates_p
         })
         .expect("renew work-1");
 
+    // A newer limit in the default home's transcript belongs to another login,
+    // even while this is the only isolated account enrolled on the machine.
+    let day = b.home.join(".codex/sessions/2026/12/15");
+    std::fs::create_dir_all(&day).expect("day");
+    let rollout_body = [
+        meta_as(
+            (now - 300) * 1000,
+            ROOT,
+            ROOT,
+            None,
+            Some("paginated"),
+            Some(("acct-default", "user-default")),
+        ),
+        rate(
+            (now - 30) * 1000,
+            "codex",
+            Some((100.0, 300, now + 3600)),
+            None,
+        ),
+    ]
+    .concat();
+    std::fs::write(
+        day.join(format!("rollout-2026-12-15T10-00-00-{ROOT}.jsonl")),
+        rollout_body,
+    )
+    .expect("rollout");
+
     let f1 = gather(&m, &CODEX);
     let pool1 = f1.pool.as_ref().expect("codex pool after renew");
     let auth_1 = staging_1.join("auth.json").display().to_string();
@@ -713,6 +837,7 @@ fn pooled_codex_serves_enrolled_staging_login_without_default_auth_and_rotates_p
         f1.login_file.as_ref().map(|(p, _)| p.as_path()),
         Some(staging_1.join("auth.json").as_path())
     );
+    assert_eq!(f1.limited_until, None);
     let r1 = assess(&f1, true, now);
     assert_eq!((r1.state, r1.mark), (State::Ok, Mark::Ok), "{}", r1.fact);
 
@@ -739,32 +864,8 @@ fn pooled_codex_serves_enrolled_staging_login_without_default_auth_and_rotates_p
         r2.fact
     );
 
-    // 4. Enroll work-2 into work-2+1/auth.json while shared ~/.codex/sessions holds work-1's 100%
+    // 4. Enroll work-2 into work-2+1/auth.json while shared ~/.codex/sessions holds the default login's 100%
     //    rollout -> serving row rotates to work-2 and is Ok (not blocked by shared rollout).
-    let day = b.home.join(".codex/sessions/2026/12/15");
-    std::fs::create_dir_all(&day).expect("day");
-    let rollout_body = [
-        meta_as(
-            (now - 300) * 1000,
-            ROOT,
-            ROOT,
-            None,
-            Some("paginated"),
-            Some(("acct-work-1", "user-work-1")),
-        ),
-        rate(
-            (now - 120) * 1000,
-            "codex",
-            Some((100.0, 300, now + 3600)),
-            None,
-        ),
-    ]
-    .concat();
-    std::fs::write(
-        day.join(format!("rollout-2026-12-15T10-00-00-{ROOT}.jsonl")),
-        rollout_body,
-    )
-    .expect("rollout");
     let staging_2 = b.home.join(".aterm/logins/codex/work-2+1");
     std::fs::create_dir_all(&staging_2).expect("staging_2");
     std::fs::write(staging_2.join("auth.json"), "\u{0}opaque-token-2").expect("auth 2");
@@ -1924,4 +2025,45 @@ fn a_launch_starts_nothing_where_no_file_answers_its_program() {
         !launch_finds_nothing(Path::new("bin/codex"), Some(only_empty.as_os_str())),
         "CONTROL: the shell's folder's"
     );
+}
+
+#[test]
+fn held_by_rows_are_excluded_from_due_next_and_next_sign_in() {
+    let pool = DoctorPool::new(true, None);
+    let held_dir = pool.b.dir.path().join("logins/codex/held");
+    let warm_dir = pool.b.dir.path().join("logins/codex/warm");
+    std::fs::create_dir_all(&held_dir).expect("held dir");
+    std::fs::create_dir_all(&warm_dir).expect("warm dir");
+    std::fs::write(warm_dir.join("auth.json"), "{}").expect("warm auth");
+    std::fs::write(
+        &pool.roster,
+        format!(
+            "[[account]]\nlabel = \"held\"\nclass = \"dedicated\"\ndir = {:?}\nemail = \"held@example.com\"\nheld_by = \"other-mac\"\n\n\
+             [[account]]\nlabel = \"warm\"\nclass = \"dedicated\"\ndir = {:?}\nemail = \"warm@example.com\"\n",
+            held_dir.display().to_string(),
+            warm_dir.display().to_string(),
+        ),
+    )
+    .expect("codex roster with held row first");
+
+    let f = pool.facts();
+    let p = f.pool.as_ref().expect("codex pool");
+    assert_eq!(p.serving_label.as_deref(), Some("warm"));
+    assert_eq!(p.next.as_deref(), Some("warm"));
+    assert!(p.due.is_empty());
+
+    pool.state(|state| {
+        crate::harness::accounts::note_wall(
+            state,
+            "warm",
+            "five_hour",
+            Some(DoctorPool::NOW + 3600),
+            DoctorPool::NOW,
+            DoctorPool::NOW,
+        );
+    });
+    let f = pool.facts();
+    let p = f.pool.as_ref().expect("codex pool with warm walled");
+    assert_eq!(p.serving_label.as_deref(), Some("warm"));
+    assert_eq!(p.next_sign_in, None, "held row is never next_sign_in");
 }

@@ -4,6 +4,9 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/ime/context.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
+// Modified by the aterm project in 2026; see the repository NOTICE. (aterm-x11's XIM
+// declarations, where upstream used x11-dl's.)
+
 use std::ffi::CStr;
 use std::os::raw::c_short;
 use std::sync::Arc;

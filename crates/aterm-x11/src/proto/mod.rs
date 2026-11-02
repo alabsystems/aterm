@@ -296,6 +296,9 @@ impl ValueList {
 
     /// Sets or replaces the value for single-bit mask `bit`.
     pub fn set(mut self, bit: u32, value: u32) -> ValueList {
+        if bit.count_ones() != 1 {
+            return self;
+        }
         match self.values.binary_search_by_key(&bit, |&(b, _)| b) {
             Ok(i) => self.values[i].1 = value,
             Err(i) => self.values.insert(i, (bit, value)),
@@ -311,6 +314,14 @@ impl ValueList {
     pub(crate) fn write(&self, w: &mut Writer) {
         for &(_, v) in &self.values {
             w.u32(v);
+        }
+    }
+
+    pub(crate) fn write_masked(&self, mask: u32, w: &mut Writer) {
+        for &(b, v) in &self.values {
+            if b & mask != 0 {
+                w.u32(v);
+            }
         }
     }
 }
@@ -352,10 +363,16 @@ mod tests {
 
     #[test]
     fn a_value_list_orders_its_bits() {
-        let list = ValueList::new().set(8, 3).set(1, 9).set(8, 4);
-        assert_eq!(list.mask(), 9);
+        let list = ValueList::new()
+            .set(0, 99)
+            .set(0b11, 88)
+            .set(8, 3)
+            .set(1, 9)
+            .set(8, 4)
+            .set(1 << 20, 77);
+        assert_eq!(list.mask(), 9 | (1 << 20));
         let mut w = Writer::new(0, 0);
-        list.write(&mut w);
+        list.write_masked(0xffff, &mut w);
         let req: Request<Void> = w.finish();
         let want: Vec<u8> = [9u32, 4].iter().flat_map(|v| v.to_ne_bytes()).collect();
         assert_eq!(&req.bytes()[4..], &want[..]);

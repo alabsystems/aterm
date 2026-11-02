@@ -289,15 +289,19 @@ impl Connection {
     }
 
     fn send_raw(&self, bytes: Vec<u8>, is_void: bool, fds: Vec<OwnedFd>) -> Result<u64, Error> {
+        let n_fds = c_uint::try_from(fds.len()).map_err(|_| Error::RequestTooLarge)?;
+        if bytes.len() < 4 || !bytes.len().is_multiple_of(4) {
+            return Err(Error::RequestTooLarge);
+        }
+        let max_bytes = self.maximum_request_bytes();
         let bytes = if bytes.len() / 4 > usize::from(u16::MAX) {
-            let big = big_request(&bytes).ok_or(Error::RequestTooLarge)?;
-            if big.len() > self.maximum_request_bytes() {
-                return Err(Error::RequestTooLarge);
-            }
-            big
+            big_request(&bytes).ok_or(Error::RequestTooLarge)?
         } else {
             bytes
         };
+        if bytes.len() > max_bytes {
+            return Err(Error::RequestTooLarge);
+        }
         let mut iov = [
             Iovec {
                 base: std::ptr::null_mut(),
@@ -325,7 +329,6 @@ impl Connection {
             unsafe { (self.xcb.send_request64)(self.raw.as_ptr(), flags, &mut iov[2], &request) }
         } else {
             let mut raw: Vec<c_int> = fds.into_iter().map(IntoRawFd::into_raw_fd).collect();
-            let n = c_uint::try_from(raw.len()).map_err(|_| Error::RequestTooLarge)?;
             // SAFETY: as above, plus descriptors this call hands to libxcb, which closes them (also
             // on failure).
             unsafe {
@@ -334,7 +337,7 @@ impl Connection {
                     flags,
                     &mut iov[2],
                     &request,
-                    n,
+                    n_fds,
                     raw.as_mut_ptr(),
                 )
             }

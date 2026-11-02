@@ -726,6 +726,8 @@ fn task_row(
     let mut descendants = 0u16;
     if let Some(open) = name_text.rfind(" (+")
         && let Some(n) = name_text[open + 3..].strip_suffix(')')
+        && !n.is_empty()
+        && n.bytes().all(|b| b.is_ascii_digit())
         && let Ok(n) = n.parse::<u16>()
     {
         descendants = n;

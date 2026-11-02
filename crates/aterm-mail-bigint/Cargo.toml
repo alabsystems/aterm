@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Copyright 2026 Andrew Yates
+[package]
+name = "aterm-mail-bigint"
+version.workspace = true
+edition.workspace = true
+license = "Apache-2.0 OR MIT"
+authors.workspace = true
+repository.workspace = true
+description = "Owned fixed-width arithmetic for mail authentication; derived from RustCrypto crypto-bigint"
+
+[features]
+default = ["zeroize"]
+zeroize = ["dep:zeroize"]
+
+[dependencies]
+# Both already belong to aterm's existing TLS trust base. No new registry dependency.
+subtle = { version = "2.6", default-features = false }
+zeroize = { version = "1", default-features = false, optional = true }
+
+[lints]
+workspace = true

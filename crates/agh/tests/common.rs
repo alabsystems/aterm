@@ -13,18 +13,20 @@ use agh::config;
 #[cfg(unix)]
 use agh::config::Dirs;
 use agh::fx::Fx;
+use agh::git::HelperCommand;
 use agh::identity::MapEnv;
-use agh::policy::Router;
+use agh::policy::{Named, Permit, RouteRequest, Router};
 use agh::retry::RetryPolicy;
 use agh::wire::http::HttpTransport;
 use agh::wire::{Endpoints, Transport};
 use agh::{Github, GithubBuilder};
-use agh_fake::FakeGithub;
+use agh_fake::{FakeGithub, RepoSpec};
 
 /// The hang detector for anything that must happen.
 pub const HANG: Duration = Duration::from_secs(60);
 
-const SIM_START: u64 = 1_760_000_000;
+/// The simulated clock's start, in Unix seconds: every test client's `Fx::simulated`.
+pub const SIM_START: u64 = 1_760_000_000;
 
 /// `text` as a repository name, which the test knows to be one.
 pub fn slug(text: &str) -> agh::Slug {
@@ -196,4 +198,109 @@ pub fn ctx(root: &Path, fake: &FakeGithub, env: MapEnv) -> (Ctx, Captured) {
 pub fn run_cli(ctx: &mut Ctx, args: &[&str]) -> u8 {
     let args: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
     cli::run(&args, ctx)
+}
+
+/// The `[[writers]]` row the M2 tests grant: `fixture-caller` on `alabsystems/aterm`.
+pub const WRITERS: &str =
+    "\n[[writers]]\ncaller = \"fixture-caller\"\nrepos = [\"alabsystems/aterm\"]\n";
+
+/// The canonical config plus `extra`, written as agh.toml under `Dirs::under(root)`, and the
+/// router `config::load_for_host` reads back (origin File, so grants count).
+#[cfg(unix)]
+pub fn file_router(root: &Path, extra: &str) -> (Dirs, Router) {
+    let dirs = Dirs::under(root);
+    write_config(&dirs, &format!("{}{extra}", canonical_config(root)));
+    let validated = config::load_for_host(&dirs)
+        .unwrap_or_else(|e| panic!("agh.toml did not load: {}", e.why))
+        .unwrap_or_else(|| panic!("no agh.toml at {}", dirs.config.display()));
+    (dirs, Router::from_validated(validated))
+}
+
+/// `github(router, fake)` with `journal(dirs.clone())`.
+#[cfg(unix)]
+pub fn writer(router: Router, fake: &FakeGithub, dirs: &Dirs) -> Github {
+    GithubBuilder::new(router)
+        .transport(Arc::new(HttpTransport::direct(Arc::new(env()))))
+        .endpoints(endpoints(fake))
+        .env(Arc::new(env()))
+        .fx(Arc::new(Fx::simulated(SIM_START)))
+        .caller("test")
+        .retry(RetryPolicy::NONE)
+        .journal(dirs.clone())
+        .build()
+}
+
+/// A permit for `req` from `gh`'s router and `gh.presence`, or a panic naming the refusal.
+/// Its body is `gh.router().permit(req, &|p| gh.presence(p))`, panicking with the error's why:
+/// `Router::permit`, WP1's, never `Github::permit`, WP3's, so a test that mints its permit
+/// here needs WP1 merged and nothing else. Until WP1 merges it panics with the stub's
+/// `not yet` (§2: WP4's integration tests wait for WP1).
+pub fn permit(gh: &Github, req: &RouteRequest) -> Permit {
+    gh.router()
+        .permit(req, &|p| gh.presence(p))
+        .unwrap_or_else(|e| panic!("no permit: {}", e.why))
+}
+
+/// `Named::Literal` of `slug`, granted to `fixture-caller`.
+pub fn granted(gh: &Github, slug: &str) -> Named {
+    let slug = agh::Slug::parse(slug).unwrap_or_else(|e| panic!("not a slug: {}", e.why));
+    let target = gh
+        .router()
+        .grant("fixture-caller", &slug)
+        .unwrap_or_else(|e| panic!("no grant: {}", e.why));
+    Named::Literal(target)
+}
+
+/// The default branch's head in `canonical_repos`: the sha M1's fixtures already use.
+pub const MAIN_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+/// `fixture-dev/app` (private, push for `fixture-dev-bot`) and `alabsystems/aterm` (public,
+/// push for `fixture-release-bot`) on `fake`, each with branch `main` at `MAIN_SHA`, and their
+/// ids.
+pub fn canonical_repos(fake: &FakeGithub) -> (u64, u64) {
+    let dev = fake.add_repo(
+        "fixture-dev/app",
+        RepoSpec::private().push("fixture-dev-bot"),
+    );
+    let public = fake.add_repo(
+        "alabsystems/aterm",
+        RepoSpec::public().push("fixture-release-bot"),
+    );
+    fake.set_branch("fixture-dev/app", "main", MAIN_SHA);
+    fake.set_branch("alabsystems/aterm", "main", MAIN_SHA);
+    (dev, public)
+}
+
+/// The agh binary as the git helper: `CARGO_BIN_EXE_agh`, with no words before
+/// `auth git-credential`.
+pub fn helper() -> HelperCommand {
+    HelperCommand {
+        exe: PathBuf::from(env!("CARGO_BIN_EXE_agh")),
+        args: Vec::new(),
+    }
+}
+
+/// `bytes` written to `dir/name`, for an upload; its path.
+pub fn file(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    path
+}
+
+/// Names each helper above as a function pointer or a const read, so rustc's `dead_code`
+/// lint has a use of each before the package that calls it merges (plan §1, rule 14), as
+/// M1's `every_helper_is_named` did. WP14 deletes it (§18.4).
+#[test]
+fn every_helper_is_named() {
+    let _ = WRITERS;
+    #[cfg(unix)]
+    let _ = file_router as fn(&Path, &str) -> (Dirs, Router);
+    #[cfg(unix)]
+    let _ = writer as fn(Router, &FakeGithub, &Dirs) -> Github;
+    let _ = permit as fn(&Github, &RouteRequest) -> Permit;
+    let _ = granted as fn(&Github, &str) -> Named;
+    let _ = MAIN_SHA;
+    let _ = canonical_repos as fn(&FakeGithub) -> (u64, u64);
+    let _ = helper as fn() -> HelperCommand;
+    let _ = file as fn(&Path, &str, &[u8]) -> PathBuf;
 }

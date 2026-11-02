@@ -1,0 +1,25 @@
+# kimi 2.4.0 · MEASURED 2026-10-29, `aterm ctl text` of a private headless aterm (110x32, aterm 0.146.0) running the real Kimi Code, launched by path with a scratch `HOME` and `KIMI_CODE_HOME` whose `config.toml` names one `openai`-type provider at `http://127.0.0.1:<port>/v1` with a fake key (a local stub of the Chat Completions API, crates/aterm-lab), no login · `kimi -S` with no id: the `Sessions (type to search)` picker under the welcome box (which reads `Model: not set` until a session is chosen), the folder's one session first, and `context: 0%` with no count
+
+ ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │                                                                                                          │
+ │  ▐█▛█▛█▌  Welcome to Kimi Code!                                                                          │
+ │  ▐█████▌  Run /login or /provider to get started.                                                        │
+ │                                                                                                          │
+ │  Directory: /private/tmp/at.H2aa/proj                                                                    │
+ │  Session:                                                                                                │
+ │  Model:     not set, run /login or /provider                                                             │
+ │  Version:   2.4.0                                                                                        │
+ │                                                                                                          │
+ ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+
+ ────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Sessions  (type to search)
+ ↑↓ navigate · Ctrl+A all · Ctrl+X delete · Enter select · Esc cancel
+
+ ❯ lab draft one  3m ago
+   session_d240495d-90d8-422b-bc70-82ea4e4c480f   /private/tmp/at.H2aa/proj
+   › lab hit an auth failure
+ ────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ …/tmp/at.H2aa/proj                                               @: mention files | ! to run a shell command
+                                                                                                  context: 0%

@@ -160,7 +160,7 @@ fn pause(seconds: u64) {
     if FIXTURE.with(|f| f.borrow().is_some()) {
         return;
     }
-    let until = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    let until = crate::durable::deadline_after(std::time::Duration::from_secs(seconds));
     while crate::interrupt::caught().is_none() {
         let left = until.saturating_duration_since(std::time::Instant::now());
         if left.is_zero() {

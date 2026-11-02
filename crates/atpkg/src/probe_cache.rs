@@ -22,12 +22,21 @@ const RECORD: char = '\u{1e}';
 /// Serializes this process's rewrites, so two probes on two threads keep both answers.
 static WRITES: Mutex<()> = Mutex::new(());
 
+/// Maximum size of a single probe-cache file read into memory.
+const MAX_PROBE_CACHE_BYTES: usize = 256 * 1024;
+
+/// Monotonic per-process sequence counter disambiguating temp-file names.
+static TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The file under the state root of the account this process runs as that keeps `name`'s
 /// readings ([`aterm_types::dirs::account_state_dir`]: a `sudo aterm doctor` that keeps the
 /// person's `HOME` writes root's own, never a root-owned file into the person's state);
-/// `None` with no state root.
+/// `None` with no state root or an invalid `name`.
 #[must_use]
 pub fn file(name: &str) -> Option<PathBuf> {
+    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\', '\0']) {
+        return None;
+    }
     aterm_types::dirs::account_state_dir().map(|dir| dir.join("doctor").join(name))
 }
 
@@ -89,7 +98,7 @@ pub fn identity(path: &Path) -> Option<String> {
 /// The reading `file` keeps under exactly `key`.
 #[must_use]
 pub fn get(file: &Path, key: &str) -> Option<String> {
-    let text = std::fs::read_to_string(file).ok()?;
+    let text = crate::metadata_io::read_bounded_regular_utf8(file, MAX_PROBE_CACHE_BYTES).ok()?;
     text.lines().find_map(|line| {
         let (k, v) = line.split_once(RECORD)?;
         (k == key).then(|| v.to_owned())
@@ -106,7 +115,8 @@ pub fn put(file: &Path, key: &str, value: &str) {
     let _serial = WRITES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let old = std::fs::read_to_string(file).unwrap_or_default();
+    let old = crate::metadata_io::read_bounded_regular_utf8(file, MAX_PROBE_CACHE_BYTES)
+        .unwrap_or_default();
     let mut lines: Vec<&str> = old
         .lines()
         .filter(|line| line.split_once(RECORD).is_some_and(|(k, _)| k != key))
@@ -119,18 +129,16 @@ pub fn put(file: &Path, key: &str, value: &str) {
     let Some(dir) = file.parent() else {
         return;
     };
-    if std::fs::create_dir_all(dir).is_err() {
+    if crate::platform::make_dirs_born(dir, 0o700).is_err() {
         return;
     }
     let nanos = aterm_time::since_epoch().map_or(0, |d| d.as_nanos());
+    let seq = TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let name = file
         .file_name()
         .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-    let temp = dir.join(format!(".{name}.{}.{nanos}", std::process::id()));
-    let written = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp)
+    let temp = dir.join(format!(".{name}.{}.{nanos}.{seq}", std::process::id()));
+    let written = crate::platform::open_create_new_write(&temp, 0o600)
         .and_then(|mut out| std::io::Write::write_all(&mut out, text.as_bytes()));
     if written.and_then(|()| std::fs::rename(&temp, file)).is_err() {
         let _ = std::fs::remove_file(&temp);
@@ -176,6 +184,11 @@ mod tests {
             "a joined key is kept"
         );
         assert_eq!(get(&file, "x"), None, "a key's first part is not the key");
+        assert_eq!(super::file(""), None);
+        assert_eq!(super::file("."), None);
+        assert_eq!(super::file(".."), None);
+        assert_eq!(super::file("a/b"), None);
+        assert_eq!(super::file("a\\b"), None);
     }
 
     #[test]

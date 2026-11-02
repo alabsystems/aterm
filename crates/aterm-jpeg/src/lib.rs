@@ -129,13 +129,15 @@ impl<'a> Decoder<'a> {
 
     fn segment(&mut self) -> Option<&'a [u8]> {
         let high = *self.data.get(self.pos)?;
-        let low = *self.data.get(self.pos + 1)?;
+        let low = *self.data.get(self.pos.checked_add(1)?)?;
         let length = usize::from(u16::from_be_bytes([high, low]));
         if length < 2 {
             return None;
         }
-        let payload = self.data.get(self.pos + 2..self.pos + length)?;
-        self.pos += length;
+        let start = self.pos.checked_add(2)?;
+        let end = self.pos.checked_add(length)?;
+        let payload = self.data.get(start..end)?;
+        self.pos = end;
         Some(payload)
     }
 
@@ -462,6 +464,7 @@ impl<'a> Decoder<'a> {
             }
             k += run;
             if k > 63 {
+                let _ = reader.receive_extend(size);
                 break;
             }
             let natural = ZIGZAG[k];
@@ -637,7 +640,8 @@ fn ac_first(
             continue;
         }
         k += run as usize;
-        if k > 63 {
+        if k > scan.end {
+            let _ = reader.receive_extend(size);
             break;
         }
         let value = reader.receive_extend(size).wrapping_shl(scan.low);
@@ -714,7 +718,7 @@ fn exif_orientation(tiff: &[u8]) -> Option<u16> {
         _ => return None,
     };
     let u16_at = |at: usize| -> Option<u16> {
-        let bytes = [*tiff.get(at)?, *tiff.get(at + 1)?];
+        let bytes = [*tiff.get(at)?, *tiff.get(at.checked_add(1)?)?];
         Some(if little {
             u16::from_le_bytes(bytes)
         } else {
@@ -724,9 +728,9 @@ fn exif_orientation(tiff: &[u8]) -> Option<u16> {
     let u32_at = |at: usize| -> Option<u32> {
         let bytes = [
             *tiff.get(at)?,
-            *tiff.get(at + 1)?,
-            *tiff.get(at + 2)?,
-            *tiff.get(at + 3)?,
+            *tiff.get(at.checked_add(1)?)?,
+            *tiff.get(at.checked_add(2)?)?,
+            *tiff.get(at.checked_add(3)?)?,
         ];
         Some(if little {
             u32::from_le_bytes(bytes)
@@ -739,10 +743,11 @@ fn exif_orientation(tiff: &[u8]) -> Option<u16> {
     }
     let ifd = usize::try_from(u32_at(4)?).ok()?;
     let entries = usize::from(u16_at(ifd)?);
+    let base = ifd.checked_add(2)?;
     (0..entries.min(256)).find_map(|entry| {
-        let at = ifd + 2 + entry * 12;
-        (u16_at(at)? == 274 && u16_at(at + 2)? == 3)
-            .then(|| u16_at(at + 8))
+        let at = base.checked_add(entry.checked_mul(12)?)?;
+        (u16_at(at)? == 274 && u16_at(at.checked_add(2)?)? == 3 && u32_at(at.checked_add(4)?)? == 1)
+            .then(|| u16_at(at.checked_add(8)?))
             .flatten()
             .filter(|orientation| (1..=8).contains(orientation))
     })
@@ -765,6 +770,11 @@ mod tests {
             b'I', b'I', 42, 0, 8, 0, 0, 0, 1, 0, 0x12, 0x01, 3, 0, 1, 0, 0, 0, 6, 0, 0, 0,
         ];
         assert_eq!(exif_orientation(&little), Some(6));
+        let mut wrong_count = little;
+        wrong_count[14] = 3;
+        assert_eq!(exif_orientation(&wrong_count), None);
+        let huge_ifd = [b'I', b'I', 42, 0, 0xFF, 0xFF, 0xFF, 0xFF];
+        assert_eq!(exif_orientation(&huge_ifd), None);
         let big = [
             b'M', b'M', 0, 42, 0, 0, 0, 8, 0, 1, 0x01, 0x12, 0, 3, 0, 0, 0, 1, 0, 8, 0, 0,
         ];

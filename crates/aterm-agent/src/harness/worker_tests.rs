@@ -3,6 +3,70 @@
 
 use super::*;
 
+use super::super::host_path::abs;
+
+#[test]
+fn native_worker_keeps_exact_custom_config_off_and_explicit_local_profile() {
+    let temp = aterm_tempfile::tempdir().unwrap();
+    let config = temp.path().join("custom.toml");
+    std::fs::write(&config, "[harness]\naccounts = 'off'\n").unwrap();
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = calls.clone();
+    let expected = config.clone();
+    super::super::native_keys::with_test_launcher(
+        move |provider, config| {
+            assert_eq!(provider, super::super::native_keys::Provider::Google);
+            assert_eq!(config, expected);
+            observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(Some(PathBuf::from("/checked/aterm")))
+        },
+        || {
+            let cli = row(Program::Agy);
+            let fresh = Fresh {
+                config: Some(&config),
+                ..Fresh::default()
+            };
+            let line = line_of(
+                cli,
+                Dialect::Zsh,
+                Path::new("/checked/agy"),
+                &[],
+                &[],
+                &[],
+                &fresh,
+            )
+            .unwrap();
+            assert!(!line.contains("native-run"));
+            assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+            std::fs::write(&config, "").unwrap();
+            let line = line_of(
+                cli,
+                Dialect::Zsh,
+                Path::new("/checked/agy"),
+                &[],
+                &[],
+                &[],
+                &fresh,
+            )
+            .unwrap();
+            assert!(line.contains("native-run") && line.contains(config.to_str().unwrap()));
+            assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+            let line = line_of(
+                cli,
+                Dialect::Zsh,
+                Path::new("/checked/agy"),
+                &["-gemini_dir=/person/profile".into()],
+                &[],
+                &[],
+                &fresh,
+            )
+            .unwrap();
+            assert!(!line.contains("native-run"));
+            assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        },
+    );
+}
+
 use std::path::Path;
 
 /// [`super::line`] for `starter` taken as admitted: these tests check the line's form, and
@@ -34,7 +98,8 @@ fn proc_args(argv: &[&str], env: &[&str]) -> ProcArgs {
 /// BYTE, IN THE CLI'S OWN FORM: each shell runs the line its row writes,
 /// and the program it starts — a stand-in that writes its argv
 /// NUL-separated, named as the CLI — gets the trust flag (Muse Code's, where
-/// the folder is the trusted one), `--model <m>`, then the task file's text
+/// the folder is the trusted one) and its default flags (Muse Code's
+/// contributor mode off at xhigh), `--model <m>`, then the task file's text
 /// with its trailing newlines trimmed: Claude Code's, codex-alab's, Muse
 /// Code's and Grok Build's after `--`, agy's as the attached value of
 /// `--prompt-interactive=`.
@@ -77,7 +142,17 @@ fn every_workers_first_line_hands_the_task_over_as_one_argument() {
         ),
         (
             Program::Muse,
-            vec!["--trust-workspace", "--model", "m-1.5", "--", trimmed],
+            vec![
+                "--trust-workspace",
+                "--contributor-mode",
+                "off",
+                "--reasoning-effort",
+                "xhigh",
+                "--model",
+                "m-1.5",
+                "--",
+                trimmed,
+            ],
             "XDG_DATA_HOME",
         ),
         (
@@ -109,6 +184,7 @@ fn every_workers_first_line_hands_the_task_over_as_one_argument() {
             unset: Vec::new(),
         };
         let fresh = Fresh {
+            config: None,
             model: Some("m-1.5"),
             trusted_here: true,
             permission_mode: None,
@@ -126,7 +202,7 @@ fn every_workers_first_line_hands_the_task_over_as_one_argument() {
             let run = |line: &str| {
                 let _ = std::fs::remove_file(&argv_out);
                 let out = aterm_uds::deadline::output_until(
-                    aterm_uds::spawnfd::command(shell)
+                    aterm_uds::spawnfd::command(crate::test_program::kept(shell))
                         .args(["-f", "-c", line])
                         .env("ATERM_TASK_FILE", &file)
                         .env("ARGV_OUT", &argv_out),
@@ -204,6 +280,7 @@ fn model_and_the_trust_are_each_clis_own() {
         let plain = cli.plain();
         assert_eq!(plain.exe, Path::new(cli.word));
         let fresh = |model, trusted_here| Fresh {
+            config: None,
             model,
             trusted_here,
             permission_mode: None,
@@ -212,7 +289,14 @@ fn model_and_the_trust_are_each_clis_own() {
         let named = line(cli, Dialect::Zsh, &plain, &fresh(Some("big-1"), false)).expect("a line");
         assert!(named.contains(" '--model' 'big-1' "), "{named}");
         let none = line(cli, Dialect::Zsh, &plain, &fresh(None, false)).expect("a line");
-        assert!(!none.contains("--model"), "{none}");
+        match cli.agent {
+            // Muse Code's row names a default model where `model=` names none.
+            Program::Muse => assert!(
+                none.contains(" '--model' 'muse-wonder-full-1.0' "),
+                "{none}"
+            ),
+            _ => assert!(!none.contains("--model"), "{none}"),
+        }
         let err = line(cli, Dialect::Zsh, &plain, &fresh(Some("--yolo"), false))
             .expect_err("a model that is a flag");
         assert!(err.contains("--yolo"), "{err}");
@@ -236,6 +320,7 @@ fn model_and_the_trust_are_each_clis_own() {
 #[test]
 fn a_permission_mode_is_claude_codes_own_flag() {
     let fresh = |mode| Fresh {
+        config: None,
         model: Some("big-1"),
         permission_mode: mode,
         ..Fresh::default()
@@ -527,7 +612,8 @@ fn a_starters_program_rides_only_where_it_runs_the_same_cli() {
 #[test]
 fn a_codex_starter_is_codex_alab_and_carries_its_config() {
     let d = crate::supervise::ScratchDir::new("codex", "worker-starter");
-    let user = Path::new("/Users//u");
+    let (mine, other) = (abs("/Users//u"), abs("/Users//other"));
+    let user = Path::new(&mine);
     let package = |name: &str, alab: bool| -> PathBuf {
         let root = d.join(name);
         std::fs::create_dir_all(root.join("bin")).expect("bin");
@@ -547,11 +633,7 @@ fn a_codex_starter_is_codex_alab_and_carries_its_config() {
     let vendor = package("vendor", false);
     let twin_of = |name: &str, exe: &Path| -> PathBuf {
         let twin = d.join(name);
-        std::fs::write(
-            &twin,
-            format!("#!/bin/sh\nexec '{}' \"$@\"\n", exe.display()),
-        )
-        .expect("twin");
+        std::fs::write(&twin, super::super::codex_alab::twin_text(exe)).expect("twin");
         twin
     };
     let alab_twin = twin_of("twin-alab", &alab);
@@ -682,13 +764,18 @@ fn a_codex_starter_is_codex_alab_and_carries_its_config() {
             .expect("a starter")
             .env
     };
+    let others = Path::new(&other)
+        .join(".codex")
+        .to_str()
+        .expect("UTF-8")
+        .to_owned();
     assert_eq!(
-        homes(&["HOME=/Users//other"]),
-        [("CODEX_HOME".to_string(), "/Users//other/.codex".to_string())],
+        homes(&[&format!("HOME={other}")]),
+        [("CODEX_HOME".to_string(), others)],
         "another home's .codex"
     );
     assert!(
-        homes(&["CODEX_HOME=", "HOME=/Users//u"]).is_empty(),
+        homes(&["CODEX_HOME=", &format!("HOME={mine}")]).is_empty(),
         "the user's own home"
     );
     assert!(
@@ -745,4 +832,33 @@ fn a_codex_starter_is_codex_alab_and_carries_its_config() {
         starter_of(cli, Some(&alab), &proc_args(&unknown, &[]), user, || None).expect("a starter");
     let err = line(cli, Dialect::Zsh, &s, &Fresh::default()).expect_err("an unread argv");
     assert!(err.contains("--frobnicate"), "{err}");
+}
+
+/// A MUSE CODE WORKER RUNS THE DEFAULT MODEL AT XHIGH WITH CONTRIBUTOR MODE
+/// OFF. CONTROL: a named `model=` replaces the default model (and only it);
+/// no other CLI's line gains a model it was not named.
+#[test]
+fn a_muse_worker_runs_the_default_model_with_contributor_mode_off() {
+    let muse = row(Program::Muse);
+    let plain = line(muse, Dialect::Zsh, &muse.plain(), &Fresh::default()).expect("a line");
+    assert!(plain.contains(" '--contributor-mode' 'off' "), "{plain}");
+    assert!(
+        plain.contains(" '--model' 'muse-wonder-full-1.0' "),
+        "{plain}"
+    );
+    assert!(plain.contains(" '--reasoning-effort' 'xhigh' "), "{plain}");
+    assert_eq!(plain.matches("--contributor-mode").count(), 1, "{plain}");
+    let named = line(
+        muse,
+        Dialect::Zsh,
+        &muse.plain(),
+        &Fresh {
+            model: Some("big-1"),
+            ..Fresh::default()
+        },
+    )
+    .expect("a line");
+    assert!(named.contains(" '--model' 'big-1' "), "{named}");
+    assert!(!named.contains("muse-wonder-full-1.0"), "{named}");
+    assert!(named.contains(" '--contributor-mode' 'off' "), "{named}");
 }

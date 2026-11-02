@@ -96,7 +96,11 @@ fn copy_name(pid: u32, birth: Birth) -> String {
 pub fn owner_of(name: &str) -> Option<(u32, Birth)> {
     let name = name.strip_suffix(".partial").unwrap_or(name);
     let mut parts = name.split('-');
-    let pid = parts.next()?.parse().ok()?;
+    let pid: u32 = parts
+        .next()
+        .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))?
+        .parse()
+        .ok()?;
     let seconds = parts.next()?.parse().ok()?;
     let micros = parts.next()?.parse().ok()?;
     let birth = Birth { seconds, micros };

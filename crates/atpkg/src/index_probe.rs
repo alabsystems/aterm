@@ -229,6 +229,9 @@ fn read_stamp(file: &mut File) -> Option<(u64, char, SystemTime)> {
         "E" => 'E',
         _ => return None,
     };
+    if recorded.is_empty() || !recorded.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
     Some((recorded.parse().ok()?, marker, metadata.modified().ok()?))
 }
 

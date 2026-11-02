@@ -219,7 +219,14 @@ fn preparation_case(moving: bool, default: bool, case: i64) -> ([(&'static str, 
             _ => result.line.is_none(),
         };
         let details = match case {
-            1 | 2 | 4 | 8 => result == Moved::stay(StayWhy::NoLine),
+            1 => matches!(
+                result,
+                Moved {
+                    advice: Advice::Wait { until },
+                    line: None,
+                } if until > NOW
+            ),
+            2 | 4 | 8 => result == Moved::stay(StayWhy::NoLine),
             3 | 5 | 6 | 9 | 10 | 11 => result == Moved::stay(StayWhy::NothingDue),
             _ => result.line.is_some(),
         };

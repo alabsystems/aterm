@@ -439,7 +439,7 @@ pub(crate) fn run(shell: aterm_pty::SpawnedShell, verbose: bool) -> i32 {
         }
         let out = &buf[..r as usize];
         stdout_write_all(stdout, out);
-        bytes_in += out.len() as u64;
+        bytes_in = bytes_in.saturating_add(out.len() as u64);
     }
 
     drop(guard);

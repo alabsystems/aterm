@@ -1,11 +1,11 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-winit-keymap: spec recovery from its 15 unit tests
+# aterm-winit-keymap: spec recovery from its unit tests
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 5 tests it
-> deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
-> were taken before.
+Each row of §1 is a spec to prove through Trust/Clean about the compiled Rust functions of
+`crates/aterm-winit-keymap/src/lib.rs`; the tests it subsumes are then deleted. §4 lists the tests
+no row cites.
 
 > Status 2026-10-16: the 8 specs below are the crate's migration worklist. Each is proved through
 > Trust/Clean about the compiled Rust function, then the tests it subsumes are deleted. Nothing has been
@@ -35,25 +35,25 @@ Result: **8 specs**, covering **12 tests** (§4 has 0 non-spec tests left).
   Space), 6 lock/system keys (CapsLock, NumLock, ScrollLock, PrintScreen, Pause, ContextMenu), F1..F35 and
   the 12 media/audio keys; each `m ∈ MODS` goes to `Left(m)`; every other variant gives `None`.
 - `T_kp_char : char -> Option<NamedKey>`: `'0'..'9'` → `Numpad0..Numpad9`, `'.'` → `NumpadDecimal`,
-  `','` → `NumpadSeparator`, `'/'` → `NumpadDivide`, `'*'` → `NumpadMultiply`, `'-'` → `NumpadSubtract`,
-  `'+'` → `NumpadAdd`, `'='` → `NumpadEqual`; `None` otherwise.
-- `T_kp_named : WN -> Option<NamedKey>`: `Enter` → `NumpadEnter`; ArrowUp/Down/Left/Right, Home, End,
-  PageUp, PageDown, Insert, Delete → their `Numpad*` twins; `None` otherwise.
+  `','` → `NumpadSeparator`, `'/'` → `NumpadDivide`, `'*'` → `NumpadMultiply`, `'-'` →
+  `NumpadSubtract`, `'+'` → `NumpadAdd`, `'='` → `NumpadEqual`; `None` otherwise.
+- `T_kp_named : WN -> Option<NamedKey>`: `Enter` → `NumpadEnter`; ArrowUp/Down/Left/Right, Home,
+  End, PageUp, PageDown, Insert, Delete → their `Numpad*` twins; `None` otherwise.
 - `PAIRS` = {(ShiftLeft,ShiftRight), (ControlLeft,ControlRight), (AltLeft,AltRight),
   (SuperLeft,SuperRight)} ⊂ `KC × KC`.
-- `T_qwerty : KC -> Option<char>`: KeyA..KeyZ → `'a'..'z'`, Digit0..Digit9 → `'0'..'9'`, and Backquote,
-  Minus, Equal, BracketLeft, BracketRight, Backslash, Semicolon, Quote, Comma, Period, Slash → the
-  matching unshifted US glyph; `None` for every other code.
+- `T_qwerty : KC -> Option<char>`: KeyA..KeyZ → `'a'..'z'`, Digit0..Digit9 → `'0'..'9'`, and
+  Backquote, Minus, Equal, BracketLeft, BracketRight, Backslash, Semicolon, Quote, Comma, Period,
+  Slash → the matching unshifted US glyph; `None` for every other code.
 
-All tables are finite, so every table property is decidable by enumerating variants once the carriers
-(foreign enums, `SmolStr`, `char`, `Option`) can be stated in a clause.
+Every table is finite, so each table property is decidable by enumerating variants once the
+carriers (foreign enums, `SmolStr`, `char`, `Option`) can be stated in a clause.
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes (primary tests; secondary in §2)`,
-`difficulty (Rust features the proof must handle)`, `blocking gaps` (numbers from
-`docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7; gap 0, the stale installed seal, blocks every
-row and is listed once here rather than in each row).
+`subsumes` names the primary tests (the rest are in §2), `difficulty` the Rust features the proof
+must handle, and `blocking gaps` rows of the gap table in
+`docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7. Gap 0 blocks every row and is not repeated
+in them.
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking gaps
@@ -96,7 +96,8 @@ No spec is blocked by gap 0 alone: every row needs gap 1 (foreign enum carriers)
 
 ## 2. Test → spec map (TSV)
 
-`primary` is the spec that retires the test. `also` lists the other specs the same test samples.
+`primary` is the spec that retires the test; `also` lists the other specs it samples. A test goes
+once its primary and every `also` spec are proved.
 
 ```tsv
 file	test	primary	also
@@ -114,7 +115,7 @@ src/lib.rs	base_layout_key_is_us_qwerty	base-layout-key-table
 src/lib.rs	layout_letter_twin_names_the_us_letter_under_a_non_latin_letter	layout-letter-twin-for	base-layout-key-table
 ```
 
-## 3. Coverage
+## 3. Open finding
 
 - 12 tests read. All 12 map to one of the 8 specs (§4 has 0 non-spec tests left).
 - The biggest collapse is `numpad-key-table` (5 primary); `named-key-table` retires the consolidated
@@ -122,13 +123,14 @@ src/lib.rs	layout_letter_twin_names_the_us_letter_under_a_non_latin_letter	layou
 - `a_right_side_modifier_press_maps_to_its_right_variant` is retired only when both
   `sided-modifier-contract` and `logical-key-contract` are proved (it asserts one half of each).
 
-## 4. Tests that are not spec samples
+## 4. Tests with no row
 
-> Status 2026-10-17: none left. The one test here, which read `crates/aterm-types/Cargo.toml` and
-> checked that no non-comment line names `winit`, is deleted as source scraping; no `aterm-census`
-> guard took its place.
+- `maps_function_keys_past_f12_and_media_keys` samples `named-key-table`.
+- `layout_letter_twin_names_the_us_letter_under_a_non_latin_letter` (`layout_letter_twin_for`) and
+  `us_qwerty_shifted_and_kitty_wire_round_trip` (`us_qwerty_shifted_ascii`,
+  `encode_kitty_key_wire_le`, `decode_kitty_key_wire_le`) test functions no row states.
 
-## 5. Implied specs that look wrong, or disagree with the code
+## 5. Proof order
 
 1. **Resolved — `map_numpad_key` doc aligned with `numpad-key-table` clause (1).** `map_numpad_key`
    documents explicitly that `Character` keys outside `T_kp_char` return `None` directly and that

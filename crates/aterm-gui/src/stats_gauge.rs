@@ -461,6 +461,7 @@ impl Pen<'_> {
             r_outer,
             thickness,
             track: CLEAR,
+            start: 0.0,
             frac,
             fill,
         });

@@ -61,6 +61,14 @@ pub struct Run {
     pub muse_bin: String,
     /// Its version, from its store build's record (`1.4.10-R6427.1`).
     pub muse_ver: String,
+    /// The Grok Build (`grok`) the lab launches by path, when there is one.
+    pub grok_bin: String,
+    /// Its version, from its store build's record (`1.0.70`).
+    pub grok_ver: String,
+    /// The Kimi Code (`kimi`) the lab launches by path, when there is one.
+    pub kimi_bin: String,
+    /// Its version, from its store build's record (`2.4.0`).
+    pub kimi_ver: String,
     /// The agent the tab last launched.
     pub agent: String,
     /// The login the tab's Codex was launched with: `lab`, `chatgpt` or `signed-out`.
@@ -133,6 +141,10 @@ impl Run {
             ("AGY_VER", self.agy_ver.clone()),
             ("MUSE_BIN", self.muse_bin.clone()),
             ("MUSE_VER", self.muse_ver.clone()),
+            ("GROK_BIN", self.grok_bin.clone()),
+            ("GROK_VER", self.grok_ver.clone()),
+            ("KIMI_BIN", self.kimi_bin.clone()),
+            ("KIMI_VER", self.kimi_ver.clone()),
             (
                 "AGENT",
                 if self.agent.is_empty() {
@@ -200,6 +212,10 @@ impl Run {
                 "AGY_VER" => r.agy_ver = v,
                 "MUSE_BIN" => r.muse_bin = v,
                 "MUSE_VER" => r.muse_ver = v,
+                "GROK_BIN" => r.grok_bin = v,
+                "GROK_VER" => r.grok_ver = v,
+                "KIMI_BIN" => r.kimi_bin = v,
+                "KIMI_VER" => r.kimi_ver = v,
                 "AGENT" => r.agent = v,
                 "CODEX_MODE" => r.codex_mode = v,
                 "ATERM" => r.aterm = v,
@@ -274,7 +290,7 @@ impl Run {
         Ok(std::path::PathBuf::from(&self.aterm))
     }
 
-    /// The agent the tab runs (`claude` unless `codex`, `agy` or `muse` launched one). A retired
+    /// The agent the tab runs (`claude` unless `codex`, `agy`, `muse`, `grok` or `kimi` launched one). A retired
     /// agent's record is refused by [`Run::load`], so no verb that drives the agent reads it here.
     #[must_use]
     pub fn agent(&self) -> &str {
@@ -282,6 +298,8 @@ impl Run {
             "codex" => "codex",
             "agy" => "agy",
             "muse" => "muse",
+            "grok" => "grok",
+            "kimi" => "kimi",
             _ => "claude",
         }
     }
@@ -293,6 +311,8 @@ impl Run {
             "codex" => &self.codex_ver,
             "agy" => &self.agy_ver,
             "muse" => &self.muse_ver,
+            "grok" => &self.grok_ver,
+            "kimi" => &self.kimi_ver,
             _ => &self.claude_ver,
         };
         format!(
@@ -412,6 +432,11 @@ mod tests {
             muse_bin: "/Users//o/Library/Application Support/aterm/pkg/store/muse/2001004010006427002/bin/muse"
                 .into(),
             muse_ver: "1.4.10-R6427.1".into(),
+            grok_bin: "/s/gk/home/Library/Application Support/aterm/pkg/store/grok/1000001000000000070/bin/grok"
+                .into(),
+            grok_ver: "1.0.70".into(),
+            kimi_bin: "/s/gk/store/kimi/1000002000004000000/bin/kimi".into(),
+            kimi_ver: "2.4.0".into(),
             agent: "codex".into(),
             codex_mode: "chatgpt".into(),
             aterm: "/Users//o/Developer/aterm/target/debug/aterm".into(),
@@ -431,6 +456,8 @@ mod tests {
         for (agent, prefix) in [
             ("agy", "agy-1.4.0"),
             ("muse", "muse-1.4.10-R6427.1"),
+            ("grok", "grok-1.0.70"),
+            ("kimi", "kimi-2.4.0"),
             ("claude", "claude-2.1.300"),
             ("", "claude-2.1.300"),
             ("bogus", "claude-2.1.300"),
@@ -472,7 +499,9 @@ mod tests {
             assert!(e.contains(&format!("{LAB} down g1")), "{agent}: {e}");
             assert!(e.contains(&format!("{LAB} agy g1")), "{agent}: {e}");
         }
-        for agent in ["claude", "codex", "agy", "muse", "", "bogus"] {
+        for agent in [
+            "claude", "codex", "agy", "muse", "grok", "kimi", "", "bogus",
+        ] {
             let r = Run {
                 agent: agent.into(),
                 ..r.clone()

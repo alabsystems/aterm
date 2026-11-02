@@ -100,6 +100,8 @@ impl Instance {
                 ),
             ));
         }
+        #[cfg(unix)]
+        aterm_uds::keep_out_of_children(&file)?;
         if !take(&file)? {
             return Ok(None);
         }
@@ -148,7 +150,11 @@ impl Instance {
     #[must_use]
     pub fn adopt(path: &Path) -> Option<Self> {
         let named = aterm_log::env::take(LOCK_FD_ENV)?;
-        let fd: i32 = named.to_str()?.parse().ok()?;
+        let digits = named.to_str()?;
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let fd: i32 = digits.parse().ok()?;
         adopt_fd(fd, path)
     }
 }
@@ -211,6 +217,7 @@ fn adopt_fd(fd: i32, path: &Path) -> Option<Instance> {
         // SAFETY: the caller handed `fd` over (the re-exec placed it for this image alone), and nothing else in this process uses the number.
         drop(unsafe { OwnedFd::from_raw_fd(fd) });
     }
+    aterm_uds::keep_out_of_children(&file).ok()?;
     if !take(&file).ok()? {
         return None;
     }
@@ -317,6 +324,27 @@ pub fn await_released(path: &Path, pids: &[u32], within: std::time::Duration) ->
             return Err(holder.pid);
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Send `pid` SIGTERM (never pid 0 or 1, nor a negative group); one already gone is no error.
+/// # Errors
+/// `pid` is 0, 1 or past `pid_t`, or `kill` refused (another user's process).
+#[cfg(unix)]
+pub fn terminate(pid: u32) -> Result<(), String> {
+    let pid = libc::pid_t::try_from(pid)
+        .ok()
+        .filter(|pid| *pid > 1)
+        .ok_or_else(|| format!("{pid} is not a mug's pid"))?;
+    // SAFETY: two integers; `pid` is positive and not launchd's, so this signals one process.
+    if unsafe { libc::kill(pid, libc::SIGTERM) } == 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    if e.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(format!("kill {pid}: {e}"))
     }
 }
 

@@ -972,6 +972,109 @@ pub struct WindowView {
     pub source: &'static str,
 }
 
+/// [`WindowView::source`] of a figure the accounts store holds of the account beyond the session's own reading ([`AccountView::add_held`]): another tapped session's on the same login, a sample, a standing wall, Claude Code's warning.
+pub const SOURCE_STORE: &str = "store";
+
+/// WHY A WINDOW OF THE SESSION'S ACCOUNT HAS NO FIGURE after every source aterm holds was asked ([`AccountView::note_gaps`]): [`hud_line`] prints `–` for it (never a bare `?`), [`gap_lines`] says why, and `--json` carries [`Self::word`] under the account's `missing`. aterm never polls `/api/oauth/usage` for one (accounts v2 R-12), so none is invented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowGap {
+    /// Claude Code reports another window of the login but not this one: it hands a window only while the API reports it (2.1.316's statusLine `rate_limits` keeps a window only while the last reply's headers carried both its utilization and its reset), so the vendor reports none now, and nothing else aterm read has it ([`Consulted`]).
+    NotReported,
+    /// The session's own reading carries no rate-limit window at all: none comes before the first reply, and none for a login that is no Claude subscription.
+    NoFigures,
+    /// No usage-tap reading of this process (it runs without aterm's tap, or wrote none since it started), and nothing else aterm read has the window ([`Consulted`]).
+    NoReading,
+}
+
+impl WindowGap {
+    /// The closed word `--json` carries.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            WindowGap::NotReported => "not-reported",
+            WindowGap::NoFigures => "no-figures",
+            WindowGap::NoReading => "no-reading",
+        }
+    }
+
+    /// WHY A WINDOW IS EMPTY, from the session's own usage-tap `reading` (`None`: none of its process) and whether the accounts store's newest sample of the account carried the other window and not this one (`unreported`, [`super::account_stats::Missing::NotReported`]).
+    #[must_use]
+    pub fn of(reading: Option<&super::tap::Reading>, unreported: bool) -> WindowGap {
+        match reading {
+            Some(r) if r.has_figures() => WindowGap::NotReported,
+            _ if unreported => WindowGap::NotReported,
+            Some(_) => WindowGap::NoFigures,
+            None => WindowGap::NoReading,
+        }
+    }
+}
+
+/// WHAT aterm READ BESIDE THE SESSION'S OWN READING before it called a window empty
+/// ([`AccountView::note_gaps`]): [`gap_lines`] says a source holds none only where it was read,
+/// and says why one was not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Consulted {
+    /// The accounts store's record of the session's account was read
+    /// ([`super::account_stats::home_windows`] ran on it).
+    pub store: bool,
+    /// What became of the default home's cached `/usage` body.
+    pub usage_cache: CacheRead,
+}
+
+/// WHAT BECAME OF THE DEFAULT HOME'S CACHED `/usage` BODY for the session's account ([`Consulted`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CacheRead {
+    /// Not looked at: no account was judged, so nothing beside the session's reading was read.
+    #[default]
+    Unasked,
+    /// Read as the account's: the process runs on the default home's own login, and the home's
+    /// profile names no other account than the record's.
+    Read,
+    /// Not used: the process is not shown to run on the default home's login (several logins, a
+    /// login of its own), or the home's profile names another account than the record's.
+    OtherLogin,
+    /// The process runs on the default home's login, but its profile could not be read.
+    Unreadable,
+}
+
+impl Consulted {
+    /// What [`gap_lines`] adds to a reason: which sources hold none, and why any other was not read.
+    fn clause(self) -> &'static str {
+        match (self.store, self.usage_cache) {
+            (false, _) => {
+                "the accounts store and the /usage cache were not read: aterm judged no account \
+                 for this process"
+            }
+            (true, CacheRead::Read) => "the accounts store and the /usage cache hold none either",
+            (true, CacheRead::OtherLogin) => {
+                "the accounts store holds none either, and the /usage cache was not used: it is \
+                 the default home's, and this process is not shown to run on its account"
+            }
+            (true, CacheRead::Unreadable) => {
+                "the accounts store holds none either, and the default home's profile, which \
+                 holds the /usage cache, could not be read"
+            }
+            (true, CacheRead::Unasked) => {
+                "the accounts store holds none either, and the /usage cache was not read"
+            }
+        }
+    }
+
+    /// The `--json` words of the sources read (`missing`'s companion `consulted`).
+    fn words(self) -> Vec<&'static str> {
+        [
+            (self.store, "store"),
+            (
+                self.store && self.usage_cache == CacheRead::Read,
+                "usage-cache",
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(read, word)| read.then_some(word))
+        .collect()
+    }
+}
+
 /// One account: its spend (per model), the model its live session runs, and the windows its usage tap or its Codex rollouts read.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AccountView {
@@ -983,8 +1086,12 @@ pub struct AccountView {
     pub spend: BTreeMap<String, SpendView>,
     /// The session's model id ([`TranscriptUsage::last_model`], taken by [`Self::add_transcript`]).
     pub model: Option<String>,
-    /// The rate-limit windows by the vendor's name (`five_hour`, `seven_day`), from the usage tap's reading for the session's own process ([`Self::add_reading`]), or a Codex conversation's newest reading ([`Self::add_sample`]).
+    /// The rate-limit windows by the vendor's name (`five_hour`, `seven_day`), from the usage tap's reading for the session's own process ([`Self::add_reading`]), what aterm holds of the account beside it ([`Self::add_held`]), or a Codex conversation's newest reading ([`Self::add_sample`]).
     pub windows: BTreeMap<String, WindowView>,
+    /// Why a window has no figure, by the vendor's name, where the caller asked ([`Self::note_gaps`]).
+    pub gaps: BTreeMap<String, WindowGap>,
+    /// What was read beside the session's own reading before a window was called empty ([`Self::note_gaps`]).
+    pub consulted: Consulted,
 }
 
 impl AccountView {
@@ -996,6 +1103,46 @@ impl AccountView {
             spend: BTreeMap::new(),
             model: None,
             windows: BTreeMap::new(),
+            gaps: BTreeMap::new(),
+            consulted: Consulted::default(),
+        }
+    }
+
+    /// TAKE A FIGURE aterm HOLDS OF THE ACCOUNT for window `name` (`five_hour`, `seven_day`) where the view has none yet: the accounts store's ([`SOURCE_STORE`]) or the home's cached `/usage` body's ([`super::account_stats::SOURCE_USAGE_CACHE`]), current and not cut by a limit reset ([`super::account_stats::home_windows`]), as old as `as_of` makes it. The session's own reading always wins.
+    pub fn add_held(&mut self, name: &str, fig: &super::accounts::WindowFig, as_of: i64) {
+        use super::account_stats::SOURCE_USAGE_CACHE;
+        if self.windows.contains_key(name) || !fig.current(as_of) || fig.cut() {
+            return;
+        }
+        let source = if fig.source == SOURCE_USAGE_CACHE {
+            SOURCE_USAGE_CACHE
+        } else {
+            SOURCE_STORE
+        };
+        self.windows.insert(
+            name.to_owned(),
+            WindowView {
+                used_pct: fig.whole(),
+                resets_at: fig.reset,
+                age_s: u64::try_from(as_of.saturating_sub(fig.at)).unwrap_or(0),
+                source,
+            },
+        );
+    }
+
+    /// SAY WHY THE FIVE-HOUR WINDOW OR THE WEEK STILL HAS NO FIGURE once every source has filled its windows ([`WindowGap::of`]): from the session's own usage-tap `reading`, what else was read (`consulted`), and `unreported`, which answers for a window name whether the store says the vendor reports none.
+    pub fn note_gaps(
+        &mut self,
+        reading: Option<&super::tap::Reading>,
+        consulted: Consulted,
+        unreported: impl Fn(&str) -> bool,
+    ) {
+        self.consulted = consulted;
+        for name in ["five_hour", "seven_day"] {
+            if !self.windows.contains_key(name) {
+                self.gaps
+                    .insert(name.to_owned(), WindowGap::of(reading, unreported(name)));
+            }
         }
     }
 
@@ -1343,6 +1490,17 @@ pub fn panel_sample(
     local_offset_s: i64,
     zone_offset_at: &dyn Fn(&str, i64) -> Option<i64>,
 ) -> Option<super::accounts::Sample> {
+    panel_sample_local(windows, now, &|_| Some(local_offset_s), zone_offset_at)
+}
+
+/// [`panel_sample`], reading the local zone at each candidate reset instant (`local_at`).
+#[must_use]
+pub fn panel_sample_local(
+    windows: &[PanelWindow],
+    now: i64,
+    local_at: &dyn Fn(i64) -> Option<i64>,
+    zone_offset_at: &dyn Fn(&str, i64) -> Option<i64>,
+) -> Option<super::accounts::Sample> {
     use super::accounts::{RESET_BELIEVED_S, SESSION_WINDOW_S, STAMP_SKEW_S, Sample};
     use crate::supervise::limit;
     let read = |name: &str, ahead_max: i64| {
@@ -1351,7 +1509,7 @@ pub fn panel_sample(
             .reset_text
             .as_deref()
             .and_then(limit::parse_reset)
-            .map(|spec| limit::reset_at_with(&spec, now, local_offset_s, zone_offset_at))
+            .map(|spec| limit::reset_at_local(&spec, now, local_at, zone_offset_at))
             .filter(|at| at.saturating_sub(now) <= ahead_max);
         Some((window.used_pct, reset))
     };
@@ -1425,7 +1583,7 @@ fn truncate_to(mut s: String, max: usize) -> String {
     s
 }
 
-/// The one-line HUD: `fable ?%/5h · ?%/7d · acct work · resets ? · none`.
+/// The one-line HUD: `fable ?%/5h · ?%/7d · acct work · resets ? · none`; a window whose emptiness the caller explained ([`AccountView::gaps`]) reads `–` (`opus –/5h · 1%/7d · …`), as does `resets` where both are, and [`gap_lines`] says why. The source and age are each window's where they differ (`5h tap 5s · 7d store 5d`).
 pub fn hud_line(view: &UsageView) -> String {
     let Some(acct) = view.shown() else {
         return "no account".to_owned();
@@ -1438,28 +1596,87 @@ pub fn hud_line(view: &UsageView) -> String {
         .unwrap_or_else(|| "model?".to_owned());
     let five = acct.windows.get("five_hour");
     let seven = acct.windows.get("seven_day");
-    let pct =
-        |w: Option<&WindowView>| w.map_or_else(|| "?%".to_owned(), |w| format!("{}%", w.used_pct));
+    let pct = |name: &str| match (acct.windows.get(name), acct.gaps.contains_key(name)) {
+        (Some(w), _) => format!("{}%", w.used_pct),
+        (None, true) => "\u{2013}".to_owned(),
+        (None, false) => "?%".to_owned(),
+    };
+    let explained = ["five_hour", "seven_day"]
+        .iter()
+        .all(|name| acct.gaps.contains_key(*name));
     let resets = five.or(seven).map_or_else(
-        || "?".to_owned(),
+        || if explained { "\u{2013}" } else { "?" }.to_owned(),
         |w| {
             let left = u64::try_from(w.resets_at.saturating_sub(view.as_of)).unwrap_or(0);
             format!("in {}", super::upgrade::span(left))
         },
     );
-    let source = match five.or(seven) {
-        Some(w) => format!("{} {}", w.source, super::upgrade::span(w.age_s)),
-        None => "none".to_owned(),
+    // Each window's own source and age where they differ, so a week the store held for days
+    // never reads as fresh as the tap's five-hour figure beside it.
+    let each = |w: &WindowView| format!("{} {}", w.source, super::upgrade::span(w.age_s));
+    let source = match (five, seven) {
+        (Some(f), Some(s)) if each(f) != each(s) => format!("5h {} · 7d {}", each(f), each(s)),
+        (Some(w), _) | (None, Some(w)) => each(w),
+        (None, None) => "none".to_owned(),
     };
     truncate_to(
         format!(
             "{model} {}/5h · {}/7d · acct {} · resets {resets} · {source}",
-            pct(five),
-            pct(seven),
+            pct("five_hour"),
+            pct("seven_day"),
             sanitize(&acct.label)
         ),
         HUD_MAX_BYTES,
     )
+}
+
+/// WHY EACH EMPTY WINDOW OF THE HUD'S ACCOUNT IS EMPTY ([`AccountView::gaps`]), one line per reason, the windows it covers first: `5h –: not reported: …`.
+pub fn gap_lines(view: &UsageView) -> Vec<String> {
+    let Some(acct) = view.shown() else {
+        return Vec::new();
+    };
+    let label = |name: &str| if name == "five_hour" { "5h" } else { "7d" };
+    let mut lines: Vec<(Vec<&str>, WindowGap, &str)> = Vec::new();
+    for name in ["five_hour", "seven_day"] {
+        let Some(&gap) = acct.gaps.get(name) else {
+            continue;
+        };
+        match lines.iter_mut().find(|(_, g, _)| *g == gap) {
+            Some((names, ..)) => names.push(label(name)),
+            None => lines.push((vec![label(name)], gap, name)),
+        }
+    }
+    lines
+        .into_iter()
+        .map(|(names, gap, first)| {
+            let why = match gap {
+                WindowGap::NotReported => {
+                    let (this, other) = if first == "five_hour" {
+                        ("5-hour window", "week")
+                    } else {
+                        ("week", "5-hour window")
+                    };
+                    format!(
+                        "not reported: Claude Code reports this login's {other} but no {this} (it \
+                         hands a window only while the API reports one)"
+                    )
+                }
+                WindowGap::NoFigures => "Claude Code's status line for this process carries no \
+                                         rate-limit window: none comes before the first reply, \
+                                         and none for a login that is no Claude subscription"
+                    .to_owned(),
+                WindowGap::NoReading => "no usage-tap reading of this Claude Code process (it \
+                                         runs without aterm's tap, or wrote none since it \
+                                         started)"
+                    .to_owned(),
+            };
+            format!(
+                "{} \u{2013}: {why}; {}",
+                names.join(", "),
+                acct.consulted.clause()
+            )
+        })
+        .collect()
 }
 
 /// `YYYY-MM-DDTHH:MM:SSZ` of an epoch instant, before the epoch too (the calendar is `aterm_types::rfc3339`'s, the workspace's one copy).
@@ -1521,6 +1738,21 @@ fn account_json(a: &AccountView) -> Value {
     );
     if let Some(model) = &a.model {
         o.insert("model".to_owned(), Value::from(model.as_str()));
+    }
+    if !a.gaps.is_empty() {
+        o.insert(
+            "missing".to_owned(),
+            Value::Object(
+                a.gaps
+                    .iter()
+                    .map(|(name, gap)| (name.clone(), Value::from(gap.word())))
+                    .collect(),
+            ),
+        );
+        o.insert(
+            "consulted".to_owned(),
+            Value::Array(a.consulted.words().into_iter().map(Value::from).collect()),
+        );
     }
     Value::Object(o)
 }
@@ -2478,6 +2710,261 @@ mod tests {
         let bare: Value =
             aterm_json::from_str(&usage_json(&view_with(live_account()))).expect("json");
         assert_eq!(bare["accounts"][0]["windows"], Value::Object(Map::new()));
+        assert!(bare["accounts"][0].get("missing").is_none(), "no gap noted");
+    }
+
+    /// The reading Claude Code 2.1.316 leaves a login whose replies carry the week and no
+    /// five-hour window (`tap::tests`' `claude-2.1.316-statusline-week-only.json`).
+    fn week_only_reading() -> crate::harness::tap::Reading {
+        crate::harness::tap::Reading {
+            at: 1_793_473_703,
+            sid: "s-1".to_string(),
+            pid: 7,
+            session: None,
+            login: None,
+            home: None,
+            api_ms: 219_320_877,
+            five_hour: None,
+            seven_day: Some(crate::harness::tap::Window {
+                pct: 1,
+                resets_at: 1_794_078_000,
+                pct_x10: Some(10),
+            }),
+            warm: None,
+            cache_expires_at: None,
+            version: Some("2.1.316".to_string()),
+            model: Some("claude-opus-5-5".to_string()),
+            ctx_left: None,
+            dur_us: 0,
+        }
+    }
+
+    /// A WINDOW THE VENDOR DOES NOT REPORT READS `–` WITH ITS REASON, NEVER A BARE `?`: on
+    /// 2.1.316's week-only reading the HUD says `–/5h`, one line says why, and `--json` carries
+    /// `missing.five_hour = "not-reported"`; a window nobody explained still reads `?%`.
+    #[test]
+    fn a_window_the_vendor_does_not_report_reads_a_dash_with_its_reason() {
+        let reading = week_only_reading();
+        let now = reading.at + 5;
+        let mut a = AccountView::new("m21-2", true);
+        a.model = Some("claude-opus-5-5".to_owned());
+        a.add_reading(&reading, now);
+        let mut unexplained = UsageView::new(now);
+        unexplained.accounts.push(a.clone());
+        assert!(
+            hud_line(&unexplained).starts_with("opus ?%/5h \u{b7} 1%/7d"),
+            "{}",
+            hud_line(&unexplained)
+        );
+        assert!(gap_lines(&unexplained).is_empty());
+        let both = Consulted {
+            store: true,
+            usage_cache: CacheRead::Read,
+        };
+        a.note_gaps(Some(&reading), both, |_| false);
+        let mut view = UsageView::new(now);
+        view.accounts.push(a);
+        assert_eq!(
+            hud_line(&view),
+            "opus \u{2013}/5h \u{b7} 1%/7d \u{b7} acct m21-2 \u{b7} resets in 6d23h \u{b7} tap 5s"
+        );
+        let why = gap_lines(&view);
+        assert_eq!(
+            why,
+            [
+                "5h \u{2013}: not reported: Claude Code reports this login's week but no 5-hour \
+              window (it hands a window only while the API reports one); the accounts store and \
+              the /usage cache hold none either"
+            ]
+        );
+        let json: Value = aterm_json::from_str(&usage_json(&view)).expect("json");
+        let acct = &json["accounts"][0];
+        assert_eq!(acct["missing"]["five_hour"], Value::from("not-reported"));
+        assert_eq!(
+            acct["consulted"],
+            Value::Array(vec![Value::from("store"), Value::from("usage-cache")])
+        );
+        assert!(acct["missing"].get("seven_day").is_none());
+        assert_eq!(acct["windows"]["seven_day"]["used_pct"], Value::from(1u64));
+        assert!(
+            acct["windows"].get("five_hour").is_none(),
+            "no figure is invented"
+        );
+    }
+
+    /// EACH GAP IS DECIDED BY WHAT WAS READ ([`WindowGap::of`]): a reading with any figure means
+    /// the vendor reports none of the missing window; the store's word stands in where the
+    /// process left no reading; a reading with no figure, or none at all, says that instead; and
+    /// two windows empty for one reason share one line.
+    #[test]
+    fn each_gap_is_decided_by_what_was_read() {
+        let figures = week_only_reading();
+        let bare = crate::harness::tap::Reading {
+            seven_day: None,
+            ..week_only_reading()
+        };
+        for (reading, unreported, gap) in [
+            (Some(&figures), false, WindowGap::NotReported),
+            (Some(&figures), true, WindowGap::NotReported),
+            (Some(&bare), false, WindowGap::NoFigures),
+            (Some(&bare), true, WindowGap::NotReported),
+            (None, false, WindowGap::NoReading),
+            (None, true, WindowGap::NotReported),
+        ] {
+            assert_eq!(
+                WindowGap::of(reading, unreported),
+                gap,
+                "{:?} {unreported}",
+                reading.map(crate::harness::tap::Reading::has_figures)
+            );
+        }
+        assert_eq!(
+            hud_line(&view_with(live_account())),
+            "fable ?%/5h \u{b7} ?%/7d \u{b7} acct work \u{b7} resets ? \u{b7} none",
+            "two windows nobody explained keep `?`"
+        );
+        let mut a = live_account();
+        a.note_gaps(None, Consulted::default(), |_| false);
+        let view = view_with(a);
+        assert_eq!(
+            hud_line(&view),
+            "fable \u{2013}/5h \u{b7} \u{2013}/7d \u{b7} acct work \u{b7} resets \u{2013} \u{b7} none"
+        );
+        assert_eq!(
+            gap_lines(&view),
+            [
+                "5h, 7d \u{2013}: no usage-tap reading of this Claude Code process (it runs without \
+              aterm's tap, or wrote none since it started); the accounts store and the /usage \
+              cache were not read: aterm judged no account for this process"
+            ]
+        );
+        let json: Value = aterm_json::from_str(&usage_json(&view)).expect("json");
+        assert_eq!(json["accounts"][0]["consulted"], Value::Array(Vec::new()));
+        let mut a = live_account();
+        let store = Consulted {
+            store: true,
+            usage_cache: CacheRead::OtherLogin,
+        };
+        a.note_gaps(Some(&bare), store, |_| false);
+        assert_eq!(
+            gap_lines(&view_with(a)),
+            [
+                "5h, 7d \u{2013}: Claude Code's status line for this process carries no rate-limit \
+              window: none comes before the first reply, and none for a login that is no Claude \
+              subscription; the accounts store holds none either, and the /usage cache was not \
+              used: it is the default home's, and this process is not shown to run on its account"
+            ]
+        );
+    }
+
+    /// NO FIGURE LOOKS FRESHER THAN IT IS: where the two windows come from different sources or
+    /// ages (the tap's five-hour figure beside a week the store held for days), the HUD names each
+    /// one's; where they share one reading it names it once.
+    #[test]
+    fn each_window_keeps_its_own_source_and_age() {
+        let reading = crate::harness::tap::Reading {
+            five_hour: Some(crate::harness::tap::Window {
+                pct: 42,
+                resets_at: 1_793_473_703 + 5 + 3_600,
+                pct_x10: Some(420),
+            }),
+            seven_day: None,
+            ..week_only_reading()
+        };
+        let now = reading.at + 5;
+        let mut a = AccountView::new("work", true);
+        a.model = Some("claude-opus-5-5".to_owned());
+        a.add_reading(&reading, now);
+        let week = crate::harness::accounts::WindowFig {
+            pct_x10: 300,
+            reset: now + 86_400,
+            at: now - 5 * 86_400,
+            by: "here".to_owned(),
+            source: "tap".to_owned(),
+            epoch_at: None,
+        };
+        a.add_held("seven_day", &week, now);
+        let mut view = UsageView::new(now);
+        view.accounts.push(a);
+        assert_eq!(
+            hud_line(&view),
+            "opus 42%/5h \u{b7} 30%/7d \u{b7} acct work \u{b7} resets in 1h \u{b7} 5h tap 5s \u{b7} \
+             7d store 5d"
+        );
+        let mut one = AccountView::new("work", true);
+        one.model = Some("claude-opus-5-5".to_owned());
+        one.add_reading(
+            &crate::harness::tap::Reading {
+                seven_day: week_only_reading().seven_day,
+                ..reading
+            },
+            now,
+        );
+        let mut view = UsageView::new(now);
+        view.accounts.push(one);
+        assert!(
+            hud_line(&view).ends_with(" \u{b7} resets in 1h \u{b7} tap 5s"),
+            "{}",
+            hud_line(&view)
+        );
+    }
+
+    /// WHAT aterm HOLDS OF THE ACCOUNT FILLS ONLY AN EMPTY WINDOW ([`AccountView::add_held`]): a
+    /// current store figure fills the five-hour window the reading lacked, named `store` and aged
+    /// from its own observation; the session's own week is never replaced; a void figure or one a
+    /// limit reset cut fills nothing; a cached `/usage` figure is named as such.
+    #[test]
+    fn a_held_figure_fills_only_an_empty_window() {
+        let reading = week_only_reading();
+        let now = reading.at + 5;
+        let fig = |pct_x10: u32, reset: i64, source: &str| crate::harness::accounts::WindowFig {
+            pct_x10,
+            reset,
+            at: now - 60,
+            by: "here".to_owned(),
+            source: source.to_owned(),
+            epoch_at: None,
+        };
+        let mut a = AccountView::new("work", true);
+        a.add_reading(&reading, now);
+        a.add_held("seven_day", &fig(500, reading.at + 3_600, "tap"), now);
+        assert_eq!(
+            a.windows["seven_day"].used_pct, 1,
+            "the session's own week wins"
+        );
+        a.add_held("five_hour", &fig(420, now, "tap"), now);
+        assert!(
+            !a.windows.contains_key("five_hour"),
+            "a void figure fills nothing"
+        );
+        let cut = crate::harness::accounts::WindowFig {
+            epoch_at: Some(now - 30),
+            ..fig(420, now + 3_600, "tap")
+        };
+        a.add_held("five_hour", &cut, now);
+        assert!(
+            !a.windows.contains_key("five_hour"),
+            "a cut figure fills nothing"
+        );
+        a.add_held("five_hour", &fig(425, now + 3_600, "sample"), now);
+        let five = a.windows["five_hour"];
+        assert_eq!(
+            (five.used_pct, five.resets_at, five.age_s, five.source),
+            (43, now + 3_600, 60, SOURCE_STORE)
+        );
+        a.note_gaps(Some(&reading), Consulted::default(), |_| true);
+        assert!(a.gaps.is_empty(), "no window is empty");
+        let mut cached = AccountView::new("work", true);
+        cached.add_held(
+            "five_hour",
+            &fig(
+                70,
+                now + 3_600,
+                crate::harness::account_stats::SOURCE_USAGE_CACHE,
+            ),
+            now,
+        );
+        assert_eq!(cached.windows["five_hour"].source, "usage-cache");
     }
 
     #[test]
@@ -3203,6 +3690,31 @@ mod tests {
             junk.iter().map(|w| w.name.as_str()).collect::<Vec<_>>(),
             vec!["five_hour", "seven_day"],
             "a keyless title is dropped, not guessed"
+        );
+    }
+
+    #[test]
+    fn panel_sample_local_places_zoneless_resets_across_a_daylight_change() {
+        const PDT: i64 = -7 * 3_600;
+        const PST: i64 = -8 * 3_600;
+        const NOW: i64 = 1_793_520_000; // 2026-11-01 01:00 PDT (08:00Z), 1h before fall-back
+        const CHANGE: i64 = 1_793_523_600; // 2026-11-01T09:00:00Z
+        let windows = [
+            window("five_hour", 25, Some("3am")),
+            window("seven_day", 60, Some("Nov 3 at 11am")),
+        ];
+        let local_at = |unix: i64| Some(if unix < CHANGE { PDT } else { PST });
+        let dst = panel_sample_local(&windows, NOW, &local_at, &|_, _| None).expect("sample");
+        let flat = panel_sample(&windows, NOW, PDT, &|_, _| None).expect("sample");
+        assert_eq!(
+            (dst.session_reset, dst.week_reset),
+            (Some(1_793_530_800), Some(1_793_732_400)),
+            "3am PST (11:00Z, 3h ahead) and Nov 3 11am PST (19:00Z)"
+        );
+        assert_eq!(
+            (flat.session_reset, flat.week_reset),
+            (Some(1_793_527_200), Some(1_793_728_800)),
+            "CONTROL: flat PDT places both an hour early"
         );
     }
 }

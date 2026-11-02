@@ -3,29 +3,28 @@
 
 # aterm-converge: specs behind the converge engine's tests
 
-> Status: spec recovery (docs/PLAN-tests-to-specs-2026-10-15.md, step 2) for the engine every
-> provisioning surface runs (design `docs/DESIGN-init-system-2026-10-20.md` §3). Each spec below is
-> held by the tests named in its `subsumes` column; none is proved through Trust/Clean yet. The crate
-> is on the Trust lane with a floor in `crates/aterm-release/trust/floors.tsv`.
+Specs recovered from the unit tests of the engine every provisioning surface runs
+(`docs/DESIGN-init-system-2026-10-20.md` §3). Each is held by the tests in its `subsumes` column;
+none is proved yet.
 
-Source: `crates/aterm-converge/src/` — `model.rs` (the vocabulary and the report rows), `engine.rs`
-(order, probe, plan, apply, read-back), `scope.rs` (what a surface lets a run do, `--only`, and the
-wrappers that hold changes back) and `journal.rs` (`FileJournal`). Every test is a unit test in the
-file it covers.
+Source: `src/model.rs` (the vocabulary and the report rows), `src/engine.rs` (order, probe, plan,
+apply, read-back), `src/scope.rs` (what a surface lets a run do, `--only`, and the wrappers that
+hold changes back) and `src/journal.rs` (`FileJournal`). Each test is a unit test in the file it
+covers.
 
 ## 0. Notation used in the statements
 
-- `M` = `src/model.rs`, `E` = `src/engine.rs`, `S` = `src/scope.rs`, `J` = `src/journal.rs`.
-- `run(items, mode, scope, journal)` = `run_scoped`; `run` and `run_with` are it at `Scope::EVERY`.
+- `M`, `E`, `S`, `J` = `src/model.rs`, `src/engine.rs`, `src/scope.rs`, `src/journal.rs`.
+- `run` and `run_with` are `run_scoped` at `Scope::EVERY`.
 - `ok?(r)` = `r.outcome ∈ {Ok, Changed}`.
 - `names(w, id)` = `id = w`, or `w = p*` and `id` starts with `p`.
-- The probe sequence of an item is what its successive `probe()` calls return; `apply`, `refresh`,
-  `stands_aside` and `stood_aside` are the item's own answers.
+- An item's answers (`probe`, `apply`, `refresh`, `read_aside`, `stands_aside`, `stood_aside`) are
+  inputs; successive `probe()` calls may answer differently.
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes`, `difficulty` (the Rust features a proof must
-handle), `blocking_gaps` (rows of `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7).
+`difficulty` is the Rust features a proof must handle; `blocking_gaps` are rows of
+`docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7.
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
@@ -127,35 +126,36 @@ J	a_line_waits_for_another_writers_lock_and_a_hold_past_the_wait_refuses_its_cha
 J	writers_that_cross_the_bound_together_rotate_once_and_none_is_refused	FJ-LOCK	FJ-BOUND
 ```
 
-## 3. Coverage
+## 5. Gaps and disagreements
 
-- Every test in the crate is in §2's map.
-- These tests hold the engine alone; the machines families that run on it keep their own tests in
-  `aterm-machines`.
-
-## 4. Tests that are not spec samples
-
-None.
-
-## 5. Implied specs that look wrong, or disagree with the design
-
-- CV-WAITS blocks an item behind any prerequisite that did not end `Ok` or `Changed`, so a prerequisite
-  that is `NotApplicable` on this host (an Intel Mac, an older macOS) blocks what runs after it in every
-  apply, although `NotApplicable` is "nothing to do, and nothing wrong" and never fails a surface
-  (CV-FAILS-SURFACE). A composition with such an edge needs the rule to admit `NotApplicable`, or the
-  dependant reads `Blocked` on every such host.
-- CV-ORDER is quadratic in the items per placement (each step scans every item for the lowest ready
-  one): fine for a run's few hundred items, and the property it states (the lowest-index ready item
-  first) is what keeps an ordered composition in its order.
+- No row states activations (`Item::activation`, the `Activation` trait, `settle` in `E`), and their
+  tests are not in §2:
+  `items_sharing_an_activation_are_applied_before_it_runs_once_and_read_back_after_it`,
+  the three `an_activation_*` tests,
+  `an_item_waiting_on_an_activated_item_runs_after_its_whole_activation` and
+  `a_selected_item_keeps_its_activation`. Three rows leave them out: CV-ORDER (an item whose edge
+  names an item of another activation also runs after every item of that activation), CV-READBACK
+  (an activated item is read back after its activation runs, and is Failed "applied, but not
+  activated: …" when the activation fails for it) and CV-JOURNAL-FIRST (an activation with something
+  pending journals its own line before it activates).
+- No row states `Readiness::of`, whose tests are not in §2:
+  `M::readiness_is_stricter_than_the_failure_policy_and_requires_evidence`,
+  `M::optional_readiness_round_trips_without_changing_older_reports` and
+  `M::changed_settings_await_login_or_restart_without_inventing_pending_work_for_ok_rows`.
+  `E::a_successful_read_back_reports_the_current_value_instead_of_the_old_target` is not in §2
+  either: it holds that a Changed row's `to` is the read-back value, which CV-READBACK does not say.
+- CV-WAITS blocks an item behind any prerequisite that is not ok?, so a prerequisite that is
+  `NotApplicable` on this host blocks its dependants in every apply, although `NotApplicable` never
+  fails a surface (CV-FAILS-SURFACE). An edge to such an item needs the rule to admit
+  `NotApplicable`.
 
 ## 6. Proof order (easiest, high value first)
 
-1. CV-FAILURE, CV-ASIDE-EXIT, CV-FAILS-SURFACE: closed tables over enums (gap 1's enum carriers, then
-   gap 3's enum matches).
-2. CV-SELECTS, CV-NAMES: string-prefix predicates, the `--only` and edge rules every surface shares.
-3. CV-ORDER, CV-SELECT: the scheduler, a loop over index vectors (gap 7).
-4. CV-STEP, CV-READBACK, CV-REFRESH, CV-PLAN-WAITS, CV-STOOD-ASIDE, CV-EXPLAIN: `run_one` as a table from
-   the probe sequence to the row; they need trait-object calls modelled as the item's answers.
-5. CV-JOURNAL-FIRST, CV-WAITS, CV-SCOPE-*, CV-WRAPPERS: properties of whole runs; with the probe
-   sequences as inputs they are state-machine properties a `ty_model!` of the run could carry first.
+1. CV-FAILURE, CV-ASIDE-EXIT, CV-FAILS-SURFACE: closed tables over enums (gaps 1 and 3).
+2. CV-SELECTS, CV-NAMES: string-prefix predicates.
+3. CV-ORDER, CV-SELECT: the scheduler, loops over index vectors (gap 7).
+4. CV-STEP, CV-READBACK, CV-REFRESH, CV-PLAN-WAITS, CV-STOOD-ASIDE, CV-EXPLAIN: `run_one` as a
+   table from the item's answers to its row.
+5. CV-JOURNAL-FIRST, CV-WAITS, CV-SCOPE-*, CV-WRAPPERS: whole-run properties, which a `ty_model!` of
+   the run could carry first.
 6. FJ-*: the file journal is effectful (gap 8) and FJ-LOCK concurrent (gap 13); they stay tests.

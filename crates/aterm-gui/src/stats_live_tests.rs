@@ -974,7 +974,7 @@ fn the_card_key_and_the_layers_follow_what_moved() {
 const TEXT: HeaderText<'static> = HeaderText {
     tab: "Tab 2",
     machine: "this Mac",
-    over: true,
+    over: [true; 2],
     totals: &[],
 };
 
@@ -1195,7 +1195,12 @@ fn scale_could_go(head: &HeaderPlan, strip: Strip, m: &FaceMetrics) -> Option<St
                 (left + w + plan::KEY_GAP, lead - plan::KEY_GAP, true),
             ] {
                 if x1 > x0 {
-                    spans.push(plan::KeySpan { x0, x1, strip });
+                    spans.push(plan::KeySpan {
+                        x0,
+                        x1,
+                        strip,
+                        over: strip,
+                    });
                 }
             }
             let trial = kept(spans);
@@ -1268,6 +1273,7 @@ fn the_time_scale_marks_how_far_back_at_every_width() {
             x0: strip.end() + plan::STRIP_LEAD,
             x1: strip.end() + 160.0,
             strip: false,
+            over: false,
         };
         let head = plan::header_of_strip(strip, &[free], m);
         assert_eq!(
@@ -1348,7 +1354,7 @@ fn the_time_scale_at_the_mockups_widths() {
 /// A headless App whose one focused window draws the v2 deck, holding a reading that landed at
 /// `landed`, a second after the reading before it.
 #[cfg(unix)]
-fn live_app(landed: Instant) -> (crate::App, crate::WindowId) {
+pub(crate) fn live_app(landed: Instant) -> (crate::App, crate::WindowId) {
     let mut app = crate::App::headless_for_test();
     let wid = crate::WindowId(0);
     app.config
@@ -1500,9 +1506,74 @@ fn the_app_moves_the_live_edge_only_where_motion_is_allowed() {
     assert_eq!(app.deck_live(wid), DeckLive::STILL);
 }
 
+/// A resting window's deck draws as an unfocused one's (`crate::window_rest`): still, on the
+/// background cadence, so a reading speaks for fifteen seconds and the loop is asked for no frame
+/// but the grey's; after a stir the deck holds still until a reading lands, which brings the
+/// motion back.
+#[cfg(unix)]
+#[test]
+fn a_resting_window_draws_the_deck_still() {
+    let _attached = crate::stats_deck::tests::attach_stats();
+    let t0 = Instant::now();
+    let (mut app, wid) = live_app(t0);
+    // Rest is for a window on screen: a headless instance's never rests. It is off unless set.
+    app.headless = false;
+    app.config.idle_rest_secs = Some(30.0);
+    // A reader, so the deck has an audience whose cadence the facts read.
+    let _reader = app.vitals.attach_test_reader();
+    assert_eq!(app.vitals_audience(), crate::vitals_host::Audience::Shown);
+
+    let awake = app.live_facts(wid).expect("the deck draws");
+    assert!(awake.motion, "{awake:?}");
+    assert_eq!(awake.live(t0, OPEN).beat, beat_phase(0));
+    assert_eq!(
+        awake.stale_after,
+        crate::vitals_host::FOCUSED_PERIOD * STALE_PERIODS
+    );
+    let next = app.stats_live_deadline(t0);
+    assert!(
+        next.is_some_and(|at| at > t0 && at <= t0 + FRAME),
+        "the grid's next frame: {next:?}"
+    );
+
+    app.settle_rest(Instant::now() + Duration::from_secs(60));
+    let resting = app.live_facts(wid).expect("the deck still draws");
+    assert!(!resting.motion, "{resting:?}");
+    assert_eq!(resting.live(t0, OPEN), DeckLive::STILL);
+    assert_eq!(
+        resting.stale_after,
+        crate::vitals_host::BACKGROUND_PERIOD * STALE_PERIODS
+    );
+    assert_eq!(
+        app.stats_live_deadline(t0),
+        Some(t0 + resting.stale_after),
+        "only the grey is scheduled"
+    );
+    assert_eq!(app.deck_clock_deadline(t0), None);
+    assert_eq!(
+        resting.live(t0 + Duration::from_secs(4), OPEN),
+        DeckLive::STILL,
+        "a background reading still speaks four seconds on"
+    );
+
+    let woke_at = Instant::now() + Duration::from_secs(61);
+    app.stir_rest(wid, woke_at, false);
+    let woke = app.live_facts(wid).expect("the deck draws");
+    assert!(
+        !woke.motion,
+        "the wake's own frame keeps the deck still until a reading lands: {woke:?}"
+    );
+    app.vitals.landed_at = Some(woke_at + Duration::from_millis(300));
+    let moving = app.live_facts(wid).expect("the deck draws");
+    assert!(
+        moving.motion,
+        "the reading the wake asked for brings the motion back: {moving:?}"
+    );
+}
+
 /// Lays `wid`'s deck out to its form, so its card is the height that form draws.
 #[cfg(unix)]
-fn fit_deck(app: &mut crate::App, wid: crate::WindowId) {
+pub(crate) fn fit_deck(app: &mut crate::App, wid: crate::WindowId) {
     let (_, cell) = app.win_cell_size(wid);
     let ws = app.windows.get_mut(&wid).expect("the window");
     ws.metrics.head = crate::stats_deck::reserved_deck_px(
@@ -1530,16 +1601,18 @@ fn adopt(app: &mut crate::App, share: f64, at: Instant) -> u64 {
 
 /// [`adopt`]'s needle.
 #[cfg(unix)]
-fn busier(app: &mut crate::App, share: f64, at: Instant) -> crate::stats_needle::Needle {
+pub(crate) fn busier(app: &mut crate::App, share: f64, at: Instant) -> crate::stats_needle::Needle {
     adopt(app, share, at);
     app.vitals.needle.get().expect("the reading's needle")
 }
 
-/// Follows the loop's needle deadlines from `from` while they come before `until`, drawing each
-/// of `wids` at each as the splice does: the deadlines it took.
+/// Follows the loop's deck clock deadlines from `from` while they come before `until`, as the
+/// loop drives a deck with no display link (its synthetic grid): each of `wids` draws the
+/// reading's own frame at `from`, and each frame a tick asks is drawn at the vsync the clock
+/// samples and served, as the splice draws and a present serves it: the deadlines it took.
 #[cfg(unix)]
 fn needle_deadlines(
-    app: &crate::App,
+    app: &mut crate::App,
     wids: &[crate::WindowId],
     from: Instant,
     until: Instant,
@@ -1547,12 +1620,27 @@ fn needle_deadlines(
     for &wid in wids {
         draw_needle_at(app, wid, from);
     }
-    let (mut at, mut fired) = (from, 0);
-    while let Some(next) = app.stats_needle_deadline(at).filter(|&next| next < until) {
-        at = next;
-        for &wid in wids {
-            draw_needle_at(app, wid, at);
+    let (mut now, mut fired) = (from, 0);
+    loop {
+        app.sync_deck_clocks(now);
+        let Some(at) = app.deck_clock_deadline(now).filter(|&at| at < until) else {
+            break;
+        };
+        let at = at.max(now);
+        let asked: Vec<u32> = wids
+            .iter()
+            .map(|wid| app.windows[wid].redraw_requests_for_test.get())
+            .collect();
+        app.service_deck_clocks(at);
+        for (&wid, before) in wids.iter().zip(asked) {
+            let ws = &app.windows[&wid];
+            if ws.redraw_requests_for_test.get() > before {
+                let sample = ws.deck_clock.sample_at(at, app.deck_clock_period(ws));
+                draw_needle_at(app, wid, sample);
+                app.note_deck_present(wid, at, at, 0);
+            }
         }
+        now = at;
         fired += 1;
         assert!(fired <= 1_000, "{fired} deadlines and counting");
     }
@@ -1578,12 +1666,12 @@ fn needle_app(t0: Instant, wids: &[crate::WindowId]) -> crate::App {
 }
 
 /// A reading's episode owes its window exactly the needle deadlines the loop then fires for it
-/// (`needle_frames_owed`, by which the `measure` spin row bounds the `stats_needle` owner):
-/// following the loop's own deadlines from the reading to rest, drawing each frame as the splice
-/// does, fires that many, and so does a reading that lands mid-sweep, walked from what the window
-/// drew. Two windows that draw the dial are owed a window's frames each, and the loop fires
-/// no more than both. The first reading, the same reading again and a reading no window animates
-/// owe none.
+/// (`needle_frames_owed`, by which the `measure` spin row bounds the `deck_clock` owner):
+/// following the loop's own deck clock deadlines from the reading to rest, drawing each frame
+/// as the splice does, fires that many, and so does a reading that lands mid-sweep, walked from
+/// what the window drew. Two windows that draw the dial are owed a window's frames each, and the
+/// loop fires no more than both. The first reading, the same reading again and a reading no
+/// window animates owe none.
 #[cfg(unix)]
 #[test]
 fn a_readings_owed_frames_are_the_needle_deadlines_its_windows_fire() {
@@ -1596,11 +1684,15 @@ fn a_readings_owed_frames_are_the_needle_deadlines_its_windows_fire() {
     let t1 = t0 + Duration::from_secs(1);
     let owed = adopt(&mut app, 0.95, t1);
     assert!(owed > 0, "CONTROL: a swing owes frames");
-    assert_eq!(needle_deadlines(&app, &one, t1, far), owed, "owed as fired");
+    assert_eq!(
+        needle_deadlines(&mut app, &one, t1, far),
+        owed,
+        "owed as fired"
+    );
     let t2 = t1 + Duration::from_secs(1);
     let back = adopt(&mut app, 0.10, t2);
     let mid = t2 + Duration::from_millis(150);
-    let drawn = needle_deadlines(&app, &one, t2, mid);
+    let drawn = needle_deadlines(&mut app, &one, t2, mid);
     assert!(
         drawn > 0 && drawn < back,
         "CONTROL: {drawn} of {back} drawn before the next reading"
@@ -1608,7 +1700,7 @@ fn a_readings_owed_frames_are_the_needle_deadlines_its_windows_fire() {
     let again = adopt(&mut app, 0.95, mid);
     assert!(again > 0, "CONTROL: it sweeps on from mid-sweep");
     assert_eq!(
-        needle_deadlines(&app, &one, mid, far),
+        needle_deadlines(&mut app, &one, mid, far),
         again,
         "owed as fired, mid-sweep"
     );
@@ -1628,7 +1720,7 @@ fn a_readings_owed_frames_are_the_needle_deadlines_its_windows_fire() {
         2 * owed,
         "a window's frames each"
     );
-    let fired = needle_deadlines(&both, &two, t1, far);
+    let fired = needle_deadlines(&mut both, &two, t1, far);
     assert!(
         (owed..=2 * owed).contains(&fired),
         "{fired} deadlines for two windows owed {owed} each"
@@ -1636,9 +1728,10 @@ fn a_readings_owed_frames_are_the_needle_deadlines_its_windows_fire() {
 }
 
 /// One needle for the app, retargeted where a reading is adopted: the first reading rests it on
-/// the dial, a busier one sweeps it on its own deadline (`stats_needle`, serious mode or not) from
-/// where it stood; a window without motion draws the reading and asks nothing, and a reading no
-/// window animates rests it; a layout that adds, drops or resizes the dial rests it too.
+/// the dial, a busier one sweeps it on the window's deck clock (`deck_clock`, serious mode or
+/// not) from where it stood; a window without motion draws the reading and asks nothing, and a
+/// reading no window animates rests it; a layout that adds, drops or resizes the dial rests it
+/// too, and owes the one frame that draws the reading.
 #[cfg(unix)]
 #[test]
 fn the_app_retargets_one_needle_and_rests_it_where_it_must() {
@@ -1659,8 +1752,9 @@ fn the_app_retargets_one_needle_and_rests_it_where_it_must() {
         Needle::at_rest(t0, first.target()),
         "the first reading rests"
     );
-    assert_eq!(app.stats_needle_deadline(t0), None);
-    // A busier reading sweeps it from where it stood, on its own deadline.
+    let _ = app.stats_deck_fp(wid);
+    assert_eq!(app.deck_clock_deadline(t0), None);
+    // A busier reading sweeps it from where it stood, on the window's deck clock.
     let t1 = t0 + Duration::from_secs(1);
     let hot = busier(&mut app, 0.95, t1);
     assert!(
@@ -1668,14 +1762,33 @@ fn the_app_retargets_one_needle_and_rests_it_where_it_must() {
         "CONTROL: {first:?} then {hot:?}"
     );
     assert_eq!((hot.tip.x0, hot.tip.v0), (first.tip.target, 0.0));
+    let period = app.deck_clock_period(&app.windows[&wid]);
+    assert_eq!(
+        app.deck_clock_deadline(t1),
+        Some(crate::stats_clock::grid_ceil(t1, period)),
+        "the sweep's first frame is due on the clock's next vsync"
+    );
+    let _ = draw_needle_at(&app, wid, t1);
     let next = app
-        .stats_needle_deadline(t1)
+        .deck_clock_deadline(t1)
         .expect("the needle asks a frame");
-    let interval = app.windows[&wid].effect_present_interval();
+    let facts = app.live_facts(wid).expect("the deck draws");
+    let (n, view) = facts.needle.expect("a needle");
+    assert_eq!(
+        view.interval, period,
+        "the needle's interval: one period of the window's clock"
+    );
+    let own = n
+        .next_after(
+            view,
+            facts.drawn.and_then(|d| d.frame).expect("a frame drawn"),
+        )
+        .expect("the sweep's next frame");
+    assert!(own >= t1 + view.interval, "never sooner than the interval");
     assert_eq!(
         next,
-        t1 + interval,
-        "a large swing runs at the window's rate"
+        crate::stats_clock::grid_ceil(own, period),
+        "the needle's own next frame, on the clock's vsync at or after it"
     );
     let facts = app.live_facts(wid).expect("the deck draws");
     assert!(facts.live(t1, OPEN).needle.is_some());
@@ -1686,14 +1799,14 @@ fn the_app_retargets_one_needle_and_rests_it_where_it_must() {
     );
     app.serious_mode = true;
     assert_eq!(
-        app.stats_needle_deadline(t1),
+        app.deck_clock_deadline(t1),
         Some(next),
         "serious mode keeps the needle"
     );
     app.serious_mode = false;
     // Without motion the window draws the reading and asks nothing, and a reading rests it.
     app.config.motion = Some("reduced".into());
-    assert_eq!(app.stats_needle_deadline(t1), None);
+    assert_eq!(app.deck_clock_deadline(t1), None);
     let reduced = app.live_facts(wid).expect("the deck draws");
     assert_eq!(reduced.live(t1, OPEN).needle, None);
     let t2 = t1 + Duration::from_secs(1);
@@ -1706,10 +1819,7 @@ fn the_app_retargets_one_needle_and_rests_it_where_it_must() {
     app.config.motion = None;
     let t3 = t2 + Duration::from_secs(1);
     let swing = busier(&mut app, 0.95, t3);
-    assert!(
-        app.stats_needle_deadline(t3).is_some(),
-        "CONTROL: it sweeps"
-    );
+    assert!(app.deck_clock_deadline(t3).is_some(), "CONTROL: it sweeps");
     // The other form's dial is another size: the needle rests on its reading at once.
     let ws = app.windows.get_mut(&wid).expect("the window");
     ws.deck_form = match ws.deck_form {
@@ -1727,10 +1837,11 @@ fn the_app_retargets_one_needle_and_rests_it_where_it_must() {
     assert_eq!(rested.target(), swing.target());
     assert_eq!((rested.tip.x0, rested.tip.v0), (swing.target().0, 0.0));
     assert_eq!(
-        app.stats_needle_deadline(t3),
+        draw_needle_at(&app, wid, t3),
         None,
         "a resized dial draws the reading"
     );
+    assert_eq!(app.deck_clock_deadline(t3), None, "and asks nothing more");
 }
 
 /// What window `wid` draws of the needle at `at`, kept as what it drew as the splice keeps it
@@ -1746,7 +1857,7 @@ fn draw_needle_at(app: &crate::App, wid: crate::WindowId, at: Instant) -> Option
 /// A window never draws the needle back where it already stood
 /// (`docs/DESIGN-stats-deck-now-left-2026-10-26.md` §4.2). One whose motion goes mid-sweep
 /// (`motion = "reduced"`, the focus moving to another window) draws the reading, and keeps it
-/// when its motion comes back before the next reading; one whose effect interval changes
+/// when its motion comes back before the next reading; one whose deck frame interval changes
 /// mid-sweep moves the needle on from the frame it drew. The splice keeps what each layout drew.
 /// A window that kept nothing of what it drew would draw the needle back mid-sweep (the CONTROL).
 #[cfg(unix)]
@@ -1815,17 +1926,17 @@ fn a_window_never_draws_the_needle_back_where_it_stood() {
                 None,
                 "{lose}: motion back at {m} ms draws the reading still"
             );
-            assert_eq!(app.stats_needle_deadline(ms(m)), None, "{lose}: {m} ms");
+            assert_eq!(app.deck_clock_deadline(ms(m)), None, "{lose}: {m} ms");
         }
     }
-    // A sweep whose window's effect interval halves, then doubles back, mid-way.
+    // A sweep whose window's deck frame interval halves, then doubles back, mid-way.
     at += Duration::from_secs(1);
     let n = busier(&mut app, share, at);
     let target = n.target().0;
     let set_rate = |app: &mut crate::App, us: u64| {
         let ws = app.windows.get_mut(&wid).expect("the window");
         ws.frame_interval = Some(Duration::from_micros(us));
-        ws.effect_present_interval()
+        app.deck_frame_interval(&app.windows[&wid])
     };
     let fast = set_rate(&mut app, 8_333);
     let mut nearest = f64::MAX;
@@ -2239,6 +2350,8 @@ fn the_app_steams_only_a_hot_dial_presented_alone_where_motion_is_allowed() {
         fp: 1,
         geom: 1,
         raster_fingerprint_once: std::sync::OnceLock::new(),
+        serial: 0,
+        delta: None,
         scrim: None,
     });
     assert!(!steams(&app), "a card over the deck takes the steam");

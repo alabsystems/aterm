@@ -220,10 +220,16 @@ mod imp {
         crate::process_path(pid).map(|p| p.as_os_str().as_bytes().to_vec())
     }
 
+    const MAX_VIS_BYTES: usize = 1024 * 1024;
+
     pub(super) fn vis(text: &[u8], locale: Locale) -> Option<String> {
+        if text.len() > MAX_VIS_BYTES {
+            return None;
+        }
         let src = CString::new(text).ok()?;
         let loc = ctype(locale)?;
-        let mut dst = vec![0u8; text.len() * 8 + 1];
+        let cap = text.len().checked_mul(8)?.checked_add(1)?;
+        let mut dst = vec![0u8; cap];
         // SAFETY: `loc` is a live locale object; the previous one is put back
         // below, on this thread, before anything else runs on it.
         let previous = unsafe { uselocale(loc) };

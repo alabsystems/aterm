@@ -312,7 +312,9 @@ fn a_drawn_frame_prints_its_ledger_and_a_held_frame_none() {
 }
 
 /// `live <level>` previews its level on a frame the latch admits, a light configured scheme over
-/// a light page, and on no other: a dark scheme's frames stay `light=0` at every level.
+/// a light page, and on no other: a dark scheme's frames stay `light=0` at every level. The
+/// dump's window draws at 1x, its 12 px face laying its thinnest glyph with no pixel near the
+/// full ink, so every light it latches is sheer (`Light::on_page`, §15.8 amendment 53).
 #[test]
 fn live_lights_only_what_the_latch_admits() {
     let lit = |theme: &str, live: &str| {
@@ -340,9 +342,18 @@ fn live_lights_only_what_the_latch_admits() {
     let set = |words: &[&str]| words.iter().map(|w| (*w).to_string()).collect();
     let paper = "#2b2d33 #f6f7f9";
     let dark = "#d0d0d0 #111318";
-    assert_eq!(lit(paper, ""), (set(&["light=1"]), (1, 0)));
-    assert_eq!(lit(paper, "live glass\n"), (set(&["light=3"]), (1, 1)));
-    assert_eq!(lit(paper, "live vanish\n"), (set(&["light=31"]), (1, 4)));
+    use aterm_effects::cursor_glow::{Light, Live};
+    let word = |live: Live| format!("light={}", Light::at(live).on_page(false).bits());
+    // A script with no `live` line lights at the shipped level.
+    let shipped = aterm_effects::rainbow_kitty::prism_glass::LIVE;
+    assert_eq!(
+        lit(paper, ""),
+        (set(&[&word(shipped)]), (1, shipped as u64))
+    );
+    assert_eq!(lit(paper, "live off\n"), (set(&["light=33"]), (1, 0)));
+    assert_eq!(lit(paper, "live glass\n"), (set(&["light=35"]), (1, 1)));
+    assert_eq!(lit(paper, "live vanish\n"), (set(&["light=63"]), (1, 4)));
+    assert_eq!(word(Live::Vanish), "light=63");
     assert_eq!(
         lit(dark, "live vanish\n"),
         (set(&["light=0"]), (0, 4)),
@@ -450,6 +461,50 @@ fn grid_parses() {
 #[test]
 fn font_parses() {
     assert_eq!(one("font 17.5"), Stmt::Setup(Setup::Font(17.5)));
+}
+
+#[test]
+fn scale_parses() {
+    assert_eq!(one("scale 2"), Stmt::Setup(Setup::Scale(2.0)));
+    assert_eq!(one("scale 1.5"), Stmt::Setup(Setup::Scale(1.5)));
+    assert!(statement("scale 0").is_err());
+    assert!(statement("scale 5").is_err());
+    assert!(statement("scale").is_err());
+}
+
+/// `scale 2` lays the window on a Retina display, as the lab's instances do: its frame twice the
+/// 1x frame's size each way, and a light scheme's frames light the glass, where the 1x window's
+/// light is sheer: its face lays no glyph's darkest pixel at the full ink
+/// (`host::PageFacts::glass`, `docs/design/PRISM-GLASS.md` §15.8 amendment 53).
+#[test]
+fn scale_two_lays_twice_the_frame() {
+    use aterm_effects::cursor_glow::{Light, Live};
+    let frame0 = |head: &str| {
+        let text = dumped(&format!(
+            "{head}grid 6 40\nstyle rainbow kitty\nhz 60\ntheme #2b2d33 #f6f7f9\n\
+             live glass\nat 0 pty \"$ \"\nrun 50\n"
+        ));
+        let lights: std::collections::BTreeSet<String> = text
+            .lines()
+            .filter(|l| l.starts_with("F "))
+            .filter_map(|l| l.split(' ').find(|w| w.starts_with("light=")))
+            .map(str::to_string)
+            .collect();
+        let px = text
+            .lines()
+            .find_map(|l| l.strip_prefix("  px "))
+            .and_then(|p| p.split(':').next())
+            .and_then(|wh| wh.split_once('x'))
+            .map(|(w, h)| (w.parse::<u32>().expect("w"), h.parse::<u32>().expect("h")))
+            .expect("frame 0's size");
+        (lights, px)
+    };
+    let word = |glass: bool| format!("light={}", Light::at(Live::Glass).on_page(glass).bits());
+    let (one_x, small) = frame0("");
+    let (two_x, big) = frame0("scale 2\n");
+    assert_eq!(one_x, [word(false)].into(), "1x: sheer");
+    assert_eq!(two_x, [word(true)].into(), "2x: the glass");
+    assert_eq!(big, (2 * small.0, 2 * small.1), "2x lays twice 1x's frame");
 }
 
 #[test]

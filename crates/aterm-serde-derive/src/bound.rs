@@ -50,6 +50,8 @@ pub fn with_bound(
     impl FindTyParams {
         fn visit_field(&mut self, field: &crate::ast::Field) {
             if let Ty::Path(ty) = attr::ungroup(&field.ty_tree)
+                && ty.qself.is_none()
+                && !ty.leading_colon
                 && ty.segments.len() > 1
                 && self
                     .all_type_params
@@ -66,7 +68,7 @@ pub fn with_bound(
             {
                 return;
             }
-            if !path.leading_colon && path.segments.len() == 1 {
+            if path.qself.is_none() && !path.leading_colon && path.segments.len() == 1 {
                 let id = path.segments[0].ident.to_string();
                 if self.all_type_params.contains(&id) {
                     self.relevant_type_params.insert(id);

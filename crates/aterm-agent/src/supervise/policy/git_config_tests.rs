@@ -18,9 +18,20 @@ impl Scratch {
 }
 
 fn git(dir: &Path, args: &[&str]) {
+    let mut cmd = Command::new(crate::test_program::git());
+    // The kept copy of Apple Git finds no `libexec/git-core` beside itself, so
+    // its scripted commands (`git submodule`) and init templates need the path
+    // named (`crate::test_program::git_exec_path`, as in repo_work's helper).
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let Some(exec_path) = crate::test_program::git_exec_path() {
+        cmd.env("GIT_EXEC_PATH", exec_path);
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let Some(template_dir) = crate::test_program::git_template_dir() {
+        cmd.env("GIT_TEMPLATE_DIR", template_dir);
+    }
     let out = aterm_uds::deadline::output_until(
-        Command::new(aterm_uds::os_path!("git"))
-            .args(args)
+        cmd.args(args)
             .current_dir(dir)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null"),
@@ -91,6 +102,35 @@ fn a_git_read_runs_in_the_cwd_and_every_directory_the_line_names() {
     assert!(bare.contains(&PathBuf::from("/Users//o")), "{bare:?}");
     let quoted = dirs("git -C \"my dir\" status");
     assert_eq!(quoted, [PathBuf::from("/w/p/my dir")]);
+    let led = dirs("cd ./sub && git status");
+    assert!(led.contains(&PathBuf::from("/w/p/sub")), "{led:?}");
+}
+
+/// A `cd` target bash and zsh may look up in a `CDPATH` (zsh's `cdpath`, which the worker's
+/// environment or a `.zshenv` may set) may land anywhere, so a git read after it is refused;
+/// `cd ./sub`, `cd ..` and a rooted target are not looked up.
+#[test]
+fn a_git_read_after_a_cd_a_cdpath_may_place_is_refused() {
+    for line in [
+        "cd sub && git status",
+        "pushd sub && git log -1",
+        "cd a/b; git status",
+    ] {
+        let why = git_reads(line, &[PathBuf::from("/w")], Some(Path::new("/h"))).expect_err(line);
+        assert!(why.contains("CDPATH"), "{line}: {why}");
+    }
+    // NEGATIVE CONTROL
+    for line in [
+        "cd ./sub && git status",
+        "cd ../r && git status",
+        "cd /r && git status",
+        "cd ~/r && git status",
+    ] {
+        assert!(
+            git_reads(line, &[PathBuf::from("/w")], Some(Path::new("/h"))).is_ok(),
+            "{line}"
+        );
+    }
 }
 
 #[test]
@@ -162,6 +202,7 @@ fn a_git_behind_a_wrapper_is_still_placed() {
     );
     assert_eq!(dirs("env -iC.. git status"), [PathBuf::from("/w")]);
     assert_eq!(dirs("env -C /r git -C x log"), [PathBuf::from("/r/x")]);
+    assert_eq!(dirs("env -C /r git -Cx log"), [PathBuf::from("/r/x")]);
     assert!(dirs("for i in 1 2; do cd /r && git status; done").contains(&PathBuf::from("/r")));
     assert_eq!(
         git_reads("grep -rn git src", &[PathBuf::from("/w")], None),
@@ -174,9 +215,14 @@ fn a_git_this_check_cannot_place_is_refused() {
     for line in [
         "echo . | xargs -I {} git -C {} status",
         "echo . | xargs -0I{} git -C {} status",
+        "echo . | xargs -0I {} git -C {} status",
+        "echo . | xargs -I {} git -C{} status",
         "echo . | xargs -I {} env -C {} git status",
         "env -C \"$D\" git status",
         "env -C $(mktemp -d) git status",
+        "git -C\"$D\" log",
+        "git -c core.fsmonitor=evil status",
+        "git -ccore.fsmonitor=evil status",
         "env -S 'git status'",
         "env -P /tmp/evil git status",
         "while true; do cd ..; git status; done",
@@ -394,6 +440,7 @@ fn an_executable_post_index_change_hook_is_seen() {
     use std::os::unix::fs::PermissionsExt;
     let r = repo("hook");
     let hook = r.0.path().join(".git/hooks/post-index-change");
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
     std::fs::write(&hook, "#!/bin/sh\ntouch /tmp/aterm-git-config-pwn\n").unwrap();
     std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o644)).unwrap();
     assert_eq!(
@@ -709,7 +756,7 @@ fn what_only_git_config_reads_does_not_hide_the_effective_config() {
     let empty = r.0.path().join("empty.cfg");
     std::fs::write(&empty, "").unwrap();
     let hidden = aterm_uds::deadline::output_until(
-        Command::new(aterm_uds::os_path!("git"))
+        Command::new(crate::test_program::git())
             .args(["config", "--list"])
             .current_dir(r.0.path())
             .env("GIT_CONFIG", &empty),
@@ -1091,4 +1138,36 @@ fn a_value_class_reads_as_its_values() {
         assert_eq!(is_false(class.as_deref()), is_false(*v), "{v:?}");
         assert_eq!(is_true(class.as_deref()), is_true(*v), "{v:?}");
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_tests_worker_path_is_its_git_and_the_system_not_the_runners_toolchain() {
+    use std::os::unix::fs::PermissionsExt;
+    let toolchain = Scratch::new("toolchain");
+    let gitbin = Scratch::new("gitbin");
+    let git = gitbin.0.path().join("git");
+    std::fs::write(&git, "#!/bin/sh\n").expect("git");
+    std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let runner = std::env::join_paths([toolchain.0.path(), gitbin.0.path(), Path::new("/usr/bin")])
+        .expect("join");
+    let path = worker_path_from(Some(&runner));
+    let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+    assert_eq!(
+        dirs.first().map(PathBuf::as_path),
+        Some(gitbin.0.path()),
+        "{path}"
+    );
+    assert!(!dirs.iter().any(|d| d == toolchain.0.path()), "{path}");
+    assert_eq!(
+        dirs.iter()
+            .filter(|d| d.as_path() == Path::new("/usr/bin"))
+            .count(),
+        1,
+        "{path}"
+    );
+    // CONTROL: a runner PATH with no git leaves only the system's directories.
+    let bare = worker_path_from(Some(toolchain.0.path().as_os_str()));
+    assert_eq!(bare, "/usr/bin:/bin:/usr/sbin:/sbin");
+    assert_eq!(worker_path_from(None), bare);
 }

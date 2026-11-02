@@ -71,16 +71,14 @@ impl Bell {
 
     /// Wait at most `most` for a ring: the one that came, or [`Wake::Timer`].
     pub fn nap(&self, most: Duration) -> Wake {
-        let deadline = Instant::now().checked_add(most);
+        const MAX_NAP: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+        let deadline = Instant::now() + most.min(MAX_NAP);
         let mut rung = self.rung.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
             if let Some(why) = rung.take() {
                 return why;
             }
-            let left = match deadline {
-                Some(deadline) => deadline.saturating_duration_since(Instant::now()),
-                None => most,
-            };
+            let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 return Wake::Timer;
             }
@@ -182,6 +180,15 @@ mod tests {
         bell.ring(Wake::Put);
         assert_eq!(bell.clear(), Some(Wake::Put));
         assert_eq!(bell.nap(Duration::from_millis(10)), Wake::Timer);
+        let max_ringer = {
+            let bell = Arc::clone(&bell);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(10));
+                bell.ring(Wake::Put);
+            })
+        };
+        assert_eq!(bell.nap(Duration::MAX), Wake::Put);
+        max_ringer.join().expect("rang max");
     }
 
     /// A source heard rings its bell each time it says a change came, and its thread ends once

@@ -273,7 +273,7 @@ fn tree_bytes(dir: &Path) -> u64 {
                 #[cfg(not(unix))]
                 let first = seen.insert(e.path());
                 if first {
-                    total += meta.len();
+                    total = total.saturating_add(meta.len());
                 }
             }
         }
@@ -326,7 +326,9 @@ pub fn pack_build(ctx: &Ctx, program: &str, dir: &Path, compiler_moved: bool) ->
         if !taken {
             return Ok(b);
         }
-        b += 1;
+        b = b.checked_add(1).ok_or_else(|| {
+            Error::refused(format!("{program}: build number overflowed u64::MAX"))
+        })?;
     }
 }
 
@@ -816,10 +818,10 @@ pub fn publish_group(
     } else {
         Signing::Unsigned
     };
-    let next = pf
-        .floor
-        .as_ref()
-        .map_or_else(|| "?".to_string(), |f| (f.index_build + 1).to_string());
+    let next = pf.floor.as_ref().map_or_else(
+        || "?".to_string(),
+        |f| f.index_build.saturating_add(1).to_string(),
+    );
     let flags = format!(
         "{}{}",
         if signing == Signing::Unsigned {
@@ -1014,7 +1016,7 @@ fn write_ready(
         seal = ctx.shown(&req.seal),
     );
     let path = out.join("READY.md");
-    std::fs::write(&path, text).map_err(|e| Error::io(format!("write {}", path.display()), &e))
+    crate::lane::report::write_atomic(&path, &text)
 }
 
 /// Parses `atpkg-publish publish-group` CLI arguments into a [`GroupRequest`].

@@ -243,11 +243,19 @@ fn only_the_supplied_roster_target_can_complete_its_pending_report() {
     let store = Store::at(root.path()).bounded_by(&[]);
     store
         .transact_logins(NOW, &mut None, |state, logins| {
-            Ok(note_renewed(state, logins, "main", None, "/old", None, NOW))
+            Ok(note_renewed(
+                state,
+                logins,
+                "main",
+                None,
+                at!("/old"),
+                None,
+                NOW,
+            ))
         })
         .unwrap();
     let path = root.path().join("accounts.toml");
-    let target = append_row("", "main", Class::Dedicated, Some("/old")).unwrap();
+    let target = append_row("", "main", Class::Dedicated, Some(at!("/old"))).unwrap();
     pause(&store, || {
         let held = store.acquire().unwrap();
         store.transact_sync_held(

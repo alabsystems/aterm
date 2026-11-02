@@ -147,7 +147,7 @@ pub fn chroma(c: [u8; 3]) -> f64 {
     clippy::excessive_precision,
     clippy::unreadable_literal,
     clippy::many_single_char_names,
-    reason = "Björn Ottosson's published `OkLab` matrices, digit for digit, in his names"
+    reason = "Björn Ottosson's published `OkLab` matrices, digit for digit, and variable names"
 )]
 pub fn oklch(c: [u8; 3]) -> (f64, f64, f64) {
     let [r, g, b] = c.map(lin);

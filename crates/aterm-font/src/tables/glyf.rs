@@ -264,13 +264,6 @@ pub(crate) struct GlyphPointsIter<'a> {
     pub points_left: u16, // Number of points left in the glyph.
 }
 
-impl GlyphPointsIter<'_> {
-    #[inline]
-    pub fn current_contour(&self) -> u16 {
-        self.endpoints.index.saturating_sub(1)
-    }
-}
-
 impl<'a> Iterator for GlyphPointsIter<'a> {
     type Item = GlyphPoint;
 

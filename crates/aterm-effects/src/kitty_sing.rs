@@ -385,16 +385,21 @@ impl KittySing {
             self.count = 1;
         }
         self.last = Some(now);
-        let threshold = if self.wind_from.is_some() && self.has_drive(now) {
-            KEY_SWITCH_REPS
-        } else {
-            SING_ARM_REPEATS
-        };
-        if self.count >= threshold && (self.armed_at.is_none() || self.wind_from.is_some()) {
-            self.armed_at = Some(now);
-            self.wind_from = None;
-            self.external = None;
-            self.fan_bar = None;
+        const {
+            assert!(KEY_SWITCH_REPS <= SING_ARM_REPEATS);
+        }
+        if self.count >= KEY_SWITCH_REPS && (self.armed_at.is_none() || self.wind_from.is_some()) {
+            let threshold = if self.wind_from.is_some() && self.has_drive(now) {
+                KEY_SWITCH_REPS
+            } else {
+                SING_ARM_REPEATS
+            };
+            if self.count >= threshold {
+                self.armed_at = Some(now);
+                self.wind_from = None;
+                self.external = None;
+                self.fan_bar = None;
+            }
         }
     }
 
@@ -559,18 +564,14 @@ impl KittySing {
         let ext = self.external?;
         let wind = self.wind_start(now);
         if wind.is_none()
-            && let Some(anchor) = self.armed_at
+            && let (Some(anchor), Some(bar)) = (self.armed_at, self.raw_bar(now))
+            && bar < u64::from(ext.bars)
         {
-            const INV_SING_BAR_SECONDS: f32 = 1.0 / SING_BAR_SECONDS;
-            let bar =
-                (now.saturating_duration_since(anchor).as_secs_f32() * INV_SING_BAR_SECONDS) as u64;
-            if bar < u64::from(ext.bars) {
-                if self.fan_bar != Some(bar) {
-                    return Some(now);
-                }
-                let next = anchor + Duration::from_secs_f32(SING_BAR_SECONDS * (bar + 1) as f32);
-                return Some(next.min(ext.ends_at).max(now + Duration::from_micros(1)));
+            if self.fan_bar != Some(bar) {
+                return Some(now);
             }
+            let next = anchor + Duration::from_secs_f32(SING_BAR_SECONDS * (bar + 1) as f32);
+            return Some(next.min(ext.ends_at).max(now + Duration::from_micros(1)));
         }
         let release = wind.unwrap_or(ext.ends_at);
         if !ext.outro_taken {

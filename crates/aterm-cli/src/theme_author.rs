@@ -1058,14 +1058,29 @@ mod tests {
     use crate::theme_cmd::tests::NEVER_LISTS;
     use std::path::PathBuf;
 
-    fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-cli-theme-author-{tag}-{}-{}",
-            std::process::id(),
-            aterm_time::since_epoch().map_or(0, |d| d.as_nanos())
-        ));
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        dir
+    struct ScratchDir(aterm_tempfile::TempDir);
+
+    impl std::ops::Deref for ScratchDir {
+        type Target = Path;
+
+        fn deref(&self) -> &Self::Target {
+            self.0.path()
+        }
+    }
+
+    impl AsRef<Path> for ScratchDir {
+        fn as_ref(&self) -> &Path {
+            self.0.path()
+        }
+    }
+
+    fn scratch(tag: &str) -> ScratchDir {
+        ScratchDir(
+            aterm_tempfile::Builder::new()
+                .prefix(&format!("aterm-cli-theme-author-{tag}-"))
+                .tempdir()
+                .expect("scratch dir"),
+        )
     }
 
     fn args(list: &[&str]) -> Vec<OsString> {
@@ -1336,7 +1351,8 @@ mod tests {
 
     #[test]
     fn new_writes_a_theme_that_round_trips() {
-        let dir = scratch("new").join("themes");
+        let hold = scratch("new");
+        let dir = hold.join("themes");
         let read = |out: &Outcome| {
             assert_eq!(out.code, 0, "{out:?}");
             let path = PathBuf::from(out.stdout.trim_end());
@@ -1696,7 +1712,8 @@ mod tests {
         let parsed = scheme::parse_theme_str(&out.stdout).expect("exported");
         assert_eq!(parsed.typography, host.0.theme.typography);
         assert_eq!(parsed.bold_is_bright, Some(false));
-        let dir = scratch("type-new").join("themes");
+        let hold = scratch("type-new");
+        let dir = hold.join("themes");
         let made = run(
             &args(&["new", "Desk", "--from", "Studio"]),
             Some(&dir),

@@ -77,13 +77,36 @@ fn refused_at(step: &'static str) -> io::Error {
 
 #[cfg(test)]
 fn endpoint(dir: &Path) -> io::Result<listener::ListenerId> {
-    endpoint_named(dir, NAME)
+    endpoint_at(dir, &socket_path(dir, NAME)?)
 }
 
-fn endpoint_named(dir: &Path, name: &str) -> io::Result<listener::ListenerId> {
+/// Long configuration paths keep their history in place and use a short,
+/// same-user socket name derived from the canonical history directory.
+fn socket_path(dir: &Path, name: &str) -> io::Result<PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+
     private_file::check_private_dir(dir)?;
-    let path = dir.join(name);
-    let metadata = std::fs::symlink_metadata(&path)?;
+    let canonical = std::fs::canonicalize(dir)?;
+    let direct = canonical.join(name);
+    if std::os::unix::net::SocketAddr::from_pathname(&direct).is_ok() {
+        return Ok(direct);
+    }
+    let digest = aterm_digest::Sha256::digest(canonical.as_os_str().as_bytes());
+    let short = PathBuf::from(format!("/tmp/.aterm-o{}", peer::our_uid())).join(format!(
+        "{}-{name}",
+        aterm_codec::hex::encode_lower(&digest)
+    ));
+    std::os::unix::net::SocketAddr::from_pathname(&short)?;
+    Ok(short)
+}
+
+fn endpoint_at(dir: &Path, path: &Path) -> io::Result<listener::ListenerId> {
+    private_file::check_private_dir(dir)?;
+    let parent = path.parent().ok_or_else(refused)?;
+    if parent != dir {
+        private_file::check_private_dir(parent)?;
+    }
+    let metadata = std::fs::symlink_metadata(path)?;
     if !metadata.file_type().is_socket()
         || metadata.uid() != peer::our_uid()
         || metadata.mode() & 0o777 != 0o600
@@ -98,7 +121,7 @@ pub(super) struct Server {
     wake: Option<CtlStream>,
     task: Option<JoinHandle<()>>,
     dir: PathBuf,
-    name: &'static str,
+    path: PathBuf,
     identity: listener::ListenerId,
 }
 
@@ -135,15 +158,22 @@ impl Server {
     }
 
     fn start_named(dir: &Path, name: &'static str, source: ObservationHandle) -> io::Result<Self> {
+        Self::start_at(dir, source, socket_path(dir, name)?)
+    }
+
+    fn start_at(dir: &Path, source: ObservationHandle, path: PathBuf) -> io::Result<Self> {
         private_file::check_private_dir(dir)?;
-        let path = dir.join(name);
+        let parent = path.parent().ok_or_else(refused)?;
+        if parent != dir {
+            private_file::create_private_dir(parent)?;
+        }
         match std::fs::symlink_metadata(&path) {
             Ok(_) => {
-                let previous = endpoint_named(dir, name)?;
+                let previous = endpoint_at(dir, &path)?;
                 // Never replace a listener which is still accepting connections.
                 if !aterm_uds::connect::until(&path, Instant::now() + EXCHANGE)
                     .is_err_and(|error| stale(&error))
-                    || endpoint_named(dir, name)? != previous
+                    || endpoint_at(dir, &path)? != previous
                     || listener::names_now(&path, previous) != listener::Named::Same
                 {
                     return Err(refused());
@@ -153,21 +183,19 @@ impl Server {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        let socket = CtlListener::bind(&path)?;
+        let socket = aterm_uds::kept_out(|| CtlListener::bind(&path))?;
         let bound = BoundSocket {
             identity: listener::listener_read(&path)?.ok_or_else(refused)?,
             path: path.clone(),
         };
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        aterm_uds::keep_out_of_children(&socket)?;
         socket.set_nonblocking(true)?;
-        if endpoint_named(dir, name)? != bound.identity {
+        if endpoint_at(dir, &path)? != bound.identity {
             return Err(refused());
         }
-        let (wake_read, wake_write) = CtlStream::pair()?;
-        aterm_uds::keep_out_of_children(&wake_read)?;
-        aterm_uds::keep_out_of_children(&wake_write)?;
+        let (wake_read, wake_write) = aterm_uds::kept_out(CtlStream::pair)?;
         let identity = bound.identity;
+        let kept_path = path.clone();
         let task = thread::Builder::new()
             .name("network-observer-read".into())
             .spawn(move || {
@@ -177,10 +205,9 @@ impl Server {
                     {
                         break;
                     }
-                    match socket.accept() {
+                    match aterm_uds::kept_out(|| socket.accept()) {
                         Ok((mut client, _)) => {
-                            if aterm_uds::keep_out_of_children(&client).is_ok()
-                                && client.set_nonblocking(false).is_ok()
+                            if client.set_nonblocking(false).is_ok()
                                 && peer::peer_uid(&client) == Some(peer::our_uid())
                             {
                                 let _ = serve(&mut client, &source);
@@ -201,14 +228,14 @@ impl Server {
             wake: Some(wake_write),
             task: Some(task),
             dir: dir.to_owned(),
-            name,
+            path: kept_path,
             identity,
         })
     }
 
     pub(super) fn is_running(&self) -> bool {
         self.task.as_ref().is_some_and(|task| !task.is_finished())
-            && endpoint_named(&self.dir, self.name).is_ok_and(|identity| identity == self.identity)
+            && endpoint_at(&self.dir, &self.path).is_ok_and(|identity| identity == self.identity)
     }
 }
 
@@ -321,9 +348,28 @@ fn read_named(config: &Path, name: &str) -> io::Result<Publication> {
     let requested = Instant::now();
     let deadline = requested + EXCHANGE;
     let dir = directory(config);
-    let bound = endpoint_named(&dir, name).map_err(|error| context("endpoint", error))?;
-    let mut client = aterm_uds::connect::until(&dir.join(name), deadline)
-        .map_err(|error| context("connect", error))?;
+    let path = socket_path(&dir, name).map_err(|error| context("endpoint", error))?;
+    let result = read_at(&dir, &path, requested, deadline);
+    let legacy = dir.join(name);
+    if result.as_ref().is_err_and(stale)
+        && legacy != path
+        && std::os::unix::net::SocketAddr::from_pathname(&legacy).is_ok()
+    {
+        // An older owner may have bound through a short alias of this directory.
+        return read_at(&dir, &legacy, requested, deadline);
+    }
+    result
+}
+
+fn read_at(
+    dir: &Path,
+    path: &Path,
+    requested: Instant,
+    deadline: Instant,
+) -> io::Result<Publication> {
+    let bound = endpoint_at(dir, path).map_err(|error| context("endpoint", error))?;
+    let mut client =
+        aterm_uds::connect::until(path, deadline).map_err(|error| context("connect", error))?;
     if peer::peer_uid(&client) != Some(peer::our_uid()) {
         return Err(refused_at("peer-user"));
     }
@@ -347,8 +393,8 @@ fn read_named(config: &Path, name: &str) -> io::Result<Publication> {
     let mut publication =
         decode_publication(&wire, now, requested).map_err(|error| context("snapshot", error))?;
     if aterm_uds::process::read_birth(native_pid) != Some(birth)
-        || endpoint_named(&dir, name).map_err(|error| context("endpoint-recheck", error))? != bound
-        || listener::names_now(dir.join(name), bound) != listener::Named::Same
+        || endpoint_at(dir, path).map_err(|error| context("endpoint-recheck", error))? != bound
+        || listener::names_now(path, bound) != listener::Named::Same
     {
         return Err(refused_at("endpoint-changed"));
     }
@@ -424,6 +470,22 @@ fn live_decode(wire: &[u8], now: u64) -> io::Result<NetworkObservation> {
     live_decode_parts(wire, now).map(|(observation, _, _)| observation)
 }
 
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbRelayHistory",
+        action = "Read",
+        project = "aterm_db::network_state::relay::history_conformance::relay_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "DbRelayHistory",
+        action = "Case",
+        reason = "The native fixture chooses retained history, current clocks, source sample age and contact lease"
+    )
+)]
 fn decode_publication(wire: &[u8], now: u64, requested: Instant) -> io::Result<Publication> {
     let (observation, age_ms, contact_ages) = live_decode_parts(wire, now)?;
     let at = requested
@@ -537,10 +599,10 @@ fn live_decode_parts(
             Some(value) => Some(value.as_u64().ok_or_else(|| refused_at("peer-check"))?),
             None => return Err(refused_at("peer-check")),
         };
-        if peer.first_seen_ms > peer.last_seen_ms
-            || peer.last_seen_ms > now
-            || peer.last_checked_ms.is_some_and(|at| at > now)
-            || peer.samples.iter().any(|sample| sample.at_ms > now)
+        // Retained contacts and samples stay in observation order across wall-clock rollback.
+        // Only a claim of current reachability needs current contact/check timestamps.
+        if peer.reachability == Reachability::Reachable
+            && (peer.last_seen_ms > now || peer.last_checked_ms.is_some_and(|at| at > now))
         {
             return Err(refused_at("peer-clock"));
         }
@@ -554,6 +616,10 @@ fn live_decode_parts(
     }
     Ok((observation, age_ms, contact_ages))
 }
+
+#[cfg(test)]
+#[path = "relay_history_conformance.rs"]
+mod history_conformance;
 
 #[cfg(test)]
 mod tests {
@@ -683,6 +749,130 @@ mod tests {
         }
     }
 
+    #[test]
+    fn observer_rollback_history_round_trips_without_replacing_live_inventory_with_disk() {
+        let root = socket_dir();
+        let config = root.path().join("aterm.toml");
+        let handle = ObservationHandle::default();
+        let mut owner = Observer::open(&config, handle.clone()).unwrap();
+        let identity = |id| MachineIdentity {
+            machine_id: [id; 16],
+            incarnation: [id; 16],
+            label: None,
+        };
+        owner
+            .local(
+                identity(1),
+                aterm_secrets::commons::journal::Trust {
+                    network: [1; 16],
+                    authority: [2; 32],
+                    genesis: [3; 32],
+                },
+            )
+            .unwrap();
+        let at = Instant::now();
+        let exchange = |wall, sampled_at| account_exchange::Candidate {
+            observation: AccountsExchangeObservation {
+                scope_digest: [3; 32],
+                local_actor: [4; 48],
+                control_observation: [5; 64],
+                inventory_count: 2,
+                inventory_fingerprint: [6; 32],
+                peer: identity(2),
+                sampled_at_ms: wall,
+            },
+            sampled_at,
+        };
+        let round_trip = |publication: &Publication, wall| {
+            let source = publication.observation.clone();
+            let requested = publication.sampled_at();
+            let wire = live_encode_publication(publication, 0).unwrap();
+            let decoded = decode_publication(&wire, wall, requested).unwrap();
+            assert_eq!(decoded.observation, source);
+            assert_eq!(decoded.sampled_at(), publication.sampled_at());
+            assert_eq!(
+                decoded.current_at(requested, Some(wall)),
+                publication.current_at(requested, Some(wall))
+            );
+            // The previous whole-frame clock guard rejects these genuine producer states.
+            assert!(source.peers.iter().any(|peer| {
+                peer.first_seen_ms > peer.last_seen_ms
+                    || peer.last_seen_ms > wall
+                    || peer.last_checked_ms.is_some_and(|checked| checked > wall)
+                    || peer.samples.iter().any(|sample| sample.at_ms > wall)
+            }));
+            assert!(decode_publication(&wire, wall - 1, requested).is_err());
+            assert!(
+                decode_publication(
+                    &live_encode_publication(publication, 15_001).unwrap(),
+                    wall,
+                    requested
+                )
+                .is_err()
+            );
+            let expired =
+                decoded.current_at(requested + REACHABLE + Duration::from_secs(1), Some(wall));
+            assert_eq!(expired.visibility, Visibility::Unavailable);
+            assert_eq!(expired.observed_at_ms, source.observed_at_ms);
+            assert_eq!(expired.accounts_exchange, source.accounts_exchange);
+            assert_eq!(publication.observation, source);
+            decoded
+        };
+        owner.contact(identity(2), 100_000, at);
+        owner.accounts_exchange(exchange(100_000, at));
+        owner.observe(Visibility::Active, 0, "observing", 100_000, at);
+
+        // A fresh heartbeat retains the pre-rollback contact as unconfirmed history.
+        owner.observe(
+            Visibility::Active,
+            0,
+            "observing",
+            90_000,
+            at + Duration::from_secs(1),
+        );
+        let publication = handle.try_publication().unwrap();
+        let relayed = round_trip(&publication, 90_000);
+        assert_eq!(
+            relayed.observation.peers[0].reachability,
+            Reachability::LastSeen
+        );
+        assert_eq!(relayed.observation.peers[0].last_seen_ms, 100_000);
+
+        // A genuinely new contact can precede its retained first contact on the wall clock.
+        for (wall, elapsed) in [(90_001, 2), (90_002, 3)] {
+            let sampled_at = at + Duration::from_secs(elapsed);
+            owner.contact(identity(2), wall, sampled_at);
+            owner.accounts_exchange(exchange(wall, sampled_at));
+            owner.observe(Visibility::Active, 0, "observing", wall, sampled_at);
+            let publication = handle.try_publication().unwrap();
+            let relayed = round_trip(&publication, wall);
+            let peer = &relayed.observation.peers[0];
+            assert_eq!(peer.first_seen_ms, 100_000);
+            assert_eq!(peer.last_seen_ms, wall);
+            assert_eq!(peer.reachability, Reachability::Reachable);
+            assert_eq!(
+                peer.samples
+                    .iter()
+                    .map(|sample| sample.at_ms)
+                    .collect::<Vec<_>>(),
+                [100_000, 90_000, 90_001]
+            );
+            assert_eq!(
+                relayed.observation.accounts_exchange.unwrap().sampled_at_ms,
+                wall
+            );
+        }
+        assert_eq!(
+            read_history(&config)
+                .unwrap()
+                .accounts_exchange
+                .unwrap()
+                .sampled_at_ms,
+            90_001,
+            "the newer live receipt must not be replaced by the older checkpoint"
+        );
+    }
+
     fn socket_dir() -> aterm_tempfile::TempDir {
         // macOS's default temporary root plus the per-config suffix exceeds
         // sockaddr_un on some hosts. Keep socket fixtures in a short root.
@@ -713,6 +903,11 @@ mod tests {
                 first_seen_ms: now - 100,
                 last_seen_ms: now,
                 last_checked_ms: Some(now),
+                last_repair: None,
+                last_authenticated_endpoint: Some(AuthenticatedEndpoint {
+                    address: "127.0.0.1:41384".parse().unwrap(),
+                    observed_at_ms: now,
+                }),
                 reachability: Reachability::Reachable,
                 instances: None,
                 samples: vec![PresenceSample {
@@ -722,6 +917,90 @@ mod tests {
             }],
             ..NetworkObservation::default()
         }
+    }
+
+    #[test]
+    fn live_relay_preserves_an_old_failed_attempt_without_renewing_its_time() {
+        use aterm_types::network_state::{RepairObservation, RepairOutcome, RepairStage};
+        let mut state = current();
+        state.peers[0].last_repair = Some(RepairObservation {
+            completed_at_ms: state.observed_at_ms - 60_000,
+            outbound: false,
+            stage: Some(RepairStage::Application),
+            outcome: RepairOutcome::Failed,
+            table: Some([9; 32]),
+            sent: Some(1),
+            received: Some(2),
+            deferred: Some(0),
+        });
+        let decoded = live_decode(&live_encode(&state, 0).unwrap(), state.observed_at_ms).unwrap();
+        assert_eq!(decoded.peers[0].last_repair, state.peers[0].last_repair);
+        assert_eq!(decoded.peers[0].reachability, Reachability::Reachable);
+        assert_eq!(
+            value(&decoded)["peers"][0]["last_repair"]["completed_at_ms"],
+            json!(state.observed_at_ms - 60_000)
+        );
+    }
+
+    #[test]
+    fn long_paths_keep_profiles_waiters_and_directory_permissions_separate() {
+        let root = socket_dir();
+        let first = root.path().join("first-configuration-".repeat(10));
+        let second = root.path().join("second-configuration-".repeat(10));
+        private_file::create_private_dir(&first).unwrap();
+        private_file::create_private_dir(&second).unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&first, &alias).unwrap();
+        let alias = alias.join("aterm.toml");
+        let first = first.join("aterm.toml");
+        let second = second.join("aterm.toml");
+        let first_handle = ObservationHandle::default();
+        let second_handle = ObservationHandle::default();
+        let first_owner = Observer::open(&first, first_handle.clone()).unwrap();
+        let _second_owner = Observer::open(&second, second_handle.clone()).unwrap();
+        let mut first_state = current();
+        let mut second_state = current();
+        first_state.observer.as_mut().unwrap().machine_id = [7; 16];
+        second_state.observer.as_mut().unwrap().machine_id = [8; 16];
+        publish(&first_handle, first_state.clone());
+        publish(&second_handle, second_state.clone());
+        assert_eq!(read(&first).unwrap().observer, first_state.observer);
+        assert_eq!(read(&alias).unwrap().observer, first_state.observer);
+        assert_eq!(read(&second).unwrap().observer, second_state.observer);
+
+        let wait_handle = ObservationHandle::default();
+        let mut held = current();
+        held.visibility = Visibility::Waiting;
+        held.peers.clear();
+        publish(&wait_handle, held);
+        let wait = Server::start_wait(&directory(&first), wait_handle).unwrap();
+        std::fs::set_permissions(directory(&first), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        assert_eq!(
+            read(&first).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(read(&second).unwrap().observer, second_state.observer);
+        std::fs::set_permissions(directory(&first), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        assert_eq!(read(&first).unwrap().visibility, Visibility::Active);
+        drop(first_owner);
+        assert_eq!(read(&first).unwrap().visibility, Visibility::Waiting);
+        assert_eq!(read(&alias).unwrap().visibility, Visibility::Waiting);
+        assert_eq!(read(&second).unwrap().observer, second_state.observer);
+        drop(wait);
+
+        // An older owner used the short alias itself as its socket pathname.
+        let legacy_handle = ObservationHandle::default();
+        let legacy = Server::start_at(
+            &directory(&alias),
+            legacy_handle.clone(),
+            directory(&alias).join(NAME),
+        )
+        .unwrap();
+        publish(&legacy_handle, current());
+        assert!(legacy.is_running());
+        assert_eq!(read(&alias).unwrap().visibility, Visibility::Active);
     }
 
     #[test]
@@ -754,7 +1033,10 @@ mod tests {
             }
         }
         let root = socket_dir();
-        let config = root.path().join("aterm.toml");
+        // A valid configuration can live beyond sockaddr_un's path capacity.
+        let deep = root.path().join("long-configuration-directory-".repeat(5));
+        private_file::create_private_dir(&deep).unwrap();
+        let config = deep.join("aterm.toml");
         let executable = std::env::current_exe().unwrap();
         let mut command = aterm_uds::spawnfd::command(executable);
         command
@@ -807,7 +1089,16 @@ mod tests {
             Observer::open(&config, ObservationHandle::default()),
             Err(OpenFailure::Owned)
         ));
-        let state = current();
+        let mut state = current();
+        state.accounts_exchange = Some(aterm_types::network_state::AccountsExchangeObservation {
+            scope_digest: [3; 32],
+            local_actor: [4; 48],
+            control_observation: [5; 64],
+            inventory_count: 2,
+            inventory_fingerprint: [6; 32],
+            peer: state.peers[0].identity.clone(),
+            sampled_at_ms: state.observed_at_ms - 60_000,
+        });
         publish(&handle, state.clone());
         let seen = read(&config).unwrap();
         assert_eq!(seen.via_local_process, Some(std::process::id()));
@@ -817,6 +1108,11 @@ mod tests {
         let mut unwrapped = seen;
         unwrapped.via_local_process = None;
         assert_eq!(unwrapped, state);
+        assert_eq!(
+            read(&config).unwrap().accounts_exchange,
+            state.accounts_exchange,
+            "a later authenticated local relay read cannot renew a historical exchange"
+        );
         let history = encode(&state, None).unwrap();
         private_file::write_private(&directory(&config), "projection.json", &history).unwrap();
         drop(owner);
@@ -825,8 +1121,41 @@ mod tests {
         assert_eq!(retained.peers[0].reachability, Reachability::Unknown);
         assert!(retained.observer.is_none());
         assert!(retained.via_local_process.is_none());
+        assert_eq!(retained.accounts_exchange, state.accounts_exchange);
         let successor = Observer::open(&config, ObservationHandle::default()).unwrap();
         drop(successor);
+    }
+
+    #[test]
+    fn old_live_frames_without_endpoint_metadata_remain_readable() {
+        let state = current();
+        let mut wire: Value = aterm_json::from_slice(&live_encode(&state, 0).unwrap()).unwrap();
+        wire.as_object_mut()
+            .unwrap()
+            .get_mut("history")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("accounts_exchange");
+        wire.as_object_mut()
+            .unwrap()
+            .get_mut("history")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .get_mut("peers")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()[0]
+            .as_object_mut()
+            .unwrap()
+            .remove("last_authenticated_endpoint");
+        let decoded =
+            live_decode(&aterm_json::to_vec(&wire).unwrap(), state.observed_at_ms).unwrap();
+        assert_eq!(decoded.peers[0].identity, state.peers[0].identity);
+        assert_eq!(decoded.peers[0].reachability, Reachability::Reachable);
+        assert!(decoded.peers[0].last_authenticated_endpoint.is_none());
+        assert!(decoded.accounts_exchange.is_none());
     }
 
     #[test]
@@ -982,6 +1311,15 @@ mod tests {
         let mut future = state.clone();
         future.peers[0].last_seen_ms += 1;
         assert!(live_decode(&live_encode(&future, 0).unwrap(), state.observed_at_ms).is_err());
+        let mut future_check = state.clone();
+        future_check.peers[0].last_checked_ms = Some(state.observed_at_ms + 1);
+        assert!(
+            live_decode(
+                &live_encode(&future_check, 0).unwrap(),
+                state.observed_at_ms
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1014,15 +1352,6 @@ mod tests {
         let mut oversized = state.clone();
         oversized.detail = "x".repeat(2049);
         assert!(live_decode(&live_encode(&oversized, 0).unwrap(), state.observed_at_ms).is_err());
-        let mut future_sample = state.clone();
-        future_sample.peers[0].samples[0].at_ms += 1;
-        assert!(
-            live_decode(
-                &live_encode(&future_sample, 0).unwrap(),
-                state.observed_at_ms
-            )
-            .is_err()
-        );
     }
 
     #[test]
@@ -1176,14 +1505,13 @@ mod tests {
     }
 
     #[test]
-    fn long_socket_path_does_not_stop_local_observation_or_history() {
+    fn long_socket_path_preserves_live_observation_and_history() {
         let root = socket_dir();
         let long = root.path().join("x".repeat(160));
         private_file::create_private_dir(&long).unwrap();
         let config = long.join("aterm.toml");
         let handle = ObservationHandle::default();
         let mut owner = Observer::open(&config, handle.clone()).unwrap();
-        assert!(owner.relay.is_none());
         owner.observe(
             Visibility::Active,
             0,
@@ -1194,7 +1522,9 @@ mod tests {
         assert_eq!(handle.snapshot().visibility, Visibility::Active);
         assert!(owner.log.as_ref().unwrap().stats().retained_records > 0);
         assert_eq!(read_history(&config).unwrap().history, HistoryState::Ready);
-        assert!(read(&config).is_err());
+        let live = read(&config).unwrap();
+        assert_eq!(live.visibility, Visibility::Active);
+        assert_eq!(live.via_local_process, Some(std::process::id()));
     }
 
     #[test]

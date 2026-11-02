@@ -17,6 +17,8 @@ impl Flock {
     /// Take `file`'s exclusive lock without blocking.
     pub(crate) fn try_lock(file: File) -> Result<Self, std::fs::TryLockError> {
         let file: std::fs::File = file;
+        #[cfg(any(unix, windows))]
+        let _ = aterm_uds::keep_out_of_children(&file);
         #[expect(
             clippy::disallowed_methods,
             reason = "the guard's own take: its Drop releases by LOCK_UN"
@@ -28,6 +30,8 @@ impl Flock {
     /// Take `file`'s shared lock without blocking.
     pub(crate) fn try_lock_shared(file: File) -> Result<Self, std::fs::TryLockError> {
         let file: std::fs::File = file;
+        #[cfg(any(unix, windows))]
+        let _ = aterm_uds::keep_out_of_children(&file);
         #[expect(
             clippy::disallowed_methods,
             reason = "the guard's own take: its Drop releases by LOCK_UN"
@@ -39,7 +43,9 @@ impl Flock {
     /// Take `file`'s exclusive lock, re-trying every [`LOCK_POLL`] for up to `limit`.
     pub(crate) fn lock_within(file: File, limit: Duration, what: &Path) -> io::Result<Self> {
         let file: std::fs::File = file;
-        let deadline = Instant::now() + limit;
+        #[cfg(any(unix, windows))]
+        let _ = aterm_uds::keep_out_of_children(&file);
+        let deadline = Instant::now().checked_add(limit);
         loop {
             #[expect(
                 clippy::disallowed_methods,
@@ -48,7 +54,9 @@ impl Flock {
             let taken = file.try_lock();
             match taken {
                 Ok(()) => return Ok(Self(file)),
-                Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                Err(std::fs::TryLockError::WouldBlock)
+                    if deadline.is_none_or(|d| Instant::now() < d) =>
+                {
                     std::thread::sleep(LOCK_POLL);
                 }
                 Err(std::fs::TryLockError::WouldBlock) => {
@@ -69,6 +77,8 @@ impl Flock {
     /// Take `file`'s exclusive lock, waiting for a holder to let go.
     pub(crate) fn lock(file: File) -> io::Result<Self> {
         let file: std::fs::File = file;
+        #[cfg(any(unix, windows))]
+        let _ = aterm_uds::keep_out_of_children(&file);
         #[expect(
             clippy::disallowed_methods,
             reason = "the guard's own take: its Drop releases by LOCK_UN"
@@ -137,6 +147,49 @@ impl StoreLock {
         }
     }
 
+    /// A local installer must still address the very writer-lock inode this guard holds.
+    #[cfg(unix)]
+    pub(crate) fn checked_layout(&self) -> io::Result<Layout> {
+        use std::os::unix::fs::MetadataExt as _;
+        let layout = self.layout();
+        let named = crate::local_harness::fs::owned_file(&crate::metadata_io::open_regular(
+            &layout.store_lock(),
+        )?)?;
+        let held = crate::local_harness::fs::owned_file(&self._file)?;
+        if (named.dev(), named.ino()) != (held.dev(), held.ino()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "store writer lock changed",
+            ));
+        }
+        Ok(layout)
+    }
+
+    /// Bind the writer lock through an already held prefix, never another pathname lookup.
+    #[cfg(unix)]
+    pub(crate) fn checked_layout_at(&self, prefix: &impl std::os::fd::AsFd) -> io::Result<Layout> {
+        use std::os::unix::fs::MetadataExt as _;
+        let named = aterm_dirfd::openat(
+            prefix,
+            "store.lock",
+            aterm_dirfd::OFlags::RDONLY
+                | aterm_dirfd::OFlags::NOFOLLOW
+                | aterm_dirfd::OFlags::CLOEXEC
+                | aterm_dirfd::OFlags::NONBLOCK,
+            aterm_dirfd::Mode::empty(),
+        )
+        .map_err(io::Error::from)?;
+        let named = crate::local_harness::fs::owned_file(&std::fs::File::from(named))?;
+        let held = crate::local_harness::fs::owned_file(&self._file)?;
+        if (named.dev(), named.ino()) != (held.dev(), held.ino()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "store writer lock changed",
+            ));
+        }
+        Ok(self.layout())
+    }
+
     /// Say who holds the store ([`holder_path`]): this pid, and whether it is a person's
     /// typed verb ([`person_holder`]).
     pub fn announce_holder(&mut self, layout: &Layout, person: bool) {
@@ -145,7 +198,11 @@ impl StoreLock {
         let tmp = layout
             .prefix
             .join(format!("store.lock.holder.tmp-{}", std::process::id()));
-        if std::fs::write(&tmp, body).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
+        let _ = std::fs::remove_file(&tmp);
+        let written = crate::platform::open_create_new_write(&tmp, 0o644)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, body.as_bytes()))
+            .and_then(|()| std::fs::rename(&tmp, &path));
+        if written.is_ok() {
             self.holder = Some(path);
         } else {
             let _ = std::fs::remove_file(&tmp);
@@ -177,7 +234,12 @@ fn read_holder(path: &Path) -> Option<(u32, bool)> {
     let mut person = None;
     for line in text.lines() {
         match line.split_once('=') {
-            Some(("pid", v)) => pid = v.trim().parse::<u32>().ok(),
+            Some(("pid", v)) => {
+                let s = v.trim();
+                pid = (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                    .then(|| s.parse::<u32>().ok())
+                    .flatten();
+            }
             Some(("person", v)) => person = Some(v.trim() == "1"),
             _ => {}
         }
@@ -290,7 +352,7 @@ pub fn lock_store_waiting(
     still_wanted: impl Fn() -> bool,
 ) -> Result<StoreLock, StoreLockError> {
     let grace = aterm_types::dev_seam!(WAIT_ANNOUNCE_GRACE_SEAM)
-        .and_then(|ms| ms.to_str()?.parse().ok())
+        .and_then(|ms| ms.to_str().filter(|s| !s.starts_with('+'))?.parse().ok())
         .map_or(WAIT_ANNOUNCE_GRACE, Duration::from_millis);
     lock_store_waiting_on(
         &MonotonicClock,
@@ -525,7 +587,7 @@ fn open_lock_file(path: &Path) -> io::Result<File> {
         libc::openat(
             dir.as_raw_fd(),
             name.as_ptr(),
-            libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC,
+            libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
             libc::c_uint::from(0o600_u16),
         )
     };
@@ -533,7 +595,15 @@ fn open_lock_file(path: &Path) -> io::Result<File> {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: `openat` just returned `fd`, which nothing else owns.
-    Ok(File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+    let file = File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    aterm_uds::keep_out_of_children(&file)?;
+    Ok(file)
 }
 
 /// The lock file at `path`, created if it is missing and never truncated.

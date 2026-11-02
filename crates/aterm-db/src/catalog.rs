@@ -61,6 +61,8 @@ pub struct Entry {
 }
 #[derive(Debug, Default)]
 pub struct Snapshot {
+    /// Declarations were read from separate recovery storage, not repaired writer custody.
+    pub recovery: bool,
     pub entries: BTreeMap<Digest, Entry>,
     /// Authenticated operations with unsupported/invalid catalog payloads.
     pub inert: usize,
@@ -72,12 +74,137 @@ pub struct Snapshot {
 pub struct Directory {
     root: PathBuf,
     trust: Trust,
+    region: crate::table::store::Region,
 }
 impl Directory {
     pub fn new(paths: &Paths, trust: Trust) -> Self {
         Self {
             root: paths.dir.join("commons/tables"),
             trust,
+            region: crate::table::store::Region::Primary,
+        }
+    }
+
+    pub(crate) fn recovery(&self) -> Self {
+        if self.is_recovery() {
+            return self.clone();
+        }
+        Self {
+            root: self
+                .root
+                .parent()
+                .expect("table root has a Commons parent")
+                .join("recovery/tables"),
+            trust: self.trust,
+            region: crate::table::store::Region::Recovery,
+        }
+    }
+
+    pub(crate) fn is_recovery(&self) -> bool {
+        self.region == crate::table::store::Region::Recovery
+    }
+
+    pub(crate) fn primary(&self) -> Self {
+        if !self.is_recovery() {
+            return self.clone();
+        }
+        Self {
+            root: self
+                .root
+                .parent()
+                .and_then(Path::parent)
+                .expect("recovery tables have a Commons grandparent")
+                .join("tables"),
+            trust: self.trust,
+            region: crate::table::store::Region::Primary,
+        }
+    }
+
+    pub(crate) fn open_store(&self, session: &Session<'_>, scope: Scope) -> Result<Store> {
+        let path = self.path(scope)?;
+        match self.region {
+            crate::table::store::Region::Primary => Store::open(session, &path, scope),
+            crate::table::store::Region::Recovery => Store::open_recovery(session, &path, scope),
+        }
+    }
+
+    pub(crate) fn observe_store(&self, session: &Session<'_>, scope: Scope) -> Result<Store> {
+        let path = self.path(scope)?;
+        match self.region {
+            crate::table::store::Region::Primary => Store::observe(session, &path, scope),
+            crate::table::store::Region::Recovery => Store::observe_recovery(session, &path, scope),
+        }
+    }
+
+    /// Observe existing authenticated data. An application's recovery observation
+    /// includes healthy primary data, rechecking both custody snapshots. This never
+    /// creates storage or changes writer custody. Inspect [`Store::is_recovery`]
+    /// before treating its contents as the original replica.
+    ///
+    /// # Errors
+    /// A required custody snapshot is unavailable or changes, membership is
+    /// stale, the scope is foreign, or combined evidence disagrees or exceeds
+    /// the table's limits.
+    pub fn observe_table(&self, session: &Session<'_>, scope: Scope) -> Result<Store> {
+        match self.observe_table_if_exists(session, scope)? {
+            Some(store) => Ok(store),
+            None => self.observe_store(session, scope),
+        }
+    }
+
+    pub(crate) fn observe_store_if_exists(
+        &self,
+        session: &Session<'_>,
+        scope: Scope,
+    ) -> Result<Option<Store>> {
+        Store::observe_if_exists_region(session, &self.path(scope)?, scope, self.region)
+    }
+
+    /// Observe existing primary or recovery storage without creating it. A missing
+    /// table or incomplete first enrollment returns `None`; a valid recovery
+    /// observation includes healthy primary application data and remains
+    /// receive-only. Sharing policy is the caller's decision.
+    ///
+    /// # Errors
+    /// A required established store is damaged or changes, the scope belongs
+    /// to another network, membership is stale, or combined evidence disagrees
+    /// or exceeds the table's limits.
+    pub fn observe_table_if_exists(
+        &self,
+        session: &Session<'_>,
+        scope: Scope,
+    ) -> Result<Option<Store>> {
+        match self.observe_store_if_exists(session, scope) {
+            Ok(Some(store)) if self.is_recovery() && scope != self.catalog_scope() => {
+                match self.primary().observe_store_if_exists(session, scope) {
+                    Ok(Some(primary)) => store.with_observed_primary(session, primary).map(Some),
+                    Err(error) if error.is_busy() => Err(error),
+                    _ => Ok(Some(store)),
+                }
+            }
+            Ok(Some(store)) if !self.is_recovery() && scope != self.catalog_scope() => {
+                match self.recovery().observe_store_if_exists(session, scope)? {
+                    Some(recovery) => recovery.with_observed_primary(session, store).map(Some),
+                    None => Ok(Some(store)),
+                }
+            }
+            Ok(Some(store)) => Ok(Some(store)),
+            Ok(None) if !self.is_recovery() => {
+                self.recovery().observe_store_if_exists(session, scope)
+            }
+            Ok(None) => Ok(None),
+            Err(error) if self.is_recovery() || error.is_busy() => Err(error),
+            Err(original) => match self.recovery().observe_store_if_exists(session, scope) {
+                Ok(Some(store)) => Ok(Some(store)),
+                _ => Err(original),
+            },
+        }
+    }
+
+    fn join_store(&self, session: &Session<'_>, path: &Path, scope: Scope) -> Result<Store> {
+        match self.region {
+            crate::table::store::Region::Primary => Store::join(session, path, scope),
+            crate::table::store::Region::Recovery => Store::join_recovery(session, path, scope),
         }
     }
     pub fn catalog_scope(&self) -> Scope {
@@ -98,11 +225,13 @@ impl Directory {
     fn catalog(&self, session: &Session<'_>) -> Result<Store> {
         let scope = self.catalog_scope();
         let path = self.path(scope)?;
-        if let Ok(store) = Store::open(session, &path, scope) {
+        if let Ok(store) = self.open_store(session, scope) {
             return Ok(store);
         }
-        aterm_journal::create_private_dir_durable(&self.root)?;
-        Store::join(session, &path, scope)
+        if !self.is_recovery() {
+            aterm_journal::create_private_dir_durable(&self.root)?;
+        }
+        self.join_store(session, &path, scope)
     }
     /// The storage directories counted against the catalog's slots ([`CATALOG_SLOTS`], and the
     /// catalog's own): every retained one but the ring tables this Mac holds
@@ -131,6 +260,19 @@ impl Directory {
                 retained.insert(id);
             }
         }
+        if self.is_recovery() && self.primary().root.try_exists()? {
+            // Catalog recovery does not retire healthy primary application
+            // stores. Their declarations and occupied slots still matter.
+            let (primary, primary_count) = self.primary().retained()?;
+            let duplicate = retained.intersection(&primary).count();
+            count = count.saturating_add(primary_count.saturating_sub(duplicate));
+            if count > MAX_TABLES + 1 {
+                return Err(Error::new(
+                    "combined retained table storage exceeds its bound",
+                ));
+            }
+            retained.extend(primary);
+        }
         Ok((retained, count))
     }
     fn room(&self, scope: Scope) -> Result<PathBuf> {
@@ -149,10 +291,10 @@ impl Directory {
     }
     pub(crate) fn enroll(&self, session: &Session<'_>, scope: Scope) -> Result<Store> {
         let path = self.room(scope)?;
-        if let Ok(store) = Store::open(session, &path, scope) {
+        if let Ok(store) = self.open_store(session, scope) {
             return Ok(store);
         }
-        Store::join(session, &path, scope)
+        self.join_store(session, &path, scope)
     }
     /// Durable offline creation and publication. Reopening the same descriptor
     /// coalesces an existing declaration, without adding another signed record.
@@ -253,8 +395,32 @@ impl Directory {
     }
 
     /// Read locally retained declarations without enrolling or repairing storage.
-    /// A genuinely absent catalog is empty; partial or damaged custody is refused.
+    /// A genuinely absent catalog is empty. Damaged primary custody may use an
+    /// already verified recovery replica; neither store is initialized here.
     pub fn observe_with_config(&self, session: &Session<'_>, config: &Path) -> Result<Snapshot> {
+        match self.observe_primary_with_config(session, config) {
+            Ok(snapshot) => Ok(snapshot),
+            Err(error) if self.is_recovery() || error.is_busy() => Err(error),
+            Err(original) => {
+                let recovery = self.recovery();
+                if !matches!(
+                    recovery.observe_store_if_exists(session, self.catalog_scope()),
+                    Ok(Some(_))
+                ) {
+                    return Err(original);
+                }
+                recovery
+                    .observe_primary_with_config(session, config)
+                    .map_err(|_| original)
+            }
+        }
+    }
+
+    pub(crate) fn observe_primary_with_config(
+        &self,
+        session: &Session<'_>,
+        config: &Path,
+    ) -> Result<Snapshot> {
         let policy = Policy::read(config)?;
         let root_exists = match aterm_uds::private_file::check_private_dir(&self.root) {
             Ok(()) => true,
@@ -262,7 +428,7 @@ impl Directory {
             Err(error) => return Err(error.into()),
         };
         let scope = self.catalog_scope();
-        let Some(catalog) = Store::observe_if_exists(session, &self.path(scope)?, scope)? else {
+        let Some(catalog) = self.observe_store_if_exists(session, scope)? else {
             if root_exists && self.retained()?.1 != 0 {
                 return Err(Error::new(
                     "catalog is absent beside retained table storage",
@@ -281,7 +447,7 @@ impl Directory {
     /// it: an absent catalog reads as empty.
     pub(crate) fn snapshot_if_exists(&self, session: &Session<'_>) -> Result<Snapshot> {
         let scope = self.catalog_scope();
-        match Store::observe_if_exists(session, &self.path(scope)?, scope)? {
+        match self.observe_store_if_exists(session, scope)? {
             None => Ok(Snapshot::default()),
             Some(catalog) => self.project(
                 session,
@@ -321,7 +487,7 @@ impl Directory {
         if !claim.try_exists()? {
             return Ok(false);
         }
-        let mut catalog = Store::open(session, &self.path(scope)?, scope)?;
+        let mut catalog = self.open_store(session, scope)?;
         let snapshot = self.project(session, catalog.catalog(session)?, &Policy::default())?;
         let Some(entry) = snapshot.entries.get(&retired.scope.digest()) else {
             return Ok(false);
@@ -348,14 +514,15 @@ impl Directory {
     /// Read an existing catalog with default local projection policy. Missing
     /// or damaged established storage is never replaced by an empty enrollment.
     pub fn snapshot_existing(&self, session: &Session<'_>) -> Result<Snapshot> {
-        let catalog = Store::open(
+        let catalog = self.observe_table(session, self.catalog_scope())?;
+        let directory = if catalog.is_recovery() {
+            self.recovery()
+        } else {
+            self.clone()
+        };
+        directory.project(
             session,
-            &self.path(self.catalog_scope())?,
-            self.catalog_scope(),
-        )?;
-        self.project(
-            session,
-            self.discovery_records_from(session, &catalog)?,
+            directory.discovery_records_from(session, &catalog)?,
             &Policy::default(),
         )
     }
@@ -372,14 +539,15 @@ impl Directory {
         session: &Session<'_>,
         config: &Path,
     ) -> Result<Snapshot> {
-        let catalog = Store::open(
+        let catalog = self.observe_table(session, self.catalog_scope())?;
+        let directory = if catalog.is_recovery() {
+            self.recovery()
+        } else {
+            self.clone()
+        };
+        directory.project(
             session,
-            &self.path(self.catalog_scope())?,
-            self.catalog_scope(),
-        )?;
-        self.project(
-            session,
-            self.discovery_records_from(session, &catalog)?,
+            directory.discovery_records_from(session, &catalog)?,
             &Policy::read(config)?,
         )
     }
@@ -418,7 +586,7 @@ impl Directory {
         if !policy.enabled || policy.excluded.contains(&scope.digest()) {
             return Ok(Some(BTreeMap::new()));
         }
-        let Some(catalog) = Store::observe_if_exists(session, &self.path(scope)?, scope)? else {
+        let Some(catalog) = self.observe_store_if_exists(session, scope)? else {
             return Ok(None);
         };
         let snapshot = self.project(
@@ -538,11 +706,7 @@ impl Directory {
         let catalog = if session.has_control_writer() {
             self.catalog(session)?
         } else {
-            Store::observe(
-                session,
-                &self.path(self.catalog_scope())?,
-                self.catalog_scope(),
-            )?
+            self.observe_store(session, self.catalog_scope())?
         };
         self.discovery_records_from(session, &catalog)
     }
@@ -576,7 +740,10 @@ impl Directory {
         records: Vec<crate::table::Record>,
         policy: &Policy,
     ) -> Result<Snapshot> {
-        let mut snapshot = Snapshot::default();
+        let mut snapshot = Snapshot {
+            recovery: self.is_recovery(),
+            ..Snapshot::default()
+        };
         let mut created: BTreeMap<Actor, BTreeSet<Digest>> = BTreeMap::new();
         let mut order = Vec::new();
         for record in records {

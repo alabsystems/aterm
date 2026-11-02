@@ -17,6 +17,15 @@ fn main() {
     let out = std::env::var("OUT_DIR").unwrap();
     let shim = std::env::var("BC_SHIM").unwrap();
     let cargo = std::env::var("CARGO").unwrap();
+    if let Ok(ready) = std::env::var("BC_HOP_READY") {
+        std::fs::write(&ready, std::process::id().to_string()).unwrap();
+        let release = std::env::var("BC_HOP_RELEASE").unwrap();
+        let from = std::time::Instant::now();
+        while !std::path::Path::new(&release).exists() {
+            assert!(from.elapsed() < std::time::Duration::from_secs(60), "hang detector: lock witness");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
     for (name, program, args) in [
         ("cargo", cargo.as_str(), vec!["--unverified", "build", "-p", "inner"]),
         ("shim", "/bin/sh", vec![shim.as_str(), "--unverified", "build", "-p", "inner"]),
@@ -25,6 +34,7 @@ fn main() {
         let status = std::process::Command::new(program)
             .args(&args)
             .env("CARGO_TARGET_DIR", &target)
+            .env("ATERM_ADMIT", "wait")
             .status()
             .unwrap();
         assert!(status.success(), "nested {name}: {status}");
@@ -40,6 +50,50 @@ fn write(path: &Path, text: &str) {
 
 #[test]
 fn a_build_script_building_its_own_workspace_finishes_under_the_shim() {
+    nested_build(false, "build");
+}
+
+/// The same through an alias cargo expands to `build`: the shim places it by its `--config`
+/// alone, which reaches no build script's own cargo.
+#[test]
+fn a_build_script_building_its_own_workspace_through_an_alias_finishes_under_the_shim() {
+    nested_build(false, "xb");
+}
+
+/// A real Cargo, identified by this suite's compile-time compiler path, has its active build
+/// lock while its build.rs is stopped at an explicit barrier. The admission hop's covering
+/// claim remains held, and nested builds explicitly told to wait still finish under it.
+#[test]
+fn a_real_cargo_build_script_keeps_its_lock_and_covered_nested_builds_live() {
+    nested_build(true, "build");
+}
+
+/// Test observation, never admission authority: the actual compiler path baked into this
+/// suite, a stable kernel process identity, and a held file that Cargo has open at the barrier.
+fn real_cargo_lock(pid: u32, cargo: &Path) -> bool {
+    let Ok(raw) = i32::try_from(pid) else {
+        return false;
+    };
+    let Some(identity) = aterm_uds::process::read_identity(raw) else {
+        return false;
+    };
+    let Ok(cargo) = cargo.canonicalize() else {
+        return false;
+    };
+    if aterm_uds::process::read_process_path(raw).and_then(|p| p.canonicalize().ok()) != Some(cargo)
+    {
+        return false;
+    }
+    let locked = atpkg::build_admit::possible_build_lock(
+        &|| vec![pid],
+        &|pid| aterm_uds::holders::open_files(pid).unwrap_or_default(),
+        &|path| aterm_uds::ownerlock::probe(path) == aterm_uds::ownerlock::Owner::Live,
+    );
+    locked.is_some() && aterm_uds::process::read_identity(raw) == Some(identity)
+}
+
+/// `verb` is `build`, or `xb`, which the workspace's config makes an alias of it.
+fn nested_build(hop: bool, verb: &str) {
     let targo = Path::new(env!("CARGO"));
     if targo.file_name().is_none_or(|n| n != "targo") {
         aterm_spec::host::could_not_run(format!(
@@ -75,20 +129,30 @@ fn a_build_script_building_its_own_workspace_finishes_under_the_shim() {
     );
     write(&ws.join("outer/src/main.rs"), "fn main() {}\n");
     write(&ws.join("outer/build.rs"), BUILD_RS);
+    write(&ws.join(".cargo/config.toml"), "[alias]\nxb = \"build\"\n");
     let shim = root.join("targo-shim");
-    write(
-        &shim,
-        &format!(
-            "#!/bin/sh\n{}exec '{}' \"$@\"\n",
-            atpkg::build_cache::shim_block("targo").unwrap(),
-            targo.display()
-        ),
-    );
+    let block = atpkg::build_cache::shim_block("targo").unwrap();
+    let forwarding = if hop {
+        let quoted = format!("'{}'", targo.to_string_lossy().replace('\'', "'\\''"));
+        atpkg::build_cache::registered::shim_hop(
+            Path::new(env!("CARGO_BIN_EXE_atpkg")),
+            "targo",
+            &quoted,
+            None,
+        )
+    } else {
+        format!("exec '{}' \"$@\"\n", targo.display())
+    };
+    write(&shim, &format!("#!/bin/sh\n{block}{forwarding}"));
 
     let log = root.join("build.log");
-    let mut child = aterm_uds::spawnfd::command("/bin/sh")
+    let ledger = root.join("ledger");
+    let ready = root.join("build-script-ready");
+    let release = root.join("build-script-release");
+    let mut command = aterm_uds::spawnfd::command("/bin/sh");
+    command
         .arg(&shim)
-        .args(["--unverified", "build", "-q"])
+        .args(["--unverified", verb, "-q"])
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", &home)
@@ -96,9 +160,36 @@ fn a_build_script_building_its_own_workspace_finishes_under_the_shim() {
         .env("BC_SHIM", &shim)
         .current_dir(&ws)
         .stdout(aterm_uds::spawnfd::Stdio::null())
-        .stderr(std::fs::File::create(&log).unwrap())
-        .spawn()
-        .unwrap();
+        .stderr(std::fs::File::create(&log).unwrap());
+    if hop {
+        command
+            .env(atpkg::build_admit::LEDGER_ENV, &ledger)
+            .env("ATERM_STATE_HOME", root.join("state"))
+            .env("ATERM_ADMIT", "now")
+            .env("BC_HOP_READY", &ready)
+            .env("BC_HOP_RELEASE", &release);
+    }
+    let mut child = command.spawn().unwrap();
+    let witness = if hop {
+        let script_pid = aterm_spec::wait::until_within(HANG, "real Cargo's build script", || {
+            std::fs::read_to_string(&ready).ok()?.parse::<i32>().ok()
+        });
+        let parent = aterm_uds::process::read_process_parent(script_pid);
+        let locked = parent.is_some_and(|pid| real_cargo_lock(pid, targo));
+        let claims = aterm_capacity::Ledger::at(&ledger)
+            .list()
+            .expect("scratch ledger");
+        let covered = parent.is_some_and(|pid| {
+            claims
+                .iter()
+                .any(|claim| claim.pid == pid && claim.held.is_some() && claim.need.covers)
+        });
+        let ordinary = real_cargo_lock(std::process::id(), targo);
+        std::fs::write(&release, "go").expect("release the build script");
+        Some((locked, covered, ordinary))
+    } else {
+        None
+    };
     let started = Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
@@ -118,6 +209,24 @@ fn a_build_script_building_its_own_workspace_finishes_under_the_shim() {
     );
     // Cargo succeeds only once the build script exited 0 on its own.
     tmp.ran();
+    if let Some((locked, covered, ordinary)) = witness {
+        assert!(
+            locked,
+            "the real Cargo's active locked file and image were not witnessed"
+        );
+        assert!(covered, "the real Cargo had no covering claim");
+        assert!(
+            !ordinary,
+            "an ordinary ancestor cannot become Cargo by its file names"
+        );
+        aterm_spec::wait::until_within(HANG, "the outer claim let go", || {
+            aterm_capacity::Ledger::at(&ledger)
+                .list()
+                .ok()?
+                .is_empty()
+                .then_some(())
+        });
+    }
 
     let cache: PathBuf = atpkg::build_cache::build_dir(&atpkg::build_cache::cache_root(&home), &ws);
     assert!(

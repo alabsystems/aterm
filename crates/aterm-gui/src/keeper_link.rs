@@ -889,17 +889,23 @@ impl Tag {
             };
             match k {
                 "sid" if valid_sid(v) => tag.sid = Some(v.to_string()),
-                "owner" => tag.owner = v.parse().ok(),
+                "owner" if v.bytes().all(|b| b.is_ascii_digit()) => tag.owner = v.parse().ok(),
                 "rekey" => tag.rekey = v == "1",
                 "loader" => tag.loader = v == "1",
                 "frozen" => tag.frozen = v == "1",
                 "handed" => {
                     tag.handed = v
                         .split_once(':')
+                        .filter(|(o, id)| {
+                            o.bytes().all(|b| b.is_ascii_digit())
+                                && id.bytes().all(|b| b.is_ascii_digit())
+                        })
                         .and_then(|(owner, id)| Some((owner.parse().ok()?, id.parse().ok()?)));
                 }
                 "keyed" => tag.keyed = crate::session_store::parse_journal_key(v),
-                "slog_ep" => tag.slog_ep = v.parse().ok().filter(|ep| *ep >= 1),
+                "slog_ep" if v.bytes().all(|b| b.is_ascii_digit()) => {
+                    tag.slog_ep = v.parse().ok().filter(|ep| *ep >= 1);
+                }
                 _ => {}
             }
         }
@@ -1892,6 +1898,7 @@ mod tests {
             None,
             None,
             aterm_sandbox::Limits::inherit(),
+            None,
             None,
         )
         .expect("spawn");

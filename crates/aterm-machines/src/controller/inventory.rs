@@ -224,6 +224,30 @@ pub struct Controller {
 pub struct Github {
     /// The machine user's login.
     pub account: String,
+    /// `keys = "gh" | "agh-inline" | "agh-fleet"`; absent is `gh`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys: Option<KeysVia>,
+}
+
+impl Github {
+    /// `keys`, or `KeysVia::Gh` when absent.
+    #[must_use]
+    pub fn keys_via(&self) -> KeysVia {
+        self.keys.unwrap_or_default()
+    }
+}
+
+/// How the fleet's SSH keys reach GitHub (§17, machines 5a and 5b).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum KeysVia {
+    /// The REST key path, as today (`System::github_rest`): the default until WP15.
+    #[default]
+    Gh,
+    /// agh's library, the token still from the keychain's `git credential fill` (5a).
+    AghInline,
+    /// agh's library, the token from agh.toml's `fleet` profile (5b).
+    AghFleet,
 }
 
 /// One `[[host]]`.
@@ -781,7 +805,7 @@ pub fn next_serial(sys: &dyn System, paths: &Paths, floor: u64) -> Result<u64, S
     let stored = match sys.read_file(&path) {
         Ok(bytes) => {
             let text = String::from_utf8_lossy(&bytes);
-            text.trim().parse::<u64>().map_err(|_| {
+            crate::parse_uint::<u64>(text.trim()).ok_or_else(|| {
                 format!(
                     "{} holds {:?}, not a serial; restore it (or write the highest serial a \
                      host reports)",
@@ -1001,6 +1025,7 @@ pub fn canonical_host_name(
                 "core" => "Core".to_owned(),
                 "i3" | "i5" | "i7" | "i9" | "prime" => low,
                 _ if low.ends_with("gb")
+                    && low[..low.len() - 2].bytes().any(|b| b.is_ascii_digit())
                     && low[..low.len() - 2]
                         .chars()
                         .all(|c| c.is_ascii_digit() || c == '.') =>
@@ -1008,6 +1033,7 @@ pub fn canonical_host_name(
                     format!("{}GB", &tok[..tok.len() - 2])
                 }
                 _ if low.ends_with("tb")
+                    && low[..low.len() - 2].bytes().any(|b| b.is_ascii_digit())
                     && low[..low.len() - 2]
                         .chars()
                         .all(|c| c.is_ascii_digit() || c == '.') =>
@@ -1015,6 +1041,7 @@ pub fn canonical_host_name(
                     format!("{}TB", &tok[..tok.len() - 2])
                 }
                 _ if low.ends_with("ghz")
+                    && low[..low.len() - 3].bytes().any(|b| b.is_ascii_digit())
                     && low[..low.len() - 3]
                         .chars()
                         .all(|c| c.is_ascii_digit() || c == '.') =>
@@ -1028,6 +1055,7 @@ pub fn canonical_host_name(
     }
     if norm.len() >= 2
         && norm[0].starts_with('m')
+        && norm[0].len() > 1
         && norm[0][1..].chars().all(|c| c.is_ascii_digit())
     {
         if norm[1] == "Air" {
@@ -1718,6 +1746,8 @@ user = \"labadmin\"
             "m100-MacBook-Pro-M4-Pro-48GB-500GB"
         );
         assert_eq!(canonical_host_name("spark-49f7-SSH", &empty), "spark-49f7");
+        assert_eq!(canonical_host_name("gb tb ghz", &empty), "gb-tb-ghz");
+        assert_eq!(canonical_host_name("m Air", &empty), "m-Air");
 
         let fake = fake_with(HAND_EDITED);
         set_host_name(&fake, &paths(), "m14", "m14-prime").unwrap();

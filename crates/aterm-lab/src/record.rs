@@ -318,11 +318,14 @@ impl Recorder {
             }
             crate::stop::check()?;
             let left = end - now();
-            if left <= 0.0 {
+            if left <= 0.0 || left.is_nan() {
                 return Ok(None);
             }
             g = cv
-                .wait_timeout(g, Duration::from_secs_f64(left.min(0.25)))
+                .wait_timeout(
+                    g,
+                    Duration::try_from_secs_f64(left.min(0.25)).unwrap_or(Duration::ZERO),
+                )
                 .unwrap_or_else(|x| x.into_inner())
                 .0;
         }

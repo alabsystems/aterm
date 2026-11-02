@@ -886,6 +886,18 @@ fn the_readers_match_the_wire() {
         parse_offscreen(&no_origin),
         Err(OffscreenError::Bad(_))
     ));
+    for bad_flag in ["alt=2", "more=2", "enabled=2", "enabled=no"] {
+        let bad = CtlReply {
+            stderr: format!(
+                "aterm-ctl: OK 1 first=1 last=1 lost=0 breaks=0 back=0 origin=5 alt=1 {bad_flag}\n"
+            ),
+            ..ok("x\n")
+        };
+        assert!(
+            matches!(parse_offscreen(&bad), Err(OffscreenError::Bad(_))),
+            "{bad_flag}"
+        );
+    }
     assert_eq!(
         parse_offscreen(&ok("x\ny\n")),
         Err(OffscreenError::NoHeader)

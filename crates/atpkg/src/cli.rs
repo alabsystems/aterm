@@ -20,12 +20,18 @@ enum Tier {
     Plumbing,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 enum Arity {
     None,
-    One { flags: &'static [&'static str] },
-    Flags { flags: &'static [&'static str] },
+    One {
+        flags: &'static [&'static str],
+    },
     Own,
+    /// The verb parses its own words; `refuse` says no to what the words alone show cannot run,
+    /// before the store lock is taken.
+    Parsed {
+        refuse: fn(&[String]) -> Option<ExitCode>,
+    },
 }
 
 struct Verb {
@@ -45,7 +51,9 @@ const TABLE: &[Verb] = &[
         tier: Tier::Daily,
         usage: "aterm pkg install <program>\n\
                 aterm pkg install --default-set    — the whole ALab toolset",
-        arity: Arity::Own,
+        arity: Arity::Parsed {
+            refuse: |rest| parse_install_argv(rest).err(),
+        },
         program_flags: Some(&["--default-set"]),
         mutates_store: true,
         applies_machine: true,
@@ -201,15 +209,21 @@ const TABLE: &[Verb] = &[
     Verb {
         name: "repair",
         tier: Tier::Occasional,
-        usage: "aterm pkg repair [--json]   — restore installed commands, shell integration, \
+        usage: "aterm pkg repair [--json] [--only <item-id>] — restore installed commands, shell integration, \
                 the reroute stubs (abrew's `brew` too), the rustup link, exec roots, an outlived \
                 held update and (macOS) the ~/.local/bin links; --json: every row, in the one \
                 report schema",
-        arity: Arity::Flags { flags: &["--json"] },
+        arity: Arity::Parsed {
+            refuse: |rest| {
+                repair_args(rest)
+                    .err()
+                    .map(|why| usage_error("repair", Some(&why)))
+            },
+        },
         program_flags: None,
         mutates_store: true,
         applies_machine: false,
-        run: |rest| run_repair(layout(), rest.iter().any(|a| a == "--json")),
+        run: cmd_repair,
     },
     Verb {
         name: "machine",
@@ -221,10 +235,14 @@ const TABLE: &[Verb] = &[
                 cleanup\n\
                 aterm pkg machine cache           — advisory cleanup candidates and their \
                 footprints in the Rust build cache, tooling cache and retired verify gate's \
-                leftovers; cleanup rechecks eligibility and checks active use of build and \
-                tooling caches; removes nothing\n\
+                leftovers, and of a stage an earlier pass left, what will stay and why; cleanup \
+                rechecks eligibility and checks active use of build and tooling caches; removes \
+                nothing\n\
                 aterm pkg machine cache clean     — run that cleanup, without applying host \
-                settings",
+                settings\n\
+                aterm pkg machine cache retain ABS — keep one existing exact cache root; no \
+                deletion permission (ordinary cleaners older than this capability must first \
+                be updated)",
         arity: Arity::Own,
         program_flags: None,
         mutates_store: false,
@@ -546,6 +564,9 @@ fn levenshtein(a: &str, b: &str) -> usize {
 
 /// The whole package-manager CLI as a callable.
 pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
+    if argv.first().and_then(|arg| arg.to_str()) == Some(crate::native_defaults::VERB) {
+        return crate::native_defaults::run_hidden(&argv[1..]);
+    }
     // A pass the window runs and copies into its aterm.log says its notices in the log's form.
     crate::notice::stderr_form_from_env();
     // The private window's lead ([`PRIVATE_STATE_ROOT_FLAG`]), taken off before anything
@@ -996,7 +1017,10 @@ pub fn live_without_shim_of(
         return None;
     }
     let build = match std::fs::read_link(layout.program_current(program)) {
-        Ok(target) => match crate::ops::store_build_of(&layout.prefix, &target) {
+        Ok(target) => match crate::ops::store_build_of(
+            &layout.prefix,
+            &crate::seam::absolute_target(&target, &layout.program_current(program)),
+        ) {
             Some((owner, build)) if owner == program => build,
             _ => return None,
         },
@@ -1017,12 +1041,8 @@ pub fn live_without_shim_of(
     {
         return None;
     }
-    let binary = layout
-        .build_dir(program, build)
-        .join("bin")
-        .join(format!("{tool}{}", std::env::consts::EXE_SUFFIX));
-    if !binary.is_file()
-        || layout.removed_programs().contains(program)
+    let binary = crate::ops::tool_in_build(&layout.build_dir(program, build), &name)?;
+    if layout.removed_programs().ok()?.contains(program)
         || crate::linkmode::is_linked(layout, program)
         || program_disabled_here(layout, crate::status::read(layout).as_ref(), program)
     {
@@ -1558,7 +1578,9 @@ fn spawner_pid() -> Option<u32> {
 fn spawner_from(said: Option<&str>, parent: impl FnOnce() -> Option<u32>) -> Option<u32> {
     match said.map(str::trim) {
         Some(SPAWNER_DETACHED) => None,
-        said => said.and_then(|v| v.parse::<u32>().ok()).or_else(parent),
+        said => said
+            .and_then(|v| v.replace('+', "?").parse().ok())
+            .or_else(parent),
     }
 }
 
@@ -1572,7 +1594,7 @@ fn take_wait_lock_flag(args: &mut Vec<String>) -> Option<std::time::Duration> {
         args.remove(i);
         if i < args.len() {
             let value = args.remove(i);
-            if let Ok(secs) = value.parse::<u64>() {
+            if let Ok(secs) = value.replace('+', "?").parse::<u64>() {
                 wait = Some(std::time::Duration::from_secs(secs));
             }
         }
@@ -2788,26 +2810,15 @@ fn arity_refusal(rest: &[String], verb: &str) -> Option<ExitCode> {
             (operands >= 2)
                 .then(|| usage_error(verb, Some("one name at a time \u{2014} nothing was done")))
         }
-        Arity::Flags { flags } => rest.iter().enumerate().find_map(|(at, arg)| {
-            (!flags.contains(&arg.as_str()) || rest[..at].contains(arg)).then(|| {
-                usage_error(
-                    verb,
-                    Some(&format!(
-                        "unknown or repeated argument {arg:?} \u{2014} this verb takes {}, each \
-                         once, and nothing else",
-                        flags.join(", ")
-                    )),
-                )
-            })
-        }),
+        Arity::Parsed { refuse } => refuse(rest),
         Arity::Own => None,
     }
 }
 
 fn built_in_answer(verb: &str, rest: &[String]) -> Option<ExitCode> {
     let flags = match verb_row(verb)?.arity {
-        Arity::One { flags } | Arity::Flags { flags } => flags,
-        Arity::None | Arity::Own => &[],
+        Arity::One { flags } => flags,
+        Arity::None | Arity::Own | Arity::Parsed { .. } => &[],
     };
     let answer =
         crate::builtin::verb_answer(verb, rest, flags, aterm_types::version::app_version())?;
@@ -3526,7 +3537,8 @@ fn cmd_run(rest: &[String]) -> ExitCode {
     let no_harness = stripped_nh.is_some();
     let args = stripped_nh.as_deref().unwrap_or(args);
     let expanded: Vec<String>;
-    let args: &[String] = match crate::yolo::decide(tool, args) {
+    let (launch, native_target) = crate::native_defaults::decide(tool, &target, args);
+    let args: &[String] = match launch {
         crate::yolo::Launch::Flag(args) => {
             eprintln!("{}", crate::yolo::echo_line(tool, &args));
             expanded = args;
@@ -3545,7 +3557,12 @@ fn cmd_run(rest: &[String]) -> ExitCode {
         clippy::disallowed_types,
         reason = "aterm pkg run becomes the tool by exec: its caller's descriptors are the tool's"
     )]
-    let mut command = std::process::Command::new(&target);
+    let mut command = std::process::Command::new(native_target.as_deref().unwrap_or(&target));
+    #[cfg(unix)]
+    if native_target.is_some() {
+        use std::os::unix::process::CommandExt as _;
+        command.arg0(&target);
+    }
     aterm_uds::spawn::set_flags(&mut command, 0);
     command.args(args).env("PATH", child_path);
     if no_harness {
@@ -3825,7 +3842,64 @@ fn cmd_list(args: &[String]) -> ExitCode {
     run_list(layout(), human)
 }
 
-fn run_repair(layout: Option<crate::store::Layout>, json: bool) -> ExitCode {
+fn repair_args(rest: &[String]) -> Result<(bool, Option<&str>), String> {
+    let mut json = false;
+    let mut only = None;
+    let mut words = rest.iter();
+    while let Some(word) = words.next() {
+        match word.as_str() {
+            "--json" if !json => json = true,
+            "--only" if only.is_none() => {
+                let value = words
+                    .next()
+                    .filter(|value| !value.is_empty() && !value.starts_with('-'))
+                    .ok_or("--only requires one existing repair item id")?;
+                only = Some(value.as_str());
+            }
+            other if only.is_none() && other.starts_with("--only=") => {
+                only = Some(
+                    other
+                        .strip_prefix("--only=")
+                        .filter(|value| !value.is_empty() && !value.starts_with('-'))
+                        .ok_or("--only requires one existing repair item id")?,
+                );
+            }
+            other => return Err(format!("unexpected or repeated argument {other:?}")),
+        }
+    }
+    if let Some(id) = only
+        && !crate::converge::repair::names_an_item(id)
+    {
+        return Err(format!("unknown repair item {id:?}"));
+    }
+    Ok((json, only))
+}
+
+fn cmd_repair(rest: &[String]) -> ExitCode {
+    match repair_args(rest) {
+        Ok((json, only)) => run_repair(layout(), json, only),
+        Err(why) => usage_error("repair", Some(&why)),
+    }
+}
+
+fn repair_selection<'a>(
+    ground: &std::sync::Arc<crate::converge::repair::Ground>,
+    only: Option<&'a str>,
+) -> Result<Option<[&'a str; 1]>, String> {
+    match only {
+        Some(id)
+            if !crate::converge::repair::items(ground)
+                .iter()
+                .any(|item| item.id() == id) =>
+        {
+            Err(format!("unknown repair item {id:?}"))
+        }
+        Some(id) => Ok(Some([id])),
+        None => Ok(None),
+    }
+}
+
+fn run_repair(layout: Option<crate::store::Layout>, json: bool, only: Option<&str>) -> ExitCode {
     let Some(layout) = layout else {
         return ExitCode::from(1);
     };
@@ -3833,6 +3907,11 @@ fn run_repair(layout: Option<crate::store::Layout>, json: bool) -> ExitCode {
         layout,
         crate::converge::repair::Pass::Repair,
     ));
+    let selected = match repair_selection(&ground, only) {
+        Ok(selected) => selected,
+        Err(why) => return usage_error("repair", Some(&why)),
+    };
+    let only = selected.as_ref().map(|ids| ids.as_slice());
     let scope = aterm_converge::Scope {
         not_own_account: aterm_types::dirs::not_own_account().or_else(|| {
             under_private_state_root()
@@ -3844,10 +3923,10 @@ fn run_repair(layout: Option<crate::store::Layout>, json: bool) -> ExitCode {
         Some(state) => repair_rows(
             &ground,
             &mut aterm_converge::FileJournal::under(&state),
-            None,
+            only,
             scope,
         ),
-        None => repair_rows(&ground, &mut aterm_converge::ReadOnly, None, scope),
+        None => repair_rows(&ground, &mut aterm_converge::ReadOnly, only, scope),
     };
     let code = repair_exit(&rows);
     if json {
@@ -4047,6 +4126,7 @@ fn repair_store_rows(
         home: None,
         exe: None,
         rustup_home: None,
+        zsh: Default::default(),
         login_rc: None,
         pass: crate::converge::repair::Pass::Repair,
         reads: Default::default(),
@@ -4398,7 +4478,7 @@ fn list_human_lines(
 
 fn uninstall_and_retire(layout: &crate::store::Layout, program: &str) -> std::io::Result<()> {
     retirement_name_gate(program)?;
-    record_removed(layout, program);
+    record_removed(layout, program)?;
     layout.clear_retired(program);
     if program == "trust" {
         detach_rustup_seams(layout);
@@ -5416,9 +5496,13 @@ fn clear_seed_adoption(layout: &crate::store::Layout) {
     remove_marker(&layout.adopted_by_seed());
 }
 
-fn removed_programs(layout: &crate::store::Layout) -> std::collections::BTreeSet<String> {
+fn removed_programs(
+    layout: &crate::store::Layout,
+) -> std::io::Result<std::collections::BTreeSet<String>> {
     // One reader, on the layout: the unattended update lanes need the same answer.
-    layout.removed_programs()
+    layout.removed_programs().map_err(|error| std::io::Error::new(error.kind(), format!(
+        "removal decisions at {} are unreadable: {error}; preserving them and holding installation", layout.removed().display()
+    )))
 }
 
 /// The default set on `triple` before `[packages].exclude` narrows it, the one list every
@@ -5818,22 +5902,16 @@ fn explicit_install_door(
     Some(path)
 }
 
-fn record_removed(layout: &crate::store::Layout, program: &str) {
-    let mut all = removed_programs(layout);
+fn record_removed(layout: &crate::store::Layout, program: &str) -> std::io::Result<()> {
+    let mut all = removed_programs(layout)?;
     if !all.insert(program.to_string()) {
-        return;
+        return Ok(());
     }
-    if let Err(e) = write_removed(layout, &all) {
-        eprintln!(
-            "atpkg: could not record the removal at {}: {e} — the next unattended pass may \
-             reinstall {program}",
-            layout.removed().display()
-        );
-    }
+    write_removed(layout, &all)
 }
 
-fn clear_removed(layout: &crate::store::Layout, programs: &[String]) {
-    let mut all = removed_programs(layout);
+fn clear_removed(layout: &crate::store::Layout, programs: &[String]) -> std::io::Result<()> {
+    let mut all = removed_programs(layout)?;
     let mut lifted: Vec<&str> = Vec::new();
     for p in programs {
         if all.remove(p) {
@@ -5841,16 +5919,9 @@ fn clear_removed(layout: &crate::store::Layout, programs: &[String]) {
         }
     }
     if lifted.is_empty() {
-        return;
+        return Ok(());
     }
-    if let Err(e) = write_removed(layout, &all) {
-        eprintln!(
-            "atpkg: could not lift the removal record at {}: {e} — set completion may keep \
-             skipping {}",
-            layout.removed().display(),
-            lifted.join(", ")
-        );
-    }
+    write_removed(layout, &all)
 }
 
 fn write_removed(
@@ -5858,6 +5929,18 @@ fn write_removed(
     all: &std::collections::BTreeSet<String>,
 ) -> std::io::Result<()> {
     let path = layout.removed();
+    if all.iter().any(|name| {
+        name.is_empty()
+            || name.trim() != name
+            || name.starts_with('#')
+            || name.contains(['\r', '\n'])
+            || name.len() >= crate::store::REMOVAL_LINE_BYTES
+    }) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "removal name cannot be represented by the bounded line format",
+        ));
+    }
     if all.is_empty() {
         return match std::fs::remove_file(&path) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
@@ -5876,7 +5959,7 @@ fn write_removed(
     tmp_name.push_str(&std::process::id().to_string());
     let tmp = path.with_file_name(tmp_name);
     let _ = std::fs::remove_file(&tmp);
-    let wrote = crate::platform::open_create_write(&tmp, 0o600).and_then(|mut f| {
+    let wrote = crate::platform::open_create_new_write(&tmp, 0o600).and_then(|mut f| {
         use std::io::Write as _;
         f.write_all(body.as_bytes())?;
         crate::platform::sync_durable(&f)
@@ -6413,7 +6496,23 @@ fn machine_home_mismatch_between(
     ))
 }
 
-fn cache_plan_words(why: crate::build_cache::Unused) -> String {
+/// What `aterm pkg machine cache` says of one planned entry under its path: why it goes
+/// ([`cache_plan_words`]), for a stage an earlier pass left what of it will stay and why
+/// ([`crate::build_cache::remove::Forecast::words`]), and whether its Cargo locks were
+/// unavailable when checked.
+pub(crate) fn cache_plan_line(one: &crate::build_cache::Planned) -> String {
+    let mut line = cache_plan_words(one.why);
+    if let Some(stays) = one.stays.as_ref().and_then(|f| f.words(&one.path)) {
+        line.push_str("; ");
+        line.push_str(&stays);
+    }
+    if one.held {
+        line.push_str(" — Cargo locks were unavailable when checked");
+    }
+    line
+}
+
+pub(crate) fn cache_plan_words(why: crate::build_cache::Unused) -> String {
     use crate::build_cache::Unused;
     let days = |d: std::time::Duration| {
         let h = d.as_secs() / 3_600;
@@ -6484,6 +6583,15 @@ fn cache_plan_words(why: crate::build_cache::Unused) -> String {
             if stayed == 1 { "y" } else { "ies" },
             crate::cost::human_bytes(freed)
         ),
+        Unused::Revoked { freed } => format!(
+            "retirement permission revoked after {} went; retained remainder not counted",
+            crate::cost::human_bytes(freed)
+        ),
+        Unused::Refused { by } => format!(
+            "kept: nothing of it went ({}): {}",
+            by.word(),
+            by.reason()
+        ),
     }
 }
 
@@ -6548,29 +6656,48 @@ fn reclaim_build_cache() -> usize {
     use crate::build_cache::Unused;
     let retired = retire_verify_gate();
     let removed = crate::build_cache::reclaim_home();
-    let mut stayed = 0;
+    let (mut stayed, mut kept) = (0, 0);
     for (stage, why) in &removed {
-        if let Unused::Stayed {
-            stayed: count,
-            freed,
-        } = *why
-        {
-            stayed += 1;
-            println!(
-                "{}; {} of it went, and the next pass tries again",
-                crate::build_cache::remove::stayed_words(stage, count),
-                crate::cost::human_bytes(freed)
-            );
+        match *why {
+            Unused::Refused { by } => {
+                kept += 1;
+                println!(
+                    "kept {} — nothing of it went ({}): {}",
+                    stage.display(),
+                    by.word(),
+                    by.reason()
+                );
+            }
+            Unused::Stayed {
+                stayed: count,
+                freed,
+            } => {
+                stayed += 1;
+                println!(
+                    "{}; {} of it went, and the next pass tries again",
+                    crate::build_cache::remove::stayed_words(stage, count),
+                    crate::cost::human_bytes(freed)
+                );
+            }
+            Unused::Revoked { freed } => {
+                stayed += 1;
+                println!(
+                    "{}: retirement permission revoked; {} went; retained remainder not counted",
+                    stage.display(),
+                    crate::cost::human_bytes(freed)
+                );
+            }
+            _ => {}
         }
     }
     let parts = removed
         .iter()
         .filter(|(_, why)| matches!(why, Unused::Stale { .. }))
         .count();
-    if removed.len() > parts + stayed {
+    if removed.len() > parts + stayed + kept {
         println!(
             "removed {} unused Rust build cache folder(s)",
-            removed.len() - parts - stayed
+            removed.len() - parts - stayed - kept
         );
     }
     if parts > 0 {
@@ -6579,7 +6706,7 @@ fn reclaim_build_cache() -> usize {
              build cache folder(s)"
         );
     }
-    removed.len() + retired
+    removed.len() - kept + retired
 }
 
 fn cmd_machine(rest: &[String]) -> ExitCode {
@@ -6645,6 +6772,29 @@ fn cmd_machine(rest: &[String]) -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        [sub, action, flag] if sub == "cache" && action == "retain" && flag == "--capabilities" => {
+            println!("{}", crate::build_cache::registered::RETAIN_CAPABILITY);
+            ExitCode::SUCCESS
+        }
+        [sub, action, root] if sub == "cache" && action == "retain" => {
+            let Some(home) = aterm_types::dirs::home_dir() else {
+                eprintln!("atpkg: cache retention needs a home directory");
+                return ExitCode::from(2);
+            };
+            match crate::build_cache::registered::retain(&home, std::path::Path::new(root)) {
+                Ok(root) => {
+                    println!(
+                        "retained cache {} (keep-only schema 4; older ordinary cleaners must be updated)",
+                        root.display()
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("atpkg: cache not retained: {error}");
+                    ExitCode::from(75)
+                }
+            }
+        }
         [sub] if sub == "cache" => {
             if !cfg!(target_os = "macos") {
                 println!("not applicable — the Rust build cache is kept on macOS only");
@@ -6656,15 +6806,10 @@ fn cmd_machine(rest: &[String]) -> ExitCode {
                 let bytes = crate::build_cache::allocated(&one.paths);
                 total = total.saturating_add(bytes);
                 println!(
-                    "{:>10}  {}\n            {}{}",
+                    "{:>10}  {}\n            {}",
                     crate::cost::human_bytes(bytes),
                     one.path.display(),
-                    cache_plan_words(one.why),
-                    if one.held {
-                        " — Cargo locks were unavailable when checked"
-                    } else {
-                        ""
-                    }
+                    cache_plan_line(one)
                 );
             }
             let leftovers = crate::build_cache::retired::Roots::live()
@@ -7621,7 +7766,10 @@ fn cmd_install(program: Option<&String>, invoked_as: &str) -> ExitCode {
         return ExitCode::from(1);
     };
     let cfg = crate::config::cached();
-    clear_removed(&layout, std::slice::from_ref(program));
+    if let Err(error) = clear_removed(&layout, std::slice::from_ref(program)) {
+        eprintln!("atpkg: {error}");
+        return ExitCode::FAILURE;
+    }
     cmd_install_with(
         program,
         &layout,
@@ -8075,7 +8223,7 @@ fn unlink_returns_to_alab(layout: &crate::store::Layout, program: &str) -> bool 
     }
     let active = std::fs::read_link(layout.program_current(program))
         .ok()
-        .and_then(|t| t.file_name()?.to_str()?.parse::<u64>().ok())
+        .and_then(|t| t.file_name()?.to_str()?.replace('+', "?").parse().ok())
         .is_some_and(|b| crate::alab::build_is_alab(layout, program, b));
     active
         || cached_index(layout).is_some_and(|index| {
@@ -8312,7 +8460,10 @@ fn roll_forward_interrupted_activations(
         return rolled;
     };
     let shims = crate::active_builds(layout);
-    let removed = layout.removed_programs();
+    let Ok(removed) = removed_programs(layout).inspect_err(|error| eprintln!("atpkg: {error}"))
+    else {
+        return rolled;
+    };
     let mut cached = Some(cached);
     let mut index: Option<Option<crate::TrustedIndex>> = None;
     for entry in entries.flatten() {
@@ -8990,7 +9141,9 @@ fn run_update_pass_in<'scope, 'env>(
             seams,
             reading.then(|| ReadsAhead {
                 reads,
-                until: first_run.then(|| std::time::Instant::now() + seams.vendor_read_grace),
+                until: first_run
+                    .then(|| std::time::Instant::now().checked_add(seams.vendor_read_grace))
+                    .flatten(),
             }),
         );
         if let Some(index) = set_index {
@@ -9244,6 +9397,9 @@ fn run_update_pass_in<'scope, 'env>(
             }
         };
         let (said, state, unusable) = match &serves_us {
+            Some(IndexServes::Unreadable(why)) => {
+                (why.clone(), "error: removal decisions unreadable", None)
+            }
             Some(IndexServes::Yes) => (
                 format!(
                     "nothing is installed and nothing was installable — ALab \
@@ -9305,6 +9461,7 @@ fn run_update_pass_in<'scope, 'env>(
     finish_update_pass(layout, now, reached, offline, code)
 }
 
+#[derive(Default)]
 struct DefaultSetOutcome {
     failures: u32,
     announced: bool,
@@ -9438,6 +9595,17 @@ fn install_default_set_inner(
     held_flip: &std::collections::BTreeSet<String>,
     companions: SetCompanions<'_, '_>,
 ) -> DefaultSetOutcome {
+    let removed = match removed_programs(layout) {
+        Ok(removed) => removed,
+        Err(error) => {
+            eprintln!("atpkg: {error}");
+            return DefaultSetOutcome {
+                failures: 1,
+                index_error: Some(error.to_string()),
+                ..Default::default()
+            };
+        }
+    };
     let SetCompanions {
         vendor: rider,
         toolchain_flipped,
@@ -9510,8 +9678,8 @@ fn install_default_set_inner(
     let groups = crate::apply::plan_groups_here(layout, index, ch, current_triple());
     let mut installed = crate::active_builds(layout);
     let mut wanted = wanted_programs(index, cfg, current_triple());
-    for p in removed_programs(layout) {
-        wanted.remove(&p);
+    for p in &removed {
+        wanted.remove(p);
     }
     for p in reconcile_system_satisfied_with(layout, index, &wanted, &mut installed, path_var) {
         wanted.remove(&p);
@@ -9614,7 +9782,7 @@ fn install_default_set_inner(
             })
             .map(|name| (name.as_str(), crate::state::agent_installing())),
     );
-    let removed_markers = removed_programs(layout);
+    let removed_markers = &removed;
     let mut skipped_narrowed: Vec<String> = Vec::new();
     for group in &groups {
         // A tuple only: an ungrouped member installs on its own.
@@ -10070,7 +10238,11 @@ fn prefetch_set_manifests(
     };
     let groups = crate::apply::plan_groups_here(layout, index, &ch, triple);
     let mut wanted = wanted_programs(index, cfg, triple);
-    for p in removed_programs(layout) {
+    let Ok(removed) = removed_programs(layout).inspect_err(|error| eprintln!("atpkg: {error}"))
+    else {
+        return;
+    };
+    for p in removed {
         wanted.remove(&p);
     }
     let linked: std::collections::BTreeSet<&str> = groups
@@ -10452,10 +10624,17 @@ fn install_toolset(
     fetcher: &dyn crate::flow::Fetcher,
     seams: &PassSeams<'_>,
 ) -> u8 {
+    let Ok(removed) = removed_programs(layout).inspect_err(|error| eprintln!("atpkg: {error}"))
+    else {
+        return 1;
+    };
+    let all_removed: Vec<String> = removed.into_iter().collect();
+    if let Err(error) = clear_removed(layout, &all_removed) {
+        eprintln!("atpkg: {error}");
+        return 1;
+    }
     reconcile_links(layout, cfg);
     clear_decline(layout);
-    let all_removed: Vec<String> = removed_programs(layout).into_iter().collect();
-    clear_removed(layout, &all_removed);
     clear_seed_adoption(layout);
     let before = crate::active_builds(layout);
     let live_before = crate::flow::live_verifications();
@@ -10685,13 +10864,14 @@ fn seed_serviceable(
     fetcher: &dyn crate::flow::Fetcher,
     index: &crate::TrustedIndex,
     cfg: &crate::config::PackagesConfig,
+    removed: &std::collections::BTreeSet<String>,
 ) -> Vec<String> {
     serviceable_among(
         layout,
         fetcher,
         index,
         &wanted_programs(index, cfg, current_triple()),
-        &removed_programs(layout),
+        removed,
     )
 }
 
@@ -10757,6 +10937,7 @@ enum IndexServes {
     Yes,
     Unserved(Vec<String>),
     Narrowed(Narrowing),
+    Unreadable(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -10800,7 +10981,11 @@ fn index_serves(
     index: &crate::TrustedIndex,
     cfg: &crate::config::PackagesConfig,
 ) -> IndexServes {
-    if !seed_serviceable(layout, fetcher, index, cfg).is_empty() {
+    let removed = match removed_programs(layout) {
+        Ok(removed) => removed,
+        Err(error) => return IndexServes::Unreadable(error.to_string()),
+    };
+    if !seed_serviceable(layout, fetcher, index, cfg, &removed).is_empty() {
         return IndexServes::Yes;
     }
     let unnarrowed = default_set_here(index, current_triple());
@@ -10814,7 +10999,6 @@ fn index_serves(
     if everything.is_empty() {
         return IndexServes::Unserved(served_triples(fetcher, index));
     }
-    let removed = removed_programs(layout);
     let narrowing = Narrowing {
         excluded: everything
             .iter()
@@ -11028,19 +11212,10 @@ fn size_parenthetical(sizes: SignedSizes) -> String {
     }
 }
 
-#[cfg(target_os = "macos")]
+/// Whether this process runs translated (Rosetta), as the kernel says, read in this process
+/// ([`aterm_uds::process::translation`]; never off Apple).
 fn running_translated() -> bool {
-    aterm_uds::spawnfd::command("/usr/sbin/sysctl")
-        .args(["-n", "sysctl.proc_translated"])
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .is_some_and(|out| String::from_utf8_lossy(&out.stdout).trim() == "1")
-}
-
-#[cfg(not(target_os = "macos"))]
-const fn running_translated() -> bool {
-    false
+    aterm_uds::process::translation() == aterm_uds::process::Translation::Translated
 }
 
 fn report_seedless_posture(layout: &crate::store::Layout) {
@@ -11058,8 +11233,21 @@ fn report_seedless_posture_as(
     read_cached_index: impl FnOnce() -> Option<crate::TrustedIndex>,
 ) {
     let triple = current_triple();
-    let served_here = !crate::active_builds(layout).is_empty()
-        || vendor_set_wanted_on(triple, cfg, &removed_programs(layout));
+    let removed = match removed_programs(layout) {
+        Ok(removed) => removed,
+        Err(error) => {
+            eprintln!("atpkg: {error}");
+            record_unbuilt(
+                layout,
+                "*toolset*",
+                "error: removal decisions unreadable",
+                error.to_string(),
+            );
+            return;
+        }
+    };
+    let served_here =
+        !crate::active_builds(layout).is_empty() || vendor_set_wanted_on(triple, cfg, &removed);
     if window_pass
         && !served_here
         && aterm_update_core::pkg_check::launch_due_in(
@@ -11084,6 +11272,15 @@ fn report_seedless_posture_as(
         .map(|index| index_serves(layout, &*fetcher, &index, cfg))
     });
     match serves_us {
+        Some(IndexServes::Unreadable(why)) => {
+            eprintln!("atpkg: {why}");
+            record_unbuilt(
+                layout,
+                "*toolset*",
+                "error: removal decisions unreadable",
+                why,
+            );
+        }
         Some(IndexServes::Unserved(served)) => {
             let why = unserved_sentence(triple, &served);
             emit_marker_line(&seed_unusable_line(&why));
@@ -11140,7 +11337,7 @@ fn recorded_unusable_body(
     let body = status.outcome.strip_prefix(NOTHING_INSTALLABLE_LEAD)?;
     if state != crate::state::TOOLSET_UNSERVED {
         let index = read_cached_index()?;
-        let removed = removed_programs(layout);
+        let removed = removed_programs(layout).ok()?;
         if wanted_programs(&index, cfg, current_triple())
             .iter()
             .any(|program| !removed.contains(program))
@@ -11711,7 +11908,20 @@ fn vendor_plan_reading(
         now: (seams.now)(),
         late: Vec::new(),
     };
-    let removed = removed_programs(layout);
+    let removed = match removed_programs(layout) {
+        Ok(removed) => removed,
+        Err(error) => {
+            eprintln!("atpkg: {error}");
+            return (
+                VendorPass {
+                    failures: 1,
+                    failed: vec![("*removals*".into(), error.to_string())],
+                    ..Default::default()
+                },
+                vendors,
+            );
+        }
+    };
     let runs: Vec<(&'static crate::vendor_direct::VendorSpec, bool, bool)> =
         crate::vendor_direct::VENDORS
             .iter()
@@ -11801,7 +12011,10 @@ fn read_vendors_ahead<'scope, 'env>(
     let Some(shared) = fetcher.shared() else {
         return false;
     };
-    let removed = removed_programs(layout);
+    let Ok(removed) = removed_programs(layout).inspect_err(|error| eprintln!("atpkg: {error}"))
+    else {
+        return false;
+    };
     let (trust, now, read_in) = (seams.trust, (seams.now)(), seams.read_ahead_in);
     for spec in crate::vendor_direct::VENDORS {
         let program = spec.program;
@@ -13055,6 +13268,7 @@ fn link_args(rest: &[String]) -> Result<LinkArgs<'_>, String> {
             }
             let secs = args
                 .next()
+                .filter(|value| !value.starts_with('+'))
                 .and_then(|value| value.parse::<u64>().ok())
                 .ok_or_else(|| format!("{arg} requires a number of seconds"))?;
             request.wait_lock = Some(std::time::Duration::from_secs(secs));
@@ -13244,7 +13458,7 @@ fn cmd_unlink(program: Option<&String>) -> ExitCode {
                 ),
             }
             if program == crate::seam::SEAM_PROGRAM {
-                if std::fs::symlink_metadata(crate::seam::store_current(&layout)).is_ok() {
+                if verified_current_build_dir(&layout, program).is_some() {
                     reassert_rustup_seam(&layout);
                 } else {
                     detach_rustup_seams(&layout);
@@ -13275,13 +13489,11 @@ fn restore_installed_shims(
     program: &str,
     owned: Option<&[String]>,
 ) -> std::io::Result<Restored> {
-    let current = layout.program_current(program);
-    if !current.exists() {
+    let Some(build_dir) = verified_current_build_dir(layout, program) else {
         return Ok(Restored::NoBuild);
-    }
-    let build_dir = std::fs::canonicalize(&current)?;
+    };
     let bin = build_dir.join("bin");
-    if !bin.is_dir() {
+    if !std::fs::symlink_metadata(&bin).is_ok_and(|m| m.is_dir()) {
         return Ok(Restored::NoBuild);
     }
     let Some(owned) = owned else {
@@ -13289,11 +13501,9 @@ fn restore_installed_shims(
     };
     let mut tools = Vec::new();
     for name in owned {
-        let file = bin.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
-        if !file.is_file() {
-            continue;
-        }
-        if let Some(tool) = crate::store::ToolName::new(name) {
+        if let Some(tool) = crate::store::ToolName::new(name)
+            && crate::ops::tool_in_build(&build_dir, &tool).is_some()
+        {
             tools.push(tool);
         }
     }
@@ -13345,6 +13555,20 @@ fn cmd_refresh(rest: &[String]) -> ExitCode {
     } else {
         ExitCode::from(1)
     }
+}
+
+fn verified_current_build_dir(
+    layout: &crate::store::Layout,
+    program: &str,
+) -> Option<std::path::PathBuf> {
+    let current = layout.program_current(program);
+    let target = crate::seam::absolute_target(&std::fs::read_link(&current).ok()?, &current);
+    let (owner, build) = crate::ops::store_build_of(&layout.prefix, &target)?;
+    if owner != program {
+        return None;
+    }
+    let build_dir = layout.build_dir(program, build);
+    crate::store::build_is_complete(&build_dir).then_some(build_dir)
 }
 
 #[cfg(test)]

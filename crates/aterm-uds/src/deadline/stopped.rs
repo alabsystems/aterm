@@ -373,8 +373,16 @@ mod tests {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
         // After the command name, the state is the first field and `utime` the twelfth.
         let mut fields = stat.get(stat.rfind(')')? + 1..)?.split_ascii_whitespace();
-        let utime: u64 = fields.nth(11)?.parse().ok()?;
-        let stime: u64 = fields.next()?.parse().ok()?;
+        let utime: u64 = fields
+            .nth(11)
+            .filter(|s| s.bytes().all(|b| b.is_ascii_digit()))?
+            .parse()
+            .ok()?;
+        let stime: u64 = fields
+            .next()
+            .filter(|s| s.bytes().all(|b| b.is_ascii_digit()))?
+            .parse()
+            .ok()?;
         // SAFETY: `sysconf` takes an integer and touches nothing of ours.
         let hz = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).ok()?;
         (utime + stime).checked_mul(1_000_000_000_u64.checked_div(hz)?)

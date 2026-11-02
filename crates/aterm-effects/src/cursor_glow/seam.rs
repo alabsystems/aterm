@@ -1782,7 +1782,16 @@ impl CursorGlow {
         if tainted || spoken_for {
             // Logged when contested (a typed stamp fresh, the in-flight batch, or an insert-width advance); a lone spinner tick is refused silently so it cannot push the drop's verdict out of the ring.
             if typed_fresh || in_flight || insert_admits.is_some() {
-                self.log_decline(now, (ar, pc), (ar, ac), Self::DECLINE_PROGRAM_ROW);
+                self.log_program_row_refusal(
+                    now,
+                    (ar, pc),
+                    (ar, ac),
+                    ProgramRowRefusal::AnchorContested {
+                        tainted,
+                        spoken_for,
+                    },
+                    None,
+                );
             }
             return;
         }
@@ -1796,7 +1805,16 @@ impl CursorGlow {
             };
             let hand_at_caret = self.hand_types_at_the_caret(cur);
             if foreign || hand_at_caret {
-                self.log_decline(now, (ar, pc), (ar, ac), Self::DECLINE_PROGRAM_ROW);
+                self.log_program_row_refusal(
+                    now,
+                    (ar, pc),
+                    (ar, ac),
+                    ProgramRowRefusal::ParkedAnchor {
+                        foreign_glyph: foreign,
+                        hand_at_caret,
+                    },
+                    None,
+                );
                 if foreign && Self::refused_below_the_caret(cur, ar) {
                     if hand_at_caret {
                         self.hold_the_live_presses(now);
@@ -2973,6 +2991,15 @@ impl CursorGlow {
             && exact_run.is_none()
             && (mv.typed_hinted || mv.in_flight_licence);
         if mv.landing_foreign || parked_redisplay {
+            let refusal = ProgramRowRefusal::VisibleLanding {
+                landing_foreign: mv.landing_foreign,
+                parked_redisplay,
+            };
+            let parked_boundary = if parked_redisplay {
+                self.unowned_caret.and_then(|caret| caret.boundary)
+            } else {
+                None
+            };
             if let Some(credits) = exact_credits {
                 self.type_press_ring = credits;
             }
@@ -2980,7 +3007,7 @@ impl CursorGlow {
             if parked_redisplay {
                 self.forget_typed_credits(now);
             }
-            self.log_decline(now, (pr, pc), (cr, cc), Self::DECLINE_PROGRAM_ROW);
+            self.log_program_row_refusal(now, (pr, pc), (cr, cc), refusal, parked_boundary);
             return false;
         }
         let gap = self.update_typing_thermals(&mv);
@@ -3093,6 +3120,7 @@ impl CursorGlow {
         let fire_meteor =
             mv.fire && !mv.typing && (mv.dr_abs >= 1 || mv.dc_abs >= Self::METEOR_MIN_COLS);
         let born_before = self.born_geometry_census();
+        let particles_before = self.particles.len();
         let hue_advances = self.spawn_move_light(
             &mv,
             gap,
@@ -3106,6 +3134,18 @@ impl CursorGlow {
         self.spawn_lightning(&mv);
         self.spawn_landing_ring(&mv, fire_meteor);
         self.spawn_burst_particles(&mv, fire_meteor);
+        if mv.typing {
+            // A typed move's particles live their tuned lives times the duration's share of
+            // the default, as its sparks do (`move_spark_life`): on a dark page Comet's dust
+            // and Sparkle's stars are most of the trail a typist sees.
+            let (_, scale) = super::typed_life_basis(cfg.duration, self.typed_life_unscaled());
+            let mut pi = particles_before.min(self.particles.len());
+            while pi < self.particles.len() {
+                let p = &mut self.particles[pi];
+                p.life = super::scaled_typed_life(p.life, scale);
+                pi += 1;
+            }
+        }
         if self.particles.len() > Self::MAX_PARTICLES {
             let drop = self.particles.len() - Self::MAX_PARTICLES;
             self.particles.drain(0..drop);

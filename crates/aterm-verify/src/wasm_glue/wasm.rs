@@ -151,6 +151,10 @@ impl<'a> Reader<'a> {
         }
         Ok(())
     }
+
+    const fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.pos)
+    }
 }
 
 impl<'a> Module<'a> {
@@ -173,24 +177,54 @@ impl<'a> Module<'a> {
             let start = r.pos;
             r.take(size)?;
             let end = r.pos;
+            if id != CUSTOM && m.sections.iter().any(|s| s.id == id) {
+                return Err(format!("duplicate section {id} at byte {start}"));
+            }
             let mut s = Reader::new(&bytes[..end], start);
             let name = match id {
                 CUSTOM => Some(s.name()?),
                 TYPE => {
                     m.types = Self::read_types(&mut s)?;
+                    if s.pos != end {
+                        return Err(format!("trailing bytes in TYPE section at byte {}", s.pos));
+                    }
                     None
                 }
                 IMPORT => {
                     m.imports = read_imports(&mut s)?;
+                    if s.pos != end {
+                        return Err(format!(
+                            "trailing bytes in IMPORT section at byte {}",
+                            s.pos
+                        ));
+                    }
                     None
                 }
                 FUNCTION => {
-                    let n = s.u32()?;
+                    let n = s.u32()? as usize;
+                    if n > s.remaining() {
+                        return Err(format!(
+                            "function count {n} exceeds remaining section bytes at byte {}",
+                            s.pos
+                        ));
+                    }
                     m.funcs = (0..n).map(|_| s.u32()).collect::<Result<_, _>>()?;
+                    if s.pos != end {
+                        return Err(format!(
+                            "trailing bytes in FUNCTION section at byte {}",
+                            s.pos
+                        ));
+                    }
                     None
                 }
                 EXPORT => {
                     m.exports = read_exports(&mut s)?;
+                    if s.pos != end {
+                        return Err(format!(
+                            "trailing bytes in EXPORT section at byte {}",
+                            s.pos
+                        ));
+                    }
                     None
                 }
                 _ => None,
@@ -206,15 +240,33 @@ impl<'a> Module<'a> {
     }
 
     fn read_types(r: &mut Reader<'_>) -> Result<Vec<FuncType>, String> {
-        let n = r.u32()?;
-        let mut out = Vec::with_capacity(n as usize);
+        let n = r.u32()? as usize;
+        if n > r.remaining() {
+            return Err(format!(
+                "type count {n} exceeds remaining section bytes at byte {}",
+                r.pos
+            ));
+        }
+        let mut out = Vec::with_capacity(n);
         for _ in 0..n {
             if r.byte()? != 0x60 {
                 return Err("a type that is not a plain function type".to_string());
             }
-            let np = r.u32()?;
+            let np = r.u32()? as usize;
+            if np > r.remaining() {
+                return Err(format!(
+                    "param count {np} exceeds remaining section bytes at byte {}",
+                    r.pos
+                ));
+            }
             let params = (0..np).map(|_| r.valtype()).collect::<Result<_, _>>()?;
-            let nr = r.u32()?;
+            let nr = r.u32()? as usize;
+            if nr > r.remaining() {
+                return Err(format!(
+                    "result count {nr} exceeds remaining section bytes at byte {}",
+                    r.pos
+                ));
+            }
             let results = (0..nr).map(|_| r.valtype()).collect::<Result<_, _>>()?;
             out.push(FuncType { params, results });
         }
@@ -303,8 +355,14 @@ fn kind(b: u8) -> Result<Kind, String> {
 }
 
 fn read_imports(r: &mut Reader<'_>) -> Result<Vec<Import>, String> {
-    let n = r.u32()?;
-    let mut out = Vec::with_capacity(n as usize);
+    let n = r.u32()? as usize;
+    if n > r.remaining() {
+        return Err(format!(
+            "import count {n} exceeds remaining section bytes at byte {}",
+            r.pos
+        ));
+    }
+    let mut out = Vec::with_capacity(n);
     for _ in 0..n {
         let module = r.name()?;
         let name = r.name()?;
@@ -342,10 +400,19 @@ fn read_imports(r: &mut Reader<'_>) -> Result<Vec<Import>, String> {
 }
 
 fn read_exports(r: &mut Reader<'_>) -> Result<Vec<Export>, String> {
-    let n = r.u32()?;
-    let mut out = Vec::with_capacity(n as usize);
+    let n = r.u32()? as usize;
+    if n > r.remaining() {
+        return Err(format!(
+            "export count {n} exceeds remaining section bytes at byte {}",
+            r.pos
+        ));
+    }
+    let mut out = Vec::with_capacity(n);
     for _ in 0..n {
         let name = r.name()?;
+        if out.iter().any(|e: &Export| e.name == name) {
+            return Err(format!("duplicate export {name:?}"));
+        }
         let k = kind(r.byte()?)?;
         out.push(Export {
             name,
@@ -455,5 +522,21 @@ pub(crate) mod tests {
         assert!(Module::parse(b"\0asm\x02\0\0\0").is_err());
         let bytes = sample(&[]);
         assert!(Module::parse(&bytes[..bytes.len() - 2]).is_err());
+
+        let mut oversized_funcs = MAGIC.to_vec();
+        oversized_funcs.extend([FUNCTION, 2, 0xff, 0x01]);
+        assert!(Module::parse(&oversized_funcs).is_err());
+
+        let mut trailing_funcs = MAGIC.to_vec();
+        trailing_funcs.extend([FUNCTION, 3, 1, 0, 99]);
+        assert!(Module::parse(&trailing_funcs).is_err());
+
+        let mut dup_func_section = MAGIC.to_vec();
+        dup_func_section.extend([FUNCTION, 2, 1, 0, FUNCTION, 2, 1, 0]);
+        assert!(Module::parse(&dup_func_section).is_err());
+
+        let mut dup_export = MAGIC.to_vec();
+        dup_export.extend([EXPORT, 9, 2, 1, b'g', 0, 0, 1, b'g', 0, 1]);
+        assert!(Module::parse(&dup_export).is_err());
     }
 }

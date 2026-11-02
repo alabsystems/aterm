@@ -12,12 +12,126 @@ use crate::paths::Paths;
 pub const INSTALLED_LABEL: &str = "com.aterm.aterm.acaffiene";
 /// The prefix of any other build's label.
 pub const DEV_LABEL_PREFIX: &str = "com.aterm.aterm.acaffiene.dev";
-/// The installed app's executable.
+/// The installed app's executable in `/Applications` ([`installed_executables`] has
+/// `~/Applications` too).
 pub const INSTALLED_EXECUTABLE: &str = "/Applications/aterm.app/Contents/MacOS/aterm";
+
+/// Where aterm installs itself, as the executable in each, in the order aterm-update's first
+/// launch picks: `/Applications` ([`INSTALLED_EXECUTABLE`]) for a person who can write it, else
+/// `~/Applications` under `home`.
+#[must_use]
+pub fn installed_executables(home: &Path) -> [std::path::PathBuf; 2] {
+    [
+        std::path::PathBuf::from(INSTALLED_EXECUTABLE),
+        home.join("Applications")
+            .join("aterm.app")
+            .join("Contents")
+            .join("MacOS")
+            .join("aterm"),
+    ]
+}
+
+/// The [`installed_executables`] under `home` that are there.
+#[must_use]
+pub fn installed_present(home: &Path) -> Vec<std::path::PathBuf> {
+    installed_executables(home)
+        .into_iter()
+        .filter(|exe| exe.is_file())
+        .collect()
+}
+
+/// Whether `exe` (canonical) is an installed app's executable ([`installed_executables`]), as
+/// spelled or resolved.
+#[must_use]
+pub fn is_installed(exe: &Path, home: &Path) -> bool {
+    installed_executables(home)
+        .iter()
+        .any(|installed| same_exe(installed, exe))
+}
+
+/// Whether `a` names `b`: spelled alike, or `a` resolves to `b`.
+pub(crate) fn same_exe(a: &Path, b: &Path) -> bool {
+    a == b || std::fs::canonicalize(a).is_ok_and(|a| a == b)
+}
+
+/// The installed app whose mug a pass with no window keeps ([`serving_install`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Installed {
+    /// Its executable, which has the `acaffiene` verb.
+    At(std::path::PathBuf),
+    /// None is installed, or each one installed is an aterm with no `acaffiene` verb, whose own
+    /// Caffeine, if any, is its own: why.
+    Absent(String),
+    /// One did not say whether it has the verb (its first exec macOS still assesses, say): why.
+    /// The next pass asks again.
+    Unanswered(String),
+}
+
+/// The first of `present` ([`installed_present`]) that has the `acaffiene` verb: `own`, this
+/// process's executable, without asking, and any other as `serves` answers
+/// ([`crate::code::serves_acaffiene`]). An installed aterm older than the verb is never started
+/// as an aCaffiene job, which its KeepAlive would start again every ten seconds.
+#[must_use]
+pub fn serving_install(
+    present: &[std::path::PathBuf],
+    own: Option<&Path>,
+    serves: impl Fn(&Path) -> Option<bool>,
+) -> Installed {
+    if present.is_empty() {
+        return Installed::Absent(
+            "aterm.app is not installed in /Applications or ~/Applications".to_string(),
+        );
+    }
+    let mut older = Vec::new();
+    let mut unanswered = Vec::new();
+    for exe in present {
+        if own.is_some_and(|own| same_exe(exe, own)) {
+            return Installed::At(exe.clone());
+        }
+        match serves(exe) {
+            Some(true) => return Installed::At(exe.clone()),
+            Some(false) => older.push(format!(
+                "{} has no `acaffiene` verb (an aterm older than aCaffiene)",
+                exe.display()
+            )),
+            None => unanswered.push(format!("{} did not answer `help acaffiene`", exe.display())),
+        }
+    }
+    if unanswered.is_empty() {
+        Installed::Absent(older.join("; "))
+    } else {
+        Installed::Unanswered(
+            unanswered
+                .into_iter()
+                .chain(older)
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
+    }
+}
+
 /// What the job runs after its program.
 pub const SERVE_ARGS: [&str; 2] = ["acaffiene", "serve"];
 /// The exit status `serve` ends with when the code it was started from changed (an update).
 pub const EXIT_RESTART: u8 = 75;
+/// The exit status of a `serve` that could not keep the Mac awake for a reason that can clear
+/// up (a full disk, a copy or a save that failed, a lock another process holds a moment):
+/// launchd's KeepAlive starts it again ([`crate::trouble`] records why). A refusal no start
+/// again cures exits 0 with its trouble recorded, for `aterm doctor` and the window to report.
+pub const EXIT_RETRY: u8 = 69;
+
+/// How long a `serve` run as its job waits before it exits [`EXIT_RETRY`]: launchd starts a job
+/// that ran this long again at once, so a trouble that lasts costs a start a minute rather than
+/// one every ten seconds (launchd's throttle).
+pub const RETRY_PAUSE: std::time::Duration = std::time::Duration::from_secs(50);
+
+/// Wait [`RETRY_PAUSE`] when this process runs as a mug's launchd job (`XPC_SERVICE_NAME` names
+/// one); a `serve` run by hand, or a test, goes on at once.
+pub fn pause_before_retry() {
+    if std::env::var("XPC_SERVICE_NAME").is_ok_and(|name| is_label(&name)) {
+        std::thread::sleep(RETRY_PAUSE);
+    }
+}
 
 /// The launchctl binary.
 #[cfg(unix)]
@@ -196,6 +310,32 @@ pub fn set_startup(paths: &Paths, label: &str, program: &Path, on: bool) -> io::
         bundle_id_of(program).as_deref(),
     );
     aterm_uds::atomic_file::write(&plist, text.as_bytes(), 0o644)
+}
+
+/// The person's own Enable at Startup for `label`: [`set_startup`], and a record of an off
+/// ([`Paths::startup_off_file`]) that no launch overrides ([`startup_turned_off`]); an on
+/// removes it.
+/// # Errors
+/// As [`set_startup`], or the record cannot be written or removed.
+pub fn choose_startup(paths: &Paths, label: &str, program: &Path, on: bool) -> io::Result<()> {
+    set_startup(paths, label, program, on)?;
+    let record = paths.startup_off_file(label);
+    if on {
+        return match std::fs::remove_file(&record) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        };
+    }
+    if let Some(dir) = record.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&record, b"Enable at Startup turned off by the person\n")
+}
+
+/// Whether the person turned Enable at Startup off for `label` ([`choose_startup`]).
+#[must_use]
+pub fn startup_turned_off(paths: &Paths, label: &str) -> bool {
+    paths.startup_off_file(label).is_file()
 }
 
 /// Enable at Startup.
@@ -455,10 +595,10 @@ pub enum JobState {
 pub fn print_pid(text: &str) -> Option<u32> {
     text.lines().find_map(|line| {
         let top = line.strip_prefix('\t')?;
-        top.strip_prefix("pid = ")?
-            .trim_end()
-            .parse()
-            .ok()
+        let s = top.strip_prefix("pid = ")?.trim_end();
+        (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| s.parse().ok())
+            .flatten()
             .filter(|pid| *pid > 0)
     })
 }
@@ -482,7 +622,7 @@ pub enum Started {
 fn launchctl(argv: &[String]) -> io::Result<std::process::Output> {
     let mut cmd = aterm_uds::spawnfd::command(LAUNCHCTL);
     cmd.args(argv);
-    aterm_uds::deadline::output_until(&mut cmd, std::time::Instant::now() + LAUNCHCTL_HANG)
+    aterm_uds::deadline::output_within(&mut cmd, LAUNCHCTL_HANG)
         .map_err(|e| io::Error::other(format!("launchctl {}: {e}", argv.join(" "))))
 }
 
@@ -680,6 +820,67 @@ mod tests {
         ] {
             assert_ne!(label_for(Path::new(other)), INSTALLED_LABEL, "{other}");
         }
+    }
+
+    /// aterm installs itself in `/Applications`, or in `~/Applications` for a person who cannot
+    /// write it (aterm-update's first launch): either is the installed app, and a dev build or
+    /// another bundle is not.
+    #[test]
+    fn an_install_in_either_applications_folder_is_installed() {
+        let home = Path::new("/Users//x");
+        let [system, own] = installed_executables(home);
+        assert_eq!(system, Path::new(INSTALLED_EXECUTABLE));
+        assert_eq!(
+            own,
+            Path::new("/Users//x/Applications/aterm.app/Contents/MacOS/aterm")
+        );
+        assert!(is_installed(&system, home));
+        assert!(is_installed(&own, home), "a non-admin's install");
+        for not in [
+            "/Users//x/aterm/target/debug/aterm",
+            "/Applications/aterm (dev).app/Contents/MacOS/aterm",
+            "/Users//y/Applications/aterm.app/Contents/MacOS/aterm",
+        ] {
+            assert!(!is_installed(Path::new(not), home), "{not}");
+        }
+    }
+
+    /// The pass keeps the first installed app that has the verb: its own executable without
+    /// asking; an older aterm is never started as the job; one that did not answer is asked
+    /// again by the next pass.
+    #[test]
+    fn the_pass_keeps_an_installed_app_that_serves_acaffiene() {
+        let system = std::path::PathBuf::from(INSTALLED_EXECUTABLE);
+        let own = std::path::PathBuf::from("/Users//x/Applications/aterm.app/Contents/MacOS/aterm");
+        assert!(matches!(
+            serving_install(&[], None, |_| panic!("nothing to ask")),
+            Installed::Absent(_)
+        ));
+        assert_eq!(
+            serving_install(std::slice::from_ref(&own), Some(&own), |_| panic!(
+                "its own verb"
+            )),
+            Installed::At(own.clone())
+        );
+        assert_eq!(
+            serving_install(&[system.clone(), own.clone()], None, |exe| Some(exe == own)),
+            Installed::At(own.clone()),
+            "0.144 in /Applications, a newer aterm in ~/Applications"
+        );
+        let older = serving_install(std::slice::from_ref(&system), None, |_| Some(false));
+        assert!(
+            matches!(&older, Installed::Absent(why) if why.contains("no `acaffiene` verb")),
+            "{older:?}"
+        );
+        assert!(matches!(
+            serving_install(&[system.clone(), own], None, |exe| (exe != system)
+                .then_some(false)),
+            Installed::Unanswered(_)
+        ));
+        assert_eq!(
+            serving_install(std::slice::from_ref(&system), None, |_| Some(true)),
+            Installed::At(system)
+        );
     }
 
     #[test]
@@ -1173,5 +1374,12 @@ mod tests {
             .collect();
         assert_eq!(answered, [(session, Err(io::ErrorKind::PermissionDenied))]);
         assert!(stuck.exists(), "an unlisted folder's stay");
+    }
+
+    #[test]
+    fn print_pid_rejects_signed_numbers() {
+        assert_eq!(print_pid("\tpid = 42\n"), Some(42));
+        assert_eq!(print_pid("\tpid = +42\n"), None);
+        assert_eq!(print_pid("\tpid = -1\n"), None);
     }
 }

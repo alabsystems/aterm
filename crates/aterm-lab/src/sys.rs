@@ -19,6 +19,29 @@ pub fn alive(pid: i32) -> bool {
     pid > 1 && unsafe { libc::kill(pid, 0) } == 0
 }
 
+/// The process macOS charges `pid`'s privacy requests to, if its responsibility
+/// query is available and names a process.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn responsible_pid(pid: i32) -> Option<i32> {
+    type Responsible = unsafe extern "C" fn(libc::pid_t) -> libc::pid_t;
+    // SAFETY: a NUL-terminated name, with RTLD_DEFAULT requesting a global lookup.
+    let found = unsafe {
+        libc::dlsym(
+            libc::RTLD_DEFAULT,
+            c"responsibility_get_pid_responsible_for_pid".as_ptr(),
+        )
+    };
+    if found.is_null() || pid <= 1 {
+        return None;
+    }
+    // SAFETY: this symbol has the C prototype pid_t f(pid_t), exactly Responsible.
+    let responsible = unsafe { std::mem::transmute::<*mut libc::c_void, Responsible>(found) };
+    // SAFETY: one positive process id; the query does not mutate the process.
+    let owner = unsafe { responsible(pid) };
+    (owner > 1).then_some(owner)
+}
+
 /// Send `sig` to `pid` (> 1; see [`alive`]).
 pub fn kill(pid: i32, sig: i32) -> io::Result<()> {
     if pid <= 1 {
@@ -62,12 +85,7 @@ pub fn kill_group(pgid: i32, sig: i32) -> io::Result<()> {
 
 /// Probe whether `kill(pid, sig)` succeeds.
 pub fn signal_probe(pid: i32, sig: i32) -> io::Result<()> {
-    // SAFETY: as [`kill`].
-    if unsafe { libc::kill(pid, sig) } == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+    kill(pid, sig)
 }
 
 /// Parent PID of this process.
@@ -202,8 +220,8 @@ pub fn local_time(secs: i64) -> (i32, u32, u32, u32, u32, u32) {
     let tm = local_tm(secs);
     let u = |v: libc::c_int| u32::try_from(v).unwrap_or(0);
     (
-        tm.tm_year + 1900,
-        u(tm.tm_mon + 1),
+        tm.tm_year.saturating_add(1900),
+        u(tm.tm_mon.saturating_add(1)),
         u(tm.tm_mday),
         u(tm.tm_hour),
         u(tm.tm_min),
@@ -232,24 +250,73 @@ fn local_tm(secs: i64) -> Tm {
 }
 
 unsafe extern "C" {
-    fn devname(dev: libc::dev_t, kind: libc::mode_t) -> *const libc::c_char;
+    fn newlocale(
+        mask: libc::c_int,
+        locale: *const libc::c_char,
+        base: *mut libc::c_void,
+    ) -> *mut libc::c_void;
+    fn freelocale(locale: *mut libc::c_void) -> libc::c_int;
+    fn nl_langinfo_l(item: libc::c_int, locale: *mut libc::c_void) -> *const libc::c_char;
 }
 
-/// Terminal device name (`devname`) for `dev`, or `??` when none.
+/// `<_locale_posix2008.h>`'s mask of each locale category, by the variable that names it.
+const LOCALE_MASKS: [(&str, libc::c_int); 6] = [
+    ("LC_COLLATE", 1 << 0),
+    ("LC_CTYPE", 1 << 1),
+    ("LC_MESSAGES", 1 << 2),
+    ("LC_MONETARY", 1 << 3),
+    ("LC_NUMERIC", 1 << 4),
+    ("LC_TIME", 1 << 5),
+];
+
+/// `<_langinfo.h>`'s `CODESET`.
+const CODESET: libc::c_int = 0;
+
+/// The codeset of the locale `name` loaded for `category` (a variable's name: `LC_CTYPE`,
+/// `LC_COLLATE`, …) by the loader `setlocale` uses, C's for a category other than `LC_CTYPE`;
+/// `None` for a name that category cannot load, or a category no variable names.
+#[must_use]
+pub fn locale_codeset(category: &str, name: &str) -> Option<String> {
+    let (_, mask) = LOCALE_MASKS.iter().find(|(c, _)| *c == category)?;
+    let name = std::ffi::CString::new(name).ok()?;
+    // SAFETY: a NUL-terminated name and no base locale; a null answer is no such locale.
+    let made = unsafe { newlocale(*mask, name.as_ptr(), std::ptr::null_mut()) };
+    if made.is_null() {
+        return None;
+    }
+    // SAFETY: `made` is a live locale object and `CODESET` an item it answers.
+    let p = unsafe { nl_langinfo_l(CODESET, made) };
+    let codeset = (!p.is_null()).then(|| {
+        // SAFETY: a non-null answer is a NUL-terminated string `made` holds, copied out here
+        // before `made` is freed.
+        unsafe { std::ffi::CStr::from_ptr(p) }
+            .to_string_lossy()
+            .into_owned()
+    });
+    // SAFETY: `made` came from `newlocale` and is freed once, here, after its last read.
+    unsafe { freelocale(made) };
+    Some(codeset.unwrap_or_default())
+}
+
+/// Terminal device name for `dev`, or `??` when none.
+///
+/// A macOS pseudo-terminal slave (major 16, the minor its number) is named from the
+/// device number alone, as `aterm-sysprobe`'s `term_node` derives its node; any other
+/// terminal device is named by its number (`dev<major>.<minor>`). `devname(3)` is
+/// never called: it scans `/dev` and `lstat`s every node it passes, so one wedged
+/// node blocks the caller without bound (a fresh shell's `ttyname` hangs the same way).
 #[must_use]
 pub fn tty_name(dev: Option<i32>) -> String {
     let Some(dev) = dev.filter(|d| *d != 0) else {
         return "??".into();
     };
-    // SAFETY: `devname` reads its two integer arguments and returns a static buffer or null.
-    let p = unsafe { devname(dev, libc::S_IFCHR) };
-    if p.is_null() {
-        return "??".into();
+    let dev = dev.cast_unsigned();
+    let (major, minor) = (dev >> 24 & 0xff, dev & 0x00ff_ffff);
+    if major == 16 {
+        format!("ttys{minor:03}")
+    } else {
+        format!("dev{major}.{minor}")
     }
-    // SAFETY: a non-null answer is a NUL-terminated string in `devname`'s own buffer.
-    unsafe { std::ffi::CStr::from_ptr(p) }
-        .to_string_lossy()
-        .into_owned()
 }
 
 static SIGNAL_WR: AtomicI32 = AtomicI32::new(-1);
@@ -269,6 +336,7 @@ extern "C" fn on_signal(sig: libc::c_int) {
 }
 
 /// Current signal disposition (`SIG_DFL`, `SIG_IGN`, or handler address) for `sig`.
+#[cfg(test)]
 pub fn disposition(sig: libc::c_int) -> io::Result<libc::sighandler_t> {
     // SAFETY: a null new action only reads the current one into `old`, a zeroed `sigaction` (a valid value) that outlives the call.
     unsafe {
@@ -299,6 +367,20 @@ pub struct SignalPipe {
 impl SignalPipe {
     /// Install the self-pipe handler for `signals`, leaving `SIG_IGN` signals ignored.
     pub fn install(signals: &[libc::c_int]) -> io::Result<Self> {
+        let mut to_set: Vec<(libc::c_int, libc::sigaction)> = Vec::new();
+        for &sig in signals {
+            // SAFETY: a null new action only reads the current one into `old`, a zeroed `sigaction` (a valid value) that outlives the call.
+            let old = unsafe {
+                let mut old: libc::sigaction = std::mem::zeroed();
+                if libc::sigaction(sig, std::ptr::null(), &raw mut old) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                old
+            };
+            if old.sa_sigaction != libc::SIG_IGN {
+                to_set.push((sig, old));
+            }
+        }
         let mut fds = [0 as libc::c_int; 2];
         // SAFETY: `fds` is a two-int array, as `pipe(2)` requires.
         if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
@@ -311,21 +393,29 @@ impl SignalPipe {
                 libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
             }
         }
-        SIGNAL_WR.store(fds[1], Ordering::Relaxed);
-        for &sig in signals {
-            if disposition(sig)? == libc::SIG_IGN {
-                continue;
-            }
+        let prev_wr = SIGNAL_WR.swap(fds[1], Ordering::Relaxed);
+        for (idx, &(sig, _)) in to_set.iter().enumerate() {
             // SAFETY: a zeroed `sigaction` is a valid starting value; the handler
             // is an `extern "C" fn(c_int)` that only calls async-signal-safe code.
-            unsafe {
+            let rc = unsafe {
                 let mut sa: libc::sigaction = std::mem::zeroed();
                 sa.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
                 sa.sa_flags = libc::SA_RESTART;
                 libc::sigemptyset(&raw mut sa.sa_mask);
-                if libc::sigaction(sig, &sa, std::ptr::null_mut()) != 0 {
-                    return Err(io::Error::last_os_error());
+                libc::sigaction(sig, &sa, std::ptr::null_mut())
+            };
+            if rc != 0 {
+                let err = io::Error::last_os_error();
+                for &(prev_sig, ref old) in &to_set[..idx] {
+                    // SAFETY: `old` is the prior `sigaction` just read for `prev_sig`.
+                    unsafe {
+                        let _ = libc::sigaction(prev_sig, old, std::ptr::null_mut());
+                    }
                 }
+                SIGNAL_WR.store(prev_wr, Ordering::Relaxed);
+                close(fds[0]);
+                close(fds[1]);
+                return Err(err);
             }
         }
         Ok(Self { read_fd: fds[0] })
@@ -510,6 +600,24 @@ pub fn max_footprint() -> Option<u64> {
     Some(info.ri_lifetime_max_phys_footprint)
 }
 
+/// What `pid` has used since it started (`proc_pid_rusage`, `RUSAGE_INFO_V4`), or `None` when
+/// the call fails (it exited, or this user may not read it).
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn rusage(pid: i32) -> Option<libc::rusage_info_v4> {
+    let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
+    // SAFETY: `info` is writable for one `rusage_info_v4`, the flavor asked for.
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            pid,
+            libc::RUSAGE_INFO_V4,
+            info.as_mut_ptr().cast::<libc::rusage_info_t>(),
+        )
+    };
+    // SAFETY: zeroed at creation, so initialized whatever the call did.
+    (rc == 0).then(|| unsafe { info.assume_init() })
+}
+
 /// Block until `pid`, this process's own child, exits (a stop, trap or continue report Darwin's `waitid` gives under `WEXITED` is consumed by `WSTOPPED | WCONTINUED | WNOHANG`, which cannot reap, backing off while nothing is consumed), and leave it unreaped (`WNOWAIT`), so the pid names it until a wait reaps it.
 ///
 /// # Errors
@@ -669,11 +777,13 @@ pub fn udp_connect(ip: [u8; 4], port: u16) -> io::Result<()> {
 
 unsafe extern "C" {
     static bootstrap_port: libc::c_uint;
+    static mach_task_self_: libc::c_uint;
     fn bootstrap_look_up(
         bp: libc::c_uint,
         name: *const libc::c_char,
         sp: *mut libc::c_uint,
     ) -> libc::c_int;
+    fn mach_port_deallocate(task: libc::c_uint, name: libc::c_uint) -> libc::c_int;
 }
 
 /// Query `bootstrap_look_up` for Mach service `name`.
@@ -683,7 +793,13 @@ pub fn mach_look_up(name: &str) -> i32 {
     let mut port: libc::c_uint = 0;
     // SAFETY: `bootstrap_port` is the task's bootstrap port, set by the runtime
     // before `main`; `c` is a valid C string and `port` a valid out-pointer.
-    unsafe { bootstrap_look_up(bootstrap_port, c.as_ptr(), &raw mut port) }
+    let kr = unsafe { bootstrap_look_up(bootstrap_port, c.as_ptr(), &raw mut port) };
+    if kr == 0 && port != 0 {
+        // SAFETY: `bootstrap_look_up` granted a send right on `port` in our IPC space;
+        // `mach_task_self_` is libSystem's cached task port.
+        let _ = unsafe { mach_port_deallocate(mach_task_self_, port) };
+    }
+    kr
 }
 
 /// Symbolic errno name (e.g. `EPERM`) or decimal fallback for `code`.
@@ -872,6 +988,8 @@ pub fn coalition_ids(pid: i32) -> Option<[u64; 2]> {
 const PROC_PIDLISTTHREADIDS: libc::c_int = 28;
 #[cfg(target_os = "macos")]
 const PROC_PIDTHREADID64INFO: libc::c_int = 15;
+#[cfg(target_os = "macos")]
+const PROC_PIDTASKINFO: libc::c_int = 4;
 
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
@@ -900,13 +1018,93 @@ fn thread_priority(pid: i32, tid: u64) -> Option<i32> {
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn main_thread_priority(pid: i32) -> Option<i32> {
+    thread_priority(pid, *thread_ids(pid)?.iter().min()?)
+}
+
+/// The ids of `pid`'s threads (`PROC_PIDLISTTHREADIDS`), at most 512; the main thread's is the
+/// least.
+#[cfg(target_os = "macos")]
+fn thread_ids(pid: i32) -> Option<Vec<u64>> {
     let mut ids = [0u64; 512];
     let size = libc::c_int::try_from(std::mem::size_of_val(&ids)).ok()?;
     // SAFETY: `ids` is a writable buffer of exactly `size` bytes for the call.
     let got =
         unsafe { libc::proc_pidinfo(pid, PROC_PIDLISTTHREADIDS, 0, ids.as_mut_ptr().cast(), size) };
     let n = usize::try_from(got).ok()? / std::mem::size_of::<u64>();
-    thread_priority(pid, *ids.get(..n)?.iter().min()?)
+    Some(ids.get(..n)?.to_vec())
+}
+
+/// One live thread's CPU time ([`thread_cpu_ns`]).
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadCpu {
+    /// The thread's id (`PROC_PIDLISTTHREADIDS`).
+    pub tid: u64,
+    /// Its name (`pthread_setname_np`), empty where it has none.
+    pub name: String,
+    /// User plus system time it has run, ns.
+    pub ns: u64,
+}
+
+/// The CPU time each live thread of `pid` has run, user plus system, in ns
+/// (`PROC_PIDTHREADID64INFO`'s `pth_user_time` and `pth_system_time`), with its name, by thread
+/// id, least (the main thread) first. A thread that exits between the list and its read is left
+/// out.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn thread_cpu_ns(pid: i32) -> Option<Vec<ThreadCpu>> {
+    let mut ids = thread_ids(pid)?;
+    ids.sort_unstable();
+    Some(
+        ids.into_iter()
+            .filter_map(|tid| {
+                // SAFETY: an all-zero `proc_threadinfo` is valid (integers and a byte array).
+                let mut info: libc::proc_threadinfo = unsafe { std::mem::zeroed() };
+                let size = libc::c_int::try_from(std::mem::size_of_val(&info)).ok()?;
+                // SAFETY: `info` is a writable buffer of exactly `size` bytes for the call.
+                let got = unsafe {
+                    libc::proc_pidinfo(
+                        pid,
+                        PROC_PIDTHREADID64INFO,
+                        tid,
+                        (&raw mut info).cast(),
+                        size,
+                    )
+                };
+                (got == size).then(|| {
+                    let name: Vec<u8> = info
+                        .pth_name
+                        .iter()
+                        .take_while(|&&c| c != 0)
+                        .map(|&c| c as u8)
+                        .collect();
+                    ThreadCpu {
+                        tid,
+                        name: String::from_utf8_lossy(&name).into_owned(),
+                        ns: info.pth_user_time + info.pth_system_time,
+                    }
+                })
+            })
+            .collect(),
+    )
+}
+
+/// The CPU time `pid` has run, user plus system, every thread it ever had, in ns
+/// (`PROC_PIDTASKINFO`'s totals, which count host ticks: converted by [`mach_timebase`]).
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn process_cpu_ns(pid: i32) -> Option<u64> {
+    // SAFETY: an all-zero `proc_taskinfo` is valid (integers only).
+    let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+    let size = libc::c_int::try_from(std::mem::size_of_val(&info)).ok()?;
+    // SAFETY: `info` is a writable buffer of exactly `size` bytes for the call.
+    let got = unsafe { libc::proc_pidinfo(pid, PROC_PIDTASKINFO, 0, (&raw mut info).cast(), size) };
+    if got != size {
+        return None;
+    }
+    let (numer, denom) = mach_timebase()?;
+    let ticks = u128::from(info.pti_total_user) + u128::from(info.pti_total_system);
+    u64::try_from(ticks * u128::from(numer) / u128::from(denom)).ok()
 }
 
 /// How many descriptors `pid` has open, counted from its table alone (`PROC_PIDLISTFDS`): no
@@ -928,7 +1126,8 @@ pub fn fd_count(pid: i32) -> Option<usize> {
             };
             slots
         ];
-        let size = libc::c_int::try_from(slots * ENTRY).ok()?;
+        let byte_cap = slots.checked_mul(ENTRY)?;
+        let size = libc::c_int::try_from(byte_cap).ok()?;
         // SAFETY: errno is this thread's own.
         unsafe { *libc::__error() = 0 };
         // SAFETY: `table` is `size` writable bytes of the entries this flavor writes.
@@ -946,10 +1145,10 @@ pub fn fd_count(pid: i32) -> Option<usize> {
         }
         let got = usize::try_from(got).ok().filter(|n| *n > 0)?;
         // A full buffer may have cut the table short: read it again with more room.
-        if got < slots * ENTRY {
+        if got < byte_cap {
             return Some(got / ENTRY);
         }
-        slots *= 2;
+        slots = slots.saturating_mul(2);
     }
     None
 }
@@ -1414,6 +1613,104 @@ fn put_inode_at(dir: RawFd, name: &CString) -> Option<(libc::dev_t, libc::ino_t)
         .then_some((st.st_dev, st.st_ino))
 }
 
+/// A new output directory retained across work outside the jail.
+pub struct NewOutputDir {
+    parent: std::os::fd::OwnedFd,
+    dir: std::os::fd::OwnedFd,
+    name: CString,
+    path: std::path::PathBuf,
+}
+
+impl NewOutputDir {
+    /// Create `path` exclusively under its existing, pinned parent.
+    /// # Errors
+    /// The parent cannot be resolved or opened, the destination exists, or creation or identity checks fail.
+    pub fn create(path: &std::path::Path) -> io::Result<Self> {
+        use std::os::fd::AsRawFd as _;
+        let name = path.file_name().ok_or(io::ErrorKind::InvalidInput)?;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .canonicalize()?;
+        let path = parent.join(name);
+        let (parent, name) = open_parent(&path)?.ok_or(io::ErrorKind::NotFound)?;
+        // SAFETY: the parent descriptor and one NUL-terminated name remain live.
+        if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the parent is pinned; O_NOFOLLOW refuses a link replacing the new entry.
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let output = Self {
+            parent,
+            dir: own_fd(fd),
+            name,
+            path,
+        };
+        output.intact()?;
+        Ok(output)
+    }
+
+    fn intact(&self) -> io::Result<()> {
+        use std::os::fd::AsRawFd as _;
+        let identity = put_inode(self.dir.as_raw_fd())?;
+        let named = entry_stat(&self.path)?;
+        if put_inode_at(self.parent.as_raw_fd(), &self.name) != Some(identity)
+            || !named.is_some_and(|entry| {
+                entry.kind == libc::S_IFDIR
+                    && entry.dev == u64::try_from(identity.0).unwrap_or(u64::MAX)
+                    && entry.ino == identity.1
+            })
+        {
+            return Err(io::Error::other("output directory was replaced"));
+        }
+        Ok(())
+    }
+
+    /// Create one artifact exclusively inside the held directory, without following links.
+    /// # Errors
+    /// `name` is not one component, it already exists, a write fails, or the directory or artifact is replaced.
+    pub fn write(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
+        use std::os::fd::AsRawFd as _;
+        let mut components = std::path::Path::new(name).components();
+        if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+            || components.next().is_some()
+        {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let name = cname(std::ffi::OsStr::new(name))?;
+        self.intact()?;
+        // SAFETY: the held directory and single name are live. O_EXCL and O_NOFOLLOW
+        // refuse any existing entry; writes use only the newly created descriptor.
+        let fd = unsafe {
+            libc::openat(
+                self.dir.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600 as libc::c_uint,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let fd = own_fd(fd);
+        write_all(fd.as_raw_fd(), bytes)?;
+        if put_inode_at(self.dir.as_raw_fd(), &name) != Some(put_inode(fd.as_raw_fd())?) {
+            return Err(io::Error::other("output artifact was replaced"));
+        }
+        self.intact()
+    }
+}
+
 /// Unlink the entry at absolute `path` without following symlinks.
 pub fn scratch_remove(path: &std::path::Path) -> io::Result<()> {
     let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
@@ -1604,18 +1901,17 @@ pub fn phys_footprint(pid: i32) -> Option<u64> {
     if pid <= 1 {
         return None;
     }
-    let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
-    // SAFETY: `info` is a zeroed `rusage_info_v4`, the struct `RUSAGE_INFO_V4`
-    // fills; the kernel writes at most its size, and it is read only on success.
-    let rc = unsafe {
-        libc::proc_pid_rusage(
-            pid,
-            libc::RUSAGE_INFO_V4,
-            info.as_mut_ptr().cast::<libc::rusage_info_t>(),
-        )
-    };
-    // SAFETY: zeroed is a valid `rusage_info_v4` (plain integers), and on success the kernel filled it.
-    (rc == 0).then(|| unsafe { info.assume_init() }.ri_phys_footprint)
+    rusage(pid).map(|info| info.ri_phys_footprint)
+}
+
+/// The bytes of `pid`'s pages in physical memory now (`ri_resident_size`, the task's resident
+/// size `ps -o rss=` prints in KiB).
+#[must_use]
+pub fn resident_size(pid: i32) -> Option<u64> {
+    if pid <= 1 {
+        return None;
+    }
+    rusage(pid).map(|info| info.ri_resident_size)
 }
 
 /// The CPU time `pid` (> 1) has used, user and system together, in the kernel's own units
@@ -1626,20 +1922,7 @@ pub fn cpu_used(pid: i32) -> Option<u64> {
     if pid <= 1 {
         return None;
     }
-    let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
-    // SAFETY: `info` is a zeroed `rusage_info_v4`, the struct `RUSAGE_INFO_V4` fills.
-    let rc = unsafe {
-        libc::proc_pid_rusage(
-            pid,
-            libc::RUSAGE_INFO_V4,
-            info.as_mut_ptr().cast::<libc::rusage_info_t>(),
-        )
-    };
-    (rc == 0).then(|| {
-        // SAFETY: zeroed is a valid `rusage_info_v4` (plain integers), and on success the kernel filled it.
-        let info = unsafe { info.assume_init() };
-        info.ri_user_time.saturating_add(info.ri_system_time)
-    })
+    rusage(pid).map(|info| info.ri_user_time.saturating_add(info.ri_system_time))
 }
 
 struct WholeMap {
@@ -2319,6 +2602,22 @@ mod tests {
     }
 
     #[test]
+    fn tty_name_names_a_pseudo_terminal_from_its_number_alone() {
+        use std::os::unix::fs::MetadataExt as _;
+        let ptmx = |minor: i32| (16 << 24) | minor;
+        assert_eq!(tty_name(None), "??");
+        assert_eq!(tty_name(Some(0)), "??");
+        assert_eq!(tty_name(Some(ptmx(0))), "ttys000");
+        assert_eq!(tty_name(Some(ptmx(31))), "ttys031");
+        assert_eq!(tty_name(Some(ptmx(511))), "ttys511");
+        // The kernel's own encoding, read off a node that is no terminal: /dev/null
+        // is major 3, minor 2.
+        let null = std::fs::metadata("/dev/null").expect("/dev/null");
+        let dev = i32::try_from(null.rdev()).expect("/dev/null's device number");
+        assert_eq!(tty_name(Some(dev)), "dev3.2");
+    }
+
+    #[test]
     fn put_preserves_occupied_stages_and_source_refusals() {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
         let scratch = aterm_tempfile::Builder::new()
@@ -2655,6 +2954,19 @@ mod tests {
         assert!(user_temp_dir().is_some_and(|t| t.starts_with('/')));
         let none = jail_pids("lab.jail.test.0000000000000000").unwrap();
         assert!(none.is_empty(), "{none:?}");
+        for bad_pid in [-1, 0, 1] {
+            assert_eq!(
+                signal_probe(bad_pid, 0).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        // Both fail at the first `sigaction` read (EINVAL on macOS, SIGKILL included), before any pipe.
+        for bad in [-1, libc::SIGKILL] {
+            assert_eq!(
+                SignalPipe::install(&[bad]).err().map(|e| e.kind()),
+                Some(io::ErrorKind::InvalidInput)
+            );
+        }
     }
 
     #[test]

@@ -419,13 +419,23 @@ const OPEN_EYE_ECHO_FRAC: f32 = 0.075;
 const OPEN_EYE_ECHO_MIN_RADIUS_PX: f32 = 0.55;
 const OPEN_EYE_ECHO_MAX_RADIUS_PX: f32 = 0.72;
 
+const BYTE_TO_F32: [f32; 256] = {
+    let mut table = [0.0f32; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        table[i] = i as f32 / 255.0;
+        i += 1;
+    }
+    table
+};
+
 /// Unpack an authored `0x00RR_GGBB` fill into `0..=1` float channels.
 #[inline]
 pub(crate) const fn rgb(hex: u32) -> (f32, f32, f32) {
     (
-        ((hex >> 16) & 0xff) as f32 / 255.0,
-        ((hex >> 8) & 0xff) as f32 / 255.0,
-        (hex & 0xff) as f32 / 255.0,
+        BYTE_TO_F32[((hex >> 16) & 0xff) as usize],
+        BYTE_TO_F32[((hex >> 8) & 0xff) as usize],
+        BYTE_TO_F32[(hex & 0xff) as usize],
     )
 }
 
@@ -480,11 +490,13 @@ pub(crate) fn paint_dark_masked_disc(
         let rem = [rr - dy0_2, rr - dy1 * dy1, rr - dy2_v * dy2_v, rr - dy3_2];
         let dy2_max = dy0_2.max(dy3_2);
         let row_base4 = (cur_y as u32 * tile_w) as usize * 4;
+        let mut idx4 = row_base4 + (x0 as usize) * 4;
         let mut x = x0;
         while x < x1 {
             let cur_x = x;
+            let i = idx4;
             x += 1;
-            let i = row_base4 + (cur_x as usize) * 4;
+            idx4 += 4;
             if mask_px[i + 3] == 0 {
                 continue;
             }
@@ -659,6 +671,20 @@ impl CatColorKey {
         background: u32,
     ) -> u8 {
         background_band_with(table, background)
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) const fn background_band_rgb(
+        table: &crate::color_math::RelativeLuminanceTable,
+        rgb: [u8; 3],
+    ) -> u8 {
+        background_band_from_lum(crate::color_math::relative_luminance_rgb(
+            table,
+            rgb[0] as usize,
+            rgb[1] as usize,
+            rgb[2] as usize,
+        ))
     }
 
     #[inline]

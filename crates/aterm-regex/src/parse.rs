@@ -162,8 +162,8 @@ impl ClassSet {
     #[inline]
     pub(crate) const fn byte_size(&self) -> usize {
         size_of::<Self>()
-            + self.ranges.len() * size_of::<(char, char)>()
-            + self.perls.len() * size_of::<PerlClass>()
+            .saturating_add(self.ranges.len().saturating_mul(size_of::<(char, char)>()))
+            .saturating_add(self.perls.len().saturating_mul(size_of::<PerlClass>()))
     }
 
     /// Close the explicit ranges under simple case folding. The perl classes
@@ -304,7 +304,36 @@ impl Parser<'_> {
 
     #[inline]
     fn peek_at(&self, n: usize) -> Option<char> {
-        self.pat.get(self.pos + n).copied()
+        self.pos
+            .checked_add(n)
+            .and_then(|i| self.pat.get(i))
+            .copied()
+    }
+
+    /// Next significant character after a `-` at `self.pos`, skipping whitespace
+    /// and `#…\n` comments when `x` mode is active.
+    fn peek_after_dash(&self) -> Option<char> {
+        let mut i = self.pos.checked_add(1)?;
+        if self.flags.ignore_whitespace {
+            while i < self.pat.len() {
+                let c = self.pat[i];
+                if c.is_whitespace() {
+                    i += 1;
+                } else if c == '#' {
+                    i += 1;
+                    while i < self.pat.len() {
+                        let ch = self.pat[i];
+                        i += 1;
+                        if ch == '\n' {
+                            break;
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+        self.pat.get(i).copied()
     }
 
     #[inline]
@@ -923,7 +952,7 @@ impl Parser<'_> {
                      operator (`\\-`) to match it literally",
                 );
             }
-            if self.peek() == Some('-') && self.peek_at(1) != Some(']') {
+            if self.peek() == Some('-') && self.peek_after_dash() != Some(']') {
                 let dash = self.pos;
                 self.pos += 1;
                 if self.flags.ignore_whitespace {
@@ -969,7 +998,13 @@ impl Parser<'_> {
     /// a range: `[\s-\d]` is an error in the `regex` crate, not the three-item
     /// class a naive parser would read it as.
     fn reject_shorthand_range(&mut self) -> Result<(), Error> {
-        if self.peek() == Some('-') && self.peek_at(1) != Some(']') {
+        if self.flags.ignore_whitespace {
+            self.skip_ignorable();
+        }
+        if self.peek() == Some('-')
+            && self.peek_at(1) != Some('-')
+            && self.peek_after_dash() != Some(']')
+        {
             return self.err("invalid range boundary, must be a literal");
         }
         Ok(())
@@ -983,7 +1018,7 @@ impl Parser<'_> {
         if self.peek_at(1) != Some(':') {
             return Ok(None);
         }
-        let mut i = self.pos + 2;
+        let mut i = self.pos.saturating_add(2);
         let negated = self.pat.get(i) == Some(&'^');
         if negated {
             i += 1;
@@ -992,7 +1027,9 @@ impl Parser<'_> {
         while self.pat.get(i).is_some_and(|c| c.is_ascii_alphabetic()) {
             i += 1;
         }
-        if self.pat.get(i) != Some(&':') || self.pat.get(i + 1) != Some(&']') {
+        if self.pat.get(i) != Some(&':')
+            || i.checked_add(1).and_then(|j| self.pat.get(j)) != Some(&']')
+        {
             return Ok(None);
         }
         let name: String = self.pat[from..i].iter().collect();
@@ -1164,6 +1201,23 @@ mod tests {
         };
         assert!(set.matches('x') && !set.matches('4'));
         assert!(message("[[:nosuch:]]").contains("nested character classes"));
+        let Ast::Concat(items) = ast("(?x)[0 - # trailing dash\n ]a") else {
+            panic!("a concat")
+        };
+        let Ast::Class(trailing_dash) = &items[0] else {
+            panic!("a class")
+        };
+        assert!(
+            trailing_dash.matches('0') && trailing_dash.matches('-') && !trailing_dash.matches(']')
+        );
+        let Ast::Class(shorthand_dash) = ast(r"(?x)[\d - ]") else {
+            panic!("a class")
+        };
+        assert!(shorthand_dash.matches('7') && shorthand_dash.matches('-'));
+        assert!(message(r"(?x)[\d - a]").contains("invalid range boundary"));
+        assert!(message("(?x)[[:alpha:] - a]").contains("invalid range boundary"));
+        assert!(message(r"[\d--a]").contains("set operations"));
+        assert!(message("[[:alpha:]--a]").contains("set operations"));
     }
 
     /// An item's own `^` is the exact complement of its folded table, over every code

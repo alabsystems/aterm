@@ -19,7 +19,7 @@ use aterm_effects::aos_momentum::bundle::{
 use aterm_effects::aos_momentum::dist::{ClaimKind, Refusal};
 use aterm_effects::aos_momentum::lease::LIMITS_V1;
 use aterm_effects::aos_momentum::m4::{
-    CheckLevel, Compared, DistNoOutcome, Evaluator, NoOutcome, Selection,
+    CheckLevel, Compared, DistNoOutcome, Evaluator, NoOutcome, Selection, Serial, Spread,
 };
 use aterm_effects::aos_momentum::policy::{MAX_DISTINCT, MAX_ROUNDS, PolicyRefusal, Totals};
 use aterm_effects::aos_momentum::search::{
@@ -27,7 +27,8 @@ use aterm_effects::aos_momentum::search::{
 };
 
 use crate::aos_workers::{
-    Fault, Phase, Pool, PoolArgs, PoolReport, Timed, available, percentiles, say,
+    Fault, Phase, Pool, PoolArgs, PoolReport, Stepped, Timed, available, percentiles, say,
+    say_built,
 };
 use crate::instance::{take_flag, take_value, take_values};
 use crate::lab_build::{LAB_BUILD, check_build};
@@ -66,9 +67,10 @@ the wall time and the events the evaluator stepped. One search per proposer, gri
                     a test sets it past the run, so a loaded host's slow evaluator build is judged as a stall
   --grace-ms MS     (debug builds, with --workers) the drain grace after a Cancel, for tests: a test sets it past
                     the run, so a slow worker's late work is judged however loaded the host
-  --frames          (debug builds, with --workers) say each worker frame taken and the step it takes on stderr, and
-                    each stretch of the coordinator's own work after a search's last claim (check, held-out, verify)
-                    as it begins, for tests' hang detector
+  --frames          (debug builds) say each step the run takes on stderr, for tests' hang detector: with --workers,
+                    each worker frame taken and its step, and each stretch of the coordinator's own work after a
+                    search's last claim (check, held-out, verify) as it begins; without, the evaluator built, each
+                    candidate trained, and the winner's held-out read and verify as each begins
   --fault SPEC      (debug builds, with --workers; repeatable) a test fault armed on every worker: NAME@G.S.A[:K]
                     on search serial G, slot S, attempt A (kill, hang and slow take :K; late, late-lie, dup,
                     dup-lie, close-lie, lie-refusal, lie-best, inflate, garbage, flood do not), or foreign@W
@@ -106,6 +108,8 @@ pub struct Args {
     pub workers: Option<PoolArgs>,
     /// `--check`, with `--workers`.
     pub check: CheckLevel,
+    /// `--frames` (debug builds): the run says its steps on stderr, for tests' hang detector.
+    pub frames: bool,
 }
 
 /// The verb's arguments. Pure.
@@ -143,8 +147,13 @@ pub fn parse_args(args: &[String]) -> Result<Args, Fail> {
             "aos-search: --toolchain needs a non-empty line",
         ));
     }
-    let count = |flag: &str, v: &str, max: usize| match v.parse::<usize>() {
-        Ok(n) if (1..=max).contains(&n) => Ok(n),
+    let count = |flag: &str, v: &str, max: usize| match v
+        .bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| v.parse::<usize>().ok())
+        .flatten()
+    {
+        Some(n) if (1..=max).contains(&n) => Ok(n),
         _ => Err(Fail::usage(format!(
             "aos-search: {flag} takes 1 to {max}, not '{v}'"
         ))),
@@ -168,30 +177,29 @@ pub fn parse_args(args: &[String]) -> Result<Args, Fail> {
             )));
         }
     };
-    if lease_ms.is_some()
-        || hello_ms.is_some()
-        || grace_ms.is_some()
-        || !faults.is_empty()
-        || frames
-    {
-        if workers.is_none() {
-            return Err(Fail::usage(
-                "aos-search: --lease-ms, --hello-ms, --grace-ms, --fault and --frames are for \
-                 --workers",
-            ));
-        }
-        if !cfg!(debug_assertions) {
-            return Err(Fail::usage(
-                "aos-search: --lease-ms, --hello-ms, --grace-ms, --fault and --frames exist in \
-                 debug builds only",
-            ));
-        }
+    let pool_flags =
+        lease_ms.is_some() || hello_ms.is_some() || grace_ms.is_some() || !faults.is_empty();
+    if pool_flags && workers.is_none() {
+        return Err(Fail::usage(
+            "aos-search: --lease-ms, --hello-ms, --grace-ms and --fault are for --workers",
+        ));
+    }
+    if (pool_flags || frames) && !cfg!(debug_assertions) {
+        return Err(Fail::usage(
+            "aos-search: --lease-ms, --hello-ms, --grace-ms, --fault and --frames exist in debug \
+             builds only",
+        ));
     }
     let millis = |flag: &str, v: Option<String>| {
         v.map(|v| {
-            v.parse::<u64>().ok().filter(|&ms| ms >= 1).ok_or_else(|| {
-                Fail::usage(format!("aos-search: {flag} takes milliseconds, not '{v}'"))
-            })
+            v.bytes()
+                .all(|b| b.is_ascii_digit())
+                .then(|| v.parse::<u64>().ok())
+                .flatten()
+                .filter(|&ms| ms >= 1)
+                .ok_or_else(|| {
+                    Fail::usage(format!("aos-search: {flag} takes milliseconds, not '{v}'"))
+                })
         })
         .transpose()
     };
@@ -217,6 +225,7 @@ pub fn parse_args(args: &[String]) -> Result<Args, Fail> {
         threads,
         workers,
         check,
+        frames,
     })
 }
 
@@ -243,10 +252,11 @@ impl<P: Proposer> Proposer for Recorded<P> {
 
 /// How a search judges its candidates.
 enum How<'p> {
-    /// M4's serial path.
-    Serial,
-    /// `--threads N`: the local fold over a thread spread.
-    Threads(usize),
+    /// M4's serial path, each candidate trained said as a step of the search numbered here under
+    /// `--frames` ([`Stepped`]).
+    Serial(Option<u32>),
+    /// `--threads N`: the local fold over a thread spread, said as [`How::Serial`]'s is.
+    Threads(usize, Option<u32>),
     /// `--workers N`: jobs in the pool, the claims checked here (design §11.3).
     Workers(&'p mut Pool, CheckLevel),
 }
@@ -366,6 +376,22 @@ fn distributed<P: Proposer>(
     }
 }
 
+/// A local search's selection over `spread`, each candidate trained said as a step of search
+/// `said` under `--frames` ([`Stepped`]): a spread changes only speed, so it is
+/// [`Evaluator::select`]'s.
+fn trained<P: Proposer>(
+    ev: &Evaluator,
+    rec: &mut Recorded<P>,
+    spread: &dyn Spread,
+    said: Option<u32>,
+) -> Result<Selection, Ended> {
+    match said {
+        Some(serial) => ev.select_spread(rec, &Stepped::new(spread, serial)),
+        None => ev.select_spread(rec, spread),
+    }
+    .map_err(Ended::No)
+}
+
 fn search<P: Proposer>(
     ev: &Evaluator,
     name: &'static str,
@@ -385,10 +411,13 @@ fn search<P: Proposer>(
     let started = Instant::now();
     let mut claimed = None;
     let frames = matches!(&how, How::Workers(p, _) if p.frames());
-    let picked = match how {
-        How::Serial => ev.select(&mut rec).map_err(Ended::No),
-        How::Threads(n) => ev.select_spread(&mut rec, &Threads(n)).map_err(Ended::No),
-        How::Workers(pool, check) => distributed(ev, &mut rec, pool, check, started, &mut claimed),
+    let (picked, local) = match how {
+        How::Serial(said) => (trained(ev, &mut rec, &Serial, said), said),
+        How::Threads(n, said) => (trained(ev, &mut rec, &Threads(n), said), said),
+        How::Workers(pool, check) => (
+            distributed(ev, &mut rec, pool, check, started, &mut claimed),
+            None,
+        ),
     };
     let stats = match &picked {
         Ok(selection) => Some(selection.stats()),
@@ -399,11 +428,13 @@ fn search<P: Proposer>(
             None
         }
     };
-    // The search's serial, when `--frames` says the coordinator's own stretches as steps.
+    // The search's serial, when `--frames` says the coordinator's own stretches as steps: the
+    // pool's in a pool run.
     let said = claimed
         .as_ref()
         .filter(|_| frames)
-        .map(|c: &Claimed| c.serial);
+        .map(|c: &Claimed| c.serial)
+        .or(local);
     if let Some(serial) = said
         && picked.is_ok()
     {
@@ -772,12 +803,16 @@ fn pool_summary(args: &PoolArgs, report: &PoolReport, out: &mut String) {
     }
 }
 
-/// How `args` judge a search, on `pool` when there is one.
-fn how<'p>(pool: &'p mut Option<Pool>, args: &Args) -> How<'p> {
+/// How `args` judge a search, on `pool` when there is one; without one, `--frames` says its steps
+/// as the command's search `serial` (from 1, as a pool numbers its searches).
+fn how<'p>(pool: &'p mut Option<Pool>, args: &Args, serial: usize) -> How<'p> {
+    let said = args
+        .frames
+        .then(|| u32::try_from(serial).unwrap_or(u32::MAX));
     match (pool.as_mut(), args.threads) {
         (Some(p), _) => How::Workers(p, args.check),
-        (None, Some(n)) => How::Threads(n),
-        (None, None) => How::Serial,
+        (None, Some(n)) => How::Threads(n, said),
+        (None, None) => How::Serial(said),
     }
 }
 
@@ -835,6 +870,8 @@ fn run_in(
     if let Some(p) = pool.as_mut() {
         p.admit(&ev)
             .map_err(|e| Fail::die(format!("aos-search: the coordinator: {e}")))?;
+    } else if args.frames {
+        say_built();
     }
     let mut searched = Vec::new();
     if args.grid {
@@ -845,7 +882,7 @@ fn run_in(
             &args.toolchain,
             built,
             out,
-            how(&mut pool, args),
+            how(&mut pool, args, 1),
         ));
     }
     let voided = |searched: &[Searched]| searched.iter().any(|s| s.void.is_some());
@@ -859,7 +896,7 @@ fn run_in(
             &args.toolchain,
             built,
             out,
-            how(&mut pool, args),
+            how(&mut pool, args, searched.len() + 1),
         ));
     }
     let report = pool.as_mut().map(Pool::shutdown);
@@ -1532,6 +1569,7 @@ mod tests {
                 threads: None,
                 workers: None,
                 check: CheckLevel::Dominance,
+                frames: false,
             }
         );
         assert_eq!(
@@ -1553,6 +1591,7 @@ mod tests {
                 threads: None,
                 workers: None,
                 check: CheckLevel::Dominance,
+                frames: false,
             }
         );
         assert!(usage_of(&["--out", "o"]).contains("name a proposer"));
@@ -1583,6 +1622,7 @@ not a plan
             threads: None,
             workers: None,
             check: CheckLevel::Dominance,
+            frames: false,
         };
         let (code, summary) = run(&args, Some(text), dir.path()).expect("runs");
         assert_eq!(code, 0, "{summary}");
@@ -1678,6 +1718,7 @@ not a plan
                     threads: None,
                     workers: None,
                     check: CheckLevel::Dominance,
+                    frames: false,
                 };
                 let (code, summary) = run_in(
                     &args,
@@ -2217,7 +2258,7 @@ not a plan
     }
 
     /// `--threads` and `--workers` exclude each other; `--check` and the debug overrides need
-    /// `--workers`.
+    /// `--workers`, but for `--frames`, which a run without a pool takes too.
     #[test]
     fn the_parallel_flags_are_exclusive_and_bounded() {
         let a = parse_args(&words(&["--grid", "--out", "o", "--threads", "4"])).expect("parses");
@@ -2254,8 +2295,10 @@ not a plan
         assert!(
             usage_of(&["--grid", "--out", "o", "--fault", "dup@1.0.1"]).contains("for --workers")
         );
-        assert!(usage_of(&["--grid", "--out", "o", "--frames"]).contains("for --workers"));
-        assert_eq!(a.workers.map(|p| p.frames), Some(false));
+        assert_eq!(
+            (a.frames, a.workers.map(|p| p.frames)),
+            (false, Some(false))
+        );
         if cfg!(debug_assertions) {
             let a = parse_args(&words(&[
                 "--grid",
@@ -2266,7 +2309,17 @@ not a plan
                 "--frames",
             ]))
             .expect("parses");
-            assert_eq!(a.workers.map(|p| p.frames), Some(true));
+            assert_eq!((a.frames, a.workers.map(|p| p.frames)), (true, Some(true)));
+            // A run without a pool says its steps too.
+            for local in [
+                &["--grid"][..],
+                &["--plans", "p"],
+                &["--grid", "--threads", "2"],
+            ] {
+                let a = parse_args(&words(&[local, &["--out", "o", "--frames"]].concat()))
+                    .expect("parses");
+                assert!(a.frames && a.workers.is_none(), "{local:?}");
+            }
             let a = parse_args(&words(&[
                 "--grid",
                 "--out",

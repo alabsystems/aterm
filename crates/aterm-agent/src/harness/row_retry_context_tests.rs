@@ -64,6 +64,7 @@ fn transition_for(state: &State, action: &str, variation: usize) -> State {
                 },
                 step: 1,
                 inputs: inputs(state["origin"], variation),
+                page_stopped: false,
             },
         );
     }

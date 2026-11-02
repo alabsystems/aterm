@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The stub: a local stand-in for the Anthropic Messages API.
+//! The stub: a local stand-in for the Anthropic Messages API (and, beside it, the OpenAI
+//! Responses, Gemini, Meta and xAI routes its dialects serve).
 
 use std::io::{self, BufReader, Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
@@ -14,8 +15,10 @@ use crate::pyjson::{COMPACT, J};
 use crate::util::{now, one_line, py_repr, stamp};
 
 pub mod account;
+pub mod chat;
 pub mod gemini;
 pub mod muse;
+pub mod xai;
 
 /// What the stub was started with.
 #[derive(Clone, Debug)]
@@ -174,6 +177,10 @@ pub fn is_side(kind: &str) -> bool {
             | "muse-side"
             | "gemini-json"
             | "gemini-aux"
+            | "grok-json"
+            | "grok-suggest"
+            | "grok-aux"
+            | "chat-aux"
     )
 }
 
@@ -203,11 +210,29 @@ pub fn turn_dumps(dir: &Path) -> Vec<(u64, PathBuf)> {
 struct State {
     mode: String,
     mode_file_mtime: Option<std::time::SystemTime>,
+    limit_remaining: Option<u64>,
+    limit_arm: Option<LimitArm>,
     custom_budget: Vec<(String, Option<i64>)>,
     n_requests: i64,
     by_status: Vec<(String, i64)>,
     by_kind: Vec<(String, i64)>,
     proxy_attempts: i64,
+}
+
+/// The admission that installed a prearmed wall, before returning its last allowed answer.
+#[derive(Debug)]
+struct LimitArm {
+    raised_ms: i64,
+    reset_s: i64,
+}
+
+impl State {
+    fn switch_mode(&mut self, mode: &str) {
+        self.mode = mode.to_string();
+        self.limit_remaining = None;
+        self.limit_arm = None;
+        self.custom_budget.retain(|(key, _)| key != mode);
+    }
 }
 
 fn bump(counts: &mut Vec<(String, i64)>, key: &str) -> i64 {
@@ -337,6 +362,55 @@ fn seq_value(v: &str, served: u32) -> String {
     }
 }
 
+/// An on429 header value `v` as the standing limit's 429 carries it: `@RESET@`, `@RESET+N@` or
+/// `@RESET-N@` is the limit's reset (`reset`, unix seconds) moved by `N` seconds, so a window's
+/// own reset header can name a reset apart from the notice's (`anthropic-ratelimit-unified-reset`)
+/// however late the wall was raised; any other value is itself.
+#[must_use]
+pub fn reset_value(v: &str, reset: i64) -> String {
+    reset_moved(v)
+        .and_then(|by| reset.checked_add(by))
+        .map_or_else(|| v.to_string(), |at| at.to_string())
+}
+
+/// How far `@RESET@`, `@RESET+N@` or `@RESET-N@` moves the limit's reset (seconds); `None` for
+/// any other value ([`reset_value`]).
+fn reset_moved(v: &str) -> Option<i64> {
+    let rest = v.strip_prefix("@RESET")?.strip_suffix('@')?;
+    let secs = |n: &str| {
+        (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| n.parse::<i64>().ok())
+            .flatten()
+    };
+    if rest.is_empty() {
+        Some(0)
+    } else if let Some(n) = rest.strip_prefix('+') {
+        secs(n)
+    } else if let Some(n) = rest.strip_prefix('-') {
+        secs(n).map(|n| -n)
+    } else {
+        None
+    }
+}
+
+/// The on429 headers a 429 carries: each `@RESET…@` value ([`reset_value`]) set against the
+/// reset the 429 itself names (its `anthropic-ratelimit-unified-reset` among `named`), and left
+/// off a 429 that names none (the stub's `rate-limit` mode, a custom answer naming no reset), so
+/// no answer carries the template's words as a reset.
+fn on429_resolved(on429: &[(String, String)], named: &[(String, String)]) -> Vec<(String, String)> {
+    let reset = named
+        .iter()
+        .find(|(h, _)| h.eq_ignore_ascii_case("anthropic-ratelimit-unified-reset"))
+        .and_then(|(_, v)| v.trim().parse::<i64>().ok());
+    on429
+        .iter()
+        .filter_map(|(h, v)| match reset_moved(v) {
+            None => Some((h.clone(), v.clone())),
+            Some(_) => reset.map(|r| (h.clone(), reset_value(v, r))),
+        })
+        .collect()
+}
+
 const BUILTIN: &[&str] = &[
     "ok",
     "long",
@@ -349,9 +423,11 @@ const BUILTIN: &[&str] = &[
     "bg",
     "tool",
     "limit",
+    "limit-after",
     "401",
     "500",
     "bad-key",
+    "drop",
 ];
 
 const REFRESH_FILE: &str = "refresh.json";
@@ -449,6 +525,13 @@ pub fn text_of(content: Option<&J>) -> String {
     }
 }
 
+/// The digest of received message text, after [`text_of`]: strings unchanged, text blocks
+/// joined by literal newlines. Hash the complete UTF-8 text without trimming, folding spaces
+/// or using the log's shortened single-line excerpt.
+pub(crate) fn message_digest(text: &str) -> String {
+    aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(text.as_bytes()))
+}
+
 /// THE SCRIPTED REPLY OF A CUSTOM MODE.
 #[must_use]
 pub fn scripted_reply<'a>(spec: &'a J, users: &[String]) -> Option<&'a J> {
@@ -466,10 +549,37 @@ pub fn scripted_reply<'a>(spec: &'a J, users: &[String]) -> Option<&'a J> {
     })
 }
 
+/// The index among a custom spec's `replies` of the rule [`scripted_reply`] picks for `users`,
+/// which the stub's log names (`reply=<index>`), so a scene can tell which rule answered a request.
+#[must_use]
+pub fn scripted_rule(spec: &J, users: &[String]) -> Option<usize> {
+    let picked = scripted_reply(spec, users)?;
+    spec.get("replies")
+        .and_then(J::as_arr)?
+        .iter()
+        .position(|r| std::ptr::eq(r, picked))
+}
+
 /// Whether a custom spec scripts its replies ([`scripted_reply`]).
 #[must_use]
 pub fn is_scripted(spec: &J) -> bool {
     spec.get("replies").is_some()
+}
+
+/// What a gate's file name ends in ([`gate_path`]).
+pub const GATE_SUFFIX: &str = ".gate";
+
+/// The longest a reply waits on its gate ([`gate_path`]): a one-minute hang detector, never a
+/// pace. A gate still shut then is answered all the same, and the lab's want that needed it fails
+/// on what it read.
+pub const GATE_HANG: Duration = Duration::from_secs(60);
+
+/// THE FILE A SCRIPTED RULE'S `gate` WAITS ON, in the custom modes' folder `modes`: the rule's
+/// reply goes once the lab writes it (an event the lab read, never a timer). The name is kept to
+/// a mode name's letters ([`clean_mode`]), so it never leaves the folder.
+#[must_use]
+pub fn gate_path(modes: &Path, gate: &str) -> PathBuf {
+    modes.join(format!("{}{GATE_SUFFIX}", clean_mode(gate)))
 }
 
 /// `spec` with its `text` the reply `users` pick ([`scripted_reply`]).
@@ -479,7 +589,7 @@ pub fn with_reply(spec: J, users: &[String]) -> J {
         return spec;
     };
     let mut spec = spec;
-    for key in ["text", "delay_ms", "pace_s", "tool"] {
+    for key in ["text", "delay_ms", "pace_s", "tool", "gate"] {
         if let Some(v) = rule.get(key) {
             spec.set(key, v.clone());
         }
@@ -498,9 +608,9 @@ pub fn scripted_call(spec: &J, answered: bool) -> Option<(String, J)> {
 /// The tools a request `body` declares, by name, each with its arguments' schema (`None` for
 /// one that declares none, such as a freeform or server tool): Gemini's
 /// `tools[].functionDeclarations[]` (`parametersJsonSchema` or `parameters`), the Messages API's
-/// `tools[]` (`input_schema`), the Responses API's `tools[]` (`parameters`), a Muse Code
-/// `namespace` tool's own `tools[]` among them. `None` when the request declares no named tool,
-/// so a call has nothing to be read against.
+/// `tools[]` (`input_schema`), the Responses API's `tools[]` (`parameters`), the Chat Completions
+/// API's `tools[].function` (`parameters`), a Muse Code `namespace` tool's own `tools[]` among
+/// them. `None` when the request declares no named tool, so a call has nothing to be read against.
 #[must_use]
 pub fn declared_tools(body: &[u8]) -> Option<Vec<(String, Option<J>)>> {
     fn named(t: &J, keys: &[&str]) -> Option<(String, Option<J>)> {
@@ -518,6 +628,8 @@ pub fn declared_tools(body: &[u8]) -> Option<Vec<(String, Option<J>)>> {
                         .collect()
                 } else if t.get("type").and_then(J::as_str) == Some("namespace") {
                     of(t.get("tools").and_then(J::as_arr).unwrap_or_default())
+                } else if let Some(f) = t.get("function").filter(|f| matches!(f, J::Obj(_))) {
+                    named(f, &["parameters"]).into_iter().collect()
                 } else {
                     named(t, &["input_schema", "parameters"])
                         .into_iter()
@@ -966,6 +1078,101 @@ pub fn limit_params(mode: &str) -> Option<(String, i64, Option<String>)> {
     ))
 }
 
+/// A nonnegative wall timestamp and delay, in milliseconds, rounded up to a whole Unix minute.
+/// Timestamp arithmetic saturates at the supported range before rounding.
+#[must_use]
+pub(crate) const fn reset_s_ahead(now: i64, ahead: i64) -> i64 {
+    now.saturating_add(ahead).saturating_add(59_999) / 60_000 * 60
+}
+
+/// A finite allowance of main requests, followed by a normal usage wall. Side requests do not
+/// spend it. The reset is measured from the final admission, not from stub startup.
+fn limit_after_params(mode: &str) -> Option<(u64, &str, i64, &str)> {
+    let mut parts = mode.split(':');
+    if parts.next()? != "limit-after" {
+        return None;
+    }
+    let uint = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let allowed = parts.next()?;
+    if !uint(allowed) {
+        return None;
+    }
+    let allowed = allowed.parse().ok()?;
+    let claim = parts.next()?;
+    let ahead = parts.next()?;
+    if !uint(ahead) {
+        return None;
+    }
+    let ahead = ahead.parse::<i64>().ok()?;
+    let admitted_mode = parts.next().unwrap_or("ok");
+    if parts.next().is_some()
+        || claim.is_empty()
+        || !claim
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        || ahead <= 0
+        || admitted_mode.is_empty()
+        || !admitted_mode
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c))
+    {
+        return None;
+    }
+    Some((allowed, claim, ahead, admitted_mode))
+}
+
+/// A reserved finite configuration that cannot be admitted as an ordinary reply mode.
+#[derive(Debug)]
+struct InvalidFiniteGlobalMode {
+    mode: String,
+}
+
+impl InvalidFiniteGlobalMode {
+    fn answer(
+        self,
+        stub: &Stub,
+        method: &str,
+        path: &str,
+        blen: usize,
+        out: &mut Out<'_>,
+    ) -> io::Result<()> {
+        out.json(
+            400,
+            &err_body(
+                "invalid_finite_global_mode",
+                "limit-after needs N:CLAIM:AHEAD_MS[:ADMITTED_MODE]",
+            ),
+            &[],
+        )
+        .map(|status| {
+            stub.record(
+                method,
+                path,
+                status,
+                blen,
+                &self.mode,
+                "invalid finite global mode refused",
+            )
+        })
+    }
+}
+
+fn finite_allowance(mode: &str) -> Result<Option<(u64, &str, i64, &str)>, InvalidFiniteGlobalMode> {
+    let parsed = limit_after_params(mode);
+    if parsed.is_none()
+        && mode
+            .split(':')
+            .next()
+            .is_some_and(|h| h.eq_ignore_ascii_case("limit-after"))
+    {
+        Err(InvalidFiniteGlobalMode {
+            mode: mode.to_string(),
+        })
+    } else {
+        Ok(parsed)
+    }
+}
+
 /// The fixed fake key the lab gives Codex's lab provider (never a credential anywhere).
 pub const LAB_CODEX_KEY: &str = "lab-not-a-key";
 
@@ -1035,6 +1242,9 @@ pub fn auth_label(authorization: Option<&str>) -> String {
     if tok == gemini::LAB_GEMINI_KEY {
         return "gemini-key".into();
     }
+    if tok == xai::LAB_XAI_KEY {
+        return "xai-key".into();
+    }
     if let Some(label) = oauth_label(tok) {
         return format!("oat:{label}");
     }
@@ -1065,6 +1275,24 @@ pub enum Dialect {
     Codex,
     /// Muse Code: `POST /responses`, its own numbered stream and its `muse` tools ([`muse`]).
     Muse,
+}
+
+/// The Chat Completions dialect named by the lab credential. Both use the same
+/// paths; request models and message text do not select their wire format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChatDialect {
+    OpenAi,
+    Xai,
+}
+
+impl ChatDialect {
+    fn of(auth: Option<&str>) -> Self {
+        if auth_label(auth) == "xai-key" {
+            Self::Xai
+        } else {
+            Self::OpenAi
+        }
+    }
 }
 
 /// What one `/v1/responses` request is, read off its body.
@@ -1171,6 +1399,38 @@ pub fn responses_users(body: &[u8]) -> Vec<String> {
 /// A wall's answer: its status, body and headers.
 pub type WallAnswer = (u16, J, Vec<(String, String)>);
 
+/// The `retry-after` a `rate-limit:<secs>` mode names, in whole seconds (v6 §14.17.5.4): in the
+/// words of the Responses API's body (`Please try again in <secs>s.`) and of Gemini's per-minute
+/// quota (`RetryInfo`), and in the Anthropic API's `retry-after` header alone, its body naming no
+/// number as the real API's does not. `None` for any other mode, and for the bare `rate-limit`,
+/// whose Gemini answer is a spent day.
+#[must_use]
+pub fn rate_limit_after(mode: &str) -> Option<&str> {
+    let secs = mode.strip_prefix("rate-limit:")?;
+    (!secs.is_empty() && secs.bytes().all(|b| b.is_ascii_digit())).then_some(secs)
+}
+
+/// The OpenAI-compatible rate-limit error and retry header.
+fn rate_limit_answer(retry_after: &str) -> WallAnswer {
+    (
+        429,
+        J::obj([(
+            "error",
+            J::obj([
+                ("type", J::s("rate_limit_exceeded")),
+                ("code", J::s("rate_limit_exceeded")),
+                (
+                    "message",
+                    J::s(format!(
+                        "Rate limit reached for requests per min. Please try again in {retry_after}s."
+                    )),
+                ),
+            ]),
+        )]),
+        vec![("retry-after".to_string(), retry_after.to_string())],
+    )
+}
+
 /// The error a wall mode answers a Responses API request with.
 #[must_use]
 pub fn responses_error(mode: &str, retry_after: &str) -> Option<WallAnswer> {
@@ -1187,20 +1447,8 @@ pub fn responses_error(mode: &str, retry_after: &str) -> Option<WallAnswer> {
             ]),
             Vec::new(),
         ),
-        "rate-limit" => (
-            429,
-            err(vec![
-                ("type", J::s("rate_limit_exceeded")),
-                ("code", J::s("rate_limit_exceeded")),
-                (
-                    "message",
-                    J::s(format!(
-                        "Rate limit reached for requests per min. Please try again in {retry_after}s."
-                    )),
-                ),
-            ]),
-            vec![("retry-after".to_string(), retry_after.to_string())],
-        ),
+        "rate-limit" => rate_limit_answer(retry_after),
+        m if rate_limit_after(m).is_some() => rate_limit_answer(rate_limit_after(m)?),
         "401" | "bad-key" => (
             401,
             err(vec![
@@ -1394,9 +1642,37 @@ fn spec_headers(spec: &J) -> Vec<(String, String)> {
     match spec.get("headers") {
         Some(J::Obj(m)) => m
             .iter()
-            .map(|(k, v)| (k.clone(), v.as_str().map_or_else(|| v.py(), str::to_string)))
+            .filter(|(k, _)| {
+                !k.is_empty()
+                    && !k
+                        .chars()
+                        .any(|c| c == ':' || (c as u32) <= 0x20 || c == '\u{7f}')
+            })
+            .map(|(k, v)| {
+                let raw = v.as_str().map_or_else(|| v.py(), str::to_string);
+                let safe: String = raw
+                    .chars()
+                    .map(|c| {
+                        if (c as u32) < 0x20 || c == '\u{7f}' {
+                            ' '
+                        } else {
+                            c
+                        }
+                    })
+                    .collect();
+                (k.clone(), safe)
+            })
             .collect(),
         _ => Vec::new(),
+    }
+}
+
+pub(crate) fn sleep_secs(secs: f64) {
+    if secs.is_finite()
+        && secs > 0.0
+        && let Ok(d) = Duration::try_from_secs_f64(secs)
+    {
+        std::thread::sleep(d);
     }
 }
 
@@ -1484,6 +1760,9 @@ impl Request {
     }
 }
 
+const MAX_HEADER_LINES: usize = 256;
+const MAX_BODY_BYTES: usize = 64 << 20;
+
 /// Read one request; `None` at a clean end of the connection.
 /// # Errors
 /// A malformed request line or chunk, or the connection failing mid-request.
@@ -1516,6 +1795,12 @@ pub fn read_request(r: &mut impl io::BufRead) -> io::Result<Option<Request>> {
         if h.is_empty() {
             break;
         }
+        if headers.len() >= MAX_HEADER_LINES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "too many headers",
+            ));
+        }
         if let Some((k, v)) = h.split_once(':') {
             headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
         }
@@ -1528,13 +1813,20 @@ pub fn read_request(r: &mut impl io::BufRead) -> io::Result<Option<Request>> {
         body: Vec::new(),
     };
     if req.method == "POST" || req.method == "PUT" {
-        let n: usize = req
-            .header("content-length")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-        if n > 0 {
-            req.body.resize(n, 0);
-            r.read_exact(&mut req.body)?;
+        if let Some(raw_len) = req.header("content-length") {
+            let n: usize = raw_len
+                .parse()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad content-length"))?;
+            if n > MAX_BODY_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "request body too large",
+                ));
+            }
+            if n > 0 {
+                req.body.resize(n, 0);
+                r.read_exact(&mut req.body)?;
+            }
         } else if req
             .header("transfer-encoding")
             .is_some_and(|t| t.eq_ignore_ascii_case("chunked"))
@@ -1546,12 +1838,23 @@ pub fn read_request(r: &mut impl io::BufRead) -> io::Result<Option<Request>> {
                 if size.is_empty() {
                     break;
                 }
-                let n = usize::from_str_radix(size.split(';').next().unwrap_or("0").trim(), 16)
-                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad chunk size"))?;
+                let hex = size.split(';').next().unwrap_or("0").trim();
+                let n = hex
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit())
+                    .then(|| usize::from_str_radix(hex, 16).ok())
+                    .flatten()
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad chunk size"))?;
                 if n == 0 {
                     let mut end = String::new();
                     r.read_line(&mut end)?;
                     break;
+                }
+                if n > MAX_BODY_BYTES || req.body.len().saturating_add(n) > MAX_BODY_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "chunked request body too large",
+                    ));
                 }
                 let mut chunk = vec![0u8; n];
                 r.read_exact(&mut chunk)?;
@@ -1658,7 +1961,8 @@ impl Out<'_> {
             ("x-lab-stub".to_string(), "1".to_string()),
         ];
         h.extend(merged(&self.flat, extra));
-        h.extend(self.rate_for(status));
+        let rate = self.rate_for(status, &h);
+        h.extend(rate);
         self.head(status, &h)?;
         self.w.write_all(raw.as_bytes())?;
         self.w.flush()?;
@@ -1691,11 +1995,13 @@ impl Out<'_> {
         .map(|(k, v)| (k.to_string(), v));
         let mut h = h.to_vec();
         h.extend(merged(&self.flat, extra));
-        h.extend(self.rate_for(200));
+        h.extend(self.rate_for(200, &[]));
         self.head(200, &h)
     }
 
-    fn rate_for(&self, status: u16) -> Vec<(String, String)> {
+    /// The `--headers-file`'s headers on a `status` answer whose own headers are `named`
+    /// ([`on429_resolved`] for a 429).
+    fn rate_for(&self, status: u16, named: &[(String, String)]) -> Vec<(String, String)> {
         let Some(rate) = &self.rate else {
             return Vec::new();
         };
@@ -1706,7 +2012,7 @@ impl Out<'_> {
                 }
                 rate.on200.clone()
             }
-            429 => rate.on429.clone(),
+            429 => on429_resolved(&rate.on429, named),
             _ => Vec::new(),
         }
     }
@@ -1741,6 +2047,38 @@ impl Stub {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    /// `spec` WITH THE REPLY `users` PICK ([`with_reply`]), once its rule's gate is open: every
+    /// protocol takes a custom mode's reply here, so a gated rule holds its text or call alike.
+    fn gated_reply(&self, spec: J, users: &[String]) -> J {
+        let spec = with_reply(spec, users);
+        self.hold_for_gate(&spec);
+        spec
+    }
+
+    /// A RULE'S GATE ([`gate_path`]): its reply waits until the lab writes the gate's file, at
+    /// most [`GATE_HANG`], and the stub's log says which.
+    fn hold_for_gate(&self, spec: &J) {
+        let (Some(gate), Some(dir)) = (
+            spec.get("gate")
+                .and_then(J::as_str)
+                .filter(|g| !g.is_empty()),
+            self.args.modes_dir.as_ref(),
+        ) else {
+            return;
+        };
+        let path = gate_path(dir, gate);
+        let began = std::time::Instant::now();
+        while !path.exists() && began.elapsed() < GATE_HANG {
+            sleep_secs(0.2);
+        }
+        let opened = path.exists();
+        self.log(&format!(
+            "gate {gate} {} after {:.1} s",
+            if opened { "opened" } else { "STILL SHUT" },
+            began.elapsed().as_secs_f64()
+        ));
+    }
+
     /// Append one stamped line to the log.
     pub fn log(&self, line: &str) {
         let out = format!("{} {line}\n", stamp(now()));
@@ -1765,21 +2103,29 @@ impl Stub {
 
     /// The current mode; a `--mode-file` that changed since the last look wins.
     pub fn mode(&self) -> String {
+        let mut st = self.st();
+        let mut from_file = None;
         if let Some(path) = &self.args.mode_file
             && let Ok(meta) = std::fs::metadata(path)
         {
             let mtime = meta.modified().ok();
-            let changed = self.st().mode_file_mtime != mtime;
-            if changed {
+            if st.mode_file_mtime != mtime {
                 let text = std::fs::read_to_string(path).unwrap_or_default();
-                self.st().mode_file_mtime = mtime;
+                st.mode_file_mtime = mtime;
                 let m = text.trim();
                 if !m.is_empty() {
-                    self.set_mode(m, true);
+                    let m = clean_mode(m);
+                    st.switch_mode(&m);
+                    from_file = Some(m);
                 }
             }
         }
-        self.st().mode.clone()
+        let mode = st.mode.clone();
+        drop(st);
+        if let Some(m) = from_file {
+            self.log(&format!("MODE -> {m} (from file)"));
+        }
+        mode
     }
 
     /// Switch the mode (from the control path, or from the file).
@@ -1787,18 +2133,50 @@ impl Stub {
         let m = clean_mode(m);
         {
             let mut st = self.st();
-            st.mode.clone_from(&m);
-            st.custom_budget.retain(|(k, _)| *k != m);
-        }
-        if let (Some(path), false) = (&self.args.mode_file, from_file)
-            && std::fs::write(path, format!("{m}\n")).is_ok()
-        {
-            self.st().mode_file_mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+            st.switch_mode(&m);
+            if let (Some(path), false) = (&self.args.mode_file, from_file)
+                && std::fs::write(path, format!("{m}\n")).is_ok()
+            {
+                st.mode_file_mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+            }
         }
         self.log(&format!(
             "MODE -> {m}{}",
             if from_file { " (from file)" } else { "" }
         ));
+    }
+
+    /// Resolve a request once its protocol has classified it. The last allowed main request
+    /// installs the wall under the same lock that admits it, before any answer can provoke the
+    /// next main request. A request holding an older finite-mode snapshot resolves the current
+    /// mode under that lock too; a newer finite allowance must be admitted, not returned raw.
+    fn mode_for_request(&self, mode: &str, main: bool) -> Result<String, InvalidFiniteGlobalMode> {
+        if finite_allowance(mode)?.is_none() {
+            return Ok(mode.to_string());
+        }
+        let mut st = self.st();
+        let current = st.mode.clone();
+        let Some((allowed, claim, ahead, admitted_mode)) = finite_allowance(&current)? else {
+            return Ok(current);
+        };
+        if !main {
+            return Ok(admitted_mode.to_string());
+        }
+        let remaining = st.limit_remaining.get_or_insert(allowed);
+        let admitted = *remaining > 0;
+        *remaining = remaining.saturating_sub(1);
+        if *remaining > 0 {
+            return Ok(admitted_mode.to_string());
+        }
+        let raised_ms = crate::util::now_ms();
+        let reset_s = reset_s_ahead(raised_ms, ahead);
+        st.mode = format!("limit:{claim}:{reset_s}");
+        st.limit_arm = Some(LimitArm { raised_ms, reset_s });
+        if admitted {
+            Ok(admitted_mode.to_string())
+        } else {
+            Ok(st.mode.clone())
+        }
     }
 
     fn record(
@@ -1843,7 +2221,20 @@ impl Stub {
     }
 
     fn take_custom(&self, mode: &str, label: Option<&str>) -> Option<J> {
+        self.take_custom_if(mode, label, |_| true)
+    }
+
+    /// Check this request's eligibility before spending a finite custom reply.
+    fn take_custom_if(
+        &self,
+        mode: &str,
+        label: Option<&str>,
+        accepts: impl FnOnce(&J) -> bool,
+    ) -> Option<J> {
         let spec = self.custom_spec(mode)?;
+        if !accepts(&spec) {
+            return None;
+        }
         if let Some(want) = spec.get("auth").filter(|a| a.truthy())
             && want.as_str() != label
         {
@@ -1876,7 +2267,14 @@ impl Stub {
     }
 
     fn custom_spec(&self, name: &str) -> Option<J> {
-        if not_custom(name).is_some() {
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.contains('/')
+            || name.contains('\\')
+            || name.contains(':')
+            || not_custom(name).is_some()
+        {
             return None;
         }
         let dir = self.args.modes_dir.as_ref()?;
@@ -1945,6 +2343,19 @@ impl Stub {
         }
         let mode = self.mode();
         let blen = req.body.len();
+        // THE HOST UNREACHABLE (`drop`, v6 §14.17.5's stand-in): the connection closed with no
+        // answer, as a dropped route or a refused connection reaches the program, at once (a
+        // connection left open would hold the program to its own request timeout).
+        if mode == "drop" {
+            self.record(&req.method, path, 0, blen, &mode, "dropped: no answer");
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "dropped: no answer",
+            ));
+        }
+        if let Err(refusal) = finite_allowance(&mode) {
+            return refusal.answer(self, &req.method, path, blen, &mut out);
+        }
         let auth = req.header("authorization");
         let gemini_label = || {
             let key = req
@@ -1954,7 +2365,20 @@ impl Stub {
         };
         let result = if req.method == "POST" && path == "/v1/messages" {
             let label = auth_label(auth);
-            let mode = self.credential_mode(&label).unwrap_or(mode);
+            let credential_mode = self.credential_mode(&label);
+            // A credential override has explicit provenance here, before any mode snapshot
+            // comparison. Finite admission owns global State; it is not a per-key mode.
+            if credential_mode.as_deref().is_some_and(|m| {
+                m.split(':')
+                    .next()
+                    .is_some_and(|h| h.eq_ignore_ascii_case("limit-after"))
+            }) {
+                return out.json(400, &err_body(
+                    "finite_mode_requires_global",
+                    "limit-after must be configured as the global stub mode, not a credential override",
+                ), &[]).map(|status| self.record(&req.method, path, status, blen, &mode, "finite credential override refused"));
+            }
+            let mode = credential_mode.unwrap_or(mode);
             self.messages(&req.method, path, &req.body, (mode, &label), &mut out)
         } else if req.method == "GET" && path == "/v1/responses" && req.websocket_upgrade() {
             // Codex falls back to HTTP on 426; a handshake must not take a scripted POST reply.
@@ -1972,6 +2396,27 @@ impl Stub {
             self.responses(&req.method, path, &req.body, &mode, auth, d, &mut out)
         } else if req.method == "POST" && path == "/responses" {
             self.muse(&req.method, path, &req.body, &mode, req, &mut out)
+        } else if req.method == "GET" && path == "/v1/models" {
+            match ChatDialect::of(auth) {
+                ChatDialect::OpenAi => self.chat_models(&req.method, path, &mode, auth, &mut out),
+                ChatDialect::Xai => {
+                    self.xai_models(&req.method, path, &mode, &auth_label(auth), &mut out)
+                }
+            }
+        } else if req.method == "POST" && path == "/v1/chat/completions" {
+            match ChatDialect::of(auth) {
+                ChatDialect::OpenAi => {
+                    self.chat(&req.method, path, &req.body, &mode, auth, &mut out)
+                }
+                ChatDialect::Xai => self.xai_chat(
+                    &req.method,
+                    path,
+                    &req.body,
+                    &mode,
+                    &auth_label(auth),
+                    &mut out,
+                ),
+            }
         } else if req.method == "GET" && path == "/muse-code/models" {
             self.muse_models(&req.method, path, &mode, auth, &mut out)
         } else if req.method == "POST" && path == "/oauth/token" {
@@ -2028,13 +2473,13 @@ impl Stub {
                 out.json(200, &J::obj([("mode", J::s(self.mode()))]), &[])?;
             }
             "/__status" => {
-                let mode = self.mode();
+                self.mode();
                 let st = self.st();
                 let counts = |v: &[(String, i64)]| {
                     J::Obj(v.iter().map(|(k, n)| (k.clone(), J::Int(*n))).collect())
                 };
                 let snap = J::obj([
-                    ("mode", J::s(mode)),
+                    ("mode", J::s(st.mode.as_str())),
                     (
                         "custom_budget",
                         J::Obj(
@@ -2048,6 +2493,15 @@ impl Stub {
                     ("by_status", counts(&st.by_status)),
                     ("by_kind", counts(&st.by_kind)),
                     ("proxy_attempts", J::Int(st.proxy_attempts)),
+                    (
+                        "limit_arm",
+                        st.limit_arm.as_ref().map_or(J::Null, |arm| {
+                            J::obj([
+                                ("raised_ms", J::Int(arm.raised_ms)),
+                                ("reset_s", J::Int(arm.reset_s)),
+                            ])
+                        }),
+                    ),
                     (
                         "uptime_s",
                         J::Float(((now() - self.started) * 10.0).round() / 10.0),
@@ -2085,6 +2539,8 @@ impl Stub {
                     st.by_status.clear();
                     st.by_kind.clear();
                     st.custom_budget.clear();
+                    st.limit_remaining = None;
+                    st.limit_arm = None;
                 }
                 out.json(200, &J::obj([("ok", J::Bool(true))]), &[])?;
             }
@@ -2108,6 +2564,10 @@ impl Stub {
     ) -> io::Result<()> {
         let info = analyse(body);
         let kind = info.kind;
+        let mode = match self.mode_for_request(&mode, kind == "main") {
+            Ok(mode) => mode,
+            Err(refusal) => return refusal.answer(self, method, path, body.len(), out),
+        };
         let n = bump(&mut self.st().by_kind, kind);
         let model = match &info.model {
             J::Str(s) => s.clone(),
@@ -2154,9 +2614,8 @@ impl Stub {
             }
         }
         let mut mode = mode;
-        if let Some(sp) = self
-            .take_custom(&mode, Some(label))
-            .filter(|sp| kind == "main" || !is_scripted(sp))
+        if let Some(sp) =
+            self.take_custom_if(&mode, Some(label), |sp| kind == "main" || !is_scripted(sp))
         {
             // A custom mode's `script` answers the conversations keyed to it, step by step, as the
             // `tool` mode does; its replies answer every other.
@@ -2167,7 +2626,15 @@ impl Stub {
             if let Some(turn) = keyed {
                 return self.tool_turn_answer(&base.in_mode(&mode), body, &summary, turn, out);
             }
-            let sp = with_reply(sp, &message_users(body));
+            let users = message_users(body);
+            let summary = match scripted_rule(&sp, &users) {
+                Some(rule) => format!(
+                    "{summary} reply={rule} last_user_sha256={}",
+                    message_digest(&info.last_user)
+                ),
+                None => summary,
+            };
+            let sp = self.gated_reply(sp, &users);
             if let Some((name, input)) = scripted_call(&sp, messages_answered(body)) {
                 let note = misfit_note(body, &[(&name, &input)]);
                 let s = format!("{summary} custom tool:{name}{note}");
@@ -2187,6 +2654,14 @@ impl Stub {
             };
             let now_s = crate::util::now_secs();
             if now_s < reset {
+                if let Some(rate) = out.rate.as_ref() {
+                    for (_, v) in &rate.on429 {
+                        let at = reset_value(v, reset);
+                        if at != *v {
+                            summary = summary.replace(v.as_str(), &at);
+                        }
+                    }
+                }
                 let headers = [
                     ("anthropic-ratelimit-unified-status", "rejected".to_string()),
                     ("anthropic-ratelimit-unified-reset", reset.to_string()),
@@ -2199,7 +2674,10 @@ impl Stub {
                 let msg =
                     "This request would exceed your account's rate limit. Please try again later.";
                 let st = out.json(429, &err_body("rate_limit_error", msg), &headers)?;
-                let s = format!("{summary} limit:{claim} resets in {}s", reset - now_s);
+                let s = format!(
+                    "{summary} limit:{claim} resets in {}s",
+                    reset.saturating_sub(now_s)
+                );
                 self.record(method, path, st, blen, &mode, &s);
                 return Ok(());
             }
@@ -2212,9 +2690,13 @@ impl Stub {
                 self.record(method, path, st, blen, &mode, &summary);
                 return Ok(());
             }
-            "rate-limit" => {
+            m if m == "rate-limit" || rate_limit_after(m).is_some() => {
+                // The real API's body names no number: its wait is the `retry-after` header
+                // alone, which Claude Code never draws, so its harness tries on the ladder.
                 let msg = "This request would exceed your organization's rate limit of 50 requests per minute.";
-                let h = [("retry-after".to_string(), self.args.retry_after.clone())];
+                let after = rate_limit_after(m)
+                    .map_or_else(|| self.args.retry_after.clone(), str::to_string);
+                let h = [("retry-after".to_string(), after)];
                 let st = out.json(429, &err_body("rate_limit_error", msg), &h)?;
                 self.record(method, path, st, blen, &mode, &summary);
                 return Ok(());
@@ -2326,7 +2808,10 @@ impl Stub {
         self.dump(body, kind);
         let blen = body.len();
         let in_tok = est_tokens(blen);
-        let mut mode = mode.to_string();
+        let mut mode = match self.mode_for_request(mode, matches!(kind, "codex" | "muse")) {
+            Ok(mode) => mode,
+            Err(refusal) => return refusal.answer(self, method, path, blen, out),
+        };
         if dialect == Dialect::Muse && mode == "tool" && kind == "muse" {
             let script = self
                 .args
@@ -2353,11 +2838,10 @@ impl Stub {
                 Some(ToolTurn::Say(..) | ToolTurn::Calls(..)) | None => {}
             }
         }
-        if let Some(spec) = self
-            .take_custom(&mode, Some(&label))
-            .filter(|sp| !matches!(kind, "codex-json" | "muse-json") || !is_scripted(sp))
-        {
-            let spec = with_reply(spec, &responses_users(body));
+        if let Some(spec) = self.take_custom_if(&mode, Some(&label), |sp| {
+            !matches!(kind, "codex-json" | "muse-json") || !is_scripted(sp)
+        }) {
+            let spec = self.gated_reply(spec, &responses_users(body));
             if dialect == Dialect::Muse
                 && let Some((name, input)) = scripted_call(&spec, muse::results_answered(body))
             {
@@ -2377,7 +2861,7 @@ impl Stub {
                 .and_then(J::as_f64)
                 .filter(|v| *v > 0.0)
             {
-                std::thread::sleep(Duration::from_secs_f64(ms / 1000.0));
+                sleep_secs(ms / 1000.0);
             }
             let status = spec
                 .get("status")
@@ -2441,7 +2925,7 @@ impl Stub {
                 )?;
                 let s = format!(
                     "{summary} limit:{claim} resets in {}s plan={}",
-                    reset - now_s,
+                    reset.saturating_sub(now_s),
                     plan.as_deref().unwrap_or("-")
                 );
                 self.record(method, path, st, blen, &mode, &s);
@@ -2575,9 +3059,7 @@ impl Stub {
                 ]),
             )?;
             for d in deltas {
-                if pace > 0.0 {
-                    std::thread::sleep(Duration::from_secs_f64(pace));
-                }
+                sleep_secs(pace);
                 send(
                     out,
                     ev(vec![
@@ -2810,8 +3292,11 @@ impl Stub {
                 pct,
                 J::obj([
                     ("used_percent", J::Int(pct)),
-                    ("limit_window_seconds", J::Int(mins * 60)),
-                    ("reset_after_seconds", J::Int((reset - now).max(0))),
+                    ("limit_window_seconds", J::Int(mins.saturating_mul(60))),
+                    (
+                        "reset_after_seconds",
+                        J::Int(reset.saturating_sub(now).max(0)),
+                    ),
                     ("reset_at", J::Int(reset)),
                 ]),
             ))
@@ -3036,9 +3521,7 @@ impl Stub {
             )?;
             out.sse("ping", &J::obj([("type", J::s("ping"))]))?;
             for d in deltas {
-                if pace > 0.0 {
-                    std::thread::sleep(Duration::from_secs_f64(pace));
-                }
+                sleep_secs(pace);
                 out.sse(
                     "content_block_delta",
                     &J::obj([
@@ -3253,7 +3736,7 @@ impl Stub {
             .and_then(J::as_f64)
             .filter(|v| *v > 0.0)
         {
-            std::thread::sleep(Duration::from_secs_f64(ms / 1000.0));
+            sleep_secs(ms / 1000.0);
         }
         let status = spec
             .get("status")

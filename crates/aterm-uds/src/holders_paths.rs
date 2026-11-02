@@ -240,7 +240,11 @@ fn executable(pid: u32) -> Option<PathBuf> {
 fn parent_of(pid: u32) -> Option<u32> {
     let stat = crate::process::read_proc_text(Path::new(&format!("/proc/{pid}/stat"))).ok()?;
     let rest = stat.get(stat.rfind(')')? + 1..)?;
-    rest.split_whitespace().nth(1)?.parse().ok()
+    rest.split_whitespace()
+        .nth(1)
+        .filter(|s| s.bytes().all(|b| b.is_ascii_digit()))?
+        .parse()
+        .ok()
 }
 
 /// See the macOS twin.
@@ -1508,7 +1512,9 @@ pub fn write_open_files(pid: u32) -> io::Result<Vec<PathBuf>> {
         let flags = info
             .lines()
             .find_map(|l| l.strip_prefix("flags:"))
-            .and_then(|v| u32::from_str_radix(v.trim(), 8).ok());
+            .map(str::trim)
+            .filter(|v| !v.is_empty() && v.bytes().all(|b| matches!(b, b'0'..=b'7')))
+            .and_then(|v| u32::from_str_radix(v, 8).ok());
         if !flags.is_some_and(|f| matches!(f & O_ACCMODE, 1 | 2)) {
             continue;
         }

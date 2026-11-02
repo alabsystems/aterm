@@ -192,7 +192,7 @@ pub(crate) struct Rec {
 }
 
 impl Rec {
-    fn hidden(&self) -> bool {
+    pub(crate) fn hidden(&self) -> bool {
         !matches!(self.kind, Kind::Plain)
     }
 }
@@ -2122,14 +2122,18 @@ impl State {
     }
 
     /// The next record from `from` a tail of `filter` is handed: the held records below the
-    /// base first, then the retained ones (astream's `BrokerLog::read_chunk`).
+    /// base first, then the retained ones (astream's `BrokerLog::read_chunk`). Never one past
+    /// the log's head: only a power loss that cut below the durable head (the P3 control,
+    /// `ArmMutant::CutBelowDurable`) leaves held records there, and handing one would index
+    /// past the log, where the run is to go on and be judged by its laws.
     fn next_match(&self, from: u64, filter: &Filter) -> Option<u64> {
         let base = self.ret.base;
-        if from < base {
+        let held_below = base.min(self.log.len() as u64);
+        if from < held_below {
             let held = self
                 .ret
                 .held
-                .range(from..base)
+                .range(from..held_below)
                 .find(|(_, h)| filter.matches_str(&h.rec.subject))
                 .map(|(&off, _)| off);
             if held.is_some() {

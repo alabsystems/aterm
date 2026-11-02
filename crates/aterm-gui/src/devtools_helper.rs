@@ -1023,6 +1023,12 @@ pub(crate) struct Panel {
     /// stays on its done words, never closing [`DONE_FOR`] after them, until the walk lets it go
     /// ([`Lane::let_done_go`]) once macOS's Quit & Reopen sheet is gone.
     waits: Option<&'static str>,
+    /// The walk's last look at this page's time ([`Self::count_time`]), and whether the person
+    /// was at the Mac with its screen in use then: the page's [`PANEL_FOR`] counts only the
+    /// stretches between two such looks. A walk's page counts from its creation as a look that
+    /// found the person there (the walk starts, and reads the grant that turns its page, only
+    /// with them present), so a first look that finds them away does not count the time before it.
+    counted: Option<(Instant, bool)>,
 }
 
 fn listed_off(list: DevToolList) -> bool {
@@ -1065,6 +1071,7 @@ impl Panel {
             later: true,
             open_owed: false,
             waits: None,
+            counted: (show.origin == Origin::Walk).then_some((now, true)),
         }
     }
 
@@ -1518,6 +1525,29 @@ impl Panel {
             };
         }
         Effect::default()
+    }
+
+    /// The walk's look at its page's time at `now`, `counts` saying whether the person is at the
+    /// Mac with its screen in use (`App::count_walk_page_time`): the stretch since the last look
+    /// counts toward [`PANEL_FOR`] only when the person was there at both looks, so a page left
+    /// up behind a lock, or while nobody touched the Mac, does not lapse in their absence, and one
+    /// the present person leaves unanswered still lapses after ten minutes of them. A stretch
+    /// that does not count moves the show later by its length, and done words that wait for the
+    /// walk's next page ([`Self::waits`]) by the part of it after they came: done words the
+    /// grant read at a look that found the person back brought start at that look, not as long
+    /// after it as they were away.
+    pub(crate) fn count_time(&mut self, now: Instant, counts: bool) {
+        if let Some((at, counted)) = self.counted
+            && !(counted && counts)
+        {
+            self.shown_at += now.saturating_duration_since(at);
+            if self.waits.is_some()
+                && let Some(done_at) = self.done_at.as_mut()
+            {
+                *done_at += now.saturating_duration_since(at.max(*done_at));
+            }
+        }
+        self.counted = Some((now, counts));
     }
 
     /// System Settings has a sheet or dialog up (such as the Quit & Reopen / Later sheet after
@@ -2215,7 +2245,7 @@ pub(crate) struct Reach {
     pub(crate) note_declined: fn(&str),
     pub(crate) grant_stable: fn() -> bool,
     pub(crate) drag_bundle: fn(Option<&str>) -> Option<PathBuf>,
-    pub(crate) refresh_verdict: fn() -> Result<(), String>,
+    pub(crate) refresh_verdict: fn() -> Result<(), atpkg::devtools::RefreshFailed>,
     live: bool,
 }
 
@@ -2255,7 +2285,7 @@ impl Reach {
             note_declined: inert_note,
             grant_stable: inert_no,
             drag_bundle: inert_drag_bundle,
-            refresh_verdict: inert_list_terminal,
+            refresh_verdict: inert_refresh,
             live: false,
         }
     }
@@ -2297,6 +2327,12 @@ const fn inert_open_pane() -> bool {
 
 fn inert_list_terminal() -> Result<(), String> {
     Err("not run on this instance".to_string())
+}
+
+fn inert_refresh() -> Result<(), atpkg::devtools::RefreshFailed> {
+    Err(atpkg::devtools::RefreshFailed::Failed(
+        "not run on this instance".to_string(),
+    ))
 }
 
 const fn inert_read_list(_gate: ProbeGate, _subject: &str) -> DevToolList {
@@ -2534,6 +2570,54 @@ struct Shared {
     /// System Settings became the active app (`true`) or resigned it (`false`) since the lane
     /// last looked, the latest move ([`SettingsMoves`]).
     settings_moved: Option<bool>,
+    /// When the last verdict refresh that took ended (unix ms): from then on macOS checks no new
+    /// program aterm starts (the leftover-processes design's M13), so this is the grant's effect
+    /// time ([`Lane::took_at`]). A reading that finds aterm not granted forgets it.
+    took_at_ms: Option<u64>,
+    /// How many readings found aterm not granted ([`Self::forget_took`]): a refresh that took
+    /// while one did keeps no effect time.
+    not_granted_readings: u64,
+    /// A verdict refresh did not settle and waits to be asked again ([`Lane::take_unsettled`]).
+    unsettled: bool,
+    /// Verdict refreshes in a row that did not settle: only the first waits to be asked again,
+    /// so a queue that stays backed up gets one more prime, never one every few minutes.
+    unsettled_run: u32,
+}
+
+impl Shared {
+    /// Keeps what a verdict refresh that ended at `now_ms` (unix ms) says: one that took is the
+    /// grant's effect time unless a reading found aterm not granted since it started (while
+    /// [`Self::not_granted_readings`] read `not_granted_at_start`), the first of a run that did
+    /// not settle waits to be asked again, and one that failed says nothing of either.
+    fn note_refresh(
+        &mut self,
+        ended: &Result<(), atpkg::devtools::RefreshFailed>,
+        now_ms: u64,
+        not_granted_at_start: u64,
+    ) {
+        match ended {
+            Ok(()) => {
+                self.unsettled_run = 0;
+                if self.not_granted_readings == not_granted_at_start {
+                    self.took_at_ms = Some(now_ms);
+                }
+            }
+            Err(atpkg::devtools::RefreshFailed::NotSettled(_)) => {
+                self.unsettled_run = self.unsettled_run.saturating_add(1);
+                if self.unsettled_run == 1 {
+                    self.unsettled = true;
+                }
+            }
+            Err(atpkg::devtools::RefreshFailed::Failed(_)) => self.unsettled_run = 0,
+        }
+    }
+
+    /// A reading found aterm not granted: the grant's effect time is gone, also the one a refresh
+    /// still out would keep.
+    const fn forget_took(&mut self) {
+        self.took_at_ms = None;
+        self.not_granted_readings = self.not_granted_readings.wrapping_add(1);
+    }
 }
 
 /// The nudge a worker or a press sends (`Wake::DevToolsHandOver`).
@@ -2929,6 +3013,9 @@ pub(crate) struct Lane {
     /// aterm.log said the question seen asking lapsed ([`Self::settings_may_ask`]), until a
     /// reading finds it otherwise.
     said_lapsed: std::cell::Cell<bool>,
+    /// The walk's page waits for the person: they are away from the Mac or its screen is not in
+    /// use ([`Self::count_walk_page_time`]), so its list is not read.
+    walk_page_rests: bool,
 }
 
 impl Lane {
@@ -2988,6 +3075,7 @@ impl Lane {
             settings_front: false,
             settings_read_at: None,
             said_lapsed: std::cell::Cell::new(false),
+            walk_page_rests: false,
         }
     }
 
@@ -3107,10 +3195,7 @@ impl Lane {
     /// done words; any other reading gives the panel its tccd answers and, to a panel shown before
     /// any reading named the bundle id, the subject its list reads need and the icon to drag.
     pub(crate) fn note_reading(&mut self, reading: Reading, now: Instant) {
-        self.reading = Some(reading);
-        if reading.grant == DevToolGrant::Granted {
-            self.queued = None;
-        }
+        self.keep_reading(reading);
         let drag_bundle = self.reach.drag_bundle;
         if let Some(panel) = self
             .panel
@@ -3131,8 +3216,16 @@ impl Lane {
         if list.label != DevToolListLabel::Read {
             return;
         }
-        let reading = self.reading.unwrap_or(Reading::UNREAD).with_list(list);
+        self.keep_reading(self.reading.unwrap_or(Reading::UNREAD).with_list(list));
+    }
+
+    /// The lane's reading from now on, whichever read made it: aterm not granted forgets the
+    /// grant's effect time ([`Shared::forget_took`]), and aterm granted ends a waiting hand-over.
+    fn keep_reading(&mut self, reading: Reading) {
         self.reading = Some(reading);
+        if reading.grant == DevToolGrant::NotGranted {
+            self.shared.lock_or_recover().forget_took();
+        }
         if reading.grant == DevToolGrant::Granted {
             self.queued = None;
         }
@@ -3598,17 +3691,24 @@ impl Lane {
         }
         let refresh = self.reach.refresh_verdict;
         let refreshing = Arc::clone(&self.refreshing);
+        let shared = Arc::clone(&self.shared);
+        let not_granted_at_start = shared.lock_or_recover().not_granted_readings;
         let spawned = crate::qos::spawn_lane_thread(
             "aterm-devtools-refresh",
             crate::qos::Role::Background,
             move || {
-                match refresh() {
+                let ended = refresh();
+                match &ended {
                     Ok(()) => aterm_log::info!(
                         "devtools: a fresh aterm process ran a new program, so macOS asked \
                          about aterm again"
                     ),
                     Err(e) => aterm_log::warn!("devtools: asking macOS about aterm again: {e}"),
                 }
+                let now_ms = aterm_time::unix_millis().unwrap_or(0);
+                shared
+                    .lock_or_recover()
+                    .note_refresh(&ended, now_ms, not_granted_at_start);
                 refreshing.store(false, Ordering::Release);
             },
         );
@@ -3625,6 +3725,26 @@ impl Lane {
     #[cfg(test)]
     pub(crate) const fn refreshes_started(&self) -> u32 {
         self.refreshes
+    }
+
+    /// Whether a verdict refresh's worker is still out.
+    #[cfg(test)]
+    pub(crate) fn refresh_out(&self) -> bool {
+        self.refreshing.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// When the last verdict refresh that took ended (unix ms), unless a reading found aterm not
+    /// granted since: the grant's effect time, at or after which a program aterm starts is not
+    /// checked by macOS ([`Self::refresh_verdict`]).
+    pub(crate) fn took_at(&self) -> Option<u64> {
+        self.shared.lock_or_recover().took_at_ms
+    }
+
+    /// Takes whether a verdict refresh did not settle since the last take, the first of a run that
+    /// did not settle ([`Shared::note_refresh`]): macOS's queue was backed up, so it is asked again
+    /// once the queue drains (`App::note_held_episode`).
+    pub(crate) fn take_unsettled(&self) -> bool {
+        std::mem::take(&mut self.shared.lock_or_recover().unsettled)
     }
 
     fn note_waiting(&mut self, listing: Listing) {
@@ -3751,6 +3871,28 @@ impl Lane {
         self.panel = Some(panel);
         self.next_tick = Some(now);
         true
+    }
+
+    /// The walk's look at its page at `now`, `present` saying whether the person is at the Mac
+    /// with its screen in use: the page's ten minutes count only their time
+    /// ([`Panel::count_time`]), and while they are away its list is not read. Any other panel is
+    /// left alone.
+    pub(crate) fn count_walk_page_time(&mut self, now: Instant, present: bool) {
+        let Some(panel) = self
+            .panel
+            .as_mut()
+            .filter(|panel| panel.origin == Origin::Walk)
+        else {
+            self.walk_page_rests = false;
+            return;
+        };
+        panel.count_time(now, present);
+        self.walk_page_rests = !present;
+    }
+
+    /// Whether the walk's page waits for the person ([`Self::count_walk_page_time`]).
+    pub(crate) const fn walk_page_rests(&self) -> bool {
+        self.walk_page_rests
     }
 
     /// The name of the permission walk's page after the one up, `None` when it has none: a walk
@@ -4024,7 +4166,8 @@ impl Lane {
     /// [`PANEL_TICK`], placement and System Settings still running; then the done words' time and
     /// the ten-minute bound; then, at that cadence (or at once after a drop), one list read on a
     /// worker when the panel wants one, System Settings is frontmost and `read` names the gate
-    /// (`None`: `[privacy] observer = false`, which reads nothing).
+    /// (`None`: `[privacy] observer = false`, which reads nothing), and, on a walk's page, the
+    /// person is at the Mac ([`Self::count_walk_page_time`]).
     pub(crate) fn tick_panel(
         &mut self,
         now: Instant,
@@ -4103,6 +4246,7 @@ impl Lane {
             .is_some_and(|panel| panel.step.is_some());
         if effect.close.is_none()
             && (due || read_asked || walk_page)
+            && !(walk_page && self.walk_page_rests)
             && let Some(gate) = read
         {
             self.start_read(now, gate, wake);
@@ -6493,6 +6637,21 @@ pub(crate) mod test_arms {
         }
     }
 
+    /// [`opening`], whose verdict refresh does not settle: macOS's queue is backed up.
+    pub(crate) fn not_settling() -> Reach {
+        refreshing_by(|| Err(atpkg::devtools::RefreshFailed::NotSettled(None)))
+    }
+
+    /// [`opening`], whose verdict refresh is `refresh_verdict`.
+    pub(crate) fn refreshing_by(
+        refresh_verdict: fn() -> Result<(), atpkg::devtools::RefreshFailed>,
+    ) -> Reach {
+        Reach {
+            refresh_verdict,
+            ..opening()
+        }
+    }
+
     pub(crate) const DECLINED: (u64, u64) = (1_791_000_000, 1_791_000_000 + 30 * 86_400);
 
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -7740,6 +7899,98 @@ mod tests {
         }
     }
 
+    /// A walk page counts from its creation as a look that found the person there: a delayed
+    /// first look that finds them away cannot spend its lifetime. Ordinary uncounted panels
+    /// still lapse normally, and a walk with observed present time still spends that time.
+    #[test]
+    fn a_walk_pages_first_absent_count_spends_no_unobserved_time() {
+        let t0 = Instant::now();
+        let walk = || Show {
+            origin: Origin::Walk,
+            step: Some((1, 2)),
+            ..fda_show(None)
+        };
+        let mut ordinary = Panel::new(fda_show(None), t0);
+        assert_eq!(
+            ordinary.turn(t0 + PANEL_FOR).close,
+            Some(Closed::Lapsed),
+            "an ordinary uncounted panel keeps its lifetime"
+        );
+
+        let mut present = Panel::new(walk(), t0);
+        present.count_time(t0, true);
+        present.count_time(t0 + PANEL_FOR - Duration::from_secs(1), true);
+        assert_eq!(
+            present.turn(t0 + PANEL_FOR - Duration::from_secs(1)).close,
+            None
+        );
+        present.count_time(t0 + PANEL_FOR, true);
+        assert_eq!(
+            present.turn(t0 + PANEL_FOR).close,
+            Some(Closed::Lapsed),
+            "a full lifetime with observed presence still lapses"
+        );
+
+        for delay in [PANEL_FOR, PANEL_FOR * 3] {
+            let mut page = Panel::new(walk(), t0);
+            let absent = t0 + delay;
+            page.count_time(absent, false);
+            assert_eq!(
+                page.turn(absent).close,
+                None,
+                "a first absent count after {delay:?} cannot spend unobserved time"
+            );
+            let back = absent + PANEL_FOR;
+            page.count_time(back, true);
+            assert_eq!(page.turn(back).close, None, "the person just came back");
+            page.count_time(back + PANEL_FOR - Duration::from_secs(1), true);
+            assert_eq!(
+                page.turn(back + PANEL_FOR - Duration::from_secs(1)).close,
+                None
+            );
+            page.count_time(back + PANEL_FOR, true);
+            assert_eq!(
+                page.turn(back + PANEL_FOR).close,
+                Some(Closed::Lapsed),
+                "the person's subsequent full lifetime still counts"
+            );
+        }
+    }
+
+    /// An uncounted stretch moves done words that wait for the walk's next page only by its part
+    /// after they came: a grant read at the look that found the person back after an hour away
+    /// leaves them starting at that look, and a stretch the person spends away after them moves
+    /// them by its whole length.
+    #[test]
+    fn done_words_move_only_by_the_uncounted_time_after_they_came() {
+        let t0 = Instant::now();
+        let mut page = Panel::new(
+            Show {
+                origin: Origin::Walk,
+                step: Some((1, 2)),
+                ..fda_show(None)
+            },
+            t0,
+        );
+        page.waits = Some("Developer Tools");
+        let away = t0 + Duration::from_secs(1);
+        page.count_time(away, false);
+        let back = away + Duration::from_secs(60 * 60);
+        let _ = page.granted(back);
+        page.count_time(back, true);
+        assert_eq!(page.done_at, Some(back), "the hour away came before them");
+        page.count_time(back + DONE_FOR, true);
+        assert_eq!(page.done_at, Some(back), "counted time moves nothing");
+        let gone = back + DONE_FOR + Duration::from_secs(1);
+        page.count_time(gone, false);
+        page.count_time(gone + Duration::from_secs(30), true);
+        assert_eq!(
+            page.done_at,
+            Some(back + Duration::from_secs(31)),
+            "the stretch from the last present look to the return, all after them"
+        );
+    }
+
     #[test]
     fn the_panels_state_machine() {
         let t0 = Instant::now();
@@ -8667,6 +8918,135 @@ mod tests {
         assert!(lane.refresh_verdict(), "the next switch-on runs again");
         until(|| RUNS.load(Ordering::SeqCst) == 2);
         assert_eq!(lane.refreshes_started(), 2);
+    }
+
+    /// A refresh that took keeps when it ended, the grant's effect time; one that did not settle
+    /// keeps none and is taken once, to be asked again; a reading that finds aterm not granted
+    /// forgets the effect time, whether a whole reading or a list read alone says so.
+    #[test]
+    fn a_refresh_that_took_keeps_its_end_and_one_that_did_not_settle_is_taken_once() {
+        use atpkg::devtools::RefreshFailed;
+        use std::sync::atomic::Ordering;
+        let run = |refresh_verdict: fn() -> Result<(), RefreshFailed>| {
+            let mut lane = Lane::windowed_for_test(
+                Reach {
+                    refresh_verdict,
+                    ..test_reach()
+                },
+                test_arm(),
+            );
+            let before = aterm_time::unix_millis().unwrap_or(0);
+            assert!(lane.refresh_verdict());
+            until(|| !lane.refreshing.load(Ordering::SeqCst));
+            (lane, before)
+        };
+        let (mut took, before) = run(|| Ok(()));
+        assert!(
+            took.took_at().is_some_and(|at| at >= before),
+            "{:?} from {before}",
+            took.took_at()
+        );
+        assert!(!took.take_unsettled(), "it took");
+        took.note_reading(
+            test_arms::reading(DevToolGrant::Granted, test_arms::on()),
+            Instant::now(),
+        );
+        assert!(took.took_at().is_some(), "a granted reading keeps it");
+        took.note_reading(
+            test_arms::reading(DevToolGrant::NotGranted, test_arms::on()),
+            Instant::now(),
+        );
+        assert_eq!(took.took_at(), None, "not granted: the effect time is gone");
+        let (mut listed, _) = run(|| Ok(()));
+        listed.note_list(test_arms::on());
+        assert!(
+            listed.took_at().is_some(),
+            "a list that reads aterm on keeps it"
+        );
+        listed.note_list(test_arms::absent(2));
+        assert_eq!(
+            listed.took_at(),
+            None,
+            "a list that reads aterm absent: the effect time is gone"
+        );
+
+        let (unsettled, _) = run(|| Err(RefreshFailed::NotSettled(None)));
+        assert_eq!(unsettled.took_at(), None, "not settled: no effect time");
+        assert!(unsettled.take_unsettled(), "asked again");
+        assert!(!unsettled.take_unsettled(), "once");
+
+        let (failed, _) = run(|| Err(RefreshFailed::Failed("codesign: denied".into())));
+        assert_eq!(failed.took_at(), None);
+        assert!(!failed.take_unsettled(), "a failure is not asked again");
+    }
+
+    /// A refresh that took while a reading found aterm not granted says nothing of the grant: the
+    /// owner turned aterm off while its prime ran, so it keeps no effect time. The next refresh
+    /// keeps its own.
+    #[test]
+    fn a_refresh_that_took_while_aterm_read_not_granted_keeps_no_effect_time() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static HELD: AtomicBool = AtomicBool::new(true);
+        let mut lane = Lane::windowed_for_test(
+            Reach {
+                refresh_verdict: || {
+                    until(|| !HELD.load(Ordering::SeqCst));
+                    Ok(())
+                },
+                ..test_reach()
+            },
+            test_arm(),
+        );
+        assert!(lane.refresh_verdict());
+        lane.note_reading(
+            test_arms::reading(DevToolGrant::NotGranted, test_arms::on()),
+            Instant::now(),
+        );
+        HELD.store(false, Ordering::SeqCst);
+        until(|| !lane.refreshing.load(Ordering::SeqCst));
+        assert_eq!(
+            lane.took_at(),
+            None,
+            "turned off while it ran: no effect time"
+        );
+        assert!(lane.refresh_verdict());
+        until(|| !lane.refreshing.load(Ordering::SeqCst));
+        assert!(lane.took_at().is_some(), "the next refresh keeps its own");
+    }
+
+    /// Only the first of a run of refreshes that did not settle waits to be asked again: a queue
+    /// that stays backed up gets one more prime, never one every few minutes. A refresh that took
+    /// ends the run.
+    #[test]
+    fn only_the_first_of_a_run_of_refreshes_that_did_not_settle_is_asked_again() {
+        use atpkg::devtools::RefreshFailed;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static SETTLES: AtomicBool = AtomicBool::new(false);
+        let mut lane = Lane::windowed_for_test(
+            Reach {
+                refresh_verdict: || {
+                    if SETTLES.load(Ordering::SeqCst) {
+                        Ok(())
+                    } else {
+                        Err(RefreshFailed::NotSettled(None))
+                    }
+                },
+                ..test_reach()
+            },
+            test_arm(),
+        );
+        let asked_again = |lane: &mut Lane| {
+            assert!(lane.refresh_verdict());
+            until(|| !lane.refreshing.load(Ordering::SeqCst));
+            lane.take_unsettled()
+        };
+        assert!(asked_again(&mut lane), "the first that did not settle");
+        assert!(!asked_again(&mut lane), "the second in a row is not");
+        assert!(!asked_again(&mut lane), "nor the third");
+        SETTLES.store(true, Ordering::SeqCst);
+        assert!(!asked_again(&mut lane), "one that took");
+        SETTLES.store(false, Ordering::SeqCst);
+        assert!(asked_again(&mut lane), "ends the run");
     }
 
     #[test]

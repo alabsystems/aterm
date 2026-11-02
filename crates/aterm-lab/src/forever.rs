@@ -11,9 +11,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use aterm_agent::supervise::approvals::{RULE_POINT, RULE_TASK_DONE, TASK_DONE};
+use aterm_agent::supervise::approvals::{self, RULE_POINT, RULE_TASK_DONE, TASK_DONE};
 use aterm_agent::supervise::policy::needs::NEEDS_ACK;
 use aterm_agent::supervise::policy::turn_end;
+use aterm_agent::supervise::tape::show;
 
 use crate::door::{Door, Reply};
 use crate::pyjson::J;
@@ -63,6 +64,13 @@ const N4_HEAD: &str = "Hardened the parser's error paths in this turn.";
 
 const LONG_DELAY_MS: i64 = 10_000;
 const LONG_PACE_MS: i64 = 7_000;
+/// How long a reply of real work holds its agent before it streams: past the turn-end policy's
+/// floor ([`turn_end::MIN_WORK`], 2 min), so its turn is work and the short streak starts over.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "two minutes and ten seconds in ms"
+)]
+const WORK_TURN_MS: i64 = turn_end::MIN_WORK.as_millis() as i64 + 10_000;
 #[expect(
     clippy::cast_precision_loss,
     reason = "a few seconds in ms, exact in an f64"
@@ -78,7 +86,61 @@ pub fn long_reply_ms(text: &str) -> i64 {
 }
 
 const LAND_KEY: &str = "Autopilot is Land:";
+
+/// What only Land's one ask at the person's switch over a held tab says (v6 §14.17 item 3): the
+/// close of its why, which `switch-over-held`'s stand-in answers slowly.
+const SWITCH_KEY: &str = turn_end::SWITCH_WHY_TAIL;
+
+/// How long `switch-over-held`'s stand-in takes over its answer to Land's one ask: long enough
+/// that a look reads the ask standing, short of real work (`turn_end::MIN_WORK`).
+pub const SWITCH_ASK_DELAY_MS: i64 = 30_000;
 const NUDGE_KEY: &str = "Still landing:";
+/// The land check's words the stub's rules answer (`land-check@v1`): its fixed head, ahead of a
+/// chain's `MARK` and `NUDGE_KEY` rules, so no other rule answers the check.
+const LAND_CHECK_KEY: &str = turn_end::LAND_CHECK_HEAD;
+/// The one answer to the land check that lands.
+const LANDED: &str = aterm_agent::supervise::policy::land_check::LANDED;
+/// LAND'S CONTRADICTION'S HEAD (slice 4c): the stub's rule for land-contradicted's answer to it,
+/// ahead of `NUDGE_KEY`'s, whose words it opens with.
+const CONTRADICTED_KEY: &str = turn_end::LAND_CONTRADICTED_HEAD;
+/// land-contradicted's answer to the contradiction, given once the lab has landed
+/// `wip-notes.txt` for it ([`land_contradicted_work`]): what it did, then a defense of other words
+/// than [`CLEAN`]'s, so it is no same reply.
+pub const LANDED_NOTES: &str = "Committed wip-notes.txt and pushed it to origin/main.\n\
+                                Nothing left: the parser and its notes are on origin/main.";
+/// The head of Land's nudge quoting the agent's own list ([`land_check::LISTED_OPEN`]).
+const LISTED_KEY: &str = aterm_agent::supervise::policy::land_check::LISTED_OPEN;
+/// The hinted check's quote opening ([`land_check::LAND_CHECK_HINT_OPEN`]).
+const HINT_OPEN: &str = aterm_agent::supervise::policy::land_check::LAND_CHECK_HINT_OPEN;
+/// L2's list, its answer to the check: its report's leftover, said alone.
+pub const CHECK_LIST: &str = "The docs PR is still open.";
+/// land-same-list's list.
+pub const SAME_LIST: &str = "The changelog entry is not written yet.";
+/// land-reworded's second list: [`CHECK_LIST`]'s leftover in other words, its word family the
+/// same (`still open`), so only the hold's quote tells the two apart (slice 4b).
+pub const REWORDED_LIST: &str = "The pull request for the docs is still open.";
+/// What the nudge quoting [`REWORDED_LIST`] names.
+const REWORDED_KEY: &str = "The pull request for the docs is still open";
+/// land-reworded's work reply to the nudge quoting its first list (no defense).
+pub const REWORD_WORK: &str = "Rebased the docs branch onto main in this turn.";
+const REWORD_WORK_KEY: &str = "Rebased the docs branch";
+/// What the nudge quoting [`SAME_LIST`] names.
+const SAME_KEY: &str = "The changelog entry is not written yet";
+/// land-listed's list, and the work its nudge's reply does.
+pub const RELEASE_LIST: &str = "The release notes are not written yet.";
+/// What the nudge quoting [`RELEASE_LIST`] names.
+const RELEASE_KEY: &str = "The release notes are not written yet";
+/// land-listed's work reply to the nudge quoting its list (no defense).
+pub const RELEASE_WORK: &str = "Implemented the release notes for the parser in this turn.";
+const RELEASE_WORK_KEY: &str = "Implemented the release notes";
+/// land-hinted's defense: clean, a narrative clause in it that the reader reads open.
+pub const HINTED: &str = "Nothing left: the parser is on origin/main, and the old bug where a stale lock still blocked the build is fixed.";
+/// What land-hinted's check quotes of [`HINTED`].
+const HINT_KEY: &str = "stale lock still blocked the build";
+/// L6's answer to the check: its need alone.
+fn need_alone() -> String {
+    format!("NEEDS YOU: {NEED}")
+}
 /// The words of the done check the stub's rules answer (`continue-done-check@v1`).
 pub const CHECK_KEY: &str = "done is never the end";
 /// The words of Cruise's continuation the stub's rules answer (`continue@v1`).
@@ -94,11 +156,16 @@ const PAST_NEXT_STEP_MS: i64 = 60_000;
 const QUIET_UNDER_OFF_MS: i64 = 270_000;
 const CHAIN_LIMIT_MS: i64 = 16 * 60 * 1000;
 const CRUISE_N_LIMIT_MS: i64 = 20 * 60 * 1000;
+/// How long land-contradicted-list may take to watch past its hold: its contradiction waits out
+/// the short streak's fourth back-off (16 min, a defense being a done claim that lengthens the
+/// streak) after the 8 min one before the nudge quoting its list, about 28 min on every harness.
+const LIST_CONTRADICTED_LIMIT_MS: i64 = 35 * 60 * 1000;
 const WALL_REDRAW_LIMIT_MS: i64 = 30 * 60 * 1000;
 const WALL_SWITCH_LIMIT_MS: i64 = 30 * 60 * 1000;
 const WALL_UNREAD_LIMIT_MS: i64 = 100 * 60 * 1000;
 const WALL_CRUISE_LIMIT_MS: i64 = 25 * 60 * 1000;
 const WALL_RELAUNCH_LIMIT_MS: i64 = 30 * 60 * 1000;
+const WALL_TAP_LIMIT_MS: i64 = 30 * 60 * 1000;
 const AT_DONE_MS: i64 = 500;
 
 const DUE_SLACK_MS: i64 = 2_000;
@@ -197,21 +264,8 @@ const WALL_LOST_MS: i64 = 5 * 60_000;
 /// 150 s for Claude Code, whose own continue comes 30 to 90 s past the reset.
 #[must_use]
 pub fn wall_grace_ms(program: &str) -> i64 {
-    use aterm_phase::Program;
-    let p = match Harness::of(program) {
-        Some(Harness::Claude) => Program::Claude,
-        Some(Harness::Agy) => Program::Agy,
-        Some(Harness::Muse) => Program::Muse,
-        None => Program::Generic,
-    };
+    let p = Harness::of(program).map_or(aterm_phase::Program::Generic, Harness::program);
     i64::try_from(turn_end::TurnEndTiming::default().grace_for(p).as_millis()).unwrap_or(i64::MAX)
-}
-
-/// The unix second a wall raised at `now` (ms) resets at: the first whole minute at least `ahead`
-/// ms on (W1's [`WALL_AHEAD_MS`], the others' [`Chain::wall_ahead_ms`]).
-#[must_use]
-pub const fn reset_s_ahead(now: i64, ahead: i64) -> i64 {
-    (now + ahead + 59_999) / 60_000 * 60
 }
 
 const WALL_HID_AHEAD_MS: i64 = 420_000;
@@ -404,6 +458,13 @@ pub fn wall_out_of_reach(h: Harness, mode: Mode) -> Option<&'static str> {
                 "Claude Code's limit is its conversation's (its transcript), read again after any relaunch: the relaunch rule is the screen-alone agents' (Muse Code, agy)",
             ),
         },
+        Mode::WallTap | Mode::WallTapNarrow => match h {
+            Harness::Claude => None,
+            Harness::Agy | Harness::Muse => Some(
+                "the usage tap is Claude Code's status line alone: no other agent's window is read off a tap",
+            ),
+        },
+        Mode::Sysmsg => None,
         Mode::OutageLand | Mode::OutageCruise => match h {
             Harness::Claude => None,
             Harness::Agy | Harness::Muse => Some(
@@ -498,6 +559,16 @@ impl Harness {
         Harness::ALL.into_iter().find(|h| h.name() == word)
     }
 
+    /// The reader's program it runs.
+    #[must_use]
+    pub const fn program(self) -> aterm_phase::Program {
+        match self {
+            Harness::Claude => aterm_phase::Program::Claude,
+            Harness::Agy => aterm_phase::Program::Agy,
+            Harness::Muse => aterm_phase::Program::Muse,
+        }
+    }
+
     pub(crate) fn bin_ver(self, run: &Run) -> (&str, &str) {
         match self {
             Harness::Claude => (&run.claude_bin, &run.claude_ver),
@@ -538,6 +609,10 @@ pub enum Mode {
     /// W9, the agent ended and launched again by a person under its standing wall
     /// (`wall-relaunch`).
     WallRelaunch,
+    /// W10, a five-hour wall the usage tap times (`wall-tap`, [`tap`]).
+    WallTap,
+    /// W11, the same wall in a narrow pane (`wall-tap-narrow`, [`tap`]).
+    WallTapNarrow,
     /// ANGLES, a new kind of work at each done claim (`angles`, v6 §14.5's 5a), under the short
     /// back-off ladder at an eighth ([`ladder_env`]), as `ladder` runs.
     Angles,
@@ -550,6 +625,9 @@ pub enum Mode {
     /// O2, an API overload met by Cruise's own act and lifted (`outage-cruise`, [`outage`]), under
     /// the ladders at three eighths.
     OutageCruise,
+    /// A SYSTEM MESSAGE IS A WAIT (v6 §14.17.5's 12a, `sysmsg`): one chain per system-message
+    /// form the stub plays, on every harness, each on a lab of its own ([`sysmsg::Form`]).
+    Sysmsg,
 }
 
 impl Mode {
@@ -569,10 +647,13 @@ impl Mode {
             "wall-unread" => Mode::WallUnread,
             "wall-cruise" => Mode::WallCruise,
             "wall-relaunch" => Mode::WallRelaunch,
+            "wall-tap" => Mode::WallTap,
+            "wall-tap-narrow" => Mode::WallTapNarrow,
             "angles" => Mode::Angles,
             "switch" => Mode::Switch,
             "outage-land" => Mode::OutageLand,
             "outage-cruise" => Mode::OutageCruise,
+            "sysmsg" => Mode::Sysmsg,
             _ => return None,
         })
     }
@@ -589,9 +670,12 @@ impl Mode {
             Mode::WallUnread => Some(Scenario::W6),
             Mode::WallCruise => Some(Scenario::W8),
             Mode::WallRelaunch => Some(Scenario::W9),
+            Mode::WallTap => Some(Scenario::W10),
+            Mode::WallTapNarrow => Some(Scenario::W11),
             Mode::OutageLand => Some(Scenario::O1),
             Mode::OutageCruise => Some(Scenario::O2),
-            Mode::Land
+            Mode::Sysmsg
+            | Mode::Land
             | Mode::Cruise
             | Mode::Both
             | Mode::Cover
@@ -625,9 +709,23 @@ pub enum Repo {
     /// branch of its own, a branch holding a commit no remote has, and a stash entry. Angle 6
     /// leaves every one as it is ([`angles::others_left`]).
     Others,
+    /// `main` committed and its `origin` removed: a repository with no remote (slice 9c's
+    /// land-n, whose receipt is `no-remote`).
+    NoRemote,
+    /// No repository at all: the folder holds its README alone (slice 9c's land-o, whose receipt
+    /// is `no-repo`).
+    Plain,
 }
 
 impl Repo {
+    /// Whether the repository check reads it clean (`RepoWork::is_clean`): nothing left to land
+    /// where it can read, a committed repository with no remote (land-n) and a folder with no
+    /// repository (land-o) among them, so a defense there owes the land check (slice 13a).
+    #[must_use]
+    pub const fn reads_clean(self) -> bool {
+        matches!(self, Repo::Clean | Repo::NoRemote | Repo::Plain)
+    }
+
     /// What the repository suffix must name of it (`RepoWork::summary`'s words), and the words of
     /// the other legs it must not.
     #[must_use]
@@ -658,6 +756,7 @@ impl Repo {
                 &["1 stash"],
                 &["changed", "untracked", "unpushed", "not on"],
             ),
+            Repo::NoRemote | Repo::Plain => (&[], &[]),
         }
     }
 
@@ -670,6 +769,8 @@ impl Repo {
             Repo::Unpushed => "a commit no remote holds",
             Repo::Unlanded => "a commit pushed to origin/wip, not on origin/main",
             Repo::Others => "another session's worktree, branch and stash",
+            Repo::NoRemote => "committed, no remote",
+            Repo::Plain => "a plain folder, no repository",
         }
     }
 }
@@ -679,6 +780,10 @@ impl Repo {
 pub enum Chain {
     /// L1, L3, L5.
     LandA,
+    /// L18 (slice 9c: a landing in a repository with no remote, its receipt `no-remote`).
+    LandN,
+    /// L19 (slice 9c: a landing in a plain folder, its receipt `no-repo`).
+    LandO,
     /// L2.
     LandB,
     /// L4 (untracked).
@@ -754,10 +859,30 @@ pub enum Chain {
     CruiseWall,
     /// W9 (`--mode wall-relaunch`, [`relaunch_step`]).
     RelaunchWall,
+    /// W10 (`--mode wall-tap`, [`tap::step`]).
+    TapWall,
+    /// W11 (`--mode wall-tap-narrow`, [`tap::step`]).
+    NarrowTapWall,
     /// HL (Land: one defense to every act over an untracked file, held at its second answer).
     SameLand,
     /// HC (Cruise: one reply to every done check, held at its second answer).
     SameCruise,
+    /// LH (a clean defense with a clause the reader reads open: the hinted land check, landed).
+    LandHinted,
+    /// LL (the check answered with a list, the work done, a second check after it, landed).
+    LandListed,
+    /// LS (the check answered with a list, the same defense again with no work: held, quoted).
+    LandSameList,
+    /// LR (the check answered with a list, the work done, the second check answered with the
+    /// list reworded: held, the new words quoted).
+    LandReworded,
+    /// LX (slice 4c: a defense over an untracked file contradicted, the file landed, then the
+    /// check and `LANDED`).
+    LandContradicted,
+    /// LY (slice 4c's Open leg: the defense said after real work, the check's list, the nudge
+    /// quoting it answered by the audited defense again, contradicted with the list quoted, then
+    /// held at the same reply).
+    LandContradictedList,
     /// ANGLES (Cruise: every reply its own real work and a done claim, each check another angle).
     CruiseAngles,
     /// SWA (Cruise at rest in a short-turn back-off, switched to Land: [`switch`]).
@@ -766,14 +891,41 @@ pub enum Chain {
     SwitchSeq,
     /// SWF (Cruise in a back-off, switched to Land then Off within 300 ms).
     SwitchFlip,
-    /// SWH (Cruise held at the same reply, then switched to Land).
-    SwitchHeld,
+    /// SWO (Cruise held at the same reply, switched to Land, the same reply to Land's one ask).
+    SwitchOverHeld,
     /// SWB (Cruise switched to Land 5 s into a long busy turn).
     SwitchBusy,
     /// O1 (`--mode outage-land`, [`outage`]).
     LandOutage,
     /// O2 (`--mode outage-cruise`, [`outage`]).
     CruiseOutage,
+    /// OVL (`--mode sysmsg`): the API overloaded ([`sysmsg::Form::Overload`]).
+    SysOverload,
+    /// 5XX (`--mode sysmsg`): the API's server error ([`sysmsg::Form::Outage`]).
+    SysOutage,
+    /// 429 (`--mode sysmsg`): a request rate limit ([`sysmsg::Form::Rate`]).
+    SysRate,
+    /// NET (`--mode sysmsg`): the API host unreachable ([`sysmsg::Form::Drop`]).
+    SysDrop,
+    /// WIT (`--mode sysmsg`): the API overloaded under two tabs of one route, this one the first
+    /// ([`sysmsg::Form::Witness`]); its lab runs [`Chain::SysWitnessMate`] beside it.
+    SysWitness,
+    /// WTN (`--mode sysmsg`): the second tab on the witness lab's route, prompted into the
+    /// standing wall past the first's ([`sysmsg::mate_step`]), resumed on the first's answered
+    /// turn ([`sysmsg::judge_witnessed`]).
+    SysWitnessMate,
+    /// LOG (`--mode sysmsg`): an expired login under Cruise ([`sysmsg::Form::Login`]).
+    SysLogin,
+    /// LOVL (`--mode sysmsg`): the API overloaded under Land (v6 §14.17.5.6).
+    SysLandOverload,
+    /// L5XX (`--mode sysmsg`): the API's server error under Land.
+    SysLandOutage,
+    /// L429 (`--mode sysmsg`): a request rate limit under Land.
+    SysLandRate,
+    /// LNET (`--mode sysmsg`): the API host unreachable under Land.
+    SysLandDrop,
+    /// LLOG (`--mode sysmsg`): an expired login under Land.
+    SysLandLogin,
 }
 
 /// The scenarios, by the names the report and the record use.
@@ -816,8 +968,18 @@ pub enum Scenario {
     W8,
     /// The relaunch under a standing wall (`--mode wall-relaunch`).
     W9,
+    /// A five-hour wall timed by the usage tap: Esc on the countdown, a new loop in the wait
+    /// (`--mode wall-tap`).
+    W10,
+    /// The same wall timed by the tap in a pane too narrow for its countdown's words
+    /// (`--mode wall-tap-narrow`).
+    W11,
     L16,
     L17,
+    /// A landing in a repository with no remote: its receipt `no-remote` (slice 9c, land-n).
+    L18,
+    /// A landing in a plain folder: its receipt `no-repo` (slice 9c, land-o).
+    L19,
     N1,
     N2,
     N3,
@@ -845,6 +1007,22 @@ pub enum Scenario {
     HL,
     /// One reply to every done check under Cruise: held at its second answer, and said.
     HC,
+    /// A clean defense the reader reads open: the hinted land check quotes it, and `LANDED` lands.
+    LH,
+    /// The check answered with a list: quoted, the work done, a second check only after it.
+    LL,
+    /// The check answered with a list, then the same defense with no work: held, the list quoted.
+    LS,
+    /// The check answered with a list, worked, the second check answered with the list reworded:
+    /// the hold quotes the new words (slice 4b).
+    LR,
+    /// A false defense over an untracked file: Land's nudge leads with the contradiction, the
+    /// file is landed, then the check and `LANDED` land it (slice 4c, [`judge_contradicted`]).
+    LX,
+    /// The audited defense said again while the agent's list stands: Land's nudge leads with the
+    /// contradiction quoting the list, then the same reply is held (slice 4c's Open leg,
+    /// [`judge_contradicted_list`]).
+    LY,
     /// A new kind of work at each done claim under Cruise ([`angles`]): six angles in turn, then
     /// the first again, never held.
     Angles,
@@ -856,9 +1034,9 @@ pub enum Scenario {
     SwitchSeq,
     /// Land then Off within 300 ms: nothing typed ([`switch::judge_flip`]).
     SwitchFlip,
-    /// A tab held under Cruise switched to Land: nothing typed, the hold stands
-    /// ([`switch::judge_held`]).
-    SwitchHeld,
+    /// A tab held under Cruise switched to Land: land@v1 once, opened by the switch's why, and
+    /// held again at the same answer, nothing typed past it ([`switch::judge_over_held`]).
+    SwitchOverHeld,
     /// A switch 5 s into a long busy turn: nothing typed mid-turn, land@v1 within 3 s after the
     /// turn's point ([`switch::judge_busy`]).
     SwitchBusy,
@@ -869,6 +1047,20 @@ pub enum Scenario {
     /// An API overload met by Cruise's own act: only tries on the outage's rungs, one resume
     /// after the lift, and Cruise goes on ([`outage::judge`]).
     O2,
+    /// A system message's wait (v6 §14.17.5), one per form ([`sysmsg::Form`], [`sysmsg::judge`]).
+    Sys(sysmsg::Form),
+    /// An outage cleared on a witness (v6 §14.17.5.4): the witness lab's second tab resumes on
+    /// the first tab's answered turn, *has cleared*, with no blind try past the clearing
+    /// ([`sysmsg::judge_witnessed`]).
+    Witnessed,
+    /// A system message's wait under Land (v6 §14.17.5.6): its form's wants as under Cruise, no
+    /// act of Land's inside it, and Land carrying on past the resume to its landing or hold
+    /// ([`sysmsg::judge`]); the expired login's are [`sysmsg::login::judge`]'s.
+    SysLand(sysmsg::Form),
+    /// The person's sign-in after an expired login (v6 §14.17.5.6), `true` under Land: the lab
+    /// plays it last ([`sysmsg::login::step`]), and the tab goes on once
+    /// ([`sysmsg::login::judge_signed_in`]).
+    SignedIn(bool),
 }
 
 impl Scenario {
@@ -877,12 +1069,19 @@ impl Scenario {
         match self {
             Scenario::O1 => "O1",
             Scenario::O2 => "O2",
+            Scenario::Sys(f) => f.id(),
+            Scenario::SysLand(f) => f.land_id(),
+            Scenario::SignedIn(false) => "SGN",
+            Scenario::SignedIn(true) => "LSGN",
+            Scenario::Witnessed => "WTN",
             Scenario::W2 => "W2",
             Scenario::W4 => "W4",
             Scenario::W5 => "W5",
             Scenario::W6 => "W6",
             Scenario::W8 => "W8",
             Scenario::W9 => "W9",
+            Scenario::W10 => "W10",
+            Scenario::W11 => "W11",
             Scenario::L12 => "L12",
             Scenario::L13 => "L13",
             Scenario::L14 => "L14",
@@ -911,6 +1110,8 @@ impl Scenario {
             Scenario::P4P => "P4P",
             Scenario::L16 => "L16",
             Scenario::L17 => "L17",
+            Scenario::L18 => "L18",
+            Scenario::L19 => "L19",
             Scenario::N1 => "N1",
             Scenario::N2 => "N2",
             Scenario::N3 => "N3",
@@ -924,12 +1125,30 @@ impl Scenario {
             Scenario::Ladder => "LADDER",
             Scenario::HL => "HL",
             Scenario::HC => "HC",
+            Scenario::LH => "LH",
+            Scenario::LL => "LL",
+            Scenario::LS => "LS",
+            Scenario::LR => "LR",
+            Scenario::LX => "LX",
+            Scenario::LY => "LY",
             Scenario::Angles => "ANGLES",
             Scenario::SwitchAgent => "SWA",
             Scenario::SwitchSeq => "SWS",
             Scenario::SwitchFlip => "SWF",
-            Scenario::SwitchHeld => "SWH",
+            Scenario::SwitchOverHeld => "SWO",
             Scenario::SwitchBusy => "SWB",
+        }
+    }
+
+    /// [`Self::what`] on harness `h`: the expired login's scenarios in its own words
+    /// ([`sysmsg::login::what_on`]), every other scenario's alike on all.
+    #[must_use]
+    pub const fn what_on(self, h: Harness) -> &'static str {
+        match self {
+            Scenario::Sys(sysmsg::Form::Login) => sysmsg::login::what_on(h, false, false),
+            Scenario::SysLand(sysmsg::Form::Login) => sysmsg::login::what_on(h, true, false),
+            Scenario::SignedIn(land) => sysmsg::login::what_on(h, land, true),
+            _ => self.what(),
         }
     }
 
@@ -940,14 +1159,14 @@ impl Scenario {
             Scenario::L1 => "a work reply: land@v1 typed",
             Scenario::L2 => "a defense beside a leftover: a nudge naming it",
             Scenario::L3 => "NEEDS YOU and a defense: the need raised, carried on",
-            Scenario::L4 => "a defense over an untracked file: a nudge naming it",
+            Scenario::L4 => "a defense over an untracked file: the contradiction naming it",
             Scenario::L5 => "a clean defense, clean repository: landed, then quiet",
             Scenario::L6 => "a tall reply, NEEDS YOU above the window: not landed",
             Scenario::L7 => "a worker's task landed: record done why=landed",
-            Scenario::L8 => "a defense over a changed file: a nudge naming it",
-            Scenario::L9 => "a defense over a stash entry: a nudge naming it",
-            Scenario::L10 => "a defense over an unpushed commit: a nudge naming it",
-            Scenario::L11 => "a defense over a commit off origin/main: a nudge naming it",
+            Scenario::L8 => "a defense over a changed file: the contradiction naming it",
+            Scenario::L9 => "a defense over a stash entry: the contradiction naming it",
+            Scenario::L10 => "a defense over an unpushed commit: the contradiction naming it",
+            Scenario::L11 => "a defense over a commit off origin/main: the contradiction naming it",
             Scenario::C1 => "a done claim: continue-done-check@v1",
             Scenario::C2 => "its defense read: never DONE, the next point goes on",
             Scenario::Off => "a done reply under Off: nothing typed, no supervisor",
@@ -967,6 +1186,8 @@ impl Scenario {
             Scenario::W1 => "a usage wall under Land: nothing typed into it, resumed, landed",
             Scenario::L16 => "an end past the work floor, seen by a look at its tab",
             Scenario::L17 => "an end past the work floor, seen by a press on its row",
+            Scenario::L18 => "a landing with no remote: what aterm checked, no-remote",
+            Scenario::L19 => "a landing in a plain folder: what aterm checked, no-repo",
             Scenario::N1 => "Cruise names two needs: needs_n=2, carried on",
             Scenario::N2 => "a defense names none: the needs cleared, needs_n=-",
             Scenario::N3 => "the first need again: needs_n=1",
@@ -988,11 +1209,23 @@ impl Scenario {
             Scenario::W9 => {
                 "the agent launched again under its wall: nothing typed into it, resumed, landed"
             }
+            Scenario::W10 => {
+                "the tap times the wall: Esc on the countdown, a new loop in the wait, resumed at the tap's reset, landed"
+            }
+            Scenario::W11 => {
+                "the tap times the wall in a narrow pane: the wait to the tap's reset, nothing typed into it, landed"
+            }
             Scenario::O1 => {
                 "an overload from the first prompt under Land: tries on its rungs alone, resumed once, landed"
             }
             Scenario::O2 => {
                 "an overload met by Cruise: tries on its rungs alone, resumed once, Cruise goes on"
+            }
+            Scenario::Sys(f) => f.what(),
+            Scenario::SysLand(f) => f.what_land(),
+            Scenario::SignedIn(land) => sysmsg::login::what_on(Harness::Claude, land, true),
+            Scenario::Witnessed => {
+                "the second tab of one route resumes on the first's answered turn: has cleared, no blind try past the clearing"
             }
             Scenario::F18 => "a person's key into an instant turn: LEFT, theirs, nothing typed",
             Scenario::Rewrap => "a judged opener re-wrapped by a resize: not judged again",
@@ -1004,6 +1237,18 @@ impl Scenario {
             Scenario::Ladder => "the back-off ladder doubled to its cap, each act at its due",
             Scenario::HL => "one defense to every Land act: held at its second answer, and said so",
             Scenario::HC => "one reply to every done check: held at its second answer, and said so",
+            Scenario::LH => "a clean defense read open: the hinted land check, LANDED, landed",
+            Scenario::LL => "the check answered with a list: quoted, worked, checked again, landed",
+            Scenario::LS => "the check's list, then the same defense: held, the list quoted",
+            Scenario::LR => {
+                "the check's list, worked, the list reworded: held, the new words quoted"
+            }
+            Scenario::LX => {
+                "a false defense over an untracked file: the contradiction leads, landed after it"
+            }
+            Scenario::LY => {
+                "the check's list, then the audited defense again: the contradiction quotes it, held"
+            }
             Scenario::Angles => {
                 "six done claims after real work: six kinds of work asked in turn, never held"
             }
@@ -1014,8 +1259,9 @@ impl Scenario {
                 "switched under a draft: woken, nothing typed over it, land@v1 once it clears"
             }
             Scenario::SwitchFlip => "Land then Off within 300 ms: nothing typed",
-            Scenario::SwitchHeld => {
-                "a tab held under Cruise switched to Land: nothing typed, its hold stands"
+            Scenario::SwitchOverHeld => {
+                "a tab held under Cruise switched to Land: Land asks once, held again at the same \
+                 answer"
             }
             Scenario::SwitchBusy => {
                 "switched 5 s into a busy turn: nothing typed mid-turn, land@v1 at its point"
@@ -1041,8 +1287,10 @@ pub enum Opening {
 impl Chain {
     /// The measured pass's chains (`--mode both`), with P4's instant ones and the window's three
     /// (L16, L17, N1–N4).
-    pub const ALL: [Chain; 18] = [
+    pub const ALL: [Chain; 26] = [
         Chain::LandA,
+        Chain::LandN,
+        Chain::LandO,
         Chain::LandB,
         Chain::LandC,
         Chain::LandD,
@@ -1060,6 +1308,12 @@ impl Chain {
         Chain::CruiseN,
         Chain::SameLand,
         Chain::SameCruise,
+        Chain::LandHinted,
+        Chain::LandListed,
+        Chain::LandSameList,
+        Chain::LandReworded,
+        Chain::LandContradicted,
+        Chain::LandContradictedList,
     ];
 
     /// The coverage chains (`--mode cover`): what the measured pass left unobserved, and the Off
@@ -1117,6 +1371,12 @@ impl Chain {
     /// The relaunch's chain (`--mode wall-relaunch`, alone for W1's reason).
     pub const WALL_RELAUNCH: [Chain; 1] = [Chain::RelaunchWall];
 
+    /// The tapped wall's chain (`--mode wall-tap`, alone for W1's reason).
+    pub const WALL_TAP: [Chain; 1] = [Chain::TapWall];
+
+    /// The narrow tapped wall's chain (`--mode wall-tap-narrow`, alone for W1's reason).
+    pub const WALL_TAP_NARROW: [Chain; 1] = [Chain::NarrowTapWall];
+
     /// The angles' chain (`--mode angles`, on a lab of its own: its replies hold the stub for
     /// minutes each) and the Off control.
     pub const ANGLES: [Chain; 2] = [Chain::CruiseAngles, Chain::Off];
@@ -1125,7 +1385,7 @@ impl Chain {
     /// mid-run, and the Off control. The held chain's tab comes first, so its row stands on the
     /// Harness page's first screen, which is all a read of the page sees.
     pub const SWITCH: [Chain; 6] = [
-        Chain::SwitchHeld,
+        Chain::SwitchOverHeld,
         Chain::SwitchAgent,
         Chain::SwitchSeq,
         Chain::SwitchFlip,
@@ -1139,6 +1399,23 @@ impl Chain {
 
     /// The Cruise outage's chain (`--mode outage-cruise`, alone for the same reasons).
     pub const OUTAGE_CRUISE: [Chain; 1] = [Chain::CruiseOutage];
+
+    /// The system messages' chains (`--mode sysmsg`), each alone on a lab of its own for W1's
+    /// reason ([`sysmsg::Form`]): each form's under Cruise ([`sysmsg::Form::ALL`]'s order), then
+    /// each form's under Land that has one ([`sysmsg::Form::LAND`]'s, v6 §14.17.5.6).
+    pub const SYSMSG: [Chain; 11] = [
+        Chain::SysOverload,
+        Chain::SysOutage,
+        Chain::SysRate,
+        Chain::SysDrop,
+        Chain::SysWitness,
+        Chain::SysLogin,
+        Chain::SysLandOverload,
+        Chain::SysLandOutage,
+        Chain::SysLandRate,
+        Chain::SysLandDrop,
+        Chain::SysLandLogin,
+    ];
 
     /// Every chain of every mode, each once: what `--chains` may name.
     #[must_use]
@@ -1156,10 +1433,14 @@ impl Chain {
             .chain(Chain::WALL_UNREAD)
             .chain(Chain::WALL_CRUISE)
             .chain(Chain::WALL_RELAUNCH)
+            .chain(Chain::WALL_TAP)
+            .chain(Chain::WALL_TAP_NARROW)
             .chain(Chain::ANGLES)
             .chain(Chain::SWITCH)
             .chain(Chain::OUTAGE_LAND)
             .chain(Chain::OUTAGE_CRUISE)
+            .chain(Chain::SYSMSG)
+            .chain([Chain::SysWitnessMate])
         {
             if !v.contains(&c) {
                 v.push(c);
@@ -1183,10 +1464,13 @@ impl Chain {
             Mode::WallUnread => Chain::WALL_UNREAD.to_vec(),
             Mode::WallCruise => Chain::WALL_CRUISE.to_vec(),
             Mode::WallRelaunch => Chain::WALL_RELAUNCH.to_vec(),
+            Mode::WallTap => Chain::WALL_TAP.to_vec(),
+            Mode::WallTapNarrow => Chain::WALL_TAP_NARROW.to_vec(),
             Mode::Angles => Chain::ANGLES.to_vec(),
             Mode::Switch => Chain::SWITCH.to_vec(),
             Mode::OutageLand => Chain::OUTAGE_LAND.to_vec(),
             Mode::OutageCruise => Chain::OUTAGE_CRUISE.to_vec(),
+            Mode::Sysmsg => Chain::SYSMSG.to_vec(),
             Mode::Land | Mode::Cruise | Mode::Both => Chain::ALL
                 .into_iter()
                 .filter(|c| match c.autopilot() {
@@ -1210,11 +1494,35 @@ impl Chain {
                 Chain::RedrawWall => wall_out_of_reach(h, Mode::WallRedraw).is_none(),
                 Chain::UnreadWall => wall_out_of_reach(h, Mode::WallUnread).is_none(),
                 Chain::RelaunchWall => wall_out_of_reach(h, Mode::WallRelaunch).is_none(),
+                Chain::TapWall => wall_out_of_reach(h, Mode::WallTap).is_none(),
+                Chain::NarrowTapWall => wall_out_of_reach(h, Mode::WallTapNarrow).is_none(),
                 Chain::LandOutage => wall_out_of_reach(h, Mode::OutageLand).is_none(),
                 Chain::CruiseOutage => wall_out_of_reach(h, Mode::OutageCruise).is_none(),
-                _ => true,
+                c => sysmsg::Form::of(*c).is_none_or(|f| f.out_of_reach(h).is_none()),
             })
             .collect()
+    }
+
+    /// It meets a system message's stand-in ([`sysmsg::step`]): `--mode sysmsg`'s chains.
+    #[must_use]
+    pub const fn sysmsg(self) -> bool {
+        sysmsg::Form::of(self).is_some()
+    }
+
+    /// THE GATE ON A LAND CHAIN'S FIRST ANSWER (v6 §14.17.5.6): a system message's chain under
+    /// Land, whose stand-in the lab raises once the stub read the first prompt and then opens
+    /// this gate ([`sysmsg::step`]), so Land's act on that answer meets the stand-in (Land acts on
+    /// its first point within seconds, sooner than the lab's look could raise it after the point).
+    #[must_use]
+    pub fn raise_gate(self) -> Option<String> {
+        (self.sysmsg() && self.autopilot() == "land").then(|| format!("{}-raise", self.name()))
+    }
+
+    /// Its stand-in is an expired login ([`sysmsg::Form::Login`]): Claude Code launches with a
+    /// claude.ai login of the lab's, so the stub's 401 is that login's ([`launcher_with`]).
+    #[must_use]
+    pub fn login(self) -> bool {
+        sysmsg::Form::of(self) == Some(sysmsg::Form::Login)
     }
 
     /// It meets the stub's outage ([`outage::step`]): O1's chain and O2's.
@@ -1243,7 +1551,16 @@ impl Chain {
                 | Chain::UnreadWall
                 | Chain::CruiseWall
                 | Chain::RelaunchWall
+                | Chain::TapWall
+                | Chain::NarrowTapWall
         )
+    }
+
+    /// Its Claude Code runs with aterm's usage tap on its line and its wall's 429 carries the
+    /// window's figures ([`tap`]): W10's chain and W11's.
+    #[must_use]
+    pub const fn tapped(self) -> bool {
+        matches!(self, Chain::TapWall | Chain::NarrowTapWall)
     }
 
     /// How many times the lab raises its wall again at the reset instead of lifting it
@@ -1280,12 +1597,15 @@ impl Chain {
         }
     }
 
-    /// How far ahead of its raising its wall resets, at least ([`wall_step`]).
+    /// How far ahead of its raising its wall resets, at least ([`wall_step`]): a chain the lab
+    /// drives at the wall before `reset - `[`HIDE_BEFORE_RESET_MS`] (the hide, the tapped walls'
+    /// Esc and narrow pane) has the hide's room.
     #[must_use]
     pub const fn wall_ahead_ms(self) -> i64 {
         match self {
             Chain::WallHid => WALL_HID_AHEAD_MS,
             Chain::RelaunchWall => WALL_RELAUNCH_AHEAD_MS,
+            Chain::TapWall | Chain::NarrowTapWall => WALL_HID_AHEAD_MS,
             Chain::RedrawWall | Chain::UnreadWall => WALL_HID_AHEAD_MS,
             Chain::SwitchWall => WALL_SWITCH_AHEAD_MS,
             _ => WALL_AHEAD_MS,
@@ -1297,7 +1617,7 @@ impl Chain {
     pub const fn opening(self) -> Opening {
         match self {
             Chain::LandP => Opening::Person,
-            Chain::Mgr => Opening::Idle,
+            Chain::Mgr | Chain::SysWitnessMate => Opening::Idle,
             Chain::Worker => Opening::Spawned,
             _ => Opening::Prompt,
         }
@@ -1309,14 +1629,28 @@ impl Chain {
         match self {
             Chain::Cap => CAP_LIMIT_MS,
             Chain::CruiseN => CRUISE_N_LIMIT_MS,
+            Chain::LandContradictedList => LIST_CONTRADICTED_LIMIT_MS,
             Chain::Ladder => LADDER_LIMIT_MS,
             Chain::CruiseWall => WALL_CRUISE_LIMIT_MS,
             Chain::RelaunchWall => WALL_RELAUNCH_LIMIT_MS,
+            Chain::TapWall | Chain::NarrowTapWall => WALL_TAP_LIMIT_MS,
             Chain::RedrawWall => WALL_REDRAW_LIMIT_MS,
             Chain::SwitchWall => WALL_SWITCH_LIMIT_MS,
             Chain::UnreadWall => WALL_UNREAD_LIMIT_MS,
             Chain::CruiseAngles => angles::LIMIT_MS,
             Chain::LandOutage | Chain::CruiseOutage => outage::LIMIT_MS,
+            Chain::SysOverload
+            | Chain::SysOutage
+            | Chain::SysRate
+            | Chain::SysDrop
+            | Chain::SysWitness
+            | Chain::SysWitnessMate
+            | Chain::SysLogin
+            | Chain::SysLandOverload
+            | Chain::SysLandOutage
+            | Chain::SysLandRate
+            | Chain::SysLandDrop
+            | Chain::SysLandLogin => sysmsg::LIMIT_MS,
             _ => CHAIN_LIMIT_MS,
         }
     }
@@ -1332,6 +1666,8 @@ impl Chain {
     pub const fn name(self) -> &'static str {
         match self {
             Chain::LandA => "land-a",
+            Chain::LandN => "land-n",
+            Chain::LandO => "land-o",
             Chain::LandB => "land-b",
             Chain::LandC => "land-c",
             Chain::LandD => "land-d",
@@ -1368,16 +1704,36 @@ impl Chain {
             Chain::UnreadWall => "unread-wall",
             Chain::CruiseWall => "cruise-wall",
             Chain::RelaunchWall => "relaunch-wall",
+            Chain::TapWall => "tap-wall",
+            Chain::NarrowTapWall => "narrow-tap-wall",
             Chain::SameLand => "same-land",
             Chain::SameCruise => "same-cruise",
+            Chain::LandHinted => "land-hinted",
+            Chain::LandListed => "land-listed",
+            Chain::LandSameList => "land-same-list",
+            Chain::LandReworded => "land-reworded",
+            Chain::LandContradicted => "land-contradicted",
+            Chain::LandContradictedList => "land-contradicted-list",
             Chain::CruiseAngles => "cruise-angles",
             Chain::SwitchAgent => "switch-agent",
             Chain::SwitchSeq => "switch-seq",
             Chain::SwitchFlip => "switch-flip",
-            Chain::SwitchHeld => "switch-held",
+            Chain::SwitchOverHeld => "switch-over-held",
             Chain::SwitchBusy => "switch-busy",
             Chain::LandOutage => "land-outage",
             Chain::CruiseOutage => "cruise-outage",
+            Chain::SysOverload => "sys-overload",
+            Chain::SysOutage => "sys-outage",
+            Chain::SysRate => "sys-rate",
+            Chain::SysDrop => "sys-drop",
+            Chain::SysWitness => "sys-witness",
+            Chain::SysWitnessMate => "sys-witness-mate",
+            Chain::SysLogin => "sys-login",
+            Chain::SysLandOverload => "sys-land-overload",
+            Chain::SysLandOutage => "sys-land-outage",
+            Chain::SysLandRate => "sys-land-rate",
+            Chain::SysLandDrop => "sys-land-drop",
+            Chain::SysLandLogin => "sys-land-login",
         }
     }
 
@@ -1407,9 +1763,16 @@ impl Chain {
             | Chain::SwitchAgent
             | Chain::SwitchSeq
             | Chain::SwitchFlip
-            | Chain::SwitchHeld
+            | Chain::SwitchOverHeld
             | Chain::SwitchBusy
-            | Chain::CruiseOutage => "cruise",
+            | Chain::CruiseOutage
+            | Chain::SysOverload
+            | Chain::SysOutage
+            | Chain::SysRate
+            | Chain::SysDrop
+            | Chain::SysWitness
+            | Chain::SysWitnessMate
+            | Chain::SysLogin => "cruise",
             Chain::Off | Chain::Mgr => "off",
             _ => "land",
         }
@@ -1419,6 +1782,8 @@ impl Chain {
     pub const fn scenarios(self) -> &'static [Scenario] {
         match self {
             Chain::LandA => &[Scenario::L1, Scenario::L3, Scenario::L5],
+            Chain::LandN => &[Scenario::L18],
+            Chain::LandO => &[Scenario::L19],
             Chain::LandB => &[Scenario::L2],
             Chain::LandC => &[Scenario::L4],
             Chain::LandD => &[Scenario::L6],
@@ -1455,16 +1820,42 @@ impl Chain {
             Chain::UnreadWall => &[Scenario::W6],
             Chain::CruiseWall => &[Scenario::W8],
             Chain::RelaunchWall => &[Scenario::W9],
+            Chain::TapWall => &[Scenario::W10],
+            Chain::NarrowTapWall => &[Scenario::W11],
             Chain::SameLand => &[Scenario::HL],
             Chain::SameCruise => &[Scenario::HC],
+            Chain::LandHinted => &[Scenario::LH],
+            Chain::LandListed => &[Scenario::LL],
+            Chain::LandSameList => &[Scenario::LS],
+            Chain::LandReworded => &[Scenario::LR],
+            Chain::LandContradicted => &[Scenario::LX],
+            Chain::LandContradictedList => &[Scenario::LY],
             Chain::CruiseAngles => &[Scenario::Angles],
             Chain::SwitchAgent => &[Scenario::SwitchAgent],
             Chain::SwitchSeq => &[Scenario::SwitchSeq],
             Chain::SwitchFlip => &[Scenario::SwitchFlip],
-            Chain::SwitchHeld => &[Scenario::SwitchHeld],
+            Chain::SwitchOverHeld => &[Scenario::SwitchOverHeld],
             Chain::SwitchBusy => &[Scenario::SwitchBusy],
             Chain::LandOutage => &[Scenario::O1],
             Chain::CruiseOutage => &[Scenario::O2],
+            Chain::SysOverload => &[Scenario::Sys(sysmsg::Form::Overload)],
+            Chain::SysOutage => &[Scenario::Sys(sysmsg::Form::Outage)],
+            Chain::SysRate => &[Scenario::Sys(sysmsg::Form::Rate)],
+            Chain::SysDrop => &[Scenario::Sys(sysmsg::Form::Drop)],
+            Chain::SysWitness => &[Scenario::Sys(sysmsg::Form::Witness)],
+            Chain::SysWitnessMate => &[Scenario::Witnessed],
+            Chain::SysLogin => &[
+                Scenario::Sys(sysmsg::Form::Login),
+                Scenario::SignedIn(false),
+            ],
+            Chain::SysLandOverload => &[Scenario::SysLand(sysmsg::Form::Overload)],
+            Chain::SysLandOutage => &[Scenario::SysLand(sysmsg::Form::Outage)],
+            Chain::SysLandRate => &[Scenario::SysLand(sysmsg::Form::Rate)],
+            Chain::SysLandDrop => &[Scenario::SysLand(sysmsg::Form::Drop)],
+            Chain::SysLandLogin => &[
+                Scenario::SysLand(sysmsg::Form::Login),
+                Scenario::SignedIn(true),
+            ],
         }
     }
 
@@ -1472,7 +1863,9 @@ impl Chain {
     #[must_use]
     pub const fn repo(self) -> Repo {
         match self {
-            Chain::LandC => Repo::Untracked,
+            Chain::LandC | Chain::LandContradicted => Repo::Untracked,
+            Chain::LandN => Repo::NoRemote,
+            Chain::LandO => Repo::Plain,
             Chain::LandF => Repo::Changed,
             Chain::LandG => Repo::Stashed,
             Chain::LandH => Repo::Unpushed,
@@ -1497,10 +1890,15 @@ impl Chain {
         matches!(
             self,
             Chain::LandA
+                | Chain::LandN
+                | Chain::LandO
                 | Chain::LandE
                 | Chain::InstantLand
                 | Chain::LandQ
                 | Chain::LandW
+                | Chain::LandHinted
+                | Chain::LandListed
+                | Chain::LandContradicted
                 | Chain::Worker
                 | Chain::Wall
                 | Chain::WallHid
@@ -1508,6 +1906,8 @@ impl Chain {
                 | Chain::SwitchWall
                 | Chain::UnreadWall
                 | Chain::RelaunchWall
+                | Chain::TapWall
+                | Chain::NarrowTapWall
                 | Chain::LandOutage
         )
     }
@@ -1529,9 +1929,11 @@ impl Chain {
 
     /// Its script answers the acts it meets before its watch ends with one canned reply, so under
     /// ruling F (`4cefe18775`) aterm stops typing into it at that reply's second answer (the
-    /// same-reply hold, `EXCEPTION … kind=stalled`): land@v1 and the nudge answered alike (land-b
-    /// to land-i; land-e lands at the first), each done check answered alike (`cruise`, and
-    /// `wrote-c`'s `W_CHECKED`), and the two chains made for the hold. Each such chain is watched past its hold and wants the hold
+    /// same-reply hold, `EXCEPTION … kind=stalled`): land@v1 and the nudge answered alike (land-b,
+    /// land-c and land-f to land-i, and land-same-list, the land check's list between; land-e
+    /// lands at the first; land-d rests on its check's need, nudged never), each done check
+    /// answered alike (`cruise`, and `wrote-c`'s `W_CHECKED`), and the two chains made for the
+    /// hold. Each such chain is watched past its hold and wants the hold
     /// said ([`surfaces::held`]); any other chain of the measured pass or the coverage chains
     /// fails at a `kind=stalled` ([`surfaces::held::stall_fault`]).
     #[must_use]
@@ -1540,7 +1942,6 @@ impl Chain {
             self,
             Chain::LandB
                 | Chain::LandC
-                | Chain::LandD
                 | Chain::LandE
                 | Chain::LandF
                 | Chain::LandG
@@ -1550,7 +1951,10 @@ impl Chain {
                 | Chain::WroteC
                 | Chain::SameLand
                 | Chain::SameCruise
-                | Chain::SwitchHeld
+                | Chain::LandSameList
+                | Chain::LandReworded
+                | Chain::LandContradictedList
+                | Chain::SwitchOverHeld
         )
     }
 
@@ -1601,6 +2005,31 @@ impl Chain {
         self.first_reply_ms() >= floor
     }
 
+    /// THE NEED GATE (L3's land-a, L14's land-w): the name of the gate the stub holds the land
+    /// check's `LANDED` behind ([`crate::stub::GATE_SUFFIX`]), opened once the lab has read the
+    /// defense's need on every surface it judges ([`need_read`]); `None` for a chain whose
+    /// answer goes at once.
+    #[must_use]
+    pub fn need_gate(self) -> Option<String> {
+        matches!(self, Chain::LandA | Chain::LandW).then(|| format!("{}-need", self.name()))
+    }
+
+    /// LAND-CONTRADICTED'S GATE (slice 4c): the name of the gate the stub holds its answer to
+    /// Land's contradiction behind, opened once the lab has landed `wip-notes.txt` for it
+    /// ([`land_contradicted_work`]), as an agent's own commit and push would: the stub runs no
+    /// tool. `None` for every other chain.
+    #[must_use]
+    pub fn landed_gate(self) -> Option<String> {
+        (self == Chain::LandContradicted).then(|| format!("{}-landed", self.name()))
+    }
+
+    /// Whether the stub holds one of its answers behind a gate the lab's watch opens
+    /// ([`Self::need_gate`], [`Self::landed_gate`]).
+    #[must_use]
+    pub fn gated(self) -> bool {
+        self.need_gate().is_some() || self.landed_gate().is_some()
+    }
+
     /// The first prompt (L13's a person's question; L15's the worker's task).
     #[must_use]
     pub fn prompt(self) -> String {
@@ -1643,13 +2072,33 @@ impl Chain {
             r.set("pace_s", J::Float(LONG_PACE_S));
             r
         };
+        let worked = |last: &str, text: &str| {
+            let mut r = rule(last, text);
+            r.set("delay_ms", J::Int(WORK_TURN_MS));
+            r
+        };
         let after = |last: &str, before: &str, text: &str| {
             let mut r = rule(last, text);
             r.set("after", J::s(before));
             r
         };
+        // Every chain under Land answers the land check first (a `LANDED` where nothing is
+        // scripted left), so no `MARK` or `NUDGE_KEY` rule answers it with a defense.
+        let landed = || rule(LAND_CHECK_KEY, LANDED);
+        // L3's and L14's check answer: the need their defense raised stands until the lab has
+        // read it on every surface it judges ([`Chain::need_gate`]): the stub holds `LANDED`
+        // until the lab opens the gate, an event, never a fixed delay that the lab's reads may
+        // outlast under load.
+        let landed_late = || {
+            let mut r = landed();
+            if let Some(gate) = self.need_gate() {
+                r.set("gate", J::s(gate.as_str()));
+            }
+            r
+        };
         match self {
             Chain::LandA => vec![
+                landed_late(),
                 rule(NUDGE_KEY, CLEAN),
                 rule(LAND_KEY, &needs_defense()),
                 rule("", WORK),
@@ -1657,6 +2106,7 @@ impl Chain {
             Chain::LandB => {
                 let open = open_defense();
                 vec![
+                    rule(LAND_CHECK_KEY, CHECK_LIST),
                     rule(NUDGE_KEY, &open),
                     rule(LAND_KEY, &open),
                     rule("", WORK),
@@ -1668,6 +2118,7 @@ impl Chain {
             | Chain::LandG
             | Chain::LandH
             | Chain::LandI => vec![
+                landed(),
                 rule(NUDGE_KEY, CLEAN),
                 rule(LAND_KEY, CLEAN),
                 rule("", WORK),
@@ -1675,11 +2126,78 @@ impl Chain {
             Chain::LandD => {
                 let tall = tall_reply(80);
                 vec![
+                    rule(LAND_CHECK_KEY, &need_alone()),
                     rule(NUDGE_KEY, &tall),
                     rule(LAND_KEY, &tall),
                     rule("", WORK),
                 ]
             }
+            Chain::LandHinted => vec![
+                landed(),
+                rule(NUDGE_KEY, HINTED),
+                rule(LAND_KEY, HINTED),
+                rule("", WORK),
+            ],
+            // Its first check is answered with a list; the nudge quoting it gets work done (a
+            // reply past the policy's work floor, no defense, so the short streak starts over and
+            // Land's next nudge is not a back-off away); the nudge after the work gets the
+            // defense, and the check that defense owes (allowed by the work) gets `LANDED`.
+            Chain::LandListed => vec![
+                after(LAND_CHECK_KEY, LISTED_KEY, LANDED),
+                rule(LAND_CHECK_KEY, RELEASE_LIST),
+                worked(LISTED_KEY, RELEASE_WORK),
+                rule(NUDGE_KEY, CLEAN),
+                rule(LAND_KEY, CLEAN),
+                rule("", WORK),
+            ],
+            // Its defense over the untracked file gets Land's contradiction, whose answer waits on
+            // the lab's landing of the file ([`Chain::landed_gate`]) and defends it in other words;
+            // the check that defense owes over the clean repository gets `LANDED`.
+            Chain::LandContradicted => {
+                let mut answered = rule(CONTRADICTED_KEY, LANDED_NOTES);
+                if let Some(gate) = self.landed_gate() {
+                    answered.set("gate", J::s(gate.as_str()));
+                }
+                vec![
+                    landed(),
+                    answered,
+                    rule(NUDGE_KEY, CLEAN),
+                    rule(LAND_KEY, CLEAN),
+                    rule("", WORK),
+                ]
+            }
+            // Its defense is first said after real work (a tool's read, [`spec_on`], and past the
+            // work floor), so the check audits it and no same reply keeps it; the check is
+            // answered with the list; the nudge quoting the list, and the contradiction after it,
+            // each get that defense again, short: the first saying with no work is contradicted,
+            // the second is the same reply, held.
+            Chain::LandContradictedList => {
+                let open = open_defense();
+                vec![
+                    rule(LAND_CHECK_KEY, CHECK_LIST),
+                    rule(NUDGE_KEY, &open),
+                    worked(LAND_KEY, &open),
+                    rule("", WORK),
+                ]
+            }
+            Chain::LandSameList => vec![
+                rule(LAND_CHECK_KEY, SAME_LIST),
+                rule(NUDGE_KEY, CLEAN),
+                rule(LAND_KEY, CLEAN),
+                rule("", WORK),
+            ],
+            // Its first check is answered with a list; the nudge quoting it gets work done (so the
+            // list no longer stands and the defense after it owes a second check); the second
+            // check, after a nudge that quoted a list, gets the list in other words of the same
+            // family; every other nudge the defense, so Land holds on the reworded list, quoted.
+            Chain::LandReworded => vec![
+                after(LAND_CHECK_KEY, LISTED_KEY, REWORDED_LIST),
+                rule(LAND_CHECK_KEY, CHECK_LIST),
+                worked(OPEN_KEY, REWORD_WORK),
+                rule(NUDGE_KEY, CLEAN),
+                rule(LAND_KEY, CLEAN),
+                rule("", WORK),
+            ],
             Chain::Cruise => vec![
                 rule(CHECK_KEY, CLEAN),
                 rule(CONTINUE_KEY, DONE_CLAIM),
@@ -1687,18 +2205,21 @@ impl Chain {
             ],
             Chain::Off => vec![rule("", DONE_CLAIM)],
             Chain::LandQ => vec![
+                landed(),
                 rule(NUDGE_KEY, CLEAN),
                 rule(ANSWER_KEY, CLEAN),
                 rule(LAND_KEY, QUESTION),
                 rule("", WORK),
             ],
             Chain::LandP => vec![
+                landed(),
                 rule(NUDGE_KEY, CLEAN),
                 rule(LAND_KEY, CLEAN),
                 rule(ORCHESTRATED_KEY, WORK),
                 rule("", PERSON_REPLY),
             ],
             Chain::LandW => vec![
+                landed_late(),
                 rule(NUDGE_KEY, W_DEFENSE),
                 rule(LAND_KEY, W_NEEDS),
                 rule("", W_WORK),
@@ -1713,10 +2234,11 @@ impl Chain {
                 rule(OWNER_KEY, DONE_CLAIM),
                 rule("", WORK),
             ],
-            Chain::LandT => vec![rule(NUDGE_KEY, CLEAN), rule("", WORK)],
+            Chain::LandT => vec![landed(), rule(NUDGE_KEY, CLEAN), rule("", WORK)],
             Chain::Cap => {
                 let open = open_defense();
                 vec![
+                    landed(),
                     rule(NUDGE_KEY, CLEAN),
                     rule(LAND_KEY, &open),
                     rule(RESUMED_KEY, &open),
@@ -1724,7 +2246,8 @@ impl Chain {
                 ]
             }
             Chain::Mgr => Vec::new(),
-            Chain::InstantLand => vec![
+            Chain::InstantLand | Chain::LandN | Chain::LandO => vec![
+                landed(),
                 rule(NUDGE_KEY, CLEAN),
                 rule(LAND_KEY, CLEAN),
                 rule("", WORK),
@@ -1732,7 +2255,7 @@ impl Chain {
             // Its first land reply holds (a work reply, no defense), so its row under its
             // manager reads `landing` with the hold's tip until the nudge's defense lands it
             // (§12.3.11's 5d); its result is still its task's reply and the defense.
-            Chain::Worker => vec![rule(NUDGE_KEY, CLEAN), rule("", WORK)],
+            Chain::Worker => vec![landed(), rule(NUDGE_KEY, CLEAN), rule("", WORK)],
             Chain::InstantCruise | Chain::InstantPerson => vec![
                 rule(ASK_KEY, ASK_REPLY),
                 rule(CHECK_KEY, CLEAN),
@@ -1740,6 +2263,7 @@ impl Chain {
                 rule("", DONE_CLAIM),
             ],
             Chain::LandJ | Chain::LandK => vec![
+                landed(),
                 long(NUDGE_KEY, CLEAN),
                 long(LAND_KEY, CLEAN),
                 rule("", WORK),
@@ -1754,19 +2278,50 @@ impl Chain {
                 rule(CONTINUE_KEY, CLEAN),
                 rule("", &needs_reply(N1_HEAD, &[NEED_A, NEED_B])),
             ],
-            Chain::CruiseWall | Chain::CruiseOutage => vec![
+            Chain::CruiseWall
+            | Chain::CruiseOutage
+            | Chain::SysOverload
+            | Chain::SysOutage
+            | Chain::SysRate
+            | Chain::SysDrop
+            | Chain::SysWitness
+            | Chain::SysWitnessMate
+            | Chain::SysLogin => vec![
                 rule(CHECK_KEY, CLEAN),
                 rule(CONTINUE_KEY, DONE_CLAIM),
                 rule(MARK, DONE_CLAIM),
                 rule("", DONE_CLAIM),
             ],
+            // A system message's chain under Land (v6 §14.17.5.6): Land's own act meets the
+            // stand-in, which the lab raises while the stub holds the first prompt's answer
+            // ([`Chain::raise_gate`], [`sysmsg::step`]), since Land acts at once on that answer.
+            Chain::SysLandOverload
+            | Chain::SysLandOutage
+            | Chain::SysLandRate
+            | Chain::SysLandDrop
+            | Chain::SysLandLogin => {
+                let mut first = rule("", WORK);
+                if let Some(gate) = self.raise_gate() {
+                    first.set("gate", J::s(gate.as_str()));
+                }
+                vec![
+                    landed(),
+                    rule(NUDGE_KEY, CLEAN),
+                    rule(LAND_KEY, CLEAN),
+                    rule(MARK, CLEAN),
+                    first,
+                ]
+            }
             Chain::Wall
             | Chain::WallHid
             | Chain::RedrawWall
             | Chain::SwitchWall
             | Chain::UnreadWall
             | Chain::RelaunchWall
+            | Chain::TapWall
+            | Chain::NarrowTapWall
             | Chain::LandOutage => vec![
+                landed(),
                 rule(NUDGE_KEY, CLEAN),
                 rule(LAND_KEY, CLEAN),
                 rule(MARK, CLEAN),
@@ -1775,6 +2330,7 @@ impl Chain {
             Chain::SameWords => vec![rule(SAME_TURN_KEY, WORK), rule("", WORK)],
             Chain::TallScroll => vec![rule("", &scroll_reply())],
             Chain::ToolEnd => vec![
+                landed(),
                 rule(NUDGE_KEY, CLEAN),
                 rule(LAND_KEY, CLEAN),
                 rule("", TOOL_AFTER),
@@ -1794,7 +2350,13 @@ impl Chain {
                 rule(CHECK_KEY, CLEAN),
                 rule("", DONE_CLAIM),
             ],
-            Chain::SwitchHeld => vec![rule(MARK, CLEAN), rule("", DONE_CLAIM)],
+            // The same reply to every act, Land's one ask at the switch included, which the
+            // stand-in takes its time over so its ask is read standing.
+            Chain::SwitchOverHeld => {
+                let mut asked = rule(SWITCH_KEY, DONE_CLAIM);
+                asked.set("delay_ms", J::Int(SWITCH_ASK_DELAY_MS));
+                vec![asked, rule(MARK, DONE_CLAIM), rule("", DONE_CLAIM)]
+            }
             Chain::SwitchBusy => vec![
                 rule(NUDGE_KEY, CLEAN),
                 rule(LAND_KEY, CLEAN),
@@ -1879,28 +2441,42 @@ pub fn spec(chains: &[Chain]) -> J {
     ])
 }
 
-/// [`spec`] for a run on harness `h`, `dirs` its chains' repositories (in `chains`' order): F3's
-/// first turn answered with that harness's read of its own `README.md` ([`read_call`]).
+/// [`spec`] for a run on harness `h`, `dirs` its chains' repositories (in `chains`' order), each
+/// tool call that harness's read of the chain's own `README.md` ([`read_call`]): F3's first turn
+/// is answered with one, and land-listed's and land-reworded's work on their quoted lists runs
+/// one before it says what it did, as an agent's work does (a long answer with no tool row, where
+/// the reader reads them, is no work to the policy, so the list would stand); so does
+/// land-contradicted-list's first defense, so it is no no-work answer the same reply could hold.
 #[must_use]
 pub fn spec_on(chains: &[Chain], h: Harness, dirs: &[PathBuf]) -> J {
     let mut sp = spec(chains);
-    let Some(dir) = chains
+    let calls: Vec<(String, &str, J)> = chains
         .iter()
         .zip(dirs)
-        .find(|(c, _)| **c == Chain::ToolEnd)
-        .map(|(_, d)| d)
-    else {
+        .filter_map(|(c, d)| {
+            let last = match c {
+                Chain::ToolEnd => "",
+                Chain::LandListed => LISTED_KEY,
+                Chain::LandReworded => OPEN_KEY,
+                Chain::LandContradictedList => LAND_KEY,
+                _ => return None,
+            };
+            Some((c.token(), last, read_call(h, &d.join("README.md"))))
+        })
+        .collect();
+    if calls.is_empty() {
         return sp;
-    };
-    let call = read_call(h, &dir.join("README.md"));
-    let token = Chain::ToolEnd.token();
+    }
     if let Some(J::Arr(rules)) = sp.get("replies").cloned() {
         let rules = rules
             .into_iter()
             .map(|mut r| {
-                let ours = r.get("when").and_then(J::as_str) == Some(token.as_str())
-                    && r.get("last").and_then(J::as_str) == Some("");
-                if ours {
+                let when = r.get("when").and_then(J::as_str).map(str::to_string);
+                let last = r.get("last").and_then(J::as_str).map(str::to_string);
+                let ours = calls.iter().find(|(token, l, _)| {
+                    when.as_deref() == Some(token.as_str()) && last.as_deref() == Some(*l)
+                });
+                if let Some((_, _, call)) = ours {
                     r.set("tool", call.clone());
                 }
                 r
@@ -1941,6 +2517,7 @@ impl Verdict {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Row {
     pub ts: i64,
+    pub box_seq: Option<u64>,
     pub rule: String,
     pub decision: String,
     pub command: String,
@@ -2014,6 +2591,12 @@ pub struct Seen {
     pub cover: Cover,
     /// What the window showed of the tab ([`surfaces`]).
     pub window: surfaces::Window,
+    /// The chain's repository's `HEAD`, read once the watch is over, for a chain whose receipt
+    /// the lab judges ([`receipt::reads_head`]).
+    pub head: Option<String>,
+    /// When the lab landed land-contradicted's `wip-notes.txt` after Land's contradiction
+    /// ([`land_contradicted_work`]); `None` where it did not.
+    pub landed_ms: Option<i64>,
 }
 
 /// What a coverage chain's run did to its tab, and read of it, beside the records ([`Seen`]), each
@@ -2025,8 +2608,8 @@ pub struct Cover {
     /// L13: `status human_ms=` read once their Enter took the draft: how long ago a person's
     /// gesture reached the session (`-`: none ever).
     pub person_stamp: Option<String>,
-    /// L13 typed through `hwkey` in a windowed lab ([`person_keys`]): what the real key path posted
-    /// and counted.
+    /// L13's controller keys in a windowed lab ([`person_keys`]): native posting, independent
+    /// composer effects, and the person counter they must leave unchanged.
     pub keyed: Option<Keyed>,
     /// L13, CAP: when the lab's orchestrator turn went in.
     pub turn_ms: Option<i64>,
@@ -2049,7 +2632,7 @@ pub struct Cover {
     /// L15: the agent the worker's spawn started, as `meta worker=` names it once the watch is
     /// over.
     pub worker: Option<String>,
-    /// W1: when the lab raised the stub's usage wall, and the unix second it resets at
+    /// W1: the stub's actual admission that raised its prearmed usage wall, and its reset second
     /// ([`wall_step`]).
     pub wall: Option<(i64, i64)>,
     /// W1: when the lab gave the stub its scripted mode back.
@@ -2063,6 +2646,10 @@ pub struct Cover {
     /// ([`OWNER_KEY`]), each as the agent sent it, read from the stub's dumps once the watch is
     /// over ([`owner_witness`]).
     pub owner_texts: Option<Vec<String>>,
+    /// LH: the user texts of the conversation's requests that hold the land check
+    /// ([`LAND_CHECK_KEY`]), each as the agent sent it, read from the stub's dumps once the watch is
+    /// over ([`check_witness`]).
+    pub check_texts: Option<Vec<String>>,
     /// W2: the notice scrolled out of sight ([`hide_step`]).
     pub hidden: Option<Hidden>,
     /// W2: why the notice was not taken off the screen, where it was not.
@@ -2083,6 +2670,8 @@ pub struct Cover {
     pub relaunch: Option<Switch>,
     /// W9: why the relaunch was not made, where it was not.
     pub relaunch_gave_up: Option<String>,
+    /// W10, W11: what the lab did to the tapped wall ([`tap::step`]).
+    pub tap: Option<tap::Driven>,
     /// F18: `status human_ms=` read once the person's mid-chain Enter took their draft
     /// ([`Chain::asks_as_person`]): a stamp where a person's hand reached the session.
     pub ask_stamp: Option<String>,
@@ -2108,6 +2697,10 @@ pub struct Cover {
     /// SWITCH: the waits at rest the session's tapes show carrying `autopilot=` and woken by
     /// another word, read once the watch is over ([`switch::woke_witness`]; `None`: no tape read).
     pub woke: Option<Vec<switch::Woke>>,
+    /// AT ONCE: the texts the session's tapes show the loop writing, each timed from its decision
+    /// to its program's first draw, read once the watch is over ([`switch::typed_witness`];
+    /// `None`: no tape read): [`switch::land_at_once`]'s clock.
+    pub typed: Option<Vec<show::Typed>>,
     /// O1, O2: when the lab raised the stub's outage ([`outage::step`]).
     pub outage_ms: Option<i64>,
     /// O1, O2: when the lab gave the stub its scripted mode back.
@@ -2116,6 +2709,17 @@ pub struct Cover {
     /// holds the outage's line, read once the watch is over ([`outage::resumed_witness`]; `None`:
     /// not read, or never lifted).
     pub outage_resumed: Option<usize>,
+    /// `--mode sysmsg`: the instance's wakes while the stand-in stood, `metrics` reset at its
+    /// raise and read at its clearing ([`sysmsg::WAKE_FIELDS`]).
+    pub wall_wakes: Option<String>,
+    /// `--mode sysmsg`: the `metrics reset` at the raise failed, so [`Self::wall_wakes`] would
+    /// count wakes from before the wall: the figure is unobserved.
+    pub wall_wakes_unreset: bool,
+    /// `--mode sysmsg`'s witness lab: when the lab prompted its second tab into the standing wall
+    /// ([`sysmsg::mate_step`]).
+    pub mate_ms: Option<i64>,
+    /// `--mode sysmsg`'s expired login: the lab's play of the person ([`sysmsg::login::step`]).
+    pub login: Option<sysmsg::login::Played>,
 }
 
 impl Cover {
@@ -2198,17 +2802,19 @@ pub struct Scrolled {
     pub held: Option<bool>,
 }
 
-/// L13's prompt typed through `hwkey` (`forever --window`, [`person_keys`]): each key a real
-/// `NSEvent` posted into the windowed instance's own event queue, and the session's count of a
-/// person's gestures around them.
+/// L13's controller prompt typed through `hwkey` (`forever --window`, [`person_keys`]): native
+/// `NSEvent` posting and independent composer observations, without claiming a person's input.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Keyed {
     /// The presses `hwkey` handed to the window's event queue (`OK posted=<n>`): the text's
     /// characters and each Enter.
     pub posted: u64,
-    /// How many of them it posted while the window was the key window of the active app (`key=1`):
-    /// none in the jail, whose instance is no Launch Services application and cannot be activated.
+    /// How many were posted to the key window of the active app (`key=1`).
     pub key_window: u64,
+    /// The exact prompt was independently read in the composer's draft after the text keys.
+    pub draft_stood: bool,
+    /// A readable composer no longer held that draft after the single Enter.
+    pub draft_taken: bool,
     /// `status human_seq=` before the first key.
     pub seq_before: u64,
     /// `status human_seq=` once the Enter took the draft (`None`: unread).
@@ -2358,6 +2964,7 @@ pub fn pct_decode(s: &str) -> String {
     while i < b.len() {
         if b[i] == b'%'
             && let Some(h) = s.get(i + 1..i + 3)
+            && h.bytes().all(|b| b.is_ascii_hexdigit())
             && let Ok(v) = u8::from_str_radix(h, 16)
         {
             out.push(v);
@@ -2374,24 +2981,40 @@ fn at(t0: i64, t: i64) -> String {
     crate::restore::since(t0, t)
 }
 
+/// The short streak a point record (`point@v1`) names, read as the loop's own seed reads it
+/// ([`approvals::short_streak_of`]).
+fn point_streak(r: &Row) -> Option<u32> {
+    approvals::short_streak_of(&r.reason)
+}
+
+/// The short streak at the point at `t`: its ledgered point's, else the last back-off's before it
+/// and one more for each point read since (at least one: the point at `t`), since an act typed
+/// at once (the land check at its defense's point) journals no back-off of its own.
 fn streak_at(seen: &Seen, t: i64) -> Option<u32> {
     let marked = seen
         .ledger
         .iter()
         .rfind(|r| r.rule == RULE_POINT && (r.ts - t).abs() <= AT_DONE_MS)
-        .and_then(|r| {
-            let (_, n) = r.reason.split_once("short turns in a row: ")?;
-            n.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
-        });
+        .and_then(point_streak);
     marked.or_else(|| {
-        seen.journal
+        let (w, l) = seen
+            .journal
             .iter()
-            .rfind(|(at, l)| *at < t && l.starts_with("WAITING "))
-            .and_then(|(_, l)| {
-                let (_, rest) = l.split_once(" until=")?;
-                let n: u32 = rest.split_whitespace().nth(1)?.parse().ok()?;
-                n.checked_add(1)
+            .rfind(|(at, l)| *at < t && l.starts_with("WAITING "))?;
+        let (_, rest) = l.split_once(" until=")?;
+        let n: u32 = rest.split_whitespace().nth(1)?.parse().ok()?;
+        let mut since: Vec<String> = seen
+            .journal
+            .iter()
+            .filter(|(at, l)| {
+                at > w
+                    && *at <= t
+                    && idle_words(l).is_some_and(|said| !said.is_empty() && said != "-")
             })
+            .filter_map(|(_, l)| word(l, "seq"))
+            .collect();
+        since.dedup();
+        n.checked_add(u32::try_from(since.len().max(1)).unwrap_or(u32::MAX))
     })
 }
 
@@ -2528,11 +3151,33 @@ fn judge_scenarios(chain: Chain, seen: &Seen, program: &str, t0: i64) -> Vec<(Sc
     let land = seen.acts(turn_end::RULE_LAND).first().copied();
     let nudges = seen.acts(turn_end::RULE_LAND_NUDGE);
     let land_nudge_after = |t: i64| nudges.iter().copied().find(|(at, _)| *at > t);
+    let checks = seen.acts(turn_end::RULE_LAND_CHECK);
+    let land_check_after = |t: i64| checks.iter().copied().find(|(at, _)| *at > t);
     let mut out = Vec::new();
     for &s in chain.scenarios() {
         let v = match s {
             Scenario::L1 => judge_land_act(seen, land, done, t0),
-            Scenario::L2 => judge_nudge(seen, land, &land_nudge_after, done, &Want::open(), t0),
+            Scenario::L2 => judge_listed(
+                seen,
+                land,
+                &land_nudge_after,
+                done,
+                (Some(OPEN_KEY), &Want::listed(&[OPEN_KEY])),
+                t0,
+            ),
+            Scenario::LS => judge_listed(
+                seen,
+                land,
+                &land_nudge_after,
+                done,
+                (None, &Want::listed(&[SAME_KEY])),
+                t0,
+            ),
+            Scenario::LH => judge_hinted(seen, land, t0),
+            Scenario::LL => judge_relisted(seen, land, t0),
+            Scenario::LR => judge_reworded(seen, land, t0),
+            Scenario::LX => judge_contradicted(seen, land, &land_nudge_after, t0),
+            Scenario::LY => judge_contradicted_list(seen, land, &land_nudge_after, done, t0),
             Scenario::L4 | Scenario::L8 | Scenario::L9 | Scenario::L10 | Scenario::L11 => {
                 judge_nudge(
                     seen,
@@ -2543,9 +3188,9 @@ fn judge_scenarios(chain: Chain, seen: &Seen, program: &str, t0: i64) -> Vec<(Sc
                     t0,
                 )
             }
-            Scenario::L3 => judge_needs(seen, land, &land_nudge_after, program, t0),
-            Scenario::L5 => judge_landed(seen, land, &land_nudge_after, false, t0),
-            Scenario::L6 => judge_tall(seen, land, done, t0),
+            Scenario::L3 => judge_needs(seen, land, &land_check_after, program, t0),
+            Scenario::L5 => judge_landed(seen, land, false, t0),
+            Scenario::L6 => judge_rest(seen, land, done, t0),
             Scenario::L7 => judge_tasked(seen, land, t0),
             Scenario::C1 => judge_check(seen, t0),
             Scenario::C2 => judge_cruise_goes_on(seen, done, t0),
@@ -2555,7 +3200,7 @@ fn judge_scenarios(chain: Chain, seen: &Seen, program: &str, t0: i64) -> Vec<(Sc
             Scenario::P4P => judge_instant_ask(seen, t0),
             Scenario::L12 => cover::judge_answer(seen, t0),
             Scenario::L13 => cover::judge_theirs(seen, t0),
-            Scenario::L14 => cover::judge_wrote_land(seen, land, &land_nudge_after, program, t0),
+            Scenario::L14 => cover::judge_wrote_land(seen, land, &land_check_after, program, t0),
             Scenario::C3 => cover::judge_wrote_cruise(seen, done, t0),
             Scenario::C4 => cover::judge_owner_continuation(seen, done, t0),
             Scenario::P5 => cover::judge_startup(seen, t0),
@@ -2563,6 +3208,7 @@ fn judge_scenarios(chain: Chain, seen: &Seen, program: &str, t0: i64) -> Vec<(Sc
             Scenario::Cap => cover::judge_cap(seen, t0),
             Scenario::W1 => cover::judge_wall(seen, land, program, t0),
             Scenario::L16 | Scenario::L17 => judge_long_landing(seen, land, t0),
+            Scenario::L18 | Scenario::L19 => checked::judge_landing(seen, land, t0),
             Scenario::N1 => surfaces::judge_needs_step(seen, t0, 0),
             Scenario::N2 => surfaces::judge_needs_step(seen, t0, 1),
             Scenario::N3 => surfaces::judge_needs_step(seen, t0, 2),
@@ -2574,7 +3220,15 @@ fn judge_scenarios(chain: Chain, seen: &Seen, program: &str, t0: i64) -> Vec<(Sc
             Scenario::W6 => walls::judge_wall_unread(seen, land, program, t0),
             Scenario::W8 => walls::judge_wall_cruise(seen, program, t0),
             Scenario::W9 => walls::judge_wall_relaunch(seen, land, program, t0),
+            Scenario::W10 => tap::judge(seen, land, program, t0),
+            Scenario::W11 => tap::judge_narrow(seen, land, program, t0),
             Scenario::O1 | Scenario::O2 => outage::judge(chain, seen, outage::SCALE, t0),
+            Scenario::Sys(sysmsg::Form::Login) => sysmsg::login::judge(seen, false, program, t0),
+            Scenario::SysLand(sysmsg::Form::Login) => sysmsg::login::judge(seen, true, program, t0),
+            Scenario::Sys(f) => sysmsg::judge(seen, f, false, program, t0),
+            Scenario::SysLand(f) => sysmsg::judge(seen, f, true, program, t0),
+            Scenario::SignedIn(land) => sysmsg::login::judge_signed_in(seen, land, program, t0),
+            Scenario::Witnessed => sysmsg::judge_witnessed(seen, program, t0),
             Scenario::F18 => cover::judge_person_instant(seen, t0),
             Scenario::Rewrap => cover::judge_rewrap(seen, t0),
             Scenario::Scrolled => cover::judge_scrolled(seen, t0),
@@ -2586,13 +3240,16 @@ fn judge_scenarios(chain: Chain, seen: &Seen, program: &str, t0: i64) -> Vec<(Sc
             Scenario::SwitchAgent => switch::judge_at_rest(seen, t0),
             Scenario::SwitchSeq => switch::judge_draft(seen, t0),
             Scenario::SwitchFlip => switch::judge_flip(seen, t0),
-            Scenario::SwitchHeld => switch::judge_held(seen, t0),
+            Scenario::SwitchOverHeld => switch::judge_over_held(seen, t0),
             Scenario::SwitchBusy => switch::judge_busy(seen, t0),
         };
+        let v = through_check(chain, seen, t0, v);
         let cx = surfaces::Ctx { chain, program, t0 };
         let v = switch::with_at_once(s, seen, &cx, v);
         let v = surfaces::with_window(s, seen, &cx, v);
-        out.push((s, surfaces::held::with_held(s, seen, &cx, v)));
+        let v = surfaces::held::with_held(s, seen, &cx, v);
+        let v = receipt::with_receipt(chain, s, seen, t0, v);
+        out.push((s, checked::with_checked(chain, s, seen, t0, v)));
     }
     out
 }
@@ -2663,31 +3320,125 @@ fn judge_land_act(
 }
 
 struct Want {
+    /// What the nudge opens with, `head` right after it; `None` where the head may stand anywhere.
+    leads: Option<&'static str>,
     head: &'static str,
     named: &'static [&'static str],
+    /// What the nudge says after its head beside `named`.
+    says: &'static [&'static str],
     not_named: &'static [&'static str],
-    not_anywhere: [&'static str; 2],
+    not_anywhere: &'static [&'static str],
 }
 
+/// What Land's contradiction never says (slice 4c): any way out of landing the work that would
+/// clear git's probe or the reader without landing anything.
+pub(crate) const ESCAPES: [&str; 3] = ["ignore", "move it", "not open"];
+
 impl Want {
-    const fn open() -> Want {
+    /// The nudge quoting the agent's own list, `named` in it: never the reader's words, the
+    /// repository's or the needs ack (no need is scripted).
+    const fn listed(named: &'static [&'static str]) -> Want {
         Want {
-            head: OPEN_SUFFIX,
-            named: &[],
+            leads: None,
+            head: LISTED_KEY,
+            named,
+            says: &[],
             not_named: &[],
-            not_anywhere: [REPO_SUFFIX, NEEDS_ACK],
+            not_anywhere: &[OPEN_SUFFIX, REPO_SUFFIX, NEEDS_ACK],
         }
     }
 
+    /// LAND'S CONTRADICTION OF A DEFENSE WHILE THE AGENT'S LIST STANDS (slice 4c's Open leg): its
+    /// head, then the list quoted (`named` in it), its one ask and Land's own close; never the
+    /// reader's words, the repository's, the needs ack or a way out ([`ESCAPES`]).
+    const fn listed_contradicted(named: &'static [&'static str]) -> Want {
+        Want {
+            leads: Some(turn_end::LAND_CONTRADICTED_HEAD),
+            head: turn_end::CONTRADICTED_LISTED,
+            named,
+            says: &[turn_end::CONTRADICTED_LISTED_ASK, turn_end::NO_REPOSITORY],
+            not_named: &[],
+            not_anywhere: &[
+                OPEN_SUFFIX,
+                REPO_SUFFIX,
+                NEEDS_ACK,
+                ESCAPES[0],
+                ESCAPES[1],
+                ESCAPES[2],
+            ],
+        }
+    }
+
+    /// LAND'S CONTRADICTION OF A FALSE DEFENSE over the repository's work (slice 4c): its head,
+    /// then git's fact naming `repo`'s work and no other leg's, its one ask and Land's own close;
+    /// never the repository's suffix of the nudge it replaces, the reader's words, the needs ack
+    /// or a way out ([`ESCAPES`]).
     const fn repo(repo: Repo) -> Want {
         let (named, not_named) = repo.named();
         Want {
-            head: REPO_SUFFIX,
+            leads: Some(turn_end::LAND_CONTRADICTED_HEAD),
+            head: turn_end::CONTRADICTED_GIT,
             named,
+            says: &[turn_end::CONTRADICTED_GIT_ASK, turn_end::NO_REPOSITORY],
             not_named,
-            not_anywhere: [OPEN_SUFFIX, NEEDS_ACK],
+            not_anywhere: &[
+                OPEN_SUFFIX,
+                REPO_SUFFIX,
+                NEEDS_ACK,
+                ESCAPES[0],
+                ESCAPES[1],
+                ESCAPES[2],
+            ],
         }
     }
+}
+
+/// What of `text`, a nudge, `want` judges: the words from its head on, or why it is not the nudge
+/// `want` wants (what it does not say, what it says that it must not, and the text).
+fn nudge_words<'t>(text: &'t str, want: &Want) -> Result<&'t str, String> {
+    let suffix = text.find(want.head).map_or("", |i| &text[i..]);
+    let led = want.leads.is_none_or(|lead| {
+        text.strip_prefix(lead)
+            .is_some_and(|r| r.trim_start().starts_with(want.head))
+    });
+    let missing: Vec<&str> = want
+        .leads
+        .filter(|_| !led)
+        .into_iter()
+        .chain(
+            std::iter::once(want.head)
+                .chain(want.named.iter().copied())
+                .chain(want.says.iter().copied())
+                .filter(|w| !suffix.contains(w)),
+        )
+        .collect();
+    let wrong: Vec<&str> = want
+        .not_named
+        .iter()
+        .copied()
+        .filter(|w| suffix.contains(w))
+        .chain({
+            // A word that must stand nowhere, an escape among them, is matched in any case: "Or
+            // ignore it." and "Ignore it." are the same way out.
+            let lower = text.to_lowercase();
+            want.not_anywhere
+                .iter()
+                .copied()
+                .filter(move |w| lower.contains(&w.to_lowercase()))
+        })
+        .collect();
+    if missing.is_empty() && wrong.is_empty() {
+        return Ok(suffix);
+    }
+    Err(format!(
+        "does not say {missing:?}{}: {}",
+        if wrong.is_empty() {
+            String::new()
+        } else {
+            format!(" or says {wrong:?}")
+        },
+        crate::util::one_line(text, 400)
+    ))
 }
 
 fn judge_nudge<'a>(
@@ -2723,30 +3474,10 @@ fn judge_nudge<'a>(
     };
     let t2 = nudge.0;
     let text = seen.act_text(turn_end::RULE_LAND_NUDGE, nudge);
-    let suffix = text.find(want.head).map_or("", |i| &text[i..]);
-    let missing: Vec<&str> = std::iter::once(want.head)
-        .chain(want.named.iter().copied())
-        .filter(|w| !suffix.contains(w))
-        .collect();
-    let wrong: Vec<&str> = want
-        .not_named
-        .iter()
-        .copied()
-        .filter(|w| suffix.contains(w))
-        .chain(want.not_anywhere.into_iter().filter(|w| text.contains(w)))
-        .collect();
-    if !missing.is_empty() || !wrong.is_empty() {
-        return Verdict::Fail(format!(
-            "the nudge at +{} does not say {missing:?}{}: {}",
-            at(t0, t2),
-            if wrong.is_empty() {
-                String::new()
-            } else {
-                format!(" or says {wrong:?}")
-            },
-            crate::util::one_line(text, 400)
-        ));
-    }
+    let suffix = match nudge_words(text, want) {
+        Ok(suffix) => suffix,
+        Err(why) => return Verdict::Fail(format!("the nudge at +{} {why}", at(t0, t2))),
+    };
     let said = format!(
         "land-nudge@v1 typed at +{} naming \"{}\", no DONE, task never landed, no need raised",
         at(t0, t2),
@@ -2843,7 +3574,12 @@ fn judge_needs<'a>(
             *t >= *te - 5000 && *t <= until && word(s, "needs").as_deref() == Some("ask")
         })
     });
-    let nudge_text = nudge.map(|n| seen.act_text(turn_end::RULE_LAND_NUDGE, n));
+    // The act that carries the needs ack: the land check where the defense owes one (L3), its
+    // text read off its own ledger row.
+    let act = nudge
+        .and_then(|(_, l)| act_rule(l))
+        .unwrap_or(turn_end::RULE_LAND_NUDGE);
+    let nudge_text = nudge.map(|n| seen.act_text(act, n));
     let carry_on = nudge_text.is_some_and(|t| t.contains(NEEDS_ACK));
     let stray: Vec<&str> = [OPEN_SUFFIX, REPO_SUFFIX]
         .into_iter()
@@ -2863,10 +3599,10 @@ fn judge_needs<'a>(
             |(t, _)| format!("+{} status needs=ask", at(t0, *t)),
         ),
         nudge.map_or_else(
-            || "NO nudge typed".to_string(),
+            || "NO land check typed".to_string(),
             |(t, _)| {
                 format!(
-                    "land-nudge@v1 typed at +{}{}",
+                    "{act} typed at +{}{}",
                     at(t0, *t),
                     if carry_on {
                         " telling the worker its need is on the person's screen"
@@ -2878,10 +3614,10 @@ fn judge_needs<'a>(
         ),
     ];
     if landed_first {
-        facts.push("LANDED before the nudge".into());
+        facts.push(format!("LANDED before the {act}"));
     }
     if !stray.is_empty() {
-        facts.push(format!("the nudge says {stray:?}"));
+        facts.push(format!("the {act} says {stray:?}"));
     }
     let said = facts.join("; ");
     let raised = needs.is_some() && entry.is_some();
@@ -3011,75 +3747,6 @@ fn landing_quiet(
     (bad, said, window)
 }
 
-fn judge_landed<'a>(
-    seen: &'a Seen,
-    land: Option<&(i64, String)>,
-    nudge_after: &dyn Fn(i64) -> Option<&'a (i64, String)>,
-    managed: bool,
-    t0: i64,
-) -> Verdict {
-    let Some((t1, _)) = land else {
-        return Verdict::Unobserved("no land instruction was typed (L1 failed)".into());
-    };
-    let Some(nudge) = nudge_after(*t1) else {
-        if let Some(lost) = lost_after(seen, *t1, t0) {
-            return Verdict::Fail(format!(
-                "no nudge was typed for the clean defense to answer: {lost}"
-            ));
-        }
-        return Verdict::Unobserved(
-            "no nudge was typed for the clean defense to answer (L3)".into(),
-        );
-    };
-    let t2 = nudge.0;
-    let Some(done) = seen.first_after("DONE ", t2) else {
-        return Verdict::Fail(format!(
-            "no DONE within {} after the nudge's clean defense",
-            at(t0, seen.end_ms)
-        ));
-    };
-    let (mut bad, said, window) = landing_quiet(seen, done, managed, t0);
-    let text = seen.act_text(turn_end::RULE_LAND_NUDGE, nudge);
-    for w in [OPEN_SUFFIX, REPO_SUFFIX] {
-        if text.contains(w) {
-            bad.push(format!("the nudge that landed it says \"{w}\""));
-        }
-    }
-    let invented = bad.len();
-    let unread = cover::invented_record(seen, &mut bad);
-    let invented = bad.len() > invented;
-    let cleared = seen
-        .journal
-        .iter()
-        .any(|(t, l)| *t >= t2 && l.starts_with("CLEARED ") && l.contains(" needs "));
-    let entry_gone = seen.meta.last().is_some_and(|(_, m)| !needs_up(m));
-    if !cleared {
-        bad.push("no CLEARED … needs line".into());
-    }
-    if !entry_gone {
-        bad.push("the needs entry still stands in meta".into());
-    }
-    let said = format!(
-        "{said}; needs {}; no task given, the record {}",
-        if cleared && entry_gone {
-            "cleared"
-        } else {
-            "NOT cleared"
-        },
-        if unread.is_some() {
-            "not read"
-        } else if invented {
-            "INVENTED"
-        } else {
-            "OK task - throughout"
-        }
-    );
-    match unread {
-        Some(why) if bad.is_empty() => Verdict::Unobserved(format!("{said}: {why}")),
-        _ => landed_verdict(bad, said, seen, done.0, window),
-    }
-}
-
 fn landed_verdict(bad: Vec<String>, said: String, seen: &Seen, t3: i64, window: i64) -> Verdict {
     if !bad.is_empty() {
         return Verdict::Fail(format!("{said}: {}", bad.join("; ")));
@@ -3191,7 +3858,239 @@ fn judge_tasked(seen: &Seen, land: Option<&(i64, String)>, t0: i64) -> Verdict {
     landed_verdict(bad, said, seen, done.0, window)
 }
 
-fn judge_tall(
+/// The land checks typed after `t` (`land-check@v1`), in order.
+fn checks_after(seen: &Seen, t: i64) -> Vec<&(i64, String)> {
+    seen.acts(turn_end::RULE_LAND_CHECK)
+        .into_iter()
+        .filter(|(at, _)| *at > t)
+        .collect()
+}
+
+/// L6's rest: the loop's one `WAITING … rule=land-check@v1 … waits only on you` line, said once
+/// the check's answer named only a need.
+fn rest_of(seen: &Seen) -> Option<&(i64, String)> {
+    seen.journal.iter().find(|(_, l)| {
+        l.starts_with("WAITING ")
+            && word(l, "rule").as_deref() == Some(turn_end::RULE_LAND_CHECK)
+            && l.contains(aterm_agent::supervise::policy::land_check::WAITS_ON_YOU)
+    })
+}
+
+/// The first land check after `t1`, or the verdict for none: a landing without it fails, a lost
+/// loop fails, a watch too short is unobserved.
+fn the_check(seen: &Seen, t1: i64, t0: i64) -> Result<&(i64, String), Verdict> {
+    if let Some(c) = checks_after(seen, t1).first().copied() {
+        return Ok(c);
+    }
+    if let Some((d, l)) = seen.first_after("DONE ", t1) {
+        return Err(Verdict::Fail(format!(
+            "LANDED at +{} with no land check typed: {}",
+            at(t0, *d),
+            crate::util::one_line(l, 120)
+        )));
+    }
+    if let Some((t, l)) = seen
+        .acts(turn_end::RULE_LAND_NUDGE)
+        .into_iter()
+        .find(|(t, _)| *t > t1)
+    {
+        return Err(Verdict::Fail(format!(
+            "Land's nudge typed at +{} with no land check before it: {}",
+            at(t0, *t),
+            crate::util::one_line(l, 100)
+        )));
+    }
+    if let Some(lost) = lost_after(seen, t1, t0) {
+        return Err(Verdict::Fail(format!("no land check typed: {lost}")));
+    }
+    Err(Verdict::Unobserved(format!(
+        "no land-check@v1 typed within {}",
+        at(t0, seen.end_ms)
+    )))
+}
+
+/// What a check's text must and must not say: its head, hinted quoting `hint` or plain.
+fn check_text_faults(text: &str, hint: Option<&str>) -> Vec<String> {
+    let mut bad = Vec::new();
+    if !text.starts_with(turn_end::LAND_CHECK_HEAD) {
+        bad.push(format!(
+            "the check does not open with \"{}\": {}",
+            turn_end::LAND_CHECK_HEAD,
+            crate::util::one_line(text, 120)
+        ));
+    }
+    for w in [OPEN_SUFFIX, REPO_SUFFIX] {
+        if text.contains(w) {
+            bad.push(format!("the check says \"{w}\""));
+        }
+    }
+    match hint {
+        Some(h) if !(text.contains(HINT_OPEN) && text.contains(h)) => bad.push(format!(
+            "the check is not hinted with \"{h}\": {}",
+            crate::util::one_line(text, 300)
+        )),
+        None if text.contains(HINT_OPEN) => bad.push(format!(
+            "the check is hinted, not plain: {}",
+            crate::util::one_line(text, 300)
+        )),
+        _ => {}
+    }
+    bad
+}
+
+/// L5 (land-a): the defense at the land act's yield gets one land check at that point (no
+/// back-off), its `LANDED` lands, and nothing more is typed. The defense names a need, so the
+/// check carries the needs ack (L3); `LANDED` retracts no need (the post-landing review,
+/// 2026-11-01), so the need stands quietly beside the landing: no `CLEARED … needs` line after
+/// the check, and the needs entry still up at the last read.
+fn judge_landed(seen: &Seen, land: Option<&(i64, String)>, managed: bool, t0: i64) -> Verdict {
+    let Some((t1, _)) = land else {
+        return Verdict::Unobserved("no land instruction was typed (L1 failed)".into());
+    };
+    let check = match the_check(seen, *t1, t0) {
+        Ok(c) => c,
+        Err(v) => return v,
+    };
+    let t2 = check.0;
+    let Some(done) = seen.first_after("DONE ", t2) else {
+        return Verdict::Fail(format!(
+            "no DONE within {} after the land check's LANDED",
+            at(t0, seen.end_ms)
+        ));
+    };
+    let (mut bad, said, window) = landing_quiet(seen, done, managed, t0);
+    bad.extend(check_text_faults(
+        seen.act_text(turn_end::RULE_LAND_CHECK, check),
+        None,
+    ));
+    let checks = checks_after(seen, *t1).len();
+    if checks != 1 {
+        bad.push(format!("{checks} land checks typed, not one"));
+    }
+    if let Some((tn, _)) = seen
+        .acts(turn_end::RULE_LAND_NUDGE)
+        .into_iter()
+        .find(|(t, _)| *t > *t1 && *t < done.0)
+    {
+        bad.push(format!(
+            "a land-nudge@v1 typed at +{} before the landing",
+            at(t0, *tn)
+        ));
+    }
+    let defense = seen.yield_after(*t1, Some(t2), None).event;
+    let backed_off = seen
+        .journal
+        .iter()
+        .find(|(t, l)| *t > *t1 && *t < t2 && l.starts_with("WAITING ") && l.contains(" until="));
+    match (defense, backed_off) {
+        (_, Some((tw, l))) => bad.push(format!(
+            "a back-off decided before the check, at +{}: {}",
+            at(t0, *tw),
+            crate::util::one_line(l, 120)
+        )),
+        (None, None) => bad.push("the defense's yield was not read before the check".into()),
+        (Some((te, _)), None) if t2 - te >= next_step_ms(1, false) => bad.push(format!(
+            "the check typed {} after the defense's yield, a back-off's wait",
+            at(0, t2 - te)
+        )),
+        _ => {}
+    }
+    let invented = bad.len();
+    let unread = cover::invented_record(seen, &mut bad);
+    let invented = bad.len() > invented;
+    let cleared = seen
+        .journal
+        .iter()
+        .find(|(t, l)| *t >= t2 && l.starts_with("CLEARED ") && l.contains(" needs "));
+    let entry_up = seen.meta.last().is_some_and(|(_, m)| needs_up(m));
+    if let Some((tc, l)) = cleared {
+        bad.push(format!(
+            "the need was taken down at +{} though nothing retracted it: {}",
+            at(t0, *tc),
+            crate::util::one_line(l, 120)
+        ));
+    }
+    if !entry_up {
+        bad.push("the needs entry is gone from meta at the last read".into());
+    }
+    let said = format!(
+        "land-check@v1 typed at +{}{}; {said}; needs {}; no task given, the record {}",
+        at(t0, t2),
+        defense.map_or_else(String::new, |(te, _)| format!(
+            ", {} after the defense's yield",
+            at(0, t2 - te)
+        )),
+        if cleared.is_none() && entry_up {
+            "standing beside the landing"
+        } else {
+            "TAKEN DOWN"
+        },
+        if unread.is_some() {
+            "not read"
+        } else if invented {
+            "INVENTED"
+        } else {
+            "OK task - throughout"
+        }
+    );
+    match unread {
+        Some(why) if bad.is_empty() => Verdict::Unobserved(format!("{said}: {why}")),
+        _ => landed_verdict(bad, said, seen, done.0, window),
+    }
+}
+
+/// L2 (land-b) and LS (land-same-list): the defense's one check (hinted with `hint` where the
+/// reader reads a clause of it open, else plain), answered with the agent's own list; Land's
+/// nudge quotes that list (`named` in it), never the reader's words or the repository's; the same
+/// defense again is held ([`surfaces::held`]), never checked again; never landed.
+fn judge_listed<'a>(
+    seen: &'a Seen,
+    land: Option<&(i64, String)>,
+    nudge_after: &dyn Fn(i64) -> Option<&'a (i64, String)>,
+    done: Option<&(i64, String)>,
+    (hint, want): (Option<&str>, &Want),
+    t0: i64,
+) -> Verdict {
+    let Some((t1, _)) = land else {
+        return Verdict::Unobserved("no land instruction was typed".into());
+    };
+    let check = match the_check(seen, *t1, t0) {
+        Ok(c) => c,
+        Err(v) => return v,
+    };
+    let mut bad = check_text_faults(seen.act_text(turn_end::RULE_LAND_CHECK, check), hint);
+    let checks = checks_after(seen, *t1).len();
+    if checks != 1 {
+        bad.push(format!("{checks} land checks typed, not one"));
+    }
+    let v = judge_nudge(seen, Some(check), nudge_after, done, want, t0);
+    let said = format!(
+        "land-check@v1 typed at +{} ({}), {checks} check(s) in all",
+        at(t0, check.0),
+        if hint.is_some() { "hinted" } else { "plain" }
+    );
+    match v {
+        Verdict::Pass(why) if bad.is_empty() => Verdict::Pass(format!("{said}; {why}")),
+        Verdict::Pass(why) => Verdict::Fail(format!("{said}; {why}: {}", bad.join("; "))),
+        Verdict::Fail(why) => Verdict::Fail(format!("{said}; {why}{}", tail_of(&bad))),
+        Verdict::Unobserved(why) if bad.is_empty() => Verdict::Unobserved(format!("{said}; {why}")),
+        Verdict::Unobserved(why) => Verdict::Fail(format!("{said}; {why}: {}", bad.join("; "))),
+    }
+}
+
+fn tail_of(bad: &[String]) -> String {
+    if bad.is_empty() {
+        String::new()
+    } else {
+        format!("; {}", bad.join("; "))
+    }
+}
+
+/// L6 (land-d): the tall reply, its need above the window, gets the plain check (a need or a cut
+/// does not bar it); the check's answer names only the need, so Land rests: the rest said once,
+/// nothing typed past the ladder's next step, `land_held=needs`, no hold's `EXCEPTION`, never
+/// landed.
+fn judge_rest(
     seen: &Seen,
     land: Option<&(i64, String)>,
     done: Option<&(i64, String)>,
@@ -3200,61 +4099,646 @@ fn judge_tall(
     let Some((t1, _)) = land else {
         return Verdict::Unobserved("no land instruction was typed".into());
     };
-    let needs = seen.first_after("NEEDS ", *t1);
-    let entry = needs_entry(seen, *t1);
-    let nudge = seen
-        .acts(turn_end::RULE_LAND_NUDGE)
-        .into_iter()
-        .find(|(t, _)| t > t1);
-    let carry_on = nudge.is_some_and(|n| {
-        seen.act_text(turn_end::RULE_LAND_NUDGE, n)
-            .contains(NEEDS_ACK)
-    });
-    let said = format!(
-        "{}; {}; {}",
-        needs.map_or_else(
-            || "NO NEEDS line".to_string(),
-            |(t, l)| format!("+{} {}", at(t0, *t), crate::util::one_line(l, 100))
-        ),
-        entry.map_or("no needs entry", |_| "the needs entry up"),
-        nudge.map_or_else(
-            || "no nudge typed".to_string(),
-            |(t, _)| format!(
-                "land-nudge@v1 typed at +{}{}",
-                at(t0, *t),
-                if carry_on {
-                    " with the needs carry-on"
-                } else {
-                    " WITHOUT the needs carry-on"
-                }
-            )
-        )
-    );
     if let Some((d, l)) = done {
         return Verdict::Fail(format!(
-            "LANDED at +{} over the need above the window ({}): {said}",
+            "LANDED at +{} over the need ({})",
             at(t0, *d),
             crate::util::one_line(l, 90)
         ));
     }
     if seen.status_said("task", "landed", t0) {
-        return Verdict::Fail(format!("status said task=landed: {said}"));
+        return Verdict::Fail("status said task=landed".into());
     }
+    let check = match the_check(seen, *t1, t0) {
+        Ok(c) => c,
+        Err(v) => return v,
+    };
+    let t2 = check.0;
+    let mut bad = check_text_faults(seen.act_text(turn_end::RULE_LAND_CHECK, check), None);
+    let needs = seen.first_after("NEEDS ", *t1);
+    let entry = needs_entry(seen, *t1);
     if needs.is_none() || entry.is_none() {
-        return Verdict::Fail(format!("not landed, but the need was not raised: {said}"));
+        bad.push("the need was not raised".into());
     }
-    match nudge {
-        Some(_) if carry_on => Verdict::Pass(format!("not landed; {said}")),
-        Some(_) => Verdict::Fail(format!("not landed, need raised, but {said}")),
-        None => match lost_after(seen, *t1, t0) {
+    let typed: Vec<&(i64, String)> = seen
+        .all_acts()
+        .into_iter()
+        .filter(|(t, _)| *t > t2)
+        .collect();
+    if let Some((t, l)) = typed.first() {
+        bad.push(format!(
+            "TYPED into the rest at +{}: {}",
+            at(t0, *t),
+            crate::util::one_line(l, 120)
+        ));
+    }
+    if let Some((t, l)) = seen
+        .journal
+        .iter()
+        .find(|(t, l)| *t > *t1 && l.starts_with("EXCEPTION "))
+    {
+        bad.push(format!(
+            "an EXCEPTION at +{}: {}",
+            at(t0, *t),
+            crate::util::one_line(l, 120)
+        ));
+    }
+    let Some((tr, rl)) = rest_of(seen).filter(|(t, _)| *t > t2) else {
+        let why = format!(
+            "land-check@v1 typed at +{}, but no rest said (WAITING … rule={} … {})",
+            at(t0, t2),
+            turn_end::RULE_LAND_CHECK,
+            aterm_agent::supervise::policy::land_check::WAITS_ON_YOU
+        );
+        return match lost_after(seen, t2, t0) {
+            Some(lost) => Verdict::Fail(format!("{why}: {lost}{}", tail_of(&bad))),
+            None if bad.is_empty() => Verdict::Unobserved(why),
+            None => Verdict::Fail(format!("{why}{}", tail_of(&bad))),
+        };
+    };
+    // The status words are kept at each change, and the need can reach them before the rest is
+    // journaled: the words standing at the rest count, as does any later change.
+    let standing = seen
+        .status
+        .iter()
+        .rposition(|(t, _)| *t <= *tr)
+        .unwrap_or(0);
+    let held_needs = seen
+        .status
+        .iter()
+        .skip(standing)
+        .any(|(_, s)| word(s, "land_held").is_some_and(|h| h.split(',').any(|l| l == "needs")));
+    if !held_needs {
+        bad.push("status never read land_held=needs after the rest".into());
+    }
+    let window = quiet_after_landed_ms(seen, *tr, false);
+    let said = format!(
+        "land-check@v1 (plain) typed at +{}; +{} {}; {}; nothing typed for {} after it (the window {})",
+        at(t0, t2),
+        at(t0, *tr),
+        crate::util::one_line(rl, 120),
+        needs.map_or_else(
+            || "NO NEEDS line".to_string(),
+            |(t, l)| format!("+{} {}", at(t0, *t), crate::util::one_line(l, 80))
+        ),
+        at(0, seen.end_ms - tr),
+        at(0, window)
+    );
+    if !bad.is_empty() {
+        return Verdict::Fail(format!("{said}: {}", bad.join("; ")));
+    }
+    if seen.end_ms - tr < window {
+        return Verdict::Unobserved(format!("{said}: watched under the window after the rest"));
+    }
+    Verdict::Pass(format!("not landed; {said}"))
+}
+
+/// LH (land-hinted): the clean defense whose clause the reader reads open gets one hinted check
+/// quoting it, its `LANDED` lands with no nudge typed, and the composer held the hinted text as
+/// typed (the stub's own copy of the check holds the quote's glyphs).
+fn judge_hinted(seen: &Seen, land: Option<&(i64, String)>, t0: i64) -> Verdict {
+    let Some((t1, _)) = land else {
+        return Verdict::Unobserved("no land instruction was typed".into());
+    };
+    let check = match the_check(seen, *t1, t0) {
+        Ok(c) => c,
+        Err(v) => return v,
+    };
+    let t2 = check.0;
+    let Some(done) = seen.first_after("DONE ", t2) else {
+        return Verdict::Fail(format!(
+            "no DONE within {} after the hinted check's LANDED",
+            at(t0, seen.end_ms)
+        ));
+    };
+    let (mut bad, said, window) = landing_quiet(seen, done, false, t0);
+    let text = seen.act_text(turn_end::RULE_LAND_CHECK, check);
+    bad.extend(check_text_faults(text, Some(HINT_KEY)));
+    let checks = checks_after(seen, *t1).len();
+    if checks != 1 {
+        bad.push(format!("{checks} land checks typed, not one"));
+    }
+    if let Some((tn, _)) = seen.acts(turn_end::RULE_LAND_NUDGE).first() {
+        bad.push(format!("a land-nudge@v1 typed at +{}", at(t0, *tn)));
+    }
+    let held = match &seen.cover.check_texts {
+        None => "the stub's copy UNREAD".to_string(),
+        Some(texts) => {
+            let close = aterm_agent::supervise::policy::land_check::LAND_CHECK_HINT_CLOSE;
+            if texts
+                .iter()
+                .any(|t| t.contains(HINT_OPEN) && t.contains(HINT_KEY) && t.contains(close))
+            {
+                format!(
+                    "the stub's copy holds the quote as typed ({} text(s))",
+                    texts.len()
+                )
+            } else {
+                bad.push(format!(
+                    "no copy of the check the stub read holds the quote as typed: {:?}",
+                    texts
+                        .iter()
+                        .map(|t| crate::util::one_line(t, 200))
+                        .collect::<Vec<_>>()
+                ));
+                "the stub's copy NOT as typed".to_string()
+            }
+        }
+    };
+    let said = format!(
+        "land-check@v1 typed at +{} quoting \"{HINT_KEY}\"; {held}; {said}",
+        at(t0, t2)
+    );
+    if seen.cover.check_texts.is_none() && bad.is_empty() {
+        return Verdict::Unobserved(format!("{said}: the stub's dumps were not read"));
+    }
+    landed_verdict(bad, said, seen, done.0, window)
+}
+
+/// LL (land-listed): the check's list is quoted by the nudge, the nudge's reply does work, and a
+/// second check comes only after that work (and the defense after it), its `LANDED` landing.
+fn judge_relisted(seen: &Seen, land: Option<&(i64, String)>, t0: i64) -> Verdict {
+    let Some((t1, _)) = land else {
+        return Verdict::Unobserved("no land instruction was typed".into());
+    };
+    let first = match the_check(seen, *t1, t0) {
+        Ok(c) => c,
+        Err(v) => return v,
+    };
+    let nudges = seen.acts(turn_end::RULE_LAND_NUDGE);
+    let Some(quoting) = nudges.iter().copied().find(|(t, _)| *t > first.0) else {
+        return match lost_after(seen, first.0, t0) {
+            Some(lost) => Verdict::Fail(format!("no nudge after the check's list: {lost}")),
+            None => Verdict::Unobserved(format!(
+                "no nudge after the check's list within {}",
+                at(t0, seen.end_ms)
+            )),
+        };
+    };
+    let mut bad = check_text_faults(seen.act_text(turn_end::RULE_LAND_CHECK, first), None);
+    let text = seen.act_text(turn_end::RULE_LAND_NUDGE, quoting);
+    let suffix = text.find(LISTED_KEY).map_or("", |i| &text[i..]);
+    if !suffix.contains(RELEASE_KEY) {
+        bad.push(format!(
+            "the nudge at +{} does not quote the list: {}",
+            at(t0, quoting.0),
+            crate::util::one_line(text, 300)
+        ));
+    }
+    for w in [OPEN_SUFFIX, REPO_SUFFIX] {
+        if text.contains(w) {
+            bad.push(format!("the nudge says \"{w}\""));
+        }
+    }
+    let worked = seen.journal.iter().find(|(t, l)| {
+        *t > quoting.0 && idle_words(l).is_some_and(|w| w.contains(RELEASE_WORK_KEY))
+    });
+    let checks = checks_after(seen, *t1);
+    let second = checks.get(1).copied();
+    match (worked, second) {
+        (_, None) => {
+            let why = format!(
+                "the list quoted at +{}, but no second check typed",
+                at(t0, quoting.0)
+            );
+            return match lost_after(seen, quoting.0, t0) {
+                Some(lost) => Verdict::Fail(format!("{why}: {lost}{}", tail_of(&bad))),
+                None if bad.is_empty() => Verdict::Unobserved(why),
+                None => Verdict::Fail(format!("{why}{}", tail_of(&bad))),
+            };
+        }
+        (None, Some((t, _))) => bad.push(format!(
+            "a second check at +{} with no work read before it",
+            at(t0, *t)
+        )),
+        (Some((tw, _)), Some((t, _))) if *t < *tw => bad.push(format!(
+            "a second check at +{} before the work read at +{}",
+            at(t0, *t),
+            at(t0, *tw)
+        )),
+        _ => {}
+    }
+    if checks.len() > 2 {
+        bad.push(format!("{} land checks typed, not two", checks.len()));
+    }
+    let Some(second) = second else {
+        return Verdict::Fail(bad.join("; "));
+    };
+    let Some(done) = seen.first_after("DONE ", second.0) else {
+        return Verdict::Fail(format!(
+            "no DONE within {} after the second check's LANDED{}",
+            at(t0, seen.end_ms),
+            tail_of(&bad)
+        ));
+    };
+    if let Some((d, _)) = seen
+        .first_after("DONE ", *t1)
+        .filter(|(d, _)| *d < second.0)
+    {
+        bad.push(format!("LANDED at +{} on the list", at(t0, *d)));
+    }
+    let (more, said, window) = landing_quiet(seen, done, false, t0);
+    bad.extend(more);
+    let said = format!(
+        "land-check@v1 at +{}, the list quoted by the nudge at +{}, the work read{}, the second check at +{}; {said}",
+        at(t0, first.0),
+        at(t0, quoting.0),
+        worked.map_or_else(String::new, |(t, _)| format!(" at +{}", at(t0, *t))),
+        at(t0, second.0)
+    );
+    landed_verdict(bad, said, seen, done.0, window)
+}
+
+/// LR (land-reworded): the first check answered with [`CHECK_LIST`], the nudge after it quoting
+/// it; the work its reply did read; a second check only after that work, answered with
+/// [`REWORDED_LIST`], and a nudge after it quoting the new words, never the old; never landed
+/// (the hold, its quote on the window's surfaces, is [`surfaces::hold::reworded`]'s).
+fn judge_reworded(seen: &Seen, land: Option<&(i64, String)>, t0: i64) -> Verdict {
+    let Some((t1, _)) = land else {
+        return Verdict::Unobserved("no land instruction was typed".into());
+    };
+    if let Some((d, l)) = seen.first_after("DONE ", *t1) {
+        return Verdict::Fail(format!(
+            "LANDED at +{} over the list ({})",
+            at(t0, *d),
+            crate::util::one_line(l, 90)
+        ));
+    }
+    let first = match the_check(seen, *t1, t0) {
+        Ok(c) => c,
+        Err(v) => return v,
+    };
+    let mut bad = check_text_faults(seen.act_text(turn_end::RULE_LAND_CHECK, first), None);
+    let nudges = seen.acts(turn_end::RULE_LAND_NUDGE);
+    let quoting = |after: i64, key: &str| {
+        nudges.iter().copied().find(|n| {
+            n.0 > after && {
+                let text = seen.act_text(turn_end::RULE_LAND_NUDGE, n);
+                text.find(LISTED_KEY)
+                    .is_some_and(|i| text[i..].contains(key))
+            }
+        })
+    };
+    let pending = |why: String, from: i64, bad: &[String]| match lost_after(seen, from, t0) {
+        Some(lost) => Verdict::Fail(format!("{why}: {lost}{}", tail_of(bad))),
+        None if bad.is_empty() => Verdict::Unobserved(why),
+        None => Verdict::Fail(format!("{why}{}", tail_of(bad))),
+    };
+    let Some(old) = quoting(first.0, OPEN_KEY) else {
+        return pending("no nudge quoted the check's list".into(), first.0, &bad);
+    };
+    let worked = seen
+        .journal
+        .iter()
+        .find(|(t, l)| *t > old.0 && idle_words(l).is_some_and(|w| w.contains(REWORD_WORK_KEY)));
+    let checks = checks_after(seen, *t1);
+    let Some(second) = checks.get(1).copied() else {
+        return pending(
+            format!(
+                "the list quoted at +{}, but no second check typed",
+                at(t0, old.0)
+            ),
+            old.0,
+            &bad,
+        );
+    };
+    match worked {
+        None => bad.push(format!(
+            "a second check at +{} with no work read before it",
+            at(t0, second.0)
+        )),
+        Some((tw, _)) if second.0 < *tw => bad.push(format!(
+            "a second check at +{} before the work read at +{}",
+            at(t0, second.0),
+            at(t0, *tw)
+        )),
+        Some(_) => {}
+    }
+    if checks.len() > 2 {
+        bad.push(format!("{} land checks typed, not two", checks.len()));
+    }
+    if let Some(stale) = quoting(second.0, OPEN_KEY) {
+        bad.push(format!(
+            "the nudge at +{} quotes the old words after the second check",
+            at(t0, stale.0)
+        ));
+    }
+    let Some((answer, _)) = seen
+        .journal
+        .iter()
+        .find(|(t, l)| *t > second.0 && idle_words(l).is_some_and(|w| w.contains(REWORDED_KEY)))
+    else {
+        return pending(
+            format!(
+                "the second check at +{}, but no answer rewording the list read",
+                at(t0, second.0)
+            ),
+            second.0,
+            &bad,
+        );
+    };
+    // The next nudge waits out its back-off, often past the watch: where one was typed it quotes
+    // the new words.
+    let next = nudges.iter().copied().find(|n| n.0 > second.0);
+    let new = match (next, quoting(second.0, REWORDED_KEY)) {
+        (Some(n), Some(q)) if q.0 == n.0 => format!(", the new words quoted at +{}", at(t0, n.0)),
+        (Some(n), _) => {
+            bad.push(format!(
+                "the nudge at +{} after the second check quotes no new words",
+                at(t0, n.0)
+            ));
+            String::new()
+        }
+        (None, _) => ", no nudge due yet".to_string(),
+    };
+    let said = format!(
+        "land-check@v1 at +{}, the list quoted at +{}, the work read{}, the second check at +{}, \
+         answered with the list reworded at +{}{new}",
+        at(t0, first.0),
+        at(t0, old.0),
+        worked.map_or_else(String::new, |(t, _)| format!(" at +{}", at(t0, *t))),
+        at(t0, second.0),
+        at(t0, *answer)
+    );
+    if bad.is_empty() {
+        Verdict::Pass(said)
+    } else {
+        Verdict::Fail(format!("{said}: {}", bad.join("; ")))
+    }
+}
+
+/// EVERY LANDING UNDER LAND COMES THROUGH THE CHECK, and no check meets a dirty repository: a
+/// chain over a repository holding work types none; a chain of any other repository that landed
+/// (one the check reads clean, [`Repo::reads_clean`]) typed one before its landing. `v` stands
+/// where both hold.
+fn through_check(chain: Chain, seen: &Seen, t0: i64, v: Verdict) -> Verdict {
+    if chain.autopilot() != "land" {
+        return v;
+    }
+    let checks = seen.acts(turn_end::RULE_LAND_CHECK);
+    let fault = if chain == Chain::LandContradicted {
+        contradicted_check_fault(seen, &checks, t0)
+    } else if chain.repo().reads_clean() {
+        seen.journal
+            .iter()
+            .find(|(_, l)| {
+                l.starts_with("DONE ") && l.contains(&format!("rule={}", turn_end::RULE_LAND))
+            })
+            .filter(|(d, _)| !checks.iter().any(|(t, _)| t < d))
+            .map(|(d, _)| {
+                format!(
+                    "landed at +{} with no land check typed before it",
+                    at(t0, *d)
+                )
+            })
+    } else {
+        checks.first().map(|(t, l)| {
+            format!(
+                "a land check typed over a repository holding work at +{}: {}",
+                at(t0, *t),
+                crate::util::one_line(l, 100)
+            )
+        })
+    };
+    match (fault, v) {
+        (None, v) => v,
+        (Some(f), Verdict::Fail(why)) => Verdict::Fail(format!("{why}; {f}")),
+        (Some(f), Verdict::Pass(why) | Verdict::Unobserved(why)) => {
+            Verdict::Fail(format!("{why}; {f}"))
+        }
+    }
+}
+
+/// LAND-CONTRADICTED'S CHECKS (slice 4c): its repository holds work until the lab lands it after
+/// the contradiction ([`Seen::landed_ms`]), so a land check before then is one typed over work,
+/// and its landing comes through a check typed after it.
+fn contradicted_check_fault(seen: &Seen, checks: &[&(i64, String)], t0: i64) -> Option<String> {
+    let landed = seen.landed_ms.unwrap_or(i64::MAX);
+    if let Some((t, l)) = checks.iter().find(|(t, _)| *t < landed) {
+        return Some(format!(
+            "a land check typed over a repository holding work at +{}: {}",
+            at(t0, *t),
+            crate::util::one_line(l, 100)
+        ));
+    }
+    seen.journal
+        .iter()
+        .find(|(_, l)| {
+            l.starts_with("DONE ") && l.contains(&format!("rule={}", turn_end::RULE_LAND))
+        })
+        .filter(|(d, _)| !checks.iter().any(|(t, _)| *t > landed && t < d))
+        .map(|(d, _)| {
+            format!(
+                "landed at +{} with no land check typed after the work was landed",
+                at(t0, *d)
+            )
+        })
+}
+
+/// LX (land-contradicted, slice 4c): Land's first nudge after the false defense is its
+/// contradiction, typed under `land-nudge@v1`, leading with git's fact about `wip-notes.txt`
+/// ([`Want::repo`]); it is the one act at that point, and once the lab has landed the file
+/// ([`land_contradicted_work`]) the defense of the landed work gets the check and `LANDED`
+/// lands it (status `task=landed`), no need raised and no second contradiction.
+fn judge_contradicted<'a>(
+    seen: &'a Seen,
+    land: Option<&(i64, String)>,
+    nudge_after: &dyn Fn(i64) -> Option<&'a (i64, String)>,
+    t0: i64,
+) -> Verdict {
+    let Some((t1, _)) = land else {
+        return Verdict::Unobserved(
+            "no land instruction was typed, so no defense answered one".into(),
+        );
+    };
+    let Some(nudge) = nudge_after(*t1) else {
+        return match lost_after(seen, *t1, t0) {
+            Some(lost) => Verdict::Fail(format!("no land-nudge@v1 after the defense: {lost}")),
+            None => Verdict::Unobserved(format!(
+                "no land-nudge@v1 after the defense within {}",
+                at(t0, seen.end_ms)
+            )),
+        };
+    };
+    let text = seen.act_text(turn_end::RULE_LAND_NUDGE, nudge);
+    let said = match nudge_words(text, &Want::repo(Repo::Untracked)) {
+        Ok(suffix) => format!(
+            "land-nudge@v1 typed at +{} leading with the contradiction: \"{}\"",
+            at(t0, nudge.0),
+            crate::util::one_line(suffix, 200)
+        ),
+        Err(why) => {
+            return Verdict::Fail(format!("the nudge at +{} {why}", at(t0, nudge.0)));
+        }
+    };
+    let mut bad = Vec::new();
+    if let Some((t, l)) = seen
+        .all_acts()
+        .into_iter()
+        .find(|(t, _)| *t > *t1 && *t < nudge.0)
+    {
+        bad.push(format!(
+            "an act at +{} before the contradiction: {}",
+            at(t0, *t),
+            crate::util::one_line(l, 100)
+        ));
+    }
+    let Some(landed) = seen.landed_ms.filter(|l| *l >= nudge.0) else {
+        return Verdict::Fail(format!(
+            "{said}; the lab did not land wip-notes.txt after it{}",
+            tail_of(&bad)
+        ));
+    };
+    let Some((d, dl)) = seen
+        .first_after("DONE ", landed)
+        .filter(|(_, l)| l.contains(&format!("rule={}", turn_end::RULE_LAND)))
+    else {
+        let why = format!(
+            "{said}; wip-notes.txt landed at +{}, but no landing within {}",
+            at(t0, landed),
+            at(t0, seen.end_ms)
+        );
+        return match lost_after(seen, landed, t0) {
+            Some(lost) => Verdict::Fail(format!("{why}: {lost}{}", tail_of(&bad))),
+            None if bad.is_empty() => Verdict::Unobserved(why),
+            None => Verdict::Fail(format!("{why}{}", tail_of(&bad))),
+        };
+    };
+    let nudges = seen
+        .acts(turn_end::RULE_LAND_NUDGE)
+        .into_iter()
+        .filter(|(t, _)| *t > *t1 && t < d)
+        .count();
+    if nudges != 1 {
+        bad.push(format!("{nudges} nudges typed before the landing, not one"));
+    }
+    if let Some(n) = seen.needs_seen() {
+        bad.push(format!("a need was raised, though no reply named one: {n}"));
+    }
+    if !seen.status_said("task", "landed", *d - 5000) {
+        bad.push("status never said task=landed".into());
+    }
+    let why = format!(
+        "{said}; wip-notes.txt landed by the lab at +{}; {}",
+        at(t0, landed),
+        crate::util::one_line(dl, 120)
+    );
+    if bad.is_empty() {
+        Verdict::Pass(why)
+    } else {
+        Verdict::Fail(format!("{why}: {}", bad.join("; ")))
+    }
+}
+
+/// LY (land-contradicted-list, slice 4c's Open leg): the defense, said after real work, gets the
+/// one hinted check, answered with the agent's list, and Land's nudge quotes that list
+/// ([`judge_listed`]); the audited defense said again with no work gets Land's contradiction,
+/// leading with the list quoted ([`Want::listed_contradicted`]), the next act after that nudge;
+/// the same defense after it is held, nothing typed after the contradiction (the hold's words are
+/// [`surfaces::held`]'s), never landed and no need raised.
+fn judge_contradicted_list<'a>(
+    seen: &'a Seen,
+    land: Option<&(i64, String)>,
+    nudge_after: &dyn Fn(i64) -> Option<&'a (i64, String)>,
+    done: Option<&(i64, String)>,
+    t0: i64,
+) -> Verdict {
+    let first = judge_listed(
+        seen,
+        land,
+        nudge_after,
+        done,
+        (Some(OPEN_KEY), &Want::listed(&[OPEN_KEY])),
+        t0,
+    );
+    let Verdict::Pass(listed) = first else {
+        return first;
+    };
+    let quoted = land
+        .and_then(|(t1, _)| checks_after(seen, *t1).first().copied())
+        .and_then(|(tc, _)| nudge_after(*tc));
+    let Some(quoted) = quoted else {
+        return Verdict::Fail(format!("{listed}; but no nudge after the check read"));
+    };
+    let Some(contra) = nudge_after(quoted.0) else {
+        if let Yield {
+            held: Some((th, hl)),
+            ..
+        } = seen.yield_after(quoted.0, None, None)
+        {
+            return Verdict::Fail(format!(
+                "{listed}; but the defense said again was held at +{}, not contradicted: {}",
+                at(t0, *th),
+                crate::util::one_line(hl, 100)
+            ));
+        }
+        return match lost_after(seen, quoted.0, t0) {
             Some(lost) => Verdict::Fail(format!(
-                "not landed, need raised, but the carry-on never typed: {lost}: {said}"
+                "{listed}; no land-nudge@v1 after the nudge quoting the list: {lost}"
             )),
             None => Verdict::Unobserved(format!(
-                "not landed, need raised, but the carry-on not observed within {}: {said}",
+                "{listed}; no land-nudge@v1 after the nudge quoting the list within {}",
+                at(t0, seen.end_ms)
+            )),
+        };
+    };
+    let text = seen.act_text(turn_end::RULE_LAND_NUDGE, contra);
+    let said = match nudge_words(text, &Want::listed_contradicted(&[OPEN_KEY])) {
+        Ok(suffix) => format!(
+            "{listed}; then land-nudge@v1 at +{} leading with the contradiction: \"{}\"",
+            at(t0, contra.0),
+            crate::util::one_line(suffix, 200)
+        ),
+        Err(why) => {
+            return Verdict::Fail(format!(
+                "{listed}; but the nudge at +{} {why}",
+                at(t0, contra.0)
+            ));
+        }
+    };
+    let mut bad = Vec::new();
+    for (t, l) in seen
+        .all_acts()
+        .into_iter()
+        .filter(|(t, _)| *t > quoted.0 && *t != contra.0)
+    {
+        bad.push(format!(
+            "an act at +{} {} the contradiction: {}",
+            at(t0, *t),
+            if *t < contra.0 { "before" } else { "after" },
+            crate::util::one_line(l, 100)
+        ));
+    }
+    if let Some(n) = seen.needs_seen() {
+        bad.push(format!("a need was raised, though no reply named one: {n}"));
+    }
+    match seen.yield_after(contra.0, None, None) {
+        Yield {
+            event: Some(_),
+            held: Some((th, hl)),
+            ..
+        } if bad.is_empty() => Verdict::Pass(format!(
+            "{said}; +{} HELD {}",
+            at(t0, *th),
+            crate::util::one_line(hl, 100)
+        )),
+        Yield {
+            held: None,
+            waiting: Some((tw, wl)),
+            ..
+        } if bad.is_empty() => Verdict::Fail(format!(
+            "{said}; not held after it: +{} {}",
+            at(t0, *tw),
+            crate::util::one_line(wl, 100)
+        )),
+        Yield { held: None, .. } if bad.is_empty() => match lost_after(seen, contra.0, t0) {
+            Some(lost) => Verdict::Fail(format!("{said}; not held after it: {lost}")),
+            None => Verdict::Unobserved(format!(
+                "{said}; no hold read after it within {}",
                 at(t0, seen.end_ms)
             )),
         },
+        _ => Verdict::Fail(format!("{said}: {}", bad.join("; "))),
     }
 }
 
@@ -3357,33 +4841,34 @@ fn judge_cruise_goes_on(seen: &Seen, done: Option<&(i64, String)>, t0: i64) -> V
     }
 }
 
-/// How long the loop waits after a continuation at a usage wall that met the wall again, at the
-/// least (`TurnEndTiming::limit_backoff`'s first rung): its next is due at that or the reset and
-/// its grace, whichever is later.
-#[must_use]
-pub fn limit_retry_ms() -> i64 {
-    turn_end::TurnEndTiming::default()
-        .limit_backoff
-        .first()
-        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-}
-
 pub(crate) fn take_window_ms() -> i64 {
     i64::try_from(turn_end::TurnEndTiming::default().take_within.as_millis()).unwrap_or(i64::MAX)
 }
 
+/// Acts typed with no point judged between them: no `WAITING` (but a worker's take), `DONE` or
+/// `LEFT` line, and no new point read (`EVENT idle` with words, its seq not the act before's).
+/// An act typed at once has only its point to show: THE LAND CHECK, one step of the landing
+/// typed at its defense's point with no back-off (`land-check@v1`, §14.17 item 5), and an act
+/// after a turn of real work, which no back-off paces.
 fn doubled_acts(seen: &Seen, t0: i64) -> Vec<String> {
     let acts = seen.all_acts();
     acts.windows(2)
         .filter(|w| {
             let (a, b) = (w[0].0, w[1].0);
-            !seen.journal.iter().any(|(t, l)| {
+            let judged = seen.journal.iter().any(|(t, l)| {
                 *t > a
                     && *t < b
                     && ((l.starts_with("WAITING ") && !l.contains(" the worker to take the "))
                         || l.starts_with("DONE ")
                         || l.starts_with("LEFT "))
-            })
+            });
+            let new_point = seen.journal.iter().any(|(t, l)| {
+                *t > a
+                    && *t <= b
+                    && idle_words(l).is_some_and(|said| !said.is_empty() && said != "-")
+                    && word(l, "seq") != word(&w[0].1, "seq")
+            });
+            !(judged || new_point)
         })
         .map(|w| {
             format!(
@@ -3609,10 +5094,6 @@ fn lost_after(seen: &Seen, t: i64, t0: i64) -> Option<String> {
 
 fn p3_faults(seen: &Seen, t0: i64, first_works: bool) -> Vec<String> {
     let from = seen.cover.person_ms.unwrap_or(t0);
-    let streak = |r: &Row| -> Option<u32> {
-        let (_, n) = r.reason.split_once("short turns in a row: ")?;
-        n.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
-    };
     let mut out: Vec<String> = seen
         .ledger
         .iter()
@@ -3642,11 +5123,11 @@ fn p3_faults(seen: &Seen, t0: i64, first_works: bool) -> Vec<String> {
             .iter()
             .any(|(t, l)| (t - first.ts).abs() <= AT_DONE_MS && outage::is_wait(l));
         let want = u32::from(!left && !first_works);
-        if !outage && streak(first) != Some(want) {
+        if !outage && point_streak(first) != Some(want) {
             out.push(format!(
                 "the first point at +{} closed {} short turn(s), not {want} (P3: the ladder starts a step late): {}",
                 at(t0, first.ts),
-                streak(first).map_or_else(|| "?".to_string(), |n| n.to_string()),
+                point_streak(first).map_or_else(|| "?".to_string(), |n| n.to_string()),
                 crate::util::one_line(&first.reason, 90)
             ));
         }
@@ -3761,9 +5242,13 @@ fn judge_instant_land(
         .into_iter()
         .filter(|(t, _)| *t < done.0)
         .collect();
-    if before.len() != 1 {
+    // land@v1 at its due, and the land check its clean defense gets at once (§14.17 item 5).
+    let checked = before.len() == 2
+        && act_rule(&before[1].1) == Some(turn_end::RULE_LAND_CHECK)
+        && before[1].0 > *t1;
+    if before.len() != 1 && !checked {
         bad.push(format!(
-            "{} acts before the landing (one land@v1 is its due): {}",
+            "{} acts before the landing (one land@v1 is its due, then its defense's land check): {}",
             before.len(),
             before
                 .iter()
@@ -4183,6 +5668,13 @@ pub fn lay_repo_at(
         std::fs::write(dir.join(name), text).map_err(|e| format!("{name}: {e}"))
     };
     let g = |args: &[&str]| git(&home, dir, args);
+    if repo == Repo::Plain {
+        put(
+            "README.md",
+            &format!("# {token}\n\nThe forever lab's scratch folder, no repository.\n"),
+        )?;
+        return std::fs::canonicalize(dir).map_err(|e| format!("{}: {e}", dir.display()));
+    }
     git(&home, bare, &["init", "-q", "--bare", "-b", "main"])?;
     g(&["init", "-q", "-b", "main"])?;
     put(
@@ -4212,6 +5704,8 @@ pub fn lay_repo_at(
             }
         }
         Repo::Others => angles::lay_others(&home, dir)?,
+        Repo::NoRemote => g(&["remote", "remove", "origin"])?,
+        Repo::Plain => {}
     }
     std::fs::canonicalize(dir).map_err(|e| format!("{}: {e}", dir.display()))
 }
@@ -4267,6 +5761,20 @@ pub(crate) fn launcher(
     dirs: &[PathBuf],
     walled: bool,
 ) -> Result<PathBuf, Fail> {
+    launcher_with(run, h, dirs, (walled, false), (Vec::new(), Vec::new()))
+}
+
+/// [`launcher`] with `envs` in the agent's environment and `args` on its line after the lab's own
+/// (W10's and W11's usage tap, [`tap::tap_args`]; a system message's chains' own retries cut
+/// short, [`sysmsg::vendor_retries`]); Claude Code on a stored login of the lab's where `stored`
+/// ([`sysmsg::login::lay_stored`]).
+fn launcher_with(
+    run: &Run,
+    h: Harness,
+    dirs: &[PathBuf],
+    (walled, stored): (bool, bool),
+    (envs, args): (Vec<String>, Vec<String>),
+) -> Result<PathBuf, Fail> {
     let put = |p: &Path, mode: u32, text: &str| {
         crate::sys::put(p, mode, &crate::sys::PutSrc::Bytes(text.as_bytes()))
             .map_err(|e| could_not(&format!("{}: {e}", p.display())))
@@ -4278,8 +5786,14 @@ pub(crate) fn launcher(
             if walled {
                 crate::verbs::settings_merge(run, &J::obj([("apiKeyHelper", J::Null)]))?;
             }
+            if stored {
+                sysmsg::login::lay_stored(run)?;
+            }
             let l = crate::lab::Launch {
                 subscriber: walled,
+                stub_route_alone: stored,
+                envs,
+                args,
                 ..crate::lab::Launch::default()
             };
             crate::lab::launcher(run, &l)
@@ -4292,9 +5806,13 @@ pub(crate) fn launcher(
                 0o600,
                 &crate::agy::agy_settings_with(&agy_trusted(dirs), &[]),
             )?;
-            crate::agy::launcher(run, &[], &[])
+            crate::agy::launcher(run, &envs, &args)
         }
-        Harness::Muse => crate::muse::launcher(run, &[], &["--trust-workspace".to_string()]),
+        Harness::Muse => {
+            let mut args = args;
+            args.push("--trust-workspace".to_string());
+            crate::muse::launcher(run, &envs, &args)
+        }
     };
     put(&script, 0o755, &text)?;
     Ok(script)
@@ -4374,6 +5892,8 @@ struct Tab {
     t0: i64,
     ask_tried: bool,
     over: bool,
+    /// The chain's need gate was opened ([`Chain::need_gate`], [`open_need_gate`]).
+    gate_opened: bool,
 }
 
 pub(crate) fn on(door: &Door<'_>, sid: &str, args: &[&str]) -> String {
@@ -4540,36 +6060,167 @@ pub(crate) fn empty_composer(
     )?)
 }
 
+/// What `status` says of a tab's input: `input=` and `input_bytes=` (each `-` where the host does
+/// not say).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Input {
+    /// `input=`: `clear`, `pending`, `typeahead`, `stalled`, `stopped`, or `-`.
+    pub(crate) word: String,
+    /// `input_bytes=`.
+    pub(crate) bytes: String,
+    /// `input_wait_ms=`.
+    pub(crate) wait_ms: String,
+}
+
+impl Input {
+    /// The input `status` reply `stdout` names.
+    pub(crate) fn of(stdout: &str) -> Self {
+        let f = |key: &str| word(stdout, key).unwrap_or_else(|| "-".to_string());
+        Self {
+            word: f("input"),
+            bytes: f("input_bytes"),
+            wait_ms: f("input_wait_ms"),
+        }
+    }
+
+    /// Whether the program has input it has not read: anything but `clear`, or `-` where the host
+    /// does not measure it.
+    pub(crate) fn unread(&self) -> bool {
+        !matches!(self.word.as_str(), "clear" | "-")
+    }
+
+    /// `input=<w> input_bytes=<n> input_wait_ms=<ms>`.
+    pub(crate) fn said(&self) -> String {
+        format!(
+            "input={} input_bytes={} input_wait_ms={}",
+            self.word, self.bytes, self.wait_ms
+        )
+    }
+}
+
+/// How a tab's program came to have finished starting ([`started_composer`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Started {
+    /// How the wait ended: [`ComposerWait::Ready`] once it had.
+    pub(crate) wait: ComposerWait,
+    /// How long it took (ms).
+    pub(crate) ms: i64,
+    /// The last `status` read that found its input unread, where one did.
+    pub(crate) held: Option<Input>,
+    /// The last `status` read's input.
+    pub(crate) last: Input,
+}
+
+/// What one look at a starting tab's program stands at: its composer row as [`crate::screen`]
+/// reads it (`None`: none drawn), an editor's status row in its place, and its input. A composer
+/// drawn empty over input the program has not read is still starting: the lab's first prompt
+/// would wait behind that input, and the chain's clock with it.
+fn start_stand(composer: Option<String>, editor: Option<String>, input: &Input) -> Stand {
+    match composer {
+        Some(row) if row.is_empty() && input.unread() => Stand::Starting,
+        Some(row) => Stand::Composer(row),
+        None => editor.map_or(Stand::Starting, Stand::Editor),
+    }
+}
+
+/// THE LAB PROMPTS A PROGRAM ONLY ONCE IT HAS FINISHED STARTING (v6 §14.10.1, slice at1): its empty
+/// composer drawn and `status input=clear`, every byte written to it read. Claude Code 2.1.316,
+/// started beside more of itself, left even its terminal's replies unread 12 to 102 s while its
+/// composer stood drawn (rv1-l2), and so the lab's first prompt and Land's first act behind it. A
+/// hang detector over the screen and the input together ([`composer_wait`], [`COMPOSER_HANG`]): a
+/// minute in which the program neither drew nor read anything ends it.
+///
+/// # Errors
+/// The run was interrupted.
+pub(crate) fn started_composer(door: &Door<'_>, sid: &str, agent: &str) -> Result<Started, Fail> {
+    let from = now_ms();
+    let mut held: Option<Input> = None;
+    let mut last = Input::default();
+    let wait = composer_wait(
+        || {
+            let text = on(door, sid, &["text"]);
+            let input = Input::of(&on(door, sid, &["status"]));
+            if input.unread() {
+                held = Some(input.clone());
+            }
+            last.clone_from(&input);
+            let stand = start_stand(
+                crate::screen::composer_row(agent, &text),
+                crate::screen::editor_row(&text),
+                &input,
+            );
+            ((text, input.word, input.bytes), stand)
+        },
+        COMPOSER_HANG,
+        Instant::now(),
+        || {
+            stop::sleep(Duration::from_millis(100))?;
+            Ok(Instant::now())
+        },
+    )?;
+    Ok(Started {
+        wait,
+        ms: now_ms() - from,
+        held,
+        last,
+    })
+}
+
+/// Why a tab's start failed ([`started_composer`]; `None`: it did not), for `agent`: a hang over
+/// input the program left unread says so.
+pub(crate) fn start_failed(s: &Started, agent: &str) -> Option<String> {
+    match &s.wait {
+        ComposerWait::Hung if s.last.unread() => Some(format!(
+            "{agent} drew and read nothing for {} s while it started, its input unread ({})",
+            COMPOSER_HANG.as_secs(),
+            s.last.said()
+        )),
+        w => w.why(agent),
+    }
+}
+
+/// [`Started`] for the run's report: how long the start took, and the input it left unread.
+pub(crate) fn started_line(s: &Started) -> String {
+    format!(
+        "{}{}",
+        crate::restore::since(0, s.ms),
+        s.held.as_ref().map_or_else(
+            || ", its input read at every look".to_string(),
+            |i| format!(", its input unread meanwhile (last: {})", i.said())
+        )
+    )
+}
+
 pub(crate) fn tab_turn(door: &Door<'_>, sid: &str, agent: &str, text: &str) -> Result<bool, Fail> {
     let at = format!("@{sid}");
     if door.ctl(&[&at, "send", text])?.code != 0 {
         return Ok(false);
     }
-    stop::sleep(Duration::from_millis(300))?;
     let standing = |door: &Door<'_>| at_composer(door, sid, agent).as_deref() == Some(text);
-    let mut stood = false;
-    for _ in 0..40 {
-        if standing(door) {
-            stood = true;
-            break;
-        }
-        stop::sleep(Duration::from_millis(250))?;
-    }
-    if !stood {
+    // A HANG DETECTOR, not a latency budget: Claude Code 2.1.316 can leave a fresh tab's input
+    // unread for more than 10 s while it starts (`status input=pending`), and the draft stands
+    // once it reads it.
+    if !crate::wait_until(DRAFT_HANG, || standing(door)) {
         return Ok(false);
     }
-    for _ in 0..2 {
+    // Enter once, and again if the draft still stands 5 s on; then A HANG DETECTOR, not a
+    // latency budget: Claude Code 2.1.316, starting beside fifteen more tabs, left a drafted
+    // first prompt standing for more than 10 s past both Enters (slice 9c's labs), and takes it
+    // once it reads its input. A second Enter the program reads late lands on an empty composer.
+    for press in 0..2 {
         if door.ctl(&[&at, "key", "enter"])?.code != 0 {
             return Ok(false);
         }
-        for _ in 0..20 {
-            stop::sleep(Duration::from_millis(250))?;
-            if !standing(door) {
-                return Ok(true);
+        if press == 0 {
+            for _ in 0..20 {
+                stop::sleep(Duration::from_millis(250))?;
+                if !standing(door) {
+                    return Ok(true);
+                }
             }
         }
     }
-    Ok(false)
+    Ok(crate::wait_until(DRAFT_HANG, || !standing(door)))
 }
 
 fn person_turn(
@@ -4653,19 +6304,15 @@ fn person_keys(
     let press = |key: &str, keyed: &mut Keyed| -> Result<(), Fail> {
         let r = door.ctl(&["hwkey", key])?;
         let said = r.stdout.trim();
-        match word(said, "posted").and_then(|n| n.parse::<u64>().ok()) {
-            Some(n) if r.code == 0 && said.starts_with("OK ") => {
-                keyed.posted += n;
-                if word(said, "key").as_deref() == Some("1") {
-                    keyed.key_window += n;
-                }
-                Ok(())
-            }
-            _ => Err(could_not(&format!(
-                "hwkey {key}: {said}{}: the person's keys need a windowed lab (forever --window)",
+        if !active_key_posted(&r) {
+            return Err(could_not(&format!(
+                "hwkey {key}: {said}{}: one key must be posted to the active key window; delivery was not measured",
                 r.stderr.trim()
-            ))),
+            )));
         }
+        keyed.posted += 1;
+        keyed.key_window += 1;
+        Ok(())
     };
     let first = now_ms();
     for c in text.chars() {
@@ -4687,6 +6334,7 @@ fn person_keys(
         );
         return Ok(None);
     }
+    keyed.draft_stood = true;
     println!(
         "  keys      @{sid}: {} character(s) pressed through hwkey in {}; the draft stood {} after the last",
         keyed.posted,
@@ -4694,20 +6342,30 @@ fn person_keys(
         at(last, now_ms())
     );
     stop::sleep(Duration::from_millis(PERSON_STAND_MS))?;
-    for _ in 0..2 {
-        let pressed = now_ms();
-        press("enter", &mut keyed)?;
-        for _ in 0..20 {
-            stop::sleep(Duration::from_millis(250))?;
-            if !standing(door) {
-                let status = on(door, sid, &["status"]);
-                keyed.seq_after = seq(&status);
-                let stamp = word(&status, "human_ms").unwrap_or_else(|| "?".to_string());
-                return Ok(Some((pressed, stamp, keyed)));
-            }
-        }
+    let pressed = now_ms();
+    press("enter", &mut keyed)?;
+    if !crate::wait_until(DRAFT_HANG, || {
+        at_composer(door, sid, agent).is_some_and(|draft| draft != text)
+    }) {
+        return Ok(None);
     }
-    Ok(None)
+    keyed.draft_taken = true;
+    let status = on(door, sid, &["status"]);
+    keyed.seq_after = seq(&status);
+    if let Some(why) = cover::keys_unaccounted(&keyed) {
+        return Err(could_not(&format!("native controller delivery: {why}")));
+    }
+    let stamp = word(&status, "human_ms").unwrap_or_else(|| "?".to_string());
+    Ok(Some((pressed, stamp, keyed)))
+}
+
+/// A single native key was posted to the active app's key window, not merely queued elsewhere.
+fn active_key_posted(reply: &Reply) -> bool {
+    reply.code == 0
+        && reply
+            .stdout
+            .split_whitespace()
+            .eq(["OK", "posted=1", "key=1"])
 }
 
 /// The `hwkey` name of the key that types `c`: `space` for a space (the verb splits its words on
@@ -4835,6 +6493,7 @@ fn spawn_worker(
         t0,
         over: false,
         ask_tried: false,
+        gate_opened: false,
     };
     Ok((tab, slot))
 }
@@ -5163,7 +6822,7 @@ fn tool_results_of(run: &Run, token: &str) -> usize {
         .count()
 }
 
-fn records(run: &Run, sid: &str) -> (Vec<(i64, String)>, Vec<Row>) {
+pub(crate) fn records(run: &Run, sid: &str) -> (Vec<(i64, String)>, Vec<Row>) {
     let drive = run.state().join("drive");
     let journal = crate::util::scratch_text(&drive.join(format!("{sid}.journal.jsonl")))
         .lines()
@@ -5180,6 +6839,10 @@ fn records(run: &Run, sid: &str) -> (Vec<(i64, String)>, Vec<Row>) {
             let s = |k: &str| j.get(k).and_then(J::as_str).unwrap_or("").to_string();
             Some(Row {
                 ts: j.get("ts").and_then(J::as_i64)?,
+                box_seq: j
+                    .get("box_seq")
+                    .and_then(J::as_i64)
+                    .and_then(|seq| u64::try_from(seq).ok()),
                 rule: s("rule_id"),
                 decision: s("decision"),
                 command: s("command"),
@@ -5209,6 +6872,11 @@ fn status_words(door: &Door<'_>, sid: &str) -> Option<String> {
         "land_since",
         "held",
         "waiting",
+        "land_asked",
+        "landed_head",
+        "landed_on",
+        "landed_leg",
+        "landed_repo",
     ]
     .iter()
     .map(|k| format!("{k}={}", word(&s, k).unwrap_or_else(|| "?".into())))
@@ -5329,6 +6997,13 @@ fn went_on_witness(run: &Run, tab: &Tab) -> Option<i64> {
 /// speaks, each once.
 #[must_use]
 pub fn owner_texts(dumps: &[Vec<u8>], token: &str) -> Vec<String> {
+    texts_holding(dumps, token, OWNER_KEY)
+}
+
+/// Every user text of conversation `token`'s requests holding `key`, by the reader of whichever of
+/// the three APIs it speaks, each once.
+#[must_use]
+pub fn texts_holding(dumps: &[Vec<u8>], token: &str, key: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for body in dumps {
         if !String::from_utf8_lossy(body).contains(token) {
@@ -5339,12 +7014,20 @@ pub fn owner_texts(dumps: &[Vec<u8>], token: &str) -> Vec<String> {
             .chain(crate::stub::responses_users(body))
             .chain(crate::stub::gemini::gemini_users(body))
         {
-            if u.contains(OWNER_KEY) && !out.contains(&u) {
+            if u.contains(key) && !out.contains(&u) {
                 out.push(u);
             }
         }
     }
     out
+}
+
+/// LH's witness of the hinted check as the agent sent it ([`Cover::check_texts`]).
+fn check_witness(run: &Run, tab: &Tab) -> Option<Vec<String>> {
+    (tab.chain == Chain::LandHinted).then(|| {
+        let bodies: Vec<Vec<u8>> = dumps(run).into_iter().map(|(_, b)| b).collect();
+        texts_holding(&bodies, &tab.chain.token(), LAND_CHECK_KEY)
+    })
 }
 
 fn owner_witness(run: &Run, tab: &Tab) -> Option<Vec<String>> {
@@ -5530,12 +7213,24 @@ pub fn point_read(seen: &Seen, t0: i64) -> bool {
         .any(|(t, l)| *t > t0 && idle_words(l).is_some_and(|w| !w.is_empty() && w != "-"))
 }
 
-/// Whether the chain's first point from `t0` was read and nothing was typed yet: when the lab
-/// raises a wall or an outage for the chain's first act to meet ([`wall_step`],
-/// [`outage::outage_move`]).
+/// Whether the chain's first point from `t0` was read and nothing was typed yet: the outage's
+/// eligibility ([`outage::outage_move`]); a prearmed wall does not wait for this observation.
 #[must_use]
 pub fn first_point_unanswered(seen: &Seen, t0: i64) -> bool {
     point_read(seen, t0) && seen.all_acts().is_empty()
+}
+
+/// Whether the observer still needs the prearmed wall's admission evidence. A POINT and
+/// immediate ACT already in the same read cannot suppress that observation.
+fn awaits_first_raise(chain: Chain, seen: &Seen, _t0: i64) -> bool {
+    chain.walled() && seen.cover.wall.is_none()
+}
+
+fn armed_wall(status: &J) -> Option<(i64, i64)> {
+    let arm = status.get("limit_arm")?;
+    let raised = arm.get("raised_ms")?.as_i64()?;
+    let reset = arm.get("reset_s")?.as_i64()?;
+    (raised > 0 && reset.saturating_mul(1000) > raised).then_some((raised, reset))
 }
 
 fn wall_step(run: &Run, tab: &mut Tab, now: i64) -> Result<(), Fail> {
@@ -5544,17 +7239,22 @@ fn wall_step(run: &Run, tab: &mut Tab, now: i64) -> Result<(), Fail> {
     }
     match tab.seen.cover.wall {
         None => {
-            if !first_point_unanswered(&tab.seen, tab.t0) {
+            if !awaits_first_raise(tab.chain, &tab.seen, tab.t0) {
                 return Ok(());
             }
-            let reset = reset_s_ahead(now, tab.chain.wall_ahead_ms());
+            let answer = crate::stub::control(&run.port, "/__status")
+                .map_err(|e| could_not(&format!("the prearmed wall status: {e}")))?;
+            let status = J::parse(&answer)
+                .map_err(|e| could_not(&format!("the prearmed wall status: {e}")))?;
+            let Some((raised, reset)) = armed_wall(&status) else {
+                return Ok(());
+            };
             let claim = WALL_CLAIM;
-            let answer = crate::verbs::set_mode(run, &format!("limit:{claim}:{reset}"))?;
-            tab.seen.cover.wall = Some((now, reset));
+            tab.seen.cover.wall = Some((raised, reset));
             println!(
                 "  [{}] +{} stub    the usage wall raised: {claim}, resets at +{} ({})",
                 tab.chain.name(),
-                at(tab.t0, now),
+                at(tab.t0, raised),
                 at(tab.t0, reset * 1000),
                 crate::util::one_line(&answer, 120)
             );
@@ -6258,6 +7958,12 @@ fn look(run: &Run, door: &Door<'_>, tab: &mut Tab) {
         tab.seen.band_reads.push(now);
         put(&mut tab.seen.band, "band", band);
     }
+    if tab.chain.login()
+        && let Ok(messages) = reading(door, &["messages", "tag=harness"])
+    {
+        tab.seen.band_reads.push(now);
+        put(&mut tab.seen.band, "band", sysmsg::login::rows(&messages));
+    }
     if tab.chain == Chain::Off && tab.seen.reply_ms.is_none() {
         let text = on(door, &tab.sid, &["text"]);
         if text.contains("All done") {
@@ -6270,6 +7976,128 @@ fn look(run: &Run, door: &Door<'_>, tab: &mut Tab) {
         }
     }
     tab.seen.end_ms = now;
+}
+
+/// THE ORDER THE CHAINS ARE PROMPTED IN, as indices into `chains`: theirs, but the gated chains
+/// ([`Chain::gated`]: the need chains, land-contradicted) last. The lab's watch, which reads each
+/// need, or lands land-contradicted's file, and opens its gate, begins once every chain is
+/// prompted, and prompting a full run takes longer than the gate's hang detector
+/// (`stub::GATE_HANG`): a need raised first stood unread until its gate gave way.
+#[must_use]
+pub fn prompt_order(chains: &[Chain]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..chains.len()).collect();
+    order.sort_by_key(|&i| chains[i].gated());
+    order
+}
+
+/// WHETHER THE LAB HAS READ A NEED STANDING on every surface its need wants judge ([`Chain::need_gate`]):
+/// `status needs=ask needs_n=1` (L3), the `meta` entry (`attention_kinds` `ask:needs`, L1), and,
+/// where the windows are read (`window`), a `Needs you` row and the tab's `attention` state.
+#[must_use]
+pub fn need_read(seen: &Seen, window: bool) -> bool {
+    let status = seen.status.iter().any(|(_, s)| {
+        word(s, "needs").as_deref() == Some("ask") && word(s, "needs_n").as_deref() == Some("1")
+    });
+    let meta = seen.meta.iter().any(|(_, m)| needs_up(m));
+    let shown = !window
+        || (seen
+            .window
+            .menu
+            .iter()
+            .any(|(_, m)| !surfaces::rows_in(m, "needs").is_empty())
+            && seen
+                .window
+                .strip
+                .iter()
+                .any(|(_, s)| surfaces::states(s).contains(&"attention")));
+    status && meta && shown
+}
+
+/// OPENS `tab`'S NEED GATE once its need was read ([`need_read`]): the stub then answers the land
+/// check with `LANDED`, which lands and leaves the need standing.
+fn open_need_gate(run: &Run, tab: &mut Tab, window: bool) {
+    let Some(gate) = tab.chain.need_gate().filter(|_| !tab.gate_opened) else {
+        return;
+    };
+    if !need_read(&tab.seen, window) {
+        return;
+    }
+    let path = crate::stub::gate_path(&run.w.join("modes"), &gate);
+    match std::fs::write(&path, b"") {
+        Ok(()) => {
+            tab.gate_opened = true;
+            println!(
+                "  [{}] +{} gate    the need was read on every surface: the check's answer goes",
+                tab.chain.name(),
+                at(tab.t0, now_ms())
+            );
+        }
+        Err(e) => println!(
+            "  [{}] gate    {} not written: {e}",
+            tab.chain.name(),
+            path.display()
+        ),
+    }
+}
+
+/// THE CONTRADICTION'S TYPED ROW (slice 4c): the first `land-nudge@v1` the ledger says was typed
+/// with [`turn_end::LAND_CONTRADICTED_HEAD`] leading.
+fn contradiction_row(seen: &Seen) -> Option<&Row> {
+    seen.ledger.iter().find(|r| {
+        r.rule == turn_end::RULE_LAND_NUDGE
+            && r.decision == "typed"
+            && r.command.starts_with(turn_end::LAND_CONTRADICTED_HEAD)
+    })
+}
+
+/// LAND-CONTRADICTED'S HANDS (slice 4c): once the ledger shows Land's contradiction typed, the lab
+/// commits `wip-notes.txt` in the chain's repository and pushes it to `origin/main`, as the agent
+/// the contradiction asks would, then opens [`Chain::landed_gate`], so the stub's answer that says
+/// so goes ([`LANDED_NOTES`]). When it landed is [`Seen::landed_ms`]. A git step that fails leaves
+/// the gate shut: the stub's answer then goes at its hang detector over a repository still
+/// holding the file, and the judge fails the run on the second contradiction.
+fn land_contradicted_work(run: &Run, tab: &mut Tab) {
+    let Some(gate) = tab.chain.landed_gate().filter(|_| !tab.gate_opened) else {
+        return;
+    };
+    let Some(row) = contradiction_row(&tab.seen) else {
+        return;
+    };
+    let typed = row.ts;
+    tab.gate_opened = true;
+    let home = run.w.join("home");
+    let landed = [
+        &["add", "wip-notes.txt"][..],
+        &[
+            "commit",
+            "-q",
+            "-m",
+            "lab: the notes Land's contradiction named",
+        ],
+        &["push", "-q", "origin", "main"],
+    ]
+    .iter()
+    .try_for_each(|args| git(&home, &tab.dir, args));
+    let path = crate::stub::gate_path(&run.w.join("modes"), &gate);
+    let said = match landed
+        .and_then(|()| std::fs::write(&path, b"").map_err(|e| format!("{}: {e}", path.display())))
+    {
+        Ok(()) => {
+            let now = now_ms();
+            tab.seen.landed_ms = Some(now);
+            format!(
+                "the contradiction typed at +{}: wip-notes.txt committed and pushed to origin/main, \
+                 the answer goes",
+                at(tab.t0, typed)
+            )
+        }
+        Err(e) => format!("the contradiction's work NOT landed: {e}"),
+    };
+    println!(
+        "  [{}] +{} gate    {said}",
+        tab.chain.name(),
+        at(tab.t0, now_ms())
+    );
 }
 
 fn ask_due(s: &Seen, now: i64) -> bool {
@@ -6321,9 +8149,13 @@ fn finished(tab: &Tab, now: i64) -> bool {
     let done_since = |ms: i64| done.is_some_and(|d| now - d >= ms);
     match tab.chain {
         Chain::LandA
+        | Chain::LandN
+        | Chain::LandO
         | Chain::LandE
         | Chain::LandQ
         | Chain::LandW
+        | Chain::LandHinted
+        | Chain::LandListed
         | Chain::Worker
         | Chain::Wall
         | Chain::WallHid
@@ -6331,10 +8163,30 @@ fn finished(tab: &Tab, now: i64) -> bool {
         | Chain::SwitchWall
         | Chain::UnreadWall
         | Chain::RelaunchWall
+        | Chain::TapWall
+        | Chain::NarrowTapWall
         | Chain::LandOutage => false,
+        // land-contradicted lands (above); a build that holds it instead (main before 4c, whose
+        // nudge its script answers with the defense again) is watched past its hold.
+        Chain::LandContradicted => {
+            surfaces::held::stall_of(s, tab.t0).is_some_and(|(t, _)| now - *t >= PAST_NEXT_STEP_MS)
+        }
         Chain::CruiseWall => walls::cruise_went_on(s).is_some_and(|t| now - t >= 10_000),
         Chain::CruiseOutage => {
             outage::went_on(s).is_some_and(|t| now - t >= outage::WENT_ON_WATCH_MS)
+        }
+        Chain::SysOverload
+        | Chain::SysOutage
+        | Chain::SysRate
+        | Chain::SysDrop
+        | Chain::SysWitness
+        | Chain::SysWitnessMate
+        | Chain::SysLandOverload
+        | Chain::SysLandOutage
+        | Chain::SysLandRate
+        | Chain::SysLandDrop => sysmsg::watched(s, tab.chain.autopilot() == "land", now),
+        Chain::SysLogin | Chain::SysLandLogin => {
+            sysmsg::login::watched(s, tab.chain.autopilot() == "land", now)
         }
         Chain::Mgr => true,
         Chain::LandT => done_since(20_000),
@@ -6343,12 +8195,26 @@ fn finished(tab: &Tab, now: i64) -> bool {
         Chain::InstantLand => s.all_acts().is_empty() && now - tab.t0 > 300_000,
         Chain::LandB
         | Chain::LandC
-        | Chain::LandD
         | Chain::LandF
         | Chain::LandG
         | Chain::LandH
-        | Chain::LandI => {
+        | Chain::LandI
+        | Chain::LandSameList
+        | Chain::LandReworded => {
             (nudge.is_some() && surfaces::held::watched_past(s, now)) || done_since(20_000)
+        }
+        // land-contradicted-list's hold comes after its second nudge, the contradiction: the
+        // first's back-off is no end of its watch.
+        Chain::LandContradictedList => {
+            (s.acts(turn_end::RULE_LAND_NUDGE).len() >= 2 && surfaces::held::watched_past(s, now))
+                || done_since(20_000)
+        }
+        // L6 rests on its check's need: watched past the ladder's next step after the rest, as a
+        // landing is.
+        Chain::LandD => {
+            rest_of(s).is_some_and(|(t, _)| now - t >= quiet_after_landed_ms(s, *t, false) + 5000)
+                || (nudge.is_some() && surfaces::held::watched_past(s, now))
+                || done_since(20_000)
         }
         // same-land is watched past its person's turn, until its band is gone or a minute passed.
         Chain::SameLand => {
@@ -6474,7 +8340,7 @@ fn finished(tab: &Tab, now: i64) -> bool {
         Chain::SwitchAgent
         | Chain::SwitchSeq
         | Chain::SwitchFlip
-        | Chain::SwitchHeld
+        | Chain::SwitchOverHeld
         | Chain::SwitchBusy => switch::watched(tab.chain, s, now),
     }
 }
@@ -6493,7 +8359,7 @@ fn run_check(
     tag: &str,
     h: Harness,
     chains: &[Chain],
-    (surfaces_on, window): (bool, bool),
+    (surfaces_on, window, tapped, token_login, ready_gate): (bool, bool, bool, bool, bool),
 ) -> Result<Vec<(Scenario, Verdict)>, Fail> {
     let mut run = Run::load(tag)?;
     let (bin, ver) = h.bin_ver(&run);
@@ -6528,8 +8394,36 @@ fn run_check(
         );
         dirs.push(d);
     }
-    let walled = chains.iter().any(|c| c.walled());
-    let script = launcher(&run, h, &dirs, walled)?;
+    // An expired login's chain launches Claude Code on a claude.ai login of the lab's, so the
+    // stub's 401 is that login's ([`sysmsg::login`]): a stored one, the stub its only route
+    // ([`sysmsg::login::stored_arm`]), or with `--token-login` the environment's token.
+    let stored = sysmsg::login::stored_arm(h, chains, token_login);
+    let walled = chains.iter().any(|c| c.walled() || (c.login() && !stored));
+    let tap_wall = chains.iter().any(|c| c.tapped());
+    let extra = if tap_wall && tapped {
+        (Vec::new(), tap::tap_args(&run)?)
+    } else if chains.iter().any(|c| c.sysmsg()) {
+        sysmsg::vendor_retries(h)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let script = launcher_with(&run, h, &dirs, (walled, stored), extra)?;
+    if tap_wall {
+        crate::verbs::write_headers(
+            &run.w,
+            crate::verbs::rate_blocks(Some(&tap::on_429())).map_err(|e| could_not(&e))?,
+            true,
+        )?;
+        println!(
+            "  tap       {}; the wall's 429 carries the window's figures: {}",
+            if tapped {
+                "aterm's usage tap on Claude Code's line"
+            } else {
+                "NO tap on Claude Code's line (--untapped, the negative control)"
+            },
+            tap::on_429()
+        );
+    }
     let scroll_script = if chains.contains(&Chain::TallScroll) {
         scroll_launcher(&run, h, &dirs, walled)?
     } else {
@@ -6588,6 +8482,22 @@ fn run_check(
             dir.display(),
             launched.said,
         );
+        // THE LAUNCHES ARE STAGGERED (slice at1): the next tab's program starts only once this
+        // one's has finished starting, so no program starts beside another still starting.
+        if ready_gate {
+            let started = started_composer(&door, &sid, h.name())?;
+            if let Some(why) = start_failed(&started, h.name()) {
+                for l in tail_rows(&door, &sid, 12) {
+                    println!("    | {l}");
+                }
+                return Err(could_not(&format!("{why}, in {}", chain.name())));
+            }
+            println!(
+                "  started   {} @{sid}: {}",
+                chain.name(),
+                started_line(&started)
+            );
+        }
         tabs.push(Tab {
             chain,
             sid,
@@ -6602,6 +8512,7 @@ fn run_check(
             },
             t0: 0,
             ask_tried: false,
+            gate_opened: false,
             over: false,
         });
     }
@@ -6680,8 +8591,12 @@ fn run_check(
     if desk.is_some() {
         surfaces::opening_sweep(&door, &mut tabs, front_label.as_deref(), false);
     }
-    for tab in &mut tabs {
-        stop::sleep(Duration::from_secs(1))?;
+    let chains_now: Vec<Chain> = tabs.iter().map(|t| t.chain).collect();
+    for i in prompt_order(&chains_now) {
+        let tab = &mut tabs[i];
+        // The prompts go in a second apart, and the look below that the program is ready takes
+        // its time out of that second, not after it.
+        let spaced = Instant::now() + Duration::from_secs(1);
         let opening = tab.chain.opening();
         if opening == Opening::Person {
             let on_tab = crate::wait_until(Duration::from_secs(60), || {
@@ -6694,7 +8609,35 @@ fn run_check(
                 )));
             }
         }
+        // No clock starts and no tab is prompted over input its program has not read.
+        if ready_gate {
+            let ready = started_composer(&door, &tab.sid, h.name())?;
+            if let Some(why) = start_failed(&ready, h.name()) {
+                for l in tail_rows(&door, &tab.sid, 12) {
+                    println!("    | {l}");
+                }
+                return Err(could_not(&format!("{why}, in {}", tab.chain.name())));
+            }
+            if ready.held.is_some() {
+                println!(
+                    "  ready     {} @{}: before its prompt, {}",
+                    tab.chain.name(),
+                    tab.sid,
+                    started_line(&ready)
+                );
+            }
+        }
+        stop::sleep(spaced.saturating_duration_since(Instant::now()))?;
         tab.t0 = now_ms();
+        if tab.chain.walled() {
+            crate::verbs::set_mode(
+                &run,
+                &format!(
+                    "limit-after:1:{WALL_CLAIM}:{}:{MODE}",
+                    tab.chain.wall_ahead_ms(),
+                ),
+            )?;
+        }
         outage::step(&run, tab, tab.t0)?;
         let took = match opening {
             Opening::Prompt => tab_turn(&door, &tab.sid, h.name(), &tab.chain.prompt())?,
@@ -6736,12 +8679,15 @@ fn run_check(
             tab.chain.name(),
             tab.sid,
             tab.chain.prompt(),
-            tab.seen.cover.person_ms.map_or_else(String::new, |p| format!(
-                " as a person types it (the draft stood {} s, Enter at +{}; status human_ms={})",
-                PERSON_STAND_MS / 1000,
-                at(tab.t0, p),
-                tab.seen.cover.person_stamp.as_deref().unwrap_or("?")
-            )),
+            tab.seen
+                .cover
+                .person_ms
+                .map_or_else(String::new, |p| format!(
+                    " with a standing draft ({} s, Enter at +{}; status human_ms={})",
+                    PERSON_STAND_MS / 1000,
+                    at(tab.t0, p),
+                    tab.seen.cover.person_stamp.as_deref().unwrap_or("?")
+                )),
             tab.seen
                 .cover
                 .keyed
@@ -6804,6 +8750,8 @@ fn run_check(
                 surfaces::held::look_step(&door, tab, front_label.as_deref());
                 surfaces::stopped::ask_step(&door, tab, ask_sid.as_deref());
             }
+            open_need_gate(&run, tab, glance.is_some());
+            land_contradicted_work(&run, tab);
             if surfaces::held::person_due(tab.chain, &tab.seen, tab.t0, now) {
                 let began = now_ms();
                 let typed = person_turn(&door, &tab.sid, h.name(), surfaces::held::PERSON_TURN)?;
@@ -6860,14 +8808,22 @@ fn run_check(
             }
             wall_step(&run, tab, now)?;
             outage::step(&run, tab, now)?;
+            sysmsg::step(&run, &door, h, tab, now)?;
             hide_step(&door, h, tab, now)?;
             switch_step(&run, &door, h, tab)?;
             relaunch_step(&run, &door, h, tab)?;
+            tap::step(&run, &door, h, tab)?;
             unread_step(&run, tab, now);
             resize_step(&door, tab, now)?;
             scroll_step(&door, tab, now)?;
             first_screen_step(&door, tab);
-            switch::word_step(&door, h, tab, now)?;
+            switch::word_step(
+                &door,
+                h,
+                tab,
+                now,
+                desk.as_ref().map(|d| d.page_view.as_str()),
+            )?;
             if let Some(text) = tab.chain.orchestrated()
                 && orchestrator_due(tab.chain, &tab.seen, now)
             {
@@ -6891,6 +8847,14 @@ fn run_check(
             }
             if finished(tab, now) {
                 tab.over = true;
+                if receipt::reads_head(tab.chain) {
+                    tab.seen.head = receipt::head_of(&run.w.join("home"), &tab.dir);
+                    println!(
+                        "  [{}] repo    HEAD {}",
+                        tab.chain.name(),
+                        tab.seen.head.as_deref().unwrap_or("not read")
+                    );
+                }
                 tab.seen.stub = stub_witness(&run, tab);
                 tab.seen.lift_stub = lift_witness(&run, tab);
                 if let Some(n) = tab.seen.lift_stub {
@@ -6913,6 +8877,7 @@ fn run_check(
                         Some(angles::others_left(&run.w.join("home"), &tab.dir));
                 }
                 tab.seen.cover.owner_texts = owner_witness(&run, tab);
+                tab.seen.cover.check_texts = check_witness(&run, tab);
                 if let Some(texts) = &tab.seen.cover.owner_texts {
                     println!(
                         "  [{}] stub    the owner's words reached the agent in {} text(s), {} of them holding a line break",
@@ -6923,6 +8888,15 @@ fn run_check(
                 }
                 if tab.chain == Chain::ToolEnd {
                     tab.seen.cover.tool_results = Some(tool_results_of(&run, &tab.chain.token()));
+                }
+                if switch::at_once(tab.chain) {
+                    let typed = switch::typed_witness(&run, &tab.sid);
+                    println!(
+                        "  [{}] typed   {}",
+                        tab.chain.name(),
+                        switch::typed_line(typed.as_deref(), tab.t0)
+                    );
+                    tab.seen.cover.typed = typed;
                 }
                 if switch::switches(tab.chain) {
                     let woke = switch::woke_witness(&run, &tab.sid);
@@ -6975,6 +8949,7 @@ fn run_check(
                 );
             }
         }
+        sysmsg::mate_step(&door, h, &mut tabs, now)?;
         if tabs.iter().all(|t| t.over) {
             break;
         }
@@ -7035,7 +9010,7 @@ fn run_lab(
     mode: Mode,
     chains: &[Chain],
     keep: bool,
-    (surfaces_on, window): (bool, bool),
+    (surfaces_on, window, tapped, token_login, ready_gate): (bool, bool, bool, bool, bool),
 ) -> Result<Vec<(Scenario, Verdict)>, Fail> {
     if is_run(tag) {
         return Err(Fail::usage(format!(
@@ -7051,6 +9026,9 @@ fn run_lab(
     if chains.contains(&Chain::CruiseO) {
         u.harness_keys = format!("{}\n{}", u.harness_keys, owner_keys());
     }
+    // A stored login's process is the default route's only where the instance admits the stub's
+    // base URL ([`sysmsg::login::stored_arm`]).
+    u.route_seam |= sysmsg::login::stored_arm(h, chains, token_login);
     if let Some(w) = mode.walled()
         && let Some(why) = wall_out_of_reach(h, mode)
     {
@@ -7073,11 +9051,16 @@ fn run_lab(
     if window {
         let r = Run::load(tag).ok();
         println!(
-            "forever: lab '{tag}' OPENED A WINDOW on this desk (instance pid {}): L13's person types through hwkey, same-land's hold is read off it",
+            "forever: lab '{tag}' OPENED A WINDOW on this desk (instance pid {}): L13 checks native controller delivery through hwkey, not person takeover; same-land's hold is read off it",
             r.map_or(0, |r| r.instance_pid)
         );
     }
-    let verdicts = run_check(tag, h, chains, (surfaces_on, window));
+    let verdicts = run_check(
+        tag,
+        h,
+        chains,
+        (surfaces_on, window, tapped, token_login, ready_gate),
+    );
     if keep {
         println!("forever: lab '{tag}' left up ({LAB} down {tag})");
     } else {
@@ -7129,6 +9112,16 @@ struct Asked {
     keep: bool,
     surfaces: bool,
     window: bool,
+    /// `--untapped`: W10's and W11's live negative control, no usage tap on Claude Code's line.
+    untapped: bool,
+    /// `--token-login`: Claude Code's expired-login chains on the environment's OAuth token
+    /// (`claude --subscriber`), where nothing names the login's method, not on a stored login
+    /// ([`sysmsg::login::stored_arm`]).
+    token_login: bool,
+    /// `--no-ready-gate`: every tab launched at once and prompted with no look that its program
+    /// has finished starting, as the lab ran before slice at1, so Land writes behind input the
+    /// program has not read and the held-text path (its `NOTE`, the late draw) is exercised.
+    ungated: bool,
 }
 
 impl Asked {
@@ -7167,6 +9160,9 @@ fn parse_args(args: &[String]) -> Result<Option<Asked>, Fail> {
     let mut keep = false;
     let mut surfaces = true;
     let mut window = false;
+    let mut untapped = false;
+    let mut token_login = false;
+    let mut ungated = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -7184,7 +9180,7 @@ fn parse_args(args: &[String]) -> Result<Option<Asked>, Fail> {
                 let w = it.next().map(String::as_str);
                 mode = w.and_then(Mode::of).ok_or_else(|| {
                     usage(&format!(
-                        "--mode takes land, cruise, both, cover, cap, wall, wall-hid, wall-redraw, wall-switch, wall-unread, wall-cruise, wall-relaunch, resid, ladder, angles, switch, outage-land or outage-cruise, not {w:?}"
+                        "--mode takes land, cruise, both, cover, cap, wall, wall-hid, wall-redraw, wall-switch, wall-unread, wall-cruise, wall-relaunch, wall-tap, wall-tap-narrow, resid, ladder, angles, switch, outage-land, outage-cruise or sysmsg, not {w:?}"
                     ))
                 })?;
             }
@@ -7218,6 +9214,9 @@ fn parse_args(args: &[String]) -> Result<Option<Asked>, Fail> {
             "--keep" => keep = true,
             "--no-surfaces" => surfaces = false,
             "--window" => window = true,
+            "--untapped" => untapped = true,
+            "--token-login" => token_login = true,
+            "--no-ready-gate" => ungated = true,
             "-h" | "--help" => return Ok(None),
             s if s.starts_with('-') => return Err(usage(&format!("unknown option '{s}'"))),
             s => tag = Some(s.to_string()),
@@ -7232,7 +9231,20 @@ fn parse_args(args: &[String]) -> Result<Option<Asked>, Fail> {
         keep,
         surfaces,
         window,
+        untapped,
+        token_login,
+        ungated,
     };
+    if asked.token_login && asked.mode != Mode::Sysmsg {
+        return Err(usage(
+            "--token-login runs the expired login's chains on the environment's token: it takes --mode sysmsg",
+        ));
+    }
+    if asked.untapped && !matches!(asked.mode, Mode::WallTap | Mode::WallTapNarrow) {
+        return Err(usage(
+            "--untapped is the tapped walls' negative control: it takes --mode wall-tap or wall-tap-narrow",
+        ));
+    }
     if asked.window
         && !asked.harnesses.iter().any(|&h| {
             asked
@@ -7242,7 +9254,7 @@ fn parse_args(args: &[String]) -> Result<Option<Asked>, Fail> {
         })
     {
         return Err(usage(
-            "--window opens a window for a person's keys (hwkey) or for same-land's hold read off \
+            "--window opens a window for native controller keys (hwkey) or for same-land's hold read off \
              a real window (its chip's and its band's screen-reader nodes): the run needs land-p \
              (--mode cover, --chains land-p) or same-land (--chains same-land)",
         ));
@@ -7251,9 +9263,10 @@ fn parse_args(args: &[String]) -> Result<Option<Asked>, Fail> {
 }
 
 /// `forever --harness <claude|agy|muse|all> [--mode MODE] [--chains a,b] [--no-surfaces]
-/// [--window] [tag] [--keep]`, `MODE` one of `land`, `cruise`, `both`, `cover`, `cap`, `wall`,
-/// `wall-hid`, `wall-redraw`, `wall-switch`, `wall-unread`, `wall-cruise`, `wall-relaunch`,
-/// `resid`, `ladder`, `angles`, `switch`, `outage-land` or `outage-cruise`.
+/// [--window] [--untapped] [--token-login] [--no-ready-gate] [tag] [--keep]`, `MODE` one of `land`, `cruise`, `both`, `cover`,
+/// `cap`, `wall`, `wall-hid`, `wall-redraw`, `wall-switch`, `wall-unread`, `wall-cruise`,
+/// `wall-relaunch`, `wall-tap`, `wall-tap-narrow`, `resid`, `ladder`, `angles`, `switch`, `outage-land`,
+/// `outage-cruise` or `sysmsg` (each form's chain on a lab of its own, tagged `<tag>-<form>`).
 pub fn cmd_forever(args: &[String]) -> Res {
     let Some(a) = parse_args(args)? else {
         print!("{}", crate::USAGE);
@@ -7291,6 +9304,43 @@ pub fn cmd_forever(args: &[String]) -> Res {
             println!("forever: {} F3 is out of this lab's reach: {why}", h.name());
             lines.push((h, Scenario::F3, Verdict::Unobserved(why.to_string())));
         }
+        if a.mode == Mode::Sysmsg {
+            for form in sysmsg::Form::ALL {
+                if let Some(why) = form.out_of_reach(h) {
+                    println!(
+                        "forever: {} {} is out of this lab's reach: {why}",
+                        h.name(),
+                        form.id()
+                    );
+                    lines.push((h, Scenario::Sys(form), Verdict::Unobserved(why.to_string())));
+                }
+            }
+            for form in sysmsg::Form::LAND {
+                if let Some(why) = form.out_of_reach(h) {
+                    println!(
+                        "forever: {} {} is out of this lab's reach: {why}",
+                        h.name(),
+                        form.land_id()
+                    );
+                    lines.push((
+                        h,
+                        Scenario::SysLand(form),
+                        Verdict::Unobserved(why.to_string()),
+                    ));
+                }
+            }
+            // A note, not a verdict: no run could ever observe it, so a row of it would fail
+            // every run's exit.
+            for u in sysmsg::Unplayed::ALL {
+                println!(
+                    "forever: note: {} {} ({}) is out of this lab's reach: {}",
+                    h.name(),
+                    u.id(),
+                    u.what(),
+                    u.why()
+                );
+            }
+        }
         if chains.is_empty() && a.mode.walled().is_none() {
             println!(
                 "forever: {} runs none of the chains --chains asks of its mode",
@@ -7298,7 +9348,53 @@ pub fn cmd_forever(args: &[String]) -> Res {
             );
             continue;
         }
-        match run_lab(&tag, h, a.mode, &chains, a.keep, (a.surfaces, a.window)) {
+        // A SYSTEM MESSAGE'S CHAINS, EACH ON A LAB OF ITS OWN (`<tag>-<form>`): the stub's stand-in
+        // meets every conversation it serves.
+        if a.mode == Mode::Sysmsg {
+            for c in chains {
+                let Some(id) = c
+                    .scenarios()
+                    .first()
+                    .map(|s| s.id())
+                    .filter(|_| c != Chain::SysWitnessMate)
+                else {
+                    continue;
+                };
+                let tag = format!("{tag}-{}", id.to_ascii_lowercase());
+                if !crate::paths::valid_tag(&tag) {
+                    return Err(Fail::usage(format!(
+                        "forever: bad tag '{tag}' (letters, digits, _ and -, at most 24): name a shorter one"
+                    )));
+                }
+                // The witness lab runs its two tabs of one route together (v6 §14.17.5.4).
+                let pair = [c, Chain::SysWitnessMate];
+                let on_lab: &[Chain] = if c == Chain::SysWitness { &pair } else { &[c] };
+                match run_lab(
+                    &tag,
+                    h,
+                    a.mode,
+                    on_lab,
+                    a.keep,
+                    (a.surfaces, a.window, !a.untapped, a.token_login, !a.ungated),
+                ) {
+                    Ok(v) => lines.extend(v.into_iter().map(|(s, v)| (h, s, v))),
+                    Err(f) if f.code == 3 => {
+                        eprintln!("aterm-lab: {}", f.msg.unwrap_or_default());
+                        could_not_run = true;
+                    }
+                    Err(f) => return Err(f),
+                }
+            }
+            continue;
+        }
+        match run_lab(
+            &tag,
+            h,
+            a.mode,
+            &chains,
+            a.keep,
+            (a.surfaces, a.window, !a.untapped, a.token_login, !a.ungated),
+        ) {
             Ok(v) => lines.extend(v.into_iter().map(|(s, v)| (h, s, v))),
             Err(f) if f.code == 3 => {
                 eprintln!("aterm-lab: {}", f.msg.unwrap_or_default());
@@ -7314,7 +9410,7 @@ pub fn cmd_forever(args: &[String]) -> Res {
             h.name(),
             s.id(),
             v.word(),
-            s.what()
+            s.what_on(*h)
         );
     }
     let all_pass = lines.iter().all(|(_, _, v)| matches!(v, Verdict::Pass(_)));
@@ -7336,6 +9432,80 @@ pub mod walls;
 #[path = "forever_surfaces.rs"]
 pub mod surfaces;
 
+/// `seen`, a Land chain's records from before the land check, with the check its landing now
+/// takes (`land-check@v1`, §14.17 item 5): typed a second before the first `DONE …
+/// rule=land@v1`, at the defense's point (the last `EVENT idle` with words before it, moved
+/// earlier where it is later than that), and ledgered typed. The landing then stands on the
+/// check's answer. Records that have a check, or no landing, are left as they are.
+#[cfg(test)]
+pub(crate) fn with_land_check(mut seen: Seen) -> Seen {
+    let landing = format!("rule={}", turn_end::RULE_LAND);
+    let Some(i) = seen
+        .journal
+        .iter()
+        .position(|(_, l)| l.starts_with("DONE ") && l.contains(&landing))
+    else {
+        return seen;
+    };
+    let d = seen.journal[i].0;
+    if seen.journal[..i]
+        .iter()
+        .any(|(_, l)| act_rule(l) == Some(turn_end::RULE_LAND_CHECK))
+    {
+        return seen;
+    }
+    // The check comes a second before the landing its `LANDED` answers, past the landing's own
+    // rows ([`AT_DONE_MS`]), and after the defense's point and the act before it.
+    let after_act = seen.journal[..i]
+        .iter()
+        .rev()
+        .find(|(_, l)| act_rule(l).is_some())
+        .map_or(i64::MIN, |(t, _)| t + 1);
+    let defense = seen.journal[..i]
+        .iter()
+        .rposition(|(_, l)| idle_words(l).is_some_and(|w| !w.is_empty() && w != "-"));
+    let mut t = d - AT_DONE_MS - 500;
+    if let Some(e) = defense {
+        if seen.journal[e].0 >= t {
+            seen.journal[e].0 = (t - 1).max(after_act);
+        }
+        t = t.max(seen.journal[e].0 + 1);
+    }
+    let seq = defense
+        .and_then(|e| word(&seen.journal[e].1, "seq"))
+        .or_else(|| word(&seen.journal[i].1, "seq"))
+        .unwrap_or_else(|| "0".into());
+    seen.journal.insert(
+        i,
+        (
+            t,
+            format!(
+                "CONTINUED seq={seq} rule={} {}",
+                turn_end::RULE_LAND_CHECK,
+                turn_end::LAND_CHECK_HEAD
+            ),
+        ),
+    );
+    seen.journal.sort_by_key(|(at, _)| *at);
+    let at = seen
+        .ledger
+        .iter()
+        .position(|r| r.ts > t)
+        .unwrap_or(seen.ledger.len());
+    seen.ledger.insert(
+        at,
+        Row {
+            ts: t,
+            rule: turn_end::RULE_LAND_CHECK.into(),
+            decision: "typed".into(),
+            command: turn_end::LAND_CHECK.into(),
+            reason: "the turn-end policy (short turns in a row: 1)".into(),
+            box_seq: None,
+        },
+    );
+    seen
+}
+
 #[path = "forever_angles.rs"]
 pub mod angles;
 
@@ -7344,6 +9514,17 @@ pub mod switch;
 
 #[path = "forever_outage.rs"]
 pub mod outage;
+#[path = "forever_sysmsg.rs"]
+pub mod sysmsg;
+
+#[path = "forever_tap.rs"]
+pub mod tap;
+
+#[path = "forever_receipt.rs"]
+pub mod receipt;
+
+#[path = "forever_checked.rs"]
+pub mod checked;
 
 #[cfg(test)]
 #[path = "forever_tests.rs"]

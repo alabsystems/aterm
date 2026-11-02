@@ -42,8 +42,11 @@ pub(crate) fn verbose() -> bool {
 use aterm_render::Frame;
 
 mod device_layer;
+mod device_policy;
 mod format_plan;
 mod pipeline_table;
+
+pub use device_policy::DevicePolicy;
 
 pub use format_plan::{
     HdrPlan, HdrReconfigurePlan, hdr_live_upgrade_wants_f16, hdr_present_plan,
@@ -78,8 +81,9 @@ pub use renderer::RampsFx;
 #[cfg(not(target_arch = "wasm32"))]
 pub use renderer::WindowTarget;
 pub use renderer::{
-    DropOverlay, FetchProbe, FetchStage, FrameShape, GpuRenderer, GpuSurface, PresentCrop,
-    SurfacePresentFailure, TrayQuad, TrayScrim, UnormAblation, UnormRoute, WindowGpu,
+    DropOverlay, FetchProbe, FetchStage, FrameShape, GpuRenderer, GpuSurface, OverlayRefusal,
+    PresentCrop, SurfacePresentFailure, TrayDelta, TrayLayer, TrayQuad, TrayScrim, UnormAblation,
+    UnormRoute, WindowGpu, tray_rows_to_upload,
 };
 /// Demand-built effect pipeline identifiers and names (`renderer::EffectPipelines`).
 pub use renderer::{
@@ -102,6 +106,8 @@ pub mod web;
 pub use renderer::should_slice;
 /// Armed tray card ring slot bookkeeping (`tray_card_ring`).
 pub mod tray_card_ring;
+/// GPU tray prims: the chrome's vector prims as GPU instances (`tray_prims`).
+pub mod tray_prims;
 
 #[cfg(windows)]
 static VISUAL_SWAPCHAIN_REQUESTED: std::sync::atomic::AtomicBool =
@@ -181,6 +187,9 @@ pub fn visual_swapchain_active() -> bool {
 
 /// GPU device, queue, and adapter capabilities.
 pub struct GpuContext {
+    /// Retained by lazy arm setup and fresh-context rebuilds; never inferred from a surface.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) device_policy: DevicePolicy,
     pub adapter_name: String,
     pub backend: String,
     /// Whether the device supports sRGB views of `Rgba8Unorm` offscreen textures.
@@ -240,12 +249,22 @@ pub const fn metal_backend_selected() -> bool {
     true
 }
 
-/// Claims the process-once first-frame Metal warm for background execution.
+/// Claims the live-window first-frame Metal warm for background execution.
+/// Offscreen callers use [`begin_headless_first_frame_warm`] so neither warm lane
+/// may consult WindowServer when device enumeration cannot decide.
 #[cfg(target_os = "macos")]
 #[must_use]
 #[inline]
 pub fn begin_first_frame_warm() -> Option<FirstFrameWarm> {
     metal::warm::FIRST_FRAME.begin()
+}
+
+/// Claim an offscreen Metal warm without consulting WindowServer. Both lanes use the
+/// same listed device; an absent or ambiguous listing makes the warm return an error.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn begin_headless_first_frame_warm() -> Option<FirstFrameWarm> {
+    metal::warm::HEADLESS_FIRST_FRAME.begin_with_policy(DevicePolicy::Headless)
 }
 
 /// Whether [`begin_first_frame_warm`] has been claimed in this process.
@@ -257,13 +276,51 @@ pub fn first_frame_warm_began() -> bool {
 }
 
 impl GpuContext {
+    /// This context's retained device-selection authority.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[must_use]
+    pub const fn device_policy(&self) -> DevicePolicy {
+        self.device_policy
+    }
+
+    /// Acquire the live-window device using the platform's normal selection policy.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn new() -> Result<Self, String> {
+        Self::new_with_policy(DevicePolicy::Windowed)
+    }
+
+    /// Acquire an offscreen device. On macOS only a device selected by enumeration is
+    /// admitted: this never calls `MTLCreateSystemDefaultDevice` or WindowServer. Linux
+    /// uses enumerated or surfaceless EGL, with no default native-display fallback;
+    /// Windows uses its headless D3D probe without the visual-swapchain latch. No
+    /// window surface may be attached. Canvas targets have their own constructor.
+    /// # Errors
+    /// No permitted device/display is available, or the native headless probe fails.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn new_headless() -> Result<Self, String> {
+        Self::new_with_policy(DevicePolicy::Headless)
+    }
+
+    /// [`Self::new_headless`] for an offscreen renderer.
+    /// # Errors
+    /// The same acquisition or probe failure as [`Self::new_headless`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn new_offscreen() -> Result<Self, String> {
+        Self::new_headless()
+    }
+
     /// Creates the production macOS [`GpuContext`] (Metal backend).
     #[cfg(target_os = "macos")]
-    pub fn new() -> Result<Self, String> {
-        let adapter_name = metal::ffi::Device::preferred()
+    pub(crate) fn new_with_policy(device_policy: DevicePolicy) -> Result<Self, String> {
+        let device = match device_policy {
+            DevicePolicy::Windowed => metal::ffi::Device::preferred(),
+            DevicePolicy::Headless => metal::ffi::Device::for_policy(device_policy),
+        };
+        let adapter_name = device
             .map(|d| d.name())
-            .ok_or("no Metal device on this machine")?;
+            .ok_or("no Metal device admitted by the context's selection policy")?;
         let ctx = Self {
+            device_policy,
             adapter_name,
             backend: "Metal".to_owned(),
             srgb_offscreen: true,
@@ -279,11 +336,12 @@ impl GpuContext {
 
     /// Creates the production Linux [`GpuContext`] after probing EGL and GLESv2.
     #[cfg(all(gl_arm, not(target_arch = "wasm32")))]
-    pub fn new() -> Result<Self, String> {
-        let probe = gl::device::GlDevice::headless()?;
+    pub(crate) fn new_with_policy(device_policy: DevicePolicy) -> Result<Self, String> {
+        let probe = gl::device::GlDevice::headless_with_policy(device_policy)?;
         let caps = probe.caps().clone();
         drop(probe);
         Ok(Self {
+            device_policy,
             adapter_name: caps.renderer,
             backend: "Gl".to_owned(),
             srgb_offscreen: caps.srgb_views,
@@ -297,13 +355,17 @@ impl GpuContext {
     /// Creates the production Windows [`GpuContext`] after probing a headless Direct3D 11
     /// device; `Err` (no Direct3D 11 adapter) sends the frontend to the CPU renderer.
     #[cfg(d3d11_arm)]
-    pub fn new() -> Result<Self, String> {
+    pub(crate) fn new_with_policy(device_policy: DevicePolicy) -> Result<Self, String> {
         let probe = d3d11::device::D3dDevice::headless()?;
         let adapter_name = probe.caps().adapter.clone();
         drop(probe);
-        let visual_swapchain = visual_swapchain_requested();
-        VISUAL_SWAPCHAIN_ACTIVE.store(visual_swapchain, std::sync::atomic::Ordering::Relaxed);
+        let visual_swapchain =
+            device_policy == DevicePolicy::Windowed && visual_swapchain_requested();
+        if device_policy == DevicePolicy::Windowed {
+            VISUAL_SWAPCHAIN_ACTIVE.store(visual_swapchain, std::sync::atomic::Ordering::Relaxed);
+        }
         Ok(Self {
+            device_policy,
             adapter_name,
             backend: "D3d11".to_owned(),
             // The arm runs the native plan: sRGB views of `R8G8B8A8_TYPELESS` storage.

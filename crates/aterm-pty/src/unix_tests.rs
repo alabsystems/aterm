@@ -6,6 +6,59 @@ use super::*;
 const HANG_DETECTOR: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[test]
+fn a_failed_child_chdir_never_executes_in_the_inherited_folder() {
+    let scratch = aterm_tempfile::tempdir().expect("scratch");
+    let marker = scratch.path().join("must-not-run");
+    let missing = scratch.path().join("missing");
+    // SAFETY: this test owns the child and its temporary directory.
+    let authority = unsafe { aterm_cap::Authority::root_authority() };
+    let spawn = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
+    let sandbox = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
+    let command = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "printf executed > \"$1\"".into(),
+        "sh".into(),
+        marker.as_os_str().to_owned(),
+    ];
+    let run = |cwd| {
+        spawn_shell_with_pid_cell_px(
+            24,
+            80,
+            &spawn,
+            &sandbox,
+            &[],
+            None,
+            None,
+            None,
+            Some(&command),
+            Some(cwd),
+            None,
+            aterm_sandbox::Limits::inherit(),
+            None,
+            None,
+        )
+    };
+    if let Ok(child) = run(missing.to_str().unwrap()) {
+        reap(child.pid);
+        close_fd(child.master);
+        panic!("an unavailable cwd reported a launched shell");
+    }
+    assert!(
+        !marker.exists(),
+        "the command did not run in a fallback cwd"
+    );
+    let child = run(scratch.path().to_str().unwrap()).expect("the existing cwd works");
+    reap(child.pid);
+    close_fd(child.master);
+    assert_eq!(
+        std::fs::read(&marker).unwrap(),
+        b"executed",
+        "positive exec control"
+    );
+}
+
+#[test]
 fn a_wake_pipe_is_cloexec_and_a_wake_into_a_full_one_never_blocks() {
     let (rd, wr) = make_wake_pipe().expect("wake pipe");
     // SAFETY: read-only fcntl queries on two live fds owned by this test.
@@ -1156,7 +1209,164 @@ fn an_unset_tmpdir_puts_the_status_fifo_in_tmp() {
 
 #[test]
 fn a_spawned_child_gets_its_own_ctty_our_winsize_and_no_other_descriptor() {
-    spawn_probe_checks_the_child(None);
+    spawn_probe_checks_the_child(None, ProbePass::Nothing);
+}
+
+#[test]
+fn a_passed_descriptor_lands_at_its_number_and_nothing_else_does() {
+    spawn_probe_checks_the_child(None, ProbePass::Elsewhere);
+}
+
+#[test]
+fn a_descriptor_already_at_its_number_survives_the_exec() {
+    spawn_probe_checks_the_child(None, ProbePass::InPlace);
+}
+
+/// A socket made through `aterm_uds::kept_out` still reaches the child it is passed to, and its
+/// original inheritance flags are restored once the spawn returns. Darwin kernels that support
+/// `FD_CLOFORK` retain that mark; older kernels leave it unset.
+#[test]
+fn a_passed_descriptor_kept_out_of_children_reaches_the_child_and_keeps_its_mark() {
+    spawn_probe_checks_the_child(None, ProbePass::KeptOut);
+}
+
+/// A kit whose exec-status write end sits at the number the spawn passes a descriptor at: the
+/// child moves the write end off it before the pass, so its failed exec is still told and the
+/// spawn is an `Err`, never a master for a child that did not start.
+#[test]
+fn an_exec_status_channel_at_the_passed_number_still_reports_a_failed_exec() {
+    use std::os::fd::{AsFd as _, FromRawFd as _, OwnedFd};
+    // SAFETY: the trusted-launcher contract holds in a test that mints its own caps.
+    let authority = unsafe { aterm_cap::Authority::root_authority() };
+    let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
+    let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
+    let pool: &'static std::sync::Mutex<KitPool> =
+        Box::leak(Box::new(std::sync::Mutex::new(KitPool::new())));
+    TEST_KITS.with(|kits| kits.set(Some(pool)));
+    assert_eq!(fill_kits(pool, 1).expect("a kit opens"), 1);
+    let at = pool.lock().unwrap().ready[0].status_wr;
+    let (pipe_rd, pipe_wr) = make_wake_pipe().expect("a pipe");
+    // SAFETY: both ends were just made here and nothing else owns them.
+    let (rd, wr) = unsafe { (OwnedFd::from_raw_fd(pipe_rd), OwnedFd::from_raw_fd(pipe_wr)) };
+    let bogus = vec![std::ffi::OsString::from(
+        "/nonexistent/aterm-pty-no-such-prog-xyz",
+    )];
+    let result = spawn_shell_with_pid_cell_px(
+        24,
+        80,
+        &spawn_cap,
+        &sandbox_cap,
+        &[],
+        None,
+        None,
+        None,
+        Some(&bogus),
+        None,
+        None,
+        aterm_sandbox::Limits::inherit(),
+        None,
+        Some(PassedFd { fd: rd.as_fd(), at }),
+    );
+    TEST_KITS.with(|kits| kits.set(None));
+    assert_eq!(fill_kits(pool, 0).expect("close the spent end"), 0);
+    drop((rd, wr));
+    match result {
+        Ok(sh) => {
+            hangup(sh.pid);
+            reap(sh.pid);
+            close_fd(sh.master);
+            panic!(
+                "a child whose exec failed was reported as started: the pass at {at} closed \
+                 its exec-status write end"
+            );
+        }
+        Err(err) => assert!(
+            err.kind() == io::ErrorKind::Other
+                && err
+                    .to_string()
+                    .ends_with("aterm-pty-no-such-prog-xyz` does not exist"),
+            "the failed exec is told as the exec's own failure: {err}"
+        ),
+    }
+}
+
+/// A descriptor passed at a number the spawn's own kit holds (its master, its slave, or either
+/// end of its exec-status channel) reaches the child there, read by a program that runs: the
+/// child puts the pass in place only once it has closed the kit's ends and moved the status write
+/// end off the number, still close-on-exec, so the exec is told and the spawn returns.
+#[test]
+fn a_descriptor_passed_at_a_number_its_kit_holds_reaches_the_child() {
+    let pool: &'static std::sync::Mutex<KitPool> =
+        Box::leak(Box::new(std::sync::Mutex::new(KitPool::new())));
+    TEST_KITS.with(|kits| kits.set(Some(pool)));
+    for (end, name) in ["master", "slave", "status read end", "status write end"]
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(fill_kits(pool, 1).expect("a kit opens"), 1);
+        let at = {
+            let kits = pool.lock().unwrap();
+            let kit = &kits.ready[0];
+            [kit.master, kit.slave, kit.status_rd, kit.status_wr][end]
+        };
+        eprintln!("passing at the kit's {name}, {at}");
+        spawn_probe_checks_the_child(None, ProbePass::At(at));
+        assert!(
+            pool.lock().unwrap().ready.is_empty(),
+            "the spawn took the kit"
+        );
+    }
+    assert_eq!(fill_kits(pool, 0).expect("close the spent ends"), 0);
+    TEST_KITS.with(|kits| kits.set(None));
+}
+
+/// A pass the child cannot put at its number (past every descriptor limit, where `dup2` fails)
+/// ends the child before its exec, though its program would run: the spawn is an `Err` naming
+/// the number, never a master for a program started without its descriptor.
+#[test]
+fn a_pass_the_child_cannot_put_in_place_fails_the_spawn_closed() {
+    use std::os::fd::{AsFd as _, FromRawFd as _, OwnedFd};
+    // SAFETY: the trusted-launcher contract holds in a test that mints its own caps.
+    let authority = unsafe { aterm_cap::Authority::root_authority() };
+    let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
+    let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
+    let (pipe_rd, pipe_wr) = make_wake_pipe().expect("a pipe");
+    // SAFETY: both ends were just made here and nothing else owns them.
+    let (rd, wr) = unsafe { (OwnedFd::from_raw_fd(pipe_rd), OwnedFd::from_raw_fd(pipe_wr)) };
+    let at = libc::c_int::MAX;
+    let runs: Vec<std::ffi::OsString> = vec!["/bin/sh".into(), "-c".into(), "exec sleep 30".into()];
+    let result = spawn_shell_with_pid_cell_px(
+        24,
+        80,
+        &spawn_cap,
+        &sandbox_cap,
+        &[],
+        None,
+        None,
+        None,
+        Some(&runs),
+        None,
+        None,
+        aterm_sandbox::Limits::inherit(),
+        None,
+        Some(PassedFd { fd: rd.as_fd(), at }),
+    );
+    drop((rd, wr));
+    match result {
+        Ok(sh) => {
+            hangup(sh.pid);
+            reap(sh.pid);
+            close_fd(sh.master);
+            panic!("a child that could not hold its passed descriptor at {at} was started");
+        }
+        Err(err) => assert!(
+            err.kind() == io::ErrorKind::Other
+                && err.to_string().starts_with(&format!(
+                    "the child could not hold its passed descriptor at {at} "
+                )),
+            "the failed pass is told as the pass's own failure: {err}"
+        ),
+    }
 }
 
 #[test]
@@ -1173,7 +1383,7 @@ fn a_spawn_takes_a_ready_kit_and_gives_it_its_winsize() {
         let first = &kits.ready[0];
         vec![first.master, first.slave, first.status_rd, first.status_wr]
     };
-    spawn_probe_checks_the_child(Some(&waiting));
+    spawn_probe_checks_the_child(Some(&waiting), ProbePass::Nothing);
     {
         let kits = pool.lock().unwrap();
         assert_eq!(kits.ready.len(), 1, "the spawn took one kit");
@@ -1206,14 +1416,41 @@ fn a_full_or_off_pool_hands_a_spent_end_back() {
     pool.spent.clear();
 }
 
-fn spawn_probe_checks_the_child(absent: Option<&[libc::c_int]>) {
+/// Where [`spawn_probe_checks_the_child`] passes its pipe's read end, a byte already in the pipe.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ProbePass {
+    /// Nothing is passed, so the child holds nothing at the number above the probe's own.
+    Nothing,
+    /// The read end, at a number above every descriptor the probe made.
+    Elsewhere,
+    /// The read end at the number it already has, close-on-exec in the parent.
+    InPlace,
+    /// The read end at a number the caller holds until the spawn (a ready kit's).
+    At(libc::c_int),
+    /// The read end, kept out of children, at a number above every descriptor the probe made.
+    KeptOut,
+}
+
+/// Apple's `FD_CLOFORK`, which its libc crate does not name: the mark
+/// `aterm_uds::keep_out_of_children` sets there (off Apple it sets nothing).
+const FD_CLOFORK: libc::c_int = 2;
+
+fn spawn_probe_checks_the_child(absent: Option<&[libc::c_int]>, pass: ProbePass) {
+    use std::os::fd::{BorrowedFd, IntoRawFd};
     use std::sync::atomic::Ordering;
     use std::time::Duration;
     // SAFETY: single-threaded test, trusted-launcher contract trivially holds.
     let authority = unsafe { aterm_cap::Authority::root_authority() };
     let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
     let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
-    let (pipe_rd, pipe_wr) = make_wake_pipe().expect("a pipe");
+    let (pipe_rd, pipe_wr) = if pass == ProbePass::KeptOut {
+        // Probe the production socket path; older Darwin kernels ignore FD_CLOFORK.
+        let (read, write) = aterm_uds::kept_out(std::os::unix::net::UnixStream::pair)
+            .expect("a socket pair kept out of children");
+        (read.into_raw_fd(), write.into_raw_fd())
+    } else {
+        make_wake_pipe().expect("a pipe")
+    };
     // SAFETY: `fcntl(F_DUPFD)` on a descriptor this test owns.
     let parked = unsafe { libc::fcntl(pipe_rd, libc::F_DUPFD, 100) };
     assert!(parked >= 100, "park a copy of the pipe: {parked}");
@@ -1222,7 +1459,30 @@ fn spawn_probe_checks_the_child(absent: Option<&[libc::c_int]>) {
         0,
         "PRECONDITION: fd {parked} is inheritable in the parent"
     );
+    let at = match pass {
+        ProbePass::Nothing | ProbePass::Elsewhere | ProbePass::KeptOut => {
+            pipe_rd.max(pipe_wr).max(parked) + 1
+        }
+        ProbePass::InPlace => pipe_rd,
+        ProbePass::At(at) => at,
+    };
+    let mark_before = fd_flags(pipe_rd, "the passed read end") & FD_CLOFORK;
+    if pass != ProbePass::Nothing {
+        assert_ne!(
+            fd_flags(pipe_rd, "the passed read end") & libc::FD_CLOEXEC,
+            0,
+            "PRECONDITION: fd {pipe_rd} is close-on-exec in the parent"
+        );
+        // SAFETY: one byte from a live stack local into this test's own pipe.
+        let wrote = unsafe { libc::write(pipe_wr, b"x".as_ptr().cast::<libc::c_void>(), 1) };
+        assert_eq!(wrote, 1, "the byte the child reads");
+    }
     let parked_held = aterm_spec::host::sh_held(parked);
+    let strays: Vec<libc::c_int> = [pipe_rd, pipe_wr]
+        .into_iter()
+        .filter(|&fd| fd != at)
+        .collect();
+    let strays_held = aterm_spec::host::sh_held_any(&strays);
     let others: String = absent
         .unwrap_or_default()
         .iter()
@@ -1231,15 +1491,29 @@ fn spawn_probe_checks_the_child(absent: Option<&[libc::c_int]>) {
             format!("{held} && p=\"$p+{fd}\"; ")
         })
         .collect();
+    // The probe never names its terminal: `tty` (`ttyname`) scans `/dev` and `lstat`s
+    // every node it passes, so one wedged node hangs the child before it prints (and a
+    // scan can miss a pty while other tests' come and go). `ctty=y` (the child opens
+    // `/dev/tty`) plus the parent's `(pgid, sid, tcgetpgrp(this master)) == (pid, pid,
+    // pid)` below pins the same fact a name would: the child's session has a controlling
+    // terminal, and this pty's foreground group is the child's own — only a group of the
+    // session controlling this pty can be.
     let script = format!(
         "s=n; [ -t 0 ] && [ -t 1 ] && [ -t 2 ] && s=y; \
          c=n; {{ : < /dev/tty; }} 2>/dev/null && c=y; \
          p=closed; {parked_held} && p=open; \
          {others}\
-         printf 'PROBE stdio=%s ctty=%s size=[%s] tty=[%s] parked=%s\\n' \
-           \"$s\" \"$c\" \"$(stty size)\" \"$(tty)\" \"$p\"; \
+         x=none; {strays_held} && x=held; \
+         v=$(dd if=/dev/fd/{at} bs=1 count=1 2>/dev/null); \
+         printf 'PROBE stdio=%s ctty=%s size=[%s] parked=%s strays=%s pass=[%s]\\n' \
+           \"$s\" \"$c\" \"$(stty size)\" \"$p\" \"$x\" \"$v\"; \
          exec sleep 30"
     );
+    let passed = (pass != ProbePass::Nothing).then(|| PassedFd {
+        // SAFETY: `pipe_rd` is this test's own read end, open until after the spawn returns.
+        fd: unsafe { BorrowedFd::borrow_raw(pipe_rd) },
+        at,
+    });
     let exec: Vec<std::ffi::OsString> = vec!["/bin/sh".into(), "-c".into(), script.into()];
     let racy_before = RACY_EXEC_STATUS_CARRIERS.load(Ordering::Relaxed);
     let sh = spawn_shell_with_pid_cell_px(
@@ -1256,9 +1530,18 @@ fn spawn_probe_checks_the_child(absent: Option<&[libc::c_int]>) {
         None,
         aterm_sandbox::Limits::inherit(),
         Some((9, 17)),
+        passed,
     )
     .expect("the probe command must spawn");
+    // SAFETY: a read-only identity probe of this call's live child.
+    let leader = unsafe { libc::getpgid(sh.pid) };
+    assert_eq!(
+        leader, sh.pid,
+        "{pass:?}: the spawn returns while its program runs, so nothing the child holds past \
+         its exec keeps the exec-status channel open"
+    );
     let racy_after = RACY_EXEC_STATUS_CARRIERS.load(Ordering::Relaxed);
+    let marked_after = fd_flags(pipe_rd, "the passed read end") & FD_CLOFORK;
     for fd in [parked, pipe_rd, pipe_wr] {
         close_fd(fd);
     }
@@ -1276,10 +1559,6 @@ fn spawn_probe_checks_the_child(absent: Option<&[libc::c_int]>) {
         }
     }
     let seen = String::from_utf8_lossy(&seen).into_owned();
-    let want_tty = pts_name(sh.master)
-        .expect("the master must still resolve its pts name")
-        .to_string_lossy()
-        .into_owned();
     // SAFETY: read-only identity probes on a live child pid / our master fd.
     let identity = unsafe {
         (
@@ -1328,14 +1607,29 @@ fn spawn_probe_checks_the_child(absent: Option<&[libc::c_int]>) {
         "the child holds a descriptor of a kit still in the pool. Saw: {seen:?}"
     );
     assert!(
-        seen.contains(&format!("tty=[{want_tty}]")),
-        "the child's controlling terminal must be THIS session's slave \
-         ({want_tty}). Saw: {seen:?}"
+        seen.contains("strays=none"),
+        "the child holds the pipe's ends at their own numbers. Saw: {seen:?}"
+    );
+    let want_pass = if pass == ProbePass::Nothing {
+        "pass=[]"
+    } else {
+        "pass=[x]"
+    };
+    assert!(
+        seen.contains(want_pass),
+        "{pass:?}: the child reads fd {at} as {want_pass}. Saw: {seen:?}"
+    );
+    assert_eq!(
+        marked_after, mark_before,
+        "the spawn restores the read end's original inheritance mark"
     );
     assert_eq!(
         identity,
         (sh.pid, sh.pid, sh.pid),
-        "(pgid, sid, tcgetpgrp) of a session leader in the pty's foreground"
+        "(pgid, sid, tcgetpgrp) of a session leader in the pty's foreground: with the \
+         child's `ctty=y` (it opened `/dev/tty`), this pins its controlling terminal to \
+         THIS session's slave — only a group of the session controlling this pty can be \
+         its foreground group"
     );
     assert_eq!(
         (ws.ws_row, ws.ws_col, ws.ws_xpixel, ws.ws_ypixel),
@@ -1879,6 +2173,7 @@ fn a_child_starved_before_its_exec_still_starts_and_a_failed_exec_is_told_at_onc
             None,
             aterm_sandbox::Limits::shell_default(),
             None,
+            None,
         );
         (result, began.elapsed())
     };
@@ -2049,6 +2344,7 @@ fn argv_bytes_seen(exec: &[std::ffi::OsString]) -> Vec<String> {
         None,
         aterm_sandbox::Limits::inherit(),
         None,
+        None,
     )
     .expect("the probe command must spawn");
     set_nonblocking(sh.master, true).expect("nonblocking master");
@@ -2124,6 +2420,7 @@ fn a_nul_in_an_argument_or_the_shell_refuses_the_spawn() {
             None,
             aterm_sandbox::Limits::inherit(),
             None,
+            None,
         )
     };
     let end = |sh: SpawnedShell| {
@@ -2183,6 +2480,7 @@ fn a_spawned_shell_runs_in_the_ui_tier_and_nothing_it_starts_does() {
             None,
             None,
             aterm_sandbox::Limits::inherit(),
+            None,
             None,
         )
         .expect("the spawn")
@@ -2319,4 +2617,260 @@ fn main_thread_priority(pid: i32) -> i32 {
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+}
+
+/// A master the slave wrote to answers yes at once, with no wait for the byte to arrive, and no
+/// again once the byte is read: a quiet answer means every byte the slave wrote before it was
+/// read already (Linux's `n_tty` poll flushes the pty's pending buffer work first; the macOS
+/// master's queue is written within the slave's own write). NEGATIVE CONTROL (scratch):
+/// `has_unread` asking for `POLLOUT` (a master that can be written) fails "nothing written".
+#[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn has_unread_sees_what_the_slave_wrote_at_once_and_nothing_once_it_is_read() {
+    let (master, slave) = raw_pair();
+    assert!(!has_unread(master), "nothing written");
+    for round in 0..64 {
+        type_into(slave, b"x");
+        assert!(
+            has_unread(master),
+            "the write is seen at once (round {round})"
+        );
+        assert_eq!(read_exactly(master, 1), b"x");
+        assert!(!has_unread(master), "read: nothing unread (round {round})");
+    }
+    // SAFETY: both ends are this test's and still open.
+    unsafe {
+        libc::close(slave);
+        libc::close(master);
+    }
+}
+
+/// Linux's `TIOCOUTQ` (`asm-generic/ioctls.h`, aarch64's and x86_64's alike), which the
+/// first-party `libc` does not declare: the pty code never reads it on Linux.
+#[cfg(target_os = "linux")]
+const LINUX_TIOCOUTQ: libc::c_ulong = 0x5411;
+
+/// One `c_int` count a queue `ioctl` (`LINUX_TIOCOUTQ`, `FIONREAD`) reads off this test's `fd`.
+#[cfg(target_os = "linux")]
+fn queue_count(fd: i32, request: libc::c_ulong) -> usize {
+    let mut n: libc::c_int = -1;
+    // SAFETY: `fd` is this test's live pty end and `request` writes one `c_int` into `n`.
+    let rc = unsafe { libc::ioctl(fd, request, &raw mut n) };
+    assert_eq!(rc, 0, "the queue ioctl answers");
+    usize::try_from(n).expect("a count")
+}
+
+/// THE PLACEMENT PREMISE, ON LINUX (unit L1, run on the Linux lane on aarch64 and x86_64): what
+/// the foreground sampler's placement rests on (`master-has-unread`), and why no count of a
+/// master's unread output could place an exec instead. A slave's write reaches the master through
+/// the pty's flip buffer and a work queue. The master keeps no count of it: `TIOCOUTQ` reads 0
+/// with bytes unread, before the flip buffer drains and after, so `output_queue_len` answers
+/// `None` there, never a false 0. `FIONREAD` counts only what `n_tty` has received: a byte still
+/// in the flip buffer is not counted, and with more written than `n_tty`'s 4 KiB buffer takes it
+/// reads less than was written and is still unread. A poll that finds `n_tty` empty flushes the
+/// flip buffer's work before it answers, so `has_unread` sees each write the moment the write
+/// returns, `FIONREAD` then counts it, and once all is read it answers no. The 5,000 bytes are
+/// drained as the gather reads: `FIONREAD`'s count read after each poll that answers yes, until a
+/// poll answers no, and every byte must arrive. The counts each poll saw are printed, never
+/// asserted: on a quiet host 4,095 (`n_tty`'s buffer) and then 905, but a poll that finds bytes
+/// in `n_tty` answers without a flush, so while the work is still moving them `FIONREAD` can
+/// count fewer. How often `FIONREAD` read 0 before the poll is printed (`L1-PREMISE`), never
+/// asserted. NEGATIVE CONTROLS (scratch): `has_unread` answering `FIONREAD > 0` instead of
+/// polling (a count that does not flush) fails "seen at once" in a round whose write the work
+/// queue had not moved yet; `output_queue_len` answering `TIOCOUTQ` on Linux fails "no count".
+#[test]
+#[cfg(target_os = "linux")]
+fn a_linux_master_counts_no_output_and_only_its_poll_sees_what_the_flip_buffer_holds() {
+    const ROUNDS: usize = 2_000;
+    const MORE: usize = 5_000;
+    let (master, slave) = raw_pair();
+    assert_eq!(output_queue_len(master), None, "no count");
+    let mut uncounted = 0;
+    for round in 0..ROUNDS {
+        type_into(slave, b"x");
+        let before = queue_count(master, libc::FIONREAD);
+        assert!(before <= 1, "one byte written (round {round})");
+        uncounted += usize::from(before == 0);
+        assert_eq!(
+            queue_count(master, LINUX_TIOCOUTQ),
+            0,
+            "no output count before the drain (round {round})"
+        );
+        assert!(has_unread(master), "seen at once (round {round})");
+        assert_eq!(
+            queue_count(master, libc::FIONREAD),
+            1,
+            "the poll flushed it to n_tty (round {round})"
+        );
+        assert_eq!(
+            queue_count(master, LINUX_TIOCOUTQ),
+            0,
+            "no output count after the drain (round {round})"
+        );
+        assert_eq!(read_exactly(master, 1), b"x");
+        assert!(!has_unread(master), "read: nothing unread (round {round})");
+        assert_eq!(
+            queue_count(master, libc::FIONREAD),
+            0,
+            "read (round {round})"
+        );
+    }
+    eprintln!("L1-PREMISE rounds={ROUNDS} fionread_0_before_the_poll={uncounted}");
+    type_into(slave, &[b'y'; MORE]);
+    assert!(has_unread(master), "seen at once");
+    let held = queue_count(master, libc::FIONREAD);
+    assert!(
+        held > 0 && held < MORE,
+        "n_tty holds {held} of {MORE} unread: the rest waits in the flip buffer, uncounted"
+    );
+    assert_eq!(queue_count(master, LINUX_TIOCOUTQ), 0, "no output count");
+    let mut counts = vec![held];
+    let mut drained = 0;
+    let mut count = held;
+    loop {
+        assert!(
+            drained + count <= MORE,
+            "FIONREAD counts only what was written ({counts:?})"
+        );
+        assert_eq!(read_exactly(master, count), vec![b'y'; count]);
+        drained += count;
+        if !has_unread(master) {
+            break;
+        }
+        count = queue_count(master, libc::FIONREAD);
+        assert!(
+            count > 0,
+            "a poll that answers unread is counted ({counts:?})"
+        );
+        assert_eq!(queue_count(master, LINUX_TIOCOUTQ), 0, "no output count");
+        counts.push(count);
+    }
+    assert_eq!(
+        drained, MORE,
+        "every byte written arrives before a poll answers nothing unread ({counts:?})"
+    );
+    eprintln!("L1-PREMISE wrote={MORE} fionread_after_each_poll={counts:?}");
+    close_pair(master, slave);
+}
+
+/// `read_or_poke` with a bound answers `Idle` once the bound passes with nothing ready, on the
+/// wake path and the wakeless one, and still reads bytes that are there before it waits.
+/// NEGATIVE CONTROL (scratch): the wake path ignoring a poll that timed out loops in its poll
+/// for good, and the reader thread never answers.
+#[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn read_or_poke_answers_idle_once_its_bound_passes_with_nothing_ready() {
+    use std::sync::mpsc;
+    let (master, slave) = raw_pair();
+    let (wake_rd, wake_wr) = make_wake_pipe().expect("wake pipe");
+    let (tx, rx) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut buf = [0u8; 16];
+        let parked = matches!(
+            read_or_poke(master, &mut buf, wake_rd, -1, -1, -1, 5),
+            ReadOutcome::Idle
+        );
+        let wakeless = matches!(
+            read_or_poke(master, &mut buf, -1, -1, -1, -1, 5),
+            ReadOutcome::Idle
+        );
+        tx.send((parked, wakeless)).unwrap();
+    });
+    let answered = rx.recv_timeout(HANG_DETECTOR);
+    if answered.is_err() {
+        wake(wake_wr);
+    }
+    reader.join().expect("the reader thread");
+    assert_eq!(answered, Ok((true, true)), "both bounded waits end Idle");
+    type_into(slave, b"ab");
+    assert!(
+        readable(master),
+        "PRECONDITION: the bytes reached the master"
+    );
+    let mut buf = [0u8; 16];
+    assert!(matches!(
+        read_or_poke(master, &mut buf, wake_rd, -1, -1, -1, 0),
+        ReadOutcome::Data(2)
+    ));
+    for fd in [wake_rd, wake_wr] {
+        close_fd(fd);
+    }
+    close_pair(master, slave);
+}
+
+/// The shell's fork takes the spawn lock (`aterm_uds::spawn_lock`): started while a socket made
+/// through `aterm_uds::kept_out` is between its creation and its mark, it waits for the mark, so
+/// the shell's child never holds a copy of that socket.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_shell_spawn_waits_for_a_kept_out_socket_s_mark() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    const HANG: Duration = Duration::from_secs(60);
+    let (created_tx, created) = mpsc::channel();
+    let (go, go_rx) = mpsc::channel::<()>();
+    let creator = std::thread::spawn(move || {
+        aterm_uds::kept_out(|| {
+            let pair = std::os::unix::net::UnixStream::pair()?;
+            created_tx.send(()).expect("the test listens");
+            go_rx
+                .recv_timeout(HANG)
+                .expect("the test lets the mark happen");
+            Ok::<_, io::Error>(pair)
+        })
+        .expect("a kept-out pair")
+    });
+    created.recv_timeout(HANG).expect("the pair is created");
+    let spawner = std::thread::spawn(|| {
+        // SAFETY: the trusted-launcher contract holds in a test that mints its own caps.
+        let authority = unsafe { aterm_cap::Authority::root_authority() };
+        let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
+        let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
+        let command = [
+            std::ffi::OsString::from("/bin/sh"),
+            std::ffi::OsString::from("-c"),
+            std::ffi::OsString::from("exit 0"),
+        ];
+        spawn_shell_with_pid_cell_px(
+            24,
+            80,
+            &spawn_cap,
+            &sandbox_cap,
+            &[],
+            None,
+            None,
+            None,
+            Some(&command),
+            None,
+            None,
+            aterm_sandbox::Limits::shell_default(),
+            None,
+            None,
+        )
+        .map(|shell| (shell.pid, shell.master))
+    });
+    let started = Instant::now();
+    while !aterm_uds::spawn_lock::seam::spawn_waits(spawner.thread().id()) {
+        assert!(
+            !spawner.is_finished(),
+            "the shell forked while a kept-out socket was unmarked"
+        );
+        assert!(
+            started.elapsed() < HANG,
+            "the shell spawn never reached the lock"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    go.send(()).expect("the creator waits");
+    drop(creator.join().expect("the creator"));
+    let (pid, master) = spawner
+        .join()
+        .expect("the spawner")
+        .expect("the shell starts once the socket is marked");
+    hangup(pid);
+    // SAFETY: `master` is this test's own master fd, closed once.
+    unsafe {
+        libc::close(master);
+    }
+    reap(pid);
 }

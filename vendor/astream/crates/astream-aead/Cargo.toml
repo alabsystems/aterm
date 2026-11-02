@@ -42,7 +42,13 @@ astream-digest = { workspace = true, optional = true }
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize"], optional = true }
 
 [features]
-handshake = ["dep:x25519-dalek", "dep:astream-digest"]
+# On by default: SealedStream, the pre-shared-key record layer a sealed TCP transport
+# speaks (a hello each way, then every record sealed under both hellos, its direction and
+# its sequence). Off, the crate is seal/open alone: an embedder that seals only data at
+# rest (astream-broker's `at-rest` without its `aead`) compiles no sealed-transport code.
+default = ["stream"]
+stream = []
+handshake = ["stream", "dep:x25519-dalek", "dep:astream-digest"]
 # Static public-key identity (Rung 8): mutual signed-DH (SIGMA/Ed25519). Reuses
 # the handshake's ephemeral X25519 + HKDF for the session key; adds Ed25519
 # identity signatures. Off by default, so the base crate stays signature-free.

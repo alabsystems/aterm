@@ -90,6 +90,79 @@ if ($__aterm_word -and -not $env:EDITOR -and -not $env:VISUAL -and
 }
 Remove-Variable -Name __aterm_word -ErrorAction SilentlyContinue
 
+# While aterm installs Apple's Command Line Tools, `$env:ATERM_CLT_SHIM` names
+# the directory whose `git`, `cc` and kin say the tools are on their way instead
+# of raising Apple's install dialog, and its `.wanted` mark is there. A profile
+# can put `/usr/bin` back in front of it, so it moves to just ahead of the first
+# `/usr/bin` (else `/bin`): never ahead of a person's own earlier entry. Without
+# the mark nothing installs them: the shim is put back nowhere.
+function Global:__aterm_clt_shim_place {
+    $__aterm_dir = $env:ATERM_CLT_SHIM
+    __aterm_clt_bash_env $__aterm_dir
+    if (-not $__aterm_dir -or -not (Test-Path -LiteralPath $__aterm_dir -PathType Container) -or
+        -not (Test-Path -LiteralPath ($__aterm_dir.TrimEnd('/') + '.wanted') -PathType Leaf)) { return }
+    $__aterm_sep = [string][System.IO.Path]::PathSeparator
+    [string[]]$__aterm_rest = @(($env:PATH -split [regex]::Escape($__aterm_sep)) | Where-Object { $_ -cne $__aterm_dir })
+    $__aterm_at = [Array]::IndexOf($__aterm_rest, '/usr/bin')
+    if ($__aterm_at -lt 0) { $__aterm_at = [Array]::IndexOf($__aterm_rest, '/bin') }
+    if ($__aterm_at -lt 0) { return }
+    $__aterm_new = [System.Collections.Generic.List[string]]::new()
+    for ($__aterm_i = 0; $__aterm_i -lt $__aterm_rest.Count; $__aterm_i++) {
+        if ($__aterm_i -eq $__aterm_at) { $__aterm_new.Add($__aterm_dir) }
+        $__aterm_new.Add($__aterm_rest[$__aterm_i])
+    }
+    $__aterm_path = $__aterm_new -join $__aterm_sep
+    if ($__aterm_path -cne $env:PATH) { $env:PATH = $__aterm_path }
+}
+
+# A bash started inside the tab (`bash -lc`, an agent's own shell) runs its
+# login profile and loads no integration, so while the shim is wanted
+# `$env:BASH_ENV` names aterm's `bash/clt_env`, which that bash reads after its
+# profile to put the shim back; the person's own `BASH_ENV` waits in
+# `ATERM_CLT_BASH_ENV_BEFORE` and runs first. Its exact owner is recorded in
+# `ATERM_CLT_BASH_ENV_HOOK`, so another script set preserves the predecessor;
+# an older hook's `ATERM_CLT_BASH_ENV` stays its context. Once the shim is not wanted, the
+# person's own comes back (`$Global:__aterm_clt_env_on` has each prompt look).
+# A `pwsh -Login` started inside the tab has no such hook.
+if (-not (Test-Path -LiteralPath Variable:\__aterm_clt_env_on)) { $Global:__aterm_clt_env_on = $false }
+function Global:__aterm_clt_bash_env([string]$__aterm_dir) {
+    $__aterm_si = $env:ATERM_SHELL_INTEGRATION_DIR
+    $__aterm_hook = "$__aterm_si/bash/clt_env"
+    $__aterm_before = $env:BASH_ENV
+    if ((Test-Path -LiteralPath Env:ATERM_CLT_BASH_ENV_HOOK) -and
+        $env:BASH_ENV -ceq $env:ATERM_CLT_BASH_ENV_HOOK) {
+        $__aterm_before = $env:ATERM_CLT_BASH_ENV_BEFORE
+    }
+    # Keep an old hook from sourcing itself when this parent restores it.
+    if ($__aterm_before -and $env:ATERM_CLT_BASH_ENV -ceq $__aterm_before) {
+        Remove-Item -LiteralPath Env:ATERM_CLT_BASH_ENV -ErrorAction SilentlyContinue
+    }
+    if ($__aterm_dir -and $__aterm_si -and
+        (Test-Path -LiteralPath ($__aterm_dir.TrimEnd('/') + '.wanted') -PathType Leaf) -and
+        (Test-Path -LiteralPath $__aterm_hook -PathType Leaf)) {
+        if ($env:BASH_ENV -cne $__aterm_hook) {
+            if (-not (Test-Path -LiteralPath Env:ATERM_CLT_BASH_ENV_HOOK) -or
+                $env:BASH_ENV -cne $env:ATERM_CLT_BASH_ENV_HOOK) {
+                if (Test-Path -LiteralPath Env:BASH_ENV) { $env:ATERM_CLT_BASH_ENV_BEFORE = $env:BASH_ENV }
+                else { Remove-Item -LiteralPath Env:ATERM_CLT_BASH_ENV_BEFORE -ErrorAction SilentlyContinue }
+            }
+            $env:BASH_ENV = $__aterm_hook
+        }
+        $env:ATERM_CLT_BASH_ENV_HOOK = $__aterm_hook
+        $Global:__aterm_clt_env_on = $true
+        return
+    }
+    if (Test-Path -LiteralPath Env:ATERM_CLT_BASH_ENV_HOOK) {
+        if ($env:BASH_ENV -ceq $env:ATERM_CLT_BASH_ENV_HOOK) {
+            if (Test-Path -LiteralPath Env:ATERM_CLT_BASH_ENV_BEFORE) { $env:BASH_ENV = $env:ATERM_CLT_BASH_ENV_BEFORE }
+            else { Remove-Item -LiteralPath Env:BASH_ENV -ErrorAction SilentlyContinue }
+        }
+        Remove-Item -LiteralPath Env:ATERM_CLT_BASH_ENV_BEFORE -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath Env:ATERM_CLT_BASH_ENV_HOOK -ErrorAction SilentlyContinue
+    }
+    $Global:__aterm_clt_env_on = $false
+}
+
 # Move `$env:ATPKG_AGENTS` and `$env:ATERM_REROUTE_DIR` to the front of PATH
 # (reroute first, then agents) so user profile additions cannot shadow them, and
 # record the expected prefix in `$Global:__aterm_managed_want`.
@@ -123,6 +196,7 @@ function Global:__aterm_reroute_path_front {
         $Global:__aterm_managed_want = @($env:ATERM_REROUTE_DIR) + $Global:__aterm_managed_want
         $Global:__aterm_managed_reroute_on = $true
     }
+    __aterm_clt_shim_place
 }
 __aterm_reroute_path_front
 
@@ -151,6 +225,11 @@ function Global:__aterm_managed_derive_reroute {
 }
 
 function Global:__aterm_managed_path_live {
+    # Give the person's own `BASH_ENV` back once nothing wants the shim.
+    if ($Global:__aterm_clt_env_on -and (-not $env:ATERM_CLT_SHIM -or
+        -not (Test-Path -LiteralPath ($env:ATERM_CLT_SHIM.TrimEnd('/') + '.wanted') -PathType Leaf))) {
+        __aterm_clt_bash_env ''
+    }
     if (-not $Global:__aterm_managed_live -or -not $Global:__aterm_atpkg_hook) { return }
     # 1. Re-source hook if modified.
     if ([System.IO.File]::Exists($Global:__aterm_atpkg_hook)) {

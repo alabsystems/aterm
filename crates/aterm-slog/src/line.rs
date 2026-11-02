@@ -193,12 +193,24 @@ pub(crate) fn push_val(out: &mut String, val: &Val) {
     }
 }
 
+pub(crate) fn parse_u<T: std::str::FromStr>(raw: &str) -> Option<T> {
+    (!raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| raw.parse().ok())
+        .flatten()
+}
+
 /// The value `raw` decodes to for `key`, or `None` when it does not have the key's shape (the token is then skipped).
 pub(crate) fn decode_val(key: Key, raw: &str) -> Option<Val> {
     match key.cap() {
         Cap::Word(list) => Some(Val::Word(lookup_or_unknown(list, raw))),
-        Cap::U => raw.parse().ok().map(Val::U),
-        Cap::I => raw.parse().ok().map(Val::I),
+        Cap::U => parse_u(raw).map(Val::U),
+        Cap::I => {
+            let digits = raw.strip_prefix('-').unwrap_or(raw);
+            (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| raw.parse().ok())
+                .flatten()
+                .map(Val::I)
+        }
         Cap::Id => ShortId::new(raw).map(Val::Id),
         Cap::Tok(..) => BoundedToken::new(key, &pct::decode(raw)).map(Val::Tok),
         Cap::Text(_) => BoundedText::new(key, &pct::decode(raw)).map(Val::Text),
@@ -224,10 +236,7 @@ pub fn decode(line: &str) -> Result<Rec, DecodeError> {
         return Err(DecodeError::TooLong);
     }
     let mut toks = line.split(' ').filter(|t| !t.is_empty());
-    let seq: u64 = toks
-        .next()
-        .and_then(|t| t.parse().ok())
-        .ok_or(DecodeError::Seq)?;
+    let seq: u64 = toks.next().and_then(parse_u).ok_or(DecodeError::Seq)?;
     let op = toks.next().and_then(Op::from_word).ok_or(DecodeError::Op)?;
     let node = toks.next().and_then(Node::parse).ok_or(DecodeError::Node)?;
     let k = toks.next().map(Kind::from_word).ok_or(DecodeError::Kind)?;
@@ -252,7 +261,7 @@ pub fn decode(line: &str) -> Result<Rec, DecodeError> {
             "by" => rec.by = Actor::from_word(v),
             "src" => rec.src = Src::from_word(v),
             "conf" => rec.conf = Conf::from_word(v),
-            "t" => rec.t = v.parse().unwrap_or(0),
+            "t" => rec.t = parse_u(v).unwrap_or(0),
             _ => decode_field(&mut rec.f, k, v),
         }
     }
@@ -322,10 +331,10 @@ pub fn decode_bus(body: &str) -> Result<BusRec, DecodeError> {
             continue;
         };
         match k {
-            "t" => out.rec.t = v.parse().unwrap_or(0),
-            "ep" => out.ep = v.parse().unwrap_or(0),
-            "seq" => seq = v.parse().ok(),
-            "ms" => out.ms = v.parse().ok(),
+            "t" => out.rec.t = parse_u(v).unwrap_or(0),
+            "ep" => out.ep = parse_u(v).unwrap_or(0),
+            "seq" => seq = parse_u(v),
+            "ms" => out.ms = parse_u(v),
             "op" => op = Some(Op::from_word(v)),
             "node" => node = Some(Node::parse(v)),
             "k" => kind = Some(Kind::from_word(v)),

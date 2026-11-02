@@ -9,6 +9,7 @@
 # draw main's dark frames.
 
 foreach-scheme light {
+  scale 2
   grid 16 100
   style rainbow kitty
   hz 60

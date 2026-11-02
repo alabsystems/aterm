@@ -1152,6 +1152,44 @@ fn the_instances_listing_reads_as_each_rows_words() {
 }
 
 #[test]
+fn r5_keeps_later_legs_sign_ins_and_witnesses_out_of_its_verdict() {
+    let (ev, r5a, r5b) = r5();
+    let mut later = ev.clone();
+    // R5b displaces lab-b again; its recovery belongs to that later scenario.
+    later.ledger.push(Row {
+        t: r5b.to / 1000,
+        account: LABEL_B.into(),
+        kind: "sign-in".into(),
+        to: String::new(),
+        why: "auto no-route: profile(none)".into(),
+    });
+    let judged = judge_r5(&later, &r5a, R5A);
+    assert_eq!(judged.verdict, Verdict::Ok, "{}", judged.evidence);
+    // A sign-in during the account's own leg remains a failure.
+    later.ledger.last_mut().unwrap().t = r5a.to / 1000;
+    assert_eq!(judge_r5(&later, &r5a, R5A).verdict, Verdict::Fail);
+
+    for (leg, displacement, kind) in [(&r5a, R5A, "displaced"), (&r5b, R5B, "auth")] {
+        let mut late_witness = ev.clone();
+        let account = if kind == "displaced" {
+            displacement.from
+        } else {
+            displacement.to
+        };
+        for row in &mut late_witness.ledger {
+            if row.account == account && row.kind == kind {
+                row.t = leg.to / 1000 + 1;
+            }
+        }
+        assert_eq!(
+            judge_r5(&late_witness, leg, displacement).verdict,
+            Verdict::Fail,
+            "a later {kind} row cannot prove this leg"
+        );
+    }
+}
+
+#[test]
 fn r5_passes_on_the_runs_own_displacements_and_fails_on_a_stale_row_or_a_turn_elsewhere() {
     let (ev, r5a, r5b) = r5();
     let held = judge_r5(&ev, &r5a, R5A);

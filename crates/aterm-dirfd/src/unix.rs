@@ -669,6 +669,9 @@ impl Dir {
     /// Back to the directory's first entry (`rewinddir`), so a directory emptied as it was read
     /// is read again whole; a failed read no longer ends the stream.
     pub fn rewind(&mut self) {
+        if self.gone {
+            return;
+        }
         // SAFETY: `self.dirp` is a live stream owned by this value.
         unsafe { libc::rewinddir(self.dirp) };
         self.errored = false;

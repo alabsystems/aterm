@@ -196,12 +196,20 @@ pub fn watch_with(
 
 fn wait_on_wall_clock(period: Duration) -> bool {
     const SLICE: Duration = Duration::from_secs(60 * 60);
-    let due = std::time::SystemTime::now() + period;
-    while let Ok(left) = due.duration_since(std::time::SystemTime::now()) {
-        if left.is_zero() {
-            break;
+    if let Some(due) = std::time::SystemTime::now().checked_add(period) {
+        while let Ok(left) = due.duration_since(std::time::SystemTime::now()) {
+            if left.is_zero() {
+                break;
+            }
+            std::thread::sleep(left.min(SLICE));
         }
-        std::thread::sleep(left.min(SLICE));
+    } else {
+        let mut remaining = period;
+        while !remaining.is_zero() {
+            let step = remaining.min(SLICE);
+            std::thread::sleep(step);
+            remaining = remaining.saturating_sub(step);
+        }
     }
     true
 }

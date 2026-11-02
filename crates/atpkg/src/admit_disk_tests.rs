@@ -13,7 +13,7 @@ use aterm_capacity::floor::GIB;
 use aterm_capacity::{Admit, Fixed, Footprints, Ledger, Pace, Reading, Volume};
 use aterm_spec::wait::MUST_HAPPEN;
 
-use super::{Reclaim, Run, admit_on, dirs_tag};
+use super::{Reclaim, Run, admit_on, dirs_tag, scope_tag};
 
 /// The scratch image's volume: `total` GiB, `free` of it free, a 4 GiB floor.
 fn image(total: u64, free: u64) -> Reading {
@@ -28,23 +28,28 @@ fn image(total: u64, free: u64) -> Reading {
     r
 }
 
+/// What [`verify_run`] builds ([`Run::scope`]).
+const SCOPE: &str = "lint -p aterm-capacity";
+
 /// A verify run whose directories are under `dir`.
 fn verify_run(dir: &Path) -> Run {
     let target = dir.join("target");
     std::fs::create_dir_all(target.join("verify")).expect("the run's corner");
     Run {
         what: "verify lint -p aterm-capacity".to_owned(),
+        scope: SCOPE.to_owned(),
         dirs: vec![target.join("build.noindex"), target.join("verify")],
         record: target.join("verify/footprint.json"),
         cold: 27 * GIB,
         on: PathBuf::from("/Volumes/scratch"),
+        stuck_ends: None,
     }
 }
 
 /// What a first [`verify_run`] on empty directories claims, as its first line says it: with no
 /// record, the tag of its directories counts no run, so any tag reads the same.
 fn first_run() -> aterm_capacity::Estimate {
-    Footprints::default().need(0, 27 * GIB, 0)
+    Footprints::default().need(0, 27 * GIB, 0, scope_tag(SCOPE))
 }
 
 /// `line` names each of `figures`.
@@ -243,6 +248,7 @@ fn a_claim_says_why_its_figure_is_what_it_is_before_it_starts_short() {
         grew: 0,
         at_ms: 1,
         dirs: None,
+        scope: scope_tag(SCOPE),
     });
     stale.save(&run.record).expect("the record");
     let mut never = Reclaim::of(
@@ -442,12 +448,14 @@ fn warm_run(dir: &Path) -> (Run, PathBuf, Footprints, aterm_capacity::Estimate) 
         grew: 64 << 10,
         at_ms: 1,
         dirs: Some(dirs_tag(&run.dirs)),
+        scope: scope_tag(SCOPE),
     });
     warm.save(&run.record).expect("the record");
     let then = warm.need(
         aterm_capacity::allocated(&run.dirs),
         27 * GIB,
         dirs_tag(&run.dirs),
+        scope_tag(SCOPE),
     );
     assert!(then.bytes < 1 << 20, "{then}");
     (run, build, warm, then)
@@ -517,7 +525,12 @@ fn a_relief_that_empties_the_runs_directories_sizes_its_claim_again() {
         let admitted = admitted.expect("admitted once the relief freed room");
         let way = if by_watch { "the watch" } else { "the pass" };
         assert!(!build.exists(), "{way}");
-        let now = warm.need(aterm_capacity::allocated(&dirs), 27 * GIB, dirs_tag(&dirs));
+        let now = warm.need(
+            aterm_capacity::allocated(&dirs),
+            27 * GIB,
+            dirs_tag(&dirs),
+            scope_tag(SCOPE),
+        );
         assert!(now.bytes >= 8 << 20, "{way}: {now}");
         assert_eq!(admitted.estimate, now, "{way}: {said:?}");
         let held = ledger.list().expect("listed");
@@ -590,7 +603,12 @@ fn a_build_directory_emptied_while_it_waits_sizes_its_claim_again() {
     std::fs::remove_dir_all(&build).expect("another pass removed it");
     m.set(image(40, 20));
     let admitted = joined(waiting, "its admission once room came").expect("admitted");
-    let now = warm.need(aterm_capacity::allocated(&dirs), 27 * GIB, dirs_tag(&dirs));
+    let now = warm.need(
+        aterm_capacity::allocated(&dirs),
+        27 * GIB,
+        dirs_tag(&dirs),
+        scope_tag(SCOPE),
+    );
     assert!(now.bytes >= 8 << 20, "{now}");
     assert_eq!(admitted.estimate, now);
     let resized = rx
@@ -972,8 +990,60 @@ fn a_relief_notes_what_stayed_of_each_stage_it_could_not_finish() {
     let notes = super::stayed_notes(&went);
     assert_eq!(notes, [remove::named(&stage, 2).words(&stage)]);
     assert_ne!(notes, [remove::named(&stage, 7).words(&stage)]);
-    assert_eq!(remove::named(&stage, 2).first, [PathBuf::from("tmp/d")]);
+    assert_eq!(
+        remove::named(&stage, 2).first,
+        [(PathBuf::from("tmp/d"), remove::Why::StillRefusing)]
+    );
     assert!(super::stayed_notes(&went[..1]).is_empty());
+}
+
+/// WHAT A PASS KEPT IS NOT WHAT IT REMOVED: of the paths a run's record let go, one the pass
+/// returned as nothing of it gone (`Unused::Refused`: its rename refused after the check, or
+/// stopped once in its stage and returned as that stage's path, `Refusal::Staged`) is not among
+/// the directories the relief removed, and gives a note of its own; one that went, or whose stage
+/// stayed in part, still is. NEGATIVE CONTROL: the same paths returned as gone are all removed,
+/// and give no note; and a relief pairing its paths with their outcomes by path keeps the staged
+/// one among what it removed.
+#[test]
+fn a_relief_keeps_what_its_pass_refused_out_of_what_it_removed() {
+    use crate::build_cache::{Refusal, Unused};
+    let (went, kept, staged) = (
+        PathBuf::from("/c/gone/.cargo-build"),
+        PathBuf::from("/c/kept/.cargo-build"),
+        PathBuf::from("/c/staged/.cargo-build"),
+    );
+    let stage = PathBuf::from("/c/staged/.cargo-build.removing");
+    let asked = vec![went.clone(), kept.clone(), staged.clone()];
+    let refused = Unused::Refused {
+        by: Refusal::Rename(std::io::ErrorKind::PermissionDenied),
+    };
+    let returned = [
+        (went.clone(), Unused::Unfinished),
+        (kept.clone(), refused),
+        (
+            stage.clone(),
+            Unused::Refused {
+                by: Refusal::Staged,
+            },
+        ),
+    ];
+    assert_eq!(
+        super::went_of(asked.clone(), &returned),
+        std::slice::from_ref(&went)
+    );
+    let notes = super::stayed_notes(&returned);
+    assert_eq!(notes.len(), 2, "{notes:?}");
+    assert!(notes[0].contains(&kept.display().to_string()), "{notes:?}");
+    assert!(notes[0].contains(&Refusal::Rename(std::io::ErrorKind::PermissionDenied).word()));
+    assert!(notes[1].contains(&stage.display().to_string()), "{notes:?}");
+    assert!(notes[1].contains(&Refusal::Staged.word()), "{notes:?}");
+    let all_gone = [
+        (went.clone(), Unused::Unfinished),
+        (kept.clone(), Unused::Unfinished),
+        (staged.clone(), Unused::Unfinished),
+    ];
+    assert_eq!(super::went_of(asked.clone(), &all_gone), asked);
+    assert!(super::stayed_notes(&all_gone).is_empty());
 }
 
 /// A RECORD MEASURED ON OTHER DIRECTORIES IS NOT WHAT A RUN CLAIMS BY: the record holds a run
@@ -994,12 +1064,14 @@ fn a_run_measured_on_other_directories_is_not_what_a_claim_is_read_from() {
         grew: 0,
         at_ms: 1,
         dirs: Some(dirs_tag(&[dir.path().join("elsewhere")])),
+        scope: scope_tag(SCOPE),
     });
     kept.push(super::Footprint {
         peak: 1 << 20,
         grew: 1 << 20,
         at_ms: 2,
         dirs: Some(dirs_tag(&run.dirs)),
+        scope: scope_tag(SCOPE),
     });
     kept.save(&run.record).expect("the record");
     let mut never = Reclaim::of(
@@ -1020,6 +1092,72 @@ fn a_run_measured_on_other_directories_is_not_what_a_claim_is_read_from() {
     let e = admitted.estimate;
     assert_eq!((e.bytes, e.runs, e.capped), (1 << 20, 1, false), "{e}");
     let _ = admitted.finish();
+}
+
+/// A RUN'S FOOTPRINTS ARE KEPT BY ITS SCOPE ([`Run::scope`]): a `-p` verify run that wrote
+/// 1 MiB into its build directory is what the next `-p` run claims, read from that one run, but
+/// a whole-workspace run on the same directories claims the cold budget less what they hold,
+/// read from no run; once it wrote 3 MiB, the `-p` run still claims its own 1 MiB, and the
+/// whole-workspace run its 3 MiB. Negative control: with the scope ignored, the whole-workspace
+/// run claims the `-p` run's 1 MiB.
+#[test]
+fn a_narrow_runs_record_is_not_what_a_wider_run_claims() {
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("admit-disk-scope-")
+        .tempdir()
+        .expect("scratch");
+    let narrow = verify_run(dir.path());
+    let wide = Run {
+        what: "verify lint".to_owned(),
+        scope: "lint --workspace".to_owned(),
+        ..narrow.clone()
+    };
+    let build = narrow.dirs[0].clone();
+    std::fs::create_dir_all(&build).expect("the build directory");
+    let ledger = Ledger::at(dir.path().join("ledger"));
+    let claim = |run: &Run| {
+        let mut never = Reclaim::of(
+            Box::new(|_, _| panic!("reclaimed for a run with room")),
+            Box::new(|_, _, _| panic!("asked for a run with room")),
+            Box::new(|_, _| panic!("named holders for a run with room")),
+        );
+        admit_on(
+            run.clone(),
+            &ledger,
+            &Fixed::new(image(40, 36)),
+            Admit::Wait,
+            Pace::default(),
+            &mut never,
+            &mut |_| {},
+        )
+        .expect("room")
+    };
+    let first = claim(&narrow);
+    std::fs::write(build.join("narrow.rlib"), vec![1u8; 1 << 20]).expect("written");
+    let _ = first.finish();
+    let again = claim(&narrow);
+    let e = again.estimate;
+    assert_eq!(e.runs, 1, "{e}");
+    assert!((1 << 20..2 << 20).contains(&e.bytes), "{e}");
+    let _ = again.finish();
+
+    let holds = aterm_capacity::allocated(&wide.dirs);
+    let first_wide = claim(&wide);
+    let e = first_wide.estimate;
+    assert_eq!((e.bytes, e.runs), (27 * GIB - holds, 0), "{e}");
+    std::fs::write(build.join("wide.rlib"), vec![2u8; 3 << 20]).expect("written");
+    let _ = first_wide.finish();
+
+    let e = claim(&narrow).estimate;
+    assert!(
+        (1 << 20..2 << 20).contains(&e.bytes),
+        "the -p run's own: {e}"
+    );
+    let e = claim(&wide).estimate;
+    assert!(
+        (3 << 20..4 << 20).contains(&e.bytes),
+        "the wide run's own: {e}"
+    );
 }
 
 /// A RUN'S DIRECTORIES ARE NAMED BY WHAT THEY ARE, NOT HOW THEY ARE GIVEN: their tag is the same
@@ -1075,4 +1213,92 @@ fn a_runs_directories_are_tagged_by_what_they_are() {
         bytes.push(0);
     }
     assert_eq!(tag, aterm_hash::fnv1a_64(&bytes), "the stable digest");
+}
+
+/// A RUN THAT ASKS TO GIVE UP BEHIND A HOLDER THAT MAKES NO PROGRESS DOES (CW-WAIT-UNBOUNDED):
+/// on a volume another claim holds, its holder idle as the machine reads it, a run whose
+/// [`Run::stuck_ends`] is short gives up within the hang detector, naming the holder, and leaves
+/// the queue with the holder's claim still held. NEGATIVE CONTROL: the same run asking nothing
+/// waits on past three of those bounds, and is admitted once the holder lets go.
+#[test]
+fn a_run_that_asks_to_give_up_behind_a_stuck_holder_does() {
+    use aterm_capacity::{Need, Proc, Procs};
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("admit-disk-stuck-")
+        .tempdir()
+        .expect("scratch");
+    let ledger = Ledger::at(dir.path().join("ledger"));
+    let me = std::process::id();
+    let m = Arc::new(Fixed::new(image(40, 36)));
+    m.set_procs(Some(Procs::of(vec![Proc {
+        pid: me,
+        ppid: 1,
+        cpu_ns: 5,
+        ..Proc::default()
+    }])));
+    let held = aterm_capacity::admit_with(
+        &ledger,
+        &*m,
+        Need::new("lab windows boot").disk(30 * GIB, "/Volumes/scratch"),
+        Admit::Wait,
+        Pace::default(),
+        &mut |_| {},
+    )
+    .expect("the holder's claim");
+    let bound = Duration::from_millis(200);
+    let wait = |stuck_ends: Option<Duration>| {
+        let (ledger, m) = (ledger.clone(), Arc::clone(&m));
+        let run = Run {
+            stuck_ends,
+            ..verify_run(dir.path())
+        };
+        std::thread::spawn(move || {
+            let mut nothing = Reclaim::of(
+                Box::new(|_, _| (0, Vec::new(), Vec::new())),
+                Box::new(|_, _, _| None),
+                Box::new(|_, _| Vec::new()),
+            );
+            admit_on(
+                run,
+                &ledger,
+                &*m,
+                Admit::Wait,
+                Pace {
+                    poll: Duration::from_millis(5),
+                    line_every: Duration::from_secs(60),
+                },
+                &mut nothing,
+                &mut |_| {},
+            )
+        })
+    };
+    match joined(wait(Some(bound)), "the stuck wait's end") {
+        Err(e @ super::Error::Stuck { .. }) => names(
+            &e.to_string(),
+            &[
+                "gave up its wait",
+                &format!("pid {me} holds 30 GiB of disk"),
+                "which has made no progress for",
+            ],
+        ),
+        other => panic!("expected the wait to end behind the stuck holder, got {other:?}"),
+    }
+    let listed: Vec<String> = ledger
+        .list()
+        .expect("listed")
+        .into_iter()
+        .map(|r| r.need.what)
+        .collect();
+    assert_eq!(listed, ["lab windows boot"], "it left the queue");
+    let waiting = wait(None);
+    // Three bounds of the condition under test, not a wait for anything.
+    std::thread::sleep(bound * 3);
+    assert!(
+        !waiting.is_finished(),
+        "a run that asked nothing gave up: {:?}",
+        joined(waiting, "its end")
+    );
+    drop(held);
+    let admitted = joined(waiting, "the admission once the holder lets go").expect("admitted");
+    let _ = admitted.finish();
 }

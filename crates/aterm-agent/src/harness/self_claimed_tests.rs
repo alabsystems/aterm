@@ -1217,4 +1217,17 @@ fn structural_resume_validation_and_relaunch_lines_reject_malformed_or_line_brea
             "relaunch_line_env must reject {sep:?}"
         );
     }
+
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let fifo = dir.path().join("witness.fifo");
+        let c_path = CString::new(fifo.as_os_str().as_bytes()).expect("cstr");
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let witnesses = Witnesses { path: fifo };
+        assert!(!witnesses.handled(4242, "start"));
+        assert!(witnesses.record(4242, "start").is_err());
+    }
 }

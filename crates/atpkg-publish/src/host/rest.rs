@@ -25,6 +25,129 @@ pub const STAGED: &str = ".atpkg-staged";
 /// Environment variable from which git's credential helper reads the token.
 pub const GIT_TOKEN_ENV: &str = "ATPKG_PUBLISH_GIT_TOKEN";
 
+/// Credentials for the known Git helper. The secret is deliberately absent from argv and Debug.
+pub(crate) struct GitAuth {
+    token: Option<Token>,
+    origin: Option<String>,
+}
+
+impl std::fmt::Debug for GitAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GitAuth")
+            .field("origin", &self.origin)
+            .field("authenticated", &self.token.is_some())
+            .finish()
+    }
+}
+
+impl GitAuth {
+    fn new(token: Option<Token>, base: &str) -> Self {
+        Self {
+            token,
+            origin: credential_origin(base).map(str::to_owned),
+        }
+    }
+
+    /// Resolve the publication identity for an authenticated source fetch.
+    /// # Errors
+    /// An invalid HTTP origin, or a missing, unreadable, blank or malformed credential file.
+    #[cfg(any(unix, test))]
+    pub(crate) fn required(file: &Path, base: &str) -> Result<Self, HostError> {
+        if credential_origin(base).is_none() {
+            return Err(HostError::Refused(
+                "Git credentials require an HTTP origin".into(),
+            ));
+        }
+        let token = Token::from_file(file)
+            .map_err(HostError::Refused)?
+            .ok_or_else(|| {
+                HostError::Refused("the configured source credential is absent or empty".into())
+            })?;
+        Ok(Self::new(Some(token), base))
+    }
+
+    pub(crate) fn arguments(&self) -> Vec<OsString> {
+        let mut args = vec!["-c".into(), "credential.helper=".into()];
+        if self.token.is_some()
+            && let Some(origin) = &self.origin
+        {
+            args.extend([
+                "-c".into(),
+                format!("credential.{origin}.helper={}", git_helper()).into(),
+            ]);
+        }
+        args
+    }
+
+    /// The known helper's child environment; callers never log these values.
+    /// # Errors
+    /// A token whose bytes are not UTF-8.
+    pub(crate) fn environment(&self) -> Result<Vec<(String, OsString)>, HostError> {
+        match (&self.token, &self.origin) {
+            (Some(token), Some(_)) => {
+                let text = std::str::from_utf8(token.expose())
+                    .map_err(|_| HostError::Refused("the token is not UTF-8".into()))?;
+                Ok(vec![(GIT_TOKEN_ENV.into(), text.into())])
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    #[cfg(any(unix, test))]
+    pub(crate) fn redact(&self, text: &str) -> String {
+        match self
+            .token
+            .as_ref()
+            .and_then(|token| std::str::from_utf8(token.expose()).ok())
+        {
+            Some(secret) => text.replace(secret, "[redacted]"),
+            None => text.to_owned(),
+        }
+    }
+}
+
+/// Remove ambient credentials and all inherited trace selectors before the known helper runs.
+pub(crate) fn git_environment_removals() -> Vec<String> {
+    git_environment_removals_from(std::env::vars_os().map(|(key, _)| key))
+}
+
+/// Environment overrides also disable Trace2 targets enabled by system/global Git config.
+pub(crate) fn git_tracing_environment() -> Vec<(String, OsString)> {
+    [
+        ("GIT_TRACE", "0"),
+        ("GIT_TRACE2", "0"),
+        ("GIT_TRACE2_EVENT", "0"),
+        ("GIT_TRACE2_PERF", "0"),
+        ("GIT_TRACE_CURL", "0"),
+        ("GIT_TRACE_REDACT", "1"),
+    ]
+    .map(|(name, value)| (name.into(), value.into()))
+    .into()
+}
+
+fn git_environment_removals_from(names: impl IntoIterator<Item = OsString>) -> Vec<String> {
+    let mut remove = std::collections::BTreeSet::from([
+        GIT_TOKEN_ENV.to_owned(),
+        "GITHUB_TOKEN".into(),
+        "GH_TOKEN".into(),
+        "GIT_CURL_VERBOSE".into(),
+        "BASH_ENV".into(),
+        "ENV".into(),
+        "SHELLOPTS".into(),
+        "BASHOPTS".into(),
+    ]);
+    for name in names {
+        if let Some(name) = name.to_str()
+            && (name.starts_with("GIT_TRACE")
+                || name.starts_with("GH_")
+                || name.starts_with("GITHUB_"))
+        {
+            remove.insert(name.to_owned());
+        }
+    }
+    remove.into_iter().collect()
+}
+
 /// GitHub's REST API, as one identity.
 #[derive(Clone)]
 pub struct RestHost {
@@ -267,12 +390,16 @@ impl RestHost {
     }
 
     fn git(&self, args: &[OsString]) -> Result<(), HostError> {
+        self.git_output(args).map(|_| ())
+    }
+
+    fn git_output(&self, args: &[OsString]) -> Result<std::process::Output, HostError> {
         let out = self
             .git_command(args)?
             .output()
             .map_err(|e| HostError::Unreachable(format!("spawn git: {e}")))?;
         if out.status.success() {
-            return Ok(());
+            return Ok(out);
         }
         let stderr = String::from_utf8_lossy(&out.stderr);
         Err(HostError::Unreachable(format!(
@@ -285,18 +412,17 @@ impl RestHost {
     }
 
     fn git_command(&self, args: &[OsString]) -> Result<Command, HostError> {
-        let token = self.token()?;
+        let auth = GitAuth::new(self.token()?, &self.git_base);
         let mut cmd = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"));
-        cmd.args(["-c", "credential.helper="])
-            .env_remove(GIT_TOKEN_ENV)
-            .env_remove("GITHUB_TOKEN")
-            .env_remove("GH_TOKEN");
-        if let (Some(token), Some(origin)) = (token.as_ref(), credential_origin(&self.git_base)) {
-            let text = std::str::from_utf8(token.expose())
-                .map_err(|_| HostError::Refused("the token is not UTF-8".into()))?;
-            cmd.arg("-c")
-                .arg(format!("credential.{origin}.helper={}", git_helper()))
-                .env(GIT_TOKEN_ENV, text);
+        cmd.args(auth.arguments());
+        for name in git_environment_removals() {
+            cmd.env_remove(name);
+        }
+        for (name, value) in git_tracing_environment()
+            .into_iter()
+            .chain(auth.environment()?)
+        {
+            cmd.env(name, value);
         }
         #[cfg(any(test, debug_assertions))]
         for (name, value) in &self.git_env {
@@ -317,7 +443,9 @@ fn credential_origin(base: &str) -> Option<&str> {
     let (scheme, host) = base.split_once("://")?;
     (matches!(scheme, "https" | "http")
         && !host.is_empty()
-        && !host.contains(['/', '\n', '\0', '"']))
+        && host.bytes().all(|b| {
+            b.is_ascii_graphic() && !matches!(b, b'/' | b'\\' | b'?' | b'#' | b'@' | b'=' | b'"')
+        }))
     .then_some(base)
 }
 
@@ -463,7 +591,10 @@ impl ReleaseHost for RestHost {
             let path = format!("/repos/{slug}/releases/assets/{id}");
             client
                 .download_asset(&path, &part, size.max(1))
-                .map_err(|e| host_error(&e))?;
+                .map_err(|e| {
+                    let _ = std::fs::remove_file(&part);
+                    host_error(&e)
+                })?;
             let got = std::fs::metadata(&part)
                 .map(|m| m.len())
                 .unwrap_or(u64::MAX);
@@ -474,6 +605,7 @@ impl ReleaseHost for RestHost {
                 )));
             }
             std::fs::rename(&part, dir.join(name)).map_err(|e| {
+                let _ = std::fs::remove_file(&part);
                 HostError::Refused(format!("place {name} in {}: {e}", dir.display()))
             })?;
         }
@@ -572,7 +704,7 @@ impl ReleaseHost for RestHost {
     }
 
     fn fetch_public(&self, slug: &Slug, tag: &str, asset: &str, dest: &Path, cap: u64) -> Probe {
-        if let Some(parent) = dest.parent()
+        if let Some(parent) = dest.parent().filter(|p| !p.as_os_str().is_empty())
             && let Err(e) = std::fs::create_dir_all(parent)
         {
             return Probe::Unknown(format!("mkdir {}: {e}", parent.display()));
@@ -605,6 +737,19 @@ impl ReleaseHost for RestHost {
         matches!(self.token(), Ok(None))
     }
 
+    fn repo_seen(&self, slug: &Slug) -> Result<bool, HostError> {
+        let path = format!("/repos/{slug}");
+        let ask = |client: Client| match client.read(&path) {
+            Ok(_) => Ok(true),
+            Err(e) if e.is_not_found() => Ok(false),
+            Err(e) => Err(host_error(&e)),
+        };
+        if ask(self.reader()?)? {
+            return Ok(true);
+        }
+        ask(self.client(None))
+    }
+
     fn fetch_repo(&self, slug: &Slug, dir: &Path) -> Result<(), HostError> {
         let mut args: Vec<OsString> = vec!["-C".into(), dir.as_os_str().to_owned()];
         args.extend(
@@ -620,6 +765,80 @@ impl ReleaseHost for RestHost {
             }
             other => other,
         })
+    }
+
+    fn fetch_main(&self, slug: &Slug, dir: &Path, into: &str) -> Result<(), HostError> {
+        // Git may rewrite even an explicit host URL to the checkout's local mirror. Let it
+        // transport objects, but only the independently read API may name the main of record.
+        let main = self
+            .reader()
+            .and_then(|client| {
+                client
+                    .read(&format!("/repos/{slug}/commits/refs/heads/main"))
+                    .map_err(|e| host_error(&e))
+            })
+            .map_err(|why| {
+                HostError::Unreachable(format!("read {slug}'s main from the host API: {why}"))
+            })?;
+        let expected = main["sha"]
+            .as_str()
+            .filter(|sha| {
+                sha.len() == 40 && sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            })
+            .ok_or_else(|| {
+                HostError::Unreachable(format!(
+                    "the host API answered {slug}'s main without a full lowercase commit SHA"
+                ))
+            })?;
+        let mut args: Vec<OsString> = vec!["-C".into(), dir.as_os_str().to_owned()];
+        args.extend(
+            ["fetch", "--quiet", "--no-tags", "--no-write-fetch-head"]
+                .iter()
+                .map(OsString::from),
+        );
+        args.push(self.git_url(slug).into());
+        args.push(format!("+refs/heads/main:{into}").into());
+        self.git(&args).map_err(|e| match e {
+            HostError::Unreachable(why) => {
+                HostError::Unreachable(format!("fetch of {slug}'s main: {why}"))
+            }
+            other => other,
+        })?;
+        let fetched = self.git_output(&[
+            "-C".into(),
+            dir.as_os_str().to_owned(),
+            "rev-parse".into(),
+            "--verify".into(),
+            into.into(),
+        ]);
+        let checked = fetched.and_then(|out| {
+            let actual = String::from_utf8_lossy(&out.stdout);
+            if actual.trim() == expected {
+                Ok(())
+            } else {
+                Err(HostError::Unreachable(format!(
+                    "fetched {slug}'s main ({}) differs from the host API ({expected}); \
+                     main moved or git transported another main",
+                    actual.trim()
+                )))
+            }
+        });
+        if let Err(why) = checked {
+            let dropped = self.git(&[
+                "-C".into(),
+                dir.as_os_str().to_owned(),
+                "update-ref".into(),
+                "-d".into(),
+                into.into(),
+            ]);
+            return Err(HostError::Unreachable(match dropped {
+                Ok(()) => format!("could not bind {slug}'s main of record: {why}"),
+                Err(drop) => format!(
+                    "could not bind {slug}'s main of record: {why}; removing {into} failed: {drop}"
+                ),
+            }));
+        }
+        Ok(())
     }
 }
 
@@ -645,6 +864,70 @@ pub fn probe_of(code: u16) -> Probe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_preparation_removes_current_and_future_trace_and_ambient_auth_selectors() {
+        let names = [
+            "GIT_TRACE",
+            "GIT_TRACE2_EVENT",
+            "GIT_TRACE_REDACT",
+            "GIT_TRACE_FUTURE",
+            "GH_ENTERPRISE_TOKEN",
+            "GITHUB_ENTERPRISE_TOKEN",
+            "SSH_AUTH_SOCK",
+            "PATH",
+        ];
+        let remove = git_environment_removals_from(names.map(OsString::from));
+        for name in &names[..6] {
+            assert!(remove.iter().any(|entry| entry == name));
+        }
+        for name in [
+            GIT_TOKEN_ENV,
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "GIT_CURL_VERBOSE",
+            "BASH_ENV",
+            "ENV",
+            "SHELLOPTS",
+            "BASHOPTS",
+        ] {
+            assert!(remove.iter().any(|entry| entry == name));
+        }
+        assert!(
+            !remove
+                .iter()
+                .any(|entry| entry == "SSH_AUTH_SOCK" || entry == "PATH")
+        );
+    }
+
+    #[test]
+    fn required_credentials_refuse_missing_or_blank_files_and_never_debug_the_secret() {
+        let dir = aterm_tempfile::TempDir::new().expect("scratch");
+        let file = dir.path().join("token");
+        assert!(GitAuth::required(&file, "https://github.com").is_err());
+        std::fs::write(&file, " \n").expect("blank fixture credential");
+        assert!(GitAuth::required(&file, "https://github.com").is_err());
+        let secret = "github_pat_redaction_fixture";
+        std::fs::write(&file, secret).expect("fixture credential");
+        let auth = GitAuth::required(&file, "https://github.com").expect("known origin");
+        assert!(!format!("{auth:?}").contains(secret));
+        assert!(
+            !auth
+                .arguments()
+                .iter()
+                .any(|arg| arg.to_string_lossy().contains(secret))
+        );
+        assert_eq!(
+            auth.environment().expect("credential environment"),
+            vec![(GIT_TOKEN_ENV.into(), secret.into())]
+        );
+        assert_eq!(
+            auth.redact(&format!("remote echoed {secret}")),
+            "remote echoed [redacted]"
+        );
+        assert!(GitAuth::required(&file, "https://github.com.helper=!other").is_err());
+        assert!(GitAuth::required(&file, "file:///r").is_err());
+    }
 
     #[test]
     fn a_name_is_one_segment_and_a_credential_is_scoped_to_an_http_origin() {
@@ -698,6 +981,12 @@ mod tests {
         );
         let cmd = host.git_command(&["fetch".into()]).expect("the command");
         assert_eq!(shows(&cmd, secret), [format!("env: {GIT_TOKEN_ENV}")]);
+        for name in ["GIT_TRACE2", "GIT_TRACE2_EVENT", "GIT_TRACE2_PERF"] {
+            assert!(
+                cmd.get_envs()
+                    .any(|(key, value)| key == name && value == Some(std::ffi::OsStr::new("0")))
+            );
+        }
         let args: Vec<String> = cmd.get_args().map(text).collect();
         assert_eq!(
             args[..2],
@@ -734,6 +1023,8 @@ mod tests {
         let cmd = local.git_command(&["fetch".into()]).expect("the command");
         assert_eq!(shows(&cmd, secret), Vec::<String>::new());
         assert!(!cmd.get_args().any(|a| text(a).contains("helper=!")));
+        assert!(credential_origin("https://github.com.helper=!evil").is_none());
+        assert!(credential_origin("https://user@github.com").is_none());
         assert!(
             cmd.get_envs()
                 .any(|(k, v)| k == GIT_TOKEN_ENV && v.is_none())

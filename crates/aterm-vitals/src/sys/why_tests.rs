@@ -1167,6 +1167,27 @@ fn the_byte_cut_moves_rows_into_more_unless_top_is_given() {
 }
 
 #[test]
+fn the_hardware_block_gives_way_before_the_last_who_rows() {
+    let mut s = read(&long_workers_1032(), 3);
+    s.hardware = Some(crate::hardware::Sample::unavailable(
+        "refused:ioreport_subscription",
+    ));
+    s.authorized_cpu_policy = Some(std::sync::Arc::new(Jv::obj([("state", Jv::s("ok"))])));
+    let w = mac();
+    let events = pressure_events(9, s.at_ns);
+    let c = Ctx {
+        events: &events,
+        ..ctx(&w, &s, true)
+    };
+    let t = why("why", &c);
+    assert!(t.len() <= REPLY_MAX, "{} bytes\n{t}", t.len());
+    assert!(!lines(&t, "who").is_empty(), "{t}");
+    assert!(t.contains("`sys cores` prints it"), "{t}");
+    let cores = why("cores", &c);
+    assert!(cores.contains("CPU hardware: native IOReport"), "{cores}");
+}
+
+#[test]
 fn the_cut_counts_a_since_replys_delta_header() {
     let base = read(&long_workers_1032(), 3);
     let w = mac();

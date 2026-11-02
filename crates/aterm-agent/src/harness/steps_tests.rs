@@ -248,6 +248,14 @@ fn the_user_rows_that_ask_nothing_emit_no_prompt() {
         prompt("g", 0, "/compact"),
         prompt("h", 0, "\\n  <command-message>doctor</command-message>"),
         prompt("i", 0, "anything").replace(r#""type":"user","#, r#""type":"user","isMeta":true,"#),
+        prompt("i2", 0, "a person's expansion").replace(
+            r#""type":"user","#,
+            r#""type":"user","isMeta":true,"origin":{"kind":"human"},"#,
+        ),
+        prompt("i3", 0, "Claude Code's own continuation").replace(
+            r#""type":"user","#,
+            r#""type":"user","isMeta":true,"origin":{"kind":"auto-continuation"},"#,
+        ),
         prompt("j", 0, "summary").replace(
             r#""type":"user","#,
             r#""type":"user","isCompactSummary":true,"#,

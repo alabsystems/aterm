@@ -42,6 +42,11 @@ pub struct WorkerCli {
     pub operand: &'static str,
     /// The flag `model=` names the model by, followed by the model.
     pub model_flag: &'static str,
+    /// The model a fresh start runs where `model=` names none ([`Fresh::model`]); `None`
+    /// leaves the CLI its own default.
+    pub default_model: Option<&'static str>,
+    /// Flag words (each flag with its value) every fresh start carries.
+    pub default_flags: &'static [&'static str],
     /// CLI flag that trusts the starting folder for this run alone ([`Fresh::trusted_here`]).
     pub trust_flag: Option<&'static str>,
     /// CLI flag that names the permission mode a fresh start runs in
@@ -182,6 +187,8 @@ pub static WORKERS: [WorkerCli; 5] = [
         word: "claude",
         operand: upgrade::TASK_OPERAND,
         model_flag: "--model",
+        default_model: None,
+        default_flags: &[],
         trust_flag: None,
         permission_flag: Some(CLAUDE_PERMISSION_MODE),
         chrome_flag: Some(CLAUDE_CHROME_FLAG),
@@ -197,6 +204,8 @@ pub static WORKERS: [WorkerCli; 5] = [
         word: "codex",
         operand: upgrade::TASK_OPERAND,
         model_flag: "--model",
+        default_model: None,
+        default_flags: &[],
         trust_flag: None,
         permission_flag: None,
         chrome_flag: None,
@@ -221,6 +230,8 @@ pub static WORKERS: [WorkerCli; 5] = [
         word: super::upgrade_agy::PROGRAM,
         operand: upgrade::TASK_PROMPT_INTERACTIVE,
         model_flag: "--model",
+        default_model: None,
+        default_flags: &[],
         trust_flag: None,
         permission_flag: None,
         chrome_flag: None,
@@ -238,6 +249,8 @@ pub static WORKERS: [WorkerCli; 5] = [
         word: super::upgrade_muse::PROGRAM,
         operand: upgrade::TASK_OPERAND,
         model_flag: "--model",
+        default_model: Some(super::upgrade_muse::DEFAULT_MODEL),
+        default_flags: super::upgrade_muse::DEFAULT_FLAGS,
         trust_flag: Some("--trust-workspace"),
         permission_flag: None,
         chrome_flag: None,
@@ -264,6 +277,8 @@ pub static WORKERS: [WorkerCli; 5] = [
         word: grok::PROGRAM,
         operand: upgrade::TASK_OPERAND,
         model_flag: "--model",
+        default_model: None,
+        default_flags: &[],
         trust_flag: None,
         permission_flag: None,
         chrome_flag: None,
@@ -631,7 +646,10 @@ pub(crate) fn starter_of(
 /// What a worker's line names beside its program ([`fn@line`]).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Fresh<'a> {
-    /// `model=`: the CLI's `--model`.
+    /// Exact active aterm config; absence never selects shared native credentials.
+    pub config: Option<&'a Path>,
+    /// `model=`: the CLI's `--model`; `None` runs the row's
+    /// [`WorkerCli::default_model`], where it has one.
     pub model: Option<&'a str>,
     /// Whether the shell stands in the folder its starter trusted for it.
     pub trusted_here: bool,
@@ -750,7 +768,8 @@ pub(super) fn line_of(
     if let Some(flag) = cli.trust_flag.filter(|_| fresh.trusted_here) {
         flags.push(flag.to_string());
     }
-    if let Some(model) = fresh.model {
+    flags.extend(cli.default_flags.iter().map(|f| (*f).to_string()));
+    if let Some(model) = fresh.model.or(cli.default_model) {
         flags.push(cli.model_flag.to_string());
         flags.push(model.to_string());
     }
@@ -763,8 +782,15 @@ pub(super) fn line_of(
         .copied()
         .chain(cli.nicety.iter().copied())
         .collect();
-    upgrade::task_line_env_clear(dialect, &both, unset, exe, &flags, cli.operand)
-        .or_else(|_| upgrade::task_line_env_clear(dialect, env, unset, exe, &flags, cli.operand))
+    let wrapped = match super::native_keys::Provider::for_connector(cli.word) {
+        Some(provider) => super::native_keys::launch(provider, exe, &flags, &both, fresh.config)?,
+        None => None,
+    };
+    let (exe, flags) = wrapped.as_ref().map_or((exe, flags.as_slice()), |launch| {
+        (launch.program.as_path(), launch.args.as_slice())
+    });
+    upgrade::task_line_env_clear(dialect, &both, unset, exe, flags, cli.operand)
+        .or_else(|_| upgrade::task_line_env_clear(dialect, env, unset, exe, flags, cli.operand))
 }
 
 #[cfg(test)]

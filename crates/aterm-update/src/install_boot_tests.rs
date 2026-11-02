@@ -1254,6 +1254,7 @@ fn a_window_re_trial_is_bounded() {
 
     for (label, at) in [
         ("boot-retrial-lapsed", now - wait),
+        ("boot-retrial-ahead-one-sec", now + 1),
         ("boot-retrial-ahead", now + wait),
     ] {
         let (s, installed) = settled(label);
@@ -1516,6 +1517,12 @@ fn a_window_launch_record_answers_only_for_the_armed_trial() {
     clear_trial_identity(&s);
     assert!(!trial_window_launch_path(&s).exists());
     assert!(FailedMark::read(&s.trial()).is_none());
+    let target = s.root.join("private-write-target");
+    std::fs::write(&target, "untouched").unwrap();
+    let link = s.root.join("private-write-link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    assert!(write_private_file(&link, b"clobbered").is_err());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched");
     let _ = std::fs::remove_dir_all(&s.root);
 }
 
@@ -1544,6 +1551,11 @@ fn the_wait_for_a_window_ends() {
         WindowLaunch::Waiting { until: at + wait }
     );
     assert_eq!(trial_window_launch(&s, 11, at + wait), WindowLaunch::Lapsed);
+    assert_eq!(
+        trial_window_launch(&s, 11, at.saturating_sub(1)),
+        WindowLaunch::Lapsed,
+        "a record ahead of the clock holds nothing"
+    );
     assert_eq!(
         trial_window_launch(&s, 11, at.saturating_sub(wait)),
         WindowLaunch::Lapsed,

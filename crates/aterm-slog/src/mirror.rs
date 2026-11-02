@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE BUS MIRROR'S ENGINE HALF (design §5.5, phase 4): what a take of a log's bus-class records is, where the bus stands for the log, and the bodies a mirror publishes.
+//! THE BUS MIRROR'S ENGINE HALF (design §5.5, phase 4): what a take of a log's mirrored records ([`Rec::is_mirrored`]) is, where the bus stands for the log, and the bodies a mirror publishes.
 
 use super::{Entry, Log, entry_heap};
 use crate::field::{BoundedToken, Fields, Key, Tier, Val};
@@ -12,7 +12,7 @@ use crate::vocab::{Actor, Conf, Kind, Node, Op, ShortId, Src};
 /// The most slots one take answers (`log-take n=` is capped at it; the bridge asks half of its pipeline window).
 pub const TAKE_MAX: usize = 64;
 
-/// A snapshot every this many bus-class records (§5.5): a reader joining at any offset needs at most this many earlier bodies of the session.
+/// A snapshot every this many mirrored records (§5.5, `ms`, [`Rec::is_mirrored`]), placed only on a take that reaches the session's head ([`Log::bus_copy`]): a reader joining mid-burst is seeded by the next one and then needs every `ms` past its `upto=`.
 pub const SNAP_EVERY: u64 = 64;
 
 /// A snapshot also when the session's mail counts differ from the last one on the bus, at most one this often by the session's wall clock (§5.5, LOOP-2): mail marks stay local, so a snapshot's `mail_in=`/`mail_out=` are how a count crosses, and a quiet session reaches no 64th record.
@@ -21,18 +21,18 @@ pub const MAIL_SNAP_GAP_MS: u64 = 1_000;
 /// One ring entry's size: the shared record's pointer, its encoded bytes, its `ms` and its process-clock reading.
 pub const ENTRY_BYTES: usize = std::mem::size_of::<Entry>();
 
-/// What phase 4 added to every [`Log`]'s own size, mirror on or off: the bus class's `ms` head, the head at the readers' fence and the mirror's box (empty while nothing mirrors).
+/// What phase 4 added to every [`Log`]'s own size, mirror on or off: the mirror's `ms` head, the head at the readers' fence and the mirror's box (empty while nothing mirrors).
 pub const LOG_MIRROR_BYTES: usize =
     2 * std::mem::size_of::<u64>() + std::mem::size_of::<Option<Box<Mirror>>>();
 
-/// Where the bus holds a session's log up to: its seq space, the seq and the bus-class count `ms`.
+/// Where the bus holds a session's log up to: its seq space, the seq and the mirrored count `ms`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BusCursor {
     /// The seq space ([`Log::base_ep`]).
     pub ep: u32,
     /// The seq.
     pub seq: u64,
-    /// The bus-class count: every `ms` at or below it is on the bus.
+    /// The mirrored count: every `ms` at or below it is on the bus.
     pub ms: u64,
 }
 
@@ -52,10 +52,11 @@ impl BusCursor {
     /// A cursor's word read back, or `None`.
     #[must_use]
     pub fn parse(s: &str) -> Option<BusCursor> {
+        let digits = |v: &str| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit());
         let mut it = s.split(':');
-        let ep = it.next()?.parse().ok()?;
-        let seq = it.next()?.parse().ok()?;
-        let ms = it.next()?.parse().ok()?;
+        let ep = it.next().filter(|v| digits(v))?.parse().ok()?;
+        let seq = it.next().filter(|v| digits(v))?.parse().ok()?;
+        let ms = it.next().filter(|v| digits(v))?.parse().ok()?;
         it.next().is_none().then_some(BusCursor { ep, seq, ms })
     }
 }
@@ -65,7 +66,7 @@ impl BusCursor {
 pub struct Prior {
     /// Where the bus held the old space.
     pub landed: BusCursor,
-    /// The old space's bus-class count.
+    /// The old space's mirrored count.
     pub ms_head: u64,
 }
 
@@ -126,7 +127,7 @@ impl CoverWhy {
 /// What a slot's body is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SlotKind {
-    /// A record of the bus class.
+    /// A record the mirror publishes ([`Rec::is_mirrored`]).
     Record,
     /// A cover: `op=gap … n=<k>`, `ms=` the first of the `k` it covers.
     Cover,
@@ -271,7 +272,7 @@ pub enum LandRefused {
     Ahead,
 }
 
-/// A cover body (`op=gap why=<w> n=<k>`, `ms=` the first `ms` it covers): the statement that the `k` bus-class records from `lo` of space `ep` are not on the bus, and never will be.
+/// A cover body (`op=gap why=<w> n=<k>`, `ms=` the first `ms` it covers): the statement that the `k` mirrored records from `lo` of space `ep` are not on the bus, and never will be.
 #[must_use]
 pub fn cover_body(ep: u32, seq: u64, lo: u64, n: u64, why: CoverWhy, t: u64) -> String {
     let mut f = Fields::new();
@@ -369,7 +370,7 @@ fn snap_body(
 }
 
 impl Log {
-    /// The bus class's count in this seq space: the `ms` of the newest bus-class record appended, evicted or not.
+    /// The mirror's count in this seq space: the `ms` of the newest record the mirror publishes ([`Rec::is_mirrored`]) appended, evicted or not.
     #[must_use]
     pub const fn ms_head(&self) -> u64 {
         self.ms_head
@@ -397,14 +398,14 @@ impl Log {
         self.mirror.as_ref().and_then(|m| m.prior)
     }
 
-    /// The `ms` of the live record at `seq` (0 for a local-class one), or `None` when no live record has that seq.
+    /// The `ms` of the live record at `seq` (0 for one the mirror does not publish, [`Rec::is_mirrored`]), or `None` when no live record has that seq.
     #[must_use]
     pub fn ms_of(&self, seq: u64) -> Option<u64> {
         let i = self.ring.partition_point(|e| e.rec.seq < seq);
         self.ring.get(i).filter(|e| e.rec.seq == seq).map(|e| e.ms)
     }
 
-    /// The `ms` of every live bus-class record, oldest first: what a model's projection reads of the ring.
+    /// The `ms` of every live record the mirror publishes, oldest first: what a model's projection reads of the ring.
     pub fn live_ms(&self) -> impl Iterator<Item = u64> + '_ {
         self.ring.iter().map(|e| e.ms).filter(|ms| *ms > 0)
     }
@@ -457,7 +458,7 @@ impl Log {
         }
     }
 
-    /// THE TAKE, copied under the timeline's lock: at most `room` slots (capped at [`TAKE_MAX`]) past the landed cursor, oldest first, then a snapshot when one is due: at the space's first take, every [`SNAP_EVERY`] bus-class records, and when the mail counts moved, at most one every [`MAIL_SNAP_GAP_MS`] of `at`'s wall clock (a closed session's last counts are owed at once), alone at the landed cursor when nothing else is past it; a moved count the rate holds back says when it is due ([`BusCopy::due_in_ms`]).
+    /// THE TAKE, copied under the timeline's lock: at most `room` slots (capped at [`TAKE_MAX`]) past the landed cursor, oldest first, then a snapshot when one is due: at the space's first take, every [`SNAP_EVERY`] mirrored records, and when the mail counts moved, at most one every [`MAIL_SNAP_GAP_MS`] of `at`'s wall clock (a closed session's last counts are owed at once), alone at the landed cursor when nothing else is past it; a moved count the rate holds back says when it is due ([`BusCopy::due_in_ms`]).
     pub fn bus_copy(&mut self, room: usize, at: Stamp) -> BusCopy {
         let room = room.min(TAKE_MAX);
         let space = self.base_ep;
@@ -646,7 +647,7 @@ impl Log {
         Ok(Landed::Moved)
     }
 
-    /// A CLOSED SESSION'S BUS TAIL: a copy holding only the bus-class records past the landed cursor, with the cursor, the accounting a take reads and the fold its snapshot reads.
+    /// A CLOSED SESSION'S BUS TAIL: a copy holding only the mirrored records past the landed cursor, with the cursor, the accounting a take reads and the fold its snapshot reads.
     #[must_use]
     pub fn bus_tail(&self) -> Log {
         let mut t = Log::with_limits(self.ep, self.limits);

@@ -56,7 +56,12 @@ pub(crate) fn parse(rest: &str) -> Result<Asked, String> {
         ["open"] => Ok(Asked::Open(Target::Latest)),
         ["open", arg] => {
             let (key, value) = arg.split_once('=').ok_or_else(usage)?;
-            let n = value.parse::<u64>().map_err(|_| usage())?;
+            let n = value
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+                .then(|| value.parse::<u64>().ok())
+                .flatten()
+                .ok_or_else(usage)?;
             match key {
                 "ago" => Ok(Asked::Open(Target::Ago(n))),
                 "at" => Ok(Asked::Open(Target::At(Ticks(n)))),
@@ -68,9 +73,14 @@ pub(crate) fn parse(rest: &str) -> Result<Asked, String> {
         ["step", n, "by=cmd"] => count(n).map(|n| Asked::Step(StepBy::Cmd(n))),
         ["changed", cell] => {
             let (row, col) = cell.split_once(',').ok_or_else(usage)?;
-            let row = row.parse::<u16>().map_err(|_| usage())?;
-            let col = col.parse::<u16>().map_err(|_| usage())?;
-            Ok(Asked::Changed(row, col))
+            let u16_digits = |s: &str| {
+                s.bytes()
+                    .all(|b| b.is_ascii_digit())
+                    .then(|| s.parse::<u16>().ok())
+                    .flatten()
+                    .ok_or_else(usage)
+            };
+            Ok(Asked::Changed(u16_digits(row)?, u16_digits(col)?))
         }
         ["text"] => Ok(Asked::Text { trim: false }),
         ["text", "trim"] => Ok(Asked::Text { trim: true }),
@@ -147,6 +157,7 @@ pub(crate) fn cmd(
 
 /// `rewind export`: the session's kept history as an asciicast file in `<state dir>/rewind/`, mode 0600.
 fn export_verb(ctx: &crate::SessionCtx) -> String {
+    let _consumer = crate::temporal::consumer_demand();
     let export = export_of(
         &ctx.temporal
             .lock()
@@ -204,6 +215,7 @@ const NOTHING_REPLAYS: &str = "nothing recorded replays now";
 
 /// `rewind check [export]`: every replayable chain replayed under this build as the pane task and judged by `pane.faithful-replay`, with no live effect; `export` also writes the first failing chain (else the newest) as a pane trace, mode 0600, under the state directory's `rewind/`, for `aos check`.
 fn check_verb(ctx: &crate::SessionCtx, export: bool) -> String {
+    let _consumer = crate::temporal::consumer_demand();
     let chains = {
         let rec = ctx
             .temporal

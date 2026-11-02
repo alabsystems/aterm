@@ -3,7 +3,7 @@
 
 //! `presence-flap --window`.
 
-use std::io::{BufRead as _, Write as _};
+use std::io::{BufRead as _, Read as _, Write as _};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -30,7 +30,7 @@ const LEADS_MS: [u64; 3] = [350, 100, 20];
 const HANG: Duration = Duration::from_mins(1);
 
 fn sleep(secs: f64) -> Result<(), Stopped> {
-    stop::sleep(Duration::from_secs_f64(secs))
+    stop::sleep(Duration::try_from_secs_f64(secs).unwrap_or(Duration::ZERO))
 }
 
 /// One resize row of the ledger.
@@ -248,9 +248,14 @@ impl Held {
     }
 
     fn line(&mut self) -> Result<String, String> {
+        const MAX_LINE: usize = 1024 * 1024;
         let mut l = String::new();
-        match self.r.read_line(&mut l) {
+        match std::io::Read::by_ref(&mut self.r)
+            .take((MAX_LINE as u64) + 1)
+            .read_line(&mut l)
+        {
             Ok(0) => Err("the control socket closed".into()),
+            Ok(_) if l.len() > MAX_LINE => Err("the control reply exceeds 1 MiB".into()),
             Ok(_) => Ok(l.trim_end_matches(['\r', '\n']).to_string()),
             Err(e) => Err(format!("the control connection: {e}")),
         }

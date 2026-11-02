@@ -40,6 +40,7 @@ pub use time::duration_to_nanos;
 
 pub mod rfc3339;
 pub mod rust_lane;
+pub mod update_boundary;
 
 pub mod app_inspection;
 mod color_palette;

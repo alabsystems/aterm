@@ -168,18 +168,31 @@ pub fn replay_lines(
     replayed: &[Replayed],
     looks: usize,
     holds: usize,
-    (from_ms, to_ms): (i64, i64),
+    window: (i64, i64),
     offset_s: i64,
 ) -> Vec<String> {
+    replay_lines_local(replayed, looks, holds, window, &|_| Some(offset_s))
+}
+
+/// [`replay_lines`], resolving each instant's local offset from `local_at`.
+#[must_use]
+pub fn replay_lines_local(
+    replayed: &[Replayed],
+    looks: usize,
+    holds: usize,
+    (from_ms, to_ms): (i64, i64),
+    local_at: &dyn Fn(i64) -> Option<i64>,
+) -> Vec<String> {
+    let at = |at_ms: i64| clock_words(at_ms, local_at(at_ms.div_euclid(1000)).unwrap_or(0));
     let mut lines = vec![format!(
         "replay from {} to {} looks={looks} holds={holds}",
-        clock_words(from_ms, offset_s),
-        clock_words(to_ms, offset_s)
+        at(from_ms),
+        at(to_ms)
     )];
     for r in replayed {
         lines.push(format!(
             "{} {} {}",
-            clock_words(r.at_ms, offset_s),
+            at(r.at_ms),
             r.rule.name(),
             r.verdict.words()
         ));
@@ -195,7 +208,7 @@ pub fn replay_lines(
         let first = replayed
             .iter()
             .find(|r| r.rule == rule && r.verdict == SaidVerdict::Would)
-            .map_or_else(|| "never".to_string(), |r| clock_words(r.at_ms, offset_s));
+            .map_or_else(|| "never".to_string(), |r| at(r.at_ms));
         lines.push(format!("{} first would {first}", rule.name()));
     }
     lines
@@ -206,7 +219,7 @@ pub fn replay_lines(
 pub fn window_ms(word: &str) -> Option<i64> {
     let word = word.trim();
     let unit = word.chars().last()?;
-    let n: i64 = word.get(..word.len() - unit.len_utf8())?.parse().ok()?;
+    let n: i64 = crate::parse_uint(word.get(..word.len() - unit.len_utf8())?)?;
     let ms = n.checked_mul(match unit {
         's' => 1000,
         'm' => 60_000,

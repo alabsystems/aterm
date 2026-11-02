@@ -232,6 +232,7 @@ impl Drawn {
     }
 }
 
+/// R1-R5 as `seat_scroll` states them, and `Clip`: a list's rows end within its page's clip.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Rule {
     R1,
@@ -239,6 +240,7 @@ enum Rule {
     R3,
     R4,
     R5,
+    Clip,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -284,6 +286,21 @@ struct Frame {
 }
 
 impl Frame {
+    /// Whether this frame drew its plain status's bar as `bar`: as tall, docked or stacked alike.
+    fn bar_at(&self, bar: Option<StatusBar>) -> bool {
+        let tall = self
+            .screen
+            .semantic(&UiKey::new("settings/feedback"))
+            .filter(|_| self.drawn.status)
+            .map(|node| node.rect.height);
+        let docked = self
+            .screen
+            .semantic(&UiKey::new("settings/status-dock"))
+            .is_some();
+        bar.zip(tall)
+            .is_some_and(|(bar, tall)| bar.docked == docked && (bar.tall - tall).abs() < 0.5)
+    }
+
     fn listed(&self, key: &str) -> bool {
         self.list
             && self
@@ -397,6 +414,8 @@ struct Reach {
     chrome: PageChrome,
     /// The screen the first frame of the freshly opened page seats.
     seated: Screenful,
+    /// The scroll of a seat partway into the control's stop where that stop outgrows the room.
+    partway: Option<usize>,
 }
 
 /// A plain status's bar under the page as a frame draws it, and the least it can be. The bar's
@@ -459,6 +478,34 @@ fn rungs(drawn: Drawn) -> Vec<PageChrome> {
         .flatten()
         .collect()
 }
+
+/// The room `frame`'s demo-led list has in the rung where the toolbar it lists leads it too.
+fn toolbar_led_room(state: &SettingsViewState, frame: &Frame) -> Option<f32> {
+    let led = frame
+        .plan
+        .as_ref()
+        .is_some_and(|plan| plan.stop_of_identity(&UiKey::new(STAGE_STOP)).is_some());
+    let cx = cx_of(frame.drawn);
+    let width = SettingsWidth::for_viewport(cx.viewport.width);
+    let rung = PageChrome::ladder(width, cx.viewport)
+        .into_iter()
+        .find(|rung| rung.toolbar_listed)
+        .filter(|_| led && !frame.chrome.toolbar_listed)
+        .filter(|_| compact_toolbar_can_list(state, cx.viewport))?;
+    let was = (
+        state.page_chrome.replace(rung),
+        state.status_bar_most.replace(Some(0.0)),
+    );
+    let room = settings_list_body_height(state, width, cx.viewport)
+        - plain_status_extra(state, width, cx.viewport)
+        - 2.0 * showcase_page::PANEL_INSET;
+    state.page_chrome.set(was.0);
+    state.status_bar_most.set(was.1);
+    Some(room.max(0.0))
+}
+
+/// The demo's stop where it leads a stacked list.
+const STAGE_STOP: &str = "settings/showcase/stage/stop";
 
 impl Reach {
     /// A scroll whose screen shows the keyboard's control as `owed` asks.
@@ -934,9 +981,24 @@ impl Sweep {
             ));
             drawn.push(chosen.chrome);
         }
-        keys.extend(
-            rungs(key.drawn)
+        // R2's screens (`stacked`) in a chrome giving a bar room are each rung's giving one too.
+        let giving = stacked && chrome.bar_room_given;
+        let mut each = rungs(key.drawn);
+        each.extend(
+            each.clone()
                 .into_iter()
+                .filter(|_| giving)
+                .map(PageChrome::giving_bar_room),
+        );
+        let mut seen = Vec::new();
+        each.retain(|rung| {
+            !seen.contains(rung) && {
+                seen.push(*rung);
+                true
+            }
+        });
+        keys.extend(
+            each.into_iter()
                 .filter(|rung| !drawn.contains(rung))
                 .map(|rung| {
                     (
@@ -978,6 +1040,40 @@ impl Sweep {
         false
     }
 
+    /// What R2 asks of the control in `chrome` chosen anew: whole where another rung shows it so.
+    fn asked_anew(&self, key: &ReachOf, chrome: PageChrome) -> Kept {
+        let others = rungs(key.drawn)
+            .into_iter()
+            .flat_map(|rung| {
+                [
+                    Some(rung),
+                    chrome.bar_room_given.then(|| rung.giving_bar_room()),
+                ]
+            })
+            .flatten()
+            .filter(|rung| *rung != chrome)
+            .map(|rung| {
+                self.reach(&ReachOf {
+                    chrome: Some(Chrome(rung)),
+                    ..key.clone()
+                })
+            })
+            .collect::<Vec<_>>();
+        if others
+            .iter()
+            .any(|reach| reach.covering(Kept::Whole).is_some())
+        {
+            return Kept::Whole;
+        }
+        // Else the most another rung shows of it.
+        others
+            .iter()
+            .filter_map(|reach| reach.most())
+            .fold(Kept::Part(0.0), |asked, (_, most)| {
+                if asked.covers(most) { asked } else { most }
+            })
+    }
+
     /// R2 AND R5 OF A FRAME SHOWING `now` of the control, owing `owed`: `Err` names one with more.
     fn judge(
         &self,
@@ -1012,6 +1108,22 @@ impl Sweep {
             ));
         }
         let (reach, chosen) = self.framed(key, chrome);
+        // None of it drawn, where a rung's list seats partway into the control's tall stop (R2).
+        let mut partway = None;
+        if matches!(now, Kept::Part(part) if part < 0.5) {
+            self.each_reach(key, chrome, true, ReachOf::clone, |said, reach| {
+                partway = reach
+                    .partway
+                    .map(|top| format!("{said}the seat at scroll {top}"));
+                partway.is_some()
+            });
+        }
+        if let Some(partway) = partway {
+            return Err(format!(
+                "none of it drawn, but {partway}, partway into its stop taller than the room, \
+                 paints some of it: not the screen that shows the most"
+            ));
+        }
         let held = ReachOf {
             chrome: chosen.map(|_| Chrome(chrome)),
             ..key.clone()
@@ -1035,7 +1147,9 @@ impl Sweep {
         let drawn = key.drawn;
         STATUS_BAR_LEAST.with(|least| least.set(key.least));
         STATUS_UNDOCKED.with(|undocked| undocked.set(key.undocked));
-        PAGE_CHROME_HELD.with(|held| held.set(key.chrome.map(|chrome| chrome.0)));
+        // A walk's own hold (a test's) comes back once this measure is done.
+        let walks_held =
+            PAGE_CHROME_HELD.with(|held| held.replace(key.chrome.map(|chrome| chrome.0)));
         let (mut runtime, instance, view) = self.opened(drawn);
         if Held::of(view_state(&mut runtime, view)) != key.held {
             key.held.put(view_state(&mut runtime, view));
@@ -1101,6 +1215,7 @@ impl Sweep {
             elsewhere: None,
             chrome,
             seated: screen_of(&first),
+            partway: None,
         };
         // The plan a held screen measures; one drawn before the reveal held the list need not.
         let held = std::cell::RefCell::new(None);
@@ -1154,7 +1269,7 @@ impl Sweep {
         {
             STATUS_BAR_LEAST.with(|least| least.set(false));
             STATUS_UNDOCKED.with(|undocked| undocked.set(false));
-            PAGE_CHROME_HELD.with(|held| held.set(None));
+            PAGE_CHROME_HELD.with(|held| held.set(walks_held));
             return reach;
         }
         // The row whole on the screen at its stop, and beside the control on the upper of the two.
@@ -1219,7 +1334,7 @@ impl Sweep {
         if let Some(seen) = seen {
             STATUS_BAR_LEAST.with(|least| least.set(false));
             STATUS_UNDOCKED.with(|undocked| undocked.set(false));
-            PAGE_CHROME_HELD.with(|held| held.set(None));
+            PAGE_CHROME_HELD.with(|held| held.set(walks_held));
             let seated = reach.seated;
             let mut reach = Reach::clone(&seen);
             for screen in reach.screens.values_mut() {
@@ -1322,6 +1437,12 @@ impl Sweep {
                 let _ = look(top, &mut reach);
             }
         }
+        // The seat partway into a control's stop taller than the room (`tall_stop_seat`).
+        reach.partway = control
+            .zip(plan.as_ref())
+            .filter(|(_, plan)| plan.room() > 0.5)
+            .and_then(|(key, plan)| plan.tall_stop_seat(&UiKey::new(key)))
+            .map(|seat| seat.top);
         reach.elsewhere = if pinned {
             reach
                 .screens
@@ -1333,7 +1454,7 @@ impl Sweep {
         };
         STATUS_BAR_LEAST.with(|least| least.set(false));
         STATUS_UNDOCKED.with(|undocked| undocked.set(false));
-        PAGE_CHROME_HELD.with(|held| held.set(None));
+        PAGE_CHROME_HELD.with(|held| held.set(walks_held));
         if let Some(alike) = alike {
             self.alike
                 .lock()
@@ -1588,7 +1709,10 @@ fn walk(sweep: &Sweep, start: Drawn, steps: &[Step]) -> Findings {
                 .join(", ");
             format!("{scenario} from {start} [{walked}]: frame {at} at {drawn}")
         };
+        // Whether this frame broke R2: it outranks R5 only on a frame keeping it.
+        let r2_broken = Cell::new(false);
         let mut fault = |rule: Rule, said: String| {
+            r2_broken.set(r2_broken.get() || rule == Rule::R2);
             found.faults.push((rule, format!("{}: {said}", at_frame())));
             if !found.firsts.iter().any(|(seen, _)| *seen == rule) {
                 found.firsts.push((rule, at));
@@ -1614,6 +1738,48 @@ fn walk(sweep: &Sweep, start: Drawn, steps: &[Step]) -> Findings {
                     frame.first()
                 ),
             );
+        }
+        // CLIP: a list's rows end in its page's clip, the keyboard's control in its own, to 0.5pt.
+        if let Some(list) = [LIST, SHEET_LIST].into_iter().find_map(|list| {
+            frame
+                .screen
+                .paint
+                .iter()
+                .find(|node| node.key.as_str() == list)
+        }) {
+            // Its rows run from the screen's first stop to the list's last, no further than its foot.
+            let rows = frame.plan.as_ref().zip(frame.top).map(|(plan, top)| {
+                let screen = plan.screen(top.min(plan.limit()));
+                plan.span(screen.view.start..plan.len()) - screen.offset
+            });
+            let end = rows.map_or(list.rect.bottom(), |rows| {
+                (list.rect.y + rows).min(list.rect.bottom())
+            });
+            let below = end - list.clip.bottom();
+            if below > 0.5 {
+                fault(
+                    Rule::Clip,
+                    format!(
+                        "its list lays rows out {below}pt past the bottom its page clips it at: \
+                         its seats count what is laid there in view"
+                    ),
+                );
+            }
+            if let Some(key) = control.as_deref().filter(|key| frame.listed(key))
+                && let Some(node) = frame
+                    .screen
+                    .paint
+                    .iter()
+                    .find(|node| node.key.as_str() == key)
+                && let past = (node.rect.right() - node.clip.right()).max(node.clip.x - node.rect.x)
+                && past > 0.5
+                && node.clip.height > 0.0
+            {
+                fault(
+                    Rule::Clip,
+                    format!("{key} is laid out {past}pt past a side of its clip in the list"),
+                );
+            }
         }
         // R2 and R5: what this frame owes the keyboard's control, and why.
         let owed = control.as_deref().and_then(|_| match step {
@@ -1645,9 +1811,29 @@ fn walk(sweep: &Sweep, start: Drawn, steps: &[Step]) -> Findings {
                     *rule,
                     format!("{key} ({how}) {owed} as {why}, under a pinned head: {cause}"),
                 ),
-                Ok(cause) => found
-                    .exceptions
-                    .push(format!("{rule:?} at {drawn}: {key} {owed}, {cause}")),
+                // Nor where the toolbar its window lists, leading its list too, leaves it room.
+                Ok(cause) => {
+                    match frame
+                        .shown(key)
+                        .filter(|_| frame.listed(key))
+                        .and_then(|(_, tall)| {
+                            toolbar_led_room(state(&runtime, view), &frame)
+                                .filter(|room| tall <= room + 0.5)
+                        }) {
+                        Some(room) => fault(
+                            *rule,
+                            format!(
+                                "{key} (listed) {owed} as {why}, {} now, its list led by the demo: led \
+                             by the toolbar its window lists too, the list holds {room}pt, room \
+                             for it whole",
+                                frame.kept(key)
+                            ),
+                        ),
+                        None => found
+                            .exceptions
+                            .push(format!("{rule:?} at {drawn}: {key} {owed}, {cause}")),
+                    }
+                }
                 Err(said) => fault(
                     *rule,
                     format!(
@@ -1658,37 +1844,85 @@ fn walk(sweep: &Sweep, start: Drawn, steps: &[Step]) -> Findings {
                 ),
             }
         }
-        // R2: a chrome chosen anew cuts the keyboard's control only where every other rung does.
+        // R2: a chrome chosen anew cuts the control only where all rungs do, nor shows less of it.
         let giving = frame.chrome.bar_room_given;
         if let (Some(key), Some(_)) = (control.as_deref(), owed.as_ref())
             && let Kept::Part(part) = frame.kept(key)
-            && part > 0.5
             && (step.is_none() || persons)
             && last.as_ref().is_none_or(|last| last.chrome != frame.chrome)
-            && let Some((rung, scroll)) = rungs(drawn)
-                .into_iter()
-                .flat_map(|rung| [Some(rung), giving.then(|| rung.giving_bar_room())])
-                .flatten()
-                .filter(|rung| *rung != frame.chrome)
-                .find_map(|rung| {
-                    sweep
-                        .reach(&ReachOf {
+        {
+            let others = || {
+                rungs(drawn)
+                    .into_iter()
+                    .flat_map(|rung| [Some(rung), giving.then(|| rung.giving_bar_room())])
+                    .flatten()
+                    .filter(|rung| *rung != frame.chrome)
+                    .map(|rung| {
+                        let reach = sweep.reach(&ReachOf {
                             chrome: Some(Chrome(rung)),
                             ..kept_reach_of.clone()
-                        })
-                        .covering(Kept::Whole)
-                        .map(|scroll| (rung, scroll))
+                        });
+                        (rung, reach)
+                    })
+            };
+            let shows = others()
+                .find_map(|(rung, reach)| {
+                    let scroll = reach.covering(Kept::Whole)?;
+                    Some((rung, scroll, Kept::Whole))
                 })
+                .or_else(|| {
+                    others().find_map(|(rung, reach)| {
+                        let (scroll, most) = reach
+                            .most()
+                            .filter(|(_, most)| !Kept::Part(part).covers(*most))?;
+                        Some((rung, scroll, most))
+                    })
+                });
+            if let Some((rung, scroll, most)) = shows {
+                fault(
+                    Rule::R2,
+                    format!(
+                        "{key} {} in {:?}, chosen anew, though in {rung:?}, a rung of its ladder, \
+                         the screen at scroll {scroll} shows it {most}",
+                        frame.kept(key),
+                        frame.chrome
+                    ),
+                );
+            }
+        }
+        // R3 before any event: no landing whole, none of the control, where a rung shows it whole.
+        if let Some(key) = control.as_deref()
+            && opening
+            && matches!(frame.kept(key), Kept::Part(part) if part < 0.5)
+            && owed
+                .as_ref()
+                .is_none_or(|(owed, _, _)| frame.kept(key).covers(*owed))
+            && !frame.in_list(landing)
+            && wheeled.is_none()
+            && step.is_some_and(|step| !matches!(step, Step::Again | Step::Tick | Step::Refresh))
         {
-            fault(
-                Rule::R2,
-                format!(
-                    "{key} {} in {:?}, chosen anew, though in {rung:?}, a rung of its ladder, the \
-                     screen at scroll {scroll} shows it whole",
-                    frame.kept(key),
-                    frame.chrome
-                ),
+            let mut shows = None;
+            sweep.each_reach(
+                &kept_reach_of,
+                frame.chrome,
+                true,
+                ReachOf::clone,
+                |said, reach| {
+                    shows = reach.covering(Kept::Whole).map(|scroll| {
+                        format!("{said}the screen at scroll {scroll} shows it whole")
+                    });
+                    shows.is_some()
+                },
             );
+            if let Some(shows) = shows {
+                fault(
+                    Rule::R3,
+                    format!(
+                        "{key} shown none of it nor the theme in use's {landing} whole, before \
+                         any event, though {shows}"
+                    ),
+                );
+            }
         }
         // R2: the keyboard's listed control, painted at all, is whole across in a list as wide.
         if let Some(key) = control.as_deref()
@@ -1715,7 +1949,16 @@ fn walk(sweep: &Sweep, start: Drawn, steps: &[Step]) -> Findings {
                 ..kept_reach_of.clone()
             };
             let (reach, chosen) = framed(&first_of);
-            let shows = |reach: &Reach| reach.first_row_with(reach.asked(*owed));
+            // R2, kept, outranks R5: in a chrome but the last frame's, the filter as R2 asks too.
+            let shows = |reach: &Reach| {
+                let asked = reach.asked(*owed);
+                let scroll = reach.first_row_with(asked)?;
+                if r2_broken.get() || last.as_ref().is_none_or(|last| last.chrome == reach.chrome) {
+                    return Some(scroll);
+                }
+                let anew = sweep.asked_anew(&kept_reach_of, reach.chrome);
+                reach.first_row_with(if asked.covers(anew) { asked } else { anew })
+            };
             // Judged over the rungs as R3 is: another rung, or the bar at its least, at any seat.
             let rungs = || {
                 let mut found = None;
@@ -1914,8 +2157,20 @@ fn walk(sweep: &Sweep, start: Drawn, steps: &[Step]) -> Findings {
                     .zip(control.as_deref())
                     .is_none_or(|(owed, key)| frame.kept(key).covers(owed)))
         {
+            // The screens under the bar drawn: the choice's, or the least's where the frame drew it.
             let reach = asks.map(|owed| {
-                let reach = framed(&kept_reach_of).0;
+                let (reach, chosen) = framed(&kept_reach_of);
+                let held = ReachOf {
+                    chrome: chosen.map(|_| Chrome(frame.chrome)),
+                    ..kept_reach_of.clone()
+                };
+                let least = (!frame.bar_at(reach.bar))
+                    .then(|| sweep.at_least(&held, &reach))
+                    .flatten();
+                let reach = match least {
+                    Some((least, _)) if frame.bar_at(least.bar) => least,
+                    _ => reach,
+                };
                 let asked = reach.asked(owed);
                 (reach, asked)
             });
@@ -1959,46 +2214,64 @@ fn walk(sweep: &Sweep, start: Drawn, steps: &[Step]) -> Findings {
         {
             let mut read: Vec<Arc<Reach>> = Vec::new();
             for (key, reach) in judged.take() {
-                let reach = if drawn.status && key.reveal != reach_of.reveal {
+                let (key, reach) = if drawn.status && key.reveal != reach_of.reveal {
                     let key = ReachOf {
                         reveal: reach_of.reveal.clone(),
                         ..key
                     };
-                    sweep.framed(&key, frame.chrome).0
+                    let reach = sweep.framed(&key, frame.chrome).0;
+                    (key, reach)
                 } else {
-                    reach
+                    (key, reach)
                 };
                 if read.iter().any(|seen| Arc::ptr_eq(seen, &reach)) {
                     continue;
                 }
                 read.push(Arc::clone(&reach));
                 found.compared += 1;
-                let listed = frame.list_drawn();
-                let at = reach.screens.get(&top);
-                let lists = at
-                    .or_else(|| reach.screens.values().next())
-                    .and_then(|screen| screen.listed);
-                let same_list = lists
-                    .zip(listed)
-                    .is_some_and(|((was, tall), (now, height))| {
-                        was == now && (tall - height).abs() < 0.5
+                let unlike = |reach: &Reach| {
+                    let listed = frame.list_drawn();
+                    let at = reach.screens.get(&top);
+                    let lists = at
+                        .or_else(|| reach.screens.values().next())
+                        .and_then(|screen| screen.listed);
+                    let same_list =
+                        lists
+                            .zip(listed)
+                            .is_some_and(|((was, tall), (now, height))| {
+                                was == now && (tall - height).abs() < 0.5
+                            });
+                    let same_room = at.is_none_or(|screen| {
+                        (screen.room - frame.room).abs() < 0.5
+                            && (screen.list_top - frame.list_top).abs() < 0.5
                     });
-                let same_room = at.is_none_or(|screen| {
-                    (screen.room - frame.room).abs() < 0.5
-                        && (screen.list_top - frame.list_top).abs() < 0.5
-                });
-                let mixed = reach.mixed();
-                if !same_list || !same_room || !mixed.is_empty() {
-                    let at_frame = at_frame();
-                    found.unlike.push(format!(
-                        "{at_frame}: the reach it is judged by lists {lists:?} (stops, tall), the \
-                         frame {listed:?}; at scroll {top} it leaves the list {:?} (room, top), the \
-                         frame ({}, {}); its screens at {mixed:?} are in another chrome than {:?}",
-                        at.map(|screen| (screen.room, screen.list_top)),
-                        frame.room,
-                        frame.list_top,
-                        reach.chrome
-                    ));
+                    let mixed = reach.mixed();
+                    (!same_list || !same_room || !mixed.is_empty()).then(|| {
+                        format!(
+                            "the reach it is judged by lists {lists:?} (stops, tall), the frame \
+                             {listed:?}; at scroll {top} it leaves the list {:?} (room, top), the \
+                             frame ({}, {}); its screens at {mixed:?} are in another chrome than \
+                             {:?}",
+                            at.map(|screen| (screen.room, screen.list_top)),
+                            frame.room,
+                            frame.list_top,
+                            reach.chrome
+                        )
+                    })
+                };
+                // A frame whose bar shortened to its least lists as the reach under its least.
+                if let Some(said) = unlike(&reach)
+                    && sweep
+                        .at_least(
+                            &ReachOf {
+                                chrome: Some(Chrome(frame.chrome)),
+                                ..key
+                            },
+                            &reach,
+                        )
+                        .is_none_or(|(least, _)| unlike(&least).is_some())
+                {
+                    found.unlike.push(format!("{}: {said}", at_frame()));
                 }
             }
         }
@@ -2383,6 +2656,21 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
         (row, statused((244, 440), 1), vec![]),
         // A status under a held give-way chrome leaves it to the page, the landing whole (R3).
         (row_after, at((238, 668), 2), vec![Status]),
+        // R4 across a resize: the seat nearest the wheel's place showing the card, bar at least.
+        (
+            latte,
+            warned((2_273, 902), 2),
+            vec![
+                Press(MOCHA),
+                Status,
+                Text,
+                Press(MOCHA),
+                Text,
+                Wheel(-3),
+                Warning,
+                Window((417, 746)),
+            ],
+        ),
         // A theme row pressed twice is kept, which the reaches hold too.
         (
             row,
@@ -3397,27 +3685,6 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
             ],
         ),
         (
-            well,
-            at((918, 570), 1),
-            vec![
-                Wheel(8),
-                Text,
-                Window((314, 897)),
-                Warning,
-                Window((496, 306)),
-                Wheel(-8),
-                Text,
-                Wheel(1),
-                Again,
-                Window((1_402, 598)),
-                Window((1_132, 381)),
-                Status,
-                Again,
-                Window((1_150, 165)),
-                Status,
-            ],
-        ),
-        (
             field,
             at((584, 306), 2),
             vec![
@@ -3692,34 +3959,6 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
                 Window((509, 625)),
                 Up,
                 Status,
-            ],
-        ),
-        (
-            cursor_color,
-            at((421, 550), 2),
-            vec![
-                Down,
-                Focus,
-                Window((940, 289)),
-                Again,
-                Status,
-                Warning,
-                Erase,
-                Window((230, 612)),
-                Tick,
-                Wheel(-4),
-                Again,
-                Left,
-                Window((479, 859)),
-                Again,
-                Wheel(-4),
-                Tick,
-                Up,
-                Window((1_289, 166)),
-                Text,
-                Status,
-                Text,
-                Text,
             ],
         ),
         (
@@ -4437,7 +4676,7 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
         ),
         // Once a known fault here and on main; now main (c5ef831d7f) alone breaks it (R2).
         (pack, warned((173, 139), 2), vec![Window((173, 138))]),
-        // A sheet not taking the listed toolbar draws the rung it leans on, no list under it (R2).
+        // A sheet the toolbar's row would leave led is led by the toolbar it lists, whole (R2).
         (field, statused((930, 148), 1), vec![Text]),
         (
             first,
@@ -4515,42 +4754,6 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
                 Wheel(4),
                 Right,
                 Warning,
-            ],
-        ),
-        (
-            import,
-            statused((1_367, 544), 2),
-            vec![
-                Again,
-                Window((1_708, 1_197)),
-                Up,
-                Wheel(-5),
-                Again,
-                Wheel(20),
-                Again,
-                Warning,
-                Window((1_708, 1_196)),
-                Window((1_046, 1_270)),
-                Window((1_046, 1_271)),
-                Up,
-                Warning,
-                Warning,
-                Warning,
-                Window((2_040, 215)),
-                Window((2_040, 216)),
-                Type,
-                Window((2_039, 216)),
-                Window((2_040, 216)),
-                Warning,
-                Type,
-                Status,
-                Again,
-                Status,
-                Status,
-                Right,
-                Focus,
-                Wheel(-1),
-                Again,
             ],
         ),
         // A rung is tried giving bar room only under bars, or in R2 from a chrome giving it (R4).
@@ -4719,6 +4922,37 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
                 Window((376, 129)),
             ],
         ),
+        // The toolbar's row would leave these led: 51a93cc997 breaks R2, c5ef831d7f R2 or Clip.
+        (
+            first,
+            warned((1_740, 277), 1),
+            vec![Text, Warning, Press(SAVE_AS), Window((1_519, 150))],
+        ),
+        (
+            background,
+            statused((1_100, 1_622), 1),
+            vec![Window((1_190, 149)), Text],
+        ),
+        (field, statused((955, 150), 1), vec![Text]),
+        // Here 51a93cc997 breaks R2, and c5ef831d7f's rows end in the clip under the toolbar.
+        (save_as, at((900, 149), 2), vec![]),
+        // A control a rung giving the bar's room shows whole is shown whole there (R2).
+        (cursor_color, at((2_497, 133), 2), vec![Up]),
+        // No list drawn where a rung seats partway into the control's tall stop (R2).
+        (well, warned((1_964, 179), 2), vec![Window((1_614, 167))]),
+        (
+            palette,
+            statused((1_410, 171), 1),
+            vec![
+                Text,
+                Warning,
+                Warning,
+                Warning,
+                Window((1_493, 174)),
+                Press(BACKGROUND_WELL),
+                Text,
+            ],
+        ),
         // A chrome chosen anew for the person shows the control whole where a rung does (R2).
         (field, at((2_851, 134), 2), vec![]),
         (
@@ -4756,6 +4990,43 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
                 Down,
             ],
         ),
+        // Under PALETTE a slot's held start is let go, its field whole: main cut it (R2).
+        (
+            palette_first,
+            at((234, 210), 1),
+            vec![Text, Press(PALETTE_FIRST)],
+        ),
+        (palette, statused((435, 209), 2), vec![Press(PALETTE_SLOT)]),
+        (palette, at((417, 156), 2), vec![Text, Press(PALETTE_SLOT)]),
+        (
+            first,
+            warned((1_268, 165), 2),
+            vec![Window((444, 240)), Wheel(8), Press(PALETTE_SLOT)],
+        ),
+        (
+            background,
+            warned_statused((2_770, 1_310), 2),
+            vec![
+                Window((1_480, 209)),
+                Press(SAVE_AS),
+                Wheel(-2),
+                Press(PALETTE_SLOT),
+            ],
+        ),
+        // New results stay in the chrome drawn last, not a rung cutting the filter it shows (R2).
+        (
+            closed,
+            at((1_737, 506), 2),
+            vec![
+                Warning,
+                Window((1_536, 146)),
+                Status,
+                Down,
+                Type,
+                Warning,
+                Erase,
+            ],
+        ),
     ]
 }
 
@@ -4789,9 +5060,13 @@ fn a_known_walk_is_held_to_every_rule_it_breaks() {
     assert!(!Known::BreaksUnlike(&[(Rule::R3, 1), (Rule::R2, 4)]).names(&does, false));
 }
 
-/// Walks that break a keeping rule on main (c5ef831d7f) as here, each doing what its entry names.
+/// Walks that break a keeping rule on main (c5ef831d7f) as here, each doing what its entry names
+/// in macOS's UI faces (another host's faces may keep every rule on one: [`sweep`]).
 fn known_faults() -> Vec<(Scenario, Drawn, Vec<Step>, Known)> {
-    use Step::{Down, Erase, Press, Status, Text, Type, Up, Warning, Wheel, Window};
+    use Step::{
+        Again, Down, Erase, Focus, Left, Press, Right, Status, Text, Tick, Type, Up, Warning,
+        Wheel, Window,
+    };
     let on = |keyboard, theme| Scenario {
         keyboard,
         theme,
@@ -4804,7 +5079,6 @@ fn known_faults() -> Vec<(Scenario, Drawn, Vec<Step>, Known)> {
         theme: "dark:Dracula,light:GitHub Light",
         in_use: "GitHub Light",
     };
-    let palette = on(Keyboard::Sheet(PALETTE_SLOT), "GitHub Light");
     let well = on(
         Keyboard::Sheet("settings/color-open/selection_foreground"),
         "GitHub Light",
@@ -4816,8 +5090,8 @@ fn known_faults() -> Vec<(Scenario, Drawn, Vec<Step>, Known)> {
     let one_dark = on(Keyboard::Row("One Dark"), "GitHub Light");
     let foreground = on(Keyboard::Sheet(FOREGROUND), "Dracula");
     let latte = on(Keyboard::Row("Catppuccin Latte"), "GitHub Light");
-    use Known::{Breaks, BreaksUnlike};
-    use Rule::{R2, R3, R4, R5};
+    use Known::Breaks;
+    use Rule::{Clip, R2, R3, R5};
     [
         // R3 before the first event: the give-way finds no rung where the judge finds one.
         (
@@ -4936,56 +5210,27 @@ fn known_faults() -> Vec<(Scenario, Drawn, Vec<Step>, Known)> {
             vec![Press(CUSTOMIZE), Window((2_860, 155)), Down, Status, Type],
             Breaks(&[(R5, 5)]),
         ),
-        // R2: main's chrome cuts the keyboard's control on these walks too (round 8k seeds).
-        (
-            on(Keyboard::SheetFirst, "Dracula"),
-            "1268x165@2+warning",
-            vec![Window((444, 240)), Wheel(8), Press(PALETTE_SLOT)],
-            Breaks(&[(R2, 3)]),
-        ),
-        (
-            palette,
-            "417x156@2",
-            vec![Text, Press(PALETTE_SLOT)],
-            Breaks(&[(R2, 2)]),
-        ),
-        (
-            palette,
-            "435x209@2+status",
-            vec![Press(PALETTE_SLOT)],
-            Breaks(&[(R2, 1)]),
-        ),
+        // R2 and Clip: main's chrome lays the keyboard's control past a side too (round 8k seeds).
         (
             well,
             "204x770@2+status",
             vec![Press(SAVE_AS), Down, Down],
-            Breaks(&[(R2, 3)]),
+            Breaks(&[(Clip, 3), (R2, 3)]),
         ),
         (
             well,
             "476x975@1+status",
             vec![Text, Press(SAVE_AS), Window((210, 818)), Erase, Down],
-            Breaks(&[(R2, 5)]),
-        ),
-        (
-            background,
-            "2770x1310@2+warning+status",
-            vec![
-                Window((1_480, 209)),
-                Press(SAVE_AS),
-                Wheel(-2),
-                Press(PALETTE_SLOT),
-            ],
-            Breaks(&[(R2, 4)]),
+            Breaks(&[(Clip, 5), (R2, 5)]),
         ),
         (
             cursor,
             "1855x1182@2+warning",
             vec![Press(SAVE_AS), Erase, Window((179, 156)), Down],
-            Breaks(&[(R2, 4)]),
+            Breaks(&[(Clip, 4), (R2, 4)]),
         ),
         // Rules seeds 997001-3, 997777, 998001-3 and 998777 at 400, shrunk; main breaks each too.
-        // R2 across: Cancel cut at a side by Save beside it in a narrow sheet.
+        // R2 and Clip across: Cancel laid past a side by Save beside it in a narrow sheet.
         (
             on(
                 Keyboard::Sheet("settings/control/selection_foreground"),
@@ -4993,7 +5238,7 @@ fn known_faults() -> Vec<(Scenario, Drawn, Vec<Step>, Known)> {
             ),
             "1499x1376@1+warning+status",
             vec![Press(SAVE_AS), Text, Erase, Window((211, 593)), Down],
-            Breaks(&[(R2, 5)]),
+            Breaks(&[(Clip, 5), (R2, 5)]),
         ),
         // R2: the theme's name field owed what a frame left, through 1pt resizes and bars.
         (
@@ -5009,35 +5254,6 @@ fn known_faults() -> Vec<(Scenario, Drawn, Vec<Step>, Known)> {
                 Window((2_996, 140)),
             ],
             Breaks(&[(R2, 7)]),
-        ),
-        // R3 before the first event, the keyboard on Nord over Dracula.
-        (
-            on(Keyboard::Row("Nord"), "Dracula"),
-            "1197x238@1+status",
-            vec![Window((428, 154)), Text, Status],
-            Breaks(&[(R3, 3)]),
-        ),
-        // R4: a wheel's place moved by a warning leaving and a resize, judged by another list too.
-        (
-            latte,
-            "2273x902@2+warning",
-            vec![
-                Status,
-                Status,
-                Press(MOCHA),
-                Text,
-                Text,
-                Text,
-                Status,
-                Text,
-                Text,
-                Press(MOCHA),
-                Text,
-                Wheel(-3),
-                Warning,
-                Window((417, 746)),
-            ],
-            BreaksUnlike(&[(R4, 14)]),
         ),
         // R5: the dark and light segment's filter change cuts its first result.
         (
@@ -5056,6 +5272,209 @@ fn known_faults() -> Vec<(Scenario, Drawn, Vec<Step>, Known)> {
             "2568x529@1+warning+status",
             vec![Window((184, 406))],
             Breaks(&[(R3, 1)]),
+        ),
+        // R2, no list where a rung seats partway into the control's tall stop: whole, then shrunk.
+        (
+            well,
+            "918x570@1",
+            vec![
+                Wheel(8),
+                Text,
+                Window((314, 897)),
+                Warning,
+                Window((496, 306)),
+                Wheel(-8),
+                Text,
+                Wheel(1),
+                Again,
+                Window((1_402, 598)),
+                Window((1_132, 381)),
+                Status,
+                Again,
+                Window((1_150, 165)),
+                Status,
+            ],
+            Breaks(&[(R2, 14)]),
+        ),
+        (
+            cursor,
+            "421x550@2",
+            vec![
+                Down,
+                Focus,
+                Window((940, 289)),
+                Again,
+                Status,
+                Warning,
+                Erase,
+                Window((230, 612)),
+                Tick,
+                Wheel(-4),
+                Again,
+                Left,
+                Window((479, 859)),
+                Again,
+                Wheel(-4),
+                Tick,
+                Up,
+                Window((1_289, 166)),
+                Text,
+                Status,
+                Text,
+                Text,
+            ],
+            Breaks(&[(R2, 19)]),
+        ),
+        (
+            nord(Keyboard::On(IMPORT)),
+            "1367x544@2+status",
+            vec![
+                Again,
+                Window((1_708, 1_197)),
+                Up,
+                Wheel(-5),
+                Again,
+                Wheel(20),
+                Again,
+                Warning,
+                Window((1_708, 1_196)),
+                Window((1_046, 1_270)),
+                Window((1_046, 1_271)),
+                Up,
+                Warning,
+                Warning,
+                Warning,
+                Window((2_040, 215)),
+                Window((2_040, 216)),
+                Type,
+                Window((2_039, 216)),
+                Window((2_040, 216)),
+                Warning,
+                Type,
+                Status,
+                Again,
+                Status,
+                Status,
+                Right,
+                Focus,
+                Wheel(-1),
+                Again,
+            ],
+            Breaks(&[(R2, 21), (R5, 22)]),
+        ),
+        (
+            well,
+            "918x570@1",
+            vec![Text, Warning, Text, Status, Window((1_150, 165))],
+            Breaks(&[(R2, 5)]),
+        ),
+        (
+            cursor,
+            "421x550@2",
+            vec![Down, Status, Warning, Up, Window((1_289, 166)), Text],
+            Breaks(&[(R2, 6)]),
+        ),
+        (
+            nord(Keyboard::On(IMPORT)),
+            "1367x544@2+status",
+            vec![Up, Up, Window((2_040, 216)), Warning],
+            Breaks(&[(R2, 4)]),
+        ),
+        (cursor, "1579x161@2+warning", vec![], Breaks(&[(R2, 0)])),
+        (
+            nord(Keyboard::Sheet(PALETTE_FIRST)),
+            "2955x168@1+status",
+            vec![Up, Window((2_954, 168)), Warning],
+            Breaks(&[(R2, 3)]),
+        ),
+        (
+            nord(Keyboard::Sheet(PALETTE_FIRST)),
+            "1548x1009@2+status",
+            vec![
+                Status,
+                Text,
+                Status,
+                Up,
+                Warning,
+                Text,
+                Window((2_154, 229)),
+            ],
+            Breaks(&[(R2, 7)]),
+        ),
+        // The same with a list drawn, none of the control in it (seeds 997001/998001, shrunk).
+        (
+            nord(Keyboard::Pack),
+            "2939x153@2+warning",
+            vec![],
+            Breaks(&[(R2, 0)]),
+        ),
+        (
+            well,
+            "875x747@2+warning+status",
+            vec![Window((2_455, 215)), Right],
+            Breaks(&[(R2, 1), (R5, 2)]),
+        ),
+        // R3 as on main: the bar leaving, no rung keeping the toolbar shows the landing and row.
+        (
+            on(Keyboard::Row("Nord"), "Dracula"),
+            "1197x238@1+status",
+            vec![Window((428, 154)), Text, Status],
+            Breaks(&[(R3, 3)]),
+        ),
+        // R3: a status leaving shows neither the control nor the landing, a rung the control whole.
+        (
+            nord(Keyboard::On(CUSTOMIZE)),
+            "1776x151@1+warning+status",
+            vec![Warning, Warning, Status],
+            Breaks(&[(R3, 3)]),
+        ),
+        (
+            latte,
+            "1884x150@1+warning+status",
+            vec![Status],
+            Breaks(&[(R3, 1)]),
+        ),
+        // R2: new results after a wheel cut the filter in a chosen chrome (main shares it).
+        (
+            nord(Keyboard::Filter),
+            "2567x201@2+warning",
+            vec![Type, Wheel(-5), Erase],
+            Breaks(&[(R2, 3)]),
+        ),
+        // R2: new results after a wheel cut the filter in a chosen chrome (main shares it).
+        (
+            nord(Keyboard::Filter),
+            "2996x309@2+warning+status",
+            vec![Wheel(-1), Type],
+            Breaks(&[(R2, 2)]),
+        ),
+        // R2: new results after a wheel cut the filter in a chosen chrome (main shares it).
+        (
+            nord(Keyboard::Filter),
+            "1158x810@1+status",
+            vec![Type, Window((2_897, 164)), Wheel(-12), Erase],
+            Breaks(&[(R2, 4)]),
+        ),
+        // R2: new results after a wheel cut the filter in a chosen chrome (main shares it).
+        (
+            on(Keyboard::Filter, "Tokyo Night"),
+            "1170x223@1+warning+status",
+            vec![Wheel(5), Type],
+            Breaks(&[(R2, 2)]),
+        ),
+        // R2: new results after a wheel cut the filter, too tall for the last chrome's 49pt list.
+        (
+            nord(Keyboard::Filter),
+            "2465x544@2+warning+status",
+            vec![Type, Window((2_783, 245)), Wheel(8), Erase],
+            Breaks(&[(R2, 4)]),
+        ),
+        // R2: new results after a wheel cut the filter, too tall for the last chrome's 23pt list.
+        (
+            on(Keyboard::Filter, "Tokyo Night"),
+            "324x146@1+warning+status",
+            vec![Text, Status, Wheel(-5), Window((325, 147)), Type],
+            Breaks(&[(R2, 5)]),
         ),
     ]
     .into_iter()
@@ -5148,6 +5567,11 @@ fn sweep(scenario: Scenario, taken: Walks) {
                         .join("\n  ");
                         if named.names(&does.0, does.1) {
                             Ok(said)
+                        } else if !cfg!(target_os = "macos") && does.0.is_empty() && !does.1 {
+                            // [`known_faults`] names what macOS's UI faces break (Helvetica
+                            // Neue's metrics); in another host's faces a named walk may keep
+                            // every rule, which is no fault. One that breaks another rule is.
+                            Ok(format!("{said} in this host's faces"))
                         } else {
                             Err(format!("named {named:?}, does {does:?}: {said}"))
                         }
@@ -5232,7 +5656,7 @@ fn sweep(scenario: Scenario, taken: Walks) {
             .collect::<Vec<_>>()
             .join("\n")
     );
-    let rules = [Rule::R1, Rule::R2, Rule::R3, Rule::R4, Rule::R5];
+    let rules = [Rule::R1, Rule::R2, Rule::R3, Rule::R4, Rule::R5, Rule::Clip];
     let count = |rule: Rule| {
         found
             .faults
@@ -5647,10 +6071,350 @@ fn a_chrome_chosen_anew_that_cuts_the_keyboards_control_breaks_r2() {
     );
 }
 
-/// A list laid out for one room is reused for another exactly where it plans its stops alike there.
+/// The faults of a walk from `start` with `switch` set for its frames and the screens they read.
+fn walked_with(
+    scenario: Scenario,
+    switch: &'static std::thread::LocalKey<Cell<bool>>,
+    start: &str,
+    steps: &[Step],
+) -> Vec<(Rule, String)> {
+    let sweep = Sweep::new(scenario);
+    switch.with(|on| on.set(true));
+    let walked = walk(&sweep, drawn_of(start), steps);
+    switch.with(|on| on.set(false));
+    walked.faults
+}
+
+/// c5ef831d7f's unled rung cuts the field to 52 of 56pt where the toolbar-led list holds it: R2.
+#[test]
+fn a_list_led_by_the_demo_where_the_toolbar_would_lead_it_too_breaks_r2() {
+    let faults = walked_with(
+        Scenario {
+            keyboard: Keyboard::Sheet("settings/control/selection_foreground"),
+            theme: "GitHub Light",
+            in_use: "GitHub Light",
+        },
+        &TOOLBAR_LENT_REFUSED,
+        "930x148@1+status",
+        &[Step::Text],
+    );
+    assert!(
+        faults.iter().any(|(rule, said)| *rule == Rule::R2
+            && said.contains("frame 1 at")
+            && said.contains("led by the toolbar its window lists too")),
+        "a field cut where the toolbar-led list holds it whole breaks R2: {faults:?}"
+    );
+}
+
+/// c5ef831d7f's screen for these new results, cutting the filter and first result, breaks R5 too.
+#[test]
+fn new_results_cutting_the_filter_and_its_first_result_break_r5_too() {
+    let faults = walked_with(
+        Scenario {
+            keyboard: Keyboard::Filter,
+            theme: "Tokyo Night",
+            in_use: "Tokyo Night",
+        },
+        &GIVE_WAY_STRICT_ONLY,
+        "324x146@1+warning+status",
+        &[
+            Step::Text,
+            Step::Status,
+            Step::Wheel(-5),
+            Step::Window((325, 147)),
+            Step::Type,
+        ],
+    );
+    assert!(
+        faults
+            .iter()
+            .any(|(rule, said)| *rule == Rule::R5 && said.contains("frame 5 at")),
+        "a frame breaking R2 cuts its first result for no rule above R5: {faults:?}"
+    );
+}
+
+/// R2's give-way tries rungs from the chrome's own: a lent chrome's is the rung it lends from.
+#[test]
+fn a_chrome_lending_its_toolbar_stands_at_the_rung_it_lends_from() {
+    let listed = PageChrome::FULL.listing_toolbar();
+    let ladder = [PageChrome::FULL, listed];
+    for chrome in [listed, listed.giving_bar_room()] {
+        assert_eq!(
+            chrome.lending_toolbar().place_on(&ladder),
+            Some(1),
+            "{chrome:?}"
+        );
+    }
+    assert_eq!(
+        PageChrome::FULL.giving_bar_room().place_on(&ladder),
+        Some(0)
+    );
+}
+
+/// The Clip faults of a walk on GitHub Light with the keyboard on `keyboard`, under `switch`.
+fn clipped(keyboard: Keyboard, switch: &dyn Fn(bool), start: &str, steps: &[Step]) -> Vec<String> {
+    let scenario = Scenario {
+        keyboard,
+        theme: "GitHub Light",
+        in_use: "GitHub Light",
+    };
+    clipped_in(scenario, switch, start, steps)
+}
+
+/// The Clip faults of a walk in `scenario` under `switch`.
+fn clipped_in(
+    scenario: Scenario,
+    switch: &dyn Fn(bool),
+    start: &str,
+    steps: &[Step],
+) -> Vec<String> {
+    let sweep = Sweep::new(scenario);
+    switch(true);
+    let walked = walk(&sweep, drawn_of(start), steps);
+    switch(false);
+    walked
+        .faults
+        .into_iter()
+        .filter(|(rule, _)| *rule == Rule::Clip)
+        .map(|(_, said)| said)
+        .collect()
+}
+
+/// Held toolbar-listed, Save is laid under a 1519x150@2 page's clip: Clip. At 1192x152@2 it is not.
+#[test]
+fn a_list_laid_out_past_its_page_breaks_clip() {
+    use Step::{Focus, Press, Text, Warning, Window};
+    let past = |held: bool| {
+        PAGE_CHROME_HELD
+            .with(|chrome| chrome.set(held.then(|| PageChrome::FULL.listing_toolbar())));
+        TOOLBAR_LEAN_REFUSED.with(|refused| refused.set(held));
+    };
+    let first = Scenario {
+        keyboard: Keyboard::SheetFirst,
+        theme: "Dracula",
+        in_use: "Dracula",
+    };
+    let steps = [Text, Warning, Focus, Press(SAVE_AS), Window((1_519, 150))];
+    let held = clipped_in(first, &past, "1740x277@1+warning", &steps);
+    assert!(
+        held.iter()
+            .any(|said| said.contains("past the bottom its page clips it at")),
+        "rows laid out past the page's clip break Clip: {held:?}"
+    );
+    let own = clipped_in(first, &|_| {}, "1740x277@1+warning", &steps);
+    assert!(
+        own.is_empty(),
+        "the page's own chrome lays its list within: {own:?}"
+    );
+    let within = clipped(Keyboard::Sheet(SAVE_AS), &past, "1192x152@2", &[]);
+    assert!(
+        within.is_empty(),
+        "rows ending within the clip, past only the list's foot, break no Clip: {within:?}"
+    );
+}
+
+/// Reset color focused at its hug width, wider than a 189pt column at 2x, is laid past a side: Clip.
+#[test]
+fn a_control_laid_past_a_side_of_its_list_breaks_clip() {
+    let steps = [Step::Press(PALETTE_SLOT), Step::Down];
+    let uncapped = |on: bool| RESET_COLOR_UNCAPPED.with(|uncapped| uncapped.set(on));
+    let wide = clipped(
+        Keyboard::Sheet(PALETTE_SLOT),
+        &uncapped,
+        "189x856@2",
+        &steps,
+    );
+    assert!(
+        wide.iter()
+            .any(|said| said.contains("past a side of its clip")),
+        "a control laid wider than its list breaks Clip: {wide:?}"
+    );
+    let capped = clipped(Keyboard::Sheet(PALETTE_SLOT), &|_| {}, "189x856@2", &steps);
+    assert!(
+        capped.is_empty(),
+        "laid no wider than the column, it is within: {capped:?}"
+    );
+}
+
+/// c5ef831d7f's chrome at 1614x167@2+warning, no list where a rung paints part of the well: R2.
+#[test]
+fn no_list_where_a_rung_seats_partway_into_the_controls_tall_stop_breaks_r2() {
+    let sweep = Sweep::new(Scenario {
+        keyboard: Keyboard::Sheet("settings/color-open/selection_foreground"),
+        theme: "GitHub Light",
+        in_use: "GitHub Light",
+    });
+    PAGE_CHROME_HELD.with(|held| held.set(Some(PageChrome::FULL.giving_bar_room())));
+    let walked = walk(&sweep, drawn_of("1614x167@2+warning"), &[]);
+    PAGE_CHROME_HELD.with(|held| held.set(None));
+    assert!(
+        walked.faults.iter().any(|(rule, said)| *rule == Rule::R2
+            && said.contains("partway into its stop taller than the room")),
+        "no list where a rung paints some of the well breaks R2: {:?}",
+        walked.faults
+    );
+}
+
+/// A toolbar lends the demo its row only in R2's give-way: a press there draws 51a93cc997's screen.
+#[test]
+fn a_listed_toolbar_lends_its_row_only_in_the_rung_r2_gives_way_to() {
+    use Step::{Press, Text, Warning, Window};
+    let on = |keyboard, theme| Scenario {
+        keyboard,
+        theme,
+        in_use: theme,
+    };
+    let walks: [EndedWalk; 3] = [
+        (
+            on(Keyboard::SheetDrawn, "GitHub Light"),
+            "2627x186@1+warning",
+            vec![
+                Warning,
+                Press(BACKGROUND_WELL),
+                Text,
+                Window((1_468, 152)),
+                Press(BACKGROUND_WELL),
+            ],
+            (5, 56.0),
+        ),
+        (
+            on(Keyboard::Sheet(FOREGROUND), "Dracula"),
+            "1646x530@2+status",
+            vec![
+                Text,
+                Press(BACKGROUND_WELL),
+                Warning,
+                Warning,
+                Window((1_168, 158)),
+                Text,
+                Press(BACKGROUND_WELL),
+            ],
+            (5, 62.0),
+        ),
+        (
+            on(Keyboard::Sheet(SAVE_AS), "GitHub Light"),
+            "2245x438@2+warning",
+            vec![
+                Press(BACKGROUND_WELL),
+                Warning,
+                Warning,
+                Warning,
+                Window((1_192, 152)),
+                Press(BACKGROUND_WELL),
+            ],
+            (5, 56.0),
+        ),
+    ];
+    for (scenario, start, steps, (top, room)) in walks {
+        let found = walk(&Sweep::new(scenario), drawn_of(start), &steps);
+        let ended = found.ended.expect("a walk draws its first frame");
+        assert!(
+            found.faults.is_empty() && ended.0 == Some(top) && (ended.1 - room).abs() < 0.5,
+            "{scenario} from {start}: ends at {ended:?}, not ({top}, {room}); faults {:?}",
+            found.faults
+        );
+    }
+}
+
+/// c5ef831d7f's 1512x154@1+warning chrome, the status gone, shows no filter a rung shows whole: R3.
+#[test]
+fn a_frame_showing_neither_the_landing_nor_the_control_a_rung_shows_breaks_r3() {
+    let sweep = Sweep::new(Scenario {
+        keyboard: Keyboard::Filter,
+        theme: "Nord",
+        in_use: "Nord",
+    });
+    PAGE_CHROME_HELD.with(|held| held.set(Some(PageChrome::FULL.giving_bar_room())));
+    let walked = walk(
+        &sweep,
+        drawn_of("1512x154@1+warning+status"),
+        &[Step::Status],
+    );
+    PAGE_CHROME_HELD.with(|held| held.set(None));
+    assert!(
+        walked.faults.iter().any(|(rule, said)| *rule == Rule::R3
+            && said.contains("frame 1 at")
+            && said.contains("shown none of it nor the theme in use's")),
+        "neither the landing nor the filter where a rung shows the filter breaks R3: {:?} ended {:?}",
+        walked.faults,
+        walked.ended
+    );
+}
+
+/// c5ef831d7f's chrome at 2668x229@2+warning+status lists none of the well a rung seats into: R2.
+#[test]
+fn a_list_showing_none_of_the_control_a_rung_seats_partway_into_breaks_r2() {
+    let sweep = Sweep::new(Scenario {
+        keyboard: Keyboard::Sheet(BACKGROUND_WELL),
+        theme: "GitHub Light",
+        in_use: "GitHub Light",
+    });
+    PAGE_CHROME_HELD.with(|held| {
+        held.set(Some(PageChrome {
+            no_subtitle: true,
+            inset: Some(12.0),
+            ..PageChrome::FULL
+        }));
+    });
+    let walked = walk(&sweep, drawn_of("2668x229@2+warning+status"), &[]);
+    PAGE_CHROME_HELD.with(|held| held.set(None));
+    assert!(
+        walked.faults.iter().any(|(rule, said)| *rule == Rule::R2
+            && said.contains("none of it drawn")
+            && said.contains("partway into its stop taller than the room")),
+        "a list showing none of the well a rung paints some of breaks R2: {:?}",
+        walked.faults
+    );
+}
+
+/// c5ef831d7f's give-way leaves the cursor field 53 of 56pt where a giving rung shows it: R2.
+#[test]
+fn a_control_a_rung_giving_the_bars_room_shows_whole_is_owed_it() {
+    use Step::{Erase, Press, Right, Up, Warning};
+    let faults = walked_with(
+        Scenario {
+            keyboard: Keyboard::Sheet(CURSOR_COLOR),
+            theme: "Nord",
+            in_use: "Nord",
+        },
+        &GIVING_UNDER_BARS_ONLY,
+        "2497x133@2",
+        &[Erase, Warning, Press(PALETTE_FIRST), Right, Warning, Up],
+    );
+    assert!(
+        faults.iter().any(|(rule, said)| *rule == Rule::R2
+            && said.contains("frame 6 at")
+            && said.contains("inset: Some(12.0), bar_room_given: true")
+            && said.contains("a rung of its ladder")),
+        "a field cut where a rung giving the bar's room shows it whole breaks R2: {faults:?}"
+    );
+}
+
+/// R4 measures the bar's least only for a frame that drew another bar than the page's choice.
+#[test]
+fn r4_measures_the_bars_least_only_where_a_frame_drew_another_bar() {
+    use Step::{Again, Status, Text, Wheel};
+    let sweep = Sweep::new(Scenario {
+        keyboard: Keyboard::SheetDrawn,
+        theme: "GitHub Light",
+        in_use: "GitHub Light",
+    });
+    let _ = walk(
+        &sweep,
+        drawn_of("178x348@1"),
+        &[Wheel(-4), Status, Text, Again],
+    );
+    let screens = sweep.screens.load(Ordering::Relaxed);
+    assert!(
+        screens <= 4,
+        "the walk measured {screens} screens, at most 4: a least for frames under the choice's bar"
+    );
+}
+
+/// A list or a told screen is reused exactly where it plans its stops or tells alike again.
 #[test]
 fn a_list_is_reused_for_another_room_exactly_where_it_plans_its_stops_alike() {
-    use Step::{Again, Press, Status, Text, Warning, Wheel, Window};
+    use Step::{Again, Press, Status, Text, Type, Warning, Wheel, Window};
     let on = |keyboard, theme| Scenario {
         keyboard,
         theme,
@@ -5698,6 +6462,21 @@ fn a_list_is_reused_for_another_room_exactly_where_it_plans_its_stops_alike() {
             "310x1033@2+warning+status",
             vec![],
         ),
+        // A picker open in the sheet stacks its rows by the seat, at one column width.
+        (
+            on(
+                Keyboard::Sheet("settings/color-open/selection_foreground"),
+                "GitHub Light",
+            ),
+            "1268x165@2+warning",
+            vec![Wheel(-8), Press(BACKGROUND_WELL)],
+        ),
+        // New results' lax pass reads each rung's screen the strict pass told.
+        (
+            on(Keyboard::Filter, "Tokyo Night"),
+            "324x146@1+warning+status",
+            vec![Text, Status, Wheel(-5), Window((325, 147)), Type],
+        ),
     ];
     for (scenario, start, steps) in walks {
         let sweep = Sweep::new(scenario);
@@ -5708,7 +6487,7 @@ fn a_list_is_reused_for_another_room_exactly_where_it_plans_its_stops_alike() {
             .unwrap_or_default();
         assert!(
             checked.is_empty(),
-            "{start} {steps:?} plans its stops otherwise than its reuse: {checked:#?}"
+            "{start} {steps:?} plans or tells otherwise than its reuse: {checked:#?}"
         );
     }
 }
@@ -6771,6 +7550,52 @@ fn work_walks() -> Vec<WorkWalk> {
             at((303, 942), 2, true, true),
             vec![(None, [1, 2, 1, 1, 2])],
         ),
+        // R2's give-way tries a rung lending its toolbar only where the rung's panel lends it.
+        (
+            nord(Keyboard::Sheet("settings/control/background")),
+            at((192, 235), 2, true, true),
+            vec![(None, [2, 9, 5, 2, 5])],
+        ),
+        // A side's trial restores the chrome alone: the chromes it weighed stay to reuse.
+        (
+            on(Keyboard::Sheet(FOREGROUND), "Dracula"),
+            at((1_577, 1_054), 2, true, true),
+            vec![
+                (None, [1, 2, 0, 1, 2]),
+                (step(Window((293, 903))), [1, 1, 1, 1, 2]),
+                (step(Status), [1, 2, 0, 0, 1]),
+                (step(Press(PALETTE_SLOT)), [1, 2, 0, 0, 2]),
+                (step(Window((294, 903))), [1, 2, 0, 0, 2]),
+                (step(Press(PALETTE_SLOT)), [1, 0, 0, 0, 1]),
+                (step(Window((294, 902))), [1, 2, 0, 0, 1]),
+                (step(Window((293, 902))), [1, 2, 0, 0, 2]),
+                (step(Status), [2, 0, 3, 2, 2]),
+                (step(Window((2_493, 793))), [2, 3, 0, 2, 4]),
+            ],
+        ),
+        // New results' lax pass tells no rung again: it reuses what the strict pass told it keeps.
+        (
+            on(Keyboard::Filter, "Tokyo Night"),
+            at((324, 146), 1, true, true),
+            vec![
+                (None, [1, 2, 3, 1, 2]),
+                (step(Text), [2, 2, 3, 1, 4]),
+                (step(Status), [1, 1, 2, 0, 2]),
+                (step(Wheel(-5)), [1, 0, 1, 0, 1]),
+                (step(Window((325, 147))), [3, 2, 5, 0, 4]),
+                (step(Type), [3, 2, 4, 0, 5]),
+            ],
+        ),
+        // New results after a wheel cut the filter do the work 734c9b9c91 does (a known R2).
+        (
+            nord(Keyboard::Filter),
+            at((2_996, 309), 2, true, true),
+            vec![
+                (None, [1, 2, 0, 1, 2]),
+                (step(Wheel(-1)), [1, 0, 0, 1, 1]),
+                (step(Type), [1, 3, 0, 1, 2]),
+            ],
+        ),
     ]
 }
 
@@ -7079,7 +7904,75 @@ fn walks_no_rule_holds_end_on_the_screens_c5ef831d7f_ends_them_on() {
     };
     let filter_tokyo = on(Keyboard::Filter, "Tokyo Night");
     let first = on(Keyboard::SheetFirst, "Dracula");
+    let save_as = on(Keyboard::Sheet(SAVE_AS), "GitHub Light");
     let walks: Vec<EndedWalk> = vec![
+        // A press's side trial leaves no chrome chosen: the card pressed stays whole, docked.
+        (
+            first,
+            "178x675@1+status",
+            vec![
+                Press(DONE),
+                Text,
+                Press(MOCHA),
+                Warning,
+                Status,
+                Status,
+                Press(MOCHA),
+            ],
+            (12, 446.0),
+        ),
+        // A bar stood bare is weighed bare: Save As's bar stands over the list, not docked.
+        (
+            on(Keyboard::SheetDrawn, "GitHub Light"),
+            "1495x375@2+status",
+            vec![
+                Press(SAVE_AS),
+                Status,
+                Warning,
+                Press(PALETTE_SLOT),
+                Press(PALETTE_SLOT),
+                Window((993, 790)),
+                Status,
+                Text,
+                Window((545, 481)),
+            ],
+            (6, 192.0),
+        ),
+        // A pinned filter's first result whole under its bar's most, its run's caption let go.
+        (filter_tokyo, "177x706@1+status", vec![Type], (0, 90.0)),
+        // A painted first result is no cut: the filter's page gives way to no rung (shrunk).
+        (
+            filter_tokyo,
+            "1413x1491@1+status",
+            vec![Text, Window((2_343, 140)), Text, Wheel(5), Type, Text],
+            (4, 44.0),
+        ),
+        (
+            filter_tokyo,
+            "875x535@2+status",
+            vec![
+                Warning,
+                Warning,
+                Window((211, 320)),
+                Wheel(-12),
+                Type,
+                Window((1_874, 153)),
+            ],
+            (4, 45.0),
+        ),
+        (
+            on(Keyboard::Filter, "Nord"),
+            "1621x190@2+status",
+            vec![Status, Status, Wheel(-3), Type, Warning, Status],
+            (4, 18.0),
+        ),
+        // New results seat the filter whole in the rung R2's give-way takes for it.
+        (
+            on(Keyboard::Filter, "Nord"),
+            "1381x632@1+warning+status",
+            vec![Type, Text, Window((2_660, 262)), Type],
+            (2, 50.0),
+        ),
         // A start held for a stop shifted in at the top (seat_scroll's moved start).
         (
             on(Keyboard::Sheet(CURSOR_COLOR), "Nord"),
@@ -7202,6 +8095,16 @@ fn walks_no_rule_holds_end_on_the_screens_c5ef831d7f_ends_them_on() {
                 Window((2_950, 451)),
             ],
             (4, 243.0),
+        ),
+        // A listed toolbar its list left untaken stays over a whole Save As whose rows end in clip.
+        (save_as, "900x149@2", vec![], (9, 61.0)),
+        (save_as, "1407x151@2", vec![], (9, 63.0)),
+        (save_as, "714x151@2", vec![], (9, 63.0)),
+        (
+            save_as,
+            "1730x604@2+warning",
+            vec![Warning, Window((1_302, 150))],
+            (9, 62.0),
         ),
     ];
     let parted = Mutex::new(Vec::new());

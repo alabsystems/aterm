@@ -49,7 +49,8 @@ pub(in crate::macos_doctor) struct Kept {
     pub(in crate::macos_doctor) applied: Vec<Key>,
     /// Keys that read otherwise after that: the person's.
     pub(in crate::macos_doctor) kept: Vec<Key>,
-    /// A newer aterm wrote the record: its kept keys are honored, and it is never written.
+    /// A newer aterm wrote the record (a later `format`, or a row this build does not know):
+    /// its kept keys are honored, and it is never written.
     frozen: bool,
 }
 
@@ -72,7 +73,10 @@ impl Kept {
         Self::parse(&record)
     }
 
-    /// The record `record` holds.
+    /// The record `record` holds. One a newer aterm wrote (a later `format`, or a row this build
+    /// does not know, which only a newer aterm names) is frozen: a key on a row this build does
+    /// not know is kept with no row, so it is still left as the person set it, and the rest is
+    /// honored.
     ///
     /// # Errors
     /// It is not a record of this profile's, or a field cannot be read.
@@ -81,8 +85,22 @@ impl Kept {
         if record["profile"].as_str() != Some(PROFILE) {
             return Err(bad());
         }
+        let known = |number: u64| {
+            Setting::ALL
+                .into_iter()
+                .find(|setting| *setting as u64 == number)
+        };
+        let new_row = ["applied", "kept"].iter().any(|field| {
+            record[*field].as_array().is_some_and(|entries| {
+                entries.iter().any(|entry| {
+                    entry["setting"]
+                        .as_u64()
+                        .is_some_and(|number| known(number).is_none())
+                })
+            })
+        });
         let frozen = match record.get("format").map(Value::as_u64) {
-            Some(Some(format)) => format > KEPT_FORMAT,
+            Some(Some(format)) => format > KEPT_FORMAT || new_row,
             _ => return Err(bad()),
         };
         let keys = |field: &str| -> Result<Vec<Key>, String> {
@@ -94,14 +112,7 @@ impl Kept {
                     let item = entry["item"].as_str().ok_or_else(bad)?.to_owned();
                     let setting = match &entry["setting"] {
                         Value::Null => None,
-                        number => {
-                            let number = number.as_u64().ok_or_else(bad)?;
-                            Setting::ALL
-                                .into_iter()
-                                .find(|setting| *setting as u64 == number)
-                                .ok_or_else(bad)
-                                .map(Some)?
-                        }
+                        number => known(number.as_u64().ok_or_else(bad)?),
                     };
                     let held = match &entry["held"] {
                         Value::Null => None,
@@ -237,6 +248,9 @@ impl Kept {
         settled_words: &dyn Fn(&str) -> &'static str,
     ) {
         use aterm_machines::init::Hold;
+        if super::ledger::planted(super::ledger::Defect::HoldForgetsKept) {
+            return;
+        }
         for key in &self.applied {
             if !holds.iter().any(|(item, _)| *item == key.item) {
                 holds.push((
@@ -323,8 +337,8 @@ fn take(keys: &mut Vec<Key>, item: &str) -> Option<Key> {
 
 /// Forget what the record keeps in `root`: everything (`None`: Restore, Set up now) or the
 /// rows of `settings` (groups turned on again), so the next pass sets them. A record a newer
-/// aterm wrote is left as it is; one that cannot be read is replaced, since what it kept is
-/// forgotten either way.
+/// aterm wrote is left as it is, read or not; one of this build's format that cannot be read is
+/// replaced, since what it kept is forgotten either way.
 ///
 /// # Errors
 /// The record cannot be written.
@@ -334,6 +348,7 @@ pub(in crate::macos_doctor) fn forget_at(
 ) -> Result<(), String> {
     let (mut kept, damaged) = match Kept::load(root) {
         Ok(kept) => (kept, false),
+        Err(_) if newer_at(root) => return Ok(()),
         Err(_) if settings.is_none() => (Kept::default(), true),
         Err(why) => return Err(why),
     };
@@ -345,6 +360,19 @@ pub(in crate::macos_doctor) fn forget_at(
         kept.save(root)?;
     }
     Ok(())
+}
+
+/// Whether the record in `root` names a later `format` than this build writes, whether or not
+/// the rest of it reads: a newer aterm's, which this build never writes over.
+fn newer_at(root: &Path) -> bool {
+    std::fs::read(root.join(KEPT_RECORD))
+        .ok()
+        .and_then(|bytes| aterm_json::from_slice::<Value>(&bytes).ok())
+        .is_some_and(|record| {
+            record["format"]
+                .as_u64()
+                .is_some_and(|format| format > KEPT_FORMAT)
+        })
 }
 
 /// The rows whose keys the person changed, as the record in `root` says; none when it cannot be

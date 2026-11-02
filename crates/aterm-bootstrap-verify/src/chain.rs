@@ -152,6 +152,15 @@ pub fn withdrawn_floor(
 pub(crate) fn read_bounded(path: &PyPath, maximum: u64) -> Verdict<Vec<u8>> {
     let real = path.to_path();
     let file = open_file(&real)?;
+    read_bounded_file(file, path, maximum)
+}
+
+/// [`read_bounded`] over an already-opened descriptor.
+pub(crate) fn read_bounded_file(
+    file: std::fs::File,
+    path: &PyPath,
+    maximum: u64,
+) -> Verdict<Vec<u8>> {
     let mut data = Vec::new();
     file.take(maximum + 1)
         .read_to_end(&mut data)

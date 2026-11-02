@@ -113,8 +113,14 @@ pub const ROSTER: &[Row] = &[Row {
 /// The row and pid a holder `<id>@<pid>` names: a rostered id and a canonical pid above 1.
 #[must_use]
 pub fn holder(holder: &str) -> Option<(&'static Row, u32)> {
+    holder_in(ROSTER, holder)
+}
+
+/// [`holder`] in an explicitly supplied static catalog, with identical pid grammar.
+#[must_use]
+pub fn holder_in(rows: &'static [Row], holder: &str) -> Option<(&'static Row, u32)> {
     let (id, digits) = holder.split_once('@')?;
-    let row = ROSTER.iter().find(|r| r.id == id)?;
+    let row = rows.iter().find(|r| r.id == id)?;
     let pid = digits.parse::<u32>().ok().filter(|p| *p > 1)?;
     (pid.to_string() == digits).then_some((row, pid))
 }
@@ -136,6 +142,18 @@ pub fn row_named(word: &str) -> Option<&'static Row> {
 pub struct Scopes(Vec<Scope>);
 
 impl Scopes {
+    /// A canonical scope fixture for tests of paired host duties, independent of a roster row.
+    /// Wire claims still pass the row's allowance check in [`read`].
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn for_test(duties: &[Scope]) -> Self {
+        let mut duties = duties.to_vec();
+        duties.sort_unstable();
+        duties.dedup();
+        assert!(!duties.is_empty(), "a scope fixture is nonempty");
+        Self(duties)
+    }
+
     /// Whether the set holds `scope`.
     #[must_use]
     pub fn contains(&self, scope: Scope) -> bool {
@@ -267,7 +285,14 @@ pub enum Words<'a> {
 /// and allowed by its row, none twice.
 #[must_use]
 pub fn read<'a>(holder: &str, words: &'a [&'a str]) -> Words<'a> {
-    let rostered = self::holder(holder);
+    read_in(ROSTER, holder, words)
+}
+
+/// [`read`] against one explicitly supplied catalog; all claim grammar and scope validation
+/// are shared with the shipping reader.
+#[must_use]
+pub fn read_in<'a>(rows: &'static [Row], holder: &str, words: &'a [&'a str]) -> Words<'a> {
+    let rostered = holder_in(rows, holder);
     if !words.iter().any(|w| w.starts_with("contract=")) {
         return if rostered.is_some() {
             Words::Refused("a rostered harness claims under contract=3 with its scope=")

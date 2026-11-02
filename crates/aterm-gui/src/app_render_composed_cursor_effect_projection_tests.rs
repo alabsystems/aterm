@@ -124,7 +124,6 @@ fn every_composed_cursor_channel_is_hard_clipped_and_clean_is_a_real_negative_co
             active_cursor_fill: Some(0x0050_FA7B),
             fx_layers: &[],
             bloom_gate: aterm_core::render::BloomGate::Open,
-            pet_veil: &flat,
         },
         Some(ComposedCursorEffectClip {
             row0: 2,
@@ -151,8 +150,8 @@ fn every_composed_cursor_channel_is_hard_clipped_and_clean_is_a_real_negative_co
     assert_eq!(input.cursor_glow_add.len(), 1);
     assert_eq!(
         input.glow_under.len(),
-        2,
-        "the under stream and the pet's veil are projected, each clipped"
+        1,
+        "the under stream is projected, clipped"
     );
     assert_eq!(input.glow_halo.len(), 1);
     assert_eq!(
@@ -262,7 +261,6 @@ fn composed_status_owner_follows_the_fill_that_survives_host_projection() {
                 active_cursor_fill: Some(owned.fill),
                 fx_layers: &[],
                 bloom_gate: aterm_core::render::BloomGate::Open,
-                pet_veil: &[],
             },
             clip,
             cursor_override,

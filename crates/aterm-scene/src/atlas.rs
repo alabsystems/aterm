@@ -14,10 +14,11 @@ impl Tile {
     /// A transparent `w`×`h` RGBA8 tile.
     #[must_use]
     pub fn new(w: u32, h: u32) -> Self {
+        let len = (w as usize).saturating_mul(h as usize).saturating_mul(4);
         Self {
             w,
             h,
-            px: vec![0; w as usize * h as usize * 4],
+            px: vec![0; len],
         }
     }
 
@@ -68,18 +69,27 @@ impl Tile {
         if x < 0 || y < 0 || x as u32 >= self.w || y as u32 >= self.h || a <= 0.0 || a.is_nan() {
             return;
         }
-        let i = ((y as u32 * self.w + x as u32) * 4) as usize;
+        let Some(i) = (y as usize)
+            .checked_mul(self.w as usize)
+            .and_then(|r| r.checked_add(x as usize))
+            .and_then(|p| p.checked_mul(4))
+        else {
+            return;
+        };
+        let Some(dst) = self.px.get_mut(i..i.saturating_add(4)) else {
+            return;
+        };
         let sa = crate::clampf(a, 0.0, 1.0);
         let to = |v: f32| (crate::clampf(v, 0.0, 1.0) * 255.0 + 0.5) as u8;
         if sa >= 1.0 {
-            self.px[i..i + 4].copy_from_slice(&[to(rgb.0), to(rgb.1), to(rgb.2), 255]);
+            dst.copy_from_slice(&[to(rgb.0), to(rgb.1), to(rgb.2), 255]);
             return;
         }
         let (dr, dg, db, da) = (
-            self.px[i] as f32 / 255.0,
-            self.px[i + 1] as f32 / 255.0,
-            self.px[i + 2] as f32 / 255.0,
-            self.px[i + 3] as f32 / 255.0,
+            dst[0] as f32 / 255.0,
+            dst[1] as f32 / 255.0,
+            dst[2] as f32 / 255.0,
+            dst[3] as f32 / 255.0,
         );
         let inv_sa = 1.0 - sa;
         let oa = sa + da * inv_sa;
@@ -90,10 +100,10 @@ impl Tile {
                 (s * sa + d * da * inv_sa) / oa
             }
         };
-        self.px[i] = to(mix(rgb.0, dr));
-        self.px[i + 1] = to(mix(rgb.1, dg));
-        self.px[i + 2] = to(mix(rgb.2, db));
-        self.px[i + 3] = to(oa);
+        dst[0] = to(mix(rgb.0, dr));
+        dst[1] = to(mix(rgb.1, dg));
+        dst[2] = to(mix(rgb.2, db));
+        dst[3] = to(oa);
     }
 
     /// Source-over a horizontal run of `len` pixels starting at `(x, y)`.
@@ -107,10 +117,14 @@ impl Tile {
         if i64::from(start) >= end {
             return;
         }
-        let row = y as u32 * self.w;
+        let row = (y as usize).saturating_mul(self.w as usize);
+        let lo = row.saturating_add(start as usize).saturating_mul(4);
+        let hi = row.saturating_add(end as usize).saturating_mul(4);
+        let Some(span) = self.px.get_mut(lo..hi) else {
+            return;
+        };
         let sa = crate::clampf(a, 0.0, 1.0);
         let to = |v: f32| (crate::clampf(v, 0.0, 1.0) * 255.0 + 0.5) as u8;
-        let span = &mut self.px[(row + start as u32) as usize * 4..(row + end as u32) as usize * 4];
         if sa >= 1.0 {
             let quad = [to(rgb.0), to(rgb.1), to(rgb.2), 255];
             span.as_chunks_mut::<4>().0.fill(quad);
@@ -162,8 +176,8 @@ impl Tile {
         const INV16: f32 = 1.0 / 16.0;
         let x0 = x0.max(0);
         let y0 = y0.max(0);
-        let x1 = x1.min(self.w as i32);
-        let y1 = y1.min(self.h as i32);
+        let x1 = x1.min(i32::try_from(self.w).unwrap_or(i32::MAX));
+        let y1 = y1.min(i32::try_from(self.h).unwrap_or(i32::MAX));
         for py in y0..y1 {
             let py_f = py as f32;
             let dy2 = SUB.map(|off| qy(py_f + off));
@@ -214,7 +228,7 @@ impl Tile {
         if !(cx.is_finite() && cy.is_finite() && r.is_finite()) || r < 0.0 {
             return;
         }
-        let rr = r * r;
+        let rr = (r * r).min(f32::MAX);
         self.fill_quad(
             ((cx - r) as i32).saturating_sub(1),
             ((cy - r) as i32).saturating_sub(1),
@@ -276,5 +290,9 @@ mod tests {
         t.over(1, 0, (0.0, 1.0, 0.0), f32::NAN);
         t.over_run(0, 0, 4, (0.0, 0.0, 1.0), f32::NAN);
         assert_eq!(t.pixels(), &painted[..]);
+
+        let mut huge = Tile::new(4, 1);
+        huge.disc(2.0, 0.5, 2.0e20, (1.0, 1.0, 1.0), 1.0);
+        assert_eq!(huge.pixels(), &[255; 16]);
     }
 }

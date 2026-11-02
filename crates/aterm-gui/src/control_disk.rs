@@ -314,7 +314,9 @@ fn unix_now() -> i64 {
 /// THE WAIT over `shelf`: arm, latch or register a demand, park until it answers.
 pub(crate) fn run(shelf: &Shelf, wait: &SysWait, who: &Who, env: &Env<'_>) -> String {
     let armed = Instant::now();
-    let deadline = armed + Duration::from_millis(wait.timeout_ms);
+    let deadline = armed
+        .checked_add(Duration::from_millis(wait.timeout_ms))
+        .unwrap_or_else(|| armed + Duration::from_secs(365 * 24 * 3600));
     let (key, path) = {
         let b = shelf.board_lock();
         let row = match &wait.vol {

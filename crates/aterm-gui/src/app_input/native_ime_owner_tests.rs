@@ -35,6 +35,13 @@ fn page(
         ..crate::SetupStatus::default()
     });
     let (instance, first) = app.active_native_view(wid).unwrap();
+    // The person opens the Secrets line and its "Join a different vault…" to reach the fields.
+    for key in [
+        "system-state/line/secrets/disclose",
+        "system-state/row/secrets/disclose",
+    ] {
+        press(&mut app, wid, key);
+    }
     app.dispatch_native_event(
         wid,
         AppEvent::Action(ActionInvocation {
@@ -51,11 +58,24 @@ fn page(
             AppViewState::SystemState(Default::default()),
         )
         .unwrap();
+        // Each view opens its own line; the vault's fields stay open from the first.
+        press(&mut app, wid, "system-state/line/secrets/disclose");
         app.active_native_view(wid).unwrap().1
     } else {
         first
     };
     (app, wid, instance, first, second)
+}
+
+fn press(app: &mut App, wid: WindowId, key: &str) {
+    app.dispatch_native_event(
+        wid,
+        AppEvent::Action(ActionInvocation {
+            id: ActionId::new(key),
+            value: None,
+        }),
+    )
+    .unwrap();
 }
 
 fn focus(app: &mut App, wid: WindowId, view: ViewId, key: &str) {
@@ -257,7 +277,9 @@ fn a_native_composition_retires_its_old_field_projection_after_focus_moves() {
     );
 }
 
-fn url_review(known: bool) -> (App, WindowId, crate::native_app::AppInstanceId, ViewId) {
+/// A page whose plan is known, with the Secrets line and its "Join a different vault…" open and
+/// the address focused: until the plan in force is known no line opens, so no field shows.
+fn url_review() -> (App, WindowId, crate::native_app::AppInstanceId, ViewId) {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     let window = app.windows.get_mut(&wid).unwrap();
@@ -268,21 +290,17 @@ fn url_review(known: bool) -> (App, WindowId, crate::native_app::AppInstanceId, 
         crate::system_state_host::InitialSetupHandlers::inert_for_test(),
     );
     assert!(app.open_system_state_tab());
-    if known {
-        app.publish_system_state(crate::SetupStatus {
-            plan: Some(aterm_types::macos_setup::Plan::default()),
-            ..crate::SetupStatus::default()
-        });
-    }
+    app.publish_system_state(crate::SetupStatus {
+        plan: Some(aterm_types::macos_setup::Plan::default()),
+        ..crate::SetupStatus::default()
+    });
     let (instance, view) = app.active_native_view(wid).unwrap();
-    app.dispatch_native_event(
-        wid,
-        AppEvent::Action(ActionInvocation {
-            id: ActionId::new("system-state/row/secrets/disclose"),
-            value: None,
-        }),
-    )
-    .unwrap();
+    for key in [
+        "system-state/line/secrets/disclose",
+        "system-state/row/secrets/disclose",
+    ] {
+        press(&mut app, wid, key);
+    }
     focus(&mut app, wid, view, "system-state/url");
     (app, wid, instance, view)
 }
@@ -296,15 +314,15 @@ fn a_url_composition_survives_status_hydration_and_same_selection_vault_updates(
     };
 
     // A passive form still follows the saved vault when no draft is being typed.
-    let (mut passive, _, instance, _) = url_review(true);
+    let (mut passive, _, instance, _) = url_review();
     passive.publish_system_state(crate::SetupStatus {
         plan: Some(updated.clone()),
         ..crate::SetupStatus::default()
     });
     assert_eq!(values(&passive, instance).0, updated.vault_url);
 
-    for known in [false, true] {
-        let (mut app, wid, instance, _) = url_review(known);
+    {
+        let (mut app, wid, instance, _) = url_review();
         app.on_ime_preedit(wid, COMPOSED.into(), Some((0, COMPOSED.len())));
         let Some(NativeApp::SystemState(model)) = app.native_runtime.app(instance) else {
             panic!("the URL's review stays live");
@@ -342,7 +360,7 @@ fn a_url_composition_survives_status_hydration_and_same_selection_vault_updates(
 
 #[test]
 fn a_url_composition_rejects_an_incoming_automatic_offer_without_losing_its_commit() {
-    let (mut app, wid, instance, _) = url_review(true);
+    let (mut app, wid, instance, _) = url_review();
     app.on_ime_preedit(wid, COMPOSED.into(), None);
     let draft = values(&app, instance);
     let (send, receive) = std::sync::mpsc::channel();
@@ -375,7 +393,7 @@ fn a_url_composition_rejects_an_incoming_automatic_offer_without_losing_its_comm
 
 #[test]
 fn a_password_composition_rejects_an_incoming_automatic_offer_without_losing_its_commit() {
-    let (mut app, wid, instance, view) = url_review(true);
+    let (mut app, wid, instance, view) = url_review();
     focus(&mut app, wid, view, "system-state/password");
     let source = values(&app, instance).0;
     app.on_ime_preedit(wid, COMPOSED.into(), None);
@@ -419,8 +437,8 @@ fn a_password_composition_survives_saved_plan_hydration_and_vault_updates() {
         vault_url: "http://newer.invalid/v1/team".into(),
         ..source.clone()
     };
-    for known in [false, true] {
-        let (mut app, wid, instance, view) = url_review(known);
+    {
+        let (mut app, wid, instance, view) = url_review();
         focus(&mut app, wid, view, "system-state/password");
         app.on_ime_preedit(wid, COMPOSED.into(), None);
         app.publish_system_state(crate::SetupStatus {
@@ -448,7 +466,7 @@ fn a_password_composition_survives_saved_plan_hydration_and_vault_updates() {
 #[test]
 fn a_cleared_password_composition_allows_an_offer_without_leaking_its_text() {
     for cancelled in [false, true] {
-        let (mut app, wid, instance, view) = url_review(true);
+        let (mut app, wid, instance, view) = url_review();
         focus(&mut app, wid, view, "system-state/password");
         if cancelled {
             app.on_ime_preedit(wid, COMPOSED.into(), None);
@@ -483,7 +501,7 @@ fn a_cleared_password_composition_allows_an_offer_without_leaking_its_text() {
 
 #[test]
 fn a_retired_password_composition_preserves_committed_text_and_clears_its_draft() {
-    let (mut app, wid, instance, view) = url_review(true);
+    let (mut app, wid, instance, view) = url_review();
     app.dispatch_native_event(
         wid,
         AppEvent::Action(ActionInvocation {
@@ -509,7 +527,7 @@ fn a_retired_password_composition_preserves_committed_text_and_clears_its_draft(
 }
 
 fn close_linked_composition(field: &str, close_owner: bool) {
-    let (mut app, wid, instance, owner) = url_review(true);
+    let (mut app, wid, instance, owner) = url_review();
     app.windows.get_mut(&wid).unwrap().cols = 240;
     let sibling = app
         .split_active_with_native(

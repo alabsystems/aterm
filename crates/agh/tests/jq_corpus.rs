@@ -264,3 +264,31 @@ fn overflowing_decimal_literals_clamp_to_f64_max_instead_of_rendering_as_null() 
         );
     }
 }
+
+#[test]
+fn mixed_int_and_float_order_past_two_to_the_53_is_exact_and_total() {
+    let program = concat!(
+        "[9007199254740996, 9007199254740996.0, 9007199254740995, ",
+        "9007199254740993, 9007199254740992.0, 9007199254740992] | ",
+        "((. + . + . + .) | sort), unique, ",
+        "(9007199254740995 < 9007199254740996.0), ",
+        "(9007199254740996 == 9007199254740996.0), ",
+        "(9007199254740993 > 9007199254740992.0)"
+    );
+    let out = compile(program)
+        .and_then(|p| p.run(&Value::Null))
+        .expect("compiles and evaluates without driftsort total-order panic");
+    assert_eq!(out.len(), 5);
+    assert_eq!(
+        out[1],
+        aterm_json::json!([
+            9_007_199_254_740_992.0f64,
+            9_007_199_254_740_993u64,
+            9_007_199_254_740_995u64,
+            9_007_199_254_740_996u64
+        ])
+    );
+    assert_eq!(out[2], Value::Bool(true));
+    assert_eq!(out[3], Value::Bool(true));
+    assert_eq!(out[4], Value::Bool(true));
+}

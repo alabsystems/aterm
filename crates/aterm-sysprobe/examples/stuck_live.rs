@@ -245,13 +245,17 @@ impl Host {
         let procs: Vec<JobProc> = self.reader.read_all(&reqs).iter().map(job_proc).collect();
         let held = procs
             .iter()
-            .filter(|p| p.program_check)
-            .map(|p| HeldProc {
-                pid: p.pid,
-                exec: p.start.unwrap_or(0),
-                name: p.exe.clone().unwrap_or_else(|| p.name.clone()),
-                aterm: true,
-                wait: StartWait::ProgramCheck,
+            .filter_map(|p| {
+                Some(HeldProc {
+                    pid: p.pid,
+                    exec: p.start.unwrap_or(0),
+                    exec_version: None,
+                    name: p.exe.clone().unwrap_or_else(|| p.name.clone()),
+                    aterm: true,
+                    wait: p.start_wait?,
+                    tab: None,
+                    started_ms: None,
+                })
             })
             .collect();
         let lanes = self.reader.lanes();
@@ -273,6 +277,7 @@ impl Host {
             },
             process_limit: self.process_limit,
             held,
+            grant_ms: None,
         })
     }
 }
@@ -418,6 +423,20 @@ fn fd(f: &probe::FdReading) -> Fd {
     Fd { fd: f.fd, kind }
 }
 
+/// What keeps a process that stands `at` its start from starting, as the engine names it; `None`
+/// for one that started.
+const fn start_wait(at: AtStart) -> Option<StartWait> {
+    match at {
+        AtStart::Started => None,
+        AtStart::Held => Some(StartWait::ProgramCheck),
+        AtStart::Translating => Some(StartWait::Translating),
+        AtStart::Unstarted => Some(StartWait::NotStarted),
+        AtStart::StoppedUnstarted { stopped, traced } => {
+            Some(StartWait::StoppedUnstarted { stopped, traced })
+        }
+    }
+}
+
 fn job_proc(p: &ProcFacts) -> JobProc {
     JobProc {
         pid: p.pid,
@@ -461,7 +480,9 @@ fn job_proc(p: &ProcFacts) -> JobProc {
         wchan: p.wchan.clone(),
         fds: p.fds.as_ref().map(|fs| fs.iter().map(fd).collect()),
         blocked_fd: p.blocked_fd,
-        program_check: p.program_check() == Some(AtStart::Held),
+        start_wait: p.program_check().and_then(start_wait),
         version: aterm_sysprobe::procs::pid_version(p.pid).and_then(|v| u64::try_from(v).ok()),
+        becomes: None,
+        claims_ahead: None,
     }
 }

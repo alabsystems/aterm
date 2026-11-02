@@ -4,6 +4,10 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/atoms.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
+// Modified by the aterm project in 2026; see the repository NOTICE. (The atoms are interned
+// in one round trip through first-party `aterm-x11`, where upstream used x11rb's
+// `atom_manager!`: docs/AUDIT-third-party-2026-10-15.md, LW.7.)
+
 //! Collects every atom used by the platform implementation.
 
 use core::ops::Index;

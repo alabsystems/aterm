@@ -35,6 +35,7 @@ fn fixture() -> (Trust, age::Identity, Request) {
             provider: "anthropic".into(),
             method: "cli".into(),
             device: binding,
+            intent: None,
             secret: Some(SecretRef {
                 vault: "lab".into(),
                 signer: [11; 32],
@@ -43,6 +44,119 @@ fn fixture() -> (Trust, age::Identity, Request) {
         })),
     };
     (trust, identity, request)
+}
+
+#[test]
+fn fleet_intent_seals_its_binding_to_the_issuer_and_each_device_lane() {
+    let (trust, identity, request) = fixture();
+    let Action::Prepare(legacy) = &request.action else {
+        unreachable!()
+    };
+    let terms = Intent {
+        table: legacy.table,
+        key: legacy.key.clone(),
+        proposal: legacy.proposal,
+        configuration: legacy.configuration,
+        provider: legacy.provider.clone(),
+        method: legacy.method.clone(),
+        issuer: legacy.device.clone(),
+        secret: legacy.secret.clone(),
+    };
+    let hash = SecretBytes::new(vec![42; 32]);
+    assert!(terms.issued_by(&legacy.device, 1));
+    let successor = super::super::binding::Request::create(
+        trust.network,
+        trust.authority,
+        *legacy.device.machine(),
+        [88; 16],
+        &identity,
+        &[24; 32],
+    )
+    .unwrap()
+    .binding()
+    .clone();
+    assert_ne!(successor.actor(), legacy.device.actor());
+    assert!(terms.issued_by(&successor, 1));
+    assert!(!terms.issued_by(&successor, 0));
+    assert!(!terms.issued_by(&successor, 2));
+    for (network, authority, machine) in [
+        ([55; 16], trust.authority, *legacy.device.machine()),
+        (trust.network, [55; 32], *legacy.device.machine()),
+        (trust.network, trust.authority, [55; 16]),
+    ] {
+        let other = super::super::binding::Request::create(
+            network, authority, machine, [88; 16], &identity, &[24; 32],
+        )
+        .unwrap()
+        .binding()
+        .clone();
+        assert!(!terms.issued_by(&other, 1));
+    }
+    let mut intent_request = request.clone();
+    intent_request.action = Action::Intent(Box::new(terms.clone()));
+    let intent = Record::issue(
+        &SEED,
+        trust,
+        intent_request.clone(),
+        [12; 32],
+        0,
+        Some(&hash),
+    )
+    .unwrap();
+    assert_eq!(
+        Record::verify(intent.bytes(), trust).unwrap().request(),
+        &intent_request
+    );
+    assert!(intent.matches_issuer_entry(&SEED, hash.as_slice()).unwrap());
+    assert!(!intent.matches_issuer_entry(&SEED, &[43; 32]).unwrap());
+    assert!(
+        intent
+            .matches_issuer_entry(&[18; 32], hash.as_slice())
+            .is_err()
+    );
+    assert!(age::decrypt(std::slice::from_ref(&identity), &intent.capsule).is_err());
+    assert!(
+        !intent
+            .bytes()
+            .windows(32)
+            .any(|part| part == hash.as_slice())
+    );
+    let reference = IntentRef {
+        account: intent.request().account,
+        decision: intent.id(),
+    };
+    let preparation = terms.for_device(reference, legacy.device.clone());
+    let account = reference.device_account(&preparation.device);
+    let mut later_reference = reference;
+    later_reference.decision = [99; 32];
+    assert_eq!(account, later_reference.device_account(&preparation.device));
+    let child_request = Request {
+        account,
+        action: Action::Prepare(Box::new(preparation)),
+        ..request
+    };
+    let child = Record::issue(
+        &SEED,
+        trust,
+        child_request.clone(),
+        [12; 32],
+        0,
+        Some(&hash),
+    )
+    .unwrap();
+    assert_eq!(
+        Record::verify(child.bytes(), trust).unwrap().request(),
+        &child_request
+    );
+    assert!(child.matches_entry(&identity, hash.as_slice()).unwrap());
+    assert!(child.matches_issuer_entry(&SEED, hash.as_slice()).unwrap());
+    assert!(!child.matches_issuer_entry(&SEED, &[43; 32]).unwrap());
+    assert!(
+        !child
+            .bytes()
+            .windows(32)
+            .any(|part| part == hash.as_slice())
+    );
 }
 fn resign(bytes: &mut [u8]) {
     let n = bytes.len() - 64;

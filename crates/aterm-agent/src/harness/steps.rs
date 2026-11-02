@@ -94,6 +94,46 @@ const KEY_NAME: &str = aterm_phase::anchor!("transcript.name");
 const KEY_ORIGIN: &str = aterm_phase::anchor!("transcript.origin");
 const KEY_KIND: &str = aterm_phase::anchor!("transcript.kind");
 const KEY_UUID: &str = aterm_phase::anchor!("transcript.uuid");
+const ROW_USER: &str = aterm_phase::anchor!("transcript.user");
+const ROW_ASSISTANT: &str = aterm_phase::anchor!("transcript.assistant");
+const ROW_SYSTEM: &str = aterm_phase::anchor!("transcript.system");
+const ORIGIN_HUMAN: &str = aterm_phase::anchor!("transcript.human");
+const ORIGIN_TASK_NOTIFICATION: &str = aterm_phase::anchor!("transcript.task-notification");
+const ORIGIN_AUTO_CONTINUATION: &str = aterm_phase::anchor!("transcript.auto-continuation");
+
+/// The origin kinds (`origin.kind`) of a user row that is no one else's prompt: a person's, a
+/// background task's wake, Claude Code's own continuation. Any other kind is someone's.
+const ORIGIN_OWN: [&str; 3] = [
+    ORIGIN_HUMAN,
+    ORIGIN_TASK_NOTIFICATION,
+    ORIGIN_AUTO_CONTINUATION,
+];
+
+/// The row kinds (`type`) the fold acts on. Of any other row it reads only its `type` and its
+/// sidechain flag: it makes no step of it, moves no chain end and takes no build from it, so a row
+/// of any other kind, with any keys, changes nothing the fold makes (the step tests' law,
+/// `an_inert_row_changes_nothing_the_fold_makes`). `lab claude-measure` only notes a new key or
+/// record kind on such a row.
+pub const ROW_KINDS: [&str; 3] = [ROW_USER, ROW_ASSISTANT, ROW_SYSTEM];
+
+/// Whether the fold acts on a row of kind `kind` ([`ROW_KINDS`]).
+#[must_use]
+pub fn acts_on(kind: &str) -> bool {
+    ROW_KINDS.contains(&kind)
+}
+
+/// THE ONE READ OF A VALUE THE FOLD'S ARMS COMPARE (a row's `type` and `subtype`, a part's `type`,
+/// an origin's `kind`): the closed word `v` holds, as `TRANSCRIPT_KEYS` names it, else none. A
+/// word the table does not name never matches an arm, so a word an arm compares is in the table
+/// GONE and NEW-KEY hold a build to; with the keys the fold's projections keep, that is all it
+/// reads of a row (`the_fold_reads_what_the_transcript_keys_name`).
+fn word(v: Option<&Value>) -> Option<&'static str> {
+    let s = v?.as_str()?;
+    aterm_phase::anchors::TRANSCRIPT_KEYS
+        .iter()
+        .map(|a| a.text)
+        .find(|t| *t == s)
+}
 
 /// An id as the session log takes one (`aterm_slog::ShortId`'s rule).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -490,11 +530,16 @@ pub struct NoticeRead {
     pub named: Option<WallKind>,
 }
 
-/// [`NoticeRead`] of one transcript line.
+/// [`NoticeRead`] of one transcript line, read through the fold's own notice projection
+/// (`transcript::step_notice`).
 #[must_use]
 pub fn notice_read(line: &str) -> Option<NoticeRead> {
-    let v = transcript::conversation(line).ok()?;
-    let Some(Row::Entry(entry @ Entry::Notice { .. })) = wall_confirm::row_of(&v) else {
+    notice_of_value(&transcript::step_notice(line).ok()?)
+}
+
+/// [`NoticeRead`] of a row as a projection read it.
+fn notice_of_value(v: &Value) -> Option<NoticeRead> {
+    let Some(Row::Entry(entry @ Entry::Notice { .. })) = wall_confirm::row_of(v) else {
         return None;
     };
     let end = TranscriptEnd {
@@ -668,7 +713,10 @@ fn lead(line: &str) -> Option<Lead> {
 fn unicode_escape(b: &[u8]) -> Option<(char, usize)> {
     let hex = |s: &[u8]| -> Option<u32> {
         let t = std::str::from_utf8(s.get(2..6)?).ok()?;
-        u32::from_str_radix(t, 16).ok()
+        t.bytes()
+            .all(|b| b.is_ascii_hexdigit())
+            .then(|| u32::from_str_radix(t, 16).ok())
+            .flatten()
     };
     let hi = hex(b)?;
     if (0xD800..0xDC00).contains(&hi) {
@@ -1001,11 +1049,7 @@ impl StepFold {
             return;
         };
         let t = text.trim();
-        if t.is_empty()
-            || !["\"user\"", "\"assistant\"", "\"system\"", "\\u"]
-                .iter()
-                .any(|k| t.contains(k))
-        {
+        if t.is_empty() || !(ROW_KINDS.iter().any(|k| quoted(t, k)) || t.contains("\\u")) {
             return;
         }
         let parsed = if wants_parts(t) {
@@ -1023,10 +1067,12 @@ impl StepFold {
         if flag(obj, KEY_SIDECHAIN) {
             return;
         }
+        let kind = word(obj.get(KEY_TYPE));
         if let Some(v) = obj
             .get(KEY_VERSION)
             .and_then(Value::as_str)
             .and_then(StepId::new)
+            .filter(|_| kind.is_some_and(acts_on))
         {
             self.version = Some(v);
         }
@@ -1037,25 +1083,24 @@ impl StepFold {
         let opens = obj.get(KEY_PARENT).is_some_and(Value::is_null);
         let mut out: Vec<StepEvent> = Vec::new();
         let mut bad = false;
-        let kind = obj.get(KEY_TYPE).and_then(Value::as_str);
-        let unasked = kind == Some("assistant")
+        let unasked = kind == Some(ROW_ASSISTANT)
             && self.end.end.last == EndClass::Nothing
             && self.pending.is_none()
             && self.in_turn != Some(true);
         let waited = match kind {
-            Some("assistant") => self.ran(obj),
+            Some(ROW_ASSISTANT) => self.ran(obj),
             _ => None,
         };
         let mut late = None;
         let live = fresh && at_ms.is_some_and(|t| t >= self.floor_ms);
         let row = match kind {
-            Some("assistant") => self.assistant(t, obj, live, &mut out, &mut bad),
-            Some("user") => {
+            Some(ROW_ASSISTANT) => self.assistant(t, obj, live, &mut out, &mut bad),
+            Some(ROW_USER) => {
                 let (row, first) = self.user(t, obj, opens, (fresh, at_ms), &mut out, &mut bad);
                 late = first;
                 row
             }
-            Some("system") => self.system(obj, &mut out, &mut bad),
+            Some(ROW_SYSTEM) => self.system(obj, &mut out, &mut bad),
             _ => EndRow::None,
         };
         let ended = matches!(row, EndRow::Closed);
@@ -1092,7 +1137,7 @@ impl StepFold {
         }
         let state = self.state();
         let k = out.len() as u64;
-        if kind == Some("user") {
+        if kind == Some(ROW_USER) {
             // THE HELD TURN'S PROMPT, written late: dated before its rows,
             // it is queued before their steps; any other user row says no
             // such prompt comes, and they go on as they are.
@@ -1258,7 +1303,7 @@ impl StepFold {
         }
         out.reserve(parts(message).count());
         for part in parts(message) {
-            if part.get(KEY_TYPE).and_then(Value::as_str) != Some(KEY_TOOL_USE) {
+            if word(part.get(KEY_TYPE)) != Some(KEY_TOOL_USE) {
                 continue;
             }
             let Some(id) = part.get(KEY_ID).and_then(Value::as_str) else {
@@ -1290,11 +1335,9 @@ impl StepFold {
         out: &mut Vec<StepEvent>,
         bad: &mut bool,
     ) -> (EndRow, Option<StepId>) {
-        let someone = obj
-            .get(KEY_ORIGIN)
-            .and_then(|o| o.get(KEY_KIND))
-            .and_then(Value::as_str)
-            .is_some_and(|k| !matches!(k, "human" | "task-notification" | "auto-continuation"));
+        let origin = obj.get(KEY_ORIGIN).and_then(|o| o.get(KEY_KIND));
+        let someone = origin.and_then(Value::as_str).is_some()
+            && word(origin).is_none_or(|k| !ORIGIN_OWN.contains(&k));
         let meta = flag(obj, KEY_META);
         let id = obj
             .get(KEY_PROMPT_ID)
@@ -1331,7 +1374,7 @@ impl StepFold {
         let message = obj.get(KEY_MESSAGE).and_then(Value::as_object);
         let mut results = false;
         for part in parts(message) {
-            if part.get(KEY_TYPE).and_then(Value::as_str) != Some(KEY_TOOL_RESULT) {
+            if word(part.get(KEY_TYPE)) != Some(KEY_TOOL_RESULT) {
                 continue;
             }
             results = true;
@@ -1362,11 +1405,7 @@ impl StepFold {
             }
             return (EndRow::None, None);
         }
-        let asks = obj
-            .get(KEY_ORIGIN)
-            .and_then(|o| o.get(KEY_KIND))
-            .and_then(Value::as_str)
-            != Some("task-notification");
+        let asks = word(origin) != Some(ORIGIN_TASK_NOTIFICATION);
         let ask = match lead {
             _ if someone => Ask::Prompt,
             Some(l) if l.starts(INTERRUPTED) => Ask::Interrupt,
@@ -1399,7 +1438,7 @@ impl StepFold {
     }
 
     fn system(&mut self, obj: &Map, out: &mut Vec<StepEvent>, bad: &mut bool) -> EndRow {
-        match obj.get(KEY_SUBTYPE).and_then(Value::as_str) {
+        match word(obj.get(KEY_SUBTYPE)) {
             Some(KEY_TURN_DURATION) => {
                 match number(obj.get(KEY_DURATION_MS)) {
                     Some(vdur_ms) => out.push(StepEvent::TurnEnd {
@@ -1456,3 +1495,7 @@ mod tests;
 #[cfg(test)]
 #[path = "steps_corpus_tests.rs"]
 mod corpus_tests;
+
+#[cfg(test)]
+#[path = "steps_inert_tests.rs"]
+mod inert_tests;

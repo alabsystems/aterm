@@ -233,7 +233,8 @@ impl Listener {
     /// connected endpoints are checked before returning a typed connection.
     pub fn accept(&self) -> io::Result<Connection> {
         self.recheck()?;
-        let (stream, _) = self.tcp.accept()?;
+        // Nonblocking (the native listen made it so): the accept never waits under the lock.
+        let (stream, _) = aterm_uds::kept_out(|| self.tcp.accept())?;
         let connection = Connection::admitted_by(stream, self.scope, self.witness())?;
         self.recheck()?;
         Ok(connection)

@@ -35,6 +35,17 @@ const CASCADE_STEP_PTS: f64 = 26.0;
 
 const CASCADE_MIN_VISIBLE_PTS: f64 = 160.0;
 
+/// Subscribe before reading either accessibility value, keeping the observer alive through
+/// the snapshot. A change posted just before registration must reach the initial reading.
+fn observe_initial_accessibility<O>(
+    observe: impl FnOnce() -> O,
+    read: impl FnOnce() -> (bool, crate::native_appearance::AppearancePreferences),
+) -> (O, bool, crate::native_appearance::AppearancePreferences) {
+    let observer = observe();
+    let (reduce_motion, appearance) = read();
+    (observer, reduce_motion, appearance)
+}
+
 #[cfg(target_os = "linux")]
 const INITIAL_FRAME_SETTLE_WINDOW: std::time::Duration = std::time::Duration::from_millis(2000);
 #[cfg(target_os = "linux")]
@@ -572,6 +583,25 @@ impl App {
         self.install_window_state_with_parent(wid, session, rows, cols, None);
     }
 
+    /// The display scale of a window made with no OS window, the scale its
+    /// [`Self::unattached_window_metrics`] are at: a headless launch's own (`--scale`), since no
+    /// screen ever measures one; windowed, 1 until [`Self::attach_os_window`] measures it.
+    pub(crate) const fn unattached_window_scale(&self) -> f64 {
+        if self.headless {
+            self.headless_scale
+        } else {
+            1.0
+        }
+    }
+
+    /// Installs `ws`, made with no OS window, as window `wid` at
+    /// [`Self::unattached_window_scale`], so a headless window's overlay cards measure their
+    /// points at the pixels its cells are drawn at.
+    pub(crate) fn insert_unattached_window(&mut self, wid: WindowId, mut ws: WindowState) {
+        ws.scale = self.unattached_window_scale();
+        self.windows.insert(wid, Box::new(ws));
+    }
+
     /// `install_window_state` with an explicit registry lineage parent for the window's first session.
     pub(crate) fn install_window_state_with_parent(
         &mut self,
@@ -609,7 +639,7 @@ impl App {
             vec![layout],
             crate::tab_model::TabSet::new(tab),
         );
-        self.windows.insert(wid, Box::new(ws));
+        self.insert_unattached_window(wid, ws);
         self.install_window_config_assets(wid);
         self.frontmost_window = Some(wid);
         self.sync_active_session();
@@ -1065,11 +1095,25 @@ impl App {
         if self._reduce_motion.is_none()
             && let Some(proxy) = self.proxy.as_ref()
         {
-            self.system_reduce_motion = self.apprt.reduce_motion();
-            crate::native_appearance::install_preferences(
-                self.apprt.native_appearance_preferences(),
+            let (observer, reduce_motion, appearance) = observe_initial_accessibility(
+                || self.apprt.observe_reduce_motion(proxy),
+                || {
+                    (
+                        self.apprt.reduce_motion(),
+                        self.apprt.native_appearance_preferences(),
+                    )
+                },
             );
-            self._reduce_motion = self.apprt.observe_reduce_motion(proxy);
+            self._reduce_motion = observer;
+            self.system_reduce_motion =
+                reduce_motion || crate::native_appearance::dev_accessibility().reduce_motion;
+            crate::native_appearance::install_preferences(appearance);
+            // The accent macOS paints its controls in, read once a window stands; the system
+            // colours' notification reads it again.
+            #[cfg(target_os = "macos")]
+            crate::native_appearance::install_control_accent(self.apprt.control_accent());
+            // Keep the initial power sample after the same subscription.
+            let _ = self.resample_low_power(std::time::Instant::now(), true);
         }
         window.set_ime_allowed(true);
         window.set_ime_purpose(aterm_window::window::ImePurpose::Terminal);
@@ -1303,8 +1347,11 @@ impl App {
         {
             let (cw, ch) = self.cell_size();
             window.set_resize_increments(Some(PhysicalSize::new(cw as u32, ch as u32)));
-            #[cfg(target_os = "linux")]
-            window.set_min_inner_size(Some(self.whole_cell_min_size(wid)));
+            let least = self.least_window_size(wid);
+            crate::app_config::tell_least_inner_size(&window, least);
+            if let Some(ws) = self.windows.get_mut(&wid) {
+                ws.least_held = Some(least);
+            }
             if (self.font_size - self.default_font_size).abs() < 0.5 {
                 crate::restore::store_cell_metrics(
                     self.cell_metrics_font_key(),
@@ -2234,7 +2281,6 @@ impl App {
         }
         if focus && !focused {
             w.focus_window();
-            w.request_user_attention(Some(aterm_window::window::UserAttentionType::Critical));
         }
         w.request_redraw();
     }
@@ -2864,7 +2910,11 @@ impl App {
             .front_terminal(wid)
             .and_then(|terminal| crate::term_lock(&terminal.term).taskbar_progress());
         taskbar::set_progress(hwnd, progress);
-        self.sync_taskbar_extras(wid, hwnd);
+        let focused = self
+            .windows
+            .get(&wid)
+            .is_some_and(|ws| crate::os_window_focused(ws));
+        self.sample_recent_dirs(hwnd, focused);
     }
 }
 
@@ -2921,18 +2971,6 @@ pub(crate) mod taskbar {
         mark_fullscreen_window: unsafe extern "system" fn(*mut ITaskbarList3, isize, i32) -> i32,
         set_progress_value: unsafe extern "system" fn(*mut ITaskbarList3, isize, u64, u64) -> i32,
         set_progress_state: unsafe extern "system" fn(*mut ITaskbarList3, isize, u32) -> i32,
-        register_tab: unsafe extern "system" fn(*mut ITaskbarList3, isize, isize) -> i32,
-        unregister_tab: unsafe extern "system" fn(*mut ITaskbarList3, isize) -> i32,
-        set_tab_order: unsafe extern "system" fn(*mut ITaskbarList3, isize, isize) -> i32,
-        set_tab_active: unsafe extern "system" fn(*mut ITaskbarList3, isize, isize, u32) -> i32,
-        thumb_bar_add_buttons:
-            unsafe extern "system" fn(*mut ITaskbarList3, isize, u32, *const c_void) -> i32,
-        thumb_bar_update_buttons:
-            unsafe extern "system" fn(*mut ITaskbarList3, isize, u32, *const c_void) -> i32,
-        thumb_bar_set_image_list:
-            unsafe extern "system" fn(*mut ITaskbarList3, isize, isize) -> i32,
-        set_overlay_icon:
-            unsafe extern "system" fn(*mut ITaskbarList3, isize, isize, *const u16) -> i32,
     }
 
     #[repr(C)]
@@ -3042,50 +3080,17 @@ pub(crate) mod taskbar {
         });
     }
 
-    /// Show (`icon` non-zero, with its accessible NUL-terminated `description`) or clear the overlay icon.
-    pub(crate) fn set_overlay_icon(hwnd: isize, icon: isize, description: &[u16]) -> bool {
-        CACHE.with(|c| {
-            let Some(obj) = c.borrow_mut().object() else {
-                return false;
-            };
-            let description = overlay_description(icon, description);
-            // SAFETY: `obj` is a live `ITaskbarList3` created on this thread, `hwnd` a live
-            // top-level window (0 rejected by the caller), `icon` a live HICON or 0, and
-            // `description` null or a NUL-terminated UTF-16 string that outlives this synchronous
-            // call.
-            unsafe { ((*(*obj).vtbl).set_overlay_icon)(obj, hwnd, icon, description) >= 0 }
-        })
-    }
-
-    fn overlay_description(icon: isize, description: &[u16]) -> *const u16 {
-        if icon == 0 || description.last() != Some(&0) {
-            std::ptr::null()
-        } else {
-            description.as_ptr()
-        }
-    }
-
     /// Drop the cache entry for a closing window's `hwnd`.
     pub(crate) fn forget(hwnd: isize) {
-        crate::taskbar_badge_win::forget(hwnd);
         CACHE.with(|c| {
             c.borrow_mut().applied.remove(&hwnd);
         });
+        crate::jumplist_recent::forget_window(hwnd);
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
-
-        #[test]
-        fn a_show_passes_its_text_and_a_clear_passes_none() {
-            let text = crate::win_ffi::wide("A tab rang the bell");
-            assert_eq!(overlay_description(0x7010, &text), text.as_ptr());
-            assert!(overlay_description(0, &text).is_null(), "a clear");
-            assert!(overlay_description(0, &[]).is_null());
-            let unterminated: Vec<u16> = "A tab".encode_utf16().collect();
-            assert!(overlay_description(0x7010, &unterminated).is_null());
-        }
 
         #[test]
         fn progress_maps_to_the_taskbar_flag_and_value() {
@@ -3110,10 +3115,6 @@ pub(crate) mod taskbar {
             assert_eq!(
                 slot(std::mem::offset_of!(ITaskbarList3Vtbl, set_progress_state)),
                 10
-            );
-            assert_eq!(
-                slot(std::mem::offset_of!(ITaskbarList3Vtbl, set_overlay_icon)),
-                18
             );
         }
     }
@@ -3241,6 +3242,87 @@ mod tests {
     use super::*;
 
     use crate::feed_session_for_test as feed;
+
+    /// A headless window made after launch is at the launch's `--scale`, as its metrics are, so
+    /// its overlay cards measure their points at the pixels its cells are drawn at: at
+    /// `--scale 2` a second window's Overview holds the columns a 1x one does (§14.16).
+    #[test]
+    fn a_headless_window_made_after_launch_is_at_the_launchs_scale() {
+        let mut app = App::headless_for_test();
+        app.headless_scale = 2.0;
+        let second = app.insert_logical_window(crate::stub_session(app.next_session_id), 24, 80);
+        assert_eq!(app.windows[&second].scale, 2.0, "the launch's scale, not 1");
+        app.windows
+            .get_mut(&second)
+            .expect("the window")
+            .input_scratch
+            .cells = vec![Vec::new(); 24];
+        assert_eq!(app.frontmost_window, Some(second));
+        assert!(app.open_overview().is_ok());
+        let t = app
+            .overlay_coordinate_transform(second)
+            .expect("the open card's transform");
+        assert_eq!(
+            t.geom.px_per_pt, 2.0,
+            "two of the window's pixels to a point"
+        );
+    }
+
+    #[test]
+    fn a_change_at_initial_subscription_reaches_both_accessibility_readings() {
+        use std::cell::Cell;
+
+        use crate::native_appearance::AppearancePreferences;
+
+        struct Subscription<'a>(&'a Cell<bool>);
+
+        impl Drop for Subscription<'_> {
+            fn drop(&mut self) {
+                self.0.set(false);
+            }
+        }
+
+        let changed = AppearancePreferences {
+            high_contrast: true,
+            reduced_transparency: true,
+            differentiate_without_color: true,
+            ..AppearancePreferences::default()
+        };
+        let capture = |sample_early: bool| {
+            let state = Cell::new((false, AppearancePreferences::default()));
+            let subscribed = Cell::new(false);
+            let queued = Cell::new(0);
+            // Negative control: preserve the original pre-subscription snapshot.
+            let early = sample_early.then(|| state.get());
+            let (observer, reduce_motion, appearance) = observe_initial_accessibility(
+                || {
+                    // The OS changes and posts immediately before registration. Nothing
+                    // receives that notification; the snapshot must recover its new state.
+                    state.set((true, changed));
+                    if subscribed.get() {
+                        queued.set(queued.get() + 1);
+                    }
+                    subscribed.set(true);
+                    Subscription(&subscribed)
+                },
+                || {
+                    assert!(subscribed.get(), "the snapshot keeps its observer alive");
+                    early.unwrap_or_else(|| state.get())
+                },
+            );
+            assert_eq!(queued.get(), 0, "no notification can repair this snapshot");
+            assert!(subscribed.get(), "the caller retains the observer");
+            drop(observer);
+            assert!(!subscribed.get());
+            (reduce_motion, appearance)
+        };
+        assert_eq!(capture(false), (true, changed));
+        assert_eq!(
+            capture(true),
+            (false, AppearancePreferences::default()),
+            "sampling before subscription loses the change in both readings"
+        );
+    }
 
     #[test]
     fn a_cold_restores_first_window_carries_its_frame_unless_sized_otherwise() {

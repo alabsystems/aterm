@@ -203,6 +203,10 @@ fn steps_projections_answer_as_recorded() {
     for (id, row) in rows {
         corpus.record(format!("{id}/steps"), written(super::steps(&row)));
         corpus.record(format!("{id}/steps-bare"), written(super::steps_bare(&row)));
+        corpus.record(
+            format!("{id}/step-notice"),
+            written(super::step_notice(&row)),
+        );
     }
     corpus.finish();
 }

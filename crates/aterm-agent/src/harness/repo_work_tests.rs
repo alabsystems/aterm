@@ -8,24 +8,38 @@ use std::path::PathBuf;
 /// author; its output.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) fn scratch_git(dir: &Path, args: &[&str]) -> String {
+    scratch_git_dated(dir, None, args)
+}
+
+/// [`scratch_git`] with its commits and reflog entries dated `when` (Unix seconds), where given.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn scratch_git_dated(dir: &Path, when: Option<u64>, args: &[&str]) -> String {
+    let mut cmd = aterm_uds::spawnfd::command(crate::test_program::git());
+    if let Some(exec_path) = crate::test_program::git_exec_path() {
+        cmd.env("GIT_EXEC_PATH", exec_path);
+    }
+    if let Some(when) = when {
+        let stamp = format!("@{when} +0000");
+        cmd.env("GIT_COMMITTER_DATE", &stamp)
+            .env("GIT_AUTHOR_DATE", &stamp);
+    }
     let out = aterm_uds::deadline::output_until(
-        aterm_uds::spawnfd::command(aterm_uds::os_path!("git"))
-            .args([
-                "-c",
-                "user.name=Andrew Yates",
-                "-c",
-                "user.email=a@example.invalid",
-            ])
-            .args([
-                "-c",
-                "init.defaultBranch=main",
-                "-c",
-                "commit.gpgsign=false",
-            ])
-            .args(args)
-            .current_dir(dir)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null"),
+        cmd.args([
+            "-c",
+            "user.name=Andrew Yates",
+            "-c",
+            "user.email=a@example.invalid",
+        ])
+        .args([
+            "-c",
+            "init.defaultBranch=main",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null"),
         std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
     )
     .unwrap_or_else(|e| panic!("git {args:?} within the hang detector: {e}"));
@@ -344,6 +358,712 @@ fn a_submodule_checkout_a_merge_moved_past_is_no_work() {
     assert_eq!((hygiene.changed, hygiene.untracked), (0, 0), "{hygiene:?}");
 }
 
+/// `<tmp>/app/work` with `<tmp>/lib/work`'s bare origin added at `vendor/lib` over `file://`,
+/// committed and pushed: `(lib, app)`. Neither sets `submodule.recurse`, git's default.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn app_with_lib(tmp: &Path) -> (PathBuf, PathBuf) {
+    let (lib_dir, app_dir) = (tmp.join("lib"), tmp.join("app"));
+    std::fs::create_dir_all(&lib_dir).expect("lib");
+    std::fs::create_dir_all(&app_dir).expect("app");
+    let lib = repo(&lib_dir, true);
+    let app = repo(&app_dir, true);
+    let url = format!("file://{}", lib_dir.join("remote.git").display());
+    scratch_git(
+        &app,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            &url,
+            "vendor/lib",
+        ],
+    );
+    scratch_git(&app, &["commit", "-q", "-m", "lib"]);
+    scratch_git(&app, &["push", "-q", "origin", "HEAD:main"]);
+    (lib, app)
+}
+
+/// Every read of a probe of `dir` cut in turn ([`read_stall`], on the probe's clock): none reads
+/// clean, `what` naming the work it holds.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn never_clean_when_cut(dir: &Path, used: &Used, what: &str) {
+    for k in 0..40 {
+        read_stall::set_after(k, 11_000);
+        let read = probe_session(dir, Some(dir), used, Duration::from_secs(10));
+        read_stall::set(0);
+        assert!(
+            !read.is_clean(),
+            "read {k} cut: {read:?} over {what} read as clean"
+        );
+    }
+}
+
+/// A SUBMODULE'S COMMIT ON NO REMOTE IS WORK (D2-1): a commit made in `vendor/lib` and recorded
+/// by a bump the superproject pushed, but never pushed to the submodule's own remote, is one
+/// nobody cloning the remote main can fetch, though `git status` shows nothing; the probe counts
+/// it and names the submodule, and a probe cut at any read over it is never clean. NEGATIVE
+/// CONTROL: the submodule at its first record, and the same bump once its commit is pushed, read
+/// clean.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_submodule_commit_on_no_remote_is_work() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let (_lib, app) = app_with_lib(tmp.path());
+    assert_eq!(found(&app), None, "the submodule at a pushed record");
+    let sub = app.join("vendor/lib");
+    std::fs::write(sub.join("d.txt"), "four\n").expect("d.txt");
+    scratch_git(&sub, &["add", "d.txt"]);
+    scratch_git(&sub, &["commit", "-q", "-m", "local"]);
+    scratch_git(&app, &["add", "vendor/lib"]);
+    scratch_git(&app, &["commit", "-q", "-m", "bump"]);
+    scratch_git(&app, &["push", "-q", "origin", "HEAD:main"]);
+    assert_eq!(scratch_git(&app, &["status", "--porcelain"]), "");
+    let w = found(&app).expect("the submodule's commit on no remote");
+    assert_eq!(
+        (w.changed, w.untracked, w.stashes, w.unpushed, w.unlanded),
+        (0, 0, 0, 0, 0),
+        "{w:?}"
+    );
+    assert!(
+        w.summary().ends_with(": 1 unpushed commit in vendor/lib"),
+        "{}",
+        w.summary()
+    );
+    never_clean_when_cut(&app, &Used::default(), "the submodule's commit");
+    scratch_git(&sub, &["push", "-q", "origin", "HEAD:main"]);
+    assert_eq!(found(&app), None, "the submodule's commit pushed");
+}
+
+/// A submodule's silent omission of a broken remote ref proves no clean repository. The
+/// superproject's status stays clean, but `rev-list --ignore-missing` silently drops the broken
+/// ref. Controls: the same pushed submodule before and after the broken ref reads checked, and
+/// an index record the submodule has not fetched is still optional to its own commit count;
+/// a present non-commit record is unread, never treated as a missing commit.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_submodule_count_that_ignores_a_broken_ref_is_not_clean() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let (_lib, app) = app_with_lib(tmp.path());
+    let read = || probe(&app, Some(&app), PROBE_LIMIT);
+    assert!(read().checked().is_some(), "the pushed submodule");
+    let sub = app.join("vendor/lib");
+    let bad = scratch_git(
+        &sub,
+        &["rev-parse", "--git-path", "refs/remotes/origin/broken"],
+    );
+    let bad = sub.join(bad.trim());
+    std::fs::write(&bad, "invalid-ref-sentinel\n").expect("the broken ref");
+    assert_eq!(scratch_git(&app, &["status", "--porcelain"]), "");
+    assert_eq!(read(), RepoRead::Unread, "the omitted submodule reference");
+    std::fs::remove_file(&bad).expect("remove the broken ref");
+    assert!(
+        read().checked().is_some(),
+        "the same complete references again"
+    );
+
+    let missing = "0000000000000000000000000000000000000001";
+    scratch_git(
+        &app,
+        &[
+            "update-index",
+            "--cacheinfo",
+            "160000",
+            missing,
+            "vendor/lib",
+        ],
+    );
+    // The public probe resolves its root before entering this helper; `/tmp` aliases
+    // `/private/tmp` on macOS, so supply the same canonical root here.
+    let canonical = app.canonicalize().expect("the canonical project root");
+    let reads = Reads {
+        deadline: Cell::new(Instant::now() + PROBE_LIMIT),
+        each: Some(PROBE_LIMIT),
+        home: &canonical,
+        xdg: None,
+        cut: Cell::new(false),
+        starts: Cell::new(0),
+        held: None,
+        refused: None,
+    };
+    let count = submodules_unpushed(&canonical, &aterm_sysprobe::volumes::table(), &reads)
+        .expect("an unfetched record is optional, the checkout still read strictly");
+    assert_eq!(count.count, 0, "the checkout's commit is pushed");
+    assert!(!reads.cut.get(), "no ref or checkout query was omitted");
+
+    let blob = scratch_git(&sub, &["rev-parse", "HEAD:a.txt"]);
+    scratch_git(
+        &app,
+        &[
+            "update-index",
+            "--cacheinfo",
+            "160000",
+            blob.trim(),
+            "vendor/lib",
+        ],
+    );
+    assert!(
+        submodules_unpushed(&canonical, &aterm_sysprobe::volumes::table(), &reads).is_none(),
+        "a present blob is no missing commit"
+    );
+}
+
+/// A `.gitmodules` GIT CANNOT READ IS NEVER A CLEAN READING (D2-1): `git status` reads clean over
+/// a committed and pushed `.gitmodules` with a bad line, but the submodule read git refuses
+/// counted nothing, so the probe is unread. NEGATIVE CONTROL: the same repository with that
+/// file whole (its submodule never cloned here) reads checked.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_gitmodules_git_cannot_read_is_never_a_clean_reading() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let work = repo(tmp.path(), true);
+    pushed(
+        &work,
+        ".gitmodules",
+        "[submodule \"x\"]\n\tpath = x\n\turl = ../x.git\n",
+    );
+    let whole = probe(&work, Some(&work), PROBE_LIMIT);
+    assert!(whole.checked().is_some(), "{whole:?}");
+    pushed(&work, ".gitmodules", "[submodule \"x\"\n\tpath = x\n");
+    assert_eq!(scratch_git(&work, &["status", "--porcelain"]), "");
+    assert_eq!(probe(&work, Some(&work), PROBE_LIMIT), RepoRead::Unread);
+}
+
+/// `vendor/<name>` added to `app` from `url` (a path: a local clone) and committed.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn add_submodule(app: &Path, url: &str, name: &str) {
+    let path = format!("vendor/{name}");
+    scratch_git(
+        app,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            url,
+            &path,
+        ],
+    );
+    scratch_git(app, &["commit", "-q", "-m", &path]);
+}
+
+/// A commit made in `dir`, writing `name`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn local_commit(dir: &Path, name: &str) {
+    std::fs::write(dir.join(name), "x\n").expect("write");
+    scratch_git(dir, &["add", name]);
+    scratch_git(dir, &["commit", "-q", "-m", name]);
+}
+
+/// The submodule's checkout committed in `app` and pushed.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn bump_pushed(app: &Path, path: &str) {
+    scratch_git(app, &["add", path]);
+    scratch_git(app, &["commit", "-q", "-m", "bump"]);
+    scratch_git(app, &["push", "-q", "origin", "HEAD:main"]);
+}
+
+/// EVERY SUBMODULE IS READ, HOWEVER MANY (R-1): a project of 33 populated submodules, all
+/// pushed, reads checked, never unread for its count, and a commit on no remote in the last one
+/// read is counted and named. NEGATIVE CONTROL: once that commit is pushed, checked again.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn every_submodule_is_read_however_many() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let (_lib, app) = app_with_lib(tmp.path());
+    let url = tmp.path().join("lib/remote.git").display().to_string();
+    for n in 1..=32 {
+        add_submodule(&app, &url, &format!("lib{n:02}"));
+    }
+    scratch_git(&app, &["push", "-q", "origin", "HEAD:main"]);
+    let all = probe(&app, Some(&app), PROBE_LIMIT);
+    assert!(
+        all.checked().is_some(),
+        "33 submodules, all pushed: {all:?}"
+    );
+    let last = app.join("vendor/lib32");
+    local_commit(&last, "d.txt");
+    bump_pushed(&app, "vendor/lib32");
+    let w = found(&app).expect("the 33rd submodule's commit on no remote");
+    assert!(
+        w.summary().ends_with(": 1 unpushed commit in vendor/lib32"),
+        "{}",
+        w.summary()
+    );
+    scratch_git(&last, &["push", "-q", "origin", "HEAD:refs/heads/side"]);
+    let pushed = probe(&app, Some(&app), PROBE_LIMIT);
+    assert!(pushed.checked().is_some(), "{pushed:?}");
+}
+
+/// A RECORD ON NO REMOTE HOLDS THOUGH ITS CHECKOUT LAGS (R-5): a commit made in `vendor/lib`,
+/// recorded by a bump the superproject pushed, with the submodule then checked out back at its
+/// first record, is a checkout `git status` lists and the lag read drops; only the index record
+/// names the commit, and it is counted. NEGATIVE CONTROL: once that commit is on the submodule's
+/// remote, the lagging checkout reads clean.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_record_on_no_remote_holds_though_its_checkout_lags() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let (_lib, app) = app_with_lib(tmp.path());
+    let sub = app.join("vendor/lib");
+    let first = scratch_git(&sub, &["rev-parse", "HEAD"]).trim().to_string();
+    local_commit(&sub, "d.txt");
+    let made = scratch_git(&sub, &["rev-parse", "HEAD"]).trim().to_string();
+    bump_pushed(&app, "vendor/lib");
+    scratch_git(&sub, &["checkout", "-q", &first]);
+    assert_eq!(
+        scratch_git(&app, &["status", "--porcelain"]),
+        " M vendor/lib\n"
+    );
+    let w = found(&app).expect("the recorded commit on no remote");
+    assert_eq!((w.changed, w.sub_unpushed), (0, 1), "{w:?}");
+    scratch_git(
+        &sub,
+        &["push", "-q", "origin", &format!("{made}:refs/heads/main")],
+    );
+    assert_eq!(found(&app), None, "the record pushed, the checkout lagging");
+}
+
+/// A SHALLOW SUBMODULE AT A FETCHED COMMIT IS NO WORK (R-4): a clone with `--shallow-submodules`
+/// fetches the record one commit deep, below a tip of the submodule's remote that does not reach
+/// it here; the record came from that remote and is not counted. NEGATIVE CONTROL: a commit made
+/// on it, recorded by a bump the superproject pushed, is one commit on no remote.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_shallow_submodule_at_a_fetched_commit_is_no_work() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let (lib, _app) = app_with_lib(tmp.path());
+    pushed(&lib, "b.txt", "two\n");
+    let lib_bare = tmp.path().join("lib/remote.git");
+    scratch_git(
+        &lib_bare,
+        &["config", "uploadpack.allowReachableSHA1InWant", "true"],
+    );
+    let url = format!("file://{}", tmp.path().join("app/remote.git").display());
+    scratch_git(
+        tmp.path(),
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "clone",
+            "-q",
+            "--recurse-submodules",
+            "--shallow-submodules",
+            &url,
+            "clone",
+        ],
+    );
+    let clone = tmp.path().join("clone");
+    let sub = clone.join("vendor/lib");
+    assert_eq!(
+        scratch_git(&sub, &["rev-parse", "--is-shallow-repository"]).trim(),
+        "true"
+    );
+    assert_eq!(scratch_git(&clone, &["status", "--porcelain"]), "");
+    let at = probe(&clone, Some(&clone), PROBE_LIMIT);
+    assert!(at.checked().is_some(), "{at:?}");
+    local_commit(&sub, "d.txt");
+    bump_pushed(&clone, "vendor/lib");
+    let w = found(&clone).expect("a commit made on the shallow record");
+    assert_eq!(w.sub_unpushed, 1, "{w:?}");
+}
+
+/// A NESTED SUBMODULE'S COMMIT ON NO REMOTE IS WORK (R-6): `app` holds `vendor/mid`, which holds
+/// `vendor/lib`; a commit made in the innermost, recorded by bumps pushed at both levels above it,
+/// is counted and named by its path from `app`. NEGATIVE CONTROL: everything pushed, and that
+/// commit once pushed, read clean.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_nested_submodules_commit_on_no_remote_is_work() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    app_with_lib(&tmp.path().join("mid"));
+    let app_dir = tmp.path().join("app");
+    std::fs::create_dir_all(&app_dir).expect("app");
+    let app = repo(&app_dir, true);
+    let url = format!("file://{}", tmp.path().join("mid/app/remote.git").display());
+    scratch_git(
+        &app,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            &url,
+            "vendor/mid",
+        ],
+    );
+    scratch_git(
+        &app,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "update",
+            "-q",
+            "--init",
+            "--recursive",
+        ],
+    );
+    scratch_git(&app, &["commit", "-q", "-m", "mid"]);
+    scratch_git(&app, &["push", "-q", "origin", "HEAD:main"]);
+    assert_eq!(found(&app), None, "every level pushed");
+    let (mid, lib) = (app.join("vendor/mid"), app.join("vendor/mid/vendor/lib"));
+    local_commit(&lib, "d.txt");
+    bump_pushed(&mid, "vendor/lib");
+    bump_pushed(&app, "vendor/mid");
+    assert_eq!(scratch_git(&app, &["status", "--porcelain"]), "");
+    let w = found(&app).expect("the innermost commit on no remote");
+    assert!(
+        w.summary()
+            .ends_with(": 1 unpushed commit in vendor/mid/vendor/lib"),
+        "{}",
+        w.summary()
+    );
+    scratch_git(&lib, &["push", "-q", "origin", "HEAD:main"]);
+    assert_eq!(found(&app), None, "the innermost commit pushed");
+}
+
+/// A SESSION INSIDE A SUBMODULE READS THE PROJECT AROUND IT (D2-4): a session whose last `cd` was
+/// into `vendor/lib` probes the superproject, so an edit there that no commit holds is found,
+/// named in the outer repository. NEGATIVE CONTROL: with nothing left anywhere, the probe from
+/// inside the submodule reads clean, naming the outer repository it checked.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_session_inside_a_submodule_reads_the_project_around_it() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let (_lib, app) = app_with_lib(tmp.path());
+    let sub = app.join("vendor/lib");
+    let clean = probe(&sub, Some(&sub), PROBE_LIMIT);
+    assert!(clean.is_clean() && !clean.is_unread(), "{clean:?}");
+    std::fs::write(app.join("a.txt"), "edited\n").expect("edit");
+    let w = found(&sub).expect("the outer project's edit");
+    assert_eq!(
+        (w.changed, w.paths.as_slice()),
+        (1, &["a.txt".to_string()][..]),
+        "{w:?}"
+    );
+    assert!(w.repo.ends_with("/app/work"), "{w:?}");
+    scratch_git(&app, &["checkout", "-q", "--", "a.txt"]);
+    let at = probe(&sub, Some(&sub), PROBE_LIMIT);
+    assert!(
+        at.checked()
+            .is_some_and(|at| at.repo.ends_with("/app/work")),
+        "{at:?}"
+    );
+}
+
+/// A SESSION INSIDE A SUBMODULE STILL READS THE SUBMODULE (D2-4): its commit pushed to a branch of
+/// the submodule's remote but not to that remote's main, recorded by a bump the superproject
+/// pushed, holds the landing as it did before the probe read the project around it, and a read of
+/// the project git refuses is unread though the submodule reads clean. NEGATIVE CONTROLS: a
+/// session in the superproject reads nothing there, since its commit is on a remote; once on the
+/// submodule's main, the session inside reads checked.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_session_inside_a_submodule_still_reads_the_submodule() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let (_lib, app) = app_with_lib(tmp.path());
+    let sub = app.join("vendor/lib");
+    scratch_git(&sub, &["checkout", "-q", "-b", "feat"]);
+    std::fs::write(sub.join("d.txt"), "four\n").expect("d.txt");
+    scratch_git(&sub, &["add", "d.txt"]);
+    scratch_git(&sub, &["commit", "-q", "-m", "feat"]);
+    scratch_git(&sub, &["push", "-q", "origin", "feat"]);
+    scratch_git(&app, &["add", "vendor/lib"]);
+    scratch_git(&app, &["commit", "-q", "-m", "bump"]);
+    scratch_git(&app, &["push", "-q", "origin", "HEAD:main"]);
+    assert_eq!(found(&app), None, "from the superproject");
+    let w = found(&sub).expect("the submodule's commit not on its main");
+    assert_eq!(
+        (w.unlanded, w.main_ref.as_str()),
+        (1, "origin/main"),
+        "{w:?}"
+    );
+    assert!(w.repo.ends_with("/app/work/vendor/lib"), "{w:?}");
+    scratch_git(&sub, &["push", "-q", "origin", "feat:main"]);
+    let clean = probe(&sub, Some(&sub), PROBE_LIMIT);
+    assert!(clean.checked().is_some(), "{clean:?}");
+    pushed(&app, ".gitmodules", "[submodule \"vendor/lib\"\n");
+    assert_eq!(
+        probe(&sub, Some(&sub), PROBE_LIMIT),
+        RepoRead::Unread,
+        "a read of the superproject git refused, the submodule clean"
+    );
+}
+
+/// A REMOTE CONFIGURED BUT NEVER PUSHED TO HOLDS EVERY COMMIT (D2-5): a repository whose `origin`
+/// was added, or that was cloned from an empty repository, with no remote-tracking ref yet,
+/// counts each commit on `HEAD` unpushed, which the worker can push. NEGATIVE CONTROL: with no
+/// remote configured it reads clean with `remote=false` (the owner's 2026-10-25 answer 4), and
+/// once pushed, clean with `remote=true`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_configured_remote_never_pushed_to_holds_every_commit() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let work = repo(tmp.path(), false);
+    let alone = probe(&work, Some(&work), PROBE_LIMIT);
+    assert!(alone.checked().is_some_and(|at| !at.remote), "{alone:?}");
+    let bare = tmp.path().join("origin.git");
+    std::fs::create_dir_all(&bare).expect("bare");
+    scratch_git(&bare, &["init", "-q", "--bare", "."]);
+    let url = format!("file://{}", bare.display());
+    scratch_git(&work, &["remote", "add", "origin", &url]);
+    let w = found(&work).expect("a remote added, never pushed to");
+    assert_eq!((w.unpushed, w.unlanded, w.changed), (1, 0, 0), "{w:?}");
+    never_clean_when_cut(&work, &Used::default(), "a commit never pushed");
+    scratch_git(&work, &["push", "-q", "-u", "origin", "HEAD:main"]);
+    let pushed = probe(&work, Some(&work), PROBE_LIMIT);
+    assert!(pushed.checked().is_some_and(|at| at.remote), "{pushed:?}");
+
+    let empty = tmp.path().join("empty.git");
+    std::fs::create_dir_all(&empty).expect("empty");
+    scratch_git(&empty, &["init", "-q", "--bare", "."]);
+    let url = format!("file://{}", empty.display());
+    scratch_git(tmp.path(), &["clone", "-q", &url, "clone"]);
+    let clone = tmp.path().join("clone");
+    std::fs::write(clone.join("a.txt"), "one\n").expect("a.txt");
+    scratch_git(&clone, &["add", "a.txt"]);
+    scratch_git(&clone, &["commit", "-q", "-m", "one"]);
+    let w = found(&clone).expect("a clone of an empty repository, never pushed");
+    assert_eq!((w.unpushed, w.unlanded), (1, 0), "{w:?}");
+}
+
+/// WORK THIS SESSION PARKED ON ANOTHER BRANCH HOLDS THE LANDING (D2-3): a branch this worktree
+/// moved through after the session began (its own `HEAD` reflog), or one the session's own
+/// command created in a worktree it then removed (its transcript), holding commits neither
+/// `HEAD` nor the remote main has, is counted and named, and a stash made on it is counted.
+/// NEGATIVE CONTROLS: a branch this worktree used before the session began, another worktree's
+/// branch, and any probe naming no session read as before; once the branches are merged and
+/// pushed and the stash dropped, nothing is found.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn work_this_session_parked_on_another_branch_holds_the_landing() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let work = repo(tmp.path(), true);
+    let (before, began, during) = (1_700_000_000, 1_700_000_100, 1_700_000_200);
+    let at = |dir: &Path, when: u64, args: &[&str]| scratch_git_dated(dir, Some(when), args);
+    let commit = |dir: &Path, when: u64, name: &str| {
+        std::fs::write(dir.join(name), "x\n").expect("file");
+        at(dir, when, &["add", name]);
+        at(dir, when, &["commit", "-q", "-m", name]);
+    };
+    at(&work, before, &["checkout", "-q", "-b", "theirs"]);
+    commit(&work, before, "theirs.txt");
+    at(&work, before, &["checkout", "-q", "main"]);
+    let other = tmp.path().join("other");
+    let other_s = other.to_str().expect("utf-8");
+    at(
+        &work,
+        during,
+        &["worktree", "add", "-q", "-b", "side", other_s],
+    );
+    commit(&other, during, "side.txt");
+    let session = Used {
+        since: Some(began),
+        branches: Vec::new(),
+    };
+    let read = |used: &Used| finished(probe_session(&work, Some(&work), used, PROBE_LIMIT));
+    assert_eq!(
+        read(&session),
+        None,
+        "before the session, or another worktree's"
+    );
+
+    at(&work, during, &["checkout", "-q", "-b", "feat"]);
+    commit(&work, during, "feat.txt");
+    at(&work, during, &["checkout", "-q", "main"]);
+    assert_eq!(
+        found(&work),
+        None,
+        "a probe naming no session reads HEAD alone"
+    );
+    let w = read(&session).expect("the branch this session left");
+    assert_eq!((w.changed, w.stashes, w.unpushed, w.unlanded), (0, 0, 0, 0));
+    assert!(
+        w.summary()
+            .ends_with(": 1 commit on feat not on origin/main"),
+        "{}",
+        w.summary()
+    );
+    never_clean_when_cut(&work, &session, "the branch this session left");
+
+    at(&work, during, &["checkout", "-q", "feat"]);
+    std::fs::write(work.join("a.txt"), "parked\n").expect("edit");
+    at(&work, during, &["stash", "-q"]);
+    at(&work, during, &["checkout", "-q", "main"]);
+    let w = read(&session).expect("the stash on it");
+    assert_eq!(w.stashes, 1, "{w:?}");
+
+    let wt = tmp.path().join("wt");
+    let wt_s = wt.to_str().expect("utf-8");
+    at(
+        &work,
+        during,
+        &["worktree", "add", "-q", "-b", "wt-feat", wt_s],
+    );
+    commit(&wt, during, "wt.txt");
+    at(&work, during, &["worktree", "remove", wt_s]);
+    let command = format!("git worktree add -b wt-feat {wt_s} && cd {wt_s}");
+    let input = aterm_json::json!({ "command": command });
+    let tail = format!(
+        "{}\n",
+        aterm_json::json!({
+            "type": "assistant",
+            "timestamp": "2023-11-14T22:16:40.000Z",
+            "message": {"content": [{"type": "tool_use", "name": "Bash", "input": input}]}
+        })
+    );
+    let named = Used::of_session(Some(began), Some(&tail));
+    assert_eq!(named.branches, ["wt-feat"], "{named:?}");
+    let w = read(&session).expect("feat and its stash");
+    assert!(!w.summary().contains("wt-feat"), "{}", w.summary());
+    let w = read(&named).expect("the removed worktree's branch");
+    assert!(
+        w.summary()
+            .contains("2 commits on feat, wt-feat not on origin/main"),
+        "{}",
+        w.summary()
+    );
+
+    at(
+        &work,
+        during,
+        &["merge", "-q", "--no-edit", "feat", "wt-feat"],
+    );
+    at(&work, during, &["push", "-q", "origin", "HEAD:main"]);
+    at(&work, during, &["stash", "drop", "-q"]);
+    assert_eq!(read(&named), None, "merged, pushed and the stash dropped");
+}
+
+/// A BRANCH PUSHED TO `origin` AND DELETED HERE IS STILL PARKED (R-2): the session made `feat/x` in
+/// a worktree, pushed it to `origin/feat/x` and deleted its own branch, which git allows without
+/// `-D` once the remote branch has it; its commit is on no remote main, so it is counted and
+/// named. NEGATIVE CONTROLS: another remote's branch of a name the session used is none of its
+/// work; once merged into the remote main, nothing is found.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_branch_pushed_to_origin_and_deleted_here_is_still_parked() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let work = repo(tmp.path(), true);
+    let fork = tmp.path().join("fork.git");
+    std::fs::create_dir_all(&fork).expect("fork");
+    scratch_git(&fork, &["init", "-q", "--bare", "."]);
+    let fork_url = format!("file://{}", fork.display());
+    scratch_git(&work, &["remote", "add", "fork", &fork_url]);
+    scratch_git(&work, &["checkout", "-q", "-b", "feat/y"]);
+    local_commit(&work, "y.txt");
+    scratch_git(&work, &["push", "-q", "fork", "feat/y"]);
+    scratch_git(&work, &["checkout", "-q", "main"]);
+    scratch_git(&work, &["branch", "-q", "-D", "feat/y"]);
+    let wt = tmp.path().join("wt");
+    let wt_s = wt.to_str().expect("utf-8");
+    scratch_git(&work, &["worktree", "add", "-q", "-b", "feat/x", wt_s]);
+    local_commit(&wt, "x.txt");
+    scratch_git(&wt, &["push", "-q", "-u", "origin", "feat/x"]);
+    scratch_git(&work, &["worktree", "remove", wt_s]);
+    scratch_git(&work, &["branch", "-q", "-d", "feat/x"]);
+    let used = Used {
+        since: None,
+        branches: vec!["feat/x".to_string(), "feat/y".to_string()],
+    };
+    let read = |used: &Used| finished(probe_session(&work, Some(&work), used, PROBE_LIMIT));
+    let w = read(&used).expect("the branch pushed to origin, deleted here");
+    assert!(
+        w.summary()
+            .ends_with(": 1 commit on feat/x not on origin/main"),
+        "{}",
+        w.summary()
+    );
+    scratch_git(&work, &["merge", "-q", "--no-edit", "origin/feat/x"]);
+    scratch_git(&work, &["push", "-q", "origin", "HEAD:main"]);
+    assert_eq!(read(&used), None, "merged into the remote main");
+}
+
+/// A BRANCH THE SESSION USED THAT GIT CANNOT READ IS NEVER A CLEAN READING (R-5): a commit of
+/// `feat` whose object is gone fails the read of the branches the session used, though every
+/// other read answers, so the probe is unread. NEGATIVE CONTROL: a probe naming no session never
+/// reads `feat`, and reads checked.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_branch_the_session_used_that_git_cannot_read_is_never_a_clean_reading() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let work = repo(tmp.path(), true);
+    scratch_git(&work, &["checkout", "-q", "-b", "feat"]);
+    local_commit(&work, "b.txt");
+    let gone = scratch_git(&work, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
+    local_commit(&work, "c.txt");
+    scratch_git(&work, &["checkout", "-q", "main"]);
+    let (dir, file) = gone.split_at(2);
+    std::fs::remove_file(work.join(".git/objects").join(dir).join(file)).expect("the object");
+    let plain = probe(&work, Some(&work), PROBE_LIMIT);
+    assert!(plain.checked().is_some(), "{plain:?}");
+    let used = Used {
+        since: None,
+        branches: vec!["feat".to_string()],
+    };
+    assert_eq!(
+        probe_session(&work, Some(&work), &used, PROBE_LIMIT),
+        RepoRead::Unread
+    );
+}
+
+/// THE SESSION'S OWN BRANCHES AND START ([`Used::of_session`]): each branch its commands
+/// created or checked out (`checkout -b`, `switch -c`, `worktree add -b`, `branch <name>`, a
+/// worktree named after its folder, through `-C` and chained commands), newest first, each
+/// once, and the earlier of the agent's start and the first stamp its transcript holds.
+/// CONTROLS: a branch deleted, listed or renamed from, a file checked out, and words no Bash
+/// call ran name nothing.
+#[test]
+fn the_session_names_its_own_branches_and_start() {
+    let call = |command: &str| {
+        let input = aterm_json::json!({ "command": command });
+        format!(
+            "{}\n",
+            aterm_json::json!({
+                "type": "assistant",
+                "timestamp": "2023-11-14T22:13:20.000Z",
+                "message": {"content": [{"type": "tool_use", "name": "Bash", "input": input}]}
+            })
+        )
+    };
+    let tail: String = [
+        "git checkout -b a1",
+        "cd /r && git -C /r switch -c a2; git switch --create=a3",
+        "git worktree add -B a4 ../x && git worktree add ../wt-dir",
+        "git worktree add --detach ../y && git branch a5 origin/main",
+        "git -c x=y checkout --conflict diff3 a6 && git checkout -- a.txt",
+        "git branch -D gone && git branch --list 'a*' && git branch --sort=-committerdate 'a*' && git branch --merged=main && git branch -m old a7",
+        "echo git checkout -b quoted",
+        "git checkout -b a1",
+    ]
+    .iter()
+    .map(|c| call(c))
+    .collect::<String>()
+        + "{\"type\":\"user\",\"message\":{\"content\":\"git checkout -b typed\"}}\n";
+    let used = Used::of_session(Some(1_800_000_000), Some(&tail));
+    assert_eq!(
+        used.since,
+        Some(1_700_000_000),
+        "the transcript's first stamp"
+    );
+    assert_eq!(
+        used.branches,
+        ["a1", "a7", "a6", "a5", "wt-dir", "a4", "a3", "a2"],
+        "{used:?}"
+    );
+    assert_eq!(
+        Used::of_session(Some(1_600_000_000), Some(&tail)).since,
+        Some(1_600_000_000),
+        "the agent's start, the earlier"
+    );
+    assert_eq!(Used::of_session(None, None), Used::default());
+}
+
 /// THE REFLOG'S TAIL STARTS AT A WHOLE LINE: the first line that starts at or past the last
 /// [`LAG_REFLOG`] bytes, one that starts exactly there included, and a shorter file whole.
 #[test]
@@ -584,7 +1304,7 @@ fn a_probe_cut_at_any_read_is_never_a_clean_repository() {
             let read = probe(work, Some(work), Duration::from_secs(10));
             read_stall::set(0);
             match read {
-                RepoRead::Clean | RepoRead::Checked(_) => {
+                RepoRead::Clean | RepoRead::Checked(_) | RepoRead::Gone(_) => {
                     panic!("read {k} cut: read as clean over {whole:?}")
                 }
                 RepoRead::Unread => unread += 1,
@@ -607,8 +1327,11 @@ fn a_probe_cut_at_any_read_is_never_a_clean_repository() {
 /// and the next one once that is pushed), `origin/main` and a remote; it is
 /// clean, finds nothing and is the same as a clean reading. CONTROLS: the
 /// same repository with no remote reads `remote=false` and no main; a
-/// repository with no commit yet, a plain folder and a deleted folder name
-/// nothing and read [`RepoRead::Clean`].
+/// repository with no commit yet and a plain folder name nothing and read
+/// [`RepoRead::Clean`]. Each names `HEAD`'s branch, and a detached `HEAD` none
+/// (slice 9c). A DELETED FOLDER READS GONE (§14.17 item 4, slice 9c), named,
+/// and decides as clean; a relative one is never read. NEGATIVE CONTROL (run
+/// by hand): `gone_dir`'s `NotFound` test dropped reads the plain folder gone.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn a_clean_repository_reads_its_head_and_main() {
@@ -632,6 +1355,11 @@ fn a_clean_repository_reads_its_head_and_main() {
     );
     assert_eq!(at.head.len(), 40, "{at:?}");
     assert!(at.repo.ends_with("/pushed/work"), "{at:?}");
+    let branch = scratch_git(&pushed, &["symbolic-ref", "--short", "HEAD"]);
+    assert!(
+        !branch.trim().is_empty() && at.branch == branch.trim(),
+        "{at:?}"
+    );
     std::fs::write(
         pushed.join("b.txt"),
         "two
@@ -652,25 +1380,43 @@ fn a_clean_repository_reads_its_head_and_main() {
         (head_of(&alone).as_str(), "", false),
         "{at:?}"
     );
+    assert!(!at.branch.is_empty(), "{at:?}");
+    scratch_git(&alone, &["checkout", "-q", "--detach"]);
+    let at = checked(&alone).expect("a detached HEAD");
+    assert_eq!(
+        at.branch,
+        crate::harness::repo_work::DETACHED,
+        "a detached HEAD names git's own word: {at:?}"
+    );
     let unborn = tmp.path().join("unborn");
     std::fs::create_dir_all(&unborn).expect("unborn");
     scratch_git(&unborn, &["init", "-q", "."]);
     let plain = tmp.path().join("plain");
     std::fs::create_dir_all(&plain).expect("plain");
-    let gone = tmp.path().join("gone");
-    std::fs::create_dir_all(&gone).expect("gone");
-    std::fs::remove_dir(&gone).expect("deleted");
-    for (dir, what) in [
-        (&unborn, "no commit yet"),
-        (&plain, "a plain folder"),
-        (&gone, "a deleted folder"),
-    ] {
+    for (dir, what) in [(&unborn, "no commit yet"), (&plain, "a plain folder")] {
         assert_eq!(
             probe(dir, Some(tmp.path()), PROBE_LIMIT),
             RepoRead::Clean,
             "{what}"
         );
     }
+    let gone = tmp.path().join("gone").join("proj");
+    std::fs::create_dir_all(&gone).expect("gone");
+    std::fs::remove_dir_all(tmp.path().join("gone")).expect("deleted");
+    let read = probe(&gone, Some(tmp.path()), PROBE_LIMIT);
+    assert_eq!(read, RepoRead::Gone(printable(&gone.to_string_lossy())));
+    assert!(
+        read.is_clean()
+            && RepoRead::same(&read, &RepoRead::Clean)
+            && read.found().is_none()
+            && read.checked().is_none(),
+        "{read:?}"
+    );
+    assert_eq!(
+        probe(Path::new("gone/proj"), Some(tmp.path()), PROBE_LIMIT),
+        RepoRead::Clean,
+        "a relative folder"
+    );
 }
 
 /// A CLEAN PROBE CUT AT ITS HEAD READ READS AS IT DID BEFORE THE HEAD WAS READ
@@ -699,6 +1445,7 @@ fn a_clean_probe_cut_at_its_head_read_reads_as_before_the_head_was_read() {
             RepoRead::Clean => 'c',
             RepoRead::Checked(_) => 'k',
             RepoRead::Found(w) => panic!("read {k} cut: found {w:?} in a clean repository"),
+            RepoRead::Gone(g) => panic!("read {k} cut: {g:?} read as gone"),
         });
     }
     let (unread, rest) = seen.split_at(seen.find('c').unwrap_or(seen.len()));
@@ -716,24 +1463,117 @@ fn a_clean_probe_cut_at_its_head_read_reads_as_before_the_head_was_read() {
     );
 }
 
-/// A CLEAN READING OVER A COUNT GIT REFUSED NAMES NOTHING (§14.9, slice 9a;
-/// for 9b's receipt): over a clean pushed repository whose remote-tracking
-/// refs `for-each-ref` cannot print as text (a ref named in bytes that are no
-/// UTF-8, packed), that read answers nothing without a cut, so the probe
-/// counts no remote and reads [`RepoRead::Clean`], naming nothing, never
-/// `Checked` with `remote=false`, a remote it did not read as absent.
-/// CONTROL: the same repository before that ref reads `Checked` with
-/// `remote=true`.
+/// A COUNT GIT REFUSED AT A COMMIT `HEAD` NAMES IS NEVER A CLEAN REPOSITORY
+/// ([`RepoRead::Unread`]): where `HEAD` names a commit, a read the counts rest
+/// on that git refused reads unread however clean `status` read, as what it
+/// would have counted is work a landing must not end over: a stash list over a
+/// stash ref to an object the repository lacks (one stash on the branch), and
+/// an unpushed count over a remote-tracking ref to one (one unpushed commit,
+/// with no `origin` main to count it as unlanded). CONTROLS: the same
+/// repositories before the broken ref read the stash and the commit; a
+/// repository with no commit yet, whose fetched remote-tracking refs make git
+/// refuse its counts, reads [`RepoRead::Clean`], as its `HEAD` names nothing to
+/// count; and a clean pushed repository given a packed remote-tracking ref
+/// named in bytes that are no UTF-8 is read whole, `Checked` with
+/// `remote=true`, as the remote read asks only whether a ref is there.
+/// The broken stash also reads unread with any one of its reads starved past
+/// its limit, the head read among them: a refused count with its head read
+/// cut is unread too. And an unlanded count git refused (a commit pushed only
+/// to a feature branch, a commit of its history missing here, so the
+/// unpushed count still answers 0) reads unread; its control, the same
+/// repository before the object went, finds both commits unlanded.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
-fn a_clean_reading_over_a_count_git_refused_names_nothing() {
+fn a_count_git_refused_at_a_commit_head_is_never_a_clean_repository() {
     let tmp = aterm_tempfile::tempdir().expect("tmp");
-    let work = repo(tmp.path(), true);
-    let at = probe(&work, Some(&work), PROBE_LIMIT);
-    assert!(
-        at.checked().is_some_and(|at| at.remote),
-        "the control: {at:?}"
+    let missing = "0123456789abcdef0123456789abcdef01234567\n";
+    let stashed = repo(&tmp.path().join("stashed"), true);
+    std::fs::write(stashed.join("a.txt"), "changed\n").expect("a.txt");
+    scratch_git(&stashed, &["stash", "-q"]);
+    assert_eq!(
+        found(&stashed).map(|w| w.stashes),
+        Some(1),
+        "the control: the stash"
     );
+    std::fs::write(stashed.join(".git/refs/stash"), missing).expect("refs/stash");
+    assert_eq!(
+        probe(&stashed, Some(&stashed), PROBE_LIMIT),
+        RepoRead::Unread,
+        "a stash list git refused"
+    );
+    let starved = u64::try_from(PROBE_LIMIT.as_millis())
+        .unwrap_or(u64::MAX)
+        .saturating_add(1_000);
+    let mut seen = String::new();
+    for k in 0..24 {
+        read_stall::set_after(k, starved);
+        let read = probe(&stashed, Some(&stashed), PROBE_LIMIT);
+        read_stall::set(0);
+        seen.push(if read == RepoRead::Unread { 'u' } else { 'c' });
+    }
+    assert_eq!(
+        seen,
+        "u".repeat(24),
+        "the refused stash list with the k-th read cut, the head read among them"
+    );
+    let feature = repo(&tmp.path().join("feature"), true);
+    let mut history = Vec::new();
+    for (name, text) in [("b.txt", "two\n"), ("c.txt", "three\n")] {
+        std::fs::write(feature.join(name), text).expect(name);
+        scratch_git(&feature, &["add", name]);
+        scratch_git(&feature, &["commit", "-q", "-m", name]);
+        history.push(
+            scratch_git(&feature, &["rev-parse", "HEAD"])
+                .trim()
+                .to_string(),
+        );
+    }
+    scratch_git(&feature, &["push", "-q", "origin", "HEAD:feature"]);
+    assert_eq!(
+        found(&feature).map(|w| (w.unpushed, w.unlanded)),
+        Some((0, 2)),
+        "the control: pushed to a feature branch, unlanded"
+    );
+    let (dir, file) = history[0].split_at(2);
+    std::fs::remove_file(feature.join(".git/objects").join(dir).join(file))
+        .expect("a loose commit of the history");
+    assert_eq!(
+        probe(&feature, Some(&feature), PROBE_LIMIT),
+        RepoRead::Unread,
+        "an unlanded count git refused"
+    );
+    let upstream = repo(&tmp.path().join("upstream"), true);
+    scratch_git(&upstream, &["remote", "rename", "origin", "upstream"]);
+    std::fs::write(upstream.join("b.txt"), "two\n").expect("b.txt");
+    scratch_git(&upstream, &["add", "b.txt"]);
+    scratch_git(&upstream, &["commit", "-q", "-m", "two"]);
+    assert_eq!(
+        found(&upstream).map(|w| (w.unpushed, w.unlanded)),
+        Some((1, 0)),
+        "the control: the unpushed commit, no origin main"
+    );
+    std::fs::write(upstream.join(".git/refs/remotes/upstream/gone"), missing)
+        .expect("a remote-tracking ref");
+    assert_eq!(
+        probe(&upstream, Some(&upstream), PROBE_LIMIT),
+        RepoRead::Unread,
+        "an unpushed count git refused"
+    );
+    let unborn = tmp.path().join("unborn");
+    std::fs::create_dir_all(&unborn).expect("unborn");
+    scratch_git(&unborn, &["init", "-q", "."]);
+    let origin = tmp.path().join("stashed").join("remote.git");
+    scratch_git(
+        &unborn,
+        &["remote", "add", "origin", &origin.display().to_string()],
+    );
+    scratch_git(&unborn, &["fetch", "-q", "origin"]);
+    assert_eq!(
+        probe(&unborn, Some(&unborn), PROBE_LIMIT),
+        RepoRead::Clean,
+        "no commit yet: nothing to count"
+    );
+    let work = repo(&tmp.path().join("named"), true);
     let head = scratch_git(&work, &["rev-parse", "HEAD"]);
     let packed = work.join(".git/packed-refs");
     let mut refs: Vec<u8> = std::fs::read(&packed)
@@ -745,10 +1585,109 @@ fn a_clean_reading_over_a_count_git_refused_names_nothing() {
     refs.extend_from_slice(head.trim().as_bytes());
     refs.extend_from_slice(b" refs/remotes/o/\xff\n");
     std::fs::write(&packed, refs).expect("packed-refs");
+    let at = probe(&work, Some(&work), PROBE_LIMIT);
+    assert!(
+        at.checked().is_some_and(|at| at.remote),
+        "a ref named in no UTF-8 is counted: {at:?}"
+    );
+}
+
+/// Refused counts and an ordinary failed HEAD read cannot jointly prove a repository clean.
+/// Only HEAD-dependent counts may be absent in a branch independently proved unborn; a
+/// refused stash list or failed unborn confirmation remains unread. Every unselected Git
+/// query runs against a real repository, including the positive and metadata-only controls.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_refused_count_needs_independent_proof_an_unread_head_is_unborn() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let pushed = repo(&tmp.path().join("pushed"), true);
+    let read = |work: &Path, refused: &dyn Fn(&[&str]) -> bool| {
+        let reads = Reads {
+            deadline: Cell::new(Instant::now() + PROBE_LIMIT),
+            each: Some(PROBE_LIMIT),
+            home: work,
+            xdg: None,
+            cut: Cell::new(false),
+            starts: Cell::new(0),
+            held: None,
+            refused: Some(refused),
+        };
+        probe_reading(work, &Used::default(), &reads)
+    };
+    let head = |args: &[&str]| args == ["rev-parse", "--verify", "--quiet", "HEAD"];
+    let stash = |args: &[&str]| args.first() == Some(&"stash");
+    assert!(
+        read(&pushed, &|_| false).checked().is_some(),
+        "a fully read pushed repository"
+    );
     assert_eq!(
-        probe(&work, Some(&work), PROBE_LIMIT),
+        read(&pushed, &|args| head(args) || stash(args)),
+        RepoRead::Unread,
+        "a failed stash count and HEAD read are no proof of an unborn branch"
+    );
+    assert_eq!(
+        read(&pushed, &|args| {
+            head(args) || args.first() == Some(&"rev-list")
+        }),
+        RepoRead::Unread,
+        "a refused HEAD-dependent count still needs an explicit unborn proof"
+    );
+    assert_eq!(
+        read(&pushed, &head),
         RepoRead::Clean,
-        "a refused remote read names nothing"
+        "all counts answered: HEAD contributes only optional receipt metadata"
+    );
+    let unborn = tmp.path().join("unborn");
+    std::fs::create_dir_all(&unborn).expect("unborn");
+    scratch_git(&unborn, &["init", "-q", "."]);
+    let remote = tmp.path().join("pushed/remote.git");
+    scratch_git(
+        &unborn,
+        &["remote", "add", "origin", &remote.display().to_string()],
+    );
+    scratch_git(&unborn, &["fetch", "-q", "origin"]);
+    assert_eq!(
+        read(&unborn, &|_| false),
+        RepoRead::Clean,
+        "valid empty branch proof excuses only HEAD-dependent counts"
+    );
+    assert_eq!(
+        read(&unborn, &stash),
+        RepoRead::Unread,
+        "a stash refusal is independent of whether HEAD has a commit"
+    );
+    assert_eq!(
+        read(&unborn, &|args| {
+            args.first() == Some(&"for-each-ref") && args.last() == Some(&"refs/heads/main")
+        }),
+        RepoRead::Unread,
+        "a failed confirmation proves no unborn branch"
+    );
+    let raw_branch = repo(&tmp.path().join("raw-branch"), true);
+    let committed = scratch_git(&raw_branch, &["rev-parse", "HEAD"]);
+    let mut packed = committed.trim().as_bytes().to_vec();
+    packed.extend_from_slice(b" refs/heads/caf\xe9\n");
+    std::fs::write(raw_branch.join(".git/packed-refs"), packed).expect("packed raw branch");
+    std::fs::write(raw_branch.join(".git/HEAD"), b"ref: refs/heads/caf\xe9\n")
+        .expect("raw branch HEAD");
+    assert!(
+        read(&raw_branch, &|_| false).checked().is_some(),
+        "a fully read committed branch may display its name lossily"
+    );
+    assert_eq!(
+        read(&raw_branch, &|args| {
+            head(args) || args.first() == Some(&"rev-list")
+        }),
+        RepoRead::Unread,
+        "lossy replacement bytes name no ref whose absence proves the real branch unborn"
+    );
+    let broken = unborn.join(".git/refs/heads/main/broken");
+    std::fs::create_dir_all(broken.parent().expect("refs directory")).expect("refs directory");
+    std::fs::write(broken, "not-a-ref\n").expect("malformed ref");
+    assert_eq!(
+        read(&unborn, &|_| false),
+        RepoRead::Unread,
+        "Git's success with an ignored-ref warning is no complete count or empty proof"
     );
 }
 
@@ -859,6 +1798,75 @@ fn a_stash_another_worktree_made_is_none_of_this_ones() {
     scratch_git(&work, &["stash", "-q"]);
     let w = found(&work).expect("this worktree's stash");
     assert_eq!((w.stashes, w.changed), (1, 0), "{w:?}");
+}
+
+/// `path` with the last `from` in it replaced by `to`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn rewrite_last(path: &Path, from: &[u8], to: &[u8]) {
+    let bytes = std::fs::read(path).expect("the file");
+    let at = bytes
+        .windows(from.len())
+        .rposition(|w| w == from)
+        .unwrap_or_else(|| panic!("{:?} in {}", from, path.display()));
+    let mut out = bytes[..at].to_vec();
+    out.extend_from_slice(to);
+    out.extend_from_slice(&bytes[at + from.len()..]);
+    std::fs::write(path, out).expect("rewritten");
+}
+
+/// A STASH OR BRANCH NAMED IN BYTES THAT ARE NO UTF-8 IS COUNTED ON ITS BRANCH
+/// ALONE ([`stashes_on`] over the lossy branch and stash reads): beside another
+/// worktree's stash whose message is Latin-1 (`caf\xe9`), a clean pushed
+/// worktree reads `Checked` with `remote=true`, as that stash is another
+/// session's, and the other worktree counts it as its one stash; a stash
+/// written on a branch whose name is Latin-1 is counted once `HEAD` names that
+/// branch. NEGATIVE CONTROLS: the same stash with its message in UTF-8 reads
+/// `Checked` here; and the Latin-1 branch's stash reads `Checked` while `HEAD`
+/// names `main`, as it is that branch's alone.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_stash_or_branch_named_in_no_utf8_is_counted_on_its_branch_alone() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let work = repo(tmp.path(), true);
+    let other = tmp.path().join("other");
+    let other_s = other.to_str().expect("utf-8");
+    scratch_git(&work, &["worktree", "add", "-q", "-b", "side", other_s]);
+    std::fs::write(other.join("a.txt"), "side\n").expect("edit");
+    scratch_git(&other, &["stash", "push", "-q", "-m", "cafe"]);
+    let clean = |work: &Path, what: &str| {
+        let read = probe(work, Some(work), PROBE_LIMIT);
+        assert!(
+            read.checked().is_some_and(|at| at.remote),
+            "{what}: {read:?}"
+        );
+    };
+    clean(&work, "the control: another worktree's stash in UTF-8");
+    let log = work.join(".git/logs/refs/stash");
+    rewrite_last(&log, b"cafe", b"caf\xe9");
+    clean(&work, "another worktree's stash, its message Latin-1");
+    let w = found(&other).expect("its own stash");
+    assert_eq!((w.stashes, w.changed), (1, 0), "{w:?}");
+    std::fs::write(work.join("a.txt"), "here\n").expect("edit");
+    scratch_git(&work, &["stash", "-q"]);
+    rewrite_last(&log, b"WIP on main: ", b"WIP on caf\xe9: ");
+    clean(
+        &work,
+        "the control: the Latin-1 branch's stash, HEAD on main",
+    );
+    let head = scratch_git(&work, &["rev-parse", "HEAD"]);
+    let packed = work.join(".git/packed-refs");
+    let mut refs: Vec<u8> = std::fs::read(&packed)
+        .unwrap_or_default()
+        .split(|b| *b == b'\n')
+        .filter(|line| !line.is_empty() && !line.starts_with(b"#"))
+        .flat_map(|line| line.iter().copied().chain(*b"\n"))
+        .collect();
+    refs.extend_from_slice(head.trim().as_bytes());
+    refs.extend_from_slice(b" refs/heads/caf\xe9\n");
+    std::fs::write(&packed, refs).expect("packed-refs");
+    std::fs::write(work.join(".git/HEAD"), b"ref: refs/heads/caf\xe9\n").expect("HEAD");
+    let w = found(&work).expect("the stash on the branch HEAD names");
+    assert_eq!((w.stashes, w.changed, w.unpushed), (1, 0, 0), "{w:?}");
 }
 
 /// THE PERSON'S GLOBAL EXCLUDES HOLD ([`probe_with`]'s status read): a file
@@ -1209,6 +2217,27 @@ fn a_guarded_folder_is_never_probed() {
         });
         assert_eq!(unattended_dir(&work, Some(&home), &unavailable), None);
     }
+    // A FOLDER GONE UNDER A GUARDED ONE IS NEVER READ GONE (§14.17 item 4, slice 9c's review
+    // round): `gone_dir` checks the path, then where its links lead, before it reads an entry, so
+    // a folder deleted under ~/Documents, or reached through a link into it, reads as nothing to
+    // name (`RepoRead::Clean`), never `Gone`; the same folder missing outside every guarded one
+    // reads gone. NEGATIVE CONTROLS (run by hand): dropping the check of where the links lead
+    // fails the link's row; dropping both checks fails the folder's own.
+    let gone_in_docs = home.join("Documents/gone/proj");
+    assert_eq!(gone_dir(&gone_in_docs, &home, &table), None);
+    assert_eq!(
+        probe(&gone_in_docs, Some(&home), PROBE_LIMIT),
+        RepoRead::Clean
+    );
+    let into_docs = home.join("Developer/into-docs");
+    std::os::unix::fs::symlink(home.join("Documents/gone"), &into_docs)
+        .expect("owned dangling link into Documents");
+    assert_eq!(gone_dir(&into_docs.join("proj"), &home, &table), None);
+    let gone_here = home.join("Developer/gone/proj");
+    assert_eq!(
+        gone_dir(&gone_here, &home, &table),
+        Some(printable(&gone_here.to_string_lossy()))
+    );
     assert_eq!(
         unattended_dir(&home.join("documents/work"), Some(&home), &table),
         None
@@ -1381,5 +2410,234 @@ fn repo_hygiene_summarises_drift_worktrees_and_stale_branches() {
             "\u{26c1}  2 worktrees \u{b7} worktrees 512.0 MiB \u{b7} build/temp 2.0 GiB \u{b7} 120.0 GiB free",
             "\u{2387}  1 changed \u{b7} 1 untracked \u{b7} 1 unpushed \u{b7} 1 stash",
         ]
+    );
+}
+
+/// A present session branch whose commit Git cannot read is unknown work, not a branch the
+/// session deleted. Controls: the branch at a readable, landed commit and the branch after its
+/// deletion both read clean.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_session_branch_with_an_unreadable_commit_is_no_deleted_branch() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let work = repo(tmp.path(), true);
+    let used = Used {
+        since: None,
+        branches: vec!["parked".to_string()],
+    };
+    let read = || probe_session(&work, Some(&work), &used, PROBE_LIMIT);
+    scratch_git(&work, &["branch", "parked"]);
+    let landed = scratch_git(&work, &["rev-parse", "refs/heads/parked"]);
+    assert!(read().checked().is_some(), "the landed branch");
+    let path = work.join(".git/refs/heads/parked");
+    std::fs::write(&path, "0000000000000000000000000000000000000001\n")
+        .expect("a ref whose object is missing");
+    assert_eq!(scratch_git(&work, &["status", "--porcelain"]), "");
+    assert_eq!(
+        read(),
+        RepoRead::Unread,
+        "the present but unreadable branch"
+    );
+    std::fs::write(&path, landed).expect("restore the landed branch");
+    assert!(read().checked().is_some(), "the readable branch again");
+    scratch_git(&work, &["branch", "-D", "parked"]);
+    assert!(read().checked().is_some(), "a branch since deleted");
+}
+
+/// On a Mac without Apple's Command Line Tools the probe runs no `git` that is Apple's stub, which
+/// would raise their install dialog: it reads as no git, quietly. A person's own `git` earlier on
+/// PATH still runs, and the stub runs git once the developer tools' git is there. Proved on a
+/// stand-in directory whose `git` is never run.
+#[cfg(target_os = "macos")]
+#[test]
+fn without_the_command_line_tools_the_probe_runs_no_stub_git() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let stubs = scratch.path().join("usr-bin");
+    let own = scratch.path().join("own-bin");
+    let empty = scratch.path().join("empty");
+    for dir in [&stubs, &own, &empty] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    std::fs::write(stubs.join("git"), b"never run\n").unwrap();
+    std::fs::write(own.join("git"), b"never run\n").unwrap();
+    for git in [stubs.join("git"), own.join("git")] {
+        std::fs::set_permissions(git, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = |dirs: &[&Path]| std::env::join_paths(dirs).unwrap();
+    let missing = || false;
+    let present = || true;
+    assert!(git_to_run(&path(&[&empty, &stubs]), scratch.path(), &stubs, missing).is_none());
+    assert!(git_to_run(&path(&[&empty, &stubs]), scratch.path(), &stubs, present).is_some());
+    assert!(git_to_run(&path(&[&own, &stubs]), scratch.path(), &stubs, missing).is_some());
+    assert!(git_to_run(&path(&[&stubs, &own]), scratch.path(), &stubs, missing).is_none());
+    assert_eq!(
+        git_to_run(&path(&[&empty]), scratch.path(), &stubs, || panic!(
+            "no stub to ask about"
+        )),
+        None,
+        "no git at all runs nothing, not /usr/bin/git in its place"
+    );
+}
+
+/// The `git` the check judged is the one the read runs, by its absolute path: a person's own
+/// `git` earlier on PATH (Homebrew's, an atpkg build, aterm's own shim) runs, never
+/// `/usr/bin/git` behind it, which is Apple's stub on a Mac without the Command Line Tools and
+/// raises their install dialog. Proved on stand-in directories whose `git` is never run.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_git_judged_is_the_git_that_runs() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let root = scratch.path().canonicalize().unwrap();
+    let stubs = root.join("usr-bin");
+    let own = root.join("own-bin");
+    for dir in [&stubs, &own] {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("git"), b"never run\n").unwrap();
+        std::fs::set_permissions(dir.join("git"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = |dirs: &[&Path]| std::env::join_paths(dirs).unwrap();
+    let runs = |dirs: &[&Path], developer_git: bool| {
+        git_command(&path(dirs), &root, &stubs, || developer_git)
+            .map(|cmd| PathBuf::from(cmd.get_program()))
+    };
+    assert_eq!(
+        runs(&[&own, &stubs], false),
+        Some(own.join("git")),
+        "the person's own git, judged and run, with the developer tools missing"
+    );
+    assert_eq!(runs(&[&stubs, &own], false), None, "the stub runs nowhere");
+    assert_eq!(runs(&[&stubs, &own], true), Some(stubs.join("git")));
+    assert_eq!(
+        git_to_run(&path(&[&own, &stubs]), &root, &stubs, || false),
+        Some(own.join("git"))
+    );
+    assert_eq!(
+        git_to_run(&path(&[&stubs, &own]), &root, &stubs, || true),
+        Some(stubs.join("git")),
+        "the stub, once the developer tools' git is there"
+    );
+    assert_eq!(
+        git_to_run(
+            &path(&[Path::new("own-bin"), &stubs]),
+            &root,
+            &stubs,
+            || false
+        ),
+        Some(own.join("git")),
+        "a relative entry runs by its absolute path"
+    );
+}
+
+/// The probe must skip a non-executable PATH file just as the spawn does, then refuse the
+/// stub it would actually reach. These are owned text fixtures, never programs we execute.
+#[cfg(target_os = "macos")]
+#[test]
+fn git_probe_passes_nonexecutable_files_before_refusing_the_stub() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let stubs = scratch.path().join("stubs");
+    let own = scratch.path().join("own");
+    let denied = scratch.path().join("denied");
+    for (dir, mode) in [(&stubs, 0o755), (&own, 0o755), (&denied, 0o600)] {
+        std::fs::create_dir(dir).unwrap();
+        let git = dir.join("git");
+        std::fs::write(&git, b"metadata only, never run\n").unwrap();
+        std::fs::set_permissions(git, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+    let path = |dirs: &[&Path]| std::env::join_paths(dirs).unwrap();
+    assert!(git_to_run(&path(&[&own, &stubs]), scratch.path(), &stubs, || false).is_some());
+    assert!(git_to_run(&path(&[&stubs]), scratch.path(), &stubs, || true).is_some());
+    assert!(
+        git_to_run(&path(&[&denied, &stubs]), scratch.path(), &stubs, || false).is_none(),
+        "a non-executable first file cannot disguise the later Apple stub"
+    );
+}
+
+/// Relative and empty entries use the child's folder; directory/file aliases retain the
+/// selected stub's identity. Every fixture is private text and every decision is metadata.
+#[cfg(target_os = "macos")]
+#[test]
+fn git_probe_resolves_relative_empty_and_alias_entries_in_the_childs_folder() {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let stubs = scratch.path().join("stubs");
+    let own = scratch.path().join("own");
+    let child = scratch.path().join("child");
+    let empty_stub = scratch.path().join("empty-stub");
+    let empty_own = scratch.path().join("empty-own");
+    let linked_file = scratch.path().join("linked-file");
+    for dir in [&stubs, &own, &child, &empty_stub, &empty_own, &linked_file] {
+        std::fs::create_dir(dir).unwrap();
+    }
+    for git in [stubs.join("git"), own.join("git"), empty_own.join("git")] {
+        std::fs::write(&git, b"metadata only, never run\n").unwrap();
+        std::fs::set_permissions(git, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    symlink(stubs.join("git"), empty_stub.join("git")).unwrap();
+    symlink(stubs.join("git"), linked_file.join("git")).unwrap();
+    let linked_dir = scratch.path().join("linked-dir");
+    symlink(&stubs, &linked_dir).unwrap();
+    let hardlinked = scratch.path().join("hardlinked");
+    std::fs::create_dir(&hardlinked).unwrap();
+    std::fs::hard_link(stubs.join("git"), hardlinked.join("git")).unwrap();
+    let path = |dirs: &[&Path]| std::env::join_paths(dirs).unwrap();
+    assert!(git_to_run(&path(&[&own, &stubs]), &child, &stubs, || false).is_some());
+    let mut wrong = Vec::new();
+    for (name, dirs, cwd, want) in [
+        ("relative stub", vec![Path::new("../stubs")], &child, false),
+        (
+            "relative own before stub",
+            vec![Path::new("../own"), &stubs],
+            &child,
+            true,
+        ),
+        ("empty stub", vec![Path::new(""), &own], &empty_stub, false),
+        (
+            "empty own before stub",
+            vec![Path::new(""), &stubs],
+            &empty_own,
+            true,
+        ),
+        (
+            "directory alias",
+            vec![linked_dir.as_path(), &own],
+            &child,
+            false,
+        ),
+        (
+            "file alias",
+            vec![linked_file.as_path(), &own],
+            &child,
+            false,
+        ),
+        (
+            "hardlink alias",
+            vec![hardlinked.as_path(), &own],
+            &child,
+            false,
+        ),
+    ] {
+        let got = git_to_run(&path(&dirs), cwd, &stubs, || false).is_some();
+        if got != want {
+            wrong.push((name, got, want));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "Git selection differs from its child search: {wrong:?}"
+    );
+}
+
+#[test]
+fn worktree_branch_reads_attached_short_branch_flags() {
+    assert_eq!(
+        worktree_branch(&["-bfeat-attached", "../wt"]),
+        Some("feat-attached".to_string())
+    );
+    assert_eq!(
+        worktree_branch(&["-Breset-attached", "../wt"]),
+        Some("reset-attached".to_string())
     );
 }

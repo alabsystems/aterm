@@ -174,7 +174,11 @@ fn sample(at_s: u64, busy: &[u64], k: u64) -> Sample {
 fn snapshot() -> Snapshot {
     let mut v = Vitals::new();
     let _ = v.absorb(&sample(10, &[0, 0, 0, 0], 0));
-    v.absorb(&sample(11, &[20, 30, 100, 90], 1))
+    let mut s = v.absorb(&sample(11, &[20, 30, 100, 90], 1));
+    s.set_left(Some(std::sync::Arc::new(
+        crate::sys::left::tests::view_fixture(),
+    )));
+    s
 }
 
 #[test]
@@ -1214,7 +1218,7 @@ fn sys_disk_prints_what_the_walker_measured_through_the_seam() {
         "{text}"
     );
     assert!(
-        text.contains("dir root=1 path=target alloc_bytes=5000000000 entries=40000"),
+        text.contains("dir root=1 path=target alloc_bytes=5000000000 entries=40000 walked_s=3"),
         "{text}"
     );
     assert!(!text.contains("deep/er"), "below depth=3: {text}");
@@ -1252,6 +1256,10 @@ fn sys_disk_prints_what_the_walker_measured_through_the_seam() {
     };
     assert_eq!(roots[0].get("alloc_bytes"), Some(&Jv::u(7_050_000_000)));
     assert_eq!(roots[0].get("complete"), Some(&Jv::Bool(true)));
+    let Some(Jv::Arr(dirs)) = roots[0].get("dirs") else {
+        panic!("missing subtree rows")
+    };
+    assert_eq!(dirs[0].get("walked_age_s"), Some(&Jv::u(3)));
     assert_eq!(roots[1].get("walked_entries"), Some(&Jv::u(12_000)));
     let tab = all_text(&render_text(&query(View::Tab, false), &c));
     assert!(
@@ -1542,14 +1550,18 @@ fn snapshot_with_jobs() -> Snapshot {
             stopped: vec![
                 Named {
                     pid: 10,
+                    exec_version: None,
                     name: "vim".into(),
                     tab: Some(7),
+                    job: None,
                     for_ms: 0,
                 },
                 Named {
                     pid: 11,
+                    exec_version: None,
                     name: "mail".into(),
                     tab: Some(99),
+                    job: None,
                     for_ms: 0,
                 },
             ],
@@ -1560,8 +1572,72 @@ fn snapshot_with_jobs() -> Snapshot {
         demand: Demand::Fast,
         lanes_off: vec!["lane_off:kqueue_detail"],
         parked_tabs: Vec::new(),
+        at_ms: s.at_ns / 1_000_000,
     }));
     s
+}
+
+/// A reading the engine did not run on (a pull, a reading inside the engine's cadence) carries
+/// the last pass's view, so `sys jobs` says that pass's time and age in its header, in both
+/// shapes: a held finding's `for_ms` and a row's `quiet_ms` are as of it, as status's
+/// `program_check=` tells the same `for_ms` on by the view's age. The age is the snapshot's own
+/// [`Snapshot::jobs_age_ms`], never its clock against the view's: a recorded scene's snapshot
+/// keeps the scene's clock. NEGATIVE CONTROL: a view the snapshot's own reading made reads the
+/// snapshot's time, and every other view keeps it.
+#[test]
+fn sys_jobs_speaks_as_of_the_pass_that_made_its_view() {
+    use crate::jobs::Named;
+    let w = world();
+    let carried = |older_ms: u64| {
+        let mut s = snapshot_with_jobs();
+        s.jobs_age_ms = older_ms;
+        let mut v = s.jobs.as_deref().cloned().unwrap();
+        v.at_ms = 0;
+        v.findings.program_check = vec![Named {
+            pid: 401,
+            exec_version: None,
+            name: "gh".into(),
+            tab: Some(7),
+            job: None,
+            for_ms: 2_000,
+        }];
+        s.jobs = Some(std::sync::Arc::new(v));
+        s
+    };
+    let read = |s: &Snapshot, view: View| {
+        let c = ctx(&w, Some(s), false, true);
+        let reply = render_text(&query(view, false), &c);
+        let age = render_json(&query(view, true), &c)
+            .get("as_of")
+            .and_then(|a| a.get("age_ms"))
+            .cloned();
+        (reply.header(&c, false), all_text(&reply), age)
+    };
+
+    let late = carried(10_000);
+    let (header, text, age) = read(&late, View::Jobs);
+    assert!(
+        header.contains(" as_of=21:21:27.412 age_ms=10120 "),
+        "{header}"
+    );
+    assert_eq!(age, Some(Jv::Int(10_120)));
+    assert!(
+        text.contains("finding kind=program-check pid=401 exe=gh for_ms=2000"),
+        "{text}"
+    );
+    assert!(text.contains("quiet_ms=1152000"), "{text}");
+    let (header, _, _) = read(&late, View::Overview);
+    assert!(
+        header.contains(" as_of=21:21:37.412 age_ms=120 "),
+        "{header}"
+    );
+
+    let (header, _, age) = read(&carried(0), View::Jobs);
+    assert!(
+        header.contains(" as_of=21:21:37.412 age_ms=120 "),
+        "{header}"
+    );
+    assert_eq!(age, Some(Jv::Int(120)));
 }
 
 #[test]

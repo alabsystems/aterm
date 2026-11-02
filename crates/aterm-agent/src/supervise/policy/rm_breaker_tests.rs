@@ -822,6 +822,8 @@ fn a_directory_the_line_just_made_is_proven_wherever_it_is() {
             "$D is not assigned a literal",
         ),
         ("D=$(mktemp -d -p /x); rm -rf \"$D\"", "$D"),
+        ("D=$(mktemp -d ../w.XXXXXX) && rm -rf \"$D\"", "$D"),
+        ("D=$(mktemp -d sub/w.XXXXXX) && rm -rf \"$D\"", "$D"),
         ("D=$(pwd); rm -rf \"$D/x\"", "$D"),
         (
             "S=/tmp/w; D=$(mktemp -d) && rm -rf \"$S/$D\"",
@@ -1111,39 +1113,49 @@ impl Lanes {
     }
 
     /// Each of `lines` in `shell`, its stdout and its stderr, in order, or
-    /// `None`, noted, where `shell` is not installed.
+    /// `None`, noted, where `shell` is not installed. Each line runs in a
+    /// subshell of its own, at most [`LINES_PER_SHELL`] to a shell process.
     fn run_each(&mut self, shell: &'static str, lines: &[String]) -> Option<Vec<(String, String)>> {
-        let mut script = String::new();
-        for line in lines {
-            script.push_str("( eval '");
-            script.push_str(&line.replace('\'', "'\\''"));
-            script.push_str("' )\nprintf '\\036'; printf '\\036' >&2\n");
-        }
-        let (out, err) = self.run(shell, &script)?;
-        let split = |all: &str| -> Vec<String> {
-            let mut each: Vec<String> = all.split(LINE_END).map(str::to_string).collect();
-            assert_eq!(
-                each.pop().as_deref(),
-                Some(""),
-                "{shell}: past the last line: {all:?}"
+        let mut read = Vec::with_capacity(lines.len());
+        for batch in lines.chunks(LINES_PER_SHELL) {
+            let mut script = String::new();
+            for line in batch {
+                script.push_str("( eval '");
+                script.push_str(&line.replace('\'', "'\\''"));
+                script.push_str("' )\nprintf '\\036'; printf '\\036' >&2\n");
+            }
+            let (out, err) = self.run(shell, &script)?;
+            let split = |all: &str| -> Vec<String> {
+                let mut each: Vec<String> = all.split(LINE_END).map(str::to_string).collect();
+                assert_eq!(
+                    each.pop().as_deref(),
+                    Some(""),
+                    "{shell}: past the last line: {all:?}"
+                );
+                each
+            };
+            let (outs, errs) = (split(&out), split(&err));
+            assert!(
+                outs.len() == batch.len() && errs.len() == batch.len(),
+                "{shell}: {} lines, {} outputs, {} error streams:\n{out}\n{err}",
+                batch.len(),
+                outs.len(),
+                errs.len()
             );
-            each
-        };
-        let (outs, errs) = (split(&out), split(&err));
-        assert!(
-            outs.len() == lines.len() && errs.len() == lines.len(),
-            "{shell}: {} lines, {} outputs, {} error streams:\n{out}\n{err}",
-            lines.len(),
-            outs.len(),
-            errs.len()
-        );
-        Some(outs.into_iter().zip(errs).collect())
+            read.extend(outs.into_iter().zip(errs));
+        }
+        Some(read)
     }
 }
 
 /// What [`Lanes::run_each`] prints after each line, on both streams: an
 /// ASCII record separator, which no line prints.
 const LINE_END: char = '\u{1e}';
+
+/// The most lines one shell process of [`Lanes::run_each`] runs, each in a subshell: a fork is
+/// slow where the shell emulates one (Git for Windows' `bash.exe`, more so under Windows on Arm's
+/// x64 emulation), and 308 of them in one process outran the one-minute hang detector there.
+const LINES_PER_SHELL: usize = 32;
 
 impl Drop for Lanes {
     fn drop(&mut self) {

@@ -98,6 +98,100 @@ fn completion(attempt_id: u64) -> crate::UpdateHandoffCompletion {
 }
 
 #[test]
+fn an_untouched_setup_offer_survives_handoff_admission_without_an_answer() {
+    use crate::workstation_setup::{Request, WorkstationSetupDecision};
+    use aterm_types::macos_setup::Plan;
+
+    let mut app = App::headless_for_test();
+    app.headless = false;
+    app.user_input_recent = |_| false;
+    app.windows
+        .get_mut(&crate::WindowId(0))
+        .unwrap()
+        .os_window_for_test = true;
+    let (send, receive) = std::sync::mpsc::channel();
+    let request = Request::new(Plan::default(), send);
+    app.offer_workstation_setup(request.clone());
+    assert!(request.pending());
+    assert!(!app.workstation_setup_holds_handoff());
+
+    let mut pending = parked_record(9, ApplyMode::Automatic);
+    pending.live = app.pool.iter().map(|s| (s.id, s.master, s.pid)).collect();
+    pending.layout = app.capture_handoff_layout();
+    pending.activity_epoch = app.update_handoff_activity_epoch;
+    pending.hold_serials = app.hold_serials();
+    app.pending_update_handoff = Some(pending);
+    assert!(
+        app.collect_handoff_commit_facts(None, true, true, true, None)
+            .unwrap()
+            .0
+            .exact_activity,
+        "an untouched offer does not veto the final commit"
+    );
+    assert!(receive.try_recv().is_err());
+
+    let (late_send, late_receive) = std::sync::mpsc::channel();
+    app.offer_workstation_setup(Request::new(Plan::default(), late_send));
+    assert_eq!(
+        late_receive.try_recv().unwrap().decision,
+        WorkstationSetupDecision::Unavailable
+    );
+    assert!(
+        request.pending(),
+        "a late offer does not displace the first"
+    );
+    app.finish_system_state_shutdown();
+    assert_eq!(
+        receive.try_recv().unwrap().decision,
+        WorkstationSetupDecision::Unavailable
+    );
+}
+
+#[test]
+fn a_setup_offer_draft_created_after_admission_holds_the_final_commit() {
+    use crate::native_app::{ActionInvocation, AppEvent, SemanticInput};
+    use crate::workstation_setup::Request;
+    use aterm_types::macos_setup::Plan;
+
+    let mut app = App::headless_for_test();
+    app.headless = false;
+    app.user_input_recent = |_| false;
+    let wid = crate::WindowId(0);
+    app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
+    let (send, receive) = std::sync::mpsc::channel();
+    app.offer_workstation_setup(Request::new(Plan::default(), send));
+    assert!(!app.workstation_setup_holds_handoff());
+
+    let mut pending = parked_record(9, ApplyMode::Automatic);
+    pending.live = app.pool.iter().map(|s| (s.id, s.master, s.pid)).collect();
+    pending.layout = app.capture_handoff_layout();
+    pending.hold_serials = app.hold_serials();
+    app.pending_update_handoff = Some(pending);
+    let (_, view) = app.active_native_view(wid).unwrap();
+    app.dispatch_native_view_event(
+        wid,
+        view,
+        AppEvent::Action(ActionInvocation {
+            id: crate::native_ui::ActionId::new("system-state/url"),
+            value: Some(SemanticInput::Text("http://draft.local/v1/team".into())),
+        }),
+    )
+    .unwrap();
+    assert!(app.workstation_setup_holds_handoff());
+    // Hold even if an unrelated epoch comparison happens to match: the current model
+    // is checked again at commit, not only when the attempt started.
+    app.pending_update_handoff.as_mut().unwrap().activity_epoch = app.update_handoff_activity_epoch;
+    assert!(
+        !app.collect_handoff_commit_facts(None, true, true, true, None)
+            .unwrap()
+            .0
+            .exact_activity,
+        "the final commit preserves the newly typed draft"
+    );
+    assert!(receive.try_recv().is_err(), "the draft is still unanswered");
+}
+
+#[test]
 fn a_prelaunched_attempt_is_cleared_by_its_completion() {
     let mut app = App::headless_for_test();
     let (record, _cancelled, _stood_down, _transferred) = prelaunch_record(9, ApplyMode::Immediate);

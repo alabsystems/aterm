@@ -13,6 +13,525 @@ use aterm_secrets::{
 const ACCOUNT: Digest = [71; 32];
 
 #[test]
+fn current_configuration_members_batches_thirty_six_devices_and_rechecks_heads() {
+    let roles = vec![Role::Writer; 36];
+    let (lab, db, _) = fixture_on(false, &roles);
+    let admin = client::admin_open(&lab.paths[0]).unwrap();
+    let request = db
+        .intent_configuration(&admin, ACCOUNT, "one", vec![])
+        .unwrap();
+    let (root, _) = db.issue(&admin, [150; 16], request).unwrap();
+    let mut children = Vec::new();
+    for n in 0..36 {
+        let actor = lab.bootstrap(n).request().unwrap().binding().actor();
+        let request = db.intent_member_request(ACCOUNT, actor).unwrap().unwrap();
+        children.push(db.issue(&admin, [n as u8 + 151; 16], request).unwrap().0);
+    }
+    let reads = graph::READS.with(std::cell::Cell::get);
+    let captures = configuration::CAPTURES.with(std::cell::Cell::get);
+    let (_, _, members) = db.current_configuration_members(ACCOUNT).unwrap();
+    assert_eq!(members.len(), 36);
+    assert_eq!(graph::READS.with(std::cell::Cell::get) - reads, 2);
+    assert_eq!(
+        configuration::CAPTURES.with(std::cell::Cell::get) - captures,
+        1
+    );
+    assert!(
+        db.current_configuration_members_after(ACCOUNT, || {
+            let stop = db
+                .stop_request(children[35].request().account, vec![children[35].id()])
+                .unwrap();
+            db.issue(&admin, [200; 16], stop).unwrap();
+        })
+        .is_err()
+    );
+    assert_eq!(
+        db.current_configuration_members(ACCOUNT).unwrap().2.len(),
+        35
+    );
+    assert!(
+        db.current_configuration_members_after(ACCOUNT, || {
+            let stop = db.stop_request(ACCOUNT, vec![root.id()]).unwrap();
+            db.issue(&admin, [201; 16], stop).unwrap();
+        })
+        .is_err()
+    );
+}
+
+#[test]
+fn grouped_account_status_preserves_forks_stops_missing_and_foreign_parents() {
+    let (lab, _, request) = fixture(false);
+    let root = sign(&lab, request.clone());
+    let mut child = request.clone();
+    child.generation = 2;
+    child.parents = vec![root.id()];
+    let child = sign(&lab, child);
+    let mut foreign = request.clone();
+    foreign.account = [91; 32];
+    let foreign = sign(&lab, foreign);
+    let mut wrong = request.clone();
+    wrong.generation = 2;
+    wrong.parents = vec![foreign.id()];
+    let wrong = sign(&lab, wrong);
+    let mut fork = request.clone();
+    if let Action::Prepare(terms) = &mut fork.action {
+        terms.device = lab.bootstrap(1).request().unwrap().binding().clone();
+    }
+    let fork = sign(&lab, fork);
+    let mut stop = request;
+    stop.generation = 2;
+    stop.parents = vec![root.id()];
+    stop.action = Action::Stop;
+    let stop = sign(&lab, stop);
+    let mut heads = vec![root.id(), fork.id()];
+    heads.sort();
+    for (records, expected) in [
+        (vec![root.clone()], State::Ready(root.id())),
+        (vec![root.clone(), child.clone()], State::Ready(child.id())),
+        (vec![child], State::Pending),
+        (vec![foreign, wrong], State::Invalid),
+        (vec![root.clone(), fork], State::Conflict(heads)),
+        (vec![root, stop.clone()], State::Stopped(stop.id())),
+    ] {
+        let mut history = history(records);
+        assert_eq!(history.statuses()[&ACCOUNT], expected);
+        for unavailable in [0, 1] {
+            history.unavailable = unavailable;
+            let statuses = history.statuses();
+            for record in history.records.values() {
+                assert_eq!(
+                    statuses[&record.request().account],
+                    history.status(record.request().account)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn current_configuration_rechecks_direct_and_parent_heads_after_capture() {
+    for (intent, stop) in [(false, false), (false, true), (true, false), (true, true)] {
+        let (lab, db, request) = fixture(false);
+        let admin = client::admin_open(&lab.paths[0]).unwrap();
+        let request = if intent {
+            db.intent_configuration(&admin, ACCOUNT, "one", vec![])
+                .unwrap()
+        } else {
+            request
+        };
+        let (root, _) = db.issue(&admin, [86; 16], request).unwrap();
+        let account = if intent {
+            let local = lab.bootstrap(0).request().unwrap().binding().actor();
+            let request = db.intent_member_request(ACCOUNT, local).unwrap().unwrap();
+            db.issue(&admin, [85; 16], request)
+                .unwrap()
+                .0
+                .request()
+                .account
+        } else {
+            ACCOUNT
+        };
+        let before = db.current_configuration(account).unwrap().0;
+        assert!(
+            db.current_configuration_after(account, || {
+                let replacement = if stop {
+                    db.stop_request(ACCOUNT, vec![root.id()]).unwrap()
+                } else if intent {
+                    db.intent_configuration(&admin, ACCOUNT, "one", vec![root.id()])
+                        .unwrap()
+                } else {
+                    db.configuration(
+                        &admin,
+                        ACCOUNT,
+                        "one",
+                        lab.bootstrap(0).request().unwrap().binding().actor(),
+                        vec![root.id()],
+                    )
+                    .unwrap()
+                };
+                db.issue(&admin, [87; 16], replacement).unwrap();
+            })
+            .is_err()
+        );
+        if intent {
+            assert_eq!(
+                db.state(account).unwrap(),
+                State::Ready(before.id()),
+                "parent Stop must invalidate even an unchanged child head"
+            );
+        }
+        if stop || intent {
+            assert!(db.current_configuration(account).is_err());
+        } else {
+            assert_ne!(
+                db.current_configuration(account).unwrap().0.id(),
+                before.id()
+            );
+        }
+    }
+}
+
+#[test]
+fn current_configuration_refuses_changed_proposals_and_ambiguous_decisions() {
+    let (lab, db, request) = fixture(false);
+    let admin = client::admin_open(&lab.paths[0]).unwrap();
+    db.issue(&admin, [86; 16], request.clone()).unwrap();
+    db.current_configuration(ACCOUNT).unwrap();
+    let competing = db
+        .configuration(
+            &admin,
+            ACCOUNT,
+            "one",
+            lab.bootstrap(1).request().unwrap().binding().actor(),
+            vec![],
+        )
+        .unwrap();
+    let competing = sign(&lab, competing);
+    db.with_store(false, |session, store, _| {
+        let mut payload = b"AAOP1".to_vec();
+        payload.extend_from_slice(&[87; 16]);
+        payload.extend_from_slice(competing.bytes());
+        store.commit_catalog(session, &payload).map(|_| ())
+    })
+    .unwrap();
+    assert!(db.current_configuration(ACCOUNT).is_err());
+
+    let (lab, db, request) = fixture(false);
+    let admin = client::admin_open(&lab.paths[0]).unwrap();
+    db.issue(&admin, [86; 16], request).unwrap();
+    let mut changed = account(&lab, false);
+    changed
+        .as_object_mut()
+        .unwrap()
+        .insert("plan".into(), json!("changed"));
+    super::super::proposals::Proposals::at(lab.paths[0].clone())
+        .write(
+            [88; 16],
+            vec![Change {
+                collection: "accounts".into(),
+                key: "one".into(),
+                value: Some(changed),
+            }],
+        )
+        .unwrap();
+    assert!(db.current_configuration(ACCOUNT).is_err());
+}
+
+#[test]
+fn new_intents_cannot_leave_legacy_readers_using_a_superseded_device_grant() {
+    let (lab, db, legacy) = fixture(false);
+    let admin = client::admin_open(&lab.paths[0]).unwrap();
+    let (old, _) = db.issue(&admin, [80; 16], legacy).unwrap();
+    let replacement = db
+        .intent_configuration(&admin, ACCOUNT, "one", vec![old.id()])
+        .unwrap();
+    assert!(db.issue(&admin, [81; 16], replacement).is_err());
+    assert_eq!(db.state(ACCOUNT).unwrap(), State::Ready(old.id()));
+    let intent_account = [72; 32];
+    let request = db
+        .intent_configuration(&admin, intent_account, "one", vec![])
+        .unwrap();
+    let (intent, _) = db.issue(&admin, [82; 16], request).unwrap();
+    let legacy_on_intent = db
+        .configuration(
+            &admin,
+            intent_account,
+            "one",
+            lab.bootstrap(0).request().unwrap().binding().actor(),
+            vec![intent.id()],
+        )
+        .unwrap();
+    assert!(db.issue(&admin, [83; 16], legacy_on_intent).is_err());
+    assert_eq!(db.state(intent_account).unwrap(), State::Ready(intent.id()));
+}
+
+#[test]
+fn expired_shared_pass_budget_publishes_no_automatic_preparation() {
+    let (lab, db, _) = fixture(false);
+    let admin = client::admin_open(&lab.paths[0]).unwrap();
+    let request = db
+        .intent_configuration(&admin, ACCOUNT, "one", vec![])
+        .unwrap();
+    db.issue(&admin, [80; 16], request).unwrap();
+    let bounded = Activations::at_until(lab.paths[0].clone(), std::time::Instant::now());
+    assert!(bounded.materialize_next_intent(&admin).is_err());
+    assert!(db.local_preparations().unwrap().is_empty());
+}
+
+#[test]
+fn fleet_intent_keeps_each_device_current_and_its_stop_revokes_every_child() {
+    use aterm_secrets::commons::accounts::IntentRef;
+    let (lab, db, _) = fixture(true);
+    let admin = client::admin_open(&lab.paths[0]).unwrap();
+    let request = db
+        .intent_configuration(&admin, ACCOUNT, "one", vec![])
+        .unwrap();
+    let (intent, _) = db.issue(&admin, [90; 16], request).unwrap();
+    assert_eq!(db.intent_targets().unwrap().len(), 2);
+    let reference = IntentRef {
+        account: ACCOUNT,
+        decision: intent.id(),
+    };
+    let accounts: Vec<_> = (0..2)
+        .map(|n| reference.device_account(lab.bootstrap(n).request().unwrap().binding()))
+        .collect();
+    assert_ne!(accounts[0], accounts[1]);
+    assert!(db.materialize_next_intent(&admin).unwrap().is_some());
+    assert!(db.materialize_next_intent(&admin).unwrap().is_some());
+    assert!(db.materialize_next_intent(&admin).unwrap().is_none());
+    assert_eq!(
+        db.prepare(accounts[0], &admin.config)
+            .unwrap()
+            .credential()
+            .unwrap()
+            .value()
+            .as_slice(),
+        b"inert-account-token"
+    );
+    crate::table::tests::repair_commons(&lab, 3);
+    let peer = Activations::at(lab.paths[1].clone());
+    let peer_config = client::config(&lab.paths[1]).unwrap().unwrap();
+    assert_eq!(
+        peer.prepare(accounts[1], &peer_config)
+            .unwrap()
+            .credential()
+            .unwrap()
+            .value()
+            .as_slice(),
+        b"inert-account-token"
+    );
+    assert!(
+        peer.intent_targets().unwrap().is_empty(),
+        "only the named root issuer materializes children"
+    );
+    let stopped = db.stop_request(ACCOUNT, vec![intent.id()]).unwrap();
+    db.issue(&admin, [91; 16], stopped).unwrap();
+    assert!(db.prepare(accounts[0], &admin.config).is_err());
+    assert!(db.local_preparations().unwrap().is_empty());
+    crate::table::tests::repair_commons(&lab, 3);
+    assert!(peer.prepare(accounts[1], &peer_config).is_err());
+    assert!(peer.local_preparations().unwrap().is_empty());
+    assert!(db.materialize_next_intent(&admin).unwrap().is_none());
+}
+
+#[test]
+fn intent_recovery_authenticates_requester_reuses_its_receipt_and_refuses_changed_credentials() {
+    use aterm_secrets::commons::accounts::IntentRef;
+    let (lab, db, _) = fixture(true);
+    let admin = client::admin_open(&lab.paths[0]).unwrap();
+    let request = db
+        .intent_configuration(&admin, ACCOUNT, "one", vec![])
+        .unwrap();
+    let (intent, _) = db.issue(&admin, [90; 16], request).unwrap();
+    let root = lab.bootstrap(0).request().unwrap().binding().clone();
+    let other = lab.bootstrap(1).request().unwrap().binding().clone();
+    let reference = IntentRef {
+        account: ACCOUNT,
+        decision: intent.id(),
+    };
+    let account = reference.device_account(&other);
+    let request = db
+        .intent_member_request(ACCOUNT, other.actor())
+        .unwrap()
+        .unwrap();
+    let (first, _) = db.issue(&admin, [91; 16], request).unwrap();
+    assert!(
+        db.reissue_intent_preparation(&admin, account, first.id(), &root, [92; 16])
+            .is_err()
+    );
+    let (next, receipt) = db
+        .reissue_intent_preparation(&admin, account, first.id(), &other, [92; 16])
+        .unwrap();
+    let (again, same_receipt) = db
+        .reissue_intent_preparation(&admin, account, first.id(), &other, [92; 16])
+        .unwrap();
+    assert_eq!(next.id(), again.id());
+    assert_eq!(receipt.id, same_receipt.id);
+    assert_eq!(next.request().parents, vec![first.id()]);
+    let mut changed = admin.doc.clone();
+    changed
+        .set_entry(&Audience::Everyone, "token", b"different-credential")
+        .unwrap();
+    client::admin_publish(&lab.paths[0], &admin, &changed).unwrap();
+    let refreshed = client::admin_open(&lab.paths[0]).unwrap();
+    assert!(
+        db.reissue_intent_preparation(&refreshed, account, next.id(), &other, [93; 16])
+            .is_err()
+    );
+}
+
+#[test]
+fn an_existing_intent_discovers_a_later_admitted_device_without_new_approval() {
+    let lab = Lab::with_enrolled(&[Role::Writer, Role::Writer, Role::Writer], 2);
+    super::super::proposals::Proposals::at(lab.paths[0].clone())
+        .write(
+            [1; 16],
+            vec![Change {
+                collection: "accounts".into(),
+                key: "one".into(),
+                value: Some(account(&lab, false)),
+            }],
+        )
+        .unwrap();
+    let db = Activations::at(lab.paths[0].clone());
+    let admin = client::admin_open(&lab.paths[0]).unwrap();
+    let request = db
+        .intent_configuration(&admin, ACCOUNT, "one", vec![])
+        .unwrap();
+    db.issue(&admin, [90; 16], request).unwrap();
+    assert_eq!(db.intent_targets().unwrap().len(), 2);
+    assert!(db.materialize_next_intent(&admin).unwrap().is_some());
+    assert!(db.materialize_next_intent(&admin).unwrap().is_some());
+    assert!(db.materialize_next_intent(&admin).unwrap().is_none());
+    lab.admit(&[Role::Writer, Role::Writer, Role::Writer]);
+    assert_eq!(db.intent_targets().unwrap().len(), 3);
+    assert!(db.materialize_next_intent(&admin).unwrap().is_some());
+    assert!(db.materialize_next_intent(&admin).unwrap().is_none());
+}
+
+#[test]
+fn recovered_issuer_prepares_a_newly_admitted_member_without_relaxing_direct_issue() {
+    let roles = [Role::Writer; 37];
+    let mut lab = Lab::with_enrolled(&roles, 36);
+    super::super::proposals::Proposals::at(lab.paths[0].clone())
+        .write(
+            [1; 16],
+            vec![Change {
+                collection: "accounts".into(),
+                key: "one".into(),
+                value: Some(account(&lab, false)),
+            }],
+        )
+        .unwrap();
+    let original = lab.paths[0].clone();
+    let db = Activations::at(original.clone());
+    let admin = client::admin_open(&original).unwrap();
+    let request = db
+        .intent_configuration(&admin, ACCOUNT, "one", vec![])
+        .unwrap();
+    let (intent, _) = db.issue(&admin, [90; 16], request).unwrap();
+    for n in 0..36 {
+        let actor = lab.bootstrap(n).request().unwrap().binding().actor();
+        let child = db.intent_member_request(ACCOUNT, actor).unwrap().unwrap();
+        db.issue(&admin, [100 + n as u8; 16], child).unwrap();
+    }
+    assert!(db.materialize_next_intent(&admin).unwrap().is_none());
+    let config = lab._home.path().join("aterm.toml");
+    std::fs::write(&config, "").unwrap();
+    let selected = crate::generation::test_complete_successor(
+        lab._home.path(),
+        &original,
+        &lab.paths[1],
+        &config,
+        std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+    )
+    .unwrap();
+    lab.paths[1] = selected;
+    assert!(
+        db.intent_targets().unwrap().is_empty(),
+        "ordinary discovery stays issuer-strict"
+    );
+    lab.admit(&roles);
+    let new_member = lab.bootstrap(36).request().unwrap().binding().clone();
+    let request = db
+        .intent_member_request_in(ACCOUNT, new_member.actor(), true)
+        .unwrap()
+        .unwrap();
+    assert!(
+        db.issue(&admin, [91; 16], request).is_err(),
+        "raw issue cannot claim succession"
+    );
+    let reads = graph::READS.with(std::cell::Cell::get);
+    let (child, _) = db.materialize_next_intent(&admin).unwrap().unwrap();
+    assert_eq!(
+        graph::READS.with(std::cell::Cell::get) - reads,
+        3,
+        "prepared members never trigger another per-member history read"
+    );
+    let Action::Prepare(terms) = &child.request().action else {
+        panic!("expected new child")
+    };
+    assert_eq!(terms.device, new_member);
+    assert_eq!(terms.intent.unwrap().decision, intent.id());
+    assert!(db.materialize_next_intent(&admin).unwrap().is_none());
+    // Even a previously minted witness cannot outlive current revocation.
+    let successor = Bootstrap::required(&lab.paths[1]).unwrap();
+    let predecessor = Bootstrap::required(&original).unwrap();
+    let journal = Journal::read_existing(successor.journal_dir(), successor.trust()).unwrap();
+    let witness = admin
+        .account_issuer_succession(predecessor, &successor, &journal, &intent)
+        .unwrap();
+    admin
+        .prepare_account_decision_after_succession(
+            &successor,
+            &journal,
+            child.request().clone(),
+            &intent,
+            &witness,
+        )
+        .unwrap();
+    drop(journal);
+    let mut revoked = roles;
+    revoked[0] = Role::Reader;
+    lab.admit(&revoked);
+    let journal = Journal::read_existing(successor.journal_dir(), successor.trust()).unwrap();
+    assert!(
+        admin
+            .prepare_account_decision_after_succession(
+                &successor,
+                &journal,
+                child.request().clone(),
+                &intent,
+                &witness,
+            )
+            .is_err()
+    );
+    drop(journal);
+    assert!(db.materialize_next_intent(&admin).is_err());
+    lab.admit(&roles);
+    // A current Stop still invalidates all children even with valid lineage.
+    let stop = db.stop_request(ACCOUNT, vec![intent.id()]).unwrap();
+    db.issue(&admin, [92; 16], stop).unwrap();
+    assert!(db.materialize_next_intent(&admin).unwrap().is_none());
+    assert!(db.prepare(child.request().account, &admin.config).is_err());
+    // Private metadata is a hint: forging its actor cannot replace custody.
+    let selection = original.dir.join("commons/writer-generation/selection");
+    let mut value: aterm_json::Value =
+        aterm_json::from_slice(&std::fs::read(&selection).unwrap()).unwrap();
+    value.as_object_mut().unwrap().insert(
+        "actor".into(),
+        json!(aterm_codec::hex::encode_lower(&new_member.actor())),
+    );
+    aterm_secrets::fsx::write_atomic(&selection, &aterm_json::to_vec(&value).unwrap(), 0o600)
+        .unwrap();
+    assert!(db.materialize_next_intent(&admin).is_err());
+}
+
+#[test]
+fn local_discovery_requires_current_root_head_and_exact_device() {
+    let (lab, db, request) = fixture(false);
+    let admin = client::admin_open(&lab.paths[0]).unwrap();
+    let (local, _) = db.issue(&admin, [11; 16], request).unwrap();
+    let foreign = db
+        .configuration(
+            &admin,
+            [72; 32],
+            "one",
+            lab.bootstrap(1).request().unwrap().binding().actor(),
+            vec![],
+        )
+        .unwrap();
+    db.issue(&admin, [12; 16], foreign).unwrap();
+    assert_eq!(
+        db.local_preparations().unwrap(),
+        vec![(ACCOUNT, local.id())]
+    );
+    let stop = db.stop_request(ACCOUNT, vec![local.id()]).unwrap();
+    db.issue(&admin, [13; 16], stop).unwrap();
+    assert!(db.local_preparations().unwrap().is_empty());
+}
+
+#[test]
 fn prepared_configuration_owns_only_its_checked_closure_after_live_records_change() {
     let (lab, db, _) = fixture(false);
     let proposals = super::super::proposals::Proposals::at(lab.paths[0].clone());

@@ -7,6 +7,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use aterm_json::Value;
 
+use crate::unitgraph::package_name;
+
 /// One unit on the measured path: its package and the code generation it gets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Unit {
@@ -20,16 +22,6 @@ pub(crate) struct Unit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Audit {
     pub units: Vec<Unit>,
-}
-
-fn package_name(pkg_id: &str) -> &str {
-    match pkg_id.rsplit_once('#') {
-        Some((_, fragment)) if fragment.contains('@') => {
-            fragment.split_once('@').map_or(fragment, |(name, _)| name)
-        }
-        Some((url, _)) => url.rsplit('/').next().unwrap_or(url),
-        None => pkg_id,
-    }
 }
 
 fn on_the_path(unit: &Value) -> bool {

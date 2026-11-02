@@ -2,11 +2,21 @@
 // Copyright 2026 Andrew Yates
 
 use crate::harness::acts::TaskFace;
-use crate::supervise::policy::turn_end::{RULE_DONE_CHECK, RULE_LAND, RULE_LAND_NUDGE, RULE_LEFT};
+use crate::supervise::policy::turn_end::{
+    RULE_DONE_CHECK, RULE_LAND, RULE_LAND_CHECK, RULE_LAND_NUDGE, RULE_LEFT,
+};
 
 const LANDING_REPLY: &str = "Committed and pushed the parser and its tests.\nNothing left: all of \
                              it is merged into the remote main branch.";
 const PROGRESS: &str = "Committing the parser now; the lexer is next.";
+/// The land check's one landing answer: a landing's last reply.
+const LANDED: &str = crate::supervise::policy::land_check::LANDED;
+
+/// A LANDING'S LAST SCREENS: the defense (where the land check is typed, so a run gates it on
+/// the check's turn), the check's turn, and its `LANDED`.
+fn landing() -> [Vec<String>; 3] {
+    [ended(LANDING_REPLY), busy_screen(), ended(LANDED)]
+}
 
 /// A host that records every face it is told, and how it started the loop
 /// ([`IdleHost::lifted_off`]).
@@ -89,6 +99,11 @@ impl IdleHost for Faces {
 
 /// A turn of work: a call it ran, then its words.
 fn ended(said: &str) -> Vec<String> {
+    ended_after(said, "3m 2s")
+}
+
+/// [`ended`] after `worked` of the turn's (`12s`: a short turn, no real work).
+fn ended_after(said: &str, worked: &str) -> Vec<String> {
     let mut lines: Vec<String> = said.lines().map(|l| format!("⏺ {l}")).collect();
     for l in lines.iter_mut().skip(1) {
         *l = l.replacen("⏺ ", "  ", 1);
@@ -103,7 +118,7 @@ fn ended(said: &str) -> Vec<String> {
     );
     lines.extend([
         String::new(),
-        "✻ Worked for 3m 2s · done 4:24 PM".to_string(),
+        format!("✻ Worked for {worked} · done 4:24 PM"),
         String::new(),
     ]);
     let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
@@ -184,15 +199,11 @@ fn run_kept(
 fn a_landing_is_told_landed_once_and_someone_elses_live_turn_opens_it() {
     let landed = |then: Vec<Vec<String>>| {
         let host = Arc::new(Faces::default());
-        let mut screens = vec![
-            busy_screen(),
-            ended(PROGRESS),
-            busy_screen(),
-            ended(LANDING_REPLY),
-        ];
+        let mut screens = vec![busy_screen(), ended(PROGRESS), busy_screen()];
+        screens.extend(landing());
         screens.extend(then);
-        let (lines, turns) = run(screens, "land", vec![1], &host, None, None);
-        assert_eq!(turns, 1, "the instruction alone: {lines:#?}");
+        let (lines, turns) = run(screens, "land", vec![1, 3], &host, None, None);
+        assert_eq!(turns, 2, "the instruction, then the land check: {lines:#?}");
         assert!(
             lines
                 .iter()
@@ -215,20 +226,18 @@ fn a_landed_tasks_own_wake_tells_no_face() {
             finished,
             ..Faces::default()
         });
-        let screens = vec![
-            busy_screen(),
-            ended(PROGRESS),
-            busy_screen(),
-            ended(LANDING_REPLY),
+        let mut screens = vec![busy_screen(), ended(PROGRESS), busy_screen()];
+        screens.extend(landing());
+        screens.extend([
             busy_screen(),
             ended("The monitor fired: the deploy finished."),
-        ];
-        let (lines, turns) = run(screens, "land", vec![1], &host, None, None);
+        ]);
+        let (lines, turns) = run(screens, "land", vec![1, 3], &host, None, None);
         (host.told(), turns, lines)
     };
     let (told, turns, lines) = wake(Some(true));
     assert_eq!(told, [TaskFace::Open, TaskFace::Landed], "{lines:#?}");
-    assert_eq!(turns, 1, "the instruction alone: {lines:#?}");
+    assert_eq!(turns, 2, "the instruction and the check: {lines:#?}");
     let (told, _, lines) = wake(None);
     assert_eq!(
         told.get(..3),
@@ -250,25 +259,23 @@ fn a_landed_tasks_own_wake_over_someone_elses_edit_keeps_the_landing() {
         let host = Arc::new(Faces {
             finished: Some(true),
             repo: Some(edit.clone()),
-            repos: Mutex::new([None, None, began].into_iter().collect()),
+            repos: Mutex::new([None, None, None, began].into_iter().collect()),
             ..Faces::default()
         });
-        let screens = vec![
-            busy_screen(),
-            ended(PROGRESS),
-            busy_screen(),
-            ended(LANDING_REPLY),
+        let mut screens = vec![busy_screen(), ended(PROGRESS), busy_screen()];
+        screens.extend(landing());
+        screens.extend([
             busy_screen(),
             ended("The monitor fired: the deploy finished."),
-        ];
-        let (lines, turns) = run(screens, "land", vec![1], &host, None, None);
+        ]);
+        let (lines, turns) = run(screens, "land", vec![1, 3], &host, None, None);
         (host.told(), turns, lines)
     };
     let (told, turns, lines) = wake(Some(edit.clone()));
-    assert_eq!(turns, 1, "the instruction alone: {lines:#?}");
+    assert_eq!(turns, 2, "the instruction and the check: {lines:#?}");
     assert_eq!(told, [TaskFace::Open, TaskFace::Landed], "{lines:#?}");
     let (told, turns, lines) = wake(None);
-    assert_eq!(turns, 2, "the nudge: {lines:#?}");
+    assert_eq!(turns, 3, "the nudge: {lines:#?}");
     assert!(
         lines
             .iter()
@@ -353,9 +360,9 @@ fn a_cruise_done_claim_tells_no_end_and_a_persons_exchange_is_theirs() {
 
 #[test]
 fn a_landing_goes_on_past_two_nudges_and_is_told_landed_only_on_its_defense() {
-    let land_on = |last: &str| {
+    let land_on = |last: &[Vec<String>], gates: Vec<usize>| {
         let host = Arc::new(Faces::default());
-        let screens = vec![
+        let mut screens = vec![
             busy_screen(),
             ended(PROGRESS),
             busy_screen(),
@@ -364,18 +371,21 @@ fn a_landing_goes_on_past_two_nudges_and_is_told_landed_only_on_its_defense() {
             ended(PROGRESS),
             busy_screen(),
             ended(PROGRESS),
-            busy_screen(),
-            ended(last),
             busy_screen(),
         ];
-        let (lines, turns) = run(screens, "land", vec![1, 3, 5, 7], &host, None, None);
+        screens.extend(last.iter().cloned());
+        screens.push(busy_screen());
+        let (lines, turns) = run(screens, "land", gates, &host, None, None);
         (turns, host.told(), lines)
     };
-    let (turns, told, lines) = land_on(PROGRESS);
+    let (turns, told, lines) = land_on(&[ended(PROGRESS)], vec![1, 3, 5, 7]);
     assert_eq!(turns, 5, "the instruction and four nudges: {lines:#?}");
     assert_eq!(told, [TaskFace::Open], "{lines:#?}");
-    let (turns, told, lines) = land_on(LANDING_REPLY);
-    assert_eq!(turns, 4, "the instruction and three nudges: {lines:#?}");
+    let (turns, told, lines) = land_on(&landing(), vec![1, 3, 5, 7, 9]);
+    assert_eq!(
+        turns, 5,
+        "the instruction, three nudges and the check: {lines:#?}"
+    );
     assert_eq!(
         told,
         [TaskFace::Open, TaskFace::Landed, TaskFace::Open],
@@ -385,13 +395,23 @@ fn a_landing_goes_on_past_two_nudges_and_is_told_landed_only_on_its_defense() {
 
 #[test]
 fn a_restart_of_a_landing_tells_landed_and_types_nothing() {
-    for (last, face) in [
-        (LANDING_REPLY, TaskFace::Landed),
-        (PROGRESS, TaskFace::Open),
+    for (end, last, face, gates) in [
+        (
+            landing().to_vec(),
+            LANDED,
+            TaskFace::Landed,
+            vec![1, 3, 5, 7],
+        ),
+        (
+            vec![ended(PROGRESS)],
+            PROGRESS,
+            TaskFace::Open,
+            vec![1, 3, 5],
+        ),
     ] {
         let (dir, path) = files("restart-landed", &[], &[]);
         let host = Arc::new(Faces::default());
-        let screens = vec![
+        let mut screens = vec![
             busy_screen(),
             ended(PROGRESS),
             busy_screen(),
@@ -399,9 +419,9 @@ fn a_restart_of_a_landing_tells_landed_and_types_nothing() {
             busy_screen(),
             ended(PROGRESS),
             busy_screen(),
-            ended(last),
         ];
-        let (lines, turns) = run(screens, "land", vec![1, 3, 5], &host, Some(&path), None);
+        screens.extend(end);
+        let (lines, turns) = run(screens, "land", gates, &host, Some(&path), None);
         assert!(turns >= 3, "the instruction and two nudges: {lines:#?}");
         let host = Arc::new(Faces::default());
         let (lines, turns) = run(
@@ -741,7 +761,7 @@ fn only_a_landing_is_read_back_and_an_older_builds_done_seeds_nothing() {
                 std::fs::read_to_string(crate::supervise::approvals::journal_beside(&path))
                     .unwrap_or_default();
             let got =
-                ended_before(&journal, None, typed.last().copied()).map(|(words, _, _)| words);
+                ended_before(&journal, None, typed.last().copied()).map(|(words, _, _, _)| words);
             let _ = std::fs::remove_dir_all(&dir);
             got
         };
@@ -885,13 +905,13 @@ fn a_restated_landing_carries_the_time_its_note_was_journaled() {
     let (told, turns, lines) = land_first(&ledger, Vec::new(), &[]);
     assert_eq!(
         (told, turns),
-        (vec![TaskFace::Open, TaskFace::Landed], 1),
+        (vec![TaskFace::Open, TaskFace::Landed], 2),
         "{lines:#?}"
     );
     let at = note_time(&ledger, RULE_LAND);
     let host = Arc::new(Faces::default());
     let (lines, turns) = run(
-        vec![ended(LANDING_REPLY)],
+        vec![ended(LANDED)],
         "land",
         Vec::new(),
         &host,
@@ -943,7 +963,7 @@ fn a_restated_landing_carries_the_time_its_note_was_journaled() {
     std::fs::write(&ledger, rows).expect("ledger");
     let host = Arc::new(Faces::default());
     run(
-        vec![ended(LANDING_REPLY)],
+        vec![ended(LANDED)],
         "land",
         Vec::new(),
         &host,
@@ -979,7 +999,7 @@ fn a_restated_landings_note_carries_its_first_time_forward() {
         std::thread::sleep(Duration::from_millis(5));
         let host = Arc::new(Faces::default());
         let (lines, turns) = run(
-            vec![ended(LANDING_REPLY)],
+            vec![ended(LANDED)],
             "land",
             Vec::new(),
             &host,
@@ -1059,16 +1079,11 @@ fn the_page_counts_each_landing_once_through_its_wake_and_restarts() {
         })
     };
     let host = wakeful();
-    let screens = vec![
-        busy_screen(),
-        ended(PROGRESS),
-        busy_screen(),
-        ended(LANDING_REPLY),
-        busy_screen(),
-        ended(WAKE),
-    ];
-    let (lines, turns) = run(screens, "land", vec![1], &host, Some(&ledger), None);
-    assert_eq!(turns, 1, "the instruction alone: {lines:#?}");
+    let mut screens = vec![busy_screen(), ended(PROGRESS), busy_screen()];
+    screens.extend(landing());
+    screens.extend([busy_screen(), ended(WAKE)]);
+    let (lines, turns) = run(screens, "land", vec![1, 3], &host, Some(&ledger), None);
+    assert_eq!(turns, 2, "the instruction and the check: {lines:#?}");
     assert_eq!(
         host.told(),
         [TaskFace::Open, TaskFace::Landed],
@@ -1081,7 +1096,7 @@ fn the_page_counts_each_landing_once_through_its_wake_and_restarts() {
             .any(|l| landed_note(l) && l.contains(WAKE_KEPT)),
         "the wake restated the landing: {first:#?}"
     );
-    assert_eq!(read(opened), (1, 1, 1, 1), "{first:#?}");
+    assert_eq!(read(opened), (1, 1, 1, 2), "{first:#?}");
     for again in 0..2 {
         std::thread::sleep(Duration::from_millis(5));
         let host = wakeful();
@@ -1095,20 +1110,16 @@ fn the_page_counts_each_landing_once_through_its_wake_and_restarts() {
         );
         assert_eq!(turns, 0, "{again}: {lines:#?}");
         assert_eq!(host.told(), [TaskFace::Landed], "{again}: {lines:#?}");
-        assert_eq!(read(opened), (1, 1, 1, 1), "{again}: the journal's count");
+        assert_eq!(read(opened), (1, 1, 1, 2), "{again}: the journal's count");
     }
     assert_eq!(notes(), 4, "{:#?}", journal_lines(&ledger));
     std::thread::sleep(Duration::from_millis(5));
     let reopened = crate::supervise::journal::unix_ms();
     let host = Arc::new(Faces::default());
-    let screens = vec![
-        busy_screen(),
-        ended(PROGRESS),
-        busy_screen(),
-        ended(LANDING_REPLY),
-    ];
-    let (lines, turns) = run(screens, "land", vec![1], &host, Some(&ledger), None);
-    assert_eq!(turns, 1, "Land's act: {lines:#?}");
+    let mut screens = vec![busy_screen(), ended(PROGRESS), busy_screen()];
+    screens.extend(landing());
+    let (lines, turns) = run(screens, "land", vec![1, 3], &host, Some(&ledger), None);
+    assert_eq!(turns, 2, "Land's act and its check: {lines:#?}");
     assert_eq!(host.told().last(), Some(&TaskFace::Landed), "{lines:#?}");
     let (today, week, share, prompts) = read(opened);
     assert_eq!(
@@ -1117,7 +1128,10 @@ fn the_page_counts_each_landing_once_through_its_wake_and_restarts() {
         "{:#?}",
         journal_lines(&ledger)
     );
-    assert_eq!(prompts, 2, "two land prompts, one per landing");
+    assert_eq!(
+        prompts, 4,
+        "four land prompts: an instruction and a check per landing"
+    );
     assert_eq!(read(reopened).0, 1, "{:#?}", journal_lines(&ledger));
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1196,13 +1210,18 @@ fn a_restart_of_a_landed_session_types_no_land_instruction() {
         &[],
         answered("land", LANDING_REPLY),
     );
-    assert_eq!(turns, 0, "the land act's defense: {lines:#?}");
-    assert_eq!(told, [TaskFace::Open, TaskFace::Landed]);
-    assert_eq!(notes.len(), 1, "{notes:#?}");
-    assert!(
-        notes[0].contains(&format!("rule={RULE_LAND} ")),
-        "{notes:#?}"
+    assert_eq!(
+        turns, 1,
+        "the land act's defense gets the check: {lines:#?}"
     );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains(&format!("rule={RULE_LAND_CHECK} "))),
+        "{lines:#?}"
+    );
+    assert_eq!(told, [TaskFace::Open]);
+    assert!(notes.is_empty(), "{notes:#?}");
     let (turns, told, notes, lines) = restart(
         "restart-land-untaken",
         std::slice::from_ref(&land_typed),
@@ -1235,6 +1254,335 @@ fn a_restart_of_a_landed_session_types_no_land_instruction() {
         "{lines:#?}"
     );
     assert_eq!(told, [TaskFace::Landed, TaskFace::Open]);
+}
+
+/// A RESTARTED LOOP LANDS ON ITS CHECK'S `LANDED`: the ledger's last Land act is the check, so
+/// the answer the restarted loop reads first is judged as the check's, and lands with nothing
+/// typed. Negative control: the journal's seed without `checked` (`LandSeed::checked`).
+#[test]
+fn a_restarted_loop_lands_on_its_checks_landed_answer() {
+    let min = |n: u64| Duration::from_secs(60 * n);
+    let ledger = [
+        ledger_row(RULE_LAND, "land", min(10)),
+        ledger_row(RULE_LAND_CHECK, "land check", min(2)),
+    ];
+    let (dir, path) = files("restart-check-awaited", &ledger, &[]);
+    let host = Arc::new(Faces::default());
+    let (lines, turns) = run(
+        vec![answered("land check", LANDED)],
+        "land",
+        Vec::new(),
+        &host,
+        Some(&path),
+        None,
+    );
+    let notes: Vec<String> = crate::supervise::journal::read_journal(
+        &crate::supervise::approvals::journal_beside(&path),
+    )
+    .expect("journal")
+    .0
+    .into_iter()
+    .map(|r| r.line)
+    .filter(|l| l.starts_with("DONE "))
+    .collect();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(turns, 0, "the check's LANDED: {lines:#?}");
+    assert_eq!(host.told(), [TaskFace::Open, TaskFace::Landed]);
+    assert_eq!(notes.len(), 1, "{notes:#?}");
+    assert!(
+        notes[0].contains(&format!("rule={RULE_LAND} ")),
+        "{notes:#?}"
+    );
+}
+
+/// A REST ON A NEED SURVIVES A LOOP THAT FOLLOWS (the post-landing review, 2026-11-01): a loop
+/// types Land's instruction, then the check at the defense, and rests on the check's answer, a
+/// need alone, typing nothing; a loop that follows on the same ledger and the same screen reads
+/// that point as the check's answer again and types nothing either. Negative control: the restarted
+/// loop's seeded point re-judged as a defense (13a's `rejudged`, `land_defended` alone) types
+/// `land-nudge@v1` into the agent that can only wait for the person.
+#[test]
+fn a_rest_on_a_need_survives_a_loop_that_follows() {
+    let need = "NEEDS YOU: rotate the deploy key in the dashboard";
+    let (dir, path) = files("rest-restarted", &[], &[]);
+    let host = Arc::new(Faces::default());
+    let screens = vec![
+        busy_screen(),
+        ended(PROGRESS),
+        busy_screen(),
+        ended(LANDING_REPLY),
+        busy_screen(),
+        ended(need),
+    ];
+    let (lines, turns) = run(screens, "land", vec![1, 3], &host, Some(&path), None);
+    assert_eq!(turns, 2, "the instruction, then the check: {lines:#?}");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains(&format!("rule={RULE_LAND_CHECK} "))),
+        "{lines:#?}"
+    );
+    let host = Arc::new(Faces::default());
+    let (after, turns) = run(
+        vec![ended(need)],
+        "land",
+        Vec::new(),
+        &host,
+        Some(&path),
+        None,
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(turns, 0, "the rest stands: {after:#?}");
+    assert!(
+        !after.iter().any(|l| l.contains("rule=land-")),
+        "nothing of Land's typed: {after:#?}"
+    );
+}
+
+/// AN OFF NO PERSON SET KEEPS LAND'S REST ON A NEED, AT THE LOOP (the second review,
+/// 2026-11-01): a loop rests on the check's answer, a need alone; `aterm ctl` then sets Off
+/// (`autopilot_by=ctl`), and the park keeps the rest (its row `OFF_STOOD_RESTING`); the loop the
+/// host starts as that Off lifts to Land, set by `aterm ctl` too, types nothing over the same
+/// screen and keeps the need up. The person's own lift to Land is their turn: Land's act.
+/// CONTROL: the person's own Off forgets the rest, and the lift, even by `aterm ctl`, types
+/// Land's act. Negative control: `park_off_held` leaving the land episode (the first round's
+/// park) writes `OFF_STOOD_HELD`, and the lift types `land@v1` into the rest.
+#[test]
+fn an_off_no_person_set_keeps_lands_rest_at_the_loop() {
+    use crate::supervise::approvals::{OFF_STOOD, OFF_STOOD_RESTING};
+    use crate::supervise::policy::land_check::WAITS_ON_YOU;
+    let need = "NEEDS YOU: rotate the deploy key in the dashboard";
+    let screens = || {
+        vec![
+            busy_screen(),
+            ended(PROGRESS),
+            busy_screen(),
+            ended(LANDING_REPLY),
+            busy_screen(),
+            ended(need),
+        ]
+    };
+    let rest_then_off = |tag: &str, by: &'static str| {
+        // A run with no Off rests on the need and counts the `meta` reads its waits make.
+        let (dry, dry_path) = files(&format!("{tag}-dry"), &[], &[]);
+        let (lines, turns, m) = run_kept(
+            screens(),
+            "land",
+            vec![1, 3],
+            &Arc::new(Faces::default()),
+            Some(&dry_path),
+            None,
+            |m| m.autopilot_by = Some(by),
+        );
+        let journal = journal_lines(&dry_path);
+        let _ = std::fs::remove_dir_all(&dry);
+        assert_eq!(
+            turns, 2,
+            "{tag}: the instruction, then the check: {lines:#?}"
+        );
+        assert!(
+            journal
+                .iter()
+                .any(|l| l.starts_with("WAITING ") && l.contains(WAITS_ON_YOU)),
+            "{tag}: the rest: {journal:#?}"
+        );
+        let metas = m.requests.iter().filter(|r| *r == "meta").count();
+        // The same run, Off set at its next-to-last `meta` read, inside the rest's waits.
+        let (dir, path) = files(tag, &[], &[]);
+        let (lines, turns) = run_on(
+            screens(),
+            "land",
+            vec![1, 3],
+            &Arc::new(Faces::default()),
+            Some(&path),
+            None,
+            |m| {
+                m.autopilot_by = Some(by);
+                m.autopilot_at = vec![(metas - 1, Some("off"))];
+            },
+        );
+        assert_eq!(turns, 2, "{tag}: {lines:#?}");
+        (dir, path)
+    };
+    let lands = |lines: &[String]| {
+        lines
+            .iter()
+            .any(|l| l.starts_with("CONTINUED ") && l.contains(&format!("rule={RULE_LAND} ")))
+    };
+    for (by, reason) in [("ctl", OFF_STOOD_RESTING), ("human:chip", OFF_STOOD)] {
+        let tag = format!("rest-off-{}", by.replace(':', "-"));
+        for lift in ["ctl", "human:chip"] {
+            let (dir, path) = rest_then_off(&format!("{tag}-{}", lift.replace(':', "-")), by);
+            let body = std::fs::read_to_string(&path).expect("ledger");
+            let off = body
+                .lines()
+                .rev()
+                .find(|l| l.contains("\"rule_id\":\"autopilot-off@v1\""))
+                .unwrap_or_else(|| panic!("{tag}: the Off's row: {body}"));
+            let off: aterm_json::Value = aterm_json::from_str(off).expect("the Off's row");
+            assert_eq!(
+                off.get("reason").and_then(aterm_json::Value::as_str),
+                Some(reason),
+                "{tag}"
+            );
+            let (_, turns, added, after, m) = after_off_on(&path, "land", vec![ended(need)], |m| {
+                m.autopilot_by = Some(lift);
+            });
+            let _ = std::fs::remove_dir_all(&dir);
+            let types = by.starts_with("human:") || lift.starts_with("human:");
+            assert_eq!(
+                (turns > 0, lands(&after)),
+                (types, types),
+                "{tag}, lifted by {lift}: {after:#?}\n{added:#?}"
+            );
+            if !types {
+                assert!(
+                    !m.requests
+                        .iter()
+                        .any(|r| r.starts_with("meta unset attention owner=needs")),
+                    "{tag}: the need stays up: {:#?}",
+                    m.requests
+                );
+            }
+        }
+    }
+}
+
+/// THE NEEDS ENTRY SAYS THE WORK WAITS ON YOU WHERE NOTHING CARRIES ON (the second review,
+/// 2026-11-01): where Land rests on the check's answer, a need alone, the menu bar's and the
+/// border's entry ends `— waits on you`; a need the defense said stands beside the check's
+/// `LANDED`, and the entry that said `— carrying on` while the check was out is told again with
+/// the same need, ending `— waits on you`. Negative control: the tail kept at carrying on
+/// (`Session::need_tail`) says the loop carries on beside a rest and a landing.
+#[test]
+fn the_needs_entry_says_the_work_waits_on_you_where_nothing_carries_on() {
+    use crate::harness::hold_said::NeedTail;
+    let need = "NEEDS YOU: rotate the deploy key in the dashboard";
+    let ends = |tail: NeedTail| format!(" \u{2014} {}", tail.words());
+    let entries = |m: &Mock| -> Vec<String> {
+        m.requests
+            .iter()
+            .filter(|r| r.starts_with("meta set attention owner=needs "))
+            .cloned()
+            .collect()
+    };
+    let kept = |tag: &str, last: Vec<Vec<String>>| {
+        let (dir, path) = files(tag, &[], &[]);
+        let mut screens = vec![busy_screen(), ended(PROGRESS), busy_screen()];
+        screens.extend(last);
+        let (lines, turns, m) = run_kept(
+            screens,
+            "land",
+            vec![1, 3],
+            &Arc::new(Faces::default()),
+            Some(&path),
+            None,
+            |_| {},
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            turns, 2,
+            "{tag}: the instruction, then the check: {lines:#?}"
+        );
+        entries(&m)
+    };
+    let told = kept(
+        "needs-tail-rest",
+        vec![ended(LANDING_REPLY), busy_screen(), ended(need)],
+    );
+    assert!(
+        !told.is_empty()
+            && told.iter().all(
+                |e| e.contains("needs you: rotate") && e.ends_with(&ends(NeedTail::WaitsOnYou))
+            ),
+        "the rest: {told:#?}"
+    );
+    let told = kept(
+        "needs-tail-landed",
+        vec![
+            ended(&format!("{LANDING_REPLY}\n{need}")),
+            busy_screen(),
+            ended(LANDED),
+        ],
+    );
+    assert!(
+        told.len() == 2
+            && told[0].ends_with(&ends(NeedTail::CarryingOn))
+            && told[1].ends_with(&ends(NeedTail::WaitsOnYou))
+            && told[1].contains("needs you: rotate"),
+        "the check out, then landed beside the need: {told:#?}"
+    );
+}
+
+/// A DEFENSE THE CHECK AUDITED STAYS AUDITED ACROSS A LOOP THAT FOLLOWS (the post-landing
+/// review, 2026-11-01): a loop types Land's instruction, the check at the defense, and the nudge
+/// quoting the list the check's answer gave; the agent says the same defense again after a short
+/// turn (no real work), and the loop judges that point, no second check owed, but ends before its
+/// act is written (a crash between the two: its last nudge cut from the books). A loop that
+/// follows on that ledger re-judges the point and types Land's nudge again, never the check, the
+/// check's books ridden on the point's row. Negative control: the books not seeded (`run.rs`'s
+/// `seed_land_books`) types the check a second time over that defense.
+#[test]
+fn a_defense_the_check_audited_is_not_checked_again_by_a_loop_that_follows() {
+    let list = "The docs PR is still open.";
+    let (dir, path) = files("books-restarted", &[], &[]);
+    let host = Arc::new(Faces::default());
+    let screens = vec![
+        busy_screen(),
+        ended(PROGRESS),
+        busy_screen(),
+        ended(LANDING_REPLY),
+        busy_screen(),
+        ended(list),
+        busy_screen(),
+        ended_after(LANDING_REPLY, "12s"),
+    ];
+    let (lines, _) = run(screens, "land", vec![1, 3, 5], &host, Some(&path), None);
+    let typed = |lines: &[String], rule: &str| {
+        lines
+            .iter()
+            .filter(|l| l.starts_with("CONTINUED ") && l.contains(&format!("rule={rule} ")))
+            .count()
+    };
+    assert_eq!(
+        (
+            typed(&lines, RULE_LAND_CHECK),
+            typed(&lines, RULE_LAND_NUDGE)
+        ),
+        (1, 2),
+        "one check, then the nudge at the list and at the defense said again: {lines:#?}"
+    );
+    let cut_last = |file: &Path, needle: &str| {
+        let body = std::fs::read_to_string(file).expect("books");
+        let mut rows: Vec<&str> = body.lines().collect();
+        let at = rows.iter().rposition(|l| l.contains(needle)).expect(needle);
+        rows.remove(at);
+        let body: String = rows.iter().map(|r| format!("{r}\n")).collect();
+        std::fs::write(file, body).expect("books");
+    };
+    cut_last(&path, &format!("\"rule_id\":\"{RULE_LAND_NUDGE}\""));
+    cut_last(
+        &crate::supervise::approvals::journal_beside(&path),
+        &format!("rule={RULE_LAND_NUDGE} "),
+    );
+    let host = Arc::new(Faces::default());
+    let (after, _) = run(
+        vec![ended_after(LANDING_REPLY, "12s")],
+        "land",
+        Vec::new(),
+        &host,
+        Some(&path),
+        None,
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        (
+            typed(&after, RULE_LAND_CHECK),
+            typed(&after, RULE_LAND_NUDGE)
+        ),
+        (0, 1),
+        "the defense stays audited: {after:#?}"
+    );
 }
 
 /// A restart whose first point shows the landing's own words, no turn run since, keeps the
@@ -1325,26 +1673,31 @@ fn landed_note(line: &str) -> bool {
     line.starts_with("DONE ") && line.contains(&format!(" rule={RULE_LAND} "))
 }
 
-/// The first loop of a landing under Land: progress, the land instruction, its done reply, then
-/// `then`, over the books at `ledger`, with a person's hand on the screens `hand`.
+/// The first loop of a landing under Land: progress, the land instruction, its done reply, the
+/// land check and its `LANDED`, then `then` (from screen 6), over the books at `ledger`, with a
+/// person's hand on the screens `hand`.
 fn land_first(
     ledger: &Path,
     then: Vec<Vec<String>>,
     hand: &[usize],
 ) -> (Vec<TaskFace>, usize, Vec<String>) {
     let host = Arc::new(Faces::default());
-    let mut screens = vec![
-        busy_screen(),
-        ended(PROGRESS),
-        busy_screen(),
-        ended(LANDING_REPLY),
-    ];
+    let mut screens = vec![busy_screen(), ended(PROGRESS), busy_screen()];
+    screens.extend(landing());
     screens.extend(then);
-    let (lines, turns) = run_on(screens, "land", vec![1], &host, Some(ledger), None, |m| {
-        for &i in hand {
-            m.human_on.insert(i, "0");
-        }
-    });
+    let (lines, turns) = run_on(
+        screens,
+        "land",
+        vec![1, 3],
+        &host,
+        Some(ledger),
+        None,
+        |m| {
+            for &i in hand {
+                m.human_on.insert(i, "0");
+            }
+        },
+    );
     (host.told(), turns, lines)
 }
 
@@ -1387,7 +1740,7 @@ const THEIR_LANDING_REPLY_REWRAPPED: &str =
 fn someone_elses_done_turn_after_a_landing_is_never_read_as_the_landing() {
     for (tag, hand) in [
         ("together-their-turn", &[][..]),
-        ("together-own-exchange", &[4, 5][..]),
+        ("together-own-exchange", &[6, 7][..]),
     ] {
         let (dir, ledger) = files(tag, &[], &[]);
         let (told, _, lines) = land_first(
@@ -1457,7 +1810,7 @@ fn a_done_turn_no_loop_watched_after_a_landing_is_no_landing() {
     for word in ["cruise", "land"] {
         let (dir, ledger) = files(&format!("unwatched-{word}"), &[], &[]);
         let (told, turns, lines) = land_first(&ledger, Vec::new(), &[]);
-        assert_eq!(turns, 1, "{lines:#?}");
+        assert_eq!(turns, 2, "{lines:#?}");
         assert_eq!(told, [TaskFace::Open, TaskFace::Landed], "{lines:#?}");
         let (told, _, added, lines) = after_off(&ledger, word, THEIR_LANDING_REPLY);
         let log = format!("{added:#?}\n{lines:#?}");
@@ -1484,11 +1837,26 @@ fn a_landing_ridden_through_an_update_cut_reads_landed_after_its_restart() {
         let cut = |i: usize| {
             let (dir, ledger) = files("update-cut", &[], &[]);
             let host = Arc::new(Faces::default());
-            let screens = vec![busy_screen(), ended(PROGRESS), busy_screen(), ended(reply)];
-            let (_, turns) = run_on(screens, "land", vec![1], &host, Some(&ledger), None, |m| {
-                m.by_index.insert(i, replaced(REPLACED_ANCHOR));
-                m.handoff_seq = Some(7);
-            });
+            let screens = vec![
+                busy_screen(),
+                ended(PROGRESS),
+                busy_screen(),
+                ended(reply),
+                busy_screen(),
+                ended(LANDED),
+            ];
+            let (_, turns) = run_on(
+                screens,
+                "land",
+                vec![1, 3],
+                &host,
+                Some(&ledger),
+                None,
+                |m| {
+                    m.by_index.insert(i, replaced(REPLACED_ANCHOR));
+                    m.handoff_seq = Some(7);
+                },
+            );
             let first = journal_lines(&ledger);
             let seq =
                 |l: &str| crate::supervise::journal::JournalRecord::of_line(0, None, l, None).seq;
@@ -1505,7 +1873,7 @@ fn a_landing_ridden_through_an_update_cut_reads_landed_after_its_restart() {
                         })
                     })
             });
-            if again && turns == 1 && host.told() == [TaskFace::Open, TaskFace::Landed] {
+            if again && turns == 2 && host.told() == [TaskFace::Open, TaskFace::Landed] {
                 Some((dir, ledger, first))
             } else {
                 let _ = std::fs::remove_dir_all(&dir);
@@ -1514,7 +1882,7 @@ fn a_landing_ridden_through_an_update_cut_reads_landed_after_its_restart() {
         };
         let cut = &cut;
         let mut handed: Vec<_> = std::thread::scope(|scope| {
-            let tries: Vec<_> = (4..40usize).map(|i| scope.spawn(move || cut(i))).collect();
+            let tries: Vec<_> = (4..56usize).map(|i| scope.spawn(move || cut(i))).collect();
             tries
                 .into_iter()
                 .filter_map(|t| t.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
@@ -1527,7 +1895,7 @@ fn a_landing_ridden_through_an_update_cut_reads_landed_after_its_restart() {
         let (dir, ledger, first) = handed
             .pop()
             .unwrap_or_else(|| panic!("{reply:?}: no cut handed the landing's point again"));
-        let (told, turns, added, lines) = after_off(&ledger, "land", reply);
+        let (told, turns, added, lines) = after_off(&ledger, "land", LANDED);
         let log = format!("{first:#?}\n{added:#?}\n{lines:#?}");
         assert_eq!(turns, 0, "{reply:?}: nothing typed into landed work: {log}");
         assert_eq!(told, [TaskFace::Landed], "{reply:?}: {log}");
@@ -1546,10 +1914,10 @@ fn a_plain_landing_restarted_after_off_still_reads_landed() {
     let (told, turns, lines) = land_first(&ledger, Vec::new(), &[]);
     let first = journal_lines(&ledger);
     let log = format!("{first:#?}\n{lines:#?}");
-    assert_eq!(turns, 1, "the land instruction alone: {log}");
+    assert_eq!(turns, 2, "the land instruction and its check: {log}");
     assert_eq!(told, [TaskFace::Open, TaskFace::Landed], "{log}");
     assert!(first.iter().any(|l| landed_note(l)), "{log}");
-    let (told, turns, added, lines) = after_off(&ledger, "land", LANDING_REPLY);
+    let (told, turns, added, lines) = after_off(&ledger, "land", LANDED);
     let log = format!("{added:#?}\n{lines:#?}");
     assert_eq!(turns, 0, "land: nothing typed: {log}");
     assert_eq!(told, [TaskFace::Landed], "land: {log}");
@@ -1666,7 +2034,7 @@ impl std::io::Write for ReaderGone {
 }
 
 /// The first loop of a task under Land, over the ledger and journal at `ledger`: the job's
-/// progress, Land's instruction, then `last`, its answer.
+/// progress, Land's instruction, then `last`, its answer, then the land check and its `LANDED`.
 fn ended_first(ledger: &Path, last: &str, take: bool) -> (Vec<TaskFace>, usize, Vec<String>) {
     ended_first_cut(ledger, last, if take { Cut::HostStep } else { Cut::No })
 }
@@ -1674,11 +2042,18 @@ fn ended_first(ledger: &Path, last: &str, take: bool) -> (Vec<TaskFace>, usize, 
 /// [`ended_first`], the loop cut at the task's end as `cut` says.
 fn ended_first_cut(ledger: &Path, last: &str, cut: Cut) -> (Vec<TaskFace>, usize, Vec<String>) {
     let word = "land";
-    let screens = vec![busy_screen(), ended(PROGRESS), busy_screen(), ended(last)];
-    let gates = vec![1];
+    let screens = vec![
+        busy_screen(),
+        ended(PROGRESS),
+        busy_screen(),
+        ended(last),
+        busy_screen(),
+        ended(LANDED),
+    ];
+    let gates = vec![1, 3];
     let take = cut == Cut::HostStep;
     let stop = Arc::new(AtomicBool::new(false));
-    let host = Arc::new(EndTaker::new(if take { 2 } else { usize::MAX }, &stop));
+    let host = Arc::new(EndTaker::new(if take { 3 } else { usize::MAX }, &stop));
     let mut m = Mock::new(screens);
     m.history_served();
     m.autopilot = Some(word);
@@ -1715,7 +2090,7 @@ fn ended_first_cut(ledger: &Path, last: &str, cut: Cut) -> (Vec<TaskFace>, usize
     };
     let lines = if cut == Cut::ReaderGone {
         let mut out = ReaderGone {
-            ok: 1,
+            ok: 2,
             gone: false,
             out: Vec::new(),
         };
@@ -1768,7 +2143,7 @@ fn follow_landing(ledger: &Path, tag: &str, follower: &'static str, lifted: bool
     });
     let before = journal_lines(ledger).len();
     let (lines, turns) = run(
-        vec![ended(LANDING_REPLY)],
+        vec![ended(LANDED)],
         follower,
         Vec::new(),
         &host,
@@ -1810,7 +2185,7 @@ fn a_tasks_end_the_hosts_step_took_is_noted_and_its_follower_types_nothing() {
             let (told, turns, lines) = ended_first(&ledger, LANDING_REPLY, take);
             let first = journal_lines(&ledger);
             let log = format!("{tag}: {first:#?}\n{lines:#?}");
-            assert_eq!(turns, 1, "the land instruction alone: {log}");
+            assert_eq!(turns, 2, "the land instruction and its check: {log}");
             assert_eq!(told, [TaskFace::Open, TaskFace::Landed], "{log}");
             let end = first
                 .iter()
@@ -1845,7 +2220,7 @@ fn a_tasks_end_is_noted_when_its_point_line_or_its_publish_fails() {
             let (told, turns, lines) = ended_first_cut(&ledger, LANDING_REPLY, cut);
             let first = journal_lines(&ledger);
             let log = format!("{tag}: {first:#?}\n{lines:#?}");
-            assert_eq!(turns, 1, "the land instruction alone: {log}");
+            assert_eq!(turns, 2, "the land instruction and its check: {log}");
             assert_eq!(told, [TaskFace::Open, TaskFace::Landed], "{log}");
             let end = first
                 .iter()
@@ -1872,8 +2247,11 @@ fn a_tasks_end_is_noted_when_its_point_line_or_its_publish_fails() {
 #[test]
 fn a_persons_turn_after_a_landing_that_leaves_the_task_open_seeds_open() {
     let (dir, ledger) = files("open-own-exchange", &[], &[]);
-    let (told, turns, lines) = land_first(&ledger, vec![busy_screen(), ended(PROGRESS)], &[4, 5]);
-    assert_eq!(turns, 2, "the land instruction, then its nudge: {lines:#?}");
+    let (told, turns, lines) = land_first(&ledger, vec![busy_screen(), ended(PROGRESS)], &[6, 7]);
+    assert_eq!(
+        turns, 3,
+        "the land instruction, its check, then its nudge: {lines:#?}"
+    );
     assert!(
         lines.iter().any(
             |l| l.starts_with("CONTINUED ") && l.contains(&format!(" rule={RULE_LAND_NUDGE} "))
@@ -2209,6 +2587,11 @@ fn a_landing_the_memory_banner_cut_is_carried_on_after_its_restart() {
     use aterm_phase::prompt::fixtures::{MEMORY_BANNER_IDLE, screen};
     let done = "All done. Nothing left to do.";
     let restarted = |tag: &str, landing: Vec<Vec<String>>, after: &str| {
+        let gates = if landing.is_empty() {
+            vec![1]
+        } else {
+            vec![1, 3]
+        };
         let mut screens = vec![busy_screen(), ended(done), busy_screen()];
         screens.extend(landing);
         screens.extend(std::iter::repeat_n(screen(MEMORY_BANNER_IDLE), 3));
@@ -2219,7 +2602,7 @@ fn a_landing_the_memory_banner_cut_is_carried_on_after_its_restart() {
         let mut m = Mock::new(screens);
         m.history_served();
         m.autopilot = Some("land");
-        m.turn_gates = vec![1];
+        m.turn_gates = gates;
         m.vanish_after = Some(30);
         m.cursor_on_caret = true;
         m.stall_sleep = Some(Duration::from_millis(20));
@@ -2280,11 +2663,8 @@ fn a_landing_the_memory_banner_cut_is_carried_on_after_its_restart() {
         !notes.iter().any(|l| l.contains("rule=land-nudge@v1")),
         "no land nudge in the carry-on's place: {log}"
     );
-    let (points, restarts, notes, lines) = restarted(
-        "carry-landed-then-banner",
-        vec![ended(LANDING_REPLY)],
-        LANDING_REPLY,
-    );
+    let (points, restarts, notes, lines) =
+        restarted("carry-landed-then-banner", landing().to_vec(), LANDED);
     let log = format!("{notes:#?}\n{lines:#?}");
     assert!(
         restarts.iter().any(|w| w == "memory"),
@@ -2315,7 +2695,7 @@ fn a_landing_the_memory_banner_cut_is_carried_on_after_its_restart() {
 fn a_cruise_loop_over_a_landings_books_tells_no_landing() {
     let (dir, ledger) = files("cruise-over-landing", &[], &[]);
     let (told, turns, lines) = ended_first(&ledger, LANDING_REPLY, false);
-    assert_eq!(turns, 1, "{lines:#?}");
+    assert_eq!(turns, 2, "{lines:#?}");
     assert_eq!(told, [TaskFace::Open, TaskFace::Landed], "{lines:#?}");
     let at = note_time(&ledger, RULE_LAND);
     for lifted in [false, true] {
@@ -2350,7 +2730,7 @@ fn a_cruise_loop_over_a_landings_books_tells_no_landing() {
     let at_land = note_time(&ledger, RULE_LAND);
     let host = Arc::new(Faces::default());
     let (lines, turns) = run(
-        vec![ended(LANDING_REPLY)],
+        vec![ended(LANDED)],
         "land",
         Vec::new(),
         &host,
@@ -2544,23 +2924,19 @@ fn a_restart_after_a_kept_wake_keeps_the_landing() {
             finished: Some(true),
             ..Faces::default()
         });
-        let mut screens = vec![
-            busy_screen(),
-            ended(PROGRESS),
-            busy_screen(),
-            ended(LANDING_REPLY),
-        ];
+        let mut screens = vec![busy_screen(), ended(PROGRESS), busy_screen()];
+        screens.extend(landing());
         if with_wake {
             screens.extend([busy_screen(), ended(wake)]);
         }
-        let (lines, turns) = run(screens, "land", vec![1], &host, Some(&ledger), None);
-        assert_eq!(turns, 1, "{lines:#?}");
+        let (lines, turns) = run(screens, "land", vec![1, 3], &host, Some(&ledger), None);
+        assert_eq!(turns, 2, "{lines:#?}");
         assert_eq!(
             host.told(),
             [TaskFace::Open, TaskFace::Landed],
             "{lines:#?}"
         );
-        let last = if with_wake { wake } else { LANDING_REPLY };
+        let last = if with_wake { wake } else { LANDED };
         for again in 0..2 {
             let (turns, told, lines) = restart(&ledger, last);
             assert_eq!(
@@ -2611,21 +2987,23 @@ fn a_switch_to_cruise_on_the_landed_screen_is_read_at_the_wakes_end() {
             finished: Some(true),
             ..Faces::default()
         });
-        let screens = vec![
-            busy_screen(),
-            ended(PROGRESS),
-            busy_screen(),
-            ended(LANDING_REPLY),
-            busy_screen(),
-            ended(wake),
-            ended(wake),
-        ];
-        let (lines, turns) = run_on(screens, "land", vec![1], &host, Some(&ledger), None, |m| {
-            if switch {
-                m.autopilot_on.insert(3, Some("cruise"));
-            }
-            m.vanish_after = Some(12);
-        });
+        let mut screens = vec![busy_screen(), ended(PROGRESS), busy_screen()];
+        screens.extend(landing());
+        screens.extend([busy_screen(), ended(wake), ended(wake)]);
+        let (lines, turns) = run_on(
+            screens,
+            "land",
+            vec![1, 3],
+            &host,
+            Some(&ledger),
+            None,
+            |m| {
+                if switch {
+                    m.autopilot_on.insert(6, Some("cruise"));
+                }
+                m.vanish_after = Some(12);
+            },
+        );
         let _ = std::fs::remove_dir_all(&dir);
         let typed: Vec<String> = lines
             .iter()
@@ -2635,7 +3013,7 @@ fn a_switch_to_cruise_on_the_landed_screen_is_read_at_the_wakes_end() {
         (turns, host.told(), typed, lines)
     };
     let (turns, told, typed, lines) = go(true);
-    assert_eq!(turns, 2, "{lines:#?}");
+    assert_eq!(turns, 3, "{lines:#?}");
     assert_eq!(
         told,
         [TaskFace::Open, TaskFace::Landed, TaskFace::Open],
@@ -2648,9 +3026,9 @@ fn a_switch_to_cruise_on_the_landed_screen_is_read_at_the_wakes_end() {
         "{typed:#?}"
     );
     let (turns, told, typed, lines) = go(false);
-    assert_eq!(turns, 1, "{lines:#?}");
+    assert_eq!(turns, 2, "{lines:#?}");
     assert_eq!(told, [TaskFace::Open, TaskFace::Landed], "{lines:#?}");
-    assert_eq!(typed.len(), 1, "{typed:#?}");
+    assert_eq!(typed.len(), 2, "{typed:#?}");
 }
 
 /// What a client says where nothing serves the control socket yet, as a seamless update's
@@ -2675,10 +3053,10 @@ fn a_landing_whose_successors_first_meta_is_unserved_still_reads_landed() {
     for lose in [false, true] {
         let (dir, ledger) = files(&format!("unserved-meta-{lose}"), &[], &[]);
         let (told, turns, _) = land_first(&ledger, Vec::new(), &[]);
-        assert_eq!(turns, 1, "lose={lose}: the land instruction alone");
+        assert_eq!(turns, 2, "lose={lose}: the land instruction and its check");
         assert_eq!(told, [TaskFace::Open, TaskFace::Landed], "lose={lose}");
         let (told, turns, added, lines, m) =
-            after_off_on(&ledger, "land", vec![ended(LANDING_REPLY)], |m| {
+            after_off_on(&ledger, "land", vec![ended(LANDED)], |m| {
                 if lose {
                     m.verb_replies
                         .insert("meta", VecDeque::from([failed(1, UNSERVED)]));
@@ -2802,11 +3180,11 @@ fn an_off_landing_whose_first_meta_is_lost_reads_as_if_it_were_served() {
         let (told, turns, _) = land_first(&ledger, Vec::new(), &[]);
         assert_eq!(
             (told.as_slice(), turns),
-            ([TaskFace::Open, TaskFace::Landed].as_slice(), 1)
+            ([TaskFace::Open, TaskFace::Landed].as_slice(), 2)
         );
         let (told, lines, turns, metas, added) = restart_over_landing(
             &ledger,
-            vec![ended(LANDING_REPLY)],
+            vec![ended(LANDED)],
             "off",
             Autopilot::Cruise,
             false,
@@ -2843,11 +3221,11 @@ fn a_restart_whose_first_meta_is_lost_tells_the_face_its_served_start_tells() {
                 let (told, turns, _) = land_first(&ledger, Vec::new(), &[]);
                 assert_eq!(
                     (told.as_slice(), turns),
-                    ([TaskFace::Open, TaskFace::Landed].as_slice(), 1)
+                    ([TaskFace::Open, TaskFace::Landed].as_slice(), 2)
                 );
                 let (told, lines, _, metas, _) = restart_over_landing(
                     &ledger,
-                    vec![ended(LANDING_REPLY)],
+                    vec![ended(LANDED)],
                     word,
                     table,
                     lifted,

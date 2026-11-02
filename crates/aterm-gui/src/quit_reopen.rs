@@ -84,7 +84,8 @@ fn parse_reopen_args(args: &[OsString]) -> Option<(u32, PathBuf)> {
         return None;
     };
     let pid = pid
-        .to_str()?
+        .to_str()
+        .filter(|s| s.bytes().all(|b| b.is_ascii_digit()))?
         .parse::<i32>()
         .ok()
         .filter(|pid| *pid > 1)

@@ -173,7 +173,7 @@ pub use observe::{
     WatchId, WatcherSet, WatcherSpec, first_matching_row,
 };
 pub use processing::{ClockReading, KittyAnimationStep};
-pub use render_cells::{RenderCell, Script, UnderlineStyle};
+pub use render_cells::{ECHO_MIN_CONTRAST, RenderCell, Script, UnderlineStyle};
 pub use resize_journal::{RESIZE_JOURNAL_CAP, RenderDebt, ResizeReport};
 pub use search_budgeted::{BudgetedSearchError, BudgetedSearchStep};
 pub use search_index::SearchDiscard;

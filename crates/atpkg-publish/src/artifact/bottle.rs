@@ -385,10 +385,17 @@ fn collect_donor_libs(donor_roots: &[PathBuf]) -> Result<BTreeMap<String, PathBu
 }
 
 fn relink_group(primary: &Path, aliases: &[PathBuf]) -> Result<()> {
+    let primary_key = std::fs::symlink_metadata(primary)
+        .ok()
+        .and_then(|m| inode_key(&m));
     for alias in aliases {
-        std::fs::remove_file(alias)
-            .map_err(|e| Error::io(format!("rm alias {}", alias.display()), &e))?;
-        std::fs::hard_link(primary, alias)
+        let alias_key = std::fs::symlink_metadata(alias)
+            .ok()
+            .and_then(|m| inode_key(&m));
+        if primary_key.is_some() && primary_key == alias_key {
+            continue;
+        }
+        super::relink::replace(primary, alias)
             .map_err(|e| Error::io(format!("relink {}", alias.display()), &e))?;
     }
     Ok(())
@@ -951,17 +958,23 @@ pub fn parse_args(ctx: &Ctx, args: &[String]) -> Result<BottleRequest> {
             "--archive" => archive = Some(PathBuf::from(value()?)),
             "--version" => version = Some(value()?),
             "--build" => {
+                let v = value()?;
                 build = Some(
-                    value()?
-                        .parse::<Build>()
-                        .map_err(|_| Error::usage("--build takes a decimal build number"))?,
+                    (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                        .then(|| v.parse::<Build>().ok())
+                        .flatten()
+                        .ok_or_else(|| Error::usage("--build takes a decimal build number"))?,
                 );
             }
             "--triple" => triple = Some(Triple::parse(&value()?)?),
             "--strip-components" => {
-                strip_components = value()?
-                    .parse::<u32>()
-                    .map_err(|_| Error::usage("--strip-components takes a non-negative integer"))?;
+                let v = value()?;
+                strip_components = (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                    .then(|| v.parse::<u32>().ok())
+                    .flatten()
+                    .ok_or_else(|| {
+                        Error::usage("--strip-components takes a non-negative integer")
+                    })?;
             }
             "--dep-bottle" => dep_bottles.push(PathBuf::from(value()?)),
             "--donor-root" => donor_roots.push(PathBuf::from(value()?)),
@@ -1580,6 +1593,33 @@ mod tests {
         assert!(
             check_stage_tree(&bad_stage, AARCH64_APPLE_DARWIN, &["gh"], &bad_backend).is_err(),
             "leftover @@HOMEBREW_*@@ load command on native object must fail closed"
+        );
+
+        let primary = bad_stage.join("bin/primary");
+        let alias = bad_stage.join("bin/alias");
+        std::fs::write(&primary, b"v2").expect("write primary");
+        std::fs::write(&alias, b"v1").expect("write alias");
+        relink_group(&primary, std::slice::from_ref(&alias)).expect("relink distinct inode");
+        assert_eq!(std::fs::read(&alias).expect("read alias"), b"v2");
+        relink_group(&primary, std::slice::from_ref(&alias)).expect("relink same inode no-op");
+        assert_eq!(std::fs::read(&alias).expect("read alias again"), b"v2");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relinking_never_consumes_a_hidden_primary_as_scratch() {
+        super::super::relink_tests::preserves_payload(
+            super::super::relink_tests::Collision::Primary,
+            |_, primary, aliases| relink_group(primary, aliases).map_err(|error| error.to_string()),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relinking_preserves_an_unrelated_occupied_legacy_name() {
+        super::super::relink_tests::preserves_payload(
+            super::super::relink_tests::Collision::Payload,
+            |_, primary, aliases| relink_group(primary, aliases).map_err(|error| error.to_string()),
         );
     }
 }

@@ -257,6 +257,7 @@ fn generation_is_durable_and_bad_or_legacy_encodings_cannot_wrap_it() {
         .as_object_mut()
         .unwrap();
     work.remove("renewal_generation");
+    work.remove("last_success_generation");
     assert!(Logins::from_json(&aterm_json::to_string(&legacy).unwrap(), NOW).is_err());
     legacy
         .as_object_mut()

@@ -28,9 +28,10 @@ pub const RULE_BACKGROUND: &str = "continue-background@v1";
 pub const BACKGROUND_CARRY: &str = concat!(
     harness_mark!(),
     " Autopilot is Cruise: your turn ended while your own background work runs. Check on that \
-     work, then keep going with everything else in hand; never wait idle for it. Put what only \
-     a person can give on a line starting NEEDS YOU: and carry on. A go-ahead for your own \
-     reversible work is never a NEEDS YOU item."
+     work, then keep going with everything else in hand; never wait idle for it. Make the next \
+     safe decision, record it for later review, and carry on. Defer unavailable work with its \
+     reason and advance another task; do not turn routine failures into requests to the person. ",
+    super::go_ahead::never_a_need!()
 );
 
 /// [`BACKGROUND_CARRY`] with the policy's standing `rules`, fitted as every line the turn-end
@@ -38,6 +39,11 @@ pub const BACKGROUND_CARRY: &str = concat!(
 #[must_use]
 pub fn carry_words(rules: Option<&str>) -> String {
     super::turn_end::act_words(BACKGROUND_CARRY, &[], rules)
+}
+
+/// The forward-recovery instruction fitted to the same limits as a normal carry.
+pub(crate) fn recovery_words(rules: Option<&str>) -> String {
+    super::turn_end::act_words(super::turn_end::FORWARD_RECOVERY, &[], rules)
 }
 
 /// CRUISE'S CARRIES AT BACKGROUND BREAKS ([`RULE_BACKGROUND`]): when the last went and how many in a
@@ -59,8 +65,19 @@ impl BackgroundCarries {
     /// back to it, is no work of any turn.
     #[must_use]
     pub fn due(&self, timing: &TurnEndTiming, began: Instant) -> Instant {
+        self.due_within(timing, began, Duration::MAX)
+    }
+
+    /// [`Self::due`] with the back-off at most `cap`: the owner's standing go-ahead in the
+    /// carry's place waits no longer from the last carry than a point's waits from the last act
+    /// ([`super::turn_end::GO_AHEAD_WAIT`]).
+    #[must_use]
+    pub fn due_within(&self, timing: &TurnEndTiming, began: Instant, cap: Duration) -> Instant {
         self.last.map_or(began, |last| {
-            let wait = timing.short_wait_at(self.streak).unwrap_or(Duration::ZERO);
+            let wait = timing
+                .short_wait_at(self.streak)
+                .unwrap_or(Duration::ZERO)
+                .min(cap);
             last.checked_add(wait).unwrap_or(last)
         })
     }

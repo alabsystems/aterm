@@ -6,6 +6,7 @@
 # queued submit on Default Light's colours, and the colours switched to Default's 150 ms after the
 # Return, inside main's melt (and Phase 4's 0.40 s afterimage).
 
+scale 2
 grid 24 100
 style rainbow kitty
 hz 60

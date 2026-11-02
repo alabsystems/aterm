@@ -185,7 +185,9 @@ pub(super) fn parse_admin(plain: &SecretBytes) -> crate::Result<AdminText> {
 fn unsupported(magic: &str) -> Error {
     let number = |text: &str| {
         text.strip_prefix("alab-vault-admin/")
-            .filter(|number| (1..=6).contains(&number.len()))
+            .filter(|number| {
+                (1..=6).contains(&number.len()) && number.bytes().all(|b| b.is_ascii_digit())
+            })
             .and_then(|number| number.parse::<u32>().ok())
     };
     match (number(magic), number(MAGIC)) {

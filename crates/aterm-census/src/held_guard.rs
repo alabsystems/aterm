@@ -73,11 +73,7 @@ pub(crate) fn scan_tree(root: &Path) -> Result<HeldGuardScan, String> {
     for file in &files {
         let text = crate::tree::read_to_string(file)
             .map_err(|e| format!("cannot read {}: {e}", file.display()))?;
-        let rel = file
-            .strip_prefix(root)
-            .unwrap_or(file)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let rel = crate::rel_path(root, file);
         let (hits, acquires) = scan_source(&text);
         scan.acquires += acquires;
         let raw: Vec<&str> = text.lines().collect();

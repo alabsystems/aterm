@@ -308,7 +308,7 @@ pub fn of_store_binary(exe: &Path) -> ShimEnv {
 }
 
 /// The `store/<program>/<build>` directory nearest above `exe` ([`of_store_binary`]).
-fn store_build_of(exe: &Path) -> Option<PathBuf> {
+pub(crate) fn store_build_of(exe: &Path) -> Option<PathBuf> {
     let plain = exe.components().all(|c| {
         matches!(
             c,

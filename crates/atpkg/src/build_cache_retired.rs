@@ -332,11 +332,7 @@ fn listed(git: &dyn Git, checkout: &Path, wt: &Path) -> Result<Option<Listed>, S
 /// The bytes of `gitfile`, a worktree's `.git`, while it is a file as git writes one (a line
 /// naming its entry): `None` for a folder, a link, a file too long to be one, or none.
 fn gitfile_text(gitfile: &Path) -> Option<Vec<u8>> {
-    let meta = std::fs::symlink_metadata(gitfile).ok()?;
-    if !meta.is_file() || meta.len() > 4096 {
-        return None;
-    }
-    std::fs::read(gitfile).ok()
+    crate::metadata_io::read_bounded_regular(gitfile, 4096).ok()
 }
 
 /// The worktree entry of `checkout`, `<checkout>/.git/worktrees/<id>`, that `text`, the tree
@@ -613,11 +609,13 @@ fn in_main(git: &dyn Git, checkout: &Path, head: &str) -> Result<String, String>
 /// Whether a process holds the gate's machine lock in `dir`: `Some(true)` held, `Some(false)` free
 /// or no lock file, `None` unreadable.
 fn lock_held(dir: &Path) -> Option<bool> {
-    let file = match std::fs::File::open(dir.join("lock")) {
+    let file = match crate::metadata_io::open_regular(&dir.join("lock")) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(false),
         Err(_) => return None,
     };
+    #[cfg(unix)]
+    let _ = aterm_uds::keep_out_of_children(&file);
     #[expect(
         clippy::disallowed_methods,
         reason = "a probe of the retired gate's lock: let go at once below"
@@ -786,9 +784,13 @@ fn remove_snapshot(
     }
     let took = super::remove::tree(&gitfile);
     if !took.whole() {
+        let why = super::remove::named(&gitfile, 1)
+            .first
+            .first()
+            .map_or(super::remove::Why::StillRefusing, |(_, why)| *why);
         let kept = super::remove::Named {
             count: took.stayed,
-            first: vec![PathBuf::from(".git")],
+            first: vec![(PathBuf::from(".git"), why)],
         };
         return Err(format!(
             "{}, so nothing else of it was touched",

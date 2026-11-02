@@ -136,14 +136,24 @@ pub(crate) fn text_args(rest: &str) -> Result<TextArgs, String> {
             return usage();
         }
         args.shape = if let Some(n) = tok.strip_prefix("tail=") {
-            match n.parse::<usize>() {
-                Ok(n) if n > 0 => TextShape::Tail(n),
+            match (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| n.parse::<usize>().ok())
+                .flatten()
+            {
+                Some(n) if n > 0 => TextShape::Tail(n),
                 _ => return usage(),
             }
         } else if let Some(span) = tok.strip_prefix("rows=") {
             let Some((a, b)) = span.split_once('-') else {
                 return usage();
             };
+            if a.is_empty()
+                || b.is_empty()
+                || !a.bytes().all(|b| b.is_ascii_digit())
+                || !b.bytes().all(|b| b.is_ascii_digit())
+            {
+                return usage();
+            }
             let (Ok(a), Ok(b)) = (a.parse::<usize>(), b.parse::<usize>()) else {
                 return usage();
             };
@@ -173,6 +183,9 @@ pub(crate) fn split_trim_tail(rest: &str) -> (&str, bool) {
 /// `blocktext <id> [trim]`.
 pub(crate) fn cmd_blocktext_args(rest: &str, emit: impl FnOnce(u64, bool) -> String) -> String {
     let (id, trim) = split_trim_tail(rest);
+    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+        return "ERR usage: blocktext <id> [trim]\n".to_string();
+    }
     let Ok(id) = id.parse::<u64>() else {
         return "ERR usage: blocktext <id> [trim]\n".to_string();
     };
@@ -323,12 +336,20 @@ pub(crate) fn cmd_cell(term: &Arc<Mutex<Terminal>>, rest: &str) -> String {
         return "ERR usage: cell <r> <c> | cell abs=<n> <c>\n".to_string();
     };
     let abs = match rs.strip_prefix("abs=") {
-        Some(n) => match n.parse::<u64>() {
-            Ok(n) => Some(n),
-            Err(_) => return "ERR bad args\n".to_string(),
-        },
+        Some(n) => {
+            match (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| n.parse::<u64>().ok())
+                .flatten()
+            {
+                Some(n) => Some(n),
+                None => return "ERR bad args\n".to_string(),
+            }
+        }
         None => None,
     };
+    if cs.is_empty() || !cs.bytes().all(|b| b.is_ascii_digit()) {
+        return "ERR bad args\n".to_string();
+    }
     let Ok(c) = cs.parse::<usize>() else {
         return "ERR bad args\n".to_string();
     };
@@ -352,10 +373,15 @@ pub(crate) fn cmd_cell(term: &Arc<Mutex<Terminal>>, rest: &str) -> String {
             AbsRowAt::Evicted => return "ERR evicted\n".to_string(),
             AbsRowAt::OutOfRange => return "ERR out of range\n".to_string(),
         },
-        None => match rs.parse::<usize>() {
-            Ok(r) => CellRow::Screen(r),
-            Err(_) => return "ERR bad args\n".to_string(),
-        },
+        None => {
+            match (!rs.is_empty() && rs.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| rs.parse::<usize>().ok())
+                .flatten()
+            {
+                Some(r) => CellRow::Screen(r),
+                None => return "ERR bad args\n".to_string(),
+            }
+        }
     };
     if c >= t.cols() as usize || matches!(at, CellRow::Screen(r) if r >= t.rows() as usize) {
         return out_of_range();
@@ -837,7 +863,11 @@ fn format_offscreen_reply(
 /// `line <n>` -> `OK <text>\n` for the line at MONOTONIC ABSOLUTE row `n`, or `ERR out of range\n` / `ERR evicted\n` / `ERR unreadable\n`.
 /// A live row is read in a whole frame ([`term_lock_whole_when`]) with no word for one still unfinished; a history row at once.
 pub(crate) fn cmd_line(term: &Arc<Mutex<Terminal>>, rest: &str) -> String {
-    let Ok(n) = rest.trim().parse::<u64>() else {
+    let trimmed = rest.trim();
+    if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        return "ERR usage: line <abs_row>\n".to_string();
+    }
+    let Ok(n) = trimmed.parse::<u64>() else {
         return "ERR usage: line <abs_row>\n".to_string();
     };
     let live = |t: &Terminal| n >= screen_first_abs(t);
@@ -1360,16 +1390,46 @@ pub(crate) fn cmd_appstatus(proxy: &EventLoopProxy<Wake>) -> String {
     }
 }
 
-/// `appnotice <toolchain|update|harness> <text>` -> `OK recorded`.
+/// Observe native focus without an input request, activation or key-event post.
+pub(crate) fn cmd_native_focus(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
+    native_focus_with(rest, || {
+        control_media::call_main(proxy, |reply| Wake::NativeFocus { reply })
+            .map_err(|error| error.to_string())
+    })
+}
+
+fn native_focus_with(
+    rest: &str,
+    read: impl FnOnce() -> Result<(Option<crate::platform::NativeFocus>, u64), String>,
+) -> String {
+    if !rest.trim().is_empty() {
+        return "ERR usage: native-focus\n".to_string();
+    }
+    match read() {
+        Ok((Some(focus), posted)) => format!(
+            "OK available=1 window={} app_active={} window_key={} key={} posted_keys={posted}\n",
+            focus.window,
+            u8::from(focus.app_active),
+            u8::from(focus.window_key),
+            u8::from(focus.app_active && focus.window_key),
+        ),
+        Ok((None, posted)) => format!(
+            "OK available=0 window=0 app_active=- window_key=- key=- posted_keys={posted}\n"
+        ),
+        Err(error) => format!("ERR {error}\n"),
+    }
+}
+
+/// `appnotice <toolchain|update|harness|proc> <text>` -> `OK recorded`.
 pub(crate) fn cmd_appnotice(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
-    const USAGE: &str = "ERR usage: appnotice <toolchain|update|harness> <text>\n";
+    const USAGE: &str = "ERR usage: appnotice <toolchain|update|harness|proc> <text>\n";
     const MAX_TEXT_BYTES: usize = 512;
     let t = rest.trim();
     let Some((lane, text)) = t.split_once(char::is_whitespace) else {
         return USAGE.to_string();
     };
     let text = text.trim();
-    if !matches!(lane, "toolchain" | "update" | "harness") || text.is_empty() {
+    if !matches!(lane, "toolchain" | "update" | "harness" | "proc") || text.is_empty() {
         return USAGE.to_string();
     }
     if text.len() > MAX_TEXT_BYTES {
@@ -1545,7 +1605,10 @@ pub(crate) fn serve_ask_walk(
         Ok(posted) => posted,
         Err(error) => return format!("ERR {error}\n"),
     };
-    let deadline = std::time::Instant::now() + within;
+    let now = std::time::Instant::now();
+    let deadline = now
+        .checked_add(within)
+        .unwrap_or_else(|| now + std::time::Duration::from_secs(365 * 24 * 3600));
     let gave_up = match control_media::park_for_answer(&answer, deadline, hung_up, park) {
         Waited::Answer(started) => return started.reply(),
         Waited::Dropped => return "ERR main-thread reply dropped\n".to_owned(),
@@ -1653,11 +1716,12 @@ pub(crate) fn cmd_text_json_looked(
     let person = || {
         let human_seq = ctx.human_input.seq();
         let now_us = crate::metrics::now_us();
-        (
-            ctx.human_input.ms_since(now_us),
-            ctx.human_input.unkeyed_ms(now_us),
+        PersonStamps {
+            human_ms: ctx.human_input.ms_since(now_us),
+            unkeyed_ms: ctx.human_input.unkeyed_ms(now_us),
             human_seq,
-        )
+            typed_ms: ctx.human_input.typed_ms_since(now_us),
+        }
     };
     cmd_text_json_read(
         term,
@@ -1669,8 +1733,34 @@ pub(crate) fn cmd_text_json_looked(
     )
 }
 
-/// The person's stamps a `text --json` read carries: `human_ms`, `unkeyed_ms` and `human_seq`.
-pub(crate) type PersonStamps = (Option<u64>, Option<u64>, u64);
+/// The person's stamps a `text --json` read carries: `human_ms`, `unkeyed_ms`, `human_seq` and
+/// `human_typed_ms`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PersonStamps {
+    /// The last gesture's age ([`crate::human_input::HumanInputStamp::ms_since`]).
+    pub(crate) human_ms: Option<u64>,
+    /// How long the session was served with no gesture
+    /// ([`crate::human_input::HumanInputStamp::unkeyed_ms`]).
+    pub(crate) unkeyed_ms: Option<u64>,
+    /// The gestures counted ([`crate::human_input::HumanInputStamp::seq`]).
+    pub(crate) human_seq: u64,
+    /// The last typing's age ([`crate::human_input::HumanInputStamp::typed_ms_since`]), written
+    /// only where it differs from `human_ms`.
+    pub(crate) typed_ms: Option<u64>,
+}
+
+impl From<(Option<u64>, Option<u64>, u64)> for PersonStamps {
+    /// `human_ms`, `unkeyed_ms` and `human_seq`, the last gesture typing, so the read writes no
+    /// `human_typed_ms` of its own.
+    fn from((human_ms, unkeyed_ms, human_seq): (Option<u64>, Option<u64>, u64)) -> Self {
+        Self {
+            human_ms,
+            unkeyed_ms,
+            human_seq,
+            typed_ms: human_ms,
+        }
+    }
+}
 
 #[cfg(test)]
 thread_local! {
@@ -1682,16 +1772,16 @@ thread_local! {
 /// than the frame read; before the rows, so a gesture they miss moves `human_seq` past an `if-human=` fence.
 /// `"title"` is read in that same hold, so the title and the rows are one snapshot (a separate `title` read takes
 /// its own lock and can fall on either side of a frame).
-pub(crate) fn cmd_text_json_read(
+pub(crate) fn cmd_text_json_read<P: Into<PersonStamps>>(
     term: &Arc<Mutex<Terminal>>,
     frame: &FrameSlot,
     args: TextArgs,
-    person: impl FnOnce() -> PersonStamps,
+    person: impl FnOnce() -> P,
     launch: Option<&crate::launch_witness::LaunchWitness>,
     input: Option<(&crate::app_input::OutputEchoTracker, &SinkWriter)>,
 ) -> String {
     let mut look = frame.look_frame();
-    let ((human_ms, unkeyed_ms, human_seq), inputs_before);
+    let (person_stamps, inputs_before): (PersonStamps, _);
     let (
         text,
         display_rows,
@@ -1710,7 +1800,8 @@ pub(crate) fn cmd_text_json_read(
         frame_open,
     ) = {
         let t = term_lock_whole(term);
-        (human_ms, unkeyed_ms, human_seq) = person();
+        person_stamps = person().into();
+        let human_seq = person_stamps.human_seq;
         inputs_before = input.map(|(tracker, sink)| tracker.input_settled(sink));
         #[cfg(test)]
         WHILE_ROWS_READ.with(|hook| {
@@ -1748,6 +1839,12 @@ pub(crate) fn cmd_text_json_read(
             t.frame_unfinished_at(std::time::Instant::now()),
         )
     };
+    let PersonStamps {
+        human_ms,
+        unkeyed_ms,
+        human_seq,
+        typed_ms,
+    } = person_stamps;
     let inputs_after = input.map(|(tracker, _)| tracker.input_sent());
     let submits = input.map(|(tracker, _)| tracker.submits());
     let rows_text: Vec<&str> = match &text {
@@ -1814,6 +1911,11 @@ pub(crate) fn cmd_text_json_read(
         }
         if let (None, Some(ms)) = (human_ms, unkeyed_ms) {
             let _ = write!(out, ",\"unkeyed_ms\":{ms}");
+        }
+        // The person's typing, where it is not their last gesture: absent, `human_ms` says it.
+        if typed_ms != human_ms {
+            let typed = typed_ms.map_or_else(|| "null".to_string(), |ms| ms.to_string());
+            let _ = write!(out, ",\"human_typed_ms\":{typed}");
         }
         if let (Some(before), Some(after)) = (inputs_before, inputs_after) {
             let before = before.map_or_else(|| "null".to_string(), |n| n.to_string());
@@ -2739,6 +2841,42 @@ mod tests {
     };
     use crate::session_waits::{RewrapGauge, RewrapReading};
     use crate::term_lock;
+
+    #[test]
+    fn native_focus_keeps_unavailable_and_inactive_windows_unready() {
+        use crate::platform::NativeFocus;
+
+        for (focus, ready) in [
+            (None, "-"),
+            (Some((false, true)), "0"),
+            (Some((true, false)), "0"),
+            (Some((true, true)), "1"),
+        ] {
+            let observed = focus.map(|(app_active, window_key)| NativeFocus {
+                window: 42,
+                app_active,
+                window_key,
+            });
+            let reply = super::native_focus_with("", || Ok((observed, 17)));
+            let fields: std::collections::BTreeMap<_, _> = reply
+                .split_whitespace()
+                .filter_map(|word| word.split_once('='))
+                .collect();
+            assert_eq!(fields["key"], ready);
+            assert_eq!(fields["available"], if focus.is_some() { "1" } else { "0" });
+            assert_eq!(fields["posted_keys"], "17", "only observes the counter");
+        }
+        for bad in ["x", "count=0", "unread=ok", "probe"] {
+            assert_eq!(
+                super::native_focus_with(bad, || panic!("bad syntax reached the native query")),
+                "ERR usage: native-focus\n"
+            );
+        }
+        assert_eq!(
+            super::native_focus_with("", || Err("event loop closed".into())),
+            "ERR event loop closed\n"
+        );
+    }
 
     fn place(t: &mut Terminal, row: u16, col: u16, id: u8, tag: u8) {
         t.process(format!("\x1b[{row};{col}H").as_bytes());
@@ -4979,6 +5117,33 @@ mod trim_tests {
             None,
         );
         assert!(!keyed.contains("unkeyed_ms"), "{keyed}");
+        // The person's typing rides apart where it is not their last gesture (a scroll since),
+        // and stays out where it is.
+        let typed = |typed_ms| {
+            super::cmd_text_json_read(
+                &term,
+                &crate::frame_memo::FrameSlot::default(),
+                TextArgs::default(),
+                || super::PersonStamps {
+                    human_ms: Some(7),
+                    unkeyed_ms: None,
+                    human_seq: 9,
+                    typed_ms,
+                },
+                None,
+                None,
+            )
+        };
+        let scrolled = typed(Some(7_200_000));
+        assert!(
+            scrolled.ends_with(",\"human_typed_ms\":7200000}\n"),
+            "{scrolled}"
+        );
+        assert!(
+            typed(None).ends_with(",\"human_typed_ms\":null}\n"),
+            "never typed"
+        );
+        assert!(!typed(Some(7)).contains("human_typed_ms"), "the same stamp");
     }
 
     #[test]

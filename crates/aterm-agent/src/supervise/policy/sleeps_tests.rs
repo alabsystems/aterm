@@ -109,7 +109,7 @@ fn a_boot_is_its_bytes_however_a_row_spelled_it() {
 #[test]
 fn this_hosts_boot_is_written_as_its_kernel_spells_it() {
     let kernel_text = if cfg!(target_vendor = "apple") {
-        let mut sysctl = aterm_uds::spawnfd::command("/usr/sbin/sysctl");
+        let mut sysctl = aterm_uds::spawnfd::command(crate::test_program::kept("/usr/sbin/sysctl"));
         sysctl.args(["-n", "kern.bootsessionuuid"]);
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         let out = aterm_uds::deadline::output_until(&mut sysctl, deadline).expect("sysctl");

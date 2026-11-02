@@ -49,7 +49,10 @@ fn killpg(pgid: u32, sig: i32) {
     let Ok(pgid) = libc::pid_t::try_from(pgid) else {
         return;
     };
-    // SAFETY: killpg takes two integers and touches no memory of this process.
+    if pgid <= 1 {
+        return;
+    }
+    // SAFETY: killpg takes two integers (`pgid > 1`) and touches no memory of this process.
     unsafe { libc::killpg(pgid, sig) };
 }
 

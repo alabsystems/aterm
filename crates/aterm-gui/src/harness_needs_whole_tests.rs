@@ -755,3 +755,298 @@ fn the_stamped_hover_follows_a_codex_alabs_set_under_one_entry() {
         "CONTROL: the standing set told again"
     );
 }
+
+/// The go-ahead's line (DESIGN-harness-autopilot §15.6): it parks the agent's own reversible work
+/// on a person's go-ahead.
+const GO_AHEAD_LINE: &str = "NEEDS YOU: say \"rerun the checks\" so I can push my branch to main.";
+const SIGN_IN: &str = "sign agy and Muse in on this Mac (browser OAuth)";
+const HOSTING: &str = "decide on public hosting of the fleet document";
+
+/// A tab whose agent the window's own hosted loop carries under Cruise: the loop's claim on it,
+/// the `owner=needs` entry it sets on the session's meta, and the `turn` that types its answer,
+/// which the agent takes (its screen goes busy).
+struct Carried {
+    term: Arc<Mutex<aterm_core::terminal::Terminal>>,
+    ctx: Arc<crate::SessionCtx>,
+    /// The holder the loop's `meta set supervisor` claimed the tab for.
+    supervisor: Option<String>,
+}
+
+impl aterm_agent::supervise::run::Ctl for Carried {
+    fn call(&mut self, args: &[&str]) -> Result<aterm_agent::supervise::run::CtlReply, String> {
+        let words: Vec<&str> = args
+            .iter()
+            .copied()
+            .filter(|a| !a.starts_with('@'))
+            .collect();
+        let reply = |stdout: &str| aterm_agent::supervise::run::CtlReply {
+            code: 0,
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+        };
+        let seq = || self.term.lock().unwrap().content_seq();
+        Ok(match words.as_slice() {
+            ["meta"] => reply(&format!(
+                "OK title=- user_title=- description=- icon=- role=- attention=- cwd=- \
+                 state=alive attention_owner=- attention_owners=0 supervisor={} \
+                 autopilot=cruise agent_cwd=-\n",
+                self.supervisor.as_deref().unwrap_or("-")
+            )),
+            ["meta", "set", "supervisor", holder, ..] => {
+                self.supervisor = Some((*holder).to_string());
+                reply("OK\n")
+            }
+            ["meta", "set", "attention", owner, kind, text]
+                if *owner == format!("owner={NEEDS_ATTENTION_OWNER}") =>
+            {
+                assert_eq!(*kind, "kind=ask");
+                self.ctx
+                    .meta
+                    .lock()
+                    .unwrap()
+                    .set_attention_kind(
+                        NEEDS_ATTENTION_OWNER,
+                        Some((*text).to_string()),
+                        Some(AttentionKind::Ask),
+                    )
+                    .expect("a slot");
+                reply("OK\n")
+            }
+            ["meta", "unset", "attention", owner]
+                if *owner == format!("owner={NEEDS_ATTENTION_OWNER}") =>
+            {
+                self.ctx
+                    .meta
+                    .lock()
+                    .unwrap()
+                    .set_attention_kind(NEEDS_ATTENTION_OWNER, None, None)
+                    .expect("a slot");
+                reply("OK\n")
+            }
+            ["text", "--json", rest @ ..] => {
+                let args = crate::control::text_args(&rest.join(" "))?;
+                reply(&crate::control::cmd_text_json_looked(
+                    &self.term, &self.ctx, args,
+                ))
+            }
+            ["status"] => reply(&format!(
+                "OK schema=1 sid=- phase=running hold=0 fabric=connected program=claude agent=- \
+                 seq={} hand=-\n",
+                seq()
+            )),
+            ["await", "seq", ..] => {
+                std::thread::sleep(Duration::from_millis(5));
+                aterm_agent::supervise::run::CtlReply {
+                    code: 124,
+                    stdout: "OK timeout\n".to_string(),
+                    stderr: String::new(),
+                }
+            }
+            ["turn", ..] => {
+                let cols = usize::from(self.term.lock().unwrap().cols());
+                self.term.lock().unwrap().process(&working_screen(cols));
+                reply(&format!("OK turn submitted=1 pressed=1 seq={}\n", seq()))
+            }
+            _ => reply("OK\n"),
+        })
+    }
+}
+
+/// The agent at work on the answer it took.
+fn working_screen(cols: usize) -> Vec<u8> {
+    let rule = "─".repeat(cols);
+    let rows = [
+        "⏺ Rerunning the checks on my branch.".to_string(),
+        String::new(),
+        "✻ Synthesizing… (18s · esc to interrupt)".to_string(),
+        String::new(),
+        rule.clone(),
+        "❯ ".to_string(),
+        rule,
+        "  esc to interrupt".to_string(),
+    ];
+    format!("\x1b[2J\x1b[H{}\x1b[6;3H", rows.join("\r\n")).into_bytes()
+}
+
+/// What the window showed of a tab its hosted loop carries ([`carried_over`]).
+struct Seen {
+    /// The loop decided the owner's standing go-ahead, typed or waiting out its own back-off.
+    acted: bool,
+    journal: Vec<String>,
+    /// The menu bar's `Needs you` rows, the tab's hover, its `status` and the whole menu.
+    rows: Vec<String>,
+    hover: Vec<String>,
+    status: String,
+    menu: Vec<String>,
+}
+
+/// The window's hosted loop carrying session 0 of a fresh window under Cruise and `cfg` over a
+/// turn that ended on `said`: what the window shows once the loop decided the point (a point the
+/// loop attaches to waits out the go-ahead's back-off, in real time), with the facts and the entry
+/// it told applied, before the loop ends and takes its entry down.
+fn carried_over(said: &str, cfg: SupervisorConfig, tag: &str) -> Seen {
+    let mut app = App::headless_for_test();
+    let app = &mut app;
+    use std::sync::mpsc;
+    let entry = app.pool.get(0).unwrap();
+    let (term, ctx) = (entry.term.clone(), entry.ctx.clone());
+    let sid = ctx.self_id.as_str().to_string();
+    {
+        let mut tl = ctx.timeline.lock().unwrap();
+        tl.note_foreground_group(7);
+        tl.set_program(7, Some("claude".into()));
+    }
+    ctx.meta
+        .lock()
+        .unwrap()
+        .set("autopilot", Some("cruise".into()));
+    let cols = usize::from(term.lock().unwrap().cols());
+    term.lock()
+        .unwrap()
+        .process(&super::landed_restart_tests::ended_screen(said, cols));
+    let dir = std::env::temp_dir().join(format!(
+        "aterm-go-ahead-bar-{tag}-{}-{}",
+        std::process::id(),
+        aterm_agent::supervise::journal::unix_ms()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let ledger = dir.join(format!("{sid}.jsonl"));
+    let journal = aterm_agent::supervise::approvals::journal_beside(&ledger);
+    let (lane_term, lane_ctx) = (term, ctx);
+    let body: Arc<BodyFn> = Arc::new(move |job: &WorkerJob| {
+        let mut lane = Carried {
+            term: Arc::clone(&lane_term),
+            ctx: Arc::clone(&lane_ctx),
+            supervisor: None,
+        };
+        let opts = SuperviseOpts {
+            ledger: Some(ledger.clone()),
+            journal: Some(aterm_agent::supervise::approvals::journal_beside(&ledger)),
+            ..job.opts.clone()
+        };
+        let mut session =
+            aterm_agent::supervise::run::Session::new(&mut lane, Some(format!("@{}", job.sid)));
+        session.set_supervisor_name(Some(holder()));
+        session.set_handover(Arc::clone(&job.handover));
+        let mut out: Vec<u8> = Vec::new();
+        match session.run_hosted(&opts, Arc::clone(&job.stop), &mut out) {
+            Ok(()) => BodyEnd::Stopped,
+            Err(e) => BodyEnd::Failed(e),
+        }
+    });
+    let world = Arc::new(World::default());
+    world.set(&[(sid.as_str(), Program::Claude)]);
+    world.word(&sid, Some(Autopilot::Cruise));
+    let (tx, facts) = mpsc::channel();
+    let tx = Mutex::new(tx);
+    let mut h = hooks(&world, body);
+    let mine = sid.clone();
+    h.fact = Arc::new(move |sid, fact| {
+        if sid == mine {
+            let _ = tx.lock().unwrap().send(fact);
+        }
+    });
+    h.needs = store_hooks(&app.store).needs;
+    app.refresh_presence_session(0);
+    let host = HostHandle::start(cfg, false, false, h);
+    let mut lines = Vec::new();
+    let acted = aterm_spec::wait::within(
+        aterm_spec::wait::MUST_HAPPEN,
+        Duration::from_millis(5),
+        || {
+            lines = aterm_agent::supervise::journal::read_journal(&journal)
+                .map(|(records, _)| records.into_iter().map(|r| r.line).collect::<Vec<_>>())
+                .unwrap_or_default();
+            lines
+                .iter()
+                .find(|l| {
+                    l.starts_with("CONTINUED ")
+                        || l.starts_with("ESCALATED ")
+                        || (l.starts_with("WAITING ") && l.ends_with(" back-off"))
+                })
+                .map(|l| l.contains(" rule=go-ahead@v1 ") || l.starts_with("WAITING "))
+        },
+    );
+    for fact in facts.try_iter() {
+        app.apply_harness_fact(&sid, fact);
+    }
+    app.on_meta_changed(0);
+    app.refresh_presence_session(0);
+    let seen = Seen {
+        acted: acted.unwrap_or_else(|| panic!("not within 60 s: the loop's act: {lines:#?}")),
+        rows: needs_lines(app),
+        hover: hover(app),
+        status: app.session_status_record(0).expect("status"),
+        menu: app.status_item_chrome_lines(),
+        journal: lines,
+    };
+    host.shutdown_and_join();
+    let _ = std::fs::remove_dir_all(&dir);
+    seen
+}
+
+/// A GO-AHEAD THE HARNESS ANSWERS NEVER REACHES THE MENU BAR (DESIGN-harness-autopilot §15.6): the
+/// window's own hosted loop carries a Claude Code tab under Cruise whose report parks on the
+/// go-ahead beside a sign-in and a hosting decision. It decides the owner's standing go-ahead
+/// (and waits out its back-off, as at any point it attaches to), and the menu bar's rows, the
+/// tab's hover and `status` name the person's two needs and never the go-ahead's line. With the go-ahead's line alone nothing is on the menu bar. NEGATIVE CONTROL:
+/// with answers off the go-ahead is not typed and the menu bar names all three.
+#[test]
+fn a_go_ahead_the_harness_answers_never_reaches_the_menu_bar() {
+    let beside = format!(
+        "Committed the parser fix on my branch.\n{GO_AHEAD_LINE}\nNEEDS YOU: {SIGN_IN}.\nNEEDS \
+         YOU: {HOSTING}."
+    );
+    let seen = carried_over(&beside, on(), "beside");
+    let journal = &seen.journal;
+    assert!(seen.acted, "the go-ahead: {journal:#?}");
+    for (what, text) in [
+        ("rows", seen.rows.join("\n")),
+        ("hover", seen.hover.join("\n")),
+    ] {
+        assert!(
+            text.contains(SIGN_IN) && text.contains(HOSTING),
+            "{what}: {text}\n{journal:#?}"
+        );
+        assert!(
+            !text.contains("rerun the checks"),
+            "{what}: {text}\n{journal:#?}"
+        );
+    }
+    assert!(
+        seen.status.contains(" needs=ask needs_n=2"),
+        "{}\n{journal:#?}",
+        seen.status
+    );
+
+    let alone = format!("Committed the parser fix on my branch.\n{GO_AHEAD_LINE}");
+    let seen = carried_over(&alone, on(), "alone");
+    let journal = &seen.journal;
+    assert!(seen.acted, "the go-ahead: {journal:#?}");
+    assert!(
+        !seen.menu.iter().any(|l| l.contains("\"Needs you (")),
+        "{:#?}\n{journal:#?}",
+        seen.menu
+    );
+    assert!(
+        seen.status.contains(" needs=- needs_n=-"),
+        "{}\n{journal:#?}",
+        seen.status
+    );
+
+    let mut answers_off = on();
+    answers_off.set("answer_questions", "false").unwrap();
+    let seen = carried_over(&beside, answers_off, "answers-off");
+    let journal = &seen.journal;
+    assert!(!seen.acted, "no go-ahead with answers off: {journal:#?}");
+    let rows = seen.rows.join("\n");
+    assert!(
+        rows.contains("rerun the checks"),
+        "NEGATIVE CONTROL: {rows}\n{journal:#?}"
+    );
+    assert!(
+        seen.status.contains(" needs=ask needs_n=3"),
+        "{}\n{journal:#?}",
+        seen.status
+    );
+}

@@ -71,11 +71,17 @@ pub struct Paths {
 
 /// Resolve `$HOME/<rel>`.
 pub fn home_path(rel: &str) -> Result<String, String> {
-    let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
-    let mut p = home;
-    p.push('/');
-    p.push_str(rel);
-    Ok(p)
+    let home = std::env::var("HOME").ok();
+    home_path_from(home.as_deref(), rel)
+}
+
+/// Resolve `<home>/<rel>`, refusing unset, empty, or `/` `HOME` values and trimming trailing `/`.
+pub fn home_path_from(home: Option<&str>, rel: &str) -> Result<String, String> {
+    let base = home
+        .map(|h| h.trim_end_matches('/'))
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| "HOME is not set".to_string())?;
+    Ok(concat(&[base, "/", rel]))
 }
 
 /// Find `crates/aterm-update-core/src/pins.rs` by walking up from the current directory.
@@ -88,7 +94,7 @@ pub fn discover_pins_path() -> Result<String, String> {
 fn discover_pins_path_from(mut dir: std::path::PathBuf) -> Result<String, String> {
     for _ in 0..24 {
         let candidate = dir.join(PINS_REL);
-        if candidate.is_file() {
+        if std::fs::symlink_metadata(&candidate).is_ok_and(|m| m.is_file()) {
             return candidate.to_str().map(str::to_string).ok_or_else(|| {
                 "the path to pins.rs is not valid UTF-8; pass --pins explicitly".to_string()
             });
@@ -165,8 +171,18 @@ pub fn load_roster(
 ) -> Result<(Roster, Option<RosterSnapshot>), String> {
     refuse_pending_roster_transaction(path)?;
     let sig_path = concat(&[path, ".sig"]);
-    if std::fs::metadata(path).is_err() {
-        if std::fs::metadata(&sig_path).is_ok() {
+    let body_absent = match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Ok(_) => false,
+        Err(e) => return Err(concat(&["inspect ", path, ": ", &e.to_string()])),
+    };
+    if body_absent {
+        let sig_absent = match std::fs::symlink_metadata(&sig_path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Ok(_) => false,
+            Err(e) => return Err(concat(&["inspect ", &sig_path, ": ", &e.to_string()])),
+        };
+        if !sig_absent {
             return Err(concat(&[
                 sig_path.as_str(),
                 " exists but ",
@@ -646,13 +662,14 @@ pub fn lock_roster(path: &str) -> Result<RosterLock, String> {
 
 /// Acquire an existing roster lock without creating or repairing files.
 pub fn lock_roster_read_only(path: &str) -> Result<RosterLock, String> {
-    use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 
     let lock_path = concat(&[path, ".lock"]);
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(false)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(&lock_path)
         .map_err(|e| {
             concat(&[
@@ -670,6 +687,13 @@ pub fn lock_roster_read_only(path: &str) -> Result<RosterLock, String> {
             &e.to_string(),
         ])
     })?;
+    if !opened.is_file() {
+        return Err(concat(&[
+            "open existing roster lock ",
+            &lock_path,
+            " without creating it: not a regular file",
+        ]));
+    }
     let guard = aterm_update_core::FileLock::lock_open(file)
         .map_err(|e| concat(&["lock roster ", path, ": ", &e.to_string()]))?;
     #[cfg(test)]
@@ -683,7 +707,7 @@ pub fn lock_roster_read_only(path: &str) -> Result<RosterLock, String> {
             &e.to_string(),
         ])
     })?;
-    if opened.dev() != current.dev() || opened.ino() != current.ino() {
+    if !current.is_file() || opened.dev() != current.dev() || opened.ino() != current.ino() {
         return Err(concat(&[
             "the roster lock ",
             &lock_path,
@@ -821,7 +845,7 @@ pub fn preflight(verb: Verb, id: &str, paths: &Paths) -> Result<Preflight, Strin
                         .to_string(),
                 );
             }
-            if std::fs::metadata(&paths.roster).is_ok() {
+            if std::fs::symlink_metadata(&paths.roster).is_ok() {
                 return Err(concat(&[
                     "a roster already exists at ",
                     &paths.roster,
@@ -842,7 +866,7 @@ pub fn preflight(verb: Verb, id: &str, paths: &Paths) -> Result<Preflight, Strin
                      there.",
                 ]));
             }
-            if std::fs::metadata(&paths.roster).is_err() {
+            if !std::fs::symlink_metadata(&paths.roster).is_ok_and(|m| m.is_file()) {
                 return Err(concat(&[
                     "no roster at ",
                     &paths.roster,
@@ -870,7 +894,7 @@ pub fn preflight(verb: Verb, id: &str, paths: &Paths) -> Result<Preflight, Strin
         })?;
     }
 
-    if std::fs::metadata(&paths.key).is_ok() {
+    if std::fs::symlink_metadata(&paths.key).is_ok() {
         return Err(concat(&[
             &paths.key,
             " already exists. This machine already has a key — minting a second one under \
@@ -940,6 +964,12 @@ impl std::fmt::Debug for Planned {
         f.write_str(", ")?;
         f.write_str(&self.id)?;
         f.write_str(", secret=<redacted>)")
+    }
+}
+
+impl Drop for Planned {
+    fn drop(&mut self) {
+        crate::master::scrub(&mut self.machine_pkcs8);
     }
 }
 
@@ -1168,7 +1198,7 @@ impl std::fmt::Debug for Report {
 }
 
 /// Write the machine files and publish the signed roster pair.
-pub fn write_rest(planned: Planned) -> Result<Report, String> {
+pub fn write_rest(mut planned: Planned) -> Result<Report, String> {
     let armed = planned.pins_text.is_some();
     let pins = &planned.paths.pins;
     let start_over = concat(&[
@@ -1293,15 +1323,21 @@ pub fn write_rest(planned: Planned) -> Result<Report, String> {
 
     Ok(Report {
         verb: planned.verb,
-        id: planned.id,
-        paths: planned.paths,
-        master_pubkey: planned.master_pubkey,
-        master_fingerprint: planned.master_fingerprint,
-        master_after: planned.master_after,
-        machine_pubkey: planned.machine_pubkey,
+        id: std::mem::take(&mut planned.id),
+        paths: Paths {
+            pins: std::mem::take(&mut planned.paths.pins),
+            roster: std::mem::take(&mut planned.paths.roster),
+            key: std::mem::take(&mut planned.paths.key),
+            machine_pub: std::mem::take(&mut planned.paths.machine_pub),
+            pins_explicit: planned.paths.pins_explicit,
+        },
+        master_pubkey: std::mem::take(&mut planned.master_pubkey),
+        master_fingerprint: std::mem::take(&mut planned.master_fingerprint),
+        master_after: std::mem::take(&mut planned.master_after),
+        machine_pubkey: std::mem::take(&mut planned.machine_pubkey),
         roster_seq: planned.roster_seq,
-        roster_valid_until: planned.roster_valid_until,
-        roster_machines: planned.roster_machines,
+        roster_valid_until: std::mem::take(&mut planned.roster_valid_until),
+        roster_machines: std::mem::take(&mut planned.roster_machines),
         roster_was_fresh: planned.roster_was_fresh,
         pins_changed: planned.pins_text.is_some(),
     })
@@ -1575,6 +1611,14 @@ mod tests {
             "a refused join creates nothing"
         );
         assert!(!std::path::Path::new(&second.key).exists());
+
+        std::os::unix::fs::symlink(&paths.roster, &second.roster).unwrap();
+        let err = preflight(Verb::Join, "m11", &second).unwrap_err();
+        assert!(
+            err.contains("no roster at"),
+            "a symlinked roster is refused at preflight: {err}"
+        );
+        std::fs::remove_file(&second.roster).unwrap();
 
         std::fs::copy(&paths.roster, &second.roster).unwrap();
         std::fs::copy(
@@ -1896,6 +1940,22 @@ mod tests {
             !std::path::Path::new(&lock_path).exists(),
             "an observer left no rendezvous file behind"
         );
+
+        let lock_target = dir.join("lock-target");
+        std::fs::write(&lock_target, b"").unwrap();
+        std::os::unix::fs::symlink(&lock_target, &lock_path).unwrap();
+        let err = lock_roster_read_only(roster)
+            .err()
+            .expect("a symlink at .lock is refused");
+        assert!(err.contains("without creating it"), "{err}");
+        std::fs::remove_file(&lock_path).unwrap();
+
+        std::fs::create_dir(&lock_path).unwrap();
+        let err = lock_roster_read_only(roster)
+            .err()
+            .expect("a directory at .lock is refused");
+        assert!(err.contains("without creating it"), "{err}");
+        std::fs::remove_dir(&lock_path).unwrap();
 
         std::fs::write(roster, b"old body").unwrap();
         std::fs::write(&sig_path, b"old sig").unwrap();
@@ -2384,6 +2444,12 @@ mod tests {
             err.contains("never overwrite a key the roster still names"),
             "{err}"
         );
+
+        let mut dangling = paths.clone();
+        dangling.key = dir.join("dangling.key").to_str().unwrap().to_string();
+        std::os::unix::fs::symlink(dir.join("absent.key"), &dangling.key).unwrap();
+        let err = preflight(Verb::Join, "m4", &dangling).unwrap_err();
+        assert!(err.contains("already exists"), "{err}");
     }
 
     #[test]
@@ -2396,9 +2462,19 @@ mod tests {
         assert!(err.contains("roster already exists"), "{err}");
 
         std::fs::remove_file(&paths.roster).unwrap();
+        std::os::unix::fs::symlink(dir.join("absent.toml"), &paths.roster).unwrap();
+        let err = preflight(Verb::Setup, "m3", &paths).unwrap_err();
+        assert!(err.contains("roster already exists"), "{err}");
+        std::fs::remove_file(&paths.roster).unwrap();
+
         std::fs::write(concat(&[&paths.roster, ".sig"]), b"sig").unwrap();
         let master = seed_of(PAPER).pubkey_b64().unwrap();
         let expect = RosterExpectation::MayCreateFresh;
+        assert!(load_roster(&paths.roster, &master, NOW, expect).is_err());
+
+        std::fs::remove_file(concat(&[&paths.roster, ".sig"])).unwrap();
+        std::os::unix::fs::symlink(dir.join("absent.sig"), concat(&[&paths.roster, ".sig"]))
+            .unwrap();
         assert!(load_roster(&paths.roster, &master, NOW, expect).is_err());
     }
 
@@ -2427,6 +2503,17 @@ mod tests {
         assert_eq!(
             std::fs::canonicalize(found).unwrap(),
             std::fs::canonicalize(shipped).unwrap()
+        );
+
+        let dir = scratch("discover-pins-symlink");
+        let fake_pins = dir.join(PINS_REL);
+        std::fs::create_dir_all(fake_pins.parent().unwrap()).unwrap();
+        let target = dir.join("real-pins.rs");
+        std::fs::write(&target, PINS_FIXTURE).unwrap();
+        std::os::unix::fs::symlink(&target, &fake_pins).unwrap();
+        assert!(
+            discover_pins_path_from(dir.to_path_buf()).is_err(),
+            "a symlinked pins.rs is not auto-discovered"
         );
     }
 
@@ -2564,6 +2651,34 @@ mod tests {
         assert!(
             checked >= 4,
             "the run must have written pins.rs, the roster, its .sig and the key; saw {checked}"
+        );
+    }
+
+    #[test]
+    fn home_path_from_rejects_unset_empty_or_root_only_home_and_trims_trailing_slashes() {
+        assert_eq!(
+            home_path_from(None, ".aterm/release-ring/m3.key"),
+            Err("HOME is not set".to_string())
+        );
+        assert_eq!(
+            home_path_from(Some(""), ".aterm/release-ring/m3.key"),
+            Err("HOME is not set".to_string())
+        );
+        assert_eq!(
+            home_path_from(Some("/"), ".aterm/release-ring/m3.key"),
+            Err("HOME is not set".to_string())
+        );
+        assert_eq!(
+            home_path_from(Some("///"), ".aterm/release-ring/m3.key"),
+            Err("HOME is not set".to_string())
+        );
+        assert_eq!(
+            home_path_from(Some("/Users//owner"), ".aterm/release-ring/m3.key"),
+            Ok("/Users//owner/.aterm/release-ring/m3.key".to_string())
+        );
+        assert_eq!(
+            home_path_from(Some("/Users//owner/"), ".aterm/release-ring/m3.key"),
+            Ok("/Users//owner/.aterm/release-ring/m3.key".to_string())
         );
     }
 }

@@ -4,6 +4,9 @@
 // Derived from winit 0.30.13 src/platform_impl/windows/monitor.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
+// Modified by Andrew Yates for the aterm project in 2026; see the repository NOTICE.
+// Update BOOL/handle bindings and retain shared monitor handles with windows-sys 0.61.
+
 use std::collections::VecDeque;
 use std::hash::Hash;
 use std::{io, mem, ptr};
@@ -22,6 +25,11 @@ use crate::platform_impl::platform::window::Window;
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, PartialOrd, Ord)]
 pub struct MonitorHandle(HMONITOR);
+
+// Send is not implemented for HMONITOR, we have to wrap it and implement it manually.
+// For more info see:
+// https://github.com/retep998/winapi-rs/issues/360
+// https://github.com/retep998/winapi-rs/issues/396
 
 unsafe impl Send for MonitorHandle {}
 unsafe impl Sync for MonitorHandle {}

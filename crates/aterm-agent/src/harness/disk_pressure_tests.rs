@@ -86,6 +86,7 @@ fn real(now: i64) -> impl FnMut(&Row) -> std::io::Result<Removed> {
             device: None,
             volume: None,
         },
+        None,
         idle::Sessions::default,
     )
 }
@@ -522,6 +523,7 @@ fn with_a_zero_day_window_a_profile_built_minutes_ago_is_still_never_taken() {
                 device: None,
                 volume: None,
             },
+            None,
             idle::Sessions::default,
         ),
         &mut || Some(GIB),

@@ -47,6 +47,10 @@ aterm-lexicon = { workspace = true }
 aterm-ctl = { path = "../aterm-ctl" }
 # Offline `messages.log` reader for `aterm exceptions` and `aterm doctor`.
 aterm-messages = { workspace = true }
+# `aterm doctor`'s `awake:` row: whether aCaffiene's mug holds macOS's idle-sleep assertion
+# (`held::held`, which reads the power manager's assertions in-process on macOS, the rows
+# `pmset -g assertions` prints, and nothing elsewhere).
+aterm-acaffiene = { workspace = true }
 # `aterm_uds::spawnfd::command` child-process builder, and the unprivileged read of macOS's
 # own services' footprints (`services`) that `aterm doctor`'s `services:` row reports.
 aterm-uds = { workspace = true }
@@ -85,6 +89,7 @@ aterm-machines = { workspace = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 aterm-secrets = { workspace = true }
 aterm-digest = { workspace = true }
+aterm-codec = { workspace = true }
 # The setup run's ledger stamps each stage's begin with this boot (`kern.bootsessionuuid`):
 # astream's reader, which aterm-durable and aterm-link already link into this binary.
 astream-sys = { path = "../../vendor/astream/crates/astream-sys" }
@@ -104,7 +109,7 @@ aterm-time = { workspace = true }
 # zsh, no font) ends COULD NOT RUN, never a silent pass; and
 # `wait::past_text_busy`: the shim tests exec files they just wrote while sibling
 # test threads fork (Linux's ETXTBSY); and `fs_lane::join`: the doctor's lock and
-# record tests run three at a time, not on every libtest thread at once.
+# record tests run `fs_lane::PLACES` at a time, not on every libtest thread at once.
 aterm-spec = { workspace = true }
 # The setup ledger's model, which its conformance test holds the ledger to.
 aterm-models-setup = { workspace = true }

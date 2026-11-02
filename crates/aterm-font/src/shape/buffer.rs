@@ -132,7 +132,12 @@ pub(crate) struct Buffer {
     serial: u8,
     pub(crate) scratch_flags: u32,
     max_len: usize,
+    /// HarfBuzz's `max_ops`, as upstream spends it: transitions of the AAT state machines
+    /// (`kerx.rs`, `kerning.rs`).
     pub(crate) max_ops: i32,
+    /// The `GSUB`/`GPOS` work budget (`apply::Budget`), scaled by the input length like
+    /// `max_ops` but per unit of matching work.
+    pub(crate) max_layout_ops: i64,
 }
 
 impl Buffer {
@@ -142,6 +147,13 @@ impl Buffer {
     const MAX_OPS_FACTOR: i32 = 1024;
     const MAX_OPS_MIN: i32 = 16384;
     const MAX_OPS_DEFAULT: i32 = 0x1FFF_FFFF;
+    /// `GSUB`/`GPOS` work units per input character. HarfBuzz's 1024 counts nested lookups;
+    /// this counts every rule and glyph a lookup tries, of which the costliest text measured
+    /// on the system fonts (DecoType Nastaleeq Urdu, a letter and a mark alternating,
+    /// 2026-10-30) spends 5.6k per character and ordinary text at most 2.2k.
+    const MAX_LAYOUT_OPS_FACTOR: i64 = 16 * 1024;
+    const MAX_LAYOUT_OPS_MIN: i64 = 16 * Self::MAX_LAYOUT_OPS_FACTOR;
+    const MAX_LAYOUT_OPS_DEFAULT: i64 = 0x1FFF_FFFF;
 
     #[inline]
     pub(crate) fn new() -> Self {
@@ -163,6 +175,7 @@ impl Buffer {
             scratch_flags: 0,
             max_len: Self::MAX_LEN_DEFAULT,
             max_ops: Self::MAX_OPS_DEFAULT,
+            max_layout_ops: Self::MAX_LAYOUT_OPS_DEFAULT,
         }
     }
 
@@ -583,6 +596,24 @@ impl Buffer {
         self.len = j;
     }
 
+    /// The glyphs [`Self::move_to`]`(i)` copies: with an output, those between its end and `i`,
+    /// and on a rewind past the input read so far, the rest of the input it first shifts
+    /// forward.
+    pub(crate) fn move_cost(&self, i: usize) -> usize {
+        if !self.have_output {
+            return 0;
+        }
+        if self.out_len <= i {
+            return i - self.out_len;
+        }
+        let count = self.out_len - i;
+        if self.idx < count {
+            count + self.len.max(count) - self.idx
+        } else {
+            count
+        }
+    }
+
     pub(crate) fn move_to(&mut self, i: usize) -> bool {
         if !self.have_output {
             if i > self.len {
@@ -602,6 +633,8 @@ impl Buffer {
             for j in 0..count {
                 self.set_out_info(self.out_len + j, self.info[self.idx + j]);
             }
+            #[cfg(all(any(test, debug_assertions), not(trust_verify)))]
+            crate::work::note(|s| s.glyphs_moved += count as u64);
             self.idx += count;
             self.out_len += count;
         } else if self.out_len > i {
@@ -617,6 +650,8 @@ impl Buffer {
             for j in 0..count {
                 self.info[self.idx + j] = self.out_info()[self.out_len + j];
             }
+            #[cfg(all(any(test, debug_assertions), not(trust_verify)))]
+            crate::work::note(|s| s.glyphs_moved += count as u64);
         }
         true
     }
@@ -677,6 +712,8 @@ impl Buffer {
                 *info = GlyphInfo::default();
             }
         }
+        #[cfg(all(any(test, debug_assertions), not(trust_verify)))]
+        crate::work::note(|s| s.glyphs_moved += (self.len - self.idx).max(count) as u64);
         self.len += count;
         self.idx += count;
     }
@@ -694,12 +731,17 @@ impl Buffer {
         {
             self.max_ops = ops.max(Self::MAX_OPS_MIN);
         }
+        self.max_layout_ops = i64::try_from(self.len)
+            .unwrap_or(i64::MAX)
+            .saturating_mul(Self::MAX_LAYOUT_OPS_FACTOR)
+            .max(Self::MAX_LAYOUT_OPS_MIN);
     }
 
     #[inline]
     pub(crate) fn leave(&mut self) {
         self.max_len = Self::MAX_LEN_DEFAULT;
         self.max_ops = Self::MAX_OPS_DEFAULT;
+        self.max_layout_ops = Self::MAX_LAYOUT_OPS_DEFAULT;
         self.serial = 0;
     }
 

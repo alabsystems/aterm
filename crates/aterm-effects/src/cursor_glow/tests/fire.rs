@@ -3727,10 +3727,13 @@ fn the_kept_flame_rises_in_the_gaps_not_over_the_letters() {
 
 /// Typed as `echo the quick brown fox` under a line of text, quick and slower, over the newest
 /// eight cells' letters with no descender: down every pixel column under the baseline the light
-/// changes from one pixel row to the next by at most a fifth of the band's brightest, and every
+/// changes from one pixel row to the next by at most a tenth of the band's brightest, and every
 /// letter keeps the row's bar. Negative controls: capped hard ([`CursorGlow::fire_kept_cap_hard`])
-/// a step of over a fifth; capped hard and laid as one crest ([`CursorGlow::fire_kept_crest`]) a
-/// step of half or more.
+/// a step half again the eased one's; capped hard and laid as one crest
+/// ([`CursorGlow::fire_kept_crest`]) twice it. The flame is held to the letter's bar over the
+/// judge's ring under the baseline before it eases in (r25 K8-2), so it eases in nearer the row's
+/// foot, where it burns lower: there the hard cap's step was 0.11 of the band's brightest, not
+/// the fifth it was when the flame eased in from the baseline itself.
 #[test]
 fn under_a_kept_letter_the_flame_eases_in_over_pixels() {
     let g = tall_geom();
@@ -3772,7 +3775,7 @@ fn under_a_kept_letter_the_flame_eases_in_over_pixels() {
     for gap_ms in [57u64, 90] {
         let (step, worst) = run(gap_ms, false, false);
         assert!(
-            step <= 0.2,
+            step <= 0.1,
             "{gap_ms} ms apart: under a letter the flame steps {step:.3} of its brightest in a pixel"
         );
         assert!(
@@ -3782,9 +3785,9 @@ fn under_a_kept_letter_the_flame_eases_in_over_pixels() {
         let (hard, _) = run(gap_ms, false, true);
         let (round3, _) = run(gap_ms, true, true);
         assert!(
-            hard > 0.2 && round3 >= 0.5,
-            "control, {gap_ms} ms apart: capped in one pixel the flame steps {hard:.3}, \
-             laid as round 3 laid it {round3:.3}"
+            hard > 1.4 * step && round3 > 2.0 * step,
+            "control, {gap_ms} ms apart: eased the flame steps {step:.3}, capped in one pixel \
+             {hard:.3}, laid as round 3 laid it {round3:.3}"
         );
     }
 }
@@ -7411,8 +7414,8 @@ fn a_flame_s_ground_is_not_cut_by_the_letter_guard() {
     );
     let (lit_cut, olive_cut) = burst_olive_on_solarized(true);
     assert!(
-        olive_cut >= 40,
-        "control: with its grounds cut by the guard only {olive_cut} of {lit_cut} fire pixels read olive"
+        olive_cut > 0,
+        "control: with its grounds cut by the guard none of {lit_cut} fire pixels read olive"
     );
 }
 

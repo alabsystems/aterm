@@ -196,6 +196,63 @@ pub fn plan(mounted: &[Mounted], shares: &[Share]) -> Result<Vec<Op>, String> {
     Ok(ops)
 }
 
+/// Create `at` and any missing parent directories without traversing symbolic links.
+///
+/// # Errors
+/// `at` is not an absolute path of plain components, a component along `at` is a symbolic
+/// link or non-directory, or creating a missing directory fails.
+pub fn ensure_plain_dir(at: &Path) -> Result<(), String> {
+    let mut comps = at.components();
+    if comps.next() != Some(Component::RootDir) {
+        return Err(format!("mkdir {}: not an absolute path", at.display()));
+    }
+    let mut cur = PathBuf::from("/");
+    for comp in comps {
+        let Component::Normal(part) = comp else {
+            return Err(format!(
+                "mkdir {}: non-plain path component in {}",
+                at.display(),
+                cur.display()
+            ));
+        };
+        cur.push(part);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(format!(
+                    "mkdir {}: {} is a symbolic link",
+                    at.display(),
+                    cur.display()
+                ));
+            }
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => {
+                return Err(format!(
+                    "mkdir {}: {} is not a directory",
+                    at.display(),
+                    cur.display()
+                ));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => match std::fs::create_dir(&cur) {
+                Ok(()) => {}
+                Err(ce) if ce.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let meta = std::fs::symlink_metadata(&cur)
+                        .map_err(|me| format!("mkdir {}: {me}", cur.display()))?;
+                    if meta.file_type().is_symlink() || !meta.is_dir() {
+                        return Err(format!(
+                            "mkdir {}: {} is not a plain directory",
+                            at.display(),
+                            cur.display()
+                        ));
+                    }
+                }
+                Err(ce) => return Err(format!("mkdir {}: {ce}", cur.display())),
+            },
+            Err(e) => return Err(format!("mkdir {}: {e}", cur.display())),
+        }
+    }
+    Ok(())
+}
+
 /// Whether every share is bound at its path from the share's own entry once a [`plan`] ran:
 /// the topmost mount at the path is the `aterm` share's, rooted at `/<name>` exactly. A bind
 /// made through a cached entry a swap took away reads `/<name>//deleted` (measured in V4),
@@ -407,5 +464,28 @@ mod tests {
             "duplicate target bind paths must be refused"
         );
         assert!(plan(&m, &[]).is_ok());
+
+        #[cfg(unix)]
+        {
+            let dir = aterm_tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(dir.path()).unwrap();
+            let plain = root.join("work/nested");
+            ensure_plain_dir(&plain).unwrap();
+            ensure_plain_dir(&plain).unwrap();
+            assert!(plain.is_dir());
+
+            let target = root.join("elsewhere");
+            std::fs::create_dir(&target).unwrap();
+            let link = root.join("work/escape");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let err = ensure_plain_dir(&link.join("child")).unwrap_err();
+            assert!(err.contains("is a symbolic link"), "{err}");
+            assert!(!target.join("child").exists());
+
+            let file = root.join("work/plain-file");
+            std::fs::write(&file, b"x").unwrap();
+            let err = ensure_plain_dir(&file.join("child")).unwrap_err();
+            assert!(err.contains("is not a directory"), "{err}");
+        }
     }
 }

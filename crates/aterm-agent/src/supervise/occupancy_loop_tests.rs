@@ -806,4 +806,4 @@ fn the_hosted_loop_carries_the_hold_across_its_restarts() {
 mod door;
 
 #[path = "occupancy_write_tests.rs"]
-mod write;
+pub(crate) mod write;

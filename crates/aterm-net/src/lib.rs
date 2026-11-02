@@ -25,9 +25,6 @@ pub mod fleet;
 #[cfg(unix)]
 pub mod fleet_member;
 
-#[cfg(unix)]
-mod tcp_connect;
-
 /// Physical-link locality for applications that require LAN-only transport.
 #[cfg(unix)]
 pub mod lan;

@@ -430,7 +430,16 @@ pub fn spawn_shell_with_pid(
         sandbox_wrap,
         limits,
         None,
+        None,
     )
+}
+
+/// Off Unix no descriptor is passed to a child: this type has no value, so a caller of
+/// [`spawn_shell_with_pid_cell_px`] can only pass `None`, as on Unix it passes none or one.
+#[derive(Debug, Clone, Copy)]
+pub enum PassedFd<'fd> {
+    #[doc(hidden)]
+    Never(std::convert::Infallible, std::marker::PhantomData<&'fd ()>),
 }
 
 /// Unix-seam parity for [`spawn_shell_with_pid_cell_px`](crate::spawn_shell_with_pid_cell_px).
@@ -449,6 +458,7 @@ pub fn spawn_shell_with_pid_cell_px(
     sandbox_wrap: Option<&str>,
     limits: aterm_sandbox::Limits,
     _cell_px: Option<(u16, u16)>,
+    _pass: Option<PassedFd<'_>>,
 ) -> io::Result<SpawnedShell> {
     spawn_on_host(
         SpawnRequest {

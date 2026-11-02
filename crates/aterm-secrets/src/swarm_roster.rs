@@ -216,16 +216,45 @@ impl SwarmRoster {
 
     /// Canonicalize member ordering, alias sets, and grow-only deny sets.
     pub fn canonicalize(&mut self) {
+        self.deny_labels = normalize_label_set(std::mem::take(&mut self.deny_labels));
+        self.deny_nodes = normalize_word_set(std::mem::take(&mut self.deny_nodes));
         for member in &mut self.members {
             member.normalize_aliases();
+        }
+        if self.members.len() > 1 {
+            let mut best_by_recipient: BTreeMap<String, (usize, SwarmMember)> = BTreeMap::new();
+            for (idx, m) in std::mem::take(&mut self.members).into_iter().enumerate() {
+                let m_key = (
+                    !self.is_member_denied(&m),
+                    m.node_key.is_some() || m.node_id.is_some(),
+                    m.admitted_ms,
+                    std::cmp::Reverse(idx),
+                );
+                match best_by_recipient.get_mut(&m.recipient) {
+                    Some((prev_idx, prev)) => {
+                        let prev_key = (
+                            !self.is_member_denied(prev),
+                            prev.node_key.is_some() || prev.node_id.is_some(),
+                            prev.admitted_ms,
+                            std::cmp::Reverse(*prev_idx),
+                        );
+                        if m_key > prev_key {
+                            *prev_idx = idx;
+                            *prev = m;
+                        }
+                    }
+                    None => {
+                        best_by_recipient.insert(m.recipient.clone(), (idx, m));
+                    }
+                }
+            }
+            self.members = best_by_recipient.into_values().map(|(_, m)| m).collect();
         }
         self.members.sort_by(|a, b| {
             let na = leading_m_label(&a.label).map_or(u32::MAX, |(n, _)| n);
             let nb = leading_m_label(&b.label).map_or(u32::MAX, |(n, _)| n);
             (na, &a.recipient).cmp(&(nb, &b.recipient))
         });
-        self.deny_labels = normalize_label_set(std::mem::take(&mut self.deny_labels));
-        self.deny_nodes = normalize_word_set(std::mem::take(&mut self.deny_nodes));
     }
 
     /// Merge `prior`'s grow-only deny-lists into `self` so neither list ever shrinks.
@@ -295,18 +324,56 @@ impl SwarmRoster {
         aterm_toml::to_string(&Value::Table(root)).unwrap_or_default()
     }
 
-    /// Find the roster row for `recipient`.
+    /// Find the roster row for `recipient`, preferring active (un-denied), bound, and newer
+    /// rows when multiple rows share `recipient`.
     #[must_use]
     pub fn member_by_recipient(&self, recipient: &str) -> Option<&SwarmMember> {
-        self.members.iter().find(|m| m.recipient == recipient)
-    }
-
-    /// Find the roster row matching `label` or one of its `aliases`.
-    #[must_use]
-    pub fn member_by_label_or_alias(&self, label: &str) -> Option<&SwarmMember> {
         self.members
             .iter()
-            .find(|m| m.matches_label_or_alias(label))
+            .enumerate()
+            .filter(|(_, m)| m.recipient == recipient)
+            .max_by_key(|(idx, m)| {
+                (
+                    !self.is_member_denied(m),
+                    m.node_key.is_some() || m.node_id.is_some(),
+                    m.admitted_ms,
+                    std::cmp::Reverse(*idx),
+                )
+            })
+            .map(|(_, m)| m)
+    }
+
+    /// Find the roster row matching `label` or one of its `aliases`, preferring active
+    /// (un-denied), primary-label, bound, and newer rows when multiple rows match.
+    #[must_use]
+    pub fn member_by_label_or_alias(&self, label: &str) -> Option<&SwarmMember> {
+        let canonical = leading_m_label(label).map(|(_, c)| c);
+        self.members
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.matches_label_or_alias(label))
+            .max_by_key(|(idx, m)| {
+                (
+                    !self.is_member_denied(m),
+                    canonical.as_deref() == Some(m.label.as_str()),
+                    m.node_key.is_some() || m.node_id.is_some(),
+                    m.admitted_ms,
+                    std::cmp::Reverse(*idx),
+                )
+            })
+            .map(|(_, m)| m)
+    }
+
+    /// True when `m` is denied by `deny_labels` (primary label or alias) or `deny_nodes`
+    /// (`node_id` or `node_key`).
+    #[must_use]
+    pub fn is_member_denied(&self, m: &SwarmMember) -> bool {
+        self.is_label_denied(&m.label)
+            || m.aliases.iter().any(|a| self.is_label_denied(a))
+            || m.node_id.as_deref().is_some_and(|n| self.is_node_denied(n))
+            || m.node_key
+                .as_deref()
+                .is_some_and(|k| self.is_node_denied(k))
     }
 
     /// True when `node_id` appears on the grow-only `deny_nodes` list.
@@ -494,6 +561,7 @@ impl SwarmPolicy {
             if let Some(roster) = existing
                 && let Some(machine) = machines.iter().find(|m| m.name == admin_name)
                 && let Some(member) = roster.member_by_recipient(&machine.recipient)
+                && !roster.is_member_denied(member)
             {
                 out.insert(member.label.clone());
             }
@@ -834,8 +902,10 @@ pub fn next_free_number(
                 observe(n);
             }
         }
-        if let Some(claimed) = &member.claimed_label
-            && let Some((n, _)) = leading_m_label(claimed)
+        if !roster.is_member_denied(member)
+            && let Some(claimed) = &member.claimed_label
+            && let Some((n, canon)) = leading_m_label(claimed)
+            && canon == *claimed
         {
             observe(n);
         }
@@ -986,23 +1056,49 @@ pub fn promote_due_claims(
     now_ms: u64,
 ) -> bool {
     let reserved = policy.effective_reserved(doc, Some(roster));
+    let denied_indices: BTreeSet<usize> = roster
+        .members
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, m)| roster.is_member_denied(m).then_some(idx))
+        .collect();
     let mut claim_counts: BTreeMap<String, usize> = BTreeMap::new();
-    for m in &roster.members {
-        if let Some(claim) = &m.claimed_label {
-            *claim_counts.entry(claim.clone()).or_insert(0) += 1;
+    for (idx, m) in roster.members.iter().enumerate() {
+        if denied_indices.contains(&idx) {
+            continue;
+        }
+        if let Some(claim) = m
+            .claimed_label
+            .as_deref()
+            .and_then(leading_m_label)
+            .map(|(_, c)| c)
+        {
+            *claim_counts.entry(claim).or_insert(0) += 1;
         }
     }
     let mut held_labels: BTreeSet<String> = roster
         .members
         .iter()
-        .flat_map(|m| std::iter::once(m.label.clone()).chain(m.aliases.iter().cloned()))
+        .enumerate()
+        .filter(|(idx, _)| !denied_indices.contains(idx))
+        .flat_map(|(_, m)| std::iter::once(m.label.clone()).chain(m.aliases.iter().cloned()))
         .collect();
-    let deny_labels: BTreeSet<String> = roster.deny_labels.iter().cloned().collect();
+    let deny_labels: BTreeSet<String> = roster
+        .deny_labels
+        .iter()
+        .filter_map(|d| leading_m_label(d).map(|(_, c)| c))
+        .collect();
 
     let mut changed = false;
-    for member in &mut roster.members {
-        let (Some(target), Some(since)) = (member.claimed_label.clone(), member.claimed_at_ms)
+    for (idx, member) in roster.members.iter_mut().enumerate() {
+        if denied_indices.contains(&idx) {
+            continue;
+        }
+        let (Some(raw_target), Some(since)) = (member.claimed_label.clone(), member.claimed_at_ms)
         else {
+            continue;
+        };
+        let Some((_, target)) = leading_m_label(&raw_target) else {
             continue;
         };
         let unique_claimant = claim_counts.get(&target).copied() == Some(1);
@@ -1023,12 +1119,23 @@ pub fn promote_due_claims(
         let live_numbers: BTreeSet<u32> = roster
             .members
             .iter()
-            .filter_map(|m| leading_m_label(&m.label).map(|(n, _)| n))
+            .enumerate()
+            .filter(|(idx, _)| !denied_indices.contains(idx))
+            .filter_map(|(_, m)| leading_m_label(&m.label).map(|(n, _)| n))
             .collect();
-        for member in &mut roster.members {
+        for (idx, member) in roster.members.iter_mut().enumerate() {
+            if denied_indices.contains(&idx) {
+                continue;
+            }
             if let Some((n, _)) = leading_m_label(&member.label) {
                 for folded in sheet.paired_legacy_aliases(n, &live_numbers, &reserved) {
-                    member.aliases.push(folded);
+                    if !held_labels.contains(&folded)
+                        && !deny_labels.contains(&folded)
+                        && !claim_counts.contains_key(&folded)
+                    {
+                        held_labels.insert(folded.clone());
+                        member.aliases.push(folded);
+                    }
                 }
                 member.normalize_aliases();
             }
@@ -1073,13 +1180,23 @@ pub fn assign_newcomer(
 ) -> String {
     promote_due_claims(roster, doc, policy, sheet, newcomer.now_ms);
 
-    if let Some(existing) = roster
+    if let Some(pos) = roster
         .members
-        .iter_mut()
-        .find(|m| m.recipient == newcomer.recipient)
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.recipient == newcomer.recipient)
+        .max_by_key(|(idx, m)| {
+            (
+                !roster.is_member_denied(m),
+                m.node_key.is_some() || m.node_id.is_some(),
+                m.admitted_ms,
+                std::cmp::Reverse(*idx),
+            )
+        })
+        .map(|(idx, _)| idx)
     {
-        existing.vault_name = newcomer.vault_name.to_owned();
-        return existing.label.clone();
+        roster.members[pos].vault_name = newcomer.vault_name.to_owned();
+        return roster.members[pos].label.clone();
     }
 
     let reserved = policy.effective_reserved(doc, Some(roster));
@@ -1089,7 +1206,10 @@ pub fn assign_newcomer(
     let held_labels: BTreeSet<String> = roster
         .members
         .iter()
-        .filter(|m| active_recipients.contains(&m.recipient) || m.recipient == newcomer.recipient)
+        .filter(|m| {
+            !roster.is_member_denied(m)
+                && (active_recipients.contains(&m.recipient) || m.recipient == newcomer.recipient)
+        })
         .flat_map(|m| std::iter::once(m.label.clone()).chain(m.aliases.iter().cloned()))
         .collect();
 
@@ -1119,6 +1239,7 @@ pub fn assign_newcomer(
     let live_numbers: BTreeSet<u32> = roster
         .members
         .iter()
+        .filter(|m| !roster.is_member_denied(m))
         .filter_map(|m| leading_m_label(&m.label).map(|(n, _)| n))
         .chain(leading_m_label(&label).map(|(n, _)| n))
         .collect();
@@ -1127,7 +1248,16 @@ pub fn assign_newcomer(
         && let Some((n, _)) = leading_m_label(&label)
     {
         for folded in sheet.paired_legacy_aliases(n, &live_numbers, &reserved) {
-            if !held_labels.contains(&folded) {
+            if !held_labels.contains(&folded)
+                && !roster.is_label_denied(&folded)
+                && !roster.members.iter().any(|m| {
+                    !roster.is_member_denied(m)
+                        && m.claimed_label
+                            .as_deref()
+                            .and_then(leading_m_label)
+                            .is_some_and(|(_, c)| c == folded)
+                })
+            {
                 aliases.push(folded);
             }
         }
@@ -1567,6 +1697,237 @@ email = "one@example.org"
         assert_ne!(
             roster.member_by_recipient(&r_contested_b).unwrap().label,
             "m21"
+        );
+    }
+
+    #[test]
+    fn member_by_label_or_alias_prefers_active_row_over_denied_row() {
+        let r_old = Identity::generate().unwrap().recipient().to_bech32();
+        let r_new = Identity::generate().unwrap().recipient().to_bech32();
+        let old_node = "11111111111111111111111111111111";
+        let new_node = "22222222222222222222222222222222";
+        let roster = SwarmRoster {
+            deny_labels: Vec::new(),
+            deny_nodes: vec![old_node.to_owned()],
+            members: vec![
+                SwarmMember {
+                    recipient: r_old.clone(),
+                    vault_name: "m5".to_owned(),
+                    label: "m5".to_owned(),
+                    aliases: vec!["m105".to_owned()],
+                    hint: None,
+                    admitted_ms: 1_000,
+                    claimed_label: None,
+                    claimed_at_ms: None,
+                    node_id: Some(old_node.to_owned()),
+                    node_key: None,
+                },
+                SwarmMember {
+                    recipient: r_new.clone(),
+                    vault_name: "m5-2".to_owned(),
+                    label: "m5".to_owned(),
+                    aliases: Vec::new(),
+                    hint: None,
+                    admitted_ms: 2_000,
+                    claimed_label: None,
+                    claimed_at_ms: None,
+                    node_id: Some(new_node.to_owned()),
+                    node_key: None,
+                },
+            ],
+        };
+        let found = roster.member_by_label_or_alias("m5").unwrap();
+        assert_eq!(found.recipient, r_new);
+        assert!(!roster.is_member_denied(found));
+        // When only the denied row matches an alias, it is still returned so callers can see it is denied.
+        let alias_found = roster.member_by_label_or_alias("m105").unwrap();
+        assert_eq!(alias_found.recipient, r_old);
+        assert!(roster.is_member_denied(alias_found));
+    }
+
+    #[test]
+    fn assign_newcomer_and_promote_due_claims_never_fold_denied_or_claimed_legacy_aliases() {
+        let r_admin = Identity::generate().unwrap().recipient().to_bech32();
+        let r_m70 = Identity::generate().unwrap().recipient().to_bech32();
+        let r_claim_m10 = Identity::generate().unwrap().recipient().to_bech32();
+
+        let mut doc = Document::new_vault("m1", &r_admin);
+        doc.add_machine("m70", &r_m70).unwrap();
+        doc.add_machine("m10", &r_claim_m10).unwrap();
+
+        let policy = SwarmPolicy::default();
+        // Sheet pairs m2 <-> m70 (`70 - 68 = 2`), and names m10 (for a 24h claim hold),
+        // but NOT 70 itself so m70 is assigned directly on join.
+        let mut sheet = SheetHints::default();
+        sheet.numbers.insert(2);
+        sheet.numbers.insert(10);
+        sheet.shared_rows.push(vec![2, 70]);
+
+        let mut roster = SwarmRoster {
+            deny_labels: vec!["m2".to_owned()],
+            deny_nodes: Vec::new(),
+            members: vec![SwarmMember {
+                recipient: r_admin,
+                vault_name: "m1".to_owned(),
+                label: "m1".to_owned(),
+                aliases: Vec::new(),
+                hint: None,
+                admitted_ms: 1_000,
+                claimed_label: None,
+                claimed_at_ms: None,
+                node_id: None,
+                node_key: None,
+            }],
+        };
+
+        // 1. `assign_newcomer` for `m70` when paired legacy label `"m2"` is in `deny_labels`:
+        //    must NOT fold `"m2"` into `m70.aliases` (which would mark `m70` denied).
+        let assigned_m70 = assign_newcomer(
+            &mut roster,
+            &doc,
+            &policy,
+            &sheet,
+            &[],
+            Newcomer {
+                recipient: &r_m70,
+                requested_host: "m70",
+                vault_name: "m70",
+                now_ms: 2_000,
+            },
+        );
+        assert_eq!(assigned_m70, "m70");
+        let m70_row = roster.member_by_recipient(&r_m70).unwrap();
+        assert!(
+            !m70_row.aliases.contains(&"m2".to_owned()),
+            "denied legacy alias m2 must not be folded into m70: {:?}",
+            m70_row.aliases
+        );
+        assert!(!roster.is_member_denied(m70_row));
+
+        // 2. `promote_due_claims` when another member (`r_claim_m10`) promotes after 24h:
+        //    must NOT fold denied `"m2"` into `m70.aliases` either.
+        let provisional = assign_newcomer(
+            &mut roster,
+            &doc,
+            &policy,
+            &sheet,
+            &[],
+            Newcomer {
+                recipient: &r_claim_m10,
+                requested_host: "m10",
+                vault_name: "m10",
+                now_ms: 3_000,
+            },
+        );
+        assert_eq!(provisional, "m71");
+        assert!(promote_due_claims(
+            &mut roster,
+            &doc,
+            &policy,
+            &sheet,
+            3_000 + SHEET_CLAIM_HOLD_MS
+        ));
+        let m70_after = roster.member_by_recipient(&r_m70).unwrap();
+        assert!(
+            !m70_after.aliases.contains(&"m2".to_owned()),
+            "promote_due_claims must not fold denied m2 into m70: {:?}",
+            m70_after.aliases
+        );
+        assert!(!roster.is_member_denied(m70_after));
+
+        // 3. A denied row in `roster.members` carrying `claimed_label = Some("m11")` must neither
+        //    promote itself out of `deny_labels` nor block an active member's 24h claim on `"m11"`.
+        let r_denied_claimant = Identity::generate().unwrap().recipient().to_bech32();
+        let r_active_claimant = Identity::generate().unwrap().recipient().to_bech32();
+        doc.add_machine("m11", &r_active_claimant).unwrap();
+        sheet.numbers.insert(11);
+        roster.deny_labels.push("m40".to_owned());
+        roster.members.push(SwarmMember {
+            recipient: r_denied_claimant.clone(),
+            vault_name: "m40".to_owned(),
+            label: "m40".to_owned(),
+            aliases: Vec::new(),
+            hint: None,
+            admitted_ms: 3_500,
+            claimed_label: Some("m11".to_owned()),
+            claimed_at_ms: Some(3_500),
+            node_id: None,
+            node_key: None,
+        });
+        assert!(
+            !promote_due_claims(
+                &mut roster,
+                &doc,
+                &policy,
+                &sheet,
+                3_500 + SHEET_CLAIM_HOLD_MS
+            ),
+            "denied row m40 must not promote its claimed_label m11"
+        );
+        assert_eq!(
+            roster
+                .member_by_recipient(&r_denied_claimant)
+                .unwrap()
+                .label,
+            "m40"
+        );
+        let _ = assign_newcomer(
+            &mut roster,
+            &doc,
+            &policy,
+            &sheet,
+            &[],
+            Newcomer {
+                recipient: &r_active_claimant,
+                requested_host: "m11",
+                vault_name: "m11",
+                now_ms: 4_000,
+            },
+        );
+        assert!(
+            promote_due_claims(
+                &mut roster,
+                &doc,
+                &policy,
+                &sheet,
+                4_000 + SHEET_CLAIM_HOLD_MS
+            ),
+            "denied row's stale claim on m11 must not block active claimant from promoting"
+        );
+        assert_eq!(
+            roster
+                .member_by_recipient(&r_active_claimant)
+                .unwrap()
+                .label,
+            "m11"
+        );
+
+        // 4. A denied row's forged or unpromoted `claimed_label = Some("m999")` must not inflate
+        //    `next_free_number` when assigning the next newcomer.
+        if let Some(m40) = roster
+            .members
+            .iter_mut()
+            .find(|m| m.recipient == r_denied_claimant)
+        {
+            m40.claimed_label = Some("m999".to_owned());
+        }
+        let r_next = Identity::generate().unwrap().recipient().to_bech32();
+        let next_assigned = assign_newcomer(
+            &mut roster,
+            &doc,
+            &policy,
+            &sheet,
+            &[],
+            Newcomer {
+                recipient: &r_next,
+                requested_host: "Mac-mini",
+                vault_name: "Mac-mini",
+                now_ms: 4_500,
+            },
+        );
+        assert_eq!(
+            next_assigned, "m73",
+            "denied row's forged claimed_label m999 must not inflate next_free_number: {next_assigned}"
         );
     }
 }

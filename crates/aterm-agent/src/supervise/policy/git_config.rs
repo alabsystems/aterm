@@ -51,16 +51,17 @@ pub(crate) fn git_reads(
         if !matches!(program(&seg[run.at]), "cd" | "pushd") {
             continue;
         }
-        let target = seg[run.at + 1..]
-            .iter()
-            .find(|w| !w.starts_with('-') || w.as_str() == "-");
-        if looped && target.is_some_and(|t| !t.starts_with('/') && !t.starts_with('~')) {
+        let Ok(target) = cd_operand(&seg[run.at + 1..]) else {
             return Err(format!(
-                "a git read on a line whose loop repeats `cd {}`",
-                target.map(String::as_str).unwrap_or("")
+                "a git read after `{}`, a move this check cannot follow",
+                seg[run.at..].join(" ")
             ));
+        };
+        let relative = target.filter(|t| !t.starts_with(['/', '~']));
+        if looped && let Some(t) = relative {
+            return Err(format!("a git read on a line whose loop repeats `cd {t}`"));
         }
-        let found = match target.map(String::as_str) {
+        let found = match target {
             None => vec![
                 home.map(Path::to_path_buf)
                     .ok_or_else(|| "a git read after `cd` with no home".to_string())?,
@@ -73,6 +74,13 @@ pub(crate) fn git_reads(
                 found
             }
         };
+        if let Some(t) = relative.filter(|t| cdpath_searched(t)) {
+            return Err(format!(
+                "a git read after `cd {t}`, which a `CDPATH` (zsh's `cdpath`, which the worker's \
+                 environment or a .zshenv may set) may place where this check cannot follow \
+                 (`cd ./{t}` stays where it stands)"
+            ));
+        }
         bases.extend(found);
     }
     let mut out = GitReads::default();
@@ -100,9 +108,14 @@ pub(crate) fn git_reads(
         }
         let mut j = i + 1;
         while let Some(t) = seg.get(j).map(String::as_str) {
-            if t == "-C" {
-                let Some(d) = seg.get(j + 1) else {
-                    return Err("git -C without a directory".to_string());
+            if let Some(glued) = t.strip_prefix("-C") {
+                let (d, step) = if glued.is_empty() {
+                    let Some(d) = seg.get(j + 1).map(String::as_str) else {
+                        return Err("git -C without a directory".to_string());
+                    };
+                    (d, 2)
+                } else {
+                    (glued, 1)
                 };
                 if fed {
                     return Err(format!(
@@ -114,15 +127,18 @@ pub(crate) fn git_reads(
                     next.extend(resolve(base, d, home)?);
                 }
                 dirs = next;
-                j += 2;
-            } else if t == "-c"
+                j += step;
+            } else if t.starts_with("-c")
                 || t.starts_with("--git-dir")
                 || t.starts_with("--work-tree")
                 || t.starts_with("--config-env")
                 || t.starts_with("--exec-path")
             {
                 return Err(format!("git {t}"));
-            } else if t == "--namespace" {
+            } else if t == "--" {
+                j += 1;
+                break;
+            } else if matches!(t, "--namespace" | "--super-prefix" | "--attr-source") {
                 j += 2;
             } else if t.starts_with('-') {
                 j += 1;
@@ -159,6 +175,36 @@ pub(crate) fn git_reads(
         }
     }
     Ok(Some(out))
+}
+
+/// The operand of `cd` with `args`: `None` for the home, else its one operand; `Err` when it
+/// takes an option other than `-L`, `-P`, `-e`, `-@`, `-q` or `-s` (zsh's `-N` reads the
+/// directory stack), names `-` (`OLDPWD`) or a stack entry (`+N`), or takes two operands.
+pub(crate) fn cd_operand(args: &[String]) -> Result<Option<&str>, ()> {
+    let mut k = 0;
+    while let Some(w) = args.get(k).filter(|w| w.len() > 1 && w.starts_with('-')) {
+        k += 1;
+        if w == "--" {
+            break;
+        }
+        if !w[1..]
+            .chars()
+            .all(|c| matches!(c, 'L' | 'P' | 'e' | '@' | 'q' | 's'))
+        {
+            return Err(());
+        }
+    }
+    match args.get(k..).unwrap_or(&[]) {
+        [] => Ok(None),
+        [t] if t != "-" && !t.starts_with('+') => Ok(Some(t)),
+        _ => Err(()),
+    }
+}
+
+/// Whether bash and zsh look `cd t` up in `CDPATH` (zsh's `cdpath`), `t` a relative target:
+/// unless it is `.` or `..` or led by `./` or `../`.
+pub(crate) fn cdpath_searched(t: &str) -> bool {
+    !matches!(t.split('/').next(), Some("." | ".."))
 }
 
 fn resolve(base: &Path, t: &str, home: Option<&Path>) -> Result<Vec<PathBuf>, String> {
@@ -336,12 +382,12 @@ impl WorkerEnv {
         )
     }
 
-    /// A test's worker: this process's `PATH`, no system configuration.
+    /// A test's worker: [`test_worker_path`], no system configuration.
     #[cfg(test)]
     pub(crate) fn hermetic(global: Option<&Path>) -> Self {
         let global = global.unwrap_or(Path::new("/dev/null"));
         Self::from_env(vec![
-            format!("PATH={}", std::env::var("PATH").unwrap_or_default()),
+            format!("PATH={}", test_worker_path()),
             "GIT_CONFIG_NOSYSTEM=1".to_string(),
             format!("GIT_CONFIG_GLOBAL={}", global.display()),
             "CLAUDE_CONFIG_DIR=/nonexistent/aterm-hermetic-claude".to_string(),
@@ -688,6 +734,39 @@ fn is_executable(p: &Path) -> bool {
 #[cfg(not(unix))]
 fn is_executable(p: &Path) -> bool {
     p.is_file()
+}
+
+/// The `PATH` a test's worker runs git by: [`worker_path_from`] this process's `PATH`.
+#[cfg(test)]
+pub(crate) fn test_worker_path() -> String {
+    worker_path_from(std::env::var_os("PATH").as_deref())
+}
+
+/// The directory of the git `process` (a `PATH`) runs, then the system's own directories.
+/// A test runner's `PATH` itself is not a worker's: it can lead with the toolchain's
+/// directory (a `targo verify` run's did), and one in a scratch root is a directory the
+/// worker writes ahead of git, so every git read in the tests would escalate on where the
+/// runner's toolchain sits.
+#[cfg(test)]
+fn worker_path_from(process: Option<&std::ffi::OsStr>) -> String {
+    let name = if cfg!(windows) { "git.exe" } else { "git" };
+    let git_dir = process
+        .into_iter()
+        .flat_map(std::env::split_paths)
+        .find(|dir| dir.is_absolute() && is_executable(&dir.join(name)));
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for dir in git_dir
+        .into_iter()
+        .chain(["/usr/bin", "/bin", "/usr/sbin", "/sbin"].map(PathBuf::from))
+    {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    std::env::join_paths(dirs)
+        .expect("absolute directories join")
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn is_bool(v: Option<&str>) -> bool {

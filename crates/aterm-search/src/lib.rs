@@ -354,7 +354,7 @@ impl TerminalSearch {
             return Ok(found);
         }
         match direction {
-            SearchDirection::Forward => find(self.lowest_retained_line(), 0, true),
+            SearchDirection::Forward => find(0, 0, true),
             SearchDirection::Backward => find(
                 self.indexed_line_count().saturating_sub(1),
                 usize::MAX,

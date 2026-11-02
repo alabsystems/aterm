@@ -1,54 +1,18 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-sixel: spec recovery from its 25 unit tests
+# aterm-sixel: spec recovery from its unit tests
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 8 tests it
-> deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
-> were taken before.
-
-> Status 2026-10-15: this is the crate's migration worklist. Each of the 14 specs below is
-> proved through Trust/Clean, and then the tests it subsumes are deleted. The one test in §4
-> that samples no spec is deleted now.
->
-> **Tried 2026-10-19 on seal `150efe4a`: `rgb-percent` and `hls-range` are blocked, not proved.**
-> The crate is not refused by PM-1; the seal compiles it and reports a row for each fn. Each of
-> `scale_pct`, `rgb_percent` and `hls_to_rgb` was given a contract through `trust_contract_fn!`
-> in two forms. (1) A theorem over the kernel import (`trust_import_aterm_sixel__scale_pct v <= 255`,
-> `trust_import_aterm_sixel__rgb_percent r g b <= 16777215`,
-> `trust_import_aterm_sixel__hls_to_rgb h l s <= 16777215`): each is refused with
-> `AutoBoundHeadOverApplied`, because E6 mints none of the three imports. (2)
-> `ensures result == <Clean spec def>(args)`, with `scale_pct_spec`/`rgb_percent_spec` stating the
-> row's formula for every input: the defs kernel-check, and the seal names the reason (gap 3, E6
-> shapes), all at the FACET gate:
-> - `scale_pct`: "the construct outside the E6 fragment is the call to `<u32 as core::cmp::Ord>::min`
->   (E6 reads only the marker-authenticated `wrapping_*`/signed `checked_*` core methods and a
->   forwarding call to a Clean island definition) (and 4 further construct(s) outside it)", i.e. the
->   `saturating_mul`/`saturating_add` calls and the `/ 100`.
-> - `rgb_percent`: "the call to `aterm_sixel::scale_pct` … (and 10 further construct(s) outside it)":
->   a call (no callee composition) plus the shifts and `|`.
-> - `hls_to_rgb`: "Pure (not established: local _6 has type Float { width: 64 }, outside the v1 scalar
->   fragment)", then the `min` call "(and 39 further construct(s) outside it)". No gap row covers f64.
->
-> The native clause lane refuses the def-calling clause too (`unsupported contract predicate
-> expression`). The code is unchanged, and `rgb_percent_scales_correctly` and `hls_primaries_are_sane`
-> stay. `rgb-percent` is unblocked by an E6 reader (or the proven-core route) for `min`,
-> unsigned `saturating_*`, division by a constant, shifts, `|` and a call to an admitted fn;
-> `hls-range` additionally needs f64 locals and `mul_add`/`round`/float-to-int casts.
-
-Source: `crates/aterm-sixel` (read only). I read every `#[test]` (all 25 are in
-`src/tests.rs`) and the code each one reaches in `src/lib.rs`. Nothing was compiled or run.
-The claims below come from reading the code.
-
-Result: **14 specs**, covering **24 tests**. **1 test is not a spec sample** (§4). Two
-statements were corrected against the code during the merge (§5.1, §5.2). One of them,
-`decode-refines-model`, is false as first stated near the pixel cap.
+Each row of §1 is a property of `crates/aterm-sixel`'s compiled Rust that a group of its tests (all
+in `src/tests.rs`) samples; once a row is proved through Trust/Clean, the tests §2 maps to it can go.
+§0 defines the notation, §4 notes the tests §2 leaves out, §5 the places where an implied spec and
+the code disagree, and §6 orders the proofs. The claims come from reading `src/lib.rs`.
 
 ## 0. Notation used in the statements
 
 - `D` = `SixelDecoder`. `Reach` = the decoder states reachable from `D::new()` by any sequence of
   `hook`, `put(b)`, `unhook` and `abort`.
-- `run(bs)` = `let d = D::new(); d.hook(); for b in bs { d.put(b) }; d.unhook()`. This is the tests'
+- `run(bs)` = `let d = D::new(); d.hook(); for b in bs { d.put(b) }; d.unhook()`, the tests'
   `decode` helper.
 - `DIM` = `SIXEL_MAX_DIMENSION` = 4096. `CAP` = `SIXEL_MAX_PIXELS` = 4 Mi. `NREG` =
   `MAX_COLOR_REGISTERS` = 1024. `PMAX` = `SIXEL_MAX_PARAMS` = 8.
@@ -74,16 +38,17 @@ statements were corrected against the code during the merge (§5.1, §5.2). One 
     `paint(x,y)`, or 0 if unpainted.
 - `RI(d)`, the raster invariant: `raster.len() == alloc_width*alloc_height`,
   `alloc_width*alloc_height <= CAP`, `alloc_width <= DIM` and `alloc_height <= DIM`.
-- `Box(bs)` = `W(bs) * min(DIM, 6*ceil(H(bs)/6))`. This is the band-rounded box that
-  `ensure_capacity` actually allocates (§5.2).
-- `ensure_capacity` is `#[cfg_attr(trust_verify, trust::skip)]` today. So every spec that touches
-  growth has to un-skip it first, or prove it under an `unbounded_allocation` assumption.
+- `Box(bs)` = `W(bs) * min(DIM, 6*ceil(H(bs)/6))`, the band-rounded box `ensure_capacity`
+  allocates (§5.2).
+- `ensure_capacity` carries `#[cfg_attr(trust_verify, trust::skip)]`, so a spec that touches growth
+  un-skips it first or is proved under an `unbounded_allocation` assumption.
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (primary tests; the secondary ones
-are in §2), `difficulty` (the Rust features the proof must handle), and `blocking_gaps` (row
-numbers in the gap table, audit §7). Gap 0 (a seal that publishes Clean rows) blocks every row.
+Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (primary tests; secondary ones in §2),
+`difficulty` (the Rust features the proof must handle), `blocking_gaps` (rows of §7 of
+`docs/AUDIT-trust-for-test-migration-2026-10-15.md`). Gap 0 (a seal that publishes Clean rows)
+blocks every row.
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
@@ -99,14 +64,13 @@ spans	contract	SixelImage::{rows_spanned,cols_spanned}	∀ img, ∀ c: u16, with
 hook-reset	equivalence	SixelDecoder::hook	∀ d∈Reach: after d.hook(), d is observationally equal to D::new() followed by hook(). That is, ∀ bs: (d.hook(); put* bs; d.unhook()) = run(bs). No palette, geometry, extent, params or pending repeat carries over from an earlier cycle.	reuse_across_cycles_resets_state	MEDIUM: &mut self two-state reasoning over every field, Vec clear and reassignment; composes with decode-refines-model for the image half	0,1,2,4,5
 release	contract	SixelDecoder::{abort,release,pixel_alloc_bytes,unhook}	∀ d∈Reach: after d.abort(), d.active = false, pixel_alloc_bytes() = 0 and params = [], so a following unhook() is None. After any d.unhook(), pixel_alloc_bytes() = 0 as well.	abort_frees_and_yields_no_image	EASY: &mut self, Vec::new reassignment, Vec len times size_of	0,1,2
 lazy-alloc	invariant	SixelDecoder::{put,apply_raster,emit_sixel,ensure_capacity,pixel_alloc_bytes}	∀ d∈Reach: RI(d), so pixel_alloc_bytes() ≤ 4*CAP. Allocation is driven only by painting: ∀ bs, the raster state after hook; put* bs is unchanged when every `"` introducer is deleted from bs, and if bs contains no data byte in 0x40..=0x7E then pixel_alloc_bytes() = 0. A declared raster of any size never pre-sizes the buffer.	oversized_raster_declaration_is_refused_without_allocating	HARD: a Vec length model across resize and vec! reallocation, &mut self, a state invariant over Reach, a fold over put, and the trust::skip on ensure_capacity (its unbounded_allocation obligation, which sits nearest gap 8)	0,1,2,5,7,8
-growth-amortized	contract	SixelDecoder::ensure_capacity	Assume RI(d). Let aw, ah = alloc_width, alloc_height before the call; need_w = min(wx+1, DIM); need_h = min(wy+1, DIM); new_h = max(need_h, ah); geo = min(max(2*aw, need_w), DIM); new_w = (need_w ≤ aw) ? aw : (geo*new_h ≤ CAP ? geo : max(min(⌊CAP/new_h⌋, DIM), need_w, aw)). Then ensure_capacity(wx,wy) gives: (a) RI(d'). (b) If need_w ≤ aw ∧ need_h ≤ ah, d is unchanged. Else if new_w*new_h ≤ CAP, then alloc_width' = new_w ≥ need_w and alloc_height' = new_h ≥ need_h. Otherwise d is unchanged (fail closed). (c) If need_w ≤ aw, alloc_width' = aw: height-only growth keeps the stride and takes the in-place resize path. (d) Corollary: painting columns 0..N one at a time at a fixed height reallocates the width O(log N) times. (e) The old raster's rows are kept as a row-major prefix at the new stride, and new cells are 0.	width_growth_is_amortized_and_preserves_the_height_fast_path, tall_raster_width_growth_stays_amortized_near_the_pixel_cap	HARD: &mut self, checked_mul and an is_some_and closure, NonZeroUsize division, Vec resize and vec! allocation, nested chunks/chunks_mut/zip loops; trust::skip must be lifted	0,1,2,3,7,8,13
+growth-amortized	contract	SixelDecoder::ensure_capacity	Assume RI(d). Let aw, ah = alloc_width, alloc_height before the call; need_w = min(wx+1, DIM); need_h = min(wy+1, DIM); new_h = max(need_h, ah); geo = min(max(2*aw, need_w), DIM); used_w = max(max_x, need_w); new_w = (need_w ≤ aw) ? (aw*new_h ≤ CAP ? aw : max(⌊√(min(⌊CAP/new_h⌋, DIM)*used_w)⌋, used_w)) : (geo*new_h ≤ CAP ? geo : max(min(⌊CAP/new_h⌋, DIM), need_w, aw)). Then ensure_capacity(wx,wy) gives: (a) RI(d'). (b) If need_w ≤ aw ∧ need_h ≤ ah, d is unchanged. Else if new_w*new_h ≤ CAP, then alloc_width' = new_w ≥ need_w and alloc_height' = new_h ≥ need_h. Otherwise d is unchanged (fail closed). (c) If need_w ≤ aw ∧ aw*new_h ≤ CAP, alloc_width' = aw: height-only growth keeps the stride and takes the in-place resize path; when aw*new_h > CAP ≥ used_w*new_h, the over-allocated stride compacts to the geometric mean of used_w and min(⌊CAP/new_h⌋, DIM), so both dimensions keep room by the ratio r = √(CAP/(used_w*new_h)), while preserving columns 0..used_w. (d) Corollary: painting columns 0..N one at a time at a fixed height reallocates the width O(log N) times. (e) The old raster's painted rows (columns 0..min(aw, new_w)) are kept as a row-major prefix at the new stride, and new cells are 0. (f) Corollary: over one image, the calls that change the stride allocate ≤ 32*CAP pixels in all. Below the cap the width doubles (≤ 2*CAP). Since aw ≤ 2*used_w until then, the first re-stride the cap limits finds used_w*new_h > CAP/2, so both sides are ≥ 512. After a compaction the next one (with at most one capped width growth between) waits for the box to grow by r, so ln(CAP/box) halves per compaction and, as a box that can still grow has ln(CAP/box) ≥ 512/CAP, there are at most 13 compactions and 13 capped width growths, each ≤ CAP.	width_growth_is_amortized_and_preserves_the_height_fast_path, tall_raster_width_growth_stays_amortized_near_the_pixel_cap, growth_past_an_over_wide_stride_copies_the_raster_a_bounded_number_of_times	HARD: &mut self, checked_mul and an is_some_and closure, NonZeroUsize division, Vec resize and vec! allocation, usize::isqrt, nested chunks/chunks_mut/zip loops with copy_from_slice; trust::skip must be lifted	0,1,2,3,7,8,13
 params-bound	invariant	SixelDecoder::{put,start_params,finish_params}	∀ d∈Reach: d.params.len() ≤ PMAX (8). Because PMAX ≥ 5, a well-formed `#Pc;Pu;Px;Py;Pz` is collected intact, so the cap never changes the decoded result of a colour define.	semicolon_flood_keeps_params_bounded	MEDIUM: Vec push guarded by a len() comparison in a match guard, last_mut, &mut self, an invariant over Reach	0,1,2,5
 ```
 
 ## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
-Every path is `src/tests.rs`.
 
 ```tsv
 file	test	primary	also
@@ -114,6 +78,7 @@ src/tests.rs	unhook_without_hook_is_none	inactive-noop
 src/tests.rs	empty_sequence_is_none	unhook-accept	
 src/tests.rs	width_growth_is_amortized_and_preserves_the_height_fast_path	growth-amortized	
 src/tests.rs	tall_raster_width_growth_stays_amortized_near_the_pixel_cap	growth-amortized	
+src/tests.rs	growth_past_an_over_wide_stride_copies_the_raster_a_bounded_number_of_times	growth-amortized	
 src/tests.rs	small_bodies_decode_to_their_geometry_in_the_defined_colour	decode-refines-model	color-register
 src/tests.rs	oversized_raster_declaration_is_refused_without_allocating	lazy-alloc	unhook-accept
 src/tests.rs	capped_raster_at_the_pixel_limit_still_decodes	unhook-accept	image-shape
@@ -134,21 +99,16 @@ src/tests.rs	rgb_percent_scales_and_clamps_each_component	rgb-percent
 src/tests.rs	hls_to_rgb_follows_dec_shifted_hsl	hls-range	decode-refines-model
 ```
 
-## 3. Coverage
+## 4. Tests §2 does not map
 
-- 22 live tests mapped in §2 across the 14 specs (0 non-spec tests remain; 25 original tests read in the initial 2026-10-15 audit).
+- 23 live tests mapped in §2 across the 14 specs (0 non-spec tests remain; 25 original tests read in the initial 2026-10-15 audit).
 - The biggest collapse is `decode-refines-model`, with 8 primary tests plus 3 shared.
-  `unhook-accept` has 3 primary tests plus 3 shared, and `growth-amortized` has 2.
+  `unhook-accept` has 3 primary tests plus 3 shared, and `growth-amortized` has 3.
 - Gap histogram (gap → specs it blocks, out of 14): 0 → 14, 1 → 11, 2 → 11, 3 → 9, 5 → 8,
   7 → 6, 4 → 5, 8 → 2, 13 → 2, 10 → 1. No spec is blocked by gap 0 alone.
 
-## 4. Tests that are not spec samples
-
-Status (2026-10-15): `param_cap_preserves_valid_color_define` is deleted, and its §2 row is gone. Its `SIXEL_MAX_PARAMS >= 5` const assert is not a tautology (it guards the second clause of `params-bound`), so it was kept as a module-level `const _` in `src/tests.rs` until that clause is proved.
-
-Every regression test I found is an instance of one of the general specs above. That includes
-the DECGRA-only transient, the tall-raster amortization, the `!3$~` repeat leak and the
-semicolon flood.
+The module-level `const _` assert `SIXEL_MAX_PARAMS >= 5` in `src/tests.rs` guards the second clause
+of `params-bound`; it goes once that clause is proved.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
@@ -178,30 +138,24 @@ semicolon flood.
 
 ## 6. Proof order (easiest high-value first)
 
-No spec here is blocked by gap 0 alone. Every one needs at least gap 3 (body widening) or
-gaps 1 and 2 (Vec content and `&mut self` views). So the order starts with the narrowest
-widening.
+Every row needs gap 3 (body widening) or gaps 1 and 2 (Vec content and `&mut self` views), so the
+order starts with the narrowest widening.
 
-1. **`rgb-percent`** (gaps 0, 3, 5). This is pure `u32` arithmetic with no heap and no `self`, so
-   it is an `omega`-class proof once shifts, `|`, `min` and calls are admitted. It retires 1 test
-   and is the lemma `default-palette` and `color-register` cite.
-2. **`spans`** (gaps 0, 2, 3). Two `&self` scalar reads and a ceiling division. It retires 1 test
-   and is the first certified `&self` view in this crate.
-3. **`release`** together with **`inactive-noop`** (gaps 0, 1, 2, 4). These are field
-   assignments plus `Vec::new`, and a bool early return. They need only Vec length, not content,
-   which Trust already models. They retire 2 tests and give the frame lemmas every later spec uses.
-4. **`params-bound`** (gaps 0, 1, 2, 5). This is a length-only invariant over `Reach`. It retires
-   1 test and makes the §4 deletion safe in fact as well as by duplication.
-5. **`color-register`**, then **`default-palette`**. These are the first Vec *content* specs
-   (gap 1 proper). Each is small and indexed by a clamped register. They retire 2 tests.
-6. **`unhook-accept`** and **`image-shape`**. These are the security-relevant cap specs (no
-   over-cap allocation, exact output length). They need the fold over `put` (gaps 5, 7). They retire
-   4 tests and prove the dead-branch lemma (§5.5).
-7. **`growth-amortized`**, then **`lazy-alloc`**. Both first need `ensure_capacity`'s
-   `trust::skip` lifted. They retire 3 tests, and `RI` is the invariant `decode-refines-model`
-   stands on.
-8. **`decode-refines-model`**, after the §5.2 fix (or under `Box(bs) ≤ CAP`). This is the
-   highest-value spec here (8 primary tests), but it needs every gap above plus gap 10. Then
-   **`hook-reset`** follows from it and `release`.
-9. **`hls-range`** last. It is f64 code with a closure, and no gap row covers float reasoning yet.
-   Its real spec (§5.3) has to be written before it is worth proving.
+1. **`rgb-percent`** (gaps 0, 3, 5): pure `u32` arithmetic with no heap and no `self`, once gap 3
+   admits unsigned `saturating_*`, division by a constant, shifts, `|` and a call to an admitted fn.
+   It is the lemma `default-palette` and `color-register` cite.
+2. **`spans`** (gaps 0, 2, 3): two `&self` scalar reads and a ceiling division, the crate's first
+   certified `&self` view.
+3. **`release`** with **`inactive-noop`** (gaps 0, 1, 2, 4): field assignments, `Vec::new` and a
+   bool early return, needing Vec length only. They give the frame lemmas every later spec uses.
+4. **`params-bound`** (gaps 0, 1, 2, 5): a length-only invariant over `Reach`.
+5. **`color-register`**, then **`default-palette`**: the first Vec content specs (gap 1 proper),
+   each indexed by a clamped register.
+6. **`unhook-accept`** and **`image-shape`**: the cap specs (no over-cap allocation, exact output
+   length). They need the fold over `put` (gaps 5, 7) and prove the dead-branch lemma (§5.5).
+7. **`growth-amortized`**, then **`lazy-alloc`**, once `ensure_capacity`'s `trust::skip` is lifted.
+   `RI` is the invariant `decode-refines-model` stands on.
+8. **`decode-refines-model`**, after the §5.2 fix (or under `Box(bs) ≤ CAP`); it needs every gap
+   above plus gap 10. **`hook-reset`** follows from it and `release`.
+9. **`hls-range`** last: f64 locals, `mul_add`, `round`, float-to-int casts and a closure, and no gap
+   row covers float reasoning. Its real spec (§5.3) comes first.

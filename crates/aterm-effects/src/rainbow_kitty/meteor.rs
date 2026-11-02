@@ -1180,7 +1180,7 @@ impl Landing {
             None => 0.0,
         };
         let life = BASE_LIFE_MS.max(burst_ms);
-        self.pin.at + Duration::from_secs_f32(life * (1.0 / 1000.0))
+        crate::effect_util::saturating_add_secs_f32(self.pin.at, life * (1.0 / 1000.0))
     }
 
     /// A party landing: the celebration's bar fan at the caret with no meteor behind it.
@@ -1232,7 +1232,7 @@ impl Landing {
     #[inline]
     #[must_use]
     fn static_end(&self) -> Instant {
-        self.pin.at + FLIGHT_OFF_GLASS_DUR
+        crate::effect_util::saturating_add_duration(self.pin.at, FLIGHT_OFF_GLASS_DUR)
     }
 
     #[inline]
@@ -1267,7 +1267,7 @@ impl Landing {
             }
             ms = ms.max(max_spark * SPARK_CULL_U);
         }
-        self.pin.at + Duration::from_secs_f32(ms * (1.0 / 1000.0))
+        crate::effect_util::saturating_add_secs_f32(self.pin.at, ms * (1.0 / 1000.0))
     }
 }
 
@@ -2550,17 +2550,18 @@ impl<'a> Behind<'a> {
                 if s >= 1.0 || self.zone((x0, x1), (y, y + 1)).is_none() {
                     continue;
                 }
-                let (a, b) = if s * 255.0 < 1.0 {
+                let s255 = s * 255.0;
+                let (a, b) = if s255 < 1.0 {
                     (0, 0)
                 } else {
-                    let cov = (s * 255.0).round().clamp(0.0, 255.0) as u8;
+                    let cov = s255.round().clamp(0.0, 255.0) as u8;
                     (scale_end(a, cov, s), scale_end(b, cov, s))
                 };
                 ramps.ends[k] = a;
                 ramps.ends[k + 1] = b;
                 if a | b == 0 {
                     ramps.lit -= 1;
-                    if s * 255.0 >= 1.0 {
+                    if s255 >= 1.0 {
                         quads.push(GlowQuad {
                             row: r.row,
                             x: r.x,
@@ -2598,11 +2599,12 @@ impl<'a> Behind<'a> {
             let mut y = z0;
             while y < z1 {
                 let k = self.at(cx, y as f32 + 0.5);
-                if k * 255.0 >= 1.0 {
+                let k255 = k * 255.0;
+                if k255 >= 1.0 {
                     let mut piece = h;
                     (piece.y, piece.h) = (y as u16, 1);
                     if k < 1.0 {
-                        piece.color = premul_rgb(h.color, (k * 255.0).round() as u8);
+                        piece.color = premul_rgb(h.color, k255.round() as u8);
                     }
                     halos.push(piece);
                 }
@@ -4420,6 +4422,7 @@ mod tests {
             theme_bg: 0x0016_161C,
             reduced_motion: false,
             light: crate::cursor_glow::Light::OFF,
+            head_dx: 0.5,
         }
     }
 

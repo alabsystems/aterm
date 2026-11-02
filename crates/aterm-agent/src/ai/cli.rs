@@ -37,6 +37,8 @@ aterm ai — this machine's AI CLIs (claude, codex, agy, muse, grok, kimi): heal
                                 CLI's own sign-in only for a person at a terminal; exit 1 while
                                 one is signed out or not installed; --on / --fleet ([harness]
                                 hosts): those machines too, over ssh, for a person at a terminal
+                                (else, or with --read-only or --json, a read of each machine
+                                that fixes nothing, this one included)
   aterm ai login <cli>          sign one CLI in: accounts v2's or its pool's renewal where a
                                 row has an email, else its own sign-in (a person at a terminal)
   aterm ai review [--with <cli>,\u{2026} | --all] [--from <cli>] [--base <ref> | --uncommitted]
@@ -140,7 +142,7 @@ impl Env {
     pub fn var(&self, name: &str) -> Option<String> {
         self.vars
             .iter()
-            .find(|(k, _)| k == name)
+            .rfind(|(k, _)| k == name)
             .map(|(_, v)| v.clone())
     }
 
@@ -174,6 +176,9 @@ pub struct Look {
     pub asker: Asker,
     /// What is held of a fleet document from a URL, when `[ai] fleet` names one.
     pub held: Option<Held>,
+    /// The harness packages installed in the atpkg store, with their versions
+    /// ([`atpkg::harness::installed`]; `docs/DESIGN-harness-repos-2026-10-24.md` §5).
+    pub harness_packages: Vec<atpkg::harness::Installed>,
 }
 
 fn inherited(asker: Asker) -> Result<(Level, String), &'static str> {
@@ -325,6 +330,11 @@ pub fn look(env: &Env) -> Look {
         store_note,
         asker: env.asker,
         held,
+        harness_packages: env
+            .pkg
+            .as_ref()
+            .map(atpkg::harness::installed)
+            .unwrap_or_default(),
     }
 }
 
@@ -1285,8 +1295,7 @@ fn parse_review(args: &[String]) -> Result<ReviewArgs, String> {
             "--timeout" => {
                 let v = value(&mut i, "--timeout")?;
                 r.timeout = Some(
-                    v.parse::<u32>()
-                        .ok()
+                    crate::parse_uint::<u32>(&v)
                         .filter(|n| (config::TIMEOUT_MIN_S..=config::TIMEOUT_MAX_S).contains(n))
                         .ok_or_else(|| {
                             format!(
@@ -1479,6 +1488,7 @@ fn review_verb(
     let id = review::new_id();
     let now = || crate::supervise::limit::unix_now();
     let host = review::Host {
+        config: env.config.as_deref(),
         runner,
         var: &var,
         vars: &env.vars,
@@ -1531,10 +1541,28 @@ fn review_verb(
 
 const SECRET_MAX: u64 = 4096;
 
+fn scrub_vec(mut v: Vec<u8>) {
+    let cap = v.capacity();
+    v.resize(cap, 0);
+    aterm_uds::secret::scrub(&mut v);
+}
+
+fn scrub_string(s: String) {
+    scrub_vec(s.into_bytes());
+}
+
 fn secret_of(path: &Path) -> Result<Vec<u8>, String> {
     use std::io::Read as _;
-    let file =
-        std::fs::File::open(path).map_err(|e| crate::harness::one_line(&e.to_string(), 120))?;
+    let mut open = std::fs::OpenOptions::new();
+    open.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        open.custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK);
+    }
+    let file = open
+        .open(path)
+        .map_err(|e| crate::harness::one_line(&e.to_string(), 120))?;
     let meta = file
         .metadata()
         .map_err(|e| crate::harness::one_line(&e.to_string(), 120))?;
@@ -1549,16 +1577,24 @@ fn secret_of(path: &Path) -> Result<Vec<u8>, String> {
         }
     }
     let mut raw = Vec::new();
-    file.take(SECRET_MAX + 1)
-        .read_to_end(&mut raw)
-        .map_err(|e| crate::harness::one_line(&e.to_string(), 120))?;
+    if let Err(e) = file.take(SECRET_MAX + 1).read_to_end(&mut raw) {
+        scrub_vec(raw);
+        return Err(crate::harness::one_line(&e.to_string(), 120));
+    }
     if raw.len() as u64 > SECRET_MAX {
+        scrub_vec(raw);
         return Err("too large to be a secret key".to_string());
     }
-    let text = std::str::from_utf8(&raw).ok().map(str::trim);
-    Ok(text
-        .and_then(|t| aterm_codec::base64::decode_strict(t.as_bytes()).ok())
-        .unwrap_or(raw))
+    let decoded = std::str::from_utf8(&raw)
+        .ok()
+        .map(str::trim)
+        .and_then(|t| aterm_codec::base64::decode_strict(t.as_bytes()).ok());
+    if let Some(bytes) = decoded {
+        scrub_vec(raw);
+        Ok(bytes)
+    } else {
+        Ok(raw)
+    }
 }
 
 fn doc_of(path: &Path) -> Result<Vec<u8>, String> {
@@ -1645,7 +1681,11 @@ fn fleet_status(env: &Env, out: &mut dyn Write) -> ExitCode {
 fn fleet_keygen(path: &Path, out: &mut dyn Write) -> Result<(), String> {
     use std::io::Write as _;
     let (secret, public) = fleet::keygen()?;
-    let text = aterm_codec::base64::encode(&secret).map_err(|_| "the key does not encode")?;
+    let encoded = aterm_codec::base64::encode(&secret);
+    scrub_vec(secret);
+    let text = encoded.map_err(|_| "the key does not encode")?;
+    let mut line = format!("{text}\n");
+    scrub_string(text);
     let mut open = std::fs::OpenOptions::new();
     open.write(true).create_new(true);
     #[cfg(unix)]
@@ -1653,16 +1693,23 @@ fn fleet_keygen(path: &Path, out: &mut dyn Write) -> Result<(), String> {
         use std::os::unix::fs::OpenOptionsExt as _;
         open.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-    let mut file = open.open(path).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::AlreadyExists {
-            format!("{} already exists; it is never overwritten", path.display())
-        } else {
-            crate::harness::one_line(&e.to_string(), 120)
-        }
-    })?;
-    file.write_all(format!("{text}\n").as_bytes())
-        .and_then(|()| crate::durable::sync_all(&file))
-        .map_err(|e| crate::harness::one_line(&e.to_string(), 120))?;
+    let wrote = open
+        .open(path)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                format!("{} already exists; it is never overwritten", path.display())
+            } else {
+                crate::harness::one_line(&e.to_string(), 120)
+            }
+        })
+        .and_then(|mut file| {
+            file.write_all(line.as_bytes())
+                .and_then(|()| crate::durable::sync_all(&file))
+                .map_err(|e| crate::harness::one_line(&e.to_string(), 120))
+        });
+    let line_bytes = std::mem::take(&mut line);
+    scrub_string(line_bytes);
+    wrote?;
     let _ = writeln!(
         out,
         "secret key: {} (keep private)\n\
@@ -1682,8 +1729,12 @@ fn fleet_sign(doc: &Path, key: &Path, out: &mut dyn Write) -> Result<(), String>
         config::read_fleet(text).map_err(|why| format!("the document is refused: {why}"))?;
     let (seq, _) = fleet::meta(text)?;
     let secret = secret_of(key).map_err(|why| format!("{}: {why}", key.display()))?;
-    let sig = fleet::sign(&secret, &bytes)?;
-    let public = fleet::public_of(&secret)?;
+    let signed = fleet::sign(&secret, &bytes).and_then(|sig| {
+        let public = fleet::public_of(&secret)?;
+        Ok((sig, public))
+    });
+    scrub_vec(secret);
+    let (sig, public) = signed?;
     let to = sig_path(doc);
     crate::harness::upgrade_models::write_atomic_ordered(&to, &format!("{sig}\n"))
         .map_err(|e| crate::harness::one_line(&e.to_string(), 120))?;
@@ -1728,10 +1779,11 @@ fn fleet_verify(
             .ok_or("no key: pass --key <public-key>, or pin one in [ai] fleet_key")?,
     };
     let bytes = doc_of(doc)?;
-    let sig = std::fs::read(sig_path(doc)).map_err(|e| {
+    let sig_file = sig_path(doc);
+    let sig = fleet::read_sig_file(&sig_file, false).map_err(|e| {
         format!(
             "{}: {}",
-            sig_path(doc).display(),
+            sig_file.display(),
             crate::harness::one_line(&e.to_string(), 120)
         )
     })?;

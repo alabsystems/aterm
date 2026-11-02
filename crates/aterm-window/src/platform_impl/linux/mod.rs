@@ -4,6 +4,11 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/mod.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
+// Modified by the aterm project in 2026; see the repository NOTICE. (The X11 types are first-party
+// aterm-x11's, and the event loops answer no `AsFd`: the X11 loop waits in a poll(2) over two
+// descriptors, not one epoll descriptor an embedder could watch, and no aterm crate embeds the
+// loop.)
+
 #![cfg(free_unix)]
 
 #[cfg(all(not(x11_platform), not(wayland_platform)))]
@@ -57,8 +62,27 @@ pub(crate) struct PlatformSpecificEventLoopAttributes {
     pub(crate) forced_backend: Option<Backend>,
 }
 
-mod attributes;
-pub use attributes::{ApplicationName, PlatformSpecificWindowAttributes};
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplicationName {
+    pub general: String,
+    pub instance: String,
+}
+
+impl ApplicationName {
+    #[cfg(wayland_platform)]
+    pub fn new(general: String, instance: String) -> Self {
+        Self { general, instance }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PlatformSpecificWindowAttributes {
+    pub name: Option<ApplicationName>,
+    /// The launcher's startup-notification token (`DESKTOP_STARTUP_ID` on X11, `XDG_ACTIVATION_TOKEN` on Wayland).
+    pub activation_token: Option<String>,
+    /// The X11 window's background (`0x00RRGGBB`) and top-left gravity.
+    pub x11_background: Option<u32>,
+}
 
 #[cfg(x11_platform)]
 pub(crate) static X11_BACKEND: Lazy<Mutex<Result<Arc<XConnection>, XNotSupported>>> =

@@ -119,10 +119,21 @@ impl Token {
 
     /// The token in `path`: `None` when the file is absent or holds only whitespace.
     /// # Errors
-    /// A file that cannot be read, or one whose token [`Token::new`] refuses.
+    /// A file that cannot be read, is not a regular file, exceeds 16 KiB, or holds a token
+    /// [`Token::new`] refuses.
     pub fn from_file(path: &Path) -> Result<Option<Token>, String> {
-        let mut bytes = match std::fs::read(path) {
-            Ok(bytes) => bytes,
+        const TOKEN_FILE_CAP: usize = 16 * 1024;
+        use std::io::Read as _;
+
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
+        }
+        let file = match opts.open(path) {
+            Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => {
                 return Err(format!(
@@ -131,7 +142,38 @@ impl Token {
                 ));
             }
         };
-        let token = if bytes.trim_ascii().is_empty() {
+        match file.metadata() {
+            Ok(meta) if meta.is_file() => {}
+            Ok(_) => {
+                return Err(format!(
+                    "cannot read the token file {}: not a regular file",
+                    path.display()
+                ));
+            }
+            Err(e) => {
+                return Err(format!(
+                    "cannot read the token file {}: {e}",
+                    path.display()
+                ));
+            }
+        }
+        let mut bytes = Vec::new();
+        if let Err(e) = file
+            .take((TOKEN_FILE_CAP + 1) as u64)
+            .read_to_end(&mut bytes)
+        {
+            aterm_uds::secret::scrub(&mut bytes);
+            return Err(format!(
+                "cannot read the token file {}: {e}",
+                path.display()
+            ));
+        }
+        let token = if bytes.len() > TOKEN_FILE_CAP {
+            Err(format!(
+                "cannot read the token file {}: exceeds {TOKEN_FILE_CAP} bytes",
+                path.display()
+            ))
+        } else if bytes.trim_ascii().is_empty() {
             Ok(None)
         } else {
             Token::new(&bytes)
@@ -315,7 +357,10 @@ impl Exchange {
     /// [`RestError::Malformed`] for an answer over its cap; [`RestError::Transport`] when curl
     /// reached no answer.
     pub fn answer(self) -> Result<Answer, RestError> {
-        if self.exit == Some(63) || self.stderr.contains("Maximum file size exceeded") {
+        if self.exit == Some(63)
+            || self.stderr.contains("Maximum file size exceeded")
+            || self.body.len() as u64 > JSON_CAP
+        {
             return Err(RestError::Malformed(format!(
                 "GitHub's answer exceeds its {JSON_CAP}-byte cap"
             )));
@@ -405,7 +450,8 @@ impl Answer {
             300..=399 => Err(RestError::Redirect(format!(
                 "GitHub answered HTTP {} (a redirect, refused: {})",
                 self.status,
-                self.header("location").map_or("no Location", origin_of)
+                self.header("location")
+                    .map_or(std::borrow::Cow::Borrowed("no Location"), origin_of)
             ))),
             status => Err(RestError::Status {
                 status,
@@ -423,13 +469,29 @@ impl Answer {
     }
 }
 
-/// The scheme and authority of `url`, never its path or query (a CDN URL's signature).
-fn origin_of(url: &str) -> &str {
-    let after_scheme = url.find("://").map_or(0, |i| i + 3);
-    let end = url[after_scheme..]
-        .find(['/', '?', '#'])
-        .map_or(url.len(), |i| after_scheme + i);
-    &url[..end]
+/// The scheme and host/port of `url`, never its userinfo, path, or query (a CDN URL's signature).
+fn origin_of(url: &str) -> std::borrow::Cow<'_, str> {
+    if let Some((scheme, rest)) = url.split_once("://")
+        && !scheme.is_empty()
+        && scheme.as_bytes()[0].is_ascii_alphabetic()
+        && scheme
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+    {
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+        if let Some((_, host)) = authority.rsplit_once('@') {
+            return std::borrow::Cow::Owned(format!("{scheme}://{host}"));
+        }
+        return std::borrow::Cow::Borrowed(&url[..scheme.len() + 3 + authority.len()]);
+    }
+    if let Some(rest) = url.strip_prefix("//") {
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+        if let Some((_, host)) = authority.rsplit_once('@') {
+            return std::borrow::Cow::Owned(format!("//{host}"));
+        }
+        return std::borrow::Cow::Borrowed(&url[..2 + authority.len()]);
+    }
+    std::borrow::Cow::Borrowed("a relative URL")
 }
 
 /// Why a call failed.
@@ -508,10 +570,10 @@ impl Prepared {
             .run(&mut self.command, self.stdin.as_ref().map(Secret::expose))
             .map_err(not_started)?;
         let code = String::from_utf8_lossy(&out.stdout);
-        let status = code
-            .trim()
-            .parse::<u16>()
-            .ok()
+        let code = code.trim();
+        let status = (!code.is_empty() && code.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| code.parse::<u16>().ok())
+            .flatten()
             .filter(|status| *status != 0);
         let headers = read_capped(&self.scratch.0.join("headers"), HEADERS_CAP)
             .map(|dump| last_block(&String::from_utf8_lossy(&dump)))
@@ -536,7 +598,7 @@ fn not_started(e: std::io::Error) -> RestError {
     }
 }
 
-/// At most `cap` bytes of `path`; a file curl never wrote (no answer, or an empty one) is empty.
+/// At most `cap + 1` bytes of `path`; a file curl never wrote (no answer, or an empty one) is empty.
 fn read_capped(path: &Path, cap: u64) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
     let file = match std::fs::File::open(path) {
@@ -545,7 +607,7 @@ fn read_capped(path: &Path, cap: u64) -> std::io::Result<Vec<u8>> {
         Err(e) => return Err(e),
     };
     let mut bytes = Vec::new();
-    file.take(cap).read_to_end(&mut bytes)?;
+    file.take(cap.saturating_add(1)).read_to_end(&mut bytes)?;
     Ok(bytes)
 }
 
@@ -932,7 +994,7 @@ impl Client {
                 &mut self.cdn_command(&location, Some((dest_arg, cap))),
                 None,
             )
-            .map_err(|e| RestError::Transport(format!("cannot start curl: {e}")));
+            .map_err(not_started);
         let failure = match out {
             Err(e) => e,
             Ok(out) if out.status.success() => return Ok(()),
@@ -959,6 +1021,7 @@ fn cdn_failure(exit: Option<i32>, stderr: &str, cap: u64) -> RestError {
             status: said
                 .rsplit_once("returned error: ")
                 .and_then(|(_, tail)| tail.get(..3))
+                .filter(|code| code.bytes().all(|b| b.is_ascii_digit()))
                 .and_then(|code| code.parse().ok())
                 .unwrap_or(0),
             message: format!("the asset CDN refused it ({said})"),

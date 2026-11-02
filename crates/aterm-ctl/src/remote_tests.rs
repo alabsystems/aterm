@@ -68,6 +68,63 @@ fn a_drive_names_each_session_by_its_sid() {
     }
 }
 
+/// `--host` sends a read's session named after its verb in front of it, as the drive's peer
+/// reads it, and leaves a meta verb's bare sid where it stands.
+#[test]
+fn a_drive_hears_a_reads_session_in_front_of_its_verb() {
+    static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    fn worker(sent: &str) -> String {
+        if sent.contains(" text") {
+            "OK 0\n".to_owned()
+        } else {
+            "OK schema=1 sid=s-a1\n".to_owned()
+        }
+    }
+    fn drive(host: &str, _: Duration) -> Result<DriveLink, DriveRefused> {
+        assert_eq!(host, "lab-mini");
+        Ok(link(worker, &SEEN))
+    }
+    let local = LocalVerbs {
+        fleet_drive: Some(drive),
+        ..LocalVerbs::NONE
+    };
+    for typed in [
+        "status @s-a1",
+        "text s-a1 tail=3",
+        "read @s-a1",
+        "@s-a1 read trim",
+        "hold s-a1 on",
+    ] {
+        let argv = ["--host", "lab-mini"]
+            .into_iter()
+            .chain(typed.split_whitespace())
+            .map(std::ffi::OsString::from)
+            .collect();
+        let code = crate::real_main(argv, local).unwrap_or_else(|e| panic!("{typed}: {e}"));
+        assert_eq!(code, ExitCode::SUCCESS, "{typed}");
+    }
+    let refusal = crate::real_main(
+        ["--host", "lab-mini", "text", "@3"]
+            .into_iter()
+            .map(std::ffi::OsString::from)
+            .collect(),
+        local,
+    )
+    .expect_err("a local number");
+    assert!(refusal.to_string().contains("by its sid"), "{refusal}");
+    let seen = SEEN.lock().unwrap();
+    assert_eq!(
+        *seen,
+        [
+            "@s-a1 status",
+            "@s-a1 text tail=3",
+            "@s-a1 text",
+            "@s-a1 text trim",
+            "hold s-a1 on"
+        ]
+    );
+}
+
 fn turn_sent(parts: &[&str]) -> io::Result<String> {
     let parts: Vec<String> = parts.iter().map(|part| (*part).to_owned()).collect();
     let (selector, rest) = split_selector(&parts);
@@ -207,6 +264,36 @@ fn a_spawn_over_a_drive_names_no_folder_of_this_mac() {
     ] {
         let refusal = spawn_head(&words(bad), None).expect_err(bad).to_string();
         assert!(refusal.contains(why), "{bad}: {refusal}");
+    }
+}
+
+#[test]
+fn a_plain_fleet_shell_has_one_explicit_folder_and_no_task_channel() {
+    assert_eq!(
+        shell_spawn_head(&["cwd=/private/tmp".to_owned()]).unwrap(),
+        "spawn cwd=/private/tmp"
+    );
+    assert_eq!(
+        shell_spawn_head(&["cwd=/a folder".to_owned(), "raise=false".to_owned()]).unwrap(),
+        "spawn cwd=\"/a folder\" raise=false"
+    );
+    for bad in [
+        "",
+        "cwd=relative",
+        "cwd=/tmp -",
+        "cwd=/tmp len=3",
+        "cwd=/tmp command=sh",
+        "cwd=/tmp -e sh",
+        "cwd=/tmp from=s-x",
+        "cwd=/tmp model=x",
+        "cwd=/tmp agent=",
+        "cwd=/tmp raise=true",
+        "cwd=/tmp cwd=/",
+        "cwd=/tmp raise=false raise=false",
+        "cwd=/tmp split=v",
+        "cwd=/tmp window=0",
+    ] {
+        assert!(shell_spawn_head(&words(bad)).is_err(), "{bad}");
     }
 }
 
@@ -393,6 +480,68 @@ fn a_busy_fleet_handoff_retries_under_one_deadline() {
             "@s-a1 post key=k kind=note -- once"
         ]
     );
+}
+
+#[test]
+fn a_plain_shell_spawn_retries_only_a_complete_predispatch_busy_reply() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    static CASE: AtomicUsize = AtomicUsize::new(0);
+    fn busy(_: &str) -> String {
+        aterm_types::control_verbs::CONTROL_BUSY_LINE.to_owned()
+    }
+    fn ready(_: &str) -> String {
+        "OK s-00000000000000aa\n".to_owned()
+    }
+    fn eof(_: &str) -> String {
+        String::new()
+    }
+    fn partial_busy(_: &str) -> String {
+        aterm_types::control_verbs::CONTROL_BUSY_REPLY.to_owned()
+    }
+    fn surplus(_: &str) -> String {
+        format!(
+            "{}unexpected body\n",
+            aterm_types::control_verbs::CONTROL_BUSY_LINE
+        )
+    }
+    fn drive(host: &str, _: Duration) -> Result<DriveLink, DriveRefused> {
+        assert_eq!(host, "lab-mini");
+        let call = CALLS.fetch_add(1, Ordering::SeqCst);
+        let answer = match CASE.load(Ordering::SeqCst) {
+            0 if call == 0 => busy,
+            0 => ready,
+            1 => eof,
+            2 => partial_busy,
+            3 => surplus,
+            _ => unreachable!(),
+        };
+        Ok(link(answer, &SEEN))
+    }
+    let local = LocalVerbs {
+        fleet_drive: Some(drive),
+        ..LocalVerbs::NONE
+    };
+    for case in 0..4 {
+        CASE.store(case, Ordering::SeqCst);
+        CALLS.store(0, Ordering::SeqCst);
+        SEEN.lock().unwrap().clear();
+        let result = run("lab-mini", &words("spawn cwd=/tmp"), None, &local);
+        let expected = if case == 0 { 2 } else { 1 };
+        assert_eq!(CALLS.load(Ordering::SeqCst), expected, "case {case}");
+        assert_eq!(
+            SEEN.lock().unwrap().as_slice(),
+            vec!["spawn cwd=/tmp"; expected],
+            "case {case}: only the complete Busy response permits another spawn"
+        );
+        assert_eq!(
+            matches!(result, Ok(code) if code == ExitCode::SUCCESS),
+            case == 0,
+            "case {case}: {result:?}"
+        );
+    }
 }
 
 #[test]
@@ -784,6 +933,38 @@ fn a_reply_cut_at_a_shorter_timeout_is_said_as_that_timeout_not_the_peers() {
     }
 }
 
+/// A cut names the deadline it ran out at, a part of a second included: a test world's seam, an
+/// `await task` leg's `timeout=` and a `--timeout` can each make one.
+/// NEGATIVE CONTROL: whole seconds alone say a tenth of a second as `0 s`.
+#[test]
+fn a_cut_names_a_deadline_under_a_second_as_it_is() {
+    let cut = |within| {
+        closed(
+            "lab-mini",
+            "@s-a1 status\n",
+            within,
+            io::ErrorKind::WouldBlock.into(),
+        )
+        .to_string()
+    };
+    let own = cut(Within::Drive(Duration::from_millis(100)));
+    assert!(
+        own.starts_with("lab-mini did not answer within 0.1 s (its aterm is stopped"),
+        "{own}"
+    );
+    let flag = cut(Within::Timeout(
+        Duration::from_millis(1500),
+        Longer::Drive(Duration::from_millis(9500)),
+    ));
+    assert!(
+        flag.starts_with(
+            "no answer came from lab-mini within this call's --timeout of 1.5 s (a longer \
+             --timeout, or 0, waits up to the drive's own 9.5 s)"
+        ),
+        "{flag}"
+    );
+}
+
 #[test]
 fn a_handshake_that_never_comes_waits_the_callers_deadline_and_exits_2() {
     static ASKED: Mutex<Vec<Duration>> = Mutex::new(Vec::new());
@@ -962,18 +1143,21 @@ fn host_any_spawns_a_claude_or_codex_worker_alone() {
         fleet_drive: Some(never),
         ..LocalVerbs::NONE
     };
-    for (line, why) in [
-        ("survey", "run `aterm ctl survey --fleet`"),
-        ("@s-a1 spawn agent=claude -", "name no @<sel>"),
-        ("spawn agent=agy -", "a Claude Code or Codex worker"),
-        ("spawn -", "spawns a worker alone"),
-        ("spawn agent=claude", "end the request with -"),
-        ("spawn agent=claude cwd=rel -", "absolute path"),
+    for line in [
+        "survey",
+        "@s-a1 spawn agent=claude -",
+        "spawn agent=agy -",
+        "spawn -",
+        "spawn cwd=/tmp",
+        "spawn agent=claude",
+        "spawn agent=claude cwd=rel -",
     ] {
-        let refusal = run(ANY_TEST, &words(line), None, &local)
-            .expect_err(line)
-            .to_string();
-        assert!(refusal.contains(why), "{line}: {refusal}");
+        let refusal = run(ANY_TEST, &words(line), None, &local).expect_err(line);
+        assert_eq!(
+            refusal.kind(),
+            io::ErrorKind::InvalidInput,
+            "{line}: {refusal}"
+        );
     }
     let unlinked = run(
         ANY_TEST,

@@ -72,6 +72,7 @@ pub(crate) fn ask() -> crate::needs::HarnessAsk {
         more: 1,
         others: Vec::new(),
         program: aterm_phase::Program::Claude,
+        tail: crate::needs::NeedTail::CarryingOn,
     }
 }
 
@@ -79,8 +80,8 @@ pub(crate) fn ask() -> crate::needs::HarnessAsk {
 fn a_holds_words_come_in_five_forms_from_one_function() {
     let hold = glass(held(), TODAY);
     let need = ask();
-    let words = |form| hold_words(&hold, Some(&need), form, Some(TODAY));
-    let legs = "2 unpushed commits; open work in its report: follow-up, not pushed";
+    let words = |form| hold_words(&hold, Some(&need), form, Some(TODAY), None);
+    let legs = "2 unpushed commits; open in its report: follow-up, not pushed";
     assert_eq!(
         words(HoldForm::Line).as_deref(),
         Some(
@@ -109,12 +110,13 @@ fn a_holds_words_come_in_five_forms_from_one_function() {
     );
     assert_eq!(
         words(HoldForm::Hover).as_deref(),
-        Some(format!("not landed yet, needs you; {legs}").as_str()),
-        "no clock and no need's words on the hover"
+        Some(format!("not landed yet, {legs}").as_str()),
+        "no clock and no need on the hover: the need's own line stands above it"
     );
     assert_eq!(
         words(HoldForm::Tip).as_deref(),
-        Some(format!("not landed yet: needs you; {legs} \u{b7} 3 nudges").as_str())
+        Some(format!("not landed yet: {legs} \u{b7} 3 nudges").as_str()),
+        "no need on a tip: the need's own line stands above it"
     );
     let spoken = words(HoldForm::Spoken).expect("spoken");
     assert!(
@@ -123,7 +125,7 @@ fn a_holds_words_come_in_five_forms_from_one_function() {
             .all(|c| c.is_alphanumeric() || matches!(c, ' ' | '.' | ':' | ',')),
         "glyph-free: {spoken}"
     );
-    assert!(spoken.starts_with("Not landed yet. Needs you: sign 0.48.0 the release credential on this Mac. And 1 more. 2 unpushed commits. Open work in its report: follow up, not pushed."), "{spoken}");
+    assert!(spoken.starts_with("Not landed yet. Needs you: sign 0.48.0 the release credential on this Mac. And 1 more. 2 unpushed commits. Open in its report: follow up, not pushed."), "{spoken}");
     assert!(
         spoken.ends_with(" Landing since 14:02, 3 nudges."),
         "{spoken}"
@@ -137,7 +139,7 @@ fn a_holds_words_come_in_five_forms_from_one_function() {
 
     let before = glass(held(), TODAY - 6);
     let day = crate::claude_lights::Weekday::of_days(TODAY - 6);
-    let line = hold_words(&before, Some(&need), HoldForm::Line, Some(TODAY)).expect("a line");
+    let line = hold_words(&before, Some(&need), HoldForm::Line, Some(TODAY), None).expect("a line");
     assert!(
         line.ends_with(&format!(
             " \u{b7} landing since {} 14:02 \u{b7} 3 nudges",
@@ -145,7 +147,7 @@ fn a_holds_words_come_in_five_forms_from_one_function() {
         )),
         "{line}"
     );
-    let spoken = hold_words(&before, None, HoldForm::Spoken, Some(TODAY)).expect("spoken");
+    let spoken = hold_words(&before, None, HoldForm::Spoken, Some(TODAY), None).expect("spoken");
     assert!(
         spoken.ends_with(&format!(
             " Landing since {} at 14:02, 3 nudges.",
@@ -155,7 +157,7 @@ fn a_holds_words_come_in_five_forms_from_one_function() {
     );
 
     let fresh = glass(unread(), TODAY);
-    let said = |form| hold_words(&fresh, Some(&need), form, Some(TODAY));
+    let said = |form| hold_words(&fresh, Some(&need), form, Some(TODAY), None);
     assert_eq!(
         said(HoldForm::Line).as_deref(),
         Some("landing since 14:02 \u{b7} 3 nudges")
@@ -178,10 +180,13 @@ fn a_holds_words_come_in_five_forms_from_one_function() {
         TODAY,
     );
     assert_eq!(
-        hold_words(&quiet, None, HoldForm::Line, Some(TODAY)).as_deref(),
+        hold_words(&quiet, None, HoldForm::Line, Some(TODAY), None).as_deref(),
         Some("landing since 14:02")
     );
-    assert_eq!(hold_words(&quiet, None, HoldForm::Tip, Some(TODAY)), None);
+    assert_eq!(
+        hold_words(&quiet, None, HoldForm::Tip, Some(TODAY), None),
+        None
+    );
 
     let every = glass(
         LandHeld {
@@ -197,10 +202,10 @@ fn a_holds_words_come_in_five_forms_from_one_function() {
         TODAY,
     );
     assert_eq!(
-        hold_words(&every, None, HoldForm::Line, Some(TODAY)).as_deref(),
+        hold_words(&every, None, HoldForm::Line, Some(TODAY), None).as_deref(),
         Some(
             "not landed yet: a need named earlier in its reply; 1 changed file, 2 stashes, 4 \
-             commits not on the remote main; open work in its report; no \u{201c}Nothing \
+             commits not on the remote main; what it listed as left; no \u{201c}Nothing \
              left:\u{201d} defense yet; a reply too tall to read whole \u{b7} landing since 14:02 \
              \u{b7} 1 nudge"
         )
@@ -214,16 +219,55 @@ fn a_holds_words_come_in_five_forms_from_one_function() {
         TODAY,
     );
     assert_eq!(
-        hold_words(&unread, None, HoldForm::Line, Some(TODAY)).as_deref(),
+        hold_words(&unread, None, HoldForm::Line, Some(TODAY), None).as_deref(),
         Some(
             "not landed yet: a repository that could not be read; no \u{201c}Nothing \
              left:\u{201d} defense yet \u{b7} landing since 14:02 \u{b7} 1 nudge"
         )
     );
-    let spoken = hold_words(&unread, None, HoldForm::Spoken, Some(TODAY)).expect("spoken");
+    let spoken = hold_words(&unread, None, HoldForm::Spoken, Some(TODAY), None).expect("spoken");
     assert!(
         spoken.contains("A repository that could not be read."),
         "{spoken}"
+    );
+}
+
+/// A HOLD ON WORK OFF `HEAD` NAMES ITS COUNTS (R-7): a repository leg held only by a
+/// submodule's commits on no remote or by commits parked on another branch the session used says
+/// those counts. CONTROL: a repository leg with no count says `work no remote main has`.
+#[test]
+fn a_hold_on_work_off_head_names_its_counts() {
+    let line = |sub_unpushed: u16, parked: u16| {
+        let only = glass(
+            LandHeld {
+                legs: HoldLeg::Repo.bit(),
+                unpushed: 0,
+                sub_unpushed,
+                parked,
+                ..held()
+            },
+            TODAY,
+        );
+        hold_words(&only, None, HoldForm::Line, Some(TODAY), None).expect("a line")
+    };
+    let tail = " \u{b7} landing since 14:02 \u{b7} 3 nudges";
+    assert_eq!(
+        line(1, 2),
+        format!(
+            "not landed yet: 1 submodule commit on no remote, 2 commits parked on other \
+             branches{tail}"
+        )
+    );
+    assert_eq!(
+        line(3, 1),
+        format!(
+            "not landed yet: 3 submodule commits on no remote, 1 commit parked on another \
+             branch{tail}"
+        )
+    );
+    assert_eq!(
+        line(0, 0),
+        format!("not landed yet: work no remote main has{tail}")
     );
 }
 
@@ -260,16 +304,16 @@ fn the_open_leg_names_what_the_nudge_named_never_as_a_quote() {
             HoldForm::Hover,
             HoldForm::Tip,
         ] {
-            let said = hold_words(&hold, None, form, Some(TODAY)).expect("said");
+            let said = hold_words(&hold, None, form, Some(TODAY), None).expect("said");
             assert!(
-                said.contains(&format!("open work in its report: {word}"))
+                said.contains(&format!("open in its report: {word}"))
                     && !said.contains(&format!("\u{201c}{word}\u{201d}")),
                 "{form:?} of {word:?}: {said}"
             );
         }
-        let spoken = hold_words(&hold, None, HoldForm::Spoken, Some(TODAY)).expect("spoken");
+        let spoken = hold_words(&hold, None, HoldForm::Spoken, Some(TODAY), None).expect("spoken");
         let named = spoken
-            .split_once("Open work in its report: ")
+            .split_once("Open in its report: ")
             .and_then(|(_, rest)| rest.split_once('.'))
             .map(|(named, _)| named);
         assert!(
@@ -330,6 +374,7 @@ fn row(
     HarnessSessionRow {
         stopped: None,
         waiting: None,
+        switch_asked: false,
         local_id: 7,
         title: "fix the build".to_string(),
         name: "fix the build".to_string(),
@@ -343,7 +388,12 @@ fn row(
         today: TODAY,
         setting: "follows the default".to_string(),
         need,
-        hold: hold.map(|hold| ShownHold { hold, by: None }),
+        hold: hold.map(|hold| ShownHold {
+            hold,
+            by: None,
+            said: None,
+        }),
+        receipt: None,
     }
 }
 
@@ -369,8 +419,8 @@ fn state_line_says_why_land_holds() {
             .as_deref(),
         Some(
             format!(
-                "not landed yet: needs you: {} (+1 more); 2 unpushed commits; open work in \
-                 its report: follow-up, not pushed \u{b7} landing since 14:02 \u{b7} 3 nudges \
+                "not landed yet: needs you: {} (+1 more); 2 unpushed commits; open in its \
+                 report: follow-up, not pushed \u{b7} landing since 14:02 \u{b7} 3 nudges \
                  \u{b7} {pause}",
                 ask().first
             )
@@ -400,8 +450,8 @@ fn state_line_says_why_land_holds() {
             .state_line()
             .as_deref(),
         Some(
-            "not landed yet: a need named earlier in its reply; 2 unpushed commits; open work \
-             in its report: follow-up, not pushed \u{b7} landing since 14:02 \u{b7} 3 nudges"
+            "not landed yet: a need named earlier in its reply; 2 unpushed commits; open in \
+             its report: follow-up, not pushed \u{b7} landing since 14:02 \u{b7} 3 nudges"
         )
     );
     assert_eq!(
@@ -416,10 +466,12 @@ fn state_line_says_why_land_holds() {
         ..pausing
     };
     assert_eq!(
-        row(AutopilotView::Land, landed, None, hold)
-            .state_line()
-            .as_deref(),
-        Some("landed 17:42")
+        row(AutopilotView::Land, landed, None, hold).state_line(),
+        Some(format!(
+            "landed 17:42{}{}",
+            crate::native_ui::FACT_SEPARATOR,
+            aterm_agent::supervise::mode_words::NO_RECORD
+        ))
     );
     let theirs = ChipGlass {
         task: Some(TaskFace::Theirs),
@@ -450,6 +502,7 @@ pub(crate) fn held_session(session: &mut crate::harness_screen::HarnessSession) 
             0,
         ),
         by: None,
+        said: None,
     });
 }
 
@@ -504,7 +557,9 @@ fn driven(app: &App) -> Option<String> {
         hover
             .split(crate::native_ui::FACT_SEPARATOR)
             .flat_map(|part| part.lines())
-            .find(|part| part.starts_with("driven by aterm"))
+            .find(|part| {
+                part.starts_with("driven by aterm") || part.starts_with("codex-alab autopilot")
+            })
             .map(str::to_string)
     })
 }
@@ -537,8 +592,9 @@ fn meta(app: &mut App, rest: &str) {
     }
 }
 
-const WHY: &str = "driven by aterm (land: not landed yet, needs you; 2 unpushed commits; open \
-                   work in its report: follow-up, not pushed)";
+/// The hover of [`held`]: its need is said once, by the need's own line, not again here.
+const WHY: &str = "driven by aterm (land: not landed yet, 2 unpushed commits; open in its report: follow-up, \
+     not pushed)";
 
 #[test]
 fn who_drives_says_why_a_landing_holds() {
@@ -822,8 +878,8 @@ fn a_worker_reads_landing_only_after_its_instruction() {
     assert_eq!(
         row.landing_tip.as_deref(),
         Some(
-            "not landed yet: needs you; 2 unpushed commits; open work in its report: \
-             follow-up, not pushed \u{b7} 3 nudges"
+            "not landed yet: 2 unpushed commits; open in its report: follow-up, not pushed \
+             \u{b7} 3 nudges"
         )
     );
 }
@@ -900,7 +956,7 @@ fn a_fixed_legs_words_and_the_tip_are_the_ones_beside_the_leg() {
                 },
                 TODAY,
             );
-            let said = |form| hold_words(&hold, None, form, Some(TODAY));
+            let said = |form| hold_words(&hold, None, form, Some(TODAY), None);
             assert_eq!(
                 said(HoldForm::Tip),
                 Some(held_tip(words, nudges)),
@@ -942,8 +998,14 @@ fn tell_stop(
 /// Settings page's state line, the tab's hover, the worker row's tip and `status held=`.
 fn stop_surfaces(app: &mut App, view: crate::autopilot::AutopilotView) -> [String; 6] {
     let chip = ChipGlass::default();
-    let title =
-        crate::claude_lights::title_parts(&app.harness_glass, &app.pool, 0, &(view, chip)).whole;
+    let title = crate::claude_lights::title_parts(
+        &app.harness_glass,
+        &app.hold_said,
+        &app.pool,
+        0,
+        &(view, chip),
+    )
+    .whole;
     let (_, spoken) = app.autopilot_spoken(0, view, &chip);
     if !app.harness_page_shown() {
         assert!(app.open_harness_settings(WindowId(0), crate::harness_screen::HarnessFocus::Top));
@@ -977,10 +1039,8 @@ fn a_stopped_tab_says_so_wherever_its_autopilot_is_read_until_the_hold_lifts() {
     use aterm_agent::supervise::policy::exception::Exception;
     let sep = crate::native_ui::FACT_SEPARATOR;
     for held_by in HeldBy::ALL {
-        for standing in [
-            Exception::repeats_land(held_by, None),
-            Exception::repeats(held_by),
-        ] {
+        {
+            let standing = Exception::repeats(held_by);
             let case = format!("{held_by:?} {:?}", standing.when);
             let (mut app, sid, _host) = desk("land");
             tell_hold(&mut app, &sid, Some(held()));
@@ -1010,7 +1070,7 @@ fn a_stopped_tab_says_so_wherever_its_autopilot_is_read_until_the_hold_lifts() {
             assert!(
                 title.starts_with(&format!(
                     "autopilot: land \u{2014} {}{sep}not landed yet",
-                    stop_words(held_by, HoldForm::Title)
+                    stop_words(held_by, HoldForm::Title, false)
                 )),
                 "{case}: {title}"
             );
@@ -1019,13 +1079,13 @@ fn a_stopped_tab_says_so_wherever_its_autopilot_is_read_until_the_hold_lifts() {
                 "{case}: the trail gives way: {title}"
             );
             assert!(
-                spoken.starts_with(&stop_words(held_by, HoldForm::Spoken)),
+                spoken.starts_with(&stop_words(held_by, HoldForm::Spoken, false)),
                 "{case}: {spoken}"
             );
             assert!(
                 line.starts_with(&format!(
                     "{}{sep}not landed yet: ",
-                    stop_words(held_by, HoldForm::Line)
+                    stop_words(held_by, HoldForm::Line, false)
                 )),
                 "{case}: {line}"
             );
@@ -1036,14 +1096,14 @@ fn a_stopped_tab_says_so_wherever_its_autopilot_is_read_until_the_hold_lifts() {
             assert!(
                 hover.starts_with(&format!(
                     "driven by aterm (land: {}; not landed yet, ",
-                    stop_words(held_by, HoldForm::Hover)
+                    stop_words(held_by, HoldForm::Hover, false)
                 )),
                 "{case}: {hover}"
             );
             assert!(
                 tip.starts_with(&format!(
                     "{}{sep}not landed yet: ",
-                    stop_words(held_by, HoldForm::Tip)
+                    stop_words(held_by, HoldForm::Tip, false)
                 )),
                 "{case}: {tip}"
             );
@@ -1070,25 +1130,29 @@ fn a_stopped_cruise_says_the_stop_in_place_of_its_promise() {
     let promise = mode_words(Autopilot::Cruise).chip;
     let before = stop_surfaces(&mut app, AutopilotView::Cruise);
     assert!(before[0].contains(promise), "CONTROL: {before:#?}");
-    tell_stop(&mut app, &sid, Some(Exception::repeats(HeldBy::SameReply)));
+    tell_stop(
+        &mut app,
+        &sid,
+        Some(Exception::repeats_by(HeldBy::SameReply, true)),
+    );
     let [title, _, line, hover, _, field] = stop_surfaces(&mut app, AutopilotView::Cruise);
     assert!(
         title.starts_with(&format!(
             "autopilot: cruise \u{2014} {}",
-            stop_words(HeldBy::SameReply, HoldForm::Title)
+            stop_words(HeldBy::SameReply, HoldForm::Title, true)
         )),
         "{title}"
     );
     assert!(!title.contains(promise), "{title}");
     assert!(
-        line.starts_with(&stop_words(HeldBy::SameReply, HoldForm::Line)),
+        line.starts_with(&stop_words(HeldBy::SameReply, HoldForm::Line, true)),
         "{line}"
     );
     assert_eq!(
         hover,
         format!(
             "driven by aterm (cruise: {})",
-            stop_words(HeldBy::SameReply, HoldForm::Hover)
+            stop_words(HeldBy::SameReply, HoldForm::Hover, true)
         )
     );
     assert_eq!(field, HeldBy::SameReply.word());
@@ -1126,7 +1190,10 @@ fn a_stopped_cruise_says_the_stop_in_place_of_its_promise() {
             None,
         );
         let lines = menu_lines(&compose_status_menu(&glance, NOW), &[]);
-        let tip = format!("tip=\"{}\"", stop_words(HeldBy::SameReply, HoldForm::Tip));
+        let tip = format!(
+            "tip=\"{}\"",
+            stop_words(HeldBy::SameReply, HoldForm::Tip, true)
+        );
         assert_eq!(
             lines.iter().filter(|l| l.contains(&tip)).count(),
             1,
@@ -1139,6 +1206,51 @@ fn a_stopped_cruise_says_the_stop_in_place_of_its_promise() {
         off[..4].iter().all(|s| !s.contains(STOPPED_TYPING)),
         "Off types nothing, so no stop is said: {off:#?}"
     );
+}
+
+/// THE STOP NAMES THE PERSON'S SWITCH TO LAND ONLY WHERE IT ASKS (v6 §14.17 item 3): under
+/// Cruise, over a hold whose exception the switch clears (`Exception::lifted_by_switch`), the
+/// chip's title and description and the state line say `your switch to Land`. NEGATIVE CONTROLS:
+/// the same hold under Land, where there is no switch to make, and under Cruise a hold whose
+/// exception the switch does not clear (a wall's, or one whose ask was spent), say only the
+/// person's turn and the agent's work.
+#[test]
+fn the_stop_names_the_switch_to_land_only_under_cruise_where_it_asks() {
+    use crate::autopilot::AutopilotView;
+    use aterm_agent::harness::acts::{HeldBy, TYPES_AGAIN, TYPES_AGAIN_OR_SWITCH};
+    use aterm_agent::supervise::policy::exception::Exception;
+    let switch = "your switch to Land";
+    let (mut app, sid, _host) = desk("cruise");
+    tell_stop(
+        &mut app,
+        &sid,
+        Some(Exception::repeats_by(HeldBy::SameReply, true)),
+    );
+    let [title, spoken, line, ..] = stop_surfaces(&mut app, AutopilotView::Cruise);
+    for said in [&title, &spoken, &line] {
+        assert!(said.contains(TYPES_AGAIN_OR_SWITCH), "{said}");
+    }
+    tell_stop(&mut app, &sid, Some(Exception::repeats(HeldBy::SameReply)));
+    let [title, spoken, line, ..] = stop_surfaces(&mut app, AutopilotView::Cruise);
+    for said in [&title, &spoken, &line] {
+        assert!(
+            said.contains(TYPES_AGAIN) && !said.contains(switch),
+            "CONTROL: no switch clears it: {said}"
+        );
+    }
+    tell_stop(
+        &mut app,
+        &sid,
+        Some(Exception::repeats_by(HeldBy::SameReply, true)),
+    );
+    meta(&mut app, "set autopilot land");
+    let [title, spoken, line, ..] = stop_surfaces(&mut app, AutopilotView::Land);
+    for said in [&title, &spoken, &line] {
+        assert!(
+            said.contains(TYPES_AGAIN) && !said.contains(switch),
+            "CONTROL: under Land: {said}"
+        );
+    }
 }
 
 /// An outage wait (§14.17.5.2) is said by Settings ▸ Harness's state line and `status waiting=`
@@ -1222,6 +1334,64 @@ fn an_outage_wait_is_said_on_the_state_line_and_in_status_alone() {
     app.harness_screen_moved();
     let released = stop_surfaces(&mut app, AutopilotView::Cruise);
     assert!(!released[2].contains("waiting:"), "{}", released[2]);
+}
+
+/// Land's one ask at the person's switch over a held tab (v6 §14.17 item 3) is said by Settings ▸
+/// Harness's state line and `status land_asked=` while its answer is unread, and only while the
+/// chip reads `⤓ land`: the chip's title and description, the hover, the worker's tip and `held=`
+/// stay as they were, and its answer or the supervisor's release takes it down.
+#[test]
+fn the_switchs_ask_is_said_on_the_state_line_and_in_status_while_it_stands() {
+    use crate::autopilot::AutopilotView;
+    use aterm_agent::harness::acts::SWITCH_ASKED;
+    let (mut app, sid, _host) = desk("land");
+    let before = stop_surfaces(&mut app, AutopilotView::Land);
+    assert!(
+        before.iter().all(|s| !s.contains(SWITCH_ASKED)),
+        "CONTROL: {before:#?}"
+    );
+    assert_eq!(status(&app, "land_asked"), "-", "CONTROL: no ask");
+    app.apply_harness_fact(&sid, crate::HarnessFact::SwitchAsked(true));
+    let after = stop_surfaces(&mut app, AutopilotView::Land);
+    assert!(
+        after[2].starts_with(SWITCH_ASKED),
+        "the state line leads with it: {}",
+        after[2]
+    );
+    assert_eq!(status(&app, "land_asked"), "switch");
+    assert_eq!(
+        [&after[0], &after[1], &after[3], &after[4], &after[5]],
+        [&before[0], &before[1], &before[3], &before[4], &before[5]],
+        "no chip title, description, hover, tip or held= says it"
+    );
+    meta(&mut app, "set autopilot cruise");
+    let cruise = stop_surfaces(&mut app, AutopilotView::Cruise);
+    assert!(
+        !cruise[2].contains(SWITCH_ASKED),
+        "not under Cruise: {}",
+        cruise[2]
+    );
+    assert_eq!(status(&app, "land_asked"), "-", "not under Cruise");
+    meta(&mut app, "set autopilot land");
+    assert_eq!(status(&app, "land_asked"), "switch", "CONTROL: Land again");
+    app.apply_harness_fact(&sid, crate::HarnessFact::SwitchAsked(false));
+    let answered = stop_surfaces(&mut app, AutopilotView::Land);
+    assert_eq!(answered, before, "its answer takes it down");
+    assert_eq!(status(&app, "land_asked"), "-");
+    app.apply_harness_fact(&sid, crate::HarnessFact::SwitchAsked(true));
+    assert_eq!(status(&app, "land_asked"), "switch", "CONTROL: told again");
+    let ctx = app.pool.get(0).expect("session 0").ctx.clone();
+    assert!(crate::session_timeline::release_supervisor(
+        &ctx,
+        None,
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl
+    ));
+    assert_eq!(
+        status(&app, "land_asked"),
+        "-",
+        "a session this window no longer supervises is asked nothing it says"
+    );
 }
 
 /// Session 0 as a codex-alab tab under `word`, no claim standing yet: codex in front, its reader
@@ -1324,10 +1494,11 @@ fn codex_stop_surfaces(app: &mut App, sid: &str) -> [String; 5] {
 
 /// CODEX-ALAB'S OWN STOP IS SAID WHERE ATERM'S IS, WHILE ITS PROVEN CLAIM STANDS (§14.3.2): a stop
 /// codex-alab tells on its claim (`meta set harness_held`) is `status held=`'s arm, leads the
-/// Settings ▸ Harness state line and the worker row's tip in aterm's stop words led by its own
-/// name (`codex-alab stopped typing: …`), so neither reads as aterm's stop, and is said after the
-/// mode on the Overview and the hover, which name aterm as the driver, as codex-alab's (`driven by
-/// aterm (land: codex-alab stopped typing)`); its unset, and the claim's end, take every one of
+/// Settings ▸ Harness state line and the worker row's tip in a self-claim's stop words led by its
+/// own name (`codex-alab stopped typing: …`, whose restart leaves out aterm's ask at a switch to
+/// Land), so neither reads as aterm's stop, and is said after the
+/// mode on the Overview and the hover, which name the native codex-alab autopilot
+/// (`codex-alab autopilot (land: codex-alab stopped typing)`); its unset, and the claim's end, take every one of
 /// them down. NEGATIVE CONTROLS: the same tab before its claim and after it says no stop, a stop
 /// aterm's own loop put on its glass is never said under codex-alab's claim, and aterm's own stop
 /// is said only while aterm holds the claim, in its own words with no name before them.
@@ -1358,10 +1529,10 @@ fn a_codex_alabs_own_stop_is_said_where_aterms_is_while_its_claim_stands() {
     let claimed = codex_stop_surfaces(&mut app, &sid);
     quiet(&claimed, "CONTROL: claimed, nothing told");
     assert_eq!(
-        claimed[1], "driven by aterm (land)",
+        claimed[1], "codex-alab autopilot (land)",
         "CONTROL: the Overview names the claim's driver"
     );
-    assert!(super::on_stopped(&mut app, 0, Some(HeldBy::NoWork)));
+    assert!(super::on_stopped(&mut app, 0, Some(HeldBy::NoWork), true));
     assert_eq!(
         app.harness_glass[&0].stopped(),
         Some(HeldBy::NoWork),
@@ -1371,7 +1542,7 @@ fn a_codex_alabs_own_stop_is_said_where_aterms_is_while_its_claim_stands() {
         &codex_stop_surfaces(&mut app, &sid),
         "aterm's own glass under codex-alab's claim",
     );
-    assert!(super::on_stopped(&mut app, 0, None));
+    assert!(super::on_stopped(&mut app, 0, None, false));
 
     for held_by in HeldBy::ALL {
         let case = format!("{held_by:?}");
@@ -1381,11 +1552,15 @@ fn a_codex_alabs_own_stop_is_said_where_aterms_is_while_its_claim_stands() {
         );
         let [field, overview, hover, line, tip] = codex_stop_surfaces(&mut app, &sid);
         assert_eq!(field, held_by.word(), "{case}");
-        let named = |form| format!("codex-alab {}", stop_words(held_by, form));
-        let driven = format!("driven by aterm (land: {})", named(HoldForm::Hover));
+        let named = |form| format!("codex-alab {}", stop_words(held_by, form, false));
+        let driven = format!("codex-alab autopilot (land: {})", named(HoldForm::Hover));
         assert_eq!(overview, driven, "{case}");
         assert_eq!(hover, driven, "{case}");
         assert!(line.starts_with(&named(HoldForm::Line)), "{case}: {line}");
+        assert!(
+            !line.contains(&stop_words(held_by, HoldForm::Line, true)),
+            "{case}: aterm's restart, its switch to Land's ask, is not codex-alab's: {line}"
+        );
         assert_eq!(tip, named(HoldForm::Tip), "{case}");
     }
     assert_eq!(self_meta(&mut app, "unset harness_held", 4), "OK\n");
@@ -1404,7 +1579,7 @@ fn a_codex_alabs_own_stop_is_said_where_aterms_is_while_its_claim_stands() {
     assert_eq!(status(&app, "held"), "same-reply", "CONTROL: aterm's claim");
     assert_eq!(
         app.status_session_row(&handle).landing_tip.as_deref(),
-        Some(stop_words(HeldBy::SameReply, HoldForm::Tip).as_str()),
+        Some(stop_words(HeldBy::SameReply, HoldForm::Tip, false).as_str()),
         "CONTROL: aterm's claim"
     );
     let ctx = app.pool.get(0).expect("session 0").ctx.clone();
@@ -1594,8 +1769,9 @@ fn a_codex_alabs_own_land_hold_is_shown_where_aterms_is_while_its_claim_stands()
     use crate::harness_glass::stop_words;
     use aterm_agent::harness::acts::HeldBy;
     let since = SINCE_S.to_string();
-    let tip = hold_words(&glass(held(), TODAY), None, HoldForm::Tip, None).expect("a tip");
-    let hover = hold_words(&glass(held(), TODAY), None, HoldForm::Hover, None).expect("a hover");
+    let tip = hold_words(&glass(held(), TODAY), None, HoldForm::Tip, None, None).expect("a tip");
+    let hover =
+        hold_words(&glass(held(), TODAY), None, HoldForm::Hover, None, None).expect("a hover");
     let shown = |surfaces: &HoldSurfaces, case: &str| {
         assert_eq!(
             surfaces.status,
@@ -1606,12 +1782,12 @@ fn a_codex_alabs_own_land_hold_is_shown_where_aterms_is_while_its_claim_stands()
         assert_eq!(surfaces.tip, format!("codex-alab: {tip}"), "{case}");
         assert_eq!(surfaces.overview.0, format!("codex-alab: {tip}"), "{case}");
         assert_eq!(
-            surfaces.overview.1, "driven by aterm (land)",
+            surfaces.overview.1, "codex-alab autopilot (land)",
             "{case}: the driver says no hold"
         );
         assert_eq!(
             surfaces.hover,
-            format!("driven by aterm (land: codex-alab: {hover})"),
+            format!("codex-alab autopilot (land: codex-alab: {hover})"),
             "{case}"
         );
         assert!(
@@ -1661,7 +1837,7 @@ fn a_codex_alabs_own_land_hold_is_shown_where_aterms_is_while_its_claim_stands()
     );
     assert_eq!(begun.tip, "", "no yield read, no nudge: no tip");
     assert_eq!(begun.overview.0, "", "no yield read: no held line");
-    assert_eq!(begun.hover, "driven by aterm (land)", "no yield read");
+    assert_eq!(begun.hover, "codex-alab autopilot (land)", "no yield read");
     assert!(
         begun.line.starts_with("codex-alab: landing since "),
         "{}",
@@ -1688,7 +1864,7 @@ fn a_codex_alabs_own_land_hold_is_shown_where_aterms_is_while_its_claim_stands()
         "OK\n"
     );
     let stopped = codex_hold_surfaces(&mut app, &sid);
-    let stop = |form| format!("codex-alab {}", stop_words(HeldBy::SameReply, form));
+    let stop = |form| format!("codex-alab {}", stop_words(HeldBy::SameReply, form, false));
     assert_eq!(
         stopped.tip,
         format!(
@@ -1700,7 +1876,10 @@ fn a_codex_alabs_own_land_hold_is_shown_where_aterms_is_while_its_claim_stands()
     );
     assert_eq!(
         stopped.hover,
-        format!("driven by aterm (land: {}; {hover})", stop(HoldForm::Hover))
+        format!(
+            "codex-alab autopilot (land: {}; {hover})",
+            stop(HoldForm::Hover)
+        )
     );
     assert!(
         stopped.line.starts_with(&stop(HoldForm::Line))
@@ -1770,4 +1949,347 @@ fn a_codex_alabs_own_land_hold_is_shown_where_aterms_is_while_its_claim_stands()
     let row = app.status_session_row(&handle);
     assert!(!row.landing, "no claim of aterm's");
     assert_eq!(row.landing_tip, None, "no claim of aterm's");
+}
+
+/// The words aterm's loop tells beside a hold whose agent listed two items over an untracked
+/// file (slice 4b).
+fn quoted_said(first: &str) -> aterm_agent::harness::hold_said::HoldSaid {
+    aterm_agent::harness::hold_said::HoldSaid {
+        open: vec![first.to_string(), "Bump the version.".to_string()],
+        more: 0,
+        paths: vec!["wip-notes.txt".to_string()],
+    }
+}
+
+/// A hold on an untracked file and the agent's own list, three nudges since the act.
+fn listed_hold() -> LandHeld {
+    LandHeld {
+        legs: HoldLeg::Repo.bit() | HoldLeg::Open.bit(),
+        unpushed: 0,
+        untracked: 1,
+        ..held()
+    }
+}
+
+/// THE HOLD QUOTES THE AGENT AND NAMES THE FILES GIT FOUND, in every form (§14.17 item 1, slice
+/// 4b): the state line quotes each item, the title, the hover and a tip the first, counting the
+/// rest, and a screen reader hears the first as a sentence; the repository leg names the file.
+/// Negative control: the hold's words not passed (`None`) fails every quote and the file's name.
+#[test]
+fn the_hold_quotes_the_agent_and_names_the_files_git_found() {
+    use aterm_agent::harness::acts::held_tip;
+    let hold = glass(listed_hold(), TODAY);
+    let said = quoted_said("The docs PR is still open.");
+    let words = |form| hold_words(&hold, None, form, Some(TODAY), Some(&said)).expect("said");
+    let file = "1 untracked file: wip-notes.txt";
+    let first = "open in its report: \u{201c}The docs PR is still open.\u{201d} (+1 more)";
+    assert_eq!(
+        words(HoldForm::Line),
+        format!(
+            "not landed yet: {file}; open in its report: \u{201c}The docs PR is still \
+             open.\u{201d}; \u{201c}Bump the version.\u{201d} \u{b7} landing since 14:02 \u{b7} \
+             3 nudges"
+        )
+    );
+    assert_eq!(
+        words(HoldForm::Title),
+        format!("not landed yet: {file}; {first} \u{b7} landing since 14:02, 3 nudges")
+    );
+    assert_eq!(
+        words(HoldForm::Hover),
+        format!("not landed yet, {file}; {first}")
+    );
+    assert_eq!(
+        words(HoldForm::Tip),
+        held_tip(&format!("{file}; {first}"), 3)
+    );
+    let spoken = words(HoldForm::Spoken);
+    assert!(
+        spoken.contains("Open in its report: The docs PR is still open. And 1 more."),
+        "{spoken}"
+    );
+    assert!(
+        spoken.contains("1 untracked file: wip-notes.txt."),
+        "{spoken}"
+    );
+    assert!(
+        spoken
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, ' ' | '.' | ':' | ',' | '-' | '_')),
+        "glyph-free: {spoken}"
+    );
+}
+
+/// A hold of three changed files and the agent's one item, `item`, as a screen reader hears it.
+fn spoken_said(item: &str) -> String {
+    let hold = glass(
+        LandHeld {
+            legs: HoldLeg::Repo.bit() | HoldLeg::Open.bit(),
+            unpushed: 0,
+            changed: 3,
+            untracked: 0,
+            ..held()
+        },
+        TODAY,
+    );
+    let said = aterm_agent::harness::hold_said::HoldSaid {
+        open: vec![item.to_string()],
+        more: 0,
+        paths: vec![
+            "crates/aterm_x/src/hold_said.rs".to_string(),
+            "docs/my-notes/".to_string(),
+        ],
+    };
+    hold_words(&hold, None, HoldForm::Spoken, Some(TODAY), Some(&said)).expect("said")
+}
+
+/// A SCREEN READER HEARS EACH FILE'S NAME WHOLE: a nested path is said by its file name, its `-`,
+/// `_` and `.` kept and its folders left out, then `and more` where git found more than it named.
+/// Negative control: the names passed through `speakable` (`cratesaterm xsrcholdsaid.rs`) fail.
+#[test]
+fn a_screen_reader_hears_each_files_name_whole() {
+    let spoken = spoken_said("The docs PR is still open.");
+    assert!(
+        spoken.contains("3 changed files: hold_said.rs, my-notes and more."),
+        "{spoken}"
+    );
+}
+
+/// A SCREEN READER HEARS THE AGENT'S WORDS APART: a quote's `/`, `\\` and `_` are spaces, so
+/// the words they join never run together.
+/// Negative control: `/` and `_` dropped (`srcholdsaid.rs`) fail.
+#[test]
+fn a_screen_reader_hears_the_agents_words_apart() {
+    let spoken = spoken_said("Fix src/hold_said.rs in the my_tool crate.");
+    assert!(
+        spoken.contains("Open in its report: Fix src hold said.rs in the my tool crate. Landing"),
+        "{spoken}"
+    );
+}
+
+/// A QUOTE THAT CLOSES ITSELF IS NOT CLOSED AGAIN in the spoken sentence (`.`, `:`, the closing
+/// marks a screen reader is handed), and one that does not, or whose `?` is not handed on, is
+/// closed with `.`.
+/// Negative control: `.` added after every quote but one ending in `.` (`review:.`) fails.
+#[test]
+fn a_spoken_quote_is_closed_once() {
+    for (item, heard) in [
+        (
+            "Is the docs PR merged?",
+            "Open in its report: Is the docs PR merged. Landing",
+        ),
+        (
+            "The docs PR is still open.",
+            "Open in its report: The docs PR is still open. Landing",
+        ),
+        (
+            "Bump the version",
+            "Open in its report: Bump the version. Landing",
+        ),
+        (
+            "Waiting on review:",
+            "Open in its report: Waiting on review: Landing",
+        ),
+    ] {
+        let spoken = spoken_said(item);
+        assert!(spoken.contains(heard), "{item}: {spoken}");
+    }
+}
+
+/// A LONG ITEM IS CUT IN THE SHORT FORMS AND WHOLE ON THE STATE LINE: the title, the hover and a
+/// tip quote at most [`aterm_agent::harness::hold_said::SHORT_CHARS`] of it, cut at a word with
+/// `…`; the line, with room, quotes it whole.
+/// Negative control: the short forms quoting the item uncut fails the bound.
+#[test]
+fn a_long_item_is_cut_in_the_short_forms_and_whole_on_the_line() {
+    use aterm_agent::harness::hold_said::SHORT_CHARS;
+    let long =
+        "The follow-up PR for the docs is still open, waiting on a review from the docs team.";
+    let hold = glass(listed_hold(), TODAY);
+    let said = quoted_said(long);
+    let words = |form| hold_words(&hold, None, form, Some(TODAY), Some(&said)).expect("said");
+    assert!(words(HoldForm::Line).contains(&format!("\u{201c}{long}\u{201d}")));
+    for form in [HoldForm::Title, HoldForm::Hover, HoldForm::Tip] {
+        let said = words(form);
+        let quote = said
+            .split_once('\u{201c}')
+            .and_then(|(_, rest)| rest.split_once('\u{201d}'))
+            .map(|(quote, _)| quote)
+            .expect("a quote");
+        assert!(quote.chars().count() <= SHORT_CHARS, "{form:?}: {said}");
+        assert!(quote.ends_with('\u{2026}'), "{form:?}: {said}");
+        assert!(said.contains("\u{201d} (+1 more)"), "{form:?}: {said}");
+    }
+}
+
+/// SAID ONCE: A HOLD ONLY A PERSON'S NEED HOLDS WAITS ONLY ON YOU in every form (§14.4), the need
+/// itself on the title and the state line, and no form says `not landed yet:` or `needs you`
+/// beside it; the hover and a tip, under the need's own line, say only that it waits.
+/// Negative control: the need alone worded as any other leg (`not landed yet: needs you: …`)
+/// fails every form.
+#[test]
+fn a_need_alone_waits_only_on_you_in_every_form() {
+    let hold = glass(
+        LandHeld {
+            legs: HoldLeg::Needs.bit(),
+            open: [None; 4],
+            unpushed: 0,
+            ..held()
+        },
+        TODAY,
+    );
+    let need = ask();
+    let words = |form| hold_words(&hold, Some(&need), form, Some(TODAY), None).expect("said");
+    assert_eq!(
+        words(HoldForm::Line),
+        format!(
+            "waits only on you: {} (+1 more) \u{b7} landing since 14:02 \u{b7} 3 nudges",
+            need.first
+        )
+    );
+    assert_eq!(
+        words(HoldForm::Title),
+        "waits only on you: sign 0.48.0, the release credential, on this Mac (+1 more) \u{b7} \
+         landing since 14:02, 3 nudges"
+    );
+    assert_eq!(words(HoldForm::Hover), "waits only on you");
+    assert_eq!(words(HoldForm::Tip), "waits only on you \u{b7} 3 nudges");
+    assert_eq!(
+        words(HoldForm::Spoken),
+        "It waits only on you: sign 0.48.0 the release credential on this Mac. And 1 more. \
+         Landing since 14:02, 3 nudges."
+    );
+    for form in [
+        HoldForm::Title,
+        HoldForm::Line,
+        HoldForm::Hover,
+        HoldForm::Tip,
+        HoldForm::Spoken,
+    ] {
+        let said = words(form).to_lowercase();
+        assert!(
+            !said.contains("not landed yet") && !said.contains("needs you"),
+            "{form:?}: {said}"
+        );
+    }
+}
+
+/// Tab `sid`'s loop tells the hold's words, then the hold they belong to, as
+/// `turn_end_loop::tell_hold` does.
+fn tell_quoted(
+    app: &mut App,
+    sid: &str,
+    said: Option<&aterm_agent::harness::hold_said::HoldSaid>,
+    held: Option<LandHeld>,
+) {
+    let _ = crate::harness_host::store_land_said(&app.store, sid, said);
+    tell_hold(app, sid, held);
+}
+
+/// A REWORDED ITEM REFRESHES EVERY SURFACE THOUGH THE HOLD IS EQUAL (slice 4b): the chip's title
+/// and description, the state line, the tab's hover and the worker row's tip quote the new words
+/// once the loop tells them, the hold itself told again unchanged.
+/// Negative control: the stored hold's equality alone deciding whether the window reads again
+/// (main's `set_land_held`) leaves every surface on the old words.
+#[test]
+fn a_reworded_item_refreshes_every_surface_though_the_hold_is_equal() {
+    use crate::autopilot::AutopilotView;
+    let (mut app, sid, _host) = desk("land");
+    let (old, new) = (
+        "The docs PR is still open.",
+        "The pull request for the docs is still open.",
+    );
+    tell_quoted(&mut app, &sid, Some(&quoted_said(old)), Some(listed_hold()));
+    let before = stop_surfaces(&mut app, AutopilotView::Land);
+    for said in &before[..5] {
+        assert!(
+            said.contains(old.trim_end_matches('.')),
+            "CONTROL: {before:#?}"
+        );
+    }
+    tell_quoted(&mut app, &sid, Some(&quoted_said(new)), Some(listed_hold()));
+    let after = stop_surfaces(&mut app, AutopilotView::Land);
+    for said in &after[..5] {
+        assert!(
+            said.contains("pull request for the") && !said.contains(old.trim_end_matches('.')),
+            "{after:#?}"
+        );
+    }
+    tell_quoted(&mut app, &sid, None, Some(listed_hold()));
+    let plain = stop_surfaces(&mut app, AutopilotView::Land);
+    assert!(
+        plain.iter().all(|said| !said.contains('\u{201c}')),
+        "the words taken down, the reader's left: {plain:#?}"
+    );
+}
+
+/// THE HOLD'S WORDS ARE SANITIZED AND BOUNDED AT STORE: an item's escapes and bidi controls never
+/// reach the glass, and an item or path is at most
+/// [`aterm_agent::harness::hold_said::ITEM_BYTES`]; words that leave nothing store none.
+/// Negative control: the words stored as told fails the escape.
+#[test]
+fn the_holds_words_are_sanitized_and_bounded_at_store() {
+    use aterm_agent::harness::hold_said::{HoldSaid, ITEM_BYTES};
+    let (mut app, sid, _host) = desk("land");
+    let told = HoldSaid {
+        open: vec![
+            "The docs \u{1b}[31mPR\u{1b}[0m is \u{202e}still open.".to_string(),
+            "x".repeat(4 * ITEM_BYTES),
+        ],
+        more: 0,
+        paths: vec!["wip\u{7}-notes.txt".to_string()],
+    };
+    tell_quoted(&mut app, &sid, Some(&told), Some(listed_hold()));
+    let stored = app.hold_said.get(&0).cloned().expect("stored");
+    for word in stored.open.iter().chain(&stored.paths) {
+        assert!(
+            !word
+                .chars()
+                .any(|c| c.is_control() || ('\u{202a}'..='\u{202e}').contains(&c)),
+            "{word:?}"
+        );
+        assert!(word.len() <= ITEM_BYTES, "{} bytes", word.len());
+    }
+    assert!(stored.open[0].contains("PR"), "{stored:?}");
+    let blank = HoldSaid {
+        open: vec!["\u{1b}\u{202e}\u{7}".to_string()],
+        more: 0,
+        paths: Vec::new(),
+    };
+    tell_quoted(&mut app, &sid, Some(&blank), Some(listed_hold()));
+    assert!(!app.hold_said.contains_key(&0), "nothing left, none stored");
+}
+
+/// SAID ONCE (§14.4): while a read hold says `landing since 10:30, 2 nudges`, the title's
+/// `last:` leaves Land's own acts out (`⤓ landing`, `⤓ nudged`, `⤓ land check`), and the chip's
+/// spoken description does not say Land's newest act again; any other act still shows.
+/// Negative controls: the trail unfiltered fails the title; the spoken last act kept fails the
+/// description.
+#[test]
+fn the_titles_trail_drops_lands_own_acts_while_a_read_hold_says_them() {
+    use crate::autopilot::AutopilotView;
+    use aterm_agent::harness::acts::Act;
+    let (mut app, sid, _host) = desk("land");
+    // The trail keeps the three newest; Land's newest act is the one a screen reader hears.
+    for act in [Act::Landing, Act::LandCheck, Act::Approved, Act::Nudged] {
+        crate::harness_glass::on_act(&mut app, 0, act);
+    }
+    let read = |app: &mut App| {
+        let [title, spoken, ..] = stop_surfaces(app, AutopilotView::Land);
+        (title, spoken)
+    };
+    let (before, spoken) = read(&mut app);
+    for word in ["\u{2913} nudged", "\u{2713} approved"] {
+        assert!(before.contains(word), "CONTROL, no hold: {before}");
+    }
+    assert!(spoken.contains("Last:"), "CONTROL, no hold: {spoken}");
+    tell_hold(&mut app, &sid, Some(listed_hold()));
+    let (held, spoken) = read(&mut app);
+    assert!(held.contains("not landed yet"), "{held}");
+    for word in ["\u{2913} landing", "\u{2913} nudged", "\u{2913} land check"] {
+        assert!(!held.contains(word), "{word} said by the hold: {held}");
+    }
+    assert!(held.contains("\u{2713} approved"), "{held}");
+    assert!(spoken.contains("Not landed yet."), "{spoken}");
+    assert!(!spoken.contains("Last:"), "the hold says it: {spoken}");
 }

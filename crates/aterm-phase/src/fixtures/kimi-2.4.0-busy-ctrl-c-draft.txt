@@ -1,0 +1,28 @@
+# kimi 2.4.0 · MEASURED 2026-10-29, `aterm ctl text` of a private headless aterm (110x32, aterm 0.146.0) running the real Kimi Code, launched by path with a scratch `HOME` and `KIMI_CODE_HOME` whose `config.toml` names one `openai`-type provider at `http://127.0.0.1:<port>/v1` with a fake key (a local stub of the Chat Completions API, crates/aterm-lab), no login · a held turn (mode hold30) with `lab draft while busy` typed under the spinner, then one Ctrl-C: the draft is cleared, the spinner row stays and the turn goes on (no `Interrupted by user`)
+
+ ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │                                                                                                          │
+ │  ▐█▛█▛█▌  Welcome to Kimi Code!                                                                          │
+ │  ▐█████▌  Send /help for help information.                                                               │
+ │                                                                                                          │
+ │  Directory: /private/tmp/at.NuMm/proj                                                                    │
+ │  Session:   session_dc00ad28-8342-47c5-9e08-09e594e32b91                                                 │
+ │  Model:     lab-model                                                                                    │
+ │  Version:   2.4.0                                                                                        │
+ │                                                                                                          │
+ ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+   No session yet — one will be created on your first message.
+
+ ❯ lab first turn
+
+ ● Hi! I am the local lab stub, not a model. (reply 1)
+
+ ❯ lab held for ctrl-c with a draft
+
+  🌑 · Tip: /sessions to browse and resume earlier sessions
+ ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │ >                                                                                                        │
+ ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ lab-model  …/tmp/at.NuMm/proj
+                                                                                   context: 22% (20.6k/97.7k)

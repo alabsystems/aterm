@@ -19,6 +19,7 @@ fn j(t: i64, line: &str) -> (i64, String) {
 fn typed(t: i64, rule: &str, command: &str) -> Row {
     Row {
         ts: T0 + t,
+        box_seq: None,
         rule: rule.into(),
         decision: "typed".into(),
         command: command.into(),
@@ -104,13 +105,11 @@ fn said_hover() -> String {
 }
 
 /// What 3a journals, prints and shows of `seen`'s hold in `chain`: its line names its arm
-/// (`held=same-reply`) and is `when=now` where the hold is loud ([`loud`]), `status` prints
-/// `held=same-reply`, the Harness page's state line (where the window is read) leads with the
-/// stop, and `ctl messages` stands one `Stopped typing` row where it is loud, none otherwise:
-/// each read every 2.5 s from a second past the hold to the watch's end.
+/// (`held=same-reply`) with `when=later`. Status and the accessible tab state
+/// report the hold; no alert row is present. Reads cover the whole observation window.
 pub(in crate::forever) fn three_a_said(mut seen: Seen, chain: Chain) -> Seen {
     let (ts, line) = stall_of(&seen, i64::MIN).cloned().expect("a hold");
-    let when = if loud(chain) { "now" } else { "later" };
+    let when = "later";
     let (head, rest) = line.split_once(" when=").expect("when=");
     let why = rest.split_once(' ').map_or("", |(_, w)| w);
     let said = format!("{head} when={when} held={} {why}", HeldBy::SameReply.word());
@@ -130,14 +129,7 @@ pub(in crate::forever) fn three_a_said(mut seen: Seen, chain: Chain) -> Seen {
         .map_or_else(String::new, |(_, s)| s.clone());
     seen.status.push((t, format!("{last} held=same-reply")));
     seen.status_reads.extend(&reads);
-    let band = if loud(chain) {
-        format!(
-            "m-7 state=live title={} in window 2, tab 3",
-            REPEATS_LAND_TITLE.0
-        )
-    } else {
-        "-".to_string()
-    };
+    let band = "-".to_string();
     seen.band.push((t, band));
     seen.band_reads.extend(&reads);
     if seen.window.read {
@@ -146,7 +138,11 @@ pub(in crate::forever) fn three_a_said(mut seen: Seen, chain: Chain) -> Seen {
             format!(
                 "head={}: Window 2, tab 3\nstate={} · not landed yet: 1 untracked file",
                 chain.name(),
-                stop_words(HeldBy::SameReply, StopForm::Line)
+                stop_words(
+                    HeldBy::SameReply,
+                    StopForm::Line,
+                    names_switch(chain.autopilot())
+                )
             ),
         ));
         seen.window.page_reads.extend(&reads);
@@ -155,28 +151,17 @@ pub(in crate::forever) fn three_a_said(mut seen: Seen, chain: Chain) -> Seen {
         .window
         .held
         .iter()
-        .map(|(t, l)| (*t, nodes_heard(l, chain)))
+        .map(|(t, l)| (*t, nodes_heard(l)))
         .collect();
     seen
 }
 
-/// The loud hold's band row as a screen reader is handed it (`chrome`'s `a11y` line, its head cut).
-const BAND_NODE: &str = "window=2 band row=0 role=Alert label=\"aterm stopped typing in window 2, \
-                         tab 3 \u{b7} Open the tab and tell it what is still open.\" description=-";
-
-/// What a screen reader is handed at a look whose chip `chrome` read as `line` ([`ax_of`]'s
-/// lines): the chip's node saying its description, and where `chain`'s hold is loud, its band row.
-fn nodes_heard(line: &str, chain: Chain) -> String {
+/// The chip's accessibility description at a recorded look.
+fn nodes_heard(line: &str) -> String {
     let description = quoted(line, "description").map_or_else(|| "-".into(), |d| format!("{d:?}"));
-    let chip = format!(
-        "window=2 autopilot sid=s-c role=Button label=\"Autopilot: land.\" \
-         description={description}"
-    );
-    if loud(chain) {
-        format!("{BAND_NODE}\n{chip}")
-    } else {
-        chip
-    }
+    format!(
+        "window=2 autopilot sid=s-c role=Button label=\"Autopilot: land.\" description={description}"
+    )
 }
 
 /// land-c's records with its looks in front at +382 s and +412 s each reading `line`, and the
@@ -230,7 +215,8 @@ fn a_held_chip_in_front_must_say_stopped_typing() {
     let ok = held(Chain::LandC, &said_line(), MAIN_HOVER);
     let v = said(&ok, &cx(Chain::LandC, "claude"), stall(&ok));
     assert!(matches!(v, Verdict::Pass(_)), "{v:?}");
-    let title_only = said_line().replace(&stop_words(HeldBy::SameReply, StopForm::Spoken), "");
+    let title_only =
+        said_line().replace(&stop_words(HeldBy::SameReply, StopForm::Spoken, false), "");
     let half = held(Chain::LandC, &title_only, MAIN_HOVER);
     let v = said(&half, &cx(Chain::LandC, "claude"), stall(&half));
     assert!(v.why().contains("the description"), "{v:?}");
@@ -331,7 +317,7 @@ fn the_wants_fold_into_a_same_reply_chains_last_scenario() {
     assert!(
         !v.why().contains("HELD, NOT SAID")
             && v.why().contains(
-                "its journal line reads when=later held=(none), not when=now held=same-reply"
+                "its journal line reads when=later held=(none), not when=later held=same-reply"
             ),
         "{v:?}"
     );
@@ -339,8 +325,8 @@ fn the_wants_fold_into_a_same_reply_chains_last_scenario() {
     let v = with_held(Scenario::L4, &ok, &cx(Chain::LandC, "claude"), pass());
     assert!(matches!(v, Verdict::Pass(_)), "{v:?}");
     assert!(
-        v.why().contains("journaled when=now held=same-reply")
-            && v.why().contains("one `Stopped typing` row"),
+        v.why().contains("journaled when=later held=same-reply")
+            && v.why().contains("no `Stopped typing` row"),
         "{v:?}"
     );
     let v = with_held(Scenario::C1, &main, &cx(Chain::Cruise, "claude"), pass());
@@ -376,209 +362,6 @@ fn the_wants_fold_into_a_same_reply_chains_last_scenario() {
     );
 }
 
-/// WHAT 3A ADDS: the hold's line names its arm and is `when=now` only where the hold is loud,
-/// every `status` read prints `held=`, every state line read leads with the stop, and the loud
-/// hold alone stands one `Stopped typing` row in `ctl messages`. Each field missing or wrong is
-/// the others' negative control.
-#[test]
-fn three_a_wants_the_arm_journaled_and_printed_and_one_row_for_the_loud_hold_alone() {
-    let ok = three_a_said(held(Chain::LandC, &said_line(), MAIN_HOVER), Chain::LandC);
-    let judge = |s: &Seen, c: Chain| three_a(s, &cx(c, "claude"), stall(s));
-    let v = judge(&ok, Chain::LandC);
-    assert!(matches!(v, Verdict::Pass(_)), "{v:?}");
-    let fails = |s: &Seen, c: Chain, why: &str| {
-        let v = judge(s, c);
-        assert!(
-            matches!(v, Verdict::Fail(_)) && v.why().contains(why),
-            "{why}: {v:?}"
-        );
-    };
-    let mut later = ok.clone();
-    for (_, l) in &mut later.journal {
-        *l = l.replace(" when=now ", " when=later ");
-    }
-    fails(
-        &later,
-        Chain::LandC,
-        "reads when=later held=same-reply, not when=now",
-    );
-    let mut unnamed = ok.clone();
-    for (_, l) in &mut unnamed.journal {
-        *l = l.replace(" held=same-reply", "");
-    }
-    fails(&unnamed, Chain::LandC, "held=(none)");
-    let mut unknown = ok.clone();
-    for (_, l) in &mut unknown.journal {
-        *l = l.replace(" held=same-reply", " held=bogus");
-    }
-    fails(
-        &unknown,
-        Chain::LandC,
-        "reads when=now held=bogus, not when=now held=same-reply",
-    );
-    let mut unprinted = ok.clone();
-    unprinted
-        .status
-        .push((T0 + HELD_AT + 20_000, "task=open held=-".into()));
-    fails(
-        &unprinted,
-        Chain::LandC,
-        "status did not print held=same-reply",
-    );
-    let mut unled = ok.clone();
-    let line = unled.window.page.pop().expect("its state line").1;
-    let lead = stop_words(HeldBy::SameReply, StopForm::Line);
-    unled.window.page.push((
-        T0 + HELD_AT + 1_000,
-        line.replace(&format!("{lead}{FACT_SEPARATOR}"), ""),
-    ));
-    fails(&unled, Chain::LandC, "leads with no stop");
-    let mut below = ok.clone();
-    below.window.page.push((T0 + HELD_AT + 1_500, "-".into()));
-    let v = judge(&below, Chain::LandC);
-    assert!(
-        matches!(v, Verdict::Pass(_))
-            && v.why()
-                .contains("the state line: SKIPPED (its row was not drawn on the Harness page"),
-        "a row the page never drew while it held: {v:?}"
-    );
-    let mut stateless = ok.clone();
-    stateless
-        .window
-        .page
-        .push((T0 + HELD_AT + 1_500, "head=land-c: Window 2, tab 3".into()));
-    fails(
-        &stateless,
-        Chain::LandC,
-        "its row on the Harness page drew no state line",
-    );
-    let mut unpaged = ok.clone();
-    unpaged.window.page_reads.clear();
-    unpaged.window.page.clear();
-    let v = judge(&unpaged, Chain::LandC);
-    assert!(
-        matches!(v, Verdict::Unobserved(_))
-            && v.why()
-                .contains("the Harness page was not read while it held"),
-        "{v:?}"
-    );
-    let mut rowless = ok.clone();
-    rowless.band = vec![(T0 + HELD_AT + 1_000, "-".into())];
-    fails(
-        &rowless,
-        Chain::LandC,
-        "stood 0 `Stopped typing` row(s), not one",
-    );
-    let mut withdrawn = ok.clone();
-    withdrawn.band[0].1 = withdrawn.band[0].1.replace("state=live", "state=withdrawn");
-    fails(&withdrawn, Chain::LandC, "stood 0 `Stopped typing` row(s)");
-    let mut twice = ok.clone();
-    twice.band[0].1 = format!("{0} | {0}", twice.band[0].1);
-    fails(&twice, Chain::LandC, "stood 2 `Stopped typing` row(s)");
-    let quiet = three_a_said(held(Chain::LandB, &said_line(), MAIN_HOVER), Chain::LandB);
-    let v = judge(&quiet, Chain::LandB);
-    assert!(
-        matches!(v, Verdict::Pass(_))
-            && v.why().contains("journaled when=later held=same-reply")
-            && v.why().contains("no `Stopped typing` row"),
-        "{v:?}"
-    );
-    let mut loud_row = quiet.clone();
-    loud_row.band = ok.band.clone();
-    fails(
-        &loud_row,
-        Chain::LandB,
-        "a `Stopped typing` row for a hold that is not Land's",
-    );
-    let mut unread = ok;
-    unread.status_reads.clear();
-    unread.status.pop();
-    let v = judge(&unread, Chain::LandC);
-    assert!(
-        matches!(v, Verdict::Unobserved(_)) && v.why().contains("no `status` read while it held"),
-        "{v:?}"
-    );
-}
-
-/// WHAT A SCREEN READER IS HANDED (§14.3's windowed read): at each look whose chip was drawn, the
-/// chip's node in the window's accessibility tree says the description `chrome` read, led by the
-/// stop, and the loud hold's band row node names its row's title. Each node missing or wrong is
-/// the others' negative control; a band whose three rows name other holds is a named skip, and a
-/// build that prints no `a11y` node is unread.
-#[test]
-fn three_a_wants_the_chips_node_to_say_the_stop_and_the_loud_holds_band_row_node_to_name_it() {
-    let ok = three_a_said(held(Chain::LandC, &said_line(), MAIN_HOVER), Chain::LandC);
-    let judge = |s: &Seen| three_a(s, &cx(Chain::LandC, "claude"), stall(s));
-    let v = judge(&ok);
-    assert!(
-        matches!(v, Verdict::Pass(_))
-            && v.why().contains("the chip's node says \"Stopped typing:")
-            && v.why()
-                .contains("a band row's node says \"aterm stopped typing in window 2, tab 3"),
-        "{v:?}"
-    );
-    let fails = |s: &Seen, why: &str| {
-        let v = judge(s);
-        assert!(
-            matches!(v, Verdict::Fail(_)) && v.why().contains(why),
-            "{why}: {v:?}"
-        );
-    };
-    let mut stale = ok.clone();
-    stale.window.held_ax[1].1 = nodes_heard(MAIN_LINE, Chain::LandC);
-    fails(
-        &stale,
-        "the chip's node says \"Not landed yet. 1 untracked file.",
-    );
-    let mut nodeless = ok.clone();
-    nodeless.window.held_ax[0].1 = BAND_NODE.to_string();
-    fails(
-        &nodeless,
-        "its chip was drawn, yet the window's accessibility tree held no node for it",
-    );
-    let mut bandless = ok.clone();
-    bandless.window.held_ax[1].1 = nodes_heard(&said_line(), Chain::LandB);
-    fails(
-        &bandless,
-        "no band row node names \"aterm stopped typing in window 2, tab 3\" (0 row node(s))",
-    );
-    let mut crowded = ok.clone();
-    let others: Vec<String> = (4..7)
-        .map(|tab| BAND_NODE.replace("tab 3", &format!("tab {tab}")))
-        .collect();
-    crowded.window.held_ax[1].1 = format!(
-        "{}\n{}",
-        others.join("\n"),
-        nodes_heard(&said_line(), Chain::LandB)
-    );
-    let v = judge(&crowded);
-    assert!(
-        matches!(v, Verdict::Pass(_))
-            && v.why()
-                .contains("the band's node: SKIPPED (+412.2 s in front: its three rows named"),
-        "{v:?}"
-    );
-    let mut unprinted = ok.clone();
-    unprinted.window.held_ax[0].1 = "-".to_string();
-    let v = judge(&unprinted);
-    assert!(
-        matches!(v, Verdict::Unobserved(_))
-            && v.why().contains(
-                "+382.1 s in front: `chrome` printed no `a11y` node, so the screen reader's was \
-                 not read"
-            ),
-        "{v:?}"
-    );
-    let quiet = three_a_said(held(Chain::LandB, &said_line(), MAIN_HOVER), Chain::LandB);
-    let v = three_a(&quiet, &cx(Chain::LandB, "claude"), stall(&quiet));
-    assert!(
-        matches!(v, Verdict::Pass(_))
-            && v.why().contains("the chip's node says")
-            && !v.why().contains("a band row's node"),
-        "a quiet hold wants no band row node: {v:?}"
-    );
-}
-
 /// `ax_of` keeps `chrome`'s `a11y` lines for the tab's own chip node and every band row node, its
 /// head cut; another tab's chip node, other lines and a `chrome` with no `a11y` line read `-`.
 #[test]
@@ -599,107 +382,6 @@ fn the_screen_readers_nodes_are_the_tabs_chip_and_the_band_rows() {
     assert_eq!(
         ax_of(chrome, "s-e"),
         "window=2 band row=0 role=Alert label=\"aterm stopped typing\" description=-"
-    );
-}
-
-/// THE ONE LOUD HOLD is Land's over a repository leg in a session no manager waits on: the
-/// repository chains and same-land; land-b's open task, land-d's need, land-e's manager and the
-/// Cruise chains are not.
-#[test]
-fn the_loud_chains_are_lands_over_a_repository_leg_no_manager_waits_on() {
-    for c in [
-        Chain::LandC,
-        Chain::LandF,
-        Chain::LandG,
-        Chain::LandH,
-        Chain::LandI,
-        Chain::SameLand,
-    ] {
-        assert!(loud(c), "{c:?}");
-    }
-    for c in [
-        Chain::LandB,
-        Chain::LandD,
-        Chain::LandE,
-        Chain::LandT,
-        Chain::Cruise,
-        Chain::WroteC,
-        Chain::SameCruise,
-    ] {
-        assert!(!loud(c), "{c:?}");
-    }
-}
-
-/// same-land's person types their turn into the held tab once its looks were had and it was
-/// watched past its hold, and only then; the turn lifts the hold and the row goes with it.
-#[test]
-fn same_lands_person_turn_lifts_the_hold_and_takes_its_row_away() {
-    let mut watched = held(Chain::SameLand, &said_line(), MAIN_HOVER);
-    watched.end_ms = T0 + HELD_AT + 120_000;
-    let base = three_a_said(watched, Chain::SameLand);
-    let past = T0 + HELD_AT + 60_000;
-    assert!(person_due(Chain::SameLand, &base, T0, past));
-    assert!(
-        !person_due(Chain::SameLand, &base, T0, past - 1),
-        "inside its watch"
-    );
-    assert!(
-        !person_due(Chain::LandC, &base, T0, past),
-        "same-land's alone"
-    );
-    let mut one_look = base.clone();
-    one_look.window.held.truncate(1);
-    assert!(
-        !person_due(Chain::SameLand, &one_look, T0, past),
-        "a look still due"
-    );
-    let mut unheld = base.clone();
-    unheld.journal.retain(|(_, l)| !is_stall(l));
-    assert!(!person_due(Chain::SameLand, &unheld, T0, past));
-    let p = T0 + HELD_AT + 62_000;
-    let mut typed = base.clone();
-    typed.stop_person_ms = Some(p);
-    assert!(
-        !person_due(Chain::SameLand, &typed, T0, past + 60_000),
-        "once"
-    );
-    let judge = |s: &Seen| three_a(s, &cx(Chain::SameLand, "claude"), stall(s));
-    let v = judge(&base);
-    assert!(
-        matches!(v, Verdict::Unobserved(_)) && v.why().contains("no person's turn"),
-        "{v:?}"
-    );
-    let v = judge(&typed);
-    assert!(
-        matches!(v, Verdict::Fail(_)) && v.why().contains("lifted no hold"),
-        "{v:?}"
-    );
-    let mut lifted = typed.clone();
-    lifted.journal.push((
-        p + 400,
-        "CLEARED seq=3001 exception=stalled after=62s a different reply, someone's turn, or the \
-         agent working"
-            .into(),
-    ));
-    let v = judge(&lifted);
-    assert!(
-        matches!(v, Verdict::Fail(_)) && v.why().contains("row stood to"),
-        "the row outlived the hold: {v:?}"
-    );
-    let withdrawn = lifted.band[0].1.replace("state=live", "state=withdrawn");
-    let mut gone = lifted.clone();
-    gone.band.push((p + 2_000, withdrawn));
-    let v = judge(&gone);
-    assert!(
-        matches!(v, Verdict::Pass(_)) && v.why().contains("the row gone by"),
-        "{v:?}"
-    );
-    let mut unread = lifted;
-    unread.band_reads.retain(|t| *t < p);
-    let v = judge(&unread);
-    assert!(
-        matches!(v, Verdict::Unobserved(_)) && v.why().contains("not read past the lift"),
-        "{v:?}"
     );
 }
 
@@ -764,7 +446,11 @@ fn the_band_is_read_by_its_tabs_key_and_stands_only_while_live() {
         &LIVE_ROW.replace("aterm%20stopped%20typing", "Claude%20needs%20you"),
         sid,
     );
-    assert!(stop_rows(&untitled).is_empty(), "{untitled}");
+    assert_eq!(
+        stop_rows(&untitled).len(),
+        1,
+        "any live resume ask is an alert"
+    );
     let two = format!("{LIVE_ROW}\n{}", LIVE_ROW.replace("message 7", "message 9"));
     assert_eq!(stop_rows(&band_rows(&two, sid)).len(), 2);
 }
@@ -773,10 +459,13 @@ fn the_band_is_read_by_its_tabs_key_and_stands_only_while_live() {
 /// a text no stop leads as it is.
 #[test]
 fn the_holds_words_are_read_past_the_stop() {
-    for arm in HeldBy::ALL {
+    for (arm, switch) in HeldBy::ALL
+        .into_iter()
+        .flat_map(|arm| [(arm, false), (arm, true)])
+    {
         let line = format!(
             "{}{FACT_SEPARATOR}not landed yet: 1 untracked file",
-            stop_words(arm, StopForm::Line)
+            stop_words(arm, StopForm::Line, switch)
         );
         assert_eq!(
             unstopped(&line, StopForm::Line),
@@ -784,7 +473,7 @@ fn the_holds_words_are_read_past_the_stop() {
         );
         let title = format!(
             "autopilot: land \u{2014} {}{FACT_SEPARATOR}not landed yet: 1 untracked file",
-            stop_words(arm, StopForm::Title)
+            stop_words(arm, StopForm::Title, switch)
         );
         assert_eq!(
             unstopped(&title, StopForm::Title),
@@ -797,7 +486,7 @@ fn the_holds_words_are_read_past_the_stop() {
     );
     let bare = format!(
         "driven by aterm (cruise: {})",
-        stop_words(HeldBy::NoWork, StopForm::Hover)
+        stop_words(HeldBy::NoWork, StopForm::Hover, false)
     );
     assert_eq!(
         unstopped(&bare, StopForm::Hover),
@@ -819,7 +508,7 @@ fn the_holds_words_are_read_past_the_stop() {
     }
     let spoken = format!(
         "{} Not landed yet.",
-        stop_words(HeldBy::SameReply, StopForm::Spoken)
+        stop_words(HeldBy::SameReply, StopForm::Spoken, false)
     );
     assert_eq!(unstopped(&spoken, StopForm::Spoken), "Not landed yet.");
 }
@@ -1032,6 +721,59 @@ fn a_lift_with_no_new_reply_fails_the_hold() {
     ));
 }
 
+/// The person's switch to Land over the hold is their turn (v6 §14.17 item 3): a lift at or past
+/// the person's press the lab made past the hold passes, the switch named. NEGATIVE CONTROLS: a
+/// switch after the lift, one to Cruise, one not taken, one before the hold, and `meta set`'s,
+/// no person's, each leave the lift on nothing.
+#[test]
+fn a_lift_on_the_persons_switch_to_land_stands() {
+    use crate::forever::switch::Switched;
+    let switch = |at: i64, word: &'static str, took: bool| Switched {
+        at: T0 + at,
+        word,
+        reply: if took {
+            "OK".into()
+        } else {
+            "ERR denied".into()
+        },
+        took,
+        phase: "idle".into(),
+        person: true,
+    };
+    let on = |sw: Switched| {
+        let mut s = lifted_held(&said_line(), Some(0));
+        s.cover.words.push(sw);
+        stands(&s, &cx(Chain::SameLand, "claude"), stall(&s))
+    };
+    let v = on(switch(HELD_AT + 15_000, "land", true));
+    assert!(
+        matches!(v, Verdict::Pass(_))
+            && v.why()
+                .contains("on the person's switch to Land at +387.0 s"),
+        "{v:?}"
+    );
+    for (case, sw) in [
+        ("after the lift", switch(HELD_AT + 16_000, "land", true)),
+        ("to Cruise", switch(HELD_AT + 15_000, "cruise", true)),
+        ("not taken", switch(HELD_AT + 15_000, "land", false)),
+        ("before the hold", switch(HELD_AT - 1_000, "land", true)),
+        (
+            "by meta set",
+            Switched {
+                person: false,
+                ..switch(HELD_AT + 15_000, "land", true)
+            },
+        ),
+    ] {
+        let v = on(sw);
+        assert!(
+            matches!(v, Verdict::Fail(_))
+                && v.why().starts_with("HELD, THEN LIFTED WITH NO NEW REPLY"),
+            "CONTROL: a switch {case}: {v:?}"
+        );
+    }
+}
+
 /// Same-land's person's turn is theirs from their first key: aterm lifts the hold as they type
 /// (`a person is typing`), seconds before the lab reads their Enter back (agy, +437.8 s against a
 /// send at +443.2 s), so a lift between the two is the person's, and one before they typed is not.
@@ -1153,4 +895,95 @@ fn hl_fails_where_the_two_answers_differ() {
         matches!(v, Verdict::Fail(_)) && v.why().contains("the two answers differ"),
         "{v:?}"
     );
+}
+
+/// Each read is held to the Autopilot word of its own moment ([`modes_at`]; v6 §14.17 item 3, and
+/// `switch-over-held`'s run, whose state line under `meta set`'s Land at +426.4 s rightly named no
+/// switch): under Cruise the stop names the person's switch to Land, under the Land between the
+/// hold and the person's press it does not, and a read within [`SWITCH_SETTLE_MS`] of a switch
+/// may still show the word before it. NEGATIVE CONTROLS: the Land read naming the switch, a
+/// Cruise read past the settle naming none, and a switch that did not take.
+#[test]
+fn three_a_holds_each_state_line_to_the_word_of_its_read() {
+    use crate::forever::switch::{SWITCH_SETTLE_MS, Switched};
+    let chain = Chain::SwitchOverHeld;
+    let mut base = three_a_said(held(chain, &said_line(), MAIN_HOVER), chain);
+    base.window.held.clear();
+    base.window.held_ax.clear();
+    let ts = stall(&base).0;
+    let (land, back) = (ts + 20_000, ts + 40_000);
+    let ctl = |at: i64, word: &'static str| Switched {
+        at,
+        word,
+        reply: "OK".into(),
+        took: true,
+        phase: "quiet".into(),
+        person: false,
+    };
+    base.cover.words = vec![ctl(land, "land"), ctl(back, "cruise")];
+    let state = |switch: bool| {
+        format!(
+            "head={}: Window 2, tab 3\nstate={} · not landed yet: 1 untracked file",
+            chain.name(),
+            stop_words(HeldBy::SameReply, StopForm::Line, switch)
+        )
+    };
+    let with = |pages: [(i64, bool); 2]| {
+        let mut s = base.clone();
+        s.window
+            .page
+            .extend(pages.iter().map(|(t, switch)| (*t, state(*switch))));
+        s
+    };
+    let judge = |s: &Seen| three_a(s, &cx(chain, "claude"), stall(s));
+    let ok = with([(land + SWITCH_SETTLE_MS, false), (back + 1_000, true)]);
+    let v = judge(&ok);
+    assert!(matches!(v, Verdict::Pass(_)), "{v:?}");
+    assert_eq!(modes_at(&ok, "cruise", land - 1), ["cruise"]);
+    assert_eq!(modes_at(&ok, "cruise", land), ["land", "cruise"]);
+    assert_eq!(
+        modes_at(&ok, "cruise", land + SWITCH_SETTLE_MS - 1),
+        ["land", "cruise"]
+    );
+    assert_eq!(modes_at(&ok, "cruise", land + SWITCH_SETTLE_MS), ["land"]);
+    assert_eq!(modes_at(&ok, "cruise", back), ["cruise", "land"]);
+    let fails = |s: &Seen, case: &str| {
+        let v = judge(s);
+        assert!(
+            matches!(v, Verdict::Fail(_)) && v.why().contains("leads with no stop"),
+            "{case}: {v:?}"
+        );
+    };
+    fails(
+        &with([(land + SWITCH_SETTLE_MS, true), (back + 1_000, true)]),
+        "the Land read naming the switch",
+    );
+    fails(
+        &with([
+            (land + SWITCH_SETTLE_MS, false),
+            (back + SWITCH_SETTLE_MS, false),
+        ]),
+        "a Cruise read past the settle naming none",
+    );
+    let mut untaken = ok.clone();
+    untaken.cover.words[0].took = false;
+    fails(&untaken, "a switch that did not take");
+}
+
+#[test]
+fn held_diagnostics_are_later_and_never_raise_a_stop_alert() {
+    let good = three_a_said(held(Chain::LandC, &said_line(), MAIN_HOVER), Chain::LandC);
+    let judge = |seen: &Seen| three_a(seen, &cx(Chain::LandC, "claude"), stall(seen));
+    assert!(matches!(judge(&good), Verdict::Pass(_)));
+    let mut immediate = good.clone();
+    for (_, line) in &mut immediate.journal {
+        *line = line.replace("when=later", "when=now");
+    }
+    assert!(matches!(judge(&immediate), Verdict::Fail(_)));
+    let mut alerted = good;
+    alerted.band.push((
+        T0 + HELD_AT + 20_000,
+        "m-7 state=live title=Harness decision in window 2, tab 3".to_string(),
+    ));
+    assert!(matches!(judge(&alerted), Verdict::Fail(_)));
 }

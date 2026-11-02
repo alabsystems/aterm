@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //
 // Derived from serde_derive 1.0.228 src/internals/attr.rs and
-// src/internals/name.rs, and modified by the aterm project in 2026.
+// src/internals/name.rs, and modified by the aterm project in 2026: the
+// attributes are read with aterm-macro-support instead of syn, and only the
+// keys, positions and forms in docs/measured/third-party-2026-10-15/serde-attrs.tsv
+// are implemented. Every other key is an error that says so.
 // See ../LICENSE-MIT and ../LICENSE-APACHE for the upstream licenses.
 
 //! This module handles parsing of `#[serde(...)]` attributes.

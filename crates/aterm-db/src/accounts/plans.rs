@@ -21,6 +21,14 @@ type Key = (String, String);
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
         machine = "DbAccountPlan",
+        action = "Causal",
+        project = "aterm_db::accounts::plans::tests::plan_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbAccountPlan",
         action = "Clean",
         project = "aterm_db::accounts::plans::tests::plan_transition"
     )
@@ -157,12 +165,7 @@ pub(super) fn inspect(snapshot: &Snapshot, account: &str) -> Result<Value> {
     if report["truncated"].as_bool() != Some(false) {
         blockers.insert("inspection-limit");
     }
-    if snapshot.withheld > 0
-        || snapshot
-            .operations
-            .iter()
-            .any(|op| !op.available || op.refusal.is_some())
-    {
+    if !snapshot.history_complete() {
         blockers.insert("incomplete-observed-history");
     }
     let issues: Vec<_> = report["issues"]

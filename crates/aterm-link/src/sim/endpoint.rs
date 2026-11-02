@@ -4,8 +4,7 @@
 //! Deterministic verb-lane endpoint model for link bridge simulation.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
+use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use super::lock;
@@ -250,9 +249,9 @@ impl ToldGap {
         for word in words {
             let (key, value) = word.split_once('=')?;
             let fresh = match key {
-                "from" => from.replace(value.parse::<u64>().ok()?).is_none(),
-                "to" => to.replace(value.parse::<u64>().ok()?).is_none(),
-                "records" => records.replace(value.parse::<u64>().ok()?).is_none(),
+                "from" => from.replace(crate::parse_uint::<u64>(value)?).is_none(),
+                "to" => to.replace(crate::parse_uint::<u64>(value)?).is_none(),
+                "records" => records.replace(crate::parse_uint::<u64>(value)?).is_none(),
                 "sid" if !value.is_empty() => sid.replace(value.to_string()).is_none(),
                 "topic" if !value.is_empty() => topic.replace(value.to_string()).is_none(),
                 _ => false,
@@ -276,6 +275,94 @@ impl ToldGap {
 #[derive(Debug, Default)]
 pub(crate) struct Endpoint {
     pub(crate) state: Mutex<EpState>,
+}
+
+/// THE VERB LANE ANSWERED IN PLACE ([`Endpoint::lane`]): each request line the bridge writes is
+/// answered on the bridge's own thread as the write lands ([`Endpoint::answer`]), its reply
+/// queued for the reads that follow, as aterm's end of a socket would answer it. A simulated
+/// kill lands before a request or after its reply ([`crate::fx::Fx::lane`]), never between, so
+/// no thread need wait on the other end: a thread of its own did, and the handoff between the
+/// two at every request was a sixth to a quarter of each world's time.
+///
+/// Where aterm's socket would block, it panics: a read with no reply queued on a lane the bridge
+/// has not shut is the bridge reading past aterm's reply, which would hang a real bridge for
+/// good, so the world reports it as the bridge's panic, not as the lane's end.
+pub(crate) struct Answered {
+    ep: Arc<Endpoint>,
+    /// What the bridge wrote past its last whole line.
+    asked: Vec<u8>,
+    /// The replies not yet read.
+    replies: std::collections::VecDeque<u8>,
+    /// The bridge shut its reading half ([`Answered::shutdown`]).
+    read_shut: bool,
+    /// The bridge shut its writing half.
+    write_shut: bool,
+}
+
+impl Answered {
+    /// The bridge's `shutdown(2)` of its end ([`crate::ctl::Ctl::shutdown`]). After `Read` the
+    /// replies queued and every later one are dropped, and each read ends. After `Write` each
+    /// write fails, and aterm's end, its requests read to their end, closes, so a read ends once
+    /// the replies queued are read.
+    pub(crate) fn shutdown(&mut self, how: std::net::Shutdown) {
+        if matches!(how, std::net::Shutdown::Read | std::net::Shutdown::Both) {
+            self.read_shut = true;
+            self.replies.clear();
+        }
+        if matches!(how, std::net::Shutdown::Write | std::net::Shutdown::Both) {
+            self.write_shut = true;
+        }
+    }
+}
+
+impl Write for Answered {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.write_shut {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "the bridge shut its verb lane",
+            ));
+        }
+        self.asked.extend_from_slice(buf);
+        while let Some(end) = self.asked.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.asked.drain(..=end).collect();
+            let request = std::str::from_utf8(&line[..end]).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "a request line that is not UTF-8",
+                )
+            })?;
+            let reply = self.ep.answer(request);
+            if !self.read_shut {
+                self.replies.extend(reply.as_bytes());
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl std::io::Read for Answered {
+    /// The replies' next bytes, and the end (`Ok(0)`) once they are read on a lane the bridge
+    /// shut, as a shut socket's read ends.
+    ///
+    /// # Panics
+    /// A read on an open lane with no reply queued: the bridge read past aterm's reply, where
+    /// aterm's socket would block it for good.
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        assert!(
+            buf.is_empty() || !self.replies.is_empty() || self.read_shut || self.write_shut,
+            "the bridge read past aterm's reply: aterm's socket would block this read for good"
+        );
+        let n = buf.len().min(self.replies.len());
+        for (to, from) in buf.iter_mut().zip(self.replies.drain(..n)) {
+            *to = from;
+        }
+        Ok(n)
+    }
 }
 
 impl Endpoint {
@@ -509,32 +596,16 @@ impl Endpoint {
         Some(line)
     }
 
-    /// Serve the verb lane on `far` (the bridge holds the other end) until the bridge closes it.
-    pub(crate) fn serve(self: &Arc<Self>, far: UnixStream) {
-        let ep = Arc::clone(self);
-        std::thread::Builder::new()
-            .name("sim-endpoint".to_string())
-            .spawn(move || {
-                let Ok(read_half) = far.try_clone() else {
-                    return;
-                };
-                let mut out = far;
-                let mut reader = BufReader::new(read_half);
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    match reader.read_line(&mut line) {
-                        Ok(0) | Err(_) => return,
-                        Ok(_) => {}
-                    }
-                    let request = line.trim_end_matches('\n');
-                    let reply = ep.answer(request);
-                    if out.write_all(reply.as_bytes()).is_err() {
-                        return;
-                    }
-                }
-            })
-            .expect("the endpoint's thread");
+    /// The verb lane a launched bridge holds ([`crate::ctl::Ctl::simulated`]), answered in place
+    /// ([`Answered`]).
+    pub(crate) fn lane(self: &Arc<Self>) -> Answered {
+        Answered {
+            ep: Arc::clone(self),
+            asked: Vec::new(),
+            replies: std::collections::VecDeque::new(),
+            read_shut: false,
+            write_shut: false,
+        }
     }
 
     /// One request's whole reply, framed as the verb table frames it.
@@ -592,7 +663,7 @@ impl Endpoint {
                 Some("set-aside") if s.rules.lane >= 4 => {
                     match words.next().and_then(|w| w.strip_prefix("files=")) {
                         Some(n) => {
-                            s.set_aside_told += n.parse::<u64>().unwrap_or(0);
+                            s.set_aside_told += crate::parse_uint::<u64>(n).unwrap_or(0);
                             "OK\n".to_string()
                         }
                         None => "ERR usage\n".to_string(),
@@ -603,7 +674,7 @@ impl Endpoint {
                     let torn = words
                         .next()
                         .and_then(|w| w.strip_prefix("torn="))
-                        .and_then(|n| n.parse::<u64>().ok());
+                        .and_then(crate::parse_uint::<u64>);
                     match (torn, words.next()) {
                         (Some(n), None) => {
                             s.held_said = Some(n);
@@ -722,7 +793,7 @@ impl EpState {
     fn retire_post<'a>(&mut self, mut words: impl Iterator<Item = &'a str>) -> String {
         let (Some(sid), Some(id)) = (
             words.next(),
-            words.next().and_then(|n| n.parse::<u64>().ok()),
+            words.next().and_then(crate::parse_uint::<u64>),
         ) else {
             return "ERR usage: outbox sent\n".to_string();
         };
@@ -749,7 +820,7 @@ impl EpState {
         };
         let dedup = self.rules.dedup;
         let held = field("fetched")
-            .and_then(|off| off.parse::<u64>().ok())
+            .and_then(crate::parse_uint::<u64>)
             .zip(self.world.as_ref())
             .and_then(|(off, world)| {
                 let lane = format!(
@@ -762,7 +833,7 @@ impl EpState {
         let Some(session) = self.session_by_sid(sid) else {
             return "ERR no such session\n".to_string();
         };
-        if let Some(rid) = field("receipt").and_then(|n| n.parse::<u64>().ok()) {
+        if let Some(rid) = field("receipt").and_then(crate::parse_uint::<u64>) {
             let off = field("off").unwrap_or("-");
             if let Some(r) = session.receipts.iter_mut().find(|r| r.rid == rid) {
                 if r.retired.is_none() {
@@ -773,7 +844,7 @@ impl EpState {
         }
         if let Some(fetched) = field("fetched") {
             // A whole answer unparks its fetch; a chunk with more to come waits for the rest.
-            let Ok(off) = fetched.parse::<u64>() else {
+            let Some(off) = crate::parse_uint::<u64>(fetched) else {
                 return "ERR invalid deliver\n".to_string();
             };
             let answer: Vec<&str> = toks
@@ -787,7 +858,7 @@ impl EpState {
             session.fetched.push((off, answer.join(" "), held));
             return "OK\n".to_string();
         }
-        let Some(off) = field("off").and_then(|n| n.parse::<u64>().ok()) else {
+        let Some(off) = field("off").and_then(crate::parse_uint::<u64>) else {
             return "ERR invalid deliver\n".to_string();
         };
         if dedup && session.dedup.contains(&off) {
@@ -810,7 +881,7 @@ impl EpState {
             kind: field("kind").unwrap_or("note").to_string(),
             text,
             handled: false,
-            re: field("re").and_then(|n| n.parse().ok()),
+            re: field("re").and_then(crate::parse_uint),
             topic: field("topic").map(str::to_string),
         });
         session.dedup.insert(off);
@@ -826,7 +897,7 @@ impl EpState {
         let n: usize = words
             .iter()
             .find_map(|t| t.strip_prefix("n="))
-            .and_then(|n| n.parse().ok())
+            .and_then(crate::parse_uint)
             .unwrap_or(aterm_slog::TAKE_MAX);
         let key = words
             .iter()
@@ -912,7 +983,7 @@ impl EpState {
         };
         let continues = if self.rules.lane >= 3 {
             field("continues")
-                .and_then(|f| f.parse::<u64>().ok())
+                .and_then(crate::parse_uint::<u64>)
                 .zip(field("was").map(str::to_string))
         } else {
             None
@@ -962,7 +1033,7 @@ impl EpState {
 fn in_chain(was: &str, held: &str, now: &str) -> bool {
     let split = |s: &str| -> Option<(String, u64)> {
         let (id, generation) = s.split_once('.')?;
-        Some((id.to_string(), generation.parse().ok()?))
+        Some((id.to_string(), crate::parse_uint(generation)?))
     };
     if held == was {
         return true;

@@ -282,4 +282,14 @@ fn an_inotify_event_touches_its_file_and_an_overflow_touches_every_file() {
     touched.sort_unstable();
     touched.dedup();
     assert_eq!(touched, [1, 2, 3], "an overflow touches every file");
+
+    let mut huge_len = Vec::new();
+    huge_len.extend(5i32.to_ne_bytes());
+    huge_len.extend(0x2u32.to_ne_bytes());
+    huge_len.extend(0u32.to_ne_bytes());
+    huge_len.extend(u32::MAX.to_ne_bytes());
+    huge_len.extend_from_slice(b"doc.txt\0");
+    let mut touched = Vec::new();
+    inotify_touched(&huge_len, &keys, &mut touched);
+    assert_eq!(touched, [1]);
 }

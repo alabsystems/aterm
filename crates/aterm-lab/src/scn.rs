@@ -427,7 +427,9 @@ impl Ctx {
             } else {
                 self.ctl(&["send", &ch.to_string()]);
             }
-            stop::sleep(std::time::Duration::from_secs_f64(gap))?;
+            stop::sleep(
+                std::time::Duration::try_from_secs_f64(gap).unwrap_or(std::time::Duration::ZERO),
+            )?;
         }
         Ok(self.mark(&format!("type {} end", py_repr(text)), None))
     }
@@ -586,7 +588,7 @@ impl Ctx {
         for (w, l) in &self.marks {
             lines.push((*w, format!("MARK {l}")));
         }
-        lines.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        lines.sort_by(|a, b| a.0.total_cmp(&b.0));
         lines
             .iter()
             .map(|(w, l)| format!("{:8.3} {}  {l}", w - t0, stamp(*w)))
@@ -794,7 +796,9 @@ fn plain_cycle(ctx: &mut Ctx, settle: f64) -> R<(f64, Option<Frame>)> {
     {
         stop::sleep(std::time::Duration::from_millis(100))?;
     }
-    stop::sleep(std::time::Duration::from_secs_f64(settle))?;
+    stop::sleep(
+        std::time::Duration::try_from_secs_f64(settle).unwrap_or(std::time::Duration::ZERO),
+    )?;
     let stats = cycle_stats(&ctx.frames(), &ctx.journal(), t);
     merge_into(&mut ctx.sumd, &stats);
     Ok((t, Some(card)))
@@ -814,7 +818,9 @@ fn at(t: f64, dt: f64) -> R<f64> {
 }
 
 fn secs(s: f64) -> R {
-    Ok(stop::sleep(std::time::Duration::from_secs_f64(s))?)
+    Ok(stop::sleep(
+        std::time::Duration::try_from_secs_f64(s).unwrap_or(std::time::Duration::ZERO),
+    )?)
 }
 
 fn comp_states(ctx: &Ctx, t_from: f64, t_to: Option<f64>) -> J {
@@ -891,7 +897,7 @@ fn no_card(ctx: &mut Ctx) -> R {
     Ok(())
 }
 
-fn stub_main_lines(ctx: &Ctx) -> Option<Vec<String>> {
+pub(crate) fn stub_main_lines(ctx: &Ctx) -> Option<Vec<String>> {
     let t = crate::sys::scratch_read(&ctx.run.w.join("stub.log"))
         .ok()
         .flatten()
@@ -904,10 +910,24 @@ fn stub_main_lines(ctx: &Ctx) -> Option<Vec<String>> {
     )
 }
 
-fn last_user_of(line: &str) -> Option<String> {
+pub(crate) fn last_user_of(line: &str) -> Option<String> {
     let i = line.find("last_user=\"")?;
     let rest = &line[i + 11..];
     rest.find('"').map(|j| rest[..j].to_string())
+}
+
+/// The value of the stub's own `key` word (`msgs=`, `reply=`) on a request line of its log,
+/// never a word inside the request's quoted last message (`last_user="…"`, which ends before
+/// ` auth=`).
+pub(crate) fn word_of<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let (before, after) = match line.split_once(" last_user=\"") {
+        Some((before, rest)) => (before, rest.rsplit_once("\" auth=").map_or("", |(_, a)| a)),
+        None => (line, ""),
+    };
+    before
+        .split(' ')
+        .chain(after.split(' '))
+        .find_map(|w| w.strip_prefix(key))
 }
 
 fn status_of(ctx: &Ctx, key: &str) -> J {
@@ -2406,6 +2426,16 @@ pub fn run_one(s: &Scenario, k: u32, tag: &str) -> Result<Ctx, Stopped> {
                 ..Launch::default()
             },
             Plan::Autopilot(scene) => crate::autopilot_scenes::prepare(&ctx, scene)?,
+            // The corpus keeps this scenario's tape, and the loop reads the transcript's tail
+            // at each decision: lean, as the Autopilot scenes are, its tape stays under the
+            // corpus's cap (2.1.316 at its defaults: about 56 KB a read, ten reads).
+            Plan::S4b => Launch {
+                args: crate::autopilot_scenes::LEAN
+                    .iter()
+                    .map(|a| (*a).to_string())
+                    .collect(),
+                ..Launch::default()
+            },
             _ => Launch::default(),
         };
         ctx.launch(60.0, launch)?;
@@ -2588,7 +2618,7 @@ fn agg(pat: &str) {
         if v.is_empty() {
             continue;
         }
-        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        v.sort_by(f64::total_cmp);
         let n = v.len();
         let median = if n % 2 == 1 {
             v[n / 2]
@@ -2692,7 +2722,11 @@ pub fn run_selftest(tag: &str) -> Result<i32, Stopped> {
 pub fn cmd_watch(args: &[String]) -> crate::Res {
     let mut a = args.to_vec();
     let tag = crate::run::take_tag(&mut a)?;
-    let secs_total: f64 = a.first().and_then(|v| v.parse().ok()).unwrap_or(30.0);
+    let secs_total: f64 = a
+        .first()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(30.0);
     stop::install();
     let mut ctx = Ctx::new("watch", 1, &tag, "", LabKw::default(), true, false);
     if let Err(e) = ctx.start() {
@@ -2733,7 +2767,7 @@ pub fn cmd_watch(args: &[String]) -> crate::Res {
                 format!("JOURNAL {kind:<9} {}", rec_s(r, "line")),
             ));
         }
-        out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        out.sort_by(|a, b| a.0.total_cmp(&b.0));
         for (w, text) in out {
             println!("{} {text}", stamp(w));
         }

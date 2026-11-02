@@ -1492,28 +1492,6 @@ pub(crate) fn a11y_publisher_dead(reason: &str, at_in_use: bool) -> Message {
     }
 }
 
-/// Builds the error message when a presence toggle fails to persist to `aterm.toml`.
-pub(crate) fn presence_not_saved(
-    leaf: &str,
-    label: &str,
-    detail: &str,
-    indeterminate: bool,
-) -> Message {
-    let (severity, title) = if indeterminate {
-        (Severity::Warn, format!("Couldn't confirm {label}"))
-    } else {
-        (Severity::Error, format!("Couldn't save {label}"))
-    };
-    gesture_failure(
-        tags::FABRIC,
-        severity,
-        &title,
-        detail,
-        Then::step("Turn the toggle again"),
-    )
-    .key(format!("fabric.presence-save.{leaf}").as_str())
-}
-
 /// Builds the error message when a Stats Bars toggle fails to persist to `aterm.toml`.
 pub(crate) fn stats_bars_not_saved(form: &str, detail: &str, indeterminate: bool) -> Message {
     let title = if indeterminate {
@@ -2854,7 +2832,7 @@ pub(crate) fn agent_upgrade_waiting_in(
     let from = row
         .lands_by()
         .and_then(|at| {
-            let offset = crate::presence::local_offset_s()?;
+            let offset = crate::presence::local_offset_at(i64::try_from(at).unwrap_or(i64::MAX))?;
             Some(aterm_messages::words::clock_words(
                 at.saturating_mul(1000),
                 offset,
@@ -2947,13 +2925,9 @@ pub(crate) fn agent_upgrade_stalled(
         Some(Remedy::Waits) if matches!(row.wait.as_str(), "background" | "not-idle:shell") => {
             let asked = match row.phase {
                 aterm_agent::harness::upgrade::Phase::Announced { at_s, asks } if !row.quiet => {
-                    asked_again_words(
-                        row.noticed_at,
-                        at_s,
-                        asks,
-                        now,
-                        crate::presence::local_offset_s(),
-                    )
+                    asked_again_words(row.noticed_at, at_s, asks, now, &|t| {
+                        crate::presence::local_offset_at(i64::try_from(t).unwrap_or(i64::MAX))
+                    })
                 }
                 _ => String::new(),
             };
@@ -3197,28 +3171,32 @@ fn pane_words(owner: &str) -> String {
     }
 }
 
-fn asked_again_words(
+pub(crate) fn asked_again_words(
     noticed_at: u64,
     clock_s: u64,
     asks: u32,
     now: u64,
-    offset: Option<i64>,
+    offset_at: &dyn Fn(u64) -> Option<i64>,
 ) -> String {
     use aterm_agent::harness::upgrade::{MAX_ASKS, REASK_S};
     use aterm_agent::harness::upgrade_drive::elapsed_words;
     const POINT: &str = "at its next break or idle point";
-    let when = |at: u64, ago: bool| match offset {
-        Some(offset) => clock_on_day(at, now, offset),
-        None if ago && now.saturating_sub(at) < 60 => "just now".to_string(),
-        None if ago => format!("{} ago", elapsed_words(now.saturating_sub(at))),
-        None => format!("in {}", elapsed_words(at.saturating_sub(now))),
+    let now_offset = offset_at(now);
+    let when = |at: u64, ago: bool| match (offset_at(at), now_offset) {
+        (Some(at_offset), Some(now_offset)) => clock_on_day(at, now, at_offset, now_offset),
+        _ if ago && now.saturating_sub(at) < 60 => "just now".to_string(),
+        _ if ago => format!("{} ago", elapsed_words(now.saturating_sub(at))),
+        _ => format!("in {}", elapsed_words(at.saturating_sub(now))),
     };
     let last = (noticed_at != 0).then(|| when(noticed_at, true));
     let due = (clock_s != 0)
         .then(|| clock_s.saturating_add(REASK_S))
-        .filter(|due| now < *due && (offset.is_some() || *due >= now.saturating_add(60)))
+        .filter(|due| {
+            let known = offset_at(*due).is_some() && now_offset.is_some();
+            now < *due && (known || *due >= now.saturating_add(60))
+        })
         .map(|due| {
-            if offset.is_some() {
+            if offset_at(due).is_some() && now_offset.is_some() {
                 format!(" from {}", when(due, false))
             } else {
                 format!(" {} or later", when(due, false))
@@ -3236,11 +3214,11 @@ fn asked_again_words(
     }
 }
 
-fn clock_on_day(at: u64, now: u64, offset: i64) -> String {
+fn clock_on_day(at: u64, now: u64, at_offset: i64, now_offset: i64) -> String {
     use aterm_messages::words::{clock_words, day_heading, local_day};
     let ms = |s: u64| s.saturating_mul(1000);
-    let clock = clock_words(ms(at), offset);
-    let (day, today) = (local_day(ms(at), offset), local_day(ms(now), offset));
+    let clock = clock_words(ms(at), at_offset);
+    let (day, today) = (local_day(ms(at), at_offset), local_day(ms(now), now_offset));
     match day.saturating_sub(today) {
         0 => clock,
         -1 => format!("yesterday {clock}"),
@@ -3258,9 +3236,10 @@ fn clock_on_day(at: u64, now: u64, offset: i64) -> String {
 
 fn next_round_clock(row: &aterm_agent::harness::upgrade_drive::Row, now: u64) -> Option<String> {
     let secs = row.next_round_in(now).filter(|secs| *secs > 0)?;
-    let offset = crate::presence::local_offset_s()?;
+    let due = now.saturating_add(secs);
+    let offset = crate::presence::local_offset_at(i64::try_from(due).unwrap_or(i64::MAX))?;
     Some(aterm_messages::words::clock_words(
-        now.saturating_add(secs).saturating_mul(1000),
+        due.saturating_mul(1000),
         offset,
     ))
 }
@@ -4613,10 +4592,36 @@ pub(crate) fn program_check_episode(edge: HeldEdge, aterm: u32) -> Message {
     .key(PROGRAM_CHECK_EPISODE_KEY)
 }
 
-/// The key of the record naming this user's programs that have not started for a reason other than macOS's program check (leftover §5.1: Rosetta's translation, or a volume not proven local).
+/// The key of the record that macOS's program check holds programs aterm started after its Developer Tools grant took (leftover §5.1's `granted` row).
+pub(crate) const PROGRAM_CHECK_AFTER_GRANT_KEY: &str = "program-check.after-grant";
+
+/// Builds the record that macOS's program check holds `n` programs aterm started after its Developer Tools grant took (`Findings::program_check_after_grant`, leftover §5.1): once a refresh took, macOS checks no new program aterm starts (M13), so one held means the grant did not take. A fact for later, never an Entry or a Now: System State's Permissions row is the Developer Tools remedy. It is posted when a view first names one, so it gives no age.
+pub(crate) fn program_check_after_grant(n: u32) -> Message {
+    let what = if n == 1 {
+        "1 program".to_owned()
+    } else {
+        format!("{n} programs")
+    };
+    Message::new(
+        tags::SYSTEM,
+        Severity::Info,
+        format!(
+            "macOS's program check is holding {what} aterm started after its Developer Tools \
+             grant took"
+        ),
+    )
+    .line(
+        "so macOS still checks the programs aterm starts: look at aterm's row in the Developer \
+         Tools list",
+    )
+    .record()
+    .key(PROGRAM_CHECK_AFTER_GRANT_KEY)
+}
+
+/// The key of the record naming this user's programs that have not started for a reason other than macOS's program check (leftover §5.1: Rosetta's translation, a volume not proven local, or one that reads stopped or traced).
 pub(crate) const NOT_STARTED_KEY: &str = "program-check.not-started";
 
-/// Builds the record of the programs `rows` names that have not started, each with what keeps it (leftover §5.1, §6.5): "translating (Rosetta)", which aterm's Developer Tools grant does not reach, or "has not started" with nothing read to say why. It is posted when a view first names a row, so it gives no age: a row's age counts from that first sighting (`sys jobs` shows it growing). A fact for later, never an Entry or a Now: no step of aterm's moves either.
+/// Builds the record of the programs `rows` names that have not started, each with what keeps it (leftover §5.1, §6.5): "translating (Rosetta)", which aterm's Developer Tools grant does not reach, "has not started" with nothing read to say why, or "has not started" and what it reads of stopped and traced. It is posted when a view first names a row, so it gives no age: a row's age counts from that first sighting (`sys jobs` shows it growing). A fact for later, never an Entry or a Now: no step of aterm's moves either.
 pub(crate) fn not_started_record(
     rows: &[(aterm_vitals::jobs::StartWait, &aterm_vitals::jobs::Named)],
 ) -> Message {
@@ -4641,12 +4646,207 @@ pub(crate) fn not_started_record(
                 "{who}: it has not started, and its program is on a volume aterm cannot prove \
                  local, so nothing read says why"
             ),
+            StartWait::StoppedUnstarted { stopped, traced } => {
+                let read = match (stopped, traced) {
+                    (true, true) => "stopped and traced",
+                    (true, false) => "stopped",
+                    (false, true) => "traced",
+                    (false, false) => "stopped or traced",
+                };
+                format!("{who}: it has not started, and it reads {read}")
+            }
         }
     };
     Message::new(tags::SYSTEM, Severity::Info, title)
         .lines(rows.iter().map(line))
         .record()
         .key(NOT_STARTED_KEY)
+}
+
+/// The key of each record of a leftover process `end` signalled (leftover §6.5's `proc.` stem). A
+/// record never folds into another under one key: each end keeps its own row in the log.
+pub(crate) const PROC_END_KEY: &str = "proc.end";
+
+/// The key of each record that a closed tab left processes running.
+pub(crate) const PROC_LEFT_KEY: &str = "proc.left";
+
+/// The key of each record of what a verify run ended unasked, posted by that run through
+/// `appnotice proc` (`aterm_verify::runs::ToInstance`).
+pub(crate) const PROC_AUTO_END_KEY: &str = "proc.auto-end";
+
+/// How one `end` went: the signals it sent and whether the process was gone after them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct EndOutcome {
+    /// A `SIGKILL` followed the `SIGTERM`: the process outlived the grace.
+    pub(crate) killed: bool,
+    /// Identity reads no longer name it.
+    pub(crate) gone: bool,
+}
+
+/// Where a leftover row came from, as a record says it: "it outlived Tab 3 by 2 h 05 m", "from
+/// verify run <id>, whose launcher is gone", "launchd adopted it while its tab still runs", or
+/// "nothing read ties it to a tab or a run". `now_ms` is unix ms.
+pub(crate) fn left_source_words(
+    row: &aterm_vitals::left::LeftRow,
+    view: &aterm_vitals::left::LeftView,
+    now_ms: u64,
+) -> String {
+    use aterm_vitals::left::Source;
+    match &row.from {
+        Source::Closed(key) => view.closed.iter().find(|t| t.key == *key).map_or_else(
+            || "it outlived a closed tab".to_owned(),
+            |t| {
+                format!(
+                    "it outlived {} by {}",
+                    tab_words(t),
+                    aterm_uds::process::held_age(now_ms.saturating_sub(t.closed_ms))
+                )
+            },
+        ),
+        Source::Run(id) => format!(
+            "from verify run {}, whose launcher is gone",
+            aterm_vitals::sys::pct(id)
+        ),
+        Source::Tab(_) => "launchd adopted it while its tab still runs".to_owned(),
+        Source::Unknown => "nothing read ties it to a tab or a run".to_owned(),
+    }
+}
+
+/// A closed tab as a person names it: its label (`Tab 2`), else its number, else "a tab".
+fn tab_words(tab: &aterm_vitals::left::ClosedTab) -> String {
+    let label = atpkg::progress::sanitize_for_tty(tab.label.trim(), 40);
+    if !label.is_empty() {
+        label
+    } else if let Some(n) = tab.number {
+        format!("Tab {n}")
+    } else {
+        "a tab".to_owned()
+    }
+}
+
+/// `row`'s `proof=` words, comma-joined, or `none`.
+fn proof_words(row: &aterm_vitals::left::LeftRow) -> String {
+    if row.proof.is_empty() {
+        "none".to_owned()
+    } else {
+        row.proof
+            .iter()
+            .map(|p| p.word())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+/// Builds the record of one leftover process `end` signalled (leftover §4.4 step 5, §6.5): what it
+/// was, where it came from, the proof it was ended on, the signals and the outcome. A fact for
+/// later, never an Entry or a Now. `now_ms` is unix ms.
+pub(crate) fn end_record(
+    row: &aterm_vitals::left::LeftRow,
+    view: &aterm_vitals::left::LeftView,
+    outcome: EndOutcome,
+    now_ms: u64,
+) -> Message {
+    let title = match row.exe_word() {
+        "-" => format!("Ended a leftover process (pid {})", row.pid),
+        word => format!("Ended {word} (pid {})", row.pid),
+    };
+    let signals = if outcome.killed {
+        "SIGTERM, then SIGKILL once it outlived the grace"
+    } else {
+        "SIGTERM"
+    };
+    let after = if outcome.gone {
+        "it is gone"
+    } else {
+        "it still runs"
+    };
+    Message::new(tags::SYSTEM, Severity::Info, title)
+        .line(left_source_words(row, view, now_ms))
+        .line(format!(
+            "proof: {} (tier {})",
+            proof_words(row),
+            row.tier.word()
+        ))
+        .line(format!("{signals}; {after}"))
+        .record()
+        .key(PROC_END_KEY)
+}
+
+/// The closed tabs `after` holds with processes left that `told` (the closes already told) does
+/// not hold, which takes them: each close is told once, at the first view that holds what it
+/// left, however its count moves after. `told` keeps only the closed tabs `after` still holds.
+pub(crate) fn newly_left<'a>(
+    told: &mut std::collections::BTreeSet<u64>,
+    after: &'a aterm_vitals::left::LeftView,
+) -> Vec<&'a aterm_vitals::left::ClosedTab> {
+    told.retain(|key| after.closed.iter().any(|t| t.key == *key));
+    after
+        .closed
+        .iter()
+        .filter(|t| t.left > 0 && told.insert(t.key))
+        .collect()
+}
+
+/// Builds the record that `tab` closed and left processes running ("Tab 2 closed and left 3
+/// processes: ugrep ×2, tail"), from `view`'s rows of it that offer a token. A fact for later,
+/// never an Entry or a Now: `sys left scope=aterm` lists them, each with its proof.
+pub(crate) fn left_record(
+    tab: &aterm_vitals::left::ClosedTab,
+    view: &aterm_vitals::left::LeftView,
+) -> Message {
+    use aterm_vitals::left::Source;
+    let mut words: Vec<(&str, usize)> = Vec::new();
+    for row in view
+        .rows
+        .iter()
+        .filter(|r| r.from == Source::Closed(tab.key) && r.token.is_some())
+    {
+        let word = match row.exe_word() {
+            "-" => "?",
+            word => word,
+        };
+        match words.iter_mut().find(|(w, _)| *w == word) {
+            Some((_, n)) => *n += 1,
+            None => words.push((word, 1)),
+        }
+    }
+    let n = tab.left;
+    let noun = if n == 1 { "process" } else { "processes" };
+    let named: Vec<String> = words
+        .iter()
+        .map(|(w, k)| {
+            if *k == 1 {
+                (*w).to_owned()
+            } else {
+                format!("{w} ×{k}")
+            }
+        })
+        .collect();
+    let title = if named.is_empty() {
+        format!("{} closed and left {n} {noun}", tab_words(tab))
+    } else {
+        format!(
+            "{} closed and left {n} {noun}: {}",
+            tab_words(tab),
+            named.join(", ")
+        )
+    };
+    Message::new(tags::SYSTEM, Severity::Info, title)
+        .line("aterm ctl sys left scope=aterm lists them, each with its proof and token")
+        .record()
+        .key(PROC_LEFT_KEY)
+}
+
+/// Builds the record a verify run posted of a process it ended unasked (`appnotice proc
+/// <text>`): its own words, one process each. A fact for later, never an Entry or a Now.
+pub(crate) fn auto_end_record(text: &str) -> Message {
+    Message::new(
+        tags::SYSTEM,
+        Severity::Info,
+        atpkg::progress::sanitize_for_tty(text, 160),
+    )
+    .record()
+    .key(PROC_AUTO_END_KEY)
 }
 
 /// Builds the exceptions digest entry when the live upgrade host cannot lock its state directory.
@@ -4853,6 +5053,46 @@ pub(crate) fn accounts_no_sign_in_entry(rows: &[(String, String)]) -> Option<Ent
         ));
     }
     Some(entry.log_line(format!("accounts need=no-sign-in-route n={}", rows.len())))
+}
+
+pub(crate) const ACCOUNTS_SHEET_CONFLICT_KEY: &str = "harness.accounts.sheet-conflict";
+
+/// The exceptions digest entry, a fact for later, for the vault sheet's rows that give one
+/// address conflicting assignments (`accounts_sync::SheetConflict`): no sync adds that address
+/// to this machine's pools (a roster that lists it keeps its row), and every sync reads the
+/// rest, until its rows agree, which only a person can make them. Each line names a CLI and its
+/// sheet rows; no address is named.
+pub(crate) fn accounts_sheet_conflict_entry(
+    conflicts: &[aterm_agent::harness::accounts_sync::SheetConflict],
+) -> Option<Entry> {
+    conflicts.first()?;
+    let mut entry = Entry::new(
+        Family::Accounts,
+        "",
+        "sheet-conflict",
+        "The account sheet has conflicting rows",
+        Why::OnlyYou(Reason::new(
+            "rows give one address different assignments, so no pool adds it until they agree",
+        )),
+        Then::step("Give each address one assignment in the account sheet"),
+    )
+    .severity(Severity::Info)
+    .resurface(Resurface::WAIT)
+    .restated_at_once();
+    for conflict in conflicts
+        .iter()
+        .take(aterm_messages::exceptions::MORE_LINES)
+    {
+        let rows: Vec<String> = conflict.rows.iter().map(usize::to_string).collect();
+        entry = entry.more(atpkg::progress::sanitize_for_tty(
+            &format!("{}: rows {}", conflict.cli.id(), rows.join(", ")),
+            aterm_messages::DETAIL_LINE_CAP,
+        ));
+    }
+    Some(entry.log_line(format!(
+        "accounts need=sheet-conflict n={}",
+        conflicts.len()
+    )))
 }
 
 pub(crate) const ACCOUNTS_CREDITS_KEY: &str = "harness.accounts.credits";
@@ -5679,12 +5919,9 @@ pub(crate) fn notice_ask_key(sid: &str, notice: Option<&str>) -> String {
 pub(crate) fn resume_ask(sid: &str, spot: &UpgradeSpot, exception: &Exception) -> Message {
     let clean = |line: &str| atpkg::progress::sanitize_for_tty(line, 240);
     let notice = exception.notice.as_ref();
-    // A notice titles its own ask; a plain one its own title (`aterm stopped typing`, §14.3), so
-    // the default, which names Claude, is said only where neither does.
-    let (title, short_title) = match (notice, exception.title) {
-        (Some(n), _) => (n.title, n.short_title),
-        (None, Some(titled)) => titled,
-        (None, None) => ("Claude needs you", "Claude needs you"),
+    let (title, short_title) = match notice {
+        Some(n) => (n.title, n.short_title),
+        None => ("Harness decision", "Harness decision"),
     };
     let mut message = Message::new(
         tags::HARNESS,
@@ -6351,12 +6588,15 @@ pub(crate) fn agent_upgrade_word_refused(
             true,
         )
     } else if let Some((at, _)) = aterm_agent::harness::upgrade_drive::refused_stopped(why) {
-        let when = match crate::presence::local_offset_s() {
-            Some(offset) if at > 0 => format!(
+        let when = match (at > 0)
+            .then(|| crate::presence::local_offset_at(i64::try_from(at).unwrap_or(i64::MAX)))
+            .flatten()
+        {
+            Some(offset) => format!(
                 "at {}",
                 aterm_messages::words::clock_words(at.saturating_mul(1000), offset)
             ),
-            _ => "soon".to_string(),
+            None => "soon".to_string(),
         };
         (
             format!("retries {when}"),
@@ -6512,12 +6752,23 @@ pub(crate) fn agent_upgrade_went_through(
 
 const MOVED_SAID_AFTER_S: u64 = 10 * 60;
 
-/// Formats the `moved at ...` detail line for a completed upgrade record.
+/// Formats the `moved at ...` detail line for a completed upgrade record at a fixed `offset`.
+#[cfg(test)]
 pub(crate) fn moved_line(moved_at: u64, done_at: u64, offset: Option<i64>) -> Option<String> {
+    moved_line_local(moved_at, done_at, &|_| offset)
+}
+
+/// Formats the `moved at ...` detail line for a completed upgrade record, resolving `moved_at`
+/// and `done_at` at their own local offsets.
+pub(crate) fn moved_line_local(
+    moved_at: u64,
+    done_at: u64,
+    offset_at: &dyn Fn(u64) -> Option<i64>,
+) -> Option<String> {
     if moved_at == 0 || done_at < moved_at.saturating_add(MOVED_SAID_AFTER_S) {
         return None;
     }
-    let when = clock_on_day(moved_at, done_at, offset?);
+    let when = clock_on_day(moved_at, done_at, offset_at(moved_at)?, offset_at(done_at)?);
     Some(if when.starts_with(|c: char| c.is_ascii_digit()) {
         format!("moved at {when}")
     } else {
@@ -6535,7 +6786,9 @@ pub(crate) fn agent_upgrade_done(
         .outcome
         .split_once(" · ")
         .map_or(row.outcome.as_str(), |(_, rest)| rest);
-    let moved = moved_line(row.moved_at, row.done_at, crate::presence::local_offset_s());
+    let moved = moved_line_local(row.moved_at, row.done_at, &|t| {
+        crate::presence::local_offset_at(i64::try_from(t).unwrap_or(i64::MAX))
+    });
     let mut msg = Message::new(
         tags::HARNESS,
         Severity::Success,

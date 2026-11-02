@@ -40,13 +40,20 @@ impl std::error::Error for FrameError {}
 
 impl Frame {
     /// A `width x height` frame of one colour.
+    ///
+    /// # Panics
+    /// When `width * height * 4` overflows `usize`.
     #[must_use]
     pub fn filled(width: usize, height: usize, ground: Rgb) -> Self {
+        let pixels = width
+            .checked_mul(height)
+            .filter(|px| px.checked_mul(4).is_some())
+            .expect("frame dimensions overflow");
         let [r, g, b] = ground;
         Self {
             width,
             height,
-            rgba: [r, g, b, 255].repeat(width * height),
+            rgba: [r, g, b, 255].repeat(pixels),
         }
     }
 
@@ -94,15 +101,22 @@ impl Frame {
     }
 
     /// The pixel at index `p` (`y * width + x`).
+    ///
+    /// # Panics
+    /// When `p` is outside the frame (`p >= width * height`).
     #[must_use]
     pub fn pixel(&self, p: usize) -> Rgb {
-        let i = p * 4;
+        let i = p.checked_mul(4).expect("pixel index out of bounds");
         [self.rgba[i], self.rgba[i + 1], self.rgba[i + 2]]
     }
 
     /// The bytes of row `y`.
+    ///
+    /// # Panics
+    /// When `y >= height`.
     #[must_use]
     pub fn row(&self, y: usize) -> &[u8] {
+        assert!(y < self.height, "row {y} is off the frame");
         let span = self.width * 4;
         &self.rgba[y * span..(y + 1) * span]
     }

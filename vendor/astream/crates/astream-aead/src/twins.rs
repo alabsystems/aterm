@@ -12,6 +12,7 @@
 
 /// `aead_seq_monotone` as `stream_island.rs` defines it in Clean:
 /// `if cur_seq < next_seq then next_seq else cur_seq`.
+#[cfg(feature = "stream")]
 #[must_use]
 pub const fn aead_seq_monotone(cur_seq: u64, next_seq: u64) -> u64 {
     if cur_seq < next_seq {
@@ -69,12 +70,15 @@ mod tests {
     // elsewhere, so every build holds the twin to the island's answers.
     #[test]
     fn the_twins_answer_as_the_islands_do() {
-        let want = "012112222";
-        assert_eq!(
-            answers(|[a, b]| crate::stream::aead_seq_monotone(a, b)),
-            want
-        );
-        assert_eq!(answers(|[a, b]| super::aead_seq_monotone(a, b)), want);
+        #[cfg(feature = "stream")]
+        {
+            let want = "012112222";
+            assert_eq!(
+                answers(|[a, b]| crate::stream::aead_seq_monotone(a, b)),
+                want
+            );
+            assert_eq!(answers(|[a, b]| super::aead_seq_monotone(a, b)), want);
+        }
         let want = "012112222";
         assert_eq!(answers(|[a, b]| crate::aead_clamp_sealed_len(a, b)), want);
         assert_eq!(answers(|[a, b]| super::aead_clamp_sealed_len(a, b)), want);

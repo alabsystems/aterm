@@ -1,0 +1,33 @@
+# kimi 2.4.0 · MEASURED 2026-10-29, `aterm ctl text` of a private headless aterm (110x32, aterm 0.146.0) running the real Kimi Code, launched by path with a scratch `HOME` and `KIMI_CODE_HOME` whose `config.toml` names one `openai`-type provider at `http://127.0.0.1:<port>/v1` with a fake key (a local stub of the Chat Completions API, crates/aterm-lab), no login · Enter on that draft while busy: it is queued above the composer (`❯ lab typed while busy`, `↑ to edit · ctrl-s to steer immediately`), the composer empty, the turn still held
+   ┌ plan: us-agent-constantine-obsidian.md ────────────────────────────────────────────────────────────────┐
+   │ Lab plan                                                                                               │
+   │                                                                                                        │
+   │ 1. Lab step one.                                                                                       │
+   │ 2. Lab step two.                                                                                       │
+   └────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+ Current plan
+   ExitPlanMode can only be called while plan mode is active. Only the user can turn plan mode on.
+
+ ● lab after the plan
+
+ ❯ lab hit the quota
+
+ ❯ lab hit an auth failure
+   Resumed session (session_d240495d-90d8-422b-bc70-82ea4e4c480f).
+
+ ❯ lab after resume
+
+ ● Hi! I am the local lab stub, not a model. (reply 32)
+
+ ❯ lab held for queueing
+
+  🌕 · Tip: ! to run a shell command
+ ────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   ❯ lab typed while busy
+   ↑ to edit · ctrl-s to steer immediately
+ ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │ >                                                                                                        │
+ ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ lab-model  …/tmp/at.H2aa/proj
+                                                                                   context: 26% (24.6k/97.7k)

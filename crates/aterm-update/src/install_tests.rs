@@ -1737,17 +1737,13 @@ fn inverse_swap_receipt_restore_binds_old_identity_and_fails_closed() {
         aterm_durable::Flush::Durable,
     )
     .unwrap();
-    let blocked_tmp = staging
-        .installed_receipt()
-        .with_extension(format!("toml.{}.tmp", std::process::id()));
-    std::fs::create_dir(&blocked_tmp).unwrap();
+    crate::manifest::fail_next_durable_write();
     restore_installed_receipt(&staging, Some(&previous), aterm_durable::Flush::Durable)
         .expect_err("blocked kind-preserving rewrite must surface failure");
     assert!(
         !staging.installed_receipt().exists(),
         "failed NEW receipt is cleared instead of surviving as OLD authority"
     );
-    std::fs::remove_dir(&blocked_tmp).unwrap();
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -2710,10 +2706,30 @@ fn a_supersede_moves_nothing_unless_every_precondition_holds() {
         )
         .unwrap();
     };
+    let revoked_signer = |s: &Staging, _installed: &Path, _root: &Path| {
+        let mut r = Ready::read(&s.ready).unwrap();
+        r.machine_id = Some("m-revoked".to_string());
+        std::fs::write(&s.ready, r.to_toml().unwrap()).unwrap();
+        std::fs::write(s.floor(), "revoked_machines = [\"m-revoked\"]\n").unwrap();
+    };
+    let quarantined_stage = |s: &Staging, _installed: &Path, _root: &Path| {
+        crate::manifest::Quarantine::record(
+            &s.quarantine(),
+            12,
+            &"cd".repeat(32),
+            aterm_durable::Flush::Ordered,
+        )
+        .unwrap();
+    };
+    let stale_roster = |s: &Staging, _installed: &Path, _root: &Path| {
+        let mut r = Ready::read(&s.ready).unwrap();
+        r.roster_confirmed_at = None;
+        std::fs::write(&s.ready, r.to_toml().unwrap()).unwrap();
+    };
     fn unverifiable(app: &Path) {
         std::fs::remove_file(app.join("sealed")).unwrap();
     }
-    let cases: [Case; 14] = [
+    let cases: [Case; 17] = [
         (
             "not newer",
             |_, _, _| {},
@@ -2748,6 +2764,27 @@ fn a_supersede_moves_nothing_unless_every_precondition_holds() {
             (10, SUPERSEDE_RUNNING_COMMIT),
             12,
             false,
+        ),
+        (
+            "the stage signer is revoked",
+            revoked_signer,
+            (10, SUPERSEDE_RUNNING_COMMIT),
+            12,
+            false,
+        ),
+        (
+            "the stage is quarantined",
+            quarantined_stage,
+            (10, SUPERSEDE_RUNNING_COMMIT),
+            12,
+            false,
+        ),
+        (
+            "the stage roster confirmation is stale",
+            stale_roster,
+            (10, SUPERSEDE_RUNNING_COMMIT),
+            12,
+            true,
         ),
         (
             "the installed bundle is not the activation",
@@ -4426,6 +4463,9 @@ fn a_kept_predecessors_record_preserves_its_exact_path_and_refuses_extra_input()
         format!("{header} extra\n{path}\n"),
         format!("{header}\n{path}x\n"),
         format!("{header}\n\n"),
+        format!("v1 4242 +17 23\n{path}\n"),
+        format!("v1 4242 -17 23\n{path}\n"),
+        format!("v1 4242 17 +23\n{path}\n"),
         "4242 17 23\n/private/custody/aterm.app.rollback\n/Applications/aterm.app.rollback\n"
             .to_string(),
         record(PathBuf::from("/Applications/aterm.app")).encode(),
@@ -4435,6 +4475,9 @@ fn a_kept_predecessors_record_preserves_its_exact_path_and_refuses_extra_input()
         )))
         .encode(),
     ];
+    assert!(parse_owed_give_back("42 100 +17 23\n").is_none());
+    assert!(parse_owed_give_back("42 100 -17 23\n").is_none());
+    assert!(parse_owed_give_back("42 100 17 +23\n").is_none());
     let all_roundtrip = roundtrips
         .iter()
         .all(|(got, expected)| got.as_ref() == Some(expected));

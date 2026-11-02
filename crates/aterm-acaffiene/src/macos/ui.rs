@@ -518,7 +518,7 @@ mod tests {
 
     /// Every menu `compose` makes has one shape, so the open menu is always retitled in place
     /// ([`StatusUi::retitle_menu`]), never emptied while AppKit tracks it; and across a span's end
-    /// the open menu moves its checkmark from that span's row to Forever's.
+    /// the open menu takes the checkmark off that span's row.
     #[test]
     fn an_open_menu_is_always_retitled_in_place() {
         const NOW: Clocks = Clocks {
@@ -567,10 +567,10 @@ mod tests {
         let checked = |rows: &[Row], i: usize| matches!(rows[i], Row::Action { checked: true, .. });
         assert_eq!(
             changed_rows(&before, &after),
-            Some(vec![row(Choice::Hours1), row(Choice::Forever)])
+            Some(vec![row(Choice::Hours1)])
         );
         assert!(checked(&before, row(Choice::Hours1)) && !checked(&before, row(Choice::Forever)));
-        assert!(!checked(&after, row(Choice::Hours1)) && checked(&after, row(Choice::Forever)));
+        assert!(!checked(&after, row(Choice::Hours1)) && !checked(&after, row(Choice::Forever)));
     }
 
     fn types(ret: &str, args: &[&str]) -> String {

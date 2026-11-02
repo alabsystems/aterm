@@ -78,6 +78,7 @@ fn reading() -> AiReading {
         ],
         store_note: None,
         held: None,
+        harness_packages: Vec::new(),
     }
 }
 
@@ -404,6 +405,7 @@ fn a_codex_row_that_offers_no_fix_asks_nothing_of_anyone() {
                 store_note: None,
                 asker: aterm_agent::ai::permission::Asker::Person,
                 held: None,
+                harness_packages: Vec::new(),
             };
             let reading = AiReading::of(&look, 1_000_000, Some(0));
             let case = format!("{state:?}, offered {offered}");
@@ -456,10 +458,14 @@ fn a_claude_row_whose_sign_in_starts_nothing_offers_no_sign_in() {
     let (local, notes) = config::read("[ai]\npreferred = \"claude\"\n");
     let settings = config::resolve(&local, None, None, notes);
     let view = |refused: Option<&str>| ClaudeAccounts {
+        store: None,
+        roster: None,
         label: "main".to_string(),
         listed: false,
         refused: refused.map(str::to_string),
         unread: None,
+        launch_refused: None,
+        sign_in_refused: None,
         renews: false,
         login: None,
         made: false,
@@ -496,6 +502,9 @@ fn a_claude_row_whose_sign_in_starts_nothing_offers_no_sign_in() {
             record: aterm_agent::ai::store::Record::default(),
             env_credentials: Vec::new(),
             pool: None,
+            review_source: None,
+            record_scope: None,
+            credential_store_error: None,
         };
         let row = aterm_agent::ai::state::assess(&facts, true, 1_000_000);
         assert_eq!(row.state, State::SignedOut, "{}", row.fact);
@@ -506,6 +515,7 @@ fn a_claude_row_whose_sign_in_starts_nothing_offers_no_sign_in() {
             store_note: None,
             asker: aterm_agent::ai::permission::Asker::Person,
             held: None,
+            harness_packages: Vec::new(),
         };
         let reading = AiReading::of(&look, 1_000_000, Some(0));
         let case = format!("refused {refused:?}");

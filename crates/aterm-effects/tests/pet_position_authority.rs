@@ -6,7 +6,7 @@
 use std::time::{Duration, Instant};
 
 use aterm_core::terminal::Terminal;
-use aterm_effects::kitty_pet::{PetBrain, PetFrame, PetSense};
+use aterm_effects::kitty_pet::{PetBrain, PetFrame, PetSense, art_cols};
 use aterm_effects::pet_world::{PetPane, PetWorldFacts};
 
 const ROWS: u16 = 24;
@@ -14,7 +14,10 @@ const COLS: u16 = 80;
 const CELL_W: u16 = 8;
 const CELL_H: u16 = 16;
 
-const TELEPORT: f32 = 2.0;
+/// A teleport: a frame that moves the body more than half its own width. A caret's jump is
+/// crossed in one brisk bound (r25 K8-3), at the animal's own pace across a pane this narrow:
+/// 140 cells a second, 2.3 cells a 60 Hz frame, of a body 5.6 cells wide.
+const TELEPORT: f32 = 0.5 * art_cols(CELL_W, CELL_H);
 
 struct Scene {
     term: Terminal,
@@ -155,7 +158,7 @@ fn streaming_output_never_teleports_the_body() {
     );
 }
 
-/// A jumping caret closes distance at a walking pace without teleporting the body.
+/// A jumping caret closes distance in a bound without teleporting the body.
 #[test]
 fn a_caret_that_jumps_does_not_teleport_the_body() {
     let mut now = Instant::now();

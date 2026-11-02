@@ -33,10 +33,10 @@ the engine's function"), which wait on gap 12 (cross-crate citation). A small se
   or `new_from_system` by any finite sequence of exported calls (`process`, `process_str`, `resize`,
   `render`, `scroll_*`, `selection_*`, `set_*`, `note_*`, `notice*`, `messages_*`, `predict_*`,
   `pump_reflow*`, …). Every "∀ T" below ranges over `Reach`.
-- `HostState(T)`: everything a frame may depend on. That is the terminal's visible display view (grid
-  cells at the current `display_offset`, cursor, selection, modes, live OSC colours), theme, palette,
-  fonts and line height, chrome `(pad, head)`, the effects pipeline state, the committed message-band
-  rows with hover, details, forced-colour and visibility state, and the sub-row scroll residual. It
+- `HostState(T)`: everything a frame may depend on: the terminal's visible display view (grid cells
+  at the current `display_offset`, cursor, selection, modes, live OSC colours), theme, palette, fonts
+  and line height, chrome `(pad, head)`, the effects pipeline state, the committed message-band rows
+  with hover, details, forced-colour and visibility state, and the sub-row scroll residual. It
   excludes the render-schedule fields (`last_frame_key`, the window cache, `present_bands`,
   `last_present_frac`, `frame_scratch` reuse, the damage tracker).
 - `Frame(T)` = `(width, height, rgba)` after `T.render()`. `FullExp(T)` = the rgba that
@@ -65,10 +65,8 @@ the engine's function"), which wait on gap 12 (cross-crate citation). A small se
 Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (primary tests, `module::test`; the full
 map is §2), `difficulty` (the Rust features the proof must handle), `blocking_gaps` (rows of the gap
 table in `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7). Gap 0 (the installed seal publishes
-no Lean-discharged row) blocks every spec and is not repeated in the column. No spec is blocked by
-gap 0 alone: the shortest list is `tick-bits` (gap 3).
-
-Rows are in proof order (§6).
+no Lean-discharged row) blocks every spec and is not repeated in the column; no spec is blocked by gap
+0 alone. Rows are in proof order (§6).
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking_gaps
@@ -200,7 +198,7 @@ Everything pixel-level (`band-is-translation`, `effects-off-identity`, `render-h
 ## 2. Test → spec map (TSV)
 
 `file` is relative to `crates/aterm-wasm`. `primary` is the spec that retires the test; `also` lists
-other specs the same test samples. The test of §4 is deleted and has no row.
+other specs the same test samples.
 
 ```tsv
 file	test	primary	also
@@ -354,14 +352,29 @@ src/theme_api.rs	web_translucency_raises_the_effective_floor	web-contrast-floor
 - `scroll-navigation` is clause (c) of `scroll-input-export`. `theme_api::cursor_color_follows_osc12_and_resets_on_112`
   is the export-level view of `theme-reset-baseline` and maps there.
 
-## 4. Tests that are not spec samples
+## 4. Tests missing from §2
 
-`session_reset_forgets_rtt_while_coordinate_reset_preserves_it` (deleted from `src/predict_api.rs`)
-depended on timing (a 20 ms sleep over `aterm-predict`'s adaptive threshold). Its binding half
-(`predict_reset` → `Predictor::reset`, `predict_session_reset` → `reset_session`) is in
-`predict-binding-refines-predictor`; RTT retention belongs to `aterm-predict`'s clock-injected spec.
+Each line names a test file under `src/`, its tests, and the rows they sample.
 
-No other test is a pure regression with no general property; each is an instance of a spec in §1.
+- `lib.rs`: `host_mode_getters_follow_the_program` (`mode-getters-delegate`);
+  `mouse_getters_follow_the_mode_and_encoders_take_host_cells` (`mode-getters-delegate`,
+  `mouse-report-encoding`); `encode_key_follows_the_live_mode_and_its_mirrored_bits`
+  (`encode-key-stateless-equals-instance`); `console_input_words_note_one_input_each_and_refuse_unknowns`
+  (`console-input-admission`); `a_minted_scheme_links_through_osc8_until_revoked`
+  (`hyperlink-scheme-gate`); `last_command_output_is_none_then_the_latest_block_then_evicted`
+  (`last-command-output`); `search_meta_and_summary_carry_what_the_legacy_export_drops`
+  (`search-exports-agree`); `scrollback_limit_zero_is_unlimited_and_a_shrink_reclamps_the_viewport`
+  (`scrollback-retention-limit`); `small_history_rewraps_inline_and_a_deep_one_defers_to_stepped_pumps`
+  and `a_resize_during_the_window_supersedes_without_losing_history` (`reflow-offload-contract`);
+  `registered_font_handles_dedupe_build_and_refuse_unknowns` (`font-registry-interning`);
+  `the_host_theme_is_the_frames_colour_baseline` (`theme-reset-baseline`,
+  `frame-scratch-live-colors`); `incremental_and_gated_renders_equal_a_single_full_render`
+  (`render-history-independence`); `selection_range_reports_display_coords_and_none_off_screen`
+  (`selection-range-projection`).
+- `predict_api.rs`: `a_run_s_first_press_hands_the_predictor_its_row` and
+  `a_press_while_scrolled_back_hands_no_row` (`predict-binding-refines-predictor`).
+- `theme_api.rs`: `set_theme_after_a_named_theme_reports_the_host_appearance` (`web-theme-install`,
+  `web-theme-appearance-follow`).
 
 ## 5. Implied specs that look wrong, or tests that disagree with their names
 
@@ -381,7 +394,7 @@ No other test is a pure regression with no general property; each is an instance
    `shade_scroll_blit_present_stays_byte_exact` now require `blit_frames >= 1` for non-vacuity and keep
    only the byte-exact `t.rgba == full_expansion(&t)` and `present_bands` correctness oracle.
 5. `lib::web_path_scoped_refill_matches_a_full_extraction_over_a_mutation_stream` and
-   `messages_api::an_echo_frame_under_a_band_takes_the_scoped_refill` observe `last_refill`, a
+   `messages_api_tests.rs::an_echo_frame_under_a_band_takes_the_scoped_refill` observe `last_refill`, a
    `#[cfg(test)]` field. The `Scoped{1}` efficiency claim is unobservable in production, so its proof
    needs an `ensures` on `Terminal::cell_frame_damage_scoped_into`.
 6. **Resolved:** Stale `scroll_input_api.rs` module doc claiming float accumulation was proven by a unit lattice rather than a spec has been removed; the lattice samples `scroll-accumulator`/`scroll-frac-px` until Clean has an f64 model (gap 14).
@@ -396,29 +409,24 @@ No other test is a pure regression with no general property; each is an instance
 
 ## 6. Proof order (easiest high-value first)
 
-No spec is blocked by gap 0 alone, so the order prefers the smallest gap set, then the tests retired.
+§1 lists the rows in this order: the smallest gap set first, then the most tests retired. The
+dependencies:
 
-1. **`tick-bits`** (gap 3). A 4-case truth table over two bools; the first proof once E6 admits shifts and
-   bitwise OR.
-2. **`band-row-arith`** (1, 3) and **`scroll-edge-clamp`** (2, 3). Guarded `usize` arithmetic and two
-   comparison-only `&mut self` branches. `band-row-arith` is the base of the band pointer chain.
-3. **`scroll-accumulator`**, **`scroll-frac-px`** (2, 3, 14) and **`utc-offset-seconds`** (3, 14). They
-   retire 9 tests (the whole scroll lattice) and the module's "float waiver". They are the first users of
-   a Clean IEEE f64 model, so they are the forcing case for gap 14.
-4. **`streak-polarity`** (1, 12, 13) and **`tier-capabilities-json`** (1, 12). Trivial bodies whose only
-   obstacles are an `Option`/closure and a cross-crate citation.
-5. **`json-string-escape`** (1, 3, 7), **`dirty-rows-to-bands`** (1, 2, 7), **`log-journal-cursor`**
-   (1, 2, 7). Single-loop string and slice contracts; the first two feed `row-range-json`,
-   `notification-queue` and `present-buffer-coherence`.
-6. **`pct-encode-equals-control`**, **`read-kept-bounded`**, **`selection-range-projection`**,
-   **`cell-under-geometry`**, **`scroll-stamp`**, then **`scroll-input-export`** (retires 5 more by
-   composition), **`dims-clamped`**, **`frame-geometry`**.
-7. **`present-buffer-coherence`** via its lemmas (a) and (b), then **`present-band-classification`** and
-   **`needs-frame-is-gate`**. Together 9 tests; lemma (c) is the first that needs an aterm-render ensures.
-8. The engine-delegation specs, in order of how little engine model they need: `mode-getters-delegate`,
-   `encode-key-stateless-equals-instance`, `mouse-report-encoding`, `predict-off-inert`,
-   `messages-read-is-wire`, `notice-is-wire`, `predict-binding-refines-predictor`, the search, reflow,
-   scrollback and message-band specs.
-9. Last: the pixel-level and whole-pipeline specs (`band-is-translation`, `effects-*`,
-   `spill-export-coherence`, `render-history-independence`, `web-band-native-golden`), which wait for a
-   rasterizer model, and `binding-no-panic`, which is the conjunction of every other proof's bounds.
+- `band-row-arith` → `cell-under-geometry` → `band-press-semantics` → `band-hover-and-press`.
+- `scroll-accumulator`, `scroll-frac-px`, `scroll-edge-clamp` → `scroll-stamp` → `scroll-input-export`.
+- `json-string-escape` → `row-range-json`, `notification-queue`.
+- `log-journal-cursor` → `quit-record`; `read-kept-bounded` → `restore-log`; `utc-offset-seconds` →
+  `messages-page-is-engine-page`.
+- `dirty-rows-to-bands` and `present-buffer-coherence`'s lemmas (a) `expand_rgba_band` and
+  (b) `shift_rgba_band` → `present-buffer-coherence`, `present-band-classification` →
+  `needs-frame-is-gate` → `frame-gate-doors`, `selection-extend-bumps-iff-moved`.
+- `reflow-offload-contract` → `reflow-safety-nets`; `search-exports-agree` →
+  `search-budgeted-refines-one-shot`.
+
+`tick-bits` needs only gap 3 (E6 admitting shifts and bitwise OR). `scroll-accumulator`,
+`scroll-frac-px` and `utc-offset-seconds` are the first users of a Clean IEEE f64 model, so they
+force gap 14. Lemma (c) of `present-buffer-coherence` is the first step that needs an aterm-render
+`ensures`. The engine-delegation rows go in order of how little engine model they need. The
+pixel-level and whole-pipeline rows (`band-is-translation`, `effects-*`, `spill-export-coherence`,
+`render-history-independence`, `web-band-native-golden`) wait for an aterm-render rasterizer model,
+and `binding-no-panic`, the conjunction of every other proof's bounds, goes last.

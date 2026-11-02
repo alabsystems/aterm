@@ -173,6 +173,9 @@ pub const fn default_fields(noun: Noun) -> &'static [&'static str] {
         Noun::Permission => PERMISSION,
         Noun::Identity => IDENTITY,
         Noun::User => &["login", "id", "type", "name"],
+        Noun::Write => WRITE,
+        Noun::Intent => INTENT,
+        Noun::Credential => CREDENTIAL,
         Noun::Route | Noun::Raw | Noun::Wait | Noun::Meta | Noun::Policy => &[],
     }
 }
@@ -205,6 +208,29 @@ const IDENTITY: &[&str] = &[
     "remedy",
 ];
 
+/// Write's fields, every one of them derived: a write's report (`write_out::WriteReport`).
+const WRITE: &[&str] = &[
+    "outcome", "op", "repo", "key", "id", "url", "intent", "dry_run", "answer",
+];
+/// Intent's fields, every one of them derived: one journal intent's document.
+const INTENT: &[&str] = &[
+    "id",
+    "repo",
+    "op",
+    "key",
+    "open",
+    "settled",
+    "at_secs",
+    "identity",
+    "grant",
+    "target_commitish",
+    "request",
+    "observed",
+    "retracted",
+];
+/// Credential's fields, every one of them derived: what the git helper would answer.
+const CREDENTIAL: &[&str] = &["repo", "tier", "answer", "profile", "grant", "why"];
+
 /// The noun's derived fields (computed by the verb, not GitHub's).
 #[must_use]
 pub const fn derived_fields(noun: Noun) -> &'static [&'static str] {
@@ -217,6 +243,9 @@ pub const fn derived_fields(noun: Noun) -> &'static [&'static str] {
         Noun::Rate => &["as", "source"],
         Noun::Permission => PERMISSION,
         Noun::Identity => IDENTITY,
+        Noun::Write => WRITE,
+        Noun::Intent => INTENT,
+        Noun::Credential => CREDENTIAL,
         Noun::Asset
         | Noun::ContentEntry
         | Noun::TreeEntry
@@ -376,13 +405,13 @@ fn pure_derived(noun: Noun, value: &Map) -> Vec<(&'static str, Value)> {
         Noun::Commit => {
             let subject = match at(&["commit", "message"]) {
                 Value::String(message) => {
-                    Value::String(message.split('\n').next().unwrap_or("").to_string())
+                    Value::String(message.lines().next().unwrap_or("").to_string())
                 }
                 _ => Value::Null,
             };
             let author = match string(at(&["author", "login"])) {
-                Value::Null => string(at(&["commit", "author", "name"])),
-                login => login,
+                Value::String(login) if !login.is_empty() => Value::String(login),
+                _ => string(at(&["commit", "author", "name"])),
             };
             vec![
                 ("date", string(at(&["commit", "committer", "date"]))),

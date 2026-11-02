@@ -173,26 +173,41 @@ pub(crate) fn fact_title(facts: &FooterFacts, cwd: Option<&Path>, fact: Fact) ->
                     "click: accounts".into(),
                 );
             }
-            let mut parts: Vec<&str> = Vec::new();
+            let mut parts: Vec<std::borrow::Cow<'_, str>> = Vec::new();
+            let glance = facts.glance.as_ref();
             if let Some(sub) = facts.subscription.as_ref() {
                 if let Some(email) = sub.email.as_deref() {
-                    parts.push(email);
+                    parts.push(email.into());
                 }
                 if let Some(plan) = sub.plan.as_deref() {
-                    parts.push(plan);
+                    parts.push(plan.into());
                 }
                 if let Some(weekly) = sub
                     .weekly
                     .as_deref()
                     .or_else(|| sub.weekly_gap.map(|gap| gap.words()))
                 {
-                    parts.push(weekly);
+                    // The outlook's words on the week, its reset, the 5 hours and the verdict
+                    // (`docs/DESIGN-accounts-outlook-2026-10-25.md` §2.5).
+                    parts.push(match glance.and_then(|g| g.title.as_deref()) {
+                        Some(more) => format!("{weekly} ({more})").into(),
+                        None => weekly.into(),
+                    });
                 }
+            }
+            if let Some(g) = glance {
+                parts.extend(
+                    g.reset.as_deref().map(|r| {
+                        format!("{} {r}", aterm_agent::harness::footer::RESET_MARK).into()
+                    }),
+                );
+                parts.extend(g.five.as_deref().map(Into::into));
+                parts.extend(g.title_verdict.as_deref().map(Into::into));
             }
             if parts.is_empty()
                 && let Some(acct) = facts.account.as_deref()
             {
-                parts.push(acct);
+                parts.push(acct.into());
             }
             let summary = if parts.is_empty() {
                 "accounts".to_owned()
@@ -380,8 +395,16 @@ pub(crate) fn fact_spoken_of(
                 parts.push(acct);
             }
             let words = parts.join(", ");
+            // The outlook's sentences follow the week's own words (§2.5).
+            let more = facts
+                .glance
+                .as_ref()
+                .and_then(|g| g.spoken.as_deref())
+                .map_or_else(String::new, |more| {
+                    format!(". {}", more.trim_end_matches('.'))
+                });
             (
-                format!("{name}: {words}"),
+                format!("{name}: {words}{more}"),
                 "Activate for the accounts menu.".to_owned(),
             )
         }

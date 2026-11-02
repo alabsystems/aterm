@@ -12,7 +12,7 @@ use crate::api::Build;
 use crate::channel::{Log, Scratch, download_retried};
 use crate::ctx::Ctx;
 use crate::error::{Error, Result};
-use crate::host::Probe;
+use crate::host::{Probe, ReleaseHost, Slug};
 use crate::programs::{self, PackageDef, ProgramDef, Shape};
 use crate::quad::VerifiedQuad;
 use crate::triple::Triple;
@@ -377,10 +377,20 @@ pub fn names_repo(url: &str, owner: &str, repo: &str) -> bool {
         || head.strip_prefix("file://").is_some_and(local)
 }
 
-/// `commit` (called `what` in a refusal) is on `origin/main` of `repo_dir`, whose `origin` names `owner/repo` ([`names_repo`]): what ALab ships, never a fork, another branch or an unpushed commit.
+/// The ref [`check_on_main`] fetches the main of record into, and deletes after reading it.
+pub const MAIN_OF_RECORD: &str = "refs/atpkg-publish/main-of-record";
+
+/// `commit` (called `what` in a refusal) is on `main` of `owner/repo` as `host` serves it
+/// (D25): what ALab ships, never a fork, another branch or an unpushed commit. `repo_dir`'s
+/// `origin` must name `owner/repo` ([`names_repo`]), and the main it is held to is fetched from
+/// `host` ([`ReleaseHost::fetch_main`]), never read from `repo_dir`'s own
+/// `refs/remotes/origin/main`, which a local mirror's or fork's main can fill.
 /// # Errors
-/// A refusal naming what does not hold: no `origin`, an `origin` naming another repo, or `commit` not an ancestor of `refs/remotes/origin/main`.
+/// A refusal naming what does not hold: no `origin`, an `origin` naming another repo, or
+/// `commit` not an ancestor of the host's main; a could-not-run when the host's main cannot be
+/// read.
 pub fn check_on_main(
+    host: &dyn ReleaseHost,
     repo_dir: &Path,
     owner: &str,
     repo: &str,
@@ -400,30 +410,50 @@ pub fn check_on_main(
             repo_dir.display()
         )));
     }
+    let slug = Slug::new(owner, repo);
+    host.fetch_main(&slug, repo_dir, MAIN_OF_RECORD)
+        .map_err(|e| {
+            Error::cannot_run(format!(
+                "could not read {slug}'s main from the host ({e}) — a pack's source is held to \
+                 the main the host serves, never to the checkout's own origin/main"
+            ))
+        })?;
+    let tip = crate::git::run(repo_dir, &["rev-parse", "--verify", MAIN_OF_RECORD]);
     let on_main = crate::git::run(
         repo_dir,
-        &[
-            "merge-base",
-            "--is-ancestor",
-            commit,
-            "refs/remotes/origin/main",
-        ],
+        &["merge-base", "--is-ancestor", commit, MAIN_OF_RECORD],
     );
+    let dropped = crate::git::run(repo_dir, &["update-ref", "-d", MAIN_OF_RECORD]);
+    let tip = tip?;
     if let Err(e) = on_main {
         return Err(Error::refused(format!(
-            "{what} {commit} is not on {owner}/{repo} origin/main in {} ({e}) — only what ALab \
-             ships is packed (fetch origin if it landed since)",
+            "{what} {commit} is not on {owner}/{repo} main as the host serves it ({tip}), read \
+             into {} ({e}) — only what ALab ships is packed (push it to main first)",
             repo_dir.display()
         )));
     }
+    dropped?;
     Ok(())
 }
 
-/// The package's source commit is on `origin/main` of `repo_dir`, whose `origin` is `owner/repo` ([`check_on_main`]), and the version's `<count>` is that commit's `git rev-list --count`.
+/// The package's source commit is on `main` of `owner/repo` as `host` serves it, and `repo_dir`'s `origin` is `owner/repo` ([`check_on_main`]), and the version's `<count>` is that commit's `git rev-list --count`.
 /// # Errors
 /// A refusal naming what does not hold.
-pub fn check_source(repo_dir: &Path, owner: &str, repo: &str, pkg: &Package) -> Result<()> {
-    check_on_main(repo_dir, owner, repo, "the package's source", &pkg.source)?;
+pub fn check_source(
+    host: &dyn ReleaseHost,
+    repo_dir: &Path,
+    owner: &str,
+    repo: &str,
+    pkg: &Package,
+) -> Result<()> {
+    check_on_main(
+        host,
+        repo_dir,
+        owner,
+        repo,
+        "the package's source",
+        &pkg.source,
+    )?;
     let count = crate::git::rev_count(repo_dir, &pkg.source)?;
     if count != pkg.count {
         return Err(Error::refused(format!(
@@ -435,8 +465,7 @@ pub fn check_source(repo_dir: &Path, owner: &str, repo: &str, pkg: &Package) -> 
 }
 
 fn unhex(hex: &str) -> Option<Vec<u8>> {
-    hex.len()
-        .is_multiple_of(2)
+    (hex.len().is_multiple_of(2) && hex.bytes().all(|b| b.is_ascii_hexdigit()))
         .then(|| {
             (0..hex.len())
                 .step_by(2)
@@ -767,7 +796,13 @@ pub fn pack_package_with(
         "atpkg-publish: {program} {} (source {}) → build {}",
         pkg.version, pkg.source, request.build
     );
-    check_source(&request.source_repo, &ctx.accounts.staging, def.repo, &pkg)?;
+    check_source(
+        ctx.hosts.staging.as_ref(),
+        &request.source_repo,
+        &ctx.accounts.staging,
+        def.repo,
+        &pkg,
+    )?;
 
     let tc = toolchain::resolve(ctx, request.toolchain.as_deref())?;
     let _lease = toolchain::lease(
@@ -898,10 +933,15 @@ pub fn parse_args(ctx: &mut Ctx, args: &[String]) -> Result<PackageRequest> {
         match a.as_str() {
             "--program" => program = Some(value()?),
             "--build" => {
-                build =
-                    Some(value()?.parse::<Build>().map_err(|_| {
-                        Error::usage("--build takes a decimal build id (YYYYMMDDNN)")
-                    })?);
+                let v = value()?;
+                build = Some(
+                    (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                        .then(|| v.parse::<Build>().ok())
+                        .flatten()
+                        .ok_or_else(|| {
+                            Error::usage("--build takes a decimal build id (YYYYMMDDNN)")
+                        })?,
+                );
             }
             "--source-repo" => source_repo = Some(PathBuf::from(value()?)),
             "--toolchain" => toolchain = Some(PathBuf::from(value()?)),

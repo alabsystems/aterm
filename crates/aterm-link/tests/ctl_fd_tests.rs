@@ -22,7 +22,11 @@ fn a_control_connection_is_kept_out_of_every_child() {
         assert!(flags >= 0, "the connection's descriptor is open");
         flags & FD_CLOFORK != 0
     };
-    let (near, _far) = UnixStream::pair().expect("a socket pair");
+    let (near, far) = UnixStream::pair().expect("a socket pair");
+    aterm_uds::keep_out_of_children(&far).expect("mark probe");
+    if !marked(&far) {
+        return;
+    }
     let ctl = aterm_link::ctl::Ctl::from_stream(near).expect("wrap the stream");
     assert!(
         marked(ctl.get_ref()),

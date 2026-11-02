@@ -247,11 +247,25 @@ pub fn report(
     offset_s: i64,
     now_unix_ms: u64,
 ) -> Vec<String> {
+    report_local(log, scope, &|_| Some(offset_s), now_unix_ms)
+}
+
+/// [`report`], reading the local zone at each stamp (`offset_at`, unix seconds to UTC offset
+/// seconds) so a row from the other side of a daylight change says its own wall clock and day.
+#[must_use]
+pub fn report_local(
+    log: &crate::log::MessageLog,
+    scope: ReportScope,
+    offset_at: &dyn Fn(i64) -> Option<i64>,
+    now_unix_ms: u64,
+) -> Vec<String> {
     use crate::center::Outcome;
     use crate::log::{LogState, Retired};
     use crate::words::{clock_words, day_heading, local_day};
-    let today = local_day(now_unix_ms, offset_s);
+    let offset_for = |ms: u64| offset_at(i64::try_from(ms / 1000).unwrap_or(i64::MAX)).unwrap_or(0);
+    let today = local_day(now_unix_ms, offset_for(now_unix_ms));
     let said = |ms: u64| {
+        let offset_s = offset_for(ms);
         let day = local_day(ms, offset_s);
         if day >= today {
             clock_words(ms, offset_s)

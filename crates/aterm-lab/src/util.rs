@@ -159,6 +159,23 @@ pub fn shell_unquote(s: &str) -> String {
                             Some('t') => out.push('\t'),
                             Some('r') => out.push('\r'),
                             Some('e' | 'E') => out.push('\u{1b}'),
+                            Some('x') => {
+                                let mut hex = String::new();
+                                for _ in 0..2 {
+                                    if it.peek().is_some_and(char::is_ascii_hexdigit) {
+                                        if let Some(h) = it.next() {
+                                            hex.push(h);
+                                        }
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                if let Ok(b) = u8::from_str_radix(&hex, 16) {
+                                    out.push(char::from(b));
+                                } else {
+                                    out.push_str("\\x");
+                                }
+                            }
                             Some(e) => out.push(e),
                             None => {}
                         },
@@ -188,12 +205,20 @@ pub fn shell_unquote(s: &str) -> String {
 pub fn targo(args: &[&str]) -> aterm_uds::spawnfd::Command {
     let repo = &crate::paths::paths().repo;
     let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
-    let args =
-        atpkg::build_cache::with_build_dir_from(&args, atpkg::build_cache::Tool::Targo, repo)
-            .unwrap_or(args);
+    let placed =
+        atpkg::build_cache::with_build_dir_from(&args, atpkg::build_cache::Tool::Targo, repo);
+    let build_dir = placed
+        .as_deref()
+        .filter(|placed| atpkg::build_cache::loses_config(placed, atpkg::build_cache::Tool::Targo))
+        .and_then(atpkg::build_cache::directory_from_placed_args)
+        .map(str::to_owned);
+    let args = placed.unwrap_or(args);
     let mut cmd =
         aterm_uds::spawnfd::command(std::env::var_os("CARGO").unwrap_or_else(|| "targo".into()));
     cmd.args(args).current_dir(repo);
+    if let Some(build_dir) = build_dir {
+        cmd.env(atpkg::build_cache::BUILD_DIR_ENV, build_dir);
+    }
     for (name, _) in std::env::vars_os() {
         if name
             .to_str()
@@ -253,6 +278,7 @@ pub fn claim_build_at(
     match admit(&build, cwd, seat, say) {
         Admission::Claimed(held) => Ok(Some(held)),
         Admission::Stopped(e) => Err(format!("its memory claim was {e}")),
+        Admission::Refused(why) => Err(why),
         Admission::Covered(_) | Admission::Own(_) | Admission::Open(_) => Ok(None),
     }
 }
@@ -445,9 +471,10 @@ pub fn py_repr(s: &str) -> String {
                 out.push('\\');
                 out.push(c);
             }
-            c if (c as u32) < 0x20 || c == '\u{7f}' => {
+            c if (c as u32) < 0x20 || (0x7f..=0xa0).contains(&(c as u32)) => {
                 out.push_str(&format!("\\x{:02x}", c as u32))
             }
+            '\u{2028}' | '\u{2029}' => out.push_str(&format!("\\u{:04x}", c as u32)),
             c => out.push(c),
         }
     }
@@ -510,9 +537,14 @@ pub fn b64url(bytes: &[u8]) -> String {
 /// A base64url text (padding optional) as bytes; `None` when it is not one.
 #[must_use]
 pub fn b64url_decode(text: &str) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(text.len() * 3 / 4);
+    let body = text.trim_end_matches('=');
+    let pad = text.len() - body.len();
+    if body.len() % 4 == 1 || pad > 2 || (pad > 0 && !(body.len() + pad).is_multiple_of(4)) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(body.len() * 3 / 4);
     let (mut acc, mut bits) = (0u32, 0u32);
-    for c in text.trim_end_matches('=').bytes() {
+    for c in body.bytes() {
         let v = u32::try_from(B64URL.iter().position(|&b| b == c)?).ok()?;
         acc = (acc << 6) | v;
         bits += 6;
@@ -520,6 +552,9 @@ pub fn b64url_decode(text: &str) -> Option<Vec<u8>> {
             bits -= 8;
             out.push(u8::try_from((acc >> bits) & 0xff).ok()?);
         }
+    }
+    if (acc & ((1 << bits) - 1)) != 0 {
+        return None;
     }
     Some(out)
 }
@@ -777,7 +812,20 @@ mod tests {
             );
         }
         assert_eq!(super::b64url(b"\xfb\xff"), "-_8");
-        assert_eq!(super::b64url_decode("not base64!"), None);
+        assert_eq!(super::b64url_decode("Zg==").as_deref(), Some(&b"f"[..]));
+        assert_eq!(super::b64url_decode("Zm8=").as_deref(), Some(&b"fo"[..]));
+        for bad in [
+            "not base64!",
+            "A",
+            "ABCDE",
+            "Zh",
+            "Zm9",
+            "Zg=",
+            "Zm8==",
+            "===",
+        ] {
+            assert_eq!(super::b64url_decode(bad), None, "{bad:?}");
+        }
     }
 
     use super::*;
@@ -805,6 +853,7 @@ mod tests {
             "/a/Application Support/b"
         );
         assert_eq!(shell_unquote(r"$'a\nb'"), "a\nb");
+        assert_eq!(shell_unquote(r"$'a\x20\x09\x7fb'"), "a \t\x7fb");
         assert_eq!(
             shell_prepend_path("/s/runs/t/shim"),
             "\"/s/runs/t/shim:$PATH\""
@@ -824,5 +873,6 @@ mod tests {
         assert_eq!(py_repr("hi"), "'hi'");
         assert_eq!(py_repr("it's"), "\"it's\"");
         assert_eq!(py_repr("a\nb"), "'a\\nb'");
+        assert_eq!(py_repr("❯\u{a0}hi\u{80}\u{2028}"), "'❯\\xa0hi\\x80\\u2028'");
     }
 }

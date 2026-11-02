@@ -830,6 +830,8 @@ pub const WORD_WORDS: &[&str] = &[
     "handled",
     "refused",
     "deferred",
+    "restart",
+    "signal",
 ];
 
 /// Closed `gap why=` loss-reason vocabulary.
@@ -864,6 +866,10 @@ pub const WHY_WORDS: &[&str] = &[
     "ambiguous",
     "refused",
     "subject-budget",
+    // What the host's read of a session's agent image says (`meta field=supervisor why=`): the
+    // kernel confirms the agent, or nothing does and the harness only observes it.
+    "confirmed",
+    "unconfirmed",
 ];
 
 /// Closed `input verb=` vocabulary.

@@ -112,11 +112,7 @@ mod tests {
         let (near, far) = CtlStream::pair().expect("pair");
         (&far).write_all(b"said\n").expect("the peer writes");
         drop(far);
-        aterm_spec::wait::until_within(
-            aterm_spec::wait::MUST_HAPPEN,
-            "the peer's last close",
-            || aterm_uds::hangup::peer_closed(&near).then_some(()),
-        );
+        aterm_spec::wait::until_peer_closed(&near);
         let read = read_to_end_of_file(&near, |read| {
             format!("after {:?}", String::from_utf8_lossy(read))
         });

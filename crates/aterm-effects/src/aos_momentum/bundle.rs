@@ -14,6 +14,8 @@
 //! in [`aterm_aos::wire`]'s canonical encoding; [`UncheckedBundle::decode`] refuses any other bytes.
 
 use core::fmt;
+use core::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
 
 use aterm_aos::evidence::TESTED_ASSUMPTIONS;
 use aterm_aos::wire::{Dec, Enc, WireFault};
@@ -944,8 +946,10 @@ impl CandidateBundle {
         Self::verify_spread(bytes, evaluator, &Serial)
     }
 
-    /// [`Self::verify`], with the grid search that a bundle crediting the grid is checked against
-    /// judged over `spread`, when `evaluator` has not run it yet: a spread changes only speed.
+    /// [`Self::verify`], judging over `spread` each row again and the grid search that a bundle
+    /// crediting the grid is checked against (when `evaluator` has not run it yet): a spread
+    /// changes only speed, though one that takes the rows out of order may judge rows past the
+    /// one a refusal names.
     /// # Errors
     /// Any [`UncheckedBundle::decode`] refusal, then the first [`BundleRefusal::Forged`].
     pub fn verify_spread(
@@ -962,7 +966,7 @@ impl CandidateBundle {
             return Err(forged(BundleField::Candidate));
         }
         check_proposer(&b)?;
-        check_rows(&b, evaluator, plan)?;
+        check_rows(&b, evaluator, plan, spread)?;
         check_selection(&b, evaluator)?;
         check_grid(&b, evaluator, plan, spread)?;
         let mut ti = 0;
@@ -1107,6 +1111,7 @@ fn check_rows(
     b: &UncheckedBundle,
     ev: &Evaluator,
     plan: SchedulePlan,
+    spread: &dyn Spread,
 ) -> Result<(), BundleRefusal> {
     let pins = ev.policy().items();
     let mut k = 0;
@@ -1138,14 +1143,40 @@ fn check_rows(
         }
         ri += 1;
     }
+    // Each row judged again: over `spread`, then in place where it skipped one, walked in order
+    // so the refusal names the first that differs. A row the spread reaches once one before it
+    // was found to differ is left unjudged, so `Serial` (which `verify` runs), taking the rows
+    // in order, judges no row past that one.
+    let differs = |k: usize| match (b.rows.get(k), ev.row_at(plan, k)) {
+        (Some(r), Some(again)) => row_difference(r, &again),
+        _ => Some(BundleField::Row),
+    };
+    let first = AtomicUsize::new(b.rows.len());
+    let mut judged = Vec::with_capacity(b.rows.len());
     let mut k = 0;
     while k < b.rows.len() {
-        let r = &b.rows[k];
-        let Some(again) = ev.row_at(plan, k) else {
-            return Err(forged_row(BundleField::Row, &r.item));
+        judged.push(OnceLock::new());
+        k += 1;
+    }
+    spread.run(b.rows.len(), &|k| {
+        if k < first.load(Ordering::SeqCst) {
+            let field = differs(k);
+            if field.is_some() {
+                first.fetch_min(k, Ordering::SeqCst);
+            }
+            if let Some(slot) = judged.get(k) {
+                let _ = slot.set(field);
+            }
+        }
+    });
+    let mut k = 0;
+    while k < b.rows.len() {
+        let field = match judged[k].get() {
+            Some(field) => *field,
+            None => differs(k),
         };
-        if let Some(field) = row_difference(r, &again) {
-            return Err(forged_row(field, &r.item));
+        if let Some(field) = field {
+            return Err(forged_row(field, &b.rows[k].item));
         }
         k += 1;
     }

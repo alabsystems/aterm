@@ -91,7 +91,14 @@ fn client_args(args: &[OsString]) -> Option<Client> {
     if flag != FLAG {
         return None;
     }
-    let num = |a: &OsString| a.to_str()?.parse::<i16>().ok().filter(|n| *n > 0);
+    let num = |a: &OsString| {
+        let s = a.to_str()?;
+        s.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| s.parse::<i16>().ok())
+            .flatten()
+            .filter(|n| *n > 0)
+    };
     let size = match rest {
         [cols, rows] => num(cols).zip(num(rows)),
         _ => None,
@@ -107,7 +114,13 @@ fn client_args(args: &[OsString]) -> Option<Client> {
 /// A carry's three arguments: the cursor row and column, then the VT as hex (its UTF-8
 /// bytes, two lowercase or uppercase digits each).
 fn carry_args(row: &OsString, col: &OsString, hex: &OsString) -> Option<Carry> {
-    let num = |a: &OsString| a.to_str()?.parse::<u16>().ok();
+    let num = |a: &OsString| {
+        let s = a.to_str()?;
+        s.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| s.parse::<u16>().ok())
+            .flatten()
+    };
     let hex = hex.to_str()?;
     if hex.is_empty() || hex.len() > CARRY_HEX_MAX {
         return None;
@@ -136,7 +149,12 @@ fn hex_decode(hex: &str) -> Option<Vec<u8>> {
     }
     hex.as_bytes()
         .chunks_exact(2)
-        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
+        .map(|pair| {
+            pair.iter()
+                .all(u8::is_ascii_hexdigit)
+                .then(|| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
+                .flatten()
+        })
         .collect()
 }
 
@@ -254,8 +272,8 @@ fn write_guard(cols: i16, rows: i16) -> u8 {
         let read = unsafe { ffi::GetConsoleScreenBufferInfo(conout.raw(), &mut info) } != 0;
         let window = info.srWindow;
         let size = (
-            window.Right - window.Left + 1,
-            window.Bottom - window.Top + 1,
+            window.Right.saturating_sub(window.Left).saturating_add(1),
+            window.Bottom.saturating_sub(window.Top).saturating_add(1),
         );
         if !read || size == (cols, rows) || Instant::now() >= deadline {
             break;
@@ -560,6 +578,7 @@ mod tests {
             &[FLAG][..],
             &[FLAG, "120"],
             &[FLAG, "0", "30"],
+            &[FLAG, "+120", "30"],
             &[FLAG, "x", "30"],
             &[FLAG, "1", "2", "3"],
             &[LEAVE_FLAG, "now"],
@@ -567,7 +586,9 @@ mod tests {
             &[LEAVE_FLAG, "4", "54", ""],
             &[LEAVE_FLAG, "4", "54", "5"],
             &[LEAVE_FLAG, "4", "54", "zz"],
+            &[LEAVE_FLAG, "4", "54", "+a"],
             &[LEAVE_FLAG, "4", "54", "ff"],
+            &[LEAVE_FLAG, "+4", "54", "50"],
             &[LEAVE_FLAG, "-1", "54", "50"],
             &[LEAVE_FLAG, "4", "54", "50", "more"],
         ] {

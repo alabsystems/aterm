@@ -743,7 +743,7 @@ macro_rules! bind {
                 let scrollback = grid.scrollback_lines();
                 let current = grid.display_offset();
                 let want = origin.saturating_sub(u64::from(line));
-                let want = (want as usize).min(scrollback);
+                let want = usize::try_from(want).unwrap_or(usize::MAX).min(scrollback);
                 let delta = want as i64 - current as i64;
                 if let Ok(delta) = i32::try_from(delta) {
                     self.term.scroll_display(delta);

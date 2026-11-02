@@ -174,7 +174,7 @@ impl LanGate {
                 return Some((
                     Visibility::Unavailable,
                     "Network observation unavailable",
-                    Status::Refused,
+                    Status::Refused("configuration"),
                 ));
             }
             Ok(false) => {

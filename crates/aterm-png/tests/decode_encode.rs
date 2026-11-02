@@ -144,22 +144,21 @@ fn corpus_under(root: &Path) -> Vec<PathBuf> {
 #[test]
 fn the_repository_corpus_decodes_and_round_trips() {
     let files = corpus();
-    let mut images = 0usize;
-    for path in &files {
+    let round_tripped = aterm_spec::check::each(&files, |path| {
         let Ok(bytes) = std::fs::read(path) else {
-            continue;
+            return 0usize;
         };
         let label = path.display().to_string();
         for (mode, _) in ALL_MODES {
             let _ = decode_mine(&bytes, mode);
         }
         let Ok(decoded) = decode_mine(&bytes, Mode::Identity) else {
-            continue;
+            return 0;
         };
         if decoded.bit_depth != aterm_png::BitDepth::Eight
             || decoded.color_type == aterm_png::ColorType::Indexed
         {
-            continue;
+            return 0;
         }
         let out = encode(
             decoded.color_type,
@@ -173,8 +172,9 @@ fn the_repository_corpus_decodes_and_round_trips() {
             back, decoded,
             "{label}: the re-encoding decodes differently"
         );
-        images += 1;
-    }
+        1
+    });
+    let images: usize = round_tripped.into_iter().sum();
     assert!(
         images > 0,
         "corpus must decode at least one 8-bit non-indexed PNG"
@@ -487,6 +487,115 @@ fn image_data_far_past_the_declared_size_is_refused_as_its_own_error() {
     );
 }
 
+/// A zlib stream of `blocks` empty dynamic blocks, each with the cheapest header to write (12
+/// bytes that build three Huffman tables), then `data` in stored blocks.
+fn zlib_after_empty_dynamic_blocks(blocks: usize, data: &[u8]) -> Vec<u8> {
+    struct Bits {
+        out: Vec<u8>,
+        acc: u32,
+        held: u32,
+    }
+    impl Bits {
+        /// `len` bits of `value`, least significant first.
+        fn put(&mut self, value: u32, len: u32) {
+            self.acc |= value << self.held;
+            self.held += len;
+            while self.held >= 8 {
+                self.out.push(self.acc as u8);
+                self.acc >>= 8;
+                self.held -= 8;
+            }
+        }
+    }
+    let mut bits = Bits {
+        out: vec![0x78, 0x01],
+        acc: 0,
+        held: 0,
+    };
+    // Code-length code lengths in RFC 1951's order (16, 17, 18, 0, 8, ...): 18 gets
+    // one bit (word 0), 0 and 1 two bits each (words 10 and 11).
+    const CODE_LENGTHS: [u32; 18] = [0, 0, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+    for _ in 0..blocks {
+        bits.put(0b100, 3); // BFINAL=0, BTYPE=10
+        bits.put(0, 5); // HLIT: 257 literal/length codes
+        bits.put(0, 5); // HDIST: 1 distance code
+        bits.put(14, 4); // HCLEN: 18 code-length codes
+        for length in CODE_LENGTHS {
+            bits.put(length, 3);
+        }
+        bits.put(0b11, 2); // literal 0: length 1 (word 11)
+        bits.put(0, 1); // 18: 138 zeros (literals 1..=138)
+        bits.put(138 - 11, 7);
+        bits.put(0, 1); // 18: 117 zeros (literals 139..=255)
+        bits.put(117 - 11, 7);
+        bits.put(0b11, 2); // end of block: length 1
+        bits.put(0b01, 2); // the one distance code: length 0 (word 10, sent 1 then 0)
+        bits.put(1, 1); // end of block: word 1
+    }
+    let pieces: Vec<&[u8]> = data.chunks(65_535).collect();
+    for (i, piece) in pieces.iter().enumerate() {
+        bits.put(u32::from(i + 1 == pieces.len()), 3); // BFINAL, BTYPE=00
+        if bits.held > 0 {
+            bits.put(0, 8 - bits.held);
+        }
+        let len = piece.len() as u16;
+        bits.out.extend_from_slice(&len.to_le_bytes());
+        bits.out.extend_from_slice(&(!len).to_le_bytes());
+        bits.out.extend_from_slice(piece);
+    }
+    let (mut a, mut b) = (1u32, 0u32);
+    for &byte in data {
+        a = (a + u32::from(byte)) % 65521;
+        b = (b + a) % 65521;
+    }
+    let mut out = bits.out;
+    out.extend_from_slice(&((b << 16) | a).to_be_bytes());
+    out
+}
+
+#[test]
+fn image_data_whose_blocks_cost_more_than_its_size_allows_is_refused() {
+    const BLOCKS: usize = 300;
+    let gray = |side: u32, blocks: usize| {
+        let row = [&[0u8][..], &vec![7u8; side as usize]].concat();
+        let filtered = row.repeat(side as usize);
+        let idat = zlib_after_empty_dynamic_blocks(blocks, &filtered);
+        assert_eq!(
+            aterm_codec::inflate::zlib_decompress(&idat, filtered.len()).as_deref(),
+            Ok(filtered.as_slice()),
+            "the generated stream is well formed"
+        );
+        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&side.to_be_bytes());
+        ihdr.extend_from_slice(&side.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 0, 0, 0, 0]);
+        bytes.extend_from_slice(&chunk(b"IHDR", &ihdr));
+        bytes.extend_from_slice(&chunk(b"IDAT", &idat));
+        bytes.extend_from_slice(&chunk(b"IEND", &[]));
+        bytes
+    };
+    let decode = |bytes: &[u8]| {
+        let mut reader = aterm_png::Decoder::new(bytes).read_info()?;
+        let mut buf = vec![0u8; reader.output_buffer_size()];
+        reader.next_frame(&mut buf).map(|_| buf)
+    };
+
+    // 40,200 bytes of image data pay for its blocks; one byte cannot.
+    let large = decode(&gray(200, BLOCKS)).expect("a 200x200 image's stream may hold them");
+    assert!(large.len() == 200 * 200 && large.iter().all(|&g| g == 7));
+    assert_eq!(
+        decode(&gray(1, 4)),
+        Ok(vec![7]),
+        "a small image's stream may split"
+    );
+    assert_eq!(
+        decode(&gray(1, BLOCKS)),
+        Err(aterm_png::DecodingError::LimitsExceeded)
+    );
+    assert!(aterm_png::decode_rgba8(&gray(1, BLOCKS), 1).is_none());
+}
+
 #[test]
 fn a_limit_of_exactly_the_output_buffer_decodes_every_format() {
     let palette: Vec<u8> = (0..=255u8).flat_map(|i| [i, i, i]).collect();
@@ -709,6 +818,10 @@ fn decode_rgba8_decodes_every_image_inside_the_callers_dimension_budget() {
     }
     assert!(aterm_png::decode_rgba8(&black_png(4097, 1, 8, 6), 4096).is_none());
     assert!(aterm_png::decode_rgba8(&black_png(1, 4097, 8, 6), 4096).is_none());
+    let (gray_rgba, gw, gh) =
+        aterm_png::decode_rgba8(&black_png(16, 16, 8, 0), 4096).expect("grayscale decodes");
+    assert_eq!((gw, gh), (16, 16));
+    assert_eq!(gray_rgba.len(), 16 * 16 * 4);
 }
 
 #[test]

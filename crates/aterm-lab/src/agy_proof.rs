@@ -65,7 +65,8 @@ pub fn key_verdict(stub_log: &str) -> Verdict {
     ok(n > 0 && other.is_empty())
 }
 
-/// The hosts the black-hole proxy refused (`PROXY refused: CONNECT <host>:<port> …` in the stub's log), each once, in the order first asked.
+/// The hosts the black-hole proxy refused, each once in the order first asked. A nested
+/// scheme in the authority names none; URLs in the path or query do not replace the host.
 #[must_use]
 pub fn proxy_refused(stub_log: &str) -> Vec<String> {
     let mut hosts: Vec<String> = Vec::new();
@@ -77,12 +78,17 @@ pub fn proxy_refused(stub_log: &str) -> Vec<String> {
             .split_whitespace()
             .find(|w| w.contains(':') || w.contains('.'))
             .unwrap_or("");
-        let host = target
-            .trim_start_matches("http://")
-            .trim_start_matches("https://")
-            .split(['/', ':'])
-            .next()
-            .unwrap_or("");
+        let authority = target
+            .strip_prefix("http://")
+            .or_else(|| target.strip_prefix("https://"))
+            .unwrap_or(target);
+        if authority
+            .split_once("://")
+            .is_some_and(|(prefix, _)| !prefix.contains(['/', '?', '#']))
+        {
+            continue;
+        }
+        let host = authority.split(['/', ':', '?', '#']).next().unwrap_or("");
         if !host.is_empty() && !hosts.iter().any(|h| h == host) {
             hosts.push(host.to_string());
         }
@@ -805,6 +811,16 @@ mod tests {
         );
         let plain = "13:00:00 PROXY refused: GET http://metadata.google.internal/computeMetadata/v1 HTTP/1.1\n";
         assert_eq!(proxy_refused(plain), ["metadata.google.internal"]);
+        for target in [
+            "http://https://example.com",
+            "https://http://example.com",
+            "http://http://example.com",
+        ] {
+            assert!(proxy_refused(&format!("PROXY refused: {target}\n")).is_empty());
+        }
+        let redirects = "PROXY refused: GET https://example.com/path?next=http://other.example/x HTTP/1.1\n\
+                         PROXY refused: GET http://query.example?next=https://other.example/x HTTP/1.1\n";
+        assert_eq!(proxy_refused(redirects), ["example.com", "query.example"]);
         let quiet: String = STUB_LOG
             .lines()
             .filter(|l| !l.contains("PROXY"))

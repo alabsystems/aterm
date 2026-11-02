@@ -51,6 +51,8 @@ fn a_relaunch_carries_the_provider_and_drops_what_the_session_keeps() {
             "provider_retry.max_attempts=3",
             "--trust-workspace",
             "--provider=meta",
+            "--contributor-mode",
+            "off",
             "resume",
             S1,
         ]))
@@ -59,22 +61,50 @@ fn a_relaunch_carries_the_provider_and_drops_what_the_session_keeps() {
     let prompt = argv(&[STORE, "--base-url", "u", "positional hello"]);
     assert_eq!(
         rewrite_argv(&prompt, Some(S1)),
-        Ok(argv(&["--base-url", "u", "resume", S1]))
+        Ok(argv(&[
+            "--base-url",
+            "u",
+            "--contributor-mode",
+            "off",
+            "resume",
+            S1
+        ]))
     );
     assert_eq!(resumed_ref(&prompt), None);
     let last = argv(&[STORE, "resume", "--last", "--disable-shell"]);
     assert_eq!(
         rewrite_argv(&last, Some(S1)),
-        Ok(argv(&["--disable-shell", "resume", S1]))
+        Ok(argv(&[
+            "--disable-shell",
+            "--contributor-mode",
+            "off",
+            "resume",
+            S1
+        ]))
     );
     assert_eq!(resumed_ref(&last), None, "--last names no session");
-    assert_eq!(rewrite_argv(&prompt, None), Ok(argv(&["--base-url", "u"])));
+    assert_eq!(
+        rewrite_argv(&prompt, None),
+        Ok(argv(&[
+            "--base-url",
+            "u",
+            "--contributor-mode",
+            "off",
+            "--model",
+            "muse-wonder-full-1.0",
+            "--reasoning-effort",
+            "xhigh",
+        ]))
+    );
     let dashed = argv(&[STORE, "--", "--yolo", "resume"]);
-    assert_eq!(rewrite_argv(&dashed, Some(S1)), Ok(argv(&["resume", S1])));
+    assert_eq!(
+        rewrite_argv(&dashed, Some(S1)),
+        Ok(argv(&["--contributor-mode", "off", "resume", S1]))
+    );
     for attached in ["-cprovider=meta", "-c=provider=meta"] {
         assert_eq!(
             rewrite_argv(&argv(&[STORE, attached]), Some(S1)),
-            Ok(argv(&[attached, "resume", S1])),
+            Ok(argv(&[attached, "--contributor-mode", "off", "resume", S1])),
             "{attached}"
         );
     }
@@ -186,6 +216,9 @@ fn only_the_interactive_tui_is_snapshotted() {
         &[STORE, "--yolo", "resume"],
         &[STORE, "--brand-new", "resume"],
         &[STORE, "--no-session-log"],
+        &[STORE, "--model", "exec", "--brand-new"],
+        &[STORE, "--brand-new", "resume", "login"],
+        &[STORE, "fix login", "login"],
     ] {
         assert!(is_tui_argv(&argv(words)), "{words:?}");
     }
@@ -199,9 +232,23 @@ fn only_the_interactive_tui_is_snapshotted() {
         &[STORE, "--brand-new", "--version"],
         &[STORE, "--brand-new", "x", "login"],
         &[STORE, "help"],
+        &[STORE, "--workspace", "/w", "exec", "hi"],
+        &[STORE, "--no-session-log", "login"],
+        &[STORE, "--no-session-log", "--help"],
+        &[STORE, "--model", "--help"],
     ] {
         assert!(!is_tui_argv(&argv(words)), "{words:?}");
     }
+    assert!(resumes(&argv(&[STORE, "--workspace", "/w", "resume"])));
+    assert!(!resumes(&argv(&[STORE, "resume", "--help"])));
+    assert!(shared_key_defaults(&argv(&["exec", "usage"])));
+    assert!(shared_key_defaults(&argv(&["explain", "usage"])));
+    assert!(!shared_key_defaults(&argv(&[
+        "explain",
+        "exec",
+        "--prompt-file",
+        "/tmp/p"
+    ])));
 }
 
 #[test]
@@ -409,7 +456,9 @@ fn the_relaunch_carries_the_homes_the_process_had() {
     assert_eq!(env_of_words(&env_words(&other)), other);
     assert_eq!(
         told_line(S1, &other),
-        Some(format!("HOME={scratch} muse resume {S1}"))
+        Some(format!(
+            "HOME={scratch} muse --contributor-mode off resume {S1}"
+        ))
     );
     let slashed = abs("/h/");
     assert_eq!(
@@ -442,7 +491,7 @@ fn a_store_build_is_told_from_the_twin() {
 fn the_told_line_is_muses_own_resume_line() {
     assert_eq!(
         told_line(S1, &[]).as_deref(),
-        Some(format!("muse resume {S1}").as_str())
+        Some(format!("muse --contributor-mode off resume {S1}").as_str())
     );
     let env = vec![(
         "XDG_DATA_HOME".to_string(),
@@ -450,12 +499,47 @@ fn the_told_line_is_muses_own_resume_line() {
     )];
     assert_eq!(
         told_line(S1, &env).as_deref(),
-        Some(format!("XDG_DATA_HOME='/Users//u/Application Support/d' muse resume {S1}").as_str())
+        Some(
+            format!(
+                "XDG_DATA_HOME='/Users//u/Application Support/d' muse --contributor-mode off \
+                 resume {S1}"
+            )
+            .as_str()
+        )
     );
     assert_eq!(told_line("my-session-name", &[]), None);
     assert_eq!(
         told_line(S1, &[("XDG_DATA_HOME".into(), "a\nb".into())]),
         None
+    );
+}
+
+#[test]
+fn a_relaunch_runs_contributor_mode_off_and_a_fresh_start_the_default_model() {
+    // A launch that turned contributor mode on (either spelling), and one that
+    // never named it: the relaunch carries it off, exactly once.
+    for words in [
+        &[STORE, "--contributor-mode", "on"][..],
+        &[STORE, "--contributor-mode=on"][..],
+        &[STORE][..],
+    ] {
+        assert_eq!(
+            rewrite_argv(&argv(words), Some(S1)),
+            Ok(argv(&["--contributor-mode", "off", "resume", S1])),
+            "{words:?}"
+        );
+    }
+    // A fresh start (no session to resume) runs the default model at xhigh.
+    assert_eq!(
+        rewrite_argv(&argv(&[STORE]), None),
+        Ok(argv(&[
+            "--contributor-mode",
+            "off",
+            "--model",
+            "muse-wonder-full-1.0",
+            "--reasoning-effort",
+            "xhigh",
+        ]))
     );
 }
 

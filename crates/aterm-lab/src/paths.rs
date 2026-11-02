@@ -92,9 +92,19 @@ impl Paths {
             .and_then(Path::parent)
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
         let fallback = || default_state(crate::sys::getuid(), &physical(&repo));
-        let (state, state_relative, state_default) = match std::env::var("LAB_STATE") {
-            Ok(s) if !s.is_empty() && !s.starts_with('/') => (fallback(), Some(s), false),
-            Ok(s) if !s.is_empty() => (physical(Path::new(s.trim_end_matches('/'))), None, false),
+        let (state, state_relative, state_default) = match std::env::var_os("LAB_STATE") {
+            Some(os) if !os.is_empty() => {
+                let raw = Path::new(&os);
+                if !raw.is_absolute() {
+                    (fallback(), Some(os.to_string_lossy().into_owned()), false)
+                } else if let Some(s) = os.to_str() {
+                    let trimmed = s.trim_end_matches('/');
+                    let path = if trimmed.is_empty() { "/" } else { trimmed };
+                    (physical(Path::new(path)), None, false)
+                } else {
+                    (PathBuf::from(os), None, false)
+                }
+            }
             _ => (fallback(), None, true),
         };
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("aterm-lab"));
@@ -175,18 +185,24 @@ impl Paths {
     }
 
     fn state_named(&self) -> Result<&Path, String> {
-        match &self.state_relative {
-            Some(s) => Err(format!(
+        if let Some(s) = &self.state_relative {
+            return Err(format!(
                 "LAB_STATE={s} is relative (each call would read it from its own cwd, which a jailed process may \
                  write, and source the env.sh it found there): give its absolute path"
-            )),
-            None => Ok(&self.state),
+            ));
         }
+        if self.state.to_str().is_none() {
+            return Err(
+                "LAB_STATE is not valid UTF-8: the sandbox profile quotes it as UTF-8 text".into(),
+            );
+        }
+        Ok(&self.state)
     }
 
     /// The state dir.
     /// # Errors
     /// `$LAB_STATE` is the home or lies under it.
+    /// Or `$LAB_STATE` encloses a guarded home or [`state_root`], or is not valid UTF-8.
     pub fn need_state_outside(&self, homes: &[String]) -> Result<&Path, String> {
         let state = self.state_named()?;
         let real = physical(state);
@@ -196,17 +212,47 @@ impl Paths {
                 .iter()
                 .any(|s| s.starts_with(h) || s.starts_with(&home))
         };
-        match homes.iter().find(inside) {
-            Some(h) => Err(format!(
+        if let Some(h) = homes.iter().find(inside) {
+            return Err(format!(
                 "LAB_STATE={} sits inside the home {h}, whose contents the lab's jail fences: the fence refuses \
                  each directory from that home down to a run, which the harness's tape store opens one at a time, so \
                  a lab there keeps no tape. Leave LAB_STATE unset (the default, {}, is outside every home) or name \
                  a directory outside every home",
                 state.display(),
                 default_state(crate::sys::getuid(), &physical(&self.repo)).display()
-            )),
-            None => Ok(state),
+            ));
         }
+        let encloses = |h: &&String| {
+            let home = physical(Path::new(h));
+            [state, real.as_path()]
+                .iter()
+                .any(|s| Path::new(h).starts_with(s) || home.starts_with(s))
+        };
+        if let Some(h) = homes.iter().find(encloses) {
+            return Err(format!(
+                "LAB_STATE={} encloses the home {h}, whose contents the lab's jail fences: reopening LAB_STATE \
+                 would reopen {h}. Leave LAB_STATE unset (the default, {}, is outside every home) or name a \
+                 directory outside every home",
+                state.display(),
+                default_state(crate::sys::getuid(), &physical(&self.repo)).display()
+            ));
+        }
+        let states = state_root(crate::sys::getuid());
+        let states_real = physical(&states);
+        if [state, real.as_path()]
+            .iter()
+            .any(|s| states.starts_with(s) || states_real.starts_with(s))
+        {
+            return Err(format!(
+                "LAB_STATE={} encloses {}, whose subdirectories hold every checkout's default lab state: reopening \
+                 LAB_STATE would reopen other checkouts' runs and logs. Leave LAB_STATE unset (the default, {}, \
+                 is per-checkout) or name a directory of its own",
+                state.display(),
+                states.display(),
+                default_state(crate::sys::getuid(), &physical(&self.repo)).display()
+            ));
+        }
+        Ok(state)
     }
 
     /// Ensure the default state directory is private when [`Self::state_default`] is true.
@@ -811,5 +857,19 @@ mod tests {
             p.state = state.clone();
             assert_eq!(p.need_state_outside(&homes), Ok(state.as_path()));
         }
+        p.state = PathBuf::from("/");
+        assert!(p.need_state_outside(&homes).is_err());
+        p.state.clone_from(&t.0);
+        assert!(
+            p.need_state_outside(&homes)
+                .unwrap_err()
+                .contains("encloses the home")
+        );
+        p.state = state_root(crate::sys::getuid());
+        assert!(
+            p.need_state_outside(&homes)
+                .unwrap_err()
+                .contains("encloses")
+        );
     }
 }

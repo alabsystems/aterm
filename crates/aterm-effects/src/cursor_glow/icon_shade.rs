@@ -332,7 +332,8 @@ const fn halo_box(h: &RainHalo) -> PxBox {
 /// texel `art − 1 −` that. Read at the texel centres instead, a scaled
 /// sprite's silhouette sat a texel off what it drew: the companion's paw
 /// and chin, drawn from the art row above the one read, peeked through the
-/// page veil as specks between the letters (looks7 round 2).
+/// page patch then laid under its letters as specks between them (looks7
+/// round 2).
 #[inline]
 const fn stamp_texel(l: i32, art: i32, dest: i32, flip: bool) -> i32 {
     let t = l * art / dest;
@@ -453,32 +454,6 @@ fn drawn_rows_ref(
         }
         y += 1;
     }
-}
-
-/// The rows `sprite` (grid pixels, the grid at `origin` in the window) draws
-/// within `clip` (window pixels), each its drawn texels' span, into `out`,
-/// top to bottom: the silhouette the pet's page veil keeps to
-/// ([`CursorGlow::veil_pet_letters`]). Every texel the stamp draws counts,
-/// its anti-aliased edge with it: counted from the icon's half-opaque edge,
-/// a chin's sloping edge (texels a quarter to a half opaque, five pixels
-/// past the row's opaque span) lay outside the veil and lit specks between
-/// the letters (looks7 round 2). An empty art yields `clip` whole.
-#[inline]
-pub(super) fn sprite_rows(
-    sprite: &FreeSprite,
-    clip: PxBox,
-    origin: (i32, i32),
-    out: &mut Vec<PxBox>,
-) {
-    let (x, y) = (sprite.x, sprite.y);
-    let dest = (x, x + i32::from(sprite.w), y, y + i32::from(sprite.h));
-    drawn_rows_ref(
-        clip,
-        Some((&sprite.art, dest, sprite.flip_x)),
-        origin,
-        out,
-        (stamp_texel, 1),
-    );
 }
 
 /// The pieces of `rect` outside `bands` (top to bottom, disjoint rows) into
@@ -1307,146 +1282,6 @@ mod tests {
         assert!(
             whole.iter().map(|b| b.3).max() > bands.iter().map(|b| b.3).max(),
             "control: shown whole, the face's lower rows are drawn too"
-        );
-    }
-
-    /// The pixels a sprite's stamp draws, `(x, y)` in window pixels (the
-    /// grid at the window's origin): the CPU engine's own spans, read
-    /// through its bloom source ([`aterm_render::fx_bloom_quads`]).
-    fn stamped(sprite: &FreeSprite) -> std::collections::HashSet<(i32, i32)> {
-        let mut layers = Vec::new();
-        aterm_render::sprites::SpriteLayers::new(7)
-            .publish(std::slice::from_ref(sprite), &mut layers);
-        for l in &mut layers {
-            l.bloom = true;
-        }
-        let f = aterm_render::FxFrame {
-            w: 256,
-            h: 256,
-            pad: 0,
-            grid_top: 0,
-            cell_h: 16,
-            rows: 16,
-        };
-        let mut quads = Vec::new();
-        aterm_render::fx_bloom_quads(
-            &f,
-            &layers,
-            &[],
-            &mut aterm_render::FxSlicer::default(),
-            &mut aterm_render::SpriteCols::default(),
-            &mut quads,
-        );
-        let mut px = std::collections::HashSet::new();
-        for q in quads.iter().filter(|q| q.alpha > 0) {
-            let (x, y) = (i32::from(q.x), i32::from(q.y));
-            for yy in y..y + i32::from(q.h) {
-                for xx in x..x + i32::from(q.w) {
-                    px.insert((xx, yy));
-                }
-            }
-        }
-        px
-    }
-
-    /// A SCALED SPRITE'S DRAWN ROWS ARE THE PIXELS ITS STAMP DRAWS (looks7
-    /// round 2): the companion's art drawn at half its size, the page veil
-    /// keeps to these rows, and read a texel off them, or from the icon's
-    /// half-opaque edge, it missed the paw and the chin's anti-aliased edge
-    /// the stamp drew (specks between the letters on Solarized Dark). Over
-    /// arts scaled down, up and unevenly, plain and mirrored, with
-    /// translucent texels among the opaque, every pixel the CPU engine
-    /// stamps lies in a drawn row, and every row's span starts and ends on a
-    /// stamped pixel. Negative controls: read at the texel centres, or
-    /// counted from the icon's edge, a stamped pixel lies outside the rows.
-    #[test]
-    fn a_scaled_sprite_s_drawn_rows_are_the_pixels_its_stamp_draws() {
-        use aterm_core::render::PxRect;
-        use aterm_render::sprites::FreeZ;
-        // A speckled art: about a third of its texels opaque, the rest clear.
-        let art = |w: u16, h: u16| {
-            let mut rgba = vec![0u8; usize::from(w) * usize::from(h) * 4];
-            let mut seed = 0x9E37_79B9u32;
-            for t in rgba.as_chunks_mut::<4>().0 {
-                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                if seed >> 30 == 0 || (seed >> 28) & 3 == 1 {
-                    *t = [0xE0, 0xD8, 0xC8, 0xFF];
-                } else if (seed >> 26) & 7 == 5 {
-                    *t = [0xE0, 0xD8, 0xC8, 0x40];
-                }
-            }
-            Arc::new(FxArt::new(w, h, FxTexels::Rgba8Straight, rgba).expect("an art"))
-        };
-        let centred = |l: i32, a: i32, d: i32, flip: bool| {
-            let m = if flip { d - 1 - l } else { l };
-            (2 * m + 1) * a / (2 * d)
-        };
-        let (mut missed_centred, mut missed_edge) = (0usize, 0usize);
-        for (aw, ah, dw, dh) in [
-            (40, 20, 20, 10),
-            (34, 26, 21, 13),
-            (12, 10, 30, 23),
-            (9, 7, 9, 7),
-        ] {
-            for flip_x in [false, true] {
-                let sprite = FreeSprite {
-                    x: 17,
-                    y: 11,
-                    w: dw,
-                    h: dh,
-                    art: art(aw, ah),
-                    clip: PxRect::EVERYWHERE,
-                    tint: 0x00FF_FFFF,
-                    alpha: 255,
-                    flip_x,
-                    z: FreeZ::UnderText,
-                };
-                let drawn = stamped(&sprite);
-                assert!(!drawn.is_empty(), "{aw}x{ah} at {dw}x{dh}: the stamp draws");
-                let clip = (0, 256, 0, 256);
-                let mut bands = Vec::new();
-                sprite_rows(&sprite, clip, (0, 0), &mut bands);
-                let held = lit(&bands);
-                for &px in &drawn {
-                    assert!(
-                        held.contains_key(&px),
-                        "{aw}x{ah} at {dw}x{dh}, flip {flip_x}: stamped {px:?} lies in no drawn row: {bands:?}"
-                    );
-                }
-                for &(x0, x1, y0, y1) in &bands {
-                    for y in y0..y1 {
-                        assert!(
-                            drawn.contains(&(x0, y)) && drawn.contains(&(x1 - 1, y)),
-                            "{aw}x{ah} at {dw}x{dh}, flip {flip_x}: row {y} spans {x0}..{x1} past what the stamp drew"
-                        );
-                    }
-                }
-                let src = IconSrc {
-                    art: Arc::clone(&sprite.art),
-                    dest: (17, 17 + i32::from(dw), 11, 11 + i32::from(dh)),
-                    flip_x,
-                };
-                drawn_rows_by(clip, Some(&src), (0, 0), &mut bands, (centred, 1));
-                let held = lit(&bands);
-                missed_centred += drawn.iter().filter(|px| !held.contains_key(px)).count();
-                drawn_rows_by(
-                    clip,
-                    Some(&src),
-                    (0, 0),
-                    &mut bands,
-                    (stamp_texel, ICON_ALPHA_EDGE),
-                );
-                let held = lit(&bands);
-                missed_edge += drawn.iter().filter(|px| !held.contains_key(px)).count();
-            }
-        }
-        assert!(
-            missed_centred > 0,
-            "control: read at the texel centres, a stamped pixel lies outside the rows"
-        );
-        assert!(
-            missed_edge > 0,
-            "control: counted from the icon's edge, a stamped pixel lies outside the rows"
         );
     }
 

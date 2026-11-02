@@ -335,6 +335,13 @@ pub const ANCHORS: &[Anchor] = &[
         "Claude Code will automatically deny this request in",
         "2.1.281",
     ),
+    // 2.1.316's words for the same countdown (`… in 1:59, to avoid holding up an unattended
+    // session`); 2.1.308 was the last build measured with `deny`.
+    lit(
+        "box.auto_block",
+        "Claude Code will automatically block this request in",
+        "2.1.316",
+    ),
     lit("trust.title", "Accessing workspace:", "2.1.280"),
     lit("trust.yes", "Yes, I trust this folder", "2.1.280"),
     lit("trust.no", "No, exit", "2.1.280"),
@@ -380,6 +387,15 @@ pub const ANCHORS: &[Anchor] = &[
     lit("automode.not_now", "Not now", "2.1.310"),
     lit("automode.never", "Don't show again", "2.1.310"),
     lit("busy.interrupt", "esc to interrupt", "2.1.267"),
+    // The window title's lead glyph (`crate::phase::title_runs`): one of two frames while the
+    // REPL's status is busy (a turn loading, or a background agent, teammate or workflow
+    // running), flipped every 960 ms while the terminal has focus and held on one without it,
+    // the rest glyph otherwise, a blank after each. The bundle spells each as a `\u` escape
+    // (2.1.311: `["\u25D0","\u25D1"]` and `"\u2733"`), so neither is a literal of its bytes.
+    // Claude Code writes no title with its title off, leads it with no glyph where its status
+    // goes to the terminal's tab, and holds the rest glyph under a terminal multiplexer.
+    composed("title.running", "◐◑", "2.1.304"),
+    composed("title.rest", "✳", "2.1.304"),
     lit("footer.shortcuts", "? for shortcuts", "2.1.283"),
     hint("footer.clear", "esc to clear", "2.1.283"),
     composed("mode.bypass", "bypass permissions on", "2.1.283"),
@@ -1379,6 +1395,26 @@ pub const MUSE_ANCHORS: &[Anchor] = &[
         "1.4.11-R6667.1",
     ),
     lit("muse.wall.model_failed", "model failed: ", "1.4.10-R6427.1"),
+    // Its own tries spent: `model failed after 10 attempts: transport error [body-truncated]: …`,
+    // measured on the lab stub's dropped host (v6 §14.17.5).
+    composed(
+        "muse.wall.model_failed_after",
+        "model failed after ",
+        "1.4.13-R6996.1",
+    ),
+    // What follows the count there (only the plural has been seen on a screen).
+    composed(
+        "muse.wall.model_failed_attempts",
+        "attempts: ",
+        "1.4.13-R6996.1",
+    ),
+    // The cause it names where the host dropped the request: the connection's, never the API's
+    // answer.
+    composed(
+        "muse.wall.transport_error",
+        "transport error",
+        "1.4.13-R6996.1",
+    ),
     lit("muse.wall.api_error", "API error ", "1.4.10-R6427.1"),
     // The error body's `type` Muse Code draws in parentheses, as the lab stub's Codex-style body sends it: unverified against Meta's API.
     composed(
@@ -1731,7 +1767,10 @@ pub const KIMI_ANCHORS: &[Anchor] = &[
 ];
 
 /// The keys and closed words of Claude Code's transcript rows the session log's step fold reads:
-/// `lab claude-measure` refuses GONE when a build drops one the previous measured build showed.
+/// `lab claude-measure` refuses GONE when a build drops one the previous measured build showed,
+/// and NEW-KEY when a build shows one no measured build showed. aterm-agent's step tests hold the
+/// table to the fold: it is exactly the keys the fold's projections keep and the closed words its
+/// arms compare (`the_fold_reads_what_the_transcript_keys_name`).
 pub const TRANSCRIPT_KEYS: &[Anchor] = &[
     lit("transcript.tool_use", "tool_use", "2.1.294"),
     lit("transcript.tool_result", "tool_result", "2.1.294"),
@@ -1796,6 +1835,25 @@ pub const TRANSCRIPT_KEYS: &[Anchor] = &[
     lit("transcript.uuid", "uuid", "2.1.303"),
     lit("transcript.turnOrigin", "turnOrigin", "2.1.303"),
     lit("transcript.scheduledTaskId", "scheduledTaskId", "2.1.312"),
+    lit("transcript.user", "user", "2.1.294"),
+    lit("transcript.assistant", "assistant", "2.1.294"),
+    lit("transcript.system", "system", "2.1.294"),
+    lit("transcript.error", "error", "2.1.303"),
+    lit("transcript.apiError", "apiError", "2.1.303"),
+    lit("transcript.apiErrorStatus", "apiErrorStatus", "2.1.303"),
+    lit("transcript.quotaLimits", "quotaLimits", "2.1.303"),
+    lit("transcript.rateLimitType", "rateLimitType", "2.1.303"),
+    lit("transcript.human", "human", "2.1.303"),
+    lit(
+        "transcript.task-notification",
+        "task-notification",
+        "2.1.303",
+    ),
+    lit(
+        "transcript.auto-continuation",
+        "auto-continuation",
+        "2.1.303",
+    ),
 ];
 
 /// The keys and closed words of Codex's rollout rows the session log's Codex step fold reads:
@@ -1868,7 +1926,13 @@ pub fn newer_than(a: &str, b: &str) -> bool {
     let parts = |v: &str| {
         v.replace("-R", ".")
             .split('.')
-            .map(|p| p.parse::<u64>().unwrap_or(0))
+            .map(|p| {
+                if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) {
+                    p.parse::<u64>().unwrap_or(0)
+                } else {
+                    0
+                }
+            })
             .collect::<Vec<_>>()
     };
     parts(a) > parts(b)

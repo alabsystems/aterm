@@ -18,6 +18,10 @@ pub use aterm_time::Duration;
 pub use aterm_time::Instant;
 
 pub mod animate;
+/// The motion vocabulary the band draws with, shared with every animated surface: `aterm-scene`'s
+/// tokens, Q16 easings, glide, springs and cadences (`docs/DESIGN-init-on-by-default-2026-10-25.md`
+/// §5.2).
+pub use aterm_scene::motion;
 pub(crate) mod carry;
 pub(crate) mod center;
 pub mod chrome;
@@ -52,7 +56,10 @@ pub use center::{
     CatchUp, DigestSync, Echo, EchoKind, Live, MessageCenter, Outcome, PostOutcome, Posted, Settled,
 };
 pub use confirmations::ConfirmationSource;
-pub use digest::{DigestEntry, DigestView, RECENT_FILED, ReportScope, report as exceptions_report};
+pub use digest::{
+    DigestEntry, DigestView, RECENT_FILED, ReportScope, report as exceptions_report,
+    report_local as exceptions_report_local,
+};
 pub use glass::{CapsuleLayout, CapsuleRole, Hit, Links, Presentation, RowKind, RowLayout};
 pub use log::{CodecError, LogLine, LogRecord, LogState, MessageLog, Retired, Shelf};
 pub use model::{
@@ -158,12 +165,13 @@ pub(crate) const GLINT_RADIUS_PERMILLE: u32 = 30;
 pub(crate) const GLINT_MIN_HALF_CELLS: u32 = 3;
 /// The glint's peak lift (0–255).
 pub(crate) const GLINT_PEAK: u8 = 255;
-/// A data jump in a determinate fill glides over at least this long.
-pub const FILL_GLIDE: Duration = Duration::from_millis(180);
+/// A data jump in a determinate fill glides over at least this long: the motion vocabulary's
+/// GLIDE token ([`motion::GLIDE`]), which every animated surface shares.
+pub const FILL_GLIDE: Duration = motion::GLIDE;
 /// …plus this much per percentage point it travels, so a big jump does not hop many cells a frame.
-pub const FILL_GLIDE_PER_POINT: Duration = Duration::from_millis(7);
+pub const FILL_GLIDE_PER_POINT: Duration = motion::GLIDE_PER_POINT;
 /// …and never longer than this.
-pub const FILL_GLIDE_MAX: Duration = Duration::from_millis(600);
+pub const FILL_GLIDE_MAX: Duration = motion::GLIDE_MAX;
 /// The display's frame period a host that does not say otherwise is assumed to have (60 Hz).
 pub const REFRESH_DEFAULT: Duration = Duration::from_micros(16_667);
 /// A Complete echo's one conclusive sweep.

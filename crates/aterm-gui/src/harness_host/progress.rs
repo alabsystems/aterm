@@ -4,11 +4,13 @@
 //! Observations of the existing account decision, never another decision maker.
 
 use super::*;
-use aterm_agent::harness::account_progress::{AccountProgress, ProgressPhase, enrich_inventory};
+use aterm_agent::harness::account_progress::{
+    AccountProgress, ProgressPhase, enrich_inventory_with_identity,
+};
 
 #[cfg(test)]
 #[path = "progress/tests.rs"]
-mod lifecycle_tests;
+pub(super) mod lifecycle_tests;
 
 fn observe_lock<T>(value: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, ()> {
     match value.try_lock() {
@@ -40,7 +42,147 @@ pub(super) struct BoundProgress {
     born: Option<u64>,
     state: Option<PathBuf>,
     labels: BTreeSet<String>,
+    /// The exact gate recheck, independent of displayed wall time. Normal decisions have none.
+    pub(super) execution_until: Option<Instant>,
     pub(super) value: AccountProgress,
+}
+
+#[derive(Default)]
+pub(super) struct ProgressRead {
+    pub(super) progress: Option<AccountProgress>,
+    pub(super) activity_contended: bool,
+    pub(super) execution_until: Option<Instant>,
+}
+
+impl ProgressRead {
+    pub(super) fn retry(&self) -> bool {
+        self.activity_contended
+            || self
+                .progress
+                .as_ref()
+                .is_some_and(|value| moves_by_itself(&value.phase))
+    }
+
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountExecutionVisibility",
+            action = "Project",
+            project = "harness_host::tests::account_advice::execution_transition"
+        )
+    )]
+    pub(super) fn next_poll(&self, now: Instant) -> Option<Instant> {
+        earlier(
+            self.execution_until,
+            self.retry().then(|| now + Duration::from_secs(1)),
+        )
+    }
+}
+
+fn earlier(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+fn expire_execution(value: &mut AccountProgress) {
+    use aterm_agent::harness::account_progress::{
+        EXECUTION_CONTEXT_UNREAD_FINDING, EXECUTION_HISTORY_PREFIX, EXECUTION_PREPARED_FINDING,
+        EXECUTION_RECORDS_UNREAD_FINDING, EXECUTION_REFRESH_FINDING,
+        EXECUTION_ROSTER_UNREAD_FINDING,
+    };
+    value.phase = ProgressPhase::Unknown;
+    value.next_at = None;
+    for detail in &mut value.details {
+        if matches!(
+            detail.as_str(),
+            EXECUTION_PREPARED_FINDING
+                | EXECUTION_ROSTER_UNREAD_FINDING
+                | EXECUTION_CONTEXT_UNREAD_FINDING
+                | EXECUTION_RECORDS_UNREAD_FINDING
+        ) {
+            *detail = format!("{EXECUTION_HISTORY_PREFIX}{detail}");
+        }
+    }
+    value.details.insert(0, EXECUTION_REFRESH_FINDING.into());
+}
+
+fn replace_execution_progress(kept: &mut Kept, next: Option<BoundProgress>, now: Instant) -> bool {
+    let same = match (&kept.account.execution_progress, &next) {
+        (Some(old), Some(new)) => {
+            old.current(kept)
+                && old.born == new.born
+                && old.value == new.value
+                && old.state == new.state
+                && old.labels == new.labels
+        }
+        (None, None) => true,
+        _ => false,
+    };
+    let deadline_news = match (&kept.account.execution_progress, &next) {
+        (Some(old), Some(new)) => match (old.execution_until, new.execution_until) {
+            (Some(old), Some(new)) => new < old || (old <= now && now < new),
+            (None, Some(_)) => true,
+            _ => false,
+        },
+        _ => false,
+    };
+    // A still-current lease may silently extend: its already-armed earlier wake is safe.
+    // Reentering currentness or shortening a deadline needs a note even if wall words match.
+    kept.account.execution_progress = next;
+    !same || deadline_news
+}
+
+impl BoundProgress {
+    /// Reuse only context already read by the gate; it is not an inventory judgment.
+    pub(super) fn execution_context(&mut self, seat: &AccountSeat, roster: &accounts::Roster) {
+        if self.born.is_some() {
+            self.state = Some(seat.state.clone());
+            self.labels = roster.rows.iter().map(|row| row.label.clone()).collect();
+        }
+    }
+
+    fn current(&self, kept: &Kept) -> bool {
+        Arc::ptr_eq(&self.generation, &kept.account.landing)
+            && kept.snapshot.as_ref().is_some_and(|s| {
+                account_process_matches(s, &self.snapshot) && s.session == self.snapshot.session
+            })
+    }
+
+    fn matches(
+        &self,
+        kept: &Kept,
+        pid: i32,
+        born: Option<u64>,
+        conversation: Option<&str>,
+    ) -> bool {
+        self.current(kept)
+            && same_progress_process(
+                self.snapshot.pid,
+                self.born,
+                self.snapshot.session.as_deref(),
+                pid,
+                born,
+                conversation,
+            )
+    }
+
+    fn matches_execution(
+        &self,
+        kept: &Kept,
+        pid: i32,
+        born: Option<u64>,
+        conversation: Option<&str>,
+    ) -> bool {
+        self.matches(kept, pid, born, conversation)
+            || (self.born.is_none()
+                && born.is_none()
+                && self.current(kept)
+                && u32::try_from(pid).ok() == Some(self.snapshot.pid)
+                && conversation.is_some()
+                && self.snapshot.session.as_deref() == conversation)
+    }
 }
 
 fn progress_phase(advice: Option<&AccountAdvice>, point: AccountPoint) -> ProgressPhase {
@@ -162,13 +304,87 @@ fn apply_login_activity(
 }
 
 impl WorkerIdle {
+    /// Capture the existing publication fences without starting another advice calculation.
+    pub(super) fn capture_execution_progress(&self) -> Option<BoundProgress> {
+        if !observes(Some(self.agent)) {
+            return None;
+        }
+        let (snapshot, generation) = with_kept_of(&self.kept, |kept| {
+            (kept.snapshot.clone(), Arc::clone(&kept.account.landing))
+        });
+        let snapshot = snapshot?;
+        let born = snapshot.current_start_seconds();
+        let now = aterm_time::unix_secs()
+            .and_then(|v| i64::try_from(v).ok())
+            .unwrap_or(0);
+        Some(BoundProgress {
+            snapshot,
+            generation,
+            born,
+            state: None,
+            labels: BTreeSet::new(),
+            execution_until: None,
+            value: AccountProgress::unknown(now),
+        })
+    }
+
+    /// Publish only the gate's actual result, or clear its last hold on admission.
+    pub(super) fn publish_execution_progress(
+        &self,
+        captured: Option<BoundProgress>,
+        until: Option<Instant>,
+        reason: &'static str,
+        account: Option<String>,
+    ) {
+        let Some(mut bound) = captured else {
+            return;
+        };
+        bound.execution_until = until;
+        if let Some(until) = until {
+            bound.value.phase = ProgressPhase::Waiting;
+            bound.value.account = bound.born.and(account);
+            bound.value.details.push(
+                if bound.born.is_some() {
+                    reason
+                } else {
+                    aterm_agent::harness::account_progress::EXECUTION_CONTEXT_UNREAD_FINDING
+                }
+                .into(),
+            );
+            // Map this exact monotonic recheck into the display's whole seconds, rounding up.
+            bound.value.next_at = aterm_time::unix_millis().and_then(|now| {
+                let remaining = until.saturating_duration_since(Instant::now());
+                let ms = i64::try_from(remaining.as_millis())
+                    .ok()?
+                    .checked_add(i64::from(
+                        !remaining.subsec_nanos().is_multiple_of(1_000_000),
+                    ))?;
+                i64::try_from(now)
+                    .ok()?
+                    .checked_add(ms)?
+                    .checked_add(999)
+                    .map(|at| at / 1000)
+            });
+        }
+        let changed = with_kept_of(&self.kept, |kept| {
+            if !bound.current(kept) {
+                return false;
+            }
+            let next = until.map(|_| bound);
+            replace_execution_progress(kept, next, Instant::now())
+        });
+        if changed {
+            (self.hooks.note)(HostNote::AccountProgress);
+        }
+    }
+
     /// Runs on the existing supervisor worker, after its actual account judgment.
     pub(super) fn read_account_progress(
         &self,
         request: &AdviceRequest,
         point: AccountPoint,
         advice: Option<&AccountAdvice>,
-        judged: Option<&accounts::Point>,
+        judged: Option<&mut AccountJudgment>,
     ) -> Option<BoundProgress> {
         if !observes(Some(self.agent)) {
             return None;
@@ -187,7 +403,7 @@ impl WorkerIdle {
         if let Some(AccountAdvice::Wait { until } | AccountAdvice::Hold { until }) = advice {
             value.next_at = wait_deadline(now, until.saturating_duration_since(Instant::now()));
         }
-        if let Some(AccountAdvice::Move { to }) = advice {
+        if let Some(AccountAdvice::Move { to, .. }) = advice {
             value.details.push(format!("Selected alternate: {to}"));
         }
         if matches!(advice, Some(AccountAdvice::Resume { .. })) {
@@ -209,6 +425,7 @@ impl WorkerIdle {
             born,
             state: None,
             labels: BTreeSet::new(),
+            execution_until: None,
             value,
         };
         let Some(seat) = (self.hooks.acts.account_seat)() else {
@@ -255,14 +472,34 @@ impl WorkerIdle {
                 .push("Account records could not be read consistently".into());
             return Some(bound);
         };
-        enrich_inventory(
+        let (point, mut identities) = match judged {
+            Some(judged)
+                if judged.roster == roster && judged.identities.seat.context().matches(&seat) =>
+            {
+                (Some(&judged.point), Some(&mut judged.identities))
+            }
+            Some(_) => {
+                bound
+                    .value
+                    .details
+                    .push(aterm_agent::harness::account_progress::BINDINGS_CHANGED_FINDING.into());
+                (None, None)
+            }
+            None => (None, None),
+        };
+        enrich_inventory_with_identity(
             &mut bound.value,
             &roster,
             &state,
             &logins,
             &accounts::enrolled(&roster),
             &me,
-            judged,
+            point,
+            |label| {
+                identities.as_mut().is_none_or(|identities| {
+                    roster.row(label).is_some_and(|row| identities.matches(row))
+                })
+            },
         );
         if !me.default_home || !me.stored_login || me.label().is_none() {
             bound.value.eligible = None;
@@ -273,6 +510,7 @@ impl WorkerIdle {
 
 impl HostHandle {
     /// Pure in-memory read. Contention is distinct from an absent observation.
+    #[cfg(test)]
     pub(crate) fn account_progress(
         &self,
         sid: &str,
@@ -280,33 +518,123 @@ impl HostHandle {
         started: Option<u64>,
         conversation: Option<&str>,
     ) -> Result<Option<AccountProgress>, ()> {
+        self.account_progress_read(sid, pid, started, conversation)
+            .map(|read| read.progress)
+    }
+
+    fn account_progress_read(
+        &self,
+        sid: &str,
+        pid: i32,
+        started: Option<u64>,
+        conversation: Option<&str>,
+    ) -> Result<ProgressRead, ()> {
+        self.account_progress_read_with_activity(
+            sid,
+            pid,
+            started,
+            conversation,
+            || {
+                (
+                    Instant::now(),
+                    aterm_time::unix_secs().and_then(|v| i64::try_from(v).ok()),
+                )
+            },
+            aterm_agent::harness::accounts_sync::login_activity,
+        )
+    }
+
+    /// Keep display expiry and activity inputs controllable without changing the observed gate.
+    #[cfg(test)]
+    pub(super) fn account_progress_with_activity(
+        &self,
+        sid: &str,
+        pid: i32,
+        started: Option<u64>,
+        conversation: Option<&str>,
+        clock: impl FnOnce() -> (Instant, Option<i64>),
+        activity: impl FnOnce(
+            &accounts::Store,
+            accounts::Cli,
+            i64,
+        )
+            -> Option<Vec<aterm_agent::harness::accounts_sync::LoginActivity>>,
+    ) -> Result<Option<AccountProgress>, ()> {
+        self.account_progress_read_with_activity(sid, pid, started, conversation, clock, activity)
+            .map(|read| read.progress)
+    }
+
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "AccountExecutionVisibility",
+            action = "Elapse",
+            reason = "The native fixture advances the injected monotonic display clock through the gate's actual retained deadline"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountExecutionVisibility",
+            action = "Project",
+            project = "harness_host::tests::account_advice::execution_transition"
+        )
+    )]
+    pub(super) fn account_progress_read_with_activity(
+        &self,
+        sid: &str,
+        pid: i32,
+        started: Option<u64>,
+        conversation: Option<&str>,
+        clock: impl FnOnce() -> (Instant, Option<i64>),
+        activity: impl FnOnce(
+            &accounts::Store,
+            accounts::Cli,
+            i64,
+        )
+            -> Option<Vec<aterm_agent::harness::accounts_sync::LoginActivity>>,
+    ) -> Result<ProgressRead, ()> {
+        // Sample before cloning any lease. A concurrent silent extension then either appears
+        // in this read or leaves its earlier deadline armed, even if this read resumes late.
+        let (mono, wall) = clock();
         let map = observe_lock(&self.shared.kept)?;
         let Some(kept) = map.get(sid).cloned() else {
-            return Ok(None);
+            return Ok(ProgressRead::default());
         };
         drop(map);
         let kept = observe_lock(&kept)?;
-        let Some(bound) = &kept.account.progress else {
-            return Ok(None);
+        let execution = kept
+            .account
+            .execution_progress
+            .as_ref()
+            .filter(|bound| bound.matches_execution(&kept, pid, started, conversation));
+        let normal = kept
+            .account
+            .progress
+            .as_ref()
+            .filter(|bound| bound.matches(&kept, pid, started, conversation));
+        let Some(bound) = execution.or(normal) else {
+            return Ok(ProgressRead::default());
         };
-        if !Arc::ptr_eq(&bound.generation, &kept.account.landing)
-            || !same_progress_process(
-                bound.snapshot.pid,
-                bound.born,
-                bound.snapshot.session.as_deref(),
-                pid,
-                started,
-                conversation,
-            )
-            || !kept.snapshot.as_ref().is_some_and(|s| {
-                account_process_matches(s, &bound.snapshot) && s.session == bound.snapshot.session
-            })
-        {
-            return Ok(None);
-        }
+        let execution_active = execution.is_some();
+        let execution_until = execution.and_then(|bound| bound.execution_until);
         let mut value = bound.value.clone();
-        if let Some(flying) = &kept.account.flying {
-            if flying.pid == bound.snapshot.pid && flying.start == bound.snapshot.start {
+        // Prefer the gate's own roster; use a current decision only if that gate read failed.
+        let activity_context = if bound.born.is_some() && bound.state.is_none() {
+            normal
+                .filter(|normal| normal.state.is_some())
+                .unwrap_or(bound)
+        } else {
+            bound
+        };
+        let state = activity_context.state.clone();
+        let labels = activity_context.labels.clone();
+        let mut current_work = false;
+        if bound.born.is_some() {
+            if let Some(flying) = kept.account.flying.as_ref().filter(|flying| {
+                flying.pid == bound.snapshot.pid && flying.start == bound.snapshot.start
+            }) {
+                current_work = true;
                 if flying.rejected.is_some() {
                     value.phase = ProgressPhase::Waiting;
                     value.details.insert(
@@ -318,40 +646,59 @@ impl HostHandle {
                         to: flying.to.clone(),
                     };
                 }
-            }
-        } else if let Some(moved) = &kept.account.moved {
-            if account_process_matches(&moved.process, &bound.snapshot) && !moved.answered {
+            } else if let Some(moved) = kept.account.moved.as_ref().filter(|moved| {
+                account_process_matches(&moved.process, &bound.snapshot) && !moved.answered
+            }) {
+                current_work = true;
                 value.phase = ProgressPhase::Verifying {
                     to: moved.to.clone(),
                 };
+            } else if kept.account.probing.as_ref().is_some_and(|probe| {
+                probe.pid == bound.snapshot.pid && probe.start == bound.snapshot.start
+            }) {
+                current_work = true;
+                value.phase = ProgressPhase::Probing;
+            } else if let Some(held) = kept
+                .account
+                .held
+                .filter(|why| *why != "off" && !execution_active)
+            {
+                value.phase = ProgressPhase::Waiting;
+                value.details.insert(0, reason(held));
             }
-        } else if kept.account.probing.as_ref().is_some_and(|probe| {
-            probe.pid == bound.snapshot.pid && probe.start == bound.snapshot.start
-        }) {
-            value.phase = ProgressPhase::Probing;
-        } else if let Some(held) = kept.account.held.filter(|why| *why != "off") {
-            value.phase = ProgressPhase::Waiting;
-            value.details.insert(0, reason(held));
         }
-        let state = bound.state.clone();
-        let labels = bound.labels.clone();
         drop(kept);
-        let now = aterm_time::unix_secs()
-            .and_then(|v| i64::try_from(v).ok())
-            .unwrap_or(value.observed_at);
-        // A retained decision can outlive its wait. Preserve its observation
-        // time and phase, but never present a past deadline as the next event.
-        value.next_at = value.next_at.filter(|at| *at > now);
-        if let Some(state) = state {
-            let activity = aterm_agent::harness::accounts_sync::login_activity(
-                &accounts::Store::at(&state),
-                accounts::Cli::Claude,
-                now,
-            )
-            .ok_or(())?;
-            apply_login_activity(&mut value, &labels, activity, now);
+        // Currentness is monotonic; the wall clock is only for displayed timestamps and activity.
+        let execution_until = execution_until.filter(|until| mono < *until);
+        if execution_active && execution_until.is_none() {
+            let phase = value.phase.clone();
+            expire_execution(&mut value);
+            if current_work {
+                value.phase = phase;
+            }
         }
-        if self.shared.switches.accounts() == accounts::Mode::Off
+        let now = wall.unwrap_or(value.observed_at);
+        // A normal retained decision can outlive its wait. Never present a past wall deadline
+        // as the next event; an execution receipt's currentness already used the monotonic clock.
+        value.next_at = value.next_at.filter(|at| *at > now);
+        let mut activity_contended = false;
+        if let Some(state) = state {
+            let gate_deadline = execution_until.is_some().then_some(value.next_at);
+            let activity = activity(&accounts::Store::at(&state), accounts::Cli::Claude, now);
+            match activity {
+                Some(activity) => apply_login_activity(&mut value, &labels, activity, now),
+                None if execution_active => activity_contended = true,
+                None => return Err(()),
+            }
+            if let Some(deadline) = gate_deadline {
+                value.next_at = deadline;
+            }
+        }
+        if self.shared.switches.accounts() == accounts::Mode::Off && execution_active {
+            value
+                .details
+                .push("Automatic account rotation is off".into());
+        } else if self.shared.switches.accounts() == accounts::Mode::Off
             && !matches!(
                 value.phase,
                 ProgressPhase::Switching { .. }
@@ -367,7 +714,11 @@ impl HostHandle {
                 "Waiting for a decision under the current account policy".into(),
             );
         }
-        Ok(Some(value))
+        Ok(ProgressRead {
+            progress: Some(value),
+            activity_contended,
+            execution_until,
+        })
     }
 }
 
@@ -388,10 +739,29 @@ impl crate::App {
     /// Poll only immutable supervisor observations; never read an account file on the GUI thread.
     ///
     /// Each loop wake reads them, a [`HostNote::AccountProgress`](super::HostNote::AccountProgress)
-    /// among them, and the window arms a wake of its own a second on only while a read was
-    /// contended or an observation moves by itself ([`moves_by_itself`]). A Claude tab at rest arms
-    /// no timer: `lab forever`'s END holds an idle window to `timer_wakes=0`.
+    /// among them. Active work or contention polls a second on; a current execution receipt also
+    /// arms one wake at its exact gate recheck so an unrefreshed refusal becomes history. A settled
+    /// expired receipt arms no timer, preserving the idle window's zero timer wakes.
     pub(crate) fn service_harness_account_progress(&mut self, now: Instant) {
+        self.service_harness_account_progress_with_reader(
+            now,
+            |host, sid, pid, birth, conversation| {
+                host.account_progress_read(sid, pid, birth, conversation)
+            },
+        );
+    }
+
+    pub(super) fn service_harness_account_progress_with_reader(
+        &mut self,
+        now: Instant,
+        mut read: impl FnMut(
+            &HostHandle,
+            &str,
+            i32,
+            Option<u64>,
+            Option<&str>,
+        ) -> Result<ProgressRead, ()>,
+    ) {
         if self.harness_progress_next_poll.is_some_and(|at| at > now) {
             return;
         }
@@ -405,18 +775,14 @@ impl crate::App {
             .map(|entry| (entry.id, entry.ctx.timeline.clone()))
             .collect();
         let mut again = false;
+        let mut next_poll = None;
         let mut changed = Vec::new();
         for (id, timeline) in sessions {
             let Ok(held) = observe_lock(&timeline) else {
                 again = true;
                 continue;
             };
-            if !observes(
-                held.agent()
-                    .program
-                    .as_deref()
-                    .and_then(aterm_phase::program_of),
-            ) {
+            if !observes(identified_agent(held.agent())) {
                 continue;
             }
             let Some((pid, birth)) = held.claude_footer_identity() else {
@@ -430,23 +796,27 @@ impl crate::App {
             let Some(sid) = self.session_sid(id) else {
                 continue;
             };
-            let Ok(progress) = host.account_progress(&sid, pid, birth, conversation.as_deref())
-            else {
+            let Ok(read) = read(&host, &sid, pid, birth, conversation.as_deref()) else {
                 again = true;
                 continue;
             };
-            again |= progress.as_ref().is_some_and(|p| moves_by_itself(&p.phase));
+            next_poll = earlier(next_poll, read.next_poll(now));
             let Ok(mut held) = observe_lock(&timeline) else {
                 again = true;
                 continue;
             };
-            if held.set_account_progress(pid, birth, conversation.as_deref(), progress) {
+            if held.set_account_progress(pid, birth, conversation.as_deref(), read.progress) {
                 changed.push(id);
             }
         }
-        self.harness_progress_next_poll = again.then(|| now + Duration::from_secs(1));
+        self.harness_progress_next_poll =
+            earlier(next_poll, again.then(|| now + Duration::from_secs(1)));
+        let lab_changed = !changed.is_empty() && self.lab_page_shown();
         for id in changed {
             self.on_claude_footer_changed(id);
+        }
+        if lab_changed {
+            self.publish_native_lab_state();
         }
     }
 
@@ -486,7 +856,10 @@ mod tests {
     fn a_plan_to_move_is_not_a_report_that_a_move_started() {
         assert_eq!(
             progress_phase(
-                Some(&AccountAdvice::Move { to: "other".into() }),
+                Some(&AccountAdvice::Move {
+                    to: "other".into(),
+                    yields: None
+                }),
                 AccountPoint::TurnEnd
             ),
             ProgressPhase::Ready

@@ -176,13 +176,14 @@ fn frame_step(w: WorkerId, payload: &[u8]) -> String {
     }
 }
 
-/// A stretch of the coordinator's own work on a search once its last claim is in, which
-/// `--frames` says as it begins ([`say`]): a step of the run's, as a worker frame's is, so the
-/// process tests' hang detector holds each stretch rather than all of them from the last claim to
-/// the end, one CPU-bound length a loaded host stretches past it.
+/// A stretch of the coordinator's own work at a search's end (a pool run's once its last claim is
+/// in), which `--frames` says as it begins ([`say`]): a step of the run's, as a worker frame's is,
+/// so the process tests' hang detector holds each stretch rather than all of them from the last
+/// claim (or the last candidate trained, [`Stepped`]) to the end, one CPU-bound length a loaded
+/// host stretches past it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
-    /// Step 5's check of the accepted claims (design §11.3).
+    /// Step 5's check of the accepted claims (design §11.3), in a pool run.
     Check,
     /// The winner's held-out read.
     HeldOut,
@@ -206,6 +207,59 @@ impl Phase {
 /// step=G.<name>`, each at most once a search. Its callers call it under `--frames` only.
 pub fn say(serial: u32, phase: Phase) {
     eprintln!("aos-workers step={serial}.{}", phase.name());
+}
+
+/// Says on stderr that a run without a pool has built its evaluator: `aos-workers
+/// step=0.evaluator`, once, search 0 being before the first ([`Pool::serial`]'s). A pool run's
+/// first stretch ends at its workers' hellos instead. Its caller calls it under `--frames` only.
+pub fn say_built() {
+    eprintln!("aos-workers step=0.evaluator");
+}
+
+/// A [`Spread`] that says each job it has run as a step of search `serial`, under `--frames`:
+/// `aos-workers step=G.trained.N`, `N` counting the jobs finished from 0 across its calls, so each
+/// is said once whatever the round or thread. With it a run without a pool takes a step per
+/// candidate trained, as a pool run takes one per worker frame, and the process tests' hang
+/// detector holds one candidate's training rather than the whole search, one CPU-bound length a
+/// loaded host stretches past it.
+pub struct Stepped<'a> {
+    inner: &'a dyn Spread,
+    serial: u32,
+    done: AtomicUsize,
+    sink: &'a (dyn Fn(&str) + Sync),
+}
+
+impl<'a> Stepped<'a> {
+    /// `inner`, saying its steps on stderr.
+    #[must_use]
+    pub fn new(inner: &'a dyn Spread, serial: u32) -> Stepped<'a> {
+        Stepped::to(inner, serial, &stderr_line)
+    }
+
+    /// `inner`, saying its steps to `sink`, a line each.
+    #[must_use]
+    pub fn to(inner: &'a dyn Spread, serial: u32, sink: &'a (dyn Fn(&str) + Sync)) -> Stepped<'a> {
+        Stepped {
+            inner,
+            serial,
+            done: AtomicUsize::new(0),
+            sink,
+        }
+    }
+}
+
+impl Spread for Stepped<'_> {
+    fn run(&self, n: usize, job: &(dyn Fn(usize) + Sync)) {
+        self.inner.run(n, &|i| {
+            job(i);
+            let k = self.done.fetch_add(1, Ordering::Relaxed);
+            (self.sink)(&format!("aos-workers step={}.trained.{k}", self.serial));
+        });
+    }
+}
+
+fn stderr_line(line: &str) {
+    eprintln!("{line}");
 }
 
 /// What this binary contributes to its [`ExecIdentity`]: the toolchain and profile `build.rs`
@@ -294,14 +348,23 @@ impl Fault {
             .ok_or_else(|| bad("expected NAME@KEY"))?;
         if name == "foreign" {
             let worker = key
-                .parse()
-                .map_err(|_| bad("foreign@W takes a worker index"))?;
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+                .then(|| key.parse().ok())
+                .flatten()
+                .ok_or_else(|| bad("foreign@W takes a worker index"))?;
             return Ok(Fault::Foreign { worker });
         }
         let (lease, k) = match key.split_once(':') {
             Some((lease, k)) => (
                 lease,
-                Some(k.parse::<u16>().map_err(|_| bad("K is an item ordinal"))?),
+                Some(
+                    k.bytes()
+                        .all(|b| b.is_ascii_digit())
+                        .then(|| k.parse::<u16>().ok())
+                        .flatten()
+                        .ok_or_else(|| bad("K is an item ordinal"))?,
+                ),
             ),
             None => (key, None),
         };
@@ -311,9 +374,24 @@ impl Fault {
         else {
             return Err(bad("the key is G.S.A: search serial, slot, attempt"));
         };
-        let search = g.parse().map_err(|_| bad("G is a search serial"))?;
-        let slot = s.parse().map_err(|_| bad("S is a slot"))?;
-        let attempt = a.parse().map_err(|_| bad("A is an attempt"))?;
+        let search = g
+            .bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| g.parse().ok())
+            .flatten()
+            .ok_or_else(|| bad("G is a search serial"))?;
+        let slot = s
+            .bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| s.parse().ok())
+            .flatten()
+            .ok_or_else(|| bad("S is a slot"))?;
+        let attempt = a
+            .bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| a.parse().ok())
+            .flatten()
+            .ok_or_else(|| bad("A is an attempt"))?;
         if search == 0 || attempt == 0 {
             return Err(bad("G and A count from 1"));
         }
@@ -378,7 +456,14 @@ impl WorkerArgs {
             match a.as_str() {
                 "--proto" => proto = Some(value()?),
                 "--worker" => {
-                    index = Some(value()?.parse().map_err(|_| "--worker takes an index")?);
+                    let v = value()?;
+                    index = Some(
+                        v.bytes()
+                            .all(|b| b.is_ascii_digit())
+                            .then(|| v.parse().ok())
+                            .flatten()
+                            .ok_or("--worker takes an index")?,
+                    );
                 }
                 "--fault" if cfg!(debug_assertions) => {
                     let spec = value()?;

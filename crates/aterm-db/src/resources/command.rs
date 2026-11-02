@@ -52,9 +52,14 @@ pub(super) fn run_at(
         None
     };
     let reserve = if command == "resources-reserve" {
+        let request = decode_hex(take(&mut options, "--request")?)?;
+        let cost_raw = take(&mut options, "--cost")?;
+        if cost_raw.is_empty() || !cost_raw.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(Error::new("invalid resource cost"));
+        }
         Some((
-            decode_hex(take(&mut options, "--request")?)?,
-            take(&mut options, "--cost")?
+            request,
+            cost_raw
                 .parse::<u64>()
                 .map_err(|_| Error::new("invalid resource cost"))?,
         ))
@@ -69,6 +74,7 @@ pub(super) fn run_at(
     if !options.is_empty() {
         return Err(Error::new("unknown resource option"));
     }
+    let paths = crate::generation::selected(&paths)?;
     let bootstrap = Bootstrap::required_until(
         &paths,
         std::time::Instant::now() + std::time::Duration::from_secs(2),

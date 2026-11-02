@@ -10,7 +10,10 @@
 //! starts and once a minute while it lasts ([`Wait::Block`]). The holder is a live process whose
 //! lock the kernel lets go when it exits, however it ends, so the wait is admission behind it:
 //! no deadline, no retry and no signal to anyone (`docs/DESIGN-adaptive-build-2026-10-24.md`,
-//! LOCK-WAIT). An interrupt ends the wait ([`crate::interrupt`]).
+//! LOCK-WAIT). An interrupt ends the wait ([`crate::interrupt`]). Each time it names the holder,
+//! the wait reads the holder's process tree, and once that has made no progress for its bound
+//! ([`crate::stall`]) it says so, in its line and in its mark, which a ceiling over it may end it
+//! on (CW-WAIT-UNBOUNDED).
 
 use std::fs::File;
 use std::io::{self, Read as _, Seek as _, Write as _};
@@ -19,6 +22,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::record_lock::RecordLock;
+use crate::stall::{Stall, Work};
 
 /// The head of the file the record may fill; the lock's range starts after it.
 pub const RECORD: u64 = 4096;
@@ -41,6 +45,9 @@ pub struct Holder {
     pub verb: String,
     /// The checkout it runs from; empty when the record does not say.
     pub checkout: String,
+    /// How long its process tree has made no progress, once that reached its waiter's bound
+    /// ([`Pace::stalled_after`]): what its waiter read, never part of the record.
+    pub stalled: Option<Duration>,
 }
 
 impl Holder {
@@ -53,6 +60,7 @@ impl Holder {
             since: now_secs(),
             verb: verb.to_string(),
             checkout: checkout.to_string_lossy().into_owned(),
+            stalled: None,
         }
     }
 
@@ -84,23 +92,32 @@ impl Holder {
     /// only that before it wrote this record).
     #[must_use]
     pub fn parse(text: &str) -> Option<Holder> {
+        let uint = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
         let line = text.lines().next()?;
         let mut fields = line.splitn(4, '\t');
-        let pid = fields.next()?.trim().parse().ok().filter(|p| *p != 0)?;
+        let pid = fields
+            .next()
+            .map(str::trim)
+            .filter(|s| uint(s))?
+            .parse()
+            .ok()
+            .filter(|p| *p != 0)?;
         let since = match fields.next() {
             None => 0,
-            Some(s) => s.parse().ok()?,
+            Some(s) => uint(s).then(|| s.parse().ok()).flatten()?,
         };
         Some(Holder {
             pid,
             since,
             verb: fields.next().unwrap_or_default().to_string(),
             checkout: fields.next().unwrap_or_default().to_string(),
+            stalled: None,
         })
     }
 
     /// `pid N (verb, checkout, since HH:MM)`, the clock read `offset` seconds east of UTC; what
-    /// the record does not say is left out.
+    /// the record does not say is left out. A holder its waiter found stuck adds how long it
+    /// has made no progress ([`crate::stall::no_progress`]).
     #[must_use]
     pub fn describe(&self, offset: i64) -> String {
         let mut what: Vec<String> = [&self.verb, &self.checkout]
@@ -115,10 +132,14 @@ impl Holder {
                 .rem_euclid(86_400);
             what.push(format!("since {:02}:{:02}", day / 3600, day % 3600 / 60));
         }
-        if what.is_empty() {
+        let named = if what.is_empty() {
             format!("pid {}", self.pid)
         } else {
             format!("pid {} ({})", self.pid, what.join(", "))
+        };
+        match self.stalled {
+            Some(span) => format!("{named}, {}", crate::stall::no_progress(span)),
+            None => named,
         }
     }
 }
@@ -134,7 +155,7 @@ fn now_secs() -> u64 {
 #[must_use]
 pub fn read(path: &Path) -> Option<Holder> {
     let mut head = Vec::new();
-    File::open(path)
+    open_regular_existing(path)
         .ok()?
         .take(RECORD)
         .read_to_end(&mut head)
@@ -158,6 +179,24 @@ pub fn name(
             h.describe(offset_at(h.since))
         ),
         None => "a run that wrote no record".to_string(),
+    }
+}
+
+/// How a blocked wait paces its lines and when it calls its holder stuck.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pace {
+    /// Between two lines naming the holder, after the first.
+    pub say_every: Duration,
+    /// How long the holder's process tree may make no progress before the wait calls it stuck.
+    pub stalled_after: Duration,
+}
+
+impl Default for Pace {
+    fn default() -> Self {
+        Pace {
+            say_every: SAY_EVERY,
+            stalled_after: crate::stall::STALLED_AFTER,
+        }
     }
 }
 
@@ -236,7 +275,10 @@ impl Drop for NamedLock {
 /// ([`Refused::Stopped`]). A stopped wait leaves a thread blocked on the lock with a handle of its
 /// own until the holder lets go; the lock it then has goes back at once.
 /// While it blocks, the wait is marked where a ceiling over this process's tree reads it
-/// ([`crate::waits`]), naming the holder afresh each time `say` does.
+/// ([`crate::waits`]), naming the holder afresh each time `say` does. Each time, it reads the
+/// holder's process tree ([`crate::stall::tree_work`]): once that has used no CPU time and
+/// written nothing for [`crate::stall::STALLED_AFTER`], the holder `say` hears says so
+/// ([`Holder::stalled`]), and so does the mark ([`crate::waits::Stuck`]). Nobody signals it.
 ///
 /// # Errors
 /// [`Refused`]: [`Refused::Io`] when the file cannot be opened or locked, never for its record.
@@ -247,10 +289,49 @@ pub fn take(
     say: &mut dyn FnMut(Option<&Holder>, Duration),
     stop: &dyn Fn() -> bool,
 ) -> Result<NamedLock, Refused> {
-    take_marked(path, me, wait, say, stop, crate::waits::dir().as_deref())
+    take_marked(
+        path,
+        me,
+        wait,
+        say,
+        stop,
+        crate::waits::dir().as_deref(),
+        Pace::default(),
+        &crate::stall::tree_work,
+    )
 }
 
-/// [`take`], its wait marked in `marks` (none: unmarked).
+/// [`take`] at `pace`: a test's seam, to say and call its holder stuck sooner.
+///
+/// # Errors
+/// As [`take`].
+#[cfg(any(test, debug_assertions))]
+pub fn take_paced(
+    path: &Path,
+    me: &Holder,
+    wait: Wait,
+    say: &mut dyn FnMut(Option<&Holder>, Duration),
+    stop: &dyn Fn() -> bool,
+    pace: Pace,
+) -> Result<NamedLock, Refused> {
+    take_marked(
+        path,
+        me,
+        wait,
+        say,
+        stop,
+        crate::waits::dir().as_deref(),
+        pace,
+        &crate::stall::tree_work,
+    )
+}
+
+/// [`take`], its wait marked in `marks` (none: unmarked), paced by `pace`, its holder's tree
+/// read by `work`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "take's own five, and the mark, pace and tree reader its tests set"
+)]
 fn take_marked(
     path: &Path,
     me: &Holder,
@@ -258,6 +339,8 @@ fn take_marked(
     say: &mut dyn FnMut(Option<&Holder>, Duration),
     stop: &dyn Fn() -> bool,
     marks: Option<&Path>,
+    pace: Pace,
+    work: &dyn Fn(u32) -> Option<Work>,
 ) -> Result<NamedLock, Refused> {
     match RecordLock::try_lock(open(path)?, RECORD) {
         Ok(lock) => return Ok(named(lock, me, Duration::ZERO)),
@@ -281,6 +364,7 @@ fn take_marked(
         })?;
     let started = Instant::now();
     let mut next = TICK;
+    let mut stall = Stall::default();
     loop {
         match rx.recv_timeout(TICK) {
             Ok(taken) => return Ok(named(taken?, me, started.elapsed())),
@@ -298,22 +382,32 @@ fn take_marked(
         }
         let waited = started.elapsed();
         if waited >= next {
-            let holder = read(path);
+            let mut holder = read(path);
+            if let Some(h) = &mut holder {
+                h.stalled = stall.stuck(h.pid, work(h.pid), Instant::now(), pace.stalled_after);
+            }
             say(holder.as_ref(), waited);
             if let Some(mark) = &mut mark {
-                mark.say(&waits_for(path, me, holder.as_ref()));
+                let stuck = holder.as_ref().and_then(|h| {
+                    Some(crate::waits::Stuck {
+                        holders: vec![h.pid],
+                        span: h.stalled?,
+                    })
+                });
+                mark.say_stuck(&waits_for(path, me, holder.as_ref()), stuck.as_ref());
             }
             next = if next == TICK {
-                SAY_EVERY
+                pace.say_every
             } else {
-                next + SAY_EVERY
+                next + pace.say_every
             };
         }
     }
 }
 
 /// What `me`'s wait on `path` marks ([`crate::waits`]): the holder its record names, with no
-/// clock of its own, and how long it has held the lock.
+/// clock of its own, how long it has held the lock, and how long it has made no progress once
+/// that is long enough to say.
 fn waits_for(path: &Path, me: &Holder, holder: Option<&Holder>) -> String {
     let lead = if me.verb.is_empty() {
         String::new()
@@ -324,6 +418,7 @@ fn waits_for(path: &Path, me: &Holder, holder: Option<&Holder>) -> String {
         Some(h) => {
             let named = Holder {
                 since: 0,
+                stalled: None,
                 ..h.clone()
             }
             .describe(0);
@@ -332,8 +427,11 @@ fn waits_for(path: &Path, me: &Holder, holder: Option<&Holder>) -> String {
             } else {
                 format!(" for {} min", now_secs().saturating_sub(h.since) / 60)
             };
+            let stuck = h.stalled.map_or_else(String::new, |span| {
+                format!(", and {}", crate::stall::no_progress(span))
+            });
             format!(
-                "{lead}waiting for {named}, which has held {}{held}",
+                "{lead}waiting for {named}, which has held {}{held}{stuck}",
                 path.display()
             )
         }
@@ -371,14 +469,55 @@ fn named(lock: RecordLock, me: &Holder, waited: Duration) -> NamedLock {
 /// Open (creating) `path` for locking and its record, never truncated: a lock file is a
 /// rendezvous, and its record is the holder's to clear.
 fn open(path: &Path) -> io::Result<File> {
+    #[cfg(not(unix))]
+    if std::fs::symlink_metadata(path).is_ok_and(|m| !m.is_file()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    options.open(path)
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    Ok(file)
+}
+
+fn open_regular_existing(path: &Path) -> io::Result<File> {
+    #[cfg(not(unix))]
+    if !std::fs::symlink_metadata(path)?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    Ok(file)
 }
 
 #[cfg(test)]
@@ -405,6 +544,7 @@ mod tests {
             since: 1_792_000_000,
             verb: "lab linux\tproof".into(),
             checkout: "/a b/c".into(),
+            stalled: None,
         };
         let back = Holder::parse(&h.line()).expect("a record");
         assert_eq!(back.verb, "lab linux proof", "a tab in a field is a space");
@@ -671,6 +811,70 @@ mod tests {
         }
     }
 
+    /// A holder that is itself a waiter in a chain reads as working, so a stuck holder's own
+    /// waiters are never called stuck behind it: a process blocked on a held lock wakes every
+    /// [`TICK`] to look for an interrupt, and its tree's CPU time, as the live sweep reads it,
+    /// moves between reads (the reads and the time it took are reported). Where no sweep reads
+    /// processes, it says so and checks nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_holder_waiting_in_a_chain_reads_as_working() {
+        if aterm_sysprobe::processes().is_none() {
+            eprintln!("no process sweep here: nothing to read");
+            return;
+        }
+        let dir = scratch("chain");
+        let path = dir.path().join("lane.lock");
+        let held = take(
+            &path,
+            &holder("lab linux proof"),
+            Wait::No,
+            &mut quiet,
+            &|| false,
+        )
+        .expect("free");
+        let child = Standin(
+            aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "named_lock::tests::standin_waits_for_the_lock",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(STANDIN, &path)
+                .stdin(aterm_uds::spawnfd::Stdio::null())
+                .stdout(aterm_uds::spawnfd::Stdio::null())
+                .stderr(aterm_uds::spawnfd::Stdio::null())
+                .spawn()
+                .expect("the stand-in"),
+        );
+        let waiting = dir.path().join("waiting");
+        let pid: u32 = aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the stand-in to wait for the lock",
+            || std::fs::read_to_string(&waiting).ok()?.trim().parse().ok(),
+        );
+        let first = crate::stall::tree_work(pid).expect("the waiter is swept");
+        let started = Instant::now();
+        let mut reads = 1;
+        let moved = aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the waiting holder's CPU time to move",
+            || {
+                std::thread::sleep(TICK);
+                reads += 1;
+                crate::stall::tree_work(pid).filter(|w| *w != first)
+            },
+        );
+        eprintln!(
+            "a waiter's tree moved from {first:?} to {moved:?} in {:?}, {reads} reads",
+            started.elapsed()
+        );
+        assert!(moved.cpu_ns > first.cpu_ns, "{first:?} -> {moved:?}");
+        drop(child);
+        drop(held);
+    }
+
     /// A blocked wait is marked for a ceiling to read, naming the holder, and the mark goes once
     /// the waiter has the lock. Without the mark the look for it hangs past its detector.
     #[test]
@@ -699,6 +903,8 @@ mod tests {
                     &mut quiet,
                     &|| started.elapsed() > Duration::from_secs(60),
                     Some(&marks),
+                    Pace::default(),
+                    &crate::stall::tree_work,
                 )
                 .map(drop)
             })
@@ -726,6 +932,96 @@ mod tests {
         );
     }
 
+    /// A holder whose process tree does no work is called stuck once it has done none for the
+    /// wait's bound: the holder `say` hears names how long, and the mark says so for a ceiling,
+    /// naming its pid; the wait goes on, and the holder keeps its lock. Negative control: a tree
+    /// whose work moves between reads is never called stuck.
+    #[test]
+    fn a_holder_that_makes_no_progress_is_named_stuck() {
+        use std::cell::{Cell, RefCell};
+        let dir = scratch("stuck");
+        let path = dir.path().join("lane.lock");
+        let marks = dir.path().join("waits");
+        std::fs::create_dir(&marks).expect("the marks' dir");
+        let held = take(
+            &path,
+            &holder("lab linux proof"),
+            Wait::No,
+            &mut quiet,
+            &|| false,
+        )
+        .expect("free");
+        let pace = Pace {
+            say_every: Duration::from_millis(100),
+            stalled_after: Duration::from_millis(500),
+        };
+        let idle = Work {
+            cpu_ns: 7,
+            written: 0,
+            members: 1,
+        };
+        for moves in [false, true] {
+            let reads = Cell::new(0u64);
+            let work = |_: u32| {
+                reads.set(reads.get() + 1);
+                Some(if moves {
+                    Work {
+                        cpu_ns: reads.get(),
+                        ..idle
+                    }
+                } else {
+                    idle
+                })
+            };
+            let lines = RefCell::new(Vec::new());
+            let marked = RefCell::new(Vec::new());
+            let started = Instant::now();
+            let got = take_marked(
+                &path,
+                &holder("lab linux exec"),
+                Wait::Block,
+                &mut |h, _| {
+                    lines
+                        .borrow_mut()
+                        .push(h.map(|h| h.describe(0)).unwrap_or_default());
+                    marked
+                        .borrow_mut()
+                        .extend(crate::waits::waiting(&marks).pop());
+                },
+                // Fifteen lines, a tenth of a second apart: three times the bound.
+                &|| lines.borrow().len() >= 15 || started.elapsed() > Duration::from_secs(60),
+                Some(&marks),
+                pace,
+                &work,
+            );
+            assert!(matches!(got, Err(Refused::Stopped { .. })), "{got:?}");
+            let (lines, marked) = (lines.into_inner(), marked.into_inner());
+            let said = |l: &String| l.contains(", which has made no progress for ");
+            let stuck: Vec<_> = marked.iter().filter_map(|w| w.stuck.clone()).collect();
+            if moves {
+                assert!(!lines.iter().any(said), "{lines:#?}");
+                assert!(stuck.is_empty(), "{marked:#?}");
+            } else {
+                assert!(!said(&lines[0]), "stuck at its first read: {lines:#?}");
+                assert!(lines.last().is_some_and(said), "{lines:#?}");
+                let last = stuck.last().expect("the mark said it was stuck");
+                assert_eq!(last.holders, [held.holder().pid]);
+                assert!(last.span >= pace.stalled_after, "{last:?}");
+                assert!(
+                    marked
+                        .last()
+                        .is_some_and(|w| w.text.contains(", and which has made no progress")),
+                    "{marked:#?}"
+                );
+            }
+            assert_eq!(
+                read(&path).as_ref(),
+                Some(held.holder()),
+                "the holder keeps it"
+            );
+        }
+    }
+
     #[test]
     fn a_dead_pids_record_is_not_its_holder() {
         let h = holder("lab linux proof");
@@ -735,5 +1031,33 @@ mod tests {
         assert!(stale.starts_with("a run that wrote no record"), "{stale}");
         assert!(stale.contains(&format!("pid {}", h.pid)), "{stale}");
         assert!(!name(None, |_| 0, |_| true).contains("pid"));
+        #[cfg(unix)]
+        {
+            let dir = scratch("nofollow");
+            let real = dir.path().join("real.lock");
+            std::fs::write(&real, h.line()).unwrap();
+            let link = dir.path().join("link.lock");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            assert_eq!(read(&link), None, "read must not follow a symlink");
+            assert!(
+                matches!(
+                    take(&link, &h, Wait::No, &mut quiet, &|| false),
+                    Err(Refused::Io(_))
+                ),
+                "take must refuse a symlinked lock path"
+            );
+            let fifo = dir.path().join("fifo.lock");
+            let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+            // SAFETY: `c_fifo` is a valid NUL-terminated path in our scratch directory.
+            assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+            assert_eq!(read(&fifo), None, "read must not block on a FIFO");
+            assert!(
+                matches!(
+                    take(&fifo, &h, Wait::No, &mut quiet, &|| false),
+                    Err(Refused::Io(_))
+                ),
+                "take must refuse a FIFO lock path"
+            );
+        }
     }
 }

@@ -92,7 +92,7 @@ pub(super) fn leave_prompt(app: &App) {
 }
 
 /// One printable key as the keyboard sends it.
-fn glyph(c: char) -> InputEvent {
+pub(super) fn glyph(c: char) -> InputEvent {
     InputEvent::Key {
         key: Key::Character(c),
         mods: Modifiers::empty(),
@@ -102,17 +102,29 @@ fn glyph(c: char) -> InputEvent {
     }
 }
 
+/// Dispatches `ev` at `at` as the person's.
+pub(super) fn press(app: &mut App, ev: InputEvent, at: Instant) {
+    crate::app_input::pin_input_clock(Some(at));
+    let _ = app.input(WID, ev, Source::Human);
+    crate::app_input::pin_input_clock(None);
+}
+
+/// Whether `app`'s timeline lists a detach for `why` (spaces as underscores).
+pub(super) fn detached_for(app: &App, why: &str) -> bool {
+    app.aos_ls_now()
+        .iter()
+        .any(|l| l.starts_with("slot=0 row=") && l.ends_with(&format!(" detached why={why}")))
+}
+
 /// Dispatches `n` echoed keys `KEY_GAP` apart and returns the last key's instant.
 pub(super) fn type_keys(app: &mut App, from: Instant, n: u32) -> Instant {
     let mut at = from;
     for k in 0..n {
         at = from + KEY_GAP * k;
-        crate::app_input::pin_input_clock(Some(at));
-        let _ = app.input(WID, glyph('a'), Source::Human);
+        press(app, glyph('a'), at);
         feed(app, b"a");
         app.redraw_window_at(WID, at);
     }
-    crate::app_input::pin_input_clock(None);
     at
 }
 
@@ -448,7 +460,7 @@ fn each_aos_ask_names_its_refusal_and_changes_nothing() {
         app.aos_resume_now().map(|_| ()).err(),
         Some(not_attached.clone())
     );
-    assert_eq!(app.aos_detach_now().err(), Some(not_attached));
+    assert_eq!(app.aos_detach_now(t0).err(), Some(not_attached));
     assert_eq!(
         app.aos_trace_now().err(),
         Some(AosRefusal::Trace(TraceRefusal::NotAttached))
@@ -466,7 +478,7 @@ fn each_aos_ask_names_its_refusal_and_changes_nothing() {
         app.aos_pause_at(t0).err(),
         Some(AosRefusal::Publish(PublishRefusal::AlreadyPaused))
     );
-    let (_, detached) = app.aos_detach_now().expect("detaches");
+    let (_, detached) = app.aos_detach_now(t0).expect("detaches");
     assert!(!detached.attached && !detached.paused);
 
     app.frontmost_window = None;
@@ -545,7 +557,7 @@ fn the_trace_hex_ask_exports_the_trace_file_its_summary_counts() {
     assert_eq!(replayed.code, MomentumCode::Shipped);
     assert_eq!(replayed.counts, counts);
 
-    app.aos_detach_now().expect("detaches");
+    app.aos_detach_now(last).expect("detaches");
     assert_eq!(
         app.control_aos(Asked::TraceHex, last),
         app.control_aos(Asked::Trace, last)

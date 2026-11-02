@@ -1,0 +1,19 @@
+# claude-code 2.1.311 · MEASURED 2026-10-27, `aterm ctl text` of a private headless aterm (144x50, aterm 0.145.0) in the real-Claude lab (crates/aterm-lab, run `mr`) running the store's Claude Code under a scratch home, against the lab's local stub of the API · a command statusLine (`lab statusline mr on 10`, printing `lab status line`, as aterm's usage tap is one) drawn under the composer, so the mode row says no `esc to interrupt`; the stub streams a 1093-character reply in the shape of the ATERM-KI-1027-3 reply (placeholder words, a defense line, four bullets, four NEEDS YOU lines), about 12 characters every 0.08 s; the window title `◐`/`◑ Claude Code` while the turn runs, `✳ Claude Code` from 23 ms before the done row · mid-reply (15:32:49.147): the spinner row gone since the first line was drawn, the defense line, the first bullet and a bare `  -` of the next, title `◑ Claude Code`; the harness read this frame idle and took it for the turn's end
+ ▐▛███▛█   Claude Code v2.1.311
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.XXXX/proj
+
+
+❯ write the landing report
+
+⏺ Nothing left: placeholder words of the same shape and length as the reply line placeholder words of.x
+
+  - Checkout: placeholder words of the same shape and length as the reply line placeholder words of the same shape and length as the reply line
+    placeholder wor.
+  -
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  lab status line
+  ⏵⏵ auto mode on (shift+tab to cycle)

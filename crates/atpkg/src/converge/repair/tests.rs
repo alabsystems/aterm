@@ -39,6 +39,7 @@ impl Scratch {
             home: Some(self.home.to_path_buf()),
             exe: exe.map(Path::to_path_buf),
             rustup_home: Some(self.home.join(".rustup")),
+            zsh: Default::default(),
             login_rc: None,
             pass,
             reads: Default::default(),
@@ -286,6 +287,84 @@ fn an_unwired_rc_is_wired_and_an_opted_out_one_is_laid_again_by_repair_alone() {
             .is_some_and(|d| d.contains("re-laid atpkg's block in ~/.zshrc"))
     );
     assert!(is_ok(&probe(&repair, super::RC)), "read back");
+}
+
+#[test]
+fn unreadable_rc_history_holds_both_repair_and_doctor_without_inventing_an_opt_out() {
+    let scratch = Scratch::new("rc-unknown-history");
+    let zshrc = scratch.home.join(".zshrc");
+    let user = "export EDITOR=vi\n";
+    std::fs::write(&zshrc, user).unwrap();
+    let doctor = scratch.ground(Pass::Doctor, None);
+    let rows = run(&doctor, &[super::HOOKS, super::RC], Mode::Apply);
+    assert_eq!(row(&rows, super::RC).outcome, Outcome::Changed);
+    assert!(
+        std::fs::read_to_string(&zshrc)
+            .unwrap()
+            .contains(crate::hooks::RC_BEGIN)
+    );
+    std::fs::write(&zshrc, user).unwrap();
+    let history = scratch.home.join(".aterm/rc-wired");
+    std::fs::write(&history, [0xff]).unwrap();
+    for pass in [Pass::Doctor, Pass::Repair] {
+        let ground = scratch.login_ground(pass, ".bash_profile");
+        assert!(is_ok(&probe(&ground, super::RC)));
+        let rows = run(&ground, &[super::HOOKS, super::RC], Mode::Apply);
+        assert_eq!(row(&rows, super::RC).outcome, Outcome::Ok);
+        assert_eq!(std::fs::read_to_string(&zshrc).unwrap(), user);
+        assert!(!scratch.home.join(".bash_profile").exists());
+        assert_eq!(std::fs::read(&history).unwrap(), [0xff]);
+        assert!(
+            crate::hooks::rc_wiring(&crate::hooks::RcHome::at(&scratch.home))
+                .contains(&(".zshrc", crate::hooks::RcState::HistoryUnreadable))
+        );
+    }
+}
+
+/// Under a `ZDOTDIR` the rc step reads, makes and names `$ZDOTDIR/.zshrc`, the file zsh reads
+/// (round 13: it made `~/.zshrc`, which zsh never reads there); while zsh's folder is unknown it
+/// says so and makes nothing.
+#[test]
+fn a_zdotdir_login_rc_is_the_one_zsh_reads_and_an_unknown_folder_is_said() {
+    let scratch = Scratch::new("rc-zdotdir");
+    let zdot = scratch.home.join("zdot");
+    std::fs::create_dir_all(&zdot).unwrap();
+    let mut ground = Arc::unwrap_or_clone(scratch.login_ground(Pass::Doctor, ".zshrc"));
+    ground.zsh = crate::zdotdir::ZshDir::At(zdot.clone());
+    let doctor = Arc::new(ground);
+    run(&doctor, &[super::HOOKS], Mode::Apply);
+    let Probe::Change { from, .. } = probe(&doctor, super::RC) else {
+        panic!("an absent login rc is a change");
+    };
+    assert!(from.contains("~/zdot/.zshrc does not exist"), "{from}");
+    let rows = run(&doctor, &[super::HOOKS, super::RC], Mode::Apply);
+    assert!(
+        row(&rows, super::RC)
+            .detail
+            .as_deref()
+            .is_some_and(|d| d.contains("created ~/zdot/.zshrc")),
+        "{rows:?}"
+    );
+    assert!(
+        std::fs::read_to_string(zdot.join(".zshrc"))
+            .unwrap()
+            .starts_with(crate::hooks::RC_BEGIN)
+    );
+    assert!(
+        !scratch.home.join(".zshrc").exists(),
+        "~/.zshrc is not zsh's"
+    );
+
+    let mut unknown = Arc::unwrap_or_clone(scratch.login_ground(Pass::Doctor, ".zshrc"));
+    unknown.zsh = crate::zdotdir::ZshDir::Unknown("zsh hung".to_owned());
+    let unknown = Arc::new(unknown);
+    let Probe::Ok { now } = probe(&unknown, super::RC) else {
+        panic!("an unknown folder is read, not changed");
+    };
+    assert!(
+        now.contains("zsh's .zshrc left alone") && now.contains("zsh hung"),
+        "{now}"
+    );
 }
 
 #[test]

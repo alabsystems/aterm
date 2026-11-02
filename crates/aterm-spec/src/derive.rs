@@ -759,15 +759,22 @@ impl Model {
 }
 
 /// The value of `e` under `consts`, or `None` when it mentions a state
-/// variable.
+/// variable or overflows `i64`.
 fn constant_value(e: &Expr, consts: &[(&str, i64)]) -> Option<i64> {
     match e {
         Expr::Int(n) => Some(*n),
-        Expr::ConstRef(name) if *name != "Buggy" => consts
-            .iter()
-            .find_map(|&(constant, value)| (constant == *name).then_some(value)),
-        Expr::Add(a, b) => Some(constant_value(a, consts)? + constant_value(b, consts)?),
-        Expr::Sub(a, b) => Some(constant_value(a, consts)? - constant_value(b, consts)?),
+        Expr::ConstRef(name) if *name != "Buggy" => {
+            let mut i = consts.len();
+            while i > 0 {
+                i -= 1;
+                if consts[i].0 == *name {
+                    return Some(consts[i].1);
+                }
+            }
+            None
+        }
+        Expr::Add(a, b) => constant_value(a, consts)?.checked_add(constant_value(b, consts)?),
+        Expr::Sub(a, b) => constant_value(a, consts)?.checked_sub(constant_value(b, consts)?),
         _ => None,
     }
 }
@@ -786,8 +793,8 @@ fn range_atom(
             _ => None,
         },
         Expr::Gt(a, b) => match (&**a, &**b) {
-            (Expr::Var(x), bound) => Some((*x, Some(k(bound)? + 1), None)),
-            (bound, Expr::Var(x)) => Some((*x, None, Some(k(bound)? - 1))),
+            (Expr::Var(x), bound) => Some((*x, Some(k(bound)?.checked_add(1)?), None)),
+            (bound, Expr::Var(x)) => Some((*x, None, Some(k(bound)?.checked_sub(1)?))),
             _ => None,
         },
         _ => None,
@@ -1596,6 +1603,19 @@ mod tests {
         assert!(!refused(Expr::And(
             Box::new(Expr::Gt(var(), int(0))),
             Box::new(Expr::Le(var(), Box::new(Expr::Sub(konst("Cap"), int(1))))),
+        )));
+        // Duplicate constant bindings resolve to the last entry (matching `eval_env`), and
+        // extreme `i64` arithmetic refuses cleanly instead of panicking.
+        let dup_consts = [("Cap", 0), ("Cap", 3), ("Buggy", 0)];
+        assert!(
+            not_range_bounds(&Expr::Le(var(), konst("Cap")), &dup_consts).is_empty(),
+            "last duplicate constant binding wins"
+        );
+        assert!(refused(Expr::Gt(var(), int(i64::MAX))));
+        assert!(refused(Expr::Gt(int(i64::MIN), var())));
+        assert!(refused(Expr::Le(
+            var(),
+            Box::new(Expr::Add(int(i64::MAX), int(1)))
         )));
     }
 

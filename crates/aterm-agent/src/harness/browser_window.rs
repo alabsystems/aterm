@@ -70,7 +70,7 @@ fn cache_version(name: &str) -> Option<Vec<u64>> {
         return None;
     }
     let version = rest.split('-').next()?;
-    version.split('.').map(|part| part.parse().ok()).collect()
+    version.split('.').map(crate::parse_uint).collect()
 }
 
 /// [`find_window_browser`] over its inputs: `env` (`$ATERM_BROWSER`, `PATH`), the browser
@@ -393,9 +393,12 @@ fn started_after(pid: i32, lock: &Path) -> bool {
     let Ok(written) = std::fs::symlink_metadata(lock).and_then(|m| m.modified()) else {
         return false;
     };
-    let started = std::time::UNIX_EPOCH
-        + Duration::from_secs(birth.seconds)
-        + Duration::from_micros(birth.microseconds);
+    let Some(started) = std::time::UNIX_EPOCH
+        .checked_add(Duration::from_secs(birth.seconds))
+        .and_then(|t| t.checked_add(Duration::from_micros(birth.microseconds)))
+    else {
+        return false;
+    };
     started > written
 }
 
@@ -471,7 +474,7 @@ fn singleton_holder(profile: &Path) -> Option<Holder> {
     let target = std::fs::read_link(&lock).ok()?;
     let target = target.to_string_lossy();
     let (host, pid) = target.rsplit_once('-')?;
-    let pid: i32 = pid.parse().ok().filter(|pid| *pid > 0)?;
+    let pid: i32 = crate::parse_uint(pid).filter(|pid| *pid > 0)?;
     if host_name().as_deref() == Some(host) {
         (alive(pid) && !started_after(pid, &lock)).then_some(Holder::Browser(pid))
     } else {
@@ -495,7 +498,7 @@ pub fn profile_holder(profile: &Path) -> Option<Holder> {
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(profile.join(PROFILE_LOCK_FILE))
         .ok()?;
     match ProfileLock::try_take(file) {
@@ -521,13 +524,13 @@ pub const PROFILE_LOCK_FILE: &str = "aterm-profile.lock";
 
 /// The pid written into `profile`'s [`PROFILE_LOCK_FILE`].
 fn lock_pid(profile: &Path) -> Option<i32> {
-    super::accounts::read_bounded(&profile.join(PROFILE_LOCK_FILE), 256)
-        .ok()
-        .flatten()?
-        .trim()
-        .parse()
-        .ok()
-        .filter(|pid| *pid > 0)
+    crate::parse_uint(
+        super::accounts::read_bounded(&profile.join(PROFILE_LOCK_FILE), 256)
+            .ok()
+            .flatten()?
+            .trim(),
+    )
+    .filter(|pid| *pid > 0)
 }
 
 /// Why a profile could not be claimed ([`ProfileLock::claim`]).
@@ -574,6 +577,14 @@ impl Drop for ProfileLock {
 
 impl ProfileLock {
     fn try_take(file: std::fs::File) -> std::io::Result<Result<ProfileLock, std::fs::File>> {
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "profile lock is not a regular file",
+            ));
+        }
+        #[cfg(unix)]
+        aterm_uds::keep_out_of_children(&file)?;
         #[expect(
             clippy::disallowed_methods,
             reason = "the profile lock's own take: its Drop releases by LOCK_UN"
@@ -604,7 +615,9 @@ impl ProfileLock {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         }
         let file = options
             .open(profile.join(PROFILE_LOCK_FILE))
@@ -1037,9 +1050,10 @@ pub fn tidy_profile(
         .map_err(|e| format!("{} did not start ({e})", browser_name(&browser.path)))?;
     let _guard = super::headless_oauth::BrowserChild::new(child);
     let mut cdp = super::headless_oauth::CdpClient::new(cmd_write, out_read);
-    let deadline = Instant::now()
+    let now = Instant::now();
+    let deadline = now
         .checked_add(within)
-        .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400));
+        .unwrap_or_else(|| now + Duration::from_secs(86_400));
     tidy_over_cdp(&mut cdp, session, deadline)
 }
 
@@ -1160,9 +1174,10 @@ pub(crate) fn run_window_with(
         let _ = child.kill();
         let _ = child.wait();
     };
-    let deadline = std::time::Instant::now()
+    let now = std::time::Instant::now();
+    let deadline = now
         .checked_add(hang)
-        .unwrap_or_else(|| std::time::Instant::now() + Duration::from_secs(86_400));
+        .unwrap_or_else(|| now + Duration::from_secs(86_400));
     let asked = loop {
         match child.try_wait() {
             Ok(Some(status)) => return Ok(exit_end(status)),
@@ -1184,9 +1199,10 @@ pub(crate) fn run_window_with(
         // SAFETY: a hangup to this window's own child, not yet reaped.
         unsafe { libc::kill(pid, libc::SIGHUP) };
     }
-    let until = std::time::Instant::now()
+    let grace_now = std::time::Instant::now();
+    let until = grace_now
         .checked_add(grace)
-        .unwrap_or_else(|| std::time::Instant::now() + Duration::from_secs(86_400));
+        .unwrap_or_else(|| grace_now + Duration::from_secs(86_400));
     loop {
         match child.try_wait() {
             Ok(Some(_)) => return Ok(asked),

@@ -131,27 +131,26 @@ fn write_bundle_identity(staging: &Staging, build: u64, commit: &str) {
 
 #[test]
 fn the_container_hash_answers_within_its_bound() {
-    let dir = Staging::scratch("hash-fifo");
-    let fifo = dir.root.join("container.zip");
-    let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes())
-        .expect("a scratch path has no NUL");
-    // SAFETY: a valid NUL-terminated path; mkfifo reads it and nothing else.
-    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0, "mkfifo");
+    // A hash that never finishes (a read a stalled volume holds) ends at the bound, as a refusal
+    // the next check passes over.
     let (tx, rx) = std::sync::mpsc::channel();
-    let path = fifo.clone();
-    let hasher = std::thread::spawn(move || {
-        let _ = tx.send(container_sha256(
-            &path,
+    std::thread::spawn(move || {
+        let _ = tx.send(container_sha256_with(
+            std::path::Path::new("container.zip"),
             std::time::Duration::from_millis(500),
+            |_| {
+                loop {
+                    std::thread::park();
+                }
+            },
         ));
     });
-    let answer = rx.recv_timeout(std::time::Duration::from_secs(60));
-    let _ = std::os::unix::fs::OpenOptionsExt::custom_flags(
-        std::fs::OpenOptions::new().write(true),
-        libc::O_NONBLOCK,
-    )
-    .open(&fifo);
-    let _ = hasher.join();
+    let error = rx
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the hash step answers within its bound")
+        .expect_err("a read that never finished has no digest");
+    assert!(crate::is_passing_refusal(&error), "{error}");
+    let dir = Staging::scratch("hash-bound");
     let file = dir.root.join("abc");
     std::fs::write(&file, b"abc").unwrap();
     assert_eq!(
@@ -159,10 +158,6 @@ fn the_container_hash_answers_within_its_bound() {
         Ok("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
     );
     let _ = std::fs::remove_dir_all(&dir.root);
-    let error = answer
-        .expect("the hash step answers within its bound")
-        .expect_err("a read that never finished has no digest");
-    assert!(crate::is_passing_refusal(&error), "{error}");
 }
 
 #[test]

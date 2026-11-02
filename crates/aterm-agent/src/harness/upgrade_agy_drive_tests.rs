@@ -114,6 +114,15 @@ struct After {
     /// The shell's blocks BEFORE the line, in place of the exit's
     /// ([`blocks`]): the agy still running in its block ([`running`]).
     running: Option<String>,
+    /// The relaunched screen from this read of it on (1 the first): what a person began as a look
+    /// went on.
+    screen_from: Option<(usize, String)>,
+    /// Reads of the relaunched screen so far.
+    screen_reads: usize,
+    /// What a line of the harness's is answered, in place of its being settled.
+    harness_answer: Option<String>,
+    /// The conversation's transcript a line of the harness's reaches as it is typed.
+    harness_reaches: Option<PathBuf>,
 }
 
 fn running() -> String {
@@ -138,24 +147,29 @@ fn instance(dir: &Path, w: World) -> (String, crate::harness::FakeInstanceLog) {
             .find(|w| !w.starts_with('@'))
             .unwrap_or("");
         let relaunched = w.relaunched.load(Ordering::SeqCst);
-        let after = w.after.lock().expect("after");
+        let mut after = w.after.lock().expect("after");
         let served = |what: &Option<String>, before: &String| match what {
             Some(now) if relaunched => now.clone(),
             _ => before.clone(),
         };
         match verb {
             "sessions" => format!("OK 1\nlocal {TAB} 0 idle agy"),
+            "text" if relaunched => {
+                after.screen_reads += 1;
+                match &after.screen_from {
+                    Some((from, screen)) if after.screen_reads >= *from => {
+                        format!("OK {screen}")
+                    }
+                    _ => format!("OK {}", served(&after.screen, &w.after_relaunch)),
+                }
+            }
             "text" => format!(
                 "OK {}",
-                if relaunched {
-                    served(&after.screen, &w.after_relaunch)
-                } else {
-                    after
-                        .before_screen
-                        .as_ref()
-                        .unwrap_or(&w.after_exit)
-                        .clone()
-                }
+                after
+                    .before_screen
+                    .as_ref()
+                    .unwrap_or(&w.after_exit)
+                    .clone()
             ),
             "cell" => "OK > ccd3db 1e1e1e none".to_string(),
             "status" => served(
@@ -179,6 +193,14 @@ fn instance(dir: &Path, w: World) -> (String, crate::harness::FakeInstanceLog) {
             "turn" => {
                 if line.contains("'--conversation=") {
                     w.relaunched.store(true, Ordering::SeqCst);
+                }
+                if line.contains(upgrade::HARNESS_MARK) {
+                    if let Some(transcript) = &after.harness_reaches {
+                        transcript_told(transcript, upgrade::HARNESS_MARK);
+                    }
+                    if let Some(answer) = &after.harness_answer {
+                        return answer.clone();
+                    }
                 }
                 "OK 0 turn submitted=1 status=settled seq=1 id=1".to_string()
             }
@@ -662,6 +684,39 @@ impl Rig {
             .iter()
             .filter(|l| l.contains("[aterm harness]"))
             .count()
+    }
+
+    /// The conversation's transcript.
+    fn transcript(&self) -> PathBuf {
+        self.config
+            .join("brain")
+            .join(C1)
+            .join(".system_generated/logs/transcript.jsonl")
+    }
+
+    /// The stand-in's answers to the carry-on's own steps, each as a test sets it.
+    fn on_harness_line(&self, answer: Option<&str>, reaches_transcript: bool) {
+        let transcript = self.transcript();
+        let mut after = self.after.lock().expect("after");
+        after.harness_answer = answer.map(str::to_string);
+        after.harness_reaches = reaches_transcript.then_some(transcript);
+    }
+
+    /// The relaunched screen turns to `screen` at the `from`th read from now.
+    fn shows_from(&self, from: usize, screen: String) {
+        let mut after = self.after.lock().expect("after");
+        after.screen_reads = 0;
+        after.screen_from = Some((from, screen));
+    }
+
+    /// The relaunch's record, its line `age` seconds ago.
+    fn relaunch_aged(&self, age: u64) {
+        let mut st = self.state();
+        st.phase = Phase::Relaunched {
+            at_s: now_s().saturating_sub(age),
+        };
+        st.relaunched_at = 0;
+        save(&self.opts, &key(TAB), &st);
     }
 
     fn new_crashed(&self) {
@@ -2009,4 +2064,610 @@ fn an_in_flight_agy_relaunch_waits_out_a_hand_and_counts_staleness_from_seen_exi
     let failed = rig.state();
     assert_eq!(failed.phase, Phase::Failed("stale-exit".to_string()));
     assert!(failed.exited_at >= now, "{failed:?}");
+}
+
+/// The word an agy's exit left, read off a window that never answers its block, is no word
+/// within the drive's bound, so the exit watch's look ends, and the exit is asked again
+/// (`wait:no-socket`), never an unwitnessed end; answered, it is the crash (lanes:H8).
+#[test]
+fn an_exit_word_the_window_never_answers_ends_at_its_bound() {
+    let rig = Rig::new("exit-unanswered", 137, true, false, true);
+    let snap = rig.snap(Some(C2));
+    let read = |what: &str, opts: Opts, snap: Snapshot| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(shell_word(&opts, &snap));
+        });
+        rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .unwrap_or_else(|_| panic!("{what}: no word within the hang detector"))
+    };
+    assert_eq!(
+        read("the answered block", rig.opts.clone(), snap.clone()),
+        Ok(Some(ExitKind::Crashed)),
+        "an answered block is read"
+    );
+    let dir = scratch("exit-unanswered-mute");
+    let (mute, _asked) = crate::harness::fake_instance(&dir.join("m.sock"), TOKEN, |_| {
+        crate::harness::UNANSWERED.to_string()
+    });
+    let opts = Opts {
+        sock: Some(mute),
+        timings: crate::harness::Timings {
+            drive_reply: Duration::from_millis(200),
+            ..rig.opts.timings
+        },
+        ..rig.opts.clone()
+    };
+    assert_eq!(
+        read("the unanswered block", opts.clone(), snap.clone()),
+        Err(NoSocket),
+        "an unanswered block is no word"
+    );
+    let r = after_exit_onto(
+        &opts,
+        &snap,
+        &ExitRecord::Unread,
+        ExitCause::Exit,
+        Some(rig.twin.clone()),
+        &rig.kernel,
+    );
+    assert_eq!(r.step, "wait:no-socket", "asked again, never unwitnessed");
+    assert!(rig.typed().is_empty(), "{:#?}", rig.typed());
+}
+
+/// The relaunched agy's settled screen with `said` as its last reply, under the message it
+/// answers, above the idle composer.
+fn idle_saying(said: &str) -> String {
+    let mut rows = fixture_rows(aterm_phase::agy::fixtures::END_OF_TURN);
+    let asked = rows
+        .iter()
+        .position(|r| r.starts_with("> Write about"))
+        .expect("the message");
+    let rule = rows
+        .iter()
+        .rposition(|r| r.starts_with('>'))
+        .expect("the composer")
+        - 1;
+    rows.splice(
+        asked + 1..rule,
+        [String::new(), format!("  {said}"), String::new()],
+    );
+    assert_eq!(
+        aterm_phase::agy::said_tail(&rows).as_deref(),
+        Some(said),
+        "the screen's own precondition"
+    );
+    let caret = rows
+        .iter()
+        .rposition(|r| r.starts_with('>'))
+        .expect("a caret row");
+    screen_json(&rows, (caret, 2), 20)
+}
+
+/// The carry-on a relaunch `rig` adopted (`after_exit` on the window's `hand_back`) owes at the
+/// loop's idle point, with the record's cause `cause` and `land` as the host passes it
+/// (`relaunch::resume_as`).
+fn carried(rig: &Rig, cause: &str, land: bool) -> Report {
+    let adopted = rig.attempt(&rig.snap(Some(C1)), &ExitRecord::Crashed, ExitCause::Exit);
+    assert_eq!(adopted.step, "adopted", "{adopted:?}");
+    assert_eq!(rig.continuations(), 0, "the window's relaunch types none");
+    carry_adopted(rig, cause, land)
+}
+
+/// Carry an adopted process after a test changes its later kernel or screen observations.
+fn carry_adopted(rig: &Rig, cause: &str, land: bool) -> Report {
+    let mut st = rig.state();
+    st.cause = cause.to_string();
+    let opts = Opts {
+        hand_back: false,
+        land,
+        ..rig.opts.clone()
+    };
+    carry_in_flight_with(
+        &opts,
+        Report {
+            pid: TUI,
+            tab: TAB.to_string(),
+            session: key(TAB),
+            from: VERSION.to_string(),
+            to: VERSION.to_string(),
+            step: String::new(),
+        },
+        st,
+        &key(TAB),
+        &rig.kernel,
+    )
+}
+
+/// AT THE LOOP'S IDLE POINT A AGY RELAUNCH NO STEP ADOPTED KEEPS ITS LANE'S OWN CARRY-ON:
+/// the late adoption there ([`crate::harness::relaunch::at_point`]) is Claude Code's lane's
+/// alone, so the agy that comes up only after the relaunch's own step gave up waiting for it
+/// (`wait:resume`) is carried on (`continued`, its continuation typed), not handed back.
+/// NEGATIVE CONTROL: a point read as a task done under Land hands it back (`adopted`, nothing
+/// typed). MUTANT: with `carried_here` out of `relaunch::unadopted`, the first case is adopted
+/// and types nothing.
+#[test]
+fn a_late_agy_relaunch_at_the_loops_point_keeps_its_own_carry_on() {
+    for done_under_land in [false, true] {
+        let case = format!("done under Land {done_under_land}");
+        let never = Knobs {
+            noappear: true,
+            ..Knobs::default()
+        };
+        let mut rig = relaunch_rig(&format!("point-late-{done_under_land}"), true, never);
+        rig.line_ran(None);
+        let gave_up = rig.attempt(&rig.snap(Some(C1)), &ExitRecord::Crashed, ExitCause::Exit);
+        assert_eq!(
+            gave_up.step, "wait:resume",
+            "PRECONDITION: {case}: {gave_up:?}"
+        );
+        let st = rig.state();
+        assert!(
+            matches!(st.phase, Phase::Relaunched { .. })
+                && st.relaunched_pid == 0
+                && st.resumed_pid == 0,
+            "PRECONDITION: {case}: no step adopted its agent: {st:?}"
+        );
+        assert_eq!(rig.lines(), 1, "PRECONDITION: {case}: the line typed");
+        // The agy comes up now, after its relaunch's own step gave up.
+        rig.kernel.knobs = Knobs::default();
+        rig.relaunched_shows(None, None);
+        let at = crate::harness::relaunch::at_point(
+            &Opts {
+                hand_back: false,
+                ..rig.opts.clone()
+            },
+            &st,
+            done_under_land,
+        );
+        let r = carry_in_flight_with(
+            &at,
+            Report {
+                pid: TUI,
+                tab: TAB.to_string(),
+                session: key(TAB),
+                from: VERSION.to_string(),
+                to: VERSION.to_string(),
+                step: String::new(),
+            },
+            st,
+            &key(TAB),
+            &rig.kernel,
+        );
+        let (step, continuations) = if done_under_land {
+            ("adopted", 0)
+        } else {
+            ("continued", 1)
+        };
+        assert_eq!((r.step.as_str(), r.pid), (step, NEW), "{case}: {r:?}");
+        assert_eq!(
+            rig.continuations(),
+            continuations,
+            "{case}: {:#?}",
+            rig.typed()
+        );
+        assert_eq!(rig.lines(), 1, "{case}: one relaunch line");
+    }
+}
+
+/// UNDER LAND A RELAUNCH IS CARRIED ON AS UNDER CRUISE (owner report 2026-11-01), whether the host
+/// passes Land (`Opts::land`) or the tab's status names it: one continuation that says the agent
+/// was restarted, and no done check of Cruise's ([`crate::harness::relaunch::carries_under_land`]).
+#[test]
+fn a_relaunch_under_land_is_carried_on_as_under_cruise() {
+    use crate::harness::relaunch::{CAUSE_EXIT, CAUSE_HOST, CAUSE_STALL};
+    let land_status = "OK schema=1 hold=0 hand=- integration=on autopilot=land";
+    for cause in [CAUSE_EXIT, CAUSE_HOST, CAUSE_STALL] {
+        for (land, by_status) in [(true, false), (false, true), (false, false)] {
+            let case = format!("cause `{cause}`, land {land}, by status {by_status}");
+            let rig = relaunch_rig(
+                &format!("land-{land}-{by_status}-{}", cause.len()),
+                true,
+                Knobs::default(),
+            );
+            if by_status {
+                rig.relaunched_shows(None, Some(land_status));
+            }
+            let r = carried(&rig, cause, land);
+            let st = rig.state();
+            assert_eq!(r.step, "continued", "{case}: {r:?}");
+            assert_eq!(rig.continuations(), 1, "{case}: {:#?}", rig.typed());
+            assert_eq!(st.phase, Phase::Done, "{case}");
+            assert_eq!(rig.lines(), 1, "{case}: one relaunch line");
+        }
+    }
+    // The relaunch the host carries at once (no window adoption) keeps the rule too.
+    for land in [true, false] {
+        let mut rig = relaunch_rig(&format!("land-direct-{land}"), false, Knobs::default());
+        rig.opts.land = land;
+        let r = rig.attempt(&rig.snap(Some(C1)), &ExitRecord::Crashed, ExitCause::Exit);
+        assert_eq!(r.step, "continued", "direct, land {land}: {r:?}");
+        assert_eq!(rig.continuations(), 1, "direct, land {land}");
+    }
+    for land in [true, false] {
+        let mut fresh = relaunch_rig(
+            &format!("land-direct-fresh-{land}"),
+            false,
+            Knobs {
+                new_lockless: true,
+                ..Knobs::default()
+            },
+        );
+        fresh.opts.land = land;
+        let r = fresh.attempt(&fresh.snap(Some(C1)), &ExitRecord::Crashed, ExitCause::Exit);
+        assert_eq!(
+            r.step, "refused:started-fresh",
+            "direct fresh, land {land}: {r:?}"
+        );
+        assert_eq!(fresh.continuations(), 0, "direct fresh, land {land}");
+    }
+    let mut unproved = Vec::new();
+    for (name, knobs, composer) in [
+        (
+            "other-foreground",
+            Knobs {
+                out_of_tab: true,
+                ..Knobs::default()
+            },
+            true,
+        ),
+        (
+            "lockless",
+            Knobs {
+                new_lockless: true,
+                ..Knobs::default()
+            },
+            true,
+        ),
+        (
+            "lock-unreadable",
+            Knobs {
+                holders_unreadable: true,
+                ..Knobs::default()
+            },
+            true,
+        ),
+        ("no-composer-holds-lock", Knobs::default(), false),
+        (
+            "no-composer-no-lock",
+            Knobs {
+                new_lockless: true,
+                ..Knobs::default()
+            },
+            false,
+        ),
+        (
+            "no-composer-process-gone",
+            Knobs {
+                new_dies: true,
+                ..Knobs::default()
+            },
+            false,
+        ),
+        (
+            "composer-process-gone",
+            Knobs {
+                new_dies: true,
+                ..Knobs::default()
+            },
+            true,
+        ),
+    ] {
+        let mut rig = relaunch_rig(name, true, Knobs::default());
+        let adopted = rig.attempt(&rig.snap(Some(C1)), &ExitRecord::Crashed, ExitCause::Exit);
+        assert_eq!(adopted.step, "adopted", "{name}: {adopted:?}");
+        rig.kernel.knobs = knobs;
+        if !composer {
+            rig.relaunched_shows(
+                Some(screen_json(&["Booting agy".to_string()], (0, 0), 20)),
+                None,
+            );
+        }
+        let r = carry_adopted(&rig, CAUSE_EXIT, true);
+        let st = rig.state();
+        assert_eq!(rig.continuations(), 0, "{name}: {:#?}", rig.typed());
+        if !matches!(st.phase, Phase::Relaunched { .. }) || !st.resumed_on.is_empty() {
+            unproved.push(format!("{name}: {} {:?}", r.step, st.phase));
+            continue;
+        }
+        if !rig.kernel.knobs.new_dies {
+            rig.kernel.knobs = Knobs::default();
+            rig.relaunched_shows(Some(agy_idle()), None);
+            let later = carry_adopted(&rig, CAUSE_EXIT, true);
+            assert_eq!(later.step, "continued", "{name}: later proof: {later:?}");
+            assert_eq!(rig.state().phase, Phase::Done, "{name}: later proof");
+        }
+    }
+    assert!(
+        unproved.is_empty(),
+        "Land must leave an unproved resume pending: {unproved:#?}"
+    );
+}
+
+/// AN AGY RELAUNCH INTO A DONE REPORT ASKS THE DONE CHECK, as Claude Code's does
+/// (`a_relaunch_into_a_done_report_in_words_asks_the_done_check`): the resumed conversation's last
+/// reply claims the work done, so the facts of the relaunch are typed with Cruise's done check
+/// (`continued:check`, the reversible clause where the claim names an irreversible act) in place
+/// of `upgrade::CARRY_ON`. NEGATIVE CONTROL: a reply of work going on still gets the carry-on.
+/// MUTANT: with `relaunch::said_on_screen` answering no claim, the done reports get the carry-on.
+#[test]
+fn a_relaunch_into_a_done_report_in_words_asks_the_done_check() {
+    use crate::harness::relaunch::{CAUSE_EXIT, CAUSE_HOST, CAUSE_STALL};
+    use crate::supervise::policy::turn_end::{DONE_CHECK, DONE_CHECK_REVERSIBLE, HostTurn};
+    let done = "All tasks are complete and verified; nothing is left to do.";
+    let forced = "All tasks are complete and verified. Should I force-push the rewritten history to \
+                  origin main?";
+    let going = "Committed the parser; the lexer is next.";
+    for cause in [CAUSE_EXIT, CAUSE_HOST, CAUSE_STALL] {
+        for (said, check, irreversible) in [
+            (done, true, false),
+            (forced, true, true),
+            (going, false, false),
+        ] {
+            let case = format!("cause `{cause}`: {said}");
+            let rig = relaunch_rig(
+                &format!("said-{}-{}", said.len(), cause.len()),
+                true,
+                Knobs::default(),
+            );
+            rig.relaunched_shows(Some(idle_saying(said)), None);
+            let r = carried(&rig, cause, false);
+            let typed: Vec<String> = rig
+                .typed()
+                .into_iter()
+                .filter(|l| l.contains(upgrade::HARNESS_MARK))
+                .collect();
+            assert_eq!(typed.len(), 1, "{case}: {:#?}", rig.typed());
+            assert!(typed[0].contains("Relaunched"), "{case}: the facts kept");
+            if check {
+                assert_eq!(r.step, "continued:check", "{case}: {r:?}");
+                assert!(typed[0].contains(DONE_CHECK), "{case}: {typed:?}");
+                assert!(!typed[0].contains(upgrade::CARRY_ON), "{case}: {typed:?}");
+                assert_eq!(
+                    typed[0].contains(DONE_CHECK_REVERSIBLE),
+                    irreversible,
+                    "{case}: {typed:?}"
+                );
+                assert_eq!(
+                    super::super::host_turn(&r.step),
+                    Some(HostTurn::Check),
+                    "{case}"
+                );
+            } else {
+                assert_eq!(r.step, "continued", "{case}: {r:?}");
+                assert!(typed[0].contains(upgrade::CARRY_ON), "{case}: {typed:?}");
+                assert_eq!(
+                    super::super::host_turn(&r.step),
+                    Some(HostTurn::CarryOn),
+                    "{case}"
+                );
+            }
+        }
+    }
+}
+
+/// A row of a conversation's transcript: `prompt` said, dated past any test's relaunch.
+fn transcript_told(transcript: &Path, prompt: &str) {
+    use std::io::Write as _;
+    std::fs::create_dir_all(transcript.parent().expect("logs")).expect("logs");
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(transcript)
+        .expect("the transcript");
+    writeln!(
+        file,
+        r#"{{"step_index":9,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2099-01-01T00:00:00Z","content":"<USER_REQUEST>\n{prompt} go\n</USER_REQUEST>"}}"#
+    )
+    .expect("a row");
+}
+
+/// The relaunch a step adopted, its carry-on still owed.
+fn adopted(name: &str) -> Rig {
+    let rig = relaunch_rig(name, true, Knobs::default());
+    let r = rig.attempt(&rig.snap(Some(C1)), &ExitRecord::Crashed, ExitCause::Exit);
+    assert_eq!(r.step, "adopted", "{name}: {r:?}");
+    assert_eq!(
+        rig.continuations(),
+        0,
+        "{name}: the window's relaunch types none"
+    );
+    rig
+}
+
+/// WHAT STANDS AT THE COMPOSER KEEPS THE CARRY-ON OWED, UNDER CRUISE AND LAND ALIKE: each of a
+/// person's draft, a box, a busy agent, Off and a person's grace ends the look on its own word with
+/// nothing typed and the record still `Relaunched`, and the same look with it gone types the
+/// carry-on once. MUTANT: with the words of `relaunch::settled_for_carry` read as `false`, a draft
+/// reads as `wait:unsettled`; with any arm of the look's holds removed, its case types.
+#[test]
+fn what_stands_at_the_composer_keeps_the_carry_on_owed() {
+    use crate::harness::relaunch::CAUSE_EXIT;
+    use aterm_phase::agy::fixtures as fx;
+    let person = "OK schema=1 hold=0 hand=- integration=on human_ms=400";
+    let off = "OK schema=1 hold=0 hand=- integration=on autopilot=off";
+    let cases: [(&str, Option<String>, Option<&str>); 5] = [
+        ("wait:draft", Some(at_caret(fx::DRAFT)), None),
+        ("wait:box", Some(at_caret(fx::BOX_EXEC)), None),
+        ("wait:unsettled", Some(at_caret(fx::BUSY)), None),
+        ("wait:off", None, Some(off)),
+        ("wait:held", None, Some(person)),
+    ];
+    for land in [false, true] {
+        for (word, screen, status) in &cases {
+            let case = format!("{word}, land {land}");
+            let rig = adopted(&format!("stands-{}-{land}", word.len()));
+            rig.relaunched_shows(screen.clone(), *status);
+            let r = carry_adopted(&rig, CAUSE_EXIT, land);
+            assert_eq!(r.step, *word, "{case}: {r:?}");
+            assert!(
+                matches!(rig.state().phase, Phase::Relaunched { .. }),
+                "{case}: still owed"
+            );
+            assert_eq!(rig.continuations(), 0, "{case}: {:#?}", rig.typed());
+            rig.relaunched_shows(None, None);
+            let r = carry_adopted(&rig, CAUSE_EXIT, land);
+            assert_eq!(r.step, "continued", "{case}: cleared: {r:?}");
+            assert_eq!(rig.continuations(), 1, "{case}: {:#?}", rig.typed());
+        }
+    }
+}
+
+/// A CARRY-ON OWED OUTLIVES THE RELAUNCH'S STALE BOUND WHILE ITS AGENT IS UP: a draft standing past
+/// five minutes is still `wait:draft`, and its clearing still carries on. NEGATIVE CONTROL: the
+/// agent gone, the same age is `failed:no-resume`. MUTANT: without `relaunch_present` in `expired`,
+/// the aged draft reads `failed:no-resume`.
+#[test]
+fn a_carry_on_owed_outlives_the_stale_bound_while_its_agent_is_up() {
+    use crate::harness::relaunch::CAUSE_EXIT;
+    use aterm_phase::agy::fixtures as fx;
+    for land in [false, true] {
+        let rig = adopted(&format!("aged-{land}"));
+        rig.relaunch_aged(STALE_S + 1);
+        rig.relaunched_shows(Some(at_caret(fx::DRAFT)), None);
+        let r = carry_adopted(&rig, CAUSE_EXIT, land);
+        assert_eq!(r.step, "wait:draft", "land {land}: {r:?}");
+        assert!(matches!(rig.state().phase, Phase::Relaunched { .. }));
+        rig.relaunched_shows(None, None);
+        let r = carry_adopted(&rig, CAUSE_EXIT, land);
+        assert_eq!(r.step, "continued", "land {land}: {r:?}");
+        assert_eq!(rig.continuations(), 1, "land {land}: {:#?}", rig.typed());
+    }
+    let mut gone = adopted("aged-gone");
+    gone.relaunch_aged(STALE_S + 1);
+    gone.kernel.knobs.new_dies = true;
+    gone.kernel.knobs.noappear = true;
+    gone.relaunched_shows(Some(shell_after()), None);
+    let r = carry_adopted(&gone, CAUSE_EXIT, false);
+    assert_eq!(r.step, "failed:no-resume", "{r:?}");
+    assert_eq!(gone.continuations(), 0);
+}
+
+/// A DRAFT THAT APPEARS AS THE LOOK GOES ON IS STILL A DRAFT: past the settling reads, at each read
+/// the look takes, the word is `wait:draft` and the carry-on stays owed, never given up as
+/// `done:no-continue`; and three fences that moved before the line was typed are `wait:unsettled`.
+/// NEGATIVE CONTROL: no draft types once. MUTANT: a fence's `Err` read as the end of the tries gives
+/// `done:no-continue` at the last settling read's successors.
+#[test]
+fn a_draft_begun_as_the_look_goes_on_keeps_the_carry_on_owed() {
+    use crate::harness::relaunch::CAUSE_EXIT;
+    use aterm_phase::agy::fixtures as fx;
+    for from in 1..=8 {
+        let rig = adopted(&format!("late-draft-{from}"));
+        rig.shows_from(from, at_caret(fx::DRAFT));
+        let r = carry_adopted(&rig, CAUSE_EXIT, false);
+        let typed = rig.continuations();
+        if typed == 0 {
+            assert_eq!(r.step, "wait:draft", "read {from}: {r:?}");
+            assert!(matches!(rig.state().phase, Phase::Relaunched { .. }));
+        } else {
+            assert_eq!(
+                r.step, "continued",
+                "read {from}: past the look's reads: {r:?}"
+            );
+        }
+    }
+    let late = adopted("late-draft-none");
+    let r = carry_adopted(&late, CAUSE_EXIT, false);
+    assert_eq!(r.step, "continued", "{r:?}");
+    let moved = adopted("late-moved");
+    moved.on_harness_line(Some("OK 0 turn skipped reason=changed"), false);
+    let r = carry_adopted(&moved, CAUSE_EXIT, false);
+    assert_eq!(r.step, "wait:unsettled", "{r:?}");
+    assert!(matches!(moved.state().phase, Phase::Relaunched { .. }));
+}
+
+/// A CARRY-ON LEFT UNANSWERED IS READ FOR WHAT IT DID, NOT TYPED AGAIN: the conversation's
+/// transcript showing the line within the look is `continued`; not showing it is `wait:unanswered`,
+/// and at the next look, showing it now, `done:carried`. Each is one line typed. MUTANT: with
+/// `Unanswered` read as nothing typed, the first case ends `wait:no-socket` and each second look
+/// types it again; with `prompts_since` reading through the excerpt's cleaner, no line is seen.
+#[test]
+fn a_carry_on_left_unanswered_is_read_for_what_it_did() {
+    use crate::harness::relaunch::CAUSE_EXIT;
+    let muted = |rig: &mut Rig| {
+        rig.opts.timings.drive_reply = Duration::from_millis(200);
+    };
+    let mut reached = adopted("unanswered-reached");
+    muted(&mut reached);
+    reached.on_harness_line(Some(crate::harness::UNANSWERED), true);
+    let r = carry_adopted(&reached, CAUSE_EXIT, false);
+    assert_eq!(r.step, "continued", "{r:?}");
+    assert_eq!(reached.continuations(), 1, "{:#?}", reached.typed());
+    let mut later = adopted("unanswered-later");
+    muted(&mut later);
+    later.on_harness_line(Some(crate::harness::UNANSWERED), false);
+    let r = carry_adopted(&later, CAUSE_EXIT, false);
+    assert_eq!(r.step, "wait:unanswered", "{r:?}");
+    assert_eq!(later.continuations(), 1, "{:#?}", later.typed());
+    assert!(matches!(later.state().phase, Phase::Relaunched { .. }));
+    later.on_harness_line(None, false);
+    transcript_told(&later.transcript(), upgrade::HARNESS_MARK);
+    let r = carry_adopted(&later, CAUSE_EXIT, false);
+    assert_eq!(r.step, "done:carried", "{r:?}");
+    assert_eq!(later.continuations(), 1, "{:#?}", later.typed());
+}
+
+/// WHAT REACHED THE CONVERSATION FIRST IS READ OFF ITS TRANSCRIPT, NOT OFF A KEY OR A GESTURE: a
+/// person's gesture since the relaunch, past their grace, leaves the carry-on owed (`continued`); a message of
+/// theirs since the relaunch is `done:left`, naming them; a line of the harness's is `done:carried`.
+/// MUTANT: the gesture alone read as a message (`human_ms=` as `person_keyed_since` read it) is
+/// `done:left` in the first case.
+#[test]
+fn what_reached_the_conversation_first_is_read_off_its_transcript() {
+    use crate::harness::relaunch::{CAUSE_EXIT, PERSON_FIRST};
+    let gestured = "OK schema=1 hold=0 hand=- integration=on human_ms=130000 human_typed_ms=-";
+    for land in [false, true] {
+        let rig = adopted(&format!("gesture-{land}"));
+        rig.relaunch_aged(200);
+        rig.relaunched_shows(None, Some(gestured));
+        let r = carry_adopted(&rig, CAUSE_EXIT, land);
+        assert_eq!(r.step, "continued", "land {land}: {r:?}");
+        assert_eq!(rig.continuations(), 1, "land {land}");
+        let told = adopted(&format!("told-{land}"));
+        transcript_told(&told.transcript(), "fix the tests");
+        let r = carry_adopted(&told, CAUSE_EXIT, land);
+        assert_eq!(r.step, "done:left", "land {land}: {r:?}");
+        assert!(told.state().outcome.contains(PERSON_FIRST), "land {land}");
+        assert_eq!(told.continuations(), 0, "land {land}");
+        let ours = adopted(&format!("ours-{land}"));
+        transcript_told(&ours.transcript(), upgrade::HARNESS_MARK);
+        let r = carry_adopted(&ours, CAUSE_EXIT, land);
+        assert_eq!(r.step, "done:carried", "land {land}: {r:?}");
+        assert_eq!(ours.continuations(), 0, "land {land}");
+    }
+}
+
+/// A RELAUNCH UNDER LAND WHOSE LAST REPLY DEFENDS THE WORK TYPES NOTHING: the loop's land check
+/// reads the defense (`done:landing`, whose step moves nothing). NEGATIVE CONTROLS: the same reply
+/// under Cruise gets its done check; a reply of work going on under Land gets the carry-on. MUTANT:
+/// without `defended_on_screen`'s arm, the defense under Land is typed the restart's facts, which
+/// the land check then reads as a new turn.
+#[test]
+fn a_relaunch_under_land_into_a_defense_leaves_it_to_the_land_check() {
+    use crate::harness::relaunch::CAUSE_EXIT;
+    let defense = "Nothing left: all of it is merged into the remote main branch.";
+    let rig = adopted("defended-land");
+    rig.relaunched_shows(Some(idle_saying(defense)), None);
+    let r = carry_adopted(&rig, CAUSE_EXIT, true);
+    assert_eq!(r.step, crate::harness::relaunch::LANDING, "{r:?}");
+    assert_eq!(rig.continuations(), 0, "{:#?}", rig.typed());
+    assert_eq!(rig.state().phase, Phase::Done);
+    assert!(
+        !super::super::moved(&r.step),
+        "the loop's check runs at this point"
+    );
+    let cruise = adopted("defended-cruise");
+    cruise.relaunched_shows(Some(idle_saying(defense)), None);
+    let r = carry_adopted(&cruise, CAUSE_EXIT, false);
+    assert_eq!(r.step, "continued:check", "{r:?}");
+    assert_eq!(cruise.continuations(), 1);
+    let going = adopted("going-land");
+    going.relaunched_shows(
+        Some(idle_saying("Committed the parser; the lexer is next.")),
+        None,
+    );
+    let r = carry_adopted(&going, CAUSE_EXIT, true);
+    assert_eq!(r.step, "continued", "{r:?}");
+    assert_eq!(going.continuations(), 1);
 }

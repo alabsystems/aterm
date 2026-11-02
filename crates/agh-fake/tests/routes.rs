@@ -524,7 +524,11 @@ fn the_web_download_hops_to_the_cdn_only_for_a_published_public_release() {
         ))
     );
     let cdn = format!("http://127.0.0.1:{}/assets/{slashed_id}?sig=", ports.cdn);
-    for p in [path, "/fixture-dev/app/releases/download/pkg/v1/a%20b.bin"] {
+    for p in [
+        path,
+        "/fixture-dev/app/releases/download/pkg/v1/a%20b.bin",
+        "/fixture%2Ddev/ap%70/releases/download/pkg%2Fv1/a%20b.bin",
+    ] {
         let hop = web(p, "GET");
         assert_eq!(hop.status, 302, "{p}");
         assert!(

@@ -115,13 +115,19 @@ impl DriftArgs {
     /// Parse `[max_runs=<k>] [rows=<n>] [seed=auto|alt|primary]` (any order).
     pub fn parse(rest: &str) -> Result<Self, &'static str> {
         let mut args = Self::default();
+        let dec = |v: &str| {
+            (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| v.parse::<usize>().ok())
+                .flatten()
+                .ok_or(USAGE)
+        };
         for tok in rest.split_whitespace() {
             let (key, value) = tok.split_once('=').ok_or(USAGE)?;
             match key {
                 "max_runs" => {
-                    args.max_runs = value.parse::<usize>().map_err(|_| USAGE)?.min(MAX_RUNS);
+                    args.max_runs = dec(value)?.min(MAX_RUNS);
                 }
-                "rows" => args.list_rows = Some(value.parse::<usize>().map_err(|_| USAGE)?),
+                "rows" => args.list_rows = Some(dec(value)?),
                 "seed" => {
                     args.seed = match value {
                         "auto" => Seed::Auto,
@@ -2401,5 +2407,7 @@ mod tests {
             plain.ends_with(" ms=0 computed=client") && !plain.contains("carried="),
             "{plain}"
         );
+        assert!(DriftArgs::parse("max_runs=+5").is_err());
+        assert!(DriftArgs::parse("rows=+5").is_err());
     }
 }

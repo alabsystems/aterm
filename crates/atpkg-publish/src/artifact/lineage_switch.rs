@@ -4,7 +4,10 @@
 //! Reads the lineage receipt switch from the trust repository's live `origin/main`.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
+
+static SWITCH_SEQ: AtomicU64 = AtomicU64::new(0);
 
 use crate::ctx::Ctx;
 use crate::error::Result;
@@ -216,7 +219,8 @@ fn note_live(repo: &Path, live: &str) {
     if std::fs::read_to_string(&note).is_ok_and(|s| s.lines().next() == Some(live)) {
         return;
     }
-    let tmp = note.with_extension(format!("{}", std::process::id()));
+    let seq = SWITCH_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = note.with_extension(format!("{}.{seq}", std::process::id()));
     if std::fs::write(&tmp, format!("{live}\n")).is_err() || std::fs::rename(&tmp, &note).is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -250,8 +254,9 @@ fn quarantined_fetch(repo: &Path) -> std::result::Result<(), Bounded> {
         tips.push(format!("--negotiation-tip={noted}"));
     }
     sweep_quarantines(&od);
+    let seq = SWITCH_SEQ.fetch_add(1, Ordering::Relaxed);
     let q = Quarantine(od.join(format!(
-        "{QUARANTINE_PREFIX}{}.{}",
+        "{QUARANTINE_PREFIX}{}.{}.{seq}",
         std::process::id(),
         SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -303,6 +308,7 @@ fn sweep_quarantines(od: &Path) {
             .file_name()
             .to_string_lossy()
             .starts_with(QUARANTINE_PREFIX)
+            && e.file_type().is_ok_and(|ft| ft.is_dir())
             && e.metadata()
                 .and_then(|m| m.modified())
                 .ok()
@@ -327,7 +333,7 @@ fn adopt(q: &Path, od: &Path) -> std::io::Result<()> {
             .iter()
             .filter(|n| n.starts_with("pack-") && n.ends_with(".idx"))
         {
-            let base = idx.trim_end_matches(".idx");
+            let base = idx.strip_suffix(".idx").unwrap_or(idx);
             if od.join("pack").join(idx).exists() {
                 continue;
             }

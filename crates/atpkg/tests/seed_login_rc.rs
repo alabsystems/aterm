@@ -54,6 +54,7 @@ impl Fixture {
             None => seed.env_remove("ATERM_STATE_HOME"),
         };
         seed.env("HOME", &self.home)
+            .env_remove("ZDOTDIR")
             .env("XDG_CONFIG_HOME", self.home.join(".config"))
             .env("XDG_STATE_HOME", self.home.join(".local/state"))
             .env(atpkg::hooks::LOGIN_SHELL_SEAM, login)
@@ -137,6 +138,7 @@ fn repair_rc(home: &Path, login: &'static str) -> Vec<aterm_converge::ItemReport
         home: Some(home.to_path_buf()),
         exe: None,
         rustup_home: None,
+        zsh: Default::default(),
         login_rc: Some(login),
         pass: Pass::Repair,
         reads: Default::default(),
@@ -277,6 +279,60 @@ fn shell_setup_elects_the_login_shell_s_rc_never_shell() {
         ".bashrc"
     };
     assert_eq!(fx.rc_files(), [bash_rc], "{text}");
+}
+
+/// A pass with no shell's environment (the app's, opened from Finder or by launchd, has no
+/// `ZDOTDIR`) learns zsh's folder from the zshenv file a person sets it in, so shell-setup's
+/// PATH block lands in `$ZDOTDIR/.zshrc`, the file zsh reads, and `~/.zshrc` is never made
+/// (round 13). The control is [`shell_setup_elects_the_login_shell_s_rc_never_shell`]: no
+/// zshenv, `~/.zshrc`.
+#[test]
+fn shell_setup_with_no_zdotdir_in_its_environment_reads_zsh_s_zshenv() {
+    let fx = Fixture::new("shell-setup-zshenv");
+    std::fs::create_dir_all(fx.home.join("zdot")).unwrap();
+    std::fs::write(fx.rc(".zshenv"), "export ZDOTDIR=\"$HOME/zdot\"\n").unwrap();
+    let out = fx.shell_setup("/bin/zsh", "/bin/bash");
+    let text = describe(&out);
+    assert!(out.status.success(), "{text}");
+    assert_eq!(fx.rc_files(), Vec::<&str>::new(), "no ~/.zshrc: {text}");
+    let zshrc = std::fs::read_to_string(fx.rc("zdot/.zshrc"))
+        .unwrap_or_else(|e| panic!("no $ZDOTDIR/.zshrc ({e}): {text}"));
+    assert!(
+        zshrc.contains(atpkg::selfsetup::PATH_BLOCK_START),
+        "{zshrc:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout)
+            .contains(&format!("in {}", fx.rc("zdot/.zshrc").display())),
+        "it names the file it edited: {text}"
+    );
+}
+
+/// The seed, the pass the app runs at its first launch with no shell's environment, creates
+/// the login rc zsh reads under the `ZDOTDIR` its zshenv sets, holding atpkg's block, and says
+/// so; `~/.zshrc` is never made (round 13: it was, and a new zsh sourced no hook). The control
+/// is [`seed_creates_the_login_shell_s_rc_alone_and_never_reads_shell`]: no zshenv, `~/.zshrc`.
+#[test]
+fn the_seed_with_no_zdotdir_in_its_environment_wires_the_zshrc_zsh_reads() {
+    needs_a_pinned_root();
+    let fx = Fixture::new("seed-zshenv");
+    std::fs::create_dir_all(fx.home.join("zdot")).unwrap();
+    std::fs::write(fx.rc(".zshenv"), "export ZDOTDIR=\"$HOME/zdot\"\n").unwrap();
+    let out = fx.seed("/bin/zsh", "/bin/bash");
+    let text = describe(&out);
+    assert!(out.status.success(), "{text}");
+    assert_eq!(fx.rc_files(), Vec::<&str>::new(), "no ~/.zshrc: {text}");
+    let zshrc = std::fs::read_to_string(fx.rc("zdot/.zshrc"))
+        .unwrap_or_else(|e| panic!("no $ZDOTDIR/.zshrc ({e}): {text}"));
+    assert!(
+        zshrc.starts_with("# >>> atpkg shell integration >>>")
+            && zshrc.contains(".aterm/shell.d/00-atpkg.zsh"),
+        "{zshrc:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("atpkg: created ~/zdot/.zshrc"),
+        "the seed names the file it made: {text}"
+    );
 }
 
 /// The seed reads the Command Line Tools without running anything (design init-system §4.2

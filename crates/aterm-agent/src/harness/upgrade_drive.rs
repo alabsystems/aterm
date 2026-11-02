@@ -48,6 +48,14 @@ mod watch;
 mod build_start;
 pub use build_start::BUILD_FAILS;
 #[cfg(all(test, unix))]
+pub(super) fn first_exec_probe_for_test(
+    exe: &std::path::Path,
+    limit: std::time::Duration,
+    holds: &std::path::Path,
+) -> &'static str {
+    build_start::probe_within(exe, limit, Some(holds)).word()
+}
+#[cfg(all(test, unix))]
 pub(crate) use upgrade_status::pin_awake_since;
 #[cfg(any(test, debug_assertions))]
 pub use upgrade_status::progress_projection;
@@ -845,9 +853,9 @@ pub(super) fn ids(pid: u32) -> Option<(u32, i64, i64)> {
         let out = ps(&["-o", "ppid=,pgid=,tpgid=", "-p", &pid.to_string()])?;
         let mut it = out.split_whitespace();
         Some((
-            it.next()?.parse().ok()?,
-            it.next()?.parse().ok()?,
-            it.next()?.parse().ok()?,
+            crate::parse_uint(it.next()?)?,
+            crate::parse_int(it.next()?)?,
+            crate::parse_int(it.next()?)?,
         ))
     }
 }
@@ -973,8 +981,8 @@ fn ps_table() -> Vec<ProcRow> {
     out.lines()
         .filter_map(|l| {
             let mut it = l.split_whitespace();
-            let pid = it.next()?.parse().ok()?;
-            let ppid = it.next()?.parse().ok()?;
+            let pid = crate::parse_uint(it.next()?)?;
+            let ppid = crate::parse_uint(it.next()?)?;
             Some((
                 pid,
                 ppid,
@@ -1046,8 +1054,8 @@ fn tty_table() -> Vec<(u32, u32, String, String)> {
     out.lines()
         .filter_map(|l| {
             let mut it = l.split_whitespace();
-            let pid = it.next()?.parse().ok()?;
-            let ppid = it.next()?.parse().ok()?;
+            let pid = crate::parse_uint(it.next()?)?;
+            let ppid = crate::parse_uint(it.next()?)?;
             let tty = it.next()?.to_string();
             Some((pid, ppid, tty, base_name(&it.collect::<Vec<_>>().join(" "))))
         })
@@ -1105,21 +1113,19 @@ fn opener(agent: u32, parent: u32) -> Option<String> {
 
 #[cfg(any(not(target_os = "macos"), test))]
 fn ps_opener(agent: u32, parent: u32) -> Option<String> {
-    let out = ps(&[
-        "-o",
-        &format!("pid=,{PS_TTY}=,comm="),
-        "-p",
-        &format!("{agent},{parent}"),
-    ])?;
-    let rows: Vec<(u32, String, String)> = out
-        .lines()
-        .filter_map(|l| {
+    // One pid per `ps`: asked for two or more at once, a `ps` whose own device read is
+    // wedged never returns, while each pid asked alone answers — the oracle is the same
+    // `ps`, read a pid at a time.
+    let mut rows: Vec<(u32, String, String)> = Vec::new();
+    for p in [agent, parent] {
+        let out = ps(&["-o", &format!("pid=,{PS_TTY}=,comm="), "-p", &p.to_string()])?;
+        rows.extend(out.lines().filter_map(|l| {
             let mut it = l.split_whitespace();
-            let pid = it.next()?.parse().ok()?;
+            let pid = crate::parse_uint(it.next()?)?;
             let tty = it.next()?.to_string();
             Some((pid, tty, base_name(&it.collect::<Vec<_>>().join(" "))))
-        })
-        .collect();
+        }));
+    }
     let row = |p: u32| rows.iter().find(|(q, _, _)| *q == p);
     let (_, tty, _) = row(agent)?;
     if !tty.chars().any(|c| c.is_ascii_digit()) {
@@ -1293,6 +1299,18 @@ pub(super) fn background(pid: u32, t: &[ProcRow]) -> Vec<String> {
         .collect()
 }
 
+/// The agent's own work a restart would end: the shells under it ([`background`]), and the work
+/// Claude Code's own words say runs in its own process, which no process row names: its status
+/// row's `Waiting for …`, the wait it carries above its own wake, a done row's `… still running`
+/// ([`aterm_phase::phase::in_process_work`], read whatever rule the reader reads first).
+pub(super) fn own_work(pid: u32, t: &[ProcRow], rows: &[String]) -> Vec<String> {
+    let mut work = background(pid, t);
+    if let Some(rule) = aterm_phase::phase::in_process_work(rows) {
+        work.push(format!("screen:{}", rule.replace(' ', "-")));
+    }
+    work
+}
+
 pub(super) fn background_procs(pid: u32, t: &[ProcRow]) -> Vec<(u32, String)> {
     let mut frontier = vec![pid];
     let mut found = Vec::new();
@@ -1361,13 +1379,26 @@ pub(super) fn held_of(agent: u32, procs: &[(u32, String)]) -> Vec<upgrade::Held>
 
 #[cfg(any(not(target_os = "macos"), test))]
 fn ps_held_of(agent: u32, procs: &[(u32, String)]) -> Vec<upgrade::Held> {
-    let list = procs
-        .iter()
-        .map(|(p, _)| p.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-    let Some(out) = ps(&["-o", "pid=,ppid=,etime=,args=", "-p", &list]) else {
-        return Vec::new();
+    // On macOS this is only the tests' oracle (production reads the kernel), and there
+    // `ps` is read a pid at a time, as in [`ps_opener`]: asked for a list at once, a
+    // `ps` whose own device read is wedged never returns at all. Elsewhere one call
+    // reads the whole list, as it always has.
+    let out = if cfg!(target_os = "macos") {
+        procs
+            .iter()
+            .filter_map(|(p, _)| ps(&["-o", "pid=,ppid=,etime=,args=", "-p", &p.to_string()]))
+            .collect::<Vec<_>>()
+            .join("")
+    } else {
+        let list = procs
+            .iter()
+            .map(|(p, _)| p.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let Some(out) = ps(&["-o", "pid=,ppid=,etime=,args=", "-p", &list]) else {
+            return Vec::new();
+        };
+        out
     };
     procs
         .iter()
@@ -1377,7 +1408,7 @@ fn ps_held_of(agent: u32, procs: &[(u32, String)]) -> Vec<upgrade::Held> {
                 .find(|l| l.split_whitespace().next() == Some(p.to_string().as_str()))?;
             let mut it = line.split_whitespace();
             let _ = it.next();
-            let ppid: u32 = it.next()?.parse().ok()?;
+            let ppid: u32 = crate::parse_uint(it.next()?)?;
             let age_s = parse_etime(it.next()?)?;
             let args = it.collect::<Vec<_>>().join(" ");
             Some(upgrade::Held {
@@ -1441,12 +1472,12 @@ pub(super) fn gave_up_words(agent: upgrade::Agent, held: &[upgrade::Held], quiet
 #[cfg(any(not(target_os = "macos"), test))]
 pub(super) fn parse_etime(etime: &str) -> Option<u64> {
     let (days, clock) = match etime.split_once('-') {
-        Some((d, rest)) => (d.parse::<u64>().ok()?, rest),
+        Some((d, rest)) => (crate::parse_uint::<u64>(d)?, rest),
         None => (0, etime),
     };
     let parts = clock
         .split(':')
-        .map(|p| p.parse::<u64>().ok())
+        .map(crate::parse_uint::<u64>)
         .collect::<Option<Vec<_>>>()?;
     let (h, m, sec) = match parts.as_slice() {
         [m, sec] => (0, *m, *sec),
@@ -1513,7 +1544,9 @@ pub(super) fn file_holders(file: &Path) -> Option<Vec<u32>> {
 #[cfg(all(test, target_os = "macos"))]
 pub(super) fn lsof_holders(file: &Path, pids: &[u32]) -> Option<Vec<u32>> {
     let list: Vec<String> = pids.iter().map(u32::to_string).collect();
-    let mut cmd = aterm_uds::spawnfd::command(aterm_uds::os_path!("lsof"));
+    let mut cmd = aterm_uds::spawnfd::command(aterm_uds::deadline::stand_in(Path::new(
+        aterm_uds::os_path!("lsof"),
+    )));
     cmd.args(["-n", "-P", "-t", "-a", "-p", &list.join(","), "--"])
         .arg(file);
     let now = Instant::now();
@@ -1699,23 +1732,33 @@ enum Probed {
     TimedOut,
 }
 
-fn version_of(exe: &Path) -> Probed {
-    version_within(exe, VERSION_WAIT)
+fn version_of(exe: &Path, holds: &Path) -> Probed {
+    version_within(exe, VERSION_WAIT, Some(holds))
 }
 
-fn version_within(exe: &Path, limit: Duration) -> Probed {
+/// `<exe> --version` within `limit`, its process group killed whole at the bound; the program is
+/// held from before its start until it exits with a code of its own or never started
+/// ([`super::first_exec::hold`], under `holds` unless atpkg's store holds it), and with no
+/// `holds` not held.
+fn version_within(exe: &Path, limit: Duration, holds: Option<&Path>) -> Probed {
     let now = Instant::now();
     let deadline = now
         .checked_add(limit)
         .unwrap_or_else(|| now + Duration::from_secs(3600));
-    let mut cmd = aterm_uds::spawnfd::command(exe);
-    cmd.arg("--version")
-        .stdin(aterm_uds::spawnfd::Stdio::null())
+    let Ok(super::first_exec::Prepared {
+        command: mut cmd,
+        mut hold,
+    }) = super::first_exec::prepare(exe, holds, super::first_exec::ProbeWord::Version)
+    else {
+        return Probed::TimedOut;
+    };
+    cmd.stdin(aterm_uds::spawnfd::Stdio::null())
         .stdout(aterm_uds::spawnfd::Stdio::piped())
         .stderr(aterm_uds::spawnfd::Stdio::null());
     #[cfg(unix)]
     cmd.process_group(0);
     let Ok(mut child) = cmd.spawn() else {
+        super::first_exec::never_started(&mut hold);
         return Probed::NoVersion;
     };
     #[cfg(unix)]
@@ -1767,7 +1810,13 @@ fn version_within(exe: &Path, limit: Duration) -> Probed {
     };
     let succeeded = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break status.success(),
+            Ok(Some(status)) => {
+                // a signal's end shows nothing of a run: the hold stands
+                if status.code().is_some() {
+                    super::first_exec::ran(&mut hold);
+                }
+                break status.success();
+            }
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
             _ => {
                 kill_group();
@@ -1828,11 +1877,14 @@ pub(super) struct Targets {
 }
 
 impl Targets {
-    pub(super) fn read(home: &Path) -> Targets {
+    /// The targets under `opts.home`, each program a version is asked of held until it exited
+    /// with a code of its own ([`super::first_exec`]).
+    pub(super) fn read(opts: &Opts) -> Targets {
+        let holds = super::first_exec::holds_dir(&opts.state);
         Targets::read_with(
             atpkg::store::resolve_configured().and_then(|layout| managed_twin(&layout, "claude")),
-            home,
-            cached_version,
+            &opts.home,
+            |exe| cached_version(exe, &holds),
         )
     }
 
@@ -1898,8 +1950,8 @@ enum Asked {
     Unanswered,
 }
 
-fn cached_version(exe: &Path) -> Asked {
-    cached_version_with(exe, Instant::now(), version_of)
+fn cached_version(exe: &Path, holds: &Path) -> Asked {
+    cached_version_with(exe, Instant::now(), |exe| version_of(exe, holds))
 }
 
 fn cached_version_with(exe: &Path, now: Instant, probe: impl FnOnce(&Path) -> Probed) -> Asked {
@@ -1968,7 +2020,8 @@ pub(super) fn connect_at(opts: &Opts, sock: &str) -> Result<Client, String> {
         .token
         .as_ref()
         .filter(|_| opts.sock.as_deref() == Some(sock));
-    let c = harness_client(sock, token).map_err(|e| format!("{sock}: {e}"))?;
+    let c = harness_client_within(sock, token, opts.timings.drive_reply)
+        .map_err(|e| format!("{sock}: {e}"))?;
     Ok(if opts.dry_run { c.reads_only() } else { c })
 }
 
@@ -1992,28 +2045,100 @@ impl std::fmt::Debug for HarnessToken {
 }
 
 /// A connection to `sock` that presents `token`, probed with `version`. A token the server
-/// refuses (`ERR auth`, or the connection it closed on the refusal) is replaced once by the token
+/// refuses (`ERR auth`, or a connection closed before any probe reply) is replaced once by the token
 /// beside the socket, every client's: a seamless successor that rebound the socket knows only
-/// its own. `None` presents the token beside the socket, unprobed.
+/// its own. `None` presents the token beside the socket, unprobed. Every exchange on it, the
+/// probe first, is bounded by the build's [`super::Timings::drive_reply`]
+/// ([`harness_client_within`]).
 /// # Errors
 /// The socket could not be reached, the token beside it read, or the probe's reply read.
+/// A partial or malformed reply is an error, never evidence for authentication fallback.
 pub fn harness_client(sock: &str, token: Option<&HarnessToken>) -> std::io::Result<Client> {
+    harness_client_within(sock, token, super::Timings::for_build().drive_reply)
+}
+
+/// [`harness_client`] with each validated request/reply exchange bounded by `wait`
+/// ([`RelayClient::bounded`]). An unanswered probe or later request is an error, and the
+/// connection refuses every request after it ([`RelayClient::reply_unread`]). A caller reads that
+/// as the socket's silence and asks again at its next step, on a new connection: a carry that
+/// typed nothing waits (`wait:no-socket`), a typed line left unanswered is read for what it did
+/// ([`Typed::Unanswered`]), and nothing is recorded as the server's answer. Socket dialing,
+/// token-file reading and the initial AUTH write remain separate connection setup; this is not
+/// a measured total connection-establishment bound.
+/// # Errors
+/// As [`harness_client`], and a probe unanswered within `wait`.
+pub fn harness_client_within(
+    sock: &str,
+    token: Option<&HarnessToken>,
+    wait: Duration,
+) -> std::io::Result<Client> {
+    let beside = || RelayClient::connect_local_beside(sock).map(|c| c.bounded(wait));
     let Some(token) = token else {
-        return RelayClient::connect_local_beside(sock);
+        return beside();
     };
-    let mut c = RelayClient::connect_local(sock, &token.0)?;
-    match c.request_counted("version") {
-        Ok((head, _)) if head == "ERR auth" => RelayClient::connect_local_beside(sock),
+    probe_client(
+        RelayClient::connect_local(sock, &token.0)?.bounded(wait),
+        beside,
+    )
+}
+
+fn probe_client(
+    mut c: Client,
+    beside: impl FnOnce() -> std::io::Result<Client>,
+) -> std::io::Result<Client> {
+    // Classify the peer before error cleanup shuts our end: local shutdown can
+    // imitate peer closure and discard the queued bytes that forbid auth recovery.
+    // The failed client remains unread/unsendable and is dropped after classification.
+    let hang_up = c.hang_up;
+    c.hang_up = |_| {};
+    let probe = c.request_counted("version");
+    c.hang_up = hang_up;
+    match probe {
+        Ok((head, _)) if head == "ERR auth" => {
+            drop(c);
+            beside()
+        }
         Ok(_) => Ok(c),
+        // An empty EOF has already inspected the reply stream. Truncated replies
+        // have set reply_started and cannot authorize a second authentication.
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            if c.closed_before_reply() {
+                drop(c);
+                beside()
+            } else {
+                Err(e)
+            }
+        }
         Err(e)
             if matches!(
                 e.kind(),
-                std::io::ErrorKind::BrokenPipe
-                    | std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::UnexpectedEof
-            ) =>
+                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+            ) || (e.kind() == std::io::ErrorKind::NotConnected
+                && e.raw_os_error().is_some()) =>
         {
-            RelayClient::connect_local_beside(sock)
+            if !c.closed_before_reply() {
+                return Err(e);
+            }
+            #[cfg(unix)]
+            let ended = match aterm_uds::hangup::peer_state(c.transport()) {
+                aterm_uds::hangup::PeerState::Gone => true,
+                aterm_uds::hangup::PeerState::HalfClosed => {
+                    e.kind() != std::io::ErrorKind::NotConnected
+                }
+                // Readable can mean queued bytes or a pending error. Neither
+                // certifies an empty reply, and an idle peer could park a read.
+                aterm_uds::hangup::PeerState::Readable | aterm_uds::hangup::PeerState::Idle => {
+                    false
+                }
+            };
+            #[cfg(not(unix))]
+            let ended = aterm_uds::hangup::peer_closed(c.transport());
+            if ended && c.closed_peer_without_reply() {
+                drop(c);
+                beside()
+            } else {
+                Err(e)
+            }
         }
         Err(e) => Err(e),
     }
@@ -2022,13 +2147,19 @@ pub fn harness_client(sock: &str, token: Option<&HarnessToken>) -> std::io::Resu
 pub(super) fn roster_connection(sock: &str) -> Option<Client> {
     RelayClient::connect_local_beside(sock)
         .ok()
-        .map(RelayClient::reads_only)
+        .map(|c| c.bounded(CLAIMS_WAIT).reads_only())
 }
 
+/// A read-only [`connect`] for the claims and roster reads, its probe bounded as they are
+/// ([`CLAIMS_WAIT`]).
 pub(super) fn connect_reads(opts: &Opts, sid: &str) -> Result<Client, String> {
     connect(
         &Opts {
             dry_run: true,
+            timings: super::Timings {
+                drive_reply: opts.timings.drive_reply.min(CLAIMS_WAIT),
+                ..opts.timings
+            },
             ..opts.clone()
         },
         sid,
@@ -2060,7 +2191,7 @@ fn roster_aside_within(
     agents_off: &[aterm_phase::Program],
     wait: Duration,
 ) -> Option<Aside> {
-    c.transport().set_read_timeout(Some(wait)).ok()?;
+    c.bound_by(wait);
     let (head, body) = c.request_counted("sessions").ok()?;
     if !crate::is_ok_reply(&head) {
         return None;
@@ -2147,7 +2278,7 @@ pub(crate) fn roster_rows(body: &str) -> Option<Vec<(u64, LiveTab)>> {
     let mut rows: Vec<(u64, LiveTab)> = Vec::new();
     for row in body.lines() {
         let mut words = row.split_whitespace();
-        let local = words.next()?.parse::<u64>().ok()?;
+        let local = crate::parse_uint::<u64>(words.next()?)?;
         let sid = words.next()?.to_string();
         if !sid.starts_with("s-") || rows.iter().any(|(_, t)| t.sid == sid) {
             return None;
@@ -2155,7 +2286,7 @@ pub(crate) fn roster_rows(body: &str) -> Option<Vec<(u64, LiveTab)>> {
         let fgpgid = row
             .split_whitespace()
             .find_map(|word| word.strip_prefix("fgpgid="))
-            .and_then(|word| word.parse::<i64>().ok())
+            .and_then(crate::parse_uint::<i64>)
             .filter(|&group| group > 0);
         rows.push((local, LiveTab { sid, fgpgid }));
     }
@@ -2406,6 +2537,14 @@ pub(super) fn held(c: &mut Client, sid: &str, grace_s: u32) -> bool {
     status_line(c, sid).is_none_or(|line| held_by_status(&line, grace_s))
 }
 
+/// [`held`]'s one `status` read, and what it says of the person's hour: `None` where the tab is
+/// held, else whether their last key holds the go-ahead
+/// ([`super::relaunch::go_ahead_held_by_status`]), which a carried done check then leaves unsaid.
+pub(super) fn unheld_hour(c: &mut Client, sid: &str, grace_s: u32) -> Option<bool> {
+    let line = status_line(c, sid)?;
+    (!held_by_status(&line, grace_s)).then(|| super::relaunch::go_ahead_held_by_status(&line))
+}
+
 pub(super) fn status_line(c: &mut Client, sid: &str) -> Option<String> {
     c.request_line(&format!("@{sid} status")).ok()
 }
@@ -2577,7 +2716,7 @@ pub(super) fn quiet_s(status: Option<&str>, st: &mut St, seq: u64, now: u64) -> 
         st.seq_since_s = now;
     }
     let field = |key: &str| status?.split_whitespace().find_map(|t| t.strip_prefix(key));
-    let since_ms = field("agent_since_ms=").and_then(|ms| ms.parse::<u64>().ok());
+    let since_ms = field("agent_since_ms=").and_then(crate::parse_uint::<u64>);
     match (field("agent="), since_ms) {
         (Some("idle" | "question"), Some(ms)) => ms / 1000,
         (Some(word), Some(_)) if word != "-" && word != "unknown" => 0,
@@ -2585,18 +2724,23 @@ pub(super) fn quiet_s(status: Option<&str>, st: &mut St, seq: u64, now: u64) -> 
     }
 }
 
-pub(super) fn type_line(c: &mut Client, sid: &str, line: &str) -> Result<(), String> {
+pub(super) fn type_line(c: &mut Client, sid: &str, line: &str) -> Result<(), Typed> {
     for request in [
         format!("@{sid} send -- {line}"),
         format!("@{sid} key enter"),
     ] {
-        let reply = c.request_line(&request).map_err(|e| format!("{e}"))?;
+        let reply = c.request_line(&request).map_err(|e| Typed::of_io(&e))?;
         if !crate::is_ok_reply(&reply) {
-            return Err(reply);
+            return Err(Typed::Refused(reply));
         }
     }
     Ok(())
 }
+
+/// A read the window left unanswered, or a connection it never gave ([`RelayClient::reply_unread`]):
+/// asked again at the next step (`wait:no-socket`), never read as what the window would say.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct NoSocket;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Typed {
@@ -2604,6 +2748,9 @@ pub(super) enum Typed {
     Yielded,
     Cut(String),
     Refused(String),
+    /// Its reply did not come within its wait ([`crate::unanswered`]): the server may still type
+    /// it, so a caller reads what it did before it decides, never a refusal.
+    Unanswered,
 }
 
 impl Typed {
@@ -2613,18 +2760,22 @@ impl Typed {
             Typed::Yielded => "yield".to_string(),
             Typed::Cut(why) => format!("cut-{why}"),
             Typed::Refused(e) => first_word(e),
+            Typed::Unanswered => "unanswered".to_string(),
+        }
+    }
+
+    /// A typed request's I/O error: [`Typed::Unanswered`] for a reply past its wait, else a
+    /// refusal.
+    pub(super) fn of_io(e: &std::io::Error) -> Self {
+        if crate::unanswered(e) {
+            Typed::Unanswered
+        } else {
+            Typed::Refused(format!("{e}"))
         }
     }
 }
 
 pub(super) const TURN_WAIT: &str = "idle=1 timeout=10000";
-
-pub(super) fn turn(c: &mut Client, sid: &str, text: &str) -> Result<(), String> {
-    turn_fenced(c, sid, text, None).map_err(|e| match e {
-        Typed::Refused(e) => e,
-        other => other.word(),
-    })
-}
 
 fn turn_takes_gen(c: &mut Client) -> bool {
     c.help_counted("turn")
@@ -2654,7 +2805,7 @@ fn turn_wait(keys: &str, text: &str) -> String {
     let value = |words: &str, key: &str| {
         words
             .split_whitespace()
-            .find_map(|w| w.strip_prefix(key)?.parse::<u64>().ok())
+            .find_map(|w| crate::parse_uint::<u64>(w.strip_prefix(key)?))
             .unwrap_or(0)
     };
     let count = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
@@ -2701,6 +2852,7 @@ pub(super) fn turn_fenced(
     checked_turn(c, sid, text, generation, Put::Paste)
 }
 
+#[cfg(all(test, unix))]
 pub(super) fn notice_fenced(
     c: &mut Client,
     sid: &str,
@@ -2716,6 +2868,17 @@ fn checked_turn(
     text: &str,
     generation: Option<&str>,
     put: Put,
+) -> Result<(), Typed> {
+    checked_turn_for_duty(c, sid, text, generation, put, None)
+}
+
+fn checked_turn_for_duty(
+    c: &mut Client,
+    sid: &str,
+    text: &str,
+    generation: Option<&str>,
+    put: Put,
+    authority: Option<(super::contract::Scope, u64)>,
 ) -> Result<(), Typed> {
     let fence = match generation {
         Some(g) if g.starts_with(ROWS_FENCE) => g
@@ -2738,11 +2901,29 @@ fn checked_turn(
         String::new()
     };
     let wait = turn_wait(keys, text);
+    let authority_words = match authority {
+        None => String::new(),
+        Some((duty, revision)) => {
+            let (head, body) = c
+                .request_counted(&format!("@{sid} status"))
+                .map_err(|e| Typed::of_io(&e))?;
+            let observed =
+                crate::supervise::BuiltinAuthority::from_status(&(head + &body), &hand_name());
+            if observed.revision() != Some(revision) || !observed.keeps(duty) {
+                return Err(Typed::Refused("supervisor input authority".to_string()));
+            }
+            format!(
+                "if-supervisor={} if-supervisor-revision={revision} harness-duty={} ",
+                hand_name(),
+                duty.word()
+            )
+        }
+    };
     let (head, _) = c
         .request_counted(&format!(
-            "@{sid} turn {fence}{keys}{submit}yield=0.2 {wait} {text}"
+            "@{sid} turn {authority_words}{fence}{keys}{submit}yield=0.2 {wait} {text}"
         ))
-        .map_err(|e| Typed::Refused(format!("{e}")))?;
+        .map_err(|e| Typed::of_io(&e))?;
     turn_verdict(&head)
 }
 
@@ -2757,7 +2938,7 @@ fn turn_verdict(head: &str) -> Result<(), Typed> {
     if words.contains(&"skipped") {
         let field = |key: &str| words.iter().find_map(|w| w.strip_prefix(key));
         let reason = field("reason=").unwrap_or_default();
-        let typed = field("typed=").and_then(|k| k.parse::<u64>().ok());
+        let typed = field("typed=").and_then(crate::parse_uint::<u64>);
         return Err(match (reason, typed) {
             (why, Some(1..)) => {
                 Typed::Cut(if why.is_empty() { "unknown" } else { why }.to_string())
@@ -3154,10 +3335,14 @@ fn model_record_in(state: &Path, session: &str) -> PathBuf {
 /// The resume line a person is told to run, under the relaunch's own model rule.
 #[must_use]
 pub fn resume_command_kept(state: Option<&Path>, argv: &[String], session: &str) -> Option<String> {
+    if !upgrade::is_session_id(session) {
+        return None;
+    }
     let launch = upgrade::launch_model(argv);
     let dropped = launch.as_deref().zip(state).is_some_and(|(m, state)| {
-        let record = std::fs::read_to_string(model_record_in(state, session))
+        let record = super::accounts::read_bounded(&model_record_in(state, session), 64 * 1024)
             .ok()
+            .flatten()
             .and_then(|t| ModelRecord::parse(&t))
             .unwrap_or_default();
         models::launch_model_kept(Some(m), &record).is_none()
@@ -3173,8 +3358,12 @@ pub fn resume_command_kept(state: Option<&Path>, argv: &[String], session: &str)
 }
 
 fn load_model_record(opts: &Opts, session: &str) -> ModelRecord {
-    std::fs::read_to_string(model_record_path(opts, session))
+    if !upgrade::is_session_id(session) {
+        return ModelRecord::default();
+    }
+    super::accounts::read_bounded(&model_record_path(opts, session), 64 * 1024)
         .ok()
+        .flatten()
         .and_then(|t| ModelRecord::parse(&t))
         .unwrap_or_default()
 }
@@ -3345,7 +3534,7 @@ pub(super) fn restart_models(
     if !ride && upgrade::launch_model(argv).is_none() {
         return (None, None);
     }
-    let mctx = ModelCtx::read(opts, &Targets::read(&opts.home));
+    let mctx = ModelCtx::read(opts, &Targets::read(opts));
     let riding = sf.filter(|_| ride).and_then(|sf| {
         let view = mctx.at_for_profile(opts, sf, profile);
         riding_model_in(opts, sf, argv, &mctx, Some(&view))
@@ -3459,7 +3648,7 @@ fn model_wants_a_look(opts: &Opts, sf: &SessionFile, mctx: &ModelCtx) -> bool {
 #[must_use]
 pub fn models_report(opts: &Opts) -> String {
     use std::fmt::Write as _;
-    let targets = Targets::read(&opts.home);
+    let targets = Targets::read(opts);
     let mut ctx = ModelCtx::read(opts, &targets);
     ctx.settle(Some(
         std::fs::read_to_string(opts.home.join(".claude/settings.json"))
@@ -3654,6 +3843,15 @@ pub(super) struct St {
     pub(super) tabs: Vec<String>,
     pub(super) tabs_until: Vec<(String, u64)>,
     pub(super) line: String,
+    /// Exact original native preparation and its recovered capability survive reconnects.
+    pub(super) native_prepare: String,
+    /// Persisted before any native dispatch; terminal receipts never restore raw fallback.
+    pub(super) native_coordination: bool,
+    /// Completed data is never an active grant; later crash entry mints a new operation.
+    pub(super) native_completed_prepare: Option<Box<super::native_act::Prepare>>,
+    pub(super) native_observation: Option<super::native_observe::SavedObservation>,
+    pub(super) native_rollback: bool,
+    pub(super) native: Option<super::native_act::Binding>,
     /// The directory [`Self::line`] runs the agent in when it carries no `cd` of its own
     /// ([`Plan`]'s `line_dir`; empty: it does, or none was read): once the shell stands elsewhere,
     /// the line is typed with a `cd` back to it ([`super::relaunch::line_at_shell`]).
@@ -3825,8 +4023,8 @@ impl FailedStart {
         let read = FailedStart {
             to: it.next()?.to_string(),
             source: it.next()?.to_string(),
-            failed_at: it.next()?.parse().ok()?,
-            stop_streak: it.next()?.parse().ok()?,
+            failed_at: crate::parse_uint(it.next()?)?,
+            stop_streak: crate::parse_uint(it.next()?)?,
         };
         it.next().is_none().then_some(read)
     }
@@ -4075,6 +4273,7 @@ impl St {
         SAME_PROGRAM.clone_into(&mut self.source);
         self.to.clone_from(&self.from);
         self.line = std::mem::take(&mut self.back_line);
+        self.native_rollback = self.native.is_some() || !self.native_prepare.is_empty();
         self.line_grace_s = Some(grace_s);
         self.model_list.clear();
         self.prompt = None;
@@ -4133,6 +4332,17 @@ impl St {
         who: Proc<'_>,
         now: u64,
     ) -> (St, Retarget) {
+        if let Some(old) = prior
+            .as_ref()
+            .filter(|old| old.native.is_some() || !old.native_prepare.is_empty())
+        {
+            let mut kept = old.clone();
+            kept.native_coordination = true;
+            return (kept, Retarget::Kept);
+        }
+        let native_coordination = prior
+            .as_ref()
+            .is_some_and(super::native_restart::coordinated);
         let left = prior
             .as_ref()
             .map(|p| p.left_typed.clone())
@@ -4310,6 +4520,7 @@ impl St {
             }
             None => (St::fresh(from, to, who, now), Retarget::Anew),
         };
+        st.native_coordination |= native_coordination;
         if st.left_typed.is_empty() {
             st.left_typed = left;
         }
@@ -4405,6 +4616,10 @@ impl St {
     }
 
     pub(super) fn retried_by(&self, st: &mut St) {
+        if self.preserve_unresolved_native(st) {
+            return;
+        }
+        st.native_coordination |= super::native_restart::coordinated(self);
         let Some(build) = Version::parse(&st.to) else {
             return;
         };
@@ -4415,6 +4630,10 @@ impl St {
     }
 
     pub(super) fn kept_by_restart(&self, tab: &str, st: &mut St) {
+        if self.preserve_unresolved_native(st) {
+            return;
+        }
+        st.native_coordination |= super::native_restart::coordinated(self);
         if let Some(word) = self.owners_hold(tab) {
             st.request = word;
             st.request_tab.clone_from(&self.request_tab);
@@ -4442,6 +4661,17 @@ impl St {
         } else {
             &self.to
         })
+    }
+
+    fn preserve_unresolved_native(&self, st: &mut St) -> bool {
+        if self.native.is_none() && self.native_prepare.is_empty() {
+            return false;
+        }
+        // A new target/record cannot replace the only retained id/capability/recipe/budget.
+        // Reconcile the original first, or remain held with that original intact.
+        *st = self.clone();
+        st.native_coordination = true;
+        true
     }
 
     fn new_round(&mut self, now: u64) {
@@ -4643,6 +4873,7 @@ impl St {
             ("relaunched_start", &self.relaunched_start),
             ("tab", &self.tab),
             ("line", &self.line),
+            ("native_prepare", &self.native_prepare),
             (
                 "prompt",
                 &self
@@ -4690,8 +4921,35 @@ impl St {
         ] {
             o.insert(k.into(), Value::from(v));
         }
+        if self.native_rollback {
+            o.insert("native_rollback".into(), Value::Bool(true));
+        }
+        if self.native_coordination {
+            o.insert("native_coordination".into(), Value::Bool(true));
+        }
+        if let Some(encoded) = self
+            .native_completed_prepare
+            .as_ref()
+            .and_then(|prepare| super::native_act::Request::Prepare(prepare.clone()).encode())
+        {
+            o.insert("native_completed_prepare".into(), Value::from(encoded));
+        }
+        if let Some(encoded) = self
+            .native_observation
+            .as_ref()
+            .and_then(super::native_observe::SavedObservation::encode)
+        {
+            o.insert("native_observation".into(), Value::from(encoded));
+        }
         if let Some(login) = &self.login {
             o.insert("login".into(), Value::from(login.as_str()));
+        }
+        if let Some(binding) = &self.native {
+            o.insert("native_id".into(), Value::from(binding.id.as_str()));
+            o.insert(
+                "native_cap".into(),
+                Value::from(binding.capability.as_str()),
+            );
         }
         if let Some(home) = &self.home {
             o.insert("home".into(), Value::from(home.as_str()));
@@ -4897,6 +5155,35 @@ impl St {
             shell: small("shell"),
             tab: s("tab"),
             line: s("line"),
+            native_prepare: s("native_prepare"),
+            native_coordination: v
+                .get("native_coordination")
+                .map_or(Some(false), Value::as_bool)?
+                || !s("native_prepare").is_empty()
+                || v.get("native_id").is_some()
+                || v.get("native_completed_prepare").is_some()
+                || v.get("native_observation").is_some(),
+            native_completed_prepare: match v.get("native_completed_prepare") {
+                None => None,
+                Some(value) => {
+                    let super::native_act::Request::Prepare(prepare) =
+                        super::native_act::Request::parse(value.as_str()?)?
+                    else {
+                        return None;
+                    };
+                    Some(prepare)
+                }
+            },
+            native_observation: match v.get("native_observation") {
+                None => None,
+                Some(value) => Some(super::native_observe::SavedObservation::parse(
+                    value.as_str()?,
+                )?),
+            },
+            native_rollback: v
+                .get("native_rollback")
+                .map_or(Some(false), Value::as_bool)?,
+            native: super::native_restart::read(&v)?,
             line_dir: s("line_dir"),
             line_grace_s: v
                 .get("line_grace")
@@ -4950,7 +5237,7 @@ impl St {
                 .iter()
                 .filter_map(|w| {
                     let (until, tab) = w.split_once(' ')?;
-                    Some((tab.to_string(), until.parse().ok()?))
+                    Some((tab.to_string(), crate::parse_uint(until)?))
                 })
                 .collect(),
             hold_since_s: n("hold_since"),
@@ -4965,9 +5252,9 @@ impl St {
                 .filter_map(|h| {
                     let mut it = h.split_whitespace();
                     let held = HeldBy {
-                        pid: it.next()?.parse().ok()?,
+                        pid: crate::parse_uint(it.next()?)?,
                         name: it.next()?.to_string(),
-                        since: it.next()?.parse().ok()?,
+                        since: crate::parse_uint(it.next()?)?,
                     };
                     it.next().is_none().then_some(held)
                 })
@@ -5026,7 +5313,7 @@ impl St {
                 .filter_map(|w| {
                     let mut it = w.splitn(3, ' ');
                     Some(WaitNote {
-                        at: it.next()?.parse().ok()?,
+                        at: crate::parse_uint(it.next()?)?,
                         word: it.next()?.to_string(),
                         note: it.next().unwrap_or_default().to_string(),
                     })
@@ -5034,7 +5321,7 @@ impl St {
                 .collect(),
             work_end_at: list("work_end_at")
                 .iter()
-                .filter_map(|t| t.parse().ok())
+                .filter_map(|t| crate::parse_uint(t))
                 .take(usize::try_from(upgrade::WORK_END_DAILY).unwrap_or(usize::MAX))
                 .collect(),
             goal: n("goal") != 0,
@@ -5042,7 +5329,7 @@ impl St {
                 .iter()
                 .filter_map(|w| {
                     let (at, word) = w.split_once(' ')?;
-                    Some((word.to_string(), at.parse().ok()?))
+                    Some((word.to_string(), crate::parse_uint(at)?))
                 })
                 .take(FIRSTS_KEPT)
                 .collect(),
@@ -5279,6 +5566,7 @@ impl St {
         self.shell = shell;
         tab.clone_into(&mut self.tab);
         self.line = line;
+        self.native_rollback = false;
         self.line_dir.clear();
         self.line_grace_s = None;
         self.back_line.clear();
@@ -5921,7 +6209,7 @@ pub(super) fn session_files_in(claude_dir: &Path) -> Option<Vec<SessionFile>> {
         let Some(file_pid) = path
             .file_stem()
             .and_then(|stem| stem.to_str())
-            .and_then(|stem| stem.parse::<u32>().ok())
+            .and_then(crate::parse_uint::<u32>)
         else {
             continue;
         };
@@ -6486,21 +6774,24 @@ pub fn tasked(home: &Path, session: &str, ours: &[approvals::Typed]) -> Option<b
 }
 
 /// What the supervisor of tab `tab` typed into it.
-#[must_use]
-pub fn supervisor_typed(opts: &Opts, tab: &str) -> Vec<approvals::Typed> {
+/// # Errors
+/// The conversation's existing ledger or lineage cannot be read as bounded regular text.
+pub fn supervisor_typed(opts: &Opts, tab: &str) -> std::io::Result<Vec<approvals::Typed>> {
     conversation_typed(opts, tab, None, &[])
 }
 
 pub(super) const EARLIER_TABS: usize = 8;
 
 /// What the harness typed into a conversation, keyed to the conversation rather than its current tab.
-#[must_use]
+/// # Errors
+/// An existing ledger or lineage file cannot be read as bounded regular text. The caller
+/// must retain an unknown task or hold rather than treating this as no harness acts.
 pub fn conversation_typed(
     opts: &Opts,
     tab: &str,
     session: Option<&str>,
     extra: &[String],
-) -> Vec<approvals::Typed> {
+) -> std::io::Result<Vec<approvals::Typed>> {
     let record = session.and_then(|s| load(opts, s));
     typed_through(opts, tab, session, record.as_ref(), extra, &[])
 }
@@ -6510,7 +6801,7 @@ pub(super) fn conversation_typed_by(
     tab: &str,
     session: &str,
     st: &St,
-) -> Vec<approvals::Typed> {
+) -> std::io::Result<Vec<approvals::Typed>> {
     let record = load(opts, session);
     typed_through(
         opts,
@@ -6536,19 +6827,20 @@ fn typed_through(
     record: Option<&St>,
     extra: &[String],
     until: &[(String, u64)],
-) -> Vec<approvals::Typed> {
+) -> std::io::Result<Vec<approvals::Typed>> {
     let Some(root) = opts.aterm_state.as_deref() else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    let ledgered = session.map_or_else(Vec::new, |session| {
+    let ledgered = if let Some(session) = session {
         ledger_tabs(
-            std::fs::read_to_string(ledger_path(opts))
-                .unwrap_or_default()
-                .as_str(),
+            &super::accounts::read_bounded(&ledger_path(opts), 16 * 1024 * 1024)?
+                .unwrap_or_default(),
             session,
             tab,
         )
-    });
+    } else {
+        Vec::new()
+    };
     let mut stamps: Vec<(String, u64)> = Vec::new();
     for (t, at) in until
         .iter()
@@ -6566,24 +6858,25 @@ fn typed_through(
         .map(|(t, _)| t)
         .chain(extra.iter().cloned())
         .collect();
-    tabs_through(root, tab, record, &extra)
-        .iter()
-        .flat_map(|t| {
-            let rows = approvals::typed_texts(&approvals::ledger_under(root, Some(t)), Some(t));
-            let last_ms = (t != tab)
-                .then(|| stamps.iter().find(|(s, _)| s == t))
-                .flatten()
-                .map(|(_, at)| {
-                    i64::try_from(
-                        at.saturating_mul(1000)
-                            .saturating_add(upgrade::TYPED_WITHIN_MS),
-                    )
-                    .unwrap_or(i64::MAX)
-                });
+    let mut typed = Vec::new();
+    for t in tabs_through(root, tab, record, &extra)? {
+        let rows = approvals::read_typed_texts(&approvals::ledger_under(root, Some(&t)), Some(&t))?;
+        let last_ms = (t != tab)
+            .then(|| stamps.iter().find(|(s, _)| s == &t))
+            .flatten()
+            .map(|(_, at)| {
+                i64::try_from(
+                    at.saturating_mul(1000)
+                        .saturating_add(upgrade::TYPED_WITHIN_MS),
+                )
+                .unwrap_or(i64::MAX)
+            });
+        typed.extend(
             rows.into_iter()
-                .filter(move |r| last_ms.is_none_or(|last| r.at_ms <= last))
-        })
-        .collect()
+                .filter(|r| last_ms.is_none_or(|last| r.at_ms <= last)),
+        );
+    }
+    Ok(typed)
 }
 
 pub(super) fn ledger_tabs(body: &str, session: &str, tab: &str) -> Vec<(String, Option<u64>)> {
@@ -6613,15 +6906,31 @@ pub(super) fn ledger_tabs(body: &str, session: &str, tab: &str) -> Vec<(String, 
         .collect()
 }
 
-fn tabs_through(root: &Path, tab: &str, record: Option<&St>, extra: &[String]) -> Vec<String> {
-    tabs_through_read(
+fn tabs_through(
+    root: &Path,
+    tab: &str,
+    record: Option<&St>,
+    extra: &[String],
+) -> std::io::Result<Vec<String>> {
+    let refused = std::cell::RefCell::new(None);
+    let tabs = tabs_through_read(
         root,
         tab,
         record,
         extra,
-        &|p| std::fs::read_to_string(p).ok(),
+        &|p| match super::accounts::read_bounded(p, 1024 * 1024) {
+            Ok(body) => body,
+            Err(why) => {
+                refused.borrow_mut().get_or_insert(why);
+                None
+            }
+        },
         &|_| false,
-    )
+    );
+    match refused.into_inner() {
+        Some(why) => Err(why),
+        None => Ok(tabs),
+    }
 }
 
 fn tabs_through_read(
@@ -6660,15 +6969,25 @@ fn tabs_through_read(
     tabs
 }
 
-pub(super) fn lefts_through(opts: &Opts, tab: &str, session: &str, st: &St) -> Vec<String> {
+pub(super) fn lefts_through(
+    opts: &Opts,
+    tab: &str,
+    session: &str,
+    st: &St,
+) -> std::io::Result<Vec<String>> {
     let Some(root) = opts.aterm_state.as_deref() else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let record = load(opts, session);
-    tabs_through(root, tab, record.as_ref(), &st.tabs)
-        .iter()
-        .filter_map(|t| approvals::open_left(&approvals::ledger_under(root, Some(t)), Some(t)))
-        .collect()
+    let mut lefts = Vec::new();
+    for t in tabs_through(root, tab, record.as_ref(), &st.tabs)? {
+        if let Some(key) =
+            approvals::read_open_left(&approvals::ledger_under(root, Some(&t)), Some(&t))?
+        {
+            lefts.push(key);
+        }
+    }
+    Ok(lefts)
 }
 
 /// [`lefts_through`] for a LOOP that keeps its ledger at `ledger` for session `sid`.
@@ -7252,6 +7571,18 @@ impl<'a> WhereWritten<'a> {
         self.scan()
             .map(|scan| (scan.said_done(), scan.said_irreversible()))
     }
+
+    /// Whether the agent's last reply is a clean defense of its work (`Nothing left:`).
+    pub(super) fn defended(&self) -> Option<bool> {
+        self.scan().map(upgrade::FinishedScan::defended)
+    }
+
+    /// Whether a prompt no supervisor typed was written at or after unix second `since`: a person
+    /// reached the relaunched agent first.
+    pub(super) fn asked_since(&self, since: u64) -> Option<bool> {
+        self.scan()
+            .map(|scan| since != 0 && scan.theirs_at().is_some_and(|at| at >= since))
+    }
 }
 
 pub(super) fn turn_key_where_written(
@@ -7268,11 +7599,12 @@ pub(super) fn left_to_person(
     tab: &str,
     session: &str,
     st: &St,
-) -> bool {
-    let lefts = lefts_through(opts, tab, session, st);
-    !lefts.is_empty()
+) -> std::io::Result<bool> {
+    let lefts = lefts_through(opts, tab, session, st)?;
+    // A standing marker is not lifted by a transcript whose current turn cannot be named.
+    Ok(!lefts.is_empty()
         && turn_key_where_written(opts, records, session)
-            .is_some_and(|now| lefts.iter().any(|k| now.names(k)))
+            .is_none_or(|now| lefts.iter().any(|k| now.names(k))))
 }
 
 fn read_where_written(
@@ -7367,7 +7699,88 @@ fn live_cwd(snap: &super::relaunch::Snapshot) -> Option<PathBuf> {
 /// Read the standing usage-limit reset timestamp for `snap`'s conversation.
 #[must_use]
 pub fn named_limit_reset(user_home: &Path, snap: &super::relaunch::Snapshot) -> Option<u64> {
-    upgrade::transcript_limit_reset(&snapshot_tail(user_home, snap)?)
+    match snap.run.agent() {
+        upgrade::Agent::Agy => agy_limit_reset(user_home, snap),
+        upgrade::Agent::Claude | upgrade::Agent::Codex | upgrade::Agent::Muse => {
+            upgrade::transcript_limit_reset(&snapshot_tail(user_home, snap)?)
+        }
+    }
+}
+
+fn agy_limit_reset(_user_home: &Path, snap: &super::relaunch::Snapshot) -> Option<u64> {
+    let run = snap.agy()?;
+    let screen_model = (!snap.tab.is_empty())
+        .then(|| {
+            let sock = aterm_ctl::resolve_sock_for(Some(&snap.tab)).ok()?;
+            let mut c = harness_client(&sock, None).ok()?.reads_only();
+            agy::live::wall_screen_model_on(&mut c, &snap.tab).flatten()
+        })
+        .flatten();
+    let argv_model = super::upgrade_agy::argv_model(&snap.argv);
+    let flags = super::upgrade_agy::config_flags(&snap.argv);
+    let now = crate::supervise::limit::unix_now();
+    agy_limit_reset_with(
+        argv_model.as_deref(),
+        screen_model.as_deref(),
+        now,
+        |asked| {
+            super::agy_quota_store::rotate_worker_at(
+                asked,
+                &snap.program,
+                &run.env,
+                &flags,
+                now,
+                true,
+            )
+        },
+    )
+}
+
+pub(super) fn agy_limit_reset_with(
+    argv_model: Option<&str>,
+    screen_model: Option<&str>,
+    now: i64,
+    mut pick_at_wall: impl FnMut(Option<&str>) -> Option<super::agy_quota_store::LaunchPick>,
+) -> Option<u64> {
+    let screen_clean = screen_model
+        .map(str::trim)
+        .filter(|m| !super::agy_quota::family(m).is_empty());
+    let mut chosen = pick_at_wall(screen_clean.or(argv_model));
+    if screen_clean.is_some()
+        && matches!(
+            chosen.as_ref().map(|c| &c.pick),
+            Some(super::agy_quota::Pick::Unknown { .. })
+        )
+    {
+        chosen = pick_at_wall(argv_model);
+    }
+    let chosen = chosen?;
+    let past_grace = i64::try_from(LIMIT_GRACE_S)
+        .unwrap_or(3_600)
+        .saturating_add(60);
+    let at = match &chosen.pick {
+        super::agy_quota::Pick::Wait {
+            until: Some(at), ..
+        } => Some(*at),
+        super::agy_quota::Pick::Rotate { from, .. } => chosen
+            .quota
+            .group_of(from)
+            .and_then(super::agy_quota::Group::wall_refills_at),
+        super::agy_quota::Pick::Keep { .. }
+            if chosen.named
+                || !chosen
+                    .quota
+                    .groups
+                    .iter()
+                    .any(super::agy_quota::Group::blocked) =>
+        {
+            Some(now.saturating_sub(past_grace))
+        }
+        super::agy_quota::Pick::Keep { .. }
+        | super::agy_quota::Pick::Wait { until: None, .. }
+        | super::agy_quota::Pick::Unknown { .. } => None,
+    }?;
+    u64::try_from(at).ok()
 }
 
 /// The tail of the transcript Claude Code process `pid` writes now.
@@ -7754,7 +8167,7 @@ fn due_after_lanes(
         opts,
         &files,
         tabs,
-        || Targets::read(&opts.home),
+        || Targets::read(opts),
         atpkg::caller_shell::process_args,
         process_group,
         ids,
@@ -7886,7 +8299,7 @@ impl Homes {
 
 fn instance_tabs(opts: &Opts) -> Vec<LiveTab> {
     let roster = |mut c: Client| {
-        c.transport().set_read_timeout(Some(CLAIMS_WAIT)).ok()?;
+        c.bound_by(CLAIMS_WAIT);
         host_roster(&mut c)
     };
     let one = || {
@@ -8051,13 +8464,12 @@ pub const HOME_MOVED: &str = "home-moved";
 /// `Due::Unread` reason when no newer agent version is available.
 pub const UNREAD_VERSION: &str = "no-version";
 
-/// Mints the session's upgrade state the moment its host sees it behind.
+/// Mints the session's upgrade state the moment its host sees it behind. Everything is read
+/// before the sweep lock is taken, which covers the mint alone ([`behind_after_lanes`]): a socket
+/// that answers late, or a build's version probe, holds no other session's sweep.
 pub fn note_behind(opts: &Opts, since: u64) -> Behind {
     let Some(tab) = opts.only_sid.as_deref().filter(|_| !opts.dry_run) else {
         return Behind::Nothing;
-    };
-    let Ok(_held) = sweep_lock(opts) else {
-        return Behind::Busy;
     };
     let Some(tabs) = connect(opts, tab)
         .ok()
@@ -8121,7 +8533,11 @@ fn behind_after_lanes(
         }
     };
     let native = exe_of(sf.pid).is_some_and(|exe| exe.starts_with(native_root(&opts.home)));
-    if mint_behind(opts, sf, tab, &Targets::read(&opts.home), native, since) {
+    let targets = Targets::read(opts);
+    let Ok(_held) = sweep_lock(opts) else {
+        return Behind::Busy;
+    };
+    if mint_behind(opts, sf, tab, &targets, native, since) {
         Behind::Noted
     } else {
         Behind::Nothing
@@ -8861,7 +9277,7 @@ fn claude_pass(opts: &Opts, live_tabs: Option<&[LiveTab]>) -> Vec<Report> {
             &files,
             tabs,
             |sf, tab| {
-                let tg = targets.get_or_init(|| Targets::read(&opts.home));
+                let tg = targets.get_or_init(|| Targets::read(opts));
                 opts.only_sid.as_deref().is_none_or(|only| only == tab)
                     && (needs_upgrade_inspection(sf, tg, load(opts, &sf.session_id).as_ref())
                         || model_wants_a_look(
@@ -8883,7 +9299,7 @@ fn claude_pass(opts: &Opts, live_tabs: Option<&[LiveTab]>) -> Vec<Report> {
         }
         if !claimed.is_empty() {
             let t = table();
-            let targets = targets.get_or_init(|| Targets::read(&opts.home));
+            let targets = targets.get_or_init(|| Targets::read(opts));
             let mctx = mctx.get_or_init(|| ModelCtx::read(opts, targets));
             waits.extend(claimed.into_iter().map(|(sf, args, claim)| {
                 visit_models(
@@ -8904,7 +9320,7 @@ fn claude_pass(opts: &Opts, live_tabs: Option<&[LiveTab]>) -> Vec<Report> {
         Vec::new()
     } else {
         let t = table();
-        let targets = Targets::read(&opts.home);
+        let targets = Targets::read(opts);
         let mctx = ModelCtx::read(opts, &targets);
         files
             .iter()
@@ -8952,11 +9368,30 @@ pub(super) fn sweep_lock(opts: &Opts) -> Result<Option<SweepLock>, &'static str>
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        open.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        open.mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        open.custom_flags(0x0020_0000);
     }
     let lock: std::fs::File = open
         .open(dir.join("sweep.lock"))
         .map_err(|_| "lock-unopenable")?;
+    let metadata = lock.metadata().map_err(|_| "lock-unopenable")?;
+    if !metadata.is_file() {
+        return Err("lock-unopenable");
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        if metadata.file_attributes() & 0x0000_0400 != 0 {
+            return Err("lock-unopenable");
+        }
+    }
+    #[cfg(any(unix, windows))]
+    aterm_uds::keep_out_of_children(&lock).map_err(|_| "lock-unopenable")?;
     #[expect(
         clippy::disallowed_methods,
         reason = "the take lands in a SweepLock, whose Drop releases by LOCK_UN"
@@ -9788,8 +10223,13 @@ fn visit_models(
                     || (pressed
                         && (asked_about == Phase::Pending || opts.press.is_some_and(|p| p.off))));
             let owed_here = !st.release.is_empty() && st.notice_belongs_to(sf, &tab);
+            // A press past the agent's own background work ends that work, so the agent is told:
+            // with the tab's harness on, the relaunch owes its carry-on. Every other quiet move
+            // ends no work (`upgrade::quiet_move`), and the loop's own first point goes on.
+            let ended_work =
+                pressed && !facts.background.is_empty() && !opts.press.is_some_and(|p| p.off);
             let quiet = unasked && !owed_here;
-            st.quiet = quiet;
+            st.quiet = quiet && !ended_work;
             if fresh || unasked {
                 st.model_list = model_to.clone().unwrap_or_default();
             }
@@ -9991,7 +10431,7 @@ fn look(
         status: status.as_deref(),
         dim: dim_placeholder(&mut c, tab, &scr),
     };
-    let (facts, seen) = look_facts(opts, sf, st, tab, &read, t, now);
+    let (facts, seen) = look_facts(opts, sf, st, tab, &read, t, now)?;
     Ok((
         c,
         facts,
@@ -10015,17 +10455,28 @@ pub(super) fn look_facts(
     read: &TabRead<'_>,
     t: &[ProcRow],
     now: u64,
-) -> (Facts, String) {
+) -> Result<(Facts, String), &'static str> {
     let TabRead { scr, status, dim } = *read;
+    let ours = conversation_typed(opts, tab, Some(&sf.session_id), &[])
+        .map_err(|_| "ledger-evidence-unreadable")?;
+    let records = Records::of_file(&opts.home, sf);
+    let person_left = matches!(st.phase, Phase::Pending | Phase::Announced { .. })
+        && left_to_person(opts, &records, tab, &sf.session_id, st)
+            .map_err(|_| "ledger-evidence-unreadable")?;
     let ladder = ladder_look(st, "claude", scr, sf.pid, opts.human_grace_s, now);
-    let quiet = quiet_s(status, st, scr.seq, now);
+    // A turn over under the agent's own background work publishes the phase it rests at
+    // (`aterm_phase::background_rest`), not busy: that work runs on, so its word is no quiet.
+    let quiet = match quiet_s(status, st, scr.seq, now) {
+        _ if aterm_phase::background_rest(&scr.rows).is_some() => 0,
+        quiet => quiet,
+    };
     let mut facts = Facts {
         status: sf.status.clone(),
         status_age_s: now.saturating_sub(sf.status_updated_at_ms / 1000),
         composer_empty: upgrade::composer_is_empty(&scr.rows, scr.cursor, dim),
         approval_box: aterm_phase::prompt::prompt_box_span(&scr.rows).is_some(),
         busy_footer: busy_footer(&scr.rows),
-        background: background(sf.pid, t),
+        background: own_work(sf.pid, t, &scr.rows),
         held: status.is_none_or(|line| held_by_status(line, 0)),
         quiet_s: quiet,
         hold_s: 0,
@@ -10033,10 +10484,7 @@ pub(super) fn look_facts(
         attended: ladder.attended,
         background_point: opts.background,
         taskless: matches!(st.phase, Phase::Pending | Phase::Announced { .. })
-            && Records::of_file(&opts.home, sf).tasked(
-                &sf.session_id,
-                &conversation_typed(opts, tab, Some(&sf.session_id), &[]),
-            ) == Some(false),
+            && records.tasked(&sf.session_id, &ours) == Some(false),
         limited: upgrade::limited(&scr.rows),
         login: upgrade::login_wall(upgrade::Agent::Claude, &scr.rows),
         undelivered: false,
@@ -10055,18 +10503,8 @@ pub(super) fn look_facts(
         ready_superseded: false,
         quiet: !opts.ask
             || (st.phase == Phase::Pending
-                && Records::of_file(&opts.home, sf).finished(
-                    &sf.session_id,
-                    &conversation_typed(opts, tab, Some(&sf.session_id), &[]),
-                ) == Some(true))
-            || (matches!(st.phase, Phase::Pending | Phase::Announced { .. })
-                && left_to_person(
-                    opts,
-                    &Records::of_file(&opts.home, sf),
-                    tab,
-                    &sf.session_id,
-                    st,
-                )),
+                && records.finished(&sf.session_id, &ours) == Some(true))
+            || person_left,
         unnoticed: now.saturating_sub(st.behind_since()) < upgrade::quiet_s(),
         own_hold_s: if st.own_since == 0 {
             0
@@ -10117,7 +10555,7 @@ pub(super) fn look_facts(
         place(aterm_phase::phase::composer_draft(&scr.rows).map(|(caret, _)| caret)),
         u8::from(st.goal),
     );
-    (facts, seen)
+    Ok((facts, seen))
 }
 
 fn wait_note(f: &Facts, seen: &str, holders: usize) -> String {
@@ -11185,8 +11623,13 @@ fn reads_idle(read: &Screen) -> bool {
         && reading.prompt.is_none()
 }
 
+/// Whether `read` shows the turn over for an automatic restart's signal: no work Claude Code runs
+/// in its own process pending on it ([`aterm_phase::phase::in_process_work`]; the process table
+/// the signal re-reads names none of it), and, where the status lags, an idle reading with no
+/// busy footer.
 fn turn_over_shown(read: &Screen, lagging: bool) -> bool {
-    !lagging || (!busy_footer(&read.rows) && reads_idle(read))
+    aterm_phase::phase::in_process_work(&read.rows).is_none()
+        && (!lagging || (!busy_footer(&read.rows) && reads_idle(read)))
 }
 
 /// Whether `read` lets a press's signal go: no turn running and no box open on it.
@@ -11234,6 +11677,44 @@ pub(super) fn type_fenced(
     type_fenced_then(c, tab, text, retry, put, fence_every, &mut || Ok(()))
 }
 
+/// A private built-in semantic input operation. Its exact duty/revision is pinned across
+/// screen checks and retries; every actual `turn` remains one server-side logical batch.
+pub(super) fn type_fenced_for_duty(
+    c: &mut Client,
+    tab: &str,
+    text: &str,
+    duty: super::contract::Scope,
+    put: Put,
+    fence_every: Duration,
+) -> Result<(), Typed> {
+    if !matches!(
+        duty,
+        super::contract::Scope::TurnEnd
+            | super::contract::Scope::Approvals
+            | super::contract::Scope::Questions
+            | super::contract::Scope::Walls
+    ) {
+        return Err(Typed::Refused("non-typing duty".to_string()));
+    }
+    let (head, body) = c
+        .request_counted(&format!("@{tab} status"))
+        .map_err(|e| Typed::of_io(&e))?;
+    let observed = crate::supervise::BuiltinAuthority::from_status(&(head + &body), &hand_name());
+    let Some(revision) = observed.revision().filter(|_| observed.keeps(duty)) else {
+        return Err(Typed::Refused("supervisor input authority".to_string()));
+    };
+    type_fenced_then_for_duty(
+        c,
+        tab,
+        text,
+        None,
+        put,
+        fence_every,
+        &mut || Ok(()),
+        Some((duty, revision)),
+    )
+}
+
 /// [`type_fenced`], calling `before_keys` once the fence is read and right before each try's
 /// keys are sent: an error from it types nothing and is the result. Every refusal before it
 /// typed nothing; an error after it may follow keys the server took.
@@ -11245,6 +11726,20 @@ pub(super) fn type_fenced_then(
     put: Put,
     fence_every: Duration,
     before_keys: &mut dyn FnMut() -> Result<(), Typed>,
+) -> Result<(), Typed> {
+    type_fenced_then_for_duty(c, tab, text, retry, put, fence_every, before_keys, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn type_fenced_then_for_duty(
+    c: &mut Client,
+    tab: &str,
+    text: &str,
+    retry: Option<&Retry>,
+    put: Put,
+    fence_every: Duration,
+    before_keys: &mut dyn FnMut() -> Result<(), Typed>,
+    authority: Option<(super::contract::Scope, u64)>,
 ) -> Result<(), Typed> {
     let mut hand = Hand::take(c, tab).ok_or_else(|| Typed::Refused("held".to_string()))?;
     let out = (|| {
@@ -11267,10 +11762,7 @@ pub(super) fn type_fenced_then(
                 return Err(Typed::Refused("survey".to_string()));
             }
             before_keys()?;
-            let typed = match put {
-                Put::Paste => turn_fenced(c, tab, text, generation.as_deref()),
-                Put::Pressed => notice_fenced(c, tab, text, generation.as_deref()),
-            };
+            let typed = checked_turn_for_duty(c, tab, text, generation.as_deref(), put, authority);
             match typed {
                 Ok(()) => return Ok(()),
                 Err(Typed::Changed) if again => std::thread::sleep(fence_every),
@@ -11338,6 +11830,15 @@ fn restart(
     } = *how;
     let records = Records::of_file(&opts.home, sf);
     let fresh = fresh || records.transcript_exists(&sf.session_id) == Some(false);
+    let fresh_tasked = if fresh {
+        let ours = match conversation_typed(opts, tab, Some(&sf.session_id), &[]) {
+            Ok(ours) => ours,
+            Err(_) => return said(r, super::relaunch::WAIT_LEDGER_EVIDENCE),
+        };
+        records.tasked(&sf.session_id, &ours)
+    } else {
+        None
+    };
     // A press restarts over the agent's own background work and a status that has not caught
     // up with its turn's end; what it waits for, it reads off the screen.
     let status_holds = |a: &SessionFile| pressed || status_lets_signal(a, sf, lagging);
@@ -11350,10 +11851,7 @@ fn restart(
     };
     let ours = |st: &St, a: &SessionFile| {
         if fresh {
-            records.tasked(
-                &sf.session_id,
-                &conversation_typed(opts, tab, Some(&sf.session_id), &[]),
-            ) == Some(false)
+            fresh_tasked == Some(false)
         } else if quiet {
             st.tab == tab && a.pid == sf.pid && squash(&a.proc_start) == squash(&sf.proc_start)
         } else {
@@ -11413,12 +11911,13 @@ fn restart(
         line,
         tap_dropped,
         line_dir,
+        command,
         ..
     } = match planned {
         Ok(p) => p,
         Err(no) => return unplanned(opts, r, st, no),
     };
-    let back_line = k
+    let back_plan = k
         .image(sf.pid)
         .and_then(|image| launched(argv, Some(&image), &native_root(&opts.home), true))
         .map(|(program, _)| program)
@@ -11441,8 +11940,8 @@ fn restart(
                 .ok()
         })
         .filter(|back| back.shell == shell)
-        .map(|back| back.line)
-        .unwrap_or_default();
+        .map(|back| (back.line, back.command));
+    let (back_line, back_command) = back_plan.unwrap_or_default();
     let Some(mut hand) = Hand::take(c, tab) else {
         return said(r, "wait:held");
     };
@@ -11505,9 +12004,56 @@ fn restart(
             save(opts, &sf.session_id, st);
             break 'signal Some(said(r.clone(), "wait:changed-before-signal"));
         }
-        match terminate(c, tab, pid, grace) {
+        let admission = super::native_restart::begin(
+            opts,
+            c,
+            st,
+            &sf.session_id,
+            super::contract::Scope::Upgrade,
+            &target.exe,
+            command.as_ref(),
+            back_command.as_ref(),
+        );
+        if matches!(admission, Ok(super::native_restart::Recovery::Completed)) {
+            break 'signal Some(said(r.clone(), "wait:native-completed"));
+        }
+        if matches!(admission, Ok(super::native_restart::Recovery::Retired)) {
+            break 'signal Some(said(r.clone(), "failed:native-cohort-retired"));
+        }
+        if let Err(why) = admission {
+            // The exact plan/id was saved before dispatch. Preserve it on an unknown ACK;
+            // only a proved pre-mutation abort permits a later fresh constructor.
+            if st.native_prepare.is_empty() || super::native_restart::abort(c, tab, st) {
+                st.unsent(back);
+            }
+            save(opts, &sf.session_id, st);
+            break 'signal Some(said(r.clone(), format!("wait:{why}")));
+        }
+        if st.native.is_some()
+            && (!typing_fence_read(c, tab).is_ok_and(|(_, read)| turn_over(&read))
+                || foreground_shell(k.job(sf.pid)) != Ok(shell)
+                || held(c, tab, grace)
+                || host_claim.is_some_and(|claim| !claim_still_live(c, sf.pid, claim))
+                || require_unique_owner(&opts.home, sf).is_err())
+        {
+            if super::native_restart::abort(c, tab, st) {
+                st.unsent(back);
+            }
+            save(opts, &sf.session_id, st);
+            break 'signal Some(said(r.clone(), "wait:changed-after-native-admission"));
+        }
+        let signal = if let Some(binding) = st.native.as_ref() {
+            super::native_restart::signal(c, tab, binding)
+        } else {
+            terminate(c, tab, pid, grace)
+        };
+        match signal {
             Terminated::Sent => None,
             Terminated::Refused(why) => {
+                if st.native.is_some() {
+                    save(opts, &sf.session_id, st);
+                    break 'signal Some(said(r.clone(), format!("wait:signal-{why}")));
+                }
                 st.unsent(back);
                 st.cause.clear();
                 save(opts, &sf.session_id, st);
@@ -11529,7 +12075,7 @@ fn restart(
         &said(r.clone(), "terminated"),
         if fresh {
             "SIGTERM (no task: restarted afresh, nothing typed or resumed)"
-        } else if pressed && quiet {
+        } else if pressed && st.quiet {
             "SIGTERM (the owner pressed the update arrow: resumed as it was, nothing typed but \
              the relaunch line; any background shell ends with it)"
         } else if pressed {
@@ -11591,6 +12137,14 @@ fn confirmations(opts: &Opts) -> Vec<Report> {
 #[cfg(all(test, unix))]
 #[path = "upgrade_drive_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "native_constructor_state_tests.rs"]
+mod native_constructor_state_tests;
+
+#[cfg(all(test, unix))]
+#[path = "upgrade_drive_hang_tests.rs"]
+mod hang_tests;
 
 #[cfg(test)]
 #[path = "upgrade_snapshot_env_tests.rs"]

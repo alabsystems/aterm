@@ -1176,3 +1176,297 @@ fn the_transcript_sheds_before_what_the_brief_held_without_it() {
     assert!(shed > 0, "past the transcript, the brief sheds as it did");
     assert!(same > shed, "and reads as it did");
 }
+
+/// A shell session (fix J1-2, SMOKE-2b): five closed commands, each with the `prog` run the
+/// status sweep saw beneath it, closed `out=fail` (the first and the last), `ok`, `unknown` (no
+/// exit status) and `signal`; then an input mark and a `shown` mark (a second count line), and
+/// no turns. The last failure stands as the session's need.
+fn shell_session() -> (Log, u64) {
+    let mut log = Log::new(2);
+    log.open_session(
+        Kind::Spawn,
+        Src::Aterm,
+        Conf::Exact,
+        Actor::Aterm,
+        Fields::new(),
+        at(0),
+    )
+    .expect("the session opens");
+    let mut ms = 10;
+    for (out, code) in [
+        (RunOut::Fail, Some(1)),
+        (RunOut::Ok, Some(0)),
+        (RunOut::Unknown, None),
+        (RunOut::Signal, None),
+        (RunOut::Fail, Some(2)),
+    ] {
+        let cmd = log
+            .open(
+                Open::new(Kind::Cmd, Src::Shell, Conf::Strong).under(Node::SESSION),
+                at(ms),
+            )
+            .expect("a command");
+        let prog = log
+            .open(
+                Open::new(Kind::Prog, Src::Status, Conf::Strong)
+                    .under(cmd)
+                    .fields(Fields::new().tok(Key::Prog, "make").expect("prog")),
+                at(ms + 1),
+            )
+            .expect("its program");
+        log.close(
+            prog,
+            Close::new(Out::Run(RunOut::Unknown), Src::Status, Conf::Strong),
+            at(ms + 5),
+        )
+        .expect("the program ends");
+        let mut close = Close::new(Out::Run(out), Src::Shell, Conf::Exact);
+        if let Some(code) = code {
+            close = close.fields(Fields::new().i(Key::Code, code).expect("code"));
+        }
+        log.close(cmd, close, at(ms + 10))
+            .expect("the command ends");
+        ms += 100;
+    }
+    log.mark(
+        Mark::new(Kind::Human, Src::Input, Conf::Strong).by(Actor::Human),
+        at(ms),
+    )
+    .expect("an input");
+    log.mark(
+        Mark::new(Kind::Shown, Src::Aterm, Conf::Strong)
+            .by(Actor::Aterm)
+            .fields(Fields::new().word(Key::Need, "failure").expect("need")),
+        at(ms + 1),
+    )
+    .expect("what the person is shown");
+    (log, WALL0 + ms + 60_000)
+}
+
+fn more_of(text: &str) -> &str {
+    text.lines().last().unwrap_or("")
+}
+
+/// The items of a brief's `more=` line.
+fn more_items(text: &str) -> Vec<&str> {
+    more_of(text)
+        .strip_prefix("more=")
+        .unwrap_or("")
+        .split(',')
+        .collect()
+}
+
+/// BRIEF COUNTS A SHELL SESSION'S CLOSED RUNS (fix J1-2, SMOKE-2b): `runs 5 · fail 2`, the closed
+/// `cmd` runs (never the `prog` runs beneath them) and only those that closed `out=fail` (not
+/// `unknown` or `signal`), a count line that shows exactly when the other count lines do
+/// (`shown 1`); once it is shed `more=` names it `runs:5`, so at no budget is a closed run left
+/// out while `more=` says nothing was.
+#[test]
+fn a_shell_sessions_closed_runs_are_a_count_line_more_names_once_shed() {
+    let (log, now) = shell_session();
+    let count = aterm_slog::brief::runs_line(5, 2);
+    assert_eq!(count, "runs 5 · fail 2");
+    let other = aterm_slog::brief::shown_line(1);
+    let full = log.brief("s-1", 100_000, now);
+    let body = body_lines(&full.text);
+    assert!(body.contains(&count.as_str()), "{}", full.text);
+    assert!(body.contains(&other.as_str()), "{}", full.text);
+    assert!(body[0].contains("need=failure"), "{}", full.text);
+    assert_eq!(more_of(&full.text), "more=-", "{}", full.text);
+    let (mut counted, mut named) = (0, 0);
+    for budget in (0..=full.used + 40).rev() {
+        let b = log.brief("s-1", budget, now);
+        let lines = body_lines(&b.text);
+        let items = more_items(&b.text);
+        let shows = lines.contains(&count.as_str());
+        assert_eq!(
+            shows,
+            lines.contains(&other.as_str()),
+            "budget {budget}: the runs line sheds with the other count lines\n{}",
+            b.text
+        );
+        if shows {
+            counted += 1;
+            assert!(
+                !items.iter().any(|i| i.starts_with("runs:")),
+                "budget {budget}: {}",
+                b.text
+            );
+        } else {
+            named += 1;
+            assert!(
+                items.contains(&"runs:5"),
+                "budget {budget}: the runs left out, yet {}\n{}",
+                more_of(&b.text),
+                b.text
+            );
+        }
+    }
+    assert!(counted > 0, "the count line shows when it fits");
+    assert!(named > 0, "and more= names it once shed");
+    let floor = log.brief("s-1", 0, now);
+    assert_eq!(floor.level, 4, "{}", floor.text);
+    assert!(
+        more_items(&floor.text).contains(&"runs:5"),
+        "{}",
+        floor.text
+    );
+}
+
+/// A session whose shell aterm does not integrate (`integration=off`): each program is a `prog`
+/// run the status sweep opened and closed `out=unknown`, hung from the session with no `cmd`
+/// above it. Returns the log and the seq after each program's open.
+fn unintegrated(progs: &[&str]) -> (Log, Vec<u64>) {
+    let mut log = Log::new(2);
+    log.open_session(
+        Kind::Spawn,
+        Src::Aterm,
+        Conf::Exact,
+        Actor::Aterm,
+        Fields::new(),
+        at(0),
+    )
+    .expect("the session opens");
+    let mut opened = Vec::new();
+    for (i, prog) in progs.iter().enumerate() {
+        let ms = 10 + 100 * i as u64;
+        let run = log
+            .open(
+                Open::new(Kind::Prog, Src::Status, Conf::Strong)
+                    .fields(Fields::new().tok(Key::Prog, prog).expect("prog")),
+                at(ms),
+            )
+            .expect("a program");
+        opened.push(log.last_seq());
+        log.close(
+            run,
+            Close::new(Out::Run(RunOut::Unknown), Src::Status, Conf::Strong),
+            at(ms + 50),
+        )
+        .expect("the program ends");
+    }
+    (log, opened)
+}
+
+/// A SHELL WITHOUT INTEGRATION COUNTS ITS PROGRAMS (fix J1-2, SMOKE-2b's other half): its
+/// programs are `prog` runs hung from the session, so with no command above them they are its
+/// runs, `runs 3 · fail 0` (no exit status was observed, so none failed), and `more=` names them
+/// once shed.
+#[test]
+fn a_shell_without_integration_counts_its_programs_as_runs() {
+    let (log, _) = unintegrated(&["sleep", "sh", "sleep"]);
+    let now = WALL0 + 60_000;
+    let full = log.brief("s-1", 100_000, now);
+    assert!(
+        body_lines(&full.text).contains(&"runs 3 · fail 0"),
+        "{}",
+        full.text
+    );
+    assert_eq!(more_of(&full.text), "more=-", "{}", full.text);
+    let floor = log.brief("s-1", 0, now);
+    assert!(
+        more_items(&floor.text).contains(&"runs:3"),
+        "{}",
+        floor.text
+    );
+}
+
+/// A page from `since=` (fix J1-2): its brief over the records after `since`.
+fn page(log: &Log, since: u64, now: u64) -> String {
+    let read = log.read(Cursor::new(log.ep(), since), usize::MAX);
+    aterm_slog::brief("s-1", read.recs, read.gap, log.state(), &[], 100_000, now).text
+}
+
+/// The runs count line of a brief, if it has one.
+fn runs_of(text: &str) -> Option<&str> {
+    body_lines(text)
+        .into_iter()
+        .find(|l| l.starts_with("runs "))
+}
+
+/// A PAGE PAST A PROGRAM'S OPEN, WITHOUT INTEGRATION (fix J1-2): a `prog` run whose open came
+/// before the page is still a run where nothing shows a command.
+#[test]
+fn a_page_past_an_unintegrated_programs_open_still_counts_it() {
+    let (log, opened) = unintegrated(&["sleep", "make"]);
+    let text = page(&log, opened[1], WALL0 + 60_000);
+    assert_eq!(runs_of(&text), Some("runs 1 · fail 0"), "{text}");
+}
+
+/// A PAGE PAST A COMMAND'S OPEN (fix J1-2): the command and its program opened before the page
+/// and closed in it; the command's close counts it, once, and its program's close (whose open the
+/// page lacks) is the command's.
+#[test]
+fn a_page_past_a_commands_open_counts_the_command_once() {
+    let mut log = Log::new(2);
+    log.open_session(
+        Kind::Spawn,
+        Src::Aterm,
+        Conf::Exact,
+        Actor::Aterm,
+        Fields::new(),
+        at(0),
+    )
+    .expect("the session opens");
+    let cmd = log
+        .open(Open::new(Kind::Cmd, Src::Shell, Conf::Strong), at(10))
+        .expect("a command");
+    let prog = log
+        .open(
+            Open::new(Kind::Prog, Src::Status, Conf::Strong)
+                .under(cmd)
+                .fields(Fields::new().tok(Key::Prog, "make").expect("prog")),
+            at(11),
+        )
+        .expect("its program");
+    let since = log.last_seq();
+    log.close(
+        prog,
+        Close::new(Out::Run(RunOut::Unknown), Src::Status, Conf::Strong),
+        at(50),
+    )
+    .expect("the program ends");
+    let now = WALL0 + 60_000;
+    let open = page(&log, since, now);
+    assert_eq!(
+        runs_of(&open),
+        None,
+        "the fold holds the command open, so the program is its: {open}"
+    );
+    log.close(
+        cmd,
+        Close::new(Out::Run(RunOut::Fail), Src::Shell, Conf::Exact)
+            .fields(Fields::new().i(Key::Code, 2).expect("code")),
+        at(60),
+    )
+    .expect("the command ends");
+    let closed = page(&log, since, now);
+    assert_eq!(runs_of(&closed), Some("runs 1 · fail 1"), "{closed}");
+}
+
+/// THE ONE-LINE FLOOR (§7.4's last shedding step, fix J1-2): a budget below the floor's size gets
+/// the floor, its header saying `budget=<the budget>` and `used=<the floor's own size>`, so
+/// `used=` exceeds the budget rather than a reply claiming to fit.
+#[test]
+fn a_budget_below_the_floor_gets_the_floor_and_used_says_its_size() {
+    let (log, now) = shell_session();
+    let floor = log.brief("s-1", 0, now);
+    assert_eq!(floor.level, 4, "{}", floor.text);
+    assert!(floor.used > 1, "{}", floor.text);
+    for budget in 1..floor.used {
+        let b = log.brief("s-1", budget, now);
+        assert_eq!(b.level, 4, "budget {budget}: {}", b.text);
+        assert_eq!(
+            body_lines(&b.text),
+            body_lines(&floor.text),
+            "budget {budget}"
+        );
+        assert!(b.used > budget, "budget {budget}: {}", b.text);
+        assert_eq!(b.used, tokens(b.text.len()), "budget {budget}: {}", b.text);
+        let header = b.text.lines().next().unwrap_or("");
+        assert!(
+            header.ends_with(&format!(" budget={budget} used={}", b.used)),
+            "{header}"
+        );
+    }
+}

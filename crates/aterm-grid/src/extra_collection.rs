@@ -39,6 +39,14 @@ impl ComplexCharRing {
         }
     }
 
+    /// Heap bytes held by the backing `entries` vector.
+    #[inline]
+    fn heap_bytes(&self) -> usize {
+        self.entries
+            .capacity()
+            .saturating_mul(std::mem::size_of::<char>())
+    }
+
     /// Flat index of (external row, col); callers ensure `col < stride`.
     #[inline(always)]
     fn index(&self, row: u16, col: u16) -> usize {
@@ -892,6 +900,12 @@ impl CellExtras {
         }
     }
 
+    /// Whether a dense complex-char ring has been allocated.
+    #[inline]
+    pub(crate) const fn has_complex_ring(&self) -> bool {
+        self.complex_ring.is_some()
+    }
+
     /// Clear the dense complex-char ring entries for a `width`-cell span starting at `(row, col)`, if a ring exists.
     #[inline]
     pub(crate) fn clear_complex_ring_cell(&mut self, row: u16, col: u16, width: u16) {
@@ -1690,7 +1704,14 @@ impl CellExtras {
             .map(CellExtra::memory_used)
             .fold(0, usize::saturating_add);
         let rgb_mem = self.rgb_ring.as_ref().map(|r| r.heap_bytes()).unwrap_or(0);
-        base.saturating_add(extras_mem).saturating_add(rgb_mem)
+        let complex_mem = self
+            .complex_ring
+            .as_ref()
+            .map(|r| r.heap_bytes())
+            .unwrap_or(0);
+        base.saturating_add(extras_mem)
+            .saturating_add(rgb_mem)
+            .saturating_add(complex_mem)
     }
 
     /// Number of valid extras entries excluding scrolled-off rows.
@@ -2301,5 +2322,18 @@ mod tests {
                 "col {col} lost its id to a neighbour's edit"
             );
         }
+    }
+
+    #[test]
+    fn memory_used_counts_complex_char_ring_heap_bytes() {
+        let mut extras = CellExtras::new();
+        let before = extras.memory_used();
+        extras.set_complex_char_ring(0, 0, '\u{1F680}', 24, 80);
+        let after = extras.memory_used();
+        assert_eq!(
+            after - before,
+            24 * 80 * std::mem::size_of::<char>(),
+            "allocating the complex-char ring must account for its backing entries"
+        );
     }
 }

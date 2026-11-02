@@ -615,6 +615,121 @@ fn a_transcripts_text_never_reaches_the_log() {
     assert!(!bus.join("\n").contains("SENTINELTOOL"), "{bus:?}");
 }
 
+/// A Claude Code 2.1.310 turn's rows, its end written while the dynamic workflow it started runs
+/// on (`pendingWorkflowCount`), as the live transcript of the cruise stall wrote them.
+fn workflow_turn(ms: u64) -> Vec<String> {
+    let v = r#""version":"2.1.310""#;
+    vec![
+        format!(
+            r#"{{"parentUuid":"p","isSidechain":false,"promptId":"v1","type":"user","message":{{"role":"user","content":"fix it"}},"uuid":"u-v1","timestamp":"{}",{v}}}"#,
+            at(ms)
+        ),
+        calls("m1", ms + 100, &[("toolu_wf", "Workflow")]).replace(r#""version":"2.1.300""#, v),
+        results(ms + 200, &[("toolu_wf", false)]),
+        format!(
+            r#"{{"parentUuid":"p","isSidechain":false,"type":"system","subtype":"turn_duration","durationMs":400,"messageCount":9,"pendingWorkflowCount":3,"timestamp":"{}","uuid":"d-{ms}","isMeta":false,{v}}}"#,
+            at(ms + 400)
+        ),
+    ]
+}
+
+/// The turn Claude Code opens on its own when background work it started ends (a
+/// `<task-notification>` row, `origin.kind=task-notification`), and that turn's end.
+fn notification_turn(ms: u64) -> Vec<String> {
+    let v = r#""version":"2.1.310""#;
+    vec![
+        format!(
+            r#"{{"parentUuid":"p","isSidechain":false,"promptId":"v2","type":"user","message":{{"role":"user","content":"<task-notification>\n<task-id>bdqlme1ij</task-id>\n<status>completed</status>\n</task-notification>"}},"uuid":"u-v2","timestamp":"{}","origin":{{"kind":"task-notification","producer":"session-task"}},"promptSource":"system","turnOrigin":"task_notification",{v}}}"#,
+            at(ms)
+        ),
+        calls("m2", ms + 100, &[("toolu_b", "Bash")]).replace(r#""version":"2.1.300""#, v),
+        results(ms + 200, &[("toolu_b", false)]),
+        format!(
+            r#"{{"parentUuid":"p","isSidechain":false,"type":"system","subtype":"turn_duration","durationMs":300,"messageCount":12,"timestamp":"{}","uuid":"d-{ms}","isMeta":false,{v}}}"#,
+            at(ms + 300)
+        ),
+    ]
+}
+
+/// THE CRUISE STALL OF 2026-10-24..27, replayed: a Claude Code turn ends while its own background
+/// work runs on, its screen (captured live: `Waiting for 3 dynamic workflows to finish` under an
+/// open composer) published as `rest`; the work later wakes it with a notification turn. Returns
+/// the log's lines.
+fn turns_over_background_work(name: &str, rest: &'static str) -> Vec<String> {
+    let mut r = Rig::new(name);
+    r.touch();
+    let _ = r.read(&LogWake::default());
+    r.publish(1_000, "busy", 5);
+    r.append(&workflow_turn(1_100));
+    let _ = r.read(&LogWake::default());
+    r.publish(2_000, rest, 6);
+    r.hand.set(3_100);
+    let _ = r.tl.lock().unwrap().slog_tick();
+    // The workflow ends: Claude Code's own wake runs a turn, and it ends over the work left.
+    r.publish(10_050, "busy", 7);
+    r.append(&notification_turn(10_000));
+    let _ = r.read(&LogWake::default());
+    r.publish(11_000, rest, 8);
+    r.hand.set(12_100);
+    let _ = r.tl.lock().unwrap().slog_tick();
+    r.lines()
+}
+
+#[test]
+fn a_turn_that_ends_under_its_own_background_work_closes_and_so_does_its_wake() {
+    use crate::presence::{Cursor, agent_verdict};
+    use aterm_phase::prompt::fixtures::{WAITING_WORKFLOWS_2_1_310, screen};
+    let rows = screen(WAITING_WORKFLOWS_2_1_310);
+    let caret = rows.iter().position(|r| r.starts_with('❯'));
+    let verdict = agent_verdict(
+        Some("claude"),
+        false,
+        None,
+        &rows,
+        Cursor::At(caret),
+        std::time::Instant::now(),
+    );
+    let rest = verdict.word();
+    assert_eq!(rest, "idle", "the captured screen's turn end is published");
+    let got = turns_over_background_work("slog-tx-bg-rest", rest);
+    for t in ["t1", "t2"] {
+        let closed = having(&got, &format!(" close {t} turn "));
+        assert!(
+            closed.len() == 1
+                && closed[0].contains(" out=done ")
+                && closed[0].contains(" src=screen "),
+            "{t} ends at its turn end: {got:#?}"
+        );
+    }
+    assert_eq!(having(&got, " open t").len(), 2, "two turns: {got:#?}");
+    assert_eq!(
+        having(&got, " amend t1 turn vdur_ms=400 ").len(),
+        1,
+        "{got:#?}"
+    );
+    assert_eq!(
+        having(&got, " amend t2 turn vdur_ms=300 ").len(),
+        1,
+        "the wake's end is its own turn's: {got:#?}"
+    );
+    assert_eq!(having(&got, " turn vref=v2 ").len(), 1, "{got:#?}");
+    time_order_holds(&got).unwrap();
+
+    // CONTROL: the same rows with the screen read as the reader's phase alone (`busy`, what the
+    // stalled build published) reproduce the stall: one turn, never closed, and the wake's end
+    // folded into it (the live log's `amend t4098 turn vdur_ms=… by=vendor src=transcript`).
+    let reader_phase = aterm_phase::read(Some("claude"), &rows, None).phase;
+    assert_eq!(reader_phase, aterm_phase::Phase::Busy);
+    let stalled = turns_over_background_work("slog-tx-bg-busy", reader_phase.name());
+    assert!(having(&stalled, " close t").is_empty(), "{stalled:#?}");
+    assert_eq!(having(&stalled, " open t").len(), 1, "{stalled:#?}");
+    assert_eq!(
+        having(&stalled, " amend t1 turn vdur_ms=").len(),
+        2,
+        "{stalled:#?}"
+    );
+}
+
 const THREAD: &str = "019a0000-0000-7000-8000-00000000000a";
 
 fn rollout_rows(build: &str) -> String {
@@ -802,61 +917,6 @@ fn no_task(_: u32) -> Option<String> {
 
 fn alab_12521(_: u32) -> Option<String> {
     Some("0.164.0-dev.12521+g3d3eb12d8".to_string())
-}
-
-/// A Codex package has a product version and a client version with different numeric cores.
-/// The tap binds using the client, publishes the product from the same running image, and
-/// keeps a pending product upgrade while the harness is off until that product is running.
-#[test]
-fn a_codex_product_build_labels_the_image_and_keeps_its_pending_upgrade() {
-    use crate::claude_footer::{TopCli, UpState};
-    use aterm_agent::harness::upgrade::{Agent, Phase};
-    use aterm_agent::harness::upgrade_drive::Row;
-
-    const OLD: &str = "0.1.0-dev.13764+codex.0.164.0.g4b3a367a0";
-    const NEXT: &str = "0.1.0-dev.13765+codex.0.164.0.g5c4b3a210";
-    const BEFORE: Image = Image {
-        build: |_| Some("0.165.0-dev.13764+g4b3a367a0".into()),
-        version: |_| Some(OLD.into()),
-        ..MEASURED
-    };
-    const AFTER: Image = Image {
-        build: |_| Some("0.165.0-dev.13765+g5c4b3a210".into()),
-        version: |_| Some(NEXT.into()),
-        ..MEASURED
-    };
-    const LATER: &str = "0.1.0-dev.13766+codex.0.164.0.g6d5c4b321";
-    const EXTERNALLY_UPDATED: Image = Image {
-        build: |_| Some("0.165.0-dev.13766+g6d5c4b321".into()),
-        version: |_| Some(LATER.into()),
-        ..MEASURED
-    };
-    for (name, image, product, held) in [
-        ("before", BEFORE, OLD, UpState::Held),
-        ("after", AFTER, NEXT, UpState::None),
-        ("later", EXTERNALLY_UPDATED, LATER, UpState::None),
-    ] {
-        let client = (image.build)(300).unwrap();
-        let (tl, _home, target, claim) = codex_rig(name, "codex", &client);
-        let mut host = Host::default();
-        assert!(host.ask(0xC0DE_13764, &claim.0, target, image).is_some());
-        let mut timeline = tl.lock().unwrap();
-        assert_eq!(timeline.codex_build(), Some(product));
-        assert!(timeline.set_upgrade(Some(Row {
-            agent: Agent::Codex,
-            from: OLD.into(),
-            to: NEXT.into(),
-            phase: Phase::Pending,
-            ..Row::default()
-        })));
-        assert!(timeline.set_upgrade(None));
-        let cli = TopCli::from_timeline(&timeline);
-        assert_eq!(cli.ver.as_str(), product);
-        assert_eq!(cli.kept.state, held);
-        if held == UpState::Held {
-            assert_eq!(cli.kept.to.as_str(), NEXT);
-        }
-    }
 }
 
 #[test]
@@ -1786,49 +1846,6 @@ fn the_rollout_tap_publishes_the_survey_facts_for_the_claimants_group_whatever_i
         Some("Ship native protocol".into()),
         "the session record's native goal rides with the facts"
     );
-}
-
-/// THE IMAGE'S BUILD: the tap names the ALab build the claimant's image runs on its own slot, the
-/// top rule's label's, whether or not a rollout is found; with no rollout, task or goal it
-/// publishes no survey facts, so the survey keeps reading that tab's screen. The stop forgets it.
-#[test]
-fn the_rollout_tap_names_the_images_build_apart_from_the_survey_facts() {
-    const PRODUCT: &str = "0.1.0-dev.13765+codex.0.164.0.g0a9d57d89";
-    const IMAGE: Image = Image {
-        version: |_| Some(PRODUCT.into()),
-        ..MEASURED
-    };
-    let survey = |tl: &Arc<Mutex<SessionTimeline>>| tl.lock().unwrap().codex_survey().cloned();
-    let build =
-        |tl: &Arc<Mutex<SessionTimeline>>| tl.lock().unwrap().codex_build().map(str::to_owned);
-    let mut host = Host::default();
-    for rollout in [true, false] {
-        let (tl, home, target, claim) = codex_rig(
-            &format!("build-{rollout}"),
-            "codex",
-            "0.164.0-dev.12521+g3d3eb12d8",
-        );
-        if !rollout {
-            std::fs::remove_dir_all(home.path().join("sessions")).expect("no rollout");
-        }
-        let result = host.ask(0xC0DE_0073, &claim.0, target, IMAGE);
-        assert!(
-            result.is_some(),
-            "rollout {rollout}: the claimant is current"
-        );
-        assert_eq!(
-            build(&tl).as_deref(),
-            Some(PRODUCT),
-            "rollout {rollout}: the image's product is named separately from its client"
-        );
-        assert_eq!(
-            survey(&tl).is_some(),
-            rollout,
-            "rollout {rollout}: survey facts only from what the tap read"
-        );
-        host.stop(0xC0DE_0073, &claim.0);
-        assert_eq!(build(&tl), None, "rollout {rollout}: the stop forgets it");
-    }
 }
 
 /// The record a test planted under `home` for `pid`, read with no look at the process (the rig's

@@ -65,6 +65,10 @@ const DEFAULT_WINDOW_MS: u64 = 60_000;
 
 const HOLD_MAX: usize = 4 << 20;
 
+/// The words a follower's stderr says its durable wait with, once per log, after the selector's
+/// label (fix unit E5, E2E-15).
+pub const DURABLE_WAIT_WORDS: &str = "waits for each record until the broker says it is durable";
+
 /// The development seam that has a following notifier tell the fabric bench the flushes its
 /// store asked for ([`FLUSH_TALLY`]).
 pub const FLUSH_TALLY_SEAM: &str = "ATERM_LINK_NOTIFY_FLUSH_TALLY";
@@ -458,7 +462,8 @@ enum Stand {
 /// One need on a `need` face's standing value ([`Notifier::entries_of`]): its pair, and whether
 /// its page is owed: it rose and its command ended other than `rc=0`, or `--rate` dropped it.
 /// An owed need stands for no warm-up ([`Notifier::seed_standing`]), so it pages again at its
-/// face's next record, in this run or after a restart.
+/// face's next record whose fold still sees it ([`crate::notify_need::Named`]), in this run or
+/// after a restart, however that fold knows its raise.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Entry {
     pair: Pair,
@@ -590,22 +595,26 @@ impl Store {
             }
         });
         let target = self.root.join(name);
-        let tmp = target.with_extension("tmp");
         let dir = target.parent().unwrap_or(&self.root).to_path_buf();
         std::fs::create_dir_all(&dir)?;
-        {
-            let mut f = std::fs::File::create(&tmp)?;
+        let (tmp, mut f) = crate::enable::create_temp_beside(&target, 0o600)?;
+        let staged = (|| {
             f.write_all(value.as_bytes())?;
             f.write_all(b"\n")?;
             aterm_durable::ordered_or_fsync(&f)?;
             note_flush(Flush::Ordered);
+            drop(f);
+            std::fs::rename(&tmp, &target)
+        })();
+        if let Err(e) = staged {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
         }
-        std::fs::rename(&tmp, &target)?;
         Ok(dir)
     }
 
     fn read(&self, name: &str) -> Option<String> {
-        std::fs::read_to_string(self.root.join(name))
+        read_bounded_text(&self.root.join(name), HOLD_MAX)
             .ok()
             .map(|s| s.trim_end_matches('\n').to_string())
             .filter(|s| !s.is_empty())
@@ -622,7 +631,7 @@ impl Store {
         };
         let name = log.to_string();
         let path = self.root.join("log");
-        let owner = match std::fs::read_to_string(&path) {
+        let owner = match read_bounded_text(&path, 4096) {
             Ok(saved) => Some(
                 astream_broker::LogIdentity::parse(saved.trim_end_matches('\n')).ok_or_else(
                     || {
@@ -703,7 +712,7 @@ impl Store {
 
     fn carry_text(&self, name: &str) -> io::Result<Option<String>> {
         let path = self.root.join(name);
-        match std::fs::read_to_string(&path) {
+        match read_bounded_text(&path, HOLD_MAX) {
             Ok(text) => Ok(Some(text)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 match std::fs::symlink_metadata(&path) {
@@ -732,11 +741,14 @@ impl Store {
                     for entry in entries {
                         let entry = entry?;
                         let name = entry.file_name();
-                        let Some(key) = name.to_str().filter(|k| !k.contains('.')) else {
+                        let Some(key) = name
+                            .to_str()
+                            .filter(|k| !k.starts_with('.') && !k.ends_with(".tmp"))
+                        else {
                             continue;
                         };
-                        let text = std::fs::read_to_string(entry.path())?;
-                        let off = text.trim().parse::<u64>().map_err(|_| {
+                        let text = read_bounded_text(&entry.path(), 4096)?;
+                        let off = crate::parse_uint::<u64>(text.trim()).ok_or_else(|| {
                             io::Error::new(
                                 io::ErrorKind::InvalidData,
                                 "invalid carried notifier cursor",
@@ -764,7 +776,7 @@ impl Store {
                 .filter(|line| {
                     line.split_whitespace()
                         .next()
-                        .and_then(|t| t.parse::<u64>().ok())
+                        .and_then(crate::parse_uint::<u64>)
                         .is_some_and(|off| off < fork)
                 })
                 .map(str::to_string)
@@ -823,7 +835,7 @@ impl Store {
 
     fn cursor(&self, key: &str) -> Option<u64> {
         self.read(&format!("cur/{key}"))
-            .and_then(|s| s.trim().parse().ok())
+            .and_then(|s| crate::parse_uint(s.trim()))
     }
 
     /// Move `key`'s cursor forward to `off` (never back), ordered: a cursor a power loss takes
@@ -847,7 +859,11 @@ impl Store {
 
     fn stamps(&self) -> Vec<u64> {
         self.read("rate")
-            .map(|s| s.split(',').filter_map(|t| t.trim().parse().ok()).collect())
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|t| crate::parse_uint(t.trim()))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -883,10 +899,10 @@ impl Store {
     fn suppressed(&self) -> (u64, u64) {
         let text = self.read("suppressed").unwrap_or_default();
         let mut words = text.split_whitespace();
-        let n = words.next().and_then(|n| n.parse().ok()).unwrap_or(0);
+        let n = words.next().and_then(crate::parse_uint).unwrap_or(0);
         let mark = words
             .find_map(|w| w.strip_prefix("t="))
-            .and_then(|m| m.parse().ok())
+            .and_then(crate::parse_uint)
             .unwrap_or(0);
         (n, mark)
     }
@@ -931,10 +947,56 @@ impl Fault {
     }
 
     fn fire(self, store: &Store) -> ! {
-        let _ = std::fs::write(store.root.join("fault-fired"), b"1\n");
+        let _ = write_unflushed_private(&store.root.join("fault-fired"), b"1\n");
         eprintln!("aterm-link notify: ATERM_LINK_NOTIFY_FAULT={self:?}: dying");
         aterm_uds::process::kill_self_now()
     }
+}
+
+fn read_bounded_text(path: &Path, max_bytes: usize) -> io::Result<String> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let bound = max_bytes
+        .checked_add(1)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "read limit overflow"))?;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)?;
+    let meta = f.metadata()?;
+    if !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{}: not a regular file", path.display()),
+        ));
+    }
+    if meta.len() > max_bytes as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{}: exceeds {max_bytes} bytes", path.display()),
+        ));
+    }
+    let mut bytes = Vec::new();
+    f.take(bound as u64).read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{}: exceeds {max_bytes} bytes", path.display()),
+        ));
+    }
+    String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+fn write_unflushed_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let (tmp, mut f) = crate::enable::create_temp_beside(path, 0o600)?;
+    let res = f.write_all(bytes).and_then(|()| {
+        drop(f);
+        std::fs::rename(&tmp, path)
+    });
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
 }
 
 /// Everything the verb was told.
@@ -988,6 +1050,15 @@ struct Notifier {
     held: Vec<std::collections::VecDeque<Held>>,
     /// The bytes [`Self::held`] holds, against [`HOLD_MAX`].
     held_bytes: usize,
+    /// By selector index, whether the durable wait was said for the log its reader reads now:
+    /// once per selector per log (fix unit E5, E2E-15), again only for another log or another
+    /// `ordered` ([`Notice::Log`]).
+    durable_said: Vec<bool>,
+    /// By selector index, while a streak of holds past [`HOLD_MAX`] lasts, the newest record
+    /// it paged before the broker said it durable. The hold is said once per streak, which
+    /// ends once the broker's durable head passes that record, or with another log or another
+    /// `ordered` ([`Notice::Log`]), however the held queue emptied (fix unit E5, E2E-15).
+    over_paged: Vec<Option<u64>>,
     scanned: Vec<Option<u64>>,
     /// By selector index, the durable head the reader's current connection last told
     /// ([`Notice::Durable`]).
@@ -1056,6 +1127,8 @@ impl Notifier {
             wait_durable: aterm_types::dev_seam!("ATERM_LINK_NOTIFY_PAGE_EARLY").is_none(),
             held: (0..n).map(|_| std::collections::VecDeque::new()).collect(),
             held_bytes: 0,
+            durable_said: vec![false; n],
+            over_paged: vec![None; n],
             scanned: vec![None; n],
             durable: vec![0; n],
             need,
@@ -1101,7 +1174,7 @@ impl Notifier {
             now.0,
             now.1
         );
-        if let Err(e) = std::fs::write(&*path, tally) {
+        if let Err(e) = write_unflushed_private(path, tally.as_bytes()) {
             warn(&format!("{FLUSH_TALLY_SEAM}: {e}"));
         }
     }
@@ -1182,7 +1255,7 @@ impl Notifier {
     fn verdict(&self, off: u64) -> Option<&str> {
         self.journal.iter().find_map(|line| {
             let mut it = line.split_whitespace();
-            let at: u64 = it.next()?.parse().ok()?;
+            let at: u64 = crate::parse_uint(it.next()?)?;
             (at == off).then(|| it.next()).flatten()
         })
     }
@@ -1190,7 +1263,7 @@ impl Notifier {
     fn told(&self, off: u64) -> bool {
         self.journal.iter().any(|line| {
             let mut it = line.split_whitespace();
-            it.next().and_then(|t| t.parse::<u64>().ok()) == Some(off)
+            it.next().and_then(crate::parse_uint::<u64>) == Some(off)
                 && it.next() == Some("fired")
                 && it.any(|t| t == "rc=0")
         })
@@ -1341,7 +1414,7 @@ impl Notifier {
         self.journal.retain(|l| {
             l.split_whitespace()
                 .next()
-                .and_then(|t| t.parse::<u64>().ok())
+                .and_then(crate::parse_uint::<u64>)
                 != Some(off)
         });
         self.journal.push(line);
@@ -1430,7 +1503,7 @@ impl Notifier {
         let verdict = words.nth(1);
         let Some(t) = words
             .find_map(|w| w.strip_prefix("t="))
-            .and_then(|t| t.parse::<u64>().ok())
+            .and_then(crate::parse_uint::<u64>)
         else {
             return;
         };
@@ -1681,12 +1754,18 @@ impl Notifier {
 
     /// What a `need` selector makes of one record. A whole fold keeps on the face the entries
     /// it still holds (a partial one keeps them all), an unknown raise read from an old store
-    /// taking the fold's pair it matches; a session that exited without its close keeps none; a
-    /// node's will keeps them, so a reattach that restores the same needs pages nothing. The
-    /// hit, and the pair it leaves standing once its command ran (or owed when it did not), is
-    /// the most urgent need `sel` selects that rose where the watch saw it and is no pair
-    /// standing: one a whole fold names, or one whose raise a partial fold holds with nothing
-    /// lost after it.
+    /// taking the fold's pair it matches; a session that exited without its close keeps none,
+    /// unless a successor's restore says it died (its incarnation ended without withdrawing it,
+    /// [`crate::fabric_brief::Died::Restored`]): the watch derives that close and judges the
+    /// restore as the dead session's record, so its `exited` (detail `gone`) pages once for its
+    /// space (fix unit E9); a node's will keeps them, so a reattach that restores the same needs
+    /// pages nothing. The hit, and the pair it leaves standing once its command ran (or owed
+    /// when it did not), is the most urgent need `sel` selects that rose where the watch saw it
+    /// and is no pair standing (one a whole fold names, or one whose raise a partial fold holds
+    /// with nothing lost after it), or that is the same need as an entry owed on the face and
+    /// that the fold still sees ([`crate::notify_need::Named`]): an owed page runs again however
+    /// the fold now knows the need's raise (a snapshot past it after a restart or a refold), and
+    /// whatever older need of its word stands on the face (fix unit J0-3).
     fn need_hit(
         &mut self,
         sel: &Sel,
@@ -1730,8 +1809,11 @@ impl Notifier {
         }
         let stands =
             |n: &crate::notify_need::Named| kept.iter().any(|e| !e.owed && n.pair.same(&e.pair));
+        let owed =
+            |n: &crate::notify_need::Named| kept.iter().any(|e| e.owed && n.pair.same(&e.pair));
+        let due = |n: &&crate::notify_need::Named| (n.rose && !stands(n)) || (n.seen && owed(n));
         let selected = |n: &&crate::notify_need::Named| sel.selects(n.pair.word);
-        let Some(rose) = needs.iter().filter(selected).find(|n| n.rose && !stands(n)) else {
+        let Some(rose) = needs.iter().filter(selected).find(due) else {
             if needs.iter().filter(selected).any(stands) {
                 self.counts.standing += 1;
             }
@@ -1945,7 +2027,8 @@ impl Notifier {
             }
         });
         let mut cmd = aterm_uds::spawnfd::command("/bin/sh");
-        cmd.arg("-c")
+        cmd.process_group(0)
+            .arg("-c")
             .arg(&self.cfg.exec)
             .stdin(Stdio::null())
             .env("ATERM_NOTIFY_FLEET", &self.cfg.fleet)
@@ -1967,7 +2050,7 @@ impl Notifier {
                 return "rc=spawn-failed".to_string();
             }
         };
-        let deadline = Instant::now() + self.cfg.exec_timeout;
+        let deadline = Instant::now().checked_add(self.cfg.exec_timeout);
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
@@ -1995,9 +2078,11 @@ impl Notifier {
                     return "rc=wait-failed".to_string();
                 }
             }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                if let Ok(pgid) = i32::try_from(child.id()) {
+                    let _ = aterm_uds::process::kill_group_until_empty(pgid);
+                }
+                aterm_uds::deadline::kill_within(&mut child, Duration::from_secs(5));
                 eprintln!(
                     "aterm-link notify: --exec timed out for off={}; killed",
                     hit.offset
@@ -2234,6 +2319,10 @@ impl Notifier {
                 }
                 self.durable[idx] = 0;
                 let ordered = log.ordered;
+                if (slot.id, slot.ordered) != (log.id, ordered) {
+                    self.durable_said[idx] = false;
+                    self.over_paged[idx] = None;
+                }
                 self.reader_log[idx] = log;
                 if !ordered && !self.held[idx].is_empty() {
                     self.release(idx, u64::MAX)?;
@@ -2274,19 +2363,27 @@ impl Notifier {
                     let size = subject.len() + body.len();
                     let over = self.held_bytes + size > HOLD_MAX;
                     if over {
-                        eprintln!(
-                            "aterm-link notify: {} holds {} bytes the broker has not said are \
-                             durable — past {HOLD_MAX}, so they are paged now, before it does",
-                            sel.label(),
-                            self.held_bytes + size
-                        );
-                    } else if self.held[idx].is_empty() {
-                        eprintln!(
-                            "aterm-link notify: {} off={off} waits until the broker says it \
-                             is durable (it serves ordered: its horizon plus one batch \
-                             and one full flush)",
+                        let streak = self.over_paged[idx].is_some_and(|o| self.durable[idx] <= o);
+                        self.over_paged[idx] = Some(off);
+                        if !streak {
+                            warn(&format!(
+                                "{} holds {} bytes the broker has not said are durable — past \
+                                 {HOLD_MAX}, so they are paged now, before it does (said once \
+                                 until it says they are)",
+                                sel.label(),
+                                self.held_bytes + size
+                            ));
+                            #[cfg(test)]
+                            WARNED.with(|warned| warned.borrow_mut().push(Warned::HoldOver(idx)));
+                        }
+                    } else if !std::mem::replace(&mut self.durable_said[idx], true) {
+                        warn(&format!(
+                            "{} {DURABLE_WAIT_WORDS} (it serves ordered: its horizon plus one \
+                             batch and one full flush); said once for this log",
                             sel.label()
-                        );
+                        ));
+                        #[cfg(test)]
+                        WARNED.with(|warned| warned.borrow_mut().push(Warned::DurableWait(idx)));
                     }
                     self.held_bytes += size;
                     self.held[idx].push_back(Held { off, subject, body });
@@ -2376,10 +2473,11 @@ impl Notifier {
     fn judge(&mut self, sel: &Sel, off: u64, subject: &str, body: &[u8]) -> Result<(), Stalled> {
         let verdicts = self.verdicts();
         self.on_record(sel, off, subject, body)?;
+        let next = off.saturating_add(1);
         if self.verdicts() == verdicts {
-            self.advance(&sel.key(), off + 1);
+            self.advance(&sel.key(), next);
         } else {
-            self.checkpoint(&sel.key(), off + 1);
+            self.checkpoint(&sel.key(), next);
         }
         Ok(())
     }
@@ -2391,6 +2489,12 @@ fn reader(idx: usize, sel: &Sel, cfg: &Config, root: &Path, tx: &mpsc::SyncSende
     let mut seen: Option<u64> = None;
     let mut seen_on: Option<PathBuf> = None;
     let mut backoff = Backoff::default();
+    let mut outage = transport::Outage::default();
+    let say = |line: Option<String>| {
+        if let Some(line) = line {
+            eprintln!("aterm-link notify: {} {line}", sel.label());
+        }
+    };
     loop {
         let wait = match connect_for_reader(cfg, root, &key, &filter, &mut seen, &mut seen_on) {
             Ok((mut conn, closer, mut from, log)) => {
@@ -2438,7 +2542,8 @@ fn reader(idx: usize, sel: &Sel, cfg: &Config, root: &Path, tx: &mpsc::SyncSende
                         if tx.send(Notice::Record(idx, off, subject, body)).is_err() {
                             return;
                         }
-                        seen = Some(seen.map_or(off + 1, |s| s.max(off + 1)));
+                        let after = off.saturating_add(1);
+                        seen = Some(seen.map_or(after, |s| s.max(after)));
                     }
                     if tx.send(Notice::Checkpoint(idx, next)).is_err() {
                         return;
@@ -2459,6 +2564,7 @@ fn reader(idx: usize, sel: &Sel, cfg: &Config, root: &Path, tx: &mpsc::SyncSende
                     match conn.subscribe(from, &filter) {
                         Ok(mut sub) => {
                             let _ = closer.set_read_timeout(None);
+                            say(outage.attached(Instant::now()));
                             loop {
                                 match sub
                                     .recv_live_event(&closer, astream_broker::IDLE_MARK_DEADLINE)
@@ -2472,7 +2578,8 @@ fn reader(idx: usize, sel: &Sel, cfg: &Config, root: &Path, tx: &mpsc::SyncSende
                                         {
                                             return;
                                         }
-                                        seen = Some(seen.map_or(off + 1, |s| s.max(off + 1)));
+                                        let after = off.saturating_add(1);
+                                        seen = Some(seen.map_or(after, |s| s.max(after)));
                                     }
                                     Ok(Some(astream_broker::Event::Mark { durable, .. })) => {
                                         if let Some(durable) = durable {
@@ -2498,19 +2605,13 @@ fn reader(idx: usize, sel: &Sel, cfg: &Config, root: &Path, tx: &mpsc::SyncSende
                                 }
                             }
                         }
-                        Err(e) => eprintln!(
-                            "aterm-link notify: {} could not subscribe: {e}",
-                            sel.label()
-                        ),
+                        Err(e) => say(outage.failed(Instant::now(), &e)),
                     }
                 }
                 backoff.lost(Instant::now())
             }
             Err(e) => {
-                eprintln!(
-                    "aterm-link notify: {} could not subscribe: {e}",
-                    sel.label()
-                );
+                say(outage.failed(Instant::now(), &e));
                 Some(backoff.failed())
             }
         };
@@ -2596,16 +2697,20 @@ thread_local! {
     /// While `Some`, the name of each [`Store::put`] this thread made, in order.
     static PUT_NAMES: std::cell::RefCell<Option<Vec<String>>> =
         const { std::cell::RefCell::new(None) };
-    /// What the backoff warned of on this thread ([`Notifier::fail`], [`Notifier::settle`]).
+    /// What the notifier warned of on this thread ([`Notifier::fail`], [`Notifier::settle`],
+    /// [`Notifier::take_one`]).
     static WARNED: std::cell::RefCell<Vec<Warned>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// A warning of the backoff, as [`WARNED`] keeps it: a refusal and its errno, or its end.
+/// A warning, as [`WARNED`] keeps it: the backoff's refusal and its errno, or its end; a
+/// selector's durable wait, or its hold past [`HOLD_MAX`] (fix unit E5).
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Warned {
     Refused(Option<i32>),
     Cleared,
+    DurableWait(usize),
+    HoldOver(usize),
 }
 
 /// The errno a test has the store refuse the put of `name` with ([`REFUSE`]): the first entry
@@ -2678,31 +2783,53 @@ A `need` folds the records below its cursor, up to `fabric brief`'s window, befo
 it judges one: every need that warm-up finds stands, so a notifier pages only a need raised
 at or past its cursor (a fresh one's is the head). A need whose command did not end
 `rc=0`, or that `--rate` dropped, is owed: no warm-up stands it, and it pages again at its
-session's next record, in the same run or the next (`--once` too). A session whose own row
+session's next record that still shows it (the record that raised it, or a whole snapshot
+naming it, with nothing lost after), in the same run or the next (`--once` too), whatever
+older need of its word stands. A session whose own row
 says it exited before its close reached the bus has no need; a session's close raises
 `exited`, which pages once, whether the close or the exited row reached the bus first. A
+session whose close never reached the bus pages `exited` with detail `gone` once, at a
+successor's restore that names it (`restore prev=<sid>`), when its aterm died: the
+incarnation that hosted it ended and never said it exited, as `fabric brief` derives its
+close. A quit withdraws every session it carried, so the restores of the relaunch after it
+page nothing, nor does a reopened tab's. A
 node's will (its row's `state=away`, or the legacy `gone`) pages and clears nothing, so a
 reattach that restores the same needs pages nothing. A session whose fold is partial (the
 brief's `partial`: no start, lost records, or a snapshot short of its needs) clears nothing,
-and pages a need only when it holds the record that raised it and lost nothing after it; a
-need only a snapshot names never pages. A need a consumer claims
+and pages a need only when it holds the record that raised it and lost nothing after it. A
+need only a snapshot names pages once, at the first whole snapshot (one that lists every need
+its session held) naming it with nothing lost past it, only when the bus lost its raising
+record while the follower read the session whole: the follower judged a record of the session
+whose fold was whole with nothing lost and did not name the need, so it pages though an older
+need of its word stands; one that stood before then never pages. A need a consumer claims
 (`aterm ctl @<sid> mark - need word=<review|decision|help>`) never pages:
 `aterm ctl @<sid> await log need` waits on it in the session's own log. On an `ordered`
-broker a record waits until it is durable; `--once` leaves one not yet durable for the next
-run. Prints `notify: fired= dup= skipped= dropped= suppressed= standing=` on exit. Exits 2
+broker a record waits until it is durable, which stderr says once per log; `--once` leaves
+one not yet durable for the next run. A follower that cannot reach the broker retries with
+back-off up to {RECONNECT_MAX} s, and says so once per outage (once more for each other
+error it meets) and once when it subscribes again.
+Prints `notify: fired= dup= skipped= dropped= suppressed= standing=` on exit, `standing=`
+counting this run's records whose need or `attention` value already stood, so ran nothing
+(not the values standing now: a `--once` run that reads no new record says `standing=0`). Exits 2
 on a usage error, an unreadable --cap-file, or a broker that refuses the cap files or a
 selector's read (no --cap-file grants it); 1 when the state dir cannot open or the run
 fails.
 ";
 
-/// `aterm link notify --help`: [`USAGE`] with its cursor lag filled in ([`CURSOR_LAG`]), then
-/// the words and families `need:<word>` takes ([`need_words`], [`need_families`]).
+/// `aterm link notify --help`: [`USAGE`] with its cursor lag and retry ceiling filled in
+/// ([`CURSOR_LAG`], `transport::RECONNECT_MAX`), then the words and families `need:<word>`
+/// takes ([`need_words`], [`need_families`]).
 #[must_use]
 pub fn usage() -> String {
     format!(
         "{}\nNeed words (`need:<word>`, the needs a session's fold raises):\n{}\n\
          Need families (`need:<family>`, each `<family>:<kind>` word above):\n{}\n",
-        USAGE.replace("{CURSOR_LAG}", &CURSOR_LAG.to_string()),
+        USAGE
+            .replace("{CURSOR_LAG}", &CURSOR_LAG.to_string())
+            .replace(
+                "{RECONNECT_MAX}",
+                &transport::RECONNECT_MAX.as_secs().to_string()
+            ),
         fill(need_words()),
         fill(need_families())
     )
@@ -2824,15 +2951,19 @@ fn parse(args: &[String]) -> Result<Config, String> {
                     "head" => Since::Head,
                     "start" => Since::Start,
                     n => Since::At(
-                        n.parse()
-                            .map_err(|_| format!("--since {n}: head, start or an offset"))?,
+                        (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                            .then(|| n.parse().ok())
+                            .flatten()
+                            .ok_or_else(|| format!("--since {n}: head, start or an offset"))?,
                     ),
                 };
             }
             "--exec-timeout" => {
-                let ms: u64 = value()?
-                    .parse()
-                    .map_err(|_| "--exec-timeout takes milliseconds".to_string())?;
+                let v = value()?;
+                let ms: u64 = (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                    .then(|| v.parse().ok())
+                    .flatten()
+                    .ok_or_else(|| "--exec-timeout takes milliseconds".to_string())?;
                 cfg.exec_timeout = Duration::from_millis(ms);
             }
             other => return Err(format!("unknown flag {other}")),
@@ -2862,6 +2993,9 @@ fn parse(args: &[String]) -> Result<Config, String> {
 fn parse_rate(s: &str) -> Result<(u32, u64), String> {
     let bad = || format!("--rate {s}: expected <n>/<window>, e.g. 10/1m, 1/30s, 40/1h");
     let (n, window) = s.split_once('/').ok_or_else(bad)?;
+    if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(bad());
+    }
     let limit: u32 = n.parse().map_err(|_| bad())?;
     if limit == 0 {
         return Err(format!("--rate {s}: a limit of 0 drops every notification"));
@@ -2875,6 +3009,9 @@ fn parse_rate(s: &str) -> Result<(u32, u64), String> {
     } else {
         return Err(bad());
     };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(bad());
+    }
     let count: u64 = digits.parse().map_err(|_| bad())?;
     let ms = count.checked_mul(scale).ok_or_else(bad)?;
     if ms == 0 {
@@ -2964,8 +3101,12 @@ mod tests {
         }
     }
 
+    /// A fresh scratch dir for `tag`. Its prefix is short because a broker socket a test binds in
+    /// it must fit `sun_path` ([`crate::enable::SUN_PATH_MAX`] bytes, its NUL included). Under the
+    /// build shim's `$TMPDIR/.ubd/` with a five-digit pid, the old `atlink-notify-` prefix made
+    /// `need-derived-late-false/b.sock` a path of 104 or 105 bytes, past the 103 that fit.
     fn scratch(tag: &str) -> String {
-        let p = std::env::temp_dir().join(format!("atlink-notify-{}-{tag}", std::process::id()));
+        let p = std::env::temp_dir().join(format!("atn-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         p.to_string_lossy().into_owned()
     }
@@ -3807,6 +3948,94 @@ mod tests {
             assert_eq!(cursor(&n), Some(9), "{tag}");
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// A FOLLOWER SAYS A STANDING CONDITION ONCE (fix unit E5, E2E-15): on an ordered log,
+    /// fifty records each held and then released by a durable mark say the durable wait once,
+    /// a reconnect to the same log says nothing new, and another log says it once more; three
+    /// records past [`HOLD_MAX`] in one streak say the hold once, a durable head that reaches
+    /// the streak's newest paged record but not past it keeps the streak, one past it ends it
+    /// (the next hold says it once more), and so does another log, whose drain emptied the
+    /// queue. NEGATIVE CONTROLS (scratch): the wait said whenever the held queue is empty, as
+    /// before, says it fifty times; a streak no durable mark ends says the second hold never;
+    /// a streak another log does not end says the third never.
+    #[test]
+    fn a_durable_wait_is_said_once_per_log_and_a_hold_past_its_cap_once_per_streak() {
+        let log = |generation: u64| ReadLog {
+            id: Some(astream_broker::LogIdentity {
+                id: [7; 16],
+                generation,
+            }),
+            lineage: None,
+            ordered: true,
+        };
+        let live = || b"v=1 t=1 state=live".to_vec();
+        let said = |what: fn(&Warned) -> bool| {
+            WARNED.with(|warned| warned.borrow().iter().filter(|w| what(w)).count())
+        };
+        let waits = || said(|w| matches!(w, Warned::DurableWait(0)));
+        let dir = scratch("said-once");
+        let (mut n, fired) = appending(&dir, 100, "");
+        assert!(
+            n.wait_durable,
+            "PRECONDITION: an ordered log's records wait"
+        );
+        WARNED.with(|warned| warned.borrow_mut().clear());
+        n.take(Notice::Log(0, log(0))).expect("log");
+        for off in 0..50 {
+            n.take(Notice::Record(0, off, presence_of("s-a"), live()))
+                .expect("held");
+            assert_eq!(n.held_bytes, presence_of("s-a").len() + live().len());
+            n.take(Notice::Durable(0, off + 1)).expect("released");
+            assert_eq!(n.held_bytes, 0, "{off}: released");
+        }
+        assert_eq!(waits(), 1, "fifty held records say the wait once");
+        n.take(Notice::Log(0, log(0))).expect("the same log again");
+        n.take(Notice::Record(0, 50, presence_of("s-a"), live()))
+            .expect("held");
+        n.take(Notice::Durable(0, 51)).expect("released");
+        assert_eq!(waits(), 1, "a reconnect to the same log says nothing new");
+        n.take(Notice::Log(0, log(1))).expect("another log");
+        n.take(Notice::Record(0, 60, presence_of("s-a"), live()))
+            .expect("held");
+        n.take(Notice::Durable(0, 61)).expect("released");
+        assert_eq!(waits(), 2, "another log's wait is said once more");
+        for off in 70..73 {
+            let mut big = live();
+            big.resize(HOLD_MAX, b' ');
+            n.take(Notice::Record(0, off, presence_of("s-a"), big))
+                .expect("paged past the cap");
+            assert_eq!(n.held_bytes, 0, "{off}: released at once");
+        }
+        let holds = || said(|w| matches!(w, Warned::HoldOver(0)));
+        assert_eq!(holds(), 1, "one streak");
+        let past_cap = |n: &mut Notifier, off: u64| {
+            let mut big = live();
+            big.resize(HOLD_MAX, b' ');
+            n.take(Notice::Record(0, off, presence_of("s-a"), big))
+                .expect("paged past the cap");
+            assert_eq!(n.held_bytes, 0, "{off}: released at once");
+        };
+        n.take(Notice::Durable(0, 72)).expect("durable below 72");
+        past_cap(&mut n, 80);
+        assert_eq!(holds(), 1, "72 is not durable yet: the streak goes on");
+        n.take(Notice::Durable(0, 81)).expect("durable past 80");
+        past_cap(&mut n, 90);
+        assert_eq!(holds(), 2, "the broker said the streak durable: a new one");
+        n.take(Notice::Log(0, log(2))).expect("another log");
+        past_cap(&mut n, 100);
+        assert_eq!(holds(), 3, "another log's hold is said once more");
+        assert!(
+            fired_offsets(&fired).is_empty(),
+            "PRECONDITION: no row paged"
+        );
+        let help = usage();
+        let ceiling = format!("back-off up to {} s", transport::RECONNECT_MAX.as_secs());
+        assert!(
+            help.contains(&ceiling) && !help.contains("{RECONNECT_MAX}"),
+            "the help's retry ceiling is the constant: {help}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A log a follow-mode reader reached that serves strict: a record is judged as it is read.
@@ -5065,7 +5294,11 @@ mod tests {
 
     impl Needs {
         fn open() -> Self {
-            let mut log = aterm_slog::Log::new(1);
+            Self::in_space(1)
+        }
+
+        fn in_space(ep: u32) -> Self {
+            let mut log = aterm_slog::Log::new(ep);
             log.open_session(
                 aterm_slog::Kind::Spawn,
                 aterm_slog::Src::Aterm,
@@ -5677,6 +5910,538 @@ mod tests {
                 let _ = std::fs::remove_dir_all(&dir);
             }
         }
+    }
+
+    /// The bodies of a relaunch's new shell, whose restore names `prev`: `open - restore
+    /// prev=<prev> lineage=<prev>` (aterm-gui's `note_restored` before its open).
+    fn restore_of(prev: &str) -> Vec<String> {
+        let mut log = aterm_slog::Log::new(2);
+        let f = aterm_slog::Fields::new()
+            .id(aterm_slog::Key::Prev, prev)
+            .and_then(|f| f.id(aterm_slog::Key::Lineage, prev))
+            .expect("the restore's fields");
+        log.open_session(
+            aterm_slog::Kind::Restore,
+            aterm_slog::Src::Aterm,
+            aterm_slog::Conf::Exact,
+            aterm_slog::Actor::Nobody,
+            f,
+            aterm_slog::Stamp::new(1_760_000_100_000, 0),
+        )
+        .expect("opens");
+        let bodies = mirrored(&mut log);
+        assert!(
+            bodies
+                .iter()
+                .any(|b| b.contains(" k=restore ") && b.contains(&format!(" prev={prev}"))),
+            "PRECONDITION: the restore crosses the bus naming its predecessor: {bodies:?}"
+        );
+        bodies
+    }
+
+    /// A session that pages a failure and then waits in an agent turn: its bodies.
+    fn failed_then_waiting() -> Vec<String> {
+        let mut s = Needs::open();
+        let cmd = s.cmd_open();
+        s.cmd_close(cmd, aterm_slog::RunOut::Fail);
+        s.turn();
+        s.bodies()
+    }
+
+    /// A DEAD SESSION'S EXIT PAGES ONCE, AND ONLY AT A SUCCESSOR'S RESTORE (fix unit E9, finding
+    /// E2E-5; the orchestrator's 2026-10-27 ruling). Two sessions each page a failure and then
+    /// wait in an agent turn; their node's bridge dies (its will) and the node relaunches. A
+    /// successor's restore names s-x: the watch derives s-x's close and pages `exited`, detail
+    /// `gone`, for s-x, once, at the restore, under bare `--on need` and under `need:exited`.
+    /// Nothing else pages: s-x's own `exited` row after it, the restore delivered again, a
+    /// record of s-x delivered again, and s-y, whose row a later incarnation retired with no
+    /// successor naming it (the brief derives its close; its row alone pages nothing, and its
+    /// pairs clear, as G2's rule says), nor a record of s-y delivered after that row. NEGATIVE
+    /// CONTROLS, run: a watch that derives nothing (the restore pages nothing), one that judges
+    /// the restore as the successor's record only (the exit pages late, at s-x's next record),
+    /// one that derives on a retired row too (s-y pages at its next record), and one that pages
+    /// the derived exit without its `gone`.
+    #[test]
+    fn a_successors_restore_pages_a_dead_sessions_exit_once_and_its_row_alone_pages_nothing() {
+        let face = |sid: &str| format!("/f/f1/pub/n-a/{sid}/ev");
+        let row = |sid: &str| format!("/f/f1/pub/n-a/{sid}/presence");
+        let waiting = failed_then_waiting();
+        let restore = restore_of("s-x");
+        for (tag, sel) in [
+            ("exited", Sel::Need(Some(vec!["exited"]))),
+            ("any", Sel::Need(None)),
+        ] {
+            let dir = scratch(&format!("need-restore-{tag}"));
+            let said = Path::new(&dir).join("said");
+            let (mut n, fired) = appending(
+                &dir,
+                100,
+                &format!(
+                    "printf '%s %s %s\\n' \"$ATERM_NOTIFY_NEED\" \"$ATERM_NOTIFY_DETAIL\" \
+                     \"$ATERM_NOTIFY_SID\" >> {}; ",
+                    said.display()
+                ),
+            );
+            n.cfg.on = vec![sel.clone()];
+            let mut off = 0;
+            let mut feed = |n: &mut Notifier, subject: &str, body: &[u8]| {
+                off += 1;
+                n.on_record(&sel, off, subject, body).expect("on_record");
+                off
+            };
+            let mut want = Vec::new();
+            for sid in ["s-x", "s-y"] {
+                feed(&mut n, &row(sid), b"v=1 t=1 inc=1 state=live");
+                for b in &waiting {
+                    let at = feed(&mut n, &face(sid), b.as_bytes());
+                    if b.contains("out=fail") && tag == "any" {
+                        want.push(at);
+                    }
+                }
+            }
+            feed(
+                &mut n,
+                &row("node"),
+                b"v=1 t=2 state=away inc=1 fabric=disconnected",
+            );
+            feed(&mut n, &row("node"), b"v=1 t=3 state=live inc=2");
+            for b in &restore {
+                let at = feed(&mut n, &face("s-z"), b.as_bytes());
+                if b.contains(" k=restore ") {
+                    want.push(at);
+                }
+            }
+            assert_eq!(
+                fired_offsets(&fired),
+                want,
+                "{tag}: the dead session's exit pages at its successor's restore"
+            );
+            feed(&mut n, &row("s-x"), b"v=1 t=4 inc=2 state=exited");
+            feed(&mut n, &row("s-y"), b"v=1 t=4 inc=2 state=exited");
+            for b in &restore {
+                feed(&mut n, &face("s-z"), b.as_bytes());
+            }
+            for sid in ["s-x", "s-y"] {
+                feed(&mut n, &face(sid), waiting[0].as_bytes());
+            }
+            assert_eq!(fired_offsets(&fired), want, "{tag}: and nothing else pages");
+            let said = std::fs::read_to_string(&said).unwrap_or_default();
+            assert_eq!(
+                said.lines()
+                    .filter(|l| l.starts_with("exited "))
+                    .collect::<Vec<_>>(),
+                ["exited gone s-x"],
+                "{tag}: {said}"
+            );
+            assert_eq!(standing_words(&n, &face("s-x")), ["exited"], "{tag}");
+            assert_eq!(
+                standing_words(&n, &face("s-y")),
+                Vec::<&str>::new(),
+                "{tag}: a retired row alone clears its session's pairs"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// A QUIT'S RELAUNCH AND A REOPENED TAB PAGE NO EXIT FOR THE SESSION THEIR RESTORE NAMES (fix
+    /// unit E9, the lander's review). aterm writes `restore prev=<sid>` whenever a new shell fills
+    /// a pane: after a clean quit's relaunch too, and when a closed tab is reopened. On n-a, s-q
+    /// pages a failure and waits in a turn; its aterm quits (the bridge withdraws it, `exited`
+    /// under `inc=1`, the incarnation that hosted it; its close stays in the journal), its node's
+    /// will fires as the bridge goes, the node relaunches under `inc=2`, and s-z's restore names
+    /// s-q: nothing pages for s-q's exit (its row alone says it exited, G2's rule), and its pairs
+    /// clear. On n-b, s-t waits in a turn, its tab closes and is reopened under the same
+    /// incarnation (`inc=1`): s-u's restore names s-t before s-t's own close reaches the bus,
+    /// and s-t's `exited` pages once, at that close. Under bare `--on need` and `need:exited`.
+    /// NEGATIVE CONTROLS, run: a restore that counts whatever withdrew the session pages
+    /// `exited gone s-q` at s-z's restore; one that counts while the session's own incarnation
+    /// lives pages s-t's exit twice, at s-u's restore and at s-t's close.
+    #[test]
+    fn a_quits_relaunch_and_a_reopened_tab_page_no_exit_for_the_session_their_restore_names() {
+        let face = |node: &str, sid: &str| format!("/f/f1/pub/{node}/{sid}/ev");
+        let row = |node: &str, sid: &str| format!("/f/f1/pub/{node}/{sid}/presence");
+        let waiting = failed_then_waiting();
+        let mut tab = Needs::open();
+        tab.turn();
+        let tab_open = tab.bodies();
+        tab.exit();
+        let tab_close = tab.bodies();
+        for (tag, sel) in [
+            ("exited", Sel::Need(Some(vec!["exited"]))),
+            ("any", Sel::Need(None)),
+        ] {
+            let dir = scratch(&format!("need-restore-quit-{tag}"));
+            let said = Path::new(&dir).join("said");
+            let (mut n, fired) = appending(
+                &dir,
+                100,
+                &format!(
+                    "printf '%s %s %s\\n' \"$ATERM_NOTIFY_NEED\" \"$ATERM_NOTIFY_DETAIL\" \
+                     \"$ATERM_NOTIFY_SID\" >> {}; ",
+                    said.display()
+                ),
+            );
+            n.cfg.on = vec![sel.clone()];
+            let mut off = 0;
+            let mut feed = |n: &mut Notifier, subject: &str, body: &[u8]| {
+                off += 1;
+                n.on_record(&sel, off, subject, body).expect("on_record");
+                off
+            };
+            let mut want = Vec::new();
+            feed(&mut n, &row("n-a", "node"), b"v=1 t=1 state=live inc=1");
+            feed(&mut n, &row("n-a", "s-q"), b"v=1 t=1 inc=1 state=live");
+            for b in &waiting {
+                let at = feed(&mut n, &face("n-a", "s-q"), b.as_bytes());
+                if b.contains("out=fail") && tag == "any" {
+                    want.push(at);
+                }
+            }
+            feed(&mut n, &row("n-a", "s-q"), b"v=1 t=2 inc=1 state=exited");
+            feed(
+                &mut n,
+                &row("n-a", "node"),
+                b"v=1 t=2 state=away inc=1 fabric=disconnected",
+            );
+            feed(&mut n, &row("n-a", "node"), b"v=1 t=3 state=live inc=2");
+            for b in restore_of("s-q") {
+                feed(&mut n, &face("n-a", "s-z"), b.as_bytes());
+            }
+            for b in &waiting {
+                feed(&mut n, &face("n-a", "s-q"), b.as_bytes());
+            }
+            assert_eq!(
+                fired_offsets(&fired),
+                want,
+                "{tag}: a quit's relaunch pages no exit for the session it withdrew"
+            );
+            assert_eq!(
+                standing_words(&n, &face("n-a", "s-q")),
+                Vec::<&str>::new(),
+                "{tag}: its row alone clears its pairs"
+            );
+
+            feed(&mut n, &row("n-b", "node"), b"v=1 t=1 state=live inc=1");
+            feed(&mut n, &row("n-b", "s-t"), b"v=1 t=1 inc=1 state=live");
+            for b in &tab_open {
+                feed(&mut n, &face("n-b", "s-t"), b.as_bytes());
+            }
+            for b in restore_of("s-t") {
+                feed(&mut n, &face("n-b", "s-u"), b.as_bytes());
+            }
+            for b in &tab_close {
+                let at = feed(&mut n, &face("n-b", "s-t"), b.as_bytes());
+                if b.contains(" op=close node=- ") {
+                    want.push(at);
+                }
+            }
+            feed(&mut n, &row("n-b", "s-t"), b"v=1 t=2 inc=1 state=exited");
+            assert_eq!(
+                fired_offsets(&fired),
+                want,
+                "{tag}: a reopened tab's session pages its exit once, at its own close"
+            );
+            let said = std::fs::read_to_string(&said).unwrap_or_default();
+            assert_eq!(
+                said.lines()
+                    .filter(|l| l.starts_with("exited "))
+                    .collect::<Vec<_>>(),
+                ["exited  s-t"],
+                "{tag}: {said}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// A CLEAN CLOSE NEVER DERIVES (fix unit E9). A session whose close reached the bus pages its
+    /// `exited` once, at its close; a successor's restore naming it afterwards pages nothing more
+    /// and leaves that one pair standing. NEGATIVE CONTROL, run: a watch that derives over a fold
+    /// that holds its close pages a second `exited` at the restore.
+    #[test]
+    fn a_restore_naming_a_session_whose_close_reached_the_bus_pages_nothing_more() {
+        let mut s = Needs::open();
+        s.turn();
+        s.exit();
+        let closing = s.bodies();
+        let restore = restore_of("s-x");
+        for (tag, sel) in [
+            ("exited", Sel::Need(Some(vec!["exited"]))),
+            ("any", Sel::Need(None)),
+        ] {
+            let dir = scratch(&format!("need-restore-closed-{tag}"));
+            let (mut n, fired) = appending(&dir, 100, "");
+            n.cfg.on = vec![sel.clone()];
+            let mut off = 0;
+            let mut feed = |n: &mut Notifier, subject: &str, body: &[u8]| {
+                off += 1;
+                n.on_record(&sel, off, subject, body).expect("on_record");
+                off
+            };
+            let mut want = Vec::new();
+            for b in &closing {
+                let at = feed(&mut n, NEED_FACE, b.as_bytes());
+                if b.contains(" op=close node=- ") {
+                    want.push(at);
+                }
+            }
+            assert_eq!(
+                want.len(),
+                1,
+                "PRECONDITION: one session close: {closing:?}"
+            );
+            for b in &restore {
+                feed(&mut n, "/f/f1/pub/n-a/s-z/ev", b.as_bytes());
+            }
+            assert_eq!(
+                fired_offsets(&fired),
+                want,
+                "{tag}: the exit pages once, at the close"
+            );
+            assert_eq!(standing_words(&n, NEED_FACE), ["exited"], "{tag}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// A derived exit keeps one terminal receipt when a later foreign body moves the
+    /// derived sequence, an older body arrives after it, or the real close finally arrives.
+    /// These are separate fresh stores so the late real close is also tested without the
+    /// foreign body first. Every catch-up is a real notifier `--once` over the private broker.
+    #[cfg(unix)]
+    #[test]
+    fn a_derived_exit_stands_through_later_foreign_records_and_its_real_close() {
+        for foreign_first in [false, true] {
+            let dir = scratch(&format!("late-{foreign_first}"));
+            let base = PathBuf::from(&dir);
+            std::fs::create_dir_all(&base).expect("scratch");
+            let broker = crate::test_broker(base.join("b.log")).unwrap();
+            let mut bus = NeedBus::open(&base, &broker);
+            let sock = bus.sock.clone();
+            let mut session = Needs::open();
+            session.turn();
+            let waiting = session.bodies();
+            let held: Vec<_> = waiting
+                .iter()
+                .filter_map(|body| aterm_slog::decode_bus(body).ok())
+                .collect();
+            let head = held.iter().map(|b| b.rec.seq).max().expect("a head");
+            let ms = held
+                .iter()
+                .filter_map(|b| b.ms)
+                .max()
+                .expect("a mirror head");
+            bus.row("/f/f1/pub/n-a/node/presence", "v=1 t=1 state=live inc=1");
+            bus.row("/f/f1/pub/n-a/s-x/presence", "v=1 t=1 inc=1 state=live");
+            bus.publish(NEED_FACE, waiting);
+            bus.row(
+                "/f/f1/pub/n-a/node/presence",
+                "v=1 t=2 state=away inc=1 fabric=disconnected",
+            );
+            bus.row("/f/f1/pub/n-a/node/presence", "v=1 t=3 state=live inc=2");
+            let restored = offset_of(
+                &bus.publish("/f/f1/pub/n-a/s-z/ev", restore_of("s-x")),
+                &[" k=restore "],
+            );
+            let state = base.join("follow");
+            let sel = Sel::Need(Some(vec!["exited"]));
+            let paged = need_once(&sock, &state, sel.clone(), Since::Start);
+            assert_eq!(paged, [format!("{restored} exited")]);
+            let saved = || {
+                let (config, _) = need_cfg(&sock, &state, sel.clone(), Since::Start);
+                Notifier::new(config)
+                    .expect("inspect store")
+                    .pairs_of(NEED_FACE)
+            };
+            let original = saved();
+            let [Pair {
+                word: "exited",
+                raised:
+                    crate::notify_need::Raised::At {
+                        ep: 1,
+                        seq: derived,
+                    },
+            }] = original.as_slice()
+            else {
+                panic!("the derived raise keeps its observed sequence: {original:?}");
+            };
+            if foreign_first {
+                for (seq_delta, ms_delta) in [(32, 10), (16, 9)] {
+                    let body = format!(
+                        "v=2 t=1760000000009 ep=1 seq={} ms={} op=mark node=- k=zzznew src=mark conf=claim",
+                        head + seq_delta,
+                        ms + ms_delta
+                    );
+                    let record = aterm_slog::decode_bus(&body).expect("valid newer-writer body");
+                    assert!(
+                        record.rec.seq > *derived,
+                        "a real change to the offered head"
+                    );
+                    assert_eq!(record.rec.k, aterm_slog::Kind::Unknown);
+                    bus.publish(NEED_FACE, vec![body]);
+                    assert_eq!(
+                        need_once(&sock, &state, sel.clone(), Since::Start),
+                        paged,
+                        "foreign first {foreign_first}: later and reordered bodies page no exit"
+                    );
+                    assert_eq!(saved(), original, "the stored sequence is not rewritten");
+                }
+            }
+            session.exit();
+            let closing = session.bodies();
+            let real = closing
+                .iter()
+                .filter_map(|body| aterm_slog::decode_bus(body).ok())
+                .find(|b| {
+                    b.rec.op == aterm_slog::Op::Close && b.rec.node == aterm_slog::Node::SESSION
+                })
+                .expect("the actual session close");
+            assert_ne!(
+                real.rec.seq, *derived,
+                "the late close has another sequence"
+            );
+            bus.publish(NEED_FACE, closing);
+            for _ in 0..2 {
+                assert_eq!(
+                    need_once(&sock, &state, sel.clone(), Since::Start),
+                    paged,
+                    "foreign first {foreign_first}: the real close and restart keep one receipt"
+                );
+            }
+            assert_eq!(
+                saved(),
+                original,
+                "the original token retains its provenance"
+            );
+            assert!(need_once(&sock, &base.join("late"), sel, Since::Head).is_empty());
+            drop(bus.conn);
+            bus.server.shutdown();
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Only the session's terminal exit is one identity per epoch. Two failed commands
+    /// while failure is already standing still page twice, and another epoch's session close
+    /// pages again even when its start was not retained and the old exit still stands.
+    #[cfg(unix)]
+    #[test]
+    fn renewable_failures_and_another_epochs_exit_keep_their_own_notification_identity() {
+        let dir = scratch("need-terminal-positive");
+        let base = PathBuf::from(&dir);
+        std::fs::create_dir_all(&base).expect("scratch");
+        let broker = crate::test_broker(base.join("b.log")).unwrap();
+        let mut bus = NeedBus::open(&base, &broker);
+        let sock = bus.sock.clone();
+        let state = base.join("follow");
+        let mut session = Needs::open();
+        let mut want = Vec::new();
+        for _ in 0..2 {
+            let command = session.cmd_open();
+            session.cmd_close(command, aterm_slog::RunOut::Fail);
+            let offset = offset_of(&bus.publish(NEED_FACE, session.bodies()), &["out=fail"]);
+            want.push(format!("{offset} failure"));
+        }
+        session.exit();
+        let exit = offset_of(
+            &bus.publish(NEED_FACE, session.bodies()),
+            &[" op=close node=- "],
+        );
+        want.push(format!("{exit} exited"));
+        assert_eq!(
+            need_once(&sock, &state, Sel::Need(None), Since::Start),
+            want
+        );
+
+        let mut next = Needs::in_space(2);
+        next.exit();
+        let closing: Vec<_> = next
+            .bodies()
+            .into_iter()
+            .filter(|body| body.contains(" op=close node=- "))
+            .collect();
+        assert_eq!(closing.len(), 1, "a real close with its start absent");
+        assert_eq!(aterm_slog::decode_bus(&closing[0]).expect("close").ep, 2);
+        let exit = bus.publish(NEED_FACE, closing)[0].0;
+        want.push(format!("{exit} exited"));
+        assert_eq!(
+            need_once(&sock, &state, Sel::Need(None), Since::Start),
+            want
+        );
+        assert_eq!(
+            need_once(&sock, &state, Sel::Need(None), Since::Start),
+            want
+        );
+        drop(bus.conn);
+        bus.server.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A DERIVED EXIT PAGES NOTHING AGAIN, AFTER A RESTART OR A LATE START (fix unit E9). A
+    /// notifier pages a dead session's failure and then, its aterm dead (its row live under
+    /// `inc=1`, its node's will, the node live under `inc=2`), its `exited` at its successor's
+    /// restore.
+    /// Its restart, which keeps the pair that page left standing, and a notifier started at the
+    /// head after the restore, whose warm-up folds both below its cursor and stands the derived
+    /// `exited` ([`NeedWatch::standing`]), page nothing at a record of the dead session
+    /// delivered again past their cursor, nor at its `exited` row. NEGATIVE CONTROL, run: a
+    /// warm-up that does not stand a derived exit pages it at the record delivered again, in
+    /// the run started at the head.
+    #[cfg(unix)]
+    #[test]
+    fn a_dead_sessions_derived_exit_pages_nothing_again_after_a_restart_or_a_late_start() {
+        let dir = scratch("need-restore-restart");
+        let base = PathBuf::from(&dir);
+        std::fs::create_dir_all(&base).expect("scratch");
+        let broker = crate::test_broker(base.join("b.log")).unwrap();
+        let mut bus = NeedBus::open(&base, &broker);
+        let sock = bus.sock.clone();
+        let waiting = failed_then_waiting();
+        bus.row("/f/f1/pub/n-a/node/presence", "v=1 t=1 state=live inc=1");
+        bus.row("/f/f1/pub/n-a/s-x/presence", "v=1 t=1 inc=1 state=live");
+        let failed = offset_of(&bus.publish(NEED_FACE, waiting.clone()), &["out=fail"]);
+        bus.row(
+            "/f/f1/pub/n-a/node/presence",
+            "v=1 t=2 state=away inc=1 fabric=disconnected",
+        );
+        bus.row("/f/f1/pub/n-a/node/presence", "v=1 t=3 state=live inc=2");
+        let restored = offset_of(
+            &bus.publish("/f/f1/pub/n-a/s-z/ev", restore_of("s-x")),
+            &[" k=restore "],
+        );
+        let (follow, late) = (base.join("follow"), base.join("late"));
+        let paged = need_once(&sock, &follow, Sel::Need(None), Since::Start);
+        assert_eq!(paged.len(), 2, "the failure, then the exit: {paged:?}");
+        assert!(
+            paged[0].starts_with(&format!("{failed} ")),
+            "the failure first: {paged:?}"
+        );
+        assert_eq!(
+            paged[1],
+            format!("{restored} exited"),
+            "the exit at the restore"
+        );
+        let none: Vec<String> = Vec::new();
+        assert_eq!(
+            need_once(&sock, &late, Sel::Need(None), Since::Head),
+            none,
+            "a notifier started at the head after the restore pages nothing at its start"
+        );
+        bus.publish(NEED_FACE, vec![waiting[0].clone()]);
+        bus.publish(
+            "/f/f1/pub/n-a/s-x/presence",
+            vec!["v=1 t=4 inc=2 state=exited".to_string()],
+        );
+        assert_eq!(
+            need_once(&sock, &follow, Sel::Need(None), Since::Start),
+            paged,
+            "a restart pages the derived exit nothing again"
+        );
+        assert_eq!(
+            need_once(&sock, &late, Sel::Need(None), Since::Head),
+            none,
+            "nor does the late start, whose warm-up stood it"
+        );
+        drop(bus.conn);
+        bus.server.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -6317,6 +7082,301 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Every body of `bodies` but the failed run's close: the bus lost the record that raised
+    /// the session's `failure` (a hole), and the snapshot that ends the take is the first the
+    /// follower knows of it.
+    fn losing_the_failure(bodies: Vec<String>) -> Vec<String> {
+        let kept: Vec<String> = bodies
+            .iter()
+            .filter(|b| !(b.contains(" op=close ") && b.contains("out=fail")))
+            .cloned()
+            .collect();
+        assert!(
+            kept.len() + 1 == bodies.len() && kept.last().is_some_and(|b| b.contains(" op=snap ")),
+            "PRECONDITION: one failed close, then a snapshot naming its failure: {bodies:?}"
+        );
+        kept
+    }
+
+    /// A NEED WHOSE RAISE THE BUS LOST AND WHOSE PAGE FAILED PAGES AGAIN (fix unit J0-3's
+    /// lander): the failure's close is a hole, and the mail snapshot after it is where the
+    /// follower sees the failure rise; its command fails, so the page is owed. The session's
+    /// next record pages it again in the same run, as one whose raise the follower held does,
+    /// and so does the next record after a restart, though the fold now knows the failure only
+    /// By that snapshot; once a page of it ends `rc=0`, it stands.
+    #[cfg(unix)]
+    #[test]
+    fn a_need_whose_raise_the_bus_lost_and_whose_page_failed_pages_again_in_the_run_and_after_a_restart(
+    ) {
+        let dir = scratch("need-lost-owed");
+        let base = PathBuf::from(&dir);
+        std::fs::create_dir_all(&base).expect("scratch");
+        let broker = crate::test_broker(base.join("b.log")).unwrap();
+        let mut bus = NeedBus::open(&base, &broker);
+        let sock = bus.sock.clone();
+        let mut s = Needs::open();
+        bus.publish(NEED_FACE, s.bodies());
+        s.quiet();
+        bus.publish(NEED_FACE, s.bodies());
+        let cmd = s.cmd_open();
+        s.cmd_close(cmd, aterm_slog::RunOut::Fail);
+        s.mail();
+        let snap = bus
+            .publish(NEED_FACE, losing_the_failure(s.bodies()))
+            .last()
+            .expect("the snapshot")
+            .0;
+        s.quiet();
+        let q1 = bus.publish(NEED_FACE, s.bodies()).last().expect("quiet").0;
+        let failing = base.join("failing");
+        let (mut c, fired) = need_cfg(&sock, &failing, Sel::Need(None), Since::Start);
+        c.exec = format!("{}; exit 1", c.exec);
+        Notifier::new(c)
+            .expect("open")
+            .catch_up()
+            .expect("catch up");
+        let mut want = vec![format!("{snap} failure"), format!("{q1} failure")];
+        assert_eq!(
+            fired_lines(&fired),
+            want,
+            "the failed page runs again at the session's next record, in the same run"
+        );
+        s.quiet();
+        let q2 = bus.publish(NEED_FACE, s.bodies()).last().expect("quiet").0;
+        want.push(format!("{q2} failure"));
+        let run = |state: &Path| need_once(&sock, state, Sel::Need(None), Since::Start);
+        assert_eq!(
+            run(&failing),
+            want,
+            "a restart pages it again at the session's next record"
+        );
+        s.quiet();
+        bus.publish(NEED_FACE, s.bodies());
+        assert_eq!(run(&failing), want, "once it ran rc=0, it stands");
+        drop(bus.conn);
+        bus.server.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A SECOND FAILURE WHOSE RAISE THE BUS LOST PAGES THOUGH THE FIRST STANDS (fix unit J0-3's
+    /// lander): the follower paged the session's first failure at its close, and the second
+    /// failed run's close, which lifts the first and raises its own, is a hole; the mail
+    /// snapshot after it names the second. That failure was raised after a record the follower
+    /// read whole, so the first's pair standing on the face is another need: it pages once.
+    /// When that page's command fails, it is owed, and a restart pages it at the session's next
+    /// record, though the first failure's pair still matches the fold's.
+    #[cfg(unix)]
+    #[test]
+    fn a_second_failure_whose_raise_the_bus_lost_pages_though_the_first_stands() {
+        for owing in [false, true] {
+            let dir = scratch(if owing {
+                "need-second-owed"
+            } else {
+                "need-second"
+            });
+            let base = PathBuf::from(&dir);
+            std::fs::create_dir_all(&base).expect("scratch");
+            let broker = crate::test_broker(base.join("b.log")).unwrap();
+            let mut bus = NeedBus::open(&base, &broker);
+            let sock = bus.sock.clone();
+            let mut s = Needs::open();
+            bus.publish(NEED_FACE, s.bodies());
+            s.quiet();
+            bus.publish(NEED_FACE, s.bodies());
+            let cmd = s.cmd_open();
+            s.cmd_close(cmd, aterm_slog::RunOut::Fail);
+            let first = offset_of(
+                &bus.publish(NEED_FACE, s.bodies()),
+                &[" op=close ", "out=fail"],
+            );
+            let cmd = s.cmd_open();
+            s.cmd_close(cmd, aterm_slog::RunOut::Fail);
+            s.mail();
+            let snap = bus
+                .publish(NEED_FACE, losing_the_failure(s.bodies()))
+                .last()
+                .expect("the snapshot")
+                .0;
+            let state = base.join("st");
+            let (mut c, fired) = need_cfg(&sock, &state, Sel::Need(None), Since::Start);
+            if owing {
+                c.exec = format!("{}; [ \"$ATERM_NOTIFY_OFFSET\" != {snap} ]", c.exec);
+            }
+            Notifier::new(c)
+                .expect("open")
+                .catch_up()
+                .expect("catch up");
+            let mut want = vec![format!("{first} failure"), format!("{snap} failure")];
+            assert_eq!(
+                fired_lines(&fired),
+                want,
+                "owing {owing}: each failure pages once, the second at the snapshot past its \
+                 lost close"
+            );
+            s.quiet();
+            let next = bus.publish(NEED_FACE, s.bodies()).last().expect("quiet").0;
+            if owing {
+                want.push(format!("{next} failure"));
+            }
+            let run = || need_once(&sock, &state, Sel::Need(None), Since::Start);
+            assert_eq!(
+                run(),
+                want,
+                "owing {owing}: a restart pages the second failure again only when its page \
+                 failed"
+            );
+            s.quiet();
+            bus.publish(NEED_FACE, s.bodies());
+            assert_eq!(run(), want, "owing {owing}: then it stands");
+            drop(bus.conn);
+            bus.server.shutdown();
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// AN OWED PAGE RUNS AGAIN AT A SNAPSHOT THOUGH AN OLDER NEED OF ITS WORD STANDS (fix unit
+    /// J0-3's lander): the session's start never reached the bus, so the follower's fold is
+    /// partial and drops no entry. It holds both failed closes: the first pages, and the
+    /// second's command fails, so its page is owed beside the first's standing pair. After a
+    /// restart the session's next record is a mail snapshot, whose fold knows the failure only
+    /// By that snapshot, which the first failure's pair matches as well as the owed one: the
+    /// owed page runs again there, as the session's next record of any other kind would run it.
+    #[cfg(unix)]
+    #[test]
+    fn an_owed_page_runs_again_at_a_snapshot_though_an_older_need_of_its_word_stands() {
+        let dir = scratch("need-owed-snap");
+        let base = PathBuf::from(&dir);
+        std::fs::create_dir_all(&base).expect("scratch");
+        let broker = crate::test_broker(base.join("b.log")).unwrap();
+        let mut bus = NeedBus::open(&base, &broker);
+        let sock = bus.sock.clone();
+        let mut s = Needs::open();
+        let withheld = s.bodies();
+        assert!(
+            withheld.iter().any(|b| b.contains(" op=snap ")),
+            "PRECONDITION: the session's start and first snapshot never reach the bus"
+        );
+        let close = [" op=close ", "out=fail"];
+        let cmd = s.cmd_open();
+        s.cmd_close(cmd, aterm_slog::RunOut::Fail);
+        let first = offset_of(&bus.publish(NEED_FACE, s.bodies()), &close);
+        let cmd = s.cmd_open();
+        s.cmd_close(cmd, aterm_slog::RunOut::Fail);
+        let second = offset_of(&bus.publish(NEED_FACE, s.bodies()), &close);
+        let state = base.join("st");
+        let (mut c, fired) = need_cfg(&sock, &state, Sel::Need(None), Since::Start);
+        c.exec = format!("{}; [ \"$ATERM_NOTIFY_OFFSET\" != {second} ]", c.exec);
+        Notifier::new(c)
+            .expect("open")
+            .catch_up()
+            .expect("catch up");
+        let mut want = vec![format!("{first} failure"), format!("{second} failure")];
+        assert_eq!(
+            fired_lines(&fired),
+            want,
+            "PRECONDITION: each failure's page ran, the second's failed"
+        );
+        s.mail();
+        let snapped = bus.publish(NEED_FACE, s.bodies());
+        assert!(
+            snapped.len() == 1 && snapped[0].1.contains(" op=snap "),
+            "PRECONDITION: the mail's snapshot alone: {snapped:?}"
+        );
+        want.push(format!("{} failure", snapped[0].0));
+        let run = || need_once(&sock, &state, Sel::Need(None), Since::Start);
+        assert_eq!(
+            run(),
+            want,
+            "a restart runs the owed page at the snapshot, though the first failure stands"
+        );
+        s.quiet();
+        bus.publish(NEED_FACE, s.bodies());
+        assert_eq!(run(), want, "then it stands");
+        drop(bus.conn);
+        bus.server.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// AN OWED PAGE WAITS FOR A FOLD THAT STILL SEES ITS NEED (fix unit J0-3's lander): the
+    /// session's start never reached the bus, and the follower holds the failed close, whose
+    /// page fails. The bus then loses a record after it (a hole), which may have lifted it: the
+    /// partial fold of the next record no longer sees the failure, and a restart runs nothing.
+    /// A mail snapshot that names the failure, with nothing lost past it, sees it again, and the
+    /// owed page runs there.
+    #[cfg(unix)]
+    #[test]
+    fn an_owed_page_waits_for_a_fold_that_still_sees_its_need() {
+        let dir = scratch("need-owed-seen");
+        let base = PathBuf::from(&dir);
+        std::fs::create_dir_all(&base).expect("scratch");
+        let broker = crate::test_broker(base.join("b.log")).unwrap();
+        let mut bus = NeedBus::open(&base, &broker);
+        let sock = bus.sock.clone();
+        let mut s = Needs::open();
+        let withheld = s.bodies();
+        assert!(
+            withheld.iter().any(|b| b.contains(" op=snap ")),
+            "PRECONDITION: the session's start and first snapshot never reach the bus"
+        );
+        let cmd = s.cmd_open();
+        s.cmd_close(cmd, aterm_slog::RunOut::Fail);
+        let first = offset_of(
+            &bus.publish(NEED_FACE, s.bodies()),
+            &[" op=close ", "out=fail"],
+        );
+        let state = base.join("st");
+        let (mut c, fired) = need_cfg(&sock, &state, Sel::Need(None), Since::Start);
+        c.exec = format!("{}; [ \"$ATERM_NOTIFY_OFFSET\" != {first} ]", c.exec);
+        let failing = c.exec.clone();
+        Notifier::new(c)
+            .expect("open")
+            .catch_up()
+            .expect("catch up");
+        let mut want = vec![format!("{first} failure")];
+        assert_eq!(
+            fired_lines(&fired),
+            want,
+            "PRECONDITION: the failure's page ran and failed"
+        );
+        let run = || {
+            let (mut c, fired) = need_cfg(&sock, &state, Sel::Need(None), Since::Start);
+            c.exec.clone_from(&failing);
+            Notifier::new(c)
+                .expect("open")
+                .catch_up()
+                .expect("catch up");
+            fired_lines(&fired)
+        };
+        s.quiet();
+        s.quiet();
+        let quiet = s.bodies();
+        assert_eq!(quiet.len(), 2, "PRECONDITION: two records");
+        bus.publish(NEED_FACE, quiet[1..].to_vec());
+        assert_eq!(
+            run(),
+            want,
+            "a fold that lost a record after the failure does not see it, and runs nothing"
+        );
+        s.mail();
+        let snapped = bus.publish(NEED_FACE, s.bodies());
+        assert!(
+            snapped.len() == 1 && snapped[0].1.contains(" op=snap "),
+            "PRECONDITION: the mail's snapshot alone: {snapped:?}"
+        );
+        want.push(format!("{} failure", snapped[0].0));
+        assert_eq!(
+            run(),
+            want,
+            "the snapshot sees it again, and the owed page runs"
+        );
+        s.quiet();
+        bus.publish(NEED_FACE, s.bodies());
+        assert_eq!(run(), want, "then it stands");
+        drop(bus.conn);
+        bus.server.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn need_selectors_take_the_needs_a_fold_raises_and_refuse_any_other() {
         assert_eq!(Sel::parse("need"), Ok(Sel::Need(None)));
@@ -6502,6 +7562,8 @@ mod tests {
         };
         std::fs::create_dir_all(from.root.join("cur")).unwrap();
         from.set_cursor("attention", 2).unwrap();
+        from.set_cursor("ask-to.h-alice", 9).unwrap();
+        from.set_cursor("ask-to.h-bob", 4).unwrap();
         from.set_journal(
             &["1 fired rc=0".into(), "7 fired rc=0".into()],
             Flush::Ordered,
@@ -6514,6 +7576,14 @@ mod tests {
         from.carry(&from, &ordinary, 6).unwrap();
         let carried = Store { root: ordinary };
         assert_eq!(carried.cursor("attention"), Some(2));
+        assert_eq!(carried.cursor("ask-to.h-alice"), Some(6));
+        assert_eq!(carried.cursor("ask-to.h-bob"), Some(4));
+        std::os::unix::fs::symlink(
+            carried.root.join("cur/attention"),
+            carried.root.join("cur/halt"),
+        )
+        .unwrap();
+        assert_eq!(carried.cursor("halt"), None);
         assert_eq!(carried.journal(), ["1 fired rc=0"]);
         assert_eq!(carried.standing(), from.standing());
         let empty = Store {

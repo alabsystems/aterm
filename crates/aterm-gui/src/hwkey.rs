@@ -166,6 +166,23 @@ thread_local! {
     /// The test build's stand-in for `-[NSApp currentEvent]` ([`current_key`]).
     pub(crate) static CURRENT_KEY_STUB: std::cell::Cell<Option<PostedKey>> =
         const { std::cell::Cell::new(None) };
+    /// The source verdict retained by the window callback being delivered.
+    static WINDOW_EVENT_POSTED_STUB: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Deliver a test callback with its retained source verdict, restoring an enclosing callback
+/// even if the delivery unwinds. This never queries AppKit.
+#[cfg(test)]
+pub(crate) fn with_window_event_posted_for_test<R>(posted: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WINDOW_EVENT_POSTED_STUB.with(|current| current.set(self.0));
+        }
+    }
+    let _restore = Restore(WINDOW_EVENT_POSTED_STUB.with(|current| current.replace(Some(posted))));
+    f()
 }
 
 fn with_ledger<R>(f: impl FnOnce(&mut Ledger) -> R) -> R {
@@ -181,8 +198,8 @@ fn with_ledger<R>(f: impl FnOnce(&mut Ledger) -> R) -> R {
     }
 }
 
-/// Set once a burst noted a key in this process: until then no key is a burst's, and the main
-/// thread reads no event to tell (the person's typing pays nothing for `hwkey`).
+/// Set once a burst noted a key in this process: until then no key is a burst's, and classifying
+/// a native key need not consult the ledger.
 static NOTED: AtomicBool = AtomicBool::new(false);
 
 /// Record `keys` (one press: its key-down and key-up) as a burst's, before they are posted, or
@@ -225,11 +242,25 @@ fn current_key() -> Option<PostedKey> {
     }
 }
 
-/// Whether the event AppKit is dispatching now is a key a burst posted: it takes the person's own
-/// key path (a menu's key equivalent, a binding, the focused view) with no gesture mark of its
-/// own, and it is a control client's.
+/// Whether the native event AppKit is dispatching now is a key a burst posted. Native menu and
+/// toolbar callbacks can run in a nested loop beneath a window callback from a different key,
+/// so their readers consult the current native event rather than that callback's retained source.
 pub(crate) fn current_event_posted() -> bool {
     NOTED.load(Ordering::Acquire) && current_key().is_some_and(event_posted)
+}
+
+/// Whether this window callback came from a key a burst posted. The native source classifies
+/// it before queueing a callback, including text an input method composes or commits. A retained
+/// false verdict also masks an unrelated current key. Outside a retained window callback, a
+/// native reader can still classify the event AppKit is dispatching now.
+pub(crate) fn window_callback_posted() -> bool {
+    #[cfg(test)]
+    let retained = WINDOW_EVENT_POSTED_STUB.with(std::cell::Cell::get);
+    #[cfg(all(not(test), target_os = "macos"))]
+    let retained = aterm_window::platform::macos::window_event_posted();
+    #[cfg(all(not(test), not(target_os = "macos")))]
+    let retained: Option<bool> = None;
+    retained.unwrap_or_else(current_event_posted)
 }
 
 /// Whether `seen`, a key event a native monitor holds before AppKit dispatches it, is a key a
@@ -494,16 +525,18 @@ fn take_tokens(rest: &str) -> Result<(u64, u32, u64, bool, String), String> {
                 };
             }
         } else if let Some(n) = tok.strip_prefix("count=") {
-            count = n
-                .parse::<u32>()
-                .map_err(|_| format!("ERR hwkey: bad count `{n}`\n"))?;
+            count = (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| n.parse::<u32>().ok())
+                .flatten()
+                .ok_or_else(|| format!("ERR hwkey: bad count `{n}`\n"))?;
             if count == 0 || count > MAX_COUNT {
                 return Err(format!("ERR hwkey: count must be 1..={MAX_COUNT}\n"));
             }
         } else if let Some(n) = tok.strip_prefix("interval=") {
-            interval = n
-                .parse::<u64>()
-                .map_err(|_| format!("ERR hwkey: bad interval `{n}`\n"))?;
+            interval = (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| n.parse::<u64>().ok())
+                .flatten()
+                .ok_or_else(|| format!("ERR hwkey: bad interval `{n}`\n"))?;
             if interval > MAX_INTERVAL_MS {
                 return Err(format!(
                     "ERR hwkey: interval must be 0..={MAX_INTERVAL_MS} ms\n"
@@ -880,6 +913,60 @@ mod tests {
         note_posted(&[up]).expect("room");
         assert!(at(up), "its key-up");
         assert!(!at(down), "the key-down, once the key-up was found");
+    }
+
+    /// A native menu or toolbar callback in a nested loop reads its own current key, while a
+    /// deferred window callback keeps its original source. Neither reader borrows the other's
+    /// decision, including the physical callback's definitive false verdict.
+    #[test]
+    fn native_readers_do_not_borrow_a_retained_window_callbacks_source() {
+        let a = PostedKey {
+            kind: NS_EVENT_TYPE_KEY_DOWN,
+            keycode: 0,
+            timestamp: 6_700.0,
+        };
+        let physical_b = PostedKey {
+            timestamp: 6_701.0,
+            ..a
+        };
+        let posted_b = PostedKey {
+            timestamp: 6_702.0,
+            ..a
+        };
+        note_posted(&[a, posted_b]).expect("room");
+        let retained_a = super::event_posted(a);
+        assert!(retained_a);
+        CURRENT_KEY_STUB.with(|current| current.set(Some(physical_b)));
+        super::with_window_event_posted_for_test(retained_a, || {
+            assert!(!current_event_posted(), "the nested native key is physical");
+            assert!(
+                super::window_callback_posted(),
+                "the window callback still belongs to A"
+            );
+            CURRENT_KEY_STUB.with(|current| current.set(Some(posted_b)));
+            super::with_window_event_posted_for_test(false, || {
+                assert!(current_event_posted(), "the nested native key is posted");
+                assert!(
+                    !super::window_callback_posted(),
+                    "the physical callback stays physical"
+                );
+            });
+            CURRENT_KEY_STUB.with(|current| current.set(Some(physical_b)));
+            assert!(
+                !super::event_posted(a),
+                "PRECONDITION: B consumed A's raw ledger identity"
+            );
+            assert!(
+                super::window_callback_posted(),
+                "the enclosing callback is restored"
+            );
+            assert!(!current_event_posted());
+        });
+        assert!(
+            !super::window_callback_posted(),
+            "outside a callback the raw reader is used"
+        );
+        CURRENT_KEY_STUB.with(|current| current.set(None));
     }
 
     /// System State (or a gateway card) coming to the front after the second key of five stops

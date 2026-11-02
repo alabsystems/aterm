@@ -91,25 +91,26 @@ const WHY_FIXTURE_SEAM: &str = "ATERM_DEV_WHY_FIXTURE";
 
 /// Pulls that arm the split set (`sys why`).
 pub(crate) static SPLIT_ARMED: Arming = Arming::new();
+/// Pulls that arm the stuck engine (`sys jobs`): such a pull's reading makes a new jobs view
+/// inside the engine's cadence, which every other pull keeps.
+pub(crate) static JOBS_ARMED: Arming = Arming::new();
 
-/// How soon a reading no window shows is due again after one that gave `view`: at the engine's own
-/// `Demand` while a live job stands, and within Slow's 30 s while the view
-/// [`holds_a_wait`](crate::vitals_jobs::holds_a_wait); else `None`. Never under [`JOBS_FLOOR`].
-/// The engine's `Demand` itself stays its jobs' own, so a window's bars keep its cadence.
-fn job_demand_after(view: &aterm_vitals::jobs::JobsView) -> Option<Duration> {
-    let live = view
-        .rows
-        .iter()
-        .any(|r| r.verdict != aterm_vitals::jobs::Verdict::Exited);
-    let held = crate::vitals_jobs::holds_a_wait(view);
-    let every = [
-        view.demand.every_ms().filter(|_| live),
-        aterm_vitals::jobs::Demand::Slow.every_ms().filter(|_| held),
-    ]
-    .into_iter()
-    .flatten()
-    .min()?;
-    Some(Duration::from_millis(every).max(JOBS_FLOOR))
+/// How soon a reading no window shows is due again after one that gave `view` and `left`, for
+/// what no edge tells: Slow's 30 s while [`held_on_slow`](crate::vitals_jobs::held_on_slow) (the
+/// view holds a wait, since a start raises no edge, or the leftover view offers a row whose owner
+/// is gone); else `None`. A live job's own `Demand` arms nothing with no window (an idle aterm
+/// wakes zero times, owner's bar): the reading its end needs comes on the edge that end makes (its
+/// shell's prompt, the exit its session's process watch hears), and its verdict between edges is
+/// read at the disk watch's look or on a pull. The engine's `Demand` itself stays its jobs' own, so
+/// a window's bars keep its cadence. Never under [`JOBS_FLOOR`].
+fn held_wait_after(
+    view: &aterm_vitals::jobs::JobsView,
+    left: Option<&aterm_vitals::left::LeftView>,
+) -> Option<Duration> {
+    aterm_vitals::jobs::Demand::Slow
+        .every_ms()
+        .filter(|_| crate::vitals_jobs::held_on_slow(view, left))
+        .map(|every| Duration::from_millis(every).max(JOBS_FLOOR))
 }
 
 /// The episode edge `after`'s findings make against `before`'s: `Opened` when `after` stands in a
@@ -133,32 +134,53 @@ pub(crate) fn held_edge(
         .map(HeldEdge::Drained)
 }
 
-/// The programs `after` names as not started that `before` did not: its `translating` and
-/// `not_started` findings whose pid `before`'s same list lacks, each with what keeps it, so a view
-/// adopted again names none and each program is told once while it stands.
+/// The programs `after` names as not started that `before` did not: its `translating`,
+/// `not_started` and `stopped_unstarted` findings whose pid `before`'s same list lacks, each with
+/// what keeps it (a stopped-unstarted row with the bits `after` read), so a view adopted again
+/// names none and each program is told once while it stands, whatever its bits read next.
 pub(crate) fn newly_not_started<'a>(
     before: Option<&aterm_vitals::jobs::Findings>,
     after: &'a aterm_vitals::jobs::Findings,
 ) -> Vec<(aterm_vitals::jobs::StartWait, &'a aterm_vitals::jobs::Named)> {
-    use aterm_vitals::jobs::StartWait;
-    let was = |wait: StartWait, pid: u32| {
-        before.is_some_and(|b| {
-            let list = if wait == StartWait::Translating {
-                &b.translating
-            } else {
-                &b.not_started
-            };
-            list.iter().any(|n| n.pid == pid)
-        })
+    let was = |kind: &str, pid: u32| {
+        before.is_some_and(|b| not_started_rows(b).any(|(w, n)| w.word() == kind && n.pid == pid))
     };
-    let mut fresh = Vec::new();
-    for (wait, list) in [
-        (StartWait::Translating, &after.translating),
-        (StartWait::NotStarted, &after.not_started),
-    ] {
-        fresh.extend(list.iter().filter(|n| !was(wait, n.pid)).map(|n| (wait, n)));
-    }
-    fresh
+    not_started_rows(after)
+        .filter(|(wait, n)| !was(wait.word(), n.pid))
+        .collect()
+}
+
+/// The rows `f` names as not started for another reason than macOS's program check, each with
+/// what keeps it: translating, then not started, then stopped or traced.
+fn not_started_rows(
+    f: &aterm_vitals::jobs::Findings,
+) -> impl Iterator<Item = (aterm_vitals::jobs::StartWait, &aterm_vitals::jobs::Named)> {
+    use aterm_vitals::jobs::StartWait;
+    f.translating
+        .iter()
+        .map(|n| (StartWait::Translating, n))
+        .chain(f.not_started.iter().map(|n| (StartWait::NotStarted, n)))
+        .chain(f.stopped_unstarted.iter().map(|s| {
+            (
+                StartWait::StoppedUnstarted {
+                    stopped: s.stopped,
+                    traced: s.traced,
+                },
+                &s.named,
+            )
+        }))
+}
+
+/// How many programs aterm started after its Developer Tools grant took `after` names held
+/// (`Findings::program_check_after_grant`) when `before` named none: one such program means
+/// the grant did not take, told once while any stands.
+pub(crate) fn after_grant_edge(
+    before: Option<&aterm_vitals::jobs::Findings>,
+    after: &aterm_vitals::jobs::Findings,
+) -> Option<u32> {
+    let now = after.program_check_after_grant;
+    let was = before.map_or(0, |f| f.program_check_after_grant);
+    (now > 0 && was == 0).then_some(now)
 }
 
 /// Kernel process-event edge (`NOTE_EXIT`, `NOTE_FORK`).
@@ -299,6 +321,9 @@ pub(crate) struct Request {
     /// What those roots' PTY readers read, read again at each pass
     /// ([`crate::vitals_jobs::JobFeed`]).
     pub(crate) feeds: Vec<(u64, Arc<crate::vitals_jobs::JobFeed>)>,
+    /// When aterm's Developer Tools grant took effect and which of those roots another aterm
+    /// process handed over ([`App::vitals_grant`]).
+    pub(crate) grant: crate::vitals_jobs::GrantFacts,
     /// The keys driven into those roots' terminals, counted again at each pass
     /// ([`crate::vitals_jobs::JobFeed::typed_at`]).
     pub(crate) inputs: Vec<(u64, aterm_session::sink::DrivenInputWatch)>,
@@ -668,6 +693,10 @@ pub(crate) struct VitalsHost {
     windowed: bool,
     disk_pull: bool,
     edge: bool,
+    /// A session closed since the last ask ([`Self::note_tab_closed`]): the next service asks
+    /// a whole reading at once, so the close knows what it left, and asks again while the
+    /// thread's queue is full.
+    tab_closed: bool,
     last_edge_read: Option<Instant>,
     /// Each session's [`ScreenMoves::count`] at its last output wake.
     screens: std::collections::HashMap<u64, u64>,
@@ -702,6 +731,9 @@ pub(crate) struct VitalsHost {
     survey: Arc<Where>,
     board: &'static crate::vitals_jobs::JobsBoard,
     proc_edge: &'static ProcEdge,
+    /// The closed tabs whose leftovers a `proc.left` record told, among those the adopted view
+    /// holds: each close is told once ([`crate::message_reporters::newly_left`]).
+    left_told: std::collections::BTreeSet<u64>,
 }
 
 impl Default for VitalsHost {
@@ -732,6 +764,7 @@ impl Default for VitalsHost {
             windowed: false,
             disk_pull: false,
             edge: false,
+            tab_closed: false,
             last_edge_read: None,
             screens: std::collections::HashMap::new(),
             parked: std::collections::HashMap::new(),
@@ -754,6 +787,7 @@ impl Default for VitalsHost {
             } else {
                 &PROC_EDGE
             },
+            left_told: std::collections::BTreeSet::new(),
         }
     }
 }
@@ -818,7 +852,7 @@ impl VitalsHost {
                 ));
                 self.prev_snapshot = self.snapshot.clone();
                 self.read_began = began;
-                self.snapshot = Some(snap);
+                self.snapshot = Some(crate::strain_script::adopt(snap, now));
                 true
             }
             _ => false,
@@ -828,8 +862,8 @@ impl VitalsHost {
     fn windowless_due(&self) -> Option<Instant> {
         let engine = self.snapshot.as_ref().and_then(|snap| {
             let view = snap.jobs.as_deref()?;
-            let after =
-                crate::vitals_jobs::windowless_after(view).or_else(|| job_demand_after(view))?;
+            let after = crate::vitals_jobs::windowless_after(view)
+                .or_else(|| held_wait_after(view, snap.left.as_deref()))?;
             Some(self.adopted_at? + after)
         });
         let owed = self.jobs_dropped.map(|at| at + JOBS_FLOOR);
@@ -849,6 +883,12 @@ impl VitalsHost {
             (Some(engine), Some(paced)) => Some(engine.min(paced)),
             (engine, paced) => engine.or(paced),
         }
+    }
+
+    /// Marks a session's close: the next service asks one whole reading at once, windowed or
+    /// not, so the leftover pass reads the closed tab's horizon at the exit edge.
+    pub(crate) const fn note_tab_closed(&mut self) {
+        self.tab_closed = true;
     }
 
     /// Marks an output or process-event edge when no window shows the bars.
@@ -1048,6 +1088,11 @@ trait Source {
     fn split_cold(&self) -> bool {
         false
     }
+    /// Whether a `sys jobs` waiting on a pull arms the stuck engine for its reading
+    /// ([`JOBS_ARMED`]).
+    fn jobs_armed(&self) -> bool {
+        false
+    }
 }
 
 impl Source for Reader {
@@ -1071,20 +1116,33 @@ impl Source for Reader {
         let now = Instant::now();
         self.split.cold(now) || self.gpu.cold(now)
     }
+
+    fn jobs_armed(&self) -> bool {
+        self.jobs_armed.armed()
+    }
 }
 
 #[derive(Default)]
 struct Asked {
     read: bool,
+    /// A [`Msg::Read`] came earlier in this drain: a later one keeps what it asked.
+    asked_read: bool,
     pull: bool,
     facts: bool,
     cpu_policy: Option<aterm_vitals::sys::json::Jv>,
 }
 
 impl Asked {
+    /// Takes one message into the drain's request. Only a [`Msg::Read`] changes what the reading
+    /// reads, and a later one in the same drain never drops what an earlier one asked: a whole
+    /// reading, and the engine's look (a close's ask beside a hidden window's machine-only one).
     fn take(&mut self, msg: Msg, req: &mut Request) {
         match msg {
             Msg::Read(mut r) => {
+                if std::mem::replace(&mut self.asked_read, true) {
+                    r.jobs_now |= req.jobs_now;
+                    r.machine_only &= req.machine_only;
+                }
                 let mut gaps = std::mem::take(&mut req.note_gaps);
                 let mut events = std::mem::take(&mut req.note_events);
                 gaps.append(&mut r.note_gaps);
@@ -1096,7 +1154,8 @@ impl Asked {
                 self.read = true;
             }
             Msg::Facts(mut r) => {
-                let (cadence_ms, machine_only) = (req.cadence_ms, req.machine_only);
+                let (cadence_ms, machine_only, jobs_now) =
+                    (req.cadence_ms, req.machine_only, req.jobs_now);
                 let mut gaps = std::mem::take(&mut req.note_gaps);
                 let mut events = std::mem::take(&mut req.note_events);
                 gaps.append(&mut r.note_gaps);
@@ -1106,6 +1165,7 @@ impl Asked {
                 *req = *r;
                 req.cadence_ms = cadence_ms;
                 req.machine_only = machine_only;
+                req.jobs_now = jobs_now;
                 self.facts = true;
             }
             Msg::Pull => self.pull = true,
@@ -1177,6 +1237,7 @@ fn run(
             req.self_pid = std::process::id();
         }
         let began = Instant::now();
+        crate::metrics::note_reading(crate::metrics::ReadingStep::Began);
         let snap = if asked.pull {
             pull(&mut source, &mut req, last_whole)
         } else {
@@ -1193,6 +1254,7 @@ fn run(
         }
         let words = req.ttys.iter().map(TtyWord::seen).collect();
         let jobs_moved = hand_over(latest, &snap, words, began);
+        crate::metrics::note_reading(crate::metrics::ReadingStep::Handed);
         if let Some(sys) = sys {
             sys.publish(snap, source.machine().unwrap_or(&no_machine));
         }
@@ -1243,7 +1305,9 @@ fn run(
 /// ([`Request::reread_words`]): the thread may hold its request from long before, and a write
 /// that moved a screen since a word was read (an agent's last redraw of a turn, or one inside the
 /// pair) leaves that word stamped before the output, naming no wait. `req` keeps the words the
-/// last reading read with, which the view is handed back with.
+/// last reading read with, which the view is handed back with. The pull keeps the engine's
+/// cadence, whatever that request asked of it, but for its last reading while a `sys jobs`
+/// arms the engine ([`Source::jobs_armed`]): one look, never the warm one's too.
 fn pull(source: &mut impl Source, req: &mut Request, last_whole: Option<Instant>) -> Snapshot {
     if let Some(t) = last_whole {
         std::thread::sleep(MIN_WINDOW.saturating_sub(t.elapsed()));
@@ -1263,6 +1327,7 @@ fn pull(source: &mut impl Source, req: &mut Request, last_whole: Option<Instant>
         warm
     });
     pull.reread_words();
+    pull.jobs_now = source.jobs_armed();
     let mut snap = source.reading(&pull);
     if let Some(warm) = warm {
         keep_warm_events(warm, &mut snap);
@@ -1903,11 +1968,14 @@ fn coal_sample(read: aterm_sysprobe::coalitions::CoalitionRead) -> CoalSample {
     }
 }
 
-/// A recorded `explain::fixtures` scene read in place of the machine in debug builds.
+/// A debug fixture: a recorded scene, or live hardware with utilization deliberately unread.
 #[cfg(debug_assertions)]
-pub(crate) struct WhyFixture {
-    scene: aterm_vitals::explain::fixtures::Scene,
-    t0: Option<Instant>,
+pub(crate) enum WhyFixture {
+    Recorded {
+        scene: Box<aterm_vitals::explain::fixtures::Scene>,
+        t0: Option<Instant>,
+    },
+    HardwareUnread,
 }
 
 /// No fixture in a build without debug assertions.
@@ -1919,6 +1987,10 @@ impl WhyFixture {
     fn from_seam() -> Option<Self> {
         let named = aterm_types::dev_seam!(WHY_FIXTURE_SEAM)?;
         let name = named.to_str()?;
+        if name == "hardware-unread" {
+            aterm_log::info!("system vitals: showing live hardware with unread utilization");
+            return Some(Self::HardwareUnread);
+        }
         let Some(scene) = Self::scene_named(name) else {
             aterm_log::warn!("system vitals: {WHY_FIXTURE_SEAM}={name} names no scene");
             return None;
@@ -1927,7 +1999,46 @@ impl WhyFixture {
             "system vitals: reading the {} scene",
             named.to_string_lossy()
         );
-        Some(Self { scene, t0: None })
+        Some(Self::Recorded {
+            scene: Box::new(scene),
+            t0: None,
+        })
+    }
+
+    fn is_recorded(&self) -> bool {
+        matches!(self, Self::Recorded { .. })
+    }
+
+    /// The view-only fixture never changes the model's samples or the other resources.
+    fn snapshot(&self, live: &Snapshot) -> Option<Snapshot> {
+        if !matches!(self, Self::HardwareUnread) {
+            return None;
+        }
+        let mut snap = live.clone();
+        if let Some(gpu) = snap.facts.gpu.as_mut() {
+            gpu.device_pct = None;
+            gpu.renderer_pct = None;
+            gpu.tiler_pct = None;
+        }
+        snap.gpu = None;
+        let unread = |row: &mut aterm_vitals::model::ResourceView| {
+            *row = aterm_vitals::model::ResourceView {
+                capacity: row.capacity,
+                state: row.state,
+                basis: row.basis,
+                ..Default::default()
+            };
+        };
+        unread(&mut snap.resources[aterm_vitals::Resource::Gpu.index()]);
+        if snap
+            .cpu_counter_sample
+            .as_ref()
+            .is_some_and(|cores| !cores.is_empty())
+        {
+            snap.cpu = None;
+            unread(&mut snap.resources[aterm_vitals::Resource::Cpu.index()]);
+        }
+        Some(snap)
     }
 
     /// The scene the seam's `name` names: `calm`, or `spotlight`'s work under calm's memory and
@@ -1946,7 +2057,10 @@ impl WhyFixture {
     }
 
     fn reading(&mut self, live: &Sample, split: bool) -> Sample {
-        let t0 = *self.t0.get_or_insert_with(Instant::now);
+        let Self::Recorded { t0, .. } = self else {
+            return live.clone();
+        };
+        let t0 = *t0.get_or_insert_with(Instant::now);
         self.at(
             live,
             split,
@@ -1958,7 +2072,10 @@ impl WhyFixture {
     /// tabs are the machine's tabs in order (the live tab's keys and label,
     /// the scene's shell), so a caller in a live tab reads the scene's tab.
     fn at(&self, live: &Sample, split: bool, at_ms: u64) -> Sample {
-        let mut scene = self.scene.reading(at_ms, split);
+        let Self::Recorded { scene, .. } = self else {
+            return live.clone();
+        };
+        let mut scene = scene.reading(at_ms, split);
         for (t, l) in scene.tabs.iter_mut().zip(&live.tabs) {
             (t.key, t.tab, t.label) = (l.key, l.tab, l.label.clone());
         }
@@ -2011,6 +2128,14 @@ impl WhyFixture {
     fn reading(&mut self, _live: &Sample, _split: bool) -> Sample {
         match *self {}
     }
+
+    fn is_recorded(&self) -> bool {
+        match *self {}
+    }
+
+    fn snapshot(&self, _live: &Snapshot) -> Option<Snapshot> {
+        match *self {}
+    }
 }
 
 /// The readers and the model: one per thread.
@@ -2021,6 +2146,8 @@ pub(crate) struct Reader {
     clusters: Vec<ClusterSpec>,
     vitals: aterm_vitals::Vitals,
     jobs: crate::vitals_jobs::JobsPass,
+    /// The leftover pass (`sys left`), after the jobs pass in each whole reading.
+    left: crate::vitals_left::LeftPass,
     epoch: Instant,
     /// The pass's clock ([`Request::tab_reads`]): the machine's, or a test's own, which no load
     /// spaces.
@@ -2036,6 +2163,8 @@ pub(crate) struct Reader {
     slots: aterm_sysprobe::slots::SlotReader,
     /// The split set's lane and what it keeps between split ticks.
     pub(crate) split: SplitReader,
+    /// The pulls that arm the stuck engine ([`JOBS_ARMED`]; a unit test's reader has its own).
+    pub(crate) jobs_armed: &'static Arming,
     /// The network lane's passive kernel readers.
     pub(crate) net: NetProbe,
     /// The GPU client lane.
@@ -2076,10 +2205,7 @@ impl Request {
     /// ([`crate::vitals_jobs::JobFeed::at_pass`]), so whatever a reader reads after the clock is
     /// stamped past it, and a line or output stamped past the clock waits for the next pass.
     pub(crate) fn tab_reads(&self, epoch: Instant, now: impl FnOnce() -> Instant) -> TabReads {
-        let clock = now();
-        let at_ms = u64::try_from(clock.saturating_duration_since(epoch).as_millis())
-            .unwrap_or(u64::MAX)
-            .max(1);
+        let at_ms = pass_ms(epoch, now());
         let feeds = self
             .feeds
             .iter()
@@ -2101,6 +2227,18 @@ impl Request {
             ttys,
         }
     }
+}
+
+/// The pass's clock at `clock`: ms past the reader's zero `epoch`, at least 1 ms.
+fn pass_ms(epoch: Instant, clock: Instant) -> u64 {
+    u64::try_from(clock.saturating_duration_since(epoch).as_millis())
+        .unwrap_or(u64::MAX)
+        .max(1)
+}
+
+/// How old `view` is at a reading at `at_ms` on the pass's clock ([`Snapshot::jobs_age_ms`]).
+fn jobs_age_ms(view: Option<&aterm_vitals::jobs::JobsView>, at_ms: u64) -> u64 {
+    view.map_or(0, |v| at_ms.saturating_sub(v.at_ms))
 }
 
 impl TabReads {
@@ -2127,6 +2265,7 @@ pub(crate) fn jobs_step(
         &req.tabs,
         &reads.ttys,
         &reads.feeds,
+        &req.grant,
         req.self_pid,
         thrashing,
         req.jobs_now,
@@ -2169,6 +2308,7 @@ impl Reader {
             clusters,
             vitals: aterm_vitals::Vitals::new(),
             jobs: crate::vitals_jobs::JobsPass::new(),
+            left: crate::vitals_left::LeftPass::new(),
             epoch: Instant::now(),
             clock: Instant::now,
             slots: aterm_sysprobe::slots::SlotReader::new(aterm_sysprobe::slots::default_dir(
@@ -2187,6 +2327,11 @@ impl Reader {
             },
             counter_throttle: None,
             split,
+            jobs_armed: if cfg!(test) {
+                Box::leak(Box::new(Arming::new()))
+            } else {
+                &JOBS_ARMED
+            },
             net: NetProbe::KERNEL,
             gpu: crate::vitals_gpu::GpuLane::host(),
             fixture: None,
@@ -2204,7 +2349,7 @@ impl Reader {
     }
 
     fn read_scene(&mut self, fixture: Option<WhyFixture>) {
-        if fixture.is_some() {
+        if fixture.as_ref().is_some_and(WhyFixture::is_recorded) {
             self.split.lane = CoalLane::On;
         }
         self.fixture = fixture;
@@ -2256,7 +2401,7 @@ impl Reader {
         let reads = req.tab_reads(self.epoch, self.clock);
         let now = Instant::now();
         let split = self.split.due(req, now);
-        let live_split = split && self.fixture.is_none();
+        let live_split = split && !self.fixture.as_ref().is_some_and(WhyFixture::is_recorded);
         // The reading's wall clock, read before the sweep lists the
         // processes: one born at or after it is in no earlier sweep, which is
         // how the reap credit tells a process born since the last reading
@@ -2314,12 +2459,16 @@ impl Reader {
         if req.deck || req.pull {
             attach_hardware(&mut sample, &mut self.hardware, self.hardware_read);
         }
-        let scene = self.fixture.as_mut().map(|fixture| {
-            if split {
-                self.split.last = Some(now);
-            }
-            fixture.reading(&sample, split)
-        });
+        let scene = self
+            .fixture
+            .as_mut()
+            .filter(|fixture| fixture.is_recorded())
+            .map(|fixture| {
+                if split {
+                    self.split.last = Some(now);
+                }
+                fixture.reading(&sample, split)
+            });
         let mut snap = self.vitals.absorb(scene.as_ref().unwrap_or(&sample));
         if self.split.lane.on() && snap.coal_lane == CoalLane::Off && scene.is_none() {
             aterm_log::warn!(
@@ -2350,18 +2499,30 @@ impl Reader {
         );
         let thrashing = sample.mem.is_some_and(|m| m.pressure == Pressure::Critical);
         let events_before = snap.strip_events.len();
-        snap.set_jobs(jobs_step(
+        self.jobs.tie_held(self.left.ties());
+        let jobs = jobs_step(
             &mut self.jobs,
             &reads,
             sweep.as_ref().map(|s| s.procs.as_slice()),
             req,
             thrashing,
+        );
+        let jobs_age = jobs_age_ms(jobs.as_deref(), reads.at_ms);
+        snap.set_left(self.left.tick(
+            u64::try_from(at_unix_ms).unwrap_or(0),
+            sweep.as_ref().map(|s| s.procs.as_slice()),
+            !sweep.as_ref().is_some_and(|s| s.truncated),
+            req,
+            jobs.as_deref(),
+            jobs_age,
         ));
+        snap.set_jobs(jobs);
+        snap.jobs_age_ms = jobs_age;
         for ev in snap.strip_events[events_before..].iter().cloned() {
             self.vitals.record_strip_event(ev);
         }
         self.watch_jobs(&mut snap);
-        snap
+        self.fixture_snapshot(snap)
     }
 
     /// Takes a hidden deck's reading (machine counters alone, no process sweep).
@@ -2373,26 +2534,42 @@ impl Reader {
         let scene = self
             .fixture
             .as_mut()
+            .filter(|fixture| fixture.is_recorded())
             .map(|fixture| fixture.reading(&sample, false));
         let mut snap = self.vitals.absorb(scene.as_ref().unwrap_or(&sample));
         self.set_occupancy_facts(&mut snap);
         let events_before = snap.strip_events.len();
-        snap.set_jobs(self.jobs.tick(
+        let jobs = self.jobs.tick(
             sample.at_ns / 1_000_000,
             || sample.at_ns / 1_000_000,
             None,
             &req.tabs,
             &[],
             &[],
+            &req.grant,
             req.self_pid,
             false,
             false,
-        ));
+        );
+        snap.jobs_age_ms = jobs_age_ms(jobs.as_deref(), pass_ms(self.epoch, (self.clock)()));
+        snap.set_jobs(jobs);
+        snap.set_left(self.left.last());
         for ev in snap.strip_events[events_before..].iter().cloned() {
             self.vitals.record_strip_event(ev);
         }
         self.watch_jobs(&mut snap);
-        snap
+        self.fixture_snapshot(snap)
+    }
+
+    fn fixture_snapshot(&self, snap: Snapshot) -> Snapshot {
+        match self
+            .fixture
+            .as_ref()
+            .and_then(|fixture| fixture.snapshot(&snap))
+        {
+            Some(view) => view,
+            None => snap,
+        }
     }
 
     /// The machine's counters, stamped `at_unix_ms` on the wall clock.
@@ -3623,8 +3800,26 @@ impl crate::App {
         };
         let in_view = self.deck_in_view()
             || (self.tabs_page_shown() && self.windows.values().any(|ws| !ws.occluded));
-        let focused = self.windows.values().any(|ws| ws.focused);
+        // A resting window reads as one in the background ([`crate::window_rest`]).
+        let focused = self
+            .windows
+            .values()
+            .any(|ws| ws.focused && !ws.rest.resting());
         Audience::of(in_view, bars && drawing().next().is_some(), focused)
+    }
+
+    /// A window woke from rest at `now`: while a window shows the bars, the next reading is due
+    /// at once, or a focused cadence after the last one asked if that is later, so the deck is
+    /// live again from the next reading rather than the background cadence's next.
+    pub(crate) fn vitals_ask_now(&mut self, now: Instant) {
+        if !self.vitals.windowed {
+            return;
+        }
+        let paced = self
+            .vitals
+            .asked_at
+            .map_or(now, |asked| (asked + FOCUSED_PERIOD).max(now));
+        self.vitals.next_due = Some(self.vitals.next_due.map_or(paced, |due| due.min(paced)));
     }
 
     fn deck_in_view(&self) -> bool {
@@ -3660,6 +3855,17 @@ impl crate::App {
             self.vitals.ensure_thread(proxy);
         }
         let audience = self.vitals_audience();
+        // A close's reading stays owed until it is sent: a full queue asks it at the next
+        // service.
+        if self.vitals.tab_closed && self.vitals.reader_runs() {
+            let period = audience
+                .cadence(self.any_stats_lens_open())
+                .map_or(Duration::ZERO, |(period, _)| period);
+            if self.ask_reading(now, period, false, true) {
+                self.vitals.tab_closed = false;
+                self.vitals.asked_at = Some(now);
+            }
+        }
         let shown = audience.in_view();
         let delegated = crate::resource_jobs::active();
         let chips_shown = self.stats_bars_form().shown();
@@ -3743,6 +3949,7 @@ impl crate::App {
         let sent = self.vitals.offer(Msg::Read(Box::new(req)));
         if sent {
             self.vitals.sent_layout = Some(layout);
+            crate::metrics::note_reading(crate::metrics::ReadingStep::Asked);
         }
         sent
     }
@@ -3963,6 +4170,7 @@ impl crate::App {
         self.retarget_needle(now);
         self.post_jobs_reading();
         self.note_held_episode(before.as_deref());
+        self.note_left_tabs();
         if !audience.in_view() {
             if self
                 .vitals
@@ -3992,11 +4200,25 @@ impl crate::App {
         }
     }
 
+    /// Records each closed tab the view just adopted is the first to hold with processes left:
+    /// one `proc.left` record per close ([`crate::message_reporters::newly_left`]).
+    fn note_left_tabs(&mut self) {
+        let Some(after) = self.vitals.snapshot.as_ref().and_then(|s| s.left.clone()) else {
+            return;
+        };
+        for tab in crate::message_reporters::newly_left(&mut self.vitals.left_told, &after) {
+            let _ = self.post_message(crate::message_reporters::left_record(tab, &after));
+        }
+    }
+
     /// Records what the view just adopted says of macOS's program check: one `program-check.`
     /// record per episode edge it makes against `before` ([`held_edge`]), one naming the programs
-    /// it first says have not started for another reason ([`newly_not_started`]), and, once the
-    /// view stands in no episode, the verdict refresh an episode held back
-    /// ([`Self::refresh_devtools_verdict`]).
+    /// it first says have not started for another reason ([`newly_not_started`]), one when it
+    /// first names programs aterm started after its Developer Tools grant took
+    /// ([`after_grant_edge`]), and, once the view stands in no episode, the verdict refresh held
+    /// back ([`Self::start_devtools_refresh`]): one an episode held ([`Self::refresh_devtools_verdict`])
+    /// or one that did not settle since, held first, so it is asked again at the first view that
+    /// stands in none, this one included.
     fn note_held_episode(&mut self, before: Option<&aterm_vitals::jobs::JobsView>) {
         let Some(after) = self.vitals.snapshot.as_ref().and_then(|s| s.jobs.clone()) else {
             return;
@@ -4011,8 +4233,18 @@ impl crate::App {
         if !fresh.is_empty() {
             let _ = self.post_message(crate::message_reporters::not_started_record(&fresh));
         }
+        if let Some(n) = after_grant_edge(before.map(|v| &v.findings), &after.findings) {
+            let _ = self.post_message(crate::message_reporters::program_check_after_grant(n));
+        }
+        if self.devtools_helper.take_unsettled() {
+            aterm_log::info!(
+                "devtools: asking macOS about aterm again did not settle; it is asked again once \
+                 macOS's program check catches up"
+            );
+            self.devtools_watch.hold_prime();
+        }
         if after.findings.program_check_episode.is_none() && self.devtools_watch.take_held_prime() {
-            let _ = self.devtools_helper.refresh_verdict();
+            self.start_devtools_refresh();
         }
     }
 
@@ -4031,16 +4263,27 @@ impl crate::App {
             );
             self.devtools_watch.hold_prime();
         } else {
-            let _ = self.devtools_helper.refresh_verdict();
+            self.start_devtools_refresh();
+        }
+    }
+
+    /// Starts a verdict refresh, or holds it when none starts (one is still out, or its worker
+    /// could not start), so the next view that stands in no episode asks again
+    /// ([`Self::note_held_episode`]).
+    fn start_devtools_refresh(&mut self) {
+        if !self.devtools_helper.refresh_verdict() {
+            self.devtools_watch.hold_prime();
         }
     }
 
     /// The adopted jobs view while it speaks for now ([`crate::vitals_jobs::speaks_for_now`]), and
     /// its age at `now`.
     fn jobs_view_now(&self, now: Instant) -> Option<(&aterm_vitals::jobs::JobsView, Duration)> {
-        let view = self.vitals.snapshot.as_ref()?.jobs.as_deref()?;
+        let snap = self.vitals.snapshot.as_ref()?;
+        let view = snap.jobs.as_deref()?;
         let age = now.saturating_duration_since(self.vitals.adopted_at?);
-        crate::vitals_jobs::speaks_for_now(view, age, self.vitals.reader_runs())
+        let reader = self.vitals.reader_runs();
+        crate::vitals_jobs::speaks_for_now(view, snap.left.as_deref(), age, reader)
             .then_some((view, age))
     }
 
@@ -4151,10 +4394,16 @@ impl crate::App {
         }
     }
 
-    fn redraw_stats_decks(&self) {
+    /// Asks a frame of each window that draws the stats bars on screen for the reading just
+    /// adopted: none with the bars off, and none of an occluded window (hidden, minimised or
+    /// covered), which redraws when it shows again (`App::on_occlusion_changed`).
+    pub(crate) fn redraw_stats_decks(&self) {
+        if self.stats_bars_form() == crate::stats_deck::StatsBars::Off {
+            return;
+        }
         for ws in self.windows.values() {
-            if let Some(window) = ws.os_window.as_ref() {
-                window.request_redraw();
+            if crate::stats_deck::stats_drawn_on(ws) && !ws.occluded {
+                ws.request_redraw();
             }
         }
     }
@@ -4315,12 +4564,14 @@ impl crate::App {
             .filter_map(|t| Some((t.key, self.pool.get(t.key)?.ctx.sink.driven_input_watch())))
             .collect();
         let now = aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(i64::MAX));
+        let grant = self.vitals_grant(&tabs);
         Request {
             self_pid: std::process::id(),
             tabs,
             ttys,
             tty_sources,
             feeds,
+            grant,
             inputs,
             layout,
             session_ids,
@@ -4333,6 +4584,31 @@ impl crate::App {
             plan: front_plan.and_then(|p| plan_fact(&p, &accounts, now)),
             note_gaps: Vec::new(),
             note_events: Vec::new(),
+        }
+    }
+
+    /// What the jobs pass sets against a held program's fork time
+    /// (`aterm_vitals::jobs::Findings::program_check_after_grant`): when aterm's Developer Tools
+    /// grant took effect, the end of the last verdict refresh that took
+    /// ([`crate::devtools_helper::Lane::took_at`]), only while the lane reads aterm granted; and
+    /// the roots of `tabs` whose session another aterm process handed over.
+    pub(crate) fn vitals_grant(&self, tabs: &[TabRoot]) -> crate::vitals_jobs::GrantFacts {
+        let granted = self
+            .devtools_helper
+            .reading()
+            .is_some_and(|r| r.grant == aterm_containment::DevToolGrant::Granted);
+        crate::vitals_jobs::GrantFacts {
+            grant_ms: granted.then(|| self.devtools_helper.took_at()).flatten(),
+            adopted: tabs
+                .iter()
+                .filter(|t| {
+                    self.pool.get(t.key).is_some_and(|s| {
+                        crate::consent_state::session_attribution(s)
+                            == aterm_containment::consent::Attribution::Adopted
+                    })
+                })
+                .map(|t| t.key)
+                .collect(),
         }
     }
 
@@ -4376,6 +4652,18 @@ impl crate::App {
                 _ => None,
             })
             .collect()
+    }
+}
+
+// Its one caller, `stats_live_tests::a_resting_window_draws_the_deck_still`, is unix-only.
+#[cfg(all(test, unix))]
+impl VitalsHost {
+    /// A test's stand-in for the reader thread: the host asks it its readings, so the deck has
+    /// an audience whose cadence other modules' tests can read.
+    pub(crate) fn attach_test_reader(&mut self) -> std::sync::mpsc::Receiver<Msg> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        self.tx = Some(tx);
+        rx
     }
 }
 

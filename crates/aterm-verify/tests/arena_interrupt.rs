@@ -9,11 +9,17 @@ use std::process::ExitStatus;
 use std::sync::mpsc;
 use std::time::Duration;
 
+use aterm_uds::deadline::FIRST_EXEC_HANG;
 use aterm_uds::process::pid_alive;
 use aterm_uds::spawnfd::{Stdio, command};
 
 /// A wait for something that must happen.
 const HANG: Duration = Duration::from_secs(60);
+
+/// The wait for the stand-in's launch: two first execs of new files come before it, the runner
+/// just built and the lane's staged copy, each of which the system may hold at its first exec
+/// for up to [`FIRST_EXEC_HANG`] (the lane's own staging allows that much), then [`HANG`].
+const LAUNCH: Duration = Duration::from_secs(2 * FIRST_EXEC_HANG.as_secs() + HANG.as_secs());
 
 /// SIGKILLs whatever is still listed when a failed assertion unwinds.
 struct Reaper(Vec<u32>);
@@ -118,14 +124,14 @@ fn interrupted_by(signal: &str, signo: i32) {
         let _ = tx.send(Event::Ready(std::fs::read_to_string(&reader)));
     });
 
-    let report = match rx.recv_timeout(HANG) {
+    let report = match rx.recv_timeout(LAUNCH) {
         Ok(Event::Ready(Ok(text))) => text,
         Ok(Event::Ready(Err(e))) => panic!("reading the stand-in's report: {e}"),
         Ok(Event::Exited(status)) => panic!(
             "aterm-verify exited ({status:?}) before launching the stand-in:\n{}",
             why()
         ),
-        Err(_) => panic!("no launch within {HANG:?}:\n{}", why()),
+        Err(_) => panic!("no launch within {LAUNCH:?}:\n{}", why()),
     };
     let mut lines = report.lines();
     let stand_in_pid: u32 = lines

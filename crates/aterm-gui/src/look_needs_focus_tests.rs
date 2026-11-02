@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! A look from another app is no look (§14.11 of `docs/DESIGN-harness-autopilot-2026-10-15.md`):
-//! the front tab of the focused frontmost window is looked at, and his return to it is the look.
+//! the front tab of the focused frontmost window is looked at, and their return to it is the look.
 
 use std::sync::Arc;
 
@@ -113,7 +113,7 @@ fn marks(app: &App) -> Vec<ChipLevel> {
     metadata.iter().map(|m| m.attention).collect()
 }
 
-/// He leaves for another app: window 0 loses the focus and stays the frontmost window, on screen.
+/// They leave for another app: window 0 loses the focus and stays the frontmost window, on screen.
 fn away(app: &mut App) {
     app.window_focus_event(W, false);
     let ws = &app.windows[&W];
@@ -145,7 +145,7 @@ fn an_unfocused_window_looks_at_nothing() {
     );
     let g = app.status_glance();
     assert_eq!(g.done.len(), 1, "its Done for you row: {:?}", g.done);
-    assert_eq!(g.button_title(), "\u{276f}\u{2022}");
+    assert_eq!(g.button_title(), "\u{276f}");
     assert_ne!(
         marks(&app)[0],
         ChipLevel::Done,
@@ -163,13 +163,13 @@ fn an_unfocused_window_looks_at_nothing() {
     assert_eq!(
         end_seen(&app),
         "0",
-        "a menu-bar rebuild, a reveal and a tab switch nobody made from the window see nothing while he is away"
+        "a menu-bar rebuild, a reveal and a tab switch nobody made from the window see nothing while they are away"
     );
     assert_eq!(app.status_glance().done.len(), 1, "the row stands");
 }
 
 #[test]
-fn a_workers_done_in_the_front_tab_waits_for_his_return_too() {
+fn a_workers_done_in_the_front_tab_waits_for_their_return_too() {
     let mut app = App::headless_for_test();
     app.push_stub_tab(W, crate::stub_session(1));
     app.frontmost_window = Some(W);
@@ -196,12 +196,12 @@ fn a_workers_done_in_the_front_tab_waits_for_his_return_too() {
     assert_eq!(
         app.status_glance().done.len(),
         1,
-        "a worker's done in the front tab stands while he is away"
+        "a worker's done in the front tab stands while they are away"
     );
     app.window_focus_event(W, true);
     assert!(
         app.status_glance().done.is_empty(),
-        "and goes when he comes back"
+        "and goes when they come back"
     );
 }
 
@@ -215,7 +215,11 @@ fn a_refocus_marks_it_seen_once() {
     let _ = crate::work_counts::take_end_restamps();
     app.take_status_rebuild();
     app.window_focus_event(W, true);
-    assert_eq!(end_seen(&app), "1", "his return to the window is the look");
+    assert_eq!(
+        end_seen(&app),
+        "1",
+        "their return to the window is the look"
+    );
     assert_eq!(
         crate::work_counts::take_end_restamps(),
         1,
@@ -280,15 +284,15 @@ fn a_controllers_focus_in_is_no_look() {
     assert_eq!(
         end_seen(&app),
         "0",
-        "a controller's `focus in` while he is in another app is no look: the landing stands"
+        "a controller's `focus in` while they are in another app is no look: the landing stands"
     );
     assert_eq!(app.status_glance().done.len(), 1, "its row stands");
     app.window_focus_event(W, true);
-    assert_eq!(end_seen(&app), "1", "his own return is the look");
+    assert_eq!(end_seen(&app), "1", "their own return is the look");
 }
 
 #[test]
-fn a_controllers_focus_out_does_not_end_his_look() {
+fn a_controllers_focus_out_does_not_end_their_look() {
     let (mut app, sid, _host) = desk(true);
     app.switch_tab_in(W, 0);
     app.window_focus_event(W, true);
@@ -297,7 +301,7 @@ fn a_controllers_focus_out_does_not_end_his_look() {
     assert_eq!(
         end_seen(&app),
         "1",
-        "while the window is his key window, a controller's `focus out` leaves him looking: seen as it lands"
+        "while the window is their key window, a controller's `focus out` leaves them looking: seen as it lands"
     );
     assert!(app.status_glance().done.is_empty(), "no row stands");
 }
@@ -311,7 +315,7 @@ fn the_attach_time_focus_is_the_oss_word_too() {
     assert_eq!(
         end_seen(&app),
         "0",
-        "a window attached while another app is active is not his key window: the landing stands"
+        "a window attached while another app is active is not their key window: the landing stands"
     );
     app.adopt_initial_focus(W, Some(true));
     end_after(&mut app, &sid, 40 * SEC);

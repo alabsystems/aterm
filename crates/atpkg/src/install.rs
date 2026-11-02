@@ -187,7 +187,7 @@ fn stage_extracted(
         }
         got
     };
-    finish_stage(artifact, build_dir, incoming, root, modes, hooks)
+    finish_stage(artifact, build_dir, incoming, root, modes, hooks, None)
 }
 
 /// Whether `artifact`'s payload lane extracts a tar stream, so its download can stage as it
@@ -374,7 +374,61 @@ pub(crate) fn stage_from_tree(
         Err(_) => return drift(String::from("its copy's executables could not be read")),
     }
     laid();
-    finish_stage(artifact, build_dir, &incoming, root, modes, hooks).map(FromTree::Staged)
+    finish_stage(artifact, build_dir, &incoming, root, modes, hooks, None).map(FromTree::Staged)
+}
+
+/// A local authority's held binary uses the ordinary sealed, durable stage tail, never a swap.
+/// No executable is run here; the caller binds its bytes through the mandatory pre-swap hook.
+#[cfg(unix)]
+pub(crate) fn stage_local_binary(
+    parent: &crate::local_harness::fs::Parent,
+    artifact: &Artifact,
+    input: std::fs::File,
+    build_dir: &Path,
+    hooks: &StageHooks<'_>,
+) -> Result<String, StageError> {
+    if artifact.payload != "raw-binary"
+        || artifact.size == 0
+        || crate::store::ToolName::new(&artifact.entry).is_none()
+        || hooks.pre_swap.is_none()
+        || !hooks.aliases.is_empty()
+    {
+        return Err(payload2(
+            "a local binary needs its byte gate and raw, unaliased layout",
+            "",
+        ));
+    }
+    let incoming = crate::store::incoming_dir(build_dir)
+        .ok_or_else(|| payload2("local build has no name", ""))?;
+    let local = crate::local_harness::fs::Stage::new(parent, build_dir, artifact)
+        .map_err(StageError::Io)?;
+    let tool = crate::store::ToolName::new(&artifact.entry)
+        .ok_or_else(|| payload2("invalid local entry: ", &artifact.entry))?;
+    let mut tree = TreeAccumulator::new();
+    let target = incoming.join("bin").join(tool.exe_file());
+    let written = crate::extract::stage_open_file(
+        input,
+        local.file.try_clone().map_err(StageError::Io)?,
+        &target,
+        0o755,
+        artifact.size,
+    )
+    .map_err(StageError::Extract)?;
+    tree.record_file(
+        crate::extract::rel_bytes_under(&incoming, &target).map_err(StageError::Extract)?,
+        written.mode,
+        written.content_sha_hex,
+    );
+    let modes = tree.declared_modes();
+    finish_stage(
+        artifact,
+        build_dir,
+        &incoming,
+        tree.root(),
+        modes,
+        hooks,
+        Some(&local),
+    )
 }
 
 /// Lay under the empty directory `to` a copy of everything under `from` (at `rel` in the tree):
@@ -479,7 +533,13 @@ fn finish_stage(
     root: String,
     mut modes: DeclaredModes,
     hooks: &StageHooks<'_>,
+    #[cfg(unix)] local: Option<&crate::local_harness::fs::Stage<'_>>,
+    #[cfg(not(unix))] _local: Option<()>,
 ) -> Result<String, StageError> {
+    #[cfg(unix)]
+    if let Some(local) = local {
+        return finish_local_stage(incoming, root, hooks, local);
+    }
     if let Err(e) = lay_aliases(incoming, hooks.aliases, &mut modes) {
         let _ = crate::store::remove_tree(incoming);
         return Err(e);
@@ -564,6 +624,51 @@ fn finish_stage(
     if let Some(parent) = build_dir.parent() {
         let _marked = crate::store::sync_dir_ordered(parent);
     }
+    Ok(root)
+}
+
+/// The same local hook/metadata/seal/order/ready sequence, all mutations held by descriptors.
+/// Failures before Ready retain an unready attempt without cleaning a name by path. An error
+/// after Ready may leave a complete candidate; observe and exactly validate it before retrying.
+#[cfg(unix)]
+fn finish_local_stage(
+    incoming: &Path,
+    root: String,
+    hooks: &StageHooks<'_>,
+    local: &crate::local_harness::fs::Stage<'_>,
+) -> Result<String, StageError> {
+    if let Some(verify) = hooks.pre_swap {
+        verify(incoming)?;
+    }
+    let sidecars = hooks
+        .sidecars
+        .map(|render| render(&root))
+        .transpose()?
+        .unwrap_or_default();
+    if [
+        crate::local_harness::SUFFIX,
+        crate::store::VERSION_SUFFIX,
+        crate::store::EXPOSES_SUFFIX,
+    ]
+    .iter()
+    .any(|required| !sidecars.iter().any(|(suffix, _)| suffix == required))
+        || sidecars
+            .iter()
+            .any(|(suffix, _)| !crate::store::STAGE_SIDECAR_SUFFIXES.contains(suffix))
+    {
+        return Err(payload2(
+            "local stage is missing or has unsupported metadata",
+            "",
+        ));
+    }
+    local.seal_sync().map_err(StageError::Io)?;
+    local.publish().map_err(StageError::Io)?;
+    local.metadata_checkpoint();
+    for (suffix, bytes) in sidecars {
+        local.sidecar(suffix, &bytes).map_err(StageError::Io)?;
+    }
+    local.sync().map_err(StageError::Io)?;
+    local.ready().map_err(StageError::Io)?;
     Ok(root)
 }
 
@@ -772,9 +877,16 @@ fn check_signed_tree(
             std::time::Duration::ZERO,
             std::time::Duration::saturating_add,
         );
-    let budget = std::time::Instant::now() + DEVELOPER_ID_BUDGET.saturating_add(extra);
+    let far_future = || std::time::Instant::now() + std::time::Duration::from_secs(365 * 86_400);
+    let budget = std::time::Instant::now()
+        .checked_add(DEVELOPER_ID_BUDGET.saturating_add(extra))
+        .unwrap_or_else(far_future);
     for path in &found {
-        let deadline = budget.min(std::time::Instant::now() + allowance(path));
+        let deadline = budget.min(
+            std::time::Instant::now()
+                .checked_add(allowance(path))
+                .unwrap_or_else(far_future),
+        );
         let rel = path.strip_prefix(tree).unwrap_or(path).to_string_lossy();
         let mut m = String::from(rel.as_ref());
         match verify(path, deadline) {
@@ -1539,6 +1651,17 @@ fn reverified_root(
 }
 
 fn swap_into_place(build_dir: &Path, incoming: &Path) -> std::io::Result<()> {
+    let first_exec = crate::store::first_exec_removal(build_dir)?;
+    first_exec.check(incoming)?;
+    for other in [
+        crate::store::superseded_dir(build_dir),
+        aterm_toolchain::layout::aside_of(build_dir),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        first_exec.check(&other)?;
+    }
     if crate::store::held_unproven(build_dir) {
         let mut msg = build_dir.display().to_string();
         msg.push_str(
@@ -1577,7 +1700,7 @@ fn swap_into_place(build_dir: &Path, incoming: &Path) -> std::io::Result<()> {
     let superseded = crate::store::superseded_dir(build_dir);
     let retired = match (&superseded, &outgoing) {
         (Some(old), Some(out)) if out.exists() => {
-            let _ = crate::store::remove_tree(old);
+            let _ = crate::store::remove_tree_under_gate(old, &first_exec);
             if let Err(e) = std::fs::rename(out, old) {
                 if was_complete {
                     let _ = crate::store::mark_build_ready(build_dir);
@@ -1590,7 +1713,7 @@ fn swap_into_place(build_dir: &Path, incoming: &Path) -> std::io::Result<()> {
     };
     let restore = |e: std::io::Error| {
         if retired && let (Some(old), Some(out)) = (&superseded, &outgoing) {
-            restore_outgoing(old, out, build_dir, was_complete);
+            restore_outgoing(old, out, build_dir, was_complete, &first_exec);
         }
         Err(e)
     };
@@ -1601,7 +1724,9 @@ fn swap_into_place(build_dir: &Path, incoming: &Path) -> std::io::Result<()> {
         }
     } else if !linked {
         // A tree at `<build>.noindex` that no `<build>` link names belongs to nothing.
-        if std::fs::symlink_metadata(&dest).is_ok() && crate::store::remove_tree(&dest).is_err() {
+        if std::fs::symlink_metadata(&dest).is_ok()
+            && crate::store::remove_tree_under_gate(&dest, &first_exec).is_err()
+        {
             return restore(std::io::Error::other(format!(
                 "{} is in the way and could not be removed",
                 dest.display()
@@ -1619,7 +1744,7 @@ fn swap_into_place(build_dir: &Path, incoming: &Path) -> std::io::Result<()> {
         return restore(e);
     }
     if retired && let Some(ref old) = superseded {
-        let _ = crate::store::remove_tree(old);
+        let _ = crate::store::remove_tree_under_gate(old, &first_exec);
     }
     // The `.unproven` hold was on the tree this swap replaced, so it is spent.
     if let Some(mark) = crate::store::sidecar_path(build_dir, crate::store::UNPROVEN_SUFFIX) {
@@ -1630,7 +1755,19 @@ fn swap_into_place(build_dir: &Path, incoming: &Path) -> std::io::Result<()> {
 
 /// Put the outgoing tree parked at `old` back at `out` (the build's name, or its aside, whose
 /// `<build>` link is laid again when a failed swap took it down).
-fn restore_outgoing(old: &Path, out: &Path, build_dir: &Path, was_complete: bool) -> bool {
+fn restore_outgoing(
+    old: &Path,
+    out: &Path,
+    build_dir: &Path,
+    was_complete: bool,
+    first_exec: &crate::store::FirstExecRemoval,
+) -> bool {
+    if [old, out, build_dir]
+        .into_iter()
+        .any(|target| first_exec.check(target).is_err())
+    {
+        return false;
+    }
     if std::fs::rename(old, out).is_err() {
         return false;
     }
@@ -2077,6 +2214,37 @@ mod tests {
     }
 
     #[test]
+    fn a_swap_preserves_every_held_incoming_or_superseded_target() {
+        let b = bundle("swap-held-targets");
+        let (build, witness) = b.installed();
+        for target in [
+            crate::store::incoming_dir(&build).unwrap(),
+            crate::store::superseded_dir(&build).unwrap(),
+        ] {
+            let exe = target.join("bin/inert");
+            std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+            std::fs::write(&exe, b"inert owned text, never executed").unwrap();
+            let hold = crate::store::hold_first_exec(&exe).unwrap();
+            let incoming = crate::store::incoming_dir(&build).unwrap();
+            std::fs::create_dir_all(&incoming).unwrap();
+            assert!(swap_into_place(&build, &incoming).is_err());
+            assert!(exe.is_file() && witness.is_file());
+            assert!(
+                crate::store::build_is_complete(&build),
+                "refusal precedes marker removal"
+            );
+            hold.ran();
+            crate::store::remove_tree(&target).unwrap();
+        }
+        let incoming = crate::store::incoming_dir(&build).unwrap();
+        swap_into_place(&build, &incoming).unwrap();
+        assert!(
+            build.is_dir() && !witness.exists(),
+            "unheld swap never reacquires its own gate"
+        );
+    }
+
+    #[test]
     fn a_failed_final_rename_rolls_the_old_build_back_and_re_marks_it() {
         let b = bundle("rollback-complete");
         let (build, witness) = b.installed();
@@ -2410,7 +2578,13 @@ mod tests {
         );
 
         assert!(
-            !restore_outgoing(&vanished, &build, &build, true),
+            !restore_outgoing(
+                &vanished,
+                &build,
+                &build,
+                true,
+                &crate::store::first_exec_removal(&build).unwrap()
+            ),
             "a failed restore must report itself as failed"
         );
         assert!(
@@ -3285,6 +3459,13 @@ image-alias     : /tmp/stage/bar.dmg
         ];
         let d = tmp("dmg-owner");
         let root = d.join("stage");
+        std::fs::create_dir_all(&root).unwrap();
+        // A scratch under /tmp can inherit wheel even when this user is not a member. Choose
+        // an allowed group on this owned stage before populating it, so the deliberate group
+        // changes below can be restored without root privileges.
+        // SAFETY: getegid reads this process's effective group and cannot fail.
+        let group = unsafe { libc::getegid() };
+        std::os::unix::fs::lchown(&root, None, Some(group)).unwrap();
         lay(&root, "Foo.app/Contents/MacOS/foo", b"#!/bin/sh\n", 0o755);
         lay(&root, "Foo.app/Contents/Resources/r", b"r", 0o644);
         lay_link(&root, "Foo.app/Contents/current", "MacOS/foo");

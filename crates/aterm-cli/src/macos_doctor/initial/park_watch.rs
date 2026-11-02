@@ -272,14 +272,23 @@ fn watch_network(
     lost: Arc<AtomicBool>,
     changed: fn(),
 ) -> io::Result<Arc<OwnedFd>> {
-    // SAFETY: socket(2) with constant arguments; a non-negative result is a new descriptor this
-    // function owns.
-    let raw = unsafe { libc::socket(libc::PF_ROUTE, libc::SOCK_RAW, libc::AF_UNSPEC) };
-    if raw < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: `raw` is the open descriptor socket(2) just returned, owned by nothing else.
-    let route = Arc::new(unsafe { OwnedFd::from_raw_fd(raw) });
+    // Kept out of children from its creation (`aterm_uds::kept_out`); close-on-exec is set
+    // before the mark, as `F_SETFD` replaces every descriptor flag.
+    let route = Arc::new(aterm_uds::kept_out(|| {
+        // SAFETY: socket(2) with constant arguments; a non-negative result is a new descriptor
+        // this function owns.
+        let raw = unsafe { libc::socket(libc::PF_ROUTE, libc::SOCK_RAW, libc::AF_UNSPEC) };
+        if raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `raw` is the open descriptor socket(2) just returned, owned by nothing else.
+        let route = unsafe { OwnedFd::from_raw_fd(raw) };
+        // SAFETY: F_SETFD changes only this descriptor's close-on-exec flag.
+        if unsafe { libc::fcntl(route.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(route)
+    })?);
     let thread_route = Arc::clone(&route);
     std::thread::Builder::new()
         .name("aterm-setup-park-network".into())
@@ -500,6 +509,15 @@ mod tests {
             network_told,
         )
         .unwrap();
+        let route_fd = watch.network.as_ref().unwrap().as_raw_fd();
+        // SAFETY: F_GETFD reads the descriptor's flags without mutating state.
+        let flags = unsafe { libc::fcntl(route_fd, libc::F_GETFD) };
+        assert!(flags >= 0, "F_GETFD failed");
+        assert_ne!(
+            flags & libc::FD_CLOEXEC,
+            0,
+            "route socket must be close-on-exec"
+        );
         let socket = Arc::downgrade(watch.network.as_ref().unwrap());
         let lost = Arc::clone(&watch.lost);
         drop(watch);

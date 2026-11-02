@@ -83,7 +83,6 @@ impl From<u64> for WindowId {
 #[derive(Debug, Clone)]
 pub struct WindowAttributes {
     pub(crate) inner_size: Option<Size>,
-    #[cfg(not(windows_platform))]
     pub(crate) min_inner_size: Option<Size>,
     #[cfg(macos_platform)]
     pub(crate) position: Option<Position>,
@@ -100,7 +99,6 @@ impl Default for WindowAttributes {
     fn default() -> WindowAttributes {
         WindowAttributes {
             inner_size: None,
-            #[cfg(not(windows_platform))]
             min_inner_size: None,
             #[cfg(macos_platform)]
             position: None,
@@ -122,7 +120,6 @@ impl WindowAttributes {
     }
 
     /// Sets the minimum dimensions a window can have.
-    #[cfg(not(windows_platform))]
     #[inline]
     pub fn with_min_inner_size<S: Into<Size>>(mut self, min_size: S) -> Self {
         self.min_inner_size = Some(min_size.into());
@@ -189,6 +186,26 @@ impl Window {
         let _span = tracing::debug_span!("aterm_window::Window::request_redraw",).entered();
 
         self.window.maybe_queue_on_main(|w| w.request_redraw())
+    }
+
+    /// LOCAL PATCH (aterm): ask for (`want`) or stop this window's vsync ticks,
+    /// [`WindowEvent::FrameTick`](crate::event::WindowEvent::FrameTick), from a clock that follows
+    /// the window's display. Returns whether the window has one: on macOS 14 and later its view's
+    /// `CADisplayLink`, which runs at up to the display's rate in every run-loop mode and is
+    /// paused while unwanted; nowhere else, where the caller keeps its own clock.
+    #[inline]
+    pub fn set_frame_clock(&self, want: bool) -> bool {
+        let _span = tracing::debug_span!("aterm_window::Window::set_frame_clock",).entered();
+
+        #[cfg(macos_platform)]
+        {
+            self.window.maybe_wait_on_main(move |w| w.set_frame_clock(want))
+        }
+        #[cfg(not(macos_platform))]
+        {
+            let _ = want;
+            false
+        }
     }
 }
 
@@ -284,7 +301,6 @@ impl Window {
     /// window.set_min_inner_size(Some(PhysicalSize::new(400, 200)));
     /// # }
     /// ```
-    #[cfg(not(windows_platform))]
     #[inline]
     pub fn set_min_inner_size<S: Into<Size>>(&self, min_size: Option<S>) {
         let min_size = min_size.map(|s| s.into());

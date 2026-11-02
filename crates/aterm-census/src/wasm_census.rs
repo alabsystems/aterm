@@ -142,7 +142,7 @@ fn unloaded_files(root: &Path, scan_dirs: &[String]) -> (BTreeSet<PathBuf>, Vec<
     let mut out = BTreeSet::new();
     let mut notes = Vec::new();
     let (mut crates, mut test_cuts, mut named) = (0usize, 0usize, Vec::new());
-    let rel = |p: &Path| p.strip_prefix(root).unwrap_or(p).display().to_string();
+    let rel = |p: &Path| crate::rel_path(root, p);
     for dir in scan_dirs {
         let src = root.join(dir);
         let mut paths = Vec::new();
@@ -172,8 +172,8 @@ fn unloaded_files(root: &Path, scan_dirs: &[String]) -> (BTreeSet<PathBuf>, Vec<
         if let Some(why) = unloaded.unplaced {
             notes.push(format!(
                 "module tree of {dir} not placed ({}): every file in it is swept",
-                why.strip_prefix(&format!("{}/", root.display()))
-                    .unwrap_or(&why)
+                // `why` begins with its file's path: the rest is text after it.
+                crate::rel_path(root, Path::new(&why))
             ));
         }
         if unloaded.files.is_empty() {
@@ -227,11 +227,7 @@ fn spawn_sites(root: &Path, scan_dirs: &[String], unloaded: &BTreeSet<PathBuf>) 
         let Ok(text) = crate::tree::read_to_string(&file) else {
             continue;
         };
-        let rel = file
-            .strip_prefix(root)
-            .unwrap_or(&file)
-            .to_string_lossy()
-            .into_owned();
+        let rel = crate::rel_path(root, &file);
         let masked = mask_unshipped(&text);
         for (i, raw) in masked.lines().enumerate() {
             let line = mask_literals(strip_line_comment(raw));
@@ -390,11 +386,7 @@ pub fn run_wasm_census(root: &Path) -> CensusOutcome {
             let Ok(text) = crate::tree::read_to_string(&file) else {
                 continue;
             };
-            let rel = file
-                .strip_prefix(root)
-                .unwrap_or(&file)
-                .to_string_lossy()
-                .into_owned();
+            let rel = crate::rel_path(root, &file);
             let masked = mask_unshipped(&text);
             parse_source_fns(&masked, &rel, &mut fns);
         }
@@ -566,7 +558,7 @@ pub fn run_wasm_census(root: &Path) -> CensusOutcome {
         log,
         "    scope: lexical name-based walk of the wasm root crates' shipped src + the \
          `term`-field engine hop; markers swept over the derived {}-crate wasm-process \
-         closure (precision limits: docs/temporal-safety-gate.md).",
+         closure; a lexical walk, not a proof.",
         scan.scan_dirs.len()
     );
     let summary = format!(

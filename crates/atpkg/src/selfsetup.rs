@@ -58,8 +58,8 @@ pub struct Places {
     pub xdg_data: PathBuf,
     /// `$XDG_CONFIG_HOME`, else `~/.config`.
     pub xdg_config: PathBuf,
-    /// `$ZDOTDIR`, else `$HOME`: the folder zsh reads its `.zshrc` from.
-    pub zdotdir: PathBuf,
+    /// The folder zsh reads its `.zshrc` from: `$ZDOTDIR`, else `$HOME` ([`crate::zdotdir`]).
+    pub zdotdir: crate::zdotdir::ZshDir,
     /// `ATERM_INSTALL_DIR`: the one app location of a scoped run.
     pub install_dir: Option<PathBuf>,
     /// `ATERM_BIN_DIR`, else `~/.local/bin`.
@@ -78,12 +78,18 @@ impl Places {
             home: home.to_path_buf(),
             xdg_data: xdg_data.map_or_else(|| home.join(".local/share"), Path::to_path_buf),
             xdg_config: xdg_config.map_or_else(|| home.join(".config"), Path::to_path_buf),
-            zdotdir: home.to_path_buf(),
+            zdotdir: crate::zdotdir::ZshDir::Home,
             install_dir: None,
             bin_dir: home.join(".local/bin"),
             store_dir: home.join(".local/lib/aterm/bin"),
             man_root: home.join(".local/share/man"),
         }
+    }
+
+    /// zsh's `.zshrc`, in [`Places::zdotdir`]; `None` while that folder is unknown.
+    #[must_use]
+    pub fn zshrc(&self) -> Option<PathBuf> {
+        self.zdotdir.dir(&self.home).map(|dir| dir.join(".zshrc"))
     }
 
     fn bin_dirs(&self) -> Vec<PathBuf> {
@@ -259,7 +265,10 @@ fn dir_within(a: &Path, b: &Path) -> bool {
 fn first_line_bounded(exe: &Path, args: &[impl AsRef<OsStr>], within: Duration) -> String {
     let mut cmd = aterm_uds::spawnfd::command(exe);
     cmd.args(args);
-    aterm_uds::deadline::output_until(&mut cmd, Instant::now() + within)
+    let deadline = Instant::now()
+        .checked_add(within)
+        .unwrap_or_else(|| Instant::now() + Duration::from_secs(365 * 86_400));
+    aterm_uds::deadline::output_until(&mut cmd, deadline)
         .map(|out| {
             String::from_utf8_lossy(&out.stdout)
                 .lines()
@@ -319,10 +328,13 @@ fn first_exec_unproven(program: &Path, run_as: RunAs, hang: Duration) -> Option<
         RunAs::Nobody => return Some(format!("{UNASKED}: {NOT_AS_ROOT}")),
     };
     cmd.arg("--version");
+    let deadline = Instant::now()
+        .checked_add(hang)
+        .unwrap_or_else(|| Instant::now() + Duration::from_secs(365 * 86_400));
     ran_unproven(
         program,
         run_as,
-        aterm_uds::deadline::output_until(&mut cmd, Instant::now() + hang),
+        aterm_uds::deadline::output_until(&mut cmd, deadline),
         hang,
     )
 }
@@ -367,7 +379,7 @@ fn shell_end_unproven(out: &std::process::Output, program: &Path) -> Option<Stri
     let (printed, ended) = match stdout
         .strip_suffix('\n')
         .and_then(|s| s.rsplit_once("ended "))
-        .and_then(|(printed, code)| Some((printed, code.parse::<i32>().ok()?)))
+        .and_then(|(p, c)| Some((p, c.replace('+', "?").parse::<i32>().ok()?)))
     {
         Some((printed, code)) => (printed, Some(code)),
         None => (&*stdout, None),
@@ -726,9 +738,18 @@ fn open_checked(
 /// rewrite.
 fn read_checked(path: &Path) -> std::io::Result<String> {
     use std::io::Read as _;
-    let mut text = String::new();
-    open_checked(path, std::fs::OpenOptions::new().read(true), false)?.read_to_string(&mut text)?;
-    Ok(text)
+    const CAP: usize = 1024 * 1024;
+    let mut buf = Vec::new();
+    open_checked(path, std::fs::OpenOptions::new().read(true), false)?
+        .take(CAP as u64 + 1)
+        .read_to_end(&mut buf)?;
+    if buf.len() > CAP {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "file exceeds read cap",
+        ));
+    }
+    String::from_utf8(buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
 struct Sweep<'w> {
@@ -875,12 +896,14 @@ fn uninstall_bundle(p: &Places) -> Option<PathBuf> {
 
 const CAFFEINE_CODE: &str = "acaffiene-code.noindex";
 
-const CAFFEINE_FILES: [&str; 5] = [
+/// aCaffiene's files under the support folder.
+const CAFFEINE_FILES: [&str; 6] = [
     CAFFEINE_CODE,
     "acaffiene",
     "acaffiene.state",
     "acaffiene.lock",
     "acaffiene.bridge",
+    "acaffiene.trouble",
 ];
 
 const SWEPT_DECLINE_TAG: &str = "# Recorded by aterm pkg self-uninstall for an aterm it kept.";
@@ -1321,10 +1344,11 @@ fn sweep_acaffiene_with(
 
 /// The files in `support` whose temporaries a window's launch sweeps
 /// (`aterm_acaffiene::state::sweep_temps`): aCaffiene's mode and its update bridge's pid file,
-/// under its name and the old one, each with what a temporary of it is.
-const WRITTEN_THROUGH_TEMPS: [(&str, &str); 4] = [
+/// under its name and the old one, and its trouble record, each with what a temporary of it is.
+const WRITTEN_THROUGH_TEMPS: [(&str, &str); 5] = [
     ("acaffiene.state", "aCaffiene save cut short"),
     ("acaffiene.bridge", "aCaffiene save cut short"),
+    ("acaffiene.trouble", "aCaffiene save cut short"),
     ("caffeine.state", "old Caffeine save cut short"),
     ("caffeine.bridge", "old Caffeine save cut short"),
 ];
@@ -1949,9 +1973,8 @@ fn self_uninstall_with_acaffiene(
     let desktop_is_link =
         std::fs::symlink_metadata(&desktop).is_ok_and(|m| m.file_type().is_symlink());
     if desktop.is_file() || desktop_is_link {
-        let owned = std::fs::symlink_metadata(&desktop).is_ok_and(|m| m.is_file())
-            && std::fs::read_to_string(&desktop)
-                .is_ok_and(|text| text.lines().any(|l| l == DESKTOP_MARKER));
+        let owned = crate::metadata_io::read_bounded_regular_utf8(&desktop, 64 * 1024)
+            .is_ok_and(|text| text.lines().any(|l| l == DESKTOP_MARKER));
         if owned {
             desktop_owned = true;
             s.rm(&desktop, "desktop entry");
@@ -2167,7 +2190,7 @@ fn sweep_store(s: &mut Sweep<'_>, p: &Places, acaffiene_kept: &[PathBuf]) {
 fn sweep_path_blocks(s: &mut Sweep<'_>, p: &Places) {
     let mut rcs: Vec<PathBuf> = Vec::new();
     for rc in [
-        p.zdotdir.join(".zshrc"),
+        p.zshrc().unwrap_or_else(|| p.home.join(".zshrc")),
         p.home.join(".zshrc"),
         p.home.join(".bashrc"),
         p.home.join(".bash_profile"),
@@ -2242,10 +2265,10 @@ fn without_block(text: &str) -> Option<String> {
 }
 
 /// The profile the managed PATH block lands in for `env`'s shell, zsh's in [`Places::zdotdir`]
-/// ([`crate::hooks::login_rc`] asks it with `zdotdir` at `home`).
+/// (none while that is unknown); [`crate::hooks::login_rc`] asks it too.
 pub(crate) fn rc_target(p: &Places, env: &ShellEnv) -> Option<PathBuf> {
     match env.shell_name() {
-        "zsh" => Some(p.zdotdir.join(".zshrc")),
+        "zsh" => p.zshrc(),
         "bash" if cfg!(target_os = "macos") => Some(
             [".bash_profile", ".bash_login", ".profile"]
                 .iter()
@@ -2330,12 +2353,15 @@ pub fn shell_setup(
 
 fn plan_path(p: &Places, env: &ShellEnv, coming: bool, out: &mut dyn Write) {
     let line = match rc_target(p, env) {
+        None if let Some(why) = zsh_folder_unknown(p, env) => {
+            format!("PATH: no edit — {why}")
+        }
         None => format!(
             "PATH: unrecognised shell ({}) — no profile is edited; a source hint prints \
              instead",
             env.shell.as_deref().unwrap_or("<unset>")
         ),
-        Some(rc) if std::fs::read_to_string(&rc).is_ok_and(|t| t.contains(&path_block(p, env))) => {
+        Some(rc) if read_checked(&rc).is_ok_and(|t| t.contains(&path_block(p, env))) => {
             format!(
                 "PATH: already wired — {} carries the managed block; no edit",
                 rc.display()
@@ -2348,7 +2374,7 @@ fn plan_path(p: &Places, env: &ShellEnv, coming: bool, out: &mut dyn Write) {
             )
         }
         Some(rc) => {
-            let verb = if std::fs::read_to_string(&rc).is_ok_and(|t| t.contains(PATH_BLOCK_START)) {
+            let verb = if read_checked(&rc).is_ok_and(|t| t.contains(PATH_BLOCK_START)) {
                 "updates the"
             } else {
                 "appends ONE"
@@ -2366,6 +2392,17 @@ fn plan_path(p: &Places, env: &ShellEnv, coming: bool, out: &mut dyn Write) {
         }
     };
     let _ = writeln!(out, "atpkg: {line}");
+}
+
+/// Why a zsh account's `.zshrc` is not elected: which folder zsh reads it from is unknown
+/// ([`crate::zdotdir::ZshDir::Unknown`]); `None` for any other shell or a known folder.
+fn zsh_folder_unknown(p: &Places, env: &ShellEnv) -> Option<String> {
+    match &p.zdotdir {
+        crate::zdotdir::ZshDir::Unknown(why) if env.shell_name() == "zsh" => Some(format!(
+            "which folder zsh reads .zshrc from is unknown ({why})"
+        )),
+        _ => None,
+    }
 }
 
 /// Whether `env`'s PATH already names the bin dir (the managed block's one line besides the
@@ -2439,6 +2476,14 @@ fn wire_path(
 ) -> bool {
     let shell = env.shell_name();
     let Some(rc) = rc_target(p, env) else {
+        if let Some(why) = zsh_folder_unknown(p, env) {
+            let _ = writeln!(
+                err,
+                "atpkg: PATH: no edit — {why}; put {} on PATH from it yourself",
+                p.bin_dir.display()
+            );
+            return false;
+        }
         if hook_of(p, "bash").is_file() {
             let _ = writeln!(
                 err,
@@ -2459,7 +2504,7 @@ fn wire_path(
         );
         return false;
     }
-    let text = match std::fs::read_to_string(&rc) {
+    let text = match read_checked(&rc) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => {
@@ -2582,10 +2627,18 @@ fn made_dir(dir: &Path) -> std::io::Result<()> {
 }
 
 fn write_644(dir: &Path, name: &OsStr, bytes: &[u8]) -> std::io::Result<()> {
+    made_dir(dir)?;
     let dest = dir.join(name);
-    made_dir(dir)
-        .and_then(|()| std::fs::write(&dest, bytes))
-        .and_then(|()| std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o644)))
+    let (tmp, mut file) = crate::platform::create_temp_beside(&dest, 0o644)?;
+    let written = file
+        .write_all(bytes)
+        .and_then(|()| file.set_permissions(std::fs::Permissions::from_mode(0o644)));
+    drop(file);
+    written
+        .and_then(|()| std::fs::rename(&tmp, &dest))
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })
 }
 
 fn install_man_pages(
@@ -2689,8 +2742,8 @@ fn install_completions(
         .strip_prefix(&p.home)
         .map(|rest| format!("~/{}", rest.display()))
         .unwrap_or_default();
-    let zshrc = p.zdotdir.join(".zshrc");
-    let zsh_loader = std::fs::read_to_string(&zshrc).is_ok_and(|rc| {
+    let zshrc = p.zshrc().unwrap_or_else(|| p.home.join(".zshrc"));
+    let zsh_loader = read_checked(&zshrc).is_ok_and(|rc| {
         rc.contains(&zsh_dir.display().to_string()) || (!tilde.is_empty() && rc.contains(&tilde))
     });
     let fish_loader = env.on_path("fish").is_some();
@@ -2851,8 +2904,7 @@ fn install_desktop_entry(
         return;
     }
     if entry.is_file()
-        && !std::fs::read_to_string(&entry)
-            .is_ok_and(|text| text.lines().any(|l| l == DESKTOP_MARKER))
+        && !read_checked(&entry).is_ok_and(|text| text.lines().any(|l| l == DESKTOP_MARKER))
     {
         let _ = writeln!(
             out,
@@ -2912,22 +2964,33 @@ fn install_desktop_entry(
     }
 }
 
+/// [`Places`] of this process: its environment's ([`places_from`]), with zsh's folder as
+/// [`crate::zdotdir::of_process`] learns it, so a `ZDOTDIR` this shell did not export is
+/// zsh's own answer, not `$HOME`.
 fn process_places() -> Option<Places> {
     let home = aterm_types::dirs::home_dir()?;
-    Some(places_from(&home, |name| std::env::var_os(name)))
+    let account = crate::platform::account_home();
+    let mut places = places_from(&home, account.as_deref(), |name| std::env::var_os(name));
+    places.zdotdir = crate::zdotdir::of_process(&home);
+    Some(places)
 }
 
 /// [`Places`] under `home` as the environment `var` reads them: an empty variable is unset,
-/// and `ZDOTDIR` counts only as an absolute path (a relative one names no fixed folder).
-fn places_from(home: &Path, var: impl Fn(&str) -> Option<OsString>) -> Places {
+/// and `ZDOTDIR` counts only as an absolute path at or under `home` (or anywhere when `home`
+/// is `account`, the account's own home: [`crate::zdotdir::from_env`]).
+fn places_from(
+    home: &Path,
+    account: Option<&Path>,
+    var: impl Fn(&str) -> Option<OsString>,
+) -> Places {
     let env_dir = |name: &str| var(name).filter(|v| !v.is_empty()).map(PathBuf::from);
     let mut places = Places::defaults(
         home,
         env_dir("XDG_DATA_HOME").as_deref(),
         env_dir("XDG_CONFIG_HOME").as_deref(),
     );
-    if let Some(zdotdir) = env_dir("ZDOTDIR").filter(|dir| dir.is_absolute()) {
-        places.zdotdir = zdotdir;
+    if let Some(zdotdir) = crate::zdotdir::from_env(home, account, var("ZDOTDIR")) {
+        places.zdotdir = crate::zdotdir::ZshDir::At(zdotdir);
     }
     places
 }

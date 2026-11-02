@@ -101,6 +101,63 @@ impl Api {
         }
     }
 
+    /// The public executables database for `which-formula`: one
+    /// `formula:exe exe …` line per formula from
+    /// `internal/executables.txt`. Brew refreshes its copy on the
+    /// API auto-update cadence (450s by default); a stale cached
+    /// copy serves when the refresh fails.
+    pub fn executables(&self) -> Result<Vec<(String, Vec<String>)>, String> {
+        if self.writable {
+            self.prefix.ensure_api_cache()?;
+        }
+        let path = self.cache_path("executables.txt");
+        let read = |p: &std::path::Path| {
+            crate::metadata_io::read_bounded_regular(p, API_BYTES)
+                .ok()
+                .filter(|b| !b.is_empty())
+        };
+        let bytes = if Self::fresh(&path, Duration::from_secs(450)) {
+            read(&path)
+        } else {
+            None
+        };
+        let bytes = match bytes {
+            Some(b) => b,
+            None => match get_document("internal/executables.txt") {
+                Ok(b) => {
+                    if self.writable {
+                        let _ = write_metadata(&path, &b);
+                    }
+                    b
+                }
+                Err(_) => match read(&path) {
+                    Some(b) => b,
+                    None => {
+                        return Err(
+                            "abrew: the executables database is unavailable; run `abrew update` and try again"
+                                .to_string(),
+                        );
+                    }
+                },
+            },
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        Ok(text
+            .lines()
+            .filter_map(|line| {
+                let (name, exes) = line.split_once(':')?;
+                let name = name.split('(').next().unwrap_or(name);
+                if name.is_empty() || exes.trim().is_empty() {
+                    return None;
+                }
+                Some((
+                    name.to_string(),
+                    exes.split_whitespace().map(str::to_string).collect(),
+                ))
+            })
+            .collect())
+    }
+
     /// Drop cached per-package documents but keep `keep` (the freshly fetched indexes).
     pub fn refresh_except(&self, keep: &[&str]) {
         if self.prefix.ensure_api_cache().is_err() {
@@ -133,6 +190,9 @@ impl Api {
 
     fn formula_doc(&self, name: &str) -> Result<Value, String> {
         let short = Formula::short_name(name);
+        if !super::valid_component(short) {
+            return Err(format!("abrew: no such formula: {short}"));
+        }
         self.doc_checked(
             &format!("formula/{short}.json"),
             &format!("formula-{short}.json"),
@@ -143,14 +203,18 @@ impl Api {
     }
 
     fn cask_doc(&self, token: &str) -> Result<Value, String> {
-        let short = canonical_cask_token(Formula::short_name(token));
+        let raw_short = Formula::short_name(token);
+        let short = canonical_cask_token(raw_short);
+        if !super::valid_component(short) {
+            return Err(format!("abrew: no such cask: {raw_short}"));
+        }
         self.doc_checked(
             &format!("cask/{short}.json"),
             &format!("cask-{short}.json"),
             3600,
             true,
         )
-        .map_err(|e| not_found_error(e, "cask", Formula::short_name(token)))
+        .map_err(|e| not_found_error(e, "cask", raw_short))
     }
 
     pub fn formula(&self, name: &str) -> Result<Formula, String> {
@@ -193,6 +257,35 @@ impl Api {
             crate::metadata_io::read_bounded_regular(&self.cache_path(file), API_BYTES).ok()?;
         let v = parse_json(&bytes).ok()?;
         Some(index_rows(&v, casks))
+    }
+
+    /// The formula a renamed-from name now belongs to, resolved
+    /// through the index's `oldnames` (the per-formula endpoint
+    /// 404s for old names).
+    pub fn formula_by_oldname(&self, name: &str) -> Option<Formula> {
+        let short = Formula::short_name(name);
+        let rows = match self.cached_index_rows(false) {
+            Some(rows) => rows,
+            None => self.index_rows_fresh(false).ok()?,
+        };
+        let row = rows
+            .iter()
+            .find(|r| r.oldnames.iter().any(|o| o == short))?;
+        self.formula(&row.name).ok()
+    }
+
+    /// The cask a renamed-from token now belongs to, resolved
+    /// through the index's `old_tokens`.
+    pub fn cask_by_oldtoken(&self, token: &str) -> Option<super::formula::Cask> {
+        let short = canonical_cask_token(Formula::short_name(token));
+        let rows = match self.cached_index_rows(true) {
+            Some(rows) => rows,
+            None => self.index_rows_fresh(true).ok()?,
+        };
+        let row = rows
+            .iter()
+            .find(|r| r.oldnames.iter().any(|o| o == short))?;
+        self.cask(&row.name).ok()
     }
 
     /// Index rows fetched now, ignoring cache freshness: the "after" side of an update diff.
@@ -584,6 +677,9 @@ pub struct IndexRow {
     pub version: String,
     /// Casks only; formulae carry `false`.
     pub auto_updates: bool,
+    /// Renamed-from names: formulae `oldnames`, casks `old_tokens`
+    /// (`migrate` resolution).
+    pub oldnames: Vec<String>,
 }
 
 fn index_rows(v: &Value, casks: bool) -> Vec<IndexRow> {
@@ -626,6 +722,15 @@ fn index_rows(v: &Value, casks: bool) -> Vec<IndexRow> {
                         .get("auto_updates")
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
+                oldnames: item
+                    .get(if casks { "old_tokens" } else { "oldnames" })
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|o| o.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             });
         }
     }
@@ -881,6 +986,9 @@ pub fn ghcr_token(repo: &str) -> Result<String, String> {
         || repo
             .chars()
             .any(|c| !(c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-')))
+        || repo
+            .split('/')
+            .any(|s| s.is_empty() || s == "." || s == "..")
     {
         return Err(format!("abrew: invalid GHCR repository: {repo}"));
     }
@@ -1036,6 +1144,18 @@ mod tests {
             Some("homebrew/core/wget")
         );
         assert_eq!(ghcr_repo_of("https://example.com/x.tar.gz"), None);
+        assert!(ghcr_token("homebrew/../evil").is_err());
+        assert!(ghcr_token("homebrew//wget").is_err());
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let api = Api::new(Prefix::at(tmp.path()));
+        assert_eq!(
+            api.formula("bad?query").unwrap_err(),
+            "abrew: no such formula: bad?query"
+        );
+        assert_eq!(
+            api.cask("bad?query").unwrap_err(),
+            "abrew: no such cask: bad?query"
+        );
     }
 
     #[test]

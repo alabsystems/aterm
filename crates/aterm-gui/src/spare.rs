@@ -129,13 +129,15 @@ impl Witness {
         }
     }
 
-    /// Hold `fifo` until the shell starts its first prompt or the session ends.
+    /// Hold `fifo`, the FIFO and the hold's two ends, until the shell starts its first prompt or
+    /// the session ends. Dropping it closes the host's end: a shell still at a hold reads what was
+    /// written, then end-of-file, and exits.
     pub(crate) fn hold_fifo(&self, fifo: SpareFifo) {
         *self.fifo.lock().unwrap_or_else(|p| p.into_inner()) = Some(fifo);
         self.fifo_held.store(true, Ordering::Release);
     }
 
-    /// Write a protocol line to the held FIFO.
+    /// Write a protocol line to the held host end.
     pub(crate) fn tell(&self, line: &str) -> bool {
         self.fifo
             .lock()
@@ -220,15 +222,21 @@ pub(crate) fn shell_image(pid: i32) -> Option<PathBuf> {
     }
 }
 
-/// Hold FIFO (`<control dir>/spare/<pid>-<birth>-<sid>`) and its `<sid>` symlink.
+/// A spare's hold: its FIFO (`<control dir>/spare/<pid>-<birth>-<sid>`) and `<sid>` symlink, the
+/// mark a hold finds, and the hold's two ends ([`aterm_core::shell_integration::spare_fifo::hold_ends`]).
+/// The spawn hands the shell its end at `HOLD_FD`; `tell` writes the host's. This keeps a copy of
+/// the shell's end for its life as well: a reader here never delays the shell's end-of-file, which
+/// waits only on writers, and a write after the shell died never meets `EPIPE` on a pipe.
 pub(crate) struct SpareFifo {
     path: PathBuf,
     link: Option<PathBuf>,
-    file: std::fs::File,
+    host: std::fs::File,
+    #[cfg(unix)]
+    shell: std::fs::File,
 }
 
 impl SpareFifo {
-    /// Create and open session `sid`'s FIFO and symlink.
+    /// Create session `sid`'s FIFO and symlink, and open the hold's ends.
     #[cfg(unix)]
     pub(crate) fn make(sid: &aterm_session::SessionId) -> std::io::Result<Self> {
         let dir = crate::control_auth::private_subdir(aterm_core::shell_integration::SPARE_DIR)
@@ -247,27 +255,22 @@ impl SpareFifo {
         Err(std::io::Error::other("no spare off unix"))
     }
 
-    /// Create and open a FIFO at `path` without a symlink.
+    /// Create a FIFO at `path`, without a symlink, and open the hold's ends.
     #[cfg(unix)]
     pub(crate) fn make_at(path: PathBuf) -> std::io::Result<Self> {
         use std::os::unix::ffi::OsStrExt as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
         let c = std::ffi::CString::new(path.as_os_str().as_bytes())
             .map_err(|_| std::io::Error::other("NUL in the FIFO path"))?;
         // SAFETY: `c` is a NUL-terminated path that lives across the call.
         if unsafe { libc::mkfifo(c.as_ptr(), 0o600) } != 0 {
             return Err(std::io::Error::last_os_error());
         }
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
-            .open(&path);
-        match file {
-            Ok(file) => Ok(Self {
+        match aterm_core::shell_integration::spare_fifo::hold_ends(&path) {
+            Ok(ends) => Ok(Self {
                 path,
                 link: None,
-                file,
+                host: ends.host,
+                shell: ends.shell,
             }),
             Err(e) => {
                 let _ = std::fs::remove_file(&path);
@@ -276,12 +279,21 @@ impl SpareFifo {
         }
     }
 
+    /// The shell's end, which the spawn hands the shell at `HOLD_FD`.
+    #[cfg(unix)]
+    pub(crate) fn shell_end(&self) -> std::os::fd::BorrowedFd<'_> {
+        std::os::fd::AsFd::as_fd(&self.shell)
+    }
+
     fn tell(&self, line: &str) -> std::io::Result<()> {
         use std::io::Write as _;
-        (&self.file).write_all(format!("{line}\n").as_bytes())
+        (&self.host).write_all(format!("{line}\n").as_bytes())
     }
 }
 
+/// Unlinks both names; the ends close after. No hold opens the FIFO by a name, so none can be
+/// left waiting in an open once the names are gone: a shell still at a hold reads what was told,
+/// then end-of-file, and exits.
 impl Drop for SpareFifo {
     fn drop(&mut self) {
         if let Some(link) = &self.link {
@@ -738,27 +750,35 @@ fn parse_gate_records(text: &str) -> Option<Vec<GenRecord>> {
         let [hash, streak, until, failures, max_rc, touched, reason] = f.as_slice() else {
             return None;
         };
+        if !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
         let hash = u64::from_str_radix(hash, 16).ok()?;
         if gens.iter().any(|g| g.hash == hash) || reason.chars().any(char::is_control) {
             return None;
+        }
+        fn uint<T: std::str::FromStr>(s: &str) -> Option<T> {
+            s.bytes()
+                .all(|b| b.is_ascii_digit())
+                .then(|| s.parse().ok())
+                .flatten()
         }
         let failures = if failures.is_empty() {
             Vec::new()
         } else {
             failures
                 .split(',')
-                .map(str::parse)
-                .collect::<Result<Vec<u64>, _>>()
-                .ok()?
+                .map(uint)
+                .collect::<Option<Vec<u64>>>()?
         };
         gens.push(GenRecord {
             hash,
-            streak: streak.parse().ok()?,
-            ineligible_until: until.parse().ok()?,
+            streak: uint(streak)?,
+            ineligible_until: uint(until)?,
             failures,
-            max_rc_ms: max_rc.parse().ok()?,
+            max_rc_ms: uint(max_rc)?,
             reason: (*reason).to_owned(),
-            touched: touched.parse().ok()?,
+            touched: uint(touched)?,
         });
     }
     Some(gens)
@@ -789,6 +809,15 @@ impl GateBook {
     }
 
     fn persist(&mut self) {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        self.persist_with(|path| {
+            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+            path.with_extension(format!("tmp.{}.{seq}", std::process::id()))
+        });
+    }
+
+    /// Persist through candidate staging paths supplied by the private namespace above.
+    fn persist_with(&mut self, mut next: impl FnMut(&std::path::Path) -> PathBuf) {
         self.gens.sort_by_key(|g| std::cmp::Reverse(g.touched));
         self.gens.truncate(GATE_KEEP);
         let Some(path) = &self.path else { return };
@@ -809,22 +838,29 @@ impl GateBook {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        let Ok(mut file) = options.open(&tmp) else {
+        for _ in 0..8 {
+            let tmp = next(path);
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+            }
+            let mut file = match options.open(&tmp) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(_) => return,
+            };
+            // Only this successful exclusive creation authorizes cleanup. An occupied path,
+            // including an alias, is never ours to remove to make room for the stage.
+            use std::io::Write as _;
+            let written = file.write_all(text.as_bytes());
+            drop(file);
+            if written.is_err() || std::fs::rename(&tmp, path).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
             return;
-        };
-        use std::io::Write as _;
-        let written = file.write_all(text.as_bytes());
-        drop(file);
-        if written.is_err() || std::fs::rename(&tmp, path).is_err() {
-            let _ = std::fs::remove_file(&tmp);
         }
     }
 
@@ -1530,26 +1566,18 @@ pub(crate) struct ProcRecord {
     pub(crate) uid: u32,
 }
 
+/// `pid`'s record from its `/proc/<pid>/stat` line, read by the one parser every `/proc` reader
+/// shares ([`aterm_uds::process::procfs::stat_line`], which refuses a line naming another pid).
 #[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
 fn parse_proc_stat(stat: &str, pid: i32, uid: u32) -> Option<ProcRecord> {
-    const PF_EXITING: u64 = 0x4;
-    let open = stat.find(" (")?;
-    if stat.get(..open)?.trim().parse::<i32>().ok()? != pid {
-        return None;
-    }
-    let close = stat.rfind(')')?;
-    if close < open {
-        return None;
-    }
-    let fields: Vec<&str> = stat.get(close + 1..)?.split_ascii_whitespace().collect();
-    let state = fields.first()?.chars().next()?;
+    let line = aterm_uds::process::procfs::stat_line(stat, pid)?;
     Some(ProcRecord {
-        ppid: fields.get(1)?.parse().ok()?,
-        session: fields.get(3)?.parse().ok()?,
-        start: fields.get(19)?.parse().ok()?,
-        ended: matches!(state, 'Z' | 'X' | 'x'),
-        exiting: fields.get(6)?.parse::<u64>().ok()? & PF_EXITING != 0,
-        threads: fields.get(17)?.parse().ok()?,
+        ppid: i32::try_from(line.ppid).ok()?,
+        session: i32::try_from(line.session).ok()?,
+        start: line.start,
+        ended: matches!(line.state, b'Z' | b'X' | b'x'),
+        exiting: line.exiting(),
+        threads: u32::try_from(line.threads).ok()?,
         uid,
     })
 }
@@ -1570,22 +1598,9 @@ pub(crate) trait ProcTable {
     fn pause(&mut self, pause: Duration);
 }
 
-#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
-fn listed_proc_pids(
-    entries: impl IntoIterator<Item = std::io::Result<std::ffi::OsString>>,
-) -> Option<Vec<i32>> {
-    let mut pids = Vec::new();
-    for entry in entries {
-        let name = entry.ok()?;
-        if let Some(pid) = name.to_str().and_then(|s| s.parse::<i32>().ok())
-            && pid > 0
-        {
-            pids.push(pid);
-        }
-    }
-    Some(pids)
-}
-
+/// `pid`'s record from its `stat` text and its uid, `None` once it is gone: a `stat` read that
+/// answers `ENOENT` or `ESRCH` (a process reaped between the listing and the read), or a uid
+/// read that answers `ENOENT`. Any other failure is the scan's to judge.
 #[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
 fn read_proc_record(
     pid: i32,
@@ -1594,7 +1609,12 @@ fn read_proc_record(
 ) -> std::io::Result<Option<ProcRecord>> {
     let stat = match stat() {
         Ok(stat) => stat,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                || e.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            return Ok(None);
+        }
         Err(e) => return Err(e),
     };
     let uid = match uid() {
@@ -1612,17 +1632,22 @@ struct Procfs;
 
 #[cfg(target_os = "linux")]
 impl ProcTable for Procfs {
+    /// Every pid `/proc` lists, of every user: the scan walks through another user's process
+    /// (a `sudo` under the shell). A listing cut short is no listing.
     fn list(&mut self) -> Option<Vec<i32>> {
-        let entries = std::fs::read_dir("/proc").ok()?;
-        listed_proc_pids(entries.map(|entry| entry.map(|e| e.file_name())))
+        aterm_uds::holders::listed_pids()
+            .ok()?
+            .into_iter()
+            .map(|pid| i32::try_from(pid).ok())
+            .collect()
     }
 
     fn read(&mut self, pid: i32) -> std::io::Result<Option<ProcRecord>> {
-        use std::os::unix::fs::MetadataExt as _;
+        let gone = || std::io::Error::from(std::io::ErrorKind::NotFound);
         read_proc_record(
             pid,
-            || std::fs::read_to_string(format!("/proc/{pid}/stat")),
-            || std::fs::metadata(format!("/proc/{pid}")).map(|m| m.uid()),
+            || aterm_uds::process::read_proc_text(Path::new(&format!("/proc/{pid}/stat"))),
+            || aterm_uds::holders::euid_of(u32::try_from(pid).map_err(|_| gone())?),
         )
     }
 
@@ -2190,6 +2215,9 @@ fn debug_present() -> bool {
     aterm_types::dev_seam!("ATERM_DEBUG_SPARE_PRESENT").is_some_and(|v| v == "1")
 }
 
+/// The milliseconds the spare seam `name` sets: its variable's digits, or, where it names an
+/// absolute path, the digits that file holds when it is read, so a test can move the seam while
+/// its aterm runs (a warm spare's `T_READY` is read as each one starts warming).
 fn debug_ms(name: &'static str) -> Option<Duration> {
     let raw = match name {
         "T_READY" => aterm_types::dev_seam!("ATERM_DEBUG_SPARE_TREADY_MS"),
@@ -2200,7 +2228,18 @@ fn debug_ms(name: &'static str) -> Option<Duration> {
         "PARKED" => aterm_types::dev_seam!("ATERM_DEBUG_SPARE_PARKED_MS"),
         _ => aterm_types::dev_seam!("ATERM_DEBUG_SPARE_SETTLE_MS"),
     }?;
-    raw.to_str()?.parse().ok().map(Duration::from_millis)
+    let raw = raw.to_str()?;
+    let held;
+    let digits = if Path::new(raw).is_absolute() {
+        held = std::fs::read_to_string(raw).ok()?;
+        held.trim()
+    } else {
+        raw
+    };
+    digits
+        .parse::<u64>()
+        .ok()
+        .map(|ms| Duration::from_millis(ms.min(365 * 24 * 3_600_000)))
 }
 
 fn person_window() -> Duration {
@@ -2751,6 +2790,7 @@ impl Wake {
             #[cfg(target_os = "linux")]
             Wake::WindowOp { session, .. } => Some(*session),
             Wake::ProtectedRead { session, .. } => Some(*session),
+            Wake::GrokSigninLooked { session } => Some(*session),
             Wake::LeaseChanged { .. }
             | Wake::CrashJournalOwed
             | Wake::FabricChanged { .. }
@@ -2794,6 +2834,7 @@ impl Wake {
             | Wake::NativePackagesFinished { .. }
             | Wake::NativeMachineStateFinished { .. }
             | Wake::HarnessStatsCollected { .. }
+            | Wake::LabAccountsCollected { .. }
             | Wake::Vitals
             | Wake::DiskWalk
             | Wake::NativeUpdateReconcileFinished { .. }
@@ -2856,6 +2897,7 @@ impl Wake {
             | Wake::Input { .. }
             | Wake::WorkerLaunch { .. }
             | Wake::HwKeyTarget { .. }
+            | Wake::NativeFocus { .. }
             | Wake::DocumentAdmitted(..)
             | Wake::EditRequest(..)
             | Wake::EditCancel { .. }
@@ -2887,7 +2929,6 @@ impl Wake {
             | Wake::FrontControlSurface { .. }
             | Wake::OpenAuxWindow { .. }
             | Wake::OpenFactMenu { .. }
-            | Wake::OpenProgramAutopilotMenu { .. }
             | Wake::PkgSeed { .. }
             | Wake::AgentUpgrade { .. }
             | Wake::AgentUpgradeWord { .. }
@@ -2917,6 +2958,7 @@ impl Wake {
             | Wake::PkgMachineRefused(..)
             | Wake::AppNotice { .. }
             | Wake::HeldAgentMessages(..)
+            | Wake::Record(..)
             | Wake::Notice { .. }
             | Wake::DevToolsHandOverAsked { .. }
             | Wake::PermissionWalkAsked { .. }
@@ -2982,7 +3024,7 @@ impl Wake {
             #[cfg(target_os = "macos")]
             Wake::SiblingRaised { .. } => None,
             #[cfg(target_os = "macos")]
-            Wake::NoticeVoice => None,
+            Wake::NoticeReady => None,
             #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
             Wake::NoticeClicked { .. } => None,
             #[cfg(target_os = "macos")]
@@ -3009,10 +3051,14 @@ impl Wake {
             Wake::CommitSessionRename { .. } => None,
             #[cfg(target_os = "macos")]
             Wake::CancelSessionRename { .. } => None,
-            Wake::WorkstationSetup(_)
+            Wake::MailChanged
+            | Wake::WorkstationSetup(_)
             | Wake::DeveloperToolsInstall(_, _)
+            | Wake::DeveloperToolsLowData(_)
             | Wake::InitialSetupStatus { .. }
             | Wake::InitialSetupApplyResolved
+            | Wake::InitialSetupPhraseJoined
+            | Wake::KittyBaked
             | Wake::AccountMenuRead(_) => None,
         }
     }
@@ -3136,7 +3182,11 @@ pub(crate) fn power_constrained() -> bool {
             if info.is_null() {
                 return false;
             }
-            let low = aterm_objc::send::send_bool(info, sel!(isLowPowerModeEnabled));
+            // Low Power Mode arrived in macOS 12; thermalState is available on macOS 11.
+            let low_selector = sel!(isLowPowerModeEnabled);
+            let low =
+                aterm_objc::send::send_bool_sel(info, sel!(respondsToSelector:), low_selector)
+                    && aterm_objc::send::send_bool(info, low_selector);
             let thermal = aterm_objc::send::send_isize(info, sel!(thermalState));
             low || thermal >= 2
         }
@@ -3403,9 +3453,14 @@ pub(crate) fn emit_metrics(s: &mut dyn crate::metrics::wire::FieldSink) {
     s.count("spare_ptys", crate::metrics::spare_ptys() as u64);
     s.label("spare_gate", &report.replace(' ', "_"));
     for (key, value) in rest.split_whitespace().filter_map(|t| t.split_once('=')) {
-        match value.parse::<u64>() {
-            Ok(n) => s.count(key, n),
-            Err(_) => s.label(key, value),
+        match value
+            .bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| value.parse::<u64>().ok())
+            .flatten()
+        {
+            Some(n) => s.count(key, n),
+            None => s.label(key, value),
         }
     }
     s.opt_count("spare_rc_ms_p50", rc_p50.map(u64::from), "-");

@@ -131,12 +131,14 @@ fn six_done_claims_ask_six_kinds_of_work_then_the_first_again() {
 
 /// Every angle's act fits [`VERBATIM_UNITS`] with every suffix a claim can carry (its open work,
 /// the repository's, the reversible clause and NEEDS YOU's acknowledgement) and a 400-unit rules
-/// suffix: the angle and the tail whole, the reversible clause and the acknowledgement whole.
+/// suffix: the angle and the tail whole, the reversible clause, the acknowledgement and the
+/// repository's ask whole, the tail's go-ahead word given up for the ask where both do not fit.
 #[test]
 fn every_angles_act_fits_the_verbatim_bound_with_every_suffix() {
     let rules = rules_of(400);
     let claim = "All done.\nStill open: the lexer.\nRemaining work: the e2e suite.\nNEEDS YOU: \
                  approve the force-push to main";
+    let mut kept = [false; 2];
     for n in 0..DONE_ANGLES.len() {
         let mut st = TurnEndState::default();
         act(&mut st, &idle("Stage 1 landed.", Some(3 * MIN)), t0());
@@ -152,11 +154,24 @@ fn every_angles_act_fits_the_verbatim_bound_with_every_suffix() {
         assert_eq!(*rule_id, RULE_DONE_CHECK);
         let units = text.encode_utf16().count();
         assert!(units <= VERBATIM_UNITS, "{n}: {units} units: {text}");
-        assert!(text.starts_with(&done_check_words(n)), "{n}: {text}");
-        for whole in [DONE_CHECK_REVERSIBLE, NEEDS_ACK] {
+        // The repository's ask rides at every angle; the go-ahead's word gives it the room where
+        // the two do not fit beside the clauses ([`fitted_check`]).
+        let whole = text.starts_with(&done_check_words(n));
+        let cut = super::super::go_ahead::unless_held(&done_check_words(n), true).into_owned();
+        assert!(whole || text.starts_with(&cut), "{n}: {text}");
+        kept[usize::from(whole)] = true;
+        for whole in [
+            DONE_CHECK_REVERSIBLE,
+            NEEDS_ACK,
+            "land what of it you made first",
+        ] {
             assert!(text.contains(whole), "{n}: {whole:?} in {text}");
         }
     }
+    assert_eq!(
+        kept, [true; 2],
+        "an angle keeps the word and one gives it up"
+    );
 }
 
 /// Someone's turn (a person's prompt between claims) starts the angles again; the agent's own
@@ -192,6 +207,7 @@ fn someones_turn_starts_the_angles_again_and_the_agents_own_work_does_not() {
     now += MIN;
     let theirs = TurnEndReading {
         person: Some(Duration::from_secs(8)),
+        key: Some(Duration::from_secs(8)),
         ..idle(
             "Hi! What would you like me to work on?",
             Some(Duration::from_secs(5)),
@@ -204,7 +220,12 @@ fn someones_turn_starts_the_angles_again_and_the_agents_own_work_does_not() {
     assert_eq!(st.checks(), 0, "someone's turn starts the angles again");
     now += 3 * MIN;
     let (after, _) = claim_checked(&mut st, CLAIMS[3], None, now);
-    assert_eq!(after, done_check_words(0));
+    // The first angle again, and their key minutes old holds their hour: the go-ahead's word is
+    // left out ([`super::super::go_ahead::unless_held`]).
+    assert_eq!(
+        after,
+        super::super::go_ahead::unless_held(&done_check_words(0), true)
+    );
 }
 
 /// A word other than Cruise ends the run's count: back under Cruise, the next claim asks the first
@@ -362,8 +383,11 @@ fn foreign_stash() -> crate::harness::repo_work::RepoWork {
 /// without open work and the rules, each of the six acts names the finding, asks the agent to land
 /// what of it it made and to leave the rest exactly as it is, and never to commit, merge and push
 /// all of it; none says a word that ends someone else's work. Land's nudge over the same finding
-/// still asks for all of it. NEGATIVE CONTROL: the done check composed with Land's repository
-/// ask (main's words: "commit, merge and push it to the remote main first") fails at angle 1.
+/// (its contradiction of the false defense, slice 4c) still asks for all of it, on purpose (v6
+/// §14.17.17's departures): never to delete it, and with Land's close whole, whose `NEEDS YOU:`
+/// line is where work the agent did not make goes. NEGATIVE CONTROLS: the done check composed
+/// with Land's repository ask (main's words: "commit, merge and push it to the remote main
+/// first") fails at angle 1; the contradiction without Land's close fails Land's arm.
 #[test]
 fn every_angles_composed_act_asks_only_for_the_agents_own_work() {
     let theirs = foreign_stash();
@@ -404,11 +428,23 @@ fn every_angles_composed_act_asks_only_for_the_agents_own_work() {
     assert_eq!(
         a,
         TurnEndAction::Type {
-            text: act_words(LAND_NUDGE, &[&repo_work_suffix(&theirs)], None),
+            text: land_contradicted(
+                &crate::harness::repo_work::RepoRead::Found(theirs.clone()),
+                None,
+                &[],
+                None
+            )
+            .expect("git's leg"),
             rule_id: RULE_LAND_NUDGE,
         },
-        "Land's nudge is unchanged"
+        "Land's nudge is its contradiction of the false defense"
     );
+    let TurnEndAction::Type { text, .. } = &a else {
+        panic!("{a:?}");
+    };
+    for whole in [LAND_CLOSE, "never delete work"] {
+        assert!(text.contains(whole), "{whole:?} in Land's ask: {text}");
+    }
     let main_words = act_words(&done_check_words(0), &[&repo_work_suffix(&theirs)], None);
     assert_eq!(
         own_work_fault(&main_words),

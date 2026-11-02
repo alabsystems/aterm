@@ -136,36 +136,8 @@ pub fn steward_revoke_check(paths: &Paths) -> crate::Result<StewardRevoke> {
         return idle("this Mac holds no admin key of the ALab vault");
     };
     let mut candidate = text.doc.clone();
-    let mut log_removed_machines = Vec::new();
     let local_log = super::log_entries::trusted_local_log(paths, &config)?;
-    if let Some(log) = &local_log {
-        let admins: BTreeSet<String> = candidate.admins().into_iter().collect();
-        for machine in candidate.machines() {
-            if admins.contains(&machine.name) && admins.len() <= 1 {
-                continue;
-            }
-            if let Ok(recipient) = Recipient::parse(&machine.recipient)
-                && (log.recipient_is_removed(&recipient)
-                    || log.audience_left_out_recipient(
-                        &crate::membership_log::EpochAudience::Everyone,
-                        &recipient,
-                    )
-                    || log.membership().members().values().any(|m| {
-                        m.binding.recipient() == recipient
-                            && m.node_key.is_some_and(|nk| {
-                                nk != [0; 32]
-                                    && matches!(
-                                        log.membership().node(&nk),
-                                        crate::membership_log::NodeStanding::Removed(_)
-                                    )
-                            })
-                    }))
-                && candidate.remove_machine(&machine.name, true) == Ok(true)
-            {
-                log_removed_machines.push(machine.name);
-            }
-        }
-    }
+    let log_removed_machines = remove_log_revoked_machines(&mut candidate, local_log.as_ref());
     match (
         log_removed_machines.is_empty(),
         retirement::repair_half_done_revokes_with_log(&mut candidate, local_log.as_ref())?,
@@ -197,6 +169,35 @@ pub fn steward_revoke_check(paths: &Paths) -> crate::Result<StewardRevoke> {
     }
 }
 
+fn remove_log_revoked_machines(
+    doc: &mut Document,
+    log: Option<&crate::membership_log::Log>,
+) -> Vec<String> {
+    let Some(log) = log else {
+        return Vec::new();
+    };
+    let mut removed = Vec::new();
+    let mut admins: BTreeSet<String> = doc.admins().into_iter().collect();
+    for machine in doc.machines() {
+        if admins.contains(&machine.name) && admins.len() <= 1 {
+            continue;
+        }
+        if let Ok(recipient) = Recipient::parse(&machine.recipient)
+            && (log.recipient_is_removed(&recipient)
+                || log.audience_left_out_recipient(
+                    &crate::membership_log::EpochAudience::Everyone,
+                    &recipient,
+                )
+                || super::log_entries::recipient_denied_by_roster_or_log(None, log, &recipient))
+            && doc.remove_machine(&machine.name, true) == Ok(true)
+        {
+            admins.remove(&machine.name);
+            removed.push(machine.name);
+        }
+    }
+    removed
+}
+
 /// Open the ALab vault fresh on this steward and finish any half-done revoke cascade in one
 /// publish (`sync.steward.revoke` apply, `DESIGN-alab-swarm` §7.6).
 ///
@@ -214,17 +215,29 @@ pub fn steward_finish_revokes(paths: &Paths) -> crate::Result<StewardRevoke> {
     let admin = admin_open(paths)?;
     let local_log = super::log_entries::trusted_local_log(paths, &admin.config)?;
     let mut doc = admin.published_doc.clone();
-    let Some(summary) =
-        retirement::repair_half_done_revokes_with_log(&mut doc, local_log.as_ref())?
-    else {
-        if let Some(seq) = mirrored {
-            return Ok(StewardRevoke::Done(format!(
-                "mirrored membership-log removal into vault envelope (version {seq})"
-            )));
+    let log_removed = remove_log_revoked_machines(&mut doc, local_log.as_ref());
+    let repair_summary =
+        retirement::repair_half_done_revokes_with_log(&mut doc, local_log.as_ref())?;
+    let summary = match (log_removed.is_empty(), repair_summary) {
+        (true, Some(s)) => s,
+        (false, Some(s)) => format!(
+            "mirrored membership-log removal of {}; {s}",
+            log_removed.join(", ")
+        ),
+        (false, None) => format!(
+            "mirrored membership-log removal of {} into vault envelope",
+            log_removed.join(", ")
+        ),
+        (true, None) => {
+            if let Some(seq) = mirrored {
+                return Ok(StewardRevoke::Done(format!(
+                    "mirrored membership-log removal into vault envelope (version {seq})"
+                )));
+            }
+            return Ok(StewardRevoke::Current(
+                "every revoked Mac's roster and pool cascade is complete".to_owned(),
+            ));
         }
-        return Ok(StewardRevoke::Current(
-            "every revoked Mac's roster and pool cascade is complete".to_owned(),
-        ));
     };
     match admin_publish(paths, &admin, &doc) {
         Ok(done) => Ok(StewardRevoke::Done(format!(
@@ -235,8 +248,22 @@ pub fn steward_finish_revokes(paths: &Paths) -> crate::Result<StewardRevoke> {
             let refreshed = admin_open(paths)?;
             let refreshed_log = super::log_entries::trusted_local_log(paths, &refreshed.config)?;
             let mut again = refreshed.published_doc.clone();
-            match retirement::repair_half_done_revokes_with_log(&mut again, refreshed_log.as_ref())?
-            {
+            let retry_removed = remove_log_revoked_machines(&mut again, refreshed_log.as_ref());
+            let retry_repair =
+                retirement::repair_half_done_revokes_with_log(&mut again, refreshed_log.as_ref())?;
+            let retry_summary = match (retry_removed.is_empty(), retry_repair) {
+                (true, None) => None,
+                (true, Some(s)) => Some(s),
+                (false, Some(s)) => Some(format!(
+                    "mirrored membership-log removal of {}; {s}",
+                    retry_removed.join(", ")
+                )),
+                (false, None) => Some(format!(
+                    "mirrored membership-log removal of {} into vault envelope",
+                    retry_removed.join(", ")
+                )),
+            };
+            match retry_summary {
                 None => Ok(StewardRevoke::Current(
                     "another steward finished the revoke cascade first".to_owned(),
                 )),
@@ -254,7 +281,8 @@ pub fn steward_finish_revokes(paths: &Paths) -> crate::Result<StewardRevoke> {
 }
 
 fn local_observed_network_id(paths: &Paths) -> Option<String> {
-    let text = std::fs::read_to_string(paths.dir.join("network-id")).ok()?;
+    let bytes = crate::fsx::read_owned(&paths.dir.join("network-id"), 4096).ok()??;
+    let text = std::str::from_utf8(&bytes).ok()?;
     let trimmed = text.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
@@ -263,16 +291,7 @@ pub(super) fn member_is_denied_in_roster(
     roster: &crate::swarm_roster::SwarmRoster,
     member: &crate::swarm_roster::SwarmMember,
 ) -> bool {
-    roster.is_label_denied(&member.label)
-        || member.aliases.iter().any(|a| roster.is_label_denied(a))
-        || member
-            .node_id
-            .as_deref()
-            .is_some_and(|n| roster.is_node_denied(n))
-        || member
-            .node_key
-            .as_deref()
-            .is_some_and(|k| roster.is_node_denied(k))
+    roster.is_member_denied(member)
 }
 
 pub fn local_recipient_denied_in_roster(paths: &Paths) -> bool {
@@ -309,23 +328,40 @@ pub fn local_recipient_denied_in_roster(paths: &Paths) -> bool {
             return true;
         }
     }
-    let Some(r) = roster::swarm_roster(paths).ok().flatten() else {
-        return false;
-    };
-    if let Some(m) = r.member_by_recipient(&recipient)
-        && member_is_denied_in_roster(&r, m)
+    let r = roster::swarm_roster(paths).ok().flatten();
+    if let Some(log) = &local_log
+        && log_entries::recipient_denied_by_roster_or_log(r.as_ref(), log, &my_rec)
     {
         return true;
     }
-    if let Some(cfg) = &cfg {
-        if r.is_label_denied(&cfg.host) {
-            return true;
-        }
-        if let Some(log) = &local_log
-            && log_entries::recipient_denied_by_roster_or_log(Some(&r), log, &my_rec)
-        {
-            return true;
-        }
+    let Some(r) = r else {
+        return false;
+    };
+    roster_denies_local(paths, &r, cfg.as_ref(), &recipient)
+}
+
+fn roster_denies_local(
+    paths: &Paths,
+    r: &crate::swarm_roster::SwarmRoster,
+    config: Option<&Config>,
+    recipient: &str,
+) -> bool {
+    if !r.deny_nodes.is_empty()
+        && let Ok(binding) =
+            crate::commons::bootstrap::Device::existing_binding_for_observation(paths)
+        && (r.is_node_denied(&aterm_codec::hex::encode_lower(binding.writer()))
+            || r.is_node_denied(&aterm_codec::hex::encode_lower(binding.incarnation()))
+            || r.is_node_denied(&aterm_codec::hex::encode_lower(binding.machine())))
+    {
+        return true;
+    }
+    if let Some(m) = r.member_by_recipient(recipient) {
+        return member_is_denied_in_roster(r, m);
+    }
+    if let Some(cfg) = config
+        && r.is_label_denied(&cfg.host)
+    {
+        return true;
     }
     false
 }
@@ -433,17 +469,169 @@ fn resolve_member_own_label(paths: &Paths, config: &Config) -> crate::Result<Opt
 /// own `<label>.local`).
 #[must_use]
 pub fn steward_alab_policy_role(paths: &Paths) -> Option<(bool, Option<String>)> {
-    let config = super::config(paths).ok()??;
-    if !alab_vault(&config) {
-        return None;
+    match observe_alab_role(paths) {
+        AlabRoleObservation::Allowed { own_label, .. } => Some((true, own_label)),
+        _ => None,
     }
-    let state = load_state(paths).ok()?;
+}
+
+/// Exact public source, trust-lineage and recipient binding for a retained server role.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct AlabRoleContext {
+    configuration: [u8; 32],
+    recipient: [u8; 32],
+}
+
+/// A missing role is not permission to become an unscoped ALab server.
+pub(crate) enum AlabRoleObservation {
+    /// No configured source: an explicitly named standalone server may bootstrap.
+    Missing,
+    /// A configured vault outside the ALab trust lineage retains its existing server rules.
+    NotApplicable,
+    Allowed {
+        context: AlabRoleContext,
+        own_label: Option<String>,
+    },
+    /// Positive local revocation or authenticated denial; discard every retained role.
+    Denied,
+    /// No new authority; only a previously verified role with this exact context may stand.
+    Unavailable(Option<AlabRoleContext>),
+}
+
+/// Observe role eligibility without fetching, repairing, or provisioning identity. Negative
+/// signed evidence is read before apply-health gates so a failed apply cannot hide removal.
+pub(crate) fn observe_alab_role(paths: &Paths) -> AlabRoleObservation {
+    observe_alab_role_with(paths, || {})
+}
+
+fn observe_alab_role_with(paths: &Paths, before_recheck: impl FnOnce()) -> AlabRoleObservation {
+    let observed = observe_alab_role_inner(paths);
+    let context = match &observed {
+        AlabRoleObservation::Allowed { context, .. }
+        | AlabRoleObservation::Unavailable(Some(context)) => context,
+        _ => return observed,
+    };
+    before_recheck();
+    let current = super::config(paths).ok().flatten().and_then(|config| {
+        read_identity(paths)
+            .ok()
+            .flatten()
+            .map(|identity| AlabRoleContext {
+                configuration: super::network_observation::configuration_binding(&config),
+                recipient: identity.recipient().0,
+            })
+    });
+    if current.as_ref() == Some(context) {
+        observed
+    } else {
+        AlabRoleObservation::Unavailable(None)
+    }
+}
+
+fn observe_alab_role_inner(paths: &Paths) -> AlabRoleObservation {
+    use AlabRoleObservation::{Allowed, Denied, Missing, NotApplicable, Unavailable};
+    let config = match super::config(paths) {
+        Ok(Some(config)) => config,
+        Ok(None) => return Missing,
+        Err(_) => return Unavailable(None),
+    };
+    if !config
+        .signer
+        .is_some_and(|signer| Retired::compiled().lineage(&signer, &config.followed))
+    {
+        return NotApplicable;
+    }
+    if !alab_vault(&config) || !pin_admitted(&config, None) {
+        return Denied;
+    }
+    let state = load_state(paths);
+    if state
+        .as_ref()
+        .is_ok_and(|state| state.membership == Stored::Revoked)
+    {
+        return Denied;
+    }
+    let Ok(Some(identity)) = read_identity(paths) else {
+        return Unavailable(None);
+    };
+    let context = AlabRoleContext {
+        configuration: super::network_observation::configuration_binding(&config),
+        recipient: identity.recipient().0,
+    };
+    let unavailable = || Unavailable(Some(context.clone()));
+    // This verifier binds the log's genesis to the configured root without assuming the
+    // local materialization finished. It is used here only to honor negative authority.
+    let configured_log = super::log_entries::trusted_configured_log(paths, &config);
+    let log = configured_log
+        .as_ref()
+        .ok()
+        .and_then(|l| l.as_ref())
+        .map(|l| &l.log);
+    if log.is_some_and(|log| {
+        log.recipient_is_removed(&identity.recipient())
+            || log.audience_left_out_recipient(
+                &crate::membership_log::EpochAudience::Everyone,
+                &identity.recipient(),
+            )
+            || log_entries::recipient_denied_by_roster_or_log(None, log, &identity.recipient())
+    }) {
+        return Denied;
+    }
+    // The cached envelope still has to match its signed digest/source. Reading public
+    // denial metadata during a pending apply does not grant access or admit publication.
+    let observed_roster = (|| -> crate::Result<Option<crate::swarm_roster::SwarmRoster>> {
+        if let Ok(state) = &state
+            && let Some(bytes) = super::verified_cached_envelope(paths, &config, state)
+        {
+            let envelope = envelope::parse(&bytes)?;
+            return log_entries::roster_preferring_log(paths, &config, &envelope, &identity)?
+                .0
+                .into_roster();
+        }
+        if let Some(log) = log {
+            return log_entries::roster_from_log(log, &identity)?.into_roster();
+        }
+        Ok(None)
+    })();
+    if observed_roster
+        .as_ref()
+        .ok()
+        .and_then(|r| r.as_ref())
+        .is_some_and(|roster| {
+            roster_denies_local(
+                paths,
+                roster,
+                Some(&config),
+                &identity.recipient().to_bech32(),
+            ) || log.is_some_and(|log| {
+                log_entries::recipient_denied_by_roster_or_log(
+                    Some(roster),
+                    log,
+                    &identity.recipient(),
+                )
+            })
+        })
+    {
+        return Denied;
+    }
+    if configured_log.is_err() || observed_roster.is_err() {
+        return unavailable();
+    }
+    let Ok(state) = state else {
+        return unavailable();
+    };
     let log_intact = state.seq == 0 && super::log_only_intact(paths, &config, &state);
-    if state.membership != Stored::In || (state.seq < 1 && !log_intact) {
-        return None;
+    if state.membership != Stored::In
+        || state.failed
+        || !state.pending.is_empty()
+        || (state.seq < 1 && !log_intact)
+        || ((!source_bound(&config, &state) || held_copy(paths, &config, &state).is_none())
+            && !log_intact)
+    {
+        return unavailable();
     }
     if local_recipient_denied_in_roster(paths) {
-        return None;
+        return Denied;
     }
     if let Some(identity) = read_identity(paths).ok().flatten()
         && let Some(log) = super::log_entries::trusted_local_log(paths, &config)
@@ -455,10 +643,21 @@ pub fn steward_alab_policy_role(paths: &Paths) -> Option<(bool, Option<String>)>
                 &identity.recipient(),
             ))
     {
-        return None;
+        return Denied;
     }
-    let own_label = resolve_member_own_label(paths, &config).ok().flatten();
-    Some((true, own_label))
+    let Ok(mut own_label) = resolve_member_own_label(paths, &config) else {
+        return unavailable();
+    };
+    if own_label.is_none() && config.host == crate::alab_advertised() {
+        // Legacy first holders can have the reserved alias as their configured host and no
+        // roster yet. Give this already admitted recipient a stable discovery-only name;
+        // never rewrite its configuration or bypass the alias watcher's election.
+        own_label = Some(format!(
+            "alab-member-{}",
+            super::join_code(&identity.recipient())
+        ));
+    }
+    Allowed { context, own_label }
 }
 
 /// Outcome of the ALab steward lease step (`sync.steward.lease`, `DESIGN-alab-swarm` §3.4, §8.3).
@@ -487,9 +686,10 @@ fn expire_denied_lease_holder(
     let Some(lease) = current.as_mut() else {
         return;
     };
-    let Ok(Some(mut roster)) = crate::swarm_roster::SwarmRoster::from_document(doc) else {
-        return;
-    };
+    let mut roster = crate::swarm_roster::SwarmRoster::from_document(doc)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     if let Ok(Some(denied)) = super::fleet::swarm_denied_nodes(paths) {
         roster.deny_nodes.extend(denied);
         roster.canonicalize();
@@ -501,21 +701,20 @@ fn expire_denied_lease_holder(
     {
         roster::overlay_log_membership(&log, &mut roster);
     }
+    let code_only: BTreeSet<String> = doc.code_only().into_iter().collect();
     let holder_denied = roster.is_label_denied(&lease.holder)
+        || roster.is_node_denied(&lease.holder)
         || roster
             .member_by_label_or_alias(&lease.holder)
             .is_some_and(|member| {
-                roster.is_label_denied(&member.label)
-                    || member.aliases.iter().any(|a| roster.is_label_denied(a))
-                    || member
-                        .node_id
-                        .as_deref()
-                        .is_some_and(|n| roster.is_node_denied(n))
-                    || member
-                        .node_key
-                        .as_deref()
-                        .is_some_and(|k| roster.is_node_denied(k))
-            });
+                roster.is_member_denied(member) || code_only.contains(&member.recipient)
+            })
+        || doc.machines().into_iter().any(|m| {
+            (m.name.eq_ignore_ascii_case(&lease.holder)
+                || crate::swarm_roster::leading_m_label(&m.name)
+                    .is_some_and(|(_, canon)| canon.eq_ignore_ascii_case(&lease.holder)))
+                && code_only.contains(&m.recipient)
+        });
     if holder_denied {
         lease.until = 0;
     }
@@ -768,7 +967,14 @@ pub(super) fn check_standby_eligibility(
             "this Mac has applied no copy of the vault yet".to_owned()
         ));
     }
-    if state.membership != Stored::In || (state.seq < 1 && !log_intact) {
+    if state.membership != Stored::In
+        || state.failed
+        || !state.pending.is_empty()
+        || !pin_admitted(&config, None)
+        || (state.seq < 1 && !log_intact)
+        || ((!source_bound(&config, &state) || held_copy(paths, &config, &state).is_none())
+            && !log_intact)
+    {
         return Ok(Err(
             "this Mac is not an active member of the ALab vault".to_owned()
         ));
@@ -831,17 +1037,18 @@ pub(crate) fn held_server_move_due(
 }
 
 /// Wait until `url` answers with the ALab vault ([`crate::server::is_alab_vault`]), for at most
-/// `within`.
+/// `within`. Each look is a probe ([`transport::observe_within`]): the moved server books none
+/// of them as a plain read, which would keep F20's mirror on for 14 days.
 ///
 /// # Errors
 /// Nothing there served it in time.
 #[cfg(unix)]
 pub(crate) fn serves_alab(url: &str, within: Duration) -> crate::Result<()> {
-    let deadline = Instant::now() + within;
+    let deadline = Instant::now() + within.min(Duration::from_secs(365 * 24 * 60 * 60));
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         if let Ok(Fetched::Body(bytes)) =
-            transport::fetch_within(url, None, left.min(Duration::from_secs(1)))
+            transport::observe_within(url, left.min(Duration::from_secs(1)))
             && crate::server::is_alab_vault(&bytes)
         {
             return Ok(());

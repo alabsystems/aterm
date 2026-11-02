@@ -181,6 +181,23 @@ pub fn set_env_reread(run: &Run, key: &str, value: Option<&str>) -> Result<Rerea
     set_env_reread_with_wait(run, key, value, &WallWait::new())
 }
 
+/// Deep-merge `patch` into the scratch settings ([`crate::verbs::settings_merge`]) and wait until
+/// Claude Code re-reads the file.
+///
+/// # Errors
+/// The settings could not be written, the run was interrupted, or nothing answered within [`HANG`].
+pub fn merge_reread(run: &Run, patch: &J) -> Result<Reread, Fail> {
+    let settings = run.settings().to_string_lossy().into_owned();
+    let log = run.w.join(LOG);
+    until_reread(
+        || crate::verbs::settings_merge(run, patch).map(drop),
+        || rereads(&crate::util::scratch_text(&log), &settings),
+        REWRITE_EVERY,
+        HANG,
+        &WallWait::new(),
+    )
+}
+
 pub(crate) fn set_env_reread_with_wait(
     run: &Run,
     key: &str,

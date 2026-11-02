@@ -589,7 +589,7 @@ impl ToneModel {
         Tone::from_index(best)
     }
 
-    /// Apply tanh to `s.hid` in place and compute the output logits into `s.logits`.
+    /// Apply tanh to `s.hid` and compute the output logits into `s.logits`.
     #[inline]
     fn logits_from_pre_activations(&self, s: &mut ToneScratch) {
         s.logits = self.b2;
@@ -597,7 +597,6 @@ impl ToneModel {
         while r < HIDDEN {
             let row = &self.w2[r];
             let hv = s.hid[r].tanh();
-            s.hid[r] = hv;
             let mut c = 0;
             while c < TONE_COUNT {
                 s.logits[c] += hv * row[c];

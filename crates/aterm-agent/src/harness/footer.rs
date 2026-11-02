@@ -34,6 +34,12 @@ pub const ACCOUNT_MARK: char = '\u{2386}';
 /// Names the account unit's weekly quota ([`Segment::joined`]); the rule draws a [`JOIN_MARK`]
 /// before it. The Accounts menu a click on the unit opens leads its weekly row with this mark.
 pub const WEEKLY_MARK: char = '\u{25f7}';
+/// Names the account unit's 5-hour part (`· 5h 62% left`, [`Segment::joined`]).
+pub const FIVE_MARK: char = '\u{25f6}';
+/// Names the account unit's outlook (`· continuous 7d`, `· ⧗ stop ~Wed 22:30–Thu 09:00`,
+/// [`Segment::joined`]): the rotation's own policy replayed at today's pace
+/// ([`super::outlook`]).
+pub const OUTLOOK_MARK: char = '\u{21bb}';
 /// The mark the rule draws before a part joined to the account unit (`⎆ me · weekly 61% left`).
 pub const JOIN_MARK: char = '\u{b7}';
 /// The mark before a limit wall the session hit.
@@ -44,6 +50,9 @@ pub const CONTEXT_MARK: char = '\u{25D0}';
 pub const USAGE_MARK: char = '\u{03A3}';
 /// The mark inside a limit wall that stands for "resets" (`⧗ 5h ♻ 3pm`).
 pub const RESET_MARK: char = '\u{267B}';
+
+/// Fixed finding when a typed transcript limit has no recovery observation.
+pub const UNOBSERVED_RECOVERY_FINDING: &str = "Recovery status is unobserved";
 
 /// Most transcript bytes one [`FooterCache::usage`] folds.
 pub const FOLD_BUDGET: u64 = 64 * 1024 * 1024;
@@ -134,6 +143,9 @@ pub struct FooterFacts {
     /// The session's active goal, one line ([`super::goal`]): Claude Code's `/goal` condition
     /// as its transcript leaves it ([`FooterCache::goal`]).
     pub goal: Option<String>,
+    /// The outlook's quantized parts for this pane's row ([`super::outlook::Outlook::glance`]):
+    /// the week's bar, its reset, the 5-hour part and the verdict's words.
+    pub glance: Option<super::outlook::Glance>,
 }
 
 /// One of the footer's facts a person can act on in the bottom rule.
@@ -292,6 +304,37 @@ pub fn launch_facts_of(argv: &[String], env: &[String]) -> LaunchFacts {
     }
 }
 
+/// A bar drawn inside a segment's text ([`Segment::meter`]): rigid cells at pitch 1 with no nudge
+/// ([`set_facts`]), on the rule's own centre line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Meter {
+    /// The byte offset in the segment's text the bar follows (after `weekly `); the text after it
+    /// resumes one space on.
+    pub at: usize,
+    /// Its cells, the first [`Self::n`] drawn.
+    pub cells: [super::outlook::BarCell; 10],
+    /// How many cells are drawn: 10, or 5 on a narrow rung.
+    pub n: u8,
+}
+
+impl Meter {
+    /// The cells drawn.
+    #[must_use]
+    pub fn drawn(&self) -> &[super::outlook::BarCell] {
+        &self.cells[..usize::from(self.n).min(self.cells.len())]
+    }
+}
+
+/// How a segment's words are inked.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum Tone {
+    /// The value ink.
+    #[default]
+    Value,
+    /// The warn ink: a projected stop, its `⧗` leading its words.
+    Warn,
+}
+
 /// One marked value in the footer.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Segment {
@@ -307,6 +350,13 @@ pub struct Segment {
     /// behind a [`JOIN_MARK`] rather than its own mark (which then only names it), and one fact
     /// with it ([`fact_spans`]).
     pub joined: bool,
+    /// Whether it is an attribute of the segment before it ([`Self::attached`]): set
+    /// [`JOIN_GAP`] after it with no mark drawn, and one fact with it.
+    pub attached: bool,
+    /// A bar drawn inside its text ([`Meter`]).
+    pub meter: Option<Meter>,
+    /// How its words are inked.
+    pub tone: Tone,
 }
 
 impl Segment {
@@ -330,10 +380,28 @@ impl Segment {
         }
     }
 
-    /// The mark the rule draws before its text: its own, or a [`JOIN_MARK`] where it is joined.
+    /// An attribute of the segment before it: [`JOIN_GAP`] after that one and no mark drawn, so
+    /// it lies in that segment's fact ([`fact_spans`]); `mark` only names it. The words after a
+    /// segment's bar continue it this way ([`set_facts`]).
     #[must_use]
-    pub const fn drawn_mark(&self) -> char {
-        if self.joined { JOIN_MARK } else { self.mark }
+    pub fn attached(mark: char, text: impl Into<String>) -> Self {
+        Self {
+            attached: true,
+            ..Self::joined(mark, text)
+        }
+    }
+
+    /// The mark the rule draws before its text: its own, or a [`JOIN_MARK`] where it is joined;
+    /// `None` where it is [`Self::attached`].
+    #[must_use]
+    pub const fn drawn_mark(&self) -> Option<char> {
+        if self.attached {
+            None
+        } else if self.joined {
+            Some(JOIN_MARK)
+        } else {
+            Some(self.mark)
+        }
     }
 
     fn shown_part(&self) -> (char, &str) {
@@ -1606,7 +1674,7 @@ pub fn shell_cwds(claude_dir: &Path, launch: &Path) -> Vec<PathBuf> {
         let Some(pid) = name
             .to_str()
             .and_then(|n| n.strip_suffix(".json"))
-            .and_then(|n| n.parse::<u32>().ok())
+            .and_then(crate::parse_uint::<u32>)
         else {
             continue;
         };
@@ -2173,10 +2241,20 @@ pub(crate) fn under_file_provider_domain(home: Option<&Path>, path: &Path) -> bo
     let Some(home) = home else {
         return false;
     };
-    let home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
-    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    atpkg::protected::under_file_provider_domain(&home, &resolved)
-        || atpkg::protected::under_app_data(&home, &resolved)
+    let under = |h: &Path, p: &Path| {
+        atpkg::protected::under_file_provider_domain(h, p) || atpkg::protected::under_app_data(h, p)
+    };
+    if under(home, path) {
+        return true;
+    }
+    let real_home = std::fs::canonicalize(home).ok();
+    if real_home.as_deref().is_some_and(|rh| under(rh, path)) {
+        return true;
+    }
+    let Ok(resolved) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    under(home, &resolved) || real_home.as_deref().is_some_and(|rh| under(rh, &resolved))
 }
 
 /// [`git_head`], saying why there is no answer when the kernel refused a read.
@@ -2418,6 +2496,7 @@ fn facts_for_entry_from(
         plan: None,
         context: None,
         goal: None,
+        glance: None,
     };
     (
         facts,
@@ -2793,8 +2872,8 @@ fn prefix_of_parts(cut: &str, parts: &[&str]) -> bool {
 /// quietly.
 pub const YOLO_ON: &str = "yolo";
 /// What it names the manual mode (`⏸ manual mode on`), the mode that asks before each tool: any
-/// yolo turned off is nag mode.
-pub const YOLO_OFF: &str = "nag mode";
+/// yolo turned off is manual mode.
+pub const YOLO_OFF: &str = "manual mode";
 
 /// How many items a rewritten mode row keeps ([`ModeRow`]); a row with more stands as drawn.
 pub const MODE_ROW_ITEMS: usize = 8;
@@ -3490,15 +3569,22 @@ fn model_effort_segment(facts: &FooterFacts, stubs: bool) -> Option<Segment> {
 }
 
 impl FooterFacts {
-    /// Reconcile an idle account observation with a still-standing transcript limit.
-    /// An explicit recovery decision remains authoritative; an older idle inventory
-    /// observation cannot hide a limit that the transcript reader has since found.
+    /// Reconcile account observations with a still-standing typed transcript limit.
+    /// Without a recovery observation, only that limit and its provider reset are
+    /// known. An explicit recovery decision remains authoritative; an older idle
+    /// inventory observation cannot hide a newer transcript limit.
     #[must_use]
     pub fn account_progress_view(
         &self,
     ) -> Option<std::borrow::Cow<'_, super::account_progress::AccountProgress>> {
-        use super::account_progress::ProgressPhase;
-        let progress = self.account_progress.as_ref()?;
+        use super::account_progress::{AccountProgress, ProgressPhase};
+        let Some(progress) = self.account_progress.as_ref() else {
+            let wall = self.usage.as_ref()?.wall.as_ref()?;
+            let mut view = AccountProgress::unknown(0);
+            view.wall = Some(format!("{}; provider reset: {}", wall.label, wall.resets));
+            view.details.push(UNOBSERVED_RECOVERY_FINDING.into());
+            return Some(std::borrow::Cow::Owned(view));
+        };
         let mut view = std::borrow::Cow::Borrowed(progress);
         if progress.wall.is_none()
             && matches!(
@@ -3562,15 +3648,21 @@ fn fact_segments(facts: &FooterFacts, stubs: bool) -> Vec<Segment> {
         .and_then(|s| s.email.as_deref())
         .map(|email| email_name(email).unwrap_or(email).to_owned());
     let headed = email.is_some();
-    let joined = |mark: char, text: Option<String>| {
-        text.map(|text| {
-            if headed {
-                Segment::joined(mark, text)
-            } else {
-                Segment::plain(mark, text)
-            }
-        })
+    let weekly = weekly_segment(facts, headed, facts.glance.as_ref());
+    // The outlook's parts (docs/DESIGN-accounts-outlook-2026-10-25.md §2) join the unit the
+    // email or the week leads; with neither, each stands behind its own mark.
+    let led = headed || weekly.is_some();
+    let part = |mark: char, text: String| {
+        if led {
+            Segment::joined(mark, text)
+        } else {
+            Segment::plain(mark, text)
+        }
     };
+    let glance = facts
+        .glance
+        .as_ref()
+        .filter(|_| facts.subscription.is_some());
     [
         plain(
             WALL_MARK,
@@ -3584,17 +3676,14 @@ fn fact_segments(facts: &FooterFacts, stubs: bool) -> Vec<Segment> {
                 }),
         ),
         plain(ACCOUNT_MARK, email),
-        joined(
-            WEEKLY_MARK,
-            facts.subscription.as_ref().and_then(|s| {
-                s.weekly.clone().or_else(|| {
-                    usage
-                        .and_then(|u| u.wall.as_ref())
-                        .is_some_and(|w| w.label == "7d")
-                        .then(|| "weekly 0% left".into())
-                })
-            }),
-        ),
+        weekly,
+        glance
+            .and_then(|g| g.five.clone())
+            .map(|five| part(FIVE_MARK, five)),
+        glance.and_then(|g| g.verdict.as_ref()).map(|v| Segment {
+            tone: if v.warn { Tone::Warn } else { Tone::Value },
+            ..part(OUTLOOK_MARK, v.full.clone())
+        }),
         model_effort_segment(facts, stubs),
         plain(
             ACCOUNT_MARK,
@@ -3618,6 +3707,48 @@ fn fact_segments(facts: &FooterFacts, stubs: bool) -> Vec<Segment> {
     .collect()
 }
 
+/// The words that say the week: `weekly `, the bar where the outlook drew one, the figure, and
+/// its reset (`weekly ━━━━━━╍╍╍┽ 42% left ♻ Thu 09:00`); a standing wall says the reset itself.
+/// A week aterm has not read is not shown, as a figure-less week never is on the rule; a 7-day
+/// wall's is `weekly 0% left`. Joined to the unit where an email leads it (`headed`).
+fn weekly_segment(
+    facts: &FooterFacts,
+    headed: bool,
+    glance: Option<&super::outlook::Glance>,
+) -> Option<Segment> {
+    let s = facts.subscription.as_ref()?;
+    let wall = facts.usage.as_ref().and_then(|u| u.wall.as_ref());
+    let words = s.weekly.clone().or_else(|| {
+        wall.is_some_and(|w| w.label == "7d")
+            .then(|| "weekly 0% left".into())
+    })?;
+    let mut segment = if headed {
+        Segment::joined(WEEKLY_MARK, words)
+    } else {
+        Segment::plain(WEEKLY_MARK, words)
+    };
+    let figure = segment
+        .text
+        .strip_prefix(WEEKLY_WORD)
+        .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()));
+    if let Some(glance) = glance.filter(|_| figure) {
+        if let Some((ten, _)) = glance.bar {
+            segment.meter = Some(Meter {
+                at: WEEKLY_WORD.len(),
+                cells: ten,
+                n: 10,
+            });
+        }
+        if let Some(reset) = glance.reset.as_ref().filter(|_| wall.is_none()) {
+            segment.text.push_str(&format!(" {RESET_MARK} {reset}"));
+        }
+    }
+    Some(segment)
+}
+
+/// What the week's words start with.
+const WEEKLY_WORD: &str = "weekly ";
+
 fn model_alone(facts: &FooterFacts) -> Option<Segment> {
     facts
         .model
@@ -3639,7 +3770,7 @@ pub fn segments_width(segments: &[Segment]) -> usize {
 }
 
 /// One glyph of the facts as [`set_facts`] places it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SetGlyph {
     /// The character.
     pub ch: char,
@@ -3655,6 +3786,10 @@ pub struct SetGlyph {
     pub tail: bool,
     /// A character of a hidden fact's greyed stub, its value and [`OFF_STUB`] ([`Segment::quiet`]).
     pub quiet: bool,
+    /// A cell of a segment's bar ([`Segment::meter`]): at pitch 1, never nudged.
+    pub meter: bool,
+    /// A character of a [`Tone::Warn`] segment's words.
+    pub warn: bool,
 }
 
 /// The facts set as a line of small type ([`set_facts`]).
@@ -3670,9 +3805,70 @@ pub struct SetFacts {
     pub combining: Vec<(usize, Box<[char]>)>,
 }
 
-/// Set the facts as a line of type.
+/// Set the facts as a line of type. A segment's bar ([`Segment::meter`]) is rigid: the text
+/// before it is set at [`FACT_PITCH`] and snapped to the next whole cell, the bar's cells follow at
+/// pitch 1 with no nudge, and the rest resumes after them.
 #[must_use]
 pub fn set_facts(segments: &[Segment]) -> SetFacts {
+    let Some((k, meter)) = segments
+        .iter()
+        .enumerate()
+        .find_map(|(i, s)| Some((i, s.meter?)))
+    else {
+        return set_line(segments);
+    };
+    let segment = &segments[k];
+    let at = (0..=meter.at.min(segment.text.len()))
+        .rev()
+        .find(|&i| segment.text.is_char_boundary(i))
+        .unwrap_or(0);
+    let mut head: Vec<Segment> = segments[..k].to_vec();
+    head.push(Segment {
+        text: segment.text[..at].to_owned(),
+        meter: None,
+        ..segment.clone()
+    });
+    // The rest of the segment continues it, one space on, with no mark of its own.
+    let mut tail = vec![Segment {
+        text: format!(" {}", &segment.text[at..]),
+        meter: None,
+        split: None,
+        joined: true,
+        attached: true,
+        ..segment.clone()
+    }];
+    tail.extend(segments[k + 1..].iter().cloned());
+    let head = set_line(&head);
+    let tail = set_line(&tail);
+    let bar = meter.drawn();
+    let start = head.cells;
+    let after = start + bar.len();
+    let mut glyphs = head.glyphs;
+    glyphs.extend(bar.iter().enumerate().map(|(i, c)| SetGlyph {
+        ch: c.glyph(),
+        cell: start + i,
+        cols: 1,
+        meter: true,
+        ..SetGlyph::default()
+    }));
+    glyphs.extend(tail.glyphs.into_iter().map(|g| SetGlyph {
+        cell: g.cell + after,
+        ..g
+    }));
+    let mut clusters = head.clusters;
+    clusters.extend(tail.clusters.into_iter().map(|(c, t)| (c + after, t)));
+    let mut combining = head.combining;
+    combining.extend(tail.combining.into_iter().map(|(c, m)| (c + after, m)));
+    SetFacts {
+        cells: after + tail.cells,
+        glyphs,
+        clusters,
+        combining,
+    }
+}
+
+/// [`set_facts`] of segments with no bar.
+fn set_line(segments: &[Segment]) -> SetFacts {
     let mut glyphs: Vec<SetGlyph> = Vec::new();
     let mut place: Vec<f32> = Vec::new();
     let mut clusters = Vec::new();
@@ -3695,11 +3891,14 @@ pub fn set_facts(segments: &[Segment]) -> SetFacts {
             (tail, own && quiet(tail))
         };
         let mut mark_buf = [0; 4];
-        let mark_text = segment.drawn_mark().encode_utf8(&mut mark_buf);
+        let drawn = segment.drawn_mark();
+        let mark_text: &str = drawn.map_or("", |m| m.encode_utf8(&mut mark_buf));
+        let after_mark = if drawn.is_some() { " " } else { "" };
+        let warn = segment.tone == Tone::Warn;
         for (text, mark, own) in [
-            (mark_text as &str, true, false),
-            (" ", false, false),
-            (&segment.text, false, true),
+            (mark_text, true, false),
+            (after_mark, false, false),
+            (segment.text.as_str(), false, true),
         ] {
             let mut grid = aterm_grapheme::GridColumns::new();
             let mut base = None;
@@ -3724,6 +3923,8 @@ pub fn set_facts(segments: &[Segment]) -> SetFacts {
                         mark,
                         tail,
                         quiet,
+                        meter: false,
+                        warn: warn && own,
                     });
                     if cluster.codepoint_count > 1 {
                         clusters.push((index, Box::<str>::from(cluster.text)));
@@ -3755,6 +3956,8 @@ pub fn set_facts(segments: &[Segment]) -> SetFacts {
                                 mark,
                                 tail,
                                 quiet,
+                                meter: false,
+                                warn: warn && own,
                             });
                             line += width as f32;
                         }
@@ -3869,7 +4072,7 @@ fn glyph_fact(segment: &Segment, tail: bool, quiet: bool) -> Option<(FactKind, F
             BRANCH_MARK => FactKind::Branch,
             CONTEXT_MARK => FactKind::Context,
             USAGE_MARK => FactKind::Usage,
-            ACCOUNT_MARK | WEEKLY_MARK | WALL_MARK => FactKind::Account,
+            ACCOUNT_MARK | WEEKLY_MARK | WALL_MARK | FIVE_MARK | OUTLOOK_MARK => FactKind::Account,
             _ => return None,
         }
     };
@@ -3882,9 +4085,15 @@ fn glyph_fact(segment: &Segment, tail: bool, quiet: bool) -> Option<(FactKind, F
 }
 
 /// Where each fact of `segments`, as [`set_facts`] set them (`set`), lies: a joined segment
-/// ([`Segment::joined`]) lies in the span of the fact it continues, its mark included.
+/// ([`Segment::joined`]) lies in the span of the fact it continues, its mark included, and an
+/// attached one ([`Segment::attached`]), which draws no mark, in the span of the one before it.
 #[must_use]
 pub fn fact_spans(set: &SetFacts, segments: &[Segment]) -> FactSpans {
+    // The segments in the order their marks are drawn: an attached one draws none.
+    let drawn: Vec<&Segment> = segments
+        .iter()
+        .filter(|s| s.drawn_mark().is_some())
+        .collect();
     let mut spans = FactSpans::default();
     let room = spans.len();
     let mut n = 0usize;
@@ -3894,7 +4103,7 @@ pub fn fact_spans(set: &SetFacts, segments: &[Segment]) -> FactSpans {
     let cell = |at: usize| u16::try_from(at).unwrap_or(u16::MAX);
     for glyph in &set.glyphs {
         if glyph.mark {
-            segment = segments.get(next);
+            segment = drawn.get(next).copied();
             next += 1;
             mark_at = Some(glyph.cell);
             continue;
@@ -4087,10 +4296,24 @@ fn plain_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
             BRANCH_MARK,
             PATH_MARK,
             MODEL_MARK,
+            FIVE_MARK,
+            OUTLOOK_MARK,
             ACCOUNT_MARK,
             WEEKLY_MARK,
         ] {
-            rung.retain(|segment| segment.mark != mark);
+            rung.retain(|segment| {
+                segment.mark != mark
+                    && !(mark == ACCOUNT_MARK && segment.mark == WEEKLY_MARK && segment.joined)
+            });
+            if mark == OUTLOOK_MARK
+                && facts.glance.is_some()
+                && let Some(weekly) = rung.iter_mut().find(|segment| segment.mark == WEEKLY_MARK)
+                && let Some(plain) = weekly_segment(facts, weekly.joined, None)
+            {
+                // Once the outlook yields, its bar and added reset must not keep
+                // the account wider than the same unit without an outlook.
+                *weekly = plain;
+            }
             if out.last() != Some(&rung) {
                 out.push(rung.clone());
             }
@@ -4222,11 +4445,71 @@ fn bare_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
 fn subscription_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
     let mut rung = fact_segments(facts, false);
     let mut out = vec![rung.clone()];
+    let push = |out: &mut Vec<Vec<Segment>>, rung: &[Segment]| {
+        if out.last().map(Vec::as_slice) != Some(rung) {
+            out.push(rung.to_vec());
+        }
+    };
     for mark in [CONTEXT_MARK, USAGE_MARK, BRANCH_MARK, PATH_MARK, MODEL_MARK] {
         rung.retain(|segment| segment.mark != mark);
-        if out.last() != Some(&rung) {
-            out.push(rung.clone());
+        push(&mut out, &rung);
+    }
+    // The outlook's parts give way in docs/DESIGN-accounts-outlook-2026-10-25.md §2.3's order
+    // (the email shows its name and the plan is off the rule at rest, so their rungs are gone):
+    // the 5-hour part, the long words, half the bar, a verdict that is neither a stop nor a
+    // wall, the reset (a kept verdict at its shortest), the bar. A unit with no outlook narrows
+    // as it always did: its name is cut before its week's words go short.
+    if let Some(glance) = facts.glance.as_ref() {
+        rung.retain(|segment| segment.mark != FIVE_MARK);
+        push(&mut out, &rung);
+        let verdict = glance.verdict.as_ref();
+        for segment in &mut rung {
+            match segment.mark {
+                WEEKLY_MARK => {
+                    segment.text = segment
+                        .text
+                        .replacen("% left", "%", 1)
+                        .replacen(" ago", "", 1);
+                }
+                OUTLOOK_MARK => {
+                    if let Some(v) = verdict {
+                        segment.text.clone_from(&v.short);
+                    }
+                }
+                _ => {}
+            }
         }
+        push(&mut out, &rung);
+        if let (Some((_, five)), Some(meter)) = (
+            glance.bar,
+            rung.iter_mut()
+                .find(|s| s.mark == WEEKLY_MARK)
+                .and_then(|s| s.meter.as_mut()),
+        ) {
+            meter.cells[..5].copy_from_slice(&five);
+            meter.n = 5;
+        }
+        push(&mut out, &rung);
+        if verdict.is_some_and(|v| !v.kept_narrow) {
+            rung.retain(|segment| segment.mark != OUTLOOK_MARK);
+        }
+        push(&mut out, &rung);
+        for segment in &mut rung {
+            match segment.mark {
+                WEEKLY_MARK => drop_reset(segment),
+                OUTLOOK_MARK => {
+                    if let Some(shortest) = verdict.and_then(|v| v.shortest.as_ref()) {
+                        segment.text.clone_from(shortest);
+                    }
+                }
+                _ => {}
+            }
+        }
+        push(&mut out, &rung);
+        for segment in &mut rung {
+            segment.meter = None;
+        }
+        push(&mut out, &rung);
     }
     for limit in [24, 18, 12, 8] {
         let mut short = rung.clone();
@@ -4237,7 +4520,22 @@ fn subscription_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
     let mut narrow = rung.clone();
     shorten_subscription_account(&mut narrow, 8);
     if narrow_subscription_weekly(&mut narrow) && out.last() != Some(&narrow) {
-        out.push(narrow);
+        out.push(narrow.clone());
+    }
+    // Below the unit's narrowest form the outlook gives way before the account does: a kept
+    // verdict outlasts the week's figure, then the account stands alone, so a pane too narrow
+    // for the outlook's unit still names the account wherever it would with no outlook.
+    if facts.glance.is_some() && narrow.iter().any(|s| s.mark == ACCOUNT_MARK) {
+        for keep in [
+            &[WALL_MARK, ACCOUNT_MARK, OUTLOOK_MARK][..],
+            &[WALL_MARK, ACCOUNT_MARK],
+        ] {
+            let mut last = narrow.clone();
+            last.retain(|segment| keep.contains(&segment.mark));
+            if out.last() != Some(&last) {
+                out.push(last);
+            }
+        }
     }
     if let Some(wall) = rung.iter().find(|s| s.mark == WALL_MARK).cloned() {
         out.push(vec![wall]);
@@ -4265,17 +4563,26 @@ fn shorten_subscription_account(segments: &mut [Segment], limit: usize) -> bool 
     true
 }
 
+/// The week's words without their reset (`♻ Thu 09:00`).
+fn drop_reset(segment: &mut Segment) {
+    if let Some(at) = segment.text.find(&format!(" {RESET_MARK} ")) {
+        segment.text.truncate(at);
+    }
+}
+
 /// Narrow the weekly segment to its narrow form ([`super::profile::narrow_weekly`]: an aged
-/// figure keeps its `weekly` and its age), where it has one.
+/// figure keeps its `weekly` and its age), with no bar and no reset, where it has one.
 fn narrow_subscription_weekly(segments: &mut [Segment]) -> bool {
     let Some(weekly) = segments.iter_mut().find(|s| s.mark == WEEKLY_MARK) else {
         return false;
     };
-    let Some(text) = super::profile::narrow_weekly(&weekly.text) else {
-        return false;
-    };
-    weekly.text = text;
-    true
+    let before = weekly.clone();
+    weekly.meter = None;
+    drop_reset(weekly);
+    if let Some(text) = super::profile::narrow_weekly(&weekly.text) {
+        weekly.text = text;
+    }
+    *weekly != before
 }
 
 fn subscription_reservation(facts: &FooterFacts, room: usize) -> usize {
@@ -4300,6 +4607,7 @@ fn subscription_reservation(facts: &FooterFacts, room: usize) -> usize {
 #[must_use]
 pub fn fit_rule(facts: &FooterFacts, room: usize, lights: Option<LightsWidth>) -> RuleFit {
     let ladder = plain_ladder(facts);
+    let has_recovery = facts.account_progress_on_rule().is_some();
     let model = model_alone(facts);
     let chips = lights.is_some();
     let reason = lights.is_some_and(|l| l.reason);
@@ -4334,8 +4642,12 @@ pub fn fit_rule(facts: &FooterFacts, room: usize, lights: Option<LightsWidth>) -
         .map(|rung| (rung.as_slice(), TitleFit::None, chips));
     let recovery = ladder
         .iter()
-        .filter(|_| facts.account_progress_on_rule().is_some())
+        .filter(|_| has_recovery)
         .map(|rung| (rung.as_slice(), TitleFit::None, false));
+    // Recovery text without chips has priority. Only after no recovery form fits
+    // may controls alone take the room that an optional model would otherwise use.
+    let controls =
+        std::iter::once((&[][..], TitleFit::None, true)).filter(|_| has_recovery && chips);
     let last = if facts.subscription.is_some() {
         [(&[][..], true), (model.as_slice(), false)]
     } else {
@@ -4348,6 +4660,7 @@ pub fn fit_rule(facts: &FooterFacts, room: usize, lights: Option<LightsWidth>) -
         .chain(reasons)
         .chain(bare)
         .chain(recovery)
+        .chain(controls)
         .chain(last)
         .find(|&(segments, title, chips)| rule_width(segments, title, chips, lights) <= room)
         .unwrap_or((&[], TitleFit::None, false));
@@ -4362,10 +4675,12 @@ pub fn fit_rule(facts: &FooterFacts, room: usize, lights: Option<LightsWidth>) -
 #[must_use]
 pub fn chips_room(facts: &FooterFacts, room: usize) -> usize {
     let reserved = if let Some(progress) = facts.account_progress_on_rule() {
+        let mut minimum = progress.into_owned();
+        minimum.details.clear();
         rule_width(
             &[Segment::plain(
                 WALL_MARK,
-                account_progress_text(&progress, true),
+                account_progress_line(&minimum, true, false),
             )],
             TitleFit::None,
             false,

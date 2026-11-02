@@ -3052,12 +3052,38 @@ mod tests {
             None,
             "no clock, no time"
         );
+        // 2026-11-01 00:30 PDT (-7 h) finished at 2026-11-01 09:00 PST (-8 h) across fall-back.
+        let (pdt, pst, fall_back) = (-7 * 3600, -8 * 3600, 1_793_523_600_u64);
+        let zone = |t: u64| Some(if t < fall_back { pdt } else { pst });
+        let (pre_dst, post_dst) = (1_793_518_200_u64, 1_793_552_400_u64);
+        assert_eq!(
+            crate::message_reporters::moved_line_local(pre_dst, post_dst, &zone).as_deref(),
+            Some("moved at 12:30 AM"),
+            "00:30 PDT is still Sunday on the reader's local calendar"
+        );
+        assert_eq!(
+            moved_line(pre_dst, post_dst, Some(pst)).as_deref(),
+            Some("moved yesterday 11:30 PM"),
+            "NEGATIVE CONTROL: post-change offset shifts 00:30 PDT into Saturday"
+        );
+        let asked_dst =
+            crate::message_reporters::asked_again_words(pre_dst, pre_dst, 1, post_dst, &zone);
+        let asked_flat =
+            crate::message_reporters::asked_again_words(pre_dst, pre_dst, 1, post_dst, &|_| {
+                Some(pst)
+            });
+        assert!(asked_dst.contains("last asked 12:30 AM"), "{asked_dst}");
+        assert!(
+            asked_flat.contains("last asked yesterday 11:30 PM"),
+            "NEGATIVE CONTROL: {asked_flat}"
+        );
         let mut app = App::headless_for_test();
         let now = now_s();
+        let (moved_at, done_at) = (now - 7 * 86_400, now - 5);
         let done = Row {
             phase: Phase::Done,
-            done_at: now - 5,
-            moved_at: now - 7 * 86_400,
+            done_at,
+            moved_at,
             outcome: "claude restarted on 2.1.287 \u{b7} model claude-opus-5-5".to_string(),
             to: "2.1.287".to_string(),
             ..row("s-a", 8 * 86_400)
@@ -3066,7 +3092,11 @@ mod tests {
         let records = records_titled(&app, "moved onto");
         assert_eq!(records.len(), 1, "{records:?}");
         let detail = &records[0].1;
-        match crate::presence::local_offset_s() {
+        let known = crate::presence::local_offset_at(i64::try_from(moved_at).unwrap_or(i64::MAX))
+            .zip(crate::presence::local_offset_at(
+                i64::try_from(done_at).unwrap_or(i64::MAX),
+            ));
+        match known {
             Some(_) => assert!(detail[1].starts_with("moved "), "{detail:?}"),
             None => assert_eq!(detail.len(), 2, "{detail:?}"),
         }

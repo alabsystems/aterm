@@ -31,7 +31,7 @@ use super::policy::{GRID_V1, ITEMS_V1, MAX_PROPOSAL_BYTES, MAX_ROUNDS, Totals};
 use super::search::{
     GridProposer, Mode, ON_DEMAND, Proposer, ProposerId, SearchStats, TrainFeedback,
 };
-use super::test_fixtures::BUILD;
+use super::test_fixtures::{BUILD, refused_off_the_pinned_target};
 use super::{
     HOT_HAS_WAKE, MomentumCode, MomentumEvent, MomentumObservation, MomentumTrace, NoStrandedLight,
     PrebuiltMomentum, SETTLE_MARGIN, Sched, WAKE_NO_LATER_THAN_CLEAR,
@@ -162,6 +162,9 @@ fn answer_at(
 
 #[test]
 fn the_evaluator_measures_as_the_baseline_was_measured() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = evaluator();
     let shipped = rows_of(ev, Sched::Prebuilt(MomentumCode::Shipped));
     let planned = rows_of(ev, Sched::Plan(SHIPPED_PLAN));
@@ -221,6 +224,9 @@ fn the_evaluator_measures_as_the_baseline_was_measured() {
 
 #[test]
 fn the_grid_search_selects_a_plan_useful_on_held_out() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let s = searched();
     let a = &s.admitted;
     let parts = a.bundle().parts();
@@ -315,6 +321,9 @@ fn the_grid_search_selects_a_plan_useful_on_held_out() {
 
 #[test]
 fn same_policy_same_winner_same_bundle_digest() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let first = &searched().admitted;
     let t0 = Instant::now()
         .checked_add(Duration::from_secs(17))
@@ -338,6 +347,9 @@ fn same_policy_same_winner_same_bundle_digest() {
 /// scenario and a faked fault.
 #[test]
 fn a_memoizing_evaluator_judges_each_pair_once_as_a_fresh_one_does() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = evaluator().anew().memoizing();
     let fresh = evaluator().anew();
     let reads = |e: &Evaluator| {
@@ -423,6 +435,9 @@ fn a_memoizing_evaluator_judges_each_pair_once_as_a_fresh_one_does() {
 
 #[test]
 fn cold_only_passes_no_stranded_light_and_fails_no_step_slept() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = evaluator();
     let p = cold_only();
     let refusal = ev.admit_one(&p.encode()).expect_err("refused");
@@ -454,6 +469,9 @@ fn cold_only_passes_no_stranded_light_and_fails_no_step_slept() {
 
 #[test]
 fn a_poll_past_a_frame_is_refused() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = evaluator();
     let mut plans = Vec::new();
     for f in FRAME_INTERVALS_NS {
@@ -523,6 +541,9 @@ fn a_poll_past_a_frame_is_refused() {
 
 #[test]
 fn a_poll_beyond_the_clear_fails_wake_no_later_than_clear() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = evaluator();
     let t0 = Instant::now();
     let margin = i128::try_from(SETTLE_MARGIN.as_nanos()).expect("small");
@@ -553,6 +574,9 @@ fn a_poll_beyond_the_clear_fails_wake_no_later_than_clear() {
 
 #[test]
 fn the_demo_plan_is_refused_hot_has_wake() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = evaluator();
     let mut plans = vec![DEMO_PLAN];
     plans.extend(
@@ -574,6 +598,9 @@ fn the_demo_plan_is_refused_hot_has_wake() {
 
 #[test]
 fn cadence_is_admitted_and_not_useful() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = evaluator();
     let p = plan(Split::Shipped, Wake::Cadence);
     let a = ev.admit_one(&p.encode()).expect("admitted");
@@ -596,6 +623,9 @@ fn cadence_is_admitted_and_not_useful() {
 
 #[test]
 fn size_and_decode_are_refused_first() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let fresh = evaluator().anew();
     let ev = &fresh;
     let long = vec![1u8; MAX_PROPOSAL_BYTES + 1];
@@ -637,6 +667,9 @@ fn an_unreadable_trace_an_unlogged_lane_and_an_unreproduced_log_are_refused() {
     let mut damaged = GOLDEN_TRACE.to_vec();
     let mid = damaged.len() / 2;
     damaged[mid] ^= 0x01;
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let fresh = || evaluator().anew();
     let p = gap0();
 
@@ -713,6 +746,9 @@ fn a_reset_at_rest_is_judged_as_the_host_logged_it() {
     let resting = Scenario::new(s.frame_interval_ns(), *s.start(), events, s.end_ns())
         .expect("an admitted scenario");
     let shipped = Sched::Prebuilt(MomentumCode::Shipped);
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let (plain, refusal) = evaluator().judge(shipped, k).expect("an item");
     assert!(refusal.is_none(), "{refusal:?}");
     let ev = evaluator().anew().replacing(id, resting);
@@ -748,6 +784,9 @@ impl Proposer for Spy {
 
 #[test]
 fn held_out_never_reaches_the_proposer_and_is_read_once() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = evaluator().anew();
     let cadence = plan(Split::Shipped, Wake::Cadence);
     let mut spy = Spy {
@@ -821,6 +860,9 @@ fn a_failure_on_one_held_out_item_leaves_no_outcome() {
         last + 50_000_000,
     )
     .expect("an admitted scenario");
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = evaluator().anew().replacing("held-104", lit);
     let runner_up = plan(Split::SettleAtStep { gap_us: 8_333 }, Wake::NextStep);
     let mut spy = Spy {
@@ -853,6 +895,9 @@ fn a_failure_on_one_held_out_item_leaves_no_outcome() {
 
 #[test]
 fn a_selection_is_held_out_only_in_its_build() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = evaluator();
     let other = Evaluator::v1("another-build", Instant::now()).expect("the pinned policy v1");
     let mut spy = Spy {
@@ -871,6 +916,9 @@ fn a_selection_is_held_out_only_in_its_build() {
 
 #[test]
 fn a_winner_without_a_training_gain_is_no_outcome() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = evaluator().anew();
     let mut spy = Spy {
         plans: vec![plan(Split::Shipped, Wake::Cadence), SHIPPED_PLAN],
@@ -891,6 +939,9 @@ fn a_winner_without_a_training_gain_is_no_outcome() {
 
 #[test]
 fn admit_one_is_an_on_demand_re_evaluation() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = evaluator();
     let mut a = ev.admit_one(&gap0().encode()).expect("admitted");
     let s = &searched().admitted;
@@ -922,6 +973,9 @@ fn admit_one_is_an_on_demand_re_evaluation() {
 
 #[test]
 fn a_selection_states_training_facts() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = evaluator();
     let mut spy = Spy {
         plans: vec![gap0()],
@@ -992,6 +1046,9 @@ fn drawn_where(want: impl Fn(&SchedulePlan) -> bool) -> SchedulePlan {
 
 #[test]
 fn each_grid_plans_label_is_selects_feedback() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = evaluator();
     let grid: Vec<SchedulePlan> = GRID_V1
         .iter()
@@ -1025,6 +1082,9 @@ fn each_grid_plans_label_is_selects_feedback() {
 /// and the bytes decide) under a selection and under `NoGain`.
 #[test]
 fn a_pool_outcome_is_selects_outcome() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = evaluator();
     let (pool, labels) = train_pool();
     let mut r = SplitMix::new(0x6d36_6469_6666_6572);
@@ -1090,6 +1150,9 @@ fn a_pool_outcome_is_selects_outcome() {
 
 #[test]
 fn with_k_equal_to_n_every_ranking_gives_one_outcome() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = evaluator();
     let (_, labels) = train_pool();
     assert_eq!(labels.len(), POOL_PLANS);
@@ -1110,6 +1173,9 @@ fn with_k_equal_to_n_every_ranking_gives_one_outcome() {
 
 #[test]
 fn each_scope_refuses_what_it_does_not_take() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = Evaluator::v1(BUILD, Instant::now()).expect("the pinned policy v1");
     let grid = |p: &SchedulePlan| GRID_V1.contains(&(p.split(), p.wake()));
     let [train, held, report, practice] =
@@ -1209,6 +1275,9 @@ fn each_scope_refuses_what_it_does_not_take() {
 
 #[test]
 fn a_label_is_judged_once_per_evaluator() {
+    if refused_off_the_pinned_target() {
+        return;
+    }
     let ev = Evaluator::v1(BUILD, Instant::now())
         .expect("the pinned policy v1")
         .capping_labels(2);

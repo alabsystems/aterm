@@ -756,6 +756,9 @@ pub(crate) fn prepared_base_with(
         vm.sh(NO_CLT, STEP)?;
         println!("mac: the Command Line Tools removed (xcode-select -p fails)");
     }
+    // What the guest has not written out is lost when `tart stop` outlasts its graceful wait and
+    // cuts the power: a base's removal of the Command Line Tools came back in its clones.
+    vm.sh("/bin/sync", STEP)?;
     if !vm.promote(&base) && !local_vms(tart)?.lines().any(|n| n.trim() == base) {
         return Err(not_run(format!(
             "tart rename {} {base} did not take",
@@ -1014,6 +1017,11 @@ pub(crate) fn person_install(from: &str) -> String {
     )
 }
 
+/// How long a grant's write waits on the TCC database while another writer holds it (sqlite's
+/// busy timeout): tccd writes it in the first minutes after a boot, and a write that met its lock
+/// failed at once (`database is locked`, a person base's preparation, 2026-10-31).
+const TCC_BUSY_MS: u32 = 30_000;
+
 /// The code requirement a person base's grants name: the helper's identifier alone.
 fn person_requirement() -> String {
     format!("identifier \"{PERSON_ID}\"")
@@ -1029,7 +1037,7 @@ fn person_grant(helper: &str) -> String {
          echo '{requirement}' | csreq -r- -b /tmp/person.csreq; \
          hex=$(xxd -p /tmp/person.csreq | tr -d '\\n'); \
          for s in kTCCServiceAccessibility kTCCServicePostEvent; do \
-         sudo -n sqlite3 '/Library/Application Support/com.apple.TCC/TCC.db' \
+         sudo -n sqlite3 -cmd '.timeout {TCC_BUSY_MS}' '/Library/Application Support/com.apple.TCC/TCC.db' \
          \"INSERT OR REPLACE INTO access (service,client,client_type,auth_value,auth_reason,auth_version,csreq,flags) \
          VALUES ('$s','{PERSON_HELPER}',1,2,4,1,X'$hex',0);\"; done",
         install = person_install(&format!("{GUEST_SHARE}/{helper}")),
@@ -1042,7 +1050,7 @@ fn fda_grant() -> String {
         "set -e; a=$(readlink -f {GUEST_AGENT}); \
          codesign -d -r- \"$a\" 2>&1 | sed -n '{DESIGNATED}' | csreq -r- -b /tmp/agent.csreq; \
          hex=$(xxd -p /tmp/agent.csreq | tr -d '\\n'); \
-         sudo -n sqlite3 '/Library/Application Support/com.apple.TCC/TCC.db' \
+         sudo -n sqlite3 -cmd '.timeout {TCC_BUSY_MS}' '/Library/Application Support/com.apple.TCC/TCC.db' \
          \"INSERT OR REPLACE INTO access (service,client,client_type,auth_value,auth_reason,auth_version,csreq,flags) \
          VALUES ('kTCCServiceSystemPolicyAllFiles','$a',1,2,4,1,X'$hex',0);\""
     )

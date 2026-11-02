@@ -37,6 +37,7 @@ fn line() -> Procs {
         ppid,
         footprint: 0,
         written: 0,
+        cpu_ns: 0,
     };
     Procs::of(vec![
         p(300, 200),
@@ -75,6 +76,49 @@ fn a_held_covering_claim_covers_its_holders_line_and_nothing_else() {
     assert!(!covered(&elsewhere, 300), "another line's claim");
     assert!(covered_memory(100, &[&stage], None));
     assert!(!covered_memory(300, &[&stage], None), "no ancestry read");
+}
+
+/// CREDIT IS KINSHIP: a held covering claim that credits a process (what the build it was kept
+/// for left running, reparented to launchd: 500, and its child 510) covers that process's builds
+/// and its descendants', and a waiter under it is not held to it, as under the claim's holder.
+/// NEGATIVE CONTROL: the same claim uncredited covers neither and holds the waiter; a VM's claim
+/// (no `covers`) crediting the same covers nothing; and a credited claim that waits holds the
+/// waiter still.
+#[test]
+fn a_held_claim_covers_and_frees_what_it_credits() {
+    let p = |pid, ppid| Proc {
+        pid,
+        ppid,
+        footprint: 0,
+        written: 0,
+        cpu_ns: 0,
+    };
+    let procs = Procs::of(vec![
+        p(300, 200),
+        p(200, 100),
+        p(500, 1),
+        p(510, 500),
+        p(400, 1),
+    ]);
+    let mut kept = record(200, Need::new("targo test").mem(18 * GIB).covers(), true);
+    kept.credit = vec![500];
+    let covered = |r: &Record, pid| covered_memory(pid, &[r], Some(&procs));
+    assert!(covered(&kept, 510), "a credited process's child's build");
+    assert!(covered(&kept, 500), "the credited process's own");
+    assert!(covered(&kept, 300), "its holder's line still");
+    assert!(!covered(&kept, 400), "a process outside both");
+    let mut uncredited = kept.clone();
+    uncredited.credit.clear();
+    assert!(!covered(&uncredited, 510), "uncredited, nothing of 500's");
+    let mut vm = record(200, Need::new("lab vm boot").mem(8 * GIB), true);
+    vm.credit = vec![500];
+    assert!(!covered(&vm, 510), "a VM's claim covers nothing");
+    let held_to = |r: &Record| crate::admit::counted(vec![r], 510, Some(&procs)).len();
+    assert_eq!(held_to(&kept), 0, "a waiter under a credited process");
+    assert_eq!(held_to(&uncredited), 1, "uncredited, it waits on the claim");
+    let mut waiting = kept.clone();
+    waiting.held = None;
+    assert_eq!(held_to(&waiting), 1, "a waiting claim credits nothing");
 }
 
 /// A record says that it covers, and reads back so; one that does not ask says nothing.
@@ -138,6 +182,7 @@ fn the_cover_marker_reads_its_holders_claims_and_the_ledger_answers_without_it()
         ppid,
         footprint: 0,
         written: 0,
+        cpu_ns: 0,
     };
     let build = me.wrapping_add(7);
     m.set_procs(Some(Procs::of(vec![p(build, me), p(me, 1)])));
@@ -190,12 +235,14 @@ fn the_cover_marker_reads_its_holders_claims_alone() {
             ppid: me,
             footprint: 0,
             written: 0,
+            cpu_ns: 0,
         },
         Proc {
             pid: me,
             ppid: 1,
             footprint: 0,
             written: 0,
+            cpu_ns: 0,
         },
     ])));
     let claim = admit_with(
@@ -240,12 +287,14 @@ fn a_marker_names_one_claim_of_its_holder() {
             ppid: me,
             footprint: 0,
             written: 0,
+            cpu_ns: 0,
         },
         Proc {
             pid: me,
             ppid: 1,
             footprint: 0,
             written: 0,
+            cpu_ns: 0,
         },
     ])));
     let take = |what: &str| {
@@ -279,6 +328,10 @@ fn a_marker_names_one_claim_of_its_holder() {
     assert_eq!(by(None).as_deref(), Some("verify test compile"));
     assert_eq!(Record::marker_holder(&compiles), Some(me));
     assert_eq!(Record::marker_holder(&me.to_string()), None);
+    assert_eq!(Record::marker_holder("0000000000001-0-0"), None);
+    assert_eq!(Record::marker_holder("+1-42-0"), None);
+    assert_eq!(Record::marker_holder("0000000000001-+42-0"), None);
+    assert_eq!(Record::marker_holder("0000000000001-42-+0"), None);
     drop(compile);
 }
 

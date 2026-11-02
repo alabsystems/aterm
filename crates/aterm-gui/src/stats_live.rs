@@ -35,9 +35,11 @@
 //!
 //! The dial's needle keeps its own clock off the grid ([`crate::stats_needle`]): while it sweeps
 //! to a reading, a window whose motion animates draws a frame each time its tip has moved a whole
-//! device pixel, never sooner than the window's effect present interval, and none once it rests
-//! ([`LiveFacts::next_needle`], the loop's `stats_needle` deadline). Such a frame re-rasters only
-//! the dial ([`LiveLayer::Gauge`]) and is not counted against the grid's four a second.
+//! device pixel, never sooner than the window's deck frame interval, and none once it rests
+//! ([`LiveFacts::needle_due`]). The window's deck clock draws those frames on its display's
+//! vsyncs, each sampling the needle at the vsync it reaches (`stats_clock.rs`, the loop's
+//! `deck_clock` deadline). Such a frame re-rasters only the dial ([`LiveLayer::Gauge`]) and is
+//! not counted against the grid's four a second.
 //!
 //! The dial steams while the Mac strains (`crate::stats_steam`,
 //! `docs/DESIGN-stats-deck-owner-2026-10-26.md` §5): its wisps rise on the grid's own frames, the
@@ -62,7 +64,7 @@ pub(crate) const STALE_FLOOR: Duration = Duration::from_secs(2);
 /// The live edge's frame grid, laid from the moment each reading lands: every frame the edge
 /// asks for but the needle's falls on it, so a window presents at most four grid frames a second,
 /// whatever glides and beats (the cost bound of `docs/DESIGN-stats-deck-live-2026-10-24.md` §6;
-/// the needle's own is [`LiveFacts::next_needle`]'s).
+/// the needle's frames are the window's deck clock's, `App::deck_clock_deadline`).
 pub(crate) const FRAME: Duration = Duration::from_millis(250);
 
 /// The frames one beat draws after its reading lands; it rings for that many frames of the
@@ -552,7 +554,14 @@ impl LiveFacts {
     /// What the deck draws at `now` (`now_ms` on the wall clock): the live edge as it stood at
     /// the last frame of the grid, so it changes only on the grid, and the needle as it stood at
     /// its own last frame ([`Self::next_needle`]).
+    #[cfg(test)]
     pub(crate) fn live(&self, now: Instant, now_ms: i64) -> DeckLive {
+        self.live_at(now, now_ms, now)
+    }
+
+    /// [`Self::live`] with the needle sampled at `needle_at`: the vsync the window's deck clock
+    /// says this frame reaches the display at ([`crate::stats_clock::DeckClock::sample_at`]).
+    pub(crate) fn live_at(&self, now: Instant, now_ms: i64, needle_at: Instant) -> DeckLive {
         let grid = self.grid(now, now_ms);
         if !grid.fresh || !self.motion {
             return grid;
@@ -560,8 +569,25 @@ impl LiveFacts {
         DeckLive {
             needle: self
                 .needle
-                .zip(self.needle_at(now))
+                .zip(self.needle_at(needle_at))
                 .and_then(|((n, view), d)| d.frame.and_then(|f| n.drawn(view, f))),
+            ..grid
+        }
+    }
+
+    /// [`Self::live`] with the needle as this window last drew it: what only the grid changes,
+    /// since the deck clock asks the needle's frames (`service_stats_live`).
+    fn live_as_drawn(&self, now: Instant, now_ms: i64) -> DeckLive {
+        let grid = self.grid(now, now_ms);
+        if !grid.fresh || !self.motion {
+            return grid;
+        }
+        DeckLive {
+            needle: self.needle.zip(self.drawn).and_then(|((n, view), d)| {
+                d.frame
+                    .filter(|_| d.t0 == n.t0)
+                    .and_then(|f| n.drawn(view, f))
+            }),
             ..grid
         }
     }
@@ -634,8 +660,8 @@ impl LiveFacts {
 
     /// The first moment after `now` at which the grid's part of [`Self::live`] changes, or
     /// `None` when it never will without a new reading or a change of window: the grey's moment,
-    /// or the first frame of the grid that draws something new. The needle's frames are
-    /// [`Self::next_needle`]'s.
+    /// or the first frame of the grid that draws something new. The needle's frames are the
+    /// window's deck clock's (`App::deck_clock_deadline`, the `deck_clock` owner).
     pub(crate) fn next_change(&self, now: Instant, now_ms: i64) -> Option<Instant> {
         let landed = self.landed?;
         let stale = landed + self.stale_after;
@@ -665,9 +691,10 @@ impl LiveFacts {
 
     /// The needle's next frame after `now` ([`Needle::next_after`]): the first moment its tip
     /// stands a whole device pixel (or its soak a whole step) from where this window last drew
-    /// it, never sooner than the window's effect present interval after that frame; `None` once
+    /// it, never sooner than the window's needle interval after that frame; `None` once
     /// it rests on the reading, without motion, once readings stop (the grey draws it at rest),
     /// or for the rest of a sweep this window drew at rest ([`Self::needle_at`]).
+    #[cfg(test)]
     pub(crate) fn next_needle(&self, now: Instant) -> Option<Instant> {
         let stale = self.landed? + self.stale_after;
         if stale <= now || !self.motion {
@@ -678,6 +705,40 @@ impl LiveFacts {
             .filter(|&at| at < stale)
             .map(|at| at.max(now + Duration::from_millis(1)))
     }
+
+    /// When the deck clock owes this window its next needle frame, where the window's next
+    /// frame would sample the needle at `at` ([`crate::stats_clock::DeckClock::sample_at`]):
+    /// `at` itself where the needle stands there other than where the window last drew it
+    /// (a frame due and not yet drawn), else the first moment after that frame at which it
+    /// stands a whole step elsewhere ([`Needle::next_after`], the needle's law); `None` as for
+    /// [`Self::next_needle`].
+    pub(crate) fn needle_due(&self, at: Instant, now: Instant) -> Option<Instant> {
+        let stale = self.landed? + self.stale_after;
+        if stale <= now || !self.motion {
+            return None;
+        }
+        let (n, view) = self.needle?;
+        let d = self.needle_at(at)?;
+        if shows(Some(d)) != shows(self.drawn) {
+            return Some(at);
+        }
+        n.next_after(view, d.frame?).filter(|&t| t < stale)
+    }
+}
+
+/// What a frame that draws `d` shows of the needle, as the card's key reads it
+/// ([`DeckLive::needle`], [`Needle::drawn`]): its tip's angle and soak in the dial's own steps,
+/// `None` where it stands on the reading. Two frames that show the same lay the same card out,
+/// so the splice keeps what the first drew (`stats_deck_fp`'s memo): the deck clock asks a
+/// frame only for one that shows something else, or it would ask the same frame forever.
+pub(crate) fn shows(d: Option<Drawn>) -> Option<(i32, i32)> {
+    let d = d?;
+    d.frame.filter(|f| f.k != (0, 0)).map(|_| {
+        (
+            (d.at.0 * crate::stats_needle::ANGLE_PER_DEG).round() as i32,
+            (d.at.1 * crate::stats_needle::SOAK_PER_ONE).round() as i32,
+        )
+    })
 }
 
 /// The steam's clock at `at`, whole ms floored: one monotonic count for every window, from a
@@ -704,7 +765,7 @@ fn now_unix_ms() -> i64 {
 
 impl crate::App {
     /// What decides window `wid`'s live edge now, while it draws the v2 deck on screen.
-    fn live_facts(&self, wid: crate::WindowId) -> Option<LiveFacts> {
+    pub(crate) fn live_facts(&self, wid: crate::WindowId) -> Option<LiveFacts> {
         let ws = self.windows.get(&wid)?;
         if self.stats_bars_form() != crate::stats_deck::StatsBars::Deck
             || !crate::stats_deck::stats_drawn_on(ws)
@@ -718,8 +779,13 @@ impl crate::App {
             .cadence(lens)
             .map_or(crate::vitals_host::FOCUSED_PERIOD, |(period, _)| period);
         let effect = MotionEffect::DeckLive;
+        // A resting window's deck draws as an unfocused one's, and a woken one's until a reading
+        // lands after the wake ([`crate::window_rest::Rest::deck_moves`]).
         let motion = self
-            .effect_policy(effect, self.motion_focus(wid, ws.focused))
+            .effect_policy(
+                effect,
+                self.motion_focus(wid, ws.focused && ws.rest.deck_moves(self.vitals.landed_at)),
+            )
             .animate(effect);
         let alone = ws.lens_card.is_none()
             && ws.route_card.is_none()
@@ -748,7 +814,7 @@ impl crate::App {
             .map(|n| {
                 let view = View {
                     px_per_deg,
-                    interval: ws.effect_present_interval(),
+                    interval: self.deck_frame_interval(ws),
                 };
                 (n, view)
             });
@@ -776,17 +842,19 @@ impl crate::App {
     /// and what it draws of the needle ([`LiveFacts::needle_at`]), which the splice keeps as what
     /// the window drew: at rest on the reading where the deck draws no live edge (an occluded
     /// window's draws the reading), `None` with no needle or no dial.
+    ///
+    /// The needle is sampled where the window's deck clock says this frame reaches the display
+    /// ([`crate::stats_clock::DeckClock::sample_at`]), the grid at `now`.
     pub(crate) fn deck_live_now(&self, wid: crate::WindowId) -> (DeckLive, Option<Drawn>) {
         let now = Instant::now();
-        self.live_facts(wid).map_or_else(
-            || {
-                (
-                    DeckLive::STILL,
-                    self.vitals.needle.get().map(|n| n.rested()),
-                )
-            },
-            |facts| (facts.live(now, now_unix_ms()), facts.needle_at(now)),
-        )
+        let Some((facts, ws)) = self.live_facts(wid).zip(self.windows.get(&wid)) else {
+            return (
+                DeckLive::STILL,
+                self.vitals.needle.get().map(|n| n.rested()),
+            );
+        };
+        let at = ws.deck_clock.sample_at(now, self.deck_clock_period(ws));
+        (facts.live_at(now, now_unix_ms(), at), facts.needle_at(at))
     }
 
     /// The loop's deadline for the next change of any window's live edge on the grid.
@@ -798,21 +866,13 @@ impl crate::App {
             .min()
     }
 
-    /// The loop's deadline for any window's next needle frame ([`LiveFacts::next_needle`]), kept
-    /// apart from the grid's (`DeadlineOwner::StatsNeedle`).
-    pub(crate) fn stats_needle_deadline(&self, now: Instant) -> Option<Instant> {
-        self.windows
-            .keys()
-            .filter_map(|&wid| self.live_facts(wid)?.next_needle(now))
-            .min()
-    }
-
     /// Retargets the dial's needle at the snapshot just adopted at `now`
     /// ([`Needle::retarget`]), against the finest tip of the windows that animate a dial: with
     /// none it rests on the reading at once. Returns the frames the new episode owes those
-    /// windows ([`Needle::frames_owed`], each from what it last drew, on the shortest effect
-    /// interval its display gives it, so a lane that unparks mid-episode is owed its frames),
-    /// which `ctl metrics` counts (`needle_sweeps`, `needle_frames_owed`, `needle_episode_left`).
+    /// windows ([`Needle::frames_owed`], each from what it last drew, on the shortest deck frame
+    /// interval its clock gives it, [`crate::App::deck_frame_interval_fastest`], so a clock that
+    /// unparks mid-episode is owed its frames), which `ctl metrics` counts (`needle_sweeps`,
+    /// `needle_frames_owed`, `needle_episode_left`).
     pub(crate) fn retarget_needle(&self, now: Instant) -> u64 {
         let views: Vec<(View, Option<Drawn>)> = self
             .windows
@@ -820,7 +880,7 @@ impl crate::App {
             .filter_map(|(&wid, ws)| {
                 let facts = self.live_facts(wid).filter(|f| f.motion)?;
                 let view = View {
-                    interval: ws.effect_present_interval_fastest(),
+                    interval: self.deck_frame_interval_fastest(ws),
                     ..facts.needle?.1
                 };
                 Some((view, facts.drawn))
@@ -846,14 +906,15 @@ impl crate::App {
         owed
     }
 
-    /// Asks a frame of each window whose live edge no longer matches what its card last drew.
+    /// Asks a frame of each window whose live edge on the grid no longer matches what its card
+    /// last drew; the needle's frames are its deck clock's (`stats_clock.rs`).
     pub(crate) fn service_stats_live(&self, now: Instant) {
         let now_ms = now_unix_ms();
         for (&wid, ws) in &self.windows {
             let Some(facts) = self.live_facts(wid) else {
                 continue;
             };
-            if ws.deck_live_drawn.get() != Some(facts.live(now, now_ms).key())
+            if ws.deck_live_drawn.get() != Some(facts.live_as_drawn(now, now_ms).key())
                 && let Some(window) = ws.os_window.as_ref()
             {
                 window.request_redraw();
@@ -864,4 +925,4 @@ impl crate::App {
 
 #[cfg(test)]
 #[path = "stats_live_tests.rs"]
-mod tests;
+pub(crate) mod tests;

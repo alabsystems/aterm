@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE AMEND THAT RIDES ITS OPEN (fix unit H4, finding GATE3-7): an amend that writes what its
-//! node is lives and dies with the node's open, in a batch, a carry's cut and a journal snap.
+//! THE AMEND THAT RIDES ITS OPEN (fix unit H4, finding GATE3-7; a turn's, fix unit J0-2): an
+//! amend that writes what its node is (a run's program or model, a turn's `vref=` or `cont=`, a
+//! restored session's lineage) lives and dies with the node's open, in a batch, a carry's cut and
+//! a journal snap.
 
 use std::collections::BTreeSet;
 
@@ -477,4 +479,325 @@ fn a_restored_session_keeps_what_it_was_restored_from() {
         .find(|r| r.seq == restore)
         .expect("the restore amend crosses");
     assert_eq!(crossed.f.get_str(Key::Prev), Some("s-7a1b2c"));
+}
+
+/// A turn opened under `run`.
+fn open_turn(log: &mut Log, run: Node, ms: u64) -> Node {
+    log.open(
+        Open::new(Kind::Turn, Src::Screen, Conf::Strong).under(run),
+        at(ms),
+    )
+    .expect("a turn opens")
+}
+
+fn close_turn(log: &mut Log, turn: Node, ms: u64) {
+    log.close(
+        turn,
+        Close::new(Out::Turn(TurnOut::Done), Src::Screen, Conf::Strong),
+        at(ms),
+    )
+    .expect("the turn closes");
+}
+
+/// A turn's identity amend as `TurnTracker` writes it (fix unit J0-2): the transcript names the
+/// vendor turn (`vref=`, `amend_vref`) or the earlier turn this one continues (`cont=`,
+/// `ensure_turn_as`).
+fn name_turn(log: &mut Log, turn: Node, key: Key, id: &str, ms: u64) -> u64 {
+    let f = Fields::new().id(key, id).expect("an id");
+    log.amend(
+        turn,
+        Amend::new(Kind::Turn, Src::Transcript, Conf::Strong, f).by(Actor::Vendor),
+        at(ms),
+    )
+    .expect("the turn amends")
+}
+
+/// The id a turn's `key` names: a vendor message's (`vref=`, one width so every amend weighs the
+/// same), or the turn before it (`cont=`).
+fn turn_id(key: Key, before: Node, i: u64) -> String {
+    match key {
+        Key::Cont => before.to_string(),
+        _ => format!("msg-{i:06}"),
+    }
+}
+
+/// Whether `log` holds an amend of `node` that writes `key`.
+fn named(log: &Log, node: Node, key: Key) -> bool {
+    log.window()
+        .any(|r| r.node == node && r.op == Op::Amend && r.f.get(key).is_some())
+}
+
+/// The turns in `turns` of which `log` holds the open or the `key` amend but not both.
+fn unnamed_turns(log: &Log, turns: &[Node], key: Key) -> Vec<Node> {
+    turns
+        .iter()
+        .copied()
+        .filter(|&t| held(log, t, Op::Open) != named(log, t, key))
+        .collect()
+}
+
+/// A turn named by `key`, held open while its own usage amends flood the ring: at every step the
+/// ring holds its open and the amend that names it.
+fn an_open_turns_name_stays_with_its_open(key: Key) {
+    let mut log = Log::with_limits(1, Limits::new(64, 1 << 20).expect("a small ring"));
+    let run = agent_session(&mut log, 0);
+    let before = open_turn(&mut log, run, 1);
+    close_turn(&mut log, before, 2);
+    let open = open_turn(&mut log, run, 3);
+    name_turn(&mut log, open, key, &turn_id(key, before, 0), 4);
+    let mut ms = 10;
+    while log.lost() < 500 {
+        ms += 1;
+        let f = Fields::new().u(Key::TokIn, ms).expect("a count");
+        log.amend(
+            open,
+            Amend::new(Kind::Turn, Src::Transcript, Conf::Exact, f),
+            at(ms),
+        )
+        .expect("usage amends");
+        assert!(
+            held(&log, open, Op::Open) && named(&log, open, key),
+            "{key:?} at {ms}: an open turn keeps its open and the amend that names it"
+        );
+    }
+}
+
+/// Closed turns, each named by `key` and with a mark beneath it, until the ring evicts their
+/// opens: at every step each turn's open is held iff its identity amend is.
+fn a_closed_turns_name_goes_with_its_open(key: Key) {
+    let mut log = Log::with_limits(1, Limits::new(64, 1 << 20).expect("a small ring"));
+    let run = agent_session(&mut log, 0);
+    let mut prev = open_turn(&mut log, run, 1);
+    close_turn(&mut log, prev, 2);
+    let mut ms = 10;
+    let mut turns = Vec::new();
+    let (mut some, mut none) = (false, false);
+    for i in 0..400 {
+        ms += 10;
+        let t = open_turn(&mut log, run, ms);
+        name_turn(&mut log, t, key, &turn_id(key, prev, i), ms + 1);
+        bell(&mut log, ms + 2);
+        close_turn(&mut log, t, ms + 3);
+        turns.push(t);
+        prev = t;
+        assert_eq!(unnamed_turns(&log, &turns, key), [], "{key:?} at {ms}");
+        some |= turns.iter().any(|&t| held(&log, t, Op::Open));
+        none |= turns.iter().any(|&t| !held(&log, t, Op::Open));
+    }
+    assert!(
+        some && none,
+        "PRECONDITION: the ring evicted some closed turns' opens and kept others"
+    );
+}
+
+/// A log of 120 closed turns and an open one, each named by `key`: the log, the closed turns, the
+/// open turn and the seq of the amend that names it.
+fn named_turns(key: Key) -> (Log, Vec<Node>, Node, u64) {
+    let mut log = Log::new(1);
+    let run = agent_session(&mut log, 0);
+    let mut prev = open_turn(&mut log, run, 1);
+    close_turn(&mut log, prev, 2);
+    let mut ms = 10;
+    let mut turns = Vec::new();
+    for i in 0..120 {
+        ms += 10;
+        let t = open_turn(&mut log, run, ms);
+        name_turn(&mut log, t, key, &turn_id(key, prev, i), ms + 1);
+        bell(&mut log, ms + 2);
+        close_turn(&mut log, t, ms + 3);
+        turns.push(t);
+        prev = t;
+    }
+    let open = open_turn(&mut log, run, ms + 10);
+    let seq = name_turn(&mut log, open, key, &turn_id(key, prev, 999), ms + 11);
+    bell(&mut log, ms + 12);
+    (log, turns, open, seq)
+}
+
+/// A carry cut by its byte budget sheds a closed turn's identity amend with its open, never
+/// alone, and carries the open turn's with it.
+fn a_tight_carry_keeps_a_turns_name_with_its_open(key: Key) {
+    let (log, turns, open, seq) = named_turns(key);
+    let all = log.carry(CarryBudget::SESSION, &[]).expect("carried");
+    assert_eq!(all.shed, 0, "PRECONDITION: room for everything");
+    let (mut some, mut none) = (false, false);
+    for total in (all.skeleton_bytes..all.bytes).step_by(17) {
+        let tight = CarryBudget {
+            total,
+            ..CarryBudget::SESSION
+        };
+        let Some(cut) = log.carry(tight, &[]) else {
+            continue;
+        };
+        let (new, _, _) = Log::from_carry(&cut.lines, adopt(&log, 99_000)).expect("reads");
+        assert_eq!(
+            unnamed_turns(&new, &turns, key),
+            [],
+            "{key:?}: a cut at {total} bytes"
+        );
+        assert!(
+            new.is_open(open) && new.window().any(|r| r.seq == seq),
+            "{key:?}: a cut at {total} bytes carries the open turn with its name"
+        );
+        some |= turns.iter().any(|&t| held(&new, t, Op::Open));
+        none |= turns.iter().any(|&t| !held(&new, t, Op::Open));
+    }
+    assert!(
+        some && none,
+        "PRECONDITION: the cuts kept some closed turns and shed others"
+    );
+}
+
+/// A journal snap restates the open turn with the amend that names it, right after its open, and
+/// a reader that starts in the later segment holds it and names the turn as the writer's fold does.
+fn a_later_snap_restates_a_turn_with_its_name(key: Key) {
+    let (mut log, _, open, seq) = named_turns(key);
+    let restated: Vec<(Node, Op, u64)> = log
+        .open_path_records()
+        .iter()
+        .map(|r| (r.node, r.op, r.seq))
+        .collect();
+    let at_open = restated
+        .iter()
+        .position(|&(n, op, _)| n == open && op == Op::Open)
+        .expect("the snap restates the open turn");
+    assert_eq!(
+        restated.get(at_open + 1).map(|&(.., s)| s),
+        Some(seq),
+        "{key:?}: the amend that names the turn follows its open: {restated:?}"
+    );
+    let mut w = Writer::new("p1-a1", 0);
+    w.pass(&log, 512);
+    w.rotate();
+    for i in 0..5 {
+        bell(&mut log, 5_000 + i);
+    }
+    w.pass(&log, 512);
+    let mut chain = w.read(Liveness::Live);
+    chain.segments.remove(0);
+    let v = view(std::slice::from_ref(&chain));
+    assert!(v.log.is_open(open), "the restated turn is open");
+    assert!(
+        v.log.window().any(|r| r.seq == seq),
+        "{key:?}: a reader of the later segment holds the amend that names the turn"
+    );
+    assert_eq!(
+        v.log.state().turn().and_then(|t| t.f.str(key)),
+        log.state().turn().and_then(|t| t.f.str(key)),
+        "{key:?}: the reader's fold names the turn as the writer's does"
+    );
+}
+
+/// A turn's `vref=` rides its open (fix unit J0-2): an open turn pins it while detail under the
+/// turn floods the ring.
+#[test]
+fn an_open_turns_vref_stays_with_its_open() {
+    an_open_turns_name_stays_with_its_open(Key::Vref);
+}
+
+/// A closed turn's `vref=` goes with its open: at every step of a flood of closed turns, the ring
+/// holds a turn's open iff it holds the amend that names its vendor turn.
+#[test]
+fn a_closed_turns_vref_goes_with_its_open() {
+    a_closed_turns_name_goes_with_its_open(Key::Vref);
+}
+
+/// A tight carry sheds a closed turn's `vref=` only with its open, and carries the open turn's.
+#[test]
+fn a_tight_carry_keeps_a_turns_vref_with_its_open() {
+    a_tight_carry_keeps_a_turns_name_with_its_open(Key::Vref);
+}
+
+/// A later journal snap restates an open turn with its `vref=`.
+#[test]
+fn a_later_snap_restates_a_turn_with_its_vref() {
+    a_later_snap_restates_a_turn_with_its_name(Key::Vref);
+}
+
+/// A turn's `cont=` (the earlier turn it continues) rides its open as `vref=` does: an open turn
+/// pins it.
+#[test]
+fn an_open_turns_cont_stays_with_its_open() {
+    an_open_turns_name_stays_with_its_open(Key::Cont);
+}
+
+/// A closed turn's `cont=` goes with its open through a flood of closed turns.
+#[test]
+fn a_closed_turns_cont_goes_with_its_open() {
+    a_closed_turns_name_goes_with_its_open(Key::Cont);
+}
+
+/// A tight carry sheds a closed turn's `cont=` only with its open, and carries the open turn's.
+#[test]
+fn a_tight_carry_keeps_a_turns_cont_with_its_open() {
+    a_tight_carry_keeps_a_turns_name_with_its_open(Key::Cont);
+}
+
+/// A later journal snap restates an open turn with its `cont=`.
+#[test]
+fn a_later_snap_restates_a_turn_with_its_cont() {
+    a_later_snap_restates_a_turn_with_its_name(Key::Cont);
+}
+
+/// THE BOUND: a turn named more than once at one confidence (the late-match path can name a
+/// closed turn again) has one rider per identity key, the amend the fold keeps (the newest): it
+/// pins no more than one while the turn is open, rides the closed turn's open after, and every
+/// older one is detail, evicted before the open and its rider.
+#[test]
+fn a_turn_named_twice_pins_only_the_amend_the_fold_keeps() {
+    let mut log = Log::with_limits(1, Limits::new(64, 1 << 20).expect("a small ring"));
+    let run = agent_session(&mut log, 0);
+    let t = open_turn(&mut log, run, 10);
+    let bare = log.pinned_bytes();
+    let first = name_turn(&mut log, t, Key::Vref, "msg-000001", 11);
+    let one = log.pinned_bytes() - bare;
+    assert!(one > 0, "PRECONDITION: the first name rides the open turn");
+    let second = name_turn(&mut log, t, Key::Vref, "msg-000002", 12);
+    assert_eq!(
+        log.pinned_bytes(),
+        bare + one,
+        "an open turn named twice pins one rider"
+    );
+    let class = |log: &Log, seq: u64| log.window().find(|r| r.seq == seq).map(|r| log.class_of(r));
+    assert_eq!(class(&log, first), Some(EvictClass::OpenDetail));
+    assert_eq!(class(&log, second), Some(EvictClass::Pinned));
+    close_turn(&mut log, t, 13);
+    let third = name_turn(&mut log, t, Key::Vref, "msg-000003", 14);
+    let kept = name_turn(&mut log, t, Key::Vref, "msg-000004", 15);
+    assert_eq!(
+        log.state().last[1]
+            .as_ref()
+            .and_then(|c| c.f.str(Key::Vref)),
+        Some("msg-000004"),
+        "PRECONDITION: the fold keeps the newest name"
+    );
+    assert_eq!(class(&log, kept), Some(EvictClass::ClosedOpen));
+    for older in [first, second, third] {
+        assert_eq!(
+            class(&log, older),
+            Some(EvictClass::ClosedDetail),
+            "the name at {older} is detail"
+        );
+    }
+    let mut ms = 20;
+    let mut detail_went_first = false;
+    while held(&log, t, Op::Open) {
+        ms += 10;
+        let u = open_turn(&mut log, run, ms);
+        bell(&mut log, ms + 1);
+        close_turn(&mut log, u, ms + 2);
+        let holds = |seq: u64| log.window().any(|r| r.seq == seq);
+        assert_eq!(
+            held(&log, t, Op::Open),
+            holds(kept),
+            "at {ms}: the open and the name the fold keeps go together"
+        );
+        detail_went_first |=
+            held(&log, t, Op::Open) && ![first, second, third].iter().any(|&s| holds(s));
+        assert!(ms < 1_000_000, "the flood never evicted the turn's open");
+    }
+    assert!(
+        detail_went_first,
+        "the older names went as detail while the open and its rider stayed"
+    );
 }

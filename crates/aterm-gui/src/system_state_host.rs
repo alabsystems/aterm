@@ -8,7 +8,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
 use aterm_secrets::SecretBytes;
-use aterm_types::macos_setup::{Access, Plan, Selection};
+use aterm_types::macos_setup::{Access, Plan, Selection, Setting};
 
 use crate::native_app::{AppKind, NativeApp};
 use crate::system_state::{
@@ -56,14 +56,30 @@ pub struct InitialSetupHandlers {
     /// stops still being admitted, the Stop's save), so a quit right after a
     /// Stop never resumes the run (design §3.3). At once when nothing is owed.
     pub settle: fn(),
+    /// `true`: the app is quitting, or an update's Commit is about to be written, so the
+    /// setup stages running now are cut off by no crash, and the next launch resumes them
+    /// without counting toward a park. `false`: that Commit was not written, or returned, so
+    /// the handoff did not go and the notes are taken back: aterm stopping in one of those
+    /// stages later counts again (design §6.5). A handoff notes only right before its write,
+    /// never at its start, which a refusal may still follow.
+    pub cut_off: fn(bool),
     /// Turn On Sync on the Secrets vault row: a worker reinstalls this Mac's
     /// subscriber, removes the record of the person's opt-out and reads the
     /// row again (design §3.3). Returns whether that worker started.
     pub sync_on: fn() -> bool,
+    /// The Command Line Tools tab said Apple's Command Line Tools are installed (design §3.3):
+    /// read the GitHub repositories row again at once and wake the run waiting on them, so the
+    /// page moves on without waiting for its next look.
+    pub tools_installed: fn(),
     /// The window verified its own Full Disk Access grant without durable
     /// access history. Refresh observations and finish any
     /// previously owed preference work on a worker, without admitting prompts.
     pub fda_granted: fn(),
+    /// The Secrets vault row's Join under its phrase field: on a worker, ALab lets this Mac in
+    /// with the phrase a member shows once its person pressed Allow, as `aterm members join
+    /// <phrase>` does (`docs/DESIGN-fluid-swarm-2026-10-28.md` §3.6 step 5); the receipt says
+    /// whether it did, and the Secrets row is read again. Returns whether the worker started.
+    pub join_phrase: fn(SecretBytes, PhraseJoinReceipt) -> bool,
 }
 
 #[cfg(test)]
@@ -78,9 +94,67 @@ impl InitialSetupHandlers {
             look_for_token: |_| false,
             stop: || {},
             settle: || {},
+            cut_off: |_| {},
             sync_on: || false,
+            tools_installed: || {},
             fda_granted: || {},
+            join_phrase: |_, _| false,
         }
+    }
+}
+
+/// What a phrase typed on the Secrets vault row came to ([`PhraseJoinReceipt`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PhraseOutcome {
+    /// It let this Mac in.
+    Joined,
+    /// It reached a member and let nobody in, or it is not three of the list's words: spent, so
+    /// the member's person presses Allow again for a new one.
+    Refused,
+    /// It reached no member: no ALab Mac answered on this network, so nothing was asked of it
+    /// and the same words go again.
+    NotReached,
+    /// The try stopped before it said what the phrase came to (its worker ended): it may not
+    /// have sent the phrase, so the words stay and Join tries again.
+    Stopped,
+}
+
+/// What the worker of a phrase typed on the Secrets vault row says of it
+/// ([`InitialSetupHandlers::join_phrase`]): what it came to ([`PhraseOutcome`]). Dropped unsaid,
+/// the try stopped ([`PhraseOutcome::Stopped`]).
+#[must_use = "say what the phrase came to; dropping says the try stopped"]
+#[derive(Debug)]
+pub struct PhraseJoinReceipt {
+    answer: Option<Sender<PhraseOutcome>>,
+}
+
+impl PhraseJoinReceipt {
+    fn new() -> (Self, Receiver<PhraseOutcome>) {
+        let (answer, receiver) = mpsc::channel();
+        (
+            Self {
+                answer: Some(answer),
+            },
+            receiver,
+        )
+    }
+
+    /// The join with the phrase ended with `outcome`.
+    pub fn finished(mut self, outcome: PhraseOutcome) {
+        self.finish(outcome);
+    }
+
+    fn finish(&mut self, outcome: PhraseOutcome) {
+        if let Some(answer) = self.answer.take() {
+            let _ = answer.send(outcome);
+            crate::workstation_setup::send_setup_wake(Wake::InitialSetupPhraseJoined);
+        }
+    }
+}
+
+impl Drop for PhraseJoinReceipt {
+    fn drop(&mut self) {
+        self.finish(PhraseOutcome::Stopped);
     }
 }
 
@@ -229,6 +303,75 @@ const CHANGING_READS: u8 = 10;
 /// whenever its window regains focus (§3.6).
 pub(crate) const TOKEN_LOOK: Duration = Duration::from_secs(60);
 
+/// How recently a keyboard, mouse or trackpad must have been used for a person stage to start
+/// ([`App::person_at_this_screen`]): a person who just opened aterm has.
+pub(crate) const PERSON_PRESENT_WITHIN: Duration = Duration::from_secs(60);
+
+/// How often a page in front whose sign-outs are parked for want of a person reads presence
+/// again with nothing else to wake it ([`Host::presence_look`]), so a person who comes back,
+/// with input anywhere, wakes the parked sign-outs within this.
+pub(crate) const PRESENCE_LOOK: Duration = Duration::from_secs(1);
+
+/// How the window reads whether a person is at this Mac: macOS's idle time where it gives one,
+/// else the last key, click or scroll in an aterm window ([`App::person_present_within`]).
+#[derive(Clone, Copy)]
+pub(crate) struct Presence {
+    pub(crate) input_recent: fn(Duration) -> bool,
+    pub(crate) input_readable: fn() -> bool,
+    pub(crate) last_input: Option<Instant>,
+}
+
+impl Presence {
+    /// Whether a person touched this Mac within `within` of `now`.
+    pub(crate) fn within(self, within: Duration, now: Instant) -> bool {
+        if (self.input_readable)() {
+            (self.input_recent)(within)
+        } else {
+            self.last_input
+                .is_some_and(|at| now.saturating_duration_since(at) < within)
+        }
+    }
+}
+
+/// The window's [`Presence`], as it last published System State's frontness
+/// ([`App::publish_system_state_front`]), which the setup worker reads presence through when it
+/// uses its `on_screen` port ([`system_state_on_screen`]).
+static PRESENCE: Mutex<Option<Presence>> = Mutex::new(None);
+
+/// The window's [`Presence`] as it last published it ([`App::publish_system_state_front`]), in a
+/// process with a window: the reader [`crate::person_at_this_screen`] uses there.
+pub(crate) fn published_presence() -> Option<Presence> {
+    *PRESENCE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Whether a person touched this Mac within [`PERSON_PRESENT_WITHIN`] of `now` (pure but for its
+/// readers): by `published`, the window's reader with its fallback to aterm's own last input,
+/// where this process has a window; else by `os`, macOS's idle time alone.
+pub(crate) fn person_touched(
+    published: Option<Presence>,
+    os: impl FnOnce() -> bool,
+    now: Instant,
+) -> bool {
+    published.map_or_else(os, |presence| presence.within(PERSON_PRESENT_WITHIN, now))
+}
+
+/// The setup worker's `on_screen` port, which starts the Messages and FaceTime sign-outs, a
+/// person stage (init-on-by-default design §6.4): System State in front with a person at this
+/// Mac as the window last published it ([`aterm_types::macos_setup::system_state_front`], on
+/// its events and page ticks, the screen's lock included), and a person here now, read as the
+/// worker asks: a page with nothing running owes the window no tick, so a person who walked
+/// away from it since its last publication never opens the sign-outs.
+#[must_use]
+pub fn system_state_on_screen() -> bool {
+    aterm_types::macos_setup::system_state_front()
+        && PRESENCE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some_and(|presence| presence.within(PERSON_PRESENT_WITHIN, Instant::now()))
+}
+
 /// How a request to read the shown page's rows went.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Observe {
@@ -244,6 +387,9 @@ enum Observe {
 pub(crate) struct Host {
     pending: Option<Request>,
     pending_apply: Option<PendingApply>,
+    /// The try of the phrase typed on the Secrets vault row whose join runs, and its answer
+    /// ([`PhraseJoinReceipt`]), while it runs.
+    phrase_join: Option<(crate::system_state::PhraseTry, Receiver<PhraseOutcome>)>,
     /// An accepted plan's run has not shown up in a fresh status yet: the
     /// page stays busy meanwhile.
     awaiting_run: bool,
@@ -255,6 +401,10 @@ pub(crate) struct Host {
     operation: Option<SetupOperation>,
     next_status: Option<Instant>,
     status_in_flight: bool,
+    /// The window has shown a status (the worker's, or a scenario's): until then a page that is
+    /// open asks for one read, which nothing else may bring (a launch whose worker says
+    /// nothing, a page opened by hand), so it never stays at `Checking this Mac…`.
+    status_shown: bool,
     /// The one thread that reads the worker's status, one read for each poll sent it
     /// ([`Host::send_status_poll`]): started at the first poll, and let go once setup has
     /// nothing left to say ([`App::publish_system_state`]).
@@ -262,14 +412,14 @@ pub(crate) struct Host {
     /// Reads in a row that met a write of the saved setup ([`SetupStatus::changing`]).
     changing_reads: u8,
     next_tick: Option<Instant>,
+    /// When a page in front whose sign-outs are parked for want of a person reads presence again
+    /// ([`PRESENCE_LOOK`]): its return wakes them ([`App::publish_system_state_front`]).
+    presence_look: Option<Instant>,
     generation: u64,
-    /// A review was shown in this process: a later one (an offer no window could show the first
-    /// time, or the review of the groups the ALab signal adds) opens its tab behind the person's
-    /// and waits there, never taking the tab they are in (design §6).
+    /// An offer was shown in this process: a later one (an offer no window could show the first
+    /// time, or one whose page closed before it answered) opens its tab behind the person's,
+    /// where the page answers it, never taking the tab they are in (design §6).
     review_shown: bool,
-    /// The launch review closed or was cancelled before the worker's status caught up.
-    /// Its unadmitted rows stay calm until durable status says the review has given way.
-    closed_launch_review: bool,
     /// A System State view was visible at the last tick: showing it again
     /// asks for a fresh observation (§3.5).
     shown: bool,
@@ -289,21 +439,101 @@ pub(crate) struct Host {
     latest_status: SetupStatus,
     /// The access step last published with the status.
     access_step: Option<Access>,
+    /// The permission walk's page last published with the status (the card's `Step 1 of 3`).
+    walk_page: Option<crate::system_state::WalkPage>,
+    /// Since when the vault's join has asked the Macs in ALab to let this Mac in, while it asks:
+    /// the page says it in the card only once it has asked for
+    /// [`crate::system_state::JOIN_QUIET`] (lead decision 6 of the setup screen).
+    asking_since: Option<Instant>,
+    /// What the status last published said of that asking ([`SetupStatus::asking_long`]).
+    asking_long: bool,
+    /// Where the moment the join began asking is kept across launches (wall-clock
+    /// milliseconds), so a relaunch never starts the join's quiet again: `None` keeps it in
+    /// this process alone (tests, a headless instance).
+    asking_record: Option<std::path::PathBuf>,
+    /// When the page next does something by itself (a run, or a Check, it starts after its
+    /// wait: `SystemStateApp::next_by_itself`), which wakes the loop then.
+    page_due: Option<Instant>,
+    /// When the setup run going now started, while one goes.
+    run_started: Option<Instant>,
+    /// How long the last setup run took to finish ([`SetupStatus::ready_in`]).
+    ready_in: Option<Duration>,
     /// The dev scenario shown in place of the worker, read once.
     #[cfg(any(debug_assertions, feature = "dev-seams"))]
     fixture: Option<SetupStatus>,
     #[cfg(any(debug_assertions, feature = "dev-seams"))]
     fixture_read: bool,
-    /// The first launch's review the dev scenario shows, until the page takes it.
+    /// The line the dev scenario's views open (`<scenario>@<line>`).
     #[cfg(any(debug_assertions, feature = "dev-seams"))]
-    fixture_review: Option<crate::system_state::FixtureReview>,
+    fixture_line: Option<crate::system_state::lines::Line>,
 }
+
+/// The file, in this login's state folder, that keeps when the vault's join began asking the
+/// Macs in ALab ([`Host::asking_record`]).
+const JOIN_ASKING_RECORD: &str = "system-state-join-asking";
 
 /// One read the status reader is asked for: the status handler in force, and the generation its
 /// answer carries ([`Host::send_status_poll`]).
 type StatusPoll = (fn() -> SetupStatus, u64);
 
 impl Host {
+    /// The window's own host: the join's asking start kept in this login's state folder.
+    pub(crate) fn for_launch(headless: bool) -> Self {
+        Self {
+            asking_record: if headless || cfg!(test) {
+                None
+            } else {
+                aterm_types::dirs::state_dir().map(|dir| dir.join(JOIN_ASKING_RECORD))
+            },
+            ..Self::default()
+        }
+    }
+
+    /// The status generation a read must carry to land (tests outside this module).
+    #[cfg(test)]
+    pub(crate) const fn status_generation_for_test(&self) -> u64 {
+        self.generation
+    }
+
+    /// Whether the run's Accounts stage, a person stage, is parked for want of a person: the
+    /// plan in force manages a Messages or FaceTime sign-out whose row does not read settled, its
+    /// run has not finished, and the stage's last pass said it waits for a person at this Mac
+    /// ([`aterm_types::macos_setup::StageRow::WAITS_FOR_A_PERSON`]). Only then does a page in
+    /// front read presence again by itself ([`Self::presence_look`]): a sign-out waiting for
+    /// Check again, one that failed, or one waiting for Accessibility changes nothing on a
+    /// person's return, so it owes the page no look and no timer wake (§5.6's idle budget).
+    fn sign_outs_wait_for_a_person(&self) -> bool {
+        let status = &self.latest_status;
+        !status.finished
+            && status.rows.iter().any(|row| {
+                row.detail
+                    .ends_with(aterm_types::macos_setup::StageRow::WAITS_FOR_A_PERSON)
+            })
+            && status.plan.as_ref().is_some_and(|plan| {
+                aterm_types::macos_setup::Group::Accounts
+                    .settings()
+                    .iter()
+                    .any(|setting| {
+                        plan.selection.contains(*setting)
+                            && !status.observed.iter().any(|observation| {
+                                observation.subject
+                                    == aterm_types::macos_setup::Subject::Setting(*setting)
+                                    && observation.standing.settled()
+                            })
+                    })
+            })
+    }
+
+    /// The next observation retry or shown-page token look: a real reading timer, which the
+    /// page's refresh clock must not postpone once it is due.
+    fn read_timer(&self) -> Option<Instant> {
+        let token_look = self
+            .token_looked_at
+            .filter(|_| self.shown && self.latest_status.github_needs_person())
+            .map(|at| at + TOKEN_LOOK);
+        self.observe_retry.into_iter().chain(token_look).min()
+    }
+
     /// Ask the status reader for one read of `status` (the handlers in force when the poll is
     /// sent), answered with `generation`, starting the reader if none runs (or the last one
     /// ended). `false` when no reader could take it.
@@ -340,28 +570,115 @@ impl Host {
     }
 
     /// The wake [`App::tick_system_state`] serves: the next status poll (unless one
-    /// is in flight — its reply wakes the loop itself), and, only while a run's
-    /// village walks on a shown page
+    /// is in flight — its reply wakes the loop itself), and, only while a run goes on a
+    /// shown page, whose lockup moves with it
     /// ([`crate::system_state::page_owes_animation_wake`]), the next animation tick.
     /// A settled, finished or hidden page owes no sub-second tick wake (§5.6): its
-    /// re-reads, offer answers and retries ride the worker's publications (each
-    /// requests a redraw, which wakes the loop) and the one-second status poll. The
-    /// `next_tick` the page keeps is still its walk clock; folding it here only while
-    /// the walk runs is what holds the idle wake at zero. `hands_off_keys` (the
-    /// caller's app-wide typing hold) also withholds the tick while a key was typed
-    /// within the 2.5 s gap, so the walk never wakes the loop over the input path.
+    /// re-reads and offer answers ride the worker's publications (each requests a
+    /// redraw, which wakes the loop) and a focus, file or network event, and the status
+    /// poll runs only while a page shows something moving ([`App::system_state_polls`]).
+    /// The `next_tick` the page keeps is still its walk clock; folding it here only while
+    /// the walk runs is what holds the idle wake at zero. A true timer wakes once, at its
+    /// due time: a refused reading's retry, a shown page's look for a renewed GitHub
+    /// token ([`TOKEN_LOOK`]), and, on a shown page, the moment a join's own asking turns
+    /// into the card's Allow ([`crate::system_state::JOIN_QUIET`]). `hands_off_keys` (the caller's app-wide typing hold) also
+    /// withholds the tick while a key was typed within the 2.5 s gap, so the walk never
+    /// wakes the loop over the input path.
     pub(crate) fn deadline(&self, now: Instant, hands_off_keys: bool) -> Option<Instant> {
         let walks = crate::system_state::page_owes_animation_wake(
             self.latest_status.running(),
             self.shown,
             hands_off_keys,
         );
+        // The join's own asking turns into the card's Allow once it has asked long enough: one
+        // wake, at that moment, shown page or not, so the menu line and the tab say it then too.
+        let asking_long = self
+            .asking_since
+            .filter(|_| !self.asking_long)
+            .map(|since| since + crate::system_state::JOIN_QUIET);
         self.next_status
             .filter(|_| !self.status_in_flight)
             .into_iter()
             .chain(self.next_tick.filter(|_| walks))
+            .chain(self.presence_look)
+            .chain(self.read_timer())
+            .chain(asking_long)
+            .chain(self.page_due)
             .min()
             .map(|next| next.max(now))
+    }
+
+    /// Follow the worker's status for what the window says of it ([`SetupStatus::asking_long`],
+    /// [`SetupStatus::ready_in`]): since when the vault's join asks the Macs in ALab, and when
+    /// the run going now started and how long the last one took.
+    fn track(&mut self, status: &SetupStatus, now: Instant) {
+        let asking = status.observed.iter().any(|row| {
+            row.subject == aterm_types::macos_setup::Subject::Setting(Setting::Secrets)
+                && row.now.as_deref() == Some(aterm_types::macos_setup::VAULT_ASKING)
+        });
+        let since = asking.then(|| {
+            self.asking_since
+                .unwrap_or_else(|| self.asked_before(now).unwrap_or(now))
+        });
+        if since.is_some() != self.asking_since.is_some() {
+            self.keep_asking_since(since, now);
+        }
+        self.asking_since = since;
+        let run = status.busy && self.operation.is_none() && !status.queued;
+        match self.run_started {
+            None if run => {
+                self.run_started = Some(now);
+                self.ready_in = None;
+            }
+            Some(started) if !status.busy => {
+                self.run_started = None;
+                self.ready_in = status
+                    .finished
+                    .then(|| now.saturating_duration_since(started));
+            }
+            _ => {}
+        }
+    }
+
+    /// When an earlier launch saw the join begin asking, from [`Self::asking_record`], as an
+    /// instant of this process: `None` with no record, or one an hour old or more (that join is
+    /// long over, so this asking is a new one).
+    fn asked_before(&self, now: Instant) -> Option<Instant> {
+        let path = self.asking_record.as_ref()?;
+        let then: u64 = std::fs::read_to_string(path).ok()?.trim().parse().ok()?;
+        let ago = Duration::from_millis(aterm_time::unix_millis()?.checked_sub(then)?);
+        (ago < Duration::from_secs(60 * 60)).then(|| now.checked_sub(ago).unwrap_or(now))
+    }
+
+    /// Keep (or, once the join stops asking, forget) when the join began asking.
+    fn keep_asking_since(&self, since: Option<Instant>, now: Instant) {
+        let Some(path) = &self.asking_record else {
+            return;
+        };
+        match since {
+            Some(since) => {
+                let ago = now.saturating_duration_since(since);
+                let Some(then) = aterm_time::unix_millis().map(|ms| {
+                    ms.saturating_sub(u64::try_from(ago.as_millis()).unwrap_or(u64::MAX))
+                }) else {
+                    return;
+                };
+                // A record lost to a crash only starts the quiet again: no flush is owed.
+                if let Err(error) = std::fs::write(path, then.to_string()) {
+                    aterm_log::info!("system state: the join's asking start was not kept: {error}");
+                }
+            }
+            None => {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    /// Whether the join has asked the Macs in ALab long enough at `now` for the card's Allow.
+    fn asking_long_at(&self, now: Instant) -> bool {
+        self.asking_since.is_some_and(|since| {
+            now.saturating_duration_since(since) >= crate::system_state::JOIN_QUIET
+        })
     }
 
     /// The dev scenario, when the seam names one (debug and dev-seam builds).
@@ -369,17 +686,15 @@ impl Host {
     fn fixture(&mut self) -> Option<&SetupStatus> {
         if !self.fixture_read {
             self.fixture_read = true;
-            let mut review = None;
             self.fixture = aterm_types::dev_seam!(FIXTURE_SEAM).and_then(|name| {
                 let name = name.to_str()?.to_owned();
                 let status = crate::system_state::fixture_status(&name);
                 if status.is_none() {
                     aterm_log::warn!("{FIXTURE_SEAM}={name} names no System State scenario");
                 }
-                review = crate::system_state::fixture_review(&name);
+                self.fixture_line = crate::system_state::fixture_line(&name);
                 status
             });
-            self.fixture_review = review;
         }
         self.fixture.as_ref()
     }
@@ -388,6 +703,20 @@ impl Host {
     #[cfg(not(any(debug_assertions, feature = "dev-seams")))]
     fn fixture(&mut self) -> Option<&SetupStatus> {
         None
+    }
+
+    /// The line a new view of the dev scenario opens (`<scenario>@<line>`), so a lab capture
+    /// sees its rows; `None` for every other page.
+    pub(crate) fn fixture_line(&mut self) -> Option<crate::system_state::lines::Line> {
+        #[cfg(any(debug_assertions, feature = "dev-seams"))]
+        {
+            self.fixture()?;
+            self.fixture_line
+        }
+        #[cfg(not(any(debug_assertions, feature = "dev-seams")))]
+        {
+            None
+        }
     }
 
     /// Whether a dev scenario stands in for the worker (its actions inert).
@@ -405,7 +734,7 @@ impl Host {
 
 impl App {
     /// The binary's handlers ([`set_initial_setup_handlers`]), or a test's own.
-    fn system_state_handlers(&self) -> Option<InitialSetupHandlers> {
+    pub(crate) fn system_state_handlers(&self) -> Option<InitialSetupHandlers> {
         #[cfg(test)]
         if let Some(handlers) = self.system_state_host.handlers {
             return Some(handlers);
@@ -435,10 +764,9 @@ impl App {
         self.finish_system_state_shutdown_with(handlers);
     }
 
-    /// First-launch admission still waits: its headline is the page's one signal,
-    /// so the menu line and tab's diamond stay quiet (§3.3, §3.6). Wider scope
-    /// leaves the plan already in force reporting its existing needs (§3.5).
-    pub(crate) fn system_state_review_pending(&self) -> bool {
+    /// The launch's offer still waits for the page's answer at its first tick: its headline is
+    /// the page's one signal, so the menu line and tab's diamond stay quiet (§3.3, §3.6).
+    pub(crate) fn system_state_launch_offer_waits(&self) -> bool {
         self.system_state_host
             .pending
             .as_ref()
@@ -468,6 +796,24 @@ impl App {
         }
     }
 
+    /// An update's Commit is about to be written: the setup stages running now are cut off by
+    /// no crash ([`InitialSetupHandlers::cut_off`]).
+    #[cfg(target_os = "macos")]
+    pub(crate) fn note_system_state_cut_off_at_commit(&self) {
+        if let Some(handlers) = self.system_state_handlers() {
+            (handlers.cut_off)(true);
+        }
+    }
+
+    /// The Commit [`Self::note_system_state_cut_off_at_commit`] noted was not written, or
+    /// returned: the handoff did not go, so the notes are taken back.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn take_back_system_state_cut_off(&self) {
+        if let Some(handlers) = self.system_state_handlers() {
+            (handlers.cut_off)(false);
+        }
+    }
+
     fn finish_system_state_shutdown_with(&mut self, handlers: Option<InitialSetupHandlers>) {
         // Cmd-Q can keep the models and windows until after settlement, but
         // their old frontness no longer authorizes an on-screen worker step.
@@ -477,6 +823,7 @@ impl App {
         }
         if let Some(handlers) = handlers {
             (handlers.settle)();
+            (handlers.cut_off)(true);
         }
     }
 
@@ -532,8 +879,8 @@ impl App {
         if self.resume_offer_moot(&request) {
             return;
         }
-        let quiet = self.system_state_host.review_shown
-            || matches!(request.kind(), OfferKind::Widen { .. } | OfferKind::Resume);
+        let quiet =
+            self.system_state_host.review_shown || matches!(request.kind(), OfferKind::Resume);
         if !request.pending()
             || self.headless
             || !self.can_offer_system_state(request.kind())
@@ -574,13 +921,13 @@ impl App {
     }
 
     /// The offer of a plan an earlier process admitted is moot while this window holds its own
-    /// admission of the plan in force (a press's, or an answer to an earlier offer): it goes for
-    /// this launch, finished as closed, and nothing answers it for that admission (§6). Whether
-    /// `request` was that offer, now finished.
+    /// admission of the plan in force (a press's, or an answer to an earlier offer): it is let go
+    /// with no receipt ([`Request::let_go`]), and nothing answers it for that admission (§6).
+    /// Whether `request` was that offer, now finished.
     fn resume_offer_moot(&self, request: &Request) -> bool {
         let moot = matches!(request.kind(), OfferKind::Resume) && self.own_admission_stands();
         if moot {
-            request.finish(WorkstationSetupDecision::Closed);
+            request.let_go();
         }
         moot
     }
@@ -617,7 +964,7 @@ impl App {
         }
         self.refresh_system_state_tab_indicators();
         self.system_state_host.action_refusal = None;
-        // The page answers the offer automatically on its first tick.
+        // The page answers the offer on its first tick: tick now.
         self.system_state_host.next_tick = None;
         self.system_state_host.latest_status = SetupStatus::default();
         let views: Vec<_> = self
@@ -652,9 +999,6 @@ impl App {
         &self,
         mut status: SetupStatus,
     ) -> (SetupStatus, Option<Access>) {
-        if self.closed_launch_is_unanswered(&status) {
-            status.unanswered = true;
-        }
         if self.system_state_host.operation.is_some()
             || self.system_state_host.awaiting_run
             || self.system_state_host.pending_apply.is_some()
@@ -680,20 +1024,44 @@ impl App {
         if step.is_some() || !self.system_state_host.showing_fixture() {
             status.access_step = step;
         }
+        // The walk's page, the join's asking and the last run's time are the window's to say; a
+        // scenario keeps its own.
+        let walk = self.system_state_walk_page();
+        if walk.is_some() || !self.system_state_host.showing_fixture() {
+            status.walk = walk;
+        }
+        if !self.system_state_host.showing_fixture() {
+            status.asking_long = self.system_state_host.asking_long_at(Instant::now());
+            status.ready_in = self.system_state_host.ready_in;
+        }
         (status, step)
     }
 
+    /// Whether what the window says of the status moved since it was last published: macOS's
+    /// dialog up for a grant, the walk's page, or the join's asking running long.
+    pub(crate) fn system_state_window_moved(&self, now: Instant) -> bool {
+        let host = &self.system_state_host;
+        host.access_step != self.system_state_access_step()
+            || host.walk_page != self.system_state_walk_page()
+            || host.asking_long != host.asking_long_at(now)
+    }
+
     pub(crate) fn publish_system_state(&mut self, mut status: SetupStatus) {
-        if status.cancelled || status.finished || status.run.is_some_and(|run| run.allowed) {
-            self.system_state_host.closed_launch_review = false;
-        }
-        if self.closed_launch_is_unanswered(&status) {
-            status.unanswered = true;
+        self.system_state_host.status_shown = true;
+        if !self.system_state_host.showing_fixture() {
+            self.system_state_host.track(&status, Instant::now());
         }
         // The page and the menu line read where the Command Line Tools install stands, which
         // the window alone knows (its tab, Apple's installer); a scenario keeps its own.
-        if !self.system_state_host.showing_fixture() && status.repositories_tools_wait().is_some() {
-            status.developer_tools = self.developer_tools_install_step();
+        if !self.system_state_host.showing_fixture() {
+            if status.repositories_tools_wait().is_some() {
+                status.developer_tools = self.developer_tools_install_step(&status);
+            } else {
+                // A reading with the tools there ends the calm kept since the tab installed them.
+                self.workstation_setup
+                    .developer_tools_after
+                    .settle(status.repositories_reading(), Instant::now());
+            }
         }
         self.system_state_host.latest_status = status.clone();
         let (status, step) = self.project_system_state_status(status);
@@ -704,10 +1072,12 @@ impl App {
             self.system_state_host.operation = None;
         }
         self.system_state_host.access_step = step;
+        self.system_state_host.walk_page = status.walk;
+        self.system_state_host.asking_long = status.asking_long;
         self.refresh_system_state_menu_line();
         // Setup that finished, or that a person cancelled, says nothing more by itself while no
-        // page shows it: the reader is let go and no poll is due. A worker's own publication, a
-        // page opening or a person's press asks for a read again, which starts a reader.
+        // page shows it: the reader is let go. A worker's own publication, a page opening or a
+        // person's press asks for a read again, which starts a reader.
         let quiet = (status.finished || status.cancelled)
             && !status.busy
             && self.system_state_host.pending.is_none()
@@ -715,14 +1085,15 @@ impl App {
                 .native_runtime
                 .instance_by_kind(AppKind::SystemState)
                 .is_none();
+        let polls = self.system_state_polls(&status);
         let changed = self.native_runtime.publish_system_state(status);
         self.system_state_host.status_in_flight = false;
         if quiet {
-            self.system_state_host.next_status = None;
             self.system_state_host.status_reader = None;
-        } else {
-            self.system_state_host.next_status = Some(Instant::now() + Duration::from_secs(1));
         }
+        // Only something that moves between the worker's publications is read again a second
+        // from now; anything else waits for an event, and owes no wake.
+        self.system_state_host.next_status = polls.then(|| Instant::now() + Duration::from_secs(1));
         // A Command Line Tools install a pass asked for opens its tab once it is due.
         self.tick_developer_tools_install();
         // A tab indicator that changed redraws its own window (its tab chrome).
@@ -732,12 +1103,28 @@ impl App {
         }
     }
 
+    /// Whether the worker's status is read again by itself, a second after each read
+    /// (init-on-by-default design §5.6): only while something moves between the worker's
+    /// publications: a run, a Check or a Restore going, an accepted plan whose run has not
+    /// shown up yet, or an offer waiting for its answer, which the page, the menu line and the
+    /// tab's diamond follow. Anything else reaches them as an event (a worker's publication, a
+    /// write this process made, a focus, file or network signal), so neither a settled page nor
+    /// an unfinished setup that waits wakes the loop.
+    fn system_state_polls(&self, status: &SetupStatus) -> bool {
+        let host = &self.system_state_host;
+        status.busy
+            || host.awaiting_run
+            || host.pending_apply.is_some()
+            || host.operation.is_some()
+            || host.pending.is_some()
+    }
+
     /// The page follows the window's access step at once (design §3.2, §6): when
     /// [`Self::system_state_access_step`] moved since the last publish, publish
     /// the status again so the next frame names macOS's dialog, or stops naming
     /// it. The status poll is left as it was.
     pub(crate) fn republish_system_state_access_step(&mut self) {
-        if self.system_state_host.access_step == self.system_state_access_step() {
+        if !self.system_state_window_moved(Instant::now()) {
             return;
         }
         let (in_flight, next) = (
@@ -750,17 +1137,15 @@ impl App {
     }
 
     /// Republish System State when [`Self::developer_tools_install_step`] moved since the last
-    /// publish (for example, `Install…` was queued behind a macOS permission gesture or started),
-    /// leaving the status poll as it was.
+    /// publish (for example, `Install…` was queued behind a macOS permission gesture or started,
+    /// its tab ended, or a press opened nothing), leaving the status poll as it was.
     pub(crate) fn republish_system_state_developer_tools(&mut self) {
-        if self.system_state_host.showing_fixture()
-            || self
-                .system_state_host
-                .latest_status
-                .repositories_tools_wait()
-                .is_none()
-            || self.system_state_host.latest_status.developer_tools
-                == self.developer_tools_install_step()
+        if self.system_state_host.showing_fixture() {
+            return;
+        }
+        let latest = self.system_state_host.latest_status.clone();
+        if latest.repositories_tools_wait().is_none()
+            || latest.developer_tools == self.developer_tools_install_step(&latest)
         {
             return;
         }
@@ -786,9 +1171,9 @@ impl App {
         self.system_state_host.access_step
     }
 
-    /// Redraw only the windows that show a System State page: its status and
-    /// tick (the village's walk, an offer let go) change only what it draws.
-    fn request_redraw_system_state_windows(&self) {
+    /// Redraw only the windows that show a System State page: its status, its
+    /// tick (an offer let go) and a kitty pose baked change only what it draws.
+    pub(crate) fn request_redraw_system_state_windows(&self) {
         for wid in self.system_state_showing_windows() {
             if let Some(os_window) = self.windows.get(&wid).and_then(|w| w.os_window.as_ref()) {
                 os_window.request_redraw();
@@ -873,6 +1258,9 @@ impl App {
         // The setup worker runs its on-screen steps (the sign-outs) only while
         // System State is in front (design §6); its arrival wakes a parked run.
         self.publish_system_state_front();
+        // What the window says of the status (the walk's page, the join's asking running long)
+        // reaches the page at once, whatever the page's own tick.
+        self.republish_system_state_access_step();
         if self.publish_access_opt_outs() {
             // The worker's rows were read with other opt-outs (a `[privacy]`
             // switch, or a debugger turned off that the record read at launch
@@ -886,9 +1274,14 @@ impl App {
             .system_state_host
             .next_tick
             .is_some_and(|next| next > now)
+            && self
+                .system_state_host
+                .read_timer()
+                .is_none_or(|timer| timer > now)
+            && self.system_state_host.page_due.is_none_or(|due| due > now)
         {
-            // The status keeps its own clock: one due before the next tick is asked
-            // for now, or its deadline would wake the loop every turn until the tick.
+            // A real reading timer keeps its own clock, independent of this refresh throttle.
+            // A due status alone can be served without refreshing the page.
             self.poll_system_state_status(now);
             return;
         }
@@ -897,15 +1290,13 @@ impl App {
             .instance_by_kind(AppKind::SystemState)
             .filter(|instance| self.system_state_instance_has_view(*instance));
         let Some(instance) = instance else {
-            // The review's last view went: closed, not this launch.
+            // The offer's last view went before the page answered it: it is let go, and the
+            // launch's is made again where a page can answer it.
             if let Some(request) = self.system_state_host.pending.take() {
-                let launch = matches!(request.kind(), OfferKind::Launch) && request.pending();
-                request.finish(WorkstationSetupDecision::Closed);
-                if launch {
-                    self.note_launch_review_closed();
-                }
+                request.let_go();
             }
             self.system_state_host.next_tick = None;
+            self.system_state_host.page_due = None;
             self.system_state_host.shown = false;
             self.system_state_host.observe_retry = None;
             self.poll_system_state_status(now);
@@ -975,58 +1366,27 @@ impl App {
                 }
             }
         }
-        if self.system_state_access_step() != self.system_state_host.access_step {
-            self.publish_system_state(self.system_state_host.latest_status.clone());
-        }
-        // The village walks only on a page someone can see, and only where a
-        // view someone sees draws it.
-        let seen = self.system_state_seen_views(instance);
-        let changed = self
-            .native_runtime
-            .tick_system_state(false, !shown.is_empty(), &seen);
+        // A dev scenario is a still picture of one moment: its page starts nothing by itself
+        // (its actions are inert, so a run it started would never report).
+        let changed =
+            !self.system_state_host.showing_fixture() && self.native_runtime.tick_system_state();
+        self.system_state_host.page_due = match self.native_runtime.app(instance) {
+            Some(NativeApp::SystemState(state)) => state.next_by_itself(),
+            _ => None,
+        };
         self.drain_system_state_actions();
-        if !self.system_state_host.status_in_flight {
+        // Something moving is read again by itself; an open page that never showed a status
+        // asks for its first read.
+        if !self.system_state_host.status_in_flight
+            && (self.system_state_polls(&self.system_state_host.latest_status)
+                || !self.system_state_host.status_shown)
+        {
             self.system_state_host.next_status.get_or_insert(now);
         }
         self.poll_system_state_status(now);
         self.refresh_system_state_tab_indicators();
         if changed {
             self.request_redraw_system_state_windows();
-        }
-    }
-
-    /// A dev scenario's first-launch offer ([`crate::system_state::fixture_review`]): once a
-    /// System State page is open, it is offered the plan a fresh launch offers, as a first
-    /// launch's window offers it but in a headless instance too, so a lab capture sees it. Its
-    /// answer goes nowhere.
-    #[cfg(any(debug_assertions, feature = "dev-seams"))]
-    fn offer_fixture_review(&mut self) {
-        let Some(review) = self.system_state_host.fixture_review else {
-            return;
-        };
-        if self
-            .native_runtime
-            .instance_by_kind(AppKind::SystemState)
-            .is_none()
-        {
-            return;
-        }
-        self.system_state_host.fixture_review = None;
-        let mut permissions = Selection::none();
-        permissions.set(aterm_types::macos_setup::Setting::Permissions, true);
-        let permissions = Plan::from(permissions);
-        match review {
-            crate::system_state::FixtureReview::Waiting => {
-                self.attach_system_state_offer(Request::unanswered(Plan::default()));
-            }
-            // The worker's look widens the review it offered once it hears the signal.
-            crate::system_state::FixtureReview::Widened => {
-                let request = Request::unanswered(permissions);
-                request.send_widened(Plan::default());
-                self.attach_system_state_offer(request);
-            }
-            crate::system_state::FixtureReview::Widen => self
-                .attach_system_state_offer(Request::unanswered_widen(Plan::default(), permissions)),
         }
     }
 
@@ -1063,26 +1423,40 @@ impl App {
         self.system_state_host.next_tick = None;
     }
 
-    fn closed_launch_is_unanswered(&self, status: &SetupStatus) -> bool {
-        self.system_state_host.closed_launch_review
-            && !status.cancelled
-            && !status.finished
-            && status.run.is_none_or(|run| !run.allowed)
-    }
-
-    fn note_launch_review_closed(&mut self) {
-        self.system_state_host.closed_launch_review = true;
-        let unanswered = self.closed_launch_is_unanswered(&self.system_state_host.latest_status);
-        self.system_state_host.latest_status.unanswered |= unanswered;
-        self.refresh_system_state_tab_indicators();
-    }
-
-    /// Publish visibility before another event or worker step can use it.
-    /// Closing a passive copy keeps the visible page's authority; losing the
-    /// last front page withdraws it even while a hidden controller survives.
+    /// Publish visibility before another event or worker step can use it: half of the setup
+    /// worker's `on_screen` port ([`system_state_on_screen`]), which starts the Messages and
+    /// FaceTime sign-outs, a person stage, only with a person at the page
+    /// ([`Self::system_state_front_with_a_person`]), and how the worker reads the other half,
+    /// whether a person is here as it asks. Closing a passive copy keeps the visible page's
+    /// authority; losing the last front page withdraws it even while a hidden controller
+    /// survives. Every event and every page tick publishes it again; a page with nothing running
+    /// ticks only while it is in front with its sign-outs parked for want of a person, each
+    /// [`PRESENCE_LOOK`], so the published bit goes false within a second of the minute of no
+    /// input running out and true again within a second of the person's return, input anywhere,
+    /// which wakes the parked run (`aterm_types::macos_setup::on_system_state_front`). The port
+    /// never waits on a tick to go false: the worker reads presence itself, for the stage and
+    /// again right before each sign-out's clicks.
     pub(crate) fn publish_system_state_front(&mut self) {
-        let front = self.system_state_frontmost();
+        let frontmost = self.system_state_frontmost();
+        let front = frontmost && self.person_at_this_screen();
+        *PRESENCE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(self.presence());
         aterm_types::macos_setup::set_system_state_front(front);
+        self.system_state_host.presence_look = (frontmost
+            && self.system_state_host.sign_outs_wait_for_a_person())
+        .then(|| Instant::now() + PRESENCE_LOOK);
+    }
+
+    /// Whether a person stage may put its gesture on screen now (init-on-by-default design §6.4):
+    /// System State is in front ([`Self::system_state_frontmost`]) and a person is at this Mac's
+    /// screen ([`Self::person_at_this_screen`], SAFE-1's fence, moved from the admission onto the
+    /// person stages: the Messages and FaceTime sign-outs, the debugger step's macOS dialog and
+    /// the Command Line Tools' authorization). The background stages never ask it. The input
+    /// and screen readings (an IOKit and a window server read on this thread) are made only
+    /// once the page is in front.
+    pub(crate) fn system_state_front_with_a_person(&self) -> bool {
+        self.system_state_frontmost() && self.person_at_this_screen()
     }
 
     /// Whether a System State view is the visible, active view of a focused,
@@ -1192,23 +1566,6 @@ impl App {
             .map(|(wid, _)| *wid)
     }
 
-    /// The views of `instance` that are a leaf of some on-screen window's active
-    /// tab's visible plan, focused or not: those in the windows
-    /// [`Self::system_state_showing_windows`] redraws.
-    fn system_state_seen_views(
-        &self,
-        instance: crate::native_app::AppInstanceId,
-    ) -> Vec<crate::tab_model::ViewId> {
-        self.system_state_on_screen()
-            .filter_map(|wid| self.active_visible_leaf_plan(wid))
-            .flat_map(|plan| plan.leaves.into_iter().map(|leaf| leaf.view))
-            .filter(|view| {
-                matches!(self.view_store.get(*view),
-                    Some(crate::tab_model::View::Native(native)) if native.instance == instance)
-            })
-            .collect()
-    }
-
     /// The views of `instance` that are the visible, active view of some
     /// on-screen window, focused or not.
     fn system_state_shown_views(
@@ -1250,6 +1607,17 @@ impl App {
             self.system_state_host.shown = false;
             self.system_state_host.next_tick = Some(Instant::now());
         }
+    }
+
+    /// Whether a person is at this Mac's screen: a keyboard, mouse or trackpad was used within
+    /// [`PERSON_PRESENT_WITHIN`] ([`Self::person_present_within`], read as the permission walk
+    /// and System State's access steps read it), and this login's screen is neither locked nor
+    /// switched away for another login. A person stage starts only then, so a window that opened
+    /// with nobody there (a launch from another Mac, a login with nobody at the screen, an update
+    /// relaunched overnight) runs its background stages and puts nothing on screen until a
+    /// person comes (SAFE-1's fence, on the person stages: init-on-by-default design §6.4).
+    pub(crate) fn person_at_this_screen(&self) -> bool {
+        self.person_present_within(PERSON_PRESENT_WITHIN, Instant::now()) && !(self.screen_away)()
     }
 
     /// Ask the worker for a fresh, prompt-free reading of every row for the
@@ -1333,8 +1701,6 @@ impl App {
         {
             if let Some(status) = self.system_state_host.fixture().cloned() {
                 self.system_state_host.next_status = None;
-                #[cfg(any(debug_assertions, feature = "dev-seams"))]
-                self.offer_fixture_review();
                 self.publish_system_state(status);
                 return;
             }
@@ -1382,13 +1748,6 @@ impl App {
             self.native_runtime.app(instance),
             Some(NativeApp::SystemState(_))
         ) {
-            let launch = self
-                .system_state_host
-                .pending
-                .as_ref()
-                .is_some_and(|request| {
-                    matches!(request.kind(), OfferKind::Launch) && request.pending()
-                });
             self.system_state_host.shown = false;
             self.system_state_host.observe_retry = None;
             self.native_runtime
@@ -1396,9 +1755,6 @@ impl App {
             // Retire the ended offer before a reopened page can submit a new
             // intent; that intent belongs to its manual handler, not this request.
             self.resolve_withdrawn_system_state_offer(Instant::now());
-            if launch {
-                self.note_launch_review_closed();
-            }
         }
     }
 
@@ -1463,11 +1819,58 @@ impl App {
                     aterm_log::info!("system state: Install… opened no Command Line Tools tab");
                 }
             }
+            SystemStateAction::GoToToolsTab => {
+                let _ = self.take_system_state_press();
+                if !self.go_to_developer_tools_tab() {
+                    aterm_log::info!("system state: Go to tab found no Command Line Tools tab");
+                }
+            }
+            SystemStateAction::CopyCommand { command, by_person } => {
+                // A control client's gesture has no clipboard authority, as for ⌘C.
+                let press = self.take_system_state_press();
+                if !by_person
+                    || press != crate::workstation_setup::PagePress::Person
+                    || self.person_gesture_refused()
+                {
+                    crate::app_take_over::note_clipboard_refused("copy");
+                    return;
+                }
+                if !crate::control::pbcopy(&command) {
+                    aterm_log::info!("system state: Copy Command reached no clipboard");
+                }
+            }
+            SystemStateAction::JoinPhrase(phrase, sent) => {
+                // The phrase is its own authority: a member's person pressed Allow for it, so a
+                // control client's Join goes as a person's does.
+                let _ = self.take_system_state_press();
+                if self.system_state_host.phrase_join.is_some() {
+                    // An earlier page's try still runs (this page was opened again since): this
+                    // one never starts, so its words stay for a Join once that one answered.
+                    self.native_runtime.system_state_phrase_finished(sent, None);
+                    return;
+                }
+                let (receipt, answer) = PhraseJoinReceipt::new();
+                if handlers.is_some_and(|handlers| (handlers.join_phrase)(phrase, receipt)) {
+                    self.system_state_host.phrase_join = Some((sent, answer));
+                } else {
+                    self.native_runtime.system_state_phrase_finished(sent, None);
+                    self.finish_system_state_action(false, "Join");
+                }
+            }
             SystemStateAction::Apply(mut answer, admission) => {
                 let WorkstationSetupDecision::Begin(plan) = &answer.decision else {
                     return;
                 };
-                let plan = plan.clone();
+                let mut plan = plan.clone();
+                if admission == Admission::Automatic
+                    && plan.selection.contains(Setting::Permissions)
+                {
+                    plan.selection.set(Setting::Permissions, false);
+                    answer.decision = WorkstationSetupDecision::Begin(plan.clone());
+                    aterm_log::info!(
+                        "system state: automatic setup deferred permission acquisition; continuing with available work"
+                    );
+                }
                 let Some(instance) = self.native_runtime.instance_by_kind(AppKind::SystemState)
                 else {
                     return;
@@ -1491,7 +1894,7 @@ impl App {
                     && self.own_admission_stands()
                     && let Some(request) = self.system_state_host.pending.take()
                 {
-                    request.finish(WorkstationSetupDecision::Closed);
+                    request.let_go();
                     return;
                 }
                 // A press answers for itself, never for the offer of a plan an earlier process
@@ -1535,6 +1938,9 @@ impl App {
                     answer: receiver,
                     release_permissions: true,
                 });
+                let wants_repositories = plan
+                    .selection
+                    .contains(aterm_types::macos_setup::Setting::Repositories);
                 let started = if let Some(request) = self.system_state_host.pending.take() {
                     answer.receipt = Some(receipt);
                     request.finish_answer(answer)
@@ -1544,6 +1950,12 @@ impl App {
                     false
                 };
                 if started {
+                    // A plan that leaves the GitHub repositories out (the Developer group turned
+                    // off) wants no Command Line Tools: their shim goes now, as no pass of it
+                    // will say.
+                    if !wants_repositories {
+                        self.withdraw_developer_tools_want();
+                    }
                     // Sending a startup answer and spawning a manual worker
                     // both await the same durable admission before consuming
                     // the review.
@@ -1589,7 +2001,7 @@ impl App {
                     request.finish(WorkstationSetupDecision::Unavailable);
                     // The offer's hold goes with it: a fresh read of the records decides.
                     self.recheck_initial_setup_permissions();
-                    self.native_runtime.tick_system_state(false, false, &[]);
+                    self.native_runtime.tick_system_state();
                     self.refresh_system_state_tab_indicators();
                 }
                 let started = handlers.is_some_and(|handlers| (handlers.restore)());
@@ -1638,6 +2050,26 @@ impl App {
             self.recheck_initial_setup_permissions();
         }
         self.native_runtime.refuse_system_state_apply();
+    }
+
+    /// The join with the phrase typed on the Secrets vault row answered
+    /// ([`PhraseJoinReceipt`]): the page says what it came to, and the rows are read again, so
+    /// the row moves on to Allowed or a member's vault.
+    pub(crate) fn resolve_system_state_phrase_join(&mut self) {
+        let Some((sent, answer)) = self.system_state_host.phrase_join.as_ref() else {
+            return;
+        };
+        let sent = *sent;
+        let outcome = match answer.try_recv() {
+            Ok(outcome) => outcome,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => PhraseOutcome::Stopped,
+        };
+        self.system_state_host.phrase_join = None;
+        self.native_runtime
+            .system_state_phrase_finished(sent, Some(outcome));
+        self.system_state_host.next_status = Some(Instant::now());
+        self.request_redraw_system_state_windows();
     }
 
     pub(crate) fn resolve_system_state_apply(&mut self) {

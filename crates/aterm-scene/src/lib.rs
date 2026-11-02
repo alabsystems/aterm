@@ -2,13 +2,15 @@
 // Copyright 2026 Andrew Yates
 
 //! `aterm-scene` — shared deterministic animation primitives used by the live effects
-//! engine: RGB mixing, easing, vector-path filling, and the [`Tile`] raster surface.
+//! engine and the native pages: RGB mixing, easing, vector-path filling, the [`Tile`] raster
+//! surface, and the [`motion`] vocabulary (tokens, Q16 easings, the glide, springs, cadences).
 
 #![forbid(unsafe_code)]
 #![cfg_attr(trust_verify, feature(register_tool))]
 #![cfg_attr(trust_verify, register_tool(trust))]
 
 pub(crate) mod atlas;
+pub mod motion;
 pub mod vector;
 
 pub use atlas::Tile;

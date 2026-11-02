@@ -64,8 +64,8 @@ fn roster(rows: &[(&str, Class, Option<&str>)]) -> Roster {
 fn three() -> Roster {
     roster(&[
         ("main", Class::Dedicated, None),
-        ("work-2", Class::Dedicated, Some("/logins/work-2")),
-        ("pool-a", Class::Shared, Some("/logins/pool-a")),
+        ("work-2", Class::Dedicated, Some(at!("/logins/work-2"))),
+        ("pool-a", Class::Shared, Some(at!("/logins/pool-a"))),
     ])
 }
 
@@ -1581,7 +1581,8 @@ fn rule_2_follows_no_active_account_signed_out_or_not_enrolled() {
             to: "work-2".into(),
             ahead: true,
             rotates: false,
-            takes_canary: false
+            takes_canary: false,
+            yields: None,
         }
     );
     let mut out = s.clone();
@@ -1612,7 +1613,8 @@ fn a_low_active_account_is_fallen_back_on_and_not_rotated_past_for_a_low_one() {
             to: "work-2".into(),
             ahead: false,
             rotates: false,
-            takes_canary: false
+            takes_canary: false,
+            yields: None,
         }
     );
     let mut near = spent.clone();
@@ -1802,6 +1804,7 @@ fn a_spent_account_about_to_reset_is_low_and_never_a_fresh_candidate() {
         ahead,
         rotates: true,
         takes_canary: false,
+        yields: None,
     };
     let ask = |s: &State, point: &Point, now: i64| {
         advise(&r, s, &enrolled, &me("main"), point, Mode::Early, now)
@@ -1912,6 +1915,7 @@ fn rule_4_does_not_leave_an_account_whose_reset_offer_is_about_to_expire() {
         ahead: true,
         rotates: true,
         takes_canary: false,
+        yields: None,
     };
     let held = Advice::Stay(StayWhy::OfferExpiring);
     for (left, use_by, want, why) in [
@@ -1957,6 +1961,7 @@ fn rule_4_leaves_a_limited_account_and_not_one_whose_low_window_is_about_to_rese
         ahead: true,
         rotates: true,
         takes_canary: false,
+        yields: None,
     };
 
     let resets = |at: i64| {
@@ -2147,6 +2152,7 @@ fn under_another_accounts_fresh_claim_the_leave_check_answers() {
         ahead: true,
         rotates: true,
         takes_canary: false,
+        yields: None,
     };
     let stale = NOW - MIN + PROBE_MAX_S;
     let mut s = on_main();
@@ -2168,6 +2174,146 @@ fn under_another_accounts_fresh_claim_the_leave_check_answers() {
     assert_eq!(ask(&fresh_main, NOW), Advice::Probe);
     assert!(claim_probe(&mut fresh_main, "pool-a", "s-pool", NOW - 10).is_some());
     assert_eq!(ask(&fresh_main, NOW), Advice::Stay(StayWhy::NothingDue));
+}
+
+/// A session on a row this Mac can neither record a claim on nor check (`WhyNot::Unclaimed`: its
+/// claims cannot be recorded, its own claim on the row lapsed, and the row is not its home) stops
+/// using the row at its turn end in every mode that rotates, as a session on a row another Mac's
+/// senior claim holds does (`docs/DESIGN-fluid-swarm-2026-10-28.md` F19): it moves onto a free
+/// home row, else it waits until the claims are read again or a row opens, whichever comes first.
+/// A live claim of its own on the row, claims it can record again, or `accounts = "off"` keep it
+/// on the row.
+///
+/// Negative control: with `effective_ranking_point` exempting `WhyNot::Unclaimed` (a turn end on
+/// such a row ranked as a turn end, so no yield), the first assertion failed with `Wall: no home
+/// row is free`, `left: Stay(NothingDue)`, `right: Wait { until: 1790000300 }`.
+#[test]
+fn a_session_on_a_row_this_mac_cannot_claim_yields_at_its_turn_end() {
+    let r = three();
+    let enrolled = all(&r);
+    let ask =
+        |s: &State, mode: Mode| advise(&r, s, &enrolled, &me("pool-a"), &Point::TurnEnd, mode, NOW);
+    let past_probe = |s: &State, mode: Mode| {
+        advise_past_probe(&r, s, &enrolled, &me("pool-a"), &Point::TurnEnd, mode, NOW)
+    };
+    let mut unclaimed = State {
+        active: Some("pool-a".to_string()),
+        proven: true,
+        unrecorded: true,
+        home_accounts: BTreeSet::from(["main".to_string()]),
+        ..state()
+    };
+    // Its own claim on pool-a lapsed while this Mac could not write its row again.
+    unclaimed.note_lease("pool-a", "0a0b", NOW - MIN, NOW - DAY);
+    assert_eq!(
+        unclaimed.lease_verdict("pool-a", NOW),
+        Err(WhyNot::Unclaimed)
+    );
+    assert_eq!(
+        unclaimed.lease_verdict("work-2", NOW),
+        Err(WhyNot::Unclaimed)
+    );
+
+    let mut walled = unclaimed.clone();
+    limited(&mut walled, "main", NOW + 3 * HOUR);
+    let wait = Advice::Wait {
+        until: NOW + crate::harness::claims::RECHECK_S,
+    };
+    for mode in [Mode::Wall, Mode::Early] {
+        assert_eq!(ask(&walled, mode), wait, "{mode:?}: no home row is free");
+    }
+
+    let mut opens = unclaimed.clone();
+    limited(&mut opens, "main", NOW + 2 * MIN);
+    let opening = next_opening(&r, &opens, &enrolled, NOW).expect("main opens");
+    assert!(NOW < opening && opening < NOW + crate::harness::claims::RECHECK_S);
+    for mode in [Mode::Wall, Mode::Early] {
+        assert_eq!(
+            ask(&opens, mode),
+            Advice::Wait { until: opening },
+            "{mode:?}: a home row opens first"
+        );
+    }
+
+    let home = Advice::Move {
+        to: "main".into(),
+        ahead: true,
+        rotates: true,
+        takes_canary: false,
+        yields: Some(NOW + crate::harness::claims::RECHECK_S),
+    };
+    for mode in [Mode::Wall, Mode::Early] {
+        assert_eq!(ask(&unclaimed, mode), home, "{mode:?}: a home row is free");
+    }
+
+    let mut recorded = walled.clone();
+    recorded.unrecorded = false;
+    let mut held = walled.clone();
+    held.note_lease("pool-a", "0a0b", NOW + HOUR, NOW - MIN);
+    for mode in [Mode::Wall, Mode::Early] {
+        for (s, what) in [
+            (&recorded, "claims recorded again"),
+            (&held, "its own live claim"),
+        ] {
+            assert_eq!(
+                past_probe(s, mode),
+                Advice::Stay(StayWhy::NothingDue),
+                "{mode:?}: {what}"
+            );
+        }
+    }
+    assert_eq!(ask(&walled, Mode::Off), Advice::Stay(StayWhy::Off));
+}
+
+/// While this Mac cannot record its claims, a session on one of its home rows keeps it at its turn
+/// end, and a session yielding a row it may not use moves onto a row whose claim this Mac still
+/// holds where no home row is free (`docs/DESIGN-fluid-swarm-2026-10-28.md` F19: a Mac that
+/// cannot record a claim keeps to its home accounts and the claims it holds).
+///
+/// Negative controls: with `State::lease_verdict`'s home exception dropped (`Unclaimed` for a
+/// home row too), the first assertion failed with `left: Wait { until: 1790000300 }`, `right:
+/// Stay(NothingDue)`, `Wall: a home row stays`; with its live-claim check dropped (a claim of this
+/// Mac's own no longer read), the move failed with `left: Wait { until: 1790000300 }`, `right:
+/// Move { to: "work-2", .. }`, `Wall: a row it still holds a claim on`.
+#[test]
+fn while_claims_go_unrecorded_a_home_row_stays_and_a_held_claim_takes_a_yield() {
+    let r = three();
+    let enrolled = all(&r);
+    let ask = |s: &State, on: &str, mode: Mode| {
+        advise_past_probe(&r, s, &enrolled, &me(on), &Point::TurnEnd, mode, NOW)
+    };
+    let mut s = State {
+        active: Some("main".to_string()),
+        proven: true,
+        unrecorded: true,
+        home_accounts: BTreeSet::from(["main".to_string()]),
+        ..state()
+    };
+    for mode in [Mode::Wall, Mode::Early] {
+        assert_eq!(
+            ask(&s, "main", mode),
+            Advice::Stay(StayWhy::NothingDue),
+            "{mode:?}: a home row stays"
+        );
+    }
+
+    s.active = Some("pool-a".to_string());
+    limited(&mut s, "main", NOW + 3 * HOUR);
+    s.note_lease("work-2", "0a0b", NOW + HOUR, NOW - MIN);
+    assert_eq!(s.lease_verdict("pool-a", NOW), Err(WhyNot::Unclaimed));
+    for mode in [Mode::Wall, Mode::Early] {
+        assert_eq!(
+            ask(&s, "pool-a", mode),
+            Advice::Move {
+                to: "work-2".into(),
+                ahead: true,
+                rotates: true,
+                takes_canary: false,
+                yields: Some(NOW + crate::harness::claims::RECHECK_S),
+            },
+            "{mode:?}: a row it still holds a claim on"
+        );
+    }
 }
 
 #[test]
@@ -2520,6 +2666,7 @@ fn the_owners_clearing_resumes_a_session_at_the_wall_it_lifted() {
         ahead: false,
         rotates: true,
         takes_canary: false,
+        yields: None,
     };
 
     let mut s = on_main();
@@ -2567,7 +2714,8 @@ fn the_owners_clearing_resumes_a_session_at_the_wall_it_lifted() {
             to: "work-2".into(),
             ahead: false,
             rotates: false,
-            takes_canary: false
+            takes_canary: false,
+            yields: None,
         }
     );
     let unanswered = State {
@@ -2881,6 +3029,7 @@ fn the_canarys_hold_lasts_ten_minutes_then_the_next_session_takes_its_place() {
         ahead: false,
         rotates: false,
         takes_canary: true,
+        yields: None,
     };
 
     let last = NOW + CANARY_HOLD_S - 1;
@@ -3256,6 +3405,7 @@ fn a_lost_login_signed_back_in_is_where_the_session_is_relaunched() {
         ahead: false,
         rotates: false,
         takes_canary,
+        yields: None,
     };
     let mut moved = on_main();
     limited(&mut moved, "main", NOW + 3 * DAY);
@@ -3431,6 +3581,259 @@ fn every_rotation_the_advice_gives_commits_once_the_wall_is_recorded() {
 }
 
 #[test]
+fn preparation_holds_yield_existing_and_superseded_sessions_in_every_mode() {
+    let roster = three();
+    let enrolled = all(&roster);
+    for peer_holds in [false, true] {
+        for superseded in [false, true] {
+            let mut held = on_main();
+            fresh(&mut held, "main");
+            low(&mut held, "work-2");
+            limited(&mut held, "pool-a", NOW + HOUR);
+            held.prepared_accounts.insert("main".into());
+            if peer_holds {
+                held.leases.insert(
+                    "main".into(),
+                    AccountLease {
+                        holder: "m2".into(),
+                        until: NOW + HOUR,
+                        at: NOW,
+                    },
+                );
+            }
+            let own = Me {
+                account: (!superseded).then_some("main"),
+                left: superseded.then_some("main"),
+                ..me("main")
+            };
+            for mode in [Mode::Early, Mode::Wall] {
+                let advice = advise(&roster, &held, &enrolled, &own, &Point::TurnEnd, mode, NOW);
+                assert!(
+                    matches!(advice, Advice::Move { ref to, yields: Some(_), .. } if to == "work-2"),
+                    "{mode:?}: {advice:?}"
+                );
+                let mut no_alternative = held.clone();
+                limited(&mut no_alternative, "work-2", NOW + HOUR);
+                assert!(
+                    matches!(advise(&roster, &no_alternative, &enrolled, &own, &Point::TurnEnd, mode, NOW), Advice::Wait { until } if until > NOW)
+                );
+            }
+            assert!(
+                matches!(advise(&roster, &held, &enrolled, &own, &Point::TurnEnd, Mode::Off, NOW), Advice::Wait { until } if until > NOW)
+            );
+        }
+    }
+}
+
+#[test]
+fn unavailable_login_notices_do_not_request_cross_account_rotations() {
+    let roster = three();
+    for prepared in [false, true] {
+        let mut held = on_main();
+        for label in ["main", "work-2", "pool-a"] {
+            fresh(&mut held, label);
+        }
+        held.leases.insert(
+            "main".into(),
+            AccountLease {
+                holder: "m2".into(),
+                until: NOW + HOUR,
+                at: NOW,
+            },
+        );
+        if prepared {
+            held.prepared_accounts.insert("main".into());
+        }
+        let own = Me {
+            account: None,
+            left: Some("main"),
+            ..me("main")
+        };
+        for mode in [Mode::Early, Mode::Wall, Mode::Off] {
+            assert_eq!(
+                advise(
+                    &roster,
+                    &held,
+                    &all(&roster),
+                    &own,
+                    &Point::LoginEnded,
+                    mode,
+                    NOW
+                ),
+                Advice::Stay(StayWhy::NoCandidate)
+            );
+        }
+        if !prepared {
+            assert_eq!(
+                advise(
+                    &roster,
+                    &held,
+                    &all(&roster),
+                    &own,
+                    &Point::TurnEnd,
+                    Mode::Off,
+                    NOW
+                ),
+                Advice::Stay(StayWhy::Off)
+            );
+        }
+    }
+}
+
+#[test]
+fn advice_preserves_unavailable_pins_and_only_proposes_committable_rotations() {
+    let roster = three();
+    let enrolled = all(&roster);
+    for active in ["main", "work-2"] {
+        for fault in 0..3 {
+            let mut held = on_main();
+            for label in ["main", "work-2", "pool-a"] {
+                fresh(&mut held, label);
+                if label != active {
+                    held.home_accounts.insert(label.into());
+                }
+            }
+            held.active = Some(active.into());
+            held.pinned = true;
+            match fault {
+                0 => {
+                    held.prepared_accounts.insert(active.into());
+                }
+                1 => {
+                    held.leases.insert(
+                        active.into(),
+                        AccountLease {
+                            holder: "m2".into(),
+                            until: NOW + HOUR,
+                            at: NOW,
+                        },
+                    );
+                }
+                _ => held.unrecorded = true,
+            }
+            for mine in ["main", "pool-a"] {
+                for point in [
+                    Point::TurnEnd,
+                    wall(),
+                    Point::LostLogin { seen: NOW - 1 },
+                    Point::LoginEnded,
+                ] {
+                    for mode in [Mode::Early, Mode::Wall] {
+                        let advice =
+                            advise(&roster, &held, &enrolled, &me(mine), &point, mode, NOW);
+                        if let Advice::Move {
+                            to, rotates: true, ..
+                        } = advice
+                        {
+                            let mut at_commit = held.clone();
+                            if matches!(point, Point::Wall { .. }) {
+                                note_wall(
+                                    &mut at_commit,
+                                    mine,
+                                    "five_hour",
+                                    Some(NOW + HOUR),
+                                    NOW,
+                                    NOW,
+                                );
+                            }
+                            assert!(
+                                begin_rotation(
+                                    &mut at_commit,
+                                    &roster,
+                                    &enrolled,
+                                    Some(active),
+                                    mover(mine),
+                                    &to,
+                                    NOW
+                                )
+                                .is_ok(),
+                                "{active} {fault} {mine} {point:?} {mode:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn direct_rotation_cannot_activate_a_preparation_only_credential() {
+    let roster = three();
+    let mut held = state();
+    fresh(&mut held, "work-2");
+    held.prepared_accounts.insert("work-2".into());
+    let before = held.clone();
+    assert_eq!(
+        begin_rotation(
+            &mut held,
+            &roster,
+            &all(&roster),
+            None,
+            mover("main"),
+            "work-2",
+            NOW
+        ),
+        Err(Lost::NotACandidate)
+    );
+    assert_eq!(held, before);
+}
+
+#[test]
+fn a_cleared_wall_cannot_rotate_off_an_unavailable_pin() {
+    let roster = three();
+    let enrolled = all(&roster);
+    let mut held = on_main();
+    for label in ["main", "work-2", "pool-a"] {
+        fresh(&mut held, label);
+    }
+    note_wall(&mut held, "main", "five_hour", None, NOW - MIN, NOW - MIN);
+    pin(&mut held, &roster, &enrolled, "main", NOW - 1).unwrap();
+    held.prepared_accounts.insert("main".into());
+    let point = Point::Wall {
+        window: "five_hour".into(),
+        at: Some(NOW - MIN),
+    };
+    let before = held.clone();
+    assert!(
+        matches!(advise(&roster, &held, &enrolled, &me("main"), &point, Mode::Early, NOW), Advice::Wait { until } if until > NOW)
+    );
+    assert_eq!(held, before);
+    assert!(held.pinned);
+}
+
+#[test]
+fn an_unmeasured_move_retains_its_execution_hold() {
+    let until = NOW + MIN;
+    assert_eq!(
+        held_unless_measured(
+            Advice::Move {
+                to: "work-2".into(),
+                ahead: true,
+                rotates: true,
+                takes_canary: false,
+                yields: Some(until),
+            },
+            false
+        ),
+        Advice::Wait { until }
+    );
+    assert_eq!(
+        held_unless_measured(
+            Advice::Move {
+                to: "work-2".into(),
+                ahead: true,
+                rotates: true,
+                takes_canary: false,
+                yields: None,
+            },
+            false
+        ),
+        Advice::Stay(StayWhy::Unmeasured)
+    );
+}
+
+#[test]
 fn the_machine_rotates_at_most_twice_the_roster_size_an_hour() {
     let r = three();
     let enrolled = all(&r);
@@ -3480,7 +3883,8 @@ fn the_machine_rotates_at_most_twice_the_roster_size_an_hour() {
             to: "work-2".into(),
             ahead: false,
             rotates: true,
-            takes_canary: false
+            takes_canary: false,
+            yields: None,
         }
     );
     assert_eq!(breaker_until(&s, &r, lapses), None, "not spent");
@@ -3702,7 +4106,8 @@ fn a_stamp_ahead_of_the_clock_is_not_recent_and_shadows_nothing() {
             to: "work-2".into(),
             ahead: false,
             rotates: true,
-            takes_canary: false
+            takes_canary: false,
+            yields: None,
         }
     );
     let recent = State {
@@ -4080,6 +4485,7 @@ fn a_reset_used_or_a_limit_lifted_clears_only_its_claimed_window() {
         ahead: false,
         rotates: true,
         takes_canary: false,
+        yields: None,
     };
     let ask = |s: &State| {
         advise(
@@ -4460,6 +4866,7 @@ fn a_ledger_row_round_trips_as_one_bounded_line() {
             "credits",
             "warned",
             "renewed",
+            "signed-in",
             "login-ended",
             "wrong-account",
             "reset",
@@ -4563,6 +4970,7 @@ fn a_row_wakes_waiting_tabs_only_when_an_account_is_usable_sooner() {
         Kind::ResetKept,
         Kind::ResetFailed,
         Kind::Renewed,
+        Kind::SignedIn,
     ];
     for kind in waking {
         assert!(wakes(kind, ""), "{}", kind.as_str());
@@ -5444,11 +5852,15 @@ fn a_process_login_names_its_row_byte_for_byte() {
     let r = three();
     assert_eq!(stored().me(&r), me("main"));
     assert_eq!(
-        env_of(&[(LOGIN_ENV, "/logins/work-2")]).me(&r),
+        env_of(&[(LOGIN_ENV, at!("/logins/work-2"))]).me(&r),
         me("work-2")
     );
     assert_eq!(env_of(&[(LOGIN_ENV, "")]).me(&r), me("main"));
-    for unlisted in ["/logins/work-2/", "/logins/WORK-2", "/logins/nobody"] {
+    for unlisted in [
+        at!("/logins/work-2/"),
+        at!("/logins/WORK-2"),
+        at!("/logins/nobody"),
+    ] {
         assert_eq!(
             env_of(&[(LOGIN_ENV, unlisted)]).me(&r).account,
             None,
@@ -5457,7 +5869,7 @@ fn a_process_login_names_its_row_byte_for_byte() {
     }
     assert_eq!(stored().me(&Roster::default()).account, None);
     let other = env_of(&[
-        (LOGIN_ENV, "/logins/pool-a"),
+        (LOGIN_ENV, at!("/logins/pool-a")),
         (HOME_ENV, "/elsewhere"),
         ("ANTHROPIC_BASE_URL", "https://gateway.invalid"),
     ])
@@ -5479,19 +5891,29 @@ fn a_label_is_judged_only_for_a_stored_login_in_the_default_home() {
     let judged = |env: &[(&str, &str)]| judged_label(&r, &env_of(env));
     assert_eq!(judged(&[]), Some("main"));
     assert_eq!(judged(&[(LOGIN_ENV, "")]), Some("main"));
-    assert_eq!(judged(&[(LOGIN_ENV, "/logins/work-2")]), Some("work-2"));
-    assert_eq!(judged(&[(LOGIN_ENV, "/logins/pool-a")]), Some("pool-a"));
+    assert_eq!(
+        judged(&[(LOGIN_ENV, at!("/logins/work-2"))]),
+        Some("work-2")
+    );
+    assert_eq!(
+        judged(&[(LOGIN_ENV, at!("/logins/pool-a"))]),
+        Some("pool-a")
+    );
     assert_eq!(
         judged(&[("HOME", "/home/someone"), ("PATH", "/usr/bin")]),
         Some("main"),
         "what is not the login's says nothing"
     );
 
-    for unlisted in ["/logins/work-2/", "/logins/WORK-2", "/logins/nobody"] {
+    for unlisted in [
+        at!("/logins/work-2/"),
+        at!("/logins/WORK-2"),
+        at!("/logins/nobody"),
+    ] {
         assert_eq!(judged(&[(LOGIN_ENV, unlisted)]), None, "{unlisted:?}");
     }
     assert_eq!(judged_label(&Roster::default(), &stored()), None);
-    let no_default = roster(&[("work-2", Class::Dedicated, Some("/logins/work-2"))]);
+    let no_default = roster(&[("work-2", Class::Dedicated, Some(at!("/logins/work-2")))]);
     assert_eq!(
         judged_label(&no_default, &stored()),
         None,
@@ -5500,14 +5922,17 @@ fn a_label_is_judged_only_for_a_stored_login_in_the_default_home() {
 
     let not_judged: [&[(&str, &str)]; 6] = [
         &[(HOME_ENV, "/elsewhere")],
-        &[(HOME_ENV, "/elsewhere"), (LOGIN_ENV, "/logins/work-2")],
+        &[(HOME_ENV, "/elsewhere"), (LOGIN_ENV, at!("/logins/work-2"))],
         &[("ANTHROPIC_API_KEY", "k")],
         &[
-            (LOGIN_ENV, "/logins/work-2"),
+            (LOGIN_ENV, at!("/logins/work-2")),
             ("ANTHROPIC_BASE_URL", "https://gateway.invalid"),
         ],
-        &[(LOGIN_ENV, "/logins/work-2"), (LOGIN_ENV, "/logins/pool-a")],
-        &[(LOGIN_ENV, "/logins/work-2"), (LOGIN_ENV, "")],
+        &[
+            (LOGIN_ENV, at!("/logins/work-2")),
+            (LOGIN_ENV, at!("/logins/pool-a")),
+        ],
+        &[(LOGIN_ENV, at!("/logins/work-2")), (LOGIN_ENV, "")],
     ];
     for env in not_judged {
         let who = env_of(env);
@@ -5518,7 +5943,10 @@ fn a_label_is_judged_only_for_a_stored_login_in_the_default_home() {
         assert_eq!(judged_label(&r, &who), None, "{env:?}");
     }
     assert_eq!(
-        judged(&[(LOGIN_ENV, "/logins/work-2"), (LOGIN_ENV, "/logins/work-2")]),
+        judged(&[
+            (LOGIN_ENV, at!("/logins/work-2")),
+            (LOGIN_ENV, at!("/logins/work-2"))
+        ]),
         Some("work-2")
     );
 
@@ -5546,16 +5974,16 @@ fn an_exec_environment_that_reads_empty_names_no_login() {
 fn the_footer_names_an_account_only_where_two_are_listed() {
     let two = roster(&[
         ("main", Class::Dedicated, None),
-        ("work-2", Class::Dedicated, Some("/logins/work-2")),
+        ("work-2", Class::Dedicated, Some(at!("/logins/work-2"))),
     ]);
-    let on_work = env_of(&[(LOGIN_ENV, "/logins/work-2")]);
+    let on_work = env_of(&[(LOGIN_ENV, at!("/logins/work-2"))]);
     assert_eq!(footer_label(&two, &stored()), Some("main"));
     assert_eq!(footer_label(&two, &on_work), Some("work-2"));
     assert_eq!(footer_label(&three(), &on_work), Some("work-2"));
 
     for one in [
         roster(&[("main", Class::Dedicated, None)]),
-        roster(&[("work-2", Class::Dedicated, Some("/logins/work-2"))]),
+        roster(&[("work-2", Class::Dedicated, Some(at!("/logins/work-2")))]),
     ] {
         let who = if one.rows[0].dir.is_none() {
             stored()
@@ -5568,7 +5996,7 @@ fn the_footer_names_an_account_only_where_two_are_listed() {
     assert_eq!(footer_label(&Roster::default(), &stored()), None);
 
     assert_eq!(
-        footer_label(&two, &env_of(&[(LOGIN_ENV, "/logins/work-2/")])),
+        footer_label(&two, &env_of(&[(LOGIN_ENV, at!("/logins/work-2/"))])),
         None
     );
     assert_eq!(
@@ -5706,7 +6134,7 @@ fn the_recorder_records_this_process_wall_for_its_account_once() {
     assert_eq!(state.accounts["main"].walls.len(), 1);
     assert_eq!(store.tail(10).expect("reads").len(), 1);
 
-    let work = env_of(&[(LOGIN_ENV, "/logins/work-2")]);
+    let work = env_of(&[(LOGIN_ENV, at!("/logins/work-2"))]);
     let session = StandingWall {
         at: (NOW + 30).unsigned_abs(),
         until: Some((NOW + 2 * HOUR).unsigned_abs()),
@@ -5755,7 +6183,7 @@ fn the_recorder_records_nothing_for_a_session_the_roster_does_not_govern() {
     };
 
     assert_eq!(record(&Roster::default(), &stored()), Recorded::NotListed);
-    for login in ["/logins/nobody", "/logins/work-2/"] {
+    for login in [at!("/logins/nobody"), at!("/logins/work-2/")] {
         assert_eq!(
             record(&r, &env_of(&[(LOGIN_ENV, login)])),
             Recorded::NotListed,
@@ -5767,14 +6195,15 @@ fn the_recorder_records_nothing_for_a_session_the_roster_does_not_govern() {
         env_of(&[("ANTHROPIC_API_KEY", "k")]),
         env_of(&[("CLAUDE_CODE_USE_BEDROCK", "1")]),
         env_of(&[
-            (LOGIN_ENV, "/logins/work-2"),
+            (LOGIN_ENV, at!("/logins/work-2")),
             ("ANTHROPIC_BASE_URL", "https://gateway.invalid"),
         ]),
         stored().with_profile_store(true),
     ] {
         assert_eq!(record(&r, &who), Recorded::NotStored, "{who:?}");
     }
-    let unlisted_elsewhere = env_of(&[(LOGIN_ENV, "/logins/nobody"), (HOME_ENV, "/elsewhere")]);
+    let unlisted_elsewhere =
+        env_of(&[(LOGIN_ENV, at!("/logins/nobody")), (HOME_ENV, "/elsewhere")]);
     assert_eq!(record(&r, &unlisted_elsewhere), Recorded::NotListed);
 
     assert!(!store.dir.exists(), "no directory, no lock, no state");
@@ -5790,7 +6219,7 @@ fn a_wall_row_older_than_the_process_is_the_previous_accounts_and_is_recorded_fo
     let r = three();
     let row = weekly();
     let written = NOW - 10;
-    let work = env_of(&[(LOGIN_ENV, "/logins/work-2")]);
+    let work = env_of(&[(LOGIN_ENV, at!("/logins/work-2"))]);
     for started in [written + 1, written + 30, NOW, NOW + DAY] {
         let recorded = record_wall(&store, &r, "s-one", &work, &row, started, NOW);
         assert_eq!(recorded, Recorded::NotThisProcess, "{started}");
@@ -5817,7 +6246,7 @@ fn a_wall_row_older_than_the_process_is_the_previous_accounts_and_is_recorded_fo
 #[test]
 fn a_wall_is_recorded_for_the_process_login_whatever_is_active_and_strikes_nothing() {
     let r = three();
-    let work = env_of(&[(LOGIN_ENV, "/logins/work-2")]);
+    let work = env_of(&[(LOGIN_ENV, at!("/logins/work-2"))]);
     let stands = Condition::Limited {
         until: NOW + HOUR + RESET_GRACE_S,
     };
@@ -7891,6 +8320,101 @@ fn a_void_window_keeps_its_figure_for_the_stats() {
     );
 }
 
+/// A TAP LEDGER ROW SAYS WHY A WINDOW HAS NO FIGURE, NEVER A BARE `?`: a reading without the
+/// five-hour window (Claude Code 2.1.316 leaves out one the API reply did not report) books
+/// `session – (not reported by Claude Code)`, and one whose held figure's window has closed says
+/// so rather than booking the closed figure. Negative controls: a reading that carries the window
+/// books its figure, and a figure held open from another session's reading is booked, not called
+/// unreported. No row leads its figure with a digit it does not hold, so a reader of `session N%`
+/// finds none.
+#[test]
+fn a_tap_ledger_row_says_why_a_window_has_no_figure() {
+    let week = |at: i64| TapRead {
+        seven_day: win(10, NOW + 3 * DAY, None),
+        at,
+        seen_before: true,
+        ..TapRead::default()
+    };
+    let why = |events: &[Event]| {
+        events
+            .iter()
+            .find(|e| e.kind == Kind::Sample)
+            .map(|e| e.why.clone())
+            .expect("a sample row")
+    };
+    let mut s = state();
+    let row = why(&note_reading(&mut s, "main", &week(NOW), NOW));
+    assert_eq!(
+        row,
+        "tap: session \u{2013} (not reported by Claude Code) week 1%"
+    );
+    assert!(!row.contains('?'), "{row}");
+
+    let mut carried = state();
+    let read = TapRead {
+        five_hour: win(425, NOW + HOUR, None),
+        ..week(NOW)
+    };
+    let row = why(&note_reading(&mut carried, "main", &read, NOW));
+    assert_eq!(
+        row, "tap: session 43% week 1%",
+        "the window it carried is booked"
+    );
+
+    let mut held = state();
+    note_reading(
+        &mut held,
+        "main",
+        &five(win(420, NOW + HOUR, None), NOW - MIN, true),
+        NOW - MIN,
+    );
+    let row = why(&note_reading(&mut held, "main", &week(NOW), NOW));
+    assert_eq!(
+        row, "tap: session 42% week 1%",
+        "an open held figure is booked"
+    );
+
+    let reset = NOW + HOUR;
+    let mut closed = state();
+    note_reading(
+        &mut closed,
+        "main",
+        &five(win(600, reset, None), NOW, true),
+        NOW,
+    );
+    let later = reset + HOUR;
+    let row = why(&note_reading(&mut closed, "main", &week(later), later));
+    assert_eq!(
+        row, "tap: session \u{2013} (not reported by Claude Code) week 1%",
+        "a closed window's 60% is not booked as now"
+    );
+    assert_eq!(tap_shown(Some((60, NOW + 1)), false, NOW), "60%");
+    assert_eq!(
+        tap_shown(Some((60, NOW)), true, NOW),
+        "\u{2013} (window reset)"
+    );
+    assert_eq!(tap_shown(None, true, NOW), "\u{2013} (read before a reset)");
+
+    let panel = |session_pct: Option<u32>| {
+        let mut s = state();
+        let sample = Sample {
+            session_pct,
+            session_reset: session_pct.map(|_| NOW + HOUR),
+            week_pct: Some(1),
+            week_reset: Some(NOW + 3 * DAY),
+            at: NOW,
+            ..Sample::default()
+        };
+        why(&note_sample(&mut s, "main", sample, NOW))
+    };
+    assert_eq!(
+        panel(None),
+        "session \u{2013} (not on the panel) week 1%",
+        "a row the panel lacked is not called unreported"
+    );
+    assert_eq!(panel(Some(42)), "session 42% week 1%");
+}
+
 #[test]
 fn a_windows_figures_merge_by_anchor_then_epoch_then_size() {
     let fig = |pct_x10: u32, reset: i64, at: i64, epoch_at: Option<i64>| WindowFig {
@@ -8119,6 +8643,7 @@ fn warnings_and_credits_in_use_mark_an_account_low_and_rotate_early_ahead_of_the
         ahead: true,
         rotates: true,
         takes_canary: false,
+        yields: None,
     };
     let ask = |s: &State, now: i64| {
         advise_past_probe(
@@ -8245,8 +8770,13 @@ fn warnings_and_credits_in_use_mark_an_account_low_and_rotate_early_ahead_of_the
     assert!(!refilled.accounts["main"].leave_early(NOW));
 }
 
-const POOL_ROWS: &str = "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n[[account]]\n\
-    label = \"work\"\nclass = \"dedicated\"\ndir = \"/logins/work\"\n";
+/// Two rows: `main` with no dir and `work` at `/logins/work`, absolute on this host ([`at`]).
+const POOL_ROWS: &str = at!(
+    "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n[[account]]\n\
+     label = \"work\"\nclass = \"dedicated\"\ndir = \"",
+    "/logins/work",
+    "\"\n"
+);
 
 #[test]
 fn claudes_roster_admits_no_vendor_key_and_its_store_is_where_it_was() {
@@ -8293,9 +8823,10 @@ fn claudes_roster_admits_no_vendor_key_and_its_store_is_where_it_was() {
 
 #[test]
 fn a_kimi_row_with_an_email_names_its_region_and_only_a_known_one() {
+    let sol = at!("/logins/kimi/sol");
     let row = |extra: &str| {
         format!(
-            "[[account]]\nlabel = \"sol\"\nclass = \"dedicated\"\ndir = \"/logins/kimi/sol\"\n\
+            "[[account]]\nlabel = \"sol\"\nclass = \"dedicated\"\ndir = \"{sol}\"\n\
              email = \"sol@example.com\"\n{extra}"
         )
     };
@@ -8329,7 +8860,7 @@ fn roster_identity_distinguishes_provider_realms_but_not_login_methods() {
     let first = Row {
         label: "first".into(),
         class: Class::Dedicated,
-        dir: Some("/logins/first".into()),
+        dir: Some(at!("/logins/first").into()),
         email: Some("one@example.test".into()),
         vendor: Vendor {
             region: Some(Region::Global),
@@ -8339,7 +8870,7 @@ fn roster_identity_distinguishes_provider_realms_but_not_login_methods() {
     };
     let second = Row {
         label: "second".into(),
-        dir: Some("/logins/second".into()),
+        dir: Some(at!("/logins/second").into()),
         email: Some("ONE@example.test".into()),
         vendor: Vendor {
             region: Some(Region::MainlandCn),
@@ -8435,7 +8966,7 @@ fn a_rows_vendor_keys_are_written_back_as_parsed() {
     let row = Row {
         label: "sol".into(),
         class: Class::Dedicated,
-        dir: Some("/logins/kimi/sol".into()),
+        dir: Some(at!("/logins/kimi/sol").into()),
         email: Some("sol@example.com".into()),
         vendor: Vendor {
             region: Some(Region::MainlandCn),
@@ -8463,9 +8994,14 @@ fn each_seam_exports_its_own_variable_and_the_default_row_unsets_it() {
         ..Row::default()
     };
     let work = dir(Some("/logins/work"));
+    // A login file is the row's dir joined with its name, as the host joins a path.
+    let auth = Path::new("/logins/work")
+        .join("auth.json")
+        .display()
+        .to_string();
     assert_eq!(
         login_env_for(Cli::Grok, &work),
-        ("GROK_AUTH_PATH", Some("/logins/work/auth.json".to_owned()))
+        ("GROK_AUTH_PATH", Some(auth.clone()))
     );
     assert_eq!(
         login_env_for(Cli::Claude, &work),
@@ -8480,7 +9016,7 @@ fn each_seam_exports_its_own_variable_and_the_default_row_unsets_it() {
     );
     assert_eq!(
         login_env_for(Cli::Codex, &work),
-        ("CODEX_AUTH_PATH", Some("/logins/work/auth.json".to_owned()))
+        ("CODEX_AUTH_PATH", Some(auth))
     );
     assert_eq!(
         login_env_for(Cli::Kimi, &work),
@@ -8504,24 +9040,36 @@ fn each_seam_exports_its_own_variable_and_the_default_row_unsets_it() {
 #[test]
 fn a_grok_process_is_judged_by_the_auth_file_its_seam_names() {
     let roster = Roster::parse_for(Cli::Grok, POOL_ROWS).expect("roster");
-    let who = ProcessLogin::of_env_for(Cli::Grok, [("GROK_AUTH_PATH", "/logins/work/auth.json")]);
-    assert_eq!(who.login.as_deref(), Some("/logins/work"));
+    let who = ProcessLogin::of_env_for(
+        Cli::Grok,
+        [("GROK_AUTH_PATH", at!("/logins/work/auth.json"))],
+    );
+    assert_eq!(who.login.as_deref(), Some(at!("/logins/work")));
     assert_eq!(judged_label(&roster, &who), Some("work"));
     let default = ProcessLogin::of_env_for(Cli::Grok, [("PATH", "/usr/bin")]);
     assert_eq!(judged_label(&roster, &default), Some("main"));
     for outside in [
-        ProcessLogin::of_env_for(Cli::Grok, [("GROK_AUTH_PATH", "/elsewhere/auth.json")]),
-        ProcessLogin::of_env_for(Cli::Grok, [("GROK_AUTH_PATH", "/logins/work/other.json")]),
-        ProcessLogin::of_env_for(Cli::Grok, [("GROK_AUTH_PATH", "/logins/work")]),
+        ProcessLogin::of_env_for(Cli::Grok, [("GROK_AUTH_PATH", at!("/elsewhere/auth.json"))]),
+        ProcessLogin::of_env_for(
+            Cli::Grok,
+            [("GROK_AUTH_PATH", at!("/logins/work/other.json"))],
+        ),
+        ProcessLogin::of_env_for(Cli::Grok, [("GROK_AUTH_PATH", at!("/logins/work"))]),
         ProcessLogin::of_env_for(Cli::Grok, [("GROK_AUTH_PATH", "auth.json")]),
         ProcessLogin::of_env_for(Cli::Grok, [("GROK_AUTH_PATH", "work/auth.json")]),
-        ProcessLogin::of_env_for(Cli::Grok, [("GROK_AUTH_PATH", "/logins/work/auth.json/")]),
-        ProcessLogin::of_env_for(Cli::Grok, [("GROK_AUTH_PATH", "/logins/work/auth.json/.")]),
+        ProcessLogin::of_env_for(
+            Cli::Grok,
+            [("GROK_AUTH_PATH", at!("/logins/work/auth.json/"))],
+        ),
+        ProcessLogin::of_env_for(
+            Cli::Grok,
+            [("GROK_AUTH_PATH", at!("/logins/work/auth.json/."))],
+        ),
         ProcessLogin::of_env_for(Cli::Grok, [("GROK_AUTH_PATH", "/logins/work\n1/auth.json")]),
         ProcessLogin::of_env_for(
             Cli::Grok,
             [
-                ("GROK_AUTH_PATH", "/logins/work/auth.json"),
+                ("GROK_AUTH_PATH", at!("/logins/work/auth.json")),
                 ("GROK_AUTH", "t"),
             ],
         ),
@@ -8533,7 +9081,7 @@ fn a_grok_process_is_judged_by_the_auth_file_its_seam_names() {
     let behind = ProcessLogin::of_env_for(
         Cli::Grok,
         [
-            ("GROK_AUTH_PATH", "/logins/work/auth.json"),
+            ("GROK_AUTH_PATH", at!("/logins/work/auth.json")),
             ("XAI_API_KEY", "k"),
         ],
     );
@@ -8541,14 +9089,16 @@ fn a_grok_process_is_judged_by_the_auth_file_its_seam_names() {
     let apart = ProcessLogin::of_env_for(
         Cli::Grok,
         [
-            ("GROK_AUTH_PATH", "/logins/work/auth.json"),
+            ("GROK_AUTH_PATH", at!("/logins/work/auth.json")),
             ("GROK_HOME", "/other"),
         ],
     );
     assert!(!apart.default_home);
     let codex = Roster::parse_for(Cli::Codex, POOL_ROWS).expect("roster");
-    let auth_file =
-        ProcessLogin::of_env_for(Cli::Codex, [("CODEX_AUTH_PATH", "/logins/work/auth.json")]);
+    let auth_file = ProcessLogin::of_env_for(
+        Cli::Codex,
+        [("CODEX_AUTH_PATH", at!("/logins/work/auth.json"))],
+    );
     assert!(
         auth_file.default_home,
         "a login-file seam leaves the default home shared"
@@ -8557,7 +9107,7 @@ fn a_grok_process_is_judged_by_the_auth_file_its_seam_names() {
     let apart_codex = ProcessLogin::of_env_for(
         Cli::Codex,
         [
-            ("CODEX_AUTH_PATH", "/logins/work/auth.json"),
+            ("CODEX_AUTH_PATH", at!("/logins/work/auth.json")),
             ("CODEX_HOME", "/other"),
         ],
     );
@@ -8565,7 +9115,7 @@ fn a_grok_process_is_judged_by_the_auth_file_its_seam_names() {
     let shared_key = ProcessLogin::of_env_for(
         Cli::Codex,
         [
-            ("CODEX_AUTH_PATH", "/logins/work/auth.json"),
+            ("CODEX_AUTH_PATH", at!("/logins/work/auth.json")),
             ("OPENAI_API_KEY", "k"),
         ],
     );
@@ -8577,15 +9127,18 @@ fn a_grok_process_is_judged_by_the_auth_file_its_seam_names() {
     for own in ["CODEX_API_KEY", "CODEX_ACCESS_TOKEN"] {
         let keyed = ProcessLogin::of_env_for(
             Cli::Codex,
-            [("CODEX_AUTH_PATH", "/logins/work/auth.json"), (own, "k")],
+            [
+                ("CODEX_AUTH_PATH", at!("/logins/work/auth.json")),
+                (own, "k"),
+            ],
         );
         assert_eq!(judged_label(&codex, &keyed), None, "{own}: {keyed:?}");
     }
     for malformed in [
         "auth.json",
         "work/auth.json",
-        "/logins/work/auth.json/",
-        "/logins/work/auth.json/.",
+        at!("/logins/work/auth.json/"),
+        at!("/logins/work/auth.json/."),
         "/logins/work\n1/auth.json",
         "/logins/work\u{2028}1/auth.json",
     ] {
@@ -8598,7 +9151,7 @@ fn a_grok_process_is_judged_by_the_auth_file_its_seam_names() {
         );
         assert_eq!(judged_label(&codex, &who), None, "{malformed:?}: {who:?}");
     }
-    let claude = [("CLAUDE_SECURESTORAGE_CONFIG_DIR", "/logins/work")];
+    let claude = [("CLAUDE_SECURESTORAGE_CONFIG_DIR", at!("/logins/work"))];
     assert_eq!(
         ProcessLogin::of_env_for(Cli::Claude, claude),
         ProcessLogin::of_env(claude)
@@ -8639,9 +9192,9 @@ mod login_attribution;
 fn a_kimi_process_is_judged_off_its_row_by_an_environment_model_or_header_alone() {
     let roster = Roster::parse_for(Cli::Kimi, POOL_ROWS).expect("roster");
     let on = |extra: (&'static str, &'static str)| {
-        ProcessLogin::of_env_for(Cli::Kimi, [("KIMI_CODE_HOME", "/logins/work"), extra])
+        ProcessLogin::of_env_for(Cli::Kimi, [("KIMI_CODE_HOME", at!("/logins/work")), extra])
     };
-    let row = ProcessLogin::of_env_for(Cli::Kimi, [("KIMI_CODE_HOME", "/logins/work")]);
+    let row = ProcessLogin::of_env_for(Cli::Kimi, [("KIMI_CODE_HOME", at!("/logins/work"))]);
     assert!(row.default_home, "the overlay home is the seam");
     assert_eq!(judged_label(&roster, &row), Some("work"));
     assert_eq!(
@@ -8702,6 +9255,7 @@ fn an_unmeasured_seam_holds_a_due_move_and_a_measured_one_makes_it() {
         ahead: true,
         rotates: true,
         takes_canary: false,
+        yields: None,
     };
     // No pooled CLI is unmeasured now, so the hold is tested on `held_unless_measured` itself.
     assert_eq!(
@@ -8728,5 +9282,145 @@ fn an_unmeasured_seam_holds_a_due_move_and_a_measured_one_makes_it() {
             Mode::Early,
             NOW
         )
+    );
+}
+
+/// A CLAUDE CODE WORKER STARTS WHERE THE HOST WOULD MOVE ITS TAB ([`worker_row`]): onto a
+/// pinned `active` that is another row, whether the starter's row is walled or fresh; nowhere
+/// while a canary holds `active`, or where the move would take a silent canary's place (the
+/// host's to take); nowhere once the rotation bound is spent; and under `"wall"` a low starter's
+/// row that still runs keeps it, which `"early"` moves ahead of the wall. CONTROL: a walled
+/// starter with no active row of another moves to the first row a wall would. NEGATIVE CONTROL:
+/// the launch rule ([`launch_row`] from the starter's row) ignored `active`, the canary, the
+/// bound and the mode, so a worker of a walled tab started on `work-2` against the owner's pin
+/// on `pool-a`, and one of a low tab moved under `"wall"`.
+#[test]
+fn a_worker_starts_where_the_host_would_move_its_tab() {
+    let r = three();
+    let enrolled = all(&r);
+    let start = |s: &State, mode: Mode| {
+        worker_row(&r, s, &enrolled, "main", mode, NOW).map(|row| row.label.as_str())
+    };
+    let mut walled = on_main();
+    limited(&mut walled, "main", NOW + 3 * HOUR);
+    assert_eq!(
+        start(&walled, Mode::Early),
+        Some("work-2"),
+        "CONTROL: the row a wall moves to"
+    );
+    assert_eq!(start(&walled, Mode::Wall), Some("work-2"));
+    assert_eq!(
+        start(&on_main(), Mode::Early),
+        None,
+        "a fresh starter keeps its row"
+    );
+
+    let pinned = |s: &State| State {
+        active: Some("pool-a".into()),
+        pinned: true,
+        proven: true,
+        ..s.clone()
+    };
+    assert_eq!(
+        start(&pinned(&walled), Mode::Early),
+        Some("pool-a"),
+        "a pinned active that differs from the starter"
+    );
+    assert_eq!(
+        start(&pinned(&on_main()), Mode::Wall),
+        Some("pool-a"),
+        "the pin moves a fresh starter's worker too, as the host moves its tab"
+    );
+
+    let canary = |at: i64| State {
+        active: Some("work-2".into()),
+        proven: false,
+        canary: Some(Canary {
+            sid: "s-canary".into(),
+            at,
+            took: false,
+        }),
+        ..walled.clone()
+    };
+    assert_eq!(
+        start(&canary(NOW - MIN), Mode::Early),
+        None,
+        "an unproven active holds the worker as the host holds the tab"
+    );
+    assert_eq!(
+        start(&canary(NOW - CANARY_HOLD_S - MIN), Mode::Early),
+        None,
+        "a silent canary's place is the host's to take"
+    );
+
+    let spent = State {
+        rotations: vec![NOW - 5; 6],
+        ..walled.clone()
+    };
+    assert_eq!(
+        start(&spent, Mode::Early),
+        None,
+        "the rotation bound holds it"
+    );
+
+    let mut low_main = on_main();
+    low(&mut low_main, "main");
+    assert_eq!(cond(&r, &low_main, "main", NOW), Condition::Low);
+    assert_eq!(
+        start(&low_main, Mode::Wall),
+        None,
+        "under \"wall\" a row that still runs keeps it"
+    );
+    assert_eq!(
+        start(&low_main, Mode::Early),
+        Some("work-2"),
+        "CONTROL: \"early\" leaves a low row ahead of the wall"
+    );
+}
+
+#[test]
+fn held_by_rows_never_need_local_sign_in_or_admit_rotation_target() {
+    let mut r = three();
+    r.rows[1].held_by = Some("other-mac".into());
+    r.rows[1].email = Some("work2@example.com".into());
+    r.rows[2].email = Some("poola@example.com".into());
+    let mut s = on_main();
+    note_auth(&mut s, "work-2", Auth::SignedOut, NOW);
+    note_auth(&mut s, "pool-a", Auth::SignedOut, NOW);
+    let enrolled = BTreeSet::from(["main".to_string()]);
+    let logins = Logins::default();
+
+    assert!(!needs_sign_in(&r.rows[1], &s, &logins, false, NOW));
+    assert!(needs_sign_in(&r.rows[2], &s, &logins, false, NOW));
+    assert_eq!(
+        sign_in_next(&r, &s, &enrolled, Some("main"), NOW),
+        Some(("pool-a".into(), true))
+    );
+    assert_eq!(
+        renew_next(&r, &s, &enrolled, Some("main"), NOW),
+        Some("pool-a".into())
+    );
+
+    let mut no_email_r = three();
+    no_email_r.rows[1].held_by = Some("other-mac".into());
+    assert_eq!(
+        signed_out(&no_email_r, &s, &all(&no_email_r), NOW),
+        vec!["pool-a".to_string()]
+    );
+
+    let mut rot_s = on_main();
+    limited(&mut rot_s, "main", NOW + HOUR);
+    let all_enrolled = all(&r);
+    assert_eq!(
+        begin_rotation(
+            &mut rot_s,
+            &r,
+            &all_enrolled,
+            Some("main"),
+            mover("main"),
+            "work-2",
+            NOW
+        ),
+        Err(Lost::NotACandidate)
     );
 }

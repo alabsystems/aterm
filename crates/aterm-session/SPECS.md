@@ -1,73 +1,60 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-session: spec recovery from its 101 unit tests
+# aterm-session: spec recovery from its unit tests
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 13 tests it
-> deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
-> were taken before.
+The crate's migration worklist: each spec is to be proved through Trust/Clean about the compiled
+Rust function, and the tests it subsumes then deleted. The claims come from reading the tests and
+the code they reach, not from running them.
 
-> Status 2026-10-16: this file is the crate's migration worklist. Each spec below is proved
-> through Trust/Clean about the compiled Rust function, then the tests it subsumes are deleted.
-> The 4 checks in §4 sample no spec and can be deleted now. Nothing here is proved yet.
-
-Source: `crates/aterm-session` (read only). I read every `#[test]` in
-src/{edge 13, id 2, input_backlog 17, sink 41} and tests/{conformance_authorize 2,
-conformance_fabric 5, conformance_input_unread 6, immediate_egress 3, input_backlog_pty 11,
-owned_master_census 1, spill_bound 1} = 101, and the code each one reaches. The census tool
-counts 102 because `tests/session_suite.rs` mentions "`#[test]`s" in a doc comment. That file
-only declares modules. Nothing was compiled or run. The claims below come from reading the code.
-
-Result: **37 specs**, covering **97 tests**. **4 tests are not spec samples** (§4).
-
-Gap numbers in the last column of §1 are the rows of the gap table in
-`AUDIT-trust-for-test-migration-2026-10-15.md` (historical internal audit) §7.
-Gap 0 (a seal that publishes Clean rows) is a prerequisite for every spec and is not repeated in
-the column. Seal `150efe4a` closes it locally (see
-`PLAN-tests-to-specs-2026-10-15.md` (historical internal plan)).
+`blocking gaps` numbers are rows of the gap table in
+`docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7. Gap 0 (a seal that publishes
+Lean-discharged rows) blocks every spec and is left out of the column.
 
 ## 0. Notation used in the statements
 
-- **Edge table.** `Rows(t)` is the finite map `EdgeToken -> Entry{src,dst,op,nonce}` held by
-  `EdgeTable t` (its `HashMap rows`). `Proj(e) = Edge{src,dst,op}`. `Fresh(tok,t)` means
-  `tok ∉ dom Rows(t)`. Two nonces are equal iff they are equal byte arrays (the `ct_eq` lemma in
-  `hex-codec-and-ct-eq`).
-- **CSPRNG axiom.** `EdgeToken::generate`, `LaunchNonce::generate` and `SessionId::generate` bottom
-  out in `fill_random` (a `getentropy` FFI, `trust::skip`). Freshness and distinctness of their
-  results are an axiom about the CSPRNG, not a provable property. Every spec is stated over all
-  tokens, so it never depends on the axiom except where it says so.
+- **Edge table.** `Rows(t)` is the finite map `EdgeToken -> EdgeEntry{src,dst,op,nonce}` held in
+  `EdgeTable t`'s `rows`. `Proj(e) = Edge{src,dst,op}`. `Fresh(tok,t)` ⇔ `tok ∉ dom Rows(t)`.
+  Nonces are equal iff their bytes are (the `ct_eq` lemma in `hex-codec-and-ct-eq`).
+- **CSPRNG axiom.** `EdgeToken::generate`, `LaunchNonce::generate` and `SessionId::generate`
+  bottom out in `fill_random` (`trust::skip`, over `aterm_uds::rand::fill`). Freshness and
+  distinctness of what they return is an axiom about the CSPRNG. The specs quantify over all
+  tokens and use the axiom only where they say so; tests that take `generate()` as "an unknown
+  token" or assert two ids differ rest on it.
 - **Ledger.** `L = (accepted, inflight, ring: [Run{end,first,last}], born, discard_mark)`.
   `Time(i)` is the true acceptance stamp of byte offset `i`: the `at` of the `end()` call whose
   count covered `i`, with offsets below 0 (bytes older than the sink) dated `born`.
-  `Inv(L)`: the ring's `end`s are strictly increasing and the last equals `accepted` (empty ring iff
-  `accepted = 0`); each run has `first ≤ last`; the `last`s are nondecreasing; `|ring| ≤ CAPACITY = 64`.
-  `COALESCE = 5 ms`.
+  `Inv(L)`: the ring's `end`s strictly increase and the last equals `accepted` (empty ring iff
+  `accepted = 0`); each run has `first ≤ last`; the `last`s are nondecreasing;
+  `|ring| ≤ CAPACITY = 64`. `COALESCE = 5 ms`.
 - **Backlog.** `b = InputBacklog{queued, spilled, wait, canonical, signals, output_backlog}`.
   `W = WARN_AFTER = 1 s`, `S = STALL_AFTER = 10 s`, `Q = QUIET_STALL_AFTER = 300 s`,
   `ROOM = KERNEL_QUEUE_ROOM = 1022`.
-- **Sink model.** `M(sink) = (K, Spill, order, epoch, driven, discards, restarts, severed, failed,
-  hook_armed, reply_held)`. `K` is the byte sequence the kernel has accepted from this sink, in
-  kernel order; it is the peer's read stream. `Spill` is the FIFO `Spill.buf`, whose first
-  `chunk_written` bytes are already in `K`. `order` is the `AcceptedOrder` counter; the other fields
-  are the `Shared` atomics of the same names. A **frame** is one public write call with bytes `x`.
-  `Acc(x)` is the prefix of `x` the call accepted (into `K` or into `Spill`), and `AcceptedOrder(x)`
-  is the order minted for it. `SPILL_CAP = 2 MiB`, `NONPARK_MAX = 4096`,
-  `IMMEDIATE_FRAME_MAX = 16 KiB + 32`, `METERED_SLICE = 4 KiB`, `PARK_RECHECK = 100 ms`.
+- **Sink.** `K` is the byte sequence the kernel accepted from this sink, in kernel order: the
+  peer's read stream. `Spill` is the FIFO `Spill.buf`, whose first `chunk_written` bytes are
+  already in `K`. `order` is the `AcceptedOrder` counter, `epoch` is `input_epoch`, `driven` is
+  `driven_input`; `discards`, `restarts`, `severed`, `failed` and `reply_reserved` are the
+  fields of those names. A **frame** is one public write call with bytes `x`; `Acc(x)` is the
+  prefix of `x` it accepted (into `K` or `Spill`) and `AcceptedOrder(x)` the order minted for it.
+  `SPILL_CAP = 2 MiB`, `NONPARK_MAX = 4096`, `IMMEDIATE_FRAME_MAX = 16 KiB + 32`,
+  `METERED_SLICE = 4 KiB`, `PARK_RECHECK = 100 ms`.
 - **Brackets and UTF-8.** `OPEN = ESC[200~`, `CLOSE = ESC[201~` (6 bytes each).
-  `Bracketed(x)` ⇔ `|x| ≥ 12 ∧ x` starts with `OPEN` ∧ `x` ends with `CLOSE`.
+  `Bracketed(x)` ⇔ `|x| ≥ 12` ∧ `x` starts with `OPEN` ∧ `x` ends with `CLOSE`.
   `Cont(b)` ⇔ `b & 0xC0 = 0x80`.
-- **Liveness.** In `sink-waiters-escape` and `nonparking-progress`, "returns" means it returns
-  within a bounded number of `PARK_RECHECK` periods (or bounded spin steps) once the named event
-  occurs, under a fair scheduler.
-- `∸` is truncated subtraction; `+sat` is saturating addition; `x'` is the post-state.
+- **Liveness.** In `sink-waiters-escape` and `nonparking-progress`, "returns" means returns
+  within a bounded number of `PARK_RECHECK` periods (or spin steps) once the named event occurs,
+  under a fair scheduler.
+- `∸` is truncated subtraction, `+sat` saturating addition, `x'` the post-state.
 
 ## 1. Specs (TSV)
 
-Columns: `id`, `kind`, `functions`, `statement`, `subsumes (primary tests; secondary in §2)`,
-`rust features (what the proof must handle)`, `blocking gaps (audit §7)`.
+`subsumes` lists the primary tests (secondary ones are in §2); `rust features` is what the proof
+must handle; `blocking gaps` are audit §7 rows.
 
 ```tsv
 id	kind	functions	statement	subsumes	rust features	blocking gaps
+kernel-prefix-custody	invariant	sink::{KernelPrefix,WriteReceipt,WriteReceiptError,SinkWriter::{write_frame_with_prefix,write_frame_metered_with_prefix,try_write_frame_whole_with_prefix,wait_prefix_to_kernel},Spill::{push_front,push_back,pop_front,clear},Shared::drain_write}	A prefix-aware frame creates an optional owned receipt before actual direct/spill admission. Spill append, guarded tail and owed prepend reserve exactly that frame's queued bytes under the spill lock. Actual kernel writes decrement only its prefix; the frame RAII guard seals every return/error path. wait_prefix_to_kernel succeeds iff the receipt belongs to the same live sink identity, the frame is sealed, every admitted byte reached the kernel without cancellation, and every registered native write has returned and finished accounting. Later terminal replies or operator bytes cannot prolong it or revoke its success when they fail. Clear/discard/sever/failed drain cancels only undelivered owned bytes; already kernel-written chunk bytes are never cancelled twice. An unaccepted error tail owns no bytes; a direct partial error may still complete its accepted prefix. Weak sink binding preserves no descriptor and cannot match another sink, even on the same fd. Ordinary receipt/reply paths allocate no prefix owner. Existing AcceptedOrder attribution remains unchanged.	sink::prefix::tests::{kernel_prefix_state_conforms_including_later_reply_failure_and_cancel,a_real_partial_pipe_prefix_finishes_while_a_later_terminal_reply_is_still_spilled,queued_prefix_fails_on_sever_or_peer_close_and_ordinary_receipts_remain_unowned,a_direct_partial_error_owns_only_its_accepted_kernel_prefix_and_zero_bytes_own_none}	Optional Arc/Weak receipt, RAII frame seal, per-frame spill run ownership, Mutex/Condvar, KernelPrefix ty_model conformance/mutants and real pipe backpressure	1,2,3,7
+kernel-prefix-native-custody	invariant	sink::{prefix::{KernelPrefix,NativeWrite},Spill::clear,Shared::drain_write}	A prefix-aware drainer reserves a stack-only native-write guard under the spill lock before releasing that lock. Clearing pending bytes cannot settle the receipt while that native operation remains registered, including on cancellation. Native guard Drop releases custody on every return or unwind. Every spill clear advances its generation; a returned operation from an older generation neither decrements canceled bytes nor starts another native attempt for its old chunk. A blocking native write holds no spill mutex. Scope transition acknowledgement remains behind the worker owning this receipt, while GUI authority publication never waits. No global spill-empty condition is introduced.	sink::prefix::tests::{kernel_prefix_cancelled_native_write_conforms_and_rejects_early_retirement,a_cleared_pipe_prefix_retains_its_started_native_write_and_never_retries_the_old_chunk};aterm_gui::session_scoped_input_tests::guarded_scope_cancel_keeps_transition_ack_behind_its_started_native_write	Optional borrowed RAII native-write guard, spill generation, KernelPrefix ty_model cancellation mutants, real pipe/barrier custody controls	1,2,3,7
 op-wire-roundtrip	round-trip	edge::Op::{as_str,parse}	∀ op: Op::parse(op.as_str()) = Some(op). ∀ s: parse(s) = Some(op) ⇒ s = op.as_str(), so as_str is injective. Every s outside {as_str(o)} (including "" and "write-keys") parses to None: the parser fails closed.	edge::op_wire_tokens_roundtrip_and_unknown_fails_closed	&'static str return, match on &str literals, Option<enum>, quantifier over all &str	1,3,5
 connection-kind-ops	table-property	edge::ConnectionKind::ops	ops(Pull) = [ReadScreen]; ops(Push) = [WriteInput, Signal]; ops(Both) = [ReadScreen, WriteInput, Signal]. Corollary: ∀ k, ∀ op ∈ {ConfigWrite, ClipboardWrite, DeriveLoop}: op ∉ ops(k).	edge::connection_kind_ops_are_the_closed_human_fidelity_mapping	&'static [Op] slice return, enum match, slice contains	1,3
 hex-codec-and-ct-eq	round-trip	lib::{hex_digit,hex,hex_nibble,from_hex,ct_eq}, id::LaunchNonce::{to_hex,from_hex,ct_eq}, edge::EdgeToken::{to_hex,from_hex,ct_eq}	(a) hex_nibble(c) = Some(v) ⇔ c ∈ 0-9 ∪ a-f ∪ A-F, v its digit value; hex_digit(n) is the (n & 15)-th char of "0123456789abcdef". (b) ∀ b: |hex(b)| = 2|b|, every char ∈ [0-9a-f], hex(b)[2i..2i+2] = hex_digit(b[i]>>4), hex_digit(b[i]&15). (c) from_hex(s,out) = Some(()) ⇔ |s| = 2|out| ∧ every byte of s is a hex digit, and then out[i] = 16·nib(s[2i]) + nib(s[2i+1]); else None (never zero-filled). (d) ∀ b: from_hex(hex(b),out) = Some ∧ out = b; hence LaunchNonce::from_hex(n.to_hex()) = Some(n), likewise EdgeToken. (e) ct_eq(a,b) ⇔ |a| = |b| ∧ ∀i a[i] = b[i], with no data-dependent early exit in the loop.	id::launch_nonce_hex_roundtrips_and_ct_eq	String push/with_capacity, &str bytes, as_chunks::<2>, zip loop with early ? return, &mut [u8] out-param, u8 shifts/masks, fold over zip, char	1,2,3,5,7
@@ -95,9 +82,9 @@ input-epoch-accounting	contract	sink::SinkWriter::{input_epoch,driven_input,driv
 immediate-write	contract	sink::SinkWriter::{try_write_frame_immediate,try_write_frame_immediate_with_receipt,try_write_frame_whole_with_receipt,try_write_frame_immediate_reserved}, sink::Shared::queue_rest_held	x = [] ⇒ (Full, None), no reservation. Otherwise: BusyZero if |x| > IMMEDIATE_FRAME_MAX, severed, not declared nonblocking, the fd lock or spill mutex is contended (try_lock fails), Spill ≠ ∅, or the kernel answers EAGAIN, closed or fatal; Full if the kernel took x whole; PartialInDoubt{a}, 0 < a < |x|, if it took x[..a]. BusyZero: no byte of x enters K or Spill, now or later, and Spill is unchanged. Full: x is appended to K contiguously. PartialInDoubt{a}: exactly x[..a] is appended and no later byte of x ever reaches K. The whole write (try_write_frame_whole_with_receipt) answers Queued{a}, 0 < a < |x|, in PartialInDoubt's place whenever a drainer is running or can be arranged: x[..a] is appended to K and x[a..] is appended to Spill under the same spill mutex hold (the spill-active bit set, so a writer that saw Spill = ∅ before it and takes the fd lock after it is refused the direct lane), so it reaches K whole and before any later frame unless a sever drops the rest or a discard drops the frame whole (discard-and-read-evidence); the drainer is spawned by the arranger when one is installed, never inline under the fd lock; only an arrangement that fails leaves PartialInDoubt{a}. order is Some iff accepted > 0 (a minted but unaccepted order is not returned). The call never parks: no blocking lock or syscall.	sink::peer_closed_immediate_write_has_no_accepted_order, sink::immediate_write_refuses_contention_without_delayed_injection, sink::immediate_write_refuses_spill_without_delayed_injection, immediate_egress::initial_eagain_is_busy_zero_and_never_appears_later, immediate_egress::short_write_is_partial_in_doubt_and_tail_is_never_injected, sink::the_guarded_writes_rest_defers_its_drainer_to_the_arranger, immediate_egress::the_guarded_write_queues_the_rest_of_a_short_write_and_delivers_it_whole, input_backlog_pty::a_guarded_text_longer_than_the_input_queue_is_delivered_whole_and_in_order, immediate_egress::a_blocking_frame_that_saw_the_spill_empty_queues_behind_the_guarded_rest	try_lock on two mutexes with poison recovery, nonblocking write syscall result enum, atomics, &self	1,2,4,8,13
 nonparking-progress	contract	sink::SinkWriter::{write_frame_nonparking_with_receipt,write_frame_interactive_with_receipt,write_frame_unparked,spill_or_when_full}	Interactive egress never parks: from every state it returns after ≤ TRY_LOCK_SPINS spin hints plus a bounded number of non-blocking syscalls, never waiting on the fd lock, kernel room or spill room; the spill mutex is never held across a write(2) that can park (the drainer writes under it only on a master declared non-blocking). |Spill| ≥ SPILL_CAP at entry ⇒ Err with is_refused() = true, accepted = 0, order = None, nothing appended. A frame of any size below the cap is written directly or spilled, so the spill can pass the cap by at most one frame. No drainer arrangeable ⇒ Err with is_refused() = false. Non-parking egress (|x| ≤ NONPARK_MAX): while |Spill| < SPILL_CAP and a drainer exists or can be arranged, returns Ok(|x|) after bounded steps, conceding a contended lock to the spill; otherwise it delegates to the blocking body, which parks (intended backpressure). A dead fd (−1) fails with is_refused() = false.	sink::contended_nonparking_write_concedes_within_a_bounded_spin, sink::the_interactive_egress_refuses_at_the_spill_cap_and_never_parks, sink::a_large_interactive_frame_spills_instead_of_parking, sink::the_drainer_never_parks_in_its_write_under_the_spill_mutex	bounded spin loop over try_lock, progress argument under concurrency, syscalls, Mutex, inline thread spawn	2,5,7,8,13
 spill-bound	invariant	sink::Shared::spill_append, sink::SinkWriter::{write_frame_unparked,write_frame_after_reserve,spill_tail_locked}	An append under Room::Wait happens only when |Spill| ≤ SPILL_CAP (or no drainer is live). An append under Room::NoWait happens only after its caller read |Spill| < SPILL_CAP. A prepend adds at most one frame's tail plus ≤ 12 owed bytes. Hence |Spill| ≤ SPILL_CAP + P·F, P the number of concurrent non-parking producers and F the largest frame they append. One non-parking producer of frames ≤ NONPARK_MAX: |Spill| ≤ SPILL_CAP + NONPARK_MAX + 12, so retained heap is O(SPILL_CAP).	spill_bound::nonparking_spill_is_bounded_against_a_wedged_pty	VecDeque length invariant under Mutex, racy pre-check of an AtomicUsize cache, condvar wait loop, concurrency	1,2,7,13
-drainer-arrangement	contract	sink::Shared::{spill_append,arrange_drainer}, sink::SinkWriter::{install_spill_arranger,arrange_pending_drainer}	Spill.draining ⇔ a drainer thread is live ∨ arrange_pending. A NoWait append (a concession) that finds ¬draining with an arranger installed (first install wins) sets draining ∧ arrange_pending, commits the bytes, spawns no thread and calls the arranger once after releasing the mutex; each later conceding append while arrange_pending holds calls it once again. With no arranger the append arranges inline (dup + spawn), leaving draining ∧ ¬arrange_pending, or returns NoDrainer on failure. arrange_pending_drainer() is a no-op unless arrange_pending; then it clears the flag and spawns, rolling draining back on failure. A Room::Wait waiter that sees arrange_pending arranges the drainer itself. So no waiter waits on a pending drainer that does not exist, and the spill eventually drains when the peer reads.	sink::a_concession_with_an_arranger_defers_the_spawn_to_the_worker, sink::without_an_arranger_the_concession_arranges_inline_as_before, sink::a_waiter_for_spill_room_arranges_a_pending_drainer_itself	OnceLock<Box<dyn Fn>> (higher-order), thread spawn and dup(2) failure paths, Mutex-guarded flags, &mut Spill, Arc<Self> receiver	1,2,8,13
+drainer-arrangement	contract	sink::Shared::{spill_append,arrange_drainer}, sink::SinkWriter::{install_spill_arranger,arrange_pending_drainer,wait_egress_drained_to_kernel,wait_egress_drained_to_kernel_for}, sink::Spill::clear	Spill.draining ⇔ a drainer thread is live ∨ arrange_pending. A NoWait append (a concession) that finds ¬draining with an arranger installed (first install wins) sets draining ∧ arrange_pending, commits the bytes, spawns no thread and calls the arranger once after releasing the mutex; each later conceding append while arrange_pending holds calls it once again. With no arranger the append arranges inline (dup + spawn), leaving draining ∧ ¬arrange_pending, or returns NoDrainer on failure. arrange_pending_drainer() is a no-op unless arrange_pending; then it clears the flag and spawns, rolling draining back and waking waiters on failure. Spill::clear clears arrange_pending ∧ draining when no drainer thread is live yet. A Room::Wait or completion-fence waiter that sees arrange_pending arranges the drainer itself (rolling draining back and waking waiters on failure). So no waiter waits on a pending drainer that does not exist, and the spill eventually drains when the peer reads.	sink::a_concession_with_an_arranger_defers_the_spawn_to_the_worker, sink::without_an_arranger_the_concession_arranges_inline_as_before, sink::a_waiter_for_spill_room_arranges_a_pending_drainer_itself	OnceLock<Box<dyn Fn>> (higher-order), thread spawn and dup(2) failure paths, Mutex-guarded flags, &mut Spill, Arc<Self> receiver	1,2,8,13
 egress-observers-and-fence	contract	sink::SinkWriter::{egress_drained_to_kernel,try_egress_drained_to_kernel,try_fence_egress,spilled_bytes}, sink::EgressFence	egress_drained_to_kernel() ⇔ Spill = ∅ (read through the cached atomic). try_egress_drained_to_kernel() = None iff another thread holds the spill mutex; otherwise Some(Spill = ∅), including when the mutex is poisoned; it never blocks. try_fence_egress() = Some(fence) iff the fd lock is free (a poisoned lock counts as acquired) ∧ Spill = ∅; else None, without blocking. While a fence lives no byte is appended to K by any writer or the drainer; non-parking frames queue whole in Spill and proceed in order when the fence drops.	sink::try_egress_drained_is_nonblocking_and_recovers_poison, sink::egress_drained_predicate_follows_the_spill, sink::the_egress_fence_keeps_every_frame_out_of_the_kernel_until_it_lifts	try_lock with TryLockError::Poisoned/WouldBlock, MutexGuard lifetime held in a returned struct, atomics, concurrency	1,2,13
-completion-fence	contract	sink::SinkWriter::{wait_egress_drained_to_kernel,wait_egress_drained_to_kernel_for}, sink::Shared::drain_loop	wait_egress_drained_to_kernel() blocks while draining ∧ Spill ≠ ∅ and returns Spill = ∅ ∧ ¬failed. failed is sticky: set when the drainer discards bytes after a closed peer or a hard error, and when sever drops a non-empty spill; never cleared. So after a loss every later call returns false while egress_drained_to_kernel() is true. _for(limit) returns None if the bytes are still process-local at the deadline, else the same answer. Liveness: if the peer reads, a waiter returns true once the spill has drained.	sink::egress_completion_fails_closed_when_the_spill_peer_dies	Condvar wait/wait_timeout loop (trust::paired), Instant deadline arithmetic, drainer behaviour on peer close (fd effect)	2,7,8,13
+completion-fence	contract	sink::SinkWriter::{wait_egress_drained_to_kernel,wait_egress_drained_to_kernel_for}, sink::Shared::drain_loop	wait_egress_drained_to_kernel() blocks while draining ∧ Spill ≠ ∅ (arranging any pending drainer itself under drainer-arrangement) and returns Spill = ∅ ∧ ¬failed. failed is sticky: set when the drainer discards bytes after a closed peer or a hard error, and when sever drops a non-empty spill; never cleared. So after a loss every later call returns false while egress_drained_to_kernel() is true. _for(limit) returns None if the bytes are still process-local at the deadline, else the same answer. Liveness: if the peer reads, a waiter returns true once the spill has drained.	sink::egress_completion_fails_closed_when_the_spill_peer_dies, sink::a_waiter_for_spill_room_arranges_a_pending_drainer_itself	Condvar wait/wait_timeout loop (trust::paired), Instant deadline arithmetic, drainer behaviour on peer close (fd effect)	2,7,8,13
 metered-frame	contract	sink::SinkWriter::{write_frame_metered_with_receipt,deliver_owed_locked}, sink::BulkMeter::{new,request_stop,stop_requested,progress,abandon,settle_unmetered}, sink::Shared::{write_stamped_blocking,prepend_owed}	meter.total := |x|. x = [] or a stop requested at entry ⇒ state Stopped, receipt (0,None), nothing written, sent = 0. Otherwise the state is Writing during the frame; after return it is Failed on Err, Delivered if accepted = |x|, Stopped if a stop was requested or a discard/sever happened since entry, Failed otherwise. Always sent = accepted. With no stop the frame's projection on K is x (sink-ordered-egress); with a stop at off > 0 it is x[..keep] ++ x[tail..] (bulk-stop-cut), so a bracketed paste stays closed and no character is half-sent (including on Windows when a blocked WriteFile or console-record write is released at a whole-character boundary). Owed bytes go to the front of Spill (or wait as the one post-stop write on Windows), ahead of every later frame, unless a discard or sever drops them. A frame waiting for spill room when the stop lands appends nothing and ends Stopped with sent = 0. A spilled-whole frame counts as fully sent. abandon() ⇒ Stopped; settle_unmetered(d) ⇒ Delivered if d, else Failed.	sink::a_frame_stopped_before_it_begins_writes_nothing, sink::a_metered_frame_reports_progress_and_a_stop_drops_the_unsent_middle, sink::an_unstopped_metered_frame_is_the_plain_frame, windows_input_release::stop_paste_releases_a_paste_blocked_in_writefile_and_its_close_waits_for_the_program, windows_input_release::stop_paste_of_records_releases_whole_characters_the_receipt_counts	AtomicU8 state encoding, composition with write-metered and bulk-stop-cut, poll/write syscalls, spill prepend under the fd lock, concurrency	1,2,4,7,8,13
 sink-waiters-escape	other (liveness)	sink::Shared::{write_stamped_blocking,spill_append,drain_loop}, sink::SinkWriter::{write_frame_metered_with_receipt,discard_unread_input,sever_input}, aterm_pty::{write_some_stoppable,release_stopped_writes}	Every parked party (a blocking writer in poll(POLLOUT) or ConPTY WriteFile holding the fd lock, a Room::Wait waiter for spill room, the drainer) returns within a bounded number of PARK_RECHECK periods (or immediately upon Windows overlapped release) after any of: (a) a stop on its own meter, for a metered writer; (b) a discard (the discard epoch moves), after which it writes no more of its frame; (c) a sever; (d) the peer making room. On Windows, releasing a blocked stoppable write reports the exact prefix delivered to the console host and makes no further WriteFile once stopped. After a discard the parked writer returns short (accepted = what the kernel took before it), and the next frame reaches the peer alone. Only (d) completes the frame. A pending drainer never strands a waiter (drainer-arrangement).	sink::a_stop_reaches_a_paste_parked_on_a_tty_that_is_not_draining, sink::a_stop_ends_a_paste_waiting_for_spill_room, input_backlog_pty::a_discard_ends_a_writer_parked_mid_frame, windows_input_release::a_released_write_reports_every_byte_the_program_reads	liveness under a fair scheduler, timed poll and condvar wait_timeout loops, atomics, a detached thread, fd effects (poll, tcflush, ConPTY overlapped WriteFile)	2,5,7,8,13
 sever-terminal	contract	sink::SinkWriter::{sever_input,is_severed}, sink::Shared::{is_severed,discarded_since,severed_error}, sink::ReplyBudget::try_reserve	sever_input() sets severed = true for good. Under the spill mutex it sets failed if Spill ≠ ∅, clears Spill, chunk_written and the spill-active bit, wakes every room waiter, and on Windows calls release_input_writes(master) so any frame or owed close blocked in ConPTY WriteFile is released without further WriteFile calls. A drainer parked on a full queue exits its poll loop and clears draining. It leaves discards and the kernel queue unchanged and is idempotent. Afterwards: write_frame*, write_frame_nonparking* and write_frame_interactive* fail at entry with ErrorKind::BrokenPipe and accept nothing; try_write_frame_immediate returns BusyZero; reply_budget().try_reserve(_) = None; wait_egress_drained_to_kernel() = false if the spill was dropped; frames in flight are dropped as a discard drops them.	sink::a_sever_unblocks_every_waiter, sink::a_sever_ends_a_drainer_parked_on_a_full_queue, windows_input_release::a_tabs_close_releases_the_owed_close_and_bars_every_later_write, windows_input_release::a_tabs_close_releases_a_frame_blocked_in_writefile	Mutex, AtomicBool/AtomicU64, Condvar notify_all, io::ErrorKind, composition over every entry point	1,2,4,13
@@ -109,8 +96,8 @@ discard-and-read-evidence	contract	sink::SinkWriter::{discard_unread_input,read_
 
 ## 2. Test → spec map (TSV)
 
-`primary` is the spec that retires the test. `also` lists the other specs the same test samples.
-`-` in `primary` means the test samples no spec (§4).
+`primary` is the spec that retires the test; `also` lists the other specs it samples. Some tests
+have no row yet, among them all of `tests/windows_input_release.rs`.
 
 ```tsv
 file	test	primary	also
@@ -188,7 +175,7 @@ src/sink.rs	the_interactive_egress_refuses_at_the_spill_cap_and_never_parks	nonp
 src/sink.rs	a_large_interactive_frame_spills_instead_of_parking	nonparking-progress	sink-ordered-egress
 src/sink.rs	a_sever_ends_a_drainer_parked_on_a_full_queue	sever-terminal	sink-waiters-escape
 src/sink.rs	a_sever_unblocks_every_waiter	sever-terminal	sink-waiters-escape, reply-budget, completion-fence
-src/sink.rs	a_waiter_for_spill_room_arranges_a_pending_drainer_itself	drainer-arrangement	sink-waiters-escape
+src/sink.rs	a_waiter_for_spill_room_arranges_a_pending_drainer_itself	drainer-arrangement	sink-waiters-escape, completion-fence
 src/sink.rs	reply_permits_bound_the_budget_and_release_on_drop	reply-budget	
 tests/conformance_authorize.rs	the_real_authorization_gate_conforms_to_authorize_soundness	decide-edge-denotation	
 tests/conformance_authorize.rs	the_dropped_destination_mutant_is_told_apart_from_the_real_gate	decide-edge-denotation	
@@ -226,7 +213,7 @@ tests/windows_input_release.rs	a_tabs_close_releases_a_frame_blocked_in_writefil
 tests/windows_input_release.rs	a_released_write_reports_every_byte_the_program_reads	sink-waiters-escape	write-metered
 ```
 
-## 3. Coverage
+## 3. Findings
 
 - 111 live tests mapped to the 37 specs (plus 4 historical non-spec tests deleted in §4).
 - The biggest collapses: `sink-ordered-egress` (9 primary, plus 4 shared), `decide-edge-denotation`
@@ -243,13 +230,13 @@ tests/windows_input_release.rs	a_released_write_reports_every_byte_the_program_r
   nothing yet (§5.8). Clause (2) of `sink-ordered-egress` should replace it with a theorem over
   the imported bodies.
 
-## 4. Tests that are not spec samples
+## 4. Proof order (easiest, high value first)
 
-> Status 2026-10-16: all 4 deleted, with the test-local `EdgeGate` and `SinkNoLoss` models; the
-> `conformance_fabric.rs` header is corrected. `conformance_fabric` now holds 1 test (crate: 97).
-> Status 2026-10-17: that last test went too, with the whole of `tests/conformance_fabric.rs`: its
-> `decide_edge` check repeated `edge::decide_edge_permits_only_exact_match`, and
-> `tests/conformance_authorize.rs` is the real conformance test with a negative control.
+The pure core (`edge.rs`, `id.rs`, `input_backlog.rs`) needs no effects lane (gap 8) except
+`session-id-format` (the FFI CSPRNG), the `trust::skip` bodies in `edge-table-ops`, and the
+real-pty half of `gate-classify-refine-input-unread-model`. In `sink.rs` everything beyond
+`bulk-stop-cut`, `write-metered` and `receipt-constructors` needs gap 13 (threads), and most of
+it gap 8.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
@@ -287,19 +274,16 @@ smallest Trust widening, and whose finite or table form allows decide-by-evaluat
    Straight-line `bool`/`Duration` logic over a struct, with no loops and no heap. They retire 4 tests
    directly and are the pure half of `gate-classify-refine-input-unread-model`, which retires the 5
    `conformance_input_unread` tests once the model is imported as a Lean predicate (gap 10).
-2. **`input-word-wire`, `connection-kind-ops`, `op-wire-roundtrip`** (gap 1; plus 3, and 5 for
-   `parse`). Table properties over small enums, decidable by evaluation once `&'static str` and
-   `&'static [Op]` have content models. They retire 3 tests and fix the wire vocabulary.
-3. **`ledger-discard-mark` and `receipt-constructors`** (gaps 1, 2, 3 and 1, 3). Field updates with
-   saturating arithmetic and `Option`, the first `&mut self` view for this crate. They retire 2 tests,
-   and `ledger-discard-mark` is the lemma `discard-and-read-evidence` (5 tests) needs.
-4. **`decide-edge-denotation`** (gaps 1, 2, 3, 4, 5, 10). Harder (finite-map content model for
-   `HashMap`, `ct_eq` loop), but it retires 6 tests, including all three real-code conformance tests,
-   and lets `edge-table-ops` and `grant-connection` (8 more) be stated against it.
-5. **`bulk-stop-cut`** (gaps 1, 3, 5, 7). Pure slice arithmetic with one bounded `while` loop; it is the
-   well-formedness lemma under `write-metered` and `metered-frame` (6 more tests).
-
-Next, `contention-arith` (gaps 1, 3, but f64 semantics), then the ledger chain
-(`input-ledger-run-invariant` → `ledger-oldest-unread-lower-bound` → `ledger-merge-relative-accuracy`).
-The `sink.rs` concurrency and effect specs wait on gaps 8 and 13 and come last, starting with
-`write-metered` (higher-order, no threads) and `reply-budget` (one CAS loop).
+2. **`input-word-wire`, `connection-kind-ops`, `op-wire-roundtrip`**: table properties over small
+   enums, decidable by evaluation once `&'static str` and `&'static [Op]` have content models.
+3. **`ledger-discard-mark` and `receipt-constructors`**: field updates with saturating arithmetic
+   and `Option`. `ledger-discard-mark` is the lemma `discard-and-read-evidence` needs.
+4. **`decide-edge-denotation`**: a finite-map content model for `HashMap` and the `ct_eq` loop;
+   it covers the real-code conformance tests, and `edge-table-ops` and `grant-connection` are
+   stated against it.
+5. **`bulk-stop-cut`**: slice arithmetic with one bounded `while` loop, the well-formedness lemma
+   under `write-metered` and `metered-frame`.
+6. `contention-arith` (f64 semantics), then `input-ledger-run-invariant` →
+   `ledger-oldest-unread-lower-bound` → `ledger-merge-relative-accuracy`.
+7. The `sink.rs` concurrency and effect specs (gaps 8, 13), starting with `write-metered`
+   (higher-order, no threads) and `reply-budget` (one CAS loop).

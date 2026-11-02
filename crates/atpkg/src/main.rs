@@ -16,5 +16,14 @@
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    // First, while this process has one thread, as aterm's `main` does: a build's claim holder
+    // forks away from its front's spawn, and this executable is recorded as the one the front
+    // spawns that holder from (and tethered spawns run through).
+    if let Some(code) = atpkg::build_admit::hold::entry() {
+        return code;
+    }
+    if let Some(code) = aterm_uds::tether::entry() {
+        return code;
+    }
     atpkg::cli::main_entry(std::env::args_os().skip(1).collect())
 }

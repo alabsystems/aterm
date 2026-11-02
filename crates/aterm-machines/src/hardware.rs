@@ -45,7 +45,7 @@ pub fn disk_cmd() -> Cmd {
 /// The bytes `sysctl -n hw.memsize` printed.
 #[must_use]
 pub fn parse_memsize(text: &str) -> Option<u64> {
-    text.trim().parse().ok().filter(|b| *b > 0)
+    crate::parse_uint(text.trim()).filter(|b| *b > 0)
 }
 
 /// The processor `sysctl -n machdep.cpu.brand_string` names, and an Intel processor's speed.
@@ -213,7 +213,7 @@ pub fn internal_disk(text: &str) -> Option<Disk> {
                 match key {
                     "\"Whole\"" => m.whole = value == "Yes",
                     "\"Removable\"" => m.fixed = value == "No",
-                    "\"Size\"" => m.bytes = value.parse().unwrap_or(0),
+                    "\"Size\"" => m.bytes = crate::parse_uint(value).unwrap_or(0),
                     _ => {}
                 }
             }

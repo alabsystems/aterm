@@ -9,7 +9,8 @@ use std::net::SocketAddr;
 
 use aterm_vitals::jobs::{
     Block, Class, Consumer, Fault, Fd, FdKind, GateWord, JobKind, JobRow, JobsView, Knote,
-    KnoteFilter, NamedWait, PHI_STUCK_MILLI, ProcState, TcpState, TierB, Verdict, WaitName,
+    KnoteFilter, NamedWait, PHI_STUCK_MILLI, ProcState, StartWait, TcpState, TierB, Verdict,
+    WaitName,
 };
 
 use super::world::{OutFile, Proc, World, hint};
@@ -1760,6 +1761,127 @@ pub fn all() -> Vec<Scenario> {
             model: true,
         },
         Scenario {
+            name: "held_then_sleeps.setsid",
+            row: "PC held 10 min, then the program starts and sleeps on a timer: the timer shows \
+                  at the reading that ends the hold, as the hold showed at the one that named it",
+            stretch_milli: 1000,
+            setup: |w| setsid(w, held_at_start(CHILD, "gh", true)),
+            each: |w, rel| {
+                if rel == 600_000 {
+                    let p = w.p(CHILD);
+                    p.held = false;
+                    p.wchan = Some("hrtimer_nanosleep".to_owned());
+                }
+            },
+            id: "a400",
+            until_ms: M20,
+            expect: &[
+                WaitAt(598_000, WaitName::ProgramCheck),
+                WaitAt(600_000, WaitName::Timer),
+                At(M20, Fine),
+                Never(Quiet),
+                Never(Stuck),
+            ],
+            model: true,
+        },
+        Scenario {
+            name: "translating.setsid",
+            row: "PC an agent's call whose x86_64 program Rosetta translates from its fork: work \
+                  in line, as a held one, fine however long, never quiet or stuck",
+            stretch_milli: 1000,
+            setup: |w| setsid(w, unstarted(CHILD, "x86tool", StartWait::Translating)),
+            each: nothing,
+            id: "a400",
+            until_ms: M20 + 10_000,
+            expect: &[
+                WaitAt(M1, WaitName::Translating),
+                At(M1, Fine),
+                At(M20, Fine),
+                Never(Quiet),
+                Never(Stuck),
+                PhiAtMost(0, 0),
+                NoProgressNever,
+            ],
+            model: true,
+        },
+        Scenario {
+            name: "translating_then_sleeps.setsid",
+            row: "PC translated 10 min, then the program starts and sleeps on a timer: the timer \
+                  shows at the reading that ends the translation, as the translation showed at \
+                  the one that named it",
+            stretch_milli: 1000,
+            setup: |w| setsid(w, unstarted(CHILD, "x86tool", StartWait::Translating)),
+            each: |w, rel| {
+                if rel == 600_000 {
+                    let p = w.p(CHILD);
+                    p.held = false;
+                    p.wchan = Some("hrtimer_nanosleep".to_owned());
+                }
+            },
+            id: "a400",
+            until_ms: M20,
+            expect: &[
+                WaitAt(598_000, WaitName::Translating),
+                WaitAt(600_000, WaitName::Timer),
+                At(M20, Fine),
+                Never(Quiet),
+                Never(Stuck),
+            ],
+            model: true,
+        },
+        Scenario {
+            name: "polling_then_held.setsid",
+            row: "PC a call that polled for a minute, then its program waits at macOS's program \
+                  check: waiting from the reading that names the hold, its polling none of the \
+                  hold's nor of the wait after it",
+            stretch_milli: 1000,
+            setup: |w| setsid(w, poller(CHILD)),
+            each: |w, rel| {
+                if rel == 60_000 {
+                    let p = w.p(CHILD);
+                    p.cpu_per_s = 0;
+                    p.syscalls_per_s = 0;
+                    p.held = true;
+                }
+                if rel == 600_000 {
+                    let p = w.p(CHILD);
+                    p.held = false;
+                    p.wchan = Some("hrtimer_nanosleep".to_owned());
+                }
+            },
+            id: "a400",
+            until_ms: M20,
+            expect: &[
+                ClassAt(58_000, Class::Polling),
+                WaitAt(60_000, WaitName::ProgramCheck),
+                ClassAt(60_000, Class::Waiting),
+                ClassAt(600_000, Class::Waiting),
+                WaitAt(600_000, WaitName::Timer),
+                At(M20, Fine),
+                Never(Quiet),
+                Never(Stuck),
+            ],
+            model: true,
+        },
+        Scenario {
+            name: "not_started.setsid",
+            row: "PC the same call with its program on a volume not proven local: nothing read \
+                  says why it has not started, so an unnamed wait, quiet at the prior's first \
+                  crossing",
+            stretch_milli: 1000,
+            setup: |w| setsid(w, unstarted(CHILD, "nfsprog", StartWait::NotStarted)),
+            each: nothing,
+            id: "a400",
+            until_ms: M20,
+            expect: &[
+                WaitAt(M1, WaitName::Unnamed),
+                FirstAt(Quiet, 416_000),
+                At(M20, Quiet),
+                Never(Stuck),
+            ],
+            model: true,
+        },
+        Scenario {
             name: "held_beside_curl.setsid",
             row: "PC a call whose job reads a quiet socket in one leaf while macOS's program check \
                   holds its other leaf: program-check ranks first, fine throughout",
@@ -1879,6 +2001,14 @@ fn held_at_start(pid: u32, name: &str, flagged: bool) -> Proc {
     let mut p = sleeper(pid, name);
     p.counters.cpu_ns = 2_000_000;
     p.held = flagged;
+    p
+}
+
+/// A program whose one thread never ran past 20 s, as [`held_at_start`] reads one, kept from its
+/// first instruction by `wait`.
+fn unstarted(pid: u32, name: &str, wait: StartWait) -> Proc {
+    let mut p = held_at_start(pid, name, true);
+    p.wait = wait;
     p
 }
 

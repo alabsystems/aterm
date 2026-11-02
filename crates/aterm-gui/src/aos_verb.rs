@@ -134,6 +134,7 @@ pub(crate) fn parse_form(rest: &str, debug_forms: bool) -> Result<Form, String> 
         ["export"] => Ok(Form::Export(None)),
         ["export", kept] => kept
             .strip_prefix("kept=")
+            .filter(|n| n.bytes().all(|b| b.is_ascii_digit()))
             .and_then(|n| n.parse::<u64>().ok())
             .map(|n| Form::Export(Some(n)))
             .ok_or_else(|| USAGE.to_string()),

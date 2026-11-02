@@ -198,7 +198,7 @@ fn a_press_refused_or_warned_input_unread_reads_status_before_it_presses_again()
             &["status"]
         } else {
             &[
-                "mark - act word=approve rule=read-only.classify-v10",
+                "mark - act word=approve rule=read-only.classify-v11",
                 "status",
             ]
         };
@@ -1529,4 +1529,38 @@ fn a_beside_memory_restart_rechecks_the_current_screen_sequence() {
         0,
         "the wait's frozen seq is not fresh"
     );
+}
+
+#[test]
+fn a_transient_stall_word_raises_a_withheld_ask_badge_without_freezing() {
+    for (flips, want_badges, want_frozen) in [(true, 1, 0), (false, 0, 1)] {
+        let mut m = Mock::new(vec![busy_screen(), question_screen()]);
+        m.vanish_after = Some(3);
+        m.input_after = if flips {
+            vec![(1, INPUT_STALLED), (2, INPUT_CLEAR)]
+        } else {
+            vec![(1, INPUT_STALLED)]
+        };
+        let (lines, _, journal) = hosted_journaled(&mut m, "stall-transient-ask");
+        assert_eq!(
+            badge_acts(&m).len(),
+            want_badges,
+            "flips={flips}: {journal:#?}\n{:#?}",
+            m.requests
+        );
+        assert_eq!(
+            journal.iter().filter(|l| l.starts_with("FROZEN")).count(),
+            want_frozen,
+            "flips={flips}: {journal:#?}"
+        );
+        assert!(
+            !journal.iter().any(|l| l.starts_with("THAWED")),
+            "flips={flips}: {journal:#?}"
+        );
+        assert_eq!(
+            lines.iter().filter(|l| l.starts_with("EVENT ")).count(),
+            1,
+            "review-point-once: flips={flips}: {lines:#?}"
+        );
+    }
 }

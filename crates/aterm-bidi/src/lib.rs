@@ -764,7 +764,7 @@ fn resolve_into(
             .map_or(classes.len(), |off| start + off + 1)
             .min(classes.len());
         if let (Some(cls), Some(lv)) = (classes.get(start..end), levels.get_mut(start..end)) {
-            let br = brackets.get(start..end).unwrap_or(&[]);
+            let br = brackets.get(start..end.min(brackets.len())).unwrap_or(&[]);
             resolve_paragraph(cls, br, base, r, lv);
         }
         start = end;
@@ -1695,6 +1695,16 @@ mod generated {
                 assert_eq!(cell_order, cells, "{line:?}");
             }
         }
+        // Partial `brackets` slices shorter than a paragraph still supply the
+        // entries they have and default only the missing trailing indices to
+        // `Bracket::None` (N0 paired brackets inside an RTL run).
+        let partial_para: Vec<char> = "\u{05D0}(a)\u{05D1}x".chars().collect();
+        let (p_cls, p_br) = classes_and_brackets(&partial_para);
+        assert_eq!(
+            resolve_levels_from_classes(&p_cls, &p_br[..p_cls.len() - 1], BaseDirection::Rtl),
+            resolve_levels_from_classes(&p_cls, &p_br, BaseDirection::Rtl),
+            "truncating a trailing non-bracket entry must preserve earlier bracket pairs"
+        );
     }
 
     #[test]

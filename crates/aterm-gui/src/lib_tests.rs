@@ -856,6 +856,7 @@ fn the_settling_momentum_glow_keeps_the_lane_to_its_last_frame() {
         theme_fg: 0x00C8_D3F5,
         theme_bg: 0x001A_1B26,
         block: true,
+        bar: false,
         glyph_span: None,
         light_vivid: false,
         chosen_hue: false,
@@ -1053,6 +1054,7 @@ fn disabling_serious_mode_restores_latest_underlying_requests() {
 fn a_windowed_bell_plays_one_alert_sound_per_lane() {
     let mut app = App::headless_for_test();
     app.headless = false;
+    app.config.bell_sound = Some(true);
     let now = std::time::Instant::now();
     let before = crate::alert_sounds_on_this_thread();
 
@@ -1097,8 +1099,8 @@ fn a_silenced_bell_never_consumes_the_audible_rate_limit_lane() {
     let mut app = App::headless_for_test();
     app.headless = false;
     assert!(
-        app.config.bell_sound_or_default(),
-        "the audible bell ships ON; this switch is the opt-OUT",
+        !app.config.bell_sound_or_default(),
+        "the audible bell is opt-in",
     );
     let now = std::time::Instant::now();
     let before = crate::alert_sounds_on_this_thread();
@@ -1119,6 +1121,7 @@ fn a_silenced_bell_never_consumes_the_audible_rate_limit_lane() {
 #[test]
 fn a_headless_bell_never_reaches_the_alert_sound() {
     let mut app = App::headless_for_test();
+    app.config.bell_sound = Some(true);
     assert!(app.headless, "the fixture is a headless instance");
     assert!(
         app.config.bell_sound_or_default(),
@@ -1154,6 +1157,7 @@ fn status_field<'a>(record: &'a str, key: &str) -> Option<&'a str> {
 fn a_bell_is_kept_on_the_tab_that_rang_it_and_on_no_other() {
     let mut app = App::headless_for_test();
     app.headless = false;
+    app.config.bell_sound = Some(true);
     let quiet = app.next_session_id;
     app.push_stub_tab(WindowId(0), crate::stub_session(quiet));
     {
@@ -2168,4 +2172,18 @@ fn zoom_surviving_a_reload_never_paints_a_frame_wider_than_the_window() {
         frame_w(&app) <= win.width as usize,
         "INVARIANT: the composed frame never exceeds the window"
     );
+}
+
+#[test]
+fn default_bells_are_recorded_without_alerting() {
+    let mut app = App::headless_for_test();
+    app.headless = false;
+    let before = crate::alert_sounds_on_this_thread();
+    let now = std::time::Instant::now();
+    app.on_bell(WindowId(0), 0, now);
+    app.on_bell(WindowId(0), 0, now);
+    assert_eq!(crate::alert_sounds_on_this_thread(), before);
+    let record = app.session_status_record(0).expect("the ringing session");
+    assert_eq!(status_field(&record, "bells"), Some("2"));
+    assert_eq!(status_field(&record, "bells_sounded"), Some("0"));
 }

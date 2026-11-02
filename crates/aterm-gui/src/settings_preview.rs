@@ -347,14 +347,15 @@ impl CursorPreviewSpec {
     }
 
     /// The preview's glow config on `theme`, resolved as a window's is, over a card whose page
-    /// is `clear` (no wallpaper under it). Its light (`docs/design/PRISM-GLASS.md` §15.2 1.11)
-    /// has no latch: the preview's theme is both its configured scheme and its page, and no
-    /// program moves either, so the light is [`crate::cursor_glow::Light::admitted`] the two
-    /// tests a window's latch gates on (`scheme_light`, `raw_light`) at `prism_glass::LIVE`,
-    /// from the first frame, on its page as a window's is (§15.2 1.7,
-    /// [`crate::cursor_glow::Light::on_page`]): over a wallpaper the light is sheer and draws
-    /// main's paper arm. The card draws no translucency, so its page is clear unless a wallpaper
-    /// lies under it.
+    /// takes `glass` ([`aterm_effects::host::PageFacts::glass`] for a window's). Its light
+    /// (`docs/design/PRISM-GLASS.md` §15.2 1.11) has no latch: the preview's theme is both its
+    /// configured scheme and its page, and no program moves either, so the light is
+    /// [`crate::cursor_glow::Light::admitted`] the two tests a window's latch gates on
+    /// (`scheme_light`, `raw_light`) at `prism_glass::LIVE`, from the first frame, on its page as
+    /// a window's is (§15.2 1.7, [`crate::cursor_glow::Light::on_page`]): on a page that takes no
+    /// glass the light is sheer and draws main's paper arm. The Cursor card's page keeps a
+    /// window's page law (§15.8 amendment 54, [`CursorScene`]'s frame): it takes the glass where
+    /// the card's face, at the card's device size, lays its letters full.
     fn glow_config(
         &self,
         theme: Theme,
@@ -1645,6 +1646,11 @@ impl SettingsPreviewSpec {
                     format!(", paused because {}", PreviewPause::Viewer.because())
                 } else {
                     match spec.animation() {
+                        // With no trail the glow is all that moves, and the trail's words
+                        // already said so ("glowing as you type"): say typing once.
+                        PreviewAnimation::Continuous if !spec.cursor.has_resolved_trail() => {
+                            String::new()
+                        }
                         PreviewAnimation::Continuous => ", shown while typing".to_string(),
                         PreviewAnimation::BlinkEdge { .. } => ", blinking".to_string(),
                         PreviewAnimation::None => String::new(),
@@ -4143,8 +4149,8 @@ impl TypedLine {
     }
 }
 
-/// Tests' negative controls over the cursor scenes a thread builds
-/// ([`CursorScene::new`]), each reverting one law.
+/// Tests' observation and negative controls over the cursor scenes a thread builds
+/// ([`CursorScene::new`]).
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct SceneControls {
@@ -4166,6 +4172,14 @@ struct SceneControls {
     /// A light rising past the card's top edge is laid shorter inside it;
     /// off, the box's clip cuts it flat there (`CursorGlow::set_rise_cut`).
     rises_kept: bool,
+    /// The card draws its caret in `CursorFxFrame::caret_fill` (a bar's
+    /// lifted colour); off, in the block's fill alone, as the card did before.
+    thin_caret_fill: bool,
+    /// Retain the actual pre-yield body's ablated under stream with its cached step.
+    observe_body: bool,
+    /// A typed light lives its tuned life times the duration's share of the default
+    /// (`CursorGlow::set_typed_life_scaled`); off, its tuned life whatever the duration.
+    typed_life_scaled: bool,
 }
 
 #[cfg(test)]
@@ -4178,6 +4192,9 @@ thread_local! {
             one_seat_a_line: true,
             glyph_ink: true,
             rises_kept: true,
+            thin_caret_fill: true,
+            observe_body: false,
+            typed_life_scaled: true,
         })
     };
 }
@@ -4398,6 +4415,29 @@ pub(crate) struct SceneCardShot {
     /// Card device pixels `(x0, x1, y0, y1)`, end exclusive: the union of the companion's
     /// sprites as the card drew them (the terminal's `pet_body`, its sprite unshaved).
     body: Option<(i32, i32, i32, i32)>,
+    #[cfg(test)]
+    without_body_under: Option<Vec<GlowQuad>>,
+    #[cfg(test)]
+    scene_fingerprint: u64,
+}
+
+/// The actual last decorated card, removing only its recorded body glass before the yield.
+#[cfg(test)]
+pub(crate) fn scene_card_without_body_for_test(
+    observed: &RenderInput,
+    scene_fingerprint: u64,
+) -> Option<RenderInput> {
+    DECORATED_CARD.with_borrow(|shot| {
+        let shot = shot.as_ref()?;
+        if shot.scene_fingerprint != scene_fingerprint || shot.input != *observed {
+            return None;
+        }
+        let mut input = shot.input.clone();
+        input
+            .glow_under
+            .clone_from(shot.without_body_under.as_ref()?);
+        Some(input)
+    })
 }
 
 /// A card a raster blitted: the shot, the specimen it played on (for its bare twin) at the
@@ -4578,10 +4618,10 @@ pub(crate) struct CursorScene {
     controls: SceneControls,
     /// The whole rows the card shows (`None`: every row of the grid).
     card_rows: Option<usize>,
-    /// The card's page is clear (§15.2 1.7's page law, [`aterm_effects::host::PageFacts::clear`]
-    /// as a window reads its own): the card draws no translucency, so it is clear unless a
-    /// wallpaper lies under it; only a clear page's light draws the glass.
-    page_clear: bool,
+    /// A wallpaper lies under the card (§15.2 1.7's page law, [`aterm_effects::host::PageFacts`]
+    /// as a window reads its own). The card draws no translucency, so with no wallpaper its page
+    /// is clear.
+    wallpaper: bool,
     /// Total over every field above but the phase.
     script_key: u64,
     /// Total over every field above, for the raster frame memo.
@@ -4602,6 +4642,8 @@ struct SceneStep {
     /// The theme's text holds the bloom, or its post passes spare the
     /// letters, as the live terminal's do.
     bloom_gate: aterm_core::render::BloomGate,
+    #[cfg(test)]
+    without_body_under: Option<Vec<GlowQuad>>,
 }
 
 struct ScenePlayer {
@@ -4632,7 +4674,7 @@ impl ScenePlayer {
     }
 }
 
-struct SceneStage<'a> {
+struct SceneStage<'a, 'renderer> {
     /// The specimen as the first line types on it.
     base: &'a RenderInput,
     /// The specimen once a Return has handed a line to the shell.
@@ -4645,6 +4687,9 @@ struct SceneStage<'a> {
     /// handed to the trail as the terminal's host hands it the live face's: its letter guard
     /// reads each letter's ink as the raster lays it. `None`: each glyph's ink as its colour.
     ink: Option<&'a std::sync::Arc<aterm_render::GlyphInk>>,
+    renderer: Option<&'a std::cell::RefCell<&'renderer mut aterm_render::Renderer>>,
+    #[cfg(test)]
+    without_body_under: std::cell::RefCell<Option<Vec<GlowQuad>>>,
 }
 
 impl CursorScene {
@@ -4715,11 +4760,7 @@ impl CursorScene {
             #[cfg(test)]
             controls,
             card_rows,
-            page_clear: aterm_effects::host::PageFacts {
-                opaque: true,
-                wallpaper: spec.wallpaper.is_some(),
-            }
-            .clear(),
+            wallpaper: spec.wallpaper.is_some(),
             script_key: script.finish(),
             fingerprint: hash.finish() | 1,
         }
@@ -4750,11 +4791,34 @@ impl CursorScene {
 
     /// [`Self::decorate`], the card's face laying each glyph as `ink` says
     /// ([`SceneStage::ink`]).
+    #[cfg(test)]
     pub(crate) fn decorate_inked(
         &self,
         base: &RenderInput,
         cell: (usize, usize),
         ink: Option<&std::sync::Arc<aterm_render::GlyphInk>>,
+    ) -> RenderInput {
+        self.decorate_observed(base, cell, ink, None)
+    }
+
+    /// Play with actual current-frame glyph evidence from the same renderer that draws it.
+    pub(crate) fn decorate_with_renderer(
+        &self,
+        base: &RenderInput,
+        renderer: &mut aterm_render::Renderer,
+    ) -> RenderInput {
+        let cell = renderer.cell_size();
+        let ink = renderer.glyph_ink();
+        let source = std::cell::RefCell::new(renderer);
+        self.decorate_observed(base, cell, Some(&ink), Some(&source))
+    }
+
+    fn decorate_observed(
+        &self,
+        base: &RenderInput,
+        cell: (usize, usize),
+        ink: Option<&std::sync::Arc<aterm_render::GlyphInk>>,
+        renderer: Option<&std::cell::RefCell<&mut aterm_render::Renderer>>,
     ) -> RenderInput {
         #[cfg(test)]
         let ink = ink.filter(|_| self.controls.glyph_ink);
@@ -4804,6 +4868,8 @@ impl CursorScene {
             head: 0,
         };
         let mut cat = None;
+        #[cfg(test)]
+        let mut without_body_under = None;
         if self.typing {
             let stage = SceneStage {
                 base,
@@ -4813,8 +4879,15 @@ impl CursorScene {
                 geom,
                 cursor_style: input.cursor_style,
                 ink,
+                renderer,
+                #[cfg(test)]
+                without_body_under: std::cell::RefCell::new(None),
             };
             cat = self.play(&mut input, &stage, cell);
+            #[cfg(test)]
+            {
+                without_body_under = stage.without_body_under.into_inner();
+            }
         }
         let source = scrolled.as_ref().unwrap_or(base);
         let caret_at = |at: u64| line.caret(line.shown_at(at)).min(cols - 1);
@@ -4844,6 +4917,10 @@ impl CursorScene {
             cell,
             input: input.clone(),
             body,
+            #[cfg(test)]
+            without_body_under,
+            #[cfg(test)]
+            scene_fingerprint: self.fingerprint,
         });
         input
     }
@@ -4851,7 +4928,7 @@ impl CursorScene {
     fn play(
         &self,
         input: &mut RenderInput,
-        stage: &SceneStage<'_>,
+        stage: &SceneStage<'_, '_>,
         cell: (usize, usize),
     ) -> Option<aterm_effects::kitty_cursor::CatFrame> {
         use std::hash::{Hash, Hasher};
@@ -4871,6 +4948,10 @@ impl CursorScene {
         (stage.row, stage.line.start, stage.line.end).hash(&mut key);
         (stage.geom.rows, stage.geom.cols).hash(&mut key);
         stage.ink.map(|ink| ink.fingerprint()).hash(&mut key);
+        if let Some(renderer) = stage.renderer {
+            let epoch = renderer.borrow().glyph_ink_epoch();
+            epoch.hash(&mut key);
+        }
         let key = key.finish();
         let target = self.warm_cycles() * CURSOR_SCENE_CYCLE_MS + self.shown_offset();
         let step = PLAYER.with_borrow_mut(|slot| {
@@ -4893,6 +4974,10 @@ impl CursorScene {
             }
             player.step.clone()
         });
+        #[cfg(test)]
+        stage
+            .without_body_under
+            .replace(step.without_body_under.clone());
         input.cursor_glow_add = step.glow_add;
         input.glow_under = step.glow_under;
         input.glow_halo = step.glow_halo;
@@ -4903,7 +4988,11 @@ impl CursorScene {
         input.bloom_gate = step.bloom_gate;
         if let Some(frame) = step.frame {
             input.cursor_trail_color = frame.trail_color;
-            input.cursor_fill_override = frame.block_fill.map(|owned| owned.fill);
+            input.cursor_fill_override = frame.caret_fill();
+            #[cfg(test)]
+            if !self.controls.thin_caret_fill {
+                input.cursor_fill_override = frame.block_fill.map(|owned| owned.fill);
+            }
             input.cursor_effect_style_override = compose_caret_style_override(
                 frame.bolt_cursor,
                 frame.twinkle_cursor,
@@ -4919,7 +5008,7 @@ impl CursorScene {
         step.cat
     }
 
-    fn step(&self, player: &mut ScenePlayer, stage: &SceneStage<'_>, at: u64, keep: bool) {
+    fn step(&self, player: &mut ScenePlayer, stage: &SceneStage<'_, '_>, at: u64, keep: bool) {
         use aterm_effects::cursor_fx::head_dx_for;
 
         let ScenePlayer {
@@ -5024,15 +5113,30 @@ impl CursorScene {
         fx.glow.set_motes_cut(!self.controls.motes_whole);
         #[cfg(test)]
         fx.glow.set_rise_cut(!self.controls.rises_kept);
+        #[cfg(test)]
+        fx.glow
+            .set_typed_life_scaled(self.controls.typed_life_scaled);
         fx.glow.observe_frame_text_at(
             Some((row as u16, caret)),
             text,
             ((0, 0), stage.geom.cols),
             now,
         );
-        let mut glow =
-            self.cursor
-                .glow_config(self.theme, head_dx_for(stage.cursor_style), self.page_clear);
+        // The card keeps a window's page law (`docs/design/PRISM-GLASS.md` §15.2 1.7, §15.8
+        // amendments 53 and 54): its page takes the glass when it is clear and the card's face,
+        // at the card's device size, lays its thinnest glyph's darkest pixel no further toward
+        // the page than `colour::THIN_INK_SHARE`, read off the face's ink as `App::page_facts`
+        // reads a window's. With no ink to read, it takes none.
+        let lum = |c: u32| aterm_render::linear_luminance(c & 0x00FF_FFFF);
+        let page = aterm_effects::host::PageFacts {
+            opaque: true,
+            wallpaper: self.wallpaper,
+            thin_ink: stage.ink.map_or(1.0, |ink| {
+                ink.thin_share(lum(self.theme.fg), lum(self.theme.bg))
+            }),
+        };
+        let head_dx = head_dx_for(stage.cursor_style);
+        let mut glow = self.cursor.glow_config(self.theme, head_dx, page.glass());
         let presentation = self.cursor.resolved_trail_presentation();
         let mut comet = TrailConfig {
             enabled: self.cursor.trail_enabled && presentation.comet,
@@ -5089,6 +5193,30 @@ impl CursorScene {
             cursor_cat.frame(now)
         });
         if keep {
+            // The retained step publishes this text, not the outer specimen before its
+            // typing replay. Observe those exact glyphs and protect them through the same
+            // yield as a terminal window before flattening its ramps for the card.
+            let mut protected = base.clone();
+            protected.cells.clone_from(text);
+            protected.cursor_row = row;
+            protected.cursor_col = usize::from(caret);
+            protected.cursor_visible = self.caret_shown;
+            protected.glow_under = fx.glow.under_quads().to_vec();
+            protected.glow_under_ramps = fx.glow.under_ramps().clone();
+            let observed = stage
+                .ink
+                .and(stage.renderer)
+                .map(|renderer| renderer.borrow_mut().glyph_ink_for(&protected));
+            fx.glow
+                .observe_glyph_ink(observed.or_else(|| stage.ink.cloned()));
+            #[cfg(test)]
+            let without_body = self.controls.observe_body.then(|| {
+                aterm_effects::cursor_glow::glass_yield::without_body_glass_for_test(
+                    &protected,
+                    fx.glow.glass_laid(),
+                )
+            });
+            fx.glow.yield_glass(&mut protected, &[], now);
             // The scene keeps its glow as quads (its post passes read them),
             // every lit ramp row the quad it stands for.
             let quads = |quads: &[GlowQuad], ramps: &aterm_render::GlowRamps| {
@@ -5098,7 +5226,7 @@ impl CursorScene {
             };
             *kept = SceneStep {
                 glow_add: quads(&fx.glow_scratch, fx.glow.out_ramps()),
-                glow_under: quads(fx.glow.under_quads(), fx.glow.under_ramps()),
+                glow_under: quads(&protected.glow_under, &protected.glow_under_ramps),
                 glow_halo: fx.glow.halos().to_vec(),
                 fire_patch: fx.glow.patches().to_vec(),
                 char_fg: fx.glow.charred().to_vec(),
@@ -5107,6 +5235,9 @@ impl CursorScene {
                 frame: Some(frame),
                 cat,
                 bloom_gate: fx.bloom_gate(),
+                #[cfg(test)]
+                without_body_under: without_body
+                    .map(|input| quads(&input.glow_under, &input.glow_under_ramps)),
             };
         }
     }
@@ -5126,8 +5257,9 @@ impl CursorScene {
         let radius =
             finite_or(self.post_fx.bloom_radius, aterm_render::bloom::BLOOM_RADIUS).max(0.0);
         let (mut crown, mut blur) = (Vec::new(), Vec::new());
+        let mut mask = None;
         let (crown, blur) = if input.bloom_gate.spares_letters() {
-            aterm_render::bloom::spared_sources(
+            mask = aterm_render::bloom::spared_sources(
                 &input.cursor_glow_add,
                 input,
                 grid,
@@ -5140,7 +5272,7 @@ impl CursorScene {
             (&input.cursor_glow_add[..], &input.cursor_glow_add[..])
         };
         if self.post_fx.bloom && !input.bloom_gate.held() {
-            aterm_render::bloom::apply(
+            aterm_render::bloom::apply_kept_off(
                 frame,
                 blur,
                 input.rows,
@@ -5148,6 +5280,7 @@ impl CursorScene {
                     strength: finite_or(self.post_fx.bloom_strength, 0.0).max(0.0),
                     radius,
                 },
+                mask.as_ref(),
             )?;
         }
         let budget = if self.post_fx.hdr_glow && self.post_fx.display_edr {
@@ -8521,10 +8654,11 @@ mod tests {
         );
     }
 
-    /// The preview keeps the window's page law (§15.2 1.7, `host::PageFacts::clear`): at the
-    /// glass level the Cursor card over a wallpaper lights a sheer light, so its bed draws
-    /// main's paper table, where the same card with no wallpaper draws the glass (the negative
-    /// control); each scene reads its page off its spec's wallpaper.
+    /// The preview's light keeps the window's page law (§15.2 1.7, `Light::on_page`): at the
+    /// glass level a card whose page takes no glass lights a sheer light, so its bed draws
+    /// main's paper table, where one whose page takes it draws the glass (the negative control);
+    /// each scene reads its wallpaper off its spec. Its face's part of the law is
+    /// `the_cards_letters_read_under_every_light`'s (§15.8 amendment 54).
     #[cfg(unix)]
     #[test]
     fn the_preview_s_glass_keeps_the_page_law() {
@@ -8549,18 +8683,18 @@ mod tests {
         let (light, glass) = bed(false);
         assert!(
             light.on() && light.sheer() && !light.glass() && !glass,
-            "a card over a wallpaper draws main's paper table: {light:?}"
+            "a card whose page takes no glass draws main's paper table: {light:?}"
         );
-        let page_clear = |wallpaper| {
+        let wallpaper = |wallpaper| {
             let spec = SettingsPreviewSpec {
                 wallpaper,
                 ..SettingsPreviewSpec::cursor(cursor.clone())
             };
-            CursorScene::new(&spec, paper, None).page_clear
+            CursorScene::new(&spec, paper, None).wallpaper
         };
-        assert!(page_clear(None), "no wallpaper: a clear page");
+        assert!(!wallpaper(None), "no wallpaper: a clear page");
         assert!(
-            !page_clear(Some(solid_wallpaper([200, 30, 30], 0.0, false))),
+            wallpaper(Some(solid_wallpaper([200, 30, 30], 0.0, false))),
             "a wallpaper under the card"
         );
     }
@@ -9071,6 +9205,8 @@ mod tests {
             geom,
             cursor_style: base.cursor_style,
             ink: None,
+            renderer: None,
+            without_body_under: std::cell::RefCell::new(None),
         };
         let mut player = ScenePlayer::new(0, spec.post_fx.companion_look);
         let mut cold = Vec::new();
@@ -9121,6 +9257,145 @@ mod tests {
                 .iter()
                 .zip(&cold[1..keys])
                 .any(|(w, c)| w.1 > c.1)
+        );
+    }
+
+    /// The light the card's scene lays behind its head at a Trail duration of `ms`, `raw`'s
+    /// trail on Nord, summed over `phases`: each phase decorated as the card's raster decorates
+    /// it (`CursorScene::decorate_with_renderer`) and drawn by the same renderer beside its bare
+    /// twin (the same cells with every light cleared, `settings card clean`'s), the summed
+    /// channel distance of every pixel some channel of which lies more than 12 levels off the
+    /// twin's, outside the head's box: the caret's cell and two cells either side of it, a row
+    /// above and below (`trail_duration_read`'s measure in the terminal). `scaled` off is the
+    /// negative control (`SceneControls::typed_life_scaled`).
+    fn card_trail_light(raw: &str, ms: u64, scaled: bool, phases: &[u64]) -> u64 {
+        const HEAD_CELLS: usize = 2;
+        let kept = SCENE_CONTROLS.with(std::cell::Cell::get);
+        SCENE_CONTROLS.with(|controls| {
+            controls.set(SceneControls {
+                typed_life_scaled: scaled,
+                ..kept
+            });
+        });
+        let theme = NORD.into_theme();
+        let mut spec = SettingsPreviewSpec::cursor(CursorPreviewSpec {
+            blink: false,
+            trail_style: PreviewTrailStyle::parse(raw),
+            trail_style_raw: Arc::from(raw),
+            duration_ms: ms,
+            ..CursorPreviewSpec::default()
+        });
+        spec.terminal_theme = Some(NORD);
+        let mut rend =
+            aterm_render::Renderer::from_bytes(aterm_render::embedded_font(), 14.0, theme)
+                .expect("embedded renderer");
+        rend.set_runtime_font_discovery(false);
+        let (cw, ch) = rend.cell_size();
+        let mut total = 0;
+        for &phase in phases {
+            let spec = spec.clone().with_phase(phase).normalized();
+            let (base, _) = build_terminal_specimen_input(&spec, theme);
+            let lit = CursorScene::new(&spec, theme, None).decorate_with_renderer(&base, &mut rend);
+            let mut bare = lit.clone();
+            bare.clear_overlays();
+            let (on, off) = (rend.render_input(&lit), rend.render_input(&bare));
+            let place = rend.fx_frame(on.width, on.height, lit.rows);
+            let (cx0, cy0) = (
+                place.pad + lit.cursor_col * cw,
+                place.grid_top + lit.cursor_row * ch,
+            );
+            let (x0, x1) = (
+                cx0.saturating_sub(HEAD_CELLS * cw),
+                cx0 + (HEAD_CELLS + 1) * cw,
+            );
+            let (y0, y1) = (cy0.saturating_sub(ch), cy0 + 2 * ch);
+            total += on
+                .pixels
+                .iter()
+                .zip(&off.pixels)
+                .enumerate()
+                .filter(|&(i, _)| {
+                    let (x, y) = (i % on.width, i / on.width);
+                    !((x0..x1).contains(&x) && (y0..y1).contains(&y))
+                })
+                .map(|(_, (&p, &c))| {
+                    let d = [16u32, 8, 0].map(|sh| ((p >> sh) & 0xff).abs_diff((c >> sh) & 0xff));
+                    if d.iter().any(|&v| v > 12) {
+                        u64::from(d.iter().sum::<u32>())
+                    } else {
+                        0
+                    }
+                })
+                .sum::<u64>();
+        }
+        SCENE_CONTROLS.with(|controls| controls.set(kept));
+        total
+    }
+
+    /// TRAIL DURATION SHOWS ON THE CARD (access r3's must_fix, r14 PV7: "a knob whose change
+    /// is near-invisible reads as broken"): the Cursor card's scene on Nord, summed over its
+    /// motion from 300 ms to 2100 ms as access measured it, lays at least a fifth more light
+    /// behind its head at a Trail duration of 1200 ms than at the default 260 ms, and at least
+    /// a twentieth less at 60 ms, for every style that reads the knob (`TrailKnob::Duration`:
+    /// all but the Rainbow Kitty's, whose row says its ribbon follows the typing; Lumen lays
+    /// nothing behind its head at 260 ms or 60 ms there, and its 1200 ms trail behind it).
+    /// Before, a chained key's light lived as long as the key gap needed, whatever the
+    /// duration, and Lumen, Phaser and Sparkle laid within 5% at both. Negative control
+    /// (`SceneControls::typed_life_scaled` off, the lives before): one of Lumen, Phaser and
+    /// Sparkle lays under a fifth more at 1200 ms.
+    #[test]
+    fn the_card_shows_trail_duration() {
+        use aterm_effects::cursor_glow::{KnobContext, TrailKnob};
+        let phases: Vec<u64> = (1..=7).map(|k| k * 300).collect();
+        let styles: Vec<&str> = crate::prefs::CURSOR_TRAIL_STYLES
+            .iter()
+            .copied()
+            .filter(|raw| {
+                crate::app_config::resolve_trail_style(raw)
+                    .style
+                    .is_some_and(|glow| {
+                        glow.reads_knob(TrailKnob::Duration, KnobContext::widest(false))
+                    })
+            })
+            .collect();
+        assert!(
+            styles.len() >= 9,
+            "the styles that read Trail duration: {styles:?}"
+        );
+        let read: Vec<(&str, [u64; 3])> = aterm_spec::check::each(&styles, |&raw| {
+            (
+                raw,
+                [60, 260, 1_200].map(|ms| card_trail_light(raw, ms, true, &phases)),
+            )
+        });
+        let old: Vec<(&str, u64, u64)> =
+            aterm_spec::check::each(&["lumen", "phaser", "sparkle"], |&raw| {
+                (
+                    raw,
+                    card_trail_light(raw, 260, false, &phases),
+                    card_trail_light(raw, 1_200, false, &phases),
+                )
+            });
+        eprintln!("the card's trail light at 60, 260 and 1200 ms: {read:?}; before: {old:?}");
+        for &(raw, [short, default, long]) in &read {
+            assert!(
+                long > 0,
+                "fixture: {raw} lights the card behind its head at 1200 ms"
+            );
+            assert!(
+                long * 5 >= default * 6,
+                "{raw}: the card lays {long} of trail light at 1200 ms against {default} at \
+                 260 ms, under a fifth more"
+            );
+            assert!(
+                short * 20 <= default * 19,
+                "{raw}: the card lays {short} of trail light at 60 ms against {default} at \
+                 260 ms, under a twentieth less"
+            );
+        }
+        assert!(
+            old.iter().any(|&(_, default, long)| long * 5 < default * 6),
+            "negative control: the old lives lay a fifth more at 1200 ms in each: {old:?}"
         );
     }
 
@@ -9555,6 +9830,84 @@ mod tests {
         assert!(gain_below > 0, "light below the prompt row");
         let (off_a, _) = render(false);
         assert_eq!(off_a, bare);
+    }
+
+    /// Composed r2 B1: the Cursor preview's Bloom size lights more of the card the larger it
+    /// is, and its Bloom strength changes the card, under the gate that spares the letters:
+    /// the bloom keeps off the letters at its composite (`bloom::LetterMask`), so the card's
+    /// dense lines leave it a source to blur at every radius. NEGATIVE CONTROL
+    /// (`bloom::with_source_cut_by_reach`): the source cut a whole blur's reach off the
+    /// letters, as looks10 kept it, lit the card no more at a larger size.
+    #[test]
+    fn the_preview_s_bloom_size_and_strength_change_the_card() {
+        let _ = compiled(SettingsPreviewSpec::default());
+        let prepared = crate::tray_raster::prepared_semantic_font_for_direct_view_test(
+            &SemanticFontCandidate::default(),
+        );
+        let theme = PreviewTerminalTheme::from_scheme(&aterm_types::ColorScheme::default());
+        let (w, h) = (640usize, 160usize);
+        let render = |bloom: bool, radius: f32, strength: f32, phase: u64| {
+            let mut spec = SettingsPreviewSpec::cursor(CursorPreviewSpec {
+                blink: false,
+                ..CursorPreviewSpec::default()
+            })
+            .with_terminal_theme(theme)
+            .with_phase(phase)
+            .with_prepared_font(prepared.clone());
+            spec.post_fx.bloom = bloom;
+            spec.post_fx.bloom_strength = strength;
+            spec.post_fx.bloom_radius = radius;
+            spec.post_fx.sdr_boost = 0.0;
+            let spec = spec.normalized();
+            let specimen = spec.terminal_specimen(theme.into_theme(), None);
+            crate::tray_raster::rasterize_tray(
+                &[DrawPrim::TerminalSpecimen {
+                    x: 0.0,
+                    y: 0.0,
+                    spec: Box::new(specimen),
+                }],
+                w as u32,
+                h as u32,
+                1.0,
+                [0, 0, 0, 255],
+            )
+            .0
+        };
+        let phases = [1_400_u64, 2_340, 3_100];
+        let lit_at = |radius: f32| -> usize {
+            phases
+                .iter()
+                .map(|&phase| {
+                    let (lit, bare) = (
+                        render(true, radius, aterm_render::bloom::BLOOM_STRENGTH, phase),
+                        render(false, radius, aterm_render::bloom::BLOOM_STRENGTH, phase),
+                    );
+                    lit.chunks(4)
+                        .zip(bare.chunks(4))
+                        .filter(|(l, b)| l[..3].iter().zip(&b[..3]).any(|(l, b)| l > b))
+                        .count()
+                })
+                .sum()
+        };
+        let radii = [0.5f32, aterm_render::bloom::BLOOM_RADIUS, 8.0];
+        let lit: Vec<usize> = radii.iter().map(|&r| lit_at(r)).collect();
+        assert!(
+            lit[0] > 0 && lit[0] < lit[1] && lit[1] < lit[2],
+            "the card's lit area grows with the Bloom size: {lit:?} at {radii:?}"
+        );
+        let r = aterm_render::bloom::BLOOM_RADIUS;
+        assert_ne!(
+            render(true, r, 0.4, phases[1]),
+            render(true, r, 1.2, phases[1]),
+            "the Bloom strength changes the card"
+        );
+        let cut: Vec<usize> = aterm_render::bloom::with_source_cut_by_reach(|| {
+            radii.iter().map(|&r| lit_at(r)).collect()
+        });
+        assert!(
+            !(cut[0] < cut[1] && cut[1] < cut[2]),
+            "control: the source cut by the blur's reach lights the card no more at a larger size: {cut:?}"
+        );
     }
 
     #[test]
@@ -10358,9 +10711,27 @@ mod tests {
         };
         assert_eq!(off(true).animation(), PreviewAnimation::Continuous);
         assert_eq!(off(true).state_badge(), "Live typing glow");
-        assert!(off(true).semantic_value().contains("glowing as you type"));
+        let said = off(true).semantic_value();
+        assert!(said.contains("glowing as you type"));
+        // Typing is said once (composed r1's access judge, D2 b: "no trail, glowing as you
+        // type, shown while typing").
+        assert_eq!(said.matches("typ").count(), 1, "{said}");
         assert_eq!(off(false).animation(), PreviewAnimation::None);
         assert!(!off(false).semantic_value().contains("glowing"));
+        // Control: a trail still says when it is shown.
+        let comet = SettingsPreviewSpec::cursor(CursorPreviewSpec {
+            blink: false,
+            trail_enabled: true,
+            trail_style: PreviewTrailStyle::Comet,
+            trail_style_raw: Arc::from("comet"),
+            momentum_glow: true,
+            ..CursorPreviewSpec::default()
+        });
+        assert!(
+            comet.semantic_value().contains("shown while typing"),
+            "{}",
+            comet.semantic_value()
+        );
     }
 
     #[test]
@@ -10401,6 +10772,89 @@ mod tests {
             let unlit = played(&off(style, 0x00FF_FFFF, false), paper);
             assert!(unlit.glow_under.is_empty(), "{style:?}: no glow, no ink");
         }
+    }
+
+    /// The card draws a bar caret in the colour the effects lifted for it, as the terminal
+    /// does (composed r2: the card took the block's fill alone, and the gallery read
+    /// GitHub Light's #0969da bar at 2.58 on Comet's disc): wherever Comet's light lies on
+    /// the bar during the card's loop, the bar is drawn darker on the paper in its own hue,
+    /// and never lighter. Control: the block's fill alone draws the theme's colour throughout.
+    #[test]
+    fn the_card_draws_a_bar_caret_in_its_lifted_colour() {
+        const BAR: u32 = 0x0009_69DA;
+        let lifted_phases = || -> Vec<(u64, u32)> {
+            let mut spec = SettingsPreviewSpec::cursor(CursorPreviewSpec {
+                style: PreviewCursorStyle::Bar,
+                blink: false,
+                trail_enabled: true,
+                trail_style: PreviewTrailStyle::Comet,
+                trail_style_raw: Arc::from("comet"),
+                momentum_glow: true,
+                ..CursorPreviewSpec::default()
+            });
+            spec.terminal_theme = Some(PreviewTerminalTheme::new(
+                0x001F_2328,
+                0x00FF_FFFF,
+                BAR,
+                0x0080_8080,
+                [0; 16],
+            ));
+            let paper = spec.terminal_theme.expect("a light terminal").into_theme();
+            (1..=24u64)
+                .filter_map(|k| {
+                    let input = played(&spec.clone().with_phase(k * 100), paper);
+                    let fill = input.cursor_fill_override.unwrap_or(BAR) & 0x00FF_FFFF;
+                    (fill != BAR).then_some((k * 100, fill))
+                })
+                .collect()
+        };
+        let hue = |c: u32| {
+            let [_, r, g, b] = c.to_be_bytes();
+            let (r, g, b) = (f32::from(r), f32::from(g), f32::from(b));
+            let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+            let h = if max == r {
+                (g - b) / (max - min)
+            } else if max == g {
+                2.0 + (b - r) / (max - min)
+            } else {
+                4.0 + (r - g) / (max - min)
+            };
+            (h * 60.0).rem_euclid(360.0)
+        };
+        let paper = 0x00FF_FFFF;
+        let lifted = lifted_phases();
+        assert!(
+            !lifted.is_empty(),
+            "Comet's light lies on the bar somewhere in the card's loop, and the bar is lifted there"
+        );
+        for &(phase, fill) in &lifted {
+            let (theirs, ours) = (
+                aterm_effects::color_math::contrast_ratio(BAR, paper),
+                aterm_effects::color_math::contrast_ratio(fill, paper),
+            );
+            assert!(
+                ours > theirs,
+                "at {phase} ms the bar is drawn #{fill:06x}, lighter on the paper than the theme's"
+            );
+            let gap = (hue(fill) - hue(BAR)).abs();
+            assert!(
+                gap.min(360.0 - gap) <= 4.0,
+                "at {phase} ms the bar #{fill:06x} keeps the theme's hue"
+            );
+        }
+        let kept = SCENE_CONTROLS.with(std::cell::Cell::get);
+        SCENE_CONTROLS.with(|controls| {
+            controls.set(SceneControls {
+                thin_caret_fill: false,
+                ..kept
+            });
+        });
+        let unlifted = lifted_phases();
+        SCENE_CONTROLS.with(|controls| controls.set(kept));
+        assert!(
+            unlifted.is_empty(),
+            "negative control: the block's fill alone draws the theme's bar: {unlifted:?}"
+        );
     }
 
     fn sample_rows(source: &str) -> Vec<String> {
@@ -10945,12 +11399,12 @@ mod tests {
 
     /// What every lettered cell the scene's lights or companion changed reads, as the trail
     /// lab's `trail-contrast` judges a glyph against its clean twin (`twin`, the card with no
-    /// light and no companion): the lower of its whole-cell contrast (the median of its core ink
-    /// against the median of its pure ground, as the frame has them) and its local contrast
-    /// (each solid ink pixel against the median of the nearest ring, 1 then 2 px out, of pixels
-    /// that are pure ground in the twin; the worst pixel row's lower median), a speck of a few
-    /// pixels by its local contrast alone. `(reading, bare, row, col)` for each such letter,
-    /// `bare` the same glyph read on the twin.
+    /// light and no companion): its local contrast, what a reader sees round each stroke (each
+    /// solid ink pixel against the median of the nearest ring, 1 then 2 px out, of pixels that
+    /// are pure ground in the twin; the worst pixel row's lower median), the one reading the
+    /// letter guard keeps; its whole-cell contrast (the median of its core ink against the median
+    /// of its pure ground, as the frame has them) where no solid pixel has ground that near.
+    /// `(reading, bare, row, col)` for each such letter, `bare` the same glyph read on the twin.
     fn judged_letters(
         lit: &aterm_render::Frame,
         twin: &aterm_render::Frame,
@@ -10961,14 +11415,6 @@ mod tests {
         const CORE_SHARE: f32 = 0.70;
         /// A glyph's solid ink: this share of its extreme's ratio against the ground.
         const SOLID_SHARE: f32 = 0.85;
-        /// A speck: a glyph of this many core pixels or fewer (a `.` on the card's 16 px rows
-        /// is four, two of them antialiased edge). The median of so few is an edge pixel, a
-        /// reading of the font's antialiasing rather than of the ink, so a speck reads by its
-        /// local contrast alone (each solid pixel against the ground beside it). The letter
-        /// guard reads a cell's colours, not its glyph's coverage: under Rainbow kitty
-        /// flying's submit on GitHub Light, the Return's frame, the `.` of `README.md` reads
-        /// 4.43:1 whole (5.11 bare) and 8:1 locally.
-        const SPECK_CORE_PX: usize = 6;
 
         let near =
             |a: [u8; 3], b: [u8; 3], by: u8| a.iter().zip(&b).all(|(p, q)| p.abs_diff(*q) <= by);
@@ -11007,13 +11453,6 @@ mod tests {
                 }
                 let ground_luma = luma(ground);
                 let reach = CORE_SHARE * (luma(extreme) - ground_luma).abs();
-                let speck = pixels()
-                    .filter(|&(x, y)| {
-                        let clean = frame_rgb(twin, x, y);
-                        clean != ground && (luma(clean) - ground_luma).abs() >= reach
-                    })
-                    .count()
-                    <= SPECK_CORE_PX;
                 let read = |lit: &aterm_render::Frame| {
                     let (mut ink, mut bed) = (Vec::new(), Vec::new());
                     for (x, y) in pixels() {
@@ -11073,11 +11512,10 @@ mod tests {
                             clean != ground && (luma(clean) - ground_luma).abs() >= reach
                         })
                     });
-                    Some(match local {
-                        Some(local) if speck => local,
-                        Some(local) => whole.min(local),
-                        None => whole,
-                    })
+                    // The ring round the strokes, what a reader sees round each one (the letter
+                    // guard's one model, `letter_guard::ring`): the whole cell where no solid
+                    // pixel has ground that near.
+                    Some(local.unwrap_or(whole))
                 };
                 if let (Some(reading), Some(bare)) = (read(lit), read(twin)) {
                     out.push((reading, bare, row, col));
@@ -11120,9 +11558,18 @@ mod tests {
         Clean,
     }
 
+    struct LitCard {
+        lit: aterm_render::Frame,
+        twin: aterm_render::Frame,
+        input: RenderInput,
+        cell: (usize, usize),
+        without_body: Option<aterm_render::Frame>,
+    }
+
     /// The card's terminal at `rows` rows playing `raw` on `theme` at `phase`, lit and as
     /// its `twin`, with the bloom or without and the companion in `look` (`None`: the
-    /// default): the frames, the lit input and the cell size.
+    /// default), drawn at display `scale` (1, or a Retina display's 2): the frames, the lit
+    /// input and the cell size.
     fn lit_card(
         raw: &str,
         (theme, bloom, look): (
@@ -11131,13 +11578,8 @@ mod tests {
             Option<aterm_effects::kitty_registry::KittyLook>,
         ),
         (phase, rows, twin): (u64, usize, Twin),
-        prepared: &crate::tray_raster::PreparedSemanticFont,
-    ) -> (
-        aterm_render::Frame,
-        aterm_render::Frame,
-        RenderInput,
-        (usize, usize),
-    ) {
+        (prepared, scale): (&crate::tray_raster::PreparedSemanticFont, f32),
+    ) -> LitCard {
         let spec = SettingsPreviewSpec::cursor(CursorPreviewSpec {
             blink: false,
             trail_style: PreviewTrailStyle::parse(raw),
@@ -11153,14 +11595,26 @@ mod tests {
         .with_phase(phase)
         .with_prepared_font(prepared.clone())
         .normalized();
+        let kept = SCENE_CONTROLS.get();
+        SCENE_CONTROLS.set(SceneControls {
+            observe_body: raw == "rainbow kitty pet" && scale == 2.0 && twin == Twin::Clean,
+            ..kept
+        });
         let specimen = spec.terminal_specimen(theme.into_theme(), Some(rows));
-        let cell = crate::tray_raster::specimen_cell_size_for_test(&specimen, 1.0)
-            .expect("the card's cell");
-        let scene = specimen.motion.clone().expect("the cursor scene");
-        let ink = crate::tray_raster::specimen_glyph_ink_for_test(&specimen, 1.0);
-        let lit_input = scene.decorate_inked(&specimen.input, cell, ink.as_ref());
-        let lit = crate::tray_raster::render_specimen_frame_for_test(&specimen, 1.0)
-            .expect("the lit card");
+        SCENE_CONTROLS.set(kept);
+        let crate::tray_raster::ObservedSpecimen {
+            frame: lit,
+            input: lit_input,
+            cell,
+            without_body,
+        } = crate::tray_raster::render_specimen_observed_for_test(&specimen, scale)
+            .expect("the lit card and its actual published input");
+        if raw == "rainbow kitty pet" && scale == 2.0 && twin == Twin::Clean {
+            assert!(
+                without_body.is_some(),
+                "the retained step supplies its body-only twin"
+            );
+        }
         let mut twin_input = lit_input.clone();
         match twin {
             Twin::Bare => {
@@ -11181,10 +11635,36 @@ mod tests {
                 motion: None,
                 ..specimen.clone()
             },
-            1.0,
+            scale,
         )
         .expect("the card's twin");
-        (lit, twin, lit_input, cell)
+        LitCard {
+            lit,
+            twin,
+            input: lit_input,
+            cell,
+            without_body,
+        }
+    }
+
+    /// How far toward the page the darkest pixel of the thinnest glyph of the Cursor card's face
+    /// lies on `theme` at display `scale` ([`aterm_render::GlyphInk::thin_share`]), as a window's
+    /// page law reads its own face (`host::PageFacts::thin_ink`).
+    fn card_thin_ink(
+        theme: PreviewTerminalTheme,
+        prepared: &crate::tray_raster::PreparedSemanticFont,
+        scale: f32,
+    ) -> f32 {
+        let spec = SettingsPreviewSpec::cursor(CursorPreviewSpec::default())
+            .with_terminal_theme(theme)
+            .with_prepared_font(prepared.clone())
+            .normalized();
+        let theme = theme.into_theme();
+        let specimen = spec.terminal_specimen(theme, Some(7));
+        let ink = crate::tray_raster::specimen_glyph_ink_for_test(&specimen, scale)
+            .expect("the card's face");
+        let lum = |c: u32| aterm_render::linear_luminance(c & 0x00FF_FFFF);
+        ink.thin_share(lum(theme.fg), lum(theme.bg))
     }
 
     /// `settings card` names the card a capture painted as the terminal names a frame: its grid
@@ -11235,10 +11715,13 @@ mod tests {
             .filter_map(|line| line.strip_prefix("text "))
             .collect();
         assert_eq!(text.len(), rows, "{lines:?}");
-        assert!(
-            text.iter().any(|row| row.starts_with("~/demo $ git add")),
-            "{text:?}"
-        );
+        // The card speaks this platform's shell (`CURSOR_SPECIMEN_LINES`).
+        let typing = if cfg!(windows) {
+            "PS C:\\> git add"
+        } else {
+            "~/demo $ git add"
+        };
+        assert!(text.iter().any(|row| row.starts_with(typing)), "{text:?}");
         let body = lines[2]
             .split_whitespace()
             .find_map(|word| word.strip_prefix("pet_body="))
@@ -11297,7 +11780,7 @@ mod tests {
         raw: &str,
         (side, theme): (&str, PreviewTerminalTheme),
         rows: usize,
-        prepared: &crate::tray_raster::PreparedSemanticFont,
+        (prepared, scale): (&crate::tray_raster::PreparedSemanticFont, f32),
     ) -> Vec<String> {
         let lit_at = |lit: &aterm_render::Frame, bare: &aterm_render::Frame, x, y| {
             let (a, b) = (frame_rgb(lit, x, y), frame_rgb(bare, x, y));
@@ -11305,11 +11788,13 @@ mod tests {
         };
         let mut cuts = Vec::new();
         for phase in (0..CURSOR_SCENE_CYCLE_MS).step_by(MOTION_STEP_MS as usize) {
-            let (lit, bare, ..) = lit_card(
+            let LitCard {
+                lit, twin: bare, ..
+            } = lit_card(
                 raw,
                 (theme, false, None),
                 (phase, rows, Twin::Bare),
-                prepared,
+                (prepared, scale),
             );
             let (w, h) = (lit.width, lit.height);
             let sides = (0..w)
@@ -11321,11 +11806,16 @@ mod tests {
             let risen = if top.is_empty() {
                 0
             } else {
-                let (tall, tall_bare, _, (_, cell_h)) = lit_card(
+                let LitCard {
+                    lit: tall,
+                    twin: tall_bare,
+                    cell: (_, cell_h),
+                    ..
+                } = lit_card(
                     raw,
                     (theme, false, None),
                     (phase, rows + 1, Twin::Bare),
-                    prepared,
+                    (prepared, scale),
                 );
                 top.iter()
                     .filter(|&&x| lit_at(&tall, &tall_bare, x, cell_h - 1))
@@ -11333,8 +11823,8 @@ mod tests {
             };
             if sides + risen > 0 {
                 cuts.push(format!(
-                    "{raw} {side} in {rows} rows at {phase} ms: {sides} px at the sides and \
-                     bottom, {risen} risen past the top"
+                    "{raw} {side} in {rows} rows at {scale}x at {phase} ms: {sides} px at the \
+                     sides and bottom, {risen} risen past the top"
                 ));
             }
         }
@@ -11342,9 +11832,11 @@ mod tests {
     }
 
     /// No mark the scene draws stands cut at the card's edge ([`edge_cuts`]), every style on
-    /// dark and light, in cards of three, four and five rows: the picker host's preview
-    /// shrinks to three, a Settings window under 760 px wide shows four. A particle the edge
-    /// would cut is left out whole (`CursorGlow::emit_particles`, the rainbow kitty's paper
+    /// dark and light, in cards of three, four and five rows, at display scale 1 and 2, and on
+    /// macOS on light in the host's face at scale 2, whose card the page law gives the glass
+    /// (§15.8 amendment 54): the picker host's preview shrinks to three, a Settings window under
+    /// 760 px wide shows four. A particle the
+    /// edge would cut is left out whole (`CursorGlow::emit_particles`, the rainbow kitty's paper
     /// stars), and a light rising past the card's top is laid shorter inside it, its soft top
     /// whole ([`aterm_effects::cursor_glow`]'s rise ceiling): the card gives its grid no head
     /// band (`head` 0), where a terminal window's top row rises into its own. The negative
@@ -11361,26 +11853,46 @@ mod tests {
             &aterm_types::scheme::builtin("GitHub Light").expect("built-in light theme"),
         );
         let dark = PreviewTerminalTheme::from_scheme(&aterm_types::ColorScheme::default());
-        let items: Vec<(&str, (&str, PreviewTerminalTheme), usize)> =
-            crate::prefs::CURSOR_TRAIL_STYLES
-                .iter()
-                .flat_map(|&raw| {
-                    [3, 4, 5].into_iter().flat_map(move |rows| {
-                        [(raw, ("dark", dark), rows), (raw, ("light", light), rows)]
+        // One card: its style, its named ground, its rows, its scale, and whether it lays the
+        // host's face.
+        type Card<'a> = (&'a str, (&'a str, PreviewTerminalTheme), usize, f32, bool);
+        let mut items: Vec<Card<'_>> = crate::prefs::CURSOR_TRAIL_STYLES
+            .iter()
+            .flat_map(|&raw| {
+                [3, 4, 5].into_iter().flat_map(move |rows| {
+                    [1.0, 2.0].into_iter().flat_map(move |scale| {
+                        [
+                            (raw, ("dark", dark), rows, scale, false),
+                            (raw, ("light", light), rows, scale, false),
+                        ]
                     })
                 })
-                .collect();
+            })
+            .collect();
+        if cfg!(target_os = "macos") {
+            for &raw in crate::prefs::CURSOR_TRAIL_STYLES {
+                for rows in [3, 4, 5] {
+                    items.push((raw, ("light, the host's face,", light), rows, 2.0, true));
+                }
+            }
+        }
         // Each item plays on its own thread, with that thread's fonts and scene.
-        let found: Vec<String> = aterm_spec::check::each(&items, |&(raw, ground, rows)| {
-            let _ = compiled(SettingsPreviewSpec::default());
-            let prepared = crate::tray_raster::prepared_semantic_font_for_direct_view_test(
-                &SemanticFontCandidate::default(),
-            );
-            edge_cuts(raw, ground, rows, &prepared)
-        })
-        .into_iter()
-        .flatten()
-        .collect();
+        let found: Vec<String> =
+            aterm_spec::check::each(&items, |&(raw, ground, rows, scale, host)| {
+                let _ = compiled(SettingsPreviewSpec::default());
+                #[cfg(target_os = "macos")]
+                if host {
+                    return edge_cuts(raw, ground, rows, (&host_card_face(), scale));
+                }
+                assert!(!host, "the host's face is macOS's");
+                let prepared = crate::tray_raster::prepared_semantic_font_for_direct_view_test(
+                    &SemanticFontCandidate::default(),
+                );
+                edge_cuts(raw, ground, rows, (&prepared, scale))
+            })
+            .into_iter()
+            .flatten()
+            .collect();
         assert!(found.is_empty(), "lit at the card's edge: {found:#?}");
 
         let _ = compiled(SettingsPreviewSpec::default());
@@ -11397,7 +11909,7 @@ mod tests {
             cuts
         };
         let drops = with_controls(&|c| c.motes_whole = false, &|| {
-            edge_cuts("water", ("dark", dark), 5, &prepared)
+            edge_cuts("water", ("dark", dark), 5, (&prepared, 1.0))
         });
         assert!(
             !drops.is_empty(),
@@ -11409,7 +11921,7 @@ mod tests {
             ("fire", ("dark", dark), 3),
         ] {
             let cut = with_controls(&|c| c.rises_kept = false, &|| {
-                edge_cuts(raw, ground, rows, &prepared)
+                edge_cuts(raw, ground, rows, (&prepared, 1.0))
             });
             assert!(
                 !cut.is_empty(),
@@ -11417,6 +11929,20 @@ mod tests {
                 ground.0
             );
         }
+    }
+
+    /// The host's own system face at the card's 14 px, as the Settings window draws its card on
+    /// macOS (SF Mono, 9 x 16 cells at 1x).
+    #[cfg(target_os = "macos")]
+    fn host_card_face() -> crate::tray_raster::PreparedSemanticFont {
+        let mut host = aterm_render::Renderer::from_system_with_family(
+            None,
+            14.0,
+            aterm_render::Theme::default(),
+        )
+        .expect("the host's system face");
+        host.prepare_semantic_typography("Bold Italic != => ");
+        crate::tray_raster::prepared_semantic_font_from_renderer_for_test(host)
     }
 
     /// The styles whose scene draws a companion, resident or flying.
@@ -11457,9 +11983,9 @@ mod tests {
     }
 
     /// Every letter a trail or companion lies on in the card keeps 4.5:1, judged as the
-    /// trail lab's `trail-contrast` judges one ([`judged_letters`]: the lower of the whole
-    /// cell's contrast and the local one, against the card's clean twin, no light and no
-    /// companion drawn), in every style on dark and light at every frame of the scene's loop,
+    /// trail lab's `trail-contrast` judges one ([`judged_letters`]: by the ring round its
+    /// strokes, against the card's clean twin, no light and no companion drawn), in every style
+    /// on dark and light at every frame of the scene's loop,
     /// and the companions in every look [`judged_looks`] names, in the embedded face and, on
     /// macOS, in the host's own system face at the card's 14 px (SF Mono, 9 x 16 cells: the
     /// face the settings window draws its card in, which the trail gallery photographs): the
@@ -11471,7 +11997,17 @@ mod tests {
     /// leaves. The negative controls: without the frame's text, Laser's bolt on dark lay on
     /// letters at 1:1; with every glyph's ink read as its colour whole, SF Mono's one-column
     /// stems showed the light laid under them, and Sparkle's landing on GitHub Light left the
-    /// `m` of `README.md` at 4.30:1 (the gallery's 4.17, looks9's settings round 2).
+    /// `m` of `README.md` at 4.30:1 (the gallery's 4.17, looks9's settings round 2). Under the
+    /// page law the card draws the glass where its face lays its letters full
+    /// (`host::PageFacts::glass`, `docs/design/PRISM-GLASS.md` §15.8 amendment 54): on macOS the
+    /// host's face at scale 2, so at `prism_glass::LIVE` Glass every frame of that card is judged
+    /// on the glass. The page law's own bar is the glass's, held by aterm-render's
+    /// `the_glass_draws_where_the_windows_face_lays_its_letters_full` and its control: judged by
+    /// the ring round their strokes, the card's letters keep 4.5:1 on a glass laid whatever the
+    /// face lays as well (every style, both faces, both scales, round 27), which the card's
+    /// control under the whole cell's median ground had denied. Every look, style and frame is
+    /// judged at display scale 1 and 2. The judged letters under the control print with
+    /// `--nocapture`.
     #[test]
     fn the_cards_letters_read_under_every_light() {
         let _ = compiled(SettingsPreviewSpec::default());
@@ -11482,67 +12018,158 @@ mod tests {
         #[cfg(target_os = "macos")]
         let faces = {
             let mut faces = faces;
-            let mut host = aterm_render::Renderer::from_system_with_family(
-                None,
-                14.0,
-                aterm_render::Theme::default(),
-            )
-            .expect("the host's system face");
-            host.prepare_semantic_typography("Bold Italic != => ");
-            faces.push((
-                "the host's system face",
-                crate::tray_raster::prepared_semantic_font_from_renderer_for_test(host),
-            ));
+            faces.push(("the host's system face", host_card_face()));
             faces
         };
         let light = PreviewTerminalTheme::from_scheme(
             &aterm_types::scheme::builtin("GitHub Light").expect("built-in light theme"),
         );
         let dark = PreviewTerminalTheme::from_scheme(&aterm_types::ColorScheme::default());
-        let under =
-            |raw: &str,
-             (side, theme): (&str, PreviewTerminalTheme),
-             look: Option<aterm_effects::kitty_registry::KittyLook>,
-             (face, prepared): (&str, &crate::tray_raster::PreparedSemanticFont)| {
-                let mut under = Vec::new();
-                for phase in (0..CURSOR_SCENE_CYCLE_MS).step_by(MOTION_STEP_MS as usize) {
-                    let (lit, twin, lit_input, cell) =
-                        lit_card(raw, (theme, true, look), (phase, 7, Twin::Clean), prepared);
-                    if let Some((reading, bar, row, col)) =
-                        worst_lit_letter(&lit, &twin, &lit_input, cell)
-                        && reading < bar
-                    {
+        let under = |raw: &str,
+                     (side, theme): (&str, PreviewTerminalTheme),
+                     look: Option<aterm_effects::kitty_registry::KittyLook>,
+                     (face, prepared, scale): (
+            &str,
+            &crate::tray_raster::PreparedSemanticFont,
+            f32,
+        )| {
+            let mut under = Vec::new();
+            let mut glass_frames = 0;
+            let mut judged_glass_frames = 0;
+            let mut retained_word_frames = 0;
+            for phase in (0..CURSOR_SCENE_CYCLE_MS).step_by(MOTION_STEP_MS as usize) {
+                let _ = aterm_render::test_counters::take_glass_slabs();
+                let LitCard {
+                    lit,
+                    twin,
+                    input: lit_input,
+                    cell,
+                    without_body,
+                } = lit_card(
+                    raw,
+                    (theme, true, look),
+                    (phase, 7, Twin::Clean),
+                    (prepared, scale),
+                );
+                let glass = aterm_render::test_counters::take_glass_slabs() > 0;
+                glass_frames += usize::from(glass);
+                if glass && let Some(without_body) = without_body {
+                    assert_eq!(
+                        (lit.width, lit.height),
+                        (without_body.width, without_body.height),
+                        "the body-only twin has the actual card's geometry"
+                    );
+                    let mut final_glass = Vec::new();
+                    lit_input
+                        .glow_under_ramps
+                        .expand_into(&lit_input.glow_under, &mut final_glass);
+                    let retained = judged_letters(&lit, &twin, &lit_input, cell)
+                        .into_iter()
+                        .any(|(reading, bare, row, col)| {
+                            let bar = LEGIBLE.min(OWN_SHARE * bare);
+                            reading.is_finite()
+                                && bar.is_finite()
+                                && bar > 0.0
+                                && reading >= bar
+                                && lit_input.cells[row][col].ch.is_ascii_alphabetic()
+                                && final_glass.iter().any(|q| {
+                                    if usize::from(q.row) >= lit_input.rows {
+                                        return false;
+                                    }
+                                    let (x0, y0) = (col * cell.0, row * cell.1);
+                                    let lo = x0.max(usize::from(q.x));
+                                    let hi = (x0 + cell.0)
+                                        .min(lit.width)
+                                        .min(usize::from(q.x) + usize::from(q.w));
+                                    let top = y0.max(usize::from(q.y));
+                                    let bottom = (y0 + cell.1)
+                                        .min(lit.height)
+                                        .min(usize::from(q.y) + usize::from(q.h));
+                                    (lo..hi).any(|x| {
+                                        aterm_render::glow_lerp(
+                                            u32::from(q.alpha),
+                                            u32::from(q.alpha2),
+                                            (x - usize::from(q.x)) as u32,
+                                            u32::from(q.w),
+                                        ) > 0
+                                            && (top..bottom).any(|y| {
+                                                frame_rgb(&lit, x, y)
+                                                    != frame_rgb(&without_body, x, y)
+                                            })
+                                    })
+                                })
+                        });
+                    retained_word_frames += usize::from(retained);
+                }
+                if let Some((reading, bar, row, col)) =
+                    worst_lit_letter(&lit, &twin, &lit_input, cell)
+                {
+                    assert!(reading.is_finite() && bar.is_finite() && bar > 0.0);
+                    judged_glass_frames += usize::from(glass);
+                    if reading < bar {
                         let age = look.map(|look| look.age);
                         under.push(format!(
-                            "{raw} {side} {age:?} in {face} at {phase} ms: the letter at row {row} \
-                         col {col} reads {reading:.2}:1, under its {bar:.2}"
+                            "{raw} {side} {age:?} in {face} at {scale}x at {phase} ms: the letter \
+                                 at row {row} col {col} reads {reading:.2}:1, under its {bar:.2}"
                         ));
                     }
                 }
-                under
-            };
+            }
+            if raw == "rainbow kitty pet" && side == "light" && scale == 2.0 {
+                let page = aterm_effects::host::PageFacts {
+                    thin_ink: card_thin_ink(theme, prepared, scale),
+                    ..aterm_effects::host::PageFacts::OPAQUE
+                };
+                if page.glass() {
+                    assert!(
+                        glass_frames > 0 && judged_glass_frames > 0 && retained_word_frames > 0,
+                        "{face} at {scale}x: an admitted page must retain nonzero final glass beneath an ordinary word and pass its finite unchanged judge in that frame"
+                    );
+                }
+            }
+            under
+        };
         let companions = companion_styles();
         assert!(
             companions.len() >= 4,
             "the companion styles: {companions:?}"
         );
-        let mut found = Vec::new();
-        for (face, prepared) in &faces {
-            for &raw in crate::prefs::CURSOR_TRAIL_STYLES {
-                for ground in [("dark", dark), ("light", light)] {
-                    if raw == "classic" && ground.0 == "dark" {
-                        continue;
-                    }
-                    if companions.contains(&raw) {
-                        for look in judged_looks() {
-                            found.extend(under(raw, ground, Some(look), (face, prepared)));
+        let mut items = Vec::new();
+        for (at, (face, _)) in faces.iter().enumerate() {
+            for scale in [1.0, 2.0] {
+                for &raw in crate::prefs::CURSOR_TRAIL_STYLES {
+                    for ground in [("dark", dark), ("light", light)] {
+                        if raw == "classic" && ground.0 == "dark" {
+                            continue;
                         }
-                    } else {
-                        found.extend(under(raw, ground, None, (face, prepared)));
+                        if companions.contains(&raw) {
+                            for look in judged_looks() {
+                                items.push((*face, at == 1, scale, raw, ground, Some(look)));
+                            }
+                        } else {
+                            items.push((*face, at == 1, scale, raw, ground, None));
+                        }
                     }
                 }
             }
         }
+        // Each item plays on its own thread, with that thread's fonts and scene.
+        let found: Vec<String> =
+            aterm_spec::check::each(&items, |&(face, host, scale, raw, ground, look)| {
+                let _ = compiled(SettingsPreviewSpec::default());
+                #[cfg(target_os = "macos")]
+                if host {
+                    return under(raw, ground, look, (face, &host_card_face(), scale));
+                }
+                assert!(!host, "the host's face is macOS's");
+                let prepared = crate::tray_raster::prepared_semantic_font_for_direct_view_test(
+                    &SemanticFontCandidate::default(),
+                );
+                under(raw, ground, look, (face, &prepared, scale))
+            })
+            .into_iter()
+            .flatten()
+            .collect();
         assert!(
             found.is_empty(),
             "{} frames hold a letter under its bar: {:#?}",
@@ -11558,17 +12185,37 @@ mod tests {
         };
         set(&|c| c.frame_text = false);
         let (face, prepared) = &faces[0];
-        let unread = under("laser", ("dark", dark), None, (face, prepared));
+        let unread = under("laser", ("dark", dark), None, (face, prepared, 1.0));
         set(&|c| c.frame_text = true);
         assert!(
             !unread.is_empty(),
             "negative control: blind to the frame's letters, Laser's bolt lies on one"
         );
+        let page_takes = |prepared, scale| {
+            let thin_ink = card_thin_ink(light, prepared, scale);
+            let page = aterm_effects::host::PageFacts {
+                thin_ink,
+                ..aterm_effects::host::PageFacts::OPAQUE
+            };
+            (page.glass(), thin_ink)
+        };
+        let (face, prepared) = &faces[0];
+        let (glass, thin_ink) = page_takes(prepared, 1.0);
+        assert!(
+            !glass,
+            "{face} at 1x: the page law takes no glass ({thin_ink:.4})"
+        );
         #[cfg(target_os = "macos")]
         {
-            set(&|c| c.glyph_ink = false);
             let (face, prepared) = &faces[1];
-            let solid = under("sparkle", ("light", light), None, (face, prepared));
+            let (glass, thin_ink) = page_takes(prepared, 2.0);
+            assert!(
+                glass,
+                "{face} at 2x: the page law takes the glass, so at `LIVE` Glass the card's judge \
+                 reads that card on it ({thin_ink:.4})"
+            );
+            set(&|c| c.glyph_ink = false);
+            let solid = under("sparkle", ("light", light), None, (face, prepared, 1.0));
             set(&|c| c.glyph_ink = true);
             assert!(
                 !solid.is_empty(),

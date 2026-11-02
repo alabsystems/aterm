@@ -90,7 +90,7 @@ impl StatLine {
 /// as a C `int`, so a pts minor of 2^19 or more prints negative and is read back as its 32 bits. A
 /// field that is neither an `int` nor a `u32` makes the line malformed, never "no terminal".
 fn tty_device(field: &str) -> Option<u32> {
-    let t: i64 = field.parse().ok()?;
+    let t: i64 = crate::parse_int(field)?;
     u32::try_from(t)
         .ok()
         .or_else(|| i32::try_from(t).ok().map(i32::cast_unsigned))
@@ -103,17 +103,17 @@ pub fn parse_stat(text: &str) -> Option<StatLine> {
     let close = text.rfind(')')?;
     let name = text.get(open + 1..close)?.to_owned();
     let f: Vec<&str> = text.get(close + 1..)?.split_whitespace().collect();
-    let num = |i: usize| -> Option<u64> { f.get(i)?.parse().ok() };
-    let tpgid: i64 = f.get(5)?.parse().ok()?;
+    let num = |i: usize| -> Option<u64> { crate::parse_uint(f.get(i)?) };
+    let tpgid: i64 = crate::parse_int(f.get(5)?)?;
     let cut = |t: i64| u64::try_from(t.max(0)).unwrap_or(0);
-    let cutime: i64 = f.get(13)?.parse().ok()?;
-    let cstime: i64 = f.get(14)?.parse().ok()?;
+    let cutime: i64 = crate::parse_int(f.get(13)?)?;
+    let cstime: i64 = crate::parse_int(f.get(14)?)?;
     Some(StatLine {
         name,
         state: *f.first()?.as_bytes().first()?,
-        ppid: f.get(1)?.parse().ok()?,
-        pgrp: f.get(2)?.parse().ok()?,
-        session: f.get(3)?.parse().ok()?,
+        ppid: crate::parse_uint(f.get(1)?)?,
+        pgrp: crate::parse_uint(f.get(2)?)?,
+        session: crate::parse_uint(f.get(3)?)?,
         tty_nr: tty_device(f.get(4)?)?,
         tpgid: u32::try_from(tpgid).unwrap_or(0),
         flags: num(6)?,
@@ -145,7 +145,7 @@ pub struct IoLine {
 fn keyed(text: &str, key: &str) -> Option<u64> {
     text.lines().find_map(|l| {
         let (k, v) = l.split_once(':')?;
-        (k.trim() == key).then(|| v.split_whitespace().next()?.parse().ok())?
+        (k.trim() == key).then(|| crate::parse_uint(v.split_whitespace().next()?))?
     })
 }
 
@@ -166,7 +166,7 @@ pub fn parse_io(text: &str) -> IoLine {
 pub fn parse_status(text: &str) -> (Option<u32>, Option<u64>) {
     let uid = text.lines().find_map(|l| {
         l.strip_prefix("Uid:")
-            .and_then(|r| r.split_whitespace().next()?.parse().ok())
+            .and_then(|r| crate::parse_uint(r.split_whitespace().next()?))
     });
     let csw = keyed(text, "voluntary_ctxt_switches")
         .zip(keyed(text, "nonvoluntary_ctxt_switches"))
@@ -178,7 +178,7 @@ pub fn parse_status(text: &str) -> (Option<u32>, Option<u64>) {
 #[must_use]
 pub fn parse_schedstat(text: &str) -> Option<(u64, u64)> {
     let mut f = text.split_whitespace();
-    Some((f.next()?.parse().ok()?, f.next()?.parse().ok()?))
+    Some((crate::parse_uint(f.next()?)?, crate::parse_uint(f.next()?)?))
 }
 
 /// The `read`, `write`, `readv` and `writev` call numbers.
@@ -195,12 +195,16 @@ pub const READ_WRITE: [u64; 4] = [63, 64, 65, 66];
 #[must_use]
 pub fn parse_syscall(text: &str) -> Option<i32> {
     let mut f = text.split_whitespace();
-    let nr: u64 = f.next()?.parse().ok()?;
+    let nr: u64 = crate::parse_uint(f.next()?)?;
     if !READ_WRITE.contains(&nr) {
         return None;
     }
     let arg = f.next()?;
-    i32::try_from(u64::from_str_radix(arg.strip_prefix("0x").unwrap_or(arg), 16).ok()?).ok()
+    let hex = arg.strip_prefix("0x").unwrap_or(arg);
+    if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    i32::try_from(u64::from_str_radix(hex, 16).ok()?).ok()
 }
 
 /// `/proc/<pid>/wchan`: the kernel function, `None` for `0` or empty (on a core, or not waiting).
@@ -236,7 +240,7 @@ pub enum FdLink {
 /// Classify a `fd/<n>` link's target.
 #[must_use]
 pub fn parse_fd_link(target: &str) -> FdLink {
-    let inode = |rest: &str| rest.strip_prefix('[')?.strip_suffix(']')?.parse().ok();
+    let inode = |rest: &str| crate::parse_uint(rest.strip_prefix('[')?.strip_suffix(']')?);
     if let Some(n) = target.strip_prefix("pipe:").and_then(inode) {
         FdLink::Pipe(n)
     } else if let Some(n) = target.strip_prefix("socket:").and_then(inode) {
@@ -257,47 +261,6 @@ pub fn parse_fd_link(target: &str) -> FdLink {
     } else {
         FdLink::Other
     }
-}
-
-/// `__SO_ACCEPTCON`: the Flags bit of a listening socket's `/proc/net/unix` row.
-pub const SO_ACCEPTCON: u32 = 0x1_0000;
-
-/// The next space-separated field of a `/proc/net/unix` row, past any spaces before it.
-fn net_unix_field<'a>(rest: &mut &'a [u8]) -> &'a [u8] {
-    let from = rest.iter().position(|b| *b != b' ').unwrap_or(rest.len());
-    let line = &rest[from..];
-    let end = line.iter().position(|b| *b == b' ').unwrap_or(line.len());
-    let (field, tail) = line.split_at(end);
-    *rest = tail;
-    field
-}
-
-/// The listening sockets of a `/proc/net/unix` table that are bound at a path, each `(inode,
-/// path)`: the rows whose Flags carry [`SO_ACCEPTCON`]. An abstract name (`@…`), an unbound
-/// socket and a row cut short at the read's end are left out; a path keeps every byte after the
-/// one space that follows the inode. The kernel prints every name in the namespace as raw bytes,
-/// so the table is read as bytes: a name that is no UTF-8 is a row like any other.
-#[must_use]
-pub fn listening_unix(net_unix: &[u8]) -> Vec<(u64, &[u8])> {
-    let whole = match net_unix.iter().rposition(|b| *b == b'\n') {
-        Some(e) => &net_unix[..e],
-        None => return Vec::new(),
-    };
-    whole
-        .split(|b| *b == b'\n')
-        .skip(1)
-        .filter_map(|line| {
-            let mut rest = line;
-            let mut field = || net_unix_field(&mut rest);
-            let (_slot, _refs, _protocol) = (field(), field(), field());
-            let flags = u32::from_str_radix(std::str::from_utf8(field()).ok()?, 16).ok()?;
-            let (_kind, _state) = (field(), field());
-            let inode = std::str::from_utf8(field()).ok()?.parse().ok()?;
-            let path = rest.strip_prefix(b" ")?;
-            (flags & SO_ACCEPTCON != 0 && !path.is_empty() && !path.starts_with(b"@"))
-                .then_some((inode, path))
-        })
-        .collect()
 }
 
 /// `/proc/<pid>/fdinfo/<n>`.
@@ -327,17 +290,24 @@ pub fn parse_fdinfo(text: &str) -> FdInfo {
     let mut info = FdInfo::default();
     for line in text.lines() {
         if let Some(v) = line.strip_prefix("pos:") {
-            info.pos = v.trim().parse().unwrap_or(0);
+            info.pos = crate::parse_uint(v.trim()).unwrap_or(0);
         } else if let Some(v) = line.strip_prefix("flags:") {
-            info.flags = u32::from_str_radix(v.trim(), 8).unwrap_or(0);
+            let v = v.trim();
+            info.flags = v
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'7'))
+                .then(|| u32::from_str_radix(v, 8).ok())
+                .flatten()
+                .unwrap_or(0);
         } else if let Some(v) = line.strip_prefix("ino:") {
-            info.ino = v.trim().parse().ok();
+            info.ino = crate::parse_uint(v.trim());
         } else if let Some(v) = line.strip_prefix("tfd:") {
             let mut f = v.split_whitespace();
-            let tfd = f.next().and_then(|t| t.parse().ok());
+            let tfd = f.next().and_then(crate::parse_uint);
             let events = f
                 .skip_while(|w| *w != "events:")
                 .nth(1)
+                .filter(|e| e.bytes().all(|b| b.is_ascii_hexdigit()))
                 .and_then(|e| u32::from_str_radix(e, 16).ok());
             if let (Some(t), Some(e)) = (tfd, events)
                 && info.interests.len() < MAX_KNOTES
@@ -366,6 +336,10 @@ pub struct TcpRow {
 
 fn parse_addr(field: &str, v6: bool) -> Option<(IpAddr, u16)> {
     let (addr, port) = field.split_once(':')?;
+    if !addr.bytes().all(|b| b.is_ascii_hexdigit()) || !port.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return None;
+    }
     let port = u16::from_str_radix(port, 16).ok()?;
     let ip = if v6 {
         if addr.len() != 32 {
@@ -398,10 +372,17 @@ pub fn parse_net_tcp(text: &str, v6: bool) -> Vec<TcpRow> {
             let f: Vec<&str> = l.split_whitespace().collect();
             let (_, local_port) = parse_addr(f.get(1)?, v6)?;
             let (rip, rport) = parse_addr(f.get(2)?, v6)?;
-            let state = TcpState::from_linux(u8::from_str_radix(f.get(3)?, 16).ok()?);
+            let st_str = *f.get(3)?;
+            if !st_str.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return None;
+            }
+            let state = TcpState::from_linux(u8::from_str_radix(st_str, 16).ok()?);
             let (_, rx) = f.get(4)?.split_once(':')?;
+            if !rx.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return None;
+            }
             Some(TcpRow {
-                inode: f.get(9)?.parse().ok()?,
+                inode: crate::parse_uint(f.get(9)?)?,
                 state,
                 local_port,
                 remote: (rport != 0).then(|| SocketAddr::new(rip, rport)),
@@ -416,7 +397,7 @@ pub fn parse_net_tcp(text: &str, v6: bool) -> Vec<TcpRow> {
 pub fn max_processes(text: &str) -> Option<u64> {
     text.lines()
         .find_map(|l| l.strip_prefix("Max processes"))
-        .and_then(|r| r.split_whitespace().next()?.parse().ok())
+        .and_then(|r| crate::parse_uint(r.split_whitespace().next()?))
 }
 
 /// Whether `wchan` is an event wait (`epoll_wait`, `poll`, `select`).
@@ -452,7 +433,7 @@ fn threads(dir: &Path, hz: u64) -> Option<(Vec<ThreadReading>, bool)> {
     let mut tids: Vec<u64> = std::fs::read_dir(dir.join("task"))
         .ok()?
         .flatten()
-        .filter_map(|e| e.file_name().to_str()?.parse().ok())
+        .filter_map(|e| crate::parse_uint(e.file_name().to_str()?))
         .collect();
     tids.sort_unstable();
     let truncated = tids.len() > MAX_THREADS;
@@ -487,7 +468,7 @@ fn fds(dir: &Path, sleeping: Option<bool>) -> Option<(Vec<FdReading>, bool)> {
     let mut nums: Vec<i32> = std::fs::read_dir(dir.join("fd"))
         .ok()?
         .flatten()
-        .filter_map(|e| e.file_name().to_str()?.parse().ok())
+        .filter_map(|e| crate::parse_uint(e.file_name().to_str()?))
         .collect();
     nums.sort_unstable();
     let mut truncated = nums.len() > MAX_FDS;

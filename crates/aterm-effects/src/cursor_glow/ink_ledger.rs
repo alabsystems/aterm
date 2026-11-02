@@ -10,7 +10,7 @@ mod letter_guard;
 #[cfg(any(test, debug_assertions))]
 mod state_words;
 pub(crate) use letter_guard::{
-    LetterGuard, RIM_SHOWN_SHARE, RIM_UNDER_LETTERS, RING as LETTER_GUARD_RING,
+    LetterGuard, RIM_SHOWN_SHARE, RIM_UNDER_LETTERS, RING as LETTER_GUARD_RING, ThinCaret,
 };
 
 /// Per-band RGB lift per unit coverage for a streak sample ([`InkLedger::admit_axis`]).

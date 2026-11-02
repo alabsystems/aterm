@@ -21,7 +21,11 @@ const NO_SESSION: &str = "ERR no such session\n";
 /// The `blocks [N]` argument: the last `N` blocks, or all of them when `N` is
 /// absent, unparsable or not smaller than the count.
 fn last_n<'a, T>(all: &'a [T], rest: &str) -> &'a [T] {
-    match rest.trim().parse::<usize>() {
+    let trimmed = rest.trim();
+    if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        return all;
+    }
+    match trimmed.parse::<usize>() {
         Ok(n) if n < all.len() => &all[all.len() - n..],
         _ => all,
     }

@@ -4,12 +4,15 @@
 //! `atpkg-publish lane install <alab|linux>` and `lane disarm`: snapshot and arm.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static SWAP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 use super::LaneKind;
 use super::report::Transcript;
 use super::state::{LaneState, Lock};
 use super::units::{self, Unit, UnitSpec};
-use crate::ctx::Ctx;
+use crate::ctx::{Ctx, HostChoice};
 use crate::error::{Error, Result};
 use crate::triple::Os;
 
@@ -35,6 +38,9 @@ pub struct InstallFlags {
     pub no_arm: bool,
     /// A Linux builder with no machine key: it stages for a rostered machine.
     pub keyless: bool,
+    /// Which hosts the installed unit's runs build (`--host`, parsed by WP12): `gh` until
+    /// WP15.
+    pub host: HostChoice,
 }
 
 impl InstallFlags {
@@ -401,6 +407,7 @@ pub fn install_with(
         state_dir: ctx.state_dir.clone(),
         xdg_config_home: machine.config_home.clone(),
         shim_bin: ctx.pkg_prefix.join("bin"),
+        host: HostChoice::Gh,
     };
     let unit_files = units::render(&spec);
     let rendered_dir = ctx.state_dir.join("units");
@@ -686,7 +693,8 @@ fn stamp_at_bootout(state_dir: &Path) -> Vec<PathBuf> {
 /// Point `link` at `target` in one `rename(2)` (which replaces a symlink, never follows
 /// it), so the path is never absent.
 fn swap_link(link: &Path, target: &Path) -> Result<()> {
-    let tmp = link.with_extension(format!("tmp-{}", std::process::id()));
+    let seq = SWAP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = link.with_extension(format!("tmp-{}-{seq}", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
     symlink(target, &tmp)?;
     std::fs::rename(&tmp, link).map_err(|e| {
@@ -965,7 +973,12 @@ fn listed_label(text: &str, wanted: &str) -> Option<bool> {
         let [pid, status, label] = row.as_slice() else {
             return None;
         };
-        if (*pid != "-" && !pid.parse::<u32>().is_ok_and(|n| n > 0))
+        let status_digits = status.strip_prefix('-').unwrap_or(status);
+        if (*pid != "-"
+            && !(pid.bytes().all(|b| b.is_ascii_digit())
+                && pid.parse::<u32>().is_ok_and(|n| n > 0)))
+            || status_digits.is_empty()
+            || !status_digits.bytes().all(|b| b.is_ascii_digit())
             || status.parse::<i32>().is_err()
             || !labels.insert(*label)
         {
@@ -1157,6 +1170,13 @@ mod tests {
             (
                 Observation {
                     jobs: Some(reply(true, b"PID\tStatus\tLabel\n-\t?\tother\n")),
+                    ..Observation::default()
+                },
+                false,
+            ),
+            (
+                Observation {
+                    jobs: Some(reply(true, b"PID\tStatus\tLabel\n-\t+0\tother\n")),
                     ..Observation::default()
                 },
                 false,

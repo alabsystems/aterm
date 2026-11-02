@@ -213,13 +213,9 @@ pub fn curl_to_file(url: &str, dest: &Path, headers: &[&str]) -> Result<(), Stri
                 h.replace('\\', "\\\\").replace('"', "\\\"")
             ));
         }
-        std::fs::write(&cfg, body)
+        crate::platform::open_create_new_write(&cfg, 0o600)
+            .and_then(|mut out| std::io::Write::write_all(&mut out, body.as_bytes()))
             .map_err(|e| format!("abrew: cannot write {}: {e}", cfg.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o600));
-        }
         header_cfg = cfg.to_string_lossy().into_owned();
         args.push("-K");
         args.push(&header_cfg);
@@ -259,12 +255,9 @@ pub fn head_size(url: &str, headers: &[&str]) -> Option<u64> {
                 h.replace('\\', "\\\\").replace('"', "\\\"")
             ));
         }
-        std::fs::write(&cfg, body).ok()?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o600));
-        }
+        crate::platform::open_create_new_write(&cfg, 0o600)
+            .and_then(|mut out| std::io::Write::write_all(&mut out, body.as_bytes()))
+            .ok()?;
         args.push("-K".into());
         args.push(cfg.to_string_lossy().into_owned());
     }
@@ -279,8 +272,9 @@ pub fn head_size(url: &str, headers: &[&str]) -> Option<u64> {
         .lines()
         .filter_map(|l| {
             let (k, v) = l.split_once(':')?;
-            if k.trim().eq_ignore_ascii_case("content-length") {
-                v.trim().parse::<u64>().ok()
+            let v = v.trim();
+            if k.trim().eq_ignore_ascii_case("content-length") && !v.starts_with('+') {
+                v.parse::<u64>().ok()
             } else {
                 None
             }
@@ -290,7 +284,7 @@ pub fn head_size(url: &str, headers: &[&str]) -> Option<u64> {
 
 /// SHA-256 of a file, lowercase hex (ring, streamed).
 pub fn sha256_file(path: &Path) -> Result<String, String> {
-    let mut f = std::fs::File::open(path)
+    let mut f = crate::metadata_io::open_regular(path)
         .map_err(|e| format!("abrew: cannot read {}: {e}", path.display()))?;
     let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
     let mut buf = [0u8; 65536];
@@ -608,13 +602,14 @@ fn run_dmg_helper(
     cmd: &mut aterm_uds::spawnfd::Command,
     within: std::time::Duration,
 ) -> Result<Output, aterm_uds::deadline::RunError> {
-    aterm_uds::deadline::outputs_until(
-        &mut [cmd],
-        std::time::Instant::now() + within,
-        DMG_REAP_LIMIT,
-    )
-    .pop()
-    .unwrap_or(Err(aterm_uds::deadline::RunError::TimedOut))
+    let deadline = std::time::Instant::now()
+        .checked_add(within)
+        .unwrap_or_else(|| {
+            std::time::Instant::now() + std::time::Duration::from_secs(365 * 86_400)
+        });
+    aterm_uds::deadline::outputs_until(&mut [cmd], deadline, DMG_REAP_LIMIT)
+        .pop()
+        .unwrap_or(Err(aterm_uds::deadline::RunError::TimedOut))
 }
 
 /// Extract a disk image by mounting it read-only and copying the payload out with
@@ -716,7 +711,7 @@ fn extract_archive(
         extract_zip_tree,
     };
     use crate::install::{MAX_ENTRIES, UNSIGNED_SIZE_CAP};
-    let mut file = std::fs::File::open(archive).map_err(|e| format!("abrew: {e}"))?;
+    let mut file = crate::metadata_io::open_regular(archive).map_err(|e| format!("abrew: {e}"))?;
     let mut magic = [0u8; 6];
     file.read_exact(&mut magic)
         .map_err(|e| format!("abrew: {e}"))?;

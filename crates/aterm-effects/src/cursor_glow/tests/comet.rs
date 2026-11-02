@@ -1514,3 +1514,116 @@ fn a_dense_row_s_comet_leaves_the_caret() {
         );
     }
 }
+
+/// Composed E2, A DENSE ROW'S SEAT HOLDS BEFORE IT LIGHTS: the seat is the
+/// air past the caret, where a shell's ghost text lands (fish draws its
+/// autosuggestion after the keystroke's echo). Typing a dense row on the
+/// reference dark, 80 ms a key on a 16 ms frame grid, each echo lands a
+/// frame before a hint past the caret: the seat lights no run of fewer than
+/// three frames that the hint then puts out, so the head does not flash on
+/// each key. Typing the same row with no hint, the seat lights and stays
+/// lit. Negative control: the seat lit the frame its cells turn clear
+/// (`dense_seat_unheld`) flashes under the hint on the keys.
+#[test]
+fn a_dense_row_s_comet_seat_does_not_flash_before_a_late_hint() {
+    const FILL: u32 = 0x0026_4F78;
+    let g = tall_geom();
+    let (page, ink) = (0x0011_1318u32, 0x00D0_D0D0u32);
+    let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+    let row = 3u16;
+    let mut c = cfg(GlowStyle::Comet, true);
+    c.intensity = 1.0;
+    (c.theme_fg, c.theme_bg) = (ink, page);
+    // Whether the seat past the caret is lit, frame by frame.
+    let lay = |hint: bool, unheld: bool| -> Vec<bool> {
+        let mut glow = CursorGlow {
+            dense_seat_unheld: unheld,
+            ..CursorGlow::default()
+        };
+        let mut out = Vec::new();
+        let mut text = vec![' '; g.cols];
+        let t0 = Instant::now();
+        let mut caret = 2u16;
+        let mut lit = Vec::new();
+        for f in 0..=60u64 {
+            let t = t0 + Duration::from_millis(16 * f);
+            let key = f > 0 && f % 5 == 0;
+            if key {
+                text[usize::from(caret)] = 'm';
+                caret += 1;
+                glow.note_synthetic_typed(t, 1);
+            }
+            // The row as the frame shows it, the hint past the caret; the
+            // pipeline probes it every frame.
+            let hinted = hint && f % 5 != 0;
+            let shown: Vec<char> = (0..g.cols)
+                .map(|col| {
+                    let past = col >= usize::from(caret) && col < usize::from(caret) + 6;
+                    if hinted && past { 's' } else { text[col] }
+                })
+                .collect();
+            glow.observe_row(row, caret, &shown, t);
+            let mut rows = vec![vec![aterm_core::terminal::RenderCell::default(); g.cols]; g.rows];
+            for (r, line) in rows.iter_mut().enumerate() {
+                for (col, cell) in line.iter_mut().enumerate() {
+                    (cell.fg, cell.bg) = (rgb(ink), rgb(page));
+                    if r + 1 == usize::from(row) || r == usize::from(row) + 1 {
+                        (cell.ch, cell.bg) = ('m', rgb(FILL));
+                    } else if r == usize::from(row) {
+                        cell.ch = shown[col];
+                    }
+                }
+            }
+            glow.observe_frame_text(Some((row, caret)), &rows, t);
+            glow.tick(Some((row, caret)), t, &c, g, &mut out);
+            let mut glass = Glass::new(g, page);
+            glass.add_quads(glow.under_quads());
+            let edge = (usize::from(caret) + 1) * g.cw;
+            let top = usize::from(row) * g.ch;
+            lit.push((top..top + g.ch).any(|y| {
+                (edge + g.cw..edge + 3 * g.cw).any(|x| {
+                    crate::color_math::oklab_distance(glass.px[y * glass.w + x], page) > 0.05
+                })
+            }));
+        }
+        lit
+    };
+    // Runs of lit frames, fewer than three, that a dark frame ends.
+    let flashes = |lit: &[bool]| {
+        let (mut n, mut run) = (0usize, 0usize);
+        for &on in lit {
+            if on {
+                run += 1;
+            } else {
+                n += usize::from(run > 0 && run < 3);
+                run = 0;
+            }
+        }
+        n
+    };
+    let shown = |lit: &[bool]| {
+        lit.iter()
+            .map(|&on| if on { '#' } else { '.' })
+            .collect::<String>()
+    };
+    let hinted = lay(true, false);
+    assert_eq!(
+        flashes(&hinted),
+        0,
+        "the seat flashes before the hint: {}",
+        shown(&hinted)
+    );
+    let bare = lay(false, false);
+    assert!(
+        flashes(&bare) == 0 && bare[bare.len() - 10..].iter().all(|&on| on),
+        "with no hint the seat lights and stays lit: {}",
+        shown(&bare)
+    );
+    let unheld = lay(true, true);
+    assert!(
+        flashes(&unheld) >= 6,
+        "control: the seat lit the frame it turns clear flashes {} times: {}",
+        flashes(&unheld),
+        shown(&unheld)
+    );
+}

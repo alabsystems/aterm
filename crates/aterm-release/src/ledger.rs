@@ -249,12 +249,15 @@ pub fn parse(text: &str) -> Result<Vec<Record>> {
                  \"<build_number> <version>\" (the ledger is append-only; never edit it)"
             )));
         }
-        let build: u64 = fields[0].parse().map_err(|_| {
-            Error::new(format!(
-                "{LEDGER_FILE} line {line_no}: build number {:?} is not a u64",
-                fields[0]
-            ))
-        })?;
+        let build: u64 = (!fields[0].is_empty() && fields[0].bytes().all(|b| b.is_ascii_digit()))
+            .then(|| fields[0].parse().ok())
+            .flatten()
+            .ok_or_else(|| {
+                Error::new(format!(
+                    "{LEDGER_FILE} line {line_no}: build number {:?} is not a u64",
+                    fields[0]
+                ))
+            })?;
         records.push(Record {
             build,
             version: fields[1].to_string(),

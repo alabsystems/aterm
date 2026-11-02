@@ -123,6 +123,8 @@ fn context(now_ms: u64) -> Context {
         signer: Some(signer()),
         network: NETWORK,
         members: [A, B, C].into_iter().collect(),
+        scope: None,
+        writers: BTreeMap::new(),
         now_ms,
     }
 }
@@ -815,4 +817,70 @@ fn custodian_pass_requires_commons_writer_before_publishing_vault() {
     assert_eq!(reopened.seq(), published.seq);
     let m2 = Audience::Hosts(vec!["m2".into()]);
     assert!(reopened.doc.entry(&m2, "release-notary").is_none());
+}
+
+#[test]
+fn roster_denied_binding_excluded_from_credential_copy_and_sweep_quorum() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer, Role::Writer]);
+    for paths in &lab.paths {
+        need::test_alab_policy(paths);
+    }
+    let admin = client::admin_open(&lab.paths[0]).unwrap();
+    let mut doc = admin.doc.clone();
+    let m1 = Audience::Hosts(vec!["m1".into()]);
+    doc.set_entry(&m1, "release-notary", b"apple").unwrap();
+    let published = client::admin_publish(&lab.paths[0], &admin, &doc).unwrap();
+    for paths in &lab.paths {
+        client::sync(paths, None).unwrap();
+    }
+    let now = 1_000_000_000;
+    // Both m2 and m3 post requests before m3's machine id is denied in aterm-swarm-roster.
+    need::raise(
+        &lab.paths[1],
+        Want::Mailbox("absent".into()),
+        Purpose::ByHand,
+    )
+    .unwrap();
+    need::raise(&lab.paths[2], Want::Notary, Purpose::ReleaseNotary).unwrap();
+    assert_eq!(pass_at(&lab.paths[1], now).unwrap().posted, 1);
+    assert_eq!(pass_at(&lab.paths[2], now).unwrap().posted, 1);
+    repair_commons(&lab, 3);
+
+    // Deny m3's machine id in aterm-swarm-roster on all replicas.
+    let m3_binding = lab.bootstrap(2).request().unwrap().binding().clone();
+    let roster_toml = format!(
+        "deny_nodes = [\"{}\"]\n",
+        aterm_codec::hex::encode_lower(m3_binding.machine()),
+    );
+    let admin = client::admin_open(&lab.paths[0]).unwrap();
+    let mut doc = admin.doc.clone();
+    doc.set_entry(
+        &Audience::Everyone,
+        aterm_secrets::swarm_roster::ROSTER_ENTRY,
+        roster_toml.as_bytes(),
+    )
+    .unwrap();
+    let roster_pub = client::admin_publish(&lab.paths[0], &admin, &doc).unwrap();
+    let _ = published;
+    for paths in &lab.paths {
+        client::sync(paths, None).unwrap();
+    }
+
+    // m1 sweeps m2's request; m3 is roster-denied so m1 + m2 are the only active members.
+    let m1_pass = pass_at(&lab.paths[0], now).unwrap();
+    assert_eq!(m1_pass.swept, 1, "m1 sweeps only m2's active request");
+    let custodian = custodian_pass_at(&lab.paths[0], now).unwrap().unwrap();
+    assert!(
+        custodian.published.is_empty(),
+        "roster-denied m3 must not receive a custodian copy: {custodian:?}"
+    );
+    assert_eq!(
+        custodian.asked.len(),
+        1,
+        "m2's request reaches needs-person without waiting for roster-denied m3's sweep: {custodian:?}"
+    );
+    let reopened = client::admin_open(&lab.paths[0]).unwrap();
+    assert_eq!(reopened.seq(), roster_pub.seq);
+    let m3 = Audience::Hosts(vec!["m3".into()]);
+    assert!(reopened.doc.entry(&m3, "release-notary").is_none());
 }

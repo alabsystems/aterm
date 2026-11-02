@@ -23,6 +23,11 @@ pub struct Screen {
     pub generation: Option<String>,
     /// Server-reported timestamp of the last human input.
     pub human: HumanInput,
+    /// Server-reported timestamp of the person's last typing (`"human_typed_ms"`: a key, text,
+    /// a key sequence or a paste that reached the program, never a scroll or a click); where the
+    /// reply leaves it out, [`Self::human`], as a window that reports no typing stamp of its own
+    /// says it.
+    pub typed: HumanInput,
     /// Monotonic count of human input gestures (`if-human=` fence value).
     pub human_seq: Option<u64>,
     /// Pane width in cells (`"dims.cols"`).
@@ -85,7 +90,7 @@ impl HumanInput {
         {
             None => Self::Unknown,
             Some("-") => Self::Never,
-            Some(ms) => ms.parse().map_or(Self::Unknown, Self::Ago),
+            Some(ms) => crate::parse_uint(ms).map_or(Self::Unknown, Self::Ago),
         }
     }
 
@@ -156,7 +161,7 @@ pub fn parse_text_json(body: &str) -> Result<Screen, String> {
     let rows = match &mut v {
         Json::Object(kv) => kv
             .iter_mut()
-            .find(|(k, _)| k == "rows")
+            .rfind(|(k, _)| k == "rows")
             .map(|(_, r)| std::mem::replace(r, Json::Null)),
         _ => None,
     };
@@ -176,6 +181,11 @@ pub fn parse_text_json(body: &str) -> Result<Screen, String> {
         .get("inputs")
         .and_then(Json::as_array)
         .filter(|i| i.len() == 2);
+    let human = match v.get("human_ms") {
+        None => HumanInput::Unknown,
+        Some(Json::Null) => HumanInput::never(v.get("unkeyed_ms").and_then(Json::as_u64)),
+        Some(h) => h.as_u64().map_or(HumanInput::Unknown, HumanInput::Ago),
+    };
     Ok(Screen {
         rows,
         cursor_row: usize::try_from(num(cursor, "row").unwrap_or(0)).unwrap_or(usize::MAX),
@@ -187,9 +197,10 @@ pub fn parse_text_json(body: &str) -> Result<Screen, String> {
             .and_then(Json::as_str)
             .filter(|g| ScreenGen::parse(g).is_some())
             .map(str::to_string),
-        human: match v.get("human_ms") {
-            None => HumanInput::Unknown,
-            Some(Json::Null) => HumanInput::never(v.get("unkeyed_ms").and_then(Json::as_u64)),
+        human,
+        typed: match v.get("human_typed_ms") {
+            None => human,
+            Some(Json::Null) => HumanInput::Never,
             Some(h) => h.as_u64().map_or(HumanInput::Unknown, HumanInput::Ago),
         },
         human_seq: v.get("human_seq").and_then(Json::as_u64),
@@ -239,7 +250,7 @@ impl Json {
 
     pub fn get(&self, key: &str) -> Option<&Json> {
         match self {
-            Json::Object(kv) => kv.iter().find(|(k, _)| k == key).map(|(_, v)| v),
+            Json::Object(kv) => kv.iter().rfind(|(k, _)| k == key).map(|(_, v)| v),
             _ => None,
         }
     }
@@ -378,12 +389,17 @@ fn parse_string(s: &str, i: &mut usize) -> Result<String, String> {
             't' => out.push('\t'),
             'u' => {
                 let cp = hex4(s, i)?;
+                let save = *i;
                 let ch = if (0xD800..0xDC00).contains(&cp) && s[*i..].starts_with("\\u") {
                     *i += 2;
                     let lo = hex4(s, i)?;
-                    let combined =
-                        0x10000 + ((cp - 0xD800) << 10) + (lo.wrapping_sub(0xDC00) & 0x3FF);
-                    char::from_u32(combined).unwrap_or('\u{FFFD}')
+                    if (0xDC00..0xE000).contains(&lo) {
+                        let combined = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                        char::from_u32(combined).unwrap_or('\u{FFFD}')
+                    } else {
+                        *i = save;
+                        '\u{FFFD}'
+                    }
                 } else {
                     char::from_u32(cp).unwrap_or('\u{FFFD}')
                 };
@@ -402,6 +418,9 @@ fn hex4(s: &str, i: &mut usize) -> Result<u32, String> {
     };
     let t = &rest[..last + c.len_utf8()];
     *i += t.len();
+    if !t.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("json: bad \\u escape {t:?}"));
+    }
     u32::from_str_radix(t, 16).map_err(|_| format!("json: bad \\u escape {t:?}"))
 }
 
@@ -595,6 +614,10 @@ mod tests {
         assert!(s.rows.is_empty());
         assert_eq!(s.seq, 5);
         assert_eq!(s.generation, None, "an older host sends no gen");
+        let dup = r#"{"rows":["old"],"rows":["new"],"cursor":{"row":1,"col":2},"seq":1,"seq":9}"#;
+        let s = parse_text_json(dup).expect("parses duplicate keys");
+        assert_eq!(s.rows, ["new"]);
+        assert_eq!(s.seq, 9);
     }
 
     /// The screen generation (`"gen":"<epoch>.<seq>"`) is read as the fence a
@@ -662,6 +685,28 @@ mod tests {
             absent,
             "the title is the only field it adds"
         );
+    }
+
+    /// `"human_typed_ms"`: a number is the age of the person's last typing and `null` is none,
+    /// apart from `"human_ms"`; absent, the window reports one stamp, which both read.
+    #[test]
+    fn the_persons_typing_is_read_apart_from_their_gestures() {
+        let with = |tail: &str| {
+            parse_text_json(&format!(
+                r#"{{"rows":[],"cursor":{{"row":0,"col":0}},"dims":{{"rows":2,"cols":2}},"seq":15,"gen":"2.15"{tail}}}"#
+            ))
+            .expect("parses")
+            .typed
+        };
+        assert_eq!(
+            with(r#","human_ms":5,"human_typed_ms":7200000"#),
+            HumanInput::Ago(7_200_000)
+        );
+        assert_eq!(
+            with(r#","human_ms":5,"human_typed_ms":null"#),
+            HumanInput::Never
+        );
+        assert_eq!(with(r#","human_ms":5"#), HumanInput::Ago(5));
     }
 
     /// `"human_ms"`: a number is its age, `null` is never, and absent or any other value is
@@ -847,10 +892,17 @@ mod tests {
         assert_eq!(a[3], Json::Number("-1.5e3".to_string()));
         assert_eq!(a[4].as_str(), Some("x"));
         assert_eq!(v.get("b"), Some(&Json::Object(vec![])));
+        assert_eq!(
+            Json::parse(r#""\uD83D\uDE00 \uD800\u0041 \uD800\uD83D\uDE00 \uDE00""#)
+                .expect("surrogate escapes")
+                .as_str(),
+            Some("😀 \u{FFFD}A \u{FFFD}😀 \u{FFFD}")
+        );
         assert!(Json::parse("[1,]").is_err());
         assert!(Json::parse("{\"a\" 1}").is_err());
         assert!(Json::parse("tru").is_err());
         assert!(Json::parse("\"\\q\"").is_err());
+        assert!(Json::parse(r#""\u+041""#).is_err());
     }
 
     /// [`cell_fg_is`] reads a well-formed cell's colour; a cell of an unfinished frame is no evidence.

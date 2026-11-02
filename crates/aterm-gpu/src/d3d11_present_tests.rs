@@ -59,6 +59,9 @@ fn a_changed_present_changes_the_d3d11_destination() {
         dx: 2,
         dy: 1,
         scrim,
+        serial: 0,
+        delta: None,
+        above: &[],
     };
     let carded = presented(
         &mut armed,

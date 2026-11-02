@@ -4,7 +4,7 @@
 //! Clean-tree verification for release cuts.
 
 use aterm_uds::spawnfd::command;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// How a path differs from `HEAD`.
@@ -86,6 +86,27 @@ pub fn dirty_against_head(root: &Path) -> Option<BTreeMap<String, Dirt>> {
         }
     }
     Some(dirty)
+}
+
+/// Every file the checkout at `root` tracks, its initialised submodules' own included, by its
+/// path from `root`: what is neither untracked nor ignored there.
+#[must_use]
+pub fn tracked_files(root: &Path) -> Option<BTreeSet<String>> {
+    let mut tracked = BTreeSet::new();
+    for entry in index_entries(root)? {
+        if entry.mode != GITLINK_MODE {
+            tracked.insert(entry.path);
+            continue;
+        }
+        let full = root.join(&entry.path);
+        // Reject a symlink gitlink before asking Git to inspect it, as the dirt checks do.
+        if std::fs::symlink_metadata(&full).is_ok_and(|meta| meta.is_dir()) && is_toplevel(&full) {
+            for path in tracked_files(&full)? {
+                tracked.insert(format!("{}/{path}", entry.path));
+            }
+        }
+    }
+    Some(tracked)
 }
 
 /// The strict judge, for a run that files proofs under `HEAD`'s tree.
@@ -410,6 +431,107 @@ mod tests {
             std::os::unix::fs::symlink("flagged.rs", root.join("link")).unwrap();
             assert_eq!(raw_differences(&root).unwrap(), ["link"]);
         }
+    }
+
+    /// The tracked files are the index's, an initialised submodule's own under its path; no
+    /// untracked or ignored file is one, in the checkout or in the submodule.
+    #[test]
+    fn the_tracked_files_are_the_indexes_a_submodules_included() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        repo(&sub);
+        let root = dir.path().join("w");
+        repo(&root);
+        let url = sub.to_str().unwrap();
+        let file = "protocol.file.allow=always";
+        run(
+            &root,
+            &["-c", file, "submodule", "add", "-q", url, "vendor/sub"],
+        );
+        run(&root, &["commit", "-q", "-m", "sub"]);
+        for loose in [
+            "ignored/x.rs",
+            "loose.rs",
+            "vendor/sub/ignored/y.rs",
+            "vendor/sub/z.rs",
+        ] {
+            let path = root.join(loose);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "not tracked").unwrap();
+        }
+        let tracked: Vec<String> = tracked_files(&root).unwrap().into_iter().collect();
+        assert_eq!(
+            tracked,
+            [
+                ".gitignore",
+                ".gitmodules",
+                "a.rs",
+                "flagged.rs",
+                "vendor/sub/.gitignore",
+                "vendor/sub/a.rs",
+                "vendor/sub/flagged.rs",
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_gitlink_replaced_by_an_outside_repository_symlink_enumerates_no_outside_rows() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub-source");
+        let outside = dir.path().join("outside");
+        let root = dir.path().join("w");
+        repo(&sub);
+        repo(&outside);
+        repo(&root);
+        std::fs::write(
+            outside.join("outside-only.rs"),
+            "private fixture outside the index",
+        )
+        .unwrap();
+        run(&outside, &["add", "outside-only.rs"]);
+        run(&outside, &["commit", "-q", "-m", "outside row"]);
+        run(
+            &root,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                sub.to_str().unwrap(),
+                "vendor/sub",
+            ],
+        );
+        run(&root, &["commit", "-q", "-m", "indexed gitlink"]);
+        assert!(
+            tracked_files(&root).unwrap().contains("vendor/sub/a.rs"),
+            "a real populated gitlink still enumerates its tracked files"
+        );
+        assert!(
+            tracked_files(&outside).unwrap().contains("outside-only.rs"),
+            "the symlink target is a real repository with an independently tracked row"
+        );
+
+        let link = root.join("vendor/sub");
+        std::fs::rename(&link, dir.path().join("parked-sub")).unwrap();
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        assert!(
+            link.is_dir() && is_toplevel(&link),
+            "the former following-directory condition admits this outside target"
+        );
+        let tracked = tracked_files(&root).unwrap();
+        assert_eq!(
+            tracked,
+            [".gitignore", ".gitmodules", "a.rs", "flagged.rs"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<BTreeSet<_>>()
+        );
+        assert!(!tracked.contains("vendor/sub/outside-only.rs"));
+        let dirty = dirty_against_head(&root).unwrap();
+        assert_eq!(dirty.get("vendor/sub"), Some(&Dirt::Changed));
+        assert!(dirty.keys().all(|path| !path.starts_with("vendor/sub/")));
     }
 
     #[test]

@@ -1,0 +1,50 @@
+# grok 1.0.70 · MEASURED 2026-10-29, `aterm ctl text` of a private headless aterm (144x50, aterm 0.146.0) running the real Grok Build, launched by path in the lab's jail with a scratch `HOME` and `GROK_HOME`, the lab's `XAI_API_KEY` and `GROK_XAI_API_BASE_URL`/`GROK_CLI_CHAT_PROXY_BASE_URL=http://127.0.0.1:<port>/v1` (a local stub of xAI's API, crates/aterm-lab) · the slow turn about 11 s in with a continuation typed into the composer (`and then the next step`, no Enter yet): the key row is `Enter:queue  │  Opt+Enter:newline  │  Shift+Tab:mode  │  Ctrl+c:cancel  │  Ctrl+Enter:send now  │  Ctrl+x:shortcuts` · cursor=45,28 (visible, blinking_block: after the draft) · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+  /p/t/at.lab0/proj                                                                                                   11K / 256K │ [Dashboard]
+
+
+     ❯ a slow turn                                                                                                                   1:54 PM
+
+
+     tick 1 tick 2 tick 3 tick 4 tick 5 tick 6 tick 7 tick 8 tick 9 tick 10 tick 11 tick 12 tick 13 tick 14 tick 15 tick 16          1:54 PM
+
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+                                                                                                                                               █
+
+    ⠼ Responding… 15s                                                                                                        16s ⇣11.6k [stop]
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ ❯ and then the next step                                                                                                                 │
+  ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── lab-stub ─╯
+
+  Enter:queue  │  Opt+Enter:newline  │  Shift+Tab:mode  │  Ctrl+c:cancel  │  Ctrl+Enter:send now  │  Ctrl+x:shortcuts

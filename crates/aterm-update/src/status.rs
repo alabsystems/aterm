@@ -104,7 +104,7 @@ struct LatestRecord {
 }
 
 fn read_latest(staging: &Staging) -> Option<LatestRecord> {
-    let text = std::fs::read_to_string(&staging.status).ok()?;
+    let text = crate::read_ledger_text(&staging.status)?;
     let v: aterm_toml::Value = text.parse().ok()?;
     let tag = v
         .get("latest_tag")
@@ -162,7 +162,7 @@ pub(crate) fn authorized_tag(staging: &Staging, source: &crate::Source) -> Optio
 /// the channel head.
 pub(crate) fn clear_latest_tag(staging: &Staging) {
     with_delivery(|delivery| delivery.latest = None);
-    let Ok(text) = std::fs::read_to_string(&staging.status) else {
+    let Some(text) = crate::read_ledger_text(&staging.status) else {
         return;
     };
     let Ok(mut v) = text.parse::<aterm_toml::Value>() else {
@@ -181,7 +181,9 @@ pub(crate) fn clear_latest_tag(staging: &Staging) {
         return;
     };
     let tmp = temp_path(staging);
-    if std::fs::write(&tmp, text).is_err() || std::fs::rename(&tmp, &staging.status).is_err() {
+    if crate::install::write_private_file(&tmp, text.as_bytes()).is_err()
+        || std::fs::rename(&tmp, &staging.status).is_err()
+    {
         let _ = std::fs::remove_file(&tmp);
     }
 }
@@ -277,7 +279,9 @@ pub fn record(staging: &Staging, current_build: u64, outcome: &str) {
         return;
     };
     let tmp = temp_path(staging);
-    if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, &staging.status).is_ok() {
+    if crate::install::write_private_file(&tmp, text.as_bytes()).is_ok()
+        && std::fs::rename(&tmp, &staging.status).is_ok()
+    {
         return;
     }
     let _ = std::fs::remove_file(&tmp);
@@ -432,6 +436,11 @@ mod tests {
         clear_check_note();
         set_latest_tag("v0.74.0", &source, 42, 42);
         record(&s, 42, "up to date (channel head v0.74.0)");
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(&s.status).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         let text = std::fs::read_to_string(&s.status).unwrap();
         let v: aterm_toml::Value = aterm_toml::from_str(&text).expect("valid TOML");
         assert_eq!(
@@ -502,6 +511,23 @@ mod tests {
         assert_eq!(latest_tag(&s, 42, &source), None);
         std::fs::write(&s.status, "not toml {{{").unwrap();
         assert_eq!(latest_tag(&s, 42, &source), None);
+        let target = s.root.join("outside-status.toml");
+        std::fs::write(
+            &target,
+            "schema = 1\ncurrent_build = 42\nlatest_tag = \"v0.74.0\"\n\
+             latest_source = \"alabsystems/aterm\"\nlatest_authorized_build = 42\n\
+             latest_release_build = 42\n",
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(&s.status);
+        std::os::unix::fs::symlink(&target, &s.status).unwrap();
+        assert_eq!(latest_tag(&s, 42, &source), None);
+        clear_latest_tag(&s);
+        assert!(
+            std::fs::read_to_string(&target)
+                .unwrap()
+                .contains("latest_tag")
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

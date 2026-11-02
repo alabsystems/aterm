@@ -76,6 +76,69 @@ pub(crate) const fn account_home() -> Option<PathBuf> {
     None
 }
 
+/// Open a regular file for reading without following a symlink at `path` or blocking on a FIFO.
+pub(crate) fn open_regular_reader(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(path)?
+    };
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "refusing symlink",
+            ));
+        }
+        file
+    };
+    #[cfg(not(any(unix, windows)))]
+    let file = {
+        let link = std::fs::symlink_metadata(path)?;
+        if link.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "refusing symlink",
+            ));
+        }
+        std::fs::File::open(path)?
+    };
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+/// Read up to `max` bytes of UTF-8 text from a regular file at `path` ([`open_regular_reader`]).
+pub(crate) fn read_regular_text(path: &std::path::Path, max: u64) -> std::io::Result<String> {
+    use std::io::Read as _;
+    let file = open_regular_reader(path)?;
+    let cap = usize::try_from(max.min(64 * 1024)).unwrap_or(64 * 1024);
+    let mut buf = Vec::with_capacity(cap);
+    file.take(max.saturating_add(1)).read_to_end(&mut buf)?;
+    if u64::try_from(buf.len()).unwrap_or(u64::MAX) > max {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            "file exceeds bound",
+        ));
+    }
+    String::from_utf8(buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
 /// Aterm's state root and aterm.toml as the account's own window resolves them: as this
 /// process resolves them when it runs as its account's own shell, else (a scratch home, a
 /// private state root) in the platform's layout under the account's home, because the window
@@ -123,6 +186,9 @@ pub struct Need {
     pub alone: bool,
     /// Its memory covers the builds its holder's tree starts ([`Self::covers`]).
     pub covers: bool,
+    /// End its wait behind holders that make no progress ([`Self::ends_when_stuck`]): how long
+    /// they may make none first. The waiter's own, never in a [`Record`].
+    pub stuck_ends: Option<std::time::Duration>,
 }
 
 impl Need {
@@ -228,6 +294,20 @@ impl Need {
     #[must_use]
     pub const fn covers(mut self) -> Need {
         self.covers = true;
+        self
+    }
+
+    /// End its wait once every claim it waits behind is held by a holder whose process tree,
+    /// with the processes its claim is credited with ([`Record::credit`]), has used no CPU time
+    /// and written nothing for `after`, as two looks in a row read them ([`Error::Stuck`]): the
+    /// claim leaves the queue, naming them, and nobody signals them (CW-WAIT-UNBOUNDED). A holder
+    /// that is itself waiting in a chain looks again every few seconds, so it works. Unset, a
+    /// wait lasts as long as its holders hold, its line naming each that has made no progress
+    /// for [`aterm_toolchain::stall::STALLED_AFTER`]: what a caller with no end of its own for
+    /// such a wait asks, so a tool that waits on a person's stopped job resumes with it.
+    #[must_use]
+    pub const fn ends_when_stuck(mut self, after: std::time::Duration) -> Need {
+        self.stuck_ends = Some(after);
         self
     }
 }

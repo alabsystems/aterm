@@ -166,6 +166,7 @@ impl Buffer {
         if (self.width, self.height) == (width, height) && self.live.is_some() {
             return Ok(());
         }
+        self.age = 0;
         let size_err = || WaylandPresentError::Size(width.unsigned_abs(), height.unsigned_abs());
         let len = pool_size(width, height).ok_or_else(size_err)?;
         let len_i32 = i32::try_from(len).map_err(|_| size_err())?;
@@ -249,7 +250,13 @@ impl WaylandPresenter {
         let size_err = || WaylandPresentError::Size(width.get(), height.get());
         let w = i32::try_from(width.get()).map_err(|_| size_err())?;
         let h = i32::try_from(height.get()).map_err(|_| size_err())?;
-        self.size = Some((w, h));
+        if self.size != Some((w, h)) {
+            if let Some((front, back)) = &mut self.buffers {
+                front.age = 0;
+                back.age = 0;
+            }
+            self.size = Some((w, h));
+        }
         Ok(())
     }
 

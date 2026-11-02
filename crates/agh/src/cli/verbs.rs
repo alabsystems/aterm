@@ -4,8 +4,9 @@
 //! Verb table used by the CLI parser, help renderer, schema output, and command dispatch.
 
 use super::{
-    Ctx, Outcome, args::Invocation, cmd_api, cmd_auth, cmd_can, cmd_content, cmd_git, cmd_meta,
-    cmd_policy, cmd_rate, cmd_release, cmd_repo, cmd_wait, cmd_whoami,
+    Ctx, Outcome, args::Invocation, cmd_api, cmd_asset, cmd_auth, cmd_can, cmd_content,
+    cmd_credential, cmd_git, cmd_intent, cmd_meta, cmd_policy, cmd_rate, cmd_ref, cmd_release,
+    cmd_release_write, cmd_repo, cmd_wait, cmd_whoami,
 };
 use crate::error::Result;
 
@@ -23,6 +24,12 @@ pub enum Class {
     Provision,
     /// As its method says (`api`).
     ByMethod,
+    /// An additive or modifying write (design §9.4's A and M).
+    Write,
+    /// A write that removes something, which needs `--confirm` (D).
+    Destructive,
+    /// Runs git or answers it.
+    Git,
 }
 
 /// What a flag takes.
@@ -92,11 +99,17 @@ pub enum Noun {
     Permission,
     /// agh's own documents (help, schema, version).
     Meta,
+    /// A write's outcome (`write_out::WriteReport`).
+    Write,
+    /// One journal intent.
+    Intent,
+    /// What the git helper would answer (`whoami --git`).
+    Credential,
 }
 
 impl Noun {
     /// Every noun, in declaration order.
-    pub const ALL: [Noun; 20] = [
+    pub const ALL: [Noun; 23] = [
         Noun::Release,
         Noun::ReleaseList,
         Noun::Asset,
@@ -117,6 +130,9 @@ impl Noun {
         Noun::Wait,
         Noun::Permission,
         Noun::Meta,
+        Noun::Write,
+        Noun::Intent,
+        Noun::Credential,
     ];
 
     /// The canonical kebab-case slug for this noun.
@@ -143,6 +159,9 @@ impl Noun {
             Noun::Wait => "wait",
             Noun::Permission => "permission",
             Noun::Meta => "meta",
+            Noun::Write => "write",
+            Noun::Intent => "intent",
+            Noun::Credential => "credential",
         }
     }
 
@@ -246,6 +265,28 @@ const ID: FlagSpec = value("--id", "the release's numeric id, in place of TAG");
 const TAG_REGEX: FlagSpec = value("--tag-regex", "only tags this regular expression matches");
 const PRERELEASE: FlagSpec = on("--prerelease", "only prereleases");
 const NO_PRERELEASE: FlagSpec = on("--no-prerelease", "no prereleases");
+const DRY_RUN: FlagSpec = on("--dry-run", "say what would be sent, and send nothing");
+const NOTIFY: FlagSpec = on(
+    "--notify",
+    "post the settled event to this session's fabric",
+);
+const CONFIRM: FlagSpec = value("--confirm", "the name being removed, typed again");
+const TITLE: FlagSpec = value("--title", "the release's title (default: its tag)");
+const NOTES: FlagSpec = value("--notes", "the release notes, as text");
+const NOTES_FILE: FlagSpec = value("--notes-file", "the release notes, read from this file");
+const TARGET: FlagSpec = value("--target", "the branch or sha a new tag is made at");
+const MARK_PRERELEASE: FlagSpec = on("--prerelease", "mark it a prerelease");
+const MARK_FULL: FlagSpec = on("--no-prerelease", "mark it a full release");
+const TIER: FlagSpec = value("--tier", "dev, release or external");
+const OWNER: FlagSpec = repeat(
+    "--owner",
+    "an owner the profile reads for; give it once per owner",
+);
+const WRITE: FlagSpec = on("--write", "make it those owners' writer");
+const DRAFTS: FlagSpec = on(
+    "--drafts",
+    "vouch that this token may read drafts (needs --write)",
+);
 
 /// Every verb, in table order.
 pub static VERBS: &[Verb] = &[
@@ -491,14 +532,300 @@ pub static VERBS: &[Verb] = &[
         noun: Noun::Wait,
         gh: "-",
         milestone: 1,
-        flags: &[INCLUDE_DRAFTS],
+        flags: &[INCLUDE_DRAFTS, NOTIFY],
         positionals: &["REPO", "TAG", "COND…"],
         run: cmd_wait::release_wait,
     },
     Verb {
+        path: &["release", "create"],
+        class: Class::Write,
+        usage: "agh release create REPO TAG --draft [--title T] [--notes TEXT | --notes-file F] [--target REF] [--prerelease] [--dry-run] [--notify]",
+        summary: "create a draft release, once: a rerun converges on the draft it made",
+        example: "agh release create alabsystems/aterm <tag> --draft --dry-run",
+        noun: Noun::Write,
+        gh: "gh release create --draft",
+        milestone: 2,
+        flags: &[
+            on(
+                "--draft",
+                "create it as a draft: publishing is its own step",
+            ),
+            TITLE,
+            NOTES,
+            NOTES_FILE,
+            TARGET,
+            MARK_PRERELEASE,
+            DRY_RUN,
+            NOTIFY,
+        ],
+        positionals: &["REPO", "TAG"],
+        run: cmd_release_write::release_create,
+    },
+    Verb {
+        path: &["release", "upload"],
+        class: Class::Write,
+        usage: "agh release upload REPO TAG | --id ID FILE... [--clobber] [--dry-run] [--notify]",
+        summary: "upload files to a release as assets, each checked against its digest",
+        example: "agh release upload alabsystems/aterm <tag> <file> --dry-run",
+        noun: Noun::Write,
+        gh: "gh release upload",
+        milestone: 2,
+        flags: &[
+            ID,
+            on(
+                "--clobber",
+                "replace an asset of the same name that holds other bytes",
+            ),
+            DRY_RUN,
+            NOTIFY,
+        ],
+        positionals: &["REPO", "TAG?", "FILE…?"],
+        run: cmd_release_write::release_upload,
+    },
+    Verb {
+        path: &["release", "publish"],
+        class: Class::Write,
+        usage: "agh release publish REPO TAG | --id ID [--prerelease | --no-prerelease] [--expect-asset NAME=SHA256]... [--dry-run] [--notify]",
+        summary: "publish a draft release, its assets checked against the digests expected",
+        example: "agh release publish alabsystems/aterm <tag> --expect-asset <name>=<sha256> --dry-run",
+        noun: Noun::Write,
+        gh: "gh release edit --draft=false",
+        milestone: 2,
+        flags: &[
+            ID,
+            on("--prerelease", "publish it as a prerelease"),
+            on("--no-prerelease", "publish it as a full release"),
+            repeat(
+                "--expect-asset",
+                "NAME=SHA256 an asset must hold; give it once per asset",
+            ),
+            DRY_RUN,
+            NOTIFY,
+        ],
+        positionals: &["REPO", "TAG?"],
+        run: cmd_release_write::release_publish,
+    },
+    Verb {
+        path: &["release", "edit"],
+        class: Class::Write,
+        usage: "agh release edit REPO TAG | --id ID [--title T] [--notes TEXT | --notes-file F] [--prerelease | --no-prerelease] [--dry-run]",
+        summary: "change a release's title, notes or prerelease mark",
+        example: "agh release edit alabsystems/aterm <tag> --title <title> --dry-run",
+        noun: Noun::Write,
+        gh: "gh release edit",
+        milestone: 2,
+        flags: &[
+            ID,
+            TITLE,
+            NOTES,
+            NOTES_FILE,
+            MARK_PRERELEASE,
+            MARK_FULL,
+            DRY_RUN,
+        ],
+        positionals: &["REPO", "TAG?"],
+        run: cmd_release_write::release_edit,
+    },
+    Verb {
+        path: &["release", "ensure"],
+        class: Class::Write,
+        usage: "agh release ensure REPO TAG [--title T] [--notes TEXT | --notes-file F] [--target REF] [--prerelease] [--file F]... [--publish] [--dry-run] [--notify]",
+        summary: "make a release hold its files, and publish it: each step once, a rerun converges",
+        example: "agh release ensure alabsystems/aterm <tag> --file <file> --publish --dry-run",
+        noun: Noun::Write,
+        gh: "-",
+        milestone: 2,
+        flags: &[
+            TITLE,
+            NOTES,
+            NOTES_FILE,
+            TARGET,
+            MARK_PRERELEASE,
+            repeat(
+                "--file",
+                "a file the release must hold as an asset; once per file",
+            ),
+            on("--publish", "publish it once every file is there"),
+            DRY_RUN,
+            NOTIFY,
+        ],
+        positionals: &["REPO", "TAG"],
+        run: cmd_release_write::release_ensure,
+    },
+    Verb {
+        path: &["release", "delete"],
+        class: Class::Destructive,
+        usage: "agh release delete REPO TAG | --id ID --confirm TAG [--dry-run] [--notify]",
+        summary: "delete a release, its tag typed again; the git tag stays",
+        example: "agh release delete alabsystems/aterm <tag> --confirm <tag> --dry-run",
+        noun: Noun::Write,
+        gh: "gh release delete",
+        milestone: 2,
+        flags: &[ID, CONFIRM, DRY_RUN, NOTIFY],
+        positionals: &["REPO", "TAG?"],
+        run: cmd_release_write::release_delete,
+    },
+    Verb {
+        path: &["asset", "delete"],
+        class: Class::Destructive,
+        usage: "agh asset delete REPO TAG NAME --confirm NAME [--dry-run] [--notify]",
+        summary: "delete one release asset, its name typed again",
+        example: "agh asset delete alabsystems/aterm <tag> <name> --confirm <name> --dry-run",
+        noun: Noun::Write,
+        gh: "gh release delete-asset",
+        milestone: 2,
+        flags: &[CONFIRM, DRY_RUN, NOTIFY],
+        positionals: &["REPO", "TAG", "NAME"],
+        run: cmd_asset::asset_delete,
+    },
+    Verb {
+        path: &["ref", "create"],
+        class: Class::Write,
+        usage: "agh ref create REPO REF SHA [--dry-run]",
+        summary: "create a branch or tag ref at a sha, once: a rerun at the same sha converges",
+        example: "agh ref create alabsystems/aterm refs/tags/<tag> <sha> --dry-run",
+        noun: Noun::Write,
+        gh: "gh api repos/O/R/git/refs",
+        milestone: 2,
+        flags: &[DRY_RUN],
+        positionals: &["REPO", "REF", "SHA"],
+        run: cmd_ref::ref_create,
+    },
+    Verb {
+        path: &["ref", "delete"],
+        class: Class::Destructive,
+        usage: "agh ref delete REPO REF --expect SHA --confirm REF [--dry-run]",
+        summary: "delete a ref only while it names the sha expected: a leased git push",
+        example: "agh ref delete alabsystems/aterm <ref> --expect <sha> --confirm <ref> --dry-run",
+        noun: Noun::Write,
+        gh: "git push --delete",
+        milestone: 2,
+        flags: &[
+            value("--expect", "the sha the ref must still name"),
+            CONFIRM,
+            DRY_RUN,
+        ],
+        positionals: &["REPO", "REF"],
+        run: cmd_ref::ref_delete,
+    },
+    Verb {
+        path: &["repo", "clone"],
+        class: Class::Git,
+        usage: "agh repo clone REPO [DIR] [--depth N]",
+        summary: "clone a repository through agh's isolated git runner and its credential helper",
+        example: "agh repo clone alabsystems/aterm <dir> --depth 1",
+        noun: Noun::Repo,
+        gh: "gh repo clone",
+        milestone: 2,
+        flags: &[value("--depth", "a shallow clone of the last N commits")],
+        positionals: &["REPO", "DIR?"],
+        run: cmd_repo::repo_clone,
+    },
+    Verb {
+        path: &["auth", "import"],
+        class: Class::Provision,
+        usage: "agh auth import NAME --from-gh [--user LOGIN] --tier dev|release|external [--owner OWNER]... [--write [--drafts]]",
+        summary: "provision a profile from gh's stored login, with or without a terminal",
+        example: "agh auth import <name> --from-gh --tier dev --owner <owner>",
+        noun: Noun::Identity,
+        gh: "gh auth token",
+        milestone: 2,
+        flags: &[
+            on("--from-gh", "read gh's stored login for github.com"),
+            value(
+                "--user",
+                "the gh login to import (default: gh's active one)",
+            ),
+            TIER,
+            OWNER,
+            WRITE,
+            DRAFTS,
+        ],
+        positionals: &["NAME"],
+        run: cmd_auth::auth_import,
+    },
+    Verb {
+        path: &["auth", "git-credential"],
+        class: Class::Git,
+        usage: "agh auth git-credential get|store|erase",
+        summary: "answer git's credential protocol for the run agh's git runner started",
+        example: "agh auth git-credential get",
+        noun: Noun::Credential,
+        gh: "gh auth git-credential",
+        milestone: 2,
+        flags: &[],
+        positionals: &["OP"],
+        run: cmd_credential::auth_git_credential,
+    },
+    Verb {
+        path: &["intent", "list"],
+        class: Class::Local,
+        usage: "agh intent list [REPO] [--open]",
+        summary: "the write journal's intents, by repository, then step",
+        example: "agh intent list alabsystems/aterm --open",
+        noun: Noun::Intent,
+        gh: "-",
+        milestone: 2,
+        flags: &[on("--open", "only the intents not yet settled")],
+        positionals: &["REPO?"],
+        run: cmd_intent::intent_list,
+    },
+    Verb {
+        path: &["intent", "show"],
+        class: Class::Local,
+        usage: "agh intent show REPO ID",
+        summary: "one intent of the write journal",
+        example: "agh intent show alabsystems/aterm <id>",
+        noun: Noun::Intent,
+        gh: "-",
+        milestone: 2,
+        flags: &[],
+        positionals: &["REPO", "ID"],
+        run: cmd_intent::intent_show,
+    },
+    Verb {
+        path: &["intent", "retract"],
+        class: Class::Local,
+        usage: "agh intent retract REPO ID --confirm ID",
+        summary: "retract an open intent, its id typed again, once its write is known not to have landed",
+        example: "agh intent retract alabsystems/aterm <id> --confirm <id>",
+        noun: Noun::Intent,
+        gh: "-",
+        milestone: 2,
+        flags: &[CONFIRM],
+        positionals: &["REPO", "ID"],
+        run: cmd_intent::intent_retract,
+    },
+    Verb {
+        path: &["policy", "grant"],
+        class: Class::Provision,
+        usage: "agh policy grant CALLER REPO",
+        summary: "grant a caller writes to one repository: a [[writers]] row in agh.toml",
+        example: "agh policy grant <caller> alabsystems/aterm",
+        noun: Noun::Policy,
+        gh: "-",
+        milestone: 2,
+        flags: &[],
+        positionals: &["CALLER", "REPO"],
+        run: cmd_policy::policy_grant,
+    },
+    Verb {
+        path: &["policy", "revoke"],
+        class: Class::Provision,
+        usage: "agh policy revoke CALLER REPO",
+        summary: "take a caller's grant on one repository out of agh.toml",
+        example: "agh policy revoke <caller> alabsystems/aterm",
+        noun: Noun::Policy,
+        gh: "-",
+        milestone: 2,
+        flags: &[],
+        positionals: &["CALLER", "REPO"],
+        run: cmd_policy::policy_revoke,
+    },
+    Verb {
         path: &["whoami"],
         class: Class::Local,
-        usage: "agh whoami [--for REPO [--op read|writer-read|write]] [--verify]",
+        usage: "agh whoami [--for REPO [--op read|writer-read|write]] [--verify] [--git URL]",
         summary: "every profile and ambient token, or with --for, how one request would be routed",
         example: "agh whoami --for alabsystems/aterm --op read",
         noun: Noun::Identity,
@@ -510,6 +837,10 @@ pub static VERBS: &[Verb] = &[
             on(
                 "--verify",
                 "ask GitHub which login each present profile's token is; not with --for",
+            ),
+            value(
+                "--git",
+                "the identity the git helper would answer for this URL",
             ),
         ],
         positionals: &[],
@@ -531,7 +862,7 @@ pub static VERBS: &[Verb] = &[
     Verb {
         path: &["auth", "add"],
         class: Class::Provision,
-        usage: "agh auth add NAME (--file PATH | --stdin) --tier dev|release|external [--owner OWNER]... [--write [--drafts]]",
+        usage: "agh auth add NAME (--file PATH | --stdin) --tier dev|release|external [--owner OWNER]... [--write [--drafts]] [--legacy-loose]",
         summary: "provision a profile from a token file or stdin, with or without a terminal",
         example: "agh auth add <name> --file <path> --tier dev --owner <owner>",
         noun: Noun::Identity,
@@ -546,15 +877,13 @@ pub static VERBS: &[Verb] = &[
                 "--stdin",
                 "read the token from a pipe or file on stdin, never a terminal; agh keeps a copy",
             ),
-            value("--tier", "dev, release or external"),
-            repeat(
-                "--owner",
-                "an owner the profile reads for; give it once per owner",
-            ),
-            on("--write", "make it those owners' writer"),
+            TIER,
+            OWNER,
+            WRITE,
+            DRAFTS,
             on(
-                "--drafts",
-                "vouch that this token may read drafts (needs --write)",
+                "--legacy-loose",
+                "accept a group- or world-readable --file (M2 only, for a builder's lanes)",
             ),
         ],
         positionals: &["NAME"],
@@ -615,19 +944,36 @@ pub static VERBS: &[Verb] = &[
     Verb {
         path: &["api"],
         class: Class::ByMethod,
-        usage: "agh api PATH [-X GET|HEAD] [-f k=v]... [-F k=v]... [--all] [--include] [--accept MEDIA] [-R REPO]",
-        summary: "one read of any API path, or every page of it",
+        usage: "agh api PATH [-X GET|HEAD|POST|PATCH|PUT|DELETE] [-f k=v]... [-F k=v]... [--all] [--include] [--accept MEDIA] [-R REPO] [--confirm PATH] [--dry-run]",
+        summary: "one request to any API path: a read, every page of one, or a write",
         example: "agh api /repos/alabsystems/aterm --jq .default_branch",
         noun: Noun::Raw,
         gh: "gh api",
         milestone: 1,
         flags: &[
-            short(value("--method", "GET (the default) or HEAD"), 'X'),
-            short(repeat("--raw-field", "a query pair k=v"), 'f'),
-            short(repeat("--field", "the same as -f; k=@file is refused"), 'F'),
+            short(
+                value("--method", "GET, HEAD, POST, PATCH, PUT or DELETE"),
+                'X',
+            ),
+            short(
+                repeat("--raw-field", "a query pair k=v; a write's JSON body field"),
+                'f',
+            ),
+            short(
+                repeat(
+                    "--field",
+                    "the same as -f; k=@file is refused; a write's JSON body field",
+                ),
+                'F',
+            ),
             on("--all", "every page; not with -X HEAD"),
             on("--include", "the status and headers too; not with --all"),
             value("--accept", "the Accept media type"),
+            value("--confirm", "a DELETE's path, typed again"),
+            on(
+                "--dry-run",
+                "a write: say what would be sent, and send nothing",
+            ),
         ],
         positionals: &["PATH"],
         run: cmd_api::api,
@@ -717,10 +1063,7 @@ pub static GLOBAL_FLAGS: &[FlagSpec] = &[
         "--no-probe",
         "after a 404, skip the repository probe that tells not_found from not_visible",
     ),
-    value(
-        "--record",
-        "tape this run to a new file PATH: anonymous GitHub reads, not release download",
-    ),
+    value("--record", "tape this run to a new file PATH"),
     value(
         "--replay",
         "run offline from the tape PATH (with no verb, the tape's own command line); exit 3 on \
@@ -728,9 +1071,6 @@ pub static GLOBAL_FLAGS: &[FlagSpec] = &[
     ),
     short(on("--help", "this verb's page, or the manual"), 'h'),
 ];
-
-const WRITES: &str = "writes arrive in M2";
-const USE_GH: &str = "use gh for now";
 
 /// Every refused verb (exit 1).
 pub static REFUSED: &[Refused] = &[
@@ -743,16 +1083,6 @@ pub static REFUSED: &[Refused] = &[
         path: &["auth", "token"],
         why: "agh never prints a credential",
         next: "agh auth status shows each profile's fingerprint",
-    },
-    Refused {
-        path: &["auth", "import"],
-        why: "importing a gh login arrives in M2",
-        next: "agh auth add NAME --stdin --tier TIER < FILE",
-    },
-    Refused {
-        path: &["auth", "git-credential"],
-        why: "the git credential helper arrives in M2",
-        next: "use gh for git until M2",
     },
     Refused {
         path: &["secret"],
@@ -770,54 +1100,9 @@ pub static REFUSED: &[Refused] = &[
         next: "a person deletes it on github.com",
     },
     Refused {
-        path: &["repo", "clone"],
-        why: "agh does not clone; its git helper arrives in M2",
-        next: "git clone https://github.com/OWNER/NAME",
-    },
-    Refused {
         path: &["repo", "create"],
-        why: WRITES,
-        next: USE_GH,
-    },
-    Refused {
-        path: &["release", "create"],
-        why: WRITES,
-        next: USE_GH,
-    },
-    Refused {
-        path: &["release", "upload"],
-        why: WRITES,
-        next: USE_GH,
-    },
-    Refused {
-        path: &["release", "edit"],
-        why: WRITES,
-        next: USE_GH,
-    },
-    Refused {
-        path: &["release", "publish"],
-        why: WRITES,
-        next: USE_GH,
-    },
-    Refused {
-        path: &["release", "ensure"],
-        why: WRITES,
-        next: USE_GH,
-    },
-    Refused {
-        path: &["release", "delete"],
-        why: WRITES,
-        next: USE_GH,
-    },
-    Refused {
-        path: &["asset"],
-        why: WRITES,
-        next: USE_GH,
-    },
-    Refused {
-        path: &["ref"],
-        why: WRITES,
-        next: USE_GH,
+        why: "agh does not create repositories",
+        next: "use gh repo create",
     },
     Refused {
         path: &["pr"],

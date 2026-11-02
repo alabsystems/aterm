@@ -10,7 +10,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "aterm — the atpkg PRODUCER: packs, signs, indexes, mirrors and publishes toolchain packages, and runs the unattended publish lanes. Owner-side; never shipped to clients (docs/DESIGN-atpkg-producer-rust.md)."
+description = "aterm — the atpkg PRODUCER: packs, signs, indexes, mirrors and publishes toolchain packages, and runs the unattended publish lanes. Owner-side; never shipped to clients (docs/TOOLCHAIN-PACKAGE-MANAGER.md §12)."
 
 [lib]
 path = "src/lib.rs"
@@ -22,6 +22,10 @@ path = "src/main.rs"
 test = false
 
 [dependencies]
+serde = { workspace = true, features = ["derive"] }
+aterm-capacity = { workspace = true }
+aterm-sysprobe = { workspace = true }
+libc = { workspace = true }
 # THE CLIENT. Every type the producer emits is the one the client parses (manifest,
 # Channel::for_target, TARGETS), every "verified" is the client's own chain
 # (sig::admit_roster -> authorize_index -> verify_pkg), and tree_root, the lineage

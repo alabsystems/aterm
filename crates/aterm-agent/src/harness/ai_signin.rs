@@ -68,7 +68,7 @@ pub struct AiSigninDoc {
 /// where the account's own `[[mailboxes]]` entry is sealed to it ([`sealed_route_for`]), that
 /// entry under `route`. A Mac built before `route` ignores the field whole, so it never files
 /// the entry's secrets as the address's own per-email ones.
-#[derive(Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct SealedAccountBundle {
     #[serde(skip_serializing_if = "Option::is_none")]
     password: Option<String>,
@@ -80,15 +80,8 @@ struct SealedAccountBundle {
     route: Option<SealedRoute>,
 }
 
-impl std::fmt::Debug for SealedAccountBundle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SealedAccountBundle")
-            .finish_non_exhaustive()
-    }
-}
-
 /// The account's own `[[mailboxes]]` entry, sealed whole: its login, URLs and secrets.
-#[derive(Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct SealedRoute {
     login: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -103,12 +96,6 @@ struct SealedRoute {
     mailbox_password: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     totp_secret: Option<String>,
-}
-
-impl std::fmt::Debug for SealedRoute {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SealedRoute").finish_non_exhaustive()
-    }
 }
 
 impl SealedAccountBundle {
@@ -145,7 +132,7 @@ struct WireAiSigninAccount {
 fn sanitize_endpoint_url(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     let (scheme, rest) = trimmed.split_once("://")?;
-    let (authority, tail) = match rest.find(['/', '?', '#']) {
+    let (authority, tail) = match rest.find(['/', '\\', '?', '#']) {
         Some(idx) => (&rest[..idx], &rest[idx..]),
         None => (rest, ""),
     };
@@ -163,7 +150,7 @@ fn imap_url_has_embedded_secret(url: &str) -> bool {
     let Some((_, rest)) = url.trim().split_once("://") else {
         return false;
     };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let authority = rest.split(['/', '\\', '?', '#']).next().unwrap_or(rest);
     authority
         .rsplit_once('@')
         .is_some_and(|(userinfo, _)| userinfo.contains(':'))
@@ -725,8 +712,8 @@ impl MailCodeRequest {
         for token in words {
             if let Some(val) = token.strip_prefix("since=") {
                 since = Some(
-                    val.parse::<i64>()
-                        .map_err(|_| "invalid since timestamp".to_owned())?,
+                    crate::parse_int::<i64>(val)
+                        .ok_or_else(|| "invalid since timestamp".to_owned())?,
                 );
             } else if let Some(val) = token.strip_prefix("senders=") {
                 for item in val.split(',').filter(|s| !s.is_empty()) {
@@ -844,17 +831,10 @@ impl MailCodeAudit {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct SealedMailCredential {
     kind: String,
     value: String,
-}
-
-impl std::fmt::Debug for SealedMailCredential {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SealedMailCredential")
-            .finish_non_exhaustive()
-    }
 }
 
 /// Seal a [`MailboxCredential`] to `recipient` and return a single-line base64 ciphertext.
@@ -932,46 +912,68 @@ fn authorize_mail_code_inner(
         return Err(MailCodeRefusal::Denied);
     }
     if let Some(claimed) = req.claimed_label.as_deref()
-        && roster
-            .deny_labels
-            .iter()
-            .any(|d| d.eq_ignore_ascii_case(claimed))
+        && (roster.is_label_denied(claimed)
+            || roster
+                .deny_labels
+                .iter()
+                .any(|d| d.eq_ignore_ascii_case(claimed)))
     {
         return Err(MailCodeRefusal::Denied);
     }
 
-    let member = roster
-        .members
-        .iter()
-        .find(|m| {
-            m.node_id
+    let pick_member = |pred: &dyn Fn(&SwarmMember) -> bool| -> Option<&SwarmMember> {
+        roster
+            .members
+            .iter()
+            .find(|m| pred(m) && !member_is_denied(m, roster))
+            .or_else(|| roster.members.iter().find(|m| pred(m)))
+    };
+
+    let member = pick_member(&|m| {
+        m.node_id
+            .as_deref()
+            .is_some_and(|n| n.eq_ignore_ascii_case(proof_node))
+    })
+    .or_else(|| {
+        let key_hex = proof_key_hex?;
+        pick_member(&|m| {
+            m.node_key
                 .as_deref()
-                .is_some_and(|n| n.eq_ignore_ascii_case(proof_node))
+                .is_some_and(|k| k.eq_ignore_ascii_case(key_hex))
         })
-        .or_else(|| {
-            let key_hex = proof_key_hex?;
-            roster.members.iter().find(|m| {
-                m.node_key
-                    .as_deref()
-                    .is_some_and(|k| k.eq_ignore_ascii_case(key_hex))
-            })
+    })
+    .or_else(|| {
+        let claimed = req.claimed_label.as_deref()?;
+        pick_member(&|m| {
+            m.node_id.is_none()
+                && (m.node_key.is_none() || proof_key_hex.is_some())
+                && (m.matches_label_or_alias(claimed)
+                    || m.label.eq_ignore_ascii_case(claimed)
+                    || m.aliases.iter().any(|a| a.eq_ignore_ascii_case(claimed)))
         })
-        .or_else(|| {
-            let claimed = req.claimed_label.as_deref()?;
-            roster.members.iter().find(|m| {
-                m.node_id.is_none()
-                    && (m.node_key.is_none() || proof_key_hex.is_some())
-                    && (m.label.eq_ignore_ascii_case(claimed)
-                        || m.aliases.iter().any(|a| a.eq_ignore_ascii_case(claimed)))
-            })
-        })
-        .ok_or(MailCodeRefusal::UnknownRequester)?;
+    })
+    .ok_or(MailCodeRefusal::UnknownRequester)?;
 
     if member_is_denied(member, roster) {
         return Err(MailCodeRefusal::Denied);
     }
+    if let Some(bound_node) = member.node_id.as_deref()
+        && !bound_node.eq_ignore_ascii_case(proof_node)
+    {
+        return Err(MailCodeRefusal::Denied);
+    }
     if let (Some(bound_hex), Some(proved_hex)) = (member.node_key.as_deref(), proof_key_hex)
         && !bound_hex.eq_ignore_ascii_case(proved_hex)
+    {
+        return Err(MailCodeRefusal::Denied);
+    }
+    if let Some(claimed) = req.claimed_label.as_deref()
+        && !member.matches_label_or_alias(claimed)
+        && !member.label.eq_ignore_ascii_case(claimed)
+        && !member
+            .aliases
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case(claimed))
     {
         return Err(MailCodeRefusal::Denied);
     }
@@ -990,6 +992,9 @@ fn authorize_mail_code_inner(
             let active_book = super::claims::Book::of(
                 book.rows()
                     .filter(|row| {
+                        if roster.is_node_denied(&row.machine) {
+                            return false;
+                        }
                         let canon = ai_pool::leading_m_label(&row.label)
                             .map(|(_, c)| c)
                             .unwrap_or_else(|| row.label.trim().to_ascii_lowercase());
@@ -999,13 +1004,51 @@ fn authorize_mail_code_inner(
                         if let Some(m) = roster.member_by_label_or_alias(&canon) {
                             return !member_is_denied(m, roster);
                         }
+                        if let Some(m) = roster.members.iter().find(|m| {
+                            m.node_id
+                                .as_deref()
+                                .is_some_and(|n| n.eq_ignore_ascii_case(&row.machine))
+                                || m.node_key
+                                    .as_deref()
+                                    .is_some_and(|k| k.eq_ignore_ascii_case(&row.machine))
+                        }) {
+                            return !member_is_denied(m, roster);
+                        }
                         true
                     })
                     .cloned(),
             );
+            let row_belongs_to_requester = |row: &super::claims::Row| {
+                let bound_to_other_member = roster.members.iter().any(|other| {
+                    !member_is_denied(other, roster)
+                        && !other.label.eq_ignore_ascii_case(&member.label)
+                        && (other
+                            .node_id
+                            .as_deref()
+                            .is_some_and(|n| n.eq_ignore_ascii_case(&row.machine))
+                            || other
+                                .node_key
+                                .as_deref()
+                                .is_some_and(|k| k.eq_ignore_ascii_case(&row.machine)))
+                });
+                if bound_to_other_member {
+                    return false;
+                }
+                row.machine.eq_ignore_ascii_case(proof_node)
+                    || proof_key_hex.is_some_and(|k| row.machine.eq_ignore_ascii_case(k))
+                    || member
+                        .node_id
+                        .as_deref()
+                        .is_some_and(|n| n.eq_ignore_ascii_case(&row.machine))
+                    || member
+                        .node_key
+                        .as_deref()
+                        .is_some_and(|k| k.eq_ignore_ascii_case(&row.machine))
+                    || requester_id.matches(&row.label)
+            };
             active_book
                 .rows()
-                .filter(|row| requester_id.matches(&row.label))
+                .filter(|row| row_belongs_to_requester(row))
                 .any(|row| {
                     row.claims.iter().any(|claim| {
                         claim.key.email.eq_ignore_ascii_case(&req.email)
@@ -1064,24 +1107,31 @@ fn append_audit_record(state_dir: &Path, audit: &MailCodeAudit) {
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
     let _ = aterm_uds::private_file::ensure_private_dir(state_dir);
     let path = state_dir.join(MAIL_CODE_AUDIT_FILE);
-    if std::fs::symlink_metadata(&path)
-        .ok()
-        .filter(std::fs::Metadata::is_file)
-        .map(|m| m.len())
-        .unwrap_or(0)
-        >= MAIL_CODE_AUDIT_MAX_BYTES
+    if let Ok(existing) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)
+        && let Ok(meta) = existing.metadata()
+        && meta.is_file()
+        && meta.len() >= MAIL_CODE_AUDIT_MAX_BYTES
     {
+        let _ = existing.set_permissions(std::fs::Permissions::from_mode(0o600));
+        drop(existing);
         let prev = state_dir.join(MAIL_CODE_AUDIT_PREV_FILE);
-        let _ = std::fs::rename(&path, &prev);
-        let _ = std::fs::set_permissions(&prev, std::fs::Permissions::from_mode(0o600));
+        if !std::fs::symlink_metadata(&prev).is_ok_and(|m| m.file_type().is_dir()) {
+            let _ = std::fs::remove_file(&prev);
+            let _ = std::fs::rename(&path, &prev);
+        }
     }
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
+        && f.metadata().is_ok_and(|m| m.is_file())
     {
+        let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
         let _ = writeln!(f, "{}", audit.log_line());
     }
 }
@@ -1139,6 +1189,8 @@ fn steward_handle_mail_code_with_key(
     if aterm_secrets::client::local_recipient_denied_in_roster(&paths) {
         return Err(MailCodeRefusal::NotSteward);
     }
+    let log_keys = crate::fleet_log::LocalLog::of(&paths).keys();
+    let keyring = aterm_net::fleet_member::Keyring::read(state_dir);
     if let Some(proved_key) = proof_key {
         let own_key_mismatch = match aterm_net::fleet_member::read_node_identity(state_dir)
             .ok()
@@ -1153,11 +1205,10 @@ fn steward_handle_mail_code_with_key(
         if own_key_mismatch {
             return Err(MailCodeRefusal::Denied);
         }
-        let log_keys = crate::fleet_log::LocalLog::of(&paths).keys();
         if log_keys.as_ref().is_some_and(|l| l.holds_out(&proved_key)) {
             return Err(MailCodeRefusal::Denied);
         }
-        if let Some(bound) = aterm_net::fleet_member::Keyring::read(state_dir).bound(proof_node)
+        if let Some(bound) = keyring.bound(proof_node)
             && bound != proved_key
             && !log_keys
                 .as_ref()
@@ -1173,8 +1224,7 @@ fn steward_handle_mail_code_with_key(
         .ok_or(MailCodeRefusal::NotSteward)?;
 
     let pool_path = home.join(".secrets").join(ai_pool::AI_POOL_FILE);
-    let pool = std::fs::read_to_string(&pool_path)
-        .ok()
+    let pool = read_regular_nofollow_bounded(&pool_path, 4 * 1024 * 1024)
         .and_then(|raw| Pool::from_toml(&raw, &pool_path.display().to_string()).ok());
     let claims = super::claims::read_book(home);
 
@@ -1188,6 +1238,25 @@ fn steward_handle_mail_code_with_key(
         now,
         false,
     )?;
+
+    if let Some(proved_key) = proof_key {
+        let matched_bound = roster.members.iter().any(|m| {
+            !member_is_denied(m, &roster)
+                && (m
+                    .node_id
+                    .as_deref()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(proof_node))
+                    || m.node_key
+                        .as_deref()
+                        .is_some_and(|k| k.eq_ignore_ascii_case(&proved_key.hex())))
+        });
+        if !matched_bound
+            && keyring.bound(proof_node) != Some(proved_key)
+            && log_keys.as_ref().is_some_and(|l| !l.admits(&proved_key))
+        {
+            return Err(MailCodeRefusal::Denied);
+        }
+    }
 
     if let Some(since) = req.since {
         cfg.since = Some(cfg.since.map_or(since, |prev| prev.max(since)));
@@ -1248,14 +1317,36 @@ pub fn serve_fleet_mail_code<S: std::io::Read + std::io::Write>(
 }
 
 #[cfg(unix)]
+fn read_regular_nofollow_bounded(path: &Path, max: u64) -> Option<String> {
+    use std::io::Read as _;
+    let file = astream_sys::open_nonblocking(path, astream_sys::Links::Refuse).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(max.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > max {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+#[cfg(unix)]
 fn read_standby_steward_labels(home: &Path) -> Vec<String> {
     let mut out = Vec::new();
     let paths = aterm_secrets::client::Paths::for_home(home);
     let roster = aterm_secrets::client::swarm_roster(&paths).ok().flatten();
     let push_label = |out: &mut Vec<String>, label: &str| {
         let trimmed = label.trim();
+        let is_denied = roster.as_ref().is_some_and(|r| {
+            r.is_label_denied(trimmed)
+                || r.member_by_label_or_alias(trimmed)
+                    .is_some_and(|m| member_is_denied(m, r))
+        });
         if !trimmed.is_empty()
-            && !roster.as_ref().is_some_and(|r| r.is_label_denied(trimmed))
+            && !is_denied
             && !out
                 .iter()
                 .any(|existing: &String| existing.eq_ignore_ascii_case(trimmed))
@@ -1270,7 +1361,7 @@ fn read_standby_steward_labels(home: &Path) -> Vec<String> {
         home.join(".secrets/swarm-policy.toml"),
         home.join(".config/aterm/swarm-policy.toml"),
     ] {
-        let Ok(raw) = std::fs::read_to_string(&candidate) else {
+        let Some(raw) = read_regular_nofollow_bounded(&candidate, 1024 * 1024) else {
             continue;
         };
         if let Ok(policy) = aterm_secrets::swarm_roster::SwarmPolicy::from_toml(&raw)
@@ -1413,21 +1504,37 @@ pub fn select_steward_relay_peers<'a>(
                 || roster.as_ref().is_some_and(|r| r.is_node_denied(&k.hex()))
                 || log_keys.as_ref().is_some_and(|l| l.holds_out(&k))
         }) || roster.as_ref().is_some_and(|r| {
+            let pick = |pred: &dyn Fn(&SwarmMember) -> bool| -> Option<&SwarmMember> {
+                r.members
+                    .iter()
+                    .find(|m| pred(m) && !member_is_denied(m, r))
+                    .or_else(|| r.members.iter().find(|m| pred(m)))
+            };
+            let matched = p
+                .node
+                .as_deref()
+                .and_then(|pn| {
+                    pick(&|m| {
+                        m.node_id
+                            .as_deref()
+                            .is_some_and(|mn| mn.eq_ignore_ascii_case(pn))
+                    })
+                })
+                .or_else(|| {
+                    let pk = p.key?.hex();
+                    pick(&|m| {
+                        m.node_key
+                            .as_deref()
+                            .is_some_and(|mk| mk.eq_ignore_ascii_case(&pk))
+                    })
+                });
+            if let Some(m) = matched {
+                return member_is_denied(m, r);
+            }
             let host_stem = p.host.strip_suffix(".local").unwrap_or(&p.host);
             r.is_label_denied(host_stem)
-                || r.members.iter().any(|m| {
-                    member_is_denied(m, r)
-                        && ((p.node.is_some()
-                            && m.node_id.as_deref().is_some_and(|mn| {
-                                p.node.as_deref().unwrap().eq_ignore_ascii_case(mn)
-                            }))
-                            || (p.key.is_some()
-                                && m.node_key.as_deref().is_some_and(|mk| {
-                                    mk.eq_ignore_ascii_case(&p.key.unwrap().hex())
-                                }))
-                            || host_matches_label(&p.host, &m.label)
-                            || m.aliases.iter().any(|a| host_matches_label(&p.host, a)))
-                })
+                || r.member_by_label_or_alias(host_stem)
+                    .is_some_and(|m| member_is_denied(m, r))
         })
     };
     let mut ordered: Vec<&Peer> = Vec::new();
@@ -1467,7 +1574,7 @@ pub fn fetch_relay_mail_credential(
     within: Duration,
 ) -> Option<MailboxCredential> {
     use aterm_net::fleet_member::{
-        Via, read_issuer_book, read_node_identity, read_peers, request_mail_code_from_peer,
+        Via, read_issuer_book, read_node_identity, read_peers, request_mail_code_from_bound_peer,
     };
     if !cfg.relay_enabled {
         return None;
@@ -1511,6 +1618,11 @@ pub fn fetch_relay_mail_credential(
 
     let standby_labels = read_standby_steward_labels(home);
     let ordered = select_steward_relay_peers(&peers, me.node(), &standby_labels, Some(home));
+    let denied_nodes = aterm_secrets::client::swarm_denied_nodes(&paths)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let log_keys = crate::fleet_log::LocalLog::of(&paths).keys();
 
     let now = std::time::Instant::now();
     let deadline = now
@@ -1521,11 +1633,10 @@ pub fn fetch_relay_mail_credential(
         if remaining.is_zero() {
             break;
         }
-        match request_mail_code_from_peer(
-            &peer.host,
-            peer.addr,
-            peer.port,
+        match request_mail_code_from_bound_peer(
+            peer,
             (&secret, Some(&me)),
+            (&denied_nodes, log_keys.as_deref()),
             &wire,
             remaining,
         ) {
@@ -1538,10 +1649,10 @@ pub fn fetch_relay_mail_credential(
                 MailCodeRefusal::NotSteward
                 | MailCodeRefusal::UnauthorizedEmail
                 | MailCodeRefusal::UnknownRequester
-                | MailCodeRefusal::SealFailed => continue,
-                MailCodeRefusal::NoCodeYet
-                | MailCodeRefusal::Denied
-                | MailCodeRefusal::InvalidRequest(_) => return None,
+                | MailCodeRefusal::SealFailed
+                | MailCodeRefusal::NoCodeYet
+                | MailCodeRefusal::Denied => continue,
+                MailCodeRefusal::InvalidRequest(_) => return None,
             },
             Err(_) => continue,
         }

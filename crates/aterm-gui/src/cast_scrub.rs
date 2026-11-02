@@ -323,7 +323,8 @@ pub(crate) fn scrubbed<D: AsRef<[u8]>>(
 fn kept_osc(osc: &[u8]) -> Option<Vec<u8>> {
     let mut params = osc.split(|&b| b == b';');
     let command = std::str::from_utf8(params.next()?)
-        .ok()?
+        .ok()
+        .filter(|s| s.bytes().all(|b| b.is_ascii_digit()))?
         .parse::<u32>()
         .ok()?;
     if !KEPT_OSC.contains(&command) {

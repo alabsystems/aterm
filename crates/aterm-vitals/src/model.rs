@@ -1914,6 +1914,15 @@ pub struct Snapshot {
     pub top: Vec<TopProc>,
     /// Latest job-progress view from the host's stuck-job engine.
     pub jobs: Option<std::sync::Arc<crate::jobs::JobsView>>,
+    /// How long before this reading the engine's pass that made [`Self::jobs`] ran, ms, as the
+    /// host's pass clock reads both ([`crate::jobs::JobsView::at_ms`]): 0 when this reading's own
+    /// pass made it. A reading the engine did not look at (one inside its cadence, a pull no
+    /// `sys jobs` armed it for, a machine-only one) carries the last pass's view, every figure
+    /// of which is this much older than the snapshot.
+    pub jobs_age_ms: u64,
+    /// Latest leftover view (`sys left`): what closed tabs and dead verify runs left running,
+    /// and what macOS's program check holds, each with its proof.
+    pub left: Option<std::sync::Arc<crate::left::LeftView>>,
     /// Delegated-job totals, from exactly the same process rates as the scopes.
     pub delegated: Vec<DelegatedUsage>,
     /// Whether this reading omitted the process sweep and read machine counters only.
@@ -2141,6 +2150,11 @@ impl Snapshot {
             }
             Resource::Gpu | Resource::Tokens => None,
         }
+    }
+
+    /// Take the leftover reader's view.
+    pub fn set_left(&mut self, left: Option<std::sync::Arc<crate::left::LeftView>>) {
+        self.left = left;
     }
 
     /// Take the stuck engine's view, and with it the Processes row's state and any fatal job crash
@@ -3175,6 +3189,8 @@ impl Vitals {
             tabs: pass.tabs,
             top: pass.top,
             jobs: None,
+            jobs_age_ms: 0,
+            left: None,
             delegated: pass.delegated,
             machine_only: s.machine_only,
             at_unix_ms: s.at_unix_ms,
@@ -7570,6 +7586,7 @@ mod tests {
             id: id.into(),
             tab: 1,
             kind: JobKind::Shell,
+            orphan_of: None,
             consumer: Consumer::PersonFg,
             promoted_ms: None,
             task: None,

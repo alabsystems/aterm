@@ -22,8 +22,42 @@ pub(crate) fn dir(prefix: &str) -> Dir {
     dir_in(&std::env::temp_dir(), prefix)
 }
 
+/// Raise this test process's soft descriptor limit toward 4096, once: macOS's default
+/// soft limit is 256, and the build-cache walks pin a descriptor for every directory
+/// of a deep tree on every test thread at once. At 256 the walks run out mid-pass,
+/// and a custody read that cannot open is — rightly, in production — a revocation, so
+/// parallel tests revoked each other's passes into failures a serial run never sees.
+/// Mirrors the bound `aterm-agent`'s harness tests raise by. A refused raise leaves
+/// the limit as it was.
+#[cfg(all(test, unix))]
+fn raise_descriptor_limit() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        const WANT: libc::rlim_t = 4096;
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `getrlimit` writes the one `rlimit` it is handed, on this frame.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut lim) } != 0 {
+            return;
+        }
+        if lim.rlim_cur < WANT && lim.rlim_max > lim.rlim_cur {
+            let raised = libc::rlimit {
+                rlim_cur: lim.rlim_max.min(WANT),
+                rlim_max: lim.rlim_max,
+            };
+            // SAFETY: `setrlimit` reads the one `rlimit` it is handed; a refusal leaves
+            // the limit as it was.
+            let _ = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const raised) };
+        }
+    });
+}
+
 /// [`dir`] under `parent` instead of the temp dir.
 pub(crate) fn dir_in(parent: &Path, prefix: &str) -> Dir {
+    #[cfg(all(test, unix))]
+    raise_descriptor_limit();
     let dir = aterm_tempfile::Builder::new()
         .prefix(prefix)
         .tempdir_in(parent)

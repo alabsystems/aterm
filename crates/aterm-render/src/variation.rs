@@ -93,7 +93,11 @@ pub fn parse_variation_spec(spec: &str) -> Option<(u32, f32)> {
     if tag.is_empty() || tag.len() > 4 || !tag.iter().all(u8::is_ascii_graphic) {
         return None;
     }
-    let value: f32 = value.trim().parse().ok()?;
+    let value_str = value.trim();
+    if value_str.starts_with('+') {
+        return None;
+    }
+    let value: f32 = value_str.parse().ok()?;
     if !value.is_finite() {
         return None;
     }
@@ -765,5 +769,6 @@ mod tests {
         assert_eq!((w, h), (0, 0), "space has no ink box");
         assert!(cov.is_empty(), "no coverage for a blank glyph");
         assert!(adv >= 0.0, "advance is finite and non-negative");
+        assert!(parse_variation_spec("wght=+400").is_none());
     }
 }

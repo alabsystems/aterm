@@ -541,7 +541,8 @@ fn ensure_cached(
     let base = root.join(script_set_address());
     let mut written = written.lock().unwrap_or_else(PoisonError::into_inner);
     let cached = written.as_deref() == Some(base.as_path())
-        && base.join("aterm_shell_integration.zsh").exists();
+        && std::fs::symlink_metadata(base.join("aterm_shell_integration.zsh"))
+            .is_ok_and(|m| m.file_type().is_file());
     if !cached {
         install_script_set(&root)?;
         *written = Some(base.clone());
@@ -560,7 +561,7 @@ fn ensure_cached(
     Ok(base)
 }
 
-fn script_set() -> [(&'static str, std::borrow::Cow<'static, str>); 14] {
+fn script_set() -> [(&'static str, std::borrow::Cow<'static, str>); 15] {
     [
         (
             "aterm_shell_integration.zsh",
@@ -602,6 +603,7 @@ fn script_set() -> [(&'static str, std::borrow::Cow<'static, str>); 14] {
         ("zdotdir/.zshenv", std::borrow::Cow::Borrowed(ZSH_WRAPPER)),
         ("bash/rcfile", std::borrow::Cow::Borrowed(BASH_WRAPPER)),
         ("bash/bashrc", std::borrow::Cow::Borrowed(BASH_LOADER)),
+        (CLT_BASH_ENV_FILE, std::borrow::Cow::Borrowed(CLT_BASH_ENV)),
         (
             "fish-xdg/fish/vendor_conf.d/aterm_shell_integration.fish",
             lf_only(scripts::FISH),
@@ -663,9 +665,60 @@ pub fn script_set_address() -> &'static str {
 }
 
 fn script_set_matches(dir: &Path) -> bool {
+    const SUBDIRS: [&str; 6] = [
+        "",
+        "zdotdir",
+        "bash",
+        "fish-xdg",
+        "fish-xdg/fish",
+        "fish-xdg/fish/vendor_conf.d",
+    ];
+    for sub in SUBDIRS {
+        let check = if sub.is_empty() {
+            dir.to_path_buf()
+        } else {
+            dir.join(sub)
+        };
+        if !std::fs::symlink_metadata(check).is_ok_and(|m| m.file_type().is_dir()) {
+            return false;
+        }
+    }
     script_set()
         .iter()
-        .all(|(path, bytes)| std::fs::read(dir.join(path)).is_ok_and(|b| b == bytes.as_bytes()))
+        .all(|(path, bytes)| regular_file_equals(&dir.join(path), bytes.as_bytes()))
+}
+
+fn regular_file_equals(path: &Path, expected: &[u8]) -> bool {
+    use std::io::Read as _;
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+    };
+    #[cfg(not(unix))]
+    let file = {
+        if !std::fs::symlink_metadata(path)
+            .is_ok_and(|m| m.file_type().is_file() && m.len() == expected.len() as u64)
+        {
+            return false;
+        }
+        std::fs::File::open(path)
+    };
+    let Ok(file) = file else {
+        return false;
+    };
+    let Ok(meta) = file.metadata() else {
+        return false;
+    };
+    if !meta.file_type().is_file() || meta.len() != expected.len() as u64 {
+        return false;
+    }
+    let cap = expected.len().saturating_add(1);
+    let mut buf = Vec::with_capacity(cap);
+    file.take(cap as u64).read_to_end(&mut buf).is_ok() && buf == expected
 }
 
 fn scratch_suffix() -> String {
@@ -707,9 +760,13 @@ fn install_script_set(root: &Path) -> Result<PathBuf, std::io::Error> {
             let _ = std::fs::remove_dir_all(&tmp);
             return Ok(dir);
         }
-        let stale = root.join(format!(".stale-{address}-{}", scratch_suffix()));
-        if std::fs::rename(&dir, &stale).is_ok() {
-            let _ = std::fs::remove_dir_all(&stale);
+        if std::fs::symlink_metadata(&dir).is_ok_and(|m| !m.file_type().is_dir()) {
+            let _ = std::fs::remove_file(&dir);
+        } else {
+            let stale = root.join(format!(".stale-{address}-{}", scratch_suffix()));
+            if std::fs::rename(&dir, &stale).is_ok() {
+                let _ = std::fs::remove_dir_all(&stale);
+            }
         }
     }
     let _ = std::fs::remove_dir_all(&tmp);
@@ -867,14 +924,17 @@ fn ensure_scripts(base: &Path) -> Result<(), std::io::Error> {
 macro_rules! spare_parked_hold {
     () => {
         "\
-# aterm warm spare (docs/DESIGN-warm-spare-2026-10-16.md): a spare waits here, before any startup file.
+# aterm warm spare (docs/DESIGN-warm-spare-2026-10-16.md): a spare waits here, before any startup file,
+# reading the end its host handed it at fd 10. Once the host is gone every read is end-of-file. A spare
+# with no end there exits before it signs that it is parked, so no host takes it for one.
 if [ -n \"${ATERM_REKEY_PATH:-}\" ]; then
   __aterm_spare_fifo=\"${ATERM_REKEY_PATH%/rekey/*}/spare/${ATERM_REKEY_PATH##*/}\"
   if [ -p \"$__aterm_spare_fifo\" ]; then
+    [ -p /dev/fd/10 ] || exit 0
     printf '\\033]633;P;AtermSpare=parked;id=%s\\a' \"${ATERM_SHELL_NONCE:-}\" >/dev/tty 2>/dev/null
     __aterm_spare_n=0 __aterm_spare_cd=
     while :; do
-      if IFS= read -r __aterm_spare_go < \"$__aterm_spare_fifo\"; then
+      if IFS= read -r -u 10 __aterm_spare_go; then
         case $__aterm_spare_go in
           run) __aterm_spare_mode=warm; break ;;
           go) break ;;
@@ -882,9 +942,19 @@ if [ -n \"${ATERM_REKEY_PATH:-}\" ]; then
         esac
       else
         __aterm_spare_n=$((__aterm_spare_n + 1))
-        { [ \"$__aterm_spare_n\" -lt 50 ] && [ -p \"$__aterm_spare_fifo\" ]; } || exit 0
+        [ \"$__aterm_spare_n\" -lt 50 ] || exit 0
       fi
     done 2>/dev/null
+    if [ -z \"${__aterm_spare_mode:-}\" ]; then
+      # Released: nothing the shell starts gets the hold's end. zsh takes a one-digit number in a
+      # redirection, so it closes fd 10 through a variable, under its own options.
+      if [ -n \"${ZSH_VERSION:-}\" ]; then
+        __aterm_spare_n=10
+        emulate zsh -c 'exec {__aterm_spare_n}<&-'
+      else
+        exec 10<&-
+      fi
+    fi
     if [ -n \"${__aterm_spare_cd:-}\" ]; then
       if [ -n \"${ZSH_VERSION:-}\" ]; then
         builtin cd -q -L -- \"$__aterm_spare_cd\" 2>/dev/null && OLDPWD=$PWD
@@ -1039,6 +1109,96 @@ fi
 builtin source \"$ATERM_SHELL_INTEGRATION_DIR/aterm_shell_integration.bash\"
 "
 );
+
+/// Where [`CLT_BASH_ENV`] sits in the script set; every integration names it by this path under
+/// `$ATERM_SHELL_INTEGRATION_DIR`, recording that exact path as the `BASH_ENV` it owns.
+const CLT_BASH_ENV_FILE: &str = "bash/clt_env";
+
+/// The `BASH_ENV` hook that keeps the Command Line Tools shim ahead of `/usr/bin` in a bash
+/// started inside a tab (design §6.3). While aterm installs the tools (the shim's `.wanted` mark
+/// is there), each integrated shell exports `BASH_ENV` naming this file and keeps the value it
+/// replaced in `ATERM_CLT_BASH_ENV_BEFORE`. A bash that runs a command (`bash -lc`, a script)
+/// reads it after
+/// its login profile, whose `path_helper` put `/usr/bin` back in front: the person's own
+/// `BASH_ENV` runs first, then the shim moves back to just ahead of the first `/usr/bin` (else
+/// `/bin`), never ahead of an earlier entry. Once nothing wants the shim, that bash and what it
+/// starts read the person's own `BASH_ENV` again. Bash 3.2-safe, quiet under `set -x`/`-v`, and
+/// sound under `set -e`/`-u`. An unrecognized predecessor may be an older hook or a later user
+/// replacement: its legacy `ATERM_CLT_BASH_ENV` context is retained, except a self-reference
+/// discarded before sourcing. Only the exact recorded owner can be restored away.
+const CLT_BASH_ENV: &str = "\
+# aterm: the Command Line Tools shim in a bash started inside a tab.
+{ __aterm_clt_env_flags=$-; set +xv; } 2>/dev/null
+if [ -n \"${ATERM_CLT_BASH_ENV_HOOK+set}\" ]; then
+  __aterm_clt_env_source=${ATERM_CLT_BASH_ENV_BEFORE-}
+else
+  __aterm_clt_env_source=${ATERM_CLT_BASH_ENV-}
+fi
+if [ -n \"$__aterm_clt_env_source\" ]; then
+  if [ \"${ATERM_CLT_BASH_ENV-}\" = \"$__aterm_clt_env_source\" ]; then
+    unset ATERM_CLT_BASH_ENV
+  fi
+  if [ \"$__aterm_clt_env_source\" = \"${BASH_SOURCE[0]-}\" ] ||
+     [ \"$__aterm_clt_env_source\" = \"${ATERM_CLT_BASH_ENV_HOOK-}\" ]; then
+    unset ATERM_CLT_BASH_ENV_BEFORE
+  elif [ -f \"$__aterm_clt_env_source\" ]; then
+    case $__aterm_clt_env_flags in *v*) set -v ;; esac
+    case $__aterm_clt_env_flags in *x*) set -x ;; esac
+    . \"$__aterm_clt_env_source\"
+    { __aterm_clt_env_flags=$-; set +xv; } 2>/dev/null
+  fi
+fi
+unset __aterm_clt_env_source
+if [ -n \"${ATERM_CLT_SHIM:-}\" ] && [ -f \"${ATERM_CLT_SHIM%/}.wanted\" ]; then
+  if [ -d \"$ATERM_CLT_SHIM\" ]; then
+    __aterm_clt_place() {
+      local LC_ALL=C
+      local d=\"$ATERM_CLT_SHIM\" p=\":${PATH-}:\" q s
+      while :; do
+        q=\"${p//\":$d:\"/:}\"
+        [ \"$q\" = \"$p\" ] && break
+        p=\"$q\"
+      done
+      case \"$p\" in
+        *:/usr/bin:*) s=/usr/bin ;;
+        *:/bin:*) s=/bin ;;
+        *) return 0 ;;
+      esac
+      q=\"${p#*\":$s:\"}\"
+      p=\"${p%%\":$s:\"*}:$d:$s:$q\"
+      p=\"${p#:}\"
+      p=\"${p%:}\"
+      [ \"$p\" = \"${PATH-}\" ] || export PATH=\"$p\"
+    }
+    __aterm_clt_place
+    unset -f __aterm_clt_place
+  fi
+else
+  if [ -n \"${ATERM_CLT_BASH_ENV_HOOK+set}\" ]; then
+    if [ \"${BASH_ENV-}\" = \"$ATERM_CLT_BASH_ENV_HOOK\" ]; then
+      if [ -n \"${ATERM_CLT_BASH_ENV_BEFORE+set}\" ]; then
+        export BASH_ENV=\"$ATERM_CLT_BASH_ENV_BEFORE\"
+      else
+        unset BASH_ENV
+      fi
+    fi
+    unset ATERM_CLT_BASH_ENV_BEFORE ATERM_CLT_BASH_ENV_HOOK
+  else
+    if [ -n \"${ATERM_CLT_BASH_ENV+set}\" ]; then
+      export BASH_ENV=\"$ATERM_CLT_BASH_ENV\"
+    else
+      unset BASH_ENV
+    fi
+    unset ATERM_CLT_BASH_ENV
+  fi
+fi
+case $__aterm_clt_env_flags in
+  *x*v*|*v*x*) unset __aterm_clt_env_flags; set -xv ;;
+  *x*) unset __aterm_clt_env_flags; set -x ;;
+  *v*) unset __aterm_clt_env_flags; set -v ;;
+  *) unset __aterm_clt_env_flags ;;
+esac
+";
 
 /// Convert a path to a lossy UTF-8 `String` for child environment variables
 /// without calling `Path::to_string_lossy` (a hardened `byte_loss` boundary in
@@ -1278,4 +1438,5 @@ mod tests {
     include!("tests_windows_marks.rs");
     include!("tests_hooks.rs");
     include!("tests_editor.rs");
+    include!("tests_clt_shim.rs");
 }

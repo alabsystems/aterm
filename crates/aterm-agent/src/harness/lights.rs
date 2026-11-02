@@ -111,7 +111,7 @@ impl Mode {
         }
     }
 
-    /// How a title names the mode as a place (`stopped in plan mode`): the word and ` mode`, but a rewritten row's word alone (`stopped in nag mode`), which is a state already ([`Self::word_on_glass`]).
+    /// How a title names the mode as a place (`stopped in plan mode`): the word and ` mode`, but a rewritten row's word alone (`stopped in manual mode`), which is a state already ([`Self::word_on_glass`]).
     #[must_use]
     pub fn named_on_glass(self, rewritten: bool) -> std::borrow::Cow<'static, str> {
         let word = self.word_on_glass(rewritten);
@@ -319,14 +319,14 @@ mod tests {
     }
 
     /// THE LIGHT IS THE MODE'S ONE NAME (review C8): where the glass rewrites the
-    /// mode row bypass reads `yolo` and manual `nag mode`, and a title names them
-    /// by the word alone (`nag mode`, not `nag mode mode`).
+    /// mode row bypass reads `yolo` and manual `manual mode`, and a title names them
+    /// by the word alone (`manual mode`, not `manual mode mode`).
     #[test]
     fn the_lights_word_follows_the_rewritten_row_and_only_under_its_gate() {
         assert_eq!(Mode::Bypass.word_on_glass(true), footer::YOLO_ON);
         assert_eq!(Mode::Bypass.word_on_glass(true), "yolo");
         assert_eq!(Mode::Manual.word_on_glass(true), footer::YOLO_OFF);
-        assert_eq!(Mode::Manual.named_on_glass(true), "nag mode");
+        assert_eq!(Mode::Manual.named_on_glass(true), "manual mode");
         assert_eq!(Mode::Bypass.word_on_glass(false), "bypass");
         assert_eq!(Mode::Manual.word_on_glass(false), "manual");
         assert_eq!(Mode::Manual.named_on_glass(false), "manual mode");

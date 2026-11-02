@@ -504,7 +504,9 @@ pub(crate) fn shell_runs_program_since(shell_pid: i32, since_ms: u64) -> bool {
 /// [`aterm_uds::process::boot_clock_now`]).
 #[cfg(target_os = "linux")]
 fn linux_group_and_start_ms(pid: i32) -> Option<(i32, u64)> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let stat =
+        aterm_uds::process::read_proc_text(std::path::Path::new(&format!("/proc/{pid}/stat")))
+            .ok()?;
     let mut fields = stat.get(stat.rfind(')')? + 1..)?.split_ascii_whitespace();
     if fields.next()? == "Z" {
         return None;
@@ -530,7 +532,9 @@ fn linux_group_and_start_ms(pid: i32) -> Option<(i32, u64)> {
 /// See the macOS [`process_name`].
 #[cfg(target_os = "linux")]
 pub(crate) fn process_name(pid: i32) -> Option<String> {
-    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    let comm =
+        aterm_uds::process::read_proc_text(std::path::Path::new(&format!("/proc/{pid}/comm")))
+            .ok()?;
     Some(comm.trim_end().to_string())
 }
 

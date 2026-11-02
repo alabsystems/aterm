@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Thread scheduling role, declared once per worker.
+//! Thread scheduling roles, changed by the worker that owns them.
 
 /// What a thread's work is worth relative to the human at the keyboard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,7 +56,67 @@ pub(crate) fn set_self(role: Role) {
     let _ = role;
 }
 
-/// Spawn the named worker thread `name` whose WHOLE body runs at `role`: the role is declared as the first thing the new thread does, on that thread.
+/// One role transition, observed on the thread that made it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RoleObservation {
+    pub(crate) requested: Role,
+    pub(crate) observed: Option<Role>,
+    pub(crate) class: Option<u32>,
+    pub(crate) set_errno: Option<i32>,
+    pub(crate) read_errno: Option<i32>,
+}
+
+/// Set and immediately read this thread's native role, retaining native errors.
+pub(crate) fn set_self_observed(role: Role) -> RoleObservation {
+    #[cfg(target_os = "macos")]
+    {
+        fork_at_default::install();
+        // SAFETY: both calls name the calling thread. The setter takes no
+        // pointers; the getter writes into live, correctly typed locals.
+        let (set, read, class) = unsafe {
+            let set = libc::pthread_set_qos_class_self_np(qos_class(role), 0);
+            let (mut class, mut relative) = (0, 0);
+            let read = pthread_get_qos_class_np(
+                pthread_self() as libc::pthread_t,
+                &mut class,
+                &mut relative,
+            );
+            (set, read, class)
+        };
+        let observed = (read == 0)
+            .then(|| {
+                [
+                    Role::Interactive,
+                    Role::Responsive,
+                    Role::Background,
+                    Role::Housekeeping,
+                ]
+                .into_iter()
+                .find(|candidate| qos_class(*candidate) as u32 == class)
+            })
+            .flatten();
+        RoleObservation {
+            requested: role,
+            observed,
+            class: (read == 0).then_some(class),
+            set_errno: Some(set),
+            read_errno: Some(read),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        set_self(role);
+        RoleObservation {
+            requested: role,
+            observed: None,
+            class: None,
+            set_errno: None,
+            read_errno: None,
+        }
+    }
+}
+
+/// Spawn the named worker thread `name`, declaring its initial `role` before its body runs, on that thread.
 pub(crate) fn spawn_lane_thread<F, T>(
     name: impl Into<String>,
     role: Role,
@@ -76,7 +136,6 @@ where
 
 #[cfg(target_os = "macos")]
 mod fork_at_default {
-    use libc::qos_class_t::{QOS_CLASS_BACKGROUND, QOS_CLASS_DEFAULT, QOS_CLASS_UTILITY};
     use std::cell::Cell;
 
     unsafe extern "C" {
@@ -88,10 +147,9 @@ mod fork_at_default {
     }
 
     thread_local! {
-        /// The class and relative priority [`lift`] raised this thread from, for
-        /// the fork in flight on it; `None` when it raised nothing.
-        static LIFTED_FROM: Cell<Option<(libc::qos_class_t, libc::c_int)>> =
-            const { Cell::new(None) };
+        /// What [`lift`] raised this thread from, for the fork in flight on it; `None` when it
+        /// raised nothing.
+        static LIFTED_FROM: Cell<Option<aterm_uds::qos::Lifted>> = const { Cell::new(None) };
     }
 
     /// Bracket every fork in the process with [`lift`] and [`restore`].
@@ -105,22 +163,13 @@ mod fork_at_default {
 
     /// The prepare handler: on the forking thread, before `fork(2)`.
     extern "C" fn lift() {
-        let lifted = super::requested_class_of_self().and_then(|(class, relative)| {
-            let from = [QOS_CLASS_UTILITY, QOS_CLASS_BACKGROUND]
-                .into_iter()
-                .find(|below| *below as libc::c_uint == class)?;
-            // SAFETY: sets this thread's own class; no pointers, no shared state.
-            let rc = unsafe { libc::pthread_set_qos_class_self_np(QOS_CLASS_DEFAULT, 0) };
-            (rc == 0).then_some((from, relative))
-        });
-        LIFTED_FROM.set(lifted);
+        LIFTED_FROM.set(aterm_uds::qos::lift());
     }
 
     /// The parent handler: on the forking thread, once `fork(2)` has returned.
     extern "C" fn restore() {
-        if let Some((class, relative)) = LIFTED_FROM.take() {
-            // SAFETY: as in `lift`; `class` and `relative` are the pair this thread had requested, read back off it before the fork.
-            unsafe { libc::pthread_set_qos_class_self_np(class, relative) };
+        if let Some(lifted) = LIFTED_FROM.take() {
+            aterm_uds::qos::restore(lifted);
         }
     }
 }
@@ -355,6 +404,7 @@ fn is_executable_file(path: &std::path::Path) -> bool {
 
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
+    fn pthread_self() -> *mut std::ffi::c_void;
     fn pthread_override_qos_class_start_np(
         thread: libc::pthread_t,
         class: libc::qos_class_t,
@@ -414,30 +464,13 @@ impl Drop for Boost {
 
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
-    /// Spelled as `main_thread_probe` declares it: one symbol, one signature.
-    fn pthread_self() -> *mut std::ffi::c_void;
+    #[cfg(test)]
+    fn qos_class_self() -> libc::c_uint;
     fn pthread_get_qos_class_np(
         thread: libc::pthread_t,
         class: *mut libc::c_uint,
         relative_priority: *mut libc::c_int,
     ) -> libc::c_int;
-}
-
-#[cfg(all(test, target_os = "macos"))]
-unsafe extern "C" {
-    fn qos_class_self() -> libc::c_uint;
-}
-
-/// The class and relative priority the calling thread has requested (its own word,
-/// which no override another thread pushes onto it changes), or `None` if the
-/// platform declined to answer.
-#[cfg(target_os = "macos")]
-fn requested_class_of_self() -> Option<(libc::c_uint, libc::c_int)> {
-    let mut class: libc::c_uint = 0;
-    let mut relative: libc::c_int = 0;
-    // SAFETY: both out-parameters are live, correctly typed locals, and `pthread_self` names the calling thread, alive across the call.
-    let rc = unsafe { pthread_get_qos_class_np(pthread_self().addr(), &mut class, &mut relative) };
-    (rc == 0).then_some((class, relative))
 }
 
 /// The class the calling thread is actually running at.

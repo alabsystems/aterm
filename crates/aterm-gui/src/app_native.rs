@@ -1298,13 +1298,22 @@ fn native_appearance_revision(preferences: crate::native_appearance::AppearanceP
     revision.finish()
 }
 
-const fn native_motion_revision(motion: crate::native_app::ViewMotionCx) -> u8 {
-    (motion.system_reduced as u8)
-        | ((motion.focused as u8) << 1)
-        | ((motion.performance_reduced as u8) << 2)
-        | ((motion.serious as u8) << 3)
-        | ((motion.system_dark as u8) << 4)
-        | ((motion.backend_gpu as u8) << 5)
+const fn native_motion_revision(motion: crate::native_app::ViewMotionCx) -> u16 {
+    let mode = match motion.mode {
+        crate::motion::MotionMode::Auto => 0,
+        crate::motion::MotionMode::Full => 1,
+        crate::motion::MotionMode::Reduced => 2,
+    };
+    (motion.system_reduced as u16)
+        | ((motion.focused as u16) << 1)
+        | ((motion.performance_reduced as u16) << 2)
+        | ((motion.serious as u16) << 3)
+        | ((motion.system_dark as u16) << 4)
+        | ((motion.backend_gpu as u16) << 5)
+        | ((motion.shed as u16) << 6)
+        | ((motion.low_power as u16) << 7)
+        | ((motion.window_focused as u16) << 8)
+        | (mode << 9)
 }
 
 impl NativeUiCompileStamp {
@@ -1345,6 +1354,8 @@ pub(crate) struct NativeLeafScene {
     pub(crate) viewport: crate::native_ui::LogicalRect,
     pub(crate) damage: DamageRegion,
     pub(crate) compiled: crate::native_ui::CompiledUi,
+    /// The motion-clock time its moving nodes are drawn at ([`crate::native_ui::NodeMotion`]).
+    pub(crate) motion_ms: u64,
 }
 
 /// Immutable view of one compositor-retained native leaf.
@@ -1441,9 +1452,6 @@ pub(crate) enum NativeConfigOrigin {
     },
     SeriousMode {
         desired: bool,
-    },
-    Presence {
-        key: &'static str,
     },
     ThemeChoice {
         request_id: u64,
@@ -1706,8 +1714,9 @@ impl App {
             .app(instance)
             .is_some_and(|app| app.kind() == crate::native_app::AppKind::Settings)
         {
-            // Settings ▸ Harness's session buttons write Autopilot words.
-            if self.harness_page_in(view) {
+            // Both pages expose session navigation under the shared Owner fence;
+            // Harness also writes Autopilot words.
+            if self.harness_page_in(view) || self.lab_page_in(view) {
                 crate::control::FrontControlSurface::HarnessSettings
             } else {
                 crate::control::FrontControlSurface::NativeSettings
@@ -2406,7 +2415,7 @@ impl App {
             .native_runtime
             .document_id(instance)
             .and_then(|document| self.document_store.snapshot(document));
-        let animation_phase_ms = self.native_preview_phase_ms();
+        let animation_phase_ms = self.native_motion_ms();
         let semantic_font = self.prepare_native_semantic_font(wid, view, animation_phase_ms);
         let tree = self
             .native_runtime
@@ -2444,6 +2453,7 @@ impl App {
             viewport,
             damage,
             compiled: self.compiled_native_ui_for(wid, instance, view, viewport)?,
+            motion_ms: self.native_motion_ms(),
         })
     }
 
@@ -2456,7 +2466,12 @@ impl App {
             .active_native_view(wid)
             .is_some_and(|(_, active)| active == view);
         let focused_window = self.windows.get(&wid).is_some_and(|window| window.focused);
+        let mode = self.config.motion_mode();
         crate::native_app::ViewMotionCx {
+            mode,
+            shed: self.load_shed_active_with(mode),
+            low_power: self.low_power,
+            window_focused: self.motion_focus(wid, focused_window),
             system_reduced: self.system_reduce_motion,
             focused: self.motion_focus(wid, focused_leaf && focused_window),
             performance_reduced: self.perf_reduced,
@@ -2890,15 +2905,17 @@ impl App {
         }
         // A key acts on the target page's current layout, including a wheel over an
         // unfocused About pane. About's Details changes its scroll range before a paint.
-        if kind == crate::native_app::AppKind::About
-            && matches!(
-                event,
-                AppEvent::ScrollPage(_)
-                    | AppEvent::ScrollLines(_)
-                    | AppEvent::ScrollAt { .. }
-                    | AppEvent::StepFocus(_)
-            )
-        {
+        // Mail's account form can also change its scroll range before the next paint.
+        if matches!(
+            kind,
+            crate::native_app::AppKind::About | crate::native_app::AppKind::Mail
+        ) && matches!(
+            event,
+            AppEvent::ScrollPage(_)
+                | AppEvent::ScrollLines(_)
+                | AppEvent::ScrollAt { .. }
+                | AppEvent::StepFocus(_)
+        ) {
             let viewport = self.native_ui_viewport_for(wid, view)?;
             self.compiled_native_ui_for(wid, instance, view, viewport)?;
         }
@@ -3014,6 +3031,9 @@ impl App {
                         .id
                         .as_str()
                         .strip_prefix("editor/completion/")
+                        .filter(|index| {
+                            !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit())
+                        })
                         .and_then(|index| index.parse::<usize>().ok())
                         .map(|index| {
                             AppEvent::EditorCompletion(
@@ -3025,10 +3045,12 @@ impl App {
                         .strip_prefix("editor/config-page/")
                         .and_then(|suffix| suffix.split_once('/'))
                         .and_then(|(target, candidates)| {
-                            Some((
-                                target.parse::<usize>().ok()?,
-                                candidates.parse::<usize>().ok()?,
-                            ))
+                            let uint = |s: &str| {
+                                (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                                    .then(|| s.parse::<usize>().ok())
+                                    .flatten()
+                            };
+                            Some((uint(target)?, uint(candidates)?))
                         })
                         .and_then(|(target, candidates)| {
                             self.editor_config_completion_context(instance, view)
@@ -3345,10 +3367,12 @@ impl App {
         // page key moves the list a page of its room, and the field keys edit
         // the field with focus.
         let form_active = settings_active
-            || self
-                .native_runtime
-                .app(instance)
-                .is_some_and(|app| app.kind() == crate::native_app::AppKind::SystemState);
+            || self.native_runtime.app(instance).is_some_and(|app| {
+                matches!(
+                    app.kind(),
+                    crate::native_app::AppKind::SystemState | crate::native_app::AppKind::Mail
+                )
+            });
         let config_completion_page =
             |context: crate::native_config_language::ConfigCompletionContext| {
                 AppEvent::EditorConfigNavigate {
@@ -4503,65 +4527,11 @@ impl App {
                         control_serious_mode_intent(key, value.as_deref())
                     }
                     NativeConfigOrigin::View { .. }
-                    | NativeConfigOrigin::Presence { .. }
                     | NativeConfigOrigin::ThemeChoice { .. }
                     | NativeConfigOrigin::StatsBars { .. }
                     | NativeConfigOrigin::DeckSize { .. }
                     | NativeConfigOrigin::HarnessSwitch { .. } => None,
                 });
-    }
-
-    fn publish_presence_completion(
-        &mut self,
-        key: &'static str,
-        outcome: &ConfigPatchOutcome,
-        authoritative: Option<&crate::native_config_service::ConfigSnapshot>,
-    ) {
-        let label = crate::app_take_over::PRESENCE_RIM_LABEL;
-        let feedback = match outcome {
-            ConfigPatchOutcome::Applied { .. } => {
-                if let Some(snapshot) = authoritative {
-                    self.config.presence = snapshot.config.presence.clone();
-                }
-                None
-            }
-            other => write_not_saved_cause(other),
-        };
-        if let Some((cause, indeterminate)) = feedback {
-            let durable = authoritative.map_or_else(
-                || self.config.presence_rim_enabled(),
-                |snapshot| snapshot.config.presence_rim_enabled(),
-            );
-            if key == crate::app_take_over::PRESENCE_RIM_KEY {
-                self.set_presence_bit(durable);
-            }
-            self.post_message(crate::message_reporters::presence_not_saved(
-                key,
-                label,
-                &cause,
-                indeterminate,
-            ));
-        }
-    }
-
-    /// Queue the durable settings write for the presence rim switch.
-    pub(crate) fn queue_presence_write(
-        &mut self,
-        key: &'static str,
-        desired: bool,
-    ) -> Result<(), String> {
-        self.proxy
-            .as_ref()
-            .ok_or_else(|| "config persistence needs an event-loop proxy".to_string())?;
-        let _ = native_config_queue()?;
-        self.native_config_pending.push_back(NativeConfigRequest {
-            origin: NativeConfigOrigin::Presence { key },
-            work: NativeConfigWork::ControlField {
-                key: key.to_string(),
-                value: Some(desired.to_string()),
-            },
-        });
-        self.pump_native_config()
     }
 
     /// View ▸ Stats Bars.
@@ -5607,9 +5577,6 @@ impl App {
                 authoritative,
                 synchronization_error,
             ),
-            NativeConfigOrigin::Presence { key } => {
-                self.publish_presence_completion(key, &outcome, authoritative.as_ref());
-            }
             NativeConfigOrigin::StatsBars { form } => {
                 self.publish_stats_bars_completion(form, &outcome)
             }
@@ -9391,9 +9358,7 @@ impl App {
         let title = aterm_update::health_failing_title("apply");
         let said_before = self.auto_apply_stranded_said.replace(build) == Some(build);
         let announced = self.note_update_health(title, &body);
-        if announced {
-            self.post_update_health_banner(crate::update_words::HealthKind::Install, title, &body);
-        } else if said_before {
+        if !announced && said_before {
             self.restate_update_health(
                 crate::update_words::HealthKind::of_updater_title(title),
                 title,
@@ -10448,9 +10413,12 @@ fn machine_command_output_bounded(
 
     const MAX_OUTPUT: usize = 64 * 1024;
     const POLL: Duration = Duration::from_millis(5);
-    let deadline = Instant::now() + limit;
+    let now = Instant::now();
+    let deadline = now
+        .checked_add(limit)
+        .unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 3600));
     let reserve = Duration::from_millis(250).min(limit / 4);
-    let read_deadline = deadline - reserve;
+    let read_deadline = deadline.checked_sub(reserve).unwrap_or(now);
     if Instant::now() >= read_deadline {
         return Err(format!("{operation} timed out"));
     }
@@ -10541,7 +10509,11 @@ fn machine_command_output_bounded(
         }
     })();
     result.map_err(|mut error| {
-        let cleanup_deadline = deadline.min(Instant::now() + reserve);
+        let now = Instant::now();
+        let cleanup_deadline = deadline.min(
+            now.checked_add(reserve)
+                .unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 3600)),
+        );
         if !stop_machine_read_child(&mut child, cleanup_deadline) {
             error.push_str("; child exit could not be confirmed within the cleanup budget");
             drop(child);

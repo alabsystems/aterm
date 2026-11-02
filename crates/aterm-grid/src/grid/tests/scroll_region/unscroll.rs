@@ -251,32 +251,13 @@ fn grid_unscroll_preserves_attributes() {
 
     scroll_four_off_then_unscroll(&mut grid, "Line");
 
-    let mut found_styled = false;
-    for row_idx in 0..4 {
-        if let Some(row) = grid.row(row_idx) {
-            for col in 0..20u16 {
-                if let Some(cell) = row.get(col) {
-                    let c = cell.char();
-                    if c != ' ' && c != '\0' {
-                        let fg_non_default = cell.fg_color().is_none_or(|c| !c.is_default());
-                        let cell_flags = cell.flags();
-                        if fg_non_default || cell_flags.contains(CellFlags::BOLD) {
-                            found_styled = true;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        if found_styled {
-            break;
-        }
+    let row0 = grid.row(0).expect("row 0 exists");
+    for (col, expected) in "STYLED".chars().enumerate() {
+        let cell = row0.get(col as u16).expect("cell exists");
+        assert_eq!(cell.char(), expected);
+        assert_eq!(cell.fg_color(), Some(fg));
+        assert!(cell.flags().contains(CellFlags::BOLD));
     }
-
-    assert!(
-        found_styled,
-        "Unscroll should preserve cell attributes (fg color, bold flag)"
-    );
 }
 
 #[test]
@@ -284,33 +265,26 @@ fn grid_unscroll_preserves_wrapped_flag() {
     let mut grid = tiered_grid(4, 10, 2);
 
     grid.set_cursor(0, 0);
-    for c in "ABCDEFGHIJ".chars() {
-        grid.write_char(c);
+    for c in "ABCDEFGHIJKLMNO".chars() {
+        grid.write_char_wrap(c);
     }
-    for c in "KLMNO".chars() {
-        grid.write_char(c);
-    }
-
-    if let Some(row) = grid.row_mut(0) {
-        row.set_wrapped(true);
-    }
+    assert!(!grid.row(0).unwrap().is_wrapped());
+    assert!(grid.row(1).unwrap().is_wrapped());
 
     let unscrolled = scroll_four_off_then_unscroll(&mut grid, "Scroll");
+    assert_eq!(unscrolled, 4);
 
-    let mut found_wrapped = false;
-    for row_idx in 0..unscrolled {
-        if let Some(row) = grid.row(row_idx as u16)
-            && row.is_wrapped()
-        {
-            found_wrapped = true;
-            break;
-        }
-    }
-
+    let row0 = grid.row(0).expect("row 0 exists");
+    let row1 = grid.row(1).expect("row 1 exists");
+    assert!(!row0.is_wrapped(), "head row 0 must remain unwrapped");
     assert!(
-        found_wrapped,
-        "Unscroll should preserve wrapped flag from scrollback"
+        row1.is_wrapped(),
+        "continuation row 1 must preserve its wrapped flag across tiered unscroll"
     );
+    let r0_text: String = (0..10).map(|c| row0.get(c).unwrap().char()).collect();
+    let r1_text: String = (0..5).map(|c| row1.get(c).unwrap().char()).collect();
+    assert_eq!(r0_text, "ABCDEFGHIJ");
+    assert_eq!(r1_text, "KLMNO");
 }
 
 #[test]
